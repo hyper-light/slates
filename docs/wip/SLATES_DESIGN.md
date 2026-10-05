@@ -8697,3 +8697,14 @@ Status: built 2026-10-04.
   first round; covers a removal past a snapshot's epoch); `the_ring_never_allocates_past_its_budget` (failed first:
   capacity 1,001 against 1,000); vfs 208/208.
 
+### A-73 — `export` prints the port it is served on (2026-10-04)
+Applied in the same change to: `crates/cli/src/verbs.rs` (`export_verb`), `crates/cli/tests/cli.rs`, GAPS.
+Status: built 2026-10-04.
+- Why: an NFS volume made from an export (a Docker `type=nfs` volume over Docker Desktop's VM, a PersistentVolume)
+  names the server's port as well as the path. The port was only in the daemon's status, and the A-71 Docker
+  measurements found it with `lsof`.
+- What: `export` prints `port: N` after the path, and `--json` carries `"port"`. The port is omitted only where the
+  daemon serves no NFS.
+- Proven: the live mount test exports the mounted volume and requires the printed port to equal the one `nfsstat -m`
+  reports for the kernel's mount, in both output forms.
+

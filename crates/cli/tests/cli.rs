@@ -385,6 +385,40 @@ fn nfs_port_of(path: &str) -> Option<u16> {
     .ok()
 }
 
+/// §4.6 (A-73): an NFS volume made from `slates export` (a Docker `type=nfs` volume, a PersistentVolume) needs the
+/// export's port as well as its path. Do `export ID --json` while the volume is kernel-mounted; expect the `port` it
+/// prints to be the one the kernel's mount speaks to (`nfsstat -m`), and the plain output to print it too. Then detach
+/// the export's own attachment.
+#[cfg(target_os = "macos")]
+fn an_export_names_the_port_the_kernel_mount_uses(instance: &str, id: &str, path: &str) {
+  let (code, out, err) = run(instance, &["export", id, "--json"]);
+  assert_eq!(code, 0, "export: {err}");
+  let printed: u16 = json_field(&out, "port").parse().expect("a port number");
+  assert_eq!(
+    Some(printed),
+    nfs_port_of(path),
+    "the export's port is the mount's: {out}"
+  );
+  let (code, _, err) = run(instance, &["detach", &json_field(&out, "attachment")]);
+  assert_eq!(code, 0, "detach: {err}");
+  let (code, out, err) = run(instance, &["export", id]);
+  assert_eq!(code, 0, "export: {err}");
+  assert!(
+    out.lines().any(|line| line == format!("port: {printed}")),
+    "the plain output prints the port: {out}"
+  );
+  // The plain output's path names its attachment in hex (`/<name>@<attachment_hex>.<token_hex>`).
+  let attachment = out
+    .lines()
+    .find_map(|line| line.strip_prefix("export: "))
+    .and_then(|path| path.split_once('@'))
+    .and_then(|(_, capability)| capability.split_once('.'))
+    .and_then(|(hex, _)| u64::from_str_radix(hex, 16).ok())
+    .expect("the export path names its attachment");
+  let (code, _, err) = run(instance, &["detach", &attachment.to_string()]);
+  assert_eq!(code, 0, "detach: {err}");
+}
+
 /// §4.6 A-34: a `UMNT` proves nothing by itself, since any local process can send one. Do send the
 /// daemon a forged `UMNT /<name>` while the volume is mounted, as another user could; expect the mount's
 /// attachment to survive past the daemon's confirmation deadline, and the mount to keep serving.
@@ -677,6 +711,8 @@ fn slates_mount_establishes_a_real_kernel_mount_and_unmount_removes_it() {
   mount_outlives_the_process_that_attached(&instance, &id, &mount_point.path);
   #[cfg(target_os = "macos")]
   a_forged_unmount_ends_nothing(&instance, &id, "mounted", &mount_point.path);
+  #[cfg(target_os = "macos")]
+  an_export_names_the_port_the_kernel_mount_uses(&instance, &id, &mount_point.path);
   unmount_and_check(&instance, &id, &mount_point.path);
 
   drop(mount_point);

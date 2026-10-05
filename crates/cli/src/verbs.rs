@@ -152,13 +152,18 @@ fn export_verb(
     ));
   };
   let path = crate::mount::export_path(&report.name, (attachment.attachment, token));
+  // The port the export is served on, beside the path: an NFS volume made from it (a Docker `type=nfs` volume, a
+  // PersistentVolume) names both (A-73). `None` only where the daemon serves no NFS (Windows mounts through WinFsp).
   if json {
     println!(
       "{}",
-      serde_json::json!({ "attachment": attachment.attachment, "path": path })
+      serde_json::json!({ "attachment": attachment.attachment, "path": path, "port": report.nfs_port })
     );
   } else {
     println!("export: {path}");
+    if let Some(port) = report.nfs_port {
+      println!("port: {port}");
+    }
   }
   Ok(())
 }

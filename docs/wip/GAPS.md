@@ -3504,8 +3504,9 @@ shard's own clock that A-65 budgets in (docs/bugs/2026-10-04-the-slow-observatio
 - **Measured:** a Docker volume of type `nfs` (NFSv4.2 from Docker Desktop's own Linux kernel, `slates export`)
   runs a full file workload, including `rm -rf`, with the volume empty afterwards. A host `slates mount` bound into a
   container cannot: Docker Desktop keeps every touched file open on the host, so deletes become `.nfs.*` entries
-  (2,473 of 2,524). Owed: `slates export` should print the port, or a ready `docker volume create` line, so the
-  NFS-volume form needs no `lsof`; and the OCI report should name the NFS-volume form for Docker Desktop.
+  (2,473 of 2,524). `slates export` now prints the port beside the path (`port: N`, and `"port"` in `--json`; A-73,
+  proven against the kernel mount's own port in `slates_mount_establishes_a_real_kernel_mount_and_unmount_removes_it`).
+  Owed: the OCI report should name the NFS-volume form for Docker Desktop.
 - **Owed:** the read pass over the NFSv4.2 volume is 2–9× the host bind's (1.7–4.3 s against 0.46–0.82 s for 2,524
   files). Every open is a round trip. NFSv4 read delegations (RFC 8881 §10.4) are the standard remedy, to measure.
 - **Done (A-72):** trie removal frees the nodes it empties, and the op log's ring is capped at its budget. Rounds 3 to
