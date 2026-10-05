@@ -1219,6 +1219,8 @@ struct V4Client {
   sessionid: [u8; 16],
   sequence: u32,
   xid: u32,
+  /// The slots the server granted the session (`ca_maxrequests` of the fore channel).
+  slots: u32,
 }
 
 /// Format: `NFS4_OK`, `NFS4ERR_NOENT` and the operation numbers this test sends (RFC 7863).
@@ -1287,6 +1289,11 @@ impl V4Client {
 
   /// EXCHANGE_ID for the client owner `owner`, then CREATE_SESSION, over a new connection to `port`.
   fn connect_as(port: u16, owner: &[u8]) -> V4Client {
+    V4Client::connect_asking(port, owner, 4)
+  }
+
+  /// [`V4Client::connect_as`] asking for `slots` slots, as a client's `max_session_slots` does.
+  fn connect_asking(port: u16, owner: &[u8], slots: u32) -> V4Client {
     use slates_bridge_nfs::v4::types::ChannelAttrs;
     use slates_bridge_nfs::xdr::{XdrReader, XdrWriter};
     let mut client = V4Client {
@@ -1295,6 +1302,7 @@ impl V4Client {
       sessionid: [0; 16],
       sequence: 0,
       xid: 0,
+      slots: 0,
     };
     let mut ops = XdrWriter::new();
     ops.u32(OP_EXCHANGE_ID);
@@ -1320,7 +1328,7 @@ impl V4Client {
       max_response: 1 << 20,
       max_response_cached: 1 << 12,
       max_operations: 16,
-      max_requests: 4,
+      max_requests: slots,
       ..ChannelAttrs::default()
     };
     asked.encode(&mut ops);
@@ -1330,7 +1338,23 @@ impl V4Client {
     let (status, results) = client.compound(1, ops.as_slice());
     assert_eq!(status, NFS4_OK, "CREATE_SESSION");
     client.sessionid.copy_from_slice(&results[8..8 + 16]);
+    // CREATE_SESSION4resok after the session id: the sequence id and the flags, then the fore channel.
+    let mut reader = XdrReader::new(&results[8 + 16 + 8..]);
+    client.slots = ChannelAttrs::decode(&mut reader).unwrap().max_requests;
     client
+  }
+
+  /// SEQUENCE alone on slot `slot` (its first use, sequence id 1): the compound's status.
+  fn sequence_on(&mut self, slot: u32) -> u32 {
+    use slates_bridge_nfs::xdr::XdrWriter;
+    let mut all = XdrWriter::new();
+    all.u32(OP_SEQUENCE);
+    all.fixed(&self.sessionid);
+    all.u32(1);
+    all.u32(slot);
+    all.u32(slot);
+    all.bool(false);
+    self.compound(1, all.as_slice()).0
   }
 
   /// SEQUENCE on slot 0 with the next sequence id, then `ops` (`count` of them): the status and the
@@ -1494,6 +1518,8 @@ fn remote_volume_name(client: &mut Client) -> String {
 const OP_LOCK: u32 = 12;
 const OP_TEST_STATEID: u32 = 55;
 const NFS4ERR_BAD_STATEID: u32 = 10025;
+/// Format: `NFS4ERR_BADSLOT` (RFC 8881 §15.1.11.3).
+const NFS4ERR_BADSLOT: u32 = 10053;
 const NFS4ERR_DENIED: u32 = 10010;
 const NFS4ERR_LOCKS_HELD: u32 = 10037;
 
@@ -1718,5 +1744,36 @@ fn an_nfsv4_scoped_browse_lists_a_volume_on_another_shard_with_its_own_fsid() {
   );
   drop(v4);
   drop(client);
+  drop(daemon);
+}
+
+/// Shape: the slots a client asks for, as Linux's `nfs.max_session_slots` default does (from memory).
+const ASKED_SLOTS: u32 = 64;
+
+/// §4.6 (A-75): do create a session asking for [`ASKED_SLOTS`] slots; expect the grant to be the daemon's bound on
+/// one client's requests in flight (Little's law, the bound a ring client gets, `slots_per_ring`), not the shard
+/// count, and the slots to be usable up to the grant and refused past it. Four slots (the shard count) held a
+/// parallel Go build's requests in the Linux client: 1.05 ms queued per reopen against 0.44 ms on the wire
+/// (2026-10-04).
+#[test]
+fn a_session_is_granted_one_clients_in_flight_bound_and_can_use_it() {
+  let (daemon, instance) = two_shard_daemon("slots");
+  let profile = common::machine_profile();
+  let derived = DaemonConfig::derive(&profile, &instance, Some(2));
+  let port = daemon.nfs_port().expect("the daemon is serving NFS");
+  let mut v4 = V4Client::connect_asking(port, b"slots-host", ASKED_SLOTS);
+  let bound = derived.region.slots.min(ASKED_SLOTS);
+  assert_eq!(v4.slots, bound, "the grant is one client's in-flight bound");
+  assert!(v4.slots > 2, "more slots than shards: {}", v4.slots);
+  assert_eq!(
+    v4.sequence_on(v4.slots - 1),
+    NFS4_OK,
+    "the last granted slot serves"
+  );
+  assert_eq!(
+    v4.sequence_on(v4.slots),
+    NFS4ERR_BADSLOT,
+    "a slot past the grant is refused"
+  );
   drop(daemon);
 }

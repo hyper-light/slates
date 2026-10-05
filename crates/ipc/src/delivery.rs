@@ -423,6 +423,16 @@ mod platform {
     )
   }
 
+  /// The object part of an identity, its device and inode (the first two of its fields), with the times after them
+  /// left out.
+  fn object_of(identity: &str) -> &str {
+    let mut fields = identity.match_indices(':');
+    match fields.nth(1) {
+      Some((at, _)) => identity.get(..at).unwrap_or(identity),
+      None => identity,
+    }
+  }
+
   /// Format: the fields of an identity ([`identity_of`]).
   const IDENTITY_FIELDS: usize = 4;
 
@@ -576,12 +586,20 @@ mod platform {
     // fails with `EBADF` and touches nothing, and the borrow lasts for that one call.
     let borrowed = unsafe { BorrowedFd::borrow_raw(number) };
     let stat = rustix::fs::fstat(borrowed).map_err(|_| DeliveryFault::NotInherited)?;
-    if identity_text(&stat) != identity {
+    let text = identity_text(&stat);
+    // The channel is first the named object (device and inode), then of the right kind, then unchanged since it
+    // was named (its times). The times are compared only for a pipe or socket: another kind's are not this
+    // channel's to keep still (any process's write moves `/dev/null`'s), so comparing them first made a device
+    // read as `NotInherited` or `WrongKind` by chance on a busy machine (2026-10-04).
+    if object_of(&text) != object_of(identity) {
       return Err(DeliveryFault::NotInherited);
     }
     match FileType::from_raw_mode(stat.st_mode) {
       FileType::Fifo | FileType::Socket => {}
       _ => return Err(DeliveryFault::WrongKind),
+    }
+    if text != identity {
+      return Err(DeliveryFault::NotInherited);
     }
     // SAFETY: the descriptor is open (`fstat` succeeded) and is the very channel the harness named
     // (its device, inode and modification time match the name), handed to this process for this one

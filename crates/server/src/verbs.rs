@@ -1907,6 +1907,10 @@ pub fn shard_report(state: &mut ShardState) -> ShardReport {
       HealthSignal::RingDepth => Some(ring_depth),
       HealthSignal::ShardClients => Some(shard_clients),
       HealthSignal::ShardDeferred => Some(shard_deferred),
+      HealthSignal::NfsLocalP50Ns => nfs_quantile(state, NfsTimes::Local, HALF_PPM),
+      HealthSignal::NfsLocalP99Ns => nfs_quantile(state, NfsTimes::Local, P99_PPM),
+      HealthSignal::NfsLocalOffCpuP99Ns => nfs_quantile(state, NfsTimes::LocalOffCpu, P99_PPM),
+      HealthSignal::NfsForwardedP99Ns => nfs_quantile(state, NfsTimes::Forwarded, P99_PPM),
     }
   };
   // Each signal ages by the registry's stated basis (§4.14): a report-time value is age zero, a
@@ -9453,4 +9457,35 @@ mod tests {
       "a proof under a guessed capability does not verify"
     );
   }
+}
+
+/// Format: the median, in parts per million (the histogram's quantile unit).
+const HALF_PPM: u64 = 500_000;
+/// Format: the 99th percentile, in parts per million.
+const P99_PPM: u64 = 990_000;
+
+/// Which of a shard's NFS service-time histograms a signal reads (§4.14).
+#[derive(Clone, Copy)]
+enum NfsTimes {
+  Local,
+  LocalOffCpu,
+  Forwarded,
+}
+
+/// The quantile `ppm` of one of this shard's NFS service-time histograms; `None` until a call was recorded there
+/// (an unmeasured time is unknown, never zero), and always `None` where the daemon serves no NFS.
+#[cfg(unix)]
+fn nfs_quantile(state: &ShardState, times: NfsTimes, ppm: u64) -> Option<u64> {
+  let histogram = match times {
+    NfsTimes::Local => &state.nfs_service.local,
+    NfsTimes::LocalOffCpu => &state.nfs_service.local_off_cpu,
+    NfsTimes::Forwarded => &state.nfs_service.forwarded,
+  };
+  (histogram.count() > 0).then(|| histogram.quantile(ppm))
+}
+
+/// Windows serves no NFS (it mounts through WinFsp): every NFS time is unknown.
+#[cfg(not(unix))]
+fn nfs_quantile(_state: &ShardState, _times: NfsTimes, _ppm: u64) -> Option<u64> {
+  None
 }

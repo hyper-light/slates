@@ -702,7 +702,7 @@ impl DaemonConfig {
     #[cfg(unix)]
     let nfs_v4 = nfs_v4_caps(
       reserve.get(),
-      runtime.shards.max(1),
+      (runtime.shards.max(1), region.slots),
       store.max_inodes,
       &mut derivations,
     );
@@ -779,11 +779,18 @@ pub const NFS_V4_SESSIONS_PER_CLIENT: usize = 2;
 #[cfg(unix)]
 fn nfs_v4_caps(
   reserve_per_shard: u64,
-  shards: u16,
+  (shards, in_flight): (u16, u32),
   max_inodes: usize,
   derivations: &mut Vec<String>,
 ) -> NfsV4Caps {
-  let slots: Derived<u32> = derived!(u32::from(shards).max(1), "shards", ["shards"]);
+  // A session's slots are the requests its client keeps in flight, the bound a ring client gets (`slots_per_ring`,
+  // Little's law). Until 2026-10-04 it was the shard count: four slots held a parallel Go build's requests in the
+  // Linux client, queued 1.05 ms per reopen against 0.44 ms on the wire (A-75).
+  let slots: Derived<u32> = derived!(
+    in_flight.max(1),
+    "slots_per_ring: the requests one client may hold in flight (Little's law)",
+    ["slots_per_ring"]
+  );
   derivations.push(note("nfs_v4_slots", &slots));
   let client_bytes = u64::from(slots.get())
     .saturating_mul(u64::try_from(NFS_V4_SESSIONS_PER_CLIENT).unwrap_or(u64::MAX))

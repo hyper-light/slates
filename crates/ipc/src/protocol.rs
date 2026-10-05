@@ -584,18 +584,31 @@ pub enum HealthSignal {
   ShardClients,
   /// Operations deferred on this shard.
   ShardDeferred,
+  /// The median time this shard took to serve an NFS call whose volume it owns, since boot (§4.6, §4.14).
+  NfsLocalP50Ns,
+  /// The 99th percentile of the same.
+  NfsLocalP99Ns,
+  /// The 99th percentile of the part of a local serve the operating system held the shard's thread off a core: what
+  /// a busy machine adds to the serve itself.
+  NfsLocalOffCpuP99Ns,
+  /// The 99th percentile of a call this shard read but forwarded to its volume's owner shard and back.
+  NfsForwardedP99Ns,
 }
 
 impl HealthSignal {
   /// The closed registry: every shard health signal, in the order the report emits them. A doc-truth
   /// test pins this set and its names so a rename or an addition is caught, not silently miscounted.
-  pub const ALL: [HealthSignal; 6] = [
+  pub const ALL: [HealthSignal; 10] = [
     HealthSignal::CatalogVolumes,
     HealthSignal::LogReplayNs,
     HealthSignal::LeaseExpiring,
     HealthSignal::RingDepth,
     HealthSignal::ShardClients,
     HealthSignal::ShardDeferred,
+    HealthSignal::NfsLocalP50Ns,
+    HealthSignal::NfsLocalP99Ns,
+    HealthSignal::NfsLocalOffCpuP99Ns,
+    HealthSignal::NfsForwardedP99Ns,
   ];
 
   /// The dotted name this signal reports under (the stable wire vocabulary a consumer keys on).
@@ -607,6 +620,10 @@ impl HealthSignal {
       HealthSignal::RingDepth => "ring.depth",
       HealthSignal::ShardClients => "shard.clients",
       HealthSignal::ShardDeferred => "shard.deferred",
+      HealthSignal::NfsLocalP50Ns => "nfs.local_p50_ns",
+      HealthSignal::NfsLocalP99Ns => "nfs.local_p99_ns",
+      HealthSignal::NfsLocalOffCpuP99Ns => "nfs.local_off_cpu_p99_ns",
+      HealthSignal::NfsForwardedP99Ns => "nfs.forwarded_p99_ns",
     }
   }
 
@@ -616,7 +633,11 @@ impl HealthSignal {
   /// never a healthy zero.
   pub const fn absence(self) -> AbsenceIs {
     match self {
-      HealthSignal::LogReplayNs => AbsenceIs::Unknown,
+      HealthSignal::LogReplayNs
+      | HealthSignal::NfsLocalP50Ns
+      | HealthSignal::NfsLocalP99Ns
+      | HealthSignal::NfsLocalOffCpuP99Ns
+      | HealthSignal::NfsForwardedP99Ns => AbsenceIs::Unknown,
       HealthSignal::CatalogVolumes
       | HealthSignal::LeaseExpiring
       | HealthSignal::RingDepth
@@ -629,7 +650,11 @@ impl HealthSignal {
   /// registry's rule, not one of its own.
   pub const fn freshness(self) -> FreshnessBasis {
     match self {
-      HealthSignal::LogReplayNs => FreshnessBasis::SinceBoot,
+      HealthSignal::LogReplayNs
+      | HealthSignal::NfsLocalP50Ns
+      | HealthSignal::NfsLocalP99Ns
+      | HealthSignal::NfsLocalOffCpuP99Ns
+      | HealthSignal::NfsForwardedP99Ns => FreshnessBasis::SinceBoot,
       HealthSignal::CatalogVolumes
       | HealthSignal::LeaseExpiring
       | HealthSignal::RingDepth
@@ -648,6 +673,15 @@ impl HealthSignal {
       HealthSignal::RingDepth => "the clients' command rings, summed",
       HealthSignal::ShardClients => "the shard's client slots",
       HealthSignal::ShardDeferred => "the shard's deferred-reply queue",
+      HealthSignal::NfsLocalP50Ns | HealthSignal::NfsLocalP99Ns => {
+        "the shard's NFS service times for calls served here"
+      }
+      HealthSignal::NfsLocalOffCpuP99Ns => {
+        "the shard's NFS service times less its thread's CPU time"
+      }
+      HealthSignal::NfsForwardedP99Ns => {
+        "the shard's NFS service times for calls forwarded to an owner"
+      }
     }
   }
 
@@ -661,7 +695,11 @@ impl HealthSignal {
       | HealthSignal::LeaseExpiring
       | HealthSignal::RingDepth
       | HealthSignal::ShardClients
-      | HealthSignal::ShardDeferred => Observer::OwnerShard,
+      | HealthSignal::ShardDeferred
+      | HealthSignal::NfsLocalP50Ns
+      | HealthSignal::NfsLocalP99Ns
+      | HealthSignal::NfsLocalOffCpuP99Ns
+      | HealthSignal::NfsForwardedP99Ns => Observer::OwnerShard,
     }
   }
 
@@ -2569,13 +2607,25 @@ mod health_signal_registry {
     std::fs::write(RECORD, rewritten).expect("the record is writable");
   }
 
+  /// The signals measured since boot whose absence is unknown: the replay time and the NFS service times.
+  fn since_boot_or_unknown(signal: HealthSignal) -> bool {
+    matches!(
+      signal,
+      HealthSignal::LogReplayNs
+        | HealthSignal::NfsLocalP50Ns
+        | HealthSignal::NfsLocalP99Ns
+        | HealthSignal::NfsLocalOffCpuP99Ns
+        | HealthSignal::NfsForwardedP99Ns
+    )
+  }
+
   /// Every health signal states its freshness basis (§4.14): `log.replay_ns` is a boot-time fact aged
-  /// since boot; every other signal is computed at the report. Pinned so a new signal must decide how
-  /// it ages rather than inherit age zero.
+  /// since boot, and the NFS service times accumulate since boot; every other signal is computed at the
+  /// report. Pinned so a new signal must decide how it ages rather than inherit age zero.
   #[test]
   fn every_signal_states_its_freshness_basis() {
     for signal in HealthSignal::ALL {
-      let expected = if matches!(signal, HealthSignal::LogReplayNs) {
+      let expected = if since_boot_or_unknown(signal) {
         FreshnessBasis::SinceBoot
       } else {
         FreshnessBasis::AtReport
@@ -2606,6 +2656,10 @@ mod health_signal_registry {
       "ring.depth",
       "shard.clients",
       "shard.deferred",
+      "nfs.local_p50_ns",
+      "nfs.local_p99_ns",
+      "nfs.local_off_cpu_p99_ns",
+      "nfs.forwarded_p99_ns",
     ];
     let names: Vec<&str> = HealthSignal::ALL
       .iter()
@@ -2630,12 +2684,13 @@ mod health_signal_registry {
 
   /// Every health signal types what its absence means (§4.14, A-9): a missing sample is never a silent
   /// healthy zero. `log.replay_ns` is `Unknown` (a fresh daemon has no replay time yet, distinct from a
-  /// 0 ns replay); every other signal is an always-computable count whose absence would be a `Degraded`
-  /// producer. Pinned so a new signal must decide its absence meaning, not inherit a look-alike zero.
+  /// 0 ns replay), as is an NFS service time before any call was served; every other signal is an
+  /// always-computable count whose absence would be a `Degraded` producer. Pinned so a new signal must decide its
+  /// absence meaning, not inherit a look-alike zero.
   #[test]
   fn every_signal_types_its_absence() {
     for signal in HealthSignal::ALL {
-      let expected = if matches!(signal, HealthSignal::LogReplayNs) {
+      let expected = if since_boot_or_unknown(signal) {
         AbsenceIs::Unknown
       } else {
         AbsenceIs::Degraded

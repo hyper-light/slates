@@ -1206,11 +1206,29 @@ async fn reply_v4(this: u16, call: Call, port: u16) -> Vec<u8> {
         requester,
         port,
       };
+      note(NFS4_COMPOUNDS);
       let results = compound::serve(&mut backend, &args, request_bytes).await;
       reply_bytes(xid, AcceptStatus::Success, &results)
     }
     _ => reply_bytes(xid, AcceptStatus::ProcUnavail, &[]),
   }
+}
+
+/// Counter: NFSv4 `COMPOUND`s this shard served (§4.14): the denominator of the per-compound call counts below.
+const NFS4_COMPOUNDS: &str = "nfs4.compounds";
+/// Counter: v3 calls a compound's operations made that this shard served itself.
+const NFS4_V3_LOCAL: &str = "nfs4.v3.local";
+/// Counter: v3 calls a compound's operations made that went to the volume's owner shard and back (two thread
+/// wakes each; the cost a compound run where its volume lives would not pay).
+const NFS4_V3_FORWARDED: &str = "nfs4.v3.forwarded";
+/// Counter: file-state calls (open, close, lock records; A-36) served on this shard.
+const NFS4_STATE_LOCAL: &str = "nfs4.state.local";
+/// Counter: file-state calls that went to the file's owner shard and back.
+const NFS4_STATE_FORWARDED: &str = "nfs4.state.forwarded";
+
+/// Counts one `counter` on this shard; off a shard (no state) nothing is counted.
+fn note(counter: &'static str) {
+  let _ = state::with_state(|s| *s.refusals.entry(counter).or_insert(0) += 1);
 }
 
 /// The v4 front end's backend in the daemon: each v3 call it makes presents the capability of the
@@ -1232,6 +1250,11 @@ impl compound::Backend for RoutedBackend {
     let (this, xid, port) = (self.this, self.xid, self.port);
     let requester = self.requester.clone();
     async move {
+      note(if route(NFS_PROGRAM, procedure, &args).is_some() {
+        NFS4_V3_FORWARDED
+      } else {
+        NFS4_V3_LOCAL
+      });
       let capability = presented_capability(NFS_PROGRAM, procedure, &mut args);
       let requester = requester.with_capability(capability);
       match serve_v3(this, xid, requester, NFS_PROGRAM, procedure, args, port).await {
@@ -1257,6 +1280,11 @@ impl compound::Backend for RoutedBackend {
       else {
         return status_word(Nfsstat4::BadStateid);
       };
+      note(if shard == this {
+        NFS4_STATE_LOCAL
+      } else {
+        NFS4_STATE_FORWARDED
+      });
       let Ok(call) = crate::xshard::call_on(this, shard, move || {
         Some(serve_file_state_here(procedure, &args))
       }) else {
@@ -1474,50 +1502,93 @@ async fn serve_connection(mut connection: Connection) {
   let this = registry::current_shard().unwrap_or(0);
   let mut chunk = [0u8; RECORD_CHUNK];
   loop {
-    let call = match connection.pending.take() {
-      Some(call) => Some(call),
-      None => match connection.records.read(&connection.buffer) {
-        Ok((body, consumed)) => {
-          connection
-            .buffer
-            .drain(..consumed.min(connection.buffer.len()));
-          body.map(|body| Call::parse(&body))
-        }
-        Err(_) => return,
-      },
+    let Some(batch) = serve_batch(this, &mut connection).await else {
+      return;
     };
-    match call {
-      Some(call) => {
-        if let Some(owner) = owner_elsewhere(&call) {
-          connection.pending = Some(call);
-          migrate(owner, connection);
-          return;
-        }
-        let reply = reply_to(this, call, connection.port).await;
-        if connection
-          .stream
-          .write_all(&write_record(&reply))
-          .await
-          .is_err()
-        {
-          return;
-        }
-        // A mount's call is client activity: the shard spins out its idle window after it, so the next
-        // call of a burst is read without a kernel wake (§4.7).
-        registry::with_current(|ctx| ctx.note_activity());
-        // A ready read/write does not yield. Bound a busy connection to one RPC per turn,
-        // so its successive durability barriers cannot starve the heartbeat (§4.3, D-18).
-        futures::yield_now().await;
+    if batch.answered > 0 {
+      if connection.stream.write_all(&batch.replies).await.is_err() {
+        return;
       }
-      None => match connection.stream.read(&mut chunk).await {
-        Ok(0) | Err(_) => return,
-        Ok(count) => connection
-          .buffer
-          .extend_from_slice(chunk.get(..count).unwrap_or_default()),
-      },
+      if batch.answered > 1 {
+        let _ = state::with_state(|s| {
+          *s.refusals.entry(NFS_REPLIES_BATCHED).or_insert(0) += batch.answered;
+        });
+      }
+      // A mount's call is client activity: the shard spins out its idle window after it, so the next call of a
+      // burst is read without a kernel wake (§4.7).
+      registry::with_current(|ctx| ctx.note_activity());
+    }
+    if let Some(owner) = batch.moving {
+      migrate(owner, connection);
+      return;
+    }
+    if batch.answered > 0 {
+      // A ready read/write does not yield: bound a busy connection to one batch per turn.
+      futures::yield_now().await;
+      continue;
+    }
+    match connection.stream.read(&mut chunk).await {
+      Ok(0) | Err(_) => return,
+      Ok(count) => connection
+        .buffer
+        .extend_from_slice(chunk.get(..count).unwrap_or_default()),
     }
   }
 }
+
+/// One turn's calls on a connection: the replies built, how many, and the owner shard the connection must move to
+/// before its next call (the call is kept as the connection's pending one).
+struct Batch {
+  replies: Vec<u8>,
+  answered: u64,
+  moving: Option<u16>,
+}
+
+/// Serves every complete call already buffered on `connection`, in one turn bounded by the shard's step quantum so a
+/// long pipeline still yields to the heartbeat (§4.3, D-18); the replies are gathered for one write (A-74). One
+/// reply and a yield per call queued each pipelined call behind every earlier one's write and turn. `None` when the
+/// buffered bytes are not a valid record stream (the connection ends).
+async fn serve_batch(this: u16, connection: &mut Connection) -> Option<Batch> {
+  let started = futures::now_ns();
+  let quantum = futures::step_budget_ns().unwrap_or(0);
+  let mut batch = Batch {
+    replies: Vec::new(),
+    answered: 0,
+    moving: None,
+  };
+  while let Some(call) = next_call(connection)? {
+    if let Some(owner) = owner_elsewhere(&call) {
+      // The replies already built leave first, so the moved connection answers in request order.
+      connection.pending = Some(call);
+      batch.moving = Some(owner);
+      break;
+    }
+    batch
+      .replies
+      .extend_from_slice(&write_record(&reply_to(this, call, connection.port).await));
+    batch.answered = batch.answered.saturating_add(1);
+    if futures::now_ns().saturating_sub(started) >= quantum {
+      break;
+    }
+  }
+  Some(batch)
+}
+
+/// The connection's next call: the pending one, else the next complete record in its buffer; `Some(None)` when no
+/// complete record is buffered, `None` when the bytes are not a valid record stream.
+fn next_call(connection: &mut Connection) -> Option<Option<Call>> {
+  if let Some(call) = connection.pending.take() {
+    return Some(Some(call));
+  }
+  let (body, consumed) = connection.records.read(&connection.buffer).ok()?;
+  connection
+    .buffer
+    .drain(..consumed.min(connection.buffer.len()));
+  Some(body.map(|body| Call::parse(&body)))
+}
+
+/// Counter: replies that left in a write carrying more than one (§4.14): the batched serve's non-vacuity count.
+const NFS_REPLIES_BATCHED: &str = "nfs.replies.batched";
 
 /// The shard a call should be served on when it is not this one: an NFSv3 call naming a volume another shard
 /// owns. A `MOUNT` call, an NFSv4 call (its session state is this shard's) and a host-root listing stay here, as

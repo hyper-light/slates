@@ -1659,3 +1659,26 @@ After A-72 (trie removal frees the nodes it empties; the op log's ring capped at
 85.7 MB at round 3, 86.0 MB at round 12, 86.3 MB at round 24 (+0.66 MB, against +2.1 MB after A-71 alone and
 +38.0 MB before either).
 
+### A Go build in a Docker container over NFSv4.2: where the time goes (A-74, A-75; 2026-10-04)
+
+**Command:** `bash e2e-docker-go-ctr.sh` (scratch, with this record's session): one anchor with `--shards 4`, a 4 GiB
+volume as a Docker `type=nfs` volume (NFSv4.2 from Docker Desktop's VM). In `golang:1.26`: `cp -a /usr/local/go`
+(217 MB, about 12,800 files), `go build -a net/http`, then `go build net/http` again (cached). Client-side per-op
+numbers are from `/proc/self/mountstats` (queue and RTT per call); server-side numbers are the daemon's `nfs.*`
+signals. Apple M5 Max, load average 58–81 from other sessions.
+
+| | 4 slots (before A-75) | 32 slots (A-75) | host-directory bind | container overlay |
+|---|---|---|---|---|
+| `cp -a` | 24.6–28.8 s | 23.1–23.6 s (56.2 s in one run at peak load) | 9.0 s | 0.28 s |
+| `go build -a net/http` | 6.4–7.8 s | 5.8–6.1 s | 6.4 s | 3.3 s |
+| cached rebuild | 0.78–1.10 s | 0.57–0.64 s | 0.23 s | 0.05 s |
+| reopen: client queue | 1.05 ms | 0.08–0.13 ms | | |
+| reopen: RTT | 0.44 ms | 0.78–0.88 ms | | |
+
+- **Serve:** the daemon serves a call at a 2–3 µs median (p99 74–147 µs) and almost never finds two calls waiting
+  on the connection (4 of 135,609 replies shared a write at 32 slots). So the remaining RTT is in transit, Docker
+  Desktop's VM-to-host path (a plain TCP ping-pong over it: p50 132 µs, p90 1.84 ms, p99 4.0 ms at load 81).
+- **One call in flight** (`go build -p 1`, `GOMAXPROCS=1`): reopen 0.18 ms, READ 0.17 ms, CLOSE 0.06 ms.
+- **Correction:** an earlier reading of this run printed the queue column as RTT. The table above reads them
+  correctly.
+

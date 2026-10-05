@@ -4787,7 +4787,7 @@ for replay; trace/span identity connects work across bridges, rings, shards and 
 `caused_by` connects causal events. Consumer and volume are authenticated tags, not substitutes
 for trace context. Status exposes these definitions consistently through CLI/MCP.
 
-*Health signal catalog.* Every signal is `(value, freshness_ns)` and host-observed where a host can observe it: `daemon.alive` (the anchor's view: the child is running and answered its last heartbeat), `daemon.restarts` (the anchor's count), `segment.generation` (the anchor segment's generation word), `shard.loop_lag_ns{shard}` (the driver's measured lateness), `shard.tasks{shard}` (live tasks against the arena), `ring.depth{client}` (command slots pending), `client.parked{client}`, `memory.locked_bytes` and `memory.unlocked_bytes` (per shard and rolled up), `memory.pressure` (PSI slope, macOS level, Windows notification), `catalog.volumes{shard}`, `log.bytes{partition}` and `log.replay_ns` (the last replay's duration against the recovery budget), `lease.expiring` (leases within one term of expiry), `base.watcher{volume}` (live, overflowed, unavailable), `land.active` (landings in flight), `placed.pending` (records awaiting f+1), `mirror_age{volume}`, `config.version`.
+*Health signal catalog.* Every signal is `(value, freshness_ns)` and host-observed where a host can observe it: `daemon.alive` (the anchor's view: the child is running and answered its last heartbeat), `daemon.restarts` (the anchor's count), `segment.generation` (the anchor segment's generation word), `shard.loop_lag_ns{shard}` (the driver's measured lateness), `shard.tasks{shard}` (live tasks against the arena), `ring.depth{client}` (command slots pending), `client.parked{client}`, `memory.locked_bytes` and `memory.unlocked_bytes` (per shard and rolled up), `memory.pressure` (PSI slope, macOS level, Windows notification), `catalog.volumes{shard}`, `log.bytes{partition}` and `log.replay_ns` (the last replay's duration against the recovery budget), `lease.expiring` (leases within one term of expiry), `base.watcher{volume}` (live, overflowed, unavailable), `land.active` (landings in flight), `placed.pending` (records awaiting f+1), `mirror_age{volume}`, `config.version`, and the NFS service times a shard measured since boot, `nfs.local_p50_ns`, `nfs.local_p99_ns`, `nfs.local_off_cpu_p99_ns` and `nfs.forwarded_p99_ns` (so a slow client is split into the serve, the scheduler's share of it, and the cross-shard forward).
 
 *Metric names.* One namespace, dotted, unit-suffixed, labels in braces; counters end in `_total`, histograms in `_ns` or `_bytes`. Per host: `slates.requests_total{kind,outcome}`, `slates.refusals_total{kind}`, `slates.provision_ns` (the AC-2.1 histogram: p50, p99, p999, max, spinning and parked), `slates.ring_wait_ns{client}`, `slates.wake_ns`, `slates.spin_to_park_ratio`. Per shard: `slates.shard.step_ns`, `slates.shard.batch`, `slates.shard.parks_total`, `slates.shard.kicks_total`, `slates.shard.arena_exhausted_total`. Per volume (readable through `status`): `referenced_bytes`, `unique_bytes`, `locked_bytes`, `unlocked_bytes`, `hashing_backlog_bytes`, `dedup_hit_ratio`, `compression_ratio`, `lease_epoch`, `attachments`, `base_cache_hit_ratio`, `drifted_entries`, `watcher_state`; per green: `head_version`, `merges_per_s`, `verdict_p99_ns`, `merge_path_p99_ns`, `conflict_rate{source}`, `rebase_retry_rate`, `base_lag_p99_ns`, `stale_epoch_refusals_total`, `holder_mismatch_total`. Per landing (in the report and the audit log): `entries{outcome}`, `bytes_written`, `dir_sync_ns`, `window_ns_max`, `ramp_depth`. The machine profile and every derived constant are exported as `slates.derived{name}` with their inputs.
 
@@ -8707,4 +8707,39 @@ Status: built 2026-10-04.
   daemon serves no NFS.
 - Proven: the live mount test exports the mounted volume and requires the printed port to equal the one `nfsstat -m`
   reports for the kernel's mount, in both output forms.
+
+### A-74 — A connection's buffered calls are served in one turn and answered in one write (2026-10-04)
+Applied in the same change to: `crates/server/src/nfs.rs` (`serve_connection`, `nfs.replies.batched`), the four NFS
+service-time health signals (`HealthSignal::Nfs*`, §4.14 catalog), the `nfs4.*` forwarding counters,
+`crates/server/tests/nfs_hostile.rs`, BENCHMARKS, GAPS.
+Status: built 2026-10-04.
+- Why: the loop answered one call, wrote its reply and yielded before reading the next, so a pipelined call waited
+  behind every earlier call's write and turn.
+- What: every complete call already buffered is served in one turn, bounded by the shard's step quantum so the
+  heartbeat still runs (§4.3, D-18). The replies leave in one write. A call that moves the connection to its owner
+  shard first flushes the replies already built, so replies stay in request order.
+- Measured: the Docker Go build barely batched (1,629 of 133,634 replies before A-75, 4 of 135,609 after). Requests
+  reach the daemon one at a time, so the gain there is small (OPEN of an existing file 1.11–1.41 → 0.95 ms). It
+  matters for clients that pipeline over a direct path.
+- Proven: `pipelined_calls_are_answered_in_order_and_their_replies_share_writes` (failed first: no batched reply).
+- Signals: `nfs.local_p50_ns`, `nfs.local_p99_ns`, `nfs.local_off_cpu_p99_ns` and `nfs.forwarded_p99_ns` (since
+  boot; absent means unknown). They showed the serve at a 2–3 µs median while the client saw about 1 ms, which is
+  what located the cost outside the serve.
+
+### A-75 — An NFSv4.1 session is granted one client's in-flight bound in slots (2026-10-04)
+Applied in the same change to: `crates/server/src/config.rs` (`nfs_v4_caps`), `crates/server/tests/nfs_mount.rs`,
+BENCHMARKS, GAPS.
+Status: built 2026-10-04.
+- Why: the session's slot count (`ca_maxrequests`, RFC 8881 §2.10.6) was derived as the shard count: 4 here, 2 on a
+  two-shard daemon. A parallel Go build in a Docker container queued in the Linux client waiting for a slot: 1.05 ms
+  per reopen of an existing file, against 0.44 ms on the wire (`/proc/self/mountstats`, fields queue and rtt). Chen
+  et al. (SIGMETRICS '15, Fig. 11) measured the same slot wait in Linux's own server.
+- What: the grant is `slots_per_ring`, the daemon's Little's-law bound on one client's requests in flight (the bound a
+  ring client gets), capped by what the client asks. The client-table bound already divides by the slot count, so it
+  rescales.
+- Measured: queue per reopen 1.05 → 0.08–0.13 ms; `go build -a net/http` 6.4–7.8 → 5.8–6.1 s; cached rebuild
+  0.78–1.10 → 0.57–0.64 s.
+- Owed: a remote client over a long round trip wants more slots than Little's law on service time gives. RFC 8881
+  §2.10.6.1's dynamic slot target (`sr_target_highest_slotid`) is the standard answer.
+- Proven: `a_session_is_granted_one_clients_in_flight_bound_and_can_use_it` (failed first: 2 slots granted).
 

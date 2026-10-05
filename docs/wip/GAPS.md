@@ -3513,3 +3513,21 @@ shard's own clock that A-65 budgets in (docs/bugs/2026-10-04-the-slow-observatio
   24 now grow the daemon +0.66 MB, consistent with the 512 MiB volume's op log still filling toward its charged
   5.4 MB.
 
+### 2026-10-04: NFSv4 under a parallel build (A-74, A-75)
+
+- **Done:** session slots from one client's in-flight bound (A-75); buffered calls served and answered together
+  (A-74); NFS service-time signals and `nfs4.*` forwarding counters.
+- **Fixed on the way:** `delivery::take` compared a named descriptor's times before its kind, and `/dev/null`'s
+  times move with any process's write (sampled: every 0.2 s), so the test read a device as `NotInherited` at
+  random on a busy machine. The object (device, inode) is now compared first, then the kind, and the times only
+  for a pipe or socket.
+- **Next, Ada's "do all" (2026-10-04), in order:**
+  - (A) run a compound where its volume lives: native v4 operations, the session's state placed on the volume's
+    shard, the connection moved there;
+  - (B) read and write delegations, with the session back channel and recalls from every other mutation path
+    (RFC 8881 §10.2–10.4, §20);
+  - (C) directory delegations (§10.9).
+  Docker Desktop's transit dominates per call on macOS, so B (fewer round trips) is the larger lever there; A
+  removes two thread wakes per v3 call whenever the volume is not on the listener's shard.
+- **Owed:** the dynamic slot target (RFC 8881 §2.10.6.1) for long-round-trip clients.
+

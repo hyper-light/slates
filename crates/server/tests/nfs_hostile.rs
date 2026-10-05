@@ -449,3 +449,53 @@ fn every_single_bit_flip_of_a_handle_outside_its_counter_is_refused() {
 /// Format: a v1 handle's length in bits (`crates/bridge-nfs/src/handle.rs`: version, volume, inode, generation,
 /// attachment, token = 1 + 16 + 8 + 8 + 8 + 16 bytes).
 const VICTIM_HANDLE_BITS: usize = 57 * 8;
+
+/// Shape: READs a client pipelines in one write, as a parallel build keeps many in flight on its one connection.
+const PIPELINED: u32 = 64;
+
+/// §4.6 (A-74): do pipeline [`PIPELINED`] READs of one file in a single write on one connection (the volume on the
+/// other shard, so the connection moves first), with a spinner per core; expect every reply, in request order, each
+/// carrying the file's bytes, and replies sent several to a write (`nfs.replies.batched` moved). One reply and a
+/// yield per call queued every pipelined call behind all the earlier ones' writes and yields: a parallel Go build
+/// saw 1.1–1.4 ms per OPEN where one call in flight saw 0.18 ms, against a 3 µs median serve (2026-10-04).
+#[test]
+fn pipelined_calls_are_answered_in_order_and_their_replies_share_writes() {
+  let (daemon, instance) = two_shard_daemon("pipeline");
+  let name = provision_remote_volume(&instance);
+  let export = daemon.mount_capability(&name).unwrap().unwrap();
+  let port = daemon.nfs_port().unwrap();
+  let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+  let root = mount(&mut stream, &export, 1);
+  let victim = create(&mut stream, &root, "victim", 2);
+  write(&mut stream, &victim, VICTIM_BYTES, 3);
+  let cores = std::thread::available_parallelism().map_or(1, usize::from);
+  let stop = AtomicBool::new(false);
+  let mut replies = Vec::new();
+  std::thread::scope(|scope| {
+    for _ in 0..cores {
+      scope.spawn(|| spin(&stop));
+    }
+    let mut burst = Vec::new();
+    for at in 0..PIPELINED {
+      burst.extend_from_slice(&record(NFSPROC3_READ, &read_args(&victim), 100 + at));
+    }
+    stream.write_all(&burst).unwrap();
+    for _ in 0..PIPELINED {
+      let reply = reply_record(&mut stream).expect("the daemon answers every pipelined call");
+      replies.push(reply);
+    }
+    stop.store(true, Ordering::Relaxed);
+  });
+  for (at, reply) in replies.iter().enumerate() {
+    assert_eq!(
+      word(reply, 0),
+      Some(100 + u32::try_from(at).unwrap()),
+      "reply {at} answers call {at}"
+    );
+  }
+  let refusals = daemon.refusals_on_every_shard().unwrap();
+  let batched = refusals.get("nfs.replies.batched").copied().unwrap_or(0);
+  drop(stream);
+  drop(daemon);
+  assert!(batched > 0, "pipelined replies shared writes: {refusals:?}");
+}
