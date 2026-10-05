@@ -403,31 +403,10 @@ pub fn pair_key(
   open(root, &record)
 }
 
-/// Format: the bit that marks a tenant id hashed from a principal with no numeric account (a SID, a certificate), so it
-/// never names the same tenant as a uid.
-const HASHED_TENANT: u64 = 1 << 63;
-
-/// The tenant a volume owned by `principal` seals under (A-9: the host account): a uid, or a consumer's host account;
-/// a SID or a certificate by a namespaced hash of its identity, marked [`HASHED_TENANT`].
+/// The tenant a volume owned by `principal` seals under (A-9: the host account): the database's own rule
+/// ([`slates_db::catalog::Principal::tenant`]), which a volume's destroy also reads to erase a tenant's last key.
 pub fn tenant_of(principal: &slates_db::catalog::Principal) -> u64 {
-  use slates_db::catalog::Principal;
-  let hashed = |kind: &[u8], identity: &[u8]| {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"slates tenant v1");
-    hasher.update(kind);
-    hasher.update(identity);
-    let mut word = [0u8; size_of::<u64>()];
-    if let Some(head) = hasher.finalize().as_bytes().get(..size_of::<u64>()) {
-      word.copy_from_slice(head);
-    }
-    u64::from_le_bytes(word) | HASHED_TENANT
-  };
-  match principal {
-    Principal::Uid { uid } => u64::from(*uid),
-    Principal::Consumer { account, .. } => u64::from(*account),
-    Principal::Sid { sid } => hashed(b"sid", sid.as_bytes()),
-    Principal::Certificate { hash } => hashed(b"certificate", hash),
-  }
+  principal.tenant()
 }
 
 /// The lineage key of `volume` as recorded, unwrapped read-only (no key is made): the tenant's record under the root,

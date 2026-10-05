@@ -1341,3 +1341,60 @@ fn a_trimmed_ring_rewinds_so_a_long_run_touches_one_interval() {
     "a crash mid-rewind recovers the snapshot"
   );
 }
+
+/// A tenant's key record as the partition holds it, if any.
+fn tenant_key(db: &Db, account: u64) -> bool {
+  db.partition()
+    .seal_key(&slates_db::catalog::SealKeyOwner::Tenant { account })
+    .is_some()
+}
+
+/// A-92 (seal.md §3.1, cryptographic erase): do give one tenant two volumes and another tenant one, record both
+/// tenants' keys, then destroy the first tenant's volumes one at a time, and recover the database. Expect the first
+/// tenant's key to stay while it has a volume on the partition and to be gone in the same record as its last volume's
+/// destroy, the other tenant's key untouched, and the recovered database to agree. A tenant key wraps only its
+/// volumes' lineage keys, so with its last volume it guards nothing, and slates has no account of its own to remove:
+/// the key's life is its volumes'.
+#[test]
+fn a_tenants_key_is_erased_with_its_last_volume_on_the_partition() {
+  let mut segment = segment("slates-db-tenant-erase", LOG_BYTES);
+  let mut db = open(&mut segment);
+  let (first, other) = (principal(0), principal(1));
+  let (first_account, other_account) = (1000u64, 1001u64);
+  for (n, owner) in [(1, &first), (2, &first), (3, &other)] {
+    let record = VolumeRecord {
+      owner: owner.clone(),
+      ..volume(n, &format!("v{n}"))
+    };
+    db.mutate(&mut segment, &Op::VolumeCreated { record }, 0)
+      .unwrap();
+  }
+  for account in [first_account, other_account] {
+    let record = slates_db::catalog::SealKeyRecord {
+      owner: slates_db::catalog::SealKeyOwner::Tenant { account },
+      id: [1; 16],
+      record: vec![2; slates_db::catalog::SEAL_KEY_RECORD_BYTES],
+    };
+    db.mutate(&mut segment, &Op::SealKeySet { record }, 0)
+      .unwrap();
+  }
+  db.mutate(&mut segment, &Op::VolumeDestroyed { id: vid(1) }, 0)
+    .unwrap();
+  assert!(
+    tenant_key(&db, first_account),
+    "the tenant still has a volume here"
+  );
+  db.mutate(&mut segment, &Op::VolumeDestroyed { id: vid(2) }, 0)
+    .unwrap();
+  assert!(
+    !tenant_key(&db, first_account),
+    "erased with the tenant's last volume"
+  );
+  assert!(
+    tenant_key(&db, other_account),
+    "another tenant's key is untouched"
+  );
+  drop(db);
+  let recovered = open(&mut segment);
+  assert!(!tenant_key(&recovered, first_account) && tenant_key(&recovered, other_account));
+}

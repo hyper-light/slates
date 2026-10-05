@@ -9199,8 +9199,13 @@ refused `Unwrap`; macOS and Linux) and the database's model test, whose generate
 records across crashes (non-vacuous: dropping the snapshot's key table fails it). A volume's destroy erases its lineage
 key in the same record (`Op::VolumeDestroyed`'s apply removes it, so a crash cannot part the two and replay agrees):
 `destroying_a_volume_erases_its_sealed_content` (a chunk sealed under a volume's key is refused `Unwrap` once the volume
-is destroyed; it opens without the erase, so the test is non-vacuous). Owed: a tenant's records when its account is
-removed.
+is destroyed; it opens without the erase, so the test is non-vacuous). A tenant's key goes in the record that destroys
+its last volume on the partition (2026-10-05): it wraps only its volumes' lineage keys, so it guards nothing after, and
+slates has no account of its own to remove (an account is the host's), so the key's life is its volumes'. The tenant
+rule (`Principal::tenant`) moved beside the records so the apply can read it, and the check scans the partition's
+volumes, bounded by its cap, once per destroy. Proven by `a_tenants_key_is_erased_with_its_last_volume_on_the_partition`
+(the key stays while one of two volumes remains, goes with the second, another tenant's stays, and recovery agrees;
+red before the change), with the database's generated recovery histories replaying the new apply.
 Built (2026-10-05): piece 4a, the node's recipient. The control shard opens the node's ML-KEM-1024 recipient (hybrid
 with P-384) from its record in partition 0 under the root (`SealKeyOwner::Recipient`, hyper-seal's sealed recipient,
 at most `SEAL_RECIPIENT_RECORD_MAX` bytes), or makes and records it, so it lives exactly as long as the root.

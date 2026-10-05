@@ -51,7 +51,34 @@ pub enum Principal {
   },
 }
 
+/// Format: the bit that marks a tenant id hashed from a principal with no numeric account (a SID, a certificate), so it
+/// never names the same tenant as a uid.
+const HASHED_TENANT: u64 = 1 << 63;
+
 impl Principal {
+  /// The tenant a volume owned by this principal seals under (A-92; A-9: the host account): a uid, or a consumer's host
+  /// account; a SID or a certificate by a namespaced hash of its identity, marked with the top bit so it never names the
+  /// same tenant as a uid. Here, beside the records, so a volume's destroy can tell when its tenant has no volume left.
+  pub fn tenant(&self) -> u64 {
+    let hashed = |kind: &[u8], identity: &[u8]| {
+      let mut hasher = blake3::Hasher::new();
+      hasher.update(b"slates tenant v1");
+      hasher.update(kind);
+      hasher.update(identity);
+      let mut word = [0u8; size_of::<u64>()];
+      if let Some(head) = hasher.finalize().as_bytes().get(..size_of::<u64>()) {
+        word.copy_from_slice(head);
+      }
+      u64::from_le_bytes(word) | HASHED_TENANT
+    };
+    match self {
+      Principal::Uid { uid } => u64::from(*uid),
+      Principal::Consumer { account, .. } => u64::from(*account),
+      Principal::Sid { sid } => hashed(b"sid", sid.as_bytes()),
+      Principal::Certificate { hash } => hashed(b"certificate", hash),
+    }
+  }
+
   /// The index key: a kind byte then the identity bytes.
   pub fn key(&self) -> Vec<u8> {
     /// Format: the kind bytes of the principal key.

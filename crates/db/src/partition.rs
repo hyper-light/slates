@@ -890,6 +890,7 @@ impl Partition {
       Op::VolumeDestroyed { id } => {
         // The tombstone takes the volume's slot: its sequence is read before the record goes.
         let sequence = self.tombstone_sequence(*id);
+        let tenant = self.volume(*id).map(|volume| volume.owner.tenant());
         self.remove_volume(*id)?;
         if let Some(sequence) = sequence {
           self.tombstones.insert(*id, sequence);
@@ -900,6 +901,16 @@ impl Partition {
           .seal_keys
           .remove(&SealKeyOwner::Lineage { volume: *id });
         self.seal_keys.remove(&SealKeyOwner::Naming { volume: *id });
+        // A tenant key wraps only its volumes' lineage keys, so with the tenant's last volume on this partition it is
+        // erased too, in the same record. The scan is bounded by the partition's volume cap, once per destroy.
+        if let Some(account) = tenant
+          && !self
+            .volumes()
+            .iter()
+            .any(|volume| volume.owner.tenant() == account)
+        {
+          self.seal_keys.remove(&SealKeyOwner::Tenant { account });
+        }
         Ok(())
       }
       Op::TombstoneAdopted { tombstone } => {
