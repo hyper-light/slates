@@ -9563,3 +9563,55 @@ memory cap") and GAPS.
      - The last 77 MiB was the pressure hold counting the daemon's own growth as host pressure. With that fixed, one
        volume holds 338 MiB of the 358 MB pool (BENCHMARKS;
        `docs/bugs/2026-10-05-pressure-hold-counted-the-daemons-own-growth.md`).
+
+### A-99 — Idle content sealed in RAM (2026-10-05, designed)
+Status: designed 2026-10-05; not yet built. It realizes A-92's decision from piece 5's measurement: idle RAM is
+sealed under the volume's version key (condition 9, "encrypted at rest when not being modified or read").
+- What is at rest. `ChunkStore` (`crates/vfs/src/content.rs`) already separates the *open* extent, written in place
+  until a publication seals it, from *sealed* chunks, which are immutable (a write into one copies it into a new open
+  extent, D-6). The open extent is what is being modified; a sealed chunk is at rest. So a chunk's bytes are
+  encrypted at the seal transition and stay ciphertext in the arena. A read opens only the segments it touches into
+  the caller's buffer, and a copy-on-write opens the source into the new open extent. Plaintext exists only in open
+  extents and in a reader's buffer.
+- One chokepoint. Every content read goes through `ChunkStore::extent_bytes` (10 call sites: `volume.rs` 6,
+  `base.rs` 2, `content.rs` 2), which today lends a plaintext slice of the arena. It becomes
+  `read_extent(extent, offset, out)`, which opens into `out`. The cluster's held replicas are envelopes already
+  (A-92 piece 3b), ciphertext under the lineage key; they are not touched.
+- Segments: the granule, 4 KiB, with an AES-256-GCM tag of 16 bytes each (hyper-seal `VersionKey`, seal.md §4,
+  nonce `version ‖ index | LAST`). Measured (A-92 piece 5): a warm 4 KiB open p99 667 ns on macOS and 792 ns on
+  Linux, within the 1 µs budget. One tag per 64 KiB chunk was weighed and rejected: a 4 KiB read would open the whole
+  chunk, about 7 µs at 9 GB/s.
+- Tags: 16 bytes per 4 KiB of content, 0.39%, in a tag slab beside the chunk slab. It is bounded as the chunk slab is,
+  one tag per granule of the shard's capacity. A chunk record names its first tag. Tags are in the recovery image,
+  since the ciphertext survives a daemon restart in the anchor, so its tags must too (`IMAGE_VERSION` moves).
+- Nonce uniqueness, the argument seal.md §4 requires before the version-keyed rule may be used:
+  - The key is not the lineage key itself. It is a *key epoch*: HKDF of the volume's lineage key and a 128-bit random
+    salt drawn at each daemon start, for each volume as it first seals. The salt is recorded in the image, so a later
+    daemon can open what this one sealed.
+  - The version is a per-shard counter held in memory for that daemon's life and incremented at every chunk seal. It
+    is never persisted, so no crash can make it repeat under the same key: a restarted daemon draws a new salt, hence
+    a new key, and starts its counter afresh.
+  - The segment index is the granule's place in the chunk, and a sealed chunk is never resealed (it is immutable), so
+    (key, version, index) is used once.
+  - A chunk records its epoch (an index into the image's salt table) and its version. The salt table is bounded by
+    the epochs whose chunks are still referenced; an epoch with none is dropped at a checkpoint.
+  - Restore and takeover re-seal what they materialize under the materializing daemon's own epoch, so a version never
+    crosses daemons.
+  - A random 128-bit salt colliding across daemon lives is the only way a (key, nonce) could repeat:
+    2^-128 per pair of lives.
+- Keys never leave locked memory (A-92 piece 2): the lineage key is in hyper-seal's locked region, and the epoch key
+  is derived into it.
+- Threat model, as A-92 states it: a dump of the anchor's memory, or of its content object, reads nothing of a sealed
+  chunk without the volume's keys. Not defended: the running daemon, which holds the keys and opens on read, and a
+  root user of the host, who can read the daemon. A node with sealing `unavailable` (no locked key region) keeps
+  chunks in the clear, and status says so (`seal.state`).
+- Pieces, each tested by use:
+  1. `read_extent` replaces `extent_bytes` at every site, still plaintext: a refactor proven by the existing suites.
+  2. The tag slab, the per-chunk epoch and version, and their place in the image (`IMAGE_VERSION` 17): recovery
+     round-trips them.
+  3. Sealing at `ChunkStore::seal` and opening at `read_extent` and `reopen`, under a key the server hands the store
+     per volume. Tests: a chunk's arena bytes are not its plaintext; every read returns the plaintext; a bit flipped
+     in the arena is refused typed (a read fails `Integrity`, never wrong bytes); a restart opens what the last daemon
+     sealed.
+  4. Measured: the 4 KiB read p99 and a whole-file read throughput, sealed against unsealed, under load. The 1 µs
+     budget decides whether it lands.
