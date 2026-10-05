@@ -39,6 +39,7 @@ pub mod dns;
 pub mod doorbell;
 pub mod error;
 pub mod fleet;
+mod fs_verbs;
 #[cfg(target_os = "linux")]
 mod fuse;
 #[cfg(target_os = "linux")]

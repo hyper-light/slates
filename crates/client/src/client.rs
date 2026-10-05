@@ -2215,6 +2215,84 @@ impl Client {
     }
   }
 
+  /// Replaces a plain volume's file at `path` with `bytes` under the caller's write `attachment` (§4.12 `fs.write`):
+  /// created with `mode` when absent, else truncated and rewritten. Content too large for one request is staged on the
+  /// volume's owner first and written as one verb, so the file never holds part of it. The file's new size.
+  pub fn fs_write(
+    &mut self,
+    (volume, attachment): (VolumeId, u64),
+    path: &str,
+    bytes: &[u8],
+    mode: u32,
+  ) -> Result<u64, ClientError> {
+    let request = RequestBody::FsWrite {
+      volume,
+      attachment,
+      path: path.to_owned(),
+      bytes: bytes.to_vec(),
+      mode,
+    };
+    let reply = if slates_ipc::protocol::fits(self.end.region(), &request) {
+      self.call(&request)?
+    } else {
+      let token = self.stage(volume, bytes)?;
+      self.call(&RequestBody::FsWriteStaged {
+        volume,
+        attachment,
+        path: path.to_owned(),
+        token,
+        mode,
+      })?
+    };
+    fs_done(reply, "fs write")
+  }
+
+  /// Removes the file, symbolic link or empty directory at `path` (§4.12 `fs.remove`).
+  pub fn fs_remove(
+    &mut self,
+    (volume, attachment): (VolumeId, u64),
+    path: &str,
+  ) -> Result<(), ClientError> {
+    let reply = self.call(&RequestBody::FsRemove {
+      volume,
+      attachment,
+      path: path.to_owned(),
+    })?;
+    fs_done(reply, "fs remove").map(|_| ())
+  }
+
+  /// Renames `from` to `to`, replacing what `to` names (§4.12 `fs.move`). The moved object's size.
+  pub fn fs_rename(
+    &mut self,
+    (volume, attachment): (VolumeId, u64),
+    from: &str,
+    to: &str,
+  ) -> Result<u64, ClientError> {
+    let reply = self.call(&RequestBody::FsRename {
+      volume,
+      attachment,
+      from: from.to_owned(),
+      to: to.to_owned(),
+    })?;
+    fs_done(reply, "fs rename")
+  }
+
+  /// Makes the directory `path` with `mode` (§4.12 `fs.mkdir`).
+  pub fn fs_mkdir(
+    &mut self,
+    (volume, attachment): (VolumeId, u64),
+    path: &str,
+    mode: u32,
+  ) -> Result<(), ClientError> {
+    let reply = self.call(&RequestBody::FsMkdir {
+      volume,
+      attachment,
+      path: path.to_owned(),
+      mode,
+    })?;
+    fs_done(reply, "fs mkdir").map(|_| ())
+  }
+
   /// Declares a namespace or metadata operation on a work volume (§4.16): the counterpart to `edit`'s
   /// content splice — an unlink, rename, directory, mode, symlink, hard link or extended attribute.
   pub fn declare(&mut self, work: VolumeId, op: WorkOp) -> Result<(), ClientError> {
@@ -2715,5 +2793,13 @@ impl Client {
       ReplyBody::Pinned { entries } => Ok(entries),
       _ => Err(ClientError::UnexpectedReply { verb: "pin" }),
     }
+  }
+}
+
+/// A file verb's reply: the changed object's size, or the unexpected reply named by `verb`.
+fn fs_done(reply: ReplyBody, verb: &'static str) -> Result<u64, ClientError> {
+  match reply {
+    ReplyBody::FsDone { size } => Ok(size),
+    _ => Err(ClientError::UnexpectedReply { verb }),
   }
 }

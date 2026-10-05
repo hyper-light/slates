@@ -9455,3 +9455,32 @@ Status: built 2026-10-05 (conditions 2, 5 and 12).
   merge failed it at once. `records_since_any_sequence_are_the_retained_ones_after_it` holds the indexed start to the
   filter. Suites: vfs 214, bridge-core 67, bridge-fuse 82, db 101, server recovery 16 and daemon 19, and Linux's FUSE
   CLI tests including the daemon killed under a live mount.
+
+### A-97 — The typed channel changes a plain volume's files (2026-10-05)
+Applied in the same change to: `crates/server/src/fs_verbs.rs` (new), `crates/server/src/verbs.rs` (dispatch,
+routing, republication, staging for plain volumes), `crates/ipc/src/protocol.rs` (`FsWrite`, `FsWriteStaged`,
+`FsRemove`, `FsRename`, `FsMkdir`, `FsDone`), `crates/client/src/client.rs` (`fs_write`, `fs_remove`, `fs_rename`,
+`fs_mkdir`), `crates/mcp/src/lib.rs` (`slates.fs.write`, `.remove`, `.move`, `.mkdir`),
+`crates/bridge-core/src/access.rs` (the POSIX rules, moved from `slates-bridge-nfs`, which re-exports them),
+`skills/working-in-slates-volumes/SKILL.md`, GAPS.
+Status: built 2026-10-05 (condition 13, §4.12 `slates.fs`).
+- What: an agent without a mount writes, removes, renames and makes directories in a plain volume through MCP or the
+  SDK. Each verb names the caller's own write attachment of the volume, as a mount's requests ride the mount's.
+  The attachment must be the caller's, of this volume, for writing, and not a snapshot's. Its requests are admitted
+  in the shard's attachment registry like a mount's, so a barrier sees them, and served by `VolumeBridge`, the layer
+  every mount uses. So the overlay rules, copy-on-write, the recall gate in front of a delegation (A-79), the op log a
+  mounted client's cache follows, and a scoped attachment's subtree all apply. The verb is recorded, and the shard
+  republishes before answering. A write replaces a file's whole content; content past one request is staged on the
+  owner (`StageBegin`/`StagePut`, now for a plain volume the caller may write too) and written by one verb.
+- Every OS: the verbs run on the daemon over the shared bridge, so Windows, which serves no NFS, has them as macOS and
+  Linux do. An MCP server writing through the daemon's loopback NFS export was weighed and rejected for that reason.
+- Authority: the attachment's rights (§4.13), as the typed channel's reads of a plain volume already are. POSIX mode
+  bits stay the rule between a mount's users, applied by the mount's transport. The POSIX rules moved to
+  `slates-bridge-core` so every transport and OS can apply one set.
+- Proven: `assert_files_change_through_mcp` over a live daemon checks the round trip and refusals:
+  - mkdir, write and read back, a shorter rewrite (it truncates), a 300 KiB write (staged), a move, then removing the
+    file and the emptied directory;
+  - each refused typed with nothing changed: a `..` path, a missing directory, a write over a directory, a read-only
+    attachment, another volume's attachment, and a mode past the permission bits.
+  The staging change was red against the merge loop first (a work has no store slot; the catalog record is looked
+  up instead). Suites: mcp 12, client 16, daemon 19, bridge-core 76, bridge-nfs 153.

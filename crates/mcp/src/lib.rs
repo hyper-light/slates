@@ -263,6 +263,10 @@ impl McpServer {
       "slates.merge.advance" => self.advance(&args),
       "slates.fs.read" => self.read(&args),
       "slates.fs.list" => self.list(&args),
+      "slates.fs.write" => self.fs_write(&args),
+      "slates.fs.remove" => self.fs_remove(&args),
+      "slates.fs.move" => self.fs_move(&args),
+      "slates.fs.mkdir" => self.fs_mkdir(&args),
       "slates.query" => self.query(&args),
       "slates.volume.create" => self.create_volume(&args),
       "slates.volume.list" => self.list_volumes(),
@@ -401,6 +405,41 @@ impl McpServer {
       "len": bytes.len(),
       "text": String::from_utf8_lossy(&bytes),
     }))
+  }
+
+  fn fs_write(&mut self, args: &Value) -> Result<Value, McpError> {
+    let target = (volume_arg(args, "volume")?, u64_arg(args, "attachment")?);
+    let path = string_arg(args, "path")?;
+    let text = string_arg(args, "text")?;
+    let mode = mode_arg(args, FILE_MODE)?;
+    let size = self
+      .client
+      .fs_write(target, &path, text.as_bytes(), mode)
+      .map_err(refusal)?;
+    Ok(json!({ "path": path, "size": size }))
+  }
+
+  fn fs_remove(&mut self, args: &Value) -> Result<Value, McpError> {
+    let target = (volume_arg(args, "volume")?, u64_arg(args, "attachment")?);
+    let path = string_arg(args, "path")?;
+    self.client.fs_remove(target, &path).map_err(refusal)?;
+    Ok(json!({ "path": path, "removed": true }))
+  }
+
+  fn fs_move(&mut self, args: &Value) -> Result<Value, McpError> {
+    let target = (volume_arg(args, "volume")?, u64_arg(args, "attachment")?);
+    let from = string_arg(args, "from")?;
+    let to = string_arg(args, "to")?;
+    let size = self.client.fs_rename(target, &from, &to).map_err(refusal)?;
+    Ok(json!({ "from": from, "to": to, "size": size }))
+  }
+
+  fn fs_mkdir(&mut self, args: &Value) -> Result<Value, McpError> {
+    let target = (volume_arg(args, "volume")?, u64_arg(args, "attachment")?);
+    let path = string_arg(args, "path")?;
+    let mode = mode_arg(args, DIR_MODE)?;
+    self.client.fs_mkdir(target, &path, mode).map_err(refusal)?;
+    Ok(json!({ "path": path, "made": true }))
   }
 
   fn list(&mut self, args: &Value) -> Result<Value, McpError> {
@@ -881,6 +920,32 @@ fn tool_list() -> Vec<Value> {
        the root.",
       json!({ "volume": string, "path": string, "version": integer, "attachment": integer }),
       json!(["volume"]),
+    ),
+    tool(
+      "slates.fs.write",
+      "Write a file in a plain volume under your write attachment (slates.attach.attach with write): the file's \
+       whole new content as `text`; created (with `mode`, by default rw-r--r--) when absent, its directory existing. The \
+       file's new size.",
+      json!({ "volume": string, "attachment": integer, "path": string, "text": string, "mode": integer }),
+      json!(["volume", "attachment", "path", "text"]),
+    ),
+    tool(
+      "slates.fs.remove",
+      "Remove a file, symbolic link or empty directory in a plain volume, under your write attachment.",
+      json!({ "volume": string, "attachment": integer, "path": string }),
+      json!(["volume", "attachment", "path"]),
+    ),
+    tool(
+      "slates.fs.move",
+      "Rename `from` to `to` in a plain volume under your write attachment, replacing what `to` names.",
+      json!({ "volume": string, "attachment": integer, "from": string, "to": string }),
+      json!(["volume", "attachment", "from", "to"]),
+    ),
+    tool(
+      "slates.fs.mkdir",
+      "Make a directory (with `mode`, by default rwxr-xr-x) in a plain volume under your write attachment.",
+      json!({ "volume": string, "attachment": integer, "path": string, "mode": integer }),
+      json!(["volume", "attachment", "path"]),
     ),
     tool(
       "slates.query",
@@ -1914,6 +1979,29 @@ fn view_arg(args: &Value) -> ReadAt {
     (Some(version), _) => ReadAt::Version { version },
     (None, Some(attachment)) => ReadAt::Attachment { attachment },
     (None, None) => ReadAt::Head,
+  }
+}
+
+/// Format: the permission bits `slates.fs.write` gives a file it creates when the call names none (a umask of 022's).
+const FILE_MODE: u32 = 0o644;
+/// Format: the permission bits `slates.fs.mkdir` gives a directory when the call names none (a umask of 022's).
+const DIR_MODE: u32 = 0o755;
+/// Format: the permission bits a mode argument may carry (the file type and set-id bits are not the caller's to set
+/// here).
+const MODE_BITS: u64 = 0o1777;
+
+/// The optional `mode` argument: `default` when absent; a value past the permission and sticky bits is a bad argument.
+fn mode_arg(args: &Value, default: u32) -> Result<u32, McpError> {
+  match args.get("mode") {
+    None | Some(Value::Null) => Ok(default),
+    Some(value) => value
+      .as_u64()
+      .filter(|mode| mode & !MODE_BITS == 0)
+      .and_then(|mode| u32::try_from(mode).ok())
+      .ok_or_else(|| McpError {
+        code: code::INVALID_PARAMS,
+        message: "mode: permission bits, at most 0o1777".to_owned(),
+      }),
   }
 }
 

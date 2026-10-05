@@ -3598,8 +3598,8 @@ shard's own clock that A-65 budgets in (docs/bugs/2026-10-04-the-slow-observatio
      the skills reach clients over MCP and as the raw tree in the repository;
   2. codemode: **done (A-86, `slates.query`)**; owed: a measured token comparison on a real agent task (query
      versus list-and-read);
-  3. `slates.fs` listing: **done (A-85, `slates.fs.list`)**; plain-volume write, move and delete over MCP are owed
-     (works already edit and declare);
+  3. `slates.fs`: listing **done (A-85)**; plain-volume write, mkdir, move and remove **done (A-97)**, on every OS,
+     under the caller's write attachment;
   4. `subscriptions/listen`;
   5. the official conformance suite, run in a container (no host install): **done (A-87)**: 103 checks pass on
      the 2026-07-28 requirements and every failure is classified (reference fixtures, the optional tasks extension,

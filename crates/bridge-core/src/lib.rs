@@ -15,6 +15,7 @@
 //! which each transport maps to its wire error (a Linux errno, an `nfsstat3`); the neutral layer
 //! never invents an errno, so no transport inherits another's numbering.
 
+pub mod access;
 pub mod appledouble;
 pub mod authority;
 pub mod scoped;

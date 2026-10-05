@@ -559,6 +559,66 @@ pub enum RequestBody {
     /// Where to continue: 0 to begin, else the `next` of the previous page.
     cursor: u64,
   },
+  /// Replace a plain volume's file at `path` with `bytes` (§4.12 `slates.fs.write`), under the caller's own write
+  /// attachment of the volume: the file is created with `mode` when absent (its directory must exist), else truncated
+  /// and rewritten, as one recorded verb. Appended.
+  FsWrite {
+    /// The volume (routes the verb to its owner).
+    volume: VolumeId,
+    /// The caller's write attachment of the volume.
+    attachment: u64,
+    /// The file.
+    path: String,
+    /// The file's whole new content.
+    bytes: Vec<u8>,
+    /// The permission bits a created file takes.
+    mode: u32,
+  },
+  /// `FsWrite` whose content is a full staging buffer (`StageBegin`, `StagePut`), for a file larger than one
+  /// request: one verb, so the file never holds half of it. Appended.
+  FsWriteStaged {
+    /// The volume.
+    volume: VolumeId,
+    /// The caller's write attachment of the volume.
+    attachment: u64,
+    /// The file.
+    path: String,
+    /// The staging buffer.
+    token: u64,
+    /// The permission bits a created file takes.
+    mode: u32,
+  },
+  /// Remove the file, symbolic link or empty directory at `path` (§4.12 `slates.fs.remove`). Appended.
+  FsRemove {
+    /// The volume.
+    volume: VolumeId,
+    /// The caller's write attachment of the volume.
+    attachment: u64,
+    /// The name removed.
+    path: String,
+  },
+  /// Rename `from` to `to`, replacing what `to` names as `rename(2)` does (§4.12 `slates.fs.move`). Appended.
+  FsRename {
+    /// The volume.
+    volume: VolumeId,
+    /// The caller's write attachment of the volume.
+    attachment: u64,
+    /// The source.
+    from: String,
+    /// The destination.
+    to: String,
+  },
+  /// Make a directory (§4.12 `slates.fs.mkdir`). Appended.
+  FsMkdir {
+    /// The volume.
+    volume: VolumeId,
+    /// The caller's write attachment of the volume.
+    attachment: u64,
+    /// The directory.
+    path: String,
+    /// Its permission bits.
+    mode: u32,
+  },
 }
 
 /// A concrete quorum-loss recovery proposal (§4.8). It identifies the retained copy and the
@@ -2452,6 +2512,11 @@ pub enum ReplyBody {
     entries: Vec<DirEntry>,
     /// The cursor that continues the listing, or `None` when this page ends it.
     next: Option<u64>,
+  },
+  /// A file verb (`FsWrite`, `FsWriteStaged`, `FsRemove`, `FsRename`, `FsMkdir`) changed the volume. Appended.
+  FsDone {
+    /// The changed object's size after the verb (a written file's length; 0 for a removal or a directory).
+    size: u64,
   },
 }
 

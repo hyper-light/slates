@@ -73,21 +73,8 @@ pub enum IoWant {
   Attributes,
 }
 
-/// What authorizes an I/O beyond the caller's identity.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum IoAuthority {
-  /// The object's mode, checked against the caller: an NFSv3 call, which carries no open (the owner
-  /// may write its own file whatever the bits say, standing in for the open the protocol cannot
-  /// show), or an NFSv4 special state id.
-  Mode,
-  /// An NFSv4 open whose access mode allows the I/O: it checked the caller's permission when it was
-  /// made, and a descriptor keeps its access whatever the mode becomes (POSIX).
-  Open,
-  /// A delegation's state id (§10.4): it stands for the whole client, whose local opens under it checked the opening
-  /// user's access for the open mode. Reads and writes of data pass, as under an open; a size change needs the caller's
-  /// write permission by the mode bits, since a local open checks nothing for `O_TRUNC` (pjdfstest `open/07.t`).
-  Delegation,
-}
+/// What authorizes an I/O beyond the caller's identity (the POSIX rules' own type, [`slates_bridge_core::access`]).
+pub use slates_bridge_core::access::IoAuthority;
 
 /// The key an open is found by from its file: the file first, so every open of one file is one range.
 type OpenKey = (Vec<u8>, u64, Vec<u8>);

@@ -496,6 +496,212 @@ fn assert_volume_lifecycle(server: &mut McpServer) {
   assert_status_exports_the_registries(&status);
 }
 
+/// Shape: a file larger than one request (a request rides one 4 KiB bulk chunk), so its write is staged first.
+const STAGED_FILE_BYTES: usize = 300 * 1024;
+
+/// §4.12 `slates.fs` (condition 13): do, over MCP under a write attachment of a plain volume, make a directory, write a
+/// file and read it back, rewrite it shorter, write a file past one request, move a file, and remove a file and the
+/// emptied directory; expect each read to give exactly what was last written (a rewrite truncates, the large file is
+/// whole), the moved file only at its new name, and the removed names gone. Then do the adversarial calls: a `..`
+/// path, a write into a directory that does not exist, a write over a directory, a write under a read-only
+/// attachment and under another volume's attachment, and a mode past the permission bits; expect each refused typed,
+/// with nothing changed.
+fn assert_files_change_through_mcp(server: &mut McpServer) {
+  let create = |server: &mut McpServer, name: &str| {
+    call(
+      server,
+      "slates.volume.create",
+      json!({ "name": name, "bounded": 8u64 << 20 }),
+    )["volume"]
+      .as_str()
+      .unwrap()
+      .to_owned()
+  };
+  let volume = create(server, "files");
+  let attach = |server: &mut McpServer, volume: &str, write: bool| {
+    call(
+      server,
+      "slates.attach.attach",
+      json!({ "volume": volume, "write": write }),
+    )["attachment"]
+      .as_u64()
+      .unwrap()
+  };
+  let writer = attach(server, &volume, true);
+  let at = |extra: Value| {
+    let mut args = json!({ "volume": volume, "attachment": writer });
+    if let (Some(args), Some(extra)) = (args.as_object_mut(), extra.as_object()) {
+      args.extend(extra.clone());
+    }
+    args
+  };
+  let read = |server: &mut McpServer, path: &str| {
+    call(
+      server,
+      "slates.fs.read",
+      json!({ "volume": volume, "path": path }),
+    )["text"]
+      .as_str()
+      .unwrap()
+      .to_owned()
+  };
+  call(server, "slates.fs.mkdir", at(json!({ "path": "src" })));
+  let program = "fn main() { println!(\"hi\"); }\n";
+  let written = call(
+    server,
+    "slates.fs.write",
+    at(json!({ "path": "src/main.rs", "text": program })),
+  );
+  assert_eq!(written["size"], program.len() as u64, "{written}");
+  assert_eq!(read(server, "src/main.rs"), program);
+  call(
+    server,
+    "slates.fs.write",
+    at(json!({ "path": "src/main.rs", "text": "fn main() {}\n" })),
+  );
+  assert_eq!(
+    read(server, "src/main.rs"),
+    "fn main() {}\n",
+    "a rewrite truncates"
+  );
+  let large: String = b"abcdefghijklmnopqrstuvwxyz"
+    .iter()
+    .cycle()
+    .take(STAGED_FILE_BYTES)
+    .map(|byte| char::from(*byte))
+    .collect();
+  let staged = call(
+    server,
+    "slates.fs.write",
+    at(json!({ "path": "big.txt", "text": large })),
+  );
+  assert_eq!(staged["size"], STAGED_FILE_BYTES as u64);
+  assert_eq!(read(server, "big.txt"), large, "the staged file is whole");
+  call(
+    server,
+    "slates.fs.move",
+    at(json!({ "from": "src/main.rs", "to": "src/lib.rs" })),
+  );
+  assert_eq!(read(server, "src/lib.rs"), "fn main() {}\n");
+  assert!(
+    call_refused(
+      server,
+      "slates.fs.read",
+      json!({ "volume": volume, "path": "src/main.rs" })
+    )
+    .contains("NotFound")
+  );
+  call(
+    server,
+    "slates.fs.remove",
+    at(json!({ "path": "src/lib.rs" })),
+  );
+  call(server, "slates.fs.remove", at(json!({ "path": "src" })));
+  let listed = call(server, "slates.fs.list", json!({ "volume": volume }));
+  let names: Vec<&str> = listed["entries"]
+    .as_array()
+    .unwrap()
+    .iter()
+    .filter_map(|entry| entry["name"].as_str())
+    .collect();
+  assert_eq!(names, ["big.txt"], "only the large file remains: {listed}");
+  refused_file_calls_change_nothing(server, (&volume, writer));
+}
+
+/// The adversarial half of [`assert_files_change_through_mcp`]: each refused call typed, and the volume unchanged.
+fn refused_file_calls_change_nothing(server: &mut McpServer, (volume, writer): (&str, u64)) {
+  let at = |extra: Value| {
+    let mut args = json!({ "volume": volume, "attachment": writer });
+    if let (Some(args), Some(extra)) = (args.as_object_mut(), extra.as_object()) {
+      args.extend(extra.clone());
+    }
+    args
+  };
+  let attach = |server: &mut McpServer, volume: &str, write: bool| {
+    call(
+      server,
+      "slates.attach.attach",
+      json!({ "volume": volume, "write": write }),
+    )["attachment"]
+      .as_u64()
+      .unwrap()
+  };
+  assert!(
+    !call_refused(
+      server,
+      "slates.fs.write",
+      at(json!({ "path": "../escape", "text": "x" }))
+    )
+    .is_empty()
+  );
+  assert!(
+    call_refused(
+      server,
+      "slates.fs.write",
+      at(json!({ "path": "no/such/dir.txt", "text": "x" }))
+    )
+    .contains("NotFound")
+  );
+  call(server, "slates.fs.mkdir", at(json!({ "path": "d" })));
+  assert!(
+    !call_refused(
+      server,
+      "slates.fs.write",
+      at(json!({ "path": "d", "text": "x" }))
+    )
+    .is_empty()
+  );
+  let reader = attach(server, volume, false);
+  assert!(
+    call_refused(
+      server,
+      "slates.fs.write",
+      json!({ "volume": volume, "attachment": reader, "path": "r.txt", "text": "x" })
+    )
+    .contains("Forbidden"),
+    "a read-only attachment writes nothing"
+  );
+  let other = call(
+    server,
+    "slates.volume.create",
+    json!({ "name": "files-other", "bounded": 1u64 << 20 }),
+  )["volume"]
+    .as_str()
+    .unwrap()
+    .to_owned();
+  let other_writer = attach(server, &other, true);
+  // Refused `Forbidden` when the other volume's record is on this volume's partition, `NotFound` when it is not.
+  let refusal = call_refused(
+    server,
+    "slates.fs.write",
+    json!({ "volume": volume, "attachment": other_writer, "path": "o.txt", "text": "x" }),
+  );
+  assert!(
+    refusal.contains("Forbidden") || refusal.contains("NotFound"),
+    "another volume's attachment writes nothing here: {refusal}"
+  );
+  let bad_mode = server
+    .handle(&json!({
+      "jsonrpc": "2.0", "id": 9, "method": "tools/call",
+      "params": { "name": "slates.fs.mkdir", "arguments": at(json!({ "path": "m", "mode": 0o100755 })) },
+    }))
+    .unwrap();
+  assert!(bad_mode.to_string().contains("mode"), "{bad_mode}");
+  let listed = call(server, "slates.fs.list", json!({ "volume": volume }));
+  let mut names: Vec<&str> = listed["entries"]
+    .as_array()
+    .unwrap()
+    .iter()
+    .filter_map(|entry| entry["name"].as_str())
+    .collect();
+  names.sort_unstable();
+  assert_eq!(
+    names,
+    ["big.txt", "d"],
+    "the refused calls changed nothing: {listed}"
+  );
+}
+
 /// `slates.status` — the same `daemon_json` the CLI's `status --json` prints — carries every shard's
 /// block with the health signals and the telemetry drain (§4.14; §4.12 parity: the JSON form is the
 /// text form's definition, not a subset). Expect: two shard blocks; a measured `catalog.volumes` as a
@@ -741,6 +947,7 @@ fn the_mcp_surface_serves_the_tools() {
   assert_codemode_answers_one_query(&mut server);
   assert_merge_loop(&mut server);
   assert_volume_lifecycle(&mut server);
+  assert_files_change_through_mcp(&mut server);
   assert_attach_base(&mut server);
   assert_land(&mut server);
   assert_malformed(&mut server);

@@ -57,6 +57,19 @@ volume to a container, the human first runs `slates mount <volume> <mount point>
 `oci_source` (that mount point) and `oci_destination` (the path inside the container), and give the returned
 `mounts` entry to the OCI runtime. Release with `slates.attach.detach`.
 
+## Write files without a mount
+
+With a write attachment (`slates.attach.attach` with `write: true`), change a plain volume's files directly; pass the
+`volume` and that `attachment` to each:
+
+- `slates.fs.write` with `path` and `text`: the file's whole new content. An absent file is created (its directory
+  must exist); a present one is replaced. Large files are fine: they are sent in pieces and written at once.
+- `slates.fs.mkdir` with `path`; `slates.fs.move` with `from` and `to`; `slates.fs.remove` with `path` (a file, a
+  link, or an empty directory).
+
+Paths are relative to the volume's root and may not use `..`. A refusal names why (`NotFound` for a missing
+directory, `Forbidden` for an attachment that is not yours or not for writing).
+
 ## Clean up
 
 `slates.volume.destroy` frees a volume's RAM at once. Snapshots and clones that still need its bytes keep them.

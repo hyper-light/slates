@@ -357,6 +357,11 @@ fn volume_of(body: &RequestBody) -> Option<VolumeId> {
     | RequestBody::StageBegin { work: volume, .. }
     | RequestBody::StagePut { work: volume, .. }
     | RequestBody::EditStaged { work: volume, .. }
+    | RequestBody::FsWrite { volume, .. }
+    | RequestBody::FsWriteStaged { volume, .. }
+    | RequestBody::FsRemove { volume, .. }
+    | RequestBody::FsRename { volume, .. }
+    | RequestBody::FsMkdir { volume, .. }
     | RequestBody::Land { volume, .. } => Some(*volume),
     // A green over a base is born on the base volume's owner shard, where the snapshot is walked.
     RequestBody::CreateGreen { base, .. } => base.map(|b| b.volume),
@@ -2302,6 +2307,11 @@ fn mutates_shard_image(body: &RequestBody) -> bool {
       | RequestBody::Share { .. }
       | RequestBody::Enroll { .. }
       | RequestBody::Revoke { .. }
+      | RequestBody::FsWrite { .. }
+      | RequestBody::FsWriteStaged { .. }
+      | RequestBody::FsRemove { .. }
+      | RequestBody::FsRename { .. }
+      | RequestBody::FsMkdir { .. }
   )
 }
 
@@ -2550,6 +2560,64 @@ fn dispatch_inner(
         filter: &filter,
         grant,
       },
+    ),
+    RequestBody::FsWrite {
+      volume,
+      attachment,
+      path,
+      bytes,
+      mode,
+    } => crate::fs_verbs::serve(
+      state,
+      principal,
+      (volume, attachment),
+      crate::fs_verbs::FsOp::Write {
+        path: &path,
+        bytes: &bytes,
+        mode,
+      },
+    ),
+    RequestBody::FsWriteStaged {
+      volume,
+      attachment,
+      path,
+      token,
+      mode,
+    } => fs_write_staged(state, principal, (volume, attachment), &path, token, mode),
+    RequestBody::FsRemove {
+      volume,
+      attachment,
+      path,
+    } => crate::fs_verbs::serve(
+      state,
+      principal,
+      (volume, attachment),
+      crate::fs_verbs::FsOp::Remove { path: &path },
+    ),
+    RequestBody::FsRename {
+      volume,
+      attachment,
+      from,
+      to,
+    } => crate::fs_verbs::serve(
+      state,
+      principal,
+      (volume, attachment),
+      crate::fs_verbs::FsOp::Rename {
+        from: &from,
+        to: &to,
+      },
+    ),
+    RequestBody::FsMkdir {
+      volume,
+      attachment,
+      path,
+      mode,
+    } => crate::fs_verbs::serve(
+      state,
+      principal,
+      (volume, attachment),
+      crate::fs_verbs::FsOp::Mkdir { path: &path, mode },
     ),
     RequestBody::Grants => crate::landing::grants_verb(state, principal),
     RequestBody::Audit { since } => crate::landing::audit_verb(state, since),
@@ -3767,14 +3835,40 @@ fn create_work(
 /// increment on submit. A new path is created first.
 /// `StageBegin` (`crate::staging`): a buffer of `len` bytes for an edit of `work` too large for one request, after
 /// the same write check an edit takes.
+/// The volume a staging buffer is for: a work the caller may edit, or a plain volume it may write (its file verbs'
+/// staged content, `crate::fs_verbs`); a green is read-only.
+fn staging_volume(
+  state: &ShardState,
+  principal: &Principal,
+  volume: VolumeId,
+) -> Result<DbVolumeId, Refusal> {
+  // The catalog record, not a store slot: a work is a merge volume with no slot of its own.
+  let record = state
+    .db
+    .partition()
+    .volume(to_db_volume(volume))
+    .cloned()
+    .ok_or(Refusal::NotFound)?;
+  if record.policy.role == Role::Plain {
+    if !rights_of(&record, principal).write {
+      return Err(Refusal::Forbidden {
+        verb: "stage".to_owned(),
+      });
+    }
+    return Ok(record.id);
+  }
+  crate::merge_service::require_work(state, principal, volume, true, "edit")
+    .map(|(record, _)| record.id)
+}
+
 fn stage_begin(
   state: &mut ShardState,
   principal: &Principal,
   work: VolumeId,
   len: u64,
 ) -> ReplyBody {
-  let work_id = match crate::merge_service::require_work(state, principal, work, true, "edit") {
-    Ok((record, _)) => record.id,
+  let work_id = match staging_volume(state, principal, work) {
+    Ok(id) => id,
     Err(refusal) => return refused(refusal),
   };
   let now = state.clock.monotonic_ns();
@@ -3799,8 +3893,8 @@ fn stage_put(
   offset: u64,
   bytes: &[u8],
 ) -> ReplyBody {
-  let work_id = match crate::merge_service::require_work(state, principal, work, true, "edit") {
-    Ok((record, _)) => record.id,
+  let work_id = match staging_volume(state, principal, work) {
+    Ok(id) => id,
     Err(refusal) => return refused(refusal),
   };
   let now = state.clock.monotonic_ns();
@@ -3816,6 +3910,34 @@ fn stage_put(
 }
 
 /// `EditStaged`: [`edit`] inserting a full staging buffer's bytes, which it releases.
+/// `FsWriteStaged` (`crate::fs_verbs`): an `FsWrite` whose content is a full staging buffer.
+fn fs_write_staged(
+  state: &mut ShardState,
+  principal: &Principal,
+  (volume, attachment): (VolumeId, u64),
+  path: &str,
+  token: u64,
+  mode: u32,
+) -> ReplyBody {
+  let bytes = match state.staging.take(
+    (to_db_volume(volume), principal, token),
+    &mut state.store.metadata,
+  ) {
+    Ok(bytes) => bytes,
+    Err(refusal) => return refused(refusal),
+  };
+  crate::fs_verbs::serve(
+    state,
+    principal,
+    (volume, attachment),
+    crate::fs_verbs::FsOp::Write {
+      path,
+      bytes: &bytes,
+      mode,
+    },
+  )
+}
+
 fn edit_staged(
   state: &mut ShardState,
   principal: &Principal,
