@@ -226,6 +226,8 @@ pub struct ChunkStore {
   seal_refusals: u64,
   /// Chunks sealed so far (the non-vacuity count of A-99's sealing).
   sealed: u64,
+  /// Seals written to a new block because a recovery image named the open one (A-99 with A-64).
+  moved_out_of_image: u64,
 }
 
 impl std::fmt::Debug for ChunkStore {
@@ -282,6 +284,7 @@ impl ChunkStore {
       next_version: 0,
       seal_refusals: 0,
       sealed: 0,
+      moved_out_of_image: 0,
     }
   }
 
@@ -321,6 +324,53 @@ impl ChunkStore {
   /// Encrypts the first `len` bytes of `block` in place under `key`, one granule a segment, into a fresh tag run:
   /// the chunk's seal. A refusal partway opens what it sealed, so the block holds its plaintext again, and returns
   /// `None` (the chunk stays in the clear, counted): content already acknowledged is never lost to the cipher.
+  /// Seals the `len` bytes of `block` under `key` where no recovery image is hurt: in place when no image names the
+  /// block, or else in a new block, the old one retired through the arena's deferral, so the image's plaintext open
+  /// extent still reads as plaintext after a crash before the next publication (A-64 shadow paging, as ZFS and WAFL
+  /// never overwrite a block a committed tree names). The block the chunk now lives in, and its seal; with no room
+  /// for the copy, the bytes stay in the clear where they are, counted as a refused seal.
+  fn seal_where_safe(&mut self, block: Block, len: usize, key: u32) -> (Block, Option<ChunkSeal>) {
+    if !self.arena.imaged(block) {
+      return (block, self.seal_block(block, len, key));
+    }
+    let Some(copy) = self.copied_out_of_image(block, len) else {
+      self.seal_refusals = self.seal_refusals.saturating_add(1);
+      return (block, None);
+    };
+    let seal = self.seal_block(copy, len, key);
+    // The free is deferred: the image names the old block until the next commit.
+    let _ = self.arena.free(block);
+    self.moved_out_of_image = self.moved_out_of_image.saturating_add(1);
+    (copy, seal)
+  }
+
+  /// A new block holding the first `len` bytes of `block`, or `None` when the arena or the allocator has no room.
+  fn copied_out_of_image(&mut self, block: Block, len: usize) -> Option<Block> {
+    let mut plain = Vec::new();
+    plain.try_reserve_exact(len).ok()?;
+    plain.extend_from_slice(self.arena.bytes(block)?.get(..len)?);
+    let copy = self.arena.alloc(block.len()).ok()?;
+    match self
+      .arena
+      .bytes_mut(copy)
+      .and_then(|bytes| bytes.get_mut(..len))
+    {
+      Some(target) => {
+        target.copy_from_slice(&plain);
+        Some(copy)
+      }
+      None => {
+        let _ = self.arena.free(copy);
+        None
+      }
+    }
+  }
+
+  /// Seals that wrote the chunk to a new block because a recovery image named its open block (A-99 with A-64).
+  pub const fn moved_out_of_image(&self) -> u64 {
+    self.moved_out_of_image
+  }
+
   fn seal_block(&mut self, block: Block, len: usize, key: u32) -> Option<ChunkSeal> {
     let segments = len.div_ceil(self.granule).max(1);
     let version = self.next_version;
@@ -633,14 +683,14 @@ impl ChunkStore {
       return Ok(None);
     }
     let len = usize::try_from(open.len).map_err(|_| VfsError::Invalid)?;
-    let seal = match (key, self.cipher.is_some()) {
-      (Some(key), true) => self.seal_block(open.block, len, key),
-      _ => None,
+    let (block, seal) = match (key, self.cipher.is_some()) {
+      (Some(key), true) => self.seal_where_safe(open.block, len, key),
+      _ => (open.block, None),
     };
     let inserted = self.chunks.insert(Chunk {
       born: open.born,
       len: u32::try_from(open.len).unwrap_or(u32::MAX),
-      block: open.block,
+      block,
       identity: None,
       seal,
     });

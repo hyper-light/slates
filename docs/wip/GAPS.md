@@ -3667,7 +3667,10 @@ names, a successor opens with the head's keys), the successor's wrapped key in t
 between nodes (A-93), and a tenant's key erased with its last volume on a partition. Idle RAM sealed is built (A-99, 2026-10-05): a
 chunk's bytes are AES-256-GCM ciphertext in the arena from its seal on, per 4 KiB segment, opened only into a reader's
 buffer; a restart opens what the last daemon sealed; a sealed 4 KiB read p99 916 ns against the 1 µs budget (BENCHMARKS
-"A-99 sealed read"). Owed from it: a volume's epoch key is a `VersionKey` whose expanded AES schedule sits in aws-lc's
+"A-99 sealed read"). Owed from it (found live 2026-10-05): a file smaller than a chunk stays in a plaintext open extent while idle, since
+only a window crossing or a snapshot seals one, and a freed block keeps its plaintext until reused; the idle sweep and
+the scrub are next. Closed the same day: a seal after an image encrypted the imaged block in place and a restart read
+ciphertext as content (docs/bugs/2026-10-05-a-seal-after-an-image-turned-its-open-extent-into-ciphertext.md). Also owed: a volume's epoch key is a `VersionKey` whose expanded AES schedule sits in aws-lc's
 heap, not hyper-seal's locked region, so it is neither locked against swap nor kept out of a core dump (seal.md §8 holds
 for the root and the shard masters only); held replicas and archives keep their own envelopes. Owed, in order: sealed archives (an export sealed to an operator's ML-KEM-1024
 recipient); the envelope wrap's extra copies and second BLAKE3 pass (98 ms for 64 MiB against a 9–10 GB/s seal).

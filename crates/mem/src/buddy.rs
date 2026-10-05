@@ -463,6 +463,14 @@ impl Buddy {
     self.allocatable(count, len) >= count
   }
 
+  /// Whether a recovery image, the committed one or the one being published, may name `block` (A-64): a block whose
+  /// bytes must keep the meaning the image gave them until the next commit. `false` for a block this pool did not issue.
+  pub fn imaged(&self, block: Block) -> bool {
+    self
+      .validate(block)
+      .is_ok_and(|(index, _)| self.named_by_an_image(index))
+  }
+
   /// Whether `block` names exactly a live block whose free is not deferred.
   pub fn holds(&self, block: Block) -> bool {
     self

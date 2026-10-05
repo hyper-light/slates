@@ -496,6 +496,15 @@ impl ChunkArena {
         .is_some_and(|slot| slot.buddy.holds(extent.block))
   }
 
+  /// Whether a recovery image may name `extent` (A-64), so its bytes must not change meaning before the next commit: a
+  /// seal then writes the chunk elsewhere and defers the old block's free (A-99).
+  pub fn imaged(&self, extent: Extent) -> bool {
+    self.identity == Some(extent.arena)
+      && self
+        .slot(extent.region)
+        .is_some_and(|slot| slot.buddy.imaged(extent.block))
+  }
+
   /// Bytes freed but held until the next publication commits, because the committed recovery image may name
   /// them (A-64). An allocation refused while this is not zero can succeed after a publication.
   pub fn deferred_bytes(&self) -> usize {

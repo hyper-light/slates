@@ -9645,6 +9645,14 @@ sealed under the volume's version key (condition 9, "encrypted at rest when not 
      p99 budget, so it lands. The first build opened every segment into a stack scratch and copied out; opening a
      segment the read covers whole in the caller's buffer took p50 from 833 to 709 ns and throughput from 6.2 to
      7.4 GB/s in an interleaved A/B, measured-and-rejected recorded.
+- Crash consistency (2026-10-05, docs/bugs/2026-10-05-a-seal-after-an-image-turned-its-open-extent-into-ciphertext.md):
+  a seal must not rewrite a block a recovery image names (A-64). A block no image names is sealed in place; one an
+  image names is copied to a new block and sealed there, the old block freed through the arena's deferral, so a
+  restart before the next publication still reads the image's plaintext open extent (`ChunkStore::seal_where_safe`).
+- Owed, found live the same day (`e2e-installs`: npm, pip and a 2,000-file tar through Docker on a mounted volume; 109
+  chunks sealed): an open extent is sealed only when a write crosses its chunk window or a snapshot seals it, so a
+  file smaller than a chunk stays plaintext while idle. Owed: a sweep at the shard's reap cadence that seals open
+  extents not written since the previous tick, and scrubbing plaintext blocks when freed.
 - Tag store, measured and replaced the same day: the first build sized one buddy pool for `max_chunks` full runs
   at store construction (268 MB of tags and a 16.7 M-granule buddy per shard here), which a recycled mapping zeroes by
   hand: shard starts in the restart suites p50 26 ms, p99 811 ms, max 978 ms, against the control loop's 1 s wait.

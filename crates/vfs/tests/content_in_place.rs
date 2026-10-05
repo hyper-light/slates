@@ -438,3 +438,134 @@ fn a_recovered_clone_and_its_origin_leave_nothing_behind_when_destroyed() {
     "the recovered lifecycle"
   );
 }
+
+/// A deterministic test cipher (A-99): each byte XORed with a stream of its key, version, segment and place, and a
+/// tag that sums the plaintext under the same stream, so a ciphertext read as plaintext differs and a tampered
+/// segment is refused.
+struct StreamCipher;
+
+fn stream_byte(key: u32, version: u64, index: u32, at: usize) -> u8 {
+  let mixed = u64::from(key)
+    .wrapping_mul(0x9E37_79B9)
+    .wrapping_add(version.wrapping_mul(0x85EB_CA6B))
+    .wrapping_add(u64::from(index).wrapping_mul(0xC2B2_AE35))
+    .wrapping_add(u64::try_from(at).unwrap());
+  (mixed ^ (mixed >> 13)).to_le_bytes()[0] | 1
+}
+
+fn stream_tag(key: u32, version: u64, index: u32, plain: &[u8]) -> slates_vfs::content::Tag {
+  let mut tag = slates_vfs::content::Tag::default();
+  for (at, byte) in plain.iter().enumerate() {
+    let width = tag.len();
+    let slot = tag.get_mut(at % width).unwrap();
+    *slot = slot.wrapping_add(*byte ^ stream_byte(key, version, index, at));
+  }
+  tag
+}
+
+impl slates_vfs::content::ChunkCipher for StreamCipher {
+  fn seal(
+    &self,
+    key: u32,
+    version: u64,
+    index: u32,
+    _: bool,
+    segment: &mut [u8],
+  ) -> Result<slates_vfs::content::Tag, VfsError> {
+    let tag = stream_tag(key, version, index, segment);
+    for (at, byte) in segment.iter_mut().enumerate() {
+      *byte ^= stream_byte(key, version, index, at);
+    }
+    Ok(tag)
+  }
+  fn open(
+    &self,
+    key: u32,
+    version: u64,
+    index: u32,
+    _: bool,
+    segment: &mut [u8],
+    tag: &slates_vfs::content::Tag,
+  ) -> Result<(), VfsError> {
+    for (at, byte) in segment.iter_mut().enumerate() {
+      *byte ^= stream_byte(key, version, index, at);
+    }
+    if stream_tag(key, version, index, segment) != *tag {
+      return Err(VfsError::Integrity);
+    }
+    Ok(())
+  }
+  fn identity(&self, key: u32) -> Option<slates_vfs::content::KeyIdentity> {
+    let mut identity = slates_vfs::content::KeyIdentity::default();
+    identity
+      .get_mut(..4)
+      .unwrap()
+      .copy_from_slice(&key.to_le_bytes());
+    Some(identity)
+  }
+  fn reference(&mut self, identity: &slates_vfs::content::KeyIdentity) -> Result<u32, VfsError> {
+    Ok(u32::from_le_bytes(
+      identity.get(..4).unwrap().try_into().unwrap(),
+    ))
+  }
+  fn key_for_volume(&mut self, _: [u8; 16]) -> Result<u32, VfsError> {
+    Ok(SEAL_KEY)
+  }
+}
+
+/// Shape: the key the sealing tests' volumes seal under.
+const SEAL_KEY: u32 = 7;
+
+/// A-99 with A-64 (a seal after the image). Do: on a sealing store, write a file into its open extent, capture the
+/// image (it names the open block, plaintext), then write past the first chunk window, which seals the first window,
+/// and restart from the surviving arena with no publication between. Expect: the file reads back its imaged bytes,
+/// never the ciphertext the seal left, and the second window's unstable bytes are gone. A seal that encrypted the
+/// imaged block in place turned the image's plaintext open extent into ciphertext.
+#[test]
+fn a_seal_after_the_image_leaves_the_imaged_open_extent_readable_after_a_restart() {
+  let mut source = store();
+  source.content.set_cipher(Box::new(StreamCipher));
+  let mut vol = volume(&mut source, 1 << 30);
+  vol.set_seal_key(Some(SEAL_KEY));
+  let root = vol.root_inode(&source).unwrap();
+  let f = vol.create_file_no(&mut source, root, "f", 0o644).unwrap();
+  let stable: Vec<u8> = (0..1000u32)
+    .map(|at| u8::try_from(at % 251).unwrap())
+    .collect();
+  vol.write(&mut source, f, 0, &stable).unwrap();
+  // A publication, as the daemon's barrier makes one: capture, image, commit.
+  source.content.arena_mut().capture();
+  let image = vol.to_image(&source, None).unwrap();
+  source.content.arena_mut().commit_capture();
+  assert!(
+    matches!(
+      &image.inodes.iter().find(|i| i.no == f.0).unwrap().body,
+      BodyImage::Chunked { open: Some(_), .. }
+    ),
+    "the image names the file's open extent"
+  );
+  let chunk = u64::try_from(source.content.chunk_bytes()).unwrap();
+  let sealed_before = source.content.sealed();
+  vol
+    .write(&mut source, f, chunk, b"past the first window")
+    .unwrap();
+  assert!(
+    source.content.sealed() > sealed_before,
+    "the write sealed the first window (non-vacuous)"
+  );
+  assert_eq!(
+    source.content.moved_out_of_image(),
+    1,
+    "the seal wrote the chunk to a new block, the image naming the old one"
+  );
+  let mut after = vec![0u8; 1000];
+  vol.read(&source, f, 0, &mut after).unwrap();
+  assert_eq!(after, stable, "the live volume reads the sealed chunk back");
+
+  let mut fresh = common::surviving(&source);
+  fresh.content.set_cipher(Box::new(StreamCipher));
+  let claims = common::claims(&mut fresh, &[&image]);
+  let recovered = rebuild(&mut fresh, &image, &claims).unwrap();
+  assert_eq!(recovered.stat(&fresh, f).unwrap().size, 1000);
+  assert_eq!(read_all(&recovered, &fresh, f, 1000), stable);
+}
