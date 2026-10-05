@@ -3665,3 +3665,11 @@ without `nosuid`. Every mount slates makes or documents is now `nosuid,nodev` (A
 docs/bugs/2026-10-05-setuid-through-a-shared-volume.md). The KIND lane's check runs only where the kernel has TLS
 (GitHub's Linux runner), so its first run is owed there.
 
+FUSE create path, 2026-10-05 (A-96): the delta's whole reference list and the op log's full scan are gone (2,000
+creates 0.64 → 0.36–0.45 s). Owed:
+- `Buddy::capture` / `commit_capture` walk the content arena's whole bitmap at every publication (17% of the daemon's
+  samples). The capture needs a summary of the words holding deferred blocks, and the words a free changes while a
+  capture is open.
+- The containerd workload's shell loop (`echo > f` in a loop) costs about 1.75 ms per file through runc's bind of the
+  FUSE mount, against about 0.2 ms for Python's open, write, close and stat. Measured only at load average 33–87
+  (another session's load), so not yet diagnosed.

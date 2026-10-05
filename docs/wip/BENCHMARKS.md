@@ -2026,3 +2026,26 @@ anchor restarts it over the RAM it holds, and the kernel's hard NFSv4.2 mount re
 - The first attempt hung in the harness, not in slates: a bare `wait` also waited for the anchor, which never exits.
   The script now waits on the killer's pid.
 
+### Linux FUSE mount: small creates, and a containerd/runc binding (conditions 2, 5, 12; 2026-10-05)
+
+Command: `docs/wip/bench/fuse/fuse-perf.sh` (2,000 × open O_CREAT, write, close, stat through `slates mount` on Linux;
+Docker Desktop 6.12 kernel, Apple M5 Max). Per-step p50 / p99; each row one run.
+
+| build (load average) | 2,000 creates | open | write | close | stat |
+|---|---|---|---|---|---|
+| tmpfs | 0.01 s | 1 / 3 µs | 1 / 2 µs | 0 / 0 µs | 1 / 1 µs |
+| before A-96 (≈ 8) | 0.64 s | 106 / 631 µs | 43 / 117 µs | 56 / 145 µs | 82 / 169 µs |
+| delta references (9–10) | 0.44 s | 75 / 136 µs | 34 / 68 µs | 41 / 91 µs | 60 / 100 µs |
+| delta references (9–10) | 0.36 s | 51 / 210 µs | 22 / 114 µs | 28 / 118 µs | 41 / 154 µs |
+| + op log indexed (4–7) | 0.36 s | 63 / 173 µs | 28 / 92 µs | 35 / 93 µs | 49 / 121 µs |
+| + op log indexed (4–7) | 0.45 s | 69 / 219 µs | 31 / 107 µs | 37 / 137 µs | 52 / 176 µs |
+
+containerd: `docs/wip/bench/containerd/run.sh` runs containerd 1.7.24 and runc 1.1.15 (Debian trixie) and applies the
+exact entry `slates attach --oci` returns (`{"type":"bind","options":["bind","rw","private","nosuid","nodev"]}`) through
+`ctr run`, into alpine 3.20:
+- 2,000 files, a hard link, a symlink, and a tar round trip: exit 0, 2,002 entries extracted, and the same tar hash
+  read from the host side of the mount.
+- The container sees `/work` as `rw,nosuid,nodev`.
+- The read-only entry's write is refused with EROFS.
+- Wall time, measured only under another session's load (average 33–87): 5.3–17 s against a tmpfs bind's 0.26–0.55 s.
+  The per-file gap against Python's loop is owed (GAPS).

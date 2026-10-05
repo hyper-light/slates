@@ -32,8 +32,8 @@ use slates_wire::Wire;
 
 use crate::error::VfsError;
 use crate::recover::{
-  AttachmentReferences, BodyImage, EntryImage, InodeImage, QuotaImage, SnapshotRef, VolumeImage,
-  entry_order,
+  AttachmentReferences, BodyImage, EntryImage, InodeImage, InodeReferences, QuotaImage,
+  SnapshotRef, VolumeImage, entry_order,
 };
 use crate::volume::{Store, Volume};
 
@@ -45,6 +45,9 @@ pub struct Dirty {
   /// Directory entries placed, re-pointed or removed: the directory's inode number and the name as the
   /// operation named it.
   entries: BTreeSet<(u64, String)>,
+  /// The recorded attachments' reference counts taken, forgotten or swept: the attachment's id and the inode number
+  /// (A-96). An owner this process alone knows is not recorded, as the image does not carry it.
+  references: BTreeSet<(u64, u64)>,
   /// Whether the last publication of this volume committed, so a delta has an image to apply to.
   published: bool,
   /// The volume's shape when it was last published: a delta carries only inodes and entries, so a volume whose
@@ -64,7 +67,6 @@ struct Roots {
   root_no: u64,
   last_snapshot: Option<SnapshotRef>,
   orphans: Vec<u64>,
-  references: Vec<AttachmentReferences>,
 }
 
 /// The parts of a volume a delta does not carry (the module doc's "When a delta is not taken").
@@ -85,6 +87,26 @@ impl Dirty {
   pub(crate) fn entry(&mut self, dir: u64, name: &str) {
     self.entries.insert((dir, name.to_owned()));
   }
+
+  /// Records a changed reference count of `owner` on inode `no`; an owner this process alone knows is not imaged, so
+  /// its changes are not recorded.
+  pub(crate) fn reference(&mut self, owner: crate::ids::RefOwner, no: crate::ids::InodeNo) {
+    if let crate::ids::RefOwner::Attachment(attachment) = owner {
+      self.references.insert((attachment, no.0));
+    }
+  }
+}
+
+/// One recorded attachment's reference count on one inode as a delta carries it (A-96): the count now, zero when the
+/// attachment holds none.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Wire)]
+pub struct ReferenceChange {
+  /// The attachment's durable id.
+  pub attachment: u64,
+  /// The inode number.
+  pub inode: u64,
+  /// The references the attachment holds on the inode now.
+  pub count: u32,
 }
 
 /// One directory entry as a delta carries it: present (`entry`, a whiteout's child `None`) or gone.
@@ -113,8 +135,9 @@ pub struct VolumeDelta {
   pub last_snapshot: Option<SnapshotRef>,
   /// The orphans now.
   pub orphans: Vec<u64>,
-  /// Every recorded attachment's references now.
-  pub references: Vec<AttachmentReferences>,
+  /// The recorded attachments' reference counts that changed, by attachment then inode (A-96: every attachment's
+  /// whole list made a FUSE mount's delta grow with every inode its kernel had seen).
+  pub references: Vec<ReferenceChange>,
   /// The changed inodes still present, in number order; a directory's body carries its own fields but no entries
   /// (they come from `entries` over what the previous image held).
   pub inodes: Vec<InodeImage>,
@@ -168,6 +191,7 @@ impl Volume {
     self.dirty.published
       && self.dirty.inodes.is_empty()
       && self.dirty.entries.is_empty()
+      && self.dirty.references.is_empty()
       && self.dirty.published_shape == self.shape()
       && self.dirty.published_roots.is_some()
       && self.dirty.published_roots == self.roots(store).ok()
@@ -178,6 +202,7 @@ impl Volume {
   pub fn mark_published(&mut self, store: &Store) {
     self.dirty.inodes.clear();
     self.dirty.entries.clear();
+    self.dirty.references.clear();
     self.dirty.published = true;
     self.dirty.published_shape = self.shape();
     self.dirty.published_roots = self.roots(store).ok();
@@ -197,17 +222,6 @@ impl Volume {
       root_no: root_no.0,
       last_snapshot: self.last_snapshot.map(crate::recover::snap_ref),
       orphans: self.orphans.keys().map(|no| no.0).collect(),
-      references: self
-        .attachment_references()
-        .into_iter()
-        .map(|(attachment, inodes)| AttachmentReferences {
-          attachment,
-          inodes: inodes
-            .into_iter()
-            .map(|(no, count)| crate::recover::InodeReferences { inode: no.0, count })
-            .collect(),
-        })
-        .collect(),
     })
   }
 
@@ -246,6 +260,16 @@ impl Volume {
         entry: self.entry_image(store, crate::ids::InodeNo(*dir), name)?,
       });
     }
+    let references = self
+      .dirty
+      .references
+      .iter()
+      .map(|(attachment, inode)| ReferenceChange {
+        attachment: *attachment,
+        inode: *inode,
+        count: self.attachment_reference_count(*attachment, crate::ids::InodeNo(*inode)),
+      })
+      .collect();
     Ok(VolumeDelta {
       epoch: roots.epoch,
       next_counter: roots.next_counter,
@@ -253,7 +277,7 @@ impl Volume {
       root_no: roots.root_no,
       last_snapshot: roots.last_snapshot,
       orphans: roots.orphans,
-      references: roots.references,
+      references,
       inodes,
       removed,
       entries,
@@ -303,18 +327,10 @@ impl Volume {
 }
 
 impl VolumeImage {
-  /// Applies `delta` (the module doc): afterwards this image equals the volume's full image at the delta's
-  /// publication. A change naming a directory the image does not hold is refused
-  /// [`VfsError::RecoveryIncomplete`] — the delta does not belong to this image.
-  pub fn apply(&mut self, delta: &VolumeDelta) -> Result<(), VfsError> {
-    self.epoch = delta.epoch;
-    self.next_counter = delta.next_counter;
-    self.quota = delta.quota;
-    self.root_no = delta.root_no;
-    self.last_snapshot = delta.last_snapshot;
-    self.orphans = delta.orphans.clone();
-    self.references = delta.references.clone();
-    for changed in &delta.inodes {
+  /// Replaces or inserts each changed inode's image; a directory keeps the entries the previous image held (moved,
+  /// not copied), for the entry changes to bring up to date.
+  fn apply_inodes(&mut self, changed_inodes: &[InodeImage]) {
+    for changed in changed_inodes {
       let at = self
         .inodes
         .binary_search_by_key(&changed.no, |inode| inode.no);
@@ -338,6 +354,22 @@ impl VolumeImage {
         Err(at) => self.inodes.insert(at, image),
       }
     }
+  }
+
+  /// Applies `delta` (the module doc): afterwards this image equals the volume's full image at the delta's
+  /// publication. A change naming a directory the image does not hold is refused
+  /// [`VfsError::RecoveryIncomplete`] — the delta does not belong to this image.
+  pub fn apply(&mut self, delta: &VolumeDelta) -> Result<(), VfsError> {
+    self.epoch = delta.epoch;
+    self.next_counter = delta.next_counter;
+    self.quota = delta.quota;
+    self.root_no = delta.root_no;
+    self.last_snapshot = delta.last_snapshot;
+    self.orphans = delta.orphans.clone();
+    for change in &delta.references {
+      apply_reference(&mut self.references, change);
+    }
+    self.apply_inodes(&delta.inodes);
     let policy = crate::recover::policy_from_image(self.policy);
     for change in &delta.entries {
       let Ok(at) = self
@@ -377,5 +409,52 @@ impl VolumeImage {
       }
     }
     Ok(())
+  }
+}
+
+/// Sets one attachment's count on one inode in an image's reference lists (by attachment, then by inode), removing the
+/// inode at zero and the attachment when it holds nothing.
+fn apply_reference(references: &mut Vec<AttachmentReferences>, change: &ReferenceChange) {
+  let held = references.binary_search_by_key(&change.attachment, |held| held.attachment);
+  let at = match (held, change.count) {
+    (Ok(at), _) => at,
+    (Err(_), 0) => return,
+    (Err(at), _) => {
+      references.insert(
+        at,
+        AttachmentReferences {
+          attachment: change.attachment,
+          inodes: Vec::new(),
+        },
+      );
+      at
+    }
+  };
+  let Some(owner) = references.get_mut(at) else {
+    return;
+  };
+  let reference = InodeReferences {
+    inode: change.inode,
+    count: change.count,
+  };
+  match (
+    owner
+      .inodes
+      .binary_search_by_key(&change.inode, |held| held.inode),
+    change.count,
+  ) {
+    (Ok(slot), 0) => {
+      owner.inodes.remove(slot);
+    }
+    (Ok(slot), _) => {
+      if let Some(held) = owner.inodes.get_mut(slot) {
+        *held = reference;
+      }
+    }
+    (Err(_), 0) => {}
+    (Err(slot), _) => owner.inodes.insert(slot, reference),
+  }
+  if owner.inodes.is_empty() {
+    references.remove(at);
   }
 }

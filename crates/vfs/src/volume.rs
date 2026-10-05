@@ -4430,6 +4430,7 @@ impl Volume {
     // overflow, so the increment cannot overflow; saturate defensively rather than carry an
     // unreachable error path (the invariant "global == sum of per-attachment" is preserved).
     *owned = owned.saturating_add(1);
+    self.dirty.reference(attachment, no);
     Ok(())
   }
 
@@ -4482,12 +4483,24 @@ impl Volume {
       return Ok(());
     };
     for (no, count) in owned {
+      self.dirty.reference(attachment, no);
       // Drop exactly this owner's count from the global; other owners' references keep the inode
       // alive if they hold it. A reclamation failure is retained by the orphan record, as in
       // `unreference_n`.
       self.unreference_n(store, no, u64::from(count))?;
     }
     Ok(())
+  }
+
+  /// The references the recorded attachment `attachment` holds on inode `no` now (A-96: what a delta carries for a
+  /// changed count), zero when it holds none.
+  pub(crate) fn attachment_reference_count(&self, attachment: u64, no: InodeNo) -> u32 {
+    self
+      .attachment_refs
+      .get(&RefOwner::Attachment(attachment))
+      .and_then(|inodes| inodes.get(&no))
+      .copied()
+      .unwrap_or(0)
   }
 
   /// Each recorded attachment holding references, with its share by inode, in owner and inode order: what the
@@ -4567,6 +4580,7 @@ impl Volume {
       .entry(no)
       .or_insert(0);
     *owned = owned.saturating_add(count);
+    self.dirty.reference(RefOwner::Attachment(owner), no);
     Ok(())
   }
 
@@ -4622,6 +4636,7 @@ impl Volume {
   /// Debits `drop` from `attachment`'s ledger entry for inode `no`, removing the entry at zero and
   /// the owner's map when it empties, so the ledger holds only live attributions.
   fn debit_attachment(&mut self, attachment: RefOwner, no: InodeNo, drop: u32) {
+    self.dirty.reference(attachment, no);
     if let Some(inodes) = self.attachment_refs.get_mut(&attachment) {
       if let Some(count) = inodes.get_mut(&no) {
         *count = count.saturating_sub(drop);

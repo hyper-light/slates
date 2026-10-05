@@ -6,6 +6,11 @@
 //! inode another attachment holds (a corruption), a forget must drop only its own owner's share, and
 //! a reference of a reclaimed inode must be refused. The model states the design's rule, not the
 //! implementation's mechanics, so it certifies behaviour rather than mirrors code.
+//!
+//! Attachment 0 is an owner this process alone knows, the others recorded attachments, whose references the recovery
+//! image carries (A-61). After every step the volume's publication (its full image, or a delta over the last one) is
+//! applied to what was published and must equal its full image: A-96's oracle for a delta that carries only the
+//! reference counts that changed.
 
 // Test harness code: an unwrap here is a failed test. proptest's strategy macros expand to
 // `Arc`-carrying unions; the test-harness exception of D-8 covers it.
@@ -25,6 +30,31 @@ use slates_vfs::ids::RefOwner;
 /// densely exercises the reference interactions between them rather than spreading thin.
 const FILES: usize = 4;
 const ATTACHMENTS: u64 = 3;
+
+/// The owner a history's attachment `att` is: 0 known to this process only, the others recorded.
+fn owner(att: u64) -> RefOwner {
+  if att == 0 {
+    RefOwner::Process(att)
+  } else {
+    RefOwner::Attachment(att)
+  }
+}
+
+/// A-68/A-96's oracle after a step: the publication applied to what was published equals the volume's image now.
+fn publication_matches(
+  vol: &mut slates_vfs::volume::Volume,
+  store: &slates_vfs::volume::Store,
+  published: &mut Option<slates_vfs::recover::VolumeImage>,
+) -> bool {
+  match vol.publication(store, None).unwrap() {
+    slates_vfs::delta::VolumeRecord::Full { image } => *published = Some(image),
+    slates_vfs::delta::VolumeRecord::Delta { delta } => {
+      published.as_mut().unwrap().apply(&delta).unwrap();
+    }
+  }
+  vol.mark_published(store);
+  published.as_ref() == Some(&vol.to_image(store, None).unwrap())
+}
 
 /// One step of a generated history over the reference API.
 #[derive(Clone, Debug)]
@@ -86,11 +116,13 @@ proptest! {
       nlink: [1; FILES],
       refs: BTreeMap::new(),
     };
+    let mut published = None;
+    prop_assert!(publication_matches(&mut vol, &store, &mut published));
 
     for op in ops {
       match op {
         Op::Reference { file, att } => {
-          let result = vol.reference_for(&store, inodes[file], RefOwner::Process(att));
+          let result = vol.reference_for(&store, inodes[file], owner(att));
           if model.alive(file) {
             prop_assert!(result.is_ok(), "a reference of a live inode must succeed");
             *model.refs.entry((att, file)).or_insert(0) += 1;
@@ -101,13 +133,13 @@ proptest! {
         Op::Forget { file, att, n } => {
           // A forget is always accepted (a drop of more than held, or of nothing, is a no-op); it
           // removes at most this attachment's own share.
-          vol.forget_for(&mut store, inodes[file], RefOwner::Process(att), n).unwrap();
+          vol.forget_for(&mut store, inodes[file], owner(att), n).unwrap();
           let held = model.refs.entry((att, file)).or_insert(0);
           let drop = u32::try_from(n).unwrap_or(u32::MAX).min(*held);
           *held -= drop;
         }
         Op::Sweep { att } => {
-          vol.sweep_attachment(&mut store, RefOwner::Process(att)).unwrap();
+          vol.sweep_attachment(&mut store, owner(att)).unwrap();
           for file in 0..FILES {
             model.refs.remove(&(att, file));
           }
@@ -134,6 +166,10 @@ proptest! {
           file
         );
       }
+      prop_assert!(
+        publication_matches(&mut vol, &store, &mut published),
+        "the published image, references included, is the volume's image"
+      );
     }
   }
 }

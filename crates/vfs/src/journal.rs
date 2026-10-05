@@ -194,9 +194,19 @@ impl OpLog {
     self.records.reserve_exact(target.saturating_sub(len));
   }
 
-  /// Records since `seq` (exclusive), oldest first.
+  /// Records since `seq` (exclusive), oldest first. Sequences are contiguous (each append takes the next, and
+  /// retention only drops the oldest), so the first record after `seq` is found by its distance from the oldest
+  /// retained one: the cost is the records returned, not the log (A-96: a filter over the whole retained log was a
+  /// quarter of a FUSE create's daemon time, since every reply asks for the changes since its cursor).
   pub fn since(&self, seq: u64) -> impl Iterator<Item = &OpRecord> {
-    self.records.iter().filter(move |r| r.seq > seq)
+    let oldest = self
+      .records
+      .front()
+      .map_or(self.next_seq, |record| record.seq);
+    let skip = usize::try_from(seq.saturating_add(1).saturating_sub(oldest))
+      .unwrap_or(usize::MAX)
+      .min(self.records.len());
+    self.records.range(skip..)
   }
 
   /// The newest sequence assigned.
@@ -243,6 +253,29 @@ mod tests {
     assert!(seqs.windows(2).all(|w| w[1] == w[0] + 1));
     assert_eq!(seqs.last(), Some(&5));
     assert_eq!(log.since(4).count(), 1);
+  }
+
+  /// A-96: do append past the budget so the oldest leave, then ask for the records since every sequence from before
+  /// the oldest retained to past the newest; expect exactly the retained records with a later sequence, in order (the
+  /// filter the indexed start replaced is the oracle).
+  #[test]
+  fn records_since_any_sequence_are_the_retained_ones_after_it() {
+    let mut log = OpLog::new(40 * std::mem::size_of::<OpRecord>());
+    for i in 0..200u64 {
+      log.append(Op::Create, "", Some(InodeNo(i)), Epoch(0), i, 0);
+    }
+    assert!(log.dropped() > 0, "the oldest left");
+    for seq in 0..=log.head_seq() + 2 {
+      let indexed: Vec<u64> = log.since(seq).map(|r| r.seq).collect();
+      let filtered: Vec<u64> = log
+        .records
+        .iter()
+        .filter(|r| r.seq > seq)
+        .map(|r| r.seq)
+        .collect();
+      assert_eq!(indexed, filtered, "since {seq}");
+    }
+    assert_eq!(OpLog::new(64).since(0).count(), 0, "an empty log");
   }
 
   /// §4.2: do append far past the budget; expect the ring's allocation never to exceed the records the budget holds

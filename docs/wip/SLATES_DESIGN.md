@@ -9378,3 +9378,33 @@ Status: built 2026-10-05 (conditions 5 and 12).
   `NFS4ERR_BAD_COOKIE`; no room `NFS4ERR_TOOSMALL`), `a_readdir_page_of_small_entries_fills_the_clients_maxcount`,
   the bridge-nfs suite (161), the server NFS suites (hostile 3, mount 27, TLS 7), the Linux kernel NFSv4.1 and 4.2
   mount test, and the real git/cargo/pip workloads (tree hash and file lists unchanged).
+
+### A-96 — A delta carries the reference counts that changed, and the op log is read from its cursor (2026-10-05)
+Applied in the same change to: `crates/vfs/src/delta.rs` (`Dirty::references`, `ReferenceChange`,
+`apply_reference`; `Roots` without references), `crates/vfs/src/volume.rs` (each attachment-owned reference change
+recorded; `attachment_reference_count`), `crates/vfs/src/recover.rs` (IMAGE_VERSION 15), `crates/vfs/src/journal.rs`
+(`OpLog::since` indexed), tests `crates/vfs/tests/delta_cost.rs` and `crates/vfs/tests/reference_model.rs`, GAPS,
+BENCHMARKS.
+Status: built 2026-10-05 (conditions 2, 5 and 12).
+- What: a FUSE mount's kernel holds a lookup reference on every inode it has seen, and the recovery image carries
+  them (A-61). A delta carried every recorded attachment's whole reference list whenever one count moved, so each FUSE
+  create's barrier re-imaged and re-encoded n references. It now records the changed (attachment, inode) pairs at the
+  four places a recorded attachment's count changes (take, forget, sweep, restore) and carries each pair's count now
+  (0: none held), which the replay merges by binary search. Separately, `OpLog::since` filtered the whole retained log
+  on every FUSE reply's invalidation pass; sequences are contiguous, so it now starts at its cursor's index.
+- Why, measured: 2,000 creates through Linux's FUSE mount took 0.64 s (open p50 106 µs, close 56 µs, stat 82 µs)
+  against tmpfs's 0.01 s. In the daemon's profile `publish_shard` was 66%: the delta's `roots` →
+  `attachment_references` 16%, a checkpoint's `to_image` 29%, and `VolumeBridge::invalidations`' filter 12%. NFS holds
+  no lookup references, which is why the NFS path never showed it. With 64 against 4,096 references held, one create's
+  delta encoded 1,110 against 49,494 bytes.
+- Measured after (same harness, load average 4–10): 2,000 creates in 0.36–0.45 s; open p50 51–75 µs, write 22–34 µs,
+  close 28–41 µs, stat 41–60 µs. Neither cost is in the profile any more. The kernel's `fuse_dev_write` is 20% of
+  what remains, and `Buddy::commit_capture` 17%, which walks the whole content arena's bitmap at every publication
+  (owed, GAPS).
+- Proven: `one_reference_changes_delta_costs_the_same_with_many_references_held` (the delta's bytes and allocations
+  equal with 4,096 references held as with 64; failed first at 49,494 against 1,110 bytes, and passed vacuously on
+  allocation count alone, since a collect from a map allocates once). `per_attachment_references_and_sweep_match_the_model`
+  now has recorded and process-only owners and checks the publication oracle after every step; disabling the replay's
+  merge failed it at once. `records_since_any_sequence_are_the_retained_ones_after_it` holds the indexed start to the
+  filter. Suites: vfs 214, bridge-core 67, bridge-fuse 82, db 101, server recovery 16 and daemon 19, and Linux's FUSE
+  CLI tests including the daemon killed under a live mount.
