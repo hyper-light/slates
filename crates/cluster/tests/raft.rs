@@ -395,3 +395,85 @@ fn a_removed_voter_leaves_and_the_survivors_commit_under_the_new_majority() {
   );
   cluster.assert_at_most_one_leader_per_term();
 }
+
+/// Election Safety across two membership changes with a member lagging both (Raft §6, thesis §4.1; the shape
+/// hyper-raft's swarm found, 2026-10-05: two leaders in one term where configuration took effect on apply). Do move
+/// `{1..5}` through joint to `{2,3,5}` and then to `{2,3}`, with member 5 holding only the first joint entry and no
+/// commit, and members 1 and 4 removed but still running. Have 5 campaign, first reaching only 1 and 4, then every
+/// node; then have removed member 4 campaign. Expect none of them to lead, at most one leader per term at every
+/// step, and the real leader to lead and commit under `{2,3}` afterwards. A configuration takes effect on append
+/// here, so 5's newest configuration is the joint one, whose new half `{2,3,5}` it cannot carry without 2 or 3, and
+/// they hold newer logs.
+#[test]
+fn a_member_lagging_two_configurations_cannot_lead_beside_the_real_leader() {
+  let (one, two, three, four, five) = (HostId(1), HostId(2), HostId(3), HostId(4), HostId(5));
+  let mut cluster = lag_two_configurations();
+  // The lagging member campaigns reaching only the removed-but-running members, then reaching everyone.
+  cluster.elect(five, &[one, four].into_iter().collect());
+  assert!(
+    !cluster.at(five).is_leader(),
+    "the removed members alone cannot elect it"
+  );
+  cluster.assert_at_most_one_leader_per_term();
+  cluster.elect(five, &all(5));
+  assert!(
+    !cluster.at(five).is_leader(),
+    "2 and 3 hold newer logs and refuse it"
+  );
+  cluster.assert_at_most_one_leader_per_term();
+  // A removed member that still runs campaigns too.
+  cluster.elect(four, &all(5));
+  assert!(!cluster.at(four).is_leader());
+  cluster.assert_at_most_one_leader_per_term();
+  // The real configuration still elects and commits: 2 leads under {2,3} with 3 alone.
+  if !cluster.at(two).is_leader() {
+    cluster.elect(two, &[three].into_iter().collect());
+  }
+  assert!(
+    cluster.at(two).is_leader(),
+    "the real leader leads under {{2,3}}"
+  );
+  cluster.assert_at_most_one_leader_per_term();
+  let before = cluster.at(two).commit_index();
+  cluster.at(two).append_command(b"after".to_vec());
+  cluster.replicate(two, &[three].into_iter().collect());
+  assert!(
+    cluster.at(two).commit_index() > before,
+    "and commits with 3 alone"
+  );
+}
+
+/// The setup of [`a_member_lagging_two_configurations_cannot_lead_beside_the_real_leader`]: `{1..5}` led by 2 moved
+/// through joint to `{2,3,5}` and then to `{2,3}`, member 5 holding only the first joint entry and no commit.
+fn lag_two_configurations() -> Cluster {
+  let (one, two, three, four, five) = (HostId(1), HostId(2), HostId(3), HostId(4), HostId(5));
+  let mut cluster = Cluster::new(5);
+  cluster.elect(two, &all(5));
+  assert!(cluster.at(two).is_leader());
+  // {1..5} -> joint({1..5},{2,3,5}): 5 receives the joint entry before anything commits, then the rest commit it.
+  assert!(
+    cluster
+      .at(two)
+      .begin_membership_change(vec![two, three, five])
+  );
+  cluster.replicate(two, &[five].into_iter().collect());
+  assert_eq!(
+    cluster.at(five).commit_index(),
+    0,
+    "5 holds the joint entry uncommitted"
+  );
+  cluster.replicate(two, &[one, three, four].into_iter().collect());
+  assert!(
+    cluster.at(two).commit_index() >= 1,
+    "the joint entry committed without 5 hearing of it"
+  );
+  // -> {2,3,5} -> joint({2,3,5},{2,3}) -> {2,3}, all among 2 and 3 alone: 5 lags two configurations.
+  assert!(cluster.at(two).complete_membership_change());
+  cluster.replicate(two, &[three].into_iter().collect());
+  assert!(cluster.at(two).begin_membership_change(vec![two, three]));
+  cluster.replicate(two, &[three].into_iter().collect());
+  assert!(cluster.at(two).complete_membership_change());
+  cluster.replicate(two, &[three].into_iter().collect());
+  cluster.assert_at_most_one_leader_per_term();
+  cluster
+}
