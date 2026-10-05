@@ -1967,3 +1967,26 @@ Every reader's archive was rebuilt byte for byte.
 - Loss costs 10–50% at 80 ms. A 4 MiB object at 80 ms is dominated by the manifest's round trip and slow start, so
   goodput against capacity is low for one reader and rises with eight (52%); larger objects are owed in the grid.
 
+### Real workloads through Linux's own NFS client, beside tmpfs (conditions 2 and 5; 2026-10-05)
+
+Command: `docs/wip/bench/realworld_native.sh` in a privileged `rust:1.98.0` container (the header gives the `docker run`):
+the daemon and the kernel's NFSv4.2 client in one Linux (Docker Desktop 6.12 kernel, 18 CPUs, 7.8 GB), a dynamic 3 GiB
+volume, and a tmpfs of the same size as the reference. Apple M5 Max, load average 2.9–5.1. Release build after A-93.
+Three runs; each cell is one run, in order.
+
+| workload | tmpfs | slates |
+|---|---|---|
+| `git clone --depth 1` ripgrep | 0.84, 0.87, 0.89 s | 0.97, 0.98, 0.97 s |
+| `git fsck --full` | 0.02, 0.01, 0.02 s | 0.02, 0.02, 0.02 s |
+| `cargo build --release` (regex, serde, serde_json; registry and target on the volume) | 3.09, 3.28 s | 3.28, 3.34 s |
+| `pip install requests flask` into a venv | 2.32, 2.09, 2.44 s | 2.15, 2.15, 2.16 s |
+
+- Correctness: the clone's tree hash (SHA-256 over every tracked file) is identical on both, `git fsck --full` passes, the
+  built binary runs and prints the same answer, and the file lists are identical except cargo's three lock files under
+  `target/release` (`.cargo-lock`, `.cargo-build-lock`, `.cargo-artifact-lock`), which tmpfs has and slates does not.
+  That matches cargo's own behaviour on NFS (from memory, to verify against cargo's `flock.rs`: it skips its file
+  locks on an NFS mount, where `flock` can block forever, so it never creates them); no other file differs.
+- Cost: the clone is about 12% slower (0.97 s against 0.87 s), the build about 4%, and pip within noise. The first
+  cargo build failed on both sides in an earlier run, a harness error (a second `[dependencies]` table), fixed before
+  these numbers.
+
