@@ -15,7 +15,6 @@ use slates_ipc::{ClientRegion, Listener, Prepared};
 use slates_machine::facts::Identity;
 use slates_machine::{MachineProfile, derived};
 use slates_mem::arena::ChunkArena;
-use slates_mem::region::Region;
 use slates_mem::{Handoff, Slab};
 #[cfg(unix)]
 use slates_rt::RtError;
@@ -1836,7 +1835,7 @@ impl Daemon {
       manifests: s.held_content.manifest_count(),
       refused_capacity: s.held_content.refused_capacity(),
       stages: s.held_content.stage_count(),
-      admittable: s.store.budget.admittable(),
+      admittable: s.store.admittable(),
       hold: s.store.budget.hold(),
     })
   }
@@ -2494,78 +2493,25 @@ fn content_slice(
   }
 }
 
-/// The parts of a shard's arena range, `(offset, len)` relative to the range: its length cut on `unit` into
-/// power-of-two multiples of it, largest first, the remainder under one `unit` left unused. A buddy region uses only
-/// the largest power-of-two number of granules it holds, and a shard's reserve (RAM ÷ shards ÷ classes) is rarely a
-/// power of two: as one region, 25% of a 170.7 MiB reserve sat unallocatable under a 1 GiB cap (128 MiB used,
-/// 2026-10-05). The largest part first keeps region 0 the one region the arena had before, so an image written then
-/// still names its blocks. Parts are at most one per bit of `len / unit`.
-fn arena_parts(len: usize, unit: usize) -> Vec<(usize, usize)> {
-  let unit = unit.max(1);
-  let mut units = len / unit;
-  let mut at = 0usize;
-  let mut parts = Vec::new();
-  while units > 0 {
-    let top = 1usize << (usize::BITS - 1 - units.leading_zeros());
-    let part = top.saturating_mul(unit);
-    parts.push((at, part));
-    at = at.saturating_add(part);
-    units = units.saturating_sub(top);
-  }
-  parts
-}
-
-/// The regions this shard's chunk arena lives in (§4.2), one per [`arena_parts`] part of its arena range. With the
-/// anchor's content object, each is that part of the shard's range of the object, mapped on its own (A-64): file bytes
-/// are written there once and survive the daemon, and a recovery image names them by region and block. Without one
-/// (a standalone daemon, a build without anchor-backed storage), a private mapping of each part, whose bytes die with
-/// the process.
-fn arena_regions(
-  config: &DaemonConfig,
-  partition: u16,
-  env: &[(String, String)],
-) -> Result<Vec<Region>, ServerError> {
-  let layout = config.shard_content_layout();
-  let (offset, len) = layout.arena;
-  let unit = slates_mem::mapping_granule()
-    .unwrap_or(config.page)
-    .max(config.page)
-    .max(config.content_granule());
-  let start = slice_start(config, partition).saturating_add(offset);
-  let handoff = AnchorSegment::content_handoff_in(env)
-    .filter(|(_, object_len)| start.saturating_add(len) <= *object_len);
-  let mut regions = Vec::new();
-  for (part_at, part_len) in arena_parts(len, unit) {
-    let at = start.saturating_add(part_at);
-    regions.push(match &handoff {
-      Some((handoff, _)) => {
-        // SAFETY: no other mapping in any process reaches `[at, at + part_len)` while this region lives. The range
-        // is a part of this shard's arena range, and the parts are disjoint: every shard maps its own partition's
-        // range, and this daemon's copies of the content object reach only the write log and the image slots
-        // (`image_range`, `content_slice`), which the layout keeps apart from it. The anchor that holds the object
-        // across a restart never touches its bytes, and it starts the next daemon only after this one has exited,
-        // so the mapping that wrote these bytes is gone before the next one maps them.
-        let object = unsafe { slates_mem::ExclusiveObject::open_range(handoff, at, part_len) }
-          .map_err(ServerError::Memory)?;
-        Region::shared(object, config.page)
-      }
-      None => Region::map(part_len, config.page, config.huge_pages)?,
-    });
-  }
-  Ok(regions)
-}
-
-/// This shard's chunk arena over its [`arena_regions`].
+/// This shard's chunk arena (A-98): the pool extents its partition holds from a previous daemon, added under their
+/// ids before recovery claims the blocks its image names, and the pool as the source it grows from. Also the capacity
+/// of one slice, the scale the operation headroom is derived against.
 fn shard_arena(
   config: &DaemonConfig,
   partition: u16,
   env: &[(String, String)],
-) -> Result<ChunkArena, ServerError> {
+  identity: &Identity,
+) -> Result<(ChunkArena, usize), ServerError> {
+  let (handoff, len) = handoff_of(env)?;
+  let segment = AnchorSegment::attach(&handoff, len, identity)?;
+  let mut pool = crate::content_pool::ContentPool::open(config, partition, env, segment);
   let mut arena = ChunkArena::new(config.content_granule());
-  for region in arena_regions(config, partition, env)? {
-    arena.add_region(region)?;
+  for (id, region) in pool.held()? {
+    arena.add_region_at(id, region)?;
   }
-  Ok(arena)
+  let slice = pool.slice_capacity();
+  arena.set_source(Box::new(pool));
+  Ok((arena, slice))
 }
 
 /// Runs on the shard: attaches the segment, recovers the partition, builds the store and
@@ -2584,7 +2530,7 @@ fn init_shard(
   let mut clock = HostClock::new();
   let now = slates_vfs::clock::Clock::monotonic_ns(&mut clock);
   let (db, recovered) = slates_db::replay::recover(&mut segment, partition, config.caps, now)?;
-  let arena = shard_arena(config, partition, env)?;
+  let (arena, slice_capacity) = shard_arena(config, partition, env, identity)?;
   // The operation headroom (§4.2): the bounded temporary coexistence of in-flight operations, kept
   // free of every admission (reservation and dynamic growth alike). A write into a sealed chunk
   // copies it into a new open extent — copy-on-write at chunk granularity — so the source chunk and
@@ -2606,7 +2552,8 @@ fn init_shard(
   // D-12 "degrade and keep serving": the headroom is a reserve *within* the arena's usable capacity,
   // so it can never consume the whole arena — a shard whose operation headroom ≥ its capacity refuses
   // every volume. Cap it to leave at least one chunk window admittable, whatever the machine.
-  let capacity = u64::try_from(arena.capacity()).unwrap_or(u64::MAX);
+  // Against the shard's own slice, not what it holds now: a shard claims extents lazily and may hold none (A-98).
+  let capacity = u64::try_from(slice_capacity).unwrap_or(u64::MAX);
   let headroom = derived!(
     chunk_window
       .saturating_mul(2)

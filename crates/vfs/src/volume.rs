@@ -186,6 +186,71 @@ impl Store {
     }
   }
 
+  /// Grows the arena from its pool by what a commitment of `bytes` lacks, and the budget by what was added (A-98):
+  /// the bytes added. Nothing grows while a pressure hold is set, or when the commitment is admittable already; the
+  /// admission that follows refuses as before when the pool cannot cover it.
+  pub fn make_room(&mut self, bytes: u64) -> u64 {
+    self.content.arena_mut().make_room(&mut self.budget, bytes)
+  }
+
+  /// The bytes an admission could take now (A-98): the arena's held capacity and what it could still claim from its
+  /// pool, less what is committed, the operation headroom and the pressure hold. What a refusal names as available
+  /// and a dynamic volume's `statfs` counts on; a snapshot, since another shard may claim the pool's extents first.
+  pub fn admittable(&self) -> u64 {
+    let claimable = u64::try_from(self.content.arena().claimable()).unwrap_or(u64::MAX);
+    self
+      .budget
+      .capacity()
+      .saturating_add(claimable)
+      .saturating_sub(self.budget.committed())
+      .saturating_sub(self.budget.headroom())
+      .saturating_sub(self.budget.hold())
+  }
+
+  /// Reserves `bytes` for a bounded volume against the shard budget, growing the arena from its pool first when the
+  /// budget lacks the capacity (A-98).
+  pub fn reserve(
+    &mut self,
+    bytes: u64,
+  ) -> Result<slates_mem::budget::Reservation, slates_mem::MemError> {
+    self.make_room(bytes);
+    self.budget.reserve(bytes)
+  }
+
+  /// Grows a dynamic charge by `bytes` against the shard budget, growing the arena from its pool first when the
+  /// budget lacks the capacity (A-98).
+  pub fn grow(
+    &mut self,
+    bytes: u64,
+  ) -> Result<slates_mem::budget::Reservation, slates_mem::MemError> {
+    self.make_room(bytes);
+    self.budget.grow(bytes)
+  }
+
+  /// Returns the arena's wholly free extents to its pool, keeping the capacity every commitment and the operation
+  /// headroom need (A-98): the bytes returned. Run after a committed publication, when no deferred free holds an
+  /// extent the committed image might still name.
+  pub fn release_idle(&mut self) -> u64 {
+    let keep = self
+      .budget
+      .committed()
+      .saturating_add(self.budget.headroom());
+    let returned = self
+      .content
+      .arena_mut()
+      .shrink(usize::try_from(keep).unwrap_or(usize::MAX));
+    let returned = u64::try_from(returned).unwrap_or(u64::MAX);
+    // The arena kept `keep`, the floor `retract` checks, so the budget follows it down; were it ever refused, the
+    // budget would promise bytes the arena no longer holds, so the capacity is resynchronised from the arena.
+    if !self.budget.retract(returned) {
+      let capacity = u64::try_from(self.content.arena().capacity()).unwrap_or(u64::MAX);
+      self
+        .budget
+        .retract(self.budget.capacity().saturating_sub(capacity));
+    }
+    returned
+  }
+
   /// The most bytes the store's slabs can ever hold together — directory nodes, directory blocks,
   /// inode versions, inode-table nodes and chunk records at their bounds, each slot at its true
   /// cost (§4.2 "segment, slab and buddy geometry report usable capacity"). The part of the
@@ -743,7 +808,7 @@ impl Volume {
   /// in `store` could still admit, never past its `max`. A transport reports this as the
   /// filesystem's size, so a dynamic volume's `df` never shows a total the shard cannot back.
   pub fn honourable_capacity_bytes(&self, store: &Store) -> u64 {
-    self.quota.honourable_limit(&store.budget)
+    self.quota.honourable_limit(store.admittable())
   }
 
   /// The newest epoch whose objects the head shares with a snapshot or its clone origin.
@@ -1681,7 +1746,8 @@ impl Volume {
       }
       _ => 0,
     };
-    if retention > store.budget.admittable() {
+    // A preflight: the pool's claimable room counts (A-98); the charge that follows claims it.
+    if retention > store.admittable() {
       self.retention_refusals = self.retention_refusals.saturating_add(1);
       return Err(VfsError::NoSpace);
     }
@@ -1923,6 +1989,7 @@ impl Volume {
     bytes: &[u8],
     recorded: Recorded,
   ) -> Result<usize, VfsError> {
+    store.make_room(self.quota.growth_needed(self.bytes.total(), charge));
     if !self
       .quota
       .admit(self.bytes.total(), charge, &mut store.budget)
@@ -2489,6 +2556,7 @@ impl Volume {
     tail: &[u8],
     charge: u64,
   ) -> Result<(), VfsError> {
+    store.make_room(self.quota.growth_needed(self.bytes.total(), charge));
     if !self
       .quota
       .admit(self.bytes.total(), charge, &mut store.budget)
@@ -3493,6 +3561,7 @@ impl Volume {
     if bytes == 0 {
       return Ok(());
     }
+    store.make_room(bytes);
     if store.budget.charge_retention(bytes).is_err() {
       self.retention_refusals = self.retention_refusals.saturating_add(1);
       return Err(VfsError::NoSpace);

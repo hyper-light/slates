@@ -129,6 +129,18 @@ impl Quota {
     }
   }
 
+  /// The growth a dynamic quota must still be granted for `referenced + more` (A-98: what the store makes room for
+  /// before asking); zero for a bounded quota, whose bytes its reservation already holds, or within what is granted.
+  pub fn growth_needed(&self, referenced: u64, more: u64) -> u64 {
+    match self {
+      Self::Bounded { .. } => 0,
+      Self::Dynamic { max, granted, .. } => referenced
+        .saturating_add(more)
+        .min(*max)
+        .saturating_sub(*granted),
+    }
+  }
+
   /// Bytes this quota holds against the shard budget: a dynamic quota's granted growth (a bounded
   /// quota's reservation is held by the server, so this is zero). Released to the budget on teardown.
   pub const fn budget_hold(&self) -> u64 {
@@ -169,13 +181,14 @@ impl Quota {
 
   /// The capacity the physical claim can honour right now (§4.6 `statfs`: "logical capacity and
   /// remaining space that the physical claim can honor"): a bounded quota's whole limit, since its
-  /// reservation is held; a dynamic quota's granted bytes plus what the shard `budget` could still
-  /// admit, never past its `max`. This — not the bare ceiling — is what a transport reports as the
-  /// filesystem's size, so `df` on a dynamic volume never shows a total the shard cannot back.
-  pub fn honourable_limit(&self, budget: &ShardBudget) -> u64 {
+  /// reservation is held; a dynamic quota's granted bytes plus the `admittable` bytes the shard could
+  /// still admit (`Store::admittable`, its pool's claimable extents included), never past its `max`.
+  /// This — not the bare ceiling — is what a transport reports as the filesystem's size, so `df` on a
+  /// dynamic volume never shows a total the shard cannot back.
+  pub fn honourable_limit(&self, admittable: u64) -> u64 {
     match self {
       Self::Bounded { limit } => *limit,
-      Self::Dynamic { max, granted, .. } => (*max).min(granted.saturating_add(budget.admittable())),
+      Self::Dynamic { max, granted, .. } => (*max).min(granted.saturating_add(admittable)),
     }
   }
 }

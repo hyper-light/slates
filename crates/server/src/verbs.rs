@@ -3147,7 +3147,7 @@ fn create(
     return refused(Refusal::AlreadyExists { existing });
   }
   let reservation = match size {
-    SizeClass::Bounded { limit } => match state.store.budget.reserve(limit) {
+    SizeClass::Bounded { limit } => match state.store.reserve(limit) {
       Ok(r) => Some(r),
       Err(slates_mem::MemError::BudgetExceeded { available, .. }) => {
         report_first_budget_refusal(state, "bytes", limit, available);
@@ -3808,9 +3808,9 @@ fn create_work(
   }
   // The seeded copy of the green is charged before the work exists; refused, nothing is created.
   let charged = crate::work_charge::footprint(&seeded, &[]);
-  if state.store.budget.grow(charged).is_err() {
+  if state.store.grow(charged).is_err() {
     return refused(Refusal::BudgetExceeded {
-      available: state.store.budget.admittable(),
+      available: state.store.admittable(),
     });
   }
   state.works.insert(
@@ -4562,7 +4562,7 @@ fn clone(
     DbSizeClass::Dynamic { max } => SizeClass::Dynamic { max },
   };
   let reservation = match size {
-    SizeClass::Bounded { limit } => match state.store.budget.reserve(limit) {
+    SizeClass::Bounded { limit } => match state.store.reserve(limit) {
       Ok(r) => Some(r),
       Err(slates_mem::MemError::BudgetExceeded { available, .. }) => {
         return refused(Refusal::BudgetExceeded { available });
@@ -5476,7 +5476,7 @@ fn resize(
   let old = slot.reservation;
   let grow = old.map_or(0, |r| limit.saturating_sub(r.bytes));
   let grown = if grow > 0 {
-    match state.store.budget.reserve(grow) {
+    match state.store.reserve(grow) {
       Ok(r) => Some(r),
       Err(slates_mem::MemError::BudgetExceeded { available, .. }) => {
         if let Some(v) = version_grown {
@@ -5520,7 +5520,7 @@ fn resize(
       .store
       .budget
       .release(slates_mem::budget::Reservation { bytes: combined });
-    match state.store.budget.reserve(limit) {
+    match state.store.reserve(limit) {
       Ok(r) => slot.reservation = Some(r),
       Err(_) => slot.reservation = None,
     }
@@ -6142,6 +6142,11 @@ pub(crate) fn materialize_taken_over(
     SizeClass::Bounded { limit } => limit,
     SizeClass::Dynamic { max } => max,
   };
+  // A shard that claims its arena lazily makes room for what the restore needs first (A-98); an archive that does not
+  // plan is refused by the restore below, as before.
+  if let Ok(needed) = slates_archive::restore_needed(archive) {
+    state.store.make_room(needed.min(volume_cap));
+  }
   let restore_budget = volume_cap.min(state.store.budget.admittable());
   let restored = slates_archive::restore(archive, restore_budget).map_err(|e| match e {
     slates_archive::ArchiveError::OverBudget { .. } => refused(Refusal::BudgetExceeded {
@@ -6152,7 +6157,7 @@ pub(crate) fn materialize_taken_over(
     }),
   })?;
   let reservation = match size {
-    SizeClass::Bounded { limit } => match state.store.budget.reserve(limit) {
+    SizeClass::Bounded { limit } => match state.store.reserve(limit) {
       Ok(r) => Some(r),
       Err(slates_mem::MemError::BudgetExceeded { available, .. }) => {
         return Err(Box::new(refused(Refusal::BudgetExceeded { available })));
@@ -7409,7 +7414,7 @@ fn rebuild_work(state: &mut ShardState, record: &VolumeRecord, green: DbVolumeId
   // Charged like a fresh work; a budget that cannot hold it leaves the work unbuilt (its verbs answer NotFound)
   // and counted, never kept uncharged.
   let charged = crate::work_charge::footprint(&content, &[]);
-  if state.store.budget.grow(charged).is_err() {
+  if state.store.grow(charged).is_err() {
     *state.refusals.entry(WORK_REBUILD_REFUSED).or_insert(0) += 1;
     return;
   }
@@ -7606,7 +7611,12 @@ pub fn publish_shard(state: &mut ShardState) -> Result<Published, slates_vfs::Vf
   state.store.content.arena_mut().capture();
   let outcome = publish_captured(state);
   match outcome {
-    Ok(_) => state.store.content.arena_mut().commit_capture(),
+    Ok(_) => {
+      state.store.content.arena_mut().commit_capture();
+      // The committed image names no block of a wholly free extent, and no deferred free holds one: it goes back to
+      // the pool for any shard to claim (A-98).
+      state.store.release_idle();
+    }
     Err(_) => state.store.content.arena_mut().abandon_capture(),
   }
   outcome
@@ -7949,7 +7959,7 @@ fn rebuild_volume(
   // recovery). It was admitted before the restart, so it fits unless the capacity itself shrank; on
   // teardown it is released through `budget_hold`, the same as a running volume's.
   let held = volume.budget_hold();
-  if held > 0 && state.store.budget.grow(held).is_err() {
+  if held > 0 && state.store.grow(held).is_err() {
     // The rebuilt volume returns its slots, blocks and retention rather than leaking them.
     let _ = volume.discard_partial(&mut state.store);
     if let Some(r) = reservation {
@@ -8427,6 +8437,9 @@ mod tests {
       |state| {
         let principal = Principal::Uid { uid: 1234 };
         let chunk = state.store.content.chunk_bytes();
+        // The shard claims its arena lazily (A-98); one claim takes its own slice, a single extent at this
+        // power-of-two reserve, and the volume below fits in it, so nothing else is claimed.
+        state.store.make_room(1);
         let capacity = state.store.content.arena().capacity();
         let headroom = usize::try_from(state.store.budget.headroom()).unwrap();
         let file_bytes = (capacity - headroom) / 2 + 2 * chunk;

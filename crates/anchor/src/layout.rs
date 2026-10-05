@@ -13,6 +13,9 @@ pub const LAYOUT_VERSION: u32 = 4;
 /// Format: one content-pool extent's owner word (A-98): 0 while the extent is free, else its owning partition plus
 /// one, so partition 0 is distinct from "free".
 pub const POOL_WORD_BYTES: usize = 8;
+/// Format: the pool extents a partition's slice may hold (A-98): its arena range is cut into power-of-two parts, at
+/// most one per bit of its length in units, which a 64-bit count bounds. Extent `partition × this + part`.
+pub const POOL_EXTENTS_PER_PARTITION: usize = 64;
 /// Format: the header's size: magic (4), version (4), identity (32), generation (8), total
 /// length (8), then the encoded geometry (64), padded to two cache lines.
 pub const HEADER_BYTES: usize = 128;
@@ -187,7 +190,7 @@ pub enum RegionKind {
   Audit,
   /// A landing slot.
   Landing(u32),
-  /// The content pool's owner words (A-98): one per extent, one extent per partition.
+  /// The content pool's owner words (A-98): [`POOL_EXTENTS_PER_PARTITION`] per partition.
   Pool,
 }
 
@@ -245,7 +248,9 @@ impl Geometry {
     }
     push(
       RegionKind::Pool,
-      u64::from(self.partitions).saturating_mul(u64::try_from(POOL_WORD_BYTES).unwrap_or(u64::MAX)),
+      u64::from(self.partitions)
+        .saturating_mul(u64::try_from(POOL_EXTENTS_PER_PARTITION).unwrap_or(u64::MAX))
+        .saturating_mul(u64::try_from(POOL_WORD_BYTES).unwrap_or(u64::MAX)),
     );
     out
   }

@@ -2139,6 +2139,7 @@ impl Overlay<'_> {
       self.plane()?.descriptors.remove(&no);
       let handle = self.vol.make_current_inode(store, no)?;
       let charge = self.vol.write_charge(store, no, 0, fp.size)?;
+      store.make_room(self.vol.quota.growth_needed(self.vol.bytes.total(), charge));
       if !self
         .vol
         .quota
@@ -2230,6 +2231,7 @@ impl Overlay<'_> {
       }
       bytes.truncate(done);
       let charge = u64::try_from(bytes.len()).unwrap_or(0);
+      store.make_room(self.vol.quota.growth_needed(self.vol.bytes.total(), charge));
       if !self
         .vol
         .quota

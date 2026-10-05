@@ -7,6 +7,12 @@
 //! `ArenaExhausted` naming the largest free extent when none fits, so the caller can grow or
 //! refuse in turn. Nothing here reaches the system allocator after the region set is built
 //! (AC-0.4); a region's buddy state is allocated once when the region is added.
+//!
+//! **Regions by id, and growth (A-98).** A region is held under a `u16` id that an extent carries and a recovery
+//! image names, so a region may be added under a chosen id ([`ChunkArena::add_region_at`]) and removed once wholly
+//! free ([`ChunkArena::remove_region`]) without renaming any other block. An arena may own an [`ExtentSource`]: the
+//! shared pool a shard's arena grows from when its budget would refuse ([`ChunkArena::grow`]), and returns an extent
+//! to once the extent is wholly free. Allocation tries the held regions in the order they were added.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -59,14 +65,47 @@ struct Slot {
   buddy: Buddy,
 }
 
+/// Where an arena's further regions come from (A-98): a pool of extents shared with other arenas, each handed out
+/// to one arena at a time under a stable id.
+pub trait ExtentSource: Send {
+  /// One more extent for this arena, with the id its blocks are named by, or `None` when the pool has none free.
+  fn claim(&mut self) -> Option<(u16, Region)>;
+  /// Returns extent `id`, wholly free, to the pool.
+  fn release(&mut self, id: u16, region: Region);
+  /// Claims the pool took but could not hand out (the OS refused to map the extent), so far: a claim refused this
+  /// way is counted here rather than lost.
+  fn refused(&self) -> u64;
+  /// The bytes of free extents this source could still hand out now, as an arena would hold them: what an admission
+  /// may count on beyond the arena's own capacity. A snapshot: another arena may claim them first.
+  fn available(&self) -> usize;
+}
+
 /// The arena.
-#[derive(Debug)]
 pub struct ChunkArena {
   /// This arena's identity, or `None` when the process has spent them (it then refuses every allocation).
   identity: Option<u64>,
-  slots: Vec<Slot>,
+  /// Regions by id; `None` where the arena holds no region of that id.
+  slots: Vec<Option<Slot>>,
+  /// The held ids, in the order they were added: the order allocation tries them.
+  order: Vec<u16>,
   granule: usize,
   allocated_bytes: usize,
+  /// The pool this arena grows from, when it has one.
+  source: Option<Box<dyn ExtentSource>>,
+  /// Whether the arena was locked into RAM ([`ChunkArena::lock`]): a region added after is locked as it is added.
+  locked: bool,
+}
+
+impl std::fmt::Debug for ChunkArena {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.debug_struct("ChunkArena")
+      .field("identity", &self.identity)
+      .field("order", &self.order)
+      .field("granule", &self.granule)
+      .field("allocated_bytes", &self.allocated_bytes)
+      .field("source", &self.source.is_some())
+      .finish_non_exhaustive()
+  }
 }
 
 impl ChunkArena {
@@ -82,9 +121,128 @@ impl ChunkArena {
     Self {
       identity,
       slots: Vec::new(),
+      order: Vec::new(),
       granule: granule.max(1),
       allocated_bytes: 0,
+      source: None,
+      locked: false,
     }
+  }
+
+  /// Sets the pool this arena grows from (A-98).
+  pub fn set_source(&mut self, source: Box<dyn ExtentSource>) {
+    self.source = Some(source);
+  }
+
+  /// Draws extents from the source until at least `bytes` of capacity were added or the source has none: the
+  /// capacity added (A-98). Zero without a source.
+  pub fn grow(&mut self, bytes: usize) -> usize {
+    let mut added = 0usize;
+    while added < bytes {
+      let Some((id, region)) = self.source.as_mut().and_then(|source| source.claim()) else {
+        break;
+      };
+      let before = self.capacity();
+      if self.add_region_at(id, region).is_err() {
+        // A source that hands out an id this arena holds, or a region under a granule, is refused; the claim is
+        // not the arena's to keep, and the pool sees no release for it, so stop rather than spin.
+        break;
+      }
+      // A locked arena keeps every region locked; an extent the OS will not lock goes back, and growth stops.
+      if self.locked
+        && self
+          .slot_mut(id)
+          .is_some_and(|slot| slot.region.lock().is_err())
+      {
+        if let (Ok(region), Some(source)) = (self.remove_region(id), self.source.as_mut()) {
+          source.release(id, region);
+        }
+        break;
+      }
+      added = added.saturating_add(self.capacity().saturating_sub(before));
+    }
+    added
+  }
+
+  /// Grows from the source by what a commitment of `bytes` lacks in `budget`, and extends `budget` by what was added
+  /// (A-98): the bytes added. Nothing grows when the commitment is admittable already; the deficit counts the
+  /// budget's pressure hold ([`crate::budget::ShardBudget::deficit`]).
+  pub fn make_room(&mut self, budget: &mut crate::budget::ShardBudget, bytes: u64) -> u64 {
+    if bytes == 0 {
+      return 0;
+    }
+    let deficit = budget.deficit(bytes);
+    if deficit == 0 {
+      return 0;
+    }
+    let added =
+      u64::try_from(self.grow(usize::try_from(deficit).unwrap_or(usize::MAX))).unwrap_or(u64::MAX);
+    budget.extend(added);
+    added
+  }
+
+  /// Returns every held region that is wholly free (no live or deferred block) to the source, keeping
+  /// `keep_bytes` of capacity: the capacity returned (A-98). Zero without a source.
+  pub fn shrink(&mut self, keep_bytes: usize) -> usize {
+    if self.source.is_none() {
+      return 0;
+    }
+    let mut returned = 0usize;
+    let idle: Vec<u16> = self
+      .order
+      .iter()
+      .rev()
+      .copied()
+      .filter(|id| {
+        self.slot(*id).is_some_and(|slot| {
+          slot.buddy.free_bytes() == slot.buddy.region_bytes() && slot.buddy.deferred_bytes() == 0
+        })
+      })
+      .collect();
+    for id in idle {
+      let capacity = self.capacity();
+      let Some(len) = self.slot(id).map(|slot| slot.buddy.region_bytes()) else {
+        continue;
+      };
+      if capacity.saturating_sub(len) < keep_bytes {
+        continue;
+      }
+      if let Ok(region) = self.remove_region(id)
+        && let Some(source) = self.source.as_mut()
+      {
+        source.release(id, region);
+        returned = returned.saturating_add(len);
+      }
+    }
+    returned
+  }
+
+  /// The bytes this arena could still claim from its source ([`ExtentSource::available`]); zero without a source.
+  pub fn claimable(&self) -> usize {
+    self.source.as_ref().map_or(0, |source| source.available())
+  }
+
+  /// Claims the source could not hand out so far ([`ExtentSource::refused`]); zero without a source.
+  pub fn source_refusals(&self) -> u64 {
+    self.source.as_ref().map_or(0, |source| source.refused())
+  }
+
+  fn slot(&self, id: u16) -> Option<&Slot> {
+    self.slots.get(usize::from(id)).and_then(Option::as_ref)
+  }
+
+  fn slot_mut(&mut self, id: u16) -> Option<&mut Slot> {
+    self.slots.get_mut(usize::from(id)).and_then(Option::as_mut)
+  }
+
+  /// The held regions' allocators.
+  fn held(&self) -> impl Iterator<Item = &Slot> {
+    self.slots.iter().flatten()
+  }
+
+  /// The held regions' allocators, mutably.
+  fn held_mut(&mut self) -> impl Iterator<Item = &mut Slot> {
+    self.slots.iter_mut().flatten()
   }
 
   /// The granule: every block is a power-of-two multiple of it.
@@ -95,6 +253,17 @@ impl ChunkArena {
   /// Adds a region; its length is used up to the largest power-of-two number of granules it
   /// holds. Returns the region's index.
   pub fn add_region(&mut self, region: Region) -> Result<u16, MemError> {
+    let index = u16::try_from(self.slots.len()).map_err(|_| MemError::TooLarge {
+      len: self.slots.len(),
+      max: usize::from(u16::MAX),
+    })?;
+    self.add_region_at(index, region)?;
+    Ok(index)
+  }
+
+  /// Adds a region under id `id` (A-98: a pool extent, whose id its blocks are named by). Refused
+  /// [`MemError::RegionOccupied`] when the arena holds that id, or as [`ChunkArena::add_region`] refuses.
+  pub fn add_region_at(&mut self, id: u16, region: Region) -> Result<(), MemError> {
     let granules = region.len() / self.granule;
     if granules == 0 {
       return Err(MemError::TooLarge {
@@ -102,21 +271,68 @@ impl ChunkArena {
         max: self.granule,
       });
     }
+    if self.slot(id).is_some() {
+      return Err(MemError::RegionOccupied { region: id });
+    }
     let max_order = usize::BITS - 1 - granules.leading_zeros();
-    let index = u16::try_from(self.slots.len()).map_err(|_| MemError::TooLarge {
-      len: self.slots.len(),
-      max: usize::from(u16::MAX),
-    })?;
-    self.slots.push(Slot {
+    let slot = Slot {
       region,
       buddy: Buddy::new(self.granule, max_order)?,
-    });
-    Ok(index)
+    };
+    let at = usize::from(id);
+    if self.slots.len() <= at {
+      self.slots.resize_with(at.saturating_add(1), || None);
+    }
+    if let Some(place) = self.slots.get_mut(at) {
+      *place = Some(slot);
+      self.order.push(id);
+    }
+    Ok(())
   }
 
-  /// Regions in the arena.
+  /// Removes region `id` and hands its mapping back (A-98: an extent returned to the pool). Refused
+  /// [`MemError::RegionInUse`] while it holds a live or deferred block, or `NoSuchRegion` when the arena holds no
+  /// such region.
+  pub fn remove_region(&mut self, id: u16) -> Result<Region, MemError> {
+    let slot = self.slot(id).ok_or(MemError::ForeignExtent {
+      offset: 0,
+      len: 0,
+      reason: ExtentRefusal::NoSuchRegion,
+    })?;
+    let allocated = slot
+      .buddy
+      .region_bytes()
+      .saturating_sub(slot.buddy.free_bytes());
+    if allocated > 0 || slot.buddy.deferred_bytes() > 0 {
+      return Err(MemError::RegionInUse {
+        region: id,
+        allocated: allocated.max(slot.buddy.deferred_bytes()),
+      });
+    }
+    let removed = self
+      .slots
+      .get_mut(usize::from(id))
+      .and_then(Option::take)
+      .ok_or(MemError::ForeignExtent {
+        offset: 0,
+        len: 0,
+        reason: ExtentRefusal::NoSuchRegion,
+      })?;
+    self.order.retain(|held| *held != id);
+    while self.slots.last().is_some_and(Option::is_none) {
+      self.slots.pop();
+    }
+    Ok(removed.region)
+  }
+
+  /// Regions the arena holds.
   pub fn regions(&self) -> usize {
-    self.slots.len()
+    self.order.len()
+  }
+
+  /// The held region ids, in the order allocation tries them.
+  pub fn region_ids(&self) -> &[u16] {
+    &self.order
   }
 
   /// Bytes currently allocated, deferred frees included (A-64: they stay allocated until a publication commits).
@@ -126,7 +342,7 @@ impl ChunkArena {
 
   /// Free bytes across regions.
   pub fn free_bytes(&self) -> usize {
-    self.slots.iter().map(|s| s.buddy.free_bytes()).sum()
+    self.held().map(|s| s.buddy.free_bytes()).sum()
   }
 
   /// The usable (buddy-allocatable) capacity across regions: the bytes that can actually be
@@ -134,7 +350,7 @@ impl ChunkArena {
   /// length. Admission must reserve against this, never the mapping, or it over-promises quota the
   /// arena cannot physically back (§4.2, BUG-2). Constant for the life of the arena's regions.
   pub fn capacity(&self) -> usize {
-    self.slots.iter().map(|s| s.buddy.region_bytes()).sum()
+    self.held().map(|s| s.buddy.region_bytes()).sum()
   }
 
   /// Locks every region into RAM (§4.2, BUG-1), so content a strict volume backs never swaps.
@@ -143,17 +359,17 @@ impl ChunkArena {
   /// refuses rather than silently becoming swappable service. Regions locked before the refusal
   /// stay locked; the caller unwinds by refusing the admission.
   pub fn lock(&mut self) -> Result<(), MemError> {
-    for slot in &mut self.slots {
+    for slot in self.held_mut() {
       slot.region.lock()?;
     }
+    self.locked = true;
     Ok(())
   }
 
   /// Locked bytes across regions.
   pub fn locked_bytes(&self) -> usize {
     self
-      .slots
-      .iter()
+      .held()
       .filter(|s| s.region.locked())
       .map(|s| s.region.len())
       .sum()
@@ -176,13 +392,19 @@ impl ChunkArena {
       .identity
       .ok_or(MemError::GenerationExhausted { index: u32::MAX })?;
     let mut largest = 0;
-    for (index, slot) in self.slots.iter_mut().enumerate() {
-      let Ok(region) = u16::try_from(index) else {
-        break;
+    let Self {
+      order,
+      slots,
+      allocated_bytes,
+      ..
+    } = self;
+    for &region in order.iter() {
+      let Some(slot) = slots.get_mut(usize::from(region)).and_then(Option::as_mut) else {
+        continue;
       };
       match slot.buddy.alloc(len) {
         Ok(block) => {
-          self.allocated_bytes = self.allocated_bytes.saturating_add(block.len());
+          *allocated_bytes = allocated_bytes.saturating_add(block.len());
           return Ok(Extent {
             arena,
             region,
@@ -200,8 +422,7 @@ impl ChunkArena {
   /// The refusal when no region served `len`: too large for any region, or exhausted.
   fn exhausted(&self, len: usize, largest: usize) -> MemError {
     let max = self
-      .slots
-      .iter()
+      .held()
       .map(|s| s.buddy.region_bytes())
       .max()
       .unwrap_or(0);
@@ -227,8 +448,7 @@ impl ChunkArena {
       return Err(foreign(ExtentRefusal::OtherArena));
     }
     let slot = self
-      .slots
-      .get_mut(usize::from(extent.region))
+      .slot_mut(extent.region)
       .ok_or_else(|| foreign(ExtentRefusal::NoSuchRegion))?;
     let before = slot.buddy.free_bytes();
     slot.buddy.free_or_defer(extent.block)?;
@@ -243,14 +463,11 @@ impl ChunkArena {
     let arena = self
       .identity
       .ok_or(MemError::GenerationExhausted { index: u32::MAX })?;
-    let slot = self
-      .slots
-      .get_mut(usize::from(region))
-      .ok_or(MemError::ForeignExtent {
-        offset,
-        len,
-        reason: ExtentRefusal::NoSuchRegion,
-      })?;
+    let slot = self.slot_mut(region).ok_or(MemError::ForeignExtent {
+      offset,
+      len,
+      reason: ExtentRefusal::NoSuchRegion,
+    })?;
     let block = slot.buddy.claim(offset, len)?;
     self.allocated_bytes = self.allocated_bytes.saturating_add(block.len());
     Ok(Extent {
@@ -264,7 +481,7 @@ impl ChunkArena {
   /// checked before anything changes).
   pub fn can_allocate(&self, count: usize, len: usize) -> bool {
     let mut left = count;
-    for slot in &self.slots {
+    for slot in self.held() {
       left = left.saturating_sub(slot.buddy.allocatable(left, len));
     }
     left == 0
@@ -275,21 +492,20 @@ impl ChunkArena {
   pub fn holds(&self, extent: Extent) -> bool {
     self.identity == Some(extent.arena)
       && self
-        .slots
-        .get(usize::from(extent.region))
+        .slot(extent.region)
         .is_some_and(|slot| slot.buddy.holds(extent.block))
   }
 
   /// Bytes freed but held until the next publication commits, because the committed recovery image may name
   /// them (A-64). An allocation refused while this is not zero can succeed after a publication.
   pub fn deferred_bytes(&self) -> usize {
-    self.slots.iter().map(|s| s.buddy.deferred_bytes()).sum()
+    self.held().map(|s| s.buddy.deferred_bytes()).sum()
   }
 
   /// A recovery publication starts: every live block it may name is recorded, and a free of one is deferred
   /// until the publication commits or is abandoned (A-64).
   pub fn capture(&mut self) {
-    self.slots.iter_mut().for_each(|s| s.buddy.capture());
+    self.held_mut().for_each(|s| s.buddy.capture());
   }
 
   /// The publication of the last [`ChunkArena::capture`] committed: frees every deferred block the new image
@@ -310,24 +526,26 @@ impl ChunkArena {
 
   /// Runs `step` on every region's allocator and takes the bytes it released off the allocated total.
   fn settle(&mut self, step: fn(&mut Buddy)) {
-    for slot in &mut self.slots {
+    let mut released_total = 0usize;
+    for slot in self.slots.iter_mut().flatten() {
       let before = slot.buddy.free_bytes();
       step(&mut slot.buddy);
-      let released = slot.buddy.free_bytes().saturating_sub(before);
-      self.allocated_bytes = self.allocated_bytes.saturating_sub(released);
+      released_total =
+        released_total.saturating_add(slot.buddy.free_bytes().saturating_sub(before));
     }
+    self.allocated_bytes = self.allocated_bytes.saturating_sub(released_total);
   }
 
   /// The bytes the arena's regions map — the address space taken, which the buddy's usable
   /// [`ChunkArena::capacity`] is at most (§4.2 "segment, slab and buddy geometry report usable
   /// capacity, not mapping length": both are reported, so the difference is visible).
   pub fn mapped_bytes(&self) -> usize {
-    self.slots.iter().map(|s| s.region.len()).sum()
+    self.held().map(|s| s.region.len()).sum()
   }
 
   /// The bytes of an extent.
   pub fn bytes(&self, extent: Extent) -> Option<&[u8]> {
-    let slot = self.slots.get(usize::from(extent.region))?;
+    let slot = self.slot(extent.region)?;
     slot
       .region
       .bytes()
@@ -336,7 +554,7 @@ impl ChunkArena {
 
   /// The bytes of an extent, mutably.
   pub fn bytes_mut(&mut self, extent: Extent) -> Option<&mut [u8]> {
-    let slot = self.slots.get_mut(usize::from(extent.region))?;
+    let slot = self.slot_mut(extent.region)?;
     slot
       .region
       .bytes_mut()
@@ -345,15 +563,12 @@ impl ChunkArena {
 
   /// A region, read-only.
   pub fn region(&self, index: u16) -> Option<&Region> {
-    self.slots.get(usize::from(index)).map(|s| &s.region)
+    self.slot(index).map(|s| &s.region)
   }
 
   /// A region, for the locking sequence and the pre-fault scheduler.
   pub fn region_mut(&mut self, index: u16) -> Option<&mut Region> {
-    self
-      .slots
-      .get_mut(usize::from(index))
-      .map(|s| &mut s.region)
+    self.slot_mut(index).map(|s| &mut s.region)
   }
 }
 
@@ -482,5 +697,104 @@ mod tests {
         ..
       })
     ));
+  }
+
+  /// A pool of regions under chosen ids: hands out the last returned first, as the anchor's pool may.
+  struct TestPool {
+    free: Vec<(u16, Region)>,
+  }
+
+  impl ExtentSource for TestPool {
+    fn claim(&mut self) -> Option<(u16, Region)> {
+      self.free.pop()
+    }
+    fn release(&mut self, id: u16, region: Region) {
+      self.free.push((id, region));
+    }
+    fn refused(&self) -> u64 {
+      0
+    }
+    fn available(&self) -> usize {
+      self.free.iter().map(|(_, region)| region.len()).sum()
+    }
+  }
+
+  fn pooled(p: usize, ids: &[u16]) -> ChunkArena {
+    let mut arena = ChunkArena::new(p);
+    arena.set_source(Box::new(TestPool {
+      free: ids
+        .iter()
+        .map(|id| (*id, Region::map(p * 4, p, false).unwrap()))
+        .collect(),
+    }));
+    arena
+  }
+
+  /// A-98: do grow an arena from a pool by more than one region's capacity, allocate, then free and shrink; expect the
+  /// capacity to grow by whole regions under the pool's ids, an allocation named by the region's id, a region in use
+  /// refused removal, the wholly free regions returned except what `keep_bytes` keeps, and a later growth taking the
+  /// returned id again.
+  #[test]
+  fn an_arena_grows_from_its_pool_under_the_pools_ids_and_returns_free_regions() {
+    let p = page();
+    let mut arena = pooled(p, &[40, 7]);
+    assert_eq!(arena.capacity(), 0);
+    assert_eq!(arena.grow(p * 5), p * 8, "two whole regions");
+    assert_eq!(arena.region_ids(), [7, 40]);
+    assert_eq!(arena.grow(p), 0, "the pool is empty");
+    let first = arena.alloc(p * 4).unwrap();
+    let second = arena.alloc(p).unwrap();
+    assert_eq!((first.region(), second.region()), (7, 40));
+    assert!(matches!(
+      arena.remove_region(40),
+      Err(MemError::RegionInUse { region: 40, .. })
+    ));
+    returns_free_regions_to_the_pool(&mut arena, (first, second), p);
+  }
+
+  /// The return half of [`an_arena_grows_from_its_pool_under_the_pools_ids_and_returns_free_regions`]: `first` fills
+  /// region 7 and `second` sits in region 40, each of four granules of `p`.
+  fn returns_free_regions_to_the_pool(
+    arena: &mut ChunkArena,
+    (first, second): (Extent, Extent),
+    p: usize,
+  ) {
+    arena.free(second).unwrap();
+    assert_eq!(
+      arena.shrink(0),
+      p * 4,
+      "only the wholly free region returns"
+    );
+    assert_eq!(arena.region_ids(), [7]);
+    arena.free(first).unwrap();
+    assert_eq!(arena.shrink(p * 4), 0, "keep_bytes keeps the last region");
+    assert_eq!(arena.grow(p), p * 4);
+    assert_eq!(
+      arena.region_ids(),
+      [7, 40],
+      "the returned id is taken again"
+    );
+    assert!(matches!(
+      arena.add_region_at(7, Region::map(p * 4, p, false).unwrap()),
+      Err(MemError::RegionOccupied { region: 7 })
+    ));
+  }
+
+  /// A-98 recovery: do add a region under a high id to a fresh arena and claim a block in it; expect the claim to land
+  /// at the named id and offset, and a free of it to return the arena to empty.
+  #[test]
+  fn a_block_is_claimed_in_a_region_added_under_its_id() {
+    let p = page();
+    let mut arena = ChunkArena::new(p);
+    arena
+      .add_region_at(300, Region::map(p * 4, p, false).unwrap())
+      .unwrap();
+    let claimed = arena.claim(300, p * 2, p).unwrap();
+    assert_eq!((claimed.region(), claimed.offset()), (300, p * 2));
+    assert!(arena.holds(claimed));
+    arena.free(claimed).unwrap();
+    assert_eq!(arena.allocated_bytes(), 0);
+    assert!(arena.remove_region(300).is_ok());
+    assert_eq!(arena.regions(), 0);
   }
 }

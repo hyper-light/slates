@@ -1888,16 +1888,11 @@ fn a_volume_past_the_reserves_power_of_two_part_fills_and_survives_a_restart() {
     .attach(volume, None, slates_ipc::protocol::Intent::Write)
     .unwrap()
     .attachment;
-  let file = |index: u64| -> Vec<u8> {
-    (0..FILL_FILE)
-      .map(|at| u8::try_from((at as u64 ^ index.wrapping_mul(0x9E37)) & 0xFF).unwrap())
-      .collect()
-  };
   for index in 0..FILL_FILES {
     let wrote = client.fs_write(
       (volume, attachment),
       &format!("f{index}"),
-      &file(index),
+      &file_bytes(index),
       0o644,
     );
     assert_eq!(wrote.ok(), Some(FILL_FILE as u64), "file {index}");
@@ -1911,9 +1906,131 @@ fn a_volume_past_the_reserves_power_of_two_part_fills_and_survives_a_restart() {
       slates_ipc::protocol::ReadAt::Head,
     );
     assert!(
-      read.unwrap() == file(index),
+      read.unwrap() == file_bytes(index),
       "file {index} after the restart"
     );
   }
   second.stop();
+}
+
+/// The bytes of file `index` in the fill tests: distinct per file, so a block read from the wrong place shows.
+fn file_bytes(index: u64) -> Vec<u8> {
+  (0..FILL_FILE)
+    .map(|at| u8::try_from((at as u64 ^ index.wrapping_mul(0x9E37)) & 0xFF).unwrap())
+    .collect()
+}
+
+/// Shape: one shard's slice in the pool tests: a power of two, so each slice is one extent.
+const SLICE: u64 = 32 << 20;
+/// Shape: shards in the pool tests.
+const POOL_SHARDS: u16 = 2;
+
+/// A name whose volume the partition `shard` owns, of a daemon with [`POOL_SHARDS`] partitions.
+fn name_on(shard: u16, stem: &str) -> String {
+  (0..)
+    .map(|n| format!("{stem}-{n}"))
+    .find(|name| slates_server::verbs::owner_of_name(name, usize::from(POOL_SHARDS)) == shard)
+    .unwrap()
+}
+
+/// A-98 (§4.2): a volume is no longer capped by its shard's slice. Do: start two shards whose slices are [`SLICE`]
+/// each, create a bounded volume of 1.25 × [`SLICE`] on shard 0, write 1.19 × [`SLICE`] of files into it, restart
+/// the daemon over the same anchor, and read every file. Expect the volume admitted (its shard claims the other
+/// slice's extent from the pool), every file written, and every byte back after the restart (the extent's owner
+/// word and the image's blocks in it both survive). Before the pool, the create was refused `BudgetExceeded`.
+#[test]
+fn a_volume_larger_than_its_shards_slice_fills_from_the_pool_and_survives_a_restart() {
+  let profile = common::machine_profile();
+  let instance = format!("srv-pool-{}", std::process::id());
+  let mut config = DaemonConfig::derive(&profile, &instance, Some(POOL_SHARDS));
+  config.reserve_per_shard = SLICE;
+  let segment = anchor_segment("pool", &profile, &config);
+  let first = Daemon::start(&profile, config.clone(), source_of(&segment)).unwrap();
+  first
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let mut client = connect(&instance);
+  let volume = client
+    .create(&CreateSpec {
+      size: SizeClass::Bounded {
+        limit: SLICE + SLICE / 4,
+      },
+      ..scratch(&name_on(0, "large"))
+    })
+    .expect("a volume larger than its shard's slice is admitted from the pool");
+  let attachment = client
+    .attach(volume, None, slates_ipc::protocol::Intent::Write)
+    .unwrap()
+    .attachment;
+  let files = SLICE / u64::try_from(FILL_FILE).unwrap() * 19 / 16;
+  for index in 0..files {
+    let wrote = client.fs_write(
+      (volume, attachment),
+      &format!("f{index}"),
+      &file_bytes(index),
+      0o644,
+    );
+    assert_eq!(wrote.ok(), Some(FILL_FILE as u64), "file {index}");
+  }
+  first.stop();
+  let second = Daemon::start(&profile, config, source_of(&segment)).unwrap();
+  for index in 0..files {
+    let read = client.read(
+      volume,
+      &format!("f{index}"),
+      slates_ipc::protocol::ReadAt::Head,
+    );
+    assert!(
+      read.unwrap() == file_bytes(index),
+      "file {index} after the restart"
+    );
+  }
+  second.stop();
+}
+
+/// A-98 (§4.2): shards meet in the pool. Do: on two shards of [`SLICE`] each, create a volume on shard 0 that takes
+/// the other slice's extent too, try a volume on shard 1, then destroy the first and try again. Expect shard 1's
+/// create refused `BudgetExceeded` while the pool is taken (typed, nothing created), and admitted once the destroy
+/// completes and its shard's next publication returns the wholly free extents to the pool.
+#[test]
+fn a_shard_is_refused_while_another_holds_the_pool_and_admitted_once_it_returns() {
+  let profile = common::machine_profile();
+  let instance = format!("srv-pool-meet-{}", std::process::id());
+  let mut config = DaemonConfig::derive(&profile, &instance, Some(POOL_SHARDS));
+  config.reserve_per_shard = SLICE;
+  let segment = anchor_segment("pool-meet", &profile, &config);
+  let daemon = Daemon::start(&profile, config, source_of(&segment)).unwrap();
+  daemon
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let mut client = connect(&instance);
+  let bounded = |name: String, limit: u64| CreateSpec {
+    size: SizeClass::Bounded { limit },
+    ..scratch(&name)
+  };
+  let large = client
+    .create(&bounded(name_on(0, "large"), SLICE + SLICE / 4))
+    .expect("the pool covers it");
+  let other = bounded(name_on(1, "other"), SLICE / 4);
+  match client.create(&other) {
+    Err(ClientError::Refused(slates_ipc::protocol::Refusal::BudgetExceeded { .. })) => {}
+    refused => panic!("shard 1 must be refused while shard 0 holds the pool: {refused:?}"),
+  }
+  client.destroy(large).unwrap();
+  let started = Instant::now();
+  let admitted = loop {
+    // The destroy completes in slices, and each mutating verb on shard 0 publishes; a create on shard 0 is one such
+    // verb, so the extents return at the latest after it.
+    let nudge = client.create(&bounded(name_on(0, "nudge"), 1 << 20));
+    if let Ok(nudged) = nudge {
+      client.destroy(nudged).unwrap();
+    }
+    match client.create(&other) {
+      Ok(id) => break id,
+      Err(_) if started.elapsed() < START_WAIT => std::hint::spin_loop(),
+      Err(e) => panic!("shard 1 is admitted once the pool returns: {e}"),
+    }
+  };
+  assert_ne!(admitted, large);
+  daemon.stop();
 }

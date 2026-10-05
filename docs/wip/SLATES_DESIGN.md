@@ -9485,8 +9485,8 @@ Status: built 2026-10-05 (condition 13, §4.12 `slates.fs`).
   The staging change was red against the merge loop first (a work has no store slot; the catalog record is looked
   up instead). Suites: mcp 12, client 16, daemon 19, bridge-core 76, bridge-nfs 153.
 
-### A-98 — A shard's arena grows from a shared extent pool (2026-10-05, in progress)
-Status: designed 2026-10-05; piece 1 built the same day, the rest to follow in order. Measured cause in BENCHMARKS ("The daemon under a container
+### A-98 — A shard's arena grows from a shared extent pool (2026-10-05)
+Status: designed and built 2026-10-05 (pieces 1–5); the measurement and the crash-during-growth test owed (piece 6). Measured cause in BENCHMARKS ("The daemon under a container
 memory cap") and GAPS.
 - Why: a volume lives on one shard, and a shard's content arena is a fixed slice of the anchor's content object,
   RAM ÷ shards ÷ `MEMORY_CLASSES`. A volume's ceiling is therefore 1/(3 × shards) of the machine:
@@ -9494,36 +9494,64 @@ memory cap") and GAPS.
   - 1/54 of RAM on an 18-shard host, where a 1 GiB bounded volume was refused.
   Seastar and ScyllaDB accept a fixed per-core share because their data is spread over cores by key; a slates volume
   has one writer and cannot be spread.
-- What, a two-level allocator: the shape of tcmalloc's per-thread caches over a central free list and of Linux's
-  per-CPU page lists over the zone allocator. Each shard keeps a *base* arena in its slice, smaller than today's.
-  After the slices, the content object holds a *pool* of extents, each one base arena long, so each is one buddy
-  region, as `ChunkArena` already supports several.
-  - A shard whose budget would refuse claims a free extent, maps it (`ExclusiveObject::open_range`), adds it as a
-    region, and raises its reserve by its length.
-  - A claim is a compare-and-swap of the extent's owner word in the anchor segment (0 free, else partition + 1), so
-    the claim outlives a daemon restart as the content does. It is taken on the cold growth path, never per write.
-  - The pool keeps the machine's content capacity whole: base × shards + pool = what the slices hold today.
-- Durability: a shard's recovery image lists the pool extents it holds, in region order, so blocks keep their
-  (region, offset) names (A-64). Recovery re-adds those extents in that order, checked against the owner words, and
-  claims the blocks the image names; an extent that a word says is the shard's but no image names is released.
-- Pieces, in order, each tested by use:
-  1. **Built (2026-10-05):** the owner-word table in the anchor segment. It is a `Pool` region, one 8-byte word per
-     partition, so one extent per partition, and the layout is version 4 (a version-3 segment is refused). Claim and
+- What, a two-level allocator (revised 2026-10-05, before piece 2): the shape of tcmalloc's per-thread caches over a
+  central free list and of Linux's per-CPU page lists over the zone allocator.
+  - The pool is every slice's arena range, cut into its power-of-two parts (`daemon.rs` `arena_parts`, on a unit of
+    one chunk window rounded to the mapping granule, so every part holds whole chunks). Each part is an extent; its
+    id is `partition × 64 + part`, since a slice has at most one part per bit of its unit count.
+  - An extent is held by at most one shard, claimed by a compare-and-swap of its owner word in the anchor segment
+    (0 free, else partition + 1). The claim outlives a daemon restart, as the content does.
+  - A shard claims lazily, at admission: when its budget would refuse for want of capacity, the store grows the arena
+    by the deficit (`Store::make_room`). The arena preference is the shard's own slice's parts, largest first, then
+    other slices' parts. The budget's capacity is extended by what was added.
+  - A shard returns an extent once it is wholly free after a committed publication, keeping what its commitments
+    need (piece 5).
+  - Not done, and why: the first design kept a fixed base per shard and a separate pool cut from it. Its split had no
+    derivation (R3), and an eager base leaves nothing to share. With lazy claims the total content capacity is
+    exactly today's, and one volume can reach all of it while other shards hold nothing.
+  - Blocks are named by extent id, so an image needs no extent table. The layout version 4 already refuses every
+    segment an older daemon wrote, so no older image is read.
+  - The operation headroom is derived from the shard's own slice, not from what it holds now, which may be nothing.
+  - A shard whose arena is locked (a `require_locked` admission) locks each extent it adds; a refused lock returns the
+    extent and stops the growth, so the admission is refused typed.
+  - The pressure hold (the host's shortfall, an amount withheld from admission) counts in the deficit a shard claims
+    for, so the admission ceiling is held plus claimable capacity less the hold, as it was the slice less the hold.
+    Claiming maps no RAM, and the hold keeps the claimed bytes from being admitted. **Wrong in the first cut:** growth
+    stopped while any hold was set, so on a loaded host a shard that held nothing admitted nothing (seven fleet tests
+    refused every create, `bytes[capacity=0 … headroom=10485760]`).
+  - Still per shard: the chunk, inode and directory slabs and the metadata class are sized from the shard's slice.
+    A volume of large files reaches the pool's whole capacity (a chunk is sixteen granules); a volume of many small
+    files stays bounded by its shard's slabs. Recorded in GAPS.
+- Pieces, each tested by use:
+  1. **Built (2026-10-05):** the owner-word table in the anchor segment. It is a `Pool` region of 64 words per
+     partition (`POOL_EXTENTS_PER_PARTITION`), and the layout is version 4 (a version-3 segment is refused). Claim and
      release are a compare-and-swap of the word (`pool_claim`, `pool_release`, `pool_owner`, `pool_held_by`); a
-     release by another partition changes nothing; an extent past the pool is refused typed. Proven by
-     `a_pool_extent_is_claimed_by_one_partition_and_released_only_by_it` and
-     `racing_claimants_take_each_pool_extent_exactly_once_and_the_claims_outlive_the_mapping`: eight separate
-     mappings race for eight extents and each is taken exactly once; the claims hold through a fresh attachment.
-     Both pass on macOS and Linux (a descriptor handoff there).
-  - Before piece 2 (2026-10-05): a shard's arena range is cut into power-of-two regions, largest first
-    (`daemon.rs` `arena_parts`). The buddy uses a region's largest power-of-two run of granules only, so a single
-    region left up to half of a reserve unallocatable (25% under a 1 GiB cap: 128 of 170.7 MiB). Region 0 keeps its
-    base and length, so images name blocks as before. Pool extents take the same cut.
-  2. The base and pool sizes, derived in the daemon's content layout; a refusal at an empty pool, typed.
-  3. Growth in the shard: a refused admission claims and adds an extent; the budget's reserve grows. Test: a volume
-     larger than one base arena fills on a shard, and two shards contend for the pool.
-  4. Images and recovery: extents named in the image, re-added on restart; a daemon SIGKILLed with a grown volume
-     recovers it byte for byte (the client restart oracle).
-  5. Release: an extent wholly free after a committed publication goes back to the pool.
-  6. Measured: the memory-capped container's volume against its 57 MiB today; the A-96 `capture`/`commit_capture`
-     walk stays per region.
+     release by another partition changes nothing; an extent past the pool is refused typed.
+     - `a_pool_extent_is_claimed_by_one_partition_and_released_only_by_it`.
+     - `racing_claimants_take_each_pool_extent_exactly_once_and_the_claims_outlive_the_mapping`: eight separate
+       mappings race for all 512 extents and each is taken exactly once; the claims hold through a fresh attachment.
+       It passes on macOS and Linux (a descriptor handoff there).
+  2. **Built (2026-10-05):** a slice's arena range is cut into power-of-two parts. The buddy uses a region's largest
+     power-of-two run of granules only, so a single region left up to half of a reserve unallocatable (25% under a
+     1 GiB cap: 128 of 170.7 MiB). The capped container's volume went from 57 to 124 MiB (BENCHMARKS), and
+     `a_volume_past_the_reserves_power_of_two_part_fills_and_survives_a_restart` holds it across a restart.
+  3. **Built (2026-10-05):** the arena holds regions by id (`ChunkArena::add_region_at`, `remove_region`) and grows
+     from an `ExtentSource` (`grow`, `shrink`, `make_room`); the budget extends and retracts with it (`deficit`,
+     `extend`, `retract`). `crates/server/src/content_pool.rs` is the source over the owner words.
+     - Every admission makes room first: a bounded reservation, a dynamic volume's growth (only the growth it still
+       needs, `Quota::growth_needed`), a retention charge, a replica hold's charge, and a takeover's restore (exactly
+       what the archive plans, `slates_archive::restore_needed`).
+     - Unit tests: `an_arena_grows_from_its_pool_under_the_pools_ids_and_returns_free_regions`,
+       `a_block_is_claimed_in_a_region_added_under_its_id`,
+       `a_budget_extends_by_its_deficit_and_retracts_only_above_its_commitments`.
+  4. **Built (2026-10-05):** recovery. A shard re-adds the extents its owner words name before its image's blocks are
+     claimed. `a_volume_larger_than_its_shards_slice_fills_from_the_pool_and_survives_a_restart`: two shards of a
+     32 MiB slice each; a 40 MiB volume on one shard takes 38 MiB of files and reads them back after a restart. Before
+     the pool, the create was refused.
+  5. **Built (2026-10-05):** release after every committed publication (`Store::release_idle`), keeping what the
+     commitments and the headroom need. `a_shard_is_refused_while_another_holds_the_pool_and_admitted_once_it_returns`:
+     while one shard holds both slices, the other's create is refused `BudgetExceeded`; once the volume is destroyed,
+     the other is admitted.
+  6. Owed: measured in the memory-capped container (one volume against the whole content capacity); a SIGKILL during
+     growth (a claim taken, no image naming it yet: re-added, then released at the first publication, by reading);
+     a status line for the shard's held extents and `source_refusals`.

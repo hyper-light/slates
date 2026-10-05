@@ -939,7 +939,7 @@ fn a_pool_extent_is_claimed_by_one_partition_and_released_only_by_it() {
   let id = identity();
   let segment =
     AnchorSegment::create(&unique_name("slates-anchor-test-pool"), &id, geometry()).unwrap();
-  assert_eq!(segment.pool_extents(), 2, "one extent per partition");
+  assert_eq!(segment.pool_extents(), 128, "64 extents per partition");
   assert_eq!(segment.pool_owner(0).unwrap(), None);
   assert!(segment.pool_claim(0, 1).unwrap(), "a free extent is taken");
   assert!(!segment.pool_claim(0, 0).unwrap(), "a held extent is not");
@@ -960,7 +960,7 @@ fn releases_by_their_holder_only(segment: &AnchorSegment) {
   assert!(segment.pool_release(0, 1).unwrap());
   assert_eq!(segment.pool_owner(0).unwrap(), None);
   assert_eq!(segment.pool_held_by(1).unwrap(), [1]);
-  assert!(segment.pool_claim(2, 0).is_err(), "past the pool");
+  assert!(segment.pool_claim(128, 0).is_err(), "past the pool");
 }
 
 /// A-98: do have one claimant per partition, each through its own mapping of the segment (as shards of racing daemons
@@ -982,7 +982,7 @@ fn racing_claimants_take_each_pool_extent_exactly_once_and_the_claims_outlive_th
         let (handoff, id) = (handoff.clone(), id.clone());
         scope.spawn(move || {
           let mapped = AnchorSegment::attach(&handoff, len, &id).unwrap();
-          (0..usize::from(POOL_PARTITIONS))
+          (0..mapped.pool_extents())
             .filter(|extent| mapped.pool_claim(*extent, partition).unwrap())
             .collect::<Vec<usize>>()
         })
@@ -997,7 +997,7 @@ fn racing_claimants_take_each_pool_extent_exactly_once_and_the_claims_outlive_th
   taken.sort_unstable();
   assert_eq!(
     taken,
-    (0..usize::from(POOL_PARTITIONS)).collect::<Vec<_>>(),
+    (0..segment.pool_extents()).collect::<Vec<_>>(),
     "each extent exactly once: {wins:?}"
   );
   let later = AnchorSegment::attach(&handoff, len, &id).unwrap();

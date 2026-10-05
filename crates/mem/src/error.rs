@@ -99,6 +99,18 @@ pub enum MemError {
     /// The granule or slot index whose generations are spent.
     index: u32,
   },
+  /// A region added under an id the arena already holds (A-98): nothing changed.
+  RegionOccupied {
+    /// The id.
+    region: u16,
+  },
+  /// A region removed while it still holds a live or deferred block (A-98): nothing changed.
+  RegionInUse {
+    /// The id.
+    region: u16,
+    /// The bytes still allocated in it.
+    allocated: usize,
+  },
 }
 
 /// Why a shared object's layout or access was refused (AUD-29-09).
@@ -201,6 +213,10 @@ impl fmt::Display for MemError {
         f,
         "shared layout refused at {offset} for {len} bytes: {reason:?}"
       ),
+      Self::RegionOccupied { region } => write!(f, "region {region} is already held"),
+      Self::RegionInUse { region, allocated } => {
+        write!(f, "region {region} still holds {allocated} allocated bytes")
+      }
       Self::GenerationExhausted { index } => {
         write!(f, "generations of index {index} are spent; it is retired")
       }

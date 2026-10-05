@@ -3685,22 +3685,18 @@ docs/bugs/2026-10-05-a-granted-landing-refused-on-a-held-delegation.md). The sam
 
 Condition 11/12, 2026-10-05 (BENCHMARKS "The daemon under a container memory cap ..."):
 - Under a 1 GiB cgroup cap the daemon refuses typed (`ENOSPC`) with no panic or OOM kill, and recovers its space.
-- Owed (design recorded): one volume's ceiling is its owner shard's reserve. That reserve is RAM ÷ shards ÷
-  `MEMORY_CLASSES` (3), so 1/(3 × shards) of the machine: 57 MiB of a 1 GiB container with two shards, and 1/54 of
-  RAM with 18 shards, which is why a 1 GiB bounded volume was refused on an 18-shard host (`BudgetExceeded
-  { available: 534249472 }`). The limit is physical, not only accounting: each shard's buddy arena manages a fixed
-  slice of the anchor's content object (`content_range`), cut at boot. The fix is a two-level allocator, as
-  tcmalloc's per-thread caches over a central free list and Linux's per-CPU page lists over the zone allocator do:
-  - the content object becomes extents of a derived size, handed to a shard's arena by a central allocator (one
-    word per extent, claimed by compare-and-swap on the cold growth path, never per write);
-  - a shard's reserve grows and shrinks with the extents it holds;
-  - images keep naming blocks by their offset in the one content object (A-64), so recovery reads them unchanged;
-  - claims and the sweep (A-64) walk a shard's extent set instead of one range.
-  Seastar and ScyllaDB accept a fixed per-core share because their data is spread across shards by key; a slates
-  volume lives on one shard (one writer), so it cannot. Designed as A-98, six pieces.
-  - 2026-10-05: within a shard, the whole reserve is now allocatable. It was only the reserve's largest power-of-two
-    part, so 25% was stranded under a 1 GiB cap. The capped container's volume went from 57 to 124 MiB (BENCHMARKS).
-    The per-shard ceiling itself remains until A-98 pieces 2–5.
+- Closed 2026-10-05 (A-98): one volume's ceiling was its owner shard's reserve, RAM ÷ shards ÷ `MEMORY_CLASSES`
+  (3): 57 MiB of a 1 GiB container with two shards, and 1/54 of RAM with 18 shards, which is why a 1 GiB bounded
+  volume was refused on an 18-shard host. Every slice's arena range is now a pool of power-of-two extents. Each
+  extent is held by one shard at a time under an owner word in the anchor segment. A shard claims extents at
+  admission and returns wholly free ones after a committed publication. Tests: the A-98 entry in SLATES_DESIGN.
+  - First, within a shard, the whole reserve became allocatable (it was only the largest power-of-two part): the
+    capped container's volume went from 57 to 124 MiB (BENCHMARKS).
+  - Still owed (A-98 piece 6): the capped container measured with the pool; a SIGKILL between a claim and the first
+    image that names it; held extents and `source_refusals` in status.
+  - Still per shard: the chunk, inode and directory slabs and the metadata class are sized from one slice. A volume
+    of large files reaches the whole pool (a chunk is sixteen granules); a volume of many small files stays bounded by
+    its shard's slabs.
 - Owed: on a fresh NFSv4.2 loopback mount in Docker Desktop's VM, a flush of four pipelined 256 KiB WRITEs stalls three
   200 ms retransmission steps against knfsd's one. The client's own socket (a 4,608-byte send buffer, collapsed
   window) is the shared cause. Why slates meets it thrice is not yet known: `SO_RCVBUF` and `TCP_QUICKACK` were measured

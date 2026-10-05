@@ -68,11 +68,11 @@ fn segment_words(geometry: &Geometry) -> Words {
           at.saturating_add(SUP_SEAL_ROOT),
           SEAL_ROOT_ID_BYTES.saturating_add(SEAL_ROOT_KEY_BYTES),
         )),
-      // The content pool's owner words (A-98): one per partition, each claimed by compare-and-swap.
+      // The content pool's owner words (A-98), each claimed by compare-and-swap.
       RegionKind::Pool => words.with(WordRun::strided(
         at,
         size_of::<u64>(),
-        usize::from(geometry.partitions),
+        usize::from(geometry.partitions).saturating_mul(crate::layout::POOL_EXTENTS_PER_PARTITION),
         Width::U64,
       )),
       RegionKind::Log(_) | RegionKind::Audit => words.with(WordRun::strided(
@@ -663,9 +663,9 @@ impl AnchorSegment {
     Ok(self.object.write_racy(start, from)?)
   }
 
-  /// The content pool's extents (A-98): one per partition.
+  /// The content pool's extents (A-98): [`crate::layout::POOL_EXTENTS_PER_PARTITION`] per partition.
   pub fn pool_extents(&self) -> usize {
-    usize::from(self.geometry.partitions)
+    usize::from(self.geometry.partitions).saturating_mul(crate::layout::POOL_EXTENTS_PER_PARTITION)
   }
 
   /// Extent `extent`'s owner word, refused past the pool.

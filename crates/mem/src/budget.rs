@@ -186,6 +186,39 @@ impl ShardBudget {
     self.ledger.hold = bytes;
   }
 
+  /// The capacity a commitment of `bytes` more lacks: what the arena must grow by before it is admittable (A-98).
+  /// Zero when it is admittable now. The pressure hold counts: it is an amount withheld from admission (the host's
+  /// shortfall, §4.2), so a shard that claims lazily must hold it beyond its commitments for the admission ceiling to
+  /// be what it was over a whole slice, held capacity less the hold. Claiming maps no RAM, and the hold keeps the
+  /// claimed bytes from being admitted, so nothing is written into them.
+  pub const fn deficit(&self, bytes: u64) -> u64 {
+    self
+      .ledger
+      .committed
+      .saturating_add(self.ledger.headroom)
+      .saturating_add(self.ledger.hold)
+      .saturating_add(bytes)
+      .saturating_sub(self.ledger.reserve)
+  }
+
+  /// Raises the capacity by `bytes` the arena added (A-98: an extent claimed from the pool).
+  pub fn extend(&mut self, bytes: u64) {
+    self.ledger.reserve = self.ledger.reserve.saturating_add(bytes);
+  }
+
+  /// Lowers the capacity by `bytes` the arena is returning (A-98), if what remains still covers every commitment
+  /// and the operation headroom: whether it did. A refusal changes nothing.
+  pub fn retract(&mut self, bytes: u64) -> bool {
+    let floor = self.ledger.committed.saturating_add(self.ledger.headroom);
+    match self.ledger.reserve.checked_sub(bytes) {
+      Some(left) if left >= floor => {
+        self.ledger.reserve = left;
+        true
+      }
+      _ => false,
+    }
+  }
+
   /// Reserves `bytes` for a bounded volume, whole or not at all, keeping the operation headroom free.
   pub fn reserve(&mut self, bytes: u64) -> Result<Reservation, MemError> {
     self.ledger.take(bytes).map(|bytes| Reservation { bytes })
@@ -481,6 +514,35 @@ pub fn region_bytes(capacity: u64, shards: u64, classes: u64) -> Derived<u64> {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  /// A-98: do ask a budget with no capacity for the deficit of a reservation, extend it by that, reserve, then retract
+  /// below and above what the commitments need; expect the deficit to cover the request, the headroom and the hold, the
+  /// reservation to fit exactly after the extension, a retraction that would uncover a commitment refused with nothing
+  /// changed, and one that leaves the commitments covered accepted.
+  #[test]
+  fn a_budget_extends_by_its_deficit_and_retracts_only_above_its_commitments() {
+    let mut b = ShardBudget::new(0, 10);
+    b.set_hold(5);
+    assert_eq!(
+      b.deficit(100),
+      115,
+      "the request, the headroom and the hold"
+    );
+    b.extend(115);
+    assert_eq!(b.deficit(100), 0);
+    let r = b.reserve(100).unwrap();
+    b.set_hold(0);
+    assert!(
+      !b.retract(6),
+      "110 would remain, under 100 committed + 10 headroom"
+    );
+    assert_eq!(b.capacity(), 115);
+    assert!(b.retract(5));
+    assert_eq!(b.capacity(), 110);
+    b.release(r);
+    assert!(b.retract(100));
+    assert_eq!(b.capacity(), 10);
+  }
 
   #[test]
   fn a_bounded_reservation_commits_whole_and_keeps_the_operation_headroom_free() {

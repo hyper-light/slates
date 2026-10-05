@@ -265,6 +265,20 @@ fn merged(pieces: impl Iterator<Item = (u64, Vec<u8>)>) -> Vec<(u64, Vec<u8>)> {
   out
 }
 
+/// The bytes [`restore`] admits the archive's restore against, planned without decoding a chunk: what a caller must
+/// have room for before it restores (A-98: a shard growing its arena from the pool by exactly this). A tree that does
+/// not plan is refused as [`restore`] refuses it.
+pub fn restore_needed(archive: &Archive) -> Result<u64, ArchiveError> {
+  let plan = plan(&archive.root_meta, &archive.manifest)?;
+  let chunks: BTreeMap<[u8; 32], &Chunk> = archive
+    .chunks
+    .iter()
+    .rev()
+    .map(|chunk| (chunk.identity, chunk))
+    .collect();
+  Ok(needed_bytes(&plan, &chunks).unwrap_or(u64::MAX))
+}
+
 /// Restores the whole volume the archive holds: every file's bytes, every directory and every extended
 /// attribute value, planned and admitted against `budget` bytes before anything is allocated (see the
 /// module doc), each chunk decoded once. A tree that does not plan, a missing or corrupt chunk, or a

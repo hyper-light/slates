@@ -518,7 +518,12 @@ impl Model {
     let from_key = Self::find_key(fd, policy, from).ok_or(VfsError::NotFound)?;
     let node = fd.get(&from_key).cloned().unwrap();
     let to_key = Self::find_key(td, policy, to);
-    if from_dir == to_dir && policy.same(from, to) {
+    // The same directory is the same under the policy: on a folding volume `["A"]` and `["a"]` name one directory, so
+    // a rename between them is a rename within it (found 2026-10-05 by a fresh seed: `Mkdir a`, `Mkdir a/A`, then
+    // `A/A` renamed to `a/a` kept `A` in the model while the volume respelled it, as EQUIVALENCE §4 says).
+    let same_dir =
+      from_dir.len() == to_dir.len() && from_dir.iter().zip(to_dir).all(|(a, b)| policy.same(a, b));
+    if same_dir && policy.same(from, to) {
       // The same entry: the same bytes change nothing; another spelling respells it (EQUIVALENCE §4).
       if from == to {
         return Ok(());
@@ -993,7 +998,7 @@ fn a_volume_publishes_deltas_that_rebuild_its_full_image() {
 }
 
 proptest! {
-  #![proptest_config(slates_test_seeds::unseeded(ProptestConfig { cases: 400, max_shrink_iters: 4000, .. ProptestConfig::default() }))]
+  #![proptest_config(slates_test_seeds::seeded(ProptestConfig { cases: 400, max_shrink_iters: 4000, .. ProptestConfig::default() }, include_str!("model.proptest-regressions")).unwrap())]
 
   #[test]
   fn the_volume_equals_the_model_on_every_history(steps in prop::collection::vec(step(), 1..40)) {

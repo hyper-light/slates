@@ -41,14 +41,14 @@ pub(crate) fn grow(state: &mut ShardState, work: VolumeId, bytes: u64) -> Result
   if bytes == 0 {
     return Ok(());
   }
-  match state.store.budget.grow(bytes) {
+  match state.store.grow(bytes) {
     Ok(_) => {
       if let Some(w) = state.works.get_mut(&work) {
         w.charged = w.charged.saturating_add(bytes);
       }
       Ok(())
     }
-    Err(_) => Err(state.store.budget.admittable()),
+    Err(_) => Err(state.store.admittable()),
   }
 }
 

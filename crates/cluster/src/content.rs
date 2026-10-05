@@ -1113,6 +1113,10 @@ impl ContentHold {
     index: u64,
   ) -> Result<(), ContentRefusal> {
     let credit = space.metadata.reserve(index).map_err(|e| no_capacity(&e))?;
+    // A holder whose shard claims its arena lazily grows it from the pool first (A-98).
+    space
+      .arena
+      .make_room(space.budget, kept.saturating_add(transient));
     if let Err(e) = space
       .budget
       .charge_replicated(kept.saturating_add(transient))
