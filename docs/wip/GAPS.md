@@ -3697,7 +3697,7 @@ Condition 11/12, 2026-10-05 (BENCHMARKS "The daemon under a container memory cap
   - images keep naming blocks by their offset in the one content object (A-64), so recovery reads them unchanged;
   - claims and the sweep (A-64) walk a shard's extent set instead of one range.
   Seastar and ScyllaDB accept a fixed per-core share because their data is spread across shards by key; a slates
-  volume lives on one shard (one writer), so it cannot.
+  volume lives on one shard (one writer), so it cannot. Designed as A-98, six pieces.
 - Owed: on a fresh NFSv4.2 loopback mount in Docker Desktop's VM, a flush of four pipelined 256 KiB WRITEs stalls three
   200 ms retransmission steps against knfsd's one. The client's own socket (a 4,608-byte send buffer, collapsed
   window) is the shared cause. Why slates meets it thrice is not yet known: `SO_RCVBUF` and `TCP_QUICKACK` were measured

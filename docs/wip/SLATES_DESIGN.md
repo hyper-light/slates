@@ -9484,3 +9484,35 @@ Status: built 2026-10-05 (condition 13, §4.12 `slates.fs`).
     attachment, another volume's attachment, and a mode past the permission bits.
   The staging change was red against the merge loop first (a work has no store slot; the catalog record is looked
   up instead). Suites: mcp 12, client 16, daemon 19, bridge-core 76, bridge-nfs 153.
+
+### A-98 — A shard's arena grows from a shared extent pool (planned, 2026-10-05)
+Status: designed 2026-10-05; to be built in the pieces below. Measured cause in BENCHMARKS ("The daemon under a container
+memory cap") and GAPS.
+- Why: a volume lives on one shard, and a shard's content arena is a fixed slice of the anchor's content object,
+  RAM ÷ shards ÷ `MEMORY_CLASSES`. A volume's ceiling is therefore 1/(3 × shards) of the machine:
+  - 57 MiB of a 1 GiB container with two shards;
+  - 1/54 of RAM on an 18-shard host, where a 1 GiB bounded volume was refused.
+  Seastar and ScyllaDB accept a fixed per-core share because their data is spread over cores by key; a slates volume
+  has one writer and cannot be spread.
+- What, a two-level allocator: the shape of tcmalloc's per-thread caches over a central free list and of Linux's
+  per-CPU page lists over the zone allocator. Each shard keeps a *base* arena in its slice, smaller than today's.
+  After the slices, the content object holds a *pool* of extents, each one base arena long, so each is one buddy
+  region, as `ChunkArena` already supports several.
+  - A shard whose budget would refuse claims a free extent, maps it (`ExclusiveObject::open_range`), adds it as a
+    region, and raises its reserve by its length.
+  - A claim is a compare-and-swap of the extent's owner word in the anchor segment (0 free, else partition + 1), so
+    the claim outlives a daemon restart as the content does. It is taken on the cold growth path, never per write.
+  - The pool keeps the machine's content capacity whole: base × shards + pool = what the slices hold today.
+- Durability: a shard's recovery image lists the pool extents it holds, in region order, so blocks keep their
+  (region, offset) names (A-64). Recovery re-adds those extents in that order, checked against the owner words, and
+  claims the blocks the image names; an extent that a word says is the shard's but no image names is released.
+- Pieces, in order, each tested by use:
+  1. Layout: the base and pool sizes, derived; an owner-word table in the anchor segment; pure, unit-tested.
+  2. Claim and release on the segment, raced by threads (loom, as the rings are); a refusal at an empty pool, typed.
+  3. Growth in the shard: a refused admission claims and adds an extent; the budget's reserve grows. Test: a volume
+     larger than one base arena fills on a shard, and two shards contend for the pool.
+  4. Images and recovery: extents named in the image, re-added on restart; a daemon SIGKILLed with a grown volume
+     recovers it byte for byte (the client restart oracle).
+  5. Release: an extent wholly free after a committed publication goes back to the pool.
+  6. Measured: the memory-capped container's volume against its 57 MiB today; the A-96 `capture`/`commit_capture`
+     walk stays per region.
