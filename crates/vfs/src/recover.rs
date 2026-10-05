@@ -63,9 +63,11 @@ const SHARD_MAGIC: u32 = u32::from_le_bytes(*b"SLS1");
 /// extent by their blocks in the shard's arena range instead of carrying its bytes, so a barrier costs the
 /// shard's metadata, not its content; 13 (A-64, 2026-10-03) the held replicas' image names their blocks the same way,
 /// and a clone's image carries only its own inodes and the numbers it shares with its origin snapshot.
+/// 14 (A-89, 2026-10-05) a directory's entries are ordered by their folded names under the volume's policy, so a
+/// delta's replay finds a name by binary search instead of scanning the directory.
 /// Format: the image layout version, bumped with any change to the types below or to the held replicas'
 /// image they carry.
-const IMAGE_VERSION: u16 = 13;
+const IMAGE_VERSION: u16 = 14;
 
 /// A recorded attachment's references in an image (A-61): its durable id and its share by inode.
 #[derive(Clone, Debug, PartialEq, Eq, Wire)]
@@ -182,7 +184,7 @@ pub struct EntryImage {
 pub enum BodyImage {
   /// No content yet.
   Empty,
-  /// A directory's entries, in the order the tree yields them.
+  /// A directory's entries, in canonical order ([`entry_order`]); none in a delta's image of a changed directory.
   Directory {
     /// The entries.
     entries: Vec<EntryImage>,
@@ -1140,6 +1142,25 @@ impl Volume {
     store: &Store,
     inode: &Inode,
   ) -> Result<InodeImage, VfsError> {
+    self.inode_image(store, inode, Entries::Captured)
+  }
+
+  /// The image of one inode as a delta carries it (A-68): a directory's own fields without its entries, which the
+  /// delta carries by name. Enumerating them here cost every create its parent's whole entry list (A-89).
+  pub(crate) fn image_of_inode_without_entries(
+    &self,
+    store: &Store,
+    inode: &Inode,
+  ) -> Result<InodeImage, VfsError> {
+    self.inode_image(store, inode, Entries::Omitted)
+  }
+
+  fn inode_image(
+    &self,
+    store: &Store,
+    inode: &Inode,
+    entries: Entries,
+  ) -> Result<InodeImage, VfsError> {
     let body = if let Body::Base(base) = &inode.body {
       let pinned = base
         .pinned
@@ -1160,7 +1181,10 @@ impl Volume {
           };
           let directory = store.dirs.get(handle)?;
           BodyImage::Directory {
-            entries: self.dir_entries(store, inode)?,
+            entries: match entries {
+              Entries::Captured => self.dir_entries(store, inode)?,
+              Entries::Omitted => Vec::new(),
+            },
             base: directory.base,
             origin: directory.origin.as_ref().map(|path| path.to_string()),
           }
@@ -1245,12 +1269,29 @@ impl Volume {
         child: child.map(|inode| inode.0),
       });
     }
-    // Canonical order: by name. Names are distinct within a directory under the volume's policy, so
-    // this total order is independent of the small/indexed representation the entries happened to be
-    // stored in, which makes the image deterministic and a rebuild's re-capture byte-identical.
-    entries.sort_by(|a, b| a.name.cmp(&b.name));
+    // Canonical order: by folded name under the volume's policy (the name itself under `Exact`). Names are
+    // distinct within a directory under that policy, so this total order is independent of the small/indexed
+    // representation the entries happened to be stored in, which makes the image deterministic and a rebuild's
+    // re-capture byte-identical; and a delta's replay finds a name's entry by binary search (A-89).
+    let policy = self.policy;
+    entries.sort_by(|a, b| entry_order(policy, &a.name, &b.name));
     Ok(entries)
   }
+}
+
+/// Whether an inode's image captures a directory's entries.
+#[derive(Clone, Copy)]
+enum Entries {
+  /// Every entry, in canonical order: a full image.
+  Captured,
+  /// None: a delta, which carries changed entries by name.
+  Omitted,
+}
+
+/// The canonical order of a directory image's entries (A-89): by folded name under `policy`, which is the name's own
+/// order under `Exact`. Allocation-free for an ASCII name under `Fold` (the common case).
+pub(crate) fn entry_order(policy: NameEquivalence, a: &str, b: &str) -> std::cmp::Ordering {
+  policy.folded(a).cmp(policy.folded(b))
 }
 
 /// A block's image (A-64).

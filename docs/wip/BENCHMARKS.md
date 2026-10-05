@@ -1887,3 +1887,21 @@ container (header of the script gives the `docker run`): the daemon and the kern
   create is the create's remaining cost, and the daemon's local p99 (0.49 ms) is where it goes next.
 - The Docker Desktop runs above never showed the 40 ms stall (p99 at most 1.85 ms); why that path escaped it was
   not measured.
+
+After A-89 (a create no longer re-images its parent's entries; same command, release at the A-89 change, load
+average 9.2–10.3):
+
+| workers | op | p50 | p99 | p999 | before A-89 p99 |
+|---|---|---|---|---|---|
+| 1 | create+write+close | 0.21 ms | 0.38 ms | 1.23 ms | 0.86 ms |
+| 1 | open+read+close | 26 µs | 0.17 ms | 0.27 ms | 0.21 ms |
+| 1 | stat | 2.3 µs | 54 µs | 0.10 ms | 79 µs |
+| 16 | create+write+close | 2.3 ms | 4.2 ms | 5.7 ms | 13.3 ms |
+| 16 | open+read+close | 0.86 ms | 3.1 ms | 4.4 ms | 2.9 ms |
+| 16 | stat | 0.15 ms | 1.7 ms | 2.5 ms | 1.5 ms |
+
+- A `perf record -a -g` of the daemon during the run before (linux-perf in the container, 4999 Hz) put a fifth of
+  the serving shard's samples in `Volume::dir_entries`' sort under `publish_shard` → `image_of_inode`; the machine
+  was 93.5% idle. After: mountstats OPEN 41 µs (from 0.32 ms), WRITE 30 µs, CLOSE 23 µs; the daemon's local p99
+  11 µs (from 0.49–0.59 ms). One-writer throughput 5,249 → 9,792 operations per second.
+- Owed: readdir of the 8,000-entry directory, p99 7.9 ms against tmpfs's 0.9 ms.

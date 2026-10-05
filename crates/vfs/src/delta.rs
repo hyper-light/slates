@@ -33,6 +33,7 @@ use slates_wire::Wire;
 use crate::error::VfsError;
 use crate::recover::{
   AttachmentReferences, BodyImage, EntryImage, InodeImage, QuotaImage, SnapshotRef, VolumeImage,
+  entry_order,
 };
 use crate::volume::{Store, Volume};
 
@@ -232,11 +233,7 @@ impl Volume {
       match crate::trie::get(&store.tries, self.inode_root, crate::ids::InodeNo(*no)) {
         Some(handle) => {
           let inode = store.inodes.get(handle)?;
-          let mut image = self.image_of_inode(store, inode)?;
-          if let BodyImage::Directory { entries, .. } = &mut image.body {
-            entries.clear();
-          }
-          inodes.push(image);
+          inodes.push(self.image_of_inode_without_entries(store, inode)?);
         }
         None => removed.push(*no),
       }
@@ -323,13 +320,13 @@ impl VolumeImage {
         .binary_search_by_key(&changed.no, |inode| inode.no);
       let mut image = changed.clone();
       if let BodyImage::Directory { entries, .. } = &mut image.body {
-        // The entries the previous image held (none for a directory new in this delta); the entry changes
-        // below bring them up to date.
+        // The entries the previous image held (none for a directory new in this delta), moved, not copied: the
+        // previous image of this inode is replaced below. The entry changes then bring them up to date.
         if let Ok(at) = at
           && let Some(BodyImage::Directory { entries: held, .. }) =
-            self.inodes.get(at).map(|previous| &previous.body)
+            self.inodes.get_mut(at).map(|previous| &mut previous.body)
         {
-          entries.clone_from(held);
+          *entries = std::mem::take(held);
         }
       }
       match at {
@@ -357,13 +354,21 @@ impl VolumeImage {
       else {
         return Err(VfsError::RecoveryIncomplete);
       };
-      let folded = policy.fold(&change.name);
-      entries.retain(|entry| policy.fold(&entry.name) != folded);
-      if let Some(entry) = &change.entry {
-        let at = entries
-          .binary_search_by(|held| held.name.as_str().cmp(entry.name.as_str()))
-          .unwrap_or_else(|at| at);
-        entries.insert(at, entry.clone());
+      // Entries are in canonical order (`entry_order`), and at most one holds a folded name, so the entry the
+      // change replaces or removes is found by binary search (A-89: a scan cost every replayed change its
+      // directory). The present entry's name folds as the change's does: it was looked up under it.
+      let found = entries.binary_search_by(|held| entry_order(policy, &held.name, &change.name));
+      match (found, &change.entry) {
+        (Ok(at), Some(entry)) => {
+          if let Some(slot) = entries.get_mut(at) {
+            slot.clone_from(entry);
+          }
+        }
+        (Ok(at), None) => {
+          entries.remove(at);
+        }
+        (Err(at), Some(entry)) => entries.insert(at, entry.clone()),
+        (Err(_), None) => {}
       }
     }
     for no in &delta.removed {

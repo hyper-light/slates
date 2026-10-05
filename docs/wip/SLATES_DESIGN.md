@@ -9078,3 +9078,23 @@ Status: built 2026-10-05 (the async half of A-83).
   (kept if awaited, dropped and counted if not) and waits on.
 - Proven: `an_async_edit_larger_than_a_request_is_chained_and_resolves_as_one` (20 KiB through the async path,
   read back whole; an abandoned chain leaving nothing outstanding and the file unchanged; a sync read after it).
+
+### A-89 — A delta images a changed directory without its entries; image entries in folded order (2026-10-05)
+Applied in the same change to: `crates/vfs/src/recover.rs` (`image_of_inode_without_entries`, `entry_order`,
+`IMAGE_VERSION` 14), `crates/vfs/src/delta.rs` (`Volume::delta`, `VolumeImage::apply`),
+`crates/vfs/tests/delta_cost.rs`, docs/bugs/2026-10-05-a-create-re-imaged-its-whole-directory.md, BENCHMARKS, GAPS.
+Status: built 2026-10-05 (completes A-68's promise for directories).
+- What: a delta carries a changed directory's own fields and its changed entries by name (A-68). Building it
+  called the full inode image, which enumerated, cloned and sorted every entry of the directory and then dropped
+  them, so each create cost its parent's size. The delta now images a directory without enumerating it.
+- Replay: a changed directory's held entries are moved into its new image, not cloned, and each entry change is
+  found by binary search. That needs one order for both name policies, so an image's entries are ordered by their
+  folded names under the volume's policy (the plain name order under `Exact`, unchanged). At most one entry holds
+  a folded name, and a change's present entry was looked up under the change's name, so the search finds the one
+  entry a change replaces or removes. The image layout version is 14.
+- Proven: `one_creates_delta_costs_the_same_in_a_large_directory_as_in_a_small_one` counts allocator calls. One
+  create's (publication, replay) took (4104, 4100) in a 4,096-entry directory and (71, 68) in a 64-entry one
+  before; now they are equal under both policies, and the replayed image equals the full image. The A-68 model
+  test (generated histories, deltas applied against the full image) passes unchanged.
+- Measured (native Linux NFSv4.2 loopback, one writer, 8,000 creates in one directory): OPEN round trip
+  0.33 → 0.041 ms, daemon local p99 0.59 ms → 11 µs, create+write+close p99 0.86 → 0.38 ms.

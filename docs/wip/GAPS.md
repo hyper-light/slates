@@ -3627,8 +3627,14 @@ shard's own clock that A-65 budgets in (docs/bugs/2026-10-04-the-slow-observatio
   create+write+close p99 1.2–1.9 ms with one writer and 18.9 ms with 16 in one directory (serialized by the client
   kernel's directory lock); reads at most 4.3 ms p99. Tectonic's published blob tails reach 150–200 ms (writes) and
   about 100 ms (reads).
+- **Measured natively** (2026-10-05, Linux's own client on loopback, `native.sh`): two bugs found and fixed. First,
+  Nagle on the server's sockets: replies waited for the client's 40 ms delayed ACK (create p99 43 ms). Second, every
+  create re-imaged its parent's whole entry list for the barrier's delta (A-89; OPEN round trip 0.33 ms, daemon
+  local p99 0.59 ms). Now create+write+close p99 is 0.38 ms with one writer and 4.2 ms with 16, OPEN 41 µs, and
+  the daemon's local p99 11 µs.
 - **Owed:**
-  - a write delegation's space reservation, which takes the WRITE off a create's close path (measured: 0.21 of
-    0.86 ms);
-  - the same storm on a Linux host and a k8s node (no Docker Desktop hop);
+  - a write delegation's space reservation, which takes the WRITE off a create's close path (measured natively:
+    30 µs of a 0.21 ms create);
+  - readdir of an 8,000-entry directory: p99 7.9 ms against tmpfs's 0.9 ms (native, one writer);
+  - the same storm on a k8s node;
   - a remote (fleet) read under contention, for condition 7's tail.
