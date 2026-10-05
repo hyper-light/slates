@@ -73,6 +73,7 @@ fn the_mount_arguments_describe_their_own_length() {
     port: 50_123,
     handle: Nfsfh3(vec![0xab; 57]),
     attr_cache_seconds: 1,
+    transfer_bytes: 1 << 18,
     mnt_flags: 0x8,
     mnt_from: "slates:/vol".to_owned(),
     path: vec!["vol".to_owned()],

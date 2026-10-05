@@ -220,6 +220,10 @@ mod mattr {
   pub(super) const FLAGS: u32 = 0;
   /// Format: `NFS_MATTR_NFS_VERSION`.
   pub(super) const NFS_VERSION: u32 = 1;
+  /// Format: `NFS_MATTR_READ_SIZE`: the largest READ the client sends.
+  pub(super) const READ_SIZE: u32 = 3;
+  /// Format: `NFS_MATTR_WRITE_SIZE`: the largest WRITE the client sends.
+  pub(super) const WRITE_SIZE: u32 = 4;
   /// Format: `NFS_MATTR_ATTRCACHE_REG_MIN` (the four cache times follow in order).
   pub(super) const ATTRCACHE_REG_MIN: u32 = 7;
   /// Format: `NFS_MATTR_ATTRCACHE_REG_MAX`.
@@ -281,6 +285,9 @@ pub struct MountArgs {
   pub handle: Nfsfh3,
   /// The attribute cache time for files and directories, whole seconds.
   pub attr_cache_seconds: u32,
+  /// The largest READ and WRITE the client sends: the server's own transfer maximum, so a file of up to that size
+  /// moves in one call. The kernel takes the smaller of this and its own limit.
+  pub transfer_bytes: u32,
   /// The VFS mount flags (`MNT_NOSUID`, `MNT_RDONLY`, …) as `mount(2)` takes them.
   pub mnt_flags: u32,
   /// What the mount table shows as the source: a name with no secret in it.
@@ -298,6 +305,8 @@ impl MountArgs {
     for attribute in [
       mattr::FLAGS,
       mattr::NFS_VERSION,
+      mattr::READ_SIZE,
+      mattr::WRITE_SIZE,
       mattr::ATTRCACHE_REG_MIN,
       mattr::ATTRCACHE_REG_MAX,
       mattr::ATTRCACHE_DIR_MIN,
@@ -333,6 +342,8 @@ impl MountArgs {
     push_words(&mut attrs, &mask);
     push_words(&mut attrs, &value);
     attrs.u32(NFS_V3);
+    attrs.u32(self.transfer_bytes);
+    attrs.u32(self.transfer_bytes);
     // The four cache times, in attribute order: regular min and max, directory min and max.
     for _ in [
       mattr::ATTRCACHE_REG_MIN,

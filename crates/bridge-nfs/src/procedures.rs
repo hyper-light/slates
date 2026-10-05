@@ -1009,7 +1009,11 @@ impl<'b> Export<'b> {
       .op_context()
       .map_err(|e| (nfsstat_of(&e), Some(node)))?;
     let object = ObjectId::new(identity.inode, identity.generation);
-    let want = count.min(MAX_TRANSFER);
+    // No more than the file holds past `offset` (the live size `node` carries): a client reads with its whole
+    // transfer size, 256 KiB, whatever the file's length, and a buffer of the asked size cost a 2 KiB file a 256 KiB
+    // allocation and its zeroing (2026-10-05: an overlay tree's cold read 10% slower at a 256 KiB `rsize`).
+    let left = u32::try_from(node.size.saturating_sub(offset)).unwrap_or(u32::MAX);
+    let want = count.min(MAX_TRANSFER).min(left);
     let mut data = Vec::new();
     self
       .bridge

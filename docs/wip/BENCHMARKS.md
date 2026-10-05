@@ -2082,6 +2082,24 @@ Apple M5 Max, macOS's own NFS client, 2 shards, load average about 6.
 - The writes became possible only with the same day's owner fix: before it, every base entry was root's through the
   mount and refused the user's writes (`docs/bugs/2026-10-05-base-entries-reported-root-as-owner.md`).
 - The cold read, about 158 µs per file through the NFS client, is the cost to work on next.
+- **Where the cold read goes:** 2,331 RPCs for 688 files (one ACCESS and one GETATTR per open, the macOS client's
+  close-to-open checks, and 940 READs), about 42 µs each end to end, against a daemon-side service p50 of 3 µs. The
+  client's per-call cost dominates, and the server cannot remove those calls under NFSv3.
+- **Transfer size, 2026-10-05.** The macOS mount asked no `rsize`/`wsize`, so the client used 32 KiB. Swept in random
+  order, four rounds each, a fresh daemon and mount per round (`<scratch>/ab-transfer.sh`):
+
+  | transfer | 688-file tree, cold read | 64 MiB write + fsync | 64 MiB cold read |
+  |---|---|---|---|
+  | 32 KiB | 110–122 ms | 79–83 ms | 59–61 ms |
+  | 64 KiB | 108–123 ms | 50–53 ms | 37–41 ms |
+  | **128 KiB (chosen)** | 109–123 ms | 35–39 ms | 25–29 ms |
+  | 256 KiB | 127–143 ms | 30–31 ms | 19–21 ms |
+
+  - 128 KiB is the knee: large writes run 2.2× faster (about 1.8 GB/s) and large reads 2.3× faster (about 2.4 GB/s),
+    and the small-file walk does not slow. At 256 KiB the client's own per-request cost slowed the walk by about 17%.
+  - With it, a READ is sized to the bytes the file has past its offset, not to the asked count, and the bridge reads
+    into the reply's buffer directly (no zeroed buffer of the asked size, no second copy). At 256 KiB, five rounds in
+    random order: a median of 119 ms against 124 ms for the walk.
 
 ### The daemon under a container memory cap, and large writes over Linux's NFS client on loopback (conditions 11, 12; 2026-10-05)
 

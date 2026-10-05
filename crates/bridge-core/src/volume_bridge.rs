@@ -646,17 +646,28 @@ impl Bridge for VolumeBridge<'_> {
     if let Some(owner) = InodeNo(object.inode).derived_from() {
       return self.view_read(owner, offset, want, out);
     }
-    let mut buf = vec![0u8; want];
+    // Read straight into the tail of `out`: one buffer, no second copy.
+    let start = out.len();
+    out.resize(start.saturating_add(want), 0);
     let inode = InodeNo(object.inode);
+    let tail = out.get_mut(start..).unwrap_or_default();
     let read = match host_for(&mut self.host, self.volume.is_overlay())? {
       Some(host) => self
         .volume
         .with_host(host)
-        .read(self.store, inode, offset, &mut buf),
-      None => self.volume.read(self.store, inode, offset, &mut buf),
-    }?;
-    out.extend_from_slice(&buf[..read]);
-    Ok(())
+        .read(self.store, inode, offset, tail),
+      None => self.volume.read(self.store, inode, offset, tail),
+    };
+    match read {
+      Ok(read) => {
+        out.truncate(start.saturating_add(read));
+        Ok(())
+      }
+      Err(e) => {
+        out.truncate(start);
+        Err(e)
+      }
+    }
   }
 
   fn xattr_get(

@@ -30,6 +30,24 @@ use crate::Failure;
 #[cfg(any(not(target_os = "linux"), test))]
 const ATTR_CACHE_SECONDS: u32 = 1;
 
+/// The READ and WRITE size the macOS mount asks for (`rsize`/`wsize`; the kernel takes the smaller of this and its own
+/// limit, and the server's `MAX_TRANSFER` caps it). The largest power of two at which the macOS client's
+/// small-file walk does not slow. macOS's default was 32 KiB. Swept 2026-10-05 in random order, four rounds each
+/// (Apple M5 Max, a fresh daemon and mount per round):
+///
+/// | transfer | 688-file tree, cold read | 64 MiB write + fsync | 64 MiB cold read |
+/// |---|---|---|---|
+/// | 32 KiB | 110–122 ms | 79–83 ms | 59–61 ms |
+/// | 64 KiB | 108–123 ms | 50–53 ms | 37–41 ms |
+/// | 128 KiB | 109–123 ms | 35–39 ms | 25–29 ms |
+/// | 256 KiB | 127–143 ms | 30–31 ms | 19–21 ms |
+///
+/// At 256 KiB the client's own per-request cost slowed the small-file walk by about 17%, for a further 15–25% on large
+/// transfers. 128 KiB keeps the walk and more than halves large transfers.
+/// Measured: 128 KiB, the knee of the sweep above.
+#[cfg(target_os = "macos")]
+const MACOS_TRANSFER_BYTES: u32 = 128 * 1024;
+
 /// The loopback mount mechanism a host offers (§4.6), the analogue of sylk's FUSE-backend selection.
 /// slates serves its own NFS, so its mechanism is `mount_nfs` — built into macOS and the BSDs, needing
 /// no FUSE library, kernel extension, or Apple entitlement.
@@ -201,6 +219,7 @@ fn mount_volume(
     port,
     handle,
     attr_cache_seconds: ATTR_CACHE_SECONDS,
+    transfer_bytes: slates_bridge_nfs::procedures::MAX_TRANSFER.min(MACOS_TRANSFER_BYTES),
     mnt_flags: mnt_flags_word,
     mnt_from: format!("slates:/{name}"),
     path: vec![name.to_owned()],
