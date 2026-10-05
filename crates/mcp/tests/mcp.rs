@@ -688,6 +688,7 @@ fn the_mcp_surface_serves_the_tools() {
 
   assert_protocol(&mut server);
   assert_modern_protocol(&mut server);
+  assert_skills_over_mcp(&mut server);
   assert_merge_loop(&mut server);
   assert_volume_lifecycle(&mut server);
   assert_attach_base(&mut server);
@@ -1010,4 +1011,123 @@ fn assert_modern_http(port: u16, host: &str, token: &str) {
     missing.starts_with("HTTP/1.1 404") && missing.contains("-32601"),
     "{missing}"
   );
+}
+
+/// Sends `method` with `params` (a legacy-era request) and returns its `result`, failing on an error.
+fn rpc(server: &mut McpServer, method: &str, params: Value) -> Value {
+  let reply = server
+    .handle(&json!({ "jsonrpc": "2.0", "id": 11, "method": method, "params": params }))
+    .unwrap();
+  assert!(reply.get("error").is_none(), "{method} errored: {reply}");
+  reply["result"].clone()
+}
+
+/// Checks `document` as the open Agent Skills specification (agentskills.io) requires a `SKILL.md` to be, for the
+/// skill named `name`: frontmatter whose `name` is that name (1–64 lowercase letters, digits and single inner
+/// hyphens, no reserved word) and whose `description` is 1–1,024 characters, and a body under 500 lines.
+fn assert_agent_skill(name: &str, document: &str) {
+  let yaml = document
+    .strip_prefix("---\n")
+    .and_then(|rest| rest.split_once("\n---\n"))
+    .map(|(yaml, _)| yaml)
+    .unwrap_or_else(|| panic!("{name}: no frontmatter"));
+  let field = |key: &str| {
+    yaml
+      .lines()
+      .find_map(|line| line.strip_prefix(&format!("{key}:")))
+      .map(str::trim)
+      .unwrap_or_else(|| panic!("{name}: no {key}"))
+  };
+  assert_eq!(field("name"), name, "the frontmatter names its directory");
+  assert!((1..=64).contains(&name.len()), "{name}: name length");
+  assert!(
+    name
+      .bytes()
+      .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+      && !name.starts_with('-')
+      && !name.ends_with('-')
+      && !name.contains("--"),
+    "{name}: name characters"
+  );
+  assert!(
+    !name.contains("anthropic") && !name.contains("claude"),
+    "{name}: a reserved word"
+  );
+  let description = field("description");
+  assert!(
+    (1..=1024).contains(&description.chars().count()),
+    "{name}: description length {}",
+    description.chars().count()
+  );
+  assert!(document.lines().count() < 500, "{name}: under 500 lines");
+}
+
+/// Skills over MCP (§4.12, D-19): do list the resources; expect one `skill://slates/<name>/SKILL.md` per skill, each
+/// `text/markdown` with its own description. Read each; expect a document valid under the Agent Skills
+/// specification for that name, whose description the listing showed. Expect the URI template, one prompt per skill
+/// returning the same document as a user message, `slates.help` returning it by name, and an unknown resource,
+/// prompt and skill refused (`-32602`; the help tool's as a tool-execution error).
+fn assert_skills_over_mcp(server: &mut McpServer) {
+  let listed = rpc(server, "resources/list", json!({}));
+  let resources = listed["resources"].as_array().unwrap().clone();
+  assert!(resources.len() >= 3, "{listed}");
+  let mut names = Vec::new();
+  for resource in &resources {
+    let uri = resource["uri"].as_str().unwrap();
+    let name = uri
+      .strip_prefix("skill://slates/")
+      .and_then(|rest| rest.strip_suffix("/SKILL.md"))
+      .unwrap_or_else(|| panic!("a skill URI: {uri}"));
+    assert_eq!(resource["mimeType"], "text/markdown");
+    let read = rpc(server, "resources/read", json!({ "uri": uri }));
+    let document = read["contents"][0]["text"].as_str().unwrap();
+    assert_agent_skill(name, document);
+    assert!(
+      document.contains(resource["description"].as_str().unwrap()),
+      "{name}: the listing shows the skill's own description"
+    );
+    let prompt = rpc(server, "prompts/get", json!({ "name": name }));
+    assert_eq!(prompt["messages"][0]["role"], "user");
+    assert_eq!(prompt["messages"][0]["content"]["text"], document);
+    let help = call(server, "slates.help", json!({ "skill": name }));
+    assert_eq!(help["text"], document);
+    names.push(name.to_owned());
+  }
+  assert_skill_listings_and_refusals(server, &names);
+}
+
+/// The rest of [`assert_skills_over_mcp`]: the prompt listing matches the skills `names`, the template is served,
+/// and unknown resources, prompts and skills are refused.
+fn assert_skill_listings_and_refusals(server: &mut McpServer, names: &[String]) {
+  let prompts = rpc(server, "prompts/list", json!({}));
+  let prompt_names: Vec<String> = prompts["prompts"]
+    .as_array()
+    .unwrap()
+    .iter()
+    .map(|prompt| prompt["name"].as_str().unwrap().to_owned())
+    .collect();
+  assert_eq!(
+    prompt_names, names,
+    "one prompt per skill, in the same order"
+  );
+  let templates = rpc(server, "resources/templates/list", json!({}));
+  assert_eq!(
+    templates["resourceTemplates"][0]["uriTemplate"],
+    "skill://slates/{name}/SKILL.md"
+  );
+  for (method, params) in [
+    (
+      "resources/read",
+      json!({ "uri": "skill://slates/nope/SKILL.md" }),
+    ),
+    ("resources/read", json!({ "uri": "file:///etc/passwd" })),
+    ("prompts/get", json!({ "name": "nope" })),
+  ] {
+    let reply = server
+      .handle(&json!({ "jsonrpc": "2.0", "id": 12, "method": method, "params": params }))
+      .unwrap();
+    assert_eq!(reply["error"]["code"], -32602, "{method} {params}: {reply}");
+  }
+  let unknown = call_refused(server, "slates.help", json!({ "skill": "nope" }));
+  assert!(unknown.contains("nope"), "{unknown}");
 }

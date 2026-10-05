@@ -8955,3 +8955,22 @@ Status: built 2026-10-05 (§4.12, D-19). Skills over MCP, codemode, `slates.fs` 
   promised. Every list keeps its deterministic order for client prompt caches.
 - Proven: `the_mcp_surface_serves_the_tools` (stdio and HTTP, live daemon) and
   `sentinel_values_decode_as_the_spec_encodes_them`.
+
+### A-82 — Skills over MCP: one source tree, three publications (2026-10-05)
+Applied in the same change to: `skills/{working-in-slates-volumes,merging-work-in-slates,landing-slates-work-to-disk}/SKILL.md`
+(new), `crates/mcp/src/skills.rs` (new), `crates/mcp/src/lib.rs` (`resources/list`, `resources/templates/list`,
+`resources/read`, `prompts/list`, `prompts/get`, `slates.help {skill}`, the resources and prompts capabilities),
+`crates/mcp/tests/mcp.rs`, GAPS.
+Status: built 2026-10-05 (D-19's skills, over MCP). `slates skills install` awaits a ruling (GAPS: it writes outside
+a granted landing).
+- What: D-19's three publications from one source. Each `SKILL.md` follows the open Agent Skills specification and
+  is compiled into the binary, so the one `slates` binary serves it. It is published as a `skill://slates/<name>/SKILL.md`
+  resource (a client pulls it into context), as a prompt of the same name (a user invokes it), and through
+  `slates.help`. Each skill is one closed workflow and names the real tools, checked against their code: the
+  `materialize` result's fields, the submit result's `accepted`, the license. The landing skill tells the agent to
+  hand the person the exact `grant_with` command, never to run or rephrase it (R10).
+- Unknown resources and prompts are `-32602`, as MCP 2026-07-28 requires (never an empty `contents`); a
+  `file://` URI is never served.
+- Proven: `assert_skills_over_mcp` (in `the_mcp_surface_serves_the_tools`, live daemon) reads every skill through
+  `resources/read`, `prompts/get` and `slates.help` and checks each document against the specification's name,
+  description and length constraints.

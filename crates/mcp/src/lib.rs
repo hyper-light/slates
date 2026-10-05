@@ -47,6 +47,8 @@ use slates_client::{
 #[cfg(not(windows))]
 pub mod http;
 
+mod skills;
+
 #[cfg(not(windows))]
 pub use http::serve;
 
@@ -227,6 +229,11 @@ impl McpServer {
         "cacheScope": "public",
       })),
       "tools/call" => self.call_tool(&params),
+      "resources/list" => Ok(resources_list()),
+      "resources/templates/list" => Ok(resource_templates_list()),
+      "resources/read" => resource_read(&params),
+      "prompts/list" => Ok(prompts_list()),
+      "prompts/get" => prompt_get(&params),
       other => Err(McpError {
         code: code::METHOD_NOT_FOUND,
         message: format!("unknown method: {other}"),
@@ -245,7 +252,7 @@ impl McpServer {
     let name = params.get("name").and_then(Value::as_str).unwrap_or("");
     let args = params.get("arguments").cloned().unwrap_or(Value::Null);
     let structured = match name {
-      "slates.help" => Ok(json!({ "text": HELP })),
+      "slates.help" => help(&args),
       "slates.merge.create_green" => self.create_green(&args),
       "slates.merge.create_work" => self.create_work(&args),
       "slates.merge.edit" => self.edit(&args),
@@ -642,9 +649,14 @@ fn initialize_result(params: &Value) -> Value {
   json!({
     "protocolVersion": version,
     "serverInfo": server_info(),
-    "capabilities": { "tools": {} },
+    "capabilities": capabilities(),
     "instructions": INSTRUCTIONS,
   })
+}
+
+/// What this server offers, as both eras declare it: tools, resources (the skills) and prompts (the skills again).
+fn capabilities() -> Value {
+  json!({ "tools": {}, "resources": {}, "prompts": {} })
 }
 
 /// The `server/discover` result (MCP 2026-07-28): the modern versions this server speaks, its capabilities, and
@@ -652,7 +664,7 @@ fn initialize_result(params: &Value) -> Value {
 fn discover_result() -> Value {
   json!({
     "supportedVersions": MODERN_VERSIONS,
-    "capabilities": { "tools": {} },
+    "capabilities": capabilities(),
     "instructions": INSTRUCTIONS,
     "ttlMs": CACHE_TTL_MS,
     "cacheScope": "public",
@@ -707,8 +719,8 @@ fn tool_list() -> Vec<Value> {
   vec![
     tool(
       "slates.help",
-      "The slates MCP tools and how to use them.",
-      json!({}),
+      "The slates workflow in brief and the names of its skills; with `skill`, that skill's full instructions.",
+      json!({ "skill": string }),
       json!([]),
     ),
     tool(
@@ -884,6 +896,90 @@ your edit, then rebase and submit again. versions and changed_since read the cha
 attaches to a green (slates.attach.attach) and its view is pinned to that version until \
 slates.merge.advance moves it. No tool creates a landing grant (a grant is a human-only act on \
 the CLI).";
+
+/// `slates.help`: with `skill`, that skill's document; without, the workflow in brief and the skills' names.
+fn help(args: &Value) -> Result<Value, McpError> {
+  match args.get("skill").and_then(Value::as_str) {
+    Some(name) => skills::by_name(name)
+      .map(|skill| json!({ "skill": skill.name, "text": skill.body }))
+      .ok_or_else(|| McpError {
+        code: code::INVALID_PARAMS,
+        message: format!("no skill named {name}"),
+      }),
+    None => Ok(json!({
+      "text": HELP,
+      "skills": skills::SKILLS.iter().map(|skill| skill.name).collect::<Vec<_>>(),
+    })),
+  }
+}
+
+/// `resources/list`: one resource per skill (MCP 2026-07-28 server/resources), in a fixed order.
+fn resources_list() -> Value {
+  let resources: Vec<Value> = skills::SKILLS
+    .iter()
+    .map(|skill| {
+      json!({
+        "uri": skill.uri(),
+        "name": skill.name,
+        "description": skill.description(),
+        "mimeType": skills::MIME_TYPE,
+        "size": skill.body.len(),
+      })
+    })
+    .collect();
+  json!({ "resources": resources, "ttlMs": CACHE_TTL_MS, "cacheScope": "public" })
+}
+
+/// `resources/templates/list`: the one template every skill resource fits.
+fn resource_templates_list() -> Value {
+  json!({
+    "resourceTemplates": [{
+      "uriTemplate": skills::URI_TEMPLATE,
+      "name": "slates skill",
+      "description": "A slates skill document (Agent Skills format), by its name.",
+      "mimeType": skills::MIME_TYPE,
+    }],
+    "ttlMs": CACHE_TTL_MS,
+    "cacheScope": "public",
+  })
+}
+
+/// `resources/read`: the skill document a `skill://` URI names; `-32602` for any other URI (MCP 2026-07-28: an
+/// unknown resource is invalid params, and an empty `contents` never stands for one).
+fn resource_read(params: &Value) -> Result<Value, McpError> {
+  let uri = params.get("uri").and_then(Value::as_str).unwrap_or("");
+  let skill = skills::by_uri(uri).ok_or_else(|| McpError {
+    code: code::INVALID_PARAMS,
+    message: format!("Resource not found: {uri}"),
+  })?;
+  Ok(json!({
+    "contents": [{ "uri": skill.uri(), "mimeType": skills::MIME_TYPE, "text": skill.body }],
+    "ttlMs": CACHE_TTL_MS,
+    "cacheScope": "public",
+  }))
+}
+
+/// `prompts/list`: one prompt per skill, taking no arguments.
+fn prompts_list() -> Value {
+  let prompts: Vec<Value> = skills::SKILLS
+    .iter()
+    .map(|skill| json!({ "name": skill.name, "description": skill.description(), "arguments": [] }))
+    .collect();
+  json!({ "prompts": prompts, "ttlMs": CACHE_TTL_MS, "cacheScope": "public" })
+}
+
+/// `prompts/get`: the named skill's document as one user message; `-32602` for an unknown prompt.
+fn prompt_get(params: &Value) -> Result<Value, McpError> {
+  let name = params.get("name").and_then(Value::as_str).unwrap_or("");
+  let skill = skills::by_name(name).ok_or_else(|| McpError {
+    code: code::INVALID_PARAMS,
+    message: format!("unknown prompt: {name}"),
+  })?;
+  Ok(json!({
+    "description": skill.description(),
+    "messages": [{ "role": "user", "content": { "type": "text", "text": skill.body } }],
+  }))
+}
 
 /// A JSON-RPC success reply.
 fn reply(id: &Value, result: Value) -> Value {

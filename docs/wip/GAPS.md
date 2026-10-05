@@ -3584,9 +3584,18 @@ shard's own clock that A-65 budgets in (docs/bugs/2026-10-04-the-slow-observatio
     `404` on an unknown method, and `400` on an unparseable body (all were `200`).
 - **Proven:** `crates/mcp/tests/mcp.rs`, over a live daemon on stdio and on the HTTP edge (`assert_modern_protocol`,
   `assert_modern_http`), and the spec's own sentinel examples in `http::tests`.
+- **Skills over MCP: done (A-82).** Three skills under `skills/`, compiled into the binary and served as
+  `skill://slates/<name>/SKILL.md` resources (`text/markdown`, with a URI template), as prompts of the same names,
+  and through `slates.help {skill}`:
+  - `working-in-slates-volumes`;
+  - `merging-work-in-slates`;
+  - `landing-slates-work-to-disk`.
+  Each is checked as a client reads it against the Agent Skills specification's constraints
+  (`assert_skills_over_mcp`).
 - **Owed for condition 13, in order:**
-  1. skills: the `SKILL.md` source tree, served as `skill://` resources and as prompts (`resources/*`,
-     `prompts/*`), and installed raw by `slates skills install`;
+  1. `slates skills install` (writing `.agents/skills/` and `.claude/skills/`): **Ada's ruling needed.** It writes a
+     user's project directory outside a granted landing, which R1/R10 forbid as written; D-19 lists it. Until then
+     the skills reach clients over MCP and as the raw tree in the repository;
   2. codemode: one tool that runs a bounded program over the volume verbs (vorpal's query-language pattern; output
      reduction is the measured win, `research/mcp-skills-sdks.md` §2.2.5);
   3. `slates.fs` write, list, move and delete;
