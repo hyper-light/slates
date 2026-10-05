@@ -9553,6 +9553,11 @@ memory cap") and GAPS.
      while one shard holds both slices, the other's create is refused `BudgetExceeded`; once the volume is destroyed,
      the other is admitted.
   6. Measured (2026-10-05, BENCHMARKS): under a 1 GiB cap with two shards, one volume holds 264 MiB, against 124 MiB
-     with its own slice and 57 MiB before the power-of-two cut; typed `ENOSPC`, no panic, no OOM kill. Still owed: a
-     SIGKILL during growth (a claim taken, no image naming it yet: re-added, then released at the first publication,
-     by reading); a status line for the shard's held extents and `source_refusals`; where the last 77 MiB goes.
+     with its own slice and 57 MiB before the power-of-two cut; typed `ENOSPC`, no panic, no OOM kill.
+     - A crash between a claim and the first image that names it:
+       `an_extent_claimed_just_before_a_crash_is_returned_at_the_first_publication`. The claim is left as the CAS
+       leaves it; after the restart the files are intact, the extent is free after the shard's first publication,
+       and the other shard is admitted from it (refused while it stayed claimed).
+     - Status: a shard's `reserve` and `mapped` already follow the extents it holds; the pool's refused claims are
+       the `content.pool_refused` count. No test provokes an OS refusal to map, so that count is unexercised.
+     - Owed: where the last 77 MiB goes.

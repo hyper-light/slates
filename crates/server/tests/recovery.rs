@@ -2034,3 +2034,78 @@ fn a_shard_is_refused_while_another_holds_the_pool_and_admitted_once_it_returns(
   assert_ne!(admitted, large);
   daemon.stop();
 }
+
+/// Shape: the pool extent the crash test leaves claimed: partition 1's slice, its first (and, at a power-of-two
+/// [`SLICE`], only) part (`POOL_EXTENTS_PER_PARTITION × 1 + 0`).
+const OTHER_SLICE_EXTENT: usize = slates_anchor::layout::POOL_EXTENTS_PER_PARTITION;
+
+/// A-98 crash between a claim and the first image that names it. A claim is one compare-and-swap of an owner word,
+/// durable the moment it is taken; the image naming blocks in the extent is published after. Do: on two shards of
+/// [`SLICE`], write files into a volume on shard 0 and stop; take the other slice's extent for partition 0 as a claim
+/// made just before a kill would leave it; restart over the same anchor; create a volume on shard 0 (its first
+/// publication) and then one on shard 1 needing half its own slice. Expect every file intact, the
+/// orphaned extent free again after shard 0's first publication, and shard 1 admitted from it. Without the release
+/// the extent would stay with partition 0 for the anchor's life and shard 1's create would be refused.
+#[test]
+fn an_extent_claimed_just_before_a_crash_is_returned_at_the_first_publication() {
+  let profile = common::machine_profile();
+  let instance = format!("srv-pool-crash-{}", std::process::id());
+  let mut config = DaemonConfig::derive(&profile, &instance, Some(POOL_SHARDS));
+  config.reserve_per_shard = SLICE;
+  let segment = anchor_segment("pool-crash", &profile, &config);
+  let first = Daemon::start(&profile, config.clone(), source_of(&segment)).unwrap();
+  first
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let mut client = connect(&instance);
+  let bounded = |name: String, limit: u64| CreateSpec {
+    size: SizeClass::Bounded { limit },
+    ..scratch(&name)
+  };
+  let kept = client
+    .create(&bounded(name_on(0, "kept"), SLICE / 8))
+    .unwrap();
+  let attachment = client
+    .attach(kept, None, slates_ipc::protocol::Intent::Write)
+    .unwrap()
+    .attachment;
+  let files = 3;
+  for index in 0..files {
+    let wrote = client.fs_write(
+      (kept, attachment),
+      &format!("f{index}"),
+      &file_bytes(index),
+      0o644,
+    );
+    assert_eq!(wrote.ok(), Some(FILL_FILE as u64), "file {index}");
+  }
+  first.stop();
+  assert!(
+    segment.pool_claim(OTHER_SLICE_EXTENT, 0).unwrap(),
+    "the other slice's extent was free, and is now held as a crash after its claim leaves it"
+  );
+  let second = Daemon::start(&profile, config, source_of(&segment)).unwrap();
+  for index in 0..files {
+    let read = client.read(
+      kept,
+      &format!("f{index}"),
+      slates_ipc::protocol::ReadAt::Head,
+    );
+    assert!(
+      read.unwrap() == file_bytes(index),
+      "file {index} after the restart"
+    );
+  }
+  client
+    .create(&bounded(name_on(0, "publish"), 1 << 20))
+    .expect("shard 0 publishes");
+  assert_eq!(
+    segment.pool_owner(OTHER_SLICE_EXTENT).unwrap(),
+    None,
+    "the orphaned claim is returned at the first publication"
+  );
+  client
+    .create(&bounded(name_on(1, "own"), SLICE / 2))
+    .expect("shard 1 is admitted from its own slice again");
+  second.stop();
+}

@@ -1972,6 +1972,14 @@ pub fn shard_report(state: &mut ShardState) -> ShardReport {
         kind: (*kind).to_owned(),
         count: *count,
       })
+      .chain(
+        Some(state.store.content.arena().source_refusals())
+          .filter(|count| *count > 0)
+          .map(|count| RefusalCount {
+            kind: CONTENT_POOL_REFUSED.to_owned(),
+            count,
+          }),
+      )
       .collect(),
     replayed_records: state.recovered.replayed_records,
     replay_ns: state.recovered.replay_ns,
@@ -7859,6 +7867,10 @@ fn publish_delta(state: &mut ShardState) -> Result<Published, slates_vfs::VfsErr
 
 /// Format: the status counter of publications run to release blocks whose frees waited on one (A-64).
 pub(crate) const DEFERRED_RELIEVED: &str = "arena.deferred_relieved";
+
+/// Format: the status counter of content-pool claims refused (A-98): an extent whose owner word could not be reached,
+/// or whose range the OS would not map, or one that could not be given back. Counted by the pool, never lost.
+pub(crate) const CONTENT_POOL_REFUSED: &str = "content.pool_refused";
 
 /// Publishes when the shard's arena is short of room only because freed blocks wait on a publication (A-64): a
 /// block the committed recovery image may name is not reused until a newer image commits. Run before each unit of
