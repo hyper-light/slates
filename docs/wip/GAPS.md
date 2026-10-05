@@ -3697,6 +3697,10 @@ share) holding 1,614 descriptors under the mount, the deleted files among them, 
 rather than remove. Environmental to that stack (the server is never asked to remove them), not seen on a native Linux
 mount; the files go when the VM drops its handles. Owed: confirm on Linux Docker over the FUSE and NFS mounts that the
 same install leaves none.
+Environment, 2026-10-05 afternoon: the Docker VM's TCP memory is past its hard limit (`sockstat` mem 189,245 pages,
+`tcp_mem` max 186,384; 1,658 sockets allocated outside the VM's host namespace), which slows every loopback NFS RPC
+(cargo build 100–134 s on slates against 3.6–13.5 s on tmpfs, bisected to the same on the morning's commit). Real
+workload numbers wait on a Docker Desktop restart, which is Ada's call (it stops other sessions' containers).
 Observed once, unattributed (2026-10-05): fleet `a_cross_region_client_finds_the_copyset_successor_instead_of_an_unrelated_live_peer`
 failed its `audit_wait` for the successor's status at load average 94 from other sessions; it passed 3 of 3 alone after. Closed the same day: a seal after an image encrypted the imaged block in place and a restart read
 ciphertext as content (docs/bugs/2026-10-05-a-seal-after-an-image-turned-its-open-extent-into-ciphertext.md). Also owed: a volume's epoch key is a `VersionKey` whose expanded AES schedule sits in aws-lc's

@@ -2156,6 +2156,24 @@ slices within budget either way, AC-1.5 352,335,998 → 383,350,910 B (the bench
 item), a block naming its buffer by class and handle: XFS's progression from in-inode to one block to leaf and node
 forms (Sweeney et al., USENIX 1996) without the global allocator.
 
+### An idle daemon's cost, and the real workloads again under a TCP-exhausted Docker VM (2026-10-05, afternoon)
+
+Idle (`idle-cpu.sh 60`, session scratch): a release `anchor --quick --shards 4` with one mounted volume and no client
+activity, after the idle sweep, zero on free and A-101: over 60 s the daemon used 0.04 CPU-seconds (about 0.07% of one
+core) and the anchor 0.00; `top -pid` reported 0.0% CPU, 0 idle wakeups and 0.0 power. The reap tick (1 s) with its
+sweep and the 10 Hz heartbeat cost nothing measurable at rest.
+
+Real workloads, rerun at 15:12–15:22 on HEAD (`realworld_chaos.sh`, `realworld_native.sh`): correct throughout (six
+SIGKILLs, clone tree hash `31a1f6f713d195f5`, the build runs, pip imports), but slow: cargo build 115–134 s on slates
+against 13.5 s on tmpfs, where the morning's record was 3.3 against 3.2. Bisected over Linux release builds of
+`ad76b3b` (the morning's commit), `f989cc5` and `24b536a`: all three take 100–105 s on slates against 3.6–4.4 s on
+tmpfs, so the slowdown is not in slates' code since then. `strace -c -w` on the build: `close` 71 ms a call, `openat`
+34 ms, `statx` 18 ms on slates, microseconds on tmpfs, while the daemon served each request in p50 2.8 µs, p99 82 µs.
+`TCP_NODELAY` is set on both sockets (`crates/rt/src/tcp.rs`). The Docker VM's `/proc/net/sockstat`: TCP `mem
+189245` pages against `tcp_mem` `93192 124257 186384` — past the hard limit, 1,658 TCP sockets allocated, none of
+them in the VM's host namespace (4 listening there, no NFS mounts). Every loopback RPC is throttled; numbers from this
+VM are not comparable until it is reset (restarting Docker Desktop stops other sessions' containers).
+
 ### Codemode against list-and-read on a real agent task (condition 13; 2026-10-05)
 
 Command: `cargo run --release -p slates-mcp --example codemode_tokens` (an in-process daemon, 2 shards; an overlay
