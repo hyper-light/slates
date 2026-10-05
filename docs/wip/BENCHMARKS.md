@@ -1682,3 +1682,16 @@ signals. Apple M5 Max, load average 58–81 from other sessions.
 - **Correction:** an earlier reading of this run printed the queue column as RTT. The table above reads them
   correctly.
 
+**Re-check after the shared machine's extra load ended** (another session's 24 CPU burners ran 17:55–19:37; the
+table above was measured inside that window). Three alternating pairs at 19:42–19:45, load average 15–40: HEAD
+`6832c10` (4 slots, one reply per call) against `3e45dca` (A-74, A-75).
+
+| | `6832c10` | `3e45dca` |
+|---|---|---|
+| `go build -a net/http` | 5.95 / 6.70 / 6.16 s | 4.66 / 4.66 / 4.32 s |
+| cached rebuild | 0.85 / 1.03 / 0.62 s | 0.56 / 0.58 / 0.53 s |
+| reopen: queue + RTT | 1.03 / 1.27 / 0.98 ms | 0.56 / 0.49 / 0.53 ms |
+| `cp -a` (one call in flight) | 30.2 / 21.2 / 20.8 s | 24.4 / 35.3 / 24.7 s |
+
+The copy keeps one call in flight, so the slots cannot help it; its spread is the machine's.
+
