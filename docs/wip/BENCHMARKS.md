@@ -1655,3 +1655,7 @@ Attribution before the fix: `footprint --forkCorpse -v` diffed between rounds 4 
 On a 4 GiB volume the op log's budget (1% of the quota, 43 MB) also fills over the first rounds; that is charged
 and bounded.
 
+After A-72 (trie removal frees the nodes it empties; the op log's ring capped at its budget), same 24-round run:
+85.7 MB at round 3, 86.0 MB at round 12, 86.3 MB at round 24 (+0.66 MB, against +2.1 MB after A-71 alone and
++38.0 MB before either).
+

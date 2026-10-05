@@ -164,15 +164,34 @@ impl OpLog {
       at,
       prev_version,
     };
-    self.bytes += record.bytes();
-    self.records.push_back(record);
-    while self.bytes > self.budget_bytes && self.records.len() > 1 {
-      if let Some(old) = self.records.pop_front() {
-        self.bytes -= old.bytes();
-        self.dropped += 1;
-      }
+    let incoming = record.bytes();
+    // The oldest leave before the newest lands, so the ring never holds more than the budget (the newest always stays).
+    while self.bytes.saturating_add(incoming) > self.budget_bytes {
+      let Some(old) = self.records.pop_front() else {
+        break;
+      };
+      self.bytes = self.bytes.saturating_sub(old.bytes());
+      self.dropped += 1;
     }
+    self.bytes = self.bytes.saturating_add(incoming);
+    self.reserve_within_budget();
+    self.records.push_back(record);
     seq
+  }
+
+  /// Grows the ring, when full, by doubling but never past the records the budget can hold: every record is charged
+  /// at least its fixed size and the oldest leave before the newest lands, so `budget_bytes / size_of::<OpRecord>()`
+  /// records is the most retention ever keeps (one, when a single record is larger than the budget). Plain doubling let the allocation reach twice the budget the
+  /// volume is charged for (§4.2; 2026-10-04: a 43 MB budget's ring had grown to a 33.8 MB allocation on its way to
+  /// 64 MB).
+  fn reserve_within_budget(&mut self) {
+    let len = self.records.len();
+    if len < self.records.capacity() {
+      return;
+    }
+    let most = (self.budget_bytes / std::mem::size_of::<OpRecord>()).max(len.saturating_add(1));
+    let target = len.saturating_mul(2).max(1).min(most);
+    self.records.reserve_exact(target.saturating_sub(len));
   }
 
   /// Records since `seq` (exclusive), oldest first.
@@ -224,5 +243,23 @@ mod tests {
     assert!(seqs.windows(2).all(|w| w[1] == w[0] + 1));
     assert_eq!(seqs.last(), Some(&5));
     assert_eq!(log.since(4).count(), 1);
+  }
+
+  /// §4.2: do append far past the budget; expect the ring's allocation never to exceed the records the budget holds
+  /// (doubling would reach twice that), with retention as before.
+  #[test]
+  fn the_ring_never_allocates_past_its_budget() {
+    let budget = 1000 * std::mem::size_of::<OpRecord>();
+    let mut log = OpLog::new(budget);
+    for i in 0..10_000u64 {
+      log.append(Op::Create, "", Some(InodeNo(i)), Epoch(0), i, 0);
+      assert!(
+        log.records.capacity() <= 1000,
+        "capacity {} past the budget's 1000 records",
+        log.records.capacity()
+      );
+    }
+    assert_eq!(log.head_seq(), 10_000);
+    assert!(log.len() <= 1000 && log.dropped() >= 9_000);
   }
 }

@@ -3508,8 +3508,7 @@ shard's own clock that A-65 budgets in (docs/bugs/2026-10-04-the-slow-observatio
   NFS-volume form needs no `lsof`; and the OCI report should name the NFS-volume form for Docker Desktop.
 - **Owed:** the read pass over the NFSv4.2 volume is 2–9× the host bind's (1.7–4.3 s against 0.46–0.82 s for 2,524
   files). Every open is a round trip. NFSv4 read delegations (RFC 8881 §10.4) are the standard remedy, to measure.
-- **Owed:** about 100 KB per round still accumulates (trie slab nodes, 448 KiB over six rounds; inode numbers are
-  never reused). Check that `trie` removal prunes empty nodes.
-- **Owed:** the volume op log's `VecDeque` doubles, so its allocation can reach about twice the 1% budget the volume
-  is charged for. Reserve its capacity from the budget once.
+- **Done (A-72):** trie removal frees the nodes it empties, and the op log's ring is capped at its budget. Rounds 3 to
+  24 now grow the daemon +0.66 MB, consistent with the 512 MiB volume's op log still filling toward its charged
+  5.4 MB.
 

@@ -8675,3 +8675,25 @@ Status: built 2026-10-04.
   and on, past four 16 KiB intervals), including the crash state between the two stores; db 101/101; server
   recovery 16/16.
 
+### A-72 — The inode trie frees the nodes a removal empties; the op log never allocates past its budget (2026-10-04)
+Applied in the same change to: `crates/vfs/src/trie.rs` (`remove`, `prune`), `crates/vfs/src/journal.rs`
+(`OpLog::append`, `reserve_within_budget`), BENCHMARKS, GAPS.
+Status: built 2026-10-04.
+- Why: after A-71, a daemon still grew about 100 KB per Docker round with the volume emptied each time. Two causes:
+  - **The trie (D-5).** It left empty nodes in place on removal ("numbers are never reused"). Since a number never
+    returns, such a node never fills again. A churning volume kept one empty leaf per sixteen numbers it had ever
+    held, plus their parents: 448 KiB of trie slab over six rounds.
+  - **The op log.** Its `VecDeque` grew by doubling, so the allocation could reach twice the 1%-of-quota budget the
+    volume is charged for (§4.2).
+- What:
+  - **Trie removal** frees each node it leaves empty and clears its slot in the parent, up the path to the root but
+    never the root itself. Every node on the path is current (born in the epoch, copied otherwise), so no snapshot
+    shares a freed node, and a snapshot's original went to the deadlist when it was copied.
+  - **The op log** evicts its oldest records before the newest lands, and grows its ring by doubling capped at
+    `budget / size_of::<OpRecord>()` records. That is the most retention can hold, since every record is charged at
+    least its fixed size.
+- Measured: daemon RSS from round 3 to round 24 of the Docker workload, +2.1 MB → +0.66 MB.
+- Proven: `removal_frees_the_nodes_it_empties_so_churn_leaves_only_the_root` (failed first: 77 nodes after the
+  first round; covers a removal past a snapshot's epoch); `the_ring_never_allocates_past_its_budget` (failed first:
+  capacity 1,001 against 1,000); vfs 208/208.
+

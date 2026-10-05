@@ -184,8 +184,11 @@ pub fn set(
 }
 
 /// Removes `no`, copying the path as `set` does (all or nothing, admitted the same way); returns the
-/// (possibly new) root and the removed handle, if any. Empty nodes are left in place: numbers are never reused, so a freed leaf's
-/// node stays sparse and is reclaimed with its snapshot's deadlist or the volume.
+/// (possibly new) root and the removed handle, if any. A node the removal leaves empty is freed and its slot in the
+/// parent cleared, up the path to (never including) the root (A-72): numbers are never reused, so a node left in
+/// place would never fill again, and a churning volume grew by one empty node per sixteen numbers it ever held. Every
+/// node on the path is current by then (born in `epoch`, copied if it was not), so no snapshot shares a freed node;
+/// a snapshot's original was already given to the deadlist by the copy.
 pub fn remove(
   nodes: &mut Slab<TrieNode>,
   root: Handle<TrieNode>,
@@ -199,23 +202,52 @@ pub fn remove(
   admit(nodes, nodes_to_remove(nodes, root, no, epoch)?)?;
   let mut node = ensure_current(nodes, root, epoch, dead)?;
   let new_root = node;
+  let mut path: Vec<(Handle<TrieNode>, usize)> =
+    Vec::with_capacity(usize::try_from(LEVELS).unwrap_or(0));
   for level in 0..LEVELS {
     let d = digit(no, level);
     let current = nodes.get(node)?.slots[d];
     match current {
       Slot::Inode(old) => {
         nodes.get_mut(node)?.slots[d] = Slot::Empty;
+        prune(nodes, node, &path)?;
         return Ok((new_root, Some(old)));
       }
       Slot::Node(child) => {
         let child = ensure_current(nodes, child, epoch, dead)?;
         nodes.get_mut(node)?.slots[d] = Slot::Node(child);
+        path.push((node, d));
         node = child;
       }
       Slot::Empty => return Ok((new_root, None)),
     }
   }
   Ok((new_root, None))
+}
+
+/// Frees `node` while it holds nothing, then its parent likewise, up `path` (each entry a parent and the slot that
+/// names the next node down); the root, the path's first parent, is never freed.
+fn prune(
+  nodes: &mut Slab<TrieNode>,
+  mut node: Handle<TrieNode>,
+  path: &[(Handle<TrieNode>, usize)],
+) -> Result<(), VfsError> {
+  for &(parent, slot) in path.iter().rev() {
+    if nodes
+      .get(node)?
+      .slots
+      .iter()
+      .any(|held| !matches!(held, Slot::Empty))
+    {
+      return Ok(());
+    }
+    nodes.remove(node)?;
+    if let Some(entry) = nodes.get_mut(parent)?.slots.get_mut(slot) {
+      *entry = Slot::Empty;
+    }
+    node = parent;
+  }
+  Ok(())
 }
 
 /// A node that may be mutated in `epoch`: the node itself if born in it, else a copy born now,
@@ -481,5 +513,71 @@ mod tests {
     let mut all = Vec::new();
     walk(&f.nodes, root2, &mut all);
     assert_eq!(all, vec![f.a]);
+  }
+
+  /// D-5, A-72: do create and remove many numbers in turn, as a churning volume does (numbers are never reused); expect
+  /// the trie to hold only its root again, and a removal past a snapshot's epoch to leave the snapshot's view intact.
+  /// Empty nodes left in place grew a daemon by about 100 KB per Docker round, without bound (2026-10-04).
+  #[test]
+  fn removal_frees_the_nodes_it_empties_so_churn_leaves_only_the_root() {
+    let mut nodes: Slab<TrieNode> = Slab::new(64, 1 << 16);
+    let mut inodes: Slab<Inode> = Slab::new(64, 1 << 16);
+    let mut dead = Deadlist::default();
+    let mut root = new_root(&mut nodes, Epoch(0)).unwrap();
+    for round in 0..8u64 {
+      let numbers: Vec<u64> = (round * 1000 + 1..=round * 1000 + 1000).collect();
+      for &no in &numbers {
+        let handle = inode(&mut inodes, no);
+        root = set(
+          &mut nodes,
+          root,
+          InodeNo::compose(1, no),
+          handle,
+          Epoch(0),
+          &mut dead,
+        )
+        .unwrap()
+        .0;
+      }
+      for &no in &numbers {
+        root = remove(
+          &mut nodes,
+          root,
+          InodeNo::compose(1, no),
+          Epoch(0),
+          &mut dead,
+        )
+        .unwrap()
+        .0;
+      }
+      assert_eq!(nodes.len(), 1, "round {round}: only the root remains");
+    }
+    let kept = inode(&mut inodes, 9001);
+    root = set(
+      &mut nodes,
+      root,
+      InodeNo::compose(1, 9001),
+      kept,
+      Epoch(0),
+      &mut dead,
+    )
+    .unwrap()
+    .0;
+    let frozen = root;
+    let (later, removed) = remove(
+      &mut nodes,
+      root,
+      InodeNo::compose(1, 9001),
+      Epoch(1),
+      &mut dead,
+    )
+    .unwrap();
+    assert_eq!(removed, Some(kept));
+    assert_eq!(get(&nodes, later, InodeNo::compose(1, 9001)), None);
+    assert_eq!(
+      get(&nodes, frozen, InodeNo::compose(1, 9001)),
+      Some(kept),
+      "the snapshot still sees it"
+    );
   }
 }
