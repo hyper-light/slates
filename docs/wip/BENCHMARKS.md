@@ -2108,6 +2108,21 @@ the at-rest guarantee. AC-1.5 at a million files, bisected over `git archive` bu
 `baced10` 443,572,350 B, `0799cc1` (A-68) 578,134,114 B, HEAD before the fix 586,356,834 B (over the 553 B/file budget),
 after 451,795,070 B (within).
 
+### The idle sweep on real installs through Docker (condition 9; 2026-10-05)
+
+Command: `e2e-installs.sh 1` (session scratch): a release `slates anchor --quick --shards 4`, a 2 GiB bounded volume
+mounted at a host path and bound into containers (`slates attach --oci-source`), then `npm install express lodash
+typescript` (node:20-alpine), `pip install requests flask` in a venv (python:3.12-alpine) and a 2,000-file tar round
+trip (alpine:3.20), each also on a container tmpfs. Apple M5 Max, Docker Desktop, load average 16–33.
+
+| build | npm files | pip files | tar files | chunks sealed (`content.sealed`) | daemon RSS max |
+|---|---|---|---|---|---|
+| before the idle sweep (`7a75b32`) | 2,182 (tmpfs 2,182) | 1,390 (1,385) | 2,000 (2,000) | 109 | 117 MiB |
+| with the idle sweep (`37e4e85`) | 2,182 (2,182) | 1,392 (1,385) | 2,000 (2,000) | 2,870 | 126 MiB |
+
+Times (s, slates / tmpfs): npm 10.4 / 22.8, pip 16.8 / 9.7, tar 7.5 / 0.9 in the second run. The extra pip files are
+NFSv3 silly renames held by Docker Desktop's virtiofs share (GAPS).
+
 ### Codemode against list-and-read on a real agent task (condition 13; 2026-10-05)
 
 Command: `cargo run --release -p slates-mcp --example codemode_tokens` (an in-process daemon, 2 shards; an overlay

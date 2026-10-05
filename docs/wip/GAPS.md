@@ -3684,6 +3684,14 @@ and creates even. A slab-held open extent would remove that allocation. Next, ea
 where a niche gives 8, `Home` 24 B, and directory entries and trie nodes per file. A billion-file volume at even 100 B a
 file is 100 GB on one host: billion-file namespaces need a volume's metadata spread across shards and hosts (a design
 item, not yet decided).
+Docker Desktop on macOS, 2026-10-05 (`pip-diff.sh`: one pip install of requests and flask into a slates volume and
+into a container tmpfs): 7–13 more files on slates, every one an NFSv3 silly rename (`.nfs.<fileid>.<pid>` in a
+`dist-info` directory: a file deleted while open). They persisted past 35 s after the container exited and a fresh
+container saw them. `lsof` names the holder: Apple's Virtualization.framework VM process (Docker Desktop's virtiofs
+share) holding 1,614 descriptors under the mount, the deleted files among them, so the macOS NFS client had to rename
+rather than remove. Environmental to that stack (the server is never asked to remove them), not seen on a native Linux
+mount; the files go when the VM drops its handles. Owed: confirm on Linux Docker over the FUSE and NFS mounts that the
+same install leaves none.
 Observed once, unattributed (2026-10-05): fleet `a_cross_region_client_finds_the_copyset_successor_instead_of_an_unrelated_live_peer`
 failed its `audit_wait` for the successor's status at load average 94 from other sessions; it passed 3 of 3 alone after. Closed the same day: a seal after an image encrypted the imaged block in place and a restart read
 ciphertext as content (docs/bugs/2026-10-05-a-seal-after-an-image-turned-its-open-extent-into-ciphertext.md). Also owed: a volume's epoch key is a `VersionKey` whose expanded AES schedule sits in aws-lc's
