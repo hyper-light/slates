@@ -21,15 +21,9 @@ const SEGMENT: u32 = 4096;
 /// Format: the generation the test keys are made at.
 const GENERATION: u32 = 1;
 
-/// The process's locked key region, made by whichever test asks first.
+/// The process's locked key region: made by whichever test asks first, and answered by the region made for the rest.
 fn keys() {
-  if hyper_seal::keys_held().is_none() {
-    let _ = hyper_seal::lock_keys(KEYS);
-  }
-  assert!(
-    hyper_seal::keys_held().is_some(),
-    "the key region is locked"
-  );
+  hyper_seal::lock_keys(KEYS).unwrap();
 }
 
 /// A tenant's keys for the tests: a lineage key and a naming key under one tenant.
@@ -207,9 +201,11 @@ fn another_key_or_another_name_is_refused() {
   );
 }
 
-/// A-92 (seal.md §7): do seal one chunk twice under one tenant, and once under another; expect the two seals of one
-/// tenant to share the keyed name (deduplication within a tenant) while their sealed bytes differ (a fresh data key
-/// each), and the other tenant's name to differ.
+/// A-92 (seal.md §4, §7): do seal one chunk twice under one tenant, once under another, and the same content stored
+/// under another encoding; expect the tenant's two seals to share the keyed name and the very bytes (the data key is
+/// keyed by the sealed record, so holders deduplicate ciphertext), the other tenant's name and bytes to differ, and the
+/// other encoding — the same identity, another record — to seal under another key to other bytes, so no key ever seals
+/// two plaintexts.
 #[test]
 fn keyed_names_match_within_a_tenant_and_differ_across_tenants() {
   let tenant = new_tenant();
@@ -219,7 +215,24 @@ fn keyed_names_match_within_a_tenant_and_differ_across_tenants() {
   let twice = seal_chunk(&tenant.lineage, &tenant.namer, &original, SEGMENT).unwrap();
   let elsewhere = seal_chunk(&other.lineage, &other.namer, &original, SEGMENT).unwrap();
   assert_eq!(once.name, twice.name, "one tenant names one content once");
-  assert_ne!(once.bytes, twice.bytes, "each seal has its own data key");
-  assert_ne!(once.sealed_hash(), twice.sealed_hash());
+  assert_eq!(
+    once.bytes, twice.bytes,
+    "one record seals to one ciphertext"
+  );
   assert_ne!(once.name, elsewhere.name, "another tenant's name differs");
+  assert_ne!(once.bytes, elsewhere.bytes, "another tenant's bytes differ");
+  let recoded = Archive::compressed_chunk(Archive::content(&original).unwrap());
+  assert_eq!(recoded.identity, original.identity, "the same content");
+  assert_ne!(recoded.encoding, original.encoding, "stored another way");
+  let other_record = seal_chunk(&tenant.lineage, &tenant.namer, &recoded, SEGMENT).unwrap();
+  assert_eq!(other_record.name, once.name, "named by its content");
+  assert_ne!(
+    other_record.bytes[..hyper_seal::stream::HEADER],
+    once.bytes[..hyper_seal::stream::HEADER],
+    "another record, another data key"
+  );
+  assert_eq!(
+    open_chunk(&tenant.lineage, &tenant.namer, &other_record).unwrap(),
+    recoded
+  );
 }

@@ -2228,20 +2228,54 @@ fn advance_seal(
   let Ok(slot) = state.volumes.get(handle) else {
     return false;
   };
-  match archiver.advance(&slot.volume, &state.store, slice_bytes) {
-    Ok(Progress::More) => false,
+  let archive = match archiver.advance(&slot.volume, &state.store, slice_bytes) {
+    Ok(Progress::More) => return false,
     Ok(Progress::Done(archive)) => {
-      job.manifest = Some(archive.manifest_identity());
-      job.archive = Some(archive);
       job.archiver = None;
-      true
+      archive
     }
     Err(_) => {
       job.archiver = None;
       *state.refusals.entry(SEAL_REFUSED).or_insert(0) += 1;
-      false
+      return false;
     }
+  };
+  let Some(archive) = envelope_of(state, object, archive) else {
+    return false;
+  };
+  let Some(job) = state.seals.get_mut(&object) else {
+    return false;
+  };
+  job.manifest = Some(archive.manifest_identity());
+  job.archive = Some(archive);
+  true
+}
+
+/// The archive a seal places (A-92 piece 3b): `archive` wrapped in an envelope under the volume's lineage and naming
+/// keys (`slates_cluster::envelope`), so holders keep ciphertext and hold no key, in segments of the volume's base page
+/// (seal.md §4: the smallest unit slates reads and seals at). Where this node cannot seal at all (its key region or
+/// root unavailable, reported in status) the archive is placed as it is. Where it can but a key or the seal refuses,
+/// `None`: the seal is refused and counted, and the next period starts it again; content is never placed in the clear
+/// by a node that seals.
+fn envelope_of(state: &mut ShardState, object: ObjectId, archive: Archive) -> Option<Archive> {
+  if state.seal_root.is_none() {
+    return Some(archive);
   }
+  let id = DbVolumeId { bytes: object.0 };
+  let sealed = state
+    .db
+    .partition()
+    .volume(id)
+    .map(|volume| crate::seal_keys::tenant_of(&volume.owner))
+    .and_then(|account| {
+      let lineage = crate::seal_keys::lineage(state, id, account).ok()?;
+      let namer = crate::seal_keys::namer(state, id, account).ok()?;
+      slates_cluster::envelope::wrap(&archive, &lineage, &namer, archive.base_page_size).ok()
+    });
+  if sealed.is_none() {
+    *state.refusals.entry(SEAL_ENVELOPE_REFUSED).or_insert(0) += 1;
+  }
+  sealed
 }
 
 /// Derived: how many put-latency readings the owner shard keeps for the content class's p95 — the
@@ -2970,15 +3004,22 @@ async fn materialize(origin: u16, object: ObjectId, head: HeadValue) {
         catalog_sequence,
         sequence,
       };
+      // The volume's lineage key, so this node opens what the dead owner sealed and seals under the same key (A-92
+      // pieces 3b and 4c). A head that carried no entry for this node (it acknowledged before its pair arrived) leaves
+      // a plain archive's volume to a new key, and an envelope unopened.
+      let adopted = successor_lineage.is_some_and(|lineage| {
+        let adopted =
+          crate::seal_keys::adopt_lineage(s, id, &catalog.owner, lineage, naming.as_ref()).is_ok();
+        if !adopted {
+          *s.refusals.entry(LINEAGE_UNADOPTED).or_insert(0) += 1;
+        }
+        adopted
+      });
+      let Some(archive) = opened_archive(s, id, &catalog.owner, adopted, archive) else {
+        *s.refusals.entry(ENVELOPE_UNOPENED).or_insert(0) += 1;
+        return false;
+      };
       let served = verbs::materialize_taken_over(s, id, &taken, region, &archive).is_ok();
-      // The volume's lineage key, so this node seals under the key the dead owner did (A-92 piece 4c). A head that
-      // carried no entry for this node (it acknowledged before its pair arrived) leaves the volume to a new key.
-      if served
-        && let Some(lineage) = successor_lineage
-        && crate::seal_keys::adopt_lineage(s, id, &catalog.owner, lineage, naming.as_ref()).is_err()
-      {
-        *s.refusals.entry(LINEAGE_UNADOPTED).or_insert(0) += 1;
-      }
       if served {
         // The owner shard now owns the head's and the catalog's placements — its record plane writes the
         // object's next records at the promotion epoch and ships only to holders still missing these.
@@ -3000,10 +3041,40 @@ async fn materialize(origin: u16, object: ObjectId, head: HeadValue) {
   });
 }
 
+/// The archive a taken-over volume is served from: a plain archive as it is; an envelope opened under the volume's
+/// lineage and naming keys once this node has adopted them (`adopted`), else `None` — ciphertext is never served as a
+/// volume's files.
+fn opened_archive(
+  state: &mut ShardState,
+  id: DbVolumeId,
+  owner: &slates_db::catalog::Principal,
+  adopted: bool,
+  archive: Archive,
+) -> Option<Archive> {
+  if !slates_cluster::envelope::is_envelope(&archive) {
+    return Some(archive);
+  }
+  if !adopted {
+    return None;
+  }
+  let account = crate::seal_keys::tenant_of(owner);
+  let lineage = crate::seal_keys::lineage(state, id, account).ok()?;
+  let namer = crate::seal_keys::namer(state, id, account).ok()?;
+  slates_cluster::envelope::open(&archive, &lineage, &namer).ok()
+}
+
 /// Counter: a volume whose lineage key could not be made at its seal's start (A-92 piece 4c); its head then carries no
 /// key for successors until a later seal.
 /// Format: a counter name in the daemon's status report.
 const LINEAGE_UNMADE: &str = "fleet.seal.lineage_unmade";
+/// Counter: a seal whose archive could not be wrapped in its envelope though this node seals (a key that would not
+/// unwrap or record, a seal that refused; A-92 piece 3b): the seal is dropped and started again next period.
+/// Format: a counter name in the daemon's status report.
+const SEAL_ENVELOPE_REFUSED: &str = "fleet.seal.envelope_refused";
+/// Counter: a taken-over volume whose envelope this node could not open (no key for it in the head, a key that would
+/// not adopt, or a refused open; A-92 piece 3b): the volume is not materialized from it.
+/// Format: a counter name in the daemon's status report.
+const ENVELOPE_UNOPENED: &str = "fleet.seal.envelope_unopened";
 /// Counter: a taken-over volume whose lineage key the successor could not record (A-92 piece 4c).
 /// Format: a counter name in the daemon's status report.
 const LINEAGE_UNADOPTED: &str = "fleet.seal.lineage_unadopted";

@@ -1781,6 +1781,22 @@ impl Daemon {
     })
   }
 
+  /// The archive this node holds for `object` under `manifest` as a content candidate, encoded as it would travel, or
+  /// `Ok(None)` when it holds none: what a holder keeps, which for a sealed volume is an envelope of ciphertext and
+  /// keyed names (A-92 piece 3b) — a test or an operator reads it to see what a holder learns. Runs on the control shard
+  /// ([`Self::observation`]); the typed refusal when it could not be observed.
+  pub fn fleet_held_archive(
+    &self,
+    object: slates_db::register::ObjectId,
+    manifest: [u8; 32],
+  ) -> Result<Option<Vec<u8>>, ObserveError> {
+    self.observe(self.shards.first().copied(), move |s| {
+      s.held_content
+        .archive_of(s.store.content.arena(), object, &manifest)
+        .map(|archive| archive.encode())
+    })
+  }
+
   /// The **measured put latency** of the content class on the shard that owns `object` (§4.8 "Derived
   /// constants": "hedge delay = measured p95 put latency per class"): how many binding content
   /// acknowledgements that owner shard has timed, and their p95 in nanoseconds — the hedge trigger the next

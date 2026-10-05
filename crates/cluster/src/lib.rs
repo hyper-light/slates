@@ -45,6 +45,7 @@
 
 pub mod config_group;
 pub mod content;
+pub mod envelope;
 pub mod fleet;
 mod fold;
 pub mod member_plane;

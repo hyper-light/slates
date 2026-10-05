@@ -9235,6 +9235,37 @@ under the lineage key (`HeadNaming`, no per-neighbour cost), adopted with the li
 destroy. Per-tenant naming was set aside: tenant keys are per node and partition, so tenant-wide names could never
 cross a takeover. The takeover test seals with the real naming key; its first run with it failed because the naming
 key was made after the head shipped, which is why the seal's start makes both.
+Built (2026-10-05): piece 3b, the envelope archive (`slates_cluster::envelope`), on hyper-raft `f9a2c8e`. When a seal's
+archive is complete, the owner shard wraps it (`fleet::envelope_of`). Each chunk is sealed under a data key derived from
+the volume's lineage key and the BLAKE3 of exactly the record sealed (hyper-seal `FileSealer::content_keyed`, seal.md
+§4). Keying by the record and not the chunk's identity matters: one identity can be stored under two encodings, and
+keying by it would seal two plaintexts under one key and nonce (`keyed_names_match_within_a_tenant_and_differ_across_
+tenants` seals a chunk raw and LZ4 and requires two data keys). Equal records seal to equal bytes, so holders keep
+equal content once, and a repeat is skipped before it is sealed. The real archive without its chunks, with its
+creation time zeroed, is sealed as one more chunk, so a re-seal of the same snapshot (the healer's re-offer) is the
+same envelope. The envelope's clear tree names `c<keyed name>` per sealed chunk and `m<keyed name>` for the manifest.
+Its root metadata carries inode `u64::MAX`, which no volume root has, and the manifest identity a head pins covers
+it, so a holder cannot make a reader take one kind of archive for the other. A node that seals never places in the
+clear: a key or a seal that refuses drops the seal (`fleet.seal.envelope_refused`) for the next period; a node whose
+sealing is `unavailable` (no locked key region or root) places as before, and status says so. A successor adopts the
+lineage and naming keys from the head before it materializes and opens the envelope with them; without them it
+refuses (`fleet.seal.envelope_unopened`) and never serves ciphertext as files. Proven:
+- `crates/cluster/tests/envelope.rs` (5):
+  - the round trip;
+  - identical bytes on re-wrap, and a shared chunk under one sealed identity across two snapshots;
+  - a holder's view: it verifies as an archive but has no plaintext bytes, identities, file name, time or manifest
+    identity;
+  - relabelled, missing, doubled-manifest, bit-flipped and other-tenant envelopes refused typed;
+  - a re-seal later is the same envelope.
+- In the fleet, `a_takeover_successor_serves_the_dead_owners_content_over_nfs` now reads what a surviving holder keeps:
+  an envelope without the file's bytes, while the successor serves the file byte for byte. With the wrap disabled
+  that assertion fails ("a holder keeps the snapshot as an envelope").
+- Suites: fleet 70, cluster 280, and the three-process CLI fleet (owner SIGKILLed, kernel-mount read-back) pass.
+- Cost (`cargo run --release -p slates-cluster --example envelope_bench`, 64 MiB of 1,024 distinct 64 KiB chunks,
+  best of 5, M5 Max at load average 14): wrap 98 ms (0.68 GB/s) and open 69 ms, against the plain archive's encode
+  32 ms and decode 57 ms; the envelope is 1% larger (68.04 against 67.38 MB). The wrap is off the write path (a seal
+  runs in the background) and on the takeover path once; its copies and second BLAKE3 pass around the 9–10 GB/s seal
+  are where it can still shrink.
 - Why: condition 9 asks for volumes post-quantum encrypted at rest and in transit. In transit holds already: every TLS
   handshake prefers X25519MLKEM768 (A-66, 2026-10-04), and SecP384r1MLKEM1024 replaces it between nodes once
   hyper-raft's measurement of it lands (its §10). At rest, slates has no disk (R1): a volume rests in RAM, in two

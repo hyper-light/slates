@@ -3653,12 +3653,12 @@ already made). A-92 maps it onto slates: holders keep
 ciphertext, keys live in locked memory for the anchor's life and never touch a disk, a successor opens by a lineage
 key wrapped to its ML-KEM-1024 recipient key. Built: the crate in the build, and the sealed chunk (`slates_cluster::
 sealed`, hostile-input tested), and the node root kept for the anchor's life in locked memory and adopted across a
-daemon restart, and tenant, naming and lineage keys recorded in the partition and unwrapped after a restart. Owed, in
-order: the erase on account removal (a volume's destroy already erases its lineage key); sealed content carried by the
-content plane (a sealed manifest with its clear chunk table, ciphertext verified by holders, keyed names in missing
-sets); the
-successor's wrapped key in the head record; the idle-RAM measurement and its decision; sealed archives;
-SecP384r1MLKEM1024 between nodes once hyper-raft measures it.
+daemon restart, and tenant, naming and lineage keys recorded in the partition and unwrapped after a restart. Since
+2026-10-05 also sealed content on the content plane (piece 3b, the envelope archive: holders keep ciphertext and keyed
+names, a successor opens with the head's keys), the successor's wrapped key in the head (4c), and SecP384r1MLKEM1024
+between nodes (A-93). Owed, in order: the erase on account removal (a volume's destroy already erases its lineage
+key); the idle-RAM measurement and its decision; sealed archives (an export sealed to an operator's ML-KEM-1024
+recipient); the envelope wrap's extra copies and second BLAKE3 pass (98 ms for 64 MiB against a 9–10 GB/s seal).
 
 SecP384r1MLKEM1024 between nodes is built (A-93), interoperating with OpenSSL 3.5.7 both ways.
 

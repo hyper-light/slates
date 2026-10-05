@@ -7000,6 +7000,8 @@ fn a_takeover_successor_serves_the_dead_owners_content_over_nfs() {
   // A-92 piece 4c: a chunk sealed on the owner under the volume's lineage key, to be opened on the successor.
   let volume = slates_db::catalog::VolumeId { bytes: id.bytes };
   let sealed_chunk = seal_probe_on(&daemons[0], volume);
+  // A-92 piece 3b: what a holder keeps of the snapshot.
+  let held = held_by_a_survivor(&daemons, object);
   // What the origin shows for the root's and the file's mode and owner, times and attributes, before it
   // dies.
   let origin_owners = owners_over_nfs(&daemons[0], "served");
@@ -7049,10 +7051,37 @@ fn a_takeover_successor_serves_the_dead_owners_content_over_nfs() {
   );
   assert_successor_metadata(successor_metadata.as_ref(), &origin_metadata);
   assert_probe_opened(opened.as_deref());
+  assert_held_sealed(held.as_deref());
   assert!(
     resealed,
     "a seal taken on the successor after the takeover places — its head written at the promotion \
      epoch the holders fenced the object at, not the successor's lower host epoch"
+  );
+}
+
+/// The archive a survivor holds for `object`'s head snapshot, encoded as it travels: the first survivor that holds the
+/// manifest the owner recorded for it.
+fn held_by_a_survivor(daemons: &[Daemon], object: ObjectId) -> Option<Vec<u8>> {
+  let manifest = daemons.first()?.fleet_head_manifest(object).ok()??;
+  daemons
+    .iter()
+    .skip(1)
+    .find_map(|daemon| daemon.fleet_held_archive(object, manifest).ok()?)
+}
+
+/// A-92 piece 3b: do read what a surviving holder keeps of a sealed snapshot; expect an envelope (it verifies as an
+/// archive and says it is one) holding none of the file's bytes, while the successor read them back (asserted above).
+fn assert_held_sealed(held: Option<&[u8]>) {
+  let bytes = held.expect("a survivor holds the head snapshot's content");
+  let archive =
+    slates_archive::Archive::decode(bytes).expect("the held content verifies as an archive");
+  assert!(
+    slates_cluster::envelope::is_envelope(&archive),
+    "a holder keeps the snapshot as an envelope"
+  );
+  assert!(
+    !bytes.windows(CONTENT.len()).any(|window| window == CONTENT),
+    "the file's bytes are nowhere in what the holder keeps"
   );
 }
 

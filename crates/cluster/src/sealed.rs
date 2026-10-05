@@ -5,7 +5,14 @@
 //! the volume's lineage key in the sealed chunk's header (seal.md §4's rule for a file written once; the
 //! version-keyed rule is for data overwritten in place, and needs an argument this piece does not need). What is
 //! sealed is the chunk's whole content-plane record ([`crate::content::chunk_record`]): its identity, lengths,
-//! encoding and payload, so no plaintext hash travels outside the seal. The sealed chunk is named by its keyed name,
+//! encoding and payload, so no plaintext hash travels outside the seal.
+//!
+//! The data key is keyed by the record's content (hyper-seal `FileSealer::content_keyed`, seal.md §4): derived from
+//! the lineage key and the BLAKE3 of exactly the record sealed, so the same record under the same lineage always seals
+//! to the same bytes. Holders keep ciphertext and deduplicate by it, so equal content stays one sealed chunk without
+//! the owner keeping a table of what it sealed (seal.md §7, "shared by reference, never sealed twice"). The key is the
+//! record's hash, not the chunk's identity: one identity may be stored under more than one encoding, and keying by it
+//! would seal two different plaintexts under one key and nonce. The sealed chunk is named by its keyed name,
 //! HMAC-SHA-256 of the BLAKE3 identity under the tenant's naming key truncated to 128 bits (seal.md §7): equal names
 //! within a tenant mean equal content, and a name confirms nothing to a holder without the key.
 //!
@@ -66,16 +73,18 @@ impl SealedChunk {
   }
 }
 
-/// Seals `chunk` under a fresh data key wrapped by `lineage`, in segments of `segment` plaintext bytes, named by
-/// `namer` (the tenant's naming key).
+/// Seals `chunk` under a data key derived from `lineage` and its record's BLAKE3 (the module doc), in segments of
+/// `segment` plaintext bytes, named by `namer` (the tenant's naming key). The same chunk record always seals to the
+/// same bytes.
 pub fn seal_chunk(
   lineage: &WrappingKey,
   namer: &Namer,
   chunk: &Chunk,
   segment: u32,
 ) -> Result<SealedChunk, SealedError> {
-  let (mut sealer, header) = FileSealer::new(lineage, segment)?;
   let record = chunk_record(chunk);
+  let (mut sealer, header) =
+    FileSealer::content_keyed(lineage, blake3::hash(&record).as_bytes(), segment)?;
   let size = usize::try_from(segment).map_err(|_| SealedError::Seal(SealError::Size))?;
   let segments = record.len().div_ceil(size).max(1);
   let mut bytes = Vec::with_capacity(
