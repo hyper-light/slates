@@ -35,6 +35,12 @@ pub enum SealError {
     /// its stated count is held.
     #[error("no slot for a key in the locked region")]
     Capacity,
+    /// The process's key region was made already, for fewer keys than asked: its count.
+    #[error("the key region was made already, for {slots} keys")]
+    AlreadyLocked {
+        /// The slots the region has.
+        slots: usize,
+    },
     /// The OS would not lock the region: the process's locked-memory limit.
     #[error("the OS would not lock the key region")]
     Lock,

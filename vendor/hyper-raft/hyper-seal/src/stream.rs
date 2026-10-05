@@ -177,6 +177,39 @@ impl FileSealer {
         Ok((sealer, header))
     }
 
+    /// A file keyed by its content (docs/seal.md §4): its data key and its ID derived from `parent`
+    /// and `content`, the 256-bit hash of its whole plaintext, so the same plaintext under the same
+    /// parent always seals to the same bytes, and a holder that keeps only ciphertext sees an
+    /// unchanged file as unchanged. Two different plaintexts get different keys unless their 256-bit
+    /// hashes collide, so no key ever seals two plaintexts at one nonce. What a reader of the stored
+    /// bytes learns is that two such files are equal, which their keyed names say already (§7). The
+    /// caller's contract: `content` is the hash of exactly the plaintext it then seals.
+    pub fn content_keyed(
+        parent: &WrappingKey,
+        content: &[u8; 32],
+        segment: u32,
+    ) -> Result<(Self, Header), SealError> {
+        if segment < MIN_SEGMENT {
+            return Err(SealError::Size);
+        }
+        let (data, key) = parent.derive_child(b"hyper-seal content key", content)?;
+        let (id, _) = parent.derive_child(b"hyper-seal content file", content)?;
+        let mut file = [0u8; 16];
+        fill(&mut file, &[id.bytes()]);
+        let header = Header {
+            segment,
+            file,
+            key,
+            commitment: commitment(&data, &file)?,
+        };
+        let sealer = Self {
+            segments: Segments::new(&data, header)?,
+            next: 0,
+            done: false,
+        };
+        Ok((sealer, header))
+    }
+
     /// Seals the next segment in place and returns its tag, which follows it in the file. Every
     /// segment but the last holds exactly the header's segment size; nothing follows the last.
     pub fn seal(&mut self, segment: &mut [u8], last: bool) -> Result<[u8; TAG], SealError> {
@@ -536,6 +569,35 @@ mod tests {
             key.seal(1, 1 << 31, false, &mut [0; 1]),
             Err(SealError::Size)
         );
+    }
+
+    /// The same plaintext under the same parent seals to the same bytes; other plaintext, or another
+    /// parent, to other keys and IDs; and the file opens like any other.
+    #[test]
+    fn a_content_keyed_file_seals_the_same_content_to_the_same_bytes() {
+        let parent = WrappingKey::generate(0).unwrap();
+        let seal = |parent: &WrappingKey, hash: [u8; 32], plain: &[u8]| {
+            let (mut sealer, header) = FileSealer::content_keyed(parent, &hash, 512).unwrap();
+            let mut buf = plain.to_vec();
+            let tag = sealer.seal(&mut buf, true).unwrap();
+            (header, buf, tag)
+        };
+        let a = seal(&parent, [1; 32], b"chunk one");
+        let again = seal(&parent, [1; 32], b"chunk one");
+        assert_eq!(
+            (a.0.encode(), &a.1, a.2),
+            (again.0.encode(), &again.1, again.2)
+        );
+        let b = seal(&parent, [2; 32], b"chunk two");
+        assert_ne!(a.0.file, b.0.file);
+        assert_ne!(a.0.key, b.0.key);
+        let other = WrappingKey::generate(0).unwrap();
+        let c = seal(&other, [1; 32], b"chunk one");
+        assert_ne!(a.0.key.key, c.0.key.key);
+        let opener = FileOpener::new(&parent, &a.0).unwrap();
+        let mut got = a.1.clone();
+        opener.open(0, true, &mut got, &a.2).unwrap();
+        assert_eq!(got, b"chunk one");
     }
 
     #[test]

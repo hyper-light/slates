@@ -3647,7 +3647,9 @@ shard's own clock that A-65 budgets in (docs/bugs/2026-10-04-the-slow-observatio
 
 ### 2026-10-05: volumes sealed at rest (condition 9; A-92)
 
-hyper-seal is vendored at hyper-raft `46d1035` (its CI green on all ten jobs). A-92 maps it onto slates: holders keep
+hyper-seal is vendored at hyper-raft `f9a2c8e` (its CI green on all ten jobs, per mantle; re-snapshotted from `46d1035`
+for `FileSealer::content_keyed`, the convergent seal piece 3b's archive needs, and `lock_keys` answered by the region
+already made). A-92 maps it onto slates: holders keep
 ciphertext, keys live in locked memory for the anchor's life and never touch a disk, a successor opens by a lineage
 key wrapped to its ML-KEM-1024 recipient key. Built: the crate in the build, and the sealed chunk (`slates_cluster::
 sealed`, hostile-input tested), and the node root kept for the anchor's life in locked memory and adopted across a

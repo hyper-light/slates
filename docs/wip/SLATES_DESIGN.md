@@ -9182,7 +9182,10 @@ daemon published there (`adopted`) or makes one from the secure random source an
 reads the root from its own attachment into a key of its own in the locked region, as it reads the grant-issuer
 secret, so no key crosses a thread and two daemons in one process each have their own. A region or page the OS will
 not lock leaves sealing `unavailable`, reported in status (`seal`, `seal_root` — the id, never the key —
-`seal_key_slots`, `seal_keys_held`) and never used unlocked. Proven by
+`seal_key_slots`, `seal_keys_held`) and never used unlocked. A later daemon in the same process is answered by the
+region already made (hyper-raft `f9a2c8e`): enough for its keys, or `AlreadyLocked` naming the count it holds, which
+leaves that daemon's sealing `unavailable` rather than taking a smaller region as enough (it was, before:
+`keys_held().is_some()` accepted any region). Proven by
 `a_restarted_daemon_adopts_its_anchors_sealing_root_and_a_fresh_anchor_mints_another` (macOS, and Linux as a
 non-root user) and `a_published_sealing_root_is_adopted_by_a_later_attachment`.
 Built (2026-10-05): piece 2b, the hierarchy below the root (`seal_keys::{tenant, namer, lineage}`). A tenant key per

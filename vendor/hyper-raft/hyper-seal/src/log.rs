@@ -225,11 +225,22 @@ impl FrameMac {
 
     /// The MAC of `bytes`.
     pub fn mac(&self, bytes: &[u8]) -> Result<[u8; MAC], SealError> {
+        self.mac_spans([bytes])
+    }
+
+    /// The MAC of `spans`, one after another: what a frame's MAC covers when the sealed records in
+    /// it, each authenticated by its own tag, are left out.
+    pub fn mac_spans<'a>(
+        &self,
+        spans: impl IntoIterator<Item = &'a [u8]>,
+    ) -> Result<[u8; MAC], SealError> {
         let tag = guarded(SealError::Seal, || {
             let mut ctx = hmac::Context::with_key(&self.key);
             ctx.update(FRAME_LABEL);
             ctx.update(&self.log);
-            ctx.update(bytes);
+            for span in spans {
+                ctx.update(span);
+            }
             Ok::<_, ()>(ctx.sign())
         })?;
         tag.as_ref().try_into().map_err(|_| SealError::Seal)

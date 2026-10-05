@@ -48,10 +48,12 @@ fn page_size() -> usize {
     }
 }
 
-/// Locks a region for `count` keys held at once, for the life of the process. Called once, before
-/// the first key is made; a second call, or one after a key was made, is refused, as is a region the
-/// OS will not lock (the process's locked-memory limit: `RLIMIT_MEMLOCK` on Unix, the minimum
-/// working set on Windows).
+/// Locks a region for `count` keys held at once, for the life of the process, before the first key
+/// is made. The first call makes it, and a region the OS will not lock is refused (the process's
+/// locked-memory limit: `RLIMIT_MEMLOCK` on Unix, the minimum working set on Windows). A later call
+/// is answered by the region made: `Ok` if it holds `count` keys, [`SealError::AlreadyLocked`] with
+/// its count if it holds fewer; so a library and its host, or the tests of one process, may each
+/// ask for what they need.
 pub fn lock_keys(count: usize) -> Result<(), SealError> {
     let mut made = false;
     let region = REGION.get_or_init(|| {
@@ -60,8 +62,11 @@ pub fn lock_keys(count: usize) -> Result<(), SealError> {
     });
     match (made, region) {
         (true, Ok(_)) => Ok(()),
-        (true, Err(e)) => Err(*e),
-        (false, _) => Err(SealError::Capacity),
+        (_, Err(e)) => Err(*e),
+        // A region already made serves any later caller it holds enough for: tests in one process,
+        // a library and its host. One that holds fewer says how many it holds.
+        (false, Ok(r)) if r.slots >= count => Ok(()),
+        (false, Ok(r)) => Err(SealError::AlreadyLocked { slots: r.slots }),
     }
 }
 
@@ -277,8 +282,14 @@ mod tests {
     }
 
     #[test]
-    fn a_second_region_is_refused() {
+    fn a_later_call_is_answered_by_the_region_made() {
         test_region();
-        assert_eq!(lock_keys(8), Err(SealError::Capacity));
+        let (slots, _) = keys_held().unwrap();
+        assert_eq!(lock_keys(8), Ok(()));
+        assert_eq!(lock_keys(slots), Ok(()));
+        assert_eq!(
+            lock_keys(slots + 1),
+            Err(SealError::AlreadyLocked { slots })
+        );
     }
 }

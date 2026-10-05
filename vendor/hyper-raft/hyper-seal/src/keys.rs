@@ -160,6 +160,31 @@ impl WrappingKey {
         Ok(child)
     }
 
+    /// A child key derived from this key and `label` with HKDF-SHA-384 (SP 800-56C two-step, RFC
+    /// 5869), and its record under this key: the same label always gives the same key and record. A
+    /// content-keyed file's key (docs/seal.md §4), whose label is its content's 256-bit hash.
+    pub fn derive_child(
+        &self,
+        purpose: &[u8],
+        label: &[u8],
+    ) -> Result<(Secret32, Wrapped), SealError> {
+        struct Len;
+        impl aws_lc_rs::hkdf::KeyType for Len {
+            fn len(&self) -> usize {
+                32
+            }
+        }
+        let mut child = Secret32::zeroed()?;
+        guarded(SealError::Seal, || {
+            aws_lc_rs::hkdf::Salt::new(aws_lc_rs::hkdf::HKDF_SHA384, purpose)
+                .extract(self.secret.bytes())
+                .expand(&[purpose, label], Len)?
+                .fill(child.bytes_mut())
+        })?;
+        let wrapped = self.wrap(&child)?;
+        Ok((child, wrapped))
+    }
+
     /// A new child key, random, and its record under this key: what a tenant, a volume or a file
     /// is given when it is made.
     pub fn make_child(&self) -> Result<(Secret32, Wrapped), SealError> {

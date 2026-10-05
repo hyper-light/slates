@@ -46,14 +46,24 @@ impl RootState {
 /// Locks the key region for `slots` keys and the anchor's page, then finds or makes the node's root in `segment` (the
 /// module doc). The calling thread holds no key afterwards; the shards read the root themselves.
 pub fn init(segment: &mut AnchorSegment, slots: usize) -> RootState {
-  let region = hyper_seal::keys_held().is_some()
-    || hyper_seal::lock_keys(slots).is_ok()
-    || hyper_seal::keys_held().is_some();
-  if !region {
-    eprintln!(
-      "slates-server: sealing unavailable: a key region of {slots} keys could not be locked"
-    );
-    return RootState::Unavailable;
+  // The process's region is made once; a later daemon in the same process (an in-process fleet, a restarted
+  // daemon's tests) is answered by the region already made: enough for its keys, or `AlreadyLocked` with the count it
+  // holds — never a smaller region taken as enough.
+  match hyper_seal::lock_keys(slots) {
+    Ok(()) => {}
+    Err(hyper_seal::SealError::AlreadyLocked { slots: held }) => {
+      eprintln!(
+        "slates-server: sealing unavailable: this process's key region holds {held} keys, fewer than the {slots} \
+         this daemon needs"
+      );
+      return RootState::Unavailable;
+    }
+    Err(e) => {
+      eprintln!(
+        "slates-server: sealing unavailable: a key region of {slots} keys could not be locked: {e}"
+      );
+      return RootState::Unavailable;
+    }
   }
   if segment.protect_seal_page().is_err() {
     eprintln!("slates-server: sealing unavailable: the anchor's key page could not be locked");

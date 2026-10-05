@@ -1,7 +1,7 @@
 # Vendored hyper-raft crates
 
 The crates slates shares with focal and mantle (`../hyper-raft`, github.com/hyper-light/hyper-raft), taken as a
-snapshot at one revision whose CI is green on all six targets (`SNAPSHOT`: hyper-raft `46d1035`, 2026-10-05). Never a
+snapshot at one revision whose CI is green on all six targets (`SNAPSHOT`: hyper-raft `f9a2c8e`, 2026-10-05; hyper-seal's source and hyper-timing's `ORIGIN.md` changed from `46d1035`, hyper-datagram and hyper-swim unchanged). Never a
 path or git dependency on the shared repository: slates builds what it reviewed (A-52 §5,
 `docs/wip/transport-quic.md` §5; the scheme mantle and focal use).
 
