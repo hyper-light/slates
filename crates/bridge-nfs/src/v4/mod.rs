@@ -12,7 +12,10 @@
 //! - the `COMPOUND` frame and the current and saved file handles ([`compound`]);
 //! - sessions: client ids, slot tables and the per-slot reply cache that gives exactly-once semantics
 //!   (RFC 8881 §2.10, [`session`]);
-//! - the attribute encoding (`fattr4`, [`attr`]).
+//! - the attribute encoding (`fattr4`, [`attr`]);
+//! - READDIR's page, encoded at the directory's owner from the shared bridge's rows rather than rebuilt from a v3
+//!   READDIRPLUS reply (A-95, [`listing`]): the procedure still routes, authorizes and reads through the same
+//!   export, but the `entry4`s are written once.
 //!
 //! Minor version 0 is not served: its state machine (OPEN_CONFIRM, per-owner sequence ids, no
 //! sessions) is the part D-2 rejected, and every client that speaks v4.1 prefers it.
@@ -31,6 +34,7 @@ pub mod callback;
 pub mod compound;
 pub mod delegation;
 pub mod files;
+pub mod listing;
 pub mod lock;
 pub mod session;
 pub mod status;

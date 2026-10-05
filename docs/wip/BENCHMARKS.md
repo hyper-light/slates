@@ -1932,7 +1932,18 @@ timing), beside `native.sh` on the same kernel. Load average 4.6–5.7. One run 
 - Readdir: slates sent 9 READDIRs where knfsd sent 5, each a quarter full (A-90). After A-90, a dedicated loop
   (`lsloop.py`: 8,000 files, then 300 rounds of create-one-and-list, 8,300 entries per listing) measures slates'
   listing p50 7.76 → 3.6–3.9 ms (p99 4.3–4.5 ms) against knfsd's 1.95–4.6 ms (p99 2.2–24 ms, one noisy run).
-  The remaining gap is the v4 page passing through a v3 reply's encoding and decoding (owed, GAPS).
+  The remaining gap was the v4 page passing through a v3 reply's encoding and decoding, closed by A-95:
+
+| server (load average 6.9–8.9) | READDIRs per listing | bytes per READDIR | round trip | listing p50 | listing p99 |
+|---|---|---|---|---|---|
+| slates before A-95 (4 runs; 1 and 4 shards) | 4 | 128,812 | 0.71–0.74 ms | 4.05–4.28 ms | 4.81–5.08 ms |
+| slates after A-95 (4 runs; 1 and 4 shards) | 4 | 128,812 | 0.38–0.41 ms | 2.65–2.89 ms | 3.13–3.81 ms |
+| Linux knfsd over tmpfs (2 runs) | 4 | 125,874 | 0.34–0.35 ms | 2.38–2.47 ms | 3.20–3.31 ms |
+
+  Command: `docs/wip/bench/listing/ls-ab.sh` / `knfsd-ls.sh` (the listing loop: 8,000 files, then 300 rounds of create-one-and-list
+  under a fresh prefix, so every listing refetches; an earlier version re-created existing names, and its listings
+  came from the client's cache at 0.35 ms). Per-READDIR figures are mountstats'.
+  **Measured and rejected:** one shard against four, to rule out the routing hop: 0.71 against 0.74 ms per round trip.
 
 ### Remote pulls under delay, loss, a slow or silent holder, and many readers (condition 7; 2026-10-05)
 

@@ -174,6 +174,9 @@ pub mod extension {
   pub const SETATTR_STATE: u32 = 1052;
   /// Format: DELEGRETURN (RFC 8881 §18.6; A-78). Arguments: the delegation's state id. Result: the status.
   pub const STATE_DELEGRETURN: u32 = 1053;
+  /// Format: one READDIR page encoded at the directory's owner (RFC 8881 §18.23; A-95). Arguments:
+  /// `crate::v4::listing::PageRequest`. Result: the NFSv4 status, then (when it is OK) the READDIR4resok body.
+  pub const READDIR4: u32 = 1054;
 }
 
 /// Format: the bytes a state-carrying I/O procedure appends to its NFSv3 arguments: the client id (8)
@@ -838,6 +841,7 @@ impl<'b> Export<'b> {
       | extension::STATE_LOCKU
       | extension::STATE_CHECK
       | extension::STATE_DELEGRETURN => Some(self.file_state(procedure, args)),
+      extension::READDIR4 => Some(self.readdir_v4(args)),
       _ => None,
     }
   }
@@ -2342,6 +2346,70 @@ impl<'b> Export<'b> {
       }
     }
     writer.into_bytes()
+  }
+
+  /// `extension::READDIR4` (A-95): one READDIR page of a directory in this volume, its `entry4`s encoded here from
+  /// the bridge's rows (`crate::v4::listing`), under the v3 listing's rules: read permission on the directory, the
+  /// change version as the cookie verifier, a continuation with a stale verifier refused.
+  pub fn readdir_v4(&mut self, args: &mut XdrReader<'_>) -> Vec<u8> {
+    match self.readdir_v4_page(args) {
+      Ok(writer) => writer.into_bytes(),
+      Err(status) => {
+        let mut writer = XdrWriter::new();
+        writer.u32(status.wire());
+        writer.into_bytes()
+      }
+    }
+  }
+
+  fn readdir_v4_page(
+    &mut self,
+    args: &mut XdrReader<'_>,
+  ) -> Result<XdrWriter, crate::v4::Nfsstat4> {
+    use crate::v4::Nfsstat4;
+    use crate::v4::listing::{ENTRY_TYPICAL, PageRequest, encode_page};
+    let v4 = Nfsstat4::of_v3;
+    let request = PageRequest::decode(args)?;
+    let identity = self.resolve_handle(&request.dir).map_err(v4)?;
+    let dir_node = self.attrs_of(&identity).map_err(v4)?;
+    // POSIX: listing a directory needs read permission on it.
+    if !access::permits(&self.caller, &dir_node, Want::Read) {
+      return Err(Nfsstat4::Access);
+    }
+    let cx = self.op_context().map_err(|e| v4(nfsstat_of(&e)))?;
+    let dir_object = ObjectId::new(identity.inode, identity.generation);
+    // The cookieverf is the directory's monotonic change version (§4.5), as the v3 listing's is.
+    let verf = self
+      .bridge
+      .change_token(dir_object, &cx)
+      .map_err(|e| v4(nfsstat_of(&e)))?
+      .to_be_bytes();
+    if request.cookie != 0 && request.verf != verf {
+      return Err(v4(Nfsstat3::BadCookie));
+    }
+    let rows = self
+      .bridge
+      .readdir(dir_object, &cx, 0, request.cookie, request.rows_wanted())
+      .map_err(|e| v4(nfsstat_of(&e)))?;
+    let budget = usize::try_from(request.maxcount).unwrap_or(usize::MAX);
+    let mut writer = XdrWriter::with_capacity(
+      size_of::<u32>().saturating_add(budget.min(rows.len().saturating_mul(ENTRY_TYPICAL))),
+    );
+    writer.u32(Nfsstat4::Ok.wire());
+    encode_page(
+      &request,
+      verf,
+      &rows,
+      |row| {
+        let node = self
+          .bridge
+          .getattr(ObjectId::new(row.ino, 0), &cx)
+          .map_err(|e| v4(nfsstat_of(&e)))?;
+        Ok((self.fattr3(&node), self.handle_for(row.ino, 0)))
+      },
+      &mut writer,
+    )?;
+    Ok(writer)
   }
 
   fn readdir_result(

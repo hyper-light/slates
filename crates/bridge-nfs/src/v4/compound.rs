@@ -259,15 +259,7 @@ mod claim {
 }
 /// Format: `channel_dir_from_server4` `CDFS4_FORE`: a bound connection carries the fore channel only.
 const CDFS4_FORE: u32 = 1;
-/// Format: the READDIR cookies 0, 1 and 2 are reserved (RFC 8881 §18.23.3), so a v3 cookie is shifted
-/// past them.
-const COOKIE_SHIFT: u64 = 2;
-/// Format: the size of one READDIR entry's fixed fields (value-follows, cookie, name length, the
-/// attribute bitmap's length and the attribute list's length), the least an entry costs.
-const ENTRY_FIXED: u32 = 4 + 8 + 4 + 4 + 4;
-/// Shape: the bytes a listed entry typically encodes to (a short name and a few attributes), sizing a page's buffer
-/// up front; a page of larger entries grows it, and the reply's `maxcount` caps it.
-const ENTRY_TYPICAL: usize = 64;
+use super::listing::{COOKIE_SHIFT, ENTRY_FIXED, ENTRY_TYPICAL};
 /// Format: the most a v3 READDIRPLUS `entryplus3` encodes beyond the v4 `entry4` built from it, their names (encoded
 /// alike) aside: the v3 entry's fixed fields (value-follows 4, `fileid` 8, `cookie` 8, the name's length 4), its
 /// attributes (present 4, `fattr3` 84) and its handle (present 4, length 4, at most `NFS3_FHSIZE` 64 bytes), less the
@@ -1742,9 +1734,47 @@ async fn commit<B: Backend>(backend: &mut B, reader: &mut XdrReader<'_>, frame: 
   Ok(body.into_bytes())
 }
 
-/// `READDIR` (§18.23): a v3 READDIRPLUS, the dot entries dropped, the cookies shifted past the
-/// reserved values, each entry's attributes those asked for, the whole bounded by `maxcount`.
+/// `READDIR` (§18.23): a directory in a volume is listed by its owner, which encodes the page from the bridge's rows
+/// (`extension::READDIR4`, A-95, `super::listing`); the pseudo-root, whose entries are volumes on other shards, is
+/// listed from the gathered v3 READDIRPLUS (`readdir_of_root`).
 async fn readdir<B: Backend>(
+  backend: &mut B,
+  reader: &mut XdrReader<'_>,
+  frame: &Frame,
+) -> Outcome {
+  let dir = current(frame)?.clone();
+  if crate::multi::is_root_handle(&dir) {
+    return readdir_of_root(backend, reader, frame).await;
+  }
+  let bad = |_| Nfsstat4::Badxdr;
+  let cookie = reader.u64().map_err(bad)?;
+  let mut verf = [0u8; VERIFIER_SIZE];
+  verf.copy_from_slice(reader.fixed(VERIFIER_SIZE).map_err(bad)?);
+  let _dircount = reader.u32().map_err(bad)?;
+  let maxcount = reader.u32().map_err(bad)?;
+  let requested = Bitmap::decode(reader).map_err(bad)?;
+  attr::check_readable(&requested)?;
+  if cookie == 1 || cookie == 2 {
+    return Err(Nfsstat4::BadCookie);
+  }
+  // Every entry of a volume's directory is on the volume's filesystem, so one set of figures serves the page.
+  let figures = figures(backend, &dir, &requested).await?;
+  let request = super::listing::PageRequest {
+    dir,
+    cookie: cookie.saturating_sub(COOKIE_SHIFT),
+    verf,
+    maxcount,
+    requested,
+    minor: frame.minor,
+    figures,
+  };
+  let result = backend.call_v3(extension::READDIR4, request.encode()).await;
+  super::listing::page_of(result)
+}
+
+/// `READDIR` of the pseudo-root: a v3 READDIRPLUS of the gathered volumes, the dot entries dropped, the cookies
+/// shifted past the reserved values, each entry's attributes those asked for, the whole bounded by `maxcount`.
+async fn readdir_of_root<B: Backend>(
   backend: &mut B,
   reader: &mut XdrReader<'_>,
   frame: &Frame,
@@ -1769,9 +1799,7 @@ async fn readdir<B: Backend>(
   // At most as many entries as the smallest this request can encode to fill `maxcount` with: value-follows, the
   // cookie, the shortest name, and the requested attributes of a minimal object (A-90: counted at `ENTRY_FIXED` alone,
   // the v3 page fetched, stated and encoded twice the entries an `ls` page carries).
-  let entry_floor = (size_of::<u32>() + size_of::<u64>() + 2 * size_of::<u32>())
-    .saturating_add(attr::encoded_floor((&requested, frame.minor)))
-    .max(usize::try_from(ENTRY_FIXED).unwrap_or(usize::MAX));
+  let entry_floor = super::listing::entry_floor(&requested, frame.minor);
   let fit = u32::try_from(usize::try_from(maxcount).unwrap_or(usize::MAX) / entry_floor.max(1))
     .unwrap_or(u32::MAX);
   let v3_maxcount = maxcount

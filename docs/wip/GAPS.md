@@ -3635,10 +3635,10 @@ shard's own clock that A-65 budgets in (docs/bugs/2026-10-04-the-slow-observatio
 - **Owed:**
   - a write delegation's space reservation, which takes the WRITE off a create's close path (measured natively:
     30 µs of a 0.21 ms create);
-  - readdir: measured against Linux's own nfsd over tmpfs (BENCHMARKS), slates' pages were a quarter full and its
-    encoding rebuilt the supported set per entry (A-90, fixed: an 8,300-entry listing 7.76 → 3.6–3.9 ms p50). It is
-    still about 1.9× knfsd's 1.95 ms on a quiet run: a v4 page is built by encoding and decoding a v3 READDIRPLUS
-    reply. Owed: a v4 listing served from the volume's rows directly, routed as the v3 call is;
+  - readdir, closed 2026-10-05 (A-90, A-95): pages are full, and a page is encoded at the directory's owner from the
+    volume's rows, routed as any call is. An 8,300-entry listing went 7.76 → 3.6–3.9 → 2.65–2.89 ms p50; knfsd over
+    tmpfs on the same kernel at the same load is 2.38–2.47 ms, with a higher p99 (3.20–3.31 against slates' 3.13). The
+    remaining 10% is per-entry work at the owner (a getattr, a handle, the attribute encoding);
   - the same storm on a k8s node;
   - a remote (fleet) read under contention, for condition 7's tail. The fetch is now striped and hedged across the
     recorded holders, ties its copies and steals a slow holder's backlog (A-91), and `fetch_bench` measures it under

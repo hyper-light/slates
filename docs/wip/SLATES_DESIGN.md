@@ -9120,8 +9120,8 @@ Status: built 2026-10-05.
 - Proven: `a_readdir_page_of_small_entries_fills_the_clients_maxcount` (failed at 19 entries in 1,004 bytes);
   `no_object_encodes_below_the_floor` (generated attribute sets, owners and handles of every length).
 - Measured (native Linux NFSv4.2 loopback, a listing of 8,300 entries after each create; load average 6–10): p50
-  7.76 → 3.6–3.9 ms. Linux's kernel nfsd over tmpfs, same loop: p50 1.95–4.6 ms. Owed: a v4 page that does not pass
-  through a v3 reply's encoding and decoding.
+  7.76 → 3.6–3.9 ms. Linux's kernel nfsd over tmpfs, same loop: p50 1.95–4.6 ms. The v4 page that no longer passes
+  through a v3 reply is A-95.
 
 ### A-91 — A fetch stripes across the recorded holders, hedges at the measured p95, ties and steals (2026-10-05)
 Applied in the same change to: `crates/cluster/src/content.rs` (`fetch` replacing `fetch_manifest` and
@@ -9347,3 +9347,34 @@ Status: built 2026-10-05 (condition 4).
   flags close the escalation without changing ownership.
 - Rejected: stripping setuid and setgid bits in the daemon. It would break a root filesystem built inside a volume
   (`sudo` installed by `dpkg` must stay setuid there) and still leave the mount honouring bits that arrive another way.
+
+### A-95 — A v4 READDIR page is encoded at the directory's owner (2026-10-05)
+Applied in the same change to: `crates/bridge-nfs/src/v4/listing.rs` (new: `PageRequest`, `encode_page`,
+`page_of`), `crates/bridge-nfs/src/v4/compound.rs` (`readdir` sends `extension::READDIR4`; `readdir_of_root` keeps
+the gathered listing for the pseudo-root), `crates/bridge-nfs/src/procedures.rs` (`extension::READDIR4`,
+`Export::readdir_v4`), `crates/bridge-nfs/src/v4/attr.rs` (`FsFigures`' wire form), `crates/bridge-nfs/src/v4/mod.rs`,
+GAPS, BENCHMARKS.
+Status: built 2026-10-05 (conditions 5 and 12).
+- What: a READDIR of a directory in a volume is one extension procedure at the directory's owner. It routes by the
+  directory's handle and is served by the same export, under the same capability, permission, owner-lease and
+  cookie-verifier rules as the v3 listing. There the `entry4`s are written straight from the bridge's rows into the
+  reply. The front end passes the client's `maxcount`, its attribute bitmap, its minor version and the volume's
+  filesystem figures, which every entry of a volume shares. The pseudo-root is still listed from the gathered v3
+  READDIRPLUS, because its entries are volumes on other shards that its owner cannot describe. It is a different kind
+  of directory, not a fallback.
+- Why: before, the owner encoded each entry's `fattr3` and handle into a v3 reply, and the front end decoded them
+  (allocating a name and a handle each) and encoded the `entry4`s. Linux's own NFSv4.2 client over loopback (8,300
+  entries, a listing after each create) sent the same four READDIRs of 126–129 KB to slates as to the kernel's nfsd,
+  but waited 0.74 ms per round trip for slates against 0.34 ms. Under `strace` the daemon took 0.5, 0.6, 1.2 and
+  1.8 ms between reading the 64, 64, 128 and 256 KB requests and writing their replies; each reply went out in one
+  `write` of about 60 µs. In `perf` the v3 encode was 36% of the daemon's samples. Moving the work to one shard was
+  measured first and rejected: one shard against four, 0.71 against 0.74 ms.
+- Measured (same harness, `lsloop` against a Linux-client loopback mount, load average 6.9–8.9): round trip
+  0.74 → 0.38–0.41 ms; listing p50 4.05–4.28 → 2.65–2.89 ms and p99 4.81–5.08 → 3.13–3.81 ms. knfsd at the same load
+  measured p50 2.38–2.47 ms and p99 3.20–3.31 ms. The reply bytes are unchanged (128,812 per READDIR), as the page
+  content must be.
+- Proven: `a_directory_listed_in_pages_returns_every_name_once_and_refuses_a_stale_resume` (240 names in 1 KiB pages,
+  each once, cookies unique and above 2, `eof` on the last page only; a resume after a create refused
+  `NFS4ERR_BAD_COOKIE`; no room `NFS4ERR_TOOSMALL`), `a_readdir_page_of_small_entries_fills_the_clients_maxcount`,
+  the bridge-nfs suite (161), the server NFS suites (hostile 3, mount 27, TLS 7), the Linux kernel NFSv4.1 and 4.2
+  mount test, and the real git/cargo/pip workloads (tree hash and file lists unchanged).

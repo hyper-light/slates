@@ -3132,3 +3132,151 @@ fn a_readdir_page_of_small_entries_fills_the_clients_maxcount() {
     "the page held {returned} entries in {used} of {LIST_MAXCOUNT} bytes; another {largest}-byte entry would fit"
   );
 }
+
+/// One READDIR of the root directory from `cookie` with `verf` under `maxcount`: the status, the verifier, each
+/// entry's (cookie, name), and `eof`.
+fn readdir_page(
+  client: &mut Client,
+  service: &mut Export<'_>,
+  server: &mut Server,
+  (cookie, verf, maxcount): (u64, [u8; 8], u32),
+) -> (u32, [u8; 8], Vec<(u64, String)>, bool) {
+  let mut args = client.sequenced(2);
+  args.u32(op::PUTROOTFH);
+  args.u32(op::READDIR);
+  args.u64(cookie);
+  args.fixed(&verf);
+  args.u32(maxcount);
+  args.u32(maxcount);
+  Bitmap::of(&[ATTR_TYPE, ATTR_FILEID]).encode(&mut args);
+  let reply = Client::call(service, server, args.as_slice());
+  if reply.status != Nfsstat4::Ok.wire() {
+    return (reply.status, [0; 8], Vec::new(), false);
+  }
+  let mut body = reply.walk();
+  skip_sequence(&mut body);
+  expect_ok(&mut body, op::PUTROOTFH);
+  expect_ok(&mut body, op::READDIR);
+  let verf: [u8; 8] = body.fixed(8).unwrap().try_into().unwrap();
+  let mut entries = Vec::new();
+  while body.bool().unwrap() {
+    let cookie = body.u64().unwrap();
+    let name = body.string(255).unwrap().to_owned();
+    Bitmap::decode(&mut body).unwrap();
+    body.opaque(1024).unwrap();
+    entries.push((cookie, name));
+  }
+  (reply.status, verf, entries, body.bool().unwrap())
+}
+
+/// Shape: a `maxcount` that holds a few dozen small entries, so a 240-file listing takes several pages.
+const SMALL_PAGE: u32 = 1024;
+/// Shape: a `maxcount` too small for any entry: the verifier and the closing booleans leave no room.
+const NO_ROOM: u32 = 24;
+
+/// RFC 8881 §18.23 (A-95: the page is encoded at the directory's owner). Do: list a directory of 240 files in 1 KiB
+/// pages, each resuming from the last entry's cookie under the verifier the first page returned; then start again,
+/// create a file between two pages, and resume; then ask with a `maxcount` that holds no entry. Expect: every name
+/// exactly once, no dot entry, every cookie above the reserved 2 and its own, `eof` on the last
+/// page only and several pages; a resume after the directory changed refused `NFS4ERR_BAD_COOKIE` (the verifier is
+/// the directory's change version, as the v3 listing's is); and the empty page `NFS4ERR_TOOSMALL`.
+#[test]
+fn a_directory_listed_in_pages_returns_every_name_once_and_refuses_a_stale_resume() {
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let root = vol.root_inode(&store).unwrap();
+  for at in 0..LISTED {
+    vol
+      .create_file_no(&mut store, root, &format!("f{at:04}"), 0o644)
+      .unwrap();
+  }
+  let mut bridge = VolumeBridge::new(VOLUME, &mut vol, &mut store);
+  let mut service = export(&mut bridge, 0);
+  let mut server = Server::standalone();
+  let mut client = Client::connect(&mut service, &mut server, b"host-a");
+  let (c, s, v) = (&mut client, &mut service, &mut server);
+  let (names, cookies, pages) = list_in_small_pages(c, s, v);
+  assert!(
+    pages > 2,
+    "a 240-file listing in 1 KiB pages took {pages} pages"
+  );
+  assert!(
+    cookies.iter().all(|cookie| *cookie > 2),
+    "cookies 0, 1 and 2 are reserved"
+  );
+  let mut sorted = names.clone();
+  sorted.sort();
+  let expected: Vec<String> = (0..LISTED).map(|at| format!("f{at:04}")).collect();
+  assert_eq!(sorted, expected, "every name exactly once, no dot entry");
+  let mut seen = cookies.clone();
+  seen.sort_unstable();
+  seen.dedup();
+  assert_eq!(seen.len(), cookies.len(), "every entry's cookie is its own");
+  a_stale_resume_and_a_page_with_no_room_are_refused(c, s, v);
+}
+
+/// The whole root listing in [`SMALL_PAGE`] pages, each resumed from the last cookie under the returned verifier:
+/// the names, their cookies, and the page count.
+fn list_in_small_pages(
+  c: &mut Client,
+  s: &mut Export<'_>,
+  v: &mut Server,
+) -> (Vec<String>, Vec<u64>, usize) {
+  let mut names = Vec::new();
+  let mut cookies = Vec::new();
+  let (mut cookie, mut verf, mut pages) = (0u64, [0u8; 8], 0);
+  loop {
+    let (status, page_verf, entries, eof) = readdir_page(c, s, v, (cookie, verf, SMALL_PAGE));
+    assert_eq!(status, Nfsstat4::Ok.wire(), "page {pages}");
+    assert!(
+      !entries.is_empty() || eof,
+      "a page that does not end the listing carries an entry"
+    );
+    verf = page_verf;
+    pages += 1;
+    for (entry_cookie, name) in entries {
+      cookies.push(entry_cookie);
+      names.push(name);
+    }
+    if eof {
+      return (names, cookies, pages);
+    }
+    cookie = *cookies.last().unwrap();
+  }
+}
+
+/// A resume after a create between pages is `NFS4ERR_BAD_COOKIE`; a page with no room for an entry `NFS4ERR_TOOSMALL`.
+fn a_stale_resume_and_a_page_with_no_room_are_refused(
+  c: &mut Client,
+  s: &mut Export<'_>,
+  v: &mut Server,
+) {
+  let (_, verf, first, _) = readdir_page(c, s, v, (0, [0; 8], SMALL_PAGE));
+  let resume = first.last().unwrap().0;
+  let mut args = c.sequenced(2);
+  args.u32(op::PUTROOTFH);
+  c.open_args(
+    &mut args,
+    &c.owner.clone(),
+    "between-pages",
+    BOTH,
+    DENY_NONE,
+    Some((GUARDED, Some(0o644), None)),
+  );
+  let reply = Client::call(s, v, args.as_slice());
+  assert_eq!(
+    reply.status,
+    Nfsstat4::Ok.wire(),
+    "the create between pages"
+  );
+  assert_eq!(
+    readdir_page(c, s, v, (resume, verf, SMALL_PAGE)).0,
+    Nfsstat4::BadCookie.wire(),
+    "a resume under the verifier of a directory that has since changed"
+  );
+  assert_eq!(
+    readdir_page(c, s, v, (0, [0; 8], NO_ROOM)).0,
+    Nfsstat4::Toosmall.wire(),
+    "a page with no room for an entry"
+  );
+}

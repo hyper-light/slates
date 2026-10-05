@@ -153,6 +153,41 @@ pub struct FsFigures {
   pub max_io: u64,
 }
 
+impl FsFigures {
+  /// The figures' wire form inside an extension's arguments (`super::listing::PageRequest`), field by field.
+  pub fn encode(&self, writer: &mut XdrWriter) {
+    writer.u32(self.lease_seconds);
+    writer.bool(self.case_insensitive);
+    for figure in [self.files, self.space] {
+      writer.u64(figure.0);
+      writer.u64(figure.1);
+      writer.u64(figure.2);
+    }
+    writer.u64(self.max_file_size);
+    writer.u32(self.max_link);
+    writer.u32(self.max_name);
+    writer.u64(self.max_io);
+  }
+
+  /// The figures from their wire form.
+  pub fn decode(reader: &mut crate::xdr::XdrReader<'_>) -> Result<FsFigures, crate::xdr::XdrError> {
+    let lease_seconds = reader.u32()?;
+    let case_insensitive = reader.bool()?;
+    let files = (reader.u64()?, reader.u64()?, reader.u64()?);
+    let space = (reader.u64()?, reader.u64()?, reader.u64()?);
+    Ok(FsFigures {
+      lease_seconds,
+      case_insensitive,
+      files,
+      space,
+      max_file_size: reader.u64()?,
+      max_link: reader.u32()?,
+      max_name: reader.u32()?,
+      max_io: reader.u64()?,
+    })
+  }
+}
+
 /// The attributes this server supports in a compound of minor version `minor`: every number in
 /// [`number`], less NFSv4.2's in an NFSv4.1 compound (an attribute its version does not define).
 pub fn supported(minor: u32) -> &'static Bitmap {
