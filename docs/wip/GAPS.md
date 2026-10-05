@@ -3652,7 +3652,7 @@ ciphertext, keys live in locked memory for the anchor's life and never touch a d
 key wrapped to its ML-KEM-1024 recipient key. Built: the crate in the build, and the sealed chunk (`slates_cluster::
 sealed`, hostile-input tested), and the node root kept for the anchor's life in locked memory and adopted across a
 daemon restart, and tenant, naming and lineage keys recorded in the partition and unwrapped after a restart. Owed, in
-order: the erase on volume destroy and account removal; sealed content carried by the
+order: the erase on account removal (a volume's destroy already erases its lineage key); sealed content carried by the
 content plane (a sealed manifest with its clear chunk table, ciphertext verified by holders, keyed names in missing
 sets); the
 successor's wrapped key in the head record; the idle-RAM measurement and its decision; sealed archives;

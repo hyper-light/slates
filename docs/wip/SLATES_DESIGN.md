@@ -9193,8 +9193,11 @@ is sealed under a key a restart could not unwrap; the key is unwrapped again on 
 asks for is owed with piece 3's hot path). Proven by `a_volumes_keys_survive_a_daemon_restart_and_die_with_the_anchor`
 (a chunk sealed under a volume's lineage key before a restart opens after it; under a fresh anchor's keys it is
 refused `Unwrap`; macOS and Linux) and the database's model test, whose generated histories now set and destroy key
-records across crashes (non-vacuous: dropping the snapshot's key table fails it). Owed: destroying a volume's lineage
-record when the volume is destroyed, and a tenant's records when its account is removed.
+records across crashes (non-vacuous: dropping the snapshot's key table fails it). A volume's destroy erases its lineage
+key in the same record (`Op::VolumeDestroyed`'s apply removes it, so a crash cannot part the two and replay agrees):
+`destroying_a_volume_erases_its_sealed_content` (a chunk sealed under a volume's key is refused `Unwrap` once the volume
+is destroyed; it opens without the erase, so the test is non-vacuous). Owed: a tenant's records when its account is
+removed.
 - Why: condition 9 asks for volumes post-quantum encrypted at rest and in transit. In transit holds already: every TLS
   handshake prefers X25519MLKEM768 (A-66, 2026-10-04), and SecP384r1MLKEM1024 replaces it between nodes once
   hyper-raft's measurement of it lands (its §10). At rest, slates has no disk (R1): a volume rests in RAM, in two

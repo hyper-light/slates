@@ -889,6 +889,11 @@ impl Partition {
         if let Some(sequence) = sequence {
           self.tombstones.insert(*id, sequence);
         }
+        // The volume's lineage key goes with it, in the same record (A-92; seal.md §3.1, cryptographic erase): its
+        // one wrapped copy was here, so every chunk sealed under it, on any holder, opens for no one after this.
+        self
+          .seal_keys
+          .remove(&SealKeyOwner::Lineage { volume: *id });
         Ok(())
       }
       Op::TombstoneAdopted { tombstone } => {

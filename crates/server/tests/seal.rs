@@ -132,3 +132,89 @@ fn a_volumes_keys_survive_a_daemon_restart_and_die_with_the_anchor() {
     "another anchor's keys unwrap nothing of the first's"
   );
 }
+
+/// Shape: how long the test waits for a destroyed volume's record to go (the reaper steps destroys on its cadence).
+const DESTROY_WAIT: Duration = Duration::from_secs(30);
+
+/// A typed client of `instance`, retried until the daemon answers.
+fn client_of(instance: &str) -> slates_client::Client {
+  let deadlines = slates_client::Deadlines::derive(
+    slates_server::daemon::LIVENESS_BUDGET_NS,
+    slates_db::replay::RECOVERY_BUDGET_NS,
+  )
+  .get();
+  let started = std::time::Instant::now();
+  loop {
+    match slates_client::Client::connect(instance, deadlines) {
+      Ok(client) => return client,
+      Err(e) if started.elapsed() > DESTROY_WAIT => panic!("{e}"),
+      Err(_) => std::hint::spin_loop(),
+    }
+  }
+}
+
+/// A-92 piece 2b (seal.md §3.1, cryptographic erase): do create a volume, seal a chunk under its lineage key, destroy
+/// the volume and wait for its record to go, then open the chunk under the key the shard holds for that id now;
+/// expect the lineage record gone with the volume (the shard makes a new key for the id) and the chunk refused
+/// `Unwrap` — a destroyed volume's sealed content opens for no one, on any holder.
+#[test]
+fn destroying_a_volume_erases_its_sealed_content() {
+  let instance = format!("seal-erase-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile(), &instance, Some(SHARDS));
+  let anchor = played_anchor(&config, "seal-erase");
+  let daemon = start_over(&config, &anchor);
+  daemon
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let mut client = client_of(&instance);
+  let created = client
+    .create(&slates_client::CreateSpec {
+      name: "erased".to_owned(),
+      size: slates_client::SizeClass::Bounded { limit: 1 << 20 },
+      names: slates_client::NamePolicy::Exact,
+      require_locked: false,
+      base: None,
+    })
+    .unwrap();
+  let volume = VolumeId {
+    bytes: created.bytes,
+  };
+  let sealed = daemon
+    .observe_control(OBSERVE_NS, move |state| {
+      let lineage = lineage(state, volume, ACCOUNT).unwrap();
+      let namer = namer(state, ACCOUNT).unwrap();
+      seal_chunk(
+        &lineage,
+        &namer,
+        &Archive::raw_chunk(b"to be erased".repeat(100)),
+        SEGMENT,
+      )
+      .unwrap()
+    })
+    .unwrap();
+  client.destroy(created).unwrap();
+  let started = std::time::Instant::now();
+  while daemon
+    .observe_control(OBSERVE_NS, move |state| {
+      state.db.partition().volume(volume).is_some()
+    })
+    .unwrap()
+  {
+    assert!(started.elapsed() < DESTROY_WAIT, "the destroy completes");
+    // A test thread outside the runtime waits for the reaper's next cadence; it holds no shard.
+    #[allow(clippy::disallowed_methods)]
+    std::thread::sleep(Duration::from_millis(10));
+  }
+  let opened = daemon
+    .observe_control(OBSERVE_NS, move |state| {
+      let lineage = lineage(state, volume, ACCOUNT).unwrap();
+      let namer = namer(state, ACCOUNT).unwrap();
+      open_chunk(&lineage, &namer, &sealed).map(|chunk| chunk.payload)
+    })
+    .unwrap();
+  daemon.stop();
+  assert_eq!(
+    opened,
+    Err(SealedError::Seal(hyper_seal::SealError::Unwrap))
+  );
+}
