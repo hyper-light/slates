@@ -158,9 +158,9 @@ notification encoders, the negotiation) is compiled and tested here.
 
 ## 5. Siblings found, not changed here
 
-- `Fingerprint`/`BaseEntry` carry no owner: an untouched base entry reports uid/gid 0 through
-  every mount (`ls -l` in an overlay shows base files as root's). Needs an owner field on the
-  read-only seam (`crates/vfs/src/host`, edited concurrently by the digest work).
+- Closed 2026-10-05: `Fingerprint`/`BaseEntry` carried no owner, so an untouched base entry reported uid/gid 0 through
+  every mount, and a user could edit none of the files of their own overlaid tree. The fingerprint now carries the
+  disk's owner (`docs/bugs/2026-10-05-base-entries-reported-root-as-owner.md`).
 - The design text §4.6 "WRITEBACK_CACHE is bit 16, while bit 8 is FILE_OPS" is wrong: the
   header names bit 8 `FUSE_SPLICE_MOVE` and bit 2 `FUSE_FILE_OPS`.
 - `refusal_of_vfs` (`crates/server/src/error.rs:109`) maps `BarrierIncomplete` through its

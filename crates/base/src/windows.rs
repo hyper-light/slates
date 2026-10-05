@@ -389,6 +389,9 @@ fn fingerprint_of_handle(
     ),
     ctime_ns: change_time,
     mode: info.dwFileAttributes,
+    // Windows has no POSIX owner; a base entry reports the root's, as the WinFsp bridge maps every file.
+    uid: 0,
+    gid: 0,
   })
 }
 

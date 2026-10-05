@@ -37,6 +37,9 @@ struct SimNode {
   kind: HostKind,
   ino: u64,
   mode: u32,
+  /// The owner, as `stat` reports `st_uid` and `st_gid`.
+  uid: u32,
+  gid: u32,
   bytes: Vec<u8>,
   target: Box<str>,
   mtime_ns: i64,
@@ -57,6 +60,8 @@ impl SimNode {
       mtime_ns: self.mtime_ns,
       ctime_ns: self.ctime_ns,
       mode: self.mode,
+      uid: self.uid,
+      gid: self.gid,
     }
   }
 }
@@ -181,6 +186,8 @@ impl SimHost {
         kind: HostKind::Dir,
         ino: 1,
         mode: DIR_MODE,
+        uid: 0,
+        gid: 0,
         bytes: Vec::new(),
         target: "".into(),
         mtime_ns: 0,
@@ -421,6 +428,8 @@ impl SimHost {
       } else {
         FILE_MODE
       },
+      uid: 0,
+      gid: 0,
       bytes: Vec::new(),
       target: "".into(),
       mtime_ns: self.now_ns,
@@ -582,6 +591,17 @@ impl SimHost {
     let now = self.now_ns;
     if let Some(n) = self.node_mut(&parts) {
       n.mode = mode;
+      n.ctime_ns = now;
+    }
+  }
+
+  /// Changes an entry's owner (a metadata-only change, as `chown` makes it: the ctime moves).
+  pub fn chown(&mut self, path: &str, uid: u32, gid: u32) {
+    let parts = Self::split(path);
+    let now = self.now_ns;
+    if let Some(n) = self.node_mut(&parts) {
+      n.uid = uid;
+      n.gid = gid;
       n.ctime_ns = now;
     }
   }

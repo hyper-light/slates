@@ -105,6 +105,10 @@ pub struct Fingerprint {
   pub ctime_ns: i64,
   /// Mode.
   pub mode: u32,
+  /// The owner's user id (`st_uid`): what an untouched base entry reports through a mount, as the disk holds it.
+  pub uid: u32,
+  /// The owner's group id (`st_gid`).
+  pub gid: u32,
 }
 
 /// The body.
@@ -306,20 +310,30 @@ impl Inode {
   }
 
   /// Takes attributes observed on the host beneath an overlay (an outsider's edit, §4.5): the size,
-  /// the mode when the observation carries one, and the host's times. The change counter moves when
-  /// any of them differs from what the volume held, so a client caching by the counter sees the
-  /// edit, and stays where it is when none does, so an unchanged file's cache is kept (A-38).
-  pub(crate) fn adopt_observed(&mut self, size: u64, mode: Option<u32>, mtime: i64, ctime: i64) {
+  /// the mode and owner when the observation carries them, and the host's times. The change counter
+  /// moves when any of them differs from what the volume held, so a client caching by the counter
+  /// sees the edit, and stays where it is when none does, so an unchanged file's cache is kept (A-38).
+  pub(crate) fn adopt_observed(
+    &mut self,
+    size: u64,
+    mode_and_owner: Option<(u32, u32, u32)>,
+    mtime: i64,
+    ctime: i64,
+  ) {
     let changed = self.attrs.size != size
-      || mode.is_some_and(|mode| mode != self.attrs.mode)
+      || mode_and_owner.is_some_and(|(mode, uid, gid)| {
+        (mode, uid, gid) != (self.attrs.mode, self.attrs.uid, self.attrs.gid)
+      })
       || self.attrs.mtime != mtime
       || self.attrs.ctime != ctime;
     if !changed {
       return;
     }
     self.attrs.size = size;
-    if let Some(mode) = mode {
+    if let Some((mode, uid, gid)) = mode_and_owner {
       self.attrs.mode = mode;
+      self.attrs.uid = uid;
+      self.attrs.gid = gid;
     }
     self.attrs.mtime = mtime;
     self.stamp_change(ctime);

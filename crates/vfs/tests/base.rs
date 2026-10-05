@@ -1770,3 +1770,42 @@ fn a_rename_over_a_base_directory_sees_outsider_children_and_refuses_on_a_host_f
     "the disk directory was not shadowed"
   );
 }
+
+/// Shape: the owner the ownership test's disk gives its entries (a user's own tree).
+const DISK_UID: u32 = 501;
+/// Shape: that owner's group.
+const DISK_GID: u32 = 20;
+
+/// §4.15 (owed since 2026-09 in `docs/wip/base-fuse.md` §5; found again 2026-10-05: through a macOS mount of an
+/// overlay of a user's own repository, every base file showed root's, so the user could edit none of them). Do: give a
+/// base directory and file an owner on the disk, overlay it, stat both through the volume, and copy the file up with a
+/// write. Expect each to report the disk's owner, and the copied-up file to keep it.
+#[test]
+fn a_base_entry_reports_its_owner_as_the_disk_holds_it() {
+  let mut host = SimHost::new();
+  host.mkdir("/src");
+  host.replace_file("/src/lib.rs", b"pub fn lib() {}");
+  host.chown("/src", DISK_UID, DISK_GID);
+  host.chown("/src/lib.rs", DISK_UID, DISK_GID);
+  host.advance_ns(2);
+  let mut store = store();
+  let mut vol = overlay(&mut host, &mut store);
+  let mut o = vol.with_host(&mut host);
+  let dir = o.resolve(&mut store, "/src").unwrap().inode;
+  let file = o.resolve(&mut store, "/src/lib.rs").unwrap().inode;
+  let owner = |attrs: slates_vfs::inode::Attrs| (attrs.uid, attrs.gid);
+  assert_eq!(
+    owner(o.stat(&mut store, dir).unwrap()),
+    (DISK_UID, DISK_GID)
+  );
+  assert_eq!(
+    owner(o.stat(&mut store, file).unwrap()),
+    (DISK_UID, DISK_GID)
+  );
+  o.write(&mut store, file, 0, b"pub").unwrap();
+  assert_eq!(
+    owner(o.stat(&mut store, file).unwrap()),
+    (DISK_UID, DISK_GID),
+    "a copy-up keeps the owner"
+  );
+}

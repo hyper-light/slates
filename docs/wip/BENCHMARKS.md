@@ -2066,6 +2066,23 @@ AES-256-GCM; 100,000 opens per case, each timed alone). Apple M5 Max; load avera
 The warm open meets A-92's budget (at most about 1 µs p99 under load) on both systems, so idle RAM is sealed under a
 version key kept warm per mounted volume; a cold open per access would not meet it.
 
+### An overlay of a real tree: read, change, plan (condition 5; 2026-10-05)
+
+Command: `bash <scratch>/overlay-diff.sh` (release build; `volume create --dynamic 4GiB --base crates/`, `slates mount`,
+then the host tools through the mount; each row timed by a Python `subprocess` wrapper, the CLI process included).
+Apple M5 Max, macOS's own NFS client, 2 shards, load average about 6.
+
+| step | slates | host |
+|---|---|---|
+| create the overlay volume | 4 ms | — |
+| list 688 files | 9 ms (cold and warm) | 10 ms |
+| read every byte, 15.4 MB | 109 ms cold, 36 ms warm | 25 ms |
+| change set after 10 appends, 5 creates, 3 removals | `land` plan 4 ms, exactly 10 replace / 5 create / 3 delete | `diff -rq` 29 ms, the same 18 |
+
+- The writes became possible only with the same day's owner fix: before it, every base entry was root's through the
+  mount and refused the user's writes (`docs/bugs/2026-10-05-base-entries-reported-root-as-owner.md`).
+- The cold read, about 158 µs per file through the NFS client, is the cost to work on next.
+
 ### The daemon under a container memory cap, and large writes over Linux's NFS client on loopback (conditions 11, 12; 2026-10-05)
 
 Commands: `docs/wip/bench/pressure/memory-cap.sh` (privileged `rust:1.98.0`, `--memory 1g --memory-swap 1g`, the Linux

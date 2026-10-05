@@ -3699,6 +3699,9 @@ Condition 11/12, 2026-10-05 (BENCHMARKS "The daemon under a container memory cap
   - Still per shard: the chunk, inode and directory slabs and the metadata class are sized from one slice. A volume
     of large files reaches the whole pool (a chunk is sixteen granules); a volume of many small files stays bounded by
     its shard's slabs.
+- Owed (2026-10-05): an overlay's cold read through a macOS mount is 109 ms for 688 files (15.4 MB) against 25 ms on
+  the host; warm, 36 ms. The change set is exact and fast: a `land` plan in 4 ms against `diff -rq`'s 29 ms (BENCHMARKS).
+  Also owed: an outsider's `chmod` or `chown` of an untouched base file shows only when its listing reloads.
 - Owed, re-scoped 2026-10-05: the large-write stall below was measured in a VM whose TCP memory is above `tcp_mem`'s
   maximum (739 MB allocated; BENCHMARKS), likely pinned by two wedged containers of this session. It is unmeasured
   on a clean Linux kernel. macOS's own client on a fresh mount does a 1 MiB write+fsync in 1.3 ms and 64 MiB at 789 MB/s,

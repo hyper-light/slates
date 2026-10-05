@@ -65,10 +65,11 @@ const SHARD_MAGIC: u32 = u32::from_le_bytes(*b"SLS1");
 /// and a clone's image carries only its own inodes and the numbers it shares with its origin snapshot.
 /// 14 (A-89, 2026-10-05) a directory's entries are ordered by their folded names under the volume's policy, so a
 /// delta's replay finds a name by binary search instead of scanning the directory. 15 (A-96, 2026-10-05) a delta
-/// carries only the attachments' reference counts that changed, not every attachment's whole list.
+/// carries only the attachments' reference counts that changed, not every attachment's whole list. 16 (2026-10-05) a
+/// base entry's fingerprint carries its owner, so an overlay reports a base file's owner as the disk holds it.
 /// Format: the image layout version, bumped with any change to the types below or to the held replicas'
 /// image they carry.
-const IMAGE_VERSION: u16 = 15;
+const IMAGE_VERSION: u16 = 16;
 
 /// A recorded attachment's references in an image (A-61): its durable id and its share by inode.
 #[derive(Clone, Debug, PartialEq, Eq, Wire)]

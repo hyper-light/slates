@@ -700,6 +700,8 @@ impl<H: LandFs> Landing<'_, H> {
       Ok(moved) => Ok(Some(
         Fingerprint {
           ctime_ns: witness.fingerprint.ctime_ns,
+          uid: witness.fingerprint.uid,
+          gid: witness.fingerprint.gid,
           ..moved
         } == witness.fingerprint,
       )),
@@ -853,6 +855,8 @@ impl<H: LandFs> Landing<'_, H> {
       .filter(|after| {
         Fingerprint {
           ctime_ns: witness.fingerprint.ctime_ns,
+          uid: witness.fingerprint.uid,
+          gid: witness.fingerprint.gid,
           ..**after
         } == witness.fingerprint
       })
@@ -1569,8 +1573,11 @@ impl<H: LandFs> Landing<'_, H> {
   /// or racy witness additionally requires the witnessed bytes and a stable read (§4.15).
   fn displaced_matches(&mut self, file: HostFile, witness: &Witness) -> Result<bool, HostError> {
     let before = self.host.fstat(file)?;
+    // A metadata-only change (the ctime, and the owner a `chown` moves with it) is not drift of the bytes.
     let preserved = Fingerprint {
       ctime_ns: witness.fingerprint.ctime_ns,
+      uid: witness.fingerprint.uid,
+      gid: witness.fingerprint.gid,
       ..before
     };
     if preserved != witness.fingerprint {

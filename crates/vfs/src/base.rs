@@ -1240,7 +1240,12 @@ impl Overlay<'_> {
   ) -> Result<(), VfsError> {
     let handle = self.vol.make_current_inode(store, no)?;
     let inode = store.inodes.get_mut(handle)?;
-    inode.adopt_observed(fp.size, Some(fp.mode), fp.mtime_ns, fp.ctime_ns);
+    inode.adopt_observed(
+      fp.size,
+      Some((fp.mode, fp.uid, fp.gid)),
+      fp.mtime_ns,
+      fp.ctime_ns,
+    );
     if let Body::Base(b) = &mut inode.body {
       b.base_len = fp.size;
     }
@@ -1356,6 +1361,7 @@ impl Overlay<'_> {
         inode.attrs.size = fp.size;
         inode.attrs.mtime = fp.mtime_ns;
         inode.attrs.ctime = fp.ctime_ns;
+        (inode.attrs.uid, inode.attrs.gid) = (fp.uid, fp.gid);
         inode.home = Some(Home {
           parent: parent_no,
           hash: self.vol.policy.hash(&entry.name),
@@ -1372,6 +1378,7 @@ impl Overlay<'_> {
           .map_err(host_refusal)?;
         let mut inode = Inode::new(no, epoch, Kind::Symlink, fp.mode, Body::Symlink(target));
         inode.attrs.size = fp.size;
+        (inode.attrs.uid, inode.attrs.gid) = (fp.uid, fp.gid);
         inode.home = Some(Home {
           parent: parent_no,
           hash: self.vol.policy.hash(&entry.name),
@@ -1391,6 +1398,7 @@ impl Overlay<'_> {
         let child = store.dirs.insert(node)?;
         let mut inode = Inode::new(no, epoch, Kind::Dir, fp.mode, Body::Directory(child));
         inode.attrs.nlink = 2;
+        (inode.attrs.uid, inode.attrs.gid) = (fp.uid, fp.gid);
         inode.attrs.mtime = fp.mtime_ns;
         inode.attrs.ctime = fp.ctime_ns;
         let handle = store.inodes.insert(inode)?;
@@ -2124,7 +2132,12 @@ impl Overlay<'_> {
     let prev = store.inodes.get(handle)?.version;
     {
       let inode = store.inodes.get_mut(handle)?;
-      inode.adopt_observed(fp.size, Some(fp.mode), fp.mtime_ns, fp.ctime_ns);
+      inode.adopt_observed(
+        fp.size,
+        Some((fp.mode, fp.uid, fp.gid)),
+        fp.mtime_ns,
+        fp.ctime_ns,
+      );
       if let Body::Base(b) = &mut inode.body {
         b.witness = Some(witness);
         b.base_len = fp.size;

@@ -43,7 +43,7 @@ fn refusal(e: rustix::io::Errno) -> HostError {
 }
 
 /// The fingerprint of a `stat` result: device, inode, size, both timestamps in nanoseconds,
-/// and the mode.
+/// the mode, and the owner.
 fn fingerprint(st: &Stat) -> Fingerprint {
   Fingerprint {
     dev: u64::try_from(i128::from(st.st_dev)).unwrap_or(0),
@@ -52,6 +52,8 @@ fn fingerprint(st: &Stat) -> Fingerprint {
     mtime_ns: stamp_ns(widen(st.st_mtime), widen(st.st_mtime_nsec)),
     ctime_ns: stamp_ns(widen(st.st_ctime), widen(st.st_ctime_nsec)),
     mode: mode_word(st.st_mode),
+    uid: st.st_uid,
+    gid: st.st_gid,
   }
 }
 
