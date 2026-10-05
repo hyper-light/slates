@@ -3658,3 +3658,4 @@ sets); the
 successor's wrapped key in the head record; the idle-RAM measurement and its decision; sealed archives;
 SecP384r1MLKEM1024 between nodes once hyper-raft measures it.
 
+SecP384r1MLKEM1024 between nodes is built (A-93), interoperating with OpenSSL 3.5.7 both ways.

@@ -9305,3 +9305,27 @@ key was made after the head shipped, which is why the seal's start makes both.
   holders verifying ciphertext and keyed names in the missing sets; (4) the successor's wrapped lineage key in the
   head record; (5) the idle-RAM measurement and its decision; (6) sealed archives; (7) SecP384r1MLKEM1024 between
   nodes when hyper-raft's measurement lands.
+
+### A-93 — SecP384r1MLKEM1024 first between slates' nodes (2026-10-05)
+Applied in the same change to: `crates/transport/src/kx.rs` (new), `crates/transport/src/handshake.rs`
+(`fleet_provider`), `crates/transport/examples/tls_interop.rs` (new), GAPS.
+Status: built 2026-10-05 (condition 8; A-92 piece 7; hyper-raft `docs/seal.md` §10, which moved its own nodes to this
+group first).
+- What: the fleet planes' TLS (both ends are slates) now prefer SecP384r1MLKEM1024 (draft-ietf-tls-ecdhe-mlkem, codepoint
+  0x11ED): ML-KEM-1024, CNSA 2.0's key establishment at NIST category 5, with ECDH over P-384, the shared secret their
+  concatenation (SP 800-56C Rev. 2 §2). X25519MLKEM768 (A-66, 2026-10-04) stays second, so a node from before meets
+  this one on a hybrid still; the RPC-with-TLS export keeps rustls' standard groups, which a kernel's TLS handshake
+  daemon offers. rustls 0.23 ships no such group, so it is built from rustls' public P-384 and ML-KEM-1024 groups with
+  the draft's P-curve layout: the classical part first in both shares and in the secret.
+- Proven: the fleet handshake test asserts the group on both sides; the transport suite (including the handshake
+  flight's bound and the anti-amplification limit, with the larger shares: client 1,665 bytes against 1,216, server
+  1,665 against 1,120), the cluster suite (275) and the fleet suite (70) pass. **Interoperability with an independent
+  implementation**, OpenSSL 3.5.7 in `debian:trixie`, in both directions (`tls_interop`, offering this group alone):
+  slates' client against `openssl s_server -groups SecP384r1MLKEM1024` and `openssl s_client` against slates' server
+  each completed the handshake and exchanged application data, OpenSSL reporting "Negotiated TLS1.3 group:
+  SecP384r1MLKEM1024"; an OpenSSL client offering only X25519MLKEM768 was refused with a handshake-failure alert, so
+  the successes were not a fallback. A completed handshake keys the Finished messages from the shared secret, so it
+  proves the layout and the secret's order are the draft's, not merely self-consistent.
+- Cost: hyper-raft measured about 0.25 ms of CPU more per handshake than X25519 first, and on lossy paths a first fresh
+  reply at p90 136 ms against 180 ms (mantle's report, 2026-10-05, not reproduced here); a fleet session handshakes
+  once per connection, so it is off every request path.

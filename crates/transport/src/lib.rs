@@ -41,6 +41,7 @@ pub mod flight;
 pub mod flow;
 pub mod handshake;
 pub mod keys;
+pub mod kx;
 pub mod pacer;
 pub mod packet_number;
 pub mod params;

@@ -82,11 +82,23 @@ impl Identity {
   }
 }
 
-/// The aws-lc-rs crypto provider (AWS-LC, the workspace's one cryptographic library).
+/// The aws-lc-rs crypto provider (AWS-LC, the workspace's one cryptographic library), with rustls' standard groups
+/// (X25519MLKEM768 first): what the RPC-with-TLS export offers, which a kernel's TLS handshake daemon also speaks.
 // structural: allow — D-8 exception 2: rustls's provider/config types cross its API as `Arc`.
 fn provider() -> Arc<rustls::crypto::CryptoProvider> {
   // structural: allow — D-8 exception 2: rustls's `builder_with_provider` takes `Arc` by signature.
   Arc::new(rustls::crypto::aws_lc_rs::default_provider())
+}
+
+/// The provider between slates' own nodes (the fleet planes): SecP384r1MLKEM1024 first (`crate::kx`: ML-KEM-1024, CNSA
+/// 2.0's key establishment, with P-384), then rustls' standard groups, so a node from before it still meets this one on
+/// X25519MLKEM768 and never on a classical group alone unless neither offers a hybrid.
+// structural: allow — D-8 exception 2: rustls's provider/config types cross its API as `Arc`.
+pub fn fleet_provider() -> Arc<rustls::crypto::CryptoProvider> {
+  let mut provider = rustls::crypto::aws_lc_rs::default_provider();
+  provider.kx_groups.insert(0, crate::kx::SECP384R1_MLKEM1024);
+  // structural: allow — D-8 exception 2: rustls's `builder_with_provider` takes `Arc` by signature.
+  Arc::new(provider)
 }
 
 /// Fills `out` with bytes from the crypto provider's secure random — the one source of randomness the
@@ -113,7 +125,7 @@ pub fn server_config(
   let verifier = client_verifier(allowed_clients)?;
   // structural: allow — D-8 exception 2: `with_client_cert_verifier` takes `Arc` by signature.
   let verifier = Arc::new(RosterVerifier { inner: verifier });
-  let mut config = ServerConfig::builder_with_provider(provider())
+  let mut config = ServerConfig::builder_with_provider(fleet_provider())
     .with_protocol_versions(&[&rustls::version::TLS13])?
     .with_client_cert_verifier(verifier)
     .with_single_cert(vec![identity.cert.clone()], identity.key.clone_key())?;
@@ -266,7 +278,7 @@ pub fn client_config(
   roots
     .add(pinned_server)
     .map_err(|e| HandshakeError::Setup(e.to_string()))?;
-  ClientConfig::builder_with_provider(provider())
+  ClientConfig::builder_with_provider(fleet_provider())
     .with_protocol_versions(&[&rustls::version::TLS13])?
     .with_root_certificates(roots)
     .with_client_auth_cert(
@@ -382,10 +394,11 @@ mod tests {
     Ok(())
   }
 
-  /// Goal condition 8 (transfer protected with post-quantum key exchange, aws-lc-rs), 2026-10-04: do complete a
-  /// mutual fleet handshake; expect both sides to have negotiated the hybrid X25519MLKEM768 group
-  /// (draft-ietf-tls-ecdhe-mlkem, the group TLS deployments ship), never classical X25519 alone. A session
-  /// recorded today stays confidential against a later quantum adversary only if its key exchange is hybrid.
+  /// Goal condition 8 (transfer protected with post-quantum key exchange, aws-lc-rs): do complete a mutual fleet
+  /// handshake; expect both sides to have negotiated SecP384r1MLKEM1024 (draft-ietf-tls-ecdhe-mlkem; ML-KEM-1024 with
+  /// P-384, `crate::kx`), never a classical group alone. A session recorded today stays confidential against a later
+  /// quantum adversary only if its key exchange is hybrid; between slates' own nodes the hybrid is CNSA 2.0's
+  /// category-5 KEM (2026-10-05; X25519MLKEM768 from 2026-10-04 until then).
   #[test]
   fn a_fleet_handshake_negotiates_the_hybrid_post_quantum_group() {
     let server = self_signed("server.slates");
@@ -402,7 +415,9 @@ mod tests {
     ] {
       assert_eq!(
         group.map(|group| group.name()),
-        Some(rustls::NamedGroup::X25519MLKEM768),
+        Some(rustls::NamedGroup::from(
+          crate::kx::SECP384R1_MLKEM1024_CODEPOINT
+        )),
         "the {side} negotiated the hybrid post-quantum group"
       );
     }
