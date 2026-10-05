@@ -1986,6 +1986,12 @@ Three runs; each cell is one run, in order.
   `target/release` (`.cargo-lock`, `.cargo-build-lock`, `.cargo-artifact-lock`), which tmpfs has and slates does not.
   That matches cargo's own behaviour on NFS (from memory, to verify against cargo's `flock.rs`: it skips its file
   locks on an NFS mount, where `flock` can block forever, so it never creates them); no other file differs.
+- **No write reaches a disk** (condition 3), traced: `docs/wip/bench/realworld_trace.sh` runs the same workloads with
+  `strace -f` on the anchor and the daemon for every `open`/`openat`/`openat2`/`creat`, `mkdir`, `rename`, `unlink`,
+  `link`, `symlink`, `truncate` and `memfd_create`. Through the clone, the build and the install (about 2,640 files written
+  to the volume) the two processes made **no** opening with `O_CREAT`, `O_WRONLY`, `O_RDWR` or `O_TRUNC` and **no**
+  namespace change; their only opens were kernel pseudo-files, read-only: `/proc/meminfo` 108 times (the memory
+  pressure sampling, about seven a second) and `/proc/sys/vm/overcommit_memory` once.
 - Cost: the clone is about 12% slower (0.97 s against 0.87 s), the build about 4%, and pip within noise. The first
   cargo build failed on both sides in an earlier run, a harness error (a second `[dependencies]` table), fixed before
   these numbers.
