@@ -9123,25 +9123,41 @@ Status: built 2026-10-05.
   7.76 → 3.6–3.9 ms. Linux's kernel nfsd over tmpfs, same loop: p50 1.95–4.6 ms. Owed: a v4 page that does not pass
   through a v3 reply's encoding and decoding.
 
-### A-91 — A chunk fetch stripes across the recorded holders and hedges at the measured p95 (2026-10-05)
-Applied in the same change to: `crates/cluster/src/content.rs` (`fetch_chunks`, `FetchTiming`, `Fetched`,
-`chunk_rank`, the per-holder `fetch_worker`), `crates/server/src/fleet.rs` (`fetch_into_hold`, `LatencyWindow`
-generalized from the put class, `FETCH_HEDGED`, `FETCH_HOLDER_FAILED`), `crates/server/src/state.rs`
-(`fetch_latency`), `crates/cluster/tests/content.rs`, GAPS.
+### A-91 — A fetch stripes across the recorded holders, hedges at the measured p95, ties and steals (2026-10-05)
+Applied in the same change to: `crates/cluster/src/content.rs` (`fetch` replacing `fetch_manifest` and
+`fetch_chunks`, `FetchTiming`, `Fetched`, `chunk_rank`, the per-holder `fetch_worker`, the `FetchRun` scheduler),
+`crates/server/src/fleet.rs` (`fetch_into_hold`, `LatencyWindow` generalized from the put class, `FETCH_HEDGED`,
+`FETCH_STOLEN`, `FETCH_HOLDER_FAILED`), `crates/server/src/state.rs` (`fetch_latency`), `crates/cluster/tests/content.rs`,
+`crates/cluster/examples/fetch_bench.rs`, BENCHMARKS, GAPS.
 Status: built 2026-10-05 (the fetch half of Phase 8 item 13; remote attach itself is owed).
 - What: §4.10 says chunk reads "fault to hedged fetches by identity from the recorded holders", and its failure
   matrix promises "a recorded holder unreachable during fetch: Masked (another recorded holder, hedged)". The fetch
-  asked one holder, so a silent or lossy holder cost the takeover's whole period, and the retry came a period
-  later. Now every reachable recorded holder runs a worker over its own session. Each chunk is asked first of the
-  holder its identity ranks highest (`chunk_rank`, the `fmix64` finalizer over the identity and the host), which
-  stripes a fetch across the holders. A chunk still outstanding after the hedge delay is asked of the next-ranked
-  holder too (Dean & Barroso's hedged request); the first verified answer wins. A holder whose session fails, or
-  that answers anything but the chunk asked, is dropped, and its unanswered chunks move to the next holder at once.
-  One holder is the degenerate: no hedge, the same code (R8).
+  asked one holder for the manifest and the chunks, so a silent or lossy holder cost the takeover's whole period and
+  the retry came a period later. Now every reachable recorded holder runs a worker over its own session, and one
+  coordinator schedules the manifest and then the chunks across them:
+  - every item is asked first of the holder its identity ranks highest (`chunk_rank`, the `fmix64` finalizer over
+    the identity and the host), which stripes a fetch across the holders up front, so healthy paths run at once with
+    the transport's own congestion control setting the pace;
+  - an item outstanding past the hedge delay is asked of its next-ranked holder too (Dean & Barroso's hedged
+    request), and the first verified answer wins, the other copies cancelled (their tied requests);
+  - a holder with room in its window (its first share) steals the deepest-queued chunk of the holder whose exclusive
+    backlog is longest, while that backlog is longer than its own outstanding work: work stealing from the tail, as a
+    deque scheduler does. Holders that keep pace stay balanced and duplicate nothing; a slow or silent holder's
+    backlog drains to the others, which the p95 hedge alone cannot do once the p95 has learned a holder that is slow
+    throughout as normal (measured below);
+  - a holder whose session fails, or that answers anything but the item asked, is dropped, and every item it alone
+    held moves on at once.
+  One holder is the degenerate: no hedge, no steal, the same code (R8). The manifest is verified against its identity
+  and staged by the caller, which returns the chunks still wanted.
+- Rejected on the way, measured (`fetch_bench`, 4 MiB in 64 KiB chunks): pulling chunks into a per-holder window
+  that starts at two and grows by one per answer ran a second slow start on top of the transport's (an 80 ms path
+  with one holder, 653 → 1,118 ms); sizing that window from the reader's congestion window was wrong outright (the
+  reader's window governs its small requests, not the holder's replies: 12 s).
 - The hedge delay is the measured p95 of the fetch class: each kept chunk's time from its first request to its
-  verified arrival, in a bounded window beside the put class's (`LatencyWindow`); one period before any reading,
-  as the put hedge does.
+  verified arrival, in a bounded window beside the put class's (`LatencyWindow`); one period before any reading, as
+  the put hedge does.
 - Proven: `a_silent_recorded_holder_is_masked_by_hedging_to_the_other` (an eight-chunk archive on a serving and a
-  silent holder: hedged, complete and rebuilt byte for byte with both sessions back; with the hedge off,
-  incomplete at the deadline, so the silent holder was asked first for some chunks). The fleet suite (69 tests,
-  takeover content served over NFS included) passes over the new fetch.
+  silent holder, under both assignments of their ids so the manifest also ranks first on the silent one: complete,
+  rebuilt byte for byte, both sessions back, the hedge or steal counters moved). The fleet suite (69 tests, takeover
+  content served over NFS included) passes over the new fetch. The benchmark found the manifest bug (a silent first
+  holder left the manifest unfetched) before it shipped.

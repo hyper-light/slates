@@ -2696,70 +2696,49 @@ pub async fn put_content(
   }
 }
 
-/// Fetches `object`'s manifest `manifest` from a recorded holder over `endpoint`, bounded by `deadline_ns`:
-/// the archive's header and tree with no chunks, decoded (the reader checks the manifest's hash) and accepted
-/// only when its identity is the one asked for. Returns it, if the holder had it, and the endpoint for reuse
-/// whatever the outcome.
-pub async fn fetch_manifest(
-  endpoint: Endpoint,
-  object: ObjectId,
-  manifest: [u8; 32],
-  deadline_ns: u64,
-) -> (Option<Archive>, Endpoint) {
-  let request = ContentMessage::Fetch { object, manifest }.encode();
-  let (reply, endpoint) = request_within(
-    endpoint,
-    CONTENT_FETCH_STREAM,
-    Priority::Bulk,
-    &request,
-    deadline_ns,
-  )
-  .await;
-  let archive = match ContentMessage::decode(&reply.bytes) {
-    Ok(ContentMessage::Have { archive }) => Archive::decode(&archive)
-      .ok()
-      .filter(|archive| archive.chunks.is_empty() && archive.manifest_identity() == manifest),
-    _ => None,
-  };
-  (archive, endpoint)
-}
-
-/// The timing of one chunk fetch (§4.10 "chunk reads fault to hedged fetches by identity from the recorded
-/// holders"), every value the caller's to derive.
+/// The timing of one fetch (§4.10 "chunk reads fault to hedged fetches by identity from the recorded holders"),
+/// every value the caller's to derive.
 #[derive(Clone, Copy, Debug)]
 pub struct FetchTiming {
-  /// The whole fetch's span: chunks unanswered by then are left to the next fetch, whose stage keeps every chunk
+  /// The whole fetch's span: what is unanswered by then is left to the next fetch, whose stage keeps every chunk
   /// that arrived verified (AUD-29-55).
   pub deadline_ns: u64,
-  /// How long a chunk is outstanding at the holders asked so far before it is also asked of the next-ranked
+  /// How long a request is outstanding at the holders asked so far before it is also asked of the next-ranked
   /// holder: the measured p95 of the fetch class (Dean & Barroso, CACM 2013: "send the request to a replica …
   /// after the request has been outstanding for longer than the 95th-percentile expected latency").
   pub hedge_after_ns: u64,
   /// How long a holder's worker drives its session before it looks for new work, and the coordinator between
-  /// looks: the latency a hedge or a stop waits at most before its worker sees it.
+  /// looks: the latency a hedge, a cancellation or a stop waits at most before its worker sees it.
   pub poll_ns: u64,
 }
 
-/// What a fetch did: whether every wanted chunk was kept, every holder's session back (whatever the outcome),
-/// each kept chunk's latency from its first request (the fetch class's readings for the hedge trigger), how many
-/// requests were hedges, and how many holders failed and had their chunks moved to the others.
+/// What a fetch did: whether the manifest was found and every wanted chunk kept, every holder's session back
+/// (whatever the outcome), each kept chunk's latency from its first request (the fetch class's readings for the
+/// hedge trigger), and how many requests were hedges, steals and cancellations, and how many holders failed.
 pub struct Fetched {
-  /// Whether every wanted chunk was kept.
+  /// Whether a holder answered the manifest (verified against its identity).
+  pub manifest_found: bool,
+  /// Whether the manifest was found and every chunk the stage wanted was kept.
   pub complete: bool,
   /// Every holder's session, returned whatever the outcome.
   pub sessions: Vec<(HostId, Endpoint)>,
   /// Each kept chunk's latency, from the chunk's first request to its verified arrival.
   pub latencies_ns: Vec<u64>,
-  /// Requests sent as hedges (a chunk asked of a further holder while still outstanding).
+  /// Requests sent as hedges (asked of a further holder after the hedge delay).
   pub hedges: u64,
-  /// Holders whose session failed or that answered falsely, their chunks moved to the others.
+  /// Requests an idle holder took from another's outstanding work (work stealing).
+  pub steals: u64,
+  /// Requests cancelled because another holder answered first (tied requests).
+  pub cancelled: u64,
+  /// Holders whose session failed or that answered falsely, their work moved to the others.
   pub failed_holders: u64,
 }
 
-/// The rank of `host` for `chunk`: the higher, the earlier the holder is asked. The chunk's identity is a uniform
-/// hash, so a holder's rank across chunks is pseudo-random and a fetch stripes its chunks across the recorded
-/// holders; the MurmurHash3 `fmix64` finalizer (as the register's rendezvous uses) avalanches the host's id into it.
-fn chunk_rank(chunk: &[u8; 32], host: HostId) -> u64 {
+/// The rank of `host` for the item `identity` (a chunk or the manifest): the higher, the earlier the holder is
+/// asked. Identities are uniform hashes, so a holder's rank across chunks is pseudo-random and a fetch stripes its
+/// chunks across the recorded holders; the MurmurHash3 `fmix64` finalizer (as the register's rendezvous uses)
+/// avalanches the host's id into it.
+fn chunk_rank(identity: &[u8; 32], host: HostId) -> u64 {
   /// Format: MurmurHash3 `fmix64` first multiplier (Austin Appleby, public domain).
   const FMIX_A: u64 = 0xff51_afd7_ed55_8ccd;
   /// Format: MurmurHash3 `fmix64` second multiplier (Austin Appleby, public domain).
@@ -2767,7 +2746,7 @@ fn chunk_rank(chunk: &[u8; 32], host: HostId) -> u64 {
   /// Format: MurmurHash3 `fmix64` shift distance (Austin Appleby, public domain).
   const FMIX_SHIFT: u32 = 33;
   let mut prefix = [0u8; size_of::<u64>()];
-  if let Some(head) = chunk.get(..size_of::<u64>()) {
+  if let Some(head) = identity.get(..size_of::<u64>()) {
     prefix.copy_from_slice(head);
   }
   let mut hash = u64::from_le_bytes(prefix) ^ host.0;
@@ -2779,19 +2758,30 @@ fn chunk_rank(chunk: &[u8; 32], host: HostId) -> u64 {
   hash
 }
 
+/// What a fetch item is: the manifest, or one chunk.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Item {
+  Manifest,
+  Chunk([u8; 32]),
+}
+
 /// Work for one holder's fetch worker.
 enum FetchCommand {
-  /// Ask this holder for the chunk.
-  Chunk([u8; 32]),
+  /// Ask this holder for the item.
+  Ask(Item),
+  /// Another holder answered the item first: abandon this holder's request for it.
+  Cancel(Item),
   /// Abandon what is open and hand the session back.
   Stop,
 }
 
 /// What a fetch worker reports, by the holder's index in the fetch.
 enum FetchEvent {
-  /// A holder answered the chunk asked for, for this manifest (not yet verified: `keep` does that).
-  Piece([u8; 32], Chunk),
-  /// The holder answered with anything but the chunk asked, or its session failed: it is dropped.
+  /// The holder answered the manifest, verified against its identity.
+  Manifest(usize, Archive),
+  /// The holder answered the chunk asked for, for this manifest (not yet verified: `keep` does that).
+  Piece(usize, [u8; 32], Chunk),
+  /// The holder answered with anything but the item asked, or its session failed: it is dropped.
   Failed(usize),
   /// The worker stopped and hands its session back.
   Returned(usize, Box<Endpoint>),
@@ -2802,8 +2792,8 @@ struct FetchWorker {
   index: usize,
   endpoint: Endpoint,
   binding: (ObjectId, [u8; 32]),
-  pending: std::collections::VecDeque<[u8; 32]>,
-  open: Vec<(u64, [u8; 32])>,
+  pending: std::collections::VecDeque<Item>,
+  open: Vec<(u64, Item)>,
   failed: bool,
 }
 
@@ -2812,27 +2802,46 @@ impl FetchWorker {
   fn take_commands(&mut self, commands: &Receiver<FetchCommand>) -> bool {
     loop {
       match commands.try_recv() {
-        Ok(FetchCommand::Chunk(chunk)) => {
+        Ok(FetchCommand::Ask(item)) => {
           if !self.failed {
-            self.pending.push_back(chunk);
+            self.pending.push_back(item);
           }
         }
+        Ok(FetchCommand::Cancel(item)) => self.cancel(item),
         Ok(FetchCommand::Stop) | Err(TryRecvError::Disconnected) => return false,
         Err(TryRecvError::Empty) => return true,
       }
     }
   }
 
+  /// Drops this holder's request for `item`: still queued, it never goes out; open, its exchange is abandoned so
+  /// the path stops carrying it.
+  fn cancel(&mut self, item: Item) {
+    self.pending.retain(|queued| *queued != item);
+    let endpoint = &mut self.endpoint;
+    self.open.retain(|(id, open)| {
+      if *open == item {
+        endpoint.abandon(*id);
+        false
+      } else {
+        true
+      }
+    });
+  }
+
   /// Begins the pending requests while the peer's stream credit admits them.
   fn begin_pending(&mut self) {
     let (object, manifest) = self.binding;
     while let Some(next) = self.pending.front().copied() {
-      let request = ContentMessage::FetchChunk {
-        object,
-        manifest,
-        chunk: next,
-      }
-      .encode();
+      let request = match next {
+        Item::Manifest => ContentMessage::Fetch { object, manifest }.encode(),
+        Item::Chunk(chunk) => ContentMessage::FetchChunk {
+          object,
+          manifest,
+          chunk,
+        }
+        .encode(),
+      };
       match self
         .endpoint
         .begin(CONTENT_FETCH_STREAM, Priority::Bulk, &request)
@@ -2852,35 +2861,52 @@ impl FetchWorker {
     }
   }
 
-  /// Reports every answered request: a piece for the chunk asked, or the holder failed.
+  /// Reports every answered request: the manifest or a piece for the item asked, or the holder failed.
   fn collect_replies(&mut self, events: &std::sync::mpsc::Sender<FetchEvent>) {
-    let (object, manifest) = self.binding;
     let open = std::mem::take(&mut self.open);
     for (id, asked) in open {
       let Some(reply) = self.endpoint.take_reply(id) else {
         self.open.push((id, asked));
         continue;
       };
-      match ContentMessage::decode(&reply) {
-        Ok(ContentMessage::Piece {
+      match self.answer(asked, &reply) {
+        Some(event) => {
+          let _ = events.send(event);
+        }
+        None => self.failed = true,
+      }
+    }
+  }
+
+  /// The event `reply` makes for the item `asked`, or `None` when it answers anything else.
+  fn answer(&self, asked: Item, reply: &[u8]) -> Option<FetchEvent> {
+    let (object, manifest) = self.binding;
+    match (asked, ContentMessage::decode(reply).ok()?) {
+      (Item::Manifest, ContentMessage::Have { archive }) => Archive::decode(&archive)
+        .ok()
+        .filter(|archive| archive.chunks.is_empty() && archive.manifest_identity() == manifest)
+        .map(|archive| FetchEvent::Manifest(self.index, archive)),
+      (
+        Item::Chunk(asked),
+        ContentMessage::Piece {
           object: answered_object,
           manifest: answered_manifest,
           chunk,
-        }) if answered_object == object
-          && answered_manifest == manifest
-          && chunk.identity == asked =>
-        {
-          let _ = events.send(FetchEvent::Piece(asked, chunk));
-        }
-        _ => self.failed = true,
+        },
+      ) if answered_object == object
+        && answered_manifest == manifest
+        && chunk.identity == asked =>
+      {
+        Some(FetchEvent::Piece(self.index, asked, chunk))
       }
+      _ => None,
     }
   }
 }
 
-/// One holder's side of a fetch: asks for each chunk the coordinator sends, as many in flight as the peer's
-/// stream credit admits, drives the session in slices of `poll_ns` so new work and a stop are seen within one,
-/// and reports every answer. A failed holder is reported once; the worker then only waits for the stop.
+/// One holder's side of a fetch: asks for each item the coordinator sends, as many in flight as the peer's stream
+/// credit admits, drives the session in slices of `poll_ns` so new work, a cancellation and a stop are seen within
+/// one, and reports every answer. A failed holder is reported once; the worker then only waits for the stop.
 async fn fetch_worker(
   mut worker: FetchWorker,
   commands: Receiver<FetchCommand>,
@@ -2919,37 +2945,62 @@ async fn fetch_worker(
   ));
 }
 
-/// One wanted chunk's progress in a fetch.
-struct WantedChunk {
-  identity: [u8; 32],
-  /// The holders' indices in rank order for this chunk, highest first.
+/// One wanted item's progress in a fetch.
+struct Wanted {
+  item: Item,
+  /// The holders' indices in rank order for this item, highest first.
   ranked: Vec<usize>,
-  /// How many of `ranked` have been tried (the next to ask is `ranked[tried]`).
-  tried: usize,
-  /// When the chunk was first asked for, and when it was last asked of a further holder.
+  /// The holders asked for it so far.
+  asked_of: Vec<usize>,
+  /// When the item was first asked for, and when it was last asked of a further holder.
   first_asked_ns: u64,
   last_asked_ns: u64,
-  kept: bool,
+  done: bool,
 }
 
-impl WantedChunk {
-  /// Whether every holder this chunk was asked of is no longer live.
-  fn asked_only_of_dead(&self, live: &[bool]) -> bool {
-    self.ranked.get(..self.tried).is_some_and(|tried| {
-      tried
-        .iter()
-        .all(|holder| !live.get(*holder).copied().unwrap_or(false))
-    })
+impl Wanted {
+  fn new(item: Item, hosts: &[HostId], identity: &[u8; 32], now: u64) -> Wanted {
+    let mut ranked: Vec<usize> = (0..hosts.len()).collect();
+    ranked.sort_by_key(|&index| {
+      std::cmp::Reverse(
+        hosts
+          .get(index)
+          .map_or(0, |host| chunk_rank(identity, *host)),
+      )
+    });
+    Wanted {
+      item,
+      ranked,
+      asked_of: Vec::new(),
+      first_asked_ns: now,
+      last_asked_ns: now,
+      done: false,
+    }
+  }
+
+  /// Whether a live holder is still working on it.
+  fn outstanding_at_a_live_holder(&self, live: &[bool]) -> bool {
+    self
+      .asked_of
+      .iter()
+      .any(|holder| live.get(*holder).copied().unwrap_or(false))
   }
 }
 
-/// The coordinator of one fetch: each holder's worker, which holders are live, and every wanted chunk.
+/// The coordinator of one fetch: each holder's worker, which holders are live and how much each has outstanding, and
+/// every wanted item (the manifest first, then the chunks the stage wants).
 struct FetchRun {
   hosts: Vec<HostId>,
   commands: Vec<Option<std::sync::mpsc::Sender<FetchCommand>>>,
   live: Vec<bool>,
+  /// Items asked of each holder and not yet answered or cancelled.
+  outstanding: Vec<usize>,
+  /// How many items each holder may have outstanding: its first share of the chunks (at least one), the depth it
+  /// was trusted with at the start, so stealing never asks a holder for more than it was first given.
+  window: Vec<usize>,
   running: usize,
-  chunks: Vec<WantedChunk>,
+  items: Vec<Wanted>,
+  manifest: Option<Archive>,
   refused: bool,
   fetched: Fetched,
 }
@@ -2960,7 +3011,6 @@ impl FetchRun {
   fn start(
     holders: Vec<(HostId, Endpoint)>,
     binding: (ObjectId, [u8; 32]),
-    wanted: Vec<[u8; 32]>,
     poll_ns: u64,
     events: &std::sync::mpsc::Sender<FetchEvent>,
   ) -> FetchRun {
@@ -2968,109 +3018,168 @@ impl FetchRun {
     let mut run = FetchRun {
       commands: Vec::with_capacity(hosts.len()),
       live: Vec::with_capacity(hosts.len()),
+      outstanding: vec![0; hosts.len()],
+      window: vec![1; hosts.len()],
       running: 0,
-      chunks: Vec::new(),
+      items: Vec::new(),
+      manifest: None,
       refused: false,
       fetched: Fetched {
+        manifest_found: false,
         complete: false,
         sessions: Vec::new(),
         latencies_ns: Vec::new(),
         hedges: 0,
+        steals: 0,
+        cancelled: 0,
         failed_holders: 0,
       },
       hosts,
     };
     for (index, (host, endpoint)) in holders.into_iter().enumerate() {
-      let (command_tx, command_rx) = channel::<FetchCommand>();
-      let worker_events = events.clone();
-      // The session moves to the worker over a channel once the runtime admitted it, so a refused spawn leaves
-      // the session here, never dropped with the refused future.
-      let (park_tx, park_rx) = channel::<Endpoint>();
-      let spawned = spawn_child(async move {
-        loop {
-          match park_rx.try_recv() {
-            Ok(endpoint) => {
-              let worker = FetchWorker {
-                index,
-                endpoint,
-                binding,
-                pending: std::collections::VecDeque::new(),
-                open: Vec::new(),
-                failed: false,
-              };
-              fetch_worker(worker, command_rx, worker_events, poll_ns).await;
-              return;
-            }
-            Err(TryRecvError::Disconnected) => return,
-            Err(TryRecvError::Empty) => slates_rt::futures::yield_now().await,
-          }
-        }
-      });
-      if let Ok(task) = spawned {
-        let _ = park_tx.send(endpoint);
-        let _ = detach(task);
-        run.commands.push(Some(command_tx));
-        run.live.push(true);
-        run.running = run.running.saturating_add(1);
-      } else {
-        run.fetched.sessions.push((host, endpoint));
-        run.commands.push(None);
-        run.live.push(false);
-        run.fetched.failed_holders = run.fetched.failed_holders.saturating_add(1);
-      }
-    }
-    let now = now_ns();
-    run.chunks = wanted
-      .into_iter()
-      .map(|identity| {
-        let mut ranked: Vec<usize> = (0..run.hosts.len()).collect();
-        ranked.sort_by_key(|&index| {
-          std::cmp::Reverse(
-            run
-              .hosts
-              .get(index)
-              .map_or(0, |host| chunk_rank(&identity, *host)),
-          )
-        });
-        WantedChunk {
-          identity,
-          ranked,
-          tried: 0,
-          first_asked_ns: now,
-          last_asked_ns: now,
-          kept: false,
-        }
-      })
-      .collect();
-    let FetchRun {
-      chunks,
-      commands,
-      live,
-      ..
-    } = &mut run;
-    for chunk in chunks.iter_mut() {
-      ask_next(chunk, commands, live, now);
+      run.spawn_worker(index, (host, endpoint), binding, poll_ns, events);
     }
     run
+  }
+
+  /// One holder's worker; the session moves to it over a channel once the runtime admitted it, so a refused spawn
+  /// leaves the session here, never dropped with the refused future.
+  fn spawn_worker(
+    &mut self,
+    index: usize,
+    (host, endpoint): (HostId, Endpoint),
+    binding: (ObjectId, [u8; 32]),
+    poll_ns: u64,
+    events: &std::sync::mpsc::Sender<FetchEvent>,
+  ) {
+    let (command_tx, command_rx) = channel::<FetchCommand>();
+    let worker_events = events.clone();
+    let (park_tx, park_rx) = channel::<Endpoint>();
+    let spawned = spawn_child(async move {
+      loop {
+        match park_rx.try_recv() {
+          Ok(endpoint) => {
+            let worker = FetchWorker {
+              index,
+              endpoint,
+              binding,
+              pending: std::collections::VecDeque::new(),
+              open: Vec::new(),
+              failed: false,
+            };
+            fetch_worker(worker, command_rx, worker_events, poll_ns).await;
+            return;
+          }
+          Err(TryRecvError::Disconnected) => return,
+          Err(TryRecvError::Empty) => slates_rt::futures::yield_now().await,
+        }
+      }
+    });
+    if let Ok(task) = spawned {
+      let _ = park_tx.send(endpoint);
+      let _ = detach(task);
+      self.commands.push(Some(command_tx));
+      self.live.push(true);
+      self.running = self.running.saturating_add(1);
+    } else {
+      self.fetched.sessions.push((host, endpoint));
+      self.commands.push(None);
+      self.live.push(false);
+      self.fetched.failed_holders = self.fetched.failed_holders.saturating_add(1);
+    }
+  }
+
+  /// Asks item `at` of holder `holder`, at `now`: whether the request went out.
+  fn ask(&mut self, at: usize, holder: usize, now: u64) -> bool {
+    let Some(wanted) = self.items.get_mut(at) else {
+      return false;
+    };
+    if wanted.done
+      || wanted.asked_of.contains(&holder)
+      || !self.live.get(holder).copied().unwrap_or(false)
+    {
+      return false;
+    }
+    let Some(Some(command)) = self.commands.get(holder) else {
+      return false;
+    };
+    if command.send(FetchCommand::Ask(wanted.item)).is_err() {
+      return false;
+    }
+    if wanted.asked_of.is_empty() {
+      wanted.first_asked_ns = now;
+    }
+    wanted.asked_of.push(holder);
+    wanted.last_asked_ns = now;
+    if let Some(count) = self.outstanding.get_mut(holder) {
+      *count = count.saturating_add(1);
+    }
+    true
+  }
+
+  /// Asks item `at` of its next-ranked live holder not yet asked: whether a request went out.
+  fn ask_next(&mut self, at: usize, now: u64) -> bool {
+    let ranked = self
+      .items
+      .get(at)
+      .map(|wanted| wanted.ranked.clone())
+      .unwrap_or_default();
+    ranked.into_iter().any(|holder| self.ask(at, holder, now))
+  }
+
+  /// Item `at` was answered by `answering`: done, and every other holder still asked for it is told to cancel.
+  fn finish(&mut self, at: usize, answering: usize) {
+    let Some(wanted) = self.items.get_mut(at) else {
+      return;
+    };
+    wanted.done = true;
+    let item = wanted.item;
+
+    for holder in wanted.asked_of.clone() {
+      if let Some(count) = self.outstanding.get_mut(holder) {
+        *count = count.saturating_sub(1);
+      }
+      if holder != answering
+        && self.live.get(holder).copied().unwrap_or(false)
+        && let Some(Some(command)) = self.commands.get(holder)
+        && command.send(FetchCommand::Cancel(item)).is_ok()
+      {
+        self.fetched.cancelled = self.fetched.cancelled.saturating_add(1);
+      }
+    }
   }
 
   /// Folds one worker's report in at `now`.
   fn on_event(&mut self, event: FetchEvent, keep: &mut impl FnMut(Chunk) -> bool, now: u64) {
     match event {
-      FetchEvent::Piece(asked, piece) => {
-        let Some(chunk) = self
-          .chunks
-          .iter_mut()
-          .find(|chunk| chunk.identity == asked && !chunk.kept)
+      FetchEvent::Manifest(index, archive) => {
+        if self.manifest.is_none() {
+          self.manifest = Some(archive);
+          self.fetched.manifest_found = true;
+          if let Some(at) = self
+            .items
+            .iter()
+            .position(|wanted| wanted.item == Item::Manifest)
+          {
+            self.finish(at, index);
+          }
+        }
+      }
+      FetchEvent::Piece(index, asked, piece) => {
+        let Some(at) = self
+          .items
+          .iter()
+          .position(|wanted| wanted.item == Item::Chunk(asked) && !wanted.done)
         else {
-          return; // A hedge's loser: the chunk was already kept.
+          return; // A tied request's loser: the chunk was already kept.
         };
         if keep(piece) {
-          chunk.kept = true;
-          self
-            .fetched
-            .latencies_ns
-            .push(now.saturating_sub(chunk.first_asked_ns));
+          let first = self
+            .items
+            .get(at)
+            .map_or(now, |wanted| wanted.first_asked_ns);
+          self.fetched.latencies_ns.push(now.saturating_sub(first));
+          self.finish(at, index);
         } else {
           self.refused = true;
         }
@@ -3080,7 +3189,7 @@ impl FetchRun {
     }
   }
 
-  /// Drops holder `index`: every chunk asked only of dropped holders moves to its next live holder at once.
+  /// Drops holder `index`: every item asked only of dropped holders moves to its next live holder at once.
   fn drop_holder(&mut self, index: usize, now: u64) {
     let Some(alive) = self.live.get_mut(index) else {
       return;
@@ -3090,33 +3199,74 @@ impl FetchRun {
     }
     *alive = false;
     self.fetched.failed_holders = self.fetched.failed_holders.saturating_add(1);
-    let FetchRun {
-      chunks,
-      commands,
-      live,
-      ..
-    } = self;
-    for chunk in chunks.iter_mut().filter(|chunk| !chunk.kept) {
-      if chunk.asked_only_of_dead(live) {
-        ask_next(chunk, commands, live, now);
+    for at in 0..self.items.len() {
+      let orphaned = self
+        .items
+        .get(at)
+        .is_some_and(|wanted| !wanted.done && !wanted.outstanding_at_a_live_holder(&self.live));
+      if orphaned {
+        self.ask_next(at, now);
       }
     }
   }
 
-  /// Hedges every chunk outstanding past `hedge_after_ns` to its next live holder.
-  fn hedge(&mut self, now: u64, hedge_after_ns: u64) {
-    let FetchRun {
-      chunks,
-      commands,
-      live,
-      fetched,
-      ..
-    } = self;
-    for chunk in chunks.iter_mut().filter(|chunk| !chunk.kept) {
-      if now.saturating_sub(chunk.last_asked_ns) >= hedge_after_ns
-        && ask_next(chunk, commands, live, now)
+  /// The chunks only holder `holder` has been asked for and not yet answered: its exclusive backlog, the work that
+  /// waits on it alone.
+  fn exclusive_backlog(&self, holder: usize) -> impl Iterator<Item = usize> + '_ {
+    self
+      .items
+      .iter()
+      .enumerate()
+      .filter_map(move |(at, wanted)| {
+        let exclusive = matches!(wanted.item, Item::Chunk(_))
+          && !wanted.done
+          && wanted.asked_of.contains(&holder)
+          && wanted
+            .asked_of
+            .iter()
+            .all(|asked| *asked == holder || !self.live.get(*asked).copied().unwrap_or(false));
+        exclusive.then_some(at)
+      })
+  }
+
+  /// One scheduling step at `now`: every item outstanding past `hedge_after_ns` is hedged to its next live holder;
+  /// then each holder with room in its window steals from the holder whose exclusive backlog is longest, while that
+  /// backlog is longer than the stealer's own outstanding work — taking the deepest-queued chunk, the one least likely
+  /// to be in service (work stealing from the tail, as a deque scheduler steals). Holders keeping pace stay balanced and
+  /// duplicate nothing; a slow or silent holder's backlog drains to the others, so completion follows the holders'
+  /// real rates even when one is slow throughout and the p95 has learned its latency as normal.
+  fn schedule(&mut self, now: u64, hedge_after_ns: u64) {
+    for at in 0..self.items.len() {
+      let due = self.items.get(at).is_some_and(|wanted| {
+        !wanted.done
+          && !wanted.asked_of.is_empty()
+          && now.saturating_sub(wanted.last_asked_ns) >= hedge_after_ns
+      });
+      if due && self.ask_next(at, now) {
+        self.fetched.hedges = self.fetched.hedges.saturating_add(1);
+      }
+    }
+    for stealer in 0..self.hosts.len() {
+      while self.live.get(stealer).copied().unwrap_or(false)
+        && self.outstanding.get(stealer).copied().unwrap_or(0)
+          < self.window.get(stealer).copied().unwrap_or(0)
       {
-        fetched.hedges = fetched.hedges.saturating_add(1);
+        let mine = self.outstanding.get(stealer).copied().unwrap_or(0);
+        let victim = (0..self.hosts.len())
+          .filter(|holder| *holder != stealer && self.live.get(*holder).copied().unwrap_or(false))
+          .map(|holder| (self.exclusive_backlog(holder).count(), holder))
+          .filter(|(backlog, _)| *backlog > mine)
+          .max();
+        let Some((_, victim)) = victim else {
+          break;
+        };
+        let Some(deepest) = self.exclusive_backlog(victim).last() else {
+          break;
+        };
+        if !self.ask(deepest, stealer, now) {
+          break;
+        }
+        self.fetched.steals = self.fetched.steals.saturating_add(1);
       }
     }
   }
@@ -3127,6 +3277,39 @@ impl FetchRun {
       self.fetched.sessions.push((*host, endpoint));
     }
     self.running = self.running.saturating_sub(1);
+  }
+
+  /// Whether every wanted item is done.
+  fn all_done(&self) -> bool {
+    self.items.iter().all(|wanted| wanted.done)
+  }
+
+  /// Runs the asked items until all are done, the deadline (measured from `started`) passes, no holder is live, or
+  /// `keep` refused a chunk.
+  /// The receiver is owned across the waits and handed back, so the fetch's future stays `Send`.
+  async fn drive(
+    &mut self,
+    events: Receiver<FetchEvent>,
+    keep: &mut impl FnMut(Chunk) -> bool,
+    (started, timing): (u64, FetchTiming),
+  ) -> Receiver<FetchEvent> {
+    loop {
+      let now = now_ns();
+      while let Ok(event) = events.try_recv() {
+        self.on_event(event, keep, now);
+      }
+      if self.refused || self.all_done() {
+        return events;
+      }
+      if now.saturating_sub(started) >= timing.deadline_ns || !self.live.iter().any(|alive| *alive)
+      {
+        return events;
+      }
+      self.schedule(now, timing.hedge_after_ns);
+      if slates_rt::futures::sleep(timing.poll_ns).await.is_err() {
+        return events;
+      }
+    }
   }
 
   /// Stops every worker and waits for each session back: each worker sees the stop within one poll of its session.
@@ -3149,72 +3332,63 @@ impl FetchRun {
   }
 }
 
-/// Fetches `wanted` — chunks of `object`'s manifest `manifest` — from the recorded `holders` (each over a
-/// connected session), striped and hedged (§4.10 "chunk reads fault to hedged fetches by identity from the
-/// recorded holders, verified on arrival"; failure matrix: "a recorded holder unreachable during fetch: Masked
-/// (another recorded holder, hedged)"). Each chunk is asked first of the holder its identity ranks highest
-/// ([`chunk_rank`]), which spreads a fetch across every holder; a chunk still unanswered after
-/// `timing.hedge_after_ns` is asked of the next-ranked holder too, and the first verified answer wins. A
-/// holder whose session fails, or that answers anything but the chunk asked, is dropped and every chunk it
-/// held unanswered is asked of the next holder at once. `keep` verifies and stages each chunk as it arrives
-/// (AUD-29-55); a refusal by `keep` ends the fetch incomplete. One holder is the degenerate: no hedge, the
-/// same code path (R8). Every session is returned whatever the outcome; a chunk never answered stays wanted,
-/// and the stage keeps what arrived, so the next fetch asks only for the rest.
-pub async fn fetch_chunks(
+/// Fetches `object`'s content `manifest` from its recorded `holders` (each over a connected session) — the manifest,
+/// then the chunks `stage` wants — striped, hedged and tied (§4.10 "fetches the manifest by identity from a recorded
+/// holder … chunk reads fault to hedged fetches by identity from the recorded holders, verified on arrival"; failure
+/// matrix: "a recorded holder unreachable during fetch: Masked (another recorded holder, hedged)").
+///
+/// Every item — the manifest, each chunk — is asked first of the holder its identity ranks highest ([`chunk_rank`]),
+/// which spreads the chunks across every holder. An item still unanswered after `timing.hedge_after_ns` is asked of
+/// the next-ranked holder too (a hedged request), an idle holder takes the item outstanding longest elsewhere (work
+/// stealing), and the first verified answer wins, the other copies cancelled (tied requests; Dean & Barroso, CACM
+/// 2013). A holder whose session fails, or that answers anything but the item asked, is dropped, and every item it
+/// alone held moves on at once. The manifest is verified against its identity and handed to `stage`, which returns
+/// the chunks still wanted (`None` refuses the fetch); `keep` verifies and stages each chunk as it arrives
+/// (AUD-29-55), and its refusal ends the fetch incomplete. One holder is the degenerate: no hedge, no steal, the
+/// same code (R8). Every session is returned whatever the outcome; a chunk never answered stays wanted, and the stage
+/// keeps what arrived, so the next fetch asks only for the rest.
+pub async fn fetch(
   holders: Vec<(HostId, Endpoint)>,
-  binding: (ObjectId, [u8; 32]),
-  wanted: Vec<[u8; 32]>,
+  (object, manifest): (ObjectId, [u8; 32]),
   timing: FetchTiming,
+  stage: impl FnOnce(&Archive) -> Option<Vec<[u8; 32]>>,
   mut keep: impl FnMut(Chunk) -> bool,
 ) -> Fetched {
   let (event_tx, event_rx) = channel::<FetchEvent>();
-  let mut run = FetchRun::start(holders, binding, wanted, timing.poll_ns, &event_tx);
+  let mut run = FetchRun::start(holders, (object, manifest), timing.poll_ns, &event_tx);
   drop(event_tx);
   let started = now_ns();
-  loop {
-    let now = now_ns();
-    while let Ok(event) = event_rx.try_recv() {
-      run.on_event(event, &mut keep, now);
+  run
+    .items
+    .push(Wanted::new(Item::Manifest, &run.hosts, &manifest, started));
+  run.ask_next(0, started);
+  let event_rx = run.drive(event_rx, &mut keep, (started, timing)).await;
+  let wanted = run.manifest.as_ref().map(stage);
+  let event_rx = match wanted {
+    Some(Some(chunks)) => {
+      let now = now_ns();
+      for identity in chunks {
+        let at = run.items.len();
+        run.items.push(Wanted::new(
+          Item::Chunk(identity),
+          &run.hosts,
+          &identity,
+          now,
+        ));
+        run.ask_next(at, now);
+      }
+      // Each holder's window is the share it was first given (its outstanding now), at least one.
+      for (window, outstanding) in run.window.iter_mut().zip(&run.outstanding) {
+        *window = (*outstanding).max(1);
+      }
+      let event_rx = run.drive(event_rx, &mut keep, (started, timing)).await;
+      run.fetched.complete = !run.refused && run.all_done();
+      event_rx
     }
-    if run.refused || run.chunks.iter().all(|chunk| chunk.kept) {
-      run.fetched.complete = !run.refused;
-      break;
-    }
-    if now.saturating_sub(started) >= timing.deadline_ns || !run.live.iter().any(|alive| *alive) {
-      break;
-    }
-    run.hedge(now, timing.hedge_after_ns);
-    if slates_rt::futures::sleep(timing.poll_ns).await.is_err() {
-      break;
-    }
-  }
+    Some(None) | None => event_rx,
+  };
   run.stop(event_rx, timing.poll_ns).await;
   run.fetched
-}
-
-/// Asks `chunk` of its next-ranked live holder not yet tried, at `now`: whether a request went out.
-fn ask_next(
-  chunk: &mut WantedChunk,
-  commands: &[Option<std::sync::mpsc::Sender<FetchCommand>>],
-  live: &[bool],
-  now: u64,
-) -> bool {
-  while let Some(&holder) = chunk.ranked.get(chunk.tried) {
-    chunk.tried = chunk.tried.saturating_add(1);
-    if !live.get(holder).copied().unwrap_or(false) {
-      continue;
-    }
-    if let Some(Some(command)) = commands.get(holder)
-      && command.send(FetchCommand::Chunk(chunk.identity)).is_ok()
-    {
-      if chunk.tried == 1 {
-        chunk.first_asked_ns = now;
-      }
-      chunk.last_asked_ns = now;
-      return true;
-    }
-  }
-  false
 }
 
 /// A real shard memory for the hold's tests: an arena over an anonymous mapping of whole pages, a byte budget

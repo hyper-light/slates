@@ -1933,3 +1933,37 @@ timing), beside `native.sh` on the same kernel. Load average 4.6–5.7. One run 
   (`lsloop.py`: 8,000 files, then 300 rounds of create-one-and-list, 8,300 entries per listing) measures slates'
   listing p50 7.76 → 3.6–3.9 ms (p99 4.3–4.5 ms) against knfsd's 1.95–4.6 ms (p99 2.2–24 ms, one noisy run).
   The remaining gap is the v4 page passing through a v3 reply's encoding and decoding (owed, GAPS).
+
+### Remote pulls under delay, loss, a slow or silent holder, and many readers (condition 7; 2026-10-05)
+
+Command: `cargo run --release -p slates-cluster --example fetch_bench` (the A-91 fetch; Apple M5 Max; simulated
+network, virtual clock, so the numbers are deterministic and independent of the host's load). Readers fetch a 4 MiB
+archive in 64 KiB chunks from its recorded holders over real endpoints (TLS 1.3, packet protection, the session
+plane's congestion controller). Each holder sends through its own uplink, shared by every reader it serves, with a
+queue of one bandwidth-delay product; each session's receive ceiling is twice its path's BDP. A warm-up fetch sets
+the hedge at its chunks' p95, then the timed fetches start together. Completion includes the manifest's round trip.
+Every reader's archive was rebuilt byte for byte.
+
+| scenario | holders | readers | RTT | uplink | completion (min / median / max) | goodput / capacity | hedges | steals |
+|---|---|---|---|---|---|---|---|---|
+| lan | 1 | 1 | 1 ms | 1 Gbit/s | 38.9 ms | 863 / 1,000 Mbit/s | 0 | 0 |
+| lan | 3 | 1 | 1 ms | 1 Gbit/s | 24.4 ms | 1,375 / 3,000 | 42 | 4 |
+| wan | 1 | 1 | 80 ms | 100 Mbit/s | 653 ms | 51 / 100 | 0 | 0 |
+| wan | 3 | 1 | 80 ms | 100 Mbit/s | 456 ms | 74 / 300 | 0 | 21 |
+| wan, 1% loss | 1 | 1 | 80 ms | 100 Mbit/s | 717 ms | 47 / 100 | 0 | 0 |
+| wan, 1% loss | 3 | 1 | 80 ms | 100 Mbit/s | 623 ms | 54 / 300 | 0 | 19 |
+| wan, 5% loss | 3 | 1 | 80 ms | 100 Mbit/s | 690 ms | 49 / 300 | 0 | 13 |
+| wan, one holder at 1/20 rate | 3 | 1 | 80 ms | 100 Mbit/s | 943 ms | 36 / 205 | 0 | 26 |
+| wan, one holder silent | 3 | 1 | 80 ms | 100 Mbit/s | 981 ms | 34 / 300 | 0 | 26 |
+| wan, 8 readers | 3 | 8 | 80 ms | 100 Mbit/s | 1,055 / 1,660 / 1,717 ms | 156 / 300 | 0 | 202 |
+| wan, 8 readers, 1% loss | 3 | 8 | 80 ms | 100 Mbit/s | 1,406 / 1,506 / 1,751 ms | 153 / 300 | 0 | 202 |
+
+- Before A-91 a fetch asked one holder: a silent one cost the takeover's whole period (the scenario cannot
+  complete), and the first striped version without stealing took 2,177 ms with a holder at 1/20 rate (the p95 had
+  learned the slow holder's latency as normal, so no hedge fired in time).
+- **Measured and rejected:** a pulled per-holder window starting at two chunks and growing by one per answer (one
+  holder at 80 ms: 1,118 ms against 653 ms; a second slow start on top of the transport's); that window sized from
+  the reader's congestion window (12 s: the reader's window governs its requests, not the replies).
+- Loss costs 10–50% at 80 ms. A 4 MiB object at 80 ms is dominated by the manifest's round trip and slow start, so
+  goodput against capacity is low for one reader and rises with eight (52%); larger objects are owed in the grid.
+

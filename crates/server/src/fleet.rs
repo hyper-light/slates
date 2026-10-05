@@ -75,8 +75,7 @@ use rustls::pki_types::CertificateDer;
 use slates_archive::Archive;
 use slates_cluster::config_group::ReportOutcome;
 use slates_cluster::content::{
-  CONTENT_CHUNK_STREAM, CONTENT_OFFER_STREAM, ContentMessage, fetch_chunks, fetch_manifest,
-  is_content_stream, put_content,
+  CONTENT_CHUNK_STREAM, CONTENT_OFFER_STREAM, ContentMessage, fetch, is_content_stream, put_content,
 };
 use slates_cluster::fleet::apply_peer_state;
 use slates_cluster::membership::{Liveness, MemberState};
@@ -2633,6 +2632,9 @@ async fn materialize_pending(origin: u16, budget: CommitBudget) {
 /// Counter: chunk requests a takeover fetch hedged to a further recorded holder (A-91).
 /// Format: a counter name in the daemon's status report.
 const FETCH_HEDGED: &str = "fleet.fetch.hedged";
+/// Counter: requests an idle recorded holder took from another's outstanding work in a takeover fetch (A-91).
+/// Format: a counter name in the daemon's status report.
+const FETCH_STOLEN: &str = "fleet.fetch.stolen";
 /// Counter: recorded holders a takeover fetch dropped (session lost or a false answer), their chunks moved on (A-91).
 /// Format: a counter name in the daemon's status report.
 const FETCH_HOLDER_FAILED: &str = "fleet.fetch.holder_failed";
@@ -2650,43 +2652,12 @@ async fn fetch_into_hold(
   budget: CommitBudget,
 ) -> bool {
   let holders = head.holders();
-  // Every reachable recorded holder: the manifest from one, the chunks striped and hedged across all of them
+  // Every reachable recorded holder: the manifest and the chunks are ranked, hedged and tied across all of them
   // (A-91; §4.10 "hedged fetches by identity from the recorded holders"), so one slow or lost holder is masked.
-  let mut sessions = take_sessions(|host| holders.contains(&host));
-  let Some((host, endpoint)) = sessions.pop() else {
-    return_sessions(sessions);
+  let sessions = take_sessions(|host| holders.contains(&host));
+  if sessions.is_empty() {
     return false; // No recorded holder reachable this period.
-  };
-  let (fetched, endpoint) =
-    fetch_manifest(endpoint, object, manifest, budget.max_deadline_ns()).await;
-  sessions.push((host, endpoint));
-  let Some(fetched) = fetched else {
-    return_sessions(sessions);
-    return false;
-  };
-  let staged = state::with_state(|s| {
-    let placed = slates_cluster::content::Placed {
-      sequence: s.placed_heads.get(&object).map_or(0, |head| head.sequence),
-    };
-    s.held_content.stage_fetched(
-      &mut crate::content_holder::hold_space(&mut s.store),
-      object,
-      placed,
-      &fetched,
-    )
-  });
-  let wanted = match staged {
-    Some(Ok(None)) => {
-      return_sessions(sessions);
-      return true;
-    }
-    Some(Ok(Some(wanted))) => wanted,
-    Some(Err(_)) | None => {
-      return_sessions(sessions);
-      count_refusal(MATERIALIZE_REFUSED);
-      return false;
-    }
-  };
+  }
   let hedge_after_ns =
     state::with_state(|s| hedge_delay_ns(&s.fetch_latency)).unwrap_or(HEARTBEAT_NS);
   let timing = slates_cluster::content::FetchTiming {
@@ -2694,32 +2665,75 @@ async fn fetch_into_hold(
     hedge_after_ns,
     poll_ns: budget.poll_interval_ns,
   };
-  let fetched = fetch_chunks(sessions, (object, manifest), wanted, timing, |chunk| {
-    state::with_state(|s| {
-      s.held_content
-        .stage_piece(
+  let (mut already_whole, mut stage_refused) = (false, false);
+  let fetched = fetch(
+    sessions,
+    (object, manifest),
+    timing,
+    |found| {
+      let staged = state::with_state(|s| {
+        let placed = slates_cluster::content::Placed {
+          sequence: s.placed_heads.get(&object).map_or(0, |head| head.sequence),
+        };
+        s.held_content.stage_fetched(
           &mut crate::content_holder::hold_space(&mut s.store),
           object,
-          &manifest,
-          chunk,
+          placed,
+          found,
         )
-        .is_ok()
-    })
-    .unwrap_or(false)
-  })
+      });
+      match staged {
+        Some(Ok(None)) => {
+          already_whole = true;
+          Some(Vec::new())
+        }
+        Some(Ok(Some(wanted))) => Some(wanted),
+        Some(Err(_)) | None => {
+          stage_refused = true;
+          None
+        }
+      }
+    },
+    |chunk| {
+      state::with_state(|s| {
+        s.held_content
+          .stage_piece(
+            &mut crate::content_holder::hold_space(&mut s.store),
+            object,
+            &manifest,
+            chunk,
+          )
+          .is_ok()
+      })
+      .unwrap_or(false)
+    },
+  )
   .await;
   return_sessions(fetched.sessions);
   state::with_state(|s| {
     for latency in &fetched.latencies_ns {
       s.fetch_latency.record(*latency);
     }
-    if fetched.hedges > 0 {
-      *s.refusals.entry(FETCH_HEDGED).or_insert(0) += fetched.hedges;
-    }
-    if fetched.failed_holders > 0 {
-      *s.refusals.entry(FETCH_HOLDER_FAILED).or_insert(0) += fetched.failed_holders;
+    for (name, count) in [
+      (FETCH_HEDGED, fetched.hedges),
+      (FETCH_STOLEN, fetched.steals),
+      (FETCH_HOLDER_FAILED, fetched.failed_holders),
+    ] {
+      if count > 0 {
+        *s.refusals.entry(name).or_insert(0) += count;
+      }
     }
   });
+  if stage_refused {
+    count_refusal(MATERIALIZE_REFUSED);
+    return false;
+  }
+  if already_whole {
+    return true;
+  }
+  if !fetched.complete {
+    return false; // Not whole yet: what was fetched stays staged for the next period (AUD-29-55).
+  }
   state::with_state(|s| {
     s.held_content
       .complete_stage(&mut crate::content_holder::hold_space(&mut s.store), object)

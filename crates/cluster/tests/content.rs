@@ -588,7 +588,7 @@ struct FetchObservation {
 /// exactly one wanted on resumption, and the archive rebuilt byte for byte from the stage.
 #[test]
 fn a_cut_fetch_resumes_over_a_session_with_exactly_the_chunks_still_owed() {
-  use slates_cluster::content::{FetchTiming, Placed, fetch_chunks, fetch_manifest};
+  use slates_cluster::content::{FetchTiming, Placed, fetch};
   let mut simulation = SimRuntime::new(&config(), 1).unwrap();
   let shard = simulation.shard_ids()[0];
   let (owner_identity, holder_identity) = (identity(), identity());
@@ -638,80 +638,52 @@ fn a_cut_fetch_resumes_over_a_session_with_exactly_the_chunks_still_owed() {
       let archive = two_chunk_archive();
       let (object, identity) = (ObjectId::new(OWNER, 1), archive.manifest_identity());
       let deadline = COLLECTION_NS * 4;
-      let mut reader = ContentHold::new();
-      let mut room = Room::new();
-      let (manifest, endpoint) = fetch_manifest(endpoint, object, identity, deadline).await;
-      let manifest = manifest.expect("the holder serves the manifest");
-      let stage = |reader: &mut ContentHold, room: &mut Room| {
-        let mut space = HoldSpace {
-          arena: &mut room.arena,
-          budget: &mut room.budget,
-          metadata: &mut room.metadata,
-        };
-        reader
-          .stage_fetched(&mut space, object, Placed::default(), &manifest)
-          .unwrap()
-          .unwrap_or_default()
-      };
-      let first_wanted = stage(&mut reader, &mut room);
-      let mut kept = 0;
+      let reader = Reader::kept(Room::new());
       let timing = FetchTiming {
         deadline_ns: deadline,
         hedge_after_ns: deadline,
         poll_ns: config().timer_tick_ns,
       };
-      let first = fetch_chunks(
+      let mut first_wanted = 0;
+      let mut kept = 0;
+      let first = fetch(
         vec![(HOLDER, endpoint)],
         (object, identity),
-        first_wanted.clone(),
         timing,
+        |manifest| {
+          let wanted = Reader::stage(reader, object, manifest);
+          first_wanted = wanted.len();
+          Some(wanted)
+        },
         |chunk| {
           if kept > 0 {
             return false; // the cut: the second chunk is never kept
           }
           kept += 1;
-          let mut space = HoldSpace {
-            arena: &mut room.arena,
-            budget: &mut room.budget,
-            metadata: &mut room.metadata,
-          };
-          reader
-            .stage_piece(&mut space, object, &identity, chunk)
-            .is_ok()
+          Reader::keep(reader, object, &identity, chunk)
         },
       )
       .await;
       let first_complete = first.complete;
-      let resumed_wanted = stage(&mut reader, &mut room);
-      let _resumed = fetch_chunks(
+      let mut resumed_wanted = 0;
+      let _resumed = fetch(
         first.sessions,
         (object, identity),
-        resumed_wanted.clone(),
         timing,
-        |chunk| {
-          let mut space = HoldSpace {
-            arena: &mut room.arena,
-            budget: &mut room.budget,
-            metadata: &mut room.metadata,
-          };
-          reader
-            .stage_piece(&mut space, object, &identity, chunk)
-            .is_ok()
+        |manifest| {
+          let wanted = Reader::stage(reader, object, manifest);
+          resumed_wanted = wanted.len();
+          Some(wanted)
         },
+        |chunk| Reader::keep(reader, object, &identity, chunk),
       )
       .await;
-      let mut space = HoldSpace {
-        arena: &mut room.arena,
-        budget: &mut room.budget,
-        metadata: &mut room.metadata,
-      };
-      let rebuilt = reader.complete_stage(&mut space, object).is_ok()
-        && reader.archive_of(&room.arena, object, &identity) == Some(archive);
+      let rebuilt = Reader::rebuilt(reader, object, &identity) == Some(archive);
       observed_tx
         .send(FetchObservation {
-          first_wanted: first_wanted.len(),
+          first_wanted,
           first_complete,
-          resumed_wanted: resumed_wanted.len(),
+          resumed_wanted,
           rebuilt,
         })
         .unwrap();
@@ -773,6 +745,7 @@ struct StripedObservation {
   complete: bool,
   rebuilt: bool,
   hedges: u64,
+  steals: u64,
   sessions_back: usize,
 }
 
@@ -829,8 +802,8 @@ fn spawn_fetch_holder(
 }
 
 /// Fetches the striped archive from a serving holder and a silent one, hedging after `hedge_after_ns`.
-fn run_striped_fetch(hedge_after_ns: u64) -> StripedObservation {
-  use slates_cluster::content::{FetchTiming, Placed, fetch_chunks, fetch_manifest};
+fn run_striped_fetch(hedge_after_ns: u64, swapped: bool) -> StripedObservation {
+  use slates_cluster::content::{FetchTiming, fetch};
   let mut simulation = SimRuntime::new(&config(), 1).unwrap();
   let shard = simulation.shard_ids()[0];
   let (reader_identity, serving_identity, silent_identity) = (identity(), identity(), identity());
@@ -877,56 +850,27 @@ fn run_striped_fetch(hedge_after_ns: u64) -> StripedObservation {
       let archive = striped_archive();
       let (object, identity) = (ObjectId::new(OWNER, 1), archive.manifest_identity());
       let deadline = COLLECTION_NS * 4;
-      let (manifest, serving) = fetch_manifest(serving, object, identity, deadline).await;
-      let manifest = manifest.expect("the serving holder has the manifest");
-      let mut reader = ContentHold::new();
-      let mut room = Room::with_blocks(STRIPED_BLOCKS);
-      let wanted = {
-        let mut space = HoldSpace {
-          arena: &mut room.arena,
-          budget: &mut room.budget,
-          metadata: &mut room.metadata,
-        };
-        reader
-          .stage_fetched(&mut space, object, Placed::default(), &manifest)
-          .unwrap()
-          .unwrap_or_default()
-      };
+      let reader = Reader::kept(Room::with_blocks(STRIPED_BLOCKS));
       let timing = FetchTiming {
         deadline_ns: deadline,
         hedge_after_ns,
         poll_ns: config().timer_tick_ns,
       };
-      let fetched = fetch_chunks(
-        vec![(HOLDER, serving), (SILENT, silent)],
+      let fetched = fetch(
+        holders(serving, silent, swapped),
         (object, identity),
-        wanted,
         timing,
-        |chunk| {
-          let mut space = HoldSpace {
-            arena: &mut room.arena,
-            budget: &mut room.budget,
-            metadata: &mut room.metadata,
-          };
-          reader
-            .stage_piece(&mut space, object, &identity, chunk)
-            .is_ok()
-        },
+        |manifest| Some(Reader::stage(reader, object, manifest)),
+        |chunk| Reader::keep(reader, object, &identity, chunk),
       )
       .await;
-      let mut space = HoldSpace {
-        arena: &mut room.arena,
-        budget: &mut room.budget,
-        metadata: &mut room.metadata,
-      };
-      let rebuilt = fetched.complete
-        && reader.complete_stage(&mut space, object).is_ok()
-        && reader.archive_of(&room.arena, object, &identity) == Some(archive);
+      let rebuilt = fetched.complete && Reader::rebuilt(reader, object, &identity) == Some(archive);
       observed_tx
         .send(StripedObservation {
           complete: fetched.complete,
           rebuilt,
           hedges: fetched.hedges,
+          steals: fetched.steals,
           sessions_back: fetched.sessions.len(),
         })
         .unwrap();
@@ -937,33 +881,121 @@ fn run_striped_fetch(hedge_after_ns: u64) -> StripedObservation {
 }
 
 /// A-91 (§4.10 failure matrix: "a recorded holder unreachable during fetch: Masked (another recorded holder,
-/// hedged)"): a reader fetches an eight-chunk archive from two recorded holders, one of which went silent after
-/// its session formed. Do: fetch with the hedge at a quarter of the deadline, and again with the hedge off. Expect
-/// the hedged fetch complete, the archive rebuilt byte for byte, at least one hedge sent, and both sessions back;
-/// and the unhedged fetch incomplete at its deadline — the silent holder was asked first for some chunks, so the
-/// hedge is what masked it (until A-91 a fetch asked one holder, and a silent one cost the whole period).
+/// hedged)"): a reader fetches an eight-chunk archive from two recorded holders, one of which went silent after its
+/// session formed. Do: fetch with the hedge at a quarter of the deadline, under both assignments of the two host ids
+/// (so in one of them the manifest, too, ranks first on the silent holder). Expect each fetch complete, the archive
+/// rebuilt byte for byte, both sessions back, and the silent holder's work taken by the other holder — by a hedge
+/// (the manifest, or a chunk past the hedge delay) or by work stealing (a chunk in the silent holder's backlog). The
+/// counters are the non-vacuity check: had the silent holder been asked first for nothing, neither would move (until
+/// A-91 a fetch asked one holder, and a silent one cost the whole period).
 #[test]
 fn a_silent_recorded_holder_is_masked_by_hedging_to_the_other() {
-  let hedged = run_striped_fetch(COLLECTION_NS);
-  assert!(
-    hedged.complete && hedged.rebuilt,
-    "the hedged fetch completes: {hedged:?}"
-  );
-  assert!(
-    hedged.hedges > 0,
-    "the silent holder's chunks were hedged: {hedged:?}"
-  );
-  assert_eq!(
-    hedged.sessions_back, 2,
-    "both sessions come back: {hedged:?}"
-  );
-  let unhedged = run_striped_fetch(u64::MAX);
-  assert!(
-    !unhedged.complete,
-    "without the hedge the silent holder's chunks never arrive: {unhedged:?}"
-  );
-  assert_eq!(
-    unhedged.sessions_back, 2,
-    "both sessions come back: {unhedged:?}"
-  );
+  for swapped in [false, true] {
+    let hedged = run_striped_fetch(COLLECTION_NS, swapped);
+    assert!(
+      hedged.complete && hedged.rebuilt,
+      "the fetch completes ({swapped}): {hedged:?}"
+    );
+    assert!(
+      hedged.hedges + hedged.steals > 0,
+      "the silent holder's work was taken by the other ({swapped}): {hedged:?}"
+    );
+    assert_eq!(
+      hedged.sessions_back, 2,
+      "both sessions come back ({swapped}): {hedged:?}"
+    );
+  }
+}
+
+/// A reader's content hold and its room, kept on the shard so a fetch's stage and keep reach it in turn (as the
+/// daemon's fetch reaches its shard state).
+struct Reader {
+  hold: ContentHold,
+  room: Room,
+}
+
+/// The kept reader of a test.
+type KeptReader = slates_rt::shard::Kept<std::cell::RefCell<Reader>>;
+
+impl Reader {
+  /// A reader over `room`, kept on the running shard.
+  fn kept(room: Room) -> KeptReader {
+    let reader = std::cell::RefCell::new(Reader {
+      hold: ContentHold::new(),
+      room,
+    });
+    slates_rt::registry::with_current(|context| context.keep(reader))
+      .unwrap()
+      .unwrap()
+  }
+
+  /// Lends the reader's hold and its space to `f`.
+  fn with<R>(reader: KeptReader, f: impl FnOnce(&mut ContentHold, &mut HoldSpace<'_>) -> R) -> R {
+    reader
+      .with(|cell| {
+        let mut borrowed = cell.borrow_mut();
+        let Reader { hold, room } = &mut *borrowed;
+        let mut space = HoldSpace {
+          arena: &mut room.arena,
+          budget: &mut room.budget,
+          metadata: &mut room.metadata,
+        };
+        f(hold, &mut space)
+      })
+      .unwrap()
+  }
+
+  /// Stages the fetched `manifest`: the chunks still wanted.
+  fn stage(reader: KeptReader, object: ObjectId, manifest: &Archive) -> Vec<[u8; 32]> {
+    Reader::with(reader, |hold, space| {
+      hold
+        .stage_fetched(
+          space,
+          object,
+          slates_cluster::content::Placed::default(),
+          manifest,
+        )
+        .unwrap()
+        .unwrap_or_default()
+    })
+  }
+
+  /// Verifies and stages one fetched chunk.
+  fn keep(
+    reader: KeptReader,
+    object: ObjectId,
+    identity: &[u8; 32],
+    chunk: slates_archive::format::Chunk,
+  ) -> bool {
+    Reader::with(reader, |hold, space| {
+      hold.stage_piece(space, object, identity, chunk).is_ok()
+    })
+  }
+
+  /// Completes the stage and reads the archive back, if whole.
+  fn rebuilt(reader: KeptReader, object: ObjectId, identity: &[u8; 32]) -> Option<Archive> {
+    reader
+      .with(|cell| {
+        let mut borrowed = cell.borrow_mut();
+        let Reader { hold, room } = &mut *borrowed;
+        let mut space = HoldSpace {
+          arena: &mut room.arena,
+          budget: &mut room.budget,
+          metadata: &mut room.metadata,
+        };
+        hold.complete_stage(&mut space, object).ok()?;
+        hold.archive_of(&room.arena, object, identity)
+      })
+      .unwrap()
+  }
+}
+
+/// The striped fetch's two recorded holders, the serving one first; `swapped` trades their host ids, which trades
+/// every item's rank between them (the manifest's included).
+fn holders(serving: Endpoint, silent: Endpoint, swapped: bool) -> Vec<(HostId, Endpoint)> {
+  if swapped {
+    vec![(SILENT, serving), (HOLDER, silent)]
+  } else {
+    vec![(HOLDER, serving), (SILENT, silent)]
+  }
 }
