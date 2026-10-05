@@ -17,6 +17,9 @@ ID=$(awk '/^id/{print $2}' /out/create.txt)
 slates --instance hot export "$ID" > /out/export.txt 2>&1
 PORT=$(awk '/^port:/{print $2}' /out/export.txt); EXPORT=$(awk '/^export:/{print $2}' /out/export.txt)
 mkdir -p /mnt/slates /mnt/ram
+# Unmount on every exit path while the daemon still runs: a hard mount whose server is this container's own
+# exiting daemon wedges the container's teardown forever (nfs4_proc_destroy_session under do_exit).
+trap "umount -f -l /mnt/slates 2>/dev/null" EXIT
 mount -t nfs -o "vers=4.2,proto=tcp,port=$PORT,hard,timeo=600" "127.0.0.1:$EXPORT" /mnt/slates || { echo "mount failed"; exit 1; }
 mount -t tmpfs tmpfs /mnt/ram
 echo "== slates NFSv4.2 (loopback)"

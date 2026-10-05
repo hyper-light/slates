@@ -2387,8 +2387,17 @@ impl<'b> Export<'b> {
     }
     // The cookie is the last entry's own (`.` 1, `..` 2, a child its name's hash cookie): the shared readdir
     // resumes after it with one descent, at most as many entries as the smallest could fill the client's
-    // budget with, plus one so the page's end shows (AUD-29-86).
-    let smallest = READDIR_ENTRY_FIXED.saturating_add(xdr_str_len(SHORTEST_NAME));
+    // budget with, plus one so the page's end shows (AUD-29-86). A plus entry's smallest carries its attributes
+    // and an empty handle's length too; sized as a plain entry, a plus page enumerated about four times the rows
+    // that could fit (A-90).
+    let plain_smallest = READDIR_ENTRY_FIXED.saturating_add(xdr_str_len(SHORTEST_NAME));
+    let smallest = if plus {
+      plain_smallest
+        .saturating_add(PLUS_ENTRY_FIXED)
+        .saturating_add(xdr_len(0))
+    } else {
+      plain_smallest
+    };
     let limit = (budget / smallest.max(1)).saturating_add(1);
     let rows = self
       .bridge

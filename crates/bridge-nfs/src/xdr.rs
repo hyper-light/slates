@@ -66,6 +66,35 @@ impl XdrWriter {
     self.fixed(bytes);
   }
 
+  /// An empty writer with room for `bytes` before it grows (a reply whose budget the caller knows).
+  pub fn with_capacity(bytes: usize) -> XdrWriter {
+    XdrWriter {
+      out: Vec::with_capacity(bytes),
+    }
+  }
+
+  /// Forgets everything written, keeping the buffer for reuse.
+  pub fn clear(&mut self) {
+    self.out.clear();
+  }
+
+  /// Writes a variable-length opaque whose bytes `build` writes in place: the length is written first as a
+  /// placeholder and filled in afterwards, then the padding, so the value is never built in a buffer of its own
+  /// and copied.
+  pub fn opaque_built(&mut self, build: impl FnOnce(&mut XdrWriter)) {
+    let at = self.out.len();
+    self.u32(0);
+    build(self);
+    let len = self
+      .out
+      .len()
+      .saturating_sub(at.saturating_add(size_of::<u32>()));
+    self.out.extend(std::iter::repeat_n(0u8, padding(len)));
+    if let Some(slot) = self.out.get_mut(at..at.saturating_add(size_of::<u32>())) {
+      slot.copy_from_slice(&u32::try_from(len).unwrap_or(u32::MAX).to_be_bytes());
+    }
+  }
+
   /// Writes fixed-length bytes (the length is fixed by the type, not sent) followed by padding.
   pub fn fixed(&mut self, bytes: &[u8]) {
     self.out.extend_from_slice(bytes);

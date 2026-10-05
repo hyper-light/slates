@@ -3635,9 +3635,9 @@ shard's own clock that A-65 budgets in (docs/bugs/2026-10-04-the-slow-observatio
 - **Owed:**
   - a write delegation's space reservation, which takes the WRITE off a create's close path (measured natively:
     30 µs of a 0.21 ms create);
-  - readdir of an 8,000-entry directory: p99 6.7–7.9 ms against tmpfs's 0.9 ms (native, one writer). Measured: 80
-    listings sent 9 READDIRs (mean 0.556 ms each); the client answers the rest from its cache, and the tail is a
-    refetch of the whole directory after it changed. The server's share per entry looks small. A side-by-side
-    with Linux's own nfsd over tmpfs is owed before calling the rest the client's;
+  - readdir: measured against Linux's own nfsd over tmpfs (BENCHMARKS), slates' pages were a quarter full and its
+    encoding rebuilt the supported set per entry (A-90, fixed: an 8,300-entry listing 7.76 → 3.6–3.9 ms p50). It is
+    still about 1.9× knfsd's 1.95 ms on a quiet run: a v4 page is built by encoding and decoding a v3 READDIRPLUS
+    reply. Owed: a v4 listing served from the volume's rows directly, routed as the v3 call is;
   - the same storm on a k8s node;
   - a remote (fleet) read under contention, for condition 7's tail.

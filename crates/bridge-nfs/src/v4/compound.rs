@@ -265,6 +265,17 @@ const COOKIE_SHIFT: u64 = 2;
 /// Format: the size of one READDIR entry's fixed fields (value-follows, cookie, name length, the
 /// attribute bitmap's length and the attribute list's length), the least an entry costs.
 const ENTRY_FIXED: u32 = 4 + 8 + 4 + 4 + 4;
+/// Shape: the bytes a listed entry typically encodes to (a short name and a few attributes), sizing a page's buffer
+/// up front; a page of larger entries grows it, and the reply's `maxcount` caps it.
+const ENTRY_TYPICAL: usize = 64;
+/// Format: the most a v3 READDIRPLUS `entryplus3` encodes beyond the v4 `entry4` built from it, their names (encoded
+/// alike) aside: the v3 entry's fixed fields (value-follows 4, `fileid` 8, `cookie` 8, the name's length 4), its
+/// attributes (present 4, `fattr3` 84) and its handle (present 4, length 4, at most `NFS3_FHSIZE` 64 bytes), less the
+/// v4 entry's [`ENTRY_FIXED`].
+const V3_ENTRY_EXCESS: u32 = (4 + 8 + 8 + 4) + (4 + 84) + (4 + 4 + 64) - ENTRY_FIXED;
+/// Format: a v3 READDIRPLUS reply's fields beside its entries: the status 4, the directory's `post_op_attr` (4 + 84),
+/// the cookie verifier 8, and the end-of-list and `eof` booleans (4 + 4).
+const V3_REPLY_OVERHEAD: u32 = 4 + (4 + 84) + 8 + 4 + 4;
 /// Format: `settime4` `SET_TO_CLIENT_TIME4`.
 const SET_TO_CLIENT_TIME4: u32 = 1;
 
@@ -1113,7 +1124,7 @@ async fn verify<B: Backend>(
   if requested.has(attr::number::RDATTR_ERROR) {
     return Err(Nfsstat4::Inval);
   }
-  if requested.intersect(&attr::supported(frame.minor)) != requested {
+  if requested.intersect(attr::supported(frame.minor)) != requested {
     return Err(Nfsstat4::Attrnotsupp);
   }
   let fh = current(frame)?.clone();
@@ -1751,21 +1762,46 @@ async fn readdir<B: Backend>(
   }
   let dir = current(frame)?.clone();
   let v3_cookie = cookie.saturating_sub(COOKIE_SHIFT);
+  // The page is built from a v3 READDIRPLUS, whose entries are larger than the v4 entries a client lists with
+  // (a whole `fattr3` and a handle each). Its budget is the client's plus the most every entry the page could
+  // hold exceeds its v4 form, so the v3 budget never ends the page before `maxcount` does (A-90: under the bare
+  // `maxcount` a page of `ls` entries was a quarter full, and a listing took four times the round trips).
+  // At most as many entries as the smallest this request can encode to fill `maxcount` with: value-follows, the
+  // cookie, the shortest name, and the requested attributes of a minimal object (A-90: counted at `ENTRY_FIXED` alone,
+  // the v3 page fetched, stated and encoded twice the entries an `ls` page carries).
+  let entry_floor = (size_of::<u32>() + size_of::<u64>() + 2 * size_of::<u32>())
+    .saturating_add(attr::encoded_floor((&requested, frame.minor)))
+    .max(usize::try_from(ENTRY_FIXED).unwrap_or(usize::MAX));
+  let fit = u32::try_from(usize::try_from(maxcount).unwrap_or(usize::MAX) / entry_floor.max(1))
+    .unwrap_or(u32::MAX);
+  let v3_maxcount = maxcount
+    .saturating_add(fit.saturating_mul(V3_ENTRY_EXCESS))
+    .saturating_add(V3_REPLY_OVERHEAD);
   let result = backend
     .call_v3(
       NFSPROC3_READDIRPLUS,
-      v3call::readdirplus_args(&dir, v3_cookie, verf, dircount.max(maxcount), maxcount),
+      v3call::readdirplus_args(
+        &dir,
+        v3_cookie,
+        verf,
+        dircount.max(v3_maxcount),
+        v3_maxcount,
+      ),
     )
     .await;
-  let max_entries = usize::try_from(maxcount / ENTRY_FIXED).unwrap_or(0).max(1);
+  let max_entries = usize::try_from(fit).unwrap_or(0).max(1);
   let listing = v3(v3call::readdirplus(&result, max_entries.saturating_mul(2)))?;
   // The filesystem-wide figures, once per filesystem the entries are on: a volume root listed in the
   // pseudo-root is on its own volume, not the root's.
   let mut figures_by_fsid: Vec<(u64, FsFigures)> = Vec::new();
-  let mut entries = XdrWriter::new();
+  let budget = usize::try_from(maxcount).unwrap_or(usize::MAX);
+  // The page is built in one buffer sized to the reply it may become, and each entry in one reused buffer (A-90: a
+  // writer per entry and a growing page were a fifth of a page's time).
+  let mut entries =
+    XdrWriter::with_capacity(budget.min(listing.entries.len().saturating_mul(ENTRY_TYPICAL)));
+  let mut one = XdrWriter::new();
   let mut returned = 0usize;
   let mut all = true;
-  let budget = usize::try_from(maxcount).unwrap_or(usize::MAX);
   for entry in &listing.entries {
     if entry.name == "." || entry.name == ".." {
       continue;
@@ -1779,7 +1815,7 @@ async fn readdir<B: Backend>(
         figures
       }
     };
-    let mut one = XdrWriter::new();
+    one.clear();
     one.bool(true);
     one.u64(entry.cookie.saturating_add(COOKIE_SHIFT));
     one.opaque(entry.name.as_bytes());

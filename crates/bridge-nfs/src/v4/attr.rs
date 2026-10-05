@@ -155,7 +155,20 @@ pub struct FsFigures {
 
 /// The attributes this server supports in a compound of minor version `minor`: every number in
 /// [`number`], less NFSv4.2's in an NFSv4.1 compound (an attribute its version does not define).
-pub fn supported(minor: u32) -> Bitmap {
+pub fn supported(minor: u32) -> &'static Bitmap {
+  /// The set for minor versions through 1, and for the highest: built once per process, as every listed entry's
+  /// encoding asks for it (A-90: rebuilt per call, it was 15% of a READDIR page's time).
+  static THROUGH_ONE: std::sync::OnceLock<Bitmap> = std::sync::OnceLock::new();
+  static HIGHEST: std::sync::OnceLock<Bitmap> = std::sync::OnceLock::new();
+  if minor >= super::MINOR_HIGHEST {
+    HIGHEST.get_or_init(|| supported_set(minor))
+  } else {
+    THROUGH_ONE.get_or_init(|| supported_set(minor))
+  }
+}
+
+/// The attributes this server supports at `minor`, built (see [`supported`]).
+fn supported_set(minor: u32) -> Bitmap {
   use number::*;
   let all = [
     SUPPORTED_ATTRS,
@@ -252,8 +265,11 @@ pub fn exclusive_create_settable() -> Bitmap {
 /// Refuses a read of `requested` that names an attribute that can be set and never read:
 /// `NFS4ERR_INVAL` (§5.6).
 pub fn check_readable(requested: &Bitmap) -> Result<(), Nfsstat4> {
-  let write_only = Bitmap::of(&[number::TIME_ACCESS_SET, number::TIME_MODIFY_SET]);
-  if requested.intersect(&write_only).is_empty() {
+  /// Built once per process (see [`supported`]).
+  static WRITE_ONLY: std::sync::OnceLock<Bitmap> = std::sync::OnceLock::new();
+  let write_only =
+    WRITE_ONLY.get_or_init(|| Bitmap::of(&[number::TIME_ACCESS_SET, number::TIME_MODIFY_SET]));
+  if requested.intersect(write_only).is_empty() {
     Ok(())
   } else {
     Err(Nfsstat4::Inval)
@@ -273,16 +289,29 @@ pub fn encode(
   fs: &FsFigures,
   writer: &mut XdrWriter,
 ) -> Result<(), Nfsstat4> {
-  use number::*;
   check_readable(requested)?;
   // The change counter and the full-range times ride after the `fattr3` fields in the front end's
   // dialect; attributes without them are a server fault, never a guess from the 32-bit `fattr3`.
   let v4 = attrs.v4.ok_or(Nfsstat4::Serverfault)?;
-  let returned = requested.intersect(&supported(minor));
-  let mut values = XdrWriter::new();
+  let returned = requested.intersect(supported(minor));
+  returned.encode(writer);
+  writer.opaque_built(|values| encode_values(&returned, minor, (attrs, &v4), handle, fs, values));
+  Ok(())
+}
+
+/// The values of the `returned` attributes, in bit order (the body of [`encode`]'s `fattr4` opaque).
+fn encode_values(
+  returned: &Bitmap,
+  minor: u32,
+  (attrs, v4): (&Fattr3, &crate::nfs::V4Attrs),
+  handle: &Nfsfh3,
+  fs: &FsFigures,
+  values: &mut XdrWriter,
+) {
+  use number::*;
   for bit in returned.bits() {
     match bit {
-      SUPPORTED_ATTRS => supported(minor).encode(&mut values),
+      SUPPORTED_ATTRS => supported(minor).encode(values),
       TYPE => values.u32(ftype4_of(attrs.kind)),
       FH_EXPIRE_TYPE => values.u32(FH4_PERSISTENT),
       CHANGE => values.u64(v4.change),
@@ -319,17 +348,53 @@ pub fn encode(
       SPACE_FREE => values.u64(fs.space.1),
       SPACE_TOTAL => values.u64(fs.space.2),
       SPACE_USED => values.u64(attrs.used),
-      TIME_ACCESS => time(&mut values, v4.atime_ns),
-      TIME_DELTA => time(&mut values, 1),
-      TIME_METADATA => time(&mut values, v4.ctime_ns),
-      TIME_MODIFY => time(&mut values, v4.mtime_ns),
-      SUPPATTR_EXCLCREAT => exclusive_create_settable().encode(&mut values),
+      TIME_ACCESS => time(values, v4.atime_ns),
+      TIME_DELTA => time(values, 1),
+      TIME_METADATA => time(values, v4.ctime_ns),
+      TIME_MODIFY => time(values, v4.mtime_ns),
+      SUPPATTR_EXCLCREAT => exclusive_create_settable().encode(values),
       _ => {}
     }
   }
-  returned.encode(writer);
-  writer.opaque(&values.into_bytes());
-  Ok(())
+}
+
+/// The fewest bytes the `requested` attributes encode to (the bitmap and the `fattr4` opaque) for any object at `minor`
+/// (A-90): the attributes of a minimal object (an empty handle, owner and group 0 — the shortest owner strings — and
+/// every other field fixed in size) encoded once. The encoder itself is the table of sizes, so the floor cannot drift
+/// from what [`encode`] writes. Zero for a request [`encode`] refuses.
+pub fn encoded_floor((requested, minor): (&Bitmap, u32)) -> usize {
+  let minimal = Fattr3 {
+    kind: Ftype3::Reg,
+    mode: 0,
+    nlink: 0,
+    uid: 0,
+    gid: 0,
+    size: 0,
+    used: 0,
+    rdev: crate::nfs::Specdata3::default(),
+    fsid: 0,
+    fileid: 0,
+    atime: crate::nfs::Nfstime3::default(),
+    mtime: crate::nfs::Nfstime3::default(),
+    ctime: crate::nfs::Nfstime3::default(),
+    v4: Some(crate::nfs::V4Attrs {
+      change: 0,
+      atime_ns: 0,
+      mtime_ns: 0,
+      ctime_ns: 0,
+    }),
+  };
+  let mut writer = XdrWriter::new();
+  match encode(
+    (requested, minor),
+    &minimal,
+    &Nfsfh3::default(),
+    &FsFigures::default(),
+    &mut writer,
+  ) {
+    Ok(()) => writer.len(),
+    Err(_) => 0,
+  }
 }
 
 /// An `nfstime4` (RFC 8881 §3.3.1) of `ns` nanoseconds since the epoch: signed seconds, and the

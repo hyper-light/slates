@@ -1906,5 +1906,30 @@ average 9.2–10.3):
   11 µs (from 0.49–0.59 ms). One-writer throughput 5,249 → 9,792 operations per second.
 - Readdir of the 8,000-entry directory: p99 6.7–7.9 ms against tmpfs's 0.9 ms. Mountstats in a rerun: 9 READDIRs
   for 80 listings, mean round trip 0.556 ms. The client serves most listings from its cache, and the tail is a
-  refetch after the directory changed. Owed: the same storm against Linux's own nfsd over tmpfs, to separate the
-  server's share from the client's.
+  refetch after the directory changed.
+
+#### Against Linux's own kernel nfsd (2026-10-05)
+
+Command: `knfsd.sh WORKERS FILES` (scratch; the same storm against `nfs-kernel-server` exporting a tmpfs over loopback
+NFSv4.2 in a privileged `python:3.12-slim-trixie` container, `nfsv4gracetime` 10 s and a warm-up create before
+timing), beside `native.sh` on the same kernel. Load average 4.6–5.7. One run each.
+
+| workers | op | knfsd p50 | knfsd p99 | slates p50 | slates p99 |
+|---|---|---|---|---|---|
+| 1 | create+write+close | 212 µs | 427 µs | 159 µs | 286 µs |
+| 1 | open+read+close | 114 µs | 232 µs | 24 µs | 122 µs |
+| 1 | stat | 2.5 µs | 10 µs | 2.2 µs | 41 µs |
+| 1 | readdir | 0.52 ms | 4.2 ms | 0.35 ms | 6.5 ms |
+| 16 | create+write+close | 2.0 ms | 3.6 ms | 1.6 ms | 3.2 ms |
+| 16 | open+read+close | 1.0 ms | 3.6 ms | 0.85 ms | 3.2 ms |
+| 16 | stat | 125 µs | 1.7 ms | 123 µs | 1.7 ms |
+
+- Reads are faster under slates because it grants read delegations: the client opens without a round trip. knfsd
+  returned 88 delegations in the run, slates 3,001.
+- The stat tail is the Linux client's delegation watermark (`nfsv4.delegation_watermark` = 5000 on this kernel): past
+  5,000 held delegations it returns them at close, then refetches the attributes. DELEGRETURN 3,001 and GETATTR 3,244
+  against knfsd's 82.
+- Readdir: slates sent 9 READDIRs where knfsd sent 5, each a quarter full (A-90). After A-90, a dedicated loop
+  (`lsloop.py`: 8,000 files, then 300 rounds of create-one-and-list, 8,300 entries per listing) measures slates'
+  listing p50 7.76 → 3.6–3.9 ms (p99 4.3–4.5 ms) against knfsd's 1.95–4.6 ms (p99 2.2–24 ms, one noisy run).
+  The remaining gap is the v4 page passing through a v3 reply's encoding and decoding (owed, GAPS).

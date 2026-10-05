@@ -9098,3 +9098,27 @@ Status: built 2026-10-05 (completes A-68's promise for directories).
   test (generated histories, deltas applied against the full image) passes unchanged.
 - Measured (native Linux NFSv4.2 loopback, one writer, 8,000 creates in one directory): OPEN round trip
   0.33 → 0.041 ms, daemon local p99 0.59 ms → 11 µs, create+write+close p99 0.86 → 0.38 ms.
+
+### A-90 — A READDIR page holds what the client's `maxcount` holds; attributes encode in place (2026-10-05)
+Applied in the same change to: `crates/bridge-nfs/src/v4/compound.rs` (`readdir`, `V3_ENTRY_EXCESS`,
+`V3_REPLY_OVERHEAD`, `ENTRY_TYPICAL`), `crates/bridge-nfs/src/v4/attr.rs` (`supported` and `check_readable` built
+once, `encode` writing in place, `encoded_floor`), `crates/bridge-nfs/src/xdr.rs` (`with_capacity`, `clear`,
+`opaque_built`), `crates/bridge-nfs/src/procedures.rs` (a plus page's smallest entry), `crates/bridge-nfs/tests/v4.rs`,
+`crates/bridge-nfs/tests/attr_floor.rs`, BENCHMARKS, GAPS.
+Status: built 2026-10-05.
+- What: a v4 READDIR page is built from a v3 READDIRPLUS over the routing seam. The v3 call had the client's
+  `maxcount` as its budget, but a v3 plus entry carries a whole `fattr3` and a handle, so an `ls` page came back a
+  quarter full (19 entries in 1,004 of 4,096 bytes) and a listing took about four times the round trips. The v3
+  budget is now the client's plus, for every entry the page could hold, the most a v3 entry exceeds its v4 form.
+  "Could hold" is counted from the smallest entry this request encodes to: the requested attributes of a minimal
+  object, encoded once by the encoder itself (`encoded_floor`), so the bound cannot drift from what is written.
+- Also: a v3 plus page sized its row enumeration from a plain entry's smallest size, so it enumerated about four
+  times the rows that could fit; it now counts a plus entry's attributes and handle length.
+- Encoding: the supported-attribute sets are built once per process, the attribute values are written in place
+  behind a patched length, and a page reuses one entry buffer. Rebuilt per entry, the supported set alone was 15% of
+  a page's time and buffer growth a fifth.
+- Proven: `a_readdir_page_of_small_entries_fills_the_clients_maxcount` (failed at 19 entries in 1,004 bytes);
+  `no_object_encodes_below_the_floor` (generated attribute sets, owners and handles of every length).
+- Measured (native Linux NFSv4.2 loopback, a listing of 8,300 entries after each create; load average 6–10): p50
+  7.76 → 3.6–3.9 ms. Linux's kernel nfsd over tmpfs, same loop: p50 1.95–4.6 ms. Owed: a v4 page that does not pass
+  through a v3 reply's encoding and decoding.

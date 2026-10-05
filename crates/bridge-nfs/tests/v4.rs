@@ -3063,3 +3063,72 @@ fn the_sessions_negotiated_sizes_bound_requests_and_replies() {
     "a kept reply past the negotiated cache size"
   );
 }
+
+/// Format: the `type` attribute's number (RFC 8881 §5.8.1.3).
+const ATTR_TYPE: u32 = 1;
+/// Shape: files in the listed directory: enough that a page of small entries cannot hold them all, within the
+/// fixture's inode cap.
+const LISTED: usize = 240;
+/// Shape: the client's `maxcount` for the page: Linux's own lower bound on a READDIR buffer, a page.
+const LIST_MAXCOUNT: u32 = 4096;
+
+/// RFC 8881 §18.23 (A-90): do list a directory of 240 files with one READDIR asking only `type` and `fileid` (the
+/// attributes a Linux `ls` asks for) under a 4 KiB `maxcount`; expect the page to be full — no further entry would
+/// have fit — since the listing has not ended. A page sized by the v3 READDIRPLUS budget it is built from (whose
+/// entries carry a whole `fattr3` and a handle) held a third of that, and cost a listing three times the round trips.
+#[test]
+fn a_readdir_page_of_small_entries_fills_the_clients_maxcount() {
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let root = vol.root_inode(&store).unwrap();
+  for at in 0..LISTED {
+    vol
+      .create_file_no(&mut store, root, &format!("f{at:04}"), 0o644)
+      .unwrap();
+  }
+  let mut bridge = VolumeBridge::new(VOLUME, &mut vol, &mut store);
+  let mut service = export(&mut bridge, 0);
+  let mut server = Server::standalone();
+  let mut client = Client::connect(&mut service, &mut server, b"host-a");
+  let mut args = client.sequenced(2);
+  args.u32(op::PUTROOTFH);
+  args.u32(op::READDIR);
+  args.u64(0);
+  args.fixed(&[0; 8]);
+  args.u32(LIST_MAXCOUNT);
+  args.u32(LIST_MAXCOUNT);
+  Bitmap::of(&[ATTR_TYPE, ATTR_FILEID]).encode(&mut args);
+  let reply = Client::call(&mut service, &mut server, args.as_slice());
+  assert_eq!(reply.status, Nfsstat4::Ok.wire(), "READDIR");
+  let mut body = reply.walk();
+  skip_sequence(&mut body);
+  expect_ok(&mut body, op::PUTROOTFH);
+  expect_ok(&mut body, op::READDIR);
+  body.fixed(8).unwrap();
+  // The result's own bytes: the verifier, then each entry, then the two closing booleans.
+  let mut used = 8 + 4 + 4;
+  let mut largest = 0;
+  let mut returned = 0;
+  while body.bool().unwrap() {
+    body.u64().unwrap();
+    let name = body.string(255).unwrap().len();
+    let bitmap = Bitmap::decode(&mut body).unwrap();
+    assert!(bitmap.has(ATTR_TYPE) && bitmap.has(ATTR_FILEID));
+    let values = body.opaque(1024).unwrap().len();
+    let pad = |len: usize| len.div_ceil(4) * 4;
+    // value-follows, cookie, the name, the bitmap (its length and two words), the values.
+    let entry = 4 + 8 + 4 + pad(name) + 4 + 4 * 2 + 4 + pad(values);
+    used += entry;
+    largest = largest.max(entry);
+    returned += 1;
+  }
+  let eof = body.bool().unwrap();
+  assert!(
+    !eof,
+    "{returned} of {LISTED} entries cannot be the whole listing"
+  );
+  assert!(
+    used + largest > LIST_MAXCOUNT as usize,
+    "the page held {returned} entries in {used} of {LIST_MAXCOUNT} bytes; another {largest}-byte entry would fit"
+  );
+}
