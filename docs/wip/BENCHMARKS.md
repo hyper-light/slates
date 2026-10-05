@@ -2132,6 +2132,10 @@ last in `python:3.12-slim-trixie`). Docker Desktop 6.12 kernel, Apple M5 Max, lo
       Desktop restart, which would also stop other sessions' containers, so it is Ada's call.
     - knfsd's one stall was measured in the same VM, so the slates/knfsd comparison is void too. The large-write
       numbers stand only once a clean kernel is measured.
+  - **A clean kernel, the same day: macOS's own NFS client** (release build, `slates mount` of a fresh dynamic volume,
+    2 shards, Apple M5 Max, load average about 6). Each 1 MiB `write` plus `fsync` took 1.2–1.3 ms over five rounds,
+    and 64 MiB plus `fsync` took 81 ms (789 MB/s). There was no stall: slates' write path shows none when the kernel's
+    TCP memory is healthy. Linux still owes its own clean measurement.
   - **Measured and rejected 2026-10-05: draining the socket before serving.** All queued bytes were read into the
     connection's buffer (bounded by the session offer, `max_request × max_requests`) before any call was served.
     The result was unchanged: 621/623/625 ms against 621/623/624 ms, and the same 9 drops and 137 prunes. The daemon

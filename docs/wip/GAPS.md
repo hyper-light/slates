@@ -3699,7 +3699,9 @@ Condition 11/12, 2026-10-05 (BENCHMARKS "The daemon under a container memory cap
     its shard's slabs.
 - Owed, re-scoped 2026-10-05: the large-write stall below was measured in a VM whose TCP memory is above `tcp_mem`'s
   maximum (739 MB allocated; BENCHMARKS), likely pinned by two wedged containers of this session. It is unmeasured
-  on a clean kernel. Next: re-measure in a fresh VM or a QEMU guest with its own kernel, slates and knfsd side by side.
+  on a clean Linux kernel. macOS's own client on a fresh mount does a 1 MiB write+fsync in 1.3 ms and 64 MiB at 789 MB/s,
+  so slates' write path has no stall of its own there. Next: re-measure Linux in a fresh VM or a QEMU guest with its own
+  kernel, slates and knfsd side by side.
   The original note: on a fresh NFSv4.2 loopback mount in Docker Desktop's VM, a flush of four pipelined 256 KiB WRITEs stalls three
   200 ms retransmission steps against knfsd's one. The client's own socket (a 4,608-byte send buffer, collapsed
   window) is the shared cause. Why slates meets it thrice is not yet known: `SO_RCVBUF` and `TCP_QUICKACK` were measured
