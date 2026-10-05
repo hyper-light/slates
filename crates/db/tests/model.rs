@@ -745,10 +745,10 @@ fn op_for_nfs(step: &Step, ids: &mut Ids) -> Option<Op> {
 fn seal_owner(kind: u8, who: u8) -> slates_db::catalog::SealKeyOwner {
   match kind {
     0 => slates_db::catalog::SealKeyOwner::Tenant {
-      account: u32::from(who),
+      account: u64::from(who),
     },
     1 => slates_db::catalog::SealKeyOwner::Naming {
-      account: u32::from(who),
+      account: u64::from(who),
     },
     _ => slates_db::catalog::SealKeyOwner::Lineage {
       volume: VolumeId { bytes: [who; 16] },

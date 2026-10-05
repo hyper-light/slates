@@ -24,7 +24,7 @@ const OBSERVE_NS: u64 = 10_000_000_000;
 /// Shape: the segment the test seals in: one 4 KiB base page.
 const SEGMENT: u32 = 4096;
 /// Format: the account the volume belongs to (any host account).
-const ACCOUNT: u32 = 501;
+const ACCOUNT: u64 = 501;
 /// Format: the volume the keys are for (its records need no volume to exist: a key is keyed by id).
 const VOLUME: VolumeId = VolumeId { bytes: [5; 16] };
 

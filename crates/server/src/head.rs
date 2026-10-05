@@ -34,6 +34,32 @@ pub struct HeadValue {
   /// The candidate holders that acknowledged holding the content whole (host ids), the "acknowledging
   /// set" a reader fetches from; empty when there is no content.
   pub content_holders: Vec<u64>,
+  /// What a successor opens the volume's sealed content with (A-92 piece 4c): the lineage key wrapped under each pair
+  /// key the owner's shard delivered; `None` with no content, or while sealing is unavailable. Appended.
+  pub sealing: Option<HeadSealing>,
+}
+
+/// The volume's lineage key as a head carries it for successors (A-92 piece 4c): who wrapped it (the owner's stable
+/// anchor and partition, which name the pair key a successor holds), the lineage key's id, and one entry per neighbour.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct HeadSealing {
+  /// The owner's stable anchor.
+  pub owner_anchor: u64,
+  /// The owner shard's partition.
+  pub partition: u16,
+  /// The lineage key's id.
+  pub lineage: [u8; 16],
+  /// The lineage key wrapped under each neighbour's pair key, in anchor order.
+  pub keys: Vec<HeadKey>,
+}
+
+/// One neighbour's copy of the lineage key: its stable anchor and the key wrapped under its pair key (AES-KW, 61 bytes).
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct HeadKey {
+  /// The neighbour's stable anchor.
+  pub anchor: u64,
+  /// The lineage key wrapped under the pair key.
+  pub wrapped: Vec<u8>,
 }
 
 impl HeadValue {
@@ -118,6 +144,7 @@ mod tests {
     HeadValue {
       manifest: Some([7u8; 32]),
       content_holders: vec![3, 9],
+      sealing: None,
     }
   }
 
@@ -134,6 +161,7 @@ mod tests {
     let creation = HeadValue {
       manifest: None,
       content_holders: Vec::new(),
+      sealing: None,
     };
     assert_eq!(
       HeadValue::from_record_bytes(&creation.to_record_bytes()),

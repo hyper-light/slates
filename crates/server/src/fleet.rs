@@ -1927,7 +1927,13 @@ fn head_value_of(
   object: ObjectId,
   quorum: Quorum,
 ) -> Option<(u64, HeadValue)> {
+  // A head that names content carries the volume's lineage key for successors (A-92 piece 4c).
   let value = |manifest: Option<[u8; 32]>, content_holders: Vec<u64>| HeadValue {
+    sealing: manifest.and(crate::seal_keys::head_sealing(
+      state,
+      record.id,
+      &record.owner,
+    )),
     manifest,
     content_holders,
   };
@@ -1999,6 +2005,19 @@ fn advance_seals(
     let Some((head, sequence)) = sealable_head(state, id, object) else {
       continue;
     };
+    // The volume's lineage key, made before its first seal, so the head naming the seal's content carries it for
+    // successors (A-92 piece 4c). Off the hot path: once per seal job.
+    if !state.seals.contains_key(&object)
+      && state.seal_root.is_some()
+      && let Some(owner) = state
+        .db
+        .partition()
+        .volume(id)
+        .map(|volume| volume.owner.clone())
+      && crate::seal_keys::lineage(state, id, crate::seal_keys::tenant_of(&owner)).is_err()
+    {
+      *state.refusals.entry(LINEAGE_UNMADE).or_insert(0) += 1;
+    }
     if !state.seals.contains_key(&object)
       && !start_seal(
         state,
@@ -2931,6 +2950,11 @@ async fn materialize(origin: u16, object: ObjectId, head: HeadValue) {
     return;
   };
   let region = head.content_holders.clone();
+  // The successor's own copy of the volume's lineage key (A-92 piece 4c), unwrapped here on the control shard, which
+  // holds the pair keys, and handed to the owner shard wrapped under this node's root.
+  let successor_lineage = head.sealing.as_ref().and_then(|sealing| {
+    state::with_state(|s| crate::seal_keys::successor_lineage(s, sealing)).flatten()
+  });
   let served = call_within(
     origin,
     target,
@@ -2943,6 +2967,14 @@ async fn materialize(origin: u16, object: ObjectId, head: HeadValue) {
         sequence,
       };
       let served = verbs::materialize_taken_over(s, id, &taken, region, &archive).is_ok();
+      // The volume's lineage key, so this node seals under the key the dead owner did (A-92 piece 4c). A head that
+      // carried no entry for this node (it acknowledged before its pair arrived) leaves the volume to a new key.
+      if served
+        && let Some(lineage) = successor_lineage
+        && crate::seal_keys::adopt_lineage(s, id, &catalog.owner, lineage).is_err()
+      {
+        *s.refusals.entry(LINEAGE_UNADOPTED).or_insert(0) += 1;
+      }
       if served {
         // The owner shard now owns the head's and the catalog's placements — its record plane writes the
         // object's next records at the promotion epoch and ships only to holders still missing these.
@@ -2963,6 +2995,14 @@ async fn materialize(origin: u16, object: ObjectId, head: HeadValue) {
     }
   });
 }
+
+/// Counter: a volume whose lineage key could not be made at its seal's start (A-92 piece 4c); its head then carries no
+/// key for successors until a later seal.
+/// Format: a counter name in the daemon's status report.
+const LINEAGE_UNMADE: &str = "fleet.seal.lineage_unmade";
+/// Counter: a taken-over volume whose lineage key the successor could not record (A-92 piece 4c).
+/// Format: a counter name in the daemon's status report.
+const LINEAGE_UNADOPTED: &str = "fleet.seal.lineage_unadopted";
 
 /// The status refusal count under which the fleet loop records that it could not serve on its bound sockets
 /// at boot — the control shard would not keep its identity, a socket could not name its port, or a

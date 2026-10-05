@@ -6997,6 +6997,9 @@ fn a_takeover_successor_serves_the_dead_owners_content_over_nfs() {
     }
   };
   let object = ObjectId(id.bytes);
+  // A-92 piece 4c: a chunk sealed on the owner under the volume's lineage key, to be opened on the successor.
+  let volume = slates_db::catalog::VolumeId { bytes: id.bytes };
+  let sealed_chunk = seal_probe_on(&daemons[0], volume);
   // What the origin shows for the root's and the file's mode and owner, times and attributes, before it
   // dies.
   let origin_owners = owners_over_nfs(&daemons[0], "served");
@@ -7019,6 +7022,8 @@ fn a_takeover_successor_serves_the_dead_owners_content_over_nfs() {
   // The metadata first: a read of the file's bytes would move its access time.
   let successor_metadata = served.then(|| metadata_over_nfs(&daemons[successor_index], "served"));
   let (got, successor_owners) = served_content(served, &daemons[successor_index], "served");
+  // A-92 piece 4c: the successor opens the owner's sealed chunk under the lineage key it adopted from the head.
+  let opened = open_after_takeover(served, sealed_chunk, &daemons[successor_index], volume);
   // The successor goes on writing the object: a further seal on it places over the remaining holder.
   let resealed =
     served && reseal_places(&successor_instance, &daemons[successor_index], "served", id);
@@ -7043,6 +7048,7 @@ fn a_takeover_successor_serves_the_dead_owners_content_over_nfs() {
      format minor 2): [root, hello.txt] as (mode, uid, gid)"
   );
   assert_successor_metadata(successor_metadata.as_ref(), &origin_metadata);
+  assert_probe_opened(opened.as_deref());
   assert!(
     resealed,
     "a seal taken on the successor after the takeover places — its head written at the promotion \
@@ -10824,4 +10830,89 @@ fn an_owner_shards_pair_key_reaches_its_candidate_under_its_recipient() {
   );
   let (sent, _) = wrapped.unwrap();
   assert_eq!(unwrapped.unwrap().unwrap(), sent, "one key on both sides");
+}
+
+/// Format: the plaintext of the chunk the takeover test seals on the owner and opens on the successor (A-92 piece 4c).
+const SEALED_PROBE: &[u8] = b"sealed on the dead owner, opened by its successor";
+/// Shape: the segment the takeover test seals in: one 4 KiB base page.
+const SEALED_SEGMENT: u32 = 4096;
+
+/// A naming key both sides of the takeover test build alike, so the test isolates the lineage key's transfer (keyed
+/// names travel with the volume in piece 3b).
+fn test_namer() -> hyper_seal::name::Namer {
+  hyper_seal::name::Namer::new(&hyper_seal::Secret32::from_bytes(&[7u8; 32]).unwrap()).unwrap()
+}
+
+/// The volume's lineage key on a control shard (made if new), for the takeover test's probe.
+fn probe_lineage(
+  s: &mut slates_server::state::ShardState,
+  volume: slates_db::catalog::VolumeId,
+) -> Option<hyper_seal::keys::WrappingKey> {
+  let owner = s
+    .db
+    .partition()
+    .volume(volume)
+    .map(|record| record.owner.clone())?;
+  let tenant = slates_server::seal_keys::tenant_of(&owner);
+  slates_server::seal_keys::lineage(s, volume, tenant).ok()
+}
+
+/// [`SEALED_PROBE`] sealed on `daemon` under `volume`'s lineage key (A-92 piece 4c).
+fn seal_probe_on(
+  daemon: &Daemon,
+  volume: slates_db::catalog::VolumeId,
+) -> Option<slates_cluster::sealed::SealedChunk> {
+  daemon
+    .observe_control(slates_server::daemon::OBSERVE_BUDGET_NS, move |s| {
+      let lineage = probe_lineage(s, volume)?;
+      slates_cluster::sealed::seal_chunk(
+        &lineage,
+        &test_namer(),
+        &slates_archive::Archive::raw_chunk(SEALED_PROBE.to_vec()),
+        SEALED_SEGMENT,
+      )
+      .ok()
+    })
+    .ok()
+    .flatten()
+}
+
+/// `sealed` opened on `daemon` under the lineage key it holds for `volume` (A-92 piece 4c).
+fn open_probe_on(
+  daemon: &Daemon,
+  volume: slates_db::catalog::VolumeId,
+  sealed: slates_cluster::sealed::SealedChunk,
+) -> Option<Vec<u8>> {
+  daemon
+    .observe_control(slates_server::daemon::OBSERVE_BUDGET_NS, move |s| {
+      let lineage = probe_lineage(s, volume)?;
+      slates_cluster::sealed::open_chunk(&lineage, &test_namer(), &sealed)
+        .ok()
+        .map(|chunk| chunk.payload)
+    })
+    .ok()
+    .flatten()
+}
+
+/// The probe sealed before the takeover, opened on the successor once it serves the volume (`served`).
+fn open_after_takeover(
+  served: bool,
+  sealed: Option<slates_cluster::sealed::SealedChunk>,
+  successor: &Daemon,
+  volume: slates_db::catalog::VolumeId,
+) -> Option<Vec<u8>> {
+  if !served {
+    return None;
+  }
+  open_probe_on(successor, volume, sealed?)
+}
+
+/// The successor opened the probe sealed on the dead owner: it adopted the volume's lineage key from the head,
+/// unwrapped under the pair key the owner delivered to it (A-92 piece 4c).
+fn assert_probe_opened(opened: Option<&[u8]>) {
+  assert_eq!(
+    opened,
+    Some(SEALED_PROBE),
+    "the successor opens a chunk sealed on the dead owner under the lineage key it adopted from the head"
+  );
 }

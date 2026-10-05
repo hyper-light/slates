@@ -766,13 +766,13 @@ pub const SEAL_KEY_RECORD_BYTES: usize = 61;
 pub enum SealKeyOwner {
   /// A tenant's key, wrapped by the node's root.
   Tenant {
-    /// The account.
-    account: u32,
+    /// The tenant: a host account, or the namespaced hash of a principal with no numeric account.
+    account: u64,
   },
   /// A tenant's naming key (seal.md §7), wrapped by the tenant's key.
   Naming {
-    /// The account.
-    account: u32,
+    /// The tenant.
+    account: u64,
   },
   /// A volume's lineage key, wrapped by its tenant's key.
   Lineage {

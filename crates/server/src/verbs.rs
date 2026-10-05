@@ -8851,6 +8851,7 @@ mod tests {
     let head = crate::head::HeadValue {
       manifest: None,
       content_holders: Vec::new(),
+      sealing: None,
     };
     let taken = super::TakenOver {
       head: &head,

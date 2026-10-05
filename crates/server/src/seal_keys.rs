@@ -113,7 +113,7 @@ const KEY_GENERATION: u32 = 1;
 /// (D-14); erasing a tenant destroys each partition's record.
 pub fn tenant(
   state: &mut crate::state::ShardState,
-  account: u32,
+  account: u64,
 ) -> Result<WrappingKey, SealKeyError> {
   let owner = slates_db::catalog::SealKeyOwner::Tenant { account };
   let recorded = state.db.partition().seal_key(&owner).cloned();
@@ -131,7 +131,7 @@ pub fn tenant(
 /// The naming key of `account` (seal.md §7: keyed names for its content), under its tenant key.
 pub fn namer(
   state: &mut crate::state::ShardState,
-  account: u32,
+  account: u64,
 ) -> Result<hyper_seal::name::Namer, SealKeyError> {
   let tenant_key = tenant(state, account)?;
   let owner = slates_db::catalog::SealKeyOwner::Naming { account };
@@ -151,7 +151,7 @@ pub fn namer(
 pub fn lineage(
   state: &mut crate::state::ShardState,
   volume: slates_db::catalog::VolumeId,
-  account: u32,
+  account: u64,
 ) -> Result<WrappingKey, SealKeyError> {
   let tenant_key = tenant(state, account)?;
   let owner = slates_db::catalog::SealKeyOwner::Lineage { volume };
@@ -388,4 +388,140 @@ pub fn pair_key(
     .ok_or(SealKeyError::Record)?;
   let root = state.seal_root.as_ref().ok_or(SealKeyError::Unavailable)?;
   open(root, &record)
+}
+
+/// Format: the bit that marks a tenant id hashed from a principal with no numeric account (a SID, a certificate), so it
+/// never names the same tenant as a uid.
+const HASHED_TENANT: u64 = 1 << 63;
+
+/// The tenant a volume owned by `principal` seals under (A-9: the host account): a uid, or a consumer's host account;
+/// a SID or a certificate by a namespaced hash of its identity, marked [`HASHED_TENANT`].
+pub fn tenant_of(principal: &slates_db::catalog::Principal) -> u64 {
+  use slates_db::catalog::Principal;
+  let hashed = |kind: &[u8], identity: &[u8]| {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"slates tenant v1");
+    hasher.update(kind);
+    hasher.update(identity);
+    let mut word = [0u8; size_of::<u64>()];
+    if let Some(head) = hasher.finalize().as_bytes().get(..size_of::<u64>()) {
+      word.copy_from_slice(head);
+    }
+    u64::from_le_bytes(word) | HASHED_TENANT
+  };
+  match principal {
+    Principal::Uid { uid } => u64::from(*uid),
+    Principal::Consumer { account, .. } => u64::from(*account),
+    Principal::Sid { sid } => hashed(b"sid", sid.as_bytes()),
+    Principal::Certificate { hash } => hashed(b"certificate", hash),
+  }
+}
+
+/// The lineage key of `volume` as recorded, unwrapped read-only (no key is made): the tenant's record under the root,
+/// then the volume's under the tenant. `None` while either is unrecorded or sealing is unavailable.
+fn recorded_lineage_secret(
+  state: &crate::state::ShardState,
+  volume: slates_db::catalog::VolumeId,
+  account: u64,
+) -> Option<(KeyId, Secret32)> {
+  use slates_db::catalog::SealKeyOwner;
+  let root = state.seal_root.as_ref()?;
+  let tenant_record = state
+    .db
+    .partition()
+    .seal_key(&SealKeyOwner::Tenant { account })?;
+  let tenant_key = open(root, tenant_record).ok()?;
+  let lineage_record = state
+    .db
+    .partition()
+    .seal_key(&SealKeyOwner::Lineage { volume })?;
+  let secret = tenant_key
+    .unwrap(&hyper_seal::keys::Wrapped::decode(&lineage_record.record).ok()?)
+    .ok()?;
+  Some((KeyId(lineage_record.id), secret))
+}
+
+/// What a sealed head carries for successors (A-92 piece 4c): the volume's lineage key wrapped under the pair key this
+/// owner shard delivered to each neighbour, in anchor order (deterministic for one set of delivered pairs). `None` while
+/// the volume has no recorded lineage key or this shard has delivered no pair.
+pub fn head_sealing(
+  state: &crate::state::ShardState,
+  volume: slates_db::catalog::VolumeId,
+  owner: &slates_db::catalog::Principal,
+) -> Option<crate::head::HeadSealing> {
+  let (lineage, secret) = recorded_lineage_secret(state, volume, tenant_of(owner))?;
+  let keys: Vec<crate::head::HeadKey> = state
+    .pairs_delivered
+    .iter()
+    .filter_map(|anchor| {
+      let pair = pair_key(
+        state,
+        slates_db::catalog::SealKeyOwner::Pair {
+          host: *anchor,
+          partition: state.partition,
+        },
+      )
+      .ok()?;
+      Some(crate::head::HeadKey {
+        anchor: *anchor,
+        wrapped: pair.wrap(&secret).ok()?.encode().to_vec(),
+      })
+    })
+    .collect();
+  if keys.is_empty() {
+    return None;
+  }
+  Some(crate::head::HeadSealing {
+    owner_anchor: state.origin_anchor.0,
+    partition: state.partition,
+    lineage: lineage.0,
+    keys,
+  })
+}
+
+/// A successor's lineage key for a taken-over volume (A-92 piece 4c), on its control shard: its own entry in the head's
+/// `sealing`, unwrapped under the pair key the owner's shard delivered to this node, then wrapped under this node's root
+/// for the owner shard of the volume here (a 61-byte record, never the key's bytes, crosses the shards). `None` when the
+/// head names no entry for this node (it acknowledged the head before its pair arrived) or the pair is unrecorded.
+pub fn successor_lineage(
+  state: &crate::state::ShardState,
+  sealing: &crate::head::HeadSealing,
+) -> Option<([u8; 16], Vec<u8>)> {
+  let own = sealing
+    .keys
+    .iter()
+    .find(|key| key.anchor == state.origin_anchor.0)?;
+  let pair = pair_key(
+    state,
+    slates_db::catalog::SealKeyOwner::Pair {
+      host: sealing.owner_anchor,
+      partition: sealing.partition,
+    },
+  )
+  .ok()?;
+  let secret = pair
+    .unwrap(&hyper_seal::keys::Wrapped::decode(&own.wrapped).ok()?)
+    .ok()?;
+  let root = state.seal_root.as_ref()?;
+  Some((sealing.lineage, root.wrap(&secret).ok()?.encode().to_vec()))
+}
+
+/// Records a taken-over volume's lineage key on its new owner shard (A-92 piece 4c): `wrapped` (the key under this node's
+/// root, from [`successor_lineage`]) unwrapped and recorded under the volume's tenant here, with the key's own id, so
+/// the successor seals under the same key the dead owner did. A lineage already recorded here is kept.
+pub fn adopt_lineage(
+  state: &mut crate::state::ShardState,
+  volume: slates_db::catalog::VolumeId,
+  owner: &slates_db::catalog::Principal,
+  (id, wrapped): ([u8; 16], Vec<u8>),
+) -> Result<(), SealKeyError> {
+  let owner_key = slates_db::catalog::SealKeyOwner::Lineage { volume };
+  if state.db.partition().seal_key(&owner_key).is_some() {
+    return Ok(());
+  }
+  let tenant_key = tenant(state, tenant_of(owner))?;
+  let root = state.seal_root.as_ref().ok_or(SealKeyError::Unavailable)?;
+  let secret = root.unwrap(&hyper_seal::keys::Wrapped::decode(&wrapped)?)?;
+  let rewrapped = tenant_key.wrap(&secret)?;
+  commit(state, record_of(owner_key, KeyId(id), &rewrapped))
 }

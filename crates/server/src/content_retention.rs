@@ -173,6 +173,7 @@ mod tests {
     let value = HeadValue {
       manifest: Some(manifest),
       content_holders: holders.iter().map(|host| host.0).collect(),
+      sealing: None,
     };
     acceptor
       .accept(&Record {

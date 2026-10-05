@@ -9215,6 +9215,19 @@ keyed first by member id, a candidate's restart would have made a new pair each 
 bound (found by the test's first run, which looked the pair up by anchor). Proven by
 `an_owner_shards_pair_key_reaches_its_candidate_under_its_recipient` (a key wrapped under the owner shard's pair key
 unwraps to the same bytes under the candidate's); the fleet suite (70) passes with delivery running every period.
+Built (2026-10-05): piece 4c, the lineage key in the head. A volume's lineage key is made when its first seal starts
+(off the hot path). A head that names content carries `HeadSealing`: the owner's anchor and partition, the lineage
+key's id, and the lineage key wrapped under each pair key the owner shard has delivered (61 bytes a neighbour, in
+anchor order). A successor unwraps its own entry on its control shard under the pair key the owner delivered to it,
+hands the key to the volume's new owner shard wrapped under its own root, and records it there under the volume's
+tenant (`adopt_lineage`), so it seals under the key the dead owner did. Proven in
+`a_takeover_successor_serves_the_dead_owners_content_over_nfs`: a chunk sealed on the owner under the volume's key
+opens on the successor after the owner dies (non-vacuous: without the adoption the successor makes a new key and the
+open fails). Stated window: a neighbour that acknowledged a head before its pair arrived holds that sequence without
+its entry until the next seal; as a successor it then starts a new key for the volume (counted
+`fleet.seal.lineage_unadopted` when the adoption fails outright). Found on the way and owed with piece 3b: the naming
+key must travel with the volume too (a successor verifies names the dead owner made), so it becomes a per-volume key
+carried beside the lineage key rather than a per-tenant one.
 - Why: condition 9 asks for volumes post-quantum encrypted at rest and in transit. In transit holds already: every TLS
   handshake prefers X25519MLKEM768 (A-66, 2026-10-04), and SecP384r1MLKEM1024 replaces it between nodes once
   hyper-raft's measurement of it lands (its §10). At rest, slates has no disk (R1): a volume rests in RAM, in two
