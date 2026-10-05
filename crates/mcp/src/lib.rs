@@ -107,10 +107,27 @@ pub fn read_stdio_line(reader: &mut impl std::io::BufRead) -> std::io::Result<St
   }
 }
 
-/// The MCP protocol version this server speaks (the dated revision it targets, §4.12).
-const PROTOCOL_VERSION: &str = "2026-07-28";
-/// The server's name, reported in `initialize`.
+/// Format: the modern (stateless) MCP revisions this server speaks (§4.12, D-19): a request carrying one in
+/// `_meta["io.modelcontextprotocol/protocolVersion"]` is served in it; any other is refused
+/// `UnsupportedProtocolVersion` naming these.
+const MODERN_VERSIONS: &[&str] = &["2026-07-28"];
+/// Format: the legacy (`initialize`-handshake) revisions a dual-era server also serves (MCP 2026-07-28 versioning:
+/// "a dual-era server MAY serve both eras concurrently on the same endpoint", for at least the twelve-month
+/// deprecation window), newest first: an `initialize` naming one is answered in it, any other in the first.
+const LEGACY_VERSIONS: &[&str] = &["2025-11-25", "2025-06-18", "2025-03-26"];
+/// The server's name, reported in `initialize` and in every modern result's `_meta`.
 const SERVER_NAME: &str = "slates";
+/// Format: the `_meta` key a modern request names its protocol version under.
+const META_PROTOCOL_VERSION: &str = "io.modelcontextprotocol/protocolVersion";
+/// Format: the `_meta` key a modern result names the server under.
+const META_SERVER_INFO: &str = "io.modelcontextprotocol/serverInfo";
+/// Format: how long a client may cache a list or discovery result, in milliseconds: zero, "immediately stale"
+/// (MCP 2026-07-28 `CacheableResult`). A daemon can be replaced by a newer binary under the same endpoint, so no
+/// longer freshness is promised; the deterministic order of every list still lets a client's prompt cache hit.
+const CACHE_TTL_MS: u64 = 0;
+/// The guidance `server/discover` gives a model about this server (MCP 2026-07-28 `DiscoverResult.instructions`):
+/// what the tools do together, not what each does.
+const INSTRUCTIONS: &str = "slates gives each agent its own copy-on-write volume, kept in RAM: create or clone a volume, attach it (a mount path, or read and write through slates.fs), work in it, and bring work together through the merge loop (slates.merge.*). Nothing reaches the host's disk until a human grants a landing; slates.land.materialize only plans one and answers GrantRequired. Volume ids are opaque hex: pass back exactly what a tool returned. A refusal is typed in structuredContent.error; call slates.help for the workflow.";
 
 /// JSON-RPC error codes (the standard set plus two in the implementation-defined server range for a
 /// typed refusal from the daemon and an unreachable daemon). These are the JSON-RPC 2.0 wire values,
@@ -126,10 +143,40 @@ mod code {
   pub(crate) const UNAVAILABLE: i64 = -32001;
   /// Format: JSON-RPC 2.0 "parse error" (the bytes were not valid JSON).
   pub(crate) const PARSE_ERROR: i64 = -32700;
+  /// Format: MCP 2026-07-28 `UNSUPPORTED_PROTOCOL_VERSION`: a modern request named a version this server does not
+  /// speak.
+  pub(crate) const UNSUPPORTED_PROTOCOL_VERSION: i64 = -32022;
+  /// Format: MCP 2026-07-28 `HEADER_MISMATCH`: an HTTP request's MCP headers disagree with its body, or a required
+  /// one is missing.
+  #[cfg(not(windows))]
+  pub(crate) const HEADER_MISMATCH: i64 = -32020;
 }
 
 /// Format: the radix of a volume id's hex text.
 const HEX_RADIX: u32 = 16;
+
+#[cfg(not(windows))]
+/// Format: the `_meta` key a modern request names its protocol version under, for the HTTP edge's header check.
+pub(crate) const META_PROTOCOL_VERSION_KEY: &str = META_PROTOCOL_VERSION;
+#[cfg(not(windows))]
+/// Format: `UnsupportedProtocolVersion`, answered `400` on HTTP.
+pub(crate) const UNSUPPORTED_PROTOCOL_VERSION_CODE: i64 = code::UNSUPPORTED_PROTOCOL_VERSION;
+#[cfg(not(windows))]
+/// Format: JSON-RPC "method not found", answered `404` on HTTP.
+pub(crate) const METHOD_NOT_FOUND_CODE: i64 = code::METHOD_NOT_FOUND;
+
+#[cfg(not(windows))]
+/// Whether `version` is a revision this server speaks, in either era.
+pub(crate) fn speaks(version: &str) -> bool {
+  MODERN_VERSIONS.contains(&version) || LEGACY_VERSIONS.contains(&version)
+}
+
+#[cfg(not(windows))]
+/// The `HeaderMismatch` error (MCP 2026-07-28, `-32020`) for request `id`: its HTTP headers disagree with its body,
+/// or a required one is missing, as `mismatch` says.
+pub(crate) fn header_mismatch_reply(id: &Value, mismatch: &str) -> Value {
+  error(id, code::HEADER_MISMATCH, mismatch)
+}
 
 /// A JSON-RPC "parse error" reply (against a null id), for the transport to send when a line of input
 /// is not valid JSON. The protocol crate owns the code so the transport carries no wire constant.
@@ -156,9 +203,29 @@ impl McpServer {
     let id = request.get("id").cloned()?;
     let method = request.get("method").and_then(Value::as_str).unwrap_or("");
     let params = request.get("params").cloned().unwrap_or(Value::Null);
+    // The era is the request's own (MCP 2026-07-28 versioning): a modern request names its version in `_meta`; a
+    // legacy one (after an `initialize`) names none. Nothing is remembered between requests.
+    let modern = match params
+      .get("_meta")
+      .and_then(|meta| meta.get(META_PROTOCOL_VERSION))
+    {
+      Some(version) => {
+        let version = version.as_str().unwrap_or("");
+        if !MODERN_VERSIONS.contains(&version) {
+          return Some(unsupported_version(&id, version));
+        }
+        true
+      }
+      None => false,
+    };
     let result = match method {
-      "initialize" => Ok(initialize_result()),
-      "tools/list" => Ok(json!({ "tools": tool_list() })),
+      "initialize" => Ok(initialize_result(&params)),
+      "server/discover" => Ok(discover_result()),
+      "tools/list" => Ok(json!({
+        "tools": tool_list(),
+        "ttlMs": CACHE_TTL_MS,
+        "cacheScope": "public",
+      })),
       "tools/call" => self.call_tool(&params),
       other => Err(McpError {
         code: code::METHOD_NOT_FOUND,
@@ -166,6 +233,7 @@ impl McpServer {
       }),
     };
     Some(match result {
+      Ok(value) if modern => reply(&id, complete(value)),
       Ok(value) => reply(&id, value),
       Err(e) => error(&id, e.code, &e.message),
     })
@@ -204,13 +272,20 @@ impl McpServer {
       "slates.land.materialize" => self.land_materialize(&args),
       "slates.status" => self.status(),
       other => {
+        // An unknown tool is a protocol error (MCP server/tools: `-32602`), not a tool-execution one.
         return Err(McpError {
-          code: code::METHOD_NOT_FOUND,
+          code: code::INVALID_PARAMS,
           message: format!("unknown tool: {other}"),
         });
       }
-    }?;
-    Ok(tool_result(&structured))
+    };
+    // Anything that went wrong once the tool was found (an argument it could not use, a typed refusal from the
+    // daemon, an unreachable daemon) is a tool-execution error the model sees and can act on (SEP-1303), never a
+    // JSON-RPC error; its typed code stays in `structuredContent.error`.
+    Ok(match structured {
+      Ok(structured) => tool_result(&structured),
+      Err(failure) => tool_error(&failure),
+    })
   }
 
   /// Creates a green from scratch, or over a complete immutable base when `base_volume` and
@@ -551,12 +626,63 @@ fn refusal(e: ClientError) -> McpError {
   }
 }
 
-/// The `initialize` result: the protocol version, the server's identity, and its capabilities (tools).
-fn initialize_result() -> Value {
+/// The server's identity, as both eras report it.
+fn server_info() -> Value {
+  json!({ "name": SERVER_NAME, "version": env!("CARGO_PKG_VERSION") })
+}
+
+/// The legacy `initialize` result: the protocol version (the client's own when it is a legacy revision this server
+/// speaks, else the newest legacy one), the server's identity, and its capabilities (tools).
+fn initialize_result(params: &Value) -> Value {
+  let asked = params.get("protocolVersion").and_then(Value::as_str);
+  let version = asked
+    .filter(|asked| LEGACY_VERSIONS.contains(asked))
+    .or_else(|| LEGACY_VERSIONS.first().copied())
+    .unwrap_or_default();
   json!({
-    "protocolVersion": PROTOCOL_VERSION,
-    "serverInfo": { "name": SERVER_NAME, "version": env!("CARGO_PKG_VERSION") },
+    "protocolVersion": version,
+    "serverInfo": server_info(),
     "capabilities": { "tools": {} },
+    "instructions": INSTRUCTIONS,
+  })
+}
+
+/// The `server/discover` result (MCP 2026-07-28): the modern versions this server speaks, its capabilities, and
+/// guidance for the model; cacheable as every discovery result is.
+fn discover_result() -> Value {
+  json!({
+    "supportedVersions": MODERN_VERSIONS,
+    "capabilities": { "tools": {} },
+    "instructions": INSTRUCTIONS,
+    "ttlMs": CACHE_TTL_MS,
+    "cacheScope": "public",
+  })
+}
+
+/// A modern result: `resultType` "complete" (every result of this server is; it never asks for input mid-call) and
+/// the server's identity in `_meta`.
+fn complete(mut result: Value) -> Value {
+  if let Some(object) = result.as_object_mut() {
+    object.insert("resultType".to_owned(), json!("complete"));
+    object.insert(
+      "_meta".to_owned(),
+      json!({ META_SERVER_INFO: server_info() }),
+    );
+  }
+  result
+}
+
+/// The `UnsupportedProtocolVersion` error for a modern request naming `requested`: the versions this server speaks,
+/// so the client can retry in one of them.
+fn unsupported_version(id: &Value, requested: &str) -> Value {
+  json!({
+    "jsonrpc": "2.0",
+    "id": id,
+    "error": {
+      "code": code::UNSUPPORTED_PROTOCOL_VERSION,
+      "message": "Unsupported protocol version",
+      "data": { "supported": MODERN_VERSIONS, "requested": requested },
+    },
   })
 }
 
@@ -770,13 +896,24 @@ fn error(id: &Value, code: i64, message: &str) -> Value {
 }
 
 /// A `tools/call` result: the structured result, plus a text block carrying the same JSON (the shape
-/// MCP clients render). `isError` stays false — a tool that reached the daemon and got an answer
-/// succeeded even when that answer is a conflict; a failure is a JSON-RPC error, not a tool result.
+/// MCP clients render). `isError` stays false: a tool that reached the daemon and got an answer
+/// succeeded even when that answer is a conflict.
 fn tool_result(structured: &Value) -> Value {
   json!({
     "content": [ { "type": "text", "text": structured.to_string() } ],
     "structuredContent": structured,
     "isError": false,
+  })
+}
+
+/// A failed `tools/call` (SEP-1303): `isError` true, the failure's message as text for the model, and its typed
+/// code and message in `structuredContent.error` (`-32602` an argument the tool could not use, `-32000` a typed
+/// refusal from the daemon, `-32001` an unreachable daemon).
+fn tool_error(failure: &McpError) -> Value {
+  json!({
+    "content": [ { "type": "text", "text": failure.message } ],
+    "structuredContent": { "error": { "code": failure.code, "message": failure.message } },
+    "isError": true,
   })
 }
 

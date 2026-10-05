@@ -55,7 +55,92 @@ fn call(server: &mut McpServer, name: &str, arguments: Value) -> Value {
   });
   let reply = server.handle(&request).expect("a call gets a reply");
   assert!(reply.get("error").is_none(), "tool {name} errored: {reply}");
+  assert_eq!(
+    reply["result"]["isError"], false,
+    "tool {name} failed: {reply}"
+  );
   reply["result"]["structuredContent"].clone()
+}
+
+/// The `_meta` a modern (2026-07-28) request carries: its protocol version and capabilities.
+fn modern_meta(version: &str) -> Value {
+  json!({
+    "io.modelcontextprotocol/protocolVersion": version,
+    "io.modelcontextprotocol/clientInfo": { "name": "slates-test", "version": "0" },
+    "io.modelcontextprotocol/clientCapabilities": {},
+  })
+}
+
+/// MCP 2026-07-28 (stateless, §4.12, D-19): do discover the server with a modern request; expect a complete result
+/// naming 2026-07-28 among its supported versions, its tools capability, guidance for the model, a cache hint and
+/// the server's identity in `_meta`. List the tools the same way; expect a complete, cacheable result. Ask in an
+/// unknown version; expect `-32022` naming the supported versions and the one requested. A legacy client's
+/// `initialize` (no `_meta`) is still answered (dual era).
+fn assert_modern_protocol(server: &mut McpServer) {
+  let discover = server
+    .handle(&json!({
+      "jsonrpc": "2.0", "id": "d", "method": "server/discover",
+      "params": { "_meta": modern_meta("2026-07-28") },
+    }))
+    .unwrap();
+  let result = &discover["result"];
+  assert_eq!(result["resultType"], "complete", "{discover}");
+  assert!(
+    result["supportedVersions"]
+      .as_array()
+      .unwrap()
+      .contains(&json!("2026-07-28"))
+  );
+  assert!(result["capabilities"]["tools"].is_object());
+  assert!(
+    result["instructions"]
+      .as_str()
+      .is_some_and(|text| !text.is_empty())
+  );
+  assert!(result["ttlMs"].is_u64());
+  assert_eq!(result["cacheScope"], "public");
+  assert_eq!(
+    result["_meta"]["io.modelcontextprotocol/serverInfo"]["name"],
+    "slates"
+  );
+  assert_modern_list_and_versions(server);
+}
+
+/// The rest of [`assert_modern_protocol`]: a modern `tools/list`, an unsupported version, and a legacy client.
+fn assert_modern_list_and_versions(server: &mut McpServer) {
+  let list = server
+    .handle(&json!({
+      "jsonrpc": "2.0", "id": "l", "method": "tools/list",
+      "params": { "_meta": modern_meta("2026-07-28") },
+    }))
+    .unwrap();
+  assert_eq!(list["result"]["resultType"], "complete");
+  assert!(list["result"]["ttlMs"].is_u64());
+  assert_eq!(list["result"]["cacheScope"], "public");
+  let unsupported = server
+    .handle(&json!({
+      "jsonrpc": "2.0", "id": "u", "method": "tools/list",
+      "params": { "_meta": modern_meta("1900-01-01") },
+    }))
+    .unwrap();
+  assert_eq!(unsupported["error"]["code"], -32022, "{unsupported}");
+  assert_eq!(unsupported["error"]["data"]["requested"], "1900-01-01");
+  assert!(
+    unsupported["error"]["data"]["supported"]
+      .as_array()
+      .unwrap()
+      .contains(&json!("2026-07-28"))
+  );
+  let legacy = server
+    .handle(&json!({
+      "jsonrpc": "2.0", "id": 0, "method": "initialize",
+      "params": { "protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": { "name": "old", "version": "0" } },
+    }))
+    .unwrap();
+  assert_eq!(
+    legacy["result"]["protocolVersion"], "2025-11-25",
+    "a legacy client keeps its version"
+  );
 }
 
 /// The protocol handshake: initialize reports the version and identity, tools/list offers the merge
@@ -64,7 +149,10 @@ fn assert_protocol(server: &mut McpServer) {
   let init = server
     .handle(&json!({ "jsonrpc": "2.0", "id": 0, "method": "initialize" }))
     .unwrap();
-  assert_eq!(init["result"]["protocolVersion"], "2026-07-28");
+  assert_eq!(
+    init["result"]["protocolVersion"], "2025-11-25",
+    "a legacy initialize naming no version is answered in the newest legacy revision"
+  );
   assert_eq!(init["result"]["serverInfo"]["name"], "slates");
 
   let list = server
@@ -202,7 +290,11 @@ fn call_refused(server: &mut McpServer, name: &str, arguments: Value) -> String 
     "params": { "name": name, "arguments": arguments },
   });
   let reply = server.handle(&request).expect("a call gets a reply");
-  reply["error"]["message"]
+  assert_eq!(
+    reply["result"]["isError"], true,
+    "a refusal is a tool-execution error the model sees: {reply}"
+  );
+  reply["result"]["structuredContent"]["error"]["message"]
     .as_str()
     .unwrap_or_else(|| panic!("tool {name} was not refused: {reply}"))
     .to_owned()
@@ -530,8 +622,12 @@ fn assert_land(server: &mut McpServer) {
     }))
     .unwrap();
   assert_eq!(
-    reply["error"]["code"], -32000,
-    "an unopenable target is a typed refusal: {reply}"
+    reply["result"]["isError"], true,
+    "an unopenable target is a tool-execution error: {reply}"
+  );
+  assert_eq!(
+    reply["result"]["structuredContent"]["error"]["code"], -32000,
+    "a typed refusal: {reply}"
   );
 }
 
@@ -545,8 +641,8 @@ fn assert_malformed(server: &mut McpServer) {
     }))
     .unwrap();
   assert_eq!(
-    unknown["error"]["code"], -32601,
-    "unknown tool: method not found"
+    unknown["error"]["code"], -32602,
+    "an unknown tool is a protocol error, invalid params (MCP server/tools)"
   );
 
   let bad_id = server
@@ -556,8 +652,12 @@ fn assert_malformed(server: &mut McpServer) {
     }))
     .unwrap();
   assert_eq!(
-    bad_id["error"]["code"], -32602,
-    "bad volume id: invalid params"
+    bad_id["result"]["isError"], true,
+    "a bad argument is a tool-execution error the model can correct (SEP-1303): {bad_id}"
+  );
+  assert_eq!(
+    bad_id["result"]["structuredContent"]["error"]["code"],
+    -32602
   );
 
   let unknown_method = server
@@ -587,6 +687,7 @@ fn the_mcp_surface_serves_the_tools() {
   let mut server = McpServer::new(connect(&instance));
 
   assert_protocol(&mut server);
+  assert_modern_protocol(&mut server);
   assert_merge_loop(&mut server);
   assert_volume_lifecycle(&mut server);
   assert_attach_base(&mut server);
@@ -731,10 +832,11 @@ fn assert_http_transport(profile: &MachineProfile, instance: &str) {
     "a valid client is served: {valid}"
   );
   assert!(
-    valid.contains("\"protocolVersion\":\"2026-07-28\""),
-    "{valid}"
+    valid.contains("\"protocolVersion\":\"2025-11-25\""),
+    "a legacy initialize is answered in the newest legacy revision: {valid}"
   );
 
+  assert_modern_http(port, &ours, &token);
   assert_unauthorized_calls_have_no_effect(port, instance, &token);
 
   // The slow and idle connections were still open throughout; the valid client was not held behind them.
@@ -809,4 +911,103 @@ fn assert_residency_names_what_slates_protects(stat: &Value) {
     };
     assert_eq!(beyond, expected, "{capability}");
   }
+}
+
+/// One modern request over the HTTP edge with the given MCP headers: the raw response.
+fn modern_exchange(port: u16, host: &str, token: &str, headers: &str, body: &Value) -> String {
+  let head = format!(
+    "{}{headers}",
+    mcp_head(port, host, Some(&format!("http://{host}")), Some(token))
+  );
+  exchange(port, &head, &body.to_string())
+}
+
+/// A modern request body: `method` with `params` and the 2026-07-28 `_meta` naming `version`.
+fn modern_body(method: &str, mut params: Value, version: &str) -> Value {
+  params["_meta"] = modern_meta(version);
+  json!({ "jsonrpc": "2.0", "id": 7, "method": method, "params": params })
+}
+
+/// MCP Streamable HTTP 2026-07-28 ("Protocol Version Header", "Standard Request Headers", "Server Validation"): do
+/// send modern requests over the HTTP edge; expect one whose headers match its body served `200`; a mismatched
+/// `Mcp-Method`, a missing `Mcp-Name` on `tools/call`, and a missing `MCP-Protocol-Version` each refused `400` with
+/// `HeaderMismatch` (`-32020`); a Base64-sentinel `Mcp-Name` decoded and served; an unsupported version refused
+/// `400` with `-32022`; and an unknown method answered `404` with `-32601`.
+fn assert_modern_http(port: u16, host: &str, token: &str) {
+  let v = "2026-07-28";
+  let list = modern_body("tools/list", json!({}), v);
+  let served = modern_exchange(
+    port,
+    host,
+    token,
+    "\r\nMCP-Protocol-Version: 2026-07-28\r\nMcp-Method: tools/list",
+    &list,
+  );
+  assert!(served.starts_with("HTTP/1.1 200"), "{served}");
+  assert!(served.contains("\"resultType\":\"complete\""), "{served}");
+  let wrong_method = modern_exchange(
+    port,
+    host,
+    token,
+    "\r\nMCP-Protocol-Version: 2026-07-28\r\nMcp-Method: tools/call",
+    &list,
+  );
+  assert!(wrong_method.starts_with("HTTP/1.1 400"), "{wrong_method}");
+  assert!(wrong_method.contains("-32020"), "{wrong_method}");
+  let no_version = modern_exchange(port, host, token, "\r\nMcp-Method: tools/list", &list);
+  assert!(
+    no_version.starts_with("HTTP/1.1 400") && no_version.contains("-32020"),
+    "{no_version}"
+  );
+  let call = modern_body(
+    "tools/call",
+    json!({ "name": "slates.status", "arguments": {} }),
+    v,
+  );
+  let unnamed = modern_exchange(
+    port,
+    host,
+    token,
+    "\r\nMCP-Protocol-Version: 2026-07-28\r\nMcp-Method: tools/call",
+    &call,
+  );
+  assert!(
+    unnamed.starts_with("HTTP/1.1 400") && unnamed.contains("-32020"),
+    "{unnamed}"
+  );
+  let sentinel = modern_exchange(
+    port,
+    host,
+    token,
+    "\r\nMCP-Protocol-Version: 2026-07-28\r\nMcp-Method: tools/call\r\nMcp-Name: =?base64?c2xhdGVzLnN0YXR1cw==?=",
+    &call,
+  );
+  assert!(
+    sentinel.starts_with("HTTP/1.1 200"),
+    "a sentinel name is decoded: {sentinel}"
+  );
+  let old = modern_body("tools/list", json!({}), "1900-01-01");
+  let unsupported = modern_exchange(
+    port,
+    host,
+    token,
+    "\r\nMCP-Protocol-Version: 1900-01-01\r\nMcp-Method: tools/list",
+    &old,
+  );
+  assert!(
+    unsupported.starts_with("HTTP/1.1 400") && unsupported.contains("-32022"),
+    "{unsupported}"
+  );
+  let unknown = modern_body("no/such", json!({}), v);
+  let missing = modern_exchange(
+    port,
+    host,
+    token,
+    "\r\nMCP-Protocol-Version: 2026-07-28\r\nMcp-Method: no/such",
+    &unknown,
+  );
+  assert!(
+    missing.starts_with("HTTP/1.1 404") && missing.contains("-32601"),
+    "{missing}"
+  );
 }

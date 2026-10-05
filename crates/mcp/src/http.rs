@@ -117,6 +117,12 @@ pub struct Head {
   pub content_type: Option<String>,
   /// The `Authorization` field, when given.
   pub authorization: Option<String>,
+  /// The `MCP-Protocol-Version` field, when given.
+  pub protocol_version: Option<String>,
+  /// The `Mcp-Method` field, when given.
+  pub mcp_method: Option<String>,
+  /// The `Mcp-Name` field, when given (possibly in the Base64 sentinel form).
+  pub mcp_name: Option<String>,
 }
 
 /// Why a request is refused, as the status it is answered with.
@@ -241,6 +247,9 @@ fn read_field(head: &mut Head, line: &str) -> Result<(), Refused> {
     "origin" => head.origin = Some(value),
     "content-type" => head.content_type = Some(value),
     "authorization" => head.authorization = Some(value),
+    "mcp-protocol-version" => head.protocol_version = Some(value),
+    "mcp-method" => head.mcp_method = Some(value),
+    "mcp-name" => head.mcp_name = Some(value),
     _ => {}
   }
   Ok(())
@@ -390,15 +399,15 @@ async fn serve_connection(stream: &TcpStream, shared: Kept<Shared>, edge: &HttpE
         let Ok(mut server) = shared.server.try_borrow_mut() else {
           return None;
         };
-        Some(dispatch(&mut server, &body))
+        Some(dispatch(&mut server, &head, &body))
       })
       .flatten();
-    let Some(reply) = reply else {
+    let Some((status, reply)) = reply else {
       let _ = write_refusal(stream, Refused::Unavailable).await;
       return;
     };
     if stream
-      .write_all(&response(reply, head.keep_alive))
+      .write_all(&response(status, reply, head.keep_alive))
       .await
       .is_err()
       || !head.keep_alive
@@ -484,21 +493,153 @@ async fn fill(stream: &TcpStream, pending: &mut Vec<u8>) -> bool {
 
 /// Dispatches one JSON-RPC body: the reply, or `None` for a notification. A body that is not JSON draws
 /// the JSON-RPC parse error.
-fn dispatch(server: &mut McpServer, body: &[u8]) -> Option<Value> {
-  match serde_json::from_slice::<Value>(body) {
-    Ok(message) => server.handle(&message),
-    Err(_) => Some(crate::parse_error_reply()),
+fn dispatch(server: &mut McpServer, head: &Head, body: &[u8]) -> (&'static str, Option<Value>) {
+  let Ok(message) = serde_json::from_slice::<Value>(body) else {
+    // A body the server cannot accept is an HTTP error (Streamable HTTP: "e.g., `400 Bad Request`").
+    return (BAD_REQUEST, Some(crate::parse_error_reply()));
+  };
+  if let Err(mismatch) = check_headers(head, &message) {
+    let id = message.get("id").cloned().unwrap_or(Value::Null);
+    return (
+      BAD_REQUEST,
+      Some(crate::header_mismatch_reply(&id, &mismatch)),
+    );
+  }
+  let reply = server.handle(&message);
+  let status = match reply
+    .as_ref()
+    .and_then(|reply| reply.get("error"))
+    .and_then(|error| error.get("code"))
+    .and_then(Value::as_i64)
+  {
+    Some(crate::UNSUPPORTED_PROTOCOL_VERSION_CODE) => BAD_REQUEST,
+    Some(crate::METHOD_NOT_FOUND_CODE) => NOT_FOUND,
+    _ => OK,
+  };
+  (status, reply)
+}
+
+/// Format: the status lines a dispatched request is answered with.
+const OK: &str = "200 OK";
+/// Format: see [`OK`].
+const BAD_REQUEST: &str = "400 Bad Request";
+/// Format: see [`OK`].
+const NOT_FOUND: &str = "404 Not Found";
+
+/// Checks a request's MCP headers against its body (Streamable HTTP 2026-07-28, "Server Validation"): a modern
+/// request (one naming its version in `_meta`) must carry `MCP-Protocol-Version` equal to that version, `Mcp-Method`
+/// equal to its method, and, for `tools/call`, `resources/read` and `prompts/get`, `Mcp-Name` equal to its
+/// `params.name` or `params.uri` (decoded first when in the Base64 sentinel form). A legacy request (no version in
+/// `_meta`) may omit the version header, which then means 2025-03-26, a revision this server serves; one it gives
+/// must be a revision this server speaks. The mismatch, said in words, when a check fails.
+fn check_headers(head: &Head, message: &Value) -> Result<(), String> {
+  let params = message.get("params");
+  let body_version = params
+    .and_then(|params| params.get("_meta"))
+    .and_then(|meta| meta.get(crate::META_PROTOCOL_VERSION_KEY))
+    .and_then(Value::as_str);
+  let Some(body_version) = body_version else {
+    return match head.protocol_version.as_deref() {
+      Some(version) if !crate::speaks(version) => Err(format!(
+        "MCP-Protocol-Version header value '{version}' is not a revision this server speaks"
+      )),
+      _ => Ok(()),
+    };
+  };
+  let method = message.get("method").and_then(Value::as_str).unwrap_or("");
+  same(
+    "MCP-Protocol-Version",
+    head.protocol_version.as_deref(),
+    body_version,
+  )?;
+  same("Mcp-Method", head.mcp_method.as_deref(), method)?;
+  let named = match method {
+    "tools/call" | "prompts/get" => params.and_then(|params| params.get("name")),
+    "resources/read" => params.and_then(|params| params.get("uri")),
+    _ => None,
+  };
+  if let Some(name) = named {
+    let name = name.as_str().unwrap_or("");
+    let header = head.mcp_name.as_deref().map(decode_sentinel).transpose()?;
+    same("Mcp-Name", header.as_deref(), name)?;
+  }
+  Ok(())
+}
+
+/// `Ok` when header `field` was given and equals `body`; the mismatch in words otherwise.
+fn same(field: &str, header: Option<&str>, body: &str) -> Result<(), String> {
+  match header {
+    Some(value) if value == body => Ok(()),
+    Some(value) => Err(format!(
+      "Header mismatch: {field} header value '{value}' does not match body value '{body}'"
+    )),
+    None => Err(format!(
+      "Header mismatch: the required {field} header is missing"
+    )),
   }
 }
 
-/// The response bytes for a dispatched request: `200` with the JSON reply, or `202` for a notification.
-fn response(reply: Option<Value>, keep_alive: bool) -> Vec<u8> {
+/// Format: the Base64 sentinel's prefix and suffix (Streamable HTTP 2026-07-28, "Value Encoding").
+const SENTINEL_PREFIX: &str = "=?base64?";
+/// Format: see [`SENTINEL_PREFIX`].
+const SENTINEL_SUFFIX: &str = "?=";
+
+/// A header value as the body would carry it: the UTF-8 text a Base64 sentinel (`=?base64?…?=`) encodes, or the
+/// value itself when it is not one.
+fn decode_sentinel(value: &str) -> Result<String, String> {
+  let Some(encoded) = value
+    .strip_prefix(SENTINEL_PREFIX)
+    .and_then(|rest| rest.strip_suffix(SENTINEL_SUFFIX))
+  else {
+    return Ok(value.to_owned());
+  };
+  let bytes = base64_decode(encoded)
+    .ok_or_else(|| "Header mismatch: a malformed Base64 sentinel".to_owned())?;
+  String::from_utf8(bytes)
+    .map_err(|_| "Header mismatch: a Base64 sentinel that is not UTF-8".to_owned())
+}
+
+/// Format: the standard Base64 alphabet (RFC 4648 §4, Table 1): each character's position is its value.
+const BASE64_ALPHABET: &[u8; 64] =
+  b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+/// Decodes standard padded Base64 (RFC 4648 §4); `None` for anything else.
+fn base64_decode(text: &str) -> Option<Vec<u8>> {
+  /// Format: the bits one Base64 character carries, and the bits of a byte.
+  const SEXTET: u32 = 6;
+  /// Format: see [`SEXTET`].
+  const OCTET: u32 = 8;
+  /// Format: a byte's mask, and the bits the accumulator keeps (never more than a byte plus a sextet).
+  const BYTE: u32 = 0xFF;
+  /// Format: see [`BYTE`].
+  const KEPT: u32 = 0x3FFF;
+  let digits = text.trim_end_matches('=');
+  if !text.len().is_multiple_of(4) || text.len().saturating_sub(digits.len()) > 2 {
+    return None;
+  }
+  let mut out = Vec::with_capacity(digits.len());
+  let mut buffer: u32 = 0;
+  let mut held: u32 = 0;
+  for byte in digits.bytes() {
+    let value = BASE64_ALPHABET.iter().position(|&digit| digit == byte)?;
+    buffer = (buffer.checked_shl(SEXTET)? | u32::try_from(value).ok()?) & KEPT;
+    held = held.checked_add(SEXTET)?;
+    if held >= OCTET {
+      held = held.checked_sub(OCTET)?;
+      out.push(u8::try_from(buffer.checked_shr(held)? & BYTE).ok()?);
+    }
+  }
+  Some(out)
+}
+
+/// The response bytes for a dispatched request: `status` with the JSON reply, or `202` for a notification.
+fn response(status: &str, reply: Option<Value>, keep_alive: bool) -> Vec<u8> {
   let connection = if keep_alive { "keep-alive" } else { "close" };
   match reply {
     Some(value) => {
       let body = value.to_string();
       format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: \
+        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: \
          {connection}\r\n\r\n{body}",
         body.len()
       )
@@ -660,12 +801,44 @@ mod tests {
   /// A refusal's status line, and the `401` challenge, as RFC 9110 writes them.
   #[test]
   fn responses_format_correctly() {
-    let text = String::from_utf8(response(Some(serde_json::json!({"ok": true})), true)).unwrap();
+    let text =
+      String::from_utf8(response(OK, Some(serde_json::json!({"ok": true})), true)).unwrap();
     assert!(text.starts_with("HTTP/1.1 200 OK\r\n"));
     assert!(text.contains("Content-Length: 11\r\n"));
     assert!(text.ends_with("{\"ok\":true}"));
-    let text = String::from_utf8(response(None, false)).unwrap();
+    let text = String::from_utf8(response(OK, None, false)).unwrap();
     assert!(text.starts_with("HTTP/1.1 202 Accepted\r\n"));
     assert!(text.contains("Connection: close\r\n"));
+  }
+
+  /// Streamable HTTP 2026-07-28 "Value Encoding": do decode the spec's own sentinel examples; expect each original
+  /// value, a plain value passed through, and malformed Base64 refused rather than guessed.
+  #[test]
+  fn sentinel_values_decode_as_the_spec_encodes_them() {
+    assert_eq!(
+      decode_sentinel("=?base64?SGVsbG8sIOS4lueVjA==?=").unwrap(),
+      "Hello, 世界"
+    );
+    assert_eq!(
+      decode_sentinel("=?base64?IHBhZGRlZCA=?=").unwrap(),
+      " padded "
+    );
+    assert_eq!(
+      decode_sentinel("=?base64?bGluZTEKbGluZTI=?=").unwrap(),
+      "line1\nline2"
+    );
+    assert_eq!(
+      decode_sentinel("=?base64?PT9iYXNlNjQ/bGl0ZXJhbD89?=").unwrap(),
+      "=?base64?literal?="
+    );
+    assert_eq!(decode_sentinel("us-west1").unwrap(), "us-west1");
+    assert!(
+      decode_sentinel("=?base64?abc?=").is_err(),
+      "not a multiple of four"
+    );
+    assert!(
+      decode_sentinel("=?base64?ab*d?=").is_err(),
+      "outside the alphabet"
+    );
   }
 }

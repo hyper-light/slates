@@ -8935,3 +8935,23 @@ Status: built 2026-10-05 (B, second half). Directory delegations and `CB_GETATTR
   - against the Linux kernel, three alternating A/B rounds (BENCHMARKS).
 - Owed: `CB_GETATTR` in place of the GETATTR recall; directory delegations (C); a space reservation that would let
   a holder cache writes past close.
+
+### A-81 — MCP: the 2026-07-28 stateless protocol, dual era; tool failures are tool results; HTTP header validation (2026-10-05)
+Applied in the same change to: `crates/mcp/src/lib.rs` (era per request, `server/discover`, `resultType`,
+`ttlMs`/`cacheScope`, `-32022`, `tool_error`, `-32602` for an unknown tool), `crates/mcp/src/http.rs`
+(`check_headers`, the Base64 sentinel, the spec's status codes), `crates/mcp/tests/mcp.rs`, GAPS.
+Status: built 2026-10-05 (§4.12, D-19). Skills over MCP, codemode, `slates.fs` writes and subscriptions are owed
+(GAPS).
+- Why: D-19 chose the 2026-07-28 stateless protocol with dual-era support, but the server spoke only the legacy
+  `initialize` era. It also returned two shapes the spec rules out: `-32601` for an unknown tool (MCP server/tools:
+  `-32602`), and JSON-RPC errors for failures inside a call. Since 2025-11-25 (SEP-1303) those are tool-execution
+  errors, so the model sees them and can correct its call.
+- What: each request's era is its own. A request naming its version in `_meta` is modern and is checked against
+  the modern revisions served; one naming none is legacy, so an `initialize` client keeps working through the
+  twelve-month deprecation window. Nothing spans requests (the spec's "servers MUST NOT rely on prior requests").
+  On the HTTP edge the request metadata headers must agree with the body ("Server Validation"); a
+  header-routing intermediary and this server therefore never act on different values.
+- Cache hints are zero: a daemon can be replaced by a newer binary under the same endpoint, so no freshness is
+  promised. Every list keeps its deterministic order for client prompt caches.
+- Proven: `the_mcp_surface_serves_the_tools` (stdio and HTTP, live daemon) and
+  `sentinel_values_decode_as_the_spec_encodes_them`.

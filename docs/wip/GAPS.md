@@ -3556,7 +3556,11 @@ shard's own clock that A-65 budgets in (docs/bugs/2026-10-04-the-slow-observatio
   - a forwarded NFSv3 call held, not answered `JUKEBOX`;
   - write delegations: **done (A-80)**, with a zero-byte space limit; a space reservation that would let a holder
     cache writes past close is owed, as is `CB_GETATTR` in place of the GETATTR recall;
-  - directory delegations (C, §10.9);
+  - directory delegations (C, §10.9): **no client to serve yet.** Checked 2026-10-05: Linux mainline's client
+    requests them (`fs/nfs/nfs4proc.c` `should_request_dir_deleg`, gated on `NFS_CAP_DIR_DELEG`), but Docker
+    Desktop's 6.12 kernel has only nfsd's handler (`nfsd4_get_dir_delegation` in `/proc/kallsyms`) and no client
+    code. Built with the microVM lane (condition 2), which boots a mainline kernel and so gives C a client to be
+    measured against;
   - the dynamic slot target;
   - the one 84 ms `DELEGRETURN` stall, seen once, and the 74–87 ms client-side DELEGRETURN queue under load
     (BENCHMARKS, A-80; the daemon answered no `NFS4ERR_DELAY`).
@@ -3564,3 +3568,27 @@ shard's own clock that A-65 budgets in (docs/bugs/2026-10-04-the-slow-observatio
   Linux client merged a new daemon with a dead one and hung its mount
   (`docs/bugs/2026-10-04-every-daemon-announced-one-nfs-server-owner.md`).
 
+
+### 2026-10-05: MCP speaks 2026-07-28, dual era (A-81; condition 13, first piece)
+
+- **Done:**
+  - **Protocol.** A request naming its version in `_meta` is served in that modern revision (`server/discover`;
+    `resultType`; `ttlMs`/`cacheScope` on list and discovery results; the server's identity in result `_meta`). An
+    unknown version is refused `-32022` with `{supported, requested}`. Legacy `initialize` clients are still
+    served, each in its own legacy revision, or the newest when it names none.
+  - **Errors.** An unknown tool is `-32602`, a protocol error, as the spec requires (it was `-32601`). A bad
+    argument, a daemon refusal and an unreachable daemon are tool-execution errors (`isError`, SEP-1303), with the
+    typed code in `structuredContent.error` (they were JSON-RPC errors the model never saw).
+  - **HTTP.** The edge checks `MCP-Protocol-Version`, `Mcp-Method` and `Mcp-Name` (Base64 sentinels decoded)
+    against the body: `400` with `-32020` on a missing or mismatched header, `400` on an unsupported version,
+    `404` on an unknown method, and `400` on an unparseable body (all were `200`).
+- **Proven:** `crates/mcp/tests/mcp.rs`, over a live daemon on stdio and on the HTTP edge (`assert_modern_protocol`,
+  `assert_modern_http`), and the spec's own sentinel examples in `http::tests`.
+- **Owed for condition 13, in order:**
+  1. skills: the `SKILL.md` source tree, served as `skill://` resources and as prompts (`resources/*`,
+     `prompts/*`), and installed raw by `slates skills install`;
+  2. codemode: one tool that runs a bounded program over the volume verbs (vorpal's query-language pattern; output
+     reduction is the measured win, `research/mcp-skills-sdks.md` §2.2.5);
+  3. `slates.fs` write, list, move and delete;
+  4. `subscriptions/listen`;
+  5. the official conformance suite, run in a container (no host install).
