@@ -1904,4 +1904,7 @@ average 9.2–10.3):
   the serving shard's samples in `Volume::dir_entries`' sort under `publish_shard` → `image_of_inode`; the machine
   was 93.5% idle. After: mountstats OPEN 41 µs (from 0.32 ms), WRITE 30 µs, CLOSE 23 µs; the daemon's local p99
   11 µs (from 0.49–0.59 ms). One-writer throughput 5,249 → 9,792 operations per second.
-- Owed: readdir of the 8,000-entry directory, p99 7.9 ms against tmpfs's 0.9 ms.
+- Readdir of the 8,000-entry directory: p99 6.7–7.9 ms against tmpfs's 0.9 ms. Mountstats in a rerun: 9 READDIRs
+  for 80 listings, mean round trip 0.556 ms. The client serves most listings from its cache, and the tail is a
+  refetch after the directory changed. Owed: the same storm against Linux's own nfsd over tmpfs, to separate the
+  server's share from the client's.
