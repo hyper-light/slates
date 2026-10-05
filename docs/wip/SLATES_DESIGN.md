@@ -9205,6 +9205,13 @@ Status: designed 2026-10-05; the crate is vendored. The pieces below are built i
 - The owner's RAM: a volume's idle plaintext in the anchor (seal.md §8, "at rest is idle RAM") is sealed under its
   lineage key only if the measured cost fits slates' budget (a 4 KiB open at most about 1 µs p99 under load, seal.md
   §1 and §11); the measurement decides, and is recorded before that piece is built or rejected.
+- Costs measured by mantle with hyper-raft's seal bench (seal.md §11; M5 Max, load average 5, 2026-10-05; reported
+  by the mantle session, not yet reproduced in slates): a key made and wrapped p50 1.38 µs, p99 1.50 µs; a 4 KiB open
+  warm p99 542 ns, cold (unwrap and commitment) p99 1.33 µs; a 4 KiB overwrite under the version-keyed rule 0.5 µs,
+  against 9.9 µs (64 KiB chunk) and 31 µs (256 KiB chunk) with a key per chunk; sealing 9–10.5 GB/s and opening
+  8.4–9.2 GB/s a core. Two consequences: the warm open fits slates' idle-RAM budget, so that piece's own measurement
+  under slates' load is what decides it; and the version-keyed rule is worth 20–60× on an overwrite, so the argument
+  that a version never repeats is worth making rather than falling back to a key per chunk.
 - Archives leave sealed to an ML-KEM-1024 recipient the operator names.
 - Order of build: (1) the vendored crate in the build, its known-answer behaviour exercised by slates' use; (2) the
   key hierarchy in the daemon and the anchor's handover of the root; (3) sealed content on the content plane, with
