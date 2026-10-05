@@ -3697,7 +3697,10 @@ Condition 11/12, 2026-10-05 (BENCHMARKS "The daemon under a container memory cap
   - Still per shard: the chunk, inode and directory slabs and the metadata class are sized from one slice. A volume
     of large files reaches the whole pool (a chunk is sixteen granules); a volume of many small files stays bounded by
     its shard's slabs.
-- Owed: on a fresh NFSv4.2 loopback mount in Docker Desktop's VM, a flush of four pipelined 256 KiB WRITEs stalls three
+- Owed, re-scoped 2026-10-05: the large-write stall below was measured in a VM whose TCP memory is above `tcp_mem`'s
+  maximum (739 MB allocated; BENCHMARKS), likely pinned by two wedged containers of this session. It is unmeasured
+  on a clean kernel. Next: re-measure in a fresh VM or a QEMU guest with its own kernel, slates and knfsd side by side.
+  The original note: on a fresh NFSv4.2 loopback mount in Docker Desktop's VM, a flush of four pipelined 256 KiB WRITEs stalls three
   200 ms retransmission steps against knfsd's one. The client's own socket (a 4,608-byte send buffer, collapsed
   window) is the shared cause. Why slates meets it thrice is not yet known: `SO_RCVBUF` and `TCP_QUICKACK` were measured
   and rejected. A warmed mount writes at 241–471 MB/s.

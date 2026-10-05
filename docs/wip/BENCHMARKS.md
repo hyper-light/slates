@@ -2120,6 +2120,22 @@ last in `python:3.12-slim-trixie`). Docker Desktop 6.12 kernel, Apple M5 Max, lo
     and the daemon's socket its own drops (`d4`–`d5`) with an autotuned 2.2 MB receive buffer and nothing queued.
   - So this is Linux's NFS client over loopback in this VM, which knfsd meets too; slates meets it three times per
     flush where knfsd meets it once. Why three is owed.
+  - **The VM was over its TCP memory limit (found later the same day; these numbers are not evidence about slates).**
+    Inside a fresh container, `/proc/net/sockstat` read `TCP: mem 189277` pages (739 MB). The VM's `tcp_mem` is
+    `93192 124257 186384`, so the allocation was above the hard maximum, and the kernel holds every TCP socket in the
+    VM near its minimum receive allowance. That fits what was seen: the daemon's socket dropped segments while its
+    queue was empty and its buffer autotuned to 2.2 MB, and over three flushes the counters were `TCPRcvQDrop` 9,
+    `PruneCalled` 137 and `TCPFromZeroWindowAdv` 137, deterministically.
+    - What holds the memory is not certain. No process-visible namespace held more than a trivial queue, and two of
+      this session's containers (`5a5e7b603590`, `ae3a4ede408f`) have been wedged in `do_exit` on their own `hard`
+      NFS mounts since 01:36 and 02:30. The memory note on NFS wedges records them as recoverable only by a Docker
+      Desktop restart, which would also stop other sessions' containers, so it is Ada's call.
+    - knfsd's one stall was measured in the same VM, so the slates/knfsd comparison is void too. The large-write
+      numbers stand only once a clean kernel is measured.
+  - **Measured and rejected 2026-10-05: draining the socket before serving.** All queued bytes were read into the
+    connection's buffer (bounded by the session offer, `max_request × max_requests`) before any call was served.
+    The result was unchanged: 621/623/625 ms against 621/623/624 ms, and the same 9 drops and 137 prunes. The daemon
+    already keeps its queue empty, so the receive side is not where the drops come from.
   - **Measured and rejected:**
     - `SO_RCVBUF` raised on accepted streams: `fsync` still 622–626 ms and `dd` 1.2 MB/s (the option caps the buffer
       at `rmem_max` and turns autotuning off);
