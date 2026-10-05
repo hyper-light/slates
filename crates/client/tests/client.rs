@@ -927,6 +927,15 @@ fn a_restarted_daemon_adopts_its_anchors_sealing_root_and_a_fresh_anchor_mints_a
   );
   assert_eq!(adopted.state, "adopted", "a restart finds it: {adopted:?}");
   assert_eq!(adopted.root_id, minted.root_id, "the very same root");
+  assert_eq!(
+    minted.recipient_id.len(),
+    16,
+    "the node's ML-KEM recipient is made with the root: {minted:?}"
+  );
+  assert_eq!(
+    adopted.recipient_id, minted.recipient_id,
+    "and opened again from its sealed record after the restart (A-92 piece 4a)"
+  );
   assert!(
     adopted.key_slots > 0 && adopted.keys_held > 0,
     "held in the locked region: {adopted:?}"

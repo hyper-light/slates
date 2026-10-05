@@ -779,7 +779,15 @@ pub enum SealKeyOwner {
     /// The volume.
     volume: VolumeId,
   },
+  /// The node's ML-KEM-1024 recipient key pair (seal.md §6), sealed whole under the node's root: what a successor
+  /// unwraps a taken-over volume's lineage key with. Recorded in partition 0 only. Appended.
+  Recipient,
 }
+
+/// Format: the most bytes a sealed recipient record holds: hyper-seal's `Recipient::seal` of a hybrid recipient is one
+/// STREAM file of 5,027 bytes (header 114, id 16, ML-KEM-1024 decapsulation key 3,168 and encapsulation key 1,568,
+/// P-384 scalar 48 and public point 97, tag 16), bounded at the next power of two.
+pub const SEAL_RECIPIENT_RECORD_MAX: usize = 8192;
 
 /// A sealing key, wrapped by its parent (A-92; seal.md §3.3): its owner, its own id (what its children's records name
 /// as their parent), and hyper-seal's 61-byte wrapped record. The key's bytes never appear here.
@@ -789,6 +797,7 @@ pub struct SealKeyRecord {
   pub owner: SealKeyOwner,
   /// The key's own id.
   pub id: [u8; 16],
-  /// The wrapped record, [`SEAL_KEY_RECORD_BYTES`] long.
+  /// The wrapped record: [`SEAL_KEY_RECORD_BYTES`] long, or for the node's recipient its sealed form, at most
+  /// [`SEAL_RECIPIENT_RECORD_MAX`].
   pub record: Vec<u8>,
 }

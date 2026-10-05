@@ -2668,6 +2668,7 @@ fn init_shard(
     issuer_secret,
     seal_root,
     seal_state: sealing,
+    seal_recipient: None,
     content,
     content_range,
     delta_range: delta_range(config, partition, content_range),
@@ -2821,6 +2822,17 @@ fn init_shard(
   }
   crate::retention::retain(&mut state)?;
   crate::retention::derive_log_budgets(&mut state);
+  // The node's ML-KEM recipient (A-92 piece 4a), on the control shard, whose partition holds its sealed record: opened
+  // under the root, or made and recorded now. Unavailable sealing leaves it `None`, reported in status.
+  if partition == 0 {
+    state.seal_recipient = match crate::seal_keys::recipient(&mut state) {
+      Ok(recipient) => Some(recipient),
+      Err(e) => {
+        eprintln!("slates-server: the node's sealing recipient is unavailable: {e:?}");
+        None
+      }
+    };
+  }
   let rebuilt = verbs::rebuild_recovered(&mut state);
   if rebuilt.skipped > 0 {
     RECOVERY_SKIPPED.fetch_add(

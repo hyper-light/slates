@@ -47,6 +47,7 @@ fn report() -> ReplyBody {
         root_id: vec![73; 16],
         key_slots: 79,
         keys_held: 3,
+        recipient_id: vec![83; 16],
       },
       fleet: FleetReport {
         host: 19,

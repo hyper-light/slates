@@ -223,3 +223,32 @@ fn commit(
     Err(SealKeyError::Record)
   }
 }
+
+/// The node's ML-KEM-1024 recipient (A-92 piece 4a; seal.md §6): opened from its record in partition 0 under the node's
+/// root, or made now (hybrid, with P-384) and recorded sealed under the root. It lives as long as the root, so keys
+/// wrapped to it stay openable across a daemon restart and die with the anchor. Called on the control shard, whose
+/// partition holds the record.
+pub fn recipient(
+  state: &mut crate::state::ShardState,
+) -> Result<hyper_seal::recipient::Recipient, SealKeyError> {
+  let owner = slates_db::catalog::SealKeyOwner::Recipient;
+  let recorded = state.db.partition().seal_key(&owner).cloned();
+  let root = state.seal_root.as_ref().ok_or(SealKeyError::Unavailable)?;
+  if let Some(record) = recorded {
+    return Ok(hyper_seal::recipient::Recipient::open(
+      root,
+      &record.record,
+    )?);
+  }
+  let made = hyper_seal::recipient::Recipient::generate(true)?;
+  let sealed = made.seal(root)?;
+  commit(
+    state,
+    slates_db::catalog::SealKeyRecord {
+      owner,
+      id: made.public().id,
+      record: sealed,
+    },
+  )?;
+  Ok(made)
+}

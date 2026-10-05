@@ -22,7 +22,8 @@ use crate::catalog::{
   AttachmentRecord, AuditRecord, CompletionRecord, Consumer, ConsumerRecord, GrantRecord,
   LandingLeaseRecord, LandingRecord, LeaseRecord, LineageEdge, NfsClientRecord,
   NfsDelegationRecord, NfsLockRecord, NfsOpenRecord, Principal, SEAL_KEY_RECORD_BYTES,
-  SealKeyOwner, SealKeyRecord, SnapshotId, SnapshotRecord, Tombstone, VolumeId, VolumeRecord,
+  SEAL_RECIPIENT_RECORD_MAX, SealKeyOwner, SealKeyRecord, SnapshotId, SnapshotRecord, Tombstone,
+  VolumeId, VolumeRecord,
 };
 use crate::error::DbError;
 use crate::op::Op;
@@ -707,7 +708,11 @@ impl Partition {
       // A key is made once: a second record for its owner would leave two keys sealing one owner's content. A record
       // is hyper-seal's fixed length, so a malformed one never enters the log.
       Op::SealKeySet { record } => {
-        if record.record.len() != SEAL_KEY_RECORD_BYTES {
+        let fits = match record.owner {
+          SealKeyOwner::Recipient => (1..=SEAL_RECIPIENT_RECORD_MAX).contains(&record.record.len()),
+          _ => record.record.len() == SEAL_KEY_RECORD_BYTES,
+        };
+        if !fits {
           Err(DbError::SealKeyMalformed {
             len: record.record.len(),
           })

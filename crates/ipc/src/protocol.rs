@@ -946,6 +946,9 @@ pub struct ShardReport {
   /// replicated chunks and manifests at their arena block length, charged from unpromised capacity only.
   /// Appended.
   pub replicated_bytes: u64,
+  /// The node's ML-KEM-1024 recipient id (A-92 piece 4a): live on the control shard, whose partition holds it; empty
+  /// on the others and while sealing is unavailable. Appended.
+  pub seal_recipient_id: Vec<u8>,
 }
 
 /// The daemon's place in its fleet (§4.8; §2.6 boot step 6), as the verbs' placement authority sees it.
@@ -1059,6 +1062,8 @@ pub struct SealReport {
   pub key_slots: u64,
   /// The keys held in it now.
   pub keys_held: u64,
+  /// The node's ML-KEM-1024 recipient id (A-92 piece 4a), or empty while sealing is unavailable. Appended.
+  pub recipient_id: Vec<u8>,
 }
 
 /// One bounded drain of a shard's telemetry ring (§4.14): the operator-facing export of the chokepoint

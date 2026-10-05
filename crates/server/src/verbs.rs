@@ -1999,6 +1999,11 @@ pub fn shard_report(state: &mut ShardState) -> ShardReport {
     landings_in_flight: u64::try_from(state.landing.in_flight.len()).unwrap_or(u64::MAX),
     target_leases: u64::try_from(state.db.partition().landing_leases().count()).unwrap_or(u64::MAX),
     replicated_bytes: state.store.budget.replicated(),
+    seal_recipient_id: state
+      .seal_recipient
+      .as_ref()
+      .map(|recipient| recipient.public().id.to_vec())
+      .unwrap_or_default(),
   }
 }
 
@@ -2148,6 +2153,12 @@ fn daemon_report(state: &mut ShardState, shards: Vec<ShardReport>) -> ReplyBody 
     })
     .unwrap_or((0, 0, 0));
   let fleet = fleet_report(state, &shards);
+  // The node's recipient lives on the control shard: its part carries the id, whichever shard answers.
+  let control_recipient = shards
+    .iter()
+    .find(|shard| shard.control)
+    .map(|shard| shard.seal_recipient_id.clone())
+    .unwrap_or_default();
   ReplyBody::DaemonStatus {
     report: Box::new(DaemonReport {
       pid: std::process::id(),
@@ -2158,13 +2169,13 @@ fn daemon_report(state: &mut ShardState, shards: Vec<ShardReport>) -> ReplyBody 
       clients_refused: crate::daemon::CLIENTS_REFUSED.load(Ordering::Acquire),
       shards,
       fleet,
-      seal: seal_report(state),
+      seal: seal_report(state, control_recipient),
     }),
   }
 }
 
 /// The node's sealing at rest for the status report (A-92): how its root came and its id, and the key region.
-fn seal_report(state: &ShardState) -> slates_ipc::protocol::SealReport {
+fn seal_report(state: &ShardState, recipient_id: Vec<u8>) -> slates_ipc::protocol::SealReport {
   let root_id = state.seal_root.as_ref().map(|root| root.id().0);
   let (slots, held) = hyper_seal::keys_held().unwrap_or((0, 0));
   slates_ipc::protocol::SealReport {
@@ -2172,6 +2183,7 @@ fn seal_report(state: &ShardState) -> slates_ipc::protocol::SealReport {
     root_id: root_id.map(|id| id.to_vec()).unwrap_or_default(),
     key_slots: u64::try_from(slots).unwrap_or(u64::MAX),
     keys_held: u64::try_from(held).unwrap_or(u64::MAX),
+    recipient_id,
   }
 }
 

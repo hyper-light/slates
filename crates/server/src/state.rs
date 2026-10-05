@@ -343,6 +343,10 @@ pub struct ShardState {
   pub seal_root: Option<hyper_seal::keys::WrappingKey>,
   /// How the daemon came by the root, for the status report.
   pub seal_state: crate::seal_keys::RootState,
+  /// The node's ML-KEM-1024 recipient (A-92 piece 4a), on the control shard only (its partition holds the record):
+  /// what a successor unwraps a taken-over volume's lineage key with. `None` elsewhere and while sealing is
+  /// unavailable.
+  pub seal_recipient: Option<hyper_seal::recipient::Recipient>,
   /// Replies waiting for the client's ring (full, or the reply came from another shard), by
   /// client slot; `recorded` says the completion record already exists (at the owner
   /// partition of a forwarded verb), so this shard must not record it again.

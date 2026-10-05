@@ -9198,6 +9198,13 @@ key in the same record (`Op::VolumeDestroyed`'s apply removes it, so a crash can
 `destroying_a_volume_erases_its_sealed_content` (a chunk sealed under a volume's key is refused `Unwrap` once the volume
 is destroyed; it opens without the erase, so the test is non-vacuous). Owed: a tenant's records when its account is
 removed.
+Built (2026-10-05): piece 4a, the node's recipient. The control shard opens the node's ML-KEM-1024 recipient (hybrid
+with P-384) from its record in partition 0 under the root (`SealKeyOwner::Recipient`, hyper-seal's sealed recipient,
+at most `SEAL_RECIPIENT_RECORD_MAX` bytes), or makes and records it, so it lives exactly as long as the root.
+Its id travels on the control shard's status part and is reported as `seal_recipient`; the restart test asserts the
+same recipient after a daemon restart and another under a fresh anchor. Its decapsulation key lives in AWS-LC's
+memory (hyper-seal's `Recipient`), not hyper-seal's locked region; the daemon's process-wide core-dump exclusion
+(AUD-29-41) covers it, and locking it is owed to hyper-seal.
 - Why: condition 9 asks for volumes post-quantum encrypted at rest and in transit. In transit holds already: every TLS
   handshake prefers X25519MLKEM768 (A-66, 2026-10-04), and SecP384r1MLKEM1024 replaces it between nodes once
   hyper-raft's measurement of it lands (its §10). At rest, slates has no disk (R1): a volume rests in RAM, in two
@@ -9245,6 +9252,21 @@ removed.
   under slates' load is what decides it; and the version-keyed rule is worth 20–60× on an overwrite, so the argument
   that a version never repeats is worth making rather than falling back to a key per chunk.
 - Archives leave sealed to an ML-KEM-1024 recipient the operator names.
+- How sealed content rides the content plane unchanged (piece 3b): an **envelope archive**. Before a put, the owner wraps
+  the snapshot's archive in a synthetic one whose chunks are the sealed chunks carried as raw chunks (so a chunk's
+  identity is the BLAKE3 of its sealed bytes) and whose clear tree names one entry per sealed chunk by its keyed name
+  in hex, plus one entry for the sealed real manifest. Holders verify, stage, retain, heal and serve it exactly as any
+  archive, holding no key and learning only counts, sizes and keyed names (seal.md §13). The owner seals a chunk once
+  per keyed name and reuses the sealed bytes, so equal content stays one sealed chunk and holders still deduplicate
+  (seal.md §7: shared by reference, never sealed twice). The head record names the envelope's manifest identity, which
+  says nothing of the plaintext. A reader fetches the envelope, opens the manifest entry under the lineage key, then
+  each chunk it needs.
+- How a successor gets the key (piece 4, landing with 3b, since a successor that cannot open breaks takeover): (4a) each
+  node has an ML-KEM-1024 recipient key pair for the anchor's life, its secret half sealed under the node root
+  (hyper-seal's `Recipient::seal`) and recorded in partition 0, so a daemon restart keeps it; (4b) each node announces
+  its recipient public key to its peers over the authenticated record sessions, and keeps theirs; (4c) the head record
+  carries the volume's lineage key wrapped to each record candidate whose key it holds (seal.md §6, hybrid
+  ML-KEM-1024 with P-384), so any candidate that succeeds unwraps it, and no other node can.
 - Order of build: (1) the vendored crate in the build, its known-answer behaviour exercised by slates' use; (2) the
   key hierarchy in the daemon and the anchor's handover of the root; (3) sealed content on the content plane, with
   holders verifying ciphertext and keyed names in the missing sets; (4) the successor's wrapped lineage key in the

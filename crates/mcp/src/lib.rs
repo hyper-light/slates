@@ -1680,6 +1680,7 @@ pub fn daemon_json(r: &DaemonReport, telemetry: &[TelemetryReport]) -> Value {
     "seal": {
       "state": r.seal.state,
       "root_id": r.seal.root_id.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+      "recipient_id": r.seal.recipient_id.iter().map(|b| format!("{b:02x}")).collect::<String>(),
       "key_slots": r.seal.key_slots,
       "keys_held": r.seal.keys_held,
     },

@@ -1714,9 +1714,15 @@ fn daemon_status_text(report: &DaemonReport, telemetry: &[TelemetryReport]) -> S
     .iter()
     .map(|b| format!("{b:02x}"))
     .collect();
+  let recipient: String = report
+    .seal
+    .recipient_id
+    .iter()
+    .map(|b| format!("{b:02x}"))
+    .collect();
   out.push_str(&format!(
-    "seal: {}\nseal_root: {}\nseal_key_slots: {}\nseal_keys_held: {}\n",
-    report.seal.state, root, report.seal.key_slots, report.seal.keys_held
+    "seal: {}\nseal_root: {}\nseal_recipient: {}\nseal_key_slots: {}\nseal_keys_held: {}\n",
+    report.seal.state, root, recipient, report.seal.key_slots, report.seal.keys_held
   ));
   out.push_str(&takeover_text(&report.fleet.takeover));
   out.push_str(&group_text("council", &report.fleet.council));
