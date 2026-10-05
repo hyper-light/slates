@@ -3640,4 +3640,6 @@ shard's own clock that A-65 budgets in (docs/bugs/2026-10-04-the-slow-observatio
     still about 1.9× knfsd's 1.95 ms on a quiet run: a v4 page is built by encoding and decoding a v3 READDIRPLUS
     reply. Owed: a v4 listing served from the volume's rows directly, routed as the v3 call is;
   - the same storm on a k8s node;
-  - a remote (fleet) read under contention, for condition 7's tail.
+  - a remote (fleet) read under contention, for condition 7's tail. The fetch is now striped and hedged across the
+    recorded holders (A-91); a benchmark of it under delay, loss and contention on the simulated fabric is next, and
+    remote attach (Phase 8 item 13) is owed.

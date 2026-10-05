@@ -139,10 +139,15 @@ impl Room {
   const BLOCKS: usize = 4;
 
   fn new() -> Room {
+    Room::with_blocks(Self::BLOCKS)
+  }
+
+  /// A room of `blocks` pages.
+  fn with_blocks(blocks: usize) -> Room {
     let page = rustix::param::page_size();
     let mut arena = ChunkArena::new(page);
     arena
-      .add_region(slates_mem::region::Region::map(page * Self::BLOCKS, page, false).unwrap())
+      .add_region(slates_mem::region::Region::map(page * blocks, page, false).unwrap())
       .unwrap();
     let capacity = u64::try_from(arena.capacity()).unwrap();
     Room {
@@ -583,7 +588,7 @@ struct FetchObservation {
 /// exactly one wanted on resumption, and the archive rebuilt byte for byte from the stage.
 #[test]
 fn a_cut_fetch_resumes_over_a_session_with_exactly_the_chunks_still_owed() {
-  use slates_cluster::content::{Placed, fetch_chunks, fetch_manifest};
+  use slates_cluster::content::{FetchTiming, Placed, fetch_chunks, fetch_manifest};
   let mut simulation = SimRuntime::new(&config(), 1).unwrap();
   let shard = simulation.shard_ids()[0];
   let (owner_identity, holder_identity) = (identity(), identity());
@@ -650,11 +655,16 @@ fn a_cut_fetch_resumes_over_a_session_with_exactly_the_chunks_still_owed() {
       };
       let first_wanted = stage(&mut reader, &mut room);
       let mut kept = 0;
-      let (first_complete, endpoint) = fetch_chunks(
-        endpoint,
+      let timing = FetchTiming {
+        deadline_ns: deadline,
+        hedge_after_ns: deadline,
+        poll_ns: config().timer_tick_ns,
+      };
+      let first = fetch_chunks(
+        vec![(HOLDER, endpoint)],
         (object, identity),
         first_wanted.clone(),
-        deadline,
+        timing,
         |chunk| {
           if kept > 0 {
             return false; // the cut: the second chunk is never kept
@@ -671,12 +681,13 @@ fn a_cut_fetch_resumes_over_a_session_with_exactly_the_chunks_still_owed() {
         },
       )
       .await;
+      let first_complete = first.complete;
       let resumed_wanted = stage(&mut reader, &mut room);
-      let (_, _endpoint) = fetch_chunks(
-        endpoint,
+      let _resumed = fetch_chunks(
+        first.sessions,
         (object, identity),
         resumed_wanted.clone(),
-        deadline,
+        timing,
         |chunk| {
           let mut space = HoldSpace {
             arena: &mut room.arena,
@@ -715,5 +726,244 @@ fn a_cut_fetch_resumes_over_a_session_with_exactly_the_chunks_still_owed() {
       resumed_wanted: 1,
       rebuilt: true,
     }
+  );
+}
+
+/// Shape: the chunks of the striped archive: enough that, ranked by identity, each of two holders is asked first
+/// for some of them (all eight on one holder would be one chance in 256, and the hedge-off run shows it is not).
+const STRIPED_CHUNKS: usize = 8;
+/// Shape: the blocks a room needs for the striped archive: its chunks, the manifest and one verification scratch
+/// block, rounded up to the buddy's power of two.
+const STRIPED_BLOCKS: usize = 16;
+/// Shape: the second recorded holder of the striped fetch, the silent one.
+const SILENT: HostId = HostId(4);
+
+/// An archive of [`STRIPED_CHUNKS`] small files, one chunk each.
+fn striped_archive() -> Archive {
+  let chunks: Vec<_> = (0..STRIPED_CHUNKS)
+    .map(|at| Archive::raw_chunk(format!("striped chunk number {at}").into_bytes()))
+    .collect();
+  let entries = chunks
+    .iter()
+    .enumerate()
+    .map(|(at, chunk)| Entry {
+      name: format!("f{at}"),
+      meta: NodeMeta {
+        size: chunk.raw_len,
+        ..NodeMeta::default()
+      },
+      node: Node::File(vec![Extent {
+        offset: 0,
+        len: chunk.raw_len,
+        chunk: chunk.identity,
+        chunk_offset: 0,
+      }]),
+    })
+    .collect();
+  Archive {
+    manifest: Node::Directory(entries),
+    chunks,
+    ..archive()
+  }
+}
+
+/// What the striped fetch observed.
+#[derive(Debug)]
+struct StripedObservation {
+  complete: bool,
+  rebuilt: bool,
+  hedges: u64,
+  sessions_back: usize,
+}
+
+/// A holder over a fresh socket holding `archive`, serving content until idle (`serve` true), or one that
+/// establishes its session and never answers (`serve` false) — a recorded holder that went silent.
+fn spawn_fetch_holder(
+  simulation: &mut SimRuntime,
+  shard: slates_rt::ShardId,
+  (holder_identity, reader_certificate): (Identity, rustls::pki_types::CertificateDer<'static>),
+  (holder_tx, reader_rx): (
+    std::sync::mpsc::Sender<SocketAddrV4>,
+    Receiver<SocketAddrV4>,
+  ),
+  serve: bool,
+) {
+  simulation
+    .spawn_on(shard, async move {
+      let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+      holder_tx.send(socket.local_addr().unwrap()).unwrap();
+      let reader_address = address_from(reader_rx).await;
+      let mut endpoint = Endpoint::server(
+        socket,
+        reader_address,
+        &holder_identity,
+        &[reader_certificate],
+        slates_transport::connection::ConnectionShape::for_frame_cap(
+          slates_transport::endpoint::MAX_PACKET_PAYLOAD,
+          CONTENT_RECEIVE_CEILING,
+        ),
+      )
+      .unwrap();
+      endpoint.establish().await.unwrap();
+      if !serve {
+        return; // Silent: the session is up, and nothing is ever answered.
+      }
+      let mut held = ContentHold::new();
+      let mut room = Room::with_blocks(STRIPED_BLOCKS);
+      let mut space = HoldSpace {
+        arena: &mut room.arena,
+        budget: &mut room.budget,
+        metadata: &mut room.metadata,
+      };
+      held
+        .hold(
+          &mut space,
+          ObjectId::new(OWNER, 1),
+          slates_cluster::content::Placed::default(),
+          striped_archive(),
+        )
+        .unwrap();
+      while serve_bounded(&mut endpoint, &mut held, &mut room).await {}
+    })
+    .unwrap();
+}
+
+/// Fetches the striped archive from a serving holder and a silent one, hedging after `hedge_after_ns`.
+fn run_striped_fetch(hedge_after_ns: u64) -> StripedObservation {
+  use slates_cluster::content::{FetchTiming, Placed, fetch_chunks, fetch_manifest};
+  let mut simulation = SimRuntime::new(&config(), 1).unwrap();
+  let shard = simulation.shard_ids()[0];
+  let (reader_identity, serving_identity, silent_identity) = (identity(), identity(), identity());
+  let reader_certificate = reader_identity.certificate();
+  let (serving_certificate, silent_certificate) = (
+    serving_identity.certificate(),
+    silent_identity.certificate(),
+  );
+  let (serving_tx, serving_rx) = channel();
+  let (reader_serving_tx, reader_serving_rx) = channel();
+  let (silent_tx, silent_rx) = channel();
+  let (reader_silent_tx, reader_silent_rx) = channel();
+  spawn_fetch_holder(
+    &mut simulation,
+    shard,
+    (serving_identity, reader_certificate.clone()),
+    (serving_tx, reader_serving_rx),
+    true,
+  );
+  spawn_fetch_holder(
+    &mut simulation,
+    shard,
+    (silent_identity, reader_certificate),
+    (silent_tx, reader_silent_rx),
+    false,
+  );
+  let (observed_tx, observed_rx) = channel();
+  simulation
+    .spawn_on(shard, async move {
+      let serving = dial(
+        &reader_identity,
+        &serving_certificate,
+        reader_serving_tx,
+        serving_rx,
+      )
+      .await;
+      let silent = dial(
+        &reader_identity,
+        &silent_certificate,
+        reader_silent_tx,
+        silent_rx,
+      )
+      .await;
+      let archive = striped_archive();
+      let (object, identity) = (ObjectId::new(OWNER, 1), archive.manifest_identity());
+      let deadline = COLLECTION_NS * 4;
+      let (manifest, serving) = fetch_manifest(serving, object, identity, deadline).await;
+      let manifest = manifest.expect("the serving holder has the manifest");
+      let mut reader = ContentHold::new();
+      let mut room = Room::with_blocks(STRIPED_BLOCKS);
+      let wanted = {
+        let mut space = HoldSpace {
+          arena: &mut room.arena,
+          budget: &mut room.budget,
+          metadata: &mut room.metadata,
+        };
+        reader
+          .stage_fetched(&mut space, object, Placed::default(), &manifest)
+          .unwrap()
+          .unwrap_or_default()
+      };
+      let timing = FetchTiming {
+        deadline_ns: deadline,
+        hedge_after_ns,
+        poll_ns: config().timer_tick_ns,
+      };
+      let fetched = fetch_chunks(
+        vec![(HOLDER, serving), (SILENT, silent)],
+        (object, identity),
+        wanted,
+        timing,
+        |chunk| {
+          let mut space = HoldSpace {
+            arena: &mut room.arena,
+            budget: &mut room.budget,
+            metadata: &mut room.metadata,
+          };
+          reader
+            .stage_piece(&mut space, object, &identity, chunk)
+            .is_ok()
+        },
+      )
+      .await;
+      let mut space = HoldSpace {
+        arena: &mut room.arena,
+        budget: &mut room.budget,
+        metadata: &mut room.metadata,
+      };
+      let rebuilt = fetched.complete
+        && reader.complete_stage(&mut space, object).is_ok()
+        && reader.archive_of(&room.arena, object, &identity) == Some(archive);
+      observed_tx
+        .send(StripedObservation {
+          complete: fetched.complete,
+          rebuilt,
+          hedges: fetched.hedges,
+          sessions_back: fetched.sessions.len(),
+        })
+        .unwrap();
+    })
+    .unwrap();
+  simulation.run_until_idle();
+  observed_rx.try_recv().unwrap()
+}
+
+/// A-91 (§4.10 failure matrix: "a recorded holder unreachable during fetch: Masked (another recorded holder,
+/// hedged)"): a reader fetches an eight-chunk archive from two recorded holders, one of which went silent after
+/// its session formed. Do: fetch with the hedge at a quarter of the deadline, and again with the hedge off. Expect
+/// the hedged fetch complete, the archive rebuilt byte for byte, at least one hedge sent, and both sessions back;
+/// and the unhedged fetch incomplete at its deadline — the silent holder was asked first for some chunks, so the
+/// hedge is what masked it (until A-91 a fetch asked one holder, and a silent one cost the whole period).
+#[test]
+fn a_silent_recorded_holder_is_masked_by_hedging_to_the_other() {
+  let hedged = run_striped_fetch(COLLECTION_NS);
+  assert!(
+    hedged.complete && hedged.rebuilt,
+    "the hedged fetch completes: {hedged:?}"
+  );
+  assert!(
+    hedged.hedges > 0,
+    "the silent holder's chunks were hedged: {hedged:?}"
+  );
+  assert_eq!(
+    hedged.sessions_back, 2,
+    "both sessions come back: {hedged:?}"
+  );
+  let unhedged = run_striped_fetch(u64::MAX);
+  assert!(
+    !unhedged.complete,
+    "without the hedge the silent holder's chunks never arrive: {unhedged:?}"
+  );
+  assert_eq!(
+    unhedged.sessions_back, 2,
+    "both sessions come back: {unhedged:?}"
   );
 }

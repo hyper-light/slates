@@ -625,7 +625,11 @@ pub struct ShardState {
   /// the remaining candidates are hedged. Bounded to a window of the newest readings; empty until the
   /// first content acknowledgement, and on a laptop, where no content round runs — the trigger is then
   /// one period (R8, the same code with an empty window).
-  pub put_latency: crate::fleet::PutLatency,
+  pub put_latency: crate::fleet::LatencyWindow,
+  /// The measured fetch latency of the content class on this shard (A-91): each chunk's time from its first
+  /// request to its verified arrival, whose p95 is the hedge trigger for a fetch's chunks. Empty until the first
+  /// fetch, and on a laptop, where none runs — the trigger is then one period (R8).
+  pub fetch_latency: crate::fleet::LatencyWindow,
   /// The measured **put-failure rate** of this owner shard's content class (§4.8 "Derived constants":
   /// "healer cadence from the measured put-failure rate"): how many content rounds ended placed and how
   /// many ended short (uncertain at the deadline, or every holder answering short of quorum), over the

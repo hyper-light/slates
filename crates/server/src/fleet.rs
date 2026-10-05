@@ -59,7 +59,7 @@
 //! identically), and the record plane reaches every owner shard each period through [`crate::xshard`]:
 //! the seal walk and the head values run there, the archives and heads move here by value for the
 //! dispatch, and the acknowledgements and durable placements are recorded back there. The hedge to the
-//! remaining candidates fires on the **measured p95** of the content class's put latency ([`PutLatency`],
+//! remaining candidates fires on the **measured p95** of the content class's put latency ([`LatencyWindow`],
 //! [`hedge_delay_ns`]), one period before any reading. **Anti-entropy and the healer** are one step per
 //! healer period ([`heal_one_placed_snapshot`]): a placed snapshot is re-offered to its candidates through
 //! the same rounds — a holder that lost content is put exactly what it lacks (a repair, counted), one that
@@ -2233,17 +2233,18 @@ const PUT_LATENCY_WINDOW: usize = PUT_LATENCY_SEALS * 2;
 /// a hundred), so the trigger is a real tail, not the median of a handful.
 const PUT_LATENCY_SEALS: usize = 100;
 
-/// The measured put latency of the content class on one owner shard (§4.8 "Derived constants": "hedge
-/// delay = measured p95 put latency per class"): the newest [`PUT_LATENCY_WINDOW`] readings in arrival
-/// order, each the time from a put round's dispatch to one holder's verified acknowledgement. The p95 over
-/// them — the reading nineteen in twenty acknowledgements arrive within — is the hedge trigger
-/// ([`hedge_delay_ns`]). Bounded: the oldest reading leaves as the newest arrives (banned item 8).
+/// A measured latency class on one shard (§4.8 "Derived constants": "hedge delay = measured p95 put latency per
+/// class"): the newest [`PUT_LATENCY_WINDOW`] readings in arrival order. The content put class reads the time from
+/// a put round's dispatch to one holder's verified acknowledgement; the content fetch class (A-91) reads the time
+/// from a chunk's first request to its verified arrival. The p95 over them — the reading nineteen in twenty arrive
+/// within — is the class's hedge trigger ([`hedge_delay_ns`]). Bounded: the oldest reading leaves as the newest
+/// arrives (banned item 8).
 #[derive(Debug, Default)]
-pub struct PutLatency {
+pub struct LatencyWindow {
   readings_ns: std::collections::VecDeque<u64>,
 }
 
-impl PutLatency {
+impl LatencyWindow {
   /// Records one acknowledgement's latency, forgetting the oldest reading past the window.
   pub fn record(&mut self, latency_ns: u64) {
     if self.readings_ns.len() >= PUT_LATENCY_WINDOW {
@@ -2336,7 +2337,7 @@ fn heal_period_ns(outcomes: &PutOutcomes) -> u64 {
 /// at, so the first hedge waits exactly one round, the same code path with an empty window (R8). Dean &
 /// Barroso's hedged requests: "send the request to a replica … after the request has been outstanding for
 /// longer than the 95th-percentile expected latency for this class of requests" (CACM 2013).
-fn hedge_delay_ns(latency: &PutLatency) -> u64 {
+fn hedge_delay_ns(latency: &LatencyWindow) -> u64 {
   latency.p95_ns().unwrap_or(HEARTBEAT_NS)
 }
 
@@ -2350,7 +2351,7 @@ fn hedge_delay_ns(latency: &PutLatency) -> u64 {
 /// gathering acknowledgements at the delay — the ratified late-work rule — so a round with none at the p95
 /// expires there and is hedged); the stall window = the hedge delay itself (an acknowledgement within one
 /// delay is progress); poll = the collection cadence ([`POLL_PER_PERIOD`]).
-fn content_budget(latency: &PutLatency, round: CommitBudget) -> CommitBudget {
+fn content_budget(latency: &LatencyWindow, round: CommitBudget) -> CommitBudget {
   let hedge_delay = hedge_delay_ns(latency);
   let span = round.max_deadline_ns().max(hedge_delay);
   CommitBudget::with_extension(
@@ -2629,6 +2630,13 @@ async fn materialize_pending(origin: u16, budget: CommitBudget) {
   }
 }
 
+/// Counter: chunk requests a takeover fetch hedged to a further recorded holder (A-91).
+/// Format: a counter name in the daemon's status report.
+const FETCH_HEDGED: &str = "fleet.fetch.hedged";
+/// Counter: recorded holders a takeover fetch dropped (session lost or a false answer), their chunks moved on (A-91).
+/// Format: a counter name in the daemon's status report.
+const FETCH_HOLDER_FAILED: &str = "fleet.fetch.holder_failed";
+
 /// Fetches `object`'s content `manifest` from a recorded holder into this node's hold (§4.10 "fetches … by
 /// identity from a recorded holder"; AUD-29-55): the manifest, staged as placed for the adopted head's
 /// sequence (the retention rule keeps it while the head names this node), then each chunk the stage lacks,
@@ -2642,16 +2650,18 @@ async fn fetch_into_hold(
   budget: CommitBudget,
 ) -> bool {
   let holders = head.holders();
+  // Every reachable recorded holder: the manifest from one, the chunks striped and hedged across all of them
+  // (A-91; §4.10 "hedged fetches by identity from the recorded holders"), so one slow or lost holder is masked.
   let mut sessions = take_sessions(|host| holders.contains(&host));
   let Some((host, endpoint)) = sessions.pop() else {
     return_sessions(sessions);
     return false; // No recorded holder reachable this period.
   };
-  return_sessions(sessions);
   let (fetched, endpoint) =
     fetch_manifest(endpoint, object, manifest, budget.max_deadline_ns()).await;
+  sessions.push((host, endpoint));
   let Some(fetched) = fetched else {
-    return_sessions(vec![(host, endpoint)]);
+    return_sessions(sessions);
     return false;
   };
   let staged = state::with_state(|s| {
@@ -2667,37 +2677,49 @@ async fn fetch_into_hold(
   });
   let wanted = match staged {
     Some(Ok(None)) => {
-      return_sessions(vec![(host, endpoint)]);
+      return_sessions(sessions);
       return true;
     }
     Some(Ok(Some(wanted))) => wanted,
     Some(Err(_)) | None => {
-      return_sessions(vec![(host, endpoint)]);
+      return_sessions(sessions);
       count_refusal(MATERIALIZE_REFUSED);
       return false;
     }
   };
-  let (_, endpoint) = fetch_chunks(
-    endpoint,
-    (object, manifest),
-    wanted,
-    budget.max_deadline_ns(),
-    |chunk| {
-      state::with_state(|s| {
-        s.held_content
-          .stage_piece(
-            &mut crate::content_holder::hold_space(&mut s.store),
-            object,
-            &manifest,
-            chunk,
-          )
-          .is_ok()
-      })
-      .unwrap_or(false)
-    },
-  )
+  let hedge_after_ns =
+    state::with_state(|s| hedge_delay_ns(&s.fetch_latency)).unwrap_or(HEARTBEAT_NS);
+  let timing = slates_cluster::content::FetchTiming {
+    deadline_ns: budget.max_deadline_ns(),
+    hedge_after_ns,
+    poll_ns: budget.poll_interval_ns,
+  };
+  let fetched = fetch_chunks(sessions, (object, manifest), wanted, timing, |chunk| {
+    state::with_state(|s| {
+      s.held_content
+        .stage_piece(
+          &mut crate::content_holder::hold_space(&mut s.store),
+          object,
+          &manifest,
+          chunk,
+        )
+        .is_ok()
+    })
+    .unwrap_or(false)
+  })
   .await;
-  return_sessions(vec![(host, endpoint)]);
+  return_sessions(fetched.sessions);
+  state::with_state(|s| {
+    for latency in &fetched.latencies_ns {
+      s.fetch_latency.record(*latency);
+    }
+    if fetched.hedges > 0 {
+      *s.refusals.entry(FETCH_HEDGED).or_insert(0) += fetched.hedges;
+    }
+    if fetched.failed_holders > 0 {
+      *s.refusals.entry(FETCH_HOLDER_FAILED).or_insert(0) += fetched.failed_holders;
+    }
+  });
   state::with_state(|s| {
     s.held_content
       .complete_stage(&mut crate::content_holder::hold_space(&mut s.store), object)
@@ -5977,7 +5999,7 @@ mod tests {
   /// newest arrives, so a load regime is forgotten within a window of seals.
   #[test]
   fn the_hedge_delay_is_the_measured_p95_over_a_bounded_window() {
-    let mut latency = PutLatency::default();
+    let mut latency = LatencyWindow::default();
     assert_eq!(
       hedge_delay_ns(&latency),
       HEARTBEAT_NS,
@@ -6014,7 +6036,7 @@ mod tests {
   /// hold) and the hedge never fired — one run in three, on the sub-poll timing of the deadline race.
   #[test]
   fn a_round_with_no_acknowledgement_at_the_hedge_delay_expires_rather_than_extends() {
-    let mut latency = PutLatency::default();
+    let mut latency = LatencyWindow::default();
     latency.record(10 * MS);
     let budget = content_budget(&latency, consensus_budget(None));
     let hedge_delay = hedge_delay_ns(&latency);

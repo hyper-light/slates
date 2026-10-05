@@ -9122,3 +9122,26 @@ Status: built 2026-10-05.
 - Measured (native Linux NFSv4.2 loopback, a listing of 8,300 entries after each create; load average 6–10): p50
   7.76 → 3.6–3.9 ms. Linux's kernel nfsd over tmpfs, same loop: p50 1.95–4.6 ms. Owed: a v4 page that does not pass
   through a v3 reply's encoding and decoding.
+
+### A-91 — A chunk fetch stripes across the recorded holders and hedges at the measured p95 (2026-10-05)
+Applied in the same change to: `crates/cluster/src/content.rs` (`fetch_chunks`, `FetchTiming`, `Fetched`,
+`chunk_rank`, the per-holder `fetch_worker`), `crates/server/src/fleet.rs` (`fetch_into_hold`, `LatencyWindow`
+generalized from the put class, `FETCH_HEDGED`, `FETCH_HOLDER_FAILED`), `crates/server/src/state.rs`
+(`fetch_latency`), `crates/cluster/tests/content.rs`, GAPS.
+Status: built 2026-10-05 (the fetch half of Phase 8 item 13; remote attach itself is owed).
+- What: §4.10 says chunk reads "fault to hedged fetches by identity from the recorded holders", and its failure
+  matrix promises "a recorded holder unreachable during fetch: Masked (another recorded holder, hedged)". The fetch
+  asked one holder, so a silent or lossy holder cost the takeover's whole period, and the retry came a period
+  later. Now every reachable recorded holder runs a worker over its own session. Each chunk is asked first of the
+  holder its identity ranks highest (`chunk_rank`, the `fmix64` finalizer over the identity and the host), which
+  stripes a fetch across the holders. A chunk still outstanding after the hedge delay is asked of the next-ranked
+  holder too (Dean & Barroso's hedged request); the first verified answer wins. A holder whose session fails, or
+  that answers anything but the chunk asked, is dropped, and its unanswered chunks move to the next holder at once.
+  One holder is the degenerate: no hedge, the same code (R8).
+- The hedge delay is the measured p95 of the fetch class: each kept chunk's time from its first request to its
+  verified arrival, in a bounded window beside the put class's (`LatencyWindow`); one period before any reading,
+  as the put hedge does.
+- Proven: `a_silent_recorded_holder_is_masked_by_hedging_to_the_other` (an eight-chunk archive on a serving and a
+  silent holder: hedged, complete and rebuilt byte for byte with both sessions back; with the hedge off,
+  incomplete at the deadline, so the silent holder was asked first for some chunks). The fleet suite (69 tests,
+  takeover content served over NFS included) passes over the new fetch.
