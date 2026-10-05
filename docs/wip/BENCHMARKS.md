@@ -1859,4 +1859,31 @@ overlay's own 397 ms p50 shows Python's GIL, not the filesystem.)
   RAM. The comparison is of what a caller waits for under the pattern, not of the media.
 - Owed, measured: a write delegation's space limit is zero bytes, so the client flushes at every close. A
   reservation behind a non-zero limit would take the WRITE (0.21 of a create's 0.86 ms) off the close path. The
-  same storm on a Linux host or a k8s node, without Docker Desktop's path, is owed as the RTT floor.
+  same storm through Linux's own client on loopback is below; on a k8s node it is owed.
+
+#### The same storm through Linux's own NFS client on loopback: the Nagle stall, before and after (2026-10-05)
+
+Command: `docs/wip/bench/hotdir/native.sh WORKERS FILES_PER_WORKER` in a privileged `python:3.12-slim-trixie`
+container (header of the script gives the `docker run`): the daemon and the kernel's NFSv4.2 client in one Linux
+(Docker Desktop 6.12 kernel), over loopback, with `tmpfs` as the reference. Apple M5 Max, load average 6.8–8.2
+(other sessions). One run per row.
+
+| workers | op | before p99 | after p99 | after p50 | after p999 | tmpfs p99 |
+|---|---|---|---|---|---|---|
+| 1 | create+write+close | 43 ms | 0.86 ms | 0.47 ms | 1.25 ms | 3.8 µs |
+| 1 | open+read+close | 42 ms | 0.21 ms | 29 µs | 0.27 ms | 4.1 µs |
+| 1 | stat | — | 79 µs | 2.7 µs | 0.12 ms | 1.1 µs |
+| 16 | create+write+close | 690 ms | 13.3 ms | 6.9 ms | 14.4 ms | 1.6 ms |
+| 16 | open+read+close | — | 2.9 ms | 0.72 ms | 4.4 ms | 2.0 ms |
+| 16 | stat | — | 1.5 ms | 0.13 ms | 2.2 ms | 1.1 ms |
+
+- Before, the daemon served each operation at p50 2 µs and p99 0.59–0.72 ms, yet a round trip (mountstats OPEN)
+  cost 1.46–6.3 ms and the tails sat at 40–50 ms: Nagle's algorithm on the server's sockets held a reply written
+  while an earlier one was unacknowledged until the client's delayed ACK (Linux `TCP_DELACK_MIN`, 40 ms). The rt
+  test `a_reply_in_two_writes_does_not_wait_for_the_peers_delayed_acknowledgement` reproduced it on Linux (median
+  round 42 ms, every round after the first 40.7–51 ms) and passes on macOS, which acknowledges at once on loopback
+  here. Fix: `TCP_NODELAY` on every runtime stream (docs/bugs/2026-10-05-nagle-delayed-ack.md).
+- After, mountstats round trips at 1 worker: OPEN 0.32 ms, WRITE 31 µs, CLOSE 25 µs, GETATTR 26 µs. The OPEN with
+  create is the create's remaining cost, and the daemon's local p99 (0.49 ms) is where it goes next.
+- The Docker Desktop runs above never showed the 40 ms stall (p99 at most 1.85 ms); why that path escaped it was
+  not measured.

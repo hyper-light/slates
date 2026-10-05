@@ -245,3 +245,77 @@ fn a_spinning_shard_answers_a_socket_request_without_waiting_out_its_window() {
   );
   rt.shutdown().unwrap();
 }
+
+/// Shape: request/reply rounds timed after the connection settles; the median of them is judged, so a
+/// scheduling hiccup on a loaded host moves one sample, not the verdict.
+const ROUNDS: usize = 32;
+/// Shape: a quarter of the smallest delayed-acknowledgement timer the supported kernels run (Linux
+/// `TCP_DELACK_MIN` = HZ/25 = 40 ms, include/net/tcp.h; macOS `net.inet.tcp.delayed_ack` 100 ms), so a
+/// round that waited for the peer's delayed ACK cannot pass, yet the bound is thousands of loopback
+/// round trips.
+const ROUND_WITHIN: Duration = Duration::from_millis(10);
+
+/// §4.6 (the NFS loopback server's sockets): a server that answers one request in two writes — as it
+/// does when two replies leave in separate batches — must not hold the second write until the client
+/// acknowledges the first. With Nagle's algorithm on, the second small write waits for that ACK, and a
+/// client with nothing to send delays its ACK (40 ms on Linux), so each round costs a delayed-ACK timer:
+/// the 40 ms tails the hot-directory storm measured through a native Linux mount. Do run request/reply
+/// rounds whose reply leaves in two writes; expect the median round far under the delayed-ACK timer.
+#[test]
+fn a_reply_in_two_writes_does_not_wait_for_the_peers_delayed_acknowledgement() {
+  let rt = Runtime::start(&config()).unwrap();
+  let id = rt.shard_ids()[0];
+  let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0), BACKLOG).unwrap();
+  let addr = listener.local_addr().unwrap();
+  rt.spawn_on(id, async move {
+    if let Ok(stream) = listener.accept().await {
+      let mut buf = [0u8; 64];
+      while let Ok(n) = stream.read(&mut buf).await {
+        if n == 0
+          || stream.write_all(REPLY_PREFIX).await.is_err()
+          || stream.write_all(&buf[..n]).await.is_err()
+        {
+          break;
+        }
+      }
+    }
+  })
+  .unwrap();
+  let (tx, rx) = channel();
+  rt.spawn_on(id, async move {
+    let outcome: Result<Vec<Duration>, slates_rt::RtError> = async {
+      let stream = TcpStream::connect(addr).await?;
+      let want = REPLY_PREFIX.len() + REQUEST.len();
+      let mut rounds = Vec::with_capacity(ROUNDS);
+      for _ in 0..ROUNDS {
+        let started = std::time::Instant::now();
+        stream.write_all(REQUEST).await?;
+        let mut got = 0;
+        let mut buf = [0u8; 64];
+        while got < want {
+          let n = stream.read(&mut buf).await?;
+          if n == 0 {
+            break;
+          }
+          got += n;
+        }
+        rounds.push(started.elapsed());
+      }
+      Ok(rounds)
+    }
+    .await;
+    let _ = tx.send(outcome);
+  })
+  .unwrap();
+  let mut rounds = rx
+    .recv_timeout(Duration::from_secs(30))
+    .expect("the rounds completed")
+    .expect("the rounds succeeded");
+  rounds.sort();
+  let median = rounds[rounds.len() / 2];
+  assert!(
+    median < ROUND_WITHIN,
+    "the median round took {median:?} (all: {rounds:?}): the second write waited for a delayed ACK"
+  );
+  rt.shutdown().unwrap();
+}

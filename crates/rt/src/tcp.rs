@@ -61,6 +61,18 @@ fn set_nonblocking_cloexec(fd: &OwnedFd) -> Result<(), RtError> {
   Ok(())
 }
 
+/// Prepares a connected stream (accepted, connected or adopted): non-blocking and close-on-exec, and
+/// `TCP_NODELAY`, so a small write leaves at once instead of waiting for the peer to acknowledge the
+/// previous one (Nagle, RFC 896). Every stream here carries request/reply traffic that the server already
+/// coalesces into one write per batch, so Nagle has nothing left to merge; left on, a reply written while
+/// an earlier one is unacknowledged waits for the client's delayed ACK — 40 ms on Linux (`TCP_DELACK_MIN`),
+/// measured as the median round of `a_reply_in_two_writes_does_not_wait_for_the_peers_delayed_acknowledgement`
+/// on Linux (42 ms before; docs/bugs/2026-10-05-nagle-delayed-ack.md).
+fn prepare_stream(fd: &OwnedFd) -> Result<(), RtError> {
+  set_nonblocking_cloexec(fd)?;
+  rustix::net::sockopt::set_tcp_nodelay(fd, true).map_err(|e| refused("setsockopt(TCP_NODELAY)", e))
+}
+
 /// The bound address of `fd` as an IPv4 socket address.
 fn local_v4(fd: &OwnedFd) -> Result<SocketAddrV4, RtError> {
   match SocketAddr::try_from(getsockname(fd).map_err(|e| refused("getsockname", e))?) {
@@ -105,12 +117,12 @@ impl TcpListener {
   }
 
   /// Accepts the next connection, awaiting readability through the driver when none is pending. The
-  /// accepted socket is made non-blocking and close-on-exec, like the listener.
+  /// accepted socket is made non-blocking and close-on-exec, like the listener, and `TCP_NODELAY`.
   pub async fn accept(&self) -> Result<TcpStream, RtError> {
     loop {
       match accept(&self.fd) {
         Ok(fd) => {
-          set_nonblocking_cloexec(&fd)?;
+          prepare_stream(&fd)?;
           return Ok(TcpStream { fd });
         }
         Err(rustix::io::Errno::AGAIN) => readable(self.fd.as_raw_fd()).await?,
@@ -139,6 +151,8 @@ impl TcpStream {
       }
       Err(e) => return Err(refused("connect", e)),
     }
+    rustix::net::sockopt::set_tcp_nodelay(&fd, true)
+      .map_err(|e| refused("setsockopt(TCP_NODELAY)", e))?;
     Ok(TcpStream { fd })
   }
 
@@ -154,7 +168,7 @@ impl TcpStream {
   /// Adopts a connected stream's descriptor on the current shard: the counterpart to
   /// [`TcpStream::into_fd`]. It is made non-blocking and close-on-exec, as an accepted stream is.
   pub fn from_fd(fd: OwnedFd) -> Result<TcpStream, RtError> {
-    set_nonblocking_cloexec(&fd)?;
+    prepare_stream(&fd)?;
     Ok(TcpStream { fd })
   }
 
