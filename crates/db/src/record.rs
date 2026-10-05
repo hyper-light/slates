@@ -3,7 +3,10 @@
 //! is read, checksum verified before decode, the schema hash in front of the body).
 //!
 //! A record is a 32-byte header then the operation's canonical encoding. The ring's head and
-//! tail are monotonic byte offsets (position = offset modulo capacity; a record may wrap); the
+//! tail are byte offsets that only grow between trims (position = offset modulo capacity; a record may
+//! wrap), and a trim that empties the ring resets both to zero, so the next record reuses the first
+//! pages rather than backing fresh ones (A-71: a daemon's segment kept every page a run had ever logged
+//! through, 1.8 MB more per Docker round, until its 2.86 GB ring wrapped); the
 //! single writer copies the bytes, then publishes the tail with a release store, so a reader
 //! that sees the tail sees the record. A crash inside a copy leaves a record whose header or
 //! checksum does not verify; replay stops there and the writer resumes at that offset, so the
@@ -277,7 +280,16 @@ impl LogRing {
     }
     let words = segment.ring_words(self.kind)?;
     words[3].store(seq, Ordering::Release);
-    words[0].store(at, Ordering::Release);
+    if at == w.tail {
+      // Emptied: the next record starts again at the ring's first byte, so a long run keeps one snapshot interval's
+      // pages backed, not the whole ring's (A-71). Head first: a crash between the two stores leaves the head at the
+      // first byte under the old tail, where the record found carries an earlier sequence than `seq`, so replay
+      // cuts it as torn and the tail with it — an empty ring at the snapshot, as intended.
+      words[0].store(0, Ordering::Release);
+      words[1].store(0, Ordering::Release);
+    } else {
+      words[0].store(at, Ordering::Release);
+    }
     Ok(released)
   }
 }

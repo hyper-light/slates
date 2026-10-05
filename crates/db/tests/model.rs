@@ -1196,3 +1196,90 @@ fn the_snapshot_policy_derives_from_the_budget_and_the_measured_replay() {
   );
   assert!(p.anchors.contains(&"replay_bytes_per_us"));
 }
+
+/// Shape: the snapshot interval of the rewind test — small, so the history crosses hundreds of snapshots.
+const REWIND_INTERVAL: u64 = 16 << 10;
+/// Shape: the log ring of the rewind test: far past what one interval needs, as a daemon's ring is (2.86 GB per
+/// partition against a 1 MB interval on a fresh daemon).
+const REWIND_LOG_BYTES: u64 = 4 << 20;
+/// Shape: how many interval-sized spans of the ring a writer may touch (the interval, the record that crosses it,
+/// and slack for the record header).
+const REWIND_SPANS: u64 = 4;
+
+/// §4.8 (A-71): do renew one lease until the log has carried several times its ring's capacity, snapshotting every
+/// [`REWIND_INTERVAL`] bytes; expect the ring never to write past the first few intervals of its region — a
+/// snapshot's trim empties the ring, and the next record starts again at its first byte, so the pages a long run
+/// keeps backed are one interval's, not the whole ring's (before: a daemon's segment grew 1.8 MB per Docker round
+/// and kept every page until the 2.86 GB ring wrapped). Then recover; expect the same partition. Then put the ring
+/// in the state a crash between the rewind's two stores leaves (the head at the first byte, the tail not yet);
+/// expect recovery to cut the stale record there as torn and come back to the snapshot.
+#[test]
+fn a_trimmed_ring_rewinds_so_a_long_run_touches_one_interval() {
+  let mut seg = segment("slates-db-ring-rewind", REWIND_LOG_BYTES);
+  let mut db = open(&mut seg);
+  db.set_policy(SnapshotPolicy {
+    bytes_between_snapshots: REWIND_INTERVAL,
+  });
+  db.mutate(
+    &mut seg,
+    &Op::VolumeCreated {
+      record: volume(1, "v1"),
+    },
+    0,
+  )
+  .unwrap();
+  let mut now = 10u64;
+  let mut carried = 0u64;
+  while carried < 5 * REWIND_LOG_BYTES {
+    let before = seg.ring_words(RegionKind::Log(0)).unwrap()[1].load(Ordering::Acquire);
+    db.mutate(&mut seg, &lease(1, 1, now + 1_000), now).unwrap();
+    let after = seg.ring_words(RegionKind::Log(0)).unwrap()[1].load(Ordering::Acquire);
+    carried += after.saturating_sub(before).max(1);
+    now += 1;
+  }
+  assert!(
+    db.snapshots_taken() > 100,
+    "{} snapshots",
+    db.snapshots_taken()
+  );
+  let untouched_from =
+    slates_anchor::layout::RING_BYTES + usize::try_from(REWIND_SPANS * REWIND_INTERVAL).unwrap();
+  let ring_end = usize::try_from(REWIND_LOG_BYTES).unwrap();
+  let mut chunk = vec![0u8; 64 << 10];
+  let mut at = untouched_from;
+  while at < ring_end {
+    let len = chunk.len().min(ring_end - at);
+    seg
+      .region_read(RegionKind::Log(0), at, &mut chunk[..len])
+      .unwrap();
+    assert!(
+      chunk[..len].iter().all(|byte| *byte == 0),
+      "the ring wrote at byte {} or after, past {REWIND_SPANS} intervals",
+      at
+    );
+    at += len;
+  }
+  db.snapshot(&mut seg).unwrap();
+  let before = db.partition().to_snapshot(0);
+  drop(db);
+  let (recovered, _) = recover(&mut seg, 0, caps(), now).unwrap();
+  assert_eq!(
+    recovered.partition().to_snapshot(0),
+    before,
+    "a rewound ring recovers"
+  );
+  drop(recovered);
+  let words = seg.ring_words(RegionKind::Log(0)).unwrap();
+  let head = words[0].load(Ordering::Acquire);
+  words[1].store(head + REWIND_INTERVAL, Ordering::Release);
+  let (recovered, stats) = recover(&mut seg, 0, caps(), now).unwrap();
+  assert!(
+    stats.torn,
+    "the stale record at the rewound head is cut as torn"
+  );
+  assert_eq!(
+    recovered.partition().to_snapshot(0),
+    before,
+    "a crash mid-rewind recovers the snapshot"
+  );
+}

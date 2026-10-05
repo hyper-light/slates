@@ -1615,3 +1615,43 @@ Attribution, from a `MallocStackLogging=1` memory graph (`leaks --forkCorpse --o
 3,001 dirty 16 KiB pages (48 MB). The heap growth from 8,000 files was about 10 MB: the attribute inode each
 provenance attribute takes (5 MB of inode slab), directory and trie slabs, and the op log's ring (5.6 MB, bounded by
 its budget). The runtime's per-shard build (11 MB) is fixed, present in the empty daemon.
+
+### Docker containers over a slates volume, and the partition log's resident pages (A-71, 2026-10-04)
+
+**Command:** `bash e2e-docker-nfs.sh` (scratch, kept with this record's session). One anchor with `--shards 4`,
+one bounded volume, `slates export ID`, then `docker volume create --driver local --opt type=nfs --opt
+o=addr=host.docker.internal,vers=4.2,proto=tcp,port=PORT,hard --opt device=:EXPORT`: Docker Desktop's Linux VM
+mounts the volume with its own kernel NFSv4.2 client. There is no host mount, no Docker Desktop file share and no
+privilege on the Mac. Workload in `node:22`, over npm's own tree (2,524 entries, 18 MB): `cp -a`, `find`, read
+and hash every file, `tar cf`, `rm -rf`, `tar xf`, `rm -rf`. Compared with a Docker Desktop host-directory bind
+(APFS) and the container's own overlay. Apple M5 Max, Docker Desktop 29.3.1, load average 62–70 from other
+sessions. Times in ms, three alternating rounds:
+
+| step | slates NFSv4.2 volume | host-directory bind | container overlay |
+|---|---|---|---|
+| `cp -a` | 3,531 / 4,189 / 5,655 | 3,341 / 55,590 / 55,684 | 69 / 85 / 71 |
+| `find` | 249 / 359 / 645 | 123 / 167 / 108 | 4 / 4 / 6 |
+| read and hash all | 1,753 / 4,320 / 3,202 | 817 / 461 / 485 | 31 / 35 / 33 |
+| `tar cf` | 1,278 / 2,690 / 2,066 | 4,448 / 14,925 / 7,874 | 12 / 13 / 13 |
+| `rm -rf` | 918 / 1,696 / 1,520 | 3,283 / 13,914 / 10,197 | 15 / 14 / 15 |
+| `tar xf` | 4,244 / 4,922 / 7,805 | 15,497 / 44,668 / 47,126 | 44 / 41 / 41 |
+| `rm -rf` | 846 / 893 / 1,857 | 6,904 / 24,597 / 14,328 | 15 / 15 / 16 |
+
+The same workload over the host's `slates mount` bound into the container (the OCI form, `-v MNT:/work`) fails at
+`rm -rf`: "Directory not empty", 2,473 of 2,524 entries left as `.nfs.*` (Docker Desktop's share keeps every touched
+file open on the host, so the macOS NFS client silly-renames each delete; `docs/wip/oci-handoff.md` §4). The NFSv4.2
+volume leaves the volume empty after every round.
+
+Daemon RSS over repeated rounds, 512 MiB volume:
+
+| | round 3 | round 12 | round 24 |
+|---|---|---|---|
+| before A-71 | 90.8 MB | 107.1 MB | 128.9 MB |
+| after A-71 | 87.0 MB | 88.0 MB | 89.1 MB |
+
+Attribution before the fix: `footprint --forkCorpse -v` diffed between rounds 4 and 10 put all the growth in one
+4,893,375-page region (434 → 1,078 dirty pages), the anchor segment (`SLATES_ANCHOR_LEN` 80,173,056,000 bytes). A
+`mincore` count over the volume shard's slice of the content object stayed at 2,115 pages, and the heap grew 492 KiB.
+On a 4 GiB volume the op log's budget (1% of the quota, 43 MB) also fills over the first rounds; that is charged
+and bounded.
+

@@ -8651,3 +8651,27 @@ Status: built 2026-10-04.
   4,000 more of 4 KiB 115–124 → 84 MB.
 - Proven: `a_canonical_sidecar_keeps_no_working_copy_and_any_other_keeps_its_own` (failed first: 4,096 bytes
   held); the five captured-vector tests pass unchanged; through a real mount, `xattr -w/-p/-d` and `cp -p` round-trip.
+
+### A-71 — A partition log ring that a trim empties starts again at its first byte (2026-10-04)
+Applied in the same change to: `crates/db/src/record.rs` (`LogRing::trim`), `crates/db/tests/model.rs`,
+BENCHMARKS, GAPS, `docs/bugs/2026-10-04-the-partition-log-kept-every-page-it-ever-logged-through.md`.
+Status: built 2026-10-04.
+- Why: the §4.8 log ring's head and tail were monotonic offsets, positions taken modulo the capacity. Each snapshot
+  trims the ring behind it, but the next record went on at the old tail. The anchor segment is sparse, and a page the
+  writer touched stayed backed. So a long run backed every page it had ever logged through, until the ring wrapped at
+  its capacity (`log_bytes_per_partition` = 2.86 GB on this host, four partitions). A Docker workload over an NFSv4.2
+  volume grew the daemon by 1.8 MB per round, linear over 24 rounds, with the volume empty after each round. The
+  snapshot interval on a fresh daemon is 1 MB, so the ring never held more than that at once.
+- What: a trim that empties the ring (every trim the snapshot policy performs: the snapshot covers through the last
+  record) stores the new sequence base, then the head at 0, then the tail at 0. A crash between the two offset
+  stores leaves the head at the first byte under the old tail. The record there carries an earlier sequence than the
+  base (sequences only grow, and the header's sequence is checked), so replay cuts it as torn and the tail with it:
+  an empty ring at the snapshot. Rejected: advancing both offsets to the next multiple of the capacity (offsets stay
+  monotonic), because at one snapshot per megabyte a 2.86 GB stride exhausts a `u64` in about 74 days of
+  1 GB/s logging.
+- Measured (BENCHMARKS, "The partition log's resident pages"): 24 Docker rounds, daemon RSS from round 3 to round 24
+  +38.0 MB before, +2.1 MB after.
+- Proven: `a_trimmed_ring_rewinds_so_a_long_run_touches_one_interval` (failed first: the ring wrote at byte 65,600
+  and on, past four 16 KiB intervals), including the crash state between the two stores; db 101/101; server
+  recovery 16/16.
+

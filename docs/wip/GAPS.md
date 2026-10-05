@@ -3496,3 +3496,20 @@ inode (about 600 B of slab per file); a small value held in the owner's table wa
 cost and is not revisited without a measurement.
 Found on the way and fixed: `observe.rs`'s slow question spun by the wall clock, which under load is not late by the
 shard's own clock that A-65 budgets in (docs/bugs/2026-10-04-the-slow-observation-test-was-not-slow-under-load.md).
+
+### 2026-10-04: containers over slates on macOS; the partition log's pages (A-71)
+
+- **Done (A-71):** the partition log ring rewinds when a trim empties it; a long run keeps one snapshot interval's
+  pages, not the whole 2.86 GB ring's (BENCHMARKS).
+- **Measured:** a Docker volume of type `nfs` (NFSv4.2 from Docker Desktop's own Linux kernel, `slates export`)
+  runs a full file workload, including `rm -rf`, with the volume empty afterwards. A host `slates mount` bound into a
+  container cannot: Docker Desktop keeps every touched file open on the host, so deletes become `.nfs.*` entries
+  (2,473 of 2,524). Owed: `slates export` should print the port, or a ready `docker volume create` line, so the
+  NFS-volume form needs no `lsof`; and the OCI report should name the NFS-volume form for Docker Desktop.
+- **Owed:** the read pass over the NFSv4.2 volume is 2–9× the host bind's (1.7–4.3 s against 0.46–0.82 s for 2,524
+  files). Every open is a round trip. NFSv4 read delegations (RFC 8881 §10.4) are the standard remedy, to measure.
+- **Owed:** about 100 KB per round still accumulates (trie slab nodes, 448 KiB over six rounds; inode numbers are
+  never reused). Check that `trie` removal prunes empty nodes.
+- **Owed:** the volume op log's `VecDeque` doubles, so its allocation can reach about twice the 1% budget the volume
+  is charged for. Reserve its capacity from the budget once.
+
