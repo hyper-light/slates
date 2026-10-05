@@ -7,8 +7,12 @@
 pub const MAGIC: u32 = 0x4E41_4C53;
 /// Format: the layout version; changed for header, region or timestamp semantics. Version 3 uses
 /// one host-wide monotonic origin for supervision and retained deadlines; version 2 reset clocks
-/// per instance and cannot be recovered safely by a version-3 daemon.
-pub const LAYOUT_VERSION: u32 = 3;
+/// per instance and cannot be recovered safely by a version-3 daemon. Version 4 (A-98) appends the
+/// content pool's owner words, so a version-3 segment is refused rather than read without them.
+pub const LAYOUT_VERSION: u32 = 4;
+/// Format: one content-pool extent's owner word (A-98): 0 while the extent is free, else its owning partition plus
+/// one, so partition 0 is distinct from "free".
+pub const POOL_WORD_BYTES: usize = 8;
 /// Format: the header's size: magic (4), version (4), identity (32), generation (8), total
 /// length (8), then the encoded geometry (64), padded to two cache lines.
 pub const HEADER_BYTES: usize = 128;
@@ -183,6 +187,8 @@ pub enum RegionKind {
   Audit,
   /// A landing slot.
   Landing(u32),
+  /// The content pool's owner words (A-98): one per extent, one extent per partition.
+  Pool,
 }
 
 /// Where a region sits.
@@ -237,6 +243,10 @@ impl Geometry {
     for slot in 0..self.landing_slots {
       push(RegionKind::Landing(slot), self.landing_slot_bytes);
     }
+    push(
+      RegionKind::Pool,
+      u64::from(self.partitions).saturating_mul(u64::try_from(POOL_WORD_BYTES).unwrap_or(u64::MAX)),
+    );
     out
   }
 

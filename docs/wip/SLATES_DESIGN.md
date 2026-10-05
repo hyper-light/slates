@@ -9485,8 +9485,8 @@ Status: built 2026-10-05 (condition 13, §4.12 `slates.fs`).
   The staging change was red against the merge loop first (a work has no store slot; the catalog record is looked
   up instead). Suites: mcp 12, client 16, daemon 19, bridge-core 76, bridge-nfs 153.
 
-### A-98 — A shard's arena grows from a shared extent pool (planned, 2026-10-05)
-Status: designed 2026-10-05; to be built in the pieces below. Measured cause in BENCHMARKS ("The daemon under a container
+### A-98 — A shard's arena grows from a shared extent pool (2026-10-05, in progress)
+Status: designed 2026-10-05; piece 1 built the same day, the rest to follow in order. Measured cause in BENCHMARKS ("The daemon under a container
 memory cap") and GAPS.
 - Why: a volume lives on one shard, and a shard's content arena is a fixed slice of the anchor's content object,
   RAM ÷ shards ÷ `MEMORY_CLASSES`. A volume's ceiling is therefore 1/(3 × shards) of the machine:
@@ -9507,8 +9507,15 @@ memory cap") and GAPS.
   (region, offset) names (A-64). Recovery re-adds those extents in that order, checked against the owner words, and
   claims the blocks the image names; an extent that a word says is the shard's but no image names is released.
 - Pieces, in order, each tested by use:
-  1. Layout: the base and pool sizes, derived; an owner-word table in the anchor segment; pure, unit-tested.
-  2. Claim and release on the segment, raced by threads (loom, as the rings are); a refusal at an empty pool, typed.
+  1. **Built (2026-10-05):** the owner-word table in the anchor segment. It is a `Pool` region, one 8-byte word per
+     partition, so one extent per partition, and the layout is version 4 (a version-3 segment is refused). Claim and
+     release are a compare-and-swap of the word (`pool_claim`, `pool_release`, `pool_owner`, `pool_held_by`); a
+     release by another partition changes nothing; an extent past the pool is refused typed. Proven by
+     `a_pool_extent_is_claimed_by_one_partition_and_released_only_by_it` and
+     `racing_claimants_take_each_pool_extent_exactly_once_and_the_claims_outlive_the_mapping`: eight separate
+     mappings race for eight extents and each is taken exactly once; the claims hold through a fresh attachment.
+     Both pass on macOS and Linux (a descriptor handoff there).
+  2. The base and pool sizes, derived in the daemon's content layout; a refusal at an empty pool, typed.
   3. Growth in the shard: a refused admission claims and adds an extent; the budget's reserve grows. Test: a volume
      larger than one base arena fills on a shard, and two shards contend for the pool.
   4. Images and recovery: extents named in the image, re-added on restart; a daemon SIGKILLed with a grown volume

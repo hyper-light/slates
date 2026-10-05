@@ -926,3 +926,87 @@ fn a_device_a_daemon_sent_is_held_across_its_restart_and_handed_to_its_successor
     "the first daemon sent its device and left; its successor inherited it and read the first one's bytes"
   );
 }
+
+/// Shape: partitions of the pool tests' segment, so several claimants contend for several extents.
+const POOL_PARTITIONS: u16 = 8;
+
+/// A-98: do claim pool extents for partitions on a segment, release one by the wrong partition and by its own, and name
+/// one past the pool; expect a claim to take a free extent only, the owner read back, a release by another partition
+/// to change nothing, the extent free after its own release, the partition's held list, and the extent past the pool
+/// refused typed.
+#[test]
+fn a_pool_extent_is_claimed_by_one_partition_and_released_only_by_it() {
+  let id = identity();
+  let segment =
+    AnchorSegment::create(&unique_name("slates-anchor-test-pool"), &id, geometry()).unwrap();
+  assert_eq!(segment.pool_extents(), 2, "one extent per partition");
+  assert_eq!(segment.pool_owner(0).unwrap(), None);
+  assert!(segment.pool_claim(0, 1).unwrap(), "a free extent is taken");
+  assert!(!segment.pool_claim(0, 0).unwrap(), "a held extent is not");
+  assert_eq!(segment.pool_owner(0).unwrap(), Some(1));
+  assert!(segment.pool_claim(1, 1).unwrap());
+  assert_eq!(segment.pool_held_by(1).unwrap(), [0, 1]);
+  releases_by_their_holder_only(&segment);
+}
+
+/// The release half of [`a_pool_extent_is_claimed_by_one_partition_and_released_only_by_it`]: partition 1 holds
+/// extents 0 and 1.
+fn releases_by_their_holder_only(segment: &AnchorSegment) {
+  assert!(
+    !segment.pool_release(0, 0).unwrap(),
+    "another partition releases nothing"
+  );
+  assert_eq!(segment.pool_owner(0).unwrap(), Some(1));
+  assert!(segment.pool_release(0, 1).unwrap());
+  assert_eq!(segment.pool_owner(0).unwrap(), None);
+  assert_eq!(segment.pool_held_by(1).unwrap(), [1]);
+  assert!(segment.pool_claim(2, 0).is_err(), "past the pool");
+}
+
+/// A-98: do have one claimant per partition, each through its own mapping of the segment (as shards of racing daemons
+/// would), claim every extent at once; expect each extent taken by exactly one partition, the owner words agreeing
+/// with the winners, and the claims still there through a fresh attachment (a daemon restart keeps them).
+#[test]
+fn racing_claimants_take_each_pool_extent_exactly_once_and_the_claims_outlive_the_mapping() {
+  let id = identity();
+  let geometry = Geometry {
+    partitions: POOL_PARTITIONS,
+    ..geometry()
+  };
+  let segment =
+    AnchorSegment::create(&unique_name("slates-anchor-test-pool-race"), &id, geometry).unwrap();
+  let (handoff, len) = handoff_of(&segment);
+  let wins: Vec<Vec<usize>> = std::thread::scope(|scope| {
+    let claimants: Vec<_> = (0..POOL_PARTITIONS)
+      .map(|partition| {
+        let (handoff, id) = (handoff.clone(), id.clone());
+        scope.spawn(move || {
+          let mapped = AnchorSegment::attach(&handoff, len, &id).unwrap();
+          (0..usize::from(POOL_PARTITIONS))
+            .filter(|extent| mapped.pool_claim(*extent, partition).unwrap())
+            .collect::<Vec<usize>>()
+        })
+      })
+      .collect();
+    claimants
+      .into_iter()
+      .map(|claimant| claimant.join().unwrap())
+      .collect()
+  });
+  let mut taken: Vec<usize> = wins.iter().flatten().copied().collect();
+  taken.sort_unstable();
+  assert_eq!(
+    taken,
+    (0..usize::from(POOL_PARTITIONS)).collect::<Vec<_>>(),
+    "each extent exactly once: {wins:?}"
+  );
+  let later = AnchorSegment::attach(&handoff, len, &id).unwrap();
+  for (partition, won) in wins.iter().enumerate() {
+    assert_eq!(
+      &later
+        .pool_held_by(u16::try_from(partition).unwrap())
+        .unwrap(),
+      won
+    );
+  }
+}

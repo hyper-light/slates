@@ -68,6 +68,13 @@ fn segment_words(geometry: &Geometry) -> Words {
           at.saturating_add(SUP_SEAL_ROOT),
           SEAL_ROOT_ID_BYTES.saturating_add(SEAL_ROOT_KEY_BYTES),
         )),
+      // The content pool's owner words (A-98): one per partition, each claimed by compare-and-swap.
+      RegionKind::Pool => words.with(WordRun::strided(
+        at,
+        size_of::<u64>(),
+        usize::from(geometry.partitions),
+        Width::U64,
+      )),
       RegionKind::Log(_) | RegionKind::Audit => words.with(WordRun::strided(
         at.saturating_add(RING_HEAD),
         size_of::<u64>(),
@@ -654,6 +661,72 @@ impl AnchorSegment {
   ) -> Result<(), AnchorError> {
     let start = self.region_span(kind, at, from.len())?;
     Ok(self.object.write_racy(start, from)?)
+  }
+
+  /// The content pool's extents (A-98): one per partition.
+  pub fn pool_extents(&self) -> usize {
+    usize::from(self.geometry.partitions)
+  }
+
+  /// Extent `extent`'s owner word, refused past the pool.
+  fn pool_word(&self, extent: usize) -> Result<&AtomicU64, AnchorError> {
+    if extent >= self.pool_extents() {
+      return Err(AnchorError::Geometry {
+        reason: "a pool extent past the pool",
+      });
+    }
+    let at = extent
+      .checked_mul(crate::layout::POOL_WORD_BYTES)
+      .ok_or(AnchorError::Geometry {
+        reason: "a pool word offset overflows",
+      })?;
+    self.word_at(self.spec(RegionKind::Pool)?, at)
+  }
+
+  /// The partition that holds pool extent `extent`, or `None` while it is free (A-98).
+  pub fn pool_owner(&self, extent: usize) -> Result<Option<u16>, AnchorError> {
+    let word = self.pool_word(extent)?.load(Ordering::Acquire);
+    Ok(
+      word
+        .checked_sub(1)
+        .and_then(|owner| u16::try_from(owner).ok()),
+    )
+  }
+
+  /// Claims pool extent `extent` for `partition` if it is free: whether this call took it. One compare-and-swap of
+  /// the extent's owner word, so of any number of claimants exactly one wins, and the claim outlives the daemon as
+  /// the content does (A-98).
+  pub fn pool_claim(&self, extent: usize, partition: u16) -> Result<bool, AnchorError> {
+    let owner = u64::from(partition).saturating_add(1);
+    Ok(
+      self
+        .pool_word(extent)?
+        .compare_exchange(0, owner, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok(),
+    )
+  }
+
+  /// Releases pool extent `extent` if `partition` holds it: whether this call freed it. A release by any other
+  /// partition changes nothing.
+  pub fn pool_release(&self, extent: usize, partition: u16) -> Result<bool, AnchorError> {
+    let owner = u64::from(partition).saturating_add(1);
+    Ok(
+      self
+        .pool_word(extent)?
+        .compare_exchange(owner, 0, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok(),
+    )
+  }
+
+  /// The pool extents `partition` holds, ascending (A-98: what its recovery checks its image against).
+  pub fn pool_held_by(&self, partition: u16) -> Result<Vec<usize>, AnchorError> {
+    let mut held = Vec::new();
+    for extent in 0..self.pool_extents() {
+      if self.pool_owner(extent)? == Some(partition) {
+        held.push(extent);
+      }
+    }
+    Ok(held)
   }
 
   /// A payload region's seqlock generation word.
