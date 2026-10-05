@@ -600,6 +600,12 @@ pub struct ShardState {
   /// A host memory reading a test injected (`Daemon::inject_available_memory`), which the sampler uses in
   /// place of the platform's, so a test of the pressure arithmetic is not at the mercy of the host.
   pub(crate) injected_available: Option<u64>,
+  /// This process's resident memory a test injected (`Daemon::inject_resident_memory`), which the sampler uses in
+  /// place of the platform's reading.
+  pub(crate) injected_resident: Option<u64>,
+  /// The process's resident memory at the pressure sampler's first sample (§4.2): its growth since then is the
+  /// daemon's own use, subtracted from the host's shortfall so only pressure from elsewhere is held back.
+  pub(crate) pressure_resident_baseline: Option<u64>,
   /// The holder side of the owner lease (§4.8; AUD-08): when this node last answered each peer's direct
   /// probe reporting it alive, and the newest configuration version each announced — the evidence that
   /// gates a successor's promotion of a departed owner's objects at this holder

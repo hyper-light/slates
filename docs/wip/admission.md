@@ -37,7 +37,11 @@
 > refuses below use. Not yet: a pressure signal that stops admission (the design: sample PSI /
 > `MemAvailable` at the profile refresh cadence on the control shard and apply a hold above
 > `committed`, never below it), the Windows job-object bound, guest request buffers and open-reference
-> maps in the same ledger, and a boot-time refusal of a hand-edited layout past the bound. GAP-A9-1's
+> maps in the same ledger, and a boot-time refusal of a hand-edited layout past the bound.
+> 2026-10-05: the hold is built (`refresh_pressure_hold`). It is the host's shortfall below the first sample *less
+> the daemon's own resident growth since then*, divided among the shards. Counting the daemon's own stored bytes as
+> pressure charged them twice and stopped a volume at about half the content capacity
+> (`docs/bugs/2026-10-05-pressure-hold-counted-the-daemons-own-growth.md`). GAP-A9-1's
 > contract gaps (BUG-1–3, uncharged metadata/transient/retained bytes) are closed; see
 > `docs/wip/admission.md`.*
 

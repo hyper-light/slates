@@ -1981,6 +1981,16 @@ impl Daemon {
     Ok(())
   }
 
+  /// Test support: this process's own resident memory as the pressure sampler reads it from now on, in place of the
+  /// platform's reading (§4.2): with [`Daemon::inject_available_memory`], a test drives the sampler's split between
+  /// the daemon's own growth and pressure from elsewhere. Installed on every shard, as the available reading is.
+  pub fn inject_resident_memory(&self, bytes: u64) -> Result<(), ObserveError> {
+    for shard in self.shards.iter().copied() {
+      self.observe(Some(shard), move |s| s.injected_resident = Some(bytes))?;
+    }
+    Ok(())
+  }
+
   /// The baseline this daemon's pressure sampler measures against, once its first sample is taken (§4.2):
   /// the sampling shard's, read from whichever shard holds it.
   pub fn pressure_baseline(&self) -> Result<Option<u64>, ObserveError> {
@@ -2801,6 +2811,8 @@ fn init_shard(
     pressure_baseline: None,
     pressure_pinned: false,
     injected_available: None,
+    injected_resident: None,
+    pressure_resident_baseline: None,
     answers_given: crate::lease::AnswersGiven::default(),
     departed_owners: std::collections::BTreeMap::new(),
     green_retention: std::collections::BTreeMap::new(),
@@ -2932,7 +2944,8 @@ async fn reap_loop() {
 
 /// Samples the host's available memory and sets each shard's pressure hold (§4.2; admission.md §5.5),
 /// run on the reap loop's shard at the liveness cadence — the design's "cheap-refresh". The hold is
-/// the host-wide shortfall below the boot baseline, divided evenly among the shards (so the total
+/// the host-wide shortfall below the boot baseline, less the daemon's own resident growth since then (that is
+/// committed content, charged already), divided evenly among the shards (so the total
 /// held across the shards is the shortfall, not a multiple of it); it shrinks each shard's admittable
 /// so a new reservation is refused under pressure while an admitted volume's within-entitlement writes
 /// land, and it releases to zero as the sample recovers toward the baseline. A host with no memory
@@ -2946,13 +2959,28 @@ fn refresh_pressure_hold() {
   };
   // This daemon's first sample fixes its baseline (kept by the sampling shard, so each daemon in a
   // process has its own); a later sample above it only lowers the shortfall.
-  let Some((origin, shards, baseline)) = state::with_state(|s| {
+  let resident = state::with_state(|s| s.injected_resident)
+    .flatten()
+    .or_else(slates_machine::facts::Facts::resident_now);
+  let Some((origin, shards, baseline, resident_baseline)) = state::with_state(|s| {
     let baseline = *s.pressure_baseline.get_or_insert(available);
-    (s.shard, s.shards.clone(), baseline)
+    let resident_baseline = match resident {
+      Some(now) => Some(*s.pressure_resident_baseline.get_or_insert(now)),
+      None => s.pressure_resident_baseline,
+    };
+    (s.shard, s.shards.clone(), baseline, resident_baseline)
   }) else {
     return;
   };
-  let shortfall = baseline.saturating_sub(available);
+  // The daemon's own growth since the baseline (its content, metadata and heap) is not pressure: those bytes are
+  // committed already, so holding them back as well charged every stored byte twice (2026-10-05: one volume refused
+  // at 244 MB of a 358 MB pool under a 1 GiB cap, held back 111 MB per shard for memory it had itself filled).
+  let own_growth = resident
+    .zip(resident_baseline)
+    .map_or(0, |(now, then)| now.saturating_sub(then));
+  let shortfall = baseline
+    .saturating_sub(available)
+    .saturating_sub(own_growth);
   let per_shard = shortfall / u64::try_from(shards.len().max(1)).unwrap_or(1);
   for shard in shards {
     let _ = crate::xshard::run_on(origin, shard, move |s| {

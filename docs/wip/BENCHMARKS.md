@@ -2101,7 +2101,14 @@ last in `python:3.12-slim-trixie`). Docker Desktop 6.12 kernel, Apple M5 Max, lo
   - The two slices hold about 341 MiB. What takes the other 77 MiB (the operation headroom, the control shard's own
     claims, a slice's tail under one chunk) is not yet measured.
   - Writes ran at the fresh-mount stall's pace (WRITE `avg_exe` 398 ms over 1,092 ops), the owed item below, so the
-    run took 166 s. A 48 MiB reserve
+    run took 166 s.
+- **The pressure hold no longer counts the daemon's own growth, 2026-10-05** (the same command, `FILES=600`):
+  - One volume holds **338 MiB**, with 355.2 MB committed of the 357.8 MB pool (the rest is the operation headroom),
+    against 218–264 MiB before.
+  - The first 200 files' SHA-256 intact; after deleting half, an 8 MiB write succeeded. Daemon alive, 0 restarts,
+    0 panics, `oom_kill 0`.
+  - The cause of the missing 77 MiB, found with diagnostic lines at the refusal: a hold of 111 MB per shard for memory
+    the daemon had itself filled (`docs/bugs/2026-10-05-pressure-hold-counted-the-daemons-own-growth.md`). A 48 MiB reserve
     admits a 36 MiB volume and holds 34 MiB of files across a restart, byte for byte, on macOS and Linux. Before the
     change, the create was refused `BudgetExceeded { available: 22 MiB }`.
 - **Large writes on a fresh mount stall** at 200 ms steps, for slates and for Linux's own knfsd alike:

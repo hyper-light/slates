@@ -9560,4 +9560,6 @@ memory cap") and GAPS.
        and the other shard is admitted from it (refused while it stayed claimed).
      - Status: a shard's `reserve` and `mapped` already follow the extents it holds; the pool's refused claims are
        the `content.pool_refused` count. No test provokes an OS refusal to map, so that count is unexercised.
-     - Owed: where the last 77 MiB goes.
+     - The last 77 MiB was the pressure hold counting the daemon's own growth as host pressure. With that fixed, one
+       volume holds 338 MiB of the 358 MB pool (BENCHMARKS;
+       `docs/bugs/2026-10-05-pressure-hold-counted-the-daemons-own-growth.md`).

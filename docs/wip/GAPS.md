@@ -3694,7 +3694,8 @@ Condition 11/12, 2026-10-05 (BENCHMARKS "The daemon under a container memory cap
     capped container's volume went from 57 to 124 MiB (BENCHMARKS).
   - Measured with the pool: 264 MiB in one volume under a 1 GiB cap (BENCHMARKS). A crash between a claim and its
     first image is tested (the extent returns at the first publication), and refused claims are counted in status
-    (`content.pool_refused`, unexercised). Still owed: where the last 77 MiB goes.
+    (`content.pool_refused`, unexercised). The last 77 MiB was the pressure hold counting the daemon's own growth,
+    fixed the same day: one volume now holds 338 MiB of a 358 MB pool under a 1 GiB cap.
   - Still per shard: the chunk, inode and directory slabs and the metadata class are sized from one slice. A volume
     of large files reaches the whole pool (a chunk is sixteen granules); a volume of many small files stays bounded by
     its shard's slabs.

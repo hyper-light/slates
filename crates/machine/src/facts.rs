@@ -288,6 +288,13 @@ impl Facts {
     platform::available_bytes()
   }
 
+  /// This process's resident memory right now (one cheap query): what the daemon itself holds in RAM, its content,
+  /// metadata and heap together, so a memory-pressure sampler can tell the host's shortfall that the daemon caused
+  /// from pressure that comes from elsewhere (§4.2). `None` where the OS gives no reading.
+  pub fn resident_now() -> Option<u64> {
+    platform::resident_bytes()
+  }
+
   /// Every fact, queried now (the boot profile's input).
   pub fn query() -> Facts {
     let mut notes = Vec::new();
@@ -551,6 +558,10 @@ mod platform {
     fn mach_host_self() -> libc::mach_port_t;
   }
 
+  pub(super) fn resident_bytes() -> Option<u64> {
+    rusage_v0().map(|info| info.resident_size)
+  }
+
   pub(super) fn available_bytes() -> Option<u64> {
     let page = sysctl_u64(c"hw.pagesize")?;
     // SAFETY: an all-zero libc::vm_statistics64 is a valid, if empty, value for the call below to fill.
@@ -661,14 +672,19 @@ mod platform {
     ) -> libc::c_int;
   }
 
-  pub(super) fn locked_bytes() -> Option<u64> {
+  /// This process's `rusage_info_v0`, or `None` when the OS refuses it.
+  fn rusage_v0() -> Option<RusageInfoV0> {
     /// Format: RUSAGE_INFO_V0 (sys/resource.h).
     const RUSAGE_INFO_V0: libc::c_int = 0;
     // SAFETY: an all-zero rusage_info_v0 is a valid buffer for the call to fill.
     let mut info: RusageInfoV0 = unsafe { std::mem::zeroed() };
     // SAFETY: our own pid, the V0 flavor, and a writable buffer of the V0 layout.
     let rc = unsafe { proc_pid_rusage(libc::getpid(), RUSAGE_INFO_V0, &raw mut info) };
-    if rc == 0 { Some(info.wired_size) } else { None }
+    (rc == 0).then_some(info)
+  }
+
+  pub(super) fn locked_bytes() -> Option<u64> {
+    rusage_v0().map(|info| info.wired_size)
   }
 
   pub(super) fn identity(notes: &mut Vec<String>) -> (String, String) {
@@ -972,6 +988,16 @@ mod platform {
 
   /// Memory available to a new allocation without reclaim, as the kernel estimates it now
   /// (`MemAvailable` of `/proc/meminfo`).
+  pub(super) fn resident_bytes() -> Option<u64> {
+    // `/proc/self/statm`: size, then resident, in pages (proc(5)).
+    let pages: u64 = read("/proc/self/statm")?
+      .split_whitespace()
+      .nth(1)?
+      .parse()
+      .ok()?;
+    pages.checked_mul(u64::try_from(rustix::param::page_size()).ok()?)
+  }
+
   pub(super) fn available_bytes() -> Option<u64> {
     read("/proc/meminfo").and_then(|text| {
       text
@@ -1045,6 +1071,11 @@ mod platform {
   /// The live "available" probe arrives with the Windows bridge (Phase 4); the facts' value
   /// stands until then.
   pub(super) fn available_bytes() -> Option<u64> {
+    None
+  }
+
+  /// No reading, as for available memory: the pressure sampler holds nothing back here.
+  pub(super) fn resident_bytes() -> Option<u64> {
     None
   }
 

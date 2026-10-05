@@ -776,6 +776,52 @@ fn two_daemons_in_one_process_measure_memory_pressure_from_their_own_start() {
   );
 }
 
+/// Shape: the pressure test's daemon's own resident memory at its first sample.
+const SAMPLED_RESIDENT: u64 = 64 << 20;
+/// Shape: the bytes the daemon itself takes after its first sample (content it stored): the host's available memory
+/// falls by them and its own resident memory rises by them.
+const OWN_GROWTH: u64 = 512 << 20;
+
+/// §4.2, admission.md §5.5 (found 2026-10-05 in a 1 GiB container: one volume refused at 244 MB with a hold of 111 MB
+/// per shard for memory the daemon had itself filled). Do: let a daemon's sampler read a host's available memory and
+/// its own resident memory; then let available fall by [`OWN_GROWTH`] while its resident memory rises by the same;
+/// then let available fall a further [`LATER_DROP`] with its resident memory unchanged. Expect: no hold for its own
+/// growth (that is committed content, charged already), and the further drop held back across its shards. Before the
+/// fix the hold counted the daemon's own growth as pressure, so every stored byte was charged twice and one volume
+/// reached about half the content capacity.
+#[test]
+fn a_daemons_own_growth_is_not_memory_pressure() {
+  let profile = common::machine_profile();
+  let instance = format!("srv-pressure-own-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
+  let segment = anchor_segment("pressure-own", &profile, &config);
+  let daemon = Daemon::start(&profile, config, source_of(&segment)).unwrap();
+  daemon.inject_available_memory(SAMPLED_AVAILABLE).unwrap();
+  daemon.inject_resident_memory(SAMPLED_RESIDENT).unwrap();
+  let sampled = within_sampler_wait(|| daemon.pressure_baseline() == Ok(Some(SAMPLED_AVAILABLE)));
+  daemon
+    .inject_resident_memory(SAMPLED_RESIDENT + OWN_GROWTH)
+    .unwrap();
+  daemon
+    .inject_available_memory(SAMPLED_AVAILABLE - OWN_GROWTH)
+    .unwrap();
+  // Two sampler periods: the hold a wrong reading would set has had its chance to appear.
+  let wrongly_held = within_sampler_wait(|| daemon.pressure_hold().is_ok_and(|hold| hold > 0));
+  daemon
+    .inject_available_memory(SAMPLED_AVAILABLE - OWN_GROWTH - LATER_DROP)
+    .unwrap();
+  let per_shard = LATER_DROP / u64::from(TEST_SHARDS);
+  let pressure_held = within_sampler_wait(|| daemon.pressure_hold() == Ok(per_shard));
+  let hold = daemon.pressure_hold();
+  daemon.stop();
+  assert!(sampled, "the daemon took its first sample");
+  assert!(!wrongly_held, "its own growth is not held back as pressure");
+  assert!(
+    pressure_held,
+    "a drop it did not cause is held back, divided among its shards: {hold:?}"
+  );
+}
+
 /// AUD-29-43 (§4.2 "a remote holder makes the same admission against its own machine before acknowledging
 /// placement"): a replica is admitted only from the holder's unpromised capacity. Do: withhold the whole of
 /// every shard's admittable capacity (the memory-pressure hold), put a replica, then release the hold and
