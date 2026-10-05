@@ -9655,3 +9655,24 @@ sealed under the volume's version key (condition 9, "encrypted at rest when not 
   sizes. The fixtures make it once, for the largest daemon the profile derives, before any daemon starts
   (`crates/server/tests/common/mod.rs`); before that, a 1-shard daemon starting first left a 2-shard one with sealing
   unavailable, one recovery run in three.
+
+### A-100 — The boot waits on a working shard and stops beating when it refuses (2026-10-05)
+Status: built 2026-10-05 (docs/bugs/2026-10-05-a-slow-shard-start-stopped-the-daemon-and-left-it-beating.md).
+- Before serving, the control loop asks each shard for its retained client-id high-water mark (§4.9). The question
+  queues behind the shard's start, which runs recovery as one step. It is now asked once and awaited one liveness
+  window (`LIVENESS_BUDGET_NS`) at a time; after a window with no answer the wait goes on only if the shard's thread
+  used CPU in it (`slates_rt::registry::shard_cpu`, the same reading the observers use to tell a starved shard from a
+  wedged one, §4.14). So a long recovery is waited out, and a stuck shard, a failed start (no state) or an unreadable
+  clock is refused after one window. The wait is bounded by the start's own work.
+- The heartbeat is the control loop's child task, so it ends with the loop: a refused boot returns, `daemon.alive`
+  lapses and the anchor restarts the daemon. Before, the heartbeat was detached first and beat on, and the anchor kept
+  a daemon that would never serve. (Keeping it joinable until the boot was accepted was tried first and hung
+  `Daemon::stop` whenever a shutdown cancelled the loop before then: a joinable perpetual task holds its shard open.)
+- Tests by use, with a fault the tests inject into one shard's start (`DaemonConfig::with_boot_fault`: `Busy` spins,
+  `Stuck` sleeps; `None` in every deployment): a shard busy for two windows, and the daemon serves a create; a shard
+  asleep for two windows, and the heartbeat stops within the client's start wait. Both failed before the change.
+- Laptop and fleet alike (R8): the same boot runs at every scale.
+- Each shard's start time is in the boot log (`shard N initialized in … µs`), the evidence that found A-99's eager tag
+  store behind the slow starts.
+Applied in the same change to: GAPS (boot entry closed, the control-shard sibling open), the bug record,
+`crates/server/src/{daemon,config,lib}.rs`, `crates/server/tests/recovery.rs`.

@@ -28,7 +28,7 @@ use slates_client::{
 };
 use slates_ipc::protocol::{Filter, ReplyBody, RequestBody};
 use slates_machine::MachineProfile;
-use slates_server::{Daemon, DaemonConfig};
+use slates_server::{BootFault, BootFaultKind, Daemon, DaemonConfig};
 use slates_wire::request::RequestId;
 
 mod common;
@@ -2229,4 +2229,102 @@ fn sealed_content_reads_back_byte_for_byte_after_a_restart() {
     );
   }
   second.stop();
+}
+
+/// Shape: how long the boot tests hold a shard's start: two of the control loop's liveness windows, so the shard's first
+/// answer cannot arrive within one.
+const HELD_START_NS: u64 = 2 * slates_server::daemon::LIVENESS_BUDGET_NS;
+
+/// Boot (GAPS 2026-10-05): do start a daemon whose second shard spends two liveness windows on the CPU in its start, as
+/// a long recovery does, then connect and create a volume; expect the daemon to serve, since the control loop's first
+/// call to that shard waits while the shard is still working. Before the fix the control loop gave up after one window
+/// and the daemon never served.
+#[test]
+fn a_shard_whose_start_outlasts_a_liveness_window_while_working_does_not_stop_the_daemon() {
+  let profile = common::machine_profile();
+  let instance = format!("srv-long-start-{}", std::process::id());
+  let config =
+    DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS)).with_boot_fault(BootFault {
+      partition: 1,
+      kind: BootFaultKind::Busy,
+      for_ns: HELD_START_NS,
+    });
+  let segment = anchor_segment("long-start", &profile, &config);
+  let daemon = Daemon::start(&profile, config, source_of(&segment)).unwrap();
+  daemon
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let mut client = connect(&instance);
+  client
+    .create(&scratch("after-a-long-start"))
+    .expect("a daemon whose shard started slowly serves");
+  daemon.stop();
+  drop(segment);
+}
+
+/// Boot (GAPS 2026-10-05): do start a daemon whose second shard sleeps through two liveness windows in its start, using
+/// no CPU, as a stuck shard does; expect the daemon to stop beating within the client's start wait (so the anchor, which
+/// restarts a daemon whose heartbeat lapses, restarts it) instead of beating on while it can never serve.
+#[test]
+fn a_shard_stuck_in_its_start_stops_the_heartbeat_so_the_anchor_restarts_the_daemon() {
+  let profile = common::machine_profile();
+  let instance = format!("srv-stuck-start-{}", std::process::id());
+  let config =
+    DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS)).with_boot_fault(BootFault {
+      partition: 1,
+      kind: BootFaultKind::Stuck,
+      for_ns: HELD_START_NS,
+    });
+  let segment = anchor_segment("stuck-start", &profile, &config);
+  let daemon = Daemon::start(&profile, config, source_of(&segment)).unwrap();
+  let quiet = Duration::from_nanos(2 * slates_server::daemon::HEARTBEAT_NS);
+  let started = Instant::now();
+  let mut stopped = false;
+  while started.elapsed() < START_WAIT {
+    let before = segment.supervision().unwrap().heartbeat_ns();
+    // The test plays the anchor, which watches the heartbeat from its own thread across time.
+    #[allow(clippy::disallowed_methods)]
+    std::thread::sleep(quiet);
+    let after = segment.supervision().unwrap().heartbeat_ns();
+    if before > 0 && before == after {
+      stopped = true;
+      break;
+    }
+  }
+  assert!(
+    stopped,
+    "the heartbeat stopped after the stuck shard was refused"
+  );
+  daemon.stop();
+  drop(segment);
+}
+
+/// Boot (A-100): do start a daemon whose second shard spends two liveness windows on the CPU in its start, and stop the
+/// daemon at once, while its control loop still waits on that shard; expect the stop to finish within the client's
+/// start wait. (The heartbeat kept joinable until the boot was accepted hung `Daemon::stop` in
+/// `an_acknowledged_replica_survives_a_warm_daemon_restart`, every run, and that test is its reproducer; this one passes
+/// with either design and covers a stop during a long start.)
+#[test]
+fn a_daemon_stopped_while_its_boot_waits_on_a_shard_stops() {
+  let profile = common::machine_profile();
+  let instance = format!("srv-stop-mid-boot-{}", std::process::id());
+  let config =
+    DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS)).with_boot_fault(BootFault {
+      partition: 1,
+      kind: BootFaultKind::Busy,
+      for_ns: HELD_START_NS,
+    });
+  let segment = anchor_segment("stop-mid-boot", &profile, &config);
+  let daemon = Daemon::start(&profile, config, source_of(&segment)).unwrap();
+  let (stopped, done) = std::sync::mpsc::channel();
+  let stopper = std::thread::spawn(move || {
+    daemon.stop();
+    let _ = stopped.send(());
+  });
+  assert!(
+    done.recv_timeout(START_WAIT).is_ok(),
+    "the daemon stopped while its boot was waiting on a shard"
+  );
+  stopper.join().unwrap();
+  drop(segment);
 }

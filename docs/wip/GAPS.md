@@ -3695,16 +3695,13 @@ docs/bugs/2026-10-05-a-granted-landing-refused-on-a-held-delegation.md). The sam
 10 and 23 over NFSv4.2 were a delegation's state id letting any user of its client truncate
 (docs/bugs/2026-10-05-a-delegation-let-any-user-of-its-client-truncate.md), fixed the same day.
 
-Boot, found 2026-10-05 (open): the control loop asks every shard for its client-id high-water mark within the 1 s
-liveness budget (`restore_client_ids`, daemon.rs). The call queues behind the shard's `init_shard`, which runs recovery
-as one step, so a shard whose init takes longer than a second makes the daemon stop before serving (clients see
-`DaemonGone`). Seen once: three restart tests in one macOS recovery run at load average 16–17, not again in six runs.
-Measured the same day (each shard's start is now in the boot log): in the restart suites shard starts were p50 26 ms,
-p99 811 ms, max 978 ms, nearly all of it A-99's tag store built whole at store construction; with the tag store grown
-lazily they are p50 0.8 ms, p99 52–76 ms, max 103 ms, and the failure has not recurred. Still open: the wait does not
-tell a shard busy with a long recovery from one that is stuck. The fix waits on a shard that is still making progress
-(its thread's CPU clock moving) and refuses only one that failed its init or stopped; a failing test needs a hook that
-slows a shard's init.
+Boot, found and closed 2026-10-05 (A-100; docs/bugs/2026-10-05-a-slow-shard-start-stopped-the-daemon-and-left-it-beating.md):
+the control loop's client-id recovery gave up on a shard whose start outran the 1 s liveness window and the daemon
+never served, while its heartbeat beat on. It now waits a window at a time while the shard's thread is using CPU and
+refuses a quiet one; a refused boot stops the heartbeat so the anchor restarts the daemon. Shard starts are in the boot
+log (restart suites, after the lazy tag store: p50 0.8 ms, p99 52–76 ms). Open sibling: the control shard's own start
+blocks the heartbeat on the same shard, so a control-shard recovery longer than the anchor's liveness budget is killed
+and restarted, and would loop if every start took that long; no image measured so far comes near it.
 
 Condition 11/12, 2026-10-05 (BENCHMARKS "The daemon under a container memory cap ..."):
 - Under a 1 GiB cgroup cap the daemon refuses typed (`ENOSPC`) with no panic or OOM kill, and recovers its space.

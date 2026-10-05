@@ -309,6 +309,9 @@ pub struct DaemonConfig {
   /// again on its next use), and the root among them. Locked once at boot, a few pages, well inside the default
   /// locked-memory limit.
   pub seal_key_slots: usize,
+  /// A fault injected into one shard's start, for the boot tests; `None` in every deployment (a test sets it with
+  /// [`DaemonConfig::with_boot_fault`]).
+  pub boot_fault: Option<BootFault>,
   /// Derived: a guest device attachment's credits (§4.6 A-9, §4.9): the request credit is the shard's
   /// admission limit (`requests_in_flight_per_shard`), the byte credit the §4.9 window over the measured
   /// memcpy bandwidth and the mean wake as the kick round trip, with one request's worst case as the frame.
@@ -761,6 +764,7 @@ impl DaemonConfig {
       fleet_sessions_per_plane: 0,
       fleet_session_receive_bytes: 0,
       seal_key_slots: seal_key_slots.get(),
+      boot_fault: None,
       #[cfg(unix)]
       guest_credits,
       #[cfg(unix)]
@@ -768,6 +772,26 @@ impl DaemonConfig {
       derivations,
     }
   }
+}
+
+/// A fault injected into one shard's start (the boot tests): which partition, how it misbehaves, and for how long.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BootFault {
+  /// The partition whose start misbehaves.
+  pub partition: u16,
+  /// How it misbehaves.
+  pub kind: BootFaultKind,
+  /// For how long, nanoseconds.
+  pub for_ns: u64,
+}
+
+/// How a shard's start misbehaves under a [`BootFault`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BootFaultKind {
+  /// The start runs on the CPU for the whole time, as a long recovery does.
+  Busy,
+  /// The start sleeps for the whole time, using no CPU, as a stuck shard does.
+  Stuck,
 }
 
 /// The NFSv4 listener's table bounds (§4.6 A-35): what its sessions, clients and opens may hold.
@@ -917,6 +941,12 @@ impl DaemonConfig {
   /// machine's measured BLAKE3 throughput.
   pub fn archive_slice_bytes(&self) -> u64 {
     archive_slice_bytes(self.blake3_bytes_per_second, self.step_quantum_ns())
+  }
+
+  /// This configuration with `fault` injected into a shard's start (the boot tests).
+  pub fn with_boot_fault(mut self, fault: BootFault) -> DaemonConfig {
+    self.boot_fault = Some(fault);
+    self
   }
 
   /// The same configuration with the operator's failover SLO (the lease term's ceiling).

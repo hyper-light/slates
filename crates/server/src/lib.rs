@@ -95,7 +95,7 @@ pub mod verbs;
 pub mod virtiofs;
 pub mod xshard;
 
-pub use config::{DaemonConfig, DurabilityBound, FleetMembership};
+pub use config::{BootFault, BootFaultKind, DaemonConfig, DurabilityBound, FleetMembership};
 pub use daemon::{Daemon, DrainReport, LeadershipHandoff, SegmentSource, SessionHold};
 pub use deploy::{DeployError, FleetManifest, FleetNodeEntry, FleetPlan, NodeAddress};
 pub use dns::Resolver;

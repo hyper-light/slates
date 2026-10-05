@@ -651,6 +651,12 @@ impl Daemon {
         // How long a shard's start takes (its recovery included) is in the boot log: the control loop's first call to
         // each shard queues behind it (GAPS, boot, 2026-10-05).
         let started = std::time::Instant::now();
+        if let Some(fault) = config
+          .boot_fault
+          .filter(|fault| fault.partition == partition)
+        {
+          hold_start(fault);
+        }
         let outcome = init_shard(
           &config,
           &env,
@@ -2534,6 +2540,24 @@ fn shard_arena(
   Ok((arena, slice))
 }
 
+/// Holds a shard's start as a [`crate::config::BootFault`] says: on the CPU (a long recovery) or asleep (a stuck
+/// shard), for its duration. Only the boot tests set one.
+fn hold_start(fault: crate::config::BootFault) {
+  let duration = std::time::Duration::from_nanos(fault.for_ns);
+  match fault.kind {
+    // A stuck shard is a thread blocked without using CPU, which only a blocking wait models (D-9's exception for
+    // tests): the boot tests' `Stuck` fault, never set in a deployment.
+    #[allow(clippy::disallowed_methods)]
+    crate::config::BootFaultKind::Stuck => std::thread::sleep(duration),
+    crate::config::BootFaultKind::Busy => {
+      let started = std::time::Instant::now();
+      while started.elapsed() < duration {
+        std::hint::spin_loop();
+      }
+    }
+  }
+}
+
 /// Seals the store's idle content under keys derived from the node's sealing root (A-99); with no root the content
 /// stays in the clear, as the sealing state already reports.
 fn install_content_cipher(store: &mut Store, seal_root: Option<&hyper_seal::keys::WrappingKey>) {
@@ -3095,19 +3119,7 @@ async fn serve_loop() {
 async fn restore_client_ids(listener: &mut Listener, origin: u16, shards: &[ShardId]) -> bool {
   let mut highest = 0;
   for shard in shards {
-    let Some(retained) = crate::xshard::call_within(
-      origin,
-      shard.0,
-      |state| {
-        state
-          .db
-          .partition()
-          .client_id_high_water(state.origin_anchor.0)
-      },
-      LIVENESS_BUDGET_NS,
-    )
-    .await
-    else {
+    let Some(retained) = retained_client_ids(origin, shard.0).await else {
       INIT_FAILURES.fetch_add(1, Ordering::AcqRel);
       eprintln!(
         "slates-server: client identity recovery refused on shard {}",
@@ -3119,6 +3131,49 @@ async fn restore_client_ids(listener: &mut Listener, origin: u16, shards: &[Shar
   }
   listener.resume_after(highest);
   true
+}
+
+/// Shard `shard`'s retained client-id high-water mark. The question is asked once and awaited one liveness window at a
+/// time for as long as the shard is still working: it queues behind the shard's start, which runs recovery as one step
+/// and may outlast a window (GAPS boot, 2026-10-05). After a window with no answer, the shard's thread must have used
+/// CPU in it (its clock's progress moved) for the wait to go on, so a long recovery is waited out and a stuck shard is
+/// refused after one quiet window. The wait is bounded by the start's own work, which is bounded (recovery is bounded
+/// by the image it replays). `None` when the shard has no state (its start failed), the call is refused, or the shard
+/// was quiet for a window, or its CPU clock cannot be read (no way to tell busy from stuck).
+async fn retained_client_ids(origin: u16, shard: u16) -> Option<u32> {
+  let call = crate::xshard::call_on(origin, shard, || {
+    state::with_state(|state| {
+      state
+        .db
+        .partition()
+        .client_id_high_water(state.origin_anchor.0)
+    })
+  })
+  .ok()?;
+  let mut call = std::pin::pin!(call);
+  let holder = registry::holder_of(shard);
+  let progress_of = || {
+    holder
+      .and_then(registry::shard_cpu)
+      .map(|reading| reading.progress)
+  };
+  let mut progress = progress_of();
+  loop {
+    match futures::within(LIVENESS_BUDGET_NS, call.as_mut()).await {
+      Ok(Some(answer)) => return answer,
+      Ok(None) => {
+        let now = progress_of();
+        if now.is_none() || now == progress {
+          return None;
+        }
+        eprintln!(
+          "slates-server: shard {shard} is still starting; the control loop waits a further window"
+        );
+        progress = now;
+      }
+      Err(_) => return None,
+    }
+  }
 }
 
 /// Persist admission before its region can reach the client. A refused publication or exhausted
@@ -3183,15 +3238,17 @@ async fn control_loop(
       )
     });
   }
-  match futures::spawn(heartbeat_loop(segment)) {
-    Ok(task) => {
-      let _ = futures::detach(task);
-    }
-    Err(_) => {
-      crate::fleet::count_refusal(LOOP_SPAWN_REFUSED);
-    }
+  // The heartbeat is this loop's child (A-100): it beats while the loop lives and ends with it, cancelled and joined by
+  // the runtime when the loop returns or is cancelled. So a refused boot stops beating and the anchor restarts the
+  // daemon, and a shutdown that cancels the loop mid-boot leaves no joinable task behind to hold its shard open (a
+  // heartbeat kept joinable until the boot was accepted hung `Daemon::stop` that way).
+  if futures::spawn_child(heartbeat_loop(segment)).is_err() {
+    crate::fleet::count_refusal(LOOP_SPAWN_REFUSED);
   }
   if !restore_client_ids(&mut listener, control, &shards).await {
+    eprintln!(
+      "slates-server: the boot is refused; the heartbeat stops so the anchor restarts this daemon"
+    );
     return;
   }
   // Clients this daemon handed out, so a wanted id that is live is not given twice; bounded
