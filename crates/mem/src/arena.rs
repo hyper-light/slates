@@ -452,6 +452,18 @@ impl ChunkArena {
   /// Frees an extent this arena issued for a live allocation; anything else is refused
   /// ([`MemError::ForeignExtent`]) with every total unchanged.
   pub fn free(&mut self, extent: Extent) -> Result<(), MemError> {
+    self.release_extent(extent, true)
+  }
+
+  /// Gives back a block a recovery claimed and could not use (A-64), its bytes untouched: a give-back returns the arena
+  /// to how it was before the claim, and those bytes are content that survived the restart, which a later recovery of
+  /// the same image may still claim. [`ChunkArena::free`] scrubs instead, for bytes no one will read again.
+  pub fn give_back(&mut self, extent: Extent) -> Result<(), MemError> {
+    self.release_extent(extent, false)
+  }
+
+  /// [`ChunkArena::free`] or [`ChunkArena::give_back`]: the block released, zeroed when `scrubbed` and released now.
+  fn release_extent(&mut self, extent: Extent, scrubbed: bool) -> Result<(), MemError> {
     let foreign = |reason| MemError::ForeignExtent {
       offset: extent.offset(),
       len: extent.len(),
@@ -465,7 +477,7 @@ impl ChunkArena {
       .ok_or_else(|| foreign(ExtentRefusal::NoSuchRegion))?;
     let before = slot.buddy.free_bytes();
     let deferred = slot.buddy.free_or_defer(extent.block)?;
-    if !deferred {
+    if scrubbed && !deferred {
       scrub(&mut slot.region, extent.offset(), extent.len());
     }
     let released = slot.buddy.free_bytes().saturating_sub(before);

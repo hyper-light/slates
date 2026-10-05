@@ -694,7 +694,7 @@ impl ClaimedHold {
   /// Gives every claim back (a refused claim, before anything is committed).
   fn give_back(&mut self, arena: &mut ChunkArena) {
     for (_, extent) in std::mem::take(&mut self.blocks) {
-      let _ = arena.free(extent);
+      let _ = arena.give_back(extent);
     }
   }
 }
@@ -822,6 +822,9 @@ pub struct ContentHold {
   /// While a hold is rebuilt from its image (A-64), the claimed block the image names for each thing it stores:
   /// storing those bytes takes the block, checked byte for byte, instead of allocating a copy. Empty otherwise.
   adoptable: BTreeMap<Adopt, Extent>,
+  /// Set while a refused rebuild gives everything back ([`ContentHold::abandon`]): its blocks are claims of content
+  /// that survived the restart, so they go back with their bytes ([`ChunkArena::give_back`]), never scrubbed.
+  giving_back: bool,
 }
 
 /// What a claimed block holds, as the image names it (A-64): a chunk's payload by its identity, or a manifest-only
@@ -960,6 +963,19 @@ fn no_capacity(error: &MemError) -> ContentRefusal {
       requested: 0,
       available: 0,
     },
+  }
+}
+
+/// Releases a block of the hold: scrubbed, or given back with its bytes while a refused rebuild abandons its claims.
+fn release(
+  arena: &mut ChunkArena,
+  extent: Extent,
+  giving_back: bool,
+) -> Result<(), slates_mem::MemError> {
+  if giving_back {
+    arena.give_back(extent)
+  } else {
+    arena.free(extent)
   }
 }
 
@@ -1455,7 +1471,7 @@ impl ContentHold {
     };
     let mut bytes = as_count(stage.extent.len());
     let mut index = stage.index;
-    let _ = space.arena.free(stage.extent);
+    let _ = release(space.arena, stage.extent, self.giving_back);
     for chunk_identity in &stage.staged {
       let gone = self.chunks.get_mut(chunk_identity).is_some_and(|chunk| {
         chunk.staged = chunk.staged.saturating_sub(1);
@@ -1464,7 +1480,7 @@ impl ContentHold {
       if gone && let Some(chunk) = self.chunks.remove(chunk_identity) {
         bytes = bytes.saturating_add(as_count(chunk.extent.len()));
         index = index.saturating_add(chunk_entry_bytes());
-        let _ = space.arena.free(chunk.extent);
+        let _ = release(space.arena, chunk.extent, self.giving_back);
       }
     }
     self.give(space, bytes, 0, index);
@@ -1621,7 +1637,7 @@ impl ContentHold {
       .unwrap_or_default();
     let mut bytes = u64::try_from(record.extent.len()).unwrap_or(u64::MAX);
     let mut index = manifest_entry_bytes();
-    let _ = space.arena.free(record.extent);
+    let _ = release(space.arena, record.extent, self.giving_back);
     for chunk_identity in referenced {
       let Some(references) = held.chunks.get_mut(&chunk_identity) else {
         continue;
@@ -1639,7 +1655,7 @@ impl ContentHold {
       if gone && let Some(chunk) = self.chunks.remove(&chunk_identity) {
         bytes = bytes.saturating_add(u64::try_from(chunk.extent.len()).unwrap_or(u64::MAX));
         index = index.saturating_add(chunk_entry_bytes());
-        let _ = space.arena.free(chunk.extent);
+        let _ = release(space.arena, chunk.extent, self.giving_back);
       }
     }
     if held.manifests.is_empty() {
@@ -2019,14 +2035,16 @@ impl ContentHold {
   /// Gives back the claimed blocks nothing adopted (A-64): deferred while the committed image names them.
   fn release_unadopted(&mut self, space: &mut HoldSpace<'_>) {
     for (_, extent) in std::mem::take(&mut self.adoptable) {
-      let _ = space.arena.free(extent);
+      let _ = release(space.arena, extent, self.giving_back);
     }
   }
 
   /// A refused rebuild: everything it took goes back, and the claimed blocks nothing adopted.
   fn abandon(&mut self, space: &mut HoldSpace<'_>) {
+    self.giving_back = true;
     self.forget_all(space);
     self.release_unadopted(space);
+    self.giving_back = false;
   }
 
   /// Rebuilds one imaged stage through the transfer's own path: the manifest staged again, then each chunk it

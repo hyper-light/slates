@@ -127,8 +127,9 @@ pub enum Body {
   Sealed(Vec<Extent>),
   /// An open mutable extent over sealed extents.
   Open {
-    /// The open extent.
-    open: OpenExtent,
+    /// The open extent, boxed: a body is open only while its file is being written (the idle sweep seals it within two
+    /// ticks, A-99), so an inline 64 B extent made every inode pay for a transient state (AC-1.5, 2026-10-05).
+    open: Box<OpenExtent>,
     /// Sealed extents beneath it.
     sealed: Vec<Extent>,
   },

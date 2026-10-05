@@ -2187,7 +2187,7 @@ fn file_body_from_image(claims: &Claims, body: &BodyImage, size: u64) -> Result<
             return Err(VfsError::RecoveryIncomplete);
           }
           Ok(Body::Open {
-            open: claims.open(open)?,
+            open: Box::new(claims.open(open)?),
             sealed,
           })
         }
@@ -2340,7 +2340,7 @@ impl Claims {
             match key {
               Ok(key) => Some((key, seal.version, seal.tags.as_slice())),
               Err(refusal) => {
-                let _ = store.content.release_block(block);
+                let _ = store.content.give_back_block(block);
                 return Err(refusal);
               }
             }
@@ -2360,7 +2360,7 @@ impl Claims {
         let handle = match adopted {
           Ok(handle) => handle,
           Err(refusal) => {
-            let _ = store.content.release_block(block);
+            let _ = store.content.give_back_block(block);
             return Err(refusal);
           }
         };
@@ -2395,8 +2395,8 @@ impl Claims {
   fn give_back(&mut self, store: &mut Store) {
     for (_, held) in std::mem::take(&mut self.held) {
       let _ = match held {
-        Held::Chunk(handle, _) => store.content.free_chunk(handle),
-        Held::Open(block, _) => store.content.release_block(block),
+        Held::Chunk(handle, _) => store.content.give_back_chunk(handle),
+        Held::Open(block, _) => store.content.give_back_block(block),
       };
     }
   }

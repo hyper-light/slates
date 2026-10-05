@@ -1153,7 +1153,7 @@ impl Volume {
       return Ok(0);
     };
     let bytes = open.len;
-    let after = match store.content.seal(open, self.seal_key) {
+    let after = match store.content.seal(*open, self.seal_key) {
       Ok(extent) => {
         if let Some(extent) = extent {
           insert_extent(&mut sealed, extent);
@@ -3962,7 +3962,7 @@ impl Volume {
     // head continues in a fresh extent on its next write.
     if let Body::Open { open, sealed } = copy.body {
       let mut extents = sealed;
-      if let Some(e) = store.content.seal(open, self.seal_key)? {
+      if let Some(e) = store.content.seal(*open, self.seal_key)? {
         insert_extent(&mut extents, e);
       }
       copy.body = Body::Sealed(extents);
@@ -4853,7 +4853,7 @@ impl Volume {
     match body {
       Body::Sealed(extents) => release_extents(store, &extents, last, &mut dead)?,
       Body::Open { open, sealed } => {
-        store.content.release_open(open)?;
+        store.content.release_open(*open)?;
         release_extents(store, &sealed, last, &mut dead)?;
       }
       Body::Base(b) => release_extents(store, &b.pinned, last, &mut dead)?,
@@ -5050,10 +5050,10 @@ impl Volume {
           return refused(Body::Inline(v), refusal);
         }
         let mut sealed = Vec::new();
-        self.write_into(store, open, &mut sealed, off, bytes)
+        self.write_into(store, Box::new(open), &mut sealed, off, bytes)
       }
       Body::Sealed(mut sealed) => match self.open_window(store, &mut sealed, off, len) {
-        Ok(open) => self.write_into(store, open, &mut sealed, off, bytes),
+        Ok(open) => self.write_into(store, Box::new(open), &mut sealed, off, bytes),
         Err(refusal) => refused(Body::Sealed(sealed), refusal),
       },
       Body::Open { open, mut sealed } => self.write_into(store, open, &mut sealed, off, bytes),
@@ -5100,12 +5100,12 @@ impl Volume {
       }
     };
     let mut pinned = std::mem::take(&mut b.pinned);
-    let landed = self.write_into(store, open, &mut pinned, off, bytes);
+    let landed = self.write_into(store, Box::new(open), &mut pinned, off, bytes);
     match landed.body {
       Body::Open { open, sealed } => {
         b.pinned = sealed;
         // The slab was checked for every window this write touches, so the seal has its record.
-        if let Ok(Some(e)) = store.content.seal(open, self.seal_key) {
+        if let Ok(Some(e)) = store.content.seal(*open, self.seal_key) {
           insert_extent(&mut b.pinned, e);
         }
       }
@@ -5169,7 +5169,7 @@ impl Volume {
   pub(crate) fn write_into(
     &mut self,
     store: &mut Store,
-    open: OpenExtent,
+    open: Box<OpenExtent>,
     sealed: &mut Vec<Extent>,
     off: u64,
     bytes: &[u8],
@@ -5184,13 +5184,13 @@ impl Volume {
       // opens the cursor's window (reopening its sealed extent if it has one).
       let same_window = cursor >= current.off && cursor - current.off < chunk;
       if !same_window {
-        match store.content.seal(current, self.seal_key) {
+        match store.content.seal(*current, self.seal_key) {
           Ok(Some(e)) => insert_extent(sealed, e),
           Ok(None) => {}
           // The open extent is still whole: the windows before it stay, and so does it.
           Err(refusal) => return Landed::open(current, sealed, written(cursor), Some(refusal)),
         }
-        current = match self.open_window(store, sealed, cursor, remaining.len()) {
+        *current = match self.open_window(store, sealed, cursor, remaining.len()) {
           Ok(next) => next,
           // The previous window is sealed and the cursor's untouched: a body of sealed extents.
           Err(refusal) => {
@@ -5264,7 +5264,7 @@ impl Volume {
           &mut dead,
         )?;
         if open.off >= len {
-          store.content.release_open(open)?;
+          store.content.release_open(*open)?;
           Body::Sealed(sealed)
         } else {
           let keep = len - open.off;
@@ -5461,7 +5461,7 @@ pub(crate) struct Landed {
 impl Landed {
   /// A body whose open extent is `open` over `sealed`.
   fn open(
-    open: OpenExtent,
+    open: Box<OpenExtent>,
     sealed: &mut Vec<Extent>,
     written: usize,
     refused: Option<VfsError>,
@@ -5765,8 +5765,8 @@ fn release_dead(store: &mut Store, dead: Dead) -> Result<usize, VfsError> {
       let Ok(inode) = store.inodes.remove(h) else {
         return Ok(1);
       };
-      if let Body::Open { open, .. } = inode.body {
-        let _ = store.content.release_open(open);
+      if let Body::Open { open, .. } = &inode.body {
+        let _ = store.content.release_open(**open);
         return Ok(2);
       }
       Ok(1)

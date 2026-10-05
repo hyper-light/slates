@@ -871,6 +871,23 @@ impl ChunkStore {
     self.arena.free(block)?;
     Ok(())
   }
+
+  /// Gives back a block a recovery claimed and could not use, its bytes untouched ([`ChunkArena::give_back`]).
+  pub fn give_back_block(&mut self, block: Block) -> Result<(), VfsError> {
+    self.arena.give_back(block)?;
+    Ok(())
+  }
+
+  /// Gives back a chunk a recovery adopted and could not keep, its bytes untouched: the record and its tags go, the
+  /// block returns to the arena as it was claimed ([`ChunkArena::give_back`]).
+  pub fn give_back_chunk(&mut self, handle: Handle<Chunk>) -> Result<(), VfsError> {
+    let chunk = self.chunks.remove(handle)?;
+    self.arena.give_back(chunk.block)?;
+    if let Some(seal) = chunk.seal {
+      self.tags.free(seal.tags)?;
+    }
+    Ok(())
+  }
 }
 
 #[cfg(test)]

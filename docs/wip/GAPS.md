@@ -3677,9 +3677,15 @@ keeps an untouched volume clean: 452 MB. Then the inode (2026-10-05): `Inode` wa
 base file is copied up): `BaseBody` 160 → 64 B, `Body` 160 → 88, `Inode` 296 → 224, 452 → 377 heap bytes a file at a
 million files; overlay entries 296 → 224 B with no extra allocation (boxing all of `BaseBody` was measured first: the
 same 377 for plain files but about 100 B more per overlay entry, so rejected). Open: 377 bytes a file is still about
-2.5× HDFS's ~150 per namespace object (from memory, to verify) and is 377 GB at a billion files. Next, each measured:
-the open variant (`OpenExtent` 64 B inline in every `Body`, though an open body is transient), `Option<InodeNo>` 16 B
-where a niche gives 8, `Home` 24 B, and directory entries and trie nodes per file. Closed the same day: a seal after an image encrypted the imaged block in place and a restart read
+2.5× HDFS's ~150 per namespace object (from memory, to verify) and is 377 GB at a billion files. The open extent is boxed too (an open body is transient;
+the idle sweep closes it within two ticks): `Body` 88 → 64 (now the overlay variant's size), `Inode` 224 → 200, 377 →
+352 heap bytes a file; a write into a fresh window pays one allocation, 875–937 → 917–1,041 ns, in-place writes, reads
+and creates even. A slab-held open extent would remove that allocation. Next, each measured: `Option<InodeNo>` 16 B
+where a niche gives 8, `Home` 24 B, and directory entries and trie nodes per file. A billion-file volume at even 100 B a
+file is 100 GB on one host: billion-file namespaces need a volume's metadata spread across shards and hosts (a design
+item, not yet decided).
+Observed once, unattributed (2026-10-05): fleet `a_cross_region_client_finds_the_copyset_successor_instead_of_an_unrelated_live_peer`
+failed its `audit_wait` for the successor's status at load average 94 from other sessions; it passed 3 of 3 alone after. Closed the same day: a seal after an image encrypted the imaged block in place and a restart read
 ciphertext as content (docs/bugs/2026-10-05-a-seal-after-an-image-turned-its-open-extent-into-ciphertext.md). Also owed: a volume's epoch key is a `VersionKey` whose expanded AES schedule sits in aws-lc's
 heap, not hyper-seal's locked region, so it is neither locked against swap nor kept out of a core dump (seal.md §8 holds
 for the root and the shard masters only); held replicas and archives keep their own envelopes. Owed, in order: sealed archives (an export sealed to an operator's ML-KEM-1024
