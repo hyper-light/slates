@@ -3620,3 +3620,15 @@ shard's own clock that A-65 budgets in (docs/bugs/2026-10-04-the-slow-observatio
     shard budget, before each verb changes it (`docs/bugs/2026-10-05-work-volumes-grew-uncharged.md`). Owed: a work
     still copies its green's whole content at creation (now charged); sharing the green's bytes copy-on-write
     comes with VFS-backed works.
+
+### 2026-10-05: tail latency under a hot-directory storm, against Tectonic (condition 12, first record)
+
+- **Measured** (BENCHMARKS, "Tail latency under a hot-directory storm"): through Docker's NFSv4.2 path,
+  create+write+close p99 1.2–1.9 ms with one writer and 18.9 ms with 16 in one directory (serialized by the client
+  kernel's directory lock); reads at most 4.3 ms p99. Tectonic's published blob tails reach 150–200 ms (writes) and
+  about 100 ms (reads).
+- **Owed:**
+  - a write delegation's space reservation, which takes the WRITE off a create's close path (measured: 0.21 of
+    0.86 ms);
+  - the same storm on a Linux host and a k8s node (no Docker Desktop hop);
+  - a remote (fleet) read under contention, for condition 7's tail.

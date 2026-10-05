@@ -1819,3 +1819,44 @@ and `Origin` values reach slates unchanged. The image must share the build's gli
     legacy instead of refused `-32602`/400;
   - `initialize` as a modern request was answered instead of `-32601`/404;
   - a header naming a different version from the body met `-32022` before `-32020`.
+
+### Tail latency under a hot-directory storm, against Tectonic's published tails (condition 12; 2026-10-05)
+
+Command: `docs/wip/bench/hotdir/run.sh WORKERS FILES_PER_WORKER` (release build at `965b61f`). A slates volume is
+exported over NFSv4.2 to a Docker container (Docker Desktop 6.12 kernel, `hard`), and `hotdir.py` runs `WORKERS`
+threads in **one** shared directory, the non-ideal pattern Tectonic names (§6.3, metadata hotspots). It times every
+operation: create + write 4 KiB + close, then random open + read + close, random stat, and a readdir every 100
+operations. The container's own overlay is run as the reference. Apple M5 Max; load average 8–9 (other sessions).
+
+| workers | op | slates p50 | slates p99 | slates p999 | overlay p50 | overlay p99 |
+|---|---|---|---|---|---|---|
+| 1 | create+write+close | 0.86–1.1 ms | 1.16–1.85 ms | 1.45–2.4 ms | 8 µs | 63 µs |
+| 1 | open+read+close | 25–48 µs | 81–541 µs | 0.13–0.74 ms | 3 µs | 33 µs |
+| 1 | stat | 3–104 µs | 0.24–0.28 ms | 0.30–0.34 ms | 0.8 µs | 5 µs |
+| 4 | create+write+close | 2.5 ms | 4.4 ms | 7.0 ms | 49 µs | 227 µs |
+| 16 | create+write+close | 11.5 ms | 18.9 ms | 20.4 ms | 0.58 ms | 2.4 ms |
+| 16 | open+read+close | 1.2 ms | 4.3 ms | 7.2 ms | 0.33 ms | 2.9 ms |
+| 16 | stat | 0.34 ms | 2.3 ms | 3.9 ms | 13 µs | 1.4 ms |
+
+(Two single-worker runs, 8,000 and 2,000 files; ranges span both. Readdir at 16 workers is omitted: the reference
+overlay's own 397 ms p50 shows Python's GIL, not the filesystem.)
+
+- Where a create's time goes (mountstats, 1 worker): three round trips (OPEN with create 0.29 ms, WRITE 0.21 ms,
+  CLOSE 0.17 ms) through Docker Desktop's VM-to-host path. The daemon serves an operation in 3 µs at p50 and
+  0.49 ms at p99 (`nfs.local_p*_ns`).
+- Concurrency in one directory multiplies the create's latency nearly linearly (1.1 → 2.5 → 11.5 ms for 1, 4, 16
+  workers). The overlay shows the same shape at µs scale (8 → 49 → 583 µs): Linux holds the directory's lock across
+  an `O_CREAT` open, so creates in one directory are serial on any filesystem.
+- Reads are served from the client's cache under delegations: open+read+close at 25–48 µs, below one round trip
+  (A-78, A-80). 8,000 write delegations were granted in the 16-worker run.
+- **Against Tectonic** (FAST'21, Pan et al., Figure 3 and §6.3): blob-storage writes (partial-block quorum appends)
+  have a median of about 30 ms with the CDF reaching 100% around 150–200 ms; blob reads a median of about 15 ms and
+  a tail to about 100 ms; 72 MB warehouse block writes a p99 of about 1.5 s with hedging. A metadata shard serves
+  at most 10 KQPS, and hot directories drive about 1% of name-layer shards to it, with retries after a backoff. Under
+  the same hot-directory pattern, slates' p99 is 18.9 ms for creates at 16 writers and at most 4.3 ms for reads,
+  and slates sets no per-shard metadata cap (a shard serves an operation in 3 µs). The tiers differ, and the
+  comparison says so: Tectonic stores exabytes on disk across a datacenter, while slates serves a working set from
+  RAM. The comparison is of what a caller waits for under the pattern, not of the media.
+- Owed, measured: a write delegation's space limit is zero bytes, so the client flushes at every close. A
+  reservation behind a non-zero limit would take the WRITE (0.21 of a create's 0.86 ms) off the close path. The
+  same storm on a Linux host or a k8s node, without Docker Desktop's path, is owed as the RTT floor.
