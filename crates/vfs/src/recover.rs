@@ -1186,7 +1186,7 @@ impl Volume {
         .map(|extent| extent_image(store, extent))
         .collect::<Result<_, VfsError>>()?;
       BodyImage::Base {
-        witness: base.witness,
+        witness: base.witness.as_deref().copied(),
         pinned,
         base_len: base.base_len,
         lost: base.lost,
@@ -2199,7 +2199,7 @@ fn file_body_from_image(claims: &Claims, body: &BodyImage, size: u64) -> Result<
       base_len,
       lost,
     } => Ok(Body::Base(crate::inode::BaseBody {
-      witness: *witness,
+      witness: witness.map(Box::new),
       pinned: extents_from_image(claims, pinned, size)?,
       base_len: *base_len,
       descriptor: None,

@@ -2135,7 +2135,7 @@ impl Overlay<'_> {
         fp.ctime_ns,
       );
       if let Body::Base(b) = &mut inode.body {
-        b.witness = Some(witness);
+        b.witness = Some(Box::new(witness));
         b.base_len = fp.size;
       }
     }
@@ -3156,7 +3156,7 @@ impl Overlay<'_> {
       let handle = self.vol.make_current_inode(store, no)?;
       let prev = store.inodes.get(handle)?.version;
       let keep_descriptor = if let Body::Base(b) = &mut store.inodes.get_mut(handle)?.body {
-        b.witness = Some(witness);
+        b.witness = Some(Box::new(witness));
         b.lost = false;
         b.base_len = fp.size;
         true

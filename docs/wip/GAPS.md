@@ -3672,9 +3672,14 @@ idle sweep seals it within two ticks), and a freed block kept its plaintext (now
 AC-1.5 heap per file, found 2026-10-05: A-68's dirty set recorded every change even when the next publication was certain
 to be full (an unpublished volume, or one with snapshots, a clone origin or a base plane), 134 heap bytes a file: 443 →
 578 MB for a million files (bisected to `0799cc1`). Now it records only while a delta can follow, and a `changed` flag
-keeps an untouched volume clean: 452 MB. Open: 452 bytes a file is about 3× HDFS's ~150 per object (from memory, to
-verify); an `Inode` is 296 B, of which `Body` is 160 because the overlay variant (`BaseBody`, 160 B) is inline in
-every inode. Closed the same day: a seal after an image encrypted the imaged block in place and a restart read
+keeps an untouched volume clean: 452 MB. Then the inode (2026-10-05): `Inode` was 296 B, of which
+`Body` was 160 because the overlay variant carried a 104 B copy-up witness inline; the witness is boxed (set only once a
+base file is copied up): `BaseBody` 160 → 64 B, `Body` 160 → 88, `Inode` 296 → 224, 452 → 377 heap bytes a file at a
+million files; overlay entries 296 → 224 B with no extra allocation (boxing all of `BaseBody` was measured first: the
+same 377 for plain files but about 100 B more per overlay entry, so rejected). Open: 377 bytes a file is still about
+2.5× HDFS's ~150 per namespace object (from memory, to verify) and is 377 GB at a billion files. Next, each measured:
+the open variant (`OpenExtent` 64 B inline in every `Body`, though an open body is transient), `Option<InodeNo>` 16 B
+where a niche gives 8, `Home` 24 B, and directory entries and trie nodes per file. Closed the same day: a seal after an image encrypted the imaged block in place and a restart read
 ciphertext as content (docs/bugs/2026-10-05-a-seal-after-an-image-turned-its-open-extent-into-ciphertext.md). Also owed: a volume's epoch key is a `VersionKey` whose expanded AES schedule sits in aws-lc's
 heap, not hyper-seal's locked region, so it is neither locked against swap nor kept out of a core dump (seal.md §8 holds
 for the root and the shard masters only); held replicas and archives keep their own envelopes. Owed, in order: sealed archives (an export sealed to an operator's ML-KEM-1024

@@ -65,8 +65,9 @@ pub struct Attrs {
 /// The base-plane fields of a base-backed body (§4.5 `Body::Base`), filled in by `slates-base`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct BaseBody {
-  /// The witnessed fingerprint and identity, once copied up.
-  pub witness: Option<Witness>,
+  /// The witnessed fingerprint and identity, once copied up; boxed, since most base entries are never copied up and an
+  /// inline witness (104 B) made every inode pay for it (an `Inode` was 296 B, its `Body` 160; AC-1.5, 2026-10-05).
+  pub witness: Option<Box<Witness>>,
   /// Ranges pinned into the arena (whole file for the small class; written ranges for the large).
   pub pinned: Vec<Extent>,
   /// Length as the base holds it (or held it at the witness).
