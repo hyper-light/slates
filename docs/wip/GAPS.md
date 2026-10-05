@@ -3664,8 +3664,12 @@ sealed`, hostile-input tested), and the node root kept for the anchor's life in 
 daemon restart, and tenant, naming and lineage keys recorded in the partition and unwrapped after a restart. Since
 2026-10-05 also sealed content on the content plane (piece 3b, the envelope archive: holders keep ciphertext and keyed
 names, a successor opens with the head's keys), the successor's wrapped key in the head (4c), and SecP384r1MLKEM1024
-between nodes (A-93), and a tenant's key erased with its last volume on a partition. Owed, in order: idle RAM sealed
-(measured 2026-10-05: a warm 4 KiB open p99 667–792 ns meets the 1 µs budget, so it is decided and owed as a build); sealed archives (an export sealed to an operator's ML-KEM-1024
+between nodes (A-93), and a tenant's key erased with its last volume on a partition. Idle RAM sealed is built (A-99, 2026-10-05): a
+chunk's bytes are AES-256-GCM ciphertext in the arena from its seal on, per 4 KiB segment, opened only into a reader's
+buffer; a restart opens what the last daemon sealed; a sealed 4 KiB read p99 916 ns against the 1 µs budget (BENCHMARKS
+"A-99 sealed read"). Owed from it: a volume's epoch key is a `VersionKey` whose expanded AES schedule sits in aws-lc's
+heap, not hyper-seal's locked region, so it is neither locked against swap nor kept out of a core dump (seal.md §8 holds
+for the root and the shard masters only); held replicas and archives keep their own envelopes. Owed, in order: sealed archives (an export sealed to an operator's ML-KEM-1024
 recipient); the envelope wrap's extra copies and second BLAKE3 pass (98 ms for 64 MiB against a 9–10 GB/s seal).
 
 SecP384r1MLKEM1024 between nodes is built (A-93), interoperating with OpenSSL 3.5.7 both ways.
@@ -3690,6 +3694,13 @@ conformance lane's hermeticity (a granted landing refused while a delegation was
 docs/bugs/2026-10-05-a-granted-landing-refused-on-a-held-delegation.md). The same lane's pjdfstest `open/07.t` 6, 8,
 10 and 23 over NFSv4.2 were a delegation's state id letting any user of its client truncate
 (docs/bugs/2026-10-05-a-delegation-let-any-user-of-its-client-truncate.md), fixed the same day.
+
+Boot, found 2026-10-05 (open): the control loop asks every shard for its client-id high-water mark within the 1 s
+liveness budget (`restore_client_ids`, daemon.rs). The call queues behind the shard's `init_shard`, which runs recovery
+as one step, so a shard whose init takes longer than a second makes the daemon stop before serving (clients see
+`DaemonGone`). Seen once: three restart tests in one macOS recovery run at load average 16–17, not again in six runs.
+The fix waits on a shard that is still making progress (its thread's CPU clock moving) and refuses only one that failed
+its init or stopped; first, init's duration is to be logged, and a failing test needs a hook that slows a shard's init.
 
 Condition 11/12, 2026-10-05 (BENCHMARKS "The daemon under a container memory cap ..."):
 - Under a 1 GiB cgroup cap the daemon refuses typed (`ENOSPC`) with no panic or OOM kill, and recovers its space.

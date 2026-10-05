@@ -79,7 +79,7 @@ fn first_chunk_block(image: &VolumeImage, no: InodeNo) -> BlockImage {
   };
   extents
     .iter()
-    .find_map(|e| match e.source {
+    .find_map(|e| match &e.source {
       ExtentSourceImage::Chunk { chunk, .. } => Some(chunk.block),
       ExtentSourceImage::Zero => None,
     })

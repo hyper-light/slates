@@ -325,6 +325,9 @@ pub struct Volume {
   /// Head-reachable content bytes by birth epoch; the two public counters are sums of it.
   pub(crate) bytes: ByEpoch,
   pub(crate) journal: OpLog,
+  /// The key this volume's chunks are sealed under, by the store cipher's reference (A-99); `None` keeps them in the
+  /// clear (no cipher, or sealing unavailable on this node).
+  pub(crate) seal_key: Option<u32>,
   pub(crate) state: VolumeState,
   pub(crate) destroy_queue: Vec<Dead>,
   /// Open and lookup references per inode number (§4.6 lifetime; the inode-addressed-io design):
@@ -569,6 +572,7 @@ impl Volume {
       base: None,
       bytes: ByEpoch::default(),
       journal: OpLog::new(config.journal_bytes),
+      seal_key: None,
       state: VolumeState::Live,
       destroy_queue: Vec::new(),
       references: BTreeMap::new(),
@@ -637,6 +641,7 @@ impl Volume {
         .map(|b| b.for_clone(InodeNo::compose(config.prefix, 1), epoch)),
       bytes: ByEpoch::inherited(epoch, referenced),
       journal: OpLog::new(config.journal_bytes),
+      seal_key: None,
       state: VolumeState::Live,
       destroy_queue: Vec::new(),
       references: BTreeMap::new(),
@@ -725,6 +730,7 @@ impl Volume {
       base: None,
       bytes: ByEpoch::default(),
       journal: OpLog::new(journal_bytes),
+      seal_key: None,
       state: VolumeState::Live,
       destroy_queue: Vec::new(),
       references: BTreeMap::new(),
@@ -1055,6 +1061,16 @@ impl Volume {
       current = parent;
     }
     Ok(false)
+  }
+
+  /// Seals this volume's chunks from now on under the store cipher's key `key` (A-99), or keeps them in the clear.
+  pub fn set_seal_key(&mut self, key: Option<u32>) {
+    self.seal_key = key;
+  }
+
+  /// The key this volume's chunks are sealed under, if any.
+  pub const fn seal_key(&self) -> Option<u32> {
+    self.seal_key
   }
 
   /// The mutation version of inode `no`: a per-inode counter the journal records that increases on
@@ -3843,7 +3859,7 @@ impl Volume {
     // head continues in a fresh extent on its next write.
     if let Body::Open { open, sealed } = copy.body {
       let mut extents = sealed;
-      if let Some(e) = store.content.seal(open)? {
+      if let Some(e) = store.content.seal(open, self.seal_key)? {
         insert_extent(&mut extents, e);
       }
       copy.body = Body::Sealed(extents);
@@ -4980,7 +4996,7 @@ impl Volume {
       Body::Open { open, sealed } => {
         b.pinned = sealed;
         // The slab was checked for every window this write touches, so the seal has its record.
-        if let Ok(Some(e)) = store.content.seal(open) {
+        if let Ok(Some(e)) = store.content.seal(open, self.seal_key) {
           insert_extent(&mut b.pinned, e);
         }
       }
@@ -5059,7 +5075,7 @@ impl Volume {
       // opens the cursor's window (reopening its sealed extent if it has one).
       let same_window = cursor >= current.off && cursor - current.off < chunk;
       if !same_window {
-        match store.content.seal(current) {
+        match store.content.seal(current, self.seal_key) {
           Ok(Some(e)) => insert_extent(sealed, e),
           Ok(None) => {}
           // The open extent is still whole: the windows before it stay, and so does it.
@@ -5116,14 +5132,28 @@ impl Volume {
         Body::Inline(v)
       }
       Body::Sealed(mut extents) => {
-        clip_extents(store, &mut extents, len, last, epoch, &mut dead)?;
+        clip_extents(
+          (store, self.seal_key),
+          &mut extents,
+          len,
+          last,
+          epoch,
+          &mut dead,
+        )?;
         Body::Sealed(extents)
       }
       Body::Open {
         mut open,
         mut sealed,
       } => {
-        clip_extents(store, &mut sealed, len, last, epoch, &mut dead)?;
+        clip_extents(
+          (store, self.seal_key),
+          &mut sealed,
+          len,
+          last,
+          epoch,
+          &mut dead,
+        )?;
         if open.off >= len {
           store.content.release_open(open)?;
           Body::Sealed(sealed)
@@ -5134,7 +5164,14 @@ impl Volume {
         }
       }
       Body::Base(mut b) => {
-        clip_extents(store, &mut b.pinned, len, last, epoch, &mut dead)?;
+        clip_extents(
+          (store, self.seal_key),
+          &mut b.pinned,
+          len,
+          last,
+          epoch,
+          &mut dead,
+        )?;
         // Disk bytes past the cut are no longer the file's; a later extension is a hole.
         b.base_len = b.base_len.min(len);
         Body::Base(b)
@@ -5416,7 +5453,7 @@ pub(crate) fn insert_extent(list: &mut Vec<Extent>, e: Extent) {
 /// materialized length takes, §4.2 "allocator rounding"), its old chunk released by the epoch rule
 /// like any window the head rewrites. Returns bytes freed.
 pub(crate) fn clip_extents(
-  store: &mut Store,
+  (store, key): (&mut Store, Option<u32>),
   extents: &mut Vec<Extent>,
   len: u64,
   last: Option<Epoch>,
@@ -5437,7 +5474,13 @@ pub(crate) fn clip_extents(
         src: e.src,
       };
       freed += e.len - clipped.len;
-      keep.push(rebuilt_if_smaller(store, clipped, last, epoch, dead)?);
+      keep.push(rebuilt_if_smaller(
+        (store, key),
+        clipped,
+        last,
+        epoch,
+        dead,
+      )?);
     } else {
       keep.push(e);
     }
@@ -5450,7 +5493,7 @@ pub(crate) fn clip_extents(
 /// chunk's block is larger (the old chunk released by the epoch rule); the extent itself otherwise, and when the
 /// smaller block cannot be had now.
 fn rebuilt_if_smaller(
-  store: &mut Store,
+  (store, key): (&mut Store, Option<u32>),
   clipped: Extent,
   last: Option<Epoch>,
   epoch: Epoch,
@@ -5469,7 +5512,7 @@ fn rebuilt_if_smaller(
   let Ok(open) = store.content.reopen(&clipped, epoch) else {
     return Ok(clipped);
   };
-  let rebuilt = match store.content.seal(open) {
+  let rebuilt = match store.content.seal(open, key) {
     Ok(Some(rebuilt)) => rebuilt,
     Ok(None) => clipped,
     Err(_) => {

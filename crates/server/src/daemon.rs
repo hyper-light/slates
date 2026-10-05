@@ -2524,23 +2524,20 @@ fn shard_arena(
   Ok((arena, slice))
 }
 
-/// Runs on the shard: attaches the segment, recovers the partition, builds the store and
-/// installs the state, then spawns the server loop as a poller.
-fn init_shard(
+/// Seals the store's idle content under keys derived from the node's sealing root (A-99); with no root the content
+/// stays in the clear, as the sealing state already reports.
+fn install_content_cipher(store: &mut Store, seal_root: Option<&hyper_seal::keys::WrappingKey>) {
+  if let Some(cipher) = seal_root.and_then(crate::content_cipher::ShardCipher::new) {
+    store.content.set_cipher(Box::new(cipher));
+  }
+}
+
+/// The shard's operation headroom (§4.2), derived from the chunk window, the in-flight admission limit and the
+/// shard's slice capacity; see the derivation's comments.
+fn operation_headroom(
   config: &DaemonConfig,
-  env: &[(String, String)],
-  identity: &Identity,
-  (partition, sealing): (u16, crate::seal_keys::RootState),
-  config_shards: &[u16],
-  retained: Option<crate::retention::Retained>,
-  #[cfg(target_os = "linux")] inherited_fuse: Vec<crate::fuse_hold::HeldDevice>,
-) -> Result<(), ServerError> {
-  let (handoff, len) = handoff_of(env)?;
-  let mut segment = AnchorSegment::attach(&handoff, len, identity)?;
-  let mut clock = HostClock::new();
-  let now = slates_vfs::clock::Clock::monotonic_ns(&mut clock);
-  let (db, recovered) = slates_db::replay::recover(&mut segment, partition, config.caps, now)?;
-  let (arena, slice_capacity) = shard_arena(config, partition, env, identity)?;
+  slice_capacity: usize,
+) -> slates_machine::derived::Derived<u64> {
   // The operation headroom (§4.2): the bounded temporary coexistence of in-flight operations, kept
   // free of every admission (reservation and dynamic growth alike). A write into a sealed chunk
   // copies it into a new open extent — copy-on-write at chunk granularity — so the source chunk and
@@ -2564,7 +2561,7 @@ fn init_shard(
   // every volume. Cap it to leave at least one chunk window admittable, whatever the machine.
   // Against the shard's own slice, not what it holds now: a shard claims extents lazily and may hold none (A-98).
   let capacity = u64::try_from(slice_capacity).unwrap_or(u64::MAX);
-  let headroom = derived!(
+  derived!(
     chunk_window
       .saturating_mul(2)
       .saturating_mul(concurrent_writers)
@@ -2575,7 +2572,27 @@ fn init_shard(
       "clients_per_shard",
       "requests_in_flight_per_shard"
     ]
-  );
+  )
+}
+
+/// Runs on the shard: attaches the segment, recovers the partition, builds the store and
+/// installs the state, then spawns the server loop as a poller.
+fn init_shard(
+  config: &DaemonConfig,
+  env: &[(String, String)],
+  identity: &Identity,
+  (partition, sealing): (u16, crate::seal_keys::RootState),
+  config_shards: &[u16],
+  retained: Option<crate::retention::Retained>,
+  #[cfg(target_os = "linux")] inherited_fuse: Vec<crate::fuse_hold::HeldDevice>,
+) -> Result<(), ServerError> {
+  let (handoff, len) = handoff_of(env)?;
+  let mut segment = AnchorSegment::attach(&handoff, len, identity)?;
+  let mut clock = HostClock::new();
+  let now = slates_vfs::clock::Clock::monotonic_ns(&mut clock);
+  let (db, recovered) = slates_db::replay::recover(&mut segment, partition, config.caps, now)?;
+  let (arena, slice_capacity) = shard_arena(config, partition, env, identity)?;
+  let headroom = operation_headroom(config, slice_capacity);
   // The store owns the shard budget (§4.2): it is over what the arena can actually hand out (its
   // buddy-allocatable capacity), not the region's mapping length, so admission never promises quota
   // the arena cannot back (BUG-2), and it keeps the derived operation headroom free of every
@@ -2618,6 +2635,9 @@ fn init_shard(
   let issuer_secret = segment.issuer_secret()?;
   // The node's sealing root (A-92), read from this shard's own attachment into a key of its own in the locked region.
   let seal_root = crate::seal_keys::shard_root(&segment, sealing);
+  // Idle content is sealed in the arena under keys derived from the root (A-99), before recovery adopts any chunk,
+  // so a chunk the last daemon sealed opens. No root (sealing unavailable) keeps content in the clear.
+  install_content_cipher(&mut store, seal_root.as_ref());
   let incarnation = retained
     .as_ref()
     .map_or_else(|| boot_incarnation(&issuer_secret), |record| record.nonce);

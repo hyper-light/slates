@@ -2155,3 +2155,78 @@ fn an_extent_claimed_just_before_a_crash_is_returned_at_the_first_publication() 
     .expect("shard 1 is admitted from its own slice again");
   second.stop();
 }
+
+/// The shards' total of status counter `kind`.
+fn counter(client: &mut Client, kind: &str) -> u64 {
+  client
+    .daemon_status()
+    .unwrap()
+    .shards
+    .iter()
+    .flat_map(|shard| shard.refusals.iter())
+    .filter(|refusal| refusal.kind == kind)
+    .map(|refusal| refusal.count)
+    .sum()
+}
+
+/// Shape: the files the sealing restart test writes.
+const SEALED_FILES: u64 = 6;
+
+/// A-99 (condition 9): do write files into a volume on a daemon whose node has a sealing root, then restart the
+/// daemon over the same anchor and read every file. Expect chunks sealed in the arena (`content.sealed` moved, and no
+/// seal fell back to the clear), and every byte read back after the restart: the new daemon draws a new salt, derives
+/// the old life's keys from the identities the image records, and opens what the last daemon sealed.
+#[test]
+fn sealed_content_reads_back_byte_for_byte_after_a_restart() {
+  let profile = common::machine_profile();
+  let instance = format!("srv-sealed-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
+  let segment = anchor_segment("sealed", &profile, &config);
+  let first = Daemon::start(&profile, config.clone(), source_of(&segment)).unwrap();
+  first
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let mut client = connect(&instance);
+  let volume = client
+    .create(&CreateSpec {
+      size: SizeClass::Bounded { limit: 64 << 20 },
+      ..scratch("sealed")
+    })
+    .unwrap();
+  let attachment = client
+    .attach(volume, None, slates_ipc::protocol::Intent::Write)
+    .unwrap()
+    .attachment;
+  for index in 0..SEALED_FILES {
+    let wrote = client.fs_write(
+      (volume, attachment),
+      &format!("f{index}"),
+      &file_bytes(index),
+      0o644,
+    );
+    assert_eq!(wrote.ok(), Some(FILL_FILE as u64), "file {index}");
+  }
+  assert!(
+    counter(&mut client, "content.sealed") > 0,
+    "chunks were sealed in the arena"
+  );
+  assert_eq!(
+    counter(&mut client, "content.seal_refused"),
+    0,
+    "no seal fell back to the clear"
+  );
+  first.stop();
+  let second = Daemon::start(&profile, config, source_of(&segment)).unwrap();
+  for index in 0..SEALED_FILES {
+    let read = client.read(
+      volume,
+      &format!("f{index}"),
+      slates_ipc::protocol::ReadAt::Head,
+    );
+    assert!(
+      read.unwrap() == file_bytes(index),
+      "file {index} after the restart"
+    );
+  }
+  second.stop();
+}

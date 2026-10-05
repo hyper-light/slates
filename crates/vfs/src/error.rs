@@ -91,6 +91,9 @@ pub enum VfsError {
   /// the change succeeds once the delegation is returned or revoked (the caller retries: `NFS3ERR_JUKEBOX`,
   /// `NFS4ERR_DELAY`, `EAGAIN`).
   Delegated,
+  /// A sealed chunk's segment did not open (A-99): its bytes or its tag changed in RAM, or the key it names is gone.
+  /// Nothing is returned for it, never bytes that did not authenticate.
+  Integrity,
   /// A snapshot, submit or detach barrier could not close an attachment's generation: a request
   /// admitted into it is still in flight — a consumer lost mid-request, until its explicit
   /// failed-consumer cleanup (§4.4 A-9 `BarrierIncomplete{attachment, generation}`; §4.6 "A
@@ -124,7 +127,9 @@ impl VfsError {
       Self::CrossVolumeMove => "EXDEV",
       Self::StaleHandle => "ESTALE",
       Self::Destroying | Self::Archived | Self::Pinned => "EBUSY",
-      Self::BaseUnavailable(_) | Self::BaseDrift | Self::RecoveryIncomplete => "EIO",
+      Self::BaseUnavailable(_) | Self::BaseDrift | Self::RecoveryIncomplete | Self::Integrity => {
+        "EIO"
+      }
       Self::NotOverlay => "ENODEV",
       Self::DigestNotClean => "ENODATA",
       Self::DigestUnverified | Self::PublishNeeded | Self::Delegated => "EAGAIN",

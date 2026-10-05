@@ -26,6 +26,7 @@ pub mod catalog;
 pub mod config;
 mod consensus;
 mod consensus_recovery;
+mod content_cipher;
 mod content_holder;
 mod content_pool;
 pub mod content_retention;

@@ -67,9 +67,11 @@ const SHARD_MAGIC: u32 = u32::from_le_bytes(*b"SLS1");
 /// delta's replay finds a name by binary search instead of scanning the directory. 15 (A-96, 2026-10-05) a delta
 /// carries only the attachments' reference counts that changed, not every attachment's whole list. 16 (2026-10-05) a
 /// base entry's fingerprint carries its owner, so an overlay reports a base file's owner as the disk holds it.
+/// 17 (A-99, 2026-10-05) a sealed chunk's image carries its key identity, its version and its segments' tags, so
+/// a restarted daemon re-opens the ciphertext the arena still holds instead of reading it as clear bytes.
 /// Format: the image layout version, bumped with any change to the types below or to the held replicas'
 /// image they carry.
-const IMAGE_VERSION: u16 = 16;
+const IMAGE_VERSION: u16 = 17;
 
 /// A recorded attachment's references in an image (A-61): its durable id and its share by inode.
 #[derive(Clone, Debug, PartialEq, Eq, Wire)]
@@ -237,9 +239,21 @@ pub struct BlockImage {
   pub len: u64,
 }
 
+/// How a chunk's bytes are sealed in the arena (A-99): the key's stable identity (the cipher derives the key from it on
+/// recovery), the version its segments were sealed at, and their tags in segment order.
+#[derive(Clone, Debug, PartialEq, Eq, Wire)]
+pub struct SealImage {
+  /// The key's identity, as the store's cipher names it.
+  pub key: [u8; 32],
+  /// The version the segments were sealed at.
+  pub version: u64,
+  /// The segments' tags, in order.
+  pub tags: Vec<[u8; 16]>,
+}
+
 /// A sealed chunk (§4.5 `Chunk`): its block, the bytes used from it, its birth epoch and its identity once
 /// computed.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Wire)]
+#[derive(Clone, Debug, PartialEq, Eq, Wire)]
 pub struct ChunkImage {
   /// The block holding the bytes.
   pub block: BlockImage,
@@ -249,10 +263,12 @@ pub struct ChunkImage {
   pub born: u64,
   /// BLAKE3 of the bytes, once computed.
   pub identity: Option<[u8; 32]>,
+  /// How its bytes are sealed in the arena (A-99), when they are.
+  pub seal: Option<SealImage>,
 }
 
 /// Where a sealed extent's bytes are.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Wire)]
+#[derive(Clone, Debug, PartialEq, Eq, Wire)]
 pub enum ExtentSourceImage {
   /// Zeros.
   Zero,
@@ -266,7 +282,7 @@ pub enum ExtentSourceImage {
 }
 
 /// A sealed extent: `len` bytes at file offset `offset`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Wire)]
+#[derive(Clone, Debug, PartialEq, Eq, Wire)]
 pub struct ExtentImage {
   /// The file offset.
   pub offset: u64,
@@ -1320,6 +1336,18 @@ fn extent_image(store: &Store, extent: &Extent) -> Result<ExtentImage, VfsError>
           used: chunk.len,
           born: chunk.born.0,
           identity: chunk.identity,
+          seal: match &chunk.seal {
+            Some(seal) => Some(SealImage {
+              // A key the cipher cannot name could not be opened by a later daemon: refused, never imaged unopenable.
+              key: store
+                .content
+                .key_identity(seal.key)
+                .ok_or(VfsError::RecoveryIncomplete)?,
+              version: seal.version,
+              tags: store.content.chunk_tags(seal),
+            }),
+            None => None,
+          },
         },
         at,
       }
@@ -2191,10 +2219,10 @@ fn extents_from_image(
       return Err(VfsError::RecoveryIncomplete);
     }
     previous_end = end;
-    let src = match extent.source {
+    let src = match &extent.source {
       ExtentSourceImage::Zero => ExtentSrc::Zero,
-      ExtentSourceImage::Chunk { chunk, at } => ExtentSrc::Chunk {
-        chunk: claims.chunk(&chunk)?,
+      &ExtentSourceImage::Chunk { ref chunk, at } => ExtentSrc::Chunk {
+        chunk: claims.chunk(chunk)?,
         at,
       },
     };
@@ -2208,7 +2236,7 @@ fn extents_from_image(
 }
 
 /// What a claimed block holds (A-64).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 enum Held {
   /// A sealed chunk, recorded in the chunk slab.
   Chunk(Handle<Chunk>, ChunkImage),
@@ -2277,7 +2305,7 @@ impl Claims {
   }
 
   fn claim_extent(&mut self, store: &mut Store, extent: &ExtentImage) -> Result<(), VfsError> {
-    let ExtentSourceImage::Chunk { chunk, at } = extent.source else {
+    let &ExtentSourceImage::Chunk { ref chunk, at } = &extent.source else {
       return Ok(());
     };
     let end = u64::from(at)
@@ -2288,19 +2316,40 @@ impl Claims {
     }
     let key = (chunk.block.region, chunk.block.offset);
     match self.held.get(&key) {
-      Some(Held::Chunk(_, held)) if *held == chunk => Ok(()),
+      Some(Held::Chunk(_, held)) if held == chunk => Ok(()),
       Some(_) => Err(VfsError::RecoveryIncomplete),
       None => {
         let block =
           store
             .content
             .claim_block(chunk.block.region, chunk.block.offset, chunk.block.len)?;
-        let adopted = store.content.adopt_chunk(Chunk {
-          born: Epoch(chunk.born),
-          len: chunk.used,
-          block,
-          identity: chunk.identity,
-        });
+        let sealed = match &chunk.seal {
+          Some(seal) => {
+            let key = store
+              .content
+              .cipher_mut()
+              .ok_or(VfsError::RecoveryIncomplete)
+              .and_then(|cipher| cipher.reference(&seal.key));
+            match key {
+              Ok(key) => Some((key, seal.version, seal.tags.as_slice())),
+              Err(refusal) => {
+                let _ = store.content.release_block(block);
+                return Err(refusal);
+              }
+            }
+          }
+          None => None,
+        };
+        let adopted = store.content.adopt_chunk(
+          Chunk {
+            born: Epoch(chunk.born),
+            len: chunk.used,
+            block,
+            identity: chunk.identity,
+            seal: None,
+          },
+          sealed,
+        );
         let handle = match adopted {
           Ok(handle) => handle,
           Err(refusal) => {
@@ -2308,7 +2357,7 @@ impl Claims {
             return Err(refusal);
           }
         };
-        self.held.insert(key, Held::Chunk(handle, chunk));
+        self.held.insert(key, Held::Chunk(handle, chunk.clone()));
         Ok(())
       }
     }

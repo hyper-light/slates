@@ -2253,7 +2253,7 @@ impl Overlay<'_> {
       let epoch = self.vol.epoch;
       let mut open = store.content.open(start, bytes.len(), epoch)?;
       store.content.write_open(&mut open, 0, &bytes)?;
-      if let Some(extent) = store.content.seal(open)?
+      if let Some(extent) = store.content.seal(open, self.vol.seal_key)?
         && let Body::Base(b) = &mut store.inodes.get_mut(handle)?.body
       {
         crate::volume::insert_extent(&mut b.pinned, extent);

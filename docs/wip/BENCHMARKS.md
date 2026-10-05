@@ -2066,6 +2066,25 @@ AES-256-GCM; 100,000 opens per case, each timed alone). Apple M5 Max; load avera
 The warm open meets A-92's budget (at most about 1 µs p99 under load) on both systems, so idle RAM is sealed under a
 version key kept warm per mounted volume; a cold open per access would not meet it.
 
+### A-99 sealed read: idle content sealed in the arena, read through the chokepoint (condition 9; 2026-10-05)
+
+Command: `cargo run --release -p slates-vfs --example sealed_read_bench` (64 MiB of full chunks sealed into one
+`ChunkStore` under hyper-seal's `VersionKey`, the server's cipher, and into another in the clear; 200,000 random 4 KiB
+reads at granule-aligned offsets through `read_extent_into`, each timed alone; then the whole 64 MiB read; three rounds
+per run). Apple M5 Max, macOS 26.4.1; load average 16–18 from other sessions. The A/B binaries were run interleaved,
+five runs each (`ab.log` in the session scratch).
+
+| build | sealed 4 KiB p50 | sealed p99 (median of 15) | sealed p99 range | whole read | clear 4 KiB p50 / p99 |
+|---|---|---|---|---|---|
+| A: every segment opened in a stack scratch, then copied out | 792–875 ns | 1,083 ns | 1,000–1,333 ns | 5.66–6.42 GB/s | 209–291 / 417–625 ns |
+| B: a segment the read covers whole opened in the caller's buffer | 667–750 ns | 916 ns | 875–1,250 ns | 6.92–7.69 GB/s | 209–250 / 417–458 ns |
+
+B lands: every sealed row of B beats every row of A on p50 and throughput, and its median p99 is inside the 1 µs
+budget (A-92). A is measured-and-rejected: it zeroed a 4 KiB stack buffer and copied each segment twice. The cost left
+is AES-256-GCM itself (about 7 GB/s on one core, so about 580 ns per 4 KiB), against A-92 piece 5's warm open p99 of
+667 ns for one segment alone. The bench's first run failed `Capacity`: it made a key before locking hyper-seal's key
+region; it now calls `hyper_seal::lock_keys` first, as the daemon does at boot.
+
 ### Codemode against list-and-read on a real agent task (condition 13; 2026-10-05)
 
 Command: `cargo run --release -p slates-mcp --example codemode_tokens` (an in-process daemon, 2 shards; an overlay

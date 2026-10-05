@@ -9564,8 +9564,9 @@ memory cap") and GAPS.
        volume holds 338 MiB of the 358 MB pool (BENCHMARKS;
        `docs/bugs/2026-10-05-pressure-hold-counted-the-daemons-own-growth.md`).
 
-### A-99 — Idle content sealed in RAM (2026-10-05, in progress)
-Status: designed 2026-10-05; piece 1 built the same day. It realizes A-92's decision from piece 5's measurement: idle RAM is
+### A-99 — Idle content sealed in RAM (2026-10-05, built)
+Status: designed 2026-10-05; pieces 1–4 built and measured the same day; live in every daemon whose node has a
+sealing root. It realizes A-92's decision from piece 5's measurement: idle RAM is
 sealed under the volume's version key (condition 9, "encrypted at rest when not being modified or read").
 - What is at rest. `ChunkStore` (`crates/vfs/src/content.rs`) already separates the *open* extent, written in place
   until a publication seals it, from *sealed* chunks, which are immutable (a write into one copies it into a new open
@@ -9585,9 +9586,15 @@ sealed under the volume's version key (condition 9, "encrypted at rest when not 
   one tag per granule of the shard's capacity. A chunk record names its first tag. Tags are in the recovery image,
   since the ciphertext survives a daemon restart in the anchor, so its tags must too (`IMAGE_VERSION` moves).
 - Nonce uniqueness, the argument seal.md §4 requires before the version-keyed rule may be used:
-  - The key is not the lineage key itself. It is a *key epoch*: HKDF of the volume's lineage key and a 128-bit random
-    salt drawn at each daemon start, for each volume as it first seals. The salt is recorded in the image, so a later
-    daemon can open what this one sealed.
+  - The key is a *key epoch*: HKDF-SHA-384 of the shard's content master, with the volume's id and a 128-bit random
+    salt drawn at each daemon start as its label. The content master is derived from the node's sealing root
+    (`seal_keys::shard_root`), which lives exactly as long as the anchor and so as long as the content it protects.
+    A key's identity is its label (volume ‖ salt, `KEY_IDENTITY_BYTES` = 32), recorded in the image, so a later
+    daemon derives the same key and opens what this one sealed.
+  - **Changed in the build (2026-10-05): the root, not the volume's lineage key.** A lineage key is made with a
+    database record the first time it is asked for (A-92), so taking one when a volume is created or first written
+    would nest a transaction inside the verb's own, or put one on the write path. The HKDF label keeps keys apart per
+    volume and per daemon life, which is all the nonce argument needs (`crates/server/src/content_cipher.rs`).
   - The version is a per-shard counter held in memory for that daemon's life and incremented at every chunk seal. It
     is never persisted, so no crash can make it repeat under the same key: a restarted daemon draws a new salt, hence
     a new key, and starts its counter afresh.
@@ -9599,8 +9606,13 @@ sealed under the volume's version key (condition 9, "encrypted at rest when not 
     crosses daemons.
   - A random 128-bit salt colliding across daemon lives is the only way a (key, nonce) could repeat:
     2^-128 per pair of lives.
-- Keys never leave locked memory (A-92 piece 2): the lineage key is in hyper-seal's locked region, and the epoch key
-  is derived into it.
+- Key memory, as built: the node root and each shard's content master are `WrappingKey`s, each a slot of
+  hyper-seal's locked region (counted in `seal_key_slots`, one base page of slots per shard). A volume's epoch key is
+  derived through a transient locked slot and kept as hyper-seal's `VersionKey`, whose expanded AES key schedule lives
+  in aws-lc's ordinary heap allocation, as every hyper-seal stream sealer's does. So the epoch keys are not locked
+  against swap or excluded from a core dump. That is within A-92's threat model (the running daemon holds its keys)
+  but short of seal.md §8 for these keys; locking the schedule needs aws-lc to place it in caller memory, which its
+  API does not offer. Recorded in GAPS.
 - Threat model, as A-92 states it: a dump of the anchor's memory, or of its content object, reads nothing of a sealed
   chunk without the volume's keys. Not defended: the running daemon, which holds the keys and opens on read, and a
   root user of the host, who can read the daemon. A node with sealing `unavailable` (no locked key region) keeps
@@ -9611,11 +9623,29 @@ sealed under the volume's version key (condition 9, "encrypted at rest when not 
      the chokepoint. A chunk an extent names that is no longer there is now `StaleHandle`, where it read as zeros
      before. The overlap copy is checked (`copy_overlap`): the old `copy_range` added and indexed unchecked. vfs 215,
      cluster 280, server lib 157, NFS mount 29 and recovery 21 pass.
-  2. The tag slab, the per-chunk epoch and version, and their place in the image (`IMAGE_VERSION` 17): recovery
-     round-trips them.
-  3. Sealing at `ChunkStore::seal` and opening at `read_extent` and `reopen`, under a key the server hands the store
-     per volume. Tests: a chunk's arena bytes are not its plaintext; every read returns the plaintext; a bit flipped
-     in the arena is refused typed (a read fails `Integrity`, never wrong bytes); a restart opens what the last daemon
-     sealed.
-  4. Measured: the 4 KiB read p99 and a whole-file read throughput, sealed against unsealed, under load. The 1 µs
-     budget decides whether it lands.
+  2. **Built (2026-10-05):** the tag store (`TagStore`: 16-byte tags in a buddy pool sized `max_chunks` ×
+     the next power of two of a chunk's segments, so a chunk's tags are one run), a chunk's `ChunkSeal { key,
+     version, tags, segments }`, and the image's `SealImage { key identity, version, tags }` (`IMAGE_VERSION` 17).
+     Recovery resolves the identity to a key through the cipher (`ChunkCipher::reference`) and adopts the chunk with
+     its tags.
+  3. **Built (2026-10-05):** sealing at `ChunkStore::seal` under the volume's key (`Store::seal_key`, set by the
+     server when a volume's slot is made, `content_cipher::key_volume`), and opening at `read_extent_into` and
+     `reopen`. A cipher that refuses leaves the chunk in the clear, counted (`content.seal_refused`); chunks sealed
+     are counted (`content.sealed`). `VfsError::Integrity` reaches a client as EIO and a ring client as
+     `ContentUnavailable`. The daemon installs `ShardCipher` at shard start, before recovery adopts a chunk. Tests by
+     use: a sealed chunk's arena bytes hold no stretch of its plaintext and every span reads back plain; a flipped
+     byte is refused `Integrity` for a span touching its segment and not for one that doesn't; whole segments open in
+     the caller's buffer and a tampered one is refused (`whole_segments_open_in_the_callers_buffer_…`, whose
+     ciphertext-in-the-buffer check proves the in-place path ran); `sealed_content_reads_back_byte_for_byte_after_a_restart`
+     (server recovery: `content.sealed` moved, no refusal, every byte after a restart, macOS and Linux as a non-root
+     user). With sealing live: vfs 218, cluster 280, bridge-core 76, bridge-nfs 153, client 16, MCP 12, land 54,
+     server lib 157 and every server suite (fleet 70, recovery 22, NFS mount 29, virtio-fs 8, …) pass.
+  4. **Measured (2026-10-05), BENCHMARKS "A-99 sealed read":** a sealed 4 KiB read p50 709 ns and p99 916 ns (median
+     of 15 rows) against 250 ns and 417 ns in the clear; a whole read 6.9–7.7 GB/s against 46–59 GB/s. Within the 1 µs
+     p99 budget, so it lands. The first build opened every segment into a stack scratch and copied out; opening a
+     segment the read covers whole in the caller's buffer took p50 from 833 to 709 ns and throughput from 6.2 to
+     7.4 GB/s in an interleaved A/B, measured-and-rejected recorded.
+- Test harness note: a test process runs many daemons over hyper-seal's one key region, which the first `lock_keys`
+  sizes. The fixtures make it once, for the largest daemon the profile derives, before any daemon starts
+  (`crates/server/tests/common/mod.rs`); before that, a 1-shard daemon starting first left a 2-shard one with sealing
+  unavailable, one recovery run in three.

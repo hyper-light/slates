@@ -113,7 +113,7 @@ pub fn refusal_of_vfs(e: &VfsError) -> Refusal {
       existing: slates_ipc::protocol::VolumeId::default(),
     },
     VfsError::NoSpace => Refusal::NoSpace,
-    VfsError::RecoveryIncomplete => Refusal::ContentUnavailable,
+    VfsError::RecoveryIncomplete | VfsError::Integrity => Refusal::ContentUnavailable,
     // The wire's taxonomy names one kind for a name the volume will not take, whatever the reason.
     VfsError::InvalidName | VfsError::NameTooLong => Refusal::InvalidName,
     VfsError::Destroying => Refusal::Destroying,

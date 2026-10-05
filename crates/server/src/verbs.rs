@@ -1973,12 +1973,20 @@ pub fn shard_report(state: &mut ShardState) -> ShardReport {
         count: *count,
       })
       .chain(
-        Some(state.store.content.arena().source_refusals())
-          .filter(|count| *count > 0)
-          .map(|count| RefusalCount {
-            kind: CONTENT_POOL_REFUSED.to_owned(),
-            count,
-          }),
+        [
+          (
+            CONTENT_POOL_REFUSED,
+            state.store.content.arena().source_refusals(),
+          ),
+          (CONTENT_SEALED, state.store.content.sealed()),
+          (CONTENT_SEAL_REFUSED, state.store.content.seal_refusals()),
+        ]
+        .into_iter()
+        .filter(|(_, count)| *count > 0)
+        .map(|(kind, count)| RefusalCount {
+          kind: kind.to_owned(),
+          count,
+        }),
       )
       .collect(),
     replayed_records: state.recovered.replayed_records,
@@ -3374,6 +3382,8 @@ fn publish_created_volume(
       },
     );
   }
+  let mut volume = volume;
+  crate::content_cipher::key_volume(&mut state.store, &mut volume, id.bytes);
   let slot = VolumeSlot {
     id,
     name,
@@ -4715,6 +4725,8 @@ fn clone(
       },
     );
   }
+  let mut volume_core = volume_core;
+  crate::content_cipher::key_volume(&mut state.store, &mut volume_core, id.bytes);
   let slot = VolumeSlot {
     id,
     name: name.to_owned(),
@@ -7872,6 +7884,12 @@ pub(crate) const DEFERRED_RELIEVED: &str = "arena.deferred_relieved";
 /// or whose range the OS would not map, or one that could not be given back. Counted by the pool, never lost.
 pub(crate) const CONTENT_POOL_REFUSED: &str = "content.pool_refused";
 
+/// Format: the status counter of chunks sealed in the arena (A-99): idle content encrypted at rest.
+pub(crate) const CONTENT_SEALED: &str = "content.sealed";
+
+/// Format: the status counter of chunk seals that fell back to the clear because the cipher refused (A-99).
+pub(crate) const CONTENT_SEAL_REFUSED: &str = "content.seal_refused";
+
 /// Publishes when the shard's arena is short of room only because freed blocks wait on a publication (A-64): a
 /// block the committed recovery image may name is not reused until a newer image commits. Run before each unit of
 /// work — a transport request on a volume, a verb — so an operation within the operation headroom (the derived
@@ -8013,6 +8031,8 @@ fn rebuild_volume(
       ));
     }
   };
+  let mut volume = volume;
+  crate::content_cipher::key_volume(&mut state.store, &mut volume, record.id.bytes);
   let slot = VolumeSlot {
     id: record.id,
     name: record.name.clone(),
