@@ -15,6 +15,13 @@
 //! - **Bounds.** The client table and each client's sessions are bounded ([`Limits`]); a request past a
 //!   bound is refused `NFS4ERR_RESOURCE`, never grown into.
 //!
+//! - **Departure (A-76).** A session may leave the table that minted it (its *home*) for the shard that owns the
+//!   volume its compounds use, so they run where their data lives: [`Sessions::depart`] hands it off whole (its
+//!   slots and their kept replies, so exactly-once survives the move) when no slot is in flight, and the home
+//!   remembers where it went; [`Sessions::arrive`] takes it in as a *guest*. The client record stays home, where
+//!   it is durable (A-37): a guest's `SEQUENCE` asks for a renewal note home at most [`RENEWALS_PER_LEASE`] times
+//!   a lease, and a client dropped at home leaves a drop for each of its guests ([`Sessions::take_guest_drops`]).
+//!
 //! The state lives with whoever owns the connection's shard; it holds no lock and no shared reference.
 
 use std::collections::BTreeMap;
@@ -26,6 +33,15 @@ use super::types::{ChannelAttrs, SESSIONID_SIZE, SessionId, VERIFIER_SIZE};
 pub const EXCHGID4_FLAG_CONFIRMED_R: u32 = 0x8000_0000;
 /// Format: `EXCHGID4_FLAG_USE_NON_PNFS`: this server is a plain NFSv4.1 server (no pNFS roles yet).
 pub const EXCHGID4_FLAG_USE_NON_PNFS: u32 = 0x0001_0000;
+
+/// Derived: renewal notes a guest session sends its client's home per lease: twice, so the home's lease, checked
+/// against the whole lease, never lapses for a client a guest is still serving (at most half a lease stale).
+pub const RENEWALS_PER_LEASE: u64 = 2;
+
+/// A session handed off whole by [`Sessions::depart`], for [`Sessions::arrive`] on the shard it moves to. A clone
+/// is what a refused move hands back to its home ([`Sessions::return_home`]).
+#[derive(Clone, Debug)]
+pub struct DepartedSession(Session);
 
 /// The bounds and offers of the session state, derived by the caller from the machine.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -131,6 +147,8 @@ pub enum Sequenced {
     highest_slotid: u32,
     /// The sizes the reply must keep to.
     limits: ReplyLimits,
+    /// A guest session whose client's home is due a renewal note (A-76).
+    renew_home: bool,
   },
   /// A retry of the last request on this slot: the cached reply, to send back as it is.
   Replay(Vec<u8>),
@@ -155,16 +173,22 @@ struct Client {
 
 /// One slot: its last sequence id, that request's kept reply, and whether that request is still being
 /// served (a compound can await another shard, so its retry may arrive before it finishes).
+#[derive(Clone, Debug)]
 struct Slot {
   seq: u32,
   reply: Option<Vec<u8>>,
   in_flight: bool,
 }
 
+#[derive(Clone, Debug)]
 struct Session {
   clientid: u64,
   fore: ChannelAttrs,
   slots: Vec<Slot>,
+  /// A session that arrived from its home (A-76): its client's record is there, not here.
+  guest: bool,
+  /// When a guest last asked for a renewal note home.
+  noted_ns: u64,
 }
 
 /// The server's client ids and sessions.
@@ -184,6 +208,14 @@ pub struct Sessions {
   /// The client changes since the last [`Sessions::take_changes`], for the listener's partition to
   /// record, when the table is durable (`None` for a standalone server); drained after every compound.
   changes: Option<Vec<ClientChange>>,
+  /// Sessions of this table's clients that departed, and the shard each went to (A-76); never more than the
+  /// clients' sessions, since each is one of them.
+  away: BTreeMap<SessionId, u16>,
+  /// Departed sessions whose client was dropped here, for their guest shards to drop too; never more than `away`
+  /// held.
+  guest_drops: Vec<(SessionId, u16)>,
+  /// Guest sessions destroyed here, for their home to forget; never more than the guests held.
+  forgotten: Vec<SessionId>,
 }
 
 /// A client as a durable record carries it (§4.6 A-37): enough for a restarted listener to keep the
@@ -224,6 +256,9 @@ impl Sessions {
       sessions: BTreeMap::new(),
       dropped: Vec::new(),
       changes: None,
+      away: BTreeMap::new(),
+      guest_drops: Vec::new(),
+      forgotten: Vec::new(),
     }
   }
 
@@ -411,6 +446,8 @@ impl Sessions {
             in_flight: false,
           })
           .collect(),
+        guest: false,
+        noted_ns: now_ns,
       },
     );
     self.journal_client(clientid);
@@ -466,6 +503,11 @@ impl Sessions {
     slot.reply = None;
     slot.in_flight = true;
     let clientid = session.clientid;
+    let note_every = self.limits.lease_ns / RENEWALS_PER_LEASE;
+    let renew_home = session.guest && now_ns.saturating_sub(session.noted_ns) >= note_every;
+    if renew_home {
+      session.noted_ns = now_ns;
+    }
     if let Some(client) = self.clients.get_mut(&clientid) {
       client.renewed_ns = now_ns;
     }
@@ -473,6 +515,7 @@ impl Sessions {
       clientid,
       highest_slotid: highest,
       limits,
+      renew_home,
     })
   }
 
@@ -495,16 +538,107 @@ impl Sessions {
     }
   }
 
-  /// `DESTROY_SESSION` (§18.37).
+  /// `DESTROY_SESSION` (§18.37). A session that departed (A-76) is destroyed from its home too: its client forgets
+  /// it here and its guest is left a drop.
   pub fn destroy_session(&mut self, sessionid: &SessionId) -> Result<(), Nfsstat4> {
+    if let Some(to) = self.away.remove(sessionid) {
+      self.guest_drops.push((*sessionid, to));
+      for client in self.clients.values_mut() {
+        client.sessions.retain(|id| id != sessionid);
+      }
+      return Ok(());
+    }
     let session = self
       .sessions
       .remove(sessionid)
       .ok_or(Nfsstat4::Badsession)?;
+    if session.guest {
+      self.forgotten.push(*sessionid);
+    }
     if let Some(client) = self.clients.get_mut(&session.clientid) {
       client.sessions.retain(|id| id != sessionid);
     }
     Ok(())
+  }
+
+  /// The guest sessions destroyed here since the last call, for their home to forget ([`Sessions::forget_away`]).
+  pub fn take_forgotten(&mut self) -> Vec<SessionId> {
+    std::mem::take(&mut self.forgotten)
+  }
+
+  /// Hands session `sessionid` off whole for the shard `to` (A-76), its slots and their kept replies with it; the
+  /// home keeps its client and remembers where the session went. `None`, and nothing changes, when the session is
+  /// not this table's own (absent, or a guest here) or a slot is still being served (its reply must be kept here).
+  pub fn depart(&mut self, sessionid: &SessionId, to: u16) -> Option<DepartedSession> {
+    let session = self.sessions.get(sessionid)?;
+    if session.guest
+      || session.slots.iter().any(|slot| slot.in_flight)
+      || !self.clients.contains_key(&session.clientid)
+    {
+      return None;
+    }
+    let session = self.sessions.remove(sessionid)?;
+    self.away.insert(*sessionid, to);
+    Some(DepartedSession(session))
+  }
+
+  /// Takes in a departed session as a guest (A-76); its client stays at its home, which the caller knows. A session
+  /// id already held here is left as it is.
+  pub fn arrive(&mut self, sessionid: SessionId, departed: DepartedSession, now_ns: u64) {
+    let DepartedSession(mut session) = departed;
+    session.guest = true;
+    session.noted_ns = now_ns;
+    self.sessions.entry(sessionid).or_insert(session);
+  }
+
+  /// Takes back a session whose departure could not complete (its move was refused before it left): it is this
+  /// table's own again, as if it had never departed.
+  pub fn return_home(&mut self, sessionid: SessionId, departed: DepartedSession) {
+    if self.away.remove(&sessionid).is_some() {
+      let DepartedSession(mut session) = departed;
+      session.guest = false;
+      self.sessions.entry(sessionid).or_insert(session);
+    }
+  }
+
+  /// The shard a session of this table's departed to (A-76).
+  pub fn away(&self, sessionid: &SessionId) -> Option<u16> {
+    self.away.get(sessionid).copied()
+  }
+
+  /// Whether this table serves `sessionid` (its own or a guest).
+  pub fn holds_session(&self, sessionid: &SessionId) -> bool {
+    self.sessions.contains_key(sessionid)
+  }
+
+  /// A guest's renewal note (A-76): `clientid` was served at `now_ns`.
+  pub fn renew(&mut self, clientid: u64, now_ns: u64) {
+    if let Some(client) = self.clients.get_mut(&clientid) {
+      client.renewed_ns = client.renewed_ns.max(now_ns);
+    }
+  }
+
+  /// A departed session its guest destroyed (A-76): forgotten here, its client's count freed.
+  pub fn forget_away(&mut self, sessionid: &SessionId) {
+    if self.away.remove(sessionid).is_some() {
+      for client in self.clients.values_mut() {
+        client.sessions.retain(|id| id != sessionid);
+      }
+    }
+  }
+
+  /// Drops guest session `sessionid` (its client was dropped at its home); whether it was held.
+  pub fn drop_guest(&mut self, sessionid: &SessionId) -> bool {
+    match self.sessions.get(sessionid) {
+      Some(session) if session.guest => self.sessions.remove(sessionid).is_some(),
+      _ => false,
+    }
+  }
+
+  /// The departed sessions whose client was dropped or that were destroyed here since the last call, each with the
+  /// shard holding it, for that shard to drop.
+  pub fn take_guest_drops(&mut self) -> Vec<(SessionId, u16)> {
+    std::mem::take(&mut self.guest_drops)
   }
 
   /// `DESTROY_CLIENTID` (§18.50): refused while the client holds a session.
@@ -571,7 +705,12 @@ impl Sessions {
     if let Some(client) = self.clients.remove(&clientid) {
       self.owners.remove(&client.owner);
       for sessionid in client.sessions {
-        self.sessions.remove(&sessionid);
+        match self.away.remove(&sessionid) {
+          Some(to) => self.guest_drops.push((sessionid, to)),
+          None => {
+            self.sessions.remove(&sessionid);
+          }
+        }
       }
       self.dropped.push(clientid);
       self.journal_client(clientid);

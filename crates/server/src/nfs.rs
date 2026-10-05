@@ -87,8 +87,10 @@ use slates_bridge_nfs::procedures::{
 };
 use slates_bridge_nfs::rpc::RecordReader;
 use slates_bridge_nfs::v4::compound::{self, Server as V4Server};
+use slates_bridge_nfs::v4::session::DepartedSession;
 use slates_bridge_nfs::v4::session::Limits;
 use slates_bridge_nfs::v4::types::ChannelAttrs;
+use slates_bridge_nfs::v4::types::SessionId;
 use slates_bridge_nfs::v4::{NFS_V4, NFSPROC4_COMPOUND, NFSPROC4_NULL, Nfsstat4};
 use slates_bridge_nfs::xdr::{XdrReader, XdrWriter};
 use slates_bridge_nfs::{
@@ -1183,6 +1185,36 @@ pub struct ServiceQuantiles {
 /// One NFSv4 call (§4.6 A-35): `NULL`, or a `COMPOUND` served by the v4 front end over this shard's v4
 /// state, each of its operations becoming an NFSv3 call through [`serve_v3`].
 async fn reply_v4(this: u16, call: Call, port: u16) -> Vec<u8> {
+  serve_v4(this, this, call, port).await.0
+}
+
+/// Whether `call` is an NFSv4 `COMPOUND` (the calls a session places, A-76).
+fn is_v4_compound(call: &Call) -> bool {
+  call.program == NFS_PROGRAM && call.version == NFS_V4 && call.procedure == NFSPROC4_COMPOUND
+}
+
+/// The shard an NFSv4 compound must be served on when it is not this one (A-76): a session's compound where the
+/// session is held — the home routes one that departed to the shard it went to — and a client-table compound at the
+/// connection's `home`. A session this shard neither holds nor (as home) knows departed is answered here, with
+/// `NFS4ERR_BADSESSION`, so a connection never bounces between shards: the client makes a new session at home.
+fn v4_elsewhere(this: u16, home: u16, call: &Call) -> Option<u16> {
+  match compound::placement(&call.args) {
+    compound::Placement::Session(sessionid) => state::with_state(|s| {
+      let server = s.nfs_v4.as_ref()?;
+      if server.sessions.holds_session(&sessionid) || this != home {
+        return None;
+      }
+      server.sessions.away(&sessionid).filter(|&to| to != this)
+    })
+    .flatten(),
+    compound::Placement::Clients => (this != home).then_some(home),
+    compound::Placement::Anywhere => None,
+  }
+}
+
+/// Serves an NFSv4 call for a connection whose client table is at `home`: the reply, and the owner shard the
+/// compound's v3 calls were forwarded to, if any (where its session would rather be, A-76).
+async fn serve_v4(this: u16, home: u16, call: Call, port: u16) -> (Vec<u8>, Option<u16>) {
   let Call {
     xid,
     requester,
@@ -1192,7 +1224,7 @@ async fn reply_v4(this: u16, call: Call, port: u16) -> Vec<u8> {
     ..
   } = call;
   match procedure {
-    NFSPROC4_NULL => reply_bytes(xid, AcceptStatus::Success, &[]),
+    NFSPROC4_NULL => (reply_bytes(xid, AcceptStatus::Success, &[]), None),
     NFSPROC4_COMPOUND => {
       // Each operation's v3 call answers for the front end: no AppleDouble views (a v4 client carries
       // attributes itself, §4.6 A-33) and the change counters its attributes need (A-38).
@@ -1205,12 +1237,116 @@ async fn reply_v4(this: u16, call: Call, port: u16) -> Vec<u8> {
         xid,
         requester,
         port,
+        home,
+        forwarded_to: None,
       };
       note(NFS4_COMPOUNDS);
       let results = compound::serve(&mut backend, &args, request_bytes).await;
-      reply_bytes(xid, AcceptStatus::Success, &results)
+      (
+        reply_bytes(xid, AcceptStatus::Success, &results),
+        backend.forwarded_to,
+      )
     }
-    _ => reply_bytes(xid, AcceptStatus::ProcUnavail, &[]),
+    _ => (reply_bytes(xid, AcceptStatus::ProcUnavail, &[]), None),
+  }
+}
+
+/// After a compound on this shard (A-76): the drops a home owes the guests of clients it dropped, and the notes a
+/// guest owes the home of sessions destroyed here.
+fn v4_after(this: u16, home: u16) {
+  let (drops, forgotten) = state::with_state(|s| {
+    s.nfs_v4.as_mut().map(|server| {
+      (
+        server.sessions.take_guest_drops(),
+        server.sessions.take_forgotten(),
+      )
+    })
+  })
+  .flatten()
+  .unwrap_or_default();
+  for (sessionid, guest) in drops {
+    send_note(this, guest, NFS4_NOTE_LOST, move || {
+      with_v4_sessions(|sessions| {
+        sessions.drop_guest(&sessionid);
+      })
+    });
+  }
+  for sessionid in forgotten {
+    send_note(this, home, NFS4_NOTE_LOST, move || {
+      with_v4_sessions(|sessions| sessions.forget_away(&sessionid))
+    });
+  }
+}
+
+/// Departs the session of a compound that was forwarded to `forwarded_to` for that shard, moving with the connection
+/// (A-76): from then on its compounds run where their volume lives, with no hop. Only a session this shard holds as
+/// its own departs (`Sessions::depart`), and only when no slot is still being served. The owner shard to move to.
+fn depart_with(
+  this: u16,
+  connection: &mut Connection,
+  placement: compound::Placement,
+  forwarded_to: Option<u16>,
+) -> Option<u16> {
+  let (compound::Placement::Session(sessionid), Some(owner)) = (placement, forwarded_to) else {
+    return None;
+  };
+  if owner == this {
+    return None;
+  }
+  let departed = with_v4_sessions(|sessions| sessions.depart(&sessionid, owner)).flatten()?;
+  note(NFS4_SESSIONS_MOVED);
+  connection.carry = Some((sessionid, departed));
+  Some(owner)
+}
+
+/// Takes in a session that moved here with its connection (A-76), creating this shard's NFSv4 table if it has none.
+fn adopt_session(sessionid: SessionId, departed: DepartedSession) {
+  let now = futures::now_ns();
+  let adopted = state::with_state(|s| {
+    if s.nfs_v4.is_none() {
+      s.nfs_v4 = crate::nfs_state::server(s);
+    }
+    s.nfs_v4
+      .as_mut()
+      .map(|server| server.sessions.arrive(sessionid, departed, now))
+  })
+  .flatten();
+  if adopted.is_none() {
+    note(NFS4_SESSION_UNADOPTED);
+  }
+}
+
+/// Runs `f` on this shard's NFSv4 session table, if it has one.
+fn with_v4_sessions<R>(
+  f: impl FnOnce(&mut slates_bridge_nfs::v4::session::Sessions) -> R,
+) -> Option<R> {
+  state::with_state(|s| s.nfs_v4.as_mut().map(|server| f(&mut server.sessions))).flatten()
+}
+
+/// Sends `work` to shard `to` and awaits its outcome in a detached task of this shard, counting `lost` when it could
+/// not be delivered or did not answer within the liveness budget (never a silent drop, banned item 9).
+fn send_note(
+  this: u16,
+  to: u16,
+  lost: &'static str,
+  work: impl FnOnce() -> Option<()> + Send + 'static,
+) {
+  let Ok(call) = crate::xshard::call_on(this, to, work) else {
+    note(lost);
+    return;
+  };
+  match futures::spawn(async move {
+    if crate::xshard::within(call, crate::daemon::LIVENESS_BUDGET_NS)
+      .await
+      .is_none()
+    {
+      note(lost);
+    }
+  }) {
+    Ok(task) => {
+      let _ = futures::detach(task);
+    }
+    Err(_) => note(lost),
   }
 }
 
@@ -1226,6 +1362,13 @@ const NFS4_STATE_LOCAL: &str = "nfs4.state.local";
 /// Counter: file-state calls that went to the file's owner shard and back.
 const NFS4_STATE_FORWARDED: &str = "nfs4.state.forwarded";
 
+/// Counter: NFSv4 sessions that moved with their connection to the shard their volume lives on (A-76).
+const NFS4_SESSIONS_MOVED: &str = "nfs4.sessions.moved";
+/// Counter: sessions that arrived with a connection but could not be taken in (no NFSv4 table on the shard).
+const NFS4_SESSION_UNADOPTED: &str = "nfs4.sessions.unadopted";
+/// Counter: notes between a session's home and its guest (a renewal, a drop, a forget) that were not delivered.
+const NFS4_NOTE_LOST: &str = "nfs4.notes.lost";
+
 /// Counts one `counter` on this shard; off a shard (no state) nothing is counted.
 fn note(counter: &'static str) {
   let _ = state::with_state(|s| *s.refusals.entry(counter).or_insert(0) += 1);
@@ -1239,6 +1382,10 @@ struct RoutedBackend {
   xid: u32,
   requester: Requester,
   port: u16,
+  /// Where the connection's client table lives (A-76): a guest's renewal notes go there.
+  home: u16,
+  /// The owner shard a v3 call of this compound was forwarded to, if any.
+  forwarded_to: Option<u16>,
 }
 
 impl compound::Backend for RoutedBackend {
@@ -1249,8 +1396,12 @@ impl compound::Backend for RoutedBackend {
   ) -> impl std::future::Future<Output = Vec<u8>> {
     let (this, xid, port) = (self.this, self.xid, self.port);
     let requester = self.requester.clone();
+    let forwarded = route(NFS_PROGRAM, procedure, &args).filter(|&owner| owner != this);
+    if forwarded.is_some() {
+      self.forwarded_to = forwarded;
+    }
     async move {
-      note(if route(NFS_PROGRAM, procedure, &args).is_some() {
+      note(if forwarded.is_some() {
         NFS4_V3_FORWARDED
       } else {
         NFS4_V3_LOCAL
@@ -1322,6 +1473,13 @@ impl compound::Backend for RoutedBackend {
 
   fn now_ns(&self) -> u64 {
     futures::now_ns()
+  }
+
+  fn renew_home(&mut self, clientid: u64) {
+    let now = futures::now_ns();
+    send_note(self.this, self.home, NFS4_NOTE_LOST, move || {
+      with_v4_sessions(|sessions| sessions.renew(clientid, now))
+    });
   }
 
   fn with_v4<R>(&mut self, f: impl FnOnce(&mut V4Server) -> R) -> Result<R, Nfsstat4> {
@@ -1477,6 +1635,8 @@ async fn serve_one(stream: TcpStream, port: u16) {
     records: RecordReader::default(),
     pending: None,
     port,
+    home: registry::current_shard().unwrap_or(0),
+    carry: None,
   })
   .await;
 }
@@ -1490,6 +1650,10 @@ struct Connection {
   records: RecordReader,
   pending: Option<Call>,
   port: u16,
+  /// The shard that accepted the connection: where its NFSv4 client table lives (A-76).
+  home: u16,
+  /// An NFSv4 session moving with the connection to the shard its volume lives on (A-76), taken in there.
+  carry: Option<(SessionId, DepartedSession)>,
 }
 
 /// The serve loop of [`serve_one`], on whichever shard holds the connection now. A mount's calls name one
@@ -1557,17 +1721,31 @@ async fn serve_batch(this: u16, connection: &mut Connection) -> Option<Batch> {
     moving: None,
   };
   while let Some(call) = next_call(connection)? {
-    if let Some(owner) = owner_elsewhere(&call) {
+    let elsewhere = if is_v4_compound(&call) {
+      v4_elsewhere(this, connection.home, &call)
+    } else {
+      owner_elsewhere(&call)
+    };
+    if let Some(owner) = elsewhere {
       // The replies already built leave first, so the moved connection answers in request order.
       connection.pending = Some(call);
       batch.moving = Some(owner);
       break;
     }
-    batch
-      .replies
-      .extend_from_slice(&write_record(&reply_to(this, call, connection.port).await));
+    let reply = if is_v4_compound(&call) {
+      let placement = compound::placement(&call.args);
+      let (reply, forwarded_to) = serve_v4(this, connection.home, call, connection.port).await;
+      v4_after(this, connection.home);
+      if let Some(owner) = depart_with(this, connection, placement, forwarded_to) {
+        batch.moving = Some(owner);
+      }
+      reply
+    } else {
+      reply_to(this, call, connection.port).await
+    };
+    batch.replies.extend_from_slice(&write_record(&reply));
     batch.answered = batch.answered.saturating_add(1);
-    if futures::now_ns().saturating_sub(started) >= quantum {
+    if batch.moving.is_some() || futures::now_ns().saturating_sub(started) >= quantum {
       break;
     }
   }
@@ -1614,10 +1792,19 @@ fn migrate(owner: u16, connection: Connection) {
     records,
     pending,
     port,
+    home,
+    carry,
   } = connection;
   let fd = stream.into_fd();
+  // A copy of the session stays behind for the refusal path: a move refused before it left returns the session to its
+  // home table, so the home never points at a session no shard holds.
+  let kept = carry.clone();
   let arrive = slates_rt::task::SpawnRequest::new(
     Box::pin(async move {
+      // The session is taken in before the socket is adopted, so a failed adoption leaves it where its home says.
+      if let Some((sessionid, departed)) = carry {
+        adopt_session(sessionid, departed);
+      }
       let Ok(stream) = TcpStream::from_fd(fd) else {
         crate::fleet::count_refusal(MIGRATE_REFUSED);
         return;
@@ -1628,6 +1815,8 @@ fn migrate(owner: u16, connection: Connection) {
         records,
         pending,
         port,
+        home,
+        carry: None,
       };
       match futures::spawn(serve_connection(connection)) {
         Ok(task) => {
@@ -1642,6 +1831,13 @@ fn migrate(owner: u16, connection: Connection) {
   );
   if registry::send_control(owner, slates_rt::control::Control::Spawn(Box::new(arrive))).is_err() {
     crate::fleet::count_refusal(MIGRATE_REFUSED);
+    if let Some((sessionid, departed)) = kept {
+      let _ = state::with_state(|s| {
+        if let Some(server) = s.nfs_v4.as_mut() {
+          server.sessions.return_home(sessionid, departed);
+        }
+      });
+    }
   }
 }
 

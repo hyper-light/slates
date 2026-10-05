@@ -8743,3 +8743,32 @@ Status: built 2026-10-04.
   §2.10.6.1's dynamic slot target (`sr_target_highest_slotid`) is the standard answer.
 - Proven: `a_session_is_granted_one_clients_in_flight_bound_and_can_use_it` (failed first: 2 slots granted).
 
+### A-76 — An NFSv4.1 session moves with its connection to the shard its volume lives on (2026-10-04)
+Applied in the same change to: `crates/bridge-nfs/src/v4/session.rs` (`depart`, `arrive`, `return_home`, renewal
+notes, guest drops), `crates/bridge-nfs/src/v4/compound.rs` (`placement`, `Backend::renew_home`),
+`crates/server/src/nfs.rs` (`v4_elsewhere`, `depart_with`, `adopt_session`, `send_note`, `Connection::home`),
+`crates/bridge-nfs/tests/v4_session.rs`, `crates/server/tests/nfs_mount.rs`, BENCHMARKS, GAPS.
+Status: built 2026-10-04.
+- Why: the v4 state (clients, sessions) lived on the shard that accepted the connection, and v4 connections never
+  moved. Every v3 call a compound made for a volume on another shard went there and back, two thread wakes each.
+  With the volume on another shard, a parallel Go build in a Docker container took 8.0 s against 4.3–4.7 s, and a
+  reopen 2.2 ms against 0.5 ms (334,133 forwarded calls; forwarded p99 147 µs against 5 µs local). Linux's server
+  runs a compound's operations in one thread (`nfsd4_proc_compound`).
+- What:
+  - **Move.** After a compound whose calls were forwarded to an owner shard, its session departs for that shard
+    whole (slots and kept replies, so exactly-once survives) and moves with the connection, as an NFSv3 connection
+    already moves. A session departs only when no slot is in flight. A refused move returns it to its home.
+  - **What stays home.** The client record stays at home, where it is durable (A-37). A guest asks home for a
+    renewal note at most twice per lease. Drops of clients and destroyed sessions are sent between home and guest
+    as notes, and a note not delivered is counted (`nfs4.notes.lost`).
+  - **Routing.** A compound is placed before it is served: a session's compound goes where the session is held
+    (home routes a departed one on), and a client-table compound goes to the connection's home. A shard that
+    neither holds a session nor knows it departed answers `NFS4ERR_BADSESSION`, so a connection never bounces.
+  - **Multiple volumes.** A client using volumes on several shards keeps per-call forwarding for all but the
+    first.
+- Measured (Docker, real Linux client): 333,678 of 333,694 v3 calls ran locally after one move. Alternating with a
+  volume on the listener's shard: build 5.40–6.04 s against 5.40–6.49 s, reopen 0.64–0.77 ms against 0.62–0.80 ms.
+- Proven: `a_session_moves_to_its_volumes_shard_and_its_compounds_run_there` (one move, no forwarded call after it,
+  the retry answered from the moved cache, a second connection reaching it, destroy then re-create; it fails with
+  the move disabled); the four `v4_session.rs` departure tests.
+

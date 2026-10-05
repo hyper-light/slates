@@ -61,6 +61,11 @@ pub trait Backend {
   /// await, so compounds on other connections served by the same owner interleave with this one.
   /// `NFS4ERR_SERVERFAULT` if the state cannot be reached (a daemon shard that is shutting down).
   fn with_v4<R>(&mut self, f: impl FnOnce(&mut Server) -> R) -> Result<R, Nfsstat4>;
+  /// A guest session served a request of `clientid`, whose record is at the session's home (A-76): the home is
+  /// due a renewal note. A server whose sessions never leave their table has nothing to send.
+  fn renew_home(&mut self, clientid: u64) {
+    let _ = clientid;
+  }
 }
 
 /// Format: the operation numbers (RFC 7863 `nfs_opnum4`).
@@ -447,6 +452,42 @@ pub async fn serve<B: Backend>(backend: &mut B, args: &[u8], request_bytes: usiz
   encoded
 }
 
+/// What a compound must be served with (A-76), read from its first operation without serving it: the session it
+/// names (`SEQUENCE`, `DESTROY_SESSION`, `BIND_CONN_TO_SESSION`), the client table (`EXCHANGE_ID`,
+/// `CREATE_SESSION`, `DESTROY_CLIENTID`), or nothing in particular (a malformed or empty compound, answered
+/// wherever it lands).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Placement {
+  /// Served where this session is held.
+  Session(SessionId),
+  /// Served where the client table is (the session's home).
+  Clients,
+  /// Served wherever it arrived.
+  Anywhere,
+}
+
+/// The [`Placement`] of the compound whose arguments are `args`.
+pub fn placement(args: &[u8]) -> Placement {
+  let mut reader = XdrReader::new(args);
+  let header = reader
+    .opaque(OPAQUE_LIMIT)
+    .and_then(|_| reader.u32())
+    .and_then(|_| reader.u32());
+  let (Ok(count), Ok(opnum)) = (header, reader.u32()) else {
+    return Placement::Anywhere;
+  };
+  if count == 0 {
+    return Placement::Anywhere;
+  }
+  match opnum {
+    op::SEQUENCE | op::DESTROY_SESSION | op::BIND_CONN_TO_SESSION => {
+      decode_sessionid(&mut reader).map_or(Placement::Anywhere, Placement::Session)
+    }
+    op::EXCHANGE_ID | op::CREATE_SESSION | op::DESTROY_CLIENTID => Placement::Clients,
+    _ => Placement::Anywhere,
+  }
+}
+
 /// `opnum` as the compound's minor version knows it: an operation the version does not define is
 /// illegal in it (RFC 8881 §16.2.3), as NFSv4.2's operations (RFC 7862, RFC 8276) are in a 4.1 compound.
 fn defined_in(minor: u32, opnum: u32) -> u32 {
@@ -768,7 +809,11 @@ fn sequence<B: Backend>(
       clientid,
       highest_slotid: table_highest,
       limits,
+      renew_home,
     } => {
+      if renew_home {
+        backend.renew_home(clientid);
+      }
       let mut body = XdrWriter::new();
       body.fixed(&sessionid);
       body.u32(sequenceid);

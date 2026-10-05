@@ -1237,6 +1237,9 @@ const OP_WRITE: u32 = 38;
 const OP_EXCHANGE_ID: u32 = 42;
 const OP_CREATE_SESSION: u32 = 43;
 const OP_SEQUENCE: u32 = 53;
+/// Format: `OP_ACCESS` and `OP_DESTROY_SESSION` (RFC 7863).
+const OP_ACCESS: u32 = 3;
+const OP_DESTROY_SESSION: u32 = 44;
 
 impl V4Client {
   /// One ONC RPC call of NFS version `version` (AUTH_SYS as uid 0): the accept status and the rest.
@@ -1775,5 +1778,116 @@ fn a_session_is_granted_one_clients_in_flight_bound_and_can_use_it() {
     NFS4ERR_BADSLOT,
     "a slot past the grant is refused"
   );
+  drop(daemon);
+}
+
+/// The file handle of the volume root `component` names, over `v4`'s session.
+fn volume_root(v4: &mut V4Client, component: &str) -> Vec<u8> {
+  use slates_bridge_nfs::xdr::{XdrReader, XdrWriter};
+  let mut ops = XdrWriter::new();
+  ops.u32(OP_PUTROOTFH);
+  ops.u32(OP_LOOKUP);
+  ops.opaque(component.as_bytes());
+  ops.u32(OP_GETFH);
+  let (status, results) = v4.sequenced(3, ops.as_slice());
+  assert_eq!(status, NFS4_OK, "the volume's root");
+  let mut reader = XdrReader::new(&results);
+  reader.fixed(8 + 8 + 8).unwrap();
+  reader.opaque(128).unwrap().to_vec()
+}
+
+/// Sends `ops` on `v4`'s session from a new connection to `port`, expecting it served; the session's next sequence.
+fn reach_from_a_second_connection(v4: &V4Client, port: u16, ops: &[u8]) -> u32 {
+  let mut second = V4Client {
+    stream: TcpStream::connect(("127.0.0.1", port)).unwrap(),
+    clientid: v4.clientid,
+    sessionid: v4.sessionid,
+    sequence: v4.sequence,
+    xid: 1000,
+    slots: v4.slots,
+  };
+  let (status, _) = second.sequenced(2, ops);
+  assert_eq!(
+    status, NFS4_OK,
+    "a second connection reaches the moved session"
+  );
+  second.sequence
+}
+
+/// Shape: compounds a moved session runs after its move, each making one v3 call.
+const AFTER_MOVE: u32 = 20;
+
+/// The refusal-map counter `name` summed over every shard.
+fn counter(daemon: &Daemon, name: &str) -> u64 {
+  daemon
+    .refusals_on_every_shard()
+    .unwrap()
+    .get(name)
+    .copied()
+    .unwrap_or(0)
+}
+
+/// §4.6 (A-76): do reach a volume another shard owns over a session created at the connection's home, then run
+/// [`AFTER_MOVE`] compounds; expect the session to have moved once with the connection to the volume's shard, so the
+/// later compounds' v3 calls run there with no forward. Retry the last compound; expect its reply byte for byte from
+/// the slot cache that moved. Name the session from a second connection; expect it served (home routes it on).
+/// Destroy the session and create another; expect both served (the creation at home). With the session left at
+/// home, a parallel Go build on a volume of another shard took 8.0 s against 4.3–4.7 s (2026-10-04).
+#[test]
+fn a_session_moves_to_its_volumes_shard_and_its_compounds_run_there() {
+  use slates_bridge_nfs::xdr::XdrWriter;
+  let (daemon, instance) = two_shard_daemon("v4move");
+  let mut client = Client::connect(&instance);
+  let name = remote_volume_name(&mut client);
+  let path = capability_path(&daemon, &name);
+  let component = path.trim_start_matches('/').to_owned();
+  let port = daemon.nfs_port().expect("the daemon is serving NFS");
+  let mut v4 = V4Client::connect(port);
+  let root = volume_root(&mut v4, &component);
+  let forwarded_before = counter(&daemon, "nfs4.v3.forwarded");
+  let local_before = counter(&daemon, "nfs4.v3.local");
+  let mut access = XdrWriter::new();
+  access.u32(OP_PUTFH);
+  access.opaque(&root);
+  access.u32(OP_ACCESS);
+  access.u32(0x1f);
+  let mut last = Vec::new();
+  for _ in 0..AFTER_MOVE {
+    let (status, results) = v4.sequenced(2, access.as_slice());
+    assert_eq!(status, NFS4_OK, "ACCESS on the moved session");
+    last = results;
+  }
+  assert_eq!(
+    counter(&daemon, "nfs4.sessions.moved"),
+    1,
+    "the session moved once"
+  );
+  assert_eq!(
+    counter(&daemon, "nfs4.v3.forwarded"),
+    forwarded_before,
+    "no compound after the move forwarded a call"
+  );
+  assert!(
+    counter(&daemon, "nfs4.v3.local") >= local_before + u64::from(AFTER_MOVE),
+    "the calls ran where the volume lives"
+  );
+  v4.sequence -= 1;
+  let (status, replayed) = v4.sequenced(2, access.as_slice());
+  assert_eq!(
+    (status, &replayed),
+    (NFS4_OK, &last),
+    "the retry is the kept reply"
+  );
+  v4.sequence = reach_from_a_second_connection(&v4, port, access.as_slice());
+  let mut destroy = XdrWriter::new();
+  destroy.u32(OP_DESTROY_SESSION);
+  destroy.fixed(&v4.sessionid);
+  assert_eq!(
+    v4.compound(1, destroy.as_slice()).0,
+    NFS4_OK,
+    "DESTROY_SESSION"
+  );
+  let again = V4Client::connect_as(port, b"v4-test-host");
+  assert_ne!(again.sessionid, v4.sessionid, "a new session at home");
   drop(daemon);
 }

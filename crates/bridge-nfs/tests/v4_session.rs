@@ -272,3 +272,113 @@ fn destruction_reclaim_and_the_lease() {
   assert_eq!(sessions.expire(11 + limits().lease_ns), 1, "lapsed");
   assert_eq!(sessions.client_count(), 0);
 }
+
+/// Format: the shard a test's session departs to (A-76).
+const GUEST_SHARD: u16 = 3;
+
+/// A-76: do serve a request, depart the session to another table and retry it there; expect the retry answered
+/// from the reply cache that moved with it, the next request served as new, and the home remembering where the
+/// session went while no longer serving it.
+#[test]
+fn a_departed_session_keeps_its_reply_cache_and_its_home_remembers_it() {
+  let mut home = Sessions::new(7, limits());
+  let mut guest = Sessions::new(8, limits());
+  let (_, sessionid) = session(&mut home, "host-a");
+  assert!(matches!(
+    home.sequence(&seq(sessionid, 0, 1), 1).unwrap(),
+    Sequenced::New { .. }
+  ));
+  home.store_reply(&sessionid, 0, b"reply one");
+  let departed = home
+    .depart(&sessionid, GUEST_SHARD)
+    .expect("an idle session departs");
+  guest.arrive(sessionid, departed, 2);
+  assert_eq!(home.away(&sessionid), Some(GUEST_SHARD));
+  assert!(!home.holds_session(&sessionid) && guest.holds_session(&sessionid));
+  assert_eq!(
+    guest.sequence(&seq(sessionid, 0, 1), 3).unwrap(),
+    Sequenced::Replay(b"reply one".to_vec()),
+    "exactly-once survives the move"
+  );
+  assert!(matches!(
+    guest.sequence(&seq(sessionid, 0, 2), 4).unwrap(),
+    Sequenced::New { .. }
+  ));
+  assert_eq!(
+    home.sequence(&seq(sessionid, 0, 3), 5),
+    Err(Nfsstat4::Badsession)
+  );
+}
+
+/// A-76: do try to depart a session while one of its slots is still being served; expect a refusal that changes
+/// nothing (the reply must be kept where the request runs), then a departure once the reply is stored.
+#[test]
+fn a_session_with_a_request_in_flight_does_not_depart() {
+  let mut home = Sessions::new(7, limits());
+  let (_, sessionid) = session(&mut home, "host-a");
+  assert!(matches!(
+    home.sequence(&seq(sessionid, 1, 1), 1).unwrap(),
+    Sequenced::New { .. }
+  ));
+  assert!(home.depart(&sessionid, GUEST_SHARD).is_none());
+  assert!(home.holds_session(&sessionid) && home.away(&sessionid).is_none());
+  home.store_reply(&sessionid, 1, b"done");
+  assert!(home.depart(&sessionid, GUEST_SHARD).is_some());
+}
+
+/// A-76: do serve a guest session's requests across a lease; expect a renewal note asked for no more often than
+/// `RENEWALS_PER_LEASE` times a lease, and a home that takes the notes keeping its client past the lease.
+#[test]
+fn a_guest_asks_for_a_renewal_note_at_most_twice_a_lease_and_keeps_its_client_alive() {
+  use slates_bridge_nfs::v4::session::RENEWALS_PER_LEASE;
+  let lease = limits().lease_ns;
+  let step = lease / (4 * RENEWALS_PER_LEASE);
+  let mut home = Sessions::new(7, limits());
+  let mut guest = Sessions::new(8, limits());
+  let (clientid, sessionid) = session(&mut home, "host-a");
+  guest.arrive(sessionid, home.depart(&sessionid, GUEST_SHARD).unwrap(), 0);
+  let mut notes = 0u64;
+  let mut now = 0u64;
+  for sequenceid in 1..=u32::try_from(4 * RENEWALS_PER_LEASE * 3).unwrap() {
+    now += step;
+    if let Sequenced::New {
+      renew_home: true, ..
+    } = guest.sequence(&seq(sessionid, 0, sequenceid), now).unwrap()
+    {
+      notes += 1;
+      home.renew(clientid, now);
+    }
+    guest.store_reply(&sessionid, 0, b"r");
+  }
+  assert!(
+    notes <= 3 * RENEWALS_PER_LEASE,
+    "{notes} notes over three leases"
+  );
+  assert!(
+    notes >= 3 * RENEWALS_PER_LEASE - 1,
+    "{notes} notes over three leases"
+  );
+  assert_eq!(home.expire(now), 0, "the notes kept the client's lease");
+}
+
+/// A-76: do drop, at home, a client whose session departed (its lease lapsed); expect a drop for the guest shard,
+/// and the guest serving the session no more once it takes the drop. Then destroy a departed session from its home;
+/// expect a drop for its guest too.
+#[test]
+fn a_client_dropped_at_home_leaves_a_drop_for_each_guest() {
+  let mut home = Sessions::new(7, limits());
+  let mut guest = Sessions::new(8, limits());
+  let (_, sessionid) = session(&mut home, "host-a");
+  guest.arrive(sessionid, home.depart(&sessionid, GUEST_SHARD).unwrap(), 0);
+  assert_eq!(home.expire(limits().lease_ns + 1), 1);
+  assert_eq!(home.take_guest_drops(), vec![(sessionid, GUEST_SHARD)]);
+  assert!(guest.drop_guest(&sessionid));
+  assert_eq!(
+    guest.sequence(&seq(sessionid, 0, 1), 2),
+    Err(Nfsstat4::Badsession)
+  );
+  let (_, second) = session(&mut home, "host-b");
+  guest.arrive(second, home.depart(&second, GUEST_SHARD).unwrap(), 0);
+  assert_eq!(home.destroy_session(&second), Ok(()));
+  assert_eq!(home.take_guest_drops(), vec![(second, GUEST_SHARD)]);
+}

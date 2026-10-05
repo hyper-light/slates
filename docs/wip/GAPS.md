@@ -3522,8 +3522,9 @@ shard's own clock that A-65 budgets in (docs/bugs/2026-10-04-the-slow-observatio
   random on a busy machine. The object (device, inode) is now compared first, then the kind, and the times only
   for a pipe or socket.
 - **Next, Ada's "do all" (2026-10-04), in order:**
-  - (A) run a compound where its volume lives: native v4 operations, the session's state placed on the volume's
-    shard, the connection moved there;
+  - (A) run a compound where its volume lives — **done (A-76)**: the session moves with its connection, so the
+    other-shard case matches the listener's shard. Native v4 operations (one pass per OPEN instead of about 2.5 v3
+    calls, all local now) remain a smaller, CPU-only gain;
   - (B) read and write delegations, with the session back channel and recalls from every other mutation path
     (RFC 8881 §10.2–10.4, §20);
   - (C) directory delegations (§10.9).

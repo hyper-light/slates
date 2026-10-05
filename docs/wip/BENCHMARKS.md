@@ -1695,3 +1695,12 @@ table above was measured inside that window). Three alternating pairs at 19:42â€
 
 The copy keeps one call in flight, so the slots cannot help it; its spread is the machine's.
 
+**A-76, the session moves to the volume's shard** (same Go workload; the volume forced onto shard 3 of 4 by creating
+volumes until one lands off the listener's shard; load average 15â€“25):
+
+| | before A-76, volume on shard 3 | after A-76, volume on shard 3 | volume on the listener's shard |
+|---|---|---|---|
+| `go build -a net/http` | 8.0 s | 6.49 / 6.43 / 5.40 s | 5.97 / 6.04 / 5.40 s |
+| reopen: queue + RTT | 2.20 ms | 0.80 / 0.78 / 0.62 ms | 0.77 / 0.77 / 0.64 ms |
+| v3 calls forwarded | 334,133 | 2 (before the move) | 0 |
+
