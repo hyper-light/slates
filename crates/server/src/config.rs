@@ -82,6 +82,12 @@ const STORE_TABLE_DIVISOR: u64 = 6;
 /// Shape: the largest inline lifecycle request: a name and a base path, both under the OS
 /// path limit (Linux `PATH_MAX` 4096); one page each direction per slot.
 const BULK_CHUNK_BYTES: u64 = 4096;
+
+/// The bytes one request or reply may carry: one bulk chunk of the client's region (a paged verb sizes its page by
+/// it, `ReadRange`, `StagePut`).
+pub(crate) const fn bulk_chunk_bytes() -> u64 {
+  BULK_CHUNK_BYTES
+}
 /// Shape: the landing slots the segment holds: landings in flight per daemon, one per shard
 /// plus one for the control shard's presentation.
 const LANDING_SLOTS_PER_SHARD: u32 = 1;

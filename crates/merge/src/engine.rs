@@ -855,6 +855,17 @@ impl Green {
     })
   }
 
+  /// A file's bytes at `version`, borrowed ([`Green::content_at`] without the copy): what a paged read slices.
+  pub fn content_ref_at(&self, path: &str, version: u64) -> Option<&[u8]> {
+    self.content_history.get(path).and_then(|history| {
+      history
+        .iter()
+        .rev()
+        .find(|(recorded, _)| *recorded <= version)
+        .and_then(|(_, bytes)| bytes.as_deref())
+    })
+  }
+
   /// The ops each intervening delta in `(base, head]` applied to `path`.
   fn intervening(&self, path: &str, base: u64) -> Vec<&[Op]> {
     let base = usize::try_from(base).unwrap_or(usize::MAX);

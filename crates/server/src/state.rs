@@ -456,6 +456,8 @@ pub struct ShardState {
   /// The NFSv4.1 back channels of the connections this shard serves (`crate::callback`).
   #[cfg(unix)]
   pub(crate) callbacks: crate::callback::Callbacks,
+  /// The staging buffers of edits too large for one request, for the works this shard owns (`crate::staging`).
+  pub(crate) staging: crate::staging::Staging,
   /// This start's random nonce, announced with its derived member id on SWIM contact (§4.8).
   /// It survives a warm restart with the complete retained Raft state; whole-anchor loss changes it.
   pub member_boot_nonce: u64,
@@ -670,6 +672,9 @@ pub struct WorkState {
   /// The work's current content per file path — the post-state the increment's content ops name by
   /// range (a mounted work would keep this in its VFS tree; here `edit` maintains it directly).
   pub content: BTreeMap<String, Vec<u8>>,
+  /// Bumped by every change to `content` (an edit, a namespace declaration, a submit or rebase moving the work):
+  /// the stamp a paged read of the work's head compares between pages (`ReadRange`).
+  pub revision: u64,
 }
 
 /// A reply waiting to be written into a client's ring.

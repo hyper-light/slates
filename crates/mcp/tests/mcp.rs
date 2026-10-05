@@ -689,6 +689,8 @@ fn the_mcp_surface_serves_the_tools() {
   assert_protocol(&mut server);
   assert_modern_protocol(&mut server);
   assert_skills_over_mcp(&mut server);
+  assert_a_large_file_reads_whole(&mut server);
+  assert_a_page_stamp_moves_with_the_file(&instance);
   assert_merge_loop(&mut server);
   assert_volume_lifecycle(&mut server);
   assert_attach_base(&mut server);
@@ -1130,4 +1132,103 @@ fn assert_skill_listings_and_refusals(server: &mut McpServer, names: &[String]) 
   }
   let unknown = call_refused(server, "slates.help", json!({ "skill": "nope" }));
   assert!(unknown.contains("nope"), "{unknown}");
+}
+
+/// Shape: a file larger than one reply's bulk chunk (4 KiB) several times over.
+const LARGE_FILE_BYTES: usize = 16 * 1024;
+
+/// §4.12 `slates.fs.read`: do write a [`LARGE_FILE_BYTES`] file into a work and read it back; expect every byte, in
+/// order. A reply rides one 4 KiB bulk chunk, so a read must be paged rather than refused or lost.
+fn assert_a_large_file_reads_whole(server: &mut McpServer) {
+  let green = call(
+    server,
+    "slates.merge.create_green",
+    json!({ "name": "large-g" }),
+  )["green"]
+    .as_str()
+    .unwrap()
+    .to_owned();
+  let work = call(
+    server,
+    "slates.merge.create_work",
+    json!({ "green": green, "name": "large-w" }),
+  )["work"]
+    .as_str()
+    .unwrap()
+    .to_owned();
+  let text: String = (0..LARGE_FILE_BYTES)
+    .map(|at| char::from(b'a' + u8::try_from(at % 26).unwrap()))
+    .collect();
+  call(
+    server,
+    "slates.merge.edit",
+    json!({ "work": work, "path": "big.txt", "at": 0, "delete_len": 0, "text": text }),
+  );
+  let read = call(
+    server,
+    "slates.fs.read",
+    json!({ "volume": work, "path": "big.txt" }),
+  );
+  assert_eq!(read["len"], LARGE_FILE_BYTES, "{}", read["len"]);
+  assert_eq!(read["text"].as_str().unwrap(), text, "every byte, in order");
+}
+
+/// One `ReadRange` page of `path` in `volume` from `offset`: its bytes, total and stamp.
+fn page(
+  client: &mut Client,
+  volume: slates_client::VolumeId,
+  path: &str,
+  offset: u64,
+) -> (Vec<u8>, u64, u64) {
+  use slates_ipc::protocol::{ReadAt, ReplyBody, RequestBody};
+  match client
+    .call(&RequestBody::ReadRange {
+      volume,
+      path: path.to_owned(),
+      at: ReadAt::Head,
+      offset,
+      max: u64::MAX,
+    })
+    .unwrap()
+  {
+    ReplyBody::ReadPage {
+      bytes,
+      total,
+      stamp,
+    } => (bytes, total, stamp),
+    other => panic!("not a page: {other:?}"),
+  }
+}
+
+/// §4.12 (paged reads): do read a large work file's first page, then its second; expect the same stamp and pages
+/// no larger than one reply chunk, together the file's start. Edit the file between two pages; expect the stamp to
+/// move, so a reader never stitches pages of two states of the file together.
+fn assert_a_page_stamp_moves_with_the_file(instance: &str) {
+  let mut client = connect(instance);
+  let green = client.create_green("stamp-g", false).unwrap();
+  let (work, _) = client.create_work(green, "stamp-w").unwrap();
+  let text = vec![b'q'; LARGE_FILE_BYTES];
+  client.edit(work, "f.txt", 0, 0, &text).unwrap();
+  let (first, total, stamp) = page(&mut client, work, "f.txt", 0);
+  assert_eq!(total, u64::try_from(LARGE_FILE_BYTES).unwrap());
+  assert!(
+    !first.is_empty() && first.len() < LARGE_FILE_BYTES,
+    "a page, not the file"
+  );
+  let (second, _, again) = page(
+    &mut client,
+    work,
+    "f.txt",
+    u64::try_from(first.len()).unwrap(),
+  );
+  assert_eq!(again, stamp, "an unchanged file keeps its stamp");
+  assert!(!second.is_empty());
+  client.edit(work, "f.txt", 0, 0, b"x").unwrap();
+  let (_, _, moved) = page(
+    &mut client,
+    work,
+    "f.txt",
+    u64::try_from(first.len()).unwrap(),
+  );
+  assert_ne!(moved, stamp, "a change moves the stamp");
 }

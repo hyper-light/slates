@@ -67,6 +67,7 @@ mod nfs_state;
 pub mod nfs_tls;
 pub mod observe;
 mod owner_location;
+mod staging;
 // The container bind form of `attach` (§4.6 A-9): the host mount verified through the kernel's mount
 // table and the runtime-specification entry; paired per platform inside, so it compiles everywhere.
 pub mod oci;

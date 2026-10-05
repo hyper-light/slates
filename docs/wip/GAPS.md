@@ -3601,3 +3601,15 @@ shard's own clock that A-65 budgets in (docs/bugs/2026-10-04-the-slow-observatio
   3. `slates.fs` write, list, move and delete;
   4. `subscriptions/listen`;
   5. the official conformance suite, run in a container (no host install).
+
+### 2026-10-05: edits and reads past one bulk chunk (fixed); work volumes are uncharged (owed)
+
+- **Fixed:** the typed channel refused any edit or read larger than its 4 KiB bulk chunk
+  (`docs/bugs/2026-10-05-edits-and-reads-past-one-bulk-chunk-were-refused.md`). Reads are paged (`ReadRange`, with a
+  stamp that refuses `ChangedWhileRead`); large edits are staged on the work's owner and applied as one splice
+  (`StageBegin`, `StagePut`, `EditStaged`), the buffers charged, owned and expiring.
+- **Owed:**
+  - the SDKs' async read and edit page loops (one message today: a large one is refused, typed);
+  - **work volumes are uncharged:** a work's content map and journal grow without any charge or limit (created
+    `Dynamic { max: 0 }`, content outside the charged store), against banned item 8. Next: charge a work's content
+    to the store, with a typed refusal at its bound.

@@ -731,6 +731,173 @@ pub(crate) fn read(
   }
 }
 
+/// Format: the encoded bytes of a `ReadPage` reply beside its page (variant, lengths, total, stamp), with room to
+/// spare: what a page leaves of its reply chunk for the header.
+const READ_PAGE_HEADER_BYTES: usize = 64;
+
+/// `ReadRange` (§4.12, paged): up to `max` bytes of a file from `offset` at a view, never more than one reply chunk
+/// holds, with the file's length and a stamp that changes whenever its bytes at that view may have: a green's
+/// version (its bytes there never change), a work's revision, a plain volume's inode change counter.
+pub(crate) fn read_range(
+  state: &mut ShardState,
+  principal: &Principal,
+  (volume, path, at): (VolumeId, &str, ReadAt),
+  offset: u64,
+  max: u64,
+) -> ReplyBody {
+  let record = match find_record(state, volume) {
+    Ok(record) => record,
+    Err(refusal) => return refused(refusal),
+  };
+  if !rights_of(&record, principal).read {
+    return forbidden("read");
+  }
+  let chunk = usize::try_from(crate::config::bulk_chunk_bytes()).unwrap_or(usize::MAX);
+  let room = u64::try_from(chunk.saturating_sub(READ_PAGE_HEADER_BYTES)).unwrap_or(0);
+  let want = max.min(room);
+  let key = canonical_path(path);
+  match record.policy.role {
+    Role::Green { .. } => read_green_range(state, record.id, key, at, (offset, want)),
+    Role::Work { .. } => match at {
+      ReadAt::Head => match state.works.get(&record.id) {
+        Some(w) => match w.content.get(key) {
+          Some(bytes) => page_of(bytes, (offset, want), w.revision),
+          None => refused(Refusal::NotFound),
+        },
+        None => refused(Refusal::NotFound),
+      },
+      ReadAt::Version { .. } | ReadAt::Attachment { .. } => refused(Refusal::BadRequest {
+        reason: "a work volume has no versions to read at; read its head".to_owned(),
+      }),
+    },
+    Role::Plain => match at {
+      ReadAt::Head => read_plain_range(state, volume, path, (offset, want)),
+      ReadAt::Version { .. } | ReadAt::Attachment { .. } => refused(Refusal::BadRequest {
+        reason: "a plain volume has no green versions; read its head".to_owned(),
+      }),
+    },
+  }
+}
+
+/// The page of `bytes` from `offset`, at most `want` long, stamped `stamp`.
+fn page_of(bytes: &[u8], (offset, want): (u64, u64), stamp: u64) -> ReplyBody {
+  let total = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+  let start = usize::try_from(offset.min(total)).unwrap_or(bytes.len());
+  let end = usize::try_from(offset.saturating_add(want).min(total)).unwrap_or(bytes.len());
+  ReplyBody::ReadPage {
+    bytes: bytes.get(start..end).unwrap_or_default().to_vec(),
+    total,
+    stamp,
+  }
+}
+
+/// A green's file page at a view; the resolved version is its stamp.
+fn read_green_range(
+  state: &ShardState,
+  green: DbVolumeId,
+  path: &str,
+  at: ReadAt,
+  range: (u64, u64),
+) -> ReplyBody {
+  let Some(engine) = state.greens.get(&green) else {
+    return refused(Refusal::NotFound);
+  };
+  let version = match green_version(state, engine, green, at) {
+    Ok(version) => version,
+    Err(refusal) => return refused(refusal),
+  };
+  match engine.content_ref_at(path, version) {
+    Some(bytes) => page_of(bytes, range, version),
+    None => refused(Refusal::NotFound),
+  }
+}
+
+/// The version a read of a green at `at` serves: the head, a named version no later than it, or an attachment's
+/// pinned version; the refusal otherwise.
+fn green_version(
+  state: &ShardState,
+  engine: &slates_merge::engine::Green,
+  green: DbVolumeId,
+  at: ReadAt,
+) -> Result<u64, Refusal> {
+  let version = match at {
+    ReadAt::Head => engine.head(),
+    ReadAt::Version { version } => version,
+    ReadAt::Attachment { attachment } => match state.merge.attachments.get(&attachment) {
+      Some(pin) if pin.green == green => pin.version,
+      Some(_) => {
+        return Err(Refusal::BadRequest {
+          reason: "the attachment pins another green".to_owned(),
+        });
+      }
+      None => return Err(Refusal::NotFound),
+    },
+  };
+  if version > engine.head() {
+    return Err(Refusal::UnknownBase {
+      green: wire_id(green),
+      version,
+    });
+  }
+  Ok(version)
+}
+
+/// A plain volume's file page at its head, through the volume core (an overlay reads untouched entries from the
+/// host); the inode's change counter is its stamp.
+fn read_plain_range(
+  state: &mut ShardState,
+  volume: VolumeId,
+  path: &str,
+  (offset, want): (u64, u64),
+) -> ReplyBody {
+  let (handle, _) = match find(state, volume) {
+    Ok(found) => found,
+    Err(reply) => return *reply,
+  };
+  let ShardState { store, volumes, .. } = state;
+  let Ok(slot) = volumes.get_mut(handle) else {
+    return refused(Refusal::NotFound);
+  };
+  let mut buffer = vec![0u8; usize::try_from(want).unwrap_or(0)];
+  let read = match slot.host.as_mut() {
+    Some(host) => {
+      let mut overlay = slot.volume.with_host(host);
+      overlay.resolve(store, path).and_then(|located| {
+        if matches!(located.child, Child::Dir(_)) {
+          return Err(slates_vfs::error::VfsError::IsDirectory);
+        }
+        let observed = overlay.observe(store, located.inode)?;
+        let read = overlay.read(store, located.inode, offset, &mut buffer)?;
+        Ok((read, observed.attrs.size, observed.change))
+      })
+    }
+    None => slot.volume.resolve(store, path).and_then(|located| {
+      if matches!(located.child, Child::Dir(_)) {
+        return Err(slates_vfs::error::VfsError::IsDirectory);
+      }
+      let observed = slot.volume.observe(store, located.inode)?;
+      let read = slot
+        .volume
+        .read(store, located.inode, offset, &mut buffer)?;
+      Ok((read, observed.attrs.size, observed.change))
+    }),
+  };
+  match read {
+    Ok((read, total, stamp)) => {
+      buffer.truncate(read);
+      ReplyBody::ReadPage {
+        bytes: buffer,
+        total,
+        stamp,
+      }
+    }
+    Err(slates_vfs::error::VfsError::IsDirectory) => refused(Refusal::BadRequest {
+      reason: "the path is a directory".to_owned(),
+    }),
+    Err(e) => refused(refusal_of_vfs(&e)),
+  }
+}
+
 /// A green's file at the head, a named version, or an attachment's pinned version.
 fn read_green(state: &ShardState, green: DbVolumeId, path: &str, at: ReadAt) -> ReplyBody {
   let Some(engine) = state.greens.get(&green) else {

@@ -63,6 +63,12 @@ pub enum ClientError {
     /// What the reader reported.
     reason: String,
   },
+  /// A paged read saw the file change between two of its pages (the view's stamp moved): no bytes are returned,
+  /// since they would mix two states of the file. Read again.
+  ChangedWhileRead {
+    /// The file.
+    path: String,
+  },
 }
 
 impl fmt::Display for ClientError {
@@ -91,6 +97,9 @@ impl fmt::Display for ClientError {
         f.write_str("the reconnected channel is still being bound; nothing was sent")
       }
       Self::CompletionLost { reason } => write!(f, "the completion reader is lost: {reason}"),
+      Self::ChangedWhileRead { path } => {
+        write!(f, "{path} changed while it was read; read it again")
+      }
     }
   }
 }

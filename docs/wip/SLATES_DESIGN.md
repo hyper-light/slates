@@ -8974,3 +8974,22 @@ a granted landing).
 - Proven: `assert_skills_over_mcp` (in `the_mcp_surface_serves_the_tools`, live daemon) reads every skill through
   `resources/read`, `prompts/get` and `slates.help` and checks each document against the specification's name,
   description and length constraints.
+
+### A-83 — Paged reads and staged edits on the typed channel (2026-10-05)
+Applied in the same change to: `crates/ipc/src/protocol.rs` (`ReadRange`/`ReadPage`, `StageBegin`/`Staged`,
+`StagePut`/`StagePutDone`, `EditStaged`; `chunk_capacity`, `fits`, `framed_len`), `crates/server/src/staging.rs`
+(new), `crates/server/src/{verbs,merge_service,reap,state,daemon,config}.rs`, `crates/merge/src/engine.rs`
+(`content_ref_at`), `crates/client/src/{client,error}.rs`, `crates/mcp/tests/mcp.rs`,
+`docs/bugs/2026-10-05-edits-and-reads-past-one-bulk-chunk-were-refused.md`, GAPS.
+Status: built 2026-10-05 (§4.3's large payloads, for edits and reads). The async SDK verbs and the charging of
+work volumes are owed.
+- Why: a message rides one fixed bulk chunk of its client's region (4 KiB), so `Edit` and `ReadBytes` refused
+  anything larger. §4.3 promised large payloads through the bulk region.
+- What: reads come in pages the size of a reply chunk, each carrying the file's length and a stamp that moves
+  whenever its bytes at that view may have changed (green version, work revision, inode change counter). A reader
+  that sees the stamp move refuses instead of stitching two states together. An edit too large for one request is
+  staged on the work's owner, charged to its metadata budget, and applied as one edit. The fixed per-slot chunk
+  stays: it keeps the ring free of an allocator on its path, and paging costs one round trip per chunk on a path
+  that already costs one per verb.
+- Proven: `assert_a_large_file_reads_whole` (16 KiB through MCP), `assert_a_page_stamp_moves_with_the_file`, and
+  the staging unit tests.

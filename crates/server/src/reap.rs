@@ -57,6 +57,8 @@ pub(crate) async fn sweep(silence_ns: u64) -> usize {
 /// seats are bounded by `clients_per_shard`; a refusal never returns the id early.
 fn begin(state: &mut ShardState, silence_ns: u64) -> Vec<(Handle<ClientSlot>, u32)> {
   let now = state.clock.monotonic_ns();
+  // Abandoned staging buffers are released on this cadence too, a lease after their last use (`crate::staging`).
+  state.staging.expire(now, &mut state.store.metadata);
   let mut clients = Vec::new();
   for (handle, client) in state.clients.iter_mut_all() {
     client.status_pages.expire(now, &mut state.store.metadata);

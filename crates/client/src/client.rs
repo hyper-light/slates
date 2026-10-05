@@ -1838,12 +1838,43 @@ impl Client {
   /// Reads a file's bytes at a view (§4.12 `read`): a green's head or named version, the version
   /// an attachment pins, or a work's or plain volume's live tree.
   pub fn read(&mut self, volume: VolumeId, path: &str, at: ReadAt) -> Result<Vec<u8>, ClientError> {
-    let reply = self.call(&RequestBody::Read {
-      volume,
-      path: path.to_owned(),
-      at,
-    })?;
-    extract_read(reply)
+    // A reply rides one bulk chunk, so the file comes in pages (`ReadRange`), each as large as the daemon's reply
+    // chunk allows; every page must carry the first one's stamp, or the file changed between them and the bytes
+    // would mix two states of it.
+    let mut bytes = Vec::new();
+    let mut first_stamp = None;
+    loop {
+      let offset = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+      let reply = self.call(&RequestBody::ReadRange {
+        volume,
+        path: path.to_owned(),
+        at,
+        offset,
+        max: u64::MAX,
+      })?;
+      let ReplyBody::ReadPage {
+        bytes: page,
+        total,
+        stamp,
+      } = resolved(reply)?
+      else {
+        return Err(ClientError::UnexpectedReply { verb: "read" });
+      };
+      if *first_stamp.get_or_insert(stamp) != stamp {
+        return Err(ClientError::ChangedWhileRead {
+          path: path.to_owned(),
+        });
+      }
+      let done = offset.saturating_add(u64::try_from(page.len()).unwrap_or(u64::MAX)) >= total;
+      if page.is_empty() && !done {
+        // A page that makes no progress short of the end would loop forever.
+        return Err(ClientError::UnexpectedReply { verb: "read" });
+      }
+      bytes.extend_from_slice(&page);
+      if done {
+        return Ok(bytes);
+      }
+    }
   }
 
   /// A green's head version (§4.16 merge chain).
@@ -1885,8 +1916,47 @@ impl Client {
     }
   }
 
+  /// Stages `bytes` for an edit of `work` (`StageBegin`, then `StagePut` in pages each one request holds): the
+  /// staging token.
+  fn stage(&mut self, work: VolumeId, bytes: &[u8]) -> Result<u64, ClientError> {
+    let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    let token = match resolved(self.call(&RequestBody::StageBegin { work, len })?)? {
+      ReplyBody::Staged { token } => token,
+      _ => return Err(ClientError::UnexpectedReply { verb: "stage" }),
+    };
+    // Each put's page is what a request holds past the put's own framing at its largest offset and length.
+    let empty = RequestBody::StagePut {
+      work,
+      token,
+      offset: u64::MAX,
+      bytes: Vec::new(),
+    };
+    // Every field of a put is fixed width but its bytes (and their length prefix is a fixed four bytes), so the
+    // empty put's framed length is exactly the framing of every put.
+    let framing = slates_ipc::protocol::framed_len(&empty);
+    let page = slates_ipc::protocol::chunk_capacity(self.end.region())
+      .saturating_sub(framing)
+      .max(1);
+    let mut offset = 0usize;
+    for piece in bytes.chunks(page) {
+      let at = u64::try_from(offset).unwrap_or(u64::MAX);
+      match resolved(self.call(&RequestBody::StagePut {
+        work,
+        token,
+        offset: at,
+        bytes: piece.to_vec(),
+      })?)? {
+        ReplyBody::StagePutDone { .. } => {}
+        _ => return Err(ClientError::UnexpectedReply { verb: "stage" }),
+      }
+      offset = offset.saturating_add(piece.len());
+    }
+    Ok(token)
+  }
+
   /// Declares an edit on a work volume (§4.16): a splice at `path` — remove `delete_len` bytes at
-  /// `at`, insert `bytes`.
+  /// `at`, insert `bytes`. An edit larger than one request is staged in pages and applied as one
+  /// edit.
   pub fn edit(
     &mut self,
     work: VolumeId,
@@ -1895,13 +1965,28 @@ impl Client {
     delete_len: u64,
     bytes: &[u8],
   ) -> Result<(), ClientError> {
-    match self.call(&RequestBody::Edit {
+    let request = RequestBody::Edit {
       work,
       path: path.to_owned(),
       at,
       delete_len,
       bytes: bytes.to_vec(),
-    })? {
+    };
+    let reply = if slates_ipc::protocol::fits(self.end.region(), &request) {
+      self.call(&request)?
+    } else {
+      // Too large for one request: staged on the work's owner in pages, then applied as one edit (§4.16: one
+      // edit stays one journal operation).
+      let token = self.stage(work, bytes)?;
+      self.call(&RequestBody::EditStaged {
+        work,
+        path: path.to_owned(),
+        at,
+        delete_len,
+        token,
+      })?
+    };
+    match reply {
       ReplyBody::Edited => Ok(()),
       _ => Err(ClientError::UnexpectedReply { verb: "edit" }),
     }

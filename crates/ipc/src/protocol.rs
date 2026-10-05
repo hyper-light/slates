@@ -498,6 +498,55 @@ pub enum RequestBody {
     /// The mount point, as established.
     path: String,
   },
+  /// Reserve a staging buffer of `len` bytes on a work's owner for an edit too large for one request (§4.12;
+  /// a request rides one bulk chunk): the token `StagePut` fills and `EditStaged` applies. Charged to the owner's
+  /// metadata budget until applied or expired; never recorded. Appended.
+  StageBegin {
+    /// The work volume the staged bytes are for.
+    work: VolumeId,
+    /// The bytes to be staged.
+    len: u64,
+  },
+  /// Write the next `bytes` of a staging buffer at `offset` (which must be where the previous put ended). Never
+  /// recorded. Appended.
+  StagePut {
+    /// The work volume the buffer is for.
+    work: VolumeId,
+    /// The buffer, as `StageBegin` named it.
+    token: u64,
+    /// Where these bytes go in the buffer.
+    offset: u64,
+    /// The bytes.
+    bytes: Vec<u8>,
+  },
+  /// `Edit` with a full staging buffer as its inserted bytes: one splice, recorded as one edit, the buffer then
+  /// released (§4.16). Appended.
+  EditStaged {
+    /// The work volume.
+    work: VolumeId,
+    /// The file.
+    path: String,
+    /// The offset.
+    at: u64,
+    /// Bytes removed at `at`.
+    delete_len: u64,
+    /// The buffer holding the bytes inserted at `at`.
+    token: u64,
+  },
+  /// Read up to `max` bytes of a file from `offset` at a view (§4.12 `slates.fs.read`, paged: a reply rides one
+  /// bulk chunk). A read; never recorded. Appended.
+  ReadRange {
+    /// The volume.
+    volume: VolumeId,
+    /// The file.
+    path: String,
+    /// The view.
+    at: ReadAt,
+    /// The first byte wanted.
+    offset: u64,
+    /// The most bytes wanted (the daemon answers fewer when its reply chunk holds fewer).
+    max: u64,
+  },
 }
 
 /// A concrete quorum-loss recovery proposal (§4.8). It identifies the retained copy and the
@@ -2343,6 +2392,26 @@ pub enum ReplyBody {
   },
   /// A host mount's attachment was bound to its mount point (`BindMount`). Appended.
   MountBound,
+  /// A staging buffer was reserved (`StageBegin`). Appended.
+  Staged {
+    /// The buffer's token, unique on its owner shard.
+    token: u64,
+  },
+  /// Bytes were written into a staging buffer (`StagePut`). Appended.
+  StagePutDone {
+    /// How many of the buffer's bytes are now written.
+    filled: u64,
+  },
+  /// One page of a file (`ReadRange`). Appended.
+  ReadPage {
+    /// The bytes from the requested offset.
+    bytes: Vec<u8>,
+    /// The file's whole length at this view.
+    total: u64,
+    /// A stamp that changes whenever the file's bytes at this view may have changed: a reader that sees it move
+    /// between pages starts again.
+    stamp: u64,
+  },
 }
 
 /// A message body on the ring: the schema hash then the canonical encoding.
@@ -2408,6 +2477,24 @@ fn chunk(region: &ClientRegion, direction: Direction, index: u64) -> (usize, usi
     Direction::Reply => half,
   };
   (base + position * chunk, chunk)
+}
+
+/// The bytes one framed message may take in either direction: one bulk chunk of `region` (every slot's chunk is
+/// the same size). A verb whose message would not fit is paged by its caller (`ReadRange`, `StagePut`).
+pub fn chunk_capacity(region: &ClientRegion) -> usize {
+  let (_, capacity) = chunk(region, Direction::Request, 0);
+  capacity
+}
+
+/// Whether `message`, framed as [`pack`] frames it, fits one message of `region`.
+pub fn fits<M: Wire>(region: &ClientRegion, message: &M) -> bool {
+  let body = frame(message);
+  body.len() <= PAYLOAD_BYTES || body.len() <= chunk_capacity(region)
+}
+
+/// The framed size of `message`, as [`pack`] would write it.
+pub fn framed_len<M: Wire>(message: &M) -> usize {
+  frame(message).len()
 }
 
 /// Frames `message` into the slot for ring index `index`, inline or through the bulk chunk.

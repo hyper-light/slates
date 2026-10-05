@@ -352,6 +352,10 @@ fn volume_of(body: &RequestBody) -> Option<VolumeId> {
     | RequestBody::Pin { volume, .. }
     | RequestBody::AwaitPlaced { volume, .. }
     | RequestBody::Read { volume, .. }
+    | RequestBody::ReadRange { volume, .. }
+    | RequestBody::StageBegin { work: volume, .. }
+    | RequestBody::StagePut { work: volume, .. }
+    | RequestBody::EditStaged { work: volume, .. }
     | RequestBody::Land { volume, .. } => Some(*volume),
     // A green over a base is born on the base volume's owner shard, where the snapshot is walked.
     RequestBody::CreateGreen { base, .. } => base.map(|b| b.volume),
@@ -616,6 +620,11 @@ fn serves_latest_state(body: &RequestBody) -> Option<VolumeId> {
       at: ReadAt::Version { .. } | ReadAt::Attachment { .. },
       ..
     } => None,
+    RequestBody::ReadRange {
+      volume,
+      at: ReadAt::Head,
+      ..
+    } => Some(*volume),
     RequestBody::Versions { green } | RequestBody::ChangedSince { green, .. } => Some(*green),
     RequestBody::Status { volume } => Some(*volume),
     _ => None,
@@ -714,6 +723,8 @@ pub(crate) fn live_tree_fenced(state: &mut ShardState, volume: DbVolumeId) -> bo
 
 /// Whether a verb is a **read** safe to forward to a volume's owner without a completion record: a
 /// volume-scoped query that mutates nothing, so re-serving a retried forward is idempotent (§4.8 "Lookup").
+/// A staging verb forwards the same way: a retried put of bytes already written is answered unchanged, and a
+/// retried begin only strands a charged buffer that expires within a lease (`crate::staging`).
 fn is_forwardable_read(body: &RequestBody) -> bool {
   matches!(
     body,
@@ -721,6 +732,9 @@ fn is_forwardable_read(body: &RequestBody) -> bool {
       | RequestBody::Versions { .. }
       | RequestBody::ChangedSince { .. }
       | RequestBody::Read { .. }
+      | RequestBody::ReadRange { .. }
+      | RequestBody::StageBegin { .. }
+      | RequestBody::StagePut { .. }
   )
 }
 
@@ -2244,6 +2258,7 @@ fn mutates_shard_image(body: &RequestBody) -> bool {
       | RequestBody::CreateGreen { .. }
       | RequestBody::CreateWork { .. }
       | RequestBody::Edit { .. }
+      | RequestBody::EditStaged { .. }
       | RequestBody::Declare { .. }
       | RequestBody::Submit { .. }
       | RequestBody::Rebase { .. }
@@ -2425,6 +2440,27 @@ fn dispatch_inner(
     RequestBody::Read { volume, path, at } => {
       crate::merge_service::read(state, principal, volume, &path, at)
     }
+    RequestBody::ReadRange {
+      volume,
+      path,
+      at,
+      offset,
+      max,
+    } => crate::merge_service::read_range(state, principal, (volume, &path, at), offset, max),
+    RequestBody::StageBegin { work, len } => stage_begin(state, principal, work, len),
+    RequestBody::StagePut {
+      work,
+      token,
+      offset,
+      bytes,
+    } => stage_put(state, principal, (work, token), offset, &bytes),
+    RequestBody::EditStaged {
+      work,
+      path,
+      at,
+      delete_len,
+      token,
+    } => edit_staged(state, principal, (work, token), &path, at, delete_len),
     RequestBody::Clone {
       volume,
       snapshot,
@@ -3671,6 +3707,7 @@ fn create_work(
       base_version: base,
       journal: Vec::new(),
       content: seeded,
+      revision: 0,
     },
   );
   ReplyBody::WorkCreated {
@@ -3682,6 +3719,79 @@ fn create_work(
 /// Declares an edit on a work volume (§4.16): a splice at `path` — remove `delete_len` bytes at `at`,
 /// insert `bytes`. Maintains the work's content and appends the declared operations, composed into an
 /// increment on submit. A new path is created first.
+/// `StageBegin` (`crate::staging`): a buffer of `len` bytes for an edit of `work` too large for one request, after
+/// the same write check an edit takes.
+fn stage_begin(
+  state: &mut ShardState,
+  principal: &Principal,
+  work: VolumeId,
+  len: u64,
+) -> ReplyBody {
+  let work_id = match crate::merge_service::require_work(state, principal, work, true, "edit") {
+    Ok((record, _)) => record.id,
+    Err(refusal) => return refused(refusal),
+  };
+  let now = state.clock.monotonic_ns();
+  state.staging.expire(now, &mut state.store.metadata);
+  let expires = now.saturating_add(state.config.failover_slo_ns);
+  match state.staging.begin(
+    (work_id, principal),
+    len,
+    (state.partition, expires),
+    &mut state.store.metadata,
+  ) {
+    Ok(token) => ReplyBody::Staged { token },
+    Err(refusal) => refused(refusal),
+  }
+}
+
+/// `StagePut` (`crate::staging`): the next bytes of a staging buffer.
+fn stage_put(
+  state: &mut ShardState,
+  principal: &Principal,
+  (work, token): (VolumeId, u64),
+  offset: u64,
+  bytes: &[u8],
+) -> ReplyBody {
+  let work_id = match crate::merge_service::require_work(state, principal, work, true, "edit") {
+    Ok((record, _)) => record.id,
+    Err(refusal) => return refused(refusal),
+  };
+  let now = state.clock.monotonic_ns();
+  state.staging.expire(now, &mut state.store.metadata);
+  let expires = now.saturating_add(state.config.failover_slo_ns);
+  match state
+    .staging
+    .put((work_id, principal, token), offset, bytes, expires)
+  {
+    Ok(filled) => ReplyBody::StagePutDone { filled },
+    Err(refusal) => refused(refusal),
+  }
+}
+
+/// `EditStaged`: [`edit`] inserting a full staging buffer's bytes, which it releases.
+fn edit_staged(
+  state: &mut ShardState,
+  principal: &Principal,
+  (work, token): (VolumeId, u64),
+  path: &str,
+  at: u64,
+  delete_len: u64,
+) -> ReplyBody {
+  let work_id = match crate::merge_service::require_work(state, principal, work, true, "edit") {
+    Ok((record, _)) => record.id,
+    Err(refusal) => return refused(refusal),
+  };
+  let bytes = match state
+    .staging
+    .take((work_id, principal, token), &mut state.store.metadata)
+  {
+    Ok(bytes) => bytes,
+    Err(refusal) => return refused(refusal),
+  };
+  edit(state, principal, work, path, at, delete_len, &bytes)
+}
+
 fn edit(
   state: &mut ShardState,
   principal: &Principal,
@@ -3710,6 +3820,7 @@ fn edit(
       .min(content.len() - start);
     content.splice(start..start + del, bytes.iter().copied());
   }
+  w.revision = w.revision.wrapping_add(1);
   if is_new {
     w.journal.push(VolumeOp::Create {
       path: path.to_owned(),
@@ -3816,6 +3927,7 @@ fn declare(state: &mut ShardState, principal: &Principal, work: VolumeId, op: Wo
     },
   };
   w.journal.push(volume_op);
+  w.revision = w.revision.wrapping_add(1);
   ReplyBody::Declared
 }
 
@@ -4092,6 +4204,7 @@ fn submit(
           .files()
           .map(|(path, bytes)| (path.to_owned(), bytes.to_vec()))
           .collect();
+        w.revision = w.revision.wrapping_add(1);
       }
       // The version's merge record, issued only once its inputs — the increment just appended — are
       // placed (§4.16 "Commit"; at `f = 0` the append is the placement).
@@ -4174,6 +4287,7 @@ fn rebase(state: &mut ShardState, principal: &Principal, work: VolumeId) -> Repl
         w.base_version = version;
         w.content = files;
         w.journal = journal;
+        w.revision = w.revision.wrapping_add(1);
       }
       // The work's base rose, so the reachable floor may have: fold the green's histories to it and
       // credit the retention released (a settle after a rise only credits).
@@ -7062,6 +7176,7 @@ fn rebuild_work(state: &mut ShardState, record: &VolumeRecord, green: DbVolumeId
       base_version,
       journal: Vec::new(),
       content,
+      revision: 0,
     },
   );
 }

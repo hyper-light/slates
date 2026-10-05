@@ -2745,6 +2745,7 @@ fn init_shard(
     nfs_service: crate::nfs::ServiceTimes::default(),
     #[cfg(unix)]
     callbacks: crate::callback::Callbacks::default(),
+    staging: crate::staging::Staging::default(),
     member_boot_nonce: incarnation,
     learned_members: std::collections::BTreeMap::new(),
     authenticated_members: std::collections::BTreeSet::new(),
