@@ -8772,3 +8772,33 @@ Status: built 2026-10-04.
   the retry answered from the moved cache, a second connection reaching it, destroy then re-create; it fails with
   the move disabled); the four `v4_session.rs` departure tests.
 
+### A-77 — The NFSv4.1 back channel: callbacks over the session's own connection (2026-10-04)
+Applied in the same change to: `crates/server/src/callback.rs` (new), `crates/bridge-nfs/src/v4/callback.rs` (new),
+`crates/bridge-nfs/src/v4/session.rs` (`BackChannel`, `CallbackState`, `next_callback`),
+`crates/bridge-nfs/src/v4/compound.rs` (`CREATE_SESSION4_FLAG_CONN_BACK_CHAN`, `read_callback_sec`, `minor_version`),
+`crates/server/src/nfs.rs` (connection registration, the idle race, reply routing, the probe),
+`crates/server/tests/nfs_mount.rs`, GAPS.
+Status: built 2026-10-04 (B-1 of read delegations).
+- Why: delegations (RFC 8881 §10.4) need callbacks, and §10.2 says "a server avoids delegating responsibilities until
+  it has determined that the backchannel exists". The server granted no back channel, so Linux never expected one.
+- What:
+  - **Grant.** `CREATE_SESSION` grants the back channel on the creating connection when the client asks
+    (`CONN_BACK_CHAN`) and lists a flavor this server can call under. The first such flavor in the client's order is
+    kept as the callback credential: AUTH_SYS with the client's own `authsys_parms` byte for byte, or AUTH_NONE.
+  - **Transport.** Each served connection registers an outbox in its shard's back-channel table. A session's
+    compound binds its connection as the carrier. A callback is one RPC CALL (`CB_COMPOUND`) queued there; the
+    connection's idle wait races the socket against the outbox, and its read path routes REPLY records to the
+    waiting callback by xid.
+  - **Bounds.** One callback in flight per session; a connection that ends fails its callbacks `Lost`; every outcome
+    is typed and counted (`nfs4.callback.{up,down,refused,timeout,unsent,unmatched}`).
+  - **Probe.** On the first bind, a `CB_SEQUENCE`-only compound probes the channel, and its answer marks it up or
+    down.
+- Found against the real Linux client (Docker Desktop's kernel, NFSv4.2):
+  - an AUTH_NONE callback after the client offered AUTH_SYS is refused (`nfs4.callback.refused`);
+  - a callback naming minor version 1 on a 4.2 session is answered `NFS4ERR_BADSESSION` (reply status `0x2744`).
+  Callbacks now carry the offered credential and the minor version of the client's own compounds, and the client
+  answers the probe `NFS4_OK` (`nfs4.callback.up: 1`).
+- Proven: `a_back_channel_is_probed_on_its_connection_and_recorded_up_or_down`. An answering client gets a probe
+  naming its session, under its AUTH_SYS parameters and minor version, interleaved with its reply, and is recorded
+  up. A silent client is recorded down within the probe's deadline while its compounds are still answered.
+

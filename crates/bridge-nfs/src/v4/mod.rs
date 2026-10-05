@@ -27,6 +27,7 @@
 
 pub mod attr;
 pub mod backend;
+pub mod callback;
 pub mod compound;
 pub mod files;
 pub mod lock;

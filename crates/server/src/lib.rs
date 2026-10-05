@@ -56,6 +56,8 @@ mod write_log;
 // Unix-only `slates_rt::tcp`, so it is gated off Windows. A Windows daemon serves IPC clients and lands
 // (both cross-platform) but does not serve NFS — the mount arrives with the WinFsp bridge.
 #[cfg(unix)]
+mod callback;
+#[cfg(unix)]
 pub mod nfs;
 #[cfg(unix)]
 mod nfs_state;

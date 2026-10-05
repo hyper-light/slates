@@ -466,6 +466,13 @@ pub enum Placement {
   Anywhere,
 }
 
+/// The minor version a compound's header names (its `minorversion`), or `None` for a header that does not parse.
+pub fn minor_version(args: &[u8]) -> Option<u32> {
+  let mut reader = XdrReader::new(args);
+  reader.opaque(OPAQUE_LIMIT).ok()?;
+  reader.u32().ok()
+}
+
 /// The [`Placement`] of the compound whose arguments are `args`.
 pub fn placement(args: &[u8]) -> Placement {
   let mut reader = XdrReader::new(args);
@@ -657,37 +664,53 @@ fn exchange_id<B: Backend>(backend: &mut B, reader: &mut XdrReader<'_>) -> Outco
   Ok(body.into_bytes())
 }
 
+/// Format: `CREATE_SESSION4_FLAG_CONN_BACK_CHAN` (RFC 8881 §18.36.1): the creating connection carries the back
+/// channel.
+const CREATE_SESSION4_FLAG_CONN_BACK_CHAN: u32 = 0x0000_0002;
+
 /// `CREATE_SESSION` (§18.36).
 fn create_session<B: Backend>(backend: &mut B, reader: &mut XdrReader<'_>) -> Outcome {
   let bad = |_| Nfsstat4::Badxdr;
   let clientid = reader.u64().map_err(bad)?;
   let sequence = reader.u32().map_err(bad)?;
-  let _flags = reader.u32().map_err(bad)?;
+  let flags = reader.u32().map_err(bad)?;
   let fore = ChannelAttrs::decode(reader).map_err(bad)?;
   let back = ChannelAttrs::decode(reader).map_err(bad)?;
-  let _cb_program = reader.u32().map_err(bad)?;
-  // No callbacks are made, so an RPCSEC_GSS callback handle is kept for none.
-  read_callback_sec(reader)?;
+  let cb_program = reader.u32().map_err(bad)?;
+  // The back channel is granted when the client asks for it on this connection and offers a flavor this server
+  // calls back with (AUTH_NONE or AUTH_SYS; an RPCSEC_GSS handle alone cannot be used without GSS).
+  let (credential, _) = read_callback_sec(reader)?;
   let args = CreateSession {
     clientid,
     sequence,
     fore,
     back,
+    callback: credential
+      .filter(|_| flags & CREATE_SESSION4_FLAG_CONN_BACK_CHAN != 0)
+      .map(|credential| (cb_program, credential)),
   };
   let now = backend.now_ns();
   let granted = backend.with_v4(|server| server.sessions.create_session(&args, now))??;
   let mut body = XdrWriter::new();
   body.fixed(&granted.sessionid);
   body.u32(granted.sequence);
-  body.u32(0); // no persistence, no back channel on this connection
+  // No persistence (sessions are not durable, A-37); the back channel on this connection when granted.
+  body.u32(if granted.back_channel {
+    CREATE_SESSION4_FLAG_CONN_BACK_CHAN
+  } else {
+    0
+  });
   granted.fore.encode(&mut body);
   granted.back.encode(&mut body);
   Ok(body.into_bytes())
 }
 
-/// Reads a `callback_sec_parms4<>` (the flavors this server would call back with; it makes no
-/// callbacks yet): whether any entry names an RPCSEC_GSS handle.
-fn read_callback_sec(reader: &mut XdrReader<'_>) -> Result<bool, Nfsstat4> {
+/// Reads a `callback_sec_parms4<>` (the flavors the client accepts callbacks under, in its order of preference): the
+/// RPC credential (`opaque_auth`, encoded) of the first this server can call back with — `AUTH_NONE`, or `AUTH_SYS`
+/// with the client's own `authsys_parms` byte for byte — and whether any entry names an RPCSEC_GSS handle (which needs
+/// GSS, not offered here). RFC 8881 §18.36.3: the server calls back under a flavor the client listed; a callback under
+/// another is refused (Linux refuses an AUTH_NONE callback after offering AUTH_SYS, measured 2026-10-04).
+fn read_callback_sec(reader: &mut XdrReader<'_>) -> Result<(Option<Vec<u8>>, bool), Nfsstat4> {
   /// Format: the most callback flavors read (a client offers one or two).
   const MAX_FLAVORS: u32 = 8;
   /// Format: `AUTH_NONE`, `AUTH_SYS` and `RPCSEC_GSS` flavor numbers.
@@ -700,11 +723,19 @@ fn read_callback_sec(reader: &mut XdrReader<'_>) -> Result<bool, Nfsstat4> {
   if count > MAX_FLAVORS {
     return Err(Nfsstat4::Badxdr);
   }
+  let mut credential = None;
   let mut names_gss = false;
   for _ in 0..count {
     match reader.u32().map_err(bad)? {
-      AUTH_NONE => {}
+      AUTH_NONE => {
+        let mut none = XdrWriter::new();
+        none.u32(AUTH_NONE);
+        none.opaque(&[]);
+        credential.get_or_insert(none.into_bytes());
+      }
       AUTH_SYS => {
+        let parms = reader.rest();
+        let before = reader.remaining();
         reader.u32().map_err(bad)?; // stamp
         reader.opaque(OPAQUE_LIMIT).map_err(bad)?; // machine name
         reader.u32().map_err(bad)?; // uid
@@ -716,6 +747,11 @@ fn read_callback_sec(reader: &mut XdrReader<'_>) -> Result<bool, Nfsstat4> {
         for _ in 0..gids {
           reader.u32().map_err(bad)?;
         }
+        let used = before.saturating_sub(reader.remaining());
+        let mut sys = XdrWriter::new();
+        sys.u32(AUTH_SYS);
+        sys.opaque(parms.get(..used).ok_or(Nfsstat4::Badxdr)?);
+        credential.get_or_insert(sys.into_bytes());
       }
       RPCSEC_GSS => {
         names_gss = true;
@@ -726,7 +762,7 @@ fn read_callback_sec(reader: &mut XdrReader<'_>) -> Result<bool, Nfsstat4> {
       _ => return Err(Nfsstat4::Badxdr),
     }
   }
-  Ok(names_gss)
+  Ok((credential, names_gss))
 }
 
 /// `BIND_CONN_TO_SESSION` (§18.34): the connection carries the session's fore channel.
@@ -1026,7 +1062,7 @@ async fn verify<B: Backend>(
 /// setting is accepted.
 fn backchannel_ctl(reader: &mut XdrReader<'_>) -> Outcome {
   let _cb_program = reader.u32().map_err(|_| Nfsstat4::Badxdr)?;
-  if read_callback_sec(reader)? {
+  if read_callback_sec(reader)?.1 {
     return Err(Nfsstat4::Noent);
   }
   Ok(Vec::new())

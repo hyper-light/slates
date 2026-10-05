@@ -79,7 +79,7 @@ pub struct ExchangeIdGranted {
 }
 
 /// What `CREATE_SESSION` asked.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CreateSession {
   /// The client id.
   pub clientid: u64,
@@ -87,8 +87,12 @@ pub struct CreateSession {
   pub sequence: u32,
   /// The fore channel the client asked for.
   pub fore: ChannelAttrs,
-  /// The back channel the client asked for (echoed, negotiated; this server makes no callbacks yet).
+  /// The back channel the client asked for, negotiated down to the offer.
   pub back: ChannelAttrs,
+  /// The callback program the client serves on this connection (`csa_cb_program`) and the RPC credential to call it
+  /// under (an encoded `opaque_auth` of a flavor the client listed), when it asked for the back channel on the
+  /// connection (`CREATE_SESSION4_FLAG_CONN_BACK_CHAN`) with a flavor this server can call back with.
+  pub callback: Option<(u32, Vec<u8>)>,
 }
 
 /// What `CREATE_SESSION` granted (also the reply a retry of it gets back).
@@ -102,6 +106,52 @@ pub struct SessionGranted {
   pub fore: ChannelAttrs,
   /// The back channel granted.
   pub back: ChannelAttrs,
+  /// Whether the connection that created the session carries its back channel (§18.36.3).
+  pub back_channel: bool,
+}
+
+/// Whether a session's back channel has answered (RFC 8881 §10.2: "a server avoids delegating responsibilities
+/// until it has determined that the backchannel exists").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CallbackState {
+  /// Granted at `CREATE_SESSION`, not yet answered a probe.
+  Unproven,
+  /// Answered its last callback.
+  Up,
+  /// Failed or did not answer its last callback (`SEQ4_STATUS_CB_PATH_DOWN` until it answers again).
+  Down,
+}
+
+/// What the next callback on a session's back channel carries.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NextCallback {
+  /// The client's callback program.
+  pub program: u32,
+  /// The RPC credential to call under.
+  pub credential: Vec<u8>,
+  /// The minor version to name.
+  pub minor: u32,
+  /// The slot's sequence id for this callback.
+  pub sequence: u32,
+}
+
+/// A session's back channel (§2.10.3.1): the client's callback program and the slot this server calls on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BackChannel {
+  /// The client's callback program number.
+  pub program: u32,
+  /// The RPC credential callbacks carry (an encoded `opaque_auth` the client listed at `CREATE_SESSION`).
+  pub credential: Vec<u8>,
+  /// The minor version callbacks name: the one the client's compounds use on the session (a client matches a
+  /// callback to its session by it as well as by the session id; an NFSv4.2 client answers a minor-1 callback
+  /// `NFS4ERR_BADSESSION`, measured 2026-10-04).
+  pub minor: u32,
+  /// The back channel's negotiated sizes.
+  pub attrs: ChannelAttrs,
+  /// The sequence id of the last callback on slot 0 (one callback at a time per session).
+  pub sequence: u32,
+  /// Whether it has answered.
+  pub state: CallbackState,
 }
 
 /// What `SEQUENCE` asked.
@@ -187,6 +237,8 @@ struct Session {
   slots: Vec<Slot>,
   /// A session that arrived from its home (A-76): its client's record is there, not here.
   guest: bool,
+  /// The back channel, when the client asked for one on the creating connection.
+  back: Option<BackChannel>,
   /// When a guest last asked for a renewal note home.
   noted_ns: u64,
 }
@@ -423,6 +475,7 @@ impl Sessions {
       sequence: args.sequence,
       fore,
       back,
+      back_channel: args.callback.is_some(),
     };
     client.confirmed = true;
     client.restored = false;
@@ -447,6 +500,17 @@ impl Sessions {
           })
           .collect(),
         guest: false,
+        back: args
+          .callback
+          .clone()
+          .map(|(program, credential)| BackChannel {
+            program,
+            credential,
+            minor: 1,
+            attrs: back,
+            sequence: 0,
+            state: CallbackState::Unproven,
+          }),
         noted_ns: now_ns,
       },
     );
@@ -598,6 +662,49 @@ impl Sessions {
       let DepartedSession(mut session) = departed;
       session.guest = false;
       self.sessions.entry(sessionid).or_insert(session);
+    }
+  }
+
+  /// The back channel of `sessionid`, when it has one.
+  pub fn back_channel(&self, sessionid: &SessionId) -> Option<BackChannel> {
+    self
+      .sessions
+      .get(sessionid)
+      .and_then(|session| session.back.clone())
+  }
+
+  /// The next callback on `sessionid`'s back channel: its program, its credential and the sequence id slot 0 takes,
+  /// advanced.
+  pub fn next_callback(&mut self, sessionid: &SessionId) -> Option<NextCallback> {
+    let back = self.sessions.get_mut(sessionid)?.back.as_mut()?;
+    back.sequence = back.sequence.wrapping_add(1);
+    Some(NextCallback {
+      program: back.program,
+      credential: back.credential.clone(),
+      minor: back.minor,
+      sequence: back.sequence,
+    })
+  }
+
+  /// Records the minor version `sessionid`'s client uses, for its callbacks to name.
+  pub fn set_callback_minor(&mut self, sessionid: &SessionId, minor: u32) {
+    if let Some(back) = self
+      .sessions
+      .get_mut(sessionid)
+      .and_then(|session| session.back.as_mut())
+    {
+      back.minor = minor;
+    }
+  }
+
+  /// Records whether `sessionid`'s back channel answered its last callback.
+  pub fn set_callback_state(&mut self, sessionid: &SessionId, state: CallbackState) {
+    if let Some(back) = self
+      .sessions
+      .get_mut(sessionid)
+      .and_then(|session| session.back.as_mut())
+    {
+      back.state = state;
     }
   }
 

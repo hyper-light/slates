@@ -54,6 +54,7 @@ fn session(sessions: &mut Sessions, name: &str) -> (u64, [u8; 16]) {
         sequence: granted.sequenceid,
         fore: asked(),
         back: asked(),
+        callback: None,
       },
       0,
     )
@@ -91,6 +92,7 @@ fn a_client_id_is_confirmed_by_its_first_session_and_the_channel_is_negotiated_d
         sequence: first.sequenceid,
         fore: asked(),
         back: asked(),
+        callback: None,
       },
       0,
     )
@@ -185,6 +187,7 @@ fn a_retried_create_session_returns_its_grant() {
     sequence: granted.sequenceid,
     fore: asked(),
     back: asked(),
+    callback: None,
   };
   let first = sessions.create_session(&args, 0).unwrap();
   assert_eq!(sessions.create_session(&args, 0).unwrap(), first);
@@ -237,6 +240,7 @@ fn the_tables_refuse_at_their_bounds() {
         sequence: again.sequenceid,
         fore: asked(),
         back: asked(),
+        callback: None,
       },
       0
     ),

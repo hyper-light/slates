@@ -3526,7 +3526,10 @@ shard's own clock that A-65 budgets in (docs/bugs/2026-10-04-the-slow-observatio
     other-shard case matches the listener's shard. Native v4 operations (one pass per OPEN instead of about 2.5 v3
     calls, all local now) remain a smaller, CPU-only gain;
   - (B) read and write delegations, with the session back channel and recalls from every other mutation path
-    (RFC 8881 §10.2–10.4, §20);
+    (RFC 8881 §10.2–10.4, §20). **B-1 done (A-77): the back channel**, granted, carried, probed, and answered
+    by the real Linux client. Next: B-2, read delegations granted on OPEN (durable like A-37 opens),
+    `DELEGRETURN`, `CLAIM_DELEGATE_CUR`; then B-3, recalls from every mutation path (NFSv3, FUSE, SDK, merge,
+    landing), with the conflicting call delayed and revocation after one lease;
   - (C) directory delegations (§10.9).
   Docker Desktop's transit dominates per call on macOS, so B (fewer round trips) is the larger lever there; A
   removes two thread wakes per v3 call whenever the volume is not on the listener's shard.

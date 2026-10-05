@@ -87,8 +87,8 @@ use slates_bridge_nfs::procedures::{
 };
 use slates_bridge_nfs::rpc::RecordReader;
 use slates_bridge_nfs::v4::compound::{self, Server as V4Server};
-use slates_bridge_nfs::v4::session::DepartedSession;
 use slates_bridge_nfs::v4::session::Limits;
+use slates_bridge_nfs::v4::session::{CallbackState, DepartedSession};
 use slates_bridge_nfs::v4::types::ChannelAttrs;
 use slates_bridge_nfs::v4::types::SessionId;
 use slates_bridge_nfs::v4::{NFS_V4, NFSPROC4_COMPOUND, NFSPROC4_NULL, Nfsstat4};
@@ -1362,6 +1362,16 @@ const NFS4_STATE_LOCAL: &str = "nfs4.state.local";
 /// Counter: file-state calls that went to the file's owner shard and back.
 const NFS4_STATE_FORWARDED: &str = "nfs4.state.forwarded";
 
+/// Counter: callbacks the client refused (an RPC reply that was not accepted: a credential it would not take).
+const NFS4_CALLBACK_REFUSED: &str = "nfs4.callback.refused";
+/// Counter: callbacks the client did not answer within their deadline.
+const NFS4_CALLBACK_TIMEOUT: &str = "nfs4.callback.timeout";
+/// Counter: callbacks that could not be sent (no carrier, one already in flight, the connection gone).
+const NFS4_CALLBACK_UNSENT: &str = "nfs4.callback.unsent";
+/// Counter: back channels that answered their probe (RFC 8881 §10.2).
+const NFS4_CALLBACK_UP: &str = "nfs4.callback.up";
+/// Counter: back channels that did not answer their probe, or whose probe could not start.
+const NFS4_CALLBACK_DOWN: &str = "nfs4.callback.down";
 /// Counter: NFSv4 sessions that moved with their connection to the shard their volume lives on (A-76).
 const NFS4_SESSIONS_MOVED: &str = "nfs4.sessions.moved";
 /// Counter: sessions that arrived with a connection but could not be taken in (no NFSv4 table on the shard).
@@ -1665,22 +1675,14 @@ struct Connection {
 async fn serve_connection(mut connection: Connection) {
   let this = registry::current_shard().unwrap_or(0);
   let mut chunk = [0u8; RECORD_CHUNK];
+  // The connection's back-channel outbox on this shard (`crate::callback`), released however the loop ends.
+  let registration = Registration(crate::callback::register());
   loop {
-    let Some(batch) = serve_batch(this, &mut connection).await else {
+    let Some(batch) = serve_batch(this, &mut connection, registration.0).await else {
       return;
     };
-    if batch.answered > 0 {
-      if connection.stream.write_all(&batch.replies).await.is_err() {
-        return;
-      }
-      if batch.answered > 1 {
-        let _ = state::with_state(|s| {
-          *s.refusals.entry(NFS_REPLIES_BATCHED).or_insert(0) += batch.answered;
-        });
-      }
-      // A mount's call is client activity: the shard spins out its idle window after it, so the next call of a
-      // burst is read without a kernel wake (§4.7).
-      registry::with_current(|ctx| ctx.note_activity());
+    if !send_batch(&mut connection, &batch).await {
+      return;
     }
     if let Some(owner) = batch.moving {
       migrate(owner, connection);
@@ -1691,13 +1693,81 @@ async fn serve_connection(mut connection: Connection) {
       futures::yield_now().await;
       continue;
     }
-    match connection.stream.read(&mut chunk).await {
-      Ok(0) | Err(_) => return,
-      Ok(count) => connection
-        .buffer
-        .extend_from_slice(chunk.get(..count).unwrap_or_default()),
+    if !wait_idle(&mut connection, &mut chunk, registration.0).await {
+      return;
     }
   }
+}
+
+/// Writes a batch's replies in one write and counts the replies that shared it; whether the connection still stands.
+async fn send_batch(connection: &mut Connection, batch: &Batch) -> bool {
+  if batch.answered == 0 {
+    return true;
+  }
+  if connection.stream.write_all(&batch.replies).await.is_err() {
+    return false;
+  }
+  if batch.answered > 1 {
+    let _ = state::with_state(|s| {
+      *s.refusals.entry(NFS_REPLIES_BATCHED).or_insert(0) += batch.answered;
+    });
+  }
+  // A mount's call is client activity: the shard spins out its idle window after it, so the next call of a burst is
+  // read without a kernel wake (§4.7).
+  registry::with_current(|ctx| ctx.note_activity());
+  true
+}
+
+/// Waits for the client's next bytes (buffered for the next batch) or for callbacks queued on this connection (sent);
+/// whether the connection still stands.
+async fn wait_idle(
+  connection: &mut Connection,
+  chunk: &mut [u8],
+  registration: Option<u64>,
+) -> bool {
+  match idle(connection, chunk, registration).await {
+    Idle::Read(Ok(0) | Err(_)) => false,
+    Idle::Read(Ok(count)) => {
+      connection
+        .buffer
+        .extend_from_slice(chunk.get(..count).unwrap_or_default());
+      true
+    }
+    Idle::Send(records) => connection.stream.write_all(&records.concat()).await.is_ok(),
+  }
+}
+
+/// A connection's registration in its shard's back-channel table, ended when the serve loop ends (any path, a
+/// cancellation included), so the callbacks waiting on it fail `Lost` rather than wait out their deadline.
+struct Registration(Option<u64>);
+
+impl Drop for Registration {
+  fn drop(&mut self) {
+    if let Some(id) = self.0 {
+      crate::callback::unregister(id);
+    }
+  }
+}
+
+/// What woke an idle connection: bytes from the client, or callbacks to send it.
+enum Idle {
+  Read(Result<usize, slates_rt::RtError>),
+  Send(Vec<Vec<u8>>),
+}
+
+/// Waits for the client's next bytes or for a callback queued on this connection, whichever comes first.
+async fn idle(connection: &mut Connection, chunk: &mut [u8], registration: Option<u64>) -> Idle {
+  let mut read = std::pin::pin!(connection.stream.read(chunk));
+  std::future::poll_fn(|cx| {
+    if let Some(id) = registration {
+      let outbound = crate::callback::take_outbound(id, cx.waker());
+      if !outbound.is_empty() {
+        return std::task::Poll::Ready(Idle::Send(outbound));
+      }
+    }
+    read.as_mut().poll(cx).map(Idle::Read)
+  })
+  .await
 }
 
 /// One turn's calls on a connection: the replies built, how many, and the owner shard the connection must move to
@@ -1712,7 +1782,11 @@ struct Batch {
 /// long pipeline still yields to the heartbeat (§4.3, D-18); the replies are gathered for one write (A-74). One
 /// reply and a yield per call queued each pipelined call behind every earlier one's write and turn. `None` when the
 /// buffered bytes are not a valid record stream (the connection ends).
-async fn serve_batch(this: u16, connection: &mut Connection) -> Option<Batch> {
+async fn serve_batch(
+  this: u16,
+  connection: &mut Connection,
+  registration: Option<u64>,
+) -> Option<Batch> {
   let started = futures::now_ns();
   let quantum = futures::step_budget_ns().unwrap_or(0);
   let mut batch = Batch {
@@ -1733,12 +1807,8 @@ async fn serve_batch(this: u16, connection: &mut Connection) -> Option<Batch> {
       break;
     }
     let reply = if is_v4_compound(&call) {
-      let placement = compound::placement(&call.args);
-      let (reply, forwarded_to) = serve_v4(this, connection.home, call, connection.port).await;
-      v4_after(this, connection.home);
-      if let Some(owner) = depart_with(this, connection, placement, forwarded_to) {
-        batch.moving = Some(owner);
-      }
+      let (reply, moving) = serve_v4_on(this, connection, call, registration).await;
+      batch.moving = moving;
       reply
     } else {
       reply_to(this, call, connection.port).await
@@ -1752,17 +1822,102 @@ async fn serve_batch(this: u16, connection: &mut Connection) -> Option<Batch> {
   Some(batch)
 }
 
+/// Serves one NFSv4 compound on `connection` (A-76, A-77): binds its session's back channel to the connection, serves
+/// it, settles the notes it owes, and departs its session for the owner shard its calls were forwarded to; the reply,
+/// and the shard the connection must move to after it.
+async fn serve_v4_on(
+  this: u16,
+  connection: &mut Connection,
+  call: Call,
+  registration: Option<u64>,
+) -> (Vec<u8>, Option<u16>) {
+  let placement = compound::placement(&call.args);
+  if let (compound::Placement::Session(sessionid), Some(id)) = (placement, registration) {
+    bind_back_channel(sessionid, id, compound::minor_version(&call.args));
+  }
+  let (reply, forwarded_to) = serve_v4(this, connection.home, call, connection.port).await;
+  v4_after(this, connection.home);
+  (
+    reply,
+    depart_with(this, connection, placement, forwarded_to),
+  )
+}
+
 /// The connection's next call: the pending one, else the next complete record in its buffer; `Some(None)` when no
 /// complete record is buffered, `None` when the bytes are not a valid record stream.
 fn next_call(connection: &mut Connection) -> Option<Option<Call>> {
   if let Some(call) = connection.pending.take() {
     return Some(Some(call));
   }
-  let (body, consumed) = connection.records.read(&connection.buffer).ok()?;
-  connection
-    .buffer
-    .drain(..consumed.min(connection.buffer.len()));
-  Some(body.map(|body| Call::parse(&body)))
+  loop {
+    let (body, consumed) = connection.records.read(&connection.buffer).ok()?;
+    connection
+      .buffer
+      .drain(..consumed.min(connection.buffer.len()));
+    match body {
+      // A reply on the back channel answers one of this shard's callbacks (RFC 8881 §2.10.3.1), never a call.
+      Some(body) if crate::callback::is_reply(&body) => crate::callback::deliver(&body),
+      other => return Some(other.map(|body| Call::parse(&body))),
+    }
+  }
+}
+
+/// Binds connection `id` as the carrier of `sessionid`'s back channel when the session has one (its compounds
+/// arrive on the connection its client keeps the back channel on).
+fn bind_back_channel(sessionid: SessionId, id: u64, minor: Option<u32>) {
+  let Some(back) = with_v4_sessions(|sessions| sessions.back_channel(&sessionid)).flatten() else {
+    return;
+  };
+  if let Some(minor) = minor.filter(|&minor| minor != back.minor) {
+    with_v4_sessions(|sessions| sessions.set_callback_minor(&sessionid, minor));
+  }
+  crate::callback::carry(sessionid, id);
+  if back.state == CallbackState::Unproven {
+    // Probed once before the first use (RFC 8881 §10.2): marked down while the probe runs, so a second compound does
+    // not start another, and up only when the client answers.
+    with_v4_sessions(|sessions| sessions.set_callback_state(&sessionid, CallbackState::Down));
+    match futures::spawn(probe_back_channel(sessionid)) {
+      Ok(task) => {
+        let _ = futures::detach(task);
+      }
+      Err(_) => note(NFS4_CALLBACK_DOWN),
+    }
+  }
+}
+
+/// Probes `sessionid`'s back channel with `CB_SEQUENCE` alone and records whether the client answered `NFS4_OK`
+/// within a liveness budget.
+async fn probe_back_channel(sessionid: SessionId) {
+  let Some(next) = with_v4_sessions(|sessions| sessions.next_callback(&sessionid)).flatten() else {
+    return;
+  };
+  let args = slates_bridge_nfs::v4::callback::probe(&sessionid, next.minor, next.sequence);
+  let outcome = crate::callback::call(
+    sessionid,
+    (next.program, &next.credential),
+    &args,
+    crate::daemon::LIVENESS_BUDGET_NS,
+  )
+  .await;
+  if let Err(error) = outcome {
+    note(match error {
+      crate::callback::CallbackError::Refused => NFS4_CALLBACK_REFUSED,
+      crate::callback::CallbackError::Timeout => NFS4_CALLBACK_TIMEOUT,
+      _ => NFS4_CALLBACK_UNSENT,
+    });
+  }
+  let answered = outcome
+    .ok()
+    .and_then(|results| slates_bridge_nfs::v4::callback::status(&results))
+    == Some(Nfsstat4::Ok as u32);
+  let state = if answered {
+    note(NFS4_CALLBACK_UP);
+    CallbackState::Up
+  } else {
+    note(NFS4_CALLBACK_DOWN);
+    CallbackState::Down
+  };
+  with_v4_sessions(|sessions| sessions.set_callback_state(&sessionid, state));
 }
 
 /// Counter: replies that left in a write carrying more than one (§4.14): the batched serve's non-vacuity count.

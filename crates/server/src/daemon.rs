@@ -2743,6 +2743,8 @@ fn init_shard(
     plane: crate::member_task::PlaneState::default(),
     #[cfg(unix)]
     nfs_service: crate::nfs::ServiceTimes::default(),
+    #[cfg(unix)]
+    callbacks: crate::callback::Callbacks::default(),
     member_boot_nonce: incarnation,
     learned_members: std::collections::BTreeMap::new(),
     authenticated_members: std::collections::BTreeSet::new(),

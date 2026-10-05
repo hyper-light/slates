@@ -453,6 +453,9 @@ pub struct ShardState {
   /// How long this shard took to serve each NFS call it read, served here or forwarded to its owner (§4.14).
   #[cfg(unix)]
   pub nfs_service: crate::nfs::ServiceTimes,
+  /// The NFSv4.1 back channels of the connections this shard serves (`crate::callback`).
+  #[cfg(unix)]
+  pub(crate) callbacks: crate::callback::Callbacks,
   /// This start's random nonce, announced with its derived member id on SWIM contact (§4.8).
   /// It survives a warm restart with the complete retained Raft state; whole-anchor loss changes it.
   pub member_boot_nonce: u64,

@@ -1221,6 +1221,8 @@ struct V4Client {
   xid: u32,
   /// The slots the server granted the session (`ca_maxrequests` of the fore channel).
   slots: u32,
+  /// Whether the server granted the back channel on this connection (`CREATE_SESSION4_FLAG_CONN_BACK_CHAN`).
+  back_granted: bool,
 }
 
 /// Format: `NFS4_OK`, `NFS4ERR_NOENT` and the operation numbers this test sends (RFC 7863).
@@ -1297,6 +1299,11 @@ impl V4Client {
 
   /// [`V4Client::connect_as`] asking for `slots` slots, as a client's `max_session_slots` does.
   fn connect_asking(port: u16, owner: &[u8], slots: u32) -> V4Client {
+    V4Client::connect_full(port, owner, slots, None)
+  }
+
+  /// [`V4Client::connect_asking`], asking for the back channel on this connection to callback `program`.
+  fn connect_full(port: u16, owner: &[u8], slots: u32, back: Option<u32>) -> V4Client {
     use slates_bridge_nfs::v4::types::ChannelAttrs;
     use slates_bridge_nfs::xdr::{XdrReader, XdrWriter};
     let mut client = V4Client {
@@ -1306,6 +1313,7 @@ impl V4Client {
       sequence: 0,
       xid: 0,
       slots: 0,
+      back_granted: false,
     };
     let mut ops = XdrWriter::new();
     ops.u32(OP_EXCHANGE_ID);
@@ -1325,7 +1333,7 @@ impl V4Client {
     ops.u32(OP_CREATE_SESSION);
     ops.u64(clientid);
     ops.u32(sequenceid);
-    ops.u32(0);
+    ops.u32(if back.is_some() { CONN_BACK_CHAN } else { 0 });
     let asked = ChannelAttrs {
       max_request: 1 << 20,
       max_response: 1 << 20,
@@ -1336,11 +1344,23 @@ impl V4Client {
     };
     asked.encode(&mut ops);
     asked.encode(&mut ops);
-    ops.u32(0);
-    ops.u32(0);
+    match back {
+      Some(program) => {
+        ops.u32(program);
+        ops.u32(1); // one flavor: AUTH_SYS with these parameters
+        ops.u32(1);
+        ops.fixed(&callback_authsys());
+      }
+      None => {
+        ops.u32(0);
+        ops.u32(0);
+      }
+    }
     let (status, results) = client.compound(1, ops.as_slice());
     assert_eq!(status, NFS4_OK, "CREATE_SESSION");
     client.sessionid.copy_from_slice(&results[8..8 + 16]);
+    let flags = u32::from_be_bytes(results[8 + 16 + 4..8 + 16 + 8].try_into().unwrap());
+    client.back_granted = flags & CONN_BACK_CHAN != 0;
     // CREATE_SESSION4resok after the session id: the sequence id and the flags, then the fore channel.
     let mut reader = XdrReader::new(&results[8 + 16 + 8..]);
     client.slots = ChannelAttrs::decode(&mut reader).unwrap().max_requests;
@@ -1521,6 +1541,8 @@ fn remote_volume_name(client: &mut Client) -> String {
 const OP_LOCK: u32 = 12;
 const OP_TEST_STATEID: u32 = 55;
 const NFS4ERR_BAD_STATEID: u32 = 10025;
+/// Format: `CREATE_SESSION4_FLAG_CONN_BACK_CHAN` (RFC 8881 §18.36.1).
+const CONN_BACK_CHAN: u32 = 2;
 /// Format: `NFS4ERR_BADSLOT` (RFC 8881 §15.1.11.3).
 const NFS4ERR_BADSLOT: u32 = 10053;
 const NFS4ERR_DENIED: u32 = 10010;
@@ -1805,6 +1827,7 @@ fn reach_from_a_second_connection(v4: &V4Client, port: u16, ops: &[u8]) -> u32 {
     sequence: v4.sequence,
     xid: 1000,
     slots: v4.slots,
+    back_granted: false,
   };
   let (status, _) = second.sequenced(2, ops);
   assert_eq!(
@@ -1889,5 +1912,207 @@ fn a_session_moves_to_its_volumes_shard_and_its_compounds_run_there() {
   );
   let again = V4Client::connect_as(port, b"v4-test-host");
   assert_ne!(again.sessionid, v4.sessionid, "a new session at home");
+  drop(daemon);
+}
+
+/// Format: the callback program number the test client serves (any; the client names it at `CREATE_SESSION`).
+const CB_PROGRAM: u32 = 0x4000_0123;
+/// Format: `OP_CB_SEQUENCE` (RFC 8881 §20.9).
+const OP_CB_SEQUENCE: u32 = 11;
+/// Shape: how long the test waits for the daemon to record a probe's outcome: the probe's deadline (one liveness
+/// budget) and as much again for a loaded machine.
+const PROBE_SETTLE: Duration = Duration::from_secs(4);
+
+impl V4Client {
+  /// Sends a `SEQUENCE` compound on slot 0 without waiting for its reply; its xid.
+  fn send_sequence(&mut self) -> u32 {
+    use slates_bridge_nfs::xdr::XdrWriter;
+    use std::io::Write;
+    self.sequence += 1;
+    self.xid += 1;
+    let mut seq = XdrWriter::new();
+    seq.u32(OP_SEQUENCE);
+    seq.fixed(&self.sessionid);
+    seq.u32(self.sequence);
+    seq.u32(0);
+    seq.u32(0);
+    seq.bool(false);
+    let mut args = XdrWriter::new();
+    args.opaque(b"");
+    args.u32(2);
+    args.u32(1);
+    args.fixed(seq.as_slice());
+    let mut body = XdrWriter::new();
+    for field in [self.xid, 0, 2, 100_003, 4, 1, 0, 0, 0, 0] {
+      body.u32(field);
+    }
+    body.fixed(args.as_slice());
+    let marker = 0x8000_0000u32 | u32::try_from(body.len()).unwrap();
+    self.stream.write_all(&marker.to_be_bytes()).unwrap();
+    self.stream.write_all(body.as_slice()).unwrap();
+    self.xid
+  }
+
+  /// The next record on the connection, whatever it carries: a reply to this client or a callback call to it.
+  fn next_message(&mut self) -> Vec<u8> {
+    use std::io::Read;
+    // A message that never comes fails the test at the settle bound rather than hanging it.
+    self.stream.set_read_timeout(Some(PROBE_SETTLE)).unwrap();
+    let mut marker = [0u8; 4];
+    self.stream.read_exact(&mut marker).unwrap();
+    let mut body = vec![0u8; (u32::from_be_bytes(marker) & 0x7fff_ffff) as usize];
+    self.stream.read_exact(&mut body).unwrap();
+    body
+  }
+
+  /// Answers the callback `call` (a CB_COMPOUND whose first operation is CB_SEQUENCE) with `NFS4_OK`, after checking
+  /// it names this client's program and session.
+  fn answer_callback(&mut self, call: &[u8]) {
+    use slates_bridge_nfs::xdr::{XdrReader, XdrWriter};
+    use std::io::Write;
+    let mut reader = XdrReader::new(call);
+    let xid = check_callback_rpc(&mut reader);
+    reader.opaque(1024).unwrap(); // tag
+    assert_eq!(
+      reader.u32().unwrap(),
+      2,
+      "the callback names the minor version the client's compounds use"
+    );
+    reader.u32().unwrap(); // callback_ident
+    let operations = reader.u32().unwrap();
+    assert!(operations >= 1);
+    assert_eq!(reader.u32().unwrap(), OP_CB_SEQUENCE, "CB_SEQUENCE first");
+    assert_eq!(
+      reader.fixed(16).unwrap(),
+      &self.sessionid[..],
+      "this session"
+    );
+    let sequenceid = reader.u32().unwrap();
+    let mut body = XdrWriter::new();
+    for field in [xid, 1, 0, 0, 0, 0] {
+      body.u32(field);
+    }
+    body.u32(0); // CB_COMPOUND status
+    body.opaque(b"");
+    body.u32(1);
+    body.u32(OP_CB_SEQUENCE);
+    body.u32(0);
+    body.fixed(&self.sessionid);
+    for field in [sequenceid, 0, 0, 0] {
+      body.u32(field);
+    }
+    let marker = 0x8000_0000u32 | u32::try_from(body.len()).unwrap();
+    self.stream.write_all(&marker.to_be_bytes()).unwrap();
+    self.stream.write_all(body.as_slice()).unwrap();
+  }
+}
+
+/// Checks a callback's RPC header (a call of `CB_COMPOUND` to the client's program under its AUTH_SYS parameters) and
+/// returns its xid, leaving `reader` at the compound's arguments.
+fn check_callback_rpc(reader: &mut slates_bridge_nfs::xdr::XdrReader<'_>) -> u32 {
+  let xid = reader.u32().unwrap();
+  assert_eq!(reader.u32().unwrap(), 0, "a call");
+  assert_eq!(reader.u32().unwrap(), 2, "RPC version 2");
+  assert_eq!(
+    reader.u32().unwrap(),
+    CB_PROGRAM,
+    "the client's callback program"
+  );
+  assert_eq!(
+    (reader.u32().unwrap(), reader.u32().unwrap()),
+    (1, 1),
+    "CB_COMPOUND, version 1"
+  );
+  assert_eq!(
+    reader.u32().unwrap(),
+    1,
+    "the callback carries AUTH_SYS, the flavor the client offered"
+  );
+  assert_eq!(
+    reader.opaque(400).unwrap(),
+    &callback_authsys()[..],
+    "with the client's own parameters"
+  );
+  reader.u32().unwrap();
+  reader.opaque(400).unwrap();
+  xid
+}
+
+/// The `authsys_parms` the test client offers for callbacks: stamp, machine name, uid, gid, no supplementary gids.
+fn callback_authsys() -> Vec<u8> {
+  use slates_bridge_nfs::xdr::XdrWriter;
+  let mut parms = XdrWriter::new();
+  parms.u32(7);
+  parms.opaque(b"cb-host");
+  parms.u32(501);
+  parms.u32(20);
+  parms.u32(0);
+  parms.into_bytes()
+}
+
+/// Whether a record body is an RPC call (message type 0) rather than a reply.
+fn is_call(body: &[u8]) -> bool {
+  body.get(4..8) == Some(&[0, 0, 0, 0][..])
+}
+
+/// Polls `name` on every shard until it reaches `at_least` or [`PROBE_SETTLE`] passes; whether it did.
+fn counter_reaches(daemon: &Daemon, name: &str, at_least: u64) -> bool {
+  let started = Instant::now();
+  while started.elapsed() < PROBE_SETTLE {
+    if counter(daemon, name) >= at_least {
+      return true;
+    }
+    std::thread::yield_now();
+  }
+  false
+}
+
+/// §4.6, RFC 8881 §2.10.3.1 and §10.2 (B-1): do create a session asking for the back channel on its connection,
+/// then send a compound on it; expect the back channel granted, the daemon's probe (a `CB_COMPOUND` whose
+/// `CB_SEQUENCE` names the session) arriving on the same connection interleaved with the compound's reply, and, once
+/// answered `NFS4_OK`, the back channel recorded up. Then do the same with a client that never answers; expect the
+/// back channel recorded down once the probe's deadline passes, and that client's compounds still answered.
+#[test]
+fn a_back_channel_is_probed_on_its_connection_and_recorded_up_or_down() {
+  let (daemon, _instance) = two_shard_daemon("backchan");
+  let port = daemon.nfs_port().expect("the daemon is serving NFS");
+  let mut answering = V4Client::connect_full(port, b"cb-answers", 4, Some(CB_PROGRAM));
+  assert!(
+    answering.back_granted,
+    "the back channel is granted on the connection"
+  );
+  let xid = answering.send_sequence();
+  let (mut replied, mut probed) = (false, false);
+  while !(replied && probed) {
+    let message = answering.next_message();
+    if is_call(&message) {
+      answering.answer_callback(&message);
+      probed = true;
+    } else {
+      assert_eq!(
+        message.get(..4),
+        Some(&xid.to_be_bytes()[..]),
+        "the compound's reply"
+      );
+      replied = true;
+    }
+  }
+  assert!(
+    counter_reaches(&daemon, "nfs4.callback.up", 1),
+    "the answered probe marks the channel up"
+  );
+  let mut silent = V4Client::connect_full(port, b"cb-silent", 4, Some(CB_PROGRAM));
+  let xid = silent.send_sequence();
+  loop {
+    let message = silent.next_message();
+    if !is_call(&message) {
+      assert_eq!(message.get(..4), Some(&xid.to_be_bytes()[..]));
+      break;
+    }
+  }
+  assert!(
+    counter_reaches(&daemon, "nfs4.callback.down", 1),
+    "an unanswered probe marks the channel down"
+  );
   drop(daemon);
 }
