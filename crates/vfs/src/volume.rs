@@ -1207,16 +1207,12 @@ impl Volume {
       Body::Inline(bytes) => copy_range(bytes, 0, off, out),
       Body::Sealed(extents) => {
         for e in extents {
-          if let Some(bytes) = store.content.extent_bytes(e) {
-            copy_range(bytes, e.off, off, out);
-          }
+          store.content.read_extent_into(e, off, out)?;
         }
       }
       Body::Open { open, sealed } => {
         for e in sealed {
-          if let Some(bytes) = store.content.extent_bytes(e) {
-            copy_range(bytes, e.off, off, out);
-          }
+          store.content.read_extent_into(e, off, out)?;
         }
         copy_range(store.content.open_bytes(open), open.off, off, out);
       }
@@ -1234,9 +1230,7 @@ impl Volume {
           return Err(VfsError::BaseUnavailable(0));
         }
         for e in &b.pinned {
-          if let Some(bytes) = store.content.extent_bytes(e) {
-            copy_range(bytes, e.off, off, out);
-          }
+          store.content.read_extent_into(e, off, out)?;
         }
       }
       Body::None | Body::Directory(_) | Body::Symlink(_) => {}
@@ -2283,16 +2277,12 @@ impl Volume {
       Body::Inline(bytes) => copy_range(bytes, 0, off, out),
       Body::Sealed(extents) => {
         for e in extents {
-          if let Some(bytes) = store.content.extent_bytes(e) {
-            copy_range(bytes, e.off, off, out);
-          }
+          store.content.read_extent_into(e, off, out)?;
         }
       }
       Body::Open { open, sealed } => {
         for e in sealed {
-          if let Some(bytes) = store.content.extent_bytes(e) {
-            copy_range(bytes, e.off, off, out);
-          }
+          store.content.read_extent_into(e, off, out)?;
         }
         copy_range(store.content.open_bytes(open), open.off, off, out);
       }
@@ -2312,9 +2302,7 @@ impl Volume {
           return Err(VfsError::BaseUnavailable(0));
         }
         for e in &b.pinned {
-          if let Some(bytes) = store.content.extent_bytes(e) {
-            copy_range(bytes, e.off, off, out);
-          }
+          store.content.read_extent_into(e, off, out)?;
         }
       }
       Body::None | Body::Directory(_) | Body::Symlink(_) => {}
@@ -5399,22 +5387,7 @@ pub(crate) fn stamp_all(attrs: &mut Attrs, now: i64) {
 
 /// Copies the overlap of `bytes` (at file offset `base`) into `out` (at file offset `off`).
 pub(crate) fn copy_range(bytes: &[u8], base: u64, off: u64, out: &mut [u8]) {
-  let src_end = base + u64::try_from(bytes.len()).unwrap_or(0);
-  let dst_end = off + u64::try_from(out.len()).unwrap_or(0);
-  let start = base.max(off);
-  let end = src_end.min(dst_end);
-  if start >= end {
-    return;
-  }
-  let (s, e) = (
-    usize::try_from(start - base).unwrap_or(0),
-    usize::try_from(end - base).unwrap_or(0),
-  );
-  let (d0, d1) = (
-    usize::try_from(start - off).unwrap_or(0),
-    usize::try_from(end - off).unwrap_or(0),
-  );
-  out[d0..d1].copy_from_slice(&bytes[s..e]);
+  crate::content::copy_overlap(bytes, base, off, out);
 }
 
 /// Releases the chunks of sealed extents by the epoch rule.

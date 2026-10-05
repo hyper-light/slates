@@ -1882,9 +1882,7 @@ impl Overlay<'_> {
     }
     if let Body::Base(b) = &self.vol.inode(store, no)?.body {
       for e in &b.pinned {
-        if let Some(bytes) = store.content.extent_bytes(e) {
-          crate::volume::copy_range(bytes, e.off, off, out);
-        }
+        store.content.read_extent_into(e, off, out)?;
       }
     }
     Ok(want)
@@ -1929,9 +1927,7 @@ impl Overlay<'_> {
       self.read_disk_witnessed(store, no, &witness, off, disk)?;
     }
     for e in &pinned {
-      if let Some(bytes) = store.content.extent_bytes(e) {
-        crate::volume::copy_range(bytes, e.off, off, out);
-      }
+      store.content.read_extent_into(e, off, out)?;
     }
     Ok(want)
   }

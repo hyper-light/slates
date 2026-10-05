@@ -69,6 +69,31 @@ pub struct OpenExtent {
   pub born: Epoch,
 }
 
+/// Copies the overlap of `bytes`, which sit at file offset `base`, with a buffer `out` for file offset `off`, into
+/// that buffer; nothing when they do not overlap. Checked throughout: a range past either end copies nothing rather
+/// than indexing out of bounds.
+pub(crate) fn copy_overlap(bytes: &[u8], base: u64, off: u64, out: &mut [u8]) {
+  let source_end = base.saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
+  let target_end = off.saturating_add(u64::try_from(out.len()).unwrap_or(u64::MAX));
+  let start = base.max(off);
+  let end = source_end.min(target_end);
+  if start >= end {
+    return;
+  }
+  let span = |from: u64, to: u64| -> Option<std::ops::Range<usize>> {
+    Some(usize::try_from(from).ok()?..usize::try_from(to).ok()?)
+  };
+  let (Some(from), Some(to)) = (
+    span(start.saturating_sub(base), end.saturating_sub(base)),
+    span(start.saturating_sub(off), end.saturating_sub(off)),
+  ) else {
+    return;
+  };
+  if let (Some(source), Some(target)) = (bytes.get(from), out.get_mut(to)) {
+    target.copy_from_slice(source);
+  }
+}
+
 /// The shard's chunk store: the arena and the chunk slab.
 pub struct ChunkStore {
   arena: ChunkArena,
@@ -327,18 +352,29 @@ impl ChunkStore {
     }))
   }
 
-  /// The bytes of a sealed extent.
-  pub fn extent_bytes(&self, extent: &Extent) -> Option<&[u8]> {
-    match extent.src {
-      ExtentSrc::Zero => None,
-      ExtentSrc::Chunk { chunk, at } => {
-        let c = self.chunks.get(chunk).ok()?;
-        let bytes = self.arena.bytes(c.block)?;
-        let start = usize::try_from(at).ok()?;
-        let end = start.checked_add(usize::try_from(extent.len).ok()?)?;
-        bytes.get(start..end.min(usize::try_from(c.len).ok()?))
-      }
-    }
+  /// Copies the part of a sealed extent that overlaps a read of `out.len()` bytes at file offset `off` into the
+  /// matching place in `out`; a hole leaves `out` as it is (the caller zero-fills first). The one way a sealed
+  /// chunk's bytes are read (A-99): every reader goes through here, so the chunk's bytes can be opened from their
+  /// sealed form into `out` without any reader seeing the arena. A chunk the extent names that is no longer there is
+  /// `StaleHandle`, never zeros presented as content.
+  pub fn read_extent_into(
+    &self,
+    extent: &Extent,
+    off: u64,
+    out: &mut [u8],
+  ) -> Result<(), VfsError> {
+    let ExtentSrc::Chunk { chunk, at } = extent.src else {
+      return Ok(());
+    };
+    let c = self.chunks.get(chunk)?;
+    let bytes = self.arena.bytes(c.block).ok_or(VfsError::StaleHandle)?;
+    let start = usize::try_from(at).map_err(|_| VfsError::Invalid)?;
+    let used = usize::try_from(c.len).map_err(|_| VfsError::Invalid)?;
+    let wanted = usize::try_from(extent.len).map_err(|_| VfsError::Invalid)?;
+    let end = start.saturating_add(wanted).min(used);
+    let source = bytes.get(start..end).ok_or(VfsError::StaleHandle)?;
+    copy_overlap(source, extent.off, off, out);
+    Ok(())
   }
 
   /// Copies a sealed extent's bytes into a new open extent (copy-on-write), zero-filling
@@ -346,11 +382,9 @@ impl ChunkStore {
   /// length is the extent's.
   pub fn reopen(&mut self, extent: &Extent, born: Epoch) -> Result<OpenExtent, VfsError> {
     let len = usize::try_from(extent.len).unwrap_or(usize::MAX);
+    let mut bytes = vec![0u8; len];
+    self.read_extent_into(extent, extent.off, &mut bytes)?;
     let mut open = self.open(extent.off, len, born)?;
-    let bytes = self
-      .extent_bytes(extent)
-      .map(<[u8]>::to_vec)
-      .unwrap_or_else(|| vec![0u8; len]);
     if let Err(refusal) = self.write_open(&mut open, 0, &bytes) {
       // Refused whole: the block taken for the copy goes back.
       self.arena.free(open.block)?;
@@ -462,7 +496,9 @@ mod tests {
     s.write_open(&mut open, 5000, b"far").unwrap();
     let extent = s.seal(open).unwrap().unwrap();
     assert_eq!(extent.len, 5003);
-    assert_eq!(&s.extent_bytes(&extent).unwrap()[5000..5003], b"far");
+    let mut read = [0u8; 3];
+    s.read_extent_into(&extent, 5000, &mut read).unwrap();
+    assert_eq!(&read, b"far");
     let mut dead = Deadlist::default();
     let ExtentSrc::Chunk { chunk, .. } = extent.src else {
       panic!()

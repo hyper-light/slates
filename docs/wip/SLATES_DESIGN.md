@@ -9564,8 +9564,8 @@ memory cap") and GAPS.
        volume holds 338 MiB of the 358 MB pool (BENCHMARKS;
        `docs/bugs/2026-10-05-pressure-hold-counted-the-daemons-own-growth.md`).
 
-### A-99 — Idle content sealed in RAM (2026-10-05, designed)
-Status: designed 2026-10-05; not yet built. It realizes A-92's decision from piece 5's measurement: idle RAM is
+### A-99 — Idle content sealed in RAM (2026-10-05, in progress)
+Status: designed 2026-10-05; piece 1 built the same day. It realizes A-92's decision from piece 5's measurement: idle RAM is
 sealed under the volume's version key (condition 9, "encrypted at rest when not being modified or read").
 - What is at rest. `ChunkStore` (`crates/vfs/src/content.rs`) already separates the *open* extent, written in place
   until a publication seals it, from *sealed* chunks, which are immutable (a write into one copies it into a new open
@@ -9606,7 +9606,11 @@ sealed under the volume's version key (condition 9, "encrypted at rest when not 
   root user of the host, who can read the daemon. A node with sealing `unavailable` (no locked key region) keeps
   chunks in the clear, and status says so (`seal.state`).
 - Pieces, each tested by use:
-  1. `read_extent` replaces `extent_bytes` at every site, still plaintext: a refactor proven by the existing suites.
+  1. **Built (2026-10-05):** `ChunkStore::read_extent_into(extent, off, out)` replaces `extent_bytes` at every site
+     (`volume.rs` 6, `base.rs` 2, and `reopen`), still plaintext, and `extent_bytes` is gone, so no reader can bypass
+     the chokepoint. A chunk an extent names that is no longer there is now `StaleHandle`, where it read as zeros
+     before. The overlap copy is checked (`copy_overlap`): the old `copy_range` added and indexed unchecked. vfs 215,
+     cluster 280, server lib 157, NFS mount 29 and recovery 21 pass.
   2. The tag slab, the per-chunk epoch and version, and their place in the image (`IMAGE_VERSION` 17): recovery
      round-trips them.
   3. Sealing at `ChunkStore::seal` and opening at `read_extent` and `reopen`, under a key the server hands the store
