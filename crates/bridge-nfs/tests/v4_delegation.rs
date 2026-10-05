@@ -166,6 +166,17 @@ fn an_unreturned_delegation_is_revoked_after_a_lease() {
     !files.recall(&fh, Some(B), true, 102 + LEASE).waiting,
     "nothing left to wait for"
   );
+  assert!(
+    files.has_revoked(A),
+    "A is told on every SEQUENCE until it frees the delegation"
+  );
+  assert_eq!(files.test(&delegation.other, A), Nfsstat4::DelegRevoked);
+  assert!(
+    files.free(&delegation.other, A).is_ok(),
+    "A frees what it has seen revoked"
+  );
+  assert!(!files.has_revoked(A));
+  assert_eq!(files.test(&delegation.other, A), Nfsstat4::BadStateid);
 }
 
 /// A-36, A-78: do delegate a file opened through one mount, then change it through another mount's handle; expect the

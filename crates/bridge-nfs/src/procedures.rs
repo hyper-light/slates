@@ -2813,6 +2813,9 @@ fn nfsstat_of(e: &VfsError) -> Nfsstat3 {
     // RFC 1813 §2.6: the server could not complete the request in time; the client retries it. The arena waits on
     // the shard's next publication, which the shard runs before its next request (A-64).
     VfsError::PublishNeeded => Nfsstat3::Jukebox,
+    // RFC 8881 §10.2: the file is delegated to an NFSv4 client, whose recall was asked for; the change proceeds once
+    // the delegation is returned or revoked, so the caller retries (A-79).
+    VfsError::Delegated => Nfsstat3::Jukebox,
     _ => Nfsstat3::ServerFault,
   }
 }

@@ -74,6 +74,9 @@ const STATUS_OBJECT_NAME_NOT_FOUND: Ntstatus = Ntstatus(0xC000_0034);
 const STATUS_OBJECT_NAME_COLLISION: Ntstatus = Ntstatus(0xC000_0035);
 /// Format: `STATUS_DISK_FULL` — the volume is out of space (`ENOSPC`).
 const STATUS_DISK_FULL: Ntstatus = Ntstatus(0xC000_007F);
+/// Format: `STATUS_SHARING_VIOLATION` (`0xC000_0043`): the file is in use; Windows callers retry, as they do when an
+/// opportunistic lock is being broken. A delegated file awaiting its recall (A-79).
+const STATUS_SHARING_VIOLATION: Ntstatus = Ntstatus(0xC000_0043);
 /// Format: `STATUS_MEDIA_WRITE_PROTECTED` — the target is read-only (a pinned view refuses a write).
 const STATUS_MEDIA_WRITE_PROTECTED: Ntstatus = Ntstatus(0xC000_00A2);
 /// Format: `STATUS_FILE_IS_A_DIRECTORY` — a directory was found where a file was expected (`EISDIR`).
@@ -146,6 +149,7 @@ pub fn ntstatus(error: &VfsError) -> Ntstatus {
     VfsError::StaleHandle => STATUS_INVALID_HANDLE,
     VfsError::Pinned => STATUS_MEDIA_WRITE_PROTECTED,
     VfsError::SpecialFileOperation => STATUS_NOT_SUPPORTED,
+    VfsError::Delegated => STATUS_SHARING_VIOLATION,
     _ => STATUS_UNSUCCESSFUL,
   }
 }

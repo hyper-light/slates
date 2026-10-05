@@ -365,6 +365,12 @@ pub struct FileState {
   locks: LockTable,
   /// The files' delegations (A-78).
   delegations: super::delegation::Delegations,
+  /// Delegations revoked from their holders and not yet freed by them (RFC 8881 §10.4.5), with each holder: a holder
+  /// with one is told on every SEQUENCE (`SEQ4_STATUS_RECALLABLE_STATE_REVOKED`) until it frees it. Never more than
+  /// the delegation bound.
+  revoked: BTreeMap<Other, u64>,
+  /// How long after a recall a file is not delegated again (the lease; zero for a standalone server).
+  quiet_ns: u64,
   /// The changes since the last [`FileState::take_changes`], for the owner's partition to record, when
   /// the state is durable (`None` for a standalone server, which records nothing). Drained after
   /// every operation, so it holds one operation's changes at most.
@@ -383,6 +389,8 @@ impl FileState {
       by_file: BTreeMap::new(),
       locks: LockTable::new(tag, max_locks),
       delegations: super::delegation::Delegations::new(max_opens),
+      revoked: BTreeMap::new(),
+      quiet_ns: 0,
       changes: None,
     }
   }
@@ -803,6 +811,9 @@ impl FileState {
 
   /// TEST_STATEID's answer for one state id of `clientid` (§18.48): valid, or `NFS4ERR_BAD_STATEID`.
   pub fn test(&self, other: &Other, clientid: u64) -> Nfsstat4 {
+    if self.revoked.get(other) == Some(&clientid) {
+      return Nfsstat4::DelegRevoked;
+    }
     let held = self
       .opens
       .get(other)
@@ -819,6 +830,14 @@ impl FileState {
   /// FREE_STATEID (§18.38): a lock state holding no lock, or an open none of whose lock-owners holds
   /// one (with its lock states); `NFS4ERR_LOCKS_HELD` otherwise.
   pub fn free(&mut self, other: &Other, clientid: u64) -> Result<Released, Nfsstat4> {
+    // A revoked delegation is freed by its holder once it has seen the revocation (§18.38).
+    if self.revoked.get(other) == Some(&clientid) {
+      self.revoked.remove(other);
+      return Ok(Released {
+        stateid: Stateid::default(),
+        gone: vec![*other],
+      });
+    }
     if self.test(other, clientid) != Nfsstat4::Ok {
       return Err(Nfsstat4::BadStateid);
     }
@@ -858,6 +877,7 @@ impl FileState {
     self.locks.purge(|holder| holder != clientid);
     // The partition's client purge clears its delegation records with its opens and locks.
     self.delegations.purge(clientid);
+    self.revoked.retain(|_, holder| *holder != clientid);
     if let Some(changes) = self.changes.as_mut() {
       changes.push(FileChange::ClientCleared(clientid));
     }
@@ -924,7 +944,8 @@ impl FileState {
   /// Revokes every delegation not returned within `lease_ns` of its recall; journaled. Their `other`s and holders.
   pub fn revoke_lapsed(&mut self, now_ns: u64, lease_ns: u64, quiet_ns: u64) -> Vec<(Other, u64)> {
     let revoked = self.delegations.revoke_lapsed(now_ns, lease_ns, quiet_ns);
-    for (other, _) in &revoked {
+    for (other, holder) in &revoked {
+      self.remember_revoked(*other, *holder);
       self.journal_delegation(other);
     }
     revoked
@@ -933,6 +954,49 @@ impl FileState {
   /// How many delegations are held.
   pub fn delegation_count(&self) -> usize {
     self.delegations.len()
+  }
+
+  /// Sets how long after a recall a file is not delegated again (the owner's lease).
+  pub fn set_delegation_quiet(&mut self, quiet_ns: u64) {
+    self.quiet_ns = quiet_ns;
+  }
+
+  /// How long after a recall a file is not delegated again.
+  pub fn delegation_quiet(&self) -> u64 {
+    self.quiet_ns
+  }
+
+  /// The inodes of the delegated files, for the store's recall gate.
+  pub fn delegated_inodes(&self) -> std::collections::BTreeSet<u64> {
+    self.delegations.delegated_inodes()
+  }
+
+  /// The recall a change to `inode` asked for: the delegations of that file every holder must give back (the change's
+  /// actor is not known at the inode, so every holder's), and the recalls to send now.
+  pub fn recall_inode(&mut self, inode: u64, now_ns: u64) -> super::delegation::RecallPlan {
+    match self.delegations.handle_of_inode(inode) {
+      Some(fh) => self.delegations.recall(&fh, None, true, now_ns),
+      None => super::delegation::RecallPlan::default(),
+    }
+  }
+
+  /// Revokes delegation `other` now (its recall could not be sent); journaled, and remembered for its holder.
+  pub fn revoke_delegation(&mut self, other: &Other) {
+    if let Some(holder) = self.delegations.revoke(other) {
+      self.remember_revoked(*other, holder);
+      self.journal_delegation(other);
+    }
+  }
+
+  /// Whether `clientid` has a revoked delegation it has not freed (`SEQ4_STATUS_RECALLABLE_STATE_REVOKED`).
+  pub fn has_revoked(&self, clientid: u64) -> bool {
+    self.revoked.values().any(|holder| *holder == clientid)
+  }
+
+  fn remember_revoked(&mut self, other: Other, holder: u64) {
+    if self.revoked.len() < self.max_opens {
+      self.revoked.insert(other, holder);
+    }
   }
 
   /// Journals the current record of delegation `other`, or its clearing.

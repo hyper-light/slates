@@ -269,6 +269,33 @@ impl Delegations {
     lapsed
   }
 
+  /// Revokes delegation `other` now (its recall could not be sent); its holder, if it was held.
+  pub fn revoke(&mut self, other: &Other) -> Option<u64> {
+    let holder = self.holder(other);
+    self.remove(other);
+    holder
+  }
+
+  /// The inodes of the files delegated (each handle's inode number; a handle this daemon did not mint names none).
+  pub fn delegated_inodes(&self) -> std::collections::BTreeSet<u64> {
+    self
+      .table
+      .values()
+      .filter_map(|delegation| crate::handle::FileHandle::from_fh(&delegation.fh).ok())
+      .map(|handle| handle.inode)
+      .collect()
+  }
+
+  /// The handle of a delegated file whose inode is `inode`, for a recall a change to that inode asked for.
+  pub fn handle_of_inode(&self, inode: u64) -> Option<Nfsfh3> {
+    self
+      .table
+      .values()
+      .map(|delegation| &delegation.fh)
+      .find(|fh| crate::handle::FileHandle::from_fh(fh).is_ok_and(|handle| handle.inode == inode))
+      .cloned()
+  }
+
   /// Whether `other` names a delegation `clientid` holds of `fh`, at a current seqid (0 is "the current one").
   pub fn check(
     &self,

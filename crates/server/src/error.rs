@@ -132,6 +132,10 @@ pub fn refusal_of_vfs(e: &VfsError) -> Refusal {
     VfsError::PublishNeeded => Refusal::Unpublished {
       reason: "the arena's freed blocks wait on the shard's next recovery publication".to_owned(),
     },
+    // Retryable under the same id: the file is delegated to an NFSv4 client, whose recall was asked for (A-79).
+    VfsError::Delegated => Refusal::Unpublished {
+      reason: "the file is delegated to an NFSv4 client; its recall is under way".to_owned(),
+    },
     VfsError::TreeTooDeep { limit } => Refusal::Unsupported {
       feature: format!("archiving a tree deeper than {limit} path components"),
     },

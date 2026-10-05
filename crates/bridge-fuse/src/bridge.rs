@@ -384,6 +384,8 @@ fn errno(e: VfsError) -> i32 {
     // The bridge's open-handle table is full (audit BUG-4); the kernel's errno for it is EMFILE.
     VfsError::Memory(slates_mem::MemError::SlabFull { .. }) => EMFILE,
     VfsError::PublishNeeded => EAGAIN,
+    // The file is delegated to an NFSv4 client; its recall was asked for (A-79).
+    VfsError::Delegated => EAGAIN,
     _ => EIO,
   }
 }

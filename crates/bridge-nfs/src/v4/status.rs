@@ -164,6 +164,8 @@ pub enum Nfsstat4 {
   WrongCred = 10082,
   /// Format: `NFS4ERR_WRONG_TYPE` (RFC 7863 `nfsstat4`).
   WrongType = 10083,
+  /// Format: `NFS4ERR_DELEG_REVOKED` (RFC 7863 `nfsstat4`): a delegation the server revoked (§10.4.5).
+  DelegRevoked = 10087,
   /// Format: `NFS4ERR_NOXATTR` (RFC 8276 §8.3.1): the extended attribute is not set.
   Noxattr = 10095,
   /// Format: `NFS4ERR_XATTR2BIG` (RFC 8276 §8.3.2): the value, or the file's attributes, pass the limit.
@@ -215,7 +217,7 @@ impl Nfsstat4 {
 }
 
 /// Every status this enum defines, for [`Nfsstat4::from_wire`].
-const ALL: [Nfsstat4; 81] = [
+const ALL: [Nfsstat4; 82] = [
   Nfsstat4::Ok,
   Nfsstat4::Perm,
   Nfsstat4::Noent,
@@ -294,6 +296,7 @@ const ALL: [Nfsstat4; 81] = [
   Nfsstat4::NotOnlyOp,
   Nfsstat4::WrongCred,
   Nfsstat4::WrongType,
+  Nfsstat4::DelegRevoked,
   Nfsstat4::Noxattr,
   Nfsstat4::Xattr2big,
   Nfsstat4::UnionNotsupp,

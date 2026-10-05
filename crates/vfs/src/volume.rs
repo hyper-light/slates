@@ -94,6 +94,8 @@ pub struct Store {
   pub dir_cutover: usize,
   /// The inline-content threshold.
   pub inline_bytes: usize,
+  /// The inodes delegated to NFSv4 clients and the recalls changes to them asked for (A-79).
+  pub recall_gate: crate::recall_gate::RecallGate,
   /// The shard's byte budget (§4.2): the one capacity owner. A bounded volume's reservation and a
   /// dynamic volume's growth both go through it, so growth takes only unpromised capacity above the
   /// operation headroom and no two volumes get the same bytes. It lives here, with the store's arena
@@ -171,6 +173,7 @@ impl Store {
       content: ChunkStore::new(arena, config.page, config.max_chunks),
       dir_cutover: config.dir_cutover.max(1),
       inline_bytes: inline_bytes(config.cache_line).get(),
+      recall_gate: crate::recall_gate::RecallGate::default(),
       budget: ShardBudget::new(capacity, headroom),
       versions: VersionBudget::new(
         u64::try_from(config.max_inodes).unwrap_or(u64::MAX),
@@ -3728,6 +3731,11 @@ impl Volume {
     no: InodeNo,
   ) -> Result<Handle<Inode>, VfsError> {
     let handle = trie::get(&store.tries, self.inode_root, no).ok_or(VfsError::NotFound)?;
+    // A delegated file changes only once its delegation is returned or revoked (RFC 8881 §10.2; A-79): refused here,
+    // before anything is touched or marked, with its recall queued for the daemon.
+    if !store.recall_gate.is_open() && !store.recall_gate.admit(no.0) {
+      return Err(VfsError::Delegated);
+    }
     let (born, kind) = {
       let inode = store.inodes.get(handle)?;
       (inode.born, inode.kind)

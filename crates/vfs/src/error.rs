@@ -87,6 +87,10 @@ pub enum VfsError {
   /// The shard publishes before work whenever its free arena is below the operation headroom with blocks
   /// deferred, so only one operation larger than the headroom can meet this.
   PublishNeeded,
+  /// The file is delegated to an NFSv4 client (RFC 8881 §10.4; A-79): nothing changed, its recall was asked for, and
+  /// the change succeeds once the delegation is returned or revoked (the caller retries: `NFS3ERR_JUKEBOX`,
+  /// `NFS4ERR_DELAY`, `EAGAIN`).
+  Delegated,
   /// A snapshot, submit or detach barrier could not close an attachment's generation: a request
   /// admitted into it is still in flight — a consumer lost mid-request, until its explicit
   /// failed-consumer cleanup (§4.4 A-9 `BarrierIncomplete{attachment, generation}`; §4.6 "A
@@ -123,7 +127,7 @@ impl VfsError {
       Self::BaseUnavailable(_) | Self::BaseDrift | Self::RecoveryIncomplete => "EIO",
       Self::NotOverlay => "ENODEV",
       Self::DigestNotClean => "ENODATA",
-      Self::DigestUnverified | Self::PublishNeeded => "EAGAIN",
+      Self::DigestUnverified | Self::PublishNeeded | Self::Delegated => "EAGAIN",
       Self::DigestCacheFull => "ENOSPC",
       Self::PolicyMismatch => "EINVAL",
       Self::Memory(_) => "ENOMEM",
