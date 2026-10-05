@@ -47,6 +47,7 @@ use slates_client::{
 #[cfg(not(windows))]
 pub mod http;
 
+pub mod query;
 mod skills;
 
 #[cfg(not(windows))]
@@ -264,6 +265,7 @@ impl McpServer {
       "slates.merge.advance" => self.advance(&args),
       "slates.fs.read" => self.read(&args),
       "slates.fs.list" => self.list(&args),
+      "slates.query" => self.query(&args),
       "slates.volume.create" => self.create_volume(&args),
       "slates.volume.list" => self.list_volumes(),
       "slates.volume.stat" => self.stat_volume(&args),
@@ -428,6 +430,30 @@ impl McpServer {
       })
       .collect();
     Ok(json!({ "path": path, "entries": listed }))
+  }
+
+  fn query(&mut self, args: &Value) -> Result<Value, McpError> {
+    let text = string_arg(args, "text")?;
+    let answer =
+      query::run(&mut ClientSource(&mut self.client), &text).map_err(|failure| McpError {
+        code: match failure {
+          query::QueryError::Refused(_) => code::REFUSED,
+          _ => code::INVALID_PARAMS,
+        },
+        message: failure.to_string(),
+      })?;
+    let rows: Vec<Value> = answer
+      .rows
+      .iter()
+      .map(|row| Value::Array(row.iter().map(query::Cell::to_json).collect()))
+      .collect();
+    Ok(json!({
+      "columns": answer.columns,
+      "rows": rows,
+      "matched": answer.matched,
+      "visited": answer.visited,
+      "bytes_read": answer.bytes_read,
+    }))
   }
 
   fn rebase(&mut self, args: &Value) -> Result<Value, McpError> {
@@ -799,6 +825,17 @@ fn tool_list() -> Vec<Value> {
        the root.",
       json!({ "volume": string, "path": string, "version": integer, "attachment": integer }),
       json!(["volume"]),
+    ),
+    tool(
+      "slates.query",
+      "Codemode: one read-only query in place of many calls; only its answer comes back. \
+       FROM volumes() | files(\"VOL\"[, version = N][, under = \"dir\"]) | lines(\"VOL\" ...) | changed(\"VOL\", since = N) \
+       [WHERE cond] [SELECT cols] [ORDER BY col [DESC], ...] [LIMIT n]. Columns: volumes id,name,referenced,unique; \
+       files path,name,ext,dir,kind,size,content; lines path,line,text; changed path. Conditions: = != < <= > >= \
+       CONTAINS, STARTS WITH, ENDS WITH, GLOB (** spans directories), AND, OR, NOT. VOL is a volume id or name. \
+       Work ceilings refuse by name; narrow with WHERE, under =, LIMIT.",
+      json!({ "text": string }),
+      json!(["text"]),
     ),
     tool(
       "slates.merge.rebase",
@@ -1749,6 +1786,60 @@ fn span_json(s: &SpanRecord, chokepoints: &[ChokepointReport]) -> Value {
     "start_ns": s.start_ns,
     "end_ns": s.end_ns,
   })
+}
+
+/// The client's verbs as a query's source (`query::Source`).
+struct ClientSource<'a>(&'a mut Client);
+
+impl query::Source for ClientSource<'_> {
+  fn volumes(&mut self) -> Result<Vec<(VolumeId, String, u64, u64)>, String> {
+    self
+      .0
+      .list()
+      .map(|volumes| {
+        volumes
+          .into_iter()
+          .map(|volume| {
+            (
+              volume.id,
+              volume.name,
+              volume.referenced_bytes,
+              volume.unique_bytes,
+            )
+          })
+          .collect()
+      })
+      .map_err(|e| e.to_string())
+  }
+
+  fn list(
+    &mut self,
+    volume: VolumeId,
+    path: &str,
+    at: ReadAt,
+  ) -> Result<Vec<(String, slates_client::EntryKind, u64)>, String> {
+    self
+      .0
+      .list_dir(volume, path, at)
+      .map(|entries| {
+        entries
+          .into_iter()
+          .map(|e| (e.name, e.kind, e.size))
+          .collect()
+      })
+      .map_err(|e| e.to_string())
+  }
+
+  fn read(&mut self, volume: VolumeId, path: &str, at: ReadAt) -> Result<Vec<u8>, String> {
+    self.0.read(volume, path, at).map_err(|e| e.to_string())
+  }
+
+  fn changed(&mut self, green: VolumeId, since: u64) -> Result<Vec<String>, String> {
+    self
+      .0
+      .changed_since(green, since)
+      .map_err(|e| e.to_string())
+  }
 }
 
 /// The view a read or listing names: a green's `version`, the version an `attachment` pins, or the head.

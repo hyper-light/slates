@@ -9029,3 +9029,25 @@ Status: built 2026-10-05 (condition 13: what codemode queries and an agent witho
     at its version, an empty plain root, an unknown directory refused);
   - `a_plain_volume_lists_what_its_mount_wrote` (files written through the NFS mount, listed with their sizes);
   - unit tests of the cookie-group paging and the path-set children.
+
+### A-86 — Codemode: `slates.query` (2026-10-05)
+Applied in the same change to: `crates/mcp/src/query.rs` (new), `crates/mcp/src/lib.rs` (`slates.query`,
+`ClientSource`), `crates/mcp/tests/mcp.rs`, `skills/working-in-slates-volumes/SKILL.md`, GAPS.
+Status: built 2026-10-05 (condition 13's codemode).
+- Why: an agent surveying or searching a volume otherwise lists and reads file by file through many tool calls,
+  each answer entering its context. vorpal serves its graph through one read-only query language; Anthropic
+  measured server-side composition at 98.7% fewer tokens in one worked example and 37% fewer on complex research
+  (research/mcp-skills-sdks.md §2.2.5).
+- What: a small read-only language (`FROM volumes() | files(VOL…) | lines(VOL…) | changed(VOL, since = N)`,
+  `WHERE`, `SELECT`, `ORDER BY`, `LIMIT`; comparisons, `CONTAINS`, `STARTS WITH`, `ENDS WITH`, `GLOB`). It runs in
+  the MCP server over the client's verbs (`list_dir`, the paged `read`, `changed_since`) and is structurally
+  read-only. Ceilings are counted in work, never wall time, and refuse by name, never truncating:
+  - bytes read, one MCP message;
+  - entries visited, one message of minimal listing entries;
+  - the answer, Claude Code's 25,000-token output limit.
+  `content` is read only when a condition or column asks for it, and without `ORDER BY` a `LIMIT` stops the walk.
+- Proven:
+  - unit tests against an in-memory volume: filtering, selection and ordering; the early stop reading fewer files
+    than a full scan; glob semantics; every refusal and each ceiling by name;
+  - `assert_codemode_answers_one_query` on a live daemon (a ten-row answer from a 302-entry walk, a line search,
+    an unknown column refused as a tool-execution error).

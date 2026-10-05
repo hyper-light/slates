@@ -37,6 +37,19 @@ refusal from the daemon whose message names it, `-32001` the daemon is not runni
 - `slates.base.read_base`: a file as the base holds it, ignoring the volume's changes.
 - `slates.base.rewitness`: re-checks base entries; it returns the paths whose host file changed under you.
 
+## Survey or search with one query
+
+Rather than listing and reading file by file, ask `slates.query` once; only its answer comes back:
+
+```text
+FROM files("my-volume", under = "src") WHERE ext = "rs" AND content CONTAINS "unsafe" SELECT path, size ORDER BY size DESC LIMIT 20
+FROM lines("my-volume") WHERE text CONTAINS "TODO" SELECT path, line, text LIMIT 50
+```
+
+Sources are `volumes()`, `files(...)`, `lines(...)` and `changed("green", since = N)`; a volume is its id or its name.
+A query that would read or return too much is refused naming the ceiling: narrow it with `WHERE`, `under =` or
+`LIMIT`. `slates.fs.list` lists one directory.
+
 ## Attach
 
 `slates.attach.attach` gives an attachment id. Add `write: true` to take the volume's write lease. To hand the

@@ -692,6 +692,7 @@ fn the_mcp_surface_serves_the_tools() {
   assert_a_large_file_reads_whole(&mut server);
   assert_a_page_stamp_moves_with_the_file(&instance);
   assert_directories_list_across_pages(&mut server);
+  assert_codemode_answers_one_query(&mut server);
   assert_merge_loop(&mut server);
   assert_volume_lifecycle(&mut server);
   assert_attach_base(&mut server);
@@ -1348,4 +1349,39 @@ fn assert_directories_list_across_pages(server: &mut McpServer) {
     json!({ "volume": work, "path": "no/such" }),
   );
   assert!(!missing.is_empty());
+}
+
+/// §4.12 codemode (`slates.query`): do query the work `assert_directories_list_across_pages` built, by name: the
+/// files whose names start `file-number-029`, ordered; expect exactly those ten paths and the walk's work reported.
+/// Search its lines for `main`; expect the one line, with its number. Expect a query naming an unknown column refused
+/// as a tool-execution error.
+fn assert_codemode_answers_one_query(server: &mut McpServer) {
+  let answer = call(
+    server,
+    "slates.query",
+    json!({ "text": r#"FROM files("list-w") WHERE name STARTS WITH "file-number-029" SELECT path ORDER BY path"# }),
+  );
+  let paths: Vec<&str> = answer["rows"]
+    .as_array()
+    .unwrap()
+    .iter()
+    .map(|row| row[0].as_str().unwrap())
+    .collect();
+  let expected: Vec<String> = (290..300)
+    .map(|at| format!("file-number-{at:04}.txt"))
+    .collect();
+  assert_eq!(paths, expected);
+  assert!(answer["visited"].as_u64().unwrap() >= 302, "{answer}");
+  let lines = call(
+    server,
+    "slates.query",
+    json!({ "text": r#"FROM lines("list-w", under = "src") WHERE text CONTAINS "main" SELECT path, line"# }),
+  );
+  assert_eq!(lines["rows"], json!([["src/main.rs", 1]]));
+  let refused = call_refused(
+    server,
+    "slates.query",
+    json!({ "text": r#"FROM files("list-w") SELECT nope"# }),
+  );
+  assert!(refused.contains("nope"), "{refused}");
 }
