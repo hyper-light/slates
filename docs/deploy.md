@@ -157,11 +157,15 @@ capability its path carries.
      capacity: {storage: 64Mi}
      accessModes: [ReadWriteMany]
      storageClassName: ""
-     mountOptions: [nfsvers=4.2, xprtsec=mtls, port=7000]
+     mountOptions: [nfsvers=4.2, xprtsec=mtls, port=7000, nosuid, nodev]
      nfs:
        server: <export.clusterIP>
        path: <the path `slates export` printed>
    ```
+
+Keep `nosuid` and `nodev`. Every pod that claims the volume shares it, so without them a root process in one pod can
+plant a root-owned setuid binary that runs as root for an unprivileged user in another (measured on a Linux NFSv4.2
+mount of a slates volume, 2026-10-05). The mounts slates makes itself (`slates mount`, the OCI binding) carry both.
 
 `slates detach` of the export's attachment, or the volume's destroy, ends what the path reaches. The KIND
 lane's `cargo xtask kind export` runs this whole flow on a cluster.

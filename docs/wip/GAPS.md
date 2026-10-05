@@ -3659,3 +3659,9 @@ successor's wrapped key in the head record; the idle-RAM measurement and its dec
 SecP384r1MLKEM1024 between nodes once hyper-raft measures it.
 
 SecP384r1MLKEM1024 between nodes is built (A-93), interoperating with OpenSSL 3.5.7 both ways.
+
+Condition 4, 2026-10-05: a setuid binary planted on a shared volume ran as root through a PersistentVolume mount
+without `nosuid`. Every mount slates makes or documents is now `nosuid,nodev` (A-94;
+docs/bugs/2026-10-05-setuid-through-a-shared-volume.md). The KIND lane's check runs only where the kernel has TLS
+(GitHub's Linux runner), so its first run is owed there.
+

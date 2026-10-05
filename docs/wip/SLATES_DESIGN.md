@@ -9329,3 +9329,21 @@ group first).
 - Cost: hyper-raft measured about 0.25 ms of CPU more per handshake than X25519 first, and on lossy paths a first fresh
   reply at p90 136 ms against 180 ms (mantle's report, 2026-10-05, not reproduced here); a fleet session handshakes
   once per connection, so it is off every request path.
+
+### A-94 — Every mount of a volume is nosuid and nodev (2026-10-05)
+Applied in the same change to: `crates/cli/src/mount.rs`, `crates/cli/examples/slates_mount.rs`,
+`crates/bridge-oci/src/binding.rs`, `xtask/src/kind_export.rs`, `docs/deploy.md`, the tests named in
+`docs/bugs/2026-10-05-setuid-through-a-shared-volume.md`, GAPS.
+Status: built 2026-10-05 (condition 4).
+- What: a volume is shared between writers and readers, so no mount of it may honour a setuid or setgid bit or open a
+  device node. `slates mount` asks for both flags whoever runs it (macOS `MNT_NOSUID | MNT_NODEV`; Linux FUSE was
+  already `nosuid,nodev` as root, measured). The OCI binding entry states them. The PersistentVolume the operator
+  writes carries them, and the KIND lane checks the kernel's own flags for kubelet's mount. The daemon keeps refusing
+  device nodes (NFS4ERR_BADTYPE).
+- Why: a root-owned setuid `id` planted on a volume mounted as the documented PersistentVolume did (no `nosuid`) ran as
+  uid 0 for `nobody`; with `nosuid,nodev` it ran as 65534. This is the reason `nosuid` and `nodev` exist as mount
+  flags (mount(8)); exports(5) also defaults to `root_squash` for the same threat. slates does not squash root: a
+  container's root installing packages into a volume must own what it makes (A-73's identity rule), and the mount
+  flags close the escalation without changing ownership.
+- Rejected: stripping setuid and setgid bits in the daemon. It would break a root filesystem built inside a volume
+  (`sudo` installed by `dpkg` must stay setuid there) and still leave the mount honouring bits that arrive another way.

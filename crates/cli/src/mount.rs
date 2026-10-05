@@ -83,7 +83,7 @@ pub(crate) fn backend() -> MountBackend {
 /// returned, the bearer authority the daemon validates every request's file handle against; a mount
 /// path with no capability reaches nothing): the design's options (§4.6 — NFSv3 over TCP, the explicit
 /// `port`/`mountport` so no portmap query is needed, `soft,intr` so a wedged mount is escapable,
-/// `locallocks`, `nosuid`, `rdirplus`), plus `noresvport` for the unprivileged mount (R10) and the
+/// `locallocks`, `nosuid`, `nodev`, `rdirplus`), plus `noresvport` for the unprivileged mount (R10) and the
 /// derived attribute-cache timeout, and `rdonly` for a read-only mount (the kernel refuses writes at the
 /// mount, as the daemon does under the read-only capability). slates serves NFS and MOUNT on one port,
 /// so `port` and `mountport` are the same. The export is
@@ -99,7 +99,7 @@ fn mount_args(
 ) -> Vec<String> {
   let access = if read_only { ",rdonly" } else { "" };
   let options = format!(
-    "vers=3,tcp,port={port},mountport={port},noresvport,soft,intr,locallocks,nosuid,rdirplus,\
+    "vers=3,tcp,port={port},mountport={port},noresvport,soft,intr,locallocks,nosuid,nodev,rdirplus,\
      actimeo={ATTR_CACHE_SECONDS}{access}"
   );
   vec![
@@ -186,15 +186,22 @@ fn mount_volume(
     MOUNT_CALL_DEADLINE,
   )
   .map_err(|e| Failure::Failed(format!("mounting {name}: {e}")))?;
-  let mut mnt_flags = libc::MNT_NOSUID;
+  // `nosuid` and `nodev` whoever mounts (condition 4): a volume is shared, so a setuid binary or a device node one
+  // writer plants must not run or open with its privilege for another. xnu adds both for an unprivileged caller only.
+  let mut mnt_flags = libc::MNT_NOSUID | libc::MNT_NODEV;
   if read_only {
     mnt_flags |= libc::MNT_RDONLY;
   }
+  let mnt_flags_word = u32::try_from(mnt_flags).map_err(|_| {
+    Failure::Failed(format!(
+      "mounting {name}: mount flags {mnt_flags:#x} out of range"
+    ))
+  })?;
   let args = MountArgs {
     port,
     handle,
     attr_cache_seconds: ATTR_CACHE_SECONDS,
-    mnt_flags: u32::try_from(mnt_flags).unwrap_or(0),
+    mnt_flags: mnt_flags_word,
     mnt_from: format!("slates:/{name}"),
     path: vec![name.to_owned()],
   }

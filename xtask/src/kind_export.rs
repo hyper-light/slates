@@ -15,8 +15,9 @@
 //!    cluster is created that mounts the client material into its nodes for `tlshd`.
 //! 4. The chart is installed with one replica, the authority and the export Service. The group is
 //!    bootstrapped, a volume created, and `slates export` prints its path.
-//! 5. A PersistentVolume names the export (`nfsvers=4.2,xprtsec=mtls`), and a pod writes a file through
-//!    kubelet's mount. A second pod, a fresh mount, must read exactly those bytes.
+//! 5. A PersistentVolume names the export (`nfsvers=4.2,xprtsec=mtls,nosuid,nodev`), and a pod writes a file
+//!    through kubelet's mount. A second pod, a fresh mount, must read exactly those bytes, and the kernel must
+//!    list its mount `nosuid,nodev`.
 //!
 //! On any failure the pods' events and the node's `tlshd` journal are printed before the cluster is deleted.
 
@@ -263,12 +264,32 @@ fn prove(lane: &Lane) -> Result<(), Failure> {
     "slates-writer",
     &format!("printf '{PAYLOAD}' > /data/hello.txt && cat /data/hello.txt"),
   )?;
-  let read = lane.workload("slates-reader", "cat /data/hello.txt")?;
-  if written.trim() != PAYLOAD || read.trim() != PAYLOAD {
+  let read = lane.workload(
+    "slates-reader",
+    "cat /data/hello.txt && echo && grep ' /data ' /proc/self/mountinfo",
+  )?;
+  let mut lines = read.lines();
+  let read_bytes = lines.next().unwrap_or("");
+  if written.trim() != PAYLOAD || read_bytes.trim() != PAYLOAD {
     return Err(Failure(format!(
       "kind export: the bytes did not round-trip through kubelet's mounts: wrote {written:?}, a fresh mount read {read:?}"
     )));
   }
+  // Condition 4: kubelet's mount is `nosuid,nodev` (the PersistentVolume's `mountOptions`), so a setuid binary or a
+  // device node one pod plants on the shared volume runs or opens with no privilege in another. The kernel's own
+  // per-mount options (mountinfo's sixth field) are the evidence, not the manifest.
+  let mount_options = lines
+    .find_map(|line| line.split(' ').nth(5))
+    .unwrap_or("")
+    .to_owned();
+  for flag in ["nosuid", "nodev"] {
+    if !mount_options.split(',').any(|option| option == flag) {
+      return Err(Failure(format!(
+        "kind export: kubelet's mount of the volume is not {flag}: {mount_options:?}"
+      )));
+    }
+  }
+  eprintln!("kind export: kubelet's mount is {mount_options}");
   eprintln!(
     "kind export: kubelet mounted the volume over RPC-with-TLS; a second mount read the bytes the first wrote"
   );
@@ -289,7 +310,7 @@ spec:
   accessModes: [ReadWriteMany]
   persistentVolumeReclaimPolicy: Retain
   storageClassName: \"\"
-  mountOptions: [nfsvers=4.2, xprtsec=mtls, port={port}]
+  mountOptions: [nfsvers=4.2, xprtsec=mtls, port={port}, nosuid, nodev]
   nfs:
     server: {EXPORT_CLUSTER_IP}
     path: {path}

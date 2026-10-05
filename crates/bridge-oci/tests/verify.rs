@@ -205,9 +205,15 @@ fn the_runtime_entry_carries_the_attachment_policy() {
   assert_eq!(read_only.source, "/private/var/folders/1s/T/tmp.abc");
   assert_eq!(read_only.destination, "/work");
   assert_eq!(read_only.mount_type(), "bind");
-  assert_eq!(read_only.options(), ["bind", "ro", "private"]);
+  assert_eq!(
+    read_only.options(),
+    ["bind", "ro", "private", "nosuid", "nodev"]
+  );
   let read_write = OciMountEntry::new(&verified, "/work", false).unwrap();
-  assert_eq!(read_write.options(), ["bind", "rw", "private"]);
+  assert_eq!(
+    read_write.options(),
+    ["bind", "rw", "private", "nosuid", "nodev"]
+  );
   assert_eq!(
     OciMountEntry::new(&verified, "work", false),
     Err(DestinationRefusal::NotAbsolute)

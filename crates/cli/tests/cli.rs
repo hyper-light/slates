@@ -362,6 +362,24 @@ fn mount_and_check(instance: &str, id: &str, path: &str) {
   );
   assert!(is_mounted(path), "the kernel mount table lists the mount");
   mount_table_hides_the_capability(path);
+  #[cfg(target_os = "macos")]
+  the_macos_mount_is_nosuid_and_nodev(path);
+}
+
+/// Condition 4 (no escape through a volume): the macOS mount is `nosuid` and `nodev` (the mount table's own words), so
+/// a setuid binary or a device node one writer plants on a shared volume runs or opens with no privilege for another.
+/// xnu adds both for an unprivileged caller by itself; `slates mount` asks for them whoever runs it (2026-10-05).
+#[cfg(target_os = "macos")]
+fn the_macos_mount_is_nosuid_and_nodev(path: &str) {
+  let out = Command::new("mount").output().unwrap();
+  let table = String::from_utf8_lossy(&out.stdout);
+  let line = table
+    .lines()
+    .find(|line| line.contains(path))
+    .expect("the mount is listed");
+  for flag in ["nosuid", "nodev"] {
+    assert!(line.contains(flag), "the mount is {flag}: {line}");
+  }
 }
 
 /// Shape: how long a forged `UMNT` is watched for effect: three times the daemon's one-liveness-budget
@@ -2559,7 +2577,7 @@ fn assert_verified_binding(binding: &serde_json::Value, mount: &str, volume_name
   assert_eq!(entry["type"], "bind");
   assert_eq!(
     entry["options"],
-    serde_json::json!(["bind", "rw", "private"])
+    serde_json::json!(["bind", "rw", "private", "nosuid", "nodev"])
   );
 }
 
@@ -2720,7 +2738,7 @@ fn assert_read_only_bind(instance: &str, id: &str, path: &str) -> serde_json::Va
   let read_only_entry = &reader["established"]["binding"]["mount"];
   assert_eq!(
     read_only_entry["options"],
-    serde_json::json!(["bind", "ro", "private"])
+    serde_json::json!(["bind", "ro", "private", "nosuid", "nodev"])
   );
   assert_eq!(reader["established"]["binding"]["read_only"], true);
   let (code, _, err) = oci_check(instance, &reader);
@@ -3480,6 +3498,74 @@ fn fuse_mount_and_check(instance: &str, id: &str, path: &str) {
     "the source names the attachment: {source}"
   );
   assert_eq!(attachments_of(instance, id), "1");
+  the_mount_honours_no_setuid_and_no_device(path);
+}
+
+/// The kernel's per-mount options at `path` (Linux `mountinfo`, the sixth field: `rw,nosuid,nodev,...`).
+#[cfg(target_os = "linux")]
+fn mount_options_at(path: &str) -> Option<String> {
+  let table = std::fs::read_to_string("/proc/self/mountinfo").unwrap();
+  table.lines().find_map(|line| {
+    let mut fields = line.split(' ');
+    (fields.nth(4)? == path).then(|| fields.next().unwrap_or("").to_owned())
+  })
+}
+
+/// Condition 4 (no escape through a volume), 2026-10-05. A volume is shared: one writer may plant a root-owned setuid
+/// binary or a device node in it for another consumer to run or open. Do: read the kernel's own flags for a `slates
+/// mount`; then, as root, mount the volume `--shared` (so another user can reach it at all — an unshared FUSE mount
+/// refuses every other user outright), write a root-owned setuid copy of `id` and run it as `nobody`. Expect: the
+/// mount is `nosuid` and `nodev`, and the binary reports `nobody`'s uid, never 0. On a root-mounted NFSv4.2 volume
+/// with no `nosuid` (the PersistentVolume `docs/deploy.md` printed until this change), the same binary ran as uid 0.
+#[cfg(target_os = "linux")]
+fn the_mount_honours_no_setuid_and_no_device(path: &str) {
+  let options = mount_options_at(path).expect("the kernel lists the mount");
+  for flag in ["nosuid", "nodev"] {
+    assert!(
+      options.split(',').any(|option| option == flag),
+      "the mount is {flag}: {options}"
+    );
+  }
+}
+
+/// The setuid probe of [`the_mount_honours_no_setuid_and_no_device`], on its own `--shared` mount; root only (it makes
+/// a root-owned binary), a loud skip otherwise.
+#[cfg(target_os = "linux")]
+fn a_setuid_root_binary_on_a_shared_mount_runs_as_its_caller(instance: &str, id: &str) {
+  if !rustix::process::geteuid().is_root() {
+    eprintln!("SKIP: the setuid probe needs root to make a root-owned binary");
+    return;
+  }
+  let point = MountPoint {
+    path: fresh_mount_point(),
+  };
+  let path = point.path.clone();
+  let (code, _, err) = run(instance, &["mount", id, &path, "--shared"]);
+  assert_eq!(code, 0, "slates mount --shared: {err}");
+  the_mount_honours_no_setuid_and_no_device(&path);
+  let planted = format!("{path}/planted-id");
+  shell(&format!(
+    "chmod 755 {path} && cp /usr/bin/id {planted} && chmod 4755 {planted}"
+  ));
+  let nobody = Command::new("id").args(["-u", "nobody"]).output().unwrap();
+  let nobody = String::from_utf8_lossy(&nobody.stdout).trim().to_owned();
+  let out = Command::new("su")
+    .args(["-s", "/bin/sh", "nobody", "-c", &format!("{planted} -u")])
+    .output()
+    .unwrap();
+  let uid = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+  eprintln!(
+    "the planted setuid-root binary ran as uid {uid:?} ({})",
+    String::from_utf8_lossy(&out.stderr).trim()
+  );
+  assert_eq!(
+    uid, nobody,
+    "a setuid-root binary on the volume runs as its caller, never root"
+  );
+  shell(&format!("rm {planted}"));
+  let (code, _, err) = run(instance, &["unmount", &path]);
+  assert_eq!(code, 0, "{err}");
+  drop(point);
 }
 
 /// AUD-29-64 (`slates mount` on Linux). Do: through the real binary against a real anchor-supervised
@@ -3517,6 +3603,7 @@ fn slates_mount_on_linux_serves_a_fuse_mount_and_unmount_ends_it() {
     wait_for(|| attachments_of(&instance, &id) == "0"),
     "the daemon ended the mount's attachment"
   );
+  a_setuid_root_binary_on_a_shared_mount_runs_as_its_caller(&instance, &id);
   drop(anchor);
 }
 

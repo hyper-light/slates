@@ -102,11 +102,11 @@ fn connect(instance: &str) -> Client {
 
 /// The exact `mount_nfs` options `slates mount` builds (`crates/cli/src/mount.rs::mount_args`): NFSv3
 /// over TCP, the daemon's port for both NFS and MOUNT (one server), `noresvport` for the unprivileged
-/// mount (R10), `soft,intr` so a wedged mount is escapable, `locallocks,nosuid,rdirplus`, and
+/// mount (R10), `soft,intr` so a wedged mount is escapable, `locallocks,nosuid,nodev,rdirplus`, and
 /// `actimeo=1` (the derived attribute-cache timeout).
 fn mount_options(port: u16) -> String {
   format!(
-    "vers=3,tcp,port={port},mountport={port},noresvport,soft,intr,locallocks,nosuid,rdirplus,\
+    "vers=3,tcp,port={port},mountport={port},noresvport,soft,intr,locallocks,nosuid,nodev,rdirplus,\
      actimeo=1"
   )
 }

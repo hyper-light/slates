@@ -2,7 +2,7 @@
 //! established host attachment into the container mount namespace"): a bind mount of the verified
 //! host mount point at a destination inside the container, read-only for a read attachment. The
 //! vocabulary is the OCI runtime specification's (`config.md`, "Mounts", the Linux bind form:
-//! `{"destination", "type": "bind", "source", "options": ["bind", "ro"|"rw", "private"]}`); the field
+//! `{"destination", "type": "bind", "source", "options": ["bind", "ro"|"rw", "private", "nosuid", "nodev"]}`); the field
 //! names and option words are quoted from memory of the specification and flagged for verification in
 //! `docs/wip/oci-handoff.md`. Docker's equivalent is `--mount type=bind,source=…,destination=…,
 //! bind-recursive=disabled,bind-propagation=private[,readonly]` (never `-v`, which binds recursively and
@@ -12,6 +12,11 @@
 //! mount beneath it rides along (the verifier refuses a source that has one) — with **private**
 //! propagation, so a mount made later beneath the source on the host does not appear in the container, and
 //! `ro` makes the whole bound view read-only, since nothing beneath it is bound.
+//!
+//! The bind is also `nosuid` and `nodev` (condition 4, 2026-10-05): a volume is shared between writers and readers, so
+//! one consumer could plant a root-owned setuid binary or a device node for another to run or open. The host mount
+//! slates makes is already `nosuid,nodev` (a bind clones its source's flags), and the runtime is told so again in the
+//! entry it applies, so the container's view does not depend on how the source happened to be mounted.
 
 use crate::verify::VerifiedHostMount;
 
@@ -26,6 +31,10 @@ pub const OPTION_PRIVATE: &str = "private";
 pub const OPTION_RO: &str = "ro";
 /// Format: the read-write option.
 pub const OPTION_RW: &str = "rw";
+/// Format: the option that makes the kernel ignore setuid and setgid bits under the bind.
+pub const OPTION_NOSUID: &str = "nosuid";
+/// Format: the option that makes the kernel refuse to open device nodes under the bind.
+pub const OPTION_NODEV: &str = "nodev";
 
 /// Why a destination cannot be honoured.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -67,13 +76,15 @@ impl OciMountEntry {
     MOUNT_TYPE
   }
 
-  /// The entry's `options`: the non-recursive bind, `ro` or `rw`, and private propagation.
+  /// The entry's `options`: the non-recursive bind, `ro` or `rw`, private propagation, `nosuid` and `nodev`.
   pub fn options(&self) -> Vec<String> {
     let access = if self.read_only { OPTION_RO } else { OPTION_RW };
     vec![
       OPTION_BIND.to_owned(),
       access.to_owned(),
       OPTION_PRIVATE.to_owned(),
+      OPTION_NOSUID.to_owned(),
+      OPTION_NODEV.to_owned(),
     ]
   }
 }
