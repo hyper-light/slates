@@ -1704,3 +1704,27 @@ volumes until one lands off the listener's shard; load average 15–25):
 | reopen: queue + RTT | 2.20 ms | 0.80 / 0.78 / 0.62 ms | 0.77 / 0.77 / 0.64 ms |
 | v3 calls forwarded | 334,133 | 2 (before the move) | 0 |
 
+### A Rust build in a Docker container over NFSv4.2 (2026-10-04)
+
+**Command:** `bash e2e-docker-rust.sh` (scratch, with this record's session). Same daemon and Docker `type=nfs` volume
+as above. In `rust:1.98.0`, with the repository mounted read-only and the host's cargo registry read-only
+(`CARGO_HOME` in the container, `CARGO_NET_OFFLINE`): copy slates' workspace (about 100 MB, 82 MB of it vendored
+crates) onto the volume, `cargo build -p slates-vfs` with `CARGO_TARGET_DIR` on the volume, a no-op rebuild, and a
+rebuild after touching `crates/vfs/src/lib.rs`. Apple M5 Max, load average 15–17, at `45361be`.
+
+| step (ms) | slates NFSv4.2 | host-directory bind | container overlay |
+|---|---|---|---|
+| copy the workspace | 11,288 / 6,092 | 3,988 | 1,332 |
+| `cargo build -p slates-vfs` | 10,435 / 8,507 | 11,973 | 6,883 |
+| no-op rebuild | 419 / 223 | 10,852 | 105 |
+| rebuild after a touch | 1,913 / 1,216 | 7,138 | 397 |
+
+- **slates against the host bind:** every build step is faster on slates. Through Docker Desktop's share the no-op
+  rebuild recompiles everything, consistent with cargo's mtime fingerprints not holding over that share.
+- **Where the copy's time goes:** about ten round trips per file (`cp -a` sends 3.4 SETATTRs per file), each
+  0.3–0.4 ms through Docker Desktop's VM-to-host path, against a 3–5 µs serve (`nfs.local_p50_ns`). Copy-only
+  WRITE: 0.41 ms per call (queue 0.035, RTT 0.37).
+- **Where the build's writes go:** 4,178 WRITEs carried 746 MB (about 180 KB each) at 2.99 ms per call. That is
+  queue and RTT while the build saturates the VM's CPUs; the same path streams a 256 MiB `dd … conv=fsync` in
+  197–216 ms (1.3 GB/s), against 1.6–2.7 s on the host bind.
+
