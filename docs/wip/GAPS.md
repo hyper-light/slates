@@ -3535,3 +3535,12 @@ shard's own clock that A-65 budgets in (docs/bugs/2026-10-04-the-slow-observatio
   removes two thread wakes per v3 call whenever the volume is not on the listener's shard.
 - **Owed:** the dynamic slot target (RFC 8881 §2.10.6.1) for long-round-trip clients.
 
+### 2026-10-04: NFSv4 locks and shares across two mounts (fixed); delegation records (B-2 started)
+
+- **Fixed:** opens, share reservations and byte-range locks are keyed by the file's identity, not the handle bytes
+  that carry each mount's capability (`docs/bugs/2026-10-04-two-mounts-of-a-file-never-met-in-the-lock-table.md`).
+- **B-2 started:** durable delegation records in the partition (`NfsDelegationRecord`, `Op::NfsDelegationSet` and
+  `NfsDelegationCleared`, appended; in the snapshot; purged with the client; the db model test's histories carry
+  them). Owed: the file-state table's delegations, the grant on OPEN, `DELEGRETURN`, `CLAIM_DELEGATE_CUR`, and B-3's
+  recalls. Grants stay off until recalls cover every mutation path.
+

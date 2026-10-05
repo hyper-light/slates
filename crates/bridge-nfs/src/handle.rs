@@ -115,6 +115,26 @@ impl FileHandle {
   }
 }
 
+/// The identity of the object a handle names, without the mount capability it is served under: the handle re-encoded
+/// with no capability. Two mounts of one volume (two attachments) name one file with two handles; its NFSv4 opens,
+/// share reservations and byte-range locks are the file's, so they are keyed by this identity, never by the handle's
+/// bytes (2026-10-04: keyed by the bytes, two mounts' locks never met). A handle this daemon did not mint keeps its
+/// own bytes.
+pub fn identity(fh: &Nfsfh3) -> Vec<u8> {
+  match FileHandle::from_fh(fh) {
+    Ok(handle) => {
+      FileHandle {
+        attachment: 0,
+        token: [0; 16],
+        ..handle
+      }
+      .to_fh()
+      .0
+    }
+    Err(_) => fh.0.clone(),
+  }
+}
+
 /// Reads a big-endian `u64` from exactly eight bytes; the length is checked by the caller, so a
 /// short slice is the malformed refusal rather than a panic.
 fn read_u64(bytes: &[u8]) -> Result<u64, FileHandleError> {

@@ -7,6 +7,7 @@
 //! lock-owner); this module is pure, so its rules are tested against a byte-level model on every
 //! generated history.
 
+use crate::handle::identity;
 use std::collections::BTreeMap;
 
 use super::Nfsstat4;
@@ -280,10 +281,11 @@ impl LockTable {
     range: Range,
     kind: LockKind,
   ) -> Option<Denied> {
+    let file = identity(fh);
     self
       .by_owner
-      .range((fh.0.clone(), 0, Vec::new())..)
-      .take_while(|((file, _, _), _)| *file == fh.0)
+      .range((file.clone(), 0, Vec::new())..)
+      .take_while(|((held, _, _), _)| *held == file)
       .filter(|((_, holder, holder_owner), _)| {
         (*holder, holder_owner.as_slice()) != (clientid, owner)
       })
@@ -310,7 +312,7 @@ impl LockTable {
     fh: &Nfsfh3,
     open: Other,
   ) -> Result<Other, Nfsstat4> {
-    let key: LockKey = (fh.0.clone(), clientid, owner);
+    let key: LockKey = (identity(fh), clientid, owner);
     if let Some(other) = self.by_owner.get(&key) {
       return Ok(*other);
     }
@@ -343,7 +345,7 @@ impl LockTable {
     clientid: Option<u64>,
   ) -> Result<&LockState, Nfsstat4> {
     let state = self.table.get(&stateid.other).ok_or(Nfsstat4::BadStateid)?;
-    if state.fh != *fh || Some(state.clientid) != clientid {
+    if identity(&state.fh) != identity(fh) || Some(state.clientid) != clientid {
       return Err(Nfsstat4::BadStateid);
     }
     match stateid.seqid {
@@ -440,7 +442,7 @@ impl LockTable {
   /// [`Self::set_ranges`] refuse new state until the charge is back under the bound.
   pub fn restore_kept(&mut self, other: Other, state: LockState) {
     self.by_owner.insert(
-      (state.fh.0.clone(), state.clientid, state.owner.clone()),
+      (identity(&state.fh), state.clientid, state.owner.clone()),
       other,
     );
     self.table.insert(other, state);
@@ -450,7 +452,7 @@ impl LockTable {
     if let Some(state) = self.table.remove(other) {
       self
         .by_owner
-        .remove(&(state.fh.0, state.clientid, state.owner));
+        .remove(&(identity(&state.fh), state.clientid, state.owner));
     }
   }
 }

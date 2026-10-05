@@ -693,6 +693,22 @@ pub struct NfsOpenRecord {
   pub seqid: u32,
 }
 
+/// An NFSv4 delegation held at its file's owner (RFC 8881 §10.4; §4.6 A-78): durable, as an open is (A-37), because
+/// the anchor keeps a mount across a daemon restart and a client keeps trusting its cache while it holds one.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct NfsDelegationRecord {
+  /// The delegation state id's `other`.
+  pub other: [u8; 12],
+  /// The client holding it.
+  pub clientid: u64,
+  /// The file handle it delegates.
+  pub fh: Vec<u8>,
+  /// Whether it is a write delegation (`OPEN_DELEGATE_WRITE`); a read delegation otherwise.
+  pub write: bool,
+  /// The state id's current seqid.
+  pub seqid: u32,
+}
+
 /// One byte range of an NFSv4 lock state: `[start, end)`, `end == u64::MAX` reaching the file's end.
 #[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NfsLockRange {

@@ -20,8 +20,9 @@ use slates_wire::request::{ClientWindow, Seen};
 use crate::Art;
 use crate::catalog::{
   AttachmentRecord, AuditRecord, CompletionRecord, Consumer, ConsumerRecord, GrantRecord,
-  LandingLeaseRecord, LandingRecord, LeaseRecord, LineageEdge, NfsClientRecord, NfsLockRecord,
-  NfsOpenRecord, Principal, SnapshotId, SnapshotRecord, Tombstone, VolumeId, VolumeRecord,
+  LandingLeaseRecord, LandingRecord, LeaseRecord, LineageEdge, NfsClientRecord,
+  NfsDelegationRecord, NfsLockRecord, NfsOpenRecord, Principal, SnapshotId, SnapshotRecord,
+  Tombstone, VolumeId, VolumeRecord,
 };
 use crate::error::DbError;
 use crate::op::Op;
@@ -116,6 +117,8 @@ pub struct PartitionSnapshot {
   /// The destroyed volumes whose tombstone is still owed to their candidate holders, by volume order
   /// (AUD-29-43; appended for append-only evolution).
   pub tombstones: Vec<Tombstone>,
+  /// The NFSv4 delegations held at this partition's files, by `other` (§4.6 A-78; appended).
+  pub nfs_delegations: Vec<NfsDelegationRecord>,
 }
 
 /// The partition.
@@ -155,6 +158,7 @@ pub struct Partition {
   /// owner's file state bounds its opens and locks, the listener's session table its clients, and a
   /// replay reproduces only what they admitted.
   nfs_opens: BTreeMap<[u8; 12], NfsOpenRecord>,
+  nfs_delegations: BTreeMap<[u8; 12], NfsDelegationRecord>,
   nfs_locks: BTreeMap<[u8; 12], NfsLockRecord>,
   nfs_clients: BTreeMap<u64, NfsClientRecord>,
   nfs_instance: u32,
@@ -203,6 +207,7 @@ impl Partition {
       grants: BTreeMap::new(),
       consumers: BTreeMap::new(),
       nfs_opens: BTreeMap::new(),
+      nfs_delegations: BTreeMap::new(),
       nfs_locks: BTreeMap::new(),
       nfs_clients: BTreeMap::new(),
       nfs_instance: 0,
@@ -463,6 +468,11 @@ impl Partition {
     self.nfs_opens.values()
   }
 
+  /// The NFSv4 delegations recorded at this partition's files (§4.6 A-78).
+  pub fn nfs_delegations(&self) -> impl Iterator<Item = &NfsDelegationRecord> {
+    self.nfs_delegations.values()
+  }
+
   /// The NFSv4 lock states held at this partition's files.
   pub fn nfs_locks(&self) -> impl Iterator<Item = &NfsLockRecord> {
     self.nfs_locks.values()
@@ -487,6 +497,12 @@ impl Partition {
       Op::NfsOpenCleared { other } => {
         self.nfs_opens.remove(other);
       }
+      Op::NfsDelegationSet { record } => {
+        self.nfs_delegations.insert(record.other, record.clone());
+      }
+      Op::NfsDelegationCleared { other } => {
+        self.nfs_delegations.remove(other);
+      }
       Op::NfsLockSet { record } => {
         self.nfs_locks.insert(record.other, record.clone());
       }
@@ -499,6 +515,9 @@ impl Partition {
           .retain(|_, record| record.clientid != *clientid);
         self
           .nfs_locks
+          .retain(|_, record| record.clientid != *clientid);
+        self
+          .nfs_delegations
           .retain(|_, record| record.clientid != *clientid);
       }
       Op::NfsClientSet { record } => {
@@ -669,6 +688,8 @@ impl Partition {
       // The NFSv4 records mirror state their owner already bounded and admitted (A-37).
       Op::NfsOpenSet { .. }
       | Op::NfsOpenCleared { .. }
+      | Op::NfsDelegationSet { .. }
+      | Op::NfsDelegationCleared { .. }
       | Op::NfsLockSet { .. }
       | Op::NfsLockCleared { .. }
       | Op::NfsClientStateCleared { .. }
@@ -893,6 +914,8 @@ impl Partition {
       }
       Op::NfsOpenSet { .. }
       | Op::NfsOpenCleared { .. }
+      | Op::NfsDelegationSet { .. }
+      | Op::NfsDelegationCleared { .. }
       | Op::NfsLockSet { .. }
       | Op::NfsLockCleared { .. }
       | Op::NfsClientStateCleared { .. }
@@ -1210,6 +1233,7 @@ impl Partition {
       audit: self.audit.clone(),
       consumers: self.consumers.values().cloned().collect(),
       nfs_opens: self.nfs_opens.values().cloned().collect(),
+      nfs_delegations: self.nfs_delegations.values().cloned().collect(),
       nfs_locks: self.nfs_locks.values().cloned().collect(),
       nfs_clients: self.nfs_clients.values().cloned().collect(),
       nfs_instance: self.nfs_instance,
@@ -1249,6 +1273,9 @@ impl Partition {
   fn restore_nfs(&mut self, snapshot: &PartitionSnapshot) {
     for record in &snapshot.nfs_opens {
       self.nfs_opens.insert(record.other, record.clone());
+    }
+    for record in &snapshot.nfs_delegations {
+      self.nfs_delegations.insert(record.other, record.clone());
     }
     for record in &snapshot.nfs_locks {
       self.nfs_locks.insert(record.other, record.clone());

@@ -12,6 +12,7 @@
 //! lock state) followed by the owner's tag (its partition and boot instance), so ids minted by two
 //! owners, or by one owner before and after a restart, never collide.
 
+use crate::handle::identity;
 use std::collections::BTreeMap;
 
 use super::Nfsstat4;
@@ -395,7 +396,7 @@ impl FileState {
     for record in opens {
       let fh = Nfsfh3(record.fh);
       state.by_file.insert(
-        (fh.0.clone(), record.clientid, record.owner.clone()),
+        (identity(&fh), record.clientid, record.owner.clone()),
         record.other,
       );
       state.opens.insert(
@@ -501,11 +502,12 @@ impl FileState {
     fh: &Nfsfh3,
     share: Share,
   ) -> Result<Stateid, Nfsstat4> {
-    let key: OpenKey = (fh.0.clone(), clientid, owner);
+    let file = identity(fh);
+    let key: OpenKey = (file.clone(), clientid, owner);
     let conflicts = self
       .by_file
-      .range((fh.0.clone(), 0, Vec::new())..)
-      .take_while(|((file, _, _), _)| *file == fh.0)
+      .range((file.clone(), 0, Vec::new())..)
+      .take_while(|((held, _, _), _)| *held == file)
       .filter(|(other_key, _)| **other_key != key)
       .filter_map(|(_, other)| self.opens.get(other))
       .any(|other| share.access & other.share.deny != 0 || share.deny & other.share.access != 0);
@@ -546,7 +548,7 @@ impl FileState {
   /// `NFS4ERR_BAD_STATEID`, §8.2.2).
   fn check_open(&self, stateid: &Stateid, fh: &Nfsfh3, clientid: u64) -> Result<&Open, Nfsstat4> {
     let open = self.opens.get(&stateid.other).ok_or(Nfsstat4::BadStateid)?;
-    if open.fh != *fh || open.clientid != clientid {
+    if identity(&open.fh) != identity(fh) || open.clientid != clientid {
       return Err(Nfsstat4::BadStateid);
     }
     match stateid.seqid {
@@ -608,10 +610,11 @@ impl FileState {
       IoWant::Write => share::WRITE,
       IoWant::Attributes => return Ok(()),
     };
+    let file = identity(fh);
     let refused = self
       .by_file
-      .range((fh.0.clone(), 0, Vec::new())..)
-      .take_while(|((file, _, _), _)| *file == fh.0)
+      .range((file.clone(), 0, Vec::new())..)
+      .take_while(|((held, _, _), _)| *held == file)
       .filter(|(_, other)| Some(*other) != except)
       .filter_map(|(_, other)| self.opens.get(other))
       .any(|open| open.share.deny & denied != 0);
@@ -846,7 +849,9 @@ impl FileState {
 
   fn remove_open(&mut self, other: &Other) {
     if let Some(open) = self.opens.remove(other) {
-      self.by_file.remove(&(open.fh.0, open.clientid, open.owner));
+      self
+        .by_file
+        .remove(&(identity(&open.fh), open.clientid, open.owner));
     }
   }
 }

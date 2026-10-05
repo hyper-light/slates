@@ -281,6 +281,10 @@ enum Step {
   NfsClient(u8, u32),
   NfsClientClear(u8),
   NfsInstance,
+  /// A delegation of a file to a client (A-78), read or write.
+  NfsDelegation(u8, u8, bool),
+  /// A delegation returned or revoked.
+  NfsDelegationClear(usize),
   Crash,
 }
 
@@ -317,6 +321,8 @@ fn step() -> impl Strategy<Value = Step> {
     1 => (0..4u8, 1..8u32).prop_map(|(c, q)| Step::NfsClient(c, q)),
     1 => (0..4u8).prop_map(Step::NfsClientClear),
     1 => Just(Step::NfsInstance),
+    1 => (0..4u8, 0..8u8, any::<bool>()).prop_map(|(c, f, w)| Step::NfsDelegation(c, f, w)),
+    1 => (0..8usize).prop_map(Step::NfsDelegationClear),
     1 => Just(Step::Crash),
   ]
 }
@@ -334,6 +340,7 @@ struct Ids {
   audit_seq: u64,
   next_nfs_state: u64,
   nfs_opens: Vec<[u8; 12]>,
+  nfs_delegations: Vec<[u8; 12]>,
   nfs_locks: Vec<[u8; 12]>,
   nfs_instance: u32,
 }
@@ -536,7 +543,9 @@ fn op_for(step: &Step, ids: &mut Ids, now_ns: u64) -> Option<Op> {
     | Step::NfsClientPurge(..)
     | Step::NfsClient(..)
     | Step::NfsClientClear(..)
-    | Step::NfsInstance) => return op_for_nfs(step, ids),
+    | Step::NfsInstance
+    | Step::NfsDelegation(..)
+    | Step::NfsDelegationClear(..)) => return op_for_nfs(step, ids),
     Step::Crash => return None,
   })
 }
@@ -635,7 +644,9 @@ fn op_for_service(step: &Step, ids: &mut Ids, now_ns: u64) -> Option<Op> {
 /// The NFSv4 record operations (§4.6 A-37), split from [`op_for`]: opens and lock states named by a
 /// counter, clears and purges of what exists, client records, and instance advances.
 fn op_for_nfs(step: &Step, ids: &mut Ids) -> Option<Op> {
-  use slates_db::catalog::{NfsClientRecord, NfsLockRange, NfsLockRecord, NfsOpenRecord};
+  use slates_db::catalog::{
+    NfsClientRecord, NfsDelegationRecord, NfsLockRange, NfsLockRecord, NfsOpenRecord,
+  };
   let mint = |ids: &mut Ids| {
     ids.next_nfs_state += 1;
     let mut other = [0u8; 12];
@@ -696,6 +707,18 @@ fn op_for_nfs(step: &Step, ids: &mut Ids) -> Option<Op> {
     Step::NfsInstance => Op::NfsInstanceAdvanced {
       instance: ids.nfs_instance + 1,
     },
+    Step::NfsDelegation(client, file, write) => Op::NfsDelegationSet {
+      record: NfsDelegationRecord {
+        other: mint(ids),
+        clientid: u64::from(*client),
+        fh: vec![*file; 16],
+        write: *write,
+        seqid: 1,
+      },
+    },
+    Step::NfsDelegationClear(d) => Op::NfsDelegationCleared {
+      other: pick(&ids.nfs_delegations, *d)?,
+    },
     _ => return None,
   })
 }
@@ -705,6 +728,8 @@ fn note_applied(op: &Op, ids: &mut Ids) {
   match op {
     Op::NfsOpenSet { record } => ids.nfs_opens.push(record.other),
     Op::NfsOpenCleared { other } => ids.nfs_opens.retain(|o| o != other),
+    Op::NfsDelegationSet { record } => ids.nfs_delegations.push(record.other),
+    Op::NfsDelegationCleared { other } => ids.nfs_delegations.retain(|o| o != other),
     Op::NfsLockSet { record } => ids.nfs_locks.push(record.other),
     Op::NfsLockCleared { other } => ids.nfs_locks.retain(|o| o != other),
     Op::NfsInstanceAdvanced { instance } => ids.nfs_instance = *instance,

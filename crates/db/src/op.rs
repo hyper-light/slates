@@ -8,8 +8,8 @@ use slates_wire::Wire;
 use crate::catalog::{
   AccessEntry, AttachmentRecord, AuditRecord, BaseRecord, CompletionRecord, ConsumerRecord,
   GrantRecord, GrantState, LandingLeaseRecord, LandingRecord, LandingState, LeaseRecord,
-  LineageEdge, NfsClientRecord, NfsLockRecord, NfsOpenRecord, PlacementState, SizeClass,
-  SnapshotId, SnapshotRecord, Tombstone, VolumeId, VolumeRecord, VolumeState,
+  LineageEdge, NfsClientRecord, NfsDelegationRecord, NfsLockRecord, NfsOpenRecord, PlacementState,
+  SizeClass, SnapshotId, SnapshotRecord, Tombstone, VolumeId, VolumeRecord, VolumeState,
 };
 
 /// One mutation.
@@ -302,6 +302,16 @@ pub enum Op {
     /// The snapshot it now presents.
     snapshot: crate::catalog::SnapshotId,
   },
+  /// An NFSv4 delegation was granted or changed at its file's owner (§4.6 A-78). Appended.
+  NfsDelegationSet {
+    /// The record.
+    record: NfsDelegationRecord,
+  },
+  /// An NFSv4 delegation was returned or revoked. Appended.
+  NfsDelegationCleared {
+    /// The state id's `other`.
+    other: [u8; 12],
+  },
 }
 
 impl Op {
@@ -351,6 +361,8 @@ impl Op {
       Op::NfsInstanceAdvanced { .. } => "nfs_instance_advanced",
       Op::VolumeRebased { .. } => "volume_rebased",
       Op::AttachmentRepinned { .. } => "attachment_repinned",
+      Op::NfsDelegationSet { .. } => "nfs_delegation_set",
+      Op::NfsDelegationCleared { .. } => "nfs_delegation_cleared",
     }
   }
 }

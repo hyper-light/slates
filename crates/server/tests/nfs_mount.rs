@@ -1543,6 +1543,8 @@ const OP_TEST_STATEID: u32 = 55;
 const NFS4ERR_BAD_STATEID: u32 = 10025;
 /// Format: `CREATE_SESSION4_FLAG_CONN_BACK_CHAN` (RFC 8881 §18.36.1).
 const CONN_BACK_CHAN: u32 = 2;
+/// Format: `NFS4ERR_SHARE_DENIED` (RFC 8881 §15.1.8.4).
+const NFS4ERR_SHARE_DENIED: u32 = 10015;
 /// Format: `NFS4ERR_BADSLOT` (RFC 8881 §15.1.11.3).
 const NFS4ERR_BADSLOT: u32 = 10053;
 const NFS4ERR_DENIED: u32 = 10010;
@@ -1585,6 +1587,26 @@ impl V4Client {
     reader.u32().unwrap();
     reader.fixed(8).unwrap();
     (stateid, reader.opaque(128).unwrap().to_vec())
+  }
+
+  /// OPEN of an existing `name` under `component` by a new open-owner, asking for read access and denying writes:
+  /// the compound's status.
+  fn open_denying_writes(&mut self, component: &str, name: &str) -> u32 {
+    use slates_bridge_nfs::xdr::XdrWriter;
+    let mut ops = XdrWriter::new();
+    ops.u32(OP_PUTROOTFH);
+    ops.u32(OP_LOOKUP);
+    ops.opaque(component.as_bytes());
+    ops.u32(OP_OPEN);
+    ops.u32(0);
+    ops.u32(1); // share access READ
+    ops.u32(2); // share deny WRITE
+    ops.u64(0);
+    ops.opaque(b"denying-owner");
+    ops.u32(0); // OPEN4_NOCREATE
+    ops.u32(0); // CLAIM_NULL
+    ops.opaque(name.as_bytes());
+    self.sequenced(3, ops.as_slice()).0
   }
 
   /// TEST_STATEID of one state id: its status in the reply.
@@ -2114,5 +2136,52 @@ fn a_back_channel_is_probed_on_its_connection_and_recorded_up_or_down() {
     counter_reaches(&daemon, "nfs4.callback.down", 1),
     "an unanswered probe marks the channel down"
   );
+  drop(daemon);
+}
+
+/// §4.6 A-36, RFC 8881 §9: a file's locks and share reservations are the file's, whichever mount reaches it. Do
+/// open one file from two NFSv4 clients through two mounts of the volume (two attachments, so two capabilities and
+/// two handles for the same file), lock a range from A, then lock an overlapping range from B; expect B denied by A's
+/// lock. Then open the file through a third mount from a third client C (no open of its own), denying writes while A
+/// and B hold it open for writing; expect `NFS4ERR_SHARE_DENIED`.
+/// Keyed by the handle's bytes, which carry the capability, the two mounts' locks and shares never met (2026-10-04:
+/// two Docker containers, each with its own `slates export`, could both hold a write lock on one range).
+#[test]
+fn locks_and_shares_meet_across_two_mounts_of_one_file() {
+  let (daemon, instance) = two_shard_daemon("nfsv4mounts");
+  let mut client = Client::connect(&instance);
+  let name = remote_volume_name(&mut client);
+  let first = capability_path(&daemon, &name)
+    .trim_start_matches('/')
+    .to_owned();
+  let second = capability_path(&daemon, &name)
+    .trim_start_matches('/')
+    .to_owned();
+  assert_ne!(first, second, "two mounts, two capabilities");
+  let port = daemon.nfs_port().expect("the daemon is serving NFS");
+  let mut a = V4Client::connect_as(port, b"mount-a");
+  let mut b = V4Client::connect_as(port, b"mount-b");
+  let (open_a, fh_a) = a.open(&first, "shared.db");
+  let (open_b, fh_b) = b.open(&second, "shared.db");
+  assert_ne!(fh_a, fh_b, "the same file under two capabilities");
+  let (status, _) = a.write_lock(&fh_a, open_a, (0, 10), b"a-locker");
+  assert_eq!(status, NFS4_OK, "A's lock is granted");
+  let (status, _) = b.write_lock(&fh_b, open_b, (5, 1), b"b-locker");
+  assert_eq!(
+    status, NFS4ERR_DENIED,
+    "B meets A's lock through its own mount"
+  );
+  // C comes through a third mount and holds no open of its own, so only the others' opens of the file, through
+  // other mounts, can refuse its share.
+  let third = capability_path(&daemon, &name)
+    .trim_start_matches('/')
+    .to_owned();
+  let mut c = V4Client::connect_as(port, b"mount-c");
+  assert_eq!(
+    c.open_denying_writes(&third, "shared.db"),
+    NFS4ERR_SHARE_DENIED,
+    "C cannot deny writes while A holds the file open for writing through another mount"
+  );
+  drop((a, b, c, client));
   drop(daemon);
 }
