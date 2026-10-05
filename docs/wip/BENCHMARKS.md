@@ -2065,3 +2065,41 @@ AES-256-GCM; 100,000 opens per case, each timed alone). Apple M5 Max; load avera
 
 The warm open meets A-92's budget (at most about 1 µs p99 under load) on both systems, so idle RAM is sealed under a
 version key kept warm per mounted volume; a cold open per access would not meet it.
+
+### The daemon under a container memory cap, and large writes over Linux's NFS client on loopback (conditions 11, 12; 2026-10-05)
+
+Commands: `docs/wip/bench/pressure/memory-cap.sh` (privileged `rust:1.98.0`, `--memory 1g --memory-swap 1g`, the Linux
+release build at /target, an output directory at /out), `fsync-trace.sh` and `knfsd-fsync.sh` (the same shape, the
+last in `python:3.12-slim-trixie`). Docker Desktop 6.12 kernel, Apple M5 Max, load average 5–9.
+
+- **Under a 1 GiB cgroup cap** (`memory.max` 1073741824), 1 MiB files written with `fsync` through the kernel's NFSv4.2
+  client until refused:
+  - the 58th was refused `ENOSPC`, typed;
+  - all 57 written files read back with their SHA-256 intact;
+  - after deleting half, an 8 MiB write succeeded;
+  - the daemon was alive, the anchor recorded 0 restarts and 0 panics, and `memory.events` showed `oom_kill 0`;
+  - status answered throughout.
+  The cap sized each shard's reserve at 128 MiB, so one volume (on one shard) held 57 MiB of a 1 GiB container. A
+  volume's ceiling being its owner shard's reserve is owed in GAPS.
+- **Large writes on a fresh mount stall** at 200 ms steps, for slates and for Linux's own knfsd alike:
+
+  | server | 1 MiB write + `fsync` | `dd` 100 MiB, `conv=fsync` |
+  |---|---|---|
+  | slates, fresh NFSv4.2 mount | 621–627 ms | 1.2–8.3 MB/s |
+  | slates, the same mount after other mounts moved 200 MB | 0.6–0.9 ms | 241–471 MB/s |
+  | Linux knfsd over tmpfs, fresh NFSv4.2 mount | 206–208 ms | 4.9 MB/s |
+
+  - The kernel's tracepoints and `ss` show the mechanism. The client sends four 256 KiB WRITEs at once (slots 0–3);
+    slates answers them about 207 ms apart, knfsd with one such step. The daemon reads everything available and
+    meets `EAGAIN`, then nothing arrives for about 205 ms (`strace`).
+  - The client's socket has a 4,608-byte send buffer, a congestion window collapsed to 2, and retransmissions on a
+    201 ms timeout. The namespace counts `TCPRcvQDrop`, `TCPZeroWindowDrop`, `TCPOFODrop` and `TCPDelayedACKLost`,
+    and the daemon's socket its own drops (`d4`–`d5`) with an autotuned 2.2 MB receive buffer and nothing queued.
+  - So this is Linux's NFS client over loopback in this VM, which knfsd meets too; slates meets it three times per
+    flush where knfsd meets it once. Why three is owed.
+  - **Measured and rejected:**
+    - `SO_RCVBUF` raised on accepted streams: `fsync` still 622–626 ms and `dd` 1.2 MB/s (the option caps the buffer
+      at `rmem_max` and turns autotuning off);
+    - `TCP_QUICKACK` after every read: `fsync` 621–626 ms, `dd` 1.2 MB/s.
+    Neither is in the tree.
+

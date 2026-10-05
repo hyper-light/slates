@@ -3683,3 +3683,12 @@ docs/bugs/2026-10-05-a-granted-landing-refused-on-a-held-delegation.md). The sam
 10 and 23 over NFSv4.2 were a delegation's state id letting any user of its client truncate
 (docs/bugs/2026-10-05-a-delegation-let-any-user-of-its-client-truncate.md), fixed the same day.
 
+Condition 11/12, 2026-10-05 (BENCHMARKS "The daemon under a container memory cap ..."):
+- Under a 1 GiB cgroup cap the daemon refuses typed (`ENOSPC`) with no panic or OOM kill, and recovers its space.
+- Owed: one volume's ceiling is its owner shard's reserve (57 MiB of a 1 GiB container with two shards). A volume
+  should be able to draw on the machine's budget, not one shard's share.
+- Owed: on a fresh NFSv4.2 loopback mount in Docker Desktop's VM, a flush of four pipelined 256 KiB WRITEs stalls three
+  200 ms retransmission steps against knfsd's one. The client's own socket (a 4,608-byte send buffer, collapsed
+  window) is the shared cause. Why slates meets it thrice is not yet known: `SO_RCVBUF` and `TCP_QUICKACK` were measured
+  and rejected. A warmed mount writes at 241–471 MB/s.
+
