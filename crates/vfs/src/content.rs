@@ -12,7 +12,6 @@
 
 use slates_machine::{Derived, derived};
 use slates_mem::arena::{ChunkArena, Extent as Block};
-use slates_mem::buddy::{Block as TagBlock, Buddy};
 use slates_mem::{Handle, Slab};
 
 use crate::error::VfsError;
@@ -48,15 +47,15 @@ pub const TAG_BYTES: usize = 16;
 pub type Tag = [u8; TAG_BYTES];
 
 /// How a chunk is sealed (A-99): the key it was sealed under, by the cipher's reference, the version its segments
-/// were sealed at, and the run of tags in the store's tag pool, one per granule-sized segment.
+/// were sealed at, and its run of tags in the store's tag slabs, one per granule-sized segment.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ChunkSeal {
   /// The key, as [`ChunkCipher`] names it.
   pub key: u32,
   /// The version every segment of the chunk was sealed at; never reused under `key` (A-99's nonce argument).
   pub version: u64,
-  /// The run of tags in the pool.
-  tags: TagBlock,
+  /// The run of tags.
+  tags: TagRun,
   /// How many tags the chunk has (its segments); the run may be longer, a power of two.
   segments: u32,
 }
@@ -92,60 +91,53 @@ pub trait ChunkCipher: Send {
   fn key_for_volume(&mut self, volume: [u8; 16]) -> Result<u32, VfsError>;
 }
 
-/// The pool of segment tags (A-99): runs of `TAG_BYTES` units handed out by a buddy allocator, so a one-segment chunk
-/// takes one tag, not a chunk's worth. Bounded by the chunk slab: every sealed chunk is one record, with at most a
-/// chunk's segments.
+/// A chunk's run of tags (A-99): its slot in the store's tag slab.
+type TagRun = Handle<Box<[Tag]>>;
+
+/// The segment tags of a store's sealed chunks (A-99): one run per sealed chunk, exactly its segments long, in a slab
+/// that grows a page of slots at a time as chunks seal and is bounded by the chunk slab, since every run belongs to one
+/// chunk record. A run's length is a runtime quantity: a chunk is sixteen host pages and a segment is the arena's
+/// granule, which may be smaller than a page (4 KiB under macOS arm64's 16 KiB page: 64 segments a chunk).
+///
+/// Measured and replaced (2026-10-05): the first build was one buddy pool sized for `max_chunks` full runs, made whole
+/// at store construction: 268 MB of tags and a 16.7 M-granule buddy per shard (5.6 M chunk records on this host), which
+/// a fresh mapping zero-fills lazily but a recycled one zeroes by hand, 2–25 ms per shard in release. Under a test
+/// process's parallel daemon starts that took a debug shard's start to 0.7–1.1 s, past the 1 s the control loop waits
+/// for each shard (GAPS, boot); shard starts went from p99 811 ms to 41 ms with the slab. Fixed-length run classes (1,
+/// 2, 4, 8 and 16 tags) were tried next and refused every full chunk on a 4 KiB granule under a 16 KiB page.
 struct TagStore {
-  bytes: Vec<u8>,
-  buddy: Option<Buddy>,
+  runs: Slab<Box<[Tag]>>,
 }
 
 impl TagStore {
-  /// A pool for `max_chunks` chunks of up to `segments` segments each.
-  fn new(max_chunks: usize, segments: usize) -> TagStore {
-    let units = max_chunks
-      .saturating_mul(
-        segments
-          .max(1)
-          .checked_next_power_of_two()
-          .unwrap_or(usize::MAX),
-      )
-      .max(1);
-    let order = usize::BITS
-      .saturating_sub(1)
-      .saturating_sub(units.leading_zeros());
-    let buddy = Buddy::new(TAG_BYTES, order).ok();
-    let len = buddy.as_ref().map_or(0, Buddy::region_bytes);
+  /// A tag slab for `max_chunks` chunk records, growing a base page of slots at a time.
+  fn new(max_chunks: usize, page: usize) -> TagStore {
+    let per_page = (page / std::mem::size_of::<Box<[Tag]>>().max(1)).max(1);
     TagStore {
-      bytes: vec![0u8; len],
-      buddy,
+      runs: Slab::new(per_page, max_chunks),
     }
   }
 
-  fn alloc(&mut self, segments: usize) -> Result<TagBlock, VfsError> {
-    let buddy = self.buddy.as_mut().ok_or(VfsError::NoSpace)?;
-    Ok(buddy.alloc(segments.saturating_mul(TAG_BYTES))?)
+  /// A zeroed run of `segments` tags, or `NoSpace` when the allocator or the slab's bound refuses it.
+  fn alloc(&mut self, segments: usize) -> Result<TagRun, VfsError> {
+    let mut run = Vec::new();
+    run
+      .try_reserve_exact(segments)
+      .map_err(|_| VfsError::NoSpace)?;
+    run.resize(segments, Tag::default());
+    Ok(self.runs.insert(run.into_boxed_slice())?)
   }
 
-  fn free(&mut self, block: TagBlock) -> Result<(), VfsError> {
-    if let Some(buddy) = self.buddy.as_mut() {
-      buddy.free(block)?;
-    }
-    Ok(())
+  fn free(&mut self, run: TagRun) -> Result<(), VfsError> {
+    Ok(self.runs.discard(run)?)
   }
 
-  fn tag(&self, block: TagBlock, index: usize) -> Option<&Tag> {
-    let at = block.offset().checked_add(index.checked_mul(TAG_BYTES)?)?;
-    self
-      .bytes
-      .get(at..at.checked_add(TAG_BYTES)?)?
-      .try_into()
-      .ok()
+  fn tag(&self, run: TagRun, index: usize) -> Option<&Tag> {
+    self.runs.get(run).ok()?.get(index)
   }
 
-  fn tag_mut(&mut self, block: TagBlock, index: usize) -> Option<&mut [u8]> {
-    let at = block.offset().checked_add(index.checked_mul(TAG_BYTES)?)?;
-    self.bytes.get_mut(at..at.checked_add(TAG_BYTES)?)
+  fn tag_mut(&mut self, run: TagRun, index: usize) -> Option<&mut [u8]> {
+    Some(self.runs.get_mut(run).ok()?.get_mut(index)?.as_mut_slice())
   }
 }
 
@@ -286,7 +278,7 @@ impl ChunkStore {
       granule,
       chunk_bytes,
       cipher: None,
-      tags: TagStore::new(max_chunks, chunk_bytes.div_ceil(granule)),
+      tags: TagStore::new(max_chunks, page),
       next_version: 0,
       seal_refusals: 0,
       sealed: 0,
@@ -359,7 +351,7 @@ impl ChunkStore {
     block: Block,
     len: usize,
     (key, version): (u32, u64),
-    tags: TagBlock,
+    tags: TagRun,
     segments: usize,
   ) -> Option<()> {
     let granule = self.granule;
@@ -1058,6 +1050,54 @@ mod tests {
     ));
     s.free_chunk(chunk).unwrap();
     assert_eq!(s.seal_refusals(), 0);
+  }
+
+  /// A-99: on a store whose granule is its page and on one whose granule is a quarter of its page (macOS arm64: 4 KiB
+  /// under 16 KiB, so a full chunk has 64 segments), do seal chunks of every length from one byte to a full chunk and
+  /// free half of them as it goes, then seal again; expect every chunk sealed (no fallback to the clear), every one to
+  /// read back its bytes, and freed runs reused, so the tag slab neither refuses a chunk's run nor loses one.
+  #[test]
+  fn every_chunk_length_up_to_a_full_chunk_seals_and_its_tag_run_is_reused() {
+    for (granule, page) in [(4096, 4096), (4096, 4 * 4096)] {
+      let mut arena = ChunkArena::new(granule);
+      arena
+        .add_region(Region::map(page * 256, granule, false).unwrap())
+        .unwrap();
+      let mut s = ChunkStore::new(arena, page, 1024);
+      s.set_cipher(Box::new(TestCipher));
+      let chunk = s.chunk_bytes();
+      let lengths = [
+        1,
+        4096,
+        4097,
+        2 * 4096 + 1,
+        5 * 4096,
+        9 * 4096,
+        chunk / 2 + 1,
+        chunk,
+      ];
+      let mut sealed = Vec::new();
+      for (round, len) in lengths.iter().copied().chain(lengths).enumerate() {
+        let plain: Vec<u8> = (0..len)
+          .map(|at| u8::try_from((at + round) % 251).unwrap())
+          .collect();
+        let mut open = s.open(0, len, Epoch(0)).unwrap();
+        s.write_open(&mut open, 0, &plain).unwrap();
+        let extent = s.seal(open, Some(KEY)).unwrap().unwrap();
+        let mut back = vec![0u8; len];
+        s.read_extent_into(&extent, 0, &mut back).unwrap();
+        assert_eq!(back, plain, "a {len}-byte chunk reads back (page {page})");
+        sealed.push(extent);
+        if round % 2 == 1 {
+          let ExtentSrc::Chunk { chunk, .. } = sealed.swap_remove(0).src else {
+            panic!()
+          };
+          s.free_chunk(chunk).unwrap();
+        }
+      }
+      assert_eq!(s.seal_refusals(), 0, "page {page}");
+      assert_eq!(s.sealed(), u64::try_from(2 * lengths.len()).unwrap());
+    }
   }
 
   /// A-99 piece 4: do read whole segments of a sealed chunk (the reads opened in the caller's buffer), one span

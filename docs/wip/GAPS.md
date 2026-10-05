@@ -3699,8 +3699,12 @@ Boot, found 2026-10-05 (open): the control loop asks every shard for its client-
 liveness budget (`restore_client_ids`, daemon.rs). The call queues behind the shard's `init_shard`, which runs recovery
 as one step, so a shard whose init takes longer than a second makes the daemon stop before serving (clients see
 `DaemonGone`). Seen once: three restart tests in one macOS recovery run at load average 16–17, not again in six runs.
-The fix waits on a shard that is still making progress (its thread's CPU clock moving) and refuses only one that failed
-its init or stopped; first, init's duration is to be logged, and a failing test needs a hook that slows a shard's init.
+Measured the same day (each shard's start is now in the boot log): in the restart suites shard starts were p50 26 ms,
+p99 811 ms, max 978 ms, nearly all of it A-99's tag store built whole at store construction; with the tag store grown
+lazily they are p50 0.8 ms, p99 52–76 ms, max 103 ms, and the failure has not recurred. Still open: the wait does not
+tell a shard busy with a long recovery from one that is stuck. The fix waits on a shard that is still making progress
+(its thread's CPU clock moving) and refuses only one that failed its init or stopped; a failing test needs a hook that
+slows a shard's init.
 
 Condition 11/12, 2026-10-05 (BENCHMARKS "The daemon under a container memory cap ..."):
 - Under a 1 GiB cgroup cap the daemon refuses typed (`ENOSPC`) with no panic or OOM kill, and recovers its space.

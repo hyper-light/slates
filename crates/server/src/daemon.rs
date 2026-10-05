@@ -648,7 +648,10 @@ impl Daemon {
       #[cfg(target_os = "linux")]
       let held = inherited_fuse.next().unwrap_or_default();
       runtime.spawn_on(*shard, async move {
-        if let Err(e) = init_shard(
+        // How long a shard's start takes (its recovery included) is in the boot log: the control loop's first call to
+        // each shard queues behind it (GAPS, boot, 2026-10-05).
+        let started = std::time::Instant::now();
+        let outcome = init_shard(
           &config,
           &env,
           &identity,
@@ -657,9 +660,16 @@ impl Daemon {
           retained,
           #[cfg(target_os = "linux")]
           held,
-        ) {
-          INIT_FAILURES.fetch_add(1, Ordering::AcqRel);
-          eprintln!("slates-server: shard {partition} failed to initialize: {e}");
+        );
+        let took_us = started.elapsed().as_micros();
+        match outcome {
+          Ok(()) => eprintln!("slates-server: shard {partition} initialized in {took_us} µs"),
+          Err(e) => {
+            INIT_FAILURES.fetch_add(1, Ordering::AcqRel);
+            eprintln!(
+              "slates-server: shard {partition} failed to initialize after {took_us} µs: {e}"
+            );
+          }
         }
       })?;
     }

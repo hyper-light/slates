@@ -2082,7 +2082,12 @@ five runs each (`ab.log` in the session scratch).
 B lands: every sealed row of B beats every row of A on p50 and throughput, and its median p99 is inside the 1 µs
 budget (A-92). A is measured-and-rejected: it zeroed a 4 KiB stack buffer and copied each segment twice. The cost left
 is AES-256-GCM itself (about 7 GB/s on one core, so about 580 ns per 4 KiB), against A-92 piece 5's warm open p99 of
-667 ns for one segment alone. The bench's first run failed `Capacity`: it made a key before locking hyper-seal's key
+667 ns for one segment alone. Same day, the tag store moved from one buddy pool built whole to a lazily grown slab of exact-length runs (for shard
+start time, SLATES_DESIGN A-99). Read path, interleaved, three runs each at load average 8.8–9.0: buddy p50 625–667 ns,
+p99 875–1,250 ns, 6.85–8.14 GB/s; slab p50 625–667 ns, p99 875–1,500 ns, 7.38–8.13 GB/s. Even: the change is not a
+read-path change.
+
+The bench's first run failed `Capacity`: it made a key before locking hyper-seal's key
 region; it now calls `hyper_seal::lock_keys` first, as the daemon does at boot.
 
 ### Codemode against list-and-read on a real agent task (condition 13; 2026-10-05)

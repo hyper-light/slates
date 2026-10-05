@@ -9623,8 +9623,8 @@ sealed under the volume's version key (condition 9, "encrypted at rest when not 
      the chokepoint. A chunk an extent names that is no longer there is now `StaleHandle`, where it read as zeros
      before. The overlap copy is checked (`copy_overlap`): the old `copy_range` added and indexed unchecked. vfs 215,
      cluster 280, server lib 157, NFS mount 29 and recovery 21 pass.
-  2. **Built (2026-10-05):** the tag store (`TagStore`: 16-byte tags in a buddy pool sized `max_chunks` ×
-     the next power of two of a chunk's segments, so a chunk's tags are one run), a chunk's `ChunkSeal { key,
+  2. **Built (2026-10-05):** the tag store (`TagStore`: one exact-length run of 16-byte tags per sealed chunk, in a
+     slab that grows a page of slots at a time and is bounded by the chunk slab), a chunk's `ChunkSeal { key,
      version, tags, segments }`, and the image's `SealImage { key identity, version, tags }` (`IMAGE_VERSION` 17).
      Recovery resolves the identity to a key through the cipher (`ChunkCipher::reference`) and adopts the chunk with
      its tags.
@@ -9645,6 +9645,12 @@ sealed under the volume's version key (condition 9, "encrypted at rest when not 
      p99 budget, so it lands. The first build opened every segment into a stack scratch and copied out; opening a
      segment the read covers whole in the caller's buffer took p50 from 833 to 709 ns and throughput from 6.2 to
      7.4 GB/s in an interleaved A/B, measured-and-rejected recorded.
+- Tag store, measured and replaced the same day: the first build sized one buddy pool for `max_chunks` full runs
+  at store construction (268 MB of tags and a 16.7 M-granule buddy per shard here), which a recycled mapping zeroes by
+  hand: shard starts in the restart suites p50 26 ms, p99 811 ms, max 978 ms, against the control loop's 1 s wait.
+  With the lazy slab: p50 0.8 ms, p99 52–76 ms, max 74–103 ms (220 starts, two runs). Fixed run classes of 1–16 tags
+  were tried between and refused every full chunk where the granule is smaller than the page (4 KiB under 16 KiB:
+  64 segments), caught by the sealed restart test; a unit test now seals every length on both shapes.
 - Test harness note: a test process runs many daemons over hyper-seal's one key region, which the first `lock_keys`
   sizes. The fixtures make it once, for the largest daemon the profile derives, before any daemon starts
   (`crates/server/tests/common/mod.rs`); before that, a 1-shard daemon starting first left a 2-shard one with sealing
