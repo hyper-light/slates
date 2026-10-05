@@ -7,9 +7,20 @@
 use crate::protocol::{ReplyBody, RequestBody, decode_body, encode_body};
 use crate::{ClientRegion, IpcError};
 
+/// Format: the share of a client region's bulk area a status snapshot may take: its reply half (the other is requests').
+pub const SNAPSHOT_BULK_DIVISOR: u64 = 2;
+
+/// The status snapshot's byte bound for a region of `bulk_bytes` bulk area: what the daemon keeps as observation room.
+pub const fn snapshot_capacity_of(bulk_bytes: u64) -> u64 {
+  bulk_bytes / SNAPSHOT_BULK_DIVISOR
+}
+
 /// The status snapshot's byte bound: the already admitted bulk credit of the reply ring.
 pub fn snapshot_capacity(region: &ClientRegion) -> usize {
-  region.bulk_len() / 2
+  usize::try_from(snapshot_capacity_of(
+    u64::try_from(region.bulk_len()).unwrap_or(u64::MAX),
+  ))
+  .unwrap_or(usize::MAX)
 }
 
 /// What a page holds past its framing and cursor, derived using the actual wire encoder.

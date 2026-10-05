@@ -2820,19 +2820,24 @@ const RECORDS_ROOM: u64 = 64 * 1024;
 /// Shape: the most creates the metadata scenario tries before calling the ledger unbounded.
 const RECORD_PROBES: usize = 16;
 
-/// AC-0.10 (§4.2 metadata dimension), through the real create and destroy verbs (no mount): a
+/// AC-0.10 (§4.2 metadata dimension; §4.14), through the real create and destroy verbs (no mount): a
 /// volume's records — its journal budget, its object, its snapshot slab's first segment — are
 /// reserved against the shard's metadata ledger at create, so a daemon whose metadata class holds
 /// its slabs plus a few volumes' records refuses the next create (`BudgetExceeded`) while bytes and
-/// version slots plainly remain, and admits again once a destroy returns the records. Non-vacuous:
+/// version slots plainly remain, and admits again once a destroy returns the records — and the daemon's status is
+/// answered with the ledger full, from the observation room no record may take (red on Linux's 4 KiB pages before
+/// 2026-10-05: the full ledger refused the report itself, `BudgetExceeded { available: 1516 }`). Non-vacuous:
 /// uncharged, every create here lands (the byte budget and the version slab are far larger).
 #[test]
 fn a_metadata_class_bounds_the_volume_records_a_shard_admits() {
   let profile = common::machine_profile();
   let instance = format!("srv-metadata-{}", std::process::id());
   let mut config = DaemonConfig::derive(&profile, &instance, Some(1));
-  // The class holds the slabs' maximum footprint plus a few volumes' records, no more.
-  config.store.metadata_class_bytes = slab_footprint_of(&config) + RECORDS_ROOM;
+  // The class holds the slabs' maximum footprint, the one status capture's room no record may take (§4.14), and a
+  // few volumes' records, no more.
+  config.store.metadata_class_bytes = slab_footprint_of(&config)
+    + slates_ipc::status::snapshot_capacity_of(config.region.bulk_bytes)
+    + RECORDS_ROOM;
   let daemon = Daemon::start(
     &profile,
     config,
@@ -2852,8 +2857,9 @@ fn a_metadata_class_bounds_the_volume_records_a_shard_admits() {
   );
   // The refusal is the metadata ledger's: bytes and version slots are plainly roomy, the ledger is
   // committed up to its capacity.
-  let ReplyBody::DaemonStatus { report } = client.call(&RequestBody::DaemonStatus) else {
-    panic!("daemon status");
+  let reply = client.call(&RequestBody::DaemonStatus);
+  let ReplyBody::DaemonStatus { report } = reply else {
+    panic!("daemon status: {reply:?}");
   };
   let shard = &report.shards[0];
   assert!(

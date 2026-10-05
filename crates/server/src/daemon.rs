@@ -2597,6 +2597,14 @@ fn init_shard(
   store
     .set_metadata_class(config.store.metadata_class_bytes)
     .map_err(ServerError::Memory)?;
+  // One status capture's room, kept from every volume's records (§4.14): a client ring's status snapshot capacity, the
+  // half of its bulk area `slates_ipc::status::snapshot_capacity` bounds a capture by.
+  store
+    .metadata
+    .set_observation_room(slates_ipc::status::snapshot_capacity_of(
+      config.region.bulk_bytes,
+    ))
+    .map_err(ServerError::Memory)?;
   let shard = registry::current_shard().unwrap_or(partition);
   // The stable anchor keys TLS authentication and completion origins (§4.8). A random
   // per-start nonce derives the member id used for voting and ownership. The anchor's

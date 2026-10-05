@@ -63,14 +63,17 @@ impl StatusPages {
       });
     }
     let charged = u64::try_from(bytes.capacity()).map_err(|_| Refusal::BudgetExceeded {
-      available: budget.admittable(),
+      available: budget.observation_admittable(),
     })?;
-    let credit = match budget.reserve(charged) {
+    // Charged as observation (§4.14): the room no volume's records may take, so a status capture is held even when
+    // the ledger is full of records — the state a status must be able to report (2026-10-05: on Linux's 4 KiB pages a
+    // full ledger refused the very report that would show it, `BudgetExceeded { available: 1516 }`).
+    let credit = match budget.reserve_observation(charged) {
       Ok(credit) => credit,
       Err(_) => {
         self.clear(budget);
         return Err(Refusal::BudgetExceeded {
-          available: budget.admittable(),
+          available: budget.observation_admittable(),
         });
       }
     };

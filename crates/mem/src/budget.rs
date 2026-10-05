@@ -66,6 +66,27 @@ impl Ledger {
     Ok(amount)
   }
 
+  /// Commits `amount` whole or refuses, allowed into the headroom (never into the pressure hold): for a holder the
+  /// headroom is kept for, which every other admission leaves free.
+  fn take_into_headroom(&mut self, amount: u64) -> Result<u64, MemError> {
+    let available = self.admittable().saturating_add(
+      self.headroom.min(
+        self
+          .reserve
+          .saturating_sub(self.committed)
+          .saturating_sub(self.hold),
+      ),
+    );
+    if amount > available {
+      return Err(MemError::BudgetExceeded {
+        requested: amount,
+        available,
+      });
+    }
+    self.committed += amount;
+    Ok(amount)
+  }
+
   /// Returns `amount` to the reserve.
   fn give(&mut self, amount: u64) {
     self.committed = self.committed.saturating_sub(amount);
@@ -368,6 +389,42 @@ impl MetadataBudget {
     self.ledger.admittable()
   }
 
+  /// Keeps `bytes` of the ledger as observation room (§4.14): room no volume's records may take, so the status report
+  /// that explains a full ledger can always be held — one capture's bound, a client ring's status snapshot capacity.
+  /// Refused when the room would exceed the ledger, or is set after records were reserved.
+  pub fn set_observation_room(&mut self, bytes: u64) -> Result<(), MemError> {
+    if self.ledger.committed != 0 || bytes > self.ledger.reserve {
+      return Err(MemError::BudgetExceeded {
+        requested: bytes,
+        available: self.ledger.reserve.saturating_sub(self.ledger.committed),
+      });
+    }
+    self.ledger.headroom = bytes;
+    Ok(())
+  }
+
+  /// Bytes a status capture may still take: the admittable room plus what is left of the observation room.
+  pub fn observation_admittable(&self) -> u64 {
+    let ledger = &self.ledger;
+    ledger.admittable().saturating_add(
+      ledger.headroom.min(
+        ledger
+          .reserve
+          .saturating_sub(ledger.committed)
+          .saturating_sub(ledger.hold),
+      ),
+    )
+  }
+
+  /// Reserves `bytes` for a status capture (§4.14), whole or not at all, from the admittable room and then the
+  /// observation room no volume may take ([`MetadataBudget::set_observation_room`]).
+  pub fn reserve_observation(&mut self, bytes: u64) -> Result<MetadataCredit, MemError> {
+    self
+      .ledger
+      .take_into_headroom(bytes)
+      .map(|bytes| MetadataCredit { bytes })
+  }
+
   /// Reserves `bytes` for one volume's records, whole or not at all.
   pub fn reserve(&mut self, bytes: u64) -> Result<MetadataCredit, MemError> {
     self
@@ -631,5 +688,30 @@ mod tests {
     let s = slab_bytes(4096, 100, 48);
     assert_eq!(s.get(), 8192);
     assert_eq!(region_bytes(1 << 40, 5, 4).get(), (1 << 40) / 20);
+  }
+}
+
+#[cfg(test)]
+mod observation_tests {
+  use super::MetadataBudget;
+
+  /// §4.14: do fill a metadata ledger with records, then hold a status capture as large as the observation room;
+  /// expect the records refused at the room's edge, the capture admitted inside it, a second capture refused, and the
+  /// room back once the capture is released.
+  #[test]
+  fn the_observation_room_holds_a_status_capture_no_record_can_take() {
+    let mut budget = MetadataBudget::new(1000);
+    budget.set_observation_room(100).unwrap();
+    let records = budget.reserve(900).unwrap();
+    assert!(budget.reserve(1).is_err(), "records never take the room");
+    let capture = budget.reserve_observation(100).unwrap();
+    assert!(budget.reserve_observation(1).is_err(), "one capture's room");
+    budget.release(capture);
+    assert_eq!(budget.observation_admittable(), 100);
+    budget.release(records);
+    assert!(
+      budget.set_observation_room(2000).is_err(),
+      "larger than the ledger"
+    );
   }
 }
