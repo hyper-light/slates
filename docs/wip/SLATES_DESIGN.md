@@ -9515,6 +9515,10 @@ memory cap") and GAPS.
      `racing_claimants_take_each_pool_extent_exactly_once_and_the_claims_outlive_the_mapping`: eight separate
      mappings race for eight extents and each is taken exactly once; the claims hold through a fresh attachment.
      Both pass on macOS and Linux (a descriptor handoff there).
+  - Before piece 2 (2026-10-05): a shard's arena range is cut into power-of-two regions, largest first
+    (`daemon.rs` `arena_parts`). The buddy uses a region's largest power-of-two run of granules only, so a single
+    region left up to half of a reserve unallocatable (25% under a 1 GiB cap: 128 of 170.7 MiB). Region 0 keeps its
+    base and length, so images name blocks as before. Pool extents take the same cut.
   2. The base and pool sizes, derived in the daemon's content layout; a refusal at an empty pool, typed.
   3. Growth in the shard: a refused admission claims and adds an extent; the budget's reserve grows. Test: a volume
      larger than one base arena fills on a shard, and two shards contend for the pool.

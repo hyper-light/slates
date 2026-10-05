@@ -3698,6 +3698,9 @@ Condition 11/12, 2026-10-05 (BENCHMARKS "The daemon under a container memory cap
   - claims and the sweep (A-64) walk a shard's extent set instead of one range.
   Seastar and ScyllaDB accept a fixed per-core share because their data is spread across shards by key; a slates
   volume lives on one shard (one writer), so it cannot. Designed as A-98, six pieces.
+  - 2026-10-05: within a shard, the whole reserve is now allocatable. It was only the reserve's largest power-of-two
+    part, so 25% was stranded under a 1 GiB cap. The capped container's volume went from 57 to 124 MiB (BENCHMARKS).
+    The per-shard ceiling itself remains until A-98 pieces 2–5.
 - Owed: on a fresh NFSv4.2 loopback mount in Docker Desktop's VM, a flush of four pipelined 256 KiB WRITEs stalls three
   200 ms retransmission steps against knfsd's one. The client's own socket (a 4,608-byte send buffer, collapsed
   window) is the shared cause. Why slates meets it thrice is not yet known: `SO_RCVBUF` and `TCP_QUICKACK` were measured

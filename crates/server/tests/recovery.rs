@@ -1850,3 +1850,70 @@ fn a_clone_recovers_over_its_recovered_origin_serving_inherited_and_its_own_file
   drop(client);
   second.stop();
 }
+
+/// Shape: the power-of-two part of the reserve in [`a_volume_past_the_reserves_power_of_two_part_fills_and_survives_a_restart`].
+const POWER_PART: u64 = 32 << 20;
+/// Shape: the files that test writes, each [`FILL_FILE`] long: more than [`POWER_PART`] holds.
+const FILL_FILES: u64 = 34;
+/// Shape: one file of that test.
+const FILL_FILE: usize = 1 << 20;
+
+/// §4.2 capacity (2026-10-05): a shard's reserve is RAM ÷ shards ÷ classes, rarely a power of two, and the buddy
+/// arena used only its largest power-of-two part (128 MiB of a 170.7 MiB reserve under a 1 GiB cap, 25% stranded).
+/// Do: give one shard a reserve of 1.5 × [`POWER_PART`], create a bounded volume larger than that power-of-two part,
+/// write [`FILL_FILES`] files of a MiB into it over the anchor's content object, then restart the daemon. Expect the
+/// volume admitted, every file written, and every byte read back after the restart (the blocks past the first region
+/// are named in the image and claimed again). Before the fix the create was refused `BudgetExceeded`.
+#[test]
+fn a_volume_past_the_reserves_power_of_two_part_fills_and_survives_a_restart() {
+  let profile = common::machine_profile();
+  let instance = format!("srv-reserve-tail-{}", std::process::id());
+  let mut config = DaemonConfig::derive(&profile, &instance, Some(1));
+  config.reserve_per_shard = POWER_PART + POWER_PART / 2;
+  let segment = anchor_segment("reserve-tail", &profile, &config);
+  let first = Daemon::start(&profile, config.clone(), source_of(&segment)).unwrap();
+  first
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let mut client = connect(&instance);
+  let volume = client
+    .create(&CreateSpec {
+      size: SizeClass::Bounded {
+        limit: POWER_PART + POWER_PART / 8,
+      },
+      ..scratch("tail")
+    })
+    .expect("a volume past the power-of-two part is admitted");
+  let attachment = client
+    .attach(volume, None, slates_ipc::protocol::Intent::Write)
+    .unwrap()
+    .attachment;
+  let file = |index: u64| -> Vec<u8> {
+    (0..FILL_FILE)
+      .map(|at| u8::try_from((at as u64 ^ index.wrapping_mul(0x9E37)) & 0xFF).unwrap())
+      .collect()
+  };
+  for index in 0..FILL_FILES {
+    let wrote = client.fs_write(
+      (volume, attachment),
+      &format!("f{index}"),
+      &file(index),
+      0o644,
+    );
+    assert_eq!(wrote.ok(), Some(FILL_FILE as u64), "file {index}");
+  }
+  first.stop();
+  let second = Daemon::start(&profile, config, source_of(&segment)).unwrap();
+  for index in 0..FILL_FILES {
+    let read = client.read(
+      volume,
+      &format!("f{index}"),
+      slates_ipc::protocol::ReadAt::Head,
+    );
+    assert!(
+      read.unwrap() == file(index),
+      "file {index} after the restart"
+    );
+  }
+  second.stop();
+}

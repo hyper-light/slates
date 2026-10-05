@@ -2079,8 +2079,21 @@ last in `python:3.12-slim-trixie`). Docker Desktop 6.12 kernel, Apple M5 Max, lo
   - after deleting half, an 8 MiB write succeeded;
   - the daemon was alive, the anchor recorded 0 restarts and 0 panics, and `memory.events` showed `oom_kill 0`;
   - status answered throughout.
-  The cap sized each shard's reserve at 128 MiB, so one volume (on one shard) held 57 MiB of a 1 GiB container. A
-  volume's ceiling being its owner shard's reserve is owed in GAPS.
+  One volume (on one shard) held 57 MiB of a 1 GiB container. **Wrong in the first version of this entry:** the
+  cap did not size the reserve at 128 MiB. The reserve was 170.7 MiB (1 GiB ÷ 2 shards ÷ 3 classes), and the buddy
+  arena used only its largest power-of-two part, 128 MiB, as one region. A volume's ceiling being its owner shard's
+  reserve is owed in GAPS (A-98).
+- **The reserve's whole length, 2026-10-05** (the same command, `FILES=200`, load average 8.4): the arena range is now
+  cut into power-of-two regions on the mapping granule, largest first (`daemon.rs` `arena_parts`), so the whole
+  reserve is allocatable. Region 0 keeps its old base and length, so an image written before still names its blocks.
+  - One volume now holds **124 MiB** before the 125th 1 MiB file is refused `ENOSPC`, against 57 MiB before.
+  - The first 124 files read back with their SHA-256 intact; after deleting half, an 8 MiB write succeeded.
+  - Daemon alive, 0 restarts, 0 panics, `oom_kill 0`.
+  - The gain is more than the 42.7 MiB tail. The operation headroom is capped by the arena's capacity, so with a
+    smaller capacity the earlier run lost a larger share of it; the split between the two is not measured.
+  - Test: `a_volume_past_the_reserves_power_of_two_part_fills_and_survives_a_restart` (recovery.rs). A 48 MiB reserve
+    admits a 36 MiB volume and holds 34 MiB of files across a restart, byte for byte, on macOS and Linux. Before the
+    change, the create was refused `BudgetExceeded { available: 22 MiB }`.
 - **Large writes on a fresh mount stall** at 200 ms steps, for slates and for Linux's own knfsd alike:
 
   | server | 1 MiB write + `fsync` | `dd` 100 MiB, `conv=fsync` |
