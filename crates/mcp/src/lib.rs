@@ -191,12 +191,119 @@ pub fn parse_error_reply() -> Value {
 /// protocol above it is stateless per request (§4.12), so each `handle` is independent.
 pub struct McpServer {
   client: Client,
+  /// Whether this transport can carry a subscription's stream: stdio can (every message shares the channel); the
+  /// HTTP edge answers one JSON body per request and does not stream yet.
+  streams: bool,
+  /// The open `subscriptions/listen` requests, by their JSON-RPC id (MCP 2026-07-28 patterns/subscriptions).
+  subscriptions: Vec<Value>,
+}
+
+/// Format: the `_meta` key every message of a subscription carries: the JSON-RPC id of its `subscriptions/listen`.
+const META_SUBSCRIPTION_ID: &str = "io.modelcontextprotocol/subscriptionId";
+/// Format: the list-change notification types a `subscriptions/listen` filter names (MCP 2026-07-28).
+const LIST_FILTERS: [&str; 3] = [
+  "toolsListChanged",
+  "promptsListChanged",
+  "resourcesListChanged",
+];
+
+/// Derived: the subscriptions one connection may hold open at once: one per notification source this server has
+/// (each list it publishes, and each skill document), past which a further one can only repeat an open one. Each
+/// holds only its id, so the set stays bounded by this.
+fn max_subscriptions() -> usize {
+  LIST_FILTERS.len().saturating_add(skills::SKILLS.len())
 }
 
 impl McpServer {
-  /// Wraps a connected client.
+  /// Wraps a connected client, for a transport that answers one message per request (the HTTP edge).
   pub fn new(client: Client) -> McpServer {
-    McpServer { client }
+    McpServer {
+      client,
+      streams: false,
+      subscriptions: Vec::new(),
+    }
+  }
+
+  /// Wraps a connected client for a streaming transport (stdio), where `subscriptions/listen` is served.
+  pub fn streaming(client: Client) -> McpServer {
+    McpServer {
+      streams: true,
+      ..McpServer::new(client)
+    }
+  }
+
+  /// Ends every open subscription gracefully (MCP 2026-07-28 "Graceful Closure"): one completion result per
+  /// `subscriptions/listen`, correlated by its id, for the transport to send before it closes.
+  pub fn close_subscriptions(&mut self) -> Vec<Value> {
+    self
+      .subscriptions
+      .drain(..)
+      .map(|id| {
+        let mut result = complete(json!({}));
+        if let Some(meta) = result.get_mut("_meta").and_then(Value::as_object_mut) {
+          meta.insert(META_SUBSCRIPTION_ID.to_owned(), id.clone());
+        }
+        reply(&id, result)
+      })
+      .collect()
+  }
+
+  /// `subscriptions/listen`: the acknowledgement, the subscription's first message. The server honours the list
+  /// filters and the skill URIs it publishes; none of them changes while the server runs (the lists are fixed, the
+  /// skills are compiled in), so after the acknowledgement the stream carries nothing until it ends. A URI the server
+  /// does not publish is left out of the acknowledged filter, as the specification asks for an unsupported type.
+  fn listen(&mut self, id: &Value, params: &Value) -> Result<Value, McpError> {
+    if !self.streams {
+      return Err(McpError {
+        code: code::METHOD_NOT_FOUND,
+        message: "subscriptions/listen is served over stdio; this transport does not stream"
+          .to_owned(),
+      });
+    }
+    if self.subscriptions.len() >= max_subscriptions() {
+      return Err(McpError {
+        code: code::INVALID_PARAMS,
+        message: format!(
+          "{} subscriptions are open, one per notification source; cancel one first",
+          self.subscriptions.len()
+        ),
+      });
+    }
+    let asked = params.get("notifications").cloned().unwrap_or(Value::Null);
+    let mut honoured = serde_json::Map::new();
+    for filter in LIST_FILTERS {
+      if asked.get(filter) == Some(&Value::Bool(true)) {
+        honoured.insert(filter.to_owned(), Value::Bool(true));
+      }
+    }
+    let resources: Vec<Value> = asked
+      .get("resourceSubscriptions")
+      .and_then(Value::as_array)
+      .into_iter()
+      .flatten()
+      .filter(|uri| uri.as_str().and_then(skills::by_uri).is_some())
+      .cloned()
+      .collect();
+    if !resources.is_empty() {
+      honoured.insert("resourceSubscriptions".to_owned(), Value::Array(resources));
+    }
+    self.subscriptions.push(id.clone());
+    Ok(json!({
+      "jsonrpc": "2.0",
+      "method": "notifications/subscriptions/acknowledged",
+      "params": {
+        "_meta": { META_SUBSCRIPTION_ID: id },
+        "notifications": honoured,
+      },
+    }))
+  }
+
+  /// `notifications/cancelled` (MCP 2026-07-28 cancellation): a client ends its subscription on stdio by naming the
+  /// listen request; the server sends nothing for it after.
+  fn cancelled(&mut self, params: &Value) {
+    if let Some(request) = params.get("requestId") {
+      self.subscriptions.retain(|id| id != request);
+    }
   }
 
   /// Handles one JSON-RPC message, returning its reply — or `None` for a notification (a message
@@ -208,10 +315,13 @@ impl McpServer {
   /// [`McpServer::handle`] for a request that arrived with the HTTP `MCP-Protocol-Version` header `header`, which
   /// also says which era the request is in.
   pub fn handle_with_header(&mut self, request: &Value, header: Option<&str>) -> Option<Value> {
-    // A notification carries no `id` field and expects no reply; `?` returns nothing for it.
-    let id = request.get("id").cloned()?;
     let method = request.get("method").and_then(Value::as_str).unwrap_or("");
     let params = request.get("params").cloned().unwrap_or(Value::Null);
+    if method == "notifications/cancelled" {
+      self.cancelled(&params);
+    }
+    // A notification carries no `id` field and expects no reply; `?` returns nothing for it.
+    let id = request.get("id").cloned()?;
     // The era is the request's own (MCP 2026-07-28 versioning); nothing is remembered between requests.
     let modern = match era(&params, method, header) {
       Ok(modern) => modern,
@@ -222,6 +332,14 @@ impl McpServer {
       // A legacy-era method (2026-07-28 removed it): a legacy client's liveness check is answered empty.
       "ping" if !modern => Ok(json!({})),
       "server/discover" => Ok(discover_result()),
+      // The acknowledgement is the subscription's first message, not a reply: the reply ends the subscription.
+      "subscriptions/listen" if modern => {
+        return Some(
+          self
+            .listen(&id, &params)
+            .unwrap_or_else(|e| error(&id, e.code, &e.message)),
+        );
+      }
       "tools/list" => Ok(json!({
         "tools": tool_list(),
         "ttlMs": CACHE_TTL_MS,

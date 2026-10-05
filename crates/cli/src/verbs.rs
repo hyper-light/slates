@@ -402,16 +402,15 @@ pub(crate) fn run(request: &ClientRequest) -> Result<(), Failure> {
 /// The protocol and dispatch live in `slates-mcp`; this is the transport the CLI owns.
 pub(crate) fn mcp(options: &crate::args::McpOptions) -> Result<(), Failure> {
   let client = connect(&options.instance)?;
-  let server = slates_mcp::McpServer::new(client);
   match options.http {
     #[cfg(not(windows))]
-    Some(port) => serve_mcp_http(server, port, &options.instance),
+    Some(port) => serve_mcp_http(slates_mcp::McpServer::new(client), port, &options.instance),
     #[cfg(windows)]
     Some(_) => Err(Failure::Failed(
       "mcp http: the loopback HTTP edge is served on macOS and Linux; use stdio on Windows"
         .to_owned(),
     )),
-    None => serve_mcp_stdio(server),
+    None => serve_mcp_stdio(slates_mcp::McpServer::streaming(client)),
   }
 }
 
@@ -479,7 +478,14 @@ fn serve_mcp_stdio(mut server: slates_mcp::McpServer) -> Result<(), Failure> {
     let read =
       slates_mcp::read_stdio_line(&mut input).map_err(|e| Failure::Failed(e.to_string()))?;
     let line = match read {
-      slates_mcp::StdioLine::End => return Ok(()),
+      // stdin closed: every open subscription ends gracefully, its completion sent before the server exits.
+      slates_mcp::StdioLine::End => {
+        for closed in server.close_subscriptions() {
+          writeln!(out, "{closed}").map_err(|e| Failure::Failed(e.to_string()))?;
+        }
+        out.flush().map_err(|e| Failure::Failed(e.to_string()))?;
+        return Ok(());
+      }
       slates_mcp::StdioLine::TooLong => None,
       slates_mcp::StdioLine::Message(line) => Some(line),
     };

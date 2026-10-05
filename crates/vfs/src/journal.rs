@@ -154,7 +154,7 @@ impl OpLog {
     prev_version: u64,
   ) -> u64 {
     let seq = self.next_seq;
-    self.next_seq += 1;
+    self.next_seq = self.next_seq.saturating_add(1);
     let record = OpRecord {
       seq,
       op,
@@ -211,7 +211,7 @@ impl OpLog {
 
   /// The newest sequence assigned.
   pub fn head_seq(&self) -> u64 {
-    self.next_seq - 1
+    self.next_seq.saturating_sub(1)
   }
 
   /// Records dropped by retention.

@@ -3602,7 +3602,13 @@ shard's own clock that A-65 budgets in (docs/bugs/2026-10-04-the-slow-observatio
   3. `slates.fs`: listing **done (A-85)**; plain-volume write, mkdir, move and remove **done (A-97)**, on every OS,
      under the caller's write attachment; and from the CLI, `slates write VOLUME ATTACHMENT PATH` from stdin
      (2026-10-05, tested in the real-process anchor flow);
-  4. `subscriptions/listen`;
+  4. `subscriptions/listen`: **done on stdio (2026-10-05)**. The acknowledgement comes first with the listen's id as
+     its subscription id and the honoured subset of the filter: the three list filters and the published skill
+     URIs, none of which changes while a server runs, so no notification follows. A `notifications/cancelled` ends
+     one; stdin's close ends the rest with their completion results; open subscriptions are bounded by the server's
+     notification sources (`assert_subscriptions`). Owed: over the HTTP edge (it answers one JSON body per request,
+     so listen is refused `-32601` there), and `volume://` resources with `notifications/resources/updated` from the
+     volume's op-log head;
   5. the official conformance suite, run in a container (no host install): **done (A-87)**: 103 checks pass on
      the 2026-07-28 requirements and every failure is classified (reference fixtures, the optional tasks extension,
      undeclared features). The recorded harness is in `docs/wip/conformance/mcp/` and runs manually, not in CI

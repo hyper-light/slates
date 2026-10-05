@@ -945,6 +945,7 @@ fn the_mcp_surface_serves_the_tools() {
   assert_a_page_stamp_moves_with_the_file(&instance);
   assert_directories_list_across_pages(&mut server);
   assert_codemode_answers_one_query(&mut server);
+  assert_subscriptions(&instance);
   assert_merge_loop(&mut server);
   assert_volume_lifecycle(&mut server);
   assert_files_change_through_mcp(&mut server);
@@ -954,6 +955,100 @@ fn the_mcp_surface_serves_the_tools() {
   assert_http_transport(&profile, &instance);
 
   daemon.stop();
+}
+
+/// Shape: the skill a subscription test names (one the server publishes).
+const SUBSCRIBED_SKILL: &str = "skill://slates/working-in-slates-volumes/SKILL.md";
+/// Shape: the protocol revision the subscription test speaks (the one that defines `subscriptions/listen`).
+const LISTEN_VERSION: &str = "2026-07-28";
+
+/// A modern `subscriptions/listen` request with JSON-RPC id `id` and filter `notifications`.
+fn listen(id: u64, notifications: Value) -> Value {
+  json!({
+    "jsonrpc": "2.0",
+    "id": id,
+    "method": "subscriptions/listen",
+    "params": { "_meta": modern_meta(LISTEN_VERSION), "notifications": notifications },
+  })
+}
+
+/// MCP 2026-07-28 subscriptions (condition 13). Do: on stdio's streaming server, listen for the tools list and two
+/// resources (a published skill, an unpublished URI); call a tool; open a second subscription and cancel it with
+/// `notifications/cancelled`; end the server's subscriptions; then listen on the HTTP edge's server, and open more
+/// subscriptions than the server has notification sources. Expect: the acknowledgement as the first message,
+/// carrying the listen's id as its subscription id and only what the server honours (the unpublished URI left
+/// out); tools still answered while it is open; nothing for the cancelled one; the graceful close answering only the
+/// open subscription with a complete result under its id; listen refused on the non-streaming transport; and the
+/// subscription past the bound refused.
+fn assert_subscriptions(instance: &str) {
+  let mut server = McpServer::streaming(connect(instance));
+  let ack = server
+    .handle(&listen(
+      7,
+      json!({ "toolsListChanged": true, "resourceSubscriptions": [SUBSCRIBED_SKILL, "volume://none/x"] }),
+    ))
+    .expect("an acknowledgement");
+  assert_eq!(
+    ack["method"], "notifications/subscriptions/acknowledged",
+    "{ack}"
+  );
+  assert!(
+    ack.get("id").is_none(),
+    "the acknowledgement is a notification, not the reply: {ack}"
+  );
+  assert_eq!(
+    ack["params"]["_meta"]["io.modelcontextprotocol/subscriptionId"],
+    7
+  );
+  assert_eq!(
+    ack["params"]["notifications"],
+    json!({ "toolsListChanged": true, "resourceSubscriptions": [SUBSCRIBED_SKILL] })
+  );
+  call(&mut server, "slates.volume.list", json!({}));
+  server.handle(&listen(8, json!({ "promptsListChanged": true })));
+  let cancelled = server.handle(&json!({
+    "jsonrpc": "2.0",
+    "method": "notifications/cancelled",
+    "params": { "requestId": 8, "reason": "done" },
+  }));
+  assert!(cancelled.is_none(), "a notification is not answered");
+  let closed = server.close_subscriptions();
+  assert_eq!(
+    closed.len(),
+    1,
+    "only the open subscription ends: {closed:?}"
+  );
+  assert_eq!(closed[0]["id"], 7);
+  assert_eq!(closed[0]["result"]["resultType"], "complete");
+  assert_eq!(
+    closed[0]["result"]["_meta"]["io.modelcontextprotocol/subscriptionId"],
+    7
+  );
+  assert_listen_bounds(instance, &mut server);
+}
+
+/// The second half of [`assert_subscriptions`]: listen refused on the non-streaming transport, and past the bound.
+fn assert_listen_bounds(instance: &str, server: &mut McpServer) {
+  let mut edge = McpServer::new(connect(instance));
+  let refused = edge
+    .handle(&listen(9, json!({ "toolsListChanged": true })))
+    .unwrap();
+  assert_eq!(refused["error"]["code"], -32601, "{refused}");
+  let mut opened = 0;
+  let mut refusal = None;
+  for id in 10..100 {
+    let answer = server
+      .handle(&listen(id, json!({ "toolsListChanged": true })))
+      .unwrap();
+    if answer.get("error").is_some() {
+      refusal = Some(answer);
+      break;
+    }
+    opened += 1;
+  }
+  let refusal = refusal.expect("a bound refuses past the notification sources");
+  assert_eq!(refusal["error"]["code"], -32602, "{refusal}");
+  assert!(opened > 0, "subscriptions open up to the bound");
 }
 
 /// Shape: the edge's bearer token in this test (the command mints one from the platform's secure random).
