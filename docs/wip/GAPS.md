@@ -3596,8 +3596,9 @@ shard's own clock that A-65 budgets in (docs/bugs/2026-10-04-the-slow-observatio
   1. `slates skills install` (writing `.agents/skills/` and `.claude/skills/`): **Ada's ruling needed.** It writes a
      user's project directory outside a granted landing, which R1/R10 forbid as written; D-19 lists it. Until then
      the skills reach clients over MCP and as the raw tree in the repository;
-  2. codemode: **done (A-86, `slates.query`)**; owed: a measured token comparison on a real agent task (query
-     versus list-and-read);
+  2. codemode: **done (A-86, `slates.query`)**, and **measured 2026-10-05** on a real task (which `.rs` files of
+     `crates/` mention `unsafe`): one call and 4,150 reply bytes against 734 calls and 28.8 MB for list-and-read, the
+     same 73 files (BENCHMARKS; `crates/mcp/examples/codemode_tokens.rs`);
   3. `slates.fs`: listing **done (A-85)**; plain-volume write, mkdir, move and remove **done (A-97)**, on every OS,
      under the caller's write attachment;
   4. `subscriptions/listen`;

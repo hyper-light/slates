@@ -2066,6 +2066,23 @@ AES-256-GCM; 100,000 opens per case, each timed alone). Apple M5 Max; load avera
 The warm open meets A-92's budget (at most about 1 µs p99 under load) on both systems, so idle RAM is sealed under a
 version key kept warm per mounted volume; a cold open per access would not meet it.
 
+### Codemode against list-and-read on a real agent task (condition 13; 2026-10-05)
+
+Command: `cargo run --release -p slates-mcp --example codemode_tokens` (an in-process daemon, 2 shards; an overlay
+volume over this repository's `crates/`; the MCP server driven as an agent drives it). Apple M5 Max, load average
+about 6. The task: which Rust files mention `unsafe`.
+
+| path | tool calls | JSON-RPC reply bytes | tokens (bytes ÷ 4, a heuristic) | wall time |
+|---|---|---|---|---|
+| `slates.fs.list` + `slates.fs.read` of every `.rs`, filtered by the agent | 734 | 28,808,365 | about 7.2 M | 143 ms |
+| one `slates.query` (`FROM files(..) WHERE ext = "rs" AND content CONTAINS "unsafe" SELECT path`) | 1 | 4,150 | about 1,040 | 98 ms |
+
+- The same 73 files either way (the example fails if the sets differ).
+- 6,941× fewer bytes into the agent's context and 734× fewer calls. For a real agent the calls dominate: each one is
+  a model turn.
+- The reply bytes are about twice the 15 MB of source. Each result carries its structured content and, as the MCP
+  specification recommends for compatibility, the same JSON as text.
+
 ### An overlay of a real tree: read, change, plan (condition 5; 2026-10-05)
 
 Command: `bash <scratch>/overlay-diff.sh` (release build; `volume create --dynamic 4GiB --base crates/`, `slates mount`,
