@@ -9552,6 +9552,7 @@ memory cap") and GAPS.
      commitments and the headroom need. `a_shard_is_refused_while_another_holds_the_pool_and_admitted_once_it_returns`:
      while one shard holds both slices, the other's create is refused `BudgetExceeded`; once the volume is destroyed,
      the other is admitted.
-  6. Owed: measured in the memory-capped container (one volume against the whole content capacity); a SIGKILL during
-     growth (a claim taken, no image naming it yet: re-added, then released at the first publication, by reading);
-     a status line for the shard's held extents and `source_refusals`.
+  6. Measured (2026-10-05, BENCHMARKS): under a 1 GiB cap with two shards, one volume holds 264 MiB, against 124 MiB
+     with its own slice and 57 MiB before the power-of-two cut; typed `ENOSPC`, no panic, no OOM kill. Still owed: a
+     SIGKILL during growth (a claim taken, no image naming it yet: re-added, then released at the first publication,
+     by reading); a status line for the shard's held extents and `source_refusals`; where the last 77 MiB goes.

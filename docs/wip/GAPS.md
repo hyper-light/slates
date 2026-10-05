@@ -3692,8 +3692,8 @@ Condition 11/12, 2026-10-05 (BENCHMARKS "The daemon under a container memory cap
   admission and returns wholly free ones after a committed publication. Tests: the A-98 entry in SLATES_DESIGN.
   - First, within a shard, the whole reserve became allocatable (it was only the largest power-of-two part): the
     capped container's volume went from 57 to 124 MiB (BENCHMARKS).
-  - Still owed (A-98 piece 6): the capped container measured with the pool; a SIGKILL between a claim and the first
-    image that names it; held extents and `source_refusals` in status.
+  - Measured with the pool: 264 MiB in one volume under a 1 GiB cap (BENCHMARKS). Still owed: a SIGKILL between a
+    claim and the first image that names it; held extents and `source_refusals` in status; the last 77 MiB.
   - Still per shard: the chunk, inode and directory slabs and the metadata class are sized from one slice. A volume
     of large files reaches the whole pool (a chunk is sixteen granules); a volume of many small files stays bounded by
     its shard's slabs.

@@ -2091,7 +2091,17 @@ last in `python:3.12-slim-trixie`). Docker Desktop 6.12 kernel, Apple M5 Max, lo
   - Daemon alive, 0 restarts, 0 panics, `oom_kill 0`.
   - The gain is more than the 42.7 MiB tail. The operation headroom is capped by the arena's capacity, so with a
     smaller capacity the earlier run lost a larger share of it; the split between the two is not measured.
-  - Test: `a_volume_past_the_reserves_power_of_two_part_fills_and_survives_a_restart` (recovery.rs). A 48 MiB reserve
+  - Test: `a_volume_past_the_reserves_power_of_two_part_fills_and_survives_a_restart` (recovery.rs).
+- **The shared extent pool (A-98), 2026-10-05** (the same command, `FILES=600`, load average 5.3–6.6, commit
+  `f989cc5`): one volume now draws on both shards' slices.
+  - One volume holds **264 MiB** before the 265th 1 MiB file is refused `ENOSPC`, against 124 MiB with a shard's
+    own slice and 57 MiB this morning.
+  - The first 200 files read back with their SHA-256 intact; after deleting half, an 8 MiB write succeeded. Daemon
+    alive, 0 restarts, 0 panics, `oom_kill 0` under the 1 GiB `memory.max`.
+  - The two slices hold about 341 MiB. What takes the other 77 MiB (the operation headroom, the control shard's own
+    claims, a slice's tail under one chunk) is not yet measured.
+  - Writes ran at the fresh-mount stall's pace (WRITE `avg_exe` 398 ms over 1,092 ops), the owed item below, so the
+    run took 166 s. A 48 MiB reserve
     admits a 36 MiB volume and holds 34 MiB of files across a restart, byte for byte, on macOS and Linux. Before the
     change, the create was refused `BudgetExceeded { available: 22 MiB }`.
 - **Large writes on a fresh mount stall** at 200 ms steps, for slates and for Linux's own knfsd alike:
