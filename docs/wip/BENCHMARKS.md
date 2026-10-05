@@ -2090,6 +2090,24 @@ read-path change.
 The bench's first run failed `Capacity`: it made a key before locking hyper-seal's key
 region; it now calls `hyper_seal::lock_keys` first, as the daemon does at boot.
 
+### Zero on free, and the dirty set's heap (A-99, A-68; 2026-10-05)
+
+Command: `cargo run --release -p slates-vfs --example vfs_bench`, two binaries (the scrub on, the scrub a no-op), three
+runs each, interleaved; Apple M5 Max, load average 8–11.
+
+| row | scrub off (3 runs) | scrub on (3 runs) |
+|---|---|---|
+| write 4 KiB into a fresh window then truncate it away | 833–937 ns | 916–1,104 ns |
+| write 4 KiB in place, same epoch | 458–500 ns | 437–479 ns |
+| read 4 KiB | 130–145 ns | 122–135 ns |
+| create burst of 190,000 files, per file | 1,516–1,583 ns | 1,523–1,644 ns |
+| destroy per unit, one slice, 1M files | 22–23 ns | 22–25 ns |
+
+The scrub costs one memset of a freed block (about 100 ns for a 4 KiB granule) on the paths that free one; it lands for
+the at-rest guarantee. AC-1.5 at a million files, bisected over `git archive` builds: `cbde00a` 443,572,350 B,
+`baced10` 443,572,350 B, `0799cc1` (A-68) 578,134,114 B, HEAD before the fix 586,356,834 B (over the 553 B/file budget),
+after 451,795,070 B (within).
+
 ### Codemode against list-and-read on a real agent task (condition 13; 2026-10-05)
 
 Command: `cargo run --release -p slates-mcp --example codemode_tokens` (an in-process daemon, 2 shards; an overlay

@@ -9649,10 +9649,22 @@ sealed under the volume's version key (condition 9, "encrypted at rest when not 
   a seal must not rewrite a block a recovery image names (A-64). A block no image names is sealed in place; one an
   image names is copied to a new block and sealed there, the old block freed through the arena's deferral, so a
   restart before the next publication still reads the image's plaintext open extent (`ChunkStore::seal_where_safe`).
-- Owed, found live the same day (`e2e-installs`: npm, pip and a 2,000-file tar through Docker on a mounted volume; 109
-  chunks sealed): an open extent is sealed only when a write crosses its chunk window or a snapshot seals it, so a
-  file smaller than a chunk stays plaintext while idle. Owed: a sweep at the shard's reap cadence that seals open
-  extents not written since the previous tick, and scrubbing plaintext blocks when freed.
+- Idle sweep, built 2026-10-05 after a live run showed the gap (`e2e-installs`: npm, pip and a 2,000-file tar through
+  Docker on a mounted volume sealed only 109 chunks: an open extent was sealed only when a write crossed its window or a
+  snapshot sealed it, so a file smaller than a chunk stayed plaintext while idle). Each write stamps its inode with the
+  volume's sweep tick; at every reap tick (the liveness cadence) `Volume::age_writes` moves files not written since the
+  previous tick to a pending set, and `Volume::seal_pending` seals their open extents in cooperative slices of
+  `archive_slice_bytes`, yielding between slices. A file is sealed one to two ticks after its last write (as ZFS commits
+  each transaction group and Linux writes back an aged dirty page); an append after reopens one chunk. Recovered open
+  extents are seeded from the image. Sealed inodes are marked for the next delta. Tests: the second sweep seals an idle
+  file and the arena then holds none of its plaintext; a file written between sweeps waits a whole tick; a sweep stops at
+  its budget and the next finishes; a recovered open extent is swept; a live daemon seals an idle 1,000-byte file
+  within two seconds (`content.sealed` moves).
+- Zero on free, built 2026-10-05: a block returning to the free lists is zeroed (`ChunkArena::free` for an immediate
+  free, and the commit or abandon that releases a deferred one), as Linux's `init_on_free=1` does, so a deleted or
+  truncated file's plaintext, or a block a seal moved out of an image, is not left in free arena memory; a deferred
+  block keeps its bytes until the commit, since the image may read them. Measured: the write-then-truncate row 833–937 →
+  916–1,104 ns, the others even (BENCHMARKS).
 - Tag store, measured and replaced the same day: the first build sized one buddy pool for `max_chunks` full runs
   at store construction (268 MB of tags and a 16.7 M-granule buddy per shard here), which a recycled mapping zeroes by
   hand: shard starts in the restart suites p50 26 ms, p99 811 ms, max 978 ms, against the control loop's 1 s wait.

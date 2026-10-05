@@ -65,6 +65,19 @@ struct Slot {
   buddy: Buddy,
 }
 
+/// Zeroes the `len` bytes at `offset` of a block just returned to the free lists (A-99: zero on free, as Linux's
+/// `init_on_free=1` hardening does for the page allocator). A freed block that held a file's plaintext, a deleted
+/// file's or a block a seal moved out of an image, would otherwise keep it in RAM until reused. A block whose free is
+/// deferred keeps its bytes until the commit that releases it: the recovery image may still read them.
+fn scrub(region: &mut Region, offset: usize, len: usize) {
+  if let Some(bytes) = offset
+    .checked_add(len)
+    .and_then(|end| region.bytes_mut().get_mut(offset..end))
+  {
+    bytes.fill(0);
+  }
+}
+
 /// Where an arena's further regions come from (A-98): a pool of extents shared with other arenas, each handed out
 /// to one arena at a time under a stable id.
 pub trait ExtentSource: Send {
@@ -451,7 +464,10 @@ impl ChunkArena {
       .slot_mut(extent.region)
       .ok_or_else(|| foreign(ExtentRefusal::NoSuchRegion))?;
     let before = slot.buddy.free_bytes();
-    slot.buddy.free_or_defer(extent.block)?;
+    let deferred = slot.buddy.free_or_defer(extent.block)?;
+    if !deferred {
+      scrub(&mut slot.region, extent.offset(), extent.len());
+    }
     let released = slot.buddy.free_bytes().saturating_sub(before);
     self.allocated_bytes = self.allocated_bytes.saturating_sub(released);
     Ok(())
@@ -520,12 +536,28 @@ impl ChunkArena {
   /// The publication of the last [`ChunkArena::capture`] committed: frees every deferred block the new image
   /// cannot name.
   pub fn commit_capture(&mut self) {
-    self.settle(Buddy::commit_capture);
+    let mut released_total = 0usize;
+    for slot in self.slots.iter_mut().flatten() {
+      let before = slot.buddy.free_bytes();
+      let Slot { region, buddy } = slot;
+      buddy.commit_capture_releasing(|offset, len| scrub(region, offset, len));
+      released_total =
+        released_total.saturating_add(slot.buddy.free_bytes().saturating_sub(before));
+    }
+    self.allocated_bytes = self.allocated_bytes.saturating_sub(released_total);
   }
 
   /// The publication of the last [`ChunkArena::capture`] did not commit: frees what only it could have named.
   pub fn abandon_capture(&mut self) {
-    self.settle(Buddy::abandon_capture);
+    let mut released_total = 0usize;
+    for slot in self.slots.iter_mut().flatten() {
+      let before = slot.buddy.free_bytes();
+      let Slot { region, buddy } = slot;
+      buddy.abandon_capture_releasing(|offset, len| scrub(region, offset, len));
+      released_total =
+        released_total.saturating_add(slot.buddy.free_bytes().saturating_sub(before));
+    }
+    self.allocated_bytes = self.allocated_bytes.saturating_sub(released_total);
   }
 
   /// Every live block is named by the committed image: the state after a recovery claimed its image's blocks.

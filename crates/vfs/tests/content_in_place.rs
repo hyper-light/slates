@@ -569,3 +569,198 @@ fn a_seal_after_the_image_leaves_the_imaged_open_extent_readable_after_a_restart
   assert_eq!(recovered.stat(&fresh, f).unwrap().size, 1000);
   assert_eq!(read_all(&recovered, &fresh, f, 1000), stable);
 }
+
+/// Shape: bytes a sealing test writes as one file's content: a marker no other byte sequence in the store repeats, so
+/// finding it in the arena means the file's plaintext is there.
+const MARKER: &[u8] = b"PLAINTEXT-MARKER-a99-idle-sweep-0123456789abcdef";
+
+/// A sealing store and a sealing volume on it.
+fn sealing_volume() -> (Store, Volume) {
+  let mut source = store();
+  source.content.set_cipher(Box::new(StreamCipher));
+  let mut vol = volume(&mut source, 1 << 30);
+  vol.set_seal_key(Some(SEAL_KEY));
+  (source, vol)
+}
+
+/// Whether any region of the store's arena holds `needle` anywhere in its bytes, freed or live.
+fn arena_holds(store: &Store, needle: &[u8]) -> bool {
+  (0..store.content.arena().regions()).any(|index| {
+    store
+      .content
+      .arena()
+      .region(u16::try_from(index).unwrap())
+      .is_some_and(|region| {
+        region
+          .bytes()
+          .windows(needle.len())
+          .any(|window| window == needle)
+      })
+  })
+}
+
+/// A file of `copies` markers, the marker's bytes repeated.
+fn marked(copies: usize) -> Vec<u8> {
+  MARKER.repeat(copies)
+}
+
+/// A-99 (the idle sweep). Do: write a file smaller than a chunk on a sealing volume, then sweep twice with no write
+/// between. Expect: the first sweep seals nothing (the file was written in the tick it ends) and its plaintext is in
+/// the arena; the second seals it, the arena no longer holds its plaintext anywhere, and it reads back whole.
+#[test]
+fn an_idle_file_smaller_than_a_chunk_is_sealed_by_the_second_sweep() {
+  let (mut source, mut vol) = sealing_volume();
+  let root = vol.root_inode(&source).unwrap();
+  let f = vol.create_file_no(&mut source, root, "f", 0o644).unwrap();
+  let content = marked(20);
+  vol.write(&mut source, f, 0, &content).unwrap();
+  let first = vol.seal_idle(&mut source, u64::MAX);
+  assert_eq!(first.sealed, 0, "written in the tick the sweep ends");
+  assert!(
+    arena_holds(&source, MARKER),
+    "the open extent holds plaintext"
+  );
+  let second = vol.seal_idle(&mut source, u64::MAX);
+  assert_eq!(second.sealed, 1);
+  assert_eq!(second.sealed_bytes, u64::try_from(content.len()).unwrap());
+  assert!(
+    !arena_holds(&source, MARKER),
+    "no plaintext of the file is left in the arena"
+  );
+  assert_eq!(read_all(&vol, &source, f, content.len()), content);
+}
+
+/// A-99 (the idle sweep). Do: write a file, sweep, write it again, sweep, then sweep once more. Expect: the second
+/// sweep leaves it open (written since the sweep before), the third seals it, and it reads back with both writes.
+#[test]
+fn a_file_written_again_between_sweeps_stays_open_until_it_idles_a_whole_tick() {
+  let (mut source, mut vol) = sealing_volume();
+  let root = vol.root_inode(&source).unwrap();
+  let f = vol.create_file_no(&mut source, root, "f", 0o644).unwrap();
+  let first_write = marked(4);
+  vol.write(&mut source, f, 0, &first_write).unwrap();
+  vol.seal_idle(&mut source, u64::MAX);
+  let at = u64::try_from(first_write.len()).unwrap();
+  vol.write(&mut source, f, at, b"appended").unwrap();
+  assert_eq!(
+    vol.seal_idle(&mut source, u64::MAX).sealed,
+    0,
+    "written since the sweep before"
+  );
+  assert_eq!(vol.seal_idle(&mut source, u64::MAX).sealed, 1);
+  let mut whole = first_write.clone();
+  whole.extend_from_slice(b"appended");
+  assert_eq!(read_all(&vol, &source, f, whole.len()), whole);
+}
+
+/// A-99 (the idle sweep is bounded). Do: write eight files, sweep once to age them, then sweep with a budget of one
+/// file's bytes. Expect: that sweep seals one and leaves seven for the next, and the next seals all seven.
+#[test]
+fn a_sweep_stops_at_its_byte_budget_and_the_next_one_finishes() {
+  let (mut source, mut vol) = sealing_volume();
+  let root = vol.root_inode(&source).unwrap();
+  // Past the inline threshold (two cache lines), so each file holds an open extent.
+  let content = marked(20);
+  for index in 0..8 {
+    let f = vol
+      .create_file_no(&mut source, root, &format!("f{index}"), 0o644)
+      .unwrap();
+    vol.write(&mut source, f, 0, &content).unwrap();
+  }
+  vol.seal_idle(&mut source, u64::MAX);
+  let budget = u64::try_from(content.len()).unwrap();
+  let bounded = vol.seal_idle(&mut source, budget);
+  assert_eq!((bounded.sealed, bounded.left), (1, 7));
+  let rest = vol.seal_idle(&mut source, u64::MAX);
+  assert_eq!((rest.sealed, rest.left), (7, 0));
+  assert!(!arena_holds(&source, MARKER));
+}
+
+/// A-99 (the idle sweep across a restart). Do: write a file, publish an image (it names the open extent), restart
+/// from the surviving arena, then sweep the recovered volume twice. Expect: the recovered file is sealed by the second
+/// sweep, as a file written before the daemon's first sweep would be, and reads back whole.
+#[test]
+fn a_recovered_open_extent_is_sealed_by_the_idle_sweep() {
+  let (mut source, mut vol) = sealing_volume();
+  let root = vol.root_inode(&source).unwrap();
+  let f = vol.create_file_no(&mut source, root, "f", 0o644).unwrap();
+  let content = marked(10);
+  vol.write(&mut source, f, 0, &content).unwrap();
+  source.content.arena_mut().capture();
+  let image = vol.to_image(&source, None).unwrap();
+  source.content.arena_mut().commit_capture();
+
+  let mut fresh = common::surviving(&source);
+  fresh.content.set_cipher(Box::new(StreamCipher));
+  let claims = common::claims(&mut fresh, &[&image]);
+  let mut recovered = rebuild(&mut fresh, &image, &claims).unwrap();
+  recovered.set_seal_key(Some(SEAL_KEY));
+  recovered.seal_idle(&mut fresh, u64::MAX);
+  assert_eq!(recovered.seal_idle(&mut fresh, u64::MAX).sealed, 1);
+  assert_eq!(read_all(&recovered, &fresh, f, content.len()), content);
+}
+
+/// A-99 (zero on free). Do: write a file into its open extent (plaintext in the arena), then remove it with no image
+/// naming its block. Expect: the arena no longer holds its plaintext anywhere, live or free.
+#[test]
+fn a_removed_files_plaintext_is_scrubbed_from_the_arena() {
+  let (mut source, mut vol) = sealing_volume();
+  let root = vol.root_inode(&source).unwrap();
+  let f = vol.create_file_no(&mut source, root, "f", 0o644).unwrap();
+  vol.write(&mut source, f, 0, &marked(20)).unwrap();
+  assert!(
+    arena_holds(&source, MARKER),
+    "the open extent holds plaintext"
+  );
+  vol.unlink_no(&mut source, root, "f").unwrap();
+  assert!(
+    !arena_holds(&source, MARKER),
+    "the freed block was scrubbed"
+  );
+}
+
+/// A-99 (zero on free, deferred). Do: write a file, publish an image naming its open block, remove the file, then
+/// publish again. Expect: the plaintext stays while the committed image names the block (a restart may read it) and is
+/// gone once the next publication commits and releases the block.
+#[test]
+fn a_removed_files_imaged_plaintext_is_scrubbed_when_the_next_publication_commits() {
+  let (mut source, mut vol) = sealing_volume();
+  let root = vol.root_inode(&source).unwrap();
+  let f = vol.create_file_no(&mut source, root, "f", 0o644).unwrap();
+  vol.write(&mut source, f, 0, &marked(20)).unwrap();
+  source.content.arena_mut().capture();
+  vol.to_image(&source, None).unwrap();
+  source.content.arena_mut().commit_capture();
+  vol.unlink_no(&mut source, root, "f").unwrap();
+  assert!(
+    arena_holds(&source, MARKER),
+    "the committed image still names the block: its bytes are kept"
+  );
+  source.content.arena_mut().capture();
+  vol.to_image(&source, None).unwrap();
+  source.content.arena_mut().commit_capture();
+  assert!(
+    !arena_holds(&source, MARKER),
+    "released at the commit and scrubbed"
+  );
+}
+
+/// A-68 with the recording rule (2026-10-05). Do: snapshot a volume (its next publication is always full), publish it,
+/// then write a file. Expect: the volume is not clean, so a barrier publishes the write. A volume that records no
+/// changes because its next publication is full anyway must never answer clean, or a barrier would skip a change.
+#[test]
+fn a_volume_that_records_no_changes_is_never_clean_after_a_write() {
+  let mut source = store();
+  let mut vol = volume(&mut source, 1 << 30);
+  let root = vol.root_inode(&source).unwrap();
+  let f = vol.create_file_no(&mut source, root, "f", 0o644).unwrap();
+  vol.snapshot(&mut source).unwrap();
+  vol.mark_published(&source);
+  vol
+    .write(&mut source, f, 0, b"changed after the publication")
+    .unwrap();
+  assert!(
+    !vol.is_clean(&source),
+    "a write after the publication is not clean"
+  );
+}

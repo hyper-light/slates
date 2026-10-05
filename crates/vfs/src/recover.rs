@@ -1649,6 +1649,13 @@ impl Volume {
       vol.discard_partial(store)?;
       return Err(refusal);
     }
+    // Every open extent the image names is due an idle sweep (A-99), as if written before this daemon's first one: no
+    // write of this life stamps it, and it would otherwise stay plaintext until the file is written again.
+    for inode in &image.inodes {
+      if matches!(inode.body, BodyImage::Chunked { open: Some(_), .. }) {
+        vol.written.insert(InodeNo(inode.no), 0);
+      }
+    }
     Ok(vol)
   }
 

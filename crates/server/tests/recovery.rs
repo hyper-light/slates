@@ -2328,3 +2328,48 @@ fn a_daemon_stopped_while_its_boot_waits_on_a_shard_stops() {
   stopper.join().unwrap();
   drop(segment);
 }
+
+/// A-99 (the idle sweep, live). Do: on a daemon with a sealing root, write one file smaller than a chunk (so no write
+/// seals it) and then leave it. Expect: within the client's start wait the reap loop's sweep seals it (`content.sealed`
+/// moves from zero with no refusal), and it reads back whole.
+#[test]
+fn an_idle_small_file_is_sealed_by_the_daemons_sweep() {
+  let profile = common::machine_profile();
+  let instance = format!("srv-idle-seal-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
+  let segment = anchor_segment("idle-seal", &profile, &config);
+  let daemon = Daemon::start(&profile, config, source_of(&segment)).unwrap();
+  daemon
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let mut client = connect(&instance);
+  let volume = client.create(&scratch("idle-seal")).unwrap();
+  let attachment = client
+    .attach(volume, None, slates_ipc::protocol::Intent::Write)
+    .unwrap()
+    .attachment;
+  let bytes: Vec<u8> = (0..1000u32)
+    .map(|at| u8::try_from(at % 251).unwrap())
+    .collect();
+  client
+    .fs_write((volume, attachment), "small", &bytes, 0o644)
+    .unwrap();
+  assert_eq!(
+    counter(&mut client, "content.sealed"),
+    0,
+    "a small write seals nothing itself"
+  );
+  let started = Instant::now();
+  while counter(&mut client, "content.sealed") == 0 && started.elapsed() < START_WAIT {
+    std::hint::spin_loop();
+  }
+  assert!(
+    counter(&mut client, "content.sealed") > 0,
+    "the sweep sealed the idle file"
+  );
+  assert_eq!(counter(&mut client, "content.seal_refused"), 0);
+  let read = client.read(volume, "small", slates_ipc::protocol::ReadAt::Head);
+  assert!(read.unwrap() == bytes, "the sealed file reads back");
+  daemon.stop();
+  drop(segment);
+}

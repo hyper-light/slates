@@ -48,6 +48,9 @@ pub struct Dirty {
   /// The recorded attachments' reference counts taken, forgotten or swept: the attachment's id and the inode number
   /// (A-96). An owner this process alone knows is not recorded, as the image does not carry it.
   references: BTreeSet<(u64, u64)>,
+  /// Whether anything changed since the last publication, recorded or not: what lets a volume that records no
+  /// details (its next publication is full) still answer clean when nothing changed.
+  changed: bool,
   /// Whether the last publication of this volume committed, so a delta has an image to apply to.
   published: bool,
   /// The volume's shape when it was last published: a delta carries only inodes and entries, so a volume whose
@@ -78,19 +81,39 @@ struct Shape {
 }
 
 impl Dirty {
+  /// Whether a change is worth recording: only while the next publication may be a delta. Before a volume's first
+  /// committed publication, and while its published shape has snapshots, a clone origin or a base plane, the next one
+  /// is its full image whatever changed, so recording would hold a name and a number per change for nothing (measured
+  /// 2026-10-05: 134 heap bytes a file, a million files created into a never-published volume, 443 → 578 MB).
+  fn recording(&self) -> bool {
+    self.published && self.published_shape == Shape::default()
+  }
+
   /// Records a changed inode.
   pub(crate) fn inode(&mut self, no: u64) {
-    self.inodes.insert(no);
+    self.changed = true;
+    if self.recording() {
+      self.inodes.insert(no);
+    }
   }
 
   /// Records a changed directory entry.
   pub(crate) fn entry(&mut self, dir: u64, name: &str) {
-    self.entries.insert((dir, name.to_owned()));
+    self.changed = true;
+    if self.recording() {
+      self.entries.insert((dir, name.to_owned()));
+    }
   }
 
   /// Records a changed reference count of `owner` on inode `no`; an owner this process alone knows is not imaged, so
   /// its changes are not recorded.
   pub(crate) fn reference(&mut self, owner: crate::ids::RefOwner, no: crate::ids::InodeNo) {
+    if matches!(owner, crate::ids::RefOwner::Attachment(_)) {
+      self.changed = true;
+    }
+    if !self.recording() {
+      return;
+    }
     if let crate::ids::RefOwner::Attachment(attachment) = owner {
       self.references.insert((attachment, no.0));
     }
@@ -189,6 +212,7 @@ impl Volume {
   /// Whether nothing changed since this volume's last committed publication: a barrier need not record it.
   pub fn is_clean(&self, store: &Store) -> bool {
     self.dirty.published
+      && !self.dirty.changed
       && self.dirty.inodes.is_empty()
       && self.dirty.entries.is_empty()
       && self.dirty.references.is_empty()
@@ -203,6 +227,7 @@ impl Volume {
     self.dirty.inodes.clear();
     self.dirty.entries.clear();
     self.dirty.references.clear();
+    self.dirty.changed = false;
     self.dirty.published = true;
     self.dirty.published_shape = self.shape();
     self.dirty.published_roots = self.roots(store).ok();

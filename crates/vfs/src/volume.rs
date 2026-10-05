@@ -328,6 +328,15 @@ pub struct Volume {
   /// The key this volume's chunks are sealed under, by the store cipher's reference (A-99); `None` keeps them in the
   /// clear (no cipher, or sealing unavailable on this node).
   pub(crate) seal_key: Option<u32>,
+  /// The inodes written since an idle sweep, each by the sweep tick it was last written in (A-99): a sweep seals the
+  /// open extent of each one not written since the sweep before, so a file smaller than a chunk is not left in
+  /// plaintext while idle. Bounded by the volume's inodes; empty for a volume that does not seal.
+  pub(crate) written: BTreeMap<InodeNo, u64>,
+  /// How many idle sweeps this volume has had: the tick a write is stamped with.
+  pub(crate) sweep_tick: u64,
+  /// Files aged past a sweep tick and not yet sealed, sealed a budget at a time ([`Volume::seal_pending`]); a write
+  /// takes a file back out.
+  pub(crate) idle_pending: std::collections::BTreeSet<InodeNo>,
   pub(crate) state: VolumeState,
   pub(crate) destroy_queue: Vec<Dead>,
   /// Open and lookup references per inode number (§4.6 lifetime; the inode-addressed-io design):
@@ -573,6 +582,9 @@ impl Volume {
       bytes: ByEpoch::default(),
       journal: OpLog::new(config.journal_bytes),
       seal_key: None,
+      written: BTreeMap::new(),
+      sweep_tick: 0,
+      idle_pending: std::collections::BTreeSet::new(),
       state: VolumeState::Live,
       destroy_queue: Vec::new(),
       references: BTreeMap::new(),
@@ -642,6 +654,9 @@ impl Volume {
       bytes: ByEpoch::inherited(epoch, referenced),
       journal: OpLog::new(config.journal_bytes),
       seal_key: None,
+      written: BTreeMap::new(),
+      sweep_tick: 0,
+      idle_pending: std::collections::BTreeSet::new(),
       state: VolumeState::Live,
       destroy_queue: Vec::new(),
       references: BTreeMap::new(),
@@ -731,6 +746,9 @@ impl Volume {
       bytes: ByEpoch::default(),
       journal: OpLog::new(journal_bytes),
       seal_key: None,
+      written: BTreeMap::new(),
+      sweep_tick: 0,
+      idle_pending: std::collections::BTreeSet::new(),
       state: VolumeState::Live,
       destroy_queue: Vec::new(),
       references: BTreeMap::new(),
@@ -1066,6 +1084,91 @@ impl Volume {
   /// Seals this volume's chunks from now on under the store cipher's key `key` (A-99), or keeps them in the clear.
   pub fn set_seal_key(&mut self, key: Option<u32>) {
     self.seal_key = key;
+  }
+
+  /// The idle sweep (A-99) in one call: [`Volume::age_writes`], then [`Volume::seal_pending`] within `budget_bytes`.
+  pub fn seal_idle(&mut self, store: &mut Store, budget_bytes: u64) -> IdleSweep {
+    self.age_writes();
+    self.seal_pending(store, budget_bytes)
+  }
+
+  /// Advances the idle sweep's tick (A-99): every file last written before the previous tick, and not since, is due a
+  /// seal. A file whose last write is one to two ticks old is sealed, as ZFS commits dirty data each transaction group
+  /// and Linux writes back a dirty page once it has aged (`dirty_expire_centisecs`); a later append reopens the chunk,
+  /// one copy of at most a chunk. Called once a tick, however many slices the sealing then takes.
+  pub fn age_writes(&mut self) {
+    let tick = self.sweep_tick;
+    self.sweep_tick = tick.saturating_add(1);
+    if self.seal_key.is_none() {
+      self.written.clear();
+      self.idle_pending.clear();
+      return;
+    }
+    let aged: Vec<InodeNo> = self
+      .written
+      .iter()
+      .filter(|(_, written_at)| **written_at < tick)
+      .map(|(no, _)| *no)
+      .collect();
+    for no in aged {
+      self.written.remove(&no);
+      self.idle_pending.insert(no);
+    }
+  }
+
+  /// Seals the open extents of files due a seal, until `budget_bytes` of open bytes are sealed (one cooperative slice);
+  /// the rest wait for the next slice. A seal the store refuses leaves the file open, counted, until its next write.
+  /// The changed inodes are marked for the next recovery image.
+  pub fn seal_pending(&mut self, store: &mut Store, budget_bytes: u64) -> IdleSweep {
+    let mut outcome = IdleSweep::default();
+    while outcome.sealed_bytes < budget_bytes {
+      let Some(no) = self.idle_pending.pop_first() else {
+        break;
+      };
+      match self.seal_open_body(store, no) {
+        Ok(0) => {}
+        Ok(bytes) => {
+          outcome.sealed = outcome.sealed.saturating_add(1);
+          outcome.sealed_bytes = outcome.sealed_bytes.saturating_add(bytes);
+        }
+        Err(_) => outcome.refused = outcome.refused.saturating_add(1),
+      }
+    }
+    outcome.left = u64::try_from(self.idle_pending.len()).unwrap_or(u64::MAX);
+    outcome
+  }
+
+  /// Seals inode `no`'s open extent into a chunk, if its body has one: the open bytes sealed, or zero.
+  fn seal_open_body(&mut self, store: &mut Store, no: InodeNo) -> Result<u64, VfsError> {
+    let Some(handle) = trie::get(&store.tries, self.inode_root, no) else {
+      return Ok(0);
+    };
+    if !matches!(store.inodes.get(handle)?.body, Body::Open { .. }) {
+      return Ok(0);
+    }
+    let before = content_by_epoch(store, handle);
+    let body = std::mem::replace(&mut store.inodes.get_mut(handle)?.body, Body::None);
+    let Body::Open { open, mut sealed } = body else {
+      store.inodes.get_mut(handle)?.body = body;
+      return Ok(0);
+    };
+    let bytes = open.len;
+    let after = match store.content.seal(open, self.seal_key) {
+      Ok(extent) => {
+        if let Some(extent) = extent {
+          insert_extent(&mut sealed, extent);
+        }
+        Body::Sealed(sealed)
+      }
+      Err(refusal) => {
+        store.inodes.get_mut(handle)?.body = Body::Open { open, sealed };
+        return Err(refusal);
+      }
+    };
+    store.inodes.get_mut(handle)?.body = after;
+    self.reconcile(before, content_by_epoch(store, handle));
+    self.dirty.inode(no.0);
+    Ok(bytes)
   }
 
   /// The key this volume's chunks are sealed under, if any.
@@ -4863,7 +4966,13 @@ impl Volume {
     let before = content_by_epoch(store, handle);
     let body = std::mem::replace(&mut store.inodes.get_mut(handle)?.body, Body::None);
     let landed = self.write_body(store, body, off, bytes);
-    store.inodes.get_mut(handle)?.body = landed.body;
+    let inode = store.inodes.get_mut(handle)?;
+    inode.body = landed.body;
+    // The idle sweep's stamp (A-99): written in this tick, so not sealed before it has idled a whole one.
+    if self.seal_key.is_some() && landed.written > 0 {
+      self.written.insert(inode.no, self.sweep_tick);
+      self.idle_pending.remove(&inode.no);
+    }
     self.reconcile(before, content_by_epoch(store, handle));
     match landed.refused {
       Some(refusal) if landed.written == 0 => Err(refusal),
@@ -5300,6 +5409,19 @@ impl ByEpoch {
 /// chunk; an open extent's whole block, born with the extent. A block is the buddy block its
 /// window's materialized length takes ([`charged_window`]), so the sum is exactly the arena the
 /// head holds.
+/// What one idle sweep of a volume did (A-99).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct IdleSweep {
+  /// Open extents sealed.
+  pub sealed: u64,
+  /// Their bytes.
+  pub sealed_bytes: u64,
+  /// Seals the store refused (the file stays open, tried again after its next write).
+  pub refused: u64,
+  /// Files due a seal left for the next slice.
+  pub left: u64,
+}
+
 pub(crate) fn content_by_epoch(store: &Store, handle: Handle<Inode>) -> Vec<(Epoch, u64)> {
   let Ok(inode) = store.inodes.get(handle) else {
     return Vec::new();

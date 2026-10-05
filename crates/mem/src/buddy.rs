@@ -514,6 +514,12 @@ impl Buddy {
   /// deferred block the new image cannot name is freed. One freed while the capture was open stays deferred,
   /// since the new image may name it, and the next commit frees it.
   pub fn commit_capture(&mut self) {
+    self.commit_capture_releasing(|_, _| {});
+  }
+
+  /// [`Buddy::commit_capture`], telling `released` the byte offset and length of every block it returns to the free
+  /// lists, so the owner of the bytes can scrub them (A-99: a freed block keeps no plaintext).
+  pub fn commit_capture_releasing(&mut self, mut released: impl FnMut(usize, usize)) {
     if !self.capturing {
       return;
     }
@@ -533,6 +539,12 @@ impl Buddy {
         if let Some(index) = index {
           let order = u32::from(self.state_at(index) & ORDER_MASK);
           self.release(index, order);
+          if let Some(offset) = usize::try_from(index)
+            .ok()
+            .and_then(|index| index.checked_shl(self.granule_shift))
+          {
+            released(offset, self.order_bytes(order));
+          }
         }
       }
       let mut kept = deferred & captured;
@@ -554,6 +566,12 @@ impl Buddy {
   /// blocks freed while the capture was open stay deferred for the committed image's sake only if it names
   /// them; the others are freed now.
   pub fn abandon_capture(&mut self) {
+    self.abandon_capture_releasing(|_, _| {});
+  }
+
+  /// [`Buddy::abandon_capture`], telling `released` the byte offset and length of every block it returns to the free
+  /// lists (A-99, as [`Buddy::commit_capture_releasing`]).
+  pub fn abandon_capture_releasing(&mut self, mut released: impl FnMut(usize, usize)) {
     if !self.capturing {
       return;
     }
@@ -573,6 +591,12 @@ impl Buddy {
           let order = u32::from(self.state_at(index) & ORDER_MASK);
           self.deferred_bytes = self.deferred_bytes.saturating_sub(self.order_bytes(order));
           self.release(index, order);
+          if let Some(offset) = usize::try_from(index)
+            .ok()
+            .and_then(|index| index.checked_shl(self.granule_shift))
+          {
+            released(offset, self.order_bytes(order));
+          }
         }
       }
     }

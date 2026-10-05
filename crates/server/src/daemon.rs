@@ -2993,6 +2993,44 @@ async fn reap_loop() {
       CLIENTS_REAPED.fetch_add(u64::try_from(reaped).unwrap_or(u64::MAX), Ordering::AcqRel);
     }
     refresh_pressure_hold();
+    seal_idle_content().await;
+  }
+}
+
+/// The idle sweep of this shard's volumes (A-99), once a reap tick: every volume ages its writes, then the open extents
+/// of files idle a whole tick are sealed in cooperative slices of `archive_slice_bytes` (the bytes a slice hashes in
+/// the shard's step quantum; AES-256-GCM seals at a rate of the same order, measured 6.9–7.7 GB/s against BLAKE3's
+/// 9–10 here), yielding between slices so the shard keeps serving, until none is left.
+async fn seal_idle_content() {
+  let aged = state::with_state(|s| {
+    for (_, slot) in s.volumes.iter_mut_all() {
+      slot.volume.age_writes();
+    }
+  });
+  if aged.is_none() {
+    return;
+  }
+  loop {
+    let left = state::with_state(|s| {
+      let budget = s.config.archive_slice_bytes().max(1);
+      let mut left = 0u64;
+      let mut sealed = 0u64;
+      for (_, slot) in s.volumes.iter_mut_all() {
+        let outcome = slot
+          .volume
+          .seal_pending(&mut s.store, budget.saturating_sub(sealed));
+        sealed = sealed.saturating_add(outcome.sealed_bytes);
+        left = left.saturating_add(outcome.left);
+        if sealed >= budget {
+          break;
+        }
+      }
+      left
+    });
+    if left.unwrap_or(0) == 0 {
+      return;
+    }
+    futures::yield_now().await;
   }
 }
 
