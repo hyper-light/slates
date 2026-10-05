@@ -85,6 +85,20 @@ pub const SUP_ISSUER: usize = 64;
 /// Format: the issuer secret's width — 32 bytes, a 256-bit random value, the width of the BLAKE3 key
 /// that proves it (BLAKE3 §2.3: a 256-bit key).
 pub const ISSUER_SECRET_BYTES: usize = 32;
+/// Format: the node's **sealing root** published word (A-92): `1` once a daemon has published the root key after
+/// it, `0` before (a fresh segment, or one an older daemon wrote, which never had one). The root is made by the
+/// first daemon under this anchor and adopted by every daemon after it, so content sealed under it stays openable
+/// across a daemon restart for exactly the anchor's life, which is the life of the RAM it protects. The page is
+/// locked against swap and kept out of core dumps by the daemon before the root is written to it
+/// (`AnchorSegment::protect_seal_page`); where the OS refuses that lock, no root is published here.
+/// Format: the byte offset inside the supervision block — the cache line after the issuer secret.
+pub const SUP_SEAL_PRESENT: usize = 128;
+/// Format: the sealing root's record offset: its key id (16 bytes, hyper-seal's `KeyId`) then its 32 key bytes.
+pub const SUP_SEAL_ROOT: usize = 136;
+/// Format: the sealing root key id's width (hyper-seal's random 128-bit `KeyId`).
+pub const SEAL_ROOT_ID_BYTES: usize = 16;
+/// Format: the sealing root key's width (AES-256).
+pub const SEAL_ROOT_KEY_BYTES: usize = 32;
 
 /// Format: a published payload's words (the profile, a snapshot slot, a landing slot): the
 /// generation (odd while a writer is inside) then the length, then the bytes.

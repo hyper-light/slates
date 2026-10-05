@@ -280,10 +280,32 @@ mod os {
   pub(crate) fn lock_map(map: &mut MmapMut) -> std::io::Result<()> {
     map.lock()
   }
+
+  /// Locks bytes `offset .. offset + len` of `map` against swapping (the kernel rounds to whole pages) and, on
+  /// Linux, keeps them out of core dumps (`MADV_DONTDUMP`). A range outside the map is refused `InvalidInput`.
+  pub(crate) fn lock_map_range(
+    map: &mut MmapMut,
+    offset: usize,
+    len: usize,
+  ) -> std::io::Result<()> {
+    let end = offset
+      .checked_add(len)
+      .ok_or(std::io::ErrorKind::InvalidInput)?;
+    let range = map
+      .get_mut(offset..end)
+      .ok_or(std::io::ErrorKind::InvalidInput)?;
+    // SAFETY: `range` is a live part of `map`'s own mapping, borrowed mutably for the call; locking changes no byte
+    // of it and no other mapping.
+    unsafe { rustix::mm::mlock(range.as_mut_ptr().cast(), range.len()) }
+      .map_err(std::io::Error::from)?;
+    #[cfg(target_os = "linux")]
+    map.advise_range(memmap2::Advice::DontDump, offset, len)?;
+    Ok(())
+  }
 }
 
 #[cfg(unix)]
-pub(crate) use os::lock_map;
+pub(crate) use os::{lock_map, lock_map_range};
 
 #[cfg(windows)]
 mod os {

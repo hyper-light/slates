@@ -1677,6 +1677,12 @@ pub fn daemon_json(r: &DaemonReport, telemetry: &[TelemetryReport]) -> Value {
     "heartbeat_age_ns": r.heartbeat_age_ns,
     "clients_reaped": r.clients_reaped,
     "clients_refused": r.clients_refused,
+    "seal": {
+      "state": r.seal.state,
+      "root_id": r.seal.root_id.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+      "key_slots": r.seal.key_slots,
+      "keys_held": r.seal.keys_held,
+    },
     "shards": r.shards.iter().map(|shard| {
       let drain = telemetry.iter().find(|batch| batch.partition == shard.partition);
       shard_json(shard, drain)

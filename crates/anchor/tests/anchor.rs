@@ -128,6 +128,35 @@ fn a_segment_is_created_attached_and_read_through_the_seqlock() {
   assert_eq!(words[2].load(Ordering::Acquire), 65_536 - 64);
 }
 
+/// A-92: do create a segment and read its sealing root, then lock its page, publish a root through one attachment
+/// and read it through a later one (a restarted daemon re-attaching the anchor's segment); expect no root on the
+/// fresh segment, the page locked, and the later attachment adopting the very id and key the first published.
+#[test]
+fn a_published_sealing_root_is_adopted_by_a_later_attachment() {
+  let id = identity();
+  let mut created =
+    AnchorSegment::create(&unique_name("slates-anchor-test-seal"), &id, geometry()).unwrap();
+  assert_eq!(
+    created.seal_root().unwrap(),
+    None,
+    "a fresh segment holds no root"
+  );
+  created.protect_seal_page().unwrap();
+  let (handoff, len) = handoff_of(&created);
+  let mut first = AnchorSegment::attach(&handoff, len, &id).unwrap();
+  let (root_id, root_key) = ([7u8; 16], [9u8; 32]);
+  first.protect_seal_page().unwrap();
+  first.publish_seal_root(&root_id, &root_key).unwrap();
+  drop(first);
+  let later = AnchorSegment::attach(&handoff, len, &id).unwrap();
+  assert_eq!(later.seal_root().unwrap(), Some((root_id, root_key)));
+  assert_eq!(
+    later.issuer_secret().unwrap(),
+    [0u8; 32],
+    "the root shares the page with the issuer secret and leaves it alone"
+  );
+}
+
 /// A payload larger than its region, another machine's identity and the wrong length are
 /// refused with nothing written.
 #[test]

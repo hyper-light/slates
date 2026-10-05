@@ -10,9 +10,13 @@ use crate::layout::{
   AT_GENERATION, AT_GEOMETRY, AT_IDENTITY, AT_MAGIC, AT_TOTAL, AT_VERSION, GEOMETRY_BYTES,
   Geometry, HEADER_BYTES, IDENTITY_BYTES, ISSUER_SECRET_BYTES, LAYOUT_VERSION, MAGIC,
   PAYLOAD_BYTES, PAYLOAD_GENERATION, PAYLOAD_LEN, RING_CAPACITY, RING_HEAD, RING_SEQ_BASE,
-  RING_TAIL, RegionKind, RegionSpec, SUP_GENERATION, SUP_HEARTBEAT, SUP_ISSUER, SUP_PID,
-  SUP_RESTARTS, SUP_STARTED, SUP_STATE, SUP_STOP, SUP_STOP_BY, State,
+  RING_TAIL, RegionKind, RegionSpec, SEAL_ROOT_ID_BYTES, SEAL_ROOT_KEY_BYTES, SUP_GENERATION,
+  SUP_HEARTBEAT, SUP_ISSUER, SUP_PID, SUP_RESTARTS, SUP_SEAL_PRESENT, SUP_SEAL_ROOT, SUP_STARTED,
+  SUP_STATE, SUP_STOP, SUP_STOP_BY, State,
 };
+
+/// The node's sealing root as the anchor holds it (A-92): its key id and its key bytes.
+pub type SealRoot = ([u8; SEAL_ROOT_ID_BYTES], [u8; SEAL_ROOT_KEY_BYTES]);
 
 /// Format: the words at the head of a ring region: head, tail, capacity, sequence base.
 pub const RING_WORDS: usize = 4;
@@ -55,6 +59,14 @@ fn segment_words(geometry: &Geometry) -> Words {
         .with(WordRun::racy(
           at.saturating_add(SUP_ISSUER),
           ISSUER_SECRET_BYTES,
+        ))
+        .with(WordRun::one(
+          at.saturating_add(SUP_SEAL_PRESENT),
+          Width::U64,
+        ))
+        .with(WordRun::racy(
+          at.saturating_add(SUP_SEAL_ROOT),
+          SEAL_ROOT_ID_BYTES.saturating_add(SEAL_ROOT_KEY_BYTES),
         )),
       RegionKind::Log(_) | RegionKind::Audit => words.with(WordRun::strided(
         at.saturating_add(RING_HEAD),
@@ -521,6 +533,75 @@ impl AnchorSegment {
     let at = self.region_span(RegionKind::Supervision, SUP_ISSUER, ISSUER_SECRET_BYTES)?;
     self.object.read_racy(at, &mut out)?;
     Ok(out)
+  }
+
+  /// Locks the supervision block's page against swap and keeps it out of core dumps where the OS offers it
+  /// (A-92): the page the sealing root and the grant-issuer secret live on. Called by the daemon before it
+  /// publishes the root; a refusal (the process's locked-memory limit) means no root is kept here.
+  pub fn protect_seal_page(&mut self) -> Result<(), AnchorError> {
+    let range = self.range(self.spec(RegionKind::Supervision)?)?;
+    Ok(
+      self
+        .object
+        .lock_range(range.start, range.end.saturating_sub(range.start))?,
+    )
+  }
+
+  /// Publishes the node's sealing root (A-92): its key id and bytes, then the published word, released after
+  /// them, so a reader that sees the word sees the whole record. One daemon runs under an anchor at a time, so
+  /// there is one writer.
+  pub fn publish_seal_root(
+    &mut self,
+    id: &[u8; SEAL_ROOT_ID_BYTES],
+    key: &[u8; SEAL_ROOT_KEY_BYTES],
+  ) -> Result<(), AnchorError> {
+    let at = self.region_span(
+      RegionKind::Supervision,
+      SUP_SEAL_ROOT,
+      SEAL_ROOT_ID_BYTES.saturating_add(SEAL_ROOT_KEY_BYTES),
+    )?;
+    let mut record = [0u8; SEAL_ROOT_ID_BYTES + SEAL_ROOT_KEY_BYTES];
+    let (record_id, record_key) = record.split_at_mut(SEAL_ROOT_ID_BYTES);
+    record_id.copy_from_slice(id);
+    record_key.copy_from_slice(key);
+    self.object.write_racy(at, &record)?;
+    record.fill(0);
+    let spec = self.spec(RegionKind::Supervision)?;
+    self
+      .word_at(spec, SUP_SEAL_PRESENT)?
+      .store(1, Ordering::Release);
+    Ok(())
+  }
+
+  /// The node's sealing root, if a daemon under this anchor published one: its key id and bytes, which the caller
+  /// moves into locked memory and wipes here. `None` on a fresh segment or one an older daemon wrote.
+  pub fn seal_root(&self) -> Result<Option<SealRoot>, AnchorError> {
+    let spec = self.spec(RegionKind::Supervision)?;
+    if self
+      .word_at(spec, SUP_SEAL_PRESENT)?
+      .load(Ordering::Acquire)
+      != 1
+    {
+      return Ok(None);
+    }
+    let at = self.region_span(
+      RegionKind::Supervision,
+      SUP_SEAL_ROOT,
+      SEAL_ROOT_ID_BYTES.saturating_add(SEAL_ROOT_KEY_BYTES),
+    )?;
+    let mut record = [0u8; SEAL_ROOT_ID_BYTES + SEAL_ROOT_KEY_BYTES];
+    self.object.read_racy(at, &mut record)?;
+    let (id, key) = record.split_at(SEAL_ROOT_ID_BYTES);
+    let parsed = (
+      id.try_into().map_err(|_| AnchorError::Geometry {
+        reason: "the seal root's id",
+      })?,
+      key.try_into().map_err(|_| AnchorError::Geometry {
+        reason: "the seal root's key",
+      })?,
+    );
+    record.fill(0);
+    Ok(Some(parsed))
   }
 
   /// A region's length in bytes.

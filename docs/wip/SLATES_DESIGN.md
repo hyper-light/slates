@@ -9174,6 +9174,18 @@ says (`crates/cluster/tests/sealed.rs`: every length class, no plaintext window 
 of a two-segment chunk refused, every cut, an extension, a repeated and a spliced segment refused, another lineage or
 naming key and a swapped name refused, keyed names equal within a tenant and different across tenants). Owed for
 piece 3: the content plane carrying sealed chunks and a sealed manifest with its clear chunk table.
+Built (2026-10-05): piece 2a, the node root (`crates/server/src/seal_keys.rs`). At boot the daemon locks hyper-seal's
+key region (one base page of key slots per shard, derived and recorded as `seal_key_slots`) and the anchor's
+supervision page (`SparseObject::lock_range`: `mlock` of the one page, `MADV_DONTDUMP` on Linux, `VirtualLock` on
+Windows; the anchor locks it too, so the page stays out of swap between daemons). It then finds the root a previous
+daemon published there (`adopted`) or makes one from the secure random source and publishes it (`minted`). Each shard
+reads the root from its own attachment into a key of its own in the locked region, as it reads the grant-issuer
+secret, so no key crosses a thread and two daemons in one process each have their own. A region or page the OS will
+not lock leaves sealing `unavailable`, reported in status (`seal`, `seal_root` — the id, never the key —
+`seal_key_slots`, `seal_keys_held`) and never used unlocked. Proven by
+`a_restarted_daemon_adopts_its_anchors_sealing_root_and_a_fresh_anchor_mints_another` (macOS, and Linux as a
+non-root user) and `a_published_sealing_root_is_adopted_by_a_later_attachment`. Owed for piece 2: tenant keys per
+(account, partition) wrapped by the root and the volumes' lineage keys, recorded in the partition.
 - Why: condition 9 asks for volumes post-quantum encrypted at rest and in transit. In transit holds already: every TLS
   handshake prefers X25519MLKEM768 (A-66, 2026-10-04), and SecP384r1MLKEM1024 replaces it between nodes once
   hyper-raft's measurement of it lands (its §10). At rest, slates has no disk (R1): a volume rests in RAM, in two

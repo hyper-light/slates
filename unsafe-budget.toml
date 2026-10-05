@@ -174,7 +174,11 @@ slates-machine = 50
 #   the constructor that carries the same single-accessor promise for one shard's arena range of the content
 #   object. Its maps reuse the existing `mmap` and `MapViewOfFile` sites (now taking an offset) and the sparse
 #   section's commit, so no new block.
-slates-mem = 24
+# 2026-10-05 (+2, A-92 sealing root): `SparseObject::lock_range` locks the one page the node's sealing root lives on
+# (the anchor's supervision block) without locking the whole segment: Unix `mlock` over a sub-range of the map
+# (`region::lock_map_range`; memmap2 locks only whole maps, and its `advise_range` covers `MADV_DONTDUMP` safely) and
+# Windows `VirtualLock` over a sub-range of the view. Each is one OS call with no safe wrapper for a range.
+slates-mem = 26
 # 2026-09-14 (+11, registry slot reclamation — `docs/bugs/2026-09-14-shard-registry-leaks-every-slot-for-the-process-lifetime.md`):
 # `driver::KickFd` — the slot-owned kick descriptor: `Sync`/`Send` impls (2), `with`, `fd`, `close` (3
 # blocks reading or taking the `UnsafeCell` under the `closed` flag); `registry::register` (the previous

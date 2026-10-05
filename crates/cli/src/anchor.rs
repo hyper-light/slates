@@ -122,6 +122,11 @@ pub(crate) fn run(options: &ProcessOptions) -> Result<(), Failure> {
   let mut segment = AnchorSegment::create(&seg_name, &profile.facts.identity, config.geometry)
     .and_then(|s| s.with_content(&content_name, content_bytes))
     .map_err(|e| failed("segment", e))?;
+  // The page the node's sealing root lives on stays locked between daemons too (A-92): the anchor maps it all along.
+  // A refusal leaves it to the daemon, which then reports sealing unavailable rather than publish a root there.
+  if let Err(e) = segment.protect_seal_page() {
+    eprintln!("slates anchor: the sealing page could not be locked: {e}");
+  }
   let json = profile.to_json().map_err(|e| failed("profile", e))?;
   segment
     .publish(RegionKind::Profile, json.as_bytes())

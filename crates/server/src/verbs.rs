@@ -2158,7 +2158,20 @@ fn daemon_report(state: &mut ShardState, shards: Vec<ShardReport>) -> ReplyBody 
       clients_refused: crate::daemon::CLIENTS_REFUSED.load(Ordering::Acquire),
       shards,
       fleet,
+      seal: seal_report(state),
     }),
+  }
+}
+
+/// The node's sealing at rest for the status report (A-92): how its root came and its id, and the key region.
+fn seal_report(state: &ShardState) -> slates_ipc::protocol::SealReport {
+  let root_id = state.seal_root.as_ref().map(|root| root.id().0);
+  let (slots, held) = hyper_seal::keys_held().unwrap_or((0, 0));
+  slates_ipc::protocol::SealReport {
+    state: state.seal_state.name().to_owned(),
+    root_id: root_id.map(|id| id.to_vec()).unwrap_or_default(),
+    key_slots: u64::try_from(slots).unwrap_or(u64::MAX),
+    keys_held: u64::try_from(held).unwrap_or(u64::MAX),
   }
 }
 

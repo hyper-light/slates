@@ -36,6 +36,8 @@ const TABLE_SHARE_PERMILLE: u64 = 250;
 /// populated only as bodies need them, so the share bounds the worst case); ratified in GAPS
 /// §5 with the table share.
 const CLIENT_SHARE_PERMILLE: u64 = 250;
+/// Format: a key slot's bytes in hyper-seal's locked region (an AES-256 key, seal.md §8).
+const SEAL_KEY_BYTES: usize = 32;
 /// Shape: the share of the control shard's reserve all fleet sessions' receive windows may hold at once
 /// (§4.10a; research note §5): each window auto-tunes toward its path's BDP within this bound, as the
 /// table and client shares bound theirs (GAPS §5); pages are touched only as data arrives.
@@ -302,6 +304,11 @@ pub struct DaemonConfig {
   /// of the reserve over every fleet session (the accepted and the dialed, on both planes), never below
   /// the initial window. Zero on a laptop.
   pub fleet_session_receive_bytes: u64,
+  /// Derived: the keys hyper-seal's locked region holds at once (A-92; seal.md §8): one base page of 32-byte key
+  /// slots per shard, the bounded cache of unwrapped keys each shard keeps (a key past it is evicted and unwrapped
+  /// again on its next use), and the root among them. Locked once at boot, a few pages, well inside the default
+  /// locked-memory limit.
+  pub seal_key_slots: usize,
   /// Derived: a guest device attachment's credits (§4.6 A-9, §4.9): the request credit is the shard's
   /// admission limit (`requests_in_flight_per_shard`), the byte credit the §4.9 window over the measured
   /// memcpy bandwidth and the mean wake as the kick round trip, with one request's worst case as the frame.
@@ -541,6 +548,17 @@ impl DaemonConfig {
     ));
     // A reply rides one bulk chunk (one page each direction per slot), so a telemetry drain carries
     // what a chunk holds past the report's fixed part (§4.14 bounded export).
+    let seal_key_slots: Derived<usize> = derived!(
+      usize::try_from(page)
+        .unwrap_or(0)
+        .checked_div(SEAL_KEY_BYTES)
+        .unwrap_or(0)
+        .saturating_mul(usize::try_from(shards).unwrap_or(1))
+        .max(1),
+      "page.base / 32 × shards (one page of key slots per shard)",
+      ["page.base", "shards"]
+    );
+    derivations.push(note("seal_key_slots", &seal_key_slots));
     let telemetry_spans_per_reply =
       crate::telemetry::spans_per_reply(usize::try_from(BULK_CHUNK_BYTES).unwrap_or(usize::MAX));
     derivations.push(note(
@@ -742,6 +760,7 @@ impl DaemonConfig {
       fleet_peer_capacity: 0,
       fleet_sessions_per_plane: 0,
       fleet_session_receive_bytes: 0,
+      seal_key_slots: seal_key_slots.get(),
       #[cfg(unix)]
       guest_credits,
       #[cfg(unix)]

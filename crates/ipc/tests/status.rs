@@ -42,6 +42,12 @@ fn report() -> ReplyBody {
       clients_reaped: 11,
       clients_refused: 5,
       shards: Vec::new(),
+      seal: slates_ipc::protocol::SealReport {
+        state: "adopted".to_owned(),
+        root_id: vec![73; 16],
+        key_slots: 79,
+        keys_held: 3,
+      },
       fleet: FleetReport {
         host: 19,
         f: 0,

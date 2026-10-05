@@ -338,6 +338,11 @@ pub struct ShardState {
   /// (`landing::grant_proof`). Every shard reads the same secret, so a grant verifies on whichever shard
   /// serves the client; it is never sent on any channel.
   pub issuer_secret: [u8; slates_anchor::layout::ISSUER_SECRET_BYTES],
+  /// This shard's copy of the node's sealing root (A-92), in hyper-seal's locked region; `None` while sealing is
+  /// unavailable. Tenant keys on this partition are wrapped under it.
+  pub seal_root: Option<hyper_seal::keys::WrappingKey>,
+  /// How the daemon came by the root, for the status report.
+  pub seal_state: crate::seal_keys::RootState,
   /// Replies waiting for the client's ring (full, or the reply came from another shard), by
   /// client slot; `recorded` says the completion record already exists (at the owner
   /// partition of a forwarded verb), so this shard must not record it again.

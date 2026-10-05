@@ -3650,7 +3650,8 @@ shard's own clock that A-65 budgets in (docs/bugs/2026-10-04-the-slow-observatio
 hyper-seal is vendored at hyper-raft `46d1035` (its CI green on all ten jobs). A-92 maps it onto slates: holders keep
 ciphertext, keys live in locked memory for the anchor's life and never touch a disk, a successor opens by a lineage
 key wrapped to its ML-KEM-1024 recipient key. Built: the crate in the build, and the sealed chunk (`slates_cluster::
-sealed`, hostile-input tested). Owed, in order: the key hierarchy and the root's handover; sealed content carried by the
+sealed`, hostile-input tested), and the node root kept for the anchor's life in locked memory and adopted across a
+daemon restart. Owed, in order: tenant and lineage keys recorded in the partition; sealed content carried by the
 content plane (a sealed manifest with its clear chunk table, ciphertext verified by holders, keyed names in missing
 sets); the
 successor's wrapped key in the head record; the idle-RAM measurement and its decision; sealed archives;

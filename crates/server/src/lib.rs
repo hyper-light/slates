@@ -75,6 +75,7 @@ mod work_charge;
 pub mod oci;
 pub mod peer;
 mod reap;
+pub mod seal_keys;
 mod snapshot_view;
 pub mod state;
 mod status_pages;

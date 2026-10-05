@@ -627,6 +627,9 @@ impl Daemon {
     slates_transport::handshake::secure_random(&mut issuer_secret)
       .map_err(|e| ServerError::IssuerSecret(e.to_string()))?;
     segment.publish_issuer_secret(&issuer_secret)?;
+    // The node's sealing root (A-92): adopted from the previous daemon under this anchor, or made and published into
+    // the anchor's locked page; sealing reports itself unavailable, never unlocked, where the OS refuses the lock.
+    let sealing = crate::seal_keys::init(&mut segment, config.seal_key_slots);
     if let Some((was, now)) = limits::raise_descriptor_limit() {
       eprintln!("slates-server: descriptor limit raised from {was} to {now}");
     }
@@ -650,7 +653,7 @@ impl Daemon {
           &config,
           &env,
           &identity,
-          partition,
+          (partition, sealing),
           &all,
           retained,
           #[cfg(target_os = "linux")]
@@ -2509,7 +2512,7 @@ fn init_shard(
   config: &DaemonConfig,
   env: &[(String, String)],
   identity: &Identity,
-  partition: u16,
+  (partition, sealing): (u16, crate::seal_keys::RootState),
   config_shards: &[u16],
   retained: Option<crate::retention::Retained>,
   #[cfg(target_os = "linux")] inherited_fuse: Vec<crate::fuse_hold::HeldDevice>,
@@ -2587,6 +2590,8 @@ fn init_shard(
     |m| m.origin_anchor,
   );
   let issuer_secret = segment.issuer_secret()?;
+  // The node's sealing root (A-92), read from this shard's own attachment into a key of its own in the locked region.
+  let seal_root = crate::seal_keys::shard_root(&segment, sealing);
   let incarnation = retained
     .as_ref()
     .map_or_else(|| boot_incarnation(&issuer_secret), |record| record.nonce);
@@ -2661,6 +2666,8 @@ fn init_shard(
     config: config.clone(),
     segment,
     issuer_secret,
+    seal_root,
+    seal_state: sealing,
     content,
     content_range,
     delta_range: delta_range(config, partition, content_range),

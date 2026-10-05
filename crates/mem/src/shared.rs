@@ -368,6 +368,23 @@ impl SparseObject {
     Ok(())
   }
 
+  /// Locks bytes `offset .. offset + len` into RAM (committed first) and, on Linux, keeps them out of core dumps
+  /// (`MADV_DONTDUMP`): the page a secret lives on (A-92: the node's sealing root key in the anchor's supervision
+  /// block). A range past the object is refused `OutOfRange`, and a lock the OS refuses (its locked-memory limit)
+  /// names the call; the caller then never puts a secret there.
+  pub fn lock_range(&mut self, offset: usize, len: usize) -> Result<(), MemError> {
+    let out_of_range = MemError::OutOfRange {
+      offset,
+      len: self.len,
+    };
+    let end = offset.checked_add(len).ok_or(out_of_range.clone())?;
+    if end > self.len {
+      return Err(out_of_range);
+    }
+    self.commits.commit(&self.inner, offset, len)?;
+    self.inner.lock_range(offset, len)
+  }
+
   /// The declared 64-bit word at `offset`, committed first, as an atomic.
   pub fn atomic_u64(&self, offset: usize) -> Result<&AtomicU64, MemError> {
     check_word(&self.words, offset, Width::U64)?;
@@ -823,6 +840,13 @@ mod platform {
       })
     }
 
+    pub(super) fn lock_range(&mut self, offset: usize, len: usize) -> Result<(), MemError> {
+      crate::region::lock_map_range(&mut self.map, offset, len).map_err(|e| MemError::OsRefused {
+        call: "mlock",
+        code: e.raw_os_error(),
+      })
+    }
+
     #[cfg(target_os = "linux")]
     pub(super) fn handoff(&self) -> Result<Handoff, MemError> {
       use std::os::fd::{AsFd, IntoRawFd};
@@ -1158,6 +1182,19 @@ mod platform {
     pub(super) fn lock(&mut self) -> Result<(), MemError> {
       // SAFETY: the view is ours and `len` bytes long.
       let ok = unsafe { VirtualLock(self.view_ptr(), self.len) };
+      if ok == 0 {
+        return Err(os("VirtualLock"));
+      }
+      Ok(())
+    }
+
+    /// Locks `offset .. offset + len` of the view (the caller checked the range is inside it). Windows keeps no
+    /// locked page out of a crash dump, so locking is the whole of it here.
+    pub(super) fn lock_range(&mut self, offset: usize, len: usize) -> Result<(), MemError> {
+      let start = self.base().wrapping_add(offset).cast::<std::ffi::c_void>();
+      // SAFETY: `start .. start + len` lies inside the view (`SharedObject::lock_range` checked it), which is ours
+      // and committed; locking changes no byte.
+      let ok = unsafe { VirtualLock(start, len) };
       if ok == 0 {
         return Err(os("VirtualLock"));
       }

@@ -1042,6 +1042,23 @@ pub struct DaemonReport {
   pub shards: Vec<ShardReport>,
   /// The daemon's place in its fleet.
   pub fleet: FleetReport,
+  /// The node's sealing at rest (A-92). Appended.
+  pub seal: SealReport,
+}
+
+/// The node's sealing at rest (A-92): how its root came (`unavailable`, `minted`, `minted-daemon-only` or
+/// `adopted`), the root's id (never its key; empty while sealing is unavailable), and hyper-seal's locked key
+/// region: its slots and the keys held in it now.
+#[derive(Wire, Clone, Debug, PartialEq, Eq, Default)]
+pub struct SealReport {
+  /// How the root came.
+  pub state: String,
+  /// The root's key id, 16 bytes, or empty.
+  pub root_id: Vec<u8>,
+  /// The key region's slots.
+  pub key_slots: u64,
+  /// The keys held in it now.
+  pub keys_held: u64,
 }
 
 /// One bounded drain of a shard's telemetry ring (§4.14): the operator-facing export of the chokepoint

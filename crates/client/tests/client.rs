@@ -868,3 +868,79 @@ fn an_async_edit_larger_than_a_request_is_chained_and_resolves_as_one() {
   drop(client);
   daemon.stop();
 }
+
+/// A daemon over `segment`'s handoff (its content object included), started on a fresh config of `instance`.
+fn start_over(profile: &MachineProfile, config: &DaemonConfig, segment: &AnchorSegment) -> Daemon {
+  let (handoff, len) = segment.handoff().unwrap();
+  let content = segment.content_handoff().unwrap();
+  Daemon::start(
+    profile,
+    config.clone(),
+    SegmentSource::Handoff {
+      handoff,
+      len,
+      content,
+    },
+  )
+  .unwrap()
+}
+
+/// The anchor a test plays: a segment and its content object under `tag`.
+fn played_anchor(profile: &MachineProfile, config: &DaemonConfig, tag: &str) -> AnchorSegment {
+  AnchorSegment::create(
+    &format!("slates-seg-{tag}-{}", std::process::id()),
+    &profile.facts.identity,
+    config.geometry,
+  )
+  .unwrap()
+  .with_content(
+    &format!("slates-con-{tag}-{}", std::process::id()),
+    config.content_bytes(),
+  )
+  .unwrap()
+}
+
+/// A-92 piece 2a: do start a daemon under an anchor and read its sealing root from its status, stop it and start a
+/// second daemon under the same anchor, then start a third under a fresh anchor; expect the first to have minted a
+/// root, the second to have adopted that very root (so content sealed under it stays openable across a restart), and
+/// the third to have minted another (the root lives exactly as long as its anchor's RAM).
+#[test]
+fn a_restarted_daemon_adopts_its_anchors_sealing_root_and_a_fresh_anchor_mints_another() {
+  let profile = profile();
+  let instance = format!("cl-seal-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
+  let anchor = played_anchor(&profile, &config, "cl-seal");
+  let first = start_over(&profile, &config, &anchor);
+  let minted = connect(&instance).daemon_status().unwrap().seal;
+  first.stop();
+  let second = start_over(&profile, &config, &anchor);
+  let adopted = connect(&instance).daemon_status().unwrap().seal;
+  second.stop();
+  assert_eq!(
+    minted.state, "minted",
+    "the first daemon under an anchor makes the root: {minted:?}"
+  );
+  assert_eq!(
+    minted.root_id.len(),
+    16,
+    "its id is reported, never its key: {minted:?}"
+  );
+  assert_eq!(adopted.state, "adopted", "a restart finds it: {adopted:?}");
+  assert_eq!(adopted.root_id, minted.root_id, "the very same root");
+  assert!(
+    adopted.key_slots > 0 && adopted.keys_held > 0,
+    "held in the locked region: {adopted:?}"
+  );
+  let fresh_anchor = played_anchor(&profile, &config, "cl-seal-fresh");
+  let third = start_over(&profile, &config, &fresh_anchor);
+  let other = connect(&instance).daemon_status().unwrap().seal;
+  third.stop();
+  assert_eq!(
+    other.state, "minted",
+    "a fresh anchor has no root: {other:?}"
+  );
+  assert_ne!(
+    other.root_id, minted.root_id,
+    "another anchor's life, another root"
+  );
+}

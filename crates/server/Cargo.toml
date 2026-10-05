@@ -11,6 +11,8 @@ description = "The daemon: shards over the runtime, the control shard's rendezvo
 [dependencies]
 # The membership plane's exporter label and key types (A-67 H-2).
 hyper-datagram = { workspace = true }
+# Sealing at rest (A-92): the node root, tenant and lineage keys in locked memory.
+hyper-seal = { workspace = true }
 slates-machine = { workspace = true }
 slates-mem = { workspace = true }
 slates-rt = { workspace = true }
