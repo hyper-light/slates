@@ -202,27 +202,25 @@ impl McpServer {
   /// Handles one JSON-RPC message, returning its reply — or `None` for a notification (a message
   /// with no `id`, such as `notifications/initialized`), which JSON-RPC answers with nothing.
   pub fn handle(&mut self, request: &Value) -> Option<Value> {
+    self.handle_with_header(request, None)
+  }
+
+  /// [`McpServer::handle`] for a request that arrived with the HTTP `MCP-Protocol-Version` header `header`, which
+  /// also says which era the request is in.
+  pub fn handle_with_header(&mut self, request: &Value, header: Option<&str>) -> Option<Value> {
     // A notification carries no `id` field and expects no reply; `?` returns nothing for it.
     let id = request.get("id").cloned()?;
     let method = request.get("method").and_then(Value::as_str).unwrap_or("");
     let params = request.get("params").cloned().unwrap_or(Value::Null);
-    // The era is the request's own (MCP 2026-07-28 versioning): a modern request names its version in `_meta`; a
-    // legacy one (after an `initialize`) names none. Nothing is remembered between requests.
-    let modern = match params
-      .get("_meta")
-      .and_then(|meta| meta.get(META_PROTOCOL_VERSION))
-    {
-      Some(version) => {
-        let version = version.as_str().unwrap_or("");
-        if !MODERN_VERSIONS.contains(&version) {
-          return Some(unsupported_version(&id, version));
-        }
-        true
-      }
-      None => false,
+    // The era is the request's own (MCP 2026-07-28 versioning); nothing is remembered between requests.
+    let modern = match era(&params, method, header) {
+      Ok(modern) => modern,
+      Err(refusal) => return Some(refusal.reply(&id)),
     };
     let result = match method {
       "initialize" => Ok(initialize_result(&params)),
+      // A legacy-era method (2026-07-28 removed it): a legacy client's liveness check is answered empty.
+      "ping" if !modern => Ok(json!({})),
       "server/discover" => Ok(discover_result()),
       "tools/list" => Ok(json!({
         "tools": tool_list(),
@@ -731,18 +729,76 @@ fn complete(mut result: Value) -> Value {
   result
 }
 
-/// The `UnsupportedProtocolVersion` error for a modern request naming `requested`: the versions this server speaks,
-/// so the client can retry in one of them.
-fn unsupported_version(id: &Value, requested: &str) -> Value {
-  json!({
-    "jsonrpc": "2.0",
-    "id": id,
-    "error": {
-      "code": code::UNSUPPORTED_PROTOCOL_VERSION,
-      "message": "Unsupported protocol version",
-      "data": { "supported": MODERN_VERSIONS, "requested": requested },
-    },
-  })
+/// Format: the `_meta` key a modern request names its capabilities under.
+const META_CLIENT_CAPABILITIES: &str = "io.modelcontextprotocol/clientCapabilities";
+
+/// Why a request was refused before it was served: a JSON-RPC error, with its `data` when it carries one.
+pub(crate) struct EraRefusal {
+  /// The JSON-RPC error code.
+  pub(crate) code: i64,
+  message: String,
+  data: Option<Value>,
+}
+
+impl EraRefusal {
+  /// The refusal as the reply to request `id`.
+  pub(crate) fn reply(&self, id: &Value) -> Value {
+    let mut error = json!({ "code": self.code, "message": self.message });
+    if let (Some(data), Some(object)) = (&self.data, error.as_object_mut()) {
+      object.insert("data".to_owned(), data.clone());
+    }
+    json!({ "jsonrpc": "2.0", "id": id, "error": error })
+  }
+}
+
+/// The era of a request with `params` and `method`, arrived with HTTP header `header` (MCP 2026-07-28 versioning,
+/// SEP-2575): modern when its `_meta` names a protocol version or client capabilities (only a modern client sends
+/// them; a legacy client's `_meta` may carry a `progressToken` and nothing more), or when the HTTP header names a
+/// revision that is not a legacy one; legacy otherwise, as a dual-era server serves an `initialize` client. A modern
+/// request must name a version this server speaks (`-32022` with the supported list otherwise) and its client
+/// capabilities (`-32602`, as for a missing version); `initialize`, removed from the modern era, is `-32601`.
+pub(crate) fn era(params: &Value, method: &str, header: Option<&str>) -> Result<bool, EraRefusal> {
+  let meta = params.get("_meta");
+  let version = meta.and_then(|meta| meta.get(META_PROTOCOL_VERSION));
+  let capabilities = meta.and_then(|meta| meta.get(META_CLIENT_CAPABILITIES));
+  let modern_header = header.is_some_and(|header| !LEGACY_VERSIONS.contains(&header));
+  if version.is_none() && capabilities.is_none() && !modern_header {
+    return Ok(false);
+  }
+  if method == "initialize" {
+    return Err(EraRefusal {
+      code: code::METHOD_NOT_FOUND,
+      message:
+        "initialize is not a method of the modern era (MCP 2026-07-28); call server/discover"
+          .to_owned(),
+      data: None,
+    });
+  }
+  let Some(version) = version else {
+    return Err(EraRefusal {
+      code: code::INVALID_PARAMS,
+      message: format!("a modern request names its version in _meta[\"{META_PROTOCOL_VERSION}\"]"),
+      data: None,
+    });
+  };
+  let version = version.as_str().unwrap_or("");
+  if !MODERN_VERSIONS.contains(&version) {
+    return Err(EraRefusal {
+      code: code::UNSUPPORTED_PROTOCOL_VERSION,
+      message: "Unsupported protocol version".to_owned(),
+      data: Some(json!({ "supported": MODERN_VERSIONS, "requested": version })),
+    });
+  }
+  if capabilities.is_none() {
+    return Err(EraRefusal {
+      code: code::INVALID_PARAMS,
+      message: format!(
+        "a modern request names its capabilities in _meta[\"{META_CLIENT_CAPABILITIES}\"]"
+      ),
+      data: None,
+    });
+  }
+  Ok(true)
 }
 
 /// One tool descriptor for `tools/list`: its name, one-line description, and the JSON schema of its

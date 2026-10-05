@@ -3601,7 +3601,11 @@ shard's own clock that A-65 budgets in (docs/bugs/2026-10-04-the-slow-observatio
   3. `slates.fs` listing: **done (A-85, `slates.fs.list`)**; plain-volume write, move and delete over MCP are owed
      (works already edit and declare);
   4. `subscriptions/listen`;
-  5. the official conformance suite, run in a container (no host install).
+  5. the official conformance suite, run in a container (no host install): **done (A-87)**: 103 checks pass on
+     the 2026-07-28 requirements and every failure is classified (reference fixtures, the optional tasks extension,
+     undeclared features). The recorded harness is in `docs/wip/conformance/mcp/` and runs manually, not in CI
+     (banned item 13). Owed: the tasks extension (`io.modelcontextprotocol/tasks`) for long verbs (landings, large
+     clones), if measurement shows a call outliving a client's timeout.
 
 ### 2026-10-05: edits and reads past one bulk chunk (fixed); work volumes are uncharged (owed)
 

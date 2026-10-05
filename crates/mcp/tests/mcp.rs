@@ -141,6 +141,52 @@ fn assert_modern_list_and_versions(server: &mut McpServer) {
     legacy["result"]["protocolVersion"], "2025-11-25",
     "a legacy client keeps its version"
   );
+  // `ping` is a legacy-era method (removed in 2026-07-28): a legacy client's is answered, a modern request's is not.
+  let ping = server
+    .handle(&json!({ "jsonrpc": "2.0", "id": "p", "method": "ping" }))
+    .unwrap();
+  assert_eq!(ping["result"], json!({}), "{ping}");
+  let modern_ping = server
+    .handle(&json!({
+      "jsonrpc": "2.0", "id": "mp", "method": "ping",
+      "params": { "_meta": modern_meta("2026-07-28") },
+    }))
+    .unwrap();
+  assert_eq!(modern_ping["error"]["code"], -32601, "{modern_ping}");
+  assert_modern_meta_is_required(server);
+}
+
+/// MCP 2026-07-28 (SEP-2575): do send modern requests (`clientCapabilities` present) whose `_meta` lacks its protocol
+/// version, and one with a version but no `clientCapabilities`; expect each refused `-32602`. Send `initialize` as a
+/// modern request; expect `-32601` (the method is removed in the modern era).
+fn assert_modern_meta_is_required(server: &mut McpServer) {
+  let no_version = server
+    .handle(&json!({
+      "jsonrpc": "2.0", "id": "nv", "method": "tools/list",
+      "params": { "_meta": { "io.modelcontextprotocol/clientCapabilities": {} } },
+    }))
+    .unwrap();
+  assert_eq!(no_version["error"]["code"], -32602, "{no_version}");
+  let no_capabilities = server
+    .handle(&json!({
+      "jsonrpc": "2.0", "id": "nc", "method": "tools/list",
+      "params": { "_meta": { "io.modelcontextprotocol/protocolVersion": "2026-07-28" } },
+    }))
+    .unwrap();
+  assert_eq!(
+    no_capabilities["error"]["code"], -32602,
+    "{no_capabilities}"
+  );
+  let modern_initialize = server
+    .handle(&json!({
+      "jsonrpc": "2.0", "id": "mi", "method": "initialize",
+      "params": { "_meta": modern_meta("2026-07-28") },
+    }))
+    .unwrap();
+  assert_eq!(
+    modern_initialize["error"]["code"], -32601,
+    "{modern_initialize}"
+  );
 }
 
 /// The protocol handshake: initialize reports the version and identity, tools/list offers the merge
@@ -1002,6 +1048,50 @@ fn assert_modern_http(port: u16, host: &str, token: &str) {
   assert!(
     unsupported.starts_with("HTTP/1.1 400") && unsupported.contains("-32022"),
     "{unsupported}"
+  );
+  assert_modern_http_refusals(port, host, token);
+}
+
+/// The refusals of [`assert_modern_http`]: a header and body naming different versions (`-32020`), a modern request
+/// missing its `_meta` (`-32602`, 400), `initialize` as a modern request (`-32601`, 404), and an unknown method (404).
+fn assert_modern_http_refusals(port: u16, host: &str, token: &str) {
+  let v = "2026-07-28";
+  // A header and body naming different versions disagree before either is judged supported (SEP-2575: -32020).
+  let mismatched = modern_body("tools/list", json!({}), "1900-01-01");
+  let disagreed = modern_exchange(
+    port,
+    host,
+    token,
+    "\r\nMCP-Protocol-Version: 2026-07-28\r\nMcp-Method: tools/list",
+    &mismatched,
+  );
+  assert!(
+    disagreed.starts_with("HTTP/1.1 400") && disagreed.contains("-32020"),
+    "{disagreed}"
+  );
+  let bare = json!({ "jsonrpc": "2.0", "id": 8, "method": "tools/list", "params": {} });
+  let missing_meta = modern_exchange(
+    port,
+    host,
+    token,
+    "\r\nMCP-Protocol-Version: 2026-07-28\r\nMcp-Method: tools/list",
+    &bare,
+  );
+  assert!(
+    missing_meta.starts_with("HTTP/1.1 400") && missing_meta.contains("-32602"),
+    "{missing_meta}"
+  );
+  let initialize = json!({ "jsonrpc": "2.0", "id": 9, "method": "initialize", "params": {} });
+  let removed = modern_exchange(
+    port,
+    host,
+    token,
+    "\r\nMCP-Protocol-Version: 2026-07-28\r\nMcp-Method: initialize",
+    &initialize,
+  );
+  assert!(
+    removed.starts_with("HTTP/1.1 404") && removed.contains("-32601"),
+    "{removed}"
   );
   let unknown = modern_body("no/such", json!({}), v);
   let missing = modern_exchange(

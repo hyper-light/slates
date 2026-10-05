@@ -9051,3 +9051,16 @@ Status: built 2026-10-05 (condition 13's codemode).
     than a full scan; glob semantics; every refusal and each ceiling by name;
   - `assert_codemode_answers_one_query` on a live daemon (a ten-row answer from a 302-entry walk, a line search,
     an unknown column refused as a tool-execution error).
+
+### A-87 — MCP conformance against the official suite; the era rule reads the header (2026-10-05)
+Applied in the same change to: `crates/mcp/src/lib.rs` (`era`, `EraRefusal`, `handle_with_header`, legacy `ping`),
+`crates/mcp/src/http.rs` (the era check before the header checks; header-versus-body disagreement first),
+`crates/mcp/tests/mcp.rs`, `docs/wip/conformance/mcp/` (the recorded harness), BENCHMARKS, GAPS.
+Status: built 2026-10-05.
+- What: a request's era comes from its body and its transport. It is modern when its `_meta` names a version or
+  client capabilities (a legacy client's `_meta` carries at most a `progressToken`), or when its
+  `MCP-Protocol-Version` header names a non-legacy revision. A modern request must carry both, or is refused
+  `-32602` (HTTP 400). `initialize` is not a modern method (`-32601`, HTTP 404). A header and a body naming
+  different versions are `-32020` before either is judged supported. Legacy clients keep `initialize` and `ping`.
+- Proven: the official conformance suite (BENCHMARKS, every failure classified) and the surface test's era
+  assertions, each failing before its fix.

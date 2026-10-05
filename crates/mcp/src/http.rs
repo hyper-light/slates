@@ -498,14 +498,42 @@ fn dispatch(server: &mut McpServer, head: &Head, body: &[u8]) -> (&'static str, 
     // A body the server cannot accept is an HTTP error (Streamable HTTP: "e.g., `400 Bad Request`").
     return (BAD_REQUEST, Some(crate::parse_error_reply()));
   };
-  if let Err(mismatch) = check_headers(head, &message) {
-    let id = message.get("id").cloned().unwrap_or(Value::Null);
+  let id = message.get("id").cloned().unwrap_or(Value::Null);
+  // A modern request without its required `_meta`, or a method the modern era removed, is refused before the
+  // header checks (SEP-2575: missing `_meta` fields are `400`, a removed method `404`).
+  let params = message.get("params").cloned().unwrap_or(Value::Null);
+  let method = message.get("method").and_then(Value::as_str).unwrap_or("");
+  // A header and a body naming different versions disagree, whatever either names (`HeaderMismatch` first).
+  let body_version = params
+    .get("_meta")
+    .and_then(|meta| meta.get(crate::META_PROTOCOL_VERSION_KEY))
+    .and_then(Value::as_str);
+  if let (Some(header), Some(body)) = (head.protocol_version.as_deref(), body_version)
+    && header != body
+  {
+    let mismatch = format!(
+      "Header mismatch: MCP-Protocol-Version header value '{header}' does not match body value '{body}'"
+    );
     return (
       BAD_REQUEST,
       Some(crate::header_mismatch_reply(&id, &mismatch)),
     );
   }
-  let reply = server.handle(&message);
+  if let Err(refusal) = crate::era(&params, method, head.protocol_version.as_deref()) {
+    let status = if refusal.code == crate::METHOD_NOT_FOUND_CODE {
+      NOT_FOUND
+    } else {
+      BAD_REQUEST
+    };
+    return (status, Some(refusal.reply(&id)));
+  }
+  if let Err(mismatch) = check_headers(head, &message) {
+    return (
+      BAD_REQUEST,
+      Some(crate::header_mismatch_reply(&id, &mismatch)),
+    );
+  }
+  let reply = server.handle_with_header(&message, head.protocol_version.as_deref());
   let status = match reply
     .as_ref()
     .and_then(|reply| reply.get("error"))

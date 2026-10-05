@@ -1792,3 +1792,30 @@ tens of µs to serve: the first replies waited out the whole pipeline to save on
 stands. A turn writes what it built once it passes the quantum (about one wake, about one syscall), so a reply waits
 at most about a quantum. The pipelining test's flake came from its regime, not from the rule: in a debug build one
 READ costs 46–68 µs against a 5.3 µs wake-estimate quantum. It now pins its quantum.
+
+### MCP conformance: the official suite against `slates mcp` (A-87; 2026-10-05)
+
+Commands (`docs/wip/conformance/mcp/`): `linux-build.sh` (a release build in `rust:1.98.0`), then
+`docker run --rm -e CONF_SRC=1 -e "CONF_ARGS=--requirements 2026-07-28" -v slates-linux-target:/target:ro
+-v <this dir>:/conf:ro -v <out>:/out node:22-trixie bash /conf/run.sh`, and `python3 classify.py <out>`.
+
+`run.sh` starts an anchor, bootstraps it, serves `slates mcp --http 0`, and runs the suite (built from source at
+`c37eec8`, 2026-10-01; the published 0.1.16 has no 2026-07-28 scenarios) through `proxy.js`. The proxy adds the
+edge's bearer token, which the harness cannot send, and maps only its own address to the edge's, so hostile `Host`
+and `Origin` values reach slates unchanged. The image must share the build's glibc (`node:22` bookworm cannot run a
+`rust:1.98.0` binary).
+
+| run | passed | failed | of the failures |
+|---|---|---|---|
+| `--requirements 2026-07-28` | 103 | 65 | 38 reference fixtures, 26 the optional tasks extension, 4 undeclared features (`completion/complete`; MRTR input requests no slates tool makes) |
+| `--suite all` (legacy 2025-06-18/2025-11-25) | 7 | 24 | 19 reference fixtures, 5 undeclared capabilities (logging, completion, subscriptions), 2 legacy stateful-session checks |
+
+- Every core check of what slates implements passes: `server-stateless` 21 of 21 testable (the other 4 need the
+  suite's diagnostic tools), `caching` 8 of 8, `http-header-validation` 14 of 14, `sep-2164-resource-not-found` 3 of
+  3, `dns-rebinding-protection` 2 of 2, `tools-list` 4 of 4, and the legacy `server-initialize` and `ping`.
+- Defects the suite found, fixed with failing tests first:
+  - legacy `ping` was unanswered;
+  - a modern request (by header or by `clientCapabilities`) missing its version or capabilities was taken as
+    legacy instead of refused `-32602`/400;
+  - `initialize` as a modern request was answered instead of `-32601`/404;
+  - a header naming a different version from the body met `-32022` before `-32020`.
