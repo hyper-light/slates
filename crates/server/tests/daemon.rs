@@ -3812,3 +3812,94 @@ fn a_contended_wake_tail_does_not_shrink_the_client_seats() {
     "the daemon seats every concurrent client"
   );
 }
+
+/// §4.2 (a work's charge), banned item 8: do create a work, edit it, then withhold the shard's whole admittable
+/// capacity (the memory-pressure hold) and edit again; expect the edit refused `BudgetExceeded` with the file
+/// unchanged, and a new work of the (now non-empty) green refused too (its seeded copy is charged). Release the
+/// hold; expect the edit to succeed.
+/// A work's content and journal live in the owner shard's memory, so they are charged like a volume's growth, never
+/// kept for free.
+#[test]
+fn a_works_edits_are_charged_and_refused_typed_when_the_budget_cannot_hold_them() {
+  use slates_ipc::protocol::ReadAt;
+  let (daemon, instance) = daemon("work-charge");
+  let mut client = Client::connect(&instance);
+  let ReplyBody::GreenCreated { id: green, .. } = client.call(&RequestBody::CreateGreen {
+    name: "charge-g".to_owned(),
+    require_evidence: false,
+    base: None,
+  }) else {
+    panic!("a green")
+  };
+  let ReplyBody::WorkCreated { id: work, .. } = client.call(&RequestBody::CreateWork {
+    green,
+    name: "charge-w".to_owned(),
+  }) else {
+    panic!("a work")
+  };
+  let edit = |client: &mut Client, bytes: &[u8]| {
+    client.call(&RequestBody::Edit {
+      work,
+      path: "f.txt".to_owned(),
+      at: 0,
+      delete_len: 0,
+      bytes: bytes.to_vec(),
+    })
+  };
+  assert_eq!(edit(&mut client, b"before"), ReplyBody::Edited);
+  // Submitted, so the green holds the file and a new work's seeded copy of it costs bytes.
+  let submitted = client.call(&RequestBody::Submit {
+    work,
+    evidence: Vec::new(),
+  });
+  assert!(
+    matches!(
+      submitted,
+      ReplyBody::Submitted {
+        version: Some(_),
+        ..
+      }
+    ),
+    "{submitted:?}"
+  );
+  daemon.inject_pressure_hold(u64::MAX).unwrap();
+  let refused = edit(&mut client, b"under the hold");
+  assert!(
+    matches!(
+      refused,
+      ReplyBody::Refused {
+        refusal: slates_ipc::protocol::Refusal::BudgetExceeded { .. }
+      }
+    ),
+    "an edit the budget cannot hold is refused: {refused:?}"
+  );
+  let read = client.call(&RequestBody::Read {
+    volume: work,
+    path: "f.txt".to_owned(),
+    at: ReadAt::Head,
+  });
+  assert_eq!(
+    read,
+    ReplyBody::ReadBytes {
+      bytes: b"before".to_vec()
+    },
+    "the refused edit changed nothing"
+  );
+  let second = client.call(&RequestBody::CreateWork {
+    green,
+    name: "charge-w2".to_owned(),
+  });
+  assert!(
+    matches!(
+      second,
+      ReplyBody::Refused {
+        refusal: slates_ipc::protocol::Refusal::BudgetExceeded { .. }
+      }
+    ),
+    "a new work's seeded copy is charged: {second:?}"
+  );
+  daemon.inject_pressure_hold(0).unwrap();
+  assert_eq!(edit(&mut client, b"after "), ReplyBody::Edited);
+  drop(client);
+  daemon.stop();
+}

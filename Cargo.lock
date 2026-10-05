@@ -1601,6 +1601,7 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "hyper-datagram",
+ "proptest",
  "rcgen",
  "rustix",
  "rustls",
@@ -1622,6 +1623,7 @@ dependencies = [
  "slates-mem",
  "slates-merge",
  "slates-rt",
+ "slates-test-seeds",
  "slates-transport",
  "slates-vfs",
  "slates-wire",

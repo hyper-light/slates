@@ -675,6 +675,9 @@ pub struct WorkState {
   /// Bumped by every change to `content` (an edit, a namespace declaration, a submit or rebase moving the work):
   /// the stamp a paged read of the work's head compares between pages (`ReadRange`).
   pub revision: u64,
+  /// The bytes this work is charged against the shard's budget: its content's and journal's footprint
+  /// (`crate::work_charge`), released when it shrinks, resets or is destroyed.
+  pub charged: u64,
 }
 
 /// A reply waiting to be written into a client's ring.

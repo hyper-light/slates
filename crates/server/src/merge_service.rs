@@ -1027,6 +1027,7 @@ pub(crate) fn destroy_merge_volume(
   // A retired work may have held the oldest reachable version of its green: fold and credit. A
   // destroyed green credits everything it charged as retention.
   if let Some(work) = state.works.remove(&id) {
+    crate::work_charge::release(state, work.charged);
     let _ = settle_green_retention(state, work.green);
   }
   if state.greens.remove(&id).is_some() {

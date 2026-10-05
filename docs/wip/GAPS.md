@@ -3610,6 +3610,7 @@ shard's own clock that A-65 budgets in (docs/bugs/2026-10-04-the-slow-observatio
   (`StageBegin`, `StagePut`, `EditStaged`), the buffers charged, owned and expiring.
 - **Owed:**
   - the SDKs' async read and edit page loops (one message today: a large one is refused, typed);
-  - **work volumes are uncharged:** a work's content map and journal grow without any charge or limit (created
-    `Dynamic { max: 0 }`, content outside the charged store), against banned item 8. Next: charge a work's content
-    to the store, with a typed refusal at its bound.
+  - ~~work volumes are uncharged~~ **fixed (A-84):** a work is charged for its content and journal against the
+    shard budget, before each verb changes it (`docs/bugs/2026-10-05-work-volumes-grew-uncharged.md`). Owed: a work
+    still copies its green's whole content at creation (now charged); sharing the green's bytes copy-on-write
+    comes with VFS-backed works.

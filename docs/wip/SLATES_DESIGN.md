@@ -8993,3 +8993,21 @@ work volumes are owed.
   that already costs one per verb.
 - Proven: `assert_a_large_file_reads_whole` (16 KiB through MCP), `assert_a_page_stamp_moves_with_the_file`, and
   the staging unit tests.
+
+### A-84 — A work volume is charged for what it keeps (2026-10-05)
+Applied in the same change to: `crates/server/src/work_charge.rs` (new), `crates/merge/src/increment.rs`
+(`VolumeOp::footprint`), `crates/server/src/{verbs,merge_service,state}.rs` (`WorkState::charged`; edit, declare,
+create, submit, rebase, destroy, prune, recovery), `crates/server/tests/daemon.rs`, `crates/server/Cargo.toml`
+(proptest, test seeds), `docs/bugs/2026-10-05-work-volumes-grew-uncharged.md`, GAPS.
+Status: built 2026-10-05 (§4.2 all-cost admission, for works).
+- Why: a work's content and journal live in the owner shard's memory beside the volume core and were never
+  charged, against banned item 8. Greens were (A-16).
+- What: the charge is a dynamic volume's growth (`ShardBudget::grow`), taken before the verb changes anything, so a
+  refused verb changes nothing. An edit or declaration is charged by its exact delta (no recount per edit, so a
+  large work's edit stays cheap). A create, rebase or recovered work is recounted once. A submit secures the
+  green's files as a bound before its verdict and settles after. Destroy and prune release the charge, and a
+  recovered work the budget cannot hold is left unbuilt and counted (`merge.work_rebuild_refused`), never kept
+  uncharged.
+- Proven: `a_works_edits_are_charged_and_refused_typed_when_the_budget_cannot_hold_them` (live daemon, the
+  pressure hold) and `the_incremental_charge_equals_a_recount_after_every_step` (generated histories against a
+  recount).

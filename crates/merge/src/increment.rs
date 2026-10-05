@@ -172,6 +172,36 @@ pub enum VolumeOp {
 }
 
 impl VolumeOp {
+  /// The bytes this operation holds in memory: its own size and the heap its strings and value use. What a work
+  /// volume's journal is charged per operation (a work is charged for what it keeps, §4.2).
+  pub fn footprint(&self) -> u64 {
+    let heap = match self {
+      VolumeOp::Overwrite { path, .. }
+      | VolumeOp::Extend { path, .. }
+      | VolumeOp::Truncate { path, .. }
+      | VolumeOp::Insert { path, .. }
+      | VolumeOp::Delete { path, .. }
+      | VolumeOp::Create { path }
+      | VolumeOp::Mknod { path, .. }
+      | VolumeOp::Unlink { path }
+      | VolumeOp::Mkdir { path }
+      | VolumeOp::Rmdir { path }
+      | VolumeOp::SetMode { path, .. } => path.len(),
+      VolumeOp::Rename { from, to } => from.len().saturating_add(to.len()),
+      VolumeOp::Symlink { path, target } | VolumeOp::Link { path, target } => {
+        path.len().saturating_add(target.len())
+      }
+      VolumeOp::SetXattr { path, name, value } => path
+        .len()
+        .saturating_add(name.len())
+        .saturating_add(value.len()),
+      VolumeOp::RemoveXattr { path, name } => path.len().saturating_add(name.len()),
+    };
+    u64::try_from(size_of::<VolumeOp>().saturating_add(heap)).unwrap_or(u64::MAX)
+  }
+}
+
+impl VolumeOp {
   /// The path-free content operation, or `None` for a namespace operation.
   fn content(&self) -> Option<ContentOp> {
     match *self {
