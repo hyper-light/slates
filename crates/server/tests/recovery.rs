@@ -735,10 +735,15 @@ fn two_daemons_in_one_process_measure_memory_pressure_from_their_own_start() {
     (daemon, segment)
   };
   let (first, first_segment) = start("first");
+  // The process's resident memory is pinned too: the hold subtracts the daemon's own resident growth, and a real
+  // reading of a test process (both daemons and the harness) moves with whatever else runs, which made this test fail
+  // under x86_64 emulation at load 60 (2026-10-05).
+  first.inject_resident_memory(SAMPLED_RESIDENT).unwrap();
   first.inject_available_memory(SAMPLED_AVAILABLE).unwrap();
   let first_sampled =
     within_sampler_wait(|| first.pressure_baseline() == Ok(Some(SAMPLED_AVAILABLE)));
   let (second, second_segment) = start("second");
+  second.inject_resident_memory(SAMPLED_RESIDENT).unwrap();
   second
     .inject_available_memory(SAMPLED_AVAILABLE - GROWN_BETWEEN_STARTS)
     .unwrap();

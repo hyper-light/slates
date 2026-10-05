@@ -2174,6 +2174,20 @@ tmpfs, so the slowdown is not in slates' code since then. `strace -c -w` on the 
 them in the VM's host namespace (4 listening there, no NFS mounts). Every loopback RPC is throttled; numbers from this
 VM are not comparable until it is reset (restarting Docker Desktop stops other sessions' containers).
 
+### x86_64 Linux under emulation (condition 6; 2026-10-05)
+
+`docker run --platform linux/amd64 rust:1.98.0` on the M5 Max (Docker Desktop's x86_64 emulation; `uname -m` x86_64),
+HEAD after A-101, its own target and registry volumes, tests run as a non-root user; load average 18–60 from other
+sessions:
+- `cargo test -p slates-mem -p slates-vfs`: 316 passed, 0 failed (the content seal with its tag slab, the idle sweep,
+  zero on free, the 1 KiB directory tree and its oracle, the boxed body variants).
+- `slates-server --test seal`: 2/2; `--test daemon`: 19/19 (two failed in a parallel run on `Stalled` and passed alone).
+- `slates-server --test recovery` in parallel: 8/26, every failure a client `Stalled` after 1 s or a wall-clock check;
+  serially (`--test-threads=1`): 25/26, the sealed restart (AES-256-GCM through aws-lc's x86_64 code) among them. The
+  last was a test defect: `two_daemons_in_one_process_measure_memory_pressure_from_their_own_start` injected the
+  available memory but read the process's real resident memory, which the hold subtracts since `0db78cb`; it now pins
+  both (3/3 natively, 3/3 under emulation).
+
 ### Codemode against list-and-read on a real agent task (condition 13; 2026-10-05)
 
 Command: `cargo run --release -p slates-mcp --example codemode_tokens` (an in-process daemon, 2 shards; an overlay
