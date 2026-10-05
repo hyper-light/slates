@@ -1877,6 +1877,43 @@ impl Client {
     }
   }
 
+  /// A directory's direct entries at a view (§4.12 `slates.fs.list`), every page of them (`ReadDir`): a green's
+  /// head or named version, the version an attachment pins, or a work's or plain volume's live tree.
+  pub fn list_dir(
+    &mut self,
+    volume: VolumeId,
+    path: &str,
+    at: ReadAt,
+  ) -> Result<Vec<slates_ipc::protocol::DirEntry>, ClientError> {
+    let mut entries = Vec::new();
+    let mut cursor = 0u64;
+    loop {
+      let reply = self.call(&RequestBody::ReadDir {
+        volume,
+        path: path.to_owned(),
+        at,
+        cursor,
+      })?;
+      let ReplyBody::DirPage {
+        entries: page,
+        next,
+      } = resolved(reply)?
+      else {
+        return Err(ClientError::UnexpectedReply { verb: "list" });
+      };
+      let progressed = !page.is_empty();
+      entries.extend(page);
+      match next {
+        None => return Ok(entries),
+        // A page that names its own cursor and holds nothing would loop forever.
+        Some(next) if next == cursor && !progressed => {
+          return Err(ClientError::UnexpectedReply { verb: "list" });
+        }
+        Some(next) => cursor = next,
+      }
+    }
+  }
+
   /// A green's head version (§4.16 merge chain).
   pub fn versions(&mut self, green: VolumeId) -> Result<u64, ClientError> {
     match self.call(&RequestBody::Versions { green })? {

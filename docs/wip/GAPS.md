@@ -3598,7 +3598,8 @@ shard's own clock that A-65 budgets in (docs/bugs/2026-10-04-the-slow-observatio
      the skills reach clients over MCP and as the raw tree in the repository;
   2. codemode: one tool that runs a bounded program over the volume verbs (vorpal's query-language pattern; output
      reduction is the measured win, `research/mcp-skills-sdks.md` §2.2.5);
-  3. `slates.fs` write, list, move and delete;
+  3. `slates.fs` listing: **done (A-85, `slates.fs.list`)**; plain-volume write, move and delete over MCP are owed
+     (works already edit and declare);
   4. `subscriptions/listen`;
   5. the official conformance suite, run in a container (no host install).
 

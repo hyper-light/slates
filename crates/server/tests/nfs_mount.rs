@@ -2737,3 +2737,63 @@ fn two_fresh_daemons_name_different_servers_and_mint_different_client_ids() {
   drop((a, b));
   drop((first, second));
 }
+
+/// §4.12 `ReadDir` on a plain volume: do write two files and a directory into a provisioned volume through its NFS
+/// mount, and list its root and the directory over the typed channel; expect every entry, each file with the size
+/// written and the directory as one, and a path under a file refused.
+#[test]
+fn a_plain_volume_lists_what_its_mount_wrote() {
+  use slates_ipc::protocol::{DirEntry, EntryKind, ReadAt};
+  let (daemon, instance) = single_shard_daemon("readdir");
+  let mut client = Client::connect(&instance);
+  let ReplyBody::Created { id, .. } = client.call(&scratch("listed")) else {
+    panic!("the volume was not created");
+  };
+  let port = daemon.nfs_port().expect("the daemon is serving NFS");
+  let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+  let root = mount(&mut stream, &capability_path(&daemon, "listed"), 1);
+  let a = create(&mut stream, &root, "a.txt", 2);
+  write(&mut stream, &a, b"hello", 3);
+  let b = create(&mut stream, &root, "b.bin", 4);
+  write(&mut stream, &b, &[7u8; 300], 5);
+  let sub = common::nfs::mkdir(&mut stream, &root, "sub", 6);
+  let c = create(&mut stream, &sub, "c", 7);
+  write(&mut stream, &c, b"!", 8);
+  let list = |client: &mut Client, path: &str| {
+    client.call(&RequestBody::ReadDir {
+      volume: id,
+      path: path.to_owned(),
+      at: ReadAt::Head,
+      cursor: 0,
+    })
+  };
+  let ReplyBody::DirPage { mut entries, next } = list(&mut client, "") else {
+    panic!("a page");
+  };
+  entries.sort_by(|x, y| x.name.cmp(&y.name));
+  assert_eq!(next, None, "one page holds three entries");
+  let entry = |name: &str, kind, size| DirEntry {
+    name: name.to_owned(),
+    kind,
+    size,
+  };
+  assert_eq!(
+    entries,
+    vec![
+      entry("a.txt", EntryKind::File, 5),
+      entry("b.bin", EntryKind::File, 300),
+      entry("sub", EntryKind::Dir, 0),
+    ]
+  );
+  let ReplyBody::DirPage { entries, .. } = list(&mut client, "/sub") else {
+    panic!("a page");
+  };
+  assert_eq!(entries, vec![entry("c", EntryKind::File, 1)]);
+  assert!(
+    matches!(list(&mut client, "a.txt/x"), ReplyBody::Refused { .. }),
+    "a path under a file is refused"
+  );
+  drop(stream);
+  drop(client);
+  drop(daemon);
+}

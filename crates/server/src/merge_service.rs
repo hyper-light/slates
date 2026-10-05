@@ -814,7 +814,7 @@ fn read_green_range(
 
 /// The version a read of a green at `at` serves: the head, a named version no later than it, or an attachment's
 /// pinned version; the refusal otherwise.
-fn green_version(
+pub(crate) fn green_version(
   state: &ShardState,
   engine: &slates_merge::engine::Green,
   green: DbVolumeId,

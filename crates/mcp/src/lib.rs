@@ -263,6 +263,7 @@ impl McpServer {
       "slates.merge.changed_since" => self.changed_since(&args),
       "slates.merge.advance" => self.advance(&args),
       "slates.fs.read" => self.read(&args),
+      "slates.fs.list" => self.list(&args),
       "slates.volume.create" => self.create_volume(&args),
       "slates.volume.list" => self.list_volumes(),
       "slates.volume.stat" => self.stat_volume(&args),
@@ -393,20 +394,40 @@ impl McpServer {
   fn read(&mut self, args: &Value) -> Result<Value, McpError> {
     let volume = volume_arg(args, "volume")?;
     let path = string_arg(args, "path")?;
-    let at = match (
-      args.get("version").and_then(Value::as_u64),
-      args.get("attachment").and_then(Value::as_u64),
-    ) {
-      (Some(version), _) => ReadAt::Version { version },
-      (None, Some(attachment)) => ReadAt::Attachment { attachment },
-      (None, None) => ReadAt::Head,
-    };
+    let at = view_arg(args);
     let bytes = self.client.read(volume, &path, at).map_err(refusal)?;
     Ok(json!({
       "path": path,
       "len": bytes.len(),
       "text": String::from_utf8_lossy(&bytes),
     }))
+  }
+
+  fn list(&mut self, args: &Value) -> Result<Value, McpError> {
+    let volume = volume_arg(args, "volume")?;
+    let path = args
+      .get("path")
+      .and_then(Value::as_str)
+      .unwrap_or("")
+      .to_owned();
+    let at = view_arg(args);
+    let entries = self.client.list_dir(volume, &path, at).map_err(refusal)?;
+    let listed: Vec<Value> = entries
+      .iter()
+      .map(|entry| {
+        json!({
+          "name": entry.name,
+          "kind": match entry.kind {
+            slates_client::EntryKind::File => "file",
+            slates_client::EntryKind::Dir => "dir",
+            slates_client::EntryKind::Symlink => "symlink",
+            slates_client::EntryKind::Other => "other",
+          },
+          "size": entry.size,
+        })
+      })
+      .collect();
+    Ok(json!({ "path": path, "entries": listed }))
   }
 
   fn rebase(&mut self, args: &Value) -> Result<Value, McpError> {
@@ -770,6 +791,14 @@ fn tool_list() -> Vec<Value> {
        the version an `attachment` pins; a work's or plain volume's live tree.",
       json!({ "volume": string, "path": string, "version": integer, "attachment": integer }),
       json!(["volume", "path"]),
+    ),
+    tool(
+      "slates.fs.list",
+      "List a directory's entries (name, kind file/dir/symlink/other, a file's size) in a volume: a green's head, \
+       its `version`, or the version an `attachment` pins; a work's or plain volume's live tree. `path` defaults to \
+       the root.",
+      json!({ "volume": string, "path": string, "version": integer, "attachment": integer }),
+      json!(["volume"]),
     ),
     tool(
       "slates.merge.rebase",
@@ -1720,6 +1749,18 @@ fn span_json(s: &SpanRecord, chokepoints: &[ChokepointReport]) -> Value {
     "start_ns": s.start_ns,
     "end_ns": s.end_ns,
   })
+}
+
+/// The view a read or listing names: a green's `version`, the version an `attachment` pins, or the head.
+fn view_arg(args: &Value) -> ReadAt {
+  match (
+    args.get("version").and_then(Value::as_u64),
+    args.get("attachment").and_then(Value::as_u64),
+  ) {
+    (Some(version), _) => ReadAt::Version { version },
+    (None, Some(attachment)) => ReadAt::Attachment { attachment },
+    (None, None) => ReadAt::Head,
+  }
 }
 
 /// A required string argument, or an invalid-params error.

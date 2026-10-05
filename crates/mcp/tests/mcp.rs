@@ -691,6 +691,7 @@ fn the_mcp_surface_serves_the_tools() {
   assert_skills_over_mcp(&mut server);
   assert_a_large_file_reads_whole(&mut server);
   assert_a_page_stamp_moves_with_the_file(&instance);
+  assert_directories_list_across_pages(&mut server);
   assert_merge_loop(&mut server);
   assert_volume_lifecycle(&mut server);
   assert_attach_base(&mut server);
@@ -1231,4 +1232,120 @@ fn assert_a_page_stamp_moves_with_the_file(instance: &str) {
     u64::try_from(first.len()).unwrap(),
   );
   assert_ne!(moved, stamp, "a change moves the stamp");
+}
+
+/// Shape: root entries enough that a listing spans several 4 KiB reply chunks.
+const MANY_ENTRIES: usize = 300;
+
+/// The entries `slates.fs.list` answers for `path` in `volume` (extra view arguments in `view`): name, kind, size.
+fn listed(
+  server: &mut McpServer,
+  volume: &str,
+  path: &str,
+  view: Value,
+) -> Vec<(String, String, u64)> {
+  let mut arguments = json!({ "volume": volume, "path": path });
+  if let (Some(arguments), Some(view)) = (arguments.as_object_mut(), view.as_object()) {
+    arguments.extend(view.clone());
+  }
+  call(server, "slates.fs.list", arguments)["entries"]
+    .as_array()
+    .unwrap()
+    .iter()
+    .map(|entry| {
+      (
+        entry["name"].as_str().unwrap().to_owned(),
+        entry["kind"].as_str().unwrap().to_owned(),
+        entry["size"].as_u64().unwrap(),
+      )
+    })
+    .collect()
+}
+
+/// §4.12 `slates.fs.list`: do give a work a nested file, a declared empty directory, and [`MANY_ENTRIES`] root files;
+/// expect its root listed whole across several pages (every file with its size, the nested directory implied, the
+/// empty one declared), and the nested directory listed alone. Submit; expect the green's root at its new version
+/// to list the same. Expect a plain volume's empty root to list nothing, and an unknown directory to be refused.
+fn assert_directories_list_across_pages(server: &mut McpServer) {
+  let green = call(
+    server,
+    "slates.merge.create_green",
+    json!({ "name": "list-g" }),
+  )["green"]
+    .as_str()
+    .unwrap()
+    .to_owned();
+  let work = call(
+    server,
+    "slates.merge.create_work",
+    json!({ "green": green, "name": "list-w" }),
+  )["work"]
+    .as_str()
+    .unwrap()
+    .to_owned();
+  let edit = |server: &mut McpServer, path: &str, text: &str| {
+    call(
+      server,
+      "slates.merge.edit",
+      json!({ "work": work, "path": path, "at": 0, "delete_len": 0, "text": text }),
+    );
+  };
+  edit(server, "src/main.rs", "fn main() {}\n");
+  call(
+    server,
+    "slates.merge.declare",
+    json!({ "work": work, "op": { "kind": "mkdir", "path": "empty" } }),
+  );
+  for at in 0..MANY_ENTRIES {
+    edit(server, &format!("file-number-{at:04}.txt"), "x");
+  }
+  let root = listed(server, &work, "", json!({}));
+  assert_eq!(root.len(), MANY_ENTRIES + 2, "every entry, across pages");
+  assert!(
+    root.contains(&("src".to_owned(), "dir".to_owned(), 0)),
+    "an implied directory"
+  );
+  assert!(
+    root.contains(&("empty".to_owned(), "dir".to_owned(), 0)),
+    "a declared directory"
+  );
+  assert!(root.contains(&("file-number-0299.txt".to_owned(), "file".to_owned(), 1)));
+  assert_eq!(
+    listed(server, &work, "src", json!({})),
+    vec![("main.rs".to_owned(), "file".to_owned(), 13)]
+  );
+  let version = call(server, "slates.merge.submit", json!({ "work": work }))["version"]
+    .as_u64()
+    .unwrap();
+  let green_root = listed(server, &green, "/", json!({ "version": version }));
+  let files = |entries: &[(String, String, u64)]| {
+    entries
+      .iter()
+      .filter(|(_, kind, _)| kind == "file")
+      .cloned()
+      .collect::<Vec<_>>()
+  };
+  assert_eq!(
+    files(&green_root),
+    files(&root),
+    "the green lists what was submitted"
+  );
+  let plain = call(
+    server,
+    "slates.volume.create",
+    json!({ "name": "list-plain", "bounded": 1 << 20 }),
+  )["volume"]
+    .as_str()
+    .unwrap()
+    .to_owned();
+  assert!(
+    listed(server, &plain, "", json!({})).is_empty(),
+    "an empty plain root"
+  );
+  let missing = call_refused(
+    server,
+    "slates.fs.list",
+    json!({ "volume": work, "path": "no/such" }),
+  );
+  assert!(!missing.is_empty());
 }

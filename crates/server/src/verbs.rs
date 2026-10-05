@@ -353,6 +353,7 @@ fn volume_of(body: &RequestBody) -> Option<VolumeId> {
     | RequestBody::AwaitPlaced { volume, .. }
     | RequestBody::Read { volume, .. }
     | RequestBody::ReadRange { volume, .. }
+    | RequestBody::ReadDir { volume, .. }
     | RequestBody::StageBegin { work: volume, .. }
     | RequestBody::StagePut { work: volume, .. }
     | RequestBody::EditStaged { work: volume, .. }
@@ -624,6 +625,11 @@ fn serves_latest_state(body: &RequestBody) -> Option<VolumeId> {
       volume,
       at: ReadAt::Head,
       ..
+    }
+    | RequestBody::ReadDir {
+      volume,
+      at: ReadAt::Head,
+      ..
     } => Some(*volume),
     RequestBody::Versions { green } | RequestBody::ChangedSince { green, .. } => Some(*green),
     RequestBody::Status { volume } => Some(*volume),
@@ -733,6 +739,7 @@ fn is_forwardable_read(body: &RequestBody) -> bool {
       | RequestBody::ChangedSince { .. }
       | RequestBody::Read { .. }
       | RequestBody::ReadRange { .. }
+      | RequestBody::ReadDir { .. }
       | RequestBody::StageBegin { .. }
       | RequestBody::StagePut { .. }
   )
@@ -2447,6 +2454,12 @@ fn dispatch_inner(
       offset,
       max,
     } => crate::merge_service::read_range(state, principal, (volume, &path, at), offset, max),
+    RequestBody::ReadDir {
+      volume,
+      path,
+      at,
+      cursor,
+    } => crate::listing::read_dir(state, principal, (volume, &path, at), cursor),
     RequestBody::StageBegin { work, len } => stage_begin(state, principal, work, len),
     RequestBody::StagePut {
       work,

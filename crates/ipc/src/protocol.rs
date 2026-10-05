@@ -547,6 +547,18 @@ pub enum RequestBody {
     /// The most bytes wanted (the daemon answers fewer when its reply chunk holds fewer).
     max: u64,
   },
+  /// List a directory's direct entries at a view (§4.12 `slates.fs.list`), one reply chunk at a time: `cursor` 0
+  /// begins, and each page names the cursor that continues it. A read; never recorded. Appended.
+  ReadDir {
+    /// The volume.
+    volume: VolumeId,
+    /// The directory (`""` or `/` for the root).
+    path: String,
+    /// The view.
+    at: ReadAt,
+    /// Where to continue: 0 to begin, else the `next` of the previous page.
+    cursor: u64,
+  },
 }
 
 /// A concrete quorum-loss recovery proposal (§4.8). It identifies the retained copy and the
@@ -2412,6 +2424,37 @@ pub enum ReplyBody {
     /// between pages starts again.
     stamp: u64,
   },
+  /// One page of a directory's entries (`ReadDir`). Appended.
+  DirPage {
+    /// The entries, in the view's order.
+    entries: Vec<DirEntry>,
+    /// The cursor that continues the listing, or `None` when this page ends it.
+    next: Option<u64>,
+  },
+}
+
+/// One entry of a directory listing (`ReadDir`).
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct DirEntry {
+  /// The entry's name within its directory.
+  pub name: String,
+  /// What it is.
+  pub kind: EntryKind,
+  /// A file's length in bytes; zero for anything else.
+  pub size: u64,
+}
+
+/// What a directory entry is.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EntryKind {
+  /// A regular file.
+  File,
+  /// A directory.
+  Dir,
+  /// A symbolic link.
+  Symlink,
+  /// A FIFO, a socket or a device node.
+  Other,
 }
 
 /// A message body on the ring: the schema hash then the canonical encoding.

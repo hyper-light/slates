@@ -9011,3 +9011,21 @@ Status: built 2026-10-05 (§4.2 all-cost admission, for works).
 - Proven: `a_works_edits_are_charged_and_refused_typed_when_the_budget_cannot_hold_them` (live daemon, the
   pressure hold) and `the_incremental_charge_equals_a_recount_after_every_step` (generated histories against a
   recount).
+
+### A-85 — Directory listings at a view: `ReadDir` and `slates.fs.list` (2026-10-05)
+Applied in the same change to: `crates/ipc/src/protocol.rs` (`ReadDir`, `DirPage`, `DirEntry`, `EntryKind`),
+`crates/server/src/listing.rs` (new), `crates/server/src/{verbs,merge_service,lib}.rs`, `crates/client/src/{client,lib}.rs`
+(`list_dir`), `crates/mcp/src/lib.rs` (`slates.fs.list`), `crates/mcp/tests/mcp.rs`, `crates/server/tests/nfs_mount.rs`,
+GAPS.
+Status: built 2026-10-05 (condition 13: what codemode queries and an agent without a shell browses).
+- What: a directory's direct entries (name, kind, a file's size) at a view, one reply chunk per page:
+  - a green at a version, from the engine's state there (`base_at`);
+  - a work from what it keeps (its files, and the directories and symlinks it declared);
+  - a plain volume through the volume core's paged listing (an overlay merges in its host directory).
+  A plain volume's cursor is the volume core's resume hash, and a page never splits a group of entries sharing a
+  cookie (§4.5). A green's or work's cursor is a position in its sorted list.
+- Proven:
+  - `assert_directories_list_across_pages` (302 entries across pages, implied and declared directories, the green
+    at its version, an empty plain root, an unknown directory refused);
+  - `a_plain_volume_lists_what_its_mount_wrote` (files written through the NFS mount, listed with their sizes);
+  - unit tests of the cookie-group paging and the path-set children.
