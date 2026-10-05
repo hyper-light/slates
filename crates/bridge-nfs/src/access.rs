@@ -231,11 +231,16 @@ pub fn setattr_denial(
   {
     return Some(Denial::NotOwner);
   }
-  // A size change is a write: an NFSv4 open for writing authorized it; otherwise the mode decides.
-  if changes.size.is_some()
-    && authority == IoAuthority::Mode
-    && !permits_io(caller, node, Want::Write)
-  {
+  // A size change is a write. An NFSv4 open for writing authorized it when it was made; a delegation's state id stands
+  // for the whole client, whose local open checked only the open mode's access, never `O_TRUNC`'s write, so the bits
+  // decide strictly (pjdfstest `open/07.t`, 2026-10-05: any user of the client truncated through it); otherwise the
+  // mode decides with the I/O owner override.
+  let size_denied = match authority {
+    IoAuthority::Open => false,
+    IoAuthority::Delegation => !permits(caller, node, Want::Write),
+    IoAuthority::Mode => !permits_io(caller, node, Want::Write),
+  };
+  if changes.size.is_some() && size_denied {
     return Some(Denial::NoAccess);
   }
   if changes.atime.is_some() || changes.mtime.is_some() {
@@ -442,6 +447,59 @@ mod tests {
 
   /// SETATTR: the mode and explicit times need ownership (EPERM); the size and "now" times need write
   /// permission (EACCES); root passes everything.
+  /// pjdfstest `open/07.t` over NFSv4.2 under a delegation (CI, 2026-10-05): the Linux client opens locally under its
+  /// delegation, checking only the open mode's access (not `O_TRUNC`'s write), and sends the truncate as a SETATTR
+  /// under the delegation's state id, which stands for the whole client. Do truncate a 0477 file under a delegation as
+  /// its owner, as another user of its group, and as a user its other bits deny, and as a user whose bits allow it;
+  /// expect the first three refused and the last allowed — the mode bits strictly, with no owner override (an open's
+  /// own state id keeps it: that open was checked when made).
+  #[test]
+  fn a_truncate_under_a_delegation_needs_write_permission_by_the_bits() {
+    let truncate = SetAttr {
+      size: Some(0),
+      ..SetAttr::default()
+    };
+    let owner_denied = node(Kind::File, 0o477, 65534, 65534);
+    for (caller, file) in [
+      (user(65534, 65534, &[]), &owner_denied),
+      (
+        user(65533, 65534, &[]),
+        &node(Kind::File, 0o747, 65534, 65534),
+      ),
+      (
+        user(65533, 65533, &[]),
+        &node(Kind::File, 0o774, 65534, 65534),
+      ),
+    ] {
+      assert_eq!(
+        setattr_denial(&caller, file, &truncate, false, IoAuthority::Delegation),
+        Some(Denial::NoAccess),
+        "{caller:?}"
+      );
+    }
+    assert_eq!(
+      setattr_denial(
+        &user(65533, 65533, &[]),
+        &node(Kind::File, 0o666, 65534, 65534),
+        &truncate,
+        false,
+        IoAuthority::Delegation
+      ),
+      None
+    );
+    assert_eq!(
+      setattr_denial(
+        &user(65534, 65534, &[]),
+        &owner_denied,
+        &truncate,
+        false,
+        IoAuthority::Open
+      ),
+      None,
+      "an open for writing keeps its access whatever the mode became"
+    );
+  }
+
   #[test]
   fn setattr_denials_are_typed() {
     let file = node(Kind::File, 0o644, 1000, 1000);

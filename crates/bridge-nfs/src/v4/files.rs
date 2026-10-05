@@ -83,6 +83,10 @@ pub enum IoAuthority {
   /// An NFSv4 open whose access mode allows the I/O: it checked the caller's permission when it was
   /// made, and a descriptor keeps its access whatever the mode becomes (POSIX).
   Open,
+  /// A delegation's state id (§10.4): it stands for the whole client, whose local opens under it checked the opening
+  /// user's access for the open mode. Reads and writes of data pass, as under an open; a size change needs the caller's
+  /// write permission by the mode bits, since a local open checks nothing for `O_TRUNC` (pjdfstest `open/07.t`).
+  Delegation,
 }
 
 /// The key an open is found by from its file: the file first, so every open of one file is one range.
@@ -609,7 +613,7 @@ impl FileState {
       let write = self.delegations.check(stateid, clientid, fh)?;
       return match want {
         IoWant::Write if !write => Err(Nfsstat4::Openmode),
-        IoWant::Read | IoWant::Write => Ok(IoAuthority::Open),
+        IoWant::Read | IoWant::Write => Ok(IoAuthority::Delegation),
         IoWant::Attributes => Ok(IoAuthority::Mode),
       };
     }

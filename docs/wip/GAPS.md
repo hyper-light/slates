@@ -3675,3 +3675,11 @@ creates 0.64 → 0.36–0.45 s). Owed:
 - The containerd workload's shell loop (`echo > f` in a loop) costs about 1.75 ms per file through runc's bind of the
   FUSE mount, against about 0.2 ms for Python's open, write, close and stat. Measured only at load average 33–87
   (another session's load), so not yet diagnosed.
+
+CI red since at least `f706876`, fixed 2026-10-05: the Linux test and TSan lanes (a full metadata ledger refused the
+daemon's status; docs/bugs/2026-10-05-a-full-metadata-ledger-refused-the-status-that-reports-it.md) and the Linux
+conformance lane's hermeticity (a granted landing refused while a delegation was held, and the recall never sent;
+docs/bugs/2026-10-05-a-granted-landing-refused-on-a-held-delegation.md). The same lane's pjdfstest `open/07.t` 6, 8,
+10 and 23 over NFSv4.2 were a delegation's state id letting any user of its client truncate
+(docs/bugs/2026-10-05-a-delegation-let-any-user-of-its-client-truncate.md), fixed the same day.
+
