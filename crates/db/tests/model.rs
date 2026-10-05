@@ -285,6 +285,10 @@ enum Step {
   NfsDelegation(u8, u8, bool),
   /// A delegation returned or revoked.
   NfsDelegationClear(usize),
+  /// A sealing key recorded (A-92): its owner's kind (tenant, naming or lineage) and who.
+  SealKey(u8, u8),
+  /// A sealing key destroyed (crypto-erase).
+  SealKeyDestroy(u8, u8),
   Crash,
 }
 
@@ -323,6 +327,8 @@ fn step() -> impl Strategy<Value = Step> {
     1 => Just(Step::NfsInstance),
     1 => (0..4u8, 0..8u8, any::<bool>()).prop_map(|(c, f, w)| Step::NfsDelegation(c, f, w)),
     1 => (0..8usize).prop_map(Step::NfsDelegationClear),
+    1 => (0..3u8, 0..4u8).prop_map(|(k, w)| Step::SealKey(k, w)),
+    1 => (0..3u8, 0..4u8).prop_map(|(k, w)| Step::SealKeyDestroy(k, w)),
     1 => Just(Step::Crash),
   ]
 }
@@ -545,7 +551,9 @@ fn op_for(step: &Step, ids: &mut Ids, now_ns: u64) -> Option<Op> {
     | Step::NfsClientClear(..)
     | Step::NfsInstance
     | Step::NfsDelegation(..)
-    | Step::NfsDelegationClear(..)) => return op_for_nfs(step, ids),
+    | Step::NfsDelegationClear(..)
+    | Step::SealKey(..)
+    | Step::SealKeyDestroy(..)) => return op_for_nfs(step, ids),
     Step::Crash => return None,
   })
 }
@@ -719,8 +727,33 @@ fn op_for_nfs(step: &Step, ids: &mut Ids) -> Option<Op> {
     Step::NfsDelegationClear(d) => Op::NfsDelegationCleared {
       other: pick(&ids.nfs_delegations, *d)?,
     },
+    Step::SealKey(kind, who) => Op::SealKeySet {
+      record: slates_db::catalog::SealKeyRecord {
+        owner: seal_owner(*kind, *who),
+        id: [*who; 16],
+        record: vec![*kind; slates_db::catalog::SEAL_KEY_RECORD_BYTES],
+      },
+    },
+    Step::SealKeyDestroy(kind, who) => Op::SealKeyDestroyed {
+      owner: seal_owner(*kind, *who),
+    },
     _ => return None,
   })
+}
+
+/// A sealing key's owner: a tenant, its naming key, or a volume's lineage, by `kind`.
+fn seal_owner(kind: u8, who: u8) -> slates_db::catalog::SealKeyOwner {
+  match kind {
+    0 => slates_db::catalog::SealKeyOwner::Tenant {
+      account: u32::from(who),
+    },
+    1 => slates_db::catalog::SealKeyOwner::Naming {
+      account: u32::from(who),
+    },
+    _ => slates_db::catalog::SealKeyOwner::Lineage {
+      volume: VolumeId { bytes: [who; 16] },
+    },
+  }
 }
 
 /// Keeps the interpreter's view of live ids in step with what the partition accepted.

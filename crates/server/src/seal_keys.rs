@@ -86,3 +86,140 @@ pub fn shard_root(segment: &AnchorSegment, state: RootState) -> Option<WrappingK
   key.fill(0);
   Some(WrappingKey::new(KeyId(id), ROOT_GENERATION, secret.ok()?))
 }
+
+/// A refusal to reach a tenant's or a volume's sealing key (A-92 piece 2b).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SealKeyError {
+  /// Sealing is unavailable on this node (no root: the module doc).
+  Unavailable,
+  /// hyper-seal refused: a record that will not unwrap under its parent (another root's, or altered), a full key
+  /// region, or the random source.
+  Seal(hyper_seal::SealError),
+  /// A new key's record could not be made durable; the partition was rolled back and the key is not used.
+  Record,
+}
+
+impl From<hyper_seal::SealError> for SealKeyError {
+  fn from(error: hyper_seal::SealError) -> SealKeyError {
+    SealKeyError::Seal(error)
+  }
+}
+
+/// Format: the generation tenant, naming and lineage keys are made at (a rotation is a later one, seal.md §3.1).
+const KEY_GENERATION: u32 = 1;
+
+/// The tenant key of `account` on this partition, unwrapped from its record under the node's root, or made and
+/// recorded now. A tenant (the host account, A-9) has one key per partition, so a shard never asks another for it
+/// (D-14); erasing a tenant destroys each partition's record.
+pub fn tenant(
+  state: &mut crate::state::ShardState,
+  account: u32,
+) -> Result<WrappingKey, SealKeyError> {
+  let owner = slates_db::catalog::SealKeyOwner::Tenant { account };
+  let recorded = state.db.partition().seal_key(&owner).cloned();
+  let root = state.seal_root.as_ref().ok_or(SealKeyError::Unavailable)?;
+  match recorded {
+    Some(record) => open(root, &record),
+    None => {
+      let (key, record) = make(root, owner)?;
+      commit(state, record)?;
+      Ok(key)
+    }
+  }
+}
+
+/// The naming key of `account` (seal.md §7: keyed names for its content), under its tenant key.
+pub fn namer(
+  state: &mut crate::state::ShardState,
+  account: u32,
+) -> Result<hyper_seal::name::Namer, SealKeyError> {
+  let tenant_key = tenant(state, account)?;
+  let owner = slates_db::catalog::SealKeyOwner::Naming { account };
+  let secret = match state.db.partition().seal_key(&owner).cloned() {
+    Some(record) => tenant_key.unwrap(&hyper_seal::keys::Wrapped::decode(&record.record)?)?,
+    None => {
+      let (secret, wrapped) = tenant_key.make_child()?;
+      let id = KeyId::random()?;
+      commit(state, record_of(owner, id, &wrapped))?;
+      secret
+    }
+  };
+  Ok(hyper_seal::name::Namer::new(&secret)?)
+}
+
+/// The lineage key of `volume`, owned by `account`, under its tenant key: what seals the volume's chunks for holders.
+pub fn lineage(
+  state: &mut crate::state::ShardState,
+  volume: slates_db::catalog::VolumeId,
+  account: u32,
+) -> Result<WrappingKey, SealKeyError> {
+  let tenant_key = tenant(state, account)?;
+  let owner = slates_db::catalog::SealKeyOwner::Lineage { volume };
+  match state.db.partition().seal_key(&owner).cloned() {
+    Some(record) => open(&tenant_key, &record),
+    None => {
+      let (key, record) = make(&tenant_key, owner)?;
+      commit(state, record)?;
+      Ok(key)
+    }
+  }
+}
+
+/// The key `record` holds, unwrapped under `parent`.
+fn open(
+  parent: &WrappingKey,
+  record: &slates_db::catalog::SealKeyRecord,
+) -> Result<WrappingKey, SealKeyError> {
+  let secret = parent.unwrap(&hyper_seal::keys::Wrapped::decode(&record.record)?)?;
+  Ok(WrappingKey::new(KeyId(record.id), KEY_GENERATION, secret))
+}
+
+/// A new key for `owner`, a child of `parent`, and its record.
+fn make(
+  parent: &WrappingKey,
+  owner: slates_db::catalog::SealKeyOwner,
+) -> Result<(WrappingKey, slates_db::catalog::SealKeyRecord), SealKeyError> {
+  let (secret, wrapped) = parent.make_child()?;
+  let id = KeyId::random()?;
+  Ok((
+    WrappingKey::new(id, KEY_GENERATION, secret),
+    record_of(owner, id, &wrapped),
+  ))
+}
+
+/// The record of `owner`'s key `id`, wrapped as `wrapped`.
+fn record_of(
+  owner: slates_db::catalog::SealKeyOwner,
+  id: KeyId,
+  wrapped: &hyper_seal::keys::Wrapped,
+) -> slates_db::catalog::SealKeyRecord {
+  slates_db::catalog::SealKeyRecord {
+    owner,
+    id: id.0,
+    record: wrapped.encode().to_vec(),
+  }
+}
+
+/// Commits `record` as one transaction of the shard's partition: the key is used only once its record is durable, so
+/// nothing is ever sealed under a key a restart could not unwrap again.
+fn commit(
+  state: &mut crate::state::ShardState,
+  record: slates_db::catalog::SealKeyRecord,
+) -> Result<(), SealKeyError> {
+  let now = slates_vfs::clock::Clock::monotonic_ns(&mut state.clock);
+  state.db.begin();
+  let applied = state
+    .db
+    .mutate(
+      &mut state.segment,
+      &slates_db::Op::SealKeySet { record },
+      now,
+    )
+    .is_ok();
+  let committed = state.db.commit(&mut state.segment).is_ok();
+  if applied && committed {
+    Ok(())
+  } else {
+    Err(SealKeyError::Record)
+  }
+}

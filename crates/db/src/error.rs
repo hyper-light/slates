@@ -57,6 +57,11 @@ pub enum DbError {
     /// The partition's current instance.
     current: u32,
   },
+  /// A sealing key record of other than hyper-seal's fixed length (A-92): never entered in the log.
+  SealKeyMalformed {
+    /// The record's length.
+    len: usize,
+  },
   /// A transaction could not be made durable — its record was not appended and the snapshot that
   /// would have carried its effects was not published — so the partition was **rolled back** to its
   /// durable state: the applied effects and the completion record are gone, exactly as a restart
@@ -95,6 +100,7 @@ impl fmt::Display for DbError {
       Self::NfsInstanceRegressed { current } => {
         write!(f, "NFSv4 instance must advance past {current}")
       }
+      Self::SealKeyMalformed { len } => write!(f, "a sealing key record of {len} bytes"),
       Self::Unpublished { seq, cause } => {
         write!(
           f,

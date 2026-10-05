@@ -755,3 +755,40 @@ pub struct NfsClientRecord {
   /// The next CREATE_SESSION sequence it must send.
   pub create_seq: u32,
 }
+
+/// Format: the bytes of hyper-seal's wrapped key record (version, parent id, parent generation, AES-256-KW of the key;
+/// seal.md §3.3).
+pub const SEAL_KEY_RECORD_BYTES: usize = 61;
+
+/// Whose sealing key a record holds (A-92): a tenant's key (the host account, A-9), its naming key, or a volume's
+/// lineage key.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SealKeyOwner {
+  /// A tenant's key, wrapped by the node's root.
+  Tenant {
+    /// The account.
+    account: u32,
+  },
+  /// A tenant's naming key (seal.md §7), wrapped by the tenant's key.
+  Naming {
+    /// The account.
+    account: u32,
+  },
+  /// A volume's lineage key, wrapped by its tenant's key.
+  Lineage {
+    /// The volume.
+    volume: VolumeId,
+  },
+}
+
+/// A sealing key, wrapped by its parent (A-92; seal.md §3.3): its owner, its own id (what its children's records name
+/// as their parent), and hyper-seal's 61-byte wrapped record. The key's bytes never appear here.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct SealKeyRecord {
+  /// Whose key.
+  pub owner: SealKeyOwner,
+  /// The key's own id.
+  pub id: [u8; 16],
+  /// The wrapped record, [`SEAL_KEY_RECORD_BYTES`] long.
+  pub record: Vec<u8>,
+}

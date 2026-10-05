@@ -312,6 +312,17 @@ pub enum Op {
     /// The state id's `other`.
     other: [u8; 12],
   },
+  /// A sealing key was made and recorded wrapped by its parent (A-92). Appended.
+  SealKeySet {
+    /// The record.
+    record: crate::catalog::SealKeyRecord,
+  },
+  /// A sealing key was destroyed: its one wrapped copy is gone, so everything sealed under it is erased (seal.md
+  /// §3.1, cryptographic erase). Appended.
+  SealKeyDestroyed {
+    /// Whose key.
+    owner: crate::catalog::SealKeyOwner,
+  },
 }
 
 impl Op {
@@ -363,6 +374,8 @@ impl Op {
       Op::AttachmentRepinned { .. } => "attachment_repinned",
       Op::NfsDelegationSet { .. } => "nfs_delegation_set",
       Op::NfsDelegationCleared { .. } => "nfs_delegation_cleared",
+      Op::SealKeySet { .. } => "seal_key_set",
+      Op::SealKeyDestroyed { .. } => "seal_key_destroyed",
     }
   }
 }

@@ -9184,8 +9184,17 @@ secret, so no key crosses a thread and two daemons in one process each have thei
 not lock leaves sealing `unavailable`, reported in status (`seal`, `seal_root` — the id, never the key —
 `seal_key_slots`, `seal_keys_held`) and never used unlocked. Proven by
 `a_restarted_daemon_adopts_its_anchors_sealing_root_and_a_fresh_anchor_mints_another` (macOS, and Linux as a
-non-root user) and `a_published_sealing_root_is_adopted_by_a_later_attachment`. Owed for piece 2: tenant keys per
-(account, partition) wrapped by the root and the volumes' lineage keys, recorded in the partition.
+non-root user) and `a_published_sealing_root_is_adopted_by_a_later_attachment`.
+Built (2026-10-05): piece 2b, the hierarchy below the root (`seal_keys::{tenant, namer, lineage}`). A tenant key per
+(account, partition), wrapped by the root; the tenant's naming key and each volume's lineage key, wrapped by the tenant
+key. Each is hyper-seal's 61-byte wrapped record in the partition (`Op::SealKeySet`, refused for an owner that has one
+or a record of another length; `Op::SealKeyDestroyed`, the crypto-erase), committed before the key is used, so nothing
+is sealed under a key a restart could not unwrap; the key is unwrapped again on each use (the bounded cache seal.md §8
+asks for is owed with piece 3's hot path). Proven by `a_volumes_keys_survive_a_daemon_restart_and_die_with_the_anchor`
+(a chunk sealed under a volume's lineage key before a restart opens after it; under a fresh anchor's keys it is
+refused `Unwrap`; macOS and Linux) and the database's model test, whose generated histories now set and destroy key
+records across crashes (non-vacuous: dropping the snapshot's key table fails it). Owed: destroying a volume's lineage
+record when the volume is destroyed, and a tenant's records when its account is removed.
 - Why: condition 9 asks for volumes post-quantum encrypted at rest and in transit. In transit holds already: every TLS
   handshake prefers X25519MLKEM768 (A-66, 2026-10-04), and SecP384r1MLKEM1024 replaces it between nodes once
   hyper-raft's measurement of it lands (its §10). At rest, slates has no disk (R1): a volume rests in RAM, in two

@@ -21,8 +21,8 @@ use crate::Art;
 use crate::catalog::{
   AttachmentRecord, AuditRecord, CompletionRecord, Consumer, ConsumerRecord, GrantRecord,
   LandingLeaseRecord, LandingRecord, LeaseRecord, LineageEdge, NfsClientRecord,
-  NfsDelegationRecord, NfsLockRecord, NfsOpenRecord, Principal, SnapshotId, SnapshotRecord,
-  Tombstone, VolumeId, VolumeRecord,
+  NfsDelegationRecord, NfsLockRecord, NfsOpenRecord, Principal, SEAL_KEY_RECORD_BYTES,
+  SealKeyOwner, SealKeyRecord, SnapshotId, SnapshotRecord, Tombstone, VolumeId, VolumeRecord,
 };
 use crate::error::DbError;
 use crate::op::Op;
@@ -119,6 +119,8 @@ pub struct PartitionSnapshot {
   pub tombstones: Vec<Tombstone>,
   /// The NFSv4 delegations held at this partition's files, by `other` (§4.6 A-78; appended).
   pub nfs_delegations: Vec<NfsDelegationRecord>,
+  /// The sealing keys recorded at this partition, wrapped by their parents, by owner (A-92; appended).
+  pub seal_keys: Vec<SealKeyRecord>,
 }
 
 /// The partition.
@@ -159,6 +161,7 @@ pub struct Partition {
   /// replay reproduces only what they admitted.
   nfs_opens: BTreeMap<[u8; 12], NfsOpenRecord>,
   nfs_delegations: BTreeMap<[u8; 12], NfsDelegationRecord>,
+  seal_keys: BTreeMap<SealKeyOwner, SealKeyRecord>,
   nfs_locks: BTreeMap<[u8; 12], NfsLockRecord>,
   nfs_clients: BTreeMap<u64, NfsClientRecord>,
   nfs_instance: u32,
@@ -208,6 +211,7 @@ impl Partition {
       consumers: BTreeMap::new(),
       nfs_opens: BTreeMap::new(),
       nfs_delegations: BTreeMap::new(),
+      seal_keys: BTreeMap::new(),
       nfs_locks: BTreeMap::new(),
       nfs_clients: BTreeMap::new(),
       nfs_instance: 0,
@@ -488,6 +492,11 @@ impl Partition {
     self.nfs_instance
   }
 
+  /// The sealing key recorded for `owner` at this partition, wrapped by its parent (A-92).
+  pub fn seal_key(&self, owner: &SealKeyOwner) -> Option<&SealKeyRecord> {
+    self.seal_keys.get(owner)
+  }
+
   /// Applies one NFSv4 record operation (A-37): an upsert, a clear, or a client's purge.
   fn apply_nfs(&mut self, op: &Op) {
     match op {
@@ -695,6 +704,28 @@ impl Partition {
       | Op::NfsClientStateCleared { .. }
       | Op::NfsClientSet { .. }
       | Op::NfsClientCleared { .. } => Ok(()),
+      // A key is made once: a second record for its owner would leave two keys sealing one owner's content. A record
+      // is hyper-seal's fixed length, so a malformed one never enters the log.
+      Op::SealKeySet { record } => {
+        if record.record.len() != SEAL_KEY_RECORD_BYTES {
+          Err(DbError::SealKeyMalformed {
+            len: record.record.len(),
+          })
+        } else if self.seal_keys.contains_key(&record.owner) {
+          Err(DbError::AlreadyExists {
+            existing: record.id,
+          })
+        } else {
+          Ok(())
+        }
+      }
+      Op::SealKeyDestroyed { owner } => {
+        if self.seal_keys.contains_key(owner) {
+          Ok(())
+        } else {
+          Err(DbError::NotFound)
+        }
+      }
       // An instance only moves forward: an earlier one would let a new id repeat an old one.
       Op::NfsInstanceAdvanced { instance } => {
         if *instance > self.nfs_instance {
@@ -923,6 +954,14 @@ impl Partition {
       | Op::NfsClientCleared { .. }
       | Op::NfsInstanceAdvanced { .. } => {
         self.apply_nfs(op);
+        Ok(())
+      }
+      Op::SealKeySet { record } => {
+        self.seal_keys.insert(record.owner, record.clone());
+        Ok(())
+      }
+      Op::SealKeyDestroyed { owner } => {
+        self.seal_keys.remove(owner);
         Ok(())
       }
       Op::AttachmentBound { id, path } => {
@@ -1234,6 +1273,7 @@ impl Partition {
       consumers: self.consumers.values().cloned().collect(),
       nfs_opens: self.nfs_opens.values().cloned().collect(),
       nfs_delegations: self.nfs_delegations.values().cloned().collect(),
+      seal_keys: self.seal_keys.values().cloned().collect(),
       nfs_locks: self.nfs_locks.values().cloned().collect(),
       nfs_clients: self.nfs_clients.values().cloned().collect(),
       nfs_instance: self.nfs_instance,
@@ -1284,6 +1324,9 @@ impl Partition {
       self.nfs_clients.insert(record.clientid, record.clone());
     }
     self.nfs_instance = snapshot.nfs_instance;
+    for record in &snapshot.seal_keys {
+      self.seal_keys.insert(record.owner, record.clone());
+    }
   }
 
   fn restore_completions(&mut self, completions: &[ClientCompletions]) {
