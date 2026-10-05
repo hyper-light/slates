@@ -769,10 +769,11 @@ pub enum SealKeyOwner {
     /// The tenant: a host account, or the namespaced hash of a principal with no numeric account.
     account: u64,
   },
-  /// A tenant's naming key (seal.md §7), wrapped by the tenant's key.
+  /// A volume's naming key (seal.md §7: keyed names for its chunks), wrapped by the volume's lineage key, so it travels
+  /// with the volume to a successor (A-92 piece 4c).
   Naming {
-    /// The tenant.
-    account: u64,
+    /// The volume.
+    volume: VolumeId,
   },
   /// A volume's lineage key, wrapped by its tenant's key.
   Lineage {

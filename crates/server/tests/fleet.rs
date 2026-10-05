@@ -10837,24 +10837,20 @@ const SEALED_PROBE: &[u8] = b"sealed on the dead owner, opened by its successor"
 /// Shape: the segment the takeover test seals in: one 4 KiB base page.
 const SEALED_SEGMENT: u32 = 4096;
 
-/// A naming key both sides of the takeover test build alike, so the test isolates the lineage key's transfer (keyed
-/// names travel with the volume in piece 3b).
-fn test_namer() -> hyper_seal::name::Namer {
-  hyper_seal::name::Namer::new(&hyper_seal::Secret32::from_bytes(&[7u8; 32]).unwrap()).unwrap()
-}
-
-/// The volume's lineage key on a control shard (made if new), for the takeover test's probe.
-fn probe_lineage(
+/// The volume's lineage and naming keys on a control shard (made if new), for the takeover test's probe.
+fn probe_keys(
   s: &mut slates_server::state::ShardState,
   volume: slates_db::catalog::VolumeId,
-) -> Option<hyper_seal::keys::WrappingKey> {
+) -> Option<(hyper_seal::keys::WrappingKey, hyper_seal::name::Namer)> {
   let owner = s
     .db
     .partition()
     .volume(volume)
     .map(|record| record.owner.clone())?;
   let tenant = slates_server::seal_keys::tenant_of(&owner);
-  slates_server::seal_keys::lineage(s, volume, tenant).ok()
+  let lineage = slates_server::seal_keys::lineage(s, volume, tenant).ok()?;
+  let namer = slates_server::seal_keys::namer(s, volume, tenant).ok()?;
+  Some((lineage, namer))
 }
 
 /// [`SEALED_PROBE`] sealed on `daemon` under `volume`'s lineage key (A-92 piece 4c).
@@ -10864,10 +10860,10 @@ fn seal_probe_on(
 ) -> Option<slates_cluster::sealed::SealedChunk> {
   daemon
     .observe_control(slates_server::daemon::OBSERVE_BUDGET_NS, move |s| {
-      let lineage = probe_lineage(s, volume)?;
+      let (lineage, namer) = probe_keys(s, volume)?;
       slates_cluster::sealed::seal_chunk(
         &lineage,
-        &test_namer(),
+        &namer,
         &slates_archive::Archive::raw_chunk(SEALED_PROBE.to_vec()),
         SEALED_SEGMENT,
       )
@@ -10885,8 +10881,8 @@ fn open_probe_on(
 ) -> Option<Vec<u8>> {
   daemon
     .observe_control(slates_server::daemon::OBSERVE_BUDGET_NS, move |s| {
-      let lineage = probe_lineage(s, volume)?;
-      slates_cluster::sealed::open_chunk(&lineage, &test_namer(), &sealed)
+      let (lineage, namer) = probe_keys(s, volume)?;
+      slates_cluster::sealed::open_chunk(&lineage, &namer, &sealed)
         .ok()
         .map(|chunk| chunk.payload)
     })

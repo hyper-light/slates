@@ -899,6 +899,7 @@ impl Partition {
         self
           .seal_keys
           .remove(&SealKeyOwner::Lineage { volume: *id });
+        self.seal_keys.remove(&SealKeyOwner::Naming { volume: *id });
         Ok(())
       }
       Op::TombstoneAdopted { tombstone } => {

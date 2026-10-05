@@ -51,6 +51,18 @@ pub struct HeadSealing {
   pub lineage: [u8; 16],
   /// The lineage key wrapped under each neighbour's pair key, in anchor order.
   pub keys: Vec<HeadKey>,
+  /// The volume's naming key, as the owner recorded it (wrapped under the lineage key), so a successor verifies the
+  /// names the owner made; `None` before the volume sealed a named chunk.
+  pub naming: Option<HeadNaming>,
+}
+
+/// A volume's naming key as a head carries it: its id and its record wrapped under the volume's lineage key.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct HeadNaming {
+  /// The naming key's id.
+  pub id: [u8; 16],
+  /// The key wrapped under the lineage key (AES-KW, 61 bytes).
+  pub wrapped: Vec<u8>,
 }
 
 /// One neighbour's copy of the lineage key: its stable anchor and the key wrapped under its pair key (AES-KW, 61 bytes).

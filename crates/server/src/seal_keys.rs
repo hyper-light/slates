@@ -128,17 +128,20 @@ pub fn tenant(
   }
 }
 
-/// The naming key of `account` (seal.md §7: keyed names for its content), under its tenant key.
+/// The naming key of `volume` (seal.md §7: keyed names for its chunks), owned by `account`: a child of the volume's
+/// lineage key, recorded wrapped under it, so a successor that adopts the lineage key verifies the names the dead owner
+/// made (A-92 piece 4c).
 pub fn namer(
   state: &mut crate::state::ShardState,
+  volume: slates_db::catalog::VolumeId,
   account: u64,
 ) -> Result<hyper_seal::name::Namer, SealKeyError> {
-  let tenant_key = tenant(state, account)?;
-  let owner = slates_db::catalog::SealKeyOwner::Naming { account };
+  let lineage_key = lineage(state, volume, account)?;
+  let owner = slates_db::catalog::SealKeyOwner::Naming { volume };
   let secret = match state.db.partition().seal_key(&owner).cloned() {
-    Some(record) => tenant_key.unwrap(&hyper_seal::keys::Wrapped::decode(&record.record)?)?,
+    Some(record) => lineage_key.unwrap(&hyper_seal::keys::Wrapped::decode(&record.record)?)?,
     None => {
-      let (secret, wrapped) = tenant_key.make_child()?;
+      let (secret, wrapped) = lineage_key.make_child()?;
       let id = KeyId::random()?;
       commit(state, record_of(owner, id, &wrapped))?;
       secret
@@ -471,11 +474,20 @@ pub fn head_sealing(
   if keys.is_empty() {
     return None;
   }
+  let naming = state
+    .db
+    .partition()
+    .seal_key(&slates_db::catalog::SealKeyOwner::Naming { volume })
+    .map(|record| crate::head::HeadNaming {
+      id: record.id,
+      wrapped: record.record.clone(),
+    });
   Some(crate::head::HeadSealing {
     owner_anchor: state.origin_anchor.0,
     partition: state.partition,
     lineage: lineage.0,
     keys,
+    naming,
   })
 }
 
@@ -514,14 +526,29 @@ pub fn adopt_lineage(
   volume: slates_db::catalog::VolumeId,
   owner: &slates_db::catalog::Principal,
   (id, wrapped): ([u8; 16], Vec<u8>),
+  naming: Option<&crate::head::HeadNaming>,
 ) -> Result<(), SealKeyError> {
   let owner_key = slates_db::catalog::SealKeyOwner::Lineage { volume };
-  if state.db.partition().seal_key(&owner_key).is_some() {
-    return Ok(());
+  if state.db.partition().seal_key(&owner_key).is_none() {
+    let tenant_key = tenant(state, tenant_of(owner))?;
+    let root = state.seal_root.as_ref().ok_or(SealKeyError::Unavailable)?;
+    let secret = root.unwrap(&hyper_seal::keys::Wrapped::decode(&wrapped)?)?;
+    let rewrapped = tenant_key.wrap(&secret)?;
+    commit(state, record_of(owner_key, KeyId(id), &rewrapped))?;
   }
-  let tenant_key = tenant(state, tenant_of(owner))?;
-  let root = state.seal_root.as_ref().ok_or(SealKeyError::Unavailable)?;
-  let secret = root.unwrap(&hyper_seal::keys::Wrapped::decode(&wrapped)?)?;
-  let rewrapped = tenant_key.wrap(&secret)?;
-  commit(state, record_of(owner_key, KeyId(id), &rewrapped))
+  // The volume's naming key travels as the owner recorded it: wrapped under the lineage key both nodes now hold.
+  let naming_key = slates_db::catalog::SealKeyOwner::Naming { volume };
+  if let Some(naming) = naming
+    && state.db.partition().seal_key(&naming_key).is_none()
+  {
+    commit(
+      state,
+      slates_db::catalog::SealKeyRecord {
+        owner: naming_key,
+        id: naming.id,
+        record: naming.wrapped.clone(),
+      },
+    )?;
+  }
+  Ok(())
 }

@@ -2005,8 +2005,8 @@ fn advance_seals(
     let Some((head, sequence)) = sealable_head(state, id, object) else {
       continue;
     };
-    // The volume's lineage key, made before its first seal, so the head naming the seal's content carries it for
-    // successors (A-92 piece 4c). Off the hot path: once per seal job.
+    // The volume's lineage and naming keys (`namer` makes the lineage key first), made before its first seal, so the
+    // head naming the seal's content carries both for successors (A-92 piece 4c). Off the hot path: once per seal job.
     if !state.seals.contains_key(&object)
       && state.seal_root.is_some()
       && let Some(owner) = state
@@ -2014,7 +2014,7 @@ fn advance_seals(
         .partition()
         .volume(id)
         .map(|volume| volume.owner.clone())
-      && crate::seal_keys::lineage(state, id, crate::seal_keys::tenant_of(&owner)).is_err()
+      && crate::seal_keys::namer(state, id, crate::seal_keys::tenant_of(&owner)).is_err()
     {
       *state.refusals.entry(LINEAGE_UNMADE).or_insert(0) += 1;
     }
@@ -2955,6 +2955,10 @@ async fn materialize(origin: u16, object: ObjectId, head: HeadValue) {
   let successor_lineage = head.sealing.as_ref().and_then(|sealing| {
     state::with_state(|s| crate::seal_keys::successor_lineage(s, sealing)).flatten()
   });
+  let naming = head
+    .sealing
+    .as_ref()
+    .and_then(|sealing| sealing.naming.clone());
   let served = call_within(
     origin,
     target,
@@ -2971,7 +2975,7 @@ async fn materialize(origin: u16, object: ObjectId, head: HeadValue) {
       // carried no entry for this node (it acknowledged before its pair arrived) leaves the volume to a new key.
       if served
         && let Some(lineage) = successor_lineage
-        && crate::seal_keys::adopt_lineage(s, id, &catalog.owner, lineage).is_err()
+        && crate::seal_keys::adopt_lineage(s, id, &catalog.owner, lineage, naming.as_ref()).is_err()
       {
         *s.refusals.entry(LINEAGE_UNADOPTED).or_insert(0) += 1;
       }

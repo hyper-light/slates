@@ -9225,9 +9225,13 @@ tenant (`adopt_lineage`), so it seals under the key the dead owner did. Proven i
 opens on the successor after the owner dies (non-vacuous: without the adoption the successor makes a new key and the
 open fails). Stated window: a neighbour that acknowledged a head before its pair arrived holds that sequence without
 its entry until the next seal; as a successor it then starts a new key for the volume (counted
-`fleet.seal.lineage_unadopted` when the adoption fails outright). Found on the way and owed with piece 3b: the naming
-key must travel with the volume too (a successor verifies names the dead owner made), so it becomes a per-volume key
-carried beside the lineage key rather than a per-tenant one.
+`fleet.seal.lineage_unadopted` when the adoption fails outright). The naming key travels with the volume too (a
+successor verifies the names the dead owner made): it is a per-volume child of the lineage key (`SealKeyOwner::Naming
+{ volume }`), made with the lineage key when the first seal starts, carried once in the head as its record wrapped
+under the lineage key (`HeadNaming`, no per-neighbour cost), adopted with the lineage key, and erased with it on a
+destroy. Per-tenant naming was set aside: tenant keys are per node and partition, so tenant-wide names could never
+cross a takeover. The takeover test seals with the real naming key; its first run with it failed because the naming
+key was made after the head shipped, which is why the seal's start makes both.
 - Why: condition 9 asks for volumes post-quantum encrypted at rest and in transit. In transit holds already: every TLS
   handshake prefers X25519MLKEM768 (A-66, 2026-10-04), and SecP384r1MLKEM1024 replaces it between nodes once
   hyper-raft's measurement of it lands (its §10). At rest, slates has no disk (R1): a volume rests in RAM, in two

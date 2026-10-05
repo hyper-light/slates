@@ -748,7 +748,7 @@ fn seal_owner(kind: u8, who: u8) -> slates_db::catalog::SealKeyOwner {
       account: u64::from(who),
     },
     1 => slates_db::catalog::SealKeyOwner::Naming {
-      account: u64::from(who),
+      volume: VolumeId { bytes: [who; 16] },
     },
     _ => slates_db::catalog::SealKeyOwner::Lineage {
       volume: VolumeId { bytes: [who; 16] },

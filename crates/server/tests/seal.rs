@@ -78,7 +78,7 @@ fn seal_on(daemon: &Daemon) -> SealedChunk {
   daemon
     .observe_control(OBSERVE_NS, |state| {
       let lineage = lineage(state, VOLUME, ACCOUNT).unwrap();
-      let namer = namer(state, ACCOUNT).unwrap();
+      let namer = namer(state, VOLUME, ACCOUNT).unwrap();
       seal_chunk(
         &lineage,
         &namer,
@@ -95,7 +95,7 @@ fn open_on(daemon: &Daemon, sealed: SealedChunk) -> Result<Vec<u8>, SealedError>
   daemon
     .observe_control(OBSERVE_NS, move |state| {
       let lineage = lineage(state, VOLUME, ACCOUNT).unwrap();
-      let namer = namer(state, ACCOUNT).unwrap();
+      let namer = namer(state, VOLUME, ACCOUNT).unwrap();
       open_chunk(&lineage, &namer, &sealed).map(|chunk| chunk.payload)
     })
     .unwrap()
@@ -182,7 +182,7 @@ fn destroying_a_volume_erases_its_sealed_content() {
   let sealed = daemon
     .observe_control(OBSERVE_NS, move |state| {
       let lineage = lineage(state, volume, ACCOUNT).unwrap();
-      let namer = namer(state, ACCOUNT).unwrap();
+      let namer = namer(state, volume, ACCOUNT).unwrap();
       seal_chunk(
         &lineage,
         &namer,
@@ -208,7 +208,7 @@ fn destroying_a_volume_erases_its_sealed_content() {
   let opened = daemon
     .observe_control(OBSERVE_NS, move |state| {
       let lineage = lineage(state, volume, ACCOUNT).unwrap();
-      let namer = namer(state, ACCOUNT).unwrap();
+      let namer = namer(state, volume, ACCOUNT).unwrap();
       open_chunk(&lineage, &namer, &sealed).map(|chunk| chunk.payload)
     })
     .unwrap();
