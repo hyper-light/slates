@@ -389,6 +389,50 @@ fn capture(program: &str, args: &[&str]) -> Result<Outcome, Failure> {
   })
 }
 
+/// Runs `program args` with `input` on its stdin; its exit code and both outputs.
+fn capture_with_input(program: &str, args: &[&str], input: &[u8]) -> Result<Outcome, Failure> {
+  use std::io::Write;
+  let running = || format!("kind: running `{program} {}`", args.join(" "));
+  let mut child = Command::new(program)
+    .args(args)
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+    .map_err(|e| Failure(format!("{}: {e}", running())))?;
+  if let Some(mut stdin) = child.stdin.take() {
+    stdin
+      .write_all(input)
+      .map_err(|e| Failure(format!("{}: writing stdin: {e}", running())))?;
+  }
+  let output = child
+    .wait_with_output()
+    .map_err(|e| Failure(format!("{}: {e}", running())))?;
+  Ok(Outcome {
+    code: output.status.code().unwrap_or(-1),
+    stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+    stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+  })
+}
+
+/// Shape: the files `prove` writes into the volume before it is sealed, each [`LANE_FILE_BYTES`] long, so the
+/// takeover must serve real content, not an empty tree.
+const LANE_FILES: usize = 4;
+/// Shape: one such file's bytes (text, so the comparison through `kubectl` is exact).
+const LANE_FILE_BYTES: usize = 1 << 20;
+
+/// File `index`'s content in `prove`: distinct lines per file, so a block served from the wrong place shows.
+fn lane_file(index: usize) -> String {
+  let mut text = String::with_capacity(LANE_FILE_BYTES);
+  let mut line = 0usize;
+  while text.len() < LANE_FILE_BYTES {
+    text.push_str(&format!("file {index} line {line:08}\n"));
+    line += 1;
+  }
+  text.truncate(LANE_FILE_BYTES);
+  text
+}
+
 /// Runs `program args`, streaming its output to this terminal, and fails on a non-zero exit.
 fn stream(program: &str, args: &[&str]) -> Result<(), Failure> {
   eprintln!("kind: $ {program} {}", args.join(" "));
@@ -1543,6 +1587,75 @@ impl Lane {
     self.kubectl(&full)
   }
 
+  /// Writes [`LANE_FILES`] files into volume `id` on `pod` under a write attachment, through `slates write`.
+  fn write_lane_files(&self, pod: &str, id: &str) -> Result<(), Failure> {
+    let attached = self.verb(pod, &["attach", id, "--write"])?;
+    let attached: serde_json::Value = serde_json::from_str(&attached.stdout).map_err(|e| {
+      Failure(format!(
+        "kind: attach answered no JSON ({e}): {}",
+        attached.stderr
+      ))
+    })?;
+    let attachment = u64_of(&attached, "attachment").to_string();
+    let context = format!("kind-{}", self.cluster);
+    for index in 0..LANE_FILES {
+      let path = format!("lane-{index}.txt");
+      let wrote = capture_with_input(
+        "kubectl",
+        &[
+          "--context",
+          &context,
+          "-n",
+          NAMESPACE,
+          "exec",
+          "-i",
+          pod,
+          "--",
+          "/slates",
+          "write",
+          id,
+          &attachment,
+          &path,
+          "--json",
+        ],
+        lane_file(index).as_bytes(),
+      )?;
+      if wrote.code != 0 {
+        return Err(Failure(format!(
+          "kind: writing {path} on {pod}: {}",
+          wrote.stderr
+        )));
+      }
+    }
+    let detached = self.verb(pod, &["detach", &attachment])?;
+    if detached.code != 0 {
+      return Err(Failure(format!(
+        "kind: detach on {pod}: {}",
+        detached.stderr
+      )));
+    }
+    eprintln!("kind: wrote {LANE_FILES} files of {LANE_FILE_BYTES} bytes into {id} on {pod}");
+    Ok(())
+  }
+
+  /// Reads every file [`Self::write_lane_files`] wrote from volume `id` on `pod`, and fails unless each is exact.
+  fn read_lane_files(&self, pod: &str, id: &str) -> Result<(), Failure> {
+    for index in 0..LANE_FILES {
+      let path = format!("lane-{index}.txt");
+      let read = self.kubectl(&["exec", pod, "--", "/slates", "read", id, &path])?;
+      if read.code != 0 || read.stdout != lane_file(index) {
+        return Err(Failure(format!(
+          "kind: {pod} serves {path} of {id} wrong after the takeover ({} of {LANE_FILE_BYTES} bytes, exit {}): {}",
+          read.stdout.len(),
+          read.code,
+          read.stderr
+        )));
+      }
+    }
+    eprintln!("kind: {pod} serves every byte of the {LANE_FILES} files after the takeover");
+    Ok(())
+  }
+
   /// `prove`: formation, placement across pods, the owner's pod deleted as a crash would kill it, the
   /// survivors' retirement of it, the successor serving the volume, and the replacement pod rejoining.
   fn prove(&self) -> Result<(), Failure> {
@@ -1578,6 +1691,7 @@ impl Lane {
       .and_then(serde_json::Value::as_str)
       .ok_or_else(|| Failure(format!("kind: create answered no id: {created}")))?
       .to_owned();
+    self.write_lane_files(&owner, &id)?;
     let snapshot = self.verb(&owner, &["volume", "snapshot", &id])?;
     let snapshot: serde_json::Value = serde_json::from_str(&snapshot.stdout).map_err(|e| {
       Failure(format!(
@@ -1636,6 +1750,7 @@ impl Lane {
       "kind: {successor} took the volume over and serves it placed {:.1} s after the delete",
       served_in.as_secs_f64()
     );
+    self.read_lane_files(&successor, &id)?;
 
     // The whole anchor is gone. The replacement must join with a fresh voter identity at its
     // current DNS address; neither startup nor this history repeats bootstrap.

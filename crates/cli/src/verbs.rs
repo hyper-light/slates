@@ -1063,6 +1063,48 @@ fn landing_json(landing: &Landing) -> serde_json::Value {
   }
 }
 
+/// `write`: stdin's bytes as the file's whole new content. stdin is read up to the largest metadata ledger any shard
+/// reports, past which no shard can stage it (`crate::staging` in the daemon reserves a staged write there), so the
+/// command holds at most that much and refuses more, naming it.
+fn emit_write(
+  client: &mut Client,
+  (volume, attachment): (slates_client::VolumeId, u64),
+  path: &str,
+  mode: u32,
+  json: bool,
+) -> Result<(), ClientError> {
+  use std::io::Read;
+  let bound = client
+    .daemon_status()?
+    .shards
+    .iter()
+    .map(|shard| shard.metadata_bytes)
+    .max()
+    .unwrap_or(0);
+  let mut bytes = Vec::new();
+  let read = std::io::stdin()
+    .lock()
+    .take(bound.saturating_add(1))
+    .read_to_end(&mut bytes);
+  if let Err(e) = read {
+    return Err(ClientError::Refused(slates_client::Refusal::BadRequest {
+      reason: format!("reading stdin: {e}"),
+    }));
+  }
+  if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > bound {
+    return Err(ClientError::Refused(slates_client::Refusal::BadRequest {
+      reason: format!("stdin holds more than any shard can stage ({bound} bytes)"),
+    }));
+  }
+  let size = client.fs_write((volume, attachment), path, &bytes, mode)?;
+  if json {
+    println!("{}", serde_json::json!({ "path": path, "size": size }));
+  } else {
+    println!("wrote {size} bytes to {path}");
+  }
+  Ok(())
+}
+
 /// Acknowledges an outcome-only verb: a JSON `{ "ok": true }` under `--json`, else the text `message`.
 /// One shape for every verb whose success is a bare acknowledgement (resize, destroy, detach, destroy
 /// a snapshot), so a script tests `.ok` uniformly.
@@ -1116,6 +1158,12 @@ fn serve(client: &mut Client, verb: &Verb, json: bool) -> Result<(), ClientError
     | Verb::Rebase { .. }
     | Verb::Advance { .. }
     | Verb::Read { .. } => serve_merge(client, verb, json)?,
+    Verb::Write {
+      volume,
+      attachment,
+      path,
+      mode,
+    } => emit_write(client, (*volume, *attachment), path, *mode, json)?,
     Verb::Placed {
       volume,
       snapshot,

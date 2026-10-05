@@ -47,6 +47,27 @@ fn run(instance: &str, args: &[&str]) -> (i32, String, String) {
   )
 }
 
+/// Runs the command with `input` on its stdin; the exit code and both outputs.
+fn run_with_stdin(instance: &str, args: &[&str], input: &[u8]) -> (i32, Vec<u8>, String) {
+  use std::io::Write;
+  let mut child = slates()
+    .arg("--instance")
+    .arg(instance)
+    .args(args)
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+    .unwrap();
+  child.stdin.take().unwrap().write_all(input).unwrap();
+  let output = child.wait_with_output().unwrap();
+  (
+    output.status.code().unwrap_or(-1),
+    output.stdout,
+    String::from_utf8_lossy(&output.stderr).into_owned(),
+  )
+}
+
 fn value_of(text: &str, key: &str) -> String {
   text
     .lines()
@@ -183,6 +204,43 @@ fn placement_at_f0(instance: &str, id: &str) {
   assert!(err.contains("Unsupported"), "{err}");
 }
 
+/// Shape: the bytes of the large file the write step stages: more than one request carries.
+const STAGED_WRITE_BYTES: usize = 1 << 20;
+
+/// A-97 from the CLI: do attach for writing, `write` a small file and a staged 1 MiB one from stdin, read both back
+/// with `read`, and write under an attachment the caller does not hold; expect both files byte for byte and the last
+/// refused (exit 1) with nothing written.
+fn write_and_read(instance: &str, id: &str) {
+  let (code, out, _) = run(instance, &["attach", id, "--write"]);
+  assert_eq!(code, 0);
+  let attachment = value_of(&out, "attachment");
+  let small = b"written from stdin\n".to_vec();
+  let large: Vec<u8> = (0..STAGED_WRITE_BYTES)
+    .map(|at| u8::try_from((at * 31 + at / 4096) % 251).unwrap())
+    .collect();
+  for (path, bytes) in [("notes.txt", &small), ("big.bin", &large)] {
+    let (code, out, err) = run_with_stdin(instance, &["write", id, &attachment, path], bytes);
+    assert_eq!(code, 0, "write {path}: {err}");
+    assert!(
+      String::from_utf8_lossy(&out).contains(&format!("wrote {} bytes", bytes.len())),
+      "{}",
+      String::from_utf8_lossy(&out)
+    );
+    let (code, read, err) = run_with_stdin(instance, &["read", id, path], b"");
+    assert_eq!(code, 0, "read {path}: {err}");
+    assert!(read == *bytes, "{path} reads back as written");
+  }
+  let (code, _, err) = run_with_stdin(instance, &["write", id, "999999", "stray.txt"], b"stray");
+  assert_eq!(
+    code, 1,
+    "a write under another attachment is refused: {err}"
+  );
+  let (code, _, _) = run_with_stdin(instance, &["read", id, "stray.txt"], b"");
+  assert_ne!(code, 0, "nothing was written");
+  let (code, _, err) = run(instance, &["detach", &attachment]);
+  assert_eq!(code, 0, "detach: {err}");
+}
+
 /// attach for writing, the volume's status, detach.
 fn attach_status_detach(instance: &str, id: &str) {
   let (code, out, _) = run(instance, &["attach", id, "--write"]);
@@ -261,6 +319,7 @@ fn the_anchor_supervises_a_daemon_the_verbs_answer_and_the_daemon_leaves_with_th
   snapshot_clone_stat(&instance, &id);
   placement_at_f0(&instance, &id);
   attach_status_detach(&instance, &id);
+  write_and_read(&instance, &id);
   daemon_status(&instance);
   resize_destroy_and_refusals(&instance, &id);
   kill_anchor_and_wait_for_the_daemon_to_leave(&instance, anchor);

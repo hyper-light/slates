@@ -3600,7 +3600,8 @@ shard's own clock that A-65 budgets in (docs/bugs/2026-10-04-the-slow-observatio
      `crates/` mention `unsafe`): one call and 4,150 reply bytes against 734 calls and 28.8 MB for list-and-read, the
      same 73 files (BENCHMARKS; `crates/mcp/examples/codemode_tokens.rs`);
   3. `slates.fs`: listing **done (A-85)**; plain-volume write, mkdir, move and remove **done (A-97)**, on every OS,
-     under the caller's write attachment;
+     under the caller's write attachment; and from the CLI, `slates write VOLUME ATTACHMENT PATH` from stdin
+     (2026-10-05, tested in the real-process anchor flow);
   4. `subscriptions/listen`;
   5. the official conformance suite, run in a container (no host install): **done (A-87)**: 103 checks pass on
      the 2026-07-28 requirements and every failure is classified (reference fixtures, the optional tasks extension,
@@ -3700,6 +3701,10 @@ Condition 11/12, 2026-10-05 (BENCHMARKS "The daemon under a container memory cap
   - Still per shard: the chunk, inode and directory slabs and the metadata class are sized from one slice. A volume
     of large files reaches the whole pool (a chunk is sixteen granules); a volume of many small files stays bounded by
     its shard's slabs.
+- Owed (2026-10-05): the KIND lane's `prove` now writes four 1 MiB files before the seal and requires the successor to
+  serve every byte after the SIGKILL takeover (before, it placed an empty volume). Not yet run: Docker Desktop's VM is
+  above its `tcp_mem` maximum (BENCHMARKS), and the image's 100 MB build context uploaded at about 28 KB/s. Next: run
+  it with `install --netem 80ms 20ms 1%` once the VM is clean.
 - Owed (2026-10-05): an overlay's cold read through a macOS mount is 109 ms for 688 files (15.4 MB) against 25 ms on
   the host; warm, 36 ms. The change set is exact and fast: a `land` plan in 4 ms against `diff -rq`'s 29 ms (BENCHMARKS).
   Also owed: an outsider's `chmod` or `chown` of an untouched base file shows only when its listing reloads.

@@ -32,6 +32,7 @@ pub(crate) const USAGE: &str = "usage: slates [--instance NAME] <command>
   rebase WORK [--json]                             rebase a work onto its green's head
   advance ATTACHMENT [VERSION] [--json]            re-pin a green attachment (the head when no VERSION)
   read VOLUME PATH [--version N | --attachment A]  a file's bytes at a view (raw bytes)
+  write VOLUME ATTACHMENT PATH [--mode OCTAL] [--json]   replace a plain volume's file with stdin's bytes
   volume placed ID [--snapshot N] [--mirror] [--json]   await a durability scope
   attach ID [--read | --write] [--snapshot N]
             [--oci-source HOST_PATH --oci-destination CONTAINER_PATH] [--json]
@@ -260,6 +261,17 @@ pub(crate) enum Verb {
     attachment: u64,
     /// The version, or the head when none.
     version: Option<u64>,
+  },
+  /// Replace a plain volume's file with the bytes on stdin, under the caller's write attachment (A-97).
+  Write {
+    /// The volume.
+    volume: slates_client::VolumeId,
+    /// The caller's write attachment of it.
+    attachment: u64,
+    /// The file.
+    path: String,
+    /// The permission bits a created file takes.
+    mode: u32,
   },
   /// A file's bytes at a view: a green's head, a version, or an attachment's pinned version.
   Read {
@@ -1017,6 +1029,41 @@ fn parse_read(taken: &Taken, id: &str, path: &str) -> Result<Command, ParseError
   ))
 }
 
+/// Format: the permission bits a file `write` creates when no `--mode` is given (`rw-r--r--`, a regular file's
+/// usual mode).
+const WRITE_MODE: u32 = 0o644;
+/// Format: the radix `--mode` is read in (octal, as `chmod` takes it).
+const MODE_RADIX: u32 = 8;
+
+/// `write VOLUME ATTACHMENT PATH [--mode OCTAL]`.
+fn parse_write(
+  taken: &Taken,
+  id: &str,
+  attachment: &str,
+  path: &str,
+) -> Result<Command, ParseError> {
+  taken.only(&Spec {
+    values: &["--mode"],
+    switches: &[],
+  })?;
+  let mode = match taken.value("--mode") {
+    Some(octal) => u32::from_str_radix(octal, MODE_RADIX).map_err(|e| ParseError::BadValue {
+      what: "--mode",
+      reason: e.to_string(),
+    })?,
+    None => WRITE_MODE,
+  };
+  Ok(client(
+    taken,
+    Verb::Write {
+      volume: volume(id)?,
+      attachment: number(attachment)?,
+      path: path.to_owned(),
+      mode,
+    },
+  ))
+}
+
 /// `submit WORK [--evidence HEX]`: the evidence reference, when given, as the 64-hex identity.
 fn parse_submit(taken: &Taken, work: &str) -> Result<Command, ParseError> {
   taken.only(&Spec {
@@ -1387,6 +1434,8 @@ pub(crate) fn parse(arguments: &[String]) -> Result<Command, ParseError> {
     }
     ["read", id, path] => parse_read(&taken, id, path),
     ["read", ..] => Err(ParseError::Missing("VOLUME PATH")),
+    ["write", id, attachment, path] => parse_write(&taken, id, attachment, path),
+    ["write", ..] => Err(ParseError::Missing("VOLUME ATTACHMENT PATH")),
     ["versions", id] => {
       taken.only(&NONE)?;
       Ok(client(&taken, Verb::Versions { green: volume(id)? }))
