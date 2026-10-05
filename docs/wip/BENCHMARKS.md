@@ -1996,3 +1996,22 @@ Three runs; each cell is one run, in order.
   cargo build failed on both sides in an earlier run, a harness error (a second `[dependencies]` table), fixed before
   these numbers.
 
+### The daemon SIGKILLed in the middle of real workloads (condition 11; 2026-10-05)
+
+Command: `docs/wip/bench/realworld_chaos.sh`, run the same way as `realworld_native.sh` (same machine, same release
+build, one run). The daemon (never the anchor) is SIGKILLed twice during each workload, at the delays shown. The
+anchor restarts it over the RAM it holds, and the kernel's hard NFSv4.2 mount retries across the gap.
+
+| workload | killed at | wall time (undisturbed, above) | result |
+|---|---|---|---|
+| `git clone --depth 1` ripgrep | +0.3 s, +0.6 s | 0.97 s (0.97 s) | exit 0; `git fsck --full` passes; tree hash `31a1f6f713d195f5`, the same as on tmpfs |
+| `cargo build --release` (regex, serde, serde_json) | +1.0 s, +1.5 s | 3.58 s (3.28–3.34 s) | exit 0; the binary runs and prints `{"n":2}`, as on tmpfs |
+| `pip install requests flask` into a venv | +0.5 s, +0.8 s | 3.09 s (2.15 s) | exit 0; `import flask, requests` succeeds (requests 2.34.2) |
+
+- The anchor's account: generation 7 and 6 restarts, one per kill. No workload saw an error, and none was retried by
+  the harness. The kernel resent each request lost in a gap, and the restarted daemon answered it over the same RAM.
+- Cost of two restarts: about 0.3 s for the build and 0.9 s for pip, including the kernel's retransmit wait. The clone
+  showed none within its run-to-run spread.
+- The first attempt hung in the harness, not in slates: a bare `wait` also waited for the anchor, which never exits.
+  The script now waits on the killer's pid.
+
