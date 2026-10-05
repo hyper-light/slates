@@ -9166,6 +9166,14 @@ Status: built 2026-10-05 (the fetch half of Phase 8 item 13; remote attach itsel
 Applied in the same change to: `vendor/hyper-raft/hyper-seal` (hyper-raft `46d1035`, its CI green on all ten jobs;
 `vendor/hyper-raft/SNAPSHOT`, README), the workspace `Cargo.toml`, GAPS.
 Status: designed 2026-10-05; the crate is vendored. The pieces below are built in order, each with its own record.
+Built (2026-10-05): piece 1, and the sealed chunk of piece 3 (`crates/cluster/src/sealed.rs`): a chunk's whole record
+sealed by STREAM under a data key of its own wrapped by the lineage key (a chunk is written once, so seal.md §4's rule
+for a file written once applies and needs no version argument), named by its keyed name, verified by a holder through
+the BLAKE3 of its sealed bytes; opened only under the lineage key, whole and in place, and only as the chunk its name
+says (`crates/cluster/tests/sealed.rs`: every length class, no plaintext window or identity visible, every flipped bit
+of a two-segment chunk refused, every cut, an extension, a repeated and a spliced segment refused, another lineage or
+naming key and a swapped name refused, keyed names equal within a tenant and different across tenants). Owed for
+piece 3: the content plane carrying sealed chunks and a sealed manifest with its clear chunk table.
 - Why: condition 9 asks for volumes post-quantum encrypted at rest and in transit. In transit holds already: every TLS
   handshake prefers X25519MLKEM768 (A-66, 2026-10-04), and SecP384r1MLKEM1024 replaces it between nodes once
   hyper-raft's measurement of it lands (its §10). At rest, slates has no disk (R1): a volume rests in RAM, in two

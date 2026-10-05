@@ -387,6 +387,26 @@ fn put_chunk(out: &mut Vec<u8>, chunk: &Chunk) {
   put_blob(out, &chunk.payload);
 }
 
+/// A chunk's record as the content plane writes it: the bytes a sealed chunk seals whole (A-92), its identity among
+/// them, so nothing of the plaintext travels outside the seal.
+pub(crate) fn chunk_record(chunk: &Chunk) -> Vec<u8> {
+  let mut out = Vec::with_capacity(chunk.payload.len().saturating_add(CHUNK_RECORD_FIELDS));
+  put_chunk(&mut out, chunk);
+  out
+}
+
+/// Format: the bytes of a chunk record besides its payload: the identity (32), the raw and stored lengths (8 + 8),
+/// the encoding and level (1 + 1), the dictionary (32) and the payload's length (4).
+const CHUNK_RECORD_FIELDS: usize = 32 + 8 + 8 + 1 + 1 + 32 + 4;
+
+/// The chunk a whole record holds ([`chunk_record`]'s inverse), refusing a record with bytes past it.
+pub(crate) fn chunk_from_record(bytes: &[u8]) -> Result<Chunk, ContentError> {
+  let mut reader = Reader { bytes, at: 0 };
+  let chunk = reader.chunk()?;
+  reader.finish()?;
+  Ok(chunk)
+}
+
 /// The head every placement message after the kind byte carries: the object, the sequence and the manifest.
 fn put_placement(out: &mut Vec<u8>, object: &ObjectId, sequence: u64, manifest: &[u8; 32]) {
   out.extend_from_slice(&object.0);

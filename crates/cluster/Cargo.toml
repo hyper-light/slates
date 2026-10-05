@@ -28,6 +28,9 @@ slates-mem = { workspace = true }
 # the held content's recovery keys (A-64): a claimed block is adopted by the BLAKE3 of the bytes it holds; also the
 # retention publication's hash, timed by the publication-cost measurement (AUD-29-30).
 blake3 = { workspace = true }
+# Sealing at rest (A-92): held replicas are ciphertext, sealed by STREAM under a volume's lineage key and named by keyed
+# names (hyper-raft docs/seal.md §4, §7).
+hyper-seal = { workspace = true }
 
 [dev-dependencies]
 # self-signed enrolled identities for the holder-and-owner sessions in the tests.

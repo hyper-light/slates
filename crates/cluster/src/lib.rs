@@ -55,6 +55,7 @@ pub mod raft;
 pub mod raft_wire;
 pub mod root_group;
 pub mod routing;
+pub mod sealed;
 pub mod timing;
 
 use std::sync::mpsc::{TryRecvError, channel};
