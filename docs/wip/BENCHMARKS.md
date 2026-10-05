@@ -1728,3 +1728,34 @@ rebuild after touching `crates/vfs/src/lib.rs`. Apple M5 Max, load average 15–
   queue and RTT while the build saturates the VM's CPUs; the same path streams a 256 MiB `dd … conv=fsync` in
   197–216 ms (1.3 GB/s), against 1.6–2.7 s on the host bind.
 
+
+### Delegations against the kernels (A-78, A-79; 2026-10-04)
+
+Apple M5 Max, Docker Desktop's Linux kernel as the NFSv4.2 client, macOS's NFSv3 client; load average 40–62 (other
+sessions' work, which is the norm on this machine). Scripts are in this record's session scratchpad.
+
+**Cross-protocol consistency.** Command: `bash e2e-deleg-consistency.sh`, release build. A container holds a read
+delegation on a settled file and reads it every 50 ms. The host writes it through `slates mount` (NFSv3).
+
+| build | host write (ms) | reader sees new contents (ms after the write) | runs with a delegation |
+|---|---|---|---|
+| refused `NFS3ERR_JUKEBOX` (before the hold) | 4,033 | — | 1 of 1 |
+| hold, probe not retrying `NFS4ERR_DELAY` | 41 / 52 / 67 | 67 / 114 / 195 | 0 of 3 (probe answered DELAY; nothing recalled) |
+| hold + `NFS4ERR_DELAY` retried | 46 / 27 / 24 / 23 | 24 / 29 / 3 / 2 | 4 of 4 |
+
+- Every delegated run counts `nfs.v3.held_for_recall: 1`, `nfs4.recall.sent: 1` and `nfs4.recall.answered: 1`. The
+  reader never saw the new contents before the write: the recall comes first.
+- The undelegated middle row is not a hold measurement. It is plain NFSv3 writes, and the reader polls its attribute
+  cache. It is kept as the record of the bug (`docs/bugs/2026-10-04-a-callback-answered-delay-marked-the-back-channel-down.md`).
+
+**Settled read-heavy workload.** Command: `bash e2e-docker-rust-settled.sh`. The Rust build of the record above, with
+the workspace left to settle for one lease before the warm no-op rebuilds:
+
+| warm no-op rebuild (ms) | without delegations | with read delegations |
+|---|---|---|
+| range over the runs | 186–217 | 106–148 |
+
+- About 40% faster: the client opens, reads and closes settled files from its own cache.
+- Measured and rejected: granting on any read-only open, with no settled rule. On the churning Go build it ran 3%
+  slower, because the client returned the delegations itself. Hence the quiet period (A-78).
+- Unexplained, seen once and not again: one `DELEGRETURN` stalled 84 ms. It is in GAPS.

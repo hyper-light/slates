@@ -1274,7 +1274,12 @@ pub fn serve(state: &mut ShardState, client: Handle<ClientSlot>, request: &Reque
       shard,
     );
   }
-  match run_recorded(state, origin, id, client_id, &principal, body) {
+  let reply = run_recorded(state, origin, id, client_id, &principal, body);
+  // A change this verb was refused for a delegation asked for a recall; it is sent now, after the verb's own
+  // transaction (A-79).
+  #[cfg(unix)]
+  crate::delegation::drain(state);
+  match reply {
     Some(reply) => Served::Reply(reply),
     // The verb deferred its reply to a fleet commit (AUD-11): it comes back through `deliver`.
     None => Served::Forwarded,
@@ -1405,6 +1410,8 @@ fn run_forwarded(
   state.current_span = cause;
   let reply = run_recorded(state, origin, id, client_id, principal, body);
   state.current_span = None;
+  #[cfg(unix)]
+  crate::delegation::drain(state);
   reply
 }
 

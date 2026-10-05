@@ -135,7 +135,9 @@ pub mod extension {
   // routing returns has the same value in NFSv4).
 
   /// Format: record an open. Arguments: the open-owner (opaque), the share access and deny (`u32`
-  /// each). Result: the status, then the open's state id.
+  /// each), whether the client may be delegated the file (`u32`, A-78: its back channel answers and the open reads
+  /// only), and the caller's clock (`u64`). Result: the status, then the open's state id, then whether a read
+  /// delegation was granted (`u32`) and, when it was, its state id.
   pub const STATE_OPEN: u32 = 1040;
   /// Format: close an open. Arguments: its state id. Result: the status, then the advanced state id,
   /// then the count and each `other` (12 bytes) the owner no longer holds.
@@ -170,6 +172,8 @@ pub mod extension {
   pub const WRITE_STATE: u32 = 1051;
   /// Format: a SETATTR under a state id, laid out as [`READ_STATE`] over the NFSv3 SETATTR.
   pub const SETATTR_STATE: u32 = 1052;
+  /// Format: DELEGRETURN (RFC 8881 §18.6; A-78). Arguments: the delegation's state id. Result: the status.
+  pub const STATE_DELEGRETURN: u32 = 1053;
 }
 
 /// Format: the bytes a state-carrying I/O procedure appends to its NFSv3 arguments: the client id (8)
@@ -561,6 +565,22 @@ impl<'b> Export<'b> {
     }
   }
 
+  /// Whether the file `handle` names has not changed within its owner's delegation quiet period (the lease), so a
+  /// delegation of it is worth granting. A file whose attributes cannot be read is not.
+  fn settled(&mut self, handle: &Nfsfh3) -> bool {
+    let quiet = self
+      .file_states_mut()
+      .map_or(0, |files| files.delegation_quiet());
+    let Ok(identity) = FileHandle::from_fh(handle) else {
+      return false;
+    };
+    let Ok(node) = self.attrs_of(&identity) else {
+      return false;
+    };
+    let now = self.bridge.now();
+    u64::try_from(now.saturating_sub(node.ctime)).is_ok_and(|age| age >= quiet)
+  }
+
   fn file_states_mut(&mut self) -> Option<&mut FileState> {
     match &mut self.files {
       FileSlot::Owned(files) => Some(files),
@@ -816,7 +836,8 @@ impl<'b> Export<'b> {
       | extension::STATE_LOCK
       | extension::STATE_LOCKT
       | extension::STATE_LOCKU
-      | extension::STATE_CHECK => Some(self.file_state(procedure, args)),
+      | extension::STATE_CHECK
+      | extension::STATE_DELEGRETURN => Some(self.file_state(procedure, args)),
       _ => None,
     }
   }
@@ -1137,10 +1158,20 @@ impl<'b> Export<'b> {
     let bad = |_| Nfsstat4::Badxdr;
     let handle = Nfsfh3::decode(args).map_err(|_| Nfsstat4::Badhandle)?;
     let clientid = args.u64().map_err(bad)?;
+    // A file changed within the quiet period is likely to change again (RFC 8881 §10.4: "the probability of future
+    // conflicting open requests should be low based on the recent history of the file"), so it is not delegated: its
+    // holder would return the delegation to change it, a round trip for nothing (A-78; measured 2026-10-04: a Rust
+    // build returned 1,328 of 1,759 delegations on its own and ran 3% slower).
+    let settled = procedure != extension::STATE_OPEN || self.settled(&handle);
     let files = self.file_states_mut().ok_or(Nfsstat4::Serverfault)?;
     match procedure {
       extension::STATE_OPEN | extension::STATE_CLOSE | extension::STATE_DOWNGRADE => {
-        open_state(files, procedure, &handle, clientid, args)
+        open_state(files, (procedure, settled), &handle, clientid, args)
+      }
+      extension::STATE_DELEGRETURN => {
+        let stateid = Stateid::decode(args).map_err(bad)?;
+        files.return_delegation(&stateid, clientid, &handle)?;
+        Ok(Vec::new())
       }
       extension::STATE_LOCK | extension::STATE_LOCKT | extension::STATE_LOCKU => {
         lock_state(files, procedure, &handle, clientid, args)
@@ -2850,7 +2881,7 @@ fn encode_gone(body: &mut XdrWriter, gone: &[crate::v4::lock::Other]) {
 /// OPEN, CLOSE and OPEN_DOWNGRADE state at the owner (§4.6 A-36): the result body.
 fn open_state(
   files: &mut FileState,
-  procedure: u32,
+  (procedure, settled): (u32, bool),
   handle: &Nfsfh3,
   clientid: u64,
   args: &mut XdrReader<'_>,
@@ -2869,9 +2900,24 @@ fn open_state(
         access: args.u32().map_err(bad)?,
         deny: args.u32().map_err(bad)?,
       };
+      let may_delegate = args.u32().map_err(bad)? != 0;
+      let now_ns = args.u64().map_err(bad)?;
       files
         .open(clientid, owner, handle, share)?
         .encode(&mut body);
+      // A read delegation for a read-only open that denies nothing (RFC 8881 §10.4), when the client may take one.
+      let read_only = share.access == crate::v4::files::share::READ && share.deny == 0;
+      let quiet = files.delegation_quiet();
+      match (may_delegate && read_only && settled)
+        .then(|| files.delegate_read(clientid, handle, now_ns, quiet))
+        .flatten()
+      {
+        Some(delegation) => {
+          body.u32(1);
+          delegation.encode(&mut body);
+        }
+        None => body.u32(0),
+      }
     }
     extension::STATE_CLOSE => {
       let stateid = Stateid::decode(args).map_err(bad)?;

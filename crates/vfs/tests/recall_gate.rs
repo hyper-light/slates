@@ -60,3 +60,40 @@ fn a_delegated_inode_refuses_every_change_and_queues_one_recall() {
   store.recall_gate.release(file.0);
   assert_eq!(vol.write(&mut store, file, 0, b"after!"), Ok(6));
 }
+
+/// A-79: do refuse a change at the gate, then park on it; expect the refusal counted (so a caller can tell the gate's
+/// refusal from any other), the park to wait while the inode stays delegated, and to end once it is released.
+#[test]
+fn a_parked_caller_waits_until_the_inode_is_released() {
+  let mut store = store();
+  let mut vol = volume(&mut store, 1 << 20);
+  let root = vol.root_inode(&store).unwrap();
+  let file = vol.create_file_no(&mut store, root, "held", 0o644).unwrap();
+  store.recall_gate.delegate(file.0);
+  let before = store.recall_gate.refusals();
+  assert_eq!(
+    vol.write(&mut store, file, 0, b"x"),
+    Err(VfsError::Delegated)
+  );
+  assert_eq!(
+    store.recall_gate.refusals(),
+    before + 1,
+    "the gate's refusal"
+  );
+  let seen = store.recall_gate.generation();
+  let waker = std::task::Waker::noop();
+  assert!(
+    !store.recall_gate.wait_for_release(seen, waker),
+    "still delegated: wait"
+  );
+  assert!(
+    !store.recall_gate.wait_for_release(seen, waker),
+    "a second park replaces the first"
+  );
+  store.recall_gate.release(file.0);
+  assert!(
+    store.recall_gate.wait_for_release(seen, waker),
+    "released: go"
+  );
+  assert_eq!(vol.write(&mut store, file, 0, b"x"), Ok(1));
+}

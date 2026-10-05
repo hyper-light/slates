@@ -8802,3 +8802,81 @@ Status: built 2026-10-04 (B-1 of read delegations).
   naming its session, under its AUTH_SYS parameters and minor version, interleaved with its reply, and is recorded
   up. A silent client is recorded down within the probe's deadline while its compounds are still answered.
 
+
+### A-78 — NFSv4.1 read delegations at the file's owner (2026-10-04)
+Applied in the same change to: `crates/bridge-nfs/src/v4/delegation.rs` (new), `crates/bridge-nfs/src/v4/files.rs`
+(delegations in the owner's file state, keyed by file identity), `crates/bridge-nfs/src/v4/compound.rs` (OPEN's
+`may_delegate`, `OPEN_DELEGATE_READ`, `CLAIM_DELEGATE_CUR`/`CLAIM_DELEG_CUR_FH`, `DELEGRETURN`,
+`SEQ4_STATUS_RECALLABLE_STATE_REVOKED`), `crates/bridge-nfs/src/procedures.rs` (`STATE_OPEN` carries the wish and
+the clock; `STATE_DELEGRETURN`), `crates/db` (`NfsDelegationRecord`, `Op::NfsDelegationSet`/`NfsDelegationCleared`,
+snapshot), `crates/server/src/nfs_state.rs`, `crates/server/src/nfs.rs` (`owns_file`, `revoked_state`),
+`crates/bridge-nfs/tests/v4_delegation.rs`, `crates/server/tests/nfs_mount.rs`, GAPS, BENCHMARKS.
+Status: built 2026-10-04 (B-2 of Ada's "do all"); write delegations and directory delegations owed.
+- Why: under NFSv4.1 about 40% of a workload's requests are OPEN and CLOSE, and delegations cut requests by up to
+  29× (Chen et al., SIGMETRICS'15, tier A). A client holding a read delegation opens, reads and closes from its own
+  cache.
+- Grant: a read delegation is granted on OPEN only when every condition holds:
+  - the session's back channel has answered (A-77; §10.2);
+  - the open is read-only and denies nothing;
+  - the file's owner is the shard serving the session;
+  - the file is settled, unchanged for one lease (the quiet period, `failover_slo_ns`);
+  - the file was not recalled within the quiet period;
+  - the owner's delegation table has room.
+  Measured reason for the settled rule: granting on churning files made a Go build 3% slower, because the client
+  returned the delegations itself.
+- State: a delegation belongs to the file (keyed by `handle::identity`, as opens and locks are, so two mounts of one
+  file meet). It is journaled durably like A-37 opens, and restored with the quiet period and the recall gate's set.
+  Its state id serves its holder's reads only.
+- Return and revocation: `DELEGRETURN` returns it. A recalled delegation not returned within a lease is revoked
+  (§10.4.5). A revoked delegation stays visible to its holder as `NFS4ERR_DELEG_REVOKED`, and is flagged on every
+  `SEQUENCE`, until the holder frees it.
+- Proven:
+  - `crates/bridge-nfs/tests/v4_delegation.rs`, 8 tests: grant, recall once, quiet period, lapse revocation, two
+    mounts, state-id authority, restart;
+  - `a_write_from_another_client_recalls_the_read_delegation_first`;
+  - the real Linux client receives and returns delegations (BENCHMARKS, settled-workload A/B).
+
+### A-79 — The recall gate on every change path; NFSv3 calls held for the return (2026-10-04)
+Applied in the same change to: `crates/vfs/src/recall_gate.rs` (new), `crates/vfs/src/volume.rs`
+(`make_current_inode`), `crates/vfs/src/error.rs` (`Delegated`), `crates/server/src/delegation.rs` (new: `drain`),
+`crates/server/src/callback.rs` (`NFS4ERR_DELAY` retried), `crates/server/src/nfs.rs` (`serve_local_held`),
+`crates/server/src/{verbs,fuse}.rs`, `crates/bridge-fuse`, `crates/bridge-winfsp`, `crates/server/src/error.rs`,
+`crates/vfs/tests/recall_gate.rs`, `crates/server/tests/nfs_mount.rs`,
+`docs/bugs/2026-10-04-a-callback-answered-delay-marked-the-back-channel-down.md`, GAPS, BENCHMARKS.
+Status: built 2026-10-04 (B-3).
+- Why: RFC 8881 §10.2 says operations "outside the NFSv4.1 protocol ... also need to result in delegation recall"
+  and must wait until the delegation is returned or revoked.
+- The gate: every change to a file in slates first makes its inode current (copy-on-write), so the gate sits in
+  `make_current_inode`, with one check covering NFSv3, NFSv4, FUSE, virtio-fs, WinFsp, the SDK, merge and landing.
+  A change to a delegated inode is refused `VfsError::Delegated` before anything is touched, and the inode is
+  queued once. After each operation the owner shard's `drain` sends `CB_RECALL` on the holder's back channel, or
+  revokes at once when the holder has no answering back channel there, and revokes lapsed recalls.
+- How each caller sees the refusal:
+
+  | Caller | Answer |
+  |---|---|
+  | NFSv4 | `NFS4ERR_DELAY` |
+  | FUSE | `EAGAIN` |
+  | WinFsp | `STATUS_SHARING_VIOLATION` |
+  | SDK | `Refusal::Unpublished` |
+  | NFSv3 | held (below) |
+
+- The NFSv3 hold: §10.2 lets the server "delay responding to conflicting requests". The macOS NFSv3 client backs off
+  for seconds after `NFS3ERR_JUKEBOX` (measured: 4,033 ms for one write). So the daemon holds a v3 call the gate
+  refused, parked on the gate's generation, and serves it again at each release. The hold is bounded by one lease
+  past the recall, when a drain revokes the delegation so the last attempt proceeds. A NFSv4 sub-call is never held:
+  a holder changing its own file would block the connection its `DELEGRETURN` must arrive on.
+- Callback `NFS4ERR_DELAY`: the Linux client answers `CB_SEQUENCE` with `NFS4ERR_DELAY` while it is still setting
+  up its session (two of four Docker runs). The callback is now sent again, with the same slot sequence (§20.9.3),
+  at the daemon's poll interval within the caller's deadline.
+- Proven:
+  - `a_delegated_inode_refuses_every_change_and_queues_one_recall` and
+    `a_parked_caller_waits_until_the_inode_is_released`;
+  - `an_nfsv3_write_to_a_delegated_file_is_held_until_the_delegation_returns`, which fails `NFS3ERR_JUKEBOX` without
+    the hold;
+  - `an_nfsv3_write_held_on_an_unreturned_delegation_proceeds_after_its_revocation`;
+  - `a_probe_answered_delay_is_retried_on_the_same_slot_sequence`, which fails without the retry;
+  - against the kernels (container NFSv4.2 reader, macOS NFSv3 writer): the host write takes 23–46 ms (was 4,033 ms)
+    and the reader sees the new contents 2–29 ms after it, four runs of four.
+- Owed: FUSE and SDK callers are refused rather than parked; `SEQ4_STATUS_CB_PATH_DOWN`; a forwarded NFSv3 call (the
+  volume on another shard than the connection's, rare since A-76) is answered `JUKEBOX`, not held.

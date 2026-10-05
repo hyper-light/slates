@@ -58,6 +58,8 @@ mod write_log;
 #[cfg(unix)]
 mod callback;
 #[cfg(unix)]
+mod delegation;
+#[cfg(unix)]
 pub mod nfs;
 #[cfg(unix)]
 mod nfs_state;

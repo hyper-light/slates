@@ -3543,4 +3543,19 @@ shard's own clock that A-65 budgets in (docs/bugs/2026-10-04-the-slow-observatio
   `NfsDelegationCleared`, appended; in the snapshot; purged with the client; the db model test's histories carry
   them). Owed: the file-state table's delegations, the grant on OPEN, `DELEGRETURN`, `CLAIM_DELEGATE_CUR`, and B-3's
   recalls. Grants stay off until recalls cover every mutation path.
+- **B-2 done (A-78):** read delegations granted on OPEN at the file's owner (back channel up, read-only, deny none,
+  settled for one lease, not recently recalled, under the table's bound); `DELEGRETURN`, `CLAIM_DELEGATE_CUR`,
+  revocation after a lease, `NFS4ERR_DELEG_REVOKED` and `SEQ4_STATUS_RECALLABLE_STATE_REVOKED`.
+- **B-3 done (A-79):** the recall gate in `make_current_inode` covers every change path. NFSv3 calls are held for the
+  return, which took the macOS host write from 4,033 ms to 23–46 ms. A callback answered `NFS4ERR_DELAY` is retried
+  on the same slot sequence; before that, the back channel was marked down in two of four Linux sessions
+  (`docs/bugs/2026-10-04-a-callback-answered-delay-marked-the-back-channel-down.md`).
+- **Owed:**
+  - FUSE and SDK callers parked rather than refused;
+  - `SEQ4_STATUS_CB_PATH_DOWN`;
+  - a forwarded NFSv3 call held, not answered `JUKEBOX`;
+  - write delegations with space reservation (B, second half);
+  - directory delegations (C, §10.9);
+  - the dynamic slot target;
+  - the one 84 ms `DELEGRETURN` stall, seen once.
 

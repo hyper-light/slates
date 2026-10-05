@@ -461,6 +461,8 @@ async fn serve(attachment: u64) {
       match state::with_state(|s| turn(s, attachment)) {
         Some(Turned::Idle) => break,
         Some(Turned::Served) => {
+          // A change this request was refused for a delegation asked for a recall; it is sent now (A-79).
+          let _ = state::with_state(crate::delegation::drain);
           let _ = futures::yield_now().await;
         }
         Some(Turned::Fenced) => {

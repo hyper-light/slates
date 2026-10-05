@@ -66,6 +66,18 @@ pub trait Backend {
   fn renew_home(&mut self, clientid: u64) {
     let _ = clientid;
   }
+  /// Whether the file `fh` names is owned by the shard serving this compound (A-78: a delegation is granted only
+  /// there). A server with one owner owns every file.
+  fn owns_file(&self, fh: &Nfsfh3) -> bool {
+    let _ = fh;
+    true
+  }
+  /// Whether `clientid` holds a revoked delegation it has not freed at this shard's files
+  /// (`SEQ4_STATUS_RECALLABLE_STATE_REVOKED`, §10.4.5).
+  fn revoked_state(&mut self, clientid: u64) -> bool {
+    let _ = clientid;
+    false
+  }
 }
 
 /// Format: the operation numbers (RFC 7863 `nfs_opnum4`).
@@ -188,6 +200,16 @@ pub mod op {
 const AUTH_SYS: u32 = 1;
 /// Format: `SECINFO_STYLE4_CURRENT_FH`, the only style whose argument this server reads.
 const OPEN_DELEGATE_NONE: u32 = 0;
+/// Format: `SEQ4_STATUS_RECALLABLE_STATE_REVOKED` (RFC 8881 §18.46.3).
+const SEQ4_STATUS_RECALLABLE_STATE_REVOKED: u32 = 0x0000_0040;
+/// Format: `OPEN_DELEGATE_READ` (RFC 8881 §18.16.2).
+const OPEN_DELEGATE_READ: u32 = 1;
+/// Format: `ACE4_ACCESS_ALLOWED_ACE_TYPE` (RFC 8881 §6.2.1.1).
+const ACE4_ACCESS_ALLOWED_ACE_TYPE: u32 = 0;
+/// Format: `OPEN4_SHARE_ACCESS_WANT_DELEG_MASK` and `OPEN4_SHARE_ACCESS_WANT_NO_DELEG` (RFC 8881 §18.16.1).
+const OPEN4_SHARE_ACCESS_WANT_DELEG_MASK: u32 = 0xFF00;
+/// Format: see [`OPEN4_SHARE_ACCESS_WANT_DELEG_MASK`].
+const OPEN4_SHARE_ACCESS_WANT_NO_DELEG: u32 = 0x0400;
 /// Format: `OPEN4_RESULT_LOCKTYPE_POSIX`: this server's locks follow POSIX (RFC 8881 §18.16.3).
 const OPEN4_RESULT_LOCKTYPE_POSIX: u32 = 4;
 /// Format: `opentype4` `OPEN4_CREATE`.
@@ -207,8 +229,12 @@ mod createmode4 {
 mod claim {
   /// Format: `CLAIM_NULL`: open a name in the current directory.
   pub(super) const NULL: u32 = 0;
+  /// Format: `CLAIM_DELEGATE_CUR`: open a name in the current directory under a delegation being returned (§10.4.4).
+  pub(super) const DELEGATE_CUR: u32 = 2;
   /// Format: `CLAIM_FH`: open the current file handle itself (NFSv4.1).
   pub(super) const FH: u32 = 4;
+  /// Format: `CLAIM_DELEG_CUR_FH`: open the current file handle under a delegation being returned.
+  pub(super) const DELEG_CUR_FH: u32 = 5;
 }
 /// Format: `channel_dir_from_server4` `CDFS4_FORE`: a bound connection carries the fore channel only.
 const CDFS4_FORE: u32 = 1;
@@ -349,6 +375,8 @@ pub(super) struct Frame {
   pub(super) current: Option<Nfsfh3>,
   pub(super) saved: Option<Nfsfh3>,
   pub(super) clientid: Option<u64>,
+  /// The session the compound's `SEQUENCE` named, when it opened with one.
+  pub(super) session: Option<SessionId>,
   /// The `LOCK4denied` body of a LOCK or LOCKT refused `NFS4ERR_DENIED`, which the result carries.
   denied: Option<Vec<u8>>,
 }
@@ -384,6 +412,7 @@ pub async fn serve<B: Backend>(backend: &mut B, args: &[u8], request_bytes: usiz
     current: None,
     saved: None,
     clientid: None,
+    session: None,
     denied: None,
   };
   let mut results = XdrWriter::new();
@@ -411,6 +440,7 @@ pub async fn serve<B: Backend>(backend: &mut B, args: &[u8], request_bytes: usiz
             slot = Some((sessionid, slotid));
             limits = Some(reply_limits);
             frame.clientid = Some(clientid);
+            frame.session = Some(sessionid);
             Ok(body)
           }
           Err(status) => Err(status),
@@ -856,7 +886,12 @@ fn sequence<B: Backend>(
       body.u32(slotid);
       body.u32(table_highest);
       body.u32(table_highest); // target highest slot
-      body.u32(0); // status flags
+      // A client holding a revoked delegation it has not freed is told on every SEQUENCE until it frees it (§10.4.5).
+      body.u32(if backend.revoked_state(clientid) {
+        SEQ4_STATUS_RECALLABLE_STATE_REVOKED
+      } else {
+        0
+      });
       Ok(SequenceOutcome::New {
         body: body.into_bytes(),
         sessionid,
@@ -1268,6 +1303,7 @@ async fn file_state_operation<B: Backend>(
 ) -> Outcome {
   match opnum {
     op::CLOSE => close(backend, reader, frame).await,
+    op::DELEGRETURN => delegreturn(backend, reader, frame).await,
     op::OPEN_DOWNGRADE => open_downgrade(backend, reader, frame).await,
     op::LOCK | op::LOCKT | op::LOCKU => lock_operation(backend, opnum, reader, frame).await,
     op::TEST_STATEID => test_stateid(backend, reader, frame).await,
@@ -1282,6 +1318,28 @@ async fn file_state_operation<B: Backend>(
     | op::REMOVEXATTR => super::v42::operation(backend, opnum, reader, frame).await,
     _ => backend.with_v4(|server| state_operation(server, opnum, reader, frame))?,
   }
+}
+
+/// DELEGRETURN (§18.6) at the file's owner (A-78): the delegation given back, its file's gate opened when it was the
+/// last.
+async fn delegreturn<B: Backend>(
+  backend: &mut B,
+  reader: &mut XdrReader<'_>,
+  frame: &Frame,
+) -> Outcome {
+  let stateid = Stateid::decode(reader).map_err(|_| Nfsstat4::Badxdr)?;
+  let fh = current(frame)?.clone();
+  let clientid = frame.clientid.ok_or(Nfsstat4::OpNotInSession)?;
+  state_call(
+    backend,
+    extension::STATE_DELEGRETURN,
+    &fh,
+    clientid,
+    &stateid_bytes(&stateid),
+  )
+  .await
+  .map(|_| Vec::new())
+  .map_err(|(status, _)| status)
 }
 
 /// CLOSE (§18.2) at the file's owner, which drops the lock states that held no lock with the open.
@@ -1728,7 +1786,7 @@ async fn entry_object<B: Backend>(
 
 /// `OPEN` (§18.16): a name in the current directory (`CLAIM_NULL`), created if asked, or the current
 /// file itself (`CLAIM_FH`); an existing file's permission checked against the access asked; the share
-/// checked against the file's other opens; a state id recorded; no delegation.
+/// checked against the file's other opens; a state id recorded; a read delegation granted when one is due (A-78).
 async fn open<B: Backend>(
   backend: &mut B,
   reader: &mut XdrReader<'_>,
@@ -1736,9 +1794,9 @@ async fn open<B: Backend>(
 ) -> Outcome {
   let bad = |_| Nfsstat4::Badxdr;
   let _seqid = reader.u32().map_err(bad)?;
-  // The low bits are the share; the high bits of the access word are delegation wishes (§18.16.3),
-  // which this server never grants.
-  let access = reader.u32().map_err(bad)? & share::BOTH;
+  // The low bits are the share; the high bits of the access word are delegation wishes (§18.16.3).
+  let wishes = reader.u32().map_err(bad)?;
+  let access = wishes & share::BOTH;
   let deny = reader.u32().map_err(bad)?;
   if access == 0 || deny > share::BOTH {
     return Err(Nfsstat4::Inval);
@@ -1750,12 +1808,77 @@ async fn open<B: Backend>(
     OPEN4_CREATE => Some(open_createhow(reader)?),
     _ => None,
   };
-  let claim_type = reader.u32().map_err(bad)?;
   let dir = current(frame)?.clone();
-  let opened = match claim_type {
+  let opened = open_claim(backend, reader, dir, create, access).await?;
+  let clientid = frame.clientid.ok_or(Nfsstat4::OpNotInSession)?;
+  let may_delegate = may_delegate(backend, frame, &opened.fh, wishes)?;
+  // The open is recorded at the file's owner (§4.6 A-36), which grants a delegation when one is due (A-78).
+  let mut extra = XdrWriter::new();
+  extra.opaque(&owner);
+  extra.u32(access);
+  extra.u32(deny);
+  extra.u32(u32::from(may_delegate));
+  extra.u64(backend.now_ns());
+  let recorded = state_call(
+    backend,
+    extension::STATE_OPEN,
+    &opened.fh,
+    clientid,
+    extra.as_slice(),
+  )
+  .await
+  .map_err(|(status, _)| status)?;
+  let mut recorded = XdrReader::new(&recorded);
+  let stateid = stateid_of(&mut recorded)?;
+  let delegation = match recorded.u32() {
+    Ok(1) => Some(stateid_of(&mut recorded)?),
+    _ => None,
+  };
+  let mut body = XdrWriter::new();
+  stateid.encode(&mut body);
+  body.fixed(&change_info(&opened.dir));
+  body.u32(OPEN4_RESULT_LOCKTYPE_POSIX);
+  opened.attrset.encode(&mut body);
+  match delegation {
+    Some(delegation) => encode_read_delegation(&mut body, &delegation),
+    None => body.u32(OPEN_DELEGATE_NONE),
+  }
+  frame.current = Some(opened.fh);
+  Ok(body.into_bytes())
+}
+
+/// The file an `OPEN` names by its claim (§18.16.3), with `dir` the current file: a name in it (`CLAIM_NULL`, created
+/// if asked), the current file itself (`CLAIM_FH`), or either under a delegation being returned
+/// (`CLAIM_DELEGATE_CUR`, `CLAIM_DELEG_CUR_FH`); each checked against the access asked.
+async fn open_claim<B: Backend>(
+  backend: &mut B,
+  reader: &mut XdrReader<'_>,
+  dir: Nfsfh3,
+  create: Option<OpenCreate>,
+  access: u32,
+) -> Result<Opened, Nfsstat4> {
+  let bad = |_| Nfsstat4::Badxdr;
+  let opened = match reader.u32().map_err(bad)? {
     claim::NULL => {
       let name = component(reader)?;
       open_by_name(backend, &dir, &name, create, access).await?
+    }
+    // A re-open under a delegation being returned (§10.4.4) is an open of the same name or file: the delegation's
+    // state id rides along, and the open is checked as any other.
+    claim::DELEGATE_CUR => {
+      Stateid::decode(reader).map_err(bad)?;
+      let name = component(reader)?;
+      open_by_name(backend, &dir, &name, None, access).await?
+    }
+    claim::DELEG_CUR_FH => {
+      Stateid::decode(reader).map_err(bad)?;
+      check_open_kind(backend, &dir).await?;
+      check_open_access(backend, &dir, access).await?;
+      Opened {
+        fh: dir,
+        attrset: Bitmap::default(),
+        dir: Wcc::default(),
+      }
     }
     claim::FH => {
       check_open_kind(backend, &dir).await?;
@@ -1769,30 +1892,45 @@ async fn open<B: Backend>(
     }
     _ => return Err(Nfsstat4::Notsupp),
   };
-  let clientid = frame.clientid.ok_or(Nfsstat4::OpNotInSession)?;
-  // The open is recorded at the file's owner (§4.6 A-36).
-  let mut extra = XdrWriter::new();
-  extra.opaque(&owner);
-  extra.u32(access);
-  extra.u32(deny);
-  let recorded = state_call(
-    backend,
-    extension::STATE_OPEN,
-    &opened.fh,
-    clientid,
-    extra.as_slice(),
-  )
-  .await
-  .map_err(|(status, _)| status)?;
-  let stateid = stateid_of(&mut XdrReader::new(&recorded))?;
-  let mut body = XdrWriter::new();
-  stateid.encode(&mut body);
-  body.fixed(&change_info(&opened.dir));
-  body.u32(OPEN4_RESULT_LOCKTYPE_POSIX);
-  opened.attrset.encode(&mut body);
-  body.u32(OPEN_DELEGATE_NONE);
-  frame.current = Some(opened.fh);
-  Ok(body.into_bytes())
+  Ok(opened)
+}
+
+/// Whether an open may be delegated (A-78): the session's back channel has answered (RFC 8881 §10.2: never before
+/// it is known to exist), the client did not ask for no delegation, and the file's owner is the shard serving the
+/// session, so its recall, revocation and the revocation's notice all happen where the session lives.
+fn may_delegate<B: Backend>(
+  backend: &mut B,
+  frame: &Frame,
+  fh: &Nfsfh3,
+  wishes: u32,
+) -> Result<bool, Nfsstat4> {
+  if wishes & OPEN4_SHARE_ACCESS_WANT_DELEG_MASK == OPEN4_SHARE_ACCESS_WANT_NO_DELEG
+    || !backend.owns_file(fh)
+  {
+    return Ok(false);
+  }
+  let Some(sessionid) = frame.session else {
+    return Ok(false);
+  };
+  backend.with_v4(|server| {
+    server
+      .sessions
+      .back_channel(&sessionid)
+      .is_some_and(|back| back.state == super::session::CallbackState::Up)
+  })
+}
+
+/// Writes an `open_delegation4` granting a read delegation (§18.16.2): its state id, no recall pending, and an
+/// `nfsace4` that grants nothing, so the client still asks ACCESS for each user (§10.4: "the server may return an
+/// nfsace4 that is more restrictive than the actual ACL ... including ... denial of all access").
+fn encode_read_delegation(body: &mut XdrWriter, delegation: &Stateid) {
+  body.u32(OPEN_DELEGATE_READ);
+  delegation.encode(body);
+  body.bool(false); // recall
+  body.u32(ACE4_ACCESS_ALLOWED_ACE_TYPE);
+  body.u32(0); // flags
+  body.u32(0); // access mask: nothing granted by the delegation itself
+  body.opaque(b"EVERYONE@");
 }
 
 /// Format: the v3 ACCESS bits an open's share needs: read data (`ACCESS3_READ`) and change it

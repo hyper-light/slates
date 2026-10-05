@@ -117,11 +117,17 @@ fn single_shard_daemon(name: &str) -> (Daemon, String) {
 }
 
 fn two_shard_daemon(name: &str) -> (Daemon, String) {
+  two_shard_daemon_with(name, |_| {})
+}
+
+/// [`two_shard_daemon`] with its derived configuration adjusted by `adjust` before it starts.
+fn two_shard_daemon_with(name: &str, adjust: impl FnOnce(&mut DaemonConfig)) -> (Daemon, String) {
   let profile = common::machine_profile();
   let instance = format!("srv-{name}-{}", std::process::id());
   // Two shards, so a volume can land on a shard other than the one the NFS listener is served on,
   // exercising the cross-shard bridge queue.
-  let config = DaemonConfig::derive(&profile, &instance, Some(2));
+  let mut config = DaemonConfig::derive(&profile, &instance, Some(2));
+  adjust(&mut config);
   let daemon = Daemon::start(
     &profile,
     config,
@@ -1536,6 +1542,21 @@ fn remote_volume_name(client: &mut Client) -> String {
   panic!("no volume provisioned on a non-control shard");
 }
 
+/// A scratch volume provisioned on the control shard, the listener's (the mirror of [`remote_volume_name`]).
+fn local_volume_name(client: &mut Client) -> String {
+  /// Shape: see [`remote_volume_name`]'s attempts.
+  const ATTEMPTS: usize = 32;
+  for attempt in 0..ATTEMPTS {
+    let name = format!("v4local-{attempt}");
+    if let ReplyBody::Created { id } = client.call(&scratch(&name))
+      && slates_server::verbs::owner_of(id) == 0
+    {
+      return name;
+    }
+  }
+  panic!("no volume provisioned on the control shard");
+}
+
 /// Format: `OP_LOCK`, `OP_TEST_STATEID`, and `NFS4ERR_DENIED` / `NFS4ERR_LOCKS_HELD` /
 /// `NFS4ERR_BAD_STATEID` (RFC 7863).
 const OP_LOCK: u32 = 12;
@@ -1941,6 +1962,8 @@ fn a_session_moves_to_its_volumes_shard_and_its_compounds_run_there() {
 const CB_PROGRAM: u32 = 0x4000_0123;
 /// Format: `OP_CB_SEQUENCE` (RFC 8881 §20.9).
 const OP_CB_SEQUENCE: u32 = 11;
+/// Format: `OP_CB_RECALL` (RFC 8881 §20.2).
+const OP_CB_RECALL: u32 = 4;
 /// Shape: how long the test waits for the daemon to record a probe's outcome: the probe's deadline (one liveness
 /// budget) and as much again for a loaded machine.
 const PROBE_SETTLE: Duration = Duration::from_secs(4);
@@ -1989,44 +2012,87 @@ impl V4Client {
 
   /// Answers the callback `call` (a CB_COMPOUND whose first operation is CB_SEQUENCE) with `NFS4_OK`, after checking
   /// it names this client's program and session.
-  fn answer_callback(&mut self, call: &[u8]) {
+  fn answer_callback(&mut self, call: &[u8]) -> Option<slates_bridge_nfs::v4::types::Stateid> {
+    self.answer_callback_with(call, NFS4_OK).0
+  }
+
+  /// Answers the callback `call` as [`V4Client::answer_callback`] does, with `status`: anything but `NFS4_OK` fails
+  /// its `CB_SEQUENCE` (as the Linux client answers `NFS4ERR_DELAY`, the compound's status and the one result alike).
+  /// The recalled state id and the call's sequence id.
+  fn answer_callback_with(
+    &mut self,
+    call: &[u8],
+    status: u32,
+  ) -> (Option<slates_bridge_nfs::v4::types::Stateid>, u32) {
+    use slates_bridge_nfs::v4::types::Stateid;
     use slates_bridge_nfs::xdr::{XdrReader, XdrWriter};
     use std::io::Write;
     let mut reader = XdrReader::new(call);
     let xid = check_callback_rpc(&mut reader);
-    reader.opaque(1024).unwrap(); // tag
-    assert_eq!(
-      reader.u32().unwrap(),
-      2,
-      "the callback names the minor version the client's compounds use"
-    );
-    reader.u32().unwrap(); // callback_ident
-    let operations = reader.u32().unwrap();
-    assert!(operations >= 1);
-    assert_eq!(reader.u32().unwrap(), OP_CB_SEQUENCE, "CB_SEQUENCE first");
-    assert_eq!(
-      reader.fixed(16).unwrap(),
-      &self.sessionid[..],
-      "this session"
-    );
-    let sequenceid = reader.u32().unwrap();
+    let (operations, sequenceid) = read_cb_sequence(&mut reader, &self.sessionid);
+    let mut recalled = None;
+    let mut results = XdrWriter::new();
+    results.u32(OP_CB_SEQUENCE);
+    results.u32(status);
+    let answered = if status == NFS4_OK {
+      results.fixed(&self.sessionid);
+      for field in [sequenceid, 0, 0, 0] {
+        results.u32(field);
+      }
+      operations
+    } else {
+      1
+    };
+    for _ in 1..answered {
+      let opnum = reader.u32().unwrap();
+      assert_eq!(
+        opnum, OP_CB_RECALL,
+        "the only other callback this server sends"
+      );
+      recalled = Some(Stateid::decode(&mut reader).unwrap());
+      reader.bool().unwrap(); // truncate
+      reader.opaque(128).unwrap(); // the file
+      results.u32(OP_CB_RECALL);
+      results.u32(0);
+    }
     let mut body = XdrWriter::new();
     for field in [xid, 1, 0, 0, 0, 0] {
       body.u32(field);
     }
-    body.u32(0); // CB_COMPOUND status
+    body.u32(status); // CB_COMPOUND status
     body.opaque(b"");
-    body.u32(1);
-    body.u32(OP_CB_SEQUENCE);
-    body.u32(0);
-    body.fixed(&self.sessionid);
-    for field in [sequenceid, 0, 0, 0] {
-      body.u32(field);
-    }
+    body.u32(answered);
+    body.fixed(results.as_slice());
     let marker = 0x8000_0000u32 | u32::try_from(body.len()).unwrap();
     self.stream.write_all(&marker.to_be_bytes()).unwrap();
     self.stream.write_all(body.as_slice()).unwrap();
+    (recalled, sequenceid)
   }
+}
+
+/// Reads a `CB_COMPOUND`'s header and its leading `CB_SEQUENCE`, checking the minor version, the operation and
+/// `sessionid`: the compound's operation count and the call's sequence id, leaving `reader` at its next operation.
+fn read_cb_sequence(
+  reader: &mut slates_bridge_nfs::xdr::XdrReader<'_>,
+  sessionid: &[u8],
+) -> (u32, u32) {
+  reader.opaque(1024).unwrap(); // tag
+  assert_eq!(
+    reader.u32().unwrap(),
+    2,
+    "the callback names the minor version the client's compounds use"
+  );
+  reader.u32().unwrap(); // callback_ident
+  let operations = reader.u32().unwrap();
+  assert!(operations >= 1);
+  assert_eq!(reader.u32().unwrap(), OP_CB_SEQUENCE, "CB_SEQUENCE first");
+  assert_eq!(reader.fixed(16).unwrap(), sessionid, "this session");
+  let sequenceid = reader.u32().unwrap();
+  for _ in 0..3 {
+    reader.u32().unwrap(); // slot, highest slot, cache this
+  }
+  reader.u32().unwrap(); // referring call lists (none)
+  (operations, sequenceid)
 }
 
 /// Checks a callback's RPC header (a call of `CB_COMPOUND` to the client's program under its AUTH_SYS parameters) and
@@ -2183,5 +2249,312 @@ fn locks_and_shares_meet_across_two_mounts_of_one_file() {
     "C cannot deny writes while A holds the file open for writing through another mount"
   );
   drop((a, b, c, client));
+  drop(daemon);
+}
+
+/// Shape: the lease the recall test runs under, short so that the file it writes settles past the delegation quiet
+/// period (the lease) within the test.
+const RECALL_LEASE: Duration = Duration::from_millis(300);
+/// Format: `OP_DELEGRETURN` (RFC 8881 §18.6).
+const OP_DELEGRETURN: u32 = 8;
+/// Format: `NFS4ERR_DELAY` (RFC 8881 §15.1.1.3).
+const NFS4ERR_DELAY: u32 = 10008;
+
+impl V4Client {
+  /// Sends one compound and answers its SEQUENCE's probe while waiting, until the back channel is recorded up.
+  fn prove_back_channel(&mut self, daemon: &Daemon) {
+    let xid = self.send_sequence();
+    let (mut replied, mut probed) = (false, false);
+    while !(replied && probed) {
+      let message = self.next_message();
+      if is_call(&message) {
+        self.answer_callback(&message);
+        probed = true;
+      } else {
+        assert_eq!(message.get(..4), Some(&xid.to_be_bytes()[..]));
+        replied = true;
+      }
+    }
+    assert!(
+      counter_reaches(daemon, "nfs4.callback.up", 1),
+      "the back channel is up"
+    );
+  }
+
+  /// OPEN of an existing `name` under `component` for reading, denying nothing: the open's state id, the file's handle,
+  /// and the read delegation's state id when one was granted.
+  fn open_for_reading(
+    &mut self,
+    component: &str,
+    name: &str,
+  ) -> (
+    slates_bridge_nfs::v4::types::Stateid,
+    Vec<u8>,
+    Option<slates_bridge_nfs::v4::types::Stateid>,
+  ) {
+    use slates_bridge_nfs::v4::types::{Bitmap, Stateid};
+    use slates_bridge_nfs::xdr::{XdrReader, XdrWriter};
+    let mut ops = XdrWriter::new();
+    ops.u32(OP_PUTROOTFH);
+    ops.u32(OP_LOOKUP);
+    ops.opaque(component.as_bytes());
+    ops.u32(OP_OPEN);
+    ops.u32(0);
+    ops.u32(1); // share access READ
+    ops.u32(0); // deny none
+    ops.u64(0);
+    ops.opaque(b"reading-owner");
+    ops.u32(0); // OPEN4_NOCREATE
+    ops.u32(0); // CLAIM_NULL
+    ops.opaque(name.as_bytes());
+    ops.u32(OP_GETFH);
+    let (status, results) = self.sequenced(4, ops.as_slice());
+    assert_eq!(status, NFS4_OK, "OPEN for reading");
+    let mut reader = XdrReader::new(&results);
+    reader.fixed(8 + 8 + 8).unwrap();
+    let open = Stateid::decode(&mut reader).unwrap();
+    reader.fixed(4 + 8 + 8 + 4).unwrap();
+    Bitmap::decode(&mut reader).unwrap();
+    let delegation = match reader.u32().unwrap() {
+      1 => {
+        let stateid = Stateid::decode(&mut reader).unwrap();
+        reader.bool().unwrap(); // recall
+        reader.fixed(4 + 4 + 4).unwrap(); // ace type, flags, mask
+        reader.opaque(64).unwrap(); // who
+        Some(stateid)
+      }
+      _ => None,
+    };
+    reader.fixed(8).unwrap();
+    (open, reader.opaque(128).unwrap().to_vec(), delegation)
+  }
+
+  /// WRITE of `bytes` at offset 0 of `fh` under `stateid`, FILE_SYNC: the compound's status.
+  fn write_under(
+    &mut self,
+    fh: &[u8],
+    stateid: slates_bridge_nfs::v4::types::Stateid,
+    bytes: &[u8],
+  ) -> u32 {
+    use slates_bridge_nfs::xdr::XdrWriter;
+    let mut ops = XdrWriter::new();
+    ops.u32(OP_PUTFH);
+    ops.opaque(fh);
+    ops.u32(OP_WRITE);
+    stateid.encode(&mut ops);
+    ops.u64(0);
+    ops.u32(2); // FILE_SYNC4
+    ops.opaque(bytes);
+    self.sequenced(2, ops.as_slice()).0
+  }
+
+  /// CLOSE of `stateid` on `fh`: the compound's status.
+  fn close(&mut self, fh: &[u8], stateid: slates_bridge_nfs::v4::types::Stateid) -> u32 {
+    use slates_bridge_nfs::xdr::XdrWriter;
+    let mut ops = XdrWriter::new();
+    ops.u32(OP_PUTFH);
+    ops.opaque(fh);
+    ops.u32(OP_CLOSE);
+    ops.u32(0);
+    stateid.encode(&mut ops);
+    self.sequenced(2, ops.as_slice()).0
+  }
+
+  /// DELEGRETURN of `delegation` on `fh`: the compound's status.
+  fn delegreturn(&mut self, fh: &[u8], delegation: slates_bridge_nfs::v4::types::Stateid) -> u32 {
+    use slates_bridge_nfs::xdr::XdrWriter;
+    let mut ops = XdrWriter::new();
+    ops.u32(OP_PUTFH);
+    ops.opaque(fh);
+    ops.u32(OP_DELEGRETURN);
+    delegation.encode(&mut ops);
+    self.sequenced(2, ops.as_slice()).0
+  }
+}
+
+/// RFC 8881 §10.2, §10.4, §10.4.4 (A-78, A-79): do give client A an answering back channel and open a file from it for
+/// reading; expect a read delegation. Write the file from client B; expect `NFS4ERR_DELAY` with nothing changed, and A
+/// to receive a `CB_RECALL` naming its delegation on its own connection. Answer it and return the delegation; expect
+/// B's retried write to succeed. The volume is on the listener's own shard here, where a session's files are owned,
+/// so the grant is allowed; the daemon runs a short lease so the file settles past the quiet period quickly.
+#[test]
+fn a_write_from_another_client_recalls_the_read_delegation_first() {
+  let (daemon, instance) = two_shard_daemon_with("recall", |config| {
+    config.failover_slo_ns = RECALL_LEASE.as_nanos().try_into().unwrap();
+  });
+  let mut client = Client::connect(&instance);
+  let name = local_volume_name(&mut client);
+  let component = capability_path(&daemon, &name)
+    .trim_start_matches('/')
+    .to_owned();
+  let port = daemon.nfs_port().expect("the daemon is serving NFS");
+  let mut b = V4Client::connect_as(port, b"writer-b");
+  let (open_b, fh) = b.open(&component, "held.txt");
+  assert_eq!(b.write_under(&fh, open_b, b"before"), NFS4_OK);
+  assert_eq!(b.close(&fh, open_b), NFS4_OK);
+  // A file changed within the lease is not delegated (A-78): the test waits the short lease out.
+  let written = Instant::now();
+  while written.elapsed() < RECALL_LEASE + RECALL_LEASE / 2 {
+    std::thread::yield_now();
+  }
+  let mut a = V4Client::connect_full(port, b"holder-a", 4, Some(CB_PROGRAM));
+  a.prove_back_channel(&daemon);
+  let (_, fh_a, delegation) = a.open_for_reading(&component, "held.txt");
+  let delegation = delegation.expect("A's read-only open is delegated");
+  let (open_b, _) = b.open(&component, "held.txt");
+  assert_eq!(
+    b.write_under(&fh, open_b, b"after!"),
+    NFS4ERR_DELAY,
+    "B waits for A's delegation"
+  );
+  let recall = a.next_message();
+  assert!(is_call(&recall), "A is called back");
+  assert_eq!(
+    a.answer_callback(&recall),
+    Some(delegation),
+    "the recall names A's delegation"
+  );
+  assert_eq!(a.delegreturn(&fh_a, delegation), NFS4_OK, "A returns it");
+  assert_eq!(
+    b.write_under(&fh, open_b, b"after!"),
+    NFS4_OK,
+    "B's retry proceeds"
+  );
+  assert!(counter(&daemon, "nfs4.recall.sent") >= 1);
+  drop((a, b, client));
+  drop(daemon);
+}
+
+/// Delegates `held.txt` in a fresh short-lease daemon's volume to client A (answering back channel): the daemon, its
+/// instance's client, A, A's handle and delegation, and an NFSv3 connection with the file's v3 handle.
+fn delegated_to_a(
+  name: &str,
+) -> (
+  Daemon,
+  Client,
+  V4Client,
+  Vec<u8>,
+  slates_bridge_nfs::v4::types::Stateid,
+  TcpStream,
+  Vec<u8>,
+) {
+  let (daemon, instance) = two_shard_daemon_with(name, |config| {
+    config.failover_slo_ns = RECALL_LEASE.as_nanos().try_into().unwrap();
+  });
+  let mut client = Client::connect(&instance);
+  let volume = local_volume_name(&mut client);
+  let path = capability_path(&daemon, &volume);
+  let port = daemon.nfs_port().expect("the daemon is serving NFS");
+  let mut v3 = TcpStream::connect(("127.0.0.1", port)).unwrap();
+  let root = mount(&mut v3, &path, 1);
+  let file = create(&mut v3, &root, "held.txt", 2);
+  write(&mut v3, &file, b"before", 3);
+  // A file changed within the lease is not delegated (A-78): the test waits the short lease out.
+  let written = Instant::now();
+  while written.elapsed() < RECALL_LEASE + RECALL_LEASE / 2 {
+    std::thread::yield_now();
+  }
+  let mut a = V4Client::connect_full(port, b"holder-a", 4, Some(CB_PROGRAM));
+  a.prove_back_channel(&daemon);
+  let component = path.trim_start_matches('/').to_owned();
+  let (_, fh_a, delegation) = a.open_for_reading(&component, "held.txt");
+  let delegation = delegation.expect("A's read-only open is delegated");
+  (daemon, client, a, fh_a, delegation, v3, file)
+}
+
+/// Writes `data` to `file` over NFSv3 on another thread: its status and how long it took.
+fn write_in_background(
+  mut v3: TcpStream,
+  file: Vec<u8>,
+  data: &'static [u8],
+) -> std::thread::JoinHandle<(u32, Duration)> {
+  std::thread::spawn(move || {
+    let began = Instant::now();
+    let status = common::nfs::write_status(&mut v3, &file, data, 10);
+    (status, began.elapsed())
+  })
+}
+
+/// RFC 8881 §10.2 (A-79): do write a file A holds a read delegation of, over NFSv3; expect the write held, not
+/// answered `NFS3ERR_JUKEBOX` (whose client retry backs off for seconds), A recalled, and the write to succeed once A
+/// answers and returns the delegation, with nothing revoked (the return, not the lease, released it).
+#[test]
+fn an_nfsv3_write_to_a_delegated_file_is_held_until_the_delegation_returns() {
+  let (daemon, client, mut a, fh_a, delegation, v3, file) = delegated_to_a("held-v3");
+  let writer = write_in_background(v3, file, b"after!");
+  let recall = a.next_message();
+  assert!(is_call(&recall), "A is called back");
+  assert_eq!(a.answer_callback(&recall), Some(delegation));
+  assert_eq!(a.delegreturn(&fh_a, delegation), NFS4_OK, "A returns it");
+  let (status, took) = writer.join().unwrap();
+  assert_eq!(status, 0, "the held write succeeded (took {took:?})");
+  assert!(
+    counter(&daemon, "nfs.v3.held_for_recall") >= 1,
+    "it was held"
+  );
+  assert_eq!(
+    counter(&daemon, "nfs4.delegation.revoked_lapsed"),
+    0,
+    "released by the return"
+  );
+  drop((a, client));
+  drop(daemon);
+}
+
+/// RFC 8881 §10.4.5 (A-79): do write a file A holds a read delegation of, over NFSv3, while A answers the recall but
+/// never returns the delegation; expect the write held for one lease, the delegation then revoked, and the write to
+/// succeed.
+#[test]
+fn an_nfsv3_write_held_on_an_unreturned_delegation_proceeds_after_its_revocation() {
+  let (daemon, client, mut a, _fh_a, delegation, v3, file) = delegated_to_a("held-v3-lapse");
+  let writer = write_in_background(v3, file, b"after!");
+  let recall = a.next_message();
+  assert_eq!(a.answer_callback(&recall), Some(delegation));
+  let (status, took) = writer.join().unwrap();
+  assert_eq!(status, 0, "the held write succeeded");
+  assert!(took >= RECALL_LEASE, "held for the lease, took {took:?}");
+  assert!(counter(&daemon, "nfs4.delegation.revoked_lapsed") >= 1);
+  drop((a, client));
+  drop(daemon);
+}
+
+/// RFC 8881 §15.1.1.3, §20.9.3: do answer the back channel's probe `NFS4ERR_DELAY` (as the Linux client does while it
+/// is still setting its session up); expect the probe sent again with the same sequence id (a failed `CB_SEQUENCE`
+/// leaves the slot unchanged), and the back channel up once that one is answered `NFS4_OK`.
+#[test]
+fn a_probe_answered_delay_is_retried_on_the_same_slot_sequence() {
+  let (daemon, _instance) = two_shard_daemon("probe-delay");
+  let port = daemon.nfs_port().expect("the daemon is serving NFS");
+  let mut a = V4Client::connect_full(port, b"delaying-a", 4, Some(CB_PROGRAM));
+  let xid = a.send_sequence();
+  let mut first: Option<u32> = None;
+  let mut replied = false;
+  let mut proven = false;
+  while !(replied && proven) {
+    let message = a.next_message();
+    if !is_call(&message) {
+      assert_eq!(message.get(..4), Some(&xid.to_be_bytes()[..]));
+      replied = true;
+      continue;
+    }
+    match first {
+      None => first = Some(a.answer_callback_with(&message, NFS4ERR_DELAY).1),
+      Some(sequenceid) => {
+        let (_, again) = a.answer_callback_with(&message, NFS4_OK);
+        assert_eq!(again, sequenceid, "the same slot sequence");
+        proven = true;
+      }
+    }
+  }
+  assert!(
+    counter_reaches(&daemon, "nfs4.callback.up", 1),
+    "the back channel is up after the retry"
+  );
+  assert_eq!(
+    counter(&daemon, "nfs4.callback.down"),
+    0,
+    "never marked down"
+  );
+  drop(a);
   drop(daemon);
 }

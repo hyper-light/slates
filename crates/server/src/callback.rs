@@ -179,9 +179,54 @@ const MAX_VERIFIER: usize = 400;
 /// Counter: callback replies no callback awaited (arrived after their deadline, or never sent).
 const CALLBACK_REPLY_UNMATCHED: &str = "nfs4.callback.unmatched";
 
+/// Format: `NFS4ERR_DELAY` (RFC 8881 §15.1.1.3), a `CB_COMPOUND` status that asks the server to call again later.
+const NFS4ERR_DELAY: u32 = 10008;
+
+/// Derived: how long a callback answered `NFS4ERR_DELAY` waits before it is sent again: the daemon's poll interval
+/// (`HEARTBEAT_NS / POLL_PER_PERIOD`, 10 ms at the default cadence). The Linux client answers `CB_SEQUENCE` with it
+/// while it is still setting the session up (measured: two of four Docker runs, 2026-10-04), which passes within a
+/// round trip; Linux nfsd's own wait (`rpc_delay(task, 2 * HZ)`, two seconds) would leave the back channel unproven
+/// past the caller's deadline.
+const DELAY_RETRY_NS: u64 = crate::daemon::HEARTBEAT_NS / crate::fleet::POLL_PER_PERIOD;
+
+/// Counter: callbacks the client answered `NFS4ERR_DELAY`, sent again (the retry path's non-vacuity count).
+const CALLBACK_DELAYED: &str = "nfs4.callback.delayed";
+
 /// Sends `CB_COMPOUND` arguments `args` on `sessionid`'s back channel to the client's callback `program`, and waits
-/// up to `deadline_ns` for the reply: its results (the `CB_COMPOUND4res`).
+/// up to `deadline_ns` for the reply: its results (the `CB_COMPOUND4res`). A reply of `NFS4ERR_DELAY` is not an
+/// answer: the same arguments are sent again after [`DELAY_RETRY_NS`] while the deadline allows — the same slot
+/// sequence, since a failed `CB_SEQUENCE` leaves the client's slot unchanged (§20.9.3) — and the last reply is
+/// returned when it does not.
 pub(crate) async fn call(
+  sessionid: SessionId,
+  (program, credential): (u32, &[u8]),
+  args: &[u8],
+  deadline_ns: u64,
+) -> Result<Vec<u8>, CallbackError> {
+  let began = slates_rt::futures::now_ns();
+  loop {
+    let elapsed = slates_rt::futures::now_ns().saturating_sub(began);
+    let results = call_once(
+      sessionid,
+      (program, credential),
+      args,
+      deadline_ns.saturating_sub(elapsed),
+    )
+    .await?;
+    let delayed = slates_bridge_nfs::v4::callback::status(&results) == Some(NFS4ERR_DELAY);
+    let elapsed = slates_rt::futures::now_ns().saturating_sub(began);
+    if !delayed || elapsed.saturating_add(DELAY_RETRY_NS) >= deadline_ns {
+      return Ok(results);
+    }
+    let _ = state::with_state(|s| *s.refusals.entry(CALLBACK_DELAYED).or_insert(0) += 1);
+    if slates_rt::futures::sleep(DELAY_RETRY_NS).await.is_err() {
+      return Ok(results);
+    }
+  }
+}
+
+/// One send of [`call`]: the reply's results within `deadline_ns`, whatever their status.
+async fn call_once(
   sessionid: SessionId,
   (program, credential): (u32, &[u8]),
   args: &[u8],

@@ -41,17 +41,49 @@ fn commit(s: &mut ShardState, ops: &[Op]) -> bool {
   false
 }
 
+/// Counter: delegations granted (or advanced) at this shard's files (A-78).
+const DELEGATIONS_GRANTED: &str = "nfs4.delegation.granted";
+
 /// Records the changes the owner's file state made in the call just served. `false` when they could
 /// not be recorded; the file state has then been rebuilt from the partition's records.
 pub(crate) fn record_files(s: &mut ShardState) -> bool {
   let Some(files) = s.nfs_v4_files.as_mut() else {
     return true;
   };
-  let ops: Vec<Op> = files.take_changes().into_iter().map(file_op).collect();
+  let changes = files.take_changes();
+  // The store's recall gate follows the delegations (A-79): rebuilt whenever one was granted, returned, revoked or
+  // purged with its client.
+  let delegations_changed = changes.iter().any(|change| {
+    matches!(
+      change,
+      FileChange::DelegationSet(_)
+        | FileChange::DelegationCleared(_)
+        | FileChange::ClientCleared(_)
+    )
+  });
+  if delegations_changed {
+    let delegated = files.delegated_inodes();
+    s.store.recall_gate.reset(delegated);
+  }
+  let granted = changes
+    .iter()
+    .filter(|change| matches!(change, FileChange::DelegationSet(_)))
+    .count();
+  if granted > 0 {
+    *s.refusals.entry(DELEGATIONS_GRANTED).or_insert(0) +=
+      u64::try_from(granted).unwrap_or(u64::MAX);
+  }
+  let ops: Vec<Op> = changes.into_iter().map(file_op).collect();
   if commit(s, &ops) {
     return true;
   }
   s.nfs_v4_files = file_state(s);
+  let delegated = s
+    .nfs_v4_files
+    .as_ref()
+    .map(FileState::delegated_inodes)
+    .unwrap_or_default();
+  s.store.recall_gate.reset(delegated);
   false
 }
 
@@ -98,7 +130,7 @@ pub(crate) fn file_state(s: &mut ShardState) -> Option<FileState> {
   let caps = s.config.nfs_v4;
   let tag = slates_bridge_nfs::v4::files::owner_tag(s.partition, instance);
   let partition = s.db.partition();
-  Some(FileState::restore(
+  let restored = FileState::restore(
     tag,
     caps.opens,
     caps.locks,
@@ -116,7 +148,13 @@ pub(crate) fn file_state(s: &mut ShardState) -> Option<FileState> {
         },
       )
       .collect(),
-  ))
+  );
+  let mut files = restored;
+  // A recalled file is not delegated again for a lease (RFC 8881 §10.4, A-78).
+  files.set_delegation_quiet(s.config.failover_slo_ns);
+  // The gate starts closed on every file a kept delegation names (a restart must not let a change slip past one).
+  s.store.recall_gate.reset(files.delegated_inodes());
+  Some(files)
 }
 
 /// The listener's NFSv4 server, its client table rebuilt from the partition's records and its new

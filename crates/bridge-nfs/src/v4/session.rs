@@ -665,6 +665,21 @@ impl Sessions {
     }
   }
 
+  /// A session of `clientid` held here whose back channel has answered: where a recall to that client is sent.
+  pub fn session_with_back_channel(&self, clientid: u64) -> Option<SessionId> {
+    self
+      .sessions
+      .iter()
+      .find(|(_, session)| {
+        session.clientid == clientid
+          && session
+            .back
+            .as_ref()
+            .is_some_and(|back| back.state == CallbackState::Up)
+      })
+      .map(|(sessionid, _)| *sessionid)
+  }
+
   /// The back channel of `sessionid`, when it has one.
   pub fn back_channel(&self, sessionid: &SessionId) -> Option<BackChannel> {
     self

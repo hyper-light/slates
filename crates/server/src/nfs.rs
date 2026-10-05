@@ -883,6 +883,8 @@ fn serve_local(
       crate::telemetry::emit(s, open.end(procedure, end_ns));
     });
   }
+  // A change this call was refused for a delegation asked for a recall; it is sent now (A-79).
+  let _ = state::with_state(crate::delegation::drain);
   result
 }
 
@@ -1126,7 +1128,7 @@ async fn serve_v3(
     ),
     None => (
       false,
-      serve_local(requester, xid, program, procedure, &args, port),
+      serve_local_held(requester, xid, program, procedure, &args, port).await,
     ),
   };
   let elapsed = slates_machine::clock::monotonic_ns().saturating_sub(started);
@@ -1142,6 +1144,81 @@ async fn serve_v3(
     }
   });
   served
+}
+
+/// Counter: NFSv3 calls the recall gate refused that were held for the delegation's return rather than answered
+/// `NFS3ERR_JUKEBOX` (A-79), one per wait.
+const V3_HELD: &str = "nfs.v3.held_for_recall";
+
+/// Serves one call locally ([`serve_local`]), holding an NFSv3 call the recall gate refused until the delegation it
+/// waits on is returned or revoked (RFC 8881 §10.2: the server "may either delay responding to conflicting requests
+/// or respond to them with NFS4ERR_DELAY"; A-79). An NFSv3 client's own retry of `NFS3ERR_JUKEBOX` backs off for
+/// seconds (measured 4,033 ms for one macOS write, docs/wip/BENCHMARKS.md), while a recall is answered in a round
+/// trip, so the call waits here, parked on the gate, and is served again at each release. The hold is bounded by one
+/// lease past the recall: a delegation not returned by then is revoked (§10.4.5), which the drain before the last
+/// attempt does, so the last attempt proceeds. A NFSv4 front end's sub-call is never held: its client is told
+/// `NFS4ERR_DELAY` at once, since the holder changing its own file would otherwise block the connection its
+/// `DELEGRETURN` must arrive on. Any other refusal is answered as it is.
+async fn serve_local_held(
+  requester: Requester,
+  xid: u32,
+  program: u32,
+  procedure: u32,
+  args: &[u8],
+  port: u16,
+) -> (AcceptStatus, Vec<u8>) {
+  let holdable = program == NFS_PROGRAM && matches!(requester.dialect, Dialect::Nfs3 { .. });
+  let mut deadline: Option<u64> = None;
+  loop {
+    let seen = state::with_state(|s| s.store.recall_gate.refusals());
+    let served = serve_local(requester.clone(), xid, program, procedure, args, port);
+    let gate = state::with_state(|s| {
+      (
+        s.store.recall_gate.refusals(),
+        s.store.recall_gate.generation(),
+        s.config.failover_slo_ns,
+      )
+    });
+    let (Some(seen), Some((refusals, generation, lease))) = (seen, gate) else {
+      return served;
+    };
+    let refused_by_gate = holdable
+      && refusals != seen
+      && served.0 == AcceptStatus::Success
+      && leading_status(&served.1) == Some(Nfsstat3::Jukebox as u32);
+    let now = futures::now_ns();
+    // §10.4.5's "after a lease" is strict, and the recall was stamped after this first refusal began.
+    let until = *deadline.get_or_insert(now.saturating_add(lease).saturating_add(1));
+    if !refused_by_gate || now >= until {
+      return served;
+    }
+    let _ = state::with_state(|s| *s.refusals.entry(V3_HELD).or_insert(0) += 1);
+    let parked = futures::within(
+      until.saturating_sub(now),
+      std::future::poll_fn(|cx| {
+        let released =
+          state::with_state(|s| s.store.recall_gate.wait_for_release(generation, cx.waker()));
+        match released {
+          Some(false) => std::task::Poll::Pending,
+          _ => std::task::Poll::Ready(()),
+        }
+      }),
+    )
+    .await;
+    match parked {
+      Ok(Some(())) => {}
+      // The lease passed: revoke the lapsed delegation so the last attempt proceeds.
+      Ok(None) => {
+        let _ = state::with_state(crate::delegation::drain);
+      }
+      Err(_) => return served,
+    }
+  }
+}
+
+/// The leading `nfsstat3` of an NFSv3 procedure's results.
+fn leading_status(results: &[u8]) -> Option<u32> {
+  XdrReader::new(results).u32().ok()
 }
 
 /// The calling thread's CPU time in nanoseconds (`CLOCK_THREAD_CPUTIME_ID`), so a local serve's wall time splits
@@ -1483,6 +1560,26 @@ impl compound::Backend for RoutedBackend {
 
   fn now_ns(&self) -> u64 {
     futures::now_ns()
+  }
+
+  fn owns_file(&self, fh: &Nfsfh3) -> bool {
+    let mut args = XdrWriter::new();
+    fh.encode(&mut args);
+    route(
+      NFS_PROGRAM,
+      slates_bridge_nfs::procedures::NFSPROC3_GETATTR,
+      args.as_slice(),
+    )
+    .is_none()
+  }
+
+  fn revoked_state(&mut self, clientid: u64) -> bool {
+    state::with_state(|s| {
+      s.nfs_v4_files
+        .as_ref()
+        .is_some_and(|files| files.has_revoked(clientid))
+    })
+    .unwrap_or(false)
   }
 
   fn renew_home(&mut self, clientid: u64) {
