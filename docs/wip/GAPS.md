@@ -3614,7 +3614,8 @@ shard's own clock that A-65 budgets in (docs/bugs/2026-10-04-the-slow-observatio
   stamp that refuses `ChangedWhileRead`); large edits are staged on the work's owner and applied as one splice
   (`StageBegin`, `StagePut`, `EditStaged`), the buffers charged, owned and expiring.
 - **Owed:**
-  - the SDKs' async read and edit page loops (one message today: a large one is refused, typed);
+  - ~~the SDKs' async read and edit page loops~~ **done (A-88):** an async edit too large for one request runs as a
+    chain inside the client under one public word (the SDKs bind no async read; their sync read pages);
   - ~~work volumes are uncharged~~ **fixed (A-84):** a work is charged for its content and journal against the
     shard budget, before each verb changes it (`docs/bugs/2026-10-05-work-volumes-grew-uncharged.md`). Owed: a work
     still copies its green's whole content at creation (now charged); sharing the green's bytes copy-on-write

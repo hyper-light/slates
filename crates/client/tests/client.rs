@@ -793,3 +793,78 @@ fn a_base_seeded_greens_origin_survives_a_daemon_restart() {
   drop(segment);
   drop(dir);
 }
+
+/// Shape: an insert several bulk chunks (4 KiB) long.
+const LARGE_EDIT_BYTES: usize = 20 * 1024;
+
+/// Drives the async edit `word` as an event loop does — `take_ready`, then the edit's poll — until it resolves,
+/// within the reply deadline per step.
+fn drive_edit(client: &mut Client, word: u64) -> Result<bool, slates_client::ClientError> {
+  let started = Instant::now();
+  loop {
+    client.take_ready()?;
+    if let Some(done) = client.edit_poll(word)? {
+      return Ok(done);
+    }
+    assert!(
+      started.elapsed() < START_WAIT,
+      "the chained edit resolved in time"
+    );
+    std::hint::spin_loop();
+  }
+}
+
+/// §4.12 (A-83, the async half): do begin an async edit inserting [`LARGE_EDIT_BYTES`] into a work and drive it as
+/// an event loop would (one word, polled on readiness); expect it to resolve and the work's file to read back every
+/// byte in order, the edit staged in pages and applied as one. Begin another and abandon it after its first step;
+/// expect nothing left outstanding and the file unchanged.
+#[test]
+fn an_async_edit_larger_than_a_request_is_chained_and_resolves_as_one() {
+  let profile = profile();
+  let instance = format!("cl-chain-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
+  let daemon = Daemon::start(
+    &profile,
+    config,
+    SegmentSource::Create {
+      name: format!("slates-seg-cl-chain-{}", std::process::id()),
+    },
+  )
+  .unwrap();
+  daemon
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let mut client = connect(&instance);
+  let green = client.create_green("chain-g", false).unwrap();
+  let (work, _) = client.create_work(green, "chain-w").unwrap();
+  let text: Vec<u8> = (0..LARGE_EDIT_BYTES)
+    .map(|at| b'a' + u8::try_from(at % 26).unwrap())
+    .collect();
+  let id = client.edit_begin(work, "big.txt", 0, 0, &text).unwrap();
+  assert_eq!(drive_edit(&mut client, id.word()), Ok(true));
+  assert!(
+    client.outstanding().is_empty(),
+    "nothing outstanding after it resolved"
+  );
+  let read = client
+    .read(work, "big.txt", slates_client::ReadAt::Head)
+    .unwrap();
+  assert_eq!(read, text, "every byte, in order");
+  let abandoned = client.edit_begin(work, "big.txt", 0, 0, &text).unwrap();
+  client.take_ready().unwrap();
+  let _ = client.edit_poll(abandoned.word());
+  assert!(
+    client.abandon(abandoned.word()),
+    "the chain was outstanding"
+  );
+  assert!(
+    client.outstanding().is_empty(),
+    "abandoning a chain leaves no step behind"
+  );
+  let again = client
+    .read(work, "big.txt", slates_client::ReadAt::Head)
+    .unwrap();
+  assert_eq!(again, text, "an abandoned chain changes nothing");
+  drop(client);
+  daemon.stop();
+}

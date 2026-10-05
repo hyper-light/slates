@@ -216,6 +216,13 @@ pub struct Client {
   /// the ring's slots, which a caller that kept old ids while admitting and draining new ones could make an
   /// awaited reply.
   awaited: std::collections::BTreeMap<u64, RequestBody>,
+  /// Async edits too large for one request, by the public word their caller awaits: each runs as a chain of
+  /// steps (`StageBegin`, `StagePut`s, `EditStaged`), one in flight at a time (bounded by `awaited_cap`, as each
+  /// step is awaited).
+  edit_chains: std::collections::BTreeMap<u64, EditChain>,
+  /// The word of each chain step in flight, mapped to its chain's public word: a step's reply is filed under the
+  /// public word, so the caller's event loop sees one operation.
+  chain_steps: std::collections::BTreeMap<u64, u64>,
   /// Derived: the outstanding operations admitted — the command ring's slots, the client's in-flight
   /// bound (the same bound the retryable set keeps).
   awaited_cap: usize,
@@ -282,6 +289,31 @@ pub(crate) fn next_pause_ns(pause_ns: u64, budget_ns: u64) -> u64 {
 
 fn elapsed_ns(since: Instant) -> u64 {
   u64::try_from(since.elapsed().as_nanos()).unwrap_or(u64::MAX)
+}
+
+/// Where a chained async edit is ([`Client::edit_begin`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ChainStep {
+  /// `StageBegin` in flight.
+  Begin,
+  /// A `StagePut` in flight.
+  Put,
+  /// The `EditStaged` in flight.
+  Commit,
+}
+
+/// An async edit too large for one request, run as a chain of requests ([`Client::edit_begin`]).
+#[derive(Debug)]
+struct EditChain {
+  work: VolumeId,
+  path: String,
+  at: u64,
+  delete_len: u64,
+  bytes: Vec<u8>,
+  step: ChainStep,
+  token: u64,
+  /// How many of `bytes` are put (or in flight).
+  offset: usize,
 }
 
 /// Maps a decoded reply body to a result: a refusal becomes the typed error, any other body passes
@@ -612,6 +644,8 @@ impl Client {
       unpublished_forgotten: 0,
       pending: Vec::new(),
       awaited: std::collections::BTreeMap::new(),
+      edit_chains: std::collections::BTreeMap::new(),
+      chain_steps: std::collections::BTreeMap::new(),
       awaited_cap: unpublished_cap,
       unawaited_dropped: 0,
       attest_in_flight: None,
@@ -856,9 +890,12 @@ impl Client {
       match self.end.wait(Some(self.deadlines.reply_ns)) {
         Ok(reply) => {
           if reply.request != id.word() {
-            return Err(ClientError::UnexpectedReply {
-              verb: "another request's reply",
-            });
+            // Another request's reply (an async call's, or an abandoned one's still in flight): kept for its
+            // caller when one awaits it, else dropped and counted, as the async drain does (AUD-29-22); this wait
+            // goes on. Bounded: no more replies are in flight than the ring has slots.
+            let body: ReplyBody = unpack(self.end.region(), reply.kind, &reply.payload)?;
+            self.buffer(reply.request, body);
+            continue;
           }
           return Ok(Some(unpack(self.end.region(), reply.kind, &reply.payload)?));
         }
@@ -1028,12 +1065,36 @@ impl Client {
   /// dropped on arrival. Returns whether it was outstanding.
   pub fn abandon(&mut self, word: u64) -> bool {
     self.pending.retain(|(held, _)| *held != word);
+    if self.edit_chains.remove(&word).is_some() {
+      let steps: Vec<u64> = self
+        .chain_steps
+        .iter()
+        .filter(|(_, public)| **public == word)
+        .map(|(step, _)| *step)
+        .collect();
+      for step in steps {
+        self.chain_steps.remove(&step);
+        self.awaited.remove(&step);
+      }
+      // The chain's first step travels under the public word itself.
+      self.awaited.remove(&word);
+      return true;
+    }
     self.awaited.remove(&word).is_some()
   }
 
-  /// The caller-owned operations outstanding, by id word — what a binding settles when its channel ends.
+  /// The caller-owned operations outstanding, by id word — what a binding settles when its channel ends. A chained
+  /// edit is one operation, under its public word.
   pub fn outstanding(&self) -> Vec<u64> {
-    self.awaited.keys().copied().collect()
+    self
+      .awaited
+      .keys()
+      .filter(|word| !self.chain_steps.contains_key(word))
+      .copied()
+      .chain(self.edit_chains.keys().copied())
+      .collect::<std::collections::BTreeSet<u64>>()
+      .into_iter()
+      .collect()
   }
 
   /// Replies dropped on arrival because nothing awaited them (a protocol-only acknowledgement's, or an
@@ -1105,6 +1166,15 @@ impl Client {
   /// the admitted outstanding set, so nothing is evicted, item 8), dropped and counted when nothing does —
   /// a protocol-only acknowledgement's reply, or an abandoned operation's (AUD-29-22).
   fn buffer(&mut self, id_word: u64, body: ReplyBody) {
+    // A chain step's reply is its chain's: filed under the public word the caller awaits.
+    if let Some(public) = self.chain_steps.remove(&id_word) {
+      self.awaited.remove(&id_word);
+      self.note_reply(id_word, &body);
+      if !self.pending.iter().any(|(held, _)| *held == public) {
+        self.pending.push((public, body));
+      }
+      return;
+    }
     if self.attest_in_flight == Some(id_word) {
       self.attest_in_flight = None;
       match body {
@@ -1411,23 +1481,139 @@ impl Client {
     delete_len: u64,
     bytes: &[u8],
   ) -> Result<RequestId, ClientError> {
-    self.begin(&RequestBody::Edit {
+    let request = RequestBody::Edit {
       work,
       path: path.to_owned(),
       at,
       delete_len,
       bytes: bytes.to_vec(),
-    })
+    };
+    if slates_ipc::protocol::fits(self.end.region(), &request) {
+      return self.begin(&request);
+    }
+    // Too large for one request: the async counterpart of the sync `stage` (one edit, one journal operation), run
+    // as a chain the caller's polls advance; its word is the chain's first step's.
+    let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    let id = self.begin(&RequestBody::StageBegin { work, len })?;
+    self.edit_chains.insert(
+      id.word(),
+      EditChain {
+        work,
+        path: path.to_owned(),
+        at,
+        delete_len,
+        bytes: bytes.to_vec(),
+        step: ChainStep::Begin,
+        token: 0,
+        offset: 0,
+      },
+    );
+    Ok(id)
   }
 
   /// Takes an edit's reply within `spin_ns` (`true` when done).
   pub fn edit_spin(&mut self, id: RequestId, spin_ns: u64) -> Result<Option<bool>, ClientError> {
+    if self.edit_chains.contains_key(&id.word()) {
+      // A chained edit has no fast path: its polls advance it step by step.
+      return Ok(None);
+    }
     self.spin_as(id, spin_ns, extract_edited)
   }
 
-  /// Takes an edit's reply by id word once the completion fd signals.
+  /// Takes an edit's reply by id word once the completion fd signals. A chained edit advances one step per reply
+  /// and answers `None` until its last step's reply.
   pub fn edit_poll(&mut self, word: u64) -> Result<Option<bool>, ClientError> {
-    self.poll_as(word, extract_edited)
+    if !self.edit_chains.contains_key(&word) {
+      return self.poll_as(word, extract_edited);
+    }
+    self.take_ready()?;
+    let Some(pos) = self.pending.iter().position(|(held, _)| *held == word) else {
+      return Ok(None);
+    };
+    let (_, body) = self.pending.remove(pos);
+    self.awaited.remove(&word);
+    match resolved(body) {
+      Ok(body) => self.advance_chain(word, body),
+      Err(refused) => {
+        self.edit_chains.remove(&word);
+        Err(refused)
+      }
+    }
+  }
+
+  /// Advances the chained edit `word` by the reply `body` to its step in flight: sends the next step, or ends the
+  /// chain on the final edit's reply.
+  fn advance_chain(&mut self, word: u64, body: ReplyBody) -> Result<Option<bool>, ClientError> {
+    let Some(chain) = self.edit_chains.get_mut(&word) else {
+      return Ok(None);
+    };
+    match (chain.step, body) {
+      (ChainStep::Begin, ReplyBody::Staged { token }) => {
+        chain.token = token;
+        chain.step = ChainStep::Put;
+      }
+      (ChainStep::Put, ReplyBody::StagePutDone { .. }) => {}
+      (ChainStep::Commit, ReplyBody::Edited) => {
+        self.edit_chains.remove(&word);
+        return Ok(Some(true));
+      }
+      _ => {
+        self.edit_chains.remove(&word);
+        return Err(ClientError::UnexpectedReply { verb: "edit" });
+      }
+    }
+    let next = self.next_chain_step(word)?;
+    let id = match next.as_ref().map(|request| self.begin(request)) {
+      Some(Ok(id)) => id,
+      Some(Err(e)) => {
+        self.edit_chains.remove(&word);
+        return Err(e);
+      }
+      None => return Ok(None),
+    };
+    self.chain_steps.insert(id.word(), word);
+    Ok(None)
+  }
+
+  /// The next request of chained edit `word`: the next page of its bytes (each what one request holds past a
+  /// put's fixed framing), or, once every page is put, the edit itself.
+  fn next_chain_step(&mut self, word: u64) -> Result<Option<RequestBody>, ClientError> {
+    let capacity = slates_ipc::protocol::chunk_capacity(self.end.region());
+    let Some(chain) = self.edit_chains.get_mut(&word) else {
+      return Ok(None);
+    };
+    if chain.offset >= chain.bytes.len() {
+      chain.step = ChainStep::Commit;
+      return Ok(Some(RequestBody::EditStaged {
+        work: chain.work,
+        path: chain.path.clone(),
+        at: chain.at,
+        delete_len: chain.delete_len,
+        token: chain.token,
+      }));
+    }
+    let empty = RequestBody::StagePut {
+      work: chain.work,
+      token: chain.token,
+      offset: u64::MAX,
+      bytes: Vec::new(),
+    };
+    let page = capacity
+      .saturating_sub(slates_ipc::protocol::framed_len(&empty))
+      .max(1);
+    let end = chain.offset.saturating_add(page).min(chain.bytes.len());
+    let request = RequestBody::StagePut {
+      work: chain.work,
+      token: chain.token,
+      offset: u64::try_from(chain.offset).unwrap_or(u64::MAX),
+      bytes: chain
+        .bytes
+        .get(chain.offset..end)
+        .unwrap_or_default()
+        .to_vec(),
+    };
+    chain.offset = end;
+    Ok(Some(request))
   }
 
   /// Begins a submit of a work volume with no evidence, returning its request id.

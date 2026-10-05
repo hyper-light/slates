@@ -9064,3 +9064,17 @@ Status: built 2026-10-05.
   different versions are `-32020` before either is judged supported. Legacy clients keep `initialize` and `ping`.
 - Proven: the official conformance suite (BENCHMARKS, every failure classified) and the surface test's era
   assertions, each failing before its fix.
+
+### A-88 — Large async edits as a chain under one word; the sync wait buffers others' replies (2026-10-05)
+Applied in the same change to: `crates/client/src/client.rs` (`edit_begin`, `edit_poll`, `edit_spin`,
+`EditChain`, `buffer`, `abandon`, `outstanding`, `round_trip`), `crates/client/tests/client.rs`, GAPS.
+Status: built 2026-10-05 (the async half of A-83).
+- What: an async edit that does not fit one request runs as a chain inside the client (`StageBegin`, the
+  `StagePut`s, `EditStaged`), one step in flight at a time, under the public word its caller awaits. Each step's
+  reply is filed under that word, so a binding's event loop (`take_ready`, then `edit_poll`) sees one operation
+  and neither SDK changes. A chain is one outstanding operation, and abandoning it releases every step.
+- Found on the way: the sync round trip refused a reply for another request ("another request's reply"), so an
+  abandoned async call still in flight broke the next sync call. It now buffers that reply as the async drain does
+  (kept if awaited, dropped and counted if not) and waits on.
+- Proven: `an_async_edit_larger_than_a_request_is_chained_and_resolves_as_one` (20 KiB through the async path,
+  read back whole; an abandoned chain leaving nothing outstanding and the file unchanged; a sync read after it).
