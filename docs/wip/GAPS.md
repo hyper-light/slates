@@ -3732,6 +3732,20 @@ docs/bugs/2026-10-05-a-granted-landing-refused-on-a-held-delegation.md). The sam
 10 and 23 over NFSv4.2 were a delegation's state id letting any user of its client truncate
 (docs/bugs/2026-10-05-a-delegation-let-any-user-of-its-client-truncate.md), fixed the same day.
 
+**Reopened 2026-10-06: `open/07.t` is not closed on CI.** Every Ubuntu conformance run since `1998da3` (the first
+37334775304, the latest 37448849001) still fails 8, 10 and 23. The group member at 0747 and the other user at 0774
+open with `O_TRUNC` and truncate. The owner's case, 6, passes. The fix held locally (Linux 6.12, 0 unexpected,
+2026-10-06), so the evidence was the local client's, not CI's.
+- **6.12, from its own trace:** the owner's truncating open goes to the server as an `OPEN` for read and a `SETATTR`
+  under that open's state id, refused `NFS4ERR_OPENMODE` (so `EACCES`). The group member's and the other user's
+  opens never leave the client: its `ACCESS` answer refuses them.
+- **What CI's client sends is unrecorded.** Neither the daemon nor the lane logs operations.
+- **The open/07 sequence is now a test in the CI-run kernel suite.**
+  `the_owners_own_file_refuses_a_truncating_open_without_write_permission` (`crates/server/tests/nfs_v4_kernel.rs`)
+  runs on the suite's own mount and on one with the lane's options. On a departure it re-runs the sequence under the
+  kernel's `nfs` and `nfs4` tracepoints and fails with the trace and the kernel release.
+- **Owed:** the cause, from that trace; then the fix.
+
 Boot, found and closed 2026-10-05 (A-100; docs/bugs/2026-10-05-a-slow-shard-start-stopped-the-daemon-and-left-it-beating.md):
 the control loop's client-id recovery gave up on a shard whose start outran the 1 s liveness window and the daemon
 never served, while its heartbeat beat on. It now waits a window at a time while the shard's thread is using CPU and

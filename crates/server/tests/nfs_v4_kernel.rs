@@ -157,13 +157,27 @@ fn daemon_with_volume(tag: &str, name: &str) -> Daemon {
 /// Mounts `source` (`127.0.0.1:/<name>@<capability>`) with the kernel's NFSv4 client at minor version
 /// `minor`, at a fresh directory in the build output.
 fn kernel_mount(source: &str, port: u16, minor: u32) -> KernelMount {
+  kernel_mount_with(source, port, minor, "")
+}
+
+/// Format: the conformance lane's further NFSv4 options (`xtask/src/conformance/slates.rs` `LINUX_NFS4_OPTIONS`): a
+/// high source port and a one-second attribute cache, under which pjdfstest runs.
+#[cfg(target_os = "linux")]
+const CONFORMANCE_OPTIONS: &str = ",noresvport,actimeo=1";
+
+/// [`kernel_mount`] with `extra` appended to the options (each beginning with a comma), at a directory of its own.
+fn kernel_mount_with(source: &str, port: u16, minor: u32, extra: &str) -> KernelMount {
   let base = PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
-  let path = base.join(format!("nfs4-{minor}-{}", std::process::id()));
+  let path = base.join(format!(
+    "nfs4-{minor}-{}{}",
+    std::process::id(),
+    if extra.is_empty() { "" } else { "-lane" }
+  ));
   #[allow(clippy::disallowed_methods)] // the mount point, in the build output
   std::fs::create_dir_all(&path).unwrap();
   let mount = KernelMount { path };
   // Locks go to the server (the default `local_lock=none`): LOCK, LOCKT and LOCKU are served (A-35).
-  let options = format!("vers=4.{minor},proto=tcp,port={port},soft,timeo=10,retrans=2");
+  let options = format!("vers=4.{minor},proto=tcp,port={port},soft,timeo=10,retrans=2{extra}");
   let output = privileged("mount")
     .args(["-t", "nfs4", "-o", &options, source])
     .arg(&mount.path)
@@ -339,6 +353,130 @@ fn truncating_open_needs_write_permission(root: &Path) {
     );
     std::fs::remove_file(&path).unwrap();
   }
+}
+
+/// A child as `uid`/`gid` running `script` (perl, `Fcntl` loaded) on `path`; its exit status is the errno of the
+/// first refused call, 0 when every call succeeded.
+#[cfg(target_os = "linux")]
+fn perl_as(uid: u32, gid: u32, script: &str, path: &Path) -> Option<i32> {
+  as_ids(uid, gid, "perl")
+    .args(["-MFcntl", "-e", script])
+    .arg(path)
+    .status()
+    .unwrap()
+    .code()
+}
+
+/// Format: pjdfstest's two users and `EACCES`.
+#[cfg(target_os = "linux")]
+const OPEN07_OWNER: u32 = 65534;
+#[cfg(target_os = "linux")]
+const OPEN07_OTHER: u32 = 65533;
+#[cfg(target_os = "linux")]
+const OPEN07_EACCES: i32 = 13;
+
+/// One run of pjdfstest `open/07.t`'s sequence in a fresh directory `dir`: the owner creates its file and writes one
+/// byte, then for each (mode, caller) the owner sets the mode and the caller opens `O_RDONLY|O_TRUNC`. Returns every
+/// step that did not do what POSIX requires, empty when all did.
+#[cfg(target_os = "linux")]
+#[allow(clippy::disallowed_methods)] // file calls through the kernel mount under test (RAM-backed)
+fn open07_departures(dir: &Path) -> Vec<String> {
+  std::fs::create_dir(dir).unwrap();
+  chown_as_root(dir, OPEN07_OWNER, OPEN07_OWNER);
+  let file = dir.join("n1");
+  let made = perl_as(
+    OPEN07_OWNER,
+    OPEN07_OWNER,
+    "sysopen(my $f, $ARGV[0], O_WRONLY | O_CREAT | O_EXCL, 0644) or exit($! + 0); syswrite($f, 'x') == 1 or exit($! + 0); close($f) or exit($! + 0); exit(0)",
+    &file,
+  );
+  if made != Some(0) {
+    return vec![format!("the owner's create and write: {made:?}")];
+  }
+  let mut departures = Vec::new();
+  for (mode, uid, gid) in [
+    (0o477, OPEN07_OWNER, OPEN07_OWNER),
+    (0o747, OPEN07_OTHER, OPEN07_OWNER),
+    (0o774, OPEN07_OTHER, OPEN07_OTHER),
+  ] {
+    let chmod = format!("chmod({mode:#o}, $ARGV[0]) ? exit(0) : exit($! + 0)");
+    let set = perl_as(OPEN07_OWNER, OPEN07_OWNER, &chmod, &file);
+    let opened = perl_as(
+      uid,
+      gid,
+      "sysopen(my $f, $ARGV[0], O_RDONLY | O_TRUNC) ? exit(0) : exit($! + 0)",
+      &file,
+    );
+    let kept = perl_as(
+      OPEN07_OWNER,
+      OPEN07_OWNER,
+      "exit((stat($ARGV[0]))[7] == 1 ? 0 : 1)",
+      &file,
+    );
+    if set != Some(0) || opened != Some(OPEN07_EACCES) || kept != Some(0) {
+      departures.push(format!(
+        "mode {mode:o}, uid {uid} gid {gid}: chmod {set:?}, O_RDONLY|O_TRUNC {opened:?} (EACCES due), one byte kept {}",
+        kept == Some(0)
+      ));
+    }
+  }
+  departures
+}
+
+/// The kernel's NFSv4 client trace (its `nfs4` tracepoints, each operation with its state id and status) over
+/// `run`, with the kernel's release: the evidence a departure on another kernel is diagnosed from (tracefs is the
+/// kernel's own interface, nothing on disk; mounted first where it is not, as in a container). Turned off again
+/// before it returns.
+#[cfg(target_os = "linux")]
+fn traced<T>(run: impl FnOnce() -> T) -> (T, String) {
+  /// Format: the tracefs mount the kernel documents (`Documentation/trace/ftrace.rst`).
+  const TRACING: &str = "/sys/kernel/tracing";
+  let switch = |on: &str| {
+    privileged("sh")
+      .args([
+        "-c",
+        &format!(
+          "{{ [ -d {TRACING}/events ] || mount -t tracefs nodev {TRACING}; }} && echo {on} > {TRACING}/events/nfs4/enable && echo {on} > {TRACING}/events/nfs/enable && echo {on} > {TRACING}/tracing_on && : > {TRACING}/trace"
+        ),
+      ])
+      .status()
+      .map(|status| status.success())
+      .unwrap_or(false)
+  };
+  let switched = switch("1");
+  let result = run();
+  let trace = privileged("cat")
+    .arg(format!("{TRACING}/trace"))
+    .output()
+    .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+    .unwrap_or_default();
+  switch("0");
+  let release = Command::new("uname")
+    .arg("-r")
+    .output()
+    .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+    .unwrap_or_default();
+  (
+    result,
+    format!("kernel {release}; tracing switched on: {switched}\n{trace}"),
+  )
+}
+
+/// pjdfstest `open/07.t`, step for step, through the kernel client as the users it names. Its owner creates the
+/// file in a directory it owns, writes one byte through its own open, and changes the mode itself, so the client may
+/// hold a delegation over the file as on CI's NFSv4.2 lane. Do: for each of 0477 (the owner), 0747 (a member of the
+/// file's group) and 0774 (another user), set the mode as the owner, then open `O_RDONLY|O_TRUNC` as that caller.
+/// Expect: `EACCES` each time and the file still one byte. CI (2026-10-05, 10-06) saw 0747 and 0774 open and
+/// truncate on Ubuntu 24.04's client while Linux 6.12 refused them; a departure is re-run under the kernel's NFSv4
+/// trace and reported with it.
+#[cfg(target_os = "linux")]
+fn the_owners_own_file_refuses_a_truncating_open_without_write_permission(root: &Path, tag: &str) {
+  let departures = open07_departures(&root.join(format!("open07-{tag}")));
+  if departures.is_empty() {
+    return;
+  }
+  let (again, trace) = traced(|| open07_departures(&root.join(format!("open07-{tag}-traced"))));
+  panic!("open/07 departures ({tag} mount): {departures:#?}\nunder the trace: {again:#?}\n{trace}");
 }
 
 /// `mkfifo` and a UNIX socket's `bind` create their names through the kernel client (NFSv4 CREATE of
@@ -643,7 +781,16 @@ fn the_linux_kernel_nfsv4_client_mounts_and_works_a_volume() {
       if minor == 2 {
         sparse_seek_and_copy(&mounted.path);
         user_attributes(&mounted.path);
+        the_owners_own_file_refuses_a_truncating_open_without_write_permission(
+          &mounted.path,
+          "suite",
+        );
       }
+    }
+    #[cfg(target_os = "linux")]
+    if minor == 2 {
+      let lane = kernel_mount_with(&source, port, minor, CONFORMANCE_OPTIONS);
+      the_owners_own_file_refuses_a_truncating_open_without_write_permission(&lane.path, "lane");
     }
     let mut v3 = TcpStream::connect(("127.0.0.1", port)).unwrap();
     let root = mount(&mut v3, &path, 1);
