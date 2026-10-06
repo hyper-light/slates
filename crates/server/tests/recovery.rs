@@ -2388,6 +2388,79 @@ fn occurrences_in_content(name: &str, needle: &[u8]) -> usize {
   0
 }
 
+/// Shape: the reap ticks an idle shard is watched for further publications once its plaintext has gone.
+#[cfg(target_os = "linux")]
+const IDLE_TICKS_WATCHED: u64 = 3;
+
+/// Condition 9, a deleted file, and the cost of the rule that scrubs it. Do: write a marker file, publish every shard (as
+/// a transport's barrier does), delete the file, and leave the volume idle; then watch the shards' publications for a
+/// few ticks. Expect: the marker gone from the content object within the bound, and then no further publication: the
+/// reap tick publishes only while a free is deferred, so an idle shard costs nothing. The deletion's own scrub through a
+/// kernel mount is proven, mutation-checked, by `a_deleted_files_plaintext_leaves_the_daemons_memory`
+/// (`crates/cli/tests/cli.rs`); on this verb path the block is scrubbed with or without the rule.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_deleted_files_plaintext_leaves_the_content_object() {
+  const MARKER: &[u8] = b"SLATES-DELETED-AT-REST-4c2d";
+  let profile = common::machine_profile();
+  let instance = format!("srv-rest-delete-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
+  let tag = format!("rest-delete-{}", std::process::id());
+  let segment = anchor_segment(&tag, &profile, &config);
+  let daemon = Daemon::start(&profile, config, source_of(&segment)).unwrap();
+  daemon
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let mut client = connect(&instance);
+  let volume = client.create(&scratch("rest-delete")).unwrap();
+  let attachment = client
+    .attach(volume, None, slates_ipc::protocol::Intent::Write)
+    .unwrap()
+    .attachment;
+  client
+    .fs_write((volume, attachment), "gone", &MARKER.repeat(32), 0o644)
+    .unwrap();
+  let content = format!("slates-con-{tag}");
+  // Published while still open, as a FUSE `close` publishes it: the image names the file's plaintext block, so the
+  // delete below can only defer its free.
+  daemon.publish_every_shard().unwrap();
+  let written = occurrences_in_content(&content, MARKER);
+  client.fs_remove((volume, attachment), "gone").unwrap();
+  let started = Instant::now();
+  let mut left = occurrences_in_content(&content, MARKER);
+  while left > 0 && started.elapsed() < START_WAIT {
+    std::thread::yield_now();
+    left = occurrences_in_content(&content, MARKER);
+  }
+  let published = |daemon: &Daemon| -> u64 {
+    daemon
+      .db_publication_counters()
+      .map(|shards| shards.iter().map(|shard| shard.snapshots_taken).sum())
+      .unwrap_or(0)
+  };
+  let before = published(&daemon);
+  // A test may sleep (the lint's stated exception): the watch is wall time over the daemon's own reap ticks.
+  #[allow(clippy::disallowed_methods)]
+  std::thread::sleep(Duration::from_nanos(
+    slates_server::daemon::LIVENESS_BUDGET_NS.saturating_mul(IDLE_TICKS_WATCHED),
+  ));
+  let after = published(&daemon);
+  daemon.stop();
+  drop(segment);
+  assert!(
+    written > 0,
+    "the scan sees the plaintext right after the write (its control)"
+  );
+  assert_eq!(
+    left, 0,
+    "no copy of the deleted file's plaintext stays in the content object"
+  );
+  assert_eq!(
+    after, before,
+    "an idle shard with nothing deferred publishes nothing"
+  );
+}
+
 /// Condition 9 (A-99: plaintext at rest only where it is being written), read as an attacker on the host reads it: the
 /// anchor's content object itself. Do: write a small file carrying a marker; scan the content object; wait for the idle
 /// sweep to seal it; scan again until the bound. Expect: the marker is there right after the write (the open extent,

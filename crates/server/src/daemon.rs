@@ -2048,6 +2048,19 @@ impl Daemon {
     }
   }
 
+  /// Test support: runs every shard's publication now, as a transport's barrier does after a mutation (a FUSE `close`,
+  /// an NFS procedure): the recovery image then names the content written so far. A test proves what a freed block that
+  /// an image names still owes (A-99: its plaintext scrubbed at the commit that releases it) without driving a kernel
+  /// mount. `Ok` once every shard has answered, else the first shard's typed refusal.
+  pub fn publish_every_shard(&self) -> Result<(), ObserveError> {
+    for shard in self.shards.iter().copied() {
+      self.observe(Some(shard), |s| {
+        let _ = crate::verbs::publish_shard(s);
+      })?;
+    }
+    Ok(())
+  }
+
   /// Test support: sets the memory-pressure hold on **every** shard's byte budget (§4.2; admission.md
   /// §5.5) — capacity withheld from new admission under host memory pressure. In production
   /// [`refresh_pressure_hold`] sets it from a sampled host shortfall at the liveness cadence; this
@@ -3037,12 +3050,16 @@ async fn seal_idle_content() {
     }
     futures::yield_now().await;
   }
-  // A seal moves an imaged chunk's bytes elsewhere and defers the old block's free to the commit that releases it,
-  // which zeroes it (A-99, `slates_mem::arena`): the plaintext stays in the anchor's RAM until the shard publishes. An
-  // idle volume publishes nothing of its own, so a tick that sealed publishes once here, and a tick that sealed nothing
-  // publishes nothing. Before 2026-10-06 a sealed idle file's plaintext stayed indefinitely
-  // (`a_sealed_files_plaintext_leaves_the_content_object`). A refused publication is retried by the next tick's seal.
-  if sealed_this_tick > 0 {
+  // A freed block a published image may still name is not released, and not zeroed, until the commit that releases it
+  // (A-99, `slates_mem::arena`): a seal's moved chunk, a deleted file's blocks, a truncated tail. Each keeps its
+  // plaintext in the anchor's RAM until the shard publishes again, and an idle shard publishes nothing of its own. So
+  // a tick that sealed, or that finds frees still deferred, publishes once; a shard with neither publishes nothing.
+  // Before 2026-10-06 a sealed or deleted idle file's plaintext stayed indefinitely
+  // (`a_sealed_files_plaintext_leaves_the_content_object`, `a_deleted_files_plaintext_leaves_the_content_object`).
+  // A refused publication is retried by the next tick.
+  let deferred =
+    state::with_state(|s| s.store.content.arena().deferred_bytes() > 0).unwrap_or(false);
+  if sealed_this_tick > 0 || deferred {
     let _ = state::with_state(crate::verbs::publish_shard);
   }
 }

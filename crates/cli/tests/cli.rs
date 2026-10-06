@@ -3751,6 +3751,90 @@ fn a_destroyed_volumes_mount_refuses_writes_and_never_lets_them_reach_the_disk_b
   );
 }
 
+/// How many times `needle` occurs in process `pid`'s slates content memfd, read through `/proc` over its data ranges
+/// only (`SEEK_DATA`/`SEEK_HOLE`), so its never-written pages cost nothing.
+#[cfg(target_os = "linux")]
+#[allow(clippy::disallowed_methods)] // reading another process's memfd through /proc, read-only
+fn plaintext_in_content(pid: u32, needle: &[u8]) -> usize {
+  use std::os::unix::fs::FileExt;
+  let Ok(fds) = std::fs::read_dir(format!("/proc/{pid}/fd")) else {
+    return 0;
+  };
+  let mut count = 0;
+  for entry in fds.flatten() {
+    let target = std::fs::read_link(entry.path()).unwrap_or_default();
+    if !target.to_string_lossy().contains("memfd:slates-con") {
+      continue;
+    }
+    let Ok(file) = std::fs::File::open(entry.path()) else {
+      continue;
+    };
+    let mut at: u64 = 0;
+    while let Ok(data) = rustix::fs::seek(&file, rustix::fs::SeekFrom::Data(at)) {
+      let end = rustix::fs::seek(&file, rustix::fs::SeekFrom::Hole(data)).unwrap_or(data);
+      let mut range = vec![0u8; usize::try_from(end - data).unwrap()];
+      let read = file.read_at(&mut range, data).unwrap_or(0);
+      count += range[..read]
+        .windows(needle.len())
+        .filter(|window| *window == needle)
+        .count();
+      if end <= at {
+        break;
+      }
+      at = end;
+    }
+    break;
+  }
+  count
+}
+
+/// Condition 9 (A-99), through a real FUSE mount and read as an attacker on the host reads it: the daemon's content
+/// object. Do: write a file carrying a marker through the mount (its close publishes it), delete it, and leave the
+/// volume idle. Expect: the marker is in the content object right after the write (the scan's control) and gone
+/// within the bound after the delete. Before 2026-10-06 the delete deferred the published block's free to a commit an
+/// idle shard never made, and its plaintext stayed (a live scan: 400 copies 25 s after the delete).
+#[cfg(target_os = "linux")]
+#[test]
+fn a_deleted_files_plaintext_leaves_the_daemons_memory() {
+  if !linux_fuse_mount_runs() {
+    return;
+  }
+  const MARKER: &str = "SLATES-FUSE-DELETED-AT-REST-58e1";
+  let instance = format!("cli-fuse-rest-{}", std::process::id());
+  let _anchor = start_anchor(&instance);
+  let (code, out, err) = run(
+    &instance,
+    &["volume", "create", "rest", "--bounded", "8MiB"],
+  );
+  assert_eq!(code, 0, "{err}");
+  let id = value_of(&out, "id");
+  let mount_point = MountPoint {
+    path: fresh_mount_point(),
+  };
+  fuse_mount_and_check(&instance, &id, &mount_point.path);
+  let file = format!("{}/gone.txt", mount_point.path);
+  assert!(
+    write_with_the_shell(&file, &MARKER.repeat(64))
+      .status
+      .success()
+  );
+  let pid = daemon_pid(&instance).expect("the daemon answers");
+  let written = plaintext_in_content(pid, MARKER.as_bytes());
+  assert!(Command::new("rm").arg(&file).status().unwrap().success());
+  let gone = wait_for(|| plaintext_in_content(pid, MARKER.as_bytes()) == 0);
+  let left = plaintext_in_content(pid, MARKER.as_bytes());
+  let (code, _, err) = run(&instance, &["unmount", &mount_point.path]);
+  assert_eq!(code, 0, "{err}");
+  assert!(
+    written > 0,
+    "the scan sees the plaintext right after the write (its control)"
+  );
+  assert!(
+    gone,
+    "no copy of the deleted file's plaintext stays in the daemon's memory: {left} left"
+  );
+}
+
 /// Writes `text` to `path` with the shell (a write through a mount; tests write no host path themselves, R1).
 #[cfg(target_os = "linux")]
 fn write_with_the_shell(path: &str, text: &str) -> std::process::Output {

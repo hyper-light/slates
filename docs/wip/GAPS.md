@@ -3921,7 +3921,7 @@ council's death watch.
 one in a deferred free that waited for a publication that never came
 (`docs/bugs/2026-10-06-sealed-content-left-its-plaintext-in-ram.md`). A live scan after the fix: 0 copies once idle.
 
-**Open:** any other deferred free (a deleted file's or a truncated tail's blocks) keeps its plaintext until the
-shard's next publication. On a volume left idle after a delete, that is indefinite. The same publish-on-a-tick rule,
-or a publication per deferred-free volume, would close it.
+**Also closed, the same day: a deleted file's plaintext on an idle volume.** The reap tick now publishes once
+whenever a free is still deferred, so the release scrubs it. Proven through a real FUSE mount; mutation-checked
+(64 copies left without the rule). An idle shard with nothing deferred publishes nothing (measured over 3 ticks).
 

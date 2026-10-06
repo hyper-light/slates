@@ -39,5 +39,10 @@ There were two copies, from two causes.
 ## Sibling sweep
 
 - **The kernel's own page cache for a mount** holds plaintext. It is outside what slates protects, as A-99 states.
-- **Other deferred frees** (a deleted file's blocks, a truncate) wait for the next publication the same way. A volume
-  that is idle after a delete keeps that plaintext until its next publication. Open in GAPS.
+- **Other deferred frees.** A deleted file's blocks waited for the next publication the same way: a live scan showed
+  400 copies 25 s after a delete through a FUSE mount. Closed the same day: the reap tick publishes once whenever a
+  free is still deferred, not only after a seal.
+  - `a_deleted_files_plaintext_leaves_the_daemons_memory` (`crates/cli/tests/cli.rs`, real FUSE, Linux) fails with
+    64 copies left without that rule.
+  - `a_deleted_files_plaintext_leaves_the_content_object` (`crates/server/tests/recovery.rs`) proves an idle shard
+    then publishes nothing more.
