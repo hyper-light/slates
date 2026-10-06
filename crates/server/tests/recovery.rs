@@ -2350,6 +2350,102 @@ fn a_daemon_stopped_while_its_boot_waits_on_a_shard_stops() {
   drop(segment);
 }
 
+/// How many times `needle` occurs in the content memfd named `name` that this process holds. Only its data ranges are
+/// read (`SEEK_DATA`/`SEEK_HOLE`, which tmpfs answers), so the multi-GiB object's never-written pages cost nothing and
+/// are never allocated (`SparseObject::read` commits each page first, so the scan does not use it).
+#[cfg(target_os = "linux")]
+#[allow(clippy::disallowed_methods)] // reading this process's own memfd through /proc, read-only
+fn occurrences_in_content(name: &str, needle: &[u8]) -> usize {
+  use std::os::unix::fs::FileExt;
+  let Ok(fds) = std::fs::read_dir("/proc/self/fd") else {
+    return 0;
+  };
+  for entry in fds.flatten() {
+    let target = std::fs::read_link(entry.path()).unwrap_or_default();
+    if !target.to_string_lossy().contains(&format!("memfd:{name}")) {
+      continue;
+    }
+    let Ok(file) = std::fs::File::open(entry.path()) else {
+      continue;
+    };
+    let mut count = 0;
+    let mut at: u64 = 0;
+    while let Ok(data) = rustix::fs::seek(&file, rustix::fs::SeekFrom::Data(at)) {
+      let end = rustix::fs::seek(&file, rustix::fs::SeekFrom::Hole(data)).unwrap_or(data);
+      let mut range = vec![0u8; usize::try_from(end - data).unwrap()];
+      let read = file.read_at(&mut range, data).unwrap_or(0);
+      count += range[..read]
+        .windows(needle.len())
+        .filter(|window| *window == needle)
+        .count();
+      if end <= at {
+        break;
+      }
+      at = end;
+    }
+    return count;
+  }
+  0
+}
+
+/// Condition 9 (A-99: plaintext at rest only where it is being written), read as an attacker on the host reads it: the
+/// anchor's content object itself. Do: write a small file carrying a marker; scan the content object; wait for the idle
+/// sweep to seal it; scan again until the bound. Expect: the marker is there right after the write (the open extent,
+/// plaintext by design, the scan's control) and gone after the seal. Before 2026-10-06 the seal moved the chunk and
+/// deferred the old block's free to the next publication, and on an idle volume none came, so the plaintext stayed
+/// (a live daemon's memfd: 400 copies after 25 s, `content.sealed` moved); the write log kept a second copy until a
+/// later append overwrote it.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_sealed_files_plaintext_leaves_the_content_object() {
+  const MARKER: &[u8] = b"SLATES-PLAINTEXT-AT-REST-1b9e";
+  let profile = common::machine_profile();
+  let instance = format!("srv-rest-scrub-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
+  let tag = format!("rest-scrub-{}", std::process::id());
+  let segment = anchor_segment(&tag, &profile, &config);
+  let daemon = Daemon::start(&profile, config, source_of(&segment)).unwrap();
+  daemon
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let mut client = connect(&instance);
+  let volume = client.create(&scratch("rest-scrub")).unwrap();
+  let attachment = client
+    .attach(volume, None, slates_ipc::protocol::Intent::Write)
+    .unwrap()
+    .attachment;
+  let bytes = MARKER.repeat(32);
+  client
+    .fs_write((volume, attachment), "secret", &bytes, 0o644)
+    .unwrap();
+  let content = format!("slates-con-{tag}");
+  let written = occurrences_in_content(&content, MARKER);
+  let started = Instant::now();
+  while counter(&mut client, "content.sealed") == 0 && started.elapsed() < START_WAIT {
+    std::hint::spin_loop();
+  }
+  let sealed = counter(&mut client, "content.sealed");
+  let scrub_started = Instant::now();
+  let mut left = occurrences_in_content(&content, MARKER);
+  while left > 0 && scrub_started.elapsed() < START_WAIT {
+    std::thread::yield_now();
+    left = occurrences_in_content(&content, MARKER);
+  }
+  let read = client.read(volume, "secret", slates_ipc::protocol::ReadAt::Head);
+  daemon.stop();
+  drop(segment);
+  assert!(
+    written > 0,
+    "the scan sees the open extent's plaintext right after the write (its control)"
+  );
+  assert!(sealed > 0, "the sweep sealed the idle file");
+  assert_eq!(
+    left, 0,
+    "no copy of the sealed file's plaintext stays in the content object"
+  );
+  assert!(read.unwrap() == bytes, "the sealed file reads back whole");
+}
+
 /// A-99 (the idle sweep, live). Do: on a daemon with a sealing root, write one file smaller than a chunk (so no write
 /// seals it) and then leave it. Expect: within the client's start wait the reap loop's sweep seals it (`content.sealed`
 /// moves from zero with no refusal), and it reads back whole.

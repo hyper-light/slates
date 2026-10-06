@@ -3914,3 +3914,14 @@ through.
 
 **Open: the root group.** `serve_root` has the same shape across regions, judged by region liveness, not the
 council's death watch.
+
+### 2026-10-06: sealed content no longer leaves plaintext in RAM (condition 9)
+
+**Closed:** an idle sealed file kept two plaintext copies in the anchor's content object, one in the write log and
+one in a deferred free that waited for a publication that never came
+(`docs/bugs/2026-10-06-sealed-content-left-its-plaintext-in-ram.md`). A live scan after the fix: 0 copies once idle.
+
+**Open:** any other deferred free (a deleted file's or a truncated tail's blocks) keeps its plaintext until the
+shard's next publication. On a volume left idle after a delete, that is indefinite. The same publish-on-a-tick rule,
+or a publication per deferred-free volume, would close it.
+

@@ -227,13 +227,22 @@ impl WriteLog {
   }
 
   /// Empties the log after a publication of generation `stamp` that captured every volume: every write before it is
-  /// in that image now.
+  /// in that image now. The records are scrubbed, not only uncovered: they are the plaintext of every logged write, and
+  /// once the image holds them nothing needs them, while left in place they stayed in the anchor's RAM after the
+  /// volume's content was sealed (condition 9, A-99; `a_cleared_log_keeps_none_of_the_bytes_it_logged`). The length
+  /// goes to zero first, so a daemon killed mid-scrub replays nothing rather than half-zeroed records. The zero buffer
+  /// is at most the log's capacity, allocated once per publication.
   pub(crate) fn clear(&mut self, object: &mut SparseObject, stamp: u64) -> Result<(), Unwritten> {
+    let logged = self.used;
     self.used = 0;
     self.stamp = stamp;
     self.store(object, AT_USED, &0u64.to_le_bytes())?;
     self.store(object, AT_OVERFLOW, &0u64.to_le_bytes())?;
-    self.store(object, AT_STAMP, &stamp.to_le_bytes())
+    self.store(object, AT_STAMP, &stamp.to_le_bytes())?;
+    if logged > 0 {
+      self.store(object, HEADER_BYTES, &vec![0u8; logged])?;
+    }
+    Ok(())
   }
 
   fn store(&self, object: &mut SparseObject, offset: usize, bytes: &[u8]) -> Result<(), Unwritten> {
@@ -260,6 +269,28 @@ mod tests {
       slates_mem::Words::new(),
     )
     .unwrap()
+  }
+
+  /// Condition 9 (A-99: plaintext at rest only where it is being written). Do: append a write carrying a marker, then
+  /// clear the log as a publication that captured it does; read the log's whole region. Expect: the marker is gone.
+  /// Before 2026-10-06 `clear` reset the counters only, and every logged write's plaintext stayed in the anchor's
+  /// content object after its publication, after the volume's content was sealed, until a later append happened to
+  /// overwrite it (found by scanning a live daemon's content memfd under a FUSE mount: 800 copies of a marker 25 s idle).
+  #[test]
+  fn a_cleared_log_keeps_none_of_the_bytes_it_logged() {
+    const MARKER: &[u8] = b"PLAINTEXT-MARKER-AT-REST";
+    let mut shared = object("scrub");
+    let (mut log, _) = WriteLog::open(&mut shared, LOG_AT, LOG_BYTES, 1).unwrap();
+    log.append(&mut shared, 1, 0, &MARKER.repeat(8)).unwrap();
+    log.clear(&mut shared, 2).unwrap();
+    let mut region = vec![0u8; LOG_BYTES];
+    shared.read(LOG_AT, &mut region).unwrap();
+    assert!(
+      !region.windows(MARKER.len()).any(|window| window == MARKER),
+      "a cleared log keeps no logged byte"
+    );
+    let (_, recovered) = WriteLog::open(&mut shared, LOG_AT, LOG_BYTES, 2).unwrap();
+    assert!(recovered.records.is_empty(), "and replays nothing");
   }
 
   /// A-63. Do: append three writes under the image of generation 7; open the log as a restarted daemon whose image is

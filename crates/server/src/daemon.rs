@@ -3012,8 +3012,9 @@ async fn seal_idle_content() {
   if aged.is_none() {
     return;
   }
+  let mut sealed_this_tick = 0u64;
   loop {
-    let left = state::with_state(|s| {
+    let turn = state::with_state(|s| {
       let budget = s.config.archive_slice_bytes().max(1);
       let mut left = 0u64;
       let mut sealed = 0u64;
@@ -3027,12 +3028,22 @@ async fn seal_idle_content() {
           break;
         }
       }
-      left
+      (left, sealed)
     });
-    if left.unwrap_or(0) == 0 {
-      return;
+    let (left, sealed) = turn.unwrap_or((0, 0));
+    sealed_this_tick = sealed_this_tick.saturating_add(sealed);
+    if left == 0 {
+      break;
     }
     futures::yield_now().await;
+  }
+  // A seal moves an imaged chunk's bytes elsewhere and defers the old block's free to the commit that releases it,
+  // which zeroes it (A-99, `slates_mem::arena`): the plaintext stays in the anchor's RAM until the shard publishes. An
+  // idle volume publishes nothing of its own, so a tick that sealed publishes once here, and a tick that sealed nothing
+  // publishes nothing. Before 2026-10-06 a sealed idle file's plaintext stayed indefinitely
+  // (`a_sealed_files_plaintext_leaves_the_content_object`). A refused publication is retried by the next tick's seal.
+  if sealed_this_tick > 0 {
+    let _ = state::with_state(crate::verbs::publish_shard);
   }
 }
 
