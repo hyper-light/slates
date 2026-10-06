@@ -2441,6 +2441,19 @@ v && v/bin/pip install requests flask`, timed with `EPOCHREALTIME`.
 - **Correctness:** 1,382 files on each side, and identical bytes outside `RECORD`, `pyvenv.cfg` and `.pyc`.
 - **One earlier run** had a 7.67 s round that six later rounds did not repeat (a host-load spike).
 
+**The same workload on macOS** (macOS 26.4, M5 Max, load 4–5, the release binary). It ran through `slates mount`,
+the NFS loopback mount with no privilege, against APFS, alternating, three rounds. The script is `mac-pip.sh`; Python
+3.9.6 is the system interpreter.
+
+| | slates mount | APFS |
+|---|---|---|
+| install (rounds 1–3) | 3.95, 3.61, 3.51 s | 2.95, 2.86, 2.87 s |
+| `import flask, requests` (warm, rounds 2–3) | 0.16, 0.17 s | 0.59, 0.59 s |
+
+- **Installs** run 1.22–1.34× APFS.
+- **Warm imports** run 3.5× faster than APFS. An inference, not measured: the NFS client's attribute cache saves the
+  metadata work APFS repeats per file.
+
 **Requests slates receives**, counted by opcode at the bridge (deterministic):
 
 | | HEAD | Change |
