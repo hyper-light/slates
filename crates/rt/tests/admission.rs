@@ -11,7 +11,7 @@ use std::sync::mpsc::{Receiver, channel};
 use std::time::{Duration, Instant};
 
 use slates_rt::control::Control;
-use slates_rt::futures::{now_ns, sleep};
+use slates_rt::futures::sleep;
 use slates_rt::runtime::{Runtime, RuntimeConfig, submit_to_holder};
 use slates_rt::{Admission, AdmissionReceipt, RtError, ShardId, registry};
 
@@ -23,9 +23,6 @@ const WAIT: Duration = Duration::from_secs(10);
 /// Shape: a wait that must *not* be satisfied is watched this long — long enough that a task which
 /// was going to run has run.
 const QUIET: Duration = Duration::from_millis(200);
-/// Shape: how long a held shard spins, nanoseconds: long enough for the submissions made meanwhile
-/// to queue behind it, short enough for the test.
-const HOLD_NS: u64 = 300_000_000;
 /// Shape: a parked filler's hop between checks of its release flag, nanoseconds.
 const HOP_NS: u64 = 1_000_000;
 
@@ -46,13 +43,19 @@ fn config(tasks_per_shard: usize) -> RuntimeConfig {
   }
 }
 
-/// Holds `shard` inside one poll for [`HOLD_NS`] — a task that spins on the shard clock — and
-/// returns once the shard has admitted it, so everything submitted after this queues behind the hold.
-fn hold(rt: &Runtime, shard: ShardId) {
+/// Holds `shard` inside one poll until the returned sender sends (or is dropped, so a failed test never wedges the
+/// shard): a task that spins checking its release. Returns once the shard has admitted it, so everything submitted
+/// before the release queues behind the hold whatever the machine's speed. A fixed spin (300 ms until 2026-10-06)
+/// ended before the test's next submissions on CI's TSan lane, and the shard exited ahead of a request it was meant
+/// to drain.
+fn hold(rt: &Runtime, shard: ShardId) -> std::sync::mpsc::Sender<()> {
+  let (release, released) = channel::<()>();
   let receipt = rt
-    .spawn_on_with_receipt(shard, async {
-      let end = now_ns().saturating_add(HOLD_NS);
-      while now_ns() < end {
+    .spawn_on_with_receipt(shard, async move {
+      while matches!(
+        released.try_recv(),
+        Err(std::sync::mpsc::TryRecvError::Empty)
+      ) {
         std::hint::spin_loop();
       }
     })
@@ -61,6 +64,7 @@ fn hold(rt: &Runtime, shard: ShardId) {
     matches!(receipt.wait(WAIT), Some(Admission::Admitted(_))),
     "the hold is admitted"
   );
+  release
 }
 
 /// Submits a task that reports on a channel when it runs; the receipt and the report's receiver.
@@ -161,10 +165,11 @@ fn a_full_arena_refuses_on_the_receipt_and_admits_once_a_task_ends() {
 fn a_request_drained_during_shutdown_is_terminated_on_its_receipt() {
   let rt = Runtime::start(&config(ARENA)).unwrap();
   let shard = rt.shard_ids()[0];
-  hold(&rt, shard);
+  let release = hold(&rt, shard);
   // Queued behind the hold, in this order: the shutdown, then the request.
   registry::send_control(shard.0, Control::Shutdown).unwrap();
   let (receipt, ran) = submit_reporter(&rt, shard);
+  release.send(()).unwrap();
   let counters = rt.shutdown().unwrap();
   assert_eq!(receipt.wait(WAIT), Some(Admission::Terminated));
   assert!(
@@ -232,7 +237,7 @@ fn a_submission_pinned_to_a_holder_is_refused_once_its_slot_is_reused() {
 fn a_shutdown_lands_against_a_full_control_channel() {
   let rt = Runtime::start(&config(ARENA)).unwrap();
   let shard = rt.shard_ids()[0];
-  hold(&rt, shard);
+  let release = hold(&rt, shard);
   let mut queued = 0;
   loop {
     match rt.spawn_on(shard, async {}) {
@@ -242,6 +247,7 @@ fn a_shutdown_lands_against_a_full_control_channel() {
     }
   }
   assert!(queued >= 1, "the channel filled behind the hold");
+  release.send(()).unwrap();
   let (done_tx, done_rx) = channel();
   std::thread::spawn(move || {
     rt.shutdown().unwrap();
