@@ -2503,3 +2503,18 @@ timeline at nanosecond resolution is the next measurement.
 
 **Consequence beyond slates.** `hyper-rt`'s design (§3.2) routes every cross-thread wake through kick-only-if-parked,
 so this measurement is owed to its §12 rows: told to the focal session the same day.
+
+**Addendum, the same day: a Linux timeline at nanosecond resolution.** Each build was probed (a timestamped event per
+step, spin, park and send), and the probe's own overhead reversed the result: always-kick 2,458 ns, the candidate
+1,917 ns, against 1,958 and 2,375 ns unprobed. So the difference is a phase effect, not a fixed cost.
+- **The mechanism, from the timeline.** About 2,250 of 8,000 kicks reached a target that was mid-step. Each left a
+  pending event, so the target's next park returned at once: an extra, accidental poll of its inbox. A wake landing
+  in that poll needs no kernel wake. A wake landing after it needs the kernel's, which is about 10 µs on this loaded
+  macOS host.
+- **Why the extra poll matters at all.** In every run, both builds and both systems, the idle spin never hit (0 hits,
+  one miss per round trip). Its window is the 2-competitive spin-then-park threshold (spin for the expected cost of
+  parking; Karlin, Manasse, McGeoch and Owicki 1991), and that threshold took the startup profile's `wake.mean`
+  (1.7 µs on macOS), well below the wakes actually paid under load.
+- **What decides it next.** The daemon runs with the runtime's online wake estimate (`wake_tracking`), and
+  `rt_bench`'s ping-pong does not. Re-measure the kick rule with the estimate on, the daemon's own configuration,
+  before reopening it.
