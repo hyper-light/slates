@@ -39,6 +39,14 @@ pub const MAX_VISITS: u64 = crate::MAX_MESSAGE_BYTES / 14;
 /// Shape: the most bytes a query's answer may take when encoded: Claude Code's default limit on one MCP tool's
 /// output, 25,000 tokens (`MAX_MCP_OUTPUT_TOKENS`, research/mcp-skills-sdks.md §2.1.2), at four bytes a token.
 pub const MAX_OUTPUT_BYTES: usize = 25_000 * 4;
+/// The deepest a condition may nest (parentheses and `NOT`s), past which it is refused before the parse recurses
+/// further. A chain of `AND`s or `OR`s is one level at any length. A query runs on the MCP server's thread: the main
+/// thread over stdio (8 MiB), a runtime thread over HTTP (Rust's default 2 MiB, no size set). SQLite bounds the same
+/// hazard (`SQLITE_MAX_EXPR_DEPTH`, sqlite.org/limits.html) with its own frame size.
+/// Measured: on a 2 MiB thread a debug build parsed 400 levels and overflowed at 600, about 4 KiB a level, and a
+/// release build parsed 800 (2026-10-06, a scratch probe raising the depth on a 2 MiB thread); 200 keeps twice that
+/// headroom on the smallest stack, and `a_query_that_would_overflow_the_stack_is_answered_or_refused_typed` parses at it.
+pub const MAX_EXPR_DEPTH: usize = 200;
 
 /// What a query reads, through the client's verbs (a trait so the language is tested against an in-memory volume).
 pub trait Source {
@@ -238,8 +246,10 @@ enum Expr {
   Column(String),
   Literal(Cell),
   Not(Box<Expr>),
-  And(Box<Expr>, Box<Expr>),
-  Or(Box<Expr>, Box<Expr>),
+  /// Every term holds: a chain of any length is one level (a nested pair per term overflowed the stack at 20,000).
+  And(Vec<Expr>),
+  /// Some term holds.
+  Or(Vec<Expr>),
   Compare(Box<Expr>, Op, Box<Expr>),
 }
 
@@ -261,6 +271,8 @@ enum Op {
 struct Parser {
   tokens: Vec<Token>,
   at: usize,
+  /// How deeply the condition being parsed is nested (parentheses and `NOT`s), against [`MAX_EXPR_DEPTH`].
+  depth: usize,
 }
 
 impl Parser {
@@ -438,26 +450,49 @@ impl Parser {
   }
 
   fn or(&mut self) -> Result<Expr, QueryError> {
-    let mut left = self.and()?;
+    let mut terms = vec![self.and()?];
     while self.keyword("OR") {
-      left = Expr::Or(Box::new(left), Box::new(self.and()?));
+      terms.push(self.and()?);
     }
-    Ok(left)
+    Ok(if terms.len() == 1 {
+      terms.swap_remove(0)
+    } else {
+      Expr::Or(terms)
+    })
   }
 
   fn and(&mut self) -> Result<Expr, QueryError> {
-    let mut left = self.not()?;
+    let mut terms = vec![self.not()?];
     while self.keyword("AND") {
-      left = Expr::And(Box::new(left), Box::new(self.not()?));
+      terms.push(self.not()?);
     }
-    Ok(left)
+    Ok(if terms.len() == 1 {
+      terms.swap_remove(0)
+    } else {
+      Expr::And(terms)
+    })
   }
 
   fn not(&mut self) -> Result<Expr, QueryError> {
     if self.keyword("NOT") {
-      return Ok(Expr::Not(Box::new(self.not()?)));
+      self.deeper()?;
+      let inner = self.not();
+      self.depth = self.depth.saturating_sub(1);
+      return Ok(Expr::Not(Box::new(inner?)));
     }
     self.compare()
+  }
+
+  /// One level deeper into the condition, refused past [`MAX_EXPR_DEPTH`] before the recursion that would follow.
+  fn deeper(&mut self) -> Result<(), QueryError> {
+    self.depth = self.depth.saturating_add(1);
+    if self.depth > MAX_EXPR_DEPTH {
+      return Err(QueryError::Ceiling {
+        name: "expression depth",
+        limit: u64::try_from(MAX_EXPR_DEPTH).unwrap_or(u64::MAX),
+      });
+    }
+    Ok(())
   }
 
   fn compare(&mut self) -> Result<Expr, QueryError> {
@@ -493,7 +528,10 @@ impl Parser {
   fn operand(&mut self) -> Result<Expr, QueryError> {
     match self.next() {
       Some(Token::Symbol("(")) => {
-        let inner = self.or()?;
+        self.deeper()?;
+        let inner = self.or();
+        self.depth = self.depth.saturating_sub(1);
+        let inner = inner?;
         self.expect_symbol(")")?;
         Ok(inner)
       }
@@ -518,6 +556,7 @@ fn parse(text: &str) -> Result<Query, QueryError> {
   let mut parser = Parser {
     tokens: lex(text)?,
     at: 0,
+    depth: 0,
   };
   parser.query()
 }
@@ -723,7 +762,10 @@ fn check_columns(expr: &Expr, available: &[&str]) -> Result<(), QueryError> {
     }
     Expr::Column(_) | Expr::Literal(_) => Ok(()),
     Expr::Not(inner) => check_columns(inner, available),
-    Expr::And(a, b) | Expr::Or(a, b) | Expr::Compare(a, _, b) => {
+    Expr::And(terms) | Expr::Or(terms) => terms
+      .iter()
+      .try_for_each(|term| check_columns(term, available)),
+    Expr::Compare(a, _, b) => {
       check_columns(a, available)?;
       check_columns(b, available)
     }
@@ -764,12 +806,22 @@ fn eval(
     Expr::Column(column) => cell(column, candidate, work, source)?,
     Expr::Literal(value) => value.clone(),
     Expr::Not(inner) => Cell::Bool(!eval(inner, candidate, work, source)?.truthy()),
-    Expr::And(a, b) => Cell::Bool(
-      eval(a, candidate, work, source)?.truthy() && eval(b, candidate, work, source)?.truthy(),
-    ),
-    Expr::Or(a, b) => Cell::Bool(
-      eval(a, candidate, work, source)?.truthy() || eval(b, candidate, work, source)?.truthy(),
-    ),
+    Expr::And(terms) => {
+      for term in terms {
+        if !eval(term, candidate, work, source)?.truthy() {
+          return Ok(Cell::Bool(false));
+        }
+      }
+      Cell::Bool(true)
+    }
+    Expr::Or(terms) => {
+      for term in terms {
+        if eval(term, candidate, work, source)?.truthy() {
+          return Ok(Cell::Bool(true));
+        }
+      }
+      Cell::Bool(false)
+    }
     Expr::Compare(a, op, b) => {
       let (left, right) = (
         eval(a, candidate, work, source)?,
@@ -800,34 +852,58 @@ fn compare(left: &Cell, op: Op, right: &Cell) -> bool {
 fn glob(pattern: &str, path: &str) -> bool {
   let pattern: Vec<&str> = pattern.split('/').filter(|part| !part.is_empty()).collect();
   let path: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
-  glob_parts(&pattern, &path)
-}
-
-fn glob_parts(pattern: &[&str], path: &[&str]) -> bool {
-  match pattern.split_first() {
-    None => path.is_empty(),
-    Some((&"**", rest)) => {
-      (0..=path.len()).any(|skip| glob_parts(rest, path.get(skip..).unwrap_or_default()))
-    }
-    Some((first, rest)) => match path.split_first() {
-      Some((component, others)) => glob_component(first, component) && glob_parts(rest, others),
-      None => false,
+  wildcard(
+    &pattern,
+    &path,
+    |token| *token == "**",
+    |token, component| {
+      let token: Vec<char> = token.chars().collect();
+      let component: Vec<char> = component.chars().collect();
+      wildcard(&token, &component, |c| *c == '*', |a, b| a == b)
     },
-  }
+  )
 }
 
-fn glob_component(pattern: &str, text: &str) -> bool {
-  match pattern.split_once('*') {
-    None => pattern == text,
-    Some((head, tail)) => {
-      let Some(rest) = text.strip_prefix(head) else {
-        return false;
-      };
-      (0..=rest.len()).any(|skip| {
-        rest.is_char_boundary(skip) && glob_component(tail, rest.get(skip..).unwrap_or_default())
-      })
+/// Whether `items` matches `pattern`, where a token `is_star` stands for any run of items and every other token matches
+/// exactly one item by `matches`: the iterative matcher that backtracks only to the most recent star, O(pattern ×
+/// items) in the worst case and with no recursion (Kirk J. Krauss, "Matching Wildcards: An Empirical Way to Tame an
+/// Algorithm", Dr. Dobb's, 2014; the shape of glibc's `fnmatch` without bracket classes). Used twice: `*` within a path
+/// component, `**` across components. Before 2026-10-06 both levels recursed into every split, exponential in the
+/// stars: `*a` forty times then `*b` against a 200-character name held the MCP server for over a minute (an
+/// adversarial codemode session).
+fn wildcard<T, U>(
+  pattern: &[T],
+  items: &[U],
+  is_star: impl Fn(&T) -> bool,
+  matches: impl Fn(&T, &U) -> bool,
+) -> bool {
+  let (mut at_pattern, mut at_item) = (0usize, 0usize);
+  // The last star seen and the item it was matched against so far: on a mismatch, that star takes one more item.
+  let mut star: Option<(usize, usize)> = None;
+  while at_item < items.len() {
+    match (pattern.get(at_pattern), items.get(at_item)) {
+      (Some(token), _) if is_star(token) => {
+        star = Some((at_pattern, at_item));
+        at_pattern = at_pattern.saturating_add(1);
+      }
+      (Some(token), Some(item)) if matches(token, item) => {
+        at_pattern = at_pattern.saturating_add(1);
+        at_item = at_item.saturating_add(1);
+      }
+      _ => match star {
+        Some((star_at, star_item)) => {
+          let next = star_item.saturating_add(1);
+          star = Some((star_at, next));
+          at_pattern = star_at.saturating_add(1);
+          at_item = next;
+        }
+        None => return false,
+      },
     }
   }
+  pattern
+    .get(at_pattern..)
+    .is_some_and(|rest| rest.iter().all(is_star))
 }
 
 /// A volume named by its hex id, or by its name among the volumes.
@@ -1081,6 +1157,178 @@ mod tests {
       .iter()
       .map(|row| row.iter().map(Cell::text).collect())
       .collect()
+  }
+
+  /// The matcher [`glob`] replaced: recursion into every split, exponential in the stars. Kept as the oracle for the
+  /// small cases, where it is exact.
+  fn glob_reference(pattern: &str, path: &str) -> bool {
+    fn parts(pattern: &[&str], path: &[&str]) -> bool {
+      match pattern.split_first() {
+        None => path.is_empty(),
+        Some((&"**", rest)) => (0..=path.len()).any(|skip| parts(rest, &path[skip..])),
+        Some((first, rest)) => match path.split_first() {
+          Some((component, others)) => component_matches(first, component) && parts(rest, others),
+          None => false,
+        },
+      }
+    }
+    fn component_matches(pattern: &str, text: &str) -> bool {
+      match pattern.split_once('*') {
+        None => pattern == text,
+        Some((head, tail)) => text.strip_prefix(head).is_some_and(|rest| {
+          (0..=rest.len())
+            .any(|skip| rest.is_char_boundary(skip) && component_matches(tail, &rest[skip..]))
+        }),
+      }
+    }
+    let pattern: Vec<&str> = pattern.split('/').filter(|part| !part.is_empty()).collect();
+    let path: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
+    parts(&pattern, &path)
+  }
+
+  /// Every string over `alphabet` up to `length` characters.
+  fn strings(alphabet: &[char], length: usize) -> Vec<String> {
+    let mut all = vec![String::new()];
+    let mut frontier = vec![String::new()];
+    for _ in 0..length {
+      frontier = frontier
+        .iter()
+        .flat_map(|prefix| alphabet.iter().map(move |c| format!("{prefix}{c}")))
+        .collect();
+      all.extend(frontier.iter().cloned());
+    }
+    all
+  }
+
+  /// Every component pattern over `a`, `b`, `*` against every name over `a`, `b`, up to five characters.
+  fn assert_components_agree() {
+    for pattern in strings(&['a', 'b', '*'], 5) {
+      for name in strings(&['a', 'b'], 5) {
+        assert_eq!(
+          glob(&pattern, &name),
+          glob_reference(&pattern, &name),
+          "{pattern:?} on {name:?}"
+        );
+      }
+    }
+  }
+
+  /// Every path pattern of up to four components from `a`, `b`, `**`, `a*` against a fixed set of paths.
+  fn assert_paths_agree() {
+    let components = ["a", "b", "**", "a*"];
+    for length in 0..=4usize {
+      let patterns: Vec<String> = (0..components.len().pow(u32::try_from(length).unwrap()))
+        .map(|code| {
+          (0..length)
+            .map(|at| {
+              components
+                [(code / components.len().pow(u32::try_from(at).unwrap())) % components.len()]
+            })
+            .collect::<Vec<_>>()
+            .join("/")
+        })
+        .collect();
+      for pattern in &patterns {
+        for path in ["", "a", "b", "a/b", "a/a/b", "b/a/a/b", "aa/b/ab"] {
+          assert_eq!(
+            glob(pattern, path),
+            glob_reference(pattern, path),
+            "{pattern:?} on {path:?}"
+          );
+        }
+      }
+    }
+  }
+
+  /// §4.12 codemode, the glob matcher: do compare the iterative matcher with the recursive reference on every pattern
+  /// over `a`, `b`, `*` and every name over `a`, `b` up to five characters, and on `**` paths of up to four
+  /// components; then match the patterns that made the reference exponential. Expect: the same answer everywhere, and
+  /// the adversarial patterns answered at once (`*a` forty times then `*b` against a 200-character name held the MCP
+  /// server over a minute before 2026-10-06).
+  #[test]
+  fn the_glob_matcher_agrees_with_the_reference_and_has_no_exponential_case() {
+    assert_components_agree();
+    assert_paths_agree();
+    let long = "a".repeat(200);
+    assert!(!glob(&format!("{}*b", "*a".repeat(40)), &long));
+    assert!(!glob(
+      &format!("{}/**/b", "**/a".repeat(40)),
+      &vec!["a"; 60].join("/")
+    ));
+    assert!(glob(&format!("{}*", "*a".repeat(40)), &long));
+  }
+
+  /// §4.12 codemode, adversarially: a query is untrusted text, and a stack overflow is no panic the lint wall sees but an
+  /// abort of the whole server. Do: run a 20,000-term `OR` chain; then a condition nested one past
+  /// [`MAX_EXPR_DEPTH`] in parentheses, and one past it in `NOT`s. Expect: the chain is answered (both matching files);
+  /// each over-deep nesting is the typed `Ceiling` naming the expression depth. Before 2026-10-06 the chain built a
+  /// 20,000-deep tree whose evaluation overflowed the server's stack (`fatal runtime error: stack overflow, aborting`,
+  /// an adversarial MCP session), and nothing bounded nesting.
+  #[test]
+  fn a_query_that_would_overflow_the_stack_is_answered_or_refused_typed() {
+    let chain = vec![r#"path = "src/lib.rs""#; 20_000].join(" OR ");
+    let answer = run(
+      &mut tree(),
+      &format!(r#"FROM files("proj") WHERE {chain} OR path = "src/big.rs" SELECT path"#),
+    )
+    .unwrap();
+    assert_eq!(
+      answer.rows.len(),
+      2,
+      "a long chain is evaluated: {:?}",
+      rows(&answer)
+    );
+    let deep = MAX_EXPR_DEPTH + 1;
+    for nested in [
+      format!(r#"{}ext = "rs"{}"#, "(".repeat(deep), ")".repeat(deep)),
+      format!(r#"{}ext = "rs""#, "NOT ".repeat(deep)),
+    ] {
+      let refused = run(
+        &mut tree(),
+        &format!(r#"FROM files("proj") WHERE {nested}"#),
+      );
+      assert!(
+        matches!(
+          refused,
+          Err(QueryError::Ceiling {
+            name: "expression depth",
+            ..
+          })
+        ),
+        "{refused:?}"
+      );
+    }
+    at_the_ceiling_on_the_smallest_stack();
+  }
+
+  /// Rust's default stack for a spawned thread (`std::thread::Builder`), the smallest an MCP query runs on.
+  const SMALLEST_SERVER_STACK: usize = 2 << 20;
+
+  /// Parentheses and `NOT`s exactly [`MAX_EXPR_DEPTH`] deep are answered, not refused, on a thread with the smallest
+  /// stack an MCP server gives a query: the ceiling sits inside the stack it guards, in debug and release alike.
+  fn at_the_ceiling_on_the_smallest_stack() {
+    let answered = std::thread::Builder::new()
+      .stack_size(SMALLEST_SERVER_STACK)
+      .spawn(|| {
+        let depth = MAX_EXPR_DEPTH;
+        [
+          format!(r#"{}ext = "rs"{}"#, "(".repeat(depth), ")".repeat(depth)),
+          format!(r#"{}ext = "rs""#, "NOT ".repeat(depth)),
+        ]
+        .iter()
+        .map(|nested| {
+          run(
+            &mut tree(),
+            &format!(r#"FROM files("proj") WHERE {nested}"#),
+          )
+          .map(|answer| answer.rows.len())
+        })
+        .collect::<Vec<_>>()
+      })
+      .unwrap()
+      .join()
+      .unwrap();
+    assert!(answered.iter().all(Result::is_ok), "{answered:?}");
   }
 
   /// §4.12 codemode: do query the Rust files containing `unsafe`, by size, the largest first; expect exactly those
