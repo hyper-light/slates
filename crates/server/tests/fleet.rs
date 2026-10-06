@@ -6536,12 +6536,28 @@ fn a_takeover_completes_when_one_survivor_never_received_the_head() {
     .map(|daemon| Client::connect(daemon.instance()))
     .collect();
   let started = Instant::now();
+  // For each volume not yet served, what each survivor last answered for it: a failure names the volume and the
+  // replies (CI's Linux lane, 2026-10-06: one failure with every survivor's counters and no reply on record).
+  let mut unserved: std::collections::BTreeMap<VolumeId, Vec<String>> =
+    std::collections::BTreeMap::new();
   let served = poll_until(&survivors, SERVE_DEADLINE, || {
-    let all = volumes
-      .iter()
-      .all(|(id, _)| clients.iter_mut().any(|client| status_answers(client, *id)));
-    Ok(all || started.elapsed() >= SERVE_DEADLINE)
-  }) && started.elapsed() < SERVE_DEADLINE;
+    unserved.clear();
+    for (id, _) in &volumes {
+      let mut replies = Vec::new();
+      let answered = clients.iter_mut().any(|client| {
+        let reply = client.call(&RequestBody::Status { volume: *id });
+        let report = matches!(reply, ReplyBody::Status { .. });
+        if !report {
+          replies.push(format!("{reply:?}"));
+        }
+        report
+      });
+      if !answered {
+        unserved.insert(*id, replies);
+      }
+    }
+    Ok(unserved.is_empty() || started.elapsed() >= SERVE_DEADLINE)
+  }) && unserved.is_empty();
   drop(clients);
   let counters: Vec<_> = daemons.iter().map(Daemon::fleet_refusals).collect();
   for daemon in daemons {
@@ -6564,7 +6580,8 @@ fn a_takeover_completes_when_one_survivor_never_received_the_head() {
   );
   assert!(
     served,
-    "a survivor took every volume over and serves it within {SERVE_DEADLINE:?}: {counters:?}"
+    "a survivor took every volume over and serves it within {SERVE_DEADLINE:?}; unserved, each survivor's last \
+     reply: {unserved:?}; counters: {counters:?}"
   );
 }
 
