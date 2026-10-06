@@ -235,7 +235,7 @@ impl Answers {
 }
 
 fn count(counter: &'static str) {
-  state::with_state(|state| *state.refusals.entry(counter).or_insert(0) += 1);
+  state::with_state(|state| state.count(counter, 1));
 }
 
 /// Whether a round may wait one more poll for sessions still out: no once the liveness budget is spent, or

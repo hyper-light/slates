@@ -450,7 +450,7 @@ pub(crate) fn begin_round(
     return None;
   }
   let Some(first_epoch) = initial_epoch(state, &regional, departed, local) else {
-    *state.refusals.entry(TAKEOVER_EPOCH_EXHAUSTED).or_insert(0) += 1;
+    state.count(TAKEOVER_EPOCH_EXHAUSTED, 1);
     return None;
   };
   let take = state
@@ -463,7 +463,7 @@ pub(crate) fn begin_round(
   }
   if let Some(fence) = take.fenced {
     let Some(above) = fence.0.checked_add(1) else {
-      *state.refusals.entry(TAKEOVER_EPOCH_EXHAUSTED).or_insert(0) += 1;
+      state.count(TAKEOVER_EPOCH_EXHAUSTED, 1);
       return None;
     };
     let epoch = HostEpoch(above).max(take.epoch);

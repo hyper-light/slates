@@ -180,7 +180,7 @@ impl Cohort {
     for holder in self.holders.values() {
       if let Some(record) = holder.log.get(position) {
         let count = counts.entry(record.identity).or_insert(0);
-        *count += 1;
+        *count = count.saturating_add(1);
         if self.quorum.committed(*count) {
           return Some(record.identity);
         }
@@ -195,7 +195,8 @@ impl Cohort {
     let mut counts: BTreeMap<[u8; 32], usize> = BTreeMap::new();
     for holder in self.holders.values() {
       if let Some(record) = holder.log.get(position) {
-        *counts.entry(record.identity).or_insert(0) += 1;
+        let count = counts.entry(record.identity).or_insert(0);
+        *count = count.saturating_add(1);
       }
     }
     counts
@@ -212,7 +213,7 @@ impl Cohort {
     let mut position = 0usize;
     while let Some(identity) = self.committed_at(position) {
       prefix.push(identity);
-      position += 1;
+      position = position.saturating_add(1);
     }
     prefix
   }
@@ -307,7 +308,7 @@ impl Owner {
   /// its local log still grows, but nothing it writes is ever a quorum.
   pub fn propose(&mut self, cohort: &mut Cohort, identity: [u8; 32], reachable: &Reach) -> Commit {
     self.log.push(identity);
-    let position = (self.log.len() - 1) as u64;
+    let position = u64::try_from(self.log.len().saturating_sub(1)).unwrap_or(u64::MAX);
     let acked = cohort.offer(self.epoch, &self.log, reachable);
     let committed = cohort.quorum().committed(acked.len());
     Commit {
@@ -455,8 +456,9 @@ impl LedgerPromise {
 
   /// The canonical bytes: the header words, the log length, then each entry's epoch and identity.
   pub fn encode(&self) -> Vec<u8> {
-    let mut out =
-      Vec::with_capacity(LEDGER_PROMISE_PREFIX_BYTES + self.log.len() * LEDGER_ENTRY_BYTES);
+    let mut out = Vec::with_capacity(
+      LEDGER_PROMISE_PREFIX_BYTES.saturating_add(self.log.len().saturating_mul(LEDGER_ENTRY_BYTES)),
+    );
     out.extend_from_slice(&self.holder.0.to_le_bytes());
     out.extend_from_slice(&self.object.0);
     out.extend_from_slice(&self.epoch.0.to_le_bytes());

@@ -470,24 +470,7 @@ mod structural {
   /// The shipped crates the no-panic sweep has not reached yet (CLAUDE.md banned item 6; GAPS 2026-09-29).
   /// Every other shipped crate's root carries [`NO_PANIC_ATTRIBUTE`]. The list only shrinks: a crate on it
   /// that already carries the attribute fails too, so a crate leaves the list in the change that cleans it.
-  const NO_PANIC_PENDING: &[&str] = &[
-    "slates-bridge-core",
-    "slates-bridge-fskit",
-    "slates-bridge-fuse",
-    "slates-bridge-nfs",
-    "slates-bridge-virtiofs",
-    "slates-conformance",
-    "slates-db",
-    "slates-ipc",
-    "slates-machine",
-    "slates-mem",
-    "slates-merge",
-    "slates-rt",
-    "slates-server",
-    "slates-transport",
-    "slates-vfs",
-    "slates-wire-derive",
-  ];
+  const NO_PANIC_PENDING: &[&str] = &[];
 
   /// Format: the crate-root attribute of the no-panic law's last ratcheted part, whitespace removed: outside
   /// test builds, deny arithmetic that can overflow or divide by zero. Out-of-bounds indexing and slicing and

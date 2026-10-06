@@ -106,7 +106,9 @@ impl PageRequest {
       1 => 1,
       _ => 0,
     };
-    (budget / self.entry_floor().max(1))
+    budget
+      .checked_div(self.entry_floor())
+      .unwrap_or(0)
       .saturating_add(1)
       .saturating_add(dots)
   }
@@ -114,7 +116,9 @@ impl PageRequest {
 
 /// The least one READDIR entry encodes to under `requested` at minor version `minor` (the module doc).
 pub(crate) fn entry_floor(requested: &Bitmap, minor: u32) -> usize {
-  (size_of::<u32>() + size_of::<u64>() + 2 * size_of::<u32>())
+  size_of::<u32>()
+    .saturating_add(size_of::<u64>())
+    .saturating_add(size_of::<u32>().saturating_mul(2))
     .saturating_add(attr::encoded_floor((requested, minor)))
     .max(usize::try_from(ENTRY_FIXED).unwrap_or(usize::MAX))
 }

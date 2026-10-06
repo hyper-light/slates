@@ -274,7 +274,7 @@ impl SimHost {
 
   /// One seam call: counted, and the outsider edits armed for it applied first.
   fn tick(&mut self) {
-    self.calls += 1;
+    self.calls = self.calls.saturating_add(1);
     let now = self.calls;
     let due: Vec<Interference> = self
       .armed
@@ -355,7 +355,7 @@ impl SimHost {
       self.crashed = true;
       return Err(HostError::Unavailable(SIM_EIO));
     }
-    self.write_steps += 1;
+    self.write_steps = self.write_steps.saturating_add(1);
     Ok(())
   }
 
@@ -377,7 +377,7 @@ impl SimHost {
 
   /// Advances the simulated clock.
   pub fn advance_ns(&mut self, ns: i64) {
-    self.now_ns += ns;
+    self.now_ns = self.now_ns.saturating_add(ns);
   }
 
   /// The simulated clock, monotonic ns.
@@ -388,7 +388,7 @@ impl SimHost {
   /// The root directory, as the volume opens it.
   pub fn root(&mut self) -> HostDir {
     let h = self.next_handle;
-    self.next_handle += 1;
+    self.next_handle = self.next_handle.saturating_add(1);
     self.opens.insert(h, Open::Dir(Vec::new()));
     HostDir(h)
   }
@@ -419,7 +419,7 @@ impl SimHost {
 
   fn fresh(&mut self, kind: HostKind) -> SimNode {
     let ino = self.next_ino;
-    self.next_ino += 1;
+    self.next_ino = self.next_ino.saturating_add(1);
     SimNode {
       kind,
       ino,
@@ -515,7 +515,7 @@ impl SimHost {
   /// which is the racy case of T-1.11).
   pub fn write_in_place(&mut self, path: &str, bytes: &[u8], dt_ns: i64) {
     let parts = Self::split(path);
-    self.now_ns += dt_ns;
+    self.now_ns = self.now_ns.saturating_add(dt_ns);
     let now = self.now_ns;
     if let Some(n) = self.node_mut(&parts) {
       n.bytes = bytes.to_vec();
@@ -710,7 +710,7 @@ impl HostFs for SimHost {
       None => return Err(HostError::NotFound),
     }
     let h = self.next_handle;
-    self.next_handle += 1;
+    self.next_handle = self.next_handle.saturating_add(1);
     self.opens.insert(h, Open::Dir(parts));
     Ok(HostDir(h))
   }
@@ -725,7 +725,7 @@ impl HostFs for SimHost {
       None => return Err(HostError::NotFound),
     };
     let h = self.next_handle;
-    self.next_handle += 1;
+    self.next_handle = self.next_handle.saturating_add(1);
     self.opens.insert(
       h,
       Open::File {
@@ -875,7 +875,7 @@ impl LandFs for SimHost {
     let parts = self.dir_parts(dir)?;
     let node = self.fresh(HostKind::File);
     let h = self.next_handle;
-    self.next_handle += 1;
+    self.next_handle = self.next_handle.saturating_add(1);
     if self.unnamed_temporaries {
       self.opens.insert(h, Open::Temp { node, placed: None });
     } else {

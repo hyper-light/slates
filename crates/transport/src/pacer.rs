@@ -63,15 +63,19 @@ pub fn rate(bytes: u64, interval_ns: u64) -> u64 {
   if interval_ns == 0 {
     return 0;
   }
-  let scaled =
-    u128::from(bytes).saturating_mul(u128::from(NANOS_PER_SECOND)) / u128::from(interval_ns);
+  let scaled = u128::from(bytes)
+    .saturating_mul(u128::from(NANOS_PER_SECOND))
+    .checked_div(u128::from(interval_ns))
+    .unwrap_or(0);
   u64::try_from(scaled).unwrap_or(u64::MAX)
 }
 
 /// The bytes a `rate` (bytes per second) carries in `interval_ns`.
 pub fn volume(rate: u64, interval_ns: u64) -> u64 {
-  let scaled =
-    u128::from(rate).saturating_mul(u128::from(interval_ns)) / u128::from(NANOS_PER_SECOND);
+  let scaled = u128::from(rate)
+    .saturating_mul(u128::from(interval_ns))
+    .checked_div(u128::from(NANOS_PER_SECOND))
+    .unwrap_or(0);
   u64::try_from(scaled).unwrap_or(u64::MAX)
 }
 

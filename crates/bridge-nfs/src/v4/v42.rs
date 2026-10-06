@@ -155,7 +155,7 @@ struct Contents {
 impl Contents {
   /// Whether one more entry's fixed fields fit the reply.
   fn has_room(&self) -> bool {
-    self.writer.len() + CONTENT_ENTRY_BYTES < self.budget
+    self.writer.len().saturating_add(CONTENT_ENTRY_BYTES) < self.budget
   }
 
   /// The data bytes the next entry may carry within the reply.
@@ -163,7 +163,7 @@ impl Contents {
     u64::try_from(
       self
         .budget
-        .saturating_sub(self.writer.len() + CONTENT_ENTRY_BYTES),
+        .saturating_sub(self.writer.len().saturating_add(CONTENT_ENTRY_BYTES)),
     )
     .unwrap_or(0)
   }
@@ -185,8 +185,8 @@ async fn next_content<B: Backend>(
     // A hole from here to the next data (or the end), reported whole.
     contents.writer.u32(seek_what::HOLE);
     contents.writer.u64(at);
-    contents.writer.u64(data_at - at);
-    contents.entries += 1;
+    contents.writer.u64(data_at.saturating_sub(at));
+    contents.entries = contents.entries.saturating_add(1);
     contents.at = data_at;
     return Ok(true);
   }
@@ -211,7 +211,7 @@ async fn next_content<B: Backend>(
   contents.writer.u32(seek_what::DATA);
   contents.writer.u64(at);
   contents.writer.opaque(&data);
-  contents.entries += 1;
+  contents.entries = contents.entries.saturating_add(1);
   contents.at = at.saturating_add(u64::try_from(data.len()).unwrap_or(u64::MAX));
   Ok(true)
 }
@@ -304,24 +304,28 @@ async fn copy_range<B: Backend>(
   let mut copied = 0u64;
   let mut verifier = [0u8; v3call::VERF_SIZE];
   while copied < count {
-    let piece =
-      u32::try_from((count - copied).min(u64::from(MAX_TRANSFER))).unwrap_or(MAX_TRANSFER);
+    let piece = u32::try_from(count.saturating_sub(copied).min(u64::from(MAX_TRANSFER)))
+      .unwrap_or(MAX_TRANSFER);
+    // A range past the largest offset is the client's error (RFC 7862 §15.2.3, NFS4ERR_INVAL), never a
+    // wrapped offset.
+    let (Some(source_at), Some(destination_at)) = (
+      source_offset.checked_add(copied),
+      destination_offset.checked_add(copied),
+    ) else {
+      return Err(Nfsstat4::Inval);
+    };
     let step = copy_piece(
       backend,
       clientid,
-      (source, source_offset + copied, source_stateid),
-      (
-        destination,
-        destination_offset + copied,
-        destination_stateid,
-      ),
+      (source, source_at, source_stateid),
+      (destination, destination_at, destination_stateid),
       piece,
     )
     .await;
     match step {
       Ok((0, _)) => break,
       Ok((written, written_verifier)) => {
-        copied += u64::from(written);
+        copied = copied.saturating_add(u64::from(written));
         verifier = written_verifier;
       }
       Err(status) if copied == 0 => return Err(status),
@@ -417,7 +421,7 @@ const LISTXATTRS_FIXED_BYTES: usize = 8 + 4 + 4;
 /// An RFC 8276 key read from the wire, as the volume's attribute name `user.<key>`.
 fn user_name(reader: &mut XdrReader<'_>) -> Result<Vec<u8>, Nfsstat4> {
   let key = reader
-    .opaque(slates_vfs::xattr::XATTR_NAME_MAX_BYTES - USER_NAMESPACE.len())
+    .opaque(slates_vfs::xattr::XATTR_NAME_MAX_BYTES.saturating_sub(USER_NAMESPACE.len()))
     .map_err(|_| Nfsstat4::Nametoolong)?;
   if key.is_empty() {
     return Err(Nfsstat4::Inval);
@@ -529,12 +533,16 @@ async fn listxattrs<B: Backend>(
   for key in keys.iter().skip(start) {
     let mut one = XdrWriter::new();
     one.opaque(key);
-    if LISTXATTRS_FIXED_BYTES + names.len() + one.len() > maxcount {
+    if LISTXATTRS_FIXED_BYTES
+      .saturating_add(names.len())
+      .saturating_add(one.len())
+      > maxcount
+    {
       break;
     }
     names.fixed(one.as_slice());
-    returned += 1;
-    next += 1;
+    returned = returned.saturating_add(1);
+    next = next.saturating_add(1);
   }
   if returned == 0 && next < keys.len() {
     return Err(Nfsstat4::Toosmall);

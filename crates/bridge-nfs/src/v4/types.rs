@@ -61,7 +61,12 @@ impl Bitmap {
     self.0.iter().enumerate().flat_map(|(word, value)| {
       (0..u32::BITS)
         .filter(move |bit| value & (1 << bit) != 0)
-        .map(move |bit| u32::try_from(word).unwrap_or(0) * u32::BITS + bit)
+        .map(move |bit| {
+          u32::try_from(word)
+            .unwrap_or(0)
+            .saturating_mul(u32::BITS)
+            .saturating_add(bit)
+        })
     })
   }
 
@@ -94,7 +99,7 @@ impl Bitmap {
       .0
       .iter()
       .rposition(|word| *word != 0)
-      .map_or(0, |at| at + 1);
+      .map_or(0, |at| at.saturating_add(1));
     writer.u32(u32::try_from(used).unwrap_or(0));
     for word in self.0.iter().take(used) {
       writer.u32(*word);

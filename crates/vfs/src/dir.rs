@@ -183,7 +183,8 @@ impl Small {
   }
 
   fn fits(&self, name_len: usize) -> bool {
-    usize::from(self.count) < SMALL_ENTRIES && usize::from(self.used) + name_len <= SMALL_NAME_BYTES
+    usize::from(self.count) < SMALL_ENTRIES
+      && usize::from(self.used).saturating_add(name_len) <= SMALL_NAME_BYTES
   }
 
   /// Inserts at `at`, which `position` returned; every caller checked [`Small::fits`] first, so an entry that

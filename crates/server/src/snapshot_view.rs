@@ -124,13 +124,13 @@ pub(crate) fn close(state: &mut ShardState, view: SnapshotView) {
     metadata,
   } = view;
   if volume.discard_partial(&mut state.store).is_err() {
-    *state.refusals.entry(VIEW_RELEASE_REFUSED).or_insert(0) += 1;
+    state.count(VIEW_RELEASE_REFUSED, 1);
   }
   if let Some(&handle) = state.by_id.get(&origin)
     && let Ok(slot) = state.volumes.get_mut(handle)
     && slot.volume.unpin(snapshot).is_err()
   {
-    *state.refusals.entry(VIEW_RELEASE_REFUSED).or_insert(0) += 1;
+    state.count(VIEW_RELEASE_REFUSED, 1);
   }
   state.store.metadata.release(metadata);
 }
@@ -174,7 +174,7 @@ pub(crate) fn rebuild(state: &mut ShardState) -> usize {
     .filter(|record| presents_a_snapshot(record))
     .cloned()
     .collect();
-  let mut rebuilt = 0;
+  let mut rebuilt: usize = 0;
   for record in records {
     let Some(snapshot) = record.snapshot else {
       continue;
@@ -196,10 +196,10 @@ pub(crate) fn rebuild(state: &mut ShardState) -> usize {
     ) {
       Ok(view) => {
         state.snapshot_views.insert(record.id, view);
-        rebuilt += 1;
+        rebuilt = rebuilt.saturating_add(1);
       }
       Err(_) => {
-        *state.refusals.entry(VIEW_REBUILD_REFUSED).or_insert(0) += 1;
+        state.count(VIEW_REBUILD_REFUSED, 1);
         let _ = crate::verbs::end_attachment(state, &record, crate::verbs::Ending::Otherwise);
       }
     }

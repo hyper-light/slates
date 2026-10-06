@@ -272,7 +272,7 @@ impl ChunkArena {
   /// Adds a region under id `id` (A-98: a pool extent, whose id its blocks are named by). Refused
   /// [`MemError::RegionOccupied`] when the arena holds that id, or as [`ChunkArena::add_region`] refuses.
   pub fn add_region_at(&mut self, id: u16, region: Region) -> Result<(), MemError> {
-    let granules = region.len() / self.granule;
+    let granules = region.len().checked_div(self.granule).unwrap_or(0);
     if granules == 0 {
       return Err(MemError::TooLarge {
         len: region.len(),
@@ -282,7 +282,8 @@ impl ChunkArena {
     if self.slot(id).is_some() {
       return Err(MemError::RegionOccupied { region: id });
     }
-    let max_order = usize::BITS - 1 - granules.leading_zeros();
+    // `granules >= 1`, so it has a top bit: `ilog2` is its order.
+    let max_order = granules.ilog2();
     let slot = Slot {
       region,
       buddy: Buddy::new(self.granule, max_order)?,

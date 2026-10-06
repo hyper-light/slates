@@ -35,11 +35,12 @@ use crate::error::ServerError;
 /// of `len / unit`.
 pub(crate) fn arena_parts(len: usize, unit: usize) -> Vec<(usize, usize)> {
   let unit = unit.max(1);
-  let mut units = len / unit;
+  let mut units = len.checked_div(unit).unwrap_or(0);
   let mut at = 0usize;
   let mut parts = Vec::new();
   while units > 0 {
-    let top = 1usize << (usize::BITS - 1 - units.leading_zeros());
+    // `units >= 1` in the loop, so it has a top bit.
+    let top = 1usize.checked_shl(units.ilog2()).unwrap_or(0);
     let part = top.saturating_mul(unit);
     parts.push((at, part));
     at = at.saturating_add(part);
@@ -165,7 +166,12 @@ impl ContentPool {
   fn candidates(&self) -> impl Iterator<Item = u16> + use<> {
     let (partition, partitions, parts) = (self.partition, self.partitions, self.parts.len());
     (0..partitions)
-      .map(move |step| (partition.saturating_add(step)) % partitions)
+      .map(move |step| {
+        partition
+          .saturating_add(step)
+          .checked_rem(partitions)
+          .unwrap_or(0)
+      })
       .flat_map(move |slice| {
         (0..parts).filter_map(move |part| {
           u16::try_from(

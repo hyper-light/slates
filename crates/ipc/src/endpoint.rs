@@ -435,7 +435,7 @@ impl ClientEnd {
       return Ok(None);
     };
     self.next_reply = self.next_reply.wrapping_add(1);
-    self.replies += 1;
+    self.replies = self.replies.saturating_add(1);
     Ok(Some(Reply {
       request: slot.request,
       kind: slot.kind,
@@ -481,7 +481,7 @@ impl ClientEnd {
         self.region.client_parked()?.store(0, Ordering::Release);
         return Ok(reply);
       }
-      self.parks += 1;
+      self.parks = self.parks.saturating_add(1);
       let remaining = deadline_ns.map(|d| d.saturating_sub(elapsed_ns(started)));
       let waiting_ns = slates_machine::clock::monotonic_ns();
       #[cfg(windows)]
@@ -535,8 +535,8 @@ impl ClientEnd {
     self.unsettled = None;
     let sent_ns = stamp & !REPLY_STAMP_CONFIRMED;
     if waiting_ns <= sent_ns && sent_ns <= returned_ns {
-      self.wake.record(returned_ns - sent_ns);
-      self.wake_samples += 1;
+      self.wake.record(returned_ns.saturating_sub(sent_ns));
+      self.wake_samples = self.wake_samples.saturating_add(1);
     }
     Ok(())
   }
@@ -660,7 +660,7 @@ impl DaemonEnd {
       }
       #[cfg(windows)]
       let _ = stamped;
-      self.wakes += 1;
+      self.wakes = self.wakes.saturating_add(1);
       // Nudge the completion fd too, so an async SDK event loop polling it (D-19) wakes alongside a
       // futex-parked sync client. Both are under the same parked check, so a spinning client pays for
       // neither.

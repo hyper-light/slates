@@ -59,7 +59,7 @@ impl GuestRange {
 
   /// One past the last address (cannot overflow: proven at construction).
   pub const fn end(&self) -> u64 {
-    self.start.0 + self.len
+    self.start.0.saturating_add(self.len)
   }
 
   /// Whether the two ranges share a byte (empty ranges share none).

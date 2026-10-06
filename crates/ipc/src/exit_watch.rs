@@ -217,6 +217,7 @@ mod tests {
   #[cfg(target_os = "macos")]
   #[test]
   fn a_stopped_process_is_alive_and_a_killed_one_has_exited() {
+    let _gate = crate::descriptor_test_gate();
     let mut child = std::process::Command::new("/bin/sleep")
       .arg("30")
       .spawn()
@@ -238,6 +239,7 @@ mod tests {
   #[cfg(windows)]
   #[test]
   fn a_killed_process_has_exited() {
+    let _gate = crate::descriptor_test_gate();
     let mut child = std::process::Command::new("cmd")
       .args(["/C", "ping", "-n", "30", "127.0.0.1"])
       .spawn()

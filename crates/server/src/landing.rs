@@ -272,7 +272,7 @@ pub fn take_target_lease(
 ) -> Result<LandingLease, Refusal> {
   let now = state.clock.monotonic_ns();
   if now >= deadline_ns {
-    *state.refusals.entry(LEASE_TAKE_LATE).or_insert(0) += 1;
+    state.count(LEASE_TAKE_LATE, 1);
     return Err(Refusal::LandingLeaseLost);
   }
   release_expired_leases(state, now)?;
@@ -692,10 +692,7 @@ fn not_landed(
     // A grant approved for another consumer, volume, snapshot or target: the landing is not the one the
     // human approved, refused before any write and counted by the field that differed.
     LandingRefusal::Grant(GrantRefusal::Unbound { field }) => {
-      *state
-        .refusals
-        .entry(unbound_refusal_name(field))
-        .or_insert(0) += 1;
+      state.count(unbound_refusal_name(field), 1);
       refused(Refusal::GrantMismatch)
     }
     LandingRefusal::Grant(_) => refused(Refusal::GrantInvalid),
@@ -703,7 +700,7 @@ fn not_landed(
       reason: format!("{e:?}"),
     }),
     LandingRefusal::Volume(e) => {
-      *state.refusals.entry(LANDING_VOLUME_REFUSED).or_insert(0) += 1;
+      state.count(LANDING_VOLUME_REFUSED, 1);
       refused(refusal_of_vfs(&e))
     }
     // A run stepped after it ended: the server steps each run to its end once, so this names a defect of
@@ -802,7 +799,7 @@ fn defer_granted_landing(state: &mut ShardState, mut prepared: Prepared) -> Repl
       s.landing.running.remove(&volume);
       if !released {
         // Unreleased, the lease ends by its term; counted, never silent.
-        *s.refusals.entry(LEASE_UNRELEASED).or_insert(0) += 1;
+        s.count(LEASE_UNRELEASED, 1);
       }
       if let Some((reply, route)) = finished {
         deliver_landing(s, reply, route);
@@ -953,7 +950,7 @@ async fn recall_before_finish(granted: &mut GrantedRun, renew: LeaseAsk, key: &s
         return None;
       }
       crate::delegation::drain(s);
-      *s.refusals.entry(LANDING_HELD_FOR_RECALL).or_insert(0) += 1;
+      s.count(LANDING_HELD_FOR_RECALL, 1);
       Some((s.store.recall_gate.generation(), s.config.failover_slo_ns))
     })
     .flatten();
@@ -1032,7 +1029,7 @@ async fn keep_lease_alive(granted: &mut GrantedRun, ask: LeaseAsk, key: &str) {
     } else {
       LEASE_NOT_RENEWED
     };
-    *s.refusals.entry(counter).or_insert(0) += 1;
+    s.count(counter, 1);
   });
 }
 
@@ -1070,7 +1067,7 @@ fn begin_granted(
     Source::Head => match slot.volume.snapshot(&mut state.store) {
       Ok(id) => (Source::Snapshot(id), Some(id)),
       Err(e) => {
-        *state.refusals.entry(LANDING_SNAPSHOT_REFUSED).or_insert(0) += 1;
+        state.count(LANDING_SNAPSHOT_REFUSED, 1);
         return Begun::Refused(refused(refusal_of_vfs(&e)));
       }
     },
@@ -1222,7 +1219,8 @@ fn drop_implicit(
   if let Some(id) = implicit
     && slot.volume.destroy_snapshot(store, id).is_err()
   {
-    *counters.entry(IMPLICIT_SNAPSHOT_KEPT).or_insert(0) += 1;
+    let kept = counters.entry(IMPLICIT_SNAPSHOT_KEPT).or_insert(0);
+    *kept = kept.saturating_add(1);
   }
 }
 
@@ -1431,9 +1429,9 @@ async fn acquire_target_lease(ask: LeaseAsk, key: String) -> Result<LandingLease
   .await
   .is_some_and(|released| released.is_ok());
   crate::state::with_state(|s| {
-    *s.refusals.entry(LEASE_TAKE_UNANSWERED).or_insert(0) += 1;
+    s.count(LEASE_TAKE_UNANSWERED, 1);
     if !compensated {
-      *s.refusals.entry(LEASE_UNRELEASED).or_insert(0) += 1;
+      s.count(LEASE_UNRELEASED, 1);
     }
   });
   Err(Refusal::Overloaded { shard: control })
@@ -1500,10 +1498,7 @@ fn complete_landing_with(
       // Nothing of the landing's records is durable, as in `run_recorded`: counted, never recorded as the
       // completion, so a retry runs again.
       let refusal = crate::error::refusal_of_db(&e);
-      *state
-        .refusals
-        .entry(crate::verbs::refusal_name(&refusal))
-        .or_insert(0) += 1;
+      state.count(crate::verbs::refusal_name(&refusal), 1);
       crate::verbs::reconcile_unpublished_effects(state);
       refused(refusal)
     }
@@ -1536,7 +1531,7 @@ fn deliver_landing(
   .is_err()
   {
     // The client's retry answers from the completion record.
-    *state.refusals.entry(LANDING_UNDELIVERED).or_insert(0) += 1;
+    state.count(LANDING_UNDELIVERED, 1);
   }
 }
 
@@ -1826,14 +1821,14 @@ fn publish_landed(
   ) {
     match crate::verbs::publish_shard(state) {
       Ok(published) if !published.captured(ids.volume) => {
-        *state.refusals.entry(LANDING_PUBLISH_REFUSED).or_insert(0) += 1;
+        state.count(LANDING_PUBLISH_REFUSED, 1);
         return Some(refused(crate::error::refusal_of_vfs(
           &slates_vfs::VfsError::RecoveryIncomplete,
         )));
       }
       Ok(_) => {}
       Err(error) => {
-        *state.refusals.entry(LANDING_PUBLISH_REFUSED).or_insert(0) += 1;
+        state.count(LANDING_PUBLISH_REFUSED, 1);
         return Some(refused(crate::error::refusal_of_vfs(&error)));
       }
     }
@@ -1952,7 +1947,7 @@ pub fn grant_verb(
   };
   let expected = grant_proof(&state.issuer_secret, landing_id, &manifest, scope, term_ns);
   if !constant_time_eq(&expected, &proof) {
-    *state.refusals.entry("grant_issuer_unverified").or_insert(0) += 1;
+    state.count("grant_issuer_unverified", 1);
     return crate::verbs::refused(Refusal::GrantIssuerUnverified);
   }
   if awaiting.manifest != manifest {

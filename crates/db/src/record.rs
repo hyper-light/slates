@@ -122,7 +122,7 @@ impl LogRing {
   ) -> Result<u64, DbError> {
     let w = self.words(segment)?;
     let body = entry.to_bytes();
-    let total = u64::try_from(RECORD_HEADER + body.len()).unwrap_or(u64::MAX);
+    let total = u64::try_from(RECORD_HEADER.saturating_add(body.len())).unwrap_or(u64::MAX);
     let free = w.capacity.saturating_sub(w.tail.saturating_sub(w.head));
     if total > free {
       return Err(DbError::LogFull {
@@ -295,7 +295,11 @@ impl LogRing {
 }
 
 fn checksum(seq: u64, schema: u64, body: &[u8]) -> u32 {
-  let mut covered = Vec::with_capacity(body.len() + size_of::<u64>() * 2);
+  let mut covered = Vec::with_capacity(
+    body
+      .len()
+      .saturating_add(size_of::<u64>().saturating_mul(2)),
+  );
   covered.extend_from_slice(&seq.to_le_bytes());
   covered.extend_from_slice(&schema.to_le_bytes());
   covered.extend_from_slice(body);
@@ -303,7 +307,7 @@ fn checksum(seq: u64, schema: u64, body: &[u8]) -> u32 {
 }
 
 fn position(capacity: u64, offset: u64) -> usize {
-  usize::try_from(offset % capacity.max(1)).unwrap_or(0)
+  usize::try_from(offset.checked_rem(capacity).unwrap_or(0)).unwrap_or(0)
 }
 
 impl LogRing {

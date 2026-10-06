@@ -60,7 +60,7 @@ pub fn timer_overhead_ns() -> u64 {
     last = Instant::now();
   }
   let total = last.saturating_duration_since(start);
-  nanos(total) / u64::from(READS)
+  nanos(total).checked_div(u64::from(READS)).unwrap_or(0)
 }
 
 /// Nanoseconds in a duration, saturating at `u64::MAX` (no narrowing cast).
@@ -84,17 +84,17 @@ pub fn measure<F: FnMut()>(mut op: F, budget: Duration) -> Measurement {
       op();
     }
     let elapsed = nanos(t.elapsed());
-    if elapsed < floor && batch < u32::MAX / 2 {
-      batch *= 2;
+    if elapsed < floor && batch < u32::MAX >> 1 {
+      batch = batch.saturating_mul(2);
       continue;
     }
     if elapsed < floor {
       // The operation is unmeasurable at any batch (it was optimized away or costs nothing);
       // report what was seen, marked quick, rather than a converged zero.
-      sample.push(elapsed / u64::from(batch));
+      sample.push(elapsed.checked_div(u64::from(batch)).unwrap_or(elapsed));
       break;
     }
-    sample.push(elapsed / u64::from(batch));
+    sample.push(elapsed.checked_div(u64::from(batch)).unwrap_or(elapsed));
     if sample.len() >= MIN_SAMPLES
       && let Some(interval) = bootstrap_interval(&sample, &mut rng)
       && converged(&interval)
@@ -132,7 +132,10 @@ pub fn bytes_per_second(bytes: u64, elapsed_ns: u64) -> u64 {
   }
   /// Format: nanoseconds per second.
   const NANOS_PER_SECOND: u128 = 1_000_000_000;
-  let bps = u128::from(bytes) * NANOS_PER_SECOND / u128::from(elapsed_ns);
+  let bps = u128::from(bytes)
+    .saturating_mul(NANOS_PER_SECOND)
+    .checked_div(u128::from(elapsed_ns))
+    .unwrap_or(u128::MAX);
   u64::try_from(bps).unwrap_or(u64::MAX)
 }
 

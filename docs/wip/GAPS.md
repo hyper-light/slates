@@ -2759,10 +2759,37 @@ Open, owed in this workstream:
 
 - **Scheduler bake-off.** Pick the winner and delete the loser selector.
 - **Congestion grid re-run.** Re-run on this code, with a per-run virtual deadline added to the harness first.
-- **No-panic sweep: arithmetic.** The indexing, slicing and string-slice half is done and enforced (below,
-  2026-10-06). Still owed: 896 arithmetic operations that can overflow, in the 16 crates on `NO_PANIC_PENDING`
-  (clippy `arithmetic_side_effects` on macOS, 2026-10-06). In release these wrap rather than panic, which is a
-  wrong answer rather than an abort.
+- **No-panic sweep: arithmetic. Closed 2026-10-06.** Every shipped crate's root now denies
+  `arithmetic_side_effects` outside test builds, and `NO_PANIC_PENDING` is empty. The sites were measured with clippy
+  `arithmetic_side_effects` on macOS: 896, and 716 after the indexing sweep.
+  - **Sizes, counters and cursors** saturate.
+  - **Divisions and remainders** are `checked_*` with a stated fallback.
+  - **Values from the wire** are `checked_*` with a typed refusal:
+    - AppleDouble entry offsets;
+    - DNS fields;
+    - NFSv4.2 COPY offsets (`NFS4ERR_INVAL`);
+    - the year in a trace's RFC 3339 date.
+  - **Id counters that must never repeat** refuse when exhausted rather than wrap:
+    - an NFSv4 open state id refuses with `NFS4ERR_SERVERFAULT`;
+    - a delegation id is simply not offered.
+  - **Three formulas keep the published algorithm verbatim** under a local `allow` with an overflow proof:
+    - RFC 9000 Appendix A.3 packet-number decoding;
+    - Hinnant's `civil_from_days`;
+    - two compound sizes evaluated only in `const` items.
+  - Linted on macOS, on Linux in Docker and on Windows through `cargo xwin`. Each OS found sites the others could
+    not.
+  - Refusal counting goes through one method, `ShardState::count`: 122 hand-written `+=` sites became that call.
+  - Found on the way, on Windows: `Commits::commit`, which commits a shared section lazily, would have formed a
+    pointer past the view, and an underflowed length, for a run starting at or past the view's end. It now refuses
+    `TooLarge`. Callers pass ranges inside the view, so this was latent.
+- **Apple's pipe close-on-exec window.** macOS has no `pipe2`, so a delivery pipe becomes close-on-exec only through
+  the `fcntl` after `pipe`. A child that another thread spawns inside that window inherits the pipe's read end.
+  - `delivery`'s own docs bind a harness not to spawn from another thread while it prepares a delivery.
+  - The ipc test binary broke that rule. `exit_watch` spawns `/bin/sleep 30` beside the descriptor tests, and
+    `a_whole_record_takes_once_and_the_descriptor_is_closed` failed 2 of 80 runs (0 of 80 with `exit_watch`
+    skipped). Those tests are now serialized by a test-only gate: 0 of 80.
+  - Closing the window for every spawner in a process needs every spawn to use `POSIX_SPAWN_CLOEXEC_DEFAULT`, or one
+    owner of both pipe creation and spawning. Owed.
 
 Whole-workspace verification (2026-09-28): all 175 test binaries run directly, each under a timeout. Before
 the fixes below, 173 passed and 2 failed; both failed only outside `cargo test`, and both are fixed rather

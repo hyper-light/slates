@@ -52,7 +52,7 @@ fn copy_base(base: &[Extent], from: u64, to: u64, out: &mut Vec<Extent>) {
   let mut logical = 0u64;
   for extent in base {
     let start = logical;
-    let end = logical + extent.len;
+    let end = logical.saturating_add(extent.len);
     logical = end;
     if end <= from || start >= to {
       continue;
@@ -61,8 +61,8 @@ fn copy_base(base: &[Extent], from: u64, to: u64, out: &mut Vec<Extent>) {
     let slice_end = to.min(end);
     out.push(Extent {
       source: extent.source,
-      at: extent.at + (slice_start - start),
-      len: slice_end - slice_start,
+      at: extent.at.saturating_add(slice_start.saturating_sub(start)),
+      len: slice_end.saturating_sub(slice_start),
     });
   }
 }

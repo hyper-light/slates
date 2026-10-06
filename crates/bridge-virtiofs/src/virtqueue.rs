@@ -99,9 +99,11 @@ impl Ring {
   const fn len(self, size: u16) -> u64 {
     let size = size as u64;
     match self {
-      Ring::DescriptorTable => size * DESCRIPTOR_LEN,
-      Ring::AvailableRing => AVAILABLE_RING_FIXED_LEN + size * AVAILABLE_ENTRY_LEN,
-      Ring::UsedRing => USED_RING_FIXED_LEN + size * USED_ELEMENT_LEN,
+      Ring::DescriptorTable => size.saturating_mul(DESCRIPTOR_LEN),
+      Ring::AvailableRing => {
+        AVAILABLE_RING_FIXED_LEN.saturating_add(size.saturating_mul(AVAILABLE_ENTRY_LEN))
+      }
+      Ring::UsedRing => USED_RING_FIXED_LEN.saturating_add(size.saturating_mul(USED_ELEMENT_LEN)),
     }
   }
 }
@@ -565,10 +567,10 @@ impl Virtqueue {
         size: self.layout.size,
       }));
     }
-    let slot = u64::from(self.next_avail % self.layout.size);
+    let slot = u64::from(self.next_avail.checked_rem(self.layout.size).unwrap_or(0));
     let entry = self.ring_field(
       Ring::AvailableRing,
-      AVAILABLE_RING_OFFSET + slot * AVAILABLE_ENTRY_LEN,
+      AVAILABLE_RING_OFFSET.saturating_add(slot.saturating_mul(AVAILABLE_ENTRY_LEN)),
     );
     let head = read_u16(memory, entry)?;
     if head >= self.layout.size {
@@ -605,8 +607,11 @@ impl Virtqueue {
         writable: chain.writable_bytes,
       });
     }
-    let slot = u64::from(self.next_used % self.layout.size);
-    let element = self.ring_field(Ring::UsedRing, USED_RING_OFFSET + slot * USED_ELEMENT_LEN);
+    let slot = u64::from(self.next_used.checked_rem(self.layout.size).unwrap_or(0));
+    let element = self.ring_field(
+      Ring::UsedRing,
+      USED_RING_OFFSET.saturating_add(slot.saturating_mul(USED_ELEMENT_LEN)),
+    );
     let mut bytes = [0u8; USED_ELEMENT_BYTES];
     let (id, len) = bytes.split_at_mut(size_of::<u32>());
     id.copy_from_slice(&u32::from(chain.head).to_le_bytes());
@@ -632,9 +637,9 @@ impl Virtqueue {
   }
 
   /// The address of a field at `offset` inside `ring` (inside the validated ring, so it cannot
-  /// overflow).
+  /// overflow; were it to, the saturated address lies outside guest memory and the read is refused).
   fn ring_field(&self, ring: Ring, offset: u64) -> GuestAddr {
-    GuestAddr(self.layout.base(ring).0 + offset)
+    GuestAddr(self.layout.base(ring).0.saturating_add(offset))
   }
 
   /// Walks the chain from `head`, validating each descriptor before the next is followed.
@@ -701,11 +706,15 @@ impl Virtqueue {
     index: u16,
   ) -> Result<Descriptor, VirtqueueError> {
     // Inside the validated table, so the field addresses cannot overflow.
-    let at = self.ring_field(Ring::DescriptorTable, u64::from(index) * DESCRIPTOR_LEN);
+    let at = self.ring_field(
+      Ring::DescriptorTable,
+      u64::from(index).saturating_mul(DESCRIPTOR_LEN),
+    );
+    let field = |offset: u64| GuestAddr(at.0.saturating_add(offset));
     let addr = read_u64(memory, at)?;
-    let len = read_u32(memory, GuestAddr(at.0 + DESCRIPTOR_LEN_OFFSET))?;
-    let flags = read_u16(memory, GuestAddr(at.0 + DESCRIPTOR_FLAGS_OFFSET))?;
-    let next = read_u16(memory, GuestAddr(at.0 + DESCRIPTOR_NEXT_OFFSET))?;
+    let len = read_u32(memory, field(DESCRIPTOR_LEN_OFFSET))?;
+    let flags = read_u16(memory, field(DESCRIPTOR_FLAGS_OFFSET))?;
+    let next = read_u16(memory, field(DESCRIPTOR_NEXT_OFFSET))?;
     Ok(Descriptor {
       addr,
       len,

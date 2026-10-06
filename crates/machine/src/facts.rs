@@ -142,8 +142,8 @@ impl CpuBudget {
   // Only the Linux cgroup walk and the tests call it; the other platforms keep it compiled.
   #[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
   fn tighter(self, other: CpuBudget) -> CpuBudget {
-    let mine = u128::from(self.quota_us) * u128::from(other.period_us);
-    let theirs = u128::from(other.quota_us) * u128::from(self.period_us);
+    let mine = u128::from(self.quota_us).saturating_mul(u128::from(other.period_us));
+    let theirs = u128::from(other.quota_us).saturating_mul(u128::from(self.period_us));
     if theirs < mine { other } else { self }
   }
 }
@@ -1128,7 +1128,7 @@ mod platform {
     if len == 0 || entry == 0 {
       return Vec::new();
     }
-    let count = usize::try_from(len / entry).unwrap_or(0);
+    let count = usize::try_from(len.checked_div(entry).unwrap_or(0)).unwrap_or(0);
     let mut out: Vec<SYSTEM_LOGICAL_PROCESSOR_INFORMATION> = Vec::with_capacity(count);
     // SAFETY: the buffer holds `count` entries of `len` bytes total; on success the call filled
     // `len` bytes, so `count` entries are initialized.
@@ -1137,7 +1137,13 @@ mod platform {
       return Vec::new();
     }
     // SAFETY: see above; `len / entry` entries were written.
-    unsafe { out.set_len(usize::try_from(len / entry).unwrap_or(0)) };
+    unsafe {
+      out.set_len(
+        usize::try_from(len.checked_div(entry).unwrap_or(0))
+          .unwrap_or(0)
+          .min(count),
+      )
+    };
     out
   }
 

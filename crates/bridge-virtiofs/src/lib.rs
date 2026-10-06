@@ -47,6 +47,11 @@
 //! shard over `slates-rt`, woken by the doorbell descriptor, revoked by message, ending in the
 //! terminal step).
 
+// The no-panic law (CLAUDE.md, banned item 6): shipped code never overflows or divides by zero. Test builds
+// are exempt. Once a crate is clean this holds it there; out-of-bounds indexing and slicing are denied
+// workspace-wide.
+#![cfg_attr(not(test), deny(clippy::arithmetic_side_effects))]
+
 pub mod admission;
 pub mod capability;
 pub mod credit;

@@ -117,12 +117,12 @@ impl Quota {
         if total <= *granted {
           return true;
         }
-        let needed = total - *granted;
+        let needed = total.saturating_sub(*granted);
         if source.may_grow(needed, budget) {
           *granted = total;
           true
         } else {
-          *denied += 1;
+          *denied = denied.saturating_add(1);
           false
         }
       }

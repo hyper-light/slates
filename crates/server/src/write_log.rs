@@ -166,7 +166,10 @@ impl WriteLog {
     let offset = word(object, base.checked_add(size_of::<u64>())?)?;
     let mut length = [0u8; size_of::<u32>()];
     object
-      .read(base.checked_add(2 * size_of::<u64>())?, &mut length)
+      .read(
+        base.checked_add(size_of::<u64>().checked_mul(2)?)?,
+        &mut length,
+      )
       .ok()?;
     let length = usize::try_from(u32::from_le_bytes(length)).ok()?;
     let next = cursor.checked_add(RECORD_HEAD)?.checked_add(length)?;

@@ -21,6 +21,11 @@
 //! (this crate is the message codec, not the ring), and the Swift `FSVolume` shim (with the
 //! `Slates.app` bundle, the FSKit entitlement, and the mount spike).
 
+// The no-panic law (CLAUDE.md, banned item 6): shipped code never overflows or divides by zero. Test builds
+// are exempt. Once a crate is clean this holds it there; out-of-bounds indexing and slicing are denied
+// workspace-wide.
+#![cfg_attr(not(test), deny(clippy::arithmetic_side_effects))]
+
 // The daemon's per-mount serve session (§4.6): holds the open-handle map across requests and serves
 // shim requests against a shard's volume through a transient bridge.
 pub mod mount;

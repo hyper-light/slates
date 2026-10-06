@@ -55,16 +55,16 @@ pub(crate) fn drain(s: &mut ShardState) {
     sends.extend(files.recall_inode(inode, actor, now).send);
   }
   for _ in &lapsed {
-    *s.refusals.entry(REVOKED_LAPSED).or_insert(0) += 1;
+    s.count(REVOKED_LAPSED, 1);
   }
   for recall in sends {
     match recall_target(s, recall.clientid) {
       Some((sessionid, next)) => {
-        *s.refusals.entry(RECALL_SENT).or_insert(0) += 1;
+        s.count(RECALL_SENT, 1);
         spawn_recall(sessionid, next, recall);
       }
       None => {
-        *s.refusals.entry(REVOKED_UNREACHABLE).or_insert(0) += 1;
+        s.count(REVOKED_UNREACHABLE, 1);
         if let Some(files) = s.nfs_v4_files.as_mut() {
           files.revoke_delegation(&recall.stateid.other);
         }
@@ -115,7 +115,7 @@ fn spawn_recall(
       } else {
         RECALL_UNANSWERED
       };
-      *s.refusals.entry(counter).or_insert(0) += 1;
+      s.count(counter, 1);
     });
   });
   match task {
@@ -123,7 +123,7 @@ fn spawn_recall(
       let _ = futures::detach(task);
     }
     Err(_) => {
-      let _ = state::with_state(|s| *s.refusals.entry(RECALL_UNANSWERED).or_insert(0) += 1);
+      let _ = state::with_state(|s| s.count(RECALL_UNANSWERED, 1));
     }
   }
 }

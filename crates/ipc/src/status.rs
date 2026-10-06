@@ -25,7 +25,9 @@ pub fn snapshot_capacity(region: &ClientRegion) -> usize {
 
 /// What a page holds past its framing and cursor, derived using the actual wire encoder.
 pub fn page_capacity(region: &ClientRegion) -> usize {
-  let chunk = snapshot_capacity(region) / region.cmd().slots().max(1);
+  let chunk = snapshot_capacity(region)
+    .checked_div(region.cmd().slots())
+    .unwrap_or(0);
   let header = encode_body(&ReplyBody::DaemonStatusPage {
     snapshot: 0,
     offset: 0,

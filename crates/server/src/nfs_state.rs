@@ -37,7 +37,7 @@ fn commit(s: &mut ShardState, ops: &[Op]) -> bool {
   if applied && committed {
     return true;
   }
-  *s.refusals.entry(RECORD_REFUSED).or_insert(0) += 1;
+  s.count(RECORD_REFUSED, 1);
   false
 }
 
@@ -62,8 +62,10 @@ pub(crate) fn record_files(s: &mut ShardState) -> bool {
     .filter(|change| matches!(change, FileChange::DelegationSet(_)))
     .count();
   if granted > 0 {
-    *s.refusals.entry(DELEGATIONS_GRANTED).or_insert(0) +=
-      u64::try_from(granted).unwrap_or(u64::MAX);
+    s.count(
+      DELEGATIONS_GRANTED,
+      u64::try_from(granted).unwrap_or(u64::MAX),
+    );
   }
   let ops: Vec<Op> = changes.into_iter().map(file_op).collect();
   if commit(s, &ops) {

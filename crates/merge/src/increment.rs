@@ -452,7 +452,7 @@ fn materialize_base(entities: &mut Vec<Entity>, base: &Base, path: &str) -> Opti
     final_path: path.to_owned(),
     clobbered: false,
   });
-  Some(entities.len() - 1)
+  entities.len().checked_sub(1)
 }
 
 /// Applies one operation to the entity set.

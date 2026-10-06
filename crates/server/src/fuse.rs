@@ -223,7 +223,7 @@ pub(crate) fn defer_attach(state: &mut ShardState, pending: PendingAttach) -> Re
       let reply = complete(s, request, cause, attachment, |s| match mounted {
         Ok(mount) => established(s, pending, mount),
         Err(MountError::AllowOtherNotGranted) => {
-          *s.refusals.entry(MOUNT_REFUSED).or_insert(0) += 1;
+          s.count(MOUNT_REFUSED, 1);
           release_unmounted_lease(s, &pending.record);
           crate::verbs::refused(Refusal::AttachmentUnsupported {
             transport: slates_ipc::protocol::AttachTransport::Fuse,
@@ -231,7 +231,7 @@ pub(crate) fn defer_attach(state: &mut ShardState, pending: PendingAttach) -> Re
           })
         }
         Err(error) => {
-          *s.refusals.entry(MOUNT_REFUSED).or_insert(0) += 1;
+          s.count(MOUNT_REFUSED, 1);
           release_unmounted_lease(s, &pending.record);
           crate::verbs::refused(Refusal::TargetUnavailable {
             reason: format!("the FUSE mount at {mount_point} was refused: {error}"),
@@ -268,9 +268,7 @@ fn complete(
     Ok(_) => recorded,
     Err(e) => {
       let refusal = crate::error::refusal_of_db(&e);
-      *s.refusals
-        .entry(crate::verbs::refusal_name(&refusal))
-        .or_insert(0) += 1;
+      s.count(crate::verbs::refusal_name(&refusal), 1);
       crate::verbs::reconcile_unpublished_effects(s);
       if let Some(mount) = s.fuse_mounts.get(&attachment) {
         unmount_owned(&mount.mount_point);
@@ -301,7 +299,7 @@ fn deliver(s: &mut ShardState, reply: ReplyBody, route: Option<crate::merge_serv
   )
   .is_err()
   {
-    *s.refusals.entry(REPLY_UNDELIVERED).or_insert(0) += 1;
+    s.count(REPLY_UNDELIVERED, 1);
   }
 }
 
@@ -361,7 +359,7 @@ fn established(s: &mut ShardState, pending: PendingAttach, mount: Mount) -> Repl
     crate::fuse_hold::hold(attachment, std::os::fd::AsFd::as_fd(&channel.device())),
     Some(Err(_))
   ) {
-    *s.refusals.entry(HOLD_REFUSED).or_insert(0) += 1;
+    s.count(HOLD_REFUSED, 1);
   }
   let now = s.clock.monotonic_ns();
   let op = Op::AttachmentAdded {
@@ -567,7 +565,7 @@ fn turn(s: &mut ShardState, attachment: u64) -> Turned {
     }
     Err(_) => {
       // Ended without an unmount: the mount answers `ENOTCONN` until its user unmounts it (see `turn`).
-      *s.refusals.entry(SERVE_FAILED).or_insert(0) += 1;
+      s.count(SERVE_FAILED, 1);
       return Turned::Ended;
     }
   };
@@ -604,7 +602,7 @@ fn reply(
       .as_ref()
       .is_some_and(crate::write_log::WriteLog::holds_every_write);
   if flush_logged {
-    *s.refusals.entry(FLUSH_LOGGED).or_insert(0) += 1;
+    s.count(FLUSH_LOGGED, 1);
   }
   let refuse = if dispatched.needs_barrier() && !flush_logged {
     // The reply rides the publication with its effect (A-61), so a daemon that dies before writing it leaves its
@@ -622,7 +620,7 @@ fn reply(
     if captured {
       None
     } else {
-      *s.refusals.entry(BARRIER_REFUSED).or_insert(0) += 1;
+      s.count(BARRIER_REFUSED, 1);
       Some(EIO)
     }
   } else {
@@ -643,7 +641,7 @@ fn reply(
   match sent {
     Ok(Sent::Delivered) => Turned::Served,
     Ok(Sent::Unmatched) => {
-      *s.refusals.entry(REPLY_UNMATCHED).or_insert(0) += 1;
+      s.count(REPLY_UNMATCHED, 1);
       if refuse.is_none() {
         reclaim(s, mount, dispatched);
       }
@@ -651,7 +649,7 @@ fn reply(
     }
     Err(_) => {
       // Ended without an unmount: the mount answers `ENOTCONN` until its user unmounts it (see `turn`).
-      *s.refusals.entry(SERVE_FAILED).or_insert(0) += 1;
+      s.count(SERVE_FAILED, 1);
       Turned::Ended
     }
   }
@@ -736,7 +734,7 @@ fn redeliver(s: &mut ShardState, mount: &mut FuseMount, dispatched: &Dispatched)
 /// A serve task that cannot wait on its device: its attachment ended and its device dropped, the mount left for its
 /// user to unmount (it answers `ENOTCONN` until then; see `turn`).
 fn fail(s: &mut ShardState, attachment: u64) {
-  *s.refusals.entry(SERVE_FAILED).or_insert(0) += 1;
+  s.count(SERVE_FAILED, 1);
   ended(s, attachment);
 }
 
@@ -766,9 +764,7 @@ fn log_write(s: &mut ShardState, dispatched: &Dispatched) {
     Err(crate::write_log::Refused::Unwritten) => false,
   };
   if !logged {
-    *s.refusals
-      .entry(crate::verbs::WRITE_LOG_UNWRITTEN)
-      .or_insert(0) += 1;
+    s.count(crate::verbs::WRITE_LOG_UNWRITTEN, 1);
     if let (Some(log), Some(object)) = (s.write_log.as_mut(), s.content.as_mut()) {
       let _ = log.overflow(object);
     }
@@ -786,7 +782,7 @@ fn hand_over_session(s: &mut ShardState, attachment: u64, mount: &mut FuseMount)
   };
   mount.session_held = true;
   if matches!(crate::fuse_hold::session(attachment, session), Some(Err(_))) {
-    *s.refusals.entry(HOLD_REFUSED).or_insert(0) += 1;
+    s.count(HOLD_REFUSED, 1);
   }
 }
 
@@ -822,10 +818,10 @@ fn adopt_one(s: &mut ShardState, record: AttachmentRecord, held: crate::fuse_hol
   // A device that cannot be served again is closed and released, never unmounted: its mount was in use across the
   // restart, and an unmount would let its users' next writes by path reach the disk beneath (see `turn`).
   let end = |s: &mut ShardState| {
-    *s.refusals.entry(ADOPT_REFUSED).or_insert(0) += 1;
+    s.count(ADOPT_REFUSED, 1);
     let _ = crate::fuse_hold::release(attachment);
     if crate::verbs::end_attachment(s, &record, crate::verbs::Ending::Otherwise).is_err() {
-      *s.refusals.entry(UNMOUNT_REFUSED).or_insert(0) += 1;
+      s.count(UNMOUNT_REFUSED, 1);
     }
   };
   let Some(session) = held.session else {
@@ -895,12 +891,12 @@ fn ended(s: &mut ShardState, attachment: u64) {
   }
   // The anchor closes its copy of the device (A-61), so an ended mount is never handed to the next daemon.
   if matches!(crate::fuse_hold::release(attachment), Some(Err(_))) {
-    *s.refusals.entry(HOLD_REFUSED).or_insert(0) += 1;
+    s.count(HOLD_REFUSED, 1);
   }
   if let Some(record) = s.db.partition().attachment(attachment).cloned()
     && crate::verbs::end_attachment(s, &record, crate::verbs::Ending::Otherwise).is_err()
   {
-    *s.refusals.entry(UNMOUNT_REFUSED).or_insert(0) += 1;
+    s.count(UNMOUNT_REFUSED, 1);
   }
 }
 
@@ -946,7 +942,7 @@ pub(crate) fn leave_stale() {
     return;
   }
   let Ok(table) = slates_bridge_oci::mount_table::mount_table() else {
-    let _ = state::with_state(|s| *s.refusals.entry(UNMOUNT_REFUSED).or_insert(0) += 1);
+    let _ = state::with_state(|s| s.count(UNMOUNT_REFUSED, 1));
     return;
   };
   let left = stale
@@ -974,14 +970,14 @@ const FUSE_TYPE: &str = "fuse.slates";
 /// polling at the heartbeat's tick (bounded by the failover bound; the helper is killed and reaped past it).
 fn unmount_owned(mount_point: &str) {
   let Ok(pending) = begin_unmount(mount_point) else {
-    let _ = state::with_state(|s| *s.refusals.entry(UNMOUNT_REFUSED).or_insert(0) += 1);
+    let _ = state::with_state(|s| s.count(UNMOUNT_REFUSED, 1));
     return;
   };
   if futures::spawn(reap(pending))
     .and_then(futures::detach)
     .is_err()
   {
-    let _ = state::with_state(|s| *s.refusals.entry(UNMOUNT_REFUSED).or_insert(0) += 1);
+    let _ = state::with_state(|s| s.count(UNMOUNT_REFUSED, 1));
   }
 }
 
@@ -994,12 +990,12 @@ async fn reap(mut pending: PendingExit) {
   loop {
     if let Some(done) = pending.poll() {
       if done.is_err() {
-        let _ = state::with_state(|s| *s.refusals.entry(UNMOUNT_REFUSED).or_insert(0) += 1);
+        let _ = state::with_state(|s| s.count(UNMOUNT_REFUSED, 1));
       }
       return;
     }
     if futures::now_ns().saturating_sub(began) >= bound || futures::sleep(tick).await.is_err() {
-      let _ = state::with_state(|s| *s.refusals.entry(UNMOUNT_REFUSED).or_insert(0) += 1);
+      let _ = state::with_state(|s| s.count(UNMOUNT_REFUSED, 1));
       return;
     }
   }

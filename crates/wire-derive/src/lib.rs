@@ -10,6 +10,11 @@
 //! Refusals are compile errors with the field named: a type without a `Wire` implementation, a
 //! generic type, a union, a tuple struct, `usize`/`isize` (which do not exist on the wire).
 
+// The no-panic law (CLAUDE.md, banned item 6): shipped code never overflows or divides by zero. Test builds
+// are exempt. Once a crate is clean this holds it there; out-of-bounds indexing and slicing are denied
+// workspace-wide.
+#![cfg_attr(not(test), deny(clippy::arithmetic_side_effects))]
+
 use proc_macro::TokenStream;
 use quote::{format_ident, quote};
 use syn::{Data, DeriveInput, Fields, Type, parse_macro_input, spanned::Spanned};

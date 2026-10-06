@@ -22,6 +22,11 @@
 //! [`telemetry`] (the chokepoint spans' per-shard rings and the bounded `Telemetry` drain the status
 //! surfaces read, §4.14), [`error`].
 
+// The no-panic law (CLAUDE.md, banned item 6): shipped code never overflows or divides by zero. Test builds
+// are exempt. Once a crate is clean this holds it there; out-of-bounds indexing and slicing are denied
+// workspace-wide.
+#![cfg_attr(not(test), deny(clippy::arithmetic_side_effects))]
+
 pub mod catalog;
 pub mod config;
 mod consensus;

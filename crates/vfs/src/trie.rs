@@ -65,7 +65,10 @@ impl TrieNode {
 
 /// The digit of `no` at `level` (0 = the top level).
 fn digit(no: InodeNo, level: u32) -> usize {
-  let shift = (LEVELS - 1 - level) * BITS;
+  let shift = LEVELS
+    .saturating_sub(1)
+    .saturating_sub(level)
+    .saturating_mul(BITS);
   usize::try_from((no.counter() >> shift) & DIGIT_MASK).unwrap_or(0)
 }
 

@@ -369,7 +369,7 @@ impl Volume {
   /// no copy.
   fn dropped_copy_counter(&self, store: &Store, no: InodeNo) -> Result<u64, VfsError> {
     match self.sidecar_of(store, no)? {
-      Some(copy) => Ok(self.inode(store, copy)?.version + 1),
+      Some(copy) => Ok(self.inode(store, copy)?.version.saturating_add(1)),
       None => Ok(0),
     }
   }
@@ -379,7 +379,7 @@ impl Volume {
   pub fn view_change(&self, store: &Store, no: InodeNo) -> Result<u64, VfsError> {
     let own = owner_of(self.namespace_inode(store, no)?)?.version;
     match self.sidecar_of(store, no)? {
-      Some(copy) => Ok(own + self.inode(store, copy)?.version),
+      Some(copy) => Ok(own.saturating_add(self.inode(store, copy)?.version)),
       None => Ok(own),
     }
   }

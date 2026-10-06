@@ -257,7 +257,7 @@ fn publish(state: &mut ShardState) -> Result<(), AnchorError> {
   let mut payload = Vec::with_capacity(CHECKSUM_BYTES.saturating_add(record.len()));
   payload.extend_from_slice(blake3::hash(&record).as_bytes());
   payload.extend_from_slice(&record);
-  let slot = u8::try_from(generation % u64::from(SLOTS))
+  let slot = u8::try_from(generation.checked_rem(u64::from(SLOTS)).unwrap_or(0))
     .map_err(|_| invalid("consensus slot exceeds its format"))?;
   state
     .segment
@@ -300,7 +300,13 @@ fn set_log_budgets(state: &mut ShardState, record_bytes: usize, slot: u8) {
 pub(crate) fn derive_log_budgets(state: &mut ShardState) {
   let record = Retained::capture(state, state.consensus_generation).to_bytes();
   let record_bytes = CHECKSUM_BYTES.saturating_add(record.len());
-  let slot = u8::try_from(state.consensus_generation % u64::from(SLOTS)).unwrap_or(0);
+  let slot = u8::try_from(
+    state
+      .consensus_generation
+      .checked_rem(u64::from(SLOTS))
+      .unwrap_or(0),
+  )
+  .unwrap_or(0);
   set_log_budgets(state, record_bytes, slot);
 }
 

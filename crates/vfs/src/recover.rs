@@ -781,7 +781,7 @@ fn streamed_crc<S: ImageRead + ?Sized>(slots: &S, at: usize, len: usize) -> Resu
   let mut crc = 0;
   let mut done = 0usize;
   while done < len {
-    let take = (len - done).min(span.len());
+    let take = len.saturating_sub(done).min(span.len());
     let chunk = span.get_mut(..take).ok_or(VfsError::RecoveryIncomplete)?;
     slots.image_read(at.saturating_add(done), chunk)?;
     crc = crc32c_append(crc, chunk);
@@ -804,7 +804,7 @@ fn slots_of(total: usize) -> (Slot, Slot) {
     },
     Slot {
       offset: half,
-      len: total - half,
+      len: total.saturating_sub(half),
     },
   )
 }
@@ -922,7 +922,7 @@ fn slot_image<S: ImageRead + ?Sized>(slots: &S, slot: Slot) -> Option<(u64, Fram
     u64::from_le_bytes(generation),
     Framed {
       at: framed.at.saturating_add(SLOT_GEN_WIDTH),
-      len: framed.len - SLOT_GEN_WIDTH,
+      len: framed.len.saturating_sub(SLOT_GEN_WIDTH),
     },
   ))
 }

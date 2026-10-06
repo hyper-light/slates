@@ -101,9 +101,12 @@ impl WordRun {
   fn index_of(&self, value: usize) -> (usize, bool) {
     if self.stride.is_power_of_two() {
       let shift = self.stride.trailing_zeros();
-      (value >> shift, value & (self.stride - 1) == 0)
+      (value >> shift, value & self.stride.saturating_sub(1) == 0)
     } else {
-      (value / self.stride, value.is_multiple_of(self.stride))
+      (
+        value.checked_div(self.stride).unwrap_or(0),
+        value.is_multiple_of(self.stride),
+      )
     }
   }
 

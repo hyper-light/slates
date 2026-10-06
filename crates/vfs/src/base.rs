@@ -295,9 +295,11 @@ const DIGEST_SHARE_OF_INODE_TABLE: usize = 16;
 /// (§4.2) and never grows with the base tree.
 pub fn digest_capacity(max_inodes: usize) -> slates_machine::Derived<usize> {
   slates_machine::derived!(
-    max_inodes.saturating_mul(std::mem::size_of::<Inode>())
-      / DIGEST_SHARE_OF_INODE_TABLE
-      / std::mem::size_of::<DigestRecord>().max(1),
+    max_inodes
+      .saturating_mul(std::mem::size_of::<Inode>())
+      .checked_div(DIGEST_SHARE_OF_INODE_TABLE)
+      .and_then(|bytes| bytes.checked_div(std::mem::size_of::<DigestRecord>()))
+      .unwrap_or(0),
     "max_inodes × size_of::<Inode>() / DIGEST_SHARE_OF_INODE_TABLE / size_of::<DigestRecord>()",
     ["store.max_inodes", "reserve_per_shard"]
   )
@@ -334,7 +336,7 @@ impl DigestBudget {
     if self.live >= self.capacity {
       return Err(VfsError::DigestCacheFull);
     }
-    self.live += 1;
+    self.live = self.live.saturating_add(1);
     Ok(())
   }
 
@@ -923,7 +925,7 @@ impl Volume {
   pub(crate) fn base_forget(&mut self, store: &mut Store, no: InodeNo) -> Option<HostFile> {
     let plane = self.base.as_mut()?;
     if plane.forget_digest(store, no) {
-      plane.digest_stats.invalidated += 1;
+      plane.digest_stats.invalidated = plane.digest_stats.invalidated.saturating_add(1);
     }
     plane.drift.remove(&no);
     let descriptor = plane.descriptors.remove(&no);
@@ -1226,7 +1228,8 @@ impl Overlay<'_> {
       .get(&no)
       .is_some_and(|kept| kept.fingerprint != fp);
     if moved && self.plane()?.forget_digest(store, no) {
-      self.plane()?.digest_stats.stale += 1;
+      let stats = &mut self.plane()?.digest_stats;
+      stats.stale = stats.stale.saturating_add(1);
     }
     self.adopt_fingerprint(store, no, fp)
   }
@@ -1847,7 +1850,7 @@ impl Overlay<'_> {
         let covered = b
           .pinned
           .iter()
-          .any(|e| e.off <= off && end <= e.off + e.len);
+          .any(|e| e.off <= off && end <= e.off.saturating_add(e.len));
         (
           b.base_len,
           b.lost,
@@ -1864,8 +1867,12 @@ impl Overlay<'_> {
     if lost && !(covered || off >= base_len) {
       return Err(VfsError::BaseDrift);
     }
-    let want =
-      usize::try_from((size - off).min(u64::try_from(buf.len()).unwrap_or(u64::MAX))).unwrap_or(0);
+    let want = usize::try_from(
+      size
+        .saturating_sub(off)
+        .min(u64::try_from(buf.len()).unwrap_or(u64::MAX)),
+    )
+    .unwrap_or(0);
     let out = buf.get_mut(..want).unwrap_or_default();
     out.fill(0);
     // Disk bytes first (within the valid base length), then the pinned extents over them.
@@ -1905,8 +1912,12 @@ impl Overlay<'_> {
     if off >= size {
       return Ok(0);
     }
-    let want =
-      usize::try_from((size - off).min(u64::try_from(buf.len()).unwrap_or(u64::MAX))).unwrap_or(0);
+    let want = usize::try_from(
+      size
+        .saturating_sub(off)
+        .min(u64::try_from(buf.len()).unwrap_or(u64::MAX)),
+    )
+    .unwrap_or(0);
     let end = off.saturating_add(u64::try_from(want).unwrap_or(u64::MAX));
     let covered = pinned
       .iter()
@@ -1917,8 +1928,12 @@ impl Overlay<'_> {
     let out = buf.get_mut(..want).ok_or(VfsError::Invalid)?;
     out.fill(0);
     if off < base_len && !covered {
-      let disk_want =
-        usize::try_from((base_len - off).min(u64::try_from(want).unwrap_or(u64::MAX))).unwrap_or(0);
+      let disk_want = usize::try_from(
+        base_len
+          .saturating_sub(off)
+          .min(u64::try_from(want).unwrap_or(u64::MAX)),
+      )
+      .unwrap_or(0);
       let witness = self.vol.witness_in(id, no).ok_or(VfsError::BaseDrift)?;
       let disk = out.get_mut(..disk_want).ok_or(VfsError::Invalid)?;
       self.read_disk_witnessed(store, no, &witness, off, disk)?;
@@ -2088,7 +2103,8 @@ impl Overlay<'_> {
     // metadata — copies it up first, so the digest kept for it is dropped here, before the
     // witness is recorded and before the mutation is visible.
     if self.plane()?.forget_digest(store, no) {
-      self.plane()?.digest_stats.invalidated += 1;
+      let stats = &mut self.plane()?.digest_stats;
+      stats.invalidated = stats.invalidated.saturating_add(1);
     }
     let (host_dir, name) = self.home_of(store, no)?;
     let file = self.host.open_file(host_dir, &name).map_err(host_refusal)?;
@@ -2201,15 +2217,15 @@ impl Overlay<'_> {
       _ => return Ok(()),
     };
     let chunk = u64::try_from(store.content.chunk_bytes()).unwrap_or(u64::MAX);
-    let first = off / chunk;
-    let last = end.saturating_sub(1) / chunk;
+    let first = off.checked_div(chunk).unwrap_or(0);
+    let last = end.saturating_sub(1).checked_div(chunk).unwrap_or(0);
     if off >= end {
       return Ok(());
     }
     // Only a window that still lives on the disk needs the disk (and the drift check first);
     // bytes the volume already pinned are its own whatever the disk does beneath them.
     let wanted: Vec<u64> = (first..=last)
-      .map(|w| w * chunk)
+      .map(|w| w.saturating_mul(chunk))
       .filter(|start| *start < base_len && !pinned.contains(start))
       .collect();
     if wanted.is_empty() {
@@ -2218,7 +2234,7 @@ impl Overlay<'_> {
     self.check_drift(store, no)?;
     let file = self.descriptor(store, no)?;
     for start in wanted {
-      let len = usize::try_from((base_len - start).min(chunk)).unwrap_or(0);
+      let len = usize::try_from(base_len.saturating_sub(start).min(chunk)).unwrap_or(0);
       let mut bytes = vec![0u8; len];
       let mut done = 0usize;
       while done < len {
@@ -2320,14 +2336,16 @@ impl Overlay<'_> {
       .and_then(|b| b.digests.get(&no).copied());
     if let Some(cached) = kept {
       if cached.fingerprint == fingerprint {
-        self.plane()?.digest_stats.revalidated += 1;
+        let stats = &mut self.plane()?.digest_stats;
+        stats.revalidated = stats.revalidated.saturating_add(1);
         return Ok(DigestStart::Ready(Digest {
           identity: cached.identity,
           size: fingerprint.size,
         }));
       }
       if self.plane()?.forget_digest(store, no) {
-        self.plane()?.digest_stats.stale += 1;
+        let stats = &mut self.plane()?.digest_stats;
+        stats.stale = stats.stale.saturating_add(1);
       }
     }
     Ok(DigestStart::Pending(Box::new(PartialDigest {
@@ -2359,7 +2377,8 @@ impl Overlay<'_> {
     // The whole file is hashed; re-verify once more against the disk and keep the identity.
     self.reopen_verified(store, partial.no, partial.fingerprint)?;
     let identity = *partial.hasher.finalize().as_bytes();
-    self.plane()?.digest_stats.computed += 1;
+    let stats = &mut self.plane()?.digest_stats;
+    stats.computed = stats.computed.saturating_add(1);
     self.keep_digest(store, partial.no, partial.fingerprint, identity)?;
     Ok(Some(Digest {
       identity,
@@ -2399,10 +2418,14 @@ impl Overlay<'_> {
     let mut buf = vec![0u8; window];
     let mut hashed_this_slice: u64 = 0;
     while partial.done < partial.size && hashed_this_slice < budget {
-      let remaining = partial.size - partial.done;
-      let want = usize::try_from(remaining.min(window_len).min(budget - hashed_this_slice))
-        .unwrap_or(window)
-        .min(window);
+      let remaining = partial.size.saturating_sub(partial.done);
+      let want = usize::try_from(
+        remaining
+          .min(window_len)
+          .min(budget.saturating_sub(hashed_this_slice)),
+      )
+      .unwrap_or(window)
+      .min(window);
       let n = self
         .host
         .read_at(file, partial.done, buf.get_mut(..want).unwrap_or_default())
@@ -2433,7 +2456,8 @@ impl Overlay<'_> {
     let granularity = i64::try_from(self.granularity()).unwrap_or(i64::MAX);
     let last_change = fingerprint.mtime_ns.max(fingerprint.ctime_ns);
     if self.host.now_ns().saturating_sub(last_change) <= granularity {
-      self.plane()?.digest_stats.racy_uncached += 1;
+      let stats = &mut self.plane()?.digest_stats;
+      stats.racy_uncached = stats.racy_uncached.saturating_add(1);
       return Ok(());
     }
     let Some(home) = self.vol.inode(store, no)?.home.map(|h| h.parent()) else {
@@ -2447,7 +2471,8 @@ impl Overlay<'_> {
     match self.plane()?.remember_digest(store, no, cached) {
       Ok(()) => Ok(()),
       Err(VfsError::DigestCacheFull) => {
-        self.plane()?.digest_stats.cache_full += 1;
+        let stats = &mut self.plane()?.digest_stats;
+        stats.cache_full = stats.cache_full.saturating_add(1);
         Ok(())
       }
       Err(other) => Err(other),
@@ -2510,7 +2535,8 @@ impl Overlay<'_> {
       self.host.close_file(held);
       self.plane()?.descriptors.insert(no, fresh);
       if self.plane()?.forget_digest(store, no) {
-        self.plane()?.digest_stats.stale += 1;
+        let stats = &mut self.plane()?.digest_stats;
+        stats.stale = stats.stale.saturating_add(1);
       }
       self.adopt_fingerprint(store, no, at_path)?;
       self.invalidate_listing_of(store, no);
@@ -2549,7 +2575,7 @@ impl Overlay<'_> {
     if let Some(plane) = self.vol.base.as_mut()
       && refusal == VfsError::DigestUnverified
     {
-      plane.digest_stats.unverified += 1;
+      plane.digest_stats.unverified = plane.digest_stats.unverified.saturating_add(1);
     }
     refusal
   }
@@ -2580,9 +2606,9 @@ impl Overlay<'_> {
       let Some(plane) = self.vol.base.as_mut() else {
         return;
       };
-      plane.digest_stats.hint_rechecked += 1;
+      plane.digest_stats.hint_rechecked = plane.digest_stats.hint_rechecked.saturating_add(1);
       if now != Some(cached.fingerprint) && plane.forget_digest(store, no) {
-        plane.digest_stats.stale += 1;
+        plane.digest_stats.stale = plane.digest_stats.stale.saturating_add(1);
       }
     }
   }
@@ -2802,7 +2828,8 @@ impl Overlay<'_> {
     }
     if all {
       let dropped = self.plane()?.drop_all_digests(store);
-      self.plane()?.digest_stats.dropped_on_overflow += dropped;
+      let stats = &mut self.plane()?.digest_stats;
+      stats.dropped_on_overflow = stats.dropped_on_overflow.saturating_add(dropped);
     } else {
       for dir_no in dirs {
         self.revalidate_digests_under(store, dir_no);
@@ -2891,7 +2918,7 @@ impl Overlay<'_> {
       Some(0) => ("/", path.get(1..).unwrap_or_default()),
       Some(i) => (
         path.get(..i).unwrap_or_default(),
-        path.get(i + 1..).unwrap_or_default(),
+        path.get(i.saturating_add(1)..).unwrap_or_default(),
       ),
       None => ("/", path),
     };
@@ -2966,7 +2993,7 @@ impl Overlay<'_> {
       return Ok(());
     };
     if plane.forget_digest(store, no) {
-      plane.digest_stats.invalidated += 1;
+      plane.digest_stats.invalidated = plane.digest_stats.invalidated.saturating_add(1);
     }
     plane.record_witness(no, written, Some((dir, name.into())), at);
     plane.drift.remove(&no);
@@ -3212,7 +3239,7 @@ impl Overlay<'_> {
             self.copy_up(store, no, CopyUp::Content)?;
             let size = self.vol.inode(store, no)?.attrs.size;
             self.pin_windows(store, no, 0, size)?;
-            pinned += 1;
+            pinned = pinned.saturating_add(1);
           }
           Child::Symlink(_) | Child::Fifo(_) | Child::Socket(_) | Child::Whiteout => {}
         }

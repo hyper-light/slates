@@ -61,7 +61,7 @@ impl Wheel {
     let entries = Slab::preallocated(max_timers);
     Self {
       tick_ns,
-      now_tick: now_ns / tick_ns,
+      now_tick: now_ns.checked_div(tick_ns).unwrap_or(0),
       entries,
       heads: vec![NONE; SLOTS_PER_LEVEL * LEVELS],
       armed: 0,
@@ -88,7 +88,10 @@ impl Wheel {
 
   /// Arms a timer to wake `word` at `deadline_ns`.
   pub fn insert(&mut self, deadline_ns: u64, word: u64) -> Result<TimerId, RtError> {
-    let deadline = (deadline_ns.div_ceil(self.tick_ns)).max(self.now_tick + 1);
+    // `tick_ns >= 1` (`new` clamps it), so the division cannot fail.
+    let deadline = deadline_ns
+      .div_ceil(self.tick_ns)
+      .max(self.now_tick.saturating_add(1));
     let id = self.entries.insert(Entry {
       deadline,
       word,
@@ -98,7 +101,7 @@ impl Wheel {
       slot: 0,
     })?;
     self.link(id.index(), deadline);
-    self.armed += 1;
+    self.armed = self.armed.saturating_add(1);
     self.earliest = Some(self.earliest.map_or(deadline, |e| e.min(deadline)));
     Ok(id)
   }
@@ -153,7 +156,7 @@ impl Wheel {
   /// 66,595 of them before (every tick once any timer had fired), which made a simulated 64 kbit/s run
   /// take minutes of CPU (2026-09-27).
   pub fn advance(&mut self, now_ns: u64, fired: &mut Vec<u64>) {
-    let target = now_ns / self.tick_ns;
+    let target = now_ns.checked_div(self.tick_ns).unwrap_or(self.now_tick);
     let before = fired.len();
     while self.now_tick < target {
       self.now_tick = self.next_event_tick(target);
@@ -172,14 +175,17 @@ impl Wheel {
   fn next_event_tick(&self, target: u64) -> u64 {
     let mut best = target;
     for level in 0..LEVELS {
-      let shift = SLOT_BITS * u32::try_from(level).unwrap_or(0);
-      let span = 1u64 << shift;
-      let mut boundary = ((self.now_tick >> shift) + 1) << shift;
+      let shift = shift_of(level);
+      let span = 1u64.checked_shl(shift).unwrap_or(u64::MAX);
+      let mut boundary = (self.now_tick.checked_shr(shift).unwrap_or(0))
+        .saturating_add(1)
+        .checked_shl(shift)
+        .unwrap_or(u64::MAX);
       for _ in 0..SLOTS_PER_LEVEL {
         if boundary >= best {
           break;
         }
-        let slot = usize::try_from((boundary >> shift) & (SLOTS_PER_LEVEL as u64 - 1)).unwrap_or(0);
+        let slot = slot_of(boundary, shift);
         if self.head(level, slot) != NONE {
           best = boundary;
           break;
@@ -195,11 +201,15 @@ impl Wheel {
     let tick = self.now_tick;
     // Level 0 slot for this tick fires; a higher level's slot that this tick enters cascades.
     for level in 0..LEVELS {
-      let shift = SLOT_BITS * u32::try_from(level).unwrap_or(0);
-      if level > 0 && tick & ((1u64 << shift) - 1) != 0 {
+      let shift = shift_of(level);
+      let below = 1u64
+        .checked_shl(shift)
+        .unwrap_or(u64::MAX)
+        .saturating_sub(1);
+      if level > 0 && tick & below != 0 {
         break;
       }
-      let slot = usize::try_from((tick >> shift) & (SLOTS_PER_LEVEL as u64 - 1)).unwrap_or(0);
+      let slot = slot_of(tick, shift);
       let mut index = self.head(level, slot);
       self.set_head(level, slot, NONE);
       while index != NONE {
@@ -232,11 +242,11 @@ impl Wheel {
 
   fn level_and_slot(&self, deadline: u64) -> (usize, usize) {
     let delta = deadline.saturating_sub(self.now_tick).max(1);
-    let level = (usize::try_from((u64::BITS - 1 - delta.leading_zeros()) / SLOT_BITS).unwrap_or(0))
-      .min(LEVELS - 1);
-    let shift = SLOT_BITS * u32::try_from(level).unwrap_or(0);
-    let slot = usize::try_from((deadline >> shift) & (SLOTS_PER_LEVEL as u64 - 1)).unwrap_or(0);
-    (level, slot)
+    // `delta >= 1`, so it has a top bit: its level is that bit's position in 64-slot digits.
+    let level = usize::try_from(delta.ilog2().checked_div(SLOT_BITS).unwrap_or(0))
+      .unwrap_or(0)
+      .min(LEVELS.saturating_sub(1));
+    (level, slot_of(deadline, shift_of(level)))
   }
 
   fn link(&mut self, index: u32, deadline: u64) {
@@ -305,6 +315,19 @@ impl Wheel {
       n.prev = prev;
     }
   }
+}
+
+/// The bit position where `level`'s digit of a tick starts (`SLOT_BITS` per level; at most 30 for six levels).
+fn shift_of(level: usize) -> u32 {
+  SLOT_BITS.saturating_mul(u32::try_from(level).unwrap_or(0))
+}
+
+/// The slot `value` (a tick) falls in at the level whose digit starts at bit `shift`.
+fn slot_of(value: u64, shift: u32) -> usize {
+  let mask = u64::try_from(SLOTS_PER_LEVEL)
+    .unwrap_or(u64::MAX)
+    .saturating_sub(1);
+  usize::try_from(value.checked_shr(shift).unwrap_or(0) & mask).unwrap_or(0)
 }
 
 #[cfg(test)]

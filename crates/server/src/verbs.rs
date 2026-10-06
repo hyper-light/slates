@@ -250,7 +250,7 @@ pub fn owner_of_name(name: &str, partitions: usize) -> u16 {
     hash = hash.wrapping_mul(FNV_PRIME);
   }
   let count = u64::try_from(partitions.max(1)).unwrap_or(u64::MAX);
-  u16::try_from(hash % count).unwrap_or(u16::MAX)
+  u16::try_from(hash.checked_rem(count).unwrap_or(0)).unwrap_or(u16::MAX)
 }
 
 /// The runtime shard a partition lives on in this process.
@@ -969,10 +969,7 @@ fn forward_to_owner(
       let owner = match known {
         Some(owner) => {
           crate::state::with_state(|state| {
-            *state
-              .refusals
-              .entry("fleet.owner_location.direct")
-              .or_insert(0) += 1;
+            state.count("fleet.owner_location.direct", 1);
           });
           Some(owner)
         }
@@ -988,10 +985,7 @@ fn forward_to_owner(
           .await;
           if forwarded.is_none() {
             crate::state::with_state(|state| {
-              *state
-                .refusals
-                .entry("fleet.owner_location.forward_unsent")
-                .or_insert(0) += 1;
+              state.count("fleet.owner_location.forward_unsent", 1);
             });
           }
           forwarded
@@ -1019,10 +1013,7 @@ fn forward_to_owner(
           slates_rt::registry::send_control(origin, Control::Spawn(Box::new(back)))
         {
           crate::state::with_state(|state| {
-            *state
-              .refusals
-              .entry("fleet.owner_location.delivery_refused")
-              .or_insert(0) += 1;
+            state.count("fleet.owner_location.delivery_refused", 1);
           });
           eprintln!("slates-server: owner reply delivery refused: {error}");
         }
@@ -1047,10 +1038,7 @@ fn finish_owner_forward(
   let present = crate::state::with_state(|state| {
     let Ok(slot) = state.clients.get_mut(client) else {
       state.forwarded_rings.remove(&request);
-      *state
-        .refusals
-        .entry("fleet.owner_location.client_gone")
-        .or_insert(0) += 1;
+      state.count("fleet.owner_location.client_gone", 1);
       return false;
     };
     slot.owner_route = route;
@@ -1195,7 +1183,7 @@ pub fn serve(state: &mut ShardState, client: Handle<ClientSlot>, request: &Reque
   // A channel bound to a consumer the human has since revoked refuses every effect (§4.13), before any
   // lookup or mutation, whatever the verb — one local read (the revocation was fanned to this slot).
   if state.clients.get(client).is_ok_and(|slot| slot.revoked) {
-    *state.refusals.entry("consumer_revoked").or_insert(0) += 1;
+    state.count("consumer_revoked", 1);
     return Served::Reply(record_completion(
       state,
       origin,
@@ -1377,7 +1365,7 @@ fn run_recorded(
       // client retrying into a segment that cannot publish leaks nothing per attempt. The refusal is
       // counted here (it is deliberately *not* recorded as a completion: a retry must re-execute).
       let refusal = refusal_of_db(&e);
-      *state.refusals.entry(refusal_name(&refusal)).or_insert(0) += 1;
+      state.count(refusal_name(&refusal), 1);
       reconcile_unpublished_effects(state);
       refused(refusal)
     }
@@ -1495,9 +1483,9 @@ pub fn record_completion(
   if let Err(e) = state.db.mutate(&mut state.segment, &record, now) {
     return refused(refusal_of_db(&e));
   }
-  state.served += 1;
+  state.served = state.served.saturating_add(1);
   if let ReplyBody::Refused { refusal } = &reply {
-    *state.refusals.entry(refusal_name(refusal)).or_insert(0) += 1;
+    state.count(refusal_name(refusal), 1);
     // Every refuse-all budget refusal, whatever path produced it (a write, a merge version, a takeover's
     // restore), logs the store's breakdown once — the create path alone did before, and a takeover's
     // `BudgetExceeded { available: 0 }` on CI (run 36828863866, 2026-10-01) carried no breakdown.
@@ -2415,7 +2403,7 @@ pub(crate) fn dispatch(
   let fenced = touched.filter(|volume| state.fenced_greens.contains_key(volume));
   let destroying = matches!(body, RequestBody::Destroy { .. });
   if fenced.is_some() && !destroying {
-    *state.refusals.entry(GREEN_FENCED).or_insert(0) += 1;
+    state.count(GREEN_FENCED, 1);
     return refused(Refusal::ContentUnavailable);
   }
   let reply = dispatch_inner(state, client_id, principal, body);
@@ -2673,7 +2661,7 @@ fn dispatch_inner(
 fn enroll(state: &mut ShardState, account: u32, proof: Capability) -> ReplyBody {
   let expected = crate::landing::enroll_proof(&state.issuer_secret, account);
   if !crate::landing::constant_time_eq(&expected, &proof) {
-    *state.refusals.entry("grant_issuer_unverified").or_insert(0) += 1;
+    state.count("grant_issuer_unverified", 1);
     return refused(Refusal::GrantIssuerUnverified);
   }
   let mut secret = [0u8; 32];
@@ -2721,7 +2709,7 @@ fn revoke_on_channel(
 ) -> Served {
   let expected = crate::landing::revoke_proof(&state.issuer_secret, consumer);
   if !crate::landing::constant_time_eq(&expected, &proof) {
-    *state.refusals.entry("grant_issuer_unverified").or_insert(0) += 1;
+    state.count("grant_issuer_unverified", 1);
     return Served::Reply(refused(Refusal::GrantIssuerUnverified));
   }
   let origin = state.shard;
@@ -2972,7 +2960,7 @@ fn attest_on_channel(
         Err(refusal) => {
           let counter = attest_refusal_counter(&refusal);
           let _ = crate::xshard::run_on(origin, origin, move |s| {
-            *s.refusals.entry(counter).or_insert(0) += 1;
+            s.count(counter, 1);
           });
           refused(refusal)
         }
@@ -3047,7 +3035,7 @@ fn inode_allowance(state: &ShardState, size: SizeClass) -> u64 {
     .saturating_sub(state.store.versions.headroom())
     .max(1);
   derived!(
-    (limit / inode_bytes).min(cap).max(1),
+    limit.checked_div(inode_bytes).unwrap_or(0).min(cap).max(1),
     "min(quota / size_of::<Inode>, store.max_inodes − copy-up headroom), at least one",
     ["quota", "store.max_inodes", "vfs.copy_up_version_headroom"]
   )
@@ -3079,7 +3067,7 @@ fn entry_allowance(size: SizeClass) -> u64 {
     .unwrap_or(1)
     .max(1);
   derived!(
-    (limit / entry_bytes).max(1),
+    limit.checked_div(entry_bytes).unwrap_or(0).max(1),
     "quota / size_of::<Child>() (minimum entry footprint)",
     ["quota"]
   )
@@ -5479,7 +5467,7 @@ fn grow_version_reservation(
   if new <= old {
     return Ok(None);
   }
-  match versions.reserve(new - old) {
+  match versions.reserve(new.saturating_sub(old)) {
     Ok(c) => Ok(Some(c)),
     Err(slates_mem::MemError::BudgetExceeded { available, .. }) => {
       Err(Refusal::BudgetExceeded { available })
@@ -5499,7 +5487,9 @@ fn settle_version_reservation(
   new: u64,
 ) -> slates_mem::budget::VersionCredit {
   if new < old {
-    versions.release(slates_mem::budget::VersionCredit { slots: old - new });
+    versions.release(slates_mem::budget::VersionCredit {
+      slots: old.saturating_sub(new),
+    });
   }
   slates_mem::budget::VersionCredit { slots: new }
 }
@@ -5732,10 +5722,7 @@ fn teardown_started(
     return false;
   }
   if let Err(e) = start_teardown(state, handle, volume) {
-    *state
-      .refusals
-      .entry(refusal_name(&refusal_of_vfs(&e)))
-      .or_insert(0) += 1;
+    state.count(refusal_name(&refusal_of_vfs(&e)), 1);
   }
   true
 }
@@ -5793,10 +5780,7 @@ pub fn step_destroys(state: &mut ShardState) -> bool {
         // recorded again at the reaper's next cadence (`reap_loop` steps destroys), not in a busy round
         // — before 2026-09-29 the refusal was discarded and the tables let go of a volume the catalog
         // still held.
-        *state
-          .refusals
-          .entry(refusal_name(&refusal_of_db(&e)))
-          .or_insert(0) += 1;
+        state.count(refusal_name(&refusal_of_db(&e)), 1);
         continue;
       }
       any = true;
@@ -6147,7 +6131,7 @@ pub(crate) fn materialize_taken_over_green(
     // rather than serve versions the quorum did not commit.
     state.greens.remove(&id);
     crate::merge_service::release_green_retention(state, id);
-    *state.refusals.entry(GREEN_TAKEOVER_MISMATCH).or_insert(0) += 1;
+    state.count(GREEN_TAKEOVER_MISMATCH, 1);
     eprintln!(
       "slates-server: partition {}: taken-over green {} rebuilt to {:?}, the adopted record names version {} with another identity; refused",
       state.partition,
@@ -7189,7 +7173,7 @@ pub fn rebuild_recovered(state: &mut ShardState) -> Rebuilt {
   for record in &records {
     if matches!(record.policy.role, Role::Green { .. }) {
       rebuild_green(state, record);
-      rebuilt.merge_volumes += 1;
+      rebuilt.merge_volumes = rebuilt.merge_volumes.saturating_add(1);
     }
   }
   // Origins before their clones (A-64): a clone is rebuilt over its recovered origin's snapshot.
@@ -7201,17 +7185,19 @@ pub fn rebuild_recovered(state: &mut ShardState) -> Rebuilt {
       Role::Green { .. } => {}
       Role::Work { green, .. } => {
         rebuild_work(state, record, green);
-        rebuilt.merge_volumes += 1;
+        rebuilt.merge_volumes = rebuilt.merge_volumes.saturating_add(1);
       }
       Role::Plain => {
         match rebuild_volume(state, record, images.get(&record.id.bytes), claims.as_ref()) {
           Ok(prefix) => {
-            rebuilt.volumes += 1;
+            rebuilt.volumes = rebuilt.volumes.saturating_add(1);
             max_prefix = max_prefix.max(prefix.wrapping_add(1).max(1));
-            rebuilt.snapshots_trimmed += trim_unrecorded_snapshots(state, record.id);
+            rebuilt.snapshots_trimmed = rebuilt
+              .snapshots_trimmed
+              .saturating_add(trim_unrecorded_snapshots(state, record.id));
           }
           Err(reason) => {
-            rebuilt.skipped += 1;
+            rebuilt.skipped = rebuilt.skipped.saturating_add(1);
             eprintln!(
               "slates-server: partition {}: volume {} not rebuilt: {reason}",
               state.partition, record.name
@@ -7222,9 +7208,11 @@ pub fn rebuild_recovered(state: &mut ShardState) -> Rebuilt {
       }
     }
     let (snapshots, attachments) = reconcile_lost(state, record);
-    rebuilt.snapshots_dropped += snapshots;
-    rebuilt.attachments_dropped += attachments;
-    rebuilt.orphans_reclaimed += settle_references(state, record);
+    rebuilt.snapshots_dropped = rebuilt.snapshots_dropped.saturating_add(snapshots);
+    rebuilt.attachments_dropped = rebuilt.attachments_dropped.saturating_add(attachments);
+    rebuilt.orphans_reclaimed = rebuilt
+      .orphans_reclaimed
+      .saturating_add(settle_references(state, record));
   }
   rebuilt.blocks_swept = sweep_claims(state, claims);
   // The FUSE writes acknowledged after the last publication, back on top of the rebuilt volumes (A-63).
@@ -7254,7 +7242,7 @@ fn lineage_depth(state: &ShardState, volume: DbVolumeId) -> usize {
       break;
     };
     at = edge.origin_volume;
-    depth += 1;
+    depth = depth.saturating_add(1);
   }
   depth
 }
@@ -7325,14 +7313,14 @@ fn complete_recovered_destroys(state: &mut ShardState) -> usize {
     .map(|v| v.id)
     .collect();
   let now = state.clock.monotonic_ns();
-  let mut completed = 0;
+  let mut completed: usize = 0;
   for id in destroying {
     if state
       .db
       .mutate(&mut state.segment, &Op::VolumeDestroyed { id }, now)
       .is_ok()
     {
-      completed += 1;
+      completed = completed.saturating_add(1);
     }
   }
   retire_local_tombstones(state);
@@ -7366,14 +7354,15 @@ fn reconcile_clone_pins(state: &mut ShardState) -> usize {
       continue;
     }
     if let Some(edge) = state.db.partition().lineage(record.id) {
-      *recorded
+      let count = recorded
         .entry((edge.origin_volume.bytes, edge.origin_snapshot.value))
-        .or_insert(0) += 1;
+        .or_insert(0);
+      *count = count.saturating_add(1);
     }
   }
   let rebuilt: Vec<(DbVolumeId, Handle<VolumeSlot>)> =
     state.by_id.iter().map(|(id, h)| (*id, *h)).collect();
-  let mut changed = 0;
+  let mut changed: usize = 0;
   for (id, handle) in rebuilt {
     let Ok(slot) = state.volumes.get_mut(handle) else {
       continue;
@@ -7388,12 +7377,12 @@ fn reconcile_clone_pins(state: &mut ShardState) -> usize {
         continue;
       };
       while held < wanted && slot.volume.pin(snapshot).is_ok() {
-        held += 1;
-        changed += 1;
+        held = held.saturating_add(1);
+        changed = changed.saturating_add(1);
       }
       while held > wanted && slot.volume.unpin(snapshot).is_ok() {
-        held -= 1;
-        changed += 1;
+        held = held.saturating_sub(1);
+        changed = changed.saturating_add(1);
       }
     }
   }
@@ -7468,7 +7457,7 @@ fn fence_green(
   state.greens.remove(&record.id);
   crate::merge_service::release_green_retention(state, record.id);
   state.fenced_greens.insert(record.id, fence);
-  *state.refusals.entry(GREEN_FENCED).or_insert(0) += 1;
+  state.count(GREEN_FENCED, 1);
   eprintln!(
     "slates-server: partition {}: green {} fenced, its recovered history is not what was acknowledged: {fence:?}",
     state.partition, record.name
@@ -7496,7 +7485,7 @@ fn rebuild_work(state: &mut ShardState, record: &VolumeRecord, green: DbVolumeId
   // and counted, never kept uncharged.
   let charged = crate::work_charge::footprint(&content, &[]);
   if state.store.grow(charged).is_err() {
-    *state.refusals.entry(WORK_REBUILD_REFUSED).or_insert(0) += 1;
+    state.count(WORK_REBUILD_REFUSED, 1);
     return;
   }
   state.works.insert(
@@ -7594,14 +7583,14 @@ fn recover_images(state: &mut ShardState) -> RecoveredImages {
   let checkpoints = ContentView {
     object,
     start,
-    len: end - start,
+    len: end.saturating_sub(start),
   };
   // The delta log beside the checkpoints (A-68); an absent one (an object laid out without it) is empty.
   let log = ContentView {
     object,
     start: delta_start,
     len: if delta_end > delta_start && delta_end <= object.len() {
-      delta_end - delta_start
+      delta_end.saturating_sub(delta_start)
     } else {
       0
     },
@@ -7820,7 +7809,7 @@ fn publish_checkpoint(state: &mut ShardState) -> Result<Published, slates_vfs::V
   let mut slots = ContentSlots {
     object,
     start,
-    len: end - start,
+    len: end.saturating_sub(start),
   };
   let frame_bytes = state
     .journal
@@ -7917,7 +7906,7 @@ fn publish_delta(state: &mut ShardState) -> Result<Published, slates_vfs::VfsErr
   let mut log = ContentSlots {
     object,
     start,
-    len: end - start,
+    len: end.saturating_sub(start),
   };
   published.frame_bytes = state.journal.append(&mut log, &delta)?;
   for handle in recorded {
@@ -8245,10 +8234,10 @@ fn trim_unrecorded_snapshots(state: &mut ShardState, volume: DbVolumeId) -> usiz
     .snapshot_ids()
     .filter(|id| !recorded.contains(&db_snapshot_value(*id)))
     .collect();
-  let mut trimmed = 0;
+  let mut trimmed: usize = 0;
   for id in unrecorded {
     if slot.volume.destroy_snapshot(store, id).is_ok() {
-      trimmed += 1;
+      trimmed = trimmed.saturating_add(1);
     }
   }
   trimmed
@@ -8300,7 +8289,7 @@ fn settle_references(state: &mut ShardState, record: &VolumeRecord) -> usize {
   {
     Ok((_, reclaimed)) => reclaimed,
     Err(_) => {
-      *state.refusals.entry(REFERENCES_UNSETTLED).or_insert(0) += 1;
+      state.count(REFERENCES_UNSETTLED, 1);
       0
     }
   }
@@ -8324,7 +8313,7 @@ fn clear_write_log(state: &mut ShardState, captured_every_volume: bool, generati
   if let Some(log) = state.write_log.as_mut()
     && log.clear(object, generation).is_err()
   {
-    *state.refusals.entry(WRITE_LOG_UNWRITTEN).or_insert(0) += 1;
+    state.count(WRITE_LOG_UNWRITTEN, 1);
   }
 }
 
@@ -8337,7 +8326,7 @@ fn clear_write_log(state: &mut ShardState, captured_every_volume: bool, generati
 #[cfg(target_os = "linux")]
 fn replay_writes(state: &mut ShardState) -> usize {
   let records = std::mem::take(&mut state.replay);
-  let mut replayed = 0;
+  let mut replayed: usize = 0;
   for (index, record) in records.iter().enumerate() {
     let mut written = replay_one(state, record);
     if matches!(written, Some(Err(slates_vfs::VfsError::PublishNeeded))) {
@@ -8346,8 +8335,8 @@ fn replay_writes(state: &mut ShardState) -> usize {
       written = replay_one(state, record);
     }
     match written {
-      Some(Ok(_)) => replayed += 1,
-      _ => *state.refusals.entry(WRITE_REPLAY_REFUSED).or_insert(0) += 1,
+      Some(Ok(_)) => replayed = replayed.saturating_add(1),
+      _ => state.count(WRITE_REPLAY_REFUSED, 1),
     }
   }
   replayed
@@ -8396,7 +8385,7 @@ fn relog_remaining(state: &mut ShardState, remaining: &[crate::write_log::Record
   }
   if !kept {
     let _ = log.overflow(object);
-    *state.refusals.entry(WRITE_LOG_UNWRITTEN).or_insert(0) += 1;
+    state.count(WRITE_LOG_UNWRITTEN, 1);
   }
 }
 
@@ -8436,14 +8425,14 @@ fn reconcile_lost(state: &mut ShardState, record: &VolumeRecord) -> (usize, usiz
     .into_iter()
     .filter(|id| !recovered_snapshot(state, handle, *id))
     .collect();
-  let mut snapshots = 0;
+  let mut snapshots: usize = 0;
   for id in &lost {
     let op = Op::SnapshotDestroyed {
       volume: record.id,
       id: *id,
     };
     if state.db.mutate(&mut state.segment, &op, now).is_ok() {
-      snapshots += 1;
+      snapshots = snapshots.saturating_add(1);
     }
   }
   if lost.contains(&record.head) {
@@ -8457,7 +8446,7 @@ fn reconcile_lost(state: &mut ShardState, record: &VolumeRecord) -> (usize, usiz
         let _ = state.db.mutate(&mut state.segment, &op, now);
       }
       // No epoch can supersede the lost head's: counted, and the head is left as recorded.
-      None => *state.refusals.entry(VOLUME_EPOCH_EXHAUSTED).or_insert(0) += 1,
+      None => state.count(VOLUME_EPOCH_EXHAUSTED, 1),
     }
   }
   // An SDK's record, a FUSE mount and a guest device all die with the process: the SDK's client attaches again,
@@ -8490,14 +8479,14 @@ fn reconcile_lost(state: &mut ShardState, record: &VolumeRecord) -> (usize, usiz
     })
     .map(|a| a.id)
     .collect();
-  let mut attachments = 0;
+  let mut attachments: usize = 0;
   for id in attached {
     if state
       .db
       .mutate(&mut state.segment, &Op::AttachmentRemoved { id }, now)
       .is_ok()
     {
-      attachments += 1;
+      attachments = attachments.saturating_add(1);
     }
   }
   (snapshots, attachments)

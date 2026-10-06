@@ -142,9 +142,13 @@ impl RuntimeConfig {
   pub fn calibrate_batch(&self, latency_budget_ns: u64) -> Derived<usize> {
     let per_item_ns = measured_item_cost_ns(self);
     derived!(
-      usize::try_from(latency_budget_ns / per_item_ns.max(1))
-        .unwrap_or(usize::MAX)
-        .clamp(1, self.ring_entries.max(1)),
+      usize::try_from(
+        latency_budget_ns
+          .checked_div(per_item_ns.max(1))
+          .unwrap_or(0)
+      )
+      .unwrap_or(usize::MAX)
+      .clamp(1, self.ring_entries.max(1)),
       "latency budget / measured per-item loop cost, clamped to [1, ring entries]",
       [
         "rt.latency_budget_ns",
@@ -157,7 +161,11 @@ impl RuntimeConfig {
   /// Task slots per slab segment: one base page of slots.
   pub fn segment_tasks(&self) -> usize {
     derived!(
-      (self.page_bytes / std::mem::size_of::<crate::task::TaskSlot>()).max(1),
+      self
+        .page_bytes
+        .checked_div(std::mem::size_of::<crate::task::TaskSlot>())
+        .unwrap_or(0)
+        .max(1),
       "base page / task slot size",
       ["page.base"]
     )
@@ -221,7 +229,10 @@ fn measured_item_cost_ns(config: &RuntimeConfig) -> u64 {
 pub fn admission_limit(requests_per_second: u64, p99_service_ns: u64) -> Derived<usize> {
   /// Format: nanoseconds per second.
   const NANOS_PER_SECOND: u128 = 1_000_000_000;
-  let l = u128::from(requests_per_second) * u128::from(p99_service_ns) / NANOS_PER_SECOND;
+  let l = u128::from(requests_per_second)
+    .saturating_mul(u128::from(p99_service_ns))
+    .checked_div(NANOS_PER_SECOND)
+    .unwrap_or(0);
   derived!(
     usize::try_from(l).unwrap_or(usize::MAX).max(1),
     "request rate × p99 service time (Little's law)",

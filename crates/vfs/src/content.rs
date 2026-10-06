@@ -112,7 +112,10 @@ struct TagStore {
 impl TagStore {
   /// A tag slab for `max_chunks` chunk records, growing a base page of slots at a time.
   fn new(max_chunks: usize, page: usize) -> TagStore {
-    let per_page = (page / std::mem::size_of::<Box<[Tag]>>().max(1)).max(1);
+    let per_page = page
+      .checked_div(std::mem::size_of::<Box<[Tag]>>())
+      .unwrap_or(0)
+      .max(1);
     TagStore {
       runs: Slab::new(per_page, max_chunks),
     }
@@ -454,8 +457,8 @@ impl ChunkStore {
     let sealed = self.arena.bytes(chunk.block).ok_or(VfsError::StaleHandle)?;
     let segments = usize::try_from(seal.segments).map_err(|_| VfsError::Invalid)?;
     let mut heap = Vec::new();
-    let first = from / self.granule;
-    let last_touched = to.saturating_sub(1) / self.granule;
+    let first = from.checked_div(self.granule).unwrap_or(0);
+    let last_touched = to.saturating_sub(1).checked_div(self.granule).unwrap_or(0);
     for index in first..=last_touched.min(segments.saturating_sub(1)) {
       let start = index.saturating_mul(self.granule);
       let end = start.saturating_add(self.granule).min(used);

@@ -104,7 +104,7 @@ pub(crate) fn park(
     return false;
   };
   if state.lease_waiters.waiting.len() >= bound(state) {
-    *state.refusals.entry(FULL).or_insert(0) += 1;
+    state.count(FULL, 1);
     return false;
   }
   // The lease's own clock (suspend-inclusive), so a paused owner's waiters expire as its lease does.
@@ -123,7 +123,7 @@ pub(crate) fn park(
   });
   state.lease_waiters.by_request.insert(key(origin, id));
   state.acceptance_deferred = true;
-  *state.refusals.entry(PARKED).or_insert(0) += 1;
+  state.count(PARKED, 1);
   arm_timer(state);
   true
 }
@@ -193,7 +193,7 @@ fn run(state: &mut ShardState, waiter: LeaseWaiter, confirmed: bool) {
   let reply = if confirmed {
     crate::verbs::dispatch(state, client_id, &principal, body)
   } else {
-    *state.refusals.entry(EXPIRED).or_insert(0) += 1;
+    state.count(EXPIRED, 1);
     crate::verbs::refused(Refusal::LeaseUnconfirmed {
       version: state.fleet.configuration().version,
     })
@@ -211,11 +211,11 @@ fn run(state: &mut ShardState, waiter: LeaseWaiter, confirmed: bool) {
   let recorded = crate::verbs::record_completion(state, origin, id, reply);
   if state.db.commit(&mut state.segment).is_err() {
     crate::verbs::reconcile_unpublished_effects(state);
-    *state.refusals.entry(UNRECORDED).or_insert(0) += 1;
+    state.count(UNRECORDED, 1);
     return;
   }
   if confirmed {
-    *state.refusals.entry(SERVED).or_insert(0) += 1;
+    state.count(SERVED, 1);
   }
   let Some(route) = route else {
     // A verb forwarded from another node: its exchange polls the completion record.
@@ -233,7 +233,7 @@ fn run(state: &mut ShardState, waiter: LeaseWaiter, confirmed: bool) {
   )
   .is_err()
   {
-    *state.refusals.entry(UNDELIVERED).or_insert(0) += 1;
+    state.count(UNDELIVERED, 1);
   }
 }
 
@@ -249,7 +249,7 @@ fn arm_timer(state: &mut ShardState) {
       state.lease_waiters.timer_armed = true;
     }
     Err(_) => {
-      *state.refusals.entry(TIMER_REFUSED).or_insert(0) += 1;
+      state.count(TIMER_REFUSED, 1);
     }
   }
 }

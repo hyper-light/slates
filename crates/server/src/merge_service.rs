@@ -154,13 +154,16 @@ pub(crate) fn settle_green_retention(state: &mut ShardState, green: DbVolumeId) 
     state
       .store
       .budget
-      .charge_retention(wanted - charged)
+      .charge_retention(wanted.saturating_sub(charged))
       .map_err(|e| match e {
         slates_mem::MemError::BudgetExceeded { available, .. } => available,
         _ => 0,
       })?;
   } else if wanted < charged {
-    state.store.budget.credit_retention(charged - wanted);
+    state
+      .store
+      .budget
+      .credit_retention(charged.saturating_sub(wanted));
   }
   state.green_retention.insert(green, wanted);
   Ok(())
@@ -1625,7 +1628,7 @@ pub(crate) fn next_merge_work(state: &mut ShardState, local: HostId) -> Vec<Merg
         let Some(bytes) = inputs_of(state, green, version) else {
           continue; // The chain no longer holds the entry (the green was destroyed): nothing to place.
         };
-        *state.refusals.entry(INPUTS_UNPLACED).or_insert(0) += 1;
+        state.count(INPUTS_UNPLACED, 1);
         work.push(MergeWork::PutInputs {
           shard: state.shard,
           object,
@@ -2002,7 +2005,7 @@ pub(crate) fn defer_acceptance(state: &mut ShardState, green: DbVolumeId, versio
     .awaiting_by_request
     .insert((origin, id.client, id.sequence), (object, version));
   state.acceptance_deferred = true;
-  *state.refusals.entry(ACCEPTANCE_DEFERRED).or_insert(0) += 1;
+  state.count(ACCEPTANCE_DEFERRED, 1);
 }
 
 /// A retry of a request whose acceptance is still waiting joins the waiting entry — it will be
@@ -2057,10 +2060,10 @@ fn resolve_accepted(state: &mut ShardState, object: ObjectId, placed: u64) {
       if state.db.commit(&mut state.segment).is_err() {
         // The completion could not be made durable (rolled back, AUD-06): the client's retry will run
         // the verb again and meet the engine's idempotent accept. Nothing is delivered from memory.
-        *state.refusals.entry(ACCEPTANCE_UNRECORDED).or_insert(0) += 1;
+        state.count(ACCEPTANCE_UNRECORDED, 1);
         continue;
       }
-      *state.refusals.entry(ACCEPTANCE_RESOLVED).or_insert(0) += 1;
+      state.count(ACCEPTANCE_RESOLVED, 1);
       let Some(route) = entry.route else {
         continue;
       };
@@ -2076,7 +2079,7 @@ fn resolve_accepted(state: &mut ShardState, object: ObjectId, placed: u64) {
       )
       .is_err()
       {
-        *state.refusals.entry(ACCEPTANCE_UNDELIVERED).or_insert(0) += 1;
+        state.count(ACCEPTANCE_UNDELIVERED, 1);
       }
     }
   }
@@ -2127,22 +2130,22 @@ pub(crate) fn accept_merge_record(
   }
   if state.merge.fault.refuse_records {
     // Test support: the acknowledgement is withheld, so the owner's version cannot commit here.
-    *state.refusals.entry(RECORD_WITHHELD).or_insert(0) += 1;
+    state.count(RECORD_WITHHELD, 1);
     return Vec::new();
   }
   let Some(value) = MergeRecordValue::from_record_bytes(&record.value) else {
-    *state.refusals.entry(INPUTS_UNDECODABLE).or_insert(0) += 1;
+    state.count(INPUTS_UNDECODABLE, 1);
     return Vec::new();
   };
   if record.sequence != value.version {
-    *state.refusals.entry(OUT_OF_ORDER).or_insert(0) += 1;
+    state.count(OUT_OF_ORDER, 1);
     return Vec::new();
   }
   let next = state
     .merge
     .replicas
     .get(&object)
-    .map(|replica| replica.head() + 1);
+    .map(|replica| replica.head().saturating_add(1));
   match (next, value.version) {
     // A version this replica already applied: re-acknowledge from the acceptor (idempotent).
     (Some(next), version) if version < next => {
@@ -2151,7 +2154,7 @@ pub(crate) fn accept_merge_record(
     (None, 0) => {}
     (Some(next), version) if version == next => {}
     _ => {
-      *state.refusals.entry(OUT_OF_ORDER).or_insert(0) += 1;
+      state.count(OUT_OF_ORDER, 1);
       return Vec::new();
     }
   }
@@ -2160,7 +2163,7 @@ pub(crate) fn accept_merge_record(
     Some(manifest) => match held_inputs(state, object, &manifest) {
       Some(bytes) => Some(bytes),
       None => {
-        *state.refusals.entry(INPUTS_UNHELD).or_insert(0) += 1;
+        state.count(INPUTS_UNHELD, 1);
         return Vec::new();
       }
     },
@@ -2168,7 +2171,7 @@ pub(crate) fn accept_merge_record(
   match recompute(state, object, &value, inputs.as_deref()) {
     Ok(()) => crate::fleet::accept_held_record(state, local, peer_host, record),
     Err(reason) => {
-      *state.refusals.entry(reason).or_insert(0) += 1;
+      state.count(reason, 1);
       if reason == RECOMPUTE_MISMATCH {
         state.merge.refused.insert(object);
         state.merge.replicas.remove(&object);

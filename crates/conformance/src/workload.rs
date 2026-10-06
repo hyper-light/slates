@@ -430,7 +430,7 @@ fn first_output_difference(host: &str, mount: &str) -> Option<String> {
   let mut mount_lines = mount.lines();
   let mut number = 0usize;
   loop {
-    number += 1;
+    number = number.saturating_add(1);
     match (host_lines.next(), mount_lines.next()) {
       (None, None) => return None,
       (h, m) if h == m => {}

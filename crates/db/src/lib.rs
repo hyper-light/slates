@@ -25,6 +25,11 @@
 //! joint consensus, preserving ReadSafety and NoLoss), [`replay`] (recovery and the snapshot
 //! policy), [`error`].
 
+// The no-panic law (CLAUDE.md, banned item 6): shipped code never overflows or divides by zero. Test builds
+// are exempt. Once a crate is clean this holds it there; out-of-bounds indexing and slicing are denied
+// workspace-wide.
+#![cfg_attr(not(test), deny(clippy::arithmetic_side_effects))]
+
 pub mod art;
 pub mod catalog;
 pub mod error;

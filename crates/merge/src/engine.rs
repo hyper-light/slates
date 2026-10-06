@@ -74,14 +74,18 @@ impl Increment {
   pub fn encode(&self) -> Vec<u8> {
     let doc = self.doc.encode();
     let mut out = Vec::with_capacity(
-      self.id.len()
-        + size_of::<u64>()
-        + size_of::<u64>()
-        + doc.len()
-        + size_of::<u64>()
-        + self.post_state.len()
-        + size_of::<u64>()
-        + self.evidence.len() * EVIDENCE_BYTES,
+      [
+        self.id.len(),
+        size_of::<u64>(), // the base version
+        size_of::<u64>(), // the ops document's length
+        size_of::<u64>(), // the post-state's length
+        size_of::<u64>(), // the evidence count
+        doc.len(),
+        self.post_state.len(),
+        self.evidence.len().saturating_mul(EVIDENCE_BYTES),
+      ]
+      .into_iter()
+      .fold(0, usize::saturating_add),
     );
     out.extend_from_slice(&self.id);
     out.extend_from_slice(&self.base.to_le_bytes());
@@ -286,12 +290,19 @@ pub struct Green {
 /// The bytes a retained conflict window costs the rejected-result cache: its path, its range and
 /// its class — what the cache actually holds for it.
 fn window_bytes(window: &ConflictWindow) -> usize {
-  window.path.len() + size_of::<Range>() + size_of::<MergeConflictClass>()
+  window
+    .path
+    .len()
+    .saturating_add(size_of::<Range>())
+    .saturating_add(size_of::<MergeConflictClass>())
 }
 
 /// The bytes a rejected result costs: its identity plus its windows.
 fn rejected_entry_bytes(windows: &[ConflictWindow]) -> usize {
-  size_of::<[u8; 32]>() + windows.iter().map(window_bytes).sum::<usize>()
+  windows
+    .iter()
+    .map(window_bytes)
+    .fold(size_of::<[u8; 32]>(), usize::saturating_add)
 }
 
 /// What a green holds in memory beyond its durable chain (§4.2 all-cost admission; AUD-16): the
@@ -1773,7 +1784,8 @@ impl Green {
     let resolved = Green::resolve(inc);
     match self.decide(inc, &resolved) {
       Ok(effects) => {
-        let version = self.head() + 1;
+        // A u64 version: 2^64 merges into one green cannot happen; saturating keeps the arithmetic total.
+        let version = self.head().saturating_add(1);
         self.commit(effects, version);
         self.accepted.insert(inc.id, version);
         Outcome::Accepted { version }

@@ -62,7 +62,7 @@ impl Ledger {
         available,
       });
     }
-    self.committed += amount;
+    self.committed = self.committed.saturating_add(amount);
     Ok(amount)
   }
 
@@ -83,7 +83,7 @@ impl Ledger {
         available,
       });
     }
-    self.committed += amount;
+    self.committed = self.committed.saturating_add(amount);
     Ok(amount)
   }
 
@@ -505,7 +505,10 @@ pub fn slab_bytes(page: u64, burst_p99_slots: u64, slot_bytes: u64) -> Derived<u
 /// (§4.2 D-12 honest degradation), a locked reserve from the OS lock capacity.
 pub fn region_bytes(capacity: u64, shards: u64, classes: u64) -> Derived<u64> {
   derived!(
-    capacity / shards.max(1) / classes.max(1),
+    capacity
+      .checked_div(shards.max(1))
+      .and_then(|per_shard| per_shard.checked_div(classes.max(1)))
+      .unwrap_or(0),
     "memory capacity / shards / classes",
     ["mem.capacity", "rt.shards", "mem.classes"]
   )

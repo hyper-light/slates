@@ -111,13 +111,12 @@ pub struct OpRecord {
 impl OpRecord {
   /// The record's size for the retention budget: the fixed part plus its paths.
   fn bytes(&self) -> usize {
-    let paths = self.path.len()
-      + match &self.op {
-        Op::Rename { from } | Op::Redirect { from } => from.len(),
-        Op::SetXattr { name } | Op::RemoveXattr { name } => name.len(),
-        _ => 0,
-      };
-    std::mem::size_of::<OpRecord>() + paths
+    let paths = self.path.len().saturating_add(match &self.op {
+      Op::Rename { from } | Op::Redirect { from } => from.len(),
+      Op::SetXattr { name } | Op::RemoveXattr { name } => name.len(),
+      _ => 0,
+    });
+    std::mem::size_of::<OpRecord>().saturating_add(paths)
   }
 }
 
@@ -171,7 +170,7 @@ impl OpLog {
         break;
       };
       self.bytes = self.bytes.saturating_sub(old.bytes());
-      self.dropped += 1;
+      self.dropped = self.dropped.saturating_add(1);
     }
     self.bytes = self.bytes.saturating_add(incoming);
     self.reserve_within_budget();
@@ -189,7 +188,11 @@ impl OpLog {
     if len < self.records.capacity() {
       return;
     }
-    let most = (self.budget_bytes / std::mem::size_of::<OpRecord>()).max(len.saturating_add(1));
+    let most = self
+      .budget_bytes
+      .checked_div(std::mem::size_of::<OpRecord>())
+      .unwrap_or(0)
+      .max(len.saturating_add(1));
     let target = len.saturating_mul(2).max(1).min(most);
     self.records.reserve_exact(target.saturating_sub(len));
   }

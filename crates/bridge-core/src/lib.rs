@@ -15,6 +15,11 @@
 //! which each transport maps to its wire error (a Linux errno, an `nfsstat3`); the neutral layer
 //! never invents an errno, so no transport inherits another's numbering.
 
+// The no-panic law (CLAUDE.md, banned item 6): shipped code never overflows or divides by zero. Test builds
+// are exempt. Once a crate is clean this holds it there; out-of-bounds indexing and slicing are denied
+// workspace-wide.
+#![cfg_attr(not(test), deny(clippy::arithmetic_side_effects))]
+
 pub mod access;
 pub mod appledouble;
 pub mod authority;
@@ -86,12 +91,12 @@ pub fn whole_cookie_groups(entries: &[DirEntry], fits: usize) -> usize {
     return fits.min(entries.len());
   };
   let mut sent = fits;
-  while sent > 0
+  while let Some(before) = sent.checked_sub(1)
     && entries
-      .get(sent - 1)
+      .get(before)
       .is_some_and(|entry| entry.cookie == next.cookie)
   {
-    sent -= 1;
+    sent = before;
   }
   sent
 }

@@ -57,8 +57,12 @@ impl Percentile {
     if len == 0 {
       return 0;
     }
-    let last = u64::try_from(len - 1).unwrap_or(u64::MAX);
-    let scaled = (last * self.numerator) / self.denominator;
+    let last = u64::try_from(len.saturating_sub(1)).unwrap_or(u64::MAX);
+    let scaled = last
+      .saturating_mul(self.numerator)
+      .checked_div(self.denominator)
+      .unwrap_or(last)
+      .min(last);
     // `scaled <= last < len`, so the conversion cannot fail; the fallback is never taken.
     usize::try_from(scaled).unwrap_or(0)
   }
@@ -133,7 +137,10 @@ impl Interval {
       return 0;
     }
     let width = u128::from(self.upper.saturating_sub(self.lower));
-    let permille = width * u128::from(PERMILLE) / u128::from(self.median);
+    let permille = width
+      .saturating_mul(u128::from(PERMILLE))
+      .checked_div(u128::from(self.median))
+      .unwrap_or(u128::MAX);
     u64::try_from(permille).unwrap_or(u64::MAX)
   }
 }
@@ -174,10 +181,10 @@ impl Xorshift {
       return 0;
     }
     // Lemire's multiply-shift with rejection of the biased zone.
-    let threshold = bound_u64.wrapping_neg() % bound_u64;
+    let threshold = bound_u64.wrapping_neg().checked_rem(bound_u64).unwrap_or(0);
     loop {
       let x = self.next_u64();
-      let m = u128::from(x) * u128::from(bound_u64);
+      let m = u128::from(x).saturating_mul(u128::from(bound_u64));
       let low = u64::try_from(m & u128::from(u64::MAX)).unwrap_or(0);
       if low >= threshold {
         return usize::try_from(m >> u64::BITS).unwrap_or(0);
@@ -251,7 +258,10 @@ impl MeanInterval {
       return 0;
     }
     let width = u128::from(self.upper.saturating_sub(self.lower));
-    let permille = width * u128::from(PERMILLE) / u128::from(self.mean);
+    let permille = width
+      .saturating_mul(u128::from(PERMILLE))
+      .checked_div(u128::from(self.mean))
+      .unwrap_or(u128::MAX);
     u64::try_from(permille).unwrap_or(u64::MAX)
   }
 
@@ -265,8 +275,11 @@ impl MeanInterval {
 /// when empty.
 pub fn mean(values: &[u64]) -> Option<u64> {
   let count = u128::try_from(values.len()).ok().filter(|n| *n > 0)?;
-  let sum: u128 = values.iter().map(|v| u128::from(*v)).sum();
-  u64::try_from(sum / count).ok()
+  let sum: u128 = values
+    .iter()
+    .map(|v| u128::from(*v))
+    .fold(0, u128::saturating_add);
+  u64::try_from(sum.checked_div(count)?).ok()
 }
 
 /// The 95% bootstrap interval around the mean of `values` (any order), or `None` when empty: the
@@ -315,7 +328,7 @@ pub fn standard_deviation(values: &[u64]) -> Option<u64> {
       d.saturating_mul(d)
     })
     .fold(0u128, u128::saturating_add);
-  u64::try_from((squares / count).isqrt()).ok()
+  u64::try_from(squares.checked_div(count)?.isqrt()).ok()
 }
 
 /// Whether a mean's interval satisfies the stopping rule ([`CONVERGED_WIDTH_PERMILLE`] of the mean).

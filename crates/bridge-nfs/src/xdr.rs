@@ -20,7 +20,7 @@ const XDR_ALIGN: usize = 4;
 
 /// The alignment padding for a field of `len` bytes.
 fn padding(len: usize) -> usize {
-  (XDR_ALIGN - (len % XDR_ALIGN)) % XDR_ALIGN
+  len.next_multiple_of(XDR_ALIGN).saturating_sub(len)
 }
 
 /// A sequential XDR writer building a big-endian, four-byte-aligned byte buffer.

@@ -89,11 +89,15 @@ impl RegionGeometry {
   }
 
   fn cpl_offset(&self) -> usize {
-    self.cmd_offset() + Ring::bytes(usize::try_from(self.slots).unwrap_or(0))
+    self
+      .cmd_offset()
+      .saturating_add(Ring::bytes(usize::try_from(self.slots).unwrap_or(0)))
   }
 
   fn bulk_offset(&self) -> usize {
-    let after_rings = self.cpl_offset() + Ring::bytes(usize::try_from(self.slots).unwrap_or(0));
+    let after_rings = self
+      .cpl_offset()
+      .saturating_add(Ring::bytes(usize::try_from(self.slots).unwrap_or(0)));
     let page = usize::try_from(self.page.max(1)).unwrap_or(1);
     after_rings.next_multiple_of(page)
   }
@@ -101,7 +105,10 @@ impl RegionGeometry {
   /// The region's total bytes.
   pub fn total_bytes(&self) -> usize {
     let page = usize::try_from(self.page.max(1)).unwrap_or(1);
-    (self.bulk_offset() + usize::try_from(self.bulk_bytes).unwrap_or(0)).next_multiple_of(page)
+    self
+      .bulk_offset()
+      .saturating_add(usize::try_from(self.bulk_bytes).unwrap_or(0))
+      .next_multiple_of(page)
   }
 }
 

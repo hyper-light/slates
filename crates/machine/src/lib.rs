@@ -35,6 +35,11 @@
 //! This crate reads the kernel's pseudo-files (`/proc`, `/sys`) as queries on Linux; it never
 //! writes a host path (the structural test lists it under R1's allowed sites for that reason).
 
+// The no-panic law (CLAUDE.md, banned item 6): shipped code never overflows or divides by zero. Test builds
+// are exempt. Once a crate is clean this holds it there; out-of-bounds indexing and slicing are denied
+// workspace-wide.
+#![cfg_attr(not(test), deny(clippy::arithmetic_side_effects))]
+
 pub mod bench;
 pub mod clock;
 pub mod derived;

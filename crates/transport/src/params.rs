@@ -119,7 +119,11 @@ impl TransportParameters {
 
   /// The encoded parameters, the dialect version first.
   pub fn encode(&self) -> Vec<u8> {
-    let mut out = Vec::with_capacity(2 * (ENTRY_HEADER_BYTES + size_of::<u32>()));
+    let mut out = Vec::with_capacity(
+      ENTRY_HEADER_BYTES
+        .saturating_add(size_of::<u32>())
+        .saturating_mul(2),
+    );
     put_u32(&mut out, ID_DIALECT, DIALECT_VERSION);
     put_u32(&mut out, ID_MAX_UDP_PAYLOAD, self.max_udp_payload);
     out

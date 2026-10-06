@@ -92,7 +92,7 @@ impl ExpectedFailures {
     }
     let mut entries: Vec<ExpectedFailure> = Vec::new();
     for (index, raw) in text.lines().enumerate() {
-      let line = index + 1;
+      let line = index.saturating_add(1);
       let trimmed = raw.trim();
       if trimmed.is_empty() || trimmed.starts_with('#') {
         continue;
@@ -213,7 +213,9 @@ pub fn judge(list: &ExpectedFailures, cases: &[TapCase]) -> Judgement {
   for case in cases {
     let id = case.id.to_string();
     match case.status {
-      CaseStatus::Fail { .. } if list.contains(&id) => judgement.expected_failures += 1,
+      CaseStatus::Fail { .. } if list.contains(&id) => {
+        judgement.expected_failures = judgement.expected_failures.saturating_add(1)
+      }
       CaseStatus::Fail { .. } => judgement.unlisted_failures.push(id),
       CaseStatus::Pass if list.contains(&id) => judgement.listed_now_passing.push(id),
       _ => {}

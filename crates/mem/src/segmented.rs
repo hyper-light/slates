@@ -59,7 +59,7 @@ impl<T> Segmented<T> {
   /// Elements the array can hold before it needs another segment.
   pub fn capacity(&self) -> usize {
     self.segments.last().map_or(0, |last| {
-      (self.segments.len() - 1)
+      (self.segments.len().saturating_sub(1))
         .saturating_mul(self.segment_len)
         .saturating_add(last.capacity().min(self.segment_len))
     })
@@ -103,7 +103,7 @@ impl<T> Segmented<T> {
     if let Some(segment) = self.segments.get_mut(seg) {
       segment.push(value);
     }
-    self.len += 1;
+    self.len = self.len.saturating_add(1);
     (allocated, index)
   }
 
@@ -112,10 +112,10 @@ impl<T> Segmented<T> {
     if self.len == 0 {
       return None;
     }
-    let (seg, _) = self.split(self.len - 1);
+    let (seg, _) = self.split(self.len.saturating_sub(1));
     let value = self.segments.get_mut(seg).and_then(Vec::pop);
     if value.is_some() {
-      self.len -= 1;
+      self.len = self.len.saturating_sub(1);
       if self.segments.last().is_some_and(Vec::is_empty)
         && self.segments.len() > 1
         && let Some(empty) = self.segments.pop()
@@ -159,7 +159,10 @@ impl<T> Segmented<T> {
   }
 
   const fn split(&self, index: usize) -> (usize, usize) {
-    (index >> self.shift, index & (self.segment_len - 1))
+    (
+      index >> self.shift,
+      index & self.segment_len.saturating_sub(1),
+    )
   }
 }
 

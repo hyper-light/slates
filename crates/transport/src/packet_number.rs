@@ -71,10 +71,15 @@ pub fn encode_packet_number(full_pn: u64, largest_acked: Option<u64>) -> Encoded
   };
   // The window must strictly exceed twice the gap (Appendix A.2). Grow the field until it does, up to
   // the 4-byte maximum. `u128` so `twice_gap` and the shifted window never overflow.
-  let twice_gap = 2u128 * u128::from(num_unacked);
+  let twice_gap = u128::from(num_unacked).saturating_mul(2);
   let mut bytes: u32 = 1;
-  while bytes < MAX_PACKET_NUMBER_BYTES && (1u128 << (u8::BITS * bytes)) <= twice_gap {
-    bytes += 1;
+  while bytes < MAX_PACKET_NUMBER_BYTES
+    && 1u128
+      .checked_shl(u8::BITS.saturating_mul(bytes))
+      .unwrap_or(u128::MAX)
+      <= twice_gap
+  {
+    bytes = bytes.saturating_add(1);
   }
   // Take the least-significant `bytes` of the full number, big-endian.
   let all = full_pn.to_be_bytes();
@@ -91,6 +96,10 @@ pub fn encode_packet_number(full_pn: u64, largest_acked: Option<u64>) -> Encoded
 /// nearest to `largest_pn + 1`, resolving a wrap in either direction. An empty slice cannot occur from
 /// a well-formed header (the field is 1–4 bytes) and yields the expected next number; more than four
 /// bytes are ignored past the fourth.
+// RFC 9000 Appendix A.3 kept verbatim so it can be checked against the RFC. Nothing overflows: `len <= 4` bytes are
+// read, so `pn_bits <= 32` and `pn_win <= 2^32`; `largest_pn < 2^64` makes `expected <= 2^64`; and every sum or
+// difference of those is far inside `i128`.
+#[allow(clippy::arithmetic_side_effects)]
 pub fn decode_packet_number(largest_pn: u64, truncated: &[u8]) -> u64 {
   let len = truncated.len().min(MAX_PACKET_NUMBER_BYTES as usize);
   if len == 0 {

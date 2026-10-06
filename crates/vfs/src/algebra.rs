@@ -142,9 +142,9 @@ impl ContentMap {
       ContentOp::Truncate { len } => {
         let size = self.len();
         if len < size {
-          self.remove(len, size - len);
+          self.remove(len, size.saturating_sub(len));
         } else {
-          self.replace(size, 0, len - size);
+          self.replace(size, 0, len.saturating_sub(size));
         }
       }
       ContentOp::Insert { at, len } => self.replace(at, 0, len),
@@ -159,7 +159,7 @@ impl ContentMap {
     if at > size {
       // A hole is new bytes (zeros the post-state holds).
       self.push(Segment {
-        len: at - size,
+        len: at.saturating_sub(size),
         src: Src::New,
       });
     }
@@ -196,16 +196,16 @@ impl ContentMap {
     let mut index = self.segments.len();
     let mut carry = None;
     for (i, s) in self.segments.iter().enumerate() {
-      if cursor + s.len <= pos {
-        cursor += s.len;
+      if cursor.saturating_add(s.len) <= pos {
+        cursor = cursor.saturating_add(s.len);
         continue;
       }
       if cursor < pos {
         // Split this segment.
-        let keep = pos - cursor;
-        let rest = s.len - keep;
+        let keep = pos.saturating_sub(cursor);
+        let rest = s.len.saturating_sub(keep);
         let rest_src = match s.src {
-          Src::Base(off) => Src::Base(off + keep),
+          Src::Base(off) => Src::Base(off.saturating_add(keep)),
           Src::New => Src::New,
         };
         carry = Some((
@@ -219,7 +219,7 @@ impl ContentMap {
             src: rest_src,
           },
         ));
-        index = i + 1;
+        index = i.saturating_add(1);
       } else {
         index = i;
       }
@@ -243,11 +243,11 @@ impl ContentMap {
     if let Some(last) = self.segments.last_mut() {
       let merge = match (last.src, s.src) {
         (Src::New, Src::New) => true,
-        (Src::Base(a), Src::Base(b)) => a + last.len == b,
+        (Src::Base(a), Src::Base(b)) => a.checked_add(last.len) == Some(b),
         _ => false,
       };
       if merge {
-        last.len += s.len;
+        last.len = last.len.saturating_add(s.len);
         return;
       }
     }
@@ -272,12 +272,12 @@ impl ContentMap {
               post_at: post_cursor,
               new_len: 0,
             });
-            h.base_len += deleted;
+            h.base_len = h.base_len.saturating_add(deleted);
           }
           if let Some(h) = pending.take() {
             out.push(h);
           }
-          base_cursor = off + s.len;
+          base_cursor = off.saturating_add(s.len);
         }
         Src::New => {
           let h = pending.get_or_insert(Hunk {
@@ -286,10 +286,10 @@ impl ContentMap {
             post_at: post_cursor,
             new_len: 0,
           });
-          h.new_len += s.len;
+          h.new_len = h.new_len.saturating_add(s.len);
         }
       }
-      post_cursor += s.len;
+      post_cursor = post_cursor.saturating_add(s.len);
     }
     let trailing = base_len.saturating_sub(base_cursor);
     if trailing > 0 || pending.is_some() {
@@ -299,7 +299,7 @@ impl ContentMap {
         post_at: post_cursor,
         new_len: 0,
       });
-      h.base_len += trailing;
+      h.base_len = h.base_len.saturating_add(trailing);
       out.push(*h);
     }
     out
@@ -350,7 +350,7 @@ pub fn apply_to_bytes(bytes: &mut Vec<u8>, op: ContentOp, fresh: &[u8]) {
       if bytes.len() < at {
         bytes.resize(at, 0);
       }
-      let end = (at + new.len()).min(bytes.len());
+      let end = at.saturating_add(new.len()).min(bytes.len());
       bytes.splice(at..end, new);
     }
     ContentOp::Extend { at, len } => {

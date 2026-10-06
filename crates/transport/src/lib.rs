@@ -20,6 +20,10 @@
 //! every malformation is a typed refusal ([`FrameError`] for a field's bytes), never a panic, the same discipline as
 //! `slates-merge`'s ops-document decode and `slates-bridge-fuse`'s ABI codec.
 
+// The no-panic law (CLAUDE.md, banned item 6): shipped code never overflows or divides by zero. Test builds
+// are exempt. Once a crate is clean this holds it there; out-of-bounds indexing and slicing are denied
+// workspace-wide.
+#![cfg_attr(not(test), deny(clippy::arithmetic_side_effects))]
 // The no-panic law (CLAUDE.md item 6), enforced here ahead of the workspace-wide lint: no indexing,
 // slicing or string slicing that can go out of bounds outside tests.
 #![cfg_attr(

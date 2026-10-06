@@ -216,7 +216,8 @@ impl SetAttrIn {
     let mut r = Reader::new(body);
     let op = Opcode::SetAttr.to_wire();
     let valid = r.u32(op).ok()?;
-    r.skip(size_of::<u32>() + size_of::<u64>(), op).ok()?; // padding, fh
+    r.skip(size_of::<u32>().saturating_add(size_of::<u64>()), op)
+      .ok()?; // padding, fh
     let size = r.u64(op).ok()?;
     r.skip(size_of::<u64>(), op).ok()?; // lock_owner
     let atime_sec = r.u64(op).ok()?;
@@ -303,7 +304,7 @@ impl<'a> RenameIn<'a> {
   /// Parses a rename body; `flagged` is true for `RENAME2` (which has the extra flags word).
   pub fn parse(opcode: u32, body: &'a [u8], flagged: bool) -> Result<RenameIn<'a>, FuseError> {
     let head = if flagged {
-      size_of::<u64>() + 2 * size_of::<u32>()
+      size_of::<u64>().saturating_add(size_of::<u32>().saturating_mul(2))
     } else {
       size_of::<u64>()
     };

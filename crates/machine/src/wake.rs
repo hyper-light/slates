@@ -132,7 +132,7 @@ impl WakeLatency {
     let shift = window
       .saturating_sub(1)
       .checked_ilog2()
-      .map_or(0, |bits| bits + 1);
+      .map_or(0, |bits| bits.saturating_add(1));
     shift.min(WakeEstimate::MAX_SHIFT)
   }
 }
@@ -167,7 +167,10 @@ impl WakeEstimate {
 
   /// Folds one measured wake in.
   pub fn record(&mut self, wake_ns: u64) {
-    self.scaled = self.scaled - (self.scaled >> self.shift) + u128::from(wake_ns);
+    self.scaled = self
+      .scaled
+      .saturating_sub(self.scaled >> self.shift)
+      .saturating_add(u128::from(wake_ns));
     self.samples = self.samples.saturating_add(1);
   }
 
@@ -211,7 +214,7 @@ const DONE: u32 = 2;
 pub fn wake(budget: Duration, placement: &Placement) -> Result<WakeLatency, MachineError> {
   let pairs = core_pairs(placement);
   let saved = SavedAffinity::of_calling_thread();
-  let mut round_budget = budget / WAKE_ROUNDS;
+  let mut round_budget = budget.checked_div(WAKE_ROUNDS).unwrap_or_default();
   let mut rng = Xorshift::new(Xorshift::SEED);
   let mut kept: Vec<u64> = Vec::new();
   let mut round_medians: Vec<Interval> = Vec::new();
@@ -226,9 +229,9 @@ pub fn wake(budget: Duration, placement: &Placement) -> Result<WakeLatency, Mach
     }
     let pair = usize::try_from(rounds)
       .ok()
-      .and_then(|round| pairs.get(round % pairs.len().max(1)))
+      .and_then(|round| pairs.get(round.checked_rem(pairs.len())?))
       .copied();
-    rounds += 1;
+    rounds = rounds.saturating_add(1);
     let outcome = wake_round(pair, round_budget, &mut rng);
     placement = weaker(placement, outcome.placement);
     same_cpu_samples = same_cpu_samples.saturating_add(outcome.same_cpu);
@@ -307,7 +310,10 @@ fn summarize(
 /// its median) do not flag it; a run-long mode — a round several times faster or slower — does.
 pub fn rounds_agree(round_medians: &[Interval], pooled: &Interval) -> Option<bool> {
   let tolerance = u64::try_from(
-    u128::from(pooled.median) * u128::from(CONVERGED_WIDTH_PERMILLE) / u128::from(PERMILLE),
+    u128::from(pooled.median)
+      .saturating_mul(u128::from(CONVERGED_WIDTH_PERMILLE))
+      .checked_div(u128::from(PERMILLE))
+      .unwrap_or(0),
   )
   .unwrap_or(u64::MAX);
   let lower = pooled.lower.saturating_sub(tolerance);

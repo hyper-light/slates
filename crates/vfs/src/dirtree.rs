@@ -260,11 +260,16 @@ impl DirBlock {
   }
 
   fn free_bytes(&self) -> usize {
-    BLOCK_BYTES - self.count() * ENTRY_BYTES - usize::from(self.names_used)
+    BLOCK_BYTES
+      .saturating_sub(self.count().saturating_mul(ENTRY_BYTES))
+      .saturating_sub(usize::from(self.names_used))
   }
 
   fn live_bytes(&self) -> usize {
-    self.count() * ENTRY_BYTES + usize::from(self.names_used - self.names_dead)
+    self
+      .count()
+      .saturating_mul(ENTRY_BYTES)
+      .saturating_add(usize::from(self.names_used.saturating_sub(self.names_dead)))
   }
 
   /// Where `key` sits or would go: `Ok(at)` for the entry equal under `policy`, `Err(at)` for
@@ -333,7 +338,7 @@ impl DirBlock {
   }
 
   fn fits(&self, name_len: usize) -> bool {
-    self.free_bytes() >= ENTRY_BYTES + name_len
+    self.free_bytes() >= ENTRY_BYTES.saturating_add(name_len)
   }
 
   /// Inserts `slot` with `name` at `at`; the caller checked it fits.
@@ -423,8 +428,8 @@ impl DirBlock {
     }
     for at in (half..count).rev() {
       let s = self.slot(at);
-      self.count -= 1;
-      self.names_dead += u16::from(s.name_len);
+      self.count = self.count.saturating_sub(1);
+      self.names_dead = self.names_dead.saturating_add(u16::from(s.name_len));
     }
     self.compact_names();
   }
@@ -528,7 +533,7 @@ impl Tree {
       out.push((h, b.born));
       if depth < self.height {
         for at in 0..b.count() {
-          stack.push((handle_from_word(b.slot(at).child), depth + 1));
+          stack.push((handle_from_word(b.slot(at).child), depth.saturating_add(1)));
         }
       }
     }
@@ -551,7 +556,7 @@ impl Tree {
       out.push((h, b.born));
       if depth < self.height {
         for at in 0..b.count() {
-          stack.push((handle_from_word(b.slot(at).child), depth + 1));
+          stack.push((handle_from_word(b.slot(at).child), depth.saturating_add(1)));
         }
       }
     }
@@ -586,7 +591,7 @@ impl Tree {
         }
         block = fresh;
       }
-      let at = if level + 1 < usize::from(self.height) {
+      let at = if level.saturating_add(1) < usize::from(self.height) {
         blocks.get(block)?.child_for(policy, hash, name)
       } else {
         0
@@ -594,7 +599,7 @@ impl Tree {
       if let Some(recorded) = path.get_mut(level) {
         *recorded = (block, at);
       }
-      if level + 1 < usize::from(self.height) {
+      if level.saturating_add(1) < usize::from(self.height) {
         block = handle_from_word(blocks.get(block)?.slot(at).child);
       }
     }
@@ -618,7 +623,7 @@ impl Tree {
     for level in 0..usize::from(self.height) {
       let node = blocks.get(block)?;
       copies = copies.saturating_add(usize::from(node.born != epoch));
-      if level + 1 < usize::from(self.height) {
+      if level.saturating_add(1) < usize::from(self.height) {
         block = handle_from_word(node.slot(node.child_for(policy, hash, name)).child);
       } else {
         return Ok((copies, node.fits(fit_len)));
@@ -730,7 +735,7 @@ impl Tree {
     };
     Self::admit(blocks, copies.saturating_add(splits))?;
     let path = self.descend_mut(blocks, epoch, retired, policy, hash, name)?;
-    let depth = usize::from(self.height) - 1;
+    let depth = usize::from(self.height).saturating_sub(1);
     let (leaf, _) = step(&path, Some(depth))?;
     let at = match blocks.get(leaf)?.find(policy, hash, name) {
       Ok(_) => return Err(VfsError::AlreadyExists),
@@ -738,7 +743,7 @@ impl Tree {
     };
     let slot = Slot::from_child(hash, child);
     self.insert_split(blocks, epoch, &path, depth, leaf, at, slot, name)?;
-    self.count += 1;
+    self.count = self.count.saturating_add(1);
     Ok(())
   }
 
@@ -774,7 +779,7 @@ impl Tree {
       if !sibling.fits(name.len()) {
         return Err(VfsError::NameTooLong);
       }
-      sibling.insert_at(at - left_count, slot, name);
+      sibling.insert_at(at.saturating_sub(left_count), slot, name);
     }
     let (sep_hash, sep_name) = sibling
       .first_key()
@@ -809,7 +814,7 @@ impl Tree {
       );
       root.insert_at(1, sep, &sep_name);
       self.root = blocks.insert(root)?;
-      self.height += 1;
+      self.height = self.height.saturating_add(1);
       return Ok(());
     }
     let (parent, parent_at) = step(path, depth.checked_sub(1))?;
@@ -817,9 +822,9 @@ impl Tree {
       blocks,
       epoch,
       path,
-      depth - 1,
+      depth.saturating_sub(1),
       parent,
-      parent_at + 1,
+      parent_at.saturating_add(1),
       sep,
       &sep_name,
     )
@@ -851,7 +856,7 @@ impl Tree {
     };
     Self::admit(blocks, copies.saturating_add(splits))?;
     let path = self.descend_mut(blocks, epoch, retired, policy, hash, old)?;
-    let depth = usize::from(self.height) - 1;
+    let depth = usize::from(self.height).saturating_sub(1);
     let (leaf, _) = step(&path, Some(depth))?;
     let Ok(at) = blocks.get(leaf)?.find(policy, hash, old) else {
       return Ok(false);
@@ -879,13 +884,13 @@ impl Tree {
     let (copies, _) = self.descent_cost(blocks, epoch, policy, hash, name, 0)?;
     Self::admit(blocks, copies)?;
     let path = self.descend_mut(blocks, epoch, retired, policy, hash, name)?;
-    let depth = usize::from(self.height) - 1;
+    let depth = usize::from(self.height).saturating_sub(1);
     let (leaf, _) = step(&path, Some(depth))?;
     let Ok(at) = blocks.get(leaf)?.find(policy, hash, name) else {
       return Ok(None);
     };
     let slot = blocks.get_mut(leaf)?.remove_at(at);
-    self.count -= 1;
+    self.count = self.count.saturating_sub(1);
     self.rebalance(blocks, retired, &path, depth)?;
     Ok(Some(slot.to_child()))
   }
@@ -907,7 +912,7 @@ impl Tree {
         let born = blocks.get(self.root)?.born;
         retired.push((self.root, born));
         self.root = child;
-        self.height -= 1;
+        self.height = self.height.saturating_sub(1);
       }
       return Ok(());
     }
@@ -917,24 +922,26 @@ impl Tree {
       blocks.get_mut(parent)?.remove_at(parent_at);
       let born = blocks.get(block)?.born;
       retired.push((block, born));
-      return self.rebalance(blocks, retired, path, depth - 1);
+      return self.rebalance(blocks, retired, path, depth.saturating_sub(1));
     }
     // The separator follows the block's first key.
     self.refresh_separator(blocks, parent, parent_at, block)?;
     let parent_count = blocks.get(parent)?.count();
     let quarter = BLOCK_BYTES / MERGE_BELOW_QUARTER;
-    if blocks.get(block)?.live_bytes() < quarter && parent_at + 1 < parent_count {
-      let right = handle_from_word(blocks.get(parent)?.slot(parent_at + 1).child);
+    if blocks.get(block)?.live_bytes() < quarter && parent_at.saturating_add(1) < parent_count {
+      let right = handle_from_word(blocks.get(parent)?.slot(parent_at.saturating_add(1)).child);
       let right_live = blocks.get(right)?.live_bytes();
       if blocks.get(block)?.free_bytes() >= right_live {
         let right_block = blocks.get(right)?.clone();
         blocks.get_mut(block)?.absorb(&right_block);
-        blocks.get_mut(parent)?.remove_at(parent_at + 1);
+        blocks
+          .get_mut(parent)?
+          .remove_at(parent_at.saturating_add(1));
         retired.push((right, right_block.born));
-        return self.rebalance(blocks, retired, path, depth - 1);
+        return self.rebalance(blocks, retired, path, depth.saturating_sub(1));
       }
     }
-    self.rebalance(blocks, retired, path, depth - 1)
+    self.rebalance(blocks, retired, path, depth.saturating_sub(1))
   }
 
   fn refresh_separator(

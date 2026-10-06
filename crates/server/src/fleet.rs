@@ -560,7 +560,7 @@ pub(crate) fn learn_member(
   );
   match outcome {
     LearnedOutcome::Forged => {
-      *state.refusals.entry(MEMBER_ID_FORGED).or_insert(0) += 1;
+      state.count(MEMBER_ID_FORGED, 1);
     }
     LearnedOutcome::Current => {
       state.authenticated_members.insert(announced);
@@ -1400,9 +1400,7 @@ async fn serve_peer_records(
               if s.merge.fault.refuse_content_puts
                 && (stream == CONTENT_OFFER_STREAM || stream == CONTENT_CHUNK_STREAM)
               {
-                *s.refusals
-                  .entry(crate::merge_service::CONTENT_PUT_REFUSED)
-                  .or_insert(0) += 1;
+                s.count(crate::merge_service::CONTENT_PUT_REFUSED, 1);
                 return Vec::new();
               }
               // Authority for the object the request names is decided before any lookup (AUD-29-45),
@@ -1481,7 +1479,7 @@ async fn serve_peer_records(
                 |state| match crate::owner_location::serve(state, &request) {
                   Ok(reply) => reply,
                   Err(error) => {
-                    *state.refusals.entry(error.counter()).or_insert(0) += 1;
+                    state.count(error.counter(), 1);
                     Vec::new()
                   }
                 },
@@ -1544,7 +1542,7 @@ pub(crate) fn accept_held_record(
 ) -> Vec<u8> {
   // A test's injected refusal: this holder behaves as one that never received the owner's records.
   if state.record_refused_from.contains(&peer_host) {
-    *state.refusals.entry(RECORD_REFUSED_BY_FAULT).or_insert(0) += 1;
+    state.count(RECORD_REFUSED_BY_FAULT, 1);
     return Vec::new();
   }
   if let Err(error) = check_held_record(state, local, peer_host, record) {
@@ -2016,7 +2014,7 @@ fn advance_seals(
         .map(|volume| volume.owner.clone())
       && crate::seal_keys::namer(state, id, crate::seal_keys::tenant_of(&owner)).is_err()
     {
-      *state.refusals.entry(LINEAGE_UNMADE).or_insert(0) += 1;
+      state.count(LINEAGE_UNMADE, 1);
     }
     if !state.seals.contains_key(&object)
       && !start_seal(
@@ -2182,7 +2180,7 @@ fn start_seal(
     state.config.codec.clone(),
   );
   let Ok(archiver) = archiver else {
-    *state.refusals.entry(SEAL_REFUSED).or_insert(0) += 1;
+    state.count(SEAL_REFUSED, 1);
     return false;
   };
   // Content places on the current cohort alone (§4.10): the head names its holders, so a change in flight
@@ -2236,7 +2234,7 @@ fn advance_seal(
     }
     Err(_) => {
       job.archiver = None;
-      *state.refusals.entry(SEAL_REFUSED).or_insert(0) += 1;
+      state.count(SEAL_REFUSED, 1);
       return false;
     }
   };
@@ -2273,7 +2271,7 @@ fn envelope_of(state: &mut ShardState, object: ObjectId, archive: Archive) -> Op
       slates_cluster::envelope::wrap(&archive, &lineage, &namer, archive.base_page_size).ok()
     });
   if sealed.is_none() {
-    *state.refusals.entry(SEAL_ENVELOPE_REFUSED).or_insert(0) += 1;
+    state.count(SEAL_ENVELOPE_REFUSED, 1);
   }
   sealed
 }
@@ -2780,7 +2778,7 @@ async fn fetch_into_hold(
       (FETCH_HOLDER_FAILED, fetched.failed_holders),
     ] {
       if count > 0 {
-        *s.refusals.entry(name).or_insert(0) += count;
+        s.count(name, count);
       }
     }
   });
@@ -2867,7 +2865,7 @@ async fn adopt_pending_tombstones(origin: u16) {
       if adopted == Some(true) {
         s.pending_tombstones.remove(&object);
       } else {
-        *s.refusals.entry(TOMBSTONE_ADOPT_REFUSED).or_insert(0) += 1;
+        s.count(TOMBSTONE_ADOPT_REFUSED, 1);
       }
     });
   }
@@ -2932,7 +2930,7 @@ async fn materialize_pending_greens(origin: u16) {
       if served == Some(true) {
         s.pending_green_materializations.remove(&object);
       } else {
-        *s.refusals.entry(GREEN_TAKEOVER_REFUSED).or_insert(0) += 1;
+        s.count(GREEN_TAKEOVER_REFUSED, 1);
       }
     });
   }
@@ -3011,12 +3009,12 @@ async fn materialize(origin: u16, object: ObjectId, head: HeadValue) {
         let adopted =
           crate::seal_keys::adopt_lineage(s, id, &catalog.owner, lineage, naming.as_ref()).is_ok();
         if !adopted {
-          *s.refusals.entry(LINEAGE_UNADOPTED).or_insert(0) += 1;
+          s.count(LINEAGE_UNADOPTED, 1);
         }
         adopted
       });
       let Some(archive) = opened_archive(s, id, &catalog.owner, adopted, archive) else {
-        *s.refusals.entry(ENVELOPE_UNOPENED).or_insert(0) += 1;
+        s.count(ENVELOPE_UNOPENED, 1);
         return false;
       };
       let served = verbs::materialize_taken_over(s, id, &taken, region, &archive).is_ok();
@@ -3036,7 +3034,7 @@ async fn materialize(origin: u16, object: ObjectId, head: HeadValue) {
       s.pending_materializations.remove(&object);
       s.pending_catalogs.remove(&object);
     } else {
-      *s.refusals.entry(MATERIALIZE_REFUSED).or_insert(0) += 1;
+      s.count(MATERIALIZE_REFUSED, 1);
     }
   });
 }
@@ -3209,7 +3207,7 @@ fn count_accept_failure(error: &EndpointError, plane: &str) {
 pub(crate) fn count_refusal(kind: &'static str) -> u64 {
   state::with_state(|s| {
     let count = s.refusals.entry(kind).or_insert(0);
-    *count += 1;
+    *count = count.saturating_add(1);
     *count
   })
   .unwrap_or(0)
@@ -3952,7 +3950,7 @@ fn serve_council(state: &mut ShardState, peer: HostId, request: &[u8]) -> Vec<u8
   // `a_council_leader_the_failure_detector_holds_dead_is_replaced_and_retired`). Unanswered, it loses CheckQuorum and
   // steps down, and the followers' election timers run and elect one of them.
   if stable_dead_council_members(state).contains(&peer) {
-    *state.refusals.entry(COUNCIL_PEER_HELD_DEAD).or_insert(0) += 1;
+    state.count(COUNCIL_PEER_HELD_DEAD, 1);
     return Vec::new();
   }
   match crate::consensus::decode_message(state, false, peer, request) {
@@ -3999,7 +3997,7 @@ fn serve_council_report(state: &mut ShardState, peer_host: HostId, request: &[u8
     None => ReportOutcome::Refused,
   };
   if outcome == ReportOutcome::Refused {
-    *state.refusals.entry(REPORT_REFUSED).or_insert(0) += 1;
+    state.count(REPORT_REFUSED, 1);
   }
   outcome.encode()
 }
@@ -4105,7 +4103,7 @@ pub(crate) async fn send_council_report(
   in_flight: &mut Vec<Dispatch>,
 ) {
   let voters = state::with_state(|s| {
-    *s.refusals.entry(REPORT_SENT).or_insert(0) += 1;
+    s.count(REPORT_SENT, 1);
     if s.council.is_leader() {
       let _ = s.council.report(local, command);
       return Vec::new();
@@ -5990,7 +5988,7 @@ pub(crate) fn return_sessions(sessions: Vec<(HostId, Endpoint)>) {
           link.endpoint = Some(endpoint);
           link.borrowed = None;
         }
-        _ => *s.refusals.entry(LINK_STALE_RETURN).or_insert(0) += 1,
+        _ => s.count(LINK_STALE_RETURN, 1),
       }
     }
   });
@@ -6043,12 +6041,10 @@ pub(crate) async fn forward_over_leader_session(
         } else {
           "fleet.forward.no_session"
         };
-        *s.refusals.entry(missing).or_insert(0) += 1;
+        s.count(missing, 1);
       }
       if expired {
-        *s.refusals
-          .entry("fleet.forward.session_never_returned")
-          .or_insert(0) += 1;
+        s.count("fleet.forward.session_never_returned", 1);
       }
     });
     if expired {

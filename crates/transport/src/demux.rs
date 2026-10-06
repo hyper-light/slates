@@ -407,26 +407,27 @@ impl Demux {
     let peer = peer.ok_or(EndpointError::NotReady)?;
     if let Some(held) = inner.by_peer.get(&peer) {
       if held.held >= AUTHENTICATED_SESSIONS_PER_PEER {
-        inner.counters.peer_sessions_refused += 1;
+        inner.counters.peer_sessions_refused =
+          inner.counters.peer_sessions_refused.saturating_add(1);
         return Err(EndpointError::Admission(SessionRefusal::PeerSessions));
       }
     } else if inner.by_peer.len() >= self.peer_capacity {
-      inner.counters.peers_refused += 1;
+      inner.counters.peers_refused = inner.counters.peers_refused.saturating_add(1);
       return Err(EndpointError::Admission(SessionRefusal::PeerCapacity));
     }
     if let Some(inbox) = inner.inbox_mut(slot) {
       inbox.certificate = Some(peer.clone());
       inbox.connection_id = Some(id);
     }
-    inner.pending_handshakes -= 1;
+    inner.pending_handshakes = inner.pending_handshakes.saturating_sub(1);
     inner.by_id.insert(id, slot);
     let reservation = inner.by_peer.entry(peer).or_insert(PeerSessions {
       current: None,
       held: 0,
     });
-    reservation.held += 1;
+    reservation.held = reservation.held.saturating_add(1);
     if let Some(previous) = reservation.current.replace(slot) {
-      inner.counters.replaced += 1;
+      inner.counters.replaced = inner.counters.replaced.saturating_add(1);
       inner.close(previous);
     }
     Ok(())
@@ -446,7 +447,7 @@ impl Demux {
     };
     if let Some(certificate) = inbox.certificate {
       if let Some(reservation) = inner.by_peer.get_mut(&certificate) {
-        reservation.held -= 1;
+        reservation.held = reservation.held.saturating_sub(1);
         if reservation.current == Some(slot) {
           reservation.current = None;
         }
@@ -455,7 +456,7 @@ impl Demux {
         }
       }
     } else {
-      inner.pending_handshakes -= 1;
+      inner.pending_handshakes = inner.pending_handshakes.saturating_sub(1);
     }
     if let Some(generation) = inner.generations.get_mut(index) {
       *generation = generation.wrapping_add(1);
@@ -471,7 +472,7 @@ impl Demux {
       let target = connection_id_of(datagram).and_then(|id| inner.by_id.get(&id).copied());
       match target {
         Some(slot) => inner.deliver(self.inbox_datagrams, slot, datagram),
-        None => inner.counters.unknown_id += 1,
+        None => inner.counters.unknown_id = inner.counters.unknown_id.saturating_add(1),
       }
       return;
     }
@@ -489,9 +490,11 @@ impl Demux {
           waker.wake();
         }
       }
-      Err(OpenRefusal::Exhausted) => inner.counters.sessions_refused += 1,
+      Err(OpenRefusal::Exhausted) => {
+        inner.counters.sessions_refused = inner.counters.sessions_refused.saturating_add(1)
+      }
       Err(OpenRefusal::Setup(error)) => {
-        inner.counters.setup_refused += 1;
+        inner.counters.setup_refused = inner.counters.setup_refused.saturating_add(1);
         inner.last_setup_refusal = Some(format!("{error:?}"));
       }
     }
@@ -519,11 +522,11 @@ impl Inner {
   /// Queues a datagram for a session and wakes its reader; an inbox at `capacity` drops it, counted.
   fn deliver(&mut self, capacity: usize, slot: Slot, datagram: &[u8]) {
     let Some(inbox) = self.inbox_mut(slot) else {
-      self.counters.unknown_id += 1;
+      self.counters.unknown_id = self.counters.unknown_id.saturating_add(1);
       return;
     };
     if inbox.queue.len() >= capacity {
-      self.counters.inbox_full += 1;
+      self.counters.inbox_full = self.counters.inbox_full.saturating_add(1);
       return;
     }
     inbox.queue.push_back(datagram.to_vec());
@@ -587,8 +590,8 @@ impl Inner {
     }
     self.by_source.insert(from, slot);
     self.pending.push_back(endpoint);
-    self.pending_handshakes += 1;
-    self.counters.opened += 1;
+    self.pending_handshakes = self.pending_handshakes.saturating_add(1);
+    self.counters.opened = self.counters.opened.saturating_add(1);
     // The pool's high-water mark: every slot not on the free list is held, whatever its session's state.
     let held = u64::try_from(self.slots.len().saturating_sub(self.free.len())).unwrap_or(u64::MAX);
     self.counters.high_water = self.counters.high_water.max(held);

@@ -497,9 +497,14 @@ impl DaemonConfig {
     let volume_record_bytes =
       u64::try_from(size_of::<slates_db::catalog::VolumeRecord>()).unwrap_or(1);
     let volumes: Derived<usize> = derived!(
-      usize::try_from(tables.get() / volume_record_bytes.max(1))
-        .unwrap_or(usize::MAX)
-        .max(1),
+      usize::try_from(
+        tables
+          .get()
+          .checked_div(volume_record_bytes.max(1))
+          .unwrap_or(0)
+      )
+      .unwrap_or(usize::MAX)
+      .max(1),
       "table_bytes / size_of::<VolumeRecord>()",
       ["table_bytes"]
     );
@@ -602,7 +607,7 @@ impl DaemonConfig {
       volumes: volumes.get(),
       snapshots: volumes.get(),
       attachments: admission.get(),
-      segment_slots: usize::try_from(page / volume_record_bytes.max(1))
+      segment_slots: usize::try_from(page.checked_div(volume_record_bytes.max(1)).unwrap_or(0))
         .unwrap_or(1)
         .max(1),
       timers: volumes.get(),
@@ -622,24 +627,36 @@ impl DaemonConfig {
     let inode_unit = u64::try_from(slates_vfs::volume::inode_unit_bytes()).unwrap_or(1);
     let dir_unit = u64::try_from(slates_vfs::volume::directory_unit_bytes()).unwrap_or(1);
     let max_inodes: Derived<usize> = derived!(
-      usize::try_from(reserve.get() / inode_unit.max(1) / STORE_TABLE_DIVISOR)
-        .unwrap_or(usize::MAX)
-        .max(1),
+      usize::try_from(
+        reserve
+          .get()
+          .checked_div(inode_unit.max(1))
+          .and_then(|slots| slots.checked_div(STORE_TABLE_DIVISOR))
+          .unwrap_or(0),
+      )
+      .unwrap_or(usize::MAX)
+      .max(1),
       "metadata_class / (Slot<Inode> + Slot<TrieNode>) / STORE_TABLE_DIVISOR",
       ["reserve_per_shard", "vfs.inode_unit_bytes"]
     );
     derivations.push(note("max_inodes", &max_inodes));
     let max_dirs: Derived<usize> = derived!(
-      usize::try_from(reserve.get() / dir_unit.max(1) / STORE_TABLE_DIVISOR)
-        .unwrap_or(usize::MAX)
-        .max(1),
+      usize::try_from(
+        reserve
+          .get()
+          .checked_div(dir_unit.max(1))
+          .and_then(|slots| slots.checked_div(STORE_TABLE_DIVISOR))
+          .unwrap_or(0),
+      )
+      .unwrap_or(usize::MAX)
+      .max(1),
       "metadata_class / (Slot<DirNode> + Slot<DirBlock>) / STORE_TABLE_DIVISOR",
       ["reserve_per_shard", "vfs.directory_unit_bytes"]
     );
     derivations.push(note("max_dirs", &max_dirs));
     let granule = u64::try_from(content_granule(usize::try_from(page).unwrap_or(1))).unwrap_or(1);
     let max_chunks: Derived<usize> = derived!(
-      usize::try_from(reserve.get() / granule.max(1))
+      usize::try_from(reserve.get().checked_div(granule.max(1)).unwrap_or(0))
         .unwrap_or(usize::MAX)
         .max(1),
       "reserve_per_shard / content_granule (one chunk per granule at least)",
@@ -687,7 +704,12 @@ impl DaemonConfig {
       .max(1);
     let clients: Derived<usize> = derived!(
       usize::try_from(
-        reserve.get().saturating_mul(CLIENT_SHARE_PERMILLE) / PERMILLE / region_bytes
+        reserve
+          .get()
+          .saturating_mul(CLIENT_SHARE_PERMILLE)
+          .checked_div(PERMILLE)
+          .and_then(|share| share.checked_div(region_bytes))
+          .unwrap_or(0)
       )
       .unwrap_or(usize::MAX)
       .max(1),
@@ -863,7 +885,11 @@ fn nfs_v4_caps(
     .max(1);
   let clients: Derived<usize> = derived!(
     usize::try_from(
-      reserve_per_shard.saturating_mul(CLIENT_SHARE_PERMILLE) / PERMILLE / client_bytes
+      reserve_per_shard
+        .saturating_mul(CLIENT_SHARE_PERMILLE)
+        .checked_div(PERMILLE)
+        .and_then(|share| share.checked_div(client_bytes))
+        .unwrap_or(0)
     )
     .unwrap_or(usize::MAX)
     .max(1),
@@ -1037,8 +1063,9 @@ impl DaemonConfig {
       (self
         .reserve_per_shard
         .saturating_mul(FLEET_RECEIVE_SHARE_PERMILLE)
-        / PERMILLE
-        / u64::try_from(fleet_sessions).unwrap_or(u64::MAX))
+        .checked_div(PERMILLE)
+        .and_then(|share| share.checked_div(u64::try_from(fleet_sessions).unwrap_or(u64::MAX)))
+        .unwrap_or(0))
       .max(slates_transport::connection::initial_receive_window(
         crate::fleet::FLEET_FRAME_CAP
       )),

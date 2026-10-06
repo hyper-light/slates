@@ -905,10 +905,10 @@ impl Daemon {
   pub fn flood_control_channel(&self) -> Result<usize, ObserveError> {
     let shard = self.shards.first().copied().ok_or(ObserveError::NoTarget)?;
     let runtime = self.runtime.as_ref().ok_or(ObserveError::NoRuntime)?;
-    let mut queued = 0;
+    let mut queued: usize = 0;
     loop {
       match runtime.spawn_on(shard, async {}) {
-        Ok(()) => queued += 1,
+        Ok(()) => queued = queued.saturating_add(1),
         Err(slates_rt::RtError::ControlFull { .. }) => return Ok(queued),
         Err(slates_rt::RtError::ShardGone { shard }) => {
           return Err(ObserveError::ShardGone {
@@ -1090,7 +1090,7 @@ impl Daemon {
       match receipt.wait(std::time::Duration::from_nanos(OBSERVE_BUDGET_NS)) {
         Some(slates_rt::Admission::Admitted(_)) => {
           fill.releases.push(release);
-          fill.admitted += 1;
+          fill.admitted = fill.admitted.saturating_add(1);
         }
         Some(slates_rt::Admission::Refused(slates_rt::RtError::TooManyTasks { .. })) => {
           fill.reached_the_bound = true;
@@ -1927,7 +1927,12 @@ impl Daemon {
         .filter_map(|(index, bytes)| {
           slates_merge::engine::Increment::decode(bytes)
             .ok()
-            .map(|increment| (u64::try_from(index).unwrap_or(u64::MAX) + 1, increment.id))
+            .map(|increment| {
+              (
+                u64::try_from(index).unwrap_or(u64::MAX).saturating_add(1),
+                increment.id,
+              )
+            })
         })
         .collect()
     })
@@ -3104,7 +3109,9 @@ fn refresh_pressure_hold() {
   let shortfall = baseline
     .saturating_sub(available)
     .saturating_sub(own_growth);
-  let per_shard = shortfall / u64::try_from(shards.len().max(1)).unwrap_or(1);
+  let per_shard = shortfall
+    .checked_div(u64::try_from(shards.len().max(1)).unwrap_or(1))
+    .unwrap_or(0);
   for shard in shards {
     let _ = crate::xshard::run_on(origin, shard, move |s| {
       if !s.pressure_pinned {

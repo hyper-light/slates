@@ -154,7 +154,10 @@ impl DeviceConfig {
 /// `max_write` — the largest request the guest kernel can send is one full write.
 pub fn readable_cap() -> Derived<u64> {
   derived!(
-    u64::try_from(IN_HEADER_LEN).unwrap_or(u64::MAX) + WRITE_IN_LEN + u64::from(MAX_WRITE),
+    u64::try_from(IN_HEADER_LEN)
+      .unwrap_or(u64::MAX)
+      .saturating_add(WRITE_IN_LEN)
+      .saturating_add(u64::from(MAX_WRITE)),
     "fuse_in_header + fuse_write_in + max_write (the largest request a guest kernel can send is a full write)",
     ["fuse.in_header_len", "fuse.write_in_len", "fuse.max_write"]
   )
@@ -165,8 +168,9 @@ pub fn readable_cap() -> Derived<u64> {
 /// the largest guest base page.
 pub fn writable_cap() -> Derived<u64> {
   derived!(
-    u64::try_from(OUT_HEADER_LEN).unwrap_or(u64::MAX)
-      + FUSE_DEFAULT_MAX_PAGES_PER_REQ * LARGEST_GUEST_PAGE,
+    u64::try_from(OUT_HEADER_LEN)
+      .unwrap_or(u64::MAX)
+      .saturating_add(FUSE_DEFAULT_MAX_PAGES_PER_REQ.saturating_mul(LARGEST_GUEST_PAGE)),
     "fuse_out_header + FUSE_DEFAULT_MAX_PAGES_PER_REQ × the largest guest base page (the largest READ reply a guest kernel asks for at the default max_pages)",
     [
       "fuse.out_header_len",

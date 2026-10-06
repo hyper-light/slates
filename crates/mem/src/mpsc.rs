@@ -65,7 +65,7 @@ impl MpscRing {
       .collect();
     Ok(Self {
       slots: slots.into_boxed_slice(),
-      mask: capacity - 1,
+      mask: capacity.saturating_sub(1),
       head: Padded(AtomicUsize::new(0)),
       tail: Padded(AtomicUsize::new(0)),
       consumer_held: AtomicBool::new(false),
@@ -74,7 +74,7 @@ impl MpscRing {
 
   /// Slots.
   pub const fn capacity(&self) -> usize {
-    self.mask + 1
+    self.mask.saturating_add(1)
   }
 
   /// Pushes from any thread; returns the word back when the ring is full.

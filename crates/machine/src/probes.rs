@@ -137,7 +137,7 @@ pub fn syscall(budget: Duration) -> Measurement {
 pub fn faults(page: &PageFacts, budget: Duration) -> FaultCosts {
   let region = page.base.saturating_mul(FAULT_REGION_PAGES);
   // Shape: the three sub-probes (map/unmap baseline, base pages, populated pages) share the budget.
-  let per_probe = budget / 3;
+  let per_probe = budget.checked_div(3).unwrap_or_default();
   let map_unmap_region = measure(
     || platform::map_touch_unmap(region, page.base, Touch::None),
     per_probe,
@@ -152,7 +152,8 @@ pub fn faults(page: &PageFacts, budget: Duration) -> FaultCosts {
     / FAULT_REGION_PAGES;
   let populated_ns = platform::populated(region, page.base, per_probe)
     .map(|m| m.median_ns().saturating_sub(map_unmap_region.median_ns()) / FAULT_REGION_PAGES);
-  let huge_ns = platform::huge(page, per_probe).map(|(m, pages)| m.median_ns() / pages.max(1));
+  let huge_ns =
+    platform::huge(page, per_probe).map(|(m, pages)| m.median_ns().checked_div(pages).unwrap_or(0));
   FaultCosts {
     base_ns,
     base_region,
@@ -186,7 +187,9 @@ pub fn core_matrix(cores: &[CoreFacts], budget: Duration) -> (Vec<CorePairRtt>, 
     return (Vec::new(), Pinning::Refused);
   }
   let came_in_with = platform::current_affinity();
-  let per_pair = budget / u32::try_from(pairs.len()).unwrap_or(u32::MAX).max(1);
+  let per_pair = budget
+    .checked_div(u32::try_from(pairs.len()).unwrap_or(u32::MAX).max(1))
+    .unwrap_or_default();
   let mut pinning = Pinning::Pinned;
   let mut out = Vec::with_capacity(pairs.len());
   for (a, b) in pairs {
@@ -317,7 +320,9 @@ pub fn memcpy_curve(cache_line: u64, cap: u64, budget: Duration) -> Vec<MemcpyPo
   if sizes.is_empty() {
     return Vec::new();
   }
-  let per_point = budget / u32::try_from(sizes.len()).unwrap_or(u32::MAX).max(1);
+  let per_point = budget
+    .checked_div(u32::try_from(sizes.len()).unwrap_or(u32::MAX).max(1))
+    .unwrap_or_default();
   let largest = usize::try_from(*sizes.last().unwrap_or(&0)).unwrap_or(0);
   let src = filled(largest, Xorshift::SEED);
   let mut dst = vec![0u8; largest];
@@ -366,8 +371,10 @@ pub fn hash(bytes: u64, budget: Duration) -> HashThroughput {
 #[cfg(feature = "codecs")]
 pub fn codecs(bytes: u64, budget: Duration) -> Vec<CodecPoint> {
   let corpus = corpus(usize::try_from(bytes).unwrap_or(0));
-  let points = 1 + ZSTD_LEVELS.len();
-  let per_point = budget / u32::try_from(points).unwrap_or(u32::MAX).max(1);
+  let points = ZSTD_LEVELS.len().saturating_add(1);
+  let per_point = budget
+    .checked_div(u32::try_from(points).unwrap_or(u32::MAX).max(1))
+    .unwrap_or_default();
   let mut out = Vec::with_capacity(points);
   out.push(lz4_point(&corpus, per_point));
   for level in ZSTD_LEVELS {
@@ -389,7 +396,7 @@ fn lz4_point(corpus: &[u8], budget: Duration) -> CodecPoint {
     || {
       std::hint::black_box(lz4_flex::block::compress_prepend_size(corpus));
     },
-    budget / 2,
+    budget.checked_div(2).unwrap_or_default(),
   );
   let decompress = measure(
     || {
@@ -397,7 +404,7 @@ fn lz4_point(corpus: &[u8], budget: Duration) -> CodecPoint {
         lz4_flex::block::decompress_size_prepended(&compressed).unwrap_or_default(),
       );
     },
-    budget / 2,
+    budget.checked_div(2).unwrap_or_default(),
   );
   point("lz4", 0, corpus, &compressed, compress, decompress)
 }
@@ -409,14 +416,14 @@ fn zstd_point(corpus: &[u8], level: i32, budget: Duration) -> CodecPoint {
     || {
       std::hint::black_box(zstd::bulk::compress(corpus, level).unwrap_or_default());
     },
-    budget / 2,
+    budget.checked_div(2).unwrap_or_default(),
   );
   let capacity = corpus.len();
   let decompress = measure(
     || {
       std::hint::black_box(zstd::bulk::decompress(&compressed, capacity).unwrap_or_default());
     },
-    budget / 2,
+    budget.checked_div(2).unwrap_or_default(),
   );
   point("zstd", level, corpus, &compressed, compress, decompress)
 }
@@ -436,7 +443,10 @@ fn point(
     0
   } else {
     u64::try_from(
-      u128::from(u64::try_from(compressed.len()).unwrap_or(0)) * PERMILLE / u128::from(bytes),
+      u128::from(u64::try_from(compressed.len()).unwrap_or(0))
+        .saturating_mul(PERMILLE)
+        .checked_div(u128::from(bytes))
+        .unwrap_or(0),
     )
     .unwrap_or(u64::MAX)
   };
@@ -620,17 +630,24 @@ mod platform {
     // a region of two of them, over-mapped by one so it can be aligned, is the probe.
     let huge = page.huge.first().copied().unwrap_or(2 * 1024 * 1024);
     let huge_usize = usize::try_from(huge).ok()?;
-    let pages = huge / page.base.max(1) * 2;
+    let pages = huge
+      .checked_div(page.base.max(1))
+      .unwrap_or(0)
+      .saturating_mul(2);
     // Shape: one huge page more than the two-page span, so the span can be aligned within it.
-    let len = huge_usize * 3;
+    let len = huge_usize.saturating_mul(3);
     let base = usize::try_from(page.base).ok()?;
     Some((
       crate::bench::measure(
         || {
           if let Ok(mut map) = MmapMut::map_anon(len) {
             let _ = map.advise(memmap2::Advice::HugePage);
-            let start = map.as_ptr().addr().next_multiple_of(huge_usize) - map.as_ptr().addr();
-            let span = huge_usize * 2;
+            let start = map
+              .as_ptr()
+              .addr()
+              .next_multiple_of(huge_usize)
+              .saturating_sub(map.as_ptr().addr());
+            let span = huge_usize.saturating_mul(2);
             let end = start.saturating_add(span);
             let mut at = start;
             while at < end
@@ -874,7 +891,7 @@ mod platform {
       while at < len {
         // SAFETY: `at < len` within a committed region.
         unsafe { p.add(at).write_volatile(1) };
-        at += page;
+        at = at.saturating_add(page);
       }
     }
     free(p);

@@ -108,11 +108,16 @@ impl Piece {
           len: offset,
         },
         Piece::Base {
-          base_at: base_at + offset,
-          len: len - offset,
+          base_at: base_at.saturating_add(offset),
+          len: len.saturating_sub(offset),
         },
       ),
-      Piece::New { len } => (Piece::New { len: offset }, Piece::New { len: len - offset }),
+      Piece::New { len } => (
+        Piece::New { len: offset },
+        Piece::New {
+          len: len.saturating_sub(offset),
+        },
+      ),
     }
   }
 }
@@ -154,7 +159,7 @@ fn apply(pieces: &mut Vec<Piece>, op: &ContentOp) {
         return;
       }
       let start = split_at(pieces, at);
-      let end = split_at(pieces, at + len);
+      let end = split_at(pieces, at.saturating_add(len));
       pieces.drain(start..end);
       pieces.insert(start, Piece::New { len });
     }
@@ -170,7 +175,7 @@ fn apply(pieces: &mut Vec<Piece>, op: &ContentOp) {
         return;
       }
       let start = split_at(pieces, at);
-      let end = split_at(pieces, at + len);
+      let end = split_at(pieces, at.saturating_add(len));
       pieces.drain(start..end);
     }
     ContentOp::Truncate { len } => {
@@ -179,7 +184,9 @@ fn apply(pieces: &mut Vec<Piece>, op: &ContentOp) {
         let cut = split_at(pieces, len);
         pieces.truncate(cut);
       } else if len > total {
-        pieces.push(Piece::New { len: len - total });
+        pieces.push(Piece::New {
+          len: len.saturating_sub(total),
+        });
       }
     }
   }
@@ -245,8 +252,8 @@ fn read_out(base_len: u64, pieces: &[Piece]) -> Vec<Op> {
     let run_src = final_offset;
     let mut run_len = 0u64;
     while let Some(Piece::New { len }) = pieces.get(index) {
-      run_len += *len;
-      index += 1;
+      run_len = run_len.saturating_add(*len);
+      index = index.saturating_add(1);
     }
     // The base bytes covered before the next surviving base piece (or the base tail at the end)
     // are gone: replaced by the new run, or deleted.
@@ -264,13 +271,13 @@ fn read_out(base_len: u64, pieces: &[Piece]) -> Vec<Op> {
       run_src,
       at_end,
     );
-    base_cursor += base_skip;
-    final_offset += run_len;
+    base_cursor = base_cursor.saturating_add(base_skip);
+    final_offset = final_offset.saturating_add(run_len);
     if let Some(surviving) = pieces.get(index) {
       let len = surviving.len();
-      base_cursor += len;
-      final_offset += len;
-      index += 1;
+      base_cursor = base_cursor.saturating_add(len);
+      final_offset = final_offset.saturating_add(len);
+      index = index.saturating_add(1);
     }
   }
   // Any base beyond the last surviving piece was truncated away, with nothing added after it: a
@@ -279,7 +286,7 @@ fn read_out(base_len: u64, pieces: &[Piece]) -> Vec<Op> {
     ops.push(op(
       OpKind::Truncate,
       base_cursor,
-      base_len - base_cursor,
+      base_len.saturating_sub(base_cursor),
       u64::MAX,
     ));
   }
@@ -302,7 +309,7 @@ fn emit(
     (skip, 0) => {
       // A pure removal: to the base end is a truncate (its `at` is the new length), within it a
       // delete.
-      if at_end && at + skip == base_len {
+      if at_end && at.saturating_add(skip) == base_len {
         ops.push(op(OpKind::Truncate, at, skip, u64::MAX));
       } else {
         ops.push(op(OpKind::Delete, at, skip, u64::MAX));

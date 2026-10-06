@@ -713,7 +713,7 @@ mod platform {
       .chars()
       .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
       .collect();
-    if 1 + clean.len() + suffix.len() <= NAME_LIMIT {
+    if clean.len().saturating_add(suffix.len()).saturating_add(1) <= NAME_LIMIT {
       return format!("/{clean}{suffix}");
     }
     let mut hash = FNV_OFFSET;
@@ -1103,18 +1103,26 @@ mod platform {
       })
     }
 
+    /// The bitmap word holding `granule` and its bit in that word.
+    fn position(granule: usize) -> (usize, u64) {
+      let bits = usize::try_from(u64::BITS).unwrap_or(1);
+      let word = granule.checked_div(bits).unwrap_or(0);
+      let bit = u32::try_from(granule.checked_rem(bits).unwrap_or(0)).unwrap_or(0);
+      (word, 1u64.checked_shl(bit).unwrap_or(0))
+    }
+
     fn is_committed(&self, granule: usize) -> bool {
-      let bits = u64::BITS as usize;
+      let (word, bit) = Self::position(granule);
       self
         .bits
-        .get(granule / bits)
-        .is_some_and(|word| word.get() & (1 << (granule % bits)) != 0)
+        .get(word)
+        .is_some_and(|word| word.get() & bit != 0)
     }
 
     fn mark(&self, granule: usize) {
-      let bits = u64::BITS as usize;
-      if let Some(word) = self.bits.get(granule / bits) {
-        word.set(word.get() | (1 << (granule % bits)));
+      let (word, bit) = Self::position(granule);
+      if let Some(word) = self.bits.get(word) {
+        word.set(word.get() | bit);
       }
     }
 
@@ -1124,27 +1132,37 @@ mod platform {
       if len == 0 {
         return Ok(());
       }
-      let first = offset / self.granule;
-      let last = (offset + len - 1) / self.granule;
+      let granule_of = |at: usize| at.checked_div(self.granule).unwrap_or(0);
+      let first = granule_of(offset);
+      // `len >= 1`; a range past `usize::MAX` saturates and is clamped to the view below.
+      let last = granule_of(offset.saturating_add(len).saturating_sub(1));
       let mut granule = first;
       while granule <= last {
         if self.is_committed(granule) {
-          granule += 1;
+          granule = granule.saturating_add(1);
           continue;
         }
         let run_start = granule;
         while granule <= last && !self.is_committed(granule) {
-          granule += 1;
+          granule = granule.saturating_add(1);
         }
-        let start = run_start * self.granule;
-        let end = (granule * self.granule).min(inner.len);
+        let start = run_start.saturating_mul(self.granule);
+        let end = granule.saturating_mul(self.granule).min(inner.len);
+        // A run starting at or past the view's end has nothing to commit; refused rather than formed into a
+        // pointer past the view (callers pass ranges inside it, so this never runs).
+        let Some(span) = end.checked_sub(start).filter(|span| *span > 0) else {
+          return Err(MemError::TooLarge {
+            len: offset.saturating_add(len),
+            max: inner.len,
+          });
+        };
         // SAFETY: `[start, end)` lies inside this process's view of the section (`end` is clamped to
-        // its length); committing pages of a view of a `SEC_RESERVE` section is the documented use,
-        // and committing a page already committed is allowed.
+        // its length and `start < end` was just checked); committing pages of a view of a `SEC_RESERVE`
+        // section is the documented use, and committing a page already committed is allowed.
         let committed = unsafe {
           VirtualAlloc(
             inner.view_ptr().cast::<u8>().add(start).cast(),
-            end - start,
+            span,
             MEM_COMMIT,
             PAGE_READWRITE,
           )

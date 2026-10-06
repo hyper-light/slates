@@ -188,7 +188,10 @@ pub fn spans_per_reply(chunk_bytes: usize) -> Derived<usize> {
   let fixed = fixed_report_bytes();
   let per_span = span_record_bytes().max(1);
   derived!(
-    chunk_bytes.saturating_sub(fixed) / per_span,
+    chunk_bytes
+      .saturating_sub(fixed)
+      .checked_div(per_span)
+      .unwrap_or(0),
     "(bulk chunk bytes − encoded fixed report bytes) / encoded span record bytes",
     [
       "ipc.bulk_chunk_bytes",

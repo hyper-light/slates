@@ -162,8 +162,10 @@ impl Copa {
     // Increase when the current rate `cwnd/RTTstanding` is at or below the target `1/(δ·d_q)` (in bytes,
     // `inv_delta·smss/d_q`): `cwnd·d_q ≤ inv_delta·smss·RTTstanding`; an empty queue always increases.
     let increase = queueing == 0
-      || u128::from(self.cwnd) * u128::from(queueing)
-        <= u128::from(self.inv_delta) * u128::from(self.smss) * u128::from(standing);
+      || u128::from(self.cwnd).saturating_mul(u128::from(queueing))
+        <= u128::from(self.inv_delta)
+          .saturating_mul(u128::from(self.smss))
+          .saturating_mul(u128::from(standing));
     if increase && !event.cwnd_limited {
       // RFC 9002 §7.8: a window the sender is not using does not grow (Copa's delay signal would otherwise
       // keep raising an idle flow's window without bound). It still shrinks: the guard once skipped every
@@ -197,13 +199,14 @@ impl Copa {
     }
     // cwnd ± v/(δ·cwnd) packets per acknowledged packet, in bytes: acked · smss · v · (1/δ) / cwnd.
     let numerator = u128::from(event.newly_acked)
-      * u128::from(self.smss)
-      * u128::from(self.velocity)
-      * u128::from(self.inv_delta)
-      + u128::from(self.step_remainder);
+      .saturating_mul(u128::from(self.smss))
+      .saturating_mul(u128::from(self.velocity))
+      .saturating_mul(u128::from(self.inv_delta))
+      .saturating_add(u128::from(self.step_remainder));
     let denominator = u128::from(self.cwnd.max(1));
-    let step = u64::try_from(numerator / denominator).unwrap_or(u64::MAX);
-    self.step_remainder = u64::try_from(numerator % denominator).unwrap_or(0);
+    let step = u64::try_from(numerator.checked_div(denominator).unwrap_or(0)).unwrap_or(u64::MAX);
+    self.step_remainder =
+      u64::try_from(numerator.checked_rem(denominator).unwrap_or(0)).unwrap_or(0);
     if increase {
       self.cwnd = self.cwnd.saturating_add(step);
     } else {
@@ -237,7 +240,12 @@ impl Copa {
       self.velocity = 1;
       self.same_direction = 0;
     }
-    let cap = (self.cwnd / self.smss.max(1) / self.inv_delta.max(1)).max(1);
+    let cap = self
+      .cwnd
+      .checked_div(self.smss.max(1))
+      .and_then(|packets| packets.checked_div(self.inv_delta.max(1)))
+      .unwrap_or(0)
+      .max(1);
     self.velocity = self.velocity.min(cap);
     self.direction = direction;
     self.direction_mark = Some((now, self.cwnd));

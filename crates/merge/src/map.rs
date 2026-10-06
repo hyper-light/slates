@@ -77,14 +77,14 @@ fn map_through_one(ops: &[Op], range: Range) -> Mapped {
     }
     if at.saturating_add(old_len) <= range.start {
       // Entirely before the range (or ending exactly at its start): it shifts the range.
-      shift += i128::from(new_len) - i128::from(old_len);
+      shift = shift.saturating_add(i128::from(new_len).saturating_sub(i128::from(old_len)));
     } else if at >= range.end() {
       // Entirely after the range; every later op is further still (sorted), so stop.
       break;
     }
     // Otherwise it touches a boundary without overlapping (the edge rule): no shift, no stop.
   }
-  let shifted = i128::from(range.start) + shift;
+  let shifted = i128::from(range.start).saturating_add(shift);
   let start = u64::try_from(shifted.max(0)).unwrap_or(0);
   Mapped::Shifted(Range::new(start, range.len))
 }

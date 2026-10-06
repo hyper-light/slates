@@ -89,7 +89,7 @@ impl StreamSender {
       return None;
     }
     let start = self.send_offset;
-    let want = (sendable_end - start).min(max_frame_len as u64);
+    let want = sendable_end.saturating_sub(start).min(max_frame_len as u64);
     let lo = usize::try_from(start)
       .unwrap_or(usize::MAX)
       .min(self.buffered.len());
@@ -101,7 +101,7 @@ impl StreamSender {
       .get(lo..hi)
       .map(<[u8]>::to_vec)
       .unwrap_or_default();
-    self.send_offset = start + (hi - lo) as u64;
+    self.send_offset = start.saturating_add(hi.saturating_sub(lo) as u64);
     // The fin rides the frame that carries the final byte (when the credit reaches the end).
     let fin = self.finished && self.send_offset == self.buffered.len() as u64;
     if fin {
@@ -284,7 +284,7 @@ impl StreamAssembler {
   pub fn read(&mut self) -> Vec<u8> {
     let mut out = Vec::new();
     while let Some(segment) = self.buffered.remove(&self.read_offset) {
-      self.read_offset += segment.len() as u64;
+      self.read_offset = self.read_offset.saturating_add(segment.len() as u64);
       out.extend_from_slice(&segment);
     }
     out
@@ -310,7 +310,7 @@ impl StreamAssembler {
       .iter()
       .next_back()
       .map_or(self.read_offset, |(start, bytes)| {
-        start + bytes.len() as u64
+        start.saturating_add(bytes.len() as u64)
       })
       .max(self.read_offset)
       .max(self.fin.unwrap_or(0))

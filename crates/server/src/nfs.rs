@@ -680,7 +680,7 @@ fn unmount_capability(_capability: Option<MountCapability>, args: &[u8]) {
   })
   .unwrap_or_default();
   if mounts.is_empty() {
-    let _ = state::with_state(|s| *s.refusals.entry("nfs.unmount_refused").or_insert(0) += 1);
+    let _ = state::with_state(|s| s.count("nfs.unmount_refused", 1));
     return;
   }
   match futures::spawn(confirm_unmount(name, mounts)) {
@@ -723,19 +723,19 @@ async fn confirm_unmount(name: String, mounts: Vec<(u64, String)>) {
               crate::verbs::end_attachment(s, &record, crate::verbs::Ending::Otherwise).is_ok()
             });
           if !ended {
-            *s.refusals.entry("nfs.unmount_refused").or_insert(0) += 1;
+            s.count("nfs.unmount_refused", 1);
           }
         }
       });
       return;
     }
     if futures::now_ns().saturating_sub(began) >= UNMOUNT_CONFIRM_NS {
-      let _ = state::with_state(|s| *s.refusals.entry("nfs.unmount_unconfirmed").or_insert(0) += 1);
+      let _ = state::with_state(|s| s.count("nfs.unmount_unconfirmed", 1));
       return;
     }
     if futures::sleep(poll).await.is_err() {
       // Off a shard no poll can be timed: the confirmation is given up, counted, never spun on.
-      let _ = state::with_state(|s| *s.refusals.entry("nfs.unmount_unconfirmed").or_insert(0) += 1);
+      let _ = state::with_state(|s| s.count("nfs.unmount_unconfirmed", 1));
       return;
     }
   }
@@ -781,7 +781,7 @@ fn split_mount_capability(args: &[u8]) -> Option<(String, MountCapability)> {
   let (attachment_hex, token_hex) = capability.split_once('.')?;
   let attachment = u64::from_str_radix(attachment_hex, HEX_RADIX).ok()?;
   let hex = token_hex.as_bytes();
-  if hex.len() != size_of::<[u8; 16]>() * 2 {
+  if hex.len() != size_of::<[u8; 16]>().saturating_mul(2) {
     return None;
   }
   let mut token = [0u8; 16];
@@ -856,7 +856,7 @@ fn refused_for_write_delegation(
       .as_mut()
       .is_some_and(|files| files.check_read_conflicts(&fh, client, now));
     if waiting {
-      *s.refusals.entry(GETATTR_RECALLED).or_insert(0) += 1;
+      s.count(GETATTR_RECALLED, 1);
       crate::delegation::drain(s);
     }
     waiting
@@ -1250,7 +1250,7 @@ async fn serve_local_held(
     if !refused_by_gate || now >= until {
       return served;
     }
-    let _ = state::with_state(|s| *s.refusals.entry(V3_HELD).or_insert(0) += 1);
+    let _ = state::with_state(|s| s.count(V3_HELD, 1));
     let parked = futures::within(
       until.saturating_sub(now),
       std::future::poll_fn(|cx| {
@@ -1546,7 +1546,7 @@ const NFS4_NOTE_LOST: &str = "nfs4.notes.lost";
 
 /// Counts one `counter` on this shard; off a shard (no state) nothing is counted.
 fn note(counter: &'static str) {
-  let _ = state::with_state(|s| *s.refusals.entry(counter).or_insert(0) += 1);
+  let _ = state::with_state(|s| s.count(counter, 1));
 }
 
 /// The v4 front end's backend in the daemon: each v3 call it makes presents the capability of the
@@ -1904,7 +1904,7 @@ async fn send_batch(connection: &mut Connection, batch: &Batch) -> bool {
   }
   if batch.answered > 1 {
     let _ = state::with_state(|s| {
-      *s.refusals.entry(NFS_REPLIES_BATCHED).or_insert(0) += batch.answered;
+      s.count(NFS_REPLIES_BATCHED, batch.answered);
     });
   }
   // A mount's call is client activity: the shard spins out its idle window after it, so the next call of a burst is

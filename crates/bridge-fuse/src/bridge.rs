@@ -579,7 +579,7 @@ fn recover_unique(message: &[u8]) -> Option<u64> {
   // Format: the unique id's offset in fuse_in_header (after len and opcode, two u32).
   const AT_UNIQUE: usize = 2 * size_of::<u32>();
   message
-    .get(AT_UNIQUE..AT_UNIQUE + size_of::<u64>())
+    .get(AT_UNIQUE..AT_UNIQUE.saturating_add(size_of::<u64>()))
     .map(|b| u64::from_le_bytes(b.try_into().unwrap_or_default()))
 }
 
@@ -800,7 +800,10 @@ fn directory_page(
 ) -> Result<Vec<DirEntry>, i32> {
   /// Shape: the shortest name an entry has — one byte — which sizes the smallest entry a page holds.
   const SHORTEST_NAME: usize = 1;
-  let limit = (room / size(SHORTEST_NAME).max(1)).saturating_add(1);
+  let limit = room
+    .checked_div(size(SHORTEST_NAME))
+    .unwrap_or(0)
+    .saturating_add(1);
   let mut entries = bridge
     .readdir(object, cx, r.fh, r.offset, limit)
     .map_err(errno)?;
@@ -913,7 +916,7 @@ fn serve_create(
   let flags = body_u32(req.body, 0).unwrap_or_default();
   let mode = masked(
     body_u32(req.body, size_of::<u32>()).unwrap_or_default(),
-    body_u32(req.body, 2 * size_of::<u32>()).unwrap_or_default(),
+    body_u32(req.body, size_of::<u32>().saturating_mul(2)).unwrap_or_default(),
   );
   let name = match parse_name(req.body.get(HEAD..).unwrap_or_default()) {
     Ok(name) => name,
@@ -1071,7 +1074,7 @@ fn serve_mknod(
       name,
       masked(
         mode,
-        body_u32(head, 2 * size_of::<u32>()).unwrap_or_default(),
+        body_u32(head, size_of::<u32>().saturating_mul(2)).unwrap_or_default(),
       ),
       kind,
     )

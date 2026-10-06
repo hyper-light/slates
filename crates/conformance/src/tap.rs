@@ -330,7 +330,8 @@ pub fn shapes(cases: &[TapCase], limit: usize) -> (Vec<(String, u32)>, usize) {
   let mut counts: std::collections::BTreeMap<String, u32> = std::collections::BTreeMap::new();
   for case in cases {
     if let CaseStatus::Fail { detail } = &case.status {
-      *counts.entry(shape(detail)).or_default() += 1;
+      let count = counts.entry(shape(detail)).or_default();
+      *count = count.saturating_add(1);
     }
   }
   let total = counts.len();
@@ -345,7 +346,8 @@ pub fn failures_by_file(cases: &[TapCase], limit: usize) -> Vec<(String, u32)> {
   let mut counts: std::collections::BTreeMap<&str, u32> = std::collections::BTreeMap::new();
   for case in cases {
     if matches!(case.status, CaseStatus::Fail { .. }) {
-      *counts.entry(case.id.file.as_str()).or_default() += 1;
+      let count = counts.entry(case.id.file.as_str()).or_default();
+      *count = count.saturating_add(1);
     }
   }
   let mut rows: Vec<(String, u32)> = counts
@@ -454,7 +456,7 @@ pub fn parse_file(file: &str, output: &str, runner: &Runner) -> TapFile {
         status,
       }),
       Line::Skip => {}
-      Line::Malformed => parsed.malformed_lines += 1,
+      Line::Malformed => parsed.malformed_lines = parsed.malformed_lines.saturating_add(1),
     }
   }
   parsed

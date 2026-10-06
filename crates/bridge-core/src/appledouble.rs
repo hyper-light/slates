@@ -111,7 +111,7 @@ pub struct Span {
 impl Span {
   /// The byte past the last.
   pub const fn end(self) -> u64 {
-    self.offset + self.len
+    self.offset.saturating_add(self.len)
   }
 }
 
@@ -189,14 +189,14 @@ fn decode_entries(raw: &[u8], file_len: u64) -> Option<(Vec<(u32, Span)>, u64)> 
   if count == 0 || count > MAX_ENTRIES {
     return None;
   }
-  let header_end = u64::try_from(ENTRIES_AT + count * ENTRY_BYTES).ok()?;
+  let header_end = u64::try_from(ENTRIES_AT.checked_add(count.checked_mul(ENTRY_BYTES)?)?).ok()?;
   let mut entries: Vec<(u32, Span)> = Vec::with_capacity(count);
   for index in 0..count {
-    let at = ENTRIES_AT + index * ENTRY_BYTES;
+    let at = ENTRIES_AT.checked_add(index.checked_mul(ENTRY_BYTES)?)?;
     let kind = be32(raw, at)?;
     let span = Span {
-      offset: u64::from(be32(raw, at + ENTRY_OFFSET_AT)?),
-      len: u64::from(be32(raw, at + ENTRY_LEN_AT)?),
+      offset: u64::from(be32(raw, at.checked_add(ENTRY_OFFSET_AT)?)?),
+      len: u64::from(be32(raw, at.checked_add(ENTRY_LEN_AT)?)?),
     };
     let overlaps = entries
       .iter()
@@ -214,7 +214,7 @@ fn decode_entries(raw: &[u8], file_len: u64) -> Option<(Vec<(u32, Span)>, u64)> 
 /// could hold a header but holds no valid one is a write still in progress: `None`.
 fn decode_finder(raw: &[u8], index: usize, span: Span) -> Option<Finder> {
   let at = usize::try_from(span.offset).ok()?;
-  let info = raw.get(at..at + FINDER_INFO_BYTES)?;
+  let info = raw.get(at..at.checked_add(FINDER_INFO_BYTES)?)?;
   let finder = info.iter().any(|byte| *byte != 0).then(|| {
     (
       FINDER_INFO_NAME.to_vec(),
@@ -289,12 +289,13 @@ fn decode_attribute_entry(
   at: usize,
   entries_end: usize,
 ) -> Option<(Vec<u8>, Span, usize)> {
-  let name_len = usize::from(*raw.get(at + ATTR_ENTRY_FIXED - 1)?);
-  let name_at = at + ATTR_ENTRY_FIXED;
-  if name_len == 0 || name_at + name_len > entries_end {
+  let name_at = at.checked_add(ATTR_ENTRY_FIXED)?;
+  let name_len = usize::from(*raw.get(name_at.checked_sub(1)?)?);
+  let name_end = name_at.checked_add(name_len)?;
+  if name_len == 0 || name_end > entries_end {
     return None;
   }
-  let name = raw.get(name_at..name_at + name_len)?;
+  let name = raw.get(name_at..name_end)?;
   // The length counts the NUL, and the name holds no earlier NUL.
   let (&last, before) = name.split_last()?;
   if last != 0 || before.contains(&0) {
@@ -302,9 +303,9 @@ fn decode_attribute_entry(
   }
   let span = Span {
     offset: u64::from(be32(raw, at)?),
-    len: u64::from(be32(raw, at + ATTR_ENTRY_LEN_AT)?),
+    len: u64::from(be32(raw, at.checked_add(ATTR_ENTRY_LEN_AT)?)?),
   };
-  Some((before.to_vec(), span, at + entry_len(name_len)))
+  Some((before.to_vec(), span, at.checked_add(entry_len(name_len))?))
 }
 
 /// Whether the resource fork at `span` is the placeholder xnu writes (its size and tag).
@@ -312,11 +313,11 @@ fn is_placeholder_fork(raw: &[u8], span: Span, read_at: ReadAt<'_>) -> bool {
   if span.len != EMPTY_FORK_BYTES as u64 {
     return false;
   }
-  let at = span.offset + EMPTY_FORK_TAG_AT as u64;
+  let at = span.offset.saturating_add(EMPTY_FORK_TAG_AT as u64);
   let mut tag = [0u8; EMPTY_FORK_TAG.len()];
   let got = match usize::try_from(at)
     .ok()
-    .and_then(|start| raw.get(start..start + tag.len()))
+    .and_then(|start| raw.get(start..start.checked_add(tag.len())?))
   {
     Some(bytes) => {
       tag.copy_from_slice(bytes);
@@ -329,7 +330,10 @@ fn is_placeholder_fork(raw: &[u8], span: Span, read_at: ReadAt<'_>) -> bool {
 
 /// The length an attribute entry with a `name_len`-byte name (NUL included) occupies, aligned.
 const fn entry_len(name_len: usize) -> usize {
-  (ATTR_ENTRY_FIXED + name_len + ATTR_ALIGN - 1) & !(ATTR_ALIGN - 1)
+  ATTR_ENTRY_FIXED
+    .saturating_add(name_len)
+    .saturating_add(ATTR_ALIGN.saturating_sub(1))
+    & !ATTR_ALIGN.saturating_sub(1)
 }
 
 /// One attribute to encode: its name and its value's length. The value's bytes are fetched when a
@@ -421,17 +425,28 @@ pub fn encode(entries: &[Entry]) -> Encoding {
     named.push((index, entry));
   }
   let data_start = entries_end as u64;
-  let data_length: u64 = named.iter().map(|(_, entry)| entry.len).sum();
-  let data_end = data_start + data_length;
+  let data_length: u64 = named
+    .iter()
+    .map(|(_, entry)| entry.len)
+    .fold(0, u64::saturating_add);
+  let data_end = data_start.saturating_add(data_length);
   let fork_len = fork.map_or(EMPTY_FORK_BYTES as u64, |(_, entry)| entry.len);
   let fork = fork_index;
   let fork_at = if fork.is_some() {
-    data_end.div_ceil(FILE_UNIT).max(1) * FILE_UNIT
+    data_end
+      .div_ceil(FILE_UNIT)
+      .max(1)
+      .saturating_mul(FILE_UNIT)
   } else {
-    (data_end + fork_len).div_ceil(FILE_UNIT).max(1) * FILE_UNIT - fork_len
+    data_end
+      .saturating_add(fork_len)
+      .div_ceil(FILE_UNIT)
+      .max(1)
+      .saturating_mul(FILE_UNIT)
+      .saturating_sub(fork_len)
   };
   // The 32-bit fields must hold every offset; an encoding that cannot is left without the fork.
-  let fits = u32::try_from(fork_at + fork_len).is_ok();
+  let fits = u32::try_from(fork_at.saturating_add(fork_len)).is_ok();
   let (fork, fork_len, fork_at) = if fits {
     (fork, fork_len, fork_at)
   } else {
@@ -439,7 +454,11 @@ pub fn encode(entries: &[Entry]) -> Encoding {
     (
       None,
       len,
-      (data_end + len).div_ceil(FILE_UNIT) * FILE_UNIT - len,
+      data_end
+        .saturating_add(len)
+        .div_ceil(FILE_UNIT)
+        .saturating_mul(FILE_UNIT)
+        .saturating_sub(len),
     )
   };
 
@@ -452,7 +471,7 @@ pub fn encode(entries: &[Entry]) -> Encoding {
     &mut head,
     AD_FINDERINFO,
     FINDER_INFO_AT as u64,
-    fork_at - FINDER_INFO_AT as u64,
+    fork_at.saturating_sub(FINDER_INFO_AT as u64),
   );
   push_entry(&mut head, AD_RESOURCE, fork_at, fork_len);
   let mut segments = vec![Segment {
@@ -470,7 +489,11 @@ pub fn encode(entries: &[Entry]) -> Encoding {
     span: finder_span,
     source: finder.map_or(Source::Zero, Source::Value),
   });
-  let mut attr = Vec::with_capacity(entries_end - FINDER_INFO_AT - FINDER_INFO_BYTES);
+  let mut attr = Vec::with_capacity(
+    entries_end
+      .saturating_sub(FINDER_INFO_AT)
+      .saturating_sub(FINDER_INFO_BYTES),
+  );
   attr.extend_from_slice(&[0u8; 2]);
   attr.extend_from_slice(&ATTR_MAGIC.to_be_bytes());
   attr.extend_from_slice(&0u32.to_be_bytes()); // debug tag: doubleagentd writes zero
@@ -487,11 +510,14 @@ pub fn encode(entries: &[Entry]) -> Encoding {
     attr.extend_from_slice(&be32_of(value_at));
     attr.extend_from_slice(&be32_of(len));
     attr.extend_from_slice(&0u16.to_be_bytes());
-    attr.push(u8::try_from(name.len() + 1).unwrap_or(0));
+    attr.push(u8::try_from(name.len().saturating_add(1)).unwrap_or(0));
     attr.extend_from_slice(name);
     attr.push(0);
-    attr.resize(start + entry_len(name.len() + 1), 0);
-    value_at += len;
+    attr.resize(
+      start.saturating_add(entry_len(name.len().saturating_add(1))),
+      0,
+    );
+    value_at = value_at.saturating_add(len);
   }
   segments.push(Segment {
     span: Span {
@@ -509,13 +535,13 @@ pub fn encode(entries: &[Entry]) -> Encoding {
         source: Source::Value(*index),
       });
     }
-    at += len;
+    at = at.saturating_add(len);
   }
   if fork_at > at {
     segments.push(Segment {
       span: Span {
         offset: at,
-        len: fork_at - at,
+        len: fork_at.saturating_sub(at),
       },
       source: Source::Zero,
     });
@@ -536,7 +562,7 @@ pub fn encode(entries: &[Entry]) -> Encoding {
   held.sort_unstable();
   Encoding {
     segments,
-    len: fork_at + fork_len,
+    len: fork_at.saturating_add(fork_len),
     held,
   }
 }
@@ -554,15 +580,18 @@ impl Encoding {
     if off >= self.len {
       return 0;
     }
-    let want = usize::try_from((self.len - off).min(out.len() as u64)).unwrap_or(0);
-    let end = off + want as u64;
+    let want = usize::try_from(self.len.saturating_sub(off).min(out.len() as u64)).unwrap_or(0);
+    let end = off.saturating_add(want as u64);
     for segment in &self.segments {
       let start = segment.span.offset.max(off);
       let stop = segment.span.end().min(end);
       if start >= stop {
         continue;
       }
-      let (Ok(from), Ok(to)) = (usize::try_from(start - off), usize::try_from(stop - off)) else {
+      let (Ok(from), Ok(to)) = (
+        usize::try_from(start.saturating_sub(off)),
+        usize::try_from(stop.saturating_sub(off)),
+      ) else {
         continue;
       };
       let Some(dest) = out.get_mut(from..to) else {
@@ -651,14 +680,14 @@ fn be32_of(value: u64) -> [u8; size_of::<u32>()] {
 
 fn be32(bytes: &[u8], at: usize) -> Option<u32> {
   bytes
-    .get(at..at + size_of::<u32>())
+    .get(at..at.checked_add(size_of::<u32>())?)
     .and_then(|word| word.try_into().ok())
     .map(u32::from_be_bytes)
 }
 
 fn be16(bytes: &[u8], at: usize) -> Option<u16> {
   bytes
-    .get(at..at + size_of::<u16>())
+    .get(at..at.checked_add(size_of::<u16>())?)
     .and_then(|word| word.try_into().ok())
     .map(u16::from_be_bytes)
 }

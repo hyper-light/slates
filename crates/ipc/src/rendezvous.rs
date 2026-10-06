@@ -151,10 +151,12 @@ impl Listener {
           out.push(accepted);
         }
         Ok(None) => break,
-        Err(IpcError::PeerRefused { .. }) => self.refused += 1,
+        Err(IpcError::PeerRefused { .. }) => self.refused = self.refused.saturating_add(1),
         // Answered typed to the client by the platform's `accept_one` (the bound in the refusal),
         // counted here, and the next pending connection is served: a full daemon keeps answering.
-        Err(IpcError::TooManyClients { .. }) => self.capacity_refused += 1,
+        Err(IpcError::TooManyClients { .. }) => {
+          self.capacity_refused = self.capacity_refused.saturating_add(1)
+        }
         Err(e) => return Err(e),
       }
     }

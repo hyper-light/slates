@@ -28,24 +28,18 @@ pub(crate) async fn sweep(silence_ns: u64) -> usize {
   }) else {
     return 0;
   };
-  let mut reaped = 0;
+  let mut reaped: usize = 0;
   for (handle, client_id) in clients {
     let result = remove_on_owners(origin, &shards, batch, client_id, silence_ns).await;
     state::with_state(|state| match result {
       Ok(()) => {
         if finish(state, handle, client_id) {
-          reaped += 1;
+          reaped = reaped.saturating_add(1);
         }
       }
       Err(refusal) => {
-        *state
-          .refusals
-          .entry("client.retirement_deferred")
-          .or_insert(0) += 1;
-        *state
-          .refusals
-          .entry(crate::verbs::refusal_name(&refusal))
-          .or_insert(0) += 1;
+        state.count("client.retirement_deferred", 1);
+        state.count(crate::verbs::refusal_name(&refusal), 1);
       }
     });
     slates_rt::futures::yield_now().await;

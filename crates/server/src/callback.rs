@@ -156,7 +156,7 @@ pub(crate) fn deliver(body: &[u8]) {
         waker.wake();
       }
     }
-    _ => *s.refusals.entry(CALLBACK_REPLY_UNMATCHED).or_insert(0) += 1,
+    _ => s.count(CALLBACK_REPLY_UNMATCHED, 1),
   });
 }
 
@@ -218,7 +218,7 @@ pub(crate) async fn call(
     if !delayed || elapsed.saturating_add(DELAY_RETRY_NS) >= deadline_ns {
       return Ok(results);
     }
-    let _ = state::with_state(|s| *s.refusals.entry(CALLBACK_DELAYED).or_insert(0) += 1);
+    let _ = state::with_state(|s| s.count(CALLBACK_DELAYED, 1));
     if slates_rt::futures::sleep(DELAY_RETRY_NS).await.is_err() {
       return Ok(results);
     }

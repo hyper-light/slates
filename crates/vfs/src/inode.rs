@@ -331,7 +331,7 @@ impl Inode {
   /// when the wall clock repeats or steps back (A-38).
   pub(crate) fn stamp_change(&mut self, ctime: i64) {
     self.attrs.ctime = ctime;
-    self.version += 1;
+    self.version = self.version.saturating_add(1);
   }
 
   /// Moves the change counter by `by` with no change to the object's own attributes: its AppleDouble
@@ -339,7 +339,7 @@ impl Inode {
   /// the owner absorbs a dropped copy's counter (and one more) and a made copy's first step, and
   /// the sum never repeats (A-38).
   pub(crate) fn fold_counter(&mut self, by: u64) {
-    self.version += by;
+    self.version = self.version.saturating_add(by);
   }
 
   /// Takes attributes observed on the host beneath an overlay (an outsider's edit, §4.5): the size,

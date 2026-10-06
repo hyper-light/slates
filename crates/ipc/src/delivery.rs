@@ -379,7 +379,7 @@ mod platform {
   /// A pipe whose two ends are close-on-exec from birth (`pipe2`): no child of any thread inherits
   /// either.
   #[cfg(not(target_vendor = "apple"))]
-  fn pipe_close_on_exec() -> Result<(OwnedFd, OwnedFd), IpcError> {
+  pub(super) fn pipe_close_on_exec() -> Result<(OwnedFd, OwnedFd), IpcError> {
     rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC).map_err(|e| refused("pipe2", e))
   }
 
@@ -388,7 +388,7 @@ mod platform {
   /// the record is written only after both are marked, so it could read it. A harness on Apple must
   /// not spawn from another thread while it prepares a delivery; Linux and Windows have no window.
   #[cfg(target_vendor = "apple")]
-  fn pipe_close_on_exec() -> Result<(OwnedFd, OwnedFd), IpcError> {
+  pub(super) fn pipe_close_on_exec() -> Result<(OwnedFd, OwnedFd), IpcError> {
     let (read_end, write_end) = rustix::pipe::pipe().map_err(|e| refused("pipe", e))?;
     rustix::io::fcntl_setfd(&read_end, FdFlags::CLOEXEC).map_err(|e| refused("fcntl", e))?;
     rustix::io::fcntl_setfd(&write_end, FdFlags::CLOEXEC).map_err(|e| refused("fcntl", e))?;
@@ -632,7 +632,11 @@ mod platform {
     loop {
       match rustix::io::read(fd, &mut extra) {
         Ok(0) | Err(Errno::AGAIN) => return Ok(()),
-        Ok(n) => return Err(DeliveryFault::WrongLength { got: got + n }),
+        Ok(n) => {
+          return Err(DeliveryFault::WrongLength {
+            got: got.saturating_add(n),
+          });
+        }
         Err(Errno::INTR) => {}
         Err(_) => return Err(DeliveryFault::WrongKind),
       }
@@ -795,7 +799,7 @@ mod platform {
         list.storage.clear();
         return Err(refused("InitializeProcThreadAttributeList"));
       }
-      let bytes = list.handles.len() * size_of::<HANDLE>();
+      let bytes = list.handles.len().saturating_mul(size_of::<HANDLE>());
       // SAFETY: the list is initialized; the handle array is live for the list's whole life (it is
       // owned beside it and dropped after the delete); the attribute id and byte length are the
       // documented ones.
@@ -848,12 +852,15 @@ mod platform {
     let mut backslashes = 0usize;
     for unit in units {
       if unit == backslash {
-        backslashes += 1;
+        backslashes = backslashes.saturating_add(1);
         line.push(unit);
         continue;
       }
       if unit == quote {
-        line.extend(std::iter::repeat_n(backslash, backslashes + 1));
+        line.extend(std::iter::repeat_n(
+          backslash,
+          backslashes.saturating_add(1),
+        ));
       }
       backslashes = 0;
       line.push(unit);
@@ -1406,7 +1413,7 @@ mod platform {
         ]
       })
       .collect();
-    let Some(name) = units.get(..length / size_of::<u16>()) else {
+    let Some(name) = units.get(..length.checked_div(size_of::<u16>()).unwrap_or(0)) else {
       return false;
     };
     let backslash = u16::from(b'\\');
@@ -1629,7 +1636,7 @@ mod tests {
 
     /// A pipe holding `bytes`, its write end closed; the read end's name (owned by the take).
     fn pipe_holding(bytes: &[u8]) -> String {
-      let (read_end, write_end) = rustix::pipe::pipe().unwrap();
+      let (read_end, write_end) = super::super::platform::pipe_close_on_exec().unwrap();
       if !bytes.is_empty() {
         assert_eq!(rustix::io::write(&write_end, bytes).unwrap(), bytes.len());
       }
@@ -1639,8 +1646,12 @@ mod tests {
 
     /// A pipe holding `bytes` whose write end stays open (the harness has not finished); returns the
     /// read end's name and the write end to keep alive.
+    /// A pipe holding `bytes`, named for a take, with its write end kept. Close-on-exec like a delivery's own
+    /// pipe: a child a parallel test spawns must not inherit the read end, or the write end never meets
+    /// `EPIPE` (2026-10-06: one failure of `a_whole_record_takes_once_and_the_descriptor_is_closed` in a run
+    /// beside the spawn tests; not reproduced in 40 lone runs).
     fn pipe_still_open(bytes: &[u8]) -> (String, OwnedFd) {
-      let (read_end, write_end) = rustix::pipe::pipe().unwrap();
+      let (read_end, write_end) = super::super::platform::pipe_close_on_exec().unwrap();
       if !bytes.is_empty() {
         assert_eq!(rustix::io::write(&write_end, bytes).unwrap(), bytes.len());
       }
@@ -1656,6 +1667,7 @@ mod tests {
     /// the channel's identity first (`a_name_whose_number_holds_another_channel_leaves_it_untouched`).
     #[test]
     fn a_whole_record_takes_once_and_the_descriptor_is_closed() {
+      let _gate = crate::descriptor_test_gate();
       let (name, write_end) = pipe_still_open(&encode(42, &[9u8; 32]));
       let delivered = take_named(&name).unwrap();
       assert_eq!(delivered.consumer, 42);
@@ -1671,6 +1683,7 @@ mod tests {
     /// `WrongLength` with the bytes found, and never a wait.
     #[test]
     fn a_short_record_is_wrong_length_whether_closed_or_still_open() {
+      let _gate = crate::descriptor_test_gate();
       let record = encode(1, &[1u8; 32]);
       let name = pipe_holding(&record[..20]);
       assert_eq!(
@@ -1693,6 +1706,7 @@ mod tests {
     /// not the harness's.
     #[test]
     fn an_oversize_delivery_is_wrong_length() {
+      let _gate = crate::descriptor_test_gate();
       let mut bytes = encode(1, &[1u8; 32]).to_vec();
       bytes.push(0);
       let name = pipe_holding(&bytes);
@@ -1707,6 +1721,7 @@ mod tests {
     /// A record whose bytes were altered on the way is `Corrupt`.
     #[test]
     fn an_altered_record_is_corrupt() {
+      let _gate = crate::descriptor_test_gate();
       let mut record = encode(1, &[1u8; 32]);
       record[13] ^= 1;
       let name = pipe_holding(&record);
@@ -1717,6 +1732,7 @@ mod tests {
     /// `AlreadyConsumed`.
     #[test]
     fn an_empty_closed_channel_is_already_consumed() {
+      let _gate = crate::descriptor_test_gate();
       let name = pipe_holding(&[]);
       assert_eq!(take_named(&name), Err(DeliveryFault::AlreadyConsumed));
     }
@@ -1725,6 +1741,7 @@ mod tests {
     /// the wrong kind, refused before a byte is read; a terminal too, where the test has one.
     #[test]
     fn a_directory_a_device_or_a_file_is_the_wrong_kind() {
+      let _gate = crate::descriptor_test_gate();
       use rustix::fs::{Mode, OFlags};
       let directory =
         rustix::fs::open(".", OFlags::RDONLY | OFlags::DIRECTORY, Mode::empty()).unwrap();
@@ -1755,6 +1772,7 @@ mod tests {
     /// integration run and never in isolation).
     #[test]
     fn a_malformed_name_and_a_closed_number_are_typed() {
+      let _gate = crate::descriptor_test_gate();
       for hostile in [
         "pipe",
         "-1",
@@ -1783,9 +1801,10 @@ mod tests {
     /// descriptor flags unchanged. The pipe stays this test's, so no number is freed or reused.
     #[test]
     fn a_name_whose_number_holds_another_channel_leaves_it_untouched() {
-      let (own_read, own_write) = rustix::pipe::pipe().unwrap();
+      let _gate = crate::descriptor_test_gate();
+      let (own_read, own_write) = super::super::platform::pipe_close_on_exec().unwrap();
       assert_eq!(rustix::io::write(&own_write, b"probe").unwrap(), 5);
-      let (other_read, other_write) = rustix::pipe::pipe().unwrap();
+      let (other_read, other_write) = super::super::platform::pipe_close_on_exec().unwrap();
       assert_eq!(
         rustix::io::write(&other_write, &encode(1, &[1u8; 32])).unwrap(),
         RECORD_BYTES

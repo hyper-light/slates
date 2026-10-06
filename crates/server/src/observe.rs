@@ -335,7 +335,9 @@ where
   /// attempts, never spins. Returns the admitted task, whose answer is then pending.
   pub fn admit(self) -> Result<Admitted<T>, ObserveError> {
     let began = Instant::now();
-    let mut deadline = began + Duration::from_nanos(self.budget_ns);
+    let mut deadline = began
+      .checked_add(Duration::from_nanos(self.budget_ns))
+      .unwrap_or(began);
     let mut time = ShardTime::new(self.holder, self.budget_ns);
     // The pace is a timed wait on a channel nobody sends on: the thread parks, it does not spin, so it
     // steals no CPU from the shard it waits on; the sender is held so the wait runs its full span.
@@ -395,7 +397,7 @@ where
       if reply_sender.send(answer).is_err() {
         // The asker's wait ended first: the answer is late, discarded, and counted on the shard's
         // ledger while its state is there to count on.
-        let _ = state::with_state(|s| *s.refusals.entry(OBSERVE_LATE_REPLY).or_insert(0) += 1);
+        let _ = state::with_state(|s| s.count(OBSERVE_LATE_REPLY, 1));
       }
     });
     let receipt = match submitted {

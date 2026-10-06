@@ -548,7 +548,9 @@ impl ShardContext {
     match self.inner.try_borrow_mut() {
       Ok(mut inner) => Some(f(&mut inner)),
       Err(_) => {
-        self.nested_borrows.set(self.nested_borrows.get() + 1);
+        self
+          .nested_borrows
+          .set(self.nested_borrows.get().saturating_add(1));
         None
       }
     }
@@ -672,7 +674,9 @@ impl ShardContext {
         Ok(()) => break,
         Err(back) => {
           pending = back;
-          self.pair_full_events.set(self.pair_full_events.get() + 1);
+          self
+            .pair_full_events
+            .set(self.pair_full_events.get().saturating_add(1));
           let live = registry::with_entry(target, |entry| {
             entry.kick.kick();
             !entry.exited.load(std::sync::atomic::Ordering::Acquire)
@@ -751,7 +755,7 @@ impl ShardContext {
         let handle = match inner.arena.insert(TaskSlot::new(future, parent, joinable)) {
           Ok(h) => h,
           Err(slates_mem::MemError::SlabFull { capacity }) => {
-            inner.counters.admission_refused += 1;
+            inner.counters.admission_refused = inner.counters.admission_refused.saturating_add(1);
             return Err(RtError::TooManyTasks { capacity });
           }
           Err(e) => return Err(RtError::Mem(e)),
@@ -763,7 +767,7 @@ impl ShardContext {
         if let Ok(task) = inner.arena.get_mut(handle) {
           task.state = State::Queued;
         }
-        inner.counters.spawns += 1;
+        inner.counters.spawns = inner.counters.spawns.saturating_add(1);
         Encoded::pack(self.id, slot, handle.generation())
           .map(TaskId)
           .ok_or(RtError::TooManyTasks {
@@ -903,7 +907,7 @@ impl ShardContext {
         {
           *queued = true;
           inner.timer_waiters.push_back(word.slot());
-          inner.counters.timer_waits += 1;
+          inner.counters.timer_waits = inner.counters.timer_waits.saturating_add(1);
         }
         Ok(())
       })
@@ -930,7 +934,7 @@ impl ShardContext {
         .is_some_and(|generation| inner.arena.contains(Handle::from_raw(slot, generation)));
       if live {
         self.local.push(slot);
-        woken += 1;
+        woken = woken.saturating_add(1);
       }
     }
   }
@@ -1000,12 +1004,12 @@ impl ShardContext {
         let result = inner.driver.wait(Some(0), &mut completions);
         let harvested = !completions.is_empty();
         for c in completions.drain(..) {
-          inner.counters.completions += 1;
+          inner.counters.completions = inner.counters.completions.saturating_add(1);
           self.local.push(Encoded::from_word(c.user_data).slot());
         }
         inner.completions = completions;
         if matches!(result, Err(RtError::DriverLost)) {
-          inner.counters.driver_lost += 1;
+          inner.counters.driver_lost = inner.counters.driver_lost.saturating_add(1);
         }
         harvested
       })
@@ -1049,20 +1053,26 @@ impl ShardContext {
           .unwrap_or(false)
         || self.harvest_io()
       {
-        self.with_inner(|inner| inner.counters.spin_hits += 1);
+        self.with_inner(|inner| {
+          inner.counters.spin_hits = inner.counters.spin_hits.saturating_add(1)
+        });
         return true;
       }
       let now = self.now_ns();
       if let Some(deadline) = deadline_ns
         && now >= deadline
       {
-        self.with_inner(|inner| inner.counters.spin_deadlines += 1);
+        self.with_inner(|inner| {
+          inner.counters.spin_deadlines = inner.counters.spin_deadlines.saturating_add(1)
+        });
         // The spin waited for this deadline as a park would have; the next step measures its lateness.
         self.waited_for_ns.set(Some(deadline));
         return true;
       }
       if now >= spin_end {
-        self.with_inner(|inner| inner.counters.spin_misses += 1);
+        self.with_inner(|inner| {
+          inner.counters.spin_misses = inner.counters.spin_misses.saturating_add(1)
+        });
         return false;
       }
       std::hint::spin_loop();
@@ -1119,7 +1129,7 @@ impl ShardContext {
     let mut did_work = false;
     let (drained, batch) = self
       .with_inner(|inner| {
-        inner.counters.steps += 1;
+        inner.counters.steps = inner.counters.steps.saturating_add(1);
         // The pulse an observer on another thread reads (`registry::Pulse`): a handful of plain stores on a
         // line this core owns, so a stall diagnosis sees the arena saturating (`admission_refused`) or a
         // long poll (`longest_step_ns`) without a shard round-trip.
@@ -1247,12 +1257,16 @@ impl ShardContext {
       return;
     }
     if woken.stale() {
-      self.with_inner(|inner| inner.counters.wake_stale += 1);
+      self.with_inner(|inner| {
+        inner.counters.wake_stale = inner.counters.wake_stale.saturating_add(1)
+      });
       return;
     }
     let Some(latency) = woken.latency_ns() else {
       if woken.early() {
-        self.with_inner(|inner| inner.counters.wake_unslept += 1);
+        self.with_inner(|inner| {
+          inner.counters.wake_unslept = inner.counters.wake_unslept.saturating_add(1)
+        });
       }
       return;
     };
@@ -1262,14 +1276,16 @@ impl ShardContext {
       (switches_before_wait, attribution::voluntary_switches_now())
       && after == before
     {
-      self.with_inner(|inner| inner.counters.wake_unslept += 1);
+      self.with_inner(|inner| {
+        inner.counters.wake_unslept = inner.counters.wake_unslept.saturating_add(1)
+      });
       return;
     }
     estimate.record(latency);
     self.wake.set(Some(estimate));
     let mean = estimate.mean_ns();
     self.with_inner(|inner| {
-      inner.counters.wake_samples += 1;
+      inner.counters.wake_samples = inner.counters.wake_samples.saturating_add(1);
       inner.counters.wake_cost_ns = mean;
     });
     entry.pulse.record_wake_cost(mean);
@@ -1318,7 +1334,7 @@ impl ShardContext {
   fn wait_in_driver(&self, deadline_ns: Option<u64>) -> bool {
     self
       .with_inner(|inner| {
-        inner.counters.waits += 1;
+        inner.counters.waits = inner.counters.waits.saturating_add(1);
         if let Some(entry) = self.entry {
           entry.pulse.record_waits(inner.counters.waits);
         }
@@ -1326,18 +1342,18 @@ impl ShardContext {
         let mut completions = std::mem::take(&mut inner.completions);
         let result = inner.driver.wait(timeout, &mut completions);
         for c in completions.drain(..) {
-          inner.counters.completions += 1;
+          inner.counters.completions = inner.counters.completions.saturating_add(1);
           self.local.push(Encoded::from_word(c.user_data).slot());
         }
         inner.completions = completions;
         match result {
           Ok(()) => false,
           Err(RtError::DriverLost) => {
-            inner.counters.driver_lost += 1;
+            inner.counters.driver_lost = inner.counters.driver_lost.saturating_add(1);
             true
           }
           Err(_) => {
-            inner.counters.driver_errors += 1;
+            inner.counters.driver_errors = inner.counters.driver_errors.saturating_add(1);
             false
           }
         }
@@ -1354,7 +1370,7 @@ impl ShardContext {
     let mut bound = self.live_tasks().saturating_mul(2).saturating_add(1);
     while !self.exited.get() && bound > 0 {
       let outcome = self.step();
-      bound -= 1;
+      bound = bound.saturating_sub(1);
       if outcome.exit {
         break;
       }
@@ -1377,8 +1393,8 @@ impl ShardContext {
       let Ok(message) = inner.control.try_recv() else {
         break;
       };
-      drained += 1;
-      inner.counters.controls += 1;
+      drained = drained.saturating_add(1);
+      inner.counters.controls = inner.counters.controls.saturating_add(1);
       self.handle_control(inner, message);
     }
     if drained == batch {
@@ -1405,14 +1421,14 @@ impl ShardContext {
         break;
       };
       any = true;
-      inner.counters.wakes_foreign += 1;
+      inner.counters.wakes_foreign = inner.counters.wakes_foreign.saturating_add(1);
       self.handle_wake(inner, Encoded::from_word(word));
     }
     for consumer in &self.inbound {
       for _ in 0..batch {
         let Some(word) = consumer.pop() else { break };
         any = true;
-        inner.counters.wakes_pair += 1;
+        inner.counters.wakes_pair = inner.counters.wakes_pair.saturating_add(1);
         self.handle_wake(inner, Encoded::from_word(word));
       }
     }
@@ -1461,7 +1477,7 @@ impl ShardContext {
     for p in &inner.pollers {
       if (p.ready)() {
         any = true;
-        inner.counters.poller_wakes += 1;
+        inner.counters.poller_wakes = inner.counters.poller_wakes.saturating_add(1);
         self.local.push(p.slot);
       }
     }
@@ -1478,7 +1494,7 @@ impl ShardContext {
     {
       self.local.push(word.slot());
     } else {
-      inner.counters.stale_wakes += 1;
+      inner.counters.stale_wakes = inner.counters.stale_wakes.saturating_add(1);
     }
   }
 
@@ -1493,7 +1509,7 @@ impl ShardContext {
         if inner.shutting_down {
           // A shard shutting down admits nothing new — its arena drains to empty and the loop exits
           // — so the request is refused unadmitted: its receipt answered, its future dropped here.
-          inner.counters.refused_at_shutdown += 1;
+          inner.counters.refused_at_shutdown = inner.counters.refused_at_shutdown.saturating_add(1);
           receipt.answer(Admission::Terminated);
           return;
         }
@@ -1506,7 +1522,7 @@ impl ShardContext {
             if let Ok(task) = inner.arena.get_mut(handle) {
               task.state = State::Queued;
             }
-            inner.counters.spawns += 1;
+            inner.counters.spawns = inner.counters.spawns.saturating_add(1);
             self.local.push(handle.index());
             receipt.answer(
               match Encoded::pack(self.id, handle.index(), handle.generation()) {
@@ -1518,11 +1534,11 @@ impl ShardContext {
             );
           }
           Err(slates_mem::MemError::SlabFull { capacity }) => {
-            inner.counters.admission_refused += 1;
+            inner.counters.admission_refused = inner.counters.admission_refused.saturating_add(1);
             receipt.answer(Admission::Refused(RtError::TooManyTasks { capacity }));
           }
           Err(e) => {
-            inner.counters.admission_refused += 1;
+            inner.counters.admission_refused = inner.counters.admission_refused.saturating_add(1);
             receipt.answer(Admission::Refused(RtError::Mem(e)));
           }
         }
@@ -1551,7 +1567,7 @@ impl ShardContext {
     let any = !fired.is_empty();
     let freed = fired.len();
     for word in fired.drain(..) {
-      inner.counters.timers_fired += 1;
+      inner.counters.timers_fired = inner.counters.timers_fired.saturating_add(1);
       self.local.push(Encoded::from_word(word).slot());
     }
     inner.fired = fired;
@@ -1650,7 +1666,7 @@ fn after_poll(inner: &mut ShardInner, local: &LocalQueue, poll: PollDone) -> Opt
     attributed,
   } = poll;
   let long = attributed.is_some_and(Attribution::is_tasks);
-  inner.counters.polls += 1;
+  inner.counters.polls = inner.counters.polls.saturating_add(1);
   if let Some(attributed) = attributed {
     count_long_poll(&mut inner.counters, attributed);
   }
@@ -1661,9 +1677,9 @@ fn after_poll(inner: &mut ShardInner, local: &LocalQueue, poll: PollDone) -> Opt
   let Ok(task) = inner.arena.get_mut(handle) else {
     return Some(future);
   };
-  task.polls += 1;
+  task.polls = task.polls.saturating_add(1);
   if long {
-    task.long_steps += 1;
+    task.long_steps = task.long_steps.saturating_add(1);
   }
   task.longest_step_ns = task.longest_step_ns.max(elapsed);
   if done {
@@ -1682,16 +1698,16 @@ fn after_poll(inner: &mut ShardInner, local: &LocalQueue, poll: PollDone) -> Opt
 /// Counts a poll past the step quantum by the wall clock under whoever held it.
 fn count_long_poll(counters: &mut Counters, attributed: Attribution) {
   if attributed.is_tasks() {
-    counters.long_steps += 1;
+    counters.long_steps = counters.long_steps.saturating_add(1);
   }
   if attributed == Attribution::Blocked {
-    counters.blocked_steps += 1;
+    counters.blocked_steps = counters.blocked_steps.saturating_add(1);
   }
   if attributed == Attribution::Preempted {
-    counters.preempted_steps += 1;
+    counters.preempted_steps = counters.preempted_steps.saturating_add(1);
   }
   if attributed.is_unattributed() {
-    counters.unattributed_steps += 1;
+    counters.unattributed_steps = counters.unattributed_steps.saturating_add(1);
   }
 }
 
@@ -1711,8 +1727,8 @@ fn finish(inner: &mut ShardInner, local: &LocalQueue, slot: u32, outcome: Outcom
     Err(_) => return,
   };
   match outcome {
-    Outcome::Completed => inner.counters.completed += 1,
-    Outcome::Cancelled => inner.counters.cancelled += 1,
+    Outcome::Completed => inner.counters.completed = inner.counters.completed.saturating_add(1),
+    Outcome::Cancelled => inner.counters.cancelled = inner.counters.cancelled.saturating_add(1),
   }
   let mut child = first_child;
   while child != NO_LINK {

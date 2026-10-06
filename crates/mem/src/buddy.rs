@@ -330,7 +330,7 @@ impl Buddy {
       if order == 0 {
         return 0;
       }
-      order -= 1;
+      order = order.saturating_sub(1);
     }
   }
 
@@ -360,7 +360,7 @@ impl Buddy {
           largest_free: self.largest_free(),
         });
       }
-      found += 1;
+      found = found.saturating_add(1);
     }
     let index = self.head_of(found);
     // The incarnation is taken before anything changes, so a spent head refuses with the allocator intact.

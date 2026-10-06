@@ -2470,7 +2470,7 @@ impl<'b> Export<'b> {
     } else {
       plain_smallest
     };
-    let limit = (budget / smallest.max(1)).saturating_add(1);
+    let limit = budget.checked_div(smallest).unwrap_or(0).saturating_add(1);
     let rows = self
       .bridge
       .readdir(dir_object, &cx, 0, cookie, limit)
@@ -2491,7 +2491,7 @@ impl<'b> Export<'b> {
       } else {
         (None, None)
       };
-      let mut entry_bytes = READDIR_ENTRY_FIXED + xdr_str_len(&row.name);
+      let mut entry_bytes = READDIR_ENTRY_FIXED.saturating_add(xdr_str_len(&row.name));
       if plus {
         entry_bytes = entry_bytes
           .saturating_add(PLUS_ENTRY_FIXED)
@@ -2834,7 +2834,7 @@ fn encode_create_reply(
 /// the bytes padded up to XDR's 4-byte (one `u32`) boundary. Used to budget a READDIR reply.
 fn xdr_len(len: usize) -> usize {
   const UNIT: usize = size_of::<u32>();
-  UNIT + len.div_ceil(UNIT) * UNIT
+  len.div_ceil(UNIT).saturating_mul(UNIT).saturating_add(UNIT)
 }
 
 /// The XDR-encoded byte length of a variable-length string or opaque.

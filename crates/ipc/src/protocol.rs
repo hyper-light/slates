@@ -2603,14 +2603,17 @@ pub enum Direction {
 /// no allocator sits on the path.
 fn chunk(region: &ClientRegion, direction: Direction, index: u64) -> (usize, usize) {
   let slots = region.cmd().slots().max(1);
-  let half = region.bulk_len() / 2;
-  let chunk = half / slots;
-  let position = usize::try_from(index % u64::try_from(slots).unwrap_or(1)).unwrap_or(0);
+  let half = region.bulk_len().checked_div(2).unwrap_or(0);
+  let chunk = half.checked_div(slots).unwrap_or(0);
+  let position = index
+    .checked_rem(u64::try_from(slots).unwrap_or(1))
+    .and_then(|position| usize::try_from(position).ok())
+    .unwrap_or(0);
   let base = match direction {
     Direction::Request => 0,
     Direction::Reply => half,
   };
-  (base + position * chunk, chunk)
+  (base.saturating_add(position.saturating_mul(chunk)), chunk)
 }
 
 /// The bytes one framed message may take in either direction: one bulk chunk of `region` (every slot's chunk is

@@ -45,7 +45,13 @@ pub struct CivilDate {
 }
 
 impl CivilDate {
-  /// The civil date of `unix_seconds` (UTC).
+  /// The civil date of `unix_seconds` (UTC), by Hinnant's `civil_from_days`
+  /// (howardhinnant.github.io/date_algorithms.html).
+  // No step can overflow: `|days| <= i64::MAX / 86_400 < 1.1e14`, so `shifted` and `era * DAYS_PER_ERA` (at most
+  // `|shifted| + DAYS_PER_ERA`) stay far inside `i64`; `day_of_era` is in `[0, 146_096]`, `year_of_era` in
+  // `[0, 399]`, `day_of_year` in `[0, 365]` and `month_index` in `[0, 11]`, so every later term is small; and
+  // `era * YEARS_PER_ERA` is at most `|days| / 365`. Written as the paper's formula so it can be checked against it.
+  #[allow(clippy::arithmetic_side_effects)]
   pub fn from_unix(unix_seconds: i64) -> CivilDate {
     let days = unix_seconds.div_euclid(SECONDS_PER_DAY);
     let shifted = days + DAYS_TO_MARCH_EPOCH;

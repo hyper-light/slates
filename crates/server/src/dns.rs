@@ -206,7 +206,16 @@ pub fn check_hostname(host: &str) -> Result<(), DnsError> {
 /// Encodes one recursive `A`/`IN` question for `host` under `id` (RFC 1035 §4.1).
 pub fn encode_query(id: u16, host: &str) -> Result<Vec<u8>, DnsError> {
   let labels = labels_of(host)?;
-  let mut out = Vec::with_capacity(HEADER_BYTES + host.len() + 2 + QUESTION_TAIL_BYTES);
+  let mut out = Vec::with_capacity(
+    [
+      HEADER_BYTES,
+      host.len(),
+      size_of::<u16>(),
+      QUESTION_TAIL_BYTES,
+    ]
+    .into_iter()
+    .fold(0, usize::saturating_add),
+  );
   out.extend_from_slice(&id.to_be_bytes());
   out.extend_from_slice(&FLAG_RECURSION_DESIRED.to_be_bytes());
   out.extend_from_slice(&1u16.to_be_bytes()); // QDCOUNT
@@ -313,7 +322,9 @@ pub fn decode_answer(id: u16, host: &str, bytes: &[u8]) -> Result<Ipv4Addr, DnsE
       at: "question name",
     });
   }
-  if u16_at(bytes, cursor, "qtype")? != TYPE_A || u16_at(bytes, cursor + 2, "qclass")? != CLASS_IN {
+  if u16_at(bytes, cursor, "qtype")? != TYPE_A
+    || u16_at(bytes, cursor.saturating_add(size_of::<u16>()), "qclass")? != CLASS_IN
+  {
     return Err(DnsError::Malformed { at: "question" });
   }
   cursor = cursor.wrapping_add(QUESTION_TAIL_BYTES);
@@ -321,8 +332,8 @@ pub fn decode_answer(id: u16, host: &str, bytes: &[u8]) -> Result<Ipv4Addr, DnsE
     let mut owner = String::new();
     cursor = read_name(bytes, cursor, &mut owner)?;
     let record_type = u16_at(bytes, cursor, "type")?;
-    let class = u16_at(bytes, cursor + 2, "class")?;
-    let rdlength = u16_at(bytes, cursor + RDLENGTH_OFFSET, "rdlength")?;
+    let class = u16_at(bytes, cursor.saturating_add(size_of::<u16>()), "class")?;
+    let rdlength = u16_at(bytes, cursor.saturating_add(RDLENGTH_OFFSET), "rdlength")?;
     let rdata_start = cursor.wrapping_add(RECORD_FIXED_BYTES);
     let rdata_end = rdata_start.wrapping_add(usize::from(rdlength));
     let rdata = bytes

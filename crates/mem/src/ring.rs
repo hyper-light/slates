@@ -54,7 +54,7 @@ impl SpscRing {
     let slots: Vec<AtomicU64> = (0..capacity).map(|_| AtomicU64::new(0)).collect();
     Ok(Self {
       slots: slots.into_boxed_slice(),
-      mask: capacity - 1,
+      mask: capacity.saturating_sub(1),
       head: Padded(AtomicUsize::new(0)),
       tail: Padded(AtomicUsize::new(0)),
       split: AtomicBool::new(false),
@@ -63,7 +63,7 @@ impl SpscRing {
 
   /// Slots.
   pub const fn capacity(&self) -> usize {
-    self.mask + 1
+    self.mask.saturating_add(1)
   }
 
   /// Splits the ring into its producer and consumer halves — once in its life: `None` if they were

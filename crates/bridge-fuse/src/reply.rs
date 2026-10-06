@@ -192,7 +192,7 @@ impl OpenOut {
     let mut w = Writer::new();
     w.u64(self.fh);
     w.u32(self.open_flags);
-    w.pad(Self::LEN - w.as_bytes().len());
+    w.pad(Self::LEN.saturating_sub(w.as_bytes().len()));
     w.into_bytes()
   }
 }
@@ -212,7 +212,7 @@ impl WriteOut {
   pub fn to_bytes(&self) -> Vec<u8> {
     let mut w = Writer::new();
     w.u32(self.size);
-    w.pad(Self::LEN - w.as_bytes().len());
+    w.pad(Self::LEN.saturating_sub(w.as_bytes().len()));
     w.into_bytes()
   }
 }
@@ -311,7 +311,11 @@ impl DirBuffer {
     w.u32(u32::try_from(name.len()).unwrap_or(u32::MAX));
     w.u32(kind);
     w.bytes(name.as_bytes());
-    w.pad(padded - Self::DIRENT_HEAD - name.len());
+    w.pad(
+      padded
+        .saturating_sub(Self::DIRENT_HEAD)
+        .saturating_sub(name.len()),
+    );
     self.bytes.extend_from_slice(w.as_bytes());
     true
   }
@@ -324,7 +328,9 @@ impl DirBuffer {
     if !self.fits_plus(name) {
       return false;
     }
-    let dirent = (Self::DIRENT_HEAD + name.len()).next_multiple_of(Self::ALIGN);
+    let dirent = Self::DIRENT_HEAD
+      .saturating_add(name.len())
+      .next_multiple_of(Self::ALIGN);
     self.bytes.extend_from_slice(&entry.to_bytes());
     let mut w = Writer::new();
     w.u64(entry.nodeid);
@@ -332,7 +338,11 @@ impl DirBuffer {
     w.u32(u32::try_from(name.len()).unwrap_or(u32::MAX));
     w.u32(kind);
     w.bytes(name.as_bytes());
-    w.pad(dirent - Self::DIRENT_HEAD - name.len());
+    w.pad(
+      dirent
+        .saturating_sub(Self::DIRENT_HEAD)
+        .saturating_sub(name.len()),
+    );
     self.bytes.extend_from_slice(w.as_bytes());
     true
   }

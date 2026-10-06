@@ -85,7 +85,7 @@ impl Range {
     if self.end == u64::MAX {
       u64::MAX
     } else {
-      self.end - self.start
+      self.end.saturating_sub(self.start)
     }
   }
 
@@ -146,7 +146,7 @@ impl OwnerRanges {
 
   /// The ranges the owner would hold after unlocking `range` (the parts of its ranges outside it).
   pub fn unlocked(&self, range: Range) -> OwnerRanges {
-    let mut ranges = Vec::with_capacity(self.ranges.len() + 1);
+    let mut ranges = Vec::with_capacity(self.ranges.len().saturating_add(1));
     for &(held, kind) in &self.ranges {
       if !held.overlaps(range) {
         ranges.push((held, kind));
@@ -364,7 +364,10 @@ impl LockTable {
       .get(other)
       .map(|state| state.ranges.ranges().len().max(1))
       .ok_or(Nfsstat4::BadStateid)?;
-    let charge = self.charge() - before + ranges.ranges().len().max(1);
+    let charge = self
+      .charge()
+      .saturating_sub(before)
+      .saturating_add(ranges.ranges().len().max(1));
     if charge > self.max_ranges {
       return Err(Nfsstat4::Delay);
     }

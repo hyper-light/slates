@@ -128,7 +128,7 @@ fn close_device(attachment: u64) {
     if let Some(record) = s.db.partition().attachment(attachment).cloned()
       && crate::verbs::end_attachment(s, &record, crate::verbs::Ending::Otherwise).is_err()
     {
-      *s.refusals.entry(RECORD_END_REFUSED).or_insert(0) += 1;
+      s.count(RECORD_END_REFUSED, 1);
     }
   });
 }
@@ -195,7 +195,7 @@ impl BridgeAccess for ShardBridge {
       let captured =
         crate::verbs::publish_shard(s).is_ok_and(|published| published.captured(volume));
       if !captured {
-        *s.refusals.entry(BARRIER_REFUSED).or_insert(0) += 1;
+        s.count(BARRIER_REFUSED, 1);
       }
       captured
     })
@@ -349,7 +349,7 @@ async fn serve_guest_device<S: VmmSeam + Send + 'static>(
           .unwrap_or(Err(ReclaimError::VolumeGone)),
       };
       if !reclaimed.is_ok_and(|r| r.references_swept) {
-        let _ = state::with_state(|s| *s.refusals.entry(RECLAIM_INCOMPLETE).or_insert(0) += 1);
+        let _ = state::with_state(|s| s.count(RECLAIM_INCOMPLETE, 1));
       }
       close_device(attachment);
       on_end(outcome);

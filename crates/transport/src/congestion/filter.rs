@@ -92,19 +92,20 @@ impl WindowedMin {
   /// A filter holding `value` at `time`.
   pub fn new(time: u64, value: u64) -> WindowedMin {
     WindowedMin {
-      inverted: WindowedMax::new(time, u64::MAX - value),
+      // `!value` is `u64::MAX - value`: the order-reversing map that makes a maximum filter a minimum one.
+      inverted: WindowedMax::new(time, !value),
     }
   }
 
   /// The current windowed minimum.
   pub fn get(&self) -> u64 {
-    u64::MAX - self.inverted.get()
+    !self.inverted.get()
   }
 
   /// Folds in `value` taken at `time`, keeping the minimum over the last `window` time units, and returns
   /// the new minimum.
   pub fn update(&mut self, time: u64, window: u64, value: u64) -> u64 {
-    u64::MAX - self.inverted.update(time, window, u64::MAX - value)
+    !self.inverted.update(time, window, !value)
   }
 }
 

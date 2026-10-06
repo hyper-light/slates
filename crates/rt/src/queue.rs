@@ -50,7 +50,7 @@ impl LocalQueue {
       .pending
       .get(usize::try_from(slot).unwrap_or(usize::MAX))
     else {
-      self.overflow.set(self.overflow.get() + 1);
+      self.overflow.set(self.overflow.get().saturating_add(1));
       return;
     };
     if flag.replace(true) {
@@ -60,7 +60,7 @@ impl LocalQueue {
       Ok(mut ready) => ready.push_back(slot),
       Err(_) => {
         flag.set(false);
-        self.refused.set(self.refused.get() + 1);
+        self.refused.set(self.refused.get().saturating_add(1));
       }
     }
   }
@@ -79,7 +79,7 @@ impl LocalQueue {
         std::mem::take(&mut *draining)
       }
       _ => {
-        self.refused.set(self.refused.get() + 1);
+        self.refused.set(self.refused.get().saturating_add(1));
         Vec::new()
       }
     }

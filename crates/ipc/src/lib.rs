@@ -22,6 +22,11 @@
 //! (the daemon's and the client's ends), [`delivery`] (the harness delivery channel of a consumer's
 //! capability, §4.13: an inherited descriptor), [`error`].
 
+// The no-panic law (CLAUDE.md, banned item 6): shipped code never overflows or divides by zero. Test builds
+// are exempt. Once a crate is clean this holds it there; out-of-bounds indexing and slicing are denied
+// workspace-wide.
+#![cfg_attr(not(test), deny(clippy::arithmetic_side_effects))]
+
 /// The client-side completion bridge that gives an async SDK event loop a descriptor it can adopt as
 /// a stream (§4.7, D-19). macOS and Windows pass no completion fd (Mach and named sockets are refused,
 /// D-10), so a thread makes a client-local descriptor readable when an armed reply lands — a self-pipe
@@ -53,3 +58,18 @@ pub use rendezvous::{
   begin_connect_as, connect, connect_as, instance_from_env,
 };
 pub use slot::{PAYLOAD_BYTES, Slot, SlotKind};
+
+/// Serializes the tests that hold a pipe they expect to close against the tests that spawn a child process. On Apple
+/// a pipe is made close-on-exec by an `fcntl` after `pipe` (no `pipe2`), and a child spawned by a parallel test inside
+/// that window inherits the read end for its whole life: `a_whole_record_takes_once_and_the_descriptor_is_closed`
+/// then wrote into a pipe that still had a reader, 2 of 80 runs beside `exit_watch`'s `/bin/sleep 30`, 0 of 80 without
+/// it (2026-10-06). The same window binds a harness, as `delivery`'s `pipe_close_on_exec` says.
+#[cfg(test)]
+#[allow(clippy::disallowed_types)]
+pub(crate) fn descriptor_test_gate() -> std::sync::MutexGuard<'static, ()> {
+  // structural: allow — D-8 exception 3: a test harness; the gate's owners are the descriptor and spawning tests.
+  static GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+  GATE
+    .lock()
+    .unwrap_or_else(std::sync::PoisonError::into_inner)
+}

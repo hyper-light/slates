@@ -444,7 +444,7 @@ impl ServeState {
     /// Format: where `fuse_out_header`'s unique sits, after its length and error words.
     const AT_UNIQUE: usize = 2 * size_of::<u32>();
     reply
-      .get_mut(AT_UNIQUE..AT_UNIQUE + size_of::<u64>())?
+      .get_mut(AT_UNIQUE..AT_UNIQUE.saturating_add(size_of::<u64>()))?
       .copy_from_slice(&unique.to_le_bytes());
     Some(reply)
   }
@@ -633,7 +633,7 @@ fn reply_error(reply: &[u8]) -> i32 {
   /// Format: `fuse_out_header`: `len` (u32) then `error` (i32) — the errno field's offset.
   const ERROR_AT: usize = size_of::<u32>();
   reply
-    .get(ERROR_AT..ERROR_AT + size_of::<i32>())
+    .get(ERROR_AT..ERROR_AT.saturating_add(size_of::<i32>()))
     .and_then(|bytes| bytes.try_into().ok())
     .map_or(0, |bytes| i32::from_le_bytes(bytes).saturating_neg())
 }

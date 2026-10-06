@@ -400,8 +400,12 @@ impl Connection {
       // more than the budget in reassembly state; both ends derive the same limit from the same shape (R8).
       streams: StreamSpace::new(
         role,
-        shape.receive_ceiling
-          / stream_bytes_per_packet(usize::try_from(shape.max_datagram).unwrap_or(usize::MAX)),
+        shape
+          .receive_ceiling
+          .checked_div(stream_bytes_per_packet(
+            usize::try_from(shape.max_datagram).unwrap_or(usize::MAX),
+          ))
+          .unwrap_or(0),
       ),
       sent: SentTracker::new(),
       retransmit: VecDeque::new(),
@@ -967,9 +971,12 @@ impl Connection {
     let streams = Frame::MaxStreams {
       max: self.streams.credit(),
     };
-    packing.used = packing
-      .used
-      .saturating_add((ack.encoded_len() + credit.encoded_len() + streams.encoded_len()) as u64);
+    packing.used = packing.used.saturating_add(
+      ack
+        .encoded_len()
+        .saturating_add(credit.encoded_len())
+        .saturating_add(streams.encoded_len()) as u64,
+    );
     frames.push(ack);
     frames.push(credit);
     frames.push(streams);
@@ -1005,7 +1012,7 @@ impl Connection {
       }
       if self.credit_sent.get(&stream_id) != Some(&self.flow.stream_max(stream_id)) {
         chosen.push(stream_id);
-        slots -= 1;
+        slots = slots.saturating_sub(1);
       } else {
         current.push(stream_id);
       }
@@ -1408,7 +1415,12 @@ impl Connection {
   /// The packets the congestion window holds at its current datagram size — what bounds the reordering
   /// tolerance (a threshold past the window could never be met).
   fn window_packets(&self) -> u64 {
-    (self.controller.window() / self.controller_datagram().max(1)).max(REORDER_THRESHOLD)
+    self
+      .controller
+      .window()
+      .checked_div(self.controller_datagram().max(1))
+      .unwrap_or(0)
+      .max(REORDER_THRESHOLD)
   }
 
   /// The datagram size the controller counts in.

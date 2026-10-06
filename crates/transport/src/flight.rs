@@ -125,12 +125,13 @@ fn fragment_within(flight: &[u8], start: usize, payload: usize) -> Option<Vec<Ve
   let mut within = 0usize;
   while within < flight.len() {
     let end = flight.len().min(within.checked_add(payload)?);
-    let mut datagram = Vec::with_capacity(FRAGMENT_HEADER + (end - within));
+    let piece = end.saturating_sub(within);
+    let mut datagram = Vec::with_capacity(FRAGMENT_HEADER.saturating_add(piece));
     datagram.push(FRAGMENT_TAG);
     datagram.extend_from_slice(&start_word.to_le_bytes());
     datagram.extend_from_slice(&u16::try_from(within).ok()?.to_le_bytes());
     datagram.extend_from_slice(&total_word.to_le_bytes());
-    datagram.extend_from_slice(&u16::try_from(end - within).ok()?.to_le_bytes());
+    datagram.extend_from_slice(&u16::try_from(piece).ok()?.to_le_bytes());
     datagram.extend_from_slice(flight.get(within..end)?);
     out.push(datagram);
     within = end;
@@ -173,7 +174,11 @@ pub fn seal(
   for fragment in plain {
     let number = *next_number;
     *next_number = number.checked_add(1).ok_or(SealRefusal::NumbersExhausted)?;
-    let mut datagram = Vec::with_capacity(SEALED_HEADER + fragment.len() + key.tag_len());
+    let mut datagram = Vec::with_capacity(
+      SEALED_HEADER
+        .saturating_add(fragment.len())
+        .saturating_add(key.tag_len()),
+    );
     datagram.push(SEALED_FRAGMENT_TAG);
     datagram.extend_from_slice(&number.to_le_bytes());
     let mut body = fragment.get(1..).ok_or(SealRefusal::Sealing)?.to_vec();
@@ -200,7 +205,7 @@ pub fn open(datagram: &[u8], key: &dyn rustls::quic::PacketKey) -> Option<Vec<u8
   let plain = key
     .decrypt_in_place(u64::from(u32::from_le_bytes(number)), header, &mut body)
     .ok()?;
-  let mut fragment = Vec::with_capacity(1 + plain.len());
+  let mut fragment = Vec::with_capacity(plain.len().saturating_add(1));
   fragment.push(FRAGMENT_TAG);
   fragment.extend_from_slice(plain);
   Some(fragment)

@@ -67,10 +67,19 @@ pub struct Recovered {
   pub next_seq: u64,
 }
 
+/// The snapshot slot after `slot`: the two slots alternate, so a torn snapshot write never touches the last good one.
+fn other_slot<T: Into<u64> + TryFrom<u64> + Default>(slot: T) -> T {
+  T::try_from(slot.into().saturating_add(1).checked_rem(2).unwrap_or(0)).unwrap_or_default()
+}
+
 impl Recovered {
   /// Measured: the replay throughput in bytes per microsecond (zero when nothing replayed).
   pub fn replay_bytes_per_us(&self) -> u64 {
-    self.replayed_bytes.saturating_mul(NS_PER_US) / self.replay_ns.max(1)
+    self
+      .replayed_bytes
+      .saturating_mul(NS_PER_US)
+      .checked_div(self.replay_ns)
+      .unwrap_or(0)
   }
 }
 
@@ -176,7 +185,7 @@ pub fn recover(
     next_seq: recovered.next_seq,
     policy,
     since_snapshot_bytes: replayed.bytes,
-    next_slot: snapshot.map_or(0, |(slot, _)| (slot + 1) % 2),
+    next_slot: snapshot.map_or(0, |(slot, _)| other_slot(slot)),
     snapshots_taken: 0,
     pending: None,
     last_now_ns: now_ns,
@@ -228,7 +237,7 @@ fn derive_partition(
     for op in entry.ops() {
       partition.apply(op)?;
     }
-    records += 1;
+    records = records.saturating_add(1);
   }
   Ok(DerivedPartition {
     partition,
@@ -460,9 +469,9 @@ impl Db {
       &snapshot.to_bytes(),
     )?;
     self.log.trim(segment, self.next_seq)?;
-    self.next_slot = (self.next_slot + 1) % 2;
+    self.next_slot = other_slot(self.next_slot);
     self.since_snapshot_bytes = 0;
-    self.snapshots_taken += 1;
+    self.snapshots_taken = self.snapshots_taken.saturating_add(1);
     Ok(())
   }
 

@@ -459,7 +459,7 @@ impl<V: VolumeSet> MultiExport<V> {
       }
       used = used.saturating_add(entry.len());
       body.fixed(&entry); // each entry is already four-byte aligned, so no extra padding is added
-      emitted += 1;
+      emitted = emitted.saturating_add(1);
     }
     // A budget too small for even one pending entry is `TOOSMALL`, per RFC 1813 §3.3.16.
     if emitted == 0 && start < entries.len() {
@@ -707,14 +707,14 @@ pub fn parse_capability(text: &str) -> Option<(u64, [u8; 16])> {
   let (attachment_hex, token_hex) = text.split_once('.')?;
   let attachment = u64::from_str_radix(attachment_hex, HEX).ok()?;
   let hex = token_hex.as_bytes();
-  if hex.len() != size_of::<[u8; 16]>() * 2 {
+  if hex.len() != size_of::<[u8; 16]>().saturating_mul(2) {
     return None;
   }
   let mut token = [0u8; 16];
   for (byte, [high, low]) in token.iter_mut().zip(hex.as_chunks::<2>().0) {
     let high = char::from(*high).to_digit(HEX)?;
     let low = char::from(*low).to_digit(HEX)?;
-    *byte = u8::try_from(high * HEX + low).ok()?;
+    *byte = u8::try_from(high.checked_mul(HEX)?.checked_add(low)?).ok()?;
   }
   Some((attachment, token))
 }

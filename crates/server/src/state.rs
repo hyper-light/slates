@@ -755,6 +755,14 @@ impl std::fmt::Debug for PendingForward {
   }
 }
 
+impl ShardState {
+  /// Adds `by` to the count of refusal or event `kind`, saturating (a count never wraps to a small number).
+  pub(crate) fn count(&mut self, kind: &'static str, by: u64) {
+    let count = self.refusals.entry(kind).or_insert(0);
+    *count = count.saturating_add(by);
+  }
+}
+
 impl std::fmt::Debug for ShardState {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
     f.debug_struct("ShardState")

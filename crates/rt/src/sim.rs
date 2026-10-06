@@ -868,7 +868,11 @@ impl Driver for SimDriver {
   }
 
   fn wait(&mut self, timeout_ns: Option<u64>, out: &mut Vec<Completion>) -> Result<(), RtError> {
-    let waits = self.shared.waits.fetch_add(1, Ordering::AcqRel) + 1;
+    let waits = self
+      .shared
+      .waits
+      .fetch_add(1, Ordering::AcqRel)
+      .saturating_add(1);
     if waits >= self.shared.kill_at_wait.load(Ordering::Acquire) {
       return Err(RtError::DriverLost);
     }

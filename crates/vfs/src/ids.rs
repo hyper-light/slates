@@ -12,7 +12,7 @@ pub struct Epoch(pub u64);
 impl Epoch {
   /// The next epoch.
   pub const fn next(self) -> Epoch {
-    Epoch(self.0 + 1)
+    Epoch(self.0.saturating_add(1))
   }
 }
 

@@ -161,7 +161,8 @@ impl SimGuestMemory {
       .enumerate()
       .find(|(_, r)| r.range.contains(&range))
       .ok_or(outside.clone())?;
-    let offset = usize::try_from(range.start().0 - region.range.start().0).map_err(|_| outside)?;
+    let offset = usize::try_from(range.start().0.saturating_sub(region.range.start().0))
+      .map_err(|_| outside)?;
     Ok((index, offset))
   }
 

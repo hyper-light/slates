@@ -33,7 +33,7 @@ impl PreFault {
   /// A job that faults `slice_ns / fault_ns` pages per step (at least one).
   pub fn new(slice_ns: u64, fault_ns: u64) -> Self {
     let batch = derived!(
-      usize::try_from(slice_ns / fault_ns.max(1))
+      usize::try_from(slice_ns.checked_div(fault_ns.max(1)).unwrap_or(0))
         .unwrap_or(usize::MAX)
         .max(1),
       "idle slice / measured base-page fault cost, at least one page",
@@ -66,7 +66,7 @@ impl PreFault {
       .saturating_add(self.batch_pages.get())
       .min(pages);
     region.touch_pages(self.next_page, to);
-    let done = to - self.next_page;
+    let done = to.saturating_sub(self.next_page);
     self.next_page = to;
     Progress::Faulted { pages: done }
   }

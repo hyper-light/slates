@@ -356,7 +356,11 @@ impl DerivedConstants {
         ["memcpy", "faults.base_ns", "page.base"]
       ),
       ring_entries: derived!(
-        (wake_p99 / syscall).max(1).next_power_of_two(),
+        wake_p99
+          .checked_div(syscall)
+          .unwrap_or(0)
+          .max(1)
+          .next_power_of_two(),
         "Little's law at the overflow target: one message per syscall.median for a wake at its p99, rounded up to a power of two",
         ["wake.p99_ns", "syscall.median"]
       ),
@@ -389,7 +393,8 @@ fn arena_region(p: &MachineProfile, page: u64, syscall: u64, fault: u64) -> u64 
   let pages = syscall
     .saturating_mul(2)
     .saturating_mul(TIMER_OVERHEAD_FACTOR)
-    / fault;
+    .checked_div(fault)
+    .unwrap_or(0);
   let region = pages.max(1).saturating_mul(page).next_power_of_two();
   match (p.faults.huge_ns, p.facts.page.huge.first()) {
     (Some(huge_ns), Some(huge)) if huge_ns < fault => region.max(*huge),

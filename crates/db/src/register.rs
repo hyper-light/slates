@@ -548,8 +548,12 @@ pub fn copyset_count(hosts: u64, scatter: u64, copies: u64) -> u64 {
   if copies <= 1 {
     return hosts;
   }
-  let permutations = scatter.div_ceil(copies - 1);
-  permutations.saturating_mul(hosts) / copies
+  // `copies >= 2` here, so neither the subtraction nor the division can fail.
+  let permutations = scatter.div_ceil(copies.saturating_sub(1).max(1));
+  permutations
+    .saturating_mul(hosts)
+    .checked_div(copies)
+    .unwrap_or(0)
 }
 
 /// The number of copysets **random replication** would create at the same parameters — `hosts · C(scatter,
@@ -561,7 +565,7 @@ pub fn random_copyset_count(hosts: u64, scatter: u64, copies: u64) -> u64 {
   if copies <= 1 {
     return hosts;
   }
-  hosts.saturating_mul(binomial(scatter, copies - 1))
+  hosts.saturating_mul(binomial(scatter, copies.saturating_sub(1)))
 }
 
 /// `C(n, k)` computed iteratively without overflow for the small `k` (`copies − 1`) placement uses;
@@ -570,10 +574,14 @@ fn binomial(n: u64, k: u64) -> u64 {
   if k > n {
     return 0;
   }
-  let k = k.min(n - k);
+  let k = k.min(n.saturating_sub(k));
   let mut result: u64 = 1;
   for i in 0..k {
-    result = result.saturating_mul(n - i) / (i + 1);
+    // `i < k <= n`, so `n - i >= 1` and the divisor `i + 1 >= 1`.
+    result = result
+      .saturating_mul(n.saturating_sub(i))
+      .checked_div(i.saturating_add(1))
+      .unwrap_or(0);
   }
   result
 }
@@ -590,7 +598,7 @@ fn binomial(n: u64, k: u64) -> u64 {
 /// unknown (`0`), the candidate floor stands — recovery cannot be sized, so the tightest, lowest-loss
 /// neighbourhood is used.
 pub fn scatter_width(data_bytes: u64, bandwidth_bytes_per_s: u64, budget_ns: u64, f: u64) -> u64 {
-  let candidate_floor = 2 * f + 1;
+  let candidate_floor = f.saturating_mul(2).saturating_add(1);
   if bandwidth_bytes_per_s == 0 || budget_ns == 0 {
     return candidate_floor;
   }
@@ -621,7 +629,7 @@ pub fn coincident_loss_probability(copysets: u64, hosts: u64, failed: u64, copie
   // C(failed, copies) / C(hosts, copies) = ∏_{i=0}^{copies-1} (failed - i) / (hosts - i).
   #[allow(clippy::cast_precision_loss)]
   let ratio: f64 = (0..copies)
-    .map(|i| (failed - i) as f64 / (hosts - i) as f64)
+    .map(|i| failed.saturating_sub(i) as f64 / hosts.saturating_sub(i).max(1) as f64)
     .product();
   #[allow(clippy::cast_precision_loss)]
   let expected = copysets as f64 * ratio;
@@ -700,7 +708,7 @@ impl Record {
   /// The canonical bytes: the five header words, the value length, the value — little-endian
   /// throughout, so two hosts encode a record identically (the determinism its identity relies on).
   pub fn encode(&self) -> Vec<u8> {
-    let mut out = Vec::with_capacity(RECORD_PREFIX_BYTES + self.value.len());
+    let mut out = Vec::with_capacity(RECORD_PREFIX_BYTES.saturating_add(self.value.len()));
     out.extend_from_slice(&self.owner.0.to_le_bytes());
     out.extend_from_slice(&self.object.0);
     out.extend_from_slice(&self.sequence.to_le_bytes());
@@ -860,7 +868,7 @@ pub enum Refusal {
 pub fn encode_refusal(error: &RegisterError) -> Vec<u8> {
   match error {
     RegisterError::ConfigurationStale { version } => {
-      let mut out = Vec::with_capacity(1 + size_of::<u64>());
+      let mut out = Vec::with_capacity(size_of::<u64>().saturating_add(1));
       out.push(STALE_REFUSAL_TAG);
       out.extend_from_slice(&version.to_le_bytes());
       out
@@ -1043,7 +1051,9 @@ impl Promise {
       }
       PROMISE_SOME => {
         // A present record needs its sequence and epoch (two u64) and a u32 value length.
-        let fixed = 2 * size_of::<u64>() + size_of::<u32>();
+        let fixed = size_of::<u64>()
+          .saturating_mul(2)
+          .saturating_add(size_of::<u32>());
         if rest.len() < fixed {
           return Err(RegisterError::MalformedRecord);
         }

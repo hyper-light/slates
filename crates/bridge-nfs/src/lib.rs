@@ -17,6 +17,11 @@
 //! [`nfs`] (the NFSv3 core data types of RFC 1813 — status codes, file types, times, attributes and
 //! file handles), and [`handle`] (slates' private encoding of a volume object's durable identity into an opaque file handle: `(volume, inode, gen)`). [`mount`] (the NFSv3 MOUNT protocol, RFC 1813 Appendix I — the `MNT` request and the `mountres3` reply that hands a client the export's root handle) and [`portmap`] (the minimal portmap responder, RFC 1833) are the two helper RPC programs the server answers alongside NFS.
 
+// The no-panic law (CLAUDE.md, banned item 6): shipped code never overflows or divides by zero. Test builds
+// are exempt. Once a crate is clean this holds it there; out-of-bounds indexing and slicing are denied
+// workspace-wide.
+#![cfg_attr(not(test), deny(clippy::arithmetic_side_effects))]
+
 pub mod access;
 pub mod client;
 pub mod handle;

@@ -220,12 +220,12 @@ pub fn block_of(document: &str) -> Result<(usize, usize), &'static str> {
   let start = document
     .find(BEGIN)
     .ok_or("the document has no conformance-matrix:begin marker")?
-    + BEGIN.len();
+    .saturating_add(BEGIN.len());
   let end = document
     .get(start..)
     .and_then(|rest| rest.find(END))
     .ok_or("the document has no conformance-matrix:end marker after the begin marker")?
-    + start;
+    .saturating_add(start);
   Ok((start, end))
 }
 

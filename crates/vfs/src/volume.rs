@@ -152,7 +152,11 @@ pub struct StoreConfig {
 impl Store {
   /// A store over `arena`.
   pub fn new(config: &StoreConfig, arena: ChunkArena, headroom: u64) -> Self {
-    let segment = (config.page / std::mem::size_of::<DirNode>()).max(1);
+    let segment = config
+      .page
+      .checked_div(std::mem::size_of::<DirNode>())
+      .unwrap_or(0)
+      .max(1);
     // The budget is over what the arena can actually hand out (its buddy-allocatable capacity), not
     // the mapping length, so admission never promises quota the arena cannot back (§4.2, BUG-2).
     let capacity = u64::try_from(arena.capacity()).unwrap_or(u64::MAX);
@@ -163,11 +167,19 @@ impl Store {
         config.max_dir_blocks,
       ),
       inodes: Slab::new(
-        (config.page / std::mem::size_of::<Inode>()).max(1),
+        config
+          .page
+          .checked_div(std::mem::size_of::<Inode>())
+          .unwrap_or(0)
+          .max(1),
         config.max_inodes,
       ),
       tries: Slab::new(
-        (config.page / std::mem::size_of::<TrieNode>()).max(1),
+        config
+          .page
+          .checked_div(std::mem::size_of::<TrieNode>())
+          .unwrap_or(0)
+          .max(1),
         config.max_inodes,
       ),
       content: ChunkStore::new(arena, config.page, config.max_chunks),
@@ -276,7 +288,7 @@ impl Store {
         available: class_bytes,
       });
     }
-    let records = class_bytes - slabs;
+    let records = class_bytes.saturating_sub(slabs);
     self.metadata = MetadataBudget::new(records);
     Ok(records)
   }
@@ -628,7 +640,7 @@ impl Volume {
       .snapshots
       .get_mut(snapshot_handle(snapshot))
       .map_err(|_| VfsError::StaleHandle)?;
-    snap.clone_refs += 1;
+    snap.clone_refs = snap.clone_refs.saturating_add(1);
     let (root, inode_root, epoch, referenced) = (
       snap.root,
       snap.inode_root,
@@ -1335,8 +1347,12 @@ impl Volume {
     if off >= size {
       return Ok(0);
     }
-    let want =
-      usize::try_from((size - off).min(u64::try_from(buf.len()).unwrap_or(u64::MAX))).unwrap_or(0);
+    let want = usize::try_from(
+      size
+        .saturating_sub(off)
+        .min(u64::try_from(buf.len()).unwrap_or(u64::MAX)),
+    )
+    .unwrap_or(0);
     let out = buf.get_mut(..want).unwrap_or_default();
     out.fill(0);
     match &inode.body {
@@ -1358,10 +1374,10 @@ impl Volume {
         }
         // Unpinned disk bytes need the host: `Overlay::read` serves them.
         let unpinned = off < b.base_len
-          && !b
-            .pinned
-            .iter()
-            .any(|e| e.off <= off && off + u64::try_from(want).unwrap_or(0) <= e.off + e.len);
+          && !b.pinned.iter().any(|e| {
+            e.off <= off
+              && off.saturating_add(u64::try_from(want).unwrap_or(0)) <= e.off.saturating_add(e.len)
+          });
         if unpinned {
           return Err(VfsError::BaseUnavailable(0));
         }
@@ -2132,7 +2148,7 @@ impl Volume {
     let op = if off >= old_size {
       Op::Extend {
         at: old_size,
-        len: end - old_size,
+        len: end.saturating_sub(old_size),
       }
     } else {
       Op::Overwrite {
@@ -2396,8 +2412,12 @@ impl Volume {
     if off >= size {
       return Ok(0);
     }
-    let want =
-      usize::try_from((size - off).min(u64::try_from(buf.len()).unwrap_or(u64::MAX))).unwrap_or(0);
+    let want = usize::try_from(
+      size
+        .saturating_sub(off)
+        .min(u64::try_from(buf.len()).unwrap_or(u64::MAX)),
+    )
+    .unwrap_or(0);
     let out = buf.get_mut(..want).unwrap_or_default();
     out.fill(0);
     match &inode.body {
@@ -2421,10 +2441,10 @@ impl Volume {
           return Err(VfsError::BaseDrift);
         }
         let unpinned = off < b.base_len
-          && !b
-            .pinned
-            .iter()
-            .any(|e| e.off <= off && off + u64::try_from(want).unwrap_or(0) <= e.off + e.len);
+          && !b.pinned.iter().any(|e| {
+            e.off <= off
+              && off.saturating_add(u64::try_from(want).unwrap_or(0)) <= e.off.saturating_add(e.len)
+          });
         if unpinned {
           return Err(VfsError::BaseUnavailable(0));
         }
@@ -2521,7 +2541,7 @@ impl Volume {
       };
       let Body::Directory(d) = p.body else { break };
       current = d;
-      guard += 1;
+      guard = guard.saturating_add(1);
       if guard > usize::from(u16::MAX) {
         break;
       }
@@ -2550,7 +2570,7 @@ impl Volume {
       };
       let Body::Directory(d) = p.body else { break };
       current = d;
-      guard += 1;
+      guard = guard.saturating_add(1);
       if guard > usize::from(u16::MAX) {
         break;
       }
@@ -2577,7 +2597,7 @@ impl Volume {
       };
       let Body::Directory(d) = p.body else { break };
       current = d;
-      guard += 1;
+      guard = guard.saturating_add(1);
       if guard > usize::from(u16::MAX) {
         break;
       }
@@ -2638,10 +2658,11 @@ impl Volume {
     if at > size {
       return Err(VfsError::Invalid);
     }
-    let delete_len = delete_len.min(size - at);
-    let tail_len = usize::try_from(size - at - delete_len).map_err(|_| VfsError::FileTooLarge)?;
+    let delete_len = delete_len.min(size.saturating_sub(at));
+    let tail_len = usize::try_from(size.saturating_sub(at).saturating_sub(delete_len))
+      .map_err(|_| VfsError::FileTooLarge)?;
     let mut tail = vec![0u8; tail_len];
-    let read = self.read(store, no, at + delete_len, &mut tail)?;
+    let read = self.read(store, no, at.saturating_add(delete_len), &mut tail)?;
     tail.truncate(read);
     let inserted = u64::try_from(bytes.len()).map_err(|_| VfsError::FileTooLarge)?;
     let end = at
@@ -2694,7 +2715,7 @@ impl Volume {
       self.apply_write_whole(store, handle, at, bytes)?;
     }
     if !tail.is_empty() {
-      self.apply_write_whole(store, handle, at + inserted, tail)?;
+      self.apply_write_whole(store, handle, at.saturating_add(inserted), tail)?;
     }
     let now = self.clock.wall_ns();
     let inode = store.inodes.get_mut(handle)?;
@@ -2909,7 +2930,7 @@ impl Volume {
     if snap.clone_refs == 0 {
       return Err(VfsError::Invalid);
     }
-    snap.clone_refs -= 1;
+    snap.clone_refs = snap.clone_refs.saturating_sub(1);
     Ok(())
   }
 
@@ -3110,8 +3131,8 @@ impl Volume {
       return Err(VfsError::Destroying);
     }
     let started = self.clock.monotonic_ns();
-    let mut released = 0;
-    let mut since_check = 0;
+    let mut released: usize = 0;
+    let mut since_check: usize = 0;
     loop {
       let Some(dead) = self.destroy_queue.pop() else {
         // The queue emptied in this slice: report its units; the next call says `Done`.
@@ -3130,8 +3151,8 @@ impl Volume {
       } else {
         release_dead(store, dead)?
       };
-      released += weight;
-      since_check += weight;
+      released = released.saturating_add(weight);
+      since_check = since_check.saturating_add(weight);
       if since_check >= DESTROY_CLOCK_EVERY_UNITS {
         since_check = 0;
         if self.clock.monotonic_ns().saturating_sub(started) >= budget_ns {
@@ -3207,7 +3228,7 @@ impl Volume {
         break;
       };
       current = parent;
-      guard += 1;
+      guard = guard.saturating_add(1);
       if guard > usize::from(u16::MAX) {
         break;
       }
@@ -3236,8 +3257,8 @@ impl Volume {
       return Err(VfsError::NoSpace);
     }
     let no = InodeNo::compose(self.prefix, self.next_counter);
-    self.next_counter += 1;
-    self.live_inodes += 1;
+    self.next_counter = self.next_counter.saturating_add(1);
+    self.live_inodes = self.live_inodes.saturating_add(1);
     Ok(no)
   }
 
@@ -3604,9 +3625,12 @@ impl Volume {
     let chunk = u64::try_from(store.content.chunk_bytes())
       .unwrap_or(u64::MAX)
       .max(1);
-    let (first, last) = (off / chunk, end.saturating_sub(1) / chunk);
+    let (first, last) = (
+      window_of(off, chunk),
+      window_of(end.saturating_sub(1), chunk),
+    );
     self.retention_of_pieces(store, no, |piece, _| {
-      let window = piece / chunk;
+      let window = window_of(piece, chunk);
       window >= first && window <= last
     })
   }
@@ -3622,8 +3646,9 @@ impl Volume {
     let chunk = u64::try_from(store.content.chunk_bytes()).unwrap_or(u64::MAX);
     self.retention_of_pieces(store, no, |piece, piece_len| {
       piece >= len
-        || (piece + piece_len > len
-          && charged_window(len - piece, page, chunk) < charged_window(piece_len, page, chunk))
+        || (piece.saturating_add(piece_len) > len
+          && charged_window(len.saturating_sub(piece), page, chunk)
+            < charged_window(piece_len, page, chunk))
     })
   }
 
@@ -3641,13 +3666,14 @@ impl Volume {
       .unwrap_or(u64::MAX)
       .max(1);
     let page = u64::try_from(store.content.granule()).unwrap_or(1);
-    let window_start = at - at % chunk;
+    let window_start = window_start_of(at, chunk);
     self.retention_of_pieces(store, no, |piece, piece_len| {
       piece >= at
         || (piece == window_start
           && (writes
-            || (piece + piece_len > at
-              && charged_window(at - piece, page, chunk) < charged_window(piece_len, page, chunk))))
+            || (piece.saturating_add(piece_len) > at
+              && charged_window(at.saturating_sub(piece), page, chunk)
+                < charged_window(piece_len, page, chunk))))
     })
   }
 
@@ -3706,15 +3732,15 @@ impl Volume {
           .chunk(handle)
           .map_or(0, |c| u64::try_from(c.block.len()).unwrap_or(u64::MAX));
         let covered = len.min(self.retention_prepaid);
-        self.retention_prepaid -= covered;
+        self.retention_prepaid = self.retention_prepaid.saturating_sub(covered);
         let mut charged = covered;
-        let short = len - covered;
+        let short = len.saturating_sub(covered);
         if short > 0 {
           // Unreachable by construction; counted, never silent, and charged when the budget can
           // still take it so the ledger stays the physical truth.
           self.retention_shortfall = self.retention_shortfall.saturating_add(short);
           if store.budget.charge_retention(short).is_ok() {
-            charged += short;
+            charged = charged.saturating_add(short);
           }
         }
         self.retention_charged = self.retention_charged.saturating_add(charged);
@@ -3729,10 +3755,10 @@ impl Volume {
   /// authority), so a volume cannot credit bytes or slots it never took.
   fn credit_retention(&mut self, store: &mut Store, bytes: u64, versions: u64) {
     let bytes = bytes.min(self.retention_charged);
-    self.retention_charged -= bytes;
+    self.retention_charged = self.retention_charged.saturating_sub(bytes);
     store.budget.credit_retention(bytes);
     let versions = versions.min(self.versions_charged);
-    self.versions_charged -= versions;
+    self.versions_charged = self.versions_charged.saturating_sub(versions);
     store.versions.credit_retention(versions);
   }
 
@@ -4170,7 +4196,7 @@ impl Volume {
     // step refuses before copying, and a completed one has replaced them.
     self.retire_blocks(store, retired)?;
     placed?;
-    self.live_entries += 1;
+    self.live_entries = self.live_entries.saturating_add(1);
     Ok(over_whiteout)
   }
 
@@ -4452,7 +4478,8 @@ impl Volume {
   ) -> Result<(), VfsError> {
     let handle = self.make_current_inode(store, no)?;
     let inode = store.inodes.get_mut(handle)?;
-    inode.attrs.nlink = u32::try_from(i64::from(inode.attrs.nlink) + i64::from(delta)).unwrap_or(0);
+    inode.attrs.nlink =
+      u32::try_from(i64::from(inode.attrs.nlink).saturating_add(i64::from(delta))).unwrap_or(0);
     inode.stamp_change(self.clock.wall_ns());
     Ok(())
   }
@@ -4556,7 +4583,7 @@ impl Volume {
     let remaining = match self.references.get_mut(&no) {
       Some(count) => {
         let drop = u32::try_from(n).unwrap_or(u32::MAX).min(*count);
-        *count -= drop;
+        *count = count.saturating_sub(drop);
         let remaining = *count;
         if remaining == 0 {
           self.references.remove(&no);
@@ -4906,10 +4933,11 @@ impl Volume {
     }
     let mut cursor = off;
     while cursor < end {
-      let window = cursor / chunk;
-      let window_end = (window + 1) * chunk;
+      let window = window_of(cursor, chunk);
+      let window_start = window.saturating_mul(chunk);
+      let window_end = window_start.saturating_add(chunk);
       let write_end = end.min(window_end);
-      let materialized = write_end - window * chunk;
+      let materialized = write_end.saturating_sub(window_start);
       let entry = after.entry(window).or_insert(0);
       *entry = (*entry).max(materialized);
       cursor = write_end;
@@ -4939,8 +4967,9 @@ impl Volume {
     let end = off.saturating_add(len);
     let windows = end
       .saturating_sub(1)
-      .saturating_div(chunk_len)
-      .saturating_sub(off / chunk_len)
+      .checked_div(chunk_len)
+      .unwrap_or(0)
+      .saturating_sub(window_of(off, chunk_len))
       .saturating_add(1);
     let blocks = usize::try_from(windows.saturating_add(1)).unwrap_or(usize::MAX);
     let arena = store.content.arena();
@@ -5087,8 +5116,9 @@ impl Volume {
     let end = off.saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
     let windows = end
       .saturating_sub(1)
-      .saturating_div(chunk)
-      .saturating_sub(off / chunk)
+      .checked_div(chunk)
+      .unwrap_or(0)
+      .saturating_sub(window_of(off, chunk))
       .saturating_add(1);
     if u64::try_from(store.content.chunk_room()).unwrap_or(u64::MAX) < windows {
       return Landed {
@@ -5154,7 +5184,7 @@ impl Volume {
   ) -> Result<OpenExtent, VfsError> {
     let chunk = u64::try_from(store.content.chunk_bytes()).unwrap_or(u64::MAX);
     let epoch = self.epoch;
-    let window_start = cursor - (cursor % chunk);
+    let window_start = window_start_of(cursor, chunk);
     let Some(pos) = sealed.iter().position(|e| e.off == window_start) else {
       return store.content.open(window_start, want, epoch, self.locked);
     };
@@ -5192,7 +5222,7 @@ impl Volume {
     while !remaining.is_empty() {
       // The open extent covers one chunk window; a write outside it seals the extent and
       // opens the cursor's window (reopening its sealed extent if it has one).
-      let same_window = cursor >= current.off && cursor - current.off < chunk;
+      let same_window = cursor >= current.off && cursor.saturating_sub(current.off) < chunk;
       if !same_window {
         match store.content.seal(*current, self.seal_key) {
           Ok(Some(e)) => insert_extent(sealed, e),
@@ -5212,7 +5242,7 @@ impl Volume {
           }
         };
       }
-      let at = usize::try_from(cursor - current.off).unwrap_or(0);
+      let at = usize::try_from(cursor.saturating_sub(current.off)).unwrap_or(0);
       let room = usize::try_from(chunk)
         .unwrap_or(usize::MAX)
         .saturating_sub(at);
@@ -5278,7 +5308,7 @@ impl Volume {
           store.content.release_open(*open)?;
           Body::Sealed(sealed)
         } else {
-          let keep = len - open.off;
+          let keep = len.saturating_sub(open.off);
           store.content.shrink_open(&mut open, keep)?;
           Body::Open { open, sealed }
         }
@@ -5326,7 +5356,7 @@ impl Volume {
         Some(no) => Some(self.current_dir(store, no)?),
         None => None,
       };
-      guard += 1;
+      guard = guard.saturating_add(1);
       if guard > usize::from(u16::MAX) {
         return Err(VfsError::Invalid);
       }
@@ -5412,8 +5442,13 @@ impl ByEpoch {
     let Some(epoch) = epoch else {
       return self.total();
     };
-    let first = usize::try_from(epoch.0.saturating_sub(self.floor) + 1).unwrap_or(usize::MAX);
-    self.buckets.iter().skip(first).sum()
+    let first =
+      usize::try_from(epoch.0.saturating_sub(self.floor).saturating_add(1)).unwrap_or(usize::MAX);
+    self
+      .buckets
+      .iter()
+      .skip(first)
+      .fold(0, |total, bytes| total.saturating_add(*bytes))
   }
 }
 
@@ -5515,9 +5550,13 @@ fn materialized_windows(body: &Body, chunk: u64) -> std::collections::BTreeMap<u
   let chunk = chunk.max(1);
   let mut add = |off: u64, len: u64| {
     if len > 0 {
-      let window = off / chunk;
+      let window = window_of(off, chunk);
       let entry = map.entry(window).or_insert(0u64);
-      *entry = (*entry).max(off - window * chunk + len);
+      *entry = (*entry).max(
+        off
+          .saturating_sub(window.saturating_mul(chunk))
+          .saturating_add(len),
+      );
     }
   };
   match body {
@@ -5601,15 +5640,15 @@ pub(crate) fn clip_extents(
   for e in extents.drain(..) {
     if e.off >= len {
       if let ExtentSrc::Chunk { chunk, .. } = e.src {
-        freed += store.content.release_chunk(chunk, last, dead)?;
+        freed = freed.saturating_add(store.content.release_chunk(chunk, last, dead)?);
       }
-    } else if e.off + e.len > len {
+    } else if e.off.saturating_add(e.len) > len {
       let clipped = Extent {
         off: e.off,
-        len: len - e.off,
+        len: len.saturating_sub(e.off),
         src: e.src,
       };
-      freed += e.len - clipped.len;
+      freed = freed.saturating_add(e.len.saturating_sub(clipped.len));
       keep.push(rebuilt_if_smaller(
         (store, key),
         clipped,
@@ -5745,10 +5784,24 @@ fn collect_dirs(
 
 /// Derived: block slab segments hold the blocks of one arena-sized region of directory data,
 /// sixty-four pages of blocks per segment, so a segment is one large allocation and per-block
+/// The chunk window `at` falls in (`chunk >= 1` wherever a store hands one out; zero otherwise).
+fn window_of(at: u64, chunk: u64) -> u64 {
+  at.checked_div(chunk).unwrap_or(0)
+}
+
+/// The first byte of the chunk window `at` falls in.
+fn window_start_of(at: u64, chunk: u64) -> u64 {
+  at.saturating_sub(at.checked_rem(chunk).unwrap_or(0))
+}
+
 /// frees never reach the allocator.
 fn block_segment_slots(page: usize) -> Derived<usize> {
   derived!(
-    (page * BLOCK_SEGMENT_PAGES / size_of::<DirBlock>()).max(1),
+    page
+      .saturating_mul(BLOCK_SEGMENT_PAGES)
+      .checked_div(size_of::<DirBlock>())
+      .unwrap_or(0)
+      .max(1),
     "page × 64 / size_of::<DirBlock>()",
     ["machine page", "size_of::<DirBlock>()"]
   )

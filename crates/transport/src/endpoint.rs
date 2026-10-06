@@ -916,7 +916,7 @@ impl Endpoint {
           // sending — so it counts no timeout, and the backoff resets so a long flight's later
           // fragments are awaited at the fast interval; bounded all the same.
           crate::flight::Reassembly::Pending => {
-            partial += 1;
+            partial = partial.saturating_add(1);
             if partial > MAX_PARTIAL_FRAGMENTS_PER_TURN {
               return Err(EndpointError::NotReady);
             }
@@ -927,7 +927,7 @@ impl Endpoint {
           // it is still asking, so resend this end's flight; not re-fed to `read_hs`. Counted, so a
           // flood cannot loop forever (banned item 8).
           crate::flight::Reassembly::Repeat => {
-            attempts += 1;
+            attempts = attempts.saturating_add(1);
             if attempts > MAX_HANDSHAKE_RETRANSMITS {
               return Err(EndpointError::NotReady);
             }
@@ -940,7 +940,7 @@ impl Endpoint {
           // never a fault; bounded with the partial fragments so a flood cannot loop this forever.
           crate::flight::Reassembly::Malformed => {
             self.discarded = self.discarded.saturating_add(1);
-            partial += 1;
+            partial = partial.saturating_add(1);
             if partial > MAX_PARTIAL_FRAGMENTS_PER_TURN {
               return Err(EndpointError::NotReady);
             }
@@ -948,7 +948,7 @@ impl Endpoint {
           }
         },
         None => {
-          attempts += 1;
+          attempts = attempts.saturating_add(1);
           if attempts > MAX_HANDSHAKE_RETRANSMITS {
             return Err(EndpointError::NotReady);
           }
@@ -1008,7 +1008,7 @@ impl Endpoint {
           if from == self.peer && self.ingest(&datagram).is_ok() {
             return Ok(());
           }
-          invalid += 1;
+          invalid = invalid.saturating_add(1);
           self.discarded = self.discarded.saturating_add(1);
           if invalid > MAX_PARTIAL_FRAGMENTS_PER_TURN {
             return Err(EndpointError::NotReady);
@@ -1022,7 +1022,7 @@ impl Endpoint {
           self.resend_flight(last_flight)?;
         }
         None => {
-          retransmits += 1;
+          retransmits = retransmits.saturating_add(1);
           if retransmits > MAX_HANDSHAKE_RETRANSMITS {
             return Err(EndpointError::NotReady);
           }
@@ -1071,7 +1071,7 @@ impl Endpoint {
           if from == self.peer && self.ingest(&datagram).is_ok() {
             return Ok(());
           }
-          invalid += 1;
+          invalid = invalid.saturating_add(1);
           self.discarded = self.discarded.saturating_add(1);
           if invalid > MAX_PARTIAL_FRAGMENTS_PER_TURN {
             return Err(EndpointError::NotReady);
@@ -1086,7 +1086,7 @@ impl Endpoint {
           self.send_confirm()?;
         }
         None => {
-          silent += 1;
+          silent = silent.saturating_add(1);
           if silent > MAX_HANDSHAKE_RETRANSMITS {
             return Ok(());
           }
@@ -1302,7 +1302,11 @@ impl Endpoint {
     // its next resend — drawn by the peer's next datagram, which grows the allowance — continues from there.
     let count = fragments.len();
     for offset in 0..count {
-      let index = self.flight_cursor.saturating_add(offset) % count.max(1);
+      let index = self
+        .flight_cursor
+        .saturating_add(offset)
+        .checked_rem(count)
+        .unwrap_or(0);
       let Some(fragment) = fragments.get(index) else {
         continue;
       };
@@ -1859,8 +1863,8 @@ fn protect_packet(
   // The generation that seals this packet, and its key-phase bit (an update happens here when due).
   let phase = keys.seal(pn).map_err(EndpointError::KeysExhausted)?;
   let phase_bit = if phase { KEY_PHASE_BIT } else { 0 };
-  let first_byte = FIXED_BIT | phase_bit | u8::try_from(pn_len - 1).unwrap_or(0);
-  let mut packet = Vec::with_capacity(PACKET_NUMBER_OFFSET + pn_len);
+  let first_byte = FIXED_BIT | phase_bit | u8::try_from(pn_len.saturating_sub(1)).unwrap_or(0);
+  let mut packet = Vec::with_capacity(PACKET_NUMBER_OFFSET.saturating_add(pn_len));
   packet.push(first_byte);
   packet.extend_from_slice(cid);
   packet.extend_from_slice(encoded.as_slice());
@@ -1872,7 +1876,8 @@ fn protect_packet(
   // A path-MTU probe is padded further, to exactly `pad_to` bytes on the wire (`crate::pmtud`); every
   // other packet passes zero and is only padded for the sample.
   let mut payload = encode_frames(frames);
-  let min_payload = (HEADER_PROTECTION_SAMPLE_OFFSET + sample_len)
+  let min_payload = HEADER_PROTECTION_SAMPLE_OFFSET
+    .saturating_add(sample_len)
     .saturating_sub(header_len)
     .max(
       pad_to
@@ -1918,7 +1923,7 @@ fn unprotect_packet(
   datagram: &[u8],
 ) -> Result<(u64, Vec<Frame>), EndpointError> {
   let sample_len = keys.remote_header().sample_len();
-  if datagram.len() < HEADER_PROTECTION_SAMPLE_OFFSET + sample_len {
+  if datagram.len() < HEADER_PROTECTION_SAMPLE_OFFSET.saturating_add(sample_len) {
     return Err(EndpointError::NotReady);
   }
   // The connection id is not header-protected (RFC 9001 §5.4.1 masks only the first byte and the
@@ -1947,8 +1952,8 @@ fn unprotect_packet(
   if first_byte & FIXED_BIT == 0 || first_byte & SHORT_HEADER_RESERVED_MASK != 0 {
     return Err(EndpointError::Header);
   }
-  let pn_len = usize::from((first_byte & PACKET_NUMBER_LENGTH_MASK) + 1);
-  let header_len = PACKET_NUMBER_OFFSET + pn_len;
+  let pn_len = usize::from(first_byte & PACKET_NUMBER_LENGTH_MASK).saturating_add(1);
+  let header_len = PACKET_NUMBER_OFFSET.saturating_add(pn_len);
   let truncated = packet
     .get(PACKET_NUMBER_OFFSET..header_len)
     .ok_or(EndpointError::Header)?;

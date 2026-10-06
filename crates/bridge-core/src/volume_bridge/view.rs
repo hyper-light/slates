@@ -494,14 +494,18 @@ impl VolumeBridge<'_> {
       if start >= stop {
         continue;
       }
-      let len = usize::try_from(stop - start).map_err(|_| VfsError::FileTooLarge)?;
+      let len = usize::try_from(stop.saturating_sub(start)).map_err(|_| VfsError::FileTooLarge)?;
       let mut bytes = vec![0u8; len];
       self
         .volume
         .sidecar_read(self.store, owner, start, &mut bytes)?;
-      self
-        .volume
-        .xattr_write_at(self.store, owner, name, start - span.offset, &bytes)?;
+      self.volume.xattr_write_at(
+        self.store,
+        owner,
+        name,
+        start.saturating_sub(span.offset),
+        &bytes,
+      )?;
     }
     Ok(())
   }

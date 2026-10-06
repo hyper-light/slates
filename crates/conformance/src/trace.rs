@@ -331,24 +331,24 @@ fn is_stream_write(call: &str) -> bool {
 pub fn judge(events: &[WriteEvent], policy: &Policy<'_>) -> Hermeticity {
   let mut out = Hermeticity::default();
   for event in events {
-    out.write_calls += 1;
+    out.write_calls = out.write_calls.saturating_add(1);
     match classify(event, policy) {
       Placement::InsideTarget => {
-        out.inside_target += 1;
+        out.inside_target = out.inside_target.saturating_add(1);
         note_written(&mut out.written_inside, &event.path, policy.target);
       }
-      Placement::RamOnly(_) => out.ram_only += 1,
-      Placement::StandardStream => out.standard_streams += 1,
+      Placement::RamOnly(_) => out.ram_only = out.ram_only.saturating_add(1),
+      Placement::StandardStream => out.standard_streams = out.standard_streams.saturating_add(1),
       Placement::Unresolved => {
-        out.unresolved += 1;
+        out.unresolved = out.unresolved.saturating_add(1);
         keep_sample(&mut out.unresolved_sample, event);
       }
       Placement::Outside => {
-        out.outside += 1;
+        out.outside = out.outside.saturating_add(1);
         keep_violation(&mut out.violations, event, "outside every allowed class");
       }
       Placement::Unauthorized(reason) => {
-        out.outside += 1;
+        out.outside = out.outside.saturating_add(1);
         keep_violation(&mut out.violations, event, reason);
       }
     }
@@ -485,7 +485,7 @@ fn joined_lines(log: &str) -> Vec<Joined> {
         && let Some((began, head)) = pending.remove(&pid_text)
       {
         out.push(Joined {
-          line: index + 1,
+          line: index.saturating_add(1),
           pid,
           at_ns: began,
           body: format!("{head}{tail}"),
@@ -494,7 +494,7 @@ fn joined_lines(log: &str) -> Vec<Joined> {
       continue;
     }
     out.push(Joined {
-      line: index + 1,
+      line: index.saturating_add(1),
       pid,
       at_ns,
       body: body.to_owned(),
@@ -538,8 +538,8 @@ fn split_top_level(args: &str) -> Vec<&str> {
     }
     match c {
       '"' => in_string = true,
-      '[' | '{' | '(' => depth += 1,
-      ']' | '}' | ')' => depth -= 1,
+      '[' | '{' | '(' => depth = depth.saturating_add(1),
+      ']' | '}' | ')' => depth = depth.saturating_sub(1),
       ',' if depth == 0 => {
         out.push(args.get(start..index).unwrap_or_default().trim());
         start = index.saturating_add(1);
@@ -586,7 +586,7 @@ fn octal_char(first: char, chars: &mut std::iter::Peekable<std::str::Chars<'_>>)
   for _ in 0..OCTAL_DIGITS_AFTER_FIRST {
     match chars.peek().and_then(|c| c.to_digit(OCTAL)) {
       Some(digit) => {
-        value = value * OCTAL + digit;
+        value = value.saturating_mul(OCTAL).saturating_add(digit);
         chars.next();
       }
       None => break,
@@ -1016,7 +1016,7 @@ pub fn parse_fs_usage(log: &str) -> Vec<WriteEvent> {
     let Some(row) = read_row(raw) else {
       continue;
     };
-    fs_usage_row_events(index + 1, &row, &mut table, &mut events);
+    fs_usage_row_events(index.saturating_add(1), &row, &mut table, &mut events);
   }
   events
 }
@@ -1209,20 +1209,34 @@ fn days_from_civil(year: i64, month: i64, day: i64) -> Option<i64> {
     return None;
   }
   let year = if month <= MONTHS_BEFORE_MARCH {
-    year - 1
+    year.checked_sub(1)?
   } else {
     year
   };
   let era = year.div_euclid(YEARS_PER_ERA);
-  let of_era = year - era * YEARS_PER_ERA;
+  // `of_era` is in `[0, 399]`, `shifted` in `[0, 11]` and `day` in `[1, 31]` (checked above), so only the terms
+  // scaled by the era — a year from the text, possibly huge — can overflow; those are checked.
+  let of_era = year.rem_euclid(YEARS_PER_ERA);
   let shifted = if month > MONTHS_BEFORE_MARCH {
-    month - MARCH
+    month.saturating_sub(MARCH)
   } else {
-    month + JANUARY_SHIFT
+    month.saturating_add(JANUARY_SHIFT)
   };
-  let of_year = (MONTH_RHYTHM_DAYS * shifted + MONTH_RHYTHM_OFFSET) / MONTH_RHYTHM_MONTHS + day - 1;
-  let of_era_days = of_era * DAYS_PER_YEAR + of_era / LEAP_EVERY - of_era / NO_LEAP_EVERY + of_year;
-  Some(era * DAYS_PER_ERA + of_era_days - EPOCH_DAYS)
+  let of_year = MONTH_RHYTHM_DAYS
+    .saturating_mul(shifted)
+    .saturating_add(MONTH_RHYTHM_OFFSET)
+    .checked_div(MONTH_RHYTHM_MONTHS)?
+    .saturating_add(day)
+    .saturating_sub(1);
+  let of_era_days = of_era
+    .saturating_mul(DAYS_PER_YEAR)
+    .saturating_add(of_era.checked_div(LEAP_EVERY)?)
+    .saturating_sub(of_era.checked_div(NO_LEAP_EVERY)?)
+    .saturating_add(of_year);
+  era
+    .checked_mul(DAYS_PER_ERA)?
+    .checked_add(of_era_days)?
+    .checked_sub(EPOCH_DAYS)
 }
 
 /// The three `separator`-joined numbers of an RFC 3339 date or clock.
@@ -1331,7 +1345,7 @@ pub fn eslogger_has_activity(log: &str) -> bool {
 pub fn parse_eslogger(log: &str) -> Vec<WriteEvent> {
   let mut out = Vec::new();
   for (index, line) in log.lines().enumerate() {
-    let number = index + 1;
+    let number = index.saturating_add(1);
     if line.trim().is_empty() {
       continue;
     }

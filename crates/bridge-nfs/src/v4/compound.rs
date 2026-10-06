@@ -287,6 +287,8 @@ const SET_TO_CLIENT_TIME4: u32 = 1;
 pub const COMPOUND_HEADER_BYTES: u32 = derived_compound_header_bytes();
 
 /// The sum stated on [`COMPOUND_HEADER_BYTES`].
+// Evaluated only in a `const` item: an overflow fails the build, it cannot wrap at run time.
+#[allow(clippy::arithmetic_side_effects)]
 const fn derived_compound_header_bytes() -> u32 {
   /// Format: an XDR word.
   const WORD: usize = 4;
@@ -489,7 +491,7 @@ pub async fn serve<B: Backend>(backend: &mut B, args: &[u8], request_bytes: usiz
     } else {
       later_operation(backend, opnum, &mut reader, &mut frame).await
     };
-    done += 1;
+    done = done.saturating_add(1);
     let before = results.len();
     let recorded = record(&mut results, opnum, outcome, &mut frame);
     // The result that would carry the reply past the session's sizes is replaced by the refusal that
@@ -870,8 +872,10 @@ fn reply_bytes_so_far(tag: &[u8], results_len: usize) -> usize {
   /// Format: an XDR word.
   const WORD: usize = 4;
   let rpc = crate::rpc::reply_bytes(0, crate::rpc::AcceptStatus::Success, &[]).len();
-  let tag_padded = tag.len().div_ceil(WORD) * WORD;
-  rpc + WORD + WORD + tag_padded + WORD + results_len
+  let tag_padded = tag.len().div_ceil(WORD).saturating_mul(WORD);
+  [rpc, WORD, WORD, tag_padded, WORD, results_len]
+    .into_iter()
+    .fold(0, usize::saturating_add)
 }
 
 /// The refusal a reply of `size` bytes earns under `limits`: past the response size,
@@ -1803,8 +1807,13 @@ async fn readdir_of_root<B: Backend>(
   // cookie, the shortest name, and the requested attributes of a minimal object (A-90: counted at `ENTRY_FIXED` alone,
   // the v3 page fetched, stated and encoded twice the entries an `ls` page carries).
   let entry_floor = super::listing::entry_floor(&requested, frame.minor);
-  let fit = u32::try_from(usize::try_from(maxcount).unwrap_or(usize::MAX) / entry_floor.max(1))
-    .unwrap_or(u32::MAX);
+  let fit = u32::try_from(
+    usize::try_from(maxcount)
+      .unwrap_or(usize::MAX)
+      .checked_div(entry_floor)
+      .unwrap_or(0),
+  )
+  .unwrap_or(u32::MAX);
   let v3_maxcount = maxcount
     .saturating_add(fit.saturating_mul(V3_ENTRY_EXCESS))
     .saturating_add(V3_REPLY_OVERHEAD);
@@ -1851,12 +1860,21 @@ async fn readdir_of_root<B: Backend>(
     one.u64(entry.cookie.saturating_add(COOKIE_SHIFT));
     one.opaque(entry.name.as_bytes());
     attr::encode((&requested, frame.minor), &attrs, &fh, &figures, &mut one)?;
-    if entries.len() + one.len() + 2 * size_of::<u32>() + VERIFIER_SIZE > budget {
+    let needed = [
+      entries.len(),
+      one.len(),
+      size_of::<u32>(),
+      size_of::<u32>(),
+      VERIFIER_SIZE,
+    ]
+    .into_iter()
+    .fold(0, usize::saturating_add);
+    if needed > budget {
       all = false;
       break;
     }
     entries.fixed(one.as_slice());
-    returned += 1;
+    returned = returned.saturating_add(1);
   }
   if returned == 0 && !all {
     return Err(Nfsstat4::Toosmall);
@@ -2321,6 +2339,8 @@ enum OpenCreate {
 const SETTABLE_VALUES_BYTES: usize = derived_settable_values_bytes();
 
 /// The sum stated on [`SETTABLE_VALUES_BYTES`].
+// Evaluated only in a `const` item: an overflow fails the build, it cannot wrap at run time.
+#[allow(clippy::arithmetic_side_effects)]
 const fn derived_settable_values_bytes() -> usize {
   let word = size_of::<u32>();
   let time = word + size_of::<u64>() + size_of::<u32>();

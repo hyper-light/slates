@@ -541,7 +541,8 @@ impl FileState {
       return Err(Nfsstat4::Nospc);
     }
     let other = mint(self.next, self.tag);
-    self.next += 1;
+    // A state id is never reused: an exhausted id space refuses the open rather than wrap onto a live one.
+    self.next = self.next.checked_add(1).ok_or(Nfsstat4::Serverfault)?;
     self.opens.insert(
       other,
       Open {
@@ -901,12 +902,14 @@ impl FileState {
     if contended {
       return None;
     }
+    // A delegation is optional: an exhausted state-id space offers none rather than wrap onto a live id.
+    let following = self.next.checked_add(1)?;
     let other = mint(self.next, self.tag);
     let granted = self
       .delegations
       .grant_read((clientid, fh), other, now_ns, quiet_ns)?;
     if granted.other == other {
-      self.next += 1;
+      self.next = following;
       self.journal_delegation(&other);
     }
     Some(granted)
@@ -931,12 +934,14 @@ impl FileState {
     if opened_elsewhere {
       return None;
     }
+    // A delegation is optional: an exhausted state-id space offers none rather than wrap onto a live id.
+    let following = self.next.checked_add(1)?;
     let other = mint(self.next, self.tag);
     let granted = self
       .delegations
       .grant_write((clientid, fh), other, now_ns, quiet_ns)?;
     if granted.other == other {
-      self.next += 1;
+      self.next = following;
       self.journal_delegation(&other);
     }
     Some(granted)

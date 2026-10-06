@@ -226,12 +226,13 @@ impl Discovery {
         return Err(Refusal::Scope);
       }
     } else {
-      let enrolled = self.pins.len().saturating_sub(1)
-        + self
+      let enrolled = self.pins.len().saturating_sub(1).saturating_add(
+        self
           .records
           .keys()
           .filter(|anchor| !self.pins.contains_key(anchor))
-          .count();
+          .count(),
+      );
       if enrolled >= self.capacity && !self.pins.contains_key(&announce.anchor) {
         return Err(Refusal::Capacity);
       }

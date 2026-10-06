@@ -378,12 +378,16 @@ impl MountArgs {
     let mut out = XdrWriter::new();
     out.u32(ARGS_VERSION_XDR);
     // The args length counts from itself to the end, plus the version word before it.
-    let args_len = size_of::<u32>() // the args length itself
-      + size_of::<u32>() // the XDR-args version
-      + size_of::<u32>() * (1 + MATTR_WORDS) // the bitmap
-      + size_of::<u32>() // the attrs length
-      + attrs.len()
-      + size_of::<u32>(); // the leading version word
+    let args_len = [
+      size_of::<u32>(), // the args length itself
+      size_of::<u32>(), // the XDR-args version
+      size_of::<u32>().saturating_mul(MATTR_WORDS.saturating_add(1)), // the bitmap
+      size_of::<u32>(), // the attrs length
+      attrs.len(),
+      size_of::<u32>(), // the leading version word
+    ]
+    .into_iter()
+    .fold(0, usize::saturating_add);
     out.u32(u32::try_from(args_len).unwrap_or(u32::MAX));
     out.u32(XDR_ARGS_VERSION);
     push_words(&mut out, &bitmap);

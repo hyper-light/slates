@@ -105,7 +105,7 @@ pub struct Snapshot {
 /// (`page / size_of::<Snapshot>()`); the slab grows by segments past it.
 pub fn initial_capacity(page: usize) -> Derived<usize> {
   derived!(
-    (page / size_of::<Snapshot>()).max(1),
+    page.checked_div(size_of::<Snapshot>()).unwrap_or(0).max(1),
     "page / size_of::<Snapshot>()",
     ["machine page", "size_of::<Snapshot>()"]
   )

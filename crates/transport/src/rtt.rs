@@ -80,15 +80,20 @@ impl RttEstimator {
     // Remove the peer's ack delay when the sample still sits at or above the minimum RTT (RFC 9002 §5.3).
     // The guard makes `latest - ack_delay` non-negative (latest >= min_rtt + ack_delay >= ack_delay).
     let adjusted = if latest >= self.min_rtt.saturating_add(ack_delay) {
-      latest - ack_delay
+      latest.saturating_sub(ack_delay)
     } else {
       latest
     };
     // rttvar = 3/4 · rttvar + 1/4 · |smoothed − adjusted|; smoothed = 7/8 · smoothed + 1/8 · adjusted.
     let var_sample = self.smoothed_rtt.abs_diff(adjusted);
-    self.rttvar = self.rttvar - (self.rttvar >> RTTVAR_SHIFT) + (var_sample >> RTTVAR_SHIFT);
-    self.smoothed_rtt = self.smoothed_rtt - (self.smoothed_rtt >> SMOOTHED_RTT_SHIFT)
-      + (adjusted >> SMOOTHED_RTT_SHIFT);
+    self.rttvar = self
+      .rttvar
+      .saturating_sub(self.rttvar >> RTTVAR_SHIFT)
+      .saturating_add(var_sample >> RTTVAR_SHIFT);
+    self.smoothed_rtt = self
+      .smoothed_rtt
+      .saturating_sub(self.smoothed_rtt >> SMOOTHED_RTT_SHIFT)
+      .saturating_add(adjusted >> SMOOTHED_RTT_SHIFT);
   }
 
   /// The probe timeout in nanoseconds (RFC 9002 §6.2.1): `smoothed_rtt + max(4 · rttvar, granularity) +

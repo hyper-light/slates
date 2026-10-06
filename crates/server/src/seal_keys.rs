@@ -277,10 +277,14 @@ const RECIPIENT_ID_BYTES: usize = 16;
 /// `public` as the recipient stream carries it.
 pub fn encode_public(public: &hyper_seal::recipient::RecipientPublic) -> Vec<u8> {
   let mut out = Vec::with_capacity(
-    RECIPIENT_ID_BYTES
-      + hyper_seal::recipient::KEM_PUBLIC
-      + size_of::<u8>()
-      + hyper_seal::recipient::ECDH_PUBLIC,
+    [
+      RECIPIENT_ID_BYTES,
+      hyper_seal::recipient::KEM_PUBLIC,
+      size_of::<u8>(),
+      hyper_seal::recipient::ECDH_PUBLIC,
+    ]
+    .into_iter()
+    .fold(0, usize::saturating_add),
   );
   out.extend_from_slice(&public.id);
   out.extend_from_slice(&public.kem);

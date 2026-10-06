@@ -42,22 +42,22 @@ pub fn lock_in_order(regions: &mut [(Priority, &mut Region)], capacity_bytes: us
   let mut report = LockReport::default();
   let mut stopped = false;
   for (_, region) in regions.iter_mut() {
-    report.requested += region.len();
+    report.requested = report.requested.saturating_add(region.len());
     if stopped {
-      report.unlocked += region.len();
+      report.unlocked = report.unlocked.saturating_add(region.len());
       continue;
     }
     if report.locked.saturating_add(region.len()) > capacity_bytes {
-      report.over_capacity += 1;
-      report.unlocked += region.len();
+      report.over_capacity = report.over_capacity.saturating_add(1);
+      report.unlocked = report.unlocked.saturating_add(region.len());
       stopped = true;
       continue;
     }
     match region.lock() {
-      Ok(()) => report.locked += region.len(),
+      Ok(()) => report.locked = report.locked.saturating_add(region.len()),
       Err(e) => {
         report.refusal = Some(e);
-        report.unlocked += region.len();
+        report.unlocked = report.unlocked.saturating_add(region.len());
         stopped = true;
       }
     }

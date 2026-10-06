@@ -222,7 +222,12 @@ impl Region {
 
   /// Pages in the region.
   pub fn pages(&self) -> usize {
-    self.backing.bytes().len() / self.page
+    self
+      .backing
+      .bytes()
+      .len()
+      .checked_div(self.page)
+      .unwrap_or(0)
   }
 
   /// The bytes.

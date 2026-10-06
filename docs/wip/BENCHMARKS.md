@@ -2619,3 +2619,28 @@ directory tree's slots and the inode trie.
 The fourth new run was high on every row at once, a load spike.
 
 **Verdict:** parity, so the sweep lands.
+
+### 2026-10-06: denying overflow-capable arithmetic costs nothing measurable on the hot paths
+
+Every shipped crate's arithmetic is now saturating or checked; GAPS has the no-panic sweep's arithmetic half. A/B against
+HEAD (`60460a8`, built from a detached worktree), interleaved, on the same Apple M5 Max (128 GiB).
+
+**First pass: load 10–13, with a Miri run holding a core.** Three pairs. The median ratios ran 1.00–1.13 with
+overlapping ranges, which cannot be read.
+
+**Second pass: load 6, Miri finished.** Five pairs. Command: `vfs_bench` from each target directory
+(`cargo run --release -p slates-vfs --example vfs_bench`). Medians, new against HEAD:
+
+| Row | New | HEAD |
+|---|---|---|
+| Lookup, 2-entry inline directory | 99 ns | 106 ns |
+| Lookup, 2-entry tree | 161 ns | 166 ns |
+| Lookup, 128-entry tree | 229 ns | 234 ns |
+| Insert and remove, 128-entry tree | 187 ns | 182 ns |
+| Read 4 KiB | 127 ns | 138 ns |
+| Write 4 KiB in place | 437 ns | 458 ns |
+| Resolve a 3-component path, 10⁵ files | 406 ns | 385 ns |
+
+Every row's five values overlap the other build's. The geometric mean of the 21 row ratios is 0.984.
+
+**Verdict:** parity. The sweep lands as a correctness change, not an optimization.

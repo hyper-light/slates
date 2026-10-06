@@ -83,7 +83,7 @@ impl Writer {
 
   /// Appends `n` zero bytes (padding or reserved fields).
   pub fn pad(&mut self, n: usize) {
-    self.bytes.resize(self.bytes.len() + n, 0);
+    self.bytes.resize(self.bytes.len().saturating_add(n), 0);
   }
 
   /// Appends raw bytes (a name, or nested data).
