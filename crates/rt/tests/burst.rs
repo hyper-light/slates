@@ -55,8 +55,10 @@ fn a_burst_past_one_batch_is_drained_whole_and_the_shutdown_behind_it_lands() {
   // machine; a timed spin could end first on a slow one and the burst would drain as sent, never testing a drain
   // past one batch.
   let (release, released) = std::sync::mpsc::channel::<()>();
+  let (running, started) = std::sync::mpsc::channel::<()>();
   let hold = rt
     .spawn_on_with_receipt(shard, async move {
+      let _ = running.send(());
       while matches!(
         released.try_recv(),
         Err(std::sync::mpsc::TryRecvError::Empty)
@@ -66,6 +68,8 @@ fn a_burst_past_one_batch_is_drained_whole_and_the_shutdown_behind_it_lands() {
     })
     .unwrap();
   assert!(matches!(hold.wait(WAIT), Some(Admission::Admitted(_))));
+  // Running, not only admitted: an admitted hold not yet polled lets the burst drain as it is sent.
+  started.recv_timeout(WAIT).expect("the hold is running");
   // The burst: every send lands (the channel has room for it all), all behind the hold.
   for _ in 0..BURST {
     match rt.spawn_on(shard, async {

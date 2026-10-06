@@ -44,14 +44,17 @@ fn config(tasks_per_shard: usize) -> RuntimeConfig {
 }
 
 /// Holds `shard` inside one poll until the returned sender sends (or is dropped, so a failed test never wedges the
-/// shard): a task that spins checking its release. Returns once the shard has admitted it, so everything submitted
-/// before the release queues behind the hold whatever the machine's speed. A fixed spin (300 ms until 2026-10-06)
-/// ended before the test's next submissions on CI's TSan lane, and the shard exited ahead of a request it was meant
-/// to drain.
+/// shard): a task that spins checking its release. Returns once the hold is *running*, signalled from inside its
+/// poll, so everything submitted before the release queues behind a poll in progress whatever the machine's speed.
+/// Two earlier forms lost that order on CI's TSan lane: a fixed 300 ms spin ended first, and returning on admission
+/// let the shard drain the test's shutdown before it ever polled the hold, cancel it, and exit ahead of the request
+/// (2026-10-06, `refused_at_shutdown` 0 for 1 both times).
 fn hold(rt: &Runtime, shard: ShardId) -> std::sync::mpsc::Sender<()> {
   let (release, released) = channel::<()>();
+  let (running, started) = channel::<()>();
   let receipt = rt
     .spawn_on_with_receipt(shard, async move {
+      let _ = running.send(());
       while matches!(
         released.try_recv(),
         Err(std::sync::mpsc::TryRecvError::Empty)
@@ -64,6 +67,7 @@ fn hold(rt: &Runtime, shard: ShardId) -> std::sync::mpsc::Sender<()> {
     matches!(receipt.wait(WAIT), Some(Admission::Admitted(_))),
     "the hold is admitted"
   );
+  started.recv_timeout(WAIT).expect("the hold is running");
   release
 }
 

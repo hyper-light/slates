@@ -34,3 +34,19 @@ should.
 
 **Reported, not fixed here:** after that failure, the test binary hangs in the runtime's drop, which waits on a
 shutdown the broken drain never delivers. That regression would show on CI as a timeout, not a red test.
+
+## Second CI failure (run 37483571176, `d362987`), the same day
+
+With the release-by-the-test hold, TSan's lane still failed `refused_at_shutdown` 0 for 1. `hold()` returned when
+its task was **admitted**, not when it was **running**. Admission answers the receipt as the task enters the arena,
+and the shard can keep draining its control channel in the same step. So, under TSan's slowdown of both threads, the
+shard can take the test's shutdown before it ever polls the hold. The shutdown cancels the never-run hold, the arena
+empties, the shard exits, and the request arrives behind it, dropped undrained.
+
+That explanation fits the counter but is **not reproduced**. Slowing only the test thread (a 50 ms pause between the
+shutdown and the request) passes either way, 5 of 5 runs, because natively the shard polls the hold microseconds after
+admitting it. Reproducing needs the shard slowed between admission and its first poll.
+
+**Fix:** the hold task signals from inside its first poll, and `hold()` returns only on that signal, in
+`admission.rs` and in `burst.rs`. The stated order (shutdown, then request, both behind a poll in progress) now holds
+by construction. 200 of 200 runs locally for each suite. The TSan lane's next run is the evidence still owed.
