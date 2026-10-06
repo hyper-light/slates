@@ -2426,6 +2426,21 @@ FUSE request is two cross-thread handoffs through the kernel. On a host about 3�
 hundreds of microseconds and varies with whatever else runs, so the measure taken is what the workload asks of
 slates.
 
+**Wall time on a quiet host (later the same day, load 9).** One container, one daemon, alternating, six rounds;
+the release binary; Linux 6.12 under Docker Desktop, 18 vCPUs. The script is `pip-time-inner.sh`: `python3 -m venv
+v && v/bin/pip install requests flask`, timed with `EPOCHREALTIME`.
+
+| | slates FUSE mount | the container's own filesystem |
+|---|---|---|
+| install, round 1 (cold) | 2.83 s | 1.63 s |
+| install, rounds 2–6 | 1.95–2.02 s | 1.59–1.61 s |
+| `import flask, requests` | 0.10 s | 0.08 s |
+
+- **The gap is the request count.** Steady state is 1.24×. The 0.4 s gap is close to 19,222 requests at about 20 µs per
+  kernel round trip, so what remains is the crossing itself, not slates' work.
+- **Correctness:** 1,382 files on each side, and identical bytes outside `RECORD`, `pyvenv.cfg` and `.pyc`.
+- **One earlier run** had a 7.67 s round that six later rounds did not repeat (a host-load spike).
+
 **Requests slates receives**, counted by opcode at the bridge (deterministic):
 
 | | HEAD | Change |
