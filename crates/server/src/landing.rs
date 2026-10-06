@@ -673,8 +673,15 @@ fn not_landed(
     LandingRefusal::GrantRequired(plan) => {
       present(state, presenter, ids, &plan.manifest, &plan.binding)
     }
+    // The engine hands back every entry's report; the refusal names the conflicting ones alone (§4.15: a conflict
+    // refuses the whole landing, and the person resolving it needs only the entries in conflict). Before 2026-10-06
+    // every entry was named, so an entry that would only have been created read as a conflict.
     LandingRefusal::Conflict(entries) => refused(Refusal::LandingConflict {
-      entries: entries.iter().map(|e| e.path.to_string()).collect(),
+      entries: entries
+        .iter()
+        .filter(|e| matches!(e.verdict, Some(slates_land::verdict::Verdict::Conflict(_))))
+        .map(|e| e.path.to_string())
+        .collect(),
     }),
     LandingRefusal::LeaseHeld(held) => refused(Refusal::LandingLeaseHeld {
       holder: held.holder,

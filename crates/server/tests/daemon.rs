@@ -1081,6 +1081,94 @@ fn a_granted_landing_consumes_its_presentation() {
   drop(daemon);
 }
 
+/// §4.15 (AC-1.12, D-27): a granted landing over a base an outsider changed refuses as a conflict, names only the
+/// entries that conflict, and writes nothing. Do: overlay a directory holding `b.txt`; through the volume, change
+/// `b.txt` and create `new.txt`; then, outside the volume, change `b.txt` on disk; snapshot, present, grant and land.
+/// Expect: `LandingConflict` naming `/b.txt` alone (`new.txt` would only be created, which is no conflict), the
+/// outsider's `b.txt` untouched, and no `new.txt`. Before 2026-10-06 the refusal named every entry of the landing
+/// (`["/new.txt", "/b.txt"]`, measured through the CLI), so a person sent to resolve it looked at files that were fine.
+#[test]
+fn a_landing_over_an_outsiders_change_refuses_naming_only_the_conflict() {
+  let (daemon, instance) = daemon("land-conflict");
+  let secret = daemon.segment().issuer_secret().unwrap();
+  let mut client = Client::connect(&instance);
+  let target = common::target::target_dir();
+  target.seed("b.txt", b"base-b");
+  let ReplyBody::Created { id } = client.call(&RequestBody::Create {
+    name: "land-conflict".to_owned(),
+    size: SizeClass::Bounded { limit: 1 << 20 },
+    names: NamePolicy::Exact,
+    require_locked: false,
+    base: Some(target.path.clone()),
+  }) else {
+    panic!("create over the base");
+  };
+  let ReplyBody::Attached { attachment, .. } = client.call(&RequestBody::Attach {
+    volume: id,
+    snapshot: None,
+    intent: Intent::Write,
+    form: AttachRequest::Root,
+  }) else {
+    panic!("attach");
+  };
+  for (path, bytes) in [("b.txt", &b"volume-b"[..]), ("new.txt", &b"volume-new"[..])] {
+    let wrote = client.call(&RequestBody::FsWrite {
+      volume: id,
+      attachment,
+      path: path.to_owned(),
+      bytes: bytes.to_vec(),
+      mode: 0o644,
+    });
+    assert!(
+      !matches!(wrote, ReplyBody::Refused { .. }),
+      "write {path}: {wrote:?}"
+    );
+  }
+  // The outsider's change, past the base's timestamp granularity so the fingerprint moves.
+  #[allow(clippy::disallowed_methods)] // a test may sleep (the lint's stated exception)
+  std::thread::sleep(std::time::Duration::from_millis(1100));
+  target.seed("b.txt", b"outsider-b");
+  let ReplyBody::Snapshotted { id: snapshot, .. } =
+    client.call(&RequestBody::Snapshot { volume: id })
+  else {
+    panic!("snapshot");
+  };
+  let presented = client.call(&RequestBody::Land {
+    volume: id,
+    snapshot: Some(snapshot),
+    target: target.path.clone(),
+    filter: Filter::default(),
+    grant: None,
+  });
+  let ReplyBody::GrantRequired {
+    landing, manifest, ..
+  } = presented
+  else {
+    panic!("presented: {presented:?}");
+  };
+  let grant = verified_approval_issues(&mut client, &secret, landing, manifest);
+  let landed = client.call(&RequestBody::Land {
+    volume: id,
+    snapshot: Some(snapshot),
+    target: target.path.clone(),
+    filter: Filter::default(),
+    grant: Some(grant),
+  });
+  #[allow(clippy::disallowed_methods)] // reading the target back, read-only
+  let on_disk = std::fs::read(format!("{}/b.txt", target.path)).unwrap();
+  let created = std::path::Path::new(&format!("{}/new.txt", target.path)).exists();
+  drop(daemon);
+  assert!(
+    matches!(
+      &landed,
+      ReplyBody::Refused { refusal: Refusal::LandingConflict { entries } } if entries == &["/b.txt".to_owned()]
+    ),
+    "the conflict names /b.txt alone: {landed:?}"
+  );
+  assert_eq!(on_disk, b"outsider-b", "the outsider's change is untouched");
+  assert!(!created, "nothing of the refused landing was written");
+}
+
 /// A forged approval — the agent knows the landing and its manifest but not the issuer secret — is
 /// refused as unverified authority and issues nothing.
 fn forged_approval_is_refused(client: &mut Client, landing: u64, manifest: [u8; 32]) {
