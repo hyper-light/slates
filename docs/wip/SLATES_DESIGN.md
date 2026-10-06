@@ -2003,8 +2003,9 @@ Linux runner; then teardown proofs (detach, destroy, a daemon restart).
 >
 > **Superseded in part 2026-10-06 (A-102):** the stop no longer unmounts. It ends each mount (device dropped, the
 > anchor's copy released, a fenced shard writing no record), and the mount answers `ENOTCONN` until its user
-> unmounts it, so no write by path reaches the disk beneath. The recovery's sweep of a crashed daemon's dead mounts
-> is unchanged and open in GAPS.
+> unmounts it, so no write by path reaches the disk beneath. The restart after a crash likewise ends a dead mount's
+> record and leaves the mount for its user (`leave_stale`, counted `fuse.dead_mount_left`); that path runs only on
+> kernels before Linux 6.9, since later ones keep the mount through the anchor's held device (A-61).
 
 > **Status (2026-10-01, AUD-29-77 in part: kept copies charged; protection named).** A guest device's copy
 > buffers are charged to its attachment for as long as it keeps them: growth is charged and reserved exactly,

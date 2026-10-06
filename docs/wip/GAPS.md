@@ -3870,8 +3870,10 @@ host disk under the mount point. They now meet `ENOTCONN` or a refusal until the
 `docs/bugs/2026-10-06-an-ended-mount-let-writes-reach-the-disk-beneath.md`).
 
 **Open decisions:**
-- **Startup's stale-mount sweep (`unmount_stale`, AUD-29-64)** still unmounts a killed daemon's dead mounts. It has
-  the same fall-through for a process still inside one; keep or retire it.
+- ~~Startup's stale-mount sweep (`unmount_stale`, AUD-29-64)~~ **Closed 2026-10-06:** under A-102's rule the
+  restarted daemon now leaves a killed daemon's dead mounts for their users (`leave_stale`). The path runs only on
+  kernels before Linux 6.9, and its CLI test skips on the 6.12 and 6.17 kernels available here, so it is unexercised
+  until a pre-6.9 lane exists.
 - **Whether `destroy` should refuse a volume that is still attached**, as Docker and Kubernetes do, rather than
   ending its mounts.
 

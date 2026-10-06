@@ -2955,11 +2955,11 @@ fn init_shard(
   }
   state::install(state);
   // The FUSE mounts whose devices the anchor held, served again (A-61); then the dead ones of a killed
-  // predecessor unmounted, once the shard can run their helpers (AUD-29-64).
+  // predecessor counted and left for their users to unmount (AUD-29-64, A-102).
   #[cfg(target_os = "linux")]
   crate::fuse::adopt_held();
   #[cfg(target_os = "linux")]
-  crate::fuse::unmount_stale();
+  crate::fuse::leave_stale();
   // Detached: the loop lives as long as the shard; nothing joins it (a joinable task stays in
   // the arena after it ends, which would hold the shard's shutdown).
   // A shard whose serve or reap loop the arena refuses serves nothing: a typed initialization failure

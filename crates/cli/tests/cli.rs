@@ -3985,9 +3985,10 @@ fn slates_mount_on_linux_serves_a_fuse_mount_and_unmount_ends_it() {
 
 /// AUD-29-64 (a FUSE mount outlives its daemon's crash). Do: `slates mount` a volume over FUSE, then `SIGKILL`
 /// the daemon and wait for the anchor's restarted one. Expect: the restarted daemon has ended the dead mount's
-/// attachment (its device died with the killed process) and unmounted the dead mount, whose source the kernel
-/// table names as that attachment; before 2026-10-01 the record outlived the process and the mount stayed,
-/// answering `ENOTCONN`. Gated like the Linux mount (`SLATES_TEST_CLI=1`, FUSE).
+/// attachment (its device died with the killed process) and left the dead mount for its user to unmount, refusing
+/// writes (A-102; until 2026-10-06 it unmounted it, exposing the directory beneath); before 2026-10-01 the record
+/// outlived the process. Runs only on a kernel before Linux 6.9 (it skips on 6.9 and later, where the mount
+/// survives). Gated like the Linux mount (`SLATES_TEST_CLI=1`, FUSE).
 #[cfg(target_os = "linux")]
 #[test]
 fn a_fuse_mount_whose_daemon_was_killed_is_ended_by_the_restarted_daemon() {
@@ -4026,9 +4027,16 @@ fn a_fuse_mount_whose_daemon_was_killed_is_ended_by_the_restarted_daemon() {
     wait_for(|| attachments_of(&instance, &id) == "0"),
     "the restarted daemon ended the dead mount's attachment"
   );
+  // A-102: the dead mount stays for its user to unmount; a write through it is refused, never landing beneath.
   assert!(
-    wait_for(|| mountinfo_at(&mount_point.path).is_none()),
-    "the restarted daemon unmounted the dead mount"
+    mountinfo_at(&mount_point.path).is_some(),
+    "the dead mount stays until its user unmounts it"
+  );
+  assert!(
+    !write_with_the_shell(&format!("{}/after-the-kill", mount_point.path), "x")
+      .status
+      .success(),
+    "a write to the dead mount is refused"
   );
   drop(anchor);
 }

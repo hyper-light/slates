@@ -918,11 +918,13 @@ pub(crate) fn drop_devices(s: &mut ShardState) {
   }
 }
 
-/// Unmounts the dead FUSE mounts recovery ended (AUD-29-64): the mounts a killed daemon served, whose device
-/// died with it, so each answers `ENOTCONN` until unmounted. Run once the shard runs; each is unmounted only if
-/// the kernel's table shows exactly that mount there — `fuse.slates` with the record's attachment as its source
-/// — so a mount someone made at the path since is never touched. A table that cannot be read is counted.
-pub(crate) fn unmount_stale() {
+/// Counts the dead FUSE mounts recovery ended (AUD-29-64) and leaves them in place (A-102): the mounts a killed
+/// daemon served on a kernel that cannot resend what it read (before Linux 6.9; a later kernel keeps them through the
+/// anchor's held device, A-61). Each answers `ENOTCONN` until its user unmounts it, so no write by path reaches the
+/// disk beneath; until 2026-10-06 the restarted daemon unmounted them, exposing the directories beneath to processes
+/// still working in them. Only a mount the kernel's table shows exactly there (`fuse.slates`, the record's attachment
+/// as its source) is counted; a table that cannot be read is counted as a refusal.
+pub(crate) fn leave_stale() {
   let stale = state::with_state(|s| std::mem::take(&mut s.stale_fuse_mounts)).unwrap_or_default();
   if stale.is_empty() {
     return;
@@ -931,16 +933,23 @@ pub(crate) fn unmount_stale() {
     let _ = state::with_state(|s| *s.refusals.entry(UNMOUNT_REFUSED).or_insert(0) += 1);
     return;
   };
-  for (attachment, point) in stale {
-    let source = fsname_of(attachment);
-    if table
-      .iter()
-      .any(|m| m.mount_point == point && m.fstype == FUSE_TYPE && m.source == source)
-    {
-      unmount_owned(&point);
-    }
-  }
+  let left = stale
+    .iter()
+    .filter(|(attachment, point)| {
+      let source = fsname_of(*attachment);
+      table
+        .iter()
+        .any(|m| &m.mount_point == point && m.fstype == FUSE_TYPE && m.source == source)
+    })
+    .count();
+  let _ = state::with_state(|s| {
+    let count = s.refusals.entry(DEAD_MOUNT_LEFT).or_insert(0);
+    *count = count.saturating_add(u64::try_from(left).unwrap_or(u64::MAX));
+  });
 }
+
+/// Format: the refusal name counting dead mounts a restarted daemon left for their users to unmount ([`leave_stale`]).
+const DEAD_MOUNT_LEFT: &str = "fuse.dead_mount_left";
 
 /// Format: the filesystem type the kernel lists for a slates FUSE mount (the `slates` subtype).
 const FUSE_TYPE: &str = "fuse.slates";
