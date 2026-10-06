@@ -1928,7 +1928,9 @@ Linux runner; then teardown proofs (detach, destroy, a daemon restart).
 > the mount's `fsname` names the attachment (`slates:<id>`). Each mount is served by one task on the volume's
 > owner shard: one request per turn under the mount's registry attachment, the §4.8 barrier before a
 > mutation's reply (`EIO` when refused), a yield between requests. The kernel's unmount, a `detach`, a destroy
-> and the daemon's stop end the mount and its attachment. Owed: `slates mount` on Linux, the OCI source
+> and the daemon's stop end the mount's attachment; only a `detach` (the user's request) and the kernel's unmount
+> remove the mount itself. Any other end leaves it answering `ENOTCONN` or refusing every call until its user unmounts
+> it, so a write by path never falls through to the disk beneath (A-102). Owed: `slates mount` on Linux, the OCI source
 > authority, the anchor holding the device across a restart (above), per-shard channels.
 
 > **Status (2026-10-01, AUD-29-85: a reply's room is checked before its effect, and a lost reply's grants
@@ -9742,3 +9744,24 @@ Status: built 2026-10-05.
   slices into milliseconds of `dealloc`). Owed: size-classed block slabs, which would fit both shapes (BENCHMARKS).
 Applied in the same change to: `crates/vfs/src/{dirtree,dir}.rs`, `crates/vfs/examples/tree_heap.rs` and its data,
 BENCHMARKS, GAPS.
+
+### A-102 — Slates never unmounts a mount its user did not release (2026-10-06)
+Applied in the same change to: `crates/server/src/fuse.rs` (`turn`, `fail`, `adopt_one`), `crates/server/src/verbs.rs`
+(`end_attachment` takes an `Ending`), its callers, §4.6's FUSE status, the test
+`a_destroyed_volumes_mount_refuses_writes_and_never_lets_them_reach_the_disk_beneath`
+(`crates/cli/tests/cli.rs`), `docs/bugs/2026-10-06-an-ended-mount-let-writes-reach-the-disk-beneath.md`, GAPS.
+Status: built 2026-10-06 (conditions 3 and 4).
+- What: a FUSE mount is unmounted by slates only when its user detaches it, or when an attach is refused before the
+  user had the mount. When the volume is destroyed, the mount's serving fails, its device cannot be adopted after a
+  restart, or the consumer is revoked, the attachment ends and the device is dropped (the anchor's copy released), but
+  the mount stays in the kernel's table. The kernel then answers every call `ENOTCONN`, or the revoked registry
+  attachment refuses it, until the user unmounts.
+- Why: a mount removed underneath a process exposes the directory beneath it. Measured on Linux 6.12: after a
+  destroy, slates' `fusermount3 -u -z` completed and `echo x > mnt/new` succeeded, writing to the disk under the mount
+  point for a process that believed it was writing to the volume. This is FUSE's own rule for a server that goes away
+  (the mount stays, `ENOTCONN`). It is how an NFS client behaves with a vanished handle (`ESTALE`, never an unmount).
+  It is why Docker refuses `volume rm` and Kubernetes defers a claim's deletion while a container uses the volume.
+- Rejected: refusing `destroy` while a volume is mounted (Docker's and Kubernetes' in-use protection). That changes
+  the destroy verb's contract for every attachment kind; the fall-through, which is the escape, is closed without it.
+  Kept open in GAPS as a decision for the destroy verb.
+

@@ -200,7 +200,7 @@ pub(crate) fn rebuild(state: &mut ShardState) -> usize {
       }
       Err(_) => {
         *state.refusals.entry(VIEW_REBUILD_REFUSED).or_insert(0) += 1;
-        let _ = crate::verbs::end_attachment(state, &record);
+        let _ = crate::verbs::end_attachment(state, &record, crate::verbs::Ending::Otherwise);
       }
     }
   }

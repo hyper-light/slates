@@ -3852,3 +3852,24 @@ shard has started.
 
 **Open:** what the client waited on for 1 s with the shard live but starved. The next step is the client's view at
 that moment (connected or reconnecting, which shard answered), not a longer deadline.
+
+### 2026-10-06: an ended FUSE mount no longer exposes the disk beneath it (conditions 3 and 4)
+
+**Closed:** a destroyed, failed or revoked mount used to be lazily unmounted, so later writes by path reached the
+host disk under the mount point. They now meet `ENOTCONN` or a refusal until the user unmounts (A-102,
+`docs/bugs/2026-10-06-an-ended-mount-let-writes-reach-the-disk-beneath.md`).
+
+**Open decisions:**
+- **Startup's stale-mount sweep (`unmount_stale`, AUD-29-64)** still unmounts a killed daemon's dead mounts. It has
+  the same fall-through for a process still inside one; keep or retire it.
+- **Whether `destroy` should refuse a volume that is still attached**, as Docker and Kubernetes do, rather than
+  ending its mounts.
+
+**The battery's other findings, all correct, recorded for condition 4:**
+- `EXDEV` for a hard link to a host file and for a rename out of the volume;
+- `EINVAL` for a rename of a directory into its own child;
+- `ENOSPC` for a `fallocate` past the bound; `EPERM` for a device `mknod` and for `trusted.` xattrs;
+- an `mmap` write that reads back;
+- 531,847 write-capable calls traced, none outside RAM, the FUSE device, sockets and pipes, apart from the OS mount
+  helper's `/run/mount`;
+- no panic in the daemon's log.

@@ -3684,6 +3684,73 @@ fn the_anchor_and_its_daemon_exclude_themselves_from_core_dumps() {
   drop(anchor);
 }
 
+/// Conditions 3 and 4 (no write escapes to disk), 2026-10-06. Do: mount a volume, write through it, destroy the
+/// volume, then create a file at the mount's path; then unmount it as its user would (`fusermount3 -u`) and look under
+/// it. Expect: the mount stays in the kernel's table, the create is refused, and nothing was written to the directory
+/// beneath. Before, the destroy lazily unmounted the mount (`fusermount3 -u -z`), so the next write by path landed
+/// on the disk under the mount point, silently, for a process that believed it was still writing to the volume
+/// (found by the adversarial battery under the hermeticity trace). FUSE's own rule for a server that is gone is to
+/// keep the mount and answer every call `ENOTCONN` until its user unmounts it; an NFS client does the same with
+/// `ESTALE`.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_destroyed_volumes_mount_refuses_writes_and_never_lets_them_reach_the_disk_beneath() {
+  if !linux_fuse_mount_runs() {
+    return;
+  }
+  let instance = format!("cli-fuse-gone-{}", std::process::id());
+  let _anchor = start_anchor(&instance);
+  let (code, out, err) = run(
+    &instance,
+    &["volume", "create", "gone", "--bounded", "8MiB"],
+  );
+  assert_eq!(code, 0, "{err}");
+  let id = value_of(&out, "id");
+  let mount_point = MountPoint {
+    path: fresh_mount_point(),
+  };
+  fuse_mount_and_check(&instance, &id, &mount_point.path);
+  assert!(
+    write_with_the_shell(&format!("{}/kept.txt", mount_point.path), "kept")
+      .status
+      .success()
+  );
+  let (code, _, err) = run(&instance, &["volume", "destroy", &id]);
+  assert_eq!(code, 0, "{err}");
+  // The destroy ends the volume's mounts on its owner's next turn; give it time to have done whatever it does.
+  let stray = format!("{}/stray.txt", mount_point.path);
+  let ended = wait_for(|| {
+    !write_with_the_shell(&stray, "probe").status.success()
+      || mountinfo_at(&mount_point.path).is_none()
+  });
+  let still_mounted = mountinfo_at(&mount_point.path).is_some();
+  let refused = !write_with_the_shell(&stray, "stray").status.success();
+  let _ = Command::new("fusermount3")
+    .args(["-u", &mount_point.path])
+    .status();
+  assert!(
+    wait_for(|| mountinfo_at(&mount_point.path).is_none()),
+    "the user's unmount took"
+  );
+  let beneath: Vec<_> = std::fs::read_dir(&mount_point.path)
+    .unwrap()
+    .map(|entry| entry.unwrap().file_name())
+    .collect();
+  assert!(ended, "the mount answered the destroy");
+  assert!(
+    still_mounted,
+    "the destroyed volume's mount stays until its user unmounts it"
+  );
+  assert!(
+    refused,
+    "a write to the destroyed volume's mount is refused"
+  );
+  assert!(
+    beneath.is_empty(),
+    "nothing reached the disk beneath the mount point: {beneath:?}"
+  );
+}
+
 /// Writes `text` to `path` with the shell (a write through a mount; tests write no host path themselves, R1).
 #[cfg(target_os = "linux")]
 fn write_with_the_shell(path: &str, text: &str) -> std::process::Output {

@@ -2810,7 +2810,7 @@ fn mark_revoked(s: &mut ShardState, consumer: u64) -> Result<(), Refusal> {
     .cloned()
     .collect();
   for record in held {
-    end_attachment(s, &record).map_err(|e| refusal_of_db(&e))?;
+    end_attachment(s, &record, Ending::Otherwise).map_err(|e| refusal_of_db(&e))?;
   }
   Ok(())
 }
@@ -5301,7 +5301,7 @@ fn detach(state: &mut ShardState, principal: &Principal, attachment: u64) -> Rep
   if &record.principal != principal {
     return forbidden("detach");
   }
-  match end_attachment(state, &record) {
+  match end_attachment(state, &record, Ending::Detached) {
     Ok(()) => ReplyBody::Detached,
     Err(e) => refused(refusal_of_db(&e)),
   }
@@ -5387,6 +5387,16 @@ fn mounts_of(
   (mounts, elided)
 }
 
+/// Why an attachment ends, which decides whether its FUSE mount is unmounted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Ending {
+  /// Its user detached it (the `detach` verb): the mount goes with it, as the user asked.
+  Detached,
+  /// Anything else (a revocation, the mount's own end, a protocol's unmount): the mount, if any, stays until its
+  /// user unmounts it.
+  Otherwise,
+}
+
 /// Ends an attachment on its owner shard — the `detach` verb's effect, and the kernel's `UMNT` of a host
 /// mount's (§4.6, §4.13; AUD-01): the record removed as a recorded operation, a green pin dropped, and,
 /// when it was the holder's last attachment of the volume and the holder holds the write lease, the
@@ -5395,6 +5405,7 @@ fn mounts_of(
 pub(crate) fn end_attachment(
   state: &mut ShardState,
   record: &AttachmentRecord,
+  ending: Ending,
 ) -> Result<(), DbError> {
   let now = state.clock.monotonic_ns();
   state.db.mutate(
@@ -5413,9 +5424,14 @@ pub(crate) fn end_attachment(
   if !a_device_closes_the_view {
     crate::snapshot_view::end(state, record.id);
   }
-  // A FUSE mount of the attachment is unmounted; the kernel's disconnect ends its serve task.
-  #[cfg(target_os = "linux")]
-  crate::fuse::unmount_if_mounted(state, record.id);
+  // A FUSE mount of the attachment is unmounted only when its user detached it; the kernel's disconnect then ends
+  // its serve task. Any other end leaves the mount in place, its requests refused under the revoked registry
+  // attachment below until its user unmounts it: an unmount nobody asked for lets the next write by path land on
+  // the disk beneath the mount point (conditions 3 and 4; `docs/bugs/2026-10-06-an-ended-mount-let-writes-reach-the-disk-beneath.md`).
+  if ending == Ending::Detached {
+    #[cfg(target_os = "linux")]
+    crate::fuse::unmount_if_mounted(state, record.id);
+  }
   // The registry attachment a mount's requests rode ends with the record: revoked so no later request
   // is admitted under it, drained so its slot is reused (GAP-A9-4).
   if let Some(mount) = state.mount_attachments.remove(&record.id) {

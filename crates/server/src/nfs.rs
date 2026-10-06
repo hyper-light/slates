@@ -719,7 +719,9 @@ async fn confirm_unmount(name: String, mounts: Vec<(u64, String)>) {
             .partition()
             .attachment(attachment)
             .cloned()
-            .is_some_and(|record| crate::verbs::end_attachment(s, &record).is_ok());
+            .is_some_and(|record| {
+              crate::verbs::end_attachment(s, &record, crate::verbs::Ending::Otherwise).is_ok()
+            });
           if !ended {
             *s.refusals.entry("nfs.unmount_refused").or_insert(0) += 1;
           }

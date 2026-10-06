@@ -126,7 +126,7 @@ fn close_device(attachment: u64) {
   let _ = state::with_state(|s| {
     crate::snapshot_view::end(s, attachment);
     if let Some(record) = s.db.partition().attachment(attachment).cloned()
-      && crate::verbs::end_attachment(s, &record).is_err()
+      && crate::verbs::end_attachment(s, &record, crate::verbs::Ending::Otherwise).is_err()
     {
       *s.refusals.entry(RECORD_END_REFUSED).or_insert(0) += 1;
     }

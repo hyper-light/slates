@@ -502,8 +502,10 @@ fn turn(s: &mut ShardState, attachment: u64) -> Turned {
   let Some(mut mount) = s.fuse_mounts.remove(&attachment) else {
     return Turned::Ended;
   };
+  // The volume is gone (destroyed): the mount ends without an unmount. Its device dropped and the anchor's copy
+  // released (`ended`), the kernel answers every later call `ENOTCONN` until the mount's user unmounts it, so no write
+  // by path falls through to the disk beneath (conditions 3 and 4).
   let Some(&handle) = s.by_id.get(&mount.volume) else {
-    unmount_owned(&mount.mount_point);
     return Turned::Ended;
   };
   // The live-tree fence the NFS mount applies before every procedure (§4.8 "Leases and reads"; AUD-29-83):
@@ -521,7 +523,6 @@ fn turn(s: &mut ShardState, attachment: u64) -> Turned {
       ..
     } = &mut *s;
     let Ok(slot) = volumes.get_mut(handle) else {
-      unmount_owned(&mount.mount_point);
       return Turned::Ended;
     };
     let mut bridge = VolumeBridge::attached(
@@ -560,8 +561,8 @@ fn turn(s: &mut ShardState, attachment: u64) -> Turned {
       reply(s, attachment, &mut mount, &dispatched)
     }
     Err(_) => {
+      // Ended without an unmount: the mount answers `ENOTCONN` until its user unmounts it (see `turn`).
       *s.refusals.entry(SERVE_FAILED).or_insert(0) += 1;
-      unmount_owned(&mount.mount_point);
       return Turned::Ended;
     }
   };
@@ -633,8 +634,8 @@ fn reply(
       Turned::Served
     }
     Err(_) => {
+      // Ended without an unmount: the mount answers `ENOTCONN` until its user unmounts it (see `turn`).
       *s.refusals.entry(SERVE_FAILED).or_insert(0) += 1;
-      unmount_owned(&mount.mount_point);
       Turned::Ended
     }
   }
@@ -716,12 +717,10 @@ fn redeliver(s: &mut ShardState, mount: &mut FuseMount, dispatched: &Dispatched)
   }
 }
 
-/// A serve task that cannot wait on its device: the mount is unmounted and its attachment ended.
+/// A serve task that cannot wait on its device: its attachment ended and its device dropped, the mount left for its
+/// user to unmount (it answers `ENOTCONN` until then; see `turn`).
 fn fail(s: &mut ShardState, attachment: u64) {
   *s.refusals.entry(SERVE_FAILED).or_insert(0) += 1;
-  if let Some(mount) = s.fuse_mounts.get(&attachment) {
-    unmount_owned(&mount.mount_point);
-  }
   ended(s, attachment);
 }
 
@@ -804,11 +803,12 @@ fn adopt_one(s: &mut ShardState, record: AttachmentRecord, held: crate::fuse_hol
     .fuse_mount_point()
     .unwrap_or_default()
     .to_owned();
+  // A device that cannot be served again is closed and released, never unmounted: its mount was in use across the
+  // restart, and an unmount would let its users' next writes by path reach the disk beneath (see `turn`).
   let end = |s: &mut ShardState| {
     *s.refusals.entry(ADOPT_REFUSED).or_insert(0) += 1;
-    unmount_owned(&mount_point);
     let _ = crate::fuse_hold::release(attachment);
-    if crate::verbs::end_attachment(s, &record).is_err() {
+    if crate::verbs::end_attachment(s, &record, crate::verbs::Ending::Otherwise).is_err() {
       *s.refusals.entry(UNMOUNT_REFUSED).or_insert(0) += 1;
     }
   };
@@ -882,7 +882,7 @@ fn ended(s: &mut ShardState, attachment: u64) {
     *s.refusals.entry(HOLD_REFUSED).or_insert(0) += 1;
   }
   if let Some(record) = s.db.partition().attachment(attachment).cloned()
-    && crate::verbs::end_attachment(s, &record).is_err()
+    && crate::verbs::end_attachment(s, &record, crate::verbs::Ending::Otherwise).is_err()
   {
     *s.refusals.entry(UNMOUNT_REFUSED).or_insert(0) += 1;
   }
