@@ -2412,3 +2412,58 @@ It is not yet found.
 - *Membership.* `ready_is_exact` holds that the sets are exactly the sendable streams on every poll of the
   transfer tests. Mutations caught: a credit grant that does not requeue fails 7 tests; a raised `MaxStreams`
   that admits nothing fails the concurrent-exchanges integration test.
+
+## Linux FUSE mounts: fewer kernel round trips per request (2026-10-06)
+
+**Workload.** `python3 -m venv v && v/bin/pip install requests flask` on a slates FUSE mount, against the same in the
+container's own filesystem. Linux 6.12 (Docker Desktop's VM, 18 vCPUs), the release binary, the daemon and the mount
+as an ordinary user, host load 48–70 (the machine is shared). Both installs produce the same 1,385 files with
+identical bytes outside the files that embed their own path.
+
+**Wall time is not usable at this load.** Over five alternating rounds of HEAD and the change, each build spans about
+2.5× on its own (HEAD 12.1–29.5 s, the change 10.0–27.2 s), against 2.4–3.7 s in the container's filesystem. Each
+FUSE request is two cross-thread handoffs through the kernel. On a host about 3× oversubscribed, a handoff costs
+hundreds of microseconds and varies with whatever else runs, so the measure taken is what the workload asks of
+slates.
+
+**Requests slates receives**, counted by opcode at the bridge (deterministic):
+
+| | HEAD | Change |
+|---|---|---|
+| pip install, all requests | 21,709 | 19,222 (−11.5%) |
+| `LOOKUP` | 5,025 | 3,616 (−28%) |
+| `FLUSH` | 2,361 | 1,395 (−41%) |
+| `GETATTR` | 4,250 | 4,217 |
+| `import flask, requests` after it | 1,074 | 864 (−20%) |
+| re-reading 200 cached files: requests per file | 5 (`OPEN`, `GETATTR`, `READ`, `FLUSH`, `RELEASE`) | 2 (`OPEN`, `RELEASE`) |
+| 200 `stat`s of cached files | 1 each | 0 |
+
+**What changed:**
+- **A lookup miss is a negative entry** (node id 0), cached for its directory's lifetime: forever for the volume's
+  own directories, whose every name change through another attachment is invalidated, and bounded for a live base.
+  A virtio-fs guest, with no invalidation channel, gets lifetime 0.
+- **Open flags.** `FOPEN_KEEP_CACHE` for the volume's own files, and `FOPEN_CACHE_DIR` for its directories:
+  the kernel keeps pages and listings across opens. `FOPEN_NOFLUSH` for a read-only handle: no `FLUSH`, and no
+  barrier, at its close.
+- **Activity.** A served FUSE request counts as activity (`note_activity`), as an NFS call does: the shard spins
+  between a burst's requests instead of parking. An uncached lookup's median went 23 → 12 µs in the first rounds.
+  Its p50 is about 40 µs under load afterwards, where it was about 60 µs before, and its minimum fell 25 → 9 µs.
+- **Read-only mounts are the kernel's `ro`.** A file read and then stat'ed costs no `GETATTR`, and a write is refused
+  `EROFS` with no request.
+
+**What remains, and why:**
+- **The `GETATTR` per open on a writable mount is the kernel's own** (Linux 6.12 source): every `READ` marks atime
+  stale (`fuse_invalidate_atime`, unless the mount is read-only), and every `WRITE` marks size, mtime and ctime stale
+  (`fuse_write_update_attr`, unless writeback caching owns them). Writeback caching is declined on the recorded
+  grounds that the kernel's ownership of the size defeats invalidation of a change made through another
+  attachment.
+- **1,898 `FUSE_IOCTL` requests per install** are Python's `isatty()` on every `open()` (`TCGETS`). The kernel
+  forwards every ioctl on a FUSE file and never remembers an `ENOSYS` (`fuse_send_ioctl`, `ioctl.c`), so every FUSE
+  filesystem pays them. slates answers each with one fixed reply.
+
+**Correctness.**
+- The real-kernel suites pass: the bridge (`owner_turn`, coherence across attachments), virtio-fs, and the server's
+  FUSE mounts.
+- A new coherence phase proves a name created in the root through another attachment is seen by a mount that had
+  cached it absent. It found the root-invalidation defect
+  (`docs/bugs/2026-10-06-fuse-invalidations-of-the-root-named-an-inode-the-kernel-does-not-know.md`).

@@ -48,6 +48,8 @@ const TRUNCATED_AGAIN_TO: u64 = 2;
 enum Ask {
   /// Truncate `name` to `size` through the other attachment.
   Truncate { name: String, size: u64 },
+  /// Create `name` in the volume's root through the other attachment.
+  Create { name: String },
   /// Refuse the next invalidation gather (the injected collection failure).
   RefuseNextGather,
   /// Report the loop's counters — answered after the step the ask woke, so a report is a barrier:
@@ -186,6 +188,17 @@ fn serve(
             .unwrap();
           attachments.end(other);
         }
+        Ask::Create { name } => {
+          let cx = attachments.begin(other).unwrap();
+          let root = bridge.root(&cx).unwrap();
+          let (made, fh) = bridge
+            .create(ObjectId::new(root, 0), &cx, &name, 0o100644, 1)
+            .unwrap();
+          bridge
+            .release(ObjectId::new(made.ino, made.generation), &cx, fh)
+            .unwrap();
+          attachments.end(other);
+        }
         Ask::RefuseNextGather => bridge.refuse_gathers = 1,
         Ask::Report => report_pending = true,
       }
@@ -294,10 +307,41 @@ fn a_change_through_another_attachment_reaches_the_kernel_without_a_request_and_
     let cached = warm_and_prove_cached(&control, &mount_point);
     let told = a_change_is_seen_without_a_request(&control, &mount_point, cached);
     a_refused_gather_is_retried(&control, &mount_point, told);
+    a_name_cached_absent_in_the_root_appears_when_another_attachment_makes_it(
+      &control,
+      &mount_point,
+    );
 
     drop(scratch);
     server.join().unwrap().unwrap();
   });
+}
+
+/// A name the kernel caches as absent (a lookup miss is a negative entry for the directory's lifetime) in the
+/// volume's root, made through another attachment: the mount sees it at once. The root is the one directory the
+/// kernel names differently (node id 1) from the volume (its root inode), so its invalidations must be addressed
+/// to node id 1; before 2026-10-06 they named the volume's root inode, which the kernel does not know, and every
+/// change to a name in the root through another attachment was lost to a mount that had cached it.
+fn a_name_cached_absent_in_the_root_appears_when_another_attachment_makes_it(
+  control: &Loop,
+  mount_point: &str,
+) {
+  let probe = "test -e \"$1/g\" && echo present || echo absent";
+  assert_eq!(through_the_mount(mount_point, probe).trim(), "absent");
+  assert_eq!(
+    through_the_mount(mount_point, probe).trim(),
+    "absent",
+    "and cached so"
+  );
+  control.ask(Ask::Create {
+    name: "g".to_owned(),
+  });
+  control.report();
+  assert_eq!(
+    through_the_mount(mount_point, probe).trim(),
+    "present",
+    "the name another attachment made in the root is seen through the kernel"
+  );
 }
 
 /// Warms the kernel's cache through the mount (a write, a stat), and proves it warm and unbounded: a

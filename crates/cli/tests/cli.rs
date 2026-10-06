@@ -3684,6 +3684,77 @@ fn the_anchor_and_its_daemon_exclude_themselves_from_core_dumps() {
   drop(anchor);
 }
 
+/// Writes `text` to `path` with the shell (a write through a mount; tests write no host path themselves, R1).
+#[cfg(target_os = "linux")]
+fn write_with_the_shell(path: &str, text: &str) -> std::process::Output {
+  Command::new("sh")
+    .args(["-c", "printf '%s' \"$2\" > \"$1\"", "sh", path, text])
+    .output()
+    .unwrap()
+}
+
+/// §4.6 "Cache posture", by use: a FUSE mount whose attachment may not write is the kernel's `ro` mount. Do: write
+/// a file through a writable mount, unmount, mount the volume again `--read-only`, write and read through it. Expect:
+/// the mount table lists `ro`; the write is refused by the kernel (`Read-only file system`, no request to slates);
+/// the file reads back. The kernel then also stops treating each read as a possible atime change, so a file read and
+/// stat'ed costs no `GETATTR` (measured 2026-10-06: one per open on a writable mount, none on this one).
+#[cfg(target_os = "linux")]
+#[test]
+fn a_read_only_fuse_mount_is_the_kernels_read_only_mount() {
+  if !linux_fuse_mount_runs() {
+    return;
+  }
+  let instance = format!("cli-fuse-ro-{}", std::process::id());
+  let _anchor = start_anchor(&instance);
+  let (code, out, err) = run(&instance, &["volume", "create", "ro", "--bounded", "8MiB"]);
+  assert_eq!(code, 0, "{err}");
+  let id = value_of(&out, "id");
+  let mount_point = MountPoint {
+    path: fresh_mount_point(),
+  };
+  let file = fill_through_a_writable_mount(&instance, &id, &mount_point.path);
+  the_read_only_mount_refuses_writes_and_reads(&instance, &id, &mount_point.path, &file);
+}
+
+/// Mounts `id` writable at `path`, writes `kept.txt` through it, and unmounts; returns the file's path.
+#[cfg(target_os = "linux")]
+fn fill_through_a_writable_mount(instance: &str, id: &str, path: &str) -> String {
+  fuse_mount_and_check(instance, id, path);
+  let file = format!("{path}/kept.txt");
+  assert!(
+    write_with_the_shell(&file, "kept").status.success(),
+    "a write through the writable mount"
+  );
+  let (code, _, err) = run(instance, &["unmount", path]);
+  assert_eq!(code, 0, "{err}");
+  assert!(
+    wait_for(|| mountinfo_at(path).is_none()),
+    "the writable mount ended"
+  );
+  file
+}
+
+/// Mounts `id` `--read-only` at `path`: the kernel lists `ro`, refuses a write `EROFS`, and `file` reads back.
+#[cfg(target_os = "linux")]
+fn the_read_only_mount_refuses_writes_and_reads(instance: &str, id: &str, path: &str, file: &str) {
+  let (code, _, err) = run(instance, &["mount", id, path, "--read-only"]);
+  assert_eq!(code, 0, "slates mount --read-only: {err}");
+  let options = mount_options_at(path).unwrap_or_default();
+  assert!(
+    options.split(',').any(|option| option == "ro"),
+    "the mount is the kernel's ro: {options}"
+  );
+  let refused = write_with_the_shell(&format!("{path}/new.txt"), "x");
+  let message = String::from_utf8_lossy(&refused.stderr);
+  assert!(
+    !refused.status.success() && message.contains("Read-only file system"),
+    "EROFS from the kernel: {message}"
+  );
+  assert_eq!(std::fs::read(file).unwrap(), b"kept");
+  let (code, _, err) = run(instance, &["unmount", path]);
+  assert_eq!(code, 0, "{err}");
+}
+
 /// The kernel's mount table entry at `path` (Linux `mountinfo`): its filesystem type and source.
 #[cfg(target_os = "linux")]
 fn mountinfo_at(path: &str) -> Option<(String, String)> {

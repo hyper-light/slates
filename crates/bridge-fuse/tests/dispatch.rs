@@ -12,6 +12,7 @@ use slates_bridge_core::{
   View,
 };
 use slates_bridge_fuse::abi::{IN_HEADER_LEN, OUT_HEADER_LEN, Opcode};
+use slates_bridge_fuse::bridge::CACHE_FOREVER;
 use slates_bridge_fuse::bridge::{Bridge, DirEntry, ENOSYS, Reclaimed, reclaim_unreported};
 use slates_bridge_fuse::reply::{AttrOut, EntryOut};
 use slates_bridge_fuse::request::{RenameIn, SetAttrIn};
@@ -43,8 +44,6 @@ struct Mock {
 /// Format: the file mode of a regular file, and of a directory.
 const FILE_MODE: u32 = 0o100_644;
 const DIR_MODE: u32 = 0o040_755;
-/// Format: `ENOENT`.
-const ENOENT: i32 = 2;
 /// Format: `EINVAL`.
 const EINVAL: i32 = 22;
 /// Shape: the mock volume's "now" — a value no kernel-filled time in these tests equals, so a
@@ -408,6 +407,11 @@ fn message(opcode: u32, unique: u64, nodeid: u64, body: &[u8]) -> Vec<u8> {
   m
 }
 
+/// Whether a reply is a negative entry: success, node id 0.
+fn is_negative_entry(out: &[u8]) -> bool {
+  out[4..8] == [0u8; 4] && u64::from_le_bytes(out[16..24].try_into().unwrap()) == 0
+}
+
 fn reply_error(out: &[u8], n: usize) -> i32 {
   assert_eq!(n, OUT_HEADER_LEN);
   i32::from_le_bytes(out[4..8].try_into().unwrap())
@@ -528,9 +532,12 @@ fn reply_times(out: &[u8]) -> (u64, u64) {
   (mtime, ctime)
 }
 
-/// LOOKUP reaches the bridge and its entry reply decodes; a missing name is ENOENT.
+/// LOOKUP reaches the bridge and its entry reply decodes; a missing name is a negative entry (node id 0) cached
+/// for its directory's lifetime, so the kernel answers the next probe of that name itself (§4.6 "Cache posture":
+/// a create through any attachment invalidates the name, as it does a positive entry). Python's imports and pip
+/// probe thousands of absent names; answered `ENOENT`, each probe was a round trip to the daemon.
 #[test]
-fn lookup_dispatches_and_a_miss_is_enoent() {
+fn lookup_dispatches_and_a_miss_is_a_negative_entry_cached_for_its_directorys_lifetime() {
   let mut m = mock();
   let mut out = [0u8; 512];
   let n = dispatch(
@@ -561,8 +568,72 @@ fn lookup_dispatches_and_a_miss_is_enoent() {
     &mut m,
     &mut out,
   );
-  assert_eq!(reply_error(&out, n), -ENOENT, "the negated errno");
+  assert_eq!(n, OUT_HEADER_LEN + EntryOut::LEN, "a full entry reply");
+  assert_eq!(
+    u32::from_le_bytes(out[4..8].try_into().unwrap()),
+    0,
+    "success, not ENOENT"
+  );
+  assert_eq!(
+    u64::from_le_bytes(out[16..24].try_into().unwrap()),
+    0,
+    "node id 0: a negative entry"
+  );
+  assert_eq!(
+    u64::from_le_bytes(out[32..40].try_into().unwrap()),
+    CACHE_FOREVER,
+    "entry_valid: the root directory's lifetime (the volume's own, forever)"
+  );
   assert_eq!(m.referenced, 1, "a LOOKUP miss takes no reference");
+}
+
+/// The open flags tell the kernel what it may keep (§4.6 "Cache posture"). Do: open the mock's file (a live source,
+/// bounded lifetime) read-only and write-only, and open its root directory (the volume's own, forever). Expect: the
+/// read-only file handle carries `FOPEN_NOFLUSH` and no kept cache (an outsider may change a live source), the
+/// write-only one neither, and the root's listing is kept (`FOPEN_KEEP_CACHE | FOPEN_CACHE_DIR`).
+#[test]
+fn open_flags_keep_what_invalidation_covers_and_skip_a_read_only_flush() {
+  use slates_bridge_fuse::abi::open::{CACHE_DIR, KEEP_CACHE, NOFLUSH};
+  let mut m = mock();
+  let mut out = [0u8; 512];
+  let open_flags = |out: &[u8]| {
+    u32::from_le_bytes(
+      out[OUT_HEADER_LEN + 8..OUT_HEADER_LEN + 12]
+        .try_into()
+        .unwrap(),
+    )
+  };
+  let open_in = |flags: u32| {
+    let mut body = flags.to_le_bytes().to_vec();
+    body.extend_from_slice(&[0; 4]);
+    body
+  };
+  dispatch(
+    &message(Opcode::Open.to_wire(), 1, 2, &open_in(0)),
+    &mut m,
+    &mut out,
+  );
+  assert_eq!(
+    open_flags(&out),
+    NOFLUSH,
+    "a read-only handle on a live source: no flush, no kept pages"
+  );
+  dispatch(
+    &message(Opcode::Open.to_wire(), 2, 2, &open_in(1)),
+    &mut m,
+    &mut out,
+  );
+  assert_eq!(open_flags(&out), 0, "a write-only handle flushes at close");
+  dispatch(
+    &message(Opcode::OpenDir.to_wire(), 3, 1, &open_in(0)),
+    &mut m,
+    &mut out,
+  );
+  assert_eq!(
+    open_flags(&out),
+    KEEP_CACHE | CACHE_DIR,
+    "the volume's own directory keeps its listing"
+  );
 }
 
 /// READ returns the requested slice; WRITE mutates the file and reports the count.
@@ -1196,7 +1267,11 @@ fn reclaiming_an_unreported_reply_gives_back_exactly_what_it_granted() {
     &mut m,
     &mut out,
   );
-  assert_ne!(reply_error(&out, n), 0, "the lookup missed");
+  // The miss is a negative entry (node id 0): a lost reply of it granted nothing, so nothing is reclaimed.
+  assert!(
+    is_negative_entry(&out),
+    "the lookup missed as a negative entry"
+  );
   assert_eq!(
     reclaim_unreported(Some(Opcode::Lookup), 1, &out[..n], &mut m, &cx),
     Reclaimed::default()

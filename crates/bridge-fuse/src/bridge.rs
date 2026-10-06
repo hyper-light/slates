@@ -33,7 +33,7 @@ pub const EIO: i32 = 5;
 pub const CACHE_FOREVER: u64 = u64::MAX;
 /// Format: the FUSE node id of the root directory; the kernel always names the root by it, and
 /// the edge resolves it to the volume's real root inode number.
-const FUSE_ROOT_ID: u64 = 1;
+pub(crate) const FUSE_ROOT_ID: u64 = 1;
 /// Format: the Unix `d_type` values a `readdir` entry carries.
 const DT_DIR: u32 = 4;
 const DT_REG: u32 = 8;
@@ -618,9 +618,21 @@ fn serve_lookup(
     Ok(object) => object,
     Err(e) => return reply_err(req.header.unique, e, out),
   };
-  let result = bridge
-    .lookup(parent, cx, name)
-    .and_then(|n| referenced(bridge, cx, n));
+  let looked = bridge.lookup(parent, cx, name);
+  if matches!(looked, Err(VfsError::NotFound)) {
+    // A miss is a negative entry (node id 0, no reference taken), cached for the directory's lifetime: the
+    // kernel answers the next probe of the name itself. Every way a name appears through another attachment
+    // invalidates it (`Invalidation::Entry` for create, mknod, mkdir, link, symlink, a rename's target), and a
+    // live base directory's lifetime is bounded, as its positive entries' are (§4.6 "Cache posture").
+    let valid = valid_for(bridge, cx, parent.inode);
+    let negative = EntryOut {
+      entry_valid: valid.0,
+      entry_valid_nsec: valid.1,
+      ..EntryOut::default()
+    };
+    return reply(req.header.unique, Ok(negative), |e| e.to_bytes(), out);
+  }
+  let result = looked.and_then(|n| referenced(bridge, cx, n));
   let result = entry_reply(bridge, cx, result);
   reply(req.header.unique, result, |e| e.to_bytes(), out)
 }
@@ -640,6 +652,32 @@ fn serve_getattr(
   reply(req.header.unique, result, |a| a.to_bytes(), out)
 }
 
+/// The `fuse_open_out.open_flags` for opening `object`: the kernel keeps its pages (and a directory's listing) across
+/// opens when the object is the volume's own, whose changes are all invalidated explicitly, and sends no `FLUSH` at
+/// the close of a read-only handle (§4.6 "Cache posture"). Without them every open dropped the file's pages and
+/// every close of any handle was a round trip (open, read and close of a cached file: 4 requests where 2 suffice).
+fn open_flags_for(
+  bridge: &mut dyn Bridge,
+  cx: &OpContext,
+  object: ObjectId,
+  directory: bool,
+  flags: u32,
+) -> u32 {
+  use crate::abi::open::{CACHE_DIR, KEEP_CACHE, NOFLUSH};
+  let mut open_flags = 0;
+  if matches!(bridge.cache_lifetime(object, cx), CacheLifetime::Forever) {
+    open_flags |= if directory {
+      KEEP_CACHE | CACHE_DIR
+    } else {
+      KEEP_CACHE
+    };
+  }
+  if !directory && flags & crate::abi::ACCESS_MODE == crate::abi::READ_ONLY {
+    open_flags |= NOFLUSH;
+  }
+  open_flags
+}
+
 fn serve_open(
   bridge: &mut dyn Bridge,
   req: &Request<'_>,
@@ -657,14 +695,16 @@ fn serve_open(
     Ok(object) => object,
     Err(e) => return reply_err(req.header.unique, e, out),
   };
-  let opened = if opcode == Opcode::OpenDir {
+  let directory = opcode == Opcode::OpenDir;
+  let opened = if directory {
     bridge.opendir(object, cx)
   } else {
     bridge.open(object, cx, flags)
   };
+  let open_flags = open_flags_for(bridge, cx, object, directory, flags);
   reply(
     req.header.unique,
-    opened.map(|fh| OpenOut { fh, open_flags: 0 }),
+    opened.map(|fh| OpenOut { fh, open_flags }),
     |o| o.to_bytes(),
     out,
   )
@@ -875,8 +915,9 @@ fn serve_create(
         return reply_err(req.header.unique, e, out);
       }
       let valid = valid_for(bridge, cx, node.ino);
+      let open_flags = open_flags_for(bridge, cx, ObjectId::new(node.ino, 0), false, flags);
       let mut body = entry_out(&node, valid).to_bytes();
-      body.extend_from_slice(&OpenOut { fh, open_flags: 0 }.to_bytes());
+      body.extend_from_slice(&OpenOut { fh, open_flags }.to_bytes());
       write_or_drop(ReplyHeader::write_ok(req.header.unique, &body, out), out)
     }
     Err(e) => reply_err(req.header.unique, e, out),

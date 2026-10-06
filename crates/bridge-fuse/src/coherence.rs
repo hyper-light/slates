@@ -101,6 +101,16 @@ impl Coherence {
     }
   }
 
+  /// Moves the cursor back to `cursor`, so the next round delivers what changed since, the transport's own requests
+  /// included. A request whose effect was applied but whose reply was replaced by an error (a refused barrier's
+  /// `EIO`) left the kernel believing the change did not happen: a cached negative name, or old attributes. Only a
+  /// cursor of an earlier round moves it; `None` leaves it.
+  pub fn rewind(&mut self, cursor: Option<InvalidationCursor>) {
+    if cursor.is_some() {
+      self.cursor = cursor;
+    }
+  }
+
   /// Gathers the seam refused so far.
   pub fn gather_refusals(&self) -> u64 {
     self.gather_refusals

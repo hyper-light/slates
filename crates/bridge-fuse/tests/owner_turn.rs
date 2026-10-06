@@ -20,7 +20,8 @@ use std::time::{Duration, Instant};
 use slates_bridge_core::{Attachments, Rights, View};
 use slates_bridge_fuse::abi::Opcode;
 use slates_bridge_fuse::channel::{
-  FuseChannel, ServeState, Turn, dispatch_ready, reclaim_dispatched, send_reply,
+  FuseChannel, ServeState, Turn, dispatch_ready, reclaim_dispatched, redeliver_after_refusal,
+  send_reply,
 };
 use slates_bridge_fuse::mount::{Awaiting, Mount, Progress, begin_mount, begin_unmount};
 use slates_bridge_fuse::volume_bridge::VolumeBridge;
@@ -188,7 +189,8 @@ fn serve(mut channel: FuseChannel, refuse: Receiver<()>, counts: Sender<Counts>)
     {
       Turn::Idle | Turn::Dropped | Turn::Replayed => {}
       Turn::Ended => {
-        counts.send(tally).unwrap();
+        // The test thread may already have failed and gone; then there is no one to tell.
+        let _ = counts.send(tally);
         return;
       }
       Turn::Dispatched(dispatched) => {
@@ -208,6 +210,18 @@ fn serve(mut channel: FuseChannel, refuse: Receiver<()>, counts: Sender<Counts>)
           tally.reclaimed += given_back.references + given_back.handles;
         }
         send_reply(&channel, &mut state, &dispatched, refused.then_some(EIO)).unwrap();
+        if refused {
+          // The refused change is in the volume: the kernel is told, as the daemon's serve turn tells it.
+          redeliver_after_refusal(
+            &channel,
+            &mut state,
+            &dispatched,
+            &mut bridge,
+            &mut attachments,
+            transport,
+          )
+          .unwrap();
+        }
       }
     }
   }

@@ -45,7 +45,8 @@ use slates_bridge_core::scoped::ScopedBridge;
 use slates_bridge_core::volume_bridge::new_handle_store;
 use slates_bridge_core::{AttachmentId, Bridge, LostWrites, Rights, View, VolumeBridge};
 use slates_bridge_fuse::channel::{
-  Dispatched, FuseChannel, Sent, ServeState, Turn, dispatch_ready, reclaim_dispatched, send_reply,
+  Dispatched, FuseChannel, Sent, ServeState, Turn, dispatch_ready, reclaim_dispatched,
+  redeliver_after_refusal, send_reply,
 };
 use slates_bridge_fuse::mount::{
   Awaiting, Mount, MountError, PendingExit, Progress, begin_mount, begin_unmount,
@@ -78,6 +79,9 @@ const REPLY_UNMATCHED: &str = "fuse.reply_unmatched";
 /// Format: see [`MOUNT_REFUSED`] — the references and handles given back for replies that never reached their
 /// caller (AUD-29-85); the non-vacuity counter of the reclaim path.
 const REPLY_RECLAIMED: &str = "fuse.reply_reclaimed";
+/// Format: see [`MOUNT_REFUSED`] — a refused reply whose own applied change could not be delivered to the kernel at
+/// once (the seam refused to gather); it is delivered with the next request's round.
+const REDELIVERY_OWED: &str = "fuse.redelivery_owed";
 /// Format: see [`MOUNT_REFUSED`] — a hold, session or release the anchor's channel refused (A-61): that mount's
 /// device is not held across a restart.
 const HOLD_REFUSED: &str = "fuse.hold_refused";
@@ -202,10 +206,11 @@ pub(crate) fn defer_attach(state: &mut ShardState, pending: PendingAttach) -> Re
     // A mount shared with a container runtime's processes is `allow_other` (§4.6 A-9); the kernel still checks
     // each caller's permission bits (`default_permissions`).
     let shared = pending.record.form.shared_with_other_users();
+    let read_only = !pending.rights.write;
     let mounted = mount_without_blocking(
       &mount_point,
       &fsname_of(pending.record.id),
-      (deadline_ns, shared),
+      (deadline_ns, shared, read_only),
     )
     .await;
     let _ = state::with_state(move |s| {
@@ -300,10 +305,16 @@ fn deliver(s: &mut ShardState, reply: ReplyBody, route: Option<crate::merge_serv
 async fn mount_without_blocking(
   mount_point: &str,
   fsname: &str,
-  (deadline_ns, shared): (u64, bool),
+  (deadline_ns, shared, read_only): (u64, bool, bool),
 ) -> Result<Mount, MountError> {
-  let extra: &[&str] = if shared { &["allow_other"] } else { &[] };
-  let mut pending = begin_mount(mount_point, fsname, extra)?;
+  // A mount whose attachment may not write is the kernel's `ro`: writes are refused `EROFS` without a request, and
+  // the kernel stops treating every read as a possible atime change (Linux `fuse_invalidate_atime` skips a read-only
+  // inode), so a file read and then stat'ed costs no `GETATTR` (measured 2026-10-06: one per open before).
+  let extra: Vec<&str> = [shared.then_some("allow_other"), read_only.then_some("ro")]
+    .into_iter()
+    .flatten()
+    .collect();
+  let mut pending = begin_mount(mount_point, fsname, &extra)?;
   let began = futures::now_ns();
   let tick = crate::daemon::HEARTBEAT_NS / crate::fleet::POLL_PER_PERIOD;
   loop {
@@ -461,6 +472,11 @@ async fn serve(attachment: u64) {
       match state::with_state(|s| turn(s, attachment)) {
         Some(Turned::Idle) => break,
         Some(Turned::Served) => {
+          // A served request is client activity, as an NFS call and a guest's request are: the shard spins out its
+          // idle window after it, so a burst's next request is read without a kernel wake (§4.3, §4.7). Without it a
+          // mount's shard parked after every request once a CLI client's window lapsed, and each request paid a
+          // wake (uncached lookup median 23 µs → about 60 µs, p90 33 → 200 µs, Linux 6.12, 2026-10-06).
+          slates_rt::registry::with_current(|ctx| ctx.note_activity());
           // A change this request was refused for a delegation asked for a recall; it is sent now (A-79).
           let _ = state::with_state(crate::delegation::drain);
           let _ = futures::yield_now().await;
@@ -600,6 +616,11 @@ fn reply(
     reclaim(s, mount, dispatched);
   }
   let sent = send_reply(&mount.channel, &mut mount.serve, dispatched, refuse);
+  // A refused reply told the caller the change failed while it was applied: the kernel is told what changed, now
+  // that the caller's directory lock is released (`redeliver_after_refusal`).
+  if refuse.is_some() && matches!(sent, Ok(Sent::Delivered)) {
+    redeliver(s, mount, dispatched);
+  }
   // Written (or refused, or failed): nothing of this request remains to answer from the record.
   s.pending_replies.remove(&attachment);
   match sent {
@@ -654,6 +675,44 @@ fn reclaim(s: &mut ShardState, mount: &mut FuseMount, dispatched: &Dispatched) {
   if given_back > 0 {
     let count = refusals.entry(REPLY_RECLAIMED).or_insert(0);
     *count = count.saturating_add(given_back);
+  }
+}
+
+/// Delivers a refused request's own applied change to the kernel, over a transient bridge on the volume's slot
+/// (§4.6 "Cache posture"). A round the seam could not gather is owed again at the next request, and counted.
+fn redeliver(s: &mut ShardState, mount: &mut FuseMount, dispatched: &Dispatched) {
+  let Some(&handle) = s.by_id.get(&mount.volume) else {
+    return;
+  };
+  let ShardState {
+    store,
+    volumes,
+    attachments,
+    refusals,
+    ..
+  } = &mut *s;
+  let Ok(slot) = volumes.get_mut(handle) else {
+    return;
+  };
+  let mut bridge = VolumeBridge::attached(
+    mount.volume,
+    &mut slot.volume,
+    store,
+    &mut mount.handles,
+    slot.host.as_mut().map(|host| host as &mut dyn HostFs),
+  );
+  let mut scoped = None;
+  let delivered = redeliver_after_refusal(
+    &mount.channel,
+    &mut mount.serve,
+    dispatched,
+    scoped_or_whole(&mut bridge, &mut scoped, mount.scope),
+    attachments,
+    mount.registry,
+  );
+  if !delivered.is_ok_and(|delivered| !delivered.gather_refused) {
+    let count = refusals.entry(REDELIVERY_OWED).or_insert(0);
+    *count = count.saturating_add(1);
   }
 }
 

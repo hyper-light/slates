@@ -109,6 +109,12 @@ fn ok(out: &[u8]) -> bool {
   u32::from_le_bytes(out[4..8].try_into().unwrap()) == 0
 }
 
+/// Whether a LOOKUP reply says the name is absent: a negative entry (success, node id 0, which the kernel caches
+/// for the directory's lifetime, §4.6 "Cache posture").
+fn absent(out: &[u8]) -> bool {
+  ok(out) && u64::from_le_bytes(out[16..24].try_into().unwrap()) == 0
+}
+
 /// The node id a CREATE or LOOKUP reply names (the start of `fuse_entry_out`).
 fn reply_nodeid(out: &[u8]) -> u64 {
   u64::from_le_bytes(out[OUT_HEADER_LEN..OUT_HEADER_LEN + 8].try_into().unwrap())
@@ -151,7 +157,7 @@ fn mknod_reports_ipc_types_and_refuses_device_nodes() {
     &mut bridge,
     &mut out,
   );
-  assert_eq!(i32::from_le_bytes(out[4..8].try_into().unwrap()), -2);
+  assert!(absent(&out), "the refused device node was never made");
 }
 
 /// T-3.1 / A-26: truncated MKNOD bodies cannot create a name, including a missing NUL terminator.
@@ -168,7 +174,7 @@ fn truncated_mknod_never_changes_the_namespace() {
     dispatch(&message(8, 1, 1, &body[..end]), &mut bridge, &mut out);
     assert!(!ok(&out), "truncation at {end}");
     dispatch(&message(1, 2, 1, &name_body("pipe")), &mut bridge, &mut out);
-    assert_eq!(i32::from_le_bytes(out[4..8].try_into().unwrap()), -2);
+    assert!(absent(&out), "truncation at {end} made no name");
   }
 }
 
@@ -293,12 +299,8 @@ fn missing_names_and_absent_inodes_are_typed_errnos() {
     &mut bridge,
     &mut out,
   );
-  assert_eq!(n, OUT_HEADER_LEN);
-  assert_eq!(
-    i32::from_le_bytes(out[4..8].try_into().unwrap()),
-    -2,
-    "ENOENT"
-  );
+  assert_eq!(n, OUT_HEADER_LEN + EntryOut::LEN);
+  assert!(absent(&out), "a missing name is a negative entry");
 
   let mut r = vec![0u8; 24];
   r[16..20].copy_from_slice(&16u32.to_le_bytes()); // size; the handle word is unused for a read

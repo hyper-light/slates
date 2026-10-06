@@ -171,6 +171,27 @@ pub mod flags {
   pub const HAS_RESEND: u64 = 1 << 39;
 }
 
+/// The `fuse_open_out.open_flags` slates sets on an `OPEN`, `OPENDIR` or `CREATE` reply (`<linux/fuse.h>`; a kernel
+/// that does not know one ignores it).
+pub mod open {
+  /// Format: FOPEN_KEEP_CACHE — the kernel keeps the file's cached pages across opens instead of dropping them at
+  /// each one. Set for the volume's own objects, whose every change through another attachment is invalidated
+  /// explicitly (`Invalidation::Inode { data: true }`); never for a live base object an outsider may change.
+  pub const KEEP_CACHE: u32 = 1 << 1;
+  /// Format: FOPEN_CACHE_DIR — the kernel caches the directory's listing (7.28, Linux 4.20+); a change of a name in
+  /// it invalidates the directory's data as well as the name (`entry_invalidation`).
+  pub const CACHE_DIR: u32 = 1 << 3;
+  /// Format: FOPEN_NOFLUSH — the kernel sends no `FLUSH` when the handle's file descriptor closes (7.35, Linux
+  /// 5.18+). Set for a read-only handle, which has nothing to make durable at close: its `FLUSH` was a round trip
+  /// and a barrier for nothing. slates serves no POSIX lock operations, so no lock is released through it.
+  pub const NOFLUSH: u32 = 1 << 5;
+}
+
+/// Format: the access-mode bits of an open's `flags` (`O_ACCMODE`), and the read-only mode (`O_RDONLY`).
+pub const ACCESS_MODE: u32 = 0o3;
+/// Format: `O_RDONLY`.
+pub const READ_ONLY: u32 = 0;
+
 /// Format: FUSE_UNIQUE_RESEND — the top bit of a request's unique id marks a request the kernel resent after a
 /// `FUSE_NOTIFY_RESEND` (`include/uapi/linux/fuse.h`). A reply carries the unique exactly as the request did,
 /// bit included, since the kernel matches the whole word.

@@ -561,11 +561,42 @@ fn deliver_owed(
   state: &mut ServeState,
 ) -> Result<Delivered, ChannelError> {
   let expire_only = state.expire_only;
+  // The kernel names the volume's root node id 1 (`FUSE_ROOT_ID`), not by the volume's root inode: an
+  // invalidation naming the root inode named nothing the kernel knows and was dropped, so a change to a name in the
+  // root through another attachment never reached a mount that had cached it (found 2026-10-06 by a negative entry
+  // that outlived the name's creation).
+  let root = bridge.root(cx).ok();
   state
     .coherence
     .deliver(bridge, cx, &mut |invalidation: &Invalidation| {
-      channel.write_invalidation(invalidation, expire_only)
+      channel.write_invalidation(&addressed_to_the_kernel(invalidation, root), expire_only)
     })
+}
+
+/// `invalidation` with the volume's root inode (`root`) named as the kernel names it, node id 1.
+fn addressed_to_the_kernel(invalidation: &Invalidation, root: Option<u64>) -> Invalidation {
+  let kernel = |ino: u64| {
+    if Some(ino) == root {
+      crate::bridge::FUSE_ROOT_ID
+    } else {
+      ino
+    }
+  };
+  match invalidation {
+    Invalidation::Entry {
+      parent,
+      name,
+      expire,
+    } => Invalidation::Entry {
+      parent: kernel(*parent),
+      name: name.clone(),
+      expire: *expire,
+    },
+    Invalidation::Inode { ino, data } => Invalidation::Inode {
+      ino: kernel(*ino),
+      data: *data,
+    },
+  }
 }
 
 /// Serves one admitted request: the owed round first, so the reply never coexists with a stale
@@ -622,6 +653,9 @@ pub struct Dispatched {
   len: usize,
   /// The request as the kernel sent it, kept for what its owner records with it (a write's bytes, A-63).
   request: Vec<u8>,
+  /// Where the kernel's cache stood just before the request was served: a refused reply rewinds to it, so the
+  /// request's own applied change is delivered as an invalidation ([`redeliver_after_refusal`]).
+  cursor_before: Option<slates_bridge_core::InvalidationCursor>,
 }
 
 impl Dispatched {
@@ -719,6 +753,7 @@ pub fn dispatch_ready(
   });
   let delivered = deliver_owed(channel, bridge, &cx, state);
   let dispatched = delivered.map(|delivered| {
+    let cursor_before = state.coherence.cursor();
     let len = dispatch(&request, bridge, &cx, &mut state.reply);
     let error = state.reply.get(..len).map_or(0, reply_error);
     state.coherence.served_own_request(bridge, &cx, delivered);
@@ -730,6 +765,7 @@ pub fn dispatch_ready(
       nodeid,
       len,
       request,
+      cursor_before,
     }
   });
   attachments.end(attachment);
@@ -759,6 +795,29 @@ pub fn send_reply(
       channel.write_reply(state.reply.get(..n).unwrap_or(&[]))
     }
   }
+}
+
+/// After [`send_reply`] replaced a request's reply with an error, delivers the request's own applied change to the
+/// kernel as an invalidation (§4.6 "Cache posture"): the cursor goes back to where it stood before the request and one
+/// round runs. The caller was told the operation failed while it took effect in the volume (a refused barrier: the
+/// change is applied, not promised to survive), so without this the kernel kept what the failure implied — a
+/// `mkdir` answered `EIO` left a cached negative entry for a directory that exists. Called after the error reply,
+/// never before: an entry invalidation takes the directory's lock, which the waiting caller holds until its reply.
+pub fn redeliver_after_refusal(
+  channel: &FuseChannel,
+  state: &mut ServeState,
+  dispatched: &Dispatched,
+  bridge: &mut dyn Bridge,
+  attachments: &mut Attachments,
+  attachment: AttachmentId,
+) -> Result<Delivered, ChannelError> {
+  let Ok(cx) = attachments.begin(attachment) else {
+    return Ok(Delivered::default());
+  };
+  state.coherence.rewind(dispatched.cursor_before);
+  let delivered = deliver_owed(channel, bridge, &cx, state);
+  attachments.end(attachment);
+  delivered
 }
 
 /// Gives back what a dispatched request's success reply granted — its lookup references and open handle —

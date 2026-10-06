@@ -3793,3 +3793,24 @@ lock capacity in a per-daemon ledger; a late lock refusal is typed; `slates stat
 works. Owed: Windows (`VirtualLock` per block builds and is cross-linted, but no lane runs a strict volume), and a
 strict volume's shared blocks with a plain clone are locked for both (clones copy the source's policy, so none exists
 today).
+
+### 2026-10-06: Linux FUSE: the pip leftovers check, and request counts (condition 5)
+
+**The pip check is closed on Linux.** The 2026-10-05 entry owed a check that a `pip install` on Linux leaves no
+silly-renamed files. Over slates' FUSE mount (Linux 6.12, ordinary user) it leaves none: 1,385 files, the same names,
+identical bytes. The `.nfs.*` files seen on macOS are Docker Desktop's virtiofs share holding descriptors, as
+recorded.
+
+**Kernel round trips cut.**
+- What changed: negative entries, kept page and directory caches, no `FLUSH` at a read-only close, FUSE requests
+  counted as activity, read-only mounts as the kernel's `ro`.
+- An install sends 11.5% fewer requests, and the import after it 20% fewer (BENCHMARKS, "Linux FUSE mounts").
+- Found and fixed on the way: invalidations naming the volume root never reached the kernel, and a refused reply's
+  own change was never delivered
+  (`docs/bugs/2026-10-06-fuse-invalidations-of-the-root-named-an-inode-the-kernel-does-not-know.md`).
+
+**Open.**
+- Wall time on slates is still about 4× the container's own filesystem for this install. Each of 19,222 requests is
+  two kernel handoffs on a 3× oversubscribed host.
+- The `GETATTR` after each write or read on a writable mount, and Python's `isatty()` ioctls, are the kernel's
+  (source-verified). The next lever is batching (FUSE over io_uring, Linux 6.14+ from memory, to verify), not a round trip slates adds.
