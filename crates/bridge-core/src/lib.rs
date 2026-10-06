@@ -300,6 +300,25 @@ pub trait Bridge {
     offset: u64,
     data: &[u8],
   ) -> Result<u32, VfsError>;
+  /// Admits an allocation of `[offset, offset + len)` of file `object` under `cx` (which must allow writing): the
+  /// quota is charged for every byte of the range not yet held, all of it or none (A-108, `fallocate` mode 0).
+  fn admit_allocation(
+    &mut self,
+    object: ObjectId,
+    cx: &OpContext,
+    offset: u64,
+    len: u64,
+  ) -> Result<(), VfsError>;
+  /// Materializes the holes of `[offset, offset + len)` of file `object` with zeros under `cx`, extending its size to
+  /// the range's end (A-108). The caller sizes the range to one cooperative slice and admits the whole request
+  /// first with [`Bridge::admit_allocation`].
+  fn allocate(
+    &mut self,
+    object: ObjectId,
+    cx: &OpContext,
+    offset: u64,
+    len: u64,
+  ) -> Result<(), VfsError>;
   /// Open directory `object` under `cx`; the handle.
   fn opendir(&mut self, object: ObjectId, cx: &OpContext) -> Result<u64, VfsError>;
   /// One page of directory `object`'s listing under `cx`, resumed from `cookie` (0 starts it; each entry

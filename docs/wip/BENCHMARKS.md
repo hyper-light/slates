@@ -2681,3 +2681,41 @@ first two rounds' builds and a local cross-lint, so its latencies are not compar
 MiB after the delete, every round). The p99 medians came out at 578 µs (4 KiB) and 592 µs (64 KiB) against HEAD's 325
 and 318, at load around 18. Both sides' ranges ran up to several milliseconds, so that run could not attribute the gap.
 The in-process measurement above did: a given-back block costs 6.8 µs more per reuse. That decided the idle purge.
+
+## `fallocate` through the Linux FUSE mount, and a write's charge over the windows it touches (A-108; 2026-10-06)
+
+All runs are in Docker Desktop's Linux VM on this Mac (aarch64), image `rust:1.98.0`, release builds. The daemon runs
+`--quick --shards 1`, so both volumes share one shard, and is mounted by an ordinary user. Host load average was 10–16
+throughout (other sessions' containers), so the numbers are taken under load, as the target conditions are. The
+scripts are scratchpad `a108-inner.sh` and `wc-inner.sh`.
+
+**The allocation and the shard beside it.** For each variant:
+- `fallocate -l 64M` into a 128 MiB volume, timed;
+- then a 96 MiB `fallocate`, while a Python loop on a second volume of the same shard times `open`+`close` (each one
+  reaches the daemon) for one second, against one second with no allocation running.
+
+| Variant | 64 MiB `fallocate` | `open`+`close` during it: p50 / p99 / max | Same, no allocation: p50 / p99 / max |
+|---|---|---|---|
+| One call, unsliced (`slice_bytes = u64::MAX`) | 27 ms | 12 µs / 56 µs / 37,626 µs | 19 µs / 47 µs / 935 µs |
+| Sliced at 37 KB, whole-file charge map (first cut) | 171 ms | 13–14 µs / 145–166 µs / 543–594 µs (2 quiet runs of 3) | 13 µs / 26–66 µs / 243–250 µs |
+| Sliced at whole windows, whole-file charge map | 53–62 ms | 16–39 µs / 113–585 µs / 918–6,694 µs | 16–25 µs / 54–409 µs / 914–1,953 µs |
+| **Sliced at whole windows, charge over the touched windows (shipped)** | **33–36 ms** | **15–20 µs / 67–78 µs / 416–2,329 µs** | **16–19 µs / 36–45 µs / 242–2,112 µs** |
+
+- The unsliced call held the shard for 37.6 ms, so another volume's request waited that long.
+- Sliced, the worst wait during the allocation is within the run's own no-allocation maximum.
+- The first cut's 37 KB slices ended inside 64 KiB windows, so each slice grew the window's block again. Every slice
+  also rebuilt the whole file's window map twice. Both are fixed, and the allocation is now within 1.3× of the
+  unsliced call.
+
+**A write's charge (`Volume::write_charge`).** It built a map of every chunk window in the file on every write, so a
+1 MiB write at the end of a large file paid for all of its windows. It now maps only the windows the write touches.
+The test is `dd if=/dev/zero bs=1M count=768` into a 1 GiB volume, three interleaved rounds. "Before" is the build
+with the whole-file map; the builds differ in nothing else on the write path.
+
+| Build | Round 1 | Round 2 | Round 3 |
+|---|---|---|---|
+| Whole-file map | 296 MB/s | 305 MB/s | 303 MB/s |
+| Touched windows | 811 MB/s | 854 MB/s | 818 MB/s |
+
+That is 2.7× on a 768 MiB sequential write. The charge oracle (`crates/vfs/tests/charge_oracle.rs`) and the full vfs
+suite pass unchanged, so the charge is the same number, computed over fewer windows.

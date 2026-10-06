@@ -223,6 +223,28 @@ impl Bridge for Mock {
     self.content[at..at + data.len()].copy_from_slice(data);
     Ok(u32::try_from(data.len()).unwrap_or(u32::MAX))
   }
+  fn admit_allocation(
+    &mut self,
+    _object: ObjectId,
+    _cx: &OpContext,
+    _offset: u64,
+    _len: u64,
+  ) -> Result<(), VfsError> {
+    Ok(())
+  }
+  fn allocate(
+    &mut self,
+    _object: ObjectId,
+    _cx: &OpContext,
+    offset: u64,
+    len: u64,
+  ) -> Result<(), VfsError> {
+    let end = usize::try_from(offset + len).unwrap_or(0);
+    if self.content.len() < end {
+      self.content.resize(end, 0);
+    }
+    Ok(())
+  }
   fn opendir(&mut self, object: ObjectId, _cx: &OpContext) -> Result<u64, VfsError> {
     if object.inode == 1 {
       Ok(9)

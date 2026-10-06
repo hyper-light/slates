@@ -2156,10 +2156,19 @@ a real `pip install`, and a `kill -9` of the daemon mid-write went through the m
   `slates bootstrap root`. Test `a_create_before_bootstrap_is_refused_naming_the_command_that_fixes_it`, red first.
 
 **Owed:**
-- **`fallocate` is `EOPNOTSUPP`** (FUSE `FALLOCATE` is unserved). Honouring `posix_fallocate`'s promise, that a later
-  write in the range never fails for space, needs a quota reservation per range, which the quota model does not
-  carry yet. glibc's `posix_fallocate` falls back to writing zeros, so programs that use it work; the `fallocate`
-  tool and `fallocate(2)` callers do not.
+- **`fallocate` on the Linux FUSE mount: built (A-108, 2026-10-06).** Mode 0 and keep-size within the file are
+  served in cooperative slices; the quota is charged up front, all or none. Still owed:
+  - virtio-fs, whose synchronous dispatch answers `EOPNOTSUPP` until its device can step a request;
+  - NFSv4.2 `ALLOCATE`, which needs the same stepping inside a compound;
+  - punch, zero-range, collapse and insert, which are `EOPNOTSUPP`.
+- **Open, found 2026-10-06: one bounded volume can take a shard's whole version slab.** `inode_allowance`
+  (`crates/server/src/verbs.rs`) reserves quota ÷ `size_of::<Inode>()` version slots, capped at the slab.
+  - On a `--quick --shards 1` daemon in Docker (2 GiB byte capacity, 1,140,938 slots), a 256 MiB bounded volume
+    committed 1,140,937 slots.
+  - A 16 MiB second volume was then refused `BudgetExceeded { available: 0 }`, with 1.75 GiB of bytes uncommitted.
+  - The bytes and the slots are sized independently, so the inode allowance, not memory, bounds how many bounded
+    volumes a shard holds.
+  - This needs a decision on the allowance's derivation (the §4.2 resource vector); it is recorded, not changed.
 - **`O_TMPFILE` is `EOPNOTSUPP`** (FUSE `TMPFILE`, Linux 6.11+, is unserved).
 
 **Closed by A-107: a symlink out of the volume was followed for any caller.**

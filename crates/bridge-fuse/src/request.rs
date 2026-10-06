@@ -383,3 +383,29 @@ impl<'a> WriteIn<'a> {
     Ok(WriteIn { fh, offset, data })
   }
 }
+
+/// A `FUSE_FALLOCATE` body (`fuse_fallocate_in`, A-108).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FallocateIn {
+  /// The open file handle.
+  pub fh: u64,
+  /// The range's first byte.
+  pub offset: u64,
+  /// The range's length.
+  pub length: u64,
+  /// The `fallocate(2)` mode bits (`FALLOC_FL_*`).
+  pub mode: u32,
+}
+
+impl FallocateIn {
+  /// Parses a fallocate body; refuses one shorter than the four fields.
+  pub fn parse(opcode: u32, body: &[u8]) -> Result<FallocateIn, FuseError> {
+    let mut r = Reader::new(body);
+    Ok(FallocateIn {
+      fh: r.u64(opcode)?,
+      offset: r.u64(opcode)?,
+      length: r.u64(opcode)?,
+      mode: r.u32(opcode)?,
+    })
+  }
+}

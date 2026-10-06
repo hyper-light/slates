@@ -7,8 +7,9 @@
 //! - **CLONE**: a clone shares chunks between two files, and the volume releases a chunk by its one
 //!   owning inode's birth epoch (§4.5, D-6), so a chunk shared across inodes needs the reference
 //!   counts dedup brings (Phase 7).
-//! - **ALLOCATE**: a reservation that makes later writes immune to `ENOSPC` cannot hold under
-//!   copy-on-write, where a write into a snapshotted chunk takes new space.
+//! - **ALLOCATE**: the volume serves it (A-108: holes materialized and charged, held until a snapshot
+//!   shares the windows, as on btrfs), but an allocation is user-scaled work that must yield between
+//!   slices, and a compound is answered in one call. The Linux FUSE mount steps it; NFS is owed.
 //! - **DEALLOCATE**: punching a hole splits chunk-backed extents so that one chunk sits under two
 //!   extents, which the volume's release accounting does not yet allow; it is its own volume change.
 //! - **WRITE_SAME**, the layout operations, and the inter-server copy (a COPY naming source servers).

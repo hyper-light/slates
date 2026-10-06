@@ -86,6 +86,8 @@ pub enum Opcode {
   /// Format: FUSE_BATCH_FORGET — the kernel drops references to several inodes at once (the batched
   /// FORGET; on virtio-fs a high-priority-queue request, virtio 1.2 §5.11.6.2).
   BatchForget = 42,
+  /// Format: FUSE_FALLOCATE — allocate a file's range (`fuse_fallocate_in`), served in slices (A-108).
+  Fallocate = 43,
   /// Format: FUSE_READDIRPLUS — read directory entries with attributes.
   ReadDirPlus = 44,
   /// Format: FUSE_RENAME2 — rename with flags (`RENAME_EXCHANGE`, `RENAME_NOREPLACE`).
@@ -125,6 +127,7 @@ const ALL: &[Opcode] = &[
   Opcode::Create,
   Opcode::Destroy,
   Opcode::BatchForget,
+  Opcode::Fallocate,
   Opcode::ReadDirPlus,
   Opcode::Rename2,
 ];

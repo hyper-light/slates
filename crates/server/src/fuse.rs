@@ -518,6 +518,20 @@ fn turn(s: &mut ShardState, attachment: u64) -> Turned {
     return Turned::Fenced;
   }
   crate::verbs::relieve_deferred(s);
+  // An allocation runs a slice per turn (A-108), sized as an archive walk's: a slice of BLAKE3 at the measured rate
+  // fits half the shard's quantum, and zero-filling the same bytes is a copy, which is faster than hashing them. It is
+  // whole chunk windows, at least one: a slice ending inside a window made the next one grow that window's block again
+  // (37 KB slices of a 64 KiB window: a 64 MiB allocation took 171 ms against 27 ms unsliced, 2026-10-06).
+  let chunk = u64::try_from(s.store.content.chunk_bytes())
+    .unwrap_or(u64::MAX)
+    .max(1);
+  let slice_bytes = s
+    .config
+    .archive_slice_bytes()
+    .checked_div(chunk)
+    .unwrap_or(0)
+    .max(1)
+    .saturating_mul(chunk);
   let dispatched = {
     let ShardState {
       store,
@@ -543,12 +557,13 @@ fn turn(s: &mut ShardState, attachment: u64) -> Turned {
       attachments,
       mount.registry,
       &mut mount.serve,
+      slice_bytes,
     )
   };
   hand_over_session(s, attachment, &mut mount);
   let turned = match dispatched {
     Ok(Turn::Idle) => Turned::Idle,
-    Ok(Turn::Dropped) => Turned::Served,
+    Ok(Turn::Dropped | Turn::Continued) => Turned::Served,
     Ok(Turn::Replayed) => {
       let count = s.refusals.entry(REPLAYED).or_insert(0);
       *count = count.saturating_add(1);

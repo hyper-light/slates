@@ -232,6 +232,18 @@ fn host_for<'h>(
   }
 }
 
+/// The file and the end of an allocation of `[offset, offset + len)` (A-108). A derived view's bytes are its owner's
+/// rendering, with no holes of their own to hold, so it is refused as a special file is; a range past the largest
+/// offset is `FileTooLarge`.
+fn allocation_range(object: ObjectId, offset: u64, len: u64) -> Result<(InodeNo, u64), VfsError> {
+  let inode = InodeNo(object.inode);
+  if inode.derived_from().is_some() {
+    return Err(VfsError::SpecialFileOperation);
+  }
+  let end = offset.checked_add(len).ok_or(VfsError::FileTooLarge)?;
+  Ok((inode, end))
+}
+
 impl<'v> VolumeBridge<'v> {
   /// A bridge over the volume `volume_id` names, backed by `volume` and its `store`.
   pub fn new(
@@ -764,6 +776,42 @@ impl Bridge for VolumeBridge<'_> {
       None => self.volume.write(self.store, inode, offset, data),
     }?;
     u32::try_from(written).map_err(|_| VfsError::FileTooLarge)
+  }
+
+  fn admit_allocation(
+    &mut self,
+    object: ObjectId,
+    cx: &OpContext,
+    offset: u64,
+    len: u64,
+  ) -> Result<(), VfsError> {
+    self.authorize_write(cx)?;
+    let (inode, end) = allocation_range(object, offset, len)?;
+    match host_for(&mut self.host, self.volume.is_overlay())? {
+      Some(host) => self
+        .volume
+        .with_host(host)
+        .admit_allocation(self.store, inode, offset, end),
+      None => self.volume.admit_allocation(self.store, inode, offset, end),
+    }
+  }
+
+  fn allocate(
+    &mut self,
+    object: ObjectId,
+    cx: &OpContext,
+    offset: u64,
+    len: u64,
+  ) -> Result<(), VfsError> {
+    self.authorize_write(cx)?;
+    let (inode, end) = allocation_range(object, offset, len)?;
+    match host_for(&mut self.host, self.volume.is_overlay())? {
+      Some(host) => self
+        .volume
+        .with_host(host)
+        .allocate(self.store, inode, offset, end),
+      None => self.volume.allocate(self.store, inode, offset, end),
+    }
   }
 
   fn opendir(&mut self, object: ObjectId, cx: &OpContext) -> Result<u64, VfsError> {

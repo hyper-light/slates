@@ -173,6 +173,28 @@ impl Bridge for ScopedBridge<'_> {
     self.inner.write(object, cx, offset, data)
   }
 
+  fn admit_allocation(
+    &mut self,
+    object: ObjectId,
+    cx: &OpContext,
+    offset: u64,
+    len: u64,
+  ) -> Result<(), VfsError> {
+    self.admit(object, cx)?;
+    self.inner.admit_allocation(object, cx, offset, len)
+  }
+
+  fn allocate(
+    &mut self,
+    object: ObjectId,
+    cx: &OpContext,
+    offset: u64,
+    len: u64,
+  ) -> Result<(), VfsError> {
+    self.admit(object, cx)?;
+    self.inner.allocate(object, cx, offset, len)
+  }
+
   fn opendir(&mut self, object: ObjectId, cx: &OpContext) -> Result<u64, VfsError> {
     self.admit(object, cx)?;
     self.inner.opendir(object, cx)

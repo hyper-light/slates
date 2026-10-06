@@ -39,6 +39,11 @@ const WAIT_MS: i64 = 5;
 const VOLUME: VolumeId = VolumeId { bytes: [9; 16] };
 /// Format: `EIO`, the errno a refused barrier answers with.
 const EIO: i32 = 5;
+/// Shape: the bytes one allocation slice may materialize — one small page, so the test's 1 MiB allocation takes
+/// many turns and the stepping is exercised (the daemon sizes it from the shard's quantum, A-108).
+const SLICE_BYTES: u64 = 4096;
+/// Shape: the test allocation's length, 1 MiB.
+const ALLOCATED: u64 = 1 << 20;
 
 /// What the loop counted.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -49,6 +54,8 @@ struct Counts {
   refused: u64,
   /// The references and handles given back for the refused replies (AUD-29-85).
   reclaimed: u64,
+  /// The turns an allocation continued in (A-108): the non-vacuity counter of the stepping.
+  continued: u64,
 }
 
 fn command_available(name: &str) -> bool {
@@ -184,10 +191,12 @@ fn serve(mut channel: FuseChannel, refuse: Receiver<()>, counts: Sender<Counts>)
       &mut attachments,
       transport,
       &mut state,
+      SLICE_BYTES,
     )
     .unwrap()
     {
       Turn::Idle | Turn::Dropped | Turn::Replayed => {}
+      Turn::Continued => tally.continued += 1,
       Turn::Ended => {
         // The test thread may already have failed and gone; then there is no one to tell.
         let _ = counts.send(tally);
@@ -241,7 +250,9 @@ fn through_the_mount(mount_point: &str, script: &str) -> (bool, String) {
 
 /// The owner's turn (§4.6, §4.8, D-18). Do: mount a volume through the non-blocking handshake and serve it
 /// with `dispatch_ready`/`send_reply`; through the kernel, write a file (create, write, close) and read it
-/// back; then ask the owner to refuse its next barrier and make a directory; then unmount without blocking.
+/// back; allocate through `fallocate` (A-108, [`allocate_through_the_mount`]); then ask the owner to refuse its next
+/// barrier and make a directory; then unmount without blocking. The allocation is stepped in [`SLICE_BYTES`] slices,
+/// counted per continued turn, and its reply waits for a barrier.
 /// Expect: the create and the close's flush waited for a barrier and the write and the read did not; the
 /// refused barrier answered `mkdir` with `EIO` (the caller told, not promised survival) while the directory
 /// is in the volume, as an NFS mutation whose publication was refused is, and the lookup reference its lost
@@ -269,6 +280,7 @@ fn a_mutations_reply_waits_for_its_barrier_and_a_refused_barrier_answers_eio() {
 
   let (ok, err) = through_the_mount(&mount_point, "printf hi > \"$1/f\" && cat \"$1/f\"");
   assert!(ok, "write and read back through the mount: {err}");
+  allocate_through_the_mount(&mount_point);
   refuse_tx.send(()).unwrap();
   let (ok, err) = through_the_mount(&mount_point, "mkdir \"$1/d\"");
   assert!(
@@ -287,6 +299,39 @@ fn a_mutations_reply_waits_for_its_barrier_and_a_refused_barrier_answers_eio() {
   server.join().unwrap();
   eprintln!("{counts:?}");
   assert_counts(&counts);
+}
+
+/// A-108 through the kernel. Do: `fallocate` 1 MiB of a new file; keep-size allocate inside a written file and past
+/// its end; punch a hole. Expect: the new file is 1 MiB and reads zeros; the written file keeps its bytes and size;
+/// past the end with keep-size and the punch are `EOPNOTSUPP`, the modes slates does not serve.
+fn allocate_through_the_mount(mount_point: &str) {
+  let (ok, err) = through_the_mount(
+    mount_point,
+    &format!(
+      "fallocate -l {ALLOCATED} \"$1/big\" && test $(stat -c %s \"$1/big\") = {ALLOCATED} && \
+       test $(tr -d '\\000' < \"$1/big\" | wc -c) = 0"
+    ),
+  );
+  assert!(ok, "a 1 MiB allocation is a 1 MiB file of zeros: {err}");
+  let (ok, err) = through_the_mount(
+    mount_point,
+    "fallocate -n -o 0 -l 2 \"$1/f\" && test \"$(cat \"$1/f\")\" = hi && test $(stat -c %s \"$1/f\") = 2",
+  );
+  assert!(
+    ok,
+    "a keep-size allocation inside the file keeps its bytes and size: {err}"
+  );
+  for (mode, what) in [
+    ("-n -l 4096", "keep-size past the end"),
+    ("-p -o 0 -l 1", "a punch"),
+  ] {
+    let (ok, err) = through_the_mount(mount_point, &format!("fallocate {mode} \"$1/f\""));
+    // util-linux words `EOPNOTSUPP` as "Operation not supported", or "keep size mode is unsupported" for keep-size.
+    assert!(
+      !ok && err.contains("supported"),
+      "{what} is EOPNOTSUPP: {err}"
+    );
+  }
 }
 
 /// What the loop must have counted: one refused barrier (the `mkdir`'s), the create and the close's flush
@@ -308,6 +353,14 @@ fn assert_counts(counts: &Counts) {
   assert!(
     counts.barriered.contains(&Opcode::MkDir),
     "the mkdir's barrier was the refused one: {counts:?}"
+  );
+  assert!(
+    counts.barriered.contains(&Opcode::Fallocate),
+    "an allocation's reply waited for a barrier: {counts:?}"
+  );
+  assert!(
+    counts.continued >= ALLOCATED / SLICE_BYTES - 1,
+    "the 1 MiB allocation ran in slices, one per turn: {counts:?}"
   );
   assert!(
     !counts

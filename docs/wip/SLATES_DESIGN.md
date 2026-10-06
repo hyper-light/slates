@@ -9939,3 +9939,43 @@ Status: built 2026-10-06.
   - `d/sib -> ../d/f` and `d/near -> f`: all three read `inside`.
   - `rootlink -> /root/target`, planted by root: root reads it; tester gets `Permission denied`.
   - Mutation check: with the condition disabled, the bridge test fails with `left: Ok("/etc/cron.d/x")`.
+
+### A-108 — `fallocate` through the Linux mount, in cooperative slices (2026-10-06)
+Applied in the same change to:
+- `crates/vfs/src/volume.rs` (`admit_allocation`, `allocate`, `holes`; `write_charge` over the touched windows via
+  `materialized_windows_in`) and `crates/vfs/src/base.rs` (the overlay's copy-up and window pinning before each);
+- `crates/bridge-core` (`Bridge::admit_allocation` and `Bridge::allocate` on the volume and scoped bridges);
+- `crates/bridge-fuse`:
+  - `abi.rs` (`FALLOCATE`, 43) and `request.rs` (`FallocateIn`);
+  - `allocate.rs` (new: the stepped allocation);
+  - `channel.rs` (`dispatch_ready` keeps a running allocation, and `Turn::Continued`);
+  - `bridge.rs` (the synchronous dispatch answers `EOPNOTSUPP`; a fallocate's reply waits for a barrier);
+- `crates/server/src/fuse.rs` (the slice size, and `Continued` as a served turn);
+- the tests `crates/vfs/tests/allocate.rs` and `crates/bridge-fuse/tests/owner_turn.rs`;
+- `crates/bridge-nfs/src/v4/v42.rs` (the module doc's ALLOCATE note), GAPS, BENCHMARKS.
+
+Status: built 2026-10-06 for the Linux FUSE mount. virtio-fs and NFSv4.2 `ALLOCATE` are owed (GAPS).
+- What: `fallocate(2)` mode 0 promises that a later write into the range never fails for space, and extends the file
+  to the range's end.
+  - slates materializes the range's holes with zeros, which the quota charges now; held bytes are never touched.
+  - The whole range is admitted first, all of it or none (`NoSpace` before any change).
+  - The holes are then filled in slices, one per serve turn, with the shard free between them. A slice is whole
+    chunk windows, sized as an archive walk's (half the shard's quantum at the measured BLAKE3 rate, rounded down to
+    whole windows, at least one).
+  - `FALLOC_FL_KEEP_SIZE` within the file is served. Past its end, and every other mode (punch, zero, collapse,
+    insert), is `EOPNOTSUPP`, which glibc's `posix_fallocate` answers by writing zeros itself.
+  - The reply waits for a barrier, as a `setattr` does.
+- The promise holds until a snapshot shares the range's windows; a write then takes new space for its copy. This is
+  btrfs's documented behaviour, and the reason the design first declined ALLOCATE (v42.rs). Declining left every
+  direct `fallocate(2)` caller with `EOPNOTSUPP`, which is the worse of the two for real tools.
+- The synchronous `dispatch` cannot yield, so it answers `EOPNOTSUPP` (virtio-fs and the blocking loop) rather than
+  run user-scaled work in one call.
+- Found on the way: `write_charge` built a map of every window in the file on every write. It now maps only the windows
+  a write touches, which is the same charge (the charge oracle passes unchanged): a 768 MiB sequential write went from
+  296–305 MB/s to 811–854 MB/s.
+- Measured (BENCHMARKS, 2026-10-06):
+  - A 64 MiB `fallocate` takes 33–36 ms sliced, against 27 ms unsliced.
+  - While it runs, a request to another volume of the same shard has a p99 of 67–78 µs. Unsliced, the call held the
+    shard for 37.6 ms.
+  - With the quota full after allocating, a 64 MiB overwrite of the allocated file succeeds and a 1 MiB write
+    elsewhere gets 0 bytes.

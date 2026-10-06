@@ -55,6 +55,7 @@ const OPCODES: &[(Opcode, u32)] = &[
   (Opcode::Create, 35),
   (Opcode::Destroy, 38),
   (Opcode::BatchForget, 42),
+  (Opcode::Fallocate, 43),
   (Opcode::ReadDirPlus, 44),
   (Opcode::Rename2, 45),
 ];
@@ -63,7 +64,7 @@ const OPCODES: &[(Opcode, u32)] = &[
 /// must report each as unserved, never mistake one for a served opcode).
 const UNSERVED_OPCODES: &[u32] = &[
   31, 32, 33, 34, // GETLK, SETLK, SETLKW, ACCESS
-  36, 37, 39, 40, 41, 43, // INTERRUPT, BMAP, IOCTL, POLL, NOTIFY_REPLY, FALLOCATE
+  36, 37, 39, 40, 41, // INTERRUPT, BMAP, IOCTL, POLL, NOTIFY_REPLY
   46, 47, 48, 49, 50, 51, 52, 53,   // LSEEK .. COPY_FILE_RANGE_64
   4096, // CUSE_INIT
 ];

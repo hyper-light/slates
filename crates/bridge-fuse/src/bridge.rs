@@ -46,7 +46,7 @@ const DT_FIFO: u32 = 1;
 /// Format: POSIX directory entry type for a socket.
 const DT_SOCK: u32 = 12;
 /// Format: Linux EOPNOTSUPP, a refused special-file operation.
-const EOPNOTSUPP: i32 = 95;
+pub(crate) const EOPNOTSUPP: i32 = 95;
 /// Format: Linux ENODATA, the attribute a get or remove names is not set (`getxattr(2)`'s ENOATTR).
 const ENODATA: i32 = 61;
 /// Format: Linux ERANGE, the caller's buffer is too small for the attribute value or name list.
@@ -164,6 +164,10 @@ pub fn dispatch(message: &[u8], bridge: &mut dyn Bridge, cx: &OpContext, out: &m
     Opcode::GetXattr => serve_getxattr(bridge, &request, cx, out, false),
     Opcode::ListXattr => serve_getxattr(bridge, &request, cx, out, true),
     Opcode::RemoveXattr => serve_removexattr(bridge, &request, cx, out),
+    // An allocation is user-scaled work that must yield between slices, which one synchronous call cannot: the
+    // stepping channel serves it (`crate::allocate`, A-108), and a transport that only dispatches answers that it is
+    // not supported, which glibc's `posix_fallocate` answers by writing zeros itself.
+    Opcode::Fallocate => write_or_drop(ReplyHeader::write_error(unique, EOPNOTSUPP, out), out),
   }
 }
 
@@ -187,7 +191,7 @@ pub fn success_reply_bytes(opcode: Opcode) -> Option<usize> {
 }
 
 /// Whether a request that answered `error` changed the volume in a way its caller is promised survives a
-/// daemon restart once the reply arrives (§4.8 barrier, D-18): a namespace or attribute change, and the commit
+/// daemon restart once the reply arrives (§4.8 barrier, D-18): a namespace or attribute change, an allocation (A-108), and the commit
 /// points of data — `fsync` and the `flush` every close sends — succeeded. A plain `write` is not one: like an
 /// NFS `UNSTABLE` write, its bytes are in the daemon when it returns and are made stable by the `flush` or
 /// `fsync` that follows. Every transport that serves this dispatch (the kernel's `/dev/fuse`, a virtio-fs
@@ -210,6 +214,7 @@ pub fn needs_barrier(opcode: Option<Opcode>, error: i32) -> bool {
           | Opcode::FSync
           | Opcode::FSyncDir
           | Opcode::Flush
+          | Opcode::Fallocate
       )
     )
 }
@@ -369,7 +374,11 @@ fn body_u32(body: &[u8], at: usize) -> Option<u32> {
 /// The object the kernel's node id names: node id 1 is the root (resolved through the bridge under
 /// `cx`), every other node id is already the inode number. The FUSE node id carries no generation
 /// (generation-tracked node-id reuse is owed), so the object's generation is zero.
-fn resolve(bridge: &mut dyn Bridge, cx: &OpContext, nodeid: u64) -> Result<ObjectId, VfsError> {
+pub(crate) fn resolve(
+  bridge: &mut dyn Bridge,
+  cx: &OpContext,
+  nodeid: u64,
+) -> Result<ObjectId, VfsError> {
   let inode = if nodeid == FUSE_ROOT_ID {
     bridge.root(cx)?
   } else {
@@ -380,7 +389,7 @@ fn resolve(bridge: &mut dyn Bridge, cx: &OpContext, nodeid: u64) -> Result<Objec
 
 /// Maps a volume refusal to its POSIX errno. This is the FUSE edge's error vocabulary; each other
 /// transport maps the same [`VfsError`] to its own wire error.
-fn errno(e: VfsError) -> i32 {
+pub(crate) fn errno(e: VfsError) -> i32 {
   match e {
     VfsError::NotFound => ENOENT,
     VfsError::AlreadyExists => EEXIST,

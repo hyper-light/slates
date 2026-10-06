@@ -23,6 +23,7 @@
 #![cfg_attr(not(test), deny(clippy::arithmetic_side_effects))]
 
 pub mod abi;
+pub mod allocate;
 pub mod bridge;
 #[cfg(target_os = "linux")]
 pub mod channel;

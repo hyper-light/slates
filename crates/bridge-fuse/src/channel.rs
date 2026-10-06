@@ -35,6 +35,7 @@ use rustix::event::{EventfdFlags, PollFd, PollFlags};
 use rustix::fs::{Mode, OFlags};
 
 use crate::abi::{IN_HEADER_LEN, OUT_HEADER_LEN, Opcode};
+use crate::allocate::{Allocation, Begun};
 use crate::bridge::Bridge;
 use crate::coherence::{Coherence, Delivered};
 use crate::dispatch;
@@ -394,6 +395,9 @@ pub struct ServeState {
   replay: Option<(u64, Vec<u8>)>,
   /// Where the kernel's cache stands and what it is owed (AUD-02).
   pub coherence: Coherence,
+  /// A `FALLOCATE` still running (A-108), with where the kernel's cache stood before it began: stepped one slice
+  /// per turn, and no other request is read until it is answered.
+  allocating: Option<(Allocation, Option<slates_bridge_core::InvalidationCursor>)>,
 }
 
 impl std::fmt::Debug for ServeState {
@@ -414,6 +418,7 @@ impl ServeState {
       session: None,
       replay: None,
       coherence: Coherence::new(),
+      allocating: None,
     }
   }
 
@@ -716,6 +721,8 @@ pub enum Turn {
   /// A resent request was answered from the reply its dead daemon published and never delivered (A-61): applied
   /// once, by that daemon, never again.
   Replayed,
+  /// A slice of a running allocation landed and more remains (A-108): the owner yields, then turns again.
+  Continued,
 }
 
 /// One non-blocking turn for an owner that makes a request's effect durable before answering (the daemon,
@@ -728,7 +735,19 @@ pub fn dispatch_ready(
   attachments: &mut Attachments,
   attachment: AttachmentId,
   state: &mut ServeState,
+  slice_bytes: u64,
 ) -> Result<Turn, ChannelError> {
+  if let Some((allocation, cursor_before)) = state.allocating.take() {
+    return continue_allocation(
+      channel,
+      bridge,
+      attachments,
+      attachment,
+      state,
+      (allocation, cursor_before),
+      slice_bytes,
+    );
+  }
   let read = match channel.try_read_request() {
     Ok(Some(read)) => read,
     Ok(None) => return Ok(Turn::Idle),
@@ -757,6 +776,37 @@ pub fn dispatch_ready(
     parsed.opcode
   });
   let delivered = deliver_owed(channel, bridge, &cx, state);
+  if let (Some(Opcode::Fallocate), Ok(delivered)) = (opcode, &delivered) {
+    let delivered = *delivered;
+    let cursor_before = state.coherence.cursor();
+    let begun = Allocation::begin(&request, bridge, &cx, &mut state.reply);
+    state.coherence.served_own_request(bridge, &cx, delivered);
+    attachments.end(attachment);
+    return match begun {
+      Begun::Running(allocation) => continue_allocation(
+        channel,
+        bridge,
+        attachments,
+        attachment,
+        state,
+        (allocation, cursor_before),
+        slice_bytes,
+      ),
+      Begun::Answered(len) => {
+        let error = state.reply.get(..len).map_or(0, reply_error);
+        Ok(Turn::Dispatched(Dispatched {
+          opcode,
+          delivered,
+          error,
+          unique,
+          nodeid,
+          len,
+          request,
+          cursor_before,
+        }))
+      }
+    };
+  }
   let dispatched = delivered.map(|delivered| {
     let cursor_before = state.coherence.cursor();
     let len = dispatch(&request, bridge, &cx, &mut state.reply);
@@ -775,6 +825,50 @@ pub fn dispatch_ready(
   });
   attachments.end(attachment);
   dispatched.map(Turn::Dispatched)
+}
+
+/// One slice of a running allocation (A-108), admitted and ended around its service as a request is: the owed round
+/// first, then the slice. While more remains the allocation is kept and the turn is [`Turn::Continued`]; once it is
+/// done, or a slice is refused, its reply waits in the state as a dispatched request's does.
+fn continue_allocation(
+  channel: &mut FuseChannel,
+  bridge: &mut dyn Bridge,
+  attachments: &mut Attachments,
+  attachment: AttachmentId,
+  state: &mut ServeState,
+  (mut allocation, cursor_before): (Allocation, Option<slates_bridge_core::InvalidationCursor>),
+  slice_bytes: u64,
+) -> Result<Turn, ChannelError> {
+  let Ok(cx) = attachments.begin(attachment) else {
+    return Ok(Turn::Ended);
+  };
+  let delivered = match deliver_owed(channel, bridge, &cx, state) {
+    Ok(delivered) => delivered,
+    Err(e) => {
+      attachments.end(attachment);
+      return Err(e);
+    }
+  };
+  let answered = allocation.step(bridge, &cx, slice_bytes, &mut state.reply);
+  state.coherence.served_own_request(bridge, &cx, delivered);
+  attachments.end(attachment);
+  let Some(len) = answered else {
+    state.allocating = Some((allocation, cursor_before));
+    return Ok(Turn::Continued);
+  };
+  let parsed = Request::parse(allocation.request()).ok();
+  let unique = parsed.as_ref().map_or(0, |parsed| parsed.header.unique);
+  let nodeid = parsed.as_ref().map_or(0, |parsed| parsed.header.nodeid);
+  Ok(Turn::Dispatched(Dispatched {
+    opcode: Some(Opcode::Fallocate),
+    delivered,
+    error: state.reply.get(..len).map_or(0, reply_error),
+    unique,
+    nodeid,
+    len,
+    request: allocation.into_request(),
+    cursor_before,
+  }))
 }
 
 /// Writes a dispatched request's reply — or, when its owner could not make the effect durable, an error

@@ -2162,6 +2162,117 @@ impl Volume {
     Ok(written)
   }
 
+  /// Admits an allocation of `[off, end)` of file `no` (A-108, `fallocate` mode 0): the quota is charged now for
+  /// every byte of the range not yet held, all of it or none, so a range too large for the quota is refused
+  /// `NoSpace` before anything changes. A dynamic quota's grant grows to cover it; a bounded one is checked. The
+  /// holes are then materialized by [`Volume::allocate`] in slices, each charging what it materializes.
+  pub fn admit_allocation(
+    &mut self,
+    store: &mut Store,
+    no: InodeNo,
+    off: u64,
+    end: u64,
+  ) -> Result<(), VfsError> {
+    self.live()?;
+    self.allocatable(store, no)?;
+    let charge = self.write_charge(store, no, off, end)?;
+    store.make_room(self.quota.growth_needed(self.bytes.total(), charge));
+    if self
+      .quota
+      .admit(self.bytes.total(), charge, &mut store.budget)
+    {
+      Ok(())
+    } else {
+      Err(VfsError::NoSpace)
+    }
+  }
+
+  /// Materializes the holes of `[off, end)` of file `no` with zeros (A-108): every byte of the range not yet held
+  /// is written, and no held byte is touched, so the range reads as before and a later write into it is charged
+  /// nothing (until a snapshot shares its windows, as on btrfs). A range past the end extends the size to `end`.
+  /// Adjacent holes are written as one zero run, so a fresh range costs one write per run, not one per window. The
+  /// caller sizes the range to its slice; a short write is `NoSpace`.
+  pub fn allocate(
+    &mut self,
+    store: &mut Store,
+    no: InodeNo,
+    off: u64,
+    end: u64,
+  ) -> Result<(), VfsError> {
+    self.live()?;
+    self.allocatable(store, no)?;
+    let runs = self.holes(store, no, off, end)?;
+    let longest = runs
+      .iter()
+      .map(|(start, stop)| stop.saturating_sub(*start))
+      .max()
+      .unwrap_or(0);
+    let zeros = vec![0u8; usize::try_from(longest).map_err(|_| VfsError::FileTooLarge)?];
+    for (start, stop) in runs {
+      let len = usize::try_from(stop.saturating_sub(start)).map_err(|_| VfsError::FileTooLarge)?;
+      let run = zeros.get(..len).ok_or(VfsError::FileTooLarge)?;
+      if self.write_with(store, no, start, run, Recorded::Yes)? < len {
+        return Err(VfsError::NoSpace);
+      }
+    }
+    Ok(())
+  }
+
+  /// Refuses an allocation of anything but a regular file, as a write is refused.
+  fn allocatable(&self, store: &Store, no: InodeNo) -> Result<(), VfsError> {
+    match self.kind(store, no)? {
+      Kind::Dir => Err(VfsError::IsDirectory),
+      kind if kind.is_special() => Err(VfsError::SpecialFileOperation),
+      _ => Ok(()),
+    }
+  }
+
+  /// The holes of `[off, end)` of file `no`, as ascending runs with adjacent holes joined: the bytes no window
+  /// holds. A window holds the prefix its extents reach (the quota charges a window by that prefix); an inline
+  /// body holds its bytes; a base window not yet pinned holds the base's bytes, which are on the disk.
+  fn holes(
+    &self,
+    store: &Store,
+    no: InodeNo,
+    off: u64,
+    end: u64,
+  ) -> Result<Vec<(u64, u64)>, VfsError> {
+    let inode = self.inode(store, no)?;
+    let chunk = u64::try_from(store.content.chunk_bytes())
+      .unwrap_or(u64::MAX)
+      .max(1);
+    let held_windows = materialized_windows_in(&inode.body, chunk, off, end);
+    let mut runs: Vec<(u64, u64)> = Vec::new();
+    let mut cursor = off;
+    while cursor < end {
+      let window = window_of(cursor, chunk);
+      let window_start = window_start_of(cursor, chunk);
+      let window_end = window_start.saturating_add(chunk);
+      let mut held = held_windows.get(&window).copied().unwrap_or(0);
+      match &inode.body {
+        Body::Inline(bytes) if window == 0 => {
+          held = held.max(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
+        }
+        Body::Base(base)
+          if window_start < base.base_len && !base.pinned.iter().any(|e| e.off == window_start) =>
+        {
+          held = held.max(base.base_len.saturating_sub(window_start).min(chunk));
+        }
+        _ => {}
+      }
+      let hole_start = cursor.max(window_start.saturating_add(held));
+      let hole_end = end.min(window_end);
+      if hole_start < hole_end {
+        match runs.last_mut() {
+          Some(last) if last.1 == hole_start => last.1 = hole_end,
+          _ => runs.push((hole_start, hole_end)),
+        }
+      }
+      cursor = hole_end.max(window_end.min(end));
+    }
+    Ok(runs)
+  }
+
   /// Truncates (or extends with a hole) to `len`.
   pub fn truncate(&mut self, store: &mut Store, no: InodeNo, len: u64) -> Result<(), VfsError> {
     self.namespace_inode(store, no)?;
@@ -4919,7 +5030,10 @@ impl Volume {
     let chunk = u64::try_from(store.content.chunk_bytes()).unwrap_or(u64::MAX);
     let page = u64::try_from(store.content.granule()).unwrap_or(1);
     let inline = u64::try_from(store.inline_bytes).unwrap_or(0);
-    let before = materialized_windows(&inode.body, chunk);
+    // Only the windows `[off, end)` touches can change, so the charge is their difference alone: the map of the whole
+    // file made every write into a large file pay for all its windows (an allocation in one-window slices was
+    // quadratic, A-108).
+    let before = materialized_windows_in(&inode.body, chunk, off, end);
     let mut after = before.clone();
     let mut inline_before = 0;
     if let Body::Inline(v) = &inode.body {
@@ -5545,11 +5659,22 @@ pub(crate) fn charged_window(materialized: u64, granule: u64, chunk: u64) -> u64
 /// The materialized bytes per chunk window of a body: window index → bytes from the window's
 /// start (the chunk rule of §4.5: an extent covers its window from the window's start to the
 /// extent's end, at most one chunk). The charge is each window's [`charged_window`].
-fn materialized_windows(body: &Body, chunk: u64) -> std::collections::BTreeMap<u64, u64> {
-  let mut map = std::collections::BTreeMap::new();
+/// The materialized prefix of each chunk window `[from, to)` touches, by window: an extent counts in the window its first
+/// byte is in, and a window's prefix is the furthest its extents reach (the quota charges a window by it, §4.2). Only
+/// the touched windows are walked, so a write or an allocation slice never pays for the whole file (A-108): sealed
+/// extents are ascending, so the walk starts at a binary search; a base's pinned extents carry no order and are
+/// filtered.
+fn materialized_windows_in(
+  body: &Body,
+  chunk: u64,
+  from: u64,
+  to: u64,
+) -> std::collections::BTreeMap<u64, u64> {
   let chunk = chunk.max(1);
+  let first = window_start_of(from, chunk);
+  let mut map = std::collections::BTreeMap::new();
   let mut add = |off: u64, len: u64| {
-    if len > 0 {
+    if len > 0 && off >= first && off < to {
       let window = window_of(off, chunk);
       let entry = map.entry(window).or_insert(0u64);
       *entry = (*entry).max(
@@ -5559,10 +5684,24 @@ fn materialized_windows(body: &Body, chunk: u64) -> std::collections::BTreeMap<u
       );
     }
   };
+  let in_range = |extents: &'_ [crate::content::Extent]| {
+    let start = extents.partition_point(|e| e.off < first);
+    extents
+      .get(start..)
+      .unwrap_or(&[])
+      .iter()
+      .take_while(|e| e.off < to)
+      .map(|e| (e.off, e.len))
+      .collect::<Vec<(u64, u64)>>()
+  };
   match body {
-    Body::Sealed(extents) => extents.iter().for_each(|e| add(e.off, e.len)),
+    Body::Sealed(extents) => in_range(extents)
+      .into_iter()
+      .for_each(|(off, len)| add(off, len)),
     Body::Open { open, sealed } => {
-      sealed.iter().for_each(|e| add(e.off, e.len));
+      in_range(sealed)
+        .into_iter()
+        .for_each(|(off, len)| add(off, len));
       add(open.off, open.len);
     }
     Body::Base(b) => b.pinned.iter().for_each(|e| add(e.off, e.len)),

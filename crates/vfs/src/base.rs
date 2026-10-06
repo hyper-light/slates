@@ -2017,6 +2017,32 @@ impl Overlay<'_> {
     self.vol.write(store, no, off, bytes)
   }
 
+  /// `admit_allocation` with copy-up (A-108): the charge counts the windows still on the disk, which the slices pin.
+  pub fn admit_allocation(
+    &mut self,
+    store: &mut Store,
+    no: InodeNo,
+    off: u64,
+    end: u64,
+  ) -> Result<(), VfsError> {
+    self.copy_up(store, no, CopyUp::Content)?;
+    self.vol.admit_allocation(store, no, off, end)
+  }
+
+  /// `allocate` with copy-up (A-108): the slice's windows are pinned from the disk first, so the zeros fill only what
+  /// neither the volume nor the base holds.
+  pub fn allocate(
+    &mut self,
+    store: &mut Store,
+    no: InodeNo,
+    off: u64,
+    end: u64,
+  ) -> Result<(), VfsError> {
+    self.copy_up(store, no, CopyUp::Content)?;
+    self.pin_windows(store, no, off, end)?;
+    self.vol.allocate(store, no, off, end)
+  }
+
   /// `truncate` with copy-up.
   pub fn truncate(&mut self, store: &mut Store, no: InodeNo, len: u64) -> Result<(), VfsError> {
     self.copy_up(store, no, CopyUp::Content)?;
