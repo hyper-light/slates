@@ -9407,6 +9407,13 @@ group first).
   reply at p90 136 ms against 180 ms (mantle's report, 2026-10-05, not reproduced here); a fleet session handshakes
   once per connection, so it is off every request path.
 
+- **Amended 2026-10-06: no classical group between nodes.** The fleet provider kept rustls' classical groups (X25519,
+  P-256, P-384) after the hybrids. A peer offering one of them alone was met on it, which a later quantum adversary
+  could open: measured, two fleet ends negotiated X25519. The fleet now offers only SecP384r1MLKEM1024, X25519MLKEM768
+  and SecP256r1MLKEM768, and a classical-only offer fails the handshake
+  (`a_peer_offering_only_a_classical_group_is_refused`, red first). Every slates node offers the hybrids. The
+  transport suite and the fleet suite (71) pass. The RPC-with-TLS export is unchanged.
+
 ### A-94 — Every mount of a volume is nosuid and nodev (2026-10-05)
 Applied in the same change to: `crates/cli/src/mount.rs`, `crates/cli/examples/slates_mount.rs`,
 `crates/bridge-oci/src/binding.rs`, `xtask/src/kind_export.rs`, `docs/deploy.md`, the tests named in

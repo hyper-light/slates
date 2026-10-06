@@ -91,11 +91,21 @@ fn provider() -> Arc<rustls::crypto::CryptoProvider> {
 }
 
 /// The provider between slates' own nodes (the fleet planes): SecP384r1MLKEM1024 first (`crate::kx`: ML-KEM-1024, CNSA
-/// 2.0's key establishment, with P-384), then rustls' standard groups, so a node from before it still meets this one on
-/// X25519MLKEM768 and never on a classical group alone unless neither offers a hybrid.
+/// 2.0's key establishment, with P-384), then rustls' hybrids (X25519MLKEM768, SecP256r1MLKEM768), so a node from before
+/// the first still meets this one on a hybrid, and **no classical group at all**: a peer that offers only X25519 or a NIST
+/// curve fails the handshake rather than being met on a key exchange a later quantum adversary could open. Until
+/// 2026-10-06 rustls' classical groups followed the hybrids and such a peer was met on X25519
+/// (`a_peer_offering_only_a_classical_group_is_refused`). The RPC-with-TLS export keeps rustls' standard groups
+/// ([`provider`]): its peer is a kernel's TLS handshake daemon, not a slates node.
 // structural: allow — D-8 exception 2: rustls's provider/config types cross its API as `Arc`.
 pub fn fleet_provider() -> Arc<rustls::crypto::CryptoProvider> {
   let mut provider = rustls::crypto::aws_lc_rs::default_provider();
+  provider.kx_groups.retain(|group| {
+    matches!(
+      group.name(),
+      rustls::NamedGroup::X25519MLKEM768 | rustls::NamedGroup::secp256r1MLKEM768
+    )
+  });
   provider.kx_groups.insert(0, crate::kx::SECP384R1_MLKEM1024);
   // structural: allow — D-8 exception 2: rustls's `builder_with_provider` takes `Arc` by signature.
   Arc::new(provider)
@@ -269,6 +279,16 @@ pub fn client_config(
   pinned_server: CertificateDer<'static>,
   client_identity: &Identity,
 ) -> Result<ClientConfig, HandshakeError> {
+  client_config_with(pinned_server, client_identity, fleet_provider())
+}
+
+/// [`client_config`] over `provider`: the fleet's own, or (in a test) one that offers other groups.
+fn client_config_with(
+  pinned_server: CertificateDer<'static>,
+  client_identity: &Identity,
+  // structural: allow — D-8 exception 2: rustls's provider crosses its API as `Arc`.
+  provider: Arc<rustls::crypto::CryptoProvider>,
+) -> Result<ClientConfig, HandshakeError> {
   let mut roots = RootCertStore::empty();
   for authority in &client_identity.authorities {
     roots
@@ -278,7 +298,7 @@ pub fn client_config(
   roots
     .add(pinned_server)
     .map_err(|e| HandshakeError::Setup(e.to_string()))?;
-  ClientConfig::builder_with_provider(fleet_provider())
+  ClientConfig::builder_with_provider(provider)
     .with_protocol_versions(&[&rustls::version::TLS13])?
     .with_root_certificates(roots)
     .with_client_auth_cert(
@@ -421,6 +441,43 @@ mod tests {
         "the {side} negotiated the hybrid post-quantum group"
       );
     }
+  }
+
+  /// Goal condition 8, adversarially: a peer that offers only a classical group is refused, never met on it. Do: a
+  /// client holding an enrolled identity but offering X25519 alone handshakes with a fleet server. Expect: the handshake
+  /// fails. Until 2026-10-06 the fleet provider kept rustls' classical groups after the hybrids, and such a peer was met
+  /// on X25519: a session a later quantum adversary could open. Every slates node offers the hybrids, so only a
+  /// misconfigured or hostile peer offers a classical group alone.
+  #[test]
+  fn a_peer_offering_only_a_classical_group_is_refused() {
+    let server = self_signed("server.slates");
+    let client = self_signed("client.slates");
+    let mut classical = rustls::crypto::aws_lc_rs::default_provider();
+    classical.kx_groups = vec![rustls::crypto::aws_lc_rs::kx_group::X25519];
+    // structural: allow — D-8 exception 3: a test harness; rustls takes the provider and config as `Arc`.
+    let config = client_config_with(server.certificate(), &client, Arc::new(classical)).unwrap();
+    let mut client_side = ClientConnection::new(
+      // structural: allow — D-8 exception 3: a test harness.
+      Arc::new(config),
+      Version::V1,
+      ServerName::try_from("server.slates".to_owned()).unwrap(),
+      TransportParameters::local().encode(),
+    )
+    .unwrap();
+    let mut server_side = server_connection(
+      &server,
+      &[client.certificate()],
+      &TransportParameters::local(),
+    )
+    .unwrap();
+    let outcome = drive(&mut client_side, &mut server_side);
+    assert!(
+      outcome.is_err() || client_side.is_handshaking() || server_side.is_handshaking(),
+      "a classical-only offer must not complete a fleet handshake (negotiated {:?})",
+      server_side
+        .negotiated_key_exchange_group()
+        .map(|group| group.name())
+    );
   }
 
   /// Shape: the largest handshake flight a fleet server may send — the fragmenter's bound on a whole
