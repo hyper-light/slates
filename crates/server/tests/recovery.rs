@@ -1909,6 +1909,26 @@ const FILL_FILES: u64 = 34;
 /// Shape: one file of that test.
 const FILL_FILE: usize = 1 << 20;
 
+/// Reads `name` at the head, asking again while the client answers `Stalled` (the daemon alive but not yet answering:
+/// the typed refusal a caller retries; a read is idempotent) for up to the recovery budget a restart is bounded by.
+/// CI's TSan lane met it 3 runs of 3 on 2026-10-06: a read after the restart past the 1 s reply deadline, the runner's
+/// four vCPUs shared by the suite's parallel tests under the sanitizer's slowdown; alone, or in the whole suite on a
+/// 4-CPU container here, it never stalled (6 runs).
+fn read_answered(
+  client: &mut Client,
+  volume: VolumeId,
+  name: &str,
+) -> Result<Vec<u8>, slates_client::ClientError> {
+  let began = Instant::now();
+  loop {
+    match client.read(volume, name, slates_ipc::protocol::ReadAt::Head) {
+      Err(slates_client::ClientError::Stalled { .. })
+        if began.elapsed() < Duration::from_nanos(slates_db::replay::RECOVERY_BUDGET_NS) => {}
+      answered => return answered,
+    }
+  }
+}
+
 /// §4.2 capacity (2026-10-05): a shard's reserve is RAM ÷ shards ÷ classes, rarely a power of two, and the buddy
 /// arena used only its largest power-of-two part (128 MiB of a 170.7 MiB reserve under a 1 GiB cap, 25% stranded).
 /// Do: give one shard a reserve of 1.5 × [`POWER_PART`], create a bounded volume larger than that power-of-two part,
@@ -1951,11 +1971,7 @@ fn a_volume_past_the_reserves_power_of_two_part_fills_and_survives_a_restart() {
   first.stop();
   let second = Daemon::start(&profile, config, source_of(&segment)).unwrap();
   for index in 0..FILL_FILES {
-    let read = client.read(
-      volume,
-      &format!("f{index}"),
-      slates_ipc::protocol::ReadAt::Head,
-    );
+    let read = read_answered(&mut client, volume, &format!("f{index}"));
     assert!(
       read.unwrap() == file_bytes(index),
       "file {index} after the restart"

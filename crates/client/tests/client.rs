@@ -1036,3 +1036,45 @@ fn a_restarted_daemons_first_answer_is_awaited_for_the_reconnect_budget() {
     );
   }
 }
+
+/// Shape: a held shard start longer than the product's reply deadline (the anchor's liveness budget), as TSan's lane
+/// measured (a 1.79 s start against a 1 s deadline); a start A-100 lets the supervisor sit out while the shard works.
+const START_PAST_THE_REPLY_NS: u64 = 1_500_000_000;
+
+/// A-100 against the client. Do: with the product's own deadlines, create a volume and keep the client; stop the daemon;
+/// start its successor with one shard's start held busy past the reply deadline, and only then ask the same client for
+/// the volume's status, for each shard in turn. Expect: the status answers: the successor's start returns only once its
+/// shards have started, so a resumed session never meets a shard still starting. Written 2026-10-06 to test whether
+/// that was the cause of CI's TSan-lane stall in `crates/server/tests/recovery.rs`; it passed on the code as it was, so
+/// it was not.
+#[test]
+fn a_resumed_session_waits_out_a_shard_start_its_supervisor_allows() {
+  for partition in 0..TEST_SHARDS {
+    let profile = profile();
+    let instance = format!("cl-resume-slow-{partition}-{}", std::process::id());
+    let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
+    let segment = played_anchor(&profile, &config, &format!("cl-resume-slow-{partition}"));
+    let first = start_over(&profile, &config, &segment);
+    first
+      .bootstrap(true)
+      .expect("the fixture explicitly creates its local consensus group");
+    let mut client = connect(&instance);
+    let volume = client.create(&scratch("resume-slow")).unwrap();
+    first.stop();
+    let slow = config
+      .clone()
+      .with_boot_fault(slates_server::config::BootFault {
+        partition,
+        kind: slates_server::config::BootFaultKind::Busy,
+        for_ns: START_PAST_THE_REPLY_NS,
+      });
+    let second = start_over(&profile, &slow, &segment);
+    let status = client.status(volume);
+    let reconnects = client.reconnects();
+    second.stop();
+    assert!(
+      status.is_ok(),
+      "shard {partition} held {START_PAST_THE_REPLY_NS} ns: the resumed session's answer was waited for, not called stalled ({reconnects} reconnects): {status:?}"
+    );
+  }
+}

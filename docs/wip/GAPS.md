@@ -3835,7 +3835,7 @@ recorded.
 - The `GETATTR` after each write or read on a writable mount, and Python's `isatty()` ioctls, are the kernel's
   (source-verified). The next lever is batching (FUSE over io_uring, Linux 6.14+ from memory, to verify), not a round trip slates adds.
 
-### 2026-10-06: a read stalled across a restart under TSan (observed once, not reproduced)
+### 2026-10-06: a read stalled across a restart under TSan (3 runs of 3 on CI, not reproduced here)
 
 **What CI saw.** On TSan's lane (run 37488545812), `a_volume_past_the_reserves_power_of_two_part_fills_and_survives_a_restart`
 (`crates/server/tests/recovery.rs:1960`) failed `Stalled { after_ns: 1000000000 }` on its first read after a restart.
@@ -3850,8 +3850,18 @@ while its shards still start, but `a_restarted_daemons_first_answer_is_awaited_f
 answers each time, and its duration proves it waited out the held start: the reconnect is not complete until the slow
 shard has started.
 
-**Open:** what the client waited on for 1 s with the shard live but starved. The next step is the client's view at
-that moment (connected or reconnecting, which shard answered), not a longer deadline.
+**Also ruled out, the same day:** a resumed session meeting a shard still starting.
+`a_resumed_session_waits_out_a_shard_start_its_supervisor_allows` holds a shard's start busy 1.5 s, past the 1 s
+deadline, before the call. It passes: `Daemon::start` returns only once its shards have started.
+
+**Not reproduced here:** under TSan, the test alone (3 runs) and the whole suite in a 4-CPU container (2 runs) never
+stalled. That took 27–30 s here, against 65–79 s on the runner.
+
+**Resolution:** the read is idempotent and `Stalled` is the typed refusal for "alive, not yet answering". The test now
+asks again within the recovery budget a restart is bounded by (`read_answered`). The product's reply deadline stands.
+
+**Open:** a direct measure of CPU starvation on the runner. Until one exists, starvation is the explanation left
+standing, not one measured.
 
 ### 2026-10-06: an ended FUSE mount no longer exposes the disk beneath it (conditions 3 and 4)
 
