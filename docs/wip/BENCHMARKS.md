@@ -2515,6 +2515,11 @@ step, spin, park and send), and the probe's own overhead reversed the result: al
   one miss per round trip). Its window is the 2-competitive spin-then-park threshold (spin for the expected cost of
   parking; Karlin, Manasse, McGeoch and Owicki 1991), and that threshold took the startup profile's `wake.mean`
   (1.7 µs on macOS), well below the wakes actually paid under load.
-- **What decides it next.** The daemon runs with the runtime's online wake estimate (`wake_tracking`), and
-  `rt_bench`'s ping-pong does not. Re-measure the kick rule with the estimate on, the daemon's own configuration,
-  before reopening it.
+- **Measured in the daemon's configuration** (macOS, load 14–40). The spin window was ×100 (`IDLE_WINDOW_RATIO`)
+  with the online estimate on, alternating, three rounds: always-kick 4,875–5,917 ns, the candidate 12,167–12,791 ns.
+  Still rejected.
+- **The window is not the cause.** The shards' counters show 1–2 real driver waits per 2,000 round trips: nearly
+  every park found its message already waiting, so no kernel wake is in the candidate's extra 7 µs. What remains is
+  the 10–13 µs in which a shard thread that makes no system call logs nothing (the macOS timeline above), which is
+  the OS scheduling two spinning threads. The kick's system call is what keeps the peer promptly scheduled. That
+  mechanism is inferred, not measured, and no change to the spin derivation is justified by it.
