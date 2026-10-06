@@ -26,6 +26,22 @@ impl TargetDir {
 
 impl Drop for TargetDir {
   fn drop(&mut self) {
+    // A mount the test left at the directory is unmounted first, as its user would (A-102: a daemon's stop or a
+    // volume's destroy ends a FUSE mount but leaves it in place, answering `ENOTCONN`); otherwise the removal below
+    // fails on it and a dead mount stays on the host. Lazily, so a mount still busy goes as soon as it is free.
+    #[cfg(target_os = "linux")]
+    {
+      let mounted = std::fs::read_to_string("/proc/self/mountinfo").is_ok_and(|table| {
+        table
+          .lines()
+          .any(|line| line.split(' ').nth(4) == Some(self.path.as_str()))
+      });
+      if mounted {
+        let _ = std::process::Command::new("fusermount3")
+          .args(["-u", "-z", &self.path])
+          .status();
+      }
+    }
     // The test's own directory in the build output (CLAUDE §4: removed at the end).
     #[allow(clippy::disallowed_methods)]
     let _removed = std::fs::remove_dir_all(&self.path);
