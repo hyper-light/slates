@@ -1,7 +1,7 @@
 //! The daemon's Linux FUSE transport by use (§4.6 "Linux"; AUD-29-64): a volume mounted by `attach` with the
 //! FUSE form — the daemon running the OS's `fusermount3` without blocking its shard and serving the device on
 //! the volume's owner shard — reached by ordinary file calls through the kernel; the mount table naming the
-//! attachment; and the mount ended by a `detach`, by the kernel's own unmount, and by the daemon's stop, the
+//! attachment; and the mount ended by a `detach`, by the kernel's own unmount, and by the daemon's stop (which, A-102, leaves it in place for its user to unmount), the
 //! attachment ending with it each time.
 //!
 //! Linux only, gated: skips loudly without `fusermount3` or `/dev/fuse` (the CI Linux lane has both; locally, a
@@ -222,14 +222,44 @@ fn a_file_is_no_mount_point(client: &mut slates_client::Client, volume: slates_c
   );
 }
 
+/// A-102: after its daemon has stopped, the mount at `point` is still in the kernel's table and refuses a write (the
+/// kernel answers `ENOTCONN`), so nothing falls through to the directory beneath; its user's `fusermount3 -u` then
+/// removes it. Asserts each step, naming `what`.
+#[allow(clippy::disallowed_methods)] // a write through the dead mount, refused by the kernel
+fn left_dead_until_its_user_unmounts(point: &str, what: &str) {
+  assert!(
+    mounted_at(point).is_some(),
+    "{what}: the mount stays until its user unmounts it"
+  );
+  let wrote = std::fs::write(format!("{point}/after-the-stop"), b"x");
+  assert!(
+    wrote.is_err(),
+    "{what}: a write to the ended mount is refused"
+  );
+  let unmounted = Command::new("fusermount3")
+    .args(["-u", point])
+    .status()
+    .unwrap();
+  assert!(unmounted.success(), "{what}: its user unmounts it");
+  assert!(mounted_at(point).is_none(), "{what}: unmounted");
+  let beneath: Vec<_> = std::fs::read_dir(point)
+    .unwrap()
+    .map(|entry| entry.unwrap().file_name())
+    .collect();
+  assert!(
+    beneath.is_empty(),
+    "{what}: nothing reached the disk beneath: {beneath:?}"
+  );
+}
+
 /// AUD-29-64 (the daemon serves Linux FUSE). Do: start a daemon, create a volume, and attach it with the
 /// FUSE form at a fresh directory; work through the kernel; read the mount table; detach; attach again and
 /// unmount from the kernel's side (`fusermount3 -u`); ask for a mount over a regular file; attach again and
 /// stop the daemon. Expect: the attach answers with the mount point once mounted; every call works and reads
 /// back, and a second mount sees the first's work; the table shows `fuse.slates` with the source naming this
 /// attachment (`slates:<attachment>`); the detach and the kernel's unmount each leave no mount and the volume
-/// with no attachment; the file is refused typed with nothing mounted or recorded; the daemon's stop leaves
-/// no mount; and no barrier was refused.
+/// with no attachment; the file is refused typed with nothing mounted or recorded; the daemon's stop ends the mount
+/// but leaves it in place, refusing writes, until its user unmounts it (A-102); and no barrier was refused.
 #[test]
 fn a_volume_mounted_through_fuse_serves_the_kernel_and_ends_with_its_mount() {
   if !command_available("fusermount3") || !std::path::Path::new("/dev/fuse").exists() {
@@ -261,10 +291,7 @@ fn a_volume_mounted_through_fuse_serves_the_kernel_and_ends_with_its_mount() {
     .unwrap();
   let refusals = daemon.refusals_on_every_shard().unwrap();
   daemon.stop();
-  assert!(
-    mounted_at(&last.path).is_none(),
-    "the daemon's stop unmounted"
-  );
+  left_dead_until_its_user_unmounts(&last.path, "the daemon's stop");
   assert_eq!(refusals.get("fuse.barrier_refused"), None, "{refusals:?}");
   assert_eq!(
     refusals.get("publish.volume_skipped"),
@@ -274,9 +301,10 @@ fn a_volume_mounted_through_fuse_serves_the_kernel_and_ends_with_its_mount() {
 }
 
 /// AUD-29-64 (a fenced shard's mounts). Do: on a one-shard daemon (its control shard owns the volume), attach a
-/// FUSE mount, fence the control shard as a failed consensus publication does, then stop the daemon. Expect:
-/// the stop unmounted the mount though the shard refuses every ordinary borrow; before 2026-10-01 the fenced
-/// shard's mounts outlived the daemon, answering `ENOTCONN`.
+/// FUSE mount, fence the control shard as a failed consensus publication does, then stop the daemon. Expect: the
+/// stop ended the mount though the shard refuses every ordinary borrow: its device dropped, the mount left refusing
+/// writes until its user unmounts it (A-102). Before 2026-10-01 the fenced shard's mount kept being served after the
+/// daemon's stop.
 #[test]
 fn a_fenced_shards_fuse_mount_ends_with_the_daemon() {
   if !command_available("fusermount3") || !std::path::Path::new("/dev/fuse").exists() {
@@ -307,6 +335,7 @@ fn a_fenced_shards_fuse_mount_ends_with_the_daemon() {
   daemon.inject_consensus_failure().unwrap();
   drop(client);
   daemon.stop();
+  left_dead_until_its_user_unmounts(&point.path, "the fenced shard's stop");
   assert!(
     mounted_at(&point.path).is_none(),
     "the fenced shard's mount ended with the daemon"
@@ -399,8 +428,5 @@ fn a_scoped_fuse_mount_presents_one_directory_and_follows_it() {
     "{refused:?}"
   );
   daemon.stop();
-  assert!(
-    mounted_at(&point.path).is_none(),
-    "the daemon's stop unmounted"
-  );
+  left_dead_until_its_user_unmounts(&point.path, "the daemon's stop");
 }

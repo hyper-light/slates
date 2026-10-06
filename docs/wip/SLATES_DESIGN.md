@@ -2000,6 +2000,11 @@ Linux runner; then teardown proofs (detach, destroy, a daemon restart).
 > serve loop's end, a fenced shard included (writing no record). A FUSE attachment is recorded as such, so the
 > next start's recovery ends a crashed daemon's FUSE records and unmounts each dead mount. It does so only
 > when the kernel's table names that attachment, so a later mount at the path is never touched.
+>
+> **Superseded in part 2026-10-06 (A-102):** the stop no longer unmounts. It ends each mount (device dropped, the
+> anchor's copy released, a fenced shard writing no record), and the mount answers `ENOTCONN` until its user
+> unmounts it, so no write by path reaches the disk beneath. The recovery's sweep of a crashed daemon's dead mounts
+> is unchanged and open in GAPS.
 
 > **Status (2026-10-01, AUD-29-77 in part: kept copies charged; protection named).** A guest device's copy
 > buffers are charged to its attachment for as long as it keeps them: growth is charged and reserved exactly,
@@ -9746,15 +9751,18 @@ Applied in the same change to: `crates/vfs/src/{dirtree,dir}.rs`, `crates/vfs/ex
 BENCHMARKS, GAPS.
 
 ### A-102 — Slates never unmounts a mount its user did not release (2026-10-06)
-Applied in the same change to: `crates/server/src/fuse.rs` (`turn`, `fail`, `adopt_one`), `crates/server/src/verbs.rs`
+Applied in the same change to: `crates/server/src/fuse.rs` (`turn`, `fail`, `adopt_one`, `end_all`, `drop_devices`),
+`crates/server/src/daemon.rs` (`EndMounts`), `crates/server/tests/fuse_mount.rs`, `crates/server/src/verbs.rs`
 (`end_attachment` takes an `Ending`), its callers, §4.6's FUSE status, the test
 `a_destroyed_volumes_mount_refuses_writes_and_never_lets_them_reach_the_disk_beneath`
 (`crates/cli/tests/cli.rs`), `docs/bugs/2026-10-06-an-ended-mount-let-writes-reach-the-disk-beneath.md`, GAPS.
 Status: built 2026-10-06 (conditions 3 and 4).
 - What: a FUSE mount is unmounted by slates only when its user detaches it, or when an attach is refused before the
   user had the mount. When the volume is destroyed, the mount's serving fails, its device cannot be adopted after a
-  restart, or the consumer is revoked, the attachment ends and the device is dropped (the anchor's copy released), but
-  the mount stays in the kernel's table. The kernel then answers every call `ENOTCONN`, or the revoked registry
+  restart, the consumer is revoked, or the daemon stops, the attachment ends and the device is dropped (the anchor's
+  copy released), but the mount stays in the kernel's table. The stop's unmount (AUD-29-64, 2026-10-01) is reversed
+  here; its three tests in `crates/server/tests/fuse_mount.rs` now assert the mount stays, refuses a write and leaves
+  the directory beneath empty after its user's `fusermount3 -u`. The kernel then answers every call `ENOTCONN`, or the revoked registry
   attachment refuses it, until the user unmounts.
 - Why: a mount removed underneath a process exposes the directory beneath it. Measured on Linux 6.12: after a
   destroy, slates' `fusermount3 -u -z` completed and `echo x > mnt/new` succeeded, writing to the disk under the mount

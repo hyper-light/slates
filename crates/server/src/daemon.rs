@@ -3087,9 +3087,10 @@ fn refresh_pressure_hold() {
 
 /// Ends the shard's FUSE mounts when its serve loop ends (§4.6 "Linux"; AUD-29-64): the loop is perpetual,
 /// so it ends only when the daemon's stop cancels every task on the shard, and its drop runs on the shard's
-/// own thread with the shard's state still installed. A mount whose daemon is gone answers every call
-/// `ENOTCONN` until someone unmounts it, so the stop unmounts them here — not by a question sent ahead of the
-/// shutdown, which waits behind whatever the shard is running and answers the questions queued before it.
+/// own thread with the shard's state still installed. Each mount is ended, never unmounted (A-102): it answers every
+/// call `ENOTCONN` until its user unmounts it, so no write by path reaches the disk beneath. Ended here, not by a
+/// question sent ahead of the shutdown, which waits behind whatever the shard is running and answers the questions
+/// queued before it.
 #[cfg(target_os = "linux")]
 struct EndMounts;
 
@@ -3098,8 +3099,8 @@ impl Drop for EndMounts {
   fn drop(&mut self) {
     // A fenced shard refuses every ordinary borrow: its mounts are still released, and their records end
     // at the next start's recovery (a record is never written on a fenced shard).
-    if state::with_state(crate::fuse::unmount_all).is_none() {
-      let _ = state::with_state_at_shutdown(crate::fuse::unmount_points);
+    if state::with_state(crate::fuse::end_all).is_none() {
+      let _ = state::with_state_at_shutdown(crate::fuse::drop_devices);
     }
   }
 }

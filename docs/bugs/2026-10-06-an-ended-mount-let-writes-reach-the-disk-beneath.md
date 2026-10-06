@@ -18,6 +18,7 @@ Every way a FUSE mount's serving ended ran `fusermount3 -u -z`, a lazy unmount:
 - a serve failure;
 - a device that could not be adopted after a restart;
 - a consumer's revocation (through `end_attachment`);
+- the daemon's stop (`EndMounts`, AUD-29-64);
 - the user's `detach`.
 
 Only the last is a request to remove the mount.
@@ -46,3 +47,12 @@ revocation tests.
 - **NFS mounts are never unmounted by the daemon:** a destroyed volume answers `NFS3ERR_STALE` or `NFS4ERR_STALE` in
   place.
 - **virtio-fs guests:** the device's revocation ends the guest's view (AUD-29-68). No host path is exposed.
+
+## Follow-up the same day: the daemon's stop
+
+The stop unmounted every FUSE mount too (`EndMounts`, a tested AUD-29-64 decision). It now ends them the same way
+(`end_all`; a fenced shard's `drop_devices` writes no record). The three tests that asserted "the daemon's stop
+unmounted" now assert the A-102 contract: the mount stays, refuses a write, and after its user's `fusermount3 -u` the
+directory beneath is empty. On Linux the server's FUSE mount suite (3), the bridge's real-kernel suites and the CLI's
+10 mount tests all pass.
+

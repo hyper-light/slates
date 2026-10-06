@@ -896,33 +896,25 @@ pub(crate) fn unmount_if_mounted(s: &ShardState, attachment: u64) {
   }
 }
 
-/// Unmounts every FUSE mount the shard serves (the daemon's stop), waiting for each helper within the
-/// failover bound. Run by the end of the shard's serve loop (`daemon::EndMounts`): on a stop nothing else
-/// runs on the shard, and an unmount left to a task the stop is about to end would leave a dead mount behind.
-pub(crate) fn unmount_all(s: &mut ShardState) {
-  unmount_points(s);
+/// Ends every FUSE mount the shard serves (the daemon's stop) without unmounting any (A-102): each device is dropped and
+/// the anchor's copy released, so the kernel answers the mount's calls `ENOTCONN` until its user unmounts it, and no
+/// write by path reaches the disk beneath. Run by the end of the shard's serve loop (`daemon::EndMounts`): on a stop
+/// nothing else runs on the shard. Before 2026-10-06 the stop unmounted them (`fusermount3 -u -z`), exposing the
+/// directories beneath to the processes still working in them.
+pub(crate) fn end_all(s: &mut ShardState) {
   let attachments: Vec<u64> = s.fuse_mounts.keys().copied().collect();
   for attachment in attachments {
     ended(s, attachment);
   }
 }
 
-/// Unmounts every FUSE mount point the shard serves, waiting for each helper within the failover bound, and
-/// writes no record: [`unmount_all`]'s first half, and all a fenced shard may do at its stop.
-pub(crate) fn unmount_points(s: &mut ShardState) {
-  let deadline = std::time::Duration::from_nanos(s.config.failover_slo_ns);
-  let points: Vec<String> = s
-    .fuse_mounts
-    .values()
-    .map(|m| m.mount_point.clone())
-    .collect();
-  for point in points {
-    if let Ok(mut pending) = begin_unmount(&point) {
-      let began = std::time::Instant::now();
-      while pending.poll().is_none() && began.elapsed() < deadline {
-        std::thread::yield_now();
-      }
-    }
+/// Ends every FUSE mount the shard serves and writes no record: all a fenced shard may do at its stop. Each device is
+/// dropped and the anchor's copy released; the records end at the next start's recovery.
+pub(crate) fn drop_devices(s: &mut ShardState) {
+  let attachments: Vec<u64> = s.fuse_mounts.keys().copied().collect();
+  for attachment in attachments {
+    s.fuse_mounts.remove(&attachment);
+    let _ = crate::fuse_hold::release(attachment);
   }
 }
 
