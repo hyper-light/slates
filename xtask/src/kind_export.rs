@@ -284,8 +284,9 @@ fn prove(lane: &Lane) -> Result<(), Failure> {
     .to_owned();
   for flag in ["nosuid", "nodev"] {
     if !mount_options.split(',').any(|option| option == flag) {
+      lane.kubelet_mount_diagnostics();
       return Err(Failure(format!(
-        "kind export: kubelet's mount of the volume is not {flag}: {mount_options:?}"
+        "kind export: the pod's mount of the volume is not {flag}: {mount_options:?} (its mountinfo: {read:?})"
       )));
     }
   }
@@ -435,6 +436,68 @@ impl Lane {
     }
     let logs = self.kubectl(&["logs", name])?;
     Ok(logs.stdout)
+  }
+
+  /// Where a mount flag the PersistentVolume asked for was lost: kubelet's own NFS mount on the worker, or the
+  /// container runtime's bind of it into the pod (the pod sees only the bind). A holder pod keeps the claim mounted
+  /// while the worker's mountinfo is read (kubelet unmounts a finished pod's volumes), then is deleted. Evidence only;
+  /// errors here are printed, never raised, so the leg's own failure stays the one reported.
+  fn kubelet_mount_diagnostics(&self) {
+    let holder = serde_json::json!({
+      "apiVersion": "v1",
+      "kind": "Pod",
+      "metadata": { "name": "slates-holder", "namespace": NAMESPACE },
+      "spec": {
+        "restartPolicy": "Never",
+        "containers": [{
+          "name": "hold",
+          "image": WORKLOAD_IMAGE,
+          "imagePullPolicy": "IfNotPresent",
+          "command": ["sh", "-c", "grep ' /data ' /proc/self/mountinfo; sleep 300"],
+          "volumeMounts": [{ "name": "data", "mountPath": "/data" }],
+        }],
+        "volumes": [{ "name": "data", "persistentVolumeClaim": { "claimName": "slates-export" } }],
+      },
+    });
+    if let Err(e) = self.apply("slates-holder", &holder.to_string()) {
+      eprintln!("kind export: the holder pod was refused: {}", e.0);
+      return;
+    }
+    let started = Instant::now();
+    while started.elapsed() < POD_WAIT {
+      match self.kubectl(&[
+        "get",
+        "pod",
+        "slates-holder",
+        "-o",
+        "jsonpath={.status.phase}",
+      ]) {
+        Ok(phase) if phase.stdout.trim() == "Running" => break,
+        _ => pause(POLL_CLUSTER),
+      }
+    }
+    let worker = format!("{EXPORT_CLUSTER}-worker");
+    match capture(
+      "docker",
+      &[
+        "exec",
+        &worker,
+        "grep",
+        "-E",
+        " - nfs4? ",
+        "/proc/self/mountinfo",
+      ],
+    ) {
+      Ok(node) => eprintln!(
+        "kind export: {worker}'s NFS mounts (kubelet's own; field 6 is the per-mount flags):\n{}{}",
+        node.stdout, node.stderr
+      ),
+      Err(e) => eprintln!("kind export: reading {worker}'s mountinfo failed: {}", e.0),
+    }
+    if let Ok(logs) = self.kubectl(&["logs", "slates-holder"]) {
+      eprintln!("kind export: the holder pod's view: {}", logs.stdout);
+    }
+    let _ = self.kubectl(&["delete", "pod", "slates-holder", "--wait=false"]);
   }
 
   /// What a failed leg leaves to read: the workload pods' events (a refused mount names its error there) and
