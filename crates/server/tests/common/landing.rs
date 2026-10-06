@@ -40,11 +40,13 @@ pub(crate) fn connect(instance: &str) -> Client {
   }
 }
 
-/// A one-mebibyte scratch volume named `name`.
+/// A four-mebibyte scratch volume named `name`.
 pub(crate) fn scratch(name: &str) -> CreateSpec {
   CreateSpec {
     name: name.to_owned(),
-    size: SizeClass::Bounded { limit: 1 << 20 },
+    // 4 MiB: room for the fairness test's 600 files in the inode allowance, a quota's share of the slab at about
+    // 2.4 KB per inode (A-109); 1 MiB allowed 436.
+    size: SizeClass::Bounded { limit: 4 << 20 },
     names: NamePolicy::Exact,
     require_locked: false,
     base: None,

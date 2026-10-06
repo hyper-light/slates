@@ -254,13 +254,17 @@ const OUTLAST_FACTOR: u32 = 2;
 /// Shape: the most files a sized landing is given — sixteen calibrations; a disk so fast that more would be
 /// needed skips the test loudly rather than writing without bound.
 const MOST_FILES: usize = CALIBRATION_FILES * 16;
+/// Shape: the quota one of a sized landing's files is given: ext4's default bytes per inode (`mke2fs` `inode_ratio`).
+/// Far above both what a file's few inline bytes are charged and the bytes per inode a shard's layout gives (about
+/// 2.4 KB, A-109), so the inode allowance, not the bytes, never refuses one of the files.
+const QUOTA_PER_FILE: usize = 16 << 10;
 /// Derived: the most a sized landing's volume may grow to — each of the most files ([`MOST_FILES`], doubled
-/// once more by a landing that must be made again) given one inode's worth of quota. A volume's inode allowance
-/// is its quota over `size_of::<Inode>()` (§4.2, `verbs::inode_allowance`), and each file's few bytes are kept
-/// inline, charged only themselves (far under an inode's size). Sizing by a 16 KiB window per file made the
-/// allowance 910,222 version slots, past a 7.5 GB runner's whole slab (828,504): the volume reserved every
-/// slot, and its landing could not retain one version for its snapshot (`NoSpace`, 2026-10-01).
-const SIZED_VOLUME_BYTES: u64 = (MOST_FILES * 2 * size_of::<slates_vfs::inode::Inode>()) as u64;
+/// once more by a landing that must be made again) given [`QUOTA_PER_FILE`]. A volume's inode allowance is its
+/// quota's share of the shard's slab (§4.2, A-109, `verbs::inode_allowance`), so this takes a share of the slab, never
+/// all of it. Before A-109 the allowance was quota over `size_of::<Inode>()`, and this sizing reserved a 7.5 GB
+/// runner's whole slab (910,222 slots against 828,504), so the landing could not retain one version for its
+/// snapshot (`NoSpace`, 2026-10-01).
+const SIZED_VOLUME_BYTES: u64 = (MOST_FILES * 2 * QUOTA_PER_FILE) as u64;
 
 /// A volume for a sized landing: grown as its files arrive, up to what the most files need (a bounded volume
 /// would reserve the whole bound at creation).

@@ -6,8 +6,9 @@
 > fan-out — one inode, many names — is bounded where the byte quota and inode allowance are not; the
 > server derives it as `quota / size_of::<Child>()`. Fixtures leave it unbounded, so the oracle is
 > untouched. The volume enforces a per-volume inode allowance with correct live-count accounting; the
-> server derives the allowance from the volume's quota (`min(quota / size_of::<Inode>,
-> store.max_inodes)`) rather than the tight fair-share first tried, and the vfs test fixtures leave
+> server derives the allowance from the volume's quota (`min(quota / max(reserve_per_shard / slab,
+> size_of::<Inode>), slab)`, A-109 2026-10-06; it was `quota / size_of::<Inode>`, which let one volume of a
+> quarter of a shard's bytes take its whole slab) rather than the tight fair-share first tried, and the vfs test fixtures leave
 > it unbounded so the determinism oracle is untouched. §4.2 and GAP-A9-1 are the authority; BUG-1
 > (locked store) and BUG-2 (usable capacity) are also fixed. Xattr is not applicable (unimplemented)
 > and open handles are bounded at the bridge's `Slab` (BUG-4), so the applicable per-volume caps are

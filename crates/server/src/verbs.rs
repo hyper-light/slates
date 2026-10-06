@@ -3012,11 +3012,11 @@ fn journal_bytes_for(state: &ShardState, quota: &Quota) -> usize {
   .get()
 }
 
-/// A volume's inode allowance (§4.2 resource vector): the inodes whose metadata fits in the volume's
-/// reserved byte footprint (its quota over an inode's size), clamped to the shard's inode slab. It
-/// scales with the policy the caller asked for — a larger quota admits more inodes — and no single
-/// volume exhausts the slab. A fixed disjoint per-volume reservation is the fuller §4.2 refinement
-/// (docs/wip/resource-vector.md).
+/// A volume's inode allowance (§4.2 resource vector): its quota's share of the shard's version slab, the quota over
+/// the bytes per inode the shard's layout gives (its arena over its slab, never less than an inode's size), clamped to
+/// the slab. It scales with the policy the caller asked for, and bounded volumes whose quotas fill the arena are
+/// allowed the slab between them, so the bytes, not the slots, bound how many a shard holds. A fixed disjoint
+/// per-volume reservation is the fuller §4.2 refinement (docs/wip/resource-vector.md).
 fn inode_allowance(state: &ShardState, size: SizeClass) -> u64 {
   let limit = match size {
     SizeClass::Bounded { limit } => limit,
@@ -3034,10 +3034,19 @@ fn inode_allowance(state: &ShardState, size: SizeClass) -> u64 {
     .capacity()
     .saturating_sub(state.store.versions.headroom())
     .max(1);
+  // The bytes of quota one inode is allowed per (ext4's bytes-per-inode ratio, `mke2fs -i`): the shard's arena over
+  // the slab it can back, so the allowances of bounded volumes that fill the arena fill the slab and no more. One
+  // inode per `size_of::<Inode>()` let a quarter of a shard's bytes take its whole slab, and the next volume was
+  // refused with the rest of the bytes uncommitted (2026-10-06: 256 MiB took 1,140,937 of 1,140,938 slots).
+  let per_inode = state
+    .config
+    .reserve_per_shard
+    .div_ceil(cap)
+    .max(inode_bytes);
   derived!(
-    limit.checked_div(inode_bytes).unwrap_or(0).min(cap).max(1),
-    "min(quota / size_of::<Inode>, store.max_inodes − copy-up headroom), at least one",
-    ["quota", "store.max_inodes", "vfs.copy_up_version_headroom"]
+    limit.checked_div(per_inode).unwrap_or(0).min(cap).max(1),
+    "min(quota / max(reserve_per_shard / slab, size_of::<Inode>), store.max_inodes − copy-up headroom), at least one",
+    ["quota", "reserve_per_shard", "store.max_inodes", "vfs.copy_up_version_headroom"]
   )
   .get()
 }
@@ -8600,6 +8609,37 @@ mod tests {
       },
       |config| config.reserve_per_shard = RELIEF_RESERVE,
     );
+  }
+
+  /// §4.2 (the resource vector's inode dimension; GAPS 2026-10-06). Do: on one shard, create four bounded volumes
+  /// whose quotas together take the bytes the shard can admit. Expect: all four are admitted, so the inode allowances
+  /// of volumes that fill the arena fit the version slab. Before, each volume asked quota ÷ `size_of::<Inode>()`
+  /// slots, the first took the whole slab, and the second was refused `BudgetExceeded` with the bytes uncommitted.
+  #[test]
+  fn bounded_volumes_that_fill_a_shards_bytes_fit_its_version_slab() {
+    crate::daemon::audit_on_shard(|state| {
+      let principal = Principal::Uid { uid: 1234 };
+      let page = u64::try_from(state.store.content.granule()).unwrap();
+      let share = state.store.admittable() / 4 / page * page;
+      for n in 0..4 {
+        let reply = super::dispatch(
+          state,
+          1,
+          &principal,
+          super::RequestBody::Create {
+            name: format!("share-{n}"),
+            size: super::SizeClass::Bounded { limit: share },
+            names: super::NamePolicy::Exact,
+            require_locked: false,
+            base: None,
+          },
+        );
+        assert!(
+          matches!(reply, super::ReplyBody::Created { .. }),
+          "volume {n} of four, {share} bytes each: {reply:?}"
+        );
+      }
+    });
   }
 
   /// §4.8 (the recovery image) and §4.4 (destroy): a volume being destroyed has nothing to recover —

@@ -9979,3 +9979,30 @@ Status: built 2026-10-06 for the Linux FUSE mount. virtio-fs and NFSv4.2 `ALLOCA
     shard for 37.6 ms.
   - With the quota full after allocating, a 64 MiB overwrite of the allocated file succeeds and a 1 MiB write
     elsewhere gets 0 bytes.
+
+### A-109 — The inode allowance is the quota's share of the shard's slab (2026-10-06)
+Applied in the same change to:
+- `crates/server/src/verbs.rs` (`inode_allowance`; the test `bounded_volumes_that_fill_a_shards_bytes_fit_its_version_slab`);
+- the fixtures that leaned on the old ratio:
+  - `crates/server/tests/daemon.rs`: the capped-slab scenarios now fill the slab with a dynamic volume over an arena
+    sized with the slab;
+  - `crates/server/tests/common/landing.rs`: the scratch volume is 4 MiB, so 600 files fit;
+  - `crates/server/tests/landing_fairness.rs`: a sized landing's volume is 16 KiB of quota per file again;
+- `docs/wip/resource-vector.md` and GAPS.
+
+Status: built 2026-10-06.
+- What: a volume's inode allowance (§4.2 "Resource dimensions") is its quota divided by the bytes per inode the shard's
+  layout gives: the shard's arena (`reserve_per_shard`) over the version slots it can back, never less than one
+  inode's size, and capped at the slab as before. This is ext4's bytes-per-inode rule (`mke2fs -i`), with the ratio
+  derived from the prepared arena layout, as §4.2 asks, instead of chosen.
+- Why: the allowance was quota ÷ `size_of::<Inode>()`. The slab is sized from the metadata class, not from the content
+  bytes, so the first bounded volume of about a tenth of a shard's bytes asked for every slot.
+  - Measured in Docker, one shard, 2 GiB byte capacity: a 256 MiB volume committed 1,140,937 of 1,140,938 slots.
+  - A 16 MiB second volume was then refused `BudgetExceeded`.
+  - The sacred claims held (nothing was promised twice), but the slots, not the memory, bounded how many volumes a
+    shard could hold.
+- What it costs: a volume full of files smaller than the ratio (about 2.4 KB on this build) reaches its inode
+  allowance before its bytes, and a create there is `ENOSPC`, as §4.2 already allows. That density is still about 7×
+  ext4's default of one inode per 16 KiB.
+- Test: four volumes of a quarter of the shard's admittable bytes each are all admitted. Before the change, the
+  second was refused `BudgetExceeded { available: 0 }` (red first).

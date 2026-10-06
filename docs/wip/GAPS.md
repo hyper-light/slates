@@ -2161,14 +2161,16 @@ a real `pip install`, and a `kill -9` of the daemon mid-write went through the m
   - virtio-fs, whose synchronous dispatch answers `EOPNOTSUPP` until its device can step a request;
   - NFSv4.2 `ALLOCATE`, which needs the same stepping inside a compound;
   - punch, zero-range, collapse and insert, which are `EOPNOTSUPP`.
-- **Open, found 2026-10-06: one bounded volume can take a shard's whole version slab.** `inode_allowance`
-  (`crates/server/src/verbs.rs`) reserves quota ÷ `size_of::<Inode>()` version slots, capped at the slab.
+- **Closed by A-109 (2026-10-06): one bounded volume could take a shard's whole version slab.** `inode_allowance`
+  (`crates/server/src/verbs.rs`) reserved quota ÷ `size_of::<Inode>()` version slots, capped at the slab.
   - On a `--quick --shards 1` daemon in Docker (2 GiB byte capacity, 1,140,938 slots), a 256 MiB bounded volume
     committed 1,140,937 slots.
   - A 16 MiB second volume was then refused `BudgetExceeded { available: 0 }`, with 1.75 GiB of bytes uncommitted.
   - The bytes and the slots are sized independently, so the inode allowance, not memory, bounds how many bounded
     volumes a shard holds.
-  - This needs a decision on the allowance's derivation (the §4.2 resource vector); it is recorded, not changed.
+  - Fixed: the allowance is the quota over the shard's arena-to-slab ratio (about 2.4 KB per inode on this build,
+    ext4's bytes-per-inode rule). Test `bounded_volumes_that_fill_a_shards_bytes_fit_its_version_slab`: four
+    volumes of a quarter of the shard's admittable bytes each; before, the second was refused.
 - **`O_TMPFILE` is `EOPNOTSUPP`** (FUSE `TMPFILE`, Linux 6.11+, is unserved).
 
 **Closed by A-107: a symlink out of the volume was followed for any caller.**
