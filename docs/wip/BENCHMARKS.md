@@ -2551,3 +2551,28 @@ step, spin, park and send), and the probe's own overhead reversed the result: al
   the 10–13 µs in which a shard thread that makes no system call logs nothing (the macOS timeline above), which is
   the OS scheduling two spinning threads. The kick's system call is what keeps the peer promptly scheduled. That
   mechanism is inferred, not measured, and no change to the spin derivation is justified by it.
+
+## Per-operation latency on a Linux FUSE mount, and a close that no longer publishes (2026-10-06)
+
+**Setup.** Linux 6.12 under Docker Desktop (18 vCPUs), load 7–9, the release binary, 2 shards. Each operation was run
+5,000 times by one Python process with `perf_counter_ns` (the script is `p99-inner.sh`), against the container's
+own filesystem and tmpfs.
+
+| | slates FUSE p50 / p99 / p999 | container fs p50 / p99 | tmpfs p50 / p99 |
+|---|---|---|---|
+| create + write 4 KiB + close | 105 / 171 / 794 µs → **79 / 177 / 783 µs** | 7.3 / 23 µs | 1.8 / 4.0 µs |
+| stat | 13 / 23 / 51 µs | 0.8 / 1.1 µs | 0.5 / 0.8 µs |
+| open + read + close | 15 / 25 / 54 µs | 1.7 / 2.6 µs | 1.3 / 1.8 µs |
+| unlink | 44 / 64 / 255 µs | 3.2 / 4.8 µs | 0.8 / 1.6 µs |
+
+- **The kernel round trip sets the floor:** a FUSE request costs about 13 µs, so reads and stats sit at it.
+- **Namespace changes pay a publication on top** (§4.8 barrier: a create, an unlink).
+- **The close's `flush` published too, before.** It now publishes nothing while the write log holds every write since
+  the last publication (A-63). Create + write + close went 105 → 79 µs at p50 (−25%); p99 unchanged within noise.
+- **A real install doesn't feel it:** pip, six rounds, 1.93–2.01 s against 1.95–2.02 s before. The flush is a small
+  share of the whole.
+- **Proven safe:** `a_closed_files_writes_survive_a_kill_from_the_write_log_alone` writes and closes a file, kills the
+  daemon, and reads it back. With logging disabled the file comes back empty, the mutation check.
+- **The next lever is the create's own publication.** An intent log for namespace changes, as ZFS's ZIL does, would
+  let a create reply after one append. It is a design change to §4.8's barrier, recorded in GAPS, not built.
+

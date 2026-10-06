@@ -659,6 +659,11 @@ pub struct Dispatched {
 }
 
 impl Dispatched {
+  /// The request's opcode, when slates serves it.
+  pub fn opcode(&self) -> Option<Opcode> {
+    self.opcode
+  }
+
   /// The node the request named (the kernel's node id; the root is 1).
   pub fn nodeid(&self) -> u64 {
     self.nodeid

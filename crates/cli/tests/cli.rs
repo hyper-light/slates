@@ -4206,6 +4206,42 @@ fn a_fuse_mount_survives_its_daemons_kill_with_its_open_files_usable() {
   held.unmount();
 }
 
+/// A-63 (a write survives its daemon from the log alone). Do: through a held FUSE mount, write a file and close it
+/// (the close's `flush` publishes nothing when the write log holds every write: `fuse.flush_logged`); `SIGKILL` the
+/// daemon and wait for the anchor's restarted one; read the file. Expect: the fast path was taken (the counter moved),
+/// and the file reads back whole after the kill, replayed from the log by the successor. Written 2026-10-06 with the
+/// change that let a logged `flush` skip its publication (two publications per created file before).
+#[cfg(target_os = "linux")]
+#[test]
+fn a_closed_files_writes_survive_a_kill_from_the_write_log_alone() {
+  let Some(held) = HeldMount::start("closed") else {
+    return;
+  };
+  let file = format!("{}/closed.txt", held.mount_point.path);
+  let body = "logged-not-published-".repeat(100);
+  assert!(
+    write_with_the_shell(&file, &body).status.success(),
+    "write and close through the mount"
+  );
+  let (code, status, err) = run(&held.instance, &["status", "--json"]);
+  assert_eq!(code, 0, "{err}");
+  assert!(
+    status.contains("fuse.flush_logged"),
+    "the close's flush took the logged path (no publication)"
+  );
+  let killed = kill_the_daemon(&held.instance);
+  let restarted = await_daemon(&held.instance, Some(killed), &[]);
+  assert_ne!(restarted, killed, "a new daemon serves the mount");
+  let read = Command::new("cat").arg(&file).output().unwrap();
+  assert_eq!(
+    String::from_utf8_lossy(&read.stdout),
+    body,
+    "the closed file's bytes survived the kill, replayed from the write log"
+  );
+  held.assert_still_mounted_and_taken_over();
+  held.unmount();
+}
+
 /// A FUSE mount of a fresh volume behind an anchor, for the takeover tests (A-61); `None` (a loud skip) where the
 /// Linux mount does not run or the kernel cannot resend.
 #[cfg(target_os = "linux")]

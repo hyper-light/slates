@@ -19,7 +19,9 @@
 //! under the mount's registry attachment so a barrier over the volume sees it in flight. A request that
 //! changed what survives a restart (`Dispatched::needs_barrier`: namespace and attribute changes, `fsync`,
 //! and the `flush` every close sends) publishes the shard's recovery image before its reply (§4.8, D-18), as
-//! NFS's do; a refused or uncaptured publication answers `EIO`, never a promise of survival. The task yields
+//! NFS's do; a refused or uncaptured publication answers `EIO`, never a promise of survival. A `flush` is the
+//! exception while the write log holds every write since the last publication (A-63): those writes are replayed by a
+//! successor already, so the close publishes nothing (counted `fuse.flush_logged`; 2026-10-06). The task yields
 //! between requests so one busy mount never holds its shard. While the owner may not serve the volume's latest
 //! state — its configuration group not ready or its lease not holding, the NFS live tree's gate (§4.8;
 //! AUD-29-83) — no request is read: the kernel's requests wait, asked again each heartbeat.
@@ -70,6 +72,9 @@ const MOUNT_REFUSED: &str = "fuse.mount_refused";
 const SERVE_FAILED: &str = "fuse.serve_failed";
 /// Format: see [`MOUNT_REFUSED`].
 const BARRIER_REFUSED: &str = "fuse.barrier_refused";
+/// Format: the counter of `flush`es answered without a publication because the write log held every write since the
+/// last one (A-63); the non-vacuity counter of that fast path.
+const FLUSH_LOGGED: &str = "fuse.flush_logged";
 /// Format: see [`MOUNT_REFUSED`].
 const UNMOUNT_REFUSED: &str = "fuse.unmount_refused";
 /// Format: see [`MOUNT_REFUSED`].
@@ -590,7 +595,18 @@ fn reply(
   mount: &mut FuseMount,
   dispatched: &Dispatched,
 ) -> Turned {
-  let refuse = if dispatched.needs_barrier() {
+  // A `close`'s `flush` owes a publication only for writes the write log could not take: every write it holds is
+  // replayed by a successor (A-63), so publishing again on close made each created file cost two publications (create
+  // and flush; 105 us p50 against 15 us for a read, measured 2026-10-06). `fsync` keeps its barrier: it asks for one.
+  let flush_logged = dispatched.opcode() == Some(slates_bridge_fuse::abi::Opcode::Flush)
+    && s
+      .write_log
+      .as_ref()
+      .is_some_and(crate::write_log::WriteLog::holds_every_write);
+  if flush_logged {
+    *s.refusals.entry(FLUSH_LOGGED).or_insert(0) += 1;
+  }
+  let refuse = if dispatched.needs_barrier() && !flush_logged {
     // The reply rides the publication with its effect (A-61), so a daemon that dies before writing it leaves its
     // successor the answer for the request the kernel resends, never a second application.
     s.pending_replies.insert(

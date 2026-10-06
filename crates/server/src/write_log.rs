@@ -75,6 +75,8 @@ pub(crate) struct WriteLog {
   capacity: usize,
   used: usize,
   stamp: u64,
+  /// Whether an acknowledged write has gone unlogged since the last clear: then only a publication makes it survive.
+  overflowed: bool,
 }
 
 fn word(object: &SparseObject, at: usize) -> Option<u64> {
@@ -99,8 +101,10 @@ impl WriteLog {
       capacity,
       used: 0,
       stamp: image_generation,
+      overflowed: false,
     };
     let recovered = log.read(object, image_generation);
+    log.overflowed = recovered.everything_lost;
     if recovered.records.is_empty() && !recovered.everything_lost {
       let _ = log.clear(object, image_generation);
     }
@@ -223,7 +227,14 @@ impl WriteLog {
   /// Records that an acknowledged write could not be logged, so the next daemon reports every file as having lost
   /// writes rather than replaying an incomplete log.
   pub(crate) fn overflow(&mut self, object: &mut SparseObject) -> Result<(), Unwritten> {
+    self.overflowed = true;
     self.store(object, AT_OVERFLOW, &1u64.to_le_bytes())
+  }
+
+  /// Whether every write acknowledged since the last publication is in the log, so a successor replays them all: then
+  /// a `close`'s `flush` owes no publication of its own (A-63).
+  pub(crate) fn holds_every_write(&self) -> bool {
+    !self.overflowed
   }
 
   /// Empties the log after a publication of generation `stamp` that captured every volume: every write before it is
@@ -236,6 +247,7 @@ impl WriteLog {
     let logged = self.used;
     self.used = 0;
     self.stamp = stamp;
+    self.overflowed = false;
     self.store(object, AT_USED, &0u64.to_le_bytes())?;
     self.store(object, AT_OVERFLOW, &0u64.to_le_bytes())?;
     self.store(object, AT_STAMP, &stamp.to_le_bytes())?;

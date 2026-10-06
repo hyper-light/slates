@@ -3925,3 +3925,13 @@ one in a deferred free that waited for a publication that never came
 whenever a free is still deferred, so the release scrubs it. Proven through a real FUSE mount; mutation-checked
 (64 copies left without the rule). An idle shard with nothing deferred publishes nothing (measured over 3 ticks).
 
+### 2026-10-06: a FUSE namespace change waits a whole publication (candidate, not built)
+
+A create or an unlink through FUSE costs 40–80 µs at p50 beyond the kernel's 13 µs round trip. Each publishes the
+shard's recovery image before its reply (§4.8 barrier). Since 2026-10-06 a close's `flush` no longer does, when the
+write log holds every write.
+
+The established lever is an intent log for namespace changes, like the write log for data and ZFS's ZIL: the change
+replies after one append, and a successor replays it. That changes §4.8's barrier contract and the A-61 reply-replay
+rule, so it needs its own design pass. BENCHMARKS, "Per-operation latency on a Linux FUSE mount", has the numbers.
+
