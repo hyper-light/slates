@@ -9773,3 +9773,25 @@ Status: built 2026-10-06 (conditions 3 and 4).
   the destroy verb's contract for every attachment kind; the fall-through, which is the escape, is closed without it.
   Kept open in GAPS as a decision for the destroy verb.
 
+### A-103 — A council member the failure detector holds dead is answered nothing (2026-10-06)
+Applied in the same change to: `crates/server/src/fleet.rs` (`serve_council`), the test
+`a_council_leader_the_failure_detector_holds_dead_is_replaced_and_retired` and the diagnostics of
+`an_isolated_owner_refuses_latest_state_reads_while_the_successor_advances_the_green` (`crates/server/tests/fleet.rs`),
+`docs/bugs/2026-10-06-a-leader-held-dead-kept-leading-and-was-never-retired.md`, GAPS.
+Status: built 2026-10-06 (conditions 10 and 11).
+- What: a node leaves unanswered every council request (append, snapshot, pre-vote, vote) from a peer its failure
+  detector has held dead for the whole confirmation window, the window the leader's retirement already waits out
+  (`stable_dead_council_members`), and counts it (`fleet.council.peer_held_dead`).
+- Why: only the leader proposes retirements, and a leader never proposes its own. A leader cut off on the probe plane
+  but still carried by the record plane kept both followers' lease with its heartbeats, so they never elected another,
+  the council never committed its retirement, and no takeover began. Reproduced 1 run in 9 and 1 in 28 by the
+  isolated-owner test (401 s, the successor a follower at term 1). With the fix, the followers stop renewing its lease,
+  it loses CheckQuorum, and one of them is elected and retires it.
+- Evidence: the failure detector as the authority on liveness, driving leader election, is the Omega detector of
+  Chandra and Toueg (1996). Raft's safety does not depend on whom a node answers, only its liveness, and pre-vote
+  plus the confirmation window keep one node's false suspicion from disturbing a leader the others still hear.
+- Measured: the deterministic test failed before the fix (402 s, neither survivor leading) and passes after (7.7,
+  87, 134 and 146 s). The isolated-owner test passes 10 of 10 (6.3–7.2 s), and the fleet suite 71 of 71.
+- Open (GAPS): convergence takes up to 146 s, because the isolated leader refutes its death through gossip on
+  another plane and the confirmation window restarts.
+

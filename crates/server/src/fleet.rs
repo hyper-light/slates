@@ -3930,6 +3930,10 @@ const PAIR_KEY_STREAM: u64 = 19;
 /// Format: the reply byte of an accepted pair key.
 const PAIR_ACCEPTED: u8 = 1;
 
+/// Format: the refusal name counting council requests left unanswered because their sender is held dead
+/// ([`serve_council`]).
+const COUNCIL_PEER_HELD_DEAD: &str = "fleet.council.peer_held_dead";
+
 /// Answers one configuration-council Raft message a peer shipped on [`CONFIG_STREAM`] (§4.8, D-14): the
 /// council serves a pre-vote, a vote request, or an append — applying whatever an append newly commits to
 /// the regional configuration and refreshing this node's leader contact — and returns the reply to ship
@@ -3937,6 +3941,18 @@ const PAIR_ACCEPTED: u8 = 1;
 /// synchronously inside `serve_once`, no await held across it.
 fn serve_council(state: &mut ShardState, peer: HostId, request: &[u8]) -> Vec<u8> {
   if !same_region(state, peer) {
+    return Vec::new();
+  }
+  // A peer this node's failure detector has held dead for the whole confirmation window (the window the leader's
+  // retirement waits out) is answered nothing: no append or snapshot renews its leadership here, and no vote elects
+  // it. The detector is the authority on liveness (an Omega detector driving leader election, Chandra and Toueg
+  // 1996); Raft's safety does not depend on whom a node answers, only its liveness does. Without this, a leader cut
+  // off on the probe plane but still heard on the record plane kept both followers' lease at its term; it never
+  // proposes its own retirement, so the council never retired it and no takeover began (2026-10-06,
+  // `a_council_leader_the_failure_detector_holds_dead_is_replaced_and_retired`). Unanswered, it loses CheckQuorum and
+  // steps down, and the followers' election timers run and elect one of them.
+  if stable_dead_council_members(state).contains(&peer) {
+    *state.refusals.entry(COUNCIL_PEER_HELD_DEAD).or_insert(0) += 1;
     return Vec::new();
   }
   match crate::consensus::decode_message(state, false, peer, request) {

@@ -9705,6 +9705,33 @@ fn an_isolated_owner_refuses_latest_state_reads_while_the_successor_advances_the
   let after = observe_taken_over_green(&daemons[0], green);
   // The successor serves the advanced green.
   let successor_view = observe_taken_over_green(&daemons[successor_index], green);
+  // Whether each survivor still counts A a member, and A's own view of them: a takeover never begins while A is a
+  // member, so a run whose successor never materialized says here whether the council retired A at all
+  // (reproduced 1 run in 9 locally, 2026-10-06: 401 s, both survivors advancing 4,000 periods, no takeover counted).
+  let a_still_member: Vec<_> = [successor_index, other_index]
+    .iter()
+    .map(|&index| {
+      daemons[index]
+        .fleet_members()
+        .map(|members| members.contains(&hosts[0]))
+    })
+    .collect();
+  let a_sees: Result<Vec<HostId>, ObserveError> = daemons[0].fleet_members();
+  // The council's committed membership and leadership on each survivor: a takeover begins from a retirement the
+  // council committed, which needs a leader among the survivors (the second reproduction showed both survivors had
+  // retired A by SWIM, and still no takeover).
+  let councils: Vec<_> = [successor_index, other_index]
+    .iter()
+    .map(|&index| {
+      (
+        daemons[index]
+          .council_members()
+          .map(|members| members.contains(&hosts[0])),
+        daemons[index].council_leads(),
+      )
+    })
+    .collect();
+  let successor_council = daemons[successor_index].council_debug();
   for daemon in daemons {
     daemon.stop();
   }
@@ -9724,7 +9751,10 @@ fn an_isolated_owner_refuses_latest_state_reads_while_the_successor_advances_the
   );
   assert!(
     materialized && advanced,
-    "the successor took over the green and advanced it to version 4 (materialized={materialized} advanced={advanced})"
+    "the successor took over the green and advanced it to version 4 (materialized={materialized} advanced={advanced}); \
+     A still a member to [successor, other]: {a_still_member:?}; A's members: {a_sees:?}; \
+     (A in the committed council membership, leads) on [successor, other]: {councils:?}; \
+     the successor's council: {successor_council:?}"
   );
   assert_isolated_owner_lease(&before, &after, &successor_view);
 }
@@ -9856,6 +9886,83 @@ fn an_isolated_owner_holds_its_guests_requests_rather_than_serve_them() {
     refusals.contains_key(slates_server::lease::LEASE_UNCONFIRMED)
       || refusals.contains_key(slates_server::lease::LEASE_SUPERSEDED),
     "the lease's refusals were counted: {refusals:?}"
+  );
+}
+
+/// §4.8 (D-14): a council leader the failure detector holds dead while the consensus plane still carries it is
+/// replaced, and its retirement commits. Do: form a three-node fleet; find the council's leader; isolate it on the
+/// probe plane both ways (it answers no probe and hears none), leaving the record plane, which carries the council's
+/// traffic, whole. Expect: the two others commit its retirement (it leaves the committed council membership on
+/// both) and one of them leads. Before 2026-10-06 they kept following it at the first term: only the leader proposes
+/// retirements, a leader never proposes its own, and its heartbeats over the record plane held both followers' lease
+/// (reproduced 1 run in 9 and 1 in 28 by the isolated-owner test whenever the owner led; 401 s, no takeover).
+#[test]
+fn a_council_leader_the_failure_detector_holds_dead_is_replaced_and_retired() {
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c"];
+  let n = names.len();
+  let nodes: Vec<(MachineProfile, HostId, Identity)> =
+    names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+    nodes.iter().map(|(_, _, id)| id.certificate()).collect();
+  let (_serve_lease, serve) = mesh_serve_ports(n);
+  let daemons = start_mesh(nodes, &hosts, &certs, &serve);
+  let hosts: Vec<HostId> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
+  assert_fleet_forms(&daemons, &hosts, &names);
+  let all: Vec<&Daemon> = daemons.iter().collect();
+  let mut leader = None;
+  let led = poll_until(&all, RETIREMENT_DEADLINE, || {
+    for (index, daemon) in daemons.iter().enumerate() {
+      if daemon.council_leads()? {
+        leader = Some(index);
+        return Ok(true);
+      }
+    }
+    Ok(false)
+  });
+  assert!(led, "the council elected a leader");
+  let leader = leader.unwrap_or(0);
+  let others: Vec<usize> = (0..n).filter(|index| *index != leader).collect();
+  daemons[leader]
+    .inject_probe_deafness(&others.iter().map(|index| hosts[*index]).collect::<Vec<_>>())
+    .expect("the leader hears no probe");
+  for &index in &others {
+    daemons[index]
+      .inject_probe_deafness(&[hosts[leader]])
+      .expect("the others stop answering the leader's probes");
+  }
+  let survivors: Vec<&Daemon> = others.iter().map(|index| &daemons[*index]).collect();
+  let retired = poll_until(&survivors, RETIREMENT_DEADLINE, || {
+    let mut all_retired = true;
+    for daemon in &survivors {
+      all_retired &= !daemon.council_members()?.contains(&hosts[leader]);
+    }
+    Ok(all_retired)
+  });
+  let leads: Vec<_> = survivors
+    .iter()
+    .map(|daemon| daemon.council_leads())
+    .collect();
+  let council = survivors[0].council_debug();
+  let refusals: Vec<_> = survivors
+    .iter()
+    .map(|daemon| daemon.fleet_refusals())
+    .collect();
+  for daemon in daemons {
+    daemon.stop();
+  }
+  assert!(
+    retired,
+    "the survivors committed the isolated leader's retirement; their leadership {leads:?}; a survivor's council: \
+     {council:?}; refusals {refusals:?}"
+  );
+  assert!(
+    leads.iter().any(|lead| matches!(lead, Ok(true))),
+    "a survivor leads the council: {leads:?}"
   );
 }
 

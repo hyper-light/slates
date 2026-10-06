@@ -3898,3 +3898,17 @@ drops the flags. A local Docker bind of a `nosuid` mount keeps them, so this is 
   must run it as 65534.
 - The probe's premise is verified locally in Docker: 0 without `no-new-privileges`, 65534 with it. The lane's own run
   is owed.
+
+### 2026-10-06: a council leader held dead is now replaced (A-103); open: how fast
+
+**Closed:** a leader cut off on the probe plane but carried by the record plane kept leading and was never retired
+(`docs/bugs/2026-10-06-a-leader-held-dead-kept-leading-and-was-never-retired.md`).
+
+**Open: convergence.** The deterministic test takes 7.7 to 146 s. Its trace shows one survivor ignoring the isolated
+leader from 6 s and the other from 38 s, the ignored requests a few a minute rather than one a period. That pattern
+fits the leader refuting its death through gossip on another plane (A-15's rejoin): each refutation restarts the
+survivors' confirmation window. The design question is whether a probe-plane-only partition should let refutation
+through.
+
+**Open: the root group.** `serve_root` has the same shape across regions, judged by region liveness, not the
+council's death watch.
