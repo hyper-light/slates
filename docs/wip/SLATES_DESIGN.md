@@ -9709,7 +9709,9 @@ Status: built 2026-10-05 (docs/bugs/2026-10-05-a-slow-shard-start-stopped-the-da
 - The heartbeat is the control loop's child task, so it ends with the loop: a refused boot returns, `daemon.alive`
   lapses and the anchor restarts the daemon. Before, the heartbeat was detached first and beat on, and the anchor kept
   a daemon that would never serve. (Keeping it joinable until the boot was accepted was tried first and hung
-  `Daemon::stop` whenever a shutdown cancelled the loop before then: a joinable perpetual task holds its shard open.)
+  `Daemon::stop` whenever a shutdown cancelled the loop before then: a joinable perpetual task holds its shard open.
+  Since 2026-10-06 a shutdown releases finished joinable tasks, so that hang is gone; detaching remains right for a
+  task nobody joins, since its slot is otherwise held while the shard runs.)
 - Tests by use, with a fault the tests inject into one shard's start (`DaemonConfig::with_boot_fault`: `Busy` spins,
   `Stuck` sleeps; `None` in every deployment): a shard busy for two windows, and the daemon serves a create; a shard
   asleep for two windows, and the heartbeat stops within the client's start wait. Both failed before the change.

@@ -257,3 +257,33 @@ fn a_shutdown_lands_against_a_full_control_channel() {
     .recv_timeout(WAIT)
     .expect("the shutdown completed although its message first met a full control channel");
 }
+
+/// A shutdown completes beside joinable tasks nobody joined. Do: on a shard, spawn a joinable task that ends at once
+/// and one that never ends, join or detach neither, and let their spawner end too; then shut the runtime down.
+/// Expect: the shutdown returns (the first is released as the shutdown begins, the second as its cancellation
+/// finishes it). Before 2026-10-06 the shard left its loop only when every arena slot was free, and a finished joinable
+/// task keeps its slot for a joiner that never comes, so the join never returned (found by `hyper-rt`'s port of this
+/// runtime the same day; CLAUDE.md's "a perpetual task must be detached" was the same rule met from the other side).
+#[test]
+fn a_shutdown_completes_beside_a_finished_task_nobody_joined() {
+  let rt = Runtime::start(&config(ARENA)).unwrap();
+  let shard = rt.shard_ids()[0];
+  let (spawned, finished) = channel::<()>();
+  rt.spawn_on(shard, async move {
+    // One finished before the shutdown, one still pending until the shutdown cancels it.
+    slates_rt::futures::spawn(async {}).unwrap();
+    slates_rt::futures::spawn(std::future::pending::<()>()).unwrap();
+    let _ = spawned.send(());
+  })
+  .unwrap();
+  finished.recv_timeout(WAIT).expect("the spawner ran");
+  let (done_tx, done_rx) = channel();
+  std::thread::spawn(move || {
+    let _ = done_tx.send(rt.shutdown().is_ok());
+  });
+  assert_eq!(
+    done_rx.recv_timeout(WAIT).ok(),
+    Some(true),
+    "the shutdown returned beside a finished, never-joined task"
+  );
+}

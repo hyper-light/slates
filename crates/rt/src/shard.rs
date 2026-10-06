@@ -1539,6 +1539,7 @@ impl ShardContext {
       Control::Shutdown => {
         inner.shutting_down = true;
         cancel_all(&mut inner.arena, &self.local);
+        release_finished(&mut inner.arena);
       }
     }
   }
@@ -1773,8 +1774,35 @@ fn complete(inner: &mut ShardInner, slot: u32) {
         }
       }
     }
-    if !joinable {
+    // A shard shutting down releases a finished joinable task too: every task, any joiner among them, has been
+    // cancelled, so no join is coming, and the slot would hold the shard's exit (it leaves only an empty arena).
+    // A joiner already waiting was woken above and reads the task as gone.
+    if !joinable || inner.shutting_down {
+      if joinable && let Some(p) = parent {
+        unlink_child(&mut inner.arena, p, slot);
+      }
       let _ = inner.arena.remove(handle);
+    }
+  }
+}
+
+/// Releases every task that has already finished, joinable or not: called as a shutdown begins, when no join can come
+/// (every task has been cancelled). Before 2026-10-06 a finished joinable task nobody joined kept its slot, and the
+/// shard, which leaves its loop only with an empty arena, never shut down (`tests/admission.rs`
+/// `a_shutdown_completes_beside_a_finished_task_nobody_joined`). Admissions are refused from now on, so no slot is
+/// reused under a stale parent link.
+fn release_finished(arena: &mut Slab<TaskSlot>) {
+  let finished: Vec<(u32, Option<u32>)> = arena
+    .iter()
+    .filter(|(_, task)| task.is_done())
+    .map(|(handle, task)| (handle.index(), task.parent))
+    .collect();
+  for (slot, parent) in finished {
+    if let Some(p) = parent {
+      unlink_child(arena, p, slot);
+    }
+    if let Some(handle) = handle_at(arena, slot) {
+      let _ = arena.remove(handle);
     }
   }
 }
