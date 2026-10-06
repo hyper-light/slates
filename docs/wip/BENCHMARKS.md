@@ -2467,3 +2467,39 @@ slates.
 - A new coherence phase proves a name created in the root through another attachment is seen by a mount that had
   cached it absent. It found the root-invalidation defect
   (`docs/bugs/2026-10-06-fuse-invalidations-of-the-root-named-an-inode-the-kernel-does-not-know.md`).
+
+## Measured and rejected: kicking only a parked shard on the pair rings (2026-10-06)
+
+**The candidate.** `ShardContext::send_to` (`crates/rt/src/shard.rs`) kicks its target after every pair-ring push
+(an eventfd write, or a kevent), whatever the target is doing. The foreign path kicks only a parked target
+(`Parking::kick_if_parked`). The candidate gave the pair path the same rule, under the same fence and the target's
+park-time re-check. It is correct:
+- the loom model of the parking protocol passes (3 of 3);
+- the runtime's Miri suites pass;
+- a use-level test saw 200 of 200 wakes to a busy shard arrive with every kick saved.
+
+**The measurement.** Command: `cargo run --release -p slates-rt --example rt_bench`, alternating HEAD and the
+candidate, three rounds each. Cross-shard wake round trip, median [bootstrap interval]:
+
+| | HEAD (always kick) | Candidate (kick a parked shard) |
+|---|---|---|
+| macOS 26.4, M5 Max, load 45–55, both shards parking | 3,583–3,834 ns | 3,625–4,000 ns |
+| macOS, both shards spinning | 4,750–5,250 ns | 12,292–13,292 ns (p99 26–40 µs) |
+| Linux 6.12 (Docker Desktop, 18 vCPUs), both shards parking | 1,583–1,584 ns | 1,375–1,458 ns |
+| Linux, both shards spinning | 1,958–2,000 ns | 2,291–2,416 ns |
+
+Spinning after activity is the daemon's mode under load, and there the candidate is 20% slower on Linux and 2.5×
+slower on macOS. **Rejected.**
+
+**What the timeline showed.** On macOS, a temporary per-shard event log (step, spin, park, send) found:
+- No lost wakes: the spin never hit, and every park either found its message waiting or was kicked.
+- 1,973 of about 2,000 kicks were skipped: the target had not yet announced a park when its wake arrived.
+- The sending shard is slower to reach its next event without its own kick: from the send to its next event, p50
+  3 → 5 µs and p90 5 → 13 µs, with no event logged in the gap.
+
+The mechanism is not yet identified. It sits in the OS's scheduling of the shard threads, not in the runtime's
+protocol: nothing in the step after a poll depends on the kick. The macOS clock reads in 1 µs steps there; a Linux
+timeline at nanosecond resolution is the next measurement.
+
+**Consequence beyond slates.** `hyper-rt`'s design (§3.2) routes every cross-thread wake through kick-only-if-parked,
+so this measurement is owed to its §12 rows: told to the focal session the same day.
