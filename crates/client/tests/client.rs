@@ -953,3 +953,86 @@ fn a_restarted_daemon_adopts_its_anchors_sealing_root_and_a_fresh_anchor_mints_a
     "another anchor's life, another root"
   );
 }
+
+/// Shape: how long the successor's held shard spends starting: far past [`SHORT_REPLY_NS`], well inside the
+/// reconnect budget.
+const LONG_RECOVERY_NS: u64 = 300_000_000;
+/// Shape: a reply deadline below a restarted daemon's boot, standing for a recovery longer than the anchor's liveness
+/// budget.
+const SHORT_REPLY_NS: u64 = 1_000_000;
+
+/// One crossing of a restart: a volume made, the daemon stopped, a successor whose shard `partition` takes
+/// [`LONG_RECOVERY_NS`] to start (as a long recovery does), and a status asked meanwhile by a client whose reply
+/// deadline is [`SHORT_REPLY_NS`]; the status, the client's reconnect count, and how long the call took.
+fn status_across_a_slow_restart(
+  partition: u16,
+) -> (
+  Result<slates_ipc::protocol::StatusReport, ClientError>,
+  u64,
+  Duration,
+) {
+  let profile = profile();
+  let instance = format!("cl-first-answer-{partition}-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
+  let segment = played_anchor(&profile, &config, &format!("cl-first-answer-{partition}"));
+  let first = start_over(&profile, &config, &segment);
+  first
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  // The volume is made with the product's deadlines; the client under test, connected before the restart, makes
+  // only the call that crosses it.
+  let volume = connect(&instance).create(&scratch("first-answer")).unwrap();
+  let short = Deadlines {
+    reply_ns: SHORT_REPLY_NS,
+    ..deadlines()
+  };
+  let mut client = Client::connect(&instance, short).unwrap();
+  first.stop();
+  // The client asks from another thread while this one starts the successor (the anchor segment stays on this
+  // thread, as the anchor process's does).
+  let asking = std::thread::spawn(move || {
+    let began = Instant::now();
+    let status = client.status(volume);
+    (status, client.reconnects(), began.elapsed())
+  });
+  let slow = config
+    .clone()
+    .with_boot_fault(slates_server::config::BootFault {
+      partition,
+      kind: slates_server::config::BootFaultKind::Busy,
+      for_ns: LONG_RECOVERY_NS,
+    });
+  let second = start_over(&profile, &slow, &segment);
+  let crossed = asking.join().unwrap();
+  second.stop();
+  crossed
+}
+
+/// §4.7 (`Deadlines::derive`: the reconnect budget is "the recovery budget the restart is bounded by, plus one reply
+/// deadline for the restarted daemon's first answer"). Do: for each shard in turn, restart the daemon with that
+/// shard's start held busy [`LONG_RECOVERY_NS`] while a client whose reply deadline is shorter asks for a volume's
+/// status. Expect: the status answers each time, and the call crossed the restart. The successor opens its rendezvous
+/// while its shards still start (`Daemon::start` spawns their starts and opens the listener behind them), so this pins
+/// that a client's reconnect is not complete until a slow shard has started: a recovering daemon is waited for under
+/// the reconnect budget, never judged by one reply deadline. Written 2026-10-06 against CI's TSan lane
+/// (`Stalled { after_ns: 1000000000 }` beside a shard that took 1.79 s to start, `crates/server/tests/recovery.rs`);
+/// it passed on the code as it was, so that stall is not this path (recorded in GAPS).
+#[test]
+fn a_restarted_daemons_first_answer_is_awaited_for_the_reconnect_budget() {
+  for partition in 0..TEST_SHARDS {
+    let (status, reconnects, took) = status_across_a_slow_restart(partition);
+    assert!(
+      status.is_ok(),
+      "shard {partition} held: the restarted daemon's first answer was awaited, not called stalled: {status:?}"
+    );
+    assert!(
+      reconnects >= 1,
+      "shard {partition} held: the call crossed the restart"
+    );
+    // Non-vacuity: the call waited out the held start, so the slow path is the one exercised.
+    assert!(
+      took >= Duration::from_nanos(LONG_RECOVERY_NS),
+      "shard {partition} held: the call spanned the slow start ({took:?})"
+    );
+  }
+}

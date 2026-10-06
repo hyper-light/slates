@@ -3834,3 +3834,21 @@ recorded.
   two kernel handoffs on a 3× oversubscribed host.
 - The `GETATTR` after each write or read on a writable mount, and Python's `isatty()` ioctls, are the kernel's
   (source-verified). The next lever is batching (FUSE over io_uring, Linux 6.14+ from memory, to verify), not a round trip slates adds.
+
+### 2026-10-06: a read stalled across a restart under TSan (observed once, not reproduced)
+
+**What CI saw.** On TSan's lane (run 37488545812), `a_volume_past_the_reserves_power_of_two_part_fills_and_survives_a_restart`
+(`crates/server/tests/recovery.rs:1960`) failed `Stalled { after_ns: 1000000000 }` on its first read after a restart.
+- **The restart itself worked:** the successor's shard 3 recovered the volume, but its shard 0 took 1.79 s to start
+  (8.3 ms in the same test's first daemon), with several heavy recovery tests running in parallel on the 4-vCPU
+  runner.
+- **The client's reply deadline is the anchor's liveness budget, 1 s, by derivation** (`Deadlines::derive`).
+
+**Ruled out:** a client that judges a recovering daemon by one reply deadline. The successor does open its rendezvous
+while its shards still start, but `a_restarted_daemons_first_answer_is_awaited_for_the_reconnect_budget`
+(`crates/client/tests/client.rs`) holds each shard's start busy 300 ms against a 1 ms reply deadline. The call
+answers each time, and its duration proves it waited out the held start: the reconnect is not complete until the slow
+shard has started.
+
+**Open:** what the client waited on for 1 s with the shard live but starved. The next step is the client's view at
+that moment (connected or reconnecting, which shard answered), not a longer deadline.
