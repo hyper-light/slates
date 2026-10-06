@@ -85,7 +85,7 @@ fn filled(sealed: bool) -> Result<(ChunkStore, Vec<Extent>), Box<dyn std::error:
   let mut extents = Vec::new();
   for index in 0..CONTENT / chunk {
     let off = u64::try_from(index.checked_mul(chunk).ok_or(VfsError::Invalid)?)?;
-    let mut open = store.open(off, chunk, Epoch(0))?;
+    let mut open = store.open(off, chunk, Epoch(0), false)?;
     store.write_open(&mut open, 0, &plain)?;
     if let Some(extent) = store.seal(open, sealed.then_some(0))? {
       extents.push(extent);

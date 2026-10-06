@@ -349,7 +349,12 @@ impl ChunkStore {
     let mut plain = Vec::new();
     plain.try_reserve_exact(len).ok()?;
     plain.extend_from_slice(self.arena.bytes(block)?.get(..len)?);
-    let copy = self.arena.alloc(block.len()).ok()?;
+    // The copy replaces the block in its volume: locked if the block was.
+    let copy = if self.arena.is_locked(block) {
+      self.arena.alloc_locked(block.len()).ok()?
+    } else {
+      self.arena.alloc(block.len()).ok()?
+    };
     match self
       .arena
       .bytes_mut(copy)
@@ -553,11 +558,22 @@ impl ChunkStore {
     &mut self.arena
   }
 
+  /// Locks `block` in RAM (§4.2 D-12): a recovered strict volume's content, claimed from its image, locked again in
+  /// the new process. Idempotent; the OS's refusal is typed.
+  pub fn lock_block(&mut self, block: Block) -> Result<(), VfsError> {
+    self.arena.lock_extent(block).map_err(VfsError::from)
+  }
+
   /// Allocates a block of at least `len` bytes. An arena that is out of room while freed blocks wait for a
   /// publication (A-64: the committed recovery image may name them) refuses [`VfsError::PublishNeeded`], not a
   /// memory refusal: the room exists, and the shard's next publication releases it.
-  fn alloc(&mut self, len: usize) -> Result<Block, VfsError> {
-    match self.arena.alloc(len) {
+  fn alloc(&mut self, len: usize, locked: bool) -> Result<Block, VfsError> {
+    let taken = if locked {
+      self.arena.alloc_locked(len)
+    } else {
+      self.arena.alloc(len)
+    };
+    match taken {
       Ok(block) => Ok(block),
       Err(slates_mem::MemError::ArenaExhausted { .. }) if self.arena.deferred_bytes() > 0 => {
         Err(VfsError::PublishNeeded)
@@ -567,10 +583,16 @@ impl ChunkStore {
   }
 
   /// Opens a new extent at `off` with room for at least `want` bytes (page-multiple, at most a
-  /// chunk).
-  pub fn open(&mut self, off: u64, want: usize, born: Epoch) -> Result<OpenExtent, VfsError> {
+  /// chunk), its block locked in RAM when `locked` (a strict volume's content, §4.2 D-12).
+  pub fn open(
+    &mut self,
+    off: u64,
+    want: usize,
+    born: Epoch,
+    locked: bool,
+  ) -> Result<OpenExtent, VfsError> {
     let want = want.clamp(1, self.chunk_bytes);
-    let block = self.alloc(want.next_multiple_of(self.granule))?;
+    let block = self.alloc(want.next_multiple_of(self.granule), locked)?;
     Ok(OpenExtent {
       off,
       len: 0,
@@ -588,7 +610,9 @@ impl ChunkStore {
     if need > self.chunk_bytes {
       return Err(VfsError::FileTooLarge);
     }
-    let block = self.alloc(need.next_multiple_of(self.granule))?;
+    // The grown block holds the same extent: locked if the block it replaces was.
+    let locked = self.arena.is_locked(open.block);
+    let block = self.alloc(need.next_multiple_of(self.granule), locked)?;
     let used = usize::try_from(open.len).unwrap_or(0);
     let mut carry = vec![0u8; used];
     if let Some(src) = self.arena.bytes(open.block) {
@@ -660,7 +684,8 @@ impl ChunkStore {
     }
     // A smaller block is an economy, never a requirement: when the arena cannot give it now, the extent keeps its
     // block, whose length its charge follows (`volume::content_by_epoch`).
-    let Ok(block) = self.alloc(want) else {
+    let locked = self.arena.is_locked(open.block);
+    let Ok(block) = self.alloc(want, locked) else {
       return Ok(());
     };
     let mut carry = vec![0u8; keep];
@@ -754,11 +779,16 @@ impl ChunkStore {
   /// Copies a sealed extent's bytes into a new open extent (copy-on-write), zero-filling
   /// beyond the extent's length up to the chunk's capacity is not needed: the open extent's
   /// length is the extent's.
-  pub fn reopen(&mut self, extent: &Extent, born: Epoch) -> Result<OpenExtent, VfsError> {
+  pub fn reopen(
+    &mut self,
+    extent: &Extent,
+    born: Epoch,
+    locked: bool,
+  ) -> Result<OpenExtent, VfsError> {
     let len = usize::try_from(extent.len).unwrap_or(usize::MAX);
     let mut bytes = vec![0u8; len];
     self.read_extent_into(extent, extent.off, &mut bytes)?;
-    let mut open = self.open(extent.off, len, born)?;
+    let mut open = self.open(extent.off, len, born, locked)?;
     if let Err(refusal) = self.write_open(&mut open, 0, &bytes) {
       // Refused whole: the block taken for the copy goes back.
       self.arena.free(open.block)?;
@@ -907,7 +937,7 @@ mod tests {
   #[test]
   fn an_open_extent_grows_by_pages_and_zero_fills_gaps() {
     let mut s = store();
-    let mut open = s.open(0, 10, Epoch(0)).unwrap();
+    let mut open = s.open(0, 10, Epoch(0), false).unwrap();
     assert_eq!(open.block.len(), 4096);
     s.write_open(&mut open, 0, b"hello").unwrap();
     s.write_open(&mut open, 5000, b"far").unwrap();
@@ -924,7 +954,7 @@ mod tests {
   #[test]
   fn sealing_makes_a_chunk_that_reads_back_and_releases_by_the_epoch_rule() {
     let mut s = store();
-    let mut open = s.open(0, 10, Epoch(0)).unwrap();
+    let mut open = s.open(0, 10, Epoch(0), false).unwrap();
     s.write_open(&mut open, 5000, b"far").unwrap();
     let extent = s.seal(open, None).unwrap().unwrap();
     assert_eq!(extent.len, 5003);
@@ -953,14 +983,14 @@ mod tests {
   #[test]
   fn writes_past_a_chunk_are_refused_and_reopen_copies_the_bytes() {
     let mut s = store();
-    let mut open = s.open(0, 1, Epoch(0)).unwrap();
+    let mut open = s.open(0, 1, Epoch(0), false).unwrap();
     assert!(matches!(
       s.write_open(&mut open, s.chunk_bytes(), b"x"),
       Err(VfsError::FileTooLarge)
     ));
     s.write_open(&mut open, 0, b"abc").unwrap();
     let extent = s.seal(open, None).unwrap().unwrap();
-    let copy = s.reopen(&extent, Epoch(1)).unwrap();
+    let copy = s.reopen(&extent, Epoch(1), false).unwrap();
     assert_eq!(s.open_bytes(&copy), b"abc");
     assert_eq!(copy.born, Epoch(1));
   }
@@ -1044,7 +1074,7 @@ mod tests {
     let plain: Vec<u8> = (0..SEALED_LEN)
       .map(|at| u8::try_from(at % 251).unwrap())
       .collect();
-    let mut open = s.open(100, SEALED_LEN, Epoch(0)).unwrap();
+    let mut open = s.open(100, SEALED_LEN, Epoch(0), false).unwrap();
     s.write_open(&mut open, 0, &plain).unwrap();
     let extent = s.seal(open, Some(KEY)).unwrap().unwrap();
     (s, extent, plain)
@@ -1091,7 +1121,7 @@ mod tests {
         "span at {from}"
       );
     }
-    let copied = s.reopen(&extent, Epoch(1)).unwrap();
+    let copied = s.reopen(&extent, Epoch(1), false).unwrap();
     assert_eq!(&s.open_bytes(&copied)[..SEALED_LEN], &plain[..]);
     s.release_open(copied).unwrap();
   }
@@ -1148,7 +1178,7 @@ mod tests {
         let plain: Vec<u8> = (0..len)
           .map(|at| u8::try_from((at + round) % 251).unwrap())
           .collect();
-        let mut open = s.open(0, len, Epoch(0)).unwrap();
+        let mut open = s.open(0, len, Epoch(0), false).unwrap();
         s.write_open(&mut open, 0, &plain).unwrap();
         let extent = s.seal(open, Some(KEY)).unwrap().unwrap();
         let mut back = vec![0u8; len];

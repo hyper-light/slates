@@ -2005,6 +2005,7 @@ pub fn shard_report(state: &mut ShardState) -> ShardReport {
     metadata_bytes: state.store.metadata.capacity(),
     committed_metadata: state.store.metadata.committed(),
     mapped_bytes: u64::try_from(state.store.content.mapped_bytes()).unwrap_or(u64::MAX),
+    locked_bytes: u64::try_from(state.store.content.arena().locked_bytes()).unwrap_or(u64::MAX),
     control: is_control_shard(state),
     council: council_report(state),
     root: root_report(state),
@@ -3217,23 +3218,16 @@ fn create(
     Ok(credit) => Some(credit),
     Err(refusal) => return give_back(state, reservation, version_credit, None, refusal),
   };
-  // A strict volume backs its content in locked RAM (§4.2, BUG-1): lock the shard's arena so its
-  // content never swaps, refusing (as BudgetExceeded, the §4.2 lock-capacity refusal) if the OS
-  // will not — a strict guarantee never silently becomes swappable service. Whole-arena locking is
-  // a coarse first cut; locking only a strict volume's own chunks is the refinement (GAP-A9-1).
-  if require_locked && let Err(e) = state.store.content.arena_mut().lock() {
-    let available = match e {
-      slates_mem::MemError::LockRefused { locked, .. } => u64::try_from(locked).unwrap_or(u64::MAX),
-      _ => 0,
-    };
-    return give_back(
-      state,
-      reservation,
-      version_credit,
-      metadata_credit,
-      Refusal::BudgetExceeded { available },
-    );
-  }
+  // A strict volume's content lives in locked RAM (§4.2 D-12, BUG-1): its whole entitlement is reserved against the
+  // process's lock capacity now, refused `BudgetExceeded` if it does not fit, so a strict guarantee never silently
+  // becomes swappable service; its blocks are then locked as it allocates them, and only its blocks.
+  let lock_credit = match require_locked
+    .then(|| reserve_locked(state, size))
+    .transpose()
+  {
+    Ok(credit) => credit,
+    Err(refusal) => return give_back(state, reservation, version_credit, metadata_credit, refusal),
+  };
   let config = volume_config(state, names, quota);
   let (mut volume, host) = match base {
     None => match Volume::create(&mut state.store, config) {
@@ -3261,6 +3255,7 @@ fn create(
       }
     },
   };
+  volume.set_locked(require_locked);
   // The volume root is owned by its provisioning user (§4.13 "runs as the mounting user"; the
   // root:wheel sibling, docs/bugs/2026-09-14-volume-root-owned-by-root-wheel.md): the volume core
   // births it uid 0, gid 0, which a mount showed as root:wheel — and which the NFS export's POSIX
@@ -3330,7 +3325,7 @@ fn create(
     id,
     volume,
     host,
-    (reservation, version_credit, metadata_credit),
+    (reservation, version_credit, metadata_credit, lock_credit),
     record,
   )
 }
@@ -3348,10 +3343,11 @@ fn publish_created_volume(
     Option<slates_mem::budget::Reservation>,
     Option<slates_mem::budget::VersionCredit>,
     Option<slates_mem::budget::MetadataCredit>,
+    Option<crate::lock_ledger::LockCredit>,
   ),
   record: VolumeRecord,
 ) -> ReplyBody {
-  let (reservation, version_credit, metadata_credit) = credits;
+  let (reservation, version_credit, metadata_credit, lock_credit) = credits;
   // Capture the mount name before the record is moved into the log op below; the slot lists the
   // volume under it in the host root (a client mounts `/<name>` or reaches it by `cd <name>`).
   let name = record.name.clone();
@@ -3392,6 +3388,7 @@ fn publish_created_volume(
     reservation,
     version_credit,
     metadata_credit,
+    lock_credit,
   };
   match state.volumes.insert(slot) {
     Ok(h) => {
@@ -3420,6 +3417,29 @@ fn reply_refusal(reply: ReplyBody) -> Refusal {
       reason: "not a refusal".to_owned(),
     },
   }
+}
+
+/// The bytes a strict volume of `size` may come to hold: its bound, or its dynamic maximum.
+fn locked_entitlement(size: SizeClass) -> u64 {
+  match size {
+    SizeClass::Bounded { limit } => limit,
+    SizeClass::Dynamic { max } => max,
+  }
+}
+
+/// Reserves a strict volume's entitlement against the daemon's lock capacity (§4.2 D-12, `lock_ledger`), or the
+/// lock-capacity refusal with what is still available.
+fn reserve_locked(
+  state: &ShardState,
+  size: SizeClass,
+) -> Result<crate::lock_ledger::LockCredit, Refusal> {
+  let control = state.shards.first().copied().unwrap_or(state.shard);
+  crate::lock_ledger::LockCredit::reserve(
+    control,
+    locked_entitlement(size),
+    state.config.lock_capacity_bytes,
+  )
+  .map_err(|available| Refusal::BudgetExceeded { available })
 }
 
 fn give_back(
@@ -4635,6 +4655,12 @@ fn clone(
     Ok(credit) => Some(credit),
     Err(refusal) => return give_back(state, reservation, version_credit, None, refusal),
   };
+  // A clone of a strict volume is strict (its record is the source's): its own entitlement is reserved (§4.2 D-12).
+  let locked = record.policy.require_locked;
+  let lock_credit = match locked.then(|| reserve_locked(state, size)).transpose() {
+    Ok(credit) => credit,
+    Err(refusal) => return give_back(state, reservation, version_credit, metadata_credit, refusal),
+  };
   let cloned = match state.volumes.get_mut(handle) {
     Ok(slot) => Volume::clone_of(
       &state.store,
@@ -4664,6 +4690,7 @@ fn clone(
       );
     }
   };
+  volume_core.set_locked(locked);
   // Cap the clone's inode dimension at the same allowance already reserved above, so its per-volume
   // cap (`next_no`) and its version-slab reservation agree. A clone previously carried no inode cap.
   let _ = volume_core.set_inode_allowance(clone_allowance);
@@ -4735,6 +4762,7 @@ fn clone(
     reservation,
     version_credit,
     metadata_credit,
+    lock_credit,
   };
   match state.volumes.insert(slot) {
     Ok(h) => {
@@ -6228,24 +6256,25 @@ pub(crate) fn materialize_taken_over(
       )));
     }
   };
-  // A volume that must live in locked RAM keeps that guarantee on its successor (§4.2, AUD-29-17): the
-  // shard's arena is locked as a strict create locks it, and a successor the OS will not let lock refuses
-  // the takeover typed rather than serve the volume swappable.
-  if catalog.require_locked
-    && let Err(e) = state.store.content.arena_mut().lock()
+  // A volume that must live in locked RAM keeps that guarantee on its successor (§4.2, AUD-29-17): its entitlement
+  // is reserved against this process's lock capacity as a strict create reserves it, and a successor that cannot
+  // promise it refuses the takeover typed rather than serve the volume swappable.
+  let lock_credit = match catalog
+    .require_locked
+    .then(|| reserve_locked(state, size))
+    .transpose()
   {
-    let available = match e {
-      slates_mem::MemError::LockRefused { locked, .. } => u64::try_from(locked).unwrap_or(u64::MAX),
-      _ => 0,
-    };
-    return Err(Box::new(give_back(
-      state,
-      reservation,
-      version_credit,
-      metadata_credit,
-      Refusal::BudgetExceeded { available },
-    )));
-  }
+    Ok(credit) => credit,
+    Err(refusal) => {
+      return Err(Box::new(give_back(
+        state,
+        reservation,
+        version_credit,
+        metadata_credit,
+        refusal,
+      )));
+    }
+  };
   let mut volume = match Volume::create(&mut state.store, config) {
     Ok(v) => v,
     Err(e) => {
@@ -6258,6 +6287,7 @@ pub(crate) fn materialize_taken_over(
       )));
     }
   };
+  volume.set_locked(catalog.require_locked);
   if let Err(e) = admit_dimensions(state, &mut volume, size) {
     let _ = volume.discard_partial(&mut state.store);
     return Err(Box::new(give_back(
@@ -6310,7 +6340,7 @@ pub(crate) fn materialize_taken_over(
     id,
     volume,
     None,
-    (reservation, version_credit, metadata_credit),
+    (reservation, version_credit, metadata_credit, lock_credit),
     record,
   );
   if !matches!(published, ReplyBody::Created { .. }) {
@@ -7216,7 +7246,19 @@ fn claim_images(
   state: &mut ShardState,
   images: &std::collections::BTreeMap<[u8; 16], VolumeImage>,
 ) -> Option<slates_vfs::recover::Claims> {
-  match slates_vfs::recover::Claims::prepare(&mut state.store, images.values()) {
+  // A strict volume's blocks are locked as they are claimed (§4.2 D-12): the policy is the catalog's.
+  let strict: std::collections::BTreeSet<[u8; 16]> = state
+    .db
+    .partition()
+    .volumes()
+    .iter()
+    .filter(|record| record.policy.require_locked)
+    .map(|record| record.id.bytes)
+    .collect();
+  let marked = images
+    .iter()
+    .map(|(key, image)| (*key, image, strict.contains(key)));
+  match slates_vfs::recover::Claims::prepare_with(&mut state.store, marked) {
     Ok(claims) => Some(claims),
     Err(e) => {
       eprintln!(
@@ -7974,6 +8016,33 @@ fn rebuild_volume(
     ),
     SizeClass::Dynamic { .. } => None,
   };
+  // A recovered strict volume's entitlement is reserved again in this process (§4.2 D-12); its claimed blocks were
+  // locked as they were claimed (`claim_images`). One the OS would not let lock is refused, never served swappable.
+  if record.policy.require_locked
+    && claims.is_some_and(|claims| claims.unlockable(&record.id.bytes))
+  {
+    if let Some(r) = reservation {
+      state.store.budget.release(r);
+    }
+    return Err("a strict volume's content could not be locked in this process".to_owned());
+  }
+  let lock_credit = match record
+    .policy
+    .require_locked
+    .then(|| reserve_locked(state, size))
+    .transpose()
+  {
+    Ok(credit) => credit,
+    Err(refusal) => {
+      if let Some(r) = reservation {
+        state.store.budget.release(r);
+      }
+      return Err(format!(
+        "a strict volume's entitlement exceeds this process's lock capacity: {}",
+        refusal_name(&refusal)
+      ));
+    }
+  };
   let built = build_recovered_volume(state, record, image, claims, size);
   let (mut volume, host, prefix) = match built {
     Ok(triple) => triple,
@@ -8032,6 +8101,7 @@ fn rebuild_volume(
     }
   };
   let mut volume = volume;
+  volume.set_locked(record.policy.require_locked);
   crate::content_cipher::key_volume(&mut state.store, &mut volume, record.id.bytes);
   let slot = VolumeSlot {
     id: record.id,
@@ -8041,6 +8111,7 @@ fn rebuild_volume(
     reservation,
     version_credit,
     metadata_credit,
+    lock_credit,
   };
   let handle = state.volumes.insert(slot).map_err(|e| e.to_string())?;
   state.by_id.insert(record.id, handle);

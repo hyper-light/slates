@@ -67,28 +67,111 @@ fn a_budget_over_usable_capacity_never_over_promises_what_the_arena_can_back() {
   budget.release(reservation);
 }
 
-/// §4.2 (BUG-1): locking an arena locks its regions into RAM, so a strict (`require_locked`) volume's
-/// content never swaps; if the OS refuses (a working-set or `RLIMIT_MEMLOCK` limit) the caller learns
-/// so and refuses admission rather than silently giving swappable service. mlock capacity is
-/// environment-dependent, so a refusal here is a loud skip, not a failure.
+/// The kernel's count of this process's locked memory (`/proc/self/status` `VmLck`), in bytes.
+#[cfg(target_os = "linux")]
+fn locked_by_the_kernel() -> usize {
+  std::fs::read_to_string("/proc/self/status")
+    .unwrap()
+    .lines()
+    .find_map(|line| line.strip_prefix("VmLck:"))
+    .and_then(|rest| rest.split_whitespace().next())
+    .and_then(|kib| kib.parse::<usize>().ok())
+    .unwrap()
+    * 1024
+}
+
+/// A block of `len` bytes allocated locked, or `None` (a loud skip) where the environment refuses mlock, having
+/// checked the refusal left nothing locked.
+fn locked_or_skipped(
+  arena: &mut ChunkArena,
+  len: usize,
+) -> Result<Option<slates_mem::Extent>, MemError> {
+  match arena.alloc_locked(len) {
+    Ok(extent) => Ok(Some(extent)),
+    Err(MemError::LockRefused { .. }) => {
+      assert_eq!(
+        arena.locked_bytes(),
+        0,
+        "a refused lock leaves nothing locked"
+      );
+      eprintln!(
+        "skipped the_arena_locks_the_blocks_asked: the environment refuses mlock (no memlock capacity)"
+      );
+      Ok(None)
+    }
+    Err(e) => Err(e),
+  }
+}
+
+/// The kernel's locked count where it reports one (Linux), else none.
+fn kernel_locked() -> Option<usize> {
+  #[cfg(target_os = "linux")]
+  return Some(locked_by_the_kernel());
+  #[cfg(not(target_os = "linux"))]
+  None
+}
+
+/// Where the kernel reports its locked count, it has moved by exactly `expected` bytes since `before`.
+fn assert_kernel_moved(before: Option<usize>, expected: usize, what: &str) {
+  if let (Some(before), Some(now)) = (before, kernel_locked()) {
+    assert_eq!(now - before, expected, "{what}");
+  }
+}
+
+/// §4.2 (BUG-1, D-12): the arena locks exactly the blocks asked to be locked (a strict volume's content), never the
+/// address space it maps and never another volume's blocks beside them. Do: over a 16-page region, allocate a plain
+/// 2-page block and a locked 4-page block; then lock the plain one; free the locked one. Expect: locked bytes are 4,
+/// then 6, then 2 pages, never the region; the plain block is unlocked until asked; on Linux the kernel's own count
+/// moves by exactly as much. mlock capacity is environment-dependent, so a refusal is a loud skip that leaves
+/// nothing locked.
 #[test]
-fn locking_an_arena_locks_its_regions_or_refuses_loudly() {
-  let region = 4 * PAGE;
+fn the_arena_locks_the_blocks_asked_never_the_region_or_their_neighbours() {
+  let region = 16 * PAGE;
   let mut arena = ChunkArena::new(PAGE);
   arena
     .add_region(Region::map(region, PAGE, false).unwrap())
     .unwrap();
-  match arena.lock() {
-    Ok(()) => assert!(
-      arena.locked_bytes() >= region,
-      "a locked arena reports its regions locked ({} >= {region})",
-      arena.locked_bytes()
-    ),
-    Err(MemError::LockRefused { .. }) => {
-      eprintln!(
-        "skipped locking_an_arena_locks_its_regions: the environment refuses mlock (no memlock capacity)"
-      );
-    }
-    Err(e) => panic!("an unexpected error locking the arena: {e}"),
-  }
+  let plain = arena.alloc(2 * PAGE).unwrap();
+  let kernel_before = kernel_locked();
+  let Some(strict) = locked_or_skipped(&mut arena, 4 * PAGE).unwrap() else {
+    return;
+  };
+  assert_eq!(
+    arena.locked_bytes(),
+    4 * PAGE,
+    "only the block allocated locked is locked"
+  );
+  assert!(!arena.is_locked(plain), "the plain block beside it is not");
+  assert!(arena.is_locked(strict));
+  assert_kernel_moved(
+    kernel_before,
+    4 * PAGE,
+    "the kernel counts exactly the locked block",
+  );
+  arena.lock_extent(plain).unwrap();
+  arena.lock_extent(plain).unwrap();
+  assert_eq!(
+    arena.locked_bytes(),
+    6 * PAGE,
+    "locking an existing block locks it, once"
+  );
+  arena.free(strict).unwrap();
+  assert_eq!(arena.locked_bytes(), 2 * PAGE, "a freed block is unlocked");
+  assert_kernel_moved(
+    kernel_before,
+    2 * PAGE,
+    "the kernel's count falls with the free",
+  );
+  assert!(
+    arena.locked_bytes() < region,
+    "the region's other pages are never locked"
+  );
+  let again = arena.alloc(4 * PAGE).unwrap();
+  assert!(
+    !arena.is_locked(again),
+    "a block reusing a freed locked block's space starts unlocked"
+  );
+  arena.free(plain).unwrap();
+  arena.free(again).unwrap();
+  assert_eq!(arena.locked_bytes(), 0);
 }

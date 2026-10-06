@@ -161,6 +161,36 @@ impl Region {
     Ok(())
   }
 
+  /// Locks bytes `offset .. offset + len` (one block) against swapping, whatever backs the region: the unit a
+  /// locked arena locks, so locked memory is the content allocated, not the address space mapped (§4.2 D-12). A
+  /// range outside the region is refused `OutOfRange`; the OS's refusal (its locked-memory limit) is `LockRefused`.
+  pub fn lock_range(&mut self, offset: usize, len: usize) -> Result<(), MemError> {
+    let region_len = self.len();
+    let bytes = offset
+      .checked_add(len)
+      .and_then(|end| self.backing.bytes_mut().get_mut(offset..end))
+      .ok_or(MemError::OutOfRange {
+        offset,
+        len: region_len,
+      })?;
+    os::lock_slice(bytes).map_err(|code| MemError::LockRefused {
+      requested: len,
+      locked: 0,
+      code,
+    })
+  }
+
+  /// Unlocks bytes `offset .. offset + len`, a block [`Region::lock_range`] locked; a range outside the region is
+  /// nothing to unlock.
+  pub fn unlock_range(&mut self, offset: usize, len: usize) {
+    if let Some(bytes) = offset
+      .checked_add(len)
+      .and_then(|end| self.backing.bytes_mut().get_mut(offset..end))
+    {
+      os::unlock_slice(bytes);
+    }
+  }
+
   /// Unlocks the region.
   pub fn unlock(&mut self) {
     if self.locked {
@@ -302,6 +332,21 @@ mod os {
     map.advise_range(memmap2::Advice::DontDump, offset, len)?;
     Ok(())
   }
+
+  /// Locks `bytes`, a block of a region's own mapping, against swapping (the kernel rounds to whole pages; a
+  /// block is a page multiple on a page boundary, so no other block's page is touched). The refusal is the OS code.
+  pub(super) fn lock_slice(bytes: &mut [u8]) -> Result<(), Option<i32>> {
+    // SAFETY: `bytes` is a live part of the region's own mapping, borrowed mutably for the call; locking changes no
+    // byte of it and no other mapping.
+    unsafe { rustix::mm::mlock(bytes.as_mut_ptr().cast(), bytes.len()) }
+      .map_err(|e| Some(e.raw_os_error()))
+  }
+
+  /// Unlocks `bytes`, a block [`lock_slice`] locked.
+  pub(super) fn unlock_slice(bytes: &mut [u8]) {
+    // SAFETY: as for `lock_slice`; unlocking changes no byte.
+    let _ = unsafe { rustix::mm::munlock(bytes.as_mut_ptr().cast(), bytes.len()) };
+  }
 }
 
 #[cfg(unix)]
@@ -317,14 +362,13 @@ mod os {
     GetCurrentProcess, GetProcessWorkingSetSize, SetProcessWorkingSetSize,
   };
 
-  /// VirtualLock is bounded by the working set: raise the maximum by the region first.
-  pub(super) fn lock(map: &mut MmapMut) -> Result<(), MemError> {
-    let len = map.len();
+  /// VirtualLock is bounded by the working set: raises both bounds by `len` (a refusal is reported by the lock).
+  fn raise_working_set(len: usize) {
     let mut min: usize = 0;
     let mut max: usize = 0;
     // SAFETY: the current process pseudo-handle and two writable outputs.
     if unsafe { GetProcessWorkingSetSize(GetCurrentProcess(), &raw mut min, &raw mut max) } != 0 {
-      // SAFETY: raising both bounds by the region; a refusal is reported by VirtualLock below.
+      // SAFETY: raising both bounds by `len`; a refusal is reported by VirtualLock after.
       unsafe {
         SetProcessWorkingSetSize(
           GetCurrentProcess(),
@@ -333,6 +377,12 @@ mod os {
         )
       };
     }
+  }
+
+  /// Locks the whole region, the working set raised by it first.
+  pub(super) fn lock(map: &mut MmapMut) -> Result<(), MemError> {
+    let len = map.len();
+    raise_working_set(len);
     // SAFETY: the committed mapping owned by `map`.
     if unsafe { VirtualLock(map.as_mut_ptr().cast::<c_void>(), len) } != 0 {
       Ok(())
@@ -348,6 +398,23 @@ mod os {
   pub(super) fn unlock(map: &mut MmapMut) {
     // SAFETY: the mapping locked by `lock`.
     unsafe { VirtualUnlock(map.as_mut_ptr().cast::<c_void>(), map.len()) };
+  }
+
+  /// Locks `bytes`, a block of a region's own committed mapping, the working set raised by it first.
+  pub(super) fn lock_slice(bytes: &mut [u8]) -> Result<(), Option<i32>> {
+    raise_working_set(bytes.len());
+    // SAFETY: `bytes` is a live, committed part of the region's own mapping; locking changes no byte.
+    if unsafe { VirtualLock(bytes.as_mut_ptr().cast::<c_void>(), bytes.len()) } != 0 {
+      Ok(())
+    } else {
+      Err(std::io::Error::last_os_error().raw_os_error())
+    }
+  }
+
+  /// Unlocks `bytes`, a block [`lock_slice`] locked.
+  pub(super) fn unlock_slice(bytes: &mut [u8]) {
+    // SAFETY: as for `lock_slice`; unlocking changes no byte.
+    unsafe { VirtualUnlock(bytes.as_mut_ptr().cast::<c_void>(), bytes.len()) };
   }
 }
 

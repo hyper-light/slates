@@ -966,6 +966,10 @@ pub struct ShardReport {
   /// the usable (buddy-allocatable) part the budget admits against (§4.2 "segment, slab and buddy
   /// geometry report usable capacity, not mapping length": both, so the difference is visible).
   pub mapped_bytes: u64,
+  /// The bytes of the shard's content arena locked in RAM (§4.2 D-12, BUG-1): the whole arena once a
+  /// strict (`--locked`) volume lives on the shard, so none of its content can be paged to swap; zero
+  /// otherwise. Each region is locked as it joins, or growth stops.
+  pub locked_bytes: u64,
   /// Whether this is the control shard — the one that runs the membership loop, drives the consensus
   /// groups and holds their live timing; the other shards hold inert copies.
   pub control: bool,

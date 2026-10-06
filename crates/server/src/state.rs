@@ -81,6 +81,9 @@ pub struct VolumeSlot {
   /// its object, its snapshot slab's first segment — reserved against the shard's metadata ledger at
   /// admission, returned on teardown so the class is never over-offered.
   pub metadata_credit: Option<slates_mem::budget::MetadataCredit>,
+  /// A strict (`--locked`) volume's entitlement, held against the daemon's lock capacity (§4.2 D-12,
+  /// `lock_ledger`); returned when the slot drops.
+  pub lock_credit: Option<crate::lock_ledger::LockCredit>,
 }
 
 impl std::fmt::Debug for VolumeSlot {

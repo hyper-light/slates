@@ -1783,7 +1783,7 @@ fn daemon_status_text(report: &DaemonReport, telemetry: &[TelemetryReport]) -> S
   out.push_str(&group_text("root", &report.fleet.root));
   for shard in &report.shards {
     out.push_str(&format!(
-      "shard {}: clients={} volumes={} served={} replayed={} replay_ns={} torn={} mapped={} reserve={} committed={} retained={} replicated={} retained_versions={} metadata={} committed_metadata={} tasks_refused={} landings_awaiting={}/{} landings_in_flight={} target_leases={}\n",
+      "shard {}: clients={} volumes={} served={} replayed={} replay_ns={} torn={} mapped={} locked={} reserve={} committed={} retained={} replicated={} retained_versions={} metadata={} committed_metadata={} tasks_refused={} landings_awaiting={}/{} landings_in_flight={} target_leases={}\n",
       shard.partition,
       shard.clients,
       shard.volumes,
@@ -1792,6 +1792,7 @@ fn daemon_status_text(report: &DaemonReport, telemetry: &[TelemetryReport]) -> S
       shard.replay_ns,
       shard.torn_tail,
       shard.mapped_bytes,
+      shard.locked_bytes,
       shard.reserve_bytes,
       shard.committed_bytes,
       shard.retained_bytes,

@@ -69,6 +69,14 @@ struct Slot {
 /// `init_on_free=1` hardening does for the page allocator). A freed block that held a file's plaintext, a deleted
 /// file's or a block a seal moved out of an image, would otherwise keep it in RAM until reused. A block whose free is
 /// deferred keeps its bytes until the commit that releases it: the recovery image may still read them.
+/// A deferred block released at last: zeroed, and unlocked when it was locked.
+fn release_block(region: &mut Region, offset: usize, len: usize, locked: bool) {
+  scrub(region, offset, len);
+  if locked {
+    region.unlock_range(offset, len);
+  }
+}
+
 fn scrub(region: &mut Region, offset: usize, len: usize) {
   if let Some(bytes) = offset
     .checked_add(len)
@@ -105,8 +113,6 @@ pub struct ChunkArena {
   allocated_bytes: usize,
   /// The pool this arena grows from, when it has one.
   source: Option<Box<dyn ExtentSource>>,
-  /// Whether the arena was locked into RAM ([`ChunkArena::lock`]): a region added after is locked as it is added.
-  locked: bool,
 }
 
 impl std::fmt::Debug for ChunkArena {
@@ -138,7 +144,6 @@ impl ChunkArena {
       granule: granule.max(1),
       allocated_bytes: 0,
       source: None,
-      locked: false,
     }
   }
 
@@ -161,17 +166,7 @@ impl ChunkArena {
         // not the arena's to keep, and the pool sees no release for it, so stop rather than spin.
         break;
       }
-      // A locked arena keeps every region locked; an extent the OS will not lock goes back, and growth stops.
-      if self.locked
-        && self
-          .slot_mut(id)
-          .is_some_and(|slot| slot.region.lock().is_err())
-      {
-        if let (Ok(region), Some(source)) = (self.remove_region(id), self.source.as_mut()) {
-          source.release(id, region);
-        }
-        break;
-      }
+      // A new region holds no block, so nothing of it is locked until a block is allocated there.
       added = added.saturating_add(self.capacity().saturating_sub(before));
     }
     added
@@ -366,26 +361,46 @@ impl ChunkArena {
     self.held().map(|s| s.buddy.region_bytes()).sum()
   }
 
-  /// Locks every region into RAM (§4.2, BUG-1), so content a strict volume backs never swaps.
-  /// Idempotent: a region already locked stays locked. Returns [`MemError::LockRefused`] if the OS
-  /// refuses (a working-set or `RLIMIT_MEMLOCK` limit), so a strict guarantee that cannot be met
-  /// refuses rather than silently becoming swappable service. Regions locked before the refusal
-  /// stay locked; the caller unwinds by refusing the admission.
-  pub fn lock(&mut self) -> Result<(), MemError> {
-    for slot in self.held_mut() {
-      slot.region.lock()?;
+  /// Locks the live `extent` in RAM (§4.2 D-12): a strict volume's content never swaps. A block is a page multiple
+  /// on a page boundary, so its pages are its own. Idempotent; refused [`MemError::LockRefused`] by the OS (its
+  /// locked-memory limit), the block then unlocked and usable, or [`MemError::ForeignExtent`] for one this arena did
+  /// not issue.
+  pub fn lock_extent(&mut self, extent: Extent) -> Result<(), MemError> {
+    let foreign = |reason| MemError::ForeignExtent {
+      offset: extent.offset(),
+      len: extent.len(),
+      reason,
+    };
+    if self.identity != Some(extent.arena) {
+      return Err(foreign(ExtentRefusal::OtherArena));
     }
-    self.locked = true;
+    let slot = self
+      .slot_mut(extent.region)
+      .ok_or_else(|| foreign(ExtentRefusal::NoSuchRegion))?;
+    if slot.buddy.is_locked(extent.block) {
+      return Ok(());
+    }
+    slot.region.lock_range(extent.offset(), extent.len())?;
+    if let Err(e) = slot.buddy.lock_block(extent.block) {
+      slot.region.unlock_range(extent.offset(), extent.len());
+      return Err(e);
+    }
     Ok(())
   }
 
-  /// Locked bytes across regions.
+  /// Whether the live `extent` is locked in RAM.
+  pub fn is_locked(&self, extent: Extent) -> bool {
+    self.identity == Some(extent.arena)
+      && self
+        .slot(extent.region)
+        .is_some_and(|slot| slot.buddy.is_locked(extent.block))
+  }
+
+  /// The bytes of the blocks locked in RAM: a strict volume's content, never the address space mapped (a whole-arena
+  /// lock wired a shard's 16 GiB for one 4 MiB strict volume on macOS, measured 2026-10-06;
+  /// `docs/bugs/2026-10-06-a-locked-volume-wired-its-shards-whole-arena.md`).
   pub fn locked_bytes(&self) -> usize {
-    self
-      .held()
-      .filter(|s| s.region.locked())
-      .map(|s| s.region.len())
-      .sum()
+    self.held().map(|slot| slot.buddy.locked_bytes()).sum()
   }
 
   /// The block an allocation of `len` bytes takes — the smallest power-of-two number of granules holding
@@ -432,6 +447,17 @@ impl ChunkArena {
     Err(self.exhausted(len, largest))
   }
 
+  /// [`ChunkArena::alloc`], locked in RAM before it is handed out (a strict volume's new content). One the OS will not
+  /// lock goes back, and the refusal is the lock's.
+  pub fn alloc_locked(&mut self, len: usize) -> Result<Extent, MemError> {
+    let extent = self.alloc(len)?;
+    if let Err(e) = self.lock_extent(extent) {
+      self.free(extent)?;
+      return Err(e);
+    }
+    Ok(extent)
+  }
+
   /// The refusal when no region served `len`: too large for any region, or exhausted.
   fn exhausted(&self, len: usize, largest: usize) -> MemError {
     let max = self
@@ -476,9 +502,13 @@ impl ChunkArena {
       .slot_mut(extent.region)
       .ok_or_else(|| foreign(ExtentRefusal::NoSuchRegion))?;
     let before = slot.buddy.free_bytes();
+    let locked = slot.buddy.is_locked(extent.block);
     let deferred = slot.buddy.free_or_defer(extent.block)?;
     if scrubbed && !deferred {
       scrub(&mut slot.region, extent.offset(), extent.len());
+    }
+    if locked && !deferred {
+      slot.region.unlock_range(extent.offset(), extent.len());
     }
     let released = slot.buddy.free_bytes().saturating_sub(before);
     self.allocated_bytes = self.allocated_bytes.saturating_sub(released);
@@ -552,7 +582,8 @@ impl ChunkArena {
     for slot in self.slots.iter_mut().flatten() {
       let before = slot.buddy.free_bytes();
       let Slot { region, buddy } = slot;
-      buddy.commit_capture_releasing(|offset, len| scrub(region, offset, len));
+      buddy
+        .commit_capture_releasing(|offset, len, locked| release_block(region, offset, len, locked));
       released_total =
         released_total.saturating_add(slot.buddy.free_bytes().saturating_sub(before));
     }
@@ -565,7 +596,9 @@ impl ChunkArena {
     for slot in self.slots.iter_mut().flatten() {
       let before = slot.buddy.free_bytes();
       let Slot { region, buddy } = slot;
-      buddy.abandon_capture_releasing(|offset, len| scrub(region, offset, len));
+      buddy.abandon_capture_releasing(|offset, len, locked| {
+        release_block(region, offset, len, locked)
+      });
       released_total =
         released_total.saturating_add(slot.buddy.free_bytes().saturating_sub(before));
     }

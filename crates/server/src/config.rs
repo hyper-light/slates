@@ -239,6 +239,9 @@ pub struct DaemonConfig {
   pub caps: PartitionCaps,
   /// The client region's geometry.
   pub region: RegionGeometry,
+  /// Derived: the bytes this process may lock in RAM (the profile's lock capacity when its confirming lock succeeded,
+  /// else none): what strict (`--locked`) volumes' entitlements are reserved against (§4.2 D-12, `lock_ledger`).
+  pub lock_capacity_bytes: u64,
   /// Derived: clients per shard, the admission limit (AC-2.6): what the client share of the
   /// reserve holds in regions.
   pub clients_per_shard: usize,
@@ -474,6 +477,16 @@ impl DaemonConfig {
     derivations.push(note("effective_capacity_bytes", &effective));
     let reserve = region_bytes(effective.get(), shards, MEMORY_CLASSES);
     derivations.push(note("reserve_per_shard", &reserve));
+    let lock_capacity: Derived<u64> = derived!(
+      if profile.lock.confirmed {
+        profile.lock.bytes
+      } else {
+        0
+      },
+      "the OS's lock limit when a confirming lock succeeded, else 0",
+      ["mem.lock_capacity", "mem.lock_confirmed"]
+    );
+    derivations.push(note("lock_capacity_bytes", &lock_capacity));
     let page = profile.facts.page.base;
     let tables: Derived<u64> = derived!(
       reserve.get().saturating_mul(TABLE_SHARE_PERMILLE) / PERMILLE,
@@ -738,6 +751,7 @@ impl DaemonConfig {
       geometry,
       caps,
       region,
+      lock_capacity_bytes: lock_capacity.get(),
       clients_per_shard: clients.get(),
       landings_awaiting_per_shard: landings_awaiting.get(),
       reserve_per_shard: reserve.get(),

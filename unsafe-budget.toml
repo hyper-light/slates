@@ -178,7 +178,11 @@ slates-machine = 50
 # (the anchor's supervision block) without locking the whole segment: Unix `mlock` over a sub-range of the map
 # (`region::lock_map_range`; memmap2 locks only whole maps, and its `advise_range` covers `MADV_DONTDUMP` safely) and
 # Windows `VirtualLock` over a sub-range of the view. Each is one OS call with no safe wrapper for a range.
-slates-mem = 26
+# 2026-10-06 (+4, a strict volume locks only its own content —
+# `docs/bugs/2026-10-06-a-locked-volume-wired-its-shards-whole-arena.md`): `region::os::lock_slice` and `unlock_slice`,
+# `mlock`/`munlock` over one block of a region (Unix, 2) and `VirtualLock`/`VirtualUnlock` over it (Windows, 2). A block
+# is the unit a strict volume locks; memmap2 locks only whole maps and has no unlock of a range.
+slates-mem = 30
 # 2026-09-14 (+11, registry slot reclamation — `docs/bugs/2026-09-14-shard-registry-leaks-every-slot-for-the-process-lifetime.md`):
 # `driver::KickFd` — the slot-owned kick descriptor: `Sync`/`Send` impls (2), `with`, `fd`, `close` (3
 # blocks reading or taking the `UnsafeCell` under the `closed` flag); `registry::register` (the previous

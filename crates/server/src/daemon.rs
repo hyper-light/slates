@@ -635,6 +635,8 @@ impl Daemon {
     let retained = crate::retention::load(&segment)?;
     let runtime = Runtime::start(&config.runtime)?;
     let shards: Vec<ShardId> = runtime.shard_ids().to_vec();
+    // The lock ledger's entry for this daemon starts empty, before any shard recovers and reserves again.
+    crate::lock_ledger::reset(shards.first().map_or(0, |shard| shard.0));
     // The FUSE devices the anchor held across the restart (A-61), each moved to the shard that owns its mount.
     #[cfg(target_os = "linux")]
     let mut inherited_fuse = crate::fuse_hold::adopt(shards.len()).into_iter();

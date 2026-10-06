@@ -266,6 +266,185 @@ fn daemon_status(instance: &str) {
   assert!(out.contains("shard 1 catalog.volumes: "), "{out}");
 }
 
+/// Each shard's value of `key` (`mapped`, `locked`, ...) from `status`'s `shard N: ...` lines, by shard.
+fn shard_values(status: &str, key: &str) -> Vec<u64> {
+  let prefix = format!(" {key}=");
+  status
+    .lines()
+    .filter(|line| line.starts_with("shard ") && line.contains(": clients="))
+    .map(|line| {
+      line
+        .split(&prefix)
+        .nth(1)
+        .and_then(|rest| rest.split(' ').next())
+        .and_then(|value| value.parse().ok())
+        .unwrap_or_else(|| panic!("no {key} on {line}"))
+    })
+    .collect()
+}
+
+/// The kernel's count of the daemon's locked memory (`/proc/PID/status` `VmLck`), in bytes.
+#[cfg(target_os = "linux")]
+fn locked_by_the_kernel(pid: u32) -> u64 {
+  let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap();
+  let kib: u64 = status
+    .lines()
+    .find_map(|line| line.strip_prefix("VmLck:"))
+    .and_then(|rest| rest.split_whitespace().next())
+    .and_then(|value| value.parse().ok())
+    .unwrap();
+  kib * 1024
+}
+
+/// §4.2 D-12 (BUG-1), the `--locked` capability by use: a strict volume's content is never swappable, it pins only
+/// what it holds, and no neighbour is pinned by its policy. Do: start a daemon; create a 4 MiB volume with `--locked`
+/// and a plain one; write a mebibyte into each; kill the daemon (`SIGKILL`) and let the anchor restart it. Expect:
+/// either the OS cannot lock 4 MiB and the strict create is refused typed (`BudgetExceeded`) with nothing locked, or
+/// the empty strict volume locks nothing, the plain volume's mebibyte stays unlocked, the strict volume's mebibyte is
+/// locked (at least it, at most its entitlement; on Linux the kernel's `VmLck` for the daemon covers it), and after
+/// the restart its content is locked again and reads back byte for byte. Before, a 4 MiB strict volume wired its
+/// shard's whole 16 GiB arena on macOS (`docs/bugs/2026-10-06-a-locked-volume-wired-its-shards-whole-arena.md`).
+#[test]
+fn a_locked_volume_locks_only_its_own_content_across_a_restart_or_is_refused_with_nothing_locked() {
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the locked-volume flow: set SLATES_TEST_CLI=1 to run it (needs the machine to itself)"
+    );
+    return;
+  }
+  let instance = format!("cli-locked-{}", std::process::id());
+  let _anchor = start_anchor(&instance);
+  assert_eq!(
+    locked_in_total(&instance),
+    0,
+    "nothing is locked before a strict volume"
+  );
+  let Some(pinned) = strict_volume_or_typed_refusal(&instance) else {
+    return;
+  };
+  assert_eq!(
+    locked_in_total(&instance),
+    0,
+    "an empty strict volume locks nothing"
+  );
+  let (code, out, err) = run(
+    &instance,
+    &["volume", "create", "loose", "--bounded", "4MiB"],
+  );
+  assert_eq!(code, 0, "{err}");
+  let loose = value_of(&out, "id");
+  // Shape: a mebibyte of content, past a few chunks and inside the entitlement.
+  let content: Vec<u8> = (0..(1usize << 20))
+    .map(|at| u8::try_from(at % 251).unwrap())
+    .collect();
+  write_through_an_attachment(&instance, &loose, "loose.bin", &content);
+  assert_eq!(
+    locked_in_total(&instance),
+    0,
+    "a plain volume's content is never locked"
+  );
+  write_through_an_attachment(&instance, &pinned, "pinned.bin", &content);
+  let locked = locked_in_total(&instance);
+  eprintln!("after a 1 MiB write to each: {locked} bytes locked");
+  assert!(
+    locked >= content.len() as u64 && locked <= STRICT_ENTITLEMENT,
+    "the strict volume locks its own content, within its entitlement: {locked}"
+  );
+  assert_the_kernel_counts_at_least(&instance, locked);
+  kill_the_daemon_and_await_its_successor(&instance);
+  let relocked = locked_in_total(&instance);
+  eprintln!("after the daemon's restart: {relocked} bytes locked");
+  assert_eq!(
+    relocked, locked,
+    "the restarted daemon locks the strict volume's content again, and only it"
+  );
+  let (code, read, err) = run_with_stdin(&instance, &["read", &pinned, "pinned.bin"], b"");
+  assert_eq!(code, 0, "{err}");
+  assert!(
+    read == content,
+    "the strict volume's content survives the restart byte for byte"
+  );
+  assert_the_kernel_counts_at_least(&instance, relocked);
+}
+
+/// Shape: the strict volume's entitlement, 4 MiB: a few chunks, within a default lock limit on any host CI runs on.
+const STRICT_ENTITLEMENT: u64 = 4 << 20;
+
+/// Every shard's locked bytes, summed, from `status`.
+fn locked_in_total(instance: &str) -> u64 {
+  let (code, status, err) = run(instance, &["status"]);
+  assert_eq!(code, 0, "{err}");
+  shard_values(&status, "locked").iter().sum()
+}
+
+/// Creates the strict volume and returns its id, or, where the OS cannot lock its entitlement, checks the create was
+/// refused typed (`BudgetExceeded`) with nothing locked and returns `None`.
+fn strict_volume_or_typed_refusal(instance: &str) -> Option<String> {
+  let (code, out, err) = run(
+    instance,
+    &[
+      "volume",
+      "create",
+      "pinned",
+      "--bounded",
+      "4MiB",
+      "--locked",
+    ],
+  );
+  if code == 0 {
+    return Some(value_of(&out, "id"));
+  }
+  assert!(
+    err.contains("BudgetExceeded"),
+    "a strict create the OS cannot back is refused typed: {err}"
+  );
+  assert_eq!(
+    locked_in_total(instance),
+    0,
+    "a refused strict create locks nothing"
+  );
+  eprintln!(
+    "the OS's lock limit is below {STRICT_ENTITLEMENT} bytes: refused typed, nothing locked ({err})"
+  );
+  None
+}
+
+/// Kills the daemon (`SIGKILL`) and waits for the anchor's restarted one to answer.
+fn kill_the_daemon_and_await_its_successor(instance: &str) {
+  let killed = daemon_pid(instance).unwrap();
+  assert!(
+    Command::new("kill")
+      .args(["-9", &killed.to_string()])
+      .status()
+      .unwrap()
+      .success()
+  );
+  await_daemon(instance, Some(killed), &[]);
+}
+
+/// Writes `content` to `path` in volume `id` through a fresh write attachment.
+fn write_through_an_attachment(instance: &str, id: &str, path: &str, content: &[u8]) {
+  let (code, attached, err) = run(instance, &["attach", id, "--write"]);
+  assert_eq!(code, 0, "{err}");
+  let attachment = value_of(&attached, "attachment");
+  let (code, _, err) = run_with_stdin(instance, &["write", id, &attachment, path], content);
+  assert_eq!(code, 0, "{err}");
+}
+
+/// Where the kernel reports a process's locked memory (Linux), the daemon's covers `bytes`.
+fn assert_the_kernel_counts_at_least(instance: &str, bytes: u64) {
+  #[cfg(target_os = "linux")]
+  {
+    let kernel = locked_by_the_kernel(daemon_pid(instance).unwrap());
+    assert!(
+      kernel >= bytes,
+      "the kernel counts {kernel} bytes locked, status claims {bytes}"
+    );
+  }
+  #[cfg(not(target_os = "linux"))]
+  let _ = (instance, bytes);
+}
+
 /// resize and destroy; then the usage refusals (exit 2) and a missing volume (exit 1).
 fn resize_destroy_and_refusals(instance: &str, id: &str) {
   let (code, _, _) = run(instance, &["volume", "resize", id, "--bounded", "8MiB"]);

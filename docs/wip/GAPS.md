@@ -3773,3 +3773,23 @@ Condition 11/12, 2026-10-05 (BENCHMARKS "The daemon under a container memory cap
   window) is the shared cause. Why slates meets it thrice is not yet known: `SO_RCVBUF` and `TCP_QUICKACK` were measured
   and rejected. A warmed mount writes at 241–471 MB/s.
 
+
+### 2026-10-06: a strict volume locks only its own content (condition 3; AUD-29-77; GAP-A9-1's refinement)
+
+The capability table's one owed row, `--locked` ("records the intent only"), was half stale: since 2026-09-13 a strict
+create locked its shard's whole arena. Its first use-level test found four defects in that
+(`docs/bugs/2026-10-06-a-locked-volume-wired-its-shards-whole-arena.md`):
+- On macOS a 4 MiB strict volume wired 16,434 MiB and stalled its shard about 2 s; its client timed out on a create
+  that succeeded.
+- Every plain volume on its shard was pinned too.
+- No entitlement was reserved against the lock limit, so a shortfall surfaced as an untyped `BadRequest` on a write.
+- Recovery never locked again, so after a restart a strict volume was swappable.
+
+Closed the same day. Blocks, not regions, are locked; the policy is the volume's; recovery claims a strict volume's
+blocks locked and refuses only a volume the OS will not lock; admission reserves the entitlement against the measured
+lock capacity in a per-daemon ledger; a late lock refusal is typed; `slates status` reports `locked` per shard
+(design §4.2, "Status (2026-10-06)"). Proven by use on macOS and on Linux at two lock limits, including the kernel's own
+`VmLck`, across a `SIGKILL` and restart; the test fails with recovery's re-lock removed. The capability row now reads
+works. Owed: Windows (`VirtualLock` per block builds and is cross-linted, but no lane runs a strict volume), and a
+strict volume's shared blocks with a plain clone are locked for both (clones copy the source's policy, so none exists
+today).

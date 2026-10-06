@@ -77,6 +77,11 @@ pub struct Buddy {
   /// a free touches a bitmap (an allocator nothing publishes from pays one flag test for the deferral).
   imaged: bool,
   deferred_bytes: usize,
+  /// The heads of blocks locked in RAM (§4.2 D-12: a strict volume's content): set by [`Buddy::lock_block`], cleared
+  /// when the block is released, whichever way, so the owner unlocks exactly the blocks that were locked.
+  locked: Bits,
+  /// The bytes of the locked blocks.
+  locked_bytes: usize,
 }
 
 /// One bit per granule, sized once (AC-0.4: nothing reaches the system allocator after the build).
@@ -213,7 +218,72 @@ impl Buddy {
       capturing: false,
       imaged: false,
       deferred_bytes: 0,
+      locked: Bits::new(granules),
+      locked_bytes: 0,
     })
+  }
+
+  /// Every allocated block, deferred ones included, as `(offset, len)`, in address order: a walk of the heads that
+  /// jumps each block whole, so it costs the blocks and free blocks, not the granules inside them. A cold path (a
+  /// locked arena takes it once, when a strict volume first lives on its shard).
+  pub fn allocated(&self) -> impl Iterator<Item = (usize, usize)> + '_ {
+    let granules = self.state.len();
+    let mut at = 0usize;
+    std::iter::from_fn(move || {
+      while at < granules {
+        let here = at;
+        let state = self.state.get(here).copied().unwrap_or(INSIDE);
+        if state & HEAD_BIT == 0 {
+          at = here.saturating_add(1);
+          continue;
+        }
+        let span = 1usize << u32::from(state & ORDER_MASK);
+        at = here.saturating_add(span);
+        if state & FREE_BIT == 0 {
+          return Some((here << self.granule_shift, span << self.granule_shift));
+        }
+      }
+      None
+    })
+  }
+
+  /// Records that the live `block` is locked in RAM (the owner locked its pages). Idempotent; a block that names no
+  /// live block is refused as a free would refuse it.
+  pub fn lock_block(&mut self, block: Block) -> Result<(), MemError> {
+    let (index, order) = self
+      .validate(block)
+      .map_err(|reason| MemError::ForeignExtent {
+        offset: block.offset,
+        len: block.len,
+        reason,
+      })?;
+    if !self.locked.get(index) {
+      self.locked.set(index, true);
+      self.locked_bytes = self.locked_bytes.saturating_add(self.order_bytes(order));
+    }
+    Ok(())
+  }
+
+  /// Whether the live `block` is locked; false for one that names no live block.
+  pub fn is_locked(&self, block: Block) -> bool {
+    self
+      .validate(block)
+      .is_ok_and(|(index, _)| self.locked.get(index))
+  }
+
+  /// The bytes of the locked blocks.
+  pub const fn locked_bytes(&self) -> usize {
+    self.locked_bytes
+  }
+
+  /// Clears the lock bit of the head at `index` (a block being released), returning whether it was set.
+  fn unmark_locked(&mut self, index: u32, order: u32) -> bool {
+    if !self.locked.get(index) {
+      return false;
+    }
+    self.locked.set(index, false);
+    self.locked_bytes = self.locked_bytes.saturating_sub(self.order_bytes(order));
+    true
   }
 
   /// Bytes per granule.
@@ -412,7 +482,8 @@ impl Buddy {
         reason,
       })?;
     if !self.named_by_an_image(index) {
-      self.release(index, order);
+      // Released now: the owner asked `is_locked` first and unlocks the pages itself.
+      let _ = self.release(index, order);
       return Ok(false);
     }
     if self.deferred.get(index) {
@@ -514,12 +585,13 @@ impl Buddy {
   /// deferred block the new image cannot name is freed. One freed while the capture was open stays deferred,
   /// since the new image may name it, and the next commit frees it.
   pub fn commit_capture(&mut self) {
-    self.commit_capture_releasing(|_, _| {});
+    self.commit_capture_releasing(|_, _, _| {});
   }
 
   /// [`Buddy::commit_capture`], telling `released` the byte offset and length of every block it returns to the free
-  /// lists, so the owner of the bytes can scrub them (A-99: a freed block keeps no plaintext).
-  pub fn commit_capture_releasing(&mut self, mut released: impl FnMut(usize, usize)) {
+  /// lists, and whether it was locked, so the owner of the bytes can scrub them (A-99: a freed block keeps no
+  /// plaintext) and unlock what was locked.
+  pub fn commit_capture_releasing(&mut self, mut released: impl FnMut(usize, usize, bool)) {
     if !self.capturing {
       return;
     }
@@ -538,12 +610,12 @@ impl Buddy {
         let index = Bits::index_of(word, bit);
         if let Some(index) = index {
           let order = u32::from(self.state_at(index) & ORDER_MASK);
-          self.release(index, order);
+          let locked = self.release(index, order);
           if let Some(offset) = usize::try_from(index)
             .ok()
             .and_then(|index| index.checked_shl(self.granule_shift))
           {
-            released(offset, self.order_bytes(order));
+            released(offset, self.order_bytes(order), locked);
           }
         }
       }
@@ -566,12 +638,12 @@ impl Buddy {
   /// blocks freed while the capture was open stay deferred for the committed image's sake only if it names
   /// them; the others are freed now.
   pub fn abandon_capture(&mut self) {
-    self.abandon_capture_releasing(|_, _| {});
+    self.abandon_capture_releasing(|_, _, _| {});
   }
 
   /// [`Buddy::abandon_capture`], telling `released` the byte offset and length of every block it returns to the free
   /// lists (A-99, as [`Buddy::commit_capture_releasing`]).
-  pub fn abandon_capture_releasing(&mut self, mut released: impl FnMut(usize, usize)) {
+  pub fn abandon_capture_releasing(&mut self, mut released: impl FnMut(usize, usize, bool)) {
     if !self.capturing {
       return;
     }
@@ -590,12 +662,12 @@ impl Buddy {
         if let Some(index) = index {
           let order = u32::from(self.state_at(index) & ORDER_MASK);
           self.deferred_bytes = self.deferred_bytes.saturating_sub(self.order_bytes(order));
-          self.release(index, order);
+          let locked = self.release(index, order);
           if let Some(offset) = usize::try_from(index)
             .ok()
             .and_then(|index| index.checked_shl(self.granule_shift))
           {
-            released(offset, self.order_bytes(order));
+            released(offset, self.order_bytes(order), locked);
           }
         }
       }
@@ -675,6 +747,8 @@ impl Buddy {
       }
       self.live.set(index, false);
     }
+    // The owner asked `is_locked` before the free and unlocks the pages itself; the bit goes with the block.
+    let _ = self.unmark_locked(index, order);
     self.coalesce_free(index, order);
     Ok(())
   }
@@ -682,11 +756,13 @@ impl Buddy {
   /// Returns the allocated block of `order` at `index` to the free lists, coalescing.
   /// Never a block an image names: the deferral keeps those until a commit, and the commit replaces the committed
   /// set whole, so its bit needs no clearing here.
-  fn release(&mut self, index: u32, order: u32) {
+  fn release(&mut self, index: u32, order: u32) -> bool {
     if self.imaged {
       self.live.set(index, false);
     }
+    let locked = self.unmark_locked(index, order);
     self.coalesce_free(index, order);
+    locked
   }
 
   /// Returns the block of `order` at `index` to the free lists, coalescing; its live bit is the caller's.

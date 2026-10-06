@@ -63,6 +63,7 @@ mod callback;
 #[cfg(unix)]
 mod delegation;
 mod listing;
+mod lock_ledger;
 #[cfg(unix)]
 pub mod nfs;
 #[cfg(unix)]

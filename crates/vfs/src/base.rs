@@ -2245,7 +2245,9 @@ impl Overlay<'_> {
       let handle = self.vol.make_current_inode(store, no)?;
       let before = crate::volume::content_by_epoch(store, handle);
       let epoch = self.vol.epoch;
-      let mut open = store.content.open(start, bytes.len(), epoch)?;
+      let mut open = store
+        .content
+        .open(start, bytes.len(), epoch, self.vol.locked)?;
       store.content.write_open(&mut open, 0, &bytes)?;
       if let Some(extent) = store.content.seal(open, self.vol.seal_key)?
         && let Body::Base(b) = &mut store.inodes.get_mut(handle)?.body

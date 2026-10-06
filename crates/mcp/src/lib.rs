@@ -1949,6 +1949,8 @@ fn shard_json(s: &ShardReport, telemetry: Option<&TelemetryReport>) -> Value {
     "replayed_records": s.replayed_records,
     "replay_ns": s.replay_ns,
     "torn_tail": s.torn_tail,
+    "mapped_bytes": s.mapped_bytes,
+    "locked_bytes": s.locked_bytes,
     "reserve_bytes": s.reserve_bytes,
     "committed_bytes": s.committed_bytes,
     "version_slots": s.version_slots,

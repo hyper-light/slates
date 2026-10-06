@@ -2258,6 +2258,13 @@ enum Held {
 #[derive(Debug, Default)]
 pub struct Claims {
   held: BTreeMap<(u16, u64), Held>,
+  /// Whether the image being claimed is a strict (`--locked`) volume's, whose blocks are locked as they are claimed.
+  locking: bool,
+  /// Whether locking one of the current image's blocks was refused by the OS.
+  short: bool,
+  /// The strict volumes, by the caller's key, a block of which the OS would not lock: each is refused at its rebuild
+  /// rather than served from swappable memory, and the shard's other volumes recover all the same.
+  unlockable: std::collections::BTreeSet<[u8; 16]>,
 }
 
 impl Claims {
@@ -2268,9 +2275,25 @@ impl Claims {
     store: &mut Store,
     images: impl IntoIterator<Item = &'a VolumeImage>,
   ) -> Result<Claims, VfsError> {
+    Claims::prepare_with(
+      store,
+      images.into_iter().map(|image| ([0u8; 16], image, false)),
+    )
+  }
+
+  /// [`Claims::prepare`], each image named by its volume's key and marked strict when its volume is `--locked` (§4.2
+  /// D-12): a strict image's blocks are locked as they are claimed (a block it shares with another image is locked
+  /// when either is strict). A block the OS will not lock stays claimed, unlocked, and its volume is named in
+  /// [`Claims::unlockable`], so only that volume is refused.
+  pub fn prepare_with<'a>(
+    store: &mut Store,
+    images: impl IntoIterator<Item = ([u8; 16], &'a VolumeImage, bool)>,
+  ) -> Result<Claims, VfsError> {
     let mut claims = Claims::default();
     let mut claimed = Ok(());
-    'images: for image in images {
+    'images: for (key, image, locked) in images {
+      claims.locking = locked;
+      claims.short = false;
       let snapshot_inodes = image.snapshots.iter().flat_map(|snap| snap.inodes.iter());
       for inode in image.inodes.iter().chain(snapshot_inodes) {
         claimed = claims.claim_body(store, &inode.body);
@@ -2278,7 +2301,11 @@ impl Claims {
           break 'images;
         }
       }
+      if claims.short {
+        claims.unlockable.insert(key);
+      }
     }
+    claims.locking = false;
     if let Err(refusal) = claimed {
       claims.give_back(store);
       return Err(refusal);
@@ -2290,6 +2317,18 @@ impl Claims {
   /// The blocks claimed.
   pub fn blocks(&self) -> usize {
     self.held.len()
+  }
+
+  /// Whether the strict volume keyed `key` had a block the OS would not lock (see [`Claims::prepare_with`]).
+  pub fn unlockable(&self, key: &[u8; 16]) -> bool {
+    self.unlockable.contains(key)
+  }
+
+  /// Locks `block` when the image being claimed is strict; the OS's refusal marks the image short, never fails.
+  fn lock_if_strict(&mut self, store: &mut Store, block: slates_mem::Extent) {
+    if self.locking && store.content.lock_block(block).is_err() {
+      self.short = true;
+    }
   }
 
   fn claim_body(&mut self, store: &mut Store, body: &BodyImage) -> Result<(), VfsError> {
@@ -2322,7 +2361,13 @@ impl Claims {
     }
     let key = (chunk.block.region, chunk.block.offset);
     match self.held.get(&key) {
-      Some(Held::Chunk(_, held)) if held == chunk => Ok(()),
+      Some(Held::Chunk(handle, held)) if held == chunk => {
+        // Shared with an image claimed before: locked now if this one is strict.
+        if let Some(block) = store.content.chunk(*handle).map(|chunk| chunk.block) {
+          self.lock_if_strict(store, block);
+        }
+        Ok(())
+      }
       Some(_) => Err(VfsError::RecoveryIncomplete),
       None => {
         let block =
@@ -2364,6 +2409,7 @@ impl Claims {
           }
         };
         self.held.insert(key, Held::Chunk(handle, chunk.clone()));
+        self.lock_if_strict(store, block);
         Ok(())
       }
     }
@@ -2375,7 +2421,11 @@ impl Claims {
     }
     let key = (open.block.region, open.block.offset);
     match self.held.get(&key) {
-      Some(Held::Open(_, held)) if held == open => Ok(()),
+      Some(Held::Open(block, held)) if held == open => {
+        let block = *block;
+        self.lock_if_strict(store, block);
+        Ok(())
+      }
       Some(_) => Err(VfsError::RecoveryIncomplete),
       None => {
         let block =
@@ -2385,6 +2435,7 @@ impl Claims {
         // The bytes past the imaged length (writes made after this image) are never served: every read stops
         // at the length and every write zero-fills a gap it extends over (`ChunkStore::write_open`).
         self.held.insert(key, Held::Open(block, *open));
+        self.lock_if_strict(store, block);
         Ok(())
       }
     }

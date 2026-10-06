@@ -126,6 +126,11 @@ pub fn refusal_of_vfs(e: &VfsError) -> Refusal {
     VfsError::Memory(MemError::BudgetExceeded { available, .. }) => Refusal::BudgetExceeded {
       available: *available,
     },
+    // The OS would not lock a strict volume's block (its locked-memory limit fell below what was admitted, or another
+    // process took the wire limit): typed as the lock-capacity refusal, with what was locked when it refused.
+    VfsError::Memory(MemError::LockRefused { locked, .. }) => Refusal::BudgetExceeded {
+      available: u64::try_from(*locked).unwrap_or(u64::MAX),
+    },
     VfsError::DigestNotClean => Refusal::DigestNotClean,
     VfsError::DigestUnverified => Refusal::DigestUnverified,
     // Refused whole, retryable under the same id: the arena waits on the shard's next publication (A-64).

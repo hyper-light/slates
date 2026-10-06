@@ -978,6 +978,28 @@ Same code, zero modes.
 > - The locking shard itself spends about 36 ms a GiB in one call, once per region (the lock is idempotent). That is
 >   an unsliced step, owed (GAPS 2026-10-04).
 
+> **Status (2026-10-06, a strict volume locks only its own content).** The refinement GAP-A9-1 recorded is built,
+> and it closes four defects of the per-shard lock (`docs/bugs/2026-10-06-a-locked-volume-wired-its-shards-whole-arena.md`):
+> a 4 MiB `--locked` volume wired its shard's 16 GiB arena on macOS and stalled the shard about 2 s; it pinned every
+> plain volume on its shard; nothing reserved its entitlement against the lock limit, so a shortfall surfaced later
+> as an untyped write refusal; and recovery never locked again, so after a restart a strict volume was swappable.
+> - **Blocks, not regions.** The arena locks a block's pages (`ChunkArena::alloc_locked`, `lock_extent`; a block is a
+>   page multiple on a page boundary) and the buddy keeps a per-head locked bit. Every release path, the deferred
+>   releases a recovery image holds back among them, unlocks a block that was locked. Locked memory is a strict
+>   volume's content held, never address space mapped and never a neighbour's.
+> - **The policy is the volume's** (`Volume::set_locked`), set by create, clone, takeover and recovery. Its new
+>   extents open locked, and a block replacing one of its blocks inherits the lock.
+> - **Admission** reserves a strict volume's whole entitlement (bound or dynamic maximum) against the process's
+>   measured lock capacity (`DaemonConfig::lock_capacity_bytes`, the profile's limit when its confirming lock
+>   succeeded) in a per-daemon ledger (`lock_ledger`). One that does not fit is refused `BudgetExceeded` at create,
+>   clone, takeover or recovery. A block the OS still will not lock is refused `BudgetExceeded`, never `BadRequest`.
+> - **Recovery** claims a strict volume's blocks locked (`Claims::prepare_with`). A volume whose blocks the OS will not
+>   lock is refused at its rebuild, and the shard's other volumes recover as usual.
+> - **Measured** (macOS, Apple M5 Max): wired memory unchanged by an empty strict create (5,290 → 5,288 MiB, against
+>   +16,434 MiB before), a 48 ms reply, and exactly 1,048,576 bytes locked for a 1 MiB file, a plain neighbour's
+>   1 MiB unlocked. On Linux the kernel's `VmLck` agrees; with `ulimit -l 512` the strict create is refused up front.
+>   `slates status` reports each shard's `locked` bytes. The unsliced whole-region lock step above no longer exists.
+
 **Ownership and residency.** Each shard owns bounded generational slabs and chunk arenas;
 foreign frees are messages to the owner. Every allocation has a charge owner and a terminal
 release step. Releasing a handle reuses its slot with a new generation; repeated open/close

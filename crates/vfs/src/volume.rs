@@ -328,6 +328,9 @@ pub struct Volume {
   /// The key this volume's chunks are sealed under, by the store cipher's reference (A-99); `None` keeps them in the
   /// clear (no cipher, or sealing unavailable on this node).
   pub(crate) seal_key: Option<u32>,
+  /// Whether the volume's content is locked in RAM (§4.2 D-12, a strict `--locked` volume): every block it allocates
+  /// is locked, and only its blocks, so a plain volume beside it is never pinned by its neighbour's policy.
+  pub(crate) locked: bool,
   /// The inodes written since an idle sweep, each by the sweep tick it was last written in (A-99): a sweep seals the
   /// open extent of each one not written since the sweep before, so a file smaller than a chunk is not left in
   /// plaintext while idle. Bounded by the volume's inodes; empty for a volume that does not seal.
@@ -582,6 +585,7 @@ impl Volume {
       bytes: ByEpoch::default(),
       journal: OpLog::new(config.journal_bytes),
       seal_key: None,
+      locked: false,
       written: BTreeMap::new(),
       sweep_tick: 0,
       idle_pending: std::collections::BTreeSet::new(),
@@ -654,6 +658,7 @@ impl Volume {
       bytes: ByEpoch::inherited(epoch, referenced),
       journal: OpLog::new(config.journal_bytes),
       seal_key: None,
+      locked: false,
       written: BTreeMap::new(),
       sweep_tick: 0,
       idle_pending: std::collections::BTreeSet::new(),
@@ -746,6 +751,7 @@ impl Volume {
       bytes: ByEpoch::default(),
       journal: OpLog::new(journal_bytes),
       seal_key: None,
+      locked: false,
       written: BTreeMap::new(),
       sweep_tick: 0,
       idle_pending: std::collections::BTreeSet::new(),
@@ -1084,6 +1090,17 @@ impl Volume {
   /// Seals this volume's chunks from now on under the store cipher's key `key` (A-99), or keeps them in the clear.
   pub fn set_seal_key(&mut self, key: Option<u32>) {
     self.seal_key = key;
+  }
+
+  /// Sets whether the volume's new content is locked in RAM (§4.2 D-12); the daemon sets it from the volume's policy
+  /// before the volume takes any write. Content it already holds is locked by the caller (recovery's claims).
+  pub fn set_locked(&mut self, locked: bool) {
+    self.locked = locked;
+  }
+
+  /// Whether the volume's content is locked in RAM.
+  pub fn locked(&self) -> bool {
+    self.locked
   }
 
   /// The idle sweep (A-99) in one call: [`Volume::age_writes`], then [`Volume::seal_pending`] within `budget_bytes`.
@@ -5029,10 +5046,12 @@ impl Volume {
         } else {
           inline_len
         };
-        let mut open = match store
-          .content
-          .open(0, usize::try_from(window_zero).unwrap_or(0), epoch)
-        {
+        let mut open = match store.content.open(
+          0,
+          usize::try_from(window_zero).unwrap_or(0),
+          epoch,
+          self.locked,
+        ) {
           Ok(open) => open,
           Err(refusal) => return refused(Body::Inline(v), refusal),
         };
@@ -5137,10 +5156,10 @@ impl Volume {
     let epoch = self.epoch;
     let window_start = cursor - (cursor % chunk);
     let Some(pos) = sealed.iter().position(|e| e.off == window_start) else {
-      return store.content.open(window_start, want, epoch);
+      return store.content.open(window_start, want, epoch, self.locked);
     };
     let e = sealed.remove(pos);
-    let open = match store.content.reopen(&e, epoch) {
+    let open = match store.content.reopen(&e, epoch, self.locked) {
       Ok(open) => open,
       Err(refusal) => {
         // Refused before anything changed: the window keeps its sealed extent.
@@ -5622,7 +5641,12 @@ fn rebuilt_if_smaller(
   }
   // The smaller block is an economy, never a requirement: when the arena or the chunk slab cannot give it now, the
   // clipped extent keeps its block, and its charge follows that block (`content_by_epoch`).
-  let Ok(open) = store.content.reopen(&clipped, epoch) else {
+  // The rebuilt chunk replaces the clipped one in its volume: locked if that chunk's block was.
+  let locked = store
+    .content
+    .chunk(chunk)
+    .is_some_and(|c| store.content.arena().is_locked(c.block));
+  let Ok(open) = store.content.reopen(&clipped, epoch, locked) else {
     return Ok(clipped);
   };
   let rebuilt = match store.content.seal(open, key) {

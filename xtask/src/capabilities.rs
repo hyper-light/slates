@@ -22,6 +22,10 @@ pub enum Status {
   /// Works within the stated limits, proven by the cited tests.
   Limited,
   /// Not built; the limits name the gap that tracks it.
+  #[expect(
+    dead_code,
+    reason = "no capability is owed since 2026-10-06; the first row that becomes owed fulfils this and removes it"
+  )]
   Owed,
 }
 
@@ -282,10 +286,19 @@ pub const CAPABILITIES: &[Capability] = &[
   },
   Capability {
     name: "Locked residency (`--locked`): pinned, unswappable volume memory",
-    status: Status::Owed,
-    r#where: "—",
-    limits: "`--locked` records the intent only (AUD-29-77)",
-    evidence: &[],
+    status: Status::Limited,
+    r#where: "macOS, Linux",
+    limits: "the volume's own content is locked as it is written, never its shard's arena or a neighbour's; the whole entitlement is reserved against the process's lock limit at create, or refused typed (`BudgetExceeded`); re-locked after a daemon restart; Windows builds the per-block lock but no lane runs it yet",
+    evidence: &[
+      ev(
+        "crates/cli/tests/cli.rs",
+        "a_locked_volume_locks_only_its_own_content_across_a_restart_or_is_refused_with_nothing_locked",
+      ),
+      ev(
+        "crates/mem/tests/capacity.rs",
+        "the_arena_locks_the_blocks_asked_never_the_region_or_their_neighbours",
+      ),
+    ],
   },
 ];
 
