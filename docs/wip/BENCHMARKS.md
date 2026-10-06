@@ -2217,8 +2217,10 @@ not finish its first scenario in 9 minutes of CPU; sampled):
 The harness had three faults of its own, all fixed: names `f{at:03}` stopped sorting past 999 chunks, chunk contents
 repeated every 256 chunks (a 64 MiB archive held 16 MiB of distinct chunks, so goodput read 230 Mbit/s on a 100 Mbit/s
 link), and the warm-up hedged at the deadline where the daemon hedges at 100 ms with no readings (a silent holder
-ranked first for the manifest froze it). Some rows vary run to run (5% loss, 8 readers with loss): the simulation is not
-fully deterministic across runs, owed.
+ranked first for the manifest froze it). Some rows varied run to run (5% loss, 8 readers with loss): the bench's self-signed ECDSA
+certificates sign with a random nonce, so a signature's DER length varies (70-72 bytes) and with it the handshake's
+packet sizes and every virtual timing after. With Ed25519 (always 64 bytes) three runs of the grid are identical to the
+tenth of a millisecond.
 
 ### Codemode against list-and-read on a real agent task (condition 13; 2026-10-05)
 

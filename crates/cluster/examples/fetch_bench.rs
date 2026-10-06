@@ -149,7 +149,10 @@ fn config() -> RuntimeConfig {
 }
 
 fn identity() -> Identity {
-  let key = rcgen::KeyPair::generate().unwrap();
+  // Ed25519: a signature is always 64 bytes, so the handshake's packets are the same size every run; an ECDSA
+  // signature's DER length varies with its random nonce (70-72 bytes), which moved packet boundaries and so the
+  // virtual timings, and some rows differed run to run.
+  let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
   let certificate = rcgen::CertificateParams::new(vec![NAME.to_owned()])
     .unwrap()
     .self_signed(&key)
