@@ -57,7 +57,8 @@ const fn ev(file: &'static str, test: &'static str) -> Evidence {
   Evidence { file, test }
 }
 
-/// The registry, reviewed 2026-10-01 against the tree and the gap ledger.
+/// The registry, reviewed 2026-10-06 against the tree and the gap ledger (the Linux mount, container, Kubernetes
+/// and VM rows brought up to AUD-29-64/66/67/68/75, closed 2026-10-02).
 pub const CAPABILITIES: &[Capability] = &[
   Capability {
     name: "Volumes: create, snapshot, clone, resize, destroy (CLI and daemon)",
@@ -87,10 +88,18 @@ pub const CAPABILITIES: &[Capability] = &[
   },
   Capability {
     name: "Mount a volume on Linux",
-    status: Status::Limited,
+    status: Status::Works,
     r#where: "Linux",
-    limits: "the daemon's NFS export, mounted by the kernel client as root; the FUSE bridge is not served by the daemon yet (AUD-29-64)",
+    limits: "FUSE served by the daemon, mounted as an ordinary user (`fusermount3`); the mount and every acknowledged write survive a daemon restart on kernels 6.9+, and older kernels end the mount (AC-3.4)",
     evidence: &[
+      ev(
+        "crates/cli/tests/cli.rs",
+        "slates_mount_on_linux_serves_a_fuse_mount_and_unmount_ends_it",
+      ),
+      ev(
+        "crates/cli/tests/cli.rs",
+        "a_fuse_mount_whose_daemon_was_killed_is_ended_by_the_restarted_daemon",
+      ),
       ev(
         "crates/server/tests/nfs_v4_kernel.rs",
         "the_linux_kernel_nfsv4_client_mounts_and_works_a_volume",
@@ -218,22 +227,58 @@ pub const CAPABILITIES: &[Capability] = &[
   Capability {
     name: "Containers: an OCI runtime binds a volume",
     status: Status::Limited,
-    r#where: "Linux",
-    limits: "the host attachment is bound into the container; a served FUSE export and live source authority are owed (AUD-29-64–67)",
-    evidence: &[ev(
-      "crates/cli/tests/cli.rs",
-      "an_oci_container_consumes_the_host_attachment_through_the_runtime_bind",
-    )],
+    r#where: "macOS (Docker Desktop), Linux (Docker Engine)",
+    limits: "the profiles a container workload has run through: Docker Desktop over its local socket, and Docker Engine through `slates mount --shared`; the source is re-verified as the same mount instance just before each bind; rootless engines and other runtimes are refused typed until a workload runs through them (AUD-29-67)",
+    evidence: &[
+      ev(
+        "crates/cli/tests/cli.rs",
+        "an_oci_container_consumes_the_host_attachment_through_the_runtime_bind",
+      ),
+      ev(
+        "crates/cli/tests/cli.rs",
+        "a_linux_container_reaches_the_shared_mount_as_its_own_ids",
+      ),
+      ev(
+        "crates/cli/tests/cli.rs",
+        "a_verified_container_source_is_checked_again_before_it_is_bound",
+      ),
+    ],
   },
   Capability {
-    name: "VM guests over virtio-fs",
+    name: "Kubernetes: kubelet mounts a volume as an NFS PersistentVolume",
     status: Status::Limited,
-    r#where: "a simulated guest driver",
-    limits: "no real VMM binding yet (AUD-29-68–73)",
-    evidence: &[ev(
-      "crates/server/tests/virtiofs.rs",
-      "a_guest_writes_a_file_into_a_daemon_volume_that_the_host_reads_back_over_nfs",
-    )],
+    r#where: "Linux nodes with kernel TLS",
+    limits: "no privilege and no CSI driver (a node plugin needs privileged mount propagation): kubelet mounts the daemon's NFSv4.2 export over RPC-with-TLS with mutual X.509 (`xprtsec=mtls`); the kubelet leg is the `cargo xtask kind export` lane on the Linux CI runner, not a unit test (green first on `56272c0`, run 36965111945)",
+    evidence: &[
+      ev(
+        "crates/cli/tests/cli.rs",
+        "an_anchored_node_serves_its_export_over_rpc_with_tls_across_a_daemon_restart",
+      ),
+      ev(
+        "crates/server/tests/fleet.rs",
+        "a_fleet_node_with_an_operator_authority_serves_its_export_over_rpc_with_tls",
+      ),
+      ev(
+        "crates/server/tests/fleet.rs",
+        "the_network_exports_teardown_is_its_attachments",
+      ),
+    ],
+  },
+  Capability {
+    name: "VM guests over virtio-fs (vhost-user)",
+    status: Status::Limited,
+    r#where: "Linux hosts",
+    limits: "QEMU's `vhost-user-fs-pci` over an inherited socket with sealed-memfd guest RAM, a live guest in CI (KVM where present) running the nine roster workloads identically; no other VMM has run it yet (Firecracker, Cloud Hypervisor untested)",
+    evidence: &[
+      ev(
+        "crates/server/tests/virtiofs.rs",
+        "a_vhost_user_front_end_drives_a_guest_whose_file_the_host_reads_back",
+      ),
+      ev(
+        "crates/server/tests/virtiofs.rs",
+        "a_live_guest_runs_the_roster_workloads_identically_on_slates_and_on_its_ram",
+      ),
+    ],
   },
   Capability {
     name: "Locked residency (`--locked`): pinned, unswappable volume memory",
