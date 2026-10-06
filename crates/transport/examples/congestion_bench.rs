@@ -216,7 +216,10 @@ fn config() -> RuntimeConfig {
 }
 
 fn self_signed(name: &str) -> Identity {
-  let key = rcgen::KeyPair::generate().unwrap();
+  // Ed25519, not rcgen's default ECDSA: an ECDSA signature's DER length varies with its random nonce
+  // (70-72 bytes), which moves the handshake's packet sizes and every virtual timing after, so two runs
+  // of one build differed; Ed25519's is always 64 bytes (the same fix as cluster's `fetch_bench`).
+  let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
   let cert = rcgen::CertificateParams::new(vec![name.to_owned()])
     .unwrap()
     .self_signed(&key)

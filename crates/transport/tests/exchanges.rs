@@ -269,6 +269,9 @@ async fn coordinate<T, W, F>(
   let client_cert = client_identity.certificate();
   let (done_tx, done_rx) = channel::<()>();
   let (server_tx, server_rx) = channel::<Result<ServerReport, String>>();
+  // The client's word that it settled: the server answers until then, as a live peer does, so the client's
+  // own last acknowledgements are not left owed to a session already dropped.
+  let (settled_tx, settled_rx) = channel::<()>();
   let server = slates_rt::futures::spawn_child(async move {
     let peer = SocketAddrV4::new(Ipv4Addr::LOCALHOST, client_port);
     let outcome = match Endpoint::server(
@@ -278,10 +281,12 @@ async fn coordinate<T, W, F>(
       &[client_cert],
       shape(windows),
     ) {
-      Ok(endpoint) => serve(endpoint, mode, done_rx).await,
-      Err(e) => Err(format!("server: {e:?}")),
+      Ok(endpoint) => serve(endpoint, mode, done_rx, &server_tx, &settled_rx).await,
+      Err(e) => Some(Err(format!("server: {e:?}"))),
     };
-    let _ = server_tx.send(outcome);
+    if let Some(outcome) = outcome {
+      let _ = server_tx.send(outcome);
+    }
   })
   .unwrap();
   let client = slates_rt::futures::spawn_child(async move {
@@ -294,7 +299,7 @@ async fn coordinate<T, W, F>(
       NAME,
       shape(windows),
     ) {
-      Ok(endpoint) => drive_client(endpoint, client_work, done_tx, server_rx).await,
+      Ok(endpoint) => drive_client(endpoint, client_work, done_tx, server_rx, settled_tx).await,
       Err(e) => Report {
         client: Err(format!("client: {e:?}")),
         client_census: EndpointCensus::default(),
@@ -316,6 +321,7 @@ async fn drive_client<T, W, F>(
   client_work: W,
   done_tx: Sender<()>,
   server_rx: Receiver<Result<ServerReport, String>>,
+  settled_tx: Sender<()>,
 ) -> Report<T>
 where
   W: FnOnce(Endpoint) -> F,
@@ -345,6 +351,7 @@ where
     RUN_BOUND_NS
   };
   let client_settle = within(settle_bound, endpoint.settle()).await;
+  let _ = settled_tx.send(());
   let client_settled = matches!(client_settle, Some(Ok(())));
   let client_settle_cut_off = client_settle.is_none();
   if client_settled {
@@ -402,15 +409,57 @@ fn stalled<T>(stage: &str, started: u64) -> Report<T> {
   }
 }
 
+/// The client is done: settles, reports on `report` once this end holds nothing, then answers until the
+/// client has settled (`client_settled`, bounded), so the client's own last acknowledgements are not owed to
+/// a session already dropped.
+async fn settle_report_and_answer(
+  endpoint: &mut Endpoint,
+  served: u32,
+  report: &Sender<Result<ServerReport, String>>,
+  client_settled: &Receiver<()>,
+) {
+  let settled = matches!(within(RUN_BOUND_NS, endpoint.settle()).await, Some(Ok(())));
+  // Settled means the peer is owed nothing; a credit frame may still be in flight. Drive on until this end
+  // holds nothing at all, so the leak check is "nothing held", not merely "nothing owed".
+  let _ = within(RUN_BOUND_NS, drive_to_quiescence(endpoint)).await;
+  let _ = report.send(Ok(ServerReport {
+    census: endpoint.census(),
+    violations: endpoint.protocol_violations(),
+    served,
+    settled,
+  }));
+  let answer_until = slates_rt::futures::now_ns().saturating_add(RUN_BOUND_NS);
+  while client_settled.try_recv().is_err() && slates_rt::futures::now_ns() < answer_until {
+    if let Some(Err(_)) = within(TICK_NS, endpoint.drive()).await {
+      break;
+    }
+  }
+}
+
+/// Serves until the client is done, then settles and reports on `report` and keeps answering until the
+/// client has settled (`client_settled`, bounded): a live peer acknowledges to the end. Returns an outcome still to
+/// report, if it has not reported.
 async fn serve(
   mut endpoint: Endpoint,
   mode: ServerMode,
   done_rx: Receiver<()>,
-) -> Result<ServerReport, String> {
+  report: &Sender<Result<ServerReport, String>>,
+  client_settled: &Receiver<()>,
+) -> Option<Result<ServerReport, String>> {
+  serve_until_done(&mut endpoint, mode, done_rx, report, client_settled).await
+}
+
+async fn serve_until_done(
+  endpoint: &mut Endpoint,
+  mode: ServerMode,
+  done_rx: Receiver<()>,
+  report: &Sender<Result<ServerReport, String>>,
+  client_settled: &Receiver<()>,
+) -> Option<Result<ServerReport, String>> {
   match within(RUN_BOUND_NS, endpoint.establish()).await {
     Some(Ok(())) => {}
-    Some(Err(e)) => return Err(format!("server establish: {e:?}")),
-    None => return Err("server handshake stalled".to_owned()),
+    Some(Err(e)) => return Some(Err(format!("server establish: {e:?}"))),
+    None => return Some(Err("server handshake stalled".to_owned())),
   }
   let mut served = 0u32;
   let deadline = slates_rt::futures::now_ns().saturating_add(RUN_BOUND_NS);
@@ -419,25 +468,16 @@ async fn serve(
       && served >= n
     {
       // Dies: the session is dropped with the requests unanswered.
-      return Ok(ServerReport {
+      return Some(Ok(ServerReport {
         census: endpoint.census(),
         violations: endpoint.protocol_violations(),
         served,
         settled: false,
-      });
+      }));
     }
     if done_rx.try_recv().is_ok() {
-      let settled = matches!(within(RUN_BOUND_NS, endpoint.settle()).await, Some(Ok(())));
-      // Settled means the peer is owed nothing; a credit frame may still be in flight. Drive on until
-      // this end holds nothing at all (the client is still lingering, so it is acknowledged), so the leak
-      // check below is "nothing held", not merely "nothing owed".
-      let _ = within(RUN_BOUND_NS, drive_to_quiescence(&mut endpoint)).await;
-      return Ok(ServerReport {
-        census: endpoint.census(),
-        violations: endpoint.protocol_violations(),
-        served,
-        settled,
-      });
+      settle_report_and_answer(endpoint, served, report, client_settled).await;
+      return None;
     }
     let turn = match mode {
       ServerMode::Serve => within(TICK_NS, endpoint.serve_once(answer)).await,
@@ -447,11 +487,13 @@ async fn serve(
     };
     match turn {
       Some(Ok(())) => served += 1,
-      Some(Err(e)) => return Err(format!("server serve: {e:?}")),
+      Some(Err(e)) => return Some(Err(format!("server serve: {e:?}"))),
       None => {}
     }
   }
-  Err("the server's serve loop reached its deadline".to_owned())
+  Some(Err(
+    "the server's serve loop reached its deadline".to_owned(),
+  ))
 }
 
 /// Asserts a healthy run: the client's work succeeded, neither end saw a protocol violation, both settled,

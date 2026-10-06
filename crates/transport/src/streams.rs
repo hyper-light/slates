@@ -471,9 +471,12 @@ impl StreamSpace {
     self.wanting = wanting;
   }
 
-  /// Takes the peer's `MaxStreams` credit (it only ever rises; a stale, reordered one is ignored).
-  pub fn on_max_streams(&mut self, max: u64) {
+  /// Takes the peer's `MaxStreams` credit (it only ever rises; a stale, reordered one is ignored), and
+  /// returns the sequences it newly admits, `[from, to)` (empty when it raised nothing).
+  pub fn on_max_streams(&mut self, max: u64) -> (u64, u64) {
+    let from = self.peer_credit;
     self.peer_credit = self.peer_credit.max(max);
+    (from, self.peer_credit)
   }
 
   /// How many streams each kind of state holds.

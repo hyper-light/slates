@@ -29,12 +29,24 @@ pub struct StreamSender {
   credit: u64,
   finished: bool,
   fin_framed: bool,
+  /// Its place in the order its connection installed send streams: the order the round-robin serves in.
+  installed: u64,
 }
 
 impl StreamSender {
   /// A fresh sender with no credit (nothing sends until the peer grants some).
   pub fn new() -> StreamSender {
     StreamSender::default()
+  }
+
+  /// Its place in the order its connection installed send streams.
+  pub fn installed(&self) -> u64 {
+    self.installed
+  }
+
+  /// Records its place in the order its connection installed send streams.
+  pub fn set_installed(&mut self, installed: u64) {
+    self.installed = installed;
   }
 
   /// Buffers application bytes to send, in order.

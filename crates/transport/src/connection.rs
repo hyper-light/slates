@@ -195,6 +195,9 @@ pub struct SendStops {
   pub credit: u64,
   /// No stream had data it could send (none at all, or none within its stream credit).
   pub empty: u64,
+  /// Streams the fresh-frame scheduler examined (the work witness: it must not grow with the streams that
+  /// have nothing to send).
+  pub examined: u64,
 }
 
 /// What a connection is built with: the packet budget it frames at (the datagram payload one packet
@@ -230,10 +233,29 @@ impl ConnectionShape {
 pub struct Connection {
   /// The send streams, keyed by id (each framed only within the credit the peer has advertised for it).
   send_streams: BTreeMap<u64, StreamSender>,
-  /// Send stream ids by class, each in the order opened.
-  send_order: PerClass<Vec<u64>>,
-  /// The round-robin cursor into each class's `send_order`.
-  send_cursor: PerClass<usize>,
+  /// By class, the send streams that can frame data now (within the peer's stream credit, with bytes or
+  /// a final frame inside their own credit), as (install order, id): the order the connection took them on,
+  /// replies and its own exchanges alike. A stream joins
+  /// when it becomes sendable (opened, granted credit, admitted by the peer's stream credit) and leaves when
+  /// framing empties it or it is forgotten, so a fresh frame costs O(log n) whatever the streams with
+  /// nothing to send; the scan it replaced stepped over every one of them for each frame.
+  ready: PerClass<std::collections::BTreeSet<(u64, u64)>>,
+  /// By class, the stream served last: the next is the first ready one after it in install order,
+  /// wrapping. A finished stream resets it, so service restarts at the oldest, as the scan did; a pure
+  /// rotation that never restarted was measured and lost (control p99 ×1.37 at 100 Mbit/s, 20 ms, 1 %
+  /// loss: completion time favours first-come service over processor sharing among similar sizes). The
+  /// scan's cursor was an index that wrapped when it served the last stream, so streams installed after
+  /// that waited a whole cycle; serving after the last served instead measured control p99 ×0.989,
+  /// metadata ×0.915 and bulk ×1.024 over the 20-seed class grid (docs/wip/BENCHMARKS.md, 2026-10-06).
+  served: PerClass<Option<(u64, u64)>>,
+  /// The install order the next send stream takes.
+  next_installed: u64,
+  /// The service rule computed the slow way, in tests: send stream ids by class in install order and the
+  /// one served last (none after a completion); the frames whose choice differed from the ready sets'.
+  #[cfg(test)]
+  scan: PerClass<(Vec<u64>, Option<u64>)>,
+  #[cfg(test)]
+  scan_differed: u64,
   /// Stream control frames (`ResetStream`, `StopSending`, `MaxStreams`) awaiting their first
   /// transmission; each leaves in the next packet and is retransmitted on loss like stream data.
   control: VecDeque<Frame>,
@@ -364,8 +386,13 @@ impl Connection {
     let reserve_frame_cap = usize::try_from(shape.max_datagram).unwrap_or(usize::MAX);
     Connection {
       send_streams: BTreeMap::new(),
-      send_order: PerClass::default(),
-      send_cursor: PerClass::default(),
+      ready: PerClass::default(),
+      served: PerClass::default(),
+      next_installed: 0,
+      #[cfg(test)]
+      scan: PerClass::default(),
+      #[cfg(test)]
+      scan_differed: 0,
       control: VecDeque::new(),
       unacked: BTreeMap::new(),
       // Derived: one stream per packet's worth of stream data within the session's receive budget — the
@@ -534,8 +561,29 @@ impl Connection {
     sender.write(data);
     sender.grant_credit(self.initial_window);
     sender.finish();
+    sender.set_installed(self.next_installed);
+    self.next_installed = self.next_installed.saturating_add(1);
+    #[cfg(test)]
+    if !self.send_streams.contains_key(&stream_id) {
+      self.scan.get_mut(priority(stream_id)).0.push(stream_id);
+    }
     if self.send_streams.insert(stream_id, sender).is_none() {
-      self.send_order.get_mut(priority(stream_id)).push(stream_id);
+      self.requeue(stream_id);
+    }
+  }
+
+  /// Puts `stream_id` in its class's ready set if it can frame data now, or takes it out if it cannot.
+  fn requeue(&mut self, stream_id: u64) {
+    let Some(sender) = self.send_streams.get(&stream_id) else {
+      return;
+    };
+    let entry = (sender.installed(), stream_id);
+    let sendable = self.streams.sendable(stream_id) && sender.has_sendable();
+    let ready = self.ready.get_mut(priority(stream_id));
+    if sendable {
+      ready.insert(entry);
+    } else {
+      ready.remove(&entry);
     }
   }
 
@@ -1024,26 +1072,37 @@ impl Connection {
 
   /// Whether a stream of `class` has bytes it could frame now, within its stream credit.
   fn class_has_sendable(&self, class: Priority) -> bool {
-    self.send_order.get(class).iter().any(|stream_id| {
-      self.streams.sendable(*stream_id)
-        && self
-          .send_streams
-          .get(stream_id)
-          .is_some_and(StreamSender::has_sendable)
-    })
+    !self.ready.get(class).is_empty()
+  }
+
+  /// This end's streams whose sequences the peer's raised stream credit newly admits, `[from, to)`, may
+  /// now frame: they join their rings. The sequence is an id's high bits, so they are one range of ids.
+  fn admit(&mut self, (from, to): (u64, u64)) {
+    if from >= to {
+      return;
+    }
+    let role = self.role();
+    let low = crate::streams::compose(0, Priority::Control, Role::Client, from);
+    let high = crate::streams::compose(0, Priority::Control, Role::Client, to);
+    let admitted: Vec<u64> = self
+      .send_streams
+      .range(low..high)
+      .map(|(id, _)| *id)
+      .filter(|id| crate::streams::initiator(*id) == role)
+      .collect();
+    for stream_id in admitted {
+      self.requeue(stream_id);
+    }
   }
 
   /// Whether some class has data still to frame and no connection credit it may spend — the sender is
   /// blocked at the peer's `MaxData` (RFC 9000 §4.1, §19.12) as far as that class can go.
   fn connection_credit_blocked(&self) -> bool {
     Priority::ALL.iter().any(|&class| {
+      // A rare question (asked only with nothing recoverable in flight): a walk of the send streams.
       self.class_credit(class) == 0
-        && self.send_order.get(class).iter().any(|stream_id| {
-          self.streams.sendable(*stream_id)
-            && self
-              .send_streams
-              .get(stream_id)
-              .is_some_and(|sender| !sender.is_drained())
+        && self.send_streams.iter().any(|(stream_id, sender)| {
+          priority(*stream_id) == class && self.streams.sendable(*stream_id) && !sender.is_drained()
         })
     })
   }
@@ -1060,19 +1119,49 @@ impl Connection {
       .and_then(|sender| sender.next_frame(stream_id, max_frame_len))
   }
 
-  /// Round-robin within one class.
+  /// Round-robin within one class: the first ready stream after the one served last, wrapping, frames;
+  /// one that cannot frame within `max_frame_len` is passed over. Each ready stream is tried at most once.
   fn round_robin_class(&mut self, class: Priority, max_frame_len: usize) -> Option<Frame> {
-    let count = self.send_order.get(class).len();
-    let cursor = *self.send_cursor.get(class);
-    for step in 0..count {
-      let index = cursor.saturating_add(step) % count.max(1);
-      let Some(&stream_id) = self.send_order.get(class).get(index) else {
-        continue;
-      };
-      if let Some(frame) = self.frame_of(stream_id, max_frame_len) {
-        *self.send_cursor.get_mut(class) = index.saturating_add(1) % count.max(1);
-        return Some(frame);
+    let mut after = *self.served.get(class);
+    for _ in 0..self.ready.get(class).len() {
+      let ready = self.ready.get(class);
+      let next = after
+        .and_then(|last| {
+          ready
+            .range((std::ops::Bound::Excluded(last), std::ops::Bound::Unbounded))
+            .next()
+        })
+        .or_else(|| ready.first())
+        .copied()?;
+      self.stops.examined = self.stops.examined.saturating_add(1);
+      // The scan's choice is the first stream it would try, so only a call's first candidate is compared:
+      // one that cannot frame in the room left is passed over by both.
+      #[cfg(test)]
+      if after == *self.served.get(class) {
+        let (order, last) = self.scan.get(class);
+        let ready = self.ready.get(class);
+        let start = last
+          .and_then(|last| order.iter().position(|id| *id == last))
+          .map_or(0, |at| at + 1);
+        let count = order.len().max(1);
+        let expected = (0..order.len())
+          .filter_map(|step| order.get((start + step) % count))
+          .find(|id| ready.iter().any(|(_, ready_id)| ready_id == *id));
+        if expected != Some(&next.1) {
+          self.scan_differed += 1;
+        }
       }
+      let frame = self.frame_of(next.1, max_frame_len);
+      self.requeue(next.1);
+      if frame.is_some() {
+        *self.served.get_mut(class) = Some(next);
+        #[cfg(test)]
+        {
+          self.scan.get_mut(class).1 = Some(next.1);
+        }
+        return frame;
+      }
+      after = Some(next);
     }
     None
   }
@@ -1154,6 +1243,7 @@ impl Connection {
           if let Some(sender) = self.send_streams.get_mut(stream_id) {
             sender.grant_credit(*max);
           }
+          self.requeue(*stream_id);
         }
         Frame::MaxData { max } => {
           self.peer_max_data = self.peer_max_data.max(*max);
@@ -1180,7 +1270,10 @@ impl Connection {
         // Stream credit rides acknowledgements, as the connection credit does, so it elicits none — one
         // that did made every acknowledgement answer the last (an endless exchange of acknowledgements
         // found by the reuse oracle, 2026-09-28).
-        Frame::MaxStreams { max } => self.streams.on_max_streams(*max),
+        Frame::MaxStreams { max } => {
+          let admitted = self.streams.on_max_streams(*max);
+          self.admit(admitted);
+        }
         // A blocked peer (RFC 9000 §19.12-13): the acknowledgement this owes carries the connection
         // credit; a blocked stream's credit is marked moved, so that acknowledgement carries it first.
         Frame::DataBlocked { .. } | Frame::StreamsBlocked { .. } => ack_eliciting = true,
@@ -1731,15 +1824,55 @@ impl Connection {
     self.send_streams.is_empty() && self.control.is_empty()
   }
 
+  /// The ready sets hold exactly the send streams that can frame data now, each in its own class.
+  #[cfg(test)]
+  fn ready_is_exact(&self) -> bool {
+    let mut held: Vec<u64> = Priority::ALL
+      .iter()
+      .flat_map(|&class| {
+        self
+          .ready
+          .get(class)
+          .iter()
+          .map(|(_, id)| *id)
+          .filter(move |id| priority(*id) == class)
+      })
+      .collect();
+    let total = Priority::ALL
+      .iter()
+      .map(|&class| self.ready.get(class).len())
+      .sum::<usize>();
+    held.sort_unstable();
+    let sendable: Vec<u64> = self
+      .send_streams
+      .iter()
+      .filter(|(id, sender)| self.streams.sendable(**id) && sender.has_sendable())
+      .map(|(id, _)| *id)
+      .collect();
+    total == held.len() && held == sendable
+  }
+
   /// Forgets this end's sending half of `stream_id`: nothing of it is retransmitted afterwards, its
   /// in-flight bytes leave the window, and the connection credit they took is refunded.
   fn forget_send_stream(&mut self, stream_id: u64) {
+    let class = priority(stream_id);
+    if let Some(sender) = self.send_streams.get(&stream_id) {
+      self
+        .ready
+        .get_mut(class)
+        .remove(&(sender.installed(), stream_id));
+    }
+    // Service restarts at the oldest stream, as the scan this replaced did.
+    *self.served.get_mut(class) = None;
+    #[cfg(test)]
+    {
+      let (order, last) = self.scan.get_mut(class);
+      order.retain(|id| *id != stream_id);
+      *last = None;
+    }
     self.send_streams.remove(&stream_id);
     self.unacked.remove(&stream_id);
     self.stream_blocked_sent.remove(&stream_id);
-    let class = priority(stream_id);
-    self.send_order.get_mut(class).retain(|&id| id != stream_id);
-    *self.send_cursor.get_mut(class) = 0;
     self
       .retransmit
       .retain(|frame| !matches!(frame, Frame::Stream { stream_id: id, .. } if *id == stream_id));
@@ -2287,6 +2420,22 @@ mod tests {
         .iter()
         .map(|(_, id)| (*id, receiver.read_offset(*id)))
         .collect();
+      assert!(
+        sender.ready_is_exact(),
+        "the sender's ready sets hold exactly its sendable streams"
+      );
+      assert_eq!(
+        sender.scan_differed, 0,
+        "the sender served a stream the scan would not have"
+      );
+      assert_eq!(
+        receiver.scan_differed, 0,
+        "the receiver served a stream the scan would not have"
+      );
+      assert!(
+        receiver.ready_is_exact(),
+        "the receiver's ready sets hold exactly its sendable streams"
+      );
       let mut moved = wire.send(&mut sender, true, budget, |from| {
         for (id, read) in &reads {
           assert!(
@@ -2565,6 +2714,69 @@ mod tests {
     assert!(carried, "the control exchange left without a credit update");
   }
 
+  /// The scheduler's work for one fresh frame does not grow with streams that have nothing to send. Do: a
+  /// sender holding `idle` exchanges framed whole and not yet acknowledged (each stays a send stream until
+  /// its frames are acknowledged), then one bulk exchange in the same class; send three of its frames (the window
+  /// lets out about that much with nothing acknowledged).
+  /// Expect: as many streams examined per frame beside 24 idle streams as beside none, and the frames sent
+  /// (else the test proves nothing). The round-robin once stepped over every idle stream for each frame.
+  #[test]
+  fn a_fresh_frame_costs_the_same_beside_any_number_of_idle_streams() {
+    let examined_per_frame = |idle: u8| {
+      let window = initial_receive_window(FRAME_CAP);
+      // Shape: a ceiling of many windows, so the stream limit admits the idle streams.
+      let ceiling = window.saturating_mul(1_024);
+      let mut sender = Connection::new(
+        ConnectionShape {
+          max_datagram: FRAME_CAP as u64,
+          // Shape: credit for every idle exchange past the class reserves, so only the scheduler is measured.
+          initial_window: window.saturating_mul(64),
+          receive_ceiling: ceiling,
+        },
+        Role::Client,
+      );
+      for seed in 0..idle {
+        sender
+          .open_exchange(KIND, Priority::Bulk, &stream_content(seed, 8))
+          .unwrap();
+      }
+      let now = send_until(&mut sender, 1_000, |sender, _| {
+        sender.send_streams.values().all(StreamSender::is_drained)
+      });
+      assert!(
+        sender.send_streams.values().all(StreamSender::is_drained),
+        "the idle exchanges were framed whole: {} of {} drained, stops {:?}, in flight {}",
+        sender
+          .send_streams
+          .values()
+          .filter(|s| s.is_drained())
+          .count(),
+        sender.send_streams.len(),
+        sender.stops,
+        sender.in_flight
+      );
+      let bulk = sender
+        .open_exchange(KIND, Priority::Bulk, &stream_content(99, 64 * FRAME_DATA))
+        .unwrap();
+      let before = sender.stops.examined;
+      let mut frames = 0u64;
+      send_until(&mut sender, now, |_, sent| {
+        frames += sent.map_or(0, |sent| {
+          sent
+            .iter()
+            .filter(|frame| matches!(frame, Frame::Stream { stream_id, .. } if *stream_id == bulk))
+            .count() as u64
+        });
+        frames >= 3
+      });
+      // Shape: three frames, what the congestion window lets out with nothing acknowledged.
+      assert!(frames >= 3, "the bulk exchange sent {frames} frames");
+      (sender.stops.examined - before) / frames
+    };
+    // Shape: 24 idle streams, within what the first congestion window lets out with nothing acknowledged.
+    assert_eq!(examined_per_frame(0), examined_per_frame(24));
+  }
+
   /// Polls `sender` from `now`, moving time to each pacing release, until `done` (given the sender and the
   /// frames just sent, if any) holds or a bounded number of polls pass; returns the time reached.
   fn send_until(
@@ -2576,6 +2788,10 @@ mod tests {
       if done(sender, None) {
         break;
       }
+      assert!(
+        sender.ready_is_exact(),
+        "the ready sets hold exactly the sendable streams"
+      );
       match sender.poll_transmit(now, FRAME_CAP) {
         Some((_, frames)) => {
           if done(sender, Some(&frames)) {

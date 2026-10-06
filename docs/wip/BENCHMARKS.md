@@ -2361,3 +2361,54 @@ last in `python:3.12-slim-trixie`). Docker Desktop 6.12 kernel, Apple M5 Max, lo
     - `TCP_QUICKACK` after every read: `fsync` 621–626 ms, `dd` 1.2 MB/s.
     Neither is in the tree.
 
+
+## Session-plane ready sets: a fresh frame no longer walks idle streams (2026-10-06)
+
+**What changed.** The connection's fresh-frame scheduler (strict priority by class, round-robin within one)
+found its next stream by scanning every send stream of the class from a cursor. A send stream stays in that
+list after its data is framed, until its last frame is acknowledged, so every drained-but-unacknowledged
+exchange (and a server's requests whose replies are not yet written) was stepped over for each frame. The
+scheduler now keeps, per class, an ordered set of the streams that can frame now, keyed by install order. A
+stream joins when it becomes sendable (installed, granted stream credit, admitted by the peer's
+`MaxStreams`) and leaves when framing empties it or it is forgotten. A frame costs O(log n) in the ready
+streams, whatever the idle ones.
+
+**Work witness** (`SendStops::examined`, test
+`a_fresh_frame_costs_the_same_beside_any_number_of_idle_streams`): one bulk frame examined 1 stream beside
+no idle streams and 25 beside 24. Now 1 in both. Stream completion also no longer does an O(n) `retain` of
+the class list.
+
+**Service order, A/B on the class grid.** Command: `cargo run --release -p slates-transport --example
+class_latency_bench`, `SEEDS` set to 1–20 in a scratch copy only (260 runs a build). Virtual time; Apple M5
+Max, load 80, which does not change virtual-time numbers. Per-scenario medians, geomean of new/old:
+
+| Build | Control p99 | Metadata p99 | Bulk goodput | Worst scenario |
+|---|---|---|---|---|
+| Pure rotation (rejected) | ×0.940 | ×1.015 | ×0.993 | 100 Mbit/s, 20 ms, 1 % loss: control ×1.37, metadata ×1.56, bulk ×0.84 |
+| Next after last served, oldest after a completion (kept) | ×0.989 | ×0.915 | ×1.024 | 100 Mbit/s, 100 ms, 1 % loss: control ×1.06, bulk ×1.11 |
+
+**Noise floor.** Two runs of the old build agree on 258 of 260 rows. The grid was not reproducible at all
+before this change: its self-signed ECDSA certificates sign with a random nonce, the DER signature varies
+from 70 to 72 bytes, and that moves the handshake's packet sizes and every virtual timing after. Two old
+runs agreed on 25 of 39 rows. The class and congestion grids now use Ed25519 (always 64 bytes), as
+`fetch_bench` does since 2026-10-05. Two rows still differ run to run, so one more entropy source remains.
+It is not yet found.
+
+**Measured and rejected.**
+- **A pure rotation** (served from the front, back to the back). It is processor sharing within a class.
+  The scan restarted at the oldest stream whenever a stream completed, which approximates first-come service.
+  For completion time among similar sizes, first-come beats processor sharing (Harchol-Balter, *Performance
+  Modeling and Design of Computer Systems*, ch. 30). The rotation lost the 100 Mbit/s, 20 ms, 1 % loss
+  scenario by ×1.37 on control p99.
+- **The scan's exact order** was not kept either. Its cursor was an index that wrapped when it served the
+  class's last stream, so a stream installed afterwards waited a full cycle. Serving the first ready stream
+  after the one served last fixes that, and measured ×0.989 / ×0.915 / ×1.024 above.
+
+**Oracle.** Two test-only checks:
+- *Order.* The service rule ("first ready stream after the last served, in install order, wrapping; the
+  oldest after a completion") is computed by a linear walk and compared with the ready sets' choice for each
+  frame. Zero differences over the connection unit tests, and zero over the whole class grid with the check
+  compiled in.
+- *Membership.* `ready_is_exact` holds that the sets are exactly the sendable streams on every poll of the
+  transfer tests. Mutations caught: a credit grant that does not requeue fails 7 tests; a raised `MaxStreams`
+  that admits nothing fails the concurrent-exchanges integration test.
