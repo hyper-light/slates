@@ -33,7 +33,7 @@
 //! [`next_timeout`]: Connection::next_timeout
 //! [`on_timeout`]: Connection::on_timeout
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use crate::congestion::{AckEvent, Controller, LossEvent};
 use crate::conn::{
@@ -250,6 +250,15 @@ pub struct Connection {
   retransmit: VecDeque<Frame>,
   /// The receive reassemblers, keyed by stream id (created when a stream's first frame arrives).
   recv_streams: BTreeMap<u64, StreamAssembler>,
+  /// Receive streams a stream frame reached since the reader last took them ([`Connection::take_readable`]): the
+  /// endpoint reads only these, where it once read every open stream at every drain — a fetch of 1,024 chunks keeps
+  /// about that many reply streams open, so each packet cost a pass over all of them (2026-10-05, `fetch_bench` at
+  /// 64 MiB: 68% of the samples in `Endpoint::drain`).
+  readable: BTreeSet<u64>,
+  /// Receive streams whose credit may have moved since it was last advertised: added when a stream opens and when a
+  /// read advances it, every open stream when the window grows; consulted instead of every open stream on every
+  /// packet (the same 64 MiB fetch then spent most of its time comparing each stream's credit in `poll_transmit`).
+  credit_dirty: BTreeSet<u64>,
   /// Which packet numbers have arrived, and the acknowledgement to send back.
   acks: AckGenerator,
   /// The receive-side flow-control accounting (per stream): advertises credit a window ahead of reads.
@@ -370,6 +379,8 @@ impl Connection {
       sent: SentTracker::new(),
       retransmit: VecDeque::new(),
       recv_streams: BTreeMap::new(),
+      readable: BTreeSet::new(),
+      credit_dirty: BTreeSet::new(),
       // The receive side holds as many ranges as one acknowledgement can report (its first range plus
       // the additional ones that fit the packet budget): beyond them a range could never be acknowledged
       // anyway, and the generator stays bounded however many packets arrive.
@@ -923,8 +934,8 @@ impl Connection {
   /// packet budget whose acknowledgement leaves no room beside it never strands a credit-blocked peer.
   fn credit_moved(&self) -> bool {
     self
-      .recv_streams
-      .keys()
+      .credit_dirty
+      .iter()
       .any(|&stream_id| self.credit_sent.get(&stream_id) != Some(&self.flow.stream_max(stream_id)))
   }
 
@@ -939,14 +950,21 @@ impl Connection {
       return;
     }
     let mut chosen: Vec<u64> = Vec::new();
-    for &stream_id in self.recv_streams.keys() {
+    let mut current: Vec<u64> = Vec::new();
+    for &stream_id in &self.credit_dirty {
       if slots == 0 {
         break;
       }
       if self.credit_sent.get(&stream_id) != Some(&self.flow.stream_max(stream_id)) {
         chosen.push(stream_id);
         slots -= 1;
+      } else {
+        current.push(stream_id);
       }
+    }
+    // Advertised now, or found already advertised: no longer owed.
+    for stream_id in chosen.iter().chain(&current) {
+      self.credit_dirty.remove(stream_id);
     }
     let rotation: Vec<u64> = self
       .recv_streams
@@ -1059,6 +1077,50 @@ impl Connection {
     None
   }
 
+  /// A stream frame from the peer: dropped for a closed stream, counted for one the peer may not open, else offered to
+  /// the stream's assembler under its flow-control window, the stream then readable (and owed its first credit when
+  /// new). A refusal means the peer broke flow control or sent two final sizes (RFC 9000 §4.1, §4.5): the data is
+  /// dropped and the violation counted, never ignored.
+  fn on_stream_frame(&mut self, stream_id: u64, offset: u64, data: &[u8], fin: bool) {
+    match self.streams.arrive(stream_id) {
+      // A late copy for a stream this end already closed: dropped, never reopening it.
+      Arrival::Closed => return,
+      // A stream the peer may not open (past the credit it was given, or an id it never had): dropped and counted. A
+      // peer that keeps to its credit never meets this.
+      Arrival::Violation => {
+        self.violations = self.violations.saturating_add(1);
+        return;
+      }
+      Arrival::Open => {}
+    }
+    let window = self.flow.stream_max(stream_id);
+    let initial = self.initial_window;
+    if !self.recv_streams.contains_key(&stream_id) {
+      // A new stream's first credit is owed.
+      self.credit_dirty.insert(stream_id);
+    }
+    let assembler = self
+      .recv_streams
+      .entry(stream_id)
+      .or_insert_with(|| StreamAssembler::new(initial));
+    // The window is the ceiling the sender could not exceed; a duplicate or reordered segment is deduped.
+    assembler.grant_window(window);
+    if assembler.offer(offset, data, fin).is_err() {
+      self.violations = self.violations.saturating_add(1);
+    } else {
+      self.readable.insert(stream_id);
+    }
+  }
+
+  /// The peer is blocked on `stream_id`'s credit (RFC 9000 §19.13): the credit is marked moved, so the acknowledgement
+  /// this owes carries it first.
+  fn on_stream_blocked(&mut self, stream_id: u64) {
+    self.credit_sent.remove(&stream_id);
+    if self.recv_streams.contains_key(&stream_id) {
+      self.credit_dirty.insert(stream_id);
+    }
+  }
+
   /// Takes a packet received at `now`: records its number for acknowledgement, demultiplexes each stream
   /// frame to its reassembler, processes any acknowledgement (the RTT sample,
   /// loss detection and the congestion controller), applies each stream's advertised send credit, and
@@ -1081,30 +1143,7 @@ impl Connection {
           data,
         } => {
           ack_eliciting = true;
-          match self.streams.arrive(*stream_id) {
-            // A late copy for a stream this end already closed: dropped, never reopening it.
-            Arrival::Closed => continue,
-            // A stream the peer may not open (past the credit it was given, or an id it never had):
-            // dropped and counted. A peer that keeps to its credit never meets this.
-            Arrival::Violation => {
-              self.violations = self.violations.saturating_add(1);
-              continue;
-            }
-            Arrival::Open => {}
-          }
-          let window = self.flow.stream_max(*stream_id);
-          let initial = self.initial_window;
-          let assembler = self
-            .recv_streams
-            .entry(*stream_id)
-            .or_insert_with(|| StreamAssembler::new(initial));
-          // The window is the flow-control ceiling the sender could not exceed; a duplicate or
-          // reordered segment is deduped. A refusal means the peer broke flow control or sent two final
-          // sizes (RFC 9000 §4.1, §4.5): the data is dropped and the violation counted, never ignored.
-          assembler.grant_window(window);
-          if assembler.offer(*offset, data, *fin).is_err() {
-            self.violations = self.violations.saturating_add(1);
-          }
+          self.on_stream_frame(*stream_id, *offset, data, *fin);
         }
         Frame::Ack {
           largest,
@@ -1147,7 +1186,7 @@ impl Connection {
         Frame::DataBlocked { .. } | Frame::StreamsBlocked { .. } => ack_eliciting = true,
         Frame::StreamDataBlocked { stream_id, .. } => {
           ack_eliciting = true;
-          self.credit_sent.remove(stream_id);
+          self.on_stream_blocked(*stream_id);
         }
       }
     }
@@ -1616,10 +1655,26 @@ impl Connection {
     let read_offset = assembler.read_offset();
     self.flow.on_stream_consumed(stream_id, read_offset);
     if !bytes.is_empty() {
+      self.credit_dirty.insert(stream_id);
+      let window = self.flow.window();
       let rtt = self.rtt.has_sample().then(|| self.rtt.smoothed_rtt());
       self.flow.autotune(now, rtt);
+      if self.flow.window() != window {
+        // A grown window moves every open stream's ceiling.
+        self.credit_dirty.extend(self.recv_streams.keys().copied());
+      }
     }
     bytes
+  }
+
+  /// The receive streams a stream frame reached since the last call, still open: what a reader must read now. A
+  /// stream closed since its frame arrived is left out (its half is gone; nothing of it is to be read).
+  pub fn take_readable(&mut self) -> Vec<u64> {
+    let readable = std::mem::take(&mut self.readable);
+    readable
+      .into_iter()
+      .filter(|stream_id| self.recv_streams.contains_key(stream_id))
+      .collect()
   }
 
   /// The stream ids seen on the receive side so far (a frame has arrived for each).
@@ -1712,6 +1767,8 @@ impl Connection {
   /// this never touches the sending half (`docs/bugs/2026-09-27-a-late-request-copy-forgot-the-reply.md`).
   pub fn close_recv(&mut self, stream_id: u64) {
     self.recv_streams.remove(&stream_id);
+    self.credit_dirty.remove(&stream_id);
+    self.readable.remove(&stream_id);
     self.credit_sent.remove(&stream_id);
     self.flow.forget_stream(stream_id);
     self.streams.close_receive(stream_id);

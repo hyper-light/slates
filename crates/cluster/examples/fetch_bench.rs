@@ -9,7 +9,7 @@
 //! of the same archive records each chunk's latency, and the timed fetch hedges at that window's p95, as the daemon's
 //! fetch class does once it has readings. Every reader's rebuilt archive is compared byte for byte with the original.
 //!
-//! `cargo run --release -p slates-cluster --example fetch_bench [scenario-filter]` prints one row per scenario: the
+//! `cargo run --release -p slates-cluster --example fetch_bench [scenario-filter] [chunks]` prints one row per scenario: the
 //! readers' completion times (virtual, from the fetch's start), the aggregate goodput against the holders' summed
 //! uplink capacity, the hedges sent and the holders dropped. Deterministic from the simulation's virtual clock.
 //! **Failures** (the process exits non-zero): any reader incomplete or any archive rebuilt wrong.
@@ -46,8 +46,21 @@ use slates_transport::handshake::Identity;
 
 /// Shape: the archive's chunks, and each chunk's bytes: 4 MiB in 64 KiB chunks, enough chunks that a fetch stripes
 /// and pipelines across three holders, small enough that a grid of scenarios runs in seconds.
-const CHUNKS: usize = 64;
-/// Shape: one chunk's bytes (see [`CHUNKS`]).
+const DEFAULT_CHUNKS: usize = 64;
+
+/// The archive's chunk count for this run: the second argument, or [`DEFAULT_CHUNKS`] (4 MiB). A larger object shows
+/// the steady state a 4 MiB one hides behind the manifest's round trip and slow start.
+static CHUNK_COUNT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+
+fn chunks() -> usize {
+  *CHUNK_COUNT.get_or_init(|| {
+    std::env::args()
+      .nth(2)
+      .and_then(|count| count.parse().ok())
+      .unwrap_or(DEFAULT_CHUNKS)
+  })
+}
+/// Shape: one chunk's bytes (see [`chunks`]).
 const CHUNK_BYTES: usize = 64 * 1024;
 /// Shape: the enrolled server name every test certificate carries.
 const NAME: &str = "slates-node";
@@ -68,6 +81,11 @@ const DEADLINE_NS: u64 = 120 * NS_PER_SECOND;
 const MIN_QUEUE_BYTES: u64 = 16 * MIN_DATAGRAM_BYTES as u64;
 /// Format: the owner of the fetched object (its id names it, nothing more here).
 const OWNER: HostId = HostId(1);
+/// Shape: the hedge with no latency readings yet, the daemon's own (`fleet::fetch_into_hold` falls back to its
+/// heartbeat, 100 ms). The warm-up once hedged at the deadline instead, so a silent holder ranked first for the
+/// manifest held the warm-up to it and the timed fetch never learned a p95 (seen 2026-10-05 once distinct chunks
+/// changed the archive's identity and so its holders' ranks).
+const COLD_HEDGE_NS: u64 = 100 * NS_PER_MS;
 
 /// One scenario of the grid.
 #[derive(Clone, Debug)]
@@ -142,14 +160,17 @@ fn identity() -> Identity {
   )
 }
 
-/// The archive every holder holds: [`CHUNKS`] files of [`CHUNK_BYTES`], each its own chunk.
+/// The archive every holder holds: [`chunks`] files of [`CHUNK_BYTES`], each its own chunk.
 fn archive() -> Archive {
-  let chunks: Vec<_> = (0..CHUNKS)
+  let chunks: Vec<_> = (0..chunks())
     .map(|at| {
       let mut bytes = vec![0u8; CHUNK_BYTES];
       for (offset, byte) in bytes.iter_mut().enumerate() {
         *byte = (at.wrapping_mul(31) ^ offset.wrapping_mul(7)) as u8;
       }
+      // The chunk's index in its first bytes, so every chunk is distinct: the pattern alone repeats every 256 chunks,
+      // and a fetch moves one copy of each identity (a 1,024-chunk archive moved 16 MiB, not 64).
+      bytes[..8].copy_from_slice(&(at as u64).to_le_bytes());
       Archive::raw_chunk(bytes)
     })
     .collect();
@@ -157,7 +178,8 @@ fn archive() -> Archive {
     .iter()
     .enumerate()
     .map(|(at, chunk)| Entry {
-      name: format!("f{at:03}"),
+      // Five digits, so the names sort in creation order up to 100,000 chunks (three broke past 999: `f1000` < `f101`).
+      name: format!("f{at:05}"),
       meta: NodeMeta {
         size: chunk.raw_len,
         ..NodeMeta::default()
@@ -196,7 +218,7 @@ struct Room {
 impl Room {
   fn new() -> Room {
     let page = rustix::param::page_size();
-    let bytes = (CHUNKS * CHUNK_BYTES * 2).next_power_of_two();
+    let bytes = (chunks() * CHUNK_BYTES * 2).next_power_of_two();
     let mut arena = ChunkArena::new(page);
     arena
       .add_region(slates_mem::region::Region::map(bytes, page, false).unwrap())
@@ -349,10 +371,10 @@ async fn read(
   (warm, go): (Sender<()>, Receiver<()>),
   done: Sender<ReaderReport>,
 ) {
-  let (_, readings, sessions) = fetch_once(sessions, DEADLINE_NS).await;
+  let (_, readings, sessions) = fetch_once(sessions, COLD_HEDGE_NS).await;
   let _ = warm.send(());
   let ((), _) = receive(go).await;
-  let (report, _, _sessions) = fetch_once(sessions, p95(&readings).unwrap_or(DEADLINE_NS)).await;
+  let (report, _, _sessions) = fetch_once(sessions, p95(&readings).unwrap_or(COLD_HEDGE_NS)).await;
   let _ = done.send(report);
 }
 
@@ -673,7 +695,7 @@ fn grid() -> Vec<Scenario> {
 
 fn main() {
   let filter = std::env::args().nth(1).unwrap_or_default();
-  let archive_bytes = (CHUNKS * CHUNK_BYTES) as u64;
+  let archive_bytes = (chunks() * CHUNK_BYTES) as u64;
   println!(
     "scenario,holders,readers,rtt_ms,uplink_mbps,completion_min_ms,completion_median_ms,completion_max_ms,goodput_mbps,capacity_mbps,hedges,steals,holders_dropped,rebuilt"
   );

@@ -2835,7 +2835,7 @@ struct FetchWorker {
   endpoint: Endpoint,
   binding: (ObjectId, [u8; 32]),
   pending: std::collections::VecDeque<Item>,
-  open: Vec<(u64, Item)>,
+  open: BTreeMap<u64, Item>,
   failed: bool,
 }
 
@@ -2861,7 +2861,7 @@ impl FetchWorker {
   fn cancel(&mut self, item: Item) {
     self.pending.retain(|queued| *queued != item);
     let endpoint = &mut self.endpoint;
-    self.open.retain(|(id, open)| {
+    self.open.retain(|id, open| {
       if *open == item {
         endpoint.abandon(*id);
         false
@@ -2889,7 +2889,7 @@ impl FetchWorker {
         .begin(CONTENT_FETCH_STREAM, Priority::Bulk, &request)
       {
         Ok(id) => {
-          self.open.push((id, next));
+          self.open.insert(id, next);
           self.pending.pop_front();
         }
         Err(EndpointError::Stream(StreamRefusal::Backlogged { .. })) if !self.open.is_empty() => {
@@ -2905,10 +2905,14 @@ impl FetchWorker {
 
   /// Reports every answered request: the manifest or a piece for the item asked, or the holder failed.
   fn collect_replies(&mut self, events: &std::sync::mpsc::Sender<FetchEvent>) {
-    let open = std::mem::take(&mut self.open);
-    for (id, asked) in open {
+    // Only the exchanges whose replies completed: probing every open one each turn cost a pass over a holder's whole
+    // window (~340 requests for a 64 MiB archive across three holders) per poll.
+    for id in self.endpoint.take_completed() {
+      let Some(asked) = self.open.remove(&id) else {
+        continue;
+      };
       let Some(reply) = self.endpoint.take_reply(id) else {
-        self.open.push((id, asked));
+        self.open.insert(id, asked);
         continue;
       };
       match self.answer(asked, &reply) {
@@ -3106,7 +3110,7 @@ impl FetchRun {
               endpoint,
               binding,
               pending: std::collections::VecDeque::new(),
-              open: Vec::new(),
+              open: BTreeMap::new(),
               failed: false,
             };
             fetch_worker(worker, command_rx, worker_events, poll_ns).await;

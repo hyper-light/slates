@@ -2188,6 +2188,38 @@ sessions:
   available memory but read the process's real resident memory, which the hold subtracts since `0db78cb`; it now pins
   both (3/3 natively, 3/3 under emulation).
 
+### Remote pulls of 64 MiB, and three per-packet passes over every open stream removed (condition 7; 2026-10-05)
+
+Command: `cargo run --release -p slates-cluster --example fetch_bench wan 1024` (the A-91 grid at 1,024 chunks of 64
+KiB; simulated network, virtual clock; every reader's archive rebuilt byte for byte). Apple M5 Max.
+
+| scenario | completion (min / median / max) | goodput / capacity | steals |
+|---|---|---|---|
+| wan 1 holder | 5,907 ms | 90.9 / 100 Mbit/s | 0 |
+| wan 3 holders | 2,315 ms | 231.9 / 300 | 351 |
+| wan 1 holder, 1% loss | 6,102 ms | 88.0 / 100 | 0 |
+| wan 3 holders, 1% loss | 2,501 ms | 214.7 / 300 | 352 |
+| wan 3 holders, 5% loss | 2,627 ms | 204.4 / 300 | 347 |
+| wan 3 holders, one at 1/20 rate | 3,675 ms | 146.1 / 205 | 465 |
+| wan 3 holders, one silent | 3,802 ms | 141.2 / 300 | 468 |
+| wan 3 holders, 8 readers | 12,991 / 17,030 / 17,407 ms | 246.7 / 300 | 2,613 |
+| wan 3 holders, 8 readers, 1% loss | 8,895 / 18,201 / 18,860 ms | 227.7 / 300 | 2,856 |
+
+Getting there found three costs that grew with the open streams, each paid per packet or per poll (a 64 MiB pull did
+not finish its first scenario in 9 minutes of CPU; sampled):
+- `Endpoint::drain` read every open receive stream (68% of samples): now only those a stream frame reached
+  (`Connection::take_readable`). The first 64 MiB scenarios: >9 min → 36 s of CPU, virtual results unchanged.
+- `poll_transmit`'s credit checks compared every open stream's advertised credit with its ceiling: now a set of
+  streams whose credit may have moved (opened, read, a peer's `StreamDataBlocked`; all of them when the window grows).
+  36 → 11 s, virtual results identical. A first cut missed `StreamDataBlocked` and three loss oracles stalled.
+- The fetch worker probed every open exchange (`take_reply`, which drains) each poll: now only the exchanges whose
+  replies completed (`Endpoint::take_completed`). The 4 MiB grid 21 → 6.3 CPU-seconds.
+The harness had three faults of its own, all fixed: names `f{at:03}` stopped sorting past 999 chunks, chunk contents
+repeated every 256 chunks (a 64 MiB archive held 16 MiB of distinct chunks, so goodput read 230 Mbit/s on a 100 Mbit/s
+link), and the warm-up hedged at the deadline where the daemon hedges at 100 ms with no readings (a silent holder
+ranked first for the manifest froze it). Some rows vary run to run (5% loss, 8 readers with loss): the simulation is not
+fully deterministic across runs, owed.
+
 ### Codemode against list-and-read on a real agent task (condition 13; 2026-10-05)
 
 Command: `cargo run --release -p slates-mcp --example codemode_tokens` (an in-process daemon, 2 shards; an overlay

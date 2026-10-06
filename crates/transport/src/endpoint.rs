@@ -488,6 +488,10 @@ pub struct Endpoint {
   /// The peer's complete requests not yet handed to the caller, by stream id (each still holds its credit
   /// until replied to, so the peer cannot outrun the caller).
   ready: BTreeMap<u64, Vec<u8>>,
+  /// This end's exchanges whose replies completed since [`Endpoint::take_completed`] last took them: a caller with
+  /// many exchanges open asks only after these instead of probing every one each turn (a fetch with ~340 chunk
+  /// requests open on a session spent its time doing that, 2026-10-05).
+  completed: std::collections::BTreeSet<u64>,
 }
 
 impl Drop for Endpoint {
@@ -544,6 +548,7 @@ impl Endpoint {
       next_exchange: 0,
       arriving: BTreeMap::new(),
       ready: BTreeMap::new(),
+      completed: std::collections::BTreeSet::new(),
     })
   }
 
@@ -589,6 +594,7 @@ impl Endpoint {
       next_exchange: 0,
       arriving: BTreeMap::new(),
       ready: BTreeMap::new(),
+      completed: std::collections::BTreeSet::new(),
     })
   }
 
@@ -636,6 +642,7 @@ impl Endpoint {
       next_exchange: 0,
       arriving: BTreeMap::new(),
       ready: BTreeMap::new(),
+      completed: std::collections::BTreeSet::new(),
     })
   }
 
@@ -1580,6 +1587,17 @@ impl Endpoint {
     }
   }
 
+  /// The exchanges whose replies completed since the last call and are still here to take ([`Endpoint::take_reply`]
+  /// answers each of them now).
+  pub fn take_completed(&mut self) -> Vec<u64> {
+    self.drain();
+    let completed = std::mem::take(&mut self.completed);
+    completed
+      .into_iter()
+      .filter(|id| self.exchanges.contains_key(id))
+      .collect()
+  }
+
   /// The reply of exchange `id` if it has arrived whole, taking it (the exchange is then finished and its
   /// receiving half closed); `None` while it is still waiting or arriving, or for an unknown exchange. A
   /// receive stream counts complete only once every byte through its `fin` has been read, so the reply
@@ -1777,18 +1795,21 @@ impl Endpoint {
   fn drain(&mut self) {
     let now = now_ns();
     let role = self.conn.role();
-    for id in self.conn.recv_stream_ids() {
+    for id in self.conn.take_readable() {
       let chunk = self.conn.read_stream(now, id);
       if crate::streams::initiator(id) == role {
         // A reply to this end's exchange. One no longer open (taken or abandoned) is already closed at the
         // connection, so its frames never reach here; should one, it is refused, never read as a request.
-        match self
-          .by_stream
-          .get(&id)
-          .copied()
-          .and_then(|exchange| self.exchanges.get_mut(&exchange))
-        {
-          Some(exchange) => exchange.reply.extend_from_slice(&chunk),
+        let exchange_id = self.by_stream.get(&id).copied();
+        match exchange_id.and_then(|exchange| self.exchanges.get_mut(&exchange)) {
+          Some(exchange) => {
+            exchange.reply.extend_from_slice(&chunk);
+            if let Some(exchange_id) = exchange_id
+              && self.conn.recv_stream_complete(id)
+            {
+              self.completed.insert(exchange_id);
+            }
+          }
           None => self.conn.stop_sending(id),
         }
         continue;
