@@ -3873,3 +3873,18 @@ host disk under the mount point. They now meet `ENOTCONN` or a refusal until the
 - 531,847 write-capable calls traced, none outside RAM, the FUSE device, sockets and pipes, apart from the OS mount
   helper's `/run/mount`;
 - no panic in the daemon's log.
+
+### 2026-10-06: Kubernetes pods do not get the PersistentVolume's nosuid (condition 4)
+
+**What the lane found.** The KIND export lane failed on every run with the pod's mount `rw,relatime`. Its new node-side
+evidence (run 37493320514) showed kubelet's own NFS mount as `rw,nosuid,nodev,relatime`: containerd's bind into the pod
+drops the flags. A local Docker bind of a `nosuid` mount keeps them, so this is the runtime's behaviour, not slates'.
+
+**Response.**
+- `docs/deploy.md` now requires `allowPrivilegeEscalation: false` (Pod Security `restricted`; `no_new_privs` makes setuid
+  bits inert on exec). `nodev` stays moot, since slates refuses device nodes.
+- The lane checks the behaviour instead of the flags. A root pod plants a setuid-root coreutils `id`. A non-root pod
+  without the setting must run it as 0, the control that proves the probe can see an escalation. A pod with the setting
+  must run it as 65534.
+- The probe's premise is verified locally in Docker: 0 without `no-new-privileges`, 65534 with it. The lane's own run
+  is owed.

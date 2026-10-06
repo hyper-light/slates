@@ -163,9 +163,24 @@ capability its path carries.
        path: <the path `slates export` printed>
    ```
 
-Keep `nosuid` and `nodev`. Every pod that claims the volume shares it, so without them a root process in one pod can
-plant a root-owned setuid binary that runs as root for an unprivileged user in another (measured on a Linux NFSv4.2
-mount of a slates volume, 2026-10-05). The mounts slates makes itself (`slates mount`, the OCI binding) carry both.
+Keep `nosuid` and `nodev`, and run every pod that claims the volume with `allowPrivilegeEscalation: false` (Pod
+Security's `restricted` profile requires it):
+
+```yaml
+securityContext:
+  allowPrivilegeEscalation: false
+```
+
+Every pod that claims the volume shares it, so a root process in one pod can plant a root-owned setuid binary for an
+unprivileged user in another (measured on a Linux NFSv4.2 mount of a slates volume, 2026-10-05). The
+PersistentVolume's `nosuid,nodev` reach kubelet's own mount, but the container runtime's bind of that mount into each
+pod does not carry them. Measured on the KIND lane, 2026-10-06: the node's mount was `rw,nosuid,nodev,relatime`, the
+pod's `rw,relatime`. So a pod's mount flags cannot be the guard.
+
+`allowPrivilegeEscalation: false` sets `no_new_privs`, under which the kernel ignores setuid and setgid bits on exec
+whatever the mount says. The KIND lane proves it by use: a planted setuid-root `id` ran as 0 in a pod without the
+setting and as 65534 in one with it. `nodev` needs no pod setting, because slates refuses device nodes in a volume
+outright. The mounts slates makes itself (`slates mount`, the OCI binding) carry both flags.
 
 `slates detach` of the export's attachment, or the volume's destroy, ends what the path reaches. The KIND
 lane's `cargo xtask kind export` runs this whole flow on a cluster.

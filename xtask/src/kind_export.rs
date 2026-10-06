@@ -275,26 +275,67 @@ fn prove(lane: &Lane) -> Result<(), Failure> {
       "kind export: the bytes did not round-trip through kubelet's mounts: wrote {written:?}, a fresh mount read {read:?}"
     )));
   }
-  // Condition 4: kubelet's mount is `nosuid,nodev` (the PersistentVolume's `mountOptions`), so a setuid binary or a
-  // device node one pod plants on the shared volume runs or opens with no privilege in another. The kernel's own
-  // per-mount options (mountinfo's sixth field) are the evidence, not the manifest.
+  // Condition 4 (A-94): a setuid binary one pod plants on the shared volume must not run with privilege in another.
+  // Kubelet's own mount carries the PersistentVolume's `nosuid,nodev`, but containerd's bind of it into a pod does
+  // not (measured on this lane 2026-10-06: the node `rw,nosuid,nodev,relatime`, the pod `rw,relatime`), so the
+  // pod's mount flags cannot be the guard. The guard is the pod's `allowPrivilegeEscalation: false` (Pod Security's
+  // restricted profile; `no_new_privs`, under which exec ignores setuid bits), which `docs/deploy.md` requires.
+  // Proven by behaviour: the escalation is shown possible without it, and absent with it.
   let mount_options = lines
     .find_map(|line| line.split(' ').nth(5))
     .unwrap_or("")
     .to_owned();
-  for flag in ["nosuid", "nodev"] {
-    if !mount_options.split(',').any(|option| option == flag) {
-      lane.kubelet_mount_diagnostics();
-      return Err(Failure(format!(
-        "kind export: the pod's mount of the volume is not {flag}: {mount_options:?} (its mountinfo: {read:?})"
-      )));
-    }
+  eprintln!("kind export: the pod's mount is {mount_options} (kubelet's carries nosuid,nodev)");
+  lane.kubelet_mount_diagnostics();
+  let (unguarded, guarded) = setuid_probe(lane)?;
+  if unguarded.trim() != "0" {
+    return Err(Failure(format!(
+      "kind export: the setuid probe proves nothing: without no_new_privs it ran as {unguarded:?}, not 0"
+    )));
   }
-  eprintln!("kind export: kubelet's mount is {mount_options}");
+  if guarded.trim() != NON_ROOT {
+    return Err(Failure(format!(
+      "kind export: a setuid binary planted on the volume ran as {guarded:?} in a pod with allowPrivilegeEscalation: false"
+    )));
+  }
+  eprintln!(
+    "kind export: a planted setuid-root binary ran as 0 without allowPrivilegeEscalation: false and as {NON_ROOT} with it"
+  );
   eprintln!(
     "kind export: kubelet mounted the volume over RPC-with-TLS; a second mount read the bytes the first wrote"
   );
   Ok(())
+}
+
+/// Shape: an image with a real `id` (coreutils): busybox's `id` applet drops setuid privilege by itself, which
+/// would make the probe pass whatever the pod's settings.
+const SETUID_IMAGE: &str = "debian:bookworm-slim";
+/// Format: the unprivileged uid the probe's pods run as (`nobody`), as text.
+const NON_ROOT: &str = "65534";
+
+/// A root pod plants a root-owned setuid `id` on the volume; a non-root pod runs it without `no_new_privs` and another
+/// with it (`allowPrivilegeEscalation: false`). Returns the effective uid each printed.
+fn setuid_probe(lane: &Lane) -> Result<(String, String), Failure> {
+  let uid: u64 = NON_ROOT.parse().unwrap_or(u64::MAX);
+  lane.workload_as(
+    "slates-planter",
+    SETUID_IMAGE,
+    "cp /usr/bin/id /data/suid-id && chmod 4755 /data/suid-id && echo planted",
+    &serde_json::json!({ "runAsUser": 0 }),
+  )?;
+  let unguarded = lane.workload_as(
+    "slates-suid-unguarded",
+    SETUID_IMAGE,
+    "/data/suid-id -u",
+    &serde_json::json!({ "runAsUser": uid, "runAsGroup": uid, "allowPrivilegeEscalation": true }),
+  )?;
+  let guarded = lane.workload_as(
+    "slates-suid-guarded",
+    SETUID_IMAGE,
+    "/data/suid-id -u",
+    &serde_json::json!({ "runAsUser": uid, "runAsGroup": uid, "allowPrivilegeEscalation": false }),
+  )?;
+  Ok((unguarded, guarded))
 }
 
 /// The PersistentVolume naming the export, and its claim (bound to it by name, no storage class).
@@ -400,6 +441,17 @@ impl Lane {
   /// Runs `script` in a pod named `name` with the claim mounted at /data, waits (bounded) until it finishes,
   /// and returns its log: the pod's own view through kubelet's mount.
   fn workload(&self, name: &str, script: &str) -> Result<String, Failure> {
+    self.workload_as(name, WORKLOAD_IMAGE, script, &serde_json::json!({}))
+  }
+
+  /// [`Self::workload`] in `image` with the container's `securityContext` set to `security`.
+  fn workload_as(
+    &self,
+    name: &str,
+    image: &str,
+    script: &str,
+    security: &serde_json::Value,
+  ) -> Result<String, Failure> {
     let pod = serde_json::json!({
       "apiVersion": "v1",
       "kind": "Pod",
@@ -408,10 +460,11 @@ impl Lane {
         "restartPolicy": "Never",
         "containers": [{
           "name": "work",
-          "image": WORKLOAD_IMAGE,
+          "image": image,
           "imagePullPolicy": "IfNotPresent",
           "command": ["sh", "-c", script],
           "volumeMounts": [{ "name": "data", "mountPath": "/data" }],
+          "securityContext": security,
         }],
         "volumes": [{ "name": "data", "persistentVolumeClaim": { "claimName": "slates-export" } }],
       },
