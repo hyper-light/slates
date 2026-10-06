@@ -209,7 +209,7 @@ impl ShimError {
       VfsError::IsDirectory => ShimError::IsDirectory,
       VfsError::NotEmpty => ShimError::NotEmpty,
       VfsError::Invalid => ShimError::Invalid,
-      VfsError::NotPermitted => ShimError::NotPermitted,
+      VfsError::NotPermitted | VfsError::LinkProtected => ShimError::NotPermitted,
       // The shim's `InvalidName` tag is the host's `ENAMETOOLONG` (`SlatesVolume.swift`); a name that is not a
       // component is the host's `EINVAL`.
       VfsError::NameTooLong => ShimError::InvalidName,

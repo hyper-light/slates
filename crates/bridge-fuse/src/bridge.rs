@@ -60,6 +60,8 @@ const EAGAIN: i32 = 11;
 const ENOENT: i32 = 2;
 /// Format: EPERM, operation not permitted.
 const EPERM: i32 = 1;
+/// Format: Linux EACCES, a symlink out of the volume refused to a caller who does not own it (A-107).
+const EACCES: i32 = 13;
 /// Format: EEXIST, the name already exists.
 const EEXIST: i32 = 17;
 /// Format: ENOTDIR, not a directory.
@@ -337,11 +339,12 @@ fn body_room(out: &[u8]) -> u32 {
   u32::try_from(out.len().saturating_sub(OUT_HEADER_LEN)).unwrap_or(u32::MAX)
 }
 
-/// Whether `opcode` makes a new object, whose owner is the creating process.
+/// Whether a request carries its caller's uid and gid into the seam: a creating request stamps them on what it makes
+/// (AUD-29-81), and a `READLINK` is answered by whether its caller owns a link that leads out of the volume (A-107).
 fn creates(opcode: Opcode) -> bool {
   matches!(
     opcode,
-    Opcode::Create | Opcode::MkNod | Opcode::MkDir | Opcode::SymLink
+    Opcode::Create | Opcode::MkNod | Opcode::MkDir | Opcode::SymLink | Opcode::ReadLink
   )
 }
 
@@ -388,6 +391,7 @@ fn errno(e: VfsError) -> i32 {
     VfsError::FileTooLarge => EFBIG,
     VfsError::TooManyLinks => EMLINK,
     VfsError::NotPermitted => EPERM,
+    VfsError::LinkProtected => EACCES,
     VfsError::SpecialFileOperation => EOPNOTSUPP,
     VfsError::NoAttribute => ENODATA,
     VfsError::Invalid | VfsError::InvalidName => EINVAL,

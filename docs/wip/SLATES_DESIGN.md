@@ -9894,3 +9894,48 @@ Status: built 2026-10-06. It closes the FUSE part of A-32's owed list.
 - Why: until now every attribute operation was answered `ENOSYS`, so the kernel told every caller "not supported".
   `setfattr -n user.x` failed in an adversarial container run, and tools that tag files (download origins, build
   caches, `rsync -X`) lost their attributes on a slates mount.
+
+### A-107 — A symlink out of the volume resolves only for its owner (2026-10-06)
+Applied in the same change to:
+- `crates/vfs/src/error.rs` (`VfsError::LinkProtected`, `EACCES`);
+- `crates/bridge-core/src/links.rs` (`leaves_volume`, new) and `crates/bridge-core/src/volume_bridge.rs` (`readlink`);
+- the transports' error maps: `crates/bridge-fuse/src/bridge.rs` (`EACCES`; `ReadLink` carries the caller's uid),
+  `crates/bridge-nfs/src/procedures.rs` (`NFS3ERR_ACCES`), `crates/bridge-winfsp/src/lib.rs`
+  (`STATUS_ACCESS_DENIED`), `crates/bridge-fskit/src/lib.rs` (`NotPermitted`);
+- the tests `a_link_out_of_the_volume_resolves_only_for_its_owner` (`crates/bridge-core/tests/volume_bridge.rs`) and
+  `targets_are_classified_by_where_they_can_lead` (`links.rs`);
+- GAPS (the "Open, a design decision" symlink entry is closed).
+
+Status: built 2026-10-06.
+- What: a mount's `readlink` of a symlink whose target leaves the volume is refused `EACCES` unless the caller owns the
+  link. This is Linux's `fs.protected_symlinks` rule (Linux 3.6, on by default in every major distribution; CWE-61),
+  applied at the volume's edge instead of at sticky world-writable directories.
+  - A target leaves the volume when it is absolute, when its leading `..` components climb above the link's own
+    directory depth, or when it has a `..` after a name. The last case is judged conservatively, since resolving it
+    would need the intermediate names to be directories.
+  - A target that stays inside resolves for every caller, so a venv's `python`, `node_modules/.bin` and relative
+    links in real trees are untouched.
+  - The rule applies only where the transport names the Unix caller (FUSE's request header, NFS `AUTH_SYS`). The SDK
+    and MCP never follow a link, and their callers get the target string as data, so an SDK context with no caller
+    uid is answered.
+- Why: an agent could plant `out -> /etc/cron.d/x` in its volume, and the kernel followed that link for any later
+  process, so a privileged tool writing `vol/out` wrote the host path. slates wrote nothing itself, but it handed the
+  host a steering path. This was the gap's measured case, reproduced on HEAD `7208e42`.
+- Rejected:
+  - `nosymfollow` (`MS_NOSYMFOLLOW`): blocks the relative links real trees need.
+  - Rewriting absolute targets on `readlink`: changes what a landing writes back, so the volume stops being the
+    agent's tree.
+  - Relying on the container: true inside an OCI bind, but a host-side mount has no such root.
+- Limits:
+  - FUSE asks for `READLINK` on every follow (the kernel keeps no symlink cache for it), so the rule holds per caller.
+  - An NFS client caches a symlink's target in its page cache, so after the owner's read another local user may be
+    served the cached target without a request. The rule is therefore exact on FUSE and best-effort on NFS.
+  - FUSE cannot tell `readlink(2)` from a path walk, so a non-owner's `readlink` of such a link is refused too, which
+    is stricter than Linux (it allows `readlink` and refuses only the follow).
+- Measured (Linux FUSE, Docker `rust:1.98.0`, mount `--shared`, 2026-10-06), as `tester` (the mount's user), `root`
+  and a second user `other`:
+  - `abs -> /home/tester/out` and `d/up -> ../../../../home/tester/out`: tester reads and writes through both; root
+    and other get `Permission denied`.
+  - `d/sib -> ../d/f` and `d/near -> f`: all three read `inside`.
+  - `rootlink -> /root/target`, planted by root: root reads it; tester gets `Permission denied`.
+  - Mutation check: with the condition disabled, the bridge test fails with `left: Ok("/etc/cron.d/x")`.

@@ -135,7 +135,7 @@ pub fn ntstatus(error: &VfsError) -> Ntstatus {
     VfsError::IsDirectory => STATUS_FILE_IS_A_DIRECTORY,
     VfsError::NotEmpty => STATUS_DIRECTORY_NOT_EMPTY,
     VfsError::NoSpace => STATUS_DISK_FULL,
-    VfsError::NotPermitted => STATUS_ACCESS_DENIED,
+    VfsError::NotPermitted | VfsError::LinkProtected => STATUS_ACCESS_DENIED,
     VfsError::Invalid | VfsError::InvalidName => STATUS_INVALID_PARAMETER,
     VfsError::NameTooLong => STATUS_NAME_TOO_LONG,
     VfsError::CrossVolumeMove => STATUS_NOT_SAME_DEVICE,

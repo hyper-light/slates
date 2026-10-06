@@ -23,6 +23,9 @@ pub enum VfsError {
   NoAttribute,
   /// `EPERM` (a hard link to a directory).
   NotPermitted,
+  /// `EACCES`: a symlink whose target leaves the volume, followed by a caller who does not own it (A-107, Linux's
+  /// `protected_symlinks` rule applied at the volume's edge).
+  LinkProtected,
   /// `EOPNOTSUPP`: regular-file I/O or host landing on a FIFO/socket name (A-26).
   SpecialFileOperation,
   /// `EINVAL`: a name that is not a path component (empty, `.`, `..`, or holding a separator or NUL).
@@ -118,6 +121,7 @@ impl VfsError {
       Self::Invalid => "EINVAL",
       Self::NoAttribute => "ENOATTR",
       Self::NotPermitted => "EPERM",
+      Self::LinkProtected => "EACCES",
       Self::SpecialFileOperation => "EOPNOTSUPP",
       Self::InvalidName => "EINVAL",
       Self::NameTooLong | Self::TreeTooDeep { .. } => "ENAMETOOLONG",

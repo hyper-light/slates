@@ -243,6 +243,54 @@ fn a_created_object_is_owned_by_the_mounting_user_and_its_parent_group() {
   );
 }
 
+/// A-107 (condition 4, escapes adversarially tested): an agent (uid 1000) plants links in its volume, one to a host
+/// path, one climbing above the volume root, one that stays inside. Do follow each as another user (uid 0, the
+/// privileged operator a planted link would steer) and as the agent. Expect the two that leave refused
+/// `LinkProtected` to the other user and answered to the agent, the inside link answered to both, and a read of the
+/// text with no Unix caller (the SDK, which follows nothing) answered for every link.
+#[test]
+fn a_link_out_of_the_volume_resolves_only_for_its_owner() {
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let mut bridge = VolumeBridge::new(VolumeId { bytes: [0; 16] }, &mut vol, &mut store);
+  // The transport names each request's Unix caller (the FUSE header, NFS AUTH_SYS), as `owner_uid`.
+  let mut agent = rw_cx_as(1000);
+  agent.owner_uid = Some(1000);
+  let mut operator = rw_cx_as(0);
+  operator.owner_uid = Some(0);
+  let root = bridge.root(&agent).unwrap();
+  let dir = bridge.mkdir(oid(root), &agent, "d", 0o755).unwrap();
+  let host = bridge
+    .symlink(oid(dir.ino), &agent, "cron", "/etc/cron.d/x")
+    .unwrap();
+  let above = bridge
+    .symlink(oid(dir.ino), &agent, "up", "../../escape")
+    .unwrap();
+  let inside = bridge
+    .symlink(oid(dir.ino), &agent, "sib", "../d/f")
+    .unwrap();
+  for link in [host.ino, above.ino] {
+    assert_eq!(
+      bridge.readlink(oid(link), &operator),
+      Err(VfsError::LinkProtected)
+    );
+    assert!(
+      bridge.readlink(oid(link), &agent).is_ok(),
+      "the owner follows its own link"
+    );
+  }
+  assert_eq!(
+    bridge.readlink(oid(inside.ino), &operator).unwrap(),
+    "../d/f"
+  );
+  let mut sdk = rw_cx_as(0);
+  sdk.owner_uid = None;
+  assert_eq!(
+    bridge.readlink(oid(host.ino), &sdk).unwrap(),
+    "/etc/cron.d/x"
+  );
+}
+
 /// When the request's credential names a group (`OpContext::owner_gid`, an NFS `AUTH_SYS` gid), a
 /// created object takes *that* group, not its parent directory's — matching what a native NFS server
 /// stamps, so a file the mounting user makes lists as their own group rather than the volume root's

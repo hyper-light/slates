@@ -1079,12 +1079,26 @@ impl Bridge for VolumeBridge<'_> {
     self.attr_of(target.inode)
   }
 
+  /// The link's target. A target that leads out of the volume is refused `LinkProtected` (`EACCES`) to a caller the
+  /// transport names who does not own the link (A-107, `crate::links`): the kernel asks for the target on every follow,
+  /// so this is where Linux's `protected_symlinks` rule applies at the volume's edge. A request with no Unix caller
+  /// (the SDK, MCP) reads the text and follows nothing, so it is answered as before.
   fn readlink(&mut self, object: ObjectId, cx: &OpContext) -> Result<String, VfsError> {
     self.authorize_read(cx)?;
-    self
-      .volume
-      .readlink(self.store, InodeNo(object.inode))
-      .map(|t| t.into_string())
+    let no = InodeNo(object.inode);
+    let target = self.volume.readlink(self.store, no)?.into_string();
+    if let Some(caller) = cx.owner_uid {
+      let owner = self.volume.stat(self.store, no)?.uid;
+      // A link whose place is unknown (none recorded) is judged at the root, where any `..` leaves.
+      let place = self
+        .volume
+        .path_of_inode(self.store, no)
+        .unwrap_or_default();
+      if caller != owner && crate::links::leaves_volume(&place, &target) {
+        return Err(VfsError::LinkProtected);
+      }
+    }
+    Ok(target)
   }
 
   fn rename(

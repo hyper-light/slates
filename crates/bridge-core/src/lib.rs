@@ -23,6 +23,7 @@
 pub mod access;
 pub mod appledouble;
 pub mod authority;
+pub mod links;
 pub mod scoped;
 pub mod volume_bridge;
 

@@ -2162,19 +2162,16 @@ a real `pip install`, and a `kill -9` of the daemon mid-write went through the m
   tool and `fallocate(2)` callers do not.
 - **`O_TMPFILE` is `EOPNOTSUPP`** (FUSE `TMPFILE`, Linux 6.11+, is unserved).
 
-**Open, a design decision: an absolute symlink is followed out of the volume.**
-- What happens: an agent can plant `out -> /etc/cron.d/x` in a volume, and the kernel follows that link for any later
-  process that writes `vol/out`. The write lands on the host path with that process's permissions. slates writes
-  nothing (the daemon's `write_bytes` is unchanged), but a privileged tool writing into an agent's volume could be
-  steered.
-- Measured 2026-10-06: HEAD (`7208e42`) and this change behave identically. `ln -s /home/tester/out s; echo x > s` on
-  the mount created `/home/tester/out` on the container's disk.
-- The options, each with a cost:
-  - a `nosymfollow` attach option (`MS_NOSYMFOLLOW`, Linux 5.10+), which also blocks the relative links real trees
-    need (a venv's `python`, `node_modules/.bin`);
-  - rewriting absolute targets on `readlink` to stay inside the mount, which changes what a landing writes back;
-  - relying on the container: inside an OCI bind, absolute links already resolve within the container's root, which
-    contains them.
+**Closed by A-107: a symlink out of the volume was followed for any caller.**
+- What happened: an agent could plant `out -> /etc/cron.d/x` in a volume, and the kernel followed that link for any later
+  process that wrote `vol/out`. The write landed on the host path with that process's permissions. slates wrote
+  nothing (the daemon's `write_bytes` was unchanged), but a privileged tool writing into an agent's volume could be
+  steered. Measured on HEAD `7208e42`: `ln -s /home/tester/out s; echo x > s` created `/home/tester/out`.
+- Decided 2026-10-06 (A-107): Linux's `protected_symlinks` rule at the volume's edge.
+  - A link whose target leaves the volume resolves only for the caller who owns it; others get `EACCES`.
+  - Links that stay inside resolve for everyone.
+  - Exact on FUSE; best-effort on NFS, whose clients cache symlink targets.
+- Test: `a_link_out_of_the_volume_resolves_only_for_its_owner`, plus the e2e numbers in A-107.
 
 **Environment.** Docker Desktop's VM held a `sync(2)` in `super_lock` for every container. The cause was a slates
 process from an earlier session (container `5a5e7b603590`), stuck exiting while its mount namespace tore down a slates

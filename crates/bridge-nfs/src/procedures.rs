@@ -2917,6 +2917,7 @@ fn nfsstat_of(e: &VfsError) -> Nfsstat3 {
     VfsError::NotEmpty => Nfsstat3::Notempty,
     VfsError::NoSpace => Nfsstat3::Nospc,
     VfsError::NotPermitted => Nfsstat3::Perm,
+    VfsError::LinkProtected => Nfsstat3::Acces,
     VfsError::SpecialFileOperation => Nfsstat3::Notsupp,
     VfsError::Invalid | VfsError::InvalidName => Nfsstat3::Inval,
     VfsError::NameTooLong => Nfsstat3::Nametoolong,
