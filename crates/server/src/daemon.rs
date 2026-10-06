@@ -2552,7 +2552,8 @@ fn shard_arena(
   let (handoff, len) = handoff_of(env)?;
   let segment = AnchorSegment::attach(&handoff, len, identity)?;
   let mut pool = crate::content_pool::ContentPool::open(config, partition, env, segment);
-  let mut arena = ChunkArena::new(config.content_granule());
+  let mut arena =
+    ChunkArena::new(config.content_granule()).discarding_from(config.discard_from_bytes);
   for (id, region) in pool.held()? {
     arena.add_region_at(id, region)?;
   }
@@ -2773,6 +2774,7 @@ fn init_shard(
     pairs_delivered: std::collections::BTreeSet::new(),
     peer_recipients: std::collections::BTreeMap::new(),
     content,
+    purge_seen_allocations: 0,
     content_range,
     delta_range: delta_range(config, partition, content_range),
     journal: slates_vfs::checkpoint_log::Journal::default(),
@@ -3067,6 +3069,60 @@ async fn seal_idle_content() {
     state::with_state(|s| s.store.content.arena().deferred_bytes() > 0).unwrap_or(false);
   if sealed_this_tick > 0 || deferred {
     let _ = state::with_state(crate::verbs::publish_shard);
+    return;
+  }
+  purge_if_idle().await;
+}
+
+/// The idle shard's emptied FUSE write log, its pages given back (`crate::write_log::WriteLog::purge`).
+#[cfg(target_os = "linux")]
+fn purge_write_log(s: &mut ShardState) -> usize {
+  match (s.content.as_mut(), s.write_log.as_mut()) {
+    (Some(object), Some(log)) => log.purge(object),
+    _ => 0,
+  }
+}
+
+/// No write log off Linux (A-63 logs the FUSE mount's writes).
+#[cfg(not(target_os = "linux"))]
+fn purge_write_log(_s: &mut ShardState) -> usize {
+  0
+}
+
+/// Counter: content bytes an idle shard gave back to the OS (A-105).
+pub const CONTENT_PURGED: &str = "content.purged_bytes";
+
+/// Gives an idle shard's resident free content, and its emptied write log's pages, back to the OS (A-105): when the
+/// content arena allocated nothing since the last reap tick, its free blocks are purged a slice at a time, yielding
+/// between slices so a request that arrives meanwhile is served first. Decay-based, as jemalloc purges dirty pages after
+/// a quiet interval: a busy shard keeps its zeroed free blocks resident for the allocations that follow, an idle one
+/// stops costing RAM for what it no longer holds. Before 2026-10-06 nothing ever went back: a deleted 128 MiB file left
+/// the content object at 168 MiB allocated.
+async fn purge_if_idle() {
+  loop {
+    let step = state::with_state(|s| {
+      let allocations = s.store.content.arena().allocations();
+      let idle = allocations == s.purge_seen_allocations;
+      s.purge_seen_allocations = allocations;
+      if !idle {
+        return None;
+      }
+      let slice_blocks = usize::try_from(s.config.archive_slice_bytes())
+        .unwrap_or(usize::MAX)
+        .checked_div(s.config.discard_from_bytes.max(1))
+        .unwrap_or(0)
+        .max(1);
+      let purged = s.store.content.arena_mut().purge(slice_blocks);
+      let log = if purged.more { 0 } else { purge_write_log(s) };
+      let bytes = purged.bytes.saturating_add(log);
+      s.count(CONTENT_PURGED, u64::try_from(bytes).unwrap_or(u64::MAX));
+      Some(purged.more)
+    })
+    .flatten();
+    if step != Some(true) {
+      return;
+    }
+    futures::yield_now().await;
   }
 }
 

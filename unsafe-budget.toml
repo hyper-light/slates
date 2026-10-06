@@ -182,7 +182,12 @@ slates-machine = 50
 # `docs/bugs/2026-10-06-a-locked-volume-wired-its-shards-whole-arena.md`): `region::os::lock_slice` and `unlock_slice`,
 # `mlock`/`munlock` over one block of a region (Unix, 2) and `VirtualLock`/`VirtualUnlock` over it (Windows, 2). A block
 # is the unit a strict volume locks; memmap2 locks only whole maps and has no unlock of a range.
-slates-mem = 30
+# 2026-10-06 (+2, A-105, an idle shard gives its free content pages back —
+# `docs/bugs/2026-10-06-a-deleted-files-ram-never-went-back-to-the-os.md`): `region::os::discard_slice`
+# (`MADV_REMOVE`/`MADV_DONTNEED` over a free block's whole pages, Linux, 1) and `shared::platform::Inner::discard`
+# (`MADV_REMOVE` over a sparse object's emptied write-log pages, Linux, 1). rustix's `madvise` is unsafe because the
+# advice replaces bytes; `fallocate(PUNCH_HOLE)` is the safe call but a file write, allowed only in `slates-land` (R1).
+slates-mem = 32
 # 2026-09-14 (+11, registry slot reclamation — `docs/bugs/2026-09-14-shard-registry-leaks-every-slot-for-the-process-lifetime.md`):
 # `driver::KickFd` — the slot-owned kick descriptor: `Sync`/`Send` impls (2), `with`, `fd`, `close` (3
 # blocks reading or taking the `UnsafeCell` under the `closed` flag); `registry::register` (the previous

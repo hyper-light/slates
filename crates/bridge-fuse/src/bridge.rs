@@ -47,6 +47,10 @@ const DT_FIFO: u32 = 1;
 const DT_SOCK: u32 = 12;
 /// Format: Linux EOPNOTSUPP, a refused special-file operation.
 const EOPNOTSUPP: i32 = 95;
+/// Format: Linux ENODATA, the attribute a get or remove names is not set (`getxattr(2)`'s ENOATTR).
+const ENODATA: i32 = 61;
+/// Format: Linux ERANGE, the caller's buffer is too small for the attribute value or name list.
+const ERANGE: i32 = 34;
 /// Format: Linux EAGAIN, an operation to try again (A-64: the arena waits on the shard's next publication).
 const EAGAIN: i32 = 11;
 // The Linux errno values the volume core's refusals map to (the FUSE ABI is Linux, so the
@@ -154,6 +158,10 @@ pub fn dispatch(message: &[u8], bridge: &mut dyn Bridge, cx: &OpContext, out: &m
     Opcode::Rename2 => serve_rename(bridge, &request, cx, true, out),
     Opcode::SetAttr => serve_setattr(bridge, &request, cx, out),
     Opcode::StatFs => serve_statfs(bridge, &request, cx, out),
+    Opcode::SetXattr => serve_setxattr(bridge, &request, cx, out),
+    Opcode::GetXattr => serve_getxattr(bridge, &request, cx, out, false),
+    Opcode::ListXattr => serve_getxattr(bridge, &request, cx, out, true),
+    Opcode::RemoveXattr => serve_removexattr(bridge, &request, cx, out),
   }
 }
 
@@ -381,6 +389,7 @@ fn errno(e: VfsError) -> i32 {
     VfsError::TooManyLinks => EMLINK,
     VfsError::NotPermitted => EPERM,
     VfsError::SpecialFileOperation => EOPNOTSUPP,
+    VfsError::NoAttribute => ENODATA,
     VfsError::Invalid | VfsError::InvalidName => EINVAL,
     VfsError::NameTooLong => ENAMETOOLONG,
     VfsError::BaseUnavailable(code) => code,
@@ -1331,6 +1340,140 @@ fn setattr_changes(
     },
     ctime: set(SetAttrIn::FATTR_CTIME).then_some(s.ctime),
   })
+}
+
+/// Format: the only attribute namespace a volume stores through a Linux mount, as the NFSv4.2 bridge stores it
+/// (RFC 8276 names are `user.` attributes). `security.`, `trusted.` and `system.` belong to the host's LSM, its
+/// administrator and its ACLs, none of which a volume carries.
+const USER_NAMESPACE: &[u8] = b"user.";
+/// Format: `setxattr(2)`'s `XATTR_CREATE` (fail if the name is set) and `XATTR_REPLACE` (fail unless it is).
+const XATTR_CREATE: u32 = 1;
+/// Format: see [`XATTR_CREATE`].
+const XATTR_REPLACE: u32 = 2;
+
+/// The name an attribute request carries (NUL-terminated after the fixed part), when it is a `user.` name.
+fn user_attribute(body: &[u8]) -> Option<&[u8]> {
+  let end = body.iter().position(|b| *b == 0)?;
+  body
+    .get(..end)
+    .filter(|name| name.starts_with(USER_NAMESPACE) && name.len() > USER_NAMESPACE.len())
+}
+
+/// `GETXATTR` (and, `list`, `LISTXATTR`): `fuse_getxattr_in` is the caller's buffer size and padding, then for a
+/// get the name. A size of zero asks for the length (`fuse_getxattr_out`); a buffer too small is `ERANGE`; a name
+/// outside `user.` is not set (`ENODATA`); a listing names only `user.` attributes, each NUL-terminated.
+fn serve_getxattr(
+  bridge: &mut dyn Bridge,
+  req: &Request<'_>,
+  cx: &OpContext,
+  out: &mut [u8],
+  list: bool,
+) -> usize {
+  /// Format: `fuse_getxattr_in` — size, then padding — before the name.
+  const HEAD: usize = 2 * size_of::<u32>();
+  let unique = req.header.unique;
+  let Some(size) = body_u32(req.body, 0) else {
+    return write_or_drop(ReplyHeader::write_error(unique, EIO, out), out);
+  };
+  let object = match resolve(bridge, cx, req.header.nodeid) {
+    Ok(object) => object,
+    Err(e) => return reply_err(unique, e, out),
+  };
+  let value = if list {
+    bridge.xattr_list(object, cx).map(|names| {
+      names
+        .iter()
+        .filter(|name| name.starts_with(USER_NAMESPACE))
+        .flat_map(|name| name.iter().copied().chain(std::iter::once(0)))
+        .collect::<Vec<u8>>()
+    })
+  } else {
+    match user_attribute(req.body.get(HEAD..).unwrap_or_default()) {
+      Some(name) => bridge.xattr_get(object, cx, name),
+      None => return write_or_drop(ReplyHeader::write_error(unique, ENODATA, out), out),
+    }
+  };
+  let value = match value {
+    Ok(value) => value,
+    Err(e) => return reply_err(unique, e, out),
+  };
+  let length = u32::try_from(value.len()).unwrap_or(u32::MAX);
+  if size == 0 {
+    let mut answer = Vec::with_capacity(HEAD);
+    answer.extend_from_slice(&length.to_le_bytes());
+    answer.extend_from_slice(&0u32.to_le_bytes());
+    return write_or_drop(ReplyHeader::write_ok(unique, &answer, out), out);
+  }
+  if length > size {
+    return write_or_drop(ReplyHeader::write_error(unique, ERANGE, out), out);
+  }
+  write_or_drop(ReplyHeader::write_ok(unique, &value, out), out)
+}
+
+/// `SETXATTR`: `fuse_setxattr_in` is the value's size and the `setxattr(2)` flags (slates does not negotiate
+/// `FUSE_SETXATTR_EXT`, so the short form), then the name, then the value. Only `user.` names are stored; any other
+/// is `EOPNOTSUPP`, what a filesystem without that namespace answers.
+fn serve_setxattr(
+  bridge: &mut dyn Bridge,
+  req: &Request<'_>,
+  cx: &OpContext,
+  out: &mut [u8],
+) -> usize {
+  /// Format: `fuse_setxattr_in` — size, flags — before the name.
+  const HEAD: usize = 2 * size_of::<u32>();
+  let unique = req.header.unique;
+  let (Some(size), Some(flags)) = (body_u32(req.body, 0), body_u32(req.body, size_of::<u32>()))
+  else {
+    return write_or_drop(ReplyHeader::write_error(unique, EIO, out), out);
+  };
+  let rest = req.body.get(HEAD..).unwrap_or_default();
+  let Some(name) = user_attribute(rest) else {
+    return write_or_drop(ReplyHeader::write_error(unique, EOPNOTSUPP, out), out);
+  };
+  let value_at = name.len().saturating_add(1);
+  let value_end = value_at.saturating_add(usize::try_from(size).unwrap_or(usize::MAX));
+  let Some(value) = rest.get(value_at..value_end) else {
+    return write_or_drop(ReplyHeader::write_error(unique, EIO, out), out);
+  };
+  let how = match flags & (XATTR_CREATE | XATTR_REPLACE) {
+    XATTR_CREATE => slates_vfs::xattr::XattrSet::Create,
+    XATTR_REPLACE => slates_vfs::xattr::XattrSet::Replace,
+    0 => slates_vfs::xattr::XattrSet::Either,
+    _ => return write_or_drop(ReplyHeader::write_error(unique, EINVAL, out), out),
+  };
+  let object = match resolve(bridge, cx, req.header.nodeid) {
+    Ok(object) => object,
+    Err(e) => return reply_err(unique, e, out),
+  };
+  reply(
+    unique,
+    bridge.xattr_set(object, cx, name, value, how),
+    |()| Vec::new(),
+    out,
+  )
+}
+
+/// `REMOVEXATTR`: the body is the name. A name outside `user.` is `EOPNOTSUPP`; an unset one `ENODATA`.
+fn serve_removexattr(
+  bridge: &mut dyn Bridge,
+  req: &Request<'_>,
+  cx: &OpContext,
+  out: &mut [u8],
+) -> usize {
+  let unique = req.header.unique;
+  let Some(name) = user_attribute(req.body) else {
+    return write_or_drop(ReplyHeader::write_error(unique, EOPNOTSUPP, out), out);
+  };
+  let object = match resolve(bridge, cx, req.header.nodeid) {
+    Ok(object) => object,
+    Err(e) => return reply_err(unique, e, out),
+  };
+  reply(
+    unique,
+    bridge.xattr_remove(object, cx, name),
+    |()| Vec::new(),
+    out,
+  )
 }
 
 fn serve_statfs(

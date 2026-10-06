@@ -349,6 +349,37 @@ impl SparseObject {
     Ok(())
   }
 
+  /// Zeroes the `len` bytes at `offset` in place, a page-sized piece at a time (no buffer as long as the range): the
+  /// pages stay resident for the writes that follow. Refused as [`SparseObject::write`] is.
+  pub fn zero(&mut self, offset: usize, len: usize) -> Result<(), MemError> {
+    /// Shape: the zeros written per call (a page on every target slates builds for).
+    const ZERO_PIECE: usize = 4096;
+    check_copy(&self.words, offset, len, self.len)?;
+    let end = offset.saturating_add(len);
+    let zeros = [0u8; ZERO_PIECE];
+    let mut at = offset;
+    while at < end {
+      let piece = end.saturating_sub(at).min(ZERO_PIECE);
+      self.write(at, zeros.get(..piece).unwrap_or_default())?;
+      at = at.saturating_add(piece);
+    }
+    Ok(())
+  }
+
+  /// Gives the whole pages inside `offset .. offset + len` back to the OS (A-105), where it takes them (Linux): the
+  /// range then reads as zeros and costs no RAM until written again. For a range that already holds only zeros (a
+  /// cleared write log), so the partial pages at its ends need nothing. The bytes given back, zero where the OS took
+  /// none. Refused as [`SparseObject::write`] is.
+  pub fn discard(&mut self, offset: usize, len: usize) -> Result<usize, MemError> {
+    check_copy(&self.words, offset, len, self.len)?;
+    Ok(
+      self
+        .inner
+        .discard(offset, len)
+        .map_or(0, |(first, last)| last.saturating_sub(first)),
+    )
+  }
+
   /// Copies the `into.len()` racy bytes at `offset` out, byte by byte through `AtomicU8` (committed first):
   /// for a seqlock reader, which validates the copy against the generation after. Refused unless the span
   /// lies wholly inside one declared racy span.
@@ -833,6 +864,43 @@ mod platform {
       &mut self.map
     }
 
+    /// Gives the whole pages inside `offset .. offset + len` back to the OS, leaving a hole that reads as zeros in
+    /// every mapping of the object (`MADV_REMOVE`, which on a memfd is a hole punch): the page-aligned range given
+    /// back, or `None` (nothing changed) where there is no whole page or the OS refused.
+    #[cfg(all(target_os = "linux", not(miri)))]
+    pub(super) fn discard(&mut self, offset: usize, len: usize) -> Option<(usize, usize)> {
+      let page = rustix::param::page_size().max(1);
+      let end = offset
+        .checked_add(len)
+        .filter(|end| *end <= self.map.len())?;
+      let first = offset.next_multiple_of(page);
+      let last = end.saturating_sub(end.checked_rem(page).unwrap_or(0));
+      let interior = self
+        .map
+        .get_mut(first..last)
+        .filter(|interior| !interior.is_empty())?;
+      // SAFETY: `interior` is a live, page-aligned run of whole pages of this object's own shared mapping, borrowed
+      // mutably for the call; `MADV_REMOVE` replaces exactly those bytes with zeros (in this mapping and every other
+      // of the object), which is what the caller asks for. No lock is held on this map's pages (a sparse object is
+      // never locked).
+      unsafe {
+        rustix::mm::madvise(
+          interior.as_mut_ptr().cast(),
+          interior.len(),
+          rustix::mm::Advice::LinuxRemove,
+        )
+      }
+      .ok()
+      .map(|()| (first, last))
+    }
+
+    /// No page goes back here (a POSIX shared memory object has no hole to punch; Miri models no `madvise`): the
+    /// caller writes the zeros itself.
+    #[cfg(not(all(target_os = "linux", not(miri))))]
+    pub(super) fn discard(&mut self, _offset: usize, _len: usize) -> Option<(usize, usize)> {
+      None
+    }
+
     pub(super) fn lock(&mut self) -> Result<(), MemError> {
       crate::region::lock_map(&mut self.map).map_err(|e| MemError::OsRefused {
         call: "mlock",
@@ -1195,6 +1263,12 @@ mod platform {
     pub(super) fn bytes_mut(&mut self) -> &mut [u8] {
       // SAFETY: as for `bytes`, and `&mut self` is the only borrow of the view in this process.
       unsafe { std::slice::from_raw_parts_mut(self.base(), self.len) }
+    }
+
+    /// No page goes back here yet (decommitting a section's view leaves its pages charged to the section; owed with a
+    /// measurement): the caller writes the zeros itself.
+    pub(super) fn discard(&mut self, _offset: usize, _len: usize) -> Option<(usize, usize)> {
+      None
     }
 
     pub(super) fn lock(&mut self) -> Result<(), MemError> {

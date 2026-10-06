@@ -152,6 +152,9 @@ pub struct ShardState {
   /// the anchor provides no content object (a build or config without anchor-backed recovery); then
   /// a restart recreates content empty as before (BUG-11).
   pub content: Option<SparseObject>,
+  /// The content arena's allocation count at the last reap tick: unchanged at the next means the shard allocated
+  /// nothing in between, so its free blocks can go back to the OS (A-105, `daemon::purge_if_idle`).
+  pub(crate) purge_seen_allocations: u64,
   /// The half-open byte range `[start, end)` of `content` this shard publishes into and recovers
   /// from; `0..0` when there is no content object.
   pub content_range: (usize, usize),

@@ -46,6 +46,8 @@ struct Mock {
   last_rename: Option<RenameFlags>,
   /// The mode the last `create` reached the seam with (what the volume would keep).
   last_create_mode: Option<u32>,
+  /// The file's extended attributes, by name (the volume's table, A-32).
+  xattrs: std::collections::BTreeMap<Vec<u8>, Vec<u8>>,
 }
 
 /// Format: the file mode of a regular file, and of a directory.
@@ -122,38 +124,56 @@ impl Bridge for Mock {
       Err(VfsError::NotFound)
     }
   }
-  /// The mock holds no extended attributes.
+  /// The mock's attributes follow the volume's rules (`slates_vfs::xattr`): create and replace refuse as
+  /// `setxattr(2)` does, a missing name is `NoAttribute`.
   fn xattr_get(
     &mut self,
     _object: ObjectId,
     _cx: &OpContext,
-    _name: &[u8],
+    name: &[u8],
   ) -> Result<Vec<u8>, VfsError> {
-    Err(VfsError::NoAttribute)
+    self.xattrs.get(name).cloned().ok_or(VfsError::NoAttribute)
   }
 
   fn xattr_set(
     &mut self,
     _object: ObjectId,
     _cx: &OpContext,
-    _name: &[u8],
-    _value: &[u8],
-    _how: slates_vfs::xattr::XattrSet,
+    name: &[u8],
+    value: &[u8],
+    how: slates_vfs::xattr::XattrSet,
   ) -> Result<(), VfsError> {
-    Err(VfsError::NotPermitted)
+    use slates_vfs::xattr::XattrSet;
+    match (how, self.xattrs.contains_key(name)) {
+      (XattrSet::Create, true) => return Err(VfsError::AlreadyExists),
+      (XattrSet::Replace, false) => return Err(VfsError::NoAttribute),
+      _ => {}
+    }
+    self.xattrs.insert(name.to_vec(), value.to_vec());
+    Ok(())
   }
 
   fn xattr_list(&mut self, _object: ObjectId, _cx: &OpContext) -> Result<Vec<Box<[u8]>>, VfsError> {
-    Ok(Vec::new())
+    Ok(
+      self
+        .xattrs
+        .keys()
+        .map(|name| name.clone().into_boxed_slice())
+        .collect(),
+    )
   }
 
   fn xattr_remove(
     &mut self,
     _object: ObjectId,
     _cx: &OpContext,
-    _name: &[u8],
+    name: &[u8],
   ) -> Result<(), VfsError> {
-    Err(VfsError::NoAttribute)
+    self
+      .xattrs
+      .remove(name)
+      .map(|_| ())
+      .ok_or(VfsError::NoAttribute)
   }
 
   /// The mock's content has no holes: every byte before its end is data, and the end is the hole.
@@ -439,6 +459,7 @@ fn mock() -> Mock {
     rename_calls: 0,
     last_rename: None,
     last_create_mode: None,
+    xattrs: std::collections::BTreeMap::new(),
   }
 }
 
@@ -1077,22 +1098,144 @@ fn a_name_that_is_not_utf8_is_refused_eilseq_by_every_opcode_and_never_reaches_t
   );
 }
 
-/// The extended-attribute operations (`SETXATTR`, `GETXATTR`, `LISTXATTR`, `REMOVEXATTR`) are
-/// answered `ENOSYS`, the precise unsupported error: the kernel turns a daemon's `ENOSYS` into
-/// `EOPNOTSUPP` for the caller and stops asking, so a tool sees "not supported", never an ignored
-/// success (§4.6 "Extended attributes ... have explicit capability contracts"; T-1.21 xattrs). The
-/// volume core carries no extended attributes (`crates/vfs/src/export.rs`).
-#[test]
-fn xattr_operations_are_answered_enosys_the_precise_unsupported_error() {
-  /// Format: `FUSE_SETXATTR`, `FUSE_GETXATTR`, `FUSE_LISTXATTR`, `FUSE_REMOVEXATTR`.
-  const XATTR_OPCODES: [u32; 4] = [21, 22, 23, 24];
-  let mut m = mock();
-  let mut out = [0u8; 256];
-  for opcode in XATTR_OPCODES {
-    // fuse_setxattr_in / fuse_getxattr_in bodies are irrelevant: the opcode is unserved.
-    let n = dispatch(&message(opcode, 1, 2, b"user.k\0v"), &mut m, &mut out);
-    assert_eq!(reply_error(&out, n), -ENOSYS, "opcode {opcode}");
+/// A `fuse_setxattr_in` body (size, flags), the NUL-terminated name, then the value.
+fn setxattr_body(name: &[u8], value: &[u8], flags: u32) -> Vec<u8> {
+  let mut body = Vec::new();
+  body.extend_from_slice(&u32::try_from(value.len()).unwrap().to_le_bytes());
+  body.extend_from_slice(&flags.to_le_bytes());
+  body.extend_from_slice(name);
+  body.push(0);
+  body.extend_from_slice(value);
+  body
+}
+
+/// A `fuse_getxattr_in` body (the caller's buffer size, padding), then the name when there is one.
+fn getxattr_body(size: u32, name: Option<&[u8]>) -> Vec<u8> {
+  let mut body = Vec::new();
+  body.extend_from_slice(&size.to_le_bytes());
+  body.extend_from_slice(&0u32.to_le_bytes());
+  if let Some(name) = name {
+    body.extend_from_slice(name);
+    body.push(0);
   }
+  body
+}
+
+/// One attribute request against `m`: the reply's status (0 or a negative errno) and its body.
+fn attribute_request(m: &mut Mock, opcode: Opcode, body: &[u8]) -> (i32, Vec<u8>) {
+  let mut out = [0u8; 512];
+  let n = dispatch(&message(opcode.to_wire(), 1, 2, body), m, &mut out);
+  let status = i32::from_le_bytes(out[4..8].try_into().unwrap());
+  (status, out[OUT_HEADER_LEN..n].to_vec())
+}
+
+fn set_attribute(m: &mut Mock, name: &[u8], value: &[u8], flags: u32) -> i32 {
+  attribute_request(m, Opcode::SetXattr, &setxattr_body(name, value, flags)).0
+}
+
+fn get_attribute(m: &mut Mock, name: &[u8], size: u32) -> (i32, Vec<u8>) {
+  attribute_request(m, Opcode::GetXattr, &getxattr_body(size, Some(name)))
+}
+
+fn list_attributes(m: &mut Mock, size: u32) -> (i32, Vec<u8>) {
+  attribute_request(m, Opcode::ListXattr, &getxattr_body(size, None))
+}
+
+fn remove_attribute(m: &mut Mock, name: &[u8]) -> i32 {
+  let mut body = name.to_vec();
+  body.push(0);
+  attribute_request(m, Opcode::RemoveXattr, &body).0
+}
+
+/// §4.5 A-32 through the Linux mount (T-1.21 xattrs): do set a `user.` attribute, ask its length (size 0), read it,
+/// list the names, replace it, then remove it. Expect each answered as `getxattr(2)`, `listxattr(2)` and `setxattr(2)`
+/// specify: the length in `fuse_getxattr_out`, the value, the name NUL-terminated, the replacement read back, and a
+/// removed name `ENODATA`. Before 2026-10-06 every attribute operation was `ENOSYS` (the kernel then told every caller
+/// "not supported"), though the volume core has held attributes since A-32 (found in an adversarial container run).
+#[test]
+fn a_user_attribute_is_set_read_listed_replaced_and_removed() {
+  let mut m = mock();
+  assert_eq!(
+    set_attribute(&mut m, b"user.origin", b"https://example", 0),
+    0
+  );
+  let (status, length) = get_attribute(&mut m, b"user.origin", 0);
+  assert_eq!(
+    (status, &length[..4]),
+    (0, &15u32.to_le_bytes()[..]),
+    "the length when asked with size 0"
+  );
+  assert_eq!(
+    get_attribute(&mut m, b"user.origin", 64),
+    (0, b"https://example".to_vec())
+  );
+  assert_eq!(list_attributes(&mut m, 64), (0, b"user.origin\0".to_vec()));
+  assert_eq!(
+    set_attribute(&mut m, b"user.origin", b"x", 1),
+    -17,
+    "XATTR_CREATE over a set name is EEXIST"
+  );
+  assert_eq!(
+    set_attribute(&mut m, b"user.origin", b"replaced", 2),
+    0,
+    "XATTR_REPLACE of a set name"
+  );
+  assert_eq!(
+    get_attribute(&mut m, b"user.origin", 64),
+    (0, b"replaced".to_vec())
+  );
+  assert_eq!(remove_attribute(&mut m, b"user.origin"), 0);
+  assert_eq!(
+    get_attribute(&mut m, b"user.origin", 64).0,
+    -61,
+    "a removed name is ENODATA"
+  );
+}
+
+/// Names outside `user.` (the host LSM's, its administrator's, its ACLs', and an empty `user.` key): do set and read
+/// each. Expect `EOPNOTSUPP` for the set and `ENODATA` for the read, and nothing stored.
+#[test]
+fn attribute_names_outside_the_user_namespace_are_never_stored() {
+  let mut m = mock();
+  for name in [
+    &b"security.selinux"[..],
+    b"trusted.x",
+    b"system.posix_acl_access",
+    b"user.",
+  ] {
+    assert_eq!(set_attribute(&mut m, name, b"v", 0), -95, "{name:?}");
+    assert_eq!(get_attribute(&mut m, name, 64).0, -61, "{name:?}");
+  }
+  assert!(m.xattrs.is_empty());
+}
+
+/// Hostile and boundary attribute requests: do read and list into a buffer one byte too small, replace a name never
+/// set, and send bodies cut short. Expect `ERANGE`, `ERANGE`, `ENODATA` and `EIO`, never a panic, and nothing stored that a request did not carry whole.
+#[test]
+fn attribute_requests_outside_the_rules_are_refused_typed() {
+  let mut m = mock();
+  assert_eq!(set_attribute(&mut m, b"user.k", b"value", 0), 0);
+  assert_eq!(get_attribute(&mut m, b"user.k", 4).0, -34);
+  assert_eq!(list_attributes(&mut m, 3).0, -34);
+  assert_eq!(set_attribute(&mut m, b"user.never", b"v", 2), -61);
+  let mut cut = setxattr_body(b"user.cut", b"0123456789", 0);
+  cut.truncate(cut.len() - 3);
+  assert_eq!(
+    attribute_request(&mut m, Opcode::SetXattr, &cut).0,
+    -5,
+    "a value shorter than its size"
+  );
+  assert_eq!(
+    attribute_request(&mut m, Opcode::SetXattr, &[1, 0]).0,
+    -5,
+    "a body shorter than its fixed part"
+  );
+  assert_eq!(attribute_request(&mut m, Opcode::GetXattr, &[]).0, -5);
+  assert_eq!(
+    m.xattrs.len(),
+    1,
+    "nothing was stored from a refused request"
+  );
 }
 
 /// An attribute reply carries the object's change time in the wire change time, not its

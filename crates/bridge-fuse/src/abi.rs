@@ -59,6 +59,14 @@ pub enum Opcode {
   Release = 18,
   /// Format: FUSE_FSYNC — flush cached data of an open file.
   FSync = 20,
+  /// Format: FUSE_SETXATTR — set an extended attribute (`fuse_setxattr_in`, the name, the value).
+  SetXattr = 21,
+  /// Format: FUSE_GETXATTR — read an extended attribute, or its length (`fuse_getxattr_in`, the name).
+  GetXattr = 22,
+  /// Format: FUSE_LISTXATTR — list the extended attribute names, or their total length (`fuse_getxattr_in`).
+  ListXattr = 23,
+  /// Format: FUSE_REMOVEXATTR — remove an extended attribute (the name).
+  RemoveXattr = 24,
   /// Format: FUSE_FLUSH — the kernel flushes a file descriptor.
   Flush = 25,
   /// Format: FUSE_INIT — negotiate the connection.
@@ -104,6 +112,10 @@ const ALL: &[Opcode] = &[
   Opcode::StatFs,
   Opcode::Release,
   Opcode::FSync,
+  Opcode::SetXattr,
+  Opcode::GetXattr,
+  Opcode::ListXattr,
+  Opcode::RemoveXattr,
   Opcode::Flush,
   Opcode::Init,
   Opcode::OpenDir,

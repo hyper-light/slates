@@ -2125,6 +2125,63 @@ A genuinely dead owner delays nothing: the council's death-confirmation window a
 Failing test first: `a_holder_defers_a_promotion_while_its_answers_may_feed_the_departed_owners_lease`.
 [Bug record](../bugs/2026-09-29-holders-promised-without-the-lease-gate.md).
 
+### 2026-10-06: an adversarial container run — containment held; RAM, attributes and first-run guidance fixed
+
+**The run.** A slates volume over a base directory, FUSE-mounted in a Linux container as an ordinary user
+(`adv-inner.sh` in the session scratchpad: `rust:1.98.0`, `fuse3`, the daemon under its anchor). Hostile operations,
+a real `pip install`, and a `kill -9` of the daemon mid-write went through the mount.
+
+**Held:**
+- **The base was byte-identical afterwards.** Its tree hash was taken before and after: overwrite, append, truncate,
+  delete and an mmap write of base files all stayed in the volume.
+- **The daemon wrote 4096 bytes to disk in total.** That was one write at start (`/proc/<pid>/io write_bytes`),
+  across the 128 MiB fill, the 3,000 files and the install.
+- **Every escape attempt was refused:**
+  - hard links across the boundary: `EXDEV`;
+  - a setuid binary on the volume ran unprivileged: `nosuid`;
+  - `mknod` of a device: `EPERM`;
+  - `..` names reached nothing outside;
+  - a 300-byte name: refused;
+  - the volume quota stopped a fill at 128 MiB.
+- **The daemon survived `kill -9`.** A new daemon served the same mount, and reads continued.
+- **The install worked:** `pip install six requests idna` into a venv on the mount took 3.5–4.2 s.
+
+**Fixed:**
+- **A deleted file's RAM never went back to the OS** (A-105). Bug test `a_deleted_files_memory_goes_back_to_the_os`,
+  red first:
+  - with the old code, 16,986,112 bytes were allocated before the release and 16,986,112 after it;
+  - in the container, the memfd held 168 MiB after a 128 MiB delete, and 128 MiB after a 64 MiB write and its delete.
+- **User extended attributes were `EOPNOTSUPP`** on the Linux mount (A-106).
+- **`volume create` on a node never bootstrapped said only `ConsensusNotInitialized`.** It now names
+  `slates bootstrap root`. Test `a_create_before_bootstrap_is_refused_naming_the_command_that_fixes_it`, red first.
+
+**Owed:**
+- **`fallocate` is `EOPNOTSUPP`** (FUSE `FALLOCATE` is unserved). Honouring `posix_fallocate`'s promise, that a later
+  write in the range never fails for space, needs a quota reservation per range, which the quota model does not
+  carry yet. glibc's `posix_fallocate` falls back to writing zeros, so programs that use it work; the `fallocate`
+  tool and `fallocate(2)` callers do not.
+- **`O_TMPFILE` is `EOPNOTSUPP`** (FUSE `TMPFILE`, Linux 6.11+, is unserved).
+
+**Open, a design decision: an absolute symlink is followed out of the volume.**
+- What happens: an agent can plant `out -> /etc/cron.d/x` in a volume, and the kernel follows that link for any later
+  process that writes `vol/out`. The write lands on the host path with that process's permissions. slates writes
+  nothing (the daemon's `write_bytes` is unchanged), but a privileged tool writing into an agent's volume could be
+  steered.
+- Measured 2026-10-06: HEAD (`7208e42`) and this change behave identically. `ln -s /home/tester/out s; echo x > s` on
+  the mount created `/home/tester/out` on the container's disk.
+- The options, each with a cost:
+  - a `nosymfollow` attach option (`MS_NOSYMFOLLOW`, Linux 5.10+), which also blocks the relative links real trees
+    need (a venv's `python`, `node_modules/.bin`);
+  - rewriting absolute targets on `readlink` to stay inside the mount, which changes what a landing writes back;
+  - relying on the container: inside an OCI bind, absolute links already resolve within the container's root, which
+    contains them.
+
+**Environment.** Docker Desktop's VM held a `sync(2)` in `super_lock` for every container. The cause was a slates
+process from an earlier session (container `5a5e7b603590`), stuck exiting while its mount namespace tore down a slates
+NFS mount whose daemon was already dead (`nfs4_proc_destroy_session`, retried forever). This is the harness-ordering
+rule recorded with the 2026-10-04 VM NFS wedge (unmount before killing the daemon). It is not a slates code path, and only a
+VM restart frees it. The run uses `sync -f` (one filesystem's `syncfs`) since.
+
 ### 2026-10-06: the no-panic sweep's indexing half is closed and the lints are denied workspace-wide
 
 `indexing_slicing`, `string_slice`, `panic_in_result_fn` and `unwrap_in_result` are now `deny` in

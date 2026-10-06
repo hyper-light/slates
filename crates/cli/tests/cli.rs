@@ -106,6 +106,10 @@ impl Drop for AnchorProcess {
 }
 
 /// Starts the anchor and waits until a verb is answered.
+/// Shape: an environment variable `start_anchor_with_environment` reads as "do not bootstrap": the anchor comes up
+/// as a fresh node that has never created its consensus group. The daemon ignores it.
+const UNBOOTSTRAPPED: &str = "SLATES_TEST_UNBOOTSTRAPPED";
+
 fn start_anchor(instance: &str) -> AnchorProcess {
   start_anchor_with_environment(instance, &[])
 }
@@ -140,6 +144,9 @@ fn start_anchor_with_environment(
     if code == 0 {
       streak += 1;
       if streak >= STABLE_STREAK {
+        if environment.iter().any(|(name, _)| name == UNBOOTSTRAPPED) {
+          return anchor;
+        }
         let (code, _, error) = run(instance, &["bootstrap", "root"]);
         assert_eq!(code, 0, "explicit first-time bootstrap: {error}");
         return anchor;
@@ -485,6 +492,42 @@ fn kill_anchor_and_wait_for_the_daemon_to_leave(instance: &str, anchor: AnchorPr
 }
 
 /// The whole flow through the binary: up, the verbs, the refusals, down with the anchor.
+/// The first five minutes, adversarially (a user who never read the docs): do start a fresh node and create a
+/// volume before bootstrapping it. Expect the create refused (exit 1) with the refusal's name, as scripts match it,
+/// and the one command that fixes it, `slates bootstrap root`; then bootstrap and expect the same create to succeed.
+/// Before 2026-10-06 the refusal said only `ConsensusNotInitialized` (found in an adversarial container run).
+#[test]
+fn a_create_before_bootstrap_is_refused_naming_the_command_that_fixes_it() {
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!("skipping the unbootstrapped-node flow: set SLATES_TEST_CLI=1 to run it");
+    return;
+  }
+  let instance = format!("cli-fresh-{}", std::process::id());
+  let anchor =
+    start_anchor_with_environment(&instance, &[(UNBOOTSTRAPPED.to_owned(), "1".to_owned())]);
+  let (code, _, err) = run(
+    &instance,
+    &["volume", "create", "early", "--bounded", "4MiB"],
+  );
+  assert_eq!(code, 1, "{err}");
+  assert!(
+    err.contains("ConsensusNotInitialized"),
+    "the refusal keeps its name: {err}"
+  );
+  assert!(
+    err.contains("slates bootstrap root"),
+    "the refusal names the fix: {err}"
+  );
+  let (code, _, err) = run(&instance, &["bootstrap", "root"]);
+  assert_eq!(code, 0, "{err}");
+  let (code, _, err) = run(
+    &instance,
+    &["volume", "create", "early", "--bounded", "4MiB"],
+  );
+  assert_eq!(code, 0, "after bootstrap the create succeeds: {err}");
+  drop(anchor);
+}
+
 #[test]
 fn the_anchor_supervises_a_daemon_the_verbs_answer_and_the_daemon_leaves_with_the_anchor() {
   // This spawns a real anchor and daemon (subprocesses with spinning shards) and a `slates`
@@ -2350,7 +2393,11 @@ fn seal_on_owner(instance: &str, mountable: bool) -> (String, String) {
       instance,
       &["volume", "create", FLEET_VOLUME, "--bounded", "8MiB"],
     );
-    if code == 1 && err.trim() == "slates: refused: ConsensusNotInitialized" {
+    if code == 1
+      && err
+        .trim()
+        .starts_with("slates: refused: ConsensusNotInitialized")
+    {
       assert!(
         Instant::now() < deadline,
         "the owner imported the bootstrapped groups: {err}"

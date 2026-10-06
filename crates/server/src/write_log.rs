@@ -77,6 +77,8 @@ pub(crate) struct WriteLog {
   stamp: u64,
   /// Whether an acknowledged write has gone unlogged since the last clear: then only a publication makes it survive.
   overflowed: bool,
+  /// Whether the record area's pages were given back since the last append ([`WriteLog::purge`]).
+  purged: bool,
 }
 
 fn word(object: &SparseObject, at: usize) -> Option<u64> {
@@ -99,6 +101,7 @@ impl WriteLog {
     let mut log = WriteLog {
       start,
       capacity,
+      purged: false,
       used: 0,
       stamp: image_generation,
       overflowed: false,
@@ -224,6 +227,7 @@ impl WriteLog {
       .store(object, AT_USED, &covered.to_le_bytes())
       .map_err(|_| Refused::Unwritten)?;
     self.used = end;
+    self.purged = false;
     Ok(())
   }
 
@@ -244,8 +248,8 @@ impl WriteLog {
   /// in that image now. The records are scrubbed, not only uncovered: they are the plaintext of every logged write, and
   /// once the image holds them nothing needs them, while left in place they stayed in the anchor's RAM after the
   /// volume's content was sealed (condition 9, A-99; `a_cleared_log_keeps_none_of_the_bytes_it_logged`). The length
-  /// goes to zero first, so a daemon killed mid-scrub replays nothing rather than half-zeroed records. The zero buffer
-  /// is at most the log's capacity, allocated once per publication.
+  /// goes to zero first, so a daemon killed mid-scrub replays nothing rather than half-zeroed records. The records'
+  /// whole pages go back to the OS ([`SparseObject::zero`]), so a cleared log costs no RAM until it is written again.
   pub(crate) fn clear(&mut self, object: &mut SparseObject, stamp: u64) -> Result<(), Unwritten> {
     let logged = self.used;
     self.used = 0;
@@ -255,9 +259,25 @@ impl WriteLog {
     self.store(object, AT_OVERFLOW, &0u64.to_le_bytes())?;
     self.store(object, AT_STAMP, &stamp.to_le_bytes())?;
     if logged > 0 {
-      self.store(object, HEADER_BYTES, &vec![0u8; logged])?;
+      let at = self.start.checked_add(HEADER_BYTES).ok_or(Unwritten)?;
+      object.zero(at, logged).map_err(|_| Unwritten)?;
     }
     Ok(())
+  }
+
+  /// Gives the record area's pages back to the OS while the log is empty (A-105): run by an idle shard, so a log that
+  /// a burst of writes filled stops costing RAM once the burst is published and the shard goes quiet, while a busy
+  /// shard keeps its pages for the next appends. Once per emptying: an append re-arms it. The bytes given back.
+  pub(crate) fn purge(&mut self, object: &mut SparseObject) -> usize {
+    if self.used > 0 || self.purged {
+      return 0;
+    }
+    self.purged = true;
+    self
+      .start
+      .checked_add(HEADER_BYTES)
+      .and_then(|at| object.discard(at, self.capacity).ok())
+      .unwrap_or(0)
   }
 
   fn store(&self, object: &mut SparseObject, offset: usize, bytes: &[u8]) -> Result<(), Unwritten> {

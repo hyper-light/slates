@@ -42,6 +42,10 @@ const OPCODES: &[(Opcode, u32)] = &[
   (Opcode::StatFs, 17),
   (Opcode::Release, 18),
   (Opcode::FSync, 20),
+  (Opcode::SetXattr, 21),
+  (Opcode::GetXattr, 22),
+  (Opcode::ListXattr, 23),
+  (Opcode::RemoveXattr, 24),
   (Opcode::Flush, 25),
   (Opcode::Init, 26),
   (Opcode::OpenDir, 27),
@@ -58,7 +62,6 @@ const OPCODES: &[(Opcode, u32)] = &[
 /// `enum fuse_opcode` values slates does not serve (the header's remaining enumerators; the codec
 /// must report each as unserved, never mistake one for a served opcode).
 const UNSERVED_OPCODES: &[u32] = &[
-  21, 22, 23, 24, // SETXATTR, GETXATTR, LISTXATTR, REMOVEXATTR
   31, 32, 33, 34, // GETLK, SETLK, SETLKW, ACCESS
   36, 37, 39, 40, 41, 43, // INTERRUPT, BMAP, IOCTL, POLL, NOTIFY_REPLY, FALLOCATE
   46, 47, 48, 49, 50, 51, 52, 53,   // LSEEK .. COPY_FILE_RANGE_64

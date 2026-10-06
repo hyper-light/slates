@@ -262,6 +262,9 @@ pub struct DaemonConfig {
   pub cache_line: usize,
   /// The base page in bytes.
   pub page: usize,
+  /// The smallest released content block whose pages go back to the OS rather than being zeroed in place
+  /// (`slates_machine::profile::DerivedConstants::discard_from_bytes`).
+  pub discard_from_bytes: usize,
   /// The rendezvous instance name.
   pub instance: String,
   /// The operator's failover SLO, the lease term's ceiling (§4.4 "Derived constants", D-16).
@@ -784,6 +787,7 @@ impl DaemonConfig {
         .unwrap_or(1)
         .max(1),
       page: usize::try_from(page).unwrap_or(1).max(1),
+      discard_from_bytes: usize::try_from(d.discard_from_bytes.get()).unwrap_or(usize::MAX),
       instance: instance.to_owned(),
       failover_slo_ns: FAILOVER_SLO_NS,
       // Unstated by default: the scatter width stays at the candidate floor until a deployment states its

@@ -101,6 +101,43 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ),
   );
 
+  // A-105: a released block zeroed in place (every page stays resident) against its pages given back to the OS (a
+  // syscall now, and a fault per page when the block is reused): the measurement that makes the give-back an idle
+  // purge rather than a step of every free. Each iteration allocates a block, touches every page (as a write does),
+  // frees it and, in the second row, purges, so that row pays the refault it causes.
+  /// Shape: the block the rows release: one content chunk of sixteen pages.
+  const CHUNK_PAGES: usize = 16;
+  let block = page * CHUNK_PAGES;
+  for (name, discard_from) in [
+    (
+      "arena alloc+touch+free (16 pages, zeroed in place)",
+      usize::MAX,
+    ),
+    ("arena alloc+touch+free (16 pages, pages given back)", page),
+  ] {
+    let mut arena = slates_mem::arena::ChunkArena::new(page).discarding_from(discard_from);
+    arena.add_region(slates_mem::region::Region::map(block * 64, page, false)?)?;
+    report(
+      name,
+      measure(
+        || {
+          if let Ok(extent) = arena.alloc(block) {
+            if let Some(bytes) = arena.bytes_mut(extent) {
+              for at in (0..bytes.len()).step_by(page) {
+                if let Some(byte) = bytes.get_mut(at) {
+                  *byte = 1;
+                }
+              }
+            }
+            let _ = arena.free(extent);
+            std::hint::black_box(arena.purge(usize::MAX));
+          }
+        },
+        budget,
+      ),
+    );
+  }
+
   // The ring round trip that matters: two rings between two threads, the peer echoing each
   // word back; one round trip is a push, a cross-core handoff, an echo push and a pop.
   let to_peer = SpscRing::new(1024)?;

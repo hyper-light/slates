@@ -247,6 +247,29 @@ impl Buddy {
     })
   }
 
+  /// Every free block at or after byte `from`, as `(offset, len)`, in address order: the same head walk as
+  /// [`Buddy::allocated`], keeping the free heads instead (A-105: what an idle purge gives back to the OS). A cold path.
+  pub fn free_blocks(&self, from: usize) -> impl Iterator<Item = (usize, usize)> + '_ {
+    let granules = self.state.len();
+    let mut at = from >> self.granule_shift;
+    std::iter::from_fn(move || {
+      while at < granules {
+        let here = at;
+        let state = self.state.get(here).copied().unwrap_or(INSIDE);
+        if state & HEAD_BIT == 0 {
+          at = here.saturating_add(1);
+          continue;
+        }
+        let span = 1usize << u32::from(state & ORDER_MASK);
+        at = here.saturating_add(span);
+        if state & FREE_BIT != 0 {
+          return Some((here << self.granule_shift, span << self.granule_shift));
+        }
+      }
+      None
+    })
+  }
+
   /// Records that the live `block` is locked in RAM (the owner locked its pages). Idempotent; a block that names no
   /// live block is refused as a free would refuse it.
   pub fn lock_block(&mut self, block: Block) -> Result<(), MemError> {

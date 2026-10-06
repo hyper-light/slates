@@ -20,6 +20,14 @@ use crate::format::volume_id_text;
 
 fn failure_of(e: ClientError, instance: &str) -> Failure {
   match e {
+    // The one refusal a first-time user meets before any other: it names the command that ends it (the group is
+    // created explicitly, never on a guess, so two nodes cannot each found their own; §4.8).
+    ClientError::Refused(refusal @ slates_ipc::protocol::Refusal::ConsensusNotInitialized) => {
+      Failure::Refused(format!(
+        "{refusal:?}: this node has no consensus group yet. Create it once with `slates bootstrap root`, \
+       or, on a fleet node, wait for it to import the groups."
+      ))
+    }
     ClientError::Refused(refusal) => Failure::Refused(format!("{refusal:?}")),
     // Both are "no daemon" to the caller (exit 3), but the cause is kept: a rendezvous that is not
     // there, a claim the daemon never answered, or a daemon that stopped answering are different
@@ -1857,6 +1865,7 @@ pub(crate) fn profile(options: &ProfileOptions) -> Result<(), Failure> {
     "copy_versus_remap_bytes: {}",
     derived.copy_versus_remap_bytes.get()
   );
+  println!("discard_from_bytes: {}", derived.discard_from_bytes.get());
   println!("ring_entries: {}", derived.ring_entries.get());
   Ok(())
 }

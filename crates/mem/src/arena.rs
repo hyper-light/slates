@@ -69,7 +69,10 @@ struct Slot {
 /// `init_on_free=1` hardening does for the page allocator). A freed block that held a file's plaintext, a deleted
 /// file's or a block a seal moved out of an image, would otherwise keep it in RAM until reused. A block whose free is
 /// deferred keeps its bytes until the commit that releases it: the recovery image may still read them.
-/// A deferred block released at last: zeroed, and unlocked when it was locked.
+/// A block released (now, or a deferred one at last): zeroed in place, and unlocked when it was locked (A-99: zero on
+/// free, as Linux's `init_on_free=1` hardening does for the page allocator). A locked block is zeroed while still
+/// locked, so its plaintext never reaches swap. Its pages stay resident, ready for the next allocation; an idle arena
+/// gives them back ([`ChunkArena::purge`], A-105).
 fn release_block(region: &mut Region, offset: usize, len: usize, locked: bool) {
   scrub(region, offset, len);
   if locked {
@@ -113,6 +116,23 @@ pub struct ChunkArena {
   allocated_bytes: usize,
   /// The pool this arena grows from, when it has one.
   source: Option<Box<dyn ExtentSource>>,
+  /// The smallest free block an idle purge gives back to the OS ([`ChunkArena::discarding_from`]); `usize::MAX`, none.
+  discard_from: usize,
+  /// Bytes released and zeroed in place since the last complete purge: resident RAM no allocation holds.
+  resident_free: usize,
+  /// Where an unfinished purge resumes: the region id and the byte within it.
+  purge_cursor: Option<(u16, usize)>,
+  /// Allocations so far, monotone: a caller that sees it unchanged across an interval knows the arena was idle.
+  allocations: u64,
+}
+
+/// What one [`ChunkArena::purge`] call did.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Purged {
+  /// Bytes whose pages went back to the OS.
+  pub bytes: usize,
+  /// Whether free blocks remain to visit: the next call resumes where this one stopped.
+  pub more: bool,
 }
 
 impl std::fmt::Debug for ChunkArena {
@@ -144,7 +164,82 @@ impl ChunkArena {
       granule: granule.max(1),
       allocated_bytes: 0,
       source: None,
+      discard_from: usize::MAX,
+      resident_free: 0,
+      purge_cursor: None,
+      allocations: 0,
     }
+  }
+
+  /// Lets an idle purge give free blocks of at least `bytes` back to the OS
+  /// (`slates_machine::profile::DerivedConstants::discard_from_bytes`). Without it, free blocks stay resident.
+  pub fn discarding_from(mut self, bytes: usize) -> Self {
+    self.discard_from = bytes;
+    self
+  }
+
+  /// Allocations so far (monotone, saturating): unchanged across an interval means the arena allocated nothing in it.
+  pub fn allocations(&self) -> u64 {
+    self.allocations
+  }
+
+  /// Bytes released and zeroed since the last complete purge: resident RAM no allocation holds, which
+  /// [`ChunkArena::purge`] would give back.
+  pub fn resident_free_bytes(&self) -> usize {
+    self.resident_free
+  }
+
+  /// Gives the pages of free blocks of at least the discard size back to the OS, at most `max_blocks` of them,
+  /// resuming where the last call stopped (A-105). Decay-based, as jemalloc purges (Evans, "dirty page decay"): a
+  /// block freed under load is zeroed in place and stays resident for the next allocation, which then takes no page
+  /// faults (measured: alloc+touch+free of a 64 KiB block costs 0.4 µs zeroed in place against 7 µs given back and
+  /// faulted in again), and an idle arena returns what it no longer uses. Nothing to do while no byte was released
+  /// since the last complete purge.
+  pub fn purge(&mut self, max_blocks: usize) -> Purged {
+    if self.resident_free == 0 {
+      return Purged::default();
+    }
+    let discard_from = self.discard_from;
+    let mut done = Purged::default();
+    let mut visited = 0usize;
+    let order = self.order.clone();
+    let start = self.purge_cursor.take();
+    let mut started = start.is_none();
+    for region in order {
+      let from = match start {
+        Some((at_region, at)) if at_region == region => {
+          started = true;
+          at
+        }
+        _ if started => 0,
+        _ => continue,
+      };
+      let Some(slot) = self.slot_mut(region) else {
+        continue;
+      };
+      let Slot {
+        region: memory,
+        buddy,
+      } = slot;
+      let free: Vec<(usize, usize)> = buddy
+        .free_blocks(from)
+        .filter(|(_, len)| *len >= discard_from)
+        .take(max_blocks.saturating_sub(visited).saturating_add(1))
+        .collect();
+      for (offset, len) in free {
+        if visited >= max_blocks {
+          self.purge_cursor = Some((region, offset));
+          done.more = true;
+          return done;
+        }
+        visited = visited.saturating_add(1);
+        if memory.discard(offset, len) {
+          done.bytes = done.bytes.saturating_add(len);
+        }
+      }
+    }
+    self.resident_free = 0;
+    done
   }
 
   /// Sets the pool this arena grows from (A-98).
@@ -417,6 +512,7 @@ impl ChunkArena {
 
   /// Allocates at least `len` bytes from the first region that can serve it.
   pub fn alloc(&mut self, len: usize) -> Result<Extent, MemError> {
+    self.allocations = self.allocations.saturating_add(1);
     let arena = self
       .identity
       .ok_or(MemError::GenerationExhausted { index: u32::MAX })?;
@@ -499,20 +595,24 @@ impl ChunkArena {
     if self.identity != Some(extent.arena) {
       return Err(foreign(ExtentRefusal::OtherArena));
     }
+    let mut self_resident = 0usize;
     let slot = self
       .slot_mut(extent.region)
       .ok_or_else(|| foreign(ExtentRefusal::NoSuchRegion))?;
     let before = slot.buddy.free_bytes();
     let locked = slot.buddy.is_locked(extent.block);
     let deferred = slot.buddy.free_or_defer(extent.block)?;
-    if scrubbed && !deferred {
-      scrub(&mut slot.region, extent.offset(), extent.len());
-    }
-    if locked && !deferred {
-      slot.region.unlock_range(extent.offset(), extent.len());
+    if !deferred {
+      if scrubbed {
+        release_block(&mut slot.region, extent.offset(), extent.len(), locked);
+        self_resident = extent.len();
+      } else if locked {
+        slot.region.unlock_range(extent.offset(), extent.len());
+      }
     }
     let released = slot.buddy.free_bytes().saturating_sub(before);
     self.allocated_bytes = self.allocated_bytes.saturating_sub(released);
+    self.resident_free = self.resident_free.saturating_add(self_resident);
     Ok(())
   }
 
@@ -589,6 +689,7 @@ impl ChunkArena {
         released_total.saturating_add(slot.buddy.free_bytes().saturating_sub(before));
     }
     self.allocated_bytes = self.allocated_bytes.saturating_sub(released_total);
+    self.resident_free = self.resident_free.saturating_add(released_total);
   }
 
   /// The publication of the last [`ChunkArena::capture`] did not commit: frees what only it could have named.
@@ -604,6 +705,7 @@ impl ChunkArena {
         released_total.saturating_add(slot.buddy.free_bytes().saturating_sub(before));
     }
     self.allocated_bytes = self.allocated_bytes.saturating_sub(released_total);
+    self.resident_free = self.resident_free.saturating_add(released_total);
   }
 
   /// Every live block is named by the committed image: the state after a recovery claimed its image's blocks.
@@ -621,6 +723,7 @@ impl ChunkArena {
         released_total.saturating_add(slot.buddy.free_bytes().saturating_sub(before));
     }
     self.allocated_bytes = self.allocated_bytes.saturating_sub(released_total);
+    self.resident_free = self.resident_free.saturating_add(released_total);
   }
 
   /// The bytes the arena's regions map — the address space taken, which the buddy's usable
@@ -680,6 +783,58 @@ mod tests {
       .add_region(Region::map(p * 4, p, false).unwrap())
       .unwrap();
     arena
+  }
+
+  /// A-105, the idle purge: do allocate four one-page blocks in one region, write each, free the first and third, and
+  /// purge one block per call until the arena says it is done. Expect the freed bytes counted resident until the
+  /// purge completes and none after; the purge resuming across calls (more than one call for more than one free
+  /// block); every freed byte reading zero (A-99's scrub holds whether or not the OS took the pages); the live blocks
+  /// untouched; and a purge with nothing released since doing nothing.
+  /// Purges one block per call until the arena says it is done; the calls it took.
+  fn purge_to_the_end(arena: &mut ChunkArena) -> usize {
+    let mut calls = 0;
+    while arena.purge(1).more {
+      calls += 1;
+      assert!(calls < 8, "the purge ends");
+    }
+    calls + 1
+  }
+
+  /// Whether every byte of the `len` bytes at `at` of `bytes` is `value`.
+  fn all_are(bytes: &[u8], at: usize, len: usize, value: u8) -> bool {
+    bytes[at..at + len].iter().all(|b| *b == value)
+  }
+
+  #[test]
+  fn an_idle_purge_resumes_across_calls_and_leaves_freed_bytes_zero() {
+    let p = page();
+    let mut arena = ChunkArena::new(p).discarding_from(p);
+    arena
+      .add_region(Region::map(p * 4, p, false).unwrap())
+      .unwrap();
+    let blocks: Vec<Extent> = (0..4).map(|_| arena.alloc(p).unwrap()).collect();
+    for (index, block) in blocks.iter().enumerate() {
+      let value = u8::try_from(index + 1).unwrap();
+      arena.bytes_mut(*block).unwrap().fill(value);
+    }
+    arena.free(blocks[0]).unwrap();
+    arena.free(blocks[2]).unwrap();
+    assert_eq!(arena.resident_free_bytes(), 2 * p);
+    assert!(
+      purge_to_the_end(&mut arena) > 1,
+      "one block per call: the second took another"
+    );
+    assert_eq!(arena.resident_free_bytes(), 0);
+    assert_eq!(arena.purge(1), Purged::default(), "nothing released since");
+    let bytes = arena.slot(blocks[0].region).unwrap().region.bytes();
+    assert!(
+      all_are(bytes, 0, p, 0) && all_are(bytes, 2 * p, p, 0),
+      "freed blocks read zero"
+    );
+    assert!(
+      all_are(bytes, p, p, 2) && all_are(bytes, 3 * p, p, 4),
+      "live blocks keep their bytes"
+    );
   }
 
   /// §4.2 allocator rounding: do: allocate every length from one byte to four granules; expect each block to

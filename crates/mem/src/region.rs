@@ -191,6 +191,35 @@ impl Region {
     }
   }
 
+  /// Zeroes bytes `offset .. offset + len` (one released, unlocked block) by giving its whole pages back to the OS and
+  /// zeroing any partial page at either end, so the block's RAM is freed rather than kept resident full of zeros.
+  /// `false`, the bytes unchanged, where the OS takes no pages back (see `os::discard_slice`), the block holds no whole
+  /// page, or the range lies outside the region: the caller then zeroes them itself.
+  pub fn discard(&mut self, offset: usize, len: usize) -> bool {
+    let page = self.page.max(1);
+    let Some(end) = offset.checked_add(len).filter(|end| *end <= self.len()) else {
+      return false;
+    };
+    let first = offset.next_multiple_of(page);
+    let last = end.saturating_sub(end.checked_rem(page).unwrap_or(0));
+    if first >= last {
+      return false;
+    }
+    let shared = matches!(self.backing, Backing::Shared(_));
+    let Some(interior) = self.backing.bytes_mut().get_mut(first..last) else {
+      return false;
+    };
+    if !os::discard_slice(interior, shared) {
+      return false;
+    }
+    for edge in [offset..first, last..end] {
+      if let Some(bytes) = self.backing.bytes_mut().get_mut(edge) {
+        bytes.fill(0);
+      }
+    }
+    true
+  }
+
   /// Unlocks the region.
   pub fn unlock(&mut self) {
     if self.locked {
@@ -352,6 +381,29 @@ mod os {
     // SAFETY: as for `lock_slice`; unlocking changes no byte.
     let _ = unsafe { rustix::mm::munlock(bytes.as_mut_ptr().cast(), bytes.len()) };
   }
+
+  /// Gives the pages of `bytes` (whole pages of a region's own, unlocked mapping) back to the OS, leaving zeros:
+  /// `MADV_REMOVE` frees a shared object's own pages (every mapping of it, the anchor's included, then reads a hole),
+  /// `MADV_DONTNEED` a private mapping's. `false` when the OS refused, the bytes then unchanged.
+  #[cfg(all(target_os = "linux", not(miri)))]
+  pub(super) fn discard_slice(bytes: &mut [u8], shared: bool) -> bool {
+    let advice = if shared {
+      rustix::mm::Advice::LinuxRemove
+    } else {
+      rustix::mm::Advice::LinuxDontNeed
+    };
+    // SAFETY: `bytes` is a live, page-aligned run of whole pages of the region's own mapping, borrowed mutably for the
+    // call, and unlocked (the caller unlocks a locked block first); the advice replaces its bytes with zeros, which is
+    // what the caller asks for, and touches no byte outside it.
+    unsafe { rustix::mm::madvise(bytes.as_mut_ptr().cast(), bytes.len(), advice) }.is_ok()
+  }
+
+  /// No page goes back here: macOS's `MADV_FREE` and `MADV_FREE_REUSABLE` do not zero at once, and a POSIX shared
+  /// memory object has no hole to punch; Miri models no `madvise`. The caller zeroes the bytes itself.
+  #[cfg(not(all(target_os = "linux", not(miri))))]
+  pub(super) fn discard_slice(_bytes: &mut [u8], _shared: bool) -> bool {
+    false
+  }
 }
 
 #[cfg(unix)]
@@ -420,6 +472,12 @@ mod os {
   pub(super) fn unlock_slice(bytes: &mut [u8]) {
     // SAFETY: as for `lock_slice`; unlocking changes no byte.
     unsafe { VirtualUnlock(bytes.as_mut_ptr().cast::<c_void>(), bytes.len()) };
+  }
+
+  /// No page goes back here yet (`DiscardVirtualMemory` leaves the contents undefined, not zero, so it would still need
+  /// the zeroing it saves; owed with a measurement): the caller zeroes the bytes itself.
+  pub(super) fn discard_slice(_bytes: &mut [u8], _shared: bool) -> bool {
+    false
   }
 }
 

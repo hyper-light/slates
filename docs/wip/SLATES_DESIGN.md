@@ -1638,8 +1638,8 @@ epoch copies only its table, never a value.
 > table in `inode.rs`, recovery image version 5). It is proven by the model oracle, which now
 > generates attribute steps charged by the file chunk rule, and by the host differential, which
 > compares every file's `user.*` attributes: APFS agreed on 3,000 histories (303 attribute steps
-> exercised in one run of 1,000) and Linux tmpfs on 1,000 (276 exercised). Owed: FUSE and WinFsp
-> serving the attribute calls, the macOS NFSv3 bridge translating AppleDouble sidecars into this
+> exercised in one run of 1,000) and Linux tmpfs on 1,000 (276 exercised). FUSE serves them since A-106
+> (2026-10-06). Owed: WinFsp serving the attribute calls, the macOS NFSv3 bridge translating AppleDouble sidecars into this
 > store (§4.6), export and archive carrying the values, landing writing them under a grant, and
 > the merge's attribute ops applied through this store.
 
@@ -9828,3 +9828,69 @@ Status: built 2026-10-06 (conditions 3 and 11).
 - Evidence: the property test composes generated journals over generated bases with the real deriver, and every result
   is accepted and reads back exactly. A rule one step too strict fails it at once (a mutation check: extend at
   `< base_len`).
+
+### A-105 — An idle shard gives its free content pages back to the OS (2026-10-06)
+Applied in the same change to:
+- `crates/mem/src/region.rs` (`Region::discard`, `os::discard_slice`);
+- `crates/mem/src/buddy.rs` (`free_blocks`);
+- `crates/mem/src/arena.rs` (`ChunkArena::purge`, `resident_free_bytes`, `allocations`, `discarding_from`);
+- `crates/mem/src/shared.rs` (`SparseObject::zero`, `SparseObject::discard`);
+- `crates/server/src/write_log.rs` (`clear`, `purge`);
+- `crates/server/src/daemon.rs` (`purge_if_idle`, counter `content.purged_bytes`);
+- `crates/machine/src/profile.rs` (`discard_from_bytes`);
+- `crates/server/src/config.rs`;
+- `crates/mem/examples/mem_bench.rs` (two rows);
+- the tests `a_deleted_files_memory_goes_back_to_the_os` (`crates/server/tests/recovery.rs`) and
+  `an_idle_purge_resumes_across_calls_and_leaves_freed_bytes_zero` (`crates/mem/src/arena.rs`);
+- BENCHMARKS, GAPS.
+
+Status: built 2026-10-06, Linux. macOS and Windows keep their pages (owed below).
+- What: A-99's zero-on-free is unchanged. A released block is zeroed in place at once, so its plaintext is gone,
+  and its pages stay resident for the allocations that follow. The arena counts those zeroed free bytes.
+  - At a reap tick (`LIVENESS_BUDGET_NS`), a shard whose content arena allocated nothing since the previous tick gives
+    every free block of at least `discard_from_bytes` back to the OS.
+  - The purge resumes from a cursor, a slice of `archive_slice_bytes / discard_from_bytes` blocks at a time, yielding
+    between slices.
+  - The pages go back by `MADV_REMOVE` for the anchor's shared content object (a hole every mapping sees) and by
+    `MADV_DONTNEED` for a private region.
+  - The emptied FUSE write log gives its record area back the same way, once per emptying. Its clear zeroes in place
+    a page at a time, where it used to allocate a zero buffer as long as everything logged.
+- Why decay, not give-back at every free: measured on Linux (`mem_bench`, 2026-10-06), allocating, touching every
+  page of and freeing a 64 KiB block costs 0.32 µs when zeroed in place against 6.8 µs when given back, because each
+  page faults back in on reuse.
+  This is jemalloc's design (Evans, decay-based purging of dirty pages; tcmalloc's release rate is the same idea): hot
+  reuse takes no faults, and idle memory is returned. The first cut gave pages back at every free. On the FUSE churn
+  A/B its p99 medians came out at 578 and 592 µs against HEAD's 325 and 318, at load around 18, so the run could not
+  attribute them. The in-process measurement above priced the refault, and the free path then became the idle purge.
+- Why at all: zeroing in place kept every page resident. A 128 MiB file deleted through a FUSE mount left the content
+  memfd at 168 MiB allocated, and 64 MiB written and deleted left 128 MiB: the content plus the write log. A
+  long-running daemon held its high-water mark forever.
+- The threshold: `discard_from_bytes` is the smallest measured `memcpy` whose time exceeds one syscall: 16 KiB on a
+  4 KiB-page Linux host, 4 KiB on this M5 Max. Smaller free blocks stay resident, being cheaper to keep than to fault
+  back.
+- Owed:
+  - macOS: `MADV_FREE` and `MADV_FREE_REUSABLE` do not zero at once, and a POSIX shared memory object has no hole to
+    punch.
+  - Windows: `DiscardVirtualMemory` leaves the contents undefined.
+  Each needs its own zeroing step and a measurement.
+
+### A-106 — Extended attributes through the Linux mount (2026-10-06)
+Applied in the same change to:
+- `crates/bridge-fuse/src/abi.rs` (`SetXattr`, `GetXattr`, `ListXattr`, `RemoveXattr`);
+- `crates/bridge-fuse/src/bridge.rs` (`serve_getxattr`, `serve_setxattr`, `serve_removexattr`);
+- the tests in `crates/bridge-fuse/tests/dispatch.rs` (`a_user_attribute_is_set_read_listed_replaced_and_removed`,
+  `attribute_names_outside_the_user_namespace_are_never_stored`,
+  `attribute_requests_outside_the_rules_are_refused_typed`) and `crates/bridge-fuse/tests/abi.rs`;
+- GAPS.
+
+Status: built 2026-10-06. It closes the FUSE part of A-32's owed list.
+- What: the four attribute operations reach the volume's table (A-32) through the shared bridge trait, as the
+  NFSv4.2 bridge's RFC 8276 operations already do.
+  - Only `user.` names are stored. `security.`, `trusted.` and `system.` belong to the host's LSM, its administrator
+    and its ACLs, none of which a volume carries. Setting one is `EOPNOTSUPP` and reading one is `ENODATA`.
+  - A get or list with size 0 answers the length (`fuse_getxattr_out`); a buffer too small is `ERANGE`.
+  - `XATTR_CREATE` and `XATTR_REPLACE` map to the volume's `XattrSet`.
+  - The setxattr body is the short form, because `FUSE_SETXATTR_EXT` is not negotiated.
+- Why: until now every attribute operation was answered `ENOSYS`, so the kernel told every caller "not supported".
+  `setfattr -n user.x` failed in an adversarial container run, and tools that tag files (download origins, build
+  caches, `rsync -X`) lost their attributes on a slates mount.

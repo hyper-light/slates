@@ -2644,3 +2644,40 @@ overlapping ranges, which cannot be read.
 Every row's five values overlap the other build's. The geometric mean of the 21 row ratios is 0.984.
 
 **Verdict:** parity. The sweep lands as a correctness change, not an optimization.
+
+### 2026-10-06: giving free content pages back to the OS (A-105)
+
+Linux (Docker Desktop VM on an Apple M5 Max, Linux 6.12, 4 KiB pages, load 13–15 from other sessions' containers).
+
+**`mem_bench`, the free path** (`cargo run --release -p slates-mem --example mem_bench`, three runs). Each iteration
+allocates a 64 KiB block, touches each page and frees it:
+
+| Variant | Median per cycle |
+|---|---|
+| Zeroed in place | 317–322 ns |
+| Given back and faulted in again | 6,667–6,834 ns |
+
+That is why the give-back is an idle purge, not a step of every free.
+
+**FUSE A/B against HEAD** (`7208e42`, a detached worktree; scratchpad `discard-ab-inner.sh`, five interleaved
+rounds, both mounted as an ordinary user). Each round:
+1. `create+write+close+unlink` churn, 4,000 × 4 KiB and 2,000 × 64 KiB;
+2. a 64 MiB write;
+3. its delete;
+4. the content memfd's allocation 5 s later.
+
+| Measure | HEAD | New |
+|---|---|---|
+| 4 KiB churn p50 | 119–222 µs, median 163.0 | 50–169 µs, median 163.2 |
+| 4 KiB churn p99 | 259–4,604 µs, median 266 | 147–301 µs, median 278 |
+| 64 KiB churn p50 | 129–235 µs, median 172 | 134–197 µs, median 185 |
+| 64 KiB churn p99 | 255–3,841 µs, median 354 | 269–354 µs, median 299 |
+| Allocated 5 s after the 64 MiB delete | 128 MiB, every round | 0 MiB, every round |
+
+Latency is at parity: every row's ranges overlap. The memory goes back.
+
+**Measured and rejected the same day: give-back at every free.** Three rounds; the measurement phase overlapped the
+first two rounds' builds and a local cross-lint, so its latencies are not comparable. The give-back itself worked (0
+MiB after the delete, every round). The p99 medians came out at 578 µs (4 KiB) and 592 µs (64 KiB) against HEAD's 325
+and 318, at load around 18. Both sides' ranges ran up to several milliseconds, so that run could not attribute the gap.
+The in-process measurement above did: a given-back block costs 6.8 µs more per reuse. That decided the idle purge.

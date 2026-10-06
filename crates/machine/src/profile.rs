@@ -306,6 +306,10 @@ pub struct DerivedConstants {
   pub task_step_budget_ns: Derived<u64>,
   /// The size above which a remap beats a copy, from the memcpy curve and the fault cost.
   pub copy_versus_remap_bytes: Derived<u64>,
+  /// The smallest released block whose pages go back to the OS rather than being zeroed in place: the smallest
+  /// measured memcpy size whose copy costs more than one syscall (zeroing a block costs at most a copy of it, and
+  /// giving its pages back costs one `madvise`). `u64::MAX` when no measured size does: zeroing always wins.
+  pub discard_from_bytes: Derived<u64>,
   /// The inbound ring's entry count — Little's law at the ring's overflow target: a producer sending one
   /// message per syscall for as long as the consumer's wake takes at its p99, so a producer spins on a full
   /// ring in fewer than one wake in a hundred.
@@ -355,6 +359,11 @@ impl DerivedConstants {
         "the smallest memcpy size whose copy time exceeds the fault cost of its pages (u64::MAX when no measured size does: copying always wins)",
         ["memcpy", "faults.base_ns", "page.base"]
       ),
+      discard_from_bytes: derived!(
+        discard_versus_zero(p, syscall),
+        "the smallest memcpy size whose copy time exceeds one syscall (u64::MAX when none does: zeroing in place always wins)",
+        ["memcpy", "syscall"]
+      ),
       ring_entries: derived!(
         wake_p99
           .checked_div(syscall)
@@ -383,6 +392,7 @@ impl DerivedConstants {
       line("timer_tick_ns", &self.timer_tick_ns),
       line("task_step_budget_ns", &self.task_step_budget_ns),
       line("copy_versus_remap_bytes", &self.copy_versus_remap_bytes),
+      line("discard_from_bytes", &self.discard_from_bytes),
       line("ring_entries", &self.ring_entries),
     ]
   }
@@ -400,6 +410,13 @@ fn arena_region(p: &MachineProfile, page: u64, syscall: u64, fault: u64) -> u64 
     (Some(huge_ns), Some(huge)) if huge_ns < fault => region.max(*huge),
     _ => region,
   }
+}
+
+fn discard_versus_zero(p: &MachineProfile, syscall: u64) -> u64 {
+  p.memcpy
+    .iter()
+    .find(|point| point.per_copy.median_ns() > syscall)
+    .map_or(u64::MAX, |point| point.bytes)
 }
 
 fn copy_versus_remap(p: &MachineProfile, page: u64, fault: u64) -> u64 {
@@ -473,8 +490,13 @@ mod tests {
     );
     assert!(d.timer_tick_ns.get() >= profile.wake.mean_ns);
     assert!(d.ring_entries.get().is_power_of_two());
+    let discard = d.discard_from_bytes.get();
+    assert!(
+      discard == u64::MAX || profile.memcpy.iter().any(|point| point.bytes == discard),
+      "the discard threshold is a measured copy size or never: {discard}"
+    );
     let lines = d.lines();
-    assert_eq!(lines.len(), 6);
+    assert_eq!(lines.len(), 7);
     assert!(lines.iter().all(|l| l.contains("anchors:")), "{lines:?}");
   }
 

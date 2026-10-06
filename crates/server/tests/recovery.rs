@@ -2393,6 +2393,97 @@ fn occurrences_in_content(name: &str, needle: &[u8]) -> usize {
   0
 }
 
+/// The bytes the content memfd named `name` that this process holds has allocated: the sum of its data ranges
+/// (`SEEK_DATA`/`SEEK_HOLE`; on tmpfs a hole is a page with no RAM behind it). Zero when the object is not found.
+#[cfg(target_os = "linux")]
+#[allow(clippy::disallowed_methods)] // reading this process's own memfd through /proc, read-only
+fn allocated_in_content(name: &str) -> u64 {
+  let Ok(fds) = std::fs::read_dir("/proc/self/fd") else {
+    return 0;
+  };
+  for entry in fds.flatten() {
+    let target = std::fs::read_link(entry.path()).unwrap_or_default();
+    if !target.to_string_lossy().contains(&format!("memfd:{name}")) {
+      continue;
+    }
+    let Ok(file) = std::fs::File::open(entry.path()) else {
+      continue;
+    };
+    let mut allocated = 0;
+    let mut at: u64 = 0;
+    while let Ok(data) = rustix::fs::seek(&file, rustix::fs::SeekFrom::Data(at)) {
+      let end = rustix::fs::seek(&file, rustix::fs::SeekFrom::Hole(data)).unwrap_or(data);
+      allocated += end - data;
+      if end <= at {
+        break;
+      }
+      at = end;
+    }
+    return allocated;
+  }
+  0
+}
+
+/// Memory, a deleted file's RAM: do write a file of many chunks, publish, delete it and leave the shard idle. Expect
+/// the content object's allocated bytes to fall by most of the file within the bound: an idle shard's free blocks go
+/// back to the OS (A-105), not only zeroed in place. Before 2026-10-06 the scrub wrote
+/// zeros over every freed block, which kept every page resident: a 128 MiB file deleted through a FUSE mount left the
+/// memfd at 168 MiB allocated (an adversarial container run).
+#[cfg(target_os = "linux")]
+#[test]
+fn a_deleted_files_memory_goes_back_to_the_os() {
+  const MARKER: &[u8] = b"SLATES-RAM-RETURNED-7e19";
+  /// Shape: the file is this many chunk-sized blocks, so its release dwarfs the object's metadata and image pages.
+  const CHUNKS: usize = 256;
+  let profile = common::machine_profile();
+  let instance = format!("srv-ram-back-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
+  let chunk = slates_vfs::content::chunk_bytes(config.page).get();
+  let tag = format!("ram-back-{}", std::process::id());
+  let segment = anchor_segment(&tag, &profile, &config);
+  let daemon = Daemon::start(&profile, config, source_of(&segment)).unwrap();
+  daemon
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let mut client = connect(&instance);
+  let body = MARKER.repeat(chunk * CHUNKS / MARKER.len());
+  let mut spec = scratch("ram-back");
+  spec.size = SizeClass::Bounded {
+    limit: u64::try_from(body.len()).unwrap() * 2,
+  };
+  let volume = client.create(&spec).unwrap();
+  let attachment = client
+    .attach(volume, None, slates_ipc::protocol::Intent::Write)
+    .unwrap()
+    .attachment;
+  client
+    .fs_write((volume, attachment), "big", &body, 0o644)
+    .unwrap();
+  daemon.publish_every_shard().unwrap();
+  let content = format!("slates-con-{tag}");
+  let written = allocated_in_content(&content);
+  client.fs_remove((volume, attachment), "big").unwrap();
+  // The block is zeroed when its free is released; its pages go back when the shard is next idle at a reap tick (one
+  // tick to see no allocation, the next to purge), so the allocation is watched until it falls or the bound passes.
+  let file = u64::try_from(body.len()).unwrap();
+  let started = Instant::now();
+  let mut released = allocated_in_content(&content);
+  while written.saturating_sub(released) < file / 2 && started.elapsed() < START_WAIT {
+    std::thread::yield_now();
+    released = allocated_in_content(&content);
+  }
+  daemon.stop();
+  drop(segment);
+  assert!(
+    written >= file,
+    "the file's bytes were allocated: {written} of {file}"
+  );
+  assert!(
+    written.saturating_sub(released) >= file / 2,
+    "most of the file's RAM went back to the OS: {written} allocated with it, {released} after its release"
+  );
+}
+
 /// Shape: the reap ticks an idle shard is watched for further publications once its plaintext has gone.
 #[cfg(target_os = "linux")]
 const IDLE_TICKS_WATCHED: u64 = 3;
