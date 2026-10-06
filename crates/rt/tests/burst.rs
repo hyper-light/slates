@@ -11,7 +11,6 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use slates_rt::futures::now_ns;
 use slates_rt::runtime::{Runtime, RuntimeConfig};
 use slates_rt::{Admission, RtError};
 
@@ -21,8 +20,6 @@ const BATCH: usize = 8;
 /// Shape: the burst, four drain batches: three of them would be forgotten by a drain that re-arms only
 /// on a later send.
 const BURST: usize = BATCH * 4;
-/// Shape: how long a held shard spins, nanoseconds: long enough for the burst to queue behind it.
-const HOLD_NS: u64 = 300_000_000;
 /// Shape: how long the burst is given to run before the test calls it lost — far past the hold and the
 /// steps that drain four batches.
 const WAIT: Duration = Duration::from_secs(10);
@@ -54,10 +51,16 @@ fn config() -> RuntimeConfig {
 fn a_burst_past_one_batch_is_drained_whole_and_the_shutdown_behind_it_lands() {
   let rt = Runtime::start(&config()).unwrap();
   let shard = rt.shard_ids()[0];
+  // The hold spins until the test releases it (or drops the release), so the whole burst queues behind it on any
+  // machine; a timed spin could end first on a slow one and the burst would drain as sent, never testing a drain
+  // past one batch.
+  let (release, released) = std::sync::mpsc::channel::<()>();
   let hold = rt
-    .spawn_on_with_receipt(shard, async {
-      let end = now_ns().saturating_add(HOLD_NS);
-      while now_ns() < end {
+    .spawn_on_with_receipt(shard, async move {
+      while matches!(
+        released.try_recv(),
+        Err(std::sync::mpsc::TryRecvError::Empty)
+      ) {
         std::hint::spin_loop();
       }
     })
@@ -73,6 +76,12 @@ fn a_burst_past_one_batch_is_drained_whole_and_the_shutdown_behind_it_lands() {
       Err(e) => panic!("{e}"),
     }
   }
+  assert_eq!(
+    RAN.load(Ordering::Relaxed),
+    0,
+    "nothing of the burst ran while the hold held the shard"
+  );
+  release.send(()).unwrap();
   let began = Instant::now();
   while RAN.load(Ordering::Relaxed) < BURST as u64 && began.elapsed() < WAIT {
     std::thread::yield_now();

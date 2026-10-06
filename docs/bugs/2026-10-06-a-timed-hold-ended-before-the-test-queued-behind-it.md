@@ -22,5 +22,15 @@ before.
 
 ## Sibling sweep
 
-`hold` had two callers, both converted. No other test in `crates/rt/tests` orders work behind a fixed-time spin (the
-fillers park on a release flag already).
+- `hold` had two callers in `admission.rs`, both converted.
+- `crates/rt/tests/burst.rs` had the same timed 300 ms hold with a burst queued behind it. There a hold that ended
+  early would not fail: the burst would drain as it was sent, and the test would pass without ever testing a drain
+  past one batch. It is converted the same way, and now asserts that nothing of the burst ran before the release.
+- `wake_estimate.rs` spins too, but its spin is the CPU time it measures, and its other loop stops on a flag: no
+  ordering rests on either.
+
+**Mutation check.** With the drain's re-arm removed (the 2026-09-17 bug), the burst test fails "8 of 32", as it
+should.
+
+**Reported, not fixed here:** after that failure, the test binary hangs in the runtime's drop, which waits on a
+shutdown the broken drain never delivers. That regression would show on CI as a timeout, not a red test.
