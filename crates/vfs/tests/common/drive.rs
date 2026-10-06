@@ -2,6 +2,8 @@
 //! (they pick files by sorted path, so both sides of a comparison address the same file), and
 //! the path-keyed views of a head and of a snapshot.
 
+// Test code may panic (CLAUDE.md §2 item 6 applies to shipped code).
+#![allow(clippy::indexing_slicing)]
 use std::collections::BTreeMap;
 
 use slates_mem::Handle;

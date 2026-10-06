@@ -3,7 +3,12 @@
 //! without a panic, replies encode to the exact bytes the kernel expects, and `FUSE_INIT`
 //! negotiates the intersection of flags. These run on every host: the codec is pure.
 // Test harness code: an unwrap here is a failed test.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![allow(
+  clippy::unwrap_used,
+  clippy::expect_used,
+  clippy::panic,
+  clippy::indexing_slicing
+)]
 
 use slates_bridge_fuse::abi::{IN_HEADER_LEN, OUT_HEADER_LEN, Opcode, flags};
 use slates_bridge_fuse::error::FuseError;

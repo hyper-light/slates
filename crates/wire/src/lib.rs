@@ -21,17 +21,10 @@
 //! Modules: [`header`], [`codec`] (the `Wire` trait and the primitive encodings), [`schema`],
 //! [`crc32c`], [`frame`], [`credit`], [`request`], [`observe`] (§4.14 spans), [`error`].
 
-// The no-panic law (CLAUDE.md, banned item 6): shipped code never indexes or slices out of bounds, never
-// slices a string off a character boundary, and never overflows. Test builds are exempt. Once a crate is
-// clean this holds it there.
-#![cfg_attr(
-  not(test),
-  deny(
-    clippy::indexing_slicing,
-    clippy::string_slice,
-    clippy::arithmetic_side_effects
-  )
-)]
+// The no-panic law (CLAUDE.md, banned item 6): shipped code never overflows or divides by zero. Test builds
+// are exempt. Once a crate is clean this holds it there; out-of-bounds indexing and slicing are denied
+// workspace-wide.
+#![cfg_attr(not(test), deny(clippy::arithmetic_side_effects))]
 
 // The derive emits `::slates_wire::` paths; this alias makes them resolve inside the crate.
 extern crate self as slates_wire;

@@ -462,7 +462,11 @@ fn apply_op(entities: &mut Vec<Entity>, base: &Base, op: &VolumeOp) -> Result<()
     let index = live_index(entities, path)
       .or_else(|| materialize_base(entities, base, path))
       .ok_or_else(|| DeriveError::ContentOnMissing(path.to_owned()))?;
-    entities[index].content.push(content);
+    entities
+      .get_mut(index)
+      .ok_or_else(|| DeriveError::ContentOnMissing(path.to_owned()))?
+      .content
+      .push(content);
     return Ok(());
   }
   match op {
@@ -484,11 +488,11 @@ fn apply_create(entities: &mut Vec<Entity>, base: &Base, path: &str) -> Result<(
   let replaced = entities.iter().position(|e| {
     !e.live && !e.clobbered && e.final_path == path && e.origin.as_deref() == Some(path)
   });
-  if let Some(index) = replaced {
-    let base_len = entities[index].base_len;
+  if let Some(unlinked) = replaced.and_then(|index| entities.get_mut(index)) {
+    let base_len = unlinked.base_len;
     // The recreation supersedes the unlink: mark the dead entity clobbered so seal emits no
     // stale `Unlink` for a path that is present again.
-    entities[index].clobbered = true;
+    unlinked.clobbered = true;
     entities.push(Entity {
       origin: Some(path.to_owned()),
       base_len,
@@ -525,8 +529,11 @@ fn apply_unlink(entities: &mut Vec<Entity>, base: &Base, path: &str) -> Result<(
   let index = live_index(entities, path)
     .or_else(|| materialize_base(entities, base, path))
     .ok_or_else(|| DeriveError::UnlinkMissing(path.to_owned()))?;
-  entities[index].live = false;
-  entities[index].content.clear();
+  let unlinked = entities
+    .get_mut(index)
+    .ok_or_else(|| DeriveError::UnlinkMissing(path.to_owned()))?;
+  unlinked.live = false;
+  unlinked.content.clear();
   Ok(())
 }
 
@@ -544,28 +551,29 @@ fn apply_rename(
     .or_else(|| materialize_base(entities, base, from))
     .ok_or_else(|| DeriveError::RenameMissingSource(from.to_owned()))?;
   let destination = resolve_rename_target(entities, base, to)?;
+  let missing = || DeriveError::RenameMissingSource(from.to_owned());
   if let Some(dst) = destination {
-    entities[dst].live = false;
-    entities[dst].clobbered = true;
+    let clobbered = entities.get_mut(dst).ok_or_else(missing)?;
+    clobbered.live = false;
+    clobbered.clobbered = true;
     // Only a base file at its *own* path is a write-and-rename target: replacing it is a content
     // change to that base file. A base file that was itself renamed here is not a base path, so
     // the source is just a new file at `to`, and the clobbered file's original name is orphaned
     // (unlinked at seal by the survivor rule).
-    let dst_at_own_base = entities[dst].origin.as_deref() == Some(to);
-    let dst_base_len = entities[dst].base_len;
-    if dst_at_own_base && entities[source].origin.is_none() {
+    let dst_at_own_base = clobbered.origin.as_deref() == Some(to);
+    let dst_base_len = clobbered.base_len;
+    let moved = entities.get_mut(source).ok_or_else(missing)?;
+    if dst_at_own_base && moved.origin.is_none() {
       // A new file renamed over a base file: the destination's content is replaced (a delete of
       // the base and the new bytes), so re-root the source at the destination's base.
-      entities[source].origin = Some(to.to_owned());
-      entities[source].base_len = dst_base_len;
-      entities[source]
-        .content
-        .insert(0, ContentOp::Truncate { len: 0 });
+      moved.origin = Some(to.to_owned());
+      moved.base_len = dst_base_len;
+      moved.content.insert(0, ContentOp::Truncate { len: 0 });
     }
     // A base file over a base file keeps its origin (emitting a `Rename` at seal); a new file
     // clobbered here simply cancels.
   }
-  entities[source].final_path = to.to_owned();
+  entities.get_mut(source).ok_or_else(missing)?.final_path = to.to_owned();
   Ok(())
 }
 

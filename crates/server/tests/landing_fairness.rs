@@ -3,7 +3,13 @@
 //! between them. Before the sliced run, the landing was one synchronous call on the shard, and a verb that
 //! arrived while it ran waited for all of it.
 // Test harness code: an unwrap here is a failed test, which is what it should be.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![allow(
+  clippy::unwrap_used,
+  clippy::expect_used,
+  clippy::panic,
+  clippy::indexing_slicing,
+  clippy::unwrap_in_result
+)]
 // The daemon's NFS loopback transport and a real landing target: macOS and Linux.
 #![cfg(unix)]
 

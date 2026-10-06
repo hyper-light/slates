@@ -3,7 +3,12 @@
 //! a truncate whose smaller block cannot be allocated keeps the larger one. Before 2026-10-03 both took the
 //! inode's body out, and a refusal after that returned without putting it back: the file lost its content
 //! (`docs/bugs/2026-10-03-a-write-or-truncate-refused-partway-dropped-the-files-body.md`).
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![allow(
+  clippy::unwrap_used,
+  clippy::expect_used,
+  clippy::panic,
+  clippy::indexing_slicing
+)]
 
 mod common;
 

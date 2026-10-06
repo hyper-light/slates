@@ -1,4 +1,9 @@
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![allow(
+  clippy::unwrap_used,
+  clippy::expect_used,
+  clippy::panic,
+  clippy::indexing_slicing
+)]
 //! One NFS server serves several volumes, routing each request to the volume its file handle names
 //! (§4.6, R5): a `MultiExport` holds two independent volumes, and over one connection a client mounts
 //! `alpha`, reads its seeded file, then mounts `beta` and reads its file — the bytes never cross,

@@ -14,14 +14,7 @@
 //! human to review and add; the test binary opens no file. Every property suite in the workspace goes
 //! through [`seeded`] or [`unseeded`]; `cargo xtask check` refuses a suite that does not.
 
-#![cfg_attr(
-  not(test),
-  deny(
-    clippy::indexing_slicing,
-    clippy::string_slice,
-    clippy::arithmetic_side_effects
-  )
-)]
+#![cfg_attr(not(test), deny(clippy::arithmetic_side_effects))]
 
 use std::any::Any;
 use std::fmt;

@@ -179,7 +179,7 @@ impl FuseChannel {
   /// the kernel unmounted (the caller stops); `EINTR`/`EAGAIN` are retried by the caller.
   pub fn read_request(&mut self) -> Result<&[u8], ChannelError> {
     match rustix::io::read(&self.device, self.buffer.as_mut_slice()) {
-      Ok(n) => Ok(&self.buffer[..n]),
+      Ok(n) => Ok(self.buffer.get(..n).unwrap_or_default()),
       Err(rustix::io::Errno::NODEV) => Err(ChannelError::Disconnected),
       Err(e) => Err(ChannelError::Device {
         call: "read",
@@ -243,7 +243,7 @@ impl FuseChannel {
       // A name past the wire cap cannot be cached by the kernel either: nothing to drop.
       return Ok(());
     };
-    match rustix::io::write(&self.device, &out[..n]) {
+    match rustix::io::write(&self.device, out.get(..n).unwrap_or_default()) {
       Ok(_) | Err(rustix::io::Errno::NOENT | rustix::io::Errno::NOTEMPTY) => Ok(()),
       Err(e) => Err(ChannelError::Device {
         call: "notify",
@@ -352,7 +352,7 @@ pub fn wait(channel: &FuseChannel, signal: Option<&ChangeSignal>) -> Result<Wake
       },
     ];
     let polled = if signal.is_some() { 2 } else { 1 };
-    match rustix::event::poll(&mut fds[..polled], None) {
+    match rustix::event::poll(fds.get_mut(..polled).unwrap_or_default(), None) {
       Ok(_) => {}
       Err(rustix::io::Errno::INTR) => continue,
       Err(e) => {
@@ -884,7 +884,7 @@ impl FuseChannel {
       .map(|b| u32::from_le_bytes(b.try_into().unwrap_or_default()))
       .map(|l| usize::try_from(l).unwrap_or(0).min(self.buffer.len()))
       .unwrap_or(0);
-    self.buffer[..len].to_vec()
+    self.buffer.get(..len).unwrap_or_default().to_vec()
   }
 }
 

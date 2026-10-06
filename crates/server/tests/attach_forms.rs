@@ -6,7 +6,12 @@
 //! rendezvous, and the verbs driven over the rings. The report is checked against the machine — the
 //! kernel's own `uname`, whether the daemon's loopback listener bound — never against a copy of the table.
 // Test harness code: an unwrap here is a failed test, which is what it should be.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![allow(
+  clippy::unwrap_used,
+  clippy::expect_used,
+  clippy::panic,
+  clippy::panic_in_result_fn
+)]
 // These integration tests drive the daemon's NFS-loopback transport, the fleet's TCP
 // transport and rustix syscalls — all macOS/Linux; on Windows the daemon mounts through WinFsp and
 // the fleet transport is QUIC-over-UDP, so these particular tests are unix (as `virtiofs.rs` is).

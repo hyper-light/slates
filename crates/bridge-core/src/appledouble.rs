@@ -163,7 +163,8 @@ fn decode_layout(prefix: &[u8], file_len: u64, read_at: ReadAt<'_>) -> Option<La
     .iter()
     .position(|(kind, span)| *kind == AD_FINDERINFO && span.len >= FINDER_INFO_BYTES as u64);
   if let Some(index) = finder {
-    let (info, named) = decode_finder(raw, index, entries[index].1)?;
+    let span = entries.get(index).map(|(_, span)| *span)?;
+    let (info, named) = decode_finder(raw, index, span)?;
     attributes.extend(info);
     if let Some((named, data_start)) = named {
       header.len = data_start;
@@ -295,18 +296,15 @@ fn decode_attribute_entry(
   }
   let name = raw.get(name_at..name_at + name_len)?;
   // The length counts the NUL, and the name holds no earlier NUL.
-  if name.iter().position(|byte| *byte == 0) != Some(name_len - 1) {
+  let (&last, before) = name.split_last()?;
+  if last != 0 || before.contains(&0) {
     return None;
   }
   let span = Span {
     offset: u64::from(be32(raw, at)?),
     len: u64::from(be32(raw, at + ATTR_ENTRY_LEN_AT)?),
   };
-  Some((
-    name[..name_len - 1].to_vec(),
-    span,
-    at + entry_len(name_len),
-  ))
+  Some((before.to_vec(), span, at + entry_len(name_len)))
 }
 
 /// Whether the resource fork at `span` is the placeholder xnu writes (its size and tag).
@@ -393,36 +391,40 @@ pub fn representable(entry: &Entry) -> bool {
 /// header past [`MAX_HEADER_BYTES`] or the attribute count past xnu's limit, are left out and absent
 /// from [`Encoding::held`].
 pub fn encode(entries: &[Entry]) -> Encoding {
-  let mut order: Vec<usize> = (0..entries.len())
-    .filter(|index| representable(&entries[*index]))
+  let mut order: Vec<(usize, &Entry)> = entries
+    .iter()
+    .enumerate()
+    .filter(|(_, entry)| representable(entry))
     .collect();
-  order.sort_by(|a, b| entries[*a].name.cmp(&entries[*b].name));
+  order.sort_by(|(_, a), (_, b)| a.name.cmp(&b.name));
   let finder = order
     .iter()
-    .copied()
-    .find(|index| entries[*index].name == FINDER_INFO_NAME);
+    .find(|(_, entry)| entry.name == FINDER_INFO_NAME)
+    .map(|(index, _)| *index);
   let fork = order
     .iter()
     .copied()
-    .find(|index| entries[*index].name == RESOURCE_FORK_NAME);
-  let mut named: Vec<usize> = Vec::new();
+    .find(|(_, entry)| entry.name == RESOURCE_FORK_NAME);
+  let fork_index = fork.map(|(index, _)| index);
+  let mut named: Vec<(usize, &Entry)> = Vec::new();
   let mut entries_end = ATTR_ENTRIES_AT;
-  for index in order
+  for (index, entry) in order
     .iter()
     .copied()
-    .filter(|index| Some(*index) != finder && Some(*index) != fork)
+    .filter(|(index, _)| Some(*index) != finder && Some(*index) != fork_index)
   {
-    let next = entries_end + entry_len(entries[index].name.len() + 1);
+    let next = entries_end.saturating_add(entry_len(entry.name.len().saturating_add(1)));
     if next > MAX_HEADER_BYTES || named.len() == MAX_ATTRS {
       continue;
     }
     entries_end = next;
-    named.push(index);
+    named.push((index, entry));
   }
   let data_start = entries_end as u64;
-  let data_length: u64 = named.iter().map(|index| entries[*index].len).sum();
+  let data_length: u64 = named.iter().map(|(_, entry)| entry.len).sum();
   let data_end = data_start + data_length;
-  let fork_len = fork.map_or(EMPTY_FORK_BYTES as u64, |index| entries[index].len);
+  let fork_len = fork.map_or(EMPTY_FORK_BYTES as u64, |(_, entry)| entry.len);
+  let fork = fork_index;
   let fork_at = if fork.is_some() {
     data_end.div_ceil(FILE_UNIT).max(1) * FILE_UNIT
   } else {
@@ -479,9 +481,8 @@ pub fn encode(entries: &[Entry]) -> Encoding {
   attr.extend_from_slice(&0u16.to_be_bytes()); // flags
   attr.extend_from_slice(&u16::try_from(named.len()).unwrap_or(0).to_be_bytes());
   let mut value_at = data_start;
-  for index in &named {
-    let name = &entries[*index].name;
-    let len = entries[*index].len;
+  for (_, entry) in &named {
+    let (name, len) = (&entry.name, entry.len);
     let start = attr.len();
     attr.extend_from_slice(&be32_of(value_at));
     attr.extend_from_slice(&be32_of(len));
@@ -500,8 +501,8 @@ pub fn encode(entries: &[Entry]) -> Encoding {
     source: Source::Bytes(attr),
   });
   let mut at = data_start;
-  for index in &named {
-    let len = entries[*index].len;
+  for (index, entry) in &named {
+    let len = entry.len;
     if len > 0 {
       segments.push(Segment {
         span: Span { offset: at, len },
@@ -529,7 +530,7 @@ pub fn encode(entries: &[Entry]) -> Encoding {
       None => Source::Bytes(placeholder_fork()),
     },
   });
-  let mut held: Vec<usize> = named;
+  let mut held: Vec<usize> = named.iter().map(|(index, _)| *index).collect();
   held.extend(finder);
   held.extend(fork);
   held.sort_unstable();
@@ -564,14 +565,18 @@ impl Encoding {
       let (Ok(from), Ok(to)) = (usize::try_from(start - off), usize::try_from(stop - off)) else {
         continue;
       };
-      let dest = &mut out[from..to];
-      let within = start - segment.span.offset;
+      let Some(dest) = out.get_mut(from..to) else {
+        continue;
+      };
+      let within = start.saturating_sub(segment.span.offset);
       match &segment.source {
         Source::Bytes(bytes) => {
           let Ok(first) = usize::try_from(within) else {
             continue;
           };
-          dest.copy_from_slice(&bytes[first..first + dest.len()]);
+          if let Some(source) = bytes.get(first..first.saturating_add(dest.len())) {
+            dest.copy_from_slice(source);
+          }
         }
         Source::Zero => dest.fill(0),
         Source::Value(index) => value(*index, within, dest),
@@ -616,16 +621,18 @@ mod fork_field {
 /// The placeholder resource fork xnu writes into a fresh AppleDouble file.
 fn placeholder_fork() -> Vec<u8> {
   let mut fork = vec![0u8; EMPTY_FORK_BYTES];
-  let put32 = |fork: &mut Vec<u8>, at: usize, value: u32| {
-    fork[at..at + size_of::<u32>()].copy_from_slice(&value.to_be_bytes());
+  // Every field offset is a `fork_field` constant inside `EMPTY_FORK_BYTES`, so a write never misses.
+  let put = |fork: &mut Vec<u8>, at: usize, value: &[u8]| {
+    if let Some(field) = fork.get_mut(at..at.saturating_add(value.len())) {
+      field.copy_from_slice(value);
+    }
   };
-  let put16 = |fork: &mut Vec<u8>, at: usize, value: u16| {
-    fork[at..at + size_of::<u16>()].copy_from_slice(&value.to_be_bytes());
-  };
+  let put32 = |fork: &mut Vec<u8>, at: usize, value: u32| put(fork, at, &value.to_be_bytes());
+  let put16 = |fork: &mut Vec<u8>, at: usize, value: u16| put(fork, at, &value.to_be_bytes());
   put32(&mut fork, fork_field::DATA_OFFSET, FORK_FIRST_RESOURCE);
   put32(&mut fork, fork_field::MAP_OFFSET, FORK_FIRST_RESOURCE);
   put32(&mut fork, fork_field::MAP_LENGTH, FORK_NULL_MAP_LENGTH);
-  fork[EMPTY_FORK_TAG_AT..EMPTY_FORK_TAG_AT + EMPTY_FORK_TAG.len()].copy_from_slice(EMPTY_FORK_TAG);
+  put(&mut fork, EMPTY_FORK_TAG_AT, EMPTY_FORK_TAG);
   put32(&mut fork, fork_field::MAP_DATA_OFFSET, FORK_FIRST_RESOURCE);
   put32(&mut fork, fork_field::MAP_MAP_OFFSET, FORK_FIRST_RESOURCE);
   put32(&mut fork, fork_field::MAP_MAP_LENGTH, FORK_NULL_MAP_LENGTH);

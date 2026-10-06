@@ -15,7 +15,12 @@
 //! Test by use (R5): the real logs, the real merge, observable application.
 
 // Test harness: an unwrap, expect or panic here is a failed test.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![allow(
+  clippy::unwrap_used,
+  clippy::expect_used,
+  clippy::panic,
+  clippy::indexing_slicing
+)]
 
 use std::collections::{BTreeMap, BTreeSet};
 

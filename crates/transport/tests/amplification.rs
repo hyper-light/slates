@@ -6,7 +6,12 @@
 //! handshake completes. Until 2026-09-30 a server sent its whole flight to any source that sent a hello.
 
 // Test harness code: an unwrap here is a failed test, which is what it should be.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![allow(
+  clippy::unwrap_used,
+  clippy::expect_used,
+  clippy::panic,
+  clippy::indexing_slicing
+)]
 
 use std::sync::mpsc::{Sender, channel};
 

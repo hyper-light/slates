@@ -1438,7 +1438,10 @@ async fn lock_operation<B: Backend>(
 ) -> Outcome {
   let start = reader.rest();
   LockRequest::decode(opnum, reader)?;
-  let raw = start[..start.len() - reader.rest().len()].to_vec();
+  let raw = start
+    .get(..start.len().saturating_sub(reader.rest().len()))
+    .unwrap_or_default()
+    .to_vec();
   let fh = current(frame)?.clone();
   check_open_kind(backend, &fh).await?;
   let clientid = frame.clientid.ok_or(Nfsstat4::OpNotInSession)?;

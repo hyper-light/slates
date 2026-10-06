@@ -40,9 +40,11 @@ impl Bitmap {
       return;
     }
     if self.0.len() <= word {
-      self.0.resize(word + 1, 0);
+      self.0.resize(word.saturating_add(1), 0);
     }
-    self.0[word] |= 1 << (bit % u32::BITS);
+    if let Some(slot) = self.0.get_mut(word) {
+      *slot |= 1 << (bit % u32::BITS);
+    }
   }
 
   /// Whether bit `bit` is set.
@@ -94,7 +96,7 @@ impl Bitmap {
       .rposition(|word| *word != 0)
       .map_or(0, |at| at + 1);
     writer.u32(u32::try_from(used).unwrap_or(0));
-    for word in &self.0[..used] {
+    for word in self.0.iter().take(used) {
       writer.u32(*word);
     }
   }

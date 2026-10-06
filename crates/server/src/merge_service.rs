@@ -2210,9 +2210,11 @@ fn held_inputs(state: &mut ShardState, object: ObjectId, manifest: &[u8; 32]) ->
     // The increment encoding ends with the evidence count (a `u64`); the byte before it is the
     // post-state's last byte when the post-state is not empty.
     let evidence_count_bytes = size_of::<u64>();
-    if bytes.len() > evidence_count_bytes {
-      let at = bytes.len() - evidence_count_bytes - 1;
-      bytes[at] ^= CORRUPTION_MASK;
+    let at = bytes
+      .len()
+      .checked_sub(evidence_count_bytes.saturating_add(1));
+    if let Some(byte) = at.and_then(|at| bytes.get_mut(at)) {
+      *byte ^= CORRUPTION_MASK;
     }
   }
   Some(bytes)

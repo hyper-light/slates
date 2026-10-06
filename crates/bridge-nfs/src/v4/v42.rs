@@ -526,7 +526,7 @@ async fn listxattrs<B: Backend>(
   let mut names = XdrWriter::new();
   let mut returned = 0u32;
   let mut next = start;
-  for key in &keys[start..] {
+  for key in keys.iter().skip(start) {
     let mut one = XdrWriter::new();
     one.opaque(key);
     if LISTXATTRS_FIXED_BYTES + names.len() + one.len() > maxcount {

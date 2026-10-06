@@ -4,7 +4,12 @@
 //! reproduces the same attributes everywhere; a rendered range equals the same range of the whole
 //! file; and hostile bytes (every truncation, a bit flip in every header byte, lengths past the file)
 //! never decode to a layout reaching outside the file.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![allow(
+  clippy::unwrap_used,
+  clippy::expect_used,
+  clippy::panic,
+  clippy::indexing_slicing
+)]
 
 use slates_bridge_core::appledouble::{
   Decoded, Encoding, Entry, FINDER_INFO_NAME, Layout, MAX_HEADER_BYTES, Span, decode, encode,

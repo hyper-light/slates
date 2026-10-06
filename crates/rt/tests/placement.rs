@@ -18,7 +18,7 @@
 //! (an owned cpuset that does not begin at CPU 0) exercise both.
 
 // Test harness code: an unwrap here is a failed test, which is what it should be.
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
 #[cfg(target_os = "linux")]
 mod linux {

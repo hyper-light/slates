@@ -369,7 +369,11 @@ fn parse_size(text: &str) -> Option<u64> {
   let text = text.trim();
   let digits: String = text.chars().take_while(char::is_ascii_digit).collect();
   let value: u64 = digits.parse().ok()?;
-  let suffix = text[digits.len()..].trim().to_ascii_lowercase();
+  let suffix = text
+    .get(digits.len()..)
+    .unwrap_or_default()
+    .trim()
+    .to_ascii_lowercase();
   /// Format: binary prefixes as the kernel's pseudo-files print them.
   const KIB: u64 = 1024;
   let multiplier = match suffix.as_str() {
@@ -445,7 +449,7 @@ mod platform {
     }
     buf.truncate(len);
     let end = buf.iter().position(|b| *b == 0).unwrap_or(buf.len());
-    Some(String::from_utf8_lossy(&buf[..end]).into_owned())
+    Some(String::from_utf8_lossy(buf.get(..end).unwrap_or(&buf)).into_owned())
   }
 
   pub(super) fn page(notes: &mut Vec<String>) -> PageFacts {

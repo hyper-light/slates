@@ -785,10 +785,11 @@ fn split_mount_capability(args: &[u8]) -> Option<(String, MountCapability)> {
     return None;
   }
   let mut token = [0u8; 16];
-  for (index, byte) in token.iter_mut().enumerate() {
-    let hi = (hex[index * 2] as char).to_digit(HEX_RADIX)?;
-    let lo = (hex[index * 2 + 1] as char).to_digit(HEX_RADIX)?;
-    *byte = u8::try_from(hi * HEX_RADIX + lo).ok()?;
+  let (pairs, _) = hex.as_chunks::<2>();
+  for (byte, &[hi, lo]) in token.iter_mut().zip(pairs) {
+    let hi = char::from(hi).to_digit(HEX_RADIX)?;
+    let lo = char::from(lo).to_digit(HEX_RADIX)?;
+    *byte = u8::try_from(hi.checked_mul(HEX_RADIX)?.checked_add(lo)?).ok()?;
   }
   Some((name.to_owned(), (attachment, token)))
 }

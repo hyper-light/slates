@@ -17,6 +17,8 @@
 //! The protocol-level counterpart of the explorer (`tests/explore.rs`, which checks safety over orders with
 //! no clock): this one measures time. Everything is bounded by the scenario's duration.
 
+// Test code may panic (CLAUDE.md §2 item 6 applies to shipped code).
+#![allow(clippy::indexing_slicing)]
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 

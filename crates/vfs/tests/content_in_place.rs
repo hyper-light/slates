@@ -3,7 +3,13 @@
 //! blocks. These tests drive the claim, the rebuild and the sweep through the volume's own verbs, with the
 //! restart modelled by [`common::surviving`] (the arena's bytes carried into a fresh store, as the anchor's RAM
 //! carries them into a restarted daemon).
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![allow(
+  clippy::unwrap_used,
+  clippy::expect_used,
+  clippy::panic,
+  clippy::indexing_slicing,
+  clippy::unwrap_in_result
+)]
 
 mod common;
 

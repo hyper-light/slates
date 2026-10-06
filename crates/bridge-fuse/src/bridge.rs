@@ -1011,8 +1011,9 @@ fn serve_batch_forget(bridge: &mut dyn Bridge, req: &Request<'_>, cx: &OpContext
     .map_or(0, |count| usize::try_from(count).unwrap_or(usize::MAX));
   let (whole, _partial) = entries.as_chunks::<ENTRY>();
   for entry in whole.iter().take(claimed) {
-    let nodeid = u64::from_le_bytes(entry[..size_of::<u64>()].try_into().unwrap_or_default());
-    let nlookup = u64::from_le_bytes(entry[size_of::<u64>()..].try_into().unwrap_or_default());
+    let (nodeid, nlookup) = entry.split_at(size_of::<u64>());
+    let nodeid = u64::from_le_bytes(nodeid.try_into().unwrap_or_default());
+    let nlookup = u64::from_le_bytes(nlookup.try_into().unwrap_or_default());
     bridge.forget(ObjectId::new(nodeid, 0), cx, nlookup);
   }
   0
@@ -1044,7 +1045,13 @@ fn serve_mknod(
   let Some(head) = req.body.get(..HEAD) else {
     return write_or_drop(ReplyHeader::write_error(req.header.unique, EIO, out), out);
   };
-  let mode = u32::from_le_bytes(head[..4].try_into().unwrap_or_default());
+  let mode = u32::from_le_bytes(
+    head
+      .get(..size_of::<u32>())
+      .unwrap_or_default()
+      .try_into()
+      .unwrap_or_default(),
+  );
   let kind = match slates_vfs::export::kind_of_mode(mode) {
     Some(kind @ (Kind::Fifo | Kind::Socket)) => kind,
     _ => return reply_err(req.header.unique, VfsError::SpecialFileOperation, out),
@@ -1160,10 +1167,10 @@ fn serve_link(bridge: &mut dyn Bridge, req: &Request<'_>, cx: &OpContext, out: &
   // fuse_link_in: oldnodeid (8) — the existing inode to link — then the new name in this request's
   // directory (the header node id).
   const HEAD: usize = size_of::<u64>();
-  if req.body.len() < HEAD {
+  let Some(head) = req.body.get(..HEAD) else {
     return write_or_drop(ReplyHeader::write_error(req.header.unique, EIO, out), out);
-  }
-  let oldnodeid = u64::from_le_bytes(req.body[..HEAD].try_into().unwrap_or_default());
+  };
+  let oldnodeid = u64::from_le_bytes(head.try_into().unwrap_or_default());
   let name = match parse_name(req.body.get(HEAD..).unwrap_or_default()) {
     Ok(name) => name,
     Err(refusal) => return refuse_unparsed(req.header.unique, refusal, out),

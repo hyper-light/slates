@@ -161,7 +161,8 @@ impl XattrTable {
       .entries
       .binary_search_by(|(held, _)| held.as_ref().cmp(name))
       .ok()
-      .map(|at| self.entries[at].1)
+      .and_then(|at| self.entries.get(at))
+      .map(|(_, no)| *no)
   }
 
   /// Sets `name` to the attribute inode `no`, returning the inode it replaces.
@@ -170,7 +171,10 @@ impl XattrTable {
       .entries
       .binary_search_by(|(held, _)| held.as_ref().cmp(name))
     {
-      Ok(at) => Some(std::mem::replace(&mut self.entries[at].1, no)),
+      Ok(at) => self
+        .entries
+        .get_mut(at)
+        .map(|(_, held)| std::mem::replace(held, no)),
       Err(at) => {
         self.entries.insert(at, (name.into(), no));
         None
@@ -211,7 +215,10 @@ impl XattrTable {
   /// name repeats, which no volume produces.
   pub fn from_pairs(mut pairs: Vec<(Box<[u8]>, InodeNo)>) -> Option<Self> {
     pairs.sort_by(|a, b| a.0.cmp(&b.0));
-    if pairs.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+    if pairs
+      .windows(2)
+      .any(|pair| matches!(pair, [a, b] if a.0 == b.0))
+    {
       return None;
     }
     Some(Self {

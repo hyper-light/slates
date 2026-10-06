@@ -6,7 +6,12 @@
 //! writes. Every hostile case the contract names is refused typed, and the simulated memory's
 //! access log proves the refusal came before any buffer was touched.
 // Test harness code: an unwrap here is a failed test.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![allow(
+  clippy::unwrap_used,
+  clippy::expect_used,
+  clippy::panic,
+  clippy::indexing_slicing
+)]
 
 mod common;
 

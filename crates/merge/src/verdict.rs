@@ -90,15 +90,13 @@ pub fn path_verdict(
 fn sweep(mine: &[Range], theirs: &[Range]) -> PathVerdict {
   let mut candidates: Vec<Range> = Vec::new();
   let (mut i, mut j) = (0usize, 0usize);
-  while i < mine.len() && j < theirs.len() {
-    let a = mine[i];
-    let b = theirs[j];
+  while let (Some(&a), Some(&b)) = (mine.get(i), theirs.get(j)) {
     if a.overlaps(b) {
       if a.same_span(b) {
         // Same span, possibly the same edit made twice: pass two decides by bytes.
         candidates.push(a);
-        i += 1;
-        j += 1;
+        i = i.saturating_add(1);
+        j = j.saturating_add(1);
         continue;
       }
       // A zero-length anchor (an insert) that overlaps a non-empty intervening range is
@@ -112,9 +110,9 @@ fn sweep(mine: &[Range], theirs: &[Range]) -> PathVerdict {
     }
     // Disjoint: advance the one that ends first.
     if a.end() <= b.start {
-      i += 1;
+      i = i.saturating_add(1);
     } else {
-      j += 1;
+      j = j.saturating_add(1);
     }
   }
   if candidates.is_empty() {

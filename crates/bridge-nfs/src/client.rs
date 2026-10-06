@@ -109,7 +109,7 @@ fn mount_call(xid: u32, caller: &Credentials, procedure: u32, path: &str) -> Vec
   credential.opaque(b"localhost");
   credential.u32(caller.uid);
   credential.u32(caller.gid);
-  let gids = &caller.gids[..caller.gids.len().min(AUTH_SYS_MAX_GIDS)];
+  let gids = caller.gids.get(..AUTH_SYS_MAX_GIDS).unwrap_or(&caller.gids);
   credential.u32(u32::try_from(gids.len()).unwrap_or(0));
   for gid in gids {
     credential.u32(*gid);
@@ -191,10 +191,10 @@ pub fn exchange(port: u16, call: &[u8], deadline: Duration) -> Result<Vec<u8>, F
       Err(_) => return Err(FetchError::Malformed),
     }
     let read = stream.read(&mut chunk).map_err(FetchError::Io)?;
-    if read == 0 || received.len() + read > MAX_REPLY_BYTES {
+    if read == 0 || received.len().saturating_add(read) > MAX_REPLY_BYTES {
       return Err(FetchError::Malformed);
     }
-    received.extend_from_slice(&chunk[..read]);
+    received.extend_from_slice(chunk.get(..read).ok_or(FetchError::Malformed)?);
   }
 }
 

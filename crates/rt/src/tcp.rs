@@ -194,12 +194,12 @@ impl TcpStream {
   /// so a stalled peer yields the shard rather than blocking it. Returns when every byte is accepted.
   pub async fn write_all(&self, buf: &[u8]) -> Result<(), RtError> {
     let mut sent = 0;
-    while sent < buf.len() {
-      match rustix::io::write(&self.fd, &buf[sent..]) {
+    while let Some(unsent) = buf.get(sent..).filter(|unsent| !unsent.is_empty()) {
+      match rustix::io::write(&self.fd, unsent) {
         // A non-blocking write of a non-empty slice returns bytes written, `EAGAIN`, or an error; a
         // zero here would mean the kernel accepted nothing without blocking, which is a broken pipe.
         Ok(0) => return Err(refused("write", rustix::io::Errno::PIPE)),
-        Ok(n) => sent += n,
+        Ok(n) => sent = sent.saturating_add(n),
         Err(rustix::io::Errno::AGAIN) => writable(self.fd.as_raw_fd()).await?,
         Err(rustix::io::Errno::INTR) => continue,
         Err(e) => return Err(refused("write", e)),

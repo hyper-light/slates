@@ -489,10 +489,11 @@ mod structural {
     "slates-wire-derive",
   ];
 
-  /// Format: the crate-root attribute of the no-panic law, whitespace removed: outside test builds, deny
-  /// indexing or slicing that can fall out of bounds, string slicing off a character boundary, and
-  /// arithmetic that can overflow or divide by zero.
-  const NO_PANIC_ATTRIBUTE: &str = "#![cfg_attr(not(test),deny(clippy::indexing_slicing,clippy::string_slice,clippy::arithmetic_side_effects))]";
+  /// Format: the crate-root attribute of the no-panic law's last ratcheted part, whitespace removed: outside
+  /// test builds, deny arithmetic that can overflow or divide by zero. Out-of-bounds indexing and slicing and
+  /// string slicing off a character boundary are denied workspace-wide (`[workspace.lints.clippy]`, since
+  /// 2026-10-06, when the last site was gone).
+  const NO_PANIC_ATTRIBUTE: &str = "#![cfg_attr(not(test),deny(clippy::arithmetic_side_effects))]";
 
   /// Whether `package`'s crate root (`src/lib.rs`, else `src/main.rs`) carries [`NO_PANIC_ATTRIBUTE`], and
   /// a violation when that disagrees with [`NO_PANIC_PENDING`].

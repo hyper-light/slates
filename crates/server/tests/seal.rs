@@ -2,7 +2,12 @@
 //! (account, partition) wrapped by it, the tenant's naming key and the volume's lineage key wrapped by the tenant key —
 //! recorded in the partition and unwrapped again after a daemon restart, never written to a disk. Driven through a
 //! real daemon under an anchor the test plays, with the content plane's own seal (`slates_cluster::sealed`).
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![allow(
+  clippy::unwrap_used,
+  clippy::expect_used,
+  clippy::panic,
+  clippy::unwrap_in_result
+)]
 
 use std::sync::OnceLock;
 use std::time::Duration;

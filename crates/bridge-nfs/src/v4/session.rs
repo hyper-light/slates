@@ -382,7 +382,7 @@ impl Sessions {
         return Err(Nfsstat4::ClidInuse);
       }
       if existing.verifier == args.verifier {
-        return Ok(self.granted(clientid));
+        return self.granted(clientid);
       }
       // The client rebooted: its old record and sessions go (§18.35.5 case 5).
       self.drop_client(clientid);
@@ -419,21 +419,22 @@ impl Sessions {
     );
     self.owners.insert(args.owner.clone(), clientid);
     self.journal_client(clientid);
-    Ok(self.granted(clientid))
+    self.granted(clientid)
   }
 
-  fn granted(&self, clientid: u64) -> ExchangeIdGranted {
-    let client = &self.clients[&clientid];
+  /// The grant for a client both callers just found or inserted; a missing one is the server's fault.
+  fn granted(&self, clientid: u64) -> Result<ExchangeIdGranted, Nfsstat4> {
+    let client = self.clients.get(&clientid).ok_or(Nfsstat4::Serverfault)?;
     let confirmed = if client.confirmed {
       EXCHGID4_FLAG_CONFIRMED_R
     } else {
       0
     };
-    ExchangeIdGranted {
+    Ok(ExchangeIdGranted {
       clientid,
       sequenceid: client.create_seq,
       flags: EXCHGID4_FLAG_USE_NON_PNFS | confirmed,
-    }
+    })
   }
 
   /// `CREATE_SESSION` (§18.36.4): a new session for a client, confirming it; a retry of the last one

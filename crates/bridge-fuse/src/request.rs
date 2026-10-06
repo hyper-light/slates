@@ -84,7 +84,13 @@ impl<'a> Request<'a> {
   pub fn parse(message: &'a [u8]) -> Result<Request<'a>, FuseError> {
     let header = InHeader::parse(message)?;
     let end = usize::try_from(header.len).unwrap_or(message.len());
-    let body = &message[IN_HEADER_LEN..end];
+    // `InHeader::parse` refused a `len` below the header or past the buffer, so this always holds.
+    let body = message
+      .get(IN_HEADER_LEN..end)
+      .ok_or(FuseError::BadLength {
+        claimed: header.len,
+        have: message.len(),
+      })?;
     Ok(Request {
       header,
       opcode: Opcode::from_wire(header.opcode),
@@ -364,7 +370,7 @@ impl<'a> WriteIn<'a> {
     let offset = r.u64(opcode)?;
     let size = usize::try_from(r.u32(opcode)?).unwrap_or(usize::MAX);
     r.skip(Self::SKIP_AFTER_SIZE, opcode)?;
-    if r.remaining() < size {
+    let Some(data) = r.rest().get(..size) else {
       return Err(FuseError::ShortBody {
         opcode,
         have: body.len(),
@@ -372,11 +378,7 @@ impl<'a> WriteIn<'a> {
           .len()
           .saturating_add(size.saturating_sub(r.remaining())),
       });
-    }
-    Ok(WriteIn {
-      fh,
-      offset,
-      data: &r.rest()[..size],
-    })
+    };
+    Ok(WriteIn { fh, offset, data })
   }
 }

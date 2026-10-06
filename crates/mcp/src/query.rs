@@ -1176,8 +1176,11 @@ mod tests {
       match pattern.split_once('*') {
         None => pattern == text,
         Some((head, tail)) => text.strip_prefix(head).is_some_and(|rest| {
-          (0..=rest.len())
-            .any(|skip| rest.is_char_boundary(skip) && component_matches(tail, &rest[skip..]))
+          (0..=rest.len()).any(|skip| {
+            rest
+              .get(skip..)
+              .is_some_and(|after| component_matches(tail, after))
+          })
         }),
       }
     }

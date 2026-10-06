@@ -3,7 +3,12 @@
 //! frame left over from before a checkpoint is never replayed over it; a full log refuses. Memories are plain
 //! buffers, as the content object's slices are byte ranges.
 // Test harness code: an unwrap here is a failed test, which is what it should be.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![allow(
+  clippy::unwrap_used,
+  clippy::expect_used,
+  clippy::panic,
+  clippy::indexing_slicing
+)]
 
 use slates_vfs::checkpoint_log::{Journal, KeyedRecord, ShardDelta};
 use slates_vfs::recover::{ImageWrite, KeyedImage, ShardImage};

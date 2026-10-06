@@ -356,7 +356,7 @@ fn validate(
     });
   }
   for (index, entry) in manifest.nodes.iter().enumerate() {
-    for other in &manifest.nodes[..index] {
+    for other in manifest.nodes.iter().take(index) {
       if other.node == entry.node {
         return Err(DeployError::DuplicateNode {
           node: entry.node.clone(),
@@ -437,7 +437,12 @@ pub fn plan(
   resolver: Option<Resolver>,
 ) -> Result<FleetPlan, DeployError> {
   let this = validate(manifest, node, resolver.as_ref())?;
-  let entry = &manifest.nodes[this];
+  let entry = manifest
+    .nodes
+    .get(this)
+    .ok_or_else(|| DeployError::UnknownNode {
+      node: node.to_owned(),
+    })?;
   // Seed ids route discovery and retain each certificate's declared domain and region. They
   // authorize no votes: every daemon announces a fresh id, then joins an initialized group.
   let origin_anchor = host_id_of_certificate(&entry.certificate);

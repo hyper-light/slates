@@ -5,7 +5,12 @@
 //! answered ENOSYS. The mock implements the shared `slates-bridge-core` trait (neutral attributes
 //! and typed refusals); the dispatch converts them to the FUSE wire.
 // Test harness code: an unwrap here is a failed test.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![allow(
+  clippy::unwrap_used,
+  clippy::expect_used,
+  clippy::panic,
+  clippy::indexing_slicing
+)]
 
 use slates_bridge_core::{
   Attachments, CacheLifetime, FsStat, NodeAttr, ObjectId, OpContext, RenameFlags, Rights, SetAttr,

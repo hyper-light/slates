@@ -65,7 +65,7 @@ impl Segment {
     let len = HEADER_BYTES.saturating_add(payload.len());
     let (object, map) = platform::create(name, len)?;
     let mut segment = Segment { map, object };
-    segment.write(identity, payload);
+    segment.write(identity, payload)?;
     Ok(segment)
   }
 
@@ -81,7 +81,9 @@ impl Segment {
     if read_u32(bytes, AT_VERSION) != LAYOUT_VERSION {
       return Err(unavailable("wrong layout version"));
     }
-    let cached = &bytes[AT_IDENTITY..AT_IDENTITY + IDENTITY_BYTES];
+    let cached = bytes
+      .get(AT_IDENTITY..AT_IDENTITY.saturating_add(IDENTITY_BYTES))
+      .unwrap_or_default();
     if cached != identity.hash() {
       return Err(MachineError::ProfileStale {
         cached: hex(cached),
@@ -100,7 +102,7 @@ impl Segment {
     if end > bytes.len() {
       return Err(unavailable("payload length exceeds the segment"));
     }
-    let payload = bytes[HEADER_BYTES..end].to_vec();
+    let payload = bytes.get(HEADER_BYTES..end).unwrap_or_default().to_vec();
     if read_u64(bytes, AT_GENERATION) != generation_before {
       return Err(unavailable("the segment changed while it was read"));
     }
@@ -117,21 +119,22 @@ impl Segment {
     self.map.is_empty()
   }
 
-  fn write(&mut self, identity: &Identity, payload: &[u8]) {
+  fn write(&mut self, identity: &Identity, payload: &[u8]) -> Result<(), MachineError> {
     let start = read_u64(&self.map, AT_GENERATION);
-    put(&mut self.map, AT_GENERATION, &(start | 1).to_le_bytes());
-    put(&mut self.map, AT_MAGIC, &MAGIC.to_le_bytes());
-    put(&mut self.map, AT_VERSION, &LAYOUT_VERSION.to_le_bytes());
-    put(&mut self.map, AT_IDENTITY, &identity.hash());
+    put(&mut self.map, AT_GENERATION, &(start | 1).to_le_bytes())?;
+    put(&mut self.map, AT_MAGIC, &MAGIC.to_le_bytes())?;
+    put(&mut self.map, AT_VERSION, &LAYOUT_VERSION.to_le_bytes())?;
+    put(&mut self.map, AT_IDENTITY, &identity.hash())?;
     let length = u64::try_from(payload.len()).unwrap_or(u64::MAX);
-    put(&mut self.map, AT_LENGTH, &length.to_le_bytes());
-    put(&mut self.map, HEADER_BYTES, payload);
+    put(&mut self.map, AT_LENGTH, &length.to_le_bytes())?;
+    put(&mut self.map, HEADER_BYTES, payload)?;
     put(
       &mut self.map,
       AT_GENERATION,
       &((start | 1).wrapping_add(1)).to_le_bytes(),
-    );
+    )?;
     let _ = &self.object;
+    Ok(())
   }
 
   fn bytes(&self) -> &[u8] {
@@ -150,22 +153,30 @@ fn unavailable(reason: &str) -> MachineError {
   }
 }
 
-fn put(bytes: &mut [u8], at: usize, value: &[u8]) {
-  bytes[at..at + value.len()].copy_from_slice(value);
+/// Writes `value` at `at`, refused when the mapping is shorter than the write (never, for a segment sized by
+/// `publish`).
+fn put(bytes: &mut [u8], at: usize, value: &[u8]) -> Result<(), MachineError> {
+  bytes
+    .get_mut(at..at.saturating_add(value.len()))
+    .ok_or_else(|| unavailable("segment shorter than what it holds"))?
+    .copy_from_slice(value);
+  Ok(())
 }
 
+/// The word at `at`, or zero past the end (the header's length is checked before any field is read).
 fn read_u32(bytes: &[u8], at: usize) -> u32 {
-  let mut word = [0u8; size_of::<u32>()];
-  let n = word.len();
-  word.copy_from_slice(&bytes[at..at + n]);
-  u32::from_le_bytes(word)
+  bytes
+    .get(at..at.saturating_add(size_of::<u32>()))
+    .and_then(|word| word.try_into().ok())
+    .map_or(0, u32::from_le_bytes)
 }
 
+/// The word at `at`, or zero past the end (the header's length is checked before any field is read).
 fn read_u64(bytes: &[u8], at: usize) -> u64 {
-  let mut word = [0u8; size_of::<u64>()];
-  let n = word.len();
-  word.copy_from_slice(&bytes[at..at + n]);
-  u64::from_le_bytes(word)
+  bytes
+    .get(at..at.saturating_add(size_of::<u64>()))
+    .and_then(|word| word.try_into().ok())
+    .map_or(0, u64::from_le_bytes)
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -413,7 +424,7 @@ mod tests {
       Err(MachineError::ProfileUnavailable { .. })
     ));
     segment.bytes_mut()[AT_MAGIC] ^= 0xFF;
-    put(segment.bytes_mut(), AT_LENGTH, &u64::MAX.to_le_bytes());
+    put(segment.bytes_mut(), AT_LENGTH, &u64::MAX.to_le_bytes()).unwrap();
     assert!(matches!(
       segment.read(&id),
       Err(MachineError::ProfileUnavailable { .. })
@@ -429,7 +440,8 @@ mod tests {
       segment.bytes_mut(),
       AT_GENERATION,
       &(generation + 1).to_le_bytes(),
-    );
+    )
+    .unwrap();
     let err = segment.read(&id).unwrap_err();
     assert!(err.to_string().contains("writer"), "{err}");
   }

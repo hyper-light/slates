@@ -5,7 +5,12 @@
 //! `ratchet\t<key>\t<lower>\t<median>\t<upper>` in nanoseconds, as `cargo xtask ratchet` reads
 //! them.
 // Bench harness code: an unwrap here is a failed run.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![allow(
+  clippy::unwrap_used,
+  clippy::expect_used,
+  clippy::panic,
+  clippy::indexing_slicing
+)]
 
 use std::time::Instant;
 

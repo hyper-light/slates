@@ -10,6 +10,7 @@ allow-unwrap-in-tests = true
 allow-expect-in-tests = true
 allow-panic-in-tests = true
 allow-dbg-in-tests = true
+allow-indexing-slicing-in-tests = true
 
 # R2 and D-7/D-8: no atomic reference counting and no locks on data paths. The only allowed
 # sites are named FFI edge modules (bindings objects a GC may drop mid-call; foreign APIs that

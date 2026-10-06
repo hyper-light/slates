@@ -5,7 +5,12 @@
 //! `ShardVolumeSet` → the shard's real volume and back, so this proves the daemon's NFS transport
 //! reaches the volumes it provisioned, not a demo volume. A real `mount_nfs localhost:PORT` would do the
 //! same over the kernel; the hand-rolled ONC RPC client here needs no privilege.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![allow(
+  clippy::unwrap_used,
+  clippy::expect_used,
+  clippy::panic,
+  clippy::indexing_slicing
+)]
 // These integration tests drive the daemon's NFS-loopback transport, the fleet's TCP
 // transport and rustix syscalls — all macOS/Linux; on Windows the daemon mounts through WinFsp and
 // the fleet transport is QUIC-over-UDP, so these particular tests are unix (as `virtiofs.rs` is).

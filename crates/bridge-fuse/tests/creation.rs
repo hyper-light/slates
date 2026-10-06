@@ -2,7 +2,12 @@
 //! sends it — the creating process's uid and gid in the request header, and its umask beside the mode (the
 //! kernel negotiates `FUSE_DONT_MASK`, so the mode arrives unmasked). Every host: the dispatch is pure.
 // Test harness code: an unwrap here is a failed test.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![allow(
+  clippy::unwrap_used,
+  clippy::expect_used,
+  clippy::panic,
+  clippy::indexing_slicing
+)]
 
 use slates_bridge_core::{Attachments, Bridge, ObjectId, OpContext, Rights, View};
 use slates_bridge_fuse::abi::{IN_HEADER_LEN, Opcode};

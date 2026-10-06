@@ -87,24 +87,31 @@ impl FileHandle {
     if bytes.len() != FH_LEN {
       return Err(FileHandleError::Malformed);
     }
-    let mut at = 0;
-    if bytes[at] != FH_VERSION {
+    let Some((&version, rest)) = bytes.split_first() else {
+      return Err(FileHandleError::Malformed);
+    };
+    if version != FH_VERSION {
       return Err(FileHandleError::UnknownVersion);
     }
-    at += size_of::<u8>();
-    let mut volume = VolumeId::default();
-    volume
-      .bytes
-      .copy_from_slice(&bytes[at..at + size_of::<VolumeId>()]);
-    at += size_of::<VolumeId>();
-    let inode = read_u64(&bytes[at..at + size_of::<u64>()])?;
-    at += size_of::<u64>();
-    let generation = read_u64(&bytes[at..at + size_of::<u64>()])?;
-    at += size_of::<u64>();
-    let attachment = read_u64(&bytes[at..at + size_of::<u64>()])?;
-    at += size_of::<u64>();
-    let mut token = [0u8; 16];
-    token.copy_from_slice(&bytes[at..at + size_of::<[u8; 16]>()]);
+    let (volume, rest) = rest
+      .split_first_chunk::<{ size_of::<VolumeId>() }>()
+      .ok_or(FileHandleError::Malformed)?;
+    let volume = VolumeId { bytes: *volume };
+    let (inode, rest) = rest
+      .split_at_checked(size_of::<u64>())
+      .ok_or(FileHandleError::Malformed)?;
+    let (generation, rest) = rest
+      .split_at_checked(size_of::<u64>())
+      .ok_or(FileHandleError::Malformed)?;
+    let (attachment, rest) = rest
+      .split_at_checked(size_of::<u64>())
+      .ok_or(FileHandleError::Malformed)?;
+    let (inode, generation, attachment) = (
+      read_u64(inode)?,
+      read_u64(generation)?,
+      read_u64(attachment)?,
+    );
+    let token: [u8; 16] = rest.try_into().map_err(|_| FileHandleError::Malformed)?;
     Ok(FileHandle {
       volume,
       inode,

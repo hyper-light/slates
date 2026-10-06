@@ -13,7 +13,12 @@
 //! signing, no kernel extension, no privilege beyond the mount (R10). It serves connections serially,
 //! one at a time — enough for a mount and file access.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![allow(
+  clippy::unwrap_used,
+  clippy::expect_used,
+  clippy::panic,
+  clippy::indexing_slicing
+)]
 
 use std::io::Write;
 use std::sync::mpsc::channel;

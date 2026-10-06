@@ -8,7 +8,7 @@
 //! that carries this in production is a further gate (owed).
 
 // Test harness: an unwrap or expect here is a failed test.
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
 use std::sync::mpsc::{Receiver, channel};
 

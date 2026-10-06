@@ -9803,3 +9803,28 @@ Status: built 2026-10-06 (conditions 10 and 11).
 - Open (GAPS): convergence takes up to 146 s, because the isolated leader refutes its death through gossip on
   another plane and the confirmation window restarts.
 
+
+### A-104 — An increment's content ops must fit the base they edit (2026-10-06)
+Applied in the same change to: `crates/merge/src/engine.rs` (`fits_base`, `Green::unfit_content`, `decide`, and the
+splice through `get`), the tests `an_increment_whose_ops_run_past_the_base_is_judged_not_panicked`
+(`crates/merge/tests/engine.rs`) and `every_composed_op_set_fits_its_base_and_merges_to_the_final_content`
+(`crates/merge/tests/splice.rs`), `docs/bugs/2026-10-06-a-merge-increment-past-its-base-panicked-then-clamped.md`,
+GAPS.
+Status: built 2026-10-06 (conditions 3 and 11).
+- What: before deciding, the merge engine checks each path's content ops against the content the path edits at the
+  increment's base. A created path edits an empty base, and a renamed-into path edits its source. The ops pass only if:
+  - every op starts within the base;
+  - a delete or overwrite ends within it;
+  - a truncate ends at its end;
+  - an extend starts at its end;
+  - every byte an op adds lies in the post-state.
+  A path that fails is a conflict window of class `TypeChanged`, the class a malformed special-file declaration already
+  takes, and nothing of the increment is applied.
+- Why: "Composition at seal" above composes ops in base coordinates, so these are the deriver's own invariants. An ops
+  document is decoded from bytes, and the decoder checks only its framing. Before this change, an increment that broke the
+  invariants either aborted the merge (a base slice from 20 to 10) or, with the slice bounded, was clamped and accepted (a
+  10-byte file became `XXZ`). D-27 admits only accept, identical or conflict, and a merge built by clamping is none of
+  them.
+- Evidence: the property test composes generated journals over generated bases with the real deriver, and every result
+  is accepted and reads back exactly. A rule one step too strict fails it at once (a mutation check: extend at
+  `< base_len`).

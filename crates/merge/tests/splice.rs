@@ -11,7 +11,14 @@
 //! check asserts that an untouched region keeps a base-sourced extent, so the splice cannot pass
 //! by copying everything into the post-state.
 
+// Test code may panic (CLAUDE.md §2 item 6 applies to shipped code).
+#![allow(clippy::indexing_slicing)]
+mod common;
+
+use common::Build;
 use slates_merge::derive::{ContentOp, compose_content};
+use slates_merge::engine::{Green, Increment, Outcome};
+use slates_merge::ops_doc::OpsDoc;
 use slates_merge::splice::{Extent, Source, splice};
 
 use proptest::prelude::*;
@@ -208,6 +215,38 @@ proptest! {
     let spliced = splice(&base_extents(base_len), &net);
     let base_bytes: Vec<u8> = (0..base_len).map(base_byte).collect();
     prop_assert_eq!(read_back(&spliced, &base_bytes, &post), post);
+  }
+
+  /// D-27 hostile-input guard, its non-vacuity leg: the engine refuses a content op set that does not fit its
+  /// base (`fits_base`), so every net op set the deriver composes must still fit. Do compose any journal over
+  /// any base and submit it with nothing intervening; expect it accepted and the file equal to the journal's
+  /// final bytes.
+  #[test]
+  fn every_composed_op_set_fits_its_base_and_merges_to_the_final_content(
+    base_len in 0u64..64,
+    raw in proptest::collection::vec(
+      (any::<u8>(), 0u64..128, 0u64..128).prop_map(|(kind, a, b)| Raw { kind, a, b }),
+      0..32,
+    ),
+  ) {
+    let (ops, post) = simulate(base_len, &raw);
+    let base_bytes: Vec<u8> = (0..base_len).map(base_byte).collect();
+    let mut green = Green::new();
+    green.submit(&Build::new().create("f", &base_bytes).at(1, 0));
+    let mut doc = OpsDoc::default();
+    let path = doc.paths.intern("f");
+    doc.ops = compose_content(base_len, &ops)
+      .into_iter()
+      .map(|op| slates_merge::ops_doc::Op { path, ..op })
+      .collect();
+    let edit = Increment { id: [2; 32], base: 1, doc, post_state: post.clone(), evidence: Vec::new() };
+    let outcome = green.submit(&edit);
+    if edit.doc.ops.is_empty() {
+      prop_assert!(matches!(outcome, Outcome::Accepted { .. }), "{:?}", outcome);
+    } else {
+      prop_assert_eq!(outcome, Outcome::Accepted { version: 2 });
+      prop_assert_eq!(green.content("f"), Some(post.as_slice()));
+    }
   }
 
   /// T-6.9: the spliced extents cover exactly the final content length, and none is empty.

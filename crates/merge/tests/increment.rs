@@ -10,6 +10,8 @@
 //! from the document and compares. Base bytes (0–127) and added bytes (128–255) are disjoint, so
 //! a misplaced op, a wrong length, a wrong source, or a wrong create/unlink/rename diverges.
 
+// Test code may panic (CLAUDE.md §2 item 6 applies to shipped code).
+#![allow(clippy::indexing_slicing)]
 use std::collections::{BTreeMap, BTreeSet};
 
 use slates_merge::increment::{Base, DeriveError, VolumeOp, compose_volume};

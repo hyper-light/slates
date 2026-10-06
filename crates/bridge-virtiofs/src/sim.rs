@@ -192,7 +192,15 @@ impl GuestMemory for SimGuestMemory {
       return Ok(());
     }
     let (index, offset) = self.locate(range)?;
-    out.copy_from_slice(&self.regions[index].bytes[offset..offset + want]);
+    let held = self
+      .regions
+      .get(index)
+      .and_then(|region| region.bytes.get(offset..offset.saturating_add(want)))
+      .ok_or(GuestMemoryError::OutsideGuestMemory {
+        start: range.start().0,
+        len: range.len(),
+      })?;
+    out.copy_from_slice(held);
     self.reads.set(self.reads.get().saturating_add(1));
     self.record(range, false);
     Ok(())
@@ -204,7 +212,15 @@ impl GuestMemory for SimGuestMemory {
       return Ok(());
     }
     let (index, offset) = self.locate(range)?;
-    self.regions[index].bytes[offset..offset + want].copy_from_slice(bytes);
+    self
+      .regions
+      .get_mut(index)
+      .and_then(|region| region.bytes.get_mut(offset..offset.saturating_add(want)))
+      .ok_or(GuestMemoryError::OutsideGuestMemory {
+        start: range.start().0,
+        len: range.len(),
+      })?
+      .copy_from_slice(bytes);
     self.writes.set(self.writes.get().saturating_add(1));
     self.record(range, true);
     Ok(())

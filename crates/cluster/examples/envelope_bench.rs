@@ -5,7 +5,8 @@
   clippy::unwrap_used,
   clippy::expect_used,
   clippy::print_stdout,
-  clippy::disallowed_methods
+  clippy::disallowed_methods,
+  clippy::indexing_slicing
 )]
 
 use std::time::Instant;

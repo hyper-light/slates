@@ -5,7 +5,7 @@
 //! network/process deployment is a further gate. Test by use (R5).
 
 // Test harness: an unwrap here is a failed test.
-#![allow(clippy::unwrap_used)]
+#![allow(clippy::unwrap_used, clippy::indexing_slicing)]
 
 use std::sync::mpsc::{Receiver, channel};
 

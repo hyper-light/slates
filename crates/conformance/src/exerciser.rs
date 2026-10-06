@@ -27,7 +27,7 @@ pub struct ExerciserVerdict {
 pub fn tail(output: &str) -> String {
   let lines: Vec<&str> = output.lines().collect();
   let start = lines.len().saturating_sub(TAIL_LINES);
-  detail(&lines[start..].join("\n"))
+  detail(&lines.get(start..).unwrap_or_default().join("\n"))
 }
 
 /// Shape: fsx's operation count — enough to exercise every operation class many times (fsx picks among

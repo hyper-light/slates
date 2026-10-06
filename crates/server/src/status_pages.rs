@@ -110,7 +110,7 @@ impl StatusPages {
       snapshot: request,
       offset,
       total,
-      bytes: held.bytes[start..end].to_vec(),
+      bytes: held.bytes.get(start..end).ok_or_else(bad_cursor)?.to_vec(),
     };
     if end == held.bytes.len() {
       self.clear(budget);

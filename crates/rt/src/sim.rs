@@ -1071,9 +1071,9 @@ impl SimRuntime {
   /// Makes a shard's driver fail at its `nth` wait from now (1 = the very next one).
   pub fn kill_driver(&mut self, shard: ShardId, nth: u64) -> Result<(), RtError> {
     let index = self.index_of(shard)?;
-    let shared = self.shared[index];
+    let shared = self.shared.get(index).ok_or(RtError::NotOnShardThread)?;
     shared.kill_at_wait.store(
-      shared.waits.load(Ordering::Acquire) + nth,
+      shared.waits.load(Ordering::Acquire).saturating_add(nth),
       Ordering::Release,
     );
     Ok(())
@@ -1089,19 +1089,17 @@ impl SimRuntime {
       sim_fabric_deliver_due(self.clock().now_ns());
       let mut any_work = false;
       let mut earliest: Option<u64> = None;
-      for index in 0..self.shards.len() {
-        let ctx = self.shards[index];
+      for (&ctx, &shared) in self.shards.iter().zip(&self.shared) {
         if ctx.exited() {
           continue;
         }
         let outcome: StepOutcome = ctx.step();
-        steps += 1;
+        steps = steps.saturating_add(1);
         if outcome.did_work {
           any_work = true;
           continue;
         }
         ctx.park(outcome.next_deadline_ns);
-        let shared = self.shared[index];
         if let Some(deadline) = shared.requested_deadline() {
           earliest = Some(earliest.map_or(deadline, |e| e.min(deadline)));
         }

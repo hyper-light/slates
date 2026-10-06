@@ -17,7 +17,12 @@
 //! Test by use (R5): the register is driven only through its public commit and promote API.
 
 // Test harness: an unwrap or expect here is a failed test.
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![allow(
+  clippy::unwrap_used,
+  clippy::expect_used,
+  clippy::indexing_slicing,
+  clippy::unwrap_in_result
+)]
 
 use std::collections::BTreeMap;
 

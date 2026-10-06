@@ -410,9 +410,13 @@ fn split_pid(raw: &str) -> (String, &str) {
   {
     return (pid.trim().to_owned(), body.trim_start());
   }
-  let digits = raw.len() - raw.trim_start_matches(|c: char| c.is_ascii_digit()).len();
-  if digits > 0 && raw[digits..].starts_with(' ') {
-    return (raw[..digits].to_owned(), raw[digits..].trim_start());
+  let rest = raw.trim_start_matches(|c: char| c.is_ascii_digit());
+  let digits = raw.len().saturating_sub(rest.len());
+  if let Some((pid, body)) = raw.split_at_checked(digits)
+    && !pid.is_empty()
+    && body.starts_with(' ')
+  {
+    return (pid.to_owned(), body.trim_start());
   }
   (String::new(), raw)
 }
@@ -477,16 +481,15 @@ fn joined_lines(log: &str) -> Vec<Joined> {
       continue;
     }
     if body.starts_with("<...") {
-      if let Some(position) = body.find(RESUMED) {
-        let tail = &body[position + RESUMED.len()..];
-        if let Some((began, head)) = pending.remove(&pid_text) {
-          out.push(Joined {
-            line: index + 1,
-            pid,
-            at_ns: began,
-            body: format!("{head}{tail}"),
-          });
-        }
+      if let Some((_, tail)) = body.split_once(RESUMED)
+        && let Some((began, head)) = pending.remove(&pid_text)
+      {
+        out.push(Joined {
+          line: index + 1,
+          pid,
+          at_ns: began,
+          body: format!("{head}{tail}"),
+        });
       }
       continue;
     }
@@ -503,7 +506,7 @@ fn joined_lines(log: &str) -> Vec<Joined> {
 /// The call name and its argument list from a whole strace line.
 fn call_and_args(body: &str) -> Option<(&str, Vec<&str>)> {
   let open = body.find('(')?;
-  let name = &body[..open];
+  let name = body.get(..open)?;
   if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
     return None;
   }
@@ -511,7 +514,10 @@ fn call_and_args(body: &str) -> Option<(&str, Vec<&str>)> {
   if close < open {
     return None;
   }
-  Some((name, split_top_level(&body[open + 1..close])))
+  Some((
+    name,
+    split_top_level(body.get(open.saturating_add(1)..close)?),
+  ))
 }
 
 /// Splits an argument list at top-level commas (quotes, brackets and braces respected).
@@ -535,14 +541,15 @@ fn split_top_level(args: &str) -> Vec<&str> {
       '[' | '{' | '(' => depth += 1,
       ']' | '}' | ')' => depth -= 1,
       ',' if depth == 0 => {
-        out.push(args[start..index].trim());
-        start = index + 1;
+        out.push(args.get(start..index).unwrap_or_default().trim());
+        start = index.saturating_add(1);
       }
       _ => {}
     }
   }
-  if !args[start..].trim().is_empty() {
-    out.push(args[start..].trim());
+  let last = args.get(start..).unwrap_or_default().trim();
+  if !last.is_empty() {
+    out.push(last);
   }
   out
 }
@@ -552,7 +559,7 @@ fn quoted(arg: &str) -> Option<String> {
   let inner = arg.strip_prefix('"')?;
   let end = inner.rfind('"')?;
   let mut out = String::with_capacity(end);
-  let mut chars = inner[..end].chars().peekable();
+  let mut chars = inner.get(..end)?.chars().peekable();
   while let Some(c) = chars.next() {
     if c != '\\' {
       out.push(c);
@@ -593,12 +600,10 @@ fn descriptor(arg: &str) -> (Option<i64>, Option<String>) {
   // strace can put the deletion annotation after the closing decoration bracket. It is
   // metadata about the descriptor, not part of its path or an exemption from containment.
   let arg = arg.strip_suffix("(deleted)").unwrap_or(arg);
-  let digits = arg.len()
-    - arg
-      .trim_start_matches(|c: char| c.is_ascii_digit() || c == '-')
-      .len();
-  let number: Option<i64> = arg[..digits].parse().ok();
-  let decoration = arg[digits..]
+  let rest = arg.trim_start_matches(|c: char| c.is_ascii_digit() || c == '-');
+  let (number, rest) = arg.split_at(arg.len().saturating_sub(rest.len()));
+  let number: Option<i64> = number.parse().ok();
+  let decoration = rest
     .strip_prefix('<')
     .and_then(|rest| rest.strip_suffix('>'))
     .map(|inner| inner.trim_end_matches(" (deleted)").to_owned());
@@ -928,18 +933,23 @@ fn is_timestamp(token: &str) -> bool {
 
 fn read_row(raw: &str) -> Option<Row<'_>> {
   let tokens: Vec<&str> = raw.split_whitespace().collect();
-  if tokens.len() < MIN_ROW_TOKENS || !is_timestamp(tokens[0]) {
+  let (&[stamp, call], _) = tokens.split_first_chunk::<2>()?;
+  if tokens.len() < MIN_ROW_TOKENS || !is_timestamp(stamp) {
     return None;
   }
   let mut row = Row {
-    call: tokens[1],
+    call,
     descriptor: None,
     failed: false,
     flags: None,
     paths: Vec::new(),
   };
   // The last tokens are the elapsed time, an optional `W`, and the process name; skip them.
-  let waited = tokens[tokens.len() - TRAILING_TOKENS] == "W";
+  let waited = tokens
+    .len()
+    .checked_sub(TRAILING_TOKENS)
+    .and_then(|at| tokens.get(at))
+    .is_some_and(|token| *token == "W");
   let body_end = tokens.len().saturating_sub(if waited {
     TRAILING_TOKENS_WAITED
   } else {
@@ -971,7 +981,9 @@ fn read_token<'a>(token: &'a str, row: &mut Row<'a>) {
   {
     row.failed = true;
   } else if token.starts_with('(') && token.ends_with(')') {
-    row.flags = Some(&token[1..token.len() - 1]);
+    row.flags = token
+      .strip_prefix('(')
+      .and_then(|inner| inner.strip_suffix(')'));
   } else if token.starts_with('/') || (token.starts_with('[') && token.contains("]/")) {
     row.paths.push(token);
   }

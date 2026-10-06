@@ -109,9 +109,12 @@ pub fn summarize(
     .iter()
     .map(|span| {
       let index = span.point().index();
-      counts[index] = counts[index].saturating_add(1);
-      newest_end[index] =
-        Some(newest_end[index].map_or(span.end_ns(), |end| end.max(span.end_ns())));
+      if let Some(count) = counts.get_mut(index) {
+        *count = count.saturating_add(1);
+      }
+      if let Some(newest) = newest_end.get_mut(index) {
+        *newest = Some(newest.map_or(span.end_ns(), |end| end.max(span.end_ns())));
+      }
       if span.context().cause() == Cause::Missing {
         missing_links = missing_links.saturating_add(1);
       }
@@ -121,11 +124,15 @@ pub fn summarize(
   let chokepoints = Chokepoint::ALL
     .iter()
     .map(|point| {
-      let latest_age_ns = newest_end[point.index()].map(|end| now_ns.saturating_sub(end));
+      let latest_age_ns = newest_end
+        .get(point.index())
+        .copied()
+        .flatten()
+        .map(|end| now_ns.saturating_sub(end));
       ChokepointReport {
         name: point.name().to_owned(),
         dimension: point.dimension().to_owned(),
-        spans: counts[point.index()],
+        spans: counts.get(point.index()).copied().unwrap_or(0),
         latest_age_ns,
         fresh: latest_age_ns.is_some_and(|age| age <= horizon_ns),
         absence: point.absence(),

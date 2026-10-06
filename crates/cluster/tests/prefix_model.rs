@@ -64,7 +64,12 @@
 //!   committed index.
 
 // Test harness: an unwrap, expect or panic here is a failed test.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![allow(
+  clippy::unwrap_used,
+  clippy::expect_used,
+  clippy::panic,
+  clippy::indexing_slicing
+)]
 
 mod support;
 

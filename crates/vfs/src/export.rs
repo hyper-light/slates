@@ -311,8 +311,12 @@ impl Default for Walked {
 impl Walked {
   fn file(&mut self, size: u64) {
     let class = usize::try_from(u64::BITS - size.leading_zeros()).unwrap_or(0);
-    self.file_sizes[class.min(SIZE_CLASSES - 1)] =
-      self.file_sizes[class.min(SIZE_CLASSES - 1)].saturating_add(1);
+    if let Some(count) = self
+      .file_sizes
+      .get_mut(class.min(SIZE_CLASSES.saturating_sub(1)))
+    {
+      *count = count.saturating_add(1);
+    }
   }
 }
 

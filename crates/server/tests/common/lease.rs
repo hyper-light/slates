@@ -2,6 +2,8 @@
 //! target's lease under, and a hold and a release on the daemon's control shard — the one owner of the
 //! host's target leases — standing for another landing attempt.
 
+// Test code may panic (CLAUDE.md §2 item 6 applies to shipped code).
+#![allow(clippy::unwrap_in_result)]
 use std::path::Path;
 
 use slates_ipc::protocol::Refusal;

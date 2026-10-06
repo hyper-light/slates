@@ -1866,13 +1866,16 @@ impl Overlay<'_> {
     }
     let want =
       usize::try_from((size - off).min(u64::try_from(buf.len()).unwrap_or(u64::MAX))).unwrap_or(0);
-    let out = &mut buf[..want];
+    let out = buf.get_mut(..want).unwrap_or_default();
     out.fill(0);
     // Disk bytes first (within the valid base length), then the pinned extents over them.
     if off < base_len && !covered {
-      let disk_want =
-        usize::try_from((base_len - off).min(u64::try_from(want).unwrap_or(u64::MAX))).unwrap_or(0);
-      self.read_disk(store, no, off, &mut out[..disk_want])?;
+      let disk_want = usize::try_from(base_len.saturating_sub(off))
+        .unwrap_or(usize::MAX)
+        .min(out.len());
+      if let Some(disk) = out.get_mut(..disk_want) {
+        self.read_disk(store, no, off, disk)?;
+      }
     }
     if let Body::Base(b) = &self.vol.inode(store, no)?.body {
       for e in &b.pinned {
@@ -1967,19 +1970,19 @@ impl Overlay<'_> {
       self.check_drift(store, no)?;
     }
     let mut done = 0usize;
-    while done < out.len() {
+    while let Some(unread) = out.get_mut(done..).filter(|unread| !unread.is_empty()) {
       let n = self
         .host
         .read_at(
           file,
-          off + u64::try_from(done).unwrap_or(0),
-          &mut out[done..],
+          off.saturating_add(u64::try_from(done).unwrap_or(0)),
+          unread,
         )
         .map_err(host_refusal)?;
       if n == 0 {
         break;
       }
-      done += n;
+      done = done.saturating_add(n);
     }
     Ok(())
   }
@@ -2170,15 +2173,15 @@ impl Overlay<'_> {
   fn read_whole(&mut self, file: HostFile, size: u64) -> Result<Vec<u8>, VfsError> {
     let mut bytes = vec![0u8; usize::try_from(size).map_err(|_| VfsError::FileTooLarge)?];
     let mut done = 0usize;
-    while done < bytes.len() {
+    while let Some(unread) = bytes.get_mut(done..).filter(|unread| !unread.is_empty()) {
       let n = self
         .host
-        .read_at(file, u64::try_from(done).unwrap_or(0), &mut bytes[done..])
+        .read_at(file, u64::try_from(done).unwrap_or(0), unread)
         .map_err(host_refusal)?;
       if n == 0 {
         break;
       }
-      done += n;
+      done = done.saturating_add(n);
     }
     bytes.truncate(done);
     Ok(bytes)
@@ -2219,18 +2222,21 @@ impl Overlay<'_> {
       let mut bytes = vec![0u8; len];
       let mut done = 0usize;
       while done < len {
+        let Some(unread) = bytes.get_mut(done..) else {
+          break;
+        };
         let n = self
           .host
           .read_at(
             file,
-            start + u64::try_from(done).unwrap_or(0),
-            &mut bytes[done..],
+            start.saturating_add(u64::try_from(done).unwrap_or(0)),
+            unread,
           )
           .map_err(host_refusal)?;
         if n == 0 {
           break;
         }
-        done += n;
+        done = done.saturating_add(n);
       }
       bytes.truncate(done);
       let charge = u64::try_from(bytes.len()).unwrap_or(0);
@@ -2399,12 +2405,12 @@ impl Overlay<'_> {
         .min(window);
       let n = self
         .host
-        .read_at(file, partial.done, &mut buf[..want])
+        .read_at(file, partial.done, buf.get_mut(..want).unwrap_or_default())
         .map_err(host_refusal)?;
       if n == 0 {
         return Err(self.count_digest_refusal(VfsError::DigestUnverified));
       }
-      partial.hasher.update(&buf[..n]);
+      partial.hasher.update(buf.get(..n).unwrap_or_default());
       let n = u64::try_from(n).unwrap_or(u64::MAX);
       partial.done = partial.done.saturating_add(n);
       hashed_this_slice = hashed_this_slice.saturating_add(n);
@@ -2972,9 +2978,9 @@ impl Overlay<'_> {
 
   /// One landed path leaves the overlay.
   fn forget_landed(&mut self, store: &mut Store, path: &str) -> Result<(), VfsError> {
-    let (dir_path, name) = match path.rfind('/') {
-      Some(0) => ("/", &path[1..]),
-      Some(i) => (&path[..i], &path[i + 1..]),
+    let (dir_path, name) = match path.rsplit_once('/') {
+      Some(("", name)) => ("/", name),
+      Some((dir_path, name)) => (dir_path, name),
       None => ("/", path),
     };
     let Ok(dir_located) = self.vol.resolve(store, dir_path) else {

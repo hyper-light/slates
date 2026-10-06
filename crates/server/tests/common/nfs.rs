@@ -4,7 +4,13 @@
 //! shard's real volume and back. A real `mount_nfs localhost:PORT` does the same over the kernel.
 
 // Test harness code: an unwrap here is a failed test, which is what it should be.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![allow(
+  clippy::unwrap_used,
+  clippy::expect_used,
+  clippy::panic,
+  clippy::indexing_slicing,
+  clippy::unwrap_in_result
+)]
 
 use std::io::{Read, Write};
 

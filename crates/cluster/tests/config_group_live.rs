@@ -7,7 +7,7 @@
 //! real network/process deployment is a further gate (the daemon fleet-loop config plane).
 
 // Test harness: an unwrap or expect here is a failed test.
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
 use std::collections::BTreeMap;
 use std::sync::mpsc::{Receiver, channel};

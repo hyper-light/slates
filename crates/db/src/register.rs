@@ -74,16 +74,23 @@ impl ObjectId {
   /// The creator host named in the high 8 bytes — the id's owner by construction and the routing key a
   /// lookup extracts (§4.8 "a volume id carries its creator host").
   pub fn creator(&self) -> HostId {
-    let mut word = [0u8; size_of::<u64>()];
-    word.copy_from_slice(&self.0[..size_of::<u64>()]);
-    HostId(u64::from_be_bytes(word))
+    let (high, _) = self.halves();
+    HostId(u64::from_be_bytes(high))
   }
 
   /// The unique per-creator suffix in the low 8 bytes.
   pub fn local(&self) -> u64 {
-    let mut word = [0u8; size_of::<u64>()];
-    word.copy_from_slice(&self.0[size_of::<u64>()..]);
-    u64::from_be_bytes(word)
+    let (_, low) = self.halves();
+    u64::from_be_bytes(low)
+  }
+
+  /// The high and low eight bytes.
+  fn halves(&self) -> ([u8; size_of::<u64>()], [u8; size_of::<u64>()]) {
+    let (high, low) = self.0.split_at(size_of::<u64>());
+    (
+      high.try_into().unwrap_or_default(),
+      low.try_into().unwrap_or_default(),
+    )
   }
 
   /// The catalog register of this object (§4.8 "catalog entries are registers the owner writes under that
@@ -868,10 +875,11 @@ pub fn encode_refusal(error: &RegisterError) -> Vec<u8> {
 /// `ConfigurationStale` is exactly `1 + 8` bytes led by [`STALE_REFUSAL_TAG`], which no [`Ack`] (72 bytes)
 /// can match.
 pub fn decode_refusal(bytes: &[u8]) -> Option<Refusal> {
-  if bytes.len() != 1 + size_of::<u64>() || bytes[0] != STALE_REFUSAL_TAG {
+  let (&tag, version) = bytes.split_first()?;
+  if tag != STALE_REFUSAL_TAG {
     return None;
   }
-  let version = u64::from_le_bytes(bytes[1..].try_into().ok()?);
+  let version = u64::from_le_bytes(version.try_into().ok()?);
   Some(Refusal::ConfigurationStale { version })
 }
 

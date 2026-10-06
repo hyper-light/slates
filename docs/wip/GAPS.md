@@ -2125,6 +2125,44 @@ A genuinely dead owner delays nothing: the council's death-confirmation window a
 Failing test first: `a_holder_defers_a_promotion_while_its_answers_may_feed_the_departed_owners_lease`.
 [Bug record](../bugs/2026-09-29-holders-promised-without-the-lease-gate.md).
 
+### 2026-10-06: the no-panic sweep's indexing half is closed and the lints are denied workspace-wide
+
+`indexing_slicing`, `string_slice`, `panic_in_result_fn` and `unwrap_in_result` are now `deny` in
+`[workspace.lints.clippy]`. CLAUDE.md had always named them as enforced. Test code is exempt: clippy.toml's
+`allow-indexing-slicing-in-tests`, and an `allow` on test crates and `#[cfg(test)]` modules.
+
+**Swept:** 363 sites on macOS (194 indexing, 143 slicing, 26 string slices), plus 6 more in `cfg` code that only
+the Linux and Windows lints see:
+- the hugepage probe;
+- the Linux FUSE channel (4);
+- the Windows workload pipe.
+
+**Where they were.** 13 crates: `bridge-core`, `bridge-fuse`, `bridge-nfs`, `bridge-virtiofs`, `conformance`,
+`db`, `ipc`, `machine`, `mem`, `merge`, `rt`, `server` and `vfs`.
+
+**How.** Every site reads through `get`/`get_mut`/`split_*`, with a typed refusal where the caller can take one.
+Where a miss cannot happen (a masked ring index, a fixed header field), a comment says why and the miss arm
+does nothing harmful.
+
+**Verified:**
+- macOS clippy, Linux clippy in Docker and Windows clippy through `cargo xwin` are clean.
+- Miri (mem, wire and rt, as CI runs it) passed 65 + 30 + 27 + 2 + 5 + 6.
+- These suites are green:
+  - vfs (the model and tree oracles);
+  - db (the ART against an ordered map);
+  - bridges;
+  - merge;
+  - server daemon, recovery, seal, observe;
+  - client, mcp, land, transport;
+  - CLI with live `mount_nfs`, 19/19.
+
+**Reachable panic found and fixed:**
+[a merge increment whose ops ran past its base](../bugs/2026-10-06-a-merge-increment-past-its-base-panicked-then-clamped.md)
+(A-104). It aborted the merge, and once bounded it was clamped and accepted.
+
+**The per-crate ratchet is narrowed.** The crate-root attribute now denies `arithmetic_side_effects` only, the
+part still pending.
+
 ### 2026-09-29: the no-panic sweep — ratcheted per crate, 13 of 29 crates clean; the SDKs' id parser panicked — fixed
 
 CLAUDE.md (banned item 6) forbids panics in shipped code: out-of-bounds indexing or slicing, string slicing
@@ -2721,9 +2759,10 @@ Open, owed in this workstream:
 
 - **Scheduler bake-off.** Pick the winner and delete the loser selector.
 - **Congestion grid re-run.** Re-run on this code, with a per-run virtual deadline added to the harness first.
-- **No-panic sweep.** 634 indexing, slicing and string-slice sites across the workspace's library and binary
-  targets (clippy `indexing_slicing`/`string_slice`, 2026-09-27) before those lints are denied (CLAUDE.md
-  item 6).
+- **No-panic sweep: arithmetic.** The indexing, slicing and string-slice half is done and enforced (below,
+  2026-10-06). Still owed: 896 arithmetic operations that can overflow, in the 16 crates on `NO_PANIC_PENDING`
+  (clippy `arithmetic_side_effects` on macOS, 2026-10-06). In release these wrap rather than panic, which is a
+  wrong answer rather than an abort.
 
 Whole-workspace verification (2026-09-28): all 175 test binaries run directly, each under a timeout. Before
 the fixes below, 173 passed and 2 failed; both failed only outside `cargo test`, and both are fixed rather

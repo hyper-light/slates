@@ -4,6 +4,8 @@
 //! 2026-09-28; directional, one way taken as half the round trip), and a seeded placement of the regions on a
 //! group's hosts.
 
+// Test code may panic (CLAUDE.md §2 item 6 applies to shipped code).
+#![allow(clippy::indexing_slicing)]
 use slates_db::register::HostId;
 
 use super::timed::{MS, Profile};

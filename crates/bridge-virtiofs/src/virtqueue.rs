@@ -608,8 +608,9 @@ impl Virtqueue {
     let slot = u64::from(self.next_used % self.layout.size);
     let element = self.ring_field(Ring::UsedRing, USED_RING_OFFSET + slot * USED_ELEMENT_LEN);
     let mut bytes = [0u8; USED_ELEMENT_BYTES];
-    bytes[..size_of::<u32>()].copy_from_slice(&u32::from(chain.head).to_le_bytes());
-    bytes[size_of::<u32>()..].copy_from_slice(&written.to_le_bytes());
+    let (id, len) = bytes.split_at_mut(size_of::<u32>());
+    id.copy_from_slice(&u32::from(chain.head).to_le_bytes());
+    len.copy_from_slice(&written.to_le_bytes());
     write_bytes(memory, element, &bytes)?;
     // The reply and the element are visible before the index that publishes them (§2.7.8.2; AUD-29-72).
     memory.order(Edge::Release);
@@ -833,15 +834,16 @@ impl Virtqueue {
 
 /// The three rings must not share bytes.
 fn check_disjoint(rings: &[GuestRange; 3]) -> Result<(), VirtqueueError> {
-  for first in 0..rings.len() {
-    for second in first + 1..rings.len() {
-      if rings[first].overlaps(&rings[second]) {
-        return Err(VirtqueueError::RingsOverlap {
-          first: RINGS[first],
-          second: RINGS[second],
-        });
-      }
+  let named: Vec<(&GuestRange, Ring)> = rings.iter().zip(RINGS).collect();
+  let mut rest = named.as_slice();
+  while let Some((&(range, ring), later)) = rest.split_first() {
+    if let Some(&(_, other)) = later.iter().find(|(other, _)| range.overlaps(other)) {
+      return Err(VirtqueueError::RingsOverlap {
+        first: ring,
+        second: other,
+      });
     }
+    rest = later;
   }
   Ok(())
 }

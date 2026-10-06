@@ -12,7 +12,12 @@
 //! build output (`CARGO_TARGET_TMPDIR`; A-50), named with the process id, unmounted and removed at the end.
 #![cfg(target_os = "linux")]
 // Test harness code: an unwrap here is a failed test.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![allow(
+  clippy::unwrap_used,
+  clippy::expect_used,
+  clippy::panic,
+  clippy::unwrap_in_result
+)]
 
 use std::process::Command;
 use std::sync::mpsc::{Receiver, Sender, channel};

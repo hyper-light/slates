@@ -1337,7 +1337,7 @@ impl Volume {
     }
     let want =
       usize::try_from((size - off).min(u64::try_from(buf.len()).unwrap_or(u64::MAX))).unwrap_or(0);
-    let out = &mut buf[..want];
+    let out = buf.get_mut(..want).unwrap_or_default();
     out.fill(0);
     match &inode.body {
       Body::Inline(bytes) => copy_range(bytes, 0, off, out),
@@ -2398,7 +2398,7 @@ impl Volume {
     }
     let want =
       usize::try_from((size - off).min(u64::try_from(buf.len()).unwrap_or(u64::MAX))).unwrap_or(0);
-    let out = &mut buf[..want];
+    let out = buf.get_mut(..want).unwrap_or_default();
     out.fill(0);
     match &inode.body {
       Body::Inline(bytes) => copy_range(bytes, 0, off, out),
@@ -5217,15 +5217,16 @@ impl Volume {
         .unwrap_or(usize::MAX)
         .saturating_sub(at);
       let take = remaining.len().min(room);
-      if let Err(refusal) = store
-        .content
-        .write_open(&mut current, at, &remaining[..take])
+      if let Err(refusal) =
+        store
+          .content
+          .write_open(&mut current, at, remaining.get(..take).unwrap_or_default())
       {
         // `write_open` refuses before it changes the extent (its block grows first, or not at all).
         return Landed::open(current, sealed, written(cursor), Some(refusal));
       }
-      cursor += u64::try_from(take).unwrap_or(0);
-      remaining = &remaining[take..];
+      cursor = cursor.saturating_add(u64::try_from(take).unwrap_or(0));
+      remaining = remaining.get(take..).unwrap_or_default();
     }
     Landed::open(current, sealed, written(cursor), None)
   }
@@ -5378,23 +5379,26 @@ impl ByEpoch {
     }
   }
 
-  fn slot(&mut self, epoch: Epoch) -> &mut u64 {
+  fn slot(&mut self, epoch: Epoch) -> Option<&mut u64> {
     let index = usize::try_from(epoch.0.saturating_sub(self.floor)).unwrap_or(0);
     if self.buckets.len() <= index {
-      self.buckets.resize(index + 1, 0);
+      self.buckets.resize(index.saturating_add(1), 0);
     }
-    &mut self.buckets[index]
+    self.buckets.get_mut(index)
   }
 
   fn add(&mut self, epoch: Epoch, len: u64) {
-    if len > 0 {
-      *self.slot(epoch) += len;
+    if len > 0
+      && let Some(slot) = self.slot(epoch)
+    {
+      *slot = slot.saturating_add(len);
     }
   }
 
   fn sub(&mut self, epoch: Epoch, len: u64) {
-    if len > 0 {
-      let slot = self.slot(epoch);
+    if len > 0
+      && let Some(slot) = self.slot(epoch)
+    {
       *slot = slot.saturating_sub(len);
     }
   }

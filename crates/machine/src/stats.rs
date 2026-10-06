@@ -206,14 +206,14 @@ pub fn bootstrap_interval(sample: &Sample, rng: &mut Xorshift) -> Option<Interva
   for _ in 0..BOOTSTRAP_RESAMPLES {
     scratch.clear();
     for _ in 0..values.len() {
-      scratch.push(values[rng.below(values.len())]);
+      scratch.extend(values.get(rng.below(values.len())));
     }
     scratch.sort_unstable();
-    medians.push(scratch[Percentile::P50.index(scratch.len())]);
+    medians.extend(scratch.get(Percentile::P50.index(scratch.len())));
   }
   medians.sort_unstable();
-  let lower = medians[Percentile::LOWER_95.index(medians.len())];
-  let upper = medians[Percentile::UPPER_95.index(medians.len())];
+  let lower = *medians.get(Percentile::LOWER_95.index(medians.len()))?;
+  let upper = *medians.get(Percentile::UPPER_95.index(medians.len()))?;
   Some(Interval {
     median,
     lower,
@@ -286,15 +286,20 @@ pub fn bootstrap_mean_interval(values: &[u64], rng: &mut Xorshift) -> Option<Mea
   for _ in 0..BOOTSTRAP_RESAMPLES {
     let mut sum: u128 = 0;
     for _ in 0..values.len() {
-      sum += u128::from(values[rng.below(values.len())]);
+      sum = sum.saturating_add(
+        values
+          .get(rng.below(values.len()))
+          .copied()
+          .map_or(0, u128::from),
+      );
     }
-    means.push(u64::try_from(sum / count).unwrap_or(u64::MAX));
+    means.push(u64::try_from(sum.checked_div(count).unwrap_or(0)).unwrap_or(u64::MAX));
   }
   means.sort_unstable();
   Some(MeanInterval {
     mean: point,
-    lower: means[Percentile::LOWER_95.index(means.len())],
-    upper: means[Percentile::UPPER_95.index(means.len())],
+    lower: *means.get(Percentile::LOWER_95.index(means.len()))?,
+    upper: *means.get(Percentile::UPPER_95.index(means.len()))?,
   })
 }
 

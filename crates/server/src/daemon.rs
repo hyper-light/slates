@@ -2376,7 +2376,8 @@ pub fn host_id_of(identity: &Identity) -> u64 {
 fn boot_incarnation(secret: &[u8; slates_anchor::layout::ISSUER_SECRET_BYTES]) -> u64 {
   let digest = blake3::keyed_hash(secret, b"slates/member-incarnation/v1");
   let mut word = [0; size_of::<u64>()];
-  word.copy_from_slice(&digest.as_bytes()[..size_of::<u64>()]);
+  let (head, _) = digest.as_bytes().split_at(size_of::<u64>());
+  word.copy_from_slice(head);
   u64::from_le_bytes(word).max(1)
 }
 
@@ -3344,8 +3345,17 @@ async fn control_loop(
         // inside one round was admitted against a live set that did not yet count the earlier ones —
         // the bound of one admitted two (2026-09-14). A region that cannot be created gives the
         // reservation back at once.
+        let spread = usize::try_from(client_id)
+          .unwrap_or(0)
+          .checked_rem(shards.len())
+          .unwrap_or(0);
+        let Some(&shard) = shards.get(spread) else {
+          return Err(slates_ipc::IpcError::DaemonUnavailable {
+            endpoint: config.instance.clone(),
+            why: "the runtime has no shard to serve a client",
+          });
+        };
         state::with_handed(|h| h.insert(client_id));
-        let shard = shards[usize::try_from(client_id).unwrap_or(0) % shards.len().max(1)];
         let region = match ClientRegion::create(
           &format!("slates-cr-{}-{client_id}", config.instance),
           client_id,

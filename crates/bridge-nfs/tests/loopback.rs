@@ -1,4 +1,9 @@
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![allow(
+  clippy::unwrap_used,
+  clippy::expect_used,
+  clippy::panic,
+  clippy::indexing_slicing
+)]
 //! The NFS loopback server end to end over a real socket (§4.6, R5): a client thread mounts the export
 //! and reads a file it seeded, with no kernel mount and no privilege — exactly what a `mount_nfs` client
 //! does over the wire, driven here by a hand-rolled ONC RPC client so it runs in CI on any host. The

@@ -10,6 +10,8 @@
 //! allocator, so it is every heap byte the process holds for the tree: slabs, names, directory
 //! vectors and maps; content lives in the mapped region and is reported separately.
 
+// Test code may panic (CLAUDE.md §2 item 6 applies to shipped code).
+#![allow(clippy::indexing_slicing)]
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::error::Error;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};

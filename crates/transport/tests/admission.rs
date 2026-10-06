@@ -3,7 +3,12 @@
 //! Histories drive TLS and request/reply over the deterministic UDP fabric, holding stale
 //! endpoint owners deliberately so release-on-drop cannot conceal an admission defect.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![allow(
+  clippy::unwrap_used,
+  clippy::expect_used,
+  clippy::panic,
+  clippy::indexing_slicing
+)]
 
 use std::future::{Future, poll_fn};
 use std::task::Poll;

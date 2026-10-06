@@ -94,42 +94,46 @@ impl Children {
 
   fn get(&self, byte: u8) -> Option<NodeIx> {
     match self {
-      Children::Small { keys, nodes, len } => keys[..usize::from(*len)]
-        .iter()
-        .position(|k| *k == byte)
-        .map(|i| nodes[i]),
-      Children::Medium { keys, nodes, len } => keys[..usize::from(*len)]
-        .iter()
-        .position(|k| *k == byte)
-        .map(|i| nodes[i]),
-      Children::Large { index, nodes, .. } => {
-        let slot = index[usize::from(byte)];
-        (slot != NONE48).then(|| nodes[usize::from(slot)])
+      Children::Small { keys, nodes, len } => {
+        sorted_position(keys, *len, byte).and_then(|at| nodes.get(at).copied())
       }
-      Children::Full { nodes, .. } => nodes[usize::from(byte)],
+      Children::Medium { keys, nodes, len } => {
+        sorted_position(keys, *len, byte).and_then(|at| nodes.get(at).copied())
+      }
+      Children::Large { index, nodes, .. } => {
+        let slot = *index.get(usize::from(byte))?;
+        if slot == NONE48 {
+          None
+        } else {
+          nodes.get(usize::from(slot)).copied()
+        }
+      }
+      Children::Full { nodes, .. } => nodes.get(usize::from(byte)).copied().flatten(),
     }
   }
 
   /// Replaces the child at `byte` (which must exist).
   fn set(&mut self, byte: u8, node: NodeIx) {
-    match self {
+    let slot = match self {
       Children::Small { keys, nodes, len } => {
-        if let Some(i) = keys[..usize::from(*len)].iter().position(|k| *k == byte) {
-          nodes[i] = node;
-        }
+        sorted_position(keys, *len, byte).and_then(|at| nodes.get_mut(at))
       }
       Children::Medium { keys, nodes, len } => {
-        if let Some(i) = keys[..usize::from(*len)].iter().position(|k| *k == byte) {
-          nodes[i] = node;
-        }
+        sorted_position(keys, *len, byte).and_then(|at| nodes.get_mut(at))
       }
-      Children::Large { index, nodes, .. } => {
-        let slot = index[usize::from(byte)];
-        if slot != NONE48 {
-          nodes[usize::from(slot)] = node;
+      Children::Large { index, nodes, .. } => index
+        .get(usize::from(byte))
+        .filter(|slot| **slot != NONE48)
+        .and_then(|slot| nodes.get_mut(usize::from(*slot))),
+      Children::Full { nodes, .. } => {
+        if let Some(slot) = nodes.get_mut(usize::from(byte)) {
+          *slot = Some(node);
         }
+        return;
       }
-      Children::Full { nodes, .. } => nodes[usize::from(byte)] = Some(node),
+    };
+    if let Some(slot) = slot {
+      *slot = node;
     }
   }
 
@@ -146,14 +150,21 @@ impl Children {
         insert_sorted(keys, nodes, len, byte, node);
       }
       Children::Large { index, nodes, len } => {
-        let slot = *len;
-        nodes[usize::from(slot)] = node;
-        index[usize::from(byte)] = slot;
-        *len += 1;
+        // `grow` left room, so slot `len` is free.
+        if let (Some(free), Some(at)) = (
+          nodes.get_mut(usize::from(*len)),
+          index.get_mut(usize::from(byte)),
+        ) {
+          *free = node;
+          *at = *len;
+          *len = len.saturating_add(1);
+        }
       }
       Children::Full { nodes, len } => {
-        nodes[usize::from(byte)] = Some(node);
-        *len += 1;
+        if let Some(slot) = nodes.get_mut(usize::from(byte)) {
+          *slot = Some(node);
+          *len = len.saturating_add(1);
+        }
       }
     }
   }
@@ -195,28 +206,11 @@ impl Children {
     let removed = match self {
       Children::Small { keys, nodes, len } => remove_sorted(keys, nodes, len, byte),
       Children::Medium { keys, nodes, len } => remove_sorted(keys, nodes, len, byte),
-      Children::Large { index, nodes, len } => {
-        let slot = index[usize::from(byte)];
-        if slot == NONE48 {
-          return None;
-        }
-        index[usize::from(byte)] = NONE48;
-        let removed = nodes[usize::from(slot)];
-        // Move the last node into the freed slot so the array stays dense.
-        let last = *len - 1;
-        if slot != last {
-          nodes[usize::from(slot)] = nodes[usize::from(last)];
-          if let Some(moved) = index.iter().position(|s| *s == last) {
-            index[moved] = slot;
-          }
-        }
-        *len -= 1;
-        Some(removed)
-      }
+      Children::Large { index, nodes, len } => remove_large(index, nodes, len, byte),
       Children::Full { nodes, len } => {
-        let removed = nodes[usize::from(byte)].take();
+        let removed = nodes.get_mut(usize::from(byte)).and_then(Option::take);
         if removed.is_some() {
-          *len -= 1;
+          *len = len.saturating_sub(1);
         }
         removed
       }
@@ -256,29 +250,40 @@ impl Children {
   /// Every child, in key order.
   fn pairs(&self) -> Vec<(u8, NodeIx)> {
     match self {
-      Children::Small { keys, nodes, len } => keys[..usize::from(*len)]
+      Children::Small { keys, nodes, len } => used(keys, *len)
         .iter()
         .copied()
-        .zip(nodes[..usize::from(*len)].iter().copied())
+        .zip(nodes.iter().copied())
         .collect(),
-      Children::Medium { keys, nodes, len } => keys[..usize::from(*len)]
+      Children::Medium { keys, nodes, len } => used(keys, *len)
         .iter()
         .copied()
-        .zip(nodes[..usize::from(*len)].iter().copied())
+        .zip(nodes.iter().copied())
         .collect(),
       Children::Large { index, nodes, .. } => (0..=u8::MAX)
-        .filter_map(|b| {
-          let slot = index[usize::from(b)];
-          (slot != NONE48).then(|| (b, nodes[usize::from(slot)]))
-        })
+        .zip(index.iter())
+        .filter(|(_, slot)| **slot != NONE48)
+        .filter_map(|(byte, slot)| nodes.get(usize::from(*slot)).map(|node| (byte, *node)))
         .collect(),
       Children::Full { nodes, .. } => (0..=u8::MAX)
-        .filter_map(|b| nodes[usize::from(b)].map(|n| (b, n)))
+        .zip(nodes.iter())
+        .filter_map(|(byte, node)| node.map(|node| (byte, node)))
         .collect(),
     }
   }
 }
 
+/// The first `len` keys of a sorted shape: its children's keys.
+fn used(keys: &[u8], len: u8) -> &[u8] {
+  keys.get(..usize::from(len)).unwrap_or(keys)
+}
+
+/// Where `byte` sits among a sorted shape's first `len` keys.
+fn sorted_position(keys: &[u8], len: u8, byte: u8) -> Option<usize> {
+  used(keys, len).iter().position(|key| *key == byte)
+}
+
+/// Inserts into a sorted shape with room (`insert` grows a full one first).
 fn insert_sorted<const N: usize>(
   keys: &mut [u8; N],
   nodes: &mut [NodeIx; N],
@@ -287,12 +292,18 @@ fn insert_sorted<const N: usize>(
   node: NodeIx,
 ) {
   let n = usize::from(*len);
-  let at = keys[..n].iter().position(|k| *k > byte).unwrap_or(n);
-  keys.copy_within(at..n, at + 1);
-  nodes.copy_within(at..n, at + 1);
-  keys[at] = byte;
-  nodes[at] = node;
-  *len += 1;
+  if n >= N {
+    return;
+  }
+  let at = used(keys, *len).iter().position(|k| *k > byte).unwrap_or(n);
+  // `at <= n < N`, so both ranges lie inside the arrays.
+  keys.copy_within(at..n, at.saturating_add(1));
+  nodes.copy_within(at..n, at.saturating_add(1));
+  if let (Some(key), Some(child)) = (keys.get_mut(at), nodes.get_mut(at)) {
+    *key = byte;
+    *child = node;
+    *len = len.saturating_add(1);
+  }
 }
 
 fn remove_sorted<const N: usize>(
@@ -301,12 +312,42 @@ fn remove_sorted<const N: usize>(
   len: &mut u8,
   byte: u8,
 ) -> Option<NodeIx> {
-  let n = usize::from(*len);
-  let at = keys[..n].iter().position(|k| *k == byte)?;
-  let removed = nodes[at];
-  keys.copy_within(at + 1..n, at);
-  nodes.copy_within(at + 1..n, at);
-  *len -= 1;
+  let n = usize::from(*len).min(N);
+  let at = sorted_position(keys, *len, byte)?;
+  let removed = *nodes.get(at)?;
+  // `at < n <= N`, so both ranges lie inside the arrays.
+  keys.copy_within(at.saturating_add(1)..n, at);
+  nodes.copy_within(at.saturating_add(1)..n, at);
+  *len = len.saturating_sub(1);
+  Some(removed)
+}
+
+/// Removes from a Node48, moving the last child into the freed slot so the array stays dense.
+fn remove_large(
+  index: &mut [u8; NODE256],
+  nodes: &mut [NodeIx; NODE48],
+  len: &mut u8,
+  byte: u8,
+) -> Option<NodeIx> {
+  let at = index.get_mut(usize::from(byte))?;
+  let slot = *at;
+  if slot == NONE48 {
+    return None;
+  }
+  *at = NONE48;
+  let removed = *nodes.get(usize::from(slot))?;
+  let last = len.saturating_sub(1);
+  if slot != last {
+    if let Some(&moved_node) = nodes.get(usize::from(last))
+      && let Some(freed) = nodes.get_mut(usize::from(slot))
+    {
+      *freed = moved_node;
+    }
+    if let Some(moved) = index.iter_mut().find(|s| **s == last) {
+      *moved = slot;
+    }
+  }
+  *len = last;
   Some(removed)
 }
 
@@ -335,57 +376,58 @@ impl<V> Art<V> {
     self.len == 0
   }
 
+  fn node(&self, ix: NodeIx) -> Option<&Node<V>> {
+    self.nodes.get(usize::try_from(ix).ok()?)
+  }
+
+  fn node_mut(&mut self, ix: NodeIx) -> Option<&mut Node<V>> {
+    self.nodes.get_mut(usize::try_from(ix).ok()?)
+  }
+
   fn alloc(&mut self, node: Node<V>) -> NodeIx {
-    if let Some(ix) = self.free.pop() {
-      self.nodes[ix as usize] = node;
-      ix
-    } else {
-      self.nodes.push(node);
-      u32::try_from(self.nodes.len() - 1).unwrap_or(u32::MAX)
+    if let Some(ix) = self.free.pop()
+      && let Some(slot) = self.node_mut(ix)
+    {
+      *slot = node;
+      return ix;
     }
+    self.nodes.push(node);
+    u32::try_from(self.nodes.len().saturating_sub(1)).unwrap_or(u32::MAX)
   }
 
   fn release(&mut self, ix: NodeIx) {
-    self.nodes[ix as usize].value = None;
-    self.nodes[ix as usize].children = Children::empty();
-    self.nodes[ix as usize].prefix.clear();
-    self.free.push(ix);
+    if let Some(node) = self.node_mut(ix) {
+      node.value = None;
+      node.children = Children::empty();
+      node.prefix.clear();
+      self.free.push(ix);
+    }
+  }
+
+  /// The node `key` ends at, if it is in the tree.
+  fn find(&self, key: &[u8]) -> Option<NodeIx> {
+    let mut ix = self.root?;
+    let mut rest = key;
+    loop {
+      let node = self.node(ix)?;
+      rest = rest.strip_prefix(node.prefix.as_slice())?;
+      let Some((&byte, tail)) = rest.split_first() else {
+        return Some(ix);
+      };
+      ix = node.children.get(byte)?;
+      rest = tail;
+    }
   }
 
   /// The value at `key`.
   pub fn get(&self, key: &[u8]) -> Option<&V> {
-    let mut ix = self.root?;
-    let mut rest = key;
-    loop {
-      let node = &self.nodes[ix as usize];
-      if !rest.starts_with(&node.prefix) {
-        return None;
-      }
-      rest = &rest[node.prefix.len()..];
-      let Some((&byte, tail)) = rest.split_first() else {
-        return node.value.as_ref();
-      };
-      ix = node.children.get(byte)?;
-      rest = tail;
-    }
+    self.node(self.find(key)?)?.value.as_ref()
   }
 
   /// The value at `key`, mutably.
   pub fn get_mut(&mut self, key: &[u8]) -> Option<&mut V> {
-    let mut ix = self.root?;
-    let mut rest = key;
-    loop {
-      let node = &self.nodes[ix as usize];
-      if !rest.starts_with(&node.prefix) {
-        return None;
-      }
-      rest = &rest[node.prefix.len()..];
-      let Some((&byte, tail)) = rest.split_first() else {
-        return self.nodes[ix as usize].value.as_mut();
-      };
-      ix = node.children.get(byte)?;
-      rest = tail;
-    }
+    let ix = self.find(key)?;
+    self.node_mut(ix)?.value.as_mut()
   }
 
   /// Inserts `value` at `key`, returning the previous value.
@@ -397,58 +439,66 @@ impl<V> Art<V> {
         children: Children::empty(),
       });
       self.root = Some(ix);
-      self.len += 1;
+      self.len = self.len.saturating_add(1);
       return None;
     };
     let (ix, previous) = self.insert_at(root, key, value);
     self.root = Some(ix);
     if previous.is_none() {
-      self.len += 1;
+      self.len = self.len.saturating_add(1);
     }
     previous
   }
 
   /// Inserts beneath `ix`; returns the node now standing where `ix` stood (a split may put a
-  /// new parent above it) and the previous value.
+  /// new parent above it) and the previous value. Every `ix` here came from `alloc`, so the node is
+  /// always present; the miss arm keeps the tree as it was.
   fn insert_at(&mut self, ix: NodeIx, key: &[u8], value: V) -> (NodeIx, Option<V>) {
-    let shared = common_prefix(&self.nodes[ix as usize].prefix, key);
-    let prefix_len = self.nodes[ix as usize].prefix.len();
-    if shared < prefix_len {
+    let Some(node) = self.node_mut(ix) else {
+      return (ix, None);
+    };
+    let shared = common_prefix(&node.prefix, key);
+    if let Some((&old_byte, old_tail)) = node.prefix.get(shared..).and_then(<[u8]>::split_first) {
       // Split: a new parent with the shared run; the old node keeps the rest of its prefix.
-      let parent_prefix = key[..shared].to_vec();
-      let old_rest = self.nodes[ix as usize].prefix[shared..].to_vec();
-      let old_byte = old_rest[0];
-      self.nodes[ix as usize].prefix = old_rest[1..].to_vec();
+      node.prefix = old_tail.to_vec();
       let mut parent = Node {
-        prefix: parent_prefix,
+        prefix: key.get(..shared).unwrap_or_default().to_vec(),
         value: None,
         children: Children::empty(),
       };
       parent.children.insert(old_byte, ix);
       let parent_ix = self.alloc(parent);
-      let rest = &key[shared..];
-      match rest.split_first() {
-        None => self.nodes[parent_ix as usize].value = Some(value),
+      match key.get(shared..).unwrap_or_default().split_first() {
+        None => {
+          if let Some(parent) = self.node_mut(parent_ix) {
+            parent.value = Some(value);
+          }
+        }
         Some((&byte, tail)) => {
           let leaf = self.alloc(Node {
             prefix: tail.to_vec(),
             value: Some(value),
             children: Children::empty(),
           });
-          self.nodes[parent_ix as usize].children.insert(byte, leaf);
+          if let Some(parent) = self.node_mut(parent_ix) {
+            parent.children.insert(byte, leaf);
+          }
         }
       }
       return (parent_ix, None);
     }
-    let rest = &key[prefix_len..];
+    // No split: the whole prefix is shared, so `key` continues past it.
+    let rest = key.get(shared..).unwrap_or_default();
     let Some((&byte, tail)) = rest.split_first() else {
-      return (ix, self.nodes[ix as usize].value.replace(value));
+      return (ix, node.value.replace(value));
     };
-    match self.nodes[ix as usize].children.get(byte) {
+    match node.children.get(byte) {
       Some(child) => {
         let (new_child, previous) = self.insert_at(child, tail, value);
-        if new_child != child {
-          self.nodes[ix as usize].children.set(byte, new_child);
+        if new_child != child
+          && let Some(node) = self.node_mut(ix)
+        {
+          node.children.set(byte, new_child);
         }
         (ix, previous)
       }
@@ -458,7 +508,9 @@ impl<V> Art<V> {
           value: Some(value),
           children: Children::empty(),
         });
-        self.nodes[ix as usize].children.insert(byte, leaf);
+        if let Some(node) = self.node_mut(ix) {
+          node.children.insert(byte, leaf);
+        }
         (ix, None)
       }
     }
@@ -470,7 +522,7 @@ impl<V> Art<V> {
     let (keep, removed) = self.remove_at(root, key);
     self.root = keep;
     if removed.is_some() {
-      self.len -= 1;
+      self.len = self.len.saturating_sub(1);
     }
     removed
   }
@@ -479,23 +531,26 @@ impl<V> Art<V> {
   /// the subtree became empty) and the removed value. A node left with no value and one child
   /// merges with that child (path compression restored).
   fn remove_at(&mut self, ix: NodeIx, key: &[u8]) -> (Option<NodeIx>, Option<V>) {
-    let prefix_len = self.nodes[ix as usize].prefix.len();
-    if !key.starts_with(&self.nodes[ix as usize].prefix) {
+    let Some(node) = self.node(ix) else {
       return (Some(ix), None);
-    }
-    let rest = &key[prefix_len..];
+    };
+    let Some(rest) = key.strip_prefix(node.prefix.as_slice()) else {
+      return (Some(ix), None);
+    };
     let removed = match rest.split_first() {
-      None => self.nodes[ix as usize].value.take(),
+      None => self.node_mut(ix).and_then(|node| node.value.take()),
       Some((&byte, tail)) => {
-        let Some(child) = self.nodes[ix as usize].children.get(byte) else {
+        let Some(child) = node.children.get(byte) else {
           return (Some(ix), None);
         };
         let (keep, removed) = self.remove_at(child, tail);
-        match keep {
-          Some(k) if k != child => self.nodes[ix as usize].children.set(byte, k),
-          Some(_) => {}
-          None => {
-            self.nodes[ix as usize].children.remove(byte);
+        if let Some(node) = self.node_mut(ix) {
+          match keep {
+            Some(k) if k != child => node.children.set(byte, k),
+            Some(_) => {}
+            None => {
+              node.children.remove(byte);
+            }
           }
         }
         removed
@@ -509,20 +564,27 @@ impl<V> Art<V> {
 
   /// After a removal: an empty node goes away; a valueless node with one child merges into it.
   fn compact(&mut self, ix: NodeIx) -> Option<NodeIx> {
-    let node = &self.nodes[ix as usize];
+    let node = self.node(ix)?;
     let children = node.children.len();
     if node.value.is_some() || children > 1 {
       return Some(ix);
     }
-    if children == 0 {
+    let only = if children == 1 {
+      node.children.pairs().first().copied()
+    } else {
+      None
+    };
+    let Some((byte, child)) = only else {
       self.release(ix);
       return None;
-    }
-    let (byte, child) = self.nodes[ix as usize].children.pairs()[0];
-    let mut merged = self.nodes[ix as usize].prefix.clone();
+    };
+    let mut merged = node.prefix.clone();
     merged.push(byte);
-    merged.extend_from_slice(&self.nodes[child as usize].prefix);
-    self.nodes[child as usize].prefix = merged;
+    let Some(child_node) = self.node_mut(child) else {
+      return Some(ix);
+    };
+    merged.append(&mut child_node.prefix);
+    child_node.prefix = merged;
     self.release(ix);
     Some(child)
   }
@@ -537,7 +599,9 @@ impl<V> Art<V> {
   }
 
   fn collect<'a>(&'a self, ix: NodeIx, mut so_far: Vec<u8>, out: &mut Vec<(Vec<u8>, &'a V)>) {
-    let node = &self.nodes[ix as usize];
+    let Some(node) = self.node(ix) else {
+      return;
+    };
     so_far.extend_from_slice(&node.prefix);
     if let Some(v) = &node.value {
       out.push((so_far.clone(), v));

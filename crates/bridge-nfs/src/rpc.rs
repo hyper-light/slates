@@ -155,13 +155,18 @@ impl RecordReader {
   /// to the next call. Refusal terminates the stream; no further input may be fed to that reader.
   pub fn read(&mut self, bytes: &[u8]) -> Result<(Option<Vec<u8>>, usize), RpcError> {
     let mut consumed = 0;
-    while consumed < bytes.len() {
-      if self.marker_bytes < self.marker.len() {
-        let count = (self.marker.len() - self.marker_bytes).min(bytes.len() - consumed);
-        self.marker[self.marker_bytes..self.marker_bytes + count]
-          .copy_from_slice(&bytes[consumed..consumed + count]);
-        self.marker_bytes += count;
-        consumed += count;
+    while let Some(unread) = bytes.get(consumed..).filter(|unread| !unread.is_empty()) {
+      if let Some(marker_rest) = self
+        .marker
+        .get_mut(self.marker_bytes..)
+        .filter(|rest| !rest.is_empty())
+      {
+        let count = marker_rest.len().min(unread.len());
+        if let (Some(into), Some(from)) = (marker_rest.get_mut(..count), unread.get(..count)) {
+          into.copy_from_slice(from);
+        }
+        self.marker_bytes = self.marker_bytes.saturating_add(count);
+        consumed = consumed.saturating_add(count);
         if self.marker_bytes < self.marker.len() {
           break;
         }
@@ -174,14 +179,15 @@ impl RecordReader {
         {
           return Err(RpcError::RecordTooLarge);
         }
-        self.fragments += 1;
+        self.fragments = self.fragments.saturating_add(1);
       }
-      let count = self.remaining.min(bytes.len() - consumed);
+      let unread = bytes.get(consumed..).unwrap_or_default();
+      let count = self.remaining.min(unread.len());
       self
         .message
-        .extend_from_slice(&bytes[consumed..consumed + count]);
-      consumed += count;
-      self.remaining -= count;
+        .extend_from_slice(unread.get(..count).unwrap_or_default());
+      consumed = consumed.saturating_add(count);
+      self.remaining = self.remaining.saturating_sub(count);
       if self.remaining == 0 {
         self.marker_bytes = 0;
         if self.last {

@@ -39,7 +39,11 @@ fn write_message(unique: u64, errno: i32, body: &[u8], out: &mut [u8]) -> Result
   w.u32(errno.saturating_neg().cast_unsigned());
   w.u64(unique);
   w.bytes(body);
-  out[..total].copy_from_slice(w.as_bytes());
+  let have = out.len();
+  out
+    .get_mut(..total)
+    .ok_or(FuseError::ReplyTooSmall { have, need: total })?
+    .copy_from_slice(w.as_bytes());
   Ok(total)
 }
 

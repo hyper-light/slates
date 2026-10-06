@@ -6,7 +6,7 @@
 //! teardown with held handles, stale wakers and kept values the audit asks it to see).
 
 // Test harness code: an unwrap here is a failed test, which is what it should be.
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::channel;

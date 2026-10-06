@@ -8,7 +8,12 @@
 //! max rows are informational (a scheduler's worst case is not a code property). The
 //! `ac-2.1` lines gate the spinning p99 against the floor.
 // Bench harness code: an unwrap here is a failed run.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![allow(
+  clippy::unwrap_used,
+  clippy::expect_used,
+  clippy::panic,
+  clippy::indexing_slicing
+)]
 
 use std::time::{Duration, Instant};
 

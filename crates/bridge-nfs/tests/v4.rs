@@ -3,7 +3,13 @@
 //! checked against RFC 8881's rules — the session handshake, exactly-once replies from the slot cache,
 //! open state and its refusals, and hostile compounds.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![allow(
+  clippy::unwrap_used,
+  clippy::expect_used,
+  clippy::panic,
+  clippy::indexing_slicing,
+  clippy::unwrap_in_result
+)]
 
 use slates_bridge_core::{Attachments, Bridge, ObjectId, OpContext, Rights, View, VolumeBridge};
 use slates_bridge_nfs::Export;

@@ -7,7 +7,12 @@
 //! demands is asserted, not assumed; the simulated guest memory's access log proves refusals came
 //! before any access; a real `VolumeBridge` on a scratch volume shows the references reclaimed.
 // Test harness code: an unwrap here is a failed test.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![allow(
+  clippy::unwrap_used,
+  clippy::expect_used,
+  clippy::panic,
+  clippy::indexing_slicing
+)]
 
 mod common;
 

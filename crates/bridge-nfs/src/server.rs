@@ -100,13 +100,13 @@ pub fn serve_connection<S: Read + Write>(
         if stream.write_all(&write_record(&reply)).is_err() {
           return;
         }
-        buffer.drain(..consumed);
+        buffer.drain(..consumed.min(buffer.len()));
       }
       Ok((None, consumed)) => {
-        buffer.drain(..consumed);
+        buffer.drain(..consumed.min(buffer.len()));
         match stream.read(&mut chunk) {
           Ok(0) | Err(_) => return,
-          Ok(n) => buffer.extend_from_slice(&chunk[..n]),
+          Ok(n) => buffer.extend_from_slice(chunk.get(..n).unwrap_or(&chunk)),
         }
       }
       Err(_) => return,
@@ -209,18 +209,18 @@ pub async fn serve_connection_async(
       Ok((Some(body), consumed)) => {
         let reply = dispatch(service, v4, &body, port);
         stream.write_all(&write_record(&reply)).await?;
-        buffer.drain(..consumed);
+        buffer.drain(..consumed.min(buffer.len()));
         // Readiness can remain true across many calls. One completed RPC is the cooperative
         // work boundary even when neither direction reaches WouldBlock (§4.3, §4.6).
         slates_rt::futures::yield_now().await;
       }
       Ok((None, consumed)) => {
-        buffer.drain(..consumed);
+        buffer.drain(..consumed.min(buffer.len()));
         let read = stream.read(&mut chunk).await?;
         if read == 0 {
           return Ok(());
         }
-        buffer.extend_from_slice(&chunk[..read]);
+        buffer.extend_from_slice(chunk.get(..read).unwrap_or(&chunk));
       }
       Err(_) => return Ok(()),
     }

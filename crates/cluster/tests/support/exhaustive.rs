@@ -16,6 +16,8 @@
 //! Every search holds a memory ceiling derived from the measured cost of a state and fails rather than
 //! exhausting the machine: the first model's search held 18 GB after 300 s without finishing (2026-09-28).
 
+// Test code may panic (CLAUDE.md §2 item 6 applies to shipped code).
+#![allow(clippy::indexing_slicing)]
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashSet, VecDeque};
 use std::fmt;

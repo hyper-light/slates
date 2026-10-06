@@ -1992,7 +1992,7 @@ pub(crate) fn connection_id_of(datagram: &[u8]) -> Option<ConnectionId> {
 #[cfg(test)]
 mod tests {
   // Test harness: an unwrap here is a failed test.
-  #![allow(clippy::unwrap_used)]
+  #![allow(clippy::unwrap_used, clippy::panic_in_result_fn)]
 
   use rustls::pki_types::PrivateKeyDer;
 

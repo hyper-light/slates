@@ -85,10 +85,9 @@ impl Holder {
         epoch,
         identity: *identity,
       };
-      if position < self.log.len() {
-        self.log[position] = record;
-      } else {
-        self.log.push(record);
+      match self.log.get_mut(position) {
+        Some(held) => *held = record,
+        None => self.log.push(record),
       }
     }
     self.log.truncate(log.len());

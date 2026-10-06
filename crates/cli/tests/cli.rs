@@ -3,7 +3,13 @@
 //! outputs parsed back, the exit codes of the refusal taxonomy, and the daemon leaving when
 //! its anchor is killed.
 // Test harness code: an unwrap here is a failed test, which is what it should be.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![allow(
+  clippy::unwrap_used,
+  clippy::expect_used,
+  clippy::panic,
+  clippy::indexing_slicing,
+  clippy::string_slice
+)]
 
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};

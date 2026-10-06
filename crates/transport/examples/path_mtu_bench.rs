@@ -13,7 +13,12 @@
 //! **Failures** (the process exits non-zero): a run whose reply is not the request's digest, or that fails.
 
 // A benchmark harness: an unwrap here is a failed run, which is what it should be.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![allow(
+  clippy::unwrap_used,
+  clippy::expect_used,
+  clippy::panic,
+  clippy::indexing_slicing
+)]
 
 use std::sync::mpsc::{Receiver, channel};
 use std::time::Instant;

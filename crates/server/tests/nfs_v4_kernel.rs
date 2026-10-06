@@ -9,7 +9,12 @@
 //! Gated: it needs Linux, root (or passwordless `sudo`) for `mount`, and the `mount.nfs4` helper;
 //! set `SLATES_TEST_NFS4_KERNEL=1` to run it. Without any of these it
 //! skips loudly, printing why, and passes.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![allow(
+  clippy::unwrap_used,
+  clippy::expect_used,
+  clippy::panic,
+  clippy::indexing_slicing
+)]
 #![cfg(unix)]
 
 use std::net::TcpStream;

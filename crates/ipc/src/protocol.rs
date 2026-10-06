@@ -2676,14 +2676,14 @@ pub fn unpack<M: Wire>(
           reason: "bulk reference of the wrong size",
         });
       }
-      let offset = usize::try_from(u64::from_le_bytes(
-        payload[..8].try_into().unwrap_or([0; 8]),
-      ))
-      .unwrap_or(usize::MAX);
-      let len = usize::try_from(u64::from_le_bytes(
-        payload[8..].try_into().unwrap_or([0; 8]),
-      ))
-      .unwrap_or(usize::MAX);
+      let (offset, len) = payload
+        .split_at_checked(size_of::<u64>())
+        .unwrap_or_default();
+      let word = |bytes: &[u8]| {
+        usize::try_from(u64::from_le_bytes(bytes.try_into().unwrap_or([0; 8])))
+          .unwrap_or(usize::MAX)
+      };
+      let (offset, len) = (word(offset), word(len));
       if offset
         .checked_add(len)
         .is_none_or(|end| end > region.bulk_len())
@@ -2703,6 +2703,7 @@ pub fn unpack<M: Wire>(
 }
 
 #[cfg(test)]
+#[allow(clippy::string_slice)] // Test code may panic (CLAUDE.md §2 item 6 applies to shipped code).
 mod health_signal_registry {
   use super::{AbsenceIs, FreshnessBasis, HealthSignal};
 

@@ -4,7 +4,7 @@
 //! that usable capacity, or it admits a reservation the arena then cannot back — an over-promise a
 //! write discovers as arena exhaustion despite admission having "succeeded". This drives the arena
 //! and the budget together and asserts the observable outcome (an allocation), not a constant.
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic_in_result_fn)]
 
 use slates_mem::MemError;
 use slates_mem::arena::ChunkArena;

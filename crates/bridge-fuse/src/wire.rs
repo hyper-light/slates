@@ -25,14 +25,13 @@ impl<'a> Reader<'a> {
 
   fn take(&mut self, n: usize, opcode: u32) -> Result<&'a [u8], FuseError> {
     let end = self.at.saturating_add(n);
-    if end > self.bytes.len() {
+    let Some(slice) = self.bytes.get(self.at..end) else {
       return Err(FuseError::ShortBody {
         opcode,
         have: self.bytes.len(),
         need: end,
       });
-    }
-    let slice = &self.bytes[self.at..end];
+    };
     self.at = end;
     Ok(slice)
   }
@@ -56,7 +55,7 @@ impl<'a> Reader<'a> {
 
   /// The rest of the body, unread.
   pub fn rest(&self) -> &'a [u8] {
-    &self.bytes[self.at.min(self.bytes.len())..]
+    self.bytes.get(self.at..).unwrap_or_default()
   }
 }
 

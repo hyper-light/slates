@@ -11,7 +11,8 @@
   clippy::unwrap_used,
   clippy::expect_used,
   clippy::panic,
-  clippy::disallowed_types
+  clippy::disallowed_types,
+  clippy::indexing_slicing
 )]
 
 use std::io::{Read, Write};

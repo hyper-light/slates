@@ -211,12 +211,12 @@ impl Region {
     let to = to_page.min(pages);
     let page = self.page;
     let bytes = self.backing.bytes_mut();
-    let mut p = from_page;
-    while p < to {
-      let at = p * page;
-      bytes[at] = 0;
-      std::hint::black_box(&bytes[at]);
-      p += 1;
+    for at in (from_page..to).map_while(|p| p.checked_mul(page)) {
+      let Some(byte) = bytes.get_mut(at) else {
+        break;
+      };
+      *byte = 0;
+      std::hint::black_box(byte);
     }
   }
 

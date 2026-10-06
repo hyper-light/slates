@@ -4,7 +4,12 @@
 //! attaches the segment from its environment, writes heartbeats, and exits; the supervisor
 //! restarts it until the derived bound trips and records the crash loop in the segment.
 // Test harness code: an unwrap here is a failed test, which is what it should be.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![allow(
+  clippy::unwrap_used,
+  clippy::expect_used,
+  clippy::panic,
+  clippy::indexing_slicing
+)]
 
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};

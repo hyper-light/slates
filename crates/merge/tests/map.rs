@@ -14,6 +14,8 @@
 //! had been touched (CI run 36655388624, 2026-09-30). This is computed independently of the mapper,
 //! so a wrong shift or a missed overlap diverges.
 
+// Test code may panic (CLAUDE.md §2 item 6 applies to shipped code).
+#![allow(clippy::indexing_slicing)]
 use slates_merge::map::{Mapped, map_range};
 use slates_merge::ops_doc::{Op, OpKind};
 use slates_merge::range::Range;

@@ -8,7 +8,12 @@
 //! One VFS, two transports, byte for byte. A second guest whose consumer is not on the volume's
 //! access list is admitted (authenticated) but every effect is refused by the seam (§4.13).
 // Test harness code: an unwrap here is a failed test.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![allow(
+  clippy::unwrap_used,
+  clippy::expect_used,
+  clippy::panic,
+  clippy::indexing_slicing
+)]
 // The guest transport rides the runtime's Unix descriptor readiness.
 #![cfg(unix)]
 

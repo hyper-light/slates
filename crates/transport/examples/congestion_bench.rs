@@ -27,7 +27,8 @@
   clippy::expect_used,
   clippy::cast_precision_loss,
   clippy::cast_possible_truncation,
-  clippy::cast_sign_loss
+  clippy::cast_sign_loss,
+  clippy::indexing_slicing
 )]
 
 use std::sync::atomic::{AtomicBool, Ordering};

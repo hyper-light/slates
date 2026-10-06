@@ -18,17 +18,10 @@
 //! the design requires — a grant is made only by a human at the CLI or a confirmation surface, never by
 //! an agent answering its own question.
 
-// The no-panic law (CLAUDE.md, banned item 6): shipped code never indexes or slices out of bounds, never
-// slices a string off a character boundary, and never overflows. Test builds are exempt. Once a crate is
-// clean this holds it there.
-#![cfg_attr(
-  not(test),
-  deny(
-    clippy::indexing_slicing,
-    clippy::string_slice,
-    clippy::arithmetic_side_effects
-  )
-)]
+// The no-panic law (CLAUDE.md, banned item 6): shipped code never overflows or divides by zero. Test builds
+// are exempt. Once a crate is clean this holds it there; out-of-bounds indexing and slicing are denied
+// workspace-wide.
+#![cfg_attr(not(test), deny(clippy::arithmetic_side_effects))]
 // PyO3 0.22's `#[pymethods]`/`#[pymodule]`/`#[pyclass]` macros generate `unsafe fn` bodies that call
 // PyO3's own unsafe helpers without an inner `unsafe` block, and identity conversions on `PyErr` —
 // patterns the workspace's edition-2024 strict lints reject in *generated* code. This crate's own code

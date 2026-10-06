@@ -1,7 +1,12 @@
 //! Content placement over authenticated sessions on the simulated fabric (§4.8, §4.10,
 //! AC-8.12). The virtual clock puts valid replies inside a collector's final sleep, so
 //! deadline handling cannot discard an already-delivered offer or acknowledgement.
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![allow(
+  clippy::unwrap_used,
+  clippy::expect_used,
+  clippy::indexing_slicing,
+  clippy::unwrap_in_result
+)]
 
 use std::sync::mpsc::{Receiver, channel};
 

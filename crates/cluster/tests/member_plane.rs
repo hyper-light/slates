@@ -1,7 +1,12 @@
 //! The membership plane by use (A-67 H-2; `docs/wip/transport-quic.md` §6): members exchange sealed datagrams over an
 //! in-memory network on simulated time, the way the control shard's task drives one plane over its UDP socket.
 // Test harness code: an unwrap here is a failed test.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![allow(
+  clippy::unwrap_used,
+  clippy::expect_used,
+  clippy::panic,
+  clippy::indexing_slicing
+)]
 
 use std::collections::BTreeMap;
 use std::num::NonZeroUsize;

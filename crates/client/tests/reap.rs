@@ -4,7 +4,12 @@
 //! unaffected throughout. The test binary re-invoked is the victim (an environment variable
 //! selects the role), so the death is a real `SIGKILL` of a real process.
 // Test harness code: an unwrap here is a failed test, which is what it should be.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![allow(
+  clippy::unwrap_used,
+  clippy::expect_used,
+  clippy::panic,
+  clippy::string_slice
+)]
 
 use std::io::{BufRead, BufReader};
 use std::process::{Child, Command, Stdio};

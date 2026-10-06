@@ -1,4 +1,9 @@
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![allow(
+  clippy::unwrap_used,
+  clippy::expect_used,
+  clippy::panic,
+  clippy::indexing_slicing
+)]
 //! The FSKit shim codec, exercised by use (R5): requests round-trip through their bytes, hostile
 //! messages are typed refusals, and `serve` drives the read path against a real `VolumeBridge` over an
 //! in-memory scratch volume — the same seam the FUSE and NFS bridges dispatch onto. No socket, no

@@ -221,8 +221,9 @@ pub fn block_of(document: &str) -> Result<(usize, usize), &'static str> {
     .find(BEGIN)
     .ok_or("the document has no conformance-matrix:begin marker")?
     + BEGIN.len();
-  let end = document[start..]
-    .find(END)
+  let end = document
+    .get(start..)
+    .and_then(|rest| rest.find(END))
     .ok_or("the document has no conformance-matrix:end marker after the begin marker")?
     + start;
   Ok((start, end))
@@ -233,9 +234,9 @@ pub fn rewrite(document: &str, rendered: &str) -> Result<String, &'static str> {
   let (start, end) = block_of(document)?;
   Ok(format!(
     "{}{}{}",
-    &document[..start],
+    document.get(..start).unwrap_or_default(),
     rendered,
-    &document[end..]
+    document.get(end..).unwrap_or_default()
   ))
 }
 

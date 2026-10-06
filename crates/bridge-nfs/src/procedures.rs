@@ -297,6 +297,11 @@ const CREATE_GUARDED: u32 = 1;
 /// which the server keeps with the file so a retry of the same create succeeds (RFC 1813 §3.3.8; see
 /// [`exclusive_times`]).
 const CREATE_EXCLUSIVE: u32 = 2;
+/// The first eight bytes of a volume id, the part an export's `fsid` is made from.
+fn first_word(volume: &[u8; 16]) -> [u8; size_of::<u64>()] {
+  volume.first_chunk().copied().unwrap_or_default()
+}
+
 /// Format: the size of a `createverf3` (RFC 1813 §2.5: `NFS3_CREATEVERFSIZE`).
 pub const CREATEVERF_SIZE: usize = 8;
 
@@ -306,13 +311,12 @@ pub const CREATEVERF_SIZE: usize = 8;
 /// restart still finds its verifier; the client sets the real times right after (a Linux v4 client
 /// because `suppattr_exclcreat` leaves the times out). `(mtime, atime)` in nanoseconds.
 pub fn exclusive_times(verifier: [u8; CREATEVERF_SIZE]) -> (i64, i64) {
-  let mut mtime = [0u8; size_of::<u32>()];
-  let mut atime = [0u8; size_of::<u32>()];
-  mtime.copy_from_slice(&verifier[..size_of::<u32>()]);
-  atime.copy_from_slice(&verifier[size_of::<u32>()..]);
+  let (mtime, atime) = verifier.split_at(size_of::<u32>());
+  let mtime: [u8; size_of::<u32>()] = mtime.try_into().unwrap_or_default();
+  let atime: [u8; size_of::<u32>()] = atime.try_into().unwrap_or_default();
   (
-    i64::from(u32::from_be_bytes(mtime)) * NS_PER_SEC,
-    i64::from(u32::from_be_bytes(atime)) * NS_PER_SEC,
+    i64::from(u32::from_be_bytes(mtime)).saturating_mul(NS_PER_SEC),
+    i64::from(u32::from_be_bytes(atime)).saturating_mul(NS_PER_SEC),
   )
 }
 /// Format: the mode a CREATE falls back to when the client's `sattr3` omits one — a regular file,
@@ -479,8 +483,7 @@ impl<'b> Export<'b> {
     let mut owned = Attachments::new();
     let attachment = owned.attach(volume, View::Current, subject, rights)?;
     let attachments = Registry::Owned(owned);
-    let mut fsid = [0u8; size_of::<u64>()];
-    fsid.copy_from_slice(&volume.bytes[..size_of::<u64>()]);
+    let fsid = first_word(&volume.bytes);
     Ok(Export {
       bridge,
       volume,
@@ -513,8 +516,7 @@ impl<'b> Export<'b> {
       Principal::Uid { uid } => *uid,
       _ => access::INVALID_UID,
     };
-    let mut fsid = [0u8; size_of::<u64>()];
-    fsid.copy_from_slice(&volume.bytes[..size_of::<u64>()]);
+    let fsid = first_word(&volume.bytes);
     Export {
       bridge,
       volume,
@@ -656,9 +658,7 @@ impl<'b> Export<'b> {
 
   /// The filesystem id the export reports: the leading 64 bits of the volume id, stable per volume.
   fn fsid(&self) -> u64 {
-    let mut eight = [0u8; size_of::<u64>()];
-    eight.copy_from_slice(&self.volume.bytes[..size_of::<u64>()]);
-    u64::from_be_bytes(eight)
+    u64::from_be_bytes(first_word(&self.volume.bytes))
   }
 
   /// Mints a file handle for an inode of this export's volume, carrying the export's mount capability

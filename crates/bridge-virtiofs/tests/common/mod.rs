@@ -10,7 +10,8 @@
   unreachable_pub,
   clippy::unwrap_used,
   clippy::expect_used,
-  clippy::panic
+  clippy::panic,
+  clippy::indexing_slicing
 )]
 
 use std::collections::BTreeMap;

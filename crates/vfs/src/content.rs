@@ -614,12 +614,39 @@ impl ChunkStore {
     let locked = self.arena.is_locked(open.block);
     let block = self.alloc(need.next_multiple_of(self.granule), locked)?;
     let used = usize::try_from(open.len).unwrap_or(0);
-    let mut carry = vec![0u8; used];
-    if let Some(src) = self.arena.bytes(open.block) {
-      carry.copy_from_slice(&src[..used]);
-    }
-    if let Some(dst) = self.arena.bytes_mut(block) {
-      dst[..used].copy_from_slice(&carry);
+    self.move_into(open, block, used)
+  }
+
+  /// Copies the first `keep` bytes of `open`'s block into `block` and makes `block` the extent's, freeing the
+  /// old one. A block shorter than `keep` (never: both were sized for it) refuses typed and gives `block` back,
+  /// so no byte is silently dropped.
+  fn move_into(
+    &mut self,
+    open: &mut OpenExtent,
+    block: Block,
+    keep: usize,
+  ) -> Result<(), VfsError> {
+    let carry = self
+      .arena
+      .bytes(open.block)
+      .and_then(|src| src.get(..keep))
+      .map(<[u8]>::to_vec);
+    let copied = match (
+      carry,
+      self
+        .arena
+        .bytes_mut(block)
+        .and_then(|dst| dst.get_mut(..keep)),
+    ) {
+      (Some(carry), Some(dst)) => {
+        dst.copy_from_slice(&carry);
+        true
+      }
+      _ => false,
+    };
+    if !copied {
+      self.arena.free(block)?;
+      return Err(VfsError::StaleHandle);
     }
     self.arena.free(open.block)?;
     open.block = block;
@@ -641,10 +668,13 @@ impl ChunkStore {
       .arena
       .bytes_mut(open.block)
       .ok_or(VfsError::StaleHandle)?;
-    if at > used {
-      dst[used..at].fill(0);
+    if let Some(gap) = dst.get_mut(used..at) {
+      gap.fill(0);
     }
-    dst[at..end].copy_from_slice(bytes);
+    dst
+      .get_mut(at..end)
+      .ok_or(VfsError::StaleHandle)?
+      .copy_from_slice(bytes);
     if end > used {
       open.len = u64::try_from(end).unwrap_or(u64::MAX);
     }
@@ -657,7 +687,7 @@ impl ChunkStore {
     self
       .arena
       .bytes(open.block)
-      .map_or(&[], |b| &b[..used.min(b.len())])
+      .map_or(&[], |b| b.get(..used).unwrap_or(b))
   }
 
   /// The arena block `materialized` bytes of one window take: the smallest power-of-two number
@@ -688,16 +718,7 @@ impl ChunkStore {
     let Ok(block) = self.alloc(want, locked) else {
       return Ok(());
     };
-    let mut carry = vec![0u8; keep];
-    if let Some(src) = self.arena.bytes(open.block) {
-      carry.copy_from_slice(&src[..keep]);
-    }
-    if let Some(dst) = self.arena.bytes_mut(block) {
-      dst[..keep].copy_from_slice(&carry);
-    }
-    self.arena.free(open.block)?;
-    open.block = block;
-    Ok(())
+    self.move_into(open, block, keep)
   }
 
   /// Seals an open extent into a chunk and returns the extent that names it (or `None` for an
@@ -921,6 +942,7 @@ impl ChunkStore {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_in_result)] // Test code may panic (CLAUDE.md §2 item 6 applies to shipped code).
 mod tests {
   use super::*;
   use slates_mem::region::Region;

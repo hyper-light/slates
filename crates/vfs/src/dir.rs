@@ -151,11 +151,17 @@ impl Small {
 
   fn name(&self, e: SmallEntry) -> &str {
     let start = usize::from(e.off);
-    std::str::from_utf8(&self.names[start..start + usize::from(e.len)]).unwrap_or("")
+    let bytes = self
+      .names
+      .get(start..start.saturating_add(usize::from(e.len)));
+    std::str::from_utf8(bytes.unwrap_or_default()).unwrap_or("")
   }
 
   fn entries(&self) -> &[SmallEntry] {
-    &self.entries[..usize::from(self.count)]
+    self
+      .entries
+      .get(..usize::from(self.count))
+      .unwrap_or(&self.entries)
   }
 
   fn position(&self, policy: NameEquivalence, hash: u64, name: &str) -> Result<usize, usize> {
@@ -180,40 +186,61 @@ impl Small {
     usize::from(self.count) < SMALL_ENTRIES && usize::from(self.used) + name_len <= SMALL_NAME_BYTES
   }
 
+  /// Inserts at `at`, which `position` returned; every caller checked [`Small::fits`] first, so an entry that
+  /// would not fit (never) is not inserted.
   fn insert_at(&mut self, at: usize, hash: u64, name: &str, child: Child) {
     let count = usize::from(self.count);
+    let (Ok(len), true) = (
+      u8::try_from(name.len()),
+      self.fits(name.len()) && at <= count,
+    ) else {
+      return;
+    };
     let off = self.used;
     let start = usize::from(off);
-    self.names[start..start + name.len()].copy_from_slice(name.as_bytes());
-    self.used += u8::try_from(name.len()).unwrap_or(u8::MAX);
-    self.entries.copy_within(at..count, at + 1);
-    self.entries[at] = SmallEntry {
-      hash,
-      child,
-      off,
-      len: u8::try_from(name.len()).unwrap_or(u8::MAX),
+    let Some(name_bytes) = self.names.get_mut(start..start.saturating_add(name.len())) else {
+      return;
     };
-    self.count += 1;
+    name_bytes.copy_from_slice(name.as_bytes());
+    self.used = self.used.saturating_add(len);
+    // `at <= count < SMALL_ENTRIES` (`fits`), so both ranges lie inside the array.
+    self.entries.copy_within(at..count, at.saturating_add(1));
+    if let Some(slot) = self.entries.get_mut(at) {
+      *slot = SmallEntry {
+        hash,
+        child,
+        off,
+        len,
+      };
+    }
+    self.count = self.count.saturating_add(1);
   }
 
-  fn remove_at(&mut self, at: usize) -> SmallEntry {
+  /// Removes the entry at `at`, which `position` returned.
+  fn remove_at(&mut self, at: usize) -> Option<SmallEntry> {
     let count = usize::from(self.count);
-    let removed = self.entries[at];
-    self.entries.copy_within(at + 1..count, at);
-    self.count -= 1;
+    let removed = *self.entries().get(at)?;
+    // `at < count <= SMALL_ENTRIES`, so the range lies inside the array.
+    self.entries.copy_within(at.saturating_add(1)..count, at);
+    self.count = self.count.saturating_sub(1);
     // Rebuild the name bytes without the hole (at most two names).
     let mut names = [0u8; SMALL_NAME_BYTES];
     let mut used = 0usize;
-    for e in self.entries[..usize::from(self.count)].iter_mut() {
+    let kept = usize::from(self.count);
+    for e in self.entries.iter_mut().take(kept) {
       let start = usize::from(e.off);
       let len = usize::from(e.len);
-      names[used..used + len].copy_from_slice(&self.names[start..start + len]);
+      let from = self.names.get(start..start.saturating_add(len));
+      let into = names.get_mut(used..used.saturating_add(len));
+      if let (Some(from), Some(into)) = (from, into) {
+        into.copy_from_slice(from);
+      }
       e.off = u8::try_from(used).unwrap_or(u8::MAX);
-      used += len;
+      used = used.saturating_add(len);
     }
     self.names = names;
     self.used = u8::try_from(used).unwrap_or(u8::MAX);
-    removed
+    Some(removed)
   }
 }
 
@@ -300,7 +327,7 @@ impl DirNode {
       DirEntries::Small(s) => {
         let hash = policy.hash(name);
         let at = s.position(policy, hash, name).ok()?;
-        let e = s.entries[at];
+        let e = *s.entries().get(at)?;
         Some(EntryRef {
           hash,
           name: s.name(e),
@@ -390,7 +417,7 @@ impl DirNode {
         let Ok(at) = s.position(policy, hash, name) else {
           return Ok(None);
         };
-        Ok(Some(s.remove_at(at).child))
+        Ok(s.remove_at(at).map(|removed| removed.child))
       }
       DirEntries::Indexed(t) => {
         let removed = t.remove(blocks, epoch, retired, policy, name)?;
@@ -535,7 +562,10 @@ impl DirNode {
         let Ok(at) = s.position(policy, hash, name) else {
           return Ok(false);
         };
-        s.entries[at].child = child;
+        let Some(entry) = s.entries.get_mut(at) else {
+          return Ok(false);
+        };
+        entry.child = child;
         Ok(true)
       }
       DirEntries::Indexed(t) => t.set_child(blocks, epoch, retired, policy, name, child),

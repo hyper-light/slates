@@ -128,19 +128,20 @@ fn total_len(pieces: &[Piece]) -> u64 {
 fn split_at(pieces: &mut Vec<Piece>, offset: u64) -> usize {
   let mut acc = 0u64;
   let mut index = 0;
-  while index < pieces.len() {
+  while let Some(piece) = pieces.get_mut(index) {
     if acc == offset {
       return index;
     }
-    let piece_len = pieces[index].len();
-    if acc + piece_len > offset {
-      let (left, right) = pieces[index].split(offset - acc);
-      pieces[index] = left;
-      pieces.insert(index + 1, right);
-      return index + 1;
+    let piece_len = piece.len();
+    if acc.saturating_add(piece_len) > offset {
+      let (left, right) = piece.split(offset.saturating_sub(acc));
+      *piece = left;
+      let after = index.saturating_add(1);
+      pieces.insert(after, right);
+      return after;
     }
-    acc += piece_len;
-    index += 1;
+    acc = acc.saturating_add(piece_len);
+    index = index.saturating_add(1);
   }
   pieces.len()
 }

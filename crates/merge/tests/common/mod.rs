@@ -3,6 +3,8 @@
 //! (`tests/shuttle_green.rs`, T-6.7) decide against one and the same reference (the CLAUDE.md rule:
 //! reuse the serial reference the model tests already keep; never a second oracle).
 
+// Test code may panic (CLAUDE.md §2 item 6 applies to shipped code).
+#![allow(clippy::indexing_slicing)]
 #![allow(dead_code)]
 
 use slates_merge::engine::Increment;

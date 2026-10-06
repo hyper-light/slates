@@ -5,7 +5,13 @@
 //! daemon's real NFSv4.2 transport with no kernel mount and no privilege.
 
 // Test harness code: an unwrap here is a failed test, which is what it should be.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![allow(
+  clippy::unwrap_used,
+  clippy::expect_used,
+  clippy::panic,
+  clippy::panic_in_result_fn,
+  clippy::unwrap_in_result
+)]
 
 use std::net::TcpStream;
 

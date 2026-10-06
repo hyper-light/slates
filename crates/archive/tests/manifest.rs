@@ -3,6 +3,8 @@
 //! independent of the order entries were added and changes when any node changes; a malformed
 //! encoding is a typed refusal, never a panic.
 
+// Test code may panic (CLAUDE.md §2 item 6 applies to shipped code).
+#![allow(clippy::panic_in_result_fn)]
 use slates_archive::manifest::{Entry, Extent, ManifestError, Node, NodeMeta, Xattr};
 
 /// The tree in the canonical form the decoder accepts (§2.6 D-17; AUD-29-14): every file entry's recorded

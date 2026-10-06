@@ -9,7 +9,7 @@
 //! stuck one does not. Test by use (R5).
 
 // Test harness: an unwrap here is a failed test.
-#![allow(clippy::unwrap_used)]
+#![allow(clippy::unwrap_used, clippy::indexing_slicing)]
 
 use std::future::Future;
 use std::sync::mpsc::{Receiver, channel};

@@ -96,7 +96,9 @@ impl FsTag {
       return Err(DeviceError::TagHasNul);
     }
     let mut bytes = [0u8; TAG_LEN];
-    bytes[..name.len()].copy_from_slice(name.as_bytes());
+    if let Some(field) = bytes.get_mut(..name.len()) {
+      field.copy_from_slice(name.as_bytes());
+    }
     Ok(FsTag {
       bytes,
       len: name.len(),
@@ -111,7 +113,7 @@ impl FsTag {
 
   /// The tag's name.
   pub fn as_str(&self) -> &str {
-    std::str::from_utf8(&self.bytes[..self.len]).unwrap_or("")
+    std::str::from_utf8(self.bytes.get(..self.len).unwrap_or_default()).unwrap_or("")
   }
 }
 
@@ -535,13 +537,13 @@ impl Device {
     }
     let mut served: u32 = 0;
     while served < batch {
-      let Some(chain) = self.queues[index].peek(memory)? else {
+      let Some(chain) = self.queue_at(index)?.peek(memory)? else {
         break;
       };
       if let Err(refusal) = self.charge_copy(&chain, admission) {
         return Err(self.record_fault(refusal));
       }
-      self.queues[index].advance();
+      self.queue_at(index)?.advance();
       let written = match self.serve_chain(queue, &chain, memory, bridge, cx) {
         Ok(written) => written,
         Err(refusal) => return Err(self.record_fault(refusal)),
@@ -554,18 +556,18 @@ impl Device {
         return Ok(Serviced {
           served,
           more_pending: true,
-          interrupt_wanted: self.queues[index].interrupts_wanted(memory)?,
+          interrupt_wanted: self.queue_at(index)?.interrupts_wanted(memory)?,
           barrier_owed: true,
         });
       }
-      self.queues[index].push_used(memory, &chain, written)?;
+      self.queue_at(index)?.push_used(memory, &chain, written)?;
       admission.complete();
       served = served.saturating_add(1);
     }
     Ok(Serviced {
       served,
-      more_pending: self.queues[index].pending(memory)? > 0,
-      interrupt_wanted: self.queues[index].interrupts_wanted(memory)?,
+      more_pending: self.queue_at(index)?.pending(memory)? > 0,
+      interrupt_wanted: self.queue_at(index)?.interrupts_wanted(memory)?,
       barrier_owed: false,
     })
   }
@@ -681,11 +683,13 @@ impl Device {
       written = u32::try_from(n).unwrap_or(u32::MAX);
       self.counters.barriers_refused = self.counters.barriers_refused.saturating_add(1);
     }
-    self.queues[index].push_used(memory, &held.chain, written)?;
+    self
+      .queue_at(index)?
+      .push_used(memory, &held.chain, written)?;
     admission.complete();
     Ok(Some(Completed {
       queue: held.queue,
-      interrupt_wanted: self.queues[index].interrupts_wanted(memory)?,
+      interrupt_wanted: self.queue_at(index)?.interrupts_wanted(memory)?,
       refused: !captured,
     }))
   }
@@ -709,6 +713,11 @@ impl Device {
       });
     }
     Ok(index)
+  }
+
+  /// The queue at an index [`Self::queue_index`] checked; a miss is the configuration it checked against.
+  fn queue_at(&mut self, index: usize) -> Result<&mut Virtqueue, DeviceError> {
+    self.queues.get_mut(index).ok_or(DeviceError::NotConfigured)
   }
 
   /// Serves one chain: the FUSE request is gathered, dispatched and its reply scattered; returns
@@ -799,7 +808,7 @@ impl Device {
     match header.and_then(|h| Opcode::from_wire(h.opcode)) {
       Some(Opcode::Init) => {
         self.negotiated = negotiate(
-          &self.request[IN_HEADER_LEN..],
+          self.request.get(IN_HEADER_LEN..).unwrap_or_default(),
           slates_bridge_core::CacheCoherence::Revalidated,
         )
         .ok();

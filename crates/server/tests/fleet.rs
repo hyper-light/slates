@@ -16,7 +16,13 @@
 //! set and places (§4.10); and a takeover successor **serves** the dead owner's bytes back over its own NFS
 //! port. Real multi-process deployment and the connection-ID demux (many peers on one socket) are further
 //! gates.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![allow(
+  clippy::unwrap_used,
+  clippy::expect_used,
+  clippy::panic,
+  clippy::indexing_slicing,
+  clippy::unwrap_in_result
+)]
 // These integration tests drive the daemon's NFS-loopback transport, the fleet's TCP
 // transport and rustix syscalls — all macOS/Linux; on Windows the daemon mounts through WinFsp and
 // the fleet transport is QUIC-over-UDP, so these particular tests are unix (as `virtiofs.rs` is).

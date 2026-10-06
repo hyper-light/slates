@@ -2576,3 +2576,46 @@ own filesystem and tmpfs.
 - **The next lever is the create's own publication.** An intent log for namespace changes, as ZFS's ZIL does, would
   let a create reply after one append. It is a design change to §4.8's barrier, recorded in GAPS, not built.
 
+
+### 2026-10-06: the no-panic sweep costs nothing measurable on the hot paths
+
+The sweep turned every `[]` index and slice in shipped code into a `get`, among them the ART's child arrays, the
+directory tree's slots and the inode trie.
+
+**Setup.**
+- Apple M5 Max, 128 GiB. Load average 9–13 from other sessions' containers throughout, so rows move by ±10%
+  between runs of one binary.
+- A/B, interleaved: HEAD (`732ca43`, built from a detached worktree) against this tree. Each binary was built
+  release into its own target directory.
+- Commands: `db_bench` and `vfs_bench` from those directories (`cargo run --release -p slates-db --example db_bench`
+  and `... -p slates-vfs --example vfs_bench`).
+
+**db_bench, three runs each (medians):**
+
+| Row | New | HEAD |
+|---|---|---|
+| ART insert at 10⁴ keys | 22 / 26 / 22 ns | 23 / 24 / 31 ns |
+| ART lookup at 10⁴ keys | 8 / 11 / 8 ns | 8 / 9 / 10 ns |
+| ART insert at 10⁵ keys | 41 / 41 / 43 ns | 44 / 42 / 47 ns |
+| ART lookup at 10⁵ keys | 17 / 16 / 20 ns | 16 / 14 / 21 ns |
+| Recover 10⁴ volumes from 10⁶ records | 404 / 450 / 415 ms | 447 / 409 / 416 ms |
+
+**vfs_bench, first pass.** Every row sat within ±5% except the small directory-tree lookups.
+- Lookup in a 2-entry tree was 166–182 ns, against 161–171 ns at HEAD.
+- Directory inserts got 4–9% faster (a 128-entry tree: 182 against 192–197 ns).
+- Two causes were fixed:
+  - The searches decoded a whole slot to compare its hash. They now read the hash word alone (`hash_at`) and decode
+    a slot only when the hashes match.
+  - The word read took a bounds-checked range and then a chunk. It is now one `get(at..)` and `first_chunk`.
+
+**vfs_bench after those, four interleaved runs each:**
+
+| Lookup | New | HEAD |
+|---|---|---|
+| 2-entry tree | 177 / 177 / 171 / 203 ns | 177 / 177 / 171 / 171 ns |
+| 16-entry tree | 213 / 213 / 208 / 244 ns | 218 / 218 / 203 / 218 ns |
+| Inline directory of 2 | 106 / 104 / 101 / 119 ns | 109 / 106 / 111 / 101 ns |
+
+The fourth new run was high on every row at once, a load spike.
+
+**Verdict:** parity, so the sweep lands.

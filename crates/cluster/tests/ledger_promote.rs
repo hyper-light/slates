@@ -13,7 +13,7 @@
 //! we prove the multi-entry round rides the transport. Test by use (R5).
 
 // Test harness: an unwrap or expect here is a failed test.
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
 use std::sync::mpsc::{Receiver, channel};
 

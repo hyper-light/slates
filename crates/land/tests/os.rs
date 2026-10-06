@@ -9,7 +9,12 @@
 //! round until killed; every file is then a whole round, never torn; the parent resumes with
 //! the child's last landing id, sweeps its siblings and reaches the reference.
 // Test harness code: an unwrap here is a failed test, which is what it should be.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![allow(
+  clippy::unwrap_used,
+  clippy::expect_used,
+  clippy::panic,
+  clippy::indexing_slicing
+)]
 #![cfg(unix)]
 
 use std::path::{Path, PathBuf};

@@ -109,6 +109,14 @@ pub struct DirBlock {
   bytes: [u8; BLOCK_BYTES],
 }
 
+/// The little-endian word at `at` of `bytes`; zero past the end (a slot is always read inside its block).
+fn read_word(bytes: &[u8], at: usize) -> u64 {
+  bytes
+    .get(at..)
+    .and_then(<[u8]>::first_chunk::<WORD_BYTES>)
+    .map_or(0, |word| u64::from_le_bytes(*word))
+}
+
 /// One decoded entry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Slot {
@@ -120,29 +128,29 @@ struct Slot {
 }
 
 impl Slot {
+  /// Decodes the entry at the start of `bytes`; a slot is always read inside its block, so the zero arm (a
+  /// short tail) never runs.
   fn read(bytes: &[u8]) -> Self {
-    let word = |at: usize| {
-      let mut b = [0u8; WORD_BYTES];
-      b.copy_from_slice(&bytes[at..at + WORD_BYTES]);
-      u64::from_le_bytes(b)
-    };
-    let packed = word(PACKED_AT);
+    let packed = read_word(bytes, PACKED_AT);
     Self {
-      hash: word(0),
-      child: word(CHILD_AT),
+      hash: read_word(bytes, 0),
+      child: read_word(bytes, CHILD_AT),
       name_off: u16::try_from(packed & NAME_OFF_MASK).unwrap_or(0),
       name_len: u8::try_from((packed >> NAME_LEN_SHIFT) & BYTE_MASK).unwrap_or(0),
       kind: u8::try_from((packed >> KIND_SHIFT) & BYTE_MASK).unwrap_or(0),
     }
   }
 
+  /// Encodes the entry at the start of `bytes`; a slot is always written inside its block.
   fn write(self, bytes: &mut [u8]) {
-    bytes[..WORD_BYTES].copy_from_slice(&self.hash.to_le_bytes());
-    bytes[CHILD_AT..CHILD_AT + WORD_BYTES].copy_from_slice(&self.child.to_le_bytes());
     let packed = u64::from(self.name_off)
       | (u64::from(self.name_len) << NAME_LEN_SHIFT)
       | (u64::from(self.kind) << KIND_SHIFT);
-    bytes[PACKED_AT..PACKED_AT + WORD_BYTES].copy_from_slice(&packed.to_le_bytes());
+    for (at, word) in [(0, self.hash), (CHILD_AT, self.child), (PACKED_AT, packed)] {
+      if let Some(field) = bytes.get_mut(at..at.saturating_add(WORD_BYTES)) {
+        field.copy_from_slice(&word.to_le_bytes());
+      }
+    }
   }
 
   fn to_child(self) -> Child {
@@ -217,18 +225,33 @@ impl DirBlock {
     usize::from(self.count)
   }
 
+  /// The hash of entry `at` alone: what a search compares before it needs the rest of the slot.
+  fn hash_at(&self, at: usize) -> u64 {
+    read_word(&self.bytes, at.saturating_mul(ENTRY_BYTES))
+  }
+
   fn slot(&self, at: usize) -> Slot {
-    Slot::read(&self.bytes[at * ENTRY_BYTES..])
+    Slot::read(
+      self
+        .bytes
+        .get(at.saturating_mul(ENTRY_BYTES)..)
+        .unwrap_or_default(),
+    )
   }
 
   fn set_slot(&mut self, at: usize, slot: Slot) {
-    slot.write(&mut self.bytes[at * ENTRY_BYTES..]);
+    slot.write(
+      self
+        .bytes
+        .get_mut(at.saturating_mul(ENTRY_BYTES)..)
+        .unwrap_or_default(),
+    );
   }
 
   fn name(&self, slot: Slot) -> &str {
     let start = usize::from(slot.name_off);
-    let end = start + usize::from(slot.name_len);
-    std::str::from_utf8(&self.bytes[start..end]).unwrap_or("")
+    let end = start.saturating_add(usize::from(slot.name_len));
+    std::str::from_utf8(self.bytes.get(start..end).unwrap_or_default()).unwrap_or("")
   }
 
   /// The name of entry `at`.
@@ -250,26 +273,27 @@ impl DirBlock {
     let count = self.count();
     let (mut lo, mut hi) = (0usize, count);
     while lo < hi {
-      let mid = lo + (hi - lo) / 2;
-      let s = self.slot(mid);
-      let less = s.hash < hash
-        || (s.hash == hash && cmp_names(policy, self.name(s), name) == std::cmp::Ordering::Less);
+      let mid = lo.midpoint(hi);
+      let mid_hash = self.hash_at(mid);
+      let less = mid_hash < hash
+        || (mid_hash == hash
+          && cmp_names(policy, self.name_at(mid), name) == std::cmp::Ordering::Less);
       if less {
-        lo = mid + 1;
+        lo = mid.saturating_add(1);
       } else {
         hi = mid;
       }
     }
     // Among equal hashes, equality is the policy's, which may differ from byte order.
     let mut at = lo;
-    while at > 0 && self.slot(at - 1).hash == hash {
-      at -= 1;
+    while at > 0 && self.hash_at(at.saturating_sub(1)) == hash {
+      at = at.saturating_sub(1);
     }
-    while at < count && self.slot(at).hash == hash {
+    while at < count && self.hash_at(at) == hash {
       if policy.same(self.name_at(at), name) {
         return Ok(at);
       }
-      at += 1;
+      at = at.saturating_add(1);
     }
     Err(lo)
   }
@@ -279,14 +303,15 @@ impl DirBlock {
     let count = self.count();
     let (mut lo, mut hi) = (0usize, count);
     while lo < hi {
-      let mid = lo + (hi - lo) / 2;
-      let s = self.slot(mid);
-      let greater = s.hash > hash
-        || (s.hash == hash && cmp_names(policy, self.name(s), name) == std::cmp::Ordering::Greater);
+      let mid = lo.midpoint(hi);
+      let mid_hash = self.hash_at(mid);
+      let greater = mid_hash > hash
+        || (mid_hash == hash
+          && cmp_names(policy, self.name_at(mid), name) == std::cmp::Ordering::Greater);
       if greater {
         hi = mid;
       } else {
-        lo = mid + 1;
+        lo = mid.saturating_add(1);
       }
     }
     lo.saturating_sub(1)
@@ -297,9 +322,9 @@ impl DirBlock {
   fn first_hash_at_least(&self, hash: u64) -> usize {
     let (mut lo, mut hi) = (0usize, self.count());
     while lo < hi {
-      let mid = lo + (hi - lo) / 2;
-      if self.slot(mid).hash < hash {
-        lo = mid + 1;
+      let mid = lo.midpoint(hi);
+      if self.hash_at(mid) < hash {
+        lo = mid.saturating_add(1);
       } else {
         hi = mid;
       }
@@ -315,31 +340,46 @@ impl DirBlock {
   fn insert_at(&mut self, at: usize, mut slot: Slot, name: &str) {
     let count = self.count();
     let len = name.len();
-    let name_end = BLOCK_BYTES - usize::from(self.names_used);
-    let name_start = name_end - len;
-    self.bytes[name_start..name_end].copy_from_slice(name.as_bytes());
-    self.names_used += u16::try_from(len).unwrap_or(u16::MAX);
+    let name_end = BLOCK_BYTES.saturating_sub(usize::from(self.names_used));
+    let name_start = name_end.saturating_sub(len);
+    // `fits` left room for one more slot below the names; refusing here (never) changes nothing.
+    let slots_end = count.saturating_add(1).saturating_mul(ENTRY_BYTES);
+    if at > count || slots_end > name_start || !self.fits(len) {
+      return;
+    }
+    let Some(name_bytes) = self.bytes.get_mut(name_start..name_end) else {
+      return;
+    };
+    name_bytes.copy_from_slice(name.as_bytes());
+    self.names_used = self
+      .names_used
+      .saturating_add(u16::try_from(len).unwrap_or(u16::MAX));
     slot.name_off = u16::try_from(name_start).unwrap_or(0);
     slot.name_len = u8::try_from(len).unwrap_or(u8::MAX);
+    // Both ranges end at or below `slots_end <= name_start`, inside the block.
     self.bytes.copy_within(
-      at * ENTRY_BYTES..count * ENTRY_BYTES,
-      (at + 1) * ENTRY_BYTES,
+      at.saturating_mul(ENTRY_BYTES)..count.saturating_mul(ENTRY_BYTES),
+      at.saturating_add(1).saturating_mul(ENTRY_BYTES),
     );
     self.set_slot(at, slot);
-    self.count += 1;
+    self.count = self.count.saturating_add(1);
   }
 
   /// Removes entry `at`, leaving its name bytes as a hole that a later compaction reclaims.
   fn remove_at(&mut self, at: usize) -> Slot {
     let count = self.count();
     let slot = self.slot(at);
+    if at >= count {
+      return slot;
+    }
+    // `at < count`, so both ranges lie inside the slot area.
     self.bytes.copy_within(
-      (at + 1) * ENTRY_BYTES..count * ENTRY_BYTES,
-      at * ENTRY_BYTES,
+      at.saturating_add(1).saturating_mul(ENTRY_BYTES)..count.saturating_mul(ENTRY_BYTES),
+      at.saturating_mul(ENTRY_BYTES),
     );
-    self.count -= 1;
-    self.names_dead += u16::from(slot.name_len);
-    if usize::from(self.names_dead) >= usize::from(self.names_used - self.names_dead) {
+    self.count = self.count.saturating_sub(1);
+    self.names_dead = self.names_dead.saturating_add(u16::from(slot.name_len));
+    if self.names_dead >= self.names_used.saturating_sub(self.names_dead) {
       self.compact_names();
     }
     slot
@@ -353,11 +393,18 @@ impl DirBlock {
       let mut s = self.slot(at);
       let name = self.name(s);
       let len = name.len();
-      let end = BLOCK_BYTES - used;
-      fresh[end - len..end].copy_from_slice(name.as_bytes());
-      used += len;
-      s.name_off = u16::try_from(end - len).unwrap_or(0);
-      s.write(&mut fresh[at * ENTRY_BYTES..]);
+      let end = BLOCK_BYTES.saturating_sub(used);
+      let start = end.saturating_sub(len);
+      if let Some(into) = fresh.get_mut(start..end) {
+        into.copy_from_slice(name.as_bytes());
+      }
+      used = used.saturating_add(len);
+      s.name_off = u16::try_from(start).unwrap_or(0);
+      s.write(
+        fresh
+          .get_mut(at.saturating_mul(ENTRY_BYTES)..)
+          .unwrap_or_default(),
+      );
     }
     self.bytes.copy_from_slice(&fresh);
     self.names_used = u16::try_from(used).unwrap_or(u16::MAX);
@@ -415,6 +462,15 @@ pub type Retired = Vec<(Handle<DirBlock>, Epoch)>;
 
 /// One step of a descent: the block and the position taken in it.
 type Path = [(Handle<DirBlock>, usize); MAX_HEIGHT];
+
+/// The block and slot a descent recorded at `level`; a level past the tree's height (never: `height <=
+/// MAX_HEIGHT`, and every caller asks below it) refuses typed.
+fn step(path: &Path, level: Option<usize>) -> Result<(Handle<DirBlock>, usize), VfsError> {
+  level
+    .and_then(|level| path.get(level))
+    .copied()
+    .ok_or(VfsError::StaleHandle)
+}
 
 impl Tree {
   /// An empty tree with one leaf born at `epoch`.
@@ -523,7 +579,7 @@ impl Tree {
         if level == 0 {
           self.root = fresh;
         } else {
-          let (parent, at) = path[level - 1];
+          let (parent, at) = step(&path, level.checked_sub(1))?;
           let mut s = blocks.get(parent)?.slot(at);
           s.child = handle_word(fresh);
           blocks.get_mut(parent)?.set_slot(at, s);
@@ -535,7 +591,9 @@ impl Tree {
       } else {
         0
       };
-      path[level] = (block, at);
+      if let Some(recorded) = path.get_mut(level) {
+        *recorded = (block, at);
+      }
       if level + 1 < usize::from(self.height) {
         block = handle_from_word(blocks.get(block)?.slot(at).child);
       }
@@ -673,7 +731,7 @@ impl Tree {
     Self::admit(blocks, copies.saturating_add(splits))?;
     let path = self.descend_mut(blocks, epoch, retired, policy, hash, name)?;
     let depth = usize::from(self.height) - 1;
-    let (leaf, _) = path[depth];
+    let (leaf, _) = step(&path, Some(depth))?;
     let at = match blocks.get(leaf)?.find(policy, hash, name) {
       Ok(_) => return Err(VfsError::AlreadyExists),
       Err(at) => at,
@@ -754,7 +812,7 @@ impl Tree {
       self.height += 1;
       return Ok(());
     }
-    let (parent, parent_at) = path[depth - 1];
+    let (parent, parent_at) = step(path, depth.checked_sub(1))?;
     self.insert_split(
       blocks,
       epoch,
@@ -794,7 +852,7 @@ impl Tree {
     Self::admit(blocks, copies.saturating_add(splits))?;
     let path = self.descend_mut(blocks, epoch, retired, policy, hash, old)?;
     let depth = usize::from(self.height) - 1;
-    let (leaf, _) = path[depth];
+    let (leaf, _) = step(&path, Some(depth))?;
     let Ok(at) = blocks.get(leaf)?.find(policy, hash, old) else {
       return Ok(false);
     };
@@ -822,7 +880,7 @@ impl Tree {
     Self::admit(blocks, copies)?;
     let path = self.descend_mut(blocks, epoch, retired, policy, hash, name)?;
     let depth = usize::from(self.height) - 1;
-    let (leaf, _) = path[depth];
+    let (leaf, _) = step(&path, Some(depth))?;
     let Ok(at) = blocks.get(leaf)?.find(policy, hash, name) else {
       return Ok(None);
     };
@@ -841,7 +899,7 @@ impl Tree {
     path: &Path,
     depth: usize,
   ) -> Result<(), VfsError> {
-    let (block, _) = path[depth];
+    let (block, _) = step(path, Some(depth))?;
     if depth == 0 {
       // The root: collapse a one-child index into its child.
       while self.height > 1 && blocks.get(self.root)?.count() == 1 {
@@ -853,7 +911,7 @@ impl Tree {
       }
       return Ok(());
     }
-    let (parent, parent_at) = path[depth - 1];
+    let (parent, parent_at) = step(path, depth.checked_sub(1))?;
     let count = blocks.get(block)?.count();
     if count == 0 {
       blocks.get_mut(parent)?.remove_at(parent_at);
@@ -922,7 +980,7 @@ impl Tree {
     let (copies, _) = self.descent_cost(blocks, epoch, policy, hash, name, 0)?;
     Self::admit(blocks, copies)?;
     let path = self.descend_mut(blocks, epoch, retired, policy, hash, name)?;
-    let (leaf, _) = path[usize::from(self.height) - 1];
+    let (leaf, _) = step(&path, usize::from(self.height).checked_sub(1))?;
     let Ok(at) = blocks.get(leaf)?.find(policy, hash, name) else {
       return Ok(false);
     };
@@ -999,24 +1057,54 @@ pub struct TreeIter<'b> {
 }
 
 impl<'b> TreeIter<'b> {
+  /// The block and slot on top of the stack.
+  fn top(&self) -> Option<(Handle<DirBlock>, usize)> {
+    self
+      .depth
+      .checked_sub(1)
+      .and_then(|level| self.stack.get(level))
+      .copied()
+  }
+
+  /// Moves the top of the stack to its next slot.
+  fn advance_top(&mut self) {
+    if let Some((_, at)) = self
+      .depth
+      .checked_sub(1)
+      .and_then(|level| self.stack.get_mut(level))
+    {
+      *at = at.saturating_add(1);
+    }
+  }
+
+  /// Leaves the top block: back to its parent, which moves on to its next child.
+  fn pop(&mut self) {
+    self.depth = self.depth.saturating_sub(1);
+    self.advance_top();
+  }
+
   /// Descends leftmost from the top of the stack until a leaf is on top.
   fn settle(&mut self) {
-    while self.depth > 0 && self.depth < self.height {
-      let (h, at) = self.stack[self.depth - 1];
+    while self.depth < self.height {
+      let Some((h, at)) = self.top() else {
+        return;
+      };
       let Ok(b) = self.blocks.get(h) else {
         self.depth = 0;
         return;
       };
       if at >= b.count() {
-        self.depth -= 1;
-        if self.depth > 0 {
-          self.stack[self.depth - 1].1 += 1;
-        }
+        self.pop();
         continue;
       }
       let child = handle_from_word(b.slot(at).child);
-      self.stack[self.depth] = (child, 0);
-      self.depth += 1;
+      let Some(below) = self.stack.get_mut(self.depth) else {
+        // Deeper than `MAX_HEIGHT` (never: `height` is at most it): the walk ends rather than misreads.
+        self.depth = 0;
+        return;
+      };
+      *below = (child, 0);
+      self.depth = self.depth.saturating_add(1);
     }
   }
 }
@@ -1026,21 +1114,15 @@ impl<'b> Iterator for TreeIter<'b> {
 
   fn next(&mut self) -> Option<Self::Item> {
     loop {
-      if self.depth == 0 {
-        return None;
-      }
-      let (h, at) = self.stack[self.depth - 1];
+      let (h, at) = self.top()?;
       let b = self.blocks.get(h).ok()?;
       if at < b.count() {
-        self.stack[self.depth - 1].1 += 1;
+        self.advance_top();
         let s = b.slot(at);
         return Some((s.hash, b.name(s), s.to_child()));
       }
       // This leaf is done: go up one level, advance, and settle on the next leaf.
-      self.depth -= 1;
-      if self.depth > 0 {
-        self.stack[self.depth - 1].1 += 1;
-      }
+      self.pop();
       self.settle();
     }
   }

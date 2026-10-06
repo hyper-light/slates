@@ -7,7 +7,12 @@
 //! xattr) merge per path with their conflict classes, several dimensions merge on one path in one
 //! increment, a directory move merges as its child ops, and retries are idempotent by identity.
 // Test harness code: an unwrap or a panic in a helper is a failed test, which is what it should be.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![allow(
+  clippy::unwrap_used,
+  clippy::expect_used,
+  clippy::panic,
+  clippy::indexing_slicing
+)]
 
 mod common;
 
@@ -357,6 +362,29 @@ fn an_intervening_insert_shifts_a_later_edit() {
   let outcome = green.submit(&Build::new().overwrite("f", 8, b"YY").at(3, 1));
   assert_eq!(outcome, Outcome::Accepted { version: 3 });
   assert_eq!(green.content("f"), Some(b"XX01234567YY".as_slice()));
+}
+
+/// Hostile input, D-27: an increment's ops document is decoded from bytes a peer sent and is not checked
+/// against the file it edits. Do submit a delete that runs past the end of a ten-byte base, then an insert
+/// past where the delete stopped, over an intervening insert so the whole-file identity check replays them.
+/// Expect a typed conflict naming the path and the file unchanged: before 2026-10-06 the replay sliced the
+/// base from 20 to 10 and aborted the merge service, and with the slice bounded it clamped and accepted "XXZ".
+#[test]
+fn an_increment_whose_ops_run_past_the_base_is_judged_not_panicked() {
+  let mut green = Green::new();
+  green.submit(&Build::new().create("f", b"0123456789").at(1, 0));
+  green.submit(&Build::new().insert("f", 0, b"XX").at(2, 1));
+  let hostile = Build::new()
+    .content(OpKind::Delete, "f", 0, &[0; 20])
+    .content(OpKind::Insert, "f", 30, b"Z")
+    .at(3, 1);
+  let outcome = green.submit(&hostile);
+  assert!(matches!(outcome, Outcome::Conflict { .. }), "{outcome:?}");
+  assert_eq!(
+    green.content("f"),
+    Some(b"XX0123456789".as_slice()),
+    "nothing was applied"
+  );
 }
 
 /// The fast path fires when a path is unchanged since the increment's base, and it is counted.

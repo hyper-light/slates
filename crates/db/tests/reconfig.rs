@@ -8,6 +8,8 @@
 //! - NoLoss: once the old set is retired, every record committed under the joint rule at retirement
 //!   is still subsumed by a committed record (nothing committed during the change is lost).
 
+// Test code may panic (CLAUDE.md §2 item 6 applies to shipped code).
+#![allow(clippy::indexing_slicing)]
 use slates_db::reconfig::{Phase, Reconfiguration, RetireError};
 use slates_db::register::HostId;
 

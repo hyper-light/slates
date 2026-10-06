@@ -2,6 +2,8 @@
 //! the grant-flow session, and the overlay edits the scenarios are built from. Every test crate
 //! includes this module with `mod common;`.
 
+// Test code may panic (CLAUDE.md §2 item 6 applies to shipped code).
+#![allow(clippy::indexing_slicing, clippy::string_slice)]
 #![allow(dead_code)]
 
 pub(crate) mod removal;

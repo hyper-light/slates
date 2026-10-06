@@ -2,7 +2,7 @@
 //! with identical observable results, and the runtime's public surface behaves the same in both.
 
 // Test harness code: an unwrap here is a failed test, which is what it should be.
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
 use std::sync::mpsc::{Sender, channel};
 

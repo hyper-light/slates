@@ -234,8 +234,8 @@ pub fn admission_limit(requests_per_second: u64, p99_service_ns: u64) -> Derived
 pub(crate) fn connect_pairs(seeds: &mut [ShardSeed]) -> Result<(), RtError> {
   let entries = seeds.first().map_or(1, |s| s.config.ring_entries);
   let ids: Vec<u16> = seeds.iter().map(|s| s.id).collect();
-  for a in 0..seeds.len() {
-    for b in 0..seeds.len() {
+  for (a, &source) in ids.iter().enumerate() {
+    for (b, &target) in ids.iter().enumerate() {
       if a == b {
         continue;
       }
@@ -243,13 +243,19 @@ pub(crate) fn connect_pairs(seeds: &mut [ShardSeed]) -> Result<(), RtError> {
       // `&'static`: the entry outlives every borrower (its slot is given back only after every
       // thread of the runtime joined, and the entry itself is dropped only by the slot's next
       // registration), so the lifetime is the slot protocol's promise, not a leak.
-      let ring: &'static SpscRing = registry::lend_pair_ring(ids[a], SpscRing::new(entries)?)
-        .ok_or(RtError::ShardGone { shard: ids[a] })?;
+      let ring: &'static SpscRing = registry::lend_pair_ring(source, SpscRing::new(entries)?)
+        .ok_or(RtError::ShardGone { shard: source })?;
       // Split once, here: the source shard holds the only producer and the target the only consumer for
       // their contexts' lives (AUD-29-33).
-      let (producer, consumer) = ring.split().ok_or(RtError::RingClaimed { shard: ids[a] })?;
-      seeds[a].set_outbound(ids[b], producer);
-      seeds[b].set_inbound(consumer);
+      let (producer, consumer) = ring.split().ok_or(RtError::RingClaimed { shard: source })?;
+      seeds
+        .get_mut(a)
+        .ok_or(RtError::ShardGone { shard: source })?
+        .set_outbound(target, producer);
+      seeds
+        .get_mut(b)
+        .ok_or(RtError::ShardGone { shard: target })?
+        .set_inbound(consumer);
     }
   }
   Ok(())

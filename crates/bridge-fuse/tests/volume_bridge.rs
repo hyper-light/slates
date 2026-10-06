@@ -3,7 +3,12 @@
 //! FUSE CREATE/WRITE/LOOKUP/GETATTR/READ/READDIR round trip is exercised on every host without
 //! a mount. This is the read-and-write path the `cargo build` workload leans on.
 // Test harness code: an unwrap here is a failed test.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![allow(
+  clippy::unwrap_used,
+  clippy::expect_used,
+  clippy::panic,
+  clippy::indexing_slicing
+)]
 
 use slates_bridge_core::{Attachments, OpContext, Rights, View};
 use slates_bridge_fuse::abi::{IN_HEADER_LEN, OUT_HEADER_LEN, Opcode};

@@ -52,7 +52,11 @@ fn write_notification(code: i32, body: &[u8], out: &mut [u8]) -> Result<usize, F
   w.u32(code.cast_unsigned());
   w.u64(0); // unique: zero marks an unsolicited notification
   w.bytes(body);
-  out[..total].copy_from_slice(w.as_bytes());
+  let have = out.len();
+  out
+    .get_mut(..total)
+    .ok_or(FuseError::ReplyTooSmall { have, need: total })?
+    .copy_from_slice(w.as_bytes());
   Ok(total)
 }
 

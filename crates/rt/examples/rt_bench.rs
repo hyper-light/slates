@@ -3,6 +3,8 @@
 //!
 //! `cargo run --release -p slates-rt --example rt_bench`
 
+// Test code may panic (CLAUDE.md §2 item 6 applies to shipped code).
+#![allow(clippy::indexing_slicing)]
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::channel;
 use std::time::Duration;

@@ -4,7 +4,7 @@
 //! an attribute's value is never reachable as a namespace object by its inode number; and a recovery
 //! image rebuilds every attribute. The model oracle (`tests/model.rs`) covers generated histories and
 //! the charges; the host differential compares with the host's own `user.*` attributes.
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::unwrap_in_result)]
 
 mod common;
 

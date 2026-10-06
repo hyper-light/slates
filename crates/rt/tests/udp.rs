@@ -5,7 +5,12 @@
 //! readiness-native driver (kqueue here on macOS; epoll on Linux) — no foreign runtime.
 
 // Test harness code: an unwrap here is a failed test, which is what it should be.
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![allow(
+  clippy::unwrap_used,
+  clippy::expect_used,
+  clippy::indexing_slicing,
+  clippy::unwrap_in_result
+)]
 
 use std::sync::mpsc::channel;
 use std::time::Duration;

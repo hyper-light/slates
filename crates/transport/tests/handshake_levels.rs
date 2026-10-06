@@ -5,7 +5,12 @@
 //! both levels crossed as one plaintext stream, and an observer read the certificates off it.
 
 // Test harness code: an unwrap here is a failed test, which is what it should be.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![allow(
+  clippy::unwrap_used,
+  clippy::expect_used,
+  clippy::panic,
+  clippy::indexing_slicing
+)]
 
 use std::sync::mpsc::{Sender, channel};
 

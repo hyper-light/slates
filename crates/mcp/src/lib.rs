@@ -19,17 +19,10 @@
 //! block (the same, rendered), the shape MCP clients expect. Volume ids cross the wire as lowercase
 //! hex, opaque to the agent and echoed back on every result.
 
-// The no-panic law (CLAUDE.md, banned item 6): shipped code never indexes or slices out of bounds, never
-// slices a string off a character boundary, and never overflows. Test builds are exempt. Once a crate is
-// clean this holds it there.
-#![cfg_attr(
-  not(test),
-  deny(
-    clippy::indexing_slicing,
-    clippy::string_slice,
-    clippy::arithmetic_side_effects
-  )
-)]
+// The no-panic law (CLAUDE.md, banned item 6): shipped code never overflows or divides by zero. Test builds
+// are exempt. Once a crate is clean this holds it there; out-of-bounds indexing and slicing are denied
+// workspace-wide.
+#![cfg_attr(not(test), deny(clippy::arithmetic_side_effects))]
 
 use serde_json::{Value, json};
 use slates_client::{

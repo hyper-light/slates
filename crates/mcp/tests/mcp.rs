@@ -4,7 +4,13 @@
 //! would receive. The scenarios share one daemon in one serial test so their spinning shards do not
 //! contend (the daemon-per-test contention the client and server tests also avoid).
 // Test harness code: an unwrap here is a failed test, which is what it should be.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![allow(
+  clippy::unwrap_used,
+  clippy::expect_used,
+  clippy::panic,
+  clippy::indexing_slicing,
+  clippy::string_slice
+)]
 
 use std::time::{Duration, Instant};
 

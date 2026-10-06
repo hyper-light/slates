@@ -3,7 +3,12 @@
 //! (the client parks on the wake word, the daemon wakes it: the cost the spin window is
 //! measured against). Rows are `ratchet\t<key>\t<lower>\t<median>\t<upper>` in nanoseconds.
 // Bench harness code: an unwrap here is a failed run.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![allow(
+  clippy::unwrap_used,
+  clippy::expect_used,
+  clippy::panic,
+  clippy::indexing_slicing
+)]
 
 use std::time::Instant;
 

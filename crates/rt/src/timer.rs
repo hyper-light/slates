@@ -111,9 +111,13 @@ impl Wheel {
   /// The removed entry carries its own recorded position, so the unlink needs no second read of it.
   pub fn cancel(&mut self, id: TimerId) -> Result<(), RtError> {
     let removed = self.entries.remove(id)?;
-    let head = usize::from(removed.level) * SLOTS_PER_LEVEL + usize::from(removed.slot);
-    self.unlink_at(removed.next, removed.prev, head);
-    self.armed -= 1;
+    self.unlink_at(
+      removed.next,
+      removed.prev,
+      usize::from(removed.level),
+      usize::from(removed.slot),
+    );
+    self.armed = self.armed.saturating_sub(1);
     if self.earliest == Some(removed.deadline) {
       // The earliest may have been this one; the next query rescans.
       self.earliest_exact = false;
@@ -176,7 +180,7 @@ impl Wheel {
           break;
         }
         let slot = usize::try_from((boundary >> shift) & (SLOTS_PER_LEVEL as u64 - 1)).unwrap_or(0);
-        if self.heads[level * SLOTS_PER_LEVEL + slot] != NONE {
+        if self.head(level, slot) != NONE {
           best = boundary;
           break;
         }
@@ -187,7 +191,7 @@ impl Wheel {
   }
 
   fn expire_tick(&mut self, fired: &mut Vec<u64>) {
-    self.visits += 1;
+    self.visits = self.visits.saturating_add(1);
     let tick = self.now_tick;
     // Level 0 slot for this tick fires; a higher level's slot that this tick enters cascades.
     for level in 0..LEVELS {
@@ -196,9 +200,8 @@ impl Wheel {
         break;
       }
       let slot = usize::try_from((tick >> shift) & (SLOTS_PER_LEVEL as u64 - 1)).unwrap_or(0);
-      let head = level * SLOTS_PER_LEVEL + slot;
-      let mut index = self.heads[head];
-      self.heads[head] = NONE;
+      let mut index = self.head(level, slot);
+      self.set_head(level, slot, NONE);
       while index != NONE {
         let (next, deadline, word) = {
           let Ok(entry) = self
@@ -214,7 +217,7 @@ impl Wheel {
           let _ = self
             .entries
             .remove(Handle::from_raw(index, self.generation_of(index)));
-          self.armed -= 1;
+          self.armed = self.armed.saturating_sub(1);
         } else {
           self.link(index, deadline);
         }
@@ -238,8 +241,7 @@ impl Wheel {
 
   fn link(&mut self, index: u32, deadline: u64) {
     let (level, slot) = self.level_and_slot(deadline);
-    let head = level * SLOTS_PER_LEVEL + slot;
-    let old = self.heads[head];
+    let old = self.head(level, slot);
     if let Ok(entry) = self
       .entries
       .get_mut(Handle::from_raw(index, self.generation_of(index)))
@@ -256,7 +258,29 @@ impl Wheel {
     {
       next.prev = index;
     }
-    self.heads[head] = index;
+    self.set_head(level, slot, index);
+  }
+
+  /// The first entry of `(level, slot)`'s list, or `NONE`; a position outside the wheel holds nothing.
+  fn head(&self, level: usize, slot: usize) -> u32 {
+    self
+      .heads
+      .get(Self::head_index(level, slot))
+      .copied()
+      .unwrap_or(NONE)
+  }
+
+  /// Points `(level, slot)`'s list at `index`; `level_and_slot` and the expiry walk only name positions inside
+  /// the wheel, so the miss arm never runs.
+  fn set_head(&mut self, level: usize, slot: usize, index: u32) {
+    if let Some(head) = self.heads.get_mut(Self::head_index(level, slot)) {
+      *head = index;
+    }
+  }
+
+  /// The flat position of `(level, slot)` in `heads`.
+  fn head_index(level: usize, slot: usize) -> usize {
+    level.saturating_mul(SLOTS_PER_LEVEL).saturating_add(slot)
   }
 
   /// Splices an entry out of its doubly-linked slot list given the position it recorded — its `next`,
@@ -264,9 +288,9 @@ impl Wheel {
   /// caller removed it after validating its generation), so this only mends its former neighbours and the
   /// head pointer. Its neighbours are the entry's own list-mates, so they are live at their current
   /// generation.
-  fn unlink_at(&mut self, next: u32, prev: u32, head: usize) {
+  fn unlink_at(&mut self, next: u32, prev: u32, level: usize, slot: usize) {
     if prev == NONE {
-      self.heads[head] = next;
+      self.set_head(level, slot, next);
     } else if let Ok(p) = self
       .entries
       .get_mut(Handle::from_raw(prev, self.generation_of(prev)))

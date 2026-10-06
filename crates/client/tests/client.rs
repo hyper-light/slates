@@ -4,7 +4,12 @@
 //! volume and its snapshot are recovered from anchor-owned RAM; a second client cannot take a
 //! live session.
 // Test harness code: an unwrap here is a failed test, which is what it should be.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![allow(
+  clippy::unwrap_used,
+  clippy::expect_used,
+  clippy::panic,
+  clippy::panic_in_result_fn
+)]
 
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};

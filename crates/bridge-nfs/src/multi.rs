@@ -286,9 +286,14 @@ impl<V: VolumeSet> MultiExport<V> {
       hasher.update(name.as_bytes());
       hasher.update(&id.bytes);
     }
-    let mut eight = [0u8; size_of::<u64>()];
-    eight.copy_from_slice(&hasher.finalize().as_bytes()[..size_of::<u64>()]);
-    u64::from_be_bytes(eight)
+    u64::from_be_bytes(
+      hasher
+        .finalize()
+        .as_bytes()
+        .first_chunk()
+        .copied()
+        .unwrap_or_default(),
+    )
   }
 
   /// A cookie-verifier for the root listing: the listing's digest, so a client continuing a listing

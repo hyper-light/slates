@@ -14,7 +14,12 @@
 
 // Test harness code: an unwrap here is a failed test. proptest's strategy macros expand to
 // `Arc`-carrying unions; the test-harness exception of D-8 covers it.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::disallowed_types)]
+#![allow(
+  clippy::unwrap_used,
+  clippy::expect_used,
+  clippy::disallowed_types,
+  clippy::indexing_slicing
+)]
 
 use std::collections::BTreeMap;
 

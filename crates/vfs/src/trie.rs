@@ -49,6 +49,18 @@ impl TrieNode {
       slots: [Slot::Empty; FANOUT],
     }
   }
+
+  /// The slot for digit `d`; `digit` masks to the fanout, so the empty arm never runs.
+  fn at(&self, d: usize) -> Slot {
+    self.slots.get(d).copied().unwrap_or(Slot::Empty)
+  }
+
+  /// Sets the slot for digit `d` (inside the fanout, as `at`).
+  fn put(&mut self, d: usize, slot: Slot) {
+    if let Some(held) = self.slots.get_mut(d) {
+      *held = slot;
+    }
+  }
 }
 
 /// The digit of `no` at `level` (0 = the top level).
@@ -66,7 +78,7 @@ pub fn new_root(nodes: &mut Slab<TrieNode>, epoch: Epoch) -> Result<Handle<TrieN
 pub fn get(nodes: &Slab<TrieNode>, root: Handle<TrieNode>, no: InodeNo) -> Option<Handle<Inode>> {
   let mut node = root;
   for level in 0..LEVELS {
-    let slot = nodes.get(node).ok()?.slots[digit(no, level)];
+    let slot = nodes.get(node).ok()?.at(digit(no, level));
     match slot {
       Slot::Empty => return None,
       Slot::Node(next) => node = next,
@@ -90,7 +102,7 @@ pub(crate) fn nodes_to_set(
   let mut needed = copy(root)?;
   let mut node = root;
   for level in 0..LEVELS.saturating_sub(1) {
-    match nodes.get(node)?.slots[digit(no, level)] {
+    match nodes.get(node)?.at(digit(no, level)) {
       Slot::Node(child) => {
         needed = needed.saturating_add(copy(child)?);
         node = child;
@@ -121,7 +133,7 @@ fn nodes_to_remove(
   let mut needed = copy(root)?;
   let mut node = root;
   for level in 0..LEVELS {
-    match nodes.get(node)?.slots[digit(no, level)] {
+    match nodes.get(node)?.at(digit(no, level)) {
       Slot::Node(child) => {
         needed = needed.saturating_add(copy(child)?);
         node = child;
@@ -164,19 +176,19 @@ pub fn set(
   for level in 0..LEVELS {
     let d = digit(no, level);
     let last = level == LEVELS - 1;
-    let current = nodes.get(node)?.slots[d];
+    let current = nodes.get(node)?.at(d);
     if last {
       if let Slot::Inode(old) = current {
         previous = Some(old);
       }
-      nodes.get_mut(node)?.slots[d] = Slot::Inode(handle);
+      nodes.get_mut(node)?.put(d, Slot::Inode(handle));
       break;
     }
     let child = match current {
       Slot::Node(child) => ensure_current(nodes, child, epoch, dead)?,
       _ => nodes.insert(TrieNode::empty(epoch))?,
     };
-    nodes.get_mut(node)?.slots[d] = Slot::Node(child);
+    nodes.get_mut(node)?.put(d, Slot::Node(child));
     path.push((node, d));
     node = child;
   }
@@ -206,16 +218,16 @@ pub fn remove(
     Vec::with_capacity(usize::try_from(LEVELS).unwrap_or(0));
   for level in 0..LEVELS {
     let d = digit(no, level);
-    let current = nodes.get(node)?.slots[d];
+    let current = nodes.get(node)?.at(d);
     match current {
       Slot::Inode(old) => {
-        nodes.get_mut(node)?.slots[d] = Slot::Empty;
+        nodes.get_mut(node)?.put(d, Slot::Empty);
         prune(nodes, node, &path)?;
         return Ok((new_root, Some(old)));
       }
       Slot::Node(child) => {
         let child = ensure_current(nodes, child, epoch, dead)?;
-        nodes.get_mut(node)?.slots[d] = Slot::Node(child);
+        nodes.get_mut(node)?.put(d, Slot::Node(child));
         path.push((node, d));
         node = child;
       }

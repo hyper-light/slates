@@ -449,9 +449,9 @@ impl<'v> VolumeBridge<'v> {
 
   /// The entry and parent-attribute invalidations for the name at `path`.
   fn entry_invalidation(&mut self, path: &str, out: &mut Vec<Invalidation>) {
-    let (dir, name) = match path.rfind('/') {
-      Some(0) => ("/", &path[1..]),
-      Some(at) => (&path[..at], &path[at + 1..]),
+    let (dir, name) = match path.rsplit_once('/') {
+      Some(("", name)) => ("/", name),
+      Some((dir, name)) => (dir, name),
       None => ("/", path),
     };
     if name.is_empty() {

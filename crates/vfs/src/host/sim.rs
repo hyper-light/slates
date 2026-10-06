@@ -522,7 +522,10 @@ impl SimHost {
       n.mtime_ns = now;
       n.ctime_ns = now;
     }
-    let parent = parts[..parts.len().saturating_sub(1)].to_vec();
+    let parent = parts
+      .split_last()
+      .map(|(_, parent)| parent.to_vec())
+      .unwrap_or_default();
     self.hint_for(&parent);
   }
 
@@ -760,11 +763,11 @@ impl HostFs for SimHost {
     self.tick();
     let node = self.live_node(file)?;
     let off = usize::try_from(off).unwrap_or(usize::MAX);
-    if off >= node.bytes.len() {
-      return Ok(0);
+    let held = node.bytes.get(off..).unwrap_or_default();
+    let n = buf.len().min(held.len());
+    if let (Some(into), Some(from)) = (buf.get_mut(..n), held.get(..n)) {
+      into.copy_from_slice(from);
     }
-    let n = buf.len().min(node.bytes.len() - off);
-    buf[..n].copy_from_slice(&node.bytes[off..off + n]);
     Ok(n)
   }
 
@@ -902,10 +905,7 @@ impl LandFs for SimHost {
     let off = usize::try_from(off).map_err(|_| HostError::Unavailable(SIM_EINVAL))?;
     let (node_ino, placed) = match self.opens.get_mut(&file.0) {
       Some(Open::Temp { node, placed }) => {
-        if node.bytes.len() < off + bytes.len() {
-          node.bytes.resize(off + bytes.len(), 0);
-        }
-        node.bytes[off..off + bytes.len()].copy_from_slice(bytes);
+        write_into(&mut node.bytes, off, bytes)?;
         node.mtime_ns = now;
         node.ctime_ns = now;
         (node.ino, placed.clone())
@@ -918,10 +918,7 @@ impl LandFs for SimHost {
       && let Some(n) = self.node_mut(&parts)
       && n.ino == node_ino
     {
-      if n.bytes.len() < off + bytes.len() {
-        n.bytes.resize(off + bytes.len(), 0);
-      }
-      n.bytes[off..off + bytes.len()].copy_from_slice(bytes);
+      write_into(&mut n.bytes, off, bytes)?;
       n.mtime_ns = now;
     }
     Ok(())
@@ -1170,4 +1167,20 @@ impl SimHost {
     }
     find(&mut self.root, ino)
   }
+}
+
+/// Writes `bytes` at `off` of a simulated file, growing it with zeros as a real write past the end does; an end
+/// past `usize` refuses as the kernel's `EINVAL` would.
+fn write_into(file: &mut Vec<u8>, off: usize, bytes: &[u8]) -> Result<(), HostError> {
+  let end = off
+    .checked_add(bytes.len())
+    .ok_or(HostError::Unavailable(SIM_EINVAL))?;
+  if file.len() < end {
+    file.resize(end, 0);
+  }
+  file
+    .get_mut(off..end)
+    .ok_or(HostError::Unavailable(SIM_EINVAL))?
+    .copy_from_slice(bytes);
+  Ok(())
 }

@@ -216,13 +216,13 @@ fn pair_list(cores: &[CoreFacts]) -> Vec<(u32, u32)> {
   let ids: Vec<u32> = cores.iter().map(|c| c.id).collect();
   let mut pairs = Vec::new();
   if ids.len() <= FULL_MATRIX_CORE_LIMIT {
-    for (i, a) in ids.iter().enumerate() {
-      for b in &ids[i + 1..] {
-        pairs.push((*a, *b));
-      }
+    let mut rest = ids.as_slice();
+    while let Some((a, later)) = rest.split_first() {
+      pairs.extend(later.iter().map(|b| (*a, *b)));
+      rest = later;
     }
-  } else if let Some(first) = ids.first() {
-    pairs.extend(ids[1..].iter().map(|b| (*first, *b)));
+  } else if let Some((first, rest)) = ids.split_first() {
+    pairs.extend(rest.iter().map(|b| (*first, *b)));
   }
   pairs
 }
@@ -325,7 +325,14 @@ pub fn memcpy_curve(cache_line: u64, cap: u64, budget: Duration) -> Vec<MemcpyPo
     .into_iter()
     .map(|bytes| {
       let n = usize::try_from(bytes).unwrap_or(0);
-      let per_copy = measure(|| dst[..n].copy_from_slice(&src[..n]), per_point);
+      let per_copy = measure(
+        || {
+          if let (Some(to), Some(from)) = (dst.get_mut(..n), src.get(..n)) {
+            to.copy_from_slice(from);
+          }
+        },
+        per_point,
+      );
       std::hint::black_box(&dst);
       MemcpyPoint {
         bytes,
@@ -450,8 +457,8 @@ pub fn filled(len: usize, seed: u64) -> Vec<u8> {
   let mut out = Vec::with_capacity(len);
   while out.len() < len {
     let word = rng.next_u64().to_le_bytes();
-    let take = (len - out.len()).min(word.len());
-    out.extend_from_slice(&word[..take]);
+    let take = len.saturating_sub(out.len());
+    out.extend_from_slice(word.get(..take).unwrap_or(&word));
   }
   out
 }
@@ -504,11 +511,21 @@ pub fn corpus(len: usize) -> Vec<u8> {
   let mut rng = Xorshift::new(Xorshift::SEED);
   let mut out = Vec::with_capacity(len);
   while out.len() < half {
-    let word = WORDS[rng.below(WORDS.len())].as_bytes();
-    let take = (half - out.len()).min(word.len());
-    out.extend_from_slice(&word[..take]);
+    let word = WORDS
+      .get(rng.below(WORDS.len()))
+      .copied()
+      .unwrap_or_default()
+      .as_bytes();
+    if word.is_empty() {
+      break;
+    }
+    let take = half.saturating_sub(out.len());
+    out.extend_from_slice(word.get(..take).unwrap_or(word));
   }
-  out.extend_from_slice(&filled(len - out.len(), Xorshift::SEED ^ u64::MAX));
+  out.extend_from_slice(&filled(
+    len.saturating_sub(out.len()),
+    Xorshift::SEED ^ u64::MAX,
+  ));
   out
 }
 
@@ -553,11 +570,10 @@ mod platform {
   }
 
   fn touch_every(map: &mut MmapMut, page: usize) {
-    let len = map.len();
     let mut at = 0;
-    while at < len {
-      map[at] = 1;
-      at += page.max(1);
+    while let Some(byte) = map.get_mut(at) {
+      *byte = 1;
+      at = at.saturating_add(page.max(1));
     }
     std::hint::black_box(&map[..]);
   }
@@ -615,10 +631,13 @@ mod platform {
             let _ = map.advise(memmap2::Advice::HugePage);
             let start = map.as_ptr().addr().next_multiple_of(huge_usize) - map.as_ptr().addr();
             let span = huge_usize * 2;
+            let end = start.saturating_add(span);
             let mut at = start;
-            while at < start + span {
-              map[at] = 1;
-              at += base;
+            while at < end
+              && let Some(byte) = map.get_mut(at)
+            {
+              *byte = 1;
+              at = at.saturating_add(base.max(1));
             }
             std::hint::black_box(&map[..]);
             drop(map);

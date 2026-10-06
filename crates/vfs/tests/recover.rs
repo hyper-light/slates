@@ -5,7 +5,12 @@
 //! read as a smaller volume. This is the capture half of the write→kill→restart→read proof: what a
 //! running daemon would publish into anchor-owned RAM. Driven against an in-memory scratch volume
 //! on every host.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![allow(
+  clippy::unwrap_used,
+  clippy::expect_used,
+  clippy::panic,
+  clippy::indexing_slicing
+)]
 
 mod common;
 

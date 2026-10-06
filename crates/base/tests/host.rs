@@ -4,7 +4,12 @@
 
 // Test harness code: an unwrap here is a failed test. The build-output tests write there
 // through the standard library to play the outsider; the crate under test writes nothing.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::disallowed_methods)]
+#![allow(
+  clippy::unwrap_used,
+  clippy::expect_used,
+  clippy::disallowed_methods,
+  clippy::indexing_slicing
+)]
 
 use std::path::PathBuf;
 

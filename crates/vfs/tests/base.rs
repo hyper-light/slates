@@ -11,7 +11,9 @@
   clippy::unwrap_used,
   clippy::expect_used,
   clippy::disallowed_types,
-  clippy::panic
+  clippy::panic,
+  clippy::indexing_slicing,
+  clippy::unwrap_in_result
 )]
 
 use std::collections::{BTreeMap, BTreeSet};

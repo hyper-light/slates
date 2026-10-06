@@ -8,7 +8,12 @@
 //! tests agree with themselves. Layouts are checked by building or reading bodies at the
 //! header's byte offsets, independently of the sequential reader and writer the codec uses.
 // Test harness code: an unwrap here is a failed test.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![allow(
+  clippy::unwrap_used,
+  clippy::expect_used,
+  clippy::panic,
+  clippy::indexing_slicing
+)]
 
 use slates_bridge_fuse::abi::{
   FUSE_KERNEL_MINOR_VERSION, FUSE_KERNEL_VERSION, IN_HEADER_LEN, OUT_HEADER_LEN, Opcode, flags,

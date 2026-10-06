@@ -6,7 +6,12 @@
 //! FUSE codec's `dispatch` directly, over a second identical scratch volume with the same
 //! deterministic clock, must produce byte-identical replies.
 // Test harness code: an unwrap here is a failed test.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![allow(
+  clippy::unwrap_used,
+  clippy::expect_used,
+  clippy::panic,
+  clippy::indexing_slicing
+)]
 
 mod common;
 

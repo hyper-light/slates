@@ -1,5 +1,10 @@
 //! A-26 / §4.16: IPC namespace metadata is versioned without creating a file-content path.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![allow(
+  clippy::unwrap_used,
+  clippy::expect_used,
+  clippy::panic,
+  clippy::indexing_slicing
+)]
 
 mod common;
 

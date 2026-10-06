@@ -227,7 +227,9 @@ impl ContentMap {
     }
     let mut tail = self.segments.split_off(index);
     if let Some((i, head, rest)) = carry {
-      self.segments[i] = head;
+      if let Some(kept) = self.segments.get_mut(i) {
+        *kept = head;
+      }
       tail.insert(0, rest);
     }
     tail
@@ -315,17 +317,18 @@ pub fn apply_hunks(base: &[u8], post: &[u8], hunks: &[Hunk]) -> Option<Vec<u8>> 
     let base_len = usize::try_from(h.base_len).ok()?;
     let post_at = usize::try_from(h.post_at).ok()?;
     let new_len = usize::try_from(h.new_len).ok()?;
-    if base_at < base_cursor || base_at + base_len > base.len() {
+    let base_end = base_at.checked_add(base_len)?;
+    if base_at < base_cursor || base_end > base.len() {
       return None;
     }
-    out.extend_from_slice(&base[base_cursor..base_at]);
-    if post_at != out.len() || post_at + new_len > post.len() {
+    out.extend_from_slice(base.get(base_cursor..base_at)?);
+    if post_at != out.len() {
       return None;
     }
-    out.extend_from_slice(&post[post_at..post_at + new_len]);
-    base_cursor = base_at + base_len;
+    out.extend_from_slice(post.get(post_at..post_at.checked_add(new_len)?)?);
+    base_cursor = base_end;
   }
-  out.extend_from_slice(&base[base_cursor..]);
+  out.extend_from_slice(base.get(base_cursor..)?);
   Some(out)
 }
 

@@ -16,7 +16,12 @@
 //! seed; the box's load does not bear on it. Test by use (R5).
 
 // Test harness: an unwrap, expect or panic here is a failed test.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![allow(
+  clippy::unwrap_used,
+  clippy::expect_used,
+  clippy::panic,
+  clippy::indexing_slicing
+)]
 
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;

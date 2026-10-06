@@ -478,7 +478,10 @@ fn describe(entry: &Entry) -> String {
     if entry.digest.is_empty() {
       "-"
     } else {
-      &entry.digest[..entry.digest.len().min(DIGEST_PREVIEW_CHARS)]
+      entry
+        .digest
+        .get(..DIGEST_PREVIEW_CHARS)
+        .unwrap_or(&entry.digest)
     }
   )
 }

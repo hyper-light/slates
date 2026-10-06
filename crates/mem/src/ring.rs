@@ -129,7 +129,11 @@ impl Producer<'_> {
     if tail.wrapping_sub(head) == self.ring.capacity() {
       return Err(word);
     }
-    self.ring.slots[tail & self.ring.mask].store(word, Ordering::Relaxed);
+    // `mask` is the slot count minus one, so the masked index is always a slot; a miss reads as full.
+    let Some(slot) = self.ring.slots.get(tail & self.ring.mask) else {
+      return Err(word);
+    };
+    slot.store(word, Ordering::Relaxed);
     self
       .ring
       .tail
@@ -152,7 +156,11 @@ impl Consumer<'_> {
     if head == tail {
       return None;
     }
-    let word = self.ring.slots[head & self.ring.mask].load(Ordering::Relaxed);
+    let word = self
+      .ring
+      .slots
+      .get(head & self.ring.mask)?
+      .load(Ordering::Relaxed);
     self
       .ring
       .head

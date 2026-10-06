@@ -9,7 +9,12 @@
 //! list only shrinks" holds across commits. The `--ignored regenerate_the_evidence_matrix` writer
 //! rewrites the block deliberately; a normal run never mutates the tree.
 // Test harness code: an unwrap here is a failed test, which is what it should be.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![allow(
+  clippy::unwrap_used,
+  clippy::expect_used,
+  clippy::panic,
+  clippy::string_slice
+)]
 
 use std::path::{Path, PathBuf};
 

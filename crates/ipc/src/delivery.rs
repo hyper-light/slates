@@ -275,7 +275,7 @@ const OUTPUT_CHUNK: usize = 4096;
 fn keep_within(kept: &mut Vec<u8>, chunk: &[u8], capacity: usize, offered: &mut usize) {
   *offered = offered.saturating_add(chunk.len());
   let room = capacity.saturating_sub(kept.len());
-  kept.extend_from_slice(&chunk[..chunk.len().min(room)]);
+  kept.extend_from_slice(chunk.get(..room).unwrap_or(chunk));
 }
 
 /// A workload [`Delivery::spawn`] started: waited for, or killed, by the harness that owns it.
@@ -536,7 +536,12 @@ mod platform {
         loop {
           match std::io::Read::read(&mut stdout, &mut chunk) {
             Ok(0) => break,
-            Ok(got) => keep_within(&mut kept, &chunk[..got], capacity, &mut offered),
+            Ok(got) => keep_within(
+              &mut kept,
+              chunk.get(..got).unwrap_or(&chunk),
+              capacity,
+              &mut offered,
+            ),
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
             Err(e) => return Err(refused_io("read", &e)),
           }
@@ -611,10 +616,13 @@ mod platform {
   fn read_record(fd: &OwnedFd, record: &mut [u8; RECORD_BYTES]) -> Result<(), DeliveryFault> {
     let mut got = 0usize;
     while got < RECORD_BYTES {
-      match rustix::io::read(fd, &mut record[got..]) {
+      let Some(unread) = record.get_mut(got..) else {
+        return Err(DeliveryFault::WrongLength { got });
+      };
+      match rustix::io::read(fd, unread) {
         Ok(0) if got == 0 => return Err(DeliveryFault::AlreadyConsumed),
         Ok(0) => return Err(DeliveryFault::WrongLength { got }),
-        Ok(n) => got += n,
+        Ok(n) => got = got.saturating_add(n),
         Err(Errno::INTR) => {}
         Err(Errno::AGAIN) => return Err(DeliveryFault::WrongLength { got }),
         Err(_) => return Err(DeliveryFault::WrongKind),
@@ -1213,7 +1221,12 @@ mod platform {
           if got == 0 {
             break;
           }
-          keep_within(&mut kept, &chunk[..got], capacity, &mut offered);
+          keep_within(
+            &mut kept,
+            chunk.get(..got).unwrap_or(&chunk),
+            capacity,
+            &mut offered,
+          );
         }
       }
       let code = self.wait()?;

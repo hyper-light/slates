@@ -3,7 +3,12 @@
 //! and the FUSE requests a guest kernel sends. The guest and the device share the owning shard's thread, as an
 //! in-process VMM's parties share one address space: never concurrent.
 // Test harness code: an unwrap here is a failed test, which is what it should be.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![allow(
+  clippy::unwrap_used,
+  clippy::expect_used,
+  clippy::panic,
+  clippy::indexing_slicing
+)]
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;

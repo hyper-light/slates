@@ -14,7 +14,12 @@
 //!
 //! Test by use (R5): every assertion is on what the endpoints deliver and hold.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![allow(
+  clippy::unwrap_used,
+  clippy::expect_used,
+  clippy::panic,
+  clippy::indexing_slicing
+)]
 
 use std::future::Future;
 use std::sync::mpsc::{Receiver, Sender, channel};

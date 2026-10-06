@@ -11,6 +11,8 @@
 //! position-varying patterns, so a misplaced op, a wrong length, or a wrong source offset makes
 //! the reconstruction diverge and the test fail.
 
+// Test code may panic (CLAUDE.md §2 item 6 applies to shipped code).
+#![allow(clippy::indexing_slicing)]
 use slates_merge::derive::{ContentOp, compose_content};
 use slates_merge::ops_doc::{Op, OpKind};
 

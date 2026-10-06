@@ -81,7 +81,10 @@ impl MpscRing {
   pub fn push(&self, word: u64) -> Result<(), u64> {
     let mut tail = self.tail.0.load(Ordering::Relaxed);
     loop {
-      let slot = &self.slots[tail & self.mask];
+      // `mask` is the slot count minus one, so the masked index is always a slot; a miss reads as full.
+      let Some(slot) = self.slots.get(tail & self.mask) else {
+        return Err(word);
+      };
       let sequence = slot.sequence.load(Ordering::Acquire);
       if sequence == tail {
         match self.tail.0.compare_exchange_weak(
@@ -110,8 +113,10 @@ impl MpscRing {
   /// Whether no word is waiting (a racy read for spin loops; the consumer's `pop` is exact).
   pub fn is_empty(&self) -> bool {
     let head = self.head.0.load(Ordering::Acquire);
-    let slot = &self.slots[head & self.mask];
-    slot.sequence.load(Ordering::Acquire) != head.wrapping_add(1)
+    self
+      .slots
+      .get(head & self.mask)
+      .is_none_or(|slot| slot.sequence.load(Ordering::Acquire) != head.wrapping_add(1))
   }
 
   /// Claims the consumer half: `None` while another claim is held, so there is exactly one at a time.
@@ -150,7 +155,7 @@ impl Consumer<'_> {
   /// Pops the oldest word, if any.
   pub fn pop(&self) -> Option<u64> {
     let head = self.ring.head.0.load(Ordering::Relaxed);
-    let slot = &self.ring.slots[head & self.ring.mask];
+    let slot = self.ring.slots.get(head & self.ring.mask)?;
     let sequence = slot.sequence.load(Ordering::Acquire);
     if sequence != head.wrapping_add(1) {
       return None;

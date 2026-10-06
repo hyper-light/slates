@@ -329,7 +329,12 @@ fn fold_entries<T>(history: &mut Vec<(u64, T)>, floor: u64, cost: impl Fn(&T) ->
   if drop == 0 {
     return 0;
   }
-  let dropped: usize = history[..drop].iter().map(|(_, value)| cost(value)).sum();
+  let drop = drop.min(history.len());
+  let dropped: usize = history
+    .iter()
+    .take(drop)
+    .map(|(_, value)| cost(value))
+    .sum();
   history.drain(..drop);
   dropped
 }
@@ -389,6 +394,33 @@ fn is_content(kind: OpKind) -> bool {
   )
 }
 
+/// Whether a path's content ops are a net op set the deriver could have composed against `base_len` bytes of
+/// base content and a post-state of `post_len` bytes (`derive::compose_content`, §4.16 "Composition at seal"):
+/// every op starts within the base, a removal or overwrite ends within it, a truncate ends at its end, an extend
+/// starts at its end, and the bytes an op adds lie in the post-state. An ops document arrives as bytes and is
+/// not checked against the file it edits when decoded, so a document that fails this is refused typed rather
+/// than spliced by clamping (2026-10-06: a delete of 20 bytes from a 10-byte base, then an insert at 30, was
+/// accepted as "XXZ").
+fn fits_base(ops: &[Op], base_len: u64, post_len: u64) -> bool {
+  ops.iter().all(|op| {
+    let end = op.at.checked_add(op.len);
+    let within = op.at <= base_len;
+    let fits = match op.kind {
+      OpKind::Delete | OpKind::Overwrite => end.is_some_and(|end| end <= base_len),
+      OpKind::Truncate => end == Some(base_len),
+      OpKind::Extend => op.at == base_len,
+      _ => true,
+    };
+    let adds = matches!(op.kind, OpKind::Overwrite | OpKind::Insert | OpKind::Extend);
+    let sourced = !adds
+      || op
+        .src
+        .checked_add(op.len)
+        .is_some_and(|end| end <= post_len);
+    within && fits && sourced
+  })
+}
+
 /// Applies content ops to `base`, drawing added bytes from `post_state` — the byte splice.
 fn apply(base: &[u8], ops: &[Op], post_state: &[u8]) -> Vec<u8> {
   let base_len = base.len() as u64;
@@ -398,7 +430,7 @@ fn apply(base: &[u8], ops: &[Op], post_state: &[u8]) -> Vec<u8> {
     if op.at > pos {
       let start = usize::try_from(pos).unwrap_or(0);
       let end = usize::try_from(op.at).unwrap_or(start).min(base.len());
-      out.extend_from_slice(&base[start..end]);
+      out.extend_from_slice(base.get(start..end).unwrap_or_default());
       pos = op.at;
     }
     match op.kind {
@@ -413,7 +445,11 @@ fn apply(base: &[u8], ops: &[Op], post_state: &[u8]) -> Vec<u8> {
     }
   }
   if pos < base_len {
-    out.extend_from_slice(&base[usize::try_from(pos).unwrap_or(0)..base.len()]);
+    out.extend_from_slice(
+      base
+        .get(usize::try_from(pos).unwrap_or(usize::MAX)..)
+        .unwrap_or_default(),
+    );
   }
   out
 }
@@ -430,7 +466,7 @@ fn span_bytes(from: &[u8], src: u64, len: u64) -> &[u8] {
   let end = start
     .saturating_add(usize::try_from(len).unwrap_or(0))
     .min(from.len());
-  &from[start..end]
+  from.get(start..end).unwrap_or_default()
 }
 
 /// The changes an increment declares, resolved from the ops document into per-dimension groups by
@@ -869,8 +905,10 @@ impl Green {
   /// The ops each intervening delta in `(base, head]` applied to `path`.
   fn intervening(&self, path: &str, base: u64) -> Vec<&[Op]> {
     let base = usize::try_from(base).unwrap_or(usize::MAX);
-    self.deltas[base.min(self.deltas.len())..]
+    self
+      .deltas
       .iter()
+      .skip(base)
       .filter_map(|delta| delta.get(path).map(Vec::as_slice))
       .collect()
   }
@@ -1171,7 +1209,7 @@ impl Green {
         .unwrap_or_default();
       let start = usize::try_from(head_start).unwrap_or(usize::MAX);
       let end = start.saturating_add(agent_bytes.len());
-      let identical = end <= current.len() && &current[start..end] == agent_bytes;
+      let identical = current.get(start..end) == Some(agent_bytes);
       if !identical {
         return Err(ConflictWindow {
           path: path.to_owned(),
@@ -1410,12 +1448,34 @@ impl Green {
     Ok(Some(Effect::Special(path.to_owned(), node)))
   }
 
+  /// The paths whose content ops do not fit the content they edit at the increment's base ([`fits_base`]): a
+  /// created path edits nothing, a renamed-into path edits its source.
+  fn unfit_content(&self, inc: &Increment, r: &Resolved) -> Vec<String> {
+    let post_len = u64::try_from(inc.post_state.len()).unwrap_or(u64::MAX);
+    r.content
+      .iter()
+      .filter(|(path, ops)| {
+        let edited = r.renames.get(*path).unwrap_or(path);
+        let base_len = if r.creates.contains(*path) {
+          0
+        } else {
+          self
+            .content_ref_at(edited, inc.base)
+            .map_or(0, |bytes| u64::try_from(bytes.len()).unwrap_or(u64::MAX))
+        };
+        !fits_base(ops, base_len, post_len)
+      })
+      .map(|(path, _)| path.clone())
+      .collect()
+  }
+
   /// Decides every dimension of an increment, collecting the accepted effects or the conflicts.
   fn decide(&mut self, inc: &Increment, r: &Resolved) -> Result<Vec<Effect>, Vec<ConflictWindow>> {
     let mut effects = Vec::new();
     let mut windows: Vec<_> = r
       .invalid
       .iter()
+      .chain(self.unfit_content(inc, r).iter())
       .map(|path| Green::window(path, MergeConflictClass::TypeChanged))
       .collect();
     for (path, node) in &r.specials {
@@ -2086,7 +2146,7 @@ fn post_slice(post_state: &[u8], src: u64, len: u64) -> Vec<u8> {
   let end = start
     .saturating_add(usize::try_from(len).unwrap_or(0))
     .min(post_state.len());
-  post_state[start..end].to_vec()
+  post_state.get(start..end).unwrap_or_default().to_vec()
 }
 
 /// Read an IPC payload exactly. A saturated or truncated range must never become valid metadata.

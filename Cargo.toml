@@ -144,6 +144,12 @@ todo = "deny"
 unimplemented = "deny"
 unreachable = "deny"
 dbg_macro = "deny"
+# Out-of-bounds indexing and slicing (a byte index inside a UTF-8 character too) panic; use `get`.
+indexing_slicing = "deny"
+string_slice = "deny"
+# A function that returns `Result` reports its failures in it, never by panicking.
+panic_in_result_fn = "deny"
+unwrap_in_result = "deny"
 # Integers are checked: a narrowing `as` is a review failure; use `try_from`.
 cast_possible_truncation = "deny"
 cast_sign_loss = "deny"

@@ -7,7 +7,13 @@
 //! without a delivery finds none (`Absent`), and one told the number of a descriptor it did not
 //! inherit is refused `NotInherited` — the non-vacuity contrast for the one that did inherit.
 // Test harness code: an unwrap here is a failed test, which is what it should be.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![allow(
+  clippy::unwrap_used,
+  clippy::expect_used,
+  clippy::panic,
+  clippy::panic_in_result_fn,
+  clippy::unwrap_in_result
+)]
 
 use std::ffi::{OsStr, OsString};
 use std::process::Command;

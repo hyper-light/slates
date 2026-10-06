@@ -124,14 +124,18 @@ impl PathTable {
   /// Sorts the paths and returns, for each old index, its new index (so the ops can be
   /// remapped). Called by [`OpsDoc::canonicalize`].
   fn sort_and_remap(&mut self) -> Vec<u16> {
-    let mut order: Vec<usize> = (0..self.paths.len()).collect();
-    order.sort_by(|&a, &b| self.paths[a].cmp(&self.paths[b]));
-    let mut new_index = vec![0u16; self.paths.len()];
-    for (new, &old) in order.iter().enumerate() {
-      new_index[old] = u16::try_from(new).unwrap_or(u16::MAX);
+    let mut order: Vec<(usize, String)> = std::mem::take(&mut self.paths)
+      .into_iter()
+      .enumerate()
+      .collect();
+    order.sort_by(|(_, a), (_, b)| a.cmp(b));
+    let mut new_index = vec![0u16; order.len()];
+    for (new, (old, _)) in order.iter().enumerate() {
+      if let Some(slot) = new_index.get_mut(*old) {
+        *slot = u16::try_from(new).unwrap_or(u16::MAX);
+      }
     }
-    let sorted: Vec<String> = order.into_iter().map(|i| self.paths[i].clone()).collect();
-    self.paths = sorted;
+    self.paths = order.into_iter().map(|(_, path)| path).collect();
     new_index
   }
 
@@ -372,7 +376,7 @@ impl<'a> Reader<'a> {
 
   pub(crate) fn u8(&mut self) -> Result<u8, DocDecodeError> {
     let b = self.bytes(size_of::<u8>())?;
-    Ok(b[0])
+    b.first().copied().ok_or(DocDecodeError::Truncated)
   }
 
   pub(crate) fn u16(&mut self) -> Result<u16, DocDecodeError> {

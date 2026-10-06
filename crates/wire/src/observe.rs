@@ -730,6 +730,7 @@ impl ChokepointRegistry {
 }
 
 #[cfg(test)]
+#[allow(clippy::string_slice)] // Test code may panic (CLAUDE.md §2 item 6 applies to shipped code).
 mod tests {
   use super::{
     AbsenceIs, Cause, Chokepoint, ChokepointRegistry, RequestId, Span, SpanSink, Tracer,

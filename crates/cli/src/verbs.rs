@@ -1865,7 +1865,12 @@ pub(crate) fn profile(options: &ProfileOptions) -> Result<(), Failure> {
 mod harness_tests {
   //! The harness verb's core against an in-process daemon, with this test binary re-invoked as the
   //! workload (the cross-process fixture pattern of `crates/anchor/tests/anchor.rs`).
-  #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+  #![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::string_slice
+  )]
 
   use std::ffi::{OsStr, OsString};
   use std::time::{Duration, Instant};

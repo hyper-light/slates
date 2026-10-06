@@ -9,7 +9,12 @@
 //! These tests drive the volume through those histories and assert the head's bytes and the
 //! arena's accounting: no premature free, no double free, no leak.
 // Test harness code: an unwrap here is a failed test, which is what it should be.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![allow(
+  clippy::unwrap_used,
+  clippy::expect_used,
+  clippy::panic,
+  clippy::indexing_slicing
+)]
 
 mod common;
 

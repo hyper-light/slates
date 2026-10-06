@@ -172,12 +172,16 @@ impl VolumeBridge<'_> {
     let mut bytes = vec![0u8; len];
     let read = self.volume.read(self.store, orphan, 0, &mut bytes)?;
     bytes.truncate(read);
-    let prefix = &bytes[..bytes.len().min(MAX_HEADER_BYTES)];
+    let prefix = bytes.get(..MAX_HEADER_BYTES).unwrap_or(&bytes);
     let Decoded::Complete(layout) = appledouble::decode(prefix, size, &mut |at, buf: &mut [u8]| {
-      let start = usize::try_from(at).unwrap_or(usize::MAX).min(bytes.len());
-      let end = start.saturating_add(buf.len()).min(bytes.len());
-      buf[..end - start].copy_from_slice(&bytes[start..end]);
-      end - start
+      let held = bytes
+        .get(usize::try_from(at).unwrap_or(usize::MAX)..)
+        .unwrap_or_default();
+      let count = held.len().min(buf.len());
+      if let (Some(into), Some(from)) = (buf.get_mut(..count), held.get(..count)) {
+        into.copy_from_slice(from);
+      }
+      count
     }) else {
       return Ok(false);
     };
@@ -225,7 +229,7 @@ impl VolumeBridge<'_> {
         self.render(owner, &names, &encoding, offset, &mut buf)?
       }
     };
-    out.extend_from_slice(&buf[..read]);
+    out.extend_from_slice(buf.get(..read).unwrap_or(&buf));
     Ok(())
   }
 

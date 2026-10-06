@@ -3,7 +3,12 @@
 //! (`tests/vectors/appledouble`): a create, whole and piecewise writes, a truncate, a removal. After
 //! each step the owner's attributes in the volume's store are what the file says; the view reads back
 //! the client's bytes; a change through another path is what the next read encodes.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![allow(
+  clippy::unwrap_used,
+  clippy::expect_used,
+  clippy::panic,
+  clippy::indexing_slicing
+)]
 
 use slates_bridge_core::appledouble::{Decoded, MAX_HEADER_BYTES, decode};
 use slates_bridge_core::{

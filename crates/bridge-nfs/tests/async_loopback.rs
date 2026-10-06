@@ -1,4 +1,9 @@
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![allow(
+  clippy::unwrap_used,
+  clippy::expect_used,
+  clippy::panic,
+  clippy::indexing_slicing
+)]
 //! The async NFS server end to end over a real socket (§4.6, R5): the production `serve_connection_async`
 //! runs on slates's own runtime and serves a mount and a read over the runtime's async `TcpStream`,
 //! driven here by the same hand-rolled ONC RPC client the blocking `loopback.rs` uses — exactly what a

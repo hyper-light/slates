@@ -4251,9 +4251,12 @@ fn assemble_post_state(
     ) else {
       continue;
     };
-    let to = from.saturating_add(len);
-    if to <= source.len() && dst.saturating_add(len) <= post.len() {
-      post[dst..dst + len].copy_from_slice(&source[from..to]);
+    let span = (
+      post.get_mut(dst..dst.saturating_add(len)),
+      source.get(from..from.saturating_add(len)),
+    );
+    if let (Some(into), Some(from)) = span {
+      into.copy_from_slice(from);
     }
   }
   post

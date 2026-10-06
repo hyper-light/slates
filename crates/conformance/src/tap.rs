@@ -363,8 +363,8 @@ fn number_and_rest(after_ok: &str) -> Option<(u32, &str)> {
   let end = trimmed
     .find(|c: char| !c.is_ascii_digit())
     .unwrap_or(trimmed.len());
-  let number: u32 = trimmed[..end].parse().ok()?;
-  Some((number, trimmed[end..].trim()))
+  let (number, rest) = trimmed.split_at_checked(end)?;
+  Some((number.parse().ok()?, rest.trim()))
 }
 
 /// Whether a failure's message is a device-node `mknod` (`tried 'mknod NAME b …'` / `c …`): the
@@ -376,7 +376,7 @@ fn makes_device_node(message: &str) -> bool {
   let tokens: Vec<&str> = message.split_whitespace().collect();
   tokens
     .windows(MKNOD_TOKENS)
-    .any(|w| w[0].trim_start_matches('\'') == "mknod" && matches!(w[2], "b" | "c"))
+    .any(|w| matches!(w, [command, _, "b" | "c"] if command.trim_start_matches('\'') == "mknod"))
 }
 
 /// The status of a `not ok` line.

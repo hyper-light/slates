@@ -10,7 +10,12 @@
 //! non-vacuity contrast. And a client holding a consumer identity binds the channel again by itself
 //! after a daemon restart, before its retried verb runs, so the verb runs as the consumer.
 // Test harness code: an unwrap here is a failed test, which is what it should be.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![allow(
+  clippy::unwrap_used,
+  clippy::expect_used,
+  clippy::panic,
+  clippy::string_slice
+)]
 // This consumer/attach history drives the daemon over rendezvous and rustix process APIs (unix);
 // on Windows the client reaches the daemon through the Win32 rendezvous, a separate path.
 #![cfg(unix)]

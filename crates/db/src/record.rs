@@ -358,20 +358,26 @@ impl LogRing {
   }
 }
 
+/// Writes `value` at `at` of a header; every caller writes a fixed field inside the fixed header array, so the
+/// miss arm never runs.
 fn put(bytes: &mut [u8], at: usize, value: &[u8]) {
-  bytes[at..at + value.len()].copy_from_slice(value);
+  if let Some(field) = bytes.get_mut(at..at.saturating_add(value.len())) {
+    field.copy_from_slice(value);
+  }
 }
 
+/// The word at `at`, or zero past the end (every caller checked the header's length first).
 fn read_u32(bytes: &[u8], at: usize) -> u32 {
-  let mut word = [0u8; size_of::<u32>()];
-  let n = word.len();
-  word.copy_from_slice(&bytes[at..at + n]);
-  u32::from_le_bytes(word)
+  bytes
+    .get(at..at.saturating_add(size_of::<u32>()))
+    .and_then(|word| word.try_into().ok())
+    .map_or(0, u32::from_le_bytes)
 }
 
+/// The word at `at`, or zero past the end (every caller checked the header's length first).
 fn read_u64(bytes: &[u8], at: usize) -> u64 {
-  let mut word = [0u8; size_of::<u64>()];
-  let n = word.len();
-  word.copy_from_slice(&bytes[at..at + n]);
-  u64::from_le_bytes(word)
+  bytes
+    .get(at..at.saturating_add(size_of::<u64>()))
+    .and_then(|word| word.try_into().ok())
+    .map_or(0, u64::from_le_bytes)
 }
