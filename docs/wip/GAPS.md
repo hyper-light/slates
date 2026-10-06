@@ -3744,7 +3744,13 @@ open with `O_TRUNC` and truncate. The owner's case, 6, passes. The fix held loca
   `the_owners_own_file_refuses_a_truncating_open_without_write_permission` (`crates/server/tests/nfs_v4_kernel.rs`)
   runs on the suite's own mount and on one with the lane's options. On a departure it re-runs the sequence under the
   kernel's `nfs` and `nfs4` tracepoints and fails with the trace and the kernel release.
-- **Owed:** the cause, from that trace; then the fix.
+- **First CI result (run 37484665966, kernel 6.17.0-1022-azure):** the test never reached open/07. The owner's
+  create failed `EACCES` with no NFS event in the trace, so the mount point's ancestors refused it: the build output
+  sits under a home directory uid 65534 cannot search. The same refusal had let the suite's older
+  `truncating_open_needs_write_permission` pass vacuously on CI, its expected `EACCES` coming from the path, which hid
+  this very bug from that suite. Both now run their children from inside the directory, and the older check has a
+  read-only open as its control. Reproduced locally with a mode-750 home: HEAD fails exactly as CI did, the fix passes.
+- **Owed:** the cause, from the next CI trace; then the fix.
 
 Boot, found and closed 2026-10-05 (A-100; docs/bugs/2026-10-05-a-slow-shard-start-stopped-the-daemon-and-left-it-beating.md):
 the control loop's client-id recovery gave up on a shard whose start outran the 1 s liveness window and the daemon

@@ -58,19 +58,23 @@ fn privileged(program: &str) -> Command {
   }
 }
 
-/// `program` as root (through [`privileged`]) with its real and effective ids dropped to `uid`/`gid`
-/// and no supplementary groups: a real non-root process, whatever this test runs as.
+/// `program` run from inside `dir`, as root (through [`privileged`]) with its real and effective ids then dropped to
+/// `uid`/`gid` and no supplementary groups: a real non-root process, whatever this test runs as. The directory is
+/// entered as root, so the child names its files relative to it and never traverses the mount point's ancestors: on
+/// CI's runners the build output sits under a home directory such a uid cannot search, and an `EACCES` from there,
+/// before any NFS call, once passed for a refusal by the server (2026-10-06, the kernel's own trace: no NFS event).
 #[cfg(target_os = "linux")]
-fn as_ids(uid: u32, gid: u32, program: &str) -> Command {
-  let mut command = privileged("setpriv");
+fn as_ids_in(dir: &Path, uid: u32, gid: u32, program: &str) -> Command {
+  let mut command = privileged("sh");
   command.args([
-    "--reuid",
-    &uid.to_string(),
-    "--regid",
-    &gid.to_string(),
-    "--clear-groups",
-    program,
+    "-c",
+    "d=$1; u=$2; g=$3; shift 3; cd \"$d\" || exit 125; exec setpriv --reuid \"$u\" --regid \"$g\" --clear-groups \"$@\"",
+    "sh",
   ]);
+  command
+    .arg(dir)
+    .args([uid.to_string(), gid.to_string()])
+    .arg(program);
   command
 }
 
@@ -331,16 +335,22 @@ fn truncating_open_needs_write_permission(root: &Path) {
     std::fs::write(&path, b"x").unwrap();
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
     chown_as_root(&path, OWNER, OWNER);
-    // A child as `uid` opens the file O_RDONLY|O_TRUNC and exits with the errno (0 on success).
-    let status = as_ids(uid, OWNER, "perl")
-      .args([
-        "-MFcntl",
-        "-e",
-        "sysopen(my $f, $ARGV[0], O_RDONLY | O_TRUNC) ? exit(0) : exit($! + 0)",
-      ])
-      .arg(&path)
-      .status()
-      .unwrap();
+    // A child as `uid`, inside `root`, opens the file O_RDONLY and exits with the errno (0 on success): the control
+    // that its refusal below is the truncate's, not the path's. Then O_RDONLY|O_TRUNC.
+    let name = format!("guarded-{uid}");
+    let open_as = |script: &str| {
+      as_ids_in(root, uid, OWNER, "perl")
+        .args(["-MFcntl", "-e", script])
+        .arg(&name)
+        .status()
+        .unwrap()
+    };
+    assert_eq!(
+      open_as("sysopen(my $f, $ARGV[0], O_RDONLY) ? exit(0) : exit($! + 0)").code(),
+      Some(0),
+      "uid {uid}, mode {mode:o}: the caller reaches the file and may read it"
+    );
+    let status = open_as("sysopen(my $f, $ARGV[0], O_RDONLY | O_TRUNC) ? exit(0) : exit($! + 0)");
     assert_eq!(
       status.code(),
       Some(EACCES),
@@ -355,13 +365,17 @@ fn truncating_open_needs_write_permission(root: &Path) {
   }
 }
 
-/// A child as `uid`/`gid` running `script` (perl, `Fcntl` loaded) on `path`; its exit status is the errno of the
-/// first refused call, 0 when every call succeeded.
+/// A child as `uid`/`gid` running `script` (perl, `Fcntl` loaded) on `path`, from inside `path`'s directory under
+/// its relative name ([`as_ids_in`]); its exit status is the errno of the first refused call, 0 when every call
+/// succeeded.
 #[cfg(target_os = "linux")]
 fn perl_as(uid: u32, gid: u32, script: &str, path: &Path) -> Option<i32> {
-  as_ids(uid, gid, "perl")
+  let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
+    return None;
+  };
+  as_ids_in(dir, uid, gid, "perl")
     .args(["-MFcntl", "-e", script])
-    .arg(path)
+    .arg(name)
     .status()
     .unwrap()
     .code()
