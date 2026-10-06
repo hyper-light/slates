@@ -25,6 +25,9 @@ const START_WAIT: Duration = Duration::from_secs(5);
 /// Shape: the fast-path spin budget (nanoseconds): a tenth of a second, well past a live daemon's
 /// microsecond reply, so the fast path always catches it here.
 const SPIN_NS: u64 = 100_000_000;
+/// Shape: how long the fast path is retried window after window before the test calls the reply lost: far past a
+/// daemon slowed by a sanitizer or a loaded runner.
+const REPLY_WAIT: Duration = Duration::from_secs(30);
 /// Shape: how long the slow path waits for the completion fd to signal (nanoseconds): two seconds,
 /// far past a live daemon's reply.
 const FD_WAIT_NS: u64 = 2_000_000_000;
@@ -112,12 +115,20 @@ fn the_async_core_drives_a_daemon_by_spin_and_completion_fd() {
   let mut client = connect(&instance);
 
   // Fast path: begin a create and take its reply within the spin window — no event loop, no fd.
+  // Window after window, never the fd: what is proved is the path the reply takes, not how fast a slowed daemon (TSan,
+  // a loaded runner) commits its first create. One 100 ms window failed on CI's TSan lane, 2026-10-06.
   let create_id = client.begin(&create("async-fast")).unwrap();
-  let volume = match client
-    .spin_reply(create_id, SPIN_NS)
-    .unwrap()
-    .expect("the create replied within the spin window")
-  {
+  let began = std::time::Instant::now();
+  let fast = loop {
+    if let Some(reply) = client.spin_reply(create_id, SPIN_NS).unwrap() {
+      break reply;
+    }
+    assert!(
+      began.elapsed() < REPLY_WAIT,
+      "the create replied through the spin path within {REPLY_WAIT:?}"
+    );
+  };
+  let volume = match fast {
     ReplyBody::Created { id } => id,
     other => panic!("the create's reply is Created, got {other:?}"),
   };
