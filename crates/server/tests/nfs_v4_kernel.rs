@@ -321,15 +321,31 @@ fn exclusive_create_keeps_its_mode(root: &Path) {
 /// sending it as a SETATTR under the read-only open's state id (RFC 8881 §9.1.2: `NFS4ERR_OPENMODE`) —
 /// and a member of the file's group, mode 0747.
 #[cfg(target_os = "linux")]
-#[allow(clippy::disallowed_methods)] // file calls through the kernel mount under test (RAM-backed)
 fn truncating_open_needs_write_permission(root: &Path) {
+  let departures = truncating_departures(root, "plain");
+  if departures.is_empty() {
+    return;
+  }
+  // A departure is re-run in fresh files under the kernel's NFS trace, so a failure on another kernel says what its
+  // client sent (CI's Ubuntu 6.17 client let the owner of a 0477 file truncate it while Linux 6.12 refused).
+  let (again, trace) = traced(|| truncating_departures(root, "traced"));
+  panic!("truncating-open departures: {departures:#?}\nunder the trace: {again:#?}\n{trace}");
+}
+
+/// One run of [`truncating_open_needs_write_permission`]'s cases on files named with `tag`; every step that did not
+/// do what POSIX requires, empty when all did.
+#[cfg(target_os = "linux")]
+#[allow(clippy::disallowed_methods)] // file calls through the kernel mount under test (RAM-backed)
+fn truncating_departures(root: &Path, tag: &str) -> Vec<String> {
   use std::os::unix::fs::PermissionsExt;
   /// Format: the owner, a group member, and `EACCES` as the child's exit status.
   const OWNER: u32 = 65534;
   const MEMBER: u32 = 65533;
   const EACCES: i32 = 13;
+  let mut departures = Vec::new();
   for (uid, mode) in [(OWNER, 0o477), (MEMBER, 0o747)] {
-    let path = root.join(format!("guarded-{uid}"));
+    let name = format!("guarded-{tag}-{uid}");
+    let path = root.join(&name);
     // Made by this test's caller, who sets the mode as its owner; then given to `OWNER` by root (a
     // gift of ownership is root's alone, and this test need not run as root).
     std::fs::write(&path, b"x").unwrap();
@@ -337,32 +353,26 @@ fn truncating_open_needs_write_permission(root: &Path) {
     chown_as_root(&path, OWNER, OWNER);
     // A child as `uid`, inside `root`, opens the file O_RDONLY and exits with the errno (0 on success): the control
     // that its refusal below is the truncate's, not the path's. Then O_RDONLY|O_TRUNC.
-    let name = format!("guarded-{uid}");
     let open_as = |script: &str| {
       as_ids_in(root, uid, OWNER, "perl")
         .args(["-MFcntl", "-e", script])
         .arg(&name)
         .status()
         .unwrap()
+        .code()
     };
-    assert_eq!(
-      open_as("sysopen(my $f, $ARGV[0], O_RDONLY) ? exit(0) : exit($! + 0)").code(),
-      Some(0),
-      "uid {uid}, mode {mode:o}: the caller reaches the file and may read it"
-    );
-    let status = open_as("sysopen(my $f, $ARGV[0], O_RDONLY | O_TRUNC) ? exit(0) : exit($! + 0)");
-    assert_eq!(
-      status.code(),
-      Some(EACCES),
-      "uid {uid}, mode {mode:o}: a truncating open without write permission is refused"
-    );
-    assert_eq!(
-      std::fs::metadata(&path).unwrap().len(),
-      1,
-      "uid {uid}, mode {mode:o}: nothing was truncated"
-    );
-    std::fs::remove_file(&path).unwrap();
+    let read = open_as("sysopen(my $f, $ARGV[0], O_RDONLY) ? exit(0) : exit($! + 0)");
+    let truncating =
+      open_as("sysopen(my $f, $ARGV[0], O_RDONLY | O_TRUNC) ? exit(0) : exit($! + 0)");
+    let length = std::fs::metadata(&path).map(|m| m.len()).ok();
+    if read != Some(0) || truncating != Some(EACCES) || length != Some(1) {
+      departures.push(format!(
+        "uid {uid}, mode {mode:o}: O_RDONLY {read:?} (0 due), O_RDONLY|O_TRUNC {truncating:?} (EACCES due), length {length:?} (1 due)"
+      ));
+    }
+    let _ = std::fs::remove_file(&path);
   }
+  departures
 }
 
 /// A child as `uid`/`gid` running `script` (perl, `Fcntl` loaded) on `path`, from inside `path`'s directory under
