@@ -6545,7 +6545,7 @@ fn a_takeover_completes_when_one_survivor_never_received_the_head() {
     for (id, _) in &volumes {
       let mut replies = Vec::new();
       let answered = clients.iter_mut().any(|client| {
-        let reply = client.call(&RequestBody::Status { volume: *id });
+        let reply = call_or_show_pulses(client, &survivors, &RequestBody::Status { volume: *id });
         let report = matches!(reply, ReplyBody::Status { .. });
         if !report {
           replies.push(format!("{reply:?}"));
@@ -6627,6 +6627,26 @@ fn volumes_for_each_successor(daemons: &[Daemon], hosts: &[HostId]) -> Vec<(Volu
   volumes
 }
 
+/// `body` through `client`, and if the reply misses the test client's deadline (its `call` panics) every daemon's
+/// shard pulses at that moment, read from the runtime's registry with no shard round trip, are printed before the
+/// panic goes on: each shard's steps, parks, refused admissions and longest single step say whether a shard was
+/// wedged in one long step or simply never reached the request (CI's Linux lane, 2026-10-06: "client Status:
+/// deadline exceeded" during a takeover, with nothing else on record).
+fn call_or_show_pulses(client: &mut Client, daemons: &[&Daemon], body: &RequestBody) -> ReplyBody {
+  match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| client.call(body))) {
+    Ok(reply) => reply,
+    Err(missed) => {
+      for (index, daemon) in daemons.iter().enumerate() {
+        eprintln!(
+          "daemon {index}'s shard pulses at the missed reply: {:?}",
+          daemon.shard_pulses()
+        );
+      }
+      std::panic::resume_unwind(missed)
+    }
+  }
+}
+
 /// Polls `status` for `volume` at the daemon reached at `instance` until it answers with a report (the
 /// volume is served there) or the serve deadline passes; returns whether it did.
 fn poll_status_answers(daemons: &[&Daemon], instance: &str, volume: VolumeId) -> bool {
@@ -6636,7 +6656,7 @@ fn poll_status_answers(daemons: &[&Daemon], instance: &str, volume: VolumeId) ->
   // on record, and 12 local runs of its sibling passed).
   let mut last_refusal = None;
   let answered = poll_until(daemons, SERVE_DEADLINE, || {
-    let reply = client.call(&RequestBody::Status { volume });
+    let reply = call_or_show_pulses(&mut client, daemons, &RequestBody::Status { volume });
     let report = matches!(reply, ReplyBody::Status { .. });
     if !report {
       last_refusal = Some(format!("{reply:?}"));
