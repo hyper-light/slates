@@ -146,6 +146,8 @@ mod code {
   pub(crate) const UNAVAILABLE: i64 = -32001;
   /// Format: JSON-RPC 2.0 "parse error" (the bytes were not valid JSON).
   pub(crate) const PARSE_ERROR: i64 = -32700;
+  /// Format: JSON-RPC 2.0 "Invalid Request" (the message is not a valid request object, here an empty batch).
+  pub(crate) const INVALID_REQUEST: i64 = -32600;
   /// Format: MCP 2026-07-28 `UNSUPPORTED_PROTOCOL_VERSION`: a modern request named a version this server does not
   /// speak.
   pub(crate) const UNSUPPORTED_PROTOCOL_VERSION: i64 = -32022;
@@ -315,6 +317,31 @@ impl McpServer {
   /// [`McpServer::handle`] for a request that arrived with the HTTP `MCP-Protocol-Version` header `header`, which
   /// also says which era the request is in.
   pub fn handle_with_header(&mut self, request: &Value, header: Option<&str>) -> Option<Value> {
+    // A batch (JSON-RPC 2.0 §6; MCP 2025-03-26, a revision this server serves, requires it): each member is handled
+    // as a message of its own and the replies are returned together; notifications add none, so a batch of only
+    // notifications is answered with nothing, and an empty batch is one Invalid Request against a null id. Its size
+    // is bounded by the transport's cap on a message. Before 2026-10-06 an array, having no `id`, was taken for a
+    // notification and answered with nothing, and a client waited on its batch for good.
+    if let Some(batch) = request.as_array() {
+      if batch.is_empty() {
+        return Some(error(&Value::Null, code::INVALID_REQUEST, "an empty batch"));
+      }
+      let replies: Vec<Value> = batch
+        .iter()
+        .filter_map(|member| {
+          if member.is_array() {
+            // A batch inside a batch is no request (§6 nests nothing): that member alone is refused.
+            return Some(error(
+              &Value::Null,
+              code::INVALID_REQUEST,
+              "a batch inside a batch",
+            ));
+          }
+          self.handle_with_header(member, header)
+        })
+        .collect();
+      return (!replies.is_empty()).then_some(Value::Array(replies));
+    }
     let method = request.get("method").and_then(Value::as_str).unwrap_or("");
     let params = request.get("params").cloned().unwrap_or(Value::Null);
     if method == "notifications/cancelled" {

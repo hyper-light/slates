@@ -918,6 +918,56 @@ fn assert_malformed(server: &mut McpServer) {
   assert_eq!(unknown_method["error"]["code"], -32601);
 }
 
+/// JSON-RPC 2.0 §6 batches (MCP 2025-03-26, a revision this server serves, requires them). Do: send a batch of a
+/// request, an unknown method and a notification; an empty batch; a batch of notifications only. Expect: an array of
+/// two replies, each under its own id (the request's result, the unknown method's `-32601`); one Invalid Request
+/// (`-32600`) against a null id; no reply. Before 2026-10-06 any array was taken for a notification (it has no `id`)
+/// and answered with nothing, so a client waiting on its batch waited for good (found by an adversarial stdio session).
+fn assert_batches(server: &mut McpServer) {
+  let replies = server
+    .handle(&json!([
+      { "jsonrpc": "2.0", "id": 101, "method": "tools/list" },
+      { "jsonrpc": "2.0", "id": 102, "method": "no/such" },
+      { "jsonrpc": "2.0", "method": "notifications/initialized" },
+    ]))
+    .expect("a batch with requests is answered");
+  let replies = replies
+    .as_array()
+    .expect("a batch is answered with an array");
+  assert_eq!(
+    replies.len(),
+    2,
+    "one reply per request, none for the notification: {replies:?}"
+  );
+  let by_id = |id: u64| replies.iter().find(|reply| reply["id"] == id).cloned();
+  assert!(
+    by_id(101).is_some_and(|reply| reply["result"]["tools"].is_array()),
+    "the request's own result: {replies:?}"
+  );
+  assert_eq!(
+    by_id(102).map(|reply| reply["error"]["code"].clone()),
+    Some(json!(-32601))
+  );
+  let nested = server
+    .handle(&json!([[{ "jsonrpc": "2.0", "id": 103, "method": "tools/list" }]]))
+    .expect("a nested batch is answered");
+  assert_eq!(
+    nested[0]["error"]["code"], -32600,
+    "a batch inside a batch is refused, not served: {nested}"
+  );
+  let empty = server
+    .handle(&json!([]))
+    .expect("an empty batch is answered");
+  assert_eq!(empty["error"]["code"], -32600, "{empty}");
+  assert!(empty["id"].is_null(), "{empty}");
+  assert!(
+    server
+      .handle(&json!([{ "jsonrpc": "2.0", "method": "notifications/initialized" }]))
+      .is_none(),
+    "a batch of notifications is answered with nothing"
+  );
+}
+
 /// The whole MCP surface over one daemon: the handshake, the merge loop, the volume lifecycle, and
 /// typed errors. One serial daemon so the scenarios' spinning shards do not contend.
 #[test]
@@ -939,6 +989,7 @@ fn the_mcp_surface_serves_the_tools() {
   let mut server = McpServer::new(connect(&instance));
 
   assert_protocol(&mut server);
+  assert_batches(&mut server);
   assert_modern_protocol(&mut server);
   assert_skills_over_mcp(&mut server);
   assert_a_large_file_reads_whole(&mut server);
