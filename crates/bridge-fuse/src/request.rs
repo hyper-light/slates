@@ -99,7 +99,12 @@ pub fn parse_name(body: &[u8]) -> Result<&str, FuseError> {
     .iter()
     .position(|b| *b == 0)
     .ok_or(FuseError::UnterminatedName)?;
-  std::str::from_utf8(&body[..end]).map_err(|_| FuseError::UnterminatedName)
+  name_of(body.get(..end).ok_or(FuseError::UnterminatedName)?)
+}
+
+/// A name's bytes as a character string, or the typed refusal of one that is not UTF-8.
+fn name_of(bytes: &[u8]) -> Result<&str, FuseError> {
+  std::str::from_utf8(bytes).map_err(|_| FuseError::NameNotUtf8)
 }
 
 /// A `READ`/`READDIR` body (`struct fuse_read_in`): fh, offset, size, then fields slates does
@@ -303,29 +308,29 @@ impl<'a> RenameIn<'a> {
         need: head,
       });
     }
-    let newdir = u64::from_le_bytes(body[..size_of::<u64>()].try_into().unwrap_or_default());
+    let newdir = u64::from_le_bytes(
+      body
+        .get(..size_of::<u64>())
+        .and_then(|word| word.try_into().ok())
+        .unwrap_or_default(),
+    );
     // `fuse_rename2_in` carries the flags word right after `newdir`; an ordinary rename has none.
     let flags = if flagged {
       u32::from_le_bytes(
-        body[size_of::<u64>()..size_of::<u64>() + size_of::<u32>()]
-          .try_into()
+        body
+          .get(size_of::<u64>()..size_of::<u64>().saturating_add(size_of::<u32>()))
+          .and_then(|word| word.try_into().ok())
           .unwrap_or_default(),
       )
     } else {
       0
     };
-    let names = &body[head..];
-    let split = names
-      .iter()
-      .position(|b| *b == 0)
-      .ok_or(FuseError::UnterminatedName)?;
-    let old_name = std::str::from_utf8(&names[..split]).map_err(|_| FuseError::UnterminatedName)?;
-    let rest = &names[split + 1..];
-    let end = rest
-      .iter()
-      .position(|b| *b == 0)
-      .ok_or(FuseError::UnterminatedName)?;
-    let new_name = std::str::from_utf8(&rest[..end]).map_err(|_| FuseError::UnterminatedName)?;
+    let names = body.get(head..).unwrap_or_default();
+    let old_name = parse_name(names)?;
+    let rest = names
+      .get(old_name.len().saturating_add(1)..)
+      .unwrap_or_default();
+    let new_name = parse_name(rest)?;
     Ok(RenameIn {
       newdir,
       flags,

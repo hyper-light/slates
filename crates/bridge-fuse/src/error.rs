@@ -37,6 +37,9 @@ pub enum FuseError {
   },
   /// A name field carries no terminating NUL within the body.
   UnterminatedName,
+  /// A name is not UTF-8. A volume's names are character strings (D-4), the form every target slates serves or lands
+  /// on holds, so the caller is answered `EILSEQ`, never `EIO`: the message was well formed.
+  NameNotUtf8,
   /// A reply buffer is smaller than the reply to be written.
   ReplyTooSmall {
     /// The bytes available.
@@ -64,6 +67,7 @@ impl fmt::Display for FuseError {
         "short body for opcode {opcode}: {have} bytes, need {need}"
       ),
       Self::UnterminatedName => f.write_str("a name field is not NUL-terminated"),
+      Self::NameNotUtf8 => f.write_str("a name is not UTF-8"),
       Self::ReplyTooSmall { have, need } => {
         write!(f, "reply buffer too small: {have} bytes, need {need}")
       }

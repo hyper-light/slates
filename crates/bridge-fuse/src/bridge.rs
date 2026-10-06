@@ -27,6 +27,9 @@ use slates_vfs::inode::Kind;
 pub const ENOSYS: i32 = 38;
 /// Format: `EIO`, the errno for a request the codec could not parse.
 pub const EIO: i32 = 5;
+/// Format: `EILSEQ` (Linux, asm-generic `errno.h`), the errno for a name that is not UTF-8: the request was well
+/// formed and the name is one a volume cannot hold (D-4), as APFS answers the same name.
+pub const EILSEQ: i32 = 84;
 /// Format: how long the kernel may cache an entry or attributes of the volume's own objects:
 /// forever, since slates invalidates explicitly on every mutation (§4.6 "Cache posture"). A live
 /// base entry gets the seam's bounded lifetime instead ([`Bridge::cache_lifetime`]).
@@ -605,14 +608,25 @@ fn reply_err(unique: u64, e: VfsError, out: &mut [u8]) -> usize {
   write_or_drop(ReplyHeader::write_error(unique, errno(e), out), out)
 }
 
+/// The reply to a request whose body the codec refused: `EILSEQ` for a name that is not UTF-8 (a well-formed request
+/// naming what a volume cannot hold), `EIO` for a malformed message.
+fn refuse_unparsed(unique: u64, refusal: crate::error::FuseError, out: &mut [u8]) -> usize {
+  let errno = match refusal {
+    crate::error::FuseError::NameNotUtf8 => EILSEQ,
+    _ => EIO,
+  };
+  write_or_drop(ReplyHeader::write_error(unique, errno, out), out)
+}
+
 fn serve_lookup(
   bridge: &mut dyn Bridge,
   req: &Request<'_>,
   cx: &OpContext,
   out: &mut [u8],
 ) -> usize {
-  let Ok(name) = parse_name(req.body) else {
-    return write_or_drop(ReplyHeader::write_error(req.header.unique, EIO, out), out);
+  let name = match parse_name(req.body) {
+    Ok(name) => name,
+    Err(refusal) => return refuse_unparsed(req.header.unique, refusal, out),
   };
   let parent = match resolve(bridge, cx, req.header.nodeid) {
     Ok(object) => object,
@@ -899,8 +913,9 @@ fn serve_create(
     body_u32(req.body, size_of::<u32>()).unwrap_or_default(),
     body_u32(req.body, 2 * size_of::<u32>()).unwrap_or_default(),
   );
-  let Ok(name) = parse_name(&req.body[HEAD..]) else {
-    return write_or_drop(ReplyHeader::write_error(req.header.unique, EIO, out), out);
+  let name = match parse_name(req.body.get(HEAD..).unwrap_or_default()) {
+    Ok(name) => name,
+    Err(refusal) => return refuse_unparsed(req.header.unique, refusal, out),
   };
   let parent = match resolve(bridge, cx, req.header.nodeid) {
     Ok(object) => object,
@@ -1032,8 +1047,9 @@ fn serve_mknod(
     Some(kind @ (Kind::Fifo | Kind::Socket)) => kind,
     _ => return reply_err(req.header.unique, VfsError::SpecialFileOperation, out),
   };
-  let Ok(name) = parse_name(&req.body[HEAD..]) else {
-    return write_or_drop(ReplyHeader::write_error(req.header.unique, EIO, out), out);
+  let name = match parse_name(req.body.get(HEAD..).unwrap_or_default()) {
+    Ok(name) => name,
+    Err(refusal) => return refuse_unparsed(req.header.unique, refusal, out),
   };
   let parent = match resolve(bridge, cx, req.header.nodeid) {
     Ok(parent) => parent,
@@ -1070,8 +1086,9 @@ fn serve_mkdir(
     body_u32(req.body, 0).unwrap_or_default(),
     body_u32(req.body, size_of::<u32>()).unwrap_or_default(),
   );
-  let Ok(name) = parse_name(&req.body[HEAD..]) else {
-    return write_or_drop(ReplyHeader::write_error(req.header.unique, EIO, out), out);
+  let name = match parse_name(req.body.get(HEAD..).unwrap_or_default()) {
+    Ok(name) => name,
+    Err(refusal) => return refuse_unparsed(req.header.unique, refusal, out),
   };
   let parent = match resolve(bridge, cx, req.header.nodeid) {
     Ok(object) => object,
@@ -1091,8 +1108,9 @@ fn serve_unlink(
   is_dir: bool,
   out: &mut [u8],
 ) -> usize {
-  let Ok(name) = parse_name(req.body) else {
-    return write_or_drop(ReplyHeader::write_error(req.header.unique, EIO, out), out);
+  let name = match parse_name(req.body) {
+    Ok(name) => name,
+    Err(refusal) => return refuse_unparsed(req.header.unique, refusal, out),
   };
   let parent = match resolve(bridge, cx, req.header.nodeid) {
     Ok(object) => object,
@@ -1113,12 +1131,17 @@ fn serve_symlink(
   out: &mut [u8],
 ) -> usize {
   // The body is name\0 target\0.
-  let Ok(name) = parse_name(req.body) else {
-    return write_or_drop(ReplyHeader::write_error(req.header.unique, EIO, out), out);
+  let name = match parse_name(req.body) {
+    Ok(name) => name,
+    Err(refusal) => return refuse_unparsed(req.header.unique, refusal, out),
   };
-  let rest = &req.body[name.len() + 1..];
-  let Ok(target) = parse_name(rest) else {
-    return write_or_drop(ReplyHeader::write_error(req.header.unique, EIO, out), out);
+  let rest = req
+    .body
+    .get(name.len().saturating_add(1)..)
+    .unwrap_or_default();
+  let target = match parse_name(rest) {
+    Ok(target) => target,
+    Err(refusal) => return refuse_unparsed(req.header.unique, refusal, out),
   };
   let parent = match resolve(bridge, cx, req.header.nodeid) {
     Ok(object) => object,
@@ -1139,8 +1162,9 @@ fn serve_link(bridge: &mut dyn Bridge, req: &Request<'_>, cx: &OpContext, out: &
     return write_or_drop(ReplyHeader::write_error(req.header.unique, EIO, out), out);
   }
   let oldnodeid = u64::from_le_bytes(req.body[..HEAD].try_into().unwrap_or_default());
-  let Ok(name) = parse_name(&req.body[HEAD..]) else {
-    return write_or_drop(ReplyHeader::write_error(req.header.unique, EIO, out), out);
+  let name = match parse_name(req.body.get(HEAD..).unwrap_or_default()) {
+    Ok(name) => name,
+    Err(refusal) => return refuse_unparsed(req.header.unique, refusal, out),
   };
   let new_parent = match resolve(bridge, cx, req.header.nodeid) {
     Ok(object) => object,
@@ -1188,8 +1212,9 @@ fn serve_rename(
   } else {
     Opcode::Rename.to_wire()
   };
-  let Ok(r) = RenameIn::parse(opcode, req.body, flagged) else {
-    return write_or_drop(ReplyHeader::write_error(req.header.unique, EIO, out), out);
+  let r = match RenameIn::parse(opcode, req.body, flagged) {
+    Ok(r) => r,
+    Err(refusal) => return refuse_unparsed(req.header.unique, refusal, out),
   };
   // A flag the seam does not carry (RENAME_WHITEOUT, or any bit the header has not defined) is
   // refused with the errno `renameat2` itself gives an unsupported flag, before anything moves —

@@ -13,7 +13,9 @@ use slates_bridge_core::{
 };
 use slates_bridge_fuse::abi::{IN_HEADER_LEN, OUT_HEADER_LEN, Opcode};
 use slates_bridge_fuse::bridge::CACHE_FOREVER;
-use slates_bridge_fuse::bridge::{Bridge, DirEntry, ENOSYS, Reclaimed, reclaim_unreported};
+use slates_bridge_fuse::bridge::{
+  Bridge, DirEntry, EILSEQ, EIO, ENOSYS, Reclaimed, reclaim_unreported,
+};
 use slates_bridge_fuse::reply::{AttrOut, EntryOut};
 use slates_bridge_fuse::request::{RenameIn, SetAttrIn};
 use slates_db::catalog::{Principal, VolumeId};
@@ -979,6 +981,94 @@ fn rename2_with_a_flag_the_seam_does_not_carry_is_einval_and_never_reaches_the_s
       exchange: false,
     }),
     "a carried flag reaches the seam as itself"
+  );
+}
+
+/// Format: `S_IFIFO | 0644`, a mode mknod serves.
+const FIFO_MODE: u32 = 0o010_644;
+
+/// The body of `opcode` with `name` (and `second` where the opcode carries two names) after the opcode's fixed
+/// part, laid out as the kernel sends it (`fuse_kernel.h`: mkdir 8 bytes, mknod and create and rename2 16, link and
+/// rename 8, lookup, unlink, rmdir and symlink none).
+fn named_body(opcode: Opcode, name: &[u8], second: &[u8]) -> Vec<u8> {
+  let fixed = match opcode {
+    Opcode::MkDir | Opcode::Link | Opcode::Rename => 8,
+    Opcode::MkNod | Opcode::Create | Opcode::Rename2 => 16,
+    _ => 0,
+  };
+  let mut body = vec![0u8; fixed];
+  if opcode == Opcode::MkNod {
+    // A fifo: mknod of any other type is refused for its type before the name is read.
+    body[..4].copy_from_slice(&FIFO_MODE.to_le_bytes());
+  }
+  body.extend_from_slice(name);
+  body.push(0);
+  if matches!(opcode, Opcode::SymLink | Opcode::Rename | Opcode::Rename2) {
+    body.extend_from_slice(second);
+    body.push(0);
+  }
+  body
+}
+
+/// §4.6, D-4: a volume's names are character strings (UTF-8), the form every target slates serves or lands on can
+/// hold (NFSv4 refuses others `NFS4ERR_INVAL`, RFC 8881 §14.4; APFS `EILSEQ`; NTFS holds UTF-16). Do: send every
+/// opcode that carries a name with a name that is not UTF-8 (`bad\xff`), in either name position; then one name with
+/// no terminating NUL. Expect: `EILSEQ` for each, nothing reaching the seam; `EIO` only for the malformed message.
+#[test]
+fn a_name_that_is_not_utf8_is_refused_eilseq_by_every_opcode_and_never_reaches_the_seam() {
+  let not_utf8: &[u8] = b"bad\xff";
+  let mut m = mock();
+  let mut out = [0u8; 256];
+  let opcodes = [
+    Opcode::Lookup,
+    Opcode::MkDir,
+    Opcode::MkNod,
+    Opcode::Create,
+    Opcode::Unlink,
+    Opcode::RmDir,
+    Opcode::SymLink,
+    Opcode::Link,
+    Opcode::Rename,
+    Opcode::Rename2,
+  ];
+  let mut unique = 1;
+  for opcode in opcodes {
+    let positions: &[(&[u8], &[u8])] =
+      if matches!(opcode, Opcode::SymLink | Opcode::Rename | Opcode::Rename2) {
+        &[(not_utf8, b"fine"), (b"fine", not_utf8)]
+      } else {
+        &[(not_utf8, b"")]
+      };
+    for (name, second) in positions {
+      unique += 1;
+      let n = dispatch(
+        &message(
+          opcode.to_wire(),
+          unique,
+          1,
+          &named_body(opcode, name, second),
+        ),
+        &mut m,
+        &mut out,
+      );
+      assert_eq!(
+        reply_error(&out, n),
+        -EILSEQ,
+        "{opcode:?} with {name:?}, {second:?}"
+      );
+    }
+  }
+  assert_eq!(m.rename_calls, 0, "no rename reached the seam");
+  assert_eq!(m.last_create_mode, None, "no create reached the seam");
+  let n = dispatch(
+    &message(Opcode::Lookup.to_wire(), 99, 1, b"unterminated"),
+    &mut m,
+    &mut out,
+  );
+  assert_eq!(
+    reply_error(&out, n),
+    -EIO,
+    "a name with no NUL is a malformed message"
   );
 }
 
