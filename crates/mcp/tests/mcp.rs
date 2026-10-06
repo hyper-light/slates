@@ -1175,6 +1175,37 @@ fn mcp_head(port: u16, host: &str, origin: Option<&str>, token: Option<&str>) ->
   head
 }
 
+/// A POST declaring and sending a body one byte past [`slates_mcp::http::MAX_BODY`], whole, before reading (as an
+/// ordinary client does); the read's error kind, if any, and the response read.
+fn send_past_the_bound(
+  port: u16,
+  ours: &str,
+  token: &str,
+) -> (Result<usize, std::io::ErrorKind>, String) {
+  use std::io::{Read, Write};
+  let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+  let declared = slates_mcp::http::MAX_BODY.saturating_add(1);
+  let _ = stream.write_all(
+    format!(
+      "{}\r\nContent-Length: {declared}\r\n\r\n",
+      mcp_head(port, ours, None, Some(token))
+    )
+    .as_bytes(),
+  );
+  let chunk = vec![b'A'; 1 << 20];
+  let mut sent: u64 = 0;
+  while sent < declared {
+    let take = usize::try_from((declared - sent).min(1 << 20)).unwrap();
+    if stream.write_all(&chunk[..take]).is_err() {
+      break;
+    }
+    sent += take as u64;
+  }
+  let mut response = String::new();
+  let read = stream.read_to_string(&mut response);
+  (read.map_err(|e| e.kind()), response)
+}
+
 /// AUD-29-23 and AUD-29-24 (§4.12, §4.13; R6): the loopback HTTP edge over real sockets. Do: open hostile
 /// connections and leave them open — an unterminated line past the bound, too many headers, a body that
 /// never finishes, an idle kept-alive connection, and one reset mid-head — then, while they are open, send
@@ -1209,6 +1240,16 @@ fn assert_http_transport(profile: &MachineProfile, instance: &str) {
     "{}",
   );
   assert!(many_headers.starts_with("HTTP/1.1 431"), "{many_headers}");
+
+  // A body past the bound, sent whole as an ordinary client sends it before reading: the client reads `413`. The edge
+  // refuses on the head and closes; a client that keeps writing may see its send fail, and still reads the refusal
+  // (2026-10-06: Python's `http.client` raised on the send and never read, which is the client's choice).
+  let oversized = send_past_the_bound(port, &ours, &token);
+  assert!(
+    oversized.1.starts_with("HTTP/1.1 413"),
+    "a client that sent a body past the bound reads 413, not a reset: {:?}",
+    (oversized.0, &oversized.1[..oversized.1.len().min(80)])
+  );
 
   // Held open while the valid client runs: a body that never finishes, an idle connection, a reset one.
   let mut slow = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
