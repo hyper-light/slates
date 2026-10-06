@@ -40,6 +40,9 @@ use slates_vfs::names::NameEquivalence;
 use slates_vfs::quota::Quota;
 use slates_vfs::volume::{Store, StoreConfig, Volume, VolumeConfig};
 
+/// Format: `ENOENT`.
+const ENOENT: i32 = 2;
+
 /// Shape: the page and a small arena for the test volume.
 const PAGE: usize = 4096;
 const REGION_PAGES: usize = 4096;
@@ -109,10 +112,11 @@ fn ok(out: &[u8]) -> bool {
   u32::from_le_bytes(out[4..8].try_into().unwrap()) == 0
 }
 
-/// Whether a LOOKUP reply says the name is absent: a negative entry (success, node id 0, which the kernel caches
-/// for the directory's lifetime, §4.6 "Cache posture").
+/// Whether a LOOKUP reply says the name is absent. This context revalidates (it has no invalidation channel), so a
+/// miss has no lifetime to cache and is `ENOENT`; a negative entry is for a context the kernel can be told about
+/// (`dispatch.rs`, and a real kernel in `coherence_mount.rs`), §4.6 "Cache posture".
 fn absent(out: &[u8]) -> bool {
-  ok(out) && u64::from_le_bytes(out[16..24].try_into().unwrap()) == 0
+  i32::from_le_bytes(out[4..8].try_into().unwrap()) == -ENOENT
 }
 
 /// The node id a CREATE or LOOKUP reply names (the start of `fuse_entry_out`).
@@ -299,8 +303,11 @@ fn missing_names_and_absent_inodes_are_typed_errnos() {
     &mut bridge,
     &mut out,
   );
-  assert_eq!(n, OUT_HEADER_LEN + EntryOut::LEN);
-  assert!(absent(&out), "a missing name is a negative entry");
+  assert_eq!(n, OUT_HEADER_LEN, "an error reply: nothing to cache");
+  assert!(
+    absent(&out),
+    "a missing name is ENOENT in a revalidating context"
+  );
 
   let mut r = vec![0u8; 24];
   r[16..20].copy_from_slice(&16u32.to_le_bytes()); // size; the handle word is unused for a read

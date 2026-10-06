@@ -633,12 +633,14 @@ fn serve_lookup(
     Err(e) => return reply_err(req.header.unique, e, out),
   };
   let looked = bridge.lookup(parent, cx, name);
-  if matches!(looked, Err(VfsError::NotFound)) {
+  let valid = valid_for(bridge, cx, parent.inode);
+  if matches!(looked, Err(VfsError::NotFound)) && valid != (0, 0) {
     // A miss is a negative entry (node id 0, no reference taken), cached for the directory's lifetime: the
     // kernel answers the next probe of the name itself. Every way a name appears through another attachment
     // invalidates it (`Invalidation::Entry` for create, mknod, mkdir, link, symlink, a rename's target), and a
-    // live base directory's lifetime is bounded, as its positive entries' are (§4.6 "Cache posture").
-    let valid = valid_for(bridge, cx, parent.inode);
+    // live base directory's lifetime is bounded, as its positive entries' are (§4.6 "Cache posture"). With no
+    // lifetime (a virtio-fs guest, which has no invalidation channel) there is nothing to cache, so the miss is
+    // `ENOENT`, as it was: the same to the kernel, and what a guest has always been told.
     let negative = EntryOut {
       entry_valid: valid.0,
       entry_valid_nsec: valid.1,

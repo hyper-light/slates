@@ -202,19 +202,9 @@ fn phase_init_and_create(legs: &mut Legs<'_, '_>) -> (u64, u64) {
     "the device observed INIT"
   );
   let miss = legs.exchange(rq, Opcode::Lookup, ROOT, &name_body("hello"), 1);
-  // A miss is a negative entry (node id 0); a guest has no invalidation channel, so it is cached for nothing
-  // (`entry_valid` 0: the guest asks again every time, AUD-29-79).
-  assert_eq!(reply_error(&miss), 0);
-  assert_eq!(
-    u64_at(&miss, OUT_HEADER_LEN),
-    0,
-    "node id 0: a negative entry"
-  );
-  assert_eq!(
-    u64_at(&miss, OUT_HEADER_LEN + 16),
-    0,
-    "entry_valid 0: a guest keeps nothing"
-  );
+  // A guest has no invalidation channel, so a miss has no lifetime to cache and is answered ENOENT, never a
+  // negative entry (AUD-29-79; the bridge's negative entries are for mounts it can invalidate).
+  assert_eq!(reply_error(&miss), -ENOENT);
   let created = legs.exchange(rq, Opcode::Create, ROOT, &create_body("hello"), 2);
   assert_eq!(reply_error(&created), 0);
   (
