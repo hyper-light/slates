@@ -309,13 +309,12 @@ test('every async call ends across restart, silence, reader loss and death', asy
       `every admitted call is answered after the restart: ${JSON.stringify(settled.filter((r) => r.status === 'rejected' && !/TooManyOutstanding/.test(r.reason.message)).map((r) => r.reason.message))}`);
     await waitFor(async () => (await daemonPids(daemon, instance)).length > 0, 'the anchor restarted the daemon');
 
-    // (2) A live but silent daemon: the call ends Stalled at its reply deadline. Its anchor is stopped
-    // first, or its supervision would replace the silent daemon and the call would be recovered instead.
-    // The pids are read after the anchor stops, so a daemon it spawned in between cannot be missed and
-    // answer the call (the Python twin failed so once in nine CI runs, 2026-10-02).
-    process.kill(anchor.pid, 'SIGSTOP');
-    const live = await daemonPids(daemon, instance);
-    for (const pid of live) process.kill(pid, 'SIGSTOP');
+    // (2) A live but silent daemon: the call ends Stalled at its reply deadline. The anchor's whole process
+    // group (it leads it, `detached`, and every daemon it spawns is in it) is stopped in one signal (a negative
+    // pid), so its supervision cannot replace the silent daemon and no child it forked can escape the stop.
+    // Stopping the anchor and then each `pgrep`-found daemon left a window: a child forked but not yet exec'd
+    // does not match the daemon's command line (the Python twin failed so on CI, 2026-10-02 and 2026-10-06).
+    process.kill(-anchor.pid, 'SIGSTOP');
     await assert.rejects(client.list(), /Stalled/);
 
     // (2b) A cancelled call is released at once: it rejects AbortError and nothing is left waiting.
@@ -330,8 +329,7 @@ test('every async call ends across restart, silence, reader loss and death', asy
     await sleep(POLL_MS);
     client._sock.destroy();
     await assert.rejects(waiting, /completion fd|CompletionLost/);
-    for (const pid of live) process.kill(pid, 'SIGCONT');
-    process.kill(anchor.pid, 'SIGCONT');
+    process.kill(-anchor.pid, 'SIGCONT');
     await assert.rejects(client.list(), /completion fd|CompletionLost/, 'a lost reader refuses later calls');
 
     // (4) Death: a fresh client, then the anchor and its daemon killed for good.

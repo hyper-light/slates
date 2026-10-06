@@ -338,14 +338,14 @@ class SlatesAsyncEveryCallEnds(unittest.TestCase):
 
             await _wait_for(restarted, "the anchor restarted the daemon")
 
-            # (2) A live but silent daemon: the call ends Stalled. Its anchor is stopped first, or its
-            # supervision would replace the silent daemon and the call would be recovered instead.
-            # The pids are read after the anchor stops, so a daemon it spawned in between cannot be missed
-            # and answer the call (CI 2026-10-02: "SlatesError not raised", once in nine runs).
-            os.kill(anchor.pid, signal.SIGSTOP)
-            live = await _daemon_pids(binary, instance)
-            for pid in live:
-                os.kill(pid, signal.SIGSTOP)
+            # (2) A live but silent daemon: the call ends Stalled. The anchor's whole process group (the
+            # anchor leads it, `start_new_session`, and every daemon it spawns is in it) is stopped in one
+            # signal, so its supervision cannot replace the silent daemon and no child it forked can escape
+            # the stop. Stopping the anchor and then each `pgrep`-found daemon still left a window: a child
+            # forked but not yet exec'd does not match the daemon's command line (CI 2026-10-02 and
+            # 2026-10-06: "SlatesError not raised", the second after the pids were read post-stop).
+            group = os.getpgid(anchor.pid)
+            os.killpg(group, signal.SIGSTOP)
             with self.assertRaisesRegex(slates.SlatesError, "Stalled"):
                 await client.list()
 
@@ -356,9 +356,7 @@ class SlatesAsyncEveryCallEnds(unittest.TestCase):
             with self.assertRaises(asyncio.CancelledError):
                 await waiting
             await asyncio.sleep(POLL_SECS)
-            for pid in live:
-                os.kill(pid, signal.SIGCONT)
-            os.kill(anchor.pid, signal.SIGCONT)
+            os.killpg(group, signal.SIGCONT)
             self.assertIsInstance(await client.list(), list, "the client serves after the cancel")
 
             # (4) Death: a fresh client, then the anchor and its daemon killed for good.
