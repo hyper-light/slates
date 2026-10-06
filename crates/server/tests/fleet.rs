@@ -1020,11 +1020,21 @@ fn peers_that_each_believe_the_other_dead_find_each_other_again() {
   // Each side retires the other, as both sides of a cut conclude.
   inject_death_into([&daemon_a], host_b);
   inject_death_into([&daemon_b], host_a);
+  // Every change in what the two sides hold, with when it was seen: a failed assertion reports the history, so a
+  // run that never saw both apart says whether the deaths never took or one side was re-admitted before the other
+  // retired (CI's macOS lane, 2026-10-06: 2 of 8 runs, not reproduced locally in 12).
+  let began = Instant::now();
+  let seen: std::cell::RefCell<Vec<(u128, (bool, bool))>> = std::cell::RefCell::new(Vec::new());
   let each_holds_both = || -> Result<(bool, bool), ObserveError> {
-    Ok((
+    let held = (
       daemon_a.fleet_members()?.contains(&host_b),
       daemon_b.fleet_members()?.contains(&host_a),
-    ))
+    );
+    let mut history = seen.borrow_mut();
+    if history.last().map(|(_, last)| *last) != Some(held) {
+      history.push((began.elapsed().as_millis(), held));
+    }
+    Ok(held)
   };
   let apart = poll_until(&[&daemon_a, &daemon_b], RETIREMENT_DEADLINE, || {
     each_holds_both().map(|(a_holds_b, b_holds_a)| !a_holds_b && !b_holds_a)
@@ -1044,7 +1054,11 @@ fn peers_that_each_believe_the_other_dead_find_each_other_again() {
 
   daemon_a.stop();
   daemon_b.stop();
-  assert!(apart, "each retired the other after the injected deaths");
+  assert!(
+    apart,
+    "each retired the other after the injected deaths; (A holds B, B holds A) as seen, ms after the injections: {:?}",
+    seen.borrow()
+  );
   assert!(
     together,
     "each re-admitted the other once the path was whole"
@@ -6600,9 +6614,24 @@ fn volumes_for_each_successor(daemons: &[Daemon], hosts: &[HostId]) -> Vec<(Volu
 /// volume is served there) or the serve deadline passes; returns whether it did.
 fn poll_status_answers(daemons: &[&Daemon], instance: &str, volume: VolumeId) -> bool {
   let mut client = Client::connect(instance);
-  poll_until(daemons, SERVE_DEADLINE, || {
-    Ok(status_answers(&mut client, volume))
-  })
+  // The last reply that was not a report, kept so a poll that gives up says what the daemon answered instead
+  // (CI's macOS lane, 2026-10-06: "the successor serves the taken-over volume" failed in 2 of 8 runs with no reply
+  // on record, and 12 local runs of its sibling passed).
+  let mut last_refusal = None;
+  let answered = poll_until(daemons, SERVE_DEADLINE, || {
+    let reply = client.call(&RequestBody::Status { volume });
+    let report = matches!(reply, ReplyBody::Status { .. });
+    if !report {
+      last_refusal = Some(format!("{reply:?}"));
+    }
+    Ok(report)
+  });
+  if !answered {
+    eprintln!(
+      "status for {volume:?} at {instance} never answered a report; its last reply: {last_refusal:?}"
+    );
+  }
+  answered
 }
 
 /// Polls the owner's `await placed(snapshot, region)` verb until it answers placed, or the placement
