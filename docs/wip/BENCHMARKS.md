@@ -3149,3 +3149,22 @@ runs on a six-window file; after every step, the live volume's referenced and un
 rebuild, which recounts from the bodies. A mutation that dropped the written windows failed it. Dropping only the
 open extent's window passes, because sealing keeps the extent's epoch and block when there is no cipher. That window
 is kept anyway: a seal under a cipher may move the block.
+
+## The KIND lane on the streamed-checkpoint build (2026-10-07)
+
+This Mac (M5 Max), Docker Desktop, kind, `cargo xtask kind all` at `3ba73241` (load average 8–10): the image built
+from the repository's Dockerfile, smoked, then on a three-pod chart install:
+
+| Step | Result |
+|---|---|
+| Install and formation | 3 replicas installed and formed in 7.5 s |
+| Placement | A volume's snapshot placed at `f + 1` across pods in 7.5 s |
+| Takeover | The owner's pod deleted (SIGKILL): `slates-0` took the volume over and served it placed 3.5 s after the delete, every byte of its 4 files |
+| Rejoin | The replacement pod rejoined with a fresh identity 3.7 s after deletion |
+| `wan` (80 ± 20 ms) | 18 samples over 183 s, 0 leader changes |
+| `wan-loss` (80 ± 20 ms, 1 % loss) | 18 samples over 183 s, 0 leader changes |
+| `ceiling` (350 ms) | formed in 4.8 s; 18 samples over 183 s, 0 leader changes |
+
+`cargo xtask kind export` (kubelet mounting a published volume as an `nfs` PersistentVolume over RPC-with-TLS)
+skipped loudly here: Docker Desktop's kernel has no TLS record layer (`CONFIG_TLS`). That leg runs in CI with
+`--require-kernel-tls`.
