@@ -4406,7 +4406,14 @@ With jitter the read is bound by the session's congestion window, which collapse
   region, from 45 s after `up` onward.
 - **One node's record session to the owner stayed borrowed for good** (reads `HomedElsewhere`,
   `fleet.forward.session_never_returned`), alongside 111 session replacements on that node. A traced rerun showed
-  every read-ahead batch returning its session, so the borrower is elsewhere.
+  every read-ahead batch returning its session, so the borrower is elsewhere. **Narrowed the same day:** every
+  borrow now carries its holder (`take_sessions`'s label, kept on the link while it is out), and a forward that
+  finds its session out counts the holder (`fleet.lent_to.<function>`, or `fleet.lent_to.link` for the link task's
+  own discovery page or dial); a dropped link counts why (`fleet.link.invalid.member_changed`, `.believed_dead`,
+  `.outside_neighbourhood`). In 4 jitter-free bring-ups since (36 cross-region reads, all byte-identical,
+  26.7–36.4 s for 8 MiB), every forward miss was the link task's own discovery page, the invalidations were the
+  formation-time seed-to-learned member changes and early suspicions, replacements ran 5–55 a node, and the
+  permanent borrow did not recur. Open until it recurs with these counters to name its holder.
 
 Both need traces before diagnosis. Their logs and status are kept from the runs.
 

@@ -121,6 +121,9 @@ pub struct RecordLink {
   pub endpoint: Option<slates_transport::endpoint::Endpoint>,
   /// The connection id of the session a dispatch borrowed, while it is out; `None` otherwise.
   pub borrowed: Option<slates_transport::endpoint::ConnectionId>,
+  /// Who borrowed it, while it is out (`fleet::take_sessions`'s label, a status counter name): what a forward that
+  /// finds the session out counts, so a session that never comes back names its holder.
+  pub lent_to: Option<&'static str>,
 }
 
 impl RecordLink {
@@ -129,6 +132,7 @@ impl RecordLink {
     RecordLink {
       endpoint: Some(endpoint),
       borrowed: None,
+      lent_to: None,
     }
   }
 }

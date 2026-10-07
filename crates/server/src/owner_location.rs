@@ -277,7 +277,7 @@ pub(crate) async fn locate(query: Query) -> Result<HostId, LocationError> {
   let mut answers = Answers::default();
   let mut met_out = false;
   loop {
-    let taken = take_sessions(|peer| unasked.contains(&peer));
+    let taken = take_sessions("fleet.lent_to.locate", |peer| unasked.contains(&peer));
     for (peer, _) in &taken {
       unasked.remove(peer);
     }

@@ -988,7 +988,8 @@ impl Daemon {
         let began = slates_rt::futures::now_ns();
         let (sessions, outcome) = loop {
           let waited_ns = slates_rt::futures::now_ns().saturating_sub(began);
-          let sessions = crate::fleet::take_sessions(|host| host == peer);
+          let sessions =
+            crate::fleet::take_sessions("fleet.lent_to.hold_record_session", |host| host == peer);
           if !sessions.is_empty() {
             break (sessions, SessionHold::Took { waited_ns });
           }

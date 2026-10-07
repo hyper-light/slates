@@ -262,7 +262,9 @@ async fn announce_epochs() {
   if owed.is_empty() {
     return;
   }
-  let mut sessions = crate::fleet::take_sessions(|member| owed.contains_key(&member));
+  let mut sessions = crate::fleet::take_sessions("fleet.lent_to.announce_epochs", |member| {
+    owed.contains_key(&member)
+  });
   for (member, endpoint) in &mut sessions {
     let canonical = owed.get(member).copied().unwrap_or(false);
     announce_on(*member, endpoint, canonical).await;

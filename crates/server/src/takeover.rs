@@ -607,7 +607,7 @@ async fn ask_pages(
   budget: CommitBudget,
 ) -> Option<Dispatch> {
   let wanted: BTreeMap<HostId, HostPrepare> = requests.into_iter().collect();
-  let sessions = take_sessions(|host| wanted.contains_key(&host));
+  let sessions = take_sessions("fleet.lent_to.ask_pages", |host| wanted.contains_key(&host));
   if sessions.is_empty() {
     return None;
   }
@@ -777,7 +777,9 @@ async fn adopt(
     Some((acceptor, shape, quorum, record))
   })
   .flatten()?;
-  let holders = take_sessions(|host| host != local && shape.candidates.contains(&host));
+  let holders = take_sessions("fleet.lent_to.adopt", |host| {
+    host != local && shape.candidates.contains(&host)
+  });
   let taken: Vec<HostId> = holders.iter().map(|(host, _)| *host).collect();
   let committed = commit_record(
     local,

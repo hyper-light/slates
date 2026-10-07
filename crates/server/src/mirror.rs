@@ -191,7 +191,9 @@ pub(crate) async fn ship(
   .await
   .unwrap_or_default();
   for item in owed {
-    let sessions = take_sessions(|host| item.targets.contains(&host));
+    let sessions = take_sessions("fleet.lent_to.mirror_ship", |host| {
+      item.targets.contains(&host)
+    });
     if sessions.is_empty() {
       continue;
     }
@@ -457,7 +459,9 @@ pub(crate) async fn drive_promotion(local: HostId, budget: CommitBudget) -> Vec<
       .into_iter()
       .filter(|(host, _)| *host != local)
       .collect();
-    let sessions = take_sessions(|host| wanted.contains_key(&host));
+    let sessions = take_sessions("fleet.lent_to.drive_promotion", |host| {
+      wanted.contains_key(&host)
+    });
     if !sessions.is_empty() {
       let sent: Vec<HostId> = sessions.iter().map(|(host, _)| *host).collect();
       let outgoing: Vec<(HostId, Vec<u8>, Endpoint)> = sessions

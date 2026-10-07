@@ -1783,8 +1783,9 @@ async fn put_inputs(
   quorum: Quorum,
   budget: CommitBudget,
 ) -> Option<Dispatch> {
-  let holders =
-    take_sessions(|host| host != local && candidates.contains(&host) && !acked.contains(&host));
+  let holders = take_sessions("fleet.lent_to.put_inputs", |host| {
+    host != local && candidates.contains(&host) && !acked.contains(&host)
+  });
   if holders.is_empty() {
     return None;
   }
@@ -1847,7 +1848,7 @@ async fn ship_record(
   quorum: Quorum,
   budget: CommitBudget,
 ) -> Option<Dispatch> {
-  let holders = take_sessions(|host| targets.contains(&host));
+  let holders = take_sessions("fleet.lent_to.ship_record", |host| targets.contains(&host));
   if holders.is_empty() {
     return None;
   }

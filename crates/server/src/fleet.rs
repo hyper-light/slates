@@ -2782,7 +2782,9 @@ async fn put_seal_content(origin: u16, local: HostId, work: ContentWork) -> Opti
     .filter(|host| *host != local && !work.acked.contains(host))
     .collect();
   let targets = hedge_targets(work.hedged, remote, hedge);
-  let holders = take_sessions(|host| targets.contains(&host));
+  let holders = take_sessions("fleet.lent_to.put_seal_content", |host| {
+    targets.contains(&host)
+  });
   let dispatched_ns = futures::now_ns();
   let manifest = work.archive.manifest_identity();
   let (placement, latencies_ns, refilled, dispatch) = if holders.is_empty() {
@@ -2997,7 +2999,9 @@ async fn fetch_into_hold(
   let holders = head.holders();
   // Every reachable recorded holder: the manifest and the chunks are ranked, hedged and tied across all of them
   // (A-91; §4.10 "hedged fetches by identity from the recorded holders"), so one slow or lost holder is masked.
-  let sessions = take_sessions(|host| holders.contains(&host));
+  let sessions = take_sessions("fleet.lent_to.fetch_into_hold", |host| {
+    holders.contains(&host)
+  });
   if sessions.is_empty() {
     return false; // No recorded holder reachable this period.
   }
@@ -3463,6 +3467,10 @@ const RESOLVE_NO_ADDRESS: &str = "fleet.resolve.no-address";
 const RESOLVE_MALFORMED: &str = "fleet.resolve.malformed";
 const RESOLVE_IO: &str = "fleet.resolve.io";
 
+/// The status count of a forward that found its session held by the record link task itself (a discovery page or
+/// a dial), not lent through [`take_sessions`]: the holder named beside `fleet.forward.session_out`.
+const LENT_TO_LINK: &str = "fleet.lent_to.link";
+
 /// The status refusal counts under which a dial task records a handshake that ran out its budgets with
 /// the peer silent (`fleet.dial.redial`: the socket is dropped and the next period dials afresh) and one
 /// the transport faulted (`fleet.dial.fault`: a peer whose half-open state for this source is gone, a
@@ -3841,14 +3849,38 @@ impl DiscoveryFault {
 /// Whether the link to `anchor` still addresses `expected`: the anchor's learned member is still `expected`
 /// (or none was learned yet, the seed standing) and this node still keeps direct contact with it.
 fn link_valid(anchor: HostId, expected: HostId) -> bool {
-  state::with_state(|s| {
-    s.learned_members
-      .get(&anchor)
-      .is_none_or(|learned| learned.host == expected)
-      && keeps_direct_contact_with(s, expected)
-  })
-  .unwrap_or(false)
+  state::with_state(|s| link_invalid_reason(s, anchor, expected).is_none()).unwrap_or(false)
 }
+
+/// Why `anchor`'s link, made to `expected`, no longer holds, as a status counter name; `None` while it holds:
+/// the anchor's learned member is another incarnation, or this node no longer keeps direct contact with the
+/// member, by the reason [`direct_contact`] gives. Counted beside `fleet.discovery.invalidated`, so link churn
+/// says which rule dropped the link.
+fn link_invalid_reason(
+  state: &ShardState,
+  anchor: HostId,
+  expected: HostId,
+) -> Option<&'static str> {
+  if state
+    .learned_members
+    .get(&anchor)
+    .is_some_and(|learned| learned.host != expected)
+  {
+    return Some(LINK_INVALID_MEMBER_CHANGED);
+  }
+  match direct_contact(state, expected) {
+    DirectContact::BelievedDead => Some(LINK_INVALID_BELIEVED_DEAD),
+    DirectContact::OutsideNeighbourhood => Some(LINK_INVALID_OUTSIDE_NEIGHBOURHOOD),
+    _ => None,
+  }
+}
+
+/// A record link dropped because its anchor's learned member became another incarnation.
+const LINK_INVALID_MEMBER_CHANGED: &str = "fleet.link.invalid.member_changed";
+/// A record link dropped because this node came to believe its member dead.
+const LINK_INVALID_BELIEVED_DEAD: &str = "fleet.link.invalid.believed_dead";
+/// A record link dropped because its member left this node's neighbourhood and holds no voter's seat.
+const LINK_INVALID_OUTSIDE_NEIGHBOURHOOD: &str = "fleet.link.invalid.outside_neighbourhood";
 
 /// Wakes the discovery exchange pending on `anchor`'s record link, if one is, so it re-checks the link's
 /// validity at once — a replacement learned on contact, a retirement folded — rather than at its deadline.
@@ -3933,6 +3965,12 @@ async fn exchange_discovery(
         session.abandon(abandoned);
       }
       count_refusal(fault.counter());
+      if matches!(fault, DiscoveryFault::Invalidated)
+        && let Some(reason) =
+          state::with_state(|s| link_invalid_reason(s, anchor, expected)).flatten()
+      {
+        count_refusal(reason);
+      }
       return fault.outcome();
     }
   };
@@ -4417,7 +4455,9 @@ pub(crate) async fn send_council_report(
     s.council.voters()
   })
   .unwrap_or_default();
-  let sessions = take_sessions(|host| host != local && voters.contains(&host));
+  let sessions = take_sessions("fleet.lent_to.send_council_report", |host| {
+    host != local && voters.contains(&host)
+  });
   if sessions.is_empty() {
     return;
   }
@@ -4458,7 +4498,9 @@ async fn drive_council_replication(
   budget: CommitBudget,
   in_flight: &mut Vec<Dispatch>,
 ) {
-  let sessions = take_sessions(|host| others.contains(&host));
+  let sessions = take_sessions("fleet.lent_to.drive_council_replication", |host| {
+    others.contains(&host)
+  });
   if sessions.is_empty() {
     return;
   }
@@ -4635,7 +4677,9 @@ async fn take_campaign_sessions(
   let began = futures::now_ns();
   let (withheld, withheld_until) = campaign_hold(began);
   let available = |host: HostId| !(withheld.contains(&host) && futures::now_ns() < withheld_until);
-  let mut taken = take_sessions(|host| others.contains(&host) && available(host));
+  let mut taken = take_sessions("fleet.lent_to.take_campaign_sessions", |host| {
+    others.contains(&host) && available(host)
+  });
   let first_look = taken.len();
   loop {
     let out = voters_out(others, &taken);
@@ -4648,7 +4692,10 @@ async fn take_campaign_sessions(
       count_campaign_sessions(others, &taken, taken.len().saturating_sub(first_look));
       return taken;
     }
-    taken.extend(take_sessions(|host| out.contains(&host) && available(host)));
+    taken.extend(take_sessions(
+      "fleet.lent_to.take_campaign_sessions",
+      |host| out.contains(&host) && available(host),
+    ));
   }
 }
 
@@ -4758,7 +4805,9 @@ async fn drive_transfer_invitation(
   let Some(target) = state::with_state(|s| group.transferring_to(s)).flatten() else {
     return;
   };
-  let sessions = take_sessions(|host| host == target);
+  let sessions = take_sessions("fleet.lent_to.drive_transfer_invitation", |host| {
+    host == target
+  });
   if sessions.is_empty() {
     return;
   }
@@ -5275,7 +5324,9 @@ async fn drive_root_replication(
   budget: CommitBudget,
   in_flight: &mut Vec<Dispatch>,
 ) {
-  let sessions = take_sessions(|host| others.contains(&host));
+  let sessions = take_sessions("fleet.lent_to.drive_root_replication", |host| {
+    others.contains(&host)
+  });
   if sessions.is_empty() {
     return;
   }
@@ -5422,7 +5473,9 @@ async fn drive_root_learner_fetch(
   budget: CommitBudget,
   in_flight: &mut Vec<Dispatch>,
 ) {
-  let sessions = take_sessions(|host| voters.is_empty() || voters.contains(&host));
+  let sessions = take_sessions("fleet.lent_to.drive_root_learner_fetch", |host| {
+    voters.is_empty() || voters.contains(&host)
+  });
   if sessions.is_empty() {
     return;
   }
@@ -5486,7 +5539,7 @@ async fn drive_learner_fetch(
       .collect()
   })
   .unwrap_or_default();
-  let sessions = take_sessions(|host| {
+  let sessions = take_sessions("fleet.lent_to.drive_learner_fetch", |host| {
     regional_peers.contains(&host) && (voters.is_empty() || voters.contains(&host))
   });
   if sessions.is_empty() {
@@ -6109,7 +6162,7 @@ async fn request_peer(
   request: &[u8],
   budget: CommitBudget,
 ) -> Option<Vec<u8>> {
-  let mut sessions = take_sessions(|candidate| candidate == host);
+  let mut sessions = take_sessions("fleet.lent_to.request_peer", |candidate| candidate == host);
   let taken = sessions.pop();
   return_sessions(sessions);
   let (holder, endpoint) = taken?;
@@ -6218,8 +6271,9 @@ async fn ship_head(
   head: &Head,
   budget: CommitBudget,
 ) -> Option<Dispatch> {
-  let holders =
-    take_sessions(|host| head.shape.candidates.contains(&host) && !head.acked.contains(&host));
+  let holders = take_sessions("fleet.lent_to.ship_head", |host| {
+    head.shape.candidates.contains(&host) && !head.acked.contains(&host)
+  });
   if holders.is_empty() {
     return None; // No live session to a candidate that still needs the head; retry next period.
   }
@@ -6318,7 +6372,10 @@ fn record_acks_in(
 /// entry `None` (out on a dispatch — the link task leaves it alone) until [`return_sessions`] puts it back. A
 /// holder with no live session is skipped — the dispatch proceeds with the holders it can reach and the rest
 /// are retried next period.
-pub(crate) fn take_sessions(wanted: impl Fn(HostId) -> bool) -> Vec<(HostId, Endpoint)> {
+pub(crate) fn take_sessions(
+  lent_to: &'static str,
+  wanted: impl Fn(HostId) -> bool,
+) -> Vec<(HostId, Endpoint)> {
   state::with_state(|s| {
     let mut taken = Vec::new();
     for (host, link) in s.record_sessions.iter_mut() {
@@ -6327,6 +6384,7 @@ pub(crate) fn take_sessions(wanted: impl Fn(HostId) -> bool) -> Vec<(HostId, End
       {
         // The borrow is tagged with the session's own identity, so only this session returns to the slot.
         link.borrowed = endpoint.connection_id().ok();
+        link.lent_to = Some(lent_to);
         taken.push((*host, endpoint));
       }
     }
@@ -6349,6 +6407,7 @@ pub(crate) fn return_sessions(sessions: Vec<(HostId, Endpoint)>) {
         Some(link) if link.endpoint.is_none() && link.borrowed == returned => {
           link.endpoint = Some(endpoint);
           link.borrowed = None;
+          link.lent_to = None;
         }
         _ => s.count(LINK_STALE_RETURN, 1),
       }
@@ -6403,7 +6462,12 @@ pub(crate) async fn forward_batch_over_leader_session(
   let mut missed = false;
   loop {
     let waited = futures::now_ns().saturating_sub(began);
-    if let Some((_, endpoint)) = take_sessions(|host| host == peer).pop() {
+    if let Some((_, endpoint)) =
+      take_sessions("fleet.lent_to.forward_batch_over_leader_session", |host| {
+        host == peer
+      })
+      .pop()
+    {
       // The wait for the session spends the budget for the first byte; every byte after renews it.
       let (replies, endpoint) = slates_cluster::requests_within(
         endpoint,
@@ -6421,12 +6485,19 @@ pub(crate) async fn forward_batch_over_leader_session(
     let expired = waited >= stall_ns;
     state::with_state(|s| {
       if first_miss {
-        let missing = if s.record_sessions.contains_key(&peer) {
+        let link = s.record_sessions.get(&peer);
+        let missing = if link.is_some() {
           "fleet.forward.session_out"
         } else {
           "fleet.forward.no_session"
         };
+        // Who holds it: the borrower's own label (`take_sessions`), or the link task when nothing lent
+        // it (a discovery page or a dial), so a session that never comes back names its holder.
+        let holder = link.map(|link| link.lent_to.unwrap_or(LENT_TO_LINK));
         s.count(missing, 1);
+        if let Some(holder) = holder {
+          s.count(holder, 1);
+        }
       }
       if expired {
         s.count("fleet.forward.session_never_returned", 1);
