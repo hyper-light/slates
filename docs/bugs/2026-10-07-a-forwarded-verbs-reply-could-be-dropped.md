@@ -51,3 +51,26 @@ every daemon's refusal map with the full observation budget, including the candi
 holds. So it waited out the 3 s hold before the poll began, and the poll's first answer came after the hold. Fixed:
 the trace reads refusals within one liveness budget (`Daemon::fleet_refusals_within`). Traced, alone: passes 3 of
 3; with the old read restored, it fails. Untraced, it passed in every full-suite run before and after this change.
+
+## The copyset test, diagnosed so far (2026-10-07)
+
+Untraced full fleet suites: 4 failures in 9 runs (traced: 0 in 4), always `retry not served: HomedElsewhere`.
+The test's failure message now carries the foreign daemon's routing counters. The one failure caught with them:
+
+- `fleet.forward.*` did not move: the forward was never the failure.
+- `owner_location.round` went 1 → 4, `claim` 1 → 2, `not_owner` 2 → 8, `unavailable` 0 → 2.
+- Three rounds over three surviving home peers should give nine answers. One claim and six "not mine" make seven,
+  and neither `no_reply`, `session_out` nor `refused_by_peer` moved. So two rounds never asked the successor:
+  this node held no record session to it. A round does not wait for a peer with no session (the bounded
+  neighbourhood keeps none to most peers), so with no claim the round answered `Unavailable`.
+
+That is the working hypothesis; it is not yet confirmed by a counter. Two counters are added so the next failure
+says it outright:
+
+- `fleet.owner_location.no_session`: eligible peers a round never asked because no session existed.
+- `fleet.owner_location.forward_unanswered`: a forward that reached its owner but was not answered in time, which
+  surfaced as `HomedElsewhere` with no counter of its own.
+
+Three untraced runs since passed 71 of 71. The fix follows once a failure shows `no_session` moving: either dial a
+claimant the round skipped, within its liveness budget, or route through a peer that holds a session to it.
+

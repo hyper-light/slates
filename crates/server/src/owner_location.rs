@@ -288,6 +288,7 @@ pub(crate) async fn locate(query: Query) -> Result<HostId, LocationError> {
     }
     let out = sessions_out(&unasked);
     if out.is_empty() {
+      count_unsessioned(&unasked);
       break;
     }
     if !met_out {
@@ -307,6 +308,15 @@ pub(crate) async fn locate(query: Query) -> Result<HostId, LocationError> {
     count(error.counter());
   }
   result
+}
+
+/// Counts the peers a round left unasked because they hold no record session at all: not waited for (the bounded
+/// neighbourhood keeps none to most peers), but counted (`fleet.owner_location.no_session`), so a round that missed
+/// a claim because its claimant had no session says so rather than reading as a peer that answered "not mine".
+fn count_unsessioned(unasked: &std::collections::BTreeSet<HostId>) {
+  for _ in unasked {
+    count("fleet.owner_location.no_session");
+  }
 }
 
 /// Asks the peers whose sessions were `taken`, within `budget_ns`, folding every reply that arrives in

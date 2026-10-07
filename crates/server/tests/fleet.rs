@@ -4477,6 +4477,7 @@ fn a_forward_waits_for_the_owners_session_while_it_is_out() {
   assert_same_snapshot_reply(
     written.expect("the write was sent"),
     retry.expect("the retry was sent"),
+    "",
   );
   let counters = counters.expect("b's counters were read");
   assert!(
@@ -4697,6 +4698,17 @@ fn a_cross_region_client_finds_the_copyset_successor_instead_of_an_unrelated_liv
   trace::record(format_args!(
     "owner-lookup resumed={resumed:?} resumed_retry={resumed_retry:?}"
   ));
+  // Shown by a failed pair assertion (the trace is off in a plain run, and the failure appeared only there): how
+  // the foreign daemon routed and forwarded, before the writes and after the last retry.
+  let routing = format!(
+    "foreign location and forward counters before the writes {:?}, after the last retry {:?}",
+    location_counters(&counters_before),
+    daemons
+      .iter()
+      .find(|daemon| daemon.instance() == foreign_instance)
+      .map(|daemon| daemon.fleet_refusals_within(slates_server::daemon::LIVENESS_BUDGET_NS))
+      .map(|counters| counters.map(|counters| location_counters(&counters)))
+  );
   trace_routing_views(&daemons, ObjectId(id.bytes));
   for daemon in daemons {
     daemon.stop();
@@ -4708,8 +4720,9 @@ fn a_cross_region_client_finds_the_copyset_successor_instead_of_an_unrelated_liv
   assert_same_snapshot_reply(
     written.expect("the forward path was available"),
     retry.expect("the retry path was available"),
+    &routing,
   );
-  assert_same_snapshot_reply(resumed, resumed_retry);
+  assert_same_snapshot_reply(resumed, resumed_retry, &routing);
   assert!(
     counters_before
       .get("fleet.owner_location.round")
@@ -4799,12 +4812,12 @@ fn retry_snapshot_until_served(client: &mut Client, volume: VolumeId) -> ReplyBo
   reply
 }
 
-fn assert_same_snapshot_reply(first: ReplyBody, retry: ReplyBody) {
+fn assert_same_snapshot_reply(first: ReplyBody, retry: ReplyBody, routing: &str) {
   let ReplyBody::Snapshotted { id: first, .. } = first else {
-    panic!("write not served: {first:?}")
+    panic!("write not served: {first:?}; {routing}")
   };
   let ReplyBody::Snapshotted { id: retry, .. } = retry else {
-    panic!("retry not served: {retry:?}")
+    panic!("retry not served: {retry:?}; {routing}")
   };
   assert_eq!(
     first, retry,

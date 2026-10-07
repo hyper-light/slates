@@ -1028,8 +1028,16 @@ fn forward_to_owner(
         }
         None => None,
       };
-      let reply = bytes
-        .and_then(|bytes| decode_body::<ReplyBody>(&bytes).ok())
+      // A forward sent but unanswered within its budget comes back empty, and it is counted apart from one never
+      // sent: an owner that was reached but did not answer in time is not one that could not be reached.
+      let decoded = bytes.map(|bytes| decode_body::<ReplyBody>(&bytes).ok());
+      if matches!(decoded, Some(None)) {
+        crate::state::with_state_counted(|state| {
+          state.count("fleet.owner_location.forward_unanswered", 1);
+        });
+      }
+      let reply = decoded
+        .flatten()
         .unwrap_or_else(|| refused(Refusal::HomedElsewhere { region }));
       let route = if matches!(&reply, ReplyBody::Refused { .. }) {
         None
