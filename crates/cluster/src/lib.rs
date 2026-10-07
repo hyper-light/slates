@@ -467,6 +467,161 @@ pub async fn request_within(
   )
 }
 
+/// What [`requests_within`] brought back: each request's reply in order (`None` for one not begun, not answered
+/// within the deadline, or failed), and how the batch streamed — the stream bytes the session consumed between the
+/// first turn that consumed any and the last, and the time between those turns. Timed at the receiver over the
+/// interval the bytes were arriving in, it leaves out the request's round trip and the wait for the first byte, and
+/// it is the same however the sender interleaves the replies' streams.
+#[derive(Clone, Debug, Default)]
+pub struct BatchReplies {
+  /// The replies, in the order of the requests.
+  pub replies: Vec<Option<Vec<u8>>>,
+  /// The stream bytes consumed after the first turn that consumed any.
+  pub streamed_bytes: u64,
+  /// Nanoseconds from that turn to the last that consumed any.
+  pub streamed_ns: u64,
+}
+
+/// [`request_within`] for several requests on one session at once: each begun as its own exchange (so they share
+/// the path's congestion window and a loss in one is recovered by the acknowledgements of the next, not by a
+/// probe timeout per request). The batch is given up only once it **stalls** — no byte consumed and no reply
+/// completed for `stall_ns` — never at a fixed deadline: a batch's transfer is as long as the path makes it, and a
+/// deadline estimated from its size and a measured rate refused live transfers whenever the estimate ran fast (a
+/// cross-region read failed after 2.6 s, 2026-10-07). The progress-aware rule of the record dispatch
+/// ([`DispatchWait`]), at the byte. Returns the replies and how they streamed ([`BatchReplies`]) **together with the
+/// endpoint**, kept whatever the outcome, its unanswered exchanges abandoned. The answered prefix is what a caller
+/// reading consecutive windows keeps.
+pub async fn requests_within(
+  mut endpoint: Endpoint,
+  stream_id: u64,
+  priority: Priority,
+  requests: &[Vec<u8>],
+  stall_ns: u64,
+) -> (BatchReplies, Endpoint) {
+  let exchanges = begin_prefix(&mut endpoint, stream_id, priority, requests);
+  let mut replies: Vec<Option<Vec<u8>>> = vec![None; requests.len()];
+  let mut streaming = Streaming::from(endpoint.bytes_consumed());
+  let mut progress_ns = now_ns();
+  loop {
+    if streaming.observe(endpoint.bytes_consumed(), now_ns()) {
+      progress_ns = now_ns();
+    }
+    let (open, completed) = take_completed_replies(&mut endpoint, &exchanges, &mut replies);
+    if completed {
+      progress_ns = now_ns();
+    }
+    let quiet_ns = now_ns().saturating_sub(progress_ns);
+    if !open || quiet_ns >= stall_ns {
+      break;
+    }
+    // One turn of the session, within what is left of the stall budget; `Endpoint::drive` is cancel-safe, so a
+    // turn cut off by the budget loses nothing. A turn that cannot be timed (off a shard) or fails ends the batch as
+    // a transport error would.
+    match slates_rt::futures::within(stall_ns.saturating_sub(quiet_ns), endpoint.drive()).await {
+      Ok(Some(Ok(()))) | Ok(None) => {}
+      Ok(Some(Err(_))) | Err(_) => break,
+    }
+  }
+  for (exchange, reply) in exchanges.iter().zip(replies.iter()) {
+    if let (Some(id), None) = (exchange, reply) {
+      endpoint.abandon(*id);
+    }
+  }
+  let (streamed_bytes, streamed_ns) = streaming.measured();
+  (
+    BatchReplies {
+      replies,
+      streamed_bytes,
+      streamed_ns,
+    },
+    endpoint,
+  )
+}
+
+/// Begins one exchange per request on `endpoint`, in order, stopping at the first the session refuses (its stream
+/// credit's typed backlog): each exchange's id, `None` from the refusal on, so the replies a caller keeps are a prefix.
+fn begin_prefix(
+  endpoint: &mut Endpoint,
+  stream_id: u64,
+  priority: Priority,
+  requests: &[Vec<u8>],
+) -> Vec<Option<u64>> {
+  let mut exchanges: Vec<Option<u64>> = Vec::with_capacity(requests.len());
+  for request in requests {
+    let begun = exchanges.last().is_none_or(Option::is_some);
+    exchanges.push(
+      begun
+        .then(|| endpoint.begin(stream_id, priority, request).ok())
+        .flatten(),
+    );
+  }
+  exchanges
+}
+
+/// Takes every reply of `exchanges` that has arrived whole into `replies`: whether any exchange is still open, and
+/// whether any reply completed on this call.
+fn take_completed_replies(
+  endpoint: &mut Endpoint,
+  exchanges: &[Option<u64>],
+  replies: &mut [Option<Vec<u8>>],
+) -> (bool, bool) {
+  let mut open = false;
+  let mut completed = false;
+  for (exchange, reply) in exchanges.iter().zip(replies.iter_mut()) {
+    let (Some(id), None) = (exchange, reply.as_ref()) else {
+      continue;
+    };
+    match endpoint.take_reply(*id) {
+      Some(bytes) => {
+        *reply = Some(bytes);
+        completed = true;
+      }
+      None => open = true,
+    }
+  }
+  (open, completed)
+}
+
+/// How a batch streamed ([`BatchReplies`]): the session's consumed bytes and the time at the first turn that consumed
+/// any, and at the latest that did.
+struct Streaming {
+  at_start: u64,
+  first: Option<(u64, u64)>,
+  last: Option<(u64, u64)>,
+}
+
+impl Streaming {
+  /// Before the batch: the session had consumed `at_start` bytes.
+  fn from(at_start: u64) -> Streaming {
+    Streaming {
+      at_start,
+      first: None,
+      last: None,
+    }
+  }
+
+  /// Notes the session's consumed count at `now_ns`; whether it moved since the last note.
+  fn observe(&mut self, consumed: u64, now_ns: u64) -> bool {
+    if consumed <= self.last.map_or(self.at_start, |(_, bytes)| bytes) {
+      return false;
+    }
+    let seen = (now_ns, consumed);
+    self.first = self.first.or(Some(seen));
+    self.last = Some(seen);
+    true
+  }
+
+  /// The bytes consumed after the first turn that consumed any, and the nanoseconds from it to the last.
+  fn measured(&self) -> (u64, u64) {
+    self
+      .first
+      .zip(self.last)
+      .map_or((0, 0), |((from_ns, from), (to_ns, to))| {
+        (to.saturating_sub(from), to_ns.saturating_sub(from_ns))
+      })
+  }
+}
+
 /// Ships each `(host, request)` to that host on `stream` over its borrowed session, concurrently — one
 /// child task per session, each bounded by the budget's full span and handing its timed reply and endpoint
 /// back whatever the outcome ([`request_within`]) — and returns the replies that arrived before the round's

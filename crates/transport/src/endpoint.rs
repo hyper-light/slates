@@ -1766,6 +1766,12 @@ impl Endpoint {
     self.conn.congestion_window()
   }
 
+  /// The stream bytes this end has consumed in order on the session ([`Connection::bytes_consumed`]): what a caller
+  /// times its delivery rate by.
+  pub fn bytes_consumed(&self) -> u64 {
+    self.conn.bytes_consumed()
+  }
+
   /// Losses this end declared that the peer then acknowledged — reordering, not loss (`crate::reorder`).
   pub fn spurious_losses(&self) -> u64 {
     self.conn.spurious_losses()

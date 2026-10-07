@@ -811,7 +811,13 @@ impl Detector {
         let target = self.next_target()?;
         let nonce = self.nonce;
         self.nonce = self.nonce.saturating_add(1);
-        let pooled_span = self.pool.verdict.map(|verdict| verdict.span_ns());
+        // The pool's verdict as it judges this probe: configured now if it is due, before the
+        // handshake is compared with it. Comparing with the verdict held before configuring read none
+        // on the probe that first configured the pool, and that probe was judged by the pool however
+        // long the pair's handshake had measured its path (a near member condemned by a far one in 5
+        // of 40 seeds, 2026-10-07).
+        let pooled = self.pooled();
+        let pooled_span = pooled.map(|verdict| verdict.span_ns());
         // The handshake that keyed the pair already measured its path: a round trip longer than the
         // pool's deadline is the same evidence a late answer gives, known before the first probe.
         let (own, misfit) = self.peers.get(&target).map_or((None, false), |peer| {
@@ -825,7 +831,7 @@ impl Detector {
             Some(own) => Some(own),
             // A pair the pool's verdict does not fit is measured, not judged, until it has its own.
             None if misfit => None,
-            None => self.pooled(),
+            None => pooled,
         };
         let peer = self.peers.entry(target).or_insert_with(Peer::new);
         let seq = peer.sent;

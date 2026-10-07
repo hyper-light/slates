@@ -4676,6 +4676,116 @@ fn write_and_snapshot(client: &mut Client, name: &str) -> (VolumeId, SnapshotId)
   (id, snapshot)
 }
 
+/// Condition 7 in the geo case (§4.8 "Lookup"; `ReadAhead` in `verbs.rs`): a multi-page file read by a client of
+/// another region is byte-identical, and its pages after the first are answered from the read-ahead window the origin
+/// kept, and a read that keeps going fetches its next windows as a batch twice the size of the last, so the read
+/// crosses to the owner about `log2(windows)` times, not once per page or per window. Found on two Docker networks
+/// 100 ms apart: a read paged one round trip at a time took tens of seconds for 8 MiB and stalled at the 1 s reply
+/// deadline; one window per round trip still took 127–148 s (`docs/wip/GAPS.md` 2026-10-07). Do: write a 4 MiB file
+/// into a volume on a (region 0); read it whole through a client of b (region 1). Expect: the bytes equal, windows
+/// joined from batches (the batch path's non-vacuity counter), and at most `log2(pages) + 1` forwards to the
+/// owner.
+#[test]
+fn a_cross_region_read_is_served_from_read_ahead_windows_and_byte_identical() {
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c"];
+  let n = names.len();
+  let nodes: Vec<(MachineProfile, HostId, Identity)> =
+    names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+    nodes.iter().map(|(_, _, id)| id.certificate()).collect();
+  let (_serve_lease, serve) = mesh_serve_ports(n);
+  let regions: std::collections::BTreeMap<HostId, RegionId> = hosts
+    .iter()
+    .enumerate()
+    .map(|(index, host)| (*host, RegionId(u64::try_from(index).unwrap())))
+    .collect();
+  let daemons = start_mesh_with_regions(nodes, &hosts, &certs, &serve, 1, &regions);
+  let instances: Vec<String> = daemons
+    .iter()
+    .map(|daemon| daemon.instance().to_owned())
+    .collect();
+  let hosts: Vec<HostId> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
+  assert_fleet_forms(&daemons, &hosts, &names);
+
+  let deadlines = slates_client::Deadlines::derive(
+    slates_server::daemon::LIVENESS_BUDGET_NS,
+    slates_db::replay::RECOVERY_BUDGET_NS,
+  )
+  .get();
+  let mut raw = Client::connect(&instances[0].clone());
+  let ReplyBody::Created { id: volume } = raw.call(&RequestBody::Create {
+    name: "read-ahead".to_owned(),
+    size: SizeClass::Bounded { limit: 16 << 20 },
+    names: NamePolicy::Exact,
+    require_locked: false,
+    base: None,
+  }) else {
+    panic!("create");
+  };
+  let ReplyBody::Attached { attachment, .. } = raw.call(&RequestBody::Attach {
+    volume,
+    snapshot: None,
+    intent: Intent::Write,
+    form: AttachRequest::Root,
+  }) else {
+    panic!("attach");
+  };
+  let mut writer = slates_client::Client::connect(&instances[0], deadlines).unwrap();
+  let file: Vec<u8> = (0..4u32 << 20)
+    .map(|index| (index.wrapping_mul(2_654_435_761) >> 24) as u8)
+    .collect();
+  writer
+    .fs_write((volume, attachment), "/big", &file, 0o644)
+    .unwrap();
+  let observed: Vec<&Daemon> = daemons.iter().collect();
+  let mut reader = slates_client::Client::connect(&instances[1], deadlines).unwrap();
+  let mut last = None;
+  let read = poll_until(&observed, COUNCIL_RETIRE_DEADLINE, || {
+    let bytes = reader.read(volume, "/big", ReadAt::Head);
+    let same = bytes.as_ref().is_ok_and(|bytes| *bytes == file);
+    last = Some(bytes.map(|bytes| bytes.len()));
+    Ok(same)
+  });
+  let counters = daemons[1]
+    .fleet_refusals_within(LIVENESS_BUDGET_NS)
+    .unwrap_or_default();
+  for daemon in daemons {
+    daemon.stop();
+  }
+  let hits = counters.get("fleet.read_ahead.hit").copied().unwrap_or(0);
+  let forwards = counters
+    .get("fleet.owner_location.direct")
+    .copied()
+    .unwrap_or(0)
+    + counters
+      .get("fleet.owner_location.round")
+      .copied()
+      .unwrap_or(0);
+  let joined = counters
+    .get("fleet.read_ahead.joined")
+    .copied()
+    .unwrap_or(0);
+  eprintln!("read-ahead: {forwards} forwards, {joined} joined windows, {hits} pages from windows");
+  assert!(read, "b read a's file byte-identical (last: {last:?})");
+  assert!(
+    hits > 0,
+    "pages after the first came from the read-ahead window: {counters:?}"
+  );
+  assert!(joined > 0, "later windows came in batches: {counters:?}");
+  // Every forward answers one page itself and every other page is a hit; batches doubling from one window reach
+  // the whole file in at most log2(pages) + 1 forwards.
+  let pages = hits + forwards;
+  assert!(
+    forwards <= u64::from(pages.max(1).ilog2()) + 1,
+    "the read crossed to the owner once per doubling batch: {forwards} forwards for {pages} pages"
+  );
+}
+
 /// Polls a `Status` of `volume` through `client` until it is served or `within` passes: whether it was, and the
 /// last reply, so a wait that fails names what the node answered.
 fn poll_status_served(

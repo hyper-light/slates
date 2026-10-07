@@ -4373,3 +4373,43 @@ written on `a1`.
   - **Owed (condition 7's remote pull, in the geo case):** a read whose pages travel the WAN needs pipelining sized
     to the path, a deadline derived from the measured path rather than the local liveness budget, or reads served by
     identity from holders in the reader's own region.
+
+### 2026-10-07: cross-region reads — correct and robust; batched read-ahead 2.6–2.9× faster where the path allows
+
+Follows the rerun above. Five changes:
+
+- **Read-ahead windows, then batches.** A forwarded read asks the owner for a window and answers the client's later
+  pages from it. A read that continues fetches doubling batches of windows on one session, capped by the file, the
+  shard's read-ahead allowance and the measured delivery rate (design §4.8 "Lookup", status of this date).
+- **A batch fails only when it stalls,** never at a deadline estimated from its size. An estimate that ran fast had
+  failed live reads after 2.6–13 s.
+- **Another region's configuration version no longer supersedes an owner's lease**
+  (`docs/bugs/2026-10-07-another-regions-configuration-version-superseded-the-owner-lease.md`).
+- **The client waits on a forwarded `ReadRange` while its daemon lives** (`defers_reply`).
+- **The detector's stale-pool follow-up:** a far member condemned a live near one in 5 of 40 seeds; now in 0 of 100
+  (`docs/bugs/2026-10-07-a-far-member-condemns-the-near-side-by-its-pooled-deadline.md`, follow-up). Sent to the
+  hyper-raft owner for `swim-pair-deadline`.
+
+Measured, 8 MiB, three readers in region 1 (`docs/wip/bench/multiregion/reads.sh`; every read byte-identical):
+
+| Link | One window per forward | Batches |
+|---|---|---|
+| 100 ms, 3 % loss | 82.3–87.1 s (9) | 28.8–33.9 s (9) |
+| 100 ms ± 40 ms, 3 % loss | 127.5–148.1 s (15) | 124.9–144.9 s (9) |
+
+With jitter the read is bound by the session's congestion window, which collapses to 17–24 KB under jitter
+(`BENCHMARKS.md`, "delay jitter collapses Copa"). That is condition 7's owed jitter-robust delay signal.
+
+**Open, found the same day:**
+
+- **Cross-region membership did not form** in 2 of 12 bring-ups of the topology: every detector held only its own
+  region, from 45 s after `up` onward.
+- **One node's record session to the owner stayed borrowed for good** (reads `HomedElsewhere`,
+  `fleet.forward.session_never_returned`), alongside 111 session replacements on that node. A traced rerun showed
+  every read-ahead batch returning its session, so the borrower is elsewhere.
+
+Both need traces before diagnosis. Their logs and status are kept from the runs.
+
+**Owed:** the hyper-raft owner's review of `swim-pair-deadline` (`f129a55`). Its blocking point: a member that dies
+before its far pairs' own estimators configure is never condemned by them, so it needs a judged deadline for misfit
+pairs derived from their measured path, and the matching test.

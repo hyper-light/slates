@@ -2961,6 +2961,7 @@ fn init_shard(
     answers_given: crate::lease::AnswersGiven::default(),
     departed_owners: std::collections::BTreeMap::new(),
     green_retention: std::collections::BTreeMap::new(),
+    read_ahead: crate::verbs::ReadAheadLedger::default(),
     council_timing: slates_cluster::timing::ElectionTiming::floor(),
     root_timing: slates_cluster::timing::ElectionTiming::floor(),
     council,
@@ -3573,6 +3574,8 @@ async fn control_loop(
                 control,
                 revoked: false,
                 owner_route: None,
+                read_ahead: None,
+                read_ahead_pending: 0,
               }) {
                 Ok(_) => admission.seat(),
                 Err(e) => {

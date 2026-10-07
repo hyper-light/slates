@@ -1821,6 +1821,12 @@ impl Connection {
     &self.rtt
   }
 
+  /// The stream bytes the application has consumed in order on this connection, every stream summed: a running
+  /// total that only rises, the receiver's own delivery count.
+  pub fn bytes_consumed(&self) -> u64 {
+    self.flow.consumed()
+  }
+
   /// The receive window currently advertised ahead of consumption, and how many times it has grown.
   pub fn receive_window(&self) -> (u64, u64) {
     (self.flow.window(), self.flow.growths())

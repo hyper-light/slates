@@ -6376,26 +6376,49 @@ pub(crate) async fn forward_over_leader_session(
   request: Vec<u8>,
   deadline_ns: u64,
 ) -> Option<Vec<u8>> {
+  forward_batch_over_leader_session(peer, vec![request], deadline_ns)
+    .await
+    .map(|batch| {
+      batch
+        .replies
+        .into_iter()
+        .next()
+        .flatten()
+        .unwrap_or_default()
+    })
+}
+
+/// [`forward_over_leader_session`] for several requests at once — a read-ahead batch of windows
+/// (`RequestBody::ReadWindow`) — all sent together on the borrowed session ([`slates_cluster::requests_within`]).
+/// `stall_ns` bounds the wait for the session and, once it is borrowed, any stretch with no progress: a batch that
+/// keeps delivering is never cut off for its size. Returns the replies in order (`None` for one not answered) with
+/// how they streamed ([`slates_cluster::BatchReplies`]), or `None` when the session never came back within the
+/// budget.
+pub(crate) async fn forward_batch_over_leader_session(
+  peer: HostId,
+  requests: Vec<Vec<u8>>,
+  stall_ns: u64,
+) -> Option<slates_cluster::BatchReplies> {
   let began = futures::now_ns();
   let mut missed = false;
   loop {
     let waited = futures::now_ns().saturating_sub(began);
     if let Some((_, endpoint)) = take_sessions(|host| host == peer).pop() {
-      let remaining = deadline_ns.saturating_sub(waited);
-      let (reply, endpoint) = request_within(
+      // The wait for the session spends the budget for the first byte; every byte after renews it.
+      let (replies, endpoint) = slates_cluster::requests_within(
         endpoint,
         FORWARD_STREAM,
         Priority::Metadata,
-        &request,
-        remaining,
+        &requests,
+        stall_ns.saturating_sub(waited),
       )
       .await;
       return_sessions(vec![(peer, endpoint)]);
-      return Some(reply.bytes);
+      return Some(replies);
     }
     let first_miss = !missed;
     missed = true;
-    let expired = waited >= deadline_ns;
+    let expired = waited >= stall_ns;
     state::with_state(|s| {
       if first_miss {
         let missing = if s.record_sessions.contains_key(&peer) {

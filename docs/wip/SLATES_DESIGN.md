@@ -3775,6 +3775,24 @@ version.
 > another node uses an attachment taken at the owner. Regression
 > `a_client_of_another_node_in_the_owners_region_reads_and_writes_its_volume_through_the_owner`.
 
+> **Status (2026-10-07, forwarded reads read ahead in doubling batches).** A forwarded `ReadRange` is asked of the
+> owner as a read-ahead window (`RequestBody::ReadWindow`, half the client's ring of pages). The origin keeps the
+> window in the client's slot and answers the client's next pages from it. A read that continues where its window
+> ended fetches the next windows as a batch sent at once on the owner's session, twice the last batch (Linux's
+> sequential read-ahead growth). A batch is capped by:
+> - what is left of the file;
+> - the shard's read-ahead allowance (`DaemonConfig::read_ahead_bytes`, one session's receive bytes per peer inside
+>   the fleet's receive share), which the batch is charged against before it is fetched;
+> - once measured, what the path delivers in one liveness budget, timed between deliveries.
+>
+> Joined windows must read one state of the file. A batch is given up only when it stalls (no byte for one budget),
+> never at a deadline estimated from its size. Measured on two Docker networks at 100 ms one way with 3 % loss:
+> 8 MiB in 28.8–33.9 s against 82.3–87.1 s for one window per forward. With ±40 ms jitter the two are even
+> (125–145 s), bound by the session's congestion window (condition 7). Record:
+> `docs/bugs/2026-10-07-a-cross-region-read-took-one-wan-round-trip-per-window.md`; regression
+> `a_cross_region_read_is_served_from_read_ahead_windows_and_byte_identical` (7 forwards for 1,041 pages, where
+> one window per forward took 66).
+
 > **Owner location (2026-09-17).** A foreign node cannot reconstruct a historic copyset from
 > present membership. After its creator route stops being usable, it asks authenticated
 > home-region peers through a bounded read-only exchange. A peer claims itself only when its

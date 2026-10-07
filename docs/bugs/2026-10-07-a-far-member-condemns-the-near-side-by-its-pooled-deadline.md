@@ -91,8 +91,38 @@ record already reused: no sample, no configuration, and the pool's 2 ms deadline
   every survivor, at least one by its own probes within the stated bound, and no live member is condemned. 3 of 3.
 - hyper-swim's own suite passes 74/74; the plane suite passes 8/8; the fleet suite passes 73/73.
 
+## Follow-up: the handshake read a stale pool verdict (2026-10-07)
+
+**Found:** the far-link test failed once in a cluster suite run. It runs on virtual time with deterministic jitter;
+the member plane's own randomness (probe order) varies the run. Over 40 runs it failed 5 times, each with one
+condemnation of near member 2 by one far member (`(3, 2)` three times, `(4, 2)` once, `(6, 2)` once). The "0, 3 of
+3" above was too few runs to see it.
+
+**Cause, from a trace of each miss (temporary, 2026-10-07):** both condemning misses were judged by the pooled
+verdict (a 2.5 ms span), with the pair not marked misfit although its handshake had measured 201 ms. `start`
+compared the handshake with `self.pool.verdict` and only then called `pooled()`, which configures the pool when it
+is due. On the probe that first configured the pool, the comparison read no verdict, so it found no misfit, and that
+probe was judged by the freshly configured 2.5 ms verdict.
+
+**Fix:** `start` takes the pooled verdict first (`pooled()`, configuring it if due), then compares the handshake
+with it, and judges by it only when the pair fits.
+
+**Tests:** `no_live_member_is_condemned_across_a_lossless_far_link` passes 100 of 100 runs (35 of 40 before);
+`a_far_member_that_dies_is_condemned_by_every_survivor_and_no_live_one_is` 30 of 30; the plane suite 8/8 three
+times; hyper-swim's suite 74/74.
+
 ## Left open
 
 On the lossless link, the far pairs' estimators report 15–40 % loss: measurement periods that ended before their
 answer, counted as losses. It condemned nothing, but it widens their margins. The upstream change should decide
 whether a late answer within the pair's wait is a loss at all.
+
+**From the upstream review (hyper-raft owner, 2026-10-07): a liveness gap, open in the vendored copy too.** A misfit
+pair's probes are measurement only until its own estimator configures, and an unanswered measurement probe
+condemns nothing. A member that dies before its far pairs configure is therefore never condemned by those pairs.
+`a_far_member_that_dies_…` passes only because the dead member's near peers condemn it and the condemnation spreads.
+With members 1–2 near and 3 far and 3 killed early, no survivor would condemn it.
+
+The fix owed: a judged deadline for a misfit pair from the evidence it has (the pool's measured shape shifted by the
+pair's measured round trip), derived in hyper-raft `docs/timing.md` beside §2.7, with the test "a far member killed
+early, every survivor far, condemned by every survivor within the stated bound".

@@ -310,6 +310,11 @@ pub struct DaemonConfig {
   /// of the reserve over every fleet session (the accepted and the dialed, on both planes), never below
   /// the initial window. Zero on a laptop.
   pub fleet_session_receive_bytes: u64,
+  /// Derived: the most bytes of other owners' content a shard may hold as its clients' read-ahead windows at once
+  /// (§4.8 "Lookup"; `crate::verbs::ReadAhead`): one fleet session's receive bytes per peer, counted inside the
+  /// fleet's receive share as one more session per peer, so the windows and the session buffers together stay
+  /// within the share. Zero on a laptop, which forwards nothing.
+  pub read_ahead_bytes: u64,
   /// Derived: the keys hyper-seal's locked region holds at once (A-92; seal.md §8): one base page of 32-byte key
   /// slots per shard, the bounded cache of unwrapped keys each shard keeps (a key past it is evicted and unwrapped
   /// again on its next use), and the root among them. Locked once at boot, a few pages, well inside the default
@@ -812,6 +817,7 @@ impl DaemonConfig {
       fleet_peer_capacity: 0,
       fleet_sessions_per_plane: 0,
       fleet_session_receive_bytes: 0,
+      read_ahead_bytes: 0,
       seal_key_slots: seal_key_slots.get(),
       boot_fault: None,
       #[cfg(unix)]
@@ -1066,11 +1072,13 @@ impl DaemonConfig {
       .push(note("fleet_sessions_per_plane", &sessions_per_plane));
     self.fleet_sessions_per_plane = sessions_per_plane.get();
     // Every fleet session on the control shard: the accepted ones (the pool per plane) and the ones this
-    // node dials (one per peer per plane).
+    // node dials (one per peer per plane); and one session's worth per peer for the read-ahead windows a shard
+    // keeps of what those sessions carried (`read_ahead_bytes`).
     let fleet_sessions = sessions_per_plane
       .get()
       .saturating_add(peers)
       .saturating_mul(FLEET_PLANES)
+      .saturating_add(peers)
       .max(1);
     let receive: Derived<u64> = derived!(
       (self
@@ -1082,13 +1090,22 @@ impl DaemonConfig {
       .max(slates_transport::connection::initial_receive_window(
         crate::fleet::FLEET_FRAME_CAP
       )),
-      "reserve_per_shard × FLEET_RECEIVE_SHARE_PERMILLE / 1000 / ((fleet_sessions_per_plane + peers) × FLEET_PLANES), at least the initial window",
+      "reserve_per_shard × FLEET_RECEIVE_SHARE_PERMILLE / 1000 / ((fleet_sessions_per_plane + peers) × FLEET_PLANES + peers), at least the initial window",
       ["reserve_per_shard", "fleet.peers"]
     );
     self
       .derivations
       .push(note("fleet_session_receive_bytes", &receive));
     self.fleet_session_receive_bytes = receive.get();
+    let read_ahead: Derived<u64> = derived!(
+      receive
+        .get()
+        .saturating_mul(u64::try_from(peers).unwrap_or(u64::MAX)),
+      "fleet_session_receive_bytes × peers (one session's receive bytes per peer, inside the fleet's receive share)",
+      ["fleet_session_receive_bytes", "fleet.peers"]
+    );
+    self.derivations.push(note("read_ahead_bytes", &read_ahead));
+    self.read_ahead_bytes = read_ahead.get();
     let fleet_tasks: Derived<usize> = derived!(
       peers
         .saturating_mul(FLEET_LOOPS_PER_PEER)

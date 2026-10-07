@@ -619,6 +619,23 @@ pub enum RequestBody {
     /// Its permission bits.
     mode: u32,
   },
+  /// A read-ahead window of a file (§4.8 "Lookup" forwards; `ReadRange` across nodes): up to `max` bytes from
+  /// `offset` at a view, answered as one `ReadPage`. Sent node to node only — the origin of a forwarded `ReadRange`
+  /// asks its owner for a window and answers the client's following pages from it — and capped at the owner by a
+  /// bounded window; a client asking it directly over its ring is answered as a `ReadRange`. A read; never recorded.
+  /// Appended.
+  ReadWindow {
+    /// The volume.
+    volume: VolumeId,
+    /// The file.
+    path: String,
+    /// The view.
+    at: ReadAt,
+    /// The first byte wanted.
+    offset: u64,
+    /// The most bytes wanted.
+    max: u64,
+  },
 }
 
 /// A concrete quorum-loss recovery proposal (§4.8). It identifies the retained copy and the

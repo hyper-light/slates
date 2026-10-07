@@ -100,6 +100,11 @@ impl FlowController {
     self.growths
   }
 
+  /// The stream bytes the application has consumed on this connection, every stream's in-order advance summed.
+  pub fn consumed(&self) -> u64 {
+    self.connection_consumed
+  }
+
   /// Forgets a completed stream's per-stream credit watermark, so a later stream that reuses the id
   /// starts its flow control fresh (its offsets begin at zero, below the finished stream's watermark).
   /// The connection-wide consumed total is a separate running sum and is **kept** — the forgotten

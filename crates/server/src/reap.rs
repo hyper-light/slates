@@ -160,6 +160,8 @@ fn finish(state: &mut ShardState, handle: Handle<ClientSlot>, client_id: u32) ->
     return false;
   };
   client.status_pages.clear(&mut state.store.metadata);
+  state.read_ahead.credit(client.read_ahead_pending);
+  crate::verbs::release_read_ahead(&mut state.read_ahead, &mut client);
   if let Some(control) = state.shards.first().copied() {
     crate::daemon::release_client_id(client_id, control);
   }

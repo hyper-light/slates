@@ -69,12 +69,16 @@ impl Deadlines {
 }
 
 /// Whether the daemon defers `body`'s reply until long work ends — a granted landing, which runs in slices for
-/// as long as its tree takes, and a FUSE mount, which waits on the OS's mount helper — so a caller waits for
-/// it while the daemon lives rather than for one reply deadline.
+/// as long as its tree takes; a FUSE mount, which waits on the OS's mount helper; and a page of a file, which may be
+/// forwarded to its owner across a WAN under a deadline the daemon derives from the measured path — so a caller
+/// waits for it while the daemon lives rather than for one reply deadline.
 pub fn defers_reply(body: &RequestBody) -> bool {
   matches!(
     body,
-    RequestBody::Land { grant: Some(_), .. }
+    // A page of a file may be forwarded to its owner on another node, across a WAN; the daemon bounds that forward
+    // by the measured path and always answers, so the client waits for it while its daemon lives.
+    RequestBody::ReadRange { .. }
+      | RequestBody::Land { grant: Some(_), .. }
       | RequestBody::Attach {
         form: AttachRequest::FuseMount { .. }
           | AttachRequest::ScopedFuseMount { .. }

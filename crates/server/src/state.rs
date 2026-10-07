@@ -48,6 +48,13 @@ pub struct ClientSlot {
   pub revoked: bool,
   /// The last successful remote route, released with this client. One slot, no global catalog.
   pub(crate) owner_route: Option<crate::owner_location::CachedRoute>,
+  /// The read-ahead window of this client's latest forwarded read (`crate::verbs::ReadAhead`): the pages after the
+  /// first, answered here without another round trip to the owner. One window, released with this client.
+  pub(crate) read_ahead: Option<crate::verbs::ReadAhead>,
+  /// The budget charge of this client's read-ahead batches still being fetched (`crate::verbs::ReadAhead`): moved
+  /// to its window when a batch is delivered, and credited with the client when it goes — so a batch whose reply
+  /// was never carried home (`crate::xshard::send_back`) holds its charge no longer than its client.
+  pub(crate) read_ahead_pending: u64,
 }
 
 impl std::fmt::Debug for ClientSlot {
@@ -411,6 +418,10 @@ pub struct ShardState {
   /// work retirement moves this to exactly what the engine holds. Balanced by construction; bounded
   /// by the greens.
   pub green_retention: BTreeMap<VolumeId, u64>,
+  /// The read-ahead windows this shard's clients hold or are fetching (`crate::verbs::ReadAhead`): the bytes charged,
+  /// never past `DaemonConfig::read_ahead_bytes`. Charged before a batch is fetched, credited as each window is
+  /// replaced, dropped or its client goes.
+  pub(crate) read_ahead: crate::verbs::ReadAheadLedger,
   /// The merge plane's service state (§4.16, `crate::merge_service`): version-pinned green
   /// attachments, and the fleet's pending merge records and holder replicas.
   pub merge: crate::merge_service::MergeShardState,

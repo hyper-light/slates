@@ -188,6 +188,11 @@ far member among near ones judged each crossing probe by a 2 ms deadline on a 20
 76 to 115 condemnations of live members per pair in 30 s. After it, none, and a killed far member is still condemned
 by every survivor within its stated bound.
 
+Follow-up the same day: the handshake was compared with the pool's verdict as it stood before `start` configured
+it, so the probe that first configured the pool read no verdict to compare with and was judged by the pool. Across
+seeds, a far member condemned a live near one once in 5 of 40 runs. `start` now configures the pool first and
+compares the handshake with that verdict: 100 of 100 runs condemn no live member, and the kill case passes 30 of 30.
+
 - Evidence: slates `crates/cluster/tests/member_plane.rs` (`no_live_member_is_condemned_across_a_lossless_far_link`,
   `a_far_member_that_dies_is_condemned_by_every_survivor_and_no_live_one_is`).
 - Write-up: `docs/bugs/2026-10-07-a-far-member-condemns-the-near-side-by-its-pooled-deadline.md`.

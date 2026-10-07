@@ -170,9 +170,14 @@ in the same commit as the work). Last reviewed 2026-10-07 at `89956659`.
     volume awaited in the mirror is read byte-identical in the mirror region after its home region is lost and
     promoted. Still owed: the loss-window report, `NotPlaced { mirror }` at a deadline, and the two-network run
     under a shaped router.
-  - Cross-region reads are refused `HomedElsewhere` on the two networks (location rounds `unavailable`).
-  - The detector's far-link false deaths are fixed in the vendored copy (2026-10-07); the upstream change is owed,
-    and the two-network run still has to show it on the real topology.
+  - Cross-region reads are correct on the two networks (2026-10-07: 9 of 9 byte-identical on each link). On 100 ms
+    with 3 % loss, batched read-ahead reads 8 MiB in 28.8–33.9 s (82.3–87.1 s one window per forward). With
+    ±40 ms jitter, reads take 125–145 s, bound by the session's congestion window (condition 7's jitter work).
+  - The detector's far-link false deaths are fixed in the vendored copy, including the stale-pool follow-up (0 of 100
+    seeds). Upstream is on hyper-raft `swim-pair-deadline` (`f129a55`), owed the owner's review: a misfit pair
+    must still condemn a dead member within a stated bound when every survivor is far.
+  - Open: cross-region membership did not form in 2 of 12 bring-ups, and one node's record session stayed borrowed
+    for good (`GAPS.md` 2026-10-07).
   - Condition 7's jitter design, which replication's content pulls share.
   - The copyset-successor fleet test fails intermittently under a loaded full suite (4 of 9 untraced runs, passing
     alone). It is instrumented (`fleet.owner_location.no_session`); the hypothesis is a location round that skipped

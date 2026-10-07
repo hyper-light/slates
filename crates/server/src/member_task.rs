@@ -423,6 +423,12 @@ fn fold_events(state: &mut ShardState, events: &[PlaneEvent]) {
       crate::fleet::sample_path(state, from, rtt_ns);
       state.probe_windows.acknowledged = state.probe_windows.acknowledged.saturating_add(1);
       state.formed_probe_peers.insert(from);
+      // Only an answer from this node's own region bears on its lease: its holders are all there, and another
+      // region's answer carries that region's council version and no standing for this node — another counter,
+      // which read as newer superseded the owner for good (found 2026-10-07: region 1 at version 5, region 0 at 4).
+      if !crate::fleet::same_region(state, from) {
+        continue;
+      }
       let installed = state.fleet.configuration();
       let (own, installed_version) = (installed.standing(), installed.version);
       state.lease.answered(
@@ -771,6 +777,53 @@ pub(crate) async fn run(
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  /// §4.8 "Leases and reads" across regions (found 2026-10-07 on two Docker networks: region 1's council at version 5,
+  /// region 0's at 4, and region 0's owner refused its own volume `LeaseUnconfirmed` for good, counting
+  /// `lease.refused.superseded`). Do: fold a probe acknowledgement from a member of another region announcing a newer
+  /// configuration version and no standing for this node, then the same from a member of this node's region. Expect:
+  /// the other region's answer leaves the lease alone — its council's versions are another counter — and only the
+  /// same-region answer supersedes it.
+  #[test]
+  fn another_regions_configuration_version_never_supersedes_the_owner_lease() {
+    let (foreign_superseded, own_superseded) = crate::daemon::audit_on_shard(|state| {
+      let local = state.fleet.host();
+      let foreign = HostId(local.0 ^ 0x11);
+      let neighbour = HostId(local.0 ^ 0x22);
+      state
+        .node_regions
+        .insert(local, slates_db::register::RegionId(0));
+      state
+        .node_regions
+        .insert(foreign, slates_db::register::RegionId(1));
+      state
+        .node_regions
+        .insert(neighbour, slates_db::register::RegionId(0));
+      let installed = state.fleet.configuration().version;
+      let newer = installed.saturating_add(1);
+      let answer = |from| PlaneEvent::Acked {
+        from,
+        boot_nonce: 0,
+        configuration_version: newer,
+        standing: None,
+        sent_ns: 0,
+        rtt_ns: 1,
+      };
+      fold_events(state, &[answer(foreign)]);
+      let foreign_superseded = state.lease.known_version(installed) != installed;
+      fold_events(state, &[answer(neighbour)]);
+      let own_superseded = state.lease.known_version(installed) != installed;
+      (foreign_superseded, own_superseded)
+    });
+    assert!(
+      !foreign_superseded,
+      "another region's version left the lease alone"
+    );
+    assert!(
+      own_superseded,
+      "a same-region holder's newer version supersedes, as before"
+    );
+  }
   use slates_cluster::membership::Liveness;
 
   fn state_of(liveness: Liveness, incarnation: u64) -> MemberState {

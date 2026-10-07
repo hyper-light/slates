@@ -353,6 +353,7 @@ fn volume_of(body: &RequestBody) -> Option<VolumeId> {
     | RequestBody::AwaitPlaced { volume, .. }
     | RequestBody::Read { volume, .. }
     | RequestBody::ReadRange { volume, .. }
+    | RequestBody::ReadWindow { volume, .. }
     | RequestBody::ReadDir { volume, .. }
     | RequestBody::StageBegin { work: volume, .. }
     | RequestBody::StagePut { work: volume, .. }
@@ -631,6 +632,11 @@ fn serves_latest_state(body: &RequestBody) -> Option<VolumeId> {
       at: ReadAt::Head,
       ..
     }
+    | RequestBody::ReadWindow {
+      volume,
+      at: ReadAt::Head,
+      ..
+    }
     | RequestBody::ReadDir {
       volume,
       at: ReadAt::Head,
@@ -792,6 +798,7 @@ fn is_forwardable_read(body: &RequestBody) -> bool {
       | RequestBody::ChangedSince { .. }
       | RequestBody::Read { .. }
       | RequestBody::ReadRange { .. }
+      | RequestBody::ReadWindow { .. }
       | RequestBody::ReadDir { .. }
       | RequestBody::StageBegin { .. }
       | RequestBody::StagePut { .. }
@@ -870,7 +877,7 @@ pub(crate) async fn serve_forward(control: u16, origin: HostId, bytes: &[u8]) ->
     crate::xshard::call_within(
       control,
       shard,
-      move |s| dispatch(s, 0, &principal, body),
+      move |s| dispatch(s, FORWARDED_CLIENT, &principal, body),
       crate::daemon::LIVENESS_BUDGET_NS,
     )
     .await
@@ -1020,24 +1027,395 @@ fn forward_to_owner(
   let Some(control) = state.shards.first().copied() else {
     return Served::Reply(refused(Refusal::NotFound));
   };
+  if let Some(page) = read_ahead_before_forward(state, client, volume, &body) {
+    return Served::Reply(page);
+  }
   let cached = state
     .clients
     .get(client)
     .ok()
     .and_then(|slot| slot.owner_route);
   let origin = state.shard;
-  let request_bytes = forwarded_request(state, request, principal, body);
+  let (bodies, plan) = window_for(state, client, body);
+  let charged = plan.as_ref().map_or(0, |plan| plan.charged);
+  let requests: Vec<Vec<u8>> = bodies
+    .into_iter()
+    .map(|body| forwarded_request(state, request, principal.clone(), body))
+    .collect();
   let task = SpawnRequest::new(
     Box::pin(async move {
-      let (reply, route) = resolve_and_forward(volume, region, cached, request_bytes).await;
-      deliver_owner_forward(origin, control, (client, request), reply, route).await;
+      let (replies, route) = resolve_and_forward(volume, region, cached, requests).await;
+      deliver_owner_forward(origin, control, (client, request), replies, (route, plan)).await;
     }),
     None,
   );
   if slates_rt::registry::send_control(control, Control::Spawn(Box::new(task))).is_err() {
+    if let Ok(slot) = state.clients.get_mut(client) {
+      slot.read_ahead_pending = slot.read_ahead_pending.saturating_sub(charged);
+      state.read_ahead.credit(charged);
+    }
     return Served::Reply(refused(Refusal::HomedElsewhere { region }));
   }
   Served::Forwarded
+}
+
+/// The read-ahead window of one client's forwarded read (`ClientSlot::read_ahead`): the file and view it reads, where
+/// the window starts, and the owner's window with its stamp and the file's length. Read whole by the window's first
+/// page and answered page by page from here, so a multi-page read takes one round trip to the owner per window, not
+/// per page, and every page carries the stamp of one state of the file — the consistency `slates_client` already
+/// checks across pages, the read linearizing at its window's fetch (read-ahead as Linux and NFS clients do it, with
+/// a large `rsize`). A forwarded write by the same client to the volume, or a new read from its start, replaces it.
+///
+/// A read that keeps going where its window ends fetches the next as a **batch** of windows sent at once on the
+/// owner's session ([`crate::fleet::forward_batch_over_leader_session`]), twice as many as the batch before — the
+/// growth Linux's read-ahead gives a sequential reader (`get_next_ra_size`) — so a file of `n` windows costs about
+/// `log2(n)` request round trips, not `n`, and a loss inside a batch is recovered by the acknowledgements of the
+/// windows behind it rather than by a probe timeout per window. A batch is charged to the shard's read-ahead ledger
+/// before it is fetched ([`ReadAheadLedger`], within `DaemonConfig::read_ahead_bytes`, the allowance the fleet's
+/// receive share of the reserve holds for it), so the windows every client holds never exceed it; a batch is also
+/// capped by what is left of the file and, at send, by what the path moves in one liveness budget.
+#[derive(Clone, Debug)]
+pub(crate) struct ReadAhead {
+  volume: VolumeId,
+  path: String,
+  at: ReadAt,
+  start: u64,
+  max: u64,
+  stamp: u64,
+  total: u64,
+  bytes: Vec<u8>,
+  /// The bytes one window of this read carries: the read-ahead size this node asks for, until an owner's full
+  /// window has answered shorter (its own bound), then that — so the next batch's windows abut.
+  window: u64,
+  /// The windows the fetch that filled this asked for (the next batch asks twice as many).
+  batch: u64,
+  /// The delivery rate, bytes per second, the fetch that filled this was received at ([`delivery_rate`]); zero
+  /// before one is measured. The next batch carries no more than this rate moves in one liveness budget.
+  rate: u64,
+  /// The bytes charged to the shard's read-ahead ledger for this window ([`ReadAheadLedger`]); credited when it is
+  /// replaced, dropped or its client goes ([`release_read_ahead`]).
+  charged: u64,
+}
+
+/// The bytes a shard's clients hold or are fetching as read-ahead windows ([`ReadAhead`]), charged against
+/// `DaemonConfig::read_ahead_bytes`: whole or refused with nothing changed, and never credited past what is held.
+#[derive(Debug, Default)]
+pub(crate) struct ReadAheadLedger {
+  held: u64,
+}
+
+impl ReadAheadLedger {
+  /// Charges `bytes` if the held windows stay within `bound`.
+  fn charge(&mut self, bytes: u64, bound: u64) -> bool {
+    let held = self.held.saturating_add(bytes);
+    if held > bound {
+      return false;
+    }
+    self.held = held;
+    true
+  }
+
+  /// The bytes still free under `bound`.
+  fn room(&self, bound: u64) -> u64 {
+    bound.saturating_sub(self.held)
+  }
+
+  /// Returns `bytes` of charge, never more than is held.
+  pub(crate) fn credit(&mut self, bytes: u64) {
+    self.held = self.held.saturating_sub(bytes);
+  }
+}
+
+/// Drops `slot`'s read-ahead window, crediting its charge to the shard's ledger.
+pub(crate) fn release_read_ahead(ledger: &mut ReadAheadLedger, slot: &mut ClientSlot) {
+  if let Some(ahead) = slot.read_ahead.take() {
+    ledger.credit(ahead.charged);
+  }
+}
+
+/// The status count of client pages answered from a read-ahead window. Format: a counter name in the status report.
+const READ_AHEAD_HIT: &str = "fleet.read_ahead.hit";
+
+/// The status count of windows joined to a read-ahead window from the rest of its batch (the batch path's
+/// non-vacuity counter: zero means every fetch carried one window). Format: a counter name in the status report.
+const READ_AHEAD_JOINED: &str = "fleet.read_ahead.joined";
+
+/// A page answered from the client's read-ahead window, if the request is a later page of its read; otherwise
+/// `None`, after dropping a window a write by this client to the volume makes stale.
+fn read_ahead_before_forward(
+  state: &mut ShardState,
+  client: Handle<ClientSlot>,
+  volume: VolumeId,
+  body: &RequestBody,
+) -> Option<ReplyBody> {
+  let Ok(slot) = state.clients.get_mut(client) else {
+    return None;
+  };
+  if is_forwardable_write(body) {
+    if slot
+      .read_ahead
+      .as_ref()
+      .is_some_and(|ahead| ahead.volume == volume)
+    {
+      release_read_ahead(&mut state.read_ahead, slot);
+    }
+    return None;
+  }
+  let RequestBody::ReadRange {
+    path,
+    at,
+    offset,
+    max,
+    ..
+  } = body
+  else {
+    return None;
+  };
+  let ahead = slot.read_ahead.as_ref()?;
+  if *offset == 0 || ahead.volume != volume || ahead.path != *path || ahead.at != *at {
+    return None;
+  }
+  let skip = usize::try_from(offset.checked_sub(ahead.start)?).ok()?;
+  let rest = ahead.bytes.get(skip..)?;
+  let end_of_file =
+    offset.saturating_add(u64::try_from(rest.len()).unwrap_or(u64::MAX)) >= ahead.total;
+  if rest.is_empty() && !end_of_file {
+    return None;
+  }
+  let take = usize::try_from((*max).min(crate::merge_service::page_room())).unwrap_or(usize::MAX);
+  let page = rest.get(..take.min(rest.len())).unwrap_or(rest).to_vec();
+  let reply = ReplyBody::ReadPage {
+    bytes: page,
+    total: ahead.total,
+    stamp: ahead.stamp,
+  };
+  state.count(READ_AHEAD_HIT, 1);
+  Some(reply)
+}
+
+/// A forwarded `ReadRange` asked as a batch of windows of the owner (`RequestBody::ReadWindow`, consecutive from
+/// its offset), with the plan to keep them; any other verb unchanged, alone. The client's previous window is
+/// released first: this read missed it. A read continuing where that window ended asks twice the previous batch,
+/// capped by the windows left in the file and by the room left in the shard's read-ahead ledger, which the batch is charged against; with no room a single window is fetched
+/// uncharged — what one client could already make the shard hold (half its ring of pages, [`read_window_bytes`]).
+fn window_for(
+  state: &mut ShardState,
+  client: Handle<ClientSlot>,
+  body: RequestBody,
+) -> (Vec<RequestBody>, Option<ReadAhead>) {
+  let RequestBody::ReadRange {
+    volume,
+    path,
+    at,
+    offset,
+    max,
+  } = body
+  else {
+    return (vec![body], None);
+  };
+  let ShardState {
+    clients,
+    read_ahead,
+    ..
+  } = state;
+  let previous = clients.get_mut(client).ok().and_then(|slot| {
+    let continued = slot.read_ahead.as_ref().and_then(|ahead| {
+      let end = ahead
+        .start
+        .saturating_add(u64::try_from(ahead.bytes.len()).unwrap_or(u64::MAX));
+      (ahead.volume == volume && ahead.path == path && ahead.at == at && end == offset).then_some(
+        Continued {
+          window: ahead.window,
+          batch: ahead.batch,
+          total: ahead.total,
+          rate: ahead.rate,
+        },
+      )
+    });
+    release_read_ahead(read_ahead, slot);
+    continued
+  });
+  let rate = previous.as_ref().map_or(0, |continued| continued.rate);
+  let (window, wanted) = next_batch(previous, offset, read_window_bytes(state));
+  // A batch takes what is left of the shard's read-ahead allowance; the session's flow control paces it through
+  // the receive window.
+  let bound = state.config.read_ahead_bytes;
+  let admitted = state
+    .read_ahead
+    .room(bound)
+    .checked_div(window)
+    .unwrap_or(0);
+  let batch = wanted.min(admitted);
+  let charged = window.saturating_mul(batch);
+  let (batch, charged) = if batch > 0 && state.read_ahead.charge(charged, bound) {
+    (batch, charged)
+  } else {
+    (1, 0)
+  };
+  if let Ok(slot) = state.clients.get_mut(client) {
+    slot.read_ahead_pending = slot.read_ahead_pending.saturating_add(charged);
+  }
+  let bodies = (0..batch)
+    .map(|index| RequestBody::ReadWindow {
+      volume,
+      path: path.clone(),
+      at,
+      offset: offset.saturating_add(window.saturating_mul(index)),
+      max: window,
+    })
+    .collect();
+  let plan = ReadAhead {
+    volume,
+    path,
+    at,
+    start: offset,
+    max,
+    stamp: 0,
+    total: 0,
+    bytes: Vec::new(),
+    window,
+    batch,
+    rate,
+    charged,
+  };
+  (bodies, Some(plan))
+}
+
+/// Format: nanoseconds per second, for rates in bytes per second.
+const NANOS_PER_SECOND: u64 = 1_000_000_000;
+
+/// The window a read ended its last fetch with, when its next request continues where that window ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Continued {
+  window: u64,
+  batch: u64,
+  total: u64,
+  rate: u64,
+}
+
+/// The window size and the windows a read's next fetch at `offset` asks for: one window of `own_window` bytes for a
+/// read that does not continue a window; for one that does, twice its last batch of that window's size, but no more
+/// windows than are left in the file, and — once a delivery rate is measured — no more than that rate moves in one
+/// liveness budget, so a batch holds the owner's session no longer than one forward is already allowed to; at least
+/// one window.
+fn next_batch(previous: Option<Continued>, offset: u64, own_window: u64) -> (u64, u64) {
+  let Some(continued) = previous else {
+    return (own_window.max(1), 1);
+  };
+  let window = continued.window.max(1);
+  let left = continued
+    .total
+    .saturating_sub(offset)
+    .div_ceil(window)
+    .max(1);
+  let in_budget = if continued.rate > 0 {
+    u128::from(continued.rate)
+      .saturating_mul(u128::from(crate::daemon::LIVENESS_BUDGET_NS))
+      .checked_div(u128::from(NANOS_PER_SECOND).saturating_mul(u128::from(window)))
+      .and_then(|windows| u64::try_from(windows).ok())
+      .unwrap_or(u64::MAX)
+      .max(1)
+  } else {
+    u64::MAX
+  };
+  (
+    window,
+    continued.batch.saturating_mul(2).min(left).min(in_budget),
+  )
+}
+
+/// Keeps the owner's windows answered for `plan` in the client's slot as one window and returns its first page as
+/// the client's reply. The batch's replies are joined in order while each abuts the last and reads the same state
+/// of the file (its stamp and length); the rest — a window past a write, unanswered or refused — is dropped, and the
+/// read fetches from there when it gets there. A first reply that is not a page (a refusal) passes through, and the
+/// slot keeps no window. Whatever of the charge the kept bytes do not use is credited back. Returns the reply and
+/// the windows joined after the first.
+fn keep_window(
+  ledger: &mut ReadAheadLedger,
+  slot: &mut ClientSlot,
+  plan: ReadAhead,
+  OwnerReplies {
+    first,
+    later: replies,
+    rate,
+  }: OwnerReplies,
+) -> (ReplyBody, u64) {
+  slot.read_ahead_pending = slot.read_ahead_pending.saturating_sub(plan.charged);
+  let ReplyBody::ReadPage {
+    mut bytes,
+    total,
+    stamp,
+  } = first
+  else {
+    ledger.credit(plan.charged);
+    release_read_ahead(ledger, slot);
+    return (first, 0);
+  };
+  let first_len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+  // A first window shorter than asked that does not end the file is the owner's own bound: the next batch's
+  // windows are that long, so they abut.
+  let window = if plan.start.saturating_add(first_len) < total {
+    first_len.min(plan.window).max(1)
+  } else {
+    plan.window
+  };
+  let joined = join_batch(&mut bytes, plan.window, (stamp, total), replies);
+  let kept = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+  ledger.credit(plan.charged.saturating_sub(kept));
+  let take = usize::try_from(plan.max.min(crate::merge_service::page_room())).unwrap_or(usize::MAX);
+  let page = bytes
+    .get(..take.min(bytes.len()))
+    .unwrap_or(&bytes)
+    .to_vec();
+  release_read_ahead(ledger, slot);
+  slot.read_ahead = Some(ReadAhead {
+    stamp,
+    total,
+    bytes,
+    window,
+    charged: plan.charged.min(kept),
+    rate,
+    ..plan
+  });
+  (
+    ReplyBody::ReadPage {
+      bytes: page,
+      total,
+      stamp,
+    },
+    joined,
+  )
+}
+
+/// Joins to `bytes` — a batch's first window, asked as `window` bytes — the batch's later windows in order, while
+/// each abuts the last (every window before it came back whole, `window` bytes) and reads the same state of the file
+/// (`stamp`, `total`); stops at the first that does not, or that is not a page. Returns the windows joined.
+fn join_batch(
+  bytes: &mut Vec<u8>,
+  window: u64,
+  (stamp, total): (u64, u64),
+  replies: Vec<ReplyBody>,
+) -> u64 {
+  let whole = |bytes: &[u8]| u64::try_from(bytes.len()).ok() == Some(window);
+  let mut abuts = whole(bytes);
+  let mut joined: u64 = 0;
+  for reply in replies {
+    let ReplyBody::ReadPage {
+      bytes: more,
+      total: more_total,
+      stamp: more_stamp,
+    } = reply
+    else {
+      break;
+    };
+    if !abuts || more_stamp != stamp || more_total != total {
+      break;
+    }
+    abuts = whole(&more);
+    bytes.extend_from_slice(&more);
+    joined = joined.saturating_add(1);
+  }
+  joined
 }
 
 /// The bytes of `body` forwarded over the fleet under this client's request id, with the completion watermark
@@ -1061,15 +1439,16 @@ fn forwarded_request(
 }
 
 /// On the control shard, where the fleet's sessions live: finds `volume`'s owner in `region` (the cached route,
-/// the live creator, else the read-only location round) and forwards `request_bytes` to it once. Returns the
-/// owner's reply, or `HomedElsewhere` when no owner was found or none answered, with the route to cache when the
-/// owner served.
+/// the live creator, else the read-only location round) and forwards `requests` to it once — one verb, or a
+/// read-ahead batch of windows, sent together. Returns the owner's reply to the first, or
+/// `HomedElsewhere` when no owner was found or none answered, with the decoded replies to the rest that came back
+/// (in order, up to the first that did not), and the route to cache when the owner served.
 async fn resolve_and_forward(
   volume: VolumeId,
   region: u64,
   cached: Option<crate::owner_location::CachedRoute>,
-  request_bytes: Vec<u8>,
-) -> (ReplyBody, Option<crate::owner_location::CachedRoute>) {
+  requests: Vec<Vec<u8>>,
+) -> (OwnerReplies, Option<crate::owner_location::CachedRoute>) {
   let resolved = crate::state::with_state_counted(|state| {
     let query = crate::owner_location::Query::new(state, ObjectId(volume.bytes), region);
     (query, query.known_owner(state, cached))
@@ -1078,7 +1457,14 @@ async fn resolve_and_forward(
     // The control shard's state was out of reach (a nested borrow is counted): the client is answered as for an
     // owner not found, never left waiting for a reply no task would send (before 2026-10-07 the task returned
     // and the client waited out its reply deadline).
-    return (refused(Refusal::HomedElsewhere { region }), None);
+    return (
+      OwnerReplies {
+        first: refused(Refusal::HomedElsewhere { region }),
+        later: Vec::new(),
+        rate: 0,
+      },
+      None,
+    );
   };
   let owner = match known {
     Some(owner) => {
@@ -1091,10 +1477,20 @@ async fn resolve_and_forward(
   };
   let bytes = match owner {
     Some(owner) => {
-      let forwarded = crate::fleet::forward_over_leader_session(
+      // One liveness budget, plus the measured round-trip tail of the path to the owner: a WAN forward's reply is
+      // never refused for crossing a path the local budget did not allow for.
+      let tail_ns = crate::state::with_state(|state| {
+        state
+          .peer_paths
+          .get(&owner)
+          .and_then(slates_cluster::timing::PathRtt::tail_ns)
+      })
+      .flatten()
+      .unwrap_or(0);
+      let forwarded = crate::fleet::forward_batch_over_leader_session(
         owner,
-        request_bytes,
-        crate::daemon::LIVENESS_BUDGET_NS,
+        requests,
+        crate::daemon::LIVENESS_BUDGET_NS.saturating_add(tail_ns),
       )
       .await;
       if forwarded.is_none() {
@@ -1108,7 +1504,15 @@ async fn resolve_and_forward(
   };
   // A forward sent but unanswered within its budget comes back empty, and it is counted apart from one never
   // sent: an owner that was reached but did not answer in time is not one that could not be reached.
-  let decoded = bytes.map(|bytes| decode_body::<ReplyBody>(&bytes).ok());
+  let batch = bytes.unwrap_or_default();
+  let rate = delivery_rate(batch.streamed_bytes, batch.streamed_ns);
+  let mut replies = batch.replies.into_iter();
+  let decoded = replies
+    .next()
+    .map(|bytes| bytes.and_then(|bytes| decode_body::<ReplyBody>(&bytes).ok()));
+  let later: Vec<ReplyBody> = replies
+    .map_while(|bytes| bytes.and_then(|bytes| decode_body::<ReplyBody>(&bytes).ok()))
+    .collect();
   if matches!(decoded, Some(None)) {
     crate::state::with_state_counted(|state| {
       state.count("fleet.owner_location.forward_unanswered", 1);
@@ -1122,7 +1526,37 @@ async fn resolve_and_forward(
   } else {
     owner.map(|owner| query.route(owner))
   };
-  (reply, route)
+  (
+    OwnerReplies {
+      first: reply,
+      later,
+      rate,
+    },
+    route,
+  )
+}
+
+/// What an owner answered a forward: the reply to its first request, the decoded replies to the rest of a batch
+/// (in order, up to the first that did not come back), and the delivery rate the batch was received at
+/// ([`delivery_rate`]).
+pub(crate) struct OwnerReplies {
+  first: ReplyBody,
+  later: Vec<ReplyBody>,
+  rate: u64,
+}
+
+/// The rate, bytes per second, a batch streamed at: the bytes the session consumed over the interval they were
+/// arriving in ([`slates_cluster::BatchReplies`]) — delivery timed between deliveries, as BBR times it between
+/// acknowledgements (Cardwell et al., ACM Queue 2016), so neither the request's round trip nor the wait for the
+/// first byte, the fixed cost a batch exists to amortize, reads as a slow path, however the owner interleaves the
+/// windows' streams. Zero — no rate measured — when nothing streamed over a measurable interval: the next batch is
+/// then capped by nothing but the file and the ledger, and measures.
+fn delivery_rate(streamed_bytes: u64, streamed_ns: u64) -> u64 {
+  u128::from(streamed_bytes)
+    .saturating_mul(u128::from(NANOS_PER_SECOND))
+    .checked_div(u128::from(streamed_ns))
+    .and_then(|rate| u64::try_from(rate).ok())
+    .unwrap_or(0)
 }
 
 /// The region and volume of a verb this node must send to another host of its own region (§4.8 "Lookup": a lookup
@@ -1157,16 +1591,19 @@ async fn deliver_owner_forward(
   origin: u16,
   control: u16,
   (client, request): (Handle<ClientSlot>, u64),
-  reply: ReplyBody,
-  route: Option<crate::owner_location::CachedRoute>,
+  reply: OwnerReplies,
+  after: (
+    Option<crate::owner_location::CachedRoute>,
+    Option<ReadAhead>,
+  ),
 ) {
   if origin == control {
-    finish_owner_forward(client, request, reply, route);
+    finish_owner_forward(client, request, reply, after);
     return;
   }
   let back = SpawnRequest::new(
     Box::pin(async move {
-      finish_owner_forward(client, request, reply, route);
+      finish_owner_forward(client, request, reply, after);
     }),
     None,
   );
@@ -1176,20 +1613,37 @@ async fn deliver_owner_forward(
 fn finish_owner_forward(
   client: Handle<ClientSlot>,
   request: u64,
-  reply: ReplyBody,
-  route: Option<crate::owner_location::CachedRoute>,
+  reply: OwnerReplies,
+  (route, plan): (
+    Option<crate::owner_location::CachedRoute>,
+    Option<ReadAhead>,
+  ),
 ) {
-  let present = crate::state::with_state(|state| {
-    let Ok(slot) = state.clients.get_mut(client) else {
+  let delivered = crate::state::with_state(move |state| {
+    let ShardState {
+      clients,
+      read_ahead,
+      ..
+    } = &mut *state;
+    let Ok(slot) = clients.get_mut(client) else {
+      // The client went: its reap credited the batch's charge with it.
       state.forwarded_rings.remove(&request);
       state.count("fleet.owner_location.client_gone", 1);
-      return false;
+      return None;
     };
     slot.owner_route = route;
-    true
+    // A window answered for a read: kept for the client's next pages, and its first page is the reply.
+    Some(match plan {
+      Some(plan) => {
+        let (reply, joined) = keep_window(read_ahead, slot, plan, reply);
+        state.count(READ_AHEAD_JOINED, joined);
+        reply
+      }
+      None => reply.first,
+    })
   })
-  .unwrap_or(false);
-  if present {
+  .flatten();
+  if let Some(reply) = delivered {
     // The executing owner owns the completion. In particular, a transient routing refusal
     // must not become a permanent completion at the origin and prevent this id's retry.
     crate::state::deliver(client.index(), request, reply, true);
@@ -1440,6 +1894,19 @@ pub fn serve(state: &mut ShardState, client: Handle<ClientSlot>, request: &Reque
     principal,
     body,
   )
+}
+
+/// Format: the client id a verb forwarded from another node is dispatched under (`serve_forward`): no client of this
+/// node.
+const FORWARDED_CLIENT: u32 = 0;
+
+/// The most bytes one read-ahead window carries (`RequestBody::ReadWindow`): as many pages as a client may hold in
+/// flight on its ring, half its slots (the half `slates_client` acknowledges at), so a window replaces the round
+/// trips the client's own requests would have taken, and the origin's cache of it stays within what one client could
+/// already make it hold.
+fn read_window_bytes(state: &ShardState) -> u64 {
+  crate::merge_service::page_room()
+    .saturating_mul((u64::from(state.config.region.slots) / 2).max(1))
 }
 
 /// The completion records one client may hold unacknowledged on a shard (§4.9 "Exactly-once"; banned item 8). A
@@ -1850,7 +2317,8 @@ async fn forward_for_local_client(
   let sent = control.is_some_and(|control| {
     let task = SpawnRequest::new(
       Box::pin(async move {
-        let (reply, _) = resolve_and_forward(volume, region, None, request_bytes).await;
+        let (replies, _) = resolve_and_forward(volume, region, None, vec![request_bytes]).await;
+        let reply = replies.first;
         crate::xshard::send_back(origin, deliver_home(reply)).await;
       }),
       None,
@@ -2780,6 +3248,24 @@ fn dispatch_inner(
       offset,
       max,
     } => crate::merge_service::read_range(state, principal, (volume, &path, at), offset, max),
+    // A window for another node's read-ahead; from a client of this node, an ordinary page.
+    RequestBody::ReadWindow {
+      volume,
+      path,
+      at,
+      offset,
+      max,
+    } => {
+      // A verb forwarded from another node is dispatched with no local client (client id 0, `serve_forward`); a
+      // client of this node gets an ordinary page, which its reply chunk holds.
+      let from_another_node = client_id == FORWARDED_CLIENT;
+      let cap = if from_another_node {
+        read_window_bytes(state)
+      } else {
+        0
+      };
+      crate::merge_service::read_window(state, principal, (volume, &path, at), offset, max, cap)
+    }
     RequestBody::ReadDir {
       volume,
       path,
@@ -8998,10 +9484,113 @@ fn creator_gid() -> u32 {
 
 #[cfg(test)]
 mod tests {
+  use super::{Continued, delivery_rate, next_batch};
   use super::{
-    HostId, ObjectId, Principal, Refusal, RegionId, VolumeId, home_redirect, verify_attestation,
+    HostId, ObjectId, Principal, ReadAheadLedger, Refusal, RegionId, ReplyBody, VolumeId,
+    home_redirect, join_batch, verify_attestation,
   };
   use slates_db::register::RootConfiguration;
+
+  /// A page reply of `len` bytes of `fill`, at `stamp`, of a file `total` long.
+  fn page(fill: u8, len: usize, (stamp, total): (u64, u64)) -> ReplyBody {
+    ReplyBody::ReadPage {
+      bytes: vec![fill; len],
+      total,
+      stamp,
+    }
+  }
+
+  /// §4.8 Lookup read-ahead (`join_batch`). Do: join batches of four-byte windows: all whole and at one stamp; one
+  /// whose third window was read after a write (another stamp); one whose second window is short (the end of the
+  /// file) with a third behind it; one whose second reply is a refusal; one whose first window is short. Expect: the
+  /// whole batch joined in order; the windows before the changed stamp only; the short window joined and nothing
+  /// past it; nothing past the refusal; nothing past a short first window.
+  #[test]
+  fn a_batch_joins_in_order_only_while_each_window_abuts_and_reads_one_state() {
+    let at = (7, 100);
+    let mut bytes = vec![0; 4];
+    let joined = join_batch(&mut bytes, 4, at, vec![page(1, 4, at), page(2, 4, at)]);
+    assert_eq!((joined, bytes), (2, [[0; 4], [1; 4], [2; 4]].concat()));
+
+    let mut bytes = vec![0; 4];
+    let joined = join_batch(
+      &mut bytes,
+      4,
+      at,
+      vec![page(1, 4, at), page(2, 4, (8, 100))],
+    );
+    assert_eq!((joined, bytes), (1, [[0; 4], [1; 4]].concat()));
+
+    let mut bytes = vec![0; 4];
+    let joined = join_batch(&mut bytes, 4, at, vec![page(1, 2, at), page(2, 4, at)]);
+    assert_eq!((joined, bytes), (1, [vec![0; 4], vec![1; 2]].concat()));
+
+    let refusal = ReplyBody::Refused {
+      refusal: Refusal::NotFound,
+    };
+    let mut bytes = vec![0; 4];
+    let joined = join_batch(&mut bytes, 4, at, vec![refusal, page(2, 4, at)]);
+    assert_eq!((joined, bytes), (0, vec![0; 4]));
+
+    let mut bytes = vec![0; 3];
+    let joined = join_batch(&mut bytes, 4, at, vec![page(1, 4, at)]);
+    assert_eq!((joined, bytes), (0, vec![0; 3]));
+  }
+
+  /// §4.8 Lookup read-ahead (`next_batch`). Do: plan the fetch of a read that does not continue a window; of one
+  /// that continues a batch of 4 with 100 windows left and no rate measured; with 3 windows left; at 640 KiB/s
+  /// delivered (10 windows of 64 KiB in the 1 s liveness budget) after a batch of 8; and at a rate too slow for one
+  /// window in the budget. Expect: one window of the node's own size; 8; 3; 10; and 1 — never zero.
+  #[test]
+  fn a_continuing_read_doubles_its_batch_within_the_file_and_the_measured_rate() {
+    let window = 64 << 10;
+    let continued = |batch, total, rate| {
+      Some(Continued {
+        window,
+        batch,
+        total,
+        rate,
+      })
+    };
+    assert_eq!(next_batch(None, 0, 5_000), (5_000, 1));
+    assert_eq!(
+      next_batch(continued(4, 200 * window, 0), 100 * window, 1),
+      (window, 8)
+    );
+    assert_eq!(
+      next_batch(continued(4, 103 * window, 0), 100 * window, 1),
+      (window, 3)
+    );
+    assert_eq!(
+      next_batch(continued(8, 1 << 30, 640 << 10), 0, 1),
+      (window, 10)
+    );
+    assert_eq!(next_batch(continued(8, 1 << 30, 1_000), 0, 1), (window, 1));
+  }
+
+  /// §4.8 Lookup read-ahead (`delivery_rate`). Do: rate 1 MiB streamed over half a second, nothing over a second,
+  /// and bytes over no measurable interval. Expect: 2 MiB/s, and zero — no rate measured — for both degenerate
+  /// cases, never a division fault.
+  #[test]
+  fn a_batch_delivery_rate_is_its_streamed_bytes_over_their_interval() {
+    assert_eq!(delivery_rate(1 << 20, 500_000_000), 2 << 20);
+    assert_eq!(delivery_rate(0, 1_000_000_000), 0);
+    assert_eq!(delivery_rate(1 << 20, 0), 0);
+  }
+
+  /// §4.8 Lookup read-ahead (`ReadAheadLedger`). Do: charge windows up to the bound, one byte past it, then credit
+  /// more than is held. Expect: the charges within the bound are taken, the one past it refused with nothing
+  /// changed, and the over-credit leaves nothing held (never a negative or wrapped charge).
+  #[test]
+  fn the_read_ahead_ledger_refuses_past_its_bound_and_never_credits_below_zero() {
+    let mut ledger = ReadAheadLedger::default();
+    assert!(ledger.charge(60, 100));
+    assert!(ledger.charge(40, 100));
+    assert!(!ledger.charge(1, 100));
+    assert_eq!(ledger.room(100), 0);
+    ledger.credit(1_000);
+    assert_eq!(ledger.room(100), 100);
+  }
 
   /// Shape: the reduced reserve the relief test's shard runs with, so filling its arena takes a few chunks, not the
   /// machine's measured production reserve.

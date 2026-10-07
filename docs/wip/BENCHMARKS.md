@@ -3248,6 +3248,21 @@ The cause is delay jitter, not loss and not mainly reordering:
 Owed: a jitter-robust delay signal, chosen from the literature and A/B'd on these rows plus the 57-scenario
 bake-off (which had no heavy jitter). Until then the two reordering rows fail at 64 MiB.
 
+#### The two-network topology's crossing on `congestion_bench` (2026-10-07)
+
+`cargo run --release -p slates-transport --example congestion_bench "wan jitter"` runs two rows added for the Docker
+topology's link (`docs/wip/bench/multiregion/run.sh`): 200 ms, ±40 ms reordering jitter, 3 % loss. Simulated
+network, virtual clock, seeds 1–3.
+
+| Row | Goodput (Mbit/s) | Capacity share (mean) | Steady ping p99 (mean) |
+|---|---|---|---|
+| 10 Mbit/s | 4.24, 3.57, 2.58 | 0.346 | 522 ms |
+| 100 Mbit/s | 5.21, 4.20, 4.08 | 0.045 | 513 ms |
+
+These are long-lived flows, after a 20-round-trip warm-up. A cross-region read on the real topology is short
+request/response exchanges, and there the session delivered 65–100 KB/s (`docs/bugs/2026-10-07-a-cross-region-read-took-one-wan-round-trip-per-window.md`).
+That matches `fetch_bench`'s short transfers above, not this steady state.
+
 #### Measured and rejected: a sample-count floor on Copa's standing RTT (2026-10-07)
 
 The idea: Copa's standing RTT spans `srtt/2`; let it span the last N samples when that is longer (N = RFC 9002's

@@ -588,6 +588,19 @@ fn scenarios() -> Vec<Scenario> {
   reorder.jitter_ns = 8 * MS;
   reorder.reorders = true;
   all.push(reorder);
+  // The two-network Docker topology's crossing (`docs/wip/bench/multiregion/run.sh`: netem 100 ms ± 40 ms one
+  // way, 3 % loss each way, reordering): the WAN a cross-region read takes.
+  for rate in [10_000_000, 100_000_000] {
+    let mut wan = base(
+      format!("wan jitter=40ms rate={rate} rtt=200ms loss=3%"),
+      rate,
+      200,
+      SimLoss::random(PPM * 3 / 100),
+    );
+    wan.jitter_ns = 40 * MS;
+    wan.reorders = true;
+    all.push(wan);
+  }
   // Burst loss: bursts averaging four datagrams, about 1% overall.
   all.push(base(
     "burst loss rate=10M rtt=100ms".to_owned(),
