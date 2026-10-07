@@ -140,6 +140,8 @@ struct Outcome {
   spurious_losses: u64,
   /// The smallest holder congestion window at the end, bytes.
   min_congestion_window: u64,
+  /// The holders' loss events judged persistent congestion, summed.
+  persistent_collapses: u64,
 }
 
 fn config() -> RuntimeConfig {
@@ -291,6 +293,7 @@ async fn serve(
     let _ = stats.send(SenderStats {
       spurious_losses: endpoint.spurious_losses(),
       congestion_window: endpoint.congestion_window(),
+      persistent_collapses: endpoint.persistent_collapses(),
     });
   };
   loop {
@@ -331,6 +334,7 @@ async fn serve(
 struct SenderStats {
   spurious_losses: u64,
   congestion_window: u64,
+  persistent_collapses: u64,
 }
 
 /// What one reader's timed fetch measured.
@@ -614,6 +618,7 @@ async fn run_readers(reader_sessions: Vec<Vec<(HostId, Endpoint)>>) -> Outcome {
     all_rebuilt: true,
     spurious_losses: 0,
     min_congestion_window: u64::MAX,
+    persistent_collapses: 0,
   };
   let mut done_rx = done_rx;
   for _ in 0..readers {
@@ -650,6 +655,7 @@ async fn coordinate(scenario: Scenario) -> Outcome {
   for receiver in stats {
     let (sender, _) = receive(receiver).await;
     outcome.spurious_losses += sender.spurious_losses;
+    outcome.persistent_collapses += sender.persistent_collapses;
     outcome.min_congestion_window = outcome.min_congestion_window.min(sender.congestion_window);
   }
   outcome
@@ -809,7 +815,7 @@ fn main() {
   let filter = std::env::args().nth(1).unwrap_or_default();
   let archive_bytes = (chunks() * CHUNK_BYTES) as u64;
   println!(
-    "scenario,holders,readers,rtt_ms,uplink_mbps,completion_min_ms,completion_median_ms,completion_max_ms,goodput_mbps,capacity_mbps,hedges,steals,holders_dropped,rebuilt,spurious_losses,min_end_cwnd_bytes"
+    "scenario,holders,readers,rtt_ms,uplink_mbps,completion_min_ms,completion_median_ms,completion_max_ms,goodput_mbps,capacity_mbps,hedges,steals,holders_dropped,rebuilt,spurious_losses,min_end_cwnd_bytes,persistent_collapses"
   );
   let mut failed = false;
   for scenario in grid()
@@ -837,7 +843,7 @@ fn main() {
       .sum::<u64>()
       / 1_000_000;
     println!(
-      "{},{},{},{},{},{:.1},{:.1},{:.1},{:.1},{},{},{},{},{},{},{}",
+      "{},{},{},{},{},{:.1},{:.1},{:.1},{:.1},{},{},{},{},{},{},{},{}",
       scenario.name,
       scenario.holders,
       scenario.readers,
@@ -853,7 +859,8 @@ fn main() {
       outcome.failed_holders,
       outcome.all_rebuilt,
       outcome.spurious_losses,
-      outcome.min_congestion_window
+      outcome.min_congestion_window,
+      outcome.persistent_collapses
     );
     failed |= !outcome.all_rebuilt;
   }

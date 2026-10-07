@@ -1771,6 +1771,11 @@ impl Endpoint {
     self.conn.spurious_losses()
   }
 
+  /// Loss events judged persistent congestion, each collapsing the window (`Connection::persistent_collapses`).
+  pub fn persistent_collapses(&self) -> u64 {
+    self.conn.persistent_collapses()
+  }
+
   /// Why the connection's fresh sending stopped, counted (`Connection::send_stops`).
   pub fn send_stops(&self) -> crate::connection::SendStops {
     self.conn.send_stops()

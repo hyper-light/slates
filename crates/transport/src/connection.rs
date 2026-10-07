@@ -355,6 +355,8 @@ pub struct Connection {
   path_mtu: Option<PathMtu>,
   /// The adaptive reordering tolerance (`crate::reorder`): the loss thresholds widened by spurious losses.
   reordering: Reordering,
+  /// Loss events judged persistent congestion, counted (each collapses the window).
+  persistent_collapses: u64,
 }
 
 /// What one packet has used so far: its encoded frame bytes (against the datagram budget) and its stream
@@ -455,6 +457,7 @@ impl Connection {
       streams_blocked_sent: None,
       path_mtu: None,
       reordering: Reordering::default(),
+      persistent_collapses: 0,
     }
   }
 
@@ -1374,6 +1377,9 @@ impl Connection {
       persistent: self.persistent_congestion(&lost.packets),
       srtt: self.rtt.smoothed_rtt_or_initial(),
     });
+    if loss_event.as_ref().is_some_and(|event| event.persistent) {
+      self.persistent_collapses = self.persistent_collapses.saturating_add(1);
+    }
     self
       .controller
       .on_ack_and_loss(&ack_event, loss_event.as_ref());
@@ -1431,6 +1437,11 @@ impl Connection {
   /// Spurious losses the reordering tolerance has detected (a packet declared lost, acknowledged after).
   pub fn spurious_losses(&self) -> u64 {
     self.reordering.spurious()
+  }
+
+  /// Loss events judged persistent congestion (RFC 9002 §7.6), each collapsing the window to its minimum.
+  pub fn persistent_collapses(&self) -> u64 {
+    self.persistent_collapses
   }
 
   /// Folds acknowledged packets into path MTU discovery: a probe confirms its size (the controller follows a
@@ -1673,6 +1684,9 @@ impl Connection {
         persistent: self.persistent_congestion(&lost.packets),
         srtt: self.rtt.smoothed_rtt_or_initial(),
       };
+      if event.persistent {
+        self.persistent_collapses = self.persistent_collapses.saturating_add(1);
+      }
       self.controller.on_loss(&event);
       self.requeue_lost(lost);
       return true;

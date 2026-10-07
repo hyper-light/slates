@@ -3340,3 +3340,17 @@ The three experiments together:
   as against RTT spread with a steady delivery rate (jitter).
 - The 1 MiB runs earlier in this record exaggerated the jitter collapse, since slow start dominates them. 8 MiB is
   the honest size for these rows.
+
+#### The reordering rows are independent jitter (2026-10-07)
+
+`fetch_bench` now also reports the holders' persistent-congestion collapses (`Endpoint::persistent_collapses`). On
+the thin link with ±40 ms reordering and no loss, 8 MiB, there were 0 collapses, 15 spurious losses and an end window
+of 18.5 KB. So neither persistent congestion nor retransmission explains the 68 s.
+
+Likely reading (an interpretation of `sim.rs`'s path model, not separately measured): the simulator's in-order
+jitter clamps each datagram to arrive no earlier than the one before. Its delays therefore bunch together, and Copa
+sees little variance; with reordering each datagram's delay is drawn independently over the full band. The
+reordering rows are the true independent-jitter case, and their collapse is the delay ambiguity the starvation
+result proves, not a reordering defect: retransmissions are few. The owed design brief stands, sharpened: the delay
+signal must separate independent non-congestive jitter of tens of milliseconds from queueing, without a long memory
+of the path's rate, which the capacity-step row punishes.
