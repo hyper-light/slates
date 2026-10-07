@@ -128,6 +128,9 @@ pub struct Supervisor {
   /// WinFsp), and the descriptor type is Unix's.
   #[cfg(unix)]
   nfs_listener: Option<OwnedFd>,
+  /// Environment variables every daemon this supervisor spawns receives: the handoffs of endpoints the owner holds for
+  /// the daemon's successors (the client rendezvous, A-114), whose objects the owner keeps alive itself.
+  environment: Vec<(String, String)>,
   /// A fleet node's two serve sockets (probe, record) and its network export's listener when the plan has
   /// one, if this daemon is a fleet node (§4.8): bound once by the anchor and handed to each daemon it spawns
   /// (via [`ENV_FLEET_SERVE`]), so the manifest's ports are never free between a daemon's stop and its
@@ -188,6 +191,7 @@ impl Supervisor {
       restarts_at_ns: VecDeque::new(),
       crash_loop: false,
       lifetime: lifetime::Tie::new(),
+      environment: Vec::new(),
       #[cfg(unix)]
       nfs_listener: None,
       #[cfg(unix)]
@@ -334,6 +338,13 @@ impl Supervisor {
     ]
   }
 
+  /// Hands `name=value` to every daemon this supervisor spawns: the handoff of an endpoint the owner holds across
+  /// restarts (the client rendezvous, A-114). The owner keeps the endpoint itself alive, and any descriptor it names
+  /// inheritable.
+  pub fn hold_environment(&mut self, name: &str, value: String) {
+    self.environment.push((name.to_owned(), value));
+  }
+
   /// Holds `fd` — a bound, listening loopback socket — as the NFS listener handed to every daemon this
   /// supervisor spawns, so its port is stable across restarts (§4.6). The descriptor must be
   /// inheritable (the caller clears close-on-exec, since it is passed to the daemon across the spawn);
@@ -393,6 +404,7 @@ impl Supervisor {
     // mounts it recovers and answers the connections the dead daemon left.
     #[cfg(unix)]
     env.extend(self.device_env());
+    env.extend(self.environment.iter().cloned());
     let child = Command::new(&self.program)
       .args(&self.args)
       .envs(env)

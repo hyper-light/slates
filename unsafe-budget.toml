@@ -137,7 +137,9 @@
 #   read "alive"): on macOS, rustix's `kevent` (unsafe by signature for its user-data pointer) to
 #   register `EVFILT_PROC`/`NOTE_EXIT` and to read it with a zero timeout (2); on Windows, compiled only
 #   there, `OpenProcess(SYNCHRONIZE)`, adopting its handle as an `OwnedHandle`, and
-#   `WaitForSingleObject` with a zero timeout (3).
+#   `WaitForSingleObject` with a zero timeout (3). The anchor-held rendezvous (`rendezvous.rs` `adopt`, 2026-10-06,
+#   A-114): on Linux, borrowing the listening socket the anchor handed over by number to duplicate it close-on-exec,
+#   the shape the segment handoff already has (1). 46 → 47.
 # slates-server (5): the Windows liveness probe of a client's
 #   process (`peer.rs`, added 2026-09-05 with the dead-client reclaim): open, wait with a zero
 #   timeout, close (3), compiled only for Windows; and the daemon adopting the anchor's inherited
@@ -234,7 +236,7 @@ slates-vfs = 0
 slates-land = 3
 slates-anchor = 6
 slates-db = 0
-slates-ipc = 46
+slates-ipc = 47
 # 2026-09-19 (-1): Linux rendezvous awaits driver readiness; no raw-fd polling thread.
 # 2026-09-28 (+1): the inherited fleet serve sockets (`fleet.rs` `adopt_inherited`).
 #   Raised 5 → 6 on 2026-10-03 for A-64 (content resident once): `daemon::arena_region` maps the shard's arena range of

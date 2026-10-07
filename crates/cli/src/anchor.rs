@@ -241,6 +241,14 @@ pub(crate) fn run(options: &ProcessOptions) -> Result<(), Failure> {
   if let Some((was, now)) = slates_server::daemon::raise_descriptor_limit() {
     eprintln!("slates anchor: descriptor limit raised from {was} to {now}");
   }
+  // The client rendezvous is held the same way (A-114): a client that connects while a daemon restarts waits for the
+  // next one instead of failing "no daemon". Kept for the anchor's life; the daemon adopts it from the environment.
+  let rendezvous = slates_ipc::rendezvous::HeldRendezvous::hold(&options.instance)
+    .map_err(|e| failed("rendezvous", e))?;
+  supervisor.hold_environment(
+    slates_ipc::rendezvous::ENV_RENDEZVOUS,
+    rendezvous.env_value(),
+  );
   let mut clock = HostClock::new();
   let now = clock.monotonic_ns();
   supervisor.start(now).map_err(|e| failed("start", e))?;

@@ -2951,3 +2951,10 @@ daemon's exit too: a pidfd on Linux, a kqueue `NOTE_EXIT` on macOS (`slates_ipc:
   @babel/core, eslint; 7,419 files): 4.5 s with no kills; 8.3 s with 12 kills before (about 320 ms a kill); 4.7 s with
   7 kills after (about 30 ms a kill). Every run: `npm ls` clean, and pip's RECORD hashes for 3,606 files intact under
   10–11 kills.
+
+**A client connecting during a restart (A-114, same day).** `slates status` started at the moment the daemon was
+killed: before, exit 3 after 1,013.8 and 1,016.3 ms (the claim wait); after, exit 0 in 14.5 ms on Linux and
+15.6–17.0 ms on macOS (`crates/cli/tests/held_rendezvous.rs`, six kills a run, the longest; a debug CLI). A trace
+of the restart, release build, macOS: the anchor restarts the daemon at +2 ms, the control loop runs at +6.6 ms, and
+the pending claim is accepted at +6.7 ms. For scale, a `slates` invocation costs 3.4 ms whether or not it reaches the
+daemon (`--help` 3.4 ms, `status` 3.5 ms, p50 of 20).

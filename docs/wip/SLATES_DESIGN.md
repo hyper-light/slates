@@ -10174,3 +10174,21 @@ Status: built on macOS 2026-10-06; Linux owed (below).
   - Consuming requests and keeping them in anchor memory: it copies every request, and still needs the exact output
     position for a torn reply.
   - `TCP_REPAIR`: it needs `CAP_NET_ADMIN` (R10).
+
+### A-114 — The anchor holds the client rendezvous (2026-10-06)
+Applied in the same change to: D-10's rendezvous, GAPS, BENCHMARKS, docs/bugs/2026-10-06-a-client-connecting-during-a-restart-failed-no-daemon.md.
+
+Status: built 2026-10-06 (Linux, macOS; Windows by the shared module, cross-linted).
+- What it answers: a client that connected as its daemon died waited the one-second claim wait and failed "no
+  daemon", though the restart takes about 7 ms. A restarted daemon made a new rendezvous (macOS and Windows unlinked
+  and recreated the bootstrap object; on Linux the abstract socket vanished with the dead daemon), so a claim
+  published on the old one was never read.
+- The rule: the anchor holds every endpoint a client or a kernel connects through — the NFS listener (§4.6), the NFS
+  connections (A-113), and now the rendezvous. It creates the rendezvous once (an inheritable listening socket on
+  Linux, the bootstrap object with nothing published on macOS and Windows) and hands it to each daemon in
+  `SLATES_ANCHOR_RENDEZVOUS`. The daemon adopts it: Linux checks the inherited socket listens at the instance's
+  address; macOS and Windows check the object's magic and slot count, return claims the dead daemon took and never
+  answered to `CLAIMED`, and stamp the header. A daemon with no anchor makes its own, as before.
+- With nothing published (the anchor up, no daemon yet), a client is told "not yet published" at once, as with no
+  daemon; with a daemon restarting, its claim waits and the next daemon answers it.
+- Measured: a CLI verb started at the kill now succeeds in 14.5–17 ms (it failed after 1,014 ms).

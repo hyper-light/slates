@@ -106,8 +106,44 @@ impl std::fmt::Debug for Listener {
   }
 }
 
+/// Format: the environment variable a supervising anchor sets when it holds `instance`'s rendezvous (A-114): on Linux
+/// the inherited listening socket's descriptor number; on macOS and Windows `held` (the bootstrap object is found by
+/// the instance's name, which the anchor created and keeps).
+pub const ENV_RENDEZVOUS: &str = "SLATES_ANCHOR_RENDEZVOUS";
+
+/// The rendezvous a supervising anchor holds across daemon restarts (A-114), as it holds the NFS listener: a client
+/// that connects while a daemon is restarting waits for the next daemon (Linux: in the listening socket's backlog;
+/// macOS and Windows: its published claim in the bootstrap object, which the next daemon answers), where before the
+/// restart unlinked or closed the endpoint and the connect waited out a claim wait to fail "no daemon".
+pub struct HeldRendezvous {
+  inner: platform::Held,
+}
+
+impl std::fmt::Debug for HeldRendezvous {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.write_str("HeldRendezvous")
+  }
+}
+
+impl HeldRendezvous {
+  /// Creates `instance`'s rendezvous for the anchor to hold for its life: an inheritable listening socket (Linux), or
+  /// the bootstrap object with every slot free and nothing published (macOS, Windows), so a client finds no daemon
+  /// until the first one stamps it.
+  pub fn hold(instance: &str) -> Result<HeldRendezvous, IpcError> {
+    Ok(HeldRendezvous {
+      inner: platform::Held::hold(instance)?,
+    })
+  }
+
+  /// The [`ENV_RENDEZVOUS`] value that hands this rendezvous to a daemon the anchor spawns.
+  pub fn env_value(&self) -> String {
+    self.inner.env_value()
+  }
+}
+
 impl Listener {
-  /// Opens the daemon's end of the rendezvous for `instance`.
+  /// Opens the daemon's end of the rendezvous for `instance`: the one a supervising anchor holds when
+  /// [`ENV_RENDEZVOUS`] names it (adopted, its pending claims answered), else a fresh one this daemon owns.
   pub fn open(instance: &str) -> Result<Listener, IpcError> {
     Ok(Listener {
       inner: platform::Listener::open(instance)?,
@@ -541,17 +577,74 @@ pub mod platform {
     SocketAddrUnix::new_abstract_name(name.as_bytes()).map_err(|e| refused("abstract name", e))
   }
 
+  /// A listening socket bound at `instance`'s address, with `flags` (close-on-exec for the daemon's own; none for the
+  /// anchor's, which every daemon it spawns inherits).
+  fn listening(instance: &str, flags: SocketFlags) -> Result<OwnedFd, IpcError> {
+    let socket = rustix::net::socket_with(
+      AddressFamily::UNIX,
+      SocketType::STREAM,
+      flags | SocketFlags::NONBLOCK,
+      None,
+    )
+    .map_err(|e| refused("socket", e))?;
+    rustix::net::bind(&socket, &address(instance)?).map_err(|e| refused("bind", e))?;
+    rustix::net::listen(&socket, BACKLOG).map_err(|e| refused("listen", e))?;
+    Ok(socket)
+  }
+
+  /// The anchor's listening socket (A-114): inheritable, so the kernel keeps the address and queues every connect while
+  /// no daemon runs.
+  pub(super) struct Held {
+    socket: OwnedFd,
+  }
+
+  impl Held {
+    pub(super) fn hold(instance: &str) -> Result<Held, IpcError> {
+      Ok(Held {
+        socket: listening(instance, SocketFlags::empty())?,
+      })
+    }
+
+    pub(super) fn env_value(&self) -> String {
+      use std::os::fd::AsRawFd;
+      self.socket.as_raw_fd().to_string()
+    }
+  }
+
+  /// Adopts the listening socket an anchor handed over at descriptor `value`: duplicated close-on-exec (the inherited
+  /// number stays the process's, as an inherited segment's does), made non-blocking, and refused unless it listens at
+  /// `instance`'s own address — a number that names anything else is not this instance's rendezvous.
+  fn adopt(instance: &str, value: &str) -> Result<OwnedFd, IpcError> {
+    use std::os::fd::BorrowedFd;
+    let raw = value
+      .parse::<std::os::fd::RawFd>()
+      .ok()
+      .filter(|raw| *raw >= 0)
+      .ok_or(IpcError::Layout {
+        reason: "the anchor's rendezvous descriptor is not a number",
+      })?;
+    // SAFETY: the anchor made this listening socket inheritable and handed it across the spawn at this number; it stays
+    // open for the process's life (nothing here closes the inherited number), and the borrow lasts only for the
+    // duplication.
+    let inherited = unsafe { BorrowedFd::borrow_raw(raw) };
+    let socket = rustix::io::fcntl_dupfd_cloexec(inherited, 0).map_err(|e| refused("dup", e))?;
+    rustix::io::ioctl_fionbio(&socket, true).map_err(|e| refused("ioctl(FIONBIO)", e))?;
+    let bound = rustix::net::getsockname(&socket).map_err(|e| refused("getsockname", e))?;
+    let expected = rustix::net::SocketAddrAny::from(address(instance)?);
+    if bound != expected {
+      return Err(IpcError::Layout {
+        reason: "the anchor's rendezvous descriptor is not bound at this instance's address",
+      });
+    }
+    Ok(socket)
+  }
+
   impl Listener {
     pub(super) fn open(instance: &str) -> Result<Listener, IpcError> {
-      let socket = rustix::net::socket_with(
-        AddressFamily::UNIX,
-        SocketType::STREAM,
-        SocketFlags::CLOEXEC | SocketFlags::NONBLOCK,
-        None,
-      )
-      .map_err(|e| refused("socket", e))?;
-      rustix::net::bind(&socket, &address(instance)?).map_err(|e| refused("bind", e))?;
-      rustix::net::listen(&socket, BACKLOG).map_err(|e| refused("listen", e))?;
+      let socket = match std::env::var(super::ENV_RENDEZVOUS) {
+        Ok(value) => adopt(instance, &value)?,
+        Err(_) => listening(instance, SocketFlags::CLOEXEC)?,
+      };
       Ok(Listener {
         socket,
         uid: rustix::process::getuid().as_raw(),
@@ -1194,18 +1287,72 @@ pub mod platform {
     Ok(())
   }
 
+  /// A fresh bootstrap object for `instance`: the header's magic and slot count, every slot free, nothing published
+  /// (the start stamp zero until a daemon writes it).
+  fn fresh(instance: &str) -> Result<SharedObject, IpcError> {
+    let mut object =
+      SharedObject::create(&rendezvous_name(instance), OBJECT_BYTES, bootstrap_words())?;
+    object.write(0, &MAGIC.to_le_bytes())?;
+    object.write(
+      AT_SLOT_COUNT,
+      &u32::try_from(SLOTS).unwrap_or(u32::MAX).to_le_bytes(),
+    )?;
+    for i in 0..SLOTS {
+      state(&object, i)?.store(FREE, Ordering::Release);
+    }
+    Ok(object)
+  }
+
+  /// The bootstrap object the anchor holds (A-114): created once, kept for the anchor's life, so a client's claim made
+  /// while a daemon restarts stays where the next daemon reads it.
+  pub(super) struct Held {
+    _object: SharedObject,
+  }
+
+  impl Held {
+    pub(super) fn hold(instance: &str) -> Result<Held, IpcError> {
+      Ok(Held {
+        _object: fresh(instance)?,
+      })
+    }
+
+    pub(super) fn env_value(&self) -> String {
+      "held".to_owned()
+    }
+  }
+
+  /// Opens the bootstrap object an anchor holds for `instance`, refused unless it is one (its magic and slot count),
+  /// and readies its slots for this daemon: a claim the dead daemon took (`ANSWERING`) and never answered goes back to
+  /// `CLAIMED`, to be answered now; a slot its claimant finished (`DONE`) is freed. A claim still being written, one
+  /// published, and an answer not yet read are left as they are, for this daemon's accept and stale reclaim.
+  fn adopt(instance: &str) -> Result<SharedObject, IpcError> {
+    let handoff =
+      SharedObject::handoff_for_name(&rendezvous_name(instance)).ok_or(IpcError::Unsupported {
+        feature: "rendezvous by name",
+      })?;
+    let object = SharedObject::open(&handoff, OBJECT_BYTES, bootstrap_words())?;
+    if read_u32(&object, 0)? != MAGIC
+      || usize::try_from(read_u32(&object, AT_SLOT_COUNT)?).ok() != Some(SLOTS)
+    {
+      return Err(IpcError::Layout {
+        reason: "the anchor's rendezvous object is not this layout's",
+      });
+    }
+    for i in 0..SLOTS {
+      let word = state(&object, i)?;
+      let _ = word.compare_exchange(ANSWERING, CLAIMED, Ordering::AcqRel, Ordering::Acquire);
+      let _ = word.compare_exchange(DONE, FREE, Ordering::AcqRel, Ordering::Acquire);
+    }
+    Ok(object)
+  }
+
   impl Listener {
     pub(super) fn open(instance: &str) -> Result<Listener, IpcError> {
-      let mut object =
-        SharedObject::create(&rendezvous_name(instance), OBJECT_BYTES, bootstrap_words())?;
-      object.write(0, &MAGIC.to_le_bytes())?;
-      object.write(
-        AT_SLOT_COUNT,
-        &u32::try_from(SLOTS).unwrap_or(u32::MAX).to_le_bytes(),
-      )?;
-      for i in 0..SLOTS {
-        state(&object, i)?.store(FREE, Ordering::Release);
-      }
+      let mut object = if std::env::var_os(super::ENV_RENDEZVOUS).is_some() {
+        adopt(instance)?
+      } else {
+        fresh(instance)?
+      };
       object.write(AT_DAEMON_PID, &current_pid().to_le_bytes())?;
       // The start stamp last, with release: it publishes the header and the free table (never zero).
       object

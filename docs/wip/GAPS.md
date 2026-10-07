@@ -4155,3 +4155,13 @@ whose verifier disagrees written again — with a kill per round and a final kil
 6 rewrite rounds forced by a changed verifier, 0 lost, in each of three runs. The empty files came from runs where every
 kill sent the macOS client through its reconnect path, the path whose memory corruption panicked the kernel. That
 client is the leading suspect, not proven: the kernel run under A-113 (no reconnects) would show it, and waits for Ada.
+
+### 2026-10-06: restarts are a few milliseconds for every client (A-113 follow-ups, A-114)
+
+The anchor now wakes on the daemon's exit (pidfd / `NOTE_EXIT`) and holds the client rendezvous. A restart: anchor +2
+ms, daemon accepting +6.7 ms; NFS kill-to-answer 55 ms in the debug test (was 123–129); a CLI verb at the kill 14.5–17
+ms (was exit 3 after 1,014 ms); npm under kills about 30 ms a kill (was about 320).
+
+Open: recovery grows with a volume's files: 50,000 files recover in 70–74 ms on one shard (`restart-big.sh`). A client
+claim still has a one-second wait, so a recovery past a second would fail a connect again; the claim wait should follow
+the anchor's recovery budget when the rendezvous is held.
