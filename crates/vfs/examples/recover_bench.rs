@@ -20,10 +20,12 @@ use std::time::Instant;
 
 use slates_mem::arena::ChunkArena;
 use slates_mem::region::Region;
+use slates_vfs::checkpoint_log::{Journal, KeyedRecord, ShardDelta};
 use slates_vfs::clock::StepClock;
+use slates_vfs::delta::VolumeRecord;
 use slates_vfs::names::NameEquivalence;
 use slates_vfs::quota::Quota;
-use slates_vfs::recover::{Claims, VolumeImage};
+use slates_vfs::recover::{Claims, KeyedImage, ShardImage, VolumeImage};
 use slates_vfs::volume::{Store, StoreConfig, Volume, VolumeConfig};
 
 /// Shape: the rounds recorded per size; the best is reported (BENCHMARKS.md best-of-N, all N shown).
@@ -78,7 +80,7 @@ fn image_of(files: usize) -> (VolumeImage, usize) {
     &mut store,
     VolumeConfig {
       prefix: 1,
-      names: NameEquivalence::Exact,
+      names: NameEquivalence::Fold,
       quota: Quota::Bounded { limit: QUOTA },
       journal_bytes: JOURNAL_BYTES,
       clock: Box::new(StepClock::new(0, 1)),
@@ -125,7 +127,156 @@ fn rebuild(image: &VolumeImage) -> (u128, u128, usize) {
   (claimed, rebuilt, fresh.blocks.len())
 }
 
+/// The volume's image as a committed checkpoint in a journal's memory, as a publication leaves it.
+fn checkpointed(image: &VolumeImage) -> Vec<u8> {
+  let shard = ShardImage::new(vec![KeyedImage {
+    key: [1; 16],
+    image: image.clone(),
+  }]);
+  let mut room = 1usize << 20;
+  loop {
+    let mut slots = vec![0u8; room];
+    if Journal::default().checkpoint(&mut slots, &shard).is_ok() {
+      return slots;
+    }
+    room *= 2;
+  }
+}
+
+/// Shape: the delta log's bytes in the journal bench: larger than any checkpoint here, so the checkpoint rule (deltas
+/// since the last checkpoint reach its size) decides when to checkpoint, as in the daemon.
+const LOG_BYTES: usize = 1 << 28;
+
+/// A volume of `files` files made one create at a time with a publication after each, as the daemon's barrier does:
+/// a checkpoint when the journal wants one, else a delta; the journal's checkpoint memory, its log, and the delta
+/// frames after the last checkpoint.
+fn journal_of(files: usize) -> (Vec<u8>, Vec<u8>, usize) {
+  let mut store = store();
+  let mut vol = Volume::create(
+    &mut store,
+    VolumeConfig {
+      prefix: 1,
+      names: NameEquivalence::Fold,
+      quota: Quota::Bounded { limit: QUOTA },
+      journal_bytes: JOURNAL_BYTES,
+      clock: Box::new(StepClock::new(0, 1)),
+    },
+  )
+  .unwrap();
+  let root = vol.root_inode(&store).unwrap();
+  let bytes = vec![b'x'; FILE_BYTES];
+  let mut journal = Journal::default();
+  let mut slots = vec![0u8; 1 << 28];
+  let mut log = vec![0u8; LOG_BYTES];
+  let mut frames = 0usize;
+  let mut dir_no = root;
+  for file in 0..files {
+    if file % PER_DIR == 0 {
+      dir_no = vol
+        .mkdir_no(&mut store, root, &format!("d{:04}", file / PER_DIR), 0o755)
+        .unwrap();
+    }
+    let no = vol
+      .create_file_no(
+        &mut store,
+        dir_no,
+        &format!("f{:04}", file % PER_DIR),
+        0o644,
+      )
+      .unwrap();
+    vol.write(&mut store, no, 0, &bytes).unwrap();
+    let appended = !journal.wants_checkpoint()
+      && match vol.publication(&store, None).unwrap() {
+        VolumeRecord::Delta { delta } => journal
+          .append(
+            &mut log,
+            &ShardDelta::new(
+              vec![KeyedRecord {
+                key: [1; 16],
+                record: VolumeRecord::Delta { delta },
+              }],
+              Vec::new(),
+              None,
+              None,
+            ),
+          )
+          .is_ok(),
+        VolumeRecord::Full { .. } => false,
+      };
+    if appended {
+      frames += 1;
+    } else {
+      let image = vol.to_image(&store, None).unwrap();
+      journal
+        .checkpoint(
+          &mut slots,
+          &ShardImage::new(vec![KeyedImage {
+            key: [1; 16],
+            image,
+          }]),
+        )
+        .unwrap();
+      frames = 0;
+    }
+    vol.mark_published(&store);
+  }
+  (slots, log, frames)
+}
+
+/// Recovers a journal (its checkpoint, then its deltas): µs.
+fn replay(slots: &[u8], log: &[u8]) -> u128 {
+  let started = Instant::now();
+  let (image, _) = Journal::recover(slots, log).unwrap();
+  let took = started.elapsed().as_micros();
+  assert!(image.is_some(), "the journal recovers");
+  took
+}
+
+/// Recovers the journal (the checkpoint, no deltas): µs.
+fn decode(slots: &[u8]) -> u128 {
+  let started = Instant::now();
+  let (image, _) = Journal::recover(slots, &Vec::<u8>::new()).unwrap();
+  let took = started.elapsed().as_micros();
+  assert!(image.is_some(), "the checkpoint recovers");
+  took
+}
+
 fn main() {
+  if let Some(loops) = std::env::var("RECOVER_BENCH_REPLAY_LOOP")
+    .ok()
+    .and_then(|value| value.parse::<usize>().ok())
+  {
+    let (slots, log, _) = journal_of(FILES[1]);
+    for _ in 0..loops {
+      let _ = replay(&slots, &log);
+    }
+    return;
+  }
+  if std::env::var_os("RECOVER_BENCH_JOURNAL").is_some() {
+    println!("files,frames_after_checkpoint,replay_us_best,rounds_replay_us");
+    for files in FILES {
+      let (slots, log, frames) = journal_of(files);
+      let rounds: Vec<u128> = (0..ROUNDS).map(|_| replay(&slots, &log)).collect();
+      let all: Vec<String> = rounds.iter().map(u128::to_string).collect();
+      println!(
+        "{files},{frames},{},{}",
+        rounds.iter().min().unwrap(),
+        all.join(" ")
+      );
+    }
+    return;
+  }
+  if let Some(loops) = std::env::var("RECOVER_BENCH_DECODE_LOOP")
+    .ok()
+    .and_then(|value| value.parse::<usize>().ok())
+  {
+    let (image, _) = image_of(FILES[FILES.len() - 1]);
+    let slots = checkpointed(&image);
+    for _ in 0..loops {
+      let _ = decode(&slots);
+    }
+    return;
+  }
   if let Some(loops) = std::env::var("RECOVER_BENCH_LOOP")
     .ok()
     .and_then(|value| value.parse::<usize>().ok())
@@ -137,16 +288,19 @@ fn main() {
     return;
   }
   println!(
-    "files,claim_us_best,rebuild_us_best,rebuild_ns_per_file,dir_blocks_created,dir_blocks_rebuilt,rounds_rebuild_us"
+    "files,decode_us_best,decode_ns_per_file,claim_us_best,rebuild_us_best,rebuild_ns_per_file,dir_blocks_created,dir_blocks_rebuilt,rounds_rebuild_us"
   );
   for files in FILES {
     let (image, created_blocks) = image_of(files);
+    let slots = checkpointed(&image);
+    let decoded = (0..ROUNDS).map(|_| decode(&slots)).min().unwrap();
     let rounds: Vec<(u128, u128, usize)> = (0..ROUNDS).map(|_| rebuild(&image)).collect();
     let claim = rounds.iter().map(|r| r.0).min().unwrap();
     let rebuilt = rounds.iter().map(|r| r.1).min().unwrap();
     let all: Vec<String> = rounds.iter().map(|r| r.1.to_string()).collect();
     println!(
-      "{files},{claim},{rebuilt},{},{created_blocks},{},{}",
+      "{files},{decoded},{},{claim},{rebuilt},{},{created_blocks},{},{}",
+      decoded * 1000 / files as u128,
       rebuilt * 1000 / files as u128,
       rounds[0].2,
       all.join(" ")

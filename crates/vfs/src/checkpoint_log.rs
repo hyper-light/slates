@@ -240,10 +240,9 @@ impl Journal {
     checkpoints: &C,
     log: &L,
   ) -> Result<(Option<ShardImage>, Journal), VfsError> {
-    let Some(committed) = crate::recover::committed_slot(checkpoints) else {
-      return Ok((None, Journal::default()));
-    };
-    let Some(mut image) = ShardImage::read_from(checkpoints)? else {
+    // The committed checkpoint found, read and checked once (it was found by checking both slots, then found and
+    // read again).
+    let Some((committed, mut image)) = ShardImage::read_committed(checkpoints)? else {
       return Ok((None, Journal::default()));
     };
     let mut journal = Journal {

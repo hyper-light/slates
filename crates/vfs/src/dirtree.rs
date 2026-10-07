@@ -187,7 +187,7 @@ impl Slot {
 /// by any spelling of a folded name descends the same way the entry was inserted. Distinct
 /// entries never compare equal here (equal folded names are one entry).
 fn cmp_names(policy: NameEquivalence, a: &str, b: &str) -> std::cmp::Ordering {
-  policy.folded(a).cmp(policy.folded(b))
+  policy.compare(a, b)
 }
 
 /// A handle as one word: index in the high half, generation in the low.

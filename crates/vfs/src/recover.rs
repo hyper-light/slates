@@ -574,9 +574,21 @@ impl ShardImage {
   /// for a committed slot that is CRC-valid but decodes wrong (never a false success). A publish torn
   /// mid-write is skipped in favour of the previous committed image.
   pub fn read_from<S: ImageRead + ?Sized>(slots: &S) -> Result<Option<ShardImage>, VfsError> {
+    Ok(Self::read_committed(slots)?.map(|(_, image)| image))
+  }
+
+  /// [`ShardImage::read_from`] with the committed slot it read: the committed frame found, read and checked once.
+  pub fn read_committed<S: ImageRead + ?Sized>(
+    slots: &S,
+  ) -> Result<Option<(CommittedSlot, ShardImage)>, VfsError> {
     match recover_committed(slots)? {
       None => Ok(None),
-      Some(bytes) => ShardImage::from_content(&bytes).map(Some),
+      Some((committed, payload)) => {
+        let image = payload
+          .get(SLOT_GEN_WIDTH..)
+          .ok_or(VfsError::RecoveryIncomplete)?;
+        ShardImage::from_content(image).map(|image| Some((committed, image)))
+      }
     }
   }
 
@@ -620,7 +632,12 @@ impl VolumeImage {
   pub fn read_from<S: ImageRead + ?Sized>(slots: &S) -> Result<Option<VolumeImage>, VfsError> {
     match recover_committed(slots)? {
       None => Ok(None),
-      Some(bytes) => VolumeImage::from_content(&bytes).map(Some),
+      Some((_, payload)) => {
+        let image = payload
+          .get(SLOT_GEN_WIDTH..)
+          .ok_or(VfsError::RecoveryIncomplete)?;
+        VolumeImage::from_content(image).map(Some)
+      }
     }
   }
 }
@@ -835,21 +852,43 @@ impl CommittedSlot {
 /// The committed slot of image memory `slots`, found by checking both slots' CRCs: `None` when neither holds a
 /// committed image (a fresh object, or both torn).
 pub fn committed_slot<S: ImageRead + ?Sized>(slots: &S) -> Option<CommittedSlot> {
+  newest_first(slots)
+    .into_iter()
+    .flatten()
+    .find_map(|(second, slot)| {
+      slot_generation(slots, slot).map(|generation| CommittedSlot { generation, second })
+    })
+}
+
+/// The two slots in the order recovery tries them: by the generation each frame claims, newest first, the first slot
+/// first on a tie, a slot whose frame claims none (empty, short, or a length past the slot) left out. The claim is read
+/// from the frame without checking its CRC, which costs a pass over the whole image; the caller verifies the slot it
+/// takes, and falls back to the other when that fails, so the slot chosen is the one checking both would choose (the
+/// newest CRC-valid), at one verified pass where checking both cost two (2026-10-06: four passes per recovery, with the
+/// read below).
+fn newest_first<S: ImageRead + ?Sized>(slots: &S) -> [Option<(bool, Slot)>; 2] {
   let (zero, one) = slots_of(slots.image_len());
-  match (slot_generation(slots, zero), slot_generation(slots, one)) {
-    (Some(g0), Some(g1)) if g1 > g0 => Some(CommittedSlot {
-      generation: g1,
-      second: true,
-    }),
-    (Some(g0), _) => Some(CommittedSlot {
-      generation: g0,
-      second: false,
-    }),
-    (None, Some(g1)) => Some(CommittedSlot {
-      generation: g1,
-      second: true,
-    }),
-    (None, None) => None,
+  let claim = |slot: Slot| -> Option<u64> {
+    let mut header = [0u8; FRAME_HEADER];
+    slots.image_read(slot.offset, &mut header).ok()?;
+    let mut len = [0u8; LEN_WIDTH];
+    len.copy_from_slice(header.get(..LEN_WIDTH)?);
+    let len = usize::try_from(u32::from_le_bytes(len)).ok()?;
+    if len < SLOT_GEN_WIDTH || FRAME_HEADER.checked_add(len)? > slot.len {
+      return None;
+    }
+    let mut generation = [0u8; SLOT_GEN_WIDTH];
+    slots
+      .image_read(slot.offset.saturating_add(FRAME_HEADER), &mut generation)
+      .ok()?;
+    Some(u64::from_le_bytes(generation))
+  };
+  match (claim(zero), claim(one)) {
+    (Some(g0), Some(g1)) if g1 > g0 => [Some((true, one)), Some((false, zero))],
+    (Some(_), Some(_)) => [Some((false, zero)), Some((true, one))],
+    (Some(_), None) => [Some((false, zero)), None],
+    (None, Some(_)) => [Some((true, one)), None],
+    (None, None) => [None, None],
   }
 }
 
@@ -889,20 +928,56 @@ fn publish_committed<S: ImageWrite + ?Sized>(
 /// slot fails its CRC and is skipped, so an interrupted publish falls back to the previous committed
 /// image; a slot that is CRC-valid but decodes wrong is left for the caller to refuse, never a false
 /// success.
-fn recover_committed<S: ImageRead + ?Sized>(slots: &S) -> Result<Option<Vec<u8>>, VfsError> {
-  let (zero, one) = slots_of(slots.image_len());
-  let chosen = match (slot_image(slots, zero), slot_image(slots, one)) {
-    (Some((g0, p0)), Some((g1, p1))) => Some(if g0 >= g1 { p0 } else { p1 }),
-    (Some((_, p0)), None) => Some(p0),
-    (None, Some((_, p1))) => Some(p1),
-    (None, None) => None,
+fn recover_committed<S: ImageRead + ?Sized>(
+  slots: &S,
+) -> Result<Option<(CommittedSlot, Vec<u8>)>, VfsError> {
+  for (second, slot) in newest_first(slots).into_iter().flatten() {
+    if let Some(committed) = verified_frame(slots, slot, second)? {
+      return Ok(Some(committed));
+    }
+  }
+  Ok(None)
+}
+
+/// The committed slot a CRC-valid frame in `slot` makes and its payload (the generation's bytes, then the image's),
+/// read in one copy and checked over that copy, where it was checked by a streamed pass and then read again; `None`
+/// when the frame is empty, short or torn.
+fn verified_frame<S: ImageRead + ?Sized>(
+  slots: &S,
+  slot: Slot,
+  second: bool,
+) -> Result<Option<(CommittedSlot, Vec<u8>)>, VfsError> {
+  let mut header = [0u8; FRAME_HEADER];
+  slots.image_read(slot.offset, &mut header)?;
+  let (len_field, crc_field) = header.split_at(LEN_WIDTH);
+  let word = |field: &[u8]| {
+    let mut bytes = [0u8; LEN_WIDTH];
+    bytes.copy_from_slice(field);
+    u32::from_le_bytes(bytes)
   };
-  chosen
-    .map(|framed| {
-      let mut image = vec![0u8; framed.len];
-      slots.image_read(framed.at, &mut image).map(|()| image)
-    })
-    .transpose()
+  let len = usize::try_from(word(len_field)).unwrap_or(usize::MAX);
+  match FRAME_HEADER.checked_add(len) {
+    Some(end) if len >= SLOT_GEN_WIDTH && end <= slot.len => {}
+    _ => return Ok(None),
+  }
+  let mut payload = vec![0u8; len];
+  slots.image_read(slot.offset.saturating_add(FRAME_HEADER), &mut payload)?;
+  if crc32c(&payload) != word(crc_field) {
+    return Ok(None);
+  }
+  let mut generation = [0u8; SLOT_GEN_WIDTH];
+  generation.copy_from_slice(
+    payload
+      .get(..SLOT_GEN_WIDTH)
+      .ok_or(VfsError::RecoveryIncomplete)?,
+  );
+  Ok(Some((
+    CommittedSlot {
+      generation: u64::from_le_bytes(generation),
+      second,
+    },
+    payload,
+  )))
 }
 
 /// A slot's generation, if its frame is CRC-valid and carries one.
@@ -1309,7 +1384,7 @@ enum Entries {
 /// The canonical order of a directory image's entries (A-89): by folded name under `policy`, which is the name's own
 /// order under `Exact`. Allocation-free for an ASCII name under `Fold` (the common case).
 pub(crate) fn entry_order(policy: NameEquivalence, a: &str, b: &str) -> std::cmp::Ordering {
-  policy.folded(a).cmp(policy.folded(b))
+  policy.compare(a, b)
 }
 
 /// A block's image (A-64).

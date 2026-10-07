@@ -2981,3 +2981,20 @@ never read, which every create paid.
 
 The daemon's remaining 46 ms is mostly the image decode and the block claims, which come before the rebuild; that is
 the next lever.
+
+**Then the image decode (same day).** A recovery found the committed checkpoint by checking both slots' CRCs, then
+found and read it again (`read_from`): four passes over the image, a zeroed span buffer each, and a copy. It now reads
+the frame each slot claims without its CRC, takes the newest, and copies and checks it once, falling back to the
+other only when that fails (the same slot checking both would choose). And a replayed delta binary-searches its
+directory's entries, each comparison stepping two folded-name iterators a character at a time: an exact name now
+compares as bytes and two ASCII names under folding as lowercased bytes (a property test holds `compare` and `same`
+to the folded forms on generated names, Unicode included; the dirtree's lookups take the same path).
+
+| `recover_bench`, 10k / 50k / 200k files | Before | After |
+|---|---|---|
+| checkpoint decode, ns a file | 102 / 105 / 111 | 64 / 64 / 64 |
+| journal replay as the daemon publishes (a delta a create), µs | 2,791 / 14,115 / 39,949 | 1,761 / 8,869 / 20,248 |
+
+Daemon, the 50,000-file macOS volume (100,101 inodes: each file's provenance attribute is an AppleDouble sidecar
+inode), load average 11: decode 20.9 → 11.6–12.9 ms, claims 2.6–3.1 ms, rebuild 19–22 ms (214 ns an inode, the
+bench's rate); the recovering shard starts in 38.6–44.3 ms, from 70–74 ms this morning.
