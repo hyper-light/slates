@@ -4030,6 +4030,33 @@ impl Volume {
     Ok(previous)
   }
 
+  /// [`Self::table_set`] through a [`trie::LeafCursor`], for a run that sets numbers in increasing order (a rebuild's
+  /// placing loop).
+  pub(crate) fn table_set_in_order(
+    &mut self,
+    store: &mut Store,
+    no: InodeNo,
+    handle: Handle<Inode>,
+    cursor: &mut trie::LeafCursor,
+  ) -> Result<Option<Handle<Inode>>, VfsError> {
+    let mut scratch = Deadlist::default();
+    let (root, previous) = trie::set_in_order(
+      &mut store.tries,
+      self.inode_root,
+      no,
+      handle,
+      self.epoch,
+      &mut scratch,
+      cursor,
+    )?;
+    self.inode_root = root;
+    self.dirty.inode(no.0);
+    for d in scratch.take() {
+      self.retire(store, d)?;
+    }
+    Ok(previous)
+  }
+
   pub(crate) fn table_remove(
     &mut self,
     store: &mut Store,

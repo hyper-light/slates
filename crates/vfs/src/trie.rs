@@ -170,9 +170,22 @@ pub fn set(
   epoch: Epoch,
   dead: &mut Deadlist,
 ) -> Result<(Handle<TrieNode>, Option<Handle<Inode>>), VfsError> {
+  set_reaching(nodes, root, no, handle, epoch, dead).map(|(root, previous, _)| (root, previous))
+}
+
+/// What [`set_reaching`] returns: the (possibly new) root, the replaced handle if any, and the leaf the number went to.
+type Reached = (Handle<TrieNode>, Option<Handle<Inode>>, Handle<TrieNode>);
+
+/// [`set`], also returning the leaf node `no` was placed in (the last level's node), for a [`LeafCursor`].
+fn set_reaching(
+  nodes: &mut Slab<TrieNode>,
+  root: Handle<TrieNode>,
+  no: InodeNo,
+  handle: Handle<Inode>,
+  epoch: Epoch,
+  dead: &mut Deadlist,
+) -> Result<Reached, VfsError> {
   admit(nodes, nodes_to_set(nodes, root, no, epoch)?)?;
-  let mut path: Vec<(Handle<TrieNode>, usize)> =
-    Vec::with_capacity(usize::try_from(LEVELS).unwrap_or(0));
   let mut node = ensure_current(nodes, root, epoch, dead)?;
   let new_root = node;
   let mut previous = None;
@@ -192,9 +205,55 @@ pub fn set(
       _ => nodes.insert(TrieNode::empty(epoch))?,
     };
     nodes.get_mut(node)?.put(d, Slot::Node(child));
-    path.push((node, d));
     node = child;
   }
+  Ok((new_root, previous, node))
+}
+
+/// The leaf a run of [`set_in_order`] calls last placed into, so the next number that shares it is placed without a
+/// walk from the root. A rebuild places a volume's inodes in number order (an image lists them so), and fifteen of
+/// every sixteen numbers share the previous one's leaf: each set walked every level twice (the admission count, then
+/// the descent), 30% of a restart's rebuild (2026-10-06, `recover_bench`).
+#[derive(Debug, Default)]
+pub struct LeafCursor {
+  /// The root, the leaf, and the number's digits above the last level, as the last set left them.
+  last: Option<(Handle<TrieNode>, Handle<TrieNode>, u64)>,
+  /// Counter: sets placed straight into the held leaf, without a walk: the fast path's non-vacuity evidence.
+  pub direct: u64,
+}
+
+/// [`set`] through `cursor`: when `no` shares the leaf the cursor holds — same root handle, same digits above the last
+/// level, and the leaf still live and born in `epoch` — the slot is written there, needing no node and so no admission;
+/// otherwise the full set runs and the cursor takes its leaf. Valid between calls only while nothing else changes this
+/// trie, which a rebuild's placing loop guarantees; the checks keep a stale cursor from ever writing anywhere but a
+/// current leaf of this root.
+pub fn set_in_order(
+  nodes: &mut Slab<TrieNode>,
+  root: Handle<TrieNode>,
+  no: InodeNo,
+  handle: Handle<Inode>,
+  epoch: Epoch,
+  dead: &mut Deadlist,
+  cursor: &mut LeafCursor,
+) -> Result<(Handle<TrieNode>, Option<Handle<Inode>>), VfsError> {
+  let above = no.counter() >> BITS;
+  if let Some((held_root, leaf, held_above)) = cursor.last
+    && held_root == root
+    && held_above == above
+    && let Ok(node) = nodes.get_mut(leaf)
+    && node.born == epoch
+  {
+    let d = digit(no, LEVELS.saturating_sub(1));
+    let previous = match node.at(d) {
+      Slot::Inode(old) => Some(old),
+      _ => None,
+    };
+    node.put(d, Slot::Inode(handle));
+    cursor.direct = cursor.direct.saturating_add(1);
+    return Ok((root, previous));
+  }
+  let (new_root, previous, leaf) = set_reaching(nodes, root, no, handle, epoch, dead)?;
+  cursor.last = Some((new_root, leaf, above));
   Ok((new_root, previous))
 }
 
@@ -594,5 +653,89 @@ mod tests {
       Some(kept),
       "the snapshot still sees it"
     );
+  }
+
+  /// §4.8 rebuild (the leaf cursor). Do: place 5,000 numbers in increasing order through one [`LeafCursor`] in one
+  /// trie and through plain [`set`] in another; then replace one already placed through the cursor. Expect: every
+  /// number reads back the same handle from both, the cursor took its direct path for most of them (the non-vacuity
+  /// counter), the trees hold the same number of nodes, and the replacement returns the handle it replaced.
+  #[test]
+  fn a_cursor_run_places_what_plain_sets_place() {
+    let mut cursor_nodes: Slab<TrieNode> = Slab::new(64, 1 << 16);
+    let mut plain_nodes: Slab<TrieNode> = Slab::new(64, 1 << 16);
+    let mut inodes: Slab<Inode> = Slab::new(64, 1 << 16);
+    let mut dead = Deadlist::default();
+    let mut cursor_root = new_root(&mut cursor_nodes, Epoch(0)).unwrap();
+    let mut plain_root = new_root(&mut plain_nodes, Epoch(0)).unwrap();
+    let mut cursor = LeafCursor::default();
+    let numbers: Vec<u64> = (1..=5000).map(|n| n * 3).collect();
+    let mut handles = Vec::new();
+    for &n in &numbers {
+      let handle = inode(&mut inodes, n);
+      let no = InodeNo::compose(1, n);
+      cursor_root = set_in_order(
+        &mut cursor_nodes,
+        cursor_root,
+        no,
+        handle,
+        Epoch(0),
+        &mut dead,
+        &mut cursor,
+      )
+      .unwrap()
+      .0;
+      plain_root = set(
+        &mut plain_nodes,
+        plain_root,
+        no,
+        handle,
+        Epoch(0),
+        &mut dead,
+      )
+      .unwrap()
+      .0;
+      handles.push(handle);
+    }
+    for (&n, &handle) in numbers.iter().zip(&handles) {
+      let no = InodeNo::compose(1, n);
+      assert_eq!(
+        get(&cursor_nodes, cursor_root, no),
+        Some(handle),
+        "{n} through the cursor"
+      );
+      assert_eq!(
+        get(&plain_nodes, plain_root, no),
+        Some(handle),
+        "{n} through plain sets"
+      );
+    }
+    assert!(
+      cursor.direct > 4000,
+      "the direct path ran ({} of 5000)",
+      cursor.direct
+    );
+    assert_eq!(
+      cursor_nodes.len(),
+      plain_nodes.len(),
+      "the same nodes either way"
+    );
+    let replacement = inode(&mut inodes, 99_999);
+    let no = InodeNo::compose(1, numbers[numbers.len() - 1]);
+    let (_, previous) = set_in_order(
+      &mut cursor_nodes,
+      cursor_root,
+      no,
+      replacement,
+      Epoch(0),
+      &mut dead,
+      &mut cursor,
+    )
+    .unwrap();
+    assert_eq!(
+      previous,
+      handles.last().copied(),
+      "a replacement returns what it replaced"
+    );
+    assert!(dead.is_empty(), "one epoch copies nothing");
   }
 }

@@ -1715,7 +1715,7 @@ impl Volume {
         .get(&image.root_no)
         .ok_or(VfsError::RecoveryIncomplete)?;
     }
-    self.rebuild_entries(store, &image.inodes, &kinds, &dirs)?;
+    self.rebuild_entries(store, &image.inodes, &Kinds::Map(&kinds), &dirs)?;
     self.restore_identities(store, &image.inodes)?;
     self.live_entries = self
       .live_entries
@@ -1734,12 +1734,12 @@ impl Volume {
     root_no: InodeNo,
     epoch: Epoch,
   ) -> Result<(), VfsError> {
-    let kinds: BTreeMap<u64, KindImage> = inodes.iter().map(|i| (i.no, i.kind)).collect();
+    let kinds = Kinds::of(inodes);
     let mut dirs: BTreeMap<u64, Handle<DirNode>> = BTreeMap::new();
     dirs.insert(root_no.0, self.root);
-    self.place_inodes(store, claims, inodes, root_no, epoch, &mut dirs)?;
+    let placed = self.place_inodes(store, claims, inodes, root_no, epoch, &mut dirs)?;
     self.rebuild_entries(store, inodes, &kinds, &dirs)?;
-    self.restore_identities(store, inodes)?;
+    self.restore_placed_identities(store, inodes, root_no, &placed)?;
     Ok(())
   }
 
@@ -1921,7 +1921,7 @@ impl Volume {
       let handle = store.inodes.insert(inode)?;
       self.table_set(store, no, handle)?;
     }
-    self.rebuild_entries(store, &snap.inodes, &kinds, &dirs)?;
+    self.rebuild_entries(store, &snap.inodes, &Kinds::Map(&kinds), &dirs)?;
     self.restore_identities(store, &snap.inodes)?;
     // A clone's snapshot rebuilds its directories privately; a record the live snapshot shared with the origin
     // (born at or before the origin epoch) is this snapshot's own copy now, born with it, so the snapshot's drop
@@ -1947,18 +1947,22 @@ impl Volume {
     root_no: InodeNo,
     epoch: Epoch,
     dirs: &mut BTreeMap<u64, Handle<DirNode>>,
-  ) -> Result<(), VfsError> {
+  ) -> Result<Vec<Option<Handle<Inode>>>, VfsError> {
+    let mut placed = Vec::with_capacity(inodes.len());
+    let mut cursor = trie::LeafCursor::default();
     for image_inode in inodes {
       let no = InodeNo(image_inode.no);
       if no == root_no {
+        placed.push(None);
         continue;
       }
       let body = body_for(store, claims, image_inode, no, epoch, dirs)?;
       let inode = Inode::new(no, epoch, kind_from_image(image_inode.kind), 0, body);
       let handle = store.inodes.insert(inode)?;
-      self.table_set(store, no, handle)?;
+      self.table_set_in_order(store, no, handle, &mut cursor)?;
+      placed.push(Some(handle));
     }
-    Ok(())
+    Ok(placed)
   }
 
   /// Pass two: rebuild every directory's entries, naming each child with the right kind, and fix
@@ -1967,7 +1971,7 @@ impl Volume {
     &mut self,
     store: &mut Store,
     inodes: &[InodeImage],
-    kinds: &BTreeMap<u64, KindImage>,
+    kinds: &Kinds,
     dirs: &BTreeMap<u64, Handle<DirNode>>,
   ) -> Result<(), VfsError> {
     for image_inode in inodes {
@@ -1985,7 +1989,18 @@ impl Volume {
         .ok_or(VfsError::RecoveryIncomplete)?;
       store.dirs.get_mut(parent)?.base = *base;
       store.dirs.get_mut(parent)?.origin = origin.as_ref().map(|path| path.as_str().into());
-      for e in entries {
+      // In the tree's key order (the name's hash, then the name), not the image's (the folded name): each insert then
+      // lands past the end, which needs no shifting and whose split leaves the full block full (`dirtree`'s rightmost
+      // split). The order changes only the cost; the tree takes its entries in any order.
+      let policy = self.policy;
+      let mut ordered: Vec<(u64, &EntryImage)> =
+        entries.iter().map(|e| (policy.hash(&e.name), e)).collect();
+      ordered.sort_unstable_by(|(a_hash, a), (b_hash, b)| {
+        a_hash
+          .cmp(b_hash)
+          .then_with(|| a.name.as_bytes().cmp(b.name.as_bytes()))
+      });
+      for (_, e) in ordered {
         let child = child_for(store, e, parent_no, kinds, dirs)?;
         self.dir_insert(store, parent, &e.name, child)?;
       }
@@ -2007,17 +2022,38 @@ impl Volume {
       let no = InodeNo(image_inode.no);
       let handle =
         trie::get(&store.tries, self.inode_root, no).ok_or(VfsError::RecoveryIncomplete)?;
-      let inode = store.inodes.get_mut(handle)?;
-      inode.generation = image_inode.generation;
-      inode.born = Epoch(image_inode.born);
-      inode.version = image_inode.version;
-      inode.multi = image_inode.multi;
-      inode.home = image_inode
-        .home
-        .and_then(|h| Home::new(InodeNo(h.parent), h.hash));
-      inode.attrs = attrs_from_image(&image_inode.attrs);
-      inode.set_attribute_of(image_inode.attribute_of.map(InodeNo));
+      restore_identity(store.inodes.get_mut(handle)?, image_inode);
     }
+    self.restore_tables(store, inodes)
+  }
+
+  /// [`Self::restore_identities`] for inodes [`Self::place_inodes`] just placed: each one's handle is the one placing
+  /// returned, so no number is looked up in the trie again (the root, which placing skips, once). A restart's rebuild
+  /// spent 12% of its time on that second walk (2026-10-06, `recover_bench`).
+  fn restore_placed_identities(
+    &mut self,
+    store: &mut Store,
+    inodes: &[InodeImage],
+    root_no: InodeNo,
+    placed: &[Option<Handle<Inode>>],
+  ) -> Result<(), VfsError> {
+    if placed.len() != inodes.len() {
+      return Err(VfsError::RecoveryIncomplete);
+    }
+    for (image_inode, handle) in inodes.iter().zip(placed) {
+      let handle = match handle {
+        Some(handle) => *handle,
+        None => {
+          trie::get(&store.tries, self.inode_root, root_no).ok_or(VfsError::RecoveryIncomplete)?
+        }
+      };
+      restore_identity(store.inodes.get_mut(handle)?, image_inode);
+    }
+    self.restore_tables(store, inodes)
+  }
+
+  /// The attribute tables of `inodes` that carry any, after every identity is restored.
+  fn restore_tables(&mut self, store: &mut Store, inodes: &[InodeImage]) -> Result<(), VfsError> {
     // Tables after every identity: an attribute inode is checked in the rebuilt table, where a
     // snapshot's shared attribute inode (in its `shared` list, not `inodes`) is also found.
     for image_inode in inodes
@@ -2547,18 +2583,65 @@ impl Volume {
 
 /// The child an entry names, resolving a subdirectory to its node handle and fixing that node's
 /// parent and name from the reaching entry.
+/// The kind of each inode an image holds, by number: a flat table searched by bisection where a map was built per
+/// inode. An image lists its inodes in number order (`capture_tree`); one that does not (a delta merged in) is sorted
+/// once. A snapshot's rebuild adds kinds of its own as it goes, so it keeps a map ([`Kinds::Map`]).
+enum Kinds<'a> {
+  /// Sorted by number.
+  Sorted(Vec<(u64, KindImage)>),
+  /// A map built by its owner.
+  Map(&'a BTreeMap<u64, KindImage>),
+}
+
+impl Kinds<'_> {
+  /// The kinds of `inodes`.
+  fn of(inodes: &[InodeImage]) -> Kinds<'static> {
+    let mut table: Vec<(u64, KindImage)> = inodes.iter().map(|i| (i.no, i.kind)).collect();
+    if !table.is_sorted_by_key(|(no, _)| *no) {
+      table.sort_by_key(|(no, _)| *no);
+    }
+    Kinds::Sorted(table)
+  }
+
+  /// The kind of inode `no`, if the image holds it.
+  fn get(&self, no: u64) -> Option<KindImage> {
+    match self {
+      Kinds::Sorted(table) => table
+        .binary_search_by_key(&no, |(number, _)| *number)
+        .ok()
+        .and_then(|at| table.get(at))
+        .map(|(_, kind)| *kind),
+      Kinds::Map(map) => map.get(&no).copied(),
+    }
+  }
+}
+
+/// Restores `inode`'s true identity from its image: generation, birth epoch, version, multi-link flag, home, the
+/// exact attributes and the attribute-inode link.
+fn restore_identity(inode: &mut Inode, image_inode: &InodeImage) {
+  inode.generation = image_inode.generation;
+  inode.born = Epoch(image_inode.born);
+  inode.version = image_inode.version;
+  inode.multi = image_inode.multi;
+  inode.home = image_inode
+    .home
+    .and_then(|h| Home::new(InodeNo(h.parent), h.hash));
+  inode.attrs = attrs_from_image(&image_inode.attrs);
+  inode.set_attribute_of(image_inode.attribute_of.map(InodeNo));
+}
+
 fn child_for(
   store: &mut Store,
   entry: &EntryImage,
   parent_no: InodeNo,
-  kinds: &BTreeMap<u64, KindImage>,
+  kinds: &Kinds,
   dirs: &BTreeMap<u64, Handle<DirNode>>,
 ) -> Result<Child, VfsError> {
   let Some(child) = entry.child else {
     return Ok(Child::Whiteout);
   };
   let child_no = InodeNo(child);
-  match kinds.get(&child).ok_or(VfsError::RecoveryIncomplete)? {
+  match kinds.get(child).ok_or(VfsError::RecoveryIncomplete)? {
     KindImage::File => Ok(Child::File(child_no)),
     KindImage::Symlink => Ok(Child::Symlink(child_no)),
     KindImage::Fifo => Ok(Child::Fifo(child_no)),

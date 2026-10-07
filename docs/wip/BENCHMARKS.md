@@ -2958,3 +2958,26 @@ killed: before, exit 3 after 1,013.8 and 1,016.3 ms (the claim wait); after, exi
 of the restart, release build, macOS: the anchor restarts the daemon at +2 ms, the control loop runs at +6.6 ms, and
 the pending claim is accepted at +6.7 ms. For scale, a `slates` invocation costs 3.4 ms whether or not it reaches the
 daemon (`--help` 3.4 ms, `status` 3.5 ms, p50 of 20).
+
+## A restart's volume rebuild against the file count (2026-10-06)
+
+This Mac (M5 Max, Darwin 25.4). `cargo run --release -p slates-vfs --example recover_bench`: one volume of N 100-byte
+files in directories of 1,000, imaged, then claimed and rebuilt into a fresh store, best of 5 (all five shown by the
+bench). The daemon-level figure is `restart-big.sh` (scratchpad): a 50,000-file volume made through the macOS mount,
+unmounted, then the daemon killed three times under its anchor (`--quick --shards 2`), the recovering shard's start
+from its log.
+
+| Step | ns a file (10k / 50k / 200k) | Daemon, 50,000 files |
+|---|---|---|
+| Before | 366 / 400 / 392 | shard start 70–74 ms (rebuild 61 ms) |
+| The rebuild reuses the handles placing returned (no second trie walk) and a flat kind table | 325 / 326 / 344 | — |
+| Inodes placed through a leaf cursor (15 of 16 numbers share the last leaf; each set walked all 12 levels twice) | 191 / 204 / 223 | — |
+| Entries inserted in the tree's key order, and an append past the rightmost block leaves the full block full | 144 / 164 / 181 | shard start 45.8–46.4 ms |
+
+Directory blocks after the rebuild: 301 / 1,503 / 6,007, against 551 / 2,753 / 11,011 for the same volume built by
+creates in name order. That is 45% fewer page-sized blocks, about 20 MB less for 200,000 files. The split rule is
+PostgreSQL nbtree's rightmost-page split and SQLite's `balance_quick`. `set` also stopped allocating a path vector it
+never read, which every create paid.
+
+The daemon's remaining 46 ms is mostly the image decode and the block claims, which come before the rebuild; that is
+the next lever.
