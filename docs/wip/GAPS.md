@@ -4351,3 +4351,25 @@ were slowed runs (1,136 s and 1,170 s, 43–55 tests over 60 s, other sessions' 
 otherwise: alone 6 of 6, four concurrent copies 8 of 8 at load 34–45, and after the mirror tests in one process 2 of 2.
 The test now prints both survivors' refusal counters when the takeover does not complete, so the next failure says
 which step stalled. Not yet attributed, to the session's changes or to the load.
+
+### 2026-10-07: the two-network rerun at `2a56388f` — false deaths gone, same-region reads work, cross-region reads too slow
+
+Rerun of `docs/wip/bench/multiregion/run.sh`: 100 ms ± 40 ms one way and 3 % loss each way across the router, 8 MiB
+written on `a1`.
+
+- **False deaths:** none. Zero refutations folded in a minute on `a0` and on `b0`, where there had been about 30 per
+  minute per cross-region peer. Condemnations since start were 0–4 per pair, inside the detector's allowance at that
+  loss.
+- **Same-region reads:** `a0` and `a2` read `a1`'s volume byte-identical in 0.14–2.4 s.
+- **Cross-region reads: not usable.**
+  - Region 1's reads failed `Stalled` (the client's 1 s reply deadline) after 5–388 s, or were refused
+    `HomedElsewhere`.
+  - `b0` forwarded 440 pages directly to the owner across three read attempts (`fleet.owner_location.direct`), with 3
+    forwards unanswered.
+  - **Cause:** `Client::read` pages the file one request at a time, each forwarded across the router. That is about
+    one round trip of 200–450 ms per page, so an 8 MiB read is RTT-bound at tens of seconds. The client waits one
+    liveness budget (1 s) for each page, and the server's forward to the owner uses the same budget, so any page
+    slowed by a loss stalls the read.
+  - **Owed (condition 7's remote pull, in the geo case):** a read whose pages travel the WAN needs pipelining sized
+    to the path, a deadline derived from the measured path rather than the local liveness budget, or reads served by
+    identity from holders in the reader's own region.
