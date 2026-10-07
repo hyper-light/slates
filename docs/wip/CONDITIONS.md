@@ -180,9 +180,12 @@ in the same commit as the work). Last reviewed 2026-10-07 at `89956659`.
   - Open: cross-region membership did not form in 2 of 12 bring-ups, and one node's record session stayed borrowed
     for good (`GAPS.md` 2026-10-07).
   - Condition 7's jitter design, which replication's content pulls share.
-  - The copyset-successor fleet test fails intermittently under a loaded full suite (4 of 9 untraced runs, passing
-    alone). It is instrumented (`fleet.owner_location.no_session`); the hypothesis is a location round that skipped
-    a successor it held no session to.
+  - The copyset-successor fleet test fails intermittently in the full suite (4 of 9 untraced runs earlier; 1 of 3
+    full suites on 2026-10-07, "retry not served: HomedElsewhere", one forward unanswered, location rounds answering
+    `not_owner` 6 times and `unavailable` once). Run alone it passes, and run as 6 and as 12 concurrent copies it
+    passed 18 of 18 and 36 of 36 (load average 6.7), so contention alone does not reproduce it: it needs state the
+    serialized suite leaves behind from earlier tests in the same process. Open; the next failure's counters now
+    name any held session's holder (`fleet.lent_to.*`) and a dropped link's reason (`fleet.link.invalid.*`).
 
 ## 11. No panics; recovery proven adversarially
 
