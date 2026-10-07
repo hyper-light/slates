@@ -433,13 +433,14 @@ fn release_unmounted_lease(s: &mut ShardState, record: &AttachmentRecord) {
     .is_some_and(|l| l.holder == record.principal);
   if !holds_another && lease_is_ours {
     let now = s.clock.monotonic_ns();
-    let _ = s.db.mutate(
+    let released = s.db.mutate(
       &mut s.segment,
       &Op::LeaseReleased {
         volume: record.volume,
       },
       now,
     );
+    crate::verbs::count_secondary(s, released);
   }
 }
 

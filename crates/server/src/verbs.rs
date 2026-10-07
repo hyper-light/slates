@@ -914,7 +914,8 @@ fn prune_forwarded(state: &mut ShardState, origin: u64, client: u32, up_to: u32)
     return;
   }
   let now = state.clock.monotonic_ns();
-  let _ = state.db.mutate(
+  // Retried by the next advance; a refusal is counted, never silent.
+  let recorded = state.db.mutate(
     &mut state.segment,
     &Op::CompletionsAcknowledged {
       origin,
@@ -923,7 +924,37 @@ fn prune_forwarded(state: &mut ShardState, origin: u64, client: u32, up_to: u32)
     },
     now,
   );
+  count_secondary(state, recorded);
 }
+
+/// Counts a secondary record the database refused (`DB_SECONDARY_REFUSED`): one a verb writes beside its own effect
+/// and does not fail for (an acknowledgement watermark, a lease released with the last attachment, a lost head's
+/// epoch), each retried or superseded by a later record, so a refusal is counted where it was dropped before
+/// 2026-10-07.
+pub(crate) fn count_secondary<T, E>(state: &mut ShardState, recorded: Result<T, E>) {
+  if recorded.is_err() {
+    state.count(DB_SECONDARY_REFUSED, 1);
+  }
+}
+
+/// Format: the status counter of secondary records the database refused ([`count_secondary`]).
+pub(crate) const DB_SECONDARY_REFUSED: &str = "db.secondary_refused";
+
+/// Counts under `kind` a step whose refusal the caller cannot act on and must not drop: a rollback's discard of a
+/// volume it built (`VOLUME_DISCARD_REFUSED`), an allowance a rebuilt or cloned volume could not take
+/// (`VOLUME_ALLOWANCE_REFUSED`).
+pub(crate) fn count_kept<T, E>(state: &mut ShardState, kind: &'static str, outcome: Result<T, E>) {
+  if outcome.is_err() {
+    state.count(kind, 1);
+  }
+}
+
+/// Format: the status counter of rollbacks whose discard of a partly built volume was refused (its slots and blocks
+/// stay held).
+pub(crate) const VOLUME_DISCARD_REFUSED: &str = "volume.discard_refused";
+
+/// Format: the status counter of inode or entry allowances a volume refused (it already holds more).
+pub(crate) const VOLUME_ALLOWANCE_REFUSED: &str = "volume.allowance_refused";
 
 /// Resolves a remotely homed volume by its creator, this client's cached route or a read-only
 /// location exchange, then forwards the verb once (§4.8 Lookup, §4.9 RIFL). Discovery never
@@ -3285,7 +3316,8 @@ fn create(
     );
   }
   let Some(id) = fresh_volume_id(state) else {
-    let _ = volume.discard_partial(&mut state.store);
+    let discarded = volume.discard_partial(&mut state.store);
+    count_kept(state, VOLUME_DISCARD_REFUSED, discarded);
     return give_back(
       state,
       reservation,
@@ -3360,7 +3392,8 @@ fn publish_created_volume(
     .db
     .mutate(&mut state.segment, &Op::VolumeCreated { record }, now)
   {
-    let _ = volume.discard_partial(&mut state.store);
+    let discarded = volume.discard_partial(&mut state.store);
+    count_kept(state, VOLUME_DISCARD_REFUSED, discarded);
     return give_back(
       state,
       reservation,
@@ -3371,7 +3404,8 @@ fn publish_created_volume(
   }
   if !state.volumes.has_room() {
     let full = state.volumes.max_slots();
-    let _ = volume.discard_partial(&mut state.store);
+    let discarded = volume.discard_partial(&mut state.store);
+    count_kept(state, VOLUME_DISCARD_REFUSED, discarded);
     return give_back(
       state,
       reservation,
@@ -4700,9 +4734,11 @@ fn clone(
   volume_core.set_locked(locked);
   // Cap the clone's inode dimension at the same allowance already reserved above, so its per-volume
   // cap (`next_no`) and its version-slab reservation agree. A clone previously carried no inode cap.
-  let _ = volume_core.set_inode_allowance(clone_allowance);
+  let allowed = volume_core.set_inode_allowance(clone_allowance);
+  count_kept(state, VOLUME_ALLOWANCE_REFUSED, allowed);
   let Some(id) = fresh_volume_id(state) else {
-    let _ = volume_core.discard_partial(&mut state.store);
+    let discarded = volume_core.discard_partial(&mut state.store);
+    count_kept(state, VOLUME_DISCARD_REFUSED, discarded);
     return give_back(
       state,
       reservation,
@@ -4732,7 +4768,8 @@ fn clone(
   for op in &ops {
     if let Err(e) = state.db.mutate(&mut state.segment, op, now) {
       unpin_origin(state, handle, snapshot);
-      let _ = volume_core.discard_partial(&mut state.store);
+      let discarded = volume_core.discard_partial(&mut state.store);
+      count_kept(state, VOLUME_DISCARD_REFUSED, discarded);
       return give_back(
         state,
         reservation,
@@ -4748,7 +4785,8 @@ fn clone(
   if !state.volumes.has_room() {
     let full = state.volumes.max_slots();
     unpin_origin(state, handle, snapshot);
-    let _ = volume_core.discard_partial(&mut state.store);
+    let discarded = volume_core.discard_partial(&mut state.store);
+    count_kept(state, VOLUME_DISCARD_REFUSED, discarded);
     return give_back(
       state,
       reservation,
@@ -5459,13 +5497,14 @@ pub(crate) fn end_attachment(
     .and_then(|v| v.lease.as_ref())
     .is_some_and(|l| l.holder == record.principal);
   if !holds_another && lease_is_ours {
-    let _ = state.db.mutate(
+    let released = state.db.mutate(
       &mut state.segment,
       &Op::LeaseReleased {
         volume: record.volume,
       },
       now,
     );
+    count_secondary(state, released);
   }
   Ok(())
 }
@@ -5581,7 +5620,8 @@ fn resize(
   // The core accepted the new limit: apply the new inode cap and settle the version reservation to
   // the new allowance (the growth is already taken above; a shrink returns the difference now), then
   // settle the byte reservation the same way.
-  let _ = slot.volume.set_inode_allowance(new_allowance);
+  // Never refused: `new_allowance` is at least the live count, the setter's one refusal. Counted all the same.
+  let allowed = slot.volume.set_inode_allowance(new_allowance);
   slot.version_credit = Some(settle_version_reservation(
     &mut state.store.versions,
     old_version,
@@ -5598,6 +5638,7 @@ fn resize(
       Err(_) => slot.reservation = None,
     }
   }
+  count_kept(state, VOLUME_ALLOWANCE_REFUSED, allowed);
   let now = state.clock.monotonic_ns();
   if let Err(e) = state.db.mutate(
     &mut state.segment,
@@ -6313,7 +6354,8 @@ pub(crate) fn materialize_taken_over(
   };
   volume.set_locked(catalog.require_locked);
   if let Err(e) = admit_dimensions(state, &mut volume, size) {
-    let _ = volume.discard_partial(&mut state.store);
+    let discarded = volume.discard_partial(&mut state.store);
+    count_kept(state, VOLUME_DISCARD_REFUSED, discarded);
     return Err(Box::new(give_back(
       state,
       reservation,
@@ -6323,7 +6365,8 @@ pub(crate) fn materialize_taken_over(
     )));
   }
   if let Err(e) = populate_restored(&mut state.store, &mut volume, &restored) {
-    let _ = volume.discard_partial(&mut state.store);
+    let discarded = volume.discard_partial(&mut state.store);
+    count_kept(state, VOLUME_DISCARD_REFUSED, discarded);
     return Err(Box::new(give_back(
       state,
       reservation,
@@ -8191,7 +8234,8 @@ fn rebuild_volume(
   let held = volume.budget_hold();
   if held > 0 && state.store.grow(held).is_err() {
     // The rebuilt volume returns its slots, blocks and retention rather than leaking them.
-    let _ = volume.discard_partial(&mut state.store);
+    let discarded = volume.discard_partial(&mut state.store);
+    count_kept(state, VOLUME_DISCARD_REFUSED, discarded);
     if let Some(r) = reservation {
       state.store.budget.release(r);
     }
@@ -8200,9 +8244,11 @@ fn rebuild_volume(
   // Re-admit the inode dimension (§4.2): the fair share, but never below what the recovered volume
   // already holds — recovery does not refuse inodes that were admitted before the restart.
   let allowance = inode_allowance(state, size).max(volume.inode_usage().0);
-  let _ = volume.set_inode_allowance(allowance);
+  let allowed = volume.set_inode_allowance(allowance);
+  count_kept(state, VOLUME_ALLOWANCE_REFUSED, allowed);
   let entries = entry_allowance(size).max(volume.entry_usage().0);
-  let _ = volume.set_entry_allowance(entries);
+  let allowed = volume.set_entry_allowance(entries);
+  count_kept(state, VOLUME_ALLOWANCE_REFUSED, allowed);
   // Re-acquire the version reservation (§4.2 accounting through recovery), giving back the byte
   // reservation and re-grown hold — and the rebuilt volume's slots, blocks and retention — if the
   // slab shrank.
@@ -8210,7 +8256,8 @@ fn rebuild_volume(
     match recover_version_reservations(&mut state.store, allowance, reservation, held) {
       Ok(credit) => credit,
       Err(reason) => {
-        let _ = volume.discard_partial(&mut state.store);
+        let discarded = volume.discard_partial(&mut state.store);
+        count_kept(state, VOLUME_DISCARD_REFUSED, discarded);
         return Err(reason);
       }
     };
@@ -8220,7 +8267,8 @@ fn rebuild_volume(
   let metadata_credit = match reserve_metadata(state, journal_bytes) {
     Ok(credit) => Some(credit),
     Err(refusal) => {
-      let _ = volume.discard_partial(&mut state.store);
+      let discarded = volume.discard_partial(&mut state.store);
+      count_kept(state, VOLUME_DISCARD_REFUSED, discarded);
       if let Some(c) = version_credit {
         state.store.versions.release(c);
       }
@@ -8323,7 +8371,8 @@ fn build_recovered_volume(
   {
     // The half-built volume gives back its sources, records and blocks, as `from_image` does on its own refusals.
     let host = opened.as_mut().map(|(host, _)| host as &mut dyn HostFs);
-    let _ = volume.discard_partial_releasing(&mut state.store, host);
+    let discarded = volume.discard_partial_releasing(&mut state.store, host);
+    count_kept(state, VOLUME_DISCARD_REFUSED, discarded);
     return Err(format!(
       "RecoveryIncomplete: the image's quota exceeds the acknowledged size policy: {error}"
     ));
@@ -8566,7 +8615,8 @@ fn reconcile_lost(state: &mut ShardState, record: &VolumeRecord) -> (usize, usiz
           head: DbSnapshotId::default(),
           epoch,
         };
-        let _ = state.db.mutate(&mut state.segment, &op, now);
+        let advanced = state.db.mutate(&mut state.segment, &op, now);
+        count_secondary(state, advanced);
       }
       // No epoch can supersede the lost head's: counted, and the head is left as recorded.
       None => state.count(VOLUME_EPOCH_EXHAUSTED, 1),
