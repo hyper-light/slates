@@ -117,7 +117,15 @@ What the mirror did not receive is the loss window; the status reports it per vo
    Fleet test for M2 and M3: `a_placed_snapshot_is_held_whole_by_f_plus_one_hosts_of_the_mirror_region`. Two
    regions of three at `f = 1`; a file written and snapshotted in region 0. It passed 3 of 3 (2.1–3.8 s). The
    control, with shipping switched off, failed with no mirror host holding anything after 448 s.
-4. **M4, the mirrored head record and promotion adoption.** The head record naming the mirror holders is committed
+4. **M4, the mirrored head record and promotion adoption.** Groundwork built 2026-10-07: the mirror holder's
+   register, `slates_db::mirror::MirrorRecords`. It keeps the newest record per object by (epoch, sequence) and
+   refuses a stale one or a rewrite. Its tests are an every-permutation order oracle and a refusal table. Phase one
+   asks every member of the mirror region and adopts at answers from all but `f`, so any record acknowledged at
+   `f + 1` meets an answering holder whatever cohort the owner chose. Holders are fenced by the promotion itself
+   (M1's `HomePromoted`). Mirror records must be held durably before the acknowledgement, as home records now are
+   (`docs/bugs/2026-10-07-a-warm-restart-dropped-held-register-records.md`).
+
+   Still to build: The head record naming the mirror holders is committed
    at `f + 1` of them, under the mirror rule's authority. Promotion then runs the per-host takeover in the mirror
    region. Fleet test (AC-8.15): region 0 killed and promoted, the snapshot's bytes read from region 1, and an
    operation that awaited the mirror intact.

@@ -22,7 +22,7 @@ use std::collections::BTreeMap;
 
 use crate::ledger::{Cohort, Owner, Reach};
 use crate::register::{
-  DomainId, HostId, ObjectId, Quorum, RegionId, RootConfiguration, rendezvous_ranked,
+  DomainId, HostId, ObjectId, Quorum, Record, RegionId, RootConfiguration, rendezvous_ranked,
 };
 
 /// A volume's mirror region: a cohort of the mirror's candidate holders and the writer that replays
@@ -158,6 +158,95 @@ pub fn admits_mirror_put(
   Ok(())
 }
 
+/// Why a mirror holder refuses a mirrored record (`docs/wip/mirroring.md` M4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MirrorRecordRefusal {
+  /// The holder already holds a newer record of the object: a higher epoch, or the same epoch at a later
+  /// sequence.
+  Stale {
+    /// The held record's epoch.
+    epoch: u64,
+    /// The held record's sequence.
+    sequence: u64,
+  },
+  /// A different value at the position the holder already holds: never rewritten (§4.8 "a committed position is
+  /// never rewritten with a different value").
+  ConflictingPosition,
+}
+
+/// One mirror holder's newest record of each object it mirrors (§4.8 "Mirroring"; `docs/wip/mirroring.md` M4): a
+/// single-value register per object, ordered by (epoch, sequence) as a home holder orders records, so a successor's
+/// higher epoch fences a replaced owner. Only records the home region placed are ever shipped, so a fenced owner's
+/// later records, never placed at home, never arrive. Who may write is the caller's check
+/// ([`admits_mirror_put`]), which also refuses every record of a promoted home: the promotion is the fence the
+/// mirror's adoption reads behind. Bounded by the objects this holder mirrors, one record each.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MirrorRecords {
+  held: BTreeMap<ObjectId, Record>,
+}
+
+impl MirrorRecords {
+  /// No records.
+  pub fn new() -> MirrorRecords {
+    MirrorRecords::default()
+  }
+
+  /// Accepts `record` as its object's newest: `Ok(true)` when it replaced what was held or is the first,
+  /// `Ok(false)` for the record already held (a retry), refused when older than what is held or when it would
+  /// rewrite a held position with another value.
+  pub fn accept(&mut self, record: Record) -> Result<bool, MirrorRecordRefusal> {
+    if let Some(held) = self.held.get(&record.object) {
+      let key = (record.epoch.0, record.sequence);
+      let held_key = (held.epoch.0, held.sequence);
+      if key == held_key {
+        return if held.value == record.value {
+          Ok(false)
+        } else {
+          Err(MirrorRecordRefusal::ConflictingPosition)
+        };
+      }
+      if record.sequence == held.sequence && record.value != held.value && key > held_key {
+        // A successor's re-commit of the same position at a higher epoch carries the adopted value: a different
+        // value there would rewrite a committed position.
+        return Err(MirrorRecordRefusal::ConflictingPosition);
+      }
+      if key < held_key {
+        return Err(MirrorRecordRefusal::Stale {
+          epoch: held.epoch.0,
+          sequence: held.sequence,
+        });
+      }
+    }
+    self.held.insert(record.object, record);
+    Ok(true)
+  }
+
+  /// The newest record held of `object`.
+  pub fn newest(&self, object: ObjectId) -> Option<&Record> {
+    self.held.get(&object)
+  }
+
+  /// Every object held with its newest record, in object order: what a promotion's phase one reports.
+  pub fn iter(&self) -> impl Iterator<Item = (&ObjectId, &Record)> {
+    self.held.iter()
+  }
+
+  /// Forgets `object` (adopted, or destroyed).
+  pub fn forget(&mut self, object: ObjectId) {
+    self.held.remove(&object);
+  }
+
+  /// How many objects are held.
+  pub fn len(&self) -> usize {
+    self.held.len()
+  }
+
+  /// Whether nothing is held.
+  pub fn is_empty(&self) -> bool {
+    self.held.is_empty()
+  }
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -249,5 +338,84 @@ mod tests {
       Err(MirrorRefusal::HomePromoted { home: RegionId(0) }),
       "a promoted region writes nothing to its mirror"
     );
+  }
+
+  fn record(epoch: u64, sequence: u64, value: u8) -> Record {
+    Record {
+      owner: HostId(2),
+      object: ObjectId::new(HostId(2), 7),
+      sequence,
+      epoch: crate::register::HostEpoch(epoch),
+      generation: 0,
+      value: vec![value],
+    }
+  }
+
+  /// docs/wip/mirroring.md M4, an oracle over delivery order. Do: deliver every permutation of a set of records
+  /// (two epochs, sequences rising, the successor re-committing the adopted value at its epoch). Expect: whatever
+  /// the order, the holder ends holding the record highest by (epoch, sequence), and never a refused one.
+  #[test]
+  fn the_newest_record_by_epoch_then_sequence_is_held_whatever_the_delivery_order() {
+    let records = [
+      record(1, 1, 10),
+      record(1, 2, 11),
+      record(2, 2, 11),
+      record(2, 3, 12),
+    ];
+    let expected = record(2, 3, 12);
+    let mut order: Vec<usize> = (0..records.len()).collect();
+    let mut permutations = 0;
+    loop {
+      let mut held = MirrorRecords::new();
+      for index in &order {
+        let _ = held.accept(records[*index].clone());
+      }
+      assert_eq!(
+        held.newest(expected.object),
+        Some(&expected),
+        "order {order:?}"
+      );
+      permutations += 1;
+      // Next permutation in lexicographic order.
+      let Some(pivot) = (0..order.len() - 1)
+        .rev()
+        .find(|&i| order[i] < order[i + 1])
+      else {
+        break;
+      };
+      let successor = (pivot + 1..order.len())
+        .rev()
+        .find(|&j| order[j] > order[pivot])
+        .unwrap();
+      order.swap(pivot, successor);
+      order[pivot + 1..].reverse();
+    }
+    assert_eq!(permutations, 24);
+  }
+
+  /// docs/wip/mirroring.md M4. Do: offer an older record, a retry, and another value at a held position. Expect:
+  /// stale refused naming what is held, the retry accepted unchanged, the rewrite refused.
+  #[test]
+  fn an_older_record_and_a_rewrite_are_refused_and_a_retry_changes_nothing() {
+    let mut held = MirrorRecords::new();
+    assert_eq!(held.accept(record(2, 3, 12)), Ok(true));
+    assert_eq!(
+      held.accept(record(1, 9, 99)),
+      Err(MirrorRecordRefusal::Stale {
+        epoch: 2,
+        sequence: 3
+      })
+    );
+    assert_eq!(held.accept(record(2, 3, 12)), Ok(false));
+    assert_eq!(
+      held.accept(record(2, 3, 13)),
+      Err(MirrorRecordRefusal::ConflictingPosition)
+    );
+    assert_eq!(
+      held.accept(record(3, 3, 14)),
+      Err(MirrorRecordRefusal::ConflictingPosition),
+      "a higher epoch may re-commit a held position only with its value"
+    );
+    assert_eq!(held.accept(record(3, 3, 12)), Ok(true));
   }
 }
