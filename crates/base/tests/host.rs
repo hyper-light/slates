@@ -436,8 +436,34 @@ fn junction(link: &std::path::Path, target: &std::path::Path) {
   assert!(made.status.success(), "mklink /J: {made:?}");
 }
 
-/// The bytes of the file `name` under `dir`, through the host.
+/// A link at `link` to the directory `target`, as an outsider makes one without privilege: a junction on Windows, a
+/// symbolic link on Unix.
 #[cfg(windows)]
+fn link_dir(link: &std::path::Path, target: &std::path::Path) {
+  junction(link, target);
+}
+
+/// A link at `link` to the directory `target`, as an outsider makes one without privilege: a junction on Windows, a
+/// symbolic link on Unix.
+#[cfg(unix)]
+fn link_dir(link: &std::path::Path, target: &std::path::Path) {
+  std::os::unix::fs::symlink(target, link).unwrap();
+}
+
+/// A symbolic link at `link` to the file `target` (on Windows it needs a privilege or developer mode).
+#[cfg(windows)]
+fn link_file(target: &std::path::Path, link: &std::path::Path) -> std::io::Result<()> {
+  std::os::windows::fs::symlink_file(target, link)
+}
+
+/// A symbolic link at `link` to the file `target`.
+#[cfg(unix)]
+fn link_file(target: &std::path::Path, link: &std::path::Path) -> std::io::Result<()> {
+  std::os::unix::fs::symlink(target, link)
+}
+
+/// The bytes of the file `name` under `dir`, through the host.
+#[cfg(any(unix, windows))]
 fn read_named(host: &mut OsHost, dir: HostDir, name: &str) -> Vec<u8> {
   let file = host.open_file(dir, name).unwrap();
   let bytes = read_whole(host, file, 64);
@@ -446,7 +472,7 @@ fn read_named(host: &mut OsHost, dir: HostDir, name: &str) -> Vec<u8> {
 }
 
 /// The names a listing shows, sorted.
-#[cfg(windows)]
+#[cfg(any(unix, windows))]
 fn listed(host: &mut OsHost, dir: HostDir) -> Vec<String> {
   let mut names: Vec<String> = host
     .list(dir)
@@ -459,15 +485,15 @@ fn listed(host: &mut OsHost, dir: HostDir) -> Vec<String> {
 }
 
 /// Shape: the bytes every file outside the base holds; no host call may ever return them.
-#[cfg(windows)]
+#[cfg(any(unix, windows))]
 const SENTINEL: &[u8] = b"outside the base";
 /// Shape: the bytes every file inside the base holds.
-#[cfg(windows)]
+#[cfg(any(unix, windows))]
 const INSIDE: &[u8] = b"inside the base";
 
 /// A base (`base/f.txt`, `base/sub/inner.txt`) and a sibling outside it (`outside/sentinel.txt`,
 /// `outside/f.txt`, `outside/inner.txt`) in a fresh build-output directory.
-#[cfg(windows)]
+#[cfg(any(unix, windows))]
 fn base_and_outside(slug: &str) -> (BuildOutputDir, PathBuf, PathBuf) {
   let owned = BuildOutputDir::new(slug);
   let base = owned.0.join("base");
@@ -482,17 +508,17 @@ fn base_and_outside(slug: &str) -> (BuildOutputDir, PathBuf, PathBuf) {
   (owned, base, outside)
 }
 
-/// AUD-29-62 (root swapped). Do: open a base, then move the base away and put a junction to a directory
+/// AUD-29-62 (root swapped; junction on Windows, symbolic link on Unix since 2026-10-06). Do: open a base, then move the base away and put a junction to a directory
 /// outside it at the base's path; list the root, read a file through it, open its subdirectory. Expect: the
 /// retained root keeps naming the directory it opened — the moved base's entries and bytes, never the
 /// outside directory's.
-#[cfg(windows)]
+#[cfg(any(unix, windows))]
 #[test]
 fn a_retained_root_keeps_naming_the_base_after_its_path_becomes_a_junction() {
   let (owned, base, outside) = base_and_outside("contain-root");
   let (mut host, root) = OsHost::open_root(&base).unwrap();
   std::fs::rename(&base, owned.0.join("base-moved")).unwrap();
-  junction(&base, &outside);
+  link_dir(&base, &outside);
   assert_eq!(listed(&mut host, root), ["f.txt", "sub"]);
   assert_eq!(read_named(&mut host, root, "f.txt"), INSIDE);
   let sub = host.open_dir(root, "sub").unwrap();
@@ -508,14 +534,14 @@ fn a_retained_root_keeps_naming_the_base_after_its_path_becomes_a_junction() {
 /// the fresh lookup finds a link — refused as a directory and as a file, listed as a link, its target read
 /// — and nothing returns the outside bytes. Before, each access re-resolved `base\sub` as a path and
 /// followed the junction.
-#[cfg(windows)]
+#[cfg(any(unix, windows))]
 #[test]
 fn an_intermediate_swapped_for_a_junction_is_never_traversed() {
   let (_owned, base, outside) = base_and_outside("contain-mid");
   let (mut host, root) = OsHost::open_root(&base).unwrap();
   let sub = host.open_dir(root, "sub").unwrap();
   std::fs::rename(base.join("sub"), base.join("sub-moved")).unwrap();
-  junction(&base.join("sub"), &outside);
+  link_dir(&base.join("sub"), &outside);
   assert_eq!(listed(&mut host, sub), ["inner.txt"]);
   assert_eq!(read_named(&mut host, sub, "inner.txt"), INSIDE);
   assert_eq!(host.open_dir(root, "sub"), Err(HostError::NotDirectory));
@@ -544,16 +570,14 @@ fn an_intermediate_swapped_for_a_junction_is_never_traversed() {
 /// up again. Expect: the old handle keeps its object's bytes (the reviewed drift semantics: an open
 /// authorized inode reads as it was); the fresh lookup is refused as a file and listed as a link. Creating a
 /// file symbolic link needs a privilege or developer mode; without one the link half skips, saying so.
-#[cfg(windows)]
+#[cfg(any(unix, windows))]
 #[test]
 fn a_final_component_swapped_for_a_link_is_refused_and_an_open_file_keeps_its_bytes() {
   let (_owned, base, outside) = base_and_outside("contain-final");
   let (mut host, root) = OsHost::open_root(&base).unwrap();
   let before = host.open_file(root, "f.txt").unwrap();
   std::fs::rename(base.join("f.txt"), base.join("f-moved.txt")).unwrap();
-  if let Err(refused) =
-    std::os::windows::fs::symlink_file(outside.join("f.txt"), base.join("f.txt"))
-  {
+  if let Err(refused) = link_file(&outside.join("f.txt"), &base.join("f.txt")) {
     eprintln!("SKIP the link half: creating a file symbolic link was refused here ({refused})");
     assert_eq!(read_whole(&mut host, before, 64), INSIDE);
     return;
