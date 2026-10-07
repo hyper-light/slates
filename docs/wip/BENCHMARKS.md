@@ -2941,3 +2941,13 @@ kernel mount `slates mount` makes (scratchpad `ab.sh`, `ab-work.py`: 500 files o
 Medians are even (open+read+close perhaps 1 µs dearer: the discard is one more call). The 256 KiB write's p99 is
 tighter with the change, likely because each connection's buffers now hold two whole records where the default was
 128 KiB. The held unlink p99 of 641 µs did not repeat in three more rounds.
+
+**The anchor waits on the daemon's exit (same day).** The anchor's loop, since A-113, polled only its hold channel
+with a 100 ms pause as the timeout, so it learned of a dead daemon up to a whole pause late. It now polls the
+daemon's exit too: a pidfd on Linux, a kqueue `NOTE_EXIT` on macOS (`slates_ipc::exit_watch`).
+- macOS, `nfs_held` (six kills inside write bursts), the longest kill-to-answer: 122.7–128.7 ms before, 54.7–55.3 ms
+  after, in three runs each.
+- Linux, Docker, the npm install with kills (scratchpad `install.sh`; lodash, express, typescript, webpack,
+  @babel/core, eslint; 7,419 files): 4.5 s with no kills; 8.3 s with 12 kills before (about 320 ms a kill); 4.7 s with
+  7 kills after (about 30 ms a kill). Every run: `npm ls` clean, and pip's RECORD hashes for 3,606 files intact under
+  10–11 kills.

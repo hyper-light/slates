@@ -27,28 +27,61 @@ fn observation_pause() -> Duration {
   Duration::from_nanos(HEARTBEAT_NS)
 }
 
-/// Waits out one observation pause, or less when a daemon sends a hold (A-113): the hold channel is polled with the
-/// pause as the timeout, so a hold is taken as it arrives, and a daemon whose send waits on a full channel waits only
-/// for the anchor to wake, not for its next turn. A signal ends the wait early, as it ended the park.
+/// The exit watch on the daemon the anchor runs now, rebuilt when the pid changes (a restart).
 #[cfg(unix)]
-fn await_observation(supervisor: &Supervisor) {
-  let Some(channel) = supervisor.hold_channel() else {
+#[derive(Default)]
+struct DaemonWatch {
+  watched: Option<(u32, slates_ipc::exit_watch::ExitWatch)>,
+}
+
+#[cfg(unix)]
+impl DaemonWatch {
+  /// The watch on `pid`, taken now if the daemon changed since the last call; `None` without a daemon or a watch.
+  fn on(&mut self, pid: Option<u32>) -> Option<&slates_ipc::exit_watch::ExitWatch> {
+    let pid = pid?;
+    if self.watched.as_ref().map(|(watched, _)| *watched) != Some(pid) {
+      self.watched = slates_ipc::exit_watch::ExitWatch::on(pid)
+        .ok()
+        .map(|watch| (pid, watch));
+    }
+    self.watched.as_ref().map(|(_, watch)| watch)
+  }
+}
+
+/// Waits out one observation pause, or less: when a daemon sends a hold (A-113), or when the daemon exits. Both
+/// descriptors are polled with the pause as the timeout, so a hold is taken as it arrives and a dead daemon is
+/// restarted the moment it dies — a kill cost up to a whole pause (100 ms) of detection before its restart could begin,
+/// time every kernel client of a held mount waited. A signal ends the wait early, as it ended the park.
+#[cfg(unix)]
+fn await_observation(supervisor: &Supervisor, watch: &mut DaemonWatch) {
+  use std::os::fd::BorrowedFd;
+  let exit = watch
+    .on(supervisor.child_pid())
+    .and_then(|watch| watch.readiness());
+  let descriptors: Vec<BorrowedFd<'_>> =
+    supervisor.hold_channel().into_iter().chain(exit).collect();
+  if descriptors.is_empty() {
     std::thread::park_timeout(observation_pause());
     return;
-  };
-  let mut interest = [rustix::event::PollFd::new(
-    &channel,
-    rustix::event::PollFlags::IN,
-  )];
+  }
+  let mut interest: Vec<rustix::event::PollFd<'_>> = descriptors
+    .iter()
+    .map(|fd| rustix::event::PollFd::new(fd, rustix::event::PollFlags::IN))
+    .collect();
   let timeout = rustix::event::Timespec::try_from(observation_pause()).ok();
   // Readable, timed out or interrupted, the loop's next turn drains the channel and observes the daemon; an error
   // here only shortens the wait.
   let _ = rustix::event::poll(&mut interest, timeout.as_ref());
 }
 
+/// See the Unix arm: off Unix the anchor parks for its pause.
+#[cfg(not(unix))]
+#[derive(Default)]
+struct DaemonWatch;
+
 /// See the Unix arm: no hold channel off Unix.
 #[cfg(not(unix))]
-fn await_observation(_supervisor: &Supervisor) {
+fn await_observation(_supervisor: &Supervisor, _watch: &mut DaemonWatch) {
   std::thread::park_timeout(observation_pause());
 }
 
@@ -283,6 +316,7 @@ fn observe(
   let mut starting_since = Some(started);
   let mut longest_start_ns = 0u64;
   let mut watch = Watch::default();
+  let mut daemon_watch = DaemonWatch::default();
   loop {
     if signal::stop_requested() {
       stop_gracefully(supervisor, clock)?;
@@ -323,7 +357,7 @@ fn observe(
           }
           None => {}
         }
-        await_observation(supervisor);
+        await_observation(supervisor, &mut daemon_watch);
       }
       slates_anchor::Step::Restarted {
         exit_code,

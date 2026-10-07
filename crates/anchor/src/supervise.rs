@@ -556,6 +556,12 @@ impl Supervisor {
     self.child.is_some()
   }
 
+  /// The running daemon's pid, if one runs: what the owner watches for its exit, so a death is restarted as it happens
+  /// rather than at the next observation.
+  pub fn child_pid(&self) -> Option<u32> {
+    self.child.as_ref().map(std::process::Child::id)
+  }
+
   /// The policy.
   pub fn policy(&self) -> RestartPolicy {
     self.policy
