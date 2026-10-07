@@ -10094,3 +10094,38 @@ Status: built 2026-10-06 (Linux 6.11+; older kernels answer `EOPNOTSUPP` themsel
   - In the owner-turn test, the `LINK` of the tmpfile waited for its barrier.
 - A harness note: Python's `os.link` passed no `AT_SYMLINK_FOLLOW` here, so it linked the `/proc` magic link itself,
   and the kernel's `EXDEV` for that was right. A caller must pass the flag, as open(2) documents.
+
+### A-112 — Remote attach reads are authorized by owner-issued capabilities (2026-10-06)
+Applied in the same change to: GAPS (condition 7's remote-attach plan).
+
+Status: designed 2026-10-06; built piece by piece, each with its own record.
+- What it answers: §4.10's remote attach has B fetch a snapshot's manifest and chunks "from the recorded holders".
+  The holders answer only hosts with authority over the object (AUD-29-45: the acting owner, its candidates, the
+  recovery cohorts). A reader on a node that is none of those is refused, and must be. Reading content is not a right
+  of being a member.
+- The rule: the acting owner A decides, and the holders check.
+  1. B routes the id to A by rendezvous over the regional configuration (D-14, no catalog) and sends a
+     remote-attach request naming the principal, the volume and the snapshot.
+  2. A checks the principal's read right on the volume (§4.13 shares), and its own lease (§4.8 "reads under the
+     lease").
+  3. A answers the head (sequence, manifest identity, recorded holders) and one capability per recorded holder H:
+     `MAC_{K(A,H)}("slates-read-capability" ‖ object ‖ manifest ‖ reader B ‖ expiry)`. `K(A,H)` is the pair key A's
+     owner shard keeps with candidate H (A-92 piece 4b), and the expiry is A's lease term.
+  4. B presents the capability with each `Fetch` and `FetchChunk` to H. H recomputes it under its copy of `K(A,H)`
+     and serves only that manifest, only to B, only before the expiry. Every other request is answered exactly as an
+     unauthorized one is today: the same empty reply, counted.
+- Why this shape: it is the NASD capability (Gibson et al., "A Cost-Effective, High-Bandwidth Storage
+  Architecture", ASPLOS 1998). The file manager issues a capability MAC'd under a key it shares with the drive; the
+  drive checks it without consulting the manager. Data servers verify per request against a secret shared with the
+  manager, not by asking it, which is also the stance of NFSv4.1 pNFS layouts (RFC 8881 §12: the metadata server
+  grants a client access to the data servers).
+  - Holders check without a round trip to A, so a remote read's latency is one hedged fetch (AC-8.4).
+  - A capability names one manifest and one reader, so it reveals nothing about other objects (AUD-29-45's scope
+    holds).
+  - The expiry is the lease, so a revoked share stops new fetches within one term.
+- Rejected:
+  - Proxying every fetch through A: it loses the hedging across holders that condition 7 needs under contention,
+    and loads the owner.
+  - Adding B to the object's recorded readers in the head: that grows replicated state per reader, unbounded.
+  - Public-key signatures per capability: verifying is costlier than a MAC under a key that already exists for
+    this pair.
