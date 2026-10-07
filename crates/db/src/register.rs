@@ -1445,6 +1445,12 @@ impl Acceptor {
     self.authority.owner
   }
 
+  /// The configuration generation this acceptor serves under: what a recovery image keeps with its records, so a
+  /// restarted holder refuses and accepts as it did before.
+  pub fn generation(&self) -> u64 {
+    self.authority.generation
+  }
+
   /// Raises this holder's fence for the object to at least `epoch` (§4.8 "Promotion and takeover": "every
   /// holder raises its fence for that host to the new epoch"). When the configuration group bumps a failed
   /// host's fencing epoch, a holder installing that configuration raises the fence for the objects that host

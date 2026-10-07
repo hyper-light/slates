@@ -8238,6 +8238,10 @@ Applied in the same change to: §4.8 "Recovery", the §4.10 status (AUD-29-43/59
 - Evidence: `an_acknowledged_replica_survives_a_warm_daemon_restart` (red: held before the restart, not
   after; green), and the ownership oracle now recovers every generated hold from its image and finds the
   same hold, imaged byte-identically.
+- Correction (2026-10-07): the "Why" above was wrong about records. Held register records and their fences did
+  not survive a warm restart: no code restored an `Acceptor`. They now ride the same held image and the same
+  publish-before-reply (`docs/bugs/2026-10-07-a-warm-restart-dropped-held-register-records.md`; regression
+  `an_acknowledged_held_record_survives_a_warm_daemon_restart`).
 - What it does not change: a whole-anchor loss (the RAM-fault case) still empties the hold; publishing
   re-images the shard on every acknowledged mutation, the incremental publish owed in
   `docs/wip/recovery.md` now owed for the hold too.

@@ -117,6 +117,19 @@ pub enum SegmentSource {
   },
 }
 
+/// A held register record as a holder keeps it ([`Daemon::fleet_held_record`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HeldRecordView {
+  /// The record's position.
+  pub sequence: u64,
+  /// The epoch it was written under.
+  pub epoch: u64,
+  /// Its value.
+  pub value: Vec<u8>,
+  /// The epoch the holder's fence for the object has seen.
+  pub fence: u64,
+}
+
 /// The daemon.
 pub struct Daemon {
   runtime: Option<Runtime>,
@@ -1835,6 +1848,48 @@ impl Daemon {
     self.observe(self.shards.first().copied(), move |s| {
       let local = s.fleet.host();
       crate::content_holder::serve(s, local, &request, |_, _, _, _, _| true)
+    })
+  }
+
+  /// Test support: holds `record` from `owner` on this node as a holder whose authority check passed — the
+  /// production acceptance (`crate::fleet::hold_checked_record`) and whatever stands behind its acknowledgement —
+  /// and returns the reply bytes. A test places a held record on a daemon with no fleet peer through it, to observe
+  /// what the holder keeps across a restart. The record is written under the holder's installed configuration
+  /// version, as an authorized owner's would be.
+  pub fn hold_record_as_authorized(
+    &self,
+    owner: slates_db::register::HostId,
+    record: slates_db::register::Record,
+  ) -> Result<Vec<u8>, ObserveError> {
+    self.observe(self.shards.first().copied(), move |s| {
+      let local = s.fleet.host();
+      let record = slates_db::register::Record {
+        generation: s.fleet.configuration().version,
+        ..record
+      };
+      crate::fleet::hold_checked_record(s, local, owner, &record)
+    })
+  }
+
+  /// The newest record this node holds of `object` as a holder, with the epoch its fence has seen: what a takeover's
+  /// phase one would read from it.
+  pub fn fleet_held_record(
+    &self,
+    object: slates_db::register::ObjectId,
+  ) -> Result<Option<HeldRecordView>, ObserveError> {
+    self.observe(self.shards.first().copied(), move |s| {
+      let acceptor = s.holder_records.get(&object)?;
+      let (promised, accepted) = acceptor.persisted();
+      accepted
+        .into_iter()
+        .filter(|(held, _, _, _)| *held == object)
+        .max_by_key(|(_, sequence, _, _)| *sequence)
+        .map(|(_, sequence, epoch, value)| HeldRecordView {
+          sequence,
+          epoch: epoch.0,
+          value,
+          fence: promised.0,
+        })
     })
   }
 

@@ -1549,6 +1549,21 @@ pub(crate) fn accept_held_record(
   if let Err(error) = check_held_record(state, local, peer_host, record) {
     return encode_refusal(&error);
   }
+  hold_checked_record(state, local, peer_host, record)
+}
+
+/// The status count of held records accepted but not acknowledged because the shard's publish carrying them was
+/// refused (§4.8 persistence before reply). Format: a refusal name in the daemon's status report.
+const RECORD_UNPUBLISHED: &str = "fleet.record.unpublished";
+
+/// Holds `record` from `peer_host` once its authority was checked ([`check_held_record`]): the acceptance into this
+/// holder's register for the object, the routing it learns, and the acknowledgement or the refusal's reply.
+pub(crate) fn hold_checked_record(
+  state: &mut ShardState,
+  local: HostId,
+  peer_host: HostId,
+  record: &Record,
+) -> Vec<u8> {
   let generation = state.fleet.configuration().version;
   let accepted = match state.holder_records.get_mut(&record.object) {
     Some(acceptor) => acceptor.accept(record),
@@ -1588,6 +1603,13 @@ pub(crate) fn accept_held_record(
       {
         Ok(()) => {
           after_held_record(state, record);
+          // The acknowledgement stands behind the shard's publish (§4.8 persistence before reply): a warm restart
+          // keeps this node's member id, so a record it acknowledged must be held again after it. A refused
+          // publish answers no acknowledgement, and the record rides the next publish that commits.
+          if crate::verbs::publish_shard(state).is_err() {
+            state.count(RECORD_UNPUBLISHED, 1);
+            return Vec::new();
+          }
           ack.encode()
         }
         Err(error) => encode_refusal(&error),

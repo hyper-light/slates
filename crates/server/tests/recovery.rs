@@ -923,6 +923,64 @@ fn an_acknowledged_replica_survives_a_warm_daemon_restart() {
   );
 }
 
+/// §4.8 "persistence before reply" for register records (Vertical Paxos II's acceptor; Raft Figure 2: persistent
+/// state is updated before responding): a holder acknowledges a record only once anchor-owned RAM retains it, so a
+/// warm restart, which keeps the node's member id, keeps every record it acknowledged and the epoch its fence saw.
+/// Found 2026-10-07: no code restored a held record (`Acceptor::recovered` was never called), so a restarted holder
+/// came back under the same id holding nothing, and its takeover promise would count toward `f + 1` without the
+/// record it had acknowledged. Do: hold a head record on a daemon through the holder's production path, stop it, and
+/// start a second daemon over the same anchor segment. Expect: the record acknowledged, then held after the
+/// restart with its value and the fence's epoch.
+#[test]
+fn an_acknowledged_held_record_survives_a_warm_daemon_restart() {
+  use slates_db::register::{HostEpoch, HostId, ObjectId, Record};
+
+  let profile = common::machine_profile();
+  let instance = format!("srv-record-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
+  let segment = anchor_segment("record", &profile, &config);
+  let first = Daemon::start(&profile, config.clone(), source_of(&segment)).unwrap();
+  first
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  // The owner must be a member of the holder's council; a solo daemon's only member is itself.
+  let owner = first.member_identity().unwrap();
+  let object = ObjectId::new(HostId(owner.0), 3);
+  let record = Record {
+    owner,
+    object,
+    sequence: 4,
+    epoch: HostEpoch(2),
+    generation: 0,
+    value: b"a head".to_vec(),
+  };
+  let reply = first
+    .hold_record_as_authorized(owner, record.clone())
+    .unwrap();
+  let held_before = first.fleet_held_record(object);
+  first.stop();
+
+  let second = Daemon::start(&profile, config, source_of(&segment)).unwrap();
+  let held_after = second.fleet_held_record(object);
+  let owner_after = second.member_identity();
+  second.stop();
+  drop(segment);
+  assert!(!reply.is_empty(), "the holder acknowledged the record");
+  assert_eq!(
+    owner_after,
+    Ok(owner),
+    "a warm restart keeps the member id, so the holder's promises still count for its records"
+  );
+  assert!(
+    matches!(&held_before, Ok(Some(held)) if held.sequence == 4 && held.epoch == 2 && held.value == record.value),
+    "the record was held before the restart: {held_before:?}"
+  );
+  assert_eq!(
+    held_after, held_before,
+    "the acknowledged record and its fence are held after a warm restart"
+  );
+}
+
 // -------------------------------------------- crash injection at every durable step (AC-2.3, AC-2.12)
 //
 // A scenario of single-transaction steps, so each crash point is a real state a kill can leave. Two

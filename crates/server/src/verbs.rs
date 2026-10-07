@@ -7442,6 +7442,9 @@ pub struct Rebuilt {
   /// Whether the image's held replicas could not be recovered (logged with the reason; a health
   /// signal): the hold starts empty and the healer refills it, but those acknowledgements were not kept.
   pub replicas_refused: bool,
+  /// Register records this shard held for other owners, rebuilt with their fences (§4.8 persistence before reply):
+  /// a warm restart keeps the member id, so every record it acknowledged must be held again.
+  pub records: usize,
 }
 
 /// Rebuilds the recovered catalog's volumes into live state after a daemon start over a segment
@@ -7491,8 +7494,24 @@ pub fn rebuild_recovered(state: &mut ShardState) -> Rebuilt {
   let claims = claim_images(state, &images);
   // The held replicas' blocks too (A-64), then every claim is committed: the recovered image names them all, so none
   // is reused before this daemon's first publication commits.
-  let held_claims =
-    slates_cluster::content::ContentHold::claim_image(state.store.content.arena_mut(), &held);
+  // The held image carries the content hold and the held registers (§4.8 persistence before reply): split, the
+  // content claimed and rebuilt below, the registers rebuilt with their fences once the hold is.
+  let held = match crate::content_holder::split_held(&held) {
+    Ok(held) => Some(held),
+    Err(e) => {
+      eprintln!(
+        "slates-server: partition {}: held image refused: {e:?}",
+        state.partition
+      );
+      rebuilt.replicas_refused = true;
+      None
+    }
+  };
+  let held_content = held.as_ref().map_or(&[][..], |held| &held.content[..]);
+  let held_claims = slates_cluster::content::ContentHold::claim_image(
+    state.store.content.arena_mut(),
+    held_content,
+  );
   state.store.content.arena_mut().commit_live();
   let recovered_hold = held_claims.and_then(|claimed| {
     slates_cluster::content::ContentHold::from_claimed(
@@ -7512,6 +7531,10 @@ pub fn rebuild_recovered(state: &mut ShardState) -> Rebuilt {
       );
       rebuilt.replicas_refused = true;
     }
+  }
+  if let Some(held) = held {
+    let local = state.fleet.host();
+    rebuilt.records = crate::content_holder::restore_held_registers(state, local, held);
   }
   let mut max_prefix = state.next_prefix;
   // Greens first, so a work can seed from a rebuilt green (§4.16): a green's merge chain is replayed
@@ -8125,7 +8148,7 @@ fn publish_checkpoint(state: &mut ShardState) -> Result<Published, slates_vfs::V
   }
   // The replicas this shard holds for other owners ride the same image (AUD-29-59): a holder acknowledges a
   // content put only once a publish carrying it commits.
-  let held = state.held_content.to_image();
+  let held = crate::content_holder::held_image(state);
   let mut replies = pending_replies(state);
   // A volume that cannot be captured restarts the checkpoint without it: the image's bytes before it may already be
   // in the slot, and the slot commits only when its header is written last, so the abandoned stream commits nothing.
@@ -8322,7 +8345,7 @@ fn publish_delta_into(
     .filter(|key| !present.contains(*key))
     .copied()
     .collect();
-  let held = state.held_content.to_image();
+  let held = crate::content_holder::held_image(state);
   let held_changed = held != state.published_held;
   slates_vfs::checkpoint_log::ShardDelta::encode_finish(
     encoded,

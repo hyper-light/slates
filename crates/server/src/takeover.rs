@@ -272,8 +272,21 @@ pub(crate) fn serve_host_prepare(
     *count = count.saturating_add(1);
     return Vec::new();
   }
-  list_page(state, local, &prepare).encode()
+  let page = list_page(state, local, &prepare);
+  // The promise stands behind the shard's publish (§4.8 persistence before reply): the page raised each listed
+  // object's fence and installed the asker's authority, and a warm restart keeps this node's member id, so that
+  // fence must hold after it. A refused publish promises nothing; the asker asks again.
+  if crate::verbs::publish_shard(state).is_err() {
+    let count = state.refusals.entry(PROMISE_UNPUBLISHED).or_insert(0);
+    *count = count.saturating_add(1);
+    return Vec::new();
+  }
+  page.encode()
 }
+
+/// The status count of takeover promises not answered because the shard's publish carrying their raised fences was
+/// refused (§4.8 persistence before reply). Format: a refusal name in the daemon's status report.
+const PROMISE_UNPUBLISHED: &str = "takeover.promise_unpublished";
 
 /// Whether this node may promise `departed`'s objects now (§4.8 "Leases and reads", AUD-08): it has not answered
 /// the retired owner's probes for the membership horizon, or the owner has announced the configuration that

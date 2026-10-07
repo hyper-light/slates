@@ -4327,3 +4327,10 @@ never acknowledged grew a shard's records, and every snapshot encoding them, wit
 made a daemon miss a 5 s deadline after 24 minutes of unacknowledged polling. Each shard now holds at most
 `2 × slots` per client and refuses a new request `AcknowledgementOwed` past it
 (`docs/bugs/2026-10-07-a-client-that-never-acknowledged-grew-its-completion-records-without-bound.md`).
+
+### 2026-10-07: held register records survive a warm restart (§4.8 persistence before reply)
+
+A warm restart keeps the member id but dropped every held register record and fence: a takeover could count a
+restarted holder's empty promise and lose a committed head. A-51's statement that records survived was wrong. Records
+and fences now ride the held image and are published before the acknowledgement and before a promise
+(`docs/bugs/2026-10-07-a-warm-restart-dropped-held-register-records.md`).
