@@ -3075,6 +3075,7 @@ rounds. `cargo run --release -p slates-vfs --example create_heap` (50,000 files,
 | The checkpoint streamed into its slot | 1,024 B | 30.9 | 0.003 |
 | Inode images and publications encoded from the store, never built | 1,024 B | 13.05 | 0.003 |
 | Attribute table sized to its entries; a write's epoch view inline; a create in a current directory records nothing | 936 B | 8.05 | 0.003 |
+| `BaseBody`'s never-read `descriptor` removed: `Inode` 184 → 168 B | 904 B | 8.05 | 0.003 |
 
 **Encoded from the store (later again).** A checkpoint built an `InodeImage` per inode and a delta one per changed
 inode, plus a `String` per entry, each copying the inline body, the attribute names and the entry names only to encode
@@ -3094,6 +3095,13 @@ reserved four (96). `content_by_epoch` returns an inline view for a body of one 
 for every body was two allocations per write, the attribute's value write included. `need_current_dir` records only
 a directory it counts, so a create in a current directory allocates nothing there. Per phase: create 430.6 B and 2.0
 allocations, the write 128.7 B and 1.0 (its inline body), the attribute 373.8 B (was 461.8) and 5.0 (was 7.0).
+
+`BaseBody.descriptor` was written `None` at every construction and never read (held descriptors live in the base
+plane's `descriptors` map), yet its `Option<u64>` made every inode's `Body` 64 bytes: removed, `Body` 48 and `Inode`
+168. `tree_heap` (real trees, heap bytes per entry): npm 316 → 300, pip 352 → 336, cargo 402 → 386. Measured and not
+taken: `Body` reaches 32 bytes only with `lost` packed into `base_len`'s top bit (a rustc layout probe: 40 with a
+lazily boxed `pinned` alone), which every length write would then have to refuse at 2^63; 8 bytes an inode does not
+buy that risk to the overlay's sizes.
 
 Per phase after the streaming: create 430.6 B and 3.0 allocations, the 100-byte write 128.7 B and 3.0, the provenance attribute
 461.8 B and 7.0, a delta 0 B and 9.0, a checkpoint 2.6 B (was 398.9) and 8.9. Tests:

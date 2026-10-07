@@ -72,8 +72,6 @@ pub struct BaseBody {
   pub pinned: Vec<Extent>,
   /// Length as the base holds it (or held it at the witness).
   pub base_len: u64,
-  /// The base plane's descriptor token for the file, if one is held.
-  pub descriptor: Option<u64>,
   /// Set when a drift check failed: reads of unpinned ranges refuse with `BaseDrift`.
   pub lost: bool,
 }

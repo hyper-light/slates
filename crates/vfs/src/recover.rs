@@ -2715,7 +2715,6 @@ fn file_body_from_image(claims: &Claims, body: &BodyImage, size: u64) -> Result<
       witness: witness.map(Box::new),
       pinned: extents_from_image(claims, pinned, size)?,
       base_len: *base_len,
-      descriptor: None,
       lost: *lost,
     })),
     BodyImage::Directory { .. } | BodyImage::Symlink { .. } => Err(VfsError::RecoveryIncomplete),
