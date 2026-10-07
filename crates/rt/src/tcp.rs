@@ -23,6 +23,124 @@ use crate::driver::refused;
 use crate::error::RtError;
 use crate::readiness::{readable, writable};
 
+/// What [`TcpStream::send_records`] did with a run of records.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Sent {
+  /// One send took the whole run.
+  Whole,
+  /// The kernel took part of the run, and this process sent the rest: the stream ended mid-record for a moment.
+  Completed,
+}
+
+/// Whether a stream's sends of up to its record bound are whole ([`TcpStream::make_sends_whole`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WholeSends {
+  /// Every such send takes all of its bytes or none.
+  Guaranteed,
+  /// The kernel may take part of a send.
+  NotOffered,
+}
+
+/// The flags of a [`TcpStream::discard`]: Linux drops the bytes in the kernel; elsewhere they are copied out.
+#[cfg(target_os = "linux")]
+const DISCARD_FLAGS: rustix::net::RecvFlags = rustix::net::RecvFlags::TRUNC;
+/// See the Linux arm.
+#[cfg(not(target_os = "linux"))]
+const DISCARD_FLAGS: rustix::net::RecvFlags = rustix::net::RecvFlags::empty();
+
+/// Sets an integer socket option `rustix` does not wrap (`SO_RCVLOWAT`, `SO_SNDLOWAT`).
+fn set_int_option(
+  fd: &OwnedFd,
+  level: libc::c_int,
+  name: libc::c_int,
+  value: i32,
+) -> Result<(), rustix::io::Errno> {
+  let length = libc::socklen_t::try_from(size_of::<i32>()).unwrap_or(0);
+  // SAFETY: `fd` is a live socket this stream owns for the call; the value pointer names an `i32` on this frame that
+  // outlives the call, and the length passed is that `i32`'s size, so the kernel reads exactly the bytes it is given.
+  let result = unsafe {
+    libc::setsockopt(
+      fd.as_raw_fd(),
+      level,
+      name,
+      std::ptr::from_ref(&value).cast::<libc::c_void>(),
+      length,
+    )
+  };
+  if result == 0 {
+    Ok(())
+  } else {
+    Err(
+      rustix::io::Errno::from_io_error(&std::io::Error::last_os_error())
+        .unwrap_or(rustix::io::Errno::INVAL),
+    )
+  }
+}
+
+/// Format: the option naming the kernel's connection record and the established state's number in it: Linux
+/// `TCP_INFO` with `TCP_ESTABLISHED` (`include/net/tcp_states.h`, 1).
+#[cfg(target_os = "linux")]
+const TCP_STATE_OPTION: libc::c_int = libc::TCP_INFO;
+/// Format: Linux `TCP_ESTABLISHED` (`include/net/tcp_states.h`), the state byte of an established connection.
+#[cfg(target_os = "linux")]
+const TCP_ESTABLISHED: u8 = 1;
+/// Format: macOS `TCP_CONNECTION_INFO` with `TCPS_ESTABLISHED` (`<netinet/tcp_fsm.h>`, 4).
+#[cfg(not(target_os = "linux"))]
+const TCP_STATE_OPTION: libc::c_int = libc::TCP_CONNECTION_INFO;
+/// Format: macOS `TCPS_ESTABLISHED` (`<netinet/tcp_fsm.h>`), the state byte of an established connection.
+#[cfg(not(target_os = "linux"))]
+const TCP_ESTABLISHED: u8 = 4;
+
+/// The TCP state byte at the head of the kernel's connection record: both kernels copy out as much of the record as the
+/// caller's length asks, so one byte reads the state alone.
+fn tcp_state(fd: &OwnedFd) -> Result<u8, rustix::io::Errno> {
+  let mut state = 0u8;
+  let mut length = libc::socklen_t::try_from(size_of::<u8>()).unwrap_or(0);
+  // SAFETY: `fd` is a live socket this stream owns for the call; the buffer is one byte on this frame that outlives the
+  // call, `length` says so and is a `socklen_t` on this frame the kernel may lower, so it writes at most that byte.
+  let result = unsafe {
+    libc::getsockopt(
+      fd.as_raw_fd(),
+      libc::IPPROTO_TCP,
+      TCP_STATE_OPTION,
+      std::ptr::from_mut(&mut state).cast::<libc::c_void>(),
+      &raw mut length,
+    )
+  };
+  if result == 0 && length > 0 {
+    Ok(state)
+  } else {
+    Err(
+      rustix::io::Errno::from_io_error(&std::io::Error::last_os_error())
+        .unwrap_or(rustix::io::Errno::INVAL),
+    )
+  }
+}
+
+/// The BSD arm of [`TcpStream::make_sends_whole`]: the send buffer must hold the record, then the low-water mark is it.
+#[cfg(not(target_os = "linux"))]
+fn make_sends_whole(fd: &OwnedFd, record_bytes: usize) -> Result<WholeSends, RtError> {
+  let buffer = rustix::net::sockopt::socket_send_buffer_size(fd)
+    .map_err(|e| refused("getsockopt(SO_SNDBUF)", e))?;
+  if buffer < record_bytes {
+    return Err(refused(
+      "setsockopt(SO_SNDLOWAT)",
+      rustix::io::Errno::NOBUFS,
+    ));
+  }
+  let value = i32::try_from(record_bytes)
+    .map_err(|_| refused("setsockopt(SO_SNDLOWAT)", rustix::io::Errno::RANGE))?;
+  set_int_option(fd, libc::SOL_SOCKET, libc::SO_SNDLOWAT, value)
+    .map_err(|e| refused("setsockopt(SO_SNDLOWAT)", e))?;
+  Ok(WholeSends::Guaranteed)
+}
+
+/// The Linux arm of [`TcpStream::make_sends_whole`]: `SO_SNDLOWAT` is fixed (socket(7)), and a send copies what fits.
+#[cfg(target_os = "linux")]
+fn make_sends_whole(_fd: &OwnedFd, _record_bytes: usize) -> Result<WholeSends, RtError> {
+  Ok(WholeSends::NotOffered)
+}
+
 /// A listening TCP socket on the runtime: a non-blocking `rustix` socket whose `accept` awaits the
 /// shard's driver for the next connection.
 #[derive(Debug)]
@@ -188,6 +306,135 @@ impl TcpStream {
         Err(e) => return Err(refused("read", e)),
       }
     }
+  }
+
+  /// Awaits readability through the driver: bytes queued, at least as many as the receive low-water mark
+  /// ([`TcpStream::want_bytes`]; kqueue's read filter and Linux's `tcp_poll` both honour it), or end of stream. It
+  /// borrows no buffer, so a caller can await it and then [`TcpStream::peek_now`] into a buffer it holds only across
+  /// that synchronous call.
+  pub async fn wait_readable(&self) -> Result<(), RtError> {
+    readable(self.fd.as_raw_fd()).await
+  }
+
+  /// Copies the bytes at the head of the receive queue into `buf` without consuming them (`MSG_PEEK`), without
+  /// waiting: `Some(0)` at end of stream, `None` when nothing is queued. The bytes stay in the kernel until
+  /// [`TcpStream::discard`] consumes them, so a process that dies holding a peeked request leaves it for the next owner
+  /// of the descriptor (A-113).
+  pub fn peek_now(&self, buf: &mut [u8]) -> Result<Option<usize>, RtError> {
+    loop {
+      match rustix::net::recv(&self.fd, &mut *buf, rustix::net::RecvFlags::PEEK) {
+        Ok((n, _)) => return Ok(Some(n)),
+        Err(rustix::io::Errno::AGAIN) => return Ok(None),
+        Err(rustix::io::Errno::INTR) => continue,
+        Err(e) => return Err(refused("recv(MSG_PEEK)", e)),
+      }
+    }
+  }
+
+  /// Consumes `count` bytes from the head of the receive queue that a [`TcpStream::peek_now`] already saw, so they are
+  /// queued and the call never waits. Linux discards them in the kernel (`MSG_TRUNC` on a TCP socket, tcp(7)); elsewhere
+  /// they are copied into `scratch` and dropped. A queue holding fewer than `count` bytes is a typed refusal, never a
+  /// wait: the caller's view of the queue was wrong.
+  pub fn discard(&self, count: usize, scratch: &mut [u8]) -> Result<(), RtError> {
+    let mut left = count;
+    while left > 0 {
+      let take = left.min(scratch.len());
+      let into = scratch
+        .get_mut(..take)
+        .filter(|into| !into.is_empty())
+        .ok_or_else(|| refused("recv(discard)", rustix::io::Errno::INVAL))?;
+      match rustix::net::recv(&self.fd, into, DISCARD_FLAGS) {
+        Ok((0, _)) => return Err(refused("recv(discard)", rustix::io::Errno::PIPE)),
+        Ok((n, _)) => left = left.saturating_sub(n.min(take)),
+        Err(rustix::io::Errno::INTR) => continue,
+        Err(e) => return Err(refused("recv(discard)", e)),
+      }
+    }
+    Ok(())
+  }
+
+  /// Sends `records`, a run of whole RPC records, awaiting writability through the driver until the kernel takes them.
+  /// On a stream whose sends are whole ([`TcpStream::make_sends_whole`] answered [`WholeSends::Guaranteed`]) and a run
+  /// no longer than its record bound, one send takes all of it or nothing, so a process that dies here leaves the stream
+  /// at a record boundary (A-113). A short send is completed by this call and answered [`Sent::Completed`] so the caller
+  /// can count it: the stream crossed a moment when it ended mid-record.
+  pub async fn send_records(&self, records: &[u8]) -> Result<Sent, RtError> {
+    loop {
+      match rustix::io::write(&self.fd, records) {
+        Ok(0) if !records.is_empty() => return Err(refused("write", rustix::io::Errno::PIPE)),
+        Ok(n) if n >= records.len() => return Ok(Sent::Whole),
+        Ok(n) => {
+          self.write_all(records.get(n..).unwrap_or_default()).await?;
+          return Ok(Sent::Completed);
+        }
+        Err(rustix::io::Errno::AGAIN) => writable(self.fd.as_raw_fd()).await?,
+        Err(rustix::io::Errno::INTR) => continue,
+        Err(e) => return Err(refused("write", e)),
+      }
+    }
+  }
+
+  /// Sizes the stream's kernel buffers to hold `buffer_bytes` each way (`SO_SNDBUF`, `SO_RCVBUF`), refused unless the
+  /// kernel grants at least that much (it reports what it kept; Linux keeps double, for its bookkeeping). A buffer set
+  /// here is no longer auto-tuned.
+  pub fn reserve_buffers(&self, buffer_bytes: usize) -> Result<(), RtError> {
+    use rustix::net::sockopt;
+    sockopt::set_socket_send_buffer_size(&self.fd, buffer_bytes)
+      .map_err(|e| refused("setsockopt(SO_SNDBUF)", e))?;
+    sockopt::set_socket_recv_buffer_size(&self.fd, buffer_bytes)
+      .map_err(|e| refused("setsockopt(SO_RCVBUF)", e))?;
+    let send = sockopt::socket_send_buffer_size(&self.fd)
+      .map_err(|e| refused("getsockopt(SO_SNDBUF)", e))?;
+    let receive = sockopt::socket_recv_buffer_size(&self.fd)
+      .map_err(|e| refused("getsockopt(SO_RCVBUF)", e))?;
+    if send < buffer_bytes || receive < buffer_bytes {
+      return Err(refused(
+        "setsockopt(SO_SNDBUF/SO_RCVBUF)",
+        rustix::io::Errno::NOBUFS,
+      ));
+    }
+    Ok(())
+  }
+
+  /// Makes every send of at most `record_bytes` whole — all of it or none — where the kernel offers that, and says
+  /// whether it does. On macOS and the BSDs a non-blocking `sosend` refuses `EWOULDBLOCK`, copying nothing, while the
+  /// free space is below both the request and the send low-water mark, and allocates its buffers waiting rather than
+  /// failing midway (XNU `bsd/kern/uipc_socket.c` `sosend`, read 2026-10-06); with `SO_SNDLOWAT` at `record_bytes` a
+  /// send that size or smaller is whole. The kernel clamps the mark to the send buffer without saying so, so a buffer
+  /// smaller than `record_bytes` is refused here rather than trusted. Linux keeps `SO_SNDLOWAT` fixed (socket(7)) and
+  /// copies what fits, so it answers [`WholeSends::NotOffered`].
+  pub fn make_sends_whole(&self, record_bytes: usize) -> Result<WholeSends, RtError> {
+    make_sends_whole(&self.fd, record_bytes)
+  }
+
+  /// Sets the receive low-water mark (`SO_RCVLOWAT`): readability is reported once `bytes` are queued (or at end of
+  /// stream), so a reader waiting for a whole record is woken once, not for every segment of it.
+  pub fn want_bytes(&self, bytes: usize) -> Result<(), RtError> {
+    let value = i32::try_from(bytes.max(1)).unwrap_or(i32::MAX);
+    set_int_option(&self.fd, libc::SOL_SOCKET, libc::SO_RCVLOWAT, value)
+      .map_err(|e| refused("setsockopt(SO_RCVLOWAT)", e))
+  }
+
+  /// Whether the connection has left the established state — the peer closed its half (its FIN arrived: close-wait) or
+  /// the connection is gone. A reader that peeks and never consumes an unfinished record cannot learn of the peer's close
+  /// from a zero-length read, since the unfinished bytes stay queued; it asks this once readability says something
+  /// changed (A-113). This process never half-closes a stream it still reads, so every other state means the peer is
+  /// done. Read from the kernel's own connection record (Linux `TCP_INFO`, macOS `TCP_CONNECTION_INFO`), whose first byte
+  /// is the TCP state.
+  pub fn peer_closed(&self) -> Result<bool, RtError> {
+    let state = tcp_state(&self.fd).map_err(|e| refused("getsockopt(TCP state)", e))?;
+    Ok(state != TCP_ESTABLISHED)
+  }
+
+  /// Ends both directions of the connection (`shutdown(SHUT_RDWR)`), whoever else holds a copy of its descriptor: a
+  /// close drops only this process's copy, and the connection lives while another process (the anchor) holds one.
+  pub fn shutdown(&self) -> Result<(), RtError> {
+    rustix::net::shutdown(&self.fd, rustix::net::Shutdown::Both).map_err(|e| refused("shutdown", e))
+  }
+
+  /// The stream's descriptor, borrowed: to hand a duplicate to another process by `SCM_RIGHTS`.
+  pub fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+    std::os::fd::AsFd::as_fd(&self.fd)
   }
 
   /// Writes all of `buf`, awaiting writability through the driver whenever the send buffer is full,

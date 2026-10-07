@@ -2395,7 +2395,8 @@ impl<'b> Export<'b> {
       .bridge
       .readdir(dir_object, &cx, 0, request.cookie, request.rows_wanted())
       .map_err(|e| v4(nfsstat_of(&e)))?;
-    let budget = usize::try_from(request.maxcount).unwrap_or(usize::MAX);
+    // Capped at the transfer ceiling, as the v3 listing is (A-113); the session's response size bounds it too.
+    let budget = usize::try_from(request.maxcount.min(MAX_TRANSFER)).unwrap_or(0);
     let mut writer = XdrWriter::with_capacity(
       size_of::<u32>().saturating_add(budget.min(rows.len().saturating_mul(ENTRY_TYPICAL))),
     );
@@ -2430,12 +2431,16 @@ impl<'b> Export<'b> {
       .map_err(|_| Nfsstat3::Inval)?
       .try_into()
       .unwrap_or_default();
-    let budget = if plus {
+    let asked = if plus {
       let _dircount = args.u32().map_err(|_| Nfsstat3::Inval)?;
-      usize::try_from(args.u32().map_err(|_| Nfsstat3::Inval)?).unwrap_or(0)
+      args.u32().map_err(|_| Nfsstat3::Inval)?
     } else {
-      usize::try_from(args.u32().map_err(|_| Nfsstat3::Inval)?).unwrap_or(0)
+      args.u32().map_err(|_| Nfsstat3::Inval)?
     };
+    // The client's budget, capped at the transfer ceiling FSINFO advertises as `dtpref` (RFC 1813 §3.3.16: the server
+    // may return fewer entries than fit): every reply stays within `crate::rpc::MAX_MESSAGE`, the bound a held
+    // connection sends whole (A-113). Uncapped, a client asking 4 GiB got a page as large as the directory.
+    let budget = usize::try_from(asked.min(MAX_TRANSFER)).unwrap_or(0);
     let identity = self.resolve_handle(&dir_fh)?;
     let dir_node = self.attrs_of(&identity)?;
     let dir_attr = self.fattr3(&dir_node);

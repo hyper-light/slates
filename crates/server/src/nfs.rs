@@ -48,7 +48,11 @@
 //! the environment, and the daemon adopts it (`crate::daemon`'s `nfs_listener` over
 //! `slates_rt::tcp::TcpListener::from_fd` and `slates_anchor::ENV_NFS_LISTENER`) rather than binding a
 //! fresh ephemeral one, so the loopback
-//! port is stable across restarts; a standalone daemon (tests) still binds its own. Owed here (one
+//! port is stable across restarts; a standalone daemon (tests) still binds its own. **Every connection survives it
+//! too (A-113):** the anchor holds a duplicate of each from its accept, a request is consumed only once its reply is in
+//! the send queue, and replies leave in whole records, so a successor answers what the dead daemon left on the same
+//! socket and the kernel client never reconnects (on macOS its reconnect under repeated kills panicked the kernel,
+//! docs/bugs/2026-10-06-macos-nfs-client-panics-when-its-server-restarts.md; Linux does not hold connections yet). Owed here (one
 //! minor, situational refinement): the attribute-cache timeout from the measured loopback GETATTR RTT.
 //!
 //! **The data-plane barrier (§4.8, D-18).** A mutation served here changes the shard's volumes
@@ -85,7 +89,7 @@ use slates_bridge_nfs::procedures::{
   NFSPROC3_SYMLINK, NFSPROC3_WRITE, io_failure_reply, is_unstable, status_failure_reply,
   write_stable_how,
 };
-use slates_bridge_nfs::rpc::RecordReader;
+use slates_bridge_nfs::rpc::{MAX_MESSAGE, RecordReader};
 use slates_bridge_nfs::v4::compound::{self, Server as V4Server};
 use slates_bridge_nfs::v4::session::Limits;
 use slates_bridge_nfs::v4::session::{CallbackState, DepartedSession};
@@ -1104,22 +1108,31 @@ fn serve_root_listing(
 
 // ------------------------------------------------------------------------------------ the serve loop
 
-/// Serves NFS/MOUNT/portmap over `listener` on the current shard until the daemon stops: each
-/// connection becomes a detached task, so connections are concurrent. `port` answers a portmap
-/// `GETPORT`.
-pub async fn serve(listener: TcpListener, port: u16) {
+/// Serves NFS/MOUNT/portmap over `listener` on the current shard until the daemon stops: each connection is admitted
+/// ([`admit`]: its buffers sized, its sends made whole, and handed to the anchor to hold, A-113) and becomes a
+/// detached task, so connections are concurrent. `port` answers a portmap `GETPORT`; `bound` is the most connections
+/// the anchor holds ([`crate::config::DaemonConfig::held_connection_bound`]).
+pub async fn serve(listener: TcpListener, port: u16, bound: usize) {
   while let Ok(stream) = listener.accept().await {
-    match futures::spawn(serve_one(stream, port)) {
-      Ok(task) => {
-        let _ = futures::detach(task);
-      }
-      // The arena refused the connection's serve task: the connection is dropped (the kernel client
-      // reconnects) and the refusal counted, never silent (banned item 9).
-      Err(_) => {
-        crate::fleet::count_refusal(SERVE_SPAWN_REFUSED);
-      }
+    if let Some(connection) = admit(stream, port, bound) {
+      spawn_connection(connection);
     }
     futures::yield_now().await;
+  }
+}
+
+/// Serves `connection` as a detached task on this shard; a task the arena refuses ends the connection (the kernel
+/// client reconnects) and is counted, never silent (banned item 9).
+fn spawn_connection(connection: Connection) {
+  let ending = connection.ending();
+  match futures::spawn(serve_connection(connection)) {
+    Ok(task) => {
+      let _ = futures::detach(task);
+    }
+    Err(_) => {
+      crate::fleet::count_refusal(SERVE_SPAWN_REFUSED);
+      ending.release();
+    }
   }
 }
 
@@ -1829,107 +1842,508 @@ async fn reply_to(this: u16, mut call: Call, port: u16) -> Vec<u8> {
   .await
 }
 
-/// Serves one accepted connection: reads RPC records, routes each call, and writes the framed reply,
-/// until the client closes the connection. Owned request data (including the mounting user from the
-/// `AUTH_SYS` credential, §4.13) is taken out before the serve, so the read buffer is free to drain
-/// while a remote call awaits its owner.
-async fn serve_one(stream: TcpStream, port: u16) {
-  serve_connection(Connection {
-    stream,
-    buffer: Vec::new(),
-    records: RecordReader::default(),
-    pending: None,
-    port,
-    home: registry::current_shard().unwrap_or(0),
-    carry: None,
-  })
-  .await;
+// ------------------------------------------------------------------ a connection that outlives its daemon (A-113)
+
+/// Derived: the most wire bytes one record of a connection may span — the largest message ([`MAX_MESSAGE`]) and its
+/// one record marker. The kernel clients send each record as a single fragment (XNU `nfs_send`, Linux
+/// `xs_encode_stream_record_marker`); a peer whose record spans more than a connection's receive buffer is refused,
+/// since a request must sit whole in the kernel to be peeked.
+const RECORD_WIRE_BYTES: usize = MAX_MESSAGE + size_of::<u32>();
+
+/// Derived: each kernel buffer of a connection — two records: the one being served and the next arriving (receive),
+/// the one leaving and the next being built (send). A connection is served one call at a time, so a deeper queue adds
+/// no concurrency, only memory per connection; a shallower one could not hold a whole request beside its successor.
+const CONNECTION_BUFFER_BYTES: usize = 2 * RECORD_WIRE_BYTES;
+
+/// Counter: replies larger than a connection sends whole, answered `SYSTEM_ERR` instead (zero by construction: every
+/// reply is capped at [`MAX_MESSAGE`]; a non-zero count is a bug signal).
+const NFS_REPLY_PAST_BOUND: &str = "nfs.reply_past_bound";
+/// Counter: runs of replies the kernel took in more than one send — moments a connection ended mid-record (zero where
+/// sends are whole; a non-zero count on macOS is a bug signal).
+const NFS_SEND_COMPLETED: &str = "nfs.send_completed";
+/// The status refusal count of connections refused at admission: buffers the kernel would not size, a low-water mark
+/// it would not set, the hold bound reached, or a hold the anchor's channel would not carry. The client reconnects.
+pub(crate) const HOLD_REFUSED: &str = "nfs.connection_hold_refused";
+/// The status refusal count of connections ended because their stream was not a record stream, or carried a record
+/// larger than the connection's receive buffer.
+const STREAM_REFUSED: &str = "nfs.stream_refused";
+/// The status refusal count of connection releases the anchor's channel would not carry: the anchor keeps a copy of a
+/// connection this daemon ended until the next daemon finds it closed and releases it again.
+const RELEASE_LOST: &str = "nfs.connection_release_lost";
+
+/// Connections the anchor holds for this daemon, against [`crate::config::DaemonConfig::held_connection_bound`]:
+/// raised at a hold, lowered at a release, on whichever shard the connection then lives. A statistic-grade word touched
+/// once per connection's admission and end, never per request.
+static HELD_CONNECTIONS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+std::thread_local! {
+  /// This shard's stream buffer: the bytes a peek copies out of a connection's receive queue, and the sink of a
+  /// discard where the kernel cannot drop bytes itself. One per shard thread, borrowed only inside a synchronous call,
+  /// never across an await, so every connection the shard serves shares it.
+  static STREAM_BUFFER: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+  /// The last connection id this shard handed out ([`next_connection_id`]).
+  static LAST_CONNECTION_ID: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
-/// A connection's serving state, moved whole to the shard that owns the volume its calls name ([`migrate`]):
-/// the socket, the bytes read past the last parsed call, the record reader's partial record, and the call that
-/// named the other shard, served first there.
+/// A connection id unique across the anchor's life: the host's monotonic clock, which every daemon under one anchor
+/// shares and which never runs back (`slates_machine::clock`), made strictly increasing on this shard. Only the
+/// listener's shard hands ids out, and an id a dead daemon handed out is older than any reading after it.
+fn next_connection_id() -> u64 {
+  LAST_CONNECTION_ID.with(|last| {
+    let id = slates_machine::clock::monotonic_ns().max(last.get().saturating_add(1));
+    last.set(id);
+    id
+  })
+}
+
+/// What ends a connection the anchor holds: its id, if held. Ending one shuts it down (so the client sees it close
+/// though the anchor still holds a copy) and releases the anchor's copy.
+#[derive(Clone, Copy, Debug)]
+struct Ending {
+  held: Option<u64>,
+}
+
+impl Ending {
+  /// Releases the anchor's copy and the hold's place under the bound; without a hold, nothing.
+  fn release(self) {
+    let Some(connection) = self.held else {
+      return;
+    };
+    HELD_CONNECTIONS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    if matches!(
+      crate::anchor_hold::release_connection(connection),
+      Some(Err(_))
+    ) {
+      crate::fleet::count_refusal(RELEASE_LOST);
+    }
+  }
+}
+
+/// Admits an accepted connection (A-113): sizes its kernel buffers to [`CONNECTION_BUFFER_BYTES`] (a request must sit
+/// whole in the receive queue to be peeked), makes its sends of up to [`RECORD_WIRE_BYTES`] whole where the kernel
+/// offers that, and — under a supervising anchor that can hold it — hands the anchor a duplicate before its first
+/// request is read. A connection whose buffers or low-water mark the kernel refuses, or that the hold bound or the
+/// channel refuses, is shut down and counted ([`HOLD_REFUSED`]); the client reconnects. Where the kernel cannot make a
+/// send whole (Linux), a connection is served unheld: holding it would let a successor resume mid-record (GAPS, A-113).
+fn admit(stream: TcpStream, port: u16, bound: usize) -> Option<Connection> {
+  let refuse = |stream: &TcpStream| {
+    crate::fleet::count_refusal(HOLD_REFUSED);
+    let _ = stream.shutdown();
+  };
+  if stream.reserve_buffers(CONNECTION_BUFFER_BYTES).is_err() {
+    refuse(&stream);
+    return None;
+  }
+  let whole = match stream.make_sends_whole(RECORD_WIRE_BYTES) {
+    Ok(whole) => whole,
+    Err(_) => {
+      refuse(&stream);
+      return None;
+    }
+  };
+  let held = if whole == slates_rt::tcp::WholeSends::Guaranteed && crate::anchor_hold::anchored() {
+    let admitted = HELD_CONNECTIONS
+      .fetch_update(
+        std::sync::atomic::Ordering::Relaxed,
+        std::sync::atomic::Ordering::Relaxed,
+        |held| (held < bound).then_some(held.saturating_add(1)),
+      )
+      .is_ok();
+    if !admitted {
+      refuse(&stream);
+      return None;
+    }
+    let connection = next_connection_id();
+    if !matches!(
+      crate::anchor_hold::hold_connection(connection, stream.as_fd()),
+      Some(Ok(()))
+    ) {
+      HELD_CONNECTIONS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+      refuse(&stream);
+      return None;
+    }
+    Some(connection)
+  } else {
+    None
+  };
+  Some(Connection::new(stream, port, held))
+}
+
+/// Serves again the connections a dead daemon left (A-113), each handed back by the anchor
+/// ([`crate::anchor_hold::adopt`]): the socket and its buffers and low-water marks are as the dead daemon left them;
+/// every request it had not answered is still queued, since a request is consumed only after its reply's send. A
+/// connection that cannot be adopted is released, so the anchor closes the last copy and the client reconnects.
+pub(crate) fn adopt_held(
+  handed: Vec<crate::anchor_hold::HandedConnection>,
+  port: u16,
+  bound: usize,
+) {
+  for crate::anchor_hold::HandedConnection { connection, socket } in handed {
+    LAST_CONNECTION_ID.with(|last| last.set(last.get().max(connection)));
+    let ending = Ending {
+      held: Some(connection),
+    };
+    let previously = HELD_CONNECTIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let Ok(stream) = TcpStream::from_fd(socket) else {
+      crate::fleet::count_refusal(HOLD_REFUSED);
+      ending.release();
+      continue;
+    };
+    if previously >= bound {
+      // More were handed back than this daemon's bound allows (a smaller configuration than its predecessor's).
+      crate::fleet::count_refusal(HOLD_REFUSED);
+      let _ = stream.shutdown();
+      ending.release();
+      continue;
+    }
+    note(NFS_CONNECTIONS_ADOPTED);
+    spawn_connection(Connection::new(stream, port, Some(connection)));
+  }
+}
+
+/// Releases connections the anchor handed back that this daemon cannot serve (it has no listener): the anchor closes
+/// its copy, and with the daemon's dropped here the client sees the connection close and reconnects.
+pub(crate) fn release_handed(handed: Vec<crate::anchor_hold::HandedConnection>) {
+  for crate::anchor_hold::HandedConnection { connection, socket } in handed {
+    let _ = rustix::net::shutdown(&socket, rustix::net::Shutdown::Both);
+    drop(socket);
+    if matches!(
+      crate::anchor_hold::release_connection(connection),
+      Some(Err(_))
+    ) {
+      crate::fleet::count_refusal(RELEASE_LOST);
+    }
+  }
+}
+
+/// Counter: connections a dead daemon left that this daemon serves again (A-113).
+const NFS_CONNECTIONS_ADOPTED: &str = "nfs.connections_adopted";
+
+/// A connection's serving state, moved whole to the shard that owns the volume its calls name ([`migrate`]). The
+/// requests not yet answered live in the socket's receive queue, not here (A-113): each turn peeks them, and a request
+/// is consumed only once its reply is in the send queue, so the state a move carries — and a death loses — is no more
+/// than the socket.
 struct Connection {
   stream: TcpStream,
-  buffer: Vec<u8>,
-  records: RecordReader,
-  pending: Option<Call>,
   port: u16,
   /// The shard that accepted the connection: where its NFSv4 client table lives (A-76).
   home: u16,
   /// An NFSv4 session moving with the connection to the shard its volume lives on (A-76), taken in there.
   carry: Option<(SessionId, DepartedSession)>,
+  /// The connection's id while the anchor holds it.
+  held: Option<u64>,
+  /// The receive low-water mark last set, so it is set only when it changes (0: not known on this shard).
+  wanted: usize,
 }
 
-/// The serve loop of [`serve_one`], on whichever shard holds the connection now. A mount's calls name one
-/// volume, so the connection moves to that volume's owner shard at its first call there and is served locally
-/// from then on: a call forwarded over the bridge queue costs two cross-shard hops and two thread wakes, each
-/// of which a busy machine can delay by a scheduler quantum, and every call of a mount (six RPCs for one
-/// `rename(2)` from macOS) paid them (2026-10-04: every one of 185,745 calls was forwarded; their service p99
-/// was 115 µs at rest and 1.18 ms with a spinner per core, `crates/cli/examples/vfs_tails.rs`).
+impl Connection {
+  fn new(stream: TcpStream, port: u16, held: Option<u64>) -> Connection {
+    Connection {
+      stream,
+      port,
+      home: registry::current_shard().unwrap_or(0),
+      carry: None,
+      held,
+      wanted: 0,
+    }
+  }
+
+  /// What ends this connection, kept apart from it for the paths that lose the socket.
+  fn ending(&self) -> Ending {
+    Ending { held: self.held }
+  }
+
+  /// Ends the connection while this daemon lives: shuts it down, so the client sees it close although the anchor's copy
+  /// would keep it open, and releases the hold.
+  fn end(self) {
+    let _ = self.stream.shutdown();
+    self.ending().release();
+  }
+
+  /// Sets the receive low-water mark to `bytes` if it is not already that.
+  fn want(&mut self, bytes: usize) {
+    if self.wanted != bytes && self.stream.want_bytes(bytes).is_ok() {
+      self.wanted = bytes;
+    }
+  }
+}
+
+/// One record at the head of a connection's receive queue: its body, and the queue offset just past it (what a discard
+/// consumes to remove it and everything before it).
+struct Inbound {
+  body: Vec<u8>,
+  end: usize,
+}
+
+/// What a peek found at the head of a connection's receive queue.
+enum Head {
+  /// Whole records, in order.
+  Records(Vec<Inbound>),
+  /// No whole record: wait until this many bytes are queued.
+  Waiting(usize),
+  /// The client closed the connection.
+  Ended,
+  /// The bytes are not a record stream, or a record spans more than the buffer; the connection ends.
+  Refused,
+}
+
+/// Peeks the head of `stream`'s receive queue into this shard's stream buffer and reads the whole records there.
+fn peek_head(stream: &TcpStream) -> Head {
+  STREAM_BUFFER.with(|cell| {
+    let Ok(mut buffer) = cell.try_borrow_mut() else {
+      // Never borrowed across an await, so never busy; a busy buffer would be a bug, refused rather than waited on.
+      return Head::Refused;
+    };
+    if buffer.len() < CONNECTION_BUFFER_BYTES {
+      buffer.resize(CONNECTION_BUFFER_BYTES, 0);
+    }
+    match stream.peek_now(&mut buffer) {
+      Err(_) | Ok(Some(0)) => Head::Ended,
+      Ok(None) => Head::Waiting(1),
+      Ok(Some(queued)) => read_head(buffer.get(..queued).unwrap_or_default()),
+    }
+  })
+}
+
+/// The whole records at the head of `queued`, or how many bytes the first needs.
+fn read_head(queued: &[u8]) -> Head {
+  let mut reader = RecordReader::default();
+  let mut at = 0usize;
+  let mut records = Vec::new();
+  while let Some(rest) = queued.get(at..).filter(|rest| !rest.is_empty()) {
+    match reader.read(rest) {
+      Err(_) => return Head::Refused,
+      Ok((Some(body), used)) => {
+        at = at.saturating_add(used);
+        records.push(Inbound { body, end: at });
+      }
+      Ok((None, used)) => {
+        at = at.saturating_add(used);
+        if records.is_empty() {
+          let wanted = at.saturating_add(reader.wanted());
+          return if wanted > CONNECTION_BUFFER_BYTES {
+            Head::Refused
+          } else {
+            Head::Waiting(wanted)
+          };
+        }
+        break;
+      }
+    }
+  }
+  if records.is_empty() {
+    Head::Waiting(at.saturating_add(reader.wanted()).max(1))
+  } else {
+    Head::Records(records)
+  }
+}
+
+/// The serve loop of a connection, on whichever shard holds it now. A mount's calls name one volume, so the connection
+/// moves to that volume's owner shard at its first call there and is served locally from then on: a call forwarded over
+/// the bridge queue costs two cross-shard hops and two thread wakes, each of which a busy machine can delay by a
+/// scheduler quantum, and every call of a mount (six RPCs for one `rename(2)` from macOS) paid them (2026-10-04: every
+/// one of 185,745 calls was forwarded; their service p99 was 115 µs at rest and 1.18 ms with a spinner per core,
+/// `crates/cli/examples/vfs_tails.rs`). Each turn peeks the whole records queued, serves them up to the shard's
+/// quantum, sends their replies in whole records and only then consumes their requests (A-113).
 async fn serve_connection(mut connection: Connection) {
   let this = registry::current_shard().unwrap_or(0);
-  let mut chunk = [0u8; RECORD_CHUNK];
   // The connection's back-channel outbox on this shard (`crate::callback`), released however the loop ends.
   let registration = Registration(crate::callback::register());
+  // Whether the last wait ended because the socket became readable: with an unfinished record queued, that is the
+  // moment to ask whether the peer closed (a peek never shows the close behind bytes it does not consume).
+  let mut woken = false;
   loop {
-    let Some(batch) = serve_batch(this, &mut connection, registration.0).await else {
-      return;
-    };
-    if !send_batch(&mut connection, &batch).await {
-      return;
-    }
-    if let Some(owner) = batch.moving {
-      migrate(owner, connection);
-      return;
-    }
-    if batch.answered > 0 {
-      // A ready read/write does not yield: bound a busy connection to one batch per turn.
-      futures::yield_now().await;
-      continue;
-    }
-    if !wait_idle(&mut connection, &mut chunk, registration.0).await {
-      return;
+    match peek_head(&connection.stream) {
+      Head::Ended => {
+        connection.end();
+        return;
+      }
+      Head::Refused => {
+        crate::fleet::count_refusal(STREAM_REFUSED);
+        connection.end();
+        return;
+      }
+      Head::Waiting(bytes) => {
+        if woken && bytes > 1 && connection.stream.peer_closed().unwrap_or(true) {
+          // The peer closed with an unfinished record queued: it never completes.
+          connection.end();
+          return;
+        }
+        connection.want(bytes);
+        woken = false;
+        let standing = match idle(&connection, registration.0).await {
+          Idle::Readable => {
+            woken = true;
+            true
+          }
+          Idle::Send(records) => send_callbacks(&connection, &records).await,
+          Idle::Failed => false,
+        };
+        if !standing {
+          connection.end();
+          return;
+        }
+      }
+      Head::Records(records) => {
+        let turn = serve_turn(this, &mut connection, records, registration.0).await;
+        if !send_turn(&connection, &turn).await {
+          connection.end();
+          return;
+        }
+        if let Some(owner) = turn.moving {
+          migrate(owner, connection);
+          return;
+        }
+        // A ready read/write does not yield: bound a busy connection to one turn per scheduling round.
+        futures::yield_now().await;
+      }
     }
   }
 }
 
-/// Writes a batch's replies in one write and counts the replies that shared it; whether the connection still stands.
-async fn send_batch(connection: &mut Connection, batch: &Batch) -> bool {
-  if batch.answered == 0 {
-    return true;
+/// One turn's handled records: each record's reply (empty for a callback's answer, which has none) beside the queue
+/// offset just past it, and the owner shard the connection must move to before the next call (left queued).
+struct Turn {
+  handled: Vec<(Vec<u8>, usize)>,
+  moving: Option<u16>,
+}
+
+/// Serves the whole records peeked at the head of `connection`'s queue, in order, in one turn bounded by the shard's
+/// step quantum so a long pipeline still yields to the heartbeat (§4.3, D-18); the replies are gathered for whole-record
+/// sends (A-74). A call naming another shard's volume ends the turn and stays queued: the owner peeks it there.
+async fn serve_turn(
+  this: u16,
+  connection: &mut Connection,
+  records: Vec<Inbound>,
+  registration: Option<u64>,
+) -> Turn {
+  let started = futures::now_ns();
+  let quantum = futures::step_budget_ns().unwrap_or(0);
+  let mut turn = Turn {
+    handled: Vec::new(),
+    moving: None,
+  };
+  for Inbound { body, end } in records {
+    // A reply on the back channel answers one of this shard's callbacks (RFC 8881 §2.10.3.1), never a call.
+    if crate::callback::is_reply(&body) {
+      crate::callback::deliver(&body);
+      turn.handled.push((Vec::new(), end));
+      continue;
+    }
+    let call = Call::parse(&body);
+    let elsewhere = if is_v4_compound(&call) {
+      v4_elsewhere(this, connection.home, &call)
+    } else {
+      owner_elsewhere(&call)
+    };
+    if let Some(owner) = elsewhere {
+      turn.moving = Some(owner);
+      break;
+    }
+    let xid = call.xid;
+    let reply = if is_v4_compound(&call) {
+      let (reply, moving) = serve_v4_on(this, connection, call, registration).await;
+      turn.moving = moving;
+      reply
+    } else {
+      reply_to(this, call, connection.port).await
+    };
+    turn.handled.push((bounded_record(xid, &reply), end));
+    if turn.moving.is_some() || futures::now_ns().saturating_sub(started) >= quantum {
+      break;
+    }
   }
-  if connection.stream.write_all(&batch.replies).await.is_err() {
+  turn
+}
+
+/// `reply` framed as one record, or — past [`RECORD_WIRE_BYTES`], which no reply reaches since every result is capped
+/// at the transfer ceiling — a `SYSTEM_ERR` for its `xid`, counted: a connection sends only records it can send whole.
+fn bounded_record(xid: u32, reply: &[u8]) -> Vec<u8> {
+  let record = write_record(reply);
+  if record.len() <= RECORD_WIRE_BYTES {
+    return record;
+  }
+  note(NFS_REPLY_PAST_BOUND);
+  write_record(&reply_bytes(xid, AcceptStatus::SystemErr, &[]))
+}
+
+/// Sends a turn's replies in runs of whole records no longer than [`RECORD_WIRE_BYTES`], and after each run consumes
+/// the requests it answered (and any callback answers among them) from the receive queue: a request leaves the kernel
+/// only once its reply is in it, so a daemon that dies anywhere here leaves every unanswered request for its successor,
+/// and at worst a reply sent twice, which the client drops by its xid (RFC 5531 §9) (A-113). Whether the connection
+/// still stands.
+async fn send_turn(connection: &Connection, turn: &Turn) -> bool {
+  let mut run: Vec<u8> = Vec::new();
+  let mut run_end = 0usize;
+  let mut consumed = 0usize;
+  let mut answered = 0u64;
+  for (reply, end) in &turn.handled {
+    if !run.is_empty() && run.len().saturating_add(reply.len()) > RECORD_WIRE_BYTES {
+      if !send_run(connection, &run, run_end, &mut consumed).await {
+        return false;
+      }
+      run.clear();
+    }
+    run.extend_from_slice(reply);
+    run_end = *end;
+    if !reply.is_empty() {
+      answered = answered.saturating_add(1);
+    }
+  }
+  if run_end > consumed && !send_run(connection, &run, run_end, &mut consumed).await {
     return false;
   }
-  if batch.answered > 1 {
+  if answered > 1 {
     let _ = state::with_state(|s| {
-      s.count(NFS_REPLIES_BATCHED, batch.answered);
+      s.count(NFS_REPLIES_BATCHED, answered);
     });
   }
-  // A mount's call is client activity: the shard spins out its idle window after it, so the next call of a burst is
-  // read without a kernel wake (§4.7).
-  registry::with_current(|ctx| ctx.note_activity());
+  if answered > 0 {
+    // A mount's call is client activity: the shard spins out its idle window after it, so the next call of a burst is
+    // read without a kernel wake (§4.7).
+    registry::with_current(|ctx| ctx.note_activity());
+  }
   true
 }
 
-/// Waits for the client's next bytes (buffered for the next batch) or for callbacks queued on this connection (sent);
-/// whether the connection still stands.
-async fn wait_idle(
-  connection: &mut Connection,
-  chunk: &mut [u8],
-  registration: Option<u64>,
+/// Sends one run of whole records (if any), then consumes the receive queue through `through`; whether both succeeded.
+async fn send_run(
+  connection: &Connection,
+  run: &[u8],
+  through: usize,
+  consumed: &mut usize,
 ) -> bool {
-  match idle(connection, chunk, registration).await {
-    Idle::Read(Ok(0) | Err(_)) => false,
-    Idle::Read(Ok(count)) => {
-      connection
-        .buffer
-        .extend_from_slice(chunk.get(..count).unwrap_or_default());
-      true
+  if !run.is_empty() {
+    match connection.stream.send_records(run).await {
+      Ok(slates_rt::tcp::Sent::Whole) => {}
+      Ok(slates_rt::tcp::Sent::Completed) => note(NFS_SEND_COMPLETED),
+      Err(_) => return false,
     }
-    Idle::Send(records) => connection.stream.write_all(&records.concat()).await.is_ok(),
   }
+  let count = through.saturating_sub(*consumed);
+  let discarded = STREAM_BUFFER.with(|cell| {
+    cell
+      .try_borrow_mut()
+      .ok()
+      .is_some_and(|mut buffer| connection.stream.discard(count, &mut buffer).is_ok())
+  });
+  *consumed = through;
+  discarded
+}
+
+/// Sends callback records queued for this connection, each run whole; whether the connection still stands.
+async fn send_callbacks(connection: &Connection, records: &[Vec<u8>]) -> bool {
+  let mut run: Vec<u8> = Vec::new();
+  for record in records {
+    if !run.is_empty() && run.len().saturating_add(record.len()) > RECORD_WIRE_BYTES {
+      if connection.stream.send_records(&run).await.is_err() {
+        return false;
+      }
+      run.clear();
+    }
+    run.extend_from_slice(record);
+  }
+  run.is_empty() || connection.stream.send_records(&run).await.is_ok()
 }
 
 /// A connection's registration in its shard's back-channel table, ended when the serve loop ends (any path, a
@@ -1944,15 +2358,17 @@ impl Drop for Registration {
   }
 }
 
-/// What woke an idle connection: bytes from the client, or callbacks to send it.
+/// What woke an idle connection: bytes from the client (or its close), callbacks to send it, or a failed wait.
 enum Idle {
-  Read(Result<usize, slates_rt::RtError>),
+  Readable,
   Send(Vec<Vec<u8>>),
+  Failed,
 }
 
-/// Waits for the client's next bytes or for a callback queued on this connection, whichever comes first.
-async fn idle(connection: &mut Connection, chunk: &mut [u8], registration: Option<u64>) -> Idle {
-  let mut read = std::pin::pin!(connection.stream.read(chunk));
+/// Waits for the client's next bytes (as many as the low-water mark asks) or for a callback queued on this connection,
+/// whichever comes first.
+async fn idle(connection: &Connection, registration: Option<u64>) -> Idle {
+  let mut readable = std::pin::pin!(connection.stream.wait_readable());
   std::future::poll_fn(|cx| {
     if let Some(id) = registration {
       let outbound = crate::callback::take_outbound(id, cx.waker());
@@ -1960,61 +2376,12 @@ async fn idle(connection: &mut Connection, chunk: &mut [u8], registration: Optio
         return std::task::Poll::Ready(Idle::Send(outbound));
       }
     }
-    read.as_mut().poll(cx).map(Idle::Read)
+    readable.as_mut().poll(cx).map(|waited| match waited {
+      Ok(()) => Idle::Readable,
+      Err(_) => Idle::Failed,
+    })
   })
   .await
-}
-
-/// One turn's calls on a connection: the replies built, how many, and the owner shard the connection must move to
-/// before its next call (the call is kept as the connection's pending one).
-struct Batch {
-  replies: Vec<u8>,
-  answered: u64,
-  moving: Option<u16>,
-}
-
-/// Serves every complete call already buffered on `connection`, in one turn bounded by the shard's step quantum so a
-/// long pipeline still yields to the heartbeat (§4.3, D-18); the replies are gathered for one write (A-74). One
-/// reply and a yield per call queued each pipelined call behind every earlier one's write and turn. `None` when the
-/// buffered bytes are not a valid record stream (the connection ends).
-async fn serve_batch(
-  this: u16,
-  connection: &mut Connection,
-  registration: Option<u64>,
-) -> Option<Batch> {
-  let started = futures::now_ns();
-  let quantum = futures::step_budget_ns().unwrap_or(0);
-  let mut batch = Batch {
-    replies: Vec::new(),
-    answered: 0,
-    moving: None,
-  };
-  while let Some(call) = next_call(connection)? {
-    let elsewhere = if is_v4_compound(&call) {
-      v4_elsewhere(this, connection.home, &call)
-    } else {
-      owner_elsewhere(&call)
-    };
-    if let Some(owner) = elsewhere {
-      // The replies already built leave first, so the moved connection answers in request order.
-      connection.pending = Some(call);
-      batch.moving = Some(owner);
-      break;
-    }
-    let reply = if is_v4_compound(&call) {
-      let (reply, moving) = serve_v4_on(this, connection, call, registration).await;
-      batch.moving = moving;
-      reply
-    } else {
-      reply_to(this, call, connection.port).await
-    };
-    batch.replies.extend_from_slice(&write_record(&reply));
-    batch.answered = batch.answered.saturating_add(1);
-    if batch.moving.is_some() || futures::now_ns().saturating_sub(started) >= quantum {
-      break;
-    }
-  }
-  Some(batch)
 }
 
 /// Serves one NFSv4 compound on `connection` (A-76, A-77): binds its session's back channel to the connection, serves
@@ -2036,25 +2403,6 @@ async fn serve_v4_on(
     reply,
     depart_with(this, connection, placement, forwarded_to),
   )
-}
-
-/// The connection's next call: the pending one, else the next complete record in its buffer; `Some(None)` when no
-/// complete record is buffered, `None` when the bytes are not a valid record stream.
-fn next_call(connection: &mut Connection) -> Option<Option<Call>> {
-  if let Some(call) = connection.pending.take() {
-    return Some(Some(call));
-  }
-  loop {
-    let (body, consumed) = connection.records.read(&connection.buffer).ok()?;
-    connection
-      .buffer
-      .drain(..consumed.min(connection.buffer.len()));
-    match body {
-      // A reply on the back channel answers one of this shard's callbacks (RFC 8881 §2.10.3.1), never a call.
-      Some(body) if crate::callback::is_reply(&body) => crate::callback::deliver(&body),
-      other => return Some(other.map(|body| Call::parse(&body))),
-    }
-  }
 }
 
 /// Binds connection `id` as the carrier of `sessionid`'s back channel when the session has one (its compounds
@@ -2132,18 +2480,19 @@ fn owner_elsewhere(call: &Call) -> Option<u16> {
   route(call.program, call.procedure, &call.args)
 }
 
-/// Moves `connection` to `owner`, where its pending call is served first and the loop goes on. The move is a
-/// spawn on the owner's control channel carrying the descriptor and the read state (sharing by move); refused
-/// there, the connection is closed, and counted, and the kernel client reconnects, as at a refused accept.
+/// Moves `connection` to `owner`, where the call that named it — still at the head of the receive queue (A-113) — is
+/// peeked and served first, and the loop goes on. The move is a spawn on the owner's control channel carrying the
+/// descriptor (sharing by move); refused there, the connection is closed and its hold released, and counted, and the
+/// kernel client reconnects, as at a refused accept.
 fn migrate(owner: u16, connection: Connection) {
+  let ending = connection.ending();
   let Connection {
     stream,
-    buffer,
-    records,
-    pending,
     port,
     home,
     carry,
+    held,
+    ..
   } = connection;
   let fd = stream.into_fd();
   // A copy of the session stays behind for the refusal path: a move refused before it left returns the session to its
@@ -2157,30 +2506,25 @@ fn migrate(owner: u16, connection: Connection) {
       }
       let Ok(stream) = TcpStream::from_fd(fd) else {
         crate::fleet::count_refusal(MIGRATE_REFUSED);
+        ending.release();
         return;
       };
       let connection = Connection {
         stream,
-        buffer,
-        records,
-        pending,
         port,
         home,
         carry: None,
+        held,
+        wanted: 0,
       };
-      match futures::spawn(serve_connection(connection)) {
-        Ok(task) => {
-          let _ = futures::detach(task);
-        }
-        Err(_) => {
-          crate::fleet::count_refusal(SERVE_SPAWN_REFUSED);
-        }
-      }
+      spawn_connection(connection);
     }),
     None,
   );
   if registry::send_control(owner, slates_rt::control::Control::Spawn(Box::new(arrive))).is_err() {
     crate::fleet::count_refusal(MIGRATE_REFUSED);
+    // The refused spawn dropped the descriptor; releasing the anchor's copy closes the connection.
+    ending.release();
     if let Some((sessionid, departed)) = kept {
       let _ = state::with_state(|s| {
         if let Some(server) = s.nfs_v4.as_mut() {
@@ -2235,7 +2579,11 @@ mod tests {
     let Poll::Ready(Ok(stream)) = std::pin::pin!(listener.accept()).poll(&mut context) else {
       panic!("the established connection must be ready to accept");
     };
-    let mut server = std::pin::pin!(serve_one(stream, address.port()));
+    let mut server = std::pin::pin!(serve_connection(Connection::new(
+      stream,
+      address.port(),
+      None
+    )));
     for xid in [1u32, 2] {
       assert!(
         server.as_mut().poll(&mut context).is_pending(),

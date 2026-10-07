@@ -637,9 +637,16 @@ impl Daemon {
     let shards: Vec<ShardId> = runtime.shard_ids().to_vec();
     // The lock ledger's entry for this daemon starts empty, before any shard recovers and reserves again.
     crate::lock_ledger::reset(shards.first().map_or(0, |shard| shard.0));
-    // The FUSE devices the anchor held across the restart (A-61), each moved to the shard that owns its mount.
+    // What the anchor held across the restart (A-61, A-113): the FUSE devices, each moved to the shard that owns its
+    // mount, and the NFS loopback connections, served again on the listener's shard below.
+    #[cfg(unix)]
+    let handed = crate::anchor_hold::adopt();
     #[cfg(target_os = "linux")]
-    let mut inherited_fuse = crate::fuse_hold::adopt(shards.len()).into_iter();
+    let mut inherited_fuse = crate::fuse_hold::split(handed.devices, shards.len()).into_iter();
+    #[cfg(all(unix, not(target_os = "linux")))]
+    release_devices_without_fuse(handed.devices);
+    #[cfg(unix)]
+    let handed_connections = handed.connections;
     for (index, shard) in shards.iter().enumerate() {
       let env = segment.handoff_env()?;
       let config = config.clone();
@@ -729,33 +736,8 @@ impl Daemon {
         crate::fleet::run_membership(transport).await;
       })?;
     }
-    // The NFS transport (§4.6): one loopback listener served on the control shard. A supervising
-    // anchor holds the listener and hands its descriptor over in the environment, so its port survives
-    // a daemon restart (Unix); the daemon adopts that when present, or binds a fresh ephemeral one when
-    // it runs standalone (tests). Either way the port is known here, before the serve task moves the
-    // listener onto the shard, and the cross-shard bridge queue reaches volumes on other shards.
     #[cfg(unix)]
-    let nfs_port = match nfs_listener() {
-      Ok(nfs_listener) => {
-        let port = nfs_listener.local_addr().ok().map(|addr| addr.port());
-        if let Some(port) = port {
-          // Publish the port for a verb handler to report to a client (`slates mount`).
-          NFS_PORT.store(u32::from(port), Ordering::Release);
-          runtime.spawn_on(control, async move {
-            match futures::spawn(crate::nfs::serve(nfs_listener, port)) {
-              Ok(task) => {
-                let _ = futures::detach(task);
-              }
-              Err(_) => {
-                crate::fleet::count_refusal(LOOP_SPAWN_REFUSED);
-              }
-            }
-          })?;
-        }
-        port
-      }
-      Err(_) => None,
-    };
+    let nfs_port = start_nfs_transport(&runtime, control, &config, handed_connections)?;
     // No NFS transport on Windows: NFS is the macOS/Linux mount path (Windows mounts through WinFsp),
     // so a Windows daemon serves IPC clients and lands, but publishes no mount port.
     #[cfg(windows)]
@@ -3682,6 +3664,78 @@ fn kick_fd_of(shard: ShardId) -> Option<i32> {
 #[cfg(not(target_os = "linux"))]
 fn kick_fd_of(_shard: ShardId) -> Option<i32> {
   None
+}
+
+/// The NFS transport (§4.6): one loopback listener served on the `control` shard. A supervising anchor holds the
+/// listener and hands its descriptor over in the environment, so its port survives a daemon restart; the daemon adopts
+/// that when present, or binds a fresh ephemeral one when it runs standalone (tests). Either way the port is known
+/// here, before the serve task moves the listener onto the shard, and the cross-shard bridge queue reaches volumes on
+/// other shards. The connections the anchor held across the restart (A-113) are served first there; without a listener
+/// nothing could serve them, so each is released — the anchor closes the last copy and the kernel client reconnects to
+/// whatever listener comes next, rather than wait on a connection nobody reads. The port, if the listener bound.
+#[cfg(unix)]
+fn start_nfs_transport(
+  runtime: &Runtime,
+  control: ShardId,
+  config: &DaemonConfig,
+  handed: Vec<crate::anchor_hold::HandedConnection>,
+) -> Result<Option<u16>, RtError> {
+  let listener = nfs_listener().ok();
+  let port = listener
+    .as_ref()
+    .and_then(|listener| listener.local_addr().ok())
+    .map(|address| address.port());
+  let (Some(listener), Some(port)) = (listener, port) else {
+    crate::nfs::release_handed(handed);
+    return Ok(None);
+  };
+  // Publish the port for a verb handler to report to a client (`slates mount`).
+  NFS_PORT.store(u32::from(port), Ordering::Release);
+  let bound = config.held_connection_bound();
+  runtime.spawn_on(control, async move {
+    // The connections a dead daemon left are answered first (A-113): their kernel clients are waiting.
+    crate::nfs::adopt_held(handed, port, bound);
+    match futures::spawn(crate::nfs::serve(listener, port, bound)) {
+      Ok(task) => {
+        let _ = futures::detach(task);
+      }
+      Err(_) => {
+        crate::fleet::count_refusal(LOOP_SPAWN_REFUSED);
+      }
+    }
+  })?;
+  Ok(Some(port))
+}
+
+/// Releases and closes FUSE devices the anchor handed back to a daemon on a platform without FUSE: there is no mount to
+/// serve them, and an anchor that keeps them would hand them to every daemon after. Reported, since a device here means
+/// an anchor shared with another platform's daemon or a corrupted handoff.
+#[cfg(all(unix, not(target_os = "linux")))]
+fn release_devices_without_fuse(devices: Vec<crate::anchor_hold::HandedDevice>) {
+  for crate::anchor_hold::HandedDevice {
+    attachment,
+    device,
+    session,
+  } in devices
+  {
+    eprintln!(
+      "slates-server: the anchor handed back FUSE device {attachment:x} ({}), which this platform cannot serve; released",
+      if session.is_some() {
+        "negotiated"
+      } else {
+        "not negotiated"
+      }
+    );
+    drop(device);
+    let _ = crate::anchor_hold::send(&slates_anchor::held::Outgoing::Release { attachment });
+  }
+}
+
+/// Raises this process's soft descriptor limit to the hard one (no privilege needed); `(before, after)` when it changed.
+/// The daemon calls it at start; the anchor too, since it holds a duplicate of every FUSE device and NFS connection
+/// the daemon hands it (A-61, A-113) — at a shell's soft limit (256 on macOS) it refused holds far below its bound.
+pub fn raise_descriptor_limit() -> Option<(u64, u64)> {
+  limits::raise_descriptor_limit()
 }
 
 mod limits {

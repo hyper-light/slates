@@ -82,6 +82,11 @@
 #   `CloseHandle` (5), Win32 without a safe wrapper. An observation counts its budget in the observed shard's own time,
 #   so a starved shard is not read as wedged (docs/bugs/2026-10-03-an-observation-read-a-starved-shard-as-wedged.md).
 #   63 → 73.
+#   The held NFS connection (`tcp.rs`, 2026-10-06, §4.6 A-113): one integer `setsockopt` for the receive and send
+#   low-water marks (`SO_RCVLOWAT`, `SO_SNDLOWAT`), which rustix does not wrap (1) — the send mark is what makes a send
+#   of a whole record all-or-nothing on macOS; and one `getsockopt` of the first byte of the kernel's TCP connection
+#   record (Linux `TCP_INFO`, macOS `TCP_CONNECTION_INFO`) for the peer's close, which a peeking reader cannot see
+#   behind an unfinished record (1). 73 → 75.
 # slates-wire (4): the CRC32C hardware intrinsics behind runtime feature detection.
 # slates-wire-derive (0).
 # slates-base (10): rustix marks kevent unsafe because the kernel fills the output list; one
@@ -223,7 +228,7 @@ slates-mem = 36
 # `&self`, instead of a `&'static` field — a runtime passed by value had that field protected while its drop
 # freed the clock (Miri, `--test ownership`). (+1) the same for `LocalRuntime::context` (`runtime.rs`), whose
 # context its own `Drop` frees.
-slates-rt = 73
+slates-rt = 75
 slates-base = 10
 slates-vfs = 0
 slates-land = 3

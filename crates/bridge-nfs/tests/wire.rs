@@ -110,9 +110,9 @@ fn rpc_oversized_record_is_refused() {
 /// framing budget even though they add no payload. A maximum-size byte-fragmented record fits.
 #[test]
 fn rpc_empty_fragments_cannot_extend_a_record_without_limit() {
-  // The published server message limit is 2 MiB. Allow one marker per payload byte and a terminal
+  // The published server message limit is `MAX_MESSAGE`. Allow one marker per payload byte and a terminal
   // marker; one further marker must be refused even when no payload has arrived.
-  let payload_limit = 2 * 1024 * 1024;
+  let payload_limit = slates_bridge_nfs::rpc::MAX_MESSAGE;
   let markers = vec![0; (payload_limit + 2) * size_of::<u32>()];
   assert_eq!(read_record(&markers), Err(RpcError::RecordTooLarge));
 }
@@ -122,7 +122,7 @@ fn rpc_empty_fragments_cannot_extend_a_record_without_limit() {
 #[test]
 fn rpc_incremental_records_preserve_maximal_fragmentation_and_stream_boundaries() {
   use slates_bridge_nfs::rpc::RecordReader;
-  let payload = vec![42; 2 * 1024 * 1024];
+  let payload = vec![42; slates_bridge_nfs::rpc::MAX_MESSAGE];
   let mut wire = Vec::new();
   for byte in &payload {
     wire.extend_from_slice(&1u32.to_be_bytes());
@@ -155,7 +155,7 @@ fn rpc_incremental_records_preserve_maximal_fragmentation_and_stream_boundaries(
 fn rpc_fragment_budget_survives_tcp_read_boundaries() {
   use slates_bridge_nfs::rpc::RecordReader;
   let mut reader = RecordReader::default();
-  let fragments = 2 * 1024 * 1024 + 1;
+  let fragments = slates_bridge_nfs::rpc::MAX_MESSAGE + 1;
   for _ in 0..fragments {
     assert_eq!(reader.read(&[0; 4]), Ok((None, 4)));
   }

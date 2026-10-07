@@ -4128,3 +4128,23 @@ The established lever is an intent log for namespace changes, like the write log
 replies after one append, and a successor replays it. That changes §4.8's barrier contract and the A-61 reply-replay
 rule, so it needs its own design pass. BENCHMARKS, "Per-operation latency on a Linux FUSE mount", has the numbers.
 
+
+### 2026-10-06: the macOS NFS client panicked the kernel when its server was killed (fixed on macOS; A-113)
+
+Ten `SIGKILL`s of the daemon in 12 s under a writer panicked this Mac twice, in Apple's NFS client (a use-after-free the
+memory-tagging hardware caught). Every kill also stalled the mount 1.0 s. The trigger was ours: each death closed the
+kernel client's connection. Since A-113 the anchor holds every loopback connection and a successor answers what the
+dead daemon left: 72 pipelined writes across six kills answered on one connection, longest kill-to-answer 126 ms
+(`crates/cli/tests/nfs_held.rs`; docs/bugs/2026-10-06-macos-nfs-client-panics-when-its-server-restarts.md).
+
+Open:
+- Linux connections are not held: Linux may take part of a send, so a successor needs the exact written-byte check
+  against a ledger of the send in flight (A-113) before it may resume one.
+- The kernel client under kills has not been re-run with the fix: it repeats the experiment that panicked the machine,
+  so it waits for Ada.
+
+### 2026-10-06: two fsync-acknowledged files came back empty after daemon kills on the macOS NFS mount (open)
+
+The same kill run that measured the 1.0 s stalls (before A-113) returned two 300 KB files empty whose fsync had
+returned, among 2,320 checked. The write verifier is per daemon instance, so a restart that loses unstable writes is
+visible to the client; the cause is not yet found. The Linux FUSE run (22,068 files, 15 kills) had none.

@@ -27,6 +27,31 @@ fn observation_pause() -> Duration {
   Duration::from_nanos(HEARTBEAT_NS)
 }
 
+/// Waits out one observation pause, or less when a daemon sends a hold (A-113): the hold channel is polled with the
+/// pause as the timeout, so a hold is taken as it arrives, and a daemon whose send waits on a full channel waits only
+/// for the anchor to wake, not for its next turn. A signal ends the wait early, as it ended the park.
+#[cfg(unix)]
+fn await_observation(supervisor: &Supervisor) {
+  let Some(channel) = supervisor.hold_channel() else {
+    std::thread::park_timeout(observation_pause());
+    return;
+  };
+  let mut interest = [rustix::event::PollFd::new(
+    &channel,
+    rustix::event::PollFlags::IN,
+  )];
+  let timeout = rustix::event::Timespec::try_from(observation_pause()).ok();
+  // Readable, timed out or interrupted, the loop's next turn drains the channel and observes the daemon; an error
+  // here only shortens the wait.
+  let _ = rustix::event::poll(&mut interest, timeout.as_ref());
+}
+
+/// See the Unix arm: no hold channel off Unix.
+#[cfg(not(unix))]
+fn await_observation(_supervisor: &Supervisor) {
+  std::thread::park_timeout(observation_pause());
+}
+
 /// Binds the NFS loopback listener the anchor holds across daemon restarts (§4.6) and hands it to
 /// `supervisor`, which passes its descriptor to every daemon it spawns. A bind failure is non-fatal:
 /// the daemon then binds its own ephemeral listener (its port is not stable across a restart, but the
@@ -174,10 +199,15 @@ pub(crate) fn run(options: &ProcessOptions) -> Result<(), Failure> {
   // The FUSE devices daemons mount are held the same way (A-61): a daemon sends each to the anchor, and the
   // next daemon takes back the mounts it recovers. A channel that cannot be opened refuses the anchor's start:
   // a mount would then die with its daemon, which the anchor exists to prevent.
-  #[cfg(target_os = "linux")]
+  #[cfg(unix)]
   supervisor
-    .hold_devices(config.held_device_bound())
-    .map_err(|e| failed("device channel", e))?;
+    .hold_descriptors(config.held_device_bound(), config.held_connection_bound())
+    .map_err(|e| failed("hold channel", e))?;
+  // The anchor holds a duplicate of every device and connection it is sent, so it needs the descriptors its bounds
+  // name: raise its soft limit to the hard one, as the daemon does (no privilege needed).
+  if let Some((was, now)) = slates_server::daemon::raise_descriptor_limit() {
+    eprintln!("slates anchor: descriptor limit raised from {was} to {now}");
+  }
   let mut clock = HostClock::new();
   let now = clock.monotonic_ns();
   supervisor.start(now).map_err(|e| failed("start", e))?;
@@ -293,7 +323,7 @@ fn observe(
           }
           None => {}
         }
-        std::thread::park_timeout(observation_pause());
+        await_observation(supervisor);
       }
       slates_anchor::Step::Restarted {
         exit_code,

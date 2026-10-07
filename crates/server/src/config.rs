@@ -437,6 +437,15 @@ impl DaemonConfig {
     usize::from(self.runtime.shards).saturating_mul(slates_bridge_core::authority::MAX_ATTACHMENTS)
   }
 
+  /// Derived: the NFS loopback connections an anchor may hold for this daemon across a restart (A-113): one per live
+  /// attachment the daemon's shards can hold, as [`DaemonConfig::held_device_bound`] — a kernel mount is an attachment,
+  /// and the macOS and Linux kernel clients open one connection per mount. A connection past it is closed by the daemon
+  /// and counted (`nfs.connection_hold_refused`), never served unheld: a client that opens more than one per mount
+  /// (Linux `nconnect`) meets the bound only that much sooner.
+  pub fn held_connection_bound(&self) -> usize {
+    usize::from(self.runtime.shards).saturating_mul(slates_bridge_core::authority::MAX_ATTACHMENTS)
+  }
+
   /// The configuration from a profile, for `instance`. An explicit shard count is selected
   /// before dividing the host's capacity (§4.2); otherwise the profile chooses the cores.
   /// Explicit counts are unpinned, as several daemons may share those cores in a test or VM.

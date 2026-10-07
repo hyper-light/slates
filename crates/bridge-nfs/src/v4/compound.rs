@@ -1764,7 +1764,11 @@ async fn readdir<B: Backend>(
   let mut verf = [0u8; VERIFIER_SIZE];
   verf.copy_from_slice(reader.fixed(VERIFIER_SIZE).map_err(bad)?);
   let _dircount = reader.u32().map_err(bad)?;
-  let maxcount = reader.u32().map_err(bad)?;
+  // Capped at the transfer ceiling (A-113): the page, and the rows asked of the bridge for it, stay within one message.
+  let maxcount = reader
+    .u32()
+    .map_err(bad)?
+    .min(crate::procedures::MAX_TRANSFER);
   let requested = Bitmap::decode(reader).map_err(bad)?;
   attr::check_readable(&requested)?;
   if cookie == 1 || cookie == 2 {
@@ -1797,7 +1801,11 @@ async fn readdir_of_root<B: Backend>(
   let mut verf = [0u8; VERIFIER_SIZE];
   verf.copy_from_slice(reader.fixed(VERIFIER_SIZE).map_err(bad)?);
   let dircount = reader.u32().map_err(bad)?;
-  let maxcount = reader.u32().map_err(bad)?;
+  // Capped as a volume directory's listing is (A-113).
+  let maxcount = reader
+    .u32()
+    .map_err(bad)?
+    .min(crate::procedures::MAX_TRANSFER);
   let requested = Bitmap::decode(reader).map_err(bad)?;
   attr::check_readable(&requested)?;
   if cookie == 1 || cookie == 2 {

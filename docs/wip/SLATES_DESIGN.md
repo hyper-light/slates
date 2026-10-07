@@ -2286,7 +2286,8 @@ form acceptable; otherwise those systems use the fallback.
 > **Status (2026-09-15, POSIX access control at the NFS edge).** The NFS export now applies the POSIX permission rules to every request's caller — the uid and groups its `AUTH_SYS` credential names (the supplementary groups are read too, bounded at the protocol's sixteen) — before any effect: search to resolve a name, write and search on a directory to add, remove or rename an entry (with the sticky bit's owner rule), read or write on a file's bytes (with the owner override an NFS server applies, so an open descriptor survives a later `chmod`), and the ownership rules of `SETATTR` — `chmod` needs ownership, `chown` is restricted (`_POSIX_CHOWN_RESTRICTED`, so PATHCONF now reports `chown_restricted`), explicit times need ownership, and a non-superuser's write or chown clears the set-id bits. `ACCESS` reports the same class verdict, so a client's own `open(2)` check agrees with the server. The rules are one pure, unit-tested module (`crates/bridge-nfs/src/access.rs`) every procedure calls — the analogue of `default_permissions` at the FUSE edge, where the kernel does this from the attributes the bridge reports. Before, the export answered `ACCESS` from the owner's bits whoever asked and enforced nothing else: 5,336 of pjdfstest's 8,686 cases on the macOS lane, all in the permission-denied assertions (`docs/bugs/2026-09-15-nfs-export-enforces-no-posix-permissions.md`). Proven by use in `crates/bridge-nfs/tests/procedures.rs` (a non-owner refused `LOOKUP`, `REMOVE`, `CREATE`, `READ`, `WRITE`, `READDIR`, `RENAME`, `chmod` and `chown` typed; the owner and the superuser admitted; the sticky bit; the set-id clearing) and unchanged for the daemon's live mount test (the mounting user owns what it creates). The enforcement made the volume root's ownership load-bearing: the core births it `uid 0, gid 0` (the root:wheel sibling of 2026-09-14), which would refuse the mounting user its own volume's root, so `volume create` now stamps the root with the provisioning user's uid and primary group (the rendezvous admits only the daemon's own uid, so the two are one user); the CLI's live mount flow checks `stat -f %u:%g` of the mount point is the mounting user's. The same day's pjdfstest run through the live mount found two timestamp faults and closed them: the volume's `drop_link` now marks the inode's `ctime` when a name is dropped (POSIX `unlink()` with links remaining, a `rename` over one name of a linked file; `docs/bugs/2026-09-15-dropping-a-link-leaves-the-inodes-ctime.md`), and the NFS `LINK` reply's `linkdir_wcc` carries the directory's attributes read after the link, not before, so the client's one-second attribute cache never holds the pre-link times (`docs/bugs/2026-09-15-nfs-link-reply-carries-the-directorys-pre-link-times.md`).
 
 **macOS fallback (own NFSv3 loopback server; macOS 14.4 and any system where FSKit is
-unavailable or disabled).** One TCP loopback listener held by the anchor; ONC RPC record
+unavailable or disabled).** One TCP loopback listener held by the anchor, and since A-113 every connection it accepts,
+so a daemon restart is a slow reply to the kernel client, never a dropped connection (Linux owed); ONC RPC record
 marking; NFSv3 + MOUNT + a minimal portmap responder; the root mount at an existing user-owned mount point
 (or an already established RAM-backed target)
 with `nfsv3,tcp,port,mountport,soft,intr,locallocks,nosuid,rdirplus` and attribute-cache
@@ -10129,3 +10130,43 @@ Status: designed 2026-10-06; built piece by piece, each with its own record.
   - Adding B to the object's recorded readers in the head: that grows replicated state per reader, unbounded.
   - Public-key signatures per capability: verifying is costlier than a MAC under a key that already exists for
     this pair.
+
+### A-113 — An NFS loopback connection outlives its daemon (2026-10-06)
+Applied in the same change to: §4.6 (macOS fallback), GAPS, BENCHMARKS, docs/bugs/2026-10-06-macos-nfs-client-panics-when-its-server-restarts.md.
+
+Status: built on macOS 2026-10-06; Linux owed (below).
+- What it answers: the anchor held the NFS listener across a daemon restart, but not the connections. A daemon's death
+  closed every kernel client's connection with requests in flight, and the client reconnected. On macOS that cost a
+  1.0 s stall per kill, and under ten kills in 12 s with writes in flight, Apple's NFS client panicked the kernel twice
+  (a use-after-free in `com.apple.filesystems.nfs`). A restart is a designed event, so a kernel client must not see one.
+- The rule: a restart is a slow reply, never a dropped connection.
+  1. The daemon hands the anchor a duplicate of each accepted connection before reading its first request, over the
+     hold channel A-61 made for FUSE devices (now Unix-wide: a sequenced-packet pair on Linux, a datagram pair on
+     macOS). The anchor hands what it holds to every daemon it spawns (`ENV_CONNECTIONS`). A connection that ends is
+     shut down before its hold is released.
+  2. A request leaves the kernel only once its reply is in it: records are peeked, served, their replies sent, then
+     consumed. The receive low-water mark wakes a connection only when a whole record is queued. A successor finds
+     every unanswered request still queued and answers it on the same socket.
+  3. Replies leave in whole records, each send at most the largest record (`MAX_MESSAGE` plus its marker). On macOS,
+     `SO_SNDLOWAT` at that size makes a send all or nothing: XNU's `sosend` refuses `EWOULDBLOCK`, copying nothing,
+     while free space is below both the request and the low-water mark, and allocates its buffers waiting
+     (`bsd/kern/uipc_socket.c`, read 2026-10-06). A death can then repeat a whole reply at most, and an ONC RPC
+     client drops a reply whose xid it no longer awaits (RFC 5531).
+  4. The bounds are exact: `MAX_MESSAGE = MAX_TRANSFER + COMPOUND_HEADER_BYTES`, every reply capped there (READDIR
+     budgets at the transfer ceiling), each connection's buffers two records. A record larger than the receive buffer
+     is refused, since it could never sit whole to be peeked.
+- Re-running the one request in flight at a death is what the client's own retransmission after a reconnect did
+  before, so the semantics are unchanged. NFSv3 has no reply cache here, and NFSv4.1's session slots answer a retried
+  request from their cache.
+- Linux is owed. Linux keeps `SO_SNDLOWAT` fixed and copies what fits, so a send can end mid-record; a successor
+  resuming such a stream would hand the client the next reply's bytes as the rest of the torn one. The remedy is an
+  exact check at adoption: the bytes the kernel says were written (`tcpi_bytes_acked` plus `SIOCOUTQ`) against the
+  bounds of the send in flight, recorded in a ledger the anchor holds. Until then Linux connections are not held and
+  behave as before.
+- Scope: the loopback listener. The TLS network export keeps its TLS state in the daemon, so its connections are not
+  held; a peer reconnects.
+- Rejected:
+  - The anchor proxying every RPC: one more hop and copy per request, on the process meant to do nothing.
+  - Consuming requests and keeping them in anchor memory: it copies every request, and still needs the exact output
+    position for a torn reply.
+  - `TCP_REPAIR`: it needs `CAP_NET_ADMIN` (R10).

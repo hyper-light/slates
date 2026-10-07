@@ -817,25 +817,25 @@ fn device_child() {
     return;
   }
   let handed =
-    std::env::var(slates_anchor::devices::ENV_DEVICES).expect("the anchor handed the channel over");
-  let inherited = slates_anchor::devices::parse_env(&handed).unwrap();
+    std::env::var(slates_anchor::held::ENV_DEVICES).expect("the anchor handed the channel over");
+  let inherited = slates_anchor::held::parse_env(&handed).unwrap();
   // SAFETY: the anchor made the channel's daemon end inheritable and named its number in the environment;
   // this process adopts it once, here, so the `OwnedFd` is its single owner.
   let channel = unsafe { OwnedFd::from_raw_fd(inherited.channel) };
   let Some(device) = inherited.devices.first() else {
     let (reader, writer) = rustix::pipe::pipe().unwrap();
     rustix::io::write(&writer, DEVICE_MARK).unwrap();
-    slates_anchor::devices::send(
+    slates_anchor::held::send(
       channel.as_fd(),
-      &slates_anchor::devices::Outgoing::Hold {
+      &slates_anchor::held::Outgoing::Hold {
         attachment: DEVICE_ATTACHMENT,
         device: reader.as_fd(),
       },
     )
     .unwrap();
-    slates_anchor::devices::send(
+    slates_anchor::held::send(
       channel.as_fd(),
-      &slates_anchor::devices::Outgoing::Session {
+      &slates_anchor::held::Outgoing::Session {
         attachment: DEVICE_ATTACHMENT,
         session: &DEVICE_SESSION,
       },
@@ -883,7 +883,7 @@ fn a_device_a_daemon_sent_is_held_across_its_restart_and_handed_to_its_successor
   };
   let mut supervisor = Supervisor::new(segment, &exe, &args, policy);
   // Shape: room for this test's one device.
-  supervisor.hold_devices(4).unwrap();
+  supervisor.hold_descriptors(4, 4).unwrap();
   // SAFETY: the test is single-threaded here; the role is chosen by the child's args, so a parallel test's child
   // ignores this variable.
   unsafe {

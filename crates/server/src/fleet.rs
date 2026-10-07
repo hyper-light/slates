@@ -413,7 +413,7 @@ fn adopt_inherited(
 }
 
 /// Takes ownership of a descriptor the supervisor handed over at `raw`: a fleet serve socket
-/// (`ENV_FLEET_SERVE`), or the device channel and a held FUSE device (`slates_anchor::devices::ENV_DEVICES`,
+/// (`ENV_FLEET_SERVE`), or the device channel and a held FUSE device (`slates_anchor::held::ENV_DEVICES`,
 /// `crate::fuse_hold`).
 #[cfg(unix)]
 pub(crate) fn inherited_descriptor(raw: std::os::fd::RawFd) -> std::os::fd::OwnedFd {

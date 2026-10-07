@@ -2915,3 +2915,29 @@ user (scratchpad `crash-inner.sh`).
   `volume stat` reported `referenced_bytes` 2,147,483,588 of the 2 GiB quota.
 - **Harness lessons:** the first versions ignored `os.write`'s short return near the quota and leaked a descriptor on
   a failed write. Both read as slates faults (a "mismatched" file, a wall of `EMFILE`), and neither was one.
+
+## macOS NFS: a daemon restart under the held connection (A-113, 2026-10-06)
+
+This Mac (M5 Max, Darwin 25.4), release binaries, the anchor with `--quick --shards 1` (A/B) or `--shards 2` (kills).
+
+**The restart, before and after.** Before, through the kernel mount: each `SIGKILL` of the daemon stalled the writer
+1,003–1,015 ms (six kills); four kills in quick succession stalled one call 4,006 ms. After, through one userspace NFS
+connection (`crates/cli/tests/nfs_held.rs`, `SLATES_TEST_CLI=1`, six kills inside bursts of 12 pipelined FILE_SYNC
+WRITEs): the longest time from a kill until the next request was answered was 126.1, 122.7 and 123.9 ms over three
+runs. That is the anchor's restart of the daemon; nothing reconnected.
+
+**Every request's new cost, A/B.** The held connection peeks each request, consumes it after its reply, and sends whole
+records. `8a18d90` (base) against the change (held), interleaved base, held, base, held, four rounds each, through the
+kernel mount `slates mount` makes (scratchpad `ab.sh`, `ab-work.py`: 500 files of create+write 4 KiB+close, open+read
+4 KiB+close, unlink; 200 × 256 KiB write+fsync). Load average 4.3–6.6.
+
+| Operation | base p50 | held p50 | base p99 | held p99 |
+|---|---|---|---|---|
+| create+write+close | 433, 442, 452, 446 µs | 438, 442, 457, 432 µs | 897, 840, 895, 887 µs | 849, 877, 1,010, 899 µs |
+| open+read+close | 31, 31, 31, 32 µs | 31, 32, 33, 33 µs | 54, 41, 86, 60 µs | 41, 42, 56, 56 µs |
+| unlink | 136, 131, 156, 141 µs | 135, 126, 143, 154 µs | 309, 290, 334, 285 µs | 641, 297, 316, 274 µs |
+| 256 KiB write+fsync | 528, 572, 597, 572 µs | 545, 542, 575, 550 µs | 909, 1,856, 1,673, 1,016 µs | 845, 854, 954, 956 µs |
+
+Medians are even (open+read+close perhaps 1 µs dearer: the discard is one more call). The 256 KiB write's p99 is
+tighter with the change, likely because each connection's buffers now hold two whole records where the default was
+128 KiB. The held unlink p99 of 641 µs did not repeat in three more rounds.
