@@ -3207,3 +3207,43 @@ Desktop's LinuxKit kernel is 6.12.76-linuxkit now; its NFS client decides when a
 draws over 2,000 files touch about 1,264 distinct files, near the 1,117 GETATTRs, which suggests the client
 revalidates a file's first stat after its close and serves later ones from its cache. The 2.3 µs row is a reading
 of the older client, not a floor this build lost.
+
+### Remote pulls under horrific networks: delay jitter collapses Copa (condition 7; 2026-10-07)
+
+`fetch_bench` gained harsh rows (reordering jitter via `SimPath::reordering`, in-order jitter, 10% loss) and two
+holder counters per row: spurious losses (declared lost, then acknowledged) and the smallest end congestion
+window. Release build, this Mac, simulated network and virtual clock.
+
+At 1,024 chunks (64 MiB):
+
+| Scenario | Result |
+|---|---|
+| 3 holders, 8 readers, 10% loss (80 ms) | completes, 15.2–21.5 s, 199.6 of 300 Mbit/s |
+| 250 ms, reordering ±60 ms, 5% loss, 3 holders | **not complete within 600 s** |
+| thin 10 Mbit/s, 200 ms, reordering ±40 ms, 2% loss | **not complete within 600 s** |
+
+The thin link's parts apart, at 16 chunks (1 MiB):
+
+| Thin link, 200 ms | Goodput | End window | Spurious losses |
+|---|---|---|---|
+| no impairment (`wan`, for scale, 80 ms 100 Mbit/s) | 20.9 Mbit/s | 749 KB | 0 |
+| 2% loss, in order | 5.1 Mbit/s | 361 KB | 0 |
+| jitter ±40 ms, kept in order, no loss | 1.5 Mbit/s | 24 KB | 0 |
+| jitter ±40 ms, reordering, no loss | 0.8 Mbit/s | 19.6 KB | 9 |
+| jitter ±40 ms, reordering, 2% loss | 0.6 Mbit/s | 17.1 KB | 15 |
+
+The cause is delay jitter, not loss and not mainly reordering:
+
+- Loss alone keeps a 361 KB window.
+- Jitter alone, with no reordering and no spurious loss, collapses it to 24 KB.
+- Copa in its default mode ignores loss (`on_loss` acts only in the competitive mode or on persistent congestion),
+  so an Eifel-style undo of spurious loss responses (RFC 4015) would not help; it was considered and is not the
+  fix.
+- Copa sizes its window from `standing RTT − minimum RTT`. With ±40 ms jitter the minimum locks onto the fast
+  tail while the standing RTT (a minimum over half a round trip) sees few samples once the window is small. The
+  spread is read as queue and the window shrinks further: a feedback loop.
+- Reordering on top doubles the cost through spurious retransmissions (the adaptive tolerance, `reorder.rs`,
+  bounds those).
+
+Owed: a jitter-robust delay signal, chosen from the literature and A/B'd on these rows plus the 57-scenario
+bake-off (which had no heavy jitter). Until then the two reordering rows fail at 64 MiB.

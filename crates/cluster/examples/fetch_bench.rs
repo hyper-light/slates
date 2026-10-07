@@ -74,9 +74,10 @@ const NS_PER_MS: u64 = 1_000_000;
 /// Shape: the coordinator's and each worker's poll: a tenth of a millisecond, finer than any path's round trip
 /// here, so polling adds no visible latency.
 const POLL_NS: u64 = 100_000;
-/// Shape: the fetch's whole span: generous against the slowest scenario (5% loss at 80 ms), so the deadline never
-/// decides a completion time; a reader still incomplete at it is a failure.
-const DEADLINE_NS: u64 = 120 * NS_PER_SECOND;
+/// Shape: the fetch's whole span: generous against the slowest scenario (the thin link: 64 MiB over 10 Mbit/s is
+/// 54 s of transfer alone, before a 200 ms round trip, 2% loss and reordering), so the deadline never decides a
+/// completion time; a reader still incomplete at it is a failure.
+const DEADLINE_NS: u64 = 600 * NS_PER_SECOND;
 /// Shape: a queue ahead of each holder's uplink of one bandwidth-delay product, the classic router sizing
 /// (Villamizar & Song 1994), at least a few datagrams.
 const MIN_QUEUE_BYTES: u64 = 16 * MIN_DATAGRAM_BYTES as u64;
@@ -97,6 +98,11 @@ struct Scenario {
   rtt_ns: u64,
   rate_bits_per_second: u64,
   loss: SimLoss,
+  /// The half-width of each path's jitter: zero keeps every flow in order; above zero the jitter may reorder it (the
+  /// horrific profiles: a datagram may arrive up to twice this after one sent later).
+  jitter_ns: u64,
+  /// Whether the jitter keeps each flow in send order (varying delay alone, no reordering).
+  jitter_in_order: bool,
   /// A holder index whose uplink runs at `rate / slow_divisor` (a degraded holder), if any.
   slow: Option<(usize, u64)>,
   /// A holder index whose paths drop everything once the sessions formed (a silent holder), if any.
@@ -130,6 +136,10 @@ struct Outcome {
   steals: u64,
   failed_holders: u64,
   all_rebuilt: bool,
+  /// The holders' declared losses the readers then acknowledged, summed ([`SenderStats`]).
+  spurious_losses: u64,
+  /// The smallest holder congestion window at the end, bytes.
+  min_congestion_window: u64,
 }
 
 fn config() -> RuntimeConfig {
@@ -275,9 +285,17 @@ async fn serve(
   holder: Kept<RefCell<Holder>>,
   host: HostId,
   stop: Receiver<()>,
+  stats: Sender<SenderStats>,
 ) {
+  let report = |endpoint: &Endpoint| {
+    let _ = stats.send(SenderStats {
+      spurious_losses: endpoint.spurious_losses(),
+      congestion_window: endpoint.congestion_window(),
+    });
+  };
   loop {
     if stop.try_recv().is_ok() {
+      report(&endpoint);
       return;
     }
     let served = slates_rt::futures::within(
@@ -302,9 +320,17 @@ async fn serve(
     )
     .await;
     if matches!(served, Ok(Some(Err(_)))) {
+      report(&endpoint);
       return;
     }
   }
+}
+
+/// What a holder's sending end counted once its serve loop stopped: the losses it declared that the reader then
+/// acknowledged (reordering read as loss, `slates_transport::reorder`), and its congestion window at the end.
+struct SenderStats {
+  spurious_losses: u64,
+  congestion_window: u64,
 }
 
 /// What one reader's timed fetch measured.
@@ -453,9 +479,13 @@ fn pair_up(scenario: &Scenario) -> Vec<Pair> {
         holder_socket.local_addr().unwrap(),
         reader_socket.local_addr().unwrap(),
       );
-      let path = SimPath::in_order(one_way, 0)
-        .with_loss(scenario.loss)
-        .with_mtu(MIN_DATAGRAM_BYTES);
+      let path = if scenario.jitter_ns == 0 || scenario.jitter_in_order {
+        SimPath::in_order(one_way, scenario.jitter_ns)
+      } else {
+        SimPath::reordering(one_way, scenario.jitter_ns)
+      }
+      .with_loss(scenario.loss)
+      .with_mtu(MIN_DATAGRAM_BYTES);
       sim_udp_set_pair_path(
         holder_address.port(),
         reader_address.port(),
@@ -501,8 +531,10 @@ async fn establish(
   Vec<Vec<(HostId, Endpoint)>>,
   Vec<Sender<()>>,
   Vec<(u16, u16)>,
+  Vec<Receiver<SenderStats>>,
 ) {
   let (established_tx, established_rx) = channel();
+  let mut stats_receivers = Vec::new();
   let (mut stops, mut silent_ports) = (Vec::new(), Vec::new());
   let count = pairs.len();
   for pair in pairs {
@@ -518,13 +550,15 @@ async fn establish(
     }
     let (stop_tx, stop_rx) = channel();
     stops.push(stop_tx);
+    let (stats_tx, stats_rx) = channel();
+    stats_receivers.push(stats_rx);
     let (host, kept) = (HostId(10 + holder as u64), holders[holder]);
     let established = established_tx.clone();
     let (ready_tx, ready_rx) = channel();
     let server_task = slates_rt::futures::spawn(async move {
       server.establish().await.unwrap();
       let _ = ready_tx.send(());
-      serve(server, kept, host, stop_rx).await;
+      serve(server, kept, host, stop_rx, stats_tx).await;
     })
     .unwrap();
     let _ = slates_rt::futures::detach(server_task);
@@ -545,7 +579,7 @@ async fn establish(
     established_rx = rest;
     sessions[reader].push((host, client));
   }
-  (sessions, stops, silent_ports)
+  (sessions, stops, silent_ports, stats_receivers)
 }
 
 /// Runs every reader's warm-up, then their timed fetches together, and gathers what they measured.
@@ -578,6 +612,8 @@ async fn run_readers(reader_sessions: Vec<Vec<(HostId, Endpoint)>>) -> Outcome {
     steals: 0,
     failed_holders: 0,
     all_rebuilt: true,
+    spurious_losses: 0,
+    min_congestion_window: u64::MAX,
   };
   let mut done_rx = done_rx;
   for _ in 0..readers {
@@ -600,16 +636,21 @@ async fn run_readers(reader_sessions: Vec<Vec<(HostId, Endpoint)>>) -> Outcome {
 async fn coordinate(scenario: Scenario) -> Outcome {
   let holders = keep_holders(scenario.holders);
   let pairs = pair_up(&scenario);
-  let (reader_sessions, stops, silent_ports) = establish(pairs, &holders, &scenario).await;
+  let (reader_sessions, stops, silent_ports, stats) = establish(pairs, &holders, &scenario).await;
   // A silent holder: every one of its paths drops everything from here on.
   for (holder_port, reader_port) in silent_ports {
     let dead = SimPath::in_order(scenario.rtt_ns / 2, 0).with_loss(SimLoss::random(PPM));
     sim_udp_set_pair_path(holder_port, reader_port, dead);
     sim_udp_set_pair_path(reader_port, holder_port, dead);
   }
-  let outcome = run_readers(reader_sessions).await;
+  let mut outcome = run_readers(reader_sessions).await;
   for stop in stops {
     let _ = stop.send(());
+  }
+  for receiver in stats {
+    let (sender, _) = receive(receiver).await;
+    outcome.spurious_losses += sender.spurious_losses;
+    outcome.min_congestion_window = outcome.min_congestion_window.min(sender.congestion_window);
   }
   outcome
 }
@@ -622,6 +663,8 @@ fn grid() -> Vec<Scenario> {
     rtt_ns: rtt_ms * NS_PER_MS,
     rate_bits_per_second: mbps * 1_000_000,
     loss,
+    jitter_ns: 0,
+    jitter_in_order: false,
     slow: None,
     silent: None,
   };
@@ -694,6 +737,71 @@ fn grid() -> Vec<Scenario> {
       100,
       SimLoss::random(PPM / 100),
     ),
+    // The horrific profiles (condition 7: "heavy contested usage, network congestion, network issues"): an
+    // intercontinental path with reordering jitter and heavy loss, a congested many-reader pull at 10% loss, and a
+    // thin lossy link that reorders.
+    Scenario {
+      jitter_ns: 60 * NS_PER_MS,
+      ..base(
+        "horrific: 250 ms, reordering ±60 ms, 5% loss, 3 holders",
+        3,
+        1,
+        250,
+        100,
+        SimLoss::random(PPM / 20),
+      )
+    },
+    base(
+      "horrific: 3 holders, 8 readers, 10% loss",
+      3,
+      8,
+      wan_rtt_ms,
+      100,
+      SimLoss::random(PPM / 10),
+    ),
+    // The thin link's two impairments apart, so a slow pull names which one costs it.
+    Scenario {
+      jitter_ns: 40 * NS_PER_MS,
+      ..base(
+        "horrific parts: thin 10 Mbit/s, 200 ms, reordering ±40 ms, no loss",
+        1,
+        1,
+        200,
+        10,
+        SimLoss::NONE,
+      )
+    },
+    Scenario {
+      jitter_ns: 40 * NS_PER_MS,
+      jitter_in_order: true,
+      ..base(
+        "horrific parts: thin 10 Mbit/s, 200 ms, jitter ±40 ms in order, no loss",
+        1,
+        1,
+        200,
+        10,
+        SimLoss::NONE,
+      )
+    },
+    base(
+      "horrific parts: thin 10 Mbit/s, 200 ms, 2% loss, in order",
+      1,
+      1,
+      200,
+      10,
+      SimLoss::random(PPM / 50),
+    ),
+    Scenario {
+      jitter_ns: 40 * NS_PER_MS,
+      ..base(
+        "horrific: thin 10 Mbit/s, 200 ms, reordering ±40 ms, 2% loss",
+        1,
+        1,
+        200,
+        10,
+        SimLoss::random(PPM / 50),
+      )
+    },
   ]
 }
 
@@ -701,7 +809,7 @@ fn main() {
   let filter = std::env::args().nth(1).unwrap_or_default();
   let archive_bytes = (chunks() * CHUNK_BYTES) as u64;
   println!(
-    "scenario,holders,readers,rtt_ms,uplink_mbps,completion_min_ms,completion_median_ms,completion_max_ms,goodput_mbps,capacity_mbps,hedges,steals,holders_dropped,rebuilt"
+    "scenario,holders,readers,rtt_ms,uplink_mbps,completion_min_ms,completion_median_ms,completion_max_ms,goodput_mbps,capacity_mbps,hedges,steals,holders_dropped,rebuilt,spurious_losses,min_end_cwnd_bytes"
   );
   let mut failed = false;
   for scenario in grid()
@@ -729,7 +837,7 @@ fn main() {
       .sum::<u64>()
       / 1_000_000;
     println!(
-      "{},{},{},{},{},{:.1},{:.1},{:.1},{:.1},{},{},{},{},{}",
+      "{},{},{},{},{},{:.1},{:.1},{:.1},{:.1},{},{},{},{},{},{},{}",
       scenario.name,
       scenario.holders,
       scenario.readers,
@@ -743,7 +851,9 @@ fn main() {
       outcome.hedges,
       outcome.steals,
       outcome.failed_holders,
-      outcome.all_rebuilt
+      outcome.all_rebuilt,
+      outcome.spurious_losses,
+      outcome.min_congestion_window
     );
     failed |= !outcome.all_rebuilt;
   }
