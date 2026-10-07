@@ -2820,8 +2820,8 @@ impl Claims {
     }
     claims.locking = false;
     if let Err(refusal) = claimed {
-      claims.give_back(store);
-      return Err(refusal);
+      let undo = claims.give_back(store);
+      return Err(refusal.after_undo(undo));
     }
     store.content.arena_mut().commit_live();
     Ok(claims)
@@ -2897,8 +2897,7 @@ impl Claims {
             match key {
               Ok(key) => Some((key, seal.version, seal.tags.as_slice())),
               Err(refusal) => {
-                let _ = store.content.give_back_block(block);
-                return Err(refusal);
+                return Err(refusal.after_undo(store.content.give_back_block(block)));
               }
             }
           }
@@ -2917,8 +2916,7 @@ impl Claims {
         let handle = match adopted {
           Ok(handle) => handle,
           Err(refusal) => {
-            let _ = store.content.give_back_block(block);
-            return Err(refusal);
+            return Err(refusal.after_undo(store.content.give_back_block(block)));
           }
         };
         self.held.insert(key, Held::Chunk(handle, chunk.clone()));
@@ -2954,14 +2952,20 @@ impl Claims {
     }
   }
 
-  /// Gives back every claim of a refused preparation, before anything is committed.
-  fn give_back(&mut self, store: &mut Store) {
+  /// Gives back every claim of a refused preparation, before anything is committed: every one is tried, and the first
+  /// refusal is returned (the caller's [`VfsError::after_undo`]).
+  fn give_back(&mut self, store: &mut Store) -> Result<(), VfsError> {
+    let mut first = Ok(());
     for (_, held) in std::mem::take(&mut self.held) {
-      let _ = match held {
+      let given = match held {
         Held::Chunk(handle, _) => store.content.give_back_chunk(handle),
         Held::Open(block, _) => store.content.give_back_block(block),
       };
+      if first.is_ok() {
+        first = given;
+      }
     }
+    first
   }
 
   fn chunk(&self, chunk: &ChunkImage) -> Result<Handle<Chunk>, VfsError> {

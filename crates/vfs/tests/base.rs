@@ -333,6 +333,79 @@ fn the_overlay_worked_example_copies_up_with_a_witness_equal_to_the_disk() {
   assert_eq!(diverged[0].kind, Divergence::Witnessed);
 }
 
+/// A reclaimed base file's descriptor is closed (2026-10-07). Do: read `/src/main.rs` through the overlay (its
+/// descriptor is held, so the host holds the root, `src` and the file open), unlink it through the overlay (no
+/// reference holds it, so it is reclaimed at once), then drain the host's hints. Expect: the host holds the two
+/// directories and nothing else. Before, the reclaim took the descriptor out of the plane's table and dropped it
+/// without closing it: on a real disk, a file descriptor leaked per unlinked base file.
+#[test]
+fn an_unlinked_base_files_descriptor_is_closed() {
+  let mut host = SimHost::new();
+  host.mkdir("/src");
+  host.replace_file("/src/main.rs", b"fn main() {}");
+  host.advance_ns(2);
+  let mut store = store();
+  let mut vol = overlay(&mut host, &mut store);
+  assert_eq!(
+    read_all(&mut vol, &mut host, &mut store, "/src/main.rs").unwrap(),
+    b"fn main() {}"
+  );
+  assert_eq!(
+    host.open_handles(),
+    3,
+    "the root, src, and the file's descriptor"
+  );
+  let src = match vol
+    .with_host(&mut host)
+    .resolve(&mut store, "/src")
+    .unwrap()
+    .child
+  {
+    Child::Dir(handle) => handle,
+    other => panic!("{other:?}"),
+  };
+  vol
+    .with_host(&mut host)
+    .unlink(&mut store, src, "main.rs")
+    .unwrap();
+  vol.with_host(&mut host).process_hints(&mut store).unwrap();
+  assert_eq!(
+    host.open_handles(),
+    2,
+    "the root and src, the file's descriptor closed"
+  );
+}
+
+/// A drift re-check the host refuses is reported, never passed (2026-10-07). Do: in the worked example, arm the host
+/// to refuse opening the witnessed `/src/lib.rs` (an I/O error) and ask for the status; then clear the fault and ask
+/// again. Expect: the first status lists `/src/lib.rs` as unverified with the host's refusal and no drift; the
+/// second lists nothing unverified. Before, the refusal was dropped and the entry looked as if it matched its witness.
+#[test]
+fn a_drift_recheck_the_host_refuses_is_reported_unverified() {
+  let (mut host, mut store, mut vol, _) = worked_example();
+  host.fail(
+    slates_vfs::host::sim::SimVerb::OpenFile,
+    "/src/lib.rs",
+    slates_vfs::host::HostError::Unavailable(5),
+    u32::MAX,
+  );
+  let status = vol.with_host(&mut host).status(&mut store).unwrap();
+  assert!(status.drift.is_empty(), "{:?}", status.drift);
+  assert_eq!(
+    status
+      .unverified
+      .iter()
+      .map(|(path, _)| path.as_str())
+      .collect::<Vec<_>>(),
+    vec!["/src/lib.rs"],
+    "{:?}",
+    status.unverified
+  );
+  host.clear_faults();
+  let status = vol.with_host(&mut host).status(&mut store).unwrap();
+  assert!(status.unverified.is_empty(), "{:?}", status.unverified);
+}
+
 /// The worked example, second half: `git pull` replaces both files on the host; drift is
 /// reported on the witnessed entry and nothing else; `read_base` shows the disk; `rewitness`
 /// clears the drift and leaves the agent's content alone.
@@ -1454,9 +1527,11 @@ fn an_outsiders_edit_moves_the_change_counter_and_a_plain_stat_does_not() {
   let mut store = store();
   let mut vol = overlay(&mut host, &mut store);
   let counter = |vol: &mut Volume, host: &mut SimHost, store: &mut Store| {
-    let mut o = vol.with_host(host);
-    let no = o.resolve(store, "/f").unwrap().inode;
-    let size = o.stat(store, no).unwrap().size;
+    let (no, size) = {
+      let mut o = vol.with_host(host);
+      let no = o.resolve(store, "/f").unwrap().inode;
+      (no, o.stat(store, no).unwrap().size)
+    };
     (size, vol.change_version(store, no).unwrap())
   };
   let (size, first) = counter(&mut vol, &mut host, &mut store);

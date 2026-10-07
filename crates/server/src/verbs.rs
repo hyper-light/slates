@@ -1969,6 +1969,7 @@ pub fn shard_report(state: &mut ShardState) -> ShardReport {
           (CONTENT_SEALED, state.store.content.sealed()),
           (CONTENT_SEAL_REFUSED, state.store.content.seal_refusals()),
           (CONTENT_FREE_REFUSED, state.store.content.free_refusals()),
+          (STORE_RELEASE_REFUSED, state.store.release_refusals),
         ]
         .into_iter()
         .filter(|(_, count)| *count > 0)
@@ -5862,6 +5863,11 @@ fn status(state: &mut ShardState, principal: &Principal, volume: VolumeId) -> Re
         s.drift
           .iter()
           .map(|(p, k)| format!("{p} ({k:?})"))
+          .chain(
+            s.unverified
+              .iter()
+              .map(|(p, refusal)| format!("{p} (unverified: {refusal})")),
+          )
           .collect(),
         format!("{:?}", s.watcher),
       ),
@@ -8042,6 +8048,9 @@ pub(crate) const CONTENT_SEAL_REFUSED: &str = "content.seal_refused";
 
 /// Format: the status counter of frees refused on a seal's paths (a block or a tag run not given back, A-99).
 pub(crate) const CONTENT_FREE_REFUSED: &str = "content.free_refused";
+
+/// Format: the status counter of retired objects whose release the store refused (listed twice, or a free refused).
+pub(crate) const STORE_RELEASE_REFUSED: &str = "store.release_refused";
 
 /// Publishes when the shard's arena is short of room only because freed blocks wait on a publication (A-64): a
 /// block the committed recovery image may name is not reused until a newer image commits. Run before each unit of

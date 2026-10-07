@@ -473,9 +473,9 @@ impl Volume {
       }
     };
     if let Err(refusal) = self.table_set(store, fresh, handle) {
-      let _ = store.inodes.remove(handle);
+      let undo = store.inodes.remove(handle);
       self.unissue_no();
-      return Err(refusal);
+      return Err(refusal.after_undo(undo));
     }
     Ok(fresh)
   }

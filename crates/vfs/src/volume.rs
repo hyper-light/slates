@@ -118,6 +118,9 @@ pub struct Store {
   /// inode table's size ([`crate::base::digest_capacity`]), so the caches together never exceed
   /// their share of the reserve; at the bound a fresh digest is exported but not kept.
   pub digests: crate::base::DigestBudget,
+  /// Releases of retired objects the store refused (an object already gone, or a free the arena refused): each is an
+  /// object listed twice or one left held, so it is counted and surfaced (`store.release_refused`), never silent.
+  pub release_refusals: u64,
 }
 
 impl std::fmt::Debug for Store {
@@ -195,6 +198,7 @@ impl Store {
       digests: crate::base::DigestBudget::new(
         crate::base::digest_capacity(config.max_inodes).get(),
       ),
+      release_refusals: 0,
     }
   }
 
@@ -1519,8 +1523,7 @@ impl Volume {
     };
     // Publication: the name is the one step a client sees.
     if let Err(refusal) = self.dir_insert(store, dir, name, child) {
-      self.uninstall(store, no, handle);
-      return Err(refusal);
+      return Err(refusal.after_undo(self.uninstall(store, no, handle)));
     }
     self.touch_dir(store, dir, now)?;
     let path = self.path_of(store, dir, name);
@@ -1576,14 +1579,13 @@ impl Volume {
     let handle = match self.install(store, no, inode) {
       Ok(handle) => handle,
       Err(refusal) => {
-        let _ = store.dirs.remove(child);
-        return Err(refusal);
+        return Err(refusal.after_undo(store.dirs.remove(child)));
       }
     };
     if let Err(refusal) = self.dir_insert(store, dir, name, Child::Dir(child)) {
-      self.uninstall(store, no, handle);
-      let _ = store.dirs.remove(child);
-      return Err(refusal);
+      let inode = self.uninstall(store, no, handle);
+      let node = store.dirs.remove(child).map(|_| ()).map_err(VfsError::from);
+      return Err(refusal.after_undo(inode.and(node)));
     }
     self.touch_dir(store, dir, now)?;
     self.adjust_nlink(store, store.dirs.get(dir)?.inode, 1)?;
@@ -1626,8 +1628,7 @@ impl Volume {
     stamp_all(&mut inode.attrs, now);
     let handle = self.install(store, no, inode)?;
     if let Err(refusal) = self.dir_insert(store, dir, name, Child::Symlink(no)) {
-      self.uninstall(store, no, handle);
-      return Err(refusal);
+      return Err(refusal.after_undo(self.uninstall(store, no, handle)));
     }
     self.touch_dir(store, dir, now)?;
     let path = self.path_of(store, dir, name);
@@ -3601,10 +3602,22 @@ impl Volume {
   /// Undoes an inode a verb installed and never published (AUD-29-40): its table entry, its version
   /// and its charge, so the refused verb leaves the table, the slab and the allowance as they were.
   /// The number is not reissued.
-  fn uninstall(&mut self, store: &mut Store, no: InodeNo, handle: Handle<Inode>) {
-    let _ = self.table_remove(store, no);
-    let _ = store.inodes.remove(handle);
+  /// Both steps are taken whatever the first answers; the first refusal is returned (the caller's
+  /// [`VfsError::after_undo`]).
+  fn uninstall(
+    &mut self,
+    store: &mut Store,
+    no: InodeNo,
+    handle: Handle<Inode>,
+  ) -> Result<(), VfsError> {
+    let table = self.table_remove(store, no).map(|_| ());
+    let slab = store
+      .inodes
+      .remove(handle)
+      .map(|_| ())
+      .map_err(VfsError::from);
     self.unissue_no();
+    table.and(slab)
   }
 
   /// Installs a fresh inode under a number [`Volume::next_no`] issued: its version in the slab and its
@@ -3623,9 +3636,9 @@ impl Volume {
       }
     };
     if let Err(refusal) = self.table_set(store, no, handle) {
-      let _ = store.inodes.remove(handle);
+      let undo = store.inodes.remove(handle);
       self.unissue_no();
-      return Err(refusal);
+      return Err(refusal.after_undo(undo));
     }
     Ok(handle)
   }
@@ -4184,10 +4197,7 @@ impl Volume {
     let installed = match store.inodes.insert(copy) {
       Ok(fresh) => match self.table_set(store, no, fresh) {
         Ok(_) => Ok(fresh),
-        Err(refusal) => {
-          let _ = store.inodes.remove(fresh);
-          Err(refusal)
-        }
+        Err(refusal) => Err(refusal.after_undo(store.inodes.remove(fresh))),
       },
       Err(refusal) => Err(refusal.into()),
     };
@@ -4265,8 +4275,7 @@ impl Volume {
           Child::Dir(fresh),
         );
         if let Err(refusal) = set {
-          let _ = store.dirs.remove(fresh);
-          return Err(refusal);
+          return Err(refusal.after_undo(store.dirs.remove(fresh)));
         }
         self.retire_blocks(store, retired)?;
       }
@@ -4538,12 +4547,12 @@ impl Volume {
       None => Some(self.dir_place(store, to_dir, to_name, moved)?),
     };
     if let Err(refusal) = self.dir_remove(store, from_dir, from_name) {
-      let _ = match (replaced, over_whiteout) {
+      let undo = match (replaced, over_whiteout) {
         (Some(t), _) => self.dir_set(store, to_dir, to_name, t.child),
         (None, Some(over_whiteout)) => self.dir_unplace(store, to_dir, to_name, over_whiteout),
         (None, None) => Ok(()),
       };
-      return Err(refusal);
+      return Err(refusal.after_undo(undo));
     }
     Ok(())
   }
@@ -4719,9 +4728,13 @@ impl Volume {
     // The number leaves the head: return its credit to the inode allowance (§4.2). The single
     // permanent-free site, matching `next_no`'s single charge.
     self.live_inodes = self.live_inodes.saturating_sub(1);
-    // The base plane's descriptor, if one was held, is closed by the owner of the host at its
-    // next `process_hints`; the tables forget the inode now.
-    let _ = self.base_forget(store, no);
+    // The base plane's descriptor, if one was held, is closed when the next overlay borrow ends (the volume holds no
+    // host here); the tables forget the inode now.
+    if let Some(file) = self.base_forget(store, no)
+      && let Some(plane) = self.base.as_mut()
+    {
+      plane.queue_close(file);
+    }
     Ok(())
   }
 
@@ -5265,8 +5278,8 @@ impl Volume {
           Err(refusal) => return refused(Body::Inline(v), refusal),
         };
         if let Err(refusal) = store.content.write_open(&mut open, 0, &v) {
-          let _ = store.content.release_open(open);
-          return refused(Body::Inline(v), refusal);
+          let undo = store.content.release_open(open);
+          return refused(Body::Inline(v), refusal.after_undo(undo));
         }
         let mut sealed = Vec::new();
         self.write_into(store, Box::new(open), &mut sealed, off, bytes)
@@ -6219,34 +6232,25 @@ const BLOCK_SEGMENT_PAGES: usize = 64;
 /// `Dead::Chunk` by [`Volume::destroy`]'s walk of the head and by the recovery rebuild
 /// ([`tree_deadlist_excluding`]). Only an open extent's block belongs to the version alone.
 fn release_dead(store: &mut Store, dead: Dead) -> Result<usize, VfsError> {
-  match dead {
-    Dead::Dir(h, _) => {
-      let _ = store.dirs.discard(h);
-      Ok(1)
-    }
-    Dead::DirBlock(h, _) => {
-      let _ = store.blocks.discard(h);
-      Ok(1)
-    }
-    Dead::Inode(h, _) => {
-      let Ok(inode) = store.inodes.remove(h) else {
-        return Ok(1);
-      };
-      if let Body::Open { open, .. } = &inode.body {
-        let _ = store.content.release_open(**open);
-        return Ok(2);
-      }
-      Ok(1)
-    }
-    Dead::Trie(h, _) => {
-      let _ = store.tries.discard(h);
-      Ok(1)
-    }
-    Dead::Chunk(h, _) => {
-      let _ = store.content.free_chunk(h);
-      Ok(1)
-    }
+  // Releasing is idempotent (an object already gone counts as released, so a walk can be resumed), but a refusal is
+  // never silent: it is counted on the store.
+  let (released, freed) = match dead {
+    Dead::Dir(h, _) => (store.dirs.discard(h).map_err(VfsError::from), 1),
+    Dead::DirBlock(h, _) => (store.blocks.discard(h).map_err(VfsError::from), 1),
+    Dead::Inode(h, _) => match store.inodes.remove(h) {
+      Ok(inode) => match &inode.body {
+        Body::Open { open, .. } => (store.content.release_open(**open), 2),
+        _ => (Ok(()), 1),
+      },
+      Err(refusal) => (Err(refusal.into()), 1),
+    },
+    Dead::Trie(h, _) => (store.tries.discard(h).map_err(VfsError::from), 1),
+    Dead::Chunk(h, _) => (store.content.free_chunk(h), 1),
+  };
+  if released.is_err() {
+    store.release_refusals = store.release_refusals.saturating_add(1);
   }
+  Ok(freed)
 }
 
 /// The sealed extents a body holds: its sealed list, the sealed list beneath an open extent, or a

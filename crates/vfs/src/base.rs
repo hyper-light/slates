@@ -154,6 +154,9 @@ pub enum DriftKind {
 pub struct BaseStatus {
   /// Every witnessed entry whose disk no longer matches its witness, by path.
   pub drift: Vec<(String, DriftKind)>,
+  /// Every witnessed entry whose re-check the host refused now (an I/O error reading the disk), by path, with the
+  /// refusal: not known to match, so never reported as if it did (2026-10-07; the re-check's refusal was dropped).
+  pub unverified: Vec<(String, VfsError)>,
   /// The watcher's state.
   pub watcher: WatchState,
 }
@@ -402,6 +405,9 @@ pub struct BasePlane {
   drift: BTreeMap<InodeNo, DriftKind>,
   /// Open file descriptors by inode number (large-class copies and read-through).
   descriptors: BTreeMap<InodeNo, HostFile>,
+  /// Descriptors taken out of `descriptors` by a reclaim that had no host to close them with (the volume reclaims an
+  /// inode on its own): closed when the next [`Overlay`] borrow ends. Bounded by `descriptors`, which each left.
+  closing: Vec<HostFile>,
   /// The base entry each whiteout hides, by (directory inode, name): its fingerprint at the
   /// removal, the landing's witnessed base for a delete (§4.15). Versioned by epoch (A-48).
   whiteouts: Versioned<(InodeNo, Box<str>), Fingerprint>,
@@ -431,6 +437,11 @@ pub struct BasePlane {
 }
 
 impl BasePlane {
+  /// Queues `file`, forgotten by a reclaim with no host, to be closed when the next overlay borrow ends.
+  pub(crate) fn queue_close(&mut self, file: HostFile) {
+    self.closing.push(file);
+  }
+
   fn new(config: BaseConfig, root_no: InodeNo) -> Self {
     let mut listings = BTreeMap::new();
     listings.insert(
@@ -453,6 +464,7 @@ impl BasePlane {
       witness_homes: Versioned::default(),
       drift: BTreeMap::new(),
       descriptors: BTreeMap::new(),
+      closing: Vec::new(),
       whiteouts: Versioned::default(),
       redirects: Versioned::default(),
       watch: WatchState::Unavailable,
@@ -941,6 +953,20 @@ impl Volume {
 pub struct Overlay<'a> {
   vol: &'a mut Volume,
   host: &'a mut dyn HostFs,
+}
+
+/// An overlay borrow closes the descriptors a reclaim forgot (`BasePlane::closing`) when it ends, so every verb run
+/// through it closes what it reclaimed, and a reclaim with no host closes at the next borrow. Before 2026-10-07 a
+/// reclaim dropped the descriptor unclosed: a file descriptor leaked per unlinked base file on a real disk.
+impl Drop for Overlay<'_> {
+  fn drop(&mut self) {
+    let Some(plane) = self.vol.base.as_mut() else {
+      return;
+    };
+    for file in std::mem::take(&mut plane.closing) {
+      self.host.close_file(file);
+    }
+  }
 }
 
 impl Overlay<'_> {
@@ -2761,6 +2787,27 @@ impl Overlay<'_> {
     Ok(Some(*blake3::hash(&bytes?).as_bytes()))
   }
 
+  /// Re-checks the witnessed entries `targets` against the disk. A re-check the host refused is not a pass: its
+  /// directory waits for the next drain, so the entry is checked again rather than forgotten (bounded: the set of
+  /// directories). Drift found is recorded by the check itself.
+  fn recheck_witnessed(
+    &mut self,
+    store: &mut Store,
+    targets: Vec<InodeNo>,
+  ) -> Result<(), VfsError> {
+    for no in targets {
+      match self.check_drift(store, no) {
+        Ok(()) | Err(VfsError::BaseDrift) => {}
+        Err(_) => {
+          if let Some(home) = self.vol.inode(store, no).ok().and_then(|inode| inode.home) {
+            self.plane()?.recheck.insert(home.parent());
+          }
+        }
+      }
+    }
+    Ok(())
+  }
+
   /// `status`: every witnessed entry re-checked now, the drift list by path, the watcher.
   pub fn status(&mut self, store: &mut Store) -> Result<BaseStatus, VfsError> {
     self.process_hints(store)?;
@@ -2770,9 +2817,21 @@ impl Overlay<'_> {
       .as_ref()
       .map(|b| b.witnesses.iter_head().map(|(no, _)| *no).collect())
       .unwrap_or_default();
+    let mut unverified = Vec::new();
     for no in witnessed {
-      let _ = self.check_drift(store, no);
+      match self.check_drift(store, no) {
+        // Drift found is recorded by the check itself and listed below.
+        Ok(()) | Err(VfsError::BaseDrift) => {}
+        Err(refusal) => unverified.push((
+          self
+            .vol
+            .path_of_inode(store, no)
+            .unwrap_or_else(|| format!("inode {}", no.0)),
+          refusal,
+        )),
+      }
     }
+    unverified.sort_by(|a, b| a.0.cmp(&b.0));
     let plane = self.vol.base.as_ref().ok_or(VfsError::NotOverlay)?;
     let mut drift: Vec<(String, DriftKind)> = plane
       .drift
@@ -2790,6 +2849,7 @@ impl Overlay<'_> {
     drift.sort();
     Ok(BaseStatus {
       drift,
+      unverified,
       watcher: plane.watch,
     })
   }
@@ -2851,9 +2911,7 @@ impl Overlay<'_> {
             .is_some_and(|h| dirs.contains(&h.parent()))
       })
       .collect();
-    for no in targets {
-      let _ = self.check_drift(store, no);
-    }
+    self.recheck_witnessed(store, targets)?;
     if all {
       let dropped = self.plane()?.drop_all_digests(store);
       let stats = &mut self.plane()?.digest_stats;

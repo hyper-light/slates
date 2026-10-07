@@ -55,12 +55,7 @@ under a busier machine.
 `content::tests::a_seal_refused_partway_leaves_the_chunk_plain_even_when_opening_back_would_fail` failed before the
 fix: the read returned ciphertext.
 
-## Siblings left for review
+## Siblings
 
-Other `let _ =` sites in `slates-vfs` discard a cleanup's refusal on a path that already returns another refusal:
-
-- rollbacks of a just-inserted slab entry (`volume.rs`, `xattr.rs`);
-- give-backs during recovery (`recover.rs`);
-- `check_drift` in the drift listing (`base.rs`).
-
-Each is being reviewed in the sweep this record started.
+The rest of the sweep (rollbacks, recovery give-backs, drift re-checks, a reclaim's descriptor) is fixed and recorded
+in `2026-10-07-a-reclaimed-base-file-leaked-its-descriptor.md`.

@@ -110,6 +110,17 @@ pub enum VfsError {
 }
 
 impl VfsError {
+  /// The refusal a verb returns after undoing what it started (`undo`): its own, unless the undo was refused too; then
+  /// the undo's, which names the worse state (something the verb made could not be taken back, so the store holds
+  /// it). An undo's refusal was dropped at every rollback site before 2026-10-07; `xattr`'s `abandon_attribute` was
+  /// the one that kept it, and this is its rule, once.
+  pub(crate) fn after_undo<T, E: Into<VfsError>>(self, undo: Result<T, E>) -> VfsError {
+    match undo {
+      Ok(_) => self,
+      Err(refusal) => refusal.into(),
+    }
+  }
+
   /// The POSIX errno name, for bridges and the differential harness.
   pub const fn errno_name(&self) -> &'static str {
     match self {

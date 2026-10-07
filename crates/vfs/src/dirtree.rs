@@ -719,12 +719,18 @@ impl Tree {
   /// Gives every block of a tree this mutation built and never published back to the slab: the undo
   /// of a small directory's move to a tree that was refused partway (the tree's blocks are all born
   /// now and reachable only from it).
-  pub fn discard(self, blocks: &mut Slab<DirBlock>) {
+  /// Every block is tried; the first refusal is returned, for the caller's [`crate::error::VfsError::after_undo`].
+  pub fn discard(self, blocks: &mut Slab<DirBlock>) -> Result<(), slates_mem::MemError> {
     let mut owned = Vec::new();
     self.blocks(blocks, &mut owned);
+    let mut first = Ok(());
     for (block, _) in owned {
-      let _ = blocks.remove(block);
+      let removed = blocks.remove(block).map(drop);
+      if first.is_ok() {
+        first = removed;
+      }
     }
+    first
   }
 
   /// Inserts `name → child` (the caller checked it is absent). All or nothing: the copies and any

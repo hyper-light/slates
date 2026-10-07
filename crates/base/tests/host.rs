@@ -220,13 +220,15 @@ fn an_overlay_over_the_workspace_tree_costs_one_open_and_reads_the_disk() {
   assert_eq!(host.open_handles(), 1);
   assert_eq!(store.dirs.iter().count(), 1);
   let expected = std::fs::read(crates_dir().join("vfs/src/lib.rs")).unwrap();
-  let mut o = vol.with_host(&mut host);
-  let no = o.resolve(&mut store, "/vfs/src/lib.rs").unwrap().inode;
-  let size = o.stat(&mut store, no).unwrap().size;
-  assert_eq!(size, u64::try_from(expected.len()).unwrap());
-  let mut buf = vec![0u8; expected.len()];
-  let n = o.read(&mut store, no, 0, &mut buf).unwrap();
-  assert_eq!(&buf[..n], &expected[..]);
+  {
+    let mut o = vol.with_host(&mut host);
+    let no = o.resolve(&mut store, "/vfs/src/lib.rs").unwrap().inode;
+    let size = o.stat(&mut store, no).unwrap().size;
+    assert_eq!(size, u64::try_from(expected.len()).unwrap());
+    let mut buf = vec![0u8; expected.len()];
+    let n = o.read(&mut store, no, 0, &mut buf).unwrap();
+    assert_eq!(&buf[..n], &expected[..]);
+  }
   assert_eq!(
     host.open_handles(),
     4,

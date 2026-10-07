@@ -137,6 +137,8 @@ pub enum SimVerb {
   SyncFile,
   /// `unlink`, by the entry's path.
   Unlink,
+  /// `open_file`, by the file's path: a read the host refuses (an I/O error on the disk the volume overlays).
+  OpenFile,
 }
 
 /// An armed failure: the next `times` calls of `verb` whose path starts with `prefix` answer `error`.
@@ -719,6 +721,7 @@ impl HostFs for SimHost {
     self.tick();
     let mut parts = self.dir_parts(dir)?;
     parts.push(name.into());
+    self.fault(SimVerb::OpenFile, &format!("/{}", parts.join("/")))?;
     let node = match self.node(&parts) {
       Some(n) if n.kind == HostKind::File => n.clone(),
       Some(_) => return Err(HostError::NotFile),
