@@ -4177,3 +4177,40 @@ every module loads. Then `find / -xdev -newer` the marker, outside the mount: on
 stderr log, the kill timestamps) and npm's own debug log and update-notifier stamp, which npm keeps in the home
 directory whatever the project. No file slates wrote reached the disk; the anchor log shows 15–19 restarts and no
 panic. Each kill costs npm about 30 ms against a 4.5 s run with none.
+
+### 2026-10-07: a generated escape battery through a shared FUSE mount (condition 4)
+
+**The run.** `docs/wip/bench/escape/run.sh` (recorded command; `battery.py` and `inner.sh` beside it). Seeded random
+hostile operations go through a slates volume mounted `--shared` in a Linux container. Two identities act: `tester`,
+the agent who owns the volume, and `other`, a tool that later touches it. Operations: links out of the volume (to a
+canary, `/etc`, `/proc/self/root`, `..`-climbing paths, devices), hard links into the volume from outside, `mknod`,
+setuid copies of `id`, renames of planted links into nested directories, `..` climbing, file and directory churn and
+removal, with oversized, spaced, newline and non-ASCII names.
+
+**Invariants, checked after every step:**
+- `other` never reads or writes through a link out of the volume (A-107);
+- a hard link from outside fails;
+- a character device is never made;
+- a setuid file never runs as another uid;
+- `..` never reaches the canary outside;
+- the canary outside is byte-identical.
+
+At the end: the daemon's `write_bytes` delta, and a hash of every file outside the mount before and after.
+
+**Result** (5 seeds × 300 steps, `89956659`): no invariant violated.
+- 192 links out were planted; `other` was refused every one.
+- **Positive control:** the owner resolved its own link to the canary 17 times, so the refusals are the rule
+  working, not links being dead.
+- The daemon wrote 0 bytes to disk.
+- The outside tree's hash was unchanged, and the canary intact.
+- **Non-vacuity:** the run asserts `other` reaches the shared mount, and that the daemon's I/O counter is readable.
+
+The harness's first two runs were wrong in ways now fixed:
+- **`AllowOtherNotGranted`:** Debian's `fuse.conf` ships `#user_allow_other`, which a plain `grep` matched, so the
+  grant was never added.
+- **An unreadable `/proc/<pid>/io`:** root in a container has no `CAP_SYS_PTRACE`, so the first "0 bytes" was empty
+  input. It is now read as the daemon's user and asserted present.
+
+**Owed:** the same battery over the NFS and virtio-fs transports, and a mount namespace with a hostile `other`
+holding `CAP_SYS_ADMIN`.
+

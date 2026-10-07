@@ -84,8 +84,11 @@ in the same commit as the work). Last reviewed 2026-10-07 at `89956659`.
   - "an ended FUSE mount no longer exposes the disk beneath it".
   - The landing's escape tests (`crates/land/tests/os_escape.rs`), symlinks out of the volume resolving only for
     their owner (A-107), and hostile NFS (`crates/server/tests/nfs_hostile.rs`).
-- **Owed.** A systematic escape battery: fuzzed path and handle inputs on every transport, with the escape set
-  asserted empty. Today the evidence is a set of targeted scenarios, not a generated search.
+  - A generated battery: `GAPS.md` "a generated escape battery through a shared FUSE mount" (recorded command
+    `docs/wip/bench/escape/run.sh`). 1,500 seeded hostile steps as the owner and another user produced no
+    violation: 192 of 192 out-of-volume links refused to the other user, with positive controls, 0 daemon disk
+    writes, and the outside tree's hash unchanged.
+- **Owed.** The same battery over NFS and virtio-fs, and against a hostile user holding `CAP_SYS_ADMIN`.
 
 ## 5. Fast local reads, accurate diff and change tracking
 
