@@ -6342,16 +6342,7 @@ fn await_placed(
     Scope::Mirror => {
       let placed = target
         .and_then(|target| state.db.partition().snapshot(record.id, target))
-        .is_some_and(|snapshot| match &snapshot.placed {
-          PlacementState::Placed {
-            mirror: Some(mirror),
-            ..
-          } => {
-            let hosts: Vec<HostId> = mirror.iter().map(|host| HostId(*host)).collect();
-            config.quorum.committed(hosts.len())
-          }
-          _ => false,
-        });
+        .is_some_and(|snapshot| crate::mirror::mirror_placed(&snapshot.placed, config.quorum));
       ReplyBody::Placed {
         placed,
         mirror_age_ns: None,

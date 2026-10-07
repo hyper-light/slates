@@ -4487,6 +4487,18 @@ fn a_placed_snapshot_is_held_whole_by_f_plus_one_hosts_of_the_mirror_region() {
         ReplyBody::Placed { placed: true, .. }
       ))
     });
+  // The head record naming the mirror holders is held by f + 1 of them (what a promotion adopts from).
+  let mut record_holders = 0;
+  let records = awaited
+    && poll_until(&observed, PLACEMENT_DEADLINE, || {
+      record_holders = daemons[3..]
+        .iter()
+        .filter(|daemon| {
+          matches!(daemon.fleet_mirror_record(ObjectId(id.bytes)), Ok(Some((_, _, holders))) if holders.len() >= 2)
+        })
+        .count();
+      Ok(record_holders >= 2)
+    });
   // Caught up, the volume's mirror lag is zero.
   let mirror_age = match client.call(&RequestBody::Status { volume: id }) {
     ReplyBody::Status { report } => report.placed.mirror_age_ns,
@@ -4504,6 +4516,10 @@ fn a_placed_snapshot_is_held_whole_by_f_plus_one_hosts_of_the_mirror_region() {
   assert!(
     awaited,
     "`await placed(mirror)` answers placed once f + 1 of the mirror region hold the snapshot"
+  );
+  assert!(
+    records,
+    "f + 1 mirror holders hold the head record naming them (held by {record_holders})"
   );
   assert!(
     mirrored,

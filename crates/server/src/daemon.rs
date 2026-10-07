@@ -1893,6 +1893,21 @@ impl Daemon {
     })
   }
 
+  /// The newest head record this node holds of `object` as a mirror holder (`crate::mirror`): its sequence and
+  /// epoch, and the mirror holders it names as the content's.
+  pub fn fleet_mirror_record(
+    &self,
+    object: slates_db::register::ObjectId,
+  ) -> Result<Option<(u64, u64, Vec<u64>)>, ObserveError> {
+    self.observe(self.shards.first().copied(), move |s| {
+      let record = s.mirror_records.newest(object)?;
+      let holders = crate::head::HeadValue::from_record_bytes(&record.value)
+        .map(|head| head.content_holders)
+        .unwrap_or_default();
+      Some((record.sequence, record.epoch.0, holders))
+    })
+  }
+
   /// What this node holds for other owners and what it is charged for it (§4.2; AUD-29-43), on the shard
   /// that keeps its hold: the byte budget's `replicated` charge beside the hold's own account (they must
   /// agree), the index charge, the manifests held, the puts refused at the capacity bound, and the bytes the
@@ -2964,6 +2979,7 @@ fn init_shard(
     seals: std::collections::BTreeMap::new(),
     mirror_seals: std::collections::BTreeMap::new(),
     mirror_neighbourhood: Vec::new(),
+    mirror_records: slates_db::mirror::MirrorRecords::new(),
     put_latency: crate::fleet::LatencyWindow::default(),
     fetch_latency: crate::fleet::LatencyWindow::default(),
     put_outcomes: crate::fleet::PutOutcomes::default(),

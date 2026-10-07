@@ -659,6 +659,10 @@ pub struct ShardState {
   /// Direct contact keeps them already: a member of another region is never in this region's council configuration.
   /// Empty with no mirror declared or none of its members alive.
   pub mirror_neighbourhood: Vec<slates_db::HostId>,
+  /// The records this node holds as a mirror holder for owners in the region it mirrors (`crate::mirror`): each
+  /// object's newest head and catalog record, kept on the control shard and published in its held image before
+  /// a shipment is acknowledged. What a promotion's phase one reads. Empty outside a mirror region.
+  pub mirror_records: slates_db::mirror::MirrorRecords,
   /// The measured put latency of this node's **content class** (§4.8 "Derived constants": "hedge delay =
   /// measured p95 put latency per class"): one reading per binding content acknowledgement this owner
   /// shard has collected — the time from the round's dispatch to that holder's verified acknowledgement.

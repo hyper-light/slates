@@ -146,13 +146,15 @@ struct HeldPosition {
 struct HeldImage {
   content: Vec<u8>,
   registers: Vec<HeldRegister>,
+  /// The mirror records this node holds for another region's owners (`crate::mirror`), each an encoded record.
+  mirrored: Vec<Vec<u8>>,
 }
 
 /// The bytes of everything this shard holds for other owners, for its recovery image: empty when it holds nothing,
 /// so a laptop's image is unchanged.
 pub(crate) fn held_image(state: &ShardState) -> Vec<u8> {
   let content = state.held_content.to_image();
-  if content.is_empty() && state.holder_records.is_empty() {
+  if content.is_empty() && state.holder_records.is_empty() && state.mirror_records.is_empty() {
     return Vec::new();
   }
   let registers = state
@@ -177,7 +179,17 @@ pub(crate) fn held_image(state: &ShardState) -> Vec<u8> {
       }
     })
     .collect();
-  HeldImage { content, registers }.to_bytes()
+  let mirrored = state
+    .mirror_records
+    .iter()
+    .map(|(_, record)| record.encode())
+    .collect();
+  HeldImage {
+    content,
+    registers,
+    mirrored,
+  }
+  .to_bytes()
 }
 
 /// A recovered held image, split: the content hold's own image, and the held registers to rebuild.
@@ -185,6 +197,7 @@ pub(crate) struct RecoveredHeld {
   /// The content hold's image (`ContentHold::claim_image` reads it).
   pub(crate) content: Vec<u8>,
   registers: Vec<HeldRegister>,
+  mirrored: Vec<Vec<u8>>,
 }
 
 /// Splits a recovered held image. Empty bytes hold nothing; bytes that do not decode are refused, never read as
@@ -194,12 +207,14 @@ pub(crate) fn split_held(bytes: &[u8]) -> Result<RecoveredHeld, slates_wire::Wir
     return Ok(RecoveredHeld {
       content: Vec::new(),
       registers: Vec::new(),
+      mirrored: Vec::new(),
     });
   }
   let image = HeldImage::from_bytes(bytes)?;
   Ok(RecoveredHeld {
     content: image.content,
     registers: image.registers,
+    mirrored: image.mirrored,
   })
 }
 
@@ -211,6 +226,16 @@ pub(crate) fn restore_held_registers(
   held: RecoveredHeld,
 ) -> usize {
   let count = held.registers.len();
+  // The mirror records, each the newest of its object as it was published. One that does not decode, or that the
+  // register refuses, is counted: the image held it, and this holder no longer does.
+  for bytes in &held.mirrored {
+    let restored = slates_db::register::Record::decode(bytes)
+      .ok()
+      .is_some_and(|record| state.mirror_records.accept(record).is_ok());
+    if !restored {
+      state.count(MIRROR_RESTORE_REFUSED, 1);
+    }
+  }
   for register in held.registers {
     let accepted = register
       .accepted
@@ -239,3 +264,7 @@ pub(crate) fn restore_held_registers(
   }
   count
 }
+
+/// The status count of mirror records a recovered held image carried that could not be held again.
+/// Format: a refusal name in the daemon's status report.
+const MIRROR_RESTORE_REFUSED: &str = "fleet.mirror.restore_refused";

@@ -60,6 +60,7 @@ pub mod lease;
 mod lease_wait;
 mod member_task;
 pub mod merge_service;
+mod mirror;
 #[cfg(target_os = "linux")]
 mod write_log;
 // The NFS mount transport is the macOS/Linux mount path (Windows mounts through WinFsp); it rides the

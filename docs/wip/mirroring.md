@@ -74,7 +74,31 @@ with the mirror cohort as the candidates.
 - **The lag.** `mirror_age` per volume is the age of the oldest snapshot recorded `placed` at home and not yet in
   the mirror. Status reports it with its observation time.
 
-### 4. Promotion adoption
+### 4. Promotion adoption (revised 2026-10-07, before building it)
+
+The first version below let each mirror node rank a successor from the record it held. That is not safe: holders
+can hold different versions of an object's record, naming different holder sets, so two nodes could each believe
+they are the successor. The successor is agreed instead, as a home takeover's is, through committed configuration:
+
+1. **The mirror region's council installs the promotion.** Every holder that installed it refuses further records
+   from the lost region (M1's `HomePromoted`), which is the fence.
+2. **The council's leader runs phase one.** It asks every member of the council, in pages, for the mirror records
+   they hold of the lost region's objects. Only answers from members that installed the promotion count. It waits
+   for all members but `f`: any record acknowledged at `f + 1` of any cohort then reached an answering holder,
+   whatever cohort the owner chose (quorum intersection, as in Vertical Paxos phase one).
+3. **The leader picks a successor per object.** It takes the newest record by (epoch, sequence), and ranks the
+   successor by rendezvous among that record's own mirror holders still in the council. That host holds the content
+   and was given the volume's lineage key wrapped for it (the owner delivers pair keys to its mirror neighbourhood),
+   so it can open and serve what it adopts.
+4. **The leader commits the assignments** to the council log in bounded pages, so every member agrees on every
+   object's successor.
+5. **The successor materializes** from its own held content, the adopted head and catalog records, and its
+   unwrapped lineage key. It then serves under a host epoch the council issues.
+
+The catalog register (the volume's name, policy and access, AUD-29-17) is mirrored beside the head, since a
+successor rebuilds the volume as its catalog describes it.
+
+### 4 (first version, superseded above). Promotion adoption
 
 When the root group commits `PromoteRegion { lost: R }`, every node of `M` installs it. The takeover machinery
 then runs with `R`'s hosts as the departed owners and `M`'s committed council membership as the survivors.
@@ -125,7 +149,17 @@ What the mirror did not receive is the loss window; the status reports it per vo
    (M1's `HomePromoted`). Mirror records must be held durably before the acknowledgement, as home records now are
    (`docs/bugs/2026-10-07-a-warm-restart-dropped-held-register-records.md`).
 
-   Still to build: The head record naming the mirror holders is committed
+   Built 2026-10-07:
+   - Pair keys go to the mirror neighbourhood too, so a head's `sealing` wraps the lineage key for every mirror
+     holder.
+   - The head record (naming the mirror holders) and the catalog record are shipped together as one shipment on
+     `MIRROR_RECORD_STREAM` (`crate::mirror`). A holder admits the shipment under M1's rule, keeps the newest of
+     each record, publishes them in its held image, then acknowledges.
+   - The mirror placement is recorded only once `f + 1` hold both the content and the records.
+   - Fleet test: `f + 1` mirror holders hold the head record naming them, 3 of 3.
+
+   Still to build: the leader's phase one, the council's `MirrorAdopt` and `MirrorAdopted` entries, and the
+   successor's materialization. The head record naming the mirror holders is committed
    at `f + 1` of them, under the mirror rule's authority. Promotion then runs the per-host takeover in the mirror
    region. Fleet test (AC-8.15): region 0 killed and promoted, the snapshot's bytes read from region 1, and an
    operation that awaited the mirror intact.

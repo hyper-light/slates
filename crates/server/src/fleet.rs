@@ -1385,6 +1385,14 @@ async fn serve_peer_records(
                 })
               })
               .unwrap_or_default(),
+            crate::mirror::MIRROR_RECORD_STREAM => state::with_state(|s| {
+              let peer_host = s
+                .learned_members
+                .get(&peer_anchor)
+                .map_or(seed, |learned| learned.host);
+              crate::mirror::serve(s, local, peer_host, &request)
+            })
+            .unwrap_or_default(),
             crate::takeover::TAKEOVER_STREAM => state::with_state(|s| {
               let peer_host = s
                 .learned_members
@@ -2165,6 +2173,7 @@ fn start_mirror_seal(
       rounds: 0,
       first_round_at_ns: None,
       healing: false,
+      records_acked: Vec::new(),
     },
   );
   true
@@ -2179,12 +2188,17 @@ fn record_mirrored_seals(state: &mut ShardState) {
   let done: Vec<(ObjectId, DbSnapshotId, Vec<u64>)> = state
     .mirror_seals
     .iter()
-    .filter(|(_, job)| job.manifest.is_some() && job.content.placed(quorum))
+    .filter(|(_, job)| {
+      job.manifest.is_some() && quorum.committed(crate::mirror::holders_of(job).len())
+    })
     .map(|(object, job)| {
       (
         *object,
         job.snapshot,
-        job.content.acked.iter().map(|host| host.0).collect(),
+        crate::mirror::holders_of(job)
+          .iter()
+          .map(|host| host.0)
+          .collect(),
       )
     })
     .collect();
@@ -2441,6 +2455,7 @@ fn start_seal(
       rounds: 0,
       first_round_at_ns: None,
       healing,
+      records_acked: Vec::new(),
     },
   );
   true
@@ -5846,7 +5861,8 @@ async fn follow_configuration(
 }
 
 /// Advances `shard`'s seal jobs of `track` one bounded slice each on the owner shard and runs the content rounds
-/// of those whose archive is complete, keeping each round's dispatch for its stragglers.
+/// of those whose archive is complete, keeping each round's dispatch for its stragglers. Whether the shard holds any
+/// job of the track.
 async fn put_track_content(
   origin: u16,
   shard: u16,
@@ -5854,17 +5870,19 @@ async fn put_track_content(
   budget: CommitBudget,
   track: Track,
   in_flight: &mut Vec<Dispatch>,
-) {
-  let work = call_within(
+) -> bool {
+  let (work, jobs) = call_within(
     origin,
     shard,
     move |s| {
       let slice_bytes = s.config.archive_slice_bytes();
       let created_unix = u64::try_from(s.clock.wall_ns()).unwrap_or(0) / NANOS_PER_SECOND;
-      match track {
+      let work = match track {
         Track::Home => advance_seals(s, local, slice_bytes, created_unix, budget),
         Track::Mirror => advance_mirror_seals(s, local, slice_bytes, created_unix, budget),
-      }
+      };
+      let jobs = !seal_jobs(s, track).is_empty();
+      (work, jobs)
     },
     HEARTBEAT_NS,
   )
@@ -5875,6 +5893,7 @@ async fn put_track_content(
       in_flight.push(dispatch);
     }
   }
+  jobs
 }
 
 /// One period of the record plane for the volumes `shard` owns, in the order the design's placement rule
@@ -5895,7 +5914,12 @@ async fn run_record_period(
   // candidates (§4.10) — content places before the head that names it ships — then the shipments of placed heads
   // to the mirror region (§4.10 "Mirroring across regions").
   put_track_content(origin, shard, local, budget, Track::Home, in_flight).await;
-  put_track_content(origin, shard, local, budget, Track::Mirror, in_flight).await;
+  let mirroring = put_track_content(origin, shard, local, budget, Track::Mirror, in_flight).await;
+  // A mirror shipment's head and catalog records, once its content is held there (`crate::mirror`); no call at all
+  // while the shard ships nothing to a mirror.
+  if mirroring {
+    crate::mirror::ship(origin, shard, local, budget, in_flight).await;
+  }
   deliver_pairs(origin, shard, local, budget).await;
   ship_shard_heads(origin, shard, local, budget, owner_acceptor, in_flight).await;
   // Record durably each seal whose content and head have both placed.
@@ -5920,14 +5944,19 @@ async fn deliver_pairs(origin: u16, shard: u16, local: HostId, budget: CommitBud
     shard,
     move |s| {
       s.seal_root.as_ref()?;
-      let members: Vec<HostId> = s
+      // The home neighbourhood and the mirror neighbourhood alike: a mirror holder must be able to open a promoted
+      // volume's content, so a head's sealing wraps the lineage key for it too (`docs/wip/mirroring.md` decision 4).
+      let mut members: Vec<HostId> = s
         .fleet
         .configuration()
         .neighbourhood
         .iter()
+        .chain(s.mirror_neighbourhood.iter())
         .copied()
         .filter(|host| *host != local)
         .collect();
+      members.sort_unstable();
+      members.dedup();
       Some((members, s.pairs_delivered.clone()))
     },
     HEARTBEAT_NS,
