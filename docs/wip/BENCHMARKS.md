@@ -2790,3 +2790,45 @@ The profile it measures did not move, three runs per build:
 | 64 KiB | 82,852–116,612 | 89,898–116,612 |
 | 1 MiB | 71,089–82,241 | 78,152–80,921 |
 | 128 MiB | 21,855–22,733 | 20,404–26,368 |
+
+## A barrier no longer walks every possible region (2026-10-06)
+
+Linux 6.12 under Docker Desktop, the release binary, `--quick` (one partition per core, 18), one Python process per
+operation as in "Per-operation latency on a Linux FUSE mount" (scratchpad `ops-inner.sh`, `abops-inner.sh`).
+
+**Found.** A FUSE create or unlink waits a publication (§4.8 barrier). Timed inside `publish_shard`, on a 1 GiB arena:
+
+| Step | Time |
+|---|---|
+| `capture` | 1.4 µs |
+| The delta publication proper | 1.1 µs |
+| `commit_capture` | 4 µs |
+| `release_idle` | 8–9.8 µs, returning nothing |
+
+The arena kept its regions in a vector indexed by extent id, `partition × 64 + part`. An 18-partition daemon had up
+to 1,152 entries, mostly empty and each a few hundred bytes, and every barrier walked them in its capture, its
+commit, its capacity sum and its idle release. The regions are now dense, with an id-to-position index, so a walk
+visits only the regions held.
+
+**A/B, HEAD against the change, three interleaved rounds, load average 7–8 (1,000 operations each, p50 / p99):**
+
+| Round | create + close, HEAD | create + close, new | unlink, HEAD | unlink, new |
+|---|---|---|---|---|
+| 1 | 125 / 478 µs | 87 / 279 µs | 55 / 238 µs | 32 / 115 µs |
+| 2 | 141 / 484 µs | 117 / 464 µs | 78 / 261 µs | 57 / 293 µs |
+| 3 | 118 / 249 µs | 81 / 159 µs | 72 / 166 µs | 31 / 104 µs |
+
+**A developer workload on the mount** (the 700 files and 16 MB of `crates/` copied in, then `git add`,
+`git commit`, `find`, `grep -r`, `tar`, `rm -rf`; scratchpad `work-inner.sh`). The two runs were taken at different
+loads; tmpfs moved too (its copy took 133–168 ms, then 80–101):
+
+| Step | Before | After | tmpfs, after |
+|---|---|---|---|
+| `cp -a` | 374–390 ms | 191–302 ms | 80–101 ms |
+| `git add -A` | 573–602 ms | 357–383 ms | 142–145 ms |
+| `git commit` | 120–124 ms | 61–69 ms | 6 ms |
+| `find` | 29–30 ms | 14–16 ms | 1 ms |
+| `rm -rf` | 137–172 ms | 82–85 ms | 3 ms |
+
+The remaining distance to tmpfs on namespace changes is the publication per change, which an intent log would take
+off the reply path (GAPS, "a FUSE namespace change waits a whole publication").

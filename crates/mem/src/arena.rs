@@ -61,6 +61,8 @@ impl Extent {
 
 #[derive(Debug)]
 struct Slot {
+  /// The region's id: the extent id its blocks are named by.
+  id: u16,
   region: Region,
   buddy: Buddy,
   /// The ranges freed and zeroed in place since the idle purge last ran here: resident pages no allocation holds, which
@@ -113,8 +115,14 @@ pub trait ExtentSource: Send {
 pub struct ChunkArena {
   /// This arena's identity, or `None` when the process has spent them (it then refuses every allocation).
   identity: Option<u64>,
-  /// Regions by id; `None` where the arena holds no region of that id.
-  slots: Vec<Option<Slot>>,
+  /// The held regions, dense: every walk of the regions (a publication's capture and commit, the capacity, the idle
+  /// release) visits only these. Indexed by id instead, a daemon of N partitions kept up to 64 × N entries, mostly
+  /// empty and each a few hundred bytes, and every barrier walked all of them: about 9 µs of a 49 µs unlink on an
+  /// 18-partition Linux daemon (2026-10-06).
+  slots: Vec<Slot>,
+  /// Where each id's region is in [`ChunkArena::slots`]; `None` where the arena holds no region of that id. Its length
+  /// is one past the highest id held.
+  position: Vec<Option<usize>>,
   /// The held ids, in the order they were added: the order allocation tries them.
   order: Vec<u16>,
   granule: usize,
@@ -168,6 +176,7 @@ impl ChunkArena {
     Self {
       identity,
       slots: Vec::new(),
+      position: Vec::new(),
       order: Vec::new(),
       granule: granule.max(1),
       allocated_bytes: 0,
@@ -348,21 +357,27 @@ impl ChunkArena {
   }
 
   fn slot(&self, id: u16) -> Option<&Slot> {
-    self.slots.get(usize::from(id)).and_then(Option::as_ref)
+    self
+      .position
+      .get(usize::from(id))
+      .copied()
+      .flatten()
+      .and_then(|at| self.slots.get(at))
   }
 
   fn slot_mut(&mut self, id: u16) -> Option<&mut Slot> {
-    self.slots.get_mut(usize::from(id)).and_then(Option::as_mut)
+    let at = self.position.get(usize::from(id)).copied().flatten()?;
+    self.slots.get_mut(at)
   }
 
   /// The held regions' allocators.
   fn held(&self) -> impl Iterator<Item = &Slot> {
-    self.slots.iter().flatten()
+    self.slots.iter()
   }
 
   /// The held regions' allocators, mutably.
   fn held_mut(&mut self) -> impl Iterator<Item = &mut Slot> {
-    self.slots.iter_mut().flatten()
+    self.slots.iter_mut()
   }
 
   /// The granule: every block is a power-of-two multiple of it.
@@ -373,8 +388,8 @@ impl ChunkArena {
   /// Adds a region; its length is used up to the largest power-of-two number of granules it
   /// holds. Returns the region's index.
   pub fn add_region(&mut self, region: Region) -> Result<u16, MemError> {
-    let index = u16::try_from(self.slots.len()).map_err(|_| MemError::TooLarge {
-      len: self.slots.len(),
+    let index = u16::try_from(self.position.len()).map_err(|_| MemError::TooLarge {
+      len: self.position.len(),
       max: usize::from(u16::MAX),
     })?;
     self.add_region_at(index, region)?;
@@ -397,16 +412,18 @@ impl ChunkArena {
     // `granules >= 1`, so it has a top bit: `ilog2` is its order.
     let max_order = granules.ilog2();
     let slot = Slot {
+      id,
       dirty: crate::ranges::UnitSet::new(region.len(), self.granule),
       region,
       buddy: Buddy::new(self.granule, max_order)?,
     };
     let at = usize::from(id);
-    if self.slots.len() <= at {
-      self.slots.resize_with(at.saturating_add(1), || None);
+    if self.position.len() <= at {
+      self.position.resize(at.saturating_add(1), None);
     }
-    if let Some(place) = self.slots.get_mut(at) {
-      *place = Some(slot);
+    if let Some(place) = self.position.get_mut(at) {
+      *place = Some(self.slots.len());
+      self.slots.push(slot);
       self.order.push(id);
     }
     Ok(())
@@ -431,18 +448,26 @@ impl ChunkArena {
         allocated: allocated.max(slot.buddy.deferred_bytes()),
       });
     }
-    let removed = self
-      .slots
+    let at = self
+      .position
       .get_mut(usize::from(id))
       .and_then(Option::take)
+      .filter(|at| *at < self.slots.len())
       .ok_or(MemError::ForeignExtent {
         offset: 0,
         len: 0,
         reason: ExtentRefusal::NoSuchRegion,
       })?;
+    // The last region moves into the freed place, so its position follows it.
+    let removed = self.slots.swap_remove(at);
+    if let Some(moved) = self.slots.get(at).map(|slot| slot.id)
+      && let Some(place) = self.position.get_mut(usize::from(moved))
+    {
+      *place = Some(at);
+    }
     self.order.retain(|held| *held != id);
-    while self.slots.last().is_some_and(Option::is_none) {
-      self.slots.pop();
+    while self.position.last().is_some_and(Option::is_none) {
+      self.position.pop();
     }
     Ok(removed.region)
   }
@@ -538,13 +563,15 @@ impl ChunkArena {
     let Self {
       order,
       slots,
+      position,
       allocated_bytes,
       reused,
       resident_free,
       ..
     } = self;
     for &region in order.iter() {
-      let Some(slot) = slots.get_mut(usize::from(region)).and_then(Option::as_mut) else {
+      let at = position.get(usize::from(region)).copied().flatten();
+      let Some(slot) = at.and_then(|at| slots.get_mut(at)) else {
         continue;
       };
       match slot.buddy.alloc(len) {
@@ -724,12 +751,13 @@ impl ChunkArena {
   /// cannot name.
   pub fn commit_capture(&mut self) {
     let mut released_total = 0usize;
-    for slot in self.slots.iter_mut().flatten() {
+    for slot in self.slots.iter_mut() {
       let before = slot.buddy.free_bytes();
       let Slot {
         region,
         buddy,
         dirty,
+        ..
       } = slot;
       buddy.commit_capture_releasing(|offset, len, locked| {
         release_block(region, offset, len, locked);
@@ -745,12 +773,13 @@ impl ChunkArena {
   /// The publication of the last [`ChunkArena::capture`] did not commit: frees what only it could have named.
   pub fn abandon_capture(&mut self) {
     let mut released_total = 0usize;
-    for slot in self.slots.iter_mut().flatten() {
+    for slot in self.slots.iter_mut() {
       let before = slot.buddy.free_bytes();
       let Slot {
         region,
         buddy,
         dirty,
+        ..
       } = slot;
       buddy.abandon_capture_releasing(|offset, len, locked| {
         release_block(region, offset, len, locked);
@@ -771,7 +800,7 @@ impl ChunkArena {
   /// Runs `step` on every region's allocator and takes the bytes it released off the allocated total.
   fn settle(&mut self, step: fn(&mut Buddy)) {
     let mut released_total = 0usize;
-    for slot in self.slots.iter_mut().flatten() {
+    for slot in self.slots.iter_mut() {
       let before = slot.buddy.free_bytes();
       step(&mut slot.buddy);
       released_total =
