@@ -3354,3 +3354,33 @@ reordering rows are the true independent-jitter case, and their collapse is the 
 result proves, not a reordering defect: retransmissions are few. The owed design brief stands, sharpened: the delay
 signal must separate independent non-congestive jitter of tens of milliseconds from queueing, without a long memory
 of the path's rate, which the capacity-step row punishes.
+
+#### Measured and rejected: the ten-round floor with the loss reset (2026-10-07)
+
+The fourth combination, to separate the two effects variant three bundled: the ten-round filter (best for jitter)
+with the loss reset (credited with fixing the capacity step).
+
+| | Result |
+|---|---|
+| `congestion_bench` (geomean) | share +0.9%, ping p99 +5.0% |
+| Burst loss, p99 | 326 → 2,845 ms |
+| The 10 → 2 → 10 Mbit/s step, p99 | 160 → 500 ms, unchanged from the plain ten-round floor |
+| `fetch_bench` thin link, 8 MiB: jitter in order | 11.7 s (as the plain floor) |
+| reordering, no loss | 67.9 s |
+| reordering + 2% loss | 99.2 s |
+
+So the loss reset did not fix the step. Variant three's fix came from its two-round memory, and its reset rarely
+fires when the losses come, since the floor is not the binding limit then. The reset also leaves the window high
+through bursts.
+
+The map for the owed design, from the four:
+
+| Variant | Jitter in order | Capacity step | Grid p99 (geomean) |
+|---|---|---|---|
+| Sample floor | helps | regresses slow links | +1.2% |
+| Ten-round floor | 11.7 s, best | 500 ms | +0.8% |
+| Two-round floor + loss reset | 26.3 s, worse than `HEAD`'s 18.7 | 132 ms, fixed | −4.4% |
+| Ten-round floor + loss reset | 11.7 s | 500 ms | +5.0% |
+
+No floor fixes the independent-jitter (reordering) rows: 68–104 s across all of them. That case needs its own
+mechanism.
