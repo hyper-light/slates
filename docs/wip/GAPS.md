@@ -4214,3 +4214,36 @@ The harness's first two runs were wrong in ways now fixed:
 **Owed:** the same battery over the NFS and virtio-fs transports, and a mount namespace with a hostile `other`
 holding `CAP_SYS_ADMIN`.
 
+### 2026-10-07: the escape battery over Linux's NFS client — A-107 does not hold on NFS (condition 4)
+
+**The run.** `docs/wip/bench/escape/run-nfs.sh`: the same generator over the daemon's NFSv4.2 export, mounted by the
+kernel on loopback in a privileged container, `nosuid,nodev` as kubelet mounts the export.
+
+**Held:**
+- the daemon wrote 0 bytes to disk;
+- the outside tree's hash was unchanged, and the canary byte-identical;
+- hard links from outside failed;
+- no device was made;
+- with `nosuid`, no setuid file ran as anyone but its runner.
+
+**Did not hold: links out of the volume, on NFS.** `other` was refused on 70 of 116 planted out-of-volume links
+across 3 seeds × 300 steps. On the rest it read the canary through the link, typically one its owner had resolved
+first.
+- The Linux NFS client resolves a symlink itself and caches its target per inode, not per caller. So A-107's rule
+  (a link leaving the volume resolves only for its owner, enforced per caller at the server) holds only until the
+  link's first resolution. This was documented as "best-effort on NFS"; it is now measured.
+- Refusing out-of-volume links on NFS is not an answer: a venv's `bin/python -> /usr/bin/python3` is one, and pip
+  needs it.
+- The exposure is a tool reading or writing *as itself* through an agent's link, the steering A-107 closes on FUSE.
+  It is not a write by slates, and not a privilege the reader lacks.
+
+**First run, for the record:** without `nosuid`, an agent-planted setuid copy of `id` ran as the agent's uid for
+`other`. That is POSIX on any `suid` mount, and is why deployments mount `nosuid` and require
+`allowPrivilegeEscalation: false` (2026-10-06).
+
+**Owed** (condition 4 stays "limited" until one of these is measured):
+- On NFS, an out-of-volume link's resolution confined to its owner. The candidates are a per-identity export (each
+  identity mounts its own session, so a cache is never shared across uids) or presenting such links to the NFS
+  transport as something the client must ask the server about on each use.
+- Or document NFS as owner-only access in multi-user hosts, and keep FUSE for shared mounts.
+

@@ -88,7 +88,13 @@ in the same commit as the work). Last reviewed 2026-10-07 at `89956659`.
     `docs/wip/bench/escape/run.sh`). 1,500 seeded hostile steps as the owner and another user produced no
     violation: 192 of 192 out-of-volume links refused to the other user, with positive controls, 0 daemon disk
     writes, and the outside tree's hash unchanged.
-- **Owed.** The same battery over NFS and virtio-fs, and against a hostile user holding `CAP_SYS_ADMIN`.
+  - Over Linux's NFS client (`run-nfs.sh`, mounted `nosuid,nodev` as kubelet does): no disk write, the outside
+    tree unchanged, no device, no setuid elevation, but **out-of-volume links followed by another user on 46 of 116**
+    (the client caches symlink targets per inode, so A-107's per-caller rule holds only until a link's first
+    resolution; `GAPS.md` 2026-10-07).
+- **Owed.**
+  - A-107 on NFS: a per-identity export, or links the client must re-ask about.
+  - The battery over virtio-fs, and against a hostile user holding `CAP_SYS_ADMIN`.
 
 ## 5. Fast local reads, accurate diff and change tracking
 
