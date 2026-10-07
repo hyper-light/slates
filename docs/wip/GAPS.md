@@ -3765,7 +3765,13 @@ shard's own clock that A-65 budgets in (docs/bugs/2026-10-04-the-slow-observatio
      - Open streams are bounded at one per notification source, refused `-32602` past it.
      - Test `assert_listen_over_http` covers the head, the event, a keep-alive within the deadline, the bound, and the
        slot coming back on close.
-     Owed: `volume://` resources with `notifications/resources/updated` from the volume's op-log head;
+     `volume://` resources: **reads done (2026-10-06).**
+     - The template is `volume://{volume}/{+path}`.
+     - `resources/read` returns the file at the volume's head under the connection's rights: text when it is UTF-8,
+       else a base64 blob (RFC 4648 vectors tested).
+     - Reads are uncached and private; a path that names nothing is `-32602`.
+     Owed: `notifications/resources/updated` from the volume's op-log head. The daemon has no change subscription to
+     drive it, and polling from the MCP server would spend battery;
   5. the official conformance suite, run in a container (no host install): **done (A-87)**: 103 checks pass on
      the 2026-07-28 requirements and every failure is classified (reference fixtures, the optional tasks extension,
      undeclared features). The recorded harness is in `docs/wip/conformance/mcp/` and runs manually, not in CI

@@ -589,6 +589,7 @@ fn assert_files_change_through_mcp(server: &mut McpServer) {
     at(json!({ "from": "src/main.rs", "to": "src/lib.rs" })),
   );
   assert_eq!(read(server, "src/lib.rs"), "fn main() {}\n");
+  assert_volume_resources(server, &volume);
   assert!(
     call_refused(
       server,
@@ -1504,6 +1505,39 @@ fn assert_listen_bound(port: u16, host: &str, token: &str, first: std::net::TcpS
     );
     std::thread::yield_now();
   }
+}
+
+/// `volume://` resources (condition 13). Do: list the resource templates, then read `volume://<id>/src/lib.rs` plainly
+/// and percent-encoded, and a path that names nothing. Expect: a `volume://{volume}/{+path}` template; both reads
+/// return the file's text, uncached and private; the missing path is `-32602`.
+fn assert_volume_resources(server: &mut McpServer, volume: &str) {
+  let templates = server
+    .handle(&json!({ "jsonrpc": "2.0", "id": 3, "method": "resources/templates/list" }))
+    .unwrap();
+  assert!(
+    templates.to_string().contains("volume://{volume}/{+path}"),
+    "{templates}"
+  );
+  for path in ["src/lib.rs", "src%2Flib.rs"] {
+    let uri = format!("volume://{volume}/{path}");
+    let read = server
+      .handle(
+        &json!({ "jsonrpc": "2.0", "id": 4, "method": "resources/read", "params": { "uri": uri } }),
+      )
+      .unwrap();
+    assert_eq!(
+      read["result"]["contents"][0]["text"], "fn main() {}\n",
+      "{read}"
+    );
+    assert_eq!(read["result"]["cacheScope"], "private", "{read}");
+  }
+  let missing = server
+    .handle(&json!({
+      "jsonrpc": "2.0", "id": 5, "method": "resources/read",
+      "params": { "uri": format!("volume://{volume}/src/main.rs") }
+    }))
+    .unwrap();
+  assert_eq!(missing["error"]["code"], -32602, "{missing}");
 }
 
 /// A modern request body: `method` with `params` and the 2026-07-28 `_meta` naming `version`.

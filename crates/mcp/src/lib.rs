@@ -381,7 +381,7 @@ impl McpServer {
       "tools/call" => self.call_tool(&params),
       "resources/list" => Ok(resources_list()),
       "resources/templates/list" => Ok(resource_templates_list()),
-      "resources/read" => resource_read(&params),
+      "resources/read" => self.resource_read(&params),
       "prompts/list" => Ok(prompts_list()),
       "prompts/get" => prompt_get(&params),
       other => Err(McpError {
@@ -556,6 +556,44 @@ impl McpServer {
       "len": bytes.len(),
       "text": String::from_utf8_lossy(&bytes),
     }))
+  }
+
+  /// `resources/read`: the skill document a `skill://` URI names, or the file a `volume://` URI names at its volume's
+  /// head, read under this connection's rights (as `slates.fs.read` is) and given as text when its bytes are UTF-8,
+  /// else as a base64 `blob` (MCP 2026-07-28 resource contents). A volume's file is never cached by the client (its
+  /// head moves) and is private to the reader. `-32602` for a URI that names nothing (an unknown resource is invalid
+  /// params, and an empty `contents` never stands for one).
+  fn resource_read(&mut self, params: &Value) -> Result<Value, McpError> {
+    let uri = params.get("uri").and_then(Value::as_str).unwrap_or("");
+    let not_found = || McpError {
+      code: code::INVALID_PARAMS,
+      message: format!("Resource not found: {uri}"),
+    };
+    if let Some(skill) = skills::by_uri(uri) {
+      return Ok(json!({
+        "contents": [{ "uri": skill.uri(), "mimeType": skills::MIME_TYPE, "text": skill.body }],
+        "ttlMs": CACHE_TTL_MS,
+        "cacheScope": "public",
+      }));
+    }
+    let (volume, path) = uri
+      .strip_prefix(VOLUME_SCHEME)
+      .and_then(|rest| rest.split_once('/'))
+      .and_then(|(id, path)| Some((id_from_hex(id)?, percent_decode(path)?)))
+      .filter(|(_, path)| !path.is_empty())
+      .ok_or_else(not_found)?;
+    let bytes = match self.client.read(volume, &path, ReadAt::Head) {
+      Ok(bytes) => bytes,
+      Err(ClientError::Refused(slates_ipc::protocol::Refusal::NotFound)) => return Err(not_found()),
+      Err(e) => return Err(refusal(e)),
+    };
+    let content = match String::from_utf8(bytes) {
+      Ok(text) => json!({ "uri": uri, "mimeType": "text/plain", "text": text }),
+      Err(raw) => {
+        json!({ "uri": uri, "mimeType": "application/octet-stream", "blob": base64(raw.as_bytes()) })
+      }
+    };
+    Ok(json!({ "contents": [content], "ttlMs": 0, "cacheScope": "private" }))
   }
 
   fn fs_write(&mut self, args: &Value) -> Result<Value, McpError> {
@@ -1268,7 +1306,11 @@ fn resources_list() -> Value {
   json!({ "resources": resources, "ttlMs": CACHE_TTL_MS, "cacheScope": "public" })
 }
 
-/// `resources/templates/list`: the one template every skill resource fits.
+/// Format: the scheme of a volume file's resource URI, `volume://<volume id>/<path>` (the id as 32 lowercase hex
+/// characters, the path percent-encoded as RFC 3986 allows).
+const VOLUME_SCHEME: &str = "volume://";
+
+/// `resources/templates/list`: a skill document by its name, and a volume's file by its volume and path.
 fn resource_templates_list() -> Value {
   json!({
     "resourceTemplates": [{
@@ -1276,25 +1318,15 @@ fn resource_templates_list() -> Value {
       "name": "slates skill",
       "description": "A slates skill document (Agent Skills format), by its name.",
       "mimeType": skills::MIME_TYPE,
+    }, {
+      "uriTemplate": "volume://{volume}/{+path}",
+      "name": "slates volume file",
+      "description": "A file of a slates volume at its head, by the volume's id and the file's path, read under this \
+        connection's rights.",
     }],
     "ttlMs": CACHE_TTL_MS,
     "cacheScope": "public",
   })
-}
-
-/// `resources/read`: the skill document a `skill://` URI names; `-32602` for any other URI (MCP 2026-07-28: an
-/// unknown resource is invalid params, and an empty `contents` never stands for one).
-fn resource_read(params: &Value) -> Result<Value, McpError> {
-  let uri = params.get("uri").and_then(Value::as_str).unwrap_or("");
-  let skill = skills::by_uri(uri).ok_or_else(|| McpError {
-    code: code::INVALID_PARAMS,
-    message: format!("Resource not found: {uri}"),
-  })?;
-  Ok(json!({
-    "contents": [{ "uri": skill.uri(), "mimeType": skills::MIME_TYPE, "text": skill.body }],
-    "ttlMs": CACHE_TTL_MS,
-    "cacheScope": "public",
-  }))
 }
 
 /// `prompts/list`: one prompt per skill, taking no arguments.
@@ -2190,6 +2222,67 @@ fn volume_arg(args: &Value, key: &str) -> Result<VolumeId, McpError> {
   })
 }
 
+/// The bytes of a percent-encoded URI path (RFC 3986 §2.1), as UTF-8; `None` for a malformed escape or bytes that are
+/// not UTF-8.
+fn percent_decode(text: &str) -> Option<String> {
+  let mut bytes = Vec::with_capacity(text.len());
+  let mut rest = text.as_bytes();
+  while let Some((&first, tail)) = rest.split_first() {
+    if first == b'%' {
+      let hex = std::str::from_utf8(tail.get(..2)?).ok()?;
+      bytes.push(u8::from_str_radix(hex, PERCENT_RADIX).ok()?);
+      rest = tail.get(2..)?;
+    } else {
+      bytes.push(first);
+      rest = tail;
+    }
+  }
+  String::from_utf8(bytes).ok()
+}
+
+/// Format: a percent escape's two digits are hexadecimal (RFC 3986 §2.1).
+const PERCENT_RADIX: u32 = 16;
+/// Format: base64 encodes each group of three bytes (RFC 4648 §4)...
+const BASE64_GROUP_BYTES: usize = 3;
+/// Format: ...as four characters, padded with `=` (RFC 4648 §4).
+const BASE64_GROUP_CHARS: usize = 4;
+/// Format: one base64 character carries six bits (RFC 4648 §4).
+const BASE64_SEXTET: u32 = 0x3f;
+/// Format: the base64 alphabet (RFC 4648 §4).
+const BASE64_ALPHABET: &[u8; 64] =
+  b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+/// `bytes` in base64 with padding (RFC 4648 §4), as MCP resource blobs carry them.
+fn base64(bytes: &[u8]) -> String {
+  let sextet = |value: u32| {
+    char::from(
+      BASE64_ALPHABET
+        .get(usize::try_from(value & BASE64_SEXTET).unwrap_or(0))
+        .copied()
+        .unwrap_or(b'A'),
+    )
+  };
+  let mut out = String::with_capacity(
+    bytes
+      .len()
+      .div_ceil(BASE64_GROUP_BYTES)
+      .saturating_mul(BASE64_GROUP_CHARS),
+  );
+  for group in bytes.chunks(BASE64_GROUP_BYTES) {
+    let byte = |at: usize| group.get(at).copied().unwrap_or(0);
+    let word = u32::from_be_bytes([0, byte(0), byte(1), byte(2)]);
+    out.push(sextet(word >> 18));
+    out.push(sextet(word >> 12));
+    out.push(if group.len() > 1 {
+      sextet(word >> 6)
+    } else {
+      '='
+    });
+    out.push(if group.len() > 2 { sextet(word) } else { '=' });
+  }
+  out
+}
+
 /// A volume id as 32 lowercase hex characters.
 fn id_hex(id: VolumeId) -> String {
   id.bytes.iter().map(|b| format!("{b:02x}")).collect()
@@ -2236,5 +2329,43 @@ mod stdio_tests {
         StdioLine::Message(b"{\"c\":3}".to_vec()),
       ]
     );
+  }
+}
+
+#[cfg(test)]
+mod resource_encoding_tests {
+  use super::*;
+
+  /// RFC 4648 §10's test vectors for base64 with padding, which a `volume://` resource's blob uses. Do: encode each.
+  /// Expect: the RFC's output, byte for byte.
+  #[test]
+  fn base64_matches_the_rfc_vectors() {
+    for (input, expected) in [
+      ("", ""),
+      ("f", "Zg=="),
+      ("fo", "Zm8="),
+      ("foo", "Zm9v"),
+      ("foob", "Zm9vYg=="),
+      ("fooba", "Zm9vYmE="),
+      ("foobar", "Zm9vYmFy"),
+    ] {
+      assert_eq!(base64(input.as_bytes()), expected, "{input:?}");
+    }
+    assert_eq!(base64(&[0xff, 0x00, 0xfe]), "/wD+");
+  }
+
+  /// A `volume://` path's percent-decoding (RFC 3986 §2.1). Do: decode plain, escaped, multi-byte UTF-8 and malformed
+  /// paths. Expect: the decoded path, and `None` for a truncated escape, a non-hex escape, or bytes that are not UTF-8.
+  #[test]
+  fn volume_paths_percent_decode_and_malformed_ones_are_refused() {
+    assert_eq!(percent_decode("src/lib.rs").as_deref(), Some("src/lib.rs"));
+    assert_eq!(
+      percent_decode("src%2Flib.rs").as_deref(),
+      Some("src/lib.rs")
+    );
+    assert_eq!(percent_decode("caf%C3%A9").as_deref(), Some("café"));
+    assert_eq!(percent_decode("a%2"), None);
+    assert_eq!(percent_decode("a%zz"), None);
+    assert_eq!(percent_decode("%ff%fe"), None);
   }
 }
