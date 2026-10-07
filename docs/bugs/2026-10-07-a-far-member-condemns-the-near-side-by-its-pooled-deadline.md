@@ -1,9 +1,9 @@
-# A far member condemns the near side by its pooled deadline (open)
+# A far member condemns the near side by its pooled deadline
 
 **Found:** 2026-10-07, while diagnosing an owner lease that lapsed across two Docker networks
-(`2026-10-07-an-owner-lease-lapsed-while-far-members-stretched-the-probe-round.md`). **Status: open.** The defect
-is in the vendored failure detector, hyper-swim (`vendor/hyper-raft/hyper-swim`, snapshot `f9a2c8e` of
-`../hyper-raft`). The fix belongs upstream and is then re-snapshotted, so it is not changed here.
+(`2026-10-07-an-owner-lease-lapsed-while-far-members-stretched-the-probe-round.md`). **Status: fixed in
+slates' vendored copy (2026-10-07); owed upstream as hyper-raft branch `swim-pair-deadline`.** The defect is in the
+failure detector, hyper-swim (`vendor/hyper-raft/hyper-swim`, snapshot `f9a2c8e` of `../hyper-raft`).
 
 ## Description
 
@@ -63,3 +63,36 @@ membership. Measured here:
 - A late answer is evidence of the path, not of a loss. The pair should configure from it.
 - The test above must pass, and the existing suites must hold: a killed member is still condemned by every survivor
   within the stated bound.
+
+## Cause, confirmed (2026-10-07)
+
+The detector's own counters showed it. Each far member's estimator for a near pair had taken zero round trips in
+30 s, although that pair's answers kept arriving (its `last_answer_ns` was set). The member's pool read a 1.1 ms
+round trip with 45 % loss, its "losses" being those very probes. A peer keeps only its last three probes'
+records (`OUTSTANDING`), and the far member probed each peer about every 10 ms, so every 200 ms answer found its
+record already reused: no sample, no configuration, and the pool's 2 ms deadline judged the pair for ever.
+
+## Fix (`vendor/hyper-raft/hyper-swim/src/detector.rs`)
+
+- **When a pair stops being judged by the pool.** A pair is marked as not fitting the pool (`Peer::pool_misfit`)
+  when its keying handshake measured a round trip longer than the pool's deadline, when an answer comes back past
+  that deadline, or when an answer arrives after its record was reused. Such a pair is not judged by the pool: its
+  probes are measurement only until its own estimator configures.
+- **Its own backoff.** A misfit pair's measurement wait backs off per pair (`misfit_misses`, doubling to the
+  existing cap; RFC 6298 (5.5)). The member-wide backoff is reset by every near answer and would never reach the
+  far path. The pair's answers therefore become its samples.
+
+## Tests
+
+- `no_live_member_is_condemned_across_a_lossless_far_link`, no longer ignored. Before: 76–115 condemnations per far
+  pair. With the late-answer rule alone: 1 per pair. With the per-pair backoff and the handshake round trip: 0,
+  3 of 3, every far pair configured at the true 201 ms.
+- `a_far_member_that_dies_is_condemned_by_every_survivor_and_no_live_one_is`: a killed far member is held dead by
+  every survivor, at least one by its own probes within the stated bound, and no live member is condemned. 3 of 3.
+- hyper-swim's own suite passes 74/74; the plane suite passes 8/8; the fleet suite passes 73/73.
+
+## Left open
+
+On the lossless link, the far pairs' estimators report 15–40 % loss: measurement periods that ended before their
+answer, counted as losses. It condemned nothing, but it widens their margins. The upstream change should decide
+whether a late answer within the pair's wait is a loss at all.

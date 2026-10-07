@@ -327,6 +327,20 @@ struct Peer {
     /// The previous judged probe's bound.
     last_mistake: Option<f64>,
     last_answer_ns: Option<u64>,
+    /// Whether an answer showed the member's pooled verdict does not fit this pair: one came back
+    /// past the pool's deadline, or after its probe's record had been reused by later probes. Such a
+    /// pair is not judged by the pool: its probes are measurement only until its own estimator has a
+    /// verdict, so its answers become its samples. A far peer among near ones was otherwise judged by
+    /// a deadline drawn from the near round trips for ever: every answer arrived after its record was
+    /// gone, so the pair never took a sample, never configured, and was condemned again and again
+    /// while alive (slates, 2026-10-07: a 2 ms deadline on a 200 ms path, 76 to 115 condemnations a
+    /// pair in 30 s).
+    pool_misfit: bool,
+    /// A pool-misfit pair's own measurement backoff: its unanswered measurement periods since its last
+    /// sample. The member-wide backoff is reset by every other pair's answer, so a far pair among near
+    /// ones would never wait long enough to be answered (RFC 6298 (5.5): the timer backs off per
+    /// connection, doubling).
+    misfit_misses: u32,
     report: PeerReport,
     /// A round trip to the peer its owner measured outside the detector, the handshake that keyed
     /// the peer's session ([`Detector::join_measured`]): the first wait for its probes before this
@@ -345,6 +359,8 @@ impl Peer {
             pending_since: None,
             last_mistake: None,
             last_answer_ns: None,
+            pool_misfit: false,
+            misfit_misses: 0,
             report: PeerReport::default(),
             handshake_rtt_ns: None,
         }
@@ -795,9 +811,20 @@ impl Detector {
         let target = self.next_target()?;
         let nonce = self.nonce;
         self.nonce = self.nonce.saturating_add(1);
-        let own = self.peers.get(&target).and_then(|peer| peer.stream.verdict);
+        let pooled_span = self.pool.verdict.map(|verdict| verdict.span_ns());
+        // The handshake that keyed the pair already measured its path: a round trip longer than the
+        // pool's deadline is the same evidence a late answer gives, known before the first probe.
+        let (own, misfit) = self.peers.get(&target).map_or((None, false), |peer| {
+            let handshake_misfit = peer
+                .handshake_rtt_ns
+                .zip(pooled_span)
+                .is_some_and(|(rtt, span)| rtt > span);
+            (peer.stream.verdict, peer.pool_misfit || handshake_misfit)
+        });
         let verdict = match own {
             Some(own) => Some(own),
+            // A pair the pool's verdict does not fit is measured, not judged, until it has its own.
+            None if misfit => None,
             None => self.pooled(),
         };
         let peer = self.peers.entry(target).or_insert_with(Peer::new);
@@ -816,7 +843,7 @@ impl Detector {
             answered: false,
             verdict,
             indirect_until: None,
-            expected: now_ns.saturating_add(self.measurement_wait(self.wait_base(target))),
+            expected: now_ns.saturating_add(self.probe_wait(target)),
         };
         self.probe = Some(probe);
         self.heard_other = false;
@@ -906,6 +933,9 @@ impl Detector {
             return;
         };
         Self::account(peer, probe.verdict);
+        if peer.pool_misfit && probe.verdict.is_none() && !probe.answered {
+            peer.misfit_misses = peer.misfit_misses.saturating_add(1);
+        }
         if probe.answered {
             peer.clear_pending();
             self.condemn_pending(probe.target, probe.nonce, now_ns);
@@ -1069,6 +1099,26 @@ impl Detector {
     /// outstanding, the latest three of its peer's; when round trips lengthen past that, periods at
     /// the latest round trip's pace see every answer come for a probe written over, measure none,
     /// and never lengthen. A measured round trip ends the backing off.
+    /// How long a measurement probe of `target` waits for its answer: the member's backed-off wait,
+    /// or, for a pair the pool does not fit, that pair's own backoff from the same base.
+    fn probe_wait(&self, target: HostId) -> u64 {
+        let base = self.wait_base(target);
+        let pooled_span = self.pool.verdict.map(|verdict| verdict.span_ns());
+        match self.peers.get(&target) {
+            Some(peer)
+                if peer.pool_misfit
+                    || peer
+                        .handshake_rtt_ns
+                        .zip(pooled_span)
+                        .is_some_and(|(rtt, span)| rtt > span) =>
+            {
+                let factor = 1u64.checked_shl(peer.misfit_misses).unwrap_or(u64::MAX);
+                base.saturating_mul(factor).min(MEASUREMENT_WAIT_CAP_NS)
+            }
+            _ => self.measurement_wait(base),
+        }
+    }
+
     fn measurement_wait(&self, rtt_ns: u64) -> u64 {
         let factor = 1u64
             .checked_shl(self.measurement_misses)
@@ -1199,10 +1249,20 @@ impl Detector {
         };
         // Any answer is evidence of life when it arrives, even one too late to be measured.
         peer.last_answer_ns = Some(peer.last_answer_ns.map_or(at_ns, |last| last.max(at_ns)));
+        let pooled_span = self.pool.verdict.map(|verdict| verdict.span_ns());
         let Some(sent) = peer.take(nonce) else {
+            // An answer whose probe's record later probes already reused came back long after the
+            // pool would have judged it: the pool does not fit this pair.
+            if peer.stream.verdict.is_none() {
+                peer.pool_misfit = true;
+            }
             return;
         };
         let rtt = at_ns.saturating_sub(sent.at_ns);
+        if peer.stream.verdict.is_none() && pooled_span.is_some_and(|span| rtt > span) {
+            peer.pool_misfit = true;
+        }
+        peer.misfit_misses = 0;
         self.last_rtt_ns = Some(rtt);
         self.measurement_misses = 0;
         if let Some(((granularity, period), interval)) = measure.zip(interval) {

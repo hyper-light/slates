@@ -170,7 +170,8 @@ in the same commit as the work). Last reviewed 2026-10-07 at `89956659`.
     and `mirror_age` are built and proven in-process. The mirrored head record and promotion adoption are owed, so a
     promoted region still has nothing to serve.
   - Cross-region reads are refused `HomedElsewhere` on the two networks (location rounds `unavailable`).
-  - The vendored detector falsely condemns live members across a far link (upstream fix owed).
+  - The detector's far-link false deaths are fixed in the vendored copy (2026-10-07); the upstream change is owed,
+    and the two-network run still has to show it on the real topology.
   - Condition 7's jitter design, which replication's content pulls share.
   - The copyset-successor fleet test fails intermittently under a loaded full suite (4 of 9 untraced runs, passing
     alone). It is instrumented (`fleet.owner_location.no_session`); the hypothesis is a location round that skipped

@@ -139,7 +139,16 @@ impl Network {
         plane
           .install_epoch(HostId(peer), 1, &secret_between(me, peer), role)
           .unwrap();
-        plane.join(HostId(peer), None);
+        // As the daemon does: each peer joins with the round trip its keying handshake measured.
+        let crossing = if far.contains(&me) != far.contains(&peer) {
+          FAR_LATENCY_NS
+        } else {
+          0
+        };
+        plane.join(
+          HostId(peer),
+          Some(std::time::Duration::from_nanos(2 * (LATENCY_NS + crossing))),
+        );
       }
       members.insert(me, plane);
     }
@@ -656,14 +665,14 @@ fn an_owner_is_answered_by_its_holder_within_the_lease_bound_while_far_members_s
   );
 }
 
-/// §4.8 membership, an OPEN DEFECT in the vendored detector (`docs/bugs/2026-10-07-a-far-member-condemns-the-near-side-by-its-pooled-deadline.md`;
-/// hyper-swim upstream in `../hyper-raft`). Do: run two near members and four far ones, the far link 100 ms one way and
+/// §4.8 membership (`docs/bugs/2026-10-07-a-far-member-condemns-the-near-side-by-its-pooled-deadline.md`; fixed in the
+/// vendored hyper-swim, the diff owed upstream to `../hyper-raft`). Do: run two near members and four far ones, the far link 100 ms one way and
 /// lossless, every member alive throughout. Expect: no member condemns a live one. Measured 2026-10-07: every far member
 /// condemned both near members 20 to 49 times per 10 s for the whole run, each crossing probe judged by a deadline of
 /// 1.9 to 2.7 ms on a 200 ms path: the far member's pooled estimator, fed mostly by its 1 ms same-side round trips,
-/// judges the pair, and the pair's own estimator never takes over.
+/// judged the pair, and the pair's own estimator never took over. Each peer joins with its handshake's round trip,
+/// as the daemon's members do.
 #[test]
-#[ignore = "open defect in the vendored detector: docs/bugs/2026-10-07-a-far-member-condemns-the-near-side-by-its-pooled-deadline.md"]
 fn no_live_member_is_condemned_across_a_lossless_far_link() {
   let far = [3u64, 4, 5, 6];
   let mut fleet = Network::sized(6, &far);
@@ -675,5 +684,54 @@ fn no_live_member_is_condemned_across_a_lossless_far_link() {
   assert!(
     by_pair.is_empty(),
     "live members condemned, (member, condemned) -> count: {by_pair:?}"
+  );
+}
+
+/// §4.8 membership, the counter-case to [`no_live_member_is_condemned_across_a_lossless_far_link`]: a pair the pool
+/// does not fit is measured before it is judged, and must still be judged once it has its own verdict. Do: run two
+/// near members and four far ones until every pair is judged by its own estimator, then kill a far member. Expect:
+/// every survivor comes to hold it dead (by its own probes, within the bound its detector stated, or by gossip),
+/// near and far alike, at least one by its own probes, and no live member is ever condemned.
+#[test]
+fn a_far_member_that_dies_is_condemned_by_every_survivor_and_no_live_one_is() {
+  let far = [3u64, 4, 5, 6];
+  let members = 6u64;
+  let mut fleet = Network::sized(members, &far);
+  let judged = fleet.run_until(HORIZON_NS, |fleet| {
+    (1..=members).all(|me| {
+      (1..=members).filter(|peer| *peer != me).all(|peer| {
+        fleet.members[&me]
+          .detector()
+          .report(hyper_swim::HostId(peer))
+          .is_some_and(|report| report.configured)
+      })
+    })
+  });
+  assert!(
+    judged,
+    "every pair's own estimator configured from its evidence"
+  );
+  assert!(
+    fleet.condemned.is_empty(),
+    "no live member condemned while measuring: {:?}",
+    fleet.condemned
+  );
+  let victim = 6u64;
+  fleet.killed.push(victim);
+  let started = fleet.now_ns;
+  let condemned = fleet.run_until(started + HORIZON_NS, |fleet| {
+    (1..members).all(|me| matches!(fleet.liveness(me, victim), Some(Liveness::Dead) | None))
+  });
+  let wrongly: Vec<(u64, u64)> = fleet
+    .condemned
+    .iter()
+    .copied()
+    .filter(|(_, target)| *target != victim)
+    .collect();
+  assert!(condemned, "every survivor holds the far member dead");
+  assert!(wrongly.is_empty(), "live members condemned: {wrongly:?}");
+  assert!(
+    condemnations_by_own_probes(&fleet, victim) > 0,
+    "a survivor's own probes condemned the far member, within its stated bound"
   );
 }

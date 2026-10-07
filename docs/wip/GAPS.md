@@ -4293,7 +4293,8 @@ An 8 MiB file was written on `a1` and read back byte-identical there (sha256 `5b
 - **Fixed: the owner lease lapsed.** Every read forwarded from region 1 was refused `LeaseUnconfirmed`; the owner's
   near holders' answers were 966–1,766 ms old against the 900 ms bound. Lease renewal at the coordinator period
   (`docs/bugs/2026-10-07-an-owner-lease-lapsed-while-far-members-stretched-the-probe-round.md`).
-- **Open: far members falsely condemn the near side.** It happens three or four times a second per pair, on a
+- **Fixed later the same day, in the vendored copy: far members falsely condemned the near side** (upstream owed as
+  hyper-raft `swim-pair-deadline`). It happens three or four times a second per pair, on a
   lossless simulated link too, from the vendored detector's pooled deadline
   (`docs/bugs/2026-10-07-a-far-member-condemns-the-near-side-by-its-pooled-deadline.md`).
   - The fix is upstream in `../hyper-raft`. The reproducer is ignored until then.

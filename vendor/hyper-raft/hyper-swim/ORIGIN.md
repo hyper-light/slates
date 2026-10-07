@@ -173,3 +173,22 @@ there is no earlier form in service to keep.
     its record's findings. Theorem 7's allowance `Σβ` for live members is printed beside their
     counts, a report, not a test.
   - The counts over hundreds of runs on macOS and Linux are in `docs/benchmarks.md`.
+
+## Local patch in slates (2026-10-07), owed upstream as `swim-pair-deadline`
+
+A pair the pooled verdict does not fit is measured, not judged by the pool, until its own estimator configures.
+It is marked as not fitting when any of these shows it:
+
+- an answer comes back past the pool's deadline;
+- an answer arrives after its probe's record was reused by later probes;
+- its keying handshake measured a round trip longer than that deadline.
+
+Its measurement wait then backs off per pair (RFC 6298), so its answers become its samples. Before the patch, a
+far member among near ones judged each crossing probe by a 2 ms deadline on a 200 ms path and never took a sample:
+76 to 115 condemnations of live members per pair in 30 s. After it, none, and a killed far member is still condemned
+by every survivor within its stated bound.
+
+- Evidence: slates `crates/cluster/tests/member_plane.rs` (`no_live_member_is_condemned_across_a_lossless_far_link`,
+  `a_far_member_that_dies_is_condemned_by_every_survivor_and_no_live_one_is`).
+- Write-up: `docs/bugs/2026-10-07-a-far-member-condemns-the-near-side-by-its-pooled-deadline.md`.
+- Drop this patch when slates re-vendors a hyper-raft main that carries the fix.
