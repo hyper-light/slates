@@ -2564,7 +2564,7 @@ async fn put_seal_content(origin: u16, local: HostId, work: ContentWork) -> Opti
     quorum,
     ..
   } = work;
-  let _ = run_on(origin, shard, move |s| {
+  crate::xshard::run_on_counted(origin, shard, move |s| {
     for (_, latency_ns) in &latencies_ns {
       s.put_latency.record(*latency_ns);
     }
@@ -3793,7 +3793,7 @@ fn fold_late_content(late: LateReplies, replies: &[(HostId, TimedReply)]) {
   }
   let latency_ns = futures::now_ns().saturating_sub(dispatched_ns);
   let origin = state::with_state(|s| s.shard).unwrap_or_default();
-  let _ = run_on(origin, shard, move |s| {
+  crate::xshard::run_on_counted(origin, shard, move |s| {
     for holder in &acked {
       s.put_latency.record(latency_ns);
       if let Some(job) = s.seals.get_mut(&object)
@@ -5616,7 +5616,7 @@ async fn run_record_period(
   deliver_pairs(origin, shard, local, budget).await;
   ship_shard_heads(origin, shard, local, budget, owner_acceptor, in_flight).await;
   // Record durably each seal whose content and head have both placed.
-  let _ = run_on(origin, shard, record_placed_seals);
+  crate::xshard::run_on_counted(origin, shard, record_placed_seals);
   retire_shard_tombstones(origin, shard, local, owner_acceptor).await;
   // The greens' merge records (§4.16 "Commit"): each green's lowest pending version — its inputs put
   // while unplaced, its record shipped in order once they are.
@@ -5902,7 +5902,7 @@ async fn ship_head(
   }
   // The placement is the owner shard's fact: record it there.
   let (object, sequence, epoch) = (head.object, head.record.sequence, head.record.epoch);
-  let _ = run_on(origin, head.shard, move |s| {
+  crate::xshard::run_on_counted(origin, head.shard, move |s| {
     record_acks_in(s, object, sequence, epoch, placement);
   });
   Some(dispatch)

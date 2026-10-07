@@ -3167,7 +3167,7 @@ fn refresh_pressure_hold() {
     .checked_div(u64::try_from(shards.len().max(1)).unwrap_or(1))
     .unwrap_or(0);
   for shard in shards {
-    let _ = crate::xshard::run_on(origin, shard, move |s| {
+    crate::xshard::run_on_counted(origin, shard, move |s| {
       if !s.pressure_pinned {
         s.store.budget.set_hold(per_shard);
       }

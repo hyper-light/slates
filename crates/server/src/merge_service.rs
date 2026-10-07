@@ -1151,7 +1151,7 @@ use slates_merge::engine::{Green, Increment, Outcome};
 use slates_wire::Wire;
 
 use crate::fleet::{Dispatch, LateReplies, return_sessions, take_sessions};
-use crate::xshard::{call_within, run_on};
+use crate::xshard::call_within;
 
 /// The stream a merge record rides between an owner and a candidate holder (§4.16 "Commit"):
 /// its own id, so the holder recomputes before it accepts — never a guess from the bytes.
@@ -1795,7 +1795,7 @@ async fn put_inputs(
     Err(ClusterError::Uncertain { placement } | ClusterError::NotPlaced { placement }) => placement,
     Err(_) => return Some(dispatch),
   };
-  let _ = run_on(origin, shard, move |s| {
+  crate::xshard::run_on_counted(origin, shard, move |s| {
     if let Some(pending) = s
       .merge
       .pending
@@ -1858,7 +1858,7 @@ async fn ship_record(
     Err(ClusterError::Uncertain { placement } | ClusterError::NotPlaced { placement }) => placement,
     Err(_) => return Some(dispatch),
   };
-  let _ = run_on(origin, shard, move |s| {
+  crate::xshard::run_on_counted(origin, shard, move |s| {
     record_merge_acks(s, local, object, version, placement, quorum);
   });
   Some(dispatch)

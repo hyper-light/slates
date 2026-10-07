@@ -2024,6 +2024,10 @@ pub fn shard_report(state: &mut ShardState) -> ShardReport {
             STATE_RETENTION_REFUSED,
             crate::state::lost_steps().retention,
           ),
+          (
+            crate::xshard::RUN_REFUSED_COUNTER,
+            crate::xshard::run_refused(),
+          ),
         ]
         .into_iter()
         .filter(|(_, count)| *count > 0)
@@ -3015,7 +3019,7 @@ fn attest_on_channel(
         }
         Err(refusal) => {
           let counter = attest_refusal_counter(&refusal);
-          let _ = crate::xshard::run_on(origin, origin, move |s| {
+          crate::xshard::run_on_counted(origin, origin, move |s| {
             s.count(counter, 1);
           });
           refused(refusal)

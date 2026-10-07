@@ -81,6 +81,33 @@ fn deliver(id: u64, result: Box<dyn Any + Send>) {
   });
 }
 
+std::thread_local! {
+  /// [`run_on_counted`]'s refused spawns on this thread: work that never ran on its shard. Per thread, so each shard
+  /// reports its own, and never through the shard's state, which a caller may be borrowing.
+  static RUN_REFUSED: Cell<u64> = const { Cell::new(0) };
+}
+
+/// [`run_on`] for a caller with nothing to do on a refusal (a placement fact recorded on its owner shard, which the
+/// next period re-derives): the refusal is counted on this thread (`xshard.run_refused`), where eight callers dropped
+/// it before 2026-10-07.
+pub fn run_on_counted(
+  origin: u16,
+  shard: u16,
+  work: impl FnOnce(&mut ShardState) + Send + 'static,
+) {
+  if run_on(origin, shard, work).is_err() {
+    RUN_REFUSED.with(|count| count.set(count.get().saturating_add(1)));
+  }
+}
+
+/// The spawns [`run_on_counted`] saw refused on this thread, so far.
+pub fn run_refused() -> u64 {
+  RUN_REFUSED.with(Cell::get)
+}
+
+/// Format: the status counter of refused cross-shard runs ([`run_on_counted`]).
+pub(crate) const RUN_REFUSED_COUNTER: &str = "xshard.run_refused";
+
 /// Runs `work` on `shard`'s state — directly when `shard` is this shard (`origin`), else as a task there —
 /// delivering nothing back. The spawn is refused typed at the target's admission bound.
 pub fn run_on(
@@ -89,12 +116,12 @@ pub fn run_on(
   work: impl FnOnce(&mut ShardState) + Send + 'static,
 ) -> Result<(), RtError> {
   if shard == origin {
-    state::with_state(work);
+    state::with_state_counted(work);
     return Ok(());
   }
   let task = SpawnRequest::new(
     Box::pin(async move {
-      state::with_state(work);
+      state::with_state_counted(work);
     }),
     None,
   );
