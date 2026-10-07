@@ -2890,3 +2890,28 @@ from 500 to 0 for 500 files, as intended. But create+close stayed at 626 and 705
 before. The COMMIT had cost the server 3 µs, its round trip was not on the create's wait, and the publication moved to
 the WRITE. A dead-even A/B does not land: the change was reverted. The levers left are the LOOKUP and GETATTR round
 trips, which the trace puts at about 6 per file.
+
+## SIGKILL under write load on a Linux FUSE mount (conditions 11 and 3; 2026-10-06)
+
+Docker, Linux 6.12, the release binary under its anchor (`--quick`, 17 shards), a 2 GiB volume mounted by an ordinary
+user (scratchpad `crash-inner.sh`).
+- **The writer** (Python), for 30 s: creates files of 100 B to 300 KB, writes them whole (short writes looped), and
+  fsyncs each. It records each file's SHA-256 outside the volume only after the fsync returns. Past 2,000 files it
+  deletes an old one every other step.
+- **The killer**, meanwhile: SIGKILLs the daemon 15 times at random intervals of 0.4–1.6 s. The anchor restarts the
+  daemon and holds the mount across each death (A-61).
+- **The check** afterwards: every recorded file is read back and hashed, and every deleted name must be absent.
+
+| Kills | Files checked | Intact | Corrupt | Deleted | Resurrected | Worst operation |
+|---|---|---|---|---|---|---|
+| 15 | 22,068 | 22,068 | 0 | 20,029 | 0 | 238 ms |
+| 15 | 21,698 | 21,698 | 0 | 19,677 | 0 | 217 ms |
+| 0 | 21,706 | 21,706 | 0 | 19,688 | 0 | 29 ms |
+
+- No panic in any run.
+- Restarted daemons replayed the writes their predecessor had logged (A-63; "replayed 3 logged writes").
+- The worst operation is the restart's pause: about 200 ms against 29 ms with no kills.
+- **The ENOSPC every run reached is correct.** Deleting every other file kept about 21,700 files live, about 2 GB, and
+  `volume stat` reported `referenced_bytes` 2,147,483,588 of the 2 GiB quota.
+- **Harness lessons:** the first versions ignored `os.write`'s short return near the quota and leaked a descriptor on
+  a failed write. Both read as slates faults (a "mismatched" file, a wall of `EMFILE`), and neither was one.
