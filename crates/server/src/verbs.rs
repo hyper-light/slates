@@ -34,7 +34,7 @@ use slates_vfs::clock::{Clock, HostClock};
 use slates_vfs::host::HostFs;
 use slates_vfs::names::NameEquivalence;
 use slates_vfs::quota::{BudgetGrowth, Quota};
-use slates_vfs::recover::{KeyedImage, ShardImage, VolumeImage};
+use slates_vfs::recover::{ShardImage, VolumeImage};
 use slates_vfs::volume::{DestroyProgress, Volume, VolumeConfig};
 use slates_wire::Wire;
 use slates_wire::observe::{Chokepoint, SpanContext};
@@ -7772,10 +7772,35 @@ fn pending_replies(state: &ShardState) -> Vec<slates_vfs::recover::HeldReply> {
 
 /// A checkpoint of every volume into the free slot (§4.8): the whole shard, as every publication was before A-68.
 fn publish_checkpoint(state: &mut ShardState) -> Result<Published, slates_vfs::VfsError> {
+  // The checkpoint is streamed into one buffer the shard keeps (its capacity reused from checkpoint to checkpoint): each
+  // volume's image is encoded as it is captured, never held whole beside its encoding. Held whole, every checkpoint
+  // left its own size in the daemon's footprint, which the allocator never returned: 270 MB after 50,000 macOS files
+  // whose volume needs 47 (2026-10-06, `sizes_probe`).
+  let mut encoded = std::mem::take(&mut state.checkpoint_buffer);
+  encoded.clear();
+  encoded.reserve(state.journal.expected_checkpoint_bytes());
+  let outcome = publish_checkpoint_into(state, &mut encoded);
+  state.checkpoint_buffer = encoded;
+  outcome
+}
+
+/// [`publish_checkpoint`] into `encoded`.
+fn publish_checkpoint_into(
+  state: &mut ShardState,
+  encoded: &mut Vec<u8>,
+) -> Result<Published, slates_vfs::VfsError> {
   let (start, end) = state.content_range;
-  let mut keyed = Vec::new();
   let mut published = Published::default();
-  let handles: Vec<_> = state.volumes.iter().map(|(handle, _)| handle).collect();
+  // In key order, the order a shard image holds its volumes in (`ShardImage::new` sorts by key).
+  let mut keyed: Vec<_> = state
+    .volumes
+    .iter()
+    .map(|(handle, slot)| (slot.id.bytes, handle))
+    .collect();
+  keyed.sort_by_key(|(key, _)| *key);
+  let handles: Vec<_> = keyed.iter().map(|(_, handle)| *handle).collect();
+  let count_at = ShardImage::encode_start(encoded);
+  let mut count = 0usize;
   for handle in &handles {
     let slot = state.volumes.get_mut(*handle)?;
     if being_destroyed(&slot.volume) {
@@ -7783,21 +7808,22 @@ fn publish_checkpoint(state: &mut ShardState) -> Result<Published, slates_vfs::V
       continue;
     }
     let id = slot.id;
-    match slot.volume.to_image(
+    let mark = encoded.len();
+    encoded.extend_from_slice(&id.bytes);
+    match slot.volume.encode_image(
       &state.store,
       slot.host.as_mut().map(|host| host as &mut dyn HostFs),
+      encoded,
     ) {
-      Ok(image) => {
+      Ok(()) => {
         published.volumes.push(id);
-        keyed.push(KeyedImage {
-          key: id.bytes,
-          image,
-        });
+        count = count.saturating_add(1);
       }
       // Publish unaffected volumes even when another cannot be captured. Callers must check the touched volume
       // against the returned coverage; an omitted volume never receives a stable acknowledgement, and recovery
       // refuses it instead of rebuilding empty (§4.8, AUD-05).
       Err(e) => {
+        encoded.truncate(mark);
         count_skipped(state, id, &e);
         published.skipped.push(id);
       }
@@ -7806,9 +7832,7 @@ fn publish_checkpoint(state: &mut ShardState) -> Result<Published, slates_vfs::V
   // The replicas this shard holds for other owners ride the same image (AUD-29-59): a holder acknowledges a
   // content put only once a publish carrying it commits.
   let held = state.held_content.to_image();
-  let shard = ShardImage::new(keyed)
-    .with_held(held.clone())
-    .with_replies(pending_replies(state));
+  ShardImage::encode_finish(encoded, count_at, count, &held, pending_replies(state))?;
   let Some(object) = state.content.as_mut() else {
     return Err(slates_vfs::VfsError::RecoveryIncomplete);
   };
@@ -7822,7 +7846,7 @@ fn publish_checkpoint(state: &mut ShardState) -> Result<Published, slates_vfs::V
   };
   let frame_bytes = state
     .journal
-    .checkpoint(&mut slots, &shard)
+    .checkpoint_encoded(&mut slots, encoded)
     .map_err(|e| publish_refused(state, e))?;
   published.frame_bytes = frame_bytes;
   for handle in handles {

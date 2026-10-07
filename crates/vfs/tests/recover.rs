@@ -1838,3 +1838,144 @@ fn a_publisher_that_keeps_its_committed_slot_publishes_in_one_pass_and_survives_
     Some(image(b"five"))
   );
 }
+
+/// The volumes the streamed encoders are checked on: the built volume (a tree, an inline file, a multi-chunk file, a
+/// symlink, a hard link), one with an attribute, a snapshot taken and the head changed after it, and an open orphan;
+/// and an origin with a clone of its snapshot that diverged.
+fn varied_volumes(store: &mut Store) -> Vec<([u8; 16], Volume)> {
+  let mut plain = volume(store, 1 << 30);
+  let root = plain.root_inode(store).unwrap();
+  let dir = plain.mkdir_no(store, root, "dir", 0o755).unwrap();
+  let small = plain.create_file_no(store, root, "small", 0o644).unwrap();
+  plain.write(store, small, 0, b"hello").unwrap();
+  let big = plain.create_file_no(store, dir, "big", 0o600).unwrap();
+  let big_bytes: Vec<u8> = (0..256u32 * 1024).map(pattern_byte).collect();
+  plain.write(store, big, 0, &big_bytes).unwrap();
+  plain.symlink_no(store, root, "link", "dir/big").unwrap();
+  plain.link_no(store, dir, "small_alias", small).unwrap();
+  plain
+    .xattr_set(
+      store,
+      small,
+      b"com.apple.provenance",
+      b"value-bytes",
+      slates_vfs::xattr::XattrSet::Either,
+    )
+    .unwrap();
+  let _snap = plain.snapshot(store).unwrap();
+  plain
+    .write(store, small, 0, b"HELLO, after the snapshot")
+    .unwrap();
+  let orphan = plain.create_file_no(store, root, "orphan", 0o644).unwrap();
+  plain.write(store, orphan, 0, b"orphan-bytes").unwrap();
+  plain.reference(store, orphan).unwrap();
+  plain.unlink_no(store, root, "orphan").unwrap();
+
+  let mut origin = prefixed_volume(store, 7);
+  let origin_root = origin.root_inode(store).unwrap();
+  let shared = origin
+    .create_file_no(store, origin_root, "shared", 0o644)
+    .unwrap();
+  origin.write(store, shared, 0, b"from the origin").unwrap();
+  let snap = origin.snapshot(store).unwrap();
+  let mut clone = Volume::clone_of(
+    store,
+    &mut origin,
+    snap,
+    VolumeConfig {
+      prefix: 8,
+      names: NameEquivalence::Fold,
+      quota: Quota::Bounded { limit: 1 << 30 },
+      journal_bytes: 1 << 16,
+      clock: Box::new(StepClock::new(0, 1)),
+    },
+  )
+  .unwrap();
+  let clone_root = clone.root_inode(store).unwrap();
+  let own = clone
+    .create_file_no(store, clone_root, "clone-only", 0o644)
+    .unwrap();
+  clone.write(store, own, 0, b"diverged").unwrap();
+  vec![
+    (key_bytes(3), plain),
+    (key_bytes(1), origin),
+    (key_bytes(2), clone),
+  ]
+}
+
+/// The streamed checkpoint (2026-10-06). Do: encode varied volumes — a tree with an inline file, a multi-chunk file, a
+/// symlink, a hard link, an attribute, a snapshot with the head changed after it, an open orphan, an origin and its
+/// diverged clone — with `Volume::encode_image`, and against `to_image().encode()`. Expect: the same bytes, every one,
+/// and the bytes decode back to the image.
+#[test]
+fn a_streamed_volume_image_is_byte_for_byte_the_image_encoding() {
+  let mut store = store();
+  for (key, vol) in varied_volumes(&mut store) {
+    let image = vol.to_image(&store, None).unwrap();
+    let mut streamed = Vec::new();
+    vol.encode_image(&store, None, &mut streamed).unwrap();
+    assert_eq!(
+      streamed,
+      image.to_content(),
+      "volume {key:?}: streamed bytes"
+    );
+    assert_eq!(
+      VolumeImage::from_content(&streamed).unwrap(),
+      image,
+      "volume {key:?}: decodes back"
+    );
+  }
+}
+
+/// The streamed checkpoint (2026-10-06). Do: encode a shard of those volumes with `ShardImage::encode_start`, each
+/// volume's key then `encode_image` in key order, and `encode_finish` with held bytes and replies; frame it through
+/// `Journal::checkpoint_encoded`, and recover it. Expect: the bytes equal `ShardImage::new(…).with_held(…)
+/// .with_replies(…).encode()`, and the journal recovers that shard image.
+#[test]
+fn a_streamed_shard_checkpoint_equals_the_shard_image_and_recovers() {
+  let mut store = store();
+  let mut volumes = varied_volumes(&mut store);
+  volumes.sort_by_key(|(key, _)| *key);
+  let held = b"held replica image bytes".to_vec();
+  let replies = vec![
+    slates_vfs::recover::HeldReply {
+      attachment: 9,
+      unique: 1,
+      reply: b"r9".to_vec(),
+    },
+    slates_vfs::recover::HeldReply {
+      attachment: 4,
+      unique: 2,
+      reply: b"r4".to_vec(),
+    },
+  ];
+  let mut streamed = Vec::new();
+  let at = ShardImage::encode_start(&mut streamed);
+  for (key, vol) in &volumes {
+    streamed.extend_from_slice(key);
+    vol.encode_image(&store, None, &mut streamed).unwrap();
+  }
+  ShardImage::encode_finish(&mut streamed, at, volumes.len(), &held, replies.clone()).unwrap();
+  let expected = ShardImage::new(
+    volumes
+      .iter()
+      .map(|(key, vol)| KeyedImage {
+        key: *key,
+        image: vol.to_image(&store, None).unwrap(),
+      })
+      .collect(),
+  )
+  .with_held(held)
+  .with_replies(replies);
+  assert_eq!(streamed, expected.to_content(), "the streamed shard bytes");
+  let mut slots = vec![0u8; CONTENT_LEN];
+  let mut journal = slates_vfs::checkpoint_log::Journal::default();
+  journal.checkpoint_encoded(&mut slots, &streamed).unwrap();
+  let (recovered, _) =
+    slates_vfs::checkpoint_log::Journal::recover(&slots, &Vec::<u8>::new()).unwrap();
+  assert_eq!(
+    recovered,
+    Some(expected),
+    "the journal recovers the shard image"
+  );
+}

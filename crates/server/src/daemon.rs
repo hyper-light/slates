@@ -2760,6 +2760,7 @@ fn init_shard(
     content_range,
     delta_range: delta_range(config, partition, content_range),
     journal: slates_vfs::checkpoint_log::Journal::default(),
+    checkpoint_buffer: Vec::new(),
     published_keys: std::collections::BTreeSet::new(),
     published_held: Vec::new(),
     #[cfg(target_os = "linux")]

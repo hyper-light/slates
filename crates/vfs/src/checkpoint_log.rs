@@ -153,6 +153,13 @@ impl Journal {
     self.generation
   }
 
+  /// What the next checkpoint's image is expected to take: the last checkpoint's bytes and every delta's since (each
+  /// delta's changes are in it, as additions or rewrites). A publisher reserves its encoding buffer at this once, where
+  /// a buffer grown by doubling reached twice the image and left each outgrown one in the allocator's footprint.
+  pub fn expected_checkpoint_bytes(&self) -> usize {
+    self.checkpoint_bytes.saturating_add(self.logged_bytes)
+  }
+
   /// Whether the next publication must be a checkpoint before any delta is even built: nothing committed yet, or
   /// the deltas since the last checkpoint already reached its size.
   pub fn wants_checkpoint(&self) -> bool {
@@ -170,6 +177,27 @@ impl Journal {
       .committed
       .map(|committed| committed.advanced_to(self.generation));
     let (bytes, committed) = image.write_after(checkpoints, known)?;
+    *self = Journal {
+      committed: Some(committed),
+      generation: committed.generation,
+      tail: 0,
+      checkpoint_bytes: bytes,
+      logged_bytes: 0,
+    };
+    Ok(bytes)
+  }
+
+  /// [`Journal::checkpoint`] for a shard image already encoded (`ShardImage::encode_start` … `encode_finish`), so the
+  /// publisher never holds the image as a value; the journal is unchanged on any refusal.
+  pub fn checkpoint_encoded<S: ImageWrite + ?Sized>(
+    &mut self,
+    checkpoints: &mut S,
+    encoded: &[u8],
+  ) -> Result<usize, VfsError> {
+    let known = self
+      .committed
+      .map(|committed| committed.advanced_to(self.generation));
+    let (bytes, committed) = ShardImage::write_encoded_after(encoded, checkpoints, known)?;
     *self = Journal {
       committed: Some(committed),
       generation: committed.generation,

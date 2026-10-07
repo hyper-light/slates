@@ -258,6 +258,29 @@ fn len_prefix(len: usize, out: &mut Vec<u8>) {
   u32::try_from(len).unwrap_or(u32::MAX).encode(out);
 }
 
+/// Format: the bytes of a sequence's length prefix (a `u32`).
+pub const LEN_PREFIX_BYTES: usize = size_of::<u32>();
+
+/// Writes the length prefix a `Vec` of `len` elements encodes before its elements, for an encoder that streams a
+/// sequence's elements instead of holding them in a `Vec` (a shard checkpoint's inodes, 2026-10-06).
+pub fn encode_len(len: usize, out: &mut Vec<u8>) {
+  len_prefix(len, out);
+}
+
+/// Rewrites the length prefix written at `at` (by [`encode_len`]) to `len`, for a streamed sequence whose length is
+/// known only once its elements are written; `false` when `at` does not hold a whole prefix.
+pub fn patch_len(out: &mut [u8], at: usize, len: usize) -> bool {
+  let mut prefix = Vec::with_capacity(LEN_PREFIX_BYTES);
+  len_prefix(len, &mut prefix);
+  match out.get_mut(at..at.saturating_add(LEN_PREFIX_BYTES)) {
+    Some(slot) if slot.len() == prefix.len() => {
+      slot.copy_from_slice(&prefix);
+      true
+    }
+    _ => false,
+  }
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;

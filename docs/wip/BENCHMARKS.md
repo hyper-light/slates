@@ -3029,3 +3029,32 @@ which slates already sets to the finest nonzero value. The sidecar is how the ma
 attributes (NFSv3 has none). The server cannot remove a round trip of this create, only make each one cheaper. The
 remaining levers are outside the v3 server: a transport with extended attributes and delegations that the macOS
 client speaks.
+
+## The daemon's memory against a volume's file count: checkpoints streamed (2026-10-06)
+
+This Mac (M5 Max, Darwin 25.4). Scratchpad `mem-50k.sh`: the release daemon under its anchor (`--quick --shards 2`), a
+1 GiB volume mounted through the macOS NFS mount, 50,000 files of 100 bytes made in directories of 1,000 (100,101
+inodes with the AppleDouble sidecars), `footprint -p` of each process before and after.
+
+| | Daemon before files | Daemon after 50,000 files | Anchor |
+|---|---|---|---|
+| Before | 20 MB | 270, 307 MB | 2.4 MB |
+| Checkpoints streamed | 20 MB | 163 MB | 2.4 MB |
+| … and the buffer reserved at the expected size | 20 MB | 139, 141 MB | 2.4–2.5 MB |
+
+How it was found: `footprint -v` put the growth in `MALLOC_LARGE` (188 of 307 MB dirty, none reclaimable), and
+`malloc_zone_pressure_relief` returned nothing, so it was not freed-and-cached. A probe that built the same volume in
+one process grew 47 MB without publishing and 144 MB publishing as the daemon does, rising in steps at each
+checkpoint: +20, +28 and +43 MB at the checkpoints after 18,401, 29,157 and 46,199 files. Each checkpoint built the
+whole `VolumeImage` (every inode image, every directory's entries) and then its encoding, and the allocator kept each
+such high-water mark.
+
+The change: `Volume::encode_image` writes exactly the bytes `to_image().encode()` did, encoding each head inode as it
+is captured and dropping it; the server streams the shard image (`ShardImage::encode_start` … `encode_finish`) into
+one buffer the shard keeps, reserved at `Journal::expected_checkpoint_bytes`, and frames it with
+`Journal::checkpoint_encoded`. Two oracle tests hold the streamed bytes equal to the old encoding on volumes with a
+snapshot, a clone, an attribute, a hard link and an open orphan, and the streamed checkpoint recovers to the same shard
+image.
+
+What remains above the volume's own 47 MB is mostly the kept buffer (one image's worth, reused) and the per-create
+delta path.

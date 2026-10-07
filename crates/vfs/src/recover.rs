@@ -512,6 +512,36 @@ pub struct HeldReply {
 }
 
 impl ShardImage {
+  /// Starts a streamed shard image's encoding in `out` (for [`ShardImage::encode_finish`]): what `ShardImage::new` then
+  /// `encode` writes before the volumes, with the volume count to be patched in. The caller then appends each volume as
+  /// its key's 16 bytes followed by [`Volume::encode_image`], in key order (the order `new` sorts into), counting them.
+  pub fn encode_start(out: &mut Vec<u8>) -> usize {
+    SHARD_MAGIC.encode(out);
+    IMAGE_VERSION.encode(out);
+    let at = out.len();
+    slates_wire::codec::encode_len(0, out);
+    at
+  }
+
+  /// Ends a streamed shard image: the volume count patched in at `at` (from [`ShardImage::encode_start`]), then the held
+  /// replicas and the replies, as `ShardImage::new(volumes).with_held(held).with_replies(replies).encode` writes them.
+  pub fn encode_finish(
+    out: &mut Vec<u8>,
+    at: usize,
+    volumes: usize,
+    held: &[u8],
+    mut replies: Vec<HeldReply>,
+  ) -> Result<(), VfsError> {
+    if !slates_wire::codec::patch_len(out, at, volumes) {
+      return Err(VfsError::RecoveryIncomplete);
+    }
+    slates_wire::codec::encode_len(held.len(), out);
+    out.extend_from_slice(held);
+    replies.sort_by_key(|reply| reply.attachment);
+    replies.encode(out);
+    Ok(())
+  }
+
   /// A shard image of the given volumes, in key order, holding nothing for others.
   pub fn new(mut volumes: Vec<KeyedImage>) -> ShardImage {
     volumes.sort_by_key(|v| v.key);
@@ -567,6 +597,16 @@ impl ShardImage {
     known: Option<CommittedSlot>,
   ) -> Result<(usize, CommittedSlot), VfsError> {
     publish_committed(slots, &self.to_content(), known)
+  }
+
+  /// [`ShardImage::write_after`] for an image already encoded ([`ShardImage::encode_start`] … `encode_finish`): the
+  /// same frame, without the image ever held as a value.
+  pub fn write_encoded_after<S: ImageWrite + ?Sized>(
+    encoded: &[u8],
+    slots: &mut S,
+    known: Option<CommittedSlot>,
+  ) -> Result<(usize, CommittedSlot), VfsError> {
+    publish_committed(slots, encoded, known)
   }
 
   /// Reads the last committed shard image back from a double-buffered content-object buffer (§4.8):
@@ -1090,6 +1130,104 @@ impl Volume {
         })
         .collect(),
     })
+  }
+
+  /// Appends this volume's image encoding to `out`: exactly `self.to_image(store, host)?.encode(out)`, but the head's
+  /// inodes are encoded one at a time as they are captured, so no `Vec` of every inode image is ever held. A checkpoint
+  /// built that way held the whole image and then its encoding, and the allocator kept the high-water mark: each
+  /// checkpoint left a step of its own size in the daemon's footprint, 270 MB after 50,000 macOS files where the
+  /// volume needs 47 (2026-10-06, `sizes_probe`). On a refusal `out` is left as it was.
+  pub fn encode_image(
+    &self,
+    store: &Store,
+    host: Option<&mut dyn crate::host::HostFs>,
+    out: &mut Vec<u8>,
+  ) -> Result<(), VfsError> {
+    let start = out.len();
+    let encoded = self.encode_image_fields(store, host, out);
+    if encoded.is_err() {
+      out.truncate(start);
+    }
+    encoded
+  }
+
+  /// The fields of [`Self::encode_image`], in [`VolumeImage`]'s declaration order (the derive's canonical order).
+  fn encode_image_fields(
+    &self,
+    store: &Store,
+    host: Option<&mut dyn crate::host::HostFs>,
+    out: &mut Vec<u8>,
+  ) -> Result<(), VfsError> {
+    let base = match (&self.base, host) {
+      (Some(plane), Some(host)) => Some(plane.image(host)?),
+      (Some(_), None) => return Err(VfsError::RecoveryIncomplete),
+      (None, _) => None,
+    };
+    let snapshots = self.capture_snapshots(store)?;
+    let root_no = store
+      .dirs
+      .get(self.root)
+      .map_err(|_| VfsError::StaleHandle)?
+      .inode;
+    IMAGE_MAGIC.encode(out);
+    IMAGE_VERSION.encode(out);
+    self.prefix.encode(out);
+    policy_image(self.policy).encode(out);
+    self.epoch.0.encode(out);
+    self.next_counter.encode(out);
+    self.origin_epoch.map(|e| e.0).encode(out);
+    quota_image(&self.quota).encode(out);
+    root_no.0.encode(out);
+    self.last_snapshot.map(snap_ref).encode(out);
+    let origin_shared = self.encode_head(store, out)?;
+    origin_shared.encode(out);
+    snapshots.encode(out);
+    self
+      .orphans
+      .keys()
+      .map(|no| no.0)
+      .collect::<Vec<u64>>()
+      .encode(out);
+    base.encode(out);
+    self
+      .attachment_references()
+      .into_iter()
+      .map(|(attachment, inodes)| AttachmentReferences {
+        attachment,
+        inodes: inodes
+          .into_iter()
+          .map(|(no, count)| InodeReferences { inode: no.0, count })
+          .collect(),
+      })
+      .collect::<Vec<AttachmentReferences>>()
+      .encode(out);
+    Ok(())
+  }
+
+  /// [`Self::capture_head`] encoded as it goes: the head's inode images as a `Vec<InodeImage>` (its length patched in
+  /// once known, since a clone's shared numbers are left out), each one dropped once encoded; the shared numbers.
+  fn encode_head(&self, store: &Store, out: &mut Vec<u8>) -> Result<Vec<u64>, VfsError> {
+    let mut handles = Vec::new();
+    trie::walk(&store.tries, self.inode_root, &mut handles);
+    let at = out.len();
+    slates_wire::codec::encode_len(0, out);
+    let mut count = 0usize;
+    let mut shared = Vec::new();
+    for handle in handles {
+      let inode = store.inodes.get(handle)?;
+      if let Some(origin) = self.origin_epoch
+        && inode.born <= origin
+      {
+        shared.push(inode.no.0);
+        continue;
+      }
+      self.image_of_inode(store, inode)?.encode(out);
+      count = count.saturating_add(1);
+    }
+    if !slates_wire::codec::patch_len(out, at, count) {
+      return Err(VfsError::RecoveryIncomplete);
+    }
+    Ok(shared)
   }
 
   /// The head's inodes, and for a clone the numbers it shares with its origin snapshot (A-64): an inode born at or
