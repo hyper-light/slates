@@ -2119,3 +2119,71 @@ fn a_refused_or_abandoned_streamed_checkpoint_leaves_the_committed_one() {
     "after an abandoned stream"
   );
 }
+
+/// Shape: the steps of the write-accounting history: enough that every kind of write meets every body shape.
+const ACCOUNTING_STEPS: usize = 300;
+/// Shape: the windows the write-accounting file spans.
+const ACCOUNTING_WINDOWS: u64 = 6;
+
+/// The epoch histogram a write keeps (2026-10-06: a write reconciles only the windows it can change). Do: on a file
+/// of six chunk windows, run a seeded history of overwrites (inside a window, across windows, far from the open
+/// extent, a byte, a whole window) and truncates (into a window, to a window boundary, to zero, then growing again),
+/// and after every step image the volume and rebuild it in a fresh store, which recounts its histogram from its
+/// bodies. Expect: the live volume's referenced and unique bytes equal the rebuilt one's after every step, and its
+/// bytes read back the same.
+#[test]
+fn a_writes_accounting_equals_a_recount_after_every_step() {
+  let mut store = store();
+  let mut vol = volume(&mut store, STREAMED_QUOTA);
+  let root = vol.root_inode(&store).unwrap();
+  let chunk = u64::try_from(store.content.chunk_bytes()).unwrap();
+  let file = vol.create_file_no(&mut store, root, "f", 0o644).unwrap();
+  let mut seed = 0x2545_F491_4F6C_DD1Du64;
+  let mut next = move || {
+    seed ^= seed << 13;
+    seed ^= seed >> 7;
+    seed ^= seed << 17;
+    seed
+  };
+  for step in 0..ACCOUNTING_STEPS {
+    let span = chunk * ACCOUNTING_WINDOWS;
+    let choice = next() % 10;
+    if choice < 7 {
+      let off = next() % span;
+      let len = match next() % 4 {
+        0 => 1,
+        1 => chunk,
+        2 => chunk * 2 + 17,
+        _ => 1 + next() % 4096,
+      };
+      let fill = u8::try_from(step % 251).unwrap();
+      let bytes = vec![fill; usize::try_from(len).unwrap()];
+      vol.write(&mut store, file, off, &bytes).unwrap();
+    } else {
+      let len = match next() % 3 {
+        0 => 0,
+        1 => (next() % ACCOUNTING_WINDOWS) * chunk,
+        _ => next() % span,
+      };
+      vol.truncate(&mut store, file, len).unwrap();
+    }
+    let image = vol.to_image(&store, None).unwrap();
+    let mut fresh = common::surviving(&store);
+    let claims = common::claims(&mut fresh, &[&image]);
+    let rebuilt = Volume::from_image(
+      &mut fresh,
+      &image,
+      &claims,
+      Box::new(StepClock::new(0, 1)),
+      1 << 16,
+      None,
+    )
+    .unwrap();
+    let (live, recounted) = (vol.accounting(), rebuilt.accounting());
+    assert_eq!(
+      (live.referenced_bytes, live.unique_bytes),
+      (recounted.referenced_bytes, recounted.unique_bytes),
+      "step {step} ({choice})"
+    );
+  }
+}

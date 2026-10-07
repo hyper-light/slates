@@ -5174,7 +5174,13 @@ impl Volume {
     off: u64,
     bytes: &[u8],
   ) -> Result<usize, VfsError> {
-    let before = content_by_epoch(store, handle);
+    let touched = touched_windows(
+      &store.inodes.get(handle)?.body,
+      off,
+      bytes.len(),
+      u64::try_from(store.content.chunk_bytes()).unwrap_or(u64::MAX),
+    );
+    let before = content_by_epoch_within(store, handle, touched);
     let body = std::mem::replace(&mut store.inodes.get_mut(handle)?.body, Body::None);
     let landed = self.write_body(store, body, off, bytes);
     let inode = store.inodes.get_mut(handle)?;
@@ -5184,7 +5190,7 @@ impl Volume {
       self.written.insert(inode.no, self.sweep_tick);
       self.idle_pending.remove(&inode.no);
     }
-    self.reconcile(before, content_by_epoch(store, handle));
+    self.reconcile(before, content_by_epoch_within(store, handle, touched));
     match landed.refused {
       Some(refusal) if landed.written == 0 => Err(refusal),
       _ => Ok(landed.written),
@@ -5692,6 +5698,90 @@ pub(crate) fn content_by_epoch(store: &Store, handle: Handle<Inode>) -> EpochCon
       .filter_map(sealed_block)
       .for_each(|part| out.push(part)),
     _ => {}
+  }
+  out
+}
+
+/// The file ranges whose extents a write of `len` bytes at `off` can change in a chunked body, for the epoch histogram's
+/// reconcile to read only those (`None`: every extent, for any other body). Every extent begins at a window boundary
+/// and a window holds at most one (§4.5, the chunk rule), and a write on a sealed or open body changes extents only by
+/// reopening the windows it covers ([`Volume::open_window`]) and by sealing the extent open before it, so outside the
+/// windows `[off, off + len)` covers and the window of the open extent nothing changes, and the parts there are the
+/// same before and after. Reading every extent made a random 4 KiB overwrite cost O(the file's extents) twice:
+/// 74 µs in a 512 MiB file against 17 µs in a 16 MiB one (2026-10-06). An inline body (it may spill into window 0)
+/// and a base-backed one keep the whole view.
+fn touched_windows(body: &Body, off: u64, len: usize, chunk: u64) -> Option<[(u64, u64); 2]> {
+  let end = off.saturating_add(u64::try_from(len).unwrap_or(u64::MAX));
+  let window_end = |at: u64| window_start_of(at, chunk).saturating_add(chunk);
+  let written = (
+    window_start_of(off, chunk),
+    window_end(end.saturating_sub(1).max(off)),
+  );
+  match body {
+    Body::Sealed(_) => Some([written, written]),
+    Body::Open { open, .. } => Some([
+      written,
+      (window_start_of(open.off, chunk), window_end(open.off)),
+    ]),
+    _ => None,
+  }
+}
+
+/// [`content_by_epoch`] limited to the extents (and the open extent) overlapping `within`'s ranges, counting an
+/// extent once when the ranges overlap; the whole view for `None`.
+fn content_by_epoch_within(
+  store: &Store,
+  handle: Handle<Inode>,
+  within: Option<[(u64, u64); 2]>,
+) -> EpochContent {
+  let Some([first, second]) = within else {
+    return content_by_epoch(store, handle);
+  };
+  let mut out = EpochContent::Empty;
+  let Ok(inode) = store.inodes.get(handle) else {
+    return out;
+  };
+  let in_ranges = |e_off: u64, e_len: u64| {
+    let e_end = e_off.saturating_add(e_len);
+    [first, second]
+      .iter()
+      .any(|(start, end)| e_off < *end && *start < e_end)
+  };
+  let mut add = |e: &Extent| {
+    if let ExtentSrc::Chunk { chunk, .. } = e.src
+      && let Some(c) = store.content.chunk(chunk)
+    {
+      out.push((c.born, u64::try_from(c.block.len()).unwrap_or(u64::MAX)));
+    }
+  };
+  let (sealed, open) = match &inode.body {
+    Body::Sealed(extents) => (extents.as_slice(), None),
+    Body::Open { open, sealed } => (sealed.as_slice(), Some(open)),
+    _ => return content_by_epoch(store, handle),
+  };
+  let second_disjoint = second.1 <= first.0 || first.1 <= second.0;
+  for e in overlapping(sealed, first.0, first.1) {
+    add(e);
+  }
+  if second_disjoint {
+    for e in overlapping(sealed, second.0, second.1) {
+      add(e);
+    }
+  } else {
+    // Overlapping ranges: the extents of `second` outside `first`, so none is counted twice.
+    for e in overlapping(sealed, second.0, second.1) {
+      if !(e.off < first.1 && first.0 < e.off.saturating_add(e.len)) {
+        add(e);
+      }
+    }
+  }
+  if let Some(open) = open
+    && in_ranges(open.off, open.len.max(1))
+  {
+    out.push((
+      open.born,
+      u64::try_from(open.block.len()).unwrap_or(u64::MAX),
+    ));
   }
   out
 }

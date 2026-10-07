@@ -3126,3 +3126,26 @@ store's chunk is 64 KiB, so a 512 MiB file has 8,192 extents.
 binary-searches the extents, which every body keeps ascending and non-overlapping. Found while fixing
 `docs/bugs/2026-10-06-a-truncate-refused-partway-left-its-file-reading-zeros.md`: one unresolvable chunk anywhere
 in a file refused every read of it.
+
+## A write reconciles only the windows it can change (2026-10-06)
+
+Same machine and method as the read row above. A random 4 KiB overwrite recounted the file's every extent twice for
+the epoch histogram (`content_by_epoch` before and after), so it grew with the file. Before: 16.8 µs in a 16 MiB
+file, 39.2 µs at 128 MiB, 74.4 µs at 512 MiB. A write on a chunked body now reconciles only the windows it covers
+and the window of the extent open before it (`touched_windows`). Every extent begins at a window boundary and a
+window holds one, so nothing outside those windows changes. After, best of 5: 16.6 µs, 14.5 µs, 16.8 µs.
+
+The recorded command is `cargo run --release -p slates-vfs --example large_file_bench`. Its first run, at load
+average ~11:
+
+| File (extents) | Sequential µs/MiB | Read ns (rounds) | Overwrite ns (rounds) |
+|---|---|---|---|
+| 16 MiB (256) | 70 | 249 (255 283 261 249 268) | 24,554 (24754 25442 25420 24554 25085) |
+| 128 MiB (2,048) | 69 | 384 (396 384 421 464 437) | 11,998 (25218 25243 23412 11998 12926) |
+| 512 MiB (8,192) | 83 | 457 (528 507 457 463 491) | 18,345 (22277 26886 29905 29157 18345) |
+
+Oracle: `a_writes_accounting_equals_a_recount_after_every_step`. A seeded history of 300 overwrites and truncates
+runs on a six-window file; after every step, the live volume's referenced and unique bytes must equal those of a
+rebuild, which recounts from the bodies. A mutation that dropped the written windows failed it. Dropping only the
+open extent's window passes, because sealing keeps the extent's epoch and block when there is no cipher. That window
+is kept anyway: a seal under a cipher may move the block.
