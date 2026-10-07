@@ -4100,7 +4100,19 @@ one in a deferred free that waited for a publication that never came
 whenever a free is still deferred, so the release scrubs it. Proven through a real FUSE mount; mutation-checked
 (64 copies left without the rule). An idle shard with nothing deferred publishes nothing (measured over 3 ticks).
 
+### 2026-10-06: a macOS create costs about 13 NFS RPCs, most for the provenance attribute (diagnosed, not fixed)
+
+Through the macOS NFSv3 mount, create+close is 621 µs at p50. macOS stamps every new file with `com.apple.provenance`,
+which its NFSv3 client stores in an AppleDouble sidecar: a second CREATE, a WRITE, a COMMIT that waits a publication,
+a SETATTR, and extra LOOKUPs and GETATTRs (BENCHMARKS, "macOS NFS: what one file create costs"). The levers are listed
+there, and each needs its own A/B before it is chosen.
+
 ### 2026-10-06: a FUSE namespace change waits a whole publication (candidate, not built)
+
+Update, same day: after the dense arena regions and the incremental capture, a publication's own cost is about 3 µs
+(capture 0.04, publish 1.1, commit 0.04, idle release 0.3 µs on a 1 GiB arena), and a FUSE create+close is 52–55 µs
+against three kernel round trips of about 13 µs each. An intent log would now save a few µs, so it is no longer the
+first lever on Linux.
 
 A create or an unlink through FUSE costs 40–80 µs at p50 beyond the kernel's 13 µs round trip. Each publishes the
 shard's recovery image before its reply (§4.8 barrier). Since 2026-10-06 a close's `flush` no longer does, when the

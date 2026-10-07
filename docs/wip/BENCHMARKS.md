@@ -2851,3 +2851,35 @@ grows with the shard's arena, which is the point: a 16 GiB arena paid about 10 �
 The deferral model (`no_block_an_image_names_is_ever_handed_out_again`) now predicts each deferral from the design's
 rule, rather than reading it back. Dropping the change note on allocation fails it ("deferred exactly when an image
 names it"); before the sharpening, the model would have followed the implementation.
+
+## macOS NFS: what one file create costs, RPC by RPC (2026-10-06, diagnosis)
+
+This Mac (M5 Max, Darwin 25.4), the release daemon (`--quick --shards 1`), the NFSv3 mount `slates mount` makes. 500
+files each go through create+close, stat, open+close and unlink, from Python. Client RPCs counted with `nfsstat -c`
+before and after (scratchpad `mac-rpc.sh`).
+
+| Operation | p50 | p99 |
+|---|---|---|
+| create + close | 621 µs | 1,036 µs |
+| stat | 1 µs | 10 µs |
+| open + close | 45 µs | 99 µs |
+| unlink | 253 µs | 516 µs |
+
+RPCs for the 500 files: Create 1,000, Lookup 3,788, Getattr 1,983, Setattr 500, Write 500, Commit 500, Access 500,
+Remove 500.
+
+Every file the process created carries a `com.apple.provenance` extended attribute (`ls -la@`). NFSv3 has no extended
+attributes, so the macOS client writes it into an AppleDouble `._name` sidecar, which slates serves as the file's own
+attribute view. That costs:
+- a second CREATE;
+- a WRITE and a COMMIT, the COMMIT waiting a whole publication;
+- a SETATTR;
+- several LOOKUPs and GETATTRs.
+
+About 13 RPCs per created file at roughly 50 µs each, which is the 621 µs.
+
+The levers, each needing its own A/B:
+- the sidecar's COMMIT without a publication, with a durability argument for extended attributes;
+- fewer LOOKUP and GETATTR round trips through the attribute and negative-name caching the replies grant;
+- a transport with extended attributes the macOS client speaks (its NFS client does v3 and v4.0; slates' v4 front end
+  is 4.1/4.2).
