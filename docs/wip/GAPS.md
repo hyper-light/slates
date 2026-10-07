@@ -4269,7 +4269,10 @@ unpushed: a push is Ada's decision. Read with `gh run view 37561725434 --log-fai
    machine were the trace's own blocking read, fixed `755e6924`. Needs a loaded reproduction (six-copy load
    emulation).
 3. **`peers_that_each_believe_the_other_dead_find_each_other_again`** (Ubuntu): after injected mutual deaths, each
-   peer retired the other and they never re-met within the window. Not yet investigated.
+   peer retired the other and they never re-met within the window.
+
+Neither 2 nor 3 reproduces here under load. Fourteen busy loops (load average 12–17) on this 18-core Mac: the hedge
+test passed 3/3 and the rejoin test 3/3. Their failures are specific to the runners too.
 4. **`a_restarted_daemons_first_answer_is_awaited_for_the_reconnect_budget`** (TSan, Ubuntu x86_64):
    `Stalled { after_ns: 1000000 }`, the short reply deadline, not the reconnect budget. It does not reproduce here:
    - macOS TSan: 1 run at HEAD and 3 at `8a18d907`;
