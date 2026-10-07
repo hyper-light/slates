@@ -35,8 +35,8 @@ use slates_anchor::{AnchorSegment, Geometry};
 use slates_db::HostId;
 use slates_db::register::{DomainId, ObjectId, Quorum, RegionId, candidates_for, rendezvous_first};
 use slates_ipc::protocol::{
-  Direction, NamePolicy, Refusal, ReplyBody, RequestBody, Scope, SizeClass, SnapshotId, VolumeId,
-  pack, unpack,
+  AttachRequest, Direction, Intent, NamePolicy, ReadAt, Refusal, ReplyBody, RequestBody, Scope,
+  SizeClass, SnapshotId, VolumeId, pack, unpack,
 };
 use slates_ipc::{ClientEnd, IpcError, connect};
 use slates_machine::MachineProfile;
@@ -2009,11 +2009,11 @@ fn a_restarted_peer_is_learned_on_contact_under_its_fresh_identity() {
   let learned = observe_learned(&observed, &fleet, &daemon_b_again);
   let served_by = successor_serves(&observed, &fleet);
   // Rejoin design item 4 (2026-09-14): the returned node is a fresh member that holds nothing (R1: its
-  // RAM is gone), so it must not serve — or claim — the volume its predecessor owned; the completed
-  // takeover is undisturbed by the rejoin. Read once the successor serves, so the two views are
-  // contemporaneous.
-  let returned_serves_it =
-    served_by.served && status_answers_once(&fleet.instance_b_again, fleet.id);
+  // RAM is gone), so it must not hold — or claim — the volume its predecessor owned; the completed
+  // takeover is undisturbed by the rejoin. Its own listing (its shards' catalogs, never a forward) is the
+  // witness: since 2026-10-07 a status asked of it is forwarded to the successor and served there (§4.8
+  // "Lookup"). Read once the successor serves, so the two views are contemporaneous.
+  let returned_holds_it = served_by.served && lists_volume(&fleet.instance_b_again, fleet.id);
 
   let (formed, knew_old) = (fleet.formed, fleet.knew_old);
   daemon_b_again.stop();
@@ -2024,9 +2024,17 @@ fn a_restarted_peer_is_learned_on_contact_under_its_fresh_identity() {
   assert_restart_learned(formed, knew_old, &learned);
   assert_successor_served(&served_by, &fleet.origin_owners);
   assert!(
-    !returned_serves_it,
-    "the restarted node holds nothing and does not serve its predecessor's volume — the takeover stands"
+    !returned_holds_it,
+    "the restarted node holds nothing of its predecessor's volume — the takeover stands"
   );
+}
+
+/// Whether the daemon at `instance` lists `volume` among its own: a listing gathers its shards' catalogs only.
+fn lists_volume(instance: &str, volume: VolumeId) -> bool {
+  matches!(
+    Client::connect(instance).call(&RequestBody::List),
+    ReplyBody::Listed { volumes } if volumes.iter().any(|summary| summary.id == volume)
+  )
 }
 
 /// Whether `status` for `volume` at `instance` answers with a report right now (one call, no polling: a
@@ -4297,6 +4305,118 @@ fn a_client_reads_a_cross_region_volume_by_forwarding_to_its_owner() {
     served,
     "a client on region 1 read a volume homed in region 0 — the read was forwarded to its owner and served, \
      so the cross-region lookup is a served request, not a refusal (last reply: {last:?})"
+  );
+}
+
+/// AC (§4.8 "Lookup": a lookup by id routes to the volume's creator, whatever the asker's region). Three daemons in
+/// one region; a volume is created and write-attached on a. Do: through clients of b and c, ask its status, make a
+/// directory in it under a's attachment, and list its root. Expect: each is served by a, the directory b made is the
+/// one c lists, and a lists it too. Before 2026-10-07 only a volume homed in another region was forwarded; a client
+/// of b or c was answered `NotFound` for a's volume (found on two Docker networks, `docs/wip/GAPS.md`).
+#[test]
+fn a_client_of_another_node_in_the_owners_region_reads_and_writes_its_volume_through_the_owner() {
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c"];
+  let n = names.len();
+  let nodes: Vec<(MachineProfile, HostId, Identity)> =
+    names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+    nodes.iter().map(|(_, _, id)| id.certificate()).collect();
+  let (_serve_lease, serve) = mesh_serve_ports(n);
+  let regions: std::collections::BTreeMap<HostId, RegionId> =
+    hosts.iter().map(|host| (*host, RegionId(0))).collect();
+  let daemons = start_mesh_with_regions(nodes, &hosts, &certs, &serve, 1, &regions);
+  let instances: Vec<String> = daemons
+    .iter()
+    .map(|daemon| daemon.instance().to_owned())
+    .collect();
+  let hosts: Vec<HostId> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
+  assert_fleet_forms(&daemons, &hosts, &names);
+
+  let mut client_a = Client::connect(&instances[0].clone());
+  let ReplyBody::Created { id } = client_a.call(&scratch("same-region")) else {
+    for daemon in daemons {
+      daemon.stop();
+    }
+    panic!("create on node a did not return an id");
+  };
+  let attachment = match client_a.call(&RequestBody::Attach {
+    volume: id,
+    snapshot: None,
+    intent: Intent::Write,
+    form: AttachRequest::Root,
+  }) {
+    ReplyBody::Attached { attachment, .. } => attachment,
+    other => {
+      for daemon in daemons {
+        daemon.stop();
+      }
+      panic!("write attach on node a: {other:?}");
+    }
+  };
+  let mut client_b = Client::connect(&instances[1].clone());
+  let mut client_c = Client::connect(&instances[2].clone());
+  let (status_served, status_last) =
+    poll_status_served(&daemons, &mut client_b, id, COUNCIL_RETIRE_DEADLINE);
+  let mut made = None;
+  let made_served = poll_until(
+    &daemons.iter().collect::<Vec<_>>(),
+    COUNCIL_RETIRE_DEADLINE,
+    || {
+      let reply = client_b.call(&RequestBody::FsMkdir {
+        volume: id,
+        attachment,
+        path: "/from-b".to_owned(),
+        mode: 0o755,
+      });
+      let done = matches!(reply, ReplyBody::FsDone { .. });
+      made = Some(reply);
+      Ok(done)
+    },
+  );
+  let lists_it = |client: &mut Client| {
+    matches!(
+      client.call(&RequestBody::ReadDir {
+        volume: id,
+        path: "/".to_owned(),
+        at: ReadAt::Head,
+        cursor: 0,
+      }),
+      ReplyBody::DirPage { entries, .. } if entries.iter().any(|entry| entry.name == "from-b")
+    )
+  };
+  let mut c_lists = false;
+  let c_served = poll_until(
+    &daemons.iter().collect::<Vec<_>>(),
+    COUNCIL_RETIRE_DEADLINE,
+    || {
+      c_lists = lists_it(&mut client_c);
+      Ok(c_lists)
+    },
+  );
+  let a_lists = lists_it(&mut client_a);
+  for daemon in daemons {
+    daemon.stop();
+  }
+  assert!(
+    status_served,
+    "b's client read a's volume status through a (last reply: {status_last:?})"
+  );
+  assert!(
+    made_served,
+    "b's client made a directory in a's volume through a (last reply: {made:?})"
+  );
+  assert!(
+    c_served && c_lists,
+    "c's client listed the directory b made"
+  );
+  assert!(
+    a_lists,
+    "a lists the directory b made: one volume, at its owner"
   );
 }
 
@@ -10017,7 +10137,8 @@ const NFS3ERR_JUKEBOX: u32 = 10008;
 /// under two capabilities, one of which it then ends, and a second volume it mounted and then destroyed; B
 /// holds a volume of its own. A is then isolated on the probe plane until its lease lapses. Before the lapse
 /// and after it alike:
-/// - a status of B's volume on A answers `NotFound`: A holds none of it;
+/// - a status of B's volume on A is B's own answer, forwarded (§4.8 "Lookup"): A holds none of it, so its lease
+///   has nothing to say about it;
 /// - a read through the destroyed volume's handle answers `NFS3ERR_STALE`: the volume is not in A's set;
 /// - a read through the ended capability's handle answers `NFS3ERR_ACCES`: authorization comes before the
 ///   lease, so a lapse tells an unauthorized caller nothing about what A holds.
@@ -10070,7 +10191,7 @@ fn a_lapsed_lease_refuses_only_what_the_node_holds_and_authorizes() {
     live_read: NFS3_OK,
     ended_read: NFS3ERR_ACCES,
     destroyed_read: NFS3ERR_STALE,
-    elsewhere_status: Answer::NotFound,
+    elsewhere_status: Answer::Served,
     root_lookup: (NFS3_OK, true),
   };
   assert_eq!(

@@ -1026,72 +1026,10 @@ fn forward_to_owner(
     .ok()
     .and_then(|slot| slot.owner_route);
   let origin = state.shard;
-  let ack_up_to = state
-    .db
-    .partition()
-    .acknowledged_up_to(state.origin_anchor.0, RequestId::from_word(request).client);
-  let request_bytes = encode_body(&ForwardedRequest {
-    principal,
-    body,
-    request,
-    ack_up_to,
-  });
+  let request_bytes = forwarded_request(state, request, principal, body);
   let task = SpawnRequest::new(
     Box::pin(async move {
-      let resolved = crate::state::with_state_counted(|state| {
-        let query = crate::owner_location::Query::new(state, ObjectId(volume.bytes), region);
-        (query, query.known_owner(state, cached))
-      });
-      let Some((query, known)) = resolved else {
-        // The control shard's state was out of reach (a nested borrow is counted): the client is answered as for an
-        // owner not found, never left waiting for a reply no task would send (before 2026-10-07 the task returned
-        // and the client waited out its reply deadline).
-        let reply = refused(Refusal::HomedElsewhere { region });
-        deliver_owner_forward(origin, control, (client, request), reply, None).await;
-        return;
-      };
-      let owner = match known {
-        Some(owner) => {
-          crate::state::with_state(|state| {
-            state.count("fleet.owner_location.direct", 1);
-          });
-          Some(owner)
-        }
-        None => crate::owner_location::locate(query).await.ok(),
-      };
-      let bytes = match owner {
-        Some(owner) => {
-          let forwarded = crate::fleet::forward_over_leader_session(
-            owner,
-            request_bytes,
-            crate::daemon::LIVENESS_BUDGET_NS,
-          )
-          .await;
-          if forwarded.is_none() {
-            crate::state::with_state(|state| {
-              state.count("fleet.owner_location.forward_unsent", 1);
-            });
-          }
-          forwarded
-        }
-        None => None,
-      };
-      // A forward sent but unanswered within its budget comes back empty, and it is counted apart from one never
-      // sent: an owner that was reached but did not answer in time is not one that could not be reached.
-      let decoded = bytes.map(|bytes| decode_body::<ReplyBody>(&bytes).ok());
-      if matches!(decoded, Some(None)) {
-        crate::state::with_state_counted(|state| {
-          state.count("fleet.owner_location.forward_unanswered", 1);
-        });
-      }
-      let reply = decoded
-        .flatten()
-        .unwrap_or_else(|| refused(Refusal::HomedElsewhere { region }));
-      let route = if matches!(&reply, ReplyBody::Refused { .. }) {
-        None
-      } else {
-        owner.map(|owner| query.route(owner))
-      };
+      let (reply, route) = resolve_and_forward(volume, region, cached, request_bytes).await;
       deliver_owner_forward(origin, control, (client, request), reply, route).await;
     }),
     None,
@@ -1100,6 +1038,115 @@ fn forward_to_owner(
     return Served::Reply(refused(Refusal::HomedElsewhere { region }));
   }
   Served::Forwarded
+}
+
+/// The bytes of `body` forwarded over the fleet under this client's request id, with the completion watermark
+/// its client acknowledged (every partition holds it: acknowledgements are scattered to every shard).
+fn forwarded_request(
+  state: &ShardState,
+  request: u64,
+  principal: Principal,
+  body: RequestBody,
+) -> Vec<u8> {
+  let ack_up_to = state
+    .db
+    .partition()
+    .acknowledged_up_to(state.origin_anchor.0, RequestId::from_word(request).client);
+  encode_body(&ForwardedRequest {
+    principal,
+    body,
+    request,
+    ack_up_to,
+  })
+}
+
+/// On the control shard, where the fleet's sessions live: finds `volume`'s owner in `region` (the cached route,
+/// the live creator, else the read-only location round) and forwards `request_bytes` to it once. Returns the
+/// owner's reply, or `HomedElsewhere` when no owner was found or none answered, with the route to cache when the
+/// owner served.
+async fn resolve_and_forward(
+  volume: VolumeId,
+  region: u64,
+  cached: Option<crate::owner_location::CachedRoute>,
+  request_bytes: Vec<u8>,
+) -> (ReplyBody, Option<crate::owner_location::CachedRoute>) {
+  let resolved = crate::state::with_state_counted(|state| {
+    let query = crate::owner_location::Query::new(state, ObjectId(volume.bytes), region);
+    (query, query.known_owner(state, cached))
+  });
+  let Some((query, known)) = resolved else {
+    // The control shard's state was out of reach (a nested borrow is counted): the client is answered as for an
+    // owner not found, never left waiting for a reply no task would send (before 2026-10-07 the task returned
+    // and the client waited out its reply deadline).
+    return (refused(Refusal::HomedElsewhere { region }), None);
+  };
+  let owner = match known {
+    Some(owner) => {
+      crate::state::with_state(|state| {
+        state.count("fleet.owner_location.direct", 1);
+      });
+      Some(owner)
+    }
+    None => crate::owner_location::locate(query).await.ok(),
+  };
+  let bytes = match owner {
+    Some(owner) => {
+      let forwarded = crate::fleet::forward_over_leader_session(
+        owner,
+        request_bytes,
+        crate::daemon::LIVENESS_BUDGET_NS,
+      )
+      .await;
+      if forwarded.is_none() {
+        crate::state::with_state(|state| {
+          state.count("fleet.owner_location.forward_unsent", 1);
+        });
+      }
+      forwarded
+    }
+    None => None,
+  };
+  // A forward sent but unanswered within its budget comes back empty, and it is counted apart from one never
+  // sent: an owner that was reached but did not answer in time is not one that could not be reached.
+  let decoded = bytes.map(|bytes| decode_body::<ReplyBody>(&bytes).ok());
+  if matches!(decoded, Some(None)) {
+    crate::state::with_state_counted(|state| {
+      state.count("fleet.owner_location.forward_unanswered", 1);
+    });
+  }
+  let reply = decoded
+    .flatten()
+    .unwrap_or_else(|| refused(Refusal::HomedElsewhere { region }));
+  let route = if matches!(&reply, ReplyBody::Refused { .. }) {
+    None
+  } else {
+    owner.map(|owner| query.route(owner))
+  };
+  (reply, route)
+}
+
+/// The region and volume of a verb this node must send to another host of its own region (§4.8 "Lookup": a lookup
+/// by id routes to the volume's creator, or its successor after a takeover): a volume-scoped read or write that
+/// forwards safely, whose volume this shard's catalog does not hold, and whose id names another creator. Asked on
+/// the volume's owner shard — the one shard whose catalog would hold it — and only for a local client's verb, never
+/// one forwarded from another node, so a forward is one hop. A volume this node created and no longer holds stays
+/// `NotFound` (its successors after a same-id re-admission are GAP-A9-7's ledger transfer). A laptop never forwards:
+/// every volume it can name, it created.
+fn owned_by_another_host(state: &ShardState, body: &RequestBody) -> Option<(u64, VolumeId)> {
+  if !(is_forwardable_read(body) || is_forwardable_write(body)) {
+    return None;
+  }
+  let volume = volume_of(body)?;
+  let creator = ObjectId(volume.bytes).creator();
+  if creator == state.fleet.host() || state.db.partition().volume(to_db_volume(volume)).is_some() {
+    return None;
+  }
+  let region = state
+    .node_regions
+    .get(&state.fleet.host())
+    .copied()
+    .unwrap_or(RegionId(0));
+  Some((region.0, volume))
 }
 
 /// A late lookup belongs to the original client generation. It cannot populate a reused slot's
@@ -1385,6 +1432,30 @@ pub fn serve(state: &mut ShardState, client: Handle<ClientSlot>, request: &Reque
       shard,
     );
   }
+  serve_here(
+    state,
+    client,
+    request.request,
+    (origin, id, client_id),
+    principal,
+    body,
+  )
+}
+
+/// Serves a verb whose owner shard is this one: sent to another host of this region when that host owns its volume
+/// (§4.8 "Lookup", before any completion is recorded here), else run with its completion record.
+fn serve_here(
+  state: &mut ShardState,
+  client: Handle<ClientSlot>,
+  request: u64,
+  (origin, id, client_id): (u64, RequestId, u32),
+  principal: Principal,
+  body: RequestBody,
+) -> Served {
+  // A volume another host of this region owns goes to it (§4.8 "Lookup"), before any completion is recorded here.
+  if let Some((region, volume)) = owned_by_another_host(state, &body) {
+    return forward_to_owner(state, client, request, principal, region, volume, body);
+  }
   let reply = run_recorded(state, origin, id, client_id, &principal, body);
   // A change this verb was refused for a delegation asked for a recall; it is sent now, after the verb's own
   // transaction (A-79).
@@ -1661,8 +1732,21 @@ fn send_forward(
   let task = SpawnRequest::new(
     Box::pin(async move {
       let id = RequestId::from_word(request);
+      let mut elsewhere = None;
       let reply = crate::state::with_state(|s| {
         s.last_work_ns = s.clock.monotonic_ns();
+        // A volume another host of this region owns goes to it (§4.8 "Lookup"), before any completion is
+        // recorded here: from the control shard, which holds the fleet's sessions.
+        if let Some((region, volume)) = owned_by_another_host(s, &body) {
+          let control = s.shards.first().copied();
+          elsewhere = Some((
+            region,
+            volume,
+            control,
+            forwarded_request(s, request, principal.clone(), body.clone()),
+          ));
+          return None;
+        }
         // Where the reply goes — the origin shard's client ring — kept for a verb that answers later.
         s.reply_route = Some(crate::merge_service::ReplyRoute {
           shard: origin,
@@ -1675,6 +1759,18 @@ fn send_forward(
         run_forwarded(s, origin, id, client_id, &principal, body, cause)
       })
       .unwrap_or_else(|| Some(refused(Refusal::NotFound)));
+      if let Some((region, volume, control, request_bytes)) = elsewhere {
+        forward_for_local_client(
+          origin,
+          control,
+          (client_index, request),
+          region,
+          volume,
+          request_bytes,
+        )
+        .await;
+        return;
+      }
       // A verb that deferred its reply to a fleet commit (AUD-11) answers through the merge plane.
       let Some(reply) = reply else {
         return;
@@ -1690,6 +1786,45 @@ fn send_forward(
     None,
   );
   slates_rt::registry::send_control(owner, Control::Spawn(Box::new(task)))
+}
+
+/// Sends a local client's verb, run on its volume's owner shard here, to the volume's owner host over the fleet,
+/// from the control shard, and delivers the reply to the client's ring on `origin`. A control channel that refuses
+/// the task, or no control shard, answers `HomedElsewhere`, as an owner not found does. No route is cached: the
+/// client's slot lives on `origin`, and a cached route is only a hint.
+async fn forward_for_local_client(
+  origin: u16,
+  control: Option<u16>,
+  (client_index, request): (u32, u64),
+  region: u64,
+  volume: VolumeId,
+  request_bytes: Vec<u8>,
+) {
+  let deliver_home = move |reply: ReplyBody| {
+    SpawnRequest::new(
+      Box::pin(async move {
+        crate::state::deliver(client_index, request, reply, true);
+      }),
+      None,
+    )
+  };
+  let sent = control.is_some_and(|control| {
+    let task = SpawnRequest::new(
+      Box::pin(async move {
+        let (reply, _) = resolve_and_forward(volume, region, None, request_bytes).await;
+        crate::xshard::send_back(origin, deliver_home(reply)).await;
+      }),
+      None,
+    );
+    slates_rt::registry::send_control(control, Control::Spawn(Box::new(task))).is_ok()
+  });
+  if !sent {
+    crate::xshard::send_back(
+      origin,
+      deliver_home(refused(Refusal::HomedElsewhere { region })),
+    )
+    .await;
+  }
 }
 
 /// Retries the forwards a full control channel refused; whether any went out.

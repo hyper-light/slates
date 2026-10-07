@@ -3764,6 +3764,17 @@ context. A name is not a host pathname or a bearer capability. Fleet-wide enumer
 owners, each answer linearizable at its owner and the whole labelled with the configuration
 version.
 
+> **Status (2026-10-07, same-region lookups).** A lookup by id now reaches its creator from any node of the
+> creator's own region, not only from another region. Before, the server forwarded only a volume homed in another
+> region, and a client of another node in the owner's region was answered `NotFound` (found on two Docker
+> networks, `docs/wip/GAPS.md` 2026-10-07). A forwardable read or write whose volume the owner shard's catalog
+> lacks, and whose id names another creator, takes the same owner-location and forward path as a cross-region one,
+> with the node's own region. It is decided on the volume's owner shard, the one shard whose catalog would hold it,
+> before any completion is recorded there, and only for a local client's verb, so a forward is one hop. A volume
+> this node created and no longer holds stays `NotFound` (GAP-A9-7). Attachments stay owner-local: a write from
+> another node uses an attachment taken at the owner. Regression
+> `a_client_of_another_node_in_the_owners_region_reads_and_writes_its_volume_through_the_owner`.
+
 > **Owner location (2026-09-17).** A foreign node cannot reconstruct a historic copyset from
 > present membership. After its creator route stops being usable, it asks authenticated
 > home-region peers through a bounded read-only exchange. A peer claims itself only when its

@@ -4305,9 +4305,9 @@ An 8 MiB file was written on `a1` and read back byte-identical there (sha256 `5b
 
   The likely cause is the false deaths: a creator believed dead is not routed to directly. That is unconfirmed;
   the copyset-successor hypothesis (`no_session`) is the same path.
-- **Open: same-region non-owners answer `NotFound`.** §4.8 "Lookup" routes a lookup by id to its creator host. The
-  server forwards only volumes homed in another region; a same-region volume takes the local path and is not found
-  (`verbs.rs`, "A single-region request keeps the local fast path"). A client of `a0` or `a2` cannot read `a1`'s
+- **Closed the same day: same-region non-owners answered `NotFound`** (design §4.8 "Lookup", status 2026-10-07;
+  regression `a_client_of_another_node_in_the_owners_region_reads_and_writes_its_volume_through_the_owner`). The
+  server had forwarded only volumes homed in another region, so a client of `a0` or `a2` could not read `a1`'s
   volume.
 - **Open, and the core of condition 10: cross-region mirroring is not built.** §4.10 "Mirroring across regions"
   ships every committed record and its content to the owner's neighbourhood in the mirror region, acknowledged at
