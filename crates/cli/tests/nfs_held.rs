@@ -301,6 +301,7 @@ fn an_nfs_connection_outlives_its_daemons_kill_and_every_request_is_answered() {
 /// One NFS connection to a fresh volume's export, its file, and the model of what was written to it.
 struct HeldSession {
   stream: TcpStream,
+  root: Vec<u8>,
   file: Vec<u8>,
   model: Vec<u8>,
   xid: u32,
@@ -328,6 +329,7 @@ impl HeldSession {
     let file = nfs::create(&mut stream, &root, "burst", 2);
     HeldSession {
       stream,
+      root,
       file,
       model: Vec::new(),
       xid: 100,
@@ -419,4 +421,197 @@ fn await_new_daemon(instance: &str, killed: u32, round: usize) -> u32 {
     );
     pause();
   }
+}
+
+/// Format: NFSPROC3_COMMIT (RFC 1813).
+const COMMIT: u32 = 21;
+/// Format: `stable_how` UNSTABLE (RFC 1813 §3.3.7).
+const UNSTABLE: u32 = 0;
+/// Format: the bytes of `pre_op_attr`'s attributes (`wcc_attr`: size, mtime, ctime) and of `fattr3`.
+const WCC_ATTR_BYTES: usize = 24;
+/// See [`WCC_ATTR_BYTES`].
+const FATTR3_BYTES: usize = 84;
+/// Shape: files written per round of the commit oracle, and rounds (one kill each).
+const COMMIT_FILES: usize = 4;
+/// See [`COMMIT_FILES`].
+const COMMIT_ROUNDS: usize = 6;
+/// Shape: UNSTABLE WRITEs per file before its COMMIT: a 300 KB file as a client writes it, in 64 KiB pieces.
+const PIECES: usize = 5;
+
+/// The offset past a `wcc_data` (RFC 1813 §2.6) that starts at `at`.
+fn past_wcc(results: &[u8], at: usize) -> usize {
+  let mut at = at;
+  if u32::from_be_bytes(results[at..at + 4].try_into().unwrap()) == 1 {
+    at += WCC_ATTR_BYTES;
+  }
+  at += 4;
+  if u32::from_be_bytes(results[at..at + 4].try_into().unwrap()) == 1 {
+    at += FATTR3_BYTES;
+  }
+  at + 4
+}
+
+/// The write verifier of a WRITE reply (status, wcc_data, count, committed, verf) or a COMMIT reply (status,
+/// wcc_data, verf), asserted `NFS3_OK`.
+fn verifier_of(results: &[u8], procedure: u32) -> [u8; 8] {
+  assert_eq!(
+    nfs::status(results),
+    0,
+    "procedure {procedure} answered NFS3_OK"
+  );
+  let mut at = past_wcc(results, 4);
+  if procedure == WRITE {
+    at += 8;
+  }
+  results[at..at + 8].try_into().unwrap()
+}
+
+/// One call on `stream`, its results; replies to other xids (a duplicate from a dead daemon) are skipped.
+fn call_once(stream: &mut TcpStream, procedure: u32, args: &[u8], xid: u32) -> Vec<u8> {
+  stream
+    .write_all(&framed_call(procedure, args, xid))
+    .unwrap();
+  loop {
+    let (answered, results) = next_reply(stream);
+    if answered == xid {
+      return results;
+    }
+  }
+}
+
+/// What an `fsync` through the macOS client does to one file, as RFC 1813 §3.3.7 has a client do it: each piece
+/// written UNSTABLE, then COMMIT; a piece whose WRITE reply carried a verifier other than the COMMIT's was answered by a
+/// server that has since restarted, so it is written again and the file committed again, until one COMMIT matches every
+/// piece. Returns when the file is durable by the protocol's own promise. `kill` runs after the given call, once.
+fn fsync_like_a_client(
+  stream: &mut TcpStream,
+  file: &[u8],
+  pieces: &[Vec<u8>],
+  xid: &mut u32,
+  mut kill: impl FnMut(usize),
+) -> usize {
+  let mut verifiers: Vec<Option<[u8; 8]>> = vec![None; pieces.len()];
+  let mut calls = 0usize;
+  let mut rewrites = 0usize;
+  loop {
+    let mut offset = 0u64;
+    for (index, piece) in pieces.iter().enumerate() {
+      if verifiers[index].is_none() {
+        let mut args = Vec::new();
+        nfs::opaque(file, &mut args);
+        args.extend_from_slice(&offset.to_be_bytes());
+        args.extend_from_slice(&u32::try_from(piece.len()).unwrap().to_be_bytes());
+        args.extend_from_slice(&UNSTABLE.to_be_bytes());
+        nfs::opaque(piece, &mut args);
+        let results = call_once(stream, WRITE, &args, *xid);
+        *xid += 1;
+        verifiers[index] = Some(verifier_of(&results, WRITE));
+        kill(calls);
+        calls += 1;
+      }
+      offset += piece.len() as u64;
+    }
+    let mut args = Vec::new();
+    nfs::opaque(file, &mut args);
+    args.extend_from_slice(&0u64.to_be_bytes());
+    args.extend_from_slice(&0u32.to_be_bytes());
+    let committed = verifier_of(&call_once(stream, COMMIT, &args, *xid), COMMIT);
+    *xid += 1;
+    kill(calls);
+    calls += 1;
+    let mut stale = false;
+    for verifier in &mut verifiers {
+      if *verifier != Some(committed) {
+        *verifier = None;
+        stale = true;
+      }
+    }
+    if !stale {
+      return rewrites;
+    }
+    rewrites += 1;
+  }
+}
+
+/// RFC 1813 §3.3.7's durability promise across daemon kills, A-113. Do: under `slates anchor`, on one NFS connection,
+/// write files as the macOS client's fsync does (UNSTABLE pieces, then COMMIT, re-writing any piece whose verifier the
+/// COMMIT's disagrees with), killing the daemon once per round at a different call; then kill it once more so every file
+/// is read from the image a restart recovers. Expect: every file the protocol called durable reads back exactly, and at
+/// least one kill forced a re-write (the verifier changed under the client: the non-vacuity evidence).
+#[test]
+fn every_committed_file_survives_daemon_kills_byte_for_byte() {
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the commit oracle: set SLATES_TEST_CLI=1 to run it (an anchor and its daemons)"
+    );
+    return;
+  }
+  if cfg!(target_os = "linux") {
+    eprintln!("skipping the commit oracle: Linux does not hold NFS connections yet (A-113, GAPS)");
+    return;
+  }
+  let instance = format!("nfs-commit-{}", std::process::id());
+  let _anchor = start_anchor(&instance);
+  let mut held = HeldSession::open(&instance);
+  let mut pid = daemon_pid(&instance).expect("a daemon answers");
+  let mut xid = 10_000u32;
+  let mut committed: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+  let mut rewrites = 0usize;
+  for round in 0..COMMIT_ROUNDS {
+    let kill_at = (round * 3) % (PIECES + 1);
+    let mut killed = false;
+    for index in 0..COMMIT_FILES {
+      let name = format!("c{round}-{index}");
+      let dir = held.root.clone();
+      let file = nfs::create(&mut held.stream, &dir, &name, xid);
+      xid += 1;
+      let pieces: Vec<Vec<u8>> = (0..PIECES)
+        .map(|piece| payload(round * 10 + index, piece + 1))
+        .collect();
+      let target = pid;
+      rewrites += fsync_like_a_client(&mut held.stream, &file, &pieces, &mut xid, |call| {
+        if !killed && index == 1 && call == kill_at {
+          let status = Command::new("kill")
+            .args(["-9", &target.to_string()])
+            .status()
+            .unwrap();
+          assert!(status.success(), "kill the daemon");
+          killed = true;
+        }
+      });
+      committed.push((file, pieces.concat()));
+    }
+    if killed {
+      pid = await_new_daemon(&instance, pid, round);
+    }
+  }
+  // One more kill: every file is now read from what the restarted daemon recovered.
+  let status = Command::new("kill")
+    .args(["-9", &pid.to_string()])
+    .status()
+    .unwrap();
+  assert!(status.success(), "the final kill");
+  await_new_daemon(&instance, pid, COMMIT_ROUNDS);
+  let mut lost = Vec::new();
+  for (index, (file, bytes)) in committed.iter().enumerate() {
+    let back = read_whole(&mut held.stream, file, bytes.len(), xid);
+    xid += u32::try_from(bytes.len().div_ceil(SIZES[SIZES.len() - 1])).unwrap();
+    if back != *bytes {
+      lost.push(index);
+    }
+  }
+  eprintln!(
+    "commit oracle: {} files committed across {} kills, {rewrites} re-write rounds forced by a changed verifier, {} lost",
+    committed.len(),
+    COMMIT_ROUNDS + 1,
+    lost.len()
+  );
+  assert!(
+    lost.is_empty(),
+    "files the protocol called durable came back different: {lost:?}"
+  );
+  assert!(
+    rewrites > 0,
+    "a kill changed the verifier under the client at least once"
+  );
 }

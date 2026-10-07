@@ -4148,3 +4148,10 @@ Open:
 The same kill run that measured the 1.0 s stalls (before A-113) returned two 300 KB files empty whose fsync had
 returned, among 2,320 checked. The write verifier is per daemon instance, so a restart that loses unstable writes is
 visible to the client; the cause is not yet found. The Linux FUSE run (22,068 files, 15 kills) had none.
+
+Update, same day: the server keeps RFC 1813's promise under kills. `every_committed_file_survives_daemon_kills_byte_for_byte`
+(`crates/cli/tests/nfs_held.rs`) writes files as the macOS client's fsync does — UNSTABLE pieces, COMMIT, every piece
+whose verifier disagrees written again — with a kill per round and a final kill before reading: 24 files over 7 kills,
+6 rewrite rounds forced by a changed verifier, 0 lost, in each of three runs. The empty files came from runs where every
+kill sent the macOS client through its reconnect path, the path whose memory corruption panicked the kernel. That
+client is the leading suspect, not proven: the kernel run under A-113 (no reconnects) would show it, and waits for Ada.
