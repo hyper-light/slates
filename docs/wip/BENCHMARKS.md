@@ -2832,3 +2832,22 @@ loads; tmpfs moved too (its copy took 133–168 ms, then 80–101):
 
 The remaining distance to tmpfs on namespace changes is the publication per change, which an intent log would take
 off the reply path (GAPS, "a FUSE namespace change waits a whole publication").
+
+**Then the capture and commit themselves (same day).** They walked every word of the region's live and deferred
+bitmaps. Now a summary bit per word marks what changed since the last capture, and which words hold deferred blocks,
+so each walks only those. `capture` plus `commit_capture`, one change per publication (a create's barrier), in a
+release unit probe:
+
+| Region | Before | After |
+|---|---|---|
+| 64 MiB | 42 ns | 42 ns |
+| 1 GiB | 584 ns | 42 ns |
+| 16 GiB | 10,667 ns | 458 ns |
+
+On the Linux FUSE mount (1 GiB arena, three interleaved rounds against `aad23ee`, load average 3.7–6), create + close
+went from 57–59 / 162–176 µs to 52–55 / 143–162 µs (p50 / p99), and unlink p99 from 82–98 to 63–95 µs. The saving
+grows with the shard's arena, which is the point: a 16 GiB arena paid about 10 µs per barrier.
+
+The deferral model (`no_block_an_image_names_is_ever_handed_out_again`) now predicts each deferral from the design's
+rule, rather than reading it back. Dropping the change note on allocation fails it ("deferred exactly when an image
+names it"); before the sharpening, the model would have followed the implementation.

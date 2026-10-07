@@ -69,8 +69,16 @@ pub struct Buddy {
   committed: Bits,
   /// Committed heads freed since: still allocated, released by the next commit.
   deferred: Bits,
-  /// The heads a publication in progress may name.
+  /// The heads a publication in progress may name: `live & !deferred` as of the last capture, kept current word by
+  /// word ([`Buddy::changed`]) rather than recomputed whole.
   capture: Bits,
+  /// The words of `live` or `deferred` changed since the last capture, which the next capture recomputes.
+  changed: WordSet,
+  /// The words of `capture` recomputed since the last commit, which the next commit copies into `committed`; every
+  /// other word of `capture` equals `committed`'s.
+  uncommitted: WordSet,
+  /// The words of `deferred` holding a deferred block: what a commit or an abandon visits.
+  deferring: WordSet,
   /// Whether a capture is open (taken, neither committed nor abandoned).
   capturing: bool,
   /// Whether any image may name a block: set by the first capture and kept. Until then neither an allocation nor
@@ -128,6 +136,53 @@ impl Bits {
       } else {
         *w &= !mask;
       }
+    }
+  }
+}
+
+/// One bit per word of a [`Bits`]: the words a walk must visit. A publication's capture and commit visit the words
+/// that changed and the words that hold deferred blocks, so their cost is the change, not the region: walking every
+/// word took 3.4-4.7 µs of a 31 µs FUSE unlink on a 1 GiB arena, and 10.7 µs per publication on a 16 GiB region
+/// (2026-10-06). Sized once, as `Bits` is, so the walks allocate nothing.
+#[derive(Debug)]
+struct WordSet {
+  words: Vec<u64>,
+}
+
+impl WordSet {
+  /// An empty set over `bits` words.
+  fn new(bits: usize) -> WordSet {
+    WordSet {
+      words: vec![0; bits.div_ceil(Bits::WORD_BITS)],
+    }
+  }
+
+  fn insert(&mut self, word: usize) {
+    if let Some(summary) = self.words.get_mut(word / Bits::WORD_BITS) {
+      *summary |= 1u64 << (word % Bits::WORD_BITS);
+    }
+  }
+
+  fn remove(&mut self, word: usize) {
+    if let Some(summary) = self.words.get_mut(word / Bits::WORD_BITS) {
+      *summary &= !(1u64 << (word % Bits::WORD_BITS));
+    }
+  }
+
+  /// Every word, for the first capture, which builds the live set from the state bytes.
+  fn insert_all(&mut self, words: usize) {
+    for word in 0..words {
+      self.insert(word);
+    }
+  }
+
+  /// The summary word at `at` (its 64 words), cleared when `take` is set: what a walk reads before it mutates the
+  /// bitmaps the words name.
+  fn summary(&mut self, at: usize, take: bool) -> u64 {
+    match self.words.get_mut(at) {
+      Some(summary) if take => std::mem::take(summary),
+      Some(summary) => *summary,
+      None => 0,
     }
   }
 }
@@ -215,6 +270,9 @@ impl Buddy {
       committed: Bits::new(granules),
       deferred: Bits::new(granules),
       capture: Bits::new(granules),
+      changed: WordSet::new(granules.div_ceil(Bits::WORD_BITS)),
+      uncommitted: WordSet::new(granules.div_ceil(Bits::WORD_BITS)),
+      deferring: WordSet::new(granules.div_ceil(Bits::WORD_BITS)),
       capturing: false,
       imaged: false,
       deferred_bytes: 0,
@@ -411,6 +469,7 @@ impl Buddy {
     }
     if self.imaged {
       self.live.set(index, true);
+      self.note_changed(index);
     }
     let block_len = self.order_bytes(order);
     self.free_bytes = self.free_bytes.saturating_sub(block_len);
@@ -517,6 +576,10 @@ impl Buddy {
       });
     }
     self.deferred.set(index, true);
+    self.note_changed(index);
+    if let Some((word, _)) = Bits::word_and_mask(index) {
+      self.deferring.insert(word);
+    }
     self.deferred_bytes = self.deferred_bytes.saturating_add(self.order_bytes(order));
     Ok(true)
   }
@@ -577,6 +640,13 @@ impl Buddy {
     self.deferred_bytes
   }
 
+  /// Records that the word holding granule `index` changed in `live` or `deferred`, for the next capture.
+  fn note_changed(&mut self, index: u32) {
+    if let Some((word, _)) = Bits::word_and_mask(index) {
+      self.changed.insert(word);
+    }
+  }
+
   /// Records the heads a publication starting now may name: every live block not deferred. Until the capture
   /// is committed or abandoned, a free of one of them is deferred too.
   pub fn capture(&mut self) {
@@ -591,16 +661,26 @@ impl Buddy {
         }
       }
       self.imaged = true;
+      self.changed.insert_all(self.live.words.len());
     }
     self.capturing = true;
-    for ((capture, live), deferred) in self
-      .capture
-      .words
-      .iter_mut()
-      .zip(&self.live.words)
-      .zip(&self.deferred.words)
-    {
-      *capture = live & !deferred;
+    // Only the words that changed since the last capture are recomputed; every other word of `capture` already holds
+    // `live & !deferred` as it stands.
+    for at in 0..self.changed.words.len() {
+      let mut summary = self.changed.summary(at, true);
+      while summary != 0 {
+        let bit = summary.trailing_zeros();
+        summary &= summary.wrapping_sub(1);
+        let word = at
+          .saturating_mul(Bits::WORD_BITS)
+          .saturating_add(usize::try_from(bit).unwrap_or(0));
+        let live = self.live.words.get(word).copied().unwrap_or(0);
+        let deferred = self.deferred.words.get(word).copied().unwrap_or(0);
+        if let Some(capture) = self.capture.words.get_mut(word) {
+          *capture = live & !deferred;
+          self.uncommitted.insert(word);
+        }
+      }
     }
   }
 
@@ -620,41 +700,84 @@ impl Buddy {
     }
     self.capturing = false;
     let mut kept_bytes = 0usize;
-    for word in 0..self.deferred.words.len() {
-      let captured = self.capture.words.get(word).copied().unwrap_or(0);
-      let deferred = self.deferred.words.get(word).copied().unwrap_or(0);
-      if let Some(slot) = self.deferred.words.get_mut(word) {
-        *slot = deferred & captured;
-      }
-      let mut bits = deferred & !captured;
-      while bits != 0 {
-        let bit = bits.trailing_zeros();
-        bits &= bits.wrapping_sub(1);
-        let index = Bits::index_of(word, bit);
-        if let Some(index) = index {
-          let order = u32::from(self.state_at(index) & ORDER_MASK);
-          let locked = self.release(index, order);
-          if let Some(offset) = usize::try_from(index)
-            .ok()
-            .and_then(|index| index.checked_shl(self.granule_shift))
-          {
-            released(offset, self.order_bytes(order), locked);
-          }
-        }
-      }
-      let mut kept = deferred & captured;
-      while kept != 0 {
-        let bit = kept.trailing_zeros();
-        kept &= kept.wrapping_sub(1);
-        let order =
-          Bits::index_of(word, bit).map(|index| u32::from(self.state_at(index) & ORDER_MASK));
-        if let Some(order) = order {
-          kept_bytes = kept_bytes.saturating_add(self.order_bytes(order));
-        }
+    // Only the words holding a deferred block: the rest have nothing to release or keep.
+    for at in 0..self.deferring.words.len() {
+      let mut summary = self.deferring.summary(at, false);
+      while summary != 0 {
+        let bit = summary.trailing_zeros();
+        summary &= summary.wrapping_sub(1);
+        let word = at
+          .saturating_mul(Bits::WORD_BITS)
+          .saturating_add(usize::try_from(bit).unwrap_or(0));
+        kept_bytes = kept_bytes.saturating_add(self.commit_deferred_word(word, &mut released));
       }
     }
     self.deferred_bytes = kept_bytes;
-    std::mem::swap(&mut self.committed, &mut self.capture);
+    self.commit_uncommitted();
+  }
+
+  /// One word of deferred blocks at a commit: those the new image cannot name are released (told to `released`), the
+  /// rest stay deferred; their bytes.
+  fn commit_deferred_word(
+    &mut self,
+    word: usize,
+    released: &mut impl FnMut(usize, usize, bool),
+  ) -> usize {
+    let captured = self.capture.words.get(word).copied().unwrap_or(0);
+    let deferred = self.deferred.words.get(word).copied().unwrap_or(0);
+    if let Some(slot) = self.deferred.words.get_mut(word) {
+      *slot = deferred & captured;
+    }
+    if deferred & captured == 0 {
+      self.deferring.remove(word);
+    }
+    if deferred & !captured != 0 {
+      self.changed.insert(word);
+    }
+    let mut bits = deferred & !captured;
+    while bits != 0 {
+      let bit = bits.trailing_zeros();
+      bits &= bits.wrapping_sub(1);
+      if let Some(index) = Bits::index_of(word, bit) {
+        let order = u32::from(self.state_at(index) & ORDER_MASK);
+        let locked = self.release(index, order);
+        if let Some(offset) = usize::try_from(index)
+          .ok()
+          .and_then(|index| index.checked_shl(self.granule_shift))
+        {
+          released(offset, self.order_bytes(order), locked);
+        }
+      }
+    }
+    let mut kept_bytes = 0usize;
+    let mut kept = deferred & captured;
+    while kept != 0 {
+      let bit = kept.trailing_zeros();
+      kept &= kept.wrapping_sub(1);
+      if let Some(index) = Bits::index_of(word, bit) {
+        let order = u32::from(self.state_at(index) & ORDER_MASK);
+        kept_bytes = kept_bytes.saturating_add(self.order_bytes(order));
+      }
+    }
+    kept_bytes
+  }
+
+  /// The capture becomes the committed set: only its words recomputed since the last commit differ from it.
+  fn commit_uncommitted(&mut self) {
+    for at in 0..self.uncommitted.words.len() {
+      let mut summary = self.uncommitted.summary(at, true);
+      while summary != 0 {
+        let bit = summary.trailing_zeros();
+        summary &= summary.wrapping_sub(1);
+        let word = at
+          .saturating_mul(Bits::WORD_BITS)
+          .saturating_add(usize::try_from(bit).unwrap_or(0));
+        let captured = self.capture.words.get(word).copied().unwrap_or(0);
+        if let Some(committed) = self.committed.words.get_mut(word) {
+          *committed = captured;
+        }
+      }
+    }
   }
 
   /// The publication of the last [`Buddy::capture`] did not commit: the committed set is unchanged, and the
@@ -671,26 +794,40 @@ impl Buddy {
       return;
     }
     self.capturing = false;
-    for word in 0..self.deferred.words.len() {
-      let committed = self.committed.words.get(word).copied().unwrap_or(0);
-      let deferred = self.deferred.words.get(word).copied().unwrap_or(0);
-      let mut bits = deferred & !committed;
-      if let Some(slot) = self.deferred.words.get_mut(word) {
-        *slot = deferred & committed;
-      }
-      while bits != 0 {
-        let bit = bits.trailing_zeros();
-        bits &= bits.wrapping_sub(1);
-        let index = Bits::index_of(word, bit);
-        if let Some(index) = index {
-          let order = u32::from(self.state_at(index) & ORDER_MASK);
-          self.deferred_bytes = self.deferred_bytes.saturating_sub(self.order_bytes(order));
-          let locked = self.release(index, order);
-          if let Some(offset) = usize::try_from(index)
-            .ok()
-            .and_then(|index| index.checked_shl(self.granule_shift))
-          {
-            released(offset, self.order_bytes(order), locked);
+    // Only the words holding a deferred block; `uncommitted` keeps its words for the next commit.
+    for at in 0..self.deferring.words.len() {
+      let mut summary = self.deferring.summary(at, false);
+      while summary != 0 {
+        let bit = summary.trailing_zeros();
+        summary &= summary.wrapping_sub(1);
+        let word = at
+          .saturating_mul(Bits::WORD_BITS)
+          .saturating_add(usize::try_from(bit).unwrap_or(0));
+        let committed = self.committed.words.get(word).copied().unwrap_or(0);
+        let deferred = self.deferred.words.get(word).copied().unwrap_or(0);
+        let mut bits = deferred & !committed;
+        if let Some(slot) = self.deferred.words.get_mut(word) {
+          *slot = deferred & committed;
+        }
+        if deferred & committed == 0 {
+          self.deferring.remove(word);
+        }
+        if bits != 0 {
+          self.changed.insert(word);
+        }
+        while bits != 0 {
+          let bit = bits.trailing_zeros();
+          bits &= bits.wrapping_sub(1);
+          if let Some(index) = Bits::index_of(word, bit) {
+            let order = u32::from(self.state_at(index) & ORDER_MASK);
+            self.deferred_bytes = self.deferred_bytes.saturating_sub(self.order_bytes(order));
+            let locked = self.release(index, order);
+            if let Some(offset) = usize::try_from(index)
+              .ok()
+              .and_then(|index| index.checked_shl(self.granule_shift))
+            {
+              released(offset, self.order_bytes(order), locked);
+            }
           }
         }
       }
@@ -769,6 +906,7 @@ impl Buddy {
         });
       }
       self.live.set(index, false);
+      self.note_changed(index);
     }
     // The owner asked `is_locked` before the free and unlocks the pages itself; the bit goes with the block.
     let _ = self.unmark_locked(index, order);
@@ -782,6 +920,7 @@ impl Buddy {
   fn release(&mut self, index: u32, order: u32) -> bool {
     if self.imaged {
       self.live.set(index, false);
+      self.note_changed(index);
     }
     let locked = self.unmark_locked(index, order);
     self.coalesce_free(index, order);
@@ -1266,8 +1405,22 @@ mod tests {
         return;
       }
       let block = self.live.swap_remove(rng.below(self.live.len()));
-      if b.free_or_defer(block).unwrap() {
-        self.deferred.push((block.offset, block.len));
+      let span = (block.offset, block.len);
+      // The design's rule, predicted rather than read back: a free waits exactly when an image may name the block,
+      // the committed one or the one being captured (A-64). A deferral the rule does not call for (a stale capture)
+      // fails here as surely as a missing one.
+      let named = self.committed.contains(&span)
+        || self
+          .capture
+          .as_ref()
+          .is_some_and(|capture| capture.contains(&span));
+      let deferred = b.free_or_defer(block).unwrap();
+      assert_eq!(
+        deferred, named,
+        "{span:?}: deferred exactly when an image names it"
+      );
+      if deferred {
+        self.deferred.push(span);
       }
     }
 
@@ -1306,8 +1459,8 @@ mod tests {
 
   /// A-64, the deferral against a model. Do: a random history of allocations, frees, captures, commits and
   /// abandons. The model keeps the blocks the committed image names and those the open capture names. Expect:
-  /// no allocation ever overlaps a block either image names, and the free bytes plus the live and deferred
-  /// bytes always equal the region.
+  /// no allocation ever overlaps a block either image names; every free is deferred exactly when one of them names
+  /// it; and the free bytes plus the live and deferred bytes always equal the region.
   #[test]
   fn no_block_an_image_names_is_ever_handed_out_again() {
     let granule = 256;
