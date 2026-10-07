@@ -330,6 +330,18 @@ pub fn authorize(edge: &HttpEdge, head: &Head) -> Result<(), Refused> {
 struct Shared {
   server: RefCell<McpServer>,
   serving: Cell<usize>,
+  /// The `subscriptions/listen` streams open now, at most [`crate::max_subscriptions`]: one per notification source,
+  /// as on stdio, so listens cannot take every connection the edge serves.
+  listening: Cell<usize>,
+}
+
+/// What a dispatched request is answered with: one JSON body under a status, or a `subscriptions/listen` stream that
+/// opens with the acknowledgement.
+enum Answer {
+  /// A status and the JSON-RPC reply (none for a notification).
+  Json(&'static str, Option<Value>),
+  /// A listen stream: its acknowledgement, and the request's id for a refusal past the bound.
+  Listen(Value, Value),
 }
 
 /// Serves MCP on `listener` under `edge` until the listener fails (§4.12). Runs on the calling thread's
@@ -345,6 +357,7 @@ pub async fn serve(
     context.keep(Shared {
       server: RefCell::new(server),
       serving: Cell::new(0),
+      listening: Cell::new(0),
     })
   })
   .ok_or(slates_rt::error::RtError::NotOnShardThread)??;
@@ -402,9 +415,37 @@ async fn serve_connection(stream: &TcpStream, shared: Kept<Shared>, edge: &HttpE
         Some(dispatch(&mut server, &head, &body))
       })
       .flatten();
-    let Some((status, reply)) = reply else {
-      let _ = write_refusal(stream, Refused::Unavailable).await;
-      return;
+    let (status, reply) = match reply {
+      Some(Answer::Json(status, reply)) => (status, reply),
+      Some(Answer::Listen(acknowledgement, id)) => {
+        // A listen holds its connection until the client closes it (Streamable HTTP: closing the stream cancels the
+        // request), so the connection ends with the stream.
+        let admitted = shared
+          .with(|shared| {
+            let open = shared.listening.get();
+            let admit = open < crate::max_subscriptions();
+            if admit {
+              shared.listening.set(open.saturating_add(1));
+            }
+            (admit, open)
+          })
+          .unwrap_or((false, 0));
+        if admitted.0 {
+          stream_listen(stream, &acknowledgement, edge).await;
+          let _ = shared.with(|shared| {
+            shared
+              .listening
+              .set(shared.listening.get().saturating_sub(1))
+          });
+          return;
+        }
+        let (code, message) = crate::subscriptions_full(admitted.1);
+        (OK, Some(crate::error(&id, code, &message)))
+      }
+      None => {
+        let _ = write_refusal(stream, Refused::Unavailable).await;
+        return;
+      }
     };
     if stream
       .write_all(&response(status, reply, head.keep_alive))
@@ -493,10 +534,10 @@ async fn fill(stream: &TcpStream, pending: &mut Vec<u8>) -> bool {
 
 /// Dispatches one JSON-RPC body: the reply, or `None` for a notification. A body that is not JSON draws
 /// the JSON-RPC parse error.
-fn dispatch(server: &mut McpServer, head: &Head, body: &[u8]) -> (&'static str, Option<Value>) {
+fn dispatch(server: &mut McpServer, head: &Head, body: &[u8]) -> Answer {
   let Ok(message) = serde_json::from_slice::<Value>(body) else {
     // A body the server cannot accept is an HTTP error (Streamable HTTP: "e.g., `400 Bad Request`").
-    return (BAD_REQUEST, Some(crate::parse_error_reply()));
+    return Answer::Json(BAD_REQUEST, Some(crate::parse_error_reply()));
   };
   let id = message.get("id").cloned().unwrap_or(Value::Null);
   // A modern request without its required `_meta`, or a method the modern era removed, is refused before the
@@ -514,24 +555,32 @@ fn dispatch(server: &mut McpServer, head: &Head, body: &[u8]) -> (&'static str, 
     let mismatch = format!(
       "Header mismatch: MCP-Protocol-Version header value '{header}' does not match body value '{body}'"
     );
-    return (
+    return Answer::Json(
       BAD_REQUEST,
       Some(crate::header_mismatch_reply(&id, &mismatch)),
     );
   }
-  if let Err(refusal) = crate::era(&params, method, head.protocol_version.as_deref()) {
-    let status = if refusal.code == crate::METHOD_NOT_FOUND_CODE {
-      NOT_FOUND
-    } else {
-      BAD_REQUEST
-    };
-    return (status, Some(refusal.reply(&id)));
-  }
+  let modern = match crate::era(&params, method, head.protocol_version.as_deref()) {
+    Ok(modern) => modern,
+    Err(refusal) => {
+      let status = if refusal.code == crate::METHOD_NOT_FOUND_CODE {
+        NOT_FOUND
+      } else {
+        BAD_REQUEST
+      };
+      return Answer::Json(status, Some(refusal.reply(&id)));
+    }
+  };
   if let Err(mismatch) = check_headers(head, &message) {
-    return (
+    return Answer::Json(
       BAD_REQUEST,
       Some(crate::header_mismatch_reply(&id, &mismatch)),
     );
+  }
+  // A modern `subscriptions/listen` with an id is answered by a stream (Streamable HTTP 2026-07-28: "the server's
+  // response is itself an SSE stream that stays open"); its acknowledgement is the rule stdio uses.
+  if method == "subscriptions/listen" && modern && message.get("id").is_some() {
+    return Answer::Listen(crate::listen_acknowledgement(&id, &params), id);
   }
   let reply = server.handle_with_header(&message, head.protocol_version.as_deref());
   let status = match reply
@@ -544,7 +593,44 @@ fn dispatch(server: &mut McpServer, head: &Head, body: &[u8]) -> (&'static str, 
     Some(crate::METHOD_NOT_FOUND_CODE) => NOT_FOUND,
     _ => OK,
   };
-  (status, reply)
+  Answer::Json(status, reply)
+}
+
+/// Format: the head of a listen stream's response (Streamable HTTP 2026-07-28): an SSE stream, never cached, with
+/// `X-Accel-Buffering: no` so a reverse proxy delivers each event at once, and closed with the connection.
+const LISTEN_HEAD: &[u8] =
+  b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n\
+X-Accel-Buffering: no\r\nConnection: close\r\n\r\n";
+
+/// Format: the SSE comment line a quiet listen stream sends as its keep-alive (Streamable HTTP 2026-07-28: "a line
+/// beginning with a colon ... clients must ignore").
+const KEEP_ALIVE: &[u8] = b":\r\n";
+
+/// Serves a `subscriptions/listen` over Streamable HTTP: an SSE response whose first event is `acknowledgement`, held
+/// open until the client closes it, which is the request's cancellation (the specification's "Cancellation": nothing
+/// is sent after). Nothing the server publishes changes while it runs, so the only further bytes are keep-alive
+/// comments, one each half of the edge's idle deadline: an intermediary that closes a connection idle for that
+/// deadline, as this edge itself does, sees one first. Bytes from the client end the stream: a listen takes none.
+async fn stream_listen(stream: &TcpStream, acknowledgement: &Value, edge: &HttpEdge) {
+  let event = format!("data: {acknowledgement}\n\n");
+  if stream.write_all(LISTEN_HEAD).await.is_err()
+    || stream.write_all(event.as_bytes()).await.is_err()
+  {
+    return;
+  }
+  let keep_alive_ns = edge.deadline_ns.checked_div(2).unwrap_or(0).max(1);
+  let mut buffer = [0u8; MAX_LINE_BYTES];
+  loop {
+    match within(keep_alive_ns, stream.read(&mut buffer)).await {
+      Ok(None) => {
+        if stream.write_all(KEEP_ALIVE).await.is_err() {
+          return;
+        }
+      }
+      // The client closed (the cancellation), sent bytes, or the read or the timer failed.
+      Ok(Some(_)) | Err(_) => return,
+    }
+  }
 }
 
 /// Format: the status lines a dispatched request is answered with.

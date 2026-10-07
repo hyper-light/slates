@@ -3757,9 +3757,15 @@ shard's own clock that A-65 budgets in (docs/bugs/2026-10-04-the-slow-observatio
      its subscription id and the honoured subset of the filter: the three list filters and the published skill
      URIs, none of which changes while a server runs, so no notification follows. A `notifications/cancelled` ends
      one; stdin's close ends the rest with their completion results; open subscriptions are bounded by the server's
-     notification sources (`assert_subscriptions`). Owed: over the HTTP edge (it answers one JSON body per request,
-     so listen is refused `-32601` there), and `volume://` resources with `notifications/resources/updated` from the
-     volume's op-log head;
+     notification sources (`assert_subscriptions`). **Over the HTTP edge: done (2026-10-06).**
+     - The response is an SSE stream (`text/event-stream`, `X-Accel-Buffering: no`) whose first event is the same
+       acknowledgement.
+     - A keep-alive comment line every half of the edge's idle deadline.
+     - Closing the stream is the cancellation.
+     - Open streams are bounded at one per notification source, refused `-32602` past it.
+     - Test `assert_listen_over_http` covers the head, the event, a keep-alive within the deadline, the bound, and the
+       slot coming back on close.
+     Owed: `volume://` resources with `notifications/resources/updated` from the volume's op-log head;
   5. the official conformance suite, run in a container (no host install): **done (A-87)**: 103 checks pass on
      the 2026-07-28 requirements and every failure is classified (reference fixtures, the optional tasks extension,
      undeclared features). The recorded harness is in `docs/wip/conformance/mcp/` and runs manually, not in CI

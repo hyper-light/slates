@@ -1288,6 +1288,7 @@ fn assert_http_transport(profile: &MachineProfile, instance: &str) {
   );
 
   assert_modern_http(port, &ours, &token);
+  assert_listen_over_http(port, &ours, &token);
   assert_unauthorized_calls_have_no_effect(port, instance, &token);
 
   // The slow and idle connections were still open throughout; the valid client was not held behind them.
@@ -1371,6 +1372,138 @@ fn modern_exchange(port: u16, host: &str, token: &str, headers: &str, body: &Val
     mcp_head(port, host, Some(&format!("http://{host}")), Some(token))
   );
   exchange(port, &head, &body.to_string())
+}
+
+/// Opens a `subscriptions/listen` stream on the HTTP edge: the socket, and what it read up to the end of the first SSE
+/// event (or the response, when the edge answered with JSON).
+fn open_listen(port: u16, host: &str, token: &str) -> (std::net::TcpStream, String) {
+  use std::io::{Read, Write};
+  let body = listen(
+    7,
+    json!({ "toolsListChanged": true, "resourcesListChanged": true }),
+  )
+  .to_string();
+  let head = format!(
+    "{}\r\nMCP-Protocol-Version: {LISTEN_VERSION}\r\nMcp-Method: subscriptions/listen",
+    mcp_head(port, host, Some(&format!("http://{host}")), Some(token))
+  );
+  let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+  stream
+    .write_all(format!("{head}\r\nContent-Length: {}\r\n\r\n{body}", body.len()).as_bytes())
+    .unwrap();
+  stream.set_read_timeout(Some(HTTP_READ_WAIT)).unwrap();
+  let mut seen = Vec::new();
+  let mut byte = [0u8; 1];
+  let mut read_until =
+    |stream: &mut std::net::TcpStream, seen: &mut Vec<u8>, done: &dyn Fn(&[u8]) -> bool| {
+      while !done(seen) {
+        match stream.read(&mut byte) {
+          Ok(1) => seen.push(byte[0]),
+          _ => break,
+        }
+      }
+    };
+  read_until(&mut stream, &mut seen, &|seen| seen.ends_with(b"\r\n\r\n"));
+  let head_len = seen.len();
+  let head = String::from_utf8_lossy(&seen).into_owned();
+  if head.contains("text/event-stream") {
+    read_until(&mut stream, &mut seen, &|seen| seen.ends_with(b"\n\n"));
+  } else {
+    let length: usize = head
+      .lines()
+      .find_map(|line| line.strip_prefix("Content-Length: "))
+      .and_then(|value| value.trim().parse().ok())
+      .unwrap_or(0);
+    read_until(&mut stream, &mut seen, &|seen| {
+      seen.len() >= head_len + length
+    });
+  }
+  (stream, String::from_utf8_lossy(&seen).into_owned())
+}
+
+/// Shape: how long a test waits for the edge's first bytes on a socket.
+const HTTP_READ_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// MCP Streamable HTTP 2026-07-28, `subscriptions/listen` (condition 13; it was refused `-32601` here). Do: open a listen
+/// stream on the HTTP edge; wait past half the edge's idle deadline; open more streams than the server has
+/// notification sources; close one and listen again. Expect: an SSE response (`text/event-stream`, `X-Accel-Buffering:
+/// no`) whose first event is the acknowledgement, naming the listen's id and the honoured filters; a keep-alive comment
+/// line within the deadline; a listen past the bound answered with `-32602`; and the closed stream's slot back, since
+/// closing the stream is the cancellation.
+fn assert_listen_over_http(port: u16, host: &str, token: &str) {
+  use std::io::Read;
+  let (mut first, response) = open_listen(port, host, token);
+  assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+  assert!(
+    response.contains("Content-Type: text/event-stream"),
+    "{response}"
+  );
+  assert!(response.contains("X-Accel-Buffering: no"), "{response}");
+  let event = response
+    .split("data: ")
+    .nth(1)
+    .unwrap_or_else(|| panic!("an SSE data line: {response}"));
+  let acknowledged: Value = serde_json::from_str(event.trim()).unwrap();
+  assert_eq!(
+    acknowledged["method"],
+    "notifications/subscriptions/acknowledged"
+  );
+  assert_eq!(
+    acknowledged["params"]["_meta"]["io.modelcontextprotocol/subscriptionId"],
+    7
+  );
+  assert_eq!(
+    acknowledged["params"]["notifications"]["toolsListChanged"],
+    true
+  );
+  let deadline = Deadlines::derive(
+    slates_server::daemon::LIVENESS_BUDGET_NS,
+    slates_db::replay::RECOVERY_BUDGET_NS,
+  )
+  .get()
+  .reply_ns;
+  first
+    .set_read_timeout(Some(std::time::Duration::from_nanos(deadline)))
+    .unwrap();
+  let mut keep_alive = [0u8; 3];
+  first.read_exact(&mut keep_alive).unwrap();
+  assert_eq!(
+    &keep_alive, b":\r\n",
+    "a keep-alive comment within the deadline"
+  );
+  assert_listen_bound(port, host, token, first);
+}
+
+/// The second half of [`assert_listen_over_http`]: with `first` open, listens until one is refused past the bound
+/// (`-32602`), then closes one and finds its slot back within the wait.
+fn assert_listen_bound(port: u16, host: &str, token: &str, first: std::net::TcpStream) {
+  let mut open = vec![first];
+  let refused = loop {
+    let (stream, response) = open_listen(port, host, token);
+    if !response.contains("text/event-stream") {
+      break response;
+    }
+    open.push(stream);
+    assert!(
+      open.len() < 100,
+      "a bound refuses past the notification sources"
+    );
+  };
+  assert!(refused.contains("-32602"), "{refused}");
+  drop(open.pop());
+  let started = std::time::Instant::now();
+  loop {
+    let (stream, response) = open_listen(port, host, token);
+    if response.contains("text/event-stream") {
+      drop(stream);
+      break;
+    }
+    assert!(
+      started.elapsed() < HTTP_READ_WAIT,
+      "a closed stream gives its slot back: {response}"
+    );
+    std::thread::yield_now();
+  }
 }
 
 /// A modern request body: `method` with `params` and the 2026-07-28 `_meta` naming `version`.

@@ -205,8 +205,51 @@ const LIST_FILTERS: [&str; 3] = [
 /// Derived: the subscriptions one connection may hold open at once: one per notification source this server has
 /// (each list it publishes, and each skill document), past which a further one can only repeat an open one. Each
 /// holds only its id, so the set stays bounded by this.
-fn max_subscriptions() -> usize {
+pub(crate) fn max_subscriptions() -> usize {
   LIST_FILTERS.len().saturating_add(skills::SKILLS.len())
+}
+
+/// The acknowledgement a `subscriptions/listen` request `id` opens its stream with (MCP 2026-07-28 patterns/subscriptions):
+/// the filters asked for that this server honours. The list filters are honoured whole, and of the resource
+/// subscriptions only the skill URIs it publishes; an unsupported type is left out, as the specification asks. None of
+/// them changes while the server runs, so after this the stream carries nothing until it ends. One rule for stdio and
+/// the HTTP edge.
+pub(crate) fn listen_acknowledgement(id: &Value, params: &Value) -> Value {
+  let asked = params.get("notifications").cloned().unwrap_or(Value::Null);
+  let mut honoured = serde_json::Map::new();
+  for filter in LIST_FILTERS {
+    if asked.get(filter) == Some(&Value::Bool(true)) {
+      honoured.insert(filter.to_owned(), Value::Bool(true));
+    }
+  }
+  let resources: Vec<Value> = asked
+    .get("resourceSubscriptions")
+    .and_then(Value::as_array)
+    .into_iter()
+    .flatten()
+    .filter(|uri| uri.as_str().and_then(skills::by_uri).is_some())
+    .cloned()
+    .collect();
+  if !resources.is_empty() {
+    honoured.insert("resourceSubscriptions".to_owned(), Value::Array(resources));
+  }
+  json!({
+    "jsonrpc": "2.0",
+    "method": "notifications/subscriptions/acknowledged",
+    "params": {
+      "_meta": { META_SUBSCRIPTION_ID: id },
+      "notifications": honoured,
+    },
+  })
+}
+
+/// The refusal of a `subscriptions/listen` past the bound: `open` streams are open already, one per notification
+/// source ([`max_subscriptions`]), so a further one could only repeat one of them.
+pub(crate) fn subscriptions_full(open: usize) -> (i64, String) {
+  (
+    code::INVALID_PARAMS,
+    format!("{open} subscriptions are open, one per notification source; cancel one first"),
+  )
 }
 
 impl McpServer {
@@ -251,46 +294,16 @@ impl McpServer {
     if !self.streams {
       return Err(McpError {
         code: code::METHOD_NOT_FOUND,
-        message: "subscriptions/listen is served over stdio; this transport does not stream"
+        message: "subscriptions/listen is served over stdio and the HTTP edge, not this transport"
           .to_owned(),
       });
     }
     if self.subscriptions.len() >= max_subscriptions() {
-      return Err(McpError {
-        code: code::INVALID_PARAMS,
-        message: format!(
-          "{} subscriptions are open, one per notification source; cancel one first",
-          self.subscriptions.len()
-        ),
-      });
-    }
-    let asked = params.get("notifications").cloned().unwrap_or(Value::Null);
-    let mut honoured = serde_json::Map::new();
-    for filter in LIST_FILTERS {
-      if asked.get(filter) == Some(&Value::Bool(true)) {
-        honoured.insert(filter.to_owned(), Value::Bool(true));
-      }
-    }
-    let resources: Vec<Value> = asked
-      .get("resourceSubscriptions")
-      .and_then(Value::as_array)
-      .into_iter()
-      .flatten()
-      .filter(|uri| uri.as_str().and_then(skills::by_uri).is_some())
-      .cloned()
-      .collect();
-    if !resources.is_empty() {
-      honoured.insert("resourceSubscriptions".to_owned(), Value::Array(resources));
+      let (code, message) = subscriptions_full(self.subscriptions.len());
+      return Err(McpError { code, message });
     }
     self.subscriptions.push(id.clone());
-    Ok(json!({
-      "jsonrpc": "2.0",
-      "method": "notifications/subscriptions/acknowledged",
-      "params": {
-        "_meta": { META_SUBSCRIPTION_ID: id },
-        "notifications": honoured,
-      },
-    }))
+    Ok(listen_acknowledgement(id, params))
   }
 
   /// `notifications/cancelled` (MCP 2026-07-28 cancellation): a client ends its subscription on stdio by naming the
@@ -1312,7 +1325,7 @@ fn reply(id: &Value, result: Value) -> Value {
 }
 
 /// A JSON-RPC error reply.
-fn error(id: &Value, code: i64, message: &str) -> Value {
+pub(crate) fn error(id: &Value, code: i64, message: &str) -> Value {
   json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })
 }
 
