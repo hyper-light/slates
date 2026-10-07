@@ -63,6 +63,49 @@ pub struct ShardDelta {
 }
 
 impl ShardDelta {
+  /// Starts a streamed shard delta's encoding in `out` (for [`ShardDelta::encode_finish`]): what `ShardDelta::new`
+  /// then `encode` writes before the volumes, with their count to be patched in; returns where it goes. The caller
+  /// then appends each changed volume as its key's 16 bytes followed by `Volume::encode_publication`, in key order.
+  pub fn encode_start(out: &mut Vec<u8>) -> usize {
+    DELTA_MAGIC.encode(out);
+    DELTA_VERSION.encode(out);
+    let at = out.len();
+    slates_wire::codec::encode_len(0, out);
+    at
+  }
+
+  /// Ends a streamed shard delta: the volume count patched in at `at`, then the volumes gone (sorted here), the held
+  /// replicas' image and the replies, as `ShardDelta::new(volumes, removed, held, replies).encode` writes them.
+  pub fn encode_finish(
+    out: &mut Vec<u8>,
+    at: usize,
+    volumes: usize,
+    removed: &mut [[u8; 16]],
+    held: Option<&[u8]>,
+    replies: Option<&[HeldReply]>,
+  ) -> Result<(), VfsError> {
+    if !slates_wire::codec::patch_len(out, at, volumes) {
+      return Err(VfsError::RecoveryIncomplete);
+    }
+    removed.sort_unstable();
+    slates_wire::codec::encode_len(removed.len(), out);
+    for key in removed.iter() {
+      key.encode(out);
+    }
+    slates_wire::codec::encode_option_bytes(held, out);
+    match replies {
+      None => out.push(slates_wire::codec::OPTION_NONE),
+      Some(replies) => {
+        out.push(slates_wire::codec::OPTION_SOME);
+        slates_wire::codec::encode_len(replies.len(), out);
+        for reply in replies {
+          reply.encode(out);
+        }
+      }
+    }
+    Ok(())
+  }
+
   /// A delta of these changes.
   pub fn new(
     mut volumes: Vec<KeyedRecord>,
@@ -223,12 +266,24 @@ impl Journal {
     delta: &ShardDelta,
     scratch: &mut Vec<u8>,
   ) -> Result<usize, VfsError> {
+    if self.committed.is_none() {
+      return Err(VfsError::RecoveryIncomplete);
+    }
+    scratch.clear();
+    delta.encode(scratch);
+    self.append_encoded(log, scratch)
+  }
+
+  /// [`Journal::append`] for a shard delta already encoded (`ShardDelta::encode_start` … `encode_finish`): the daemon
+  /// streams each volume's publication into its scratch, never building the delta as a value.
+  pub fn append_encoded<S: ImageWrite + ?Sized>(
+    &mut self,
+    log: &mut S,
+    body: &[u8],
+  ) -> Result<usize, VfsError> {
     let Some(committed) = self.committed else {
       return Err(VfsError::RecoveryIncomplete);
     };
-    scratch.clear();
-    delta.encode(scratch);
-    let body: &[u8] = scratch;
     let generation = self
       .generation
       .checked_add(1)

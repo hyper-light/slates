@@ -233,13 +233,7 @@ impl Volume {
     host: Option<&mut dyn crate::host::HostFs>,
   ) -> Result<VolumeRecord, VfsError> {
     self.dirty.normalize();
-    let changed = u64::try_from(self.dirty.inodes.len()).unwrap_or(u64::MAX);
-    let shape = self.shape();
-    let full = !self.dirty.published
-      || shape != Shape::default()
-      || self.dirty.published_shape != shape
-      || changed >= self.live_inodes;
-    if full {
+    if self.publishes_whole() {
       return Ok(VolumeRecord::Full {
         image: self.to_image(store, host)?,
       });
@@ -247,6 +241,42 @@ impl Volume {
     Ok(VolumeRecord::Delta {
       delta: self.delta(store)?,
     })
+  }
+
+  /// Appends this volume's publication's encoding to `out`: exactly `self.publication(store, host)?.encode(out)`, with
+  /// the delta written from the store instead of built (an `InodeImage` per changed inode, a `String` per changed
+  /// entry: nine allocations a create, 2026-10-06 `create_heap`) and the full image streamed
+  /// ([`Volume::encode_image_into`]). On a refusal `out` is left as it was. Read-only, as `publication` is.
+  pub fn encode_publication(
+    &mut self,
+    store: &Store,
+    host: Option<&mut dyn crate::host::HostFs>,
+    out: &mut Vec<u8>,
+  ) -> Result<(), VfsError> {
+    let start = out.len();
+    self.dirty.normalize();
+    let encoded = if self.publishes_whole() {
+      VolumeRecord::WIRE_TAG_FULL.encode(out);
+      self.encode_image_into(store, host, out)
+    } else {
+      VolumeRecord::WIRE_TAG_DELTA.encode(out);
+      self.encode_delta(store, out)
+    };
+    if encoded.is_err() {
+      out.truncate(start);
+    }
+    encoded
+  }
+
+  /// Whether this volume's next publication is its whole image: never published, a shape a delta does not carry
+  /// (snapshots, a clone, a base), a shape changed since, or as many inodes changed as it holds.
+  fn publishes_whole(&self) -> bool {
+    let changed = u64::try_from(self.dirty.inodes.len()).unwrap_or(u64::MAX);
+    let shape = self.shape();
+    !self.dirty.published
+      || shape != Shape::default()
+      || self.dirty.published_shape != shape
+      || changed >= self.live_inodes
   }
 
   /// Whether nothing changed since this volume's last committed publication: a barrier need not record it.
@@ -349,6 +379,92 @@ impl Volume {
 }
 
 impl Volume {
+  /// [`Volume::delta`]'s encoding, in [`VolumeDelta`]'s field order, written from the store: the changed inodes counted
+  /// first (a number no longer in the trie is removed), then each encoded as `image_of_inode_without_entries` would be.
+  fn encode_delta(&self, store: &Store, out: &mut Vec<u8>) -> Result<(), VfsError> {
+    use slates_wire::codec::{encode_bytes, encode_len};
+    let root_no = store
+      .dirs
+      .get(self.root)
+      .map_err(|_| VfsError::StaleHandle)?
+      .inode;
+    self.epoch.0.encode(out);
+    self.next_counter.encode(out);
+    crate::recover::quota_image(&self.quota).encode(out);
+    root_no.0.encode(out);
+    self.last_snapshot.map(crate::recover::snap_ref).encode(out);
+    encode_len(self.orphans.len(), out);
+    for no in self.orphans.keys() {
+      no.0.encode(out);
+    }
+    encode_len(self.dirty.references.len(), out);
+    for (attachment, inode) in &self.dirty.references {
+      attachment.encode(out);
+      inode.encode(out);
+      self
+        .attachment_reference_count(*attachment, crate::ids::InodeNo(*inode))
+        .encode(out);
+    }
+    let present =
+      |no: u64| crate::trie::get(&store.tries, self.inode_root, crate::ids::InodeNo(no));
+    let changed = self
+      .dirty
+      .inodes
+      .iter()
+      .filter(|no| present(**no).is_some())
+      .count();
+    encode_len(changed, out);
+    for no in &self.dirty.inodes {
+      if let Some(handle) = present(*no) {
+        let inode = store.inodes.get(handle)?;
+        self.encode_inode(store, inode, crate::recover::Entries::Omitted, out)?;
+      }
+    }
+    encode_len(self.dirty.inodes.len().saturating_sub(changed), out);
+    for no in &self.dirty.inodes {
+      if present(*no).is_none() {
+        no.encode(out);
+      }
+    }
+    encode_len(self.dirty.entries.len(), out);
+    for (dir, name) in self.dirty.entry_names() {
+      dir.encode(out);
+      encode_bytes(name.as_bytes(), out);
+      self.encode_entry(store, crate::ids::InodeNo(dir), name, out)?;
+    }
+    Ok(())
+  }
+
+  /// [`Volume::entry_image`]'s encoding (an `Option<EntryImage>`), written from the store without copying the name.
+  fn encode_entry(
+    &self,
+    store: &Store,
+    dir: crate::ids::InodeNo,
+    name: &str,
+    out: &mut Vec<u8>,
+  ) -> Result<(), VfsError> {
+    let entry = match crate::trie::get(&store.tries, self.inode_root, dir) {
+      None => None,
+      Some(handle) => match store.inodes.get(handle)?.body {
+        crate::inode::Body::Directory(node) => store
+          .dirs
+          .get(node)
+          .map_err(|_| VfsError::StaleHandle)?
+          .lookup(&store.blocks, self.policy, name),
+        _ => None,
+      },
+    };
+    match entry {
+      None => out.push(slates_wire::codec::OPTION_NONE),
+      Some(entry) => {
+        out.push(slates_wire::codec::OPTION_SOME);
+        slates_wire::codec::encode_bytes(entry.name.as_bytes(), out);
+        crate::recover::child_number(store, &entry.child)?.encode(out);
+      }
+    }
+    Ok(())
+  }
+
   /// The entry `name` in directory `dir` now, as an image carries it; `None` when the name is absent or the
   /// directory is gone.
   fn entry_image(

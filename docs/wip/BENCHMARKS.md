@@ -3073,8 +3073,21 @@ rounds. `cargo run --release -p slates-vfs --example create_heap` (50,000 files,
 | Before this day's allocation work | 1,897 B | 39.9 | 9.0 |
 | Dirty sets as sorted `Vec`s, the delta encoded in a kept scratch, one exact buffer per journalled path | 1,420 B | 30.9 | 0.006 |
 | The checkpoint streamed into its slot | 1,024 B | 30.9 | 0.003 |
+| Inode images and publications encoded from the store, never built | 1,024 B | 13.05 | 0.003 |
 
-Per phase now: create 430.6 B and 3.0 allocations, the 100-byte write 128.7 B and 3.0, the provenance attribute
+**Encoded from the store (later again).** A checkpoint built an `InodeImage` per inode and a delta one per changed
+inode, plus a `String` per entry, each copying the inline body, the attribute names and the entry names only to encode
+and drop them. `Volume::encode_inode` and `Volume::encode_publication` write the same bytes from the store (the inline
+and directory bodies and the attribute table field by field, the rarer bodies through their `BodyImage`; a directory's
+entries are gathered by reference and sorted, one allocation a directory). The derive now emits each enum variant's
+discriminant (`BodyImage::WIRE_TAG_INLINE`, `VolumeRecord::WIRE_TAG_DELTA`, …), so a field-by-field encoder cannot
+disagree with its variant order. Oracles: the model test's every generated step compares `encode_publication` with
+`publication().encode()` byte for byte (a mutation writing every entry as absent failed it at the first create), the
+streamed-checkpoint tests compare the image bytes, and `a_streamed_shard_delta_equals_the_shard_delta_and_recovers`
+the shard delta's. Checkpoint allocations per file 8.87 → 0.01, delta 9.00 → 0; the daemon after 50,000 macOS files
+122, 123 MB (unchanged: these were transient allocations, not retained bytes; load average 8.8–11.5).
+
+Per phase after the streaming: create 430.6 B and 3.0 allocations, the 100-byte write 128.7 B and 3.0, the provenance attribute
 461.8 B and 7.0, a delta 0 B and 9.0, a checkpoint 2.6 B (was 398.9) and 8.9. Tests:
 `a_streamed_shard_checkpoint_equals_the_shard_image_and_recovers` (an image several stages long, framed byte for byte),
 `a_refused_or_abandoned_streamed_checkpoint_leaves_the_committed_one`, and the server's

@@ -229,3 +229,114 @@ fn a_full_log_refuses_and_a_checkpoint_follows() {
   let (recovered, _) = Journal::recover(&checkpoints, &log).unwrap();
   assert_eq!(recovered, Some(full(&vol, &store)));
 }
+
+/// The streamed shard delta (2026-10-06). Do: checkpoint a shard of three volumes, change one (its record is then a
+/// delta) and make a fourth never published (its record is its full image), and stream a shard delta in key order with
+/// `ShardDelta::encode_start`, each key then `Volume::encode_publication`, and `encode_finish` naming the other two as
+/// removed (unsorted), with held bytes and replies; log it with `Journal::append_encoded`, and log the same records as
+/// a `ShardDelta` value in a copy of the journal. Expect: the bytes equal `ShardDelta::new(…).encode()`, both journals
+/// recover the same image, and it holds the changed volume brought up to date and the fresh one, without the removed.
+#[test]
+fn a_streamed_shard_delta_equals_the_shard_delta_and_recovers() {
+  let mut store = store();
+  let mut published = seeded(&mut store);
+  let mut fresh = seeded(&mut store);
+  let gone = seeded(&mut store);
+  let (low, high) = (KEY, [9; 16]);
+  let removed = vec![[8; 16], [2; 16]];
+  let mut in_checkpoint = vec![KeyedImage {
+    key: low,
+    image: published.to_image(&store, None).unwrap(),
+  }];
+  for key in &removed {
+    in_checkpoint.push(KeyedImage {
+      key: *key,
+      image: gone.to_image(&store, None).unwrap(),
+    });
+  }
+  let (mut checkpoints, mut log) = (vec![0u8; MEMORY], vec![0u8; MEMORY]);
+  let mut journal = Journal::default();
+  journal
+    .checkpoint(&mut checkpoints, &ShardImage::new(in_checkpoint))
+    .unwrap();
+  published.mark_published(&store);
+  create(
+    &mut published,
+    &mut store,
+    "changed",
+    b"after the checkpoint",
+  );
+  create(&mut fresh, &mut store, "fresh", b"never published");
+  let replies = vec![slates_vfs::recover::HeldReply {
+    attachment: 3,
+    unique: 5,
+    reply: b"reply".to_vec(),
+  }];
+  let held = b"held image".to_vec();
+
+  let mut streamed = Vec::new();
+  let at = ShardDelta::encode_start(&mut streamed);
+  for (key, vol) in [(low, &mut published), (high, &mut fresh)] {
+    streamed.extend_from_slice(&key);
+    vol.encode_publication(&store, None, &mut streamed).unwrap();
+  }
+  let mut unsorted = removed.clone();
+  ShardDelta::encode_finish(
+    &mut streamed,
+    at,
+    2,
+    &mut unsorted,
+    Some(&held),
+    Some(&replies),
+  )
+  .unwrap();
+  let value = ShardDelta::new(
+    vec![
+      KeyedRecord {
+        key: high,
+        record: fresh.publication(&store, None).unwrap(),
+      },
+      KeyedRecord {
+        key: low,
+        record: published.publication(&store, None).unwrap(),
+      },
+    ],
+    removed,
+    Some(held),
+    Some(replies),
+  );
+  assert!(
+    matches!(
+      value.volumes[0].record,
+      slates_vfs::delta::VolumeRecord::Delta { .. }
+    ) && matches!(
+      value.volumes[1].record,
+      slates_vfs::delta::VolumeRecord::Full { .. }
+    ),
+    "one delta record and one full record"
+  );
+  let mut expected = Vec::new();
+  slates_wire::Wire::encode(&value, &mut expected);
+  assert_eq!(streamed, expected, "the streamed shard delta's bytes");
+
+  let (mut by_value, mut by_value_log) = (journal, log.clone());
+  journal.append_encoded(&mut log, &streamed).unwrap();
+  by_value
+    .append(&mut by_value_log, &value, &mut Vec::new())
+    .unwrap();
+  let (recovered, _) = Journal::recover(&checkpoints, &log).unwrap();
+  let (expected, _) = Journal::recover(&checkpoints, &by_value_log).unwrap();
+  assert_eq!(recovered, expected, "what logging the value recovers");
+  let recovered = recovered.unwrap();
+  let keys: Vec<[u8; 16]> = recovered.volumes.iter().map(|keyed| keyed.key).collect();
+  assert_eq!(
+    keys,
+    vec![low, high],
+    "the removed volumes gone, the fresh one added"
+  );
+  assert_eq!(
+    recovered.volumes[0].image,
+    published.to_image(&store, None).unwrap(),
+    "the changed volume brought up to date"
+  );
+}

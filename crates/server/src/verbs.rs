@@ -7916,12 +7916,34 @@ fn stream_checkpoint(
 /// volume's record (a delta, or its full image when it has none), the volumes gone, the held replicas when they
 /// changed, and the undelivered replies. Refuses `NoSpace` when the log cannot take it, changing nothing.
 fn publish_delta(state: &mut ShardState) -> Result<Published, slates_vfs::VfsError> {
-  let mut records = Vec::new();
+  // The delta is streamed into the shard's publish buffer, idle between publications: each changed volume's record is
+  // encoded from the store as it is taken, never built as a value (an image of every changed inode and a name per
+  // changed entry: nine allocations a create, 2026-10-06 `create_heap`).
+  let mut encoded = std::mem::take(&mut state.checkpoint_buffer);
+  encoded.clear();
+  let outcome = publish_delta_into(state, &mut encoded);
+  state.checkpoint_buffer = encoded;
+  outcome
+}
+
+/// [`publish_delta`] into `encoded`.
+fn publish_delta_into(
+  state: &mut ShardState,
+  encoded: &mut Vec<u8>,
+) -> Result<Published, slates_vfs::VfsError> {
   let mut recorded = Vec::new();
   let mut present = std::collections::BTreeSet::new();
   let mut published = Published::default();
-  let handles: Vec<_> = state.volumes.iter().map(|(handle, _)| handle).collect();
-  for handle in &handles {
+  // In key order, the order a shard delta holds its volumes in (`ShardDelta::new` sorts by key).
+  let mut keyed: Vec<_> = state
+    .volumes
+    .iter()
+    .map(|(handle, slot)| (slot.id.bytes, handle))
+    .collect();
+  keyed.sort_by_key(|(key, _)| *key);
+  let count_at = slates_vfs::checkpoint_log::ShardDelta::encode_start(encoded);
+  let mut count = 0usize;
+  for (_, handle) in &keyed {
     let slot = state.volumes.get_mut(*handle)?;
     let id = slot.id;
     if being_destroyed(&slot.volume) {
@@ -7933,20 +7955,21 @@ fn publish_delta(state: &mut ShardState) -> Result<Published, slates_vfs::VfsErr
       published.volumes.push(id);
       continue;
     }
-    match slot.volume.publication(
+    let mark = encoded.len();
+    encoded.extend_from_slice(&id.bytes);
+    match slot.volume.encode_publication(
       &state.store,
       slot.host.as_mut().map(|host| host as &mut dyn HostFs),
+      encoded,
     ) {
-      Ok(record) => {
+      Ok(()) => {
         present.insert(id.bytes);
         published.volumes.push(id);
         recorded.push(*handle);
-        records.push(slates_vfs::checkpoint_log::KeyedRecord {
-          key: id.bytes,
-          record,
-        });
+        count = count.saturating_add(1);
       }
       Err(e) => {
+        encoded.truncate(mark);
         count_skipped(state, id, &e);
         published.skipped.push(id);
         // A skipped volume keeps its committed record, so it stays present.
@@ -7956,7 +7979,7 @@ fn publish_delta(state: &mut ShardState) -> Result<Published, slates_vfs::VfsErr
       }
     }
   }
-  let removed: Vec<[u8; 16]> = state
+  let mut removed: Vec<[u8; 16]> = state
     .published_keys
     .iter()
     .filter(|key| !present.contains(*key))
@@ -7964,12 +7987,14 @@ fn publish_delta(state: &mut ShardState) -> Result<Published, slates_vfs::VfsErr
     .collect();
   let held = state.held_content.to_image();
   let held_changed = held != state.published_held;
-  let delta = slates_vfs::checkpoint_log::ShardDelta::new(
-    records,
-    removed,
-    held_changed.then(|| held.clone()),
-    Some(pending_replies(state)),
-  );
+  slates_vfs::checkpoint_log::ShardDelta::encode_finish(
+    encoded,
+    count_at,
+    count,
+    &mut removed,
+    held_changed.then_some(&held[..]),
+    Some(&pending_replies(state)),
+  )?;
   let (start, end) = state.delta_range;
   let Some(object) = state.content.as_mut() else {
     return Err(slates_vfs::VfsError::RecoveryIncomplete);
@@ -7982,10 +8007,7 @@ fn publish_delta(state: &mut ShardState) -> Result<Published, slates_vfs::VfsErr
     start,
     len: end.saturating_sub(start),
   };
-  // The delta is encoded in the shard's checkpoint buffer, idle between checkpoints: no allocation per barrier.
-  published.frame_bytes = state
-    .journal
-    .append(&mut log, &delta, &mut state.checkpoint_buffer)?;
+  published.frame_bytes = state.journal.append_encoded(&mut log, encoded)?;
   for handle in recorded {
     if let Ok(slot) = state.volumes.get_mut(handle) {
       slot.volume.mark_published(&state.store);

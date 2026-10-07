@@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use slates_mem::arena::ChunkArena;
 use slates_mem::region::Region;
-use slates_vfs::checkpoint_log::{Journal, KeyedRecord, ShardDelta};
+use slates_vfs::checkpoint_log::{Journal, ShardDelta};
 use slates_vfs::clock::StepClock;
 use slates_vfs::delta::VolumeRecord;
 use slates_vfs::names::NameEquivalence;
@@ -228,26 +228,19 @@ fn main() {
         .xattr_set(&mut store, no, PROVENANCE, &attribute, XattrSet::Either)
         .unwrap()
     });
+    // The daemon's delta: each volume's publication streamed into the kept scratch, then logged; a full record means
+    // the volume asks for a checkpoint instead (the probe's one volume publishes whole only when the journal does).
     let appended = !journal.wants_checkpoint()
       && charge(&mut delta, || {
-        match vol.publication(&store, None).unwrap() {
-          VolumeRecord::Delta { delta } => journal
-            .append(
-              &mut log,
-              &ShardDelta::new(
-                vec![KeyedRecord {
-                  key: [1; 16],
-                  record: VolumeRecord::Delta { delta },
-                }],
-                Vec::new(),
-                None,
-                None,
-              ),
-              &mut scratch,
-            )
-            .is_ok(),
-          VolumeRecord::Full { .. } => false,
-        }
+        scratch.clear();
+        let at = ShardDelta::encode_start(&mut scratch);
+        scratch.extend_from_slice(&[1; 16]);
+        let tag_at = scratch.len();
+        vol.encode_publication(&store, None, &mut scratch).unwrap();
+        let whole =
+          scratch.get(tag_at..tag_at + 4) == Some(&VolumeRecord::WIRE_TAG_FULL.to_le_bytes()[..]);
+        ShardDelta::encode_finish(&mut scratch, at, 1, &mut [], None, None).unwrap();
+        !whole && journal.append_encoded(&mut log, &scratch).is_ok()
       });
     if !appended {
       checkpoints += 1;

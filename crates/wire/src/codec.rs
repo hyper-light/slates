@@ -203,23 +203,46 @@ impl<T: Wire> Wire for Vec<T> {
   }
 }
 
+/// Format: the tag an absent `Option` encodes.
+pub const OPTION_NONE: u8 = 0;
+/// Format: the tag a present `Option` encodes before its value (an encoder writing a borrowed value's fields after it).
+pub const OPTION_SOME: u8 = 1;
+
 impl<T: Wire> Wire for Option<T> {
   const SCHEMA: &'static str = "Option";
   const SCHEMA_HASH: u64 = crate::schema::mix(crate::schema::fnv64("Option"), &[T::SCHEMA_HASH]);
   fn encode(&self, out: &mut Vec<u8>) {
     match self {
-      None => out.push(0),
+      None => out.push(OPTION_NONE),
       Some(v) => {
-        out.push(1);
+        out.push(OPTION_SOME);
         v.encode(out);
       }
     }
   }
   fn decode(input: &mut &[u8]) -> Result<Self, WireError> {
     match u8::decode(input)? {
-      0 => Ok(None),
-      1 => Ok(Some(T::decode(input)?)),
+      OPTION_NONE => Ok(None),
+      OPTION_SOME => Ok(Some(T::decode(input)?)),
       got => Err(WireError::BadTag { got }),
+    }
+  }
+}
+
+/// Writes `bytes` exactly as a `Vec<u8>` or a `String` holding them encodes, for an encoder that writes a borrowed
+/// field without first copying it into an owned value (a checkpoint's names and inline bodies, 2026-10-06).
+pub fn encode_bytes(bytes: &[u8], out: &mut Vec<u8>) {
+  len_prefix(bytes.len(), out);
+  out.extend_from_slice(bytes);
+}
+
+/// Writes `bytes` exactly as an `Option<Vec<u8>>` or `Option<String>` holding them encodes ([`encode_bytes`]).
+pub fn encode_option_bytes(bytes: Option<&[u8]>, out: &mut Vec<u8>) {
+  match bytes {
+    None => out.push(OPTION_NONE),
+    Some(bytes) => {
+      out.push(OPTION_SOME);
+      encode_bytes(bytes, out);
     }
   }
 }
@@ -263,9 +286,23 @@ pub const LEN_PREFIX_BYTES: usize = size_of::<u32>();
 
 /// Writes the length prefix a `Vec` of `len` elements encodes before its elements, for an encoder that streams a
 /// sequence's elements instead of holding them in a `Vec` (a shard checkpoint's inodes, 2026-10-06); the length is
-/// counted first, because a streamed sequence's bytes may already be past reach when its last element is written.
+/// counted first where a streamed sequence's bytes may already be past reach when its last element is written.
 pub fn encode_len(len: usize, out: &mut Vec<u8>) {
   len_prefix(len, out);
+}
+
+/// Rewrites the length prefix [`encode_len`] wrote at `at` to `len`, for a sequence streamed into a buffer whose length
+/// is known only once its elements are written (a shard delta's volumes, some of which may fail to encode); `false`
+/// when `at` does not hold a whole prefix.
+pub fn patch_len(out: &mut [u8], at: usize, len: usize) -> bool {
+  let prefix = u32::try_from(len).unwrap_or(u32::MAX).to_le_bytes();
+  match out.get_mut(at..at.saturating_add(LEN_PREFIX_BYTES)) {
+    Some(slot) => {
+      slot.copy_from_slice(&prefix);
+      true
+    }
+    None => false,
+  }
 }
 
 #[cfg(test)]

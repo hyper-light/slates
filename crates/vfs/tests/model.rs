@@ -896,8 +896,10 @@ fn with_dir(
 }
 
 /// A-68's oracle, after every step: the volume's publication — its full image, or a delta over the last one
-/// published — applied to what was published must equal the volume's full image now. Returns whether this step's
-/// publication was a delta (the count a test asserts moved, so a dead delta path cannot pass as a full-image one).
+/// published — applied to what was published must equal the volume's full image now, and the publication the daemon
+/// encodes from the store (`encode_publication`, 2026-10-06) must be byte for byte the publication's encoding. Returns
+/// whether this step's publication was a delta (the count a test asserts moved, so a dead delta path cannot pass as a
+/// full-image one).
 fn check_publication(
   vol: &mut Volume,
   store: &Store,
@@ -905,6 +907,15 @@ fn check_publication(
   step: &Step,
 ) -> bool {
   let publication = vol.publication(store, None).unwrap();
+  let mut streamed = vec![0xA5];
+  vol.encode_publication(store, None, &mut streamed).unwrap();
+  let mut encoded = Vec::new();
+  slates_wire::Wire::encode(&publication, &mut encoded);
+  assert_eq!(
+    streamed.get(1..),
+    Some(&encoded[..]),
+    "the streamed publication after {step:?}"
+  );
   let delta = matches!(publication, slates_vfs::delta::VolumeRecord::Delta { .. });
   match publication {
     slates_vfs::delta::VolumeRecord::Full { image } => *published = Some(image),

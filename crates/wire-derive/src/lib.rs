@@ -124,6 +124,7 @@ fn expand_struct(
 /// One variant's contribution to the enum's impl.
 struct VariantParts {
   reflection: String,
+  tag_const: proc_macro2::TokenStream,
   encode_arm: proc_macro2::TokenStream,
   decode_arm: proc_macro2::TokenStream,
   hashes: Vec<proc_macro2::TokenStream>,
@@ -157,12 +158,34 @@ fn expand_variant(index: usize, variant: &syn::Variant) -> syn::Result<VariantPa
   } else {
     field_arms(vname, discriminant, &idents, &types, &bound)
   };
+  let tag_name = format_ident!("WIRE_TAG_{}", screaming_snake(&vname.to_string()));
+  let tag_doc = format!(
+    "Format: the wire discriminant of `{vname}` (its declaration index), for an encoder that writes the variant's \
+     fields from borrowed data instead of building the value."
+  );
+  let tag_const = quote! {
+    #[doc = #tag_doc]
+    pub const #tag_name: u32 = #discriminant;
+  };
   Ok(VariantParts {
     reflection,
+    tag_const,
     encode_arm,
     decode_arm,
     hashes,
   })
+}
+
+/// `CamelCase` as `SCREAMING_SNAKE` (a variant's name in its tag constant's).
+fn screaming_snake(camel: &str) -> String {
+  let mut out = String::with_capacity(camel.len().saturating_mul(2));
+  for (at, c) in camel.chars().enumerate() {
+    if c.is_uppercase() && at > 0 {
+      out.push('_');
+    }
+    out.extend(c.to_uppercase());
+  }
+  out
 }
 
 fn unit_arms(
@@ -215,9 +238,13 @@ fn expand_enum(
       .join(",")
   );
   let encode_arms = parts.iter().map(|p| &p.encode_arm);
+  let tag_consts = parts.iter().map(|p| &p.tag_const);
   let decode_arms = parts.iter().map(|p| &p.decode_arm);
   let hashes = parts.iter().flat_map(|p| p.hashes.iter());
   Ok(quote! {
+    impl #name {
+      #(#tag_consts)*
+    }
     impl ::slates_wire::Wire for #name {
       const SCHEMA: &'static str = #reflection;
       const SCHEMA_HASH: u64 = ::slates_wire::schema::mix(

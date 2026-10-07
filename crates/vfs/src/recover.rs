@@ -29,6 +29,7 @@ use std::mem::Discriminant;
 
 use slates_mem::Handle;
 use slates_wire::Wire;
+use slates_wire::codec::{encode_bytes, encode_option_bytes};
 use slates_wire::crc32c::{crc32c, crc32c_append};
 
 use crate::clock::Clock;
@@ -1366,7 +1367,7 @@ impl Volume {
       {
         return Ok(());
       }
-      self.image_of_inode(store, inode)?.encode(out.buf());
+      self.encode_inode(store, inode, Entries::Captured, out.buf())?;
       out.settle()
     })?;
     Ok(shared)
@@ -1534,44 +1535,7 @@ impl Volume {
     inode: &Inode,
     entries: Entries,
   ) -> Result<InodeImage, VfsError> {
-    let body = if let Body::Base(base) = &inode.body {
-      let pinned = base
-        .pinned
-        .iter()
-        .map(|extent| extent_image(store, extent))
-        .collect::<Result<_, VfsError>>()?;
-      BodyImage::Base {
-        witness: base.witness.as_deref().copied(),
-        pinned,
-        base_len: base.base_len,
-        lost: base.lost,
-      }
-    } else {
-      match inode.kind {
-        Kind::Dir => {
-          let Body::Directory(handle) = inode.body else {
-            return Err(VfsError::RecoveryIncomplete);
-          };
-          let directory = store.dirs.get(handle)?;
-          BodyImage::Directory {
-            entries: match entries {
-              Entries::Captured => self.dir_entries(store, inode)?,
-              Entries::Omitted => Vec::new(),
-            },
-            base: directory.base,
-            origin: directory.origin.as_ref().map(|path| path.to_string()),
-          }
-        }
-        Kind::Symlink => match &inode.body {
-          Body::Symlink(target) => BodyImage::Symlink {
-            target: target.to_string(),
-          },
-          _ => return Err(VfsError::RecoveryIncomplete),
-        },
-        Kind::File => file_body_image(store, &inode.body)?,
-        Kind::Fifo | Kind::Socket => BodyImage::Empty,
-      }
-    };
+    let body = self.inode_body(store, inode, entries)?;
     Ok(InodeImage {
       no: inode.no.0,
       generation: inode.generation,
@@ -1617,6 +1581,148 @@ impl Volume {
     })
   }
 
+  /// An inode's body image: a directory's entries (or none, `Entries::Omitted`), a file's content, a symlink's target,
+  /// a base-backed file's overlay state.
+  fn inode_body(
+    &self,
+    store: &Store,
+    inode: &Inode,
+    entries: Entries,
+  ) -> Result<BodyImage, VfsError> {
+    Ok(if let Body::Base(base) = &inode.body {
+      let pinned = base
+        .pinned
+        .iter()
+        .map(|extent| extent_image(store, extent))
+        .collect::<Result<_, VfsError>>()?;
+      BodyImage::Base {
+        witness: base.witness.as_deref().copied(),
+        pinned,
+        base_len: base.base_len,
+        lost: base.lost,
+      }
+    } else {
+      match inode.kind {
+        Kind::Dir => {
+          let Body::Directory(handle) = inode.body else {
+            return Err(VfsError::RecoveryIncomplete);
+          };
+          let directory = store.dirs.get(handle)?;
+          BodyImage::Directory {
+            entries: match entries {
+              Entries::Captured => self.dir_entries(store, inode)?,
+              Entries::Omitted => Vec::new(),
+            },
+            base: directory.base,
+            origin: directory.origin.as_ref().map(|path| path.to_string()),
+          }
+        }
+        Kind::Symlink => match &inode.body {
+          Body::Symlink(target) => BodyImage::Symlink {
+            target: target.to_string(),
+          },
+          _ => return Err(VfsError::RecoveryIncomplete),
+        },
+        Kind::File => file_body_image(store, &inode.body)?,
+        Kind::Fifo | Kind::Socket => BodyImage::Empty,
+      }
+    })
+  }
+
+  /// Appends `inode`'s image encoding with its `entries`: exactly `self.inode_image(store, inode, entries)?.encode(out)`
+  /// (`image_of_inode` for a checkpoint, `image_of_inode_without_entries` for a delta), without
+  /// building the image. An `InodeImage` copies every owned field (an inline body, each attribute name, each directory
+  /// entry's name) only to be encoded and dropped: about nine allocations a file in every checkpoint (2026-10-06,
+  /// `create_heap`). The common bodies (inline, directory) and the attribute table are written from the inode; the
+  /// others (chunked, symlink, base-backed, empty) still go through their `BodyImage`, whose allocations are per extent
+  /// of a large file, not per file. The bytes are held equal to the image's by the streamed-checkpoint oracle tests.
+  pub(crate) fn encode_inode(
+    &self,
+    store: &Store,
+    inode: &Inode,
+    entries: Entries,
+    out: &mut Vec<u8>,
+  ) -> Result<(), VfsError> {
+    inode.no.0.encode(out);
+    inode.generation.encode(out);
+    inode.born.0.encode(out);
+    kind_image(inode.kind).encode(out);
+    AttrsImage {
+      mode: inode.attrs.mode,
+      uid: inode.attrs.uid,
+      gid: inode.attrs.gid,
+      nlink: inode.attrs.nlink,
+      size: inode.attrs.size,
+      atime: inode.attrs.atime,
+      mtime: inode.attrs.mtime,
+      ctime: inode.attrs.ctime,
+      btime: inode.attrs.btime,
+    }
+    .encode(out);
+    inode.version.encode(out);
+    inode
+      .home
+      .map(|h| HomeImage {
+        parent: h.parent().0,
+        hash: h.hash,
+      })
+      .encode(out);
+    inode.multi.encode(out);
+    match (&inode.body, inode.kind) {
+      (Body::Inline(bytes), Kind::File) => {
+        BodyImage::WIRE_TAG_INLINE.encode(out);
+        encode_bytes(bytes, out);
+      }
+      (Body::Directory(handle), Kind::Dir) => {
+        self.encode_directory(store, *handle, entries, out)?
+      }
+      _ => self.inode_body(store, inode, entries)?.encode(out),
+    }
+    let table = inode.xattrs.as_deref();
+    slates_wire::codec::encode_len(table.map_or(0, crate::inode::XattrTable::len), out);
+    for (name, attribute) in table.into_iter().flat_map(crate::inode::XattrTable::iter) {
+      encode_bytes(name, out);
+      attribute.0.encode(out);
+    }
+    inode.attribute_of().map(|owner| owner.0).encode(out);
+    table
+      .and_then(|table| table.sidecar)
+      .map(|copy| copy.0)
+      .encode(out);
+    Ok(())
+  }
+
+  /// A directory's `BodyImage::Directory` encoding, written from the store: the entries in canonical order
+  /// ([`entry_order`]), gathered by reference and sorted (a directory iterates in hash order), so one allocation for the
+  /// directory and none per entry, where the image copied every name.
+  fn encode_directory(
+    &self,
+    store: &Store,
+    handle: Handle<crate::dir::DirNode>,
+    entries: Entries,
+    out: &mut Vec<u8>,
+  ) -> Result<(), VfsError> {
+    let dir = store.dirs.get(handle)?;
+    let policy = self.policy;
+    BodyImage::WIRE_TAG_DIRECTORY.encode(out);
+    match entries {
+      Entries::Omitted => slates_wire::codec::encode_len(0, out),
+      Entries::Captured => {
+        let mut captured = Vec::with_capacity(dir.len());
+        captured.extend(dir.iter(&store.blocks));
+        captured.sort_by(|a, b| entry_order(policy, a.name, b.name));
+        slates_wire::codec::encode_len(captured.len(), out);
+        for entry in captured {
+          encode_bytes(entry.name.as_bytes(), out);
+          child_number(store, &entry.child)?.encode(out);
+        }
+      }
+    }
+    dir.base.encode(out);
+    encode_option_bytes(dir.origin.as_deref().map(str::as_bytes), out);
+    Ok(())
+  }
+
   /// The entries of a directory inode, by name and child inode number. A subdirectory child's
   /// number is its node's own inode; a whiteout is a base overlay this slice does not capture.
   fn dir_entries(&self, store: &Store, inode: &Inode) -> Result<Vec<EntryImage>, VfsError> {
@@ -1654,7 +1760,7 @@ impl Volume {
 
 /// Whether an inode's image captures a directory's entries.
 #[derive(Clone, Copy)]
-enum Entries {
+pub(crate) enum Entries {
   /// Every entry, in canonical order: a full image.
   Captured,
   /// None: a delta, which carries changed entries by name.
@@ -1743,6 +1849,23 @@ fn file_body_image(store: &Store, body: &Body) -> Result<BodyImage, VfsError> {
     }),
     Body::Directory(_) | Body::Symlink(_) | Body::Base(_) => Err(VfsError::RecoveryIncomplete),
   }
+}
+
+/// The inode number an entry's child names, as [`EntryImage::child`] holds it: a subdirectory's is its node's own inode;
+/// a whiteout names none.
+pub(crate) fn child_number(store: &Store, child: &Child) -> Result<Option<u64>, VfsError> {
+  Ok(match child {
+    Child::File(no) | Child::Symlink(no) | Child::Fifo(no) | Child::Socket(no) => Some(no.0),
+    Child::Dir(handle) => Some(
+      store
+        .dirs
+        .get(*handle)
+        .map_err(|_| VfsError::StaleHandle)?
+        .inode
+        .0,
+    ),
+    Child::Whiteout => None,
+  })
 }
 
 /// The image reference for a snapshot id.
