@@ -164,8 +164,9 @@ pub struct ShardState {
   /// This shard's recovery journal (A-68; `slates_vfs::checkpoint_log`): the committed checkpoint, the log's tail
   /// and what has been logged since. Only this shard publishes into its ranges.
   pub journal: slates_vfs::checkpoint_log::Journal,
-  /// The buffer a checkpoint is streamed into (`verbs::publish_checkpoint`), kept so its capacity is reused: at most the
-  /// largest checkpoint this shard wrote, which the checkpoint slot bounds.
+  /// The stage a checkpoint is streamed through into its slot (`verbs::publish_checkpoint`; `STREAM_STAGE_BYTES` and
+  /// one inode's encoding), which a delta also encodes in; kept so its capacity is reused. Bounded by the stage and the
+  /// largest delta frame, which the delta log bounds.
   pub checkpoint_buffer: Vec<u8>,
   /// The volume keys the committed journal holds, so a delta names the volumes gone since (A-68).
   pub published_keys: std::collections::BTreeSet<[u8; 16]>,

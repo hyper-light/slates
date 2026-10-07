@@ -34,7 +34,7 @@ use slates_vfs::clock::{Clock, HostClock};
 use slates_vfs::host::HostFs;
 use slates_vfs::names::NameEquivalence;
 use slates_vfs::quota::{BudgetGrowth, Quota};
-use slates_vfs::recover::{ShardImage, VolumeImage};
+use slates_vfs::recover::{ImageOut, ShardImage, VolumeImage};
 use slates_vfs::volume::{DestroyProgress, Volume, VolumeConfig};
 use slates_wire::Wire;
 use slates_wire::observe::{Chokepoint, SpanContext};
@@ -7772,25 +7772,6 @@ fn pending_replies(state: &ShardState) -> Vec<slates_vfs::recover::HeldReply> {
 
 /// A checkpoint of every volume into the free slot (§4.8): the whole shard, as every publication was before A-68.
 fn publish_checkpoint(state: &mut ShardState) -> Result<Published, slates_vfs::VfsError> {
-  // The checkpoint is streamed into one buffer the shard keeps (its capacity reused from checkpoint to checkpoint): each
-  // volume's image is encoded as it is captured, never held whole beside its encoding. Held whole, every checkpoint
-  // left its own size in the daemon's footprint, which the allocator never returned: 270 MB after 50,000 macOS files
-  // whose volume needs 47 (2026-10-06, `sizes_probe`).
-  let mut encoded = std::mem::take(&mut state.checkpoint_buffer);
-  encoded.clear();
-  encoded.reserve(state.journal.expected_checkpoint_bytes());
-  let outcome = publish_checkpoint_into(state, &mut encoded);
-  state.checkpoint_buffer = encoded;
-  outcome
-}
-
-/// [`publish_checkpoint`] into `encoded`.
-fn publish_checkpoint_into(
-  state: &mut ShardState,
-  encoded: &mut Vec<u8>,
-) -> Result<Published, slates_vfs::VfsError> {
-  let (start, end) = state.content_range;
-  let mut published = Published::default();
   // In key order, the order a shard image holds its volumes in (`ShardImage::new` sorts by key).
   let mut keyed: Vec<_> = state
     .volumes
@@ -7799,56 +7780,36 @@ fn publish_checkpoint_into(
     .collect();
   keyed.sort_by_key(|(key, _)| *key);
   let handles: Vec<_> = keyed.iter().map(|(_, handle)| *handle).collect();
-  let count_at = ShardImage::encode_start(encoded);
-  let mut count = 0usize;
-  for handle in &handles {
-    let slot = state.volumes.get_mut(*handle)?;
-    if being_destroyed(&slot.volume) {
-      published.destroying.push(slot.id);
-      continue;
-    }
-    let id = slot.id;
-    let mark = encoded.len();
-    encoded.extend_from_slice(&id.bytes);
-    match slot.volume.encode_image(
-      &state.store,
-      slot.host.as_mut().map(|host| host as &mut dyn HostFs),
-      encoded,
-    ) {
-      Ok(()) => {
-        published.volumes.push(id);
-        count = count.saturating_add(1);
-      }
-      // Publish unaffected volumes even when another cannot be captured. Callers must check the touched volume
-      // against the returned coverage; an omitted volume never receives a stable acknowledgement, and recovery
-      // refuses it instead of rebuilding empty (§4.8, AUD-05).
-      Err(e) => {
-        encoded.truncate(mark);
-        count_skipped(state, id, &e);
-        published.skipped.push(id);
-      }
-    }
+  let (_, end) = state.content_range;
+  match state.content.as_ref() {
+    None => return Err(slates_vfs::VfsError::RecoveryIncomplete),
+    Some(object) if end > object.len() => return Err(slates_vfs::VfsError::NoSpace),
+    Some(_) => {}
   }
   // The replicas this shard holds for other owners ride the same image (AUD-29-59): a holder acknowledges a
   // content put only once a publish carrying it commits.
   let held = state.held_content.to_image();
-  ShardImage::encode_finish(encoded, count_at, count, &held, pending_replies(state))?;
-  let Some(object) = state.content.as_mut() else {
-    return Err(slates_vfs::VfsError::RecoveryIncomplete);
+  let mut replies = pending_replies(state);
+  // A volume that cannot be captured restarts the checkpoint without it: the image's bytes before it may already be
+  // in the slot, and the slot commits only when its header is written last, so the abandoned stream commits nothing.
+  // Each restart leaves out one more volume, so there are at most as many restarts as volumes.
+  let mut skipped: Vec<(DbVolumeId, slates_vfs::VfsError)> = Vec::new();
+  let outcome = loop {
+    match stream_checkpoint(state, &handles, &skipped, &held, &mut replies) {
+      Ok(Streamed::Uncaptured(id, e)) => skipped.push((id, e)),
+      Ok(Streamed::Committed(published)) => break Ok(published),
+      Ok(Streamed::Refused(e)) => break Err(publish_refused(state, e)),
+      Err(e) => break Err(e),
+    }
   };
-  if end > object.len() {
-    return Err(slates_vfs::VfsError::NoSpace);
+  // Publish unaffected volumes even when another cannot be captured. Callers must check the touched volume against
+  // the returned coverage; an omitted volume never receives a stable acknowledgement, and recovery refuses it instead
+  // of rebuilding empty (§4.8, AUD-05).
+  for (id, e) in &skipped {
+    count_skipped(state, *id, e);
   }
-  let mut slots = ContentSlots {
-    object,
-    start,
-    len: end.saturating_sub(start),
-  };
-  let frame_bytes = state
-    .journal
-    .checkpoint_encoded(&mut slots, encoded)
-    .map_err(|e| publish_refused(state, e))?;
-  published.frame_bytes = frame_bytes;
+  let mut published = outcome?;
+  published.skipped = skipped.into_iter().map(|(id, _)| id).collect();
   for handle in handles {
     if let Ok(slot) = state.volumes.get_mut(handle) {
       if published.volumes.contains(&slot.id) {
@@ -7869,6 +7830,86 @@ fn publish_checkpoint_into(
     state.journal.generation(),
   );
   Ok(published)
+}
+
+/// How one streamed checkpoint attempt ended.
+enum Streamed {
+  /// The checkpoint committed, carrying these volumes.
+  Committed(Published),
+  /// This volume could not be captured; nothing committed.
+  Uncaptured(DbVolumeId, slates_vfs::VfsError),
+  /// The slot refused the image (it does not fit); nothing committed.
+  Refused(slates_vfs::VfsError),
+}
+
+/// One attempt at [`publish_checkpoint`]: the shard image streamed straight into the content object's free slot, each
+/// volume encoded as it is captured, leaving out the volumes being destroyed and those in `skipped`. The checkpoint was
+/// first held whole (every one left its own size in the daemon's footprint: 270 MB after 50,000 macOS files whose
+/// volume needs 47, 2026-10-06 `sizes_probe`), then its encoding was (a buffer the size of the image kept per shard,
+/// 399 bytes a file, `create_heap`); now only the stage, [`slates_vfs::recover::STREAM_STAGE_BYTES`] and one inode.
+fn stream_checkpoint(
+  state: &mut ShardState,
+  handles: &[Handle<VolumeSlot>],
+  skipped: &[(DbVolumeId, slates_vfs::VfsError)],
+  held: &[u8],
+  replies: &mut Vec<slates_vfs::recover::HeldReply>,
+) -> Result<Streamed, slates_vfs::VfsError> {
+  let left_out = |slot: &VolumeSlot| {
+    being_destroyed(&slot.volume) || skipped.iter().any(|(id, _)| *id == slot.id)
+  };
+  let mut count = 0usize;
+  for handle in handles {
+    if !left_out(state.volumes.get(*handle)?) {
+      count = count.saturating_add(1);
+    }
+  }
+  let (start, end) = state.content_range;
+  let Some(object) = state.content.as_mut() else {
+    return Err(slates_vfs::VfsError::RecoveryIncomplete);
+  };
+  let mut slots = ContentSlots {
+    object,
+    start,
+    len: end.saturating_sub(start),
+  };
+  let mut stream = match state
+    .journal
+    .begin_checkpoint(&mut slots, &mut state.checkpoint_buffer)
+  {
+    Ok(stream) => stream,
+    Err(e) => return Ok(Streamed::Refused(e)),
+  };
+  ShardImage::encode_start(stream.buf(), count);
+  let mut published = Published::default();
+  for handle in handles {
+    let slot = state.volumes.get_mut(*handle)?;
+    if being_destroyed(&slot.volume) {
+      published.destroying.push(slot.id);
+      continue;
+    }
+    if left_out(slot) {
+      continue;
+    }
+    let id = slot.id;
+    stream.buf().extend_from_slice(&id.bytes);
+    if let Err(e) = slot.volume.encode_image_into(
+      &state.store,
+      slot.host.as_mut().map(|host| host as &mut dyn HostFs),
+      &mut stream,
+    ) {
+      return Ok(match stream.refused() {
+        Some(refused) => Streamed::Refused(refused.clone()),
+        None => Streamed::Uncaptured(id, e),
+      });
+    }
+    published.volumes.push(id);
+  }
+  ShardImage::encode_finish(stream.buf(), held, replies);
+  match state.journal.finish_checkpoint(stream) {
+    Ok(frame_bytes) => published.frame_bytes = frame_bytes,
+    Err(e) => return Ok(Streamed::Refused(e)),
+  }
+  Ok(Streamed::Committed(published))
 }
 
 /// A delta of what changed since the last publication, appended to the shard's delta log (A-68): each changed
@@ -7941,7 +7982,10 @@ fn publish_delta(state: &mut ShardState) -> Result<Published, slates_vfs::VfsErr
     start,
     len: end.saturating_sub(start),
   };
-  published.frame_bytes = state.journal.append(&mut log, &delta)?;
+  // The delta is encoded in the shard's checkpoint buffer, idle between checkpoints: no allocation per barrier.
+  published.frame_bytes = state
+    .journal
+    .append(&mut log, &delta, &mut state.checkpoint_buffer)?;
   for handle in recorded {
     if let Ok(slot) = state.volumes.get_mut(handle) {
       slot.volume.mark_published(&state.store);
@@ -8712,6 +8756,119 @@ mod tests {
       assert!(published.skipped.is_empty(), "{published:?}");
       assert!(!published.captured(super::to_db_volume(id)));
     });
+  }
+
+  /// §4.8 (a streamed checkpoint, 2026-10-06): a checkpoint is streamed straight into its slot, so when a volume cannot
+  /// be captured the bytes of the volumes before it may already be there; the checkpoint restarts without it. Do:
+  /// create a volume of 2,000 files (its image several stream stages long), then an overlay whose base host is taken
+  /// away (as a landing holds it), so it sorts after the first and cannot be imaged; publish a checkpoint; read the
+  /// committed image back; then give the host back and publish again. Expect: the first publish captures the plain
+  /// volume and skips the overlay, and the committed image holds exactly the plain volume's image; the second captures
+  /// both. Non-vacuity: the plain volume sorts first and its image is longer than a stage, so the abandoned attempt had
+  /// written into the slot before the overlay refused.
+  #[test]
+  fn a_streamed_checkpoint_restarts_without_a_volume_it_cannot_capture() {
+    crate::daemon::audit_on_shard(|state| {
+      let principal = Principal::Uid { uid: 1234 };
+      let base = concat!(env!("CARGO_MANIFEST_DIR"), "/src").to_owned();
+      let (plain, plain_handle) = dynamic_volume(state, &principal, "streamed-plain", None);
+      let (overlay, overlay_handle) =
+        dynamic_volume(state, &principal, "streamed-overlay", Some(base));
+      assert!(plain.bytes < overlay.bytes, "the plain volume sorts first");
+      let plain_image = filled(state, plain_handle, 2_000);
+      assert!(
+        plain_image.to_content().len() > slates_vfs::recover::STREAM_STAGE_BYTES,
+        "the plain volume's image spans a stage"
+      );
+      let host = state.volumes.get_mut(overlay_handle).unwrap().host.take();
+      assert!(host.is_some(), "the overlay has a base host");
+
+      let published = super::publish_checkpoint(state).expect("the shard publishes");
+      assert_eq!(published.volumes, vec![plain], "{published:?}");
+      assert_eq!(published.skipped, vec![overlay], "{published:?}");
+      let committed: Vec<_> = committed_image(state)
+        .volumes
+        .into_iter()
+        .map(|keyed| (keyed.key, keyed.image))
+        .collect();
+      assert_eq!(
+        committed,
+        vec![(plain.bytes, plain_image)],
+        "the committed image holds the plain volume's image, whole, and nothing else"
+      );
+
+      state.volumes.get_mut(overlay_handle).unwrap().host = host;
+      let published = super::publish_checkpoint(state).expect("the shard publishes");
+      assert_eq!(published.volumes, vec![plain, overlay], "{published:?}");
+      assert!(published.skipped.is_empty(), "{published:?}");
+    });
+  }
+
+  /// A dynamic volume named `name` (over `base` when given), created through the verb: its id and its slot.
+  fn dynamic_volume(
+    state: &mut crate::state::ShardState,
+    principal: &Principal,
+    name: &str,
+    base: Option<String>,
+  ) -> (
+    super::DbVolumeId,
+    slates_mem::Handle<crate::state::VolumeSlot>,
+  ) {
+    let reply = super::dispatch(
+      state,
+      1,
+      principal,
+      super::RequestBody::Create {
+        name: name.to_owned(),
+        size: super::SizeClass::Dynamic { max: 1 << 26 },
+        names: super::NamePolicy::Exact,
+        require_locked: false,
+        base,
+      },
+    );
+    let super::ReplyBody::Created { id } = reply else {
+      panic!("{name}: {reply:?}")
+    };
+    let id = super::to_db_volume(id);
+    let handle = state
+      .volumes
+      .iter()
+      .find(|(_, slot)| slot.id == id)
+      .map(|(handle, _)| handle)
+      .unwrap();
+    (id, handle)
+  }
+
+  /// Fills the volume in `handle` with `files` small files in its root, through the volume core: its image after.
+  fn filled(
+    state: &mut crate::state::ShardState,
+    handle: slates_mem::Handle<crate::state::VolumeSlot>,
+    files: usize,
+  ) -> slates_vfs::recover::VolumeImage {
+    let slot = state.volumes.get_mut(handle).unwrap();
+    let root = slot.volume.root_inode(&state.store).unwrap();
+    for file in 0..files {
+      let no = slot
+        .volume
+        .create_file_no(&mut state.store, root, &format!("file-{file:05}"), 0o644)
+        .unwrap();
+      slot
+        .volume
+        .write(&mut state.store, no, 0, b"streamed")
+        .unwrap();
+    }
+    slot.volume.to_image(&state.store, None).unwrap()
+  }
+
+  /// The shard image committed in the shard's checkpoint slots.
+  fn committed_image(state: &mut crate::state::ShardState) -> super::ShardImage {
+    let (start, end) = state.content_range;
+    let slots = super::ContentSlots {
+      object: state.content.as_mut().unwrap(),
+      start,
+      len: end - start,
+    };
+    super::ShardImage::read_from(&slots).unwrap().unwrap()
   }
 
   /// AUD-29-43, the laptop degenerate (R8): a destroy's tombstone is owed only to remote candidate holders, and

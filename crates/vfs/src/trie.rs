@@ -381,6 +381,31 @@ pub fn walk_since(
   }
 }
 
+/// Visits every inode handle reachable from `root` in ascending number order (the order [`walk`] yields), without
+/// collecting them: a streamed checkpoint counts and then encodes a volume's inodes, where a `Vec` of every handle cost
+/// eight bytes an inode for the length of a checkpoint. Stops at the first error `visit` returns.
+pub fn for_each<E>(
+  nodes: &Slab<TrieNode>,
+  root: Handle<TrieNode>,
+  mut visit: impl FnMut(Handle<Inode>) -> Result<(), E>,
+) -> Result<(), E> {
+  let mut stack = vec![root];
+  while let Some(node) = stack.pop() {
+    let Ok(n) = nodes.get(node) else { continue };
+    for slot in n.slots.iter().rev() {
+      if let Slot::Node(child) = slot {
+        stack.push(*child);
+      }
+    }
+    for slot in &n.slots {
+      if let Slot::Inode(h) = slot {
+        visit(*h)?;
+      }
+    }
+  }
+  Ok(())
+}
+
 /// One inode's record before and after a span: `None` on a side whose table has no such number.
 pub type ChangedRecord = (Option<Handle<Inode>>, Option<Handle<Inode>>);
 

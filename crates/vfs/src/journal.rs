@@ -146,7 +146,7 @@ impl OpLog {
   pub fn append(
     &mut self,
     op: Op,
-    path: &str,
+    path: impl Into<Box<str>>,
     inode: Option<InodeNo>,
     epoch: Epoch,
     at: u64,
@@ -243,7 +243,7 @@ mod tests {
     for i in 0..5u64 {
       log.append(
         Op::Create,
-        &format!("f{i}"),
+        format!("f{i}"),
         Some(InodeNo(i)),
         Epoch(0),
         i,

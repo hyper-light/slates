@@ -1529,7 +1529,7 @@ impl Volume {
       } else {
         Op::Create
       },
-      &path,
+      path,
       Some(no),
       0,
     );
@@ -1587,7 +1587,7 @@ impl Volume {
     self.touch_dir(store, dir, now)?;
     self.adjust_nlink(store, store.dirs.get(dir)?.inode, 1)?;
     let path = self.path_of(store, dir, name);
-    self.record(Op::Mkdir, &path, Some(no), 0);
+    self.record(Op::Mkdir, path, Some(no), 0);
     Ok(child)
   }
 
@@ -1630,7 +1630,7 @@ impl Volume {
     }
     self.touch_dir(store, dir, now)?;
     let path = self.path_of(store, dir, name);
-    self.record(Op::Symlink, &path, Some(no), 0);
+    self.record(Op::Symlink, path, Some(no), 0);
     Ok(no)
   }
 
@@ -1698,7 +1698,7 @@ impl Volume {
     self.touch_dir(store, dir, now)?;
     let path = self.path_of(store, dir, name);
     let prev = self.inode(store, target)?.version;
-    self.record(Op::Link, &path, Some(target), prev);
+    self.record(Op::Link, path, Some(target), prev);
     // An orphan named again (an `O_TMPFILE` given a name by `linkat`) is in the namespace once more: it leaves the
     // orphan record, and the retention its unlink secured for a reclaim that will not happen now goes back (§4.2).
     if let Some(secured) = self.orphans.remove(&target) {
@@ -1746,7 +1746,7 @@ impl Volume {
     self.dir_remove(store, dir, name)?;
     self.drop_link(store, located.inode)?;
     self.touch_dir(store, dir, now)?;
-    self.record(Op::Unlink, &path, Some(located.inode), 0);
+    self.record(Op::Unlink, path.as_str(), Some(located.inode), 0);
     self.record_whiteout(store, dir, name, &path)?;
     Ok(())
   }
@@ -1778,7 +1778,7 @@ impl Volume {
     self.drop_link(store, located.inode)?;
     self.adjust_nlink(store, store.dirs.get(dir)?.inode, -1)?;
     self.touch_dir(store, dir, now)?;
-    self.record(Op::Rmdir, &path, Some(located.inode), 0);
+    self.record(Op::Rmdir, path.as_str(), Some(located.inode), 0);
     self.record_whiteout(store, dir, name, &path)?;
     Ok(())
   }
@@ -2027,7 +2027,7 @@ impl Volume {
       Op::Rename {
         from: from_path.into(),
       },
-      &to_path,
+      to_path,
       Some(source.inode),
       0,
     );
@@ -3335,12 +3335,36 @@ impl Volume {
 
   /// The path of `name` under `dir`, for the journal.
   pub fn path_of(&self, store: &Store, dir: Handle<DirNode>, name: &str) -> String {
-    let mut parts: Vec<Box<str>> = vec![name.into()];
+    // Two walks up the parent chain and one allocation of exactly the path's length, filled from its end: the path a
+    // create journals cost seven allocations and two reallocations built as boxed parts joined (2026-10-06,
+    // `create_heap`). The walk is the one the parts were collected by, so the path is the same.
+    let mut len = name.len().saturating_add(1);
+    self.walk_up(store, dir, |segment| {
+      len = len.saturating_add(segment.len()).saturating_add(1);
+    });
+    let mut bytes = vec![b'/'; len];
+    let mut end = len;
+    let mut place = |segment: &str| {
+      let start = end.saturating_sub(segment.len());
+      if let Some(slot) = bytes.get_mut(start..end) {
+        slot.copy_from_slice(segment.as_bytes());
+      }
+      // The separator before it stays the `/` the buffer was filled with.
+      end = start.saturating_sub(1);
+    };
+    place(name);
+    self.walk_up(store, dir, place);
+    String::from_utf8(bytes).unwrap_or_default()
+  }
+
+  /// Calls `visit` with each directory's own name from `dir` up to (not including) the root, through the head's
+  /// current directories, bounded at `u16::MAX` steps as a cycle guard.
+  fn walk_up(&self, store: &Store, dir: Handle<DirNode>, mut visit: impl FnMut(&str)) {
     let mut current = dir;
     let mut guard = 0usize;
     while let Ok(node) = store.dirs.get(current) {
       let Some(parent_no) = node.parent else { break };
-      parts.push(node.name.clone());
+      visit(&node.name);
       let Ok(parent) = self.current_dir(store, parent_no) else {
         break;
       };
@@ -3350,8 +3374,6 @@ impl Volume {
         break;
       }
     }
-    parts.reverse();
-    format!("/{}", parts.join("/"))
   }
 
   // ------------------------------------------------------------------ internals
@@ -5511,7 +5533,13 @@ impl Volume {
     Ok(false)
   }
 
-  pub(crate) fn record(&mut self, op: Op, path: &str, inode: Option<InodeNo>, prev_version: u64) {
+  pub(crate) fn record(
+    &mut self,
+    op: Op,
+    path: impl Into<Box<str>>,
+    inode: Option<InodeNo>,
+    prev_version: u64,
+  ) {
     let at = self.clock.monotonic_ns();
     self
       .journal

@@ -84,7 +84,7 @@ fn a_checkpoint_and_its_deltas_recover_the_full_image() {
       format!("bytes {at}").as_bytes(),
     );
     journal
-      .append(&mut log, &delta_of(&mut vol, &store))
+      .append(&mut log, &delta_of(&mut vol, &store), &mut Vec::new())
       .unwrap();
     let (recovered, resumed) = Journal::recover(&checkpoints, &log).unwrap();
     assert_eq!(recovered, Some(full(&vol, &store)), "after change {at}");
@@ -129,14 +129,17 @@ fn a_delta_torn_at_any_byte_recovers_the_state_before_or_after_it() {
   vol.mark_published(&store);
   create(&mut vol, &mut store, "first", b"first bytes");
   journal
-    .append(&mut log, &delta_of(&mut vol, &store))
+    .append(&mut log, &delta_of(&mut vol, &store), &mut Vec::new())
     .unwrap();
   let before = full(&vol, &store);
   create(&mut vol, &mut store, "second", b"second bytes");
   let delta = delta_of(&mut vol, &store);
   let after = full(&vol, &store);
   let mut whole = log.clone();
-  let frame = journal.clone().append(&mut whole, &delta).unwrap();
+  let frame = journal
+    .clone()
+    .append(&mut whole, &delta, &mut Vec::new())
+    .unwrap();
   let (mut afters, mut befores) = (0, 0);
   for budget in 0..=frame + 8 {
     let mut memory = log.clone();
@@ -144,7 +147,7 @@ fn a_delta_torn_at_any_byte_recovers_the_state_before_or_after_it() {
       memory: &mut memory,
       budget,
     };
-    let _ = journal.clone().append(&mut torn, &delta);
+    let _ = journal.clone().append(&mut torn, &delta, &mut Vec::new());
     let (recovered, _) = Journal::recover(&checkpoints, &memory).unwrap();
     let recovered = recovered.unwrap();
     if recovered == after {
@@ -178,7 +181,7 @@ fn frames_from_before_a_checkpoint_are_never_replayed_over_it() {
   for at in 0..5 {
     create(&mut vol, &mut store, &format!("old{at}"), &[at; 200]);
     journal
-      .append(&mut log, &delta_of(&mut vol, &store))
+      .append(&mut log, &delta_of(&mut vol, &store), &mut Vec::new())
       .unwrap();
   }
   journal
@@ -186,7 +189,7 @@ fn frames_from_before_a_checkpoint_are_never_replayed_over_it() {
     .unwrap();
   create(&mut vol, &mut store, "new", b"n");
   journal
-    .append(&mut log, &delta_of(&mut vol, &store))
+    .append(&mut log, &delta_of(&mut vol, &store), &mut Vec::new())
     .unwrap();
   let (recovered, _) = Journal::recover(&checkpoints, &log).unwrap();
   assert_eq!(recovered, Some(full(&vol, &store)));
@@ -209,7 +212,7 @@ fn a_full_log_refuses_and_a_checkpoint_follows() {
     create(&mut vol, &mut store, &format!("f{at}"), &[1; 100]);
     let delta = delta_of(&mut vol, &store);
     let generation = journal.generation();
-    if journal.append(&mut log, &delta).is_err() {
+    if journal.append(&mut log, &delta, &mut Vec::new()).is_err() {
       assert_eq!(
         journal.generation(),
         generation,

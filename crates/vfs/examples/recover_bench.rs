@@ -168,6 +168,7 @@ fn journal_of(files: usize) -> (Vec<u8>, Vec<u8>, usize) {
   let mut journal = Journal::default();
   let mut slots = vec![0u8; 1 << 28];
   let mut log = vec![0u8; LOG_BYTES];
+  let mut scratch: Vec<u8> = Vec::new();
   let mut frames = 0usize;
   let mut dir_no = root;
   for file in 0..files {
@@ -199,6 +200,7 @@ fn journal_of(files: usize) -> (Vec<u8>, Vec<u8>, usize) {
               None,
               None,
             ),
+            &mut scratch,
           )
           .is_ok(),
         VolumeRecord::Full { .. } => false,

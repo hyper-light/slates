@@ -24,7 +24,7 @@ use slates_wire::crc32c::{crc32c, crc32c_append};
 
 use crate::delta::VolumeRecord;
 use crate::error::VfsError;
-use crate::recover::{CommittedSlot, HeldReply, ImageRead, ImageWrite, ShardImage};
+use crate::recover::{CommittedSlot, HeldReply, ImageRead, ImageWrite, ShardImage, StreamedImage};
 
 /// Format: a delta's magic, checked before anything else on decode.
 const DELTA_MAGIC: u32 = u32::from_le_bytes(*b"SLD1");
@@ -153,13 +153,6 @@ impl Journal {
     self.generation
   }
 
-  /// What the next checkpoint's image is expected to take: the last checkpoint's bytes and every delta's since (each
-  /// delta's changes are in it, as additions or rewrites). A publisher reserves its encoding buffer at this once, where
-  /// a buffer grown by doubling reached twice the image and left each outgrown one in the allocator's footprint.
-  pub fn expected_checkpoint_bytes(&self) -> usize {
-    self.checkpoint_bytes.saturating_add(self.logged_bytes)
-  }
-
   /// Whether the next publication must be a checkpoint before any delta is even built: nothing committed yet, or
   /// the deltas since the last checkpoint already reached its size.
   pub fn wants_checkpoint(&self) -> bool {
@@ -187,17 +180,28 @@ impl Journal {
     Ok(bytes)
   }
 
-  /// [`Journal::checkpoint`] for a shard image already encoded (`ShardImage::encode_start` … `encode_finish`), so the
-  /// publisher never holds the image as a value; the journal is unchanged on any refusal.
-  pub fn checkpoint_encoded<S: ImageWrite + ?Sized>(
-    &mut self,
-    checkpoints: &mut S,
-    encoded: &[u8],
-  ) -> Result<usize, VfsError> {
+  /// Starts a checkpoint streamed into the free slot of `checkpoints` (staging in `stage`): the caller encodes the shard
+  /// image into it (`ShardImage::encode_start`, each volume, `encode_finish`) and hands it to
+  /// [`Journal::finish_checkpoint`], so the publisher never holds the image, nor its encoding, whole. Dropping the
+  /// stream instead abandons the checkpoint: the committed slot is untouched and the journal unchanged.
+  pub fn begin_checkpoint<'s, S: ImageWrite + ?Sized>(
+    &self,
+    checkpoints: &'s mut S,
+    stage: &'s mut Vec<u8>,
+  ) -> Result<StreamedImage<'s, S>, VfsError> {
     let known = self
       .committed
       .map(|committed| committed.advanced_to(self.generation));
-    let (bytes, committed) = ShardImage::write_encoded_after(encoded, checkpoints, known)?;
+    StreamedImage::begin(checkpoints, known, stage)
+  }
+
+  /// Commits a checkpoint begun by [`Journal::begin_checkpoint`] and restarts the log; the journal is unchanged on any
+  /// refusal (the slot could not take the image: [`VfsError::NoSpace`]).
+  pub fn finish_checkpoint<S: ImageWrite + ?Sized>(
+    &mut self,
+    image: StreamedImage<'_, S>,
+  ) -> Result<usize, VfsError> {
+    let (bytes, committed) = image.finish()?;
     *self = Journal {
       committed: Some(committed),
       generation: committed.generation,
@@ -208,18 +212,23 @@ impl Journal {
     Ok(bytes)
   }
 
-  /// Appends `delta` to `log` over the committed checkpoint. Refuses [`VfsError::NoSpace`] when the frame does not
-  /// fit the log's room (the caller checkpoints instead), and refuses before writing anything when no checkpoint is
-  /// committed; the journal is unchanged on any refusal.
+  /// Appends `delta` to `log` over the committed checkpoint, encoding it in `scratch` (cleared first; the caller keeps
+  /// it, so a barrier's delta reuses one buffer where its own grew by doubling: one allocation and seven reallocations
+  /// per create, 2026-10-06 `create_heap`). Refuses [`VfsError::NoSpace`] when the frame does not fit the log's room
+  /// (the caller checkpoints instead), and refuses before writing anything when no checkpoint is committed; the journal
+  /// is unchanged on any refusal.
   pub fn append<S: ImageWrite + ?Sized>(
     &mut self,
     log: &mut S,
     delta: &ShardDelta,
+    scratch: &mut Vec<u8>,
   ) -> Result<usize, VfsError> {
     let Some(committed) = self.committed else {
       return Err(VfsError::RecoveryIncomplete);
     };
-    let body = delta.to_bytes();
+    scratch.clear();
+    delta.encode(scratch);
+    let body: &[u8] = scratch;
     let generation = self
       .generation
       .checked_add(1)
@@ -238,7 +247,7 @@ impl Journal {
     let (gen_field, base_field) = prefix.split_at_mut(size_of::<u64>());
     gen_field.copy_from_slice(&generation.to_le_bytes());
     base_field.copy_from_slice(&committed.generation.to_le_bytes());
-    let crc = crc32c_append(crc32c(&prefix), &body);
+    let crc = crc32c_append(crc32c(&prefix), body);
     let mut header = [0u8; LOG_HEADER];
     let (len_field, crc_field) = header.split_at_mut(size_of::<u32>());
     len_field.copy_from_slice(
@@ -250,7 +259,7 @@ impl Journal {
     // The payload first and the header last, so the frame becomes CRC-valid only once all of it is written.
     let payload_at = self.tail.saturating_add(LOG_HEADER);
     log.image_write(payload_at, &prefix)?;
-    log.image_write(payload_at.saturating_add(LOG_PREFIX), &body)?;
+    log.image_write(payload_at.saturating_add(LOG_PREFIX), body)?;
     // The next frame's length word reads zero until a frame is written there, so a replay stops at this tail.
     if end.saturating_add(LOG_HEADER) <= log.image_len() {
       log.image_write(end, &[0u8; LOG_HEADER])?;

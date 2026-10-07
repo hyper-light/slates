@@ -1802,7 +1802,7 @@ impl Overlay<'_> {
         let to_path = self.vol.path_of(store, to_dir, to_name);
         self.vol.record(
           Op::Redirect { from: from.into() },
-          &to_path,
+          to_path,
           Some(moved.inode),
           0,
         );
@@ -2208,7 +2208,7 @@ impl Overlay<'_> {
       self.plane()?.descriptors.insert(no, file);
     }
     let path = self.vol.path_of_inode(store, no).unwrap_or_default();
-    self.vol.record(Op::Witness, &path, Some(no), prev);
+    self.vol.record(Op::Witness, path, Some(no), prev);
     Ok(())
   }
 
@@ -2730,7 +2730,7 @@ impl Overlay<'_> {
       .is_some_and(|b| b.drift.insert(no, kind) != Some(kind));
     if fresh {
       let path = self.vol.path_of_inode(store, no).unwrap_or_default();
-      self.vol.record(Op::Drift, &path, Some(no), 0);
+      self.vol.record(Op::Drift, path, Some(no), 0);
     }
   }
 
@@ -3224,7 +3224,7 @@ impl Overlay<'_> {
         self.host.close_file(file);
       }
       let path = self.vol.path_of_inode(store, no).unwrap_or_default();
-      self.vol.record(Op::Witness, &path, Some(no), prev);
+      self.vol.record(Op::Witness, path.as_str(), Some(no), prev);
       done.push(path);
     }
     Ok(done)

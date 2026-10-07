@@ -3041,6 +3041,7 @@ inodes with the AppleDouble sidecars), `footprint -p` of each process before and
 | Before | 20 MB | 270, 307 MB | 2.4 MB |
 | Checkpoints streamed | 20 MB | 163 MB | 2.4 MB |
 | … and the buffer reserved at the expected size | 20 MB | 139, 141 MB | 2.4–2.5 MB |
+| … and streamed straight into the slot (no kept buffer) | 20 MB | 122, 122 MB | 2.4 MB |
 
 How it was found: `footprint -v` put the growth in `MALLOC_LARGE` (188 of 307 MB dirty, none reclaimable), and
 `malloc_zone_pressure_relief` returned nothing, so it was not freed-and-cached. A probe that built the same volume in
@@ -3056,5 +3057,26 @@ one buffer the shard keeps, reserved at `Journal::expected_checkpoint_bytes`, an
 snapshot, a clone, an attribute, a hard link and an open orphan, and the streamed checkpoint recovers to the same shard
 image.
 
-What remains above the volume's own 47 MB is mostly the kept buffer (one image's worth, reused) and the per-create
-delta path.
+What remained above the volume's own 47 MB was then mostly the kept buffer (one image's worth, reused) and the
+per-create delta path.
+
+**Streamed into the slot (later the same day).** `Journal::begin_checkpoint` returns a `StreamedImage` that writes the
+image into the free slot as it is encoded, through a 64 KiB stage the shard keeps (`STREAM_STAGE_BYTES`): the slot's
+old header is zeroed first and the new one written last, so a refused, crashed or abandoned stream never commits and
+the committed slot is never touched. Counts are written before their items (a trie visit counts the head's inodes; a
+volume that cannot be captured restarts the checkpoint without it, at most once per volume), so nothing is patched
+after it may already be in the slot. The release daemon (load average 8.7–9.5, the machine shared): 122 MB in both
+rounds. `cargo run --release -p slates-vfs --example create_heap` (50,000 files, one process, the allocator counting):
+
+| | Retained heap per file | Allocations per file | Reallocations per file |
+|---|---|---|---|
+| Before this day's allocation work | 1,897 B | 39.9 | 9.0 |
+| Dirty sets as sorted `Vec`s, the delta encoded in a kept scratch, one exact buffer per journalled path | 1,420 B | 30.9 | 0.006 |
+| The checkpoint streamed into its slot | 1,024 B | 30.9 | 0.003 |
+
+Per phase now: create 430.6 B and 3.0 allocations, the 100-byte write 128.7 B and 3.0, the provenance attribute
+461.8 B and 7.0, a delta 0 B and 9.0, a checkpoint 2.6 B (was 398.9) and 8.9. Tests:
+`a_streamed_shard_checkpoint_equals_the_shard_image_and_recovers` (an image several stages long, framed byte for byte),
+`a_refused_or_abandoned_streamed_checkpoint_leaves_the_committed_one`, and the server's
+`a_streamed_checkpoint_restarts_without_a_volume_it_cannot_capture` (a 2,000-file volume streamed into the slot before
+an overlay without its host refuses; the committed image holds the first volume whole).

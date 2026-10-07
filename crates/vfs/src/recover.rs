@@ -513,33 +513,23 @@ pub struct HeldReply {
 
 impl ShardImage {
   /// Starts a streamed shard image's encoding in `out` (for [`ShardImage::encode_finish`]): what `ShardImage::new` then
-  /// `encode` writes before the volumes, with the volume count to be patched in. The caller then appends each volume as
-  /// its key's 16 bytes followed by [`Volume::encode_image`], in key order (the order `new` sorts into), counting them.
-  pub fn encode_start(out: &mut Vec<u8>) -> usize {
+  /// `encode` writes before its `volumes` volumes. The caller then appends exactly that many, each as its key's 16
+  /// bytes followed by [`Volume::encode_image`], in key order (the order `new` sorts into). The count is written first
+  /// because a streamed image's bytes may already be in its slot when the last volume is encoded; a volume that cannot
+  /// be captured restarts the stream without it.
+  pub fn encode_start(out: &mut Vec<u8>, volumes: usize) {
     SHARD_MAGIC.encode(out);
     IMAGE_VERSION.encode(out);
-    let at = out.len();
-    slates_wire::codec::encode_len(0, out);
-    at
+    slates_wire::codec::encode_len(volumes, out);
   }
 
-  /// Ends a streamed shard image: the volume count patched in at `at` (from [`ShardImage::encode_start`]), then the held
-  /// replicas and the replies, as `ShardImage::new(volumes).with_held(held).with_replies(replies).encode` writes them.
-  pub fn encode_finish(
-    out: &mut Vec<u8>,
-    at: usize,
-    volumes: usize,
-    held: &[u8],
-    mut replies: Vec<HeldReply>,
-  ) -> Result<(), VfsError> {
-    if !slates_wire::codec::patch_len(out, at, volumes) {
-      return Err(VfsError::RecoveryIncomplete);
-    }
+  /// Ends a streamed shard image: the held replicas and the replies, as
+  /// `ShardImage::new(volumes).with_held(held).with_replies(replies).encode` writes them after the volumes.
+  pub fn encode_finish(out: &mut Vec<u8>, held: &[u8], replies: &mut Vec<HeldReply>) {
     slates_wire::codec::encode_len(held.len(), out);
     out.extend_from_slice(held);
     replies.sort_by_key(|reply| reply.attachment);
     replies.encode(out);
-    Ok(())
   }
 
   /// A shard image of the given volumes, in key order, holding nothing for others.
@@ -597,16 +587,6 @@ impl ShardImage {
     known: Option<CommittedSlot>,
   ) -> Result<(usize, CommittedSlot), VfsError> {
     publish_committed(slots, &self.to_content(), known)
-  }
-
-  /// [`ShardImage::write_after`] for an image already encoded ([`ShardImage::encode_start`] … `encode_finish`): the
-  /// same frame, without the image ever held as a value.
-  pub fn write_encoded_after<S: ImageWrite + ?Sized>(
-    encoded: &[u8],
-    slots: &mut S,
-    known: Option<CommittedSlot>,
-  ) -> Result<(usize, CommittedSlot), VfsError> {
-    publish_committed(slots, encoded, known)
   }
 
   /// Reads the last committed shard image back from a double-buffered content-object buffer (§4.8):
@@ -763,6 +743,157 @@ struct Slot {
 /// them into one buffer. The header is what a restarted daemon reads to find and validate what was published; the
 /// CRC turns a write torn by a crash into a typed refusal rather than a garbage decode. Refuses
 /// [`VfsError::NoSpace`] if the slot cannot hold the frame.
+/// Where an image is encoded: a buffer the encoders append to, and a point between items where a streaming output may
+/// hand what is buffered on ([`StreamedImage`]); a plain `Vec` keeps everything.
+pub trait ImageOut {
+  /// The buffer the next items are encoded into.
+  fn buf(&mut self) -> &mut Vec<u8>;
+  /// Called between items; a streaming output hands the buffered bytes on here.
+  fn settle(&mut self) -> Result<(), VfsError>;
+}
+
+impl ImageOut for Vec<u8> {
+  fn buf(&mut self) -> &mut Vec<u8> {
+    self
+  }
+
+  fn settle(&mut self) -> Result<(), VfsError> {
+    Ok(())
+  }
+}
+
+/// A shard image framed into the free slot of double-buffered `slots` as it is encoded, so it is never held whole in
+/// memory: the encoders stage items in a buffer the caller keeps, which is copied into the slot, and folded into the
+/// frame's CRC, once it reaches [`STREAM_STAGE_BYTES`]. The slot's old header is zeroed before any payload byte lands
+/// and the new header is written last, so a publish interrupted anywhere (a refusal, a crash, a dropped stream) leaves
+/// that slot invalid and recovery reads the committed one, which is never touched (the commit is still the CRC
+/// becoming valid, §4.8). A checkpoint encoded whole kept one image's worth of buffer per shard: 399 bytes a file,
+/// 2026-10-06 `create_heap`.
+pub struct StreamedImage<'s, S: ImageWrite + ?Sized> {
+  slots: &'s mut S,
+  slot: Slot,
+  generation: u64,
+  second: bool,
+  written: usize,
+  crc: u32,
+  stage: &'s mut Vec<u8>,
+  refused: Option<VfsError>,
+}
+
+/// Shape: the bytes a streamed image stages before copying them into the slot: large enough that the per-copy cost is
+/// small against the copy, small against any image (one inode's encoding is a few hundred bytes).
+pub const STREAM_STAGE_BYTES: usize = 1 << 16;
+
+impl<'s, S: ImageWrite + ?Sized> StreamedImage<'s, S> {
+  /// Starts a frame in the slot the committed image is not in (`known`, else read from `slots`), with the next
+  /// generation, staging in `stage` (cleared); the slot's old header is zeroed first.
+  pub fn begin(
+    slots: &'s mut S,
+    known: Option<CommittedSlot>,
+    stage: &'s mut Vec<u8>,
+  ) -> Result<Self, VfsError> {
+    let committed = known.or_else(|| committed_slot(slots));
+    let generation = committed
+      .map_or(0, |slot| slot.generation)
+      .checked_add(1)
+      .ok_or(VfsError::FileTooLarge)?;
+    let second = committed.is_some_and(|slot| !slot.second);
+    let (zero, one) = slots_of(slots.image_len());
+    let slot = if second { one } else { zero };
+    if slot.len < FRAME_HEADER.saturating_add(SLOT_GEN_WIDTH) {
+      return Err(VfsError::NoSpace);
+    }
+    slots.image_write(slot.offset, &[0u8; FRAME_HEADER])?;
+    let generation_bytes = generation.to_le_bytes();
+    slots.image_write(slot.offset.saturating_add(FRAME_HEADER), &generation_bytes)?;
+    stage.clear();
+    stage.reserve(STREAM_STAGE_BYTES);
+    Ok(StreamedImage {
+      slots,
+      slot,
+      generation,
+      second,
+      written: SLOT_GEN_WIDTH,
+      crc: crc32c(&generation_bytes),
+      stage,
+      refused: None,
+    })
+  }
+
+  /// The refusal that stopped this stream (the slot could not take its bytes), if one did: an encoder's error after it
+  /// is this refusal, not the encoder's own.
+  pub fn refused(&self) -> Option<&VfsError> {
+    self.refused.as_ref()
+  }
+
+  /// Copies the staged bytes into the slot; a refusal is kept, and every later call returns it.
+  fn flush(&mut self) -> Result<(), VfsError> {
+    if let Some(refused) = &self.refused {
+      return Err(refused.clone());
+    }
+    let flushed = self.copy_out();
+    if let Err(refusal) = &flushed {
+      self.refused = Some(refusal.clone());
+    }
+    flushed
+  }
+
+  /// [`Self::flush`]'s copy.
+  fn copy_out(&mut self) -> Result<(), VfsError> {
+    if self.stage.is_empty() {
+      return Ok(());
+    }
+    let end = FRAME_HEADER
+      .checked_add(self.written)
+      .and_then(|at| at.checked_add(self.stage.len()))
+      .ok_or(VfsError::FileTooLarge)?;
+    if end > self.slot.len {
+      return Err(VfsError::NoSpace);
+    }
+    let at = self
+      .slot
+      .offset
+      .saturating_add(FRAME_HEADER)
+      .saturating_add(self.written);
+    self.slots.image_write(at, self.stage)?;
+    self.crc = crc32c_append(self.crc, self.stage);
+    self.written = self.written.saturating_add(self.stage.len());
+    self.stage.clear();
+    Ok(())
+  }
+
+  /// Flushes what is staged and writes the header, committing the frame: its length and the committed slot it makes.
+  pub fn finish(mut self) -> Result<(usize, CommittedSlot), VfsError> {
+    self.flush()?;
+    let len = u32::try_from(self.written).map_err(|_| VfsError::FileTooLarge)?;
+    let mut header = [0u8; FRAME_HEADER];
+    let (len_field, crc_field) = header.split_at_mut(LEN_WIDTH);
+    len_field.copy_from_slice(&len.to_le_bytes());
+    crc_field.copy_from_slice(&self.crc.to_le_bytes());
+    self.slots.image_write(self.slot.offset, &header)?;
+    Ok((
+      FRAME_HEADER.saturating_add(self.written),
+      CommittedSlot {
+        generation: self.generation,
+        second: self.second,
+      },
+    ))
+  }
+}
+
+impl<S: ImageWrite + ?Sized> ImageOut for StreamedImage<'_, S> {
+  fn buf(&mut self) -> &mut Vec<u8> {
+    self.stage
+  }
+
+  fn settle(&mut self) -> Result<(), VfsError> {
+    if self.stage.len() >= STREAM_STAGE_BYTES {
+      self.flush()?;
+    }
+    Ok(())
+  }
+}
+
 fn frame<S: ImageWrite + ?Sized>(
   generation: u64,
   image: &[u8],
@@ -1144,19 +1275,21 @@ impl Volume {
     out: &mut Vec<u8>,
   ) -> Result<(), VfsError> {
     let start = out.len();
-    let encoded = self.encode_image_fields(store, host, out);
+    let encoded = self.encode_image_into(store, host, out);
     if encoded.is_err() {
       out.truncate(start);
     }
     encoded
   }
 
-  /// The fields of [`Self::encode_image`], in [`VolumeImage`]'s declaration order (the derive's canonical order).
-  fn encode_image_fields(
+  /// [`Self::encode_image`] into any [`ImageOut`], settled between inodes, so a [`StreamedImage`] holds at most a
+  /// stage's bytes and one inode's. On a refusal the output holds a partial image: a streamed checkpoint restarts
+  /// without this volume (its slot is not committed until its header is written last).
+  pub fn encode_image_into<O: ImageOut + ?Sized>(
     &self,
     store: &Store,
     host: Option<&mut dyn crate::host::HostFs>,
-    out: &mut Vec<u8>,
+    out: &mut O,
   ) -> Result<(), VfsError> {
     let base = match (&self.base, host) {
       (Some(plane), Some(host)) => Some(plane.image(host)?),
@@ -1169,17 +1302,19 @@ impl Volume {
       .get(self.root)
       .map_err(|_| VfsError::StaleHandle)?
       .inode;
-    IMAGE_MAGIC.encode(out);
-    IMAGE_VERSION.encode(out);
-    self.prefix.encode(out);
-    policy_image(self.policy).encode(out);
-    self.epoch.0.encode(out);
-    self.next_counter.encode(out);
-    self.origin_epoch.map(|e| e.0).encode(out);
-    quota_image(&self.quota).encode(out);
-    root_no.0.encode(out);
-    self.last_snapshot.map(snap_ref).encode(out);
+    let fields = out.buf();
+    IMAGE_MAGIC.encode(fields);
+    IMAGE_VERSION.encode(fields);
+    self.prefix.encode(fields);
+    policy_image(self.policy).encode(fields);
+    self.epoch.0.encode(fields);
+    self.next_counter.encode(fields);
+    self.origin_epoch.map(|e| e.0).encode(fields);
+    quota_image(&self.quota).encode(fields);
+    root_no.0.encode(fields);
+    self.last_snapshot.map(snap_ref).encode(fields);
     let origin_shared = self.encode_head(store, out)?;
+    let out = out.buf();
     origin_shared.encode(out);
     snapshots.encode(out);
     self
@@ -1204,29 +1339,36 @@ impl Volume {
     Ok(())
   }
 
-  /// [`Self::capture_head`] encoded as it goes: the head's inode images as a `Vec<InodeImage>` (its length patched in
-  /// once known, since a clone's shared numbers are left out), each one dropped once encoded; the shared numbers.
-  fn encode_head(&self, store: &Store, out: &mut Vec<u8>) -> Result<Vec<u64>, VfsError> {
-    let mut handles = Vec::new();
-    trie::walk(&store.tries, self.inode_root, &mut handles);
-    let at = out.len();
-    slates_wire::codec::encode_len(0, out);
+  /// [`Self::capture_head`] encoded as it goes: the head's inode images as a `Vec<InodeImage>`, each dropped once
+  /// encoded and the output settled after it; the shared numbers. The trie is visited twice, once to count the inodes
+  /// the image carries (a clone's shared ones are left out) so the length is written before them, and once to encode
+  /// them; no `Vec` of handles is built (eight bytes an inode for the checkpoint's length).
+  fn encode_head<O: ImageOut + ?Sized>(
+    &self,
+    store: &Store,
+    out: &mut O,
+  ) -> Result<Vec<u64>, VfsError> {
     let mut count = 0usize;
     let mut shared = Vec::new();
-    for handle in handles {
+    trie::for_each(&store.tries, self.inode_root, |handle| {
+      let inode = store.inodes.get(handle)?;
+      match self.origin_epoch {
+        Some(origin) if inode.born <= origin => shared.push(inode.no.0),
+        _ => count = count.saturating_add(1),
+      }
+      Ok::<(), VfsError>(())
+    })?;
+    slates_wire::codec::encode_len(count, out.buf());
+    trie::for_each(&store.tries, self.inode_root, |handle| {
       let inode = store.inodes.get(handle)?;
       if let Some(origin) = self.origin_epoch
         && inode.born <= origin
       {
-        shared.push(inode.no.0);
-        continue;
+        return Ok(());
       }
-      self.image_of_inode(store, inode)?.encode(out);
-      count = count.saturating_add(1);
-    }
-    if !slates_wire::codec::patch_len(out, at, count) {
-      return Err(VfsError::RecoveryIncomplete);
-    }
+      self.image_of_inode(store, inode)?.encode(out.buf());
+      out.settle()
+    })?;
     Ok(shared)
   }
 

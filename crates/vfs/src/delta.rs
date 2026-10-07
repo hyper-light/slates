@@ -40,11 +40,16 @@ use crate::volume::{Store, Volume};
 /// What a volume changed since it was last published.
 #[derive(Clone, Debug, Default)]
 pub struct Dirty {
-  /// Inode numbers created, written or removed.
-  inodes: BTreeSet<u64>,
-  /// Directory entries placed, re-pointed or removed: the directory's inode number and the name as the
-  /// operation named it.
-  entries: BTreeSet<(u64, String)>,
+  /// Inode numbers created, written or removed, in the order recorded (repeats included) until
+  /// [`Dirty::normalize`] sorts and dedups them for a publication. A set allocated a node per change and freed it at every
+  /// publication: two of a create's eleven allocations (2026-10-06, `create_heap`). Cleared, not freed, at publication.
+  inodes: Vec<u64>,
+  /// Directory entries placed, re-pointed or removed: the directory's inode number and the name as the operation named
+  /// it, the name a span of [`Dirty::names`]; unsorted, with repeats, until [`Dirty::normalize`].
+  entries: Vec<(u64, std::ops::Range<usize>)>,
+  /// The bytes of every recorded entry's name, one after another: one buffer, kept across publications, where each
+  /// name was its own allocation.
+  names: String,
   /// The recorded attachments' reference counts taken, forgotten or swept: the attachment's id and the inode number
   /// (A-96). An owner this process alone knows is not recorded, as the image does not carry it.
   references: BTreeSet<(u64, u64)>,
@@ -93,7 +98,7 @@ impl Dirty {
   pub(crate) fn inode(&mut self, no: u64) {
     self.changed = true;
     if self.recording() {
-      self.inodes.insert(no);
+      self.inodes.push(no);
     }
   }
 
@@ -101,8 +106,42 @@ impl Dirty {
   pub(crate) fn entry(&mut self, dir: u64, name: &str) {
     self.changed = true;
     if self.recording() {
-      self.entries.insert((dir, name.to_owned()));
+      let start = self.names.len();
+      self.names.push_str(name);
+      self.entries.push((dir, start..self.names.len()));
     }
+  }
+
+  /// Sorts and dedups the recorded inodes and entries (by directory, then the name's bytes: the order and the set the
+  /// sets this replaces gave), so a publication reads each change once, in a deterministic order. Names stay where they
+  /// were written in [`Dirty::names`].
+  fn normalize(&mut self) {
+    self.inodes.sort_unstable();
+    self.inodes.dedup();
+    let names = &self.names;
+    let name_of = |range: &std::ops::Range<usize>| names.get(range.clone()).unwrap_or_default();
+    self.entries.sort_unstable_by(|(a_dir, a), (b_dir, b)| {
+      a_dir.cmp(b_dir).then_with(|| name_of(a).cmp(name_of(b)))
+    });
+    self
+      .entries
+      .dedup_by(|(b_dir, b), (a_dir, a)| a_dir == b_dir && name_of(a) == name_of(b));
+  }
+
+  /// The recorded entries as (directory, name), after [`Dirty::normalize`].
+  fn entry_names(&self) -> impl Iterator<Item = (u64, &str)> {
+    self
+      .entries
+      .iter()
+      .map(|(dir, range)| (*dir, self.names.get(range.clone()).unwrap_or_default()))
+  }
+
+  /// Forgets every recorded change, keeping the buffers' capacity for the next ones.
+  fn clear_recorded(&mut self) {
+    self.inodes.clear();
+    self.entries.clear();
+    self.names.clear();
+    self.references.clear();
   }
 
   /// Records a changed reference count of `owner` on inode `no`; an owner this process alone knows is not imaged, so
@@ -189,10 +228,11 @@ impl Volume {
   /// This volume's publication now (the module doc): a delta when one applies, else its full image. Read-only:
   /// the changes stay recorded until [`Volume::mark_published`] is told the publication committed.
   pub fn publication(
-    &self,
+    &mut self,
     store: &Store,
     host: Option<&mut dyn crate::host::HostFs>,
   ) -> Result<VolumeRecord, VfsError> {
+    self.dirty.normalize();
     let changed = u64::try_from(self.dirty.inodes.len()).unwrap_or(u64::MAX);
     let shape = self.shape();
     let full = !self.dirty.published
@@ -224,9 +264,7 @@ impl Volume {
   /// Records that this volume's last [`Volume::publication`] was published and committed: the changes it carried are
   /// forgotten, and the next record may be a delta over it.
   pub fn mark_published(&mut self, store: &Store) {
-    self.dirty.inodes.clear();
-    self.dirty.entries.clear();
-    self.dirty.references.clear();
+    self.dirty.clear_recorded();
     self.dirty.changed = false;
     self.dirty.published = true;
     self.dirty.published_shape = self.shape();
@@ -278,11 +316,11 @@ impl Volume {
       }
     }
     let mut entries = Vec::with_capacity(self.dirty.entries.len());
-    for (dir, name) in &self.dirty.entries {
+    for (dir, name) in self.dirty.entry_names() {
       entries.push(EntryChange {
-        dir: *dir,
-        name: name.clone(),
-        entry: self.entry_image(store, crate::ids::InodeNo(*dir), name)?,
+        dir,
+        name: name.to_owned(),
+        entry: self.entry_image(store, crate::ids::InodeNo(dir), name)?,
       });
     }
     let references = self
