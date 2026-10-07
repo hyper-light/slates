@@ -3791,7 +3791,9 @@ mod limits {
 }
 
 #[cfg(test)]
-pub(crate) use tests::{audit_on_shard, audit_on_shard_configured, test_profile};
+pub(crate) use tests::{
+  audit_daemon, audit_on_shard, audit_on_shard_configured, observe_first, test_profile,
+};
 
 #[cfg(test)]
 mod tests {
@@ -3854,8 +3856,45 @@ mod tests {
     );
     let mut config = crate::DaemonConfig::derive(&profile, &instance, Some(1));
     configure(&mut config);
+    let daemon = audit_daemon_with(&profile, config, instance);
+    let result = daemon.observe(daemon.shards.first().copied(), history);
+    daemon.stop();
+    result.expect("the audit history completed")
+  }
+
+  /// A running one-shard audit daemon, bootstrapped, for a test whose work outlives one observation (a task it spawns
+  /// that must still run after the observation returns); the test stops it.
+  pub(crate) fn audit_daemon() -> super::Daemon {
+    let profile = test_profile();
+    static NEXT_KEPT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let instance = format!(
+      "audit-kept-{}-{}",
+      std::process::id(),
+      NEXT_KEPT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
+    let config = crate::DaemonConfig::derive(&profile, &instance, Some(1));
+    audit_daemon_with(&profile, config, instance)
+  }
+
+  /// Runs `history` on `daemon`'s first shard (an [`audit_daemon`]'s one), as [`audit_on_shard`] does, leaving the
+  /// daemon running.
+  pub(crate) fn observe_first<T: Send + 'static>(
+    daemon: &super::Daemon,
+    history: impl FnOnce(&mut crate::state::ShardState) -> T + Clone + Send + 'static,
+  ) -> T {
+    daemon
+      .observe(daemon.shards.first().copied(), history)
+      .expect("the observation completed")
+  }
+
+  /// Starts and bootstraps an audit daemon under `config`.
+  fn audit_daemon_with(
+    profile: &slates_machine::MachineProfile,
+    config: crate::DaemonConfig,
+    instance: String,
+  ) -> super::Daemon {
     let daemon = super::Daemon::start(
-      &profile,
+      profile,
       config,
       super::SegmentSource::Create { name: instance },
     )
@@ -3863,9 +3902,7 @@ mod tests {
     daemon
       .bootstrap(true)
       .expect("the audit explicitly creates its initial group");
-    let result = daemon.observe(daemon.shards.first().copied(), history);
-    daemon.stop();
-    result.expect("the audit history completed")
+    daemon
   }
 
   /// AC-8.1, §4.8 restart-as-join; AUD-07: vote for B, lose the whole anchor, then receive C's

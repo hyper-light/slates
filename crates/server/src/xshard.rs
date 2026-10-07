@@ -152,6 +152,41 @@ impl<T: 'static> Future for CrossShardCall<T> {
   }
 }
 
+/// Sends `back`, the task that carries a result home to `origin` (a reply to its client, an awaited call's answer), and
+/// waits for room when the origin's control channel is full: retried at [`REPLY_PACE_NS`] for at most
+/// [`REPLY_ROOM_ATTEMPTS`] attempts, one coordinator period. A full channel drains as the origin turns, so a burst no
+/// longer costs the reply; a reply still refused after the period, or whose origin is gone, is counted on this shard
+/// (`xshard.reply_dropped`) and its waiter's own deadline answers it (the client's reply deadline; `call_within`'s).
+/// Before 2026-10-07 every refusal dropped the reply at once and unseen.
+pub async fn send_back(origin: u16, back: SpawnRequest) {
+  let mut message = Control::Spawn(Box::new(back));
+  for _ in 0..REPLY_ROOM_ATTEMPTS {
+    match registry::send_control_or_return(origin, message) {
+      Ok(()) => return,
+      Err(registry::RefusedControl {
+        error: RtError::ControlFull { .. },
+        message: Some(unsent),
+      }) => {
+        message = unsent;
+        let _ = slates_rt::futures::sleep(REPLY_PACE_NS).await;
+      }
+      Err(_) => break,
+    }
+  }
+  state::with_state_counted(|s| s.count(REPLY_DROPPED, 1));
+}
+
+/// Shape: the pace of a reply's retries for room — a tenth of a coordinator period, the collection loops' cadence
+/// (`crate::fleet::POLL_PER_PERIOD`), so a waiting reply asks about as often as the shard's loops turn.
+const REPLY_PACE_NS: u64 = crate::daemon::HEARTBEAT_NS / crate::fleet::POLL_PER_PERIOD;
+
+/// Shape: the attempts a reply makes for room: one coordinator period at [`REPLY_PACE_NS`] (the period the daemon's
+/// own loops tolerate a stall for before acting), plus the first.
+const REPLY_ROOM_ATTEMPTS: u64 = crate::fleet::POLL_PER_PERIOD + 1;
+
+/// Format: the status counter of results that could not be carried home ([`send_back`]).
+pub(crate) const REPLY_DROPPED: &str = "xshard.reply_dropped";
+
 /// Runs `work` on `shard` and returns its result on this shard (`origin`). The closure borrows
 /// shard state only as needed; the NFS dispatcher may take several short borrows. On the same shard
 /// the closure runs directly. The spawn is refused typed at the target's admission
@@ -178,7 +213,7 @@ pub fn call_on<T: Send + 'static>(
         }),
         None,
       );
-      let _ = registry::send_control(origin, Control::Spawn(Box::new(back)));
+      send_back(origin, back).await;
     }),
     None,
   );
@@ -225,6 +260,43 @@ pub async fn within<T: 'static>(call: CrossShardCall<T>, deadline_ns: u64) -> Op
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  /// A result carried home waits for room (2026-10-07). Do: on a shard, register a stand-in slot whose control channel
+  /// holds one message, fill it, and spawn a task that sends a result home to it with `send_back`; from the test
+  /// thread, wait two reply paces, then take the filler off the channel. Expect: the result's message arrives after
+  /// the filler, and nothing was counted dropped. Before, the full channel dropped it at once.
+  #[test]
+  // The test thread stands for the origin shard draining later: it must wait off-shard while the reply retries.
+  #[allow(clippy::disallowed_methods)]
+  fn a_result_sent_home_to_a_full_channel_waits_for_room() {
+    let daemon = crate::daemon::audit_daemon();
+    let (registration, receiver) = crate::daemon::observe_first(&daemon, |_state| {
+      let (registration, receiver) = registry::register(
+        4,
+        1,
+        registry::RegisterKick::Kick(slates_rt::driver::Kick::none()),
+      )
+      .unwrap();
+      let home = registration.shard();
+      let filler = SpawnRequest::new(Box::pin(async {}), None);
+      registry::send_control(home, Control::Spawn(Box::new(filler))).unwrap();
+      let back = SpawnRequest::new(Box::pin(async {}), None);
+      let task = slates_rt::futures::spawn(send_back(home, back)).unwrap();
+      slates_rt::futures::detach(task).unwrap();
+      (registration, receiver)
+    });
+    std::thread::sleep(std::time::Duration::from_nanos(2 * REPLY_PACE_NS));
+    assert!(receiver.try_recv().is_ok(), "the filler");
+    let carried = receiver.recv_timeout(std::time::Duration::from_nanos(
+      REPLY_PACE_NS * REPLY_ROOM_ATTEMPTS,
+    ));
+    assert!(
+      carried.is_ok(),
+      "the result's message arrived once there was room"
+    );
+    drop(registration);
+    daemon.stop();
+  }
 
   struct Released(std::sync::mpsc::SyncSender<()>);
 

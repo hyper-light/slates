@@ -524,7 +524,7 @@ fn promote_region_on_root(
           }),
           None,
         );
-        let _ = slates_rt::registry::send_control(origin, Control::Spawn(Box::new(back)));
+        crate::xshard::send_back(origin, back).await;
       }
     }),
     None,
@@ -990,11 +990,16 @@ fn forward_to_owner(
   });
   let task = SpawnRequest::new(
     Box::pin(async move {
-      let resolved = crate::state::with_state(|state| {
+      let resolved = crate::state::with_state_counted(|state| {
         let query = crate::owner_location::Query::new(state, ObjectId(volume.bytes), region);
         (query, query.known_owner(state, cached))
       });
       let Some((query, known)) = resolved else {
+        // The control shard's state was out of reach (a nested borrow is counted): the client is answered as for an
+        // owner not found, never left waiting for a reply no task would send (before 2026-10-07 the task returned
+        // and the client waited out its reply deadline).
+        let reply = refused(Refusal::HomedElsewhere { region });
+        deliver_owner_forward(origin, control, (client, request), reply, None).await;
         return;
       };
       let owner = match known {
@@ -1031,24 +1036,7 @@ fn forward_to_owner(
       } else {
         owner.map(|owner| query.route(owner))
       };
-      if origin == control {
-        finish_owner_forward(client, request, reply, route);
-      } else {
-        let back = SpawnRequest::new(
-          Box::pin(async move {
-            finish_owner_forward(client, request, reply, route);
-          }),
-          None,
-        );
-        if let Err(error) =
-          slates_rt::registry::send_control(origin, Control::Spawn(Box::new(back)))
-        {
-          crate::state::with_state(|state| {
-            state.count("fleet.owner_location.delivery_refused", 1);
-          });
-          eprintln!("slates-server: owner reply delivery refused: {error}");
-        }
-      }
+      deliver_owner_forward(origin, control, (client, request), reply, route).await;
     }),
     None,
   );
@@ -1060,6 +1048,28 @@ fn forward_to_owner(
 
 /// A late lookup belongs to the original client generation. It cannot populate a reused slot's
 /// cache or deliver a predecessor's result to the client that now occupies that slot.
+/// Carries a forwarded verb's reply from the control shard to the client's shard `origin` and finishes it there
+/// ([`finish_owner_forward`]): at once on the same shard, else as a task sent home ([`crate::xshard::send_back`]).
+async fn deliver_owner_forward(
+  origin: u16,
+  control: u16,
+  (client, request): (Handle<ClientSlot>, u64),
+  reply: ReplyBody,
+  route: Option<crate::owner_location::CachedRoute>,
+) {
+  if origin == control {
+    finish_owner_forward(client, request, reply, route);
+    return;
+  }
+  let back = SpawnRequest::new(
+    Box::pin(async move {
+      finish_owner_forward(client, request, reply, route);
+    }),
+    None,
+  );
+  crate::xshard::send_back(origin, back).await;
+}
+
 fn finish_owner_forward(
   client: Handle<ClientSlot>,
   request: u64,
@@ -1619,7 +1629,7 @@ fn send_forward(
         }),
         None,
       );
-      let _ = slates_rt::registry::send_control(origin, Control::Spawn(Box::new(back)));
+      crate::xshard::send_back(origin, back).await;
     }),
     None,
   );
@@ -1702,7 +1712,7 @@ fn scatter_list(
           }),
           None,
         );
-        let _ = slates_rt::registry::send_control(origin, Control::Spawn(Box::new(back)));
+        crate::xshard::send_back(origin, back).await;
       }),
       None,
     );
@@ -1753,7 +1763,7 @@ fn scatter_grants(
           }),
           None,
         );
-        let _ = slates_rt::registry::send_control(origin, Control::Spawn(Box::new(back)));
+        crate::xshard::send_back(origin, back).await;
       }),
       None,
     );
@@ -1811,7 +1821,7 @@ fn scatter_status(state: &mut ShardState, client_index: u32, request: u64) -> Se
           }),
           None,
         );
-        let _ = slates_rt::registry::send_control(origin, Control::Spawn(Box::new(back)));
+        crate::xshard::send_back(origin, back).await;
       }),
       None,
     );
@@ -1856,7 +1866,7 @@ fn scatter_acknowledge(
           }),
           None,
         );
-        let _ = slates_rt::registry::send_control(origin, Control::Spawn(Box::new(back)));
+        crate::xshard::send_back(origin, back).await;
       }),
       None,
     );
