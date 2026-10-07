@@ -38,6 +38,7 @@ pub mod lock;
 pub mod loom_bounds;
 pub mod mpsc;
 pub mod prefault;
+mod ranges;
 pub mod region;
 pub mod ring;
 pub mod segmented;
@@ -83,5 +84,22 @@ pub(crate) mod test_serial {
     fn drop(&mut self) {
       BUSY.store(false, Ordering::Release);
     }
+  }
+
+  /// The process's physical footprint in bytes (what macOS memory pressure and jetsam count), or `None` when the OS
+  /// will not say.
+  #[cfg(target_os = "macos")]
+  pub(crate) fn footprint() -> Option<u64> {
+    let mut info = std::mem::MaybeUninit::<libc::rusage_info_v4>::zeroed();
+    // SAFETY: `proc_pid_rusage` writes one `rusage_info_v4` into the buffer it is given, which is that size.
+    let refused = unsafe {
+      libc::proc_pid_rusage(
+        libc::getpid(),
+        libc::RUSAGE_INFO_V4,
+        info.as_mut_ptr().cast(),
+      )
+    };
+    // SAFETY: the call succeeded, so it filled the struct.
+    (refused == 0).then(|| unsafe { info.assume_init() }.ri_phys_footprint)
   }
 }

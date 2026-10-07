@@ -187,7 +187,12 @@ slates-machine = 50
 # (`MADV_REMOVE`/`MADV_DONTNEED` over a free block's whole pages, Linux, 1) and `shared::platform::Inner::discard`
 # (`MADV_REMOVE` over a sparse object's emptied write-log pages, Linux, 1). rustix's `madvise` is unsafe because the
 # advice replaces bytes; `fallocate(PUNCH_HOLE)` is the safe call but a file write, allowed only in `slates-land` (R1).
-slates-mem = 32
+# 2026-10-06 (+4, A-110, the macOS give-back): `region::os::discard_slice` and `reuse_slice` on macOS
+# (`MADV_FREE_REUSABLE` over a free block's whole pages and `MADV_FREE_REUSE` before it is handed out again, 2; rustix
+# has no Darwin advice, so they are `libc::madvise`); and the test-only footprint reader `test_serial::footprint`
+# (`proc_pid_rusage` into a buffer of its struct's size and the `assume_init` after it succeeded, 2), with which the
+# give-back's tests observe what macOS counts.
+slates-mem = 36
 # 2026-09-14 (+11, registry slot reclamation — `docs/bugs/2026-09-14-shard-registry-leaks-every-slot-for-the-process-lifetime.md`):
 # `driver::KickFd` — the slot-owned kick descriptor: `Sync`/`Send` impls (2), `with`, `fd`, `close` (3
 # blocks reading or taking the `UnsafeCell` under the `closed` flag); `registry::register` (the previous

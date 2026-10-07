@@ -63,6 +63,11 @@ impl Extent {
 struct Slot {
   region: Region,
   buddy: Buddy,
+  /// The ranges freed and zeroed in place since the idle purge last ran here: resident pages no allocation holds, which
+  /// the purge gives back (A-105). A scrubbing free records its block; an allocation or a claim takes its block out; the
+  /// purge drains the set. So it holds only free bytes, the purge touches only what was freed, and a block given back
+  /// unscrubbed (a recovery's, whose bytes may be claimed again) is never in it.
+  dirty: crate::ranges::UnitSet,
 }
 
 /// Zeroes the `len` bytes at `offset` of a block just returned to the free lists (A-99: zero on free, as Linux's
@@ -124,6 +129,9 @@ pub struct ChunkArena {
   purge_cursor: Option<(u16, usize)>,
   /// Allocations so far, monotone: a caller that sees it unchanged across an interval knows the arena was idle.
   allocations: u64,
+  /// Bytes whose reusable mark an allocation cleared before handing them out (A-110, macOS), monotone: the counter a
+  /// test of the give-back asserts moved, so a dead clearing path cannot pass as one that had nothing to clear.
+  reused: u64,
 }
 
 /// What one [`ChunkArena::purge`] call did.
@@ -168,6 +176,7 @@ impl ChunkArena {
       resident_free: 0,
       purge_cursor: None,
       allocations: 0,
+      reused: 0,
     }
   }
 
@@ -181,6 +190,12 @@ impl ChunkArena {
   /// Allocations so far (monotone, saturating): unchanged across an interval means the arena allocated nothing in it.
   pub fn allocations(&self) -> u64 {
     self.allocations
+  }
+
+  /// Bytes whose reusable mark an allocation cleared before handing them out (A-110; zero where a discard leaves no
+  /// mark).
+  pub fn reused_bytes(&self) -> u64 {
+    self.reused
   }
 
   /// Bytes released and zeroed since the last complete purge: resident RAM no allocation holds, which
@@ -217,27 +232,29 @@ impl ChunkArena {
       let Some(slot) = self.slot_mut(region) else {
         continue;
       };
-      let Slot {
-        region: memory,
-        buddy,
-      } = slot;
-      let free: Vec<(usize, usize)> = buddy
-        .free_blocks(from)
-        .filter(|(_, len)| *len >= discard_from)
-        .take(max_blocks.saturating_sub(visited).saturating_add(1))
-        .collect();
-      for (offset, len) in free {
+      let mut at = from;
+      let mut drained = 0usize;
+      let size = slot.region.len();
+      while let Some((first, reach)) = slot.dirty.next_run_from(at, size) {
         if visited >= max_blocks {
-          self.purge_cursor = Some((region, offset));
+          self.resident_free = self.resident_free.saturating_sub(drained);
+          self.purge_cursor = Some((region, first));
           done.more = true;
           return done;
         }
         visited = visited.saturating_add(1);
-        if memory.discard(offset, len) {
+        slot.dirty.take(first, reach);
+        let len = reach.saturating_sub(first);
+        drained = drained.saturating_add(len);
+        // A range shorter than the discard size stays resident: keeping it costs less than faulting it back.
+        if len >= discard_from && slot.region.discard(first, len) {
           done.bytes = done.bytes.saturating_add(len);
         }
+        at = reach;
       }
+      self.resident_free = self.resident_free.saturating_sub(drained);
     }
+    // Every set is drained: nothing freed is left resident, whatever the count drifted to.
     self.resident_free = 0;
     done
   }
@@ -380,6 +397,7 @@ impl ChunkArena {
     // `granules >= 1`, so it has a top bit: `ilog2` is its order.
     let max_order = granules.ilog2();
     let slot = Slot {
+      dirty: crate::ranges::UnitSet::new(region.len(), self.granule),
       region,
       buddy: Buddy::new(self.granule, max_order)?,
     };
@@ -521,6 +539,8 @@ impl ChunkArena {
       order,
       slots,
       allocated_bytes,
+      reused,
+      resident_free,
       ..
     } = self;
     for &region in order.iter() {
@@ -529,6 +549,21 @@ impl ChunkArena {
       };
       match slot.buddy.alloc(len) {
         Ok(block) => {
+          // A block that may carry the OS's reusable mark is cleared before it is handed out, or the kernel could take
+          // its pages while they hold data (A-110). One the OS will not clear goes back to the free lists unused.
+          match slot.region.prepare(block.offset(), block.len()) {
+            Ok(cleared) => {
+              *reused = reused.saturating_add(u64::try_from(cleared).unwrap_or(u64::MAX));
+              let taken = slot
+                .dirty
+                .take(block.offset(), block.offset().saturating_add(block.len()));
+              *resident_free = resident_free.saturating_sub(taken);
+            }
+            Err(refused) => {
+              slot.buddy.free(block)?;
+              return Err(refused);
+            }
+          }
           *allocated_bytes = allocated_bytes.saturating_add(block.len());
           return Ok(Extent {
             arena,
@@ -605,6 +640,10 @@ impl ChunkArena {
     if !deferred {
       if scrubbed {
         release_block(&mut slot.region, extent.offset(), extent.len(), locked);
+        slot.dirty.mark(
+          extent.offset(),
+          extent.offset().saturating_add(extent.len()),
+        );
         self_resident = extent.len();
       } else if locked {
         slot.region.unlock_range(extent.offset(), extent.len());
@@ -628,6 +667,11 @@ impl ChunkArena {
       reason: ExtentRefusal::NoSuchRegion,
     })?;
     let block = slot.buddy.claim(offset, len)?;
+    slot.region.forget_marks(block.offset(), block.len());
+    let taken = slot
+      .dirty
+      .take(block.offset(), block.offset().saturating_add(block.len()));
+    self.resident_free = self.resident_free.saturating_sub(taken);
     self.allocated_bytes = self.allocated_bytes.saturating_add(block.len());
     Ok(Extent {
       arena,
@@ -682,9 +726,15 @@ impl ChunkArena {
     let mut released_total = 0usize;
     for slot in self.slots.iter_mut().flatten() {
       let before = slot.buddy.free_bytes();
-      let Slot { region, buddy } = slot;
-      buddy
-        .commit_capture_releasing(|offset, len, locked| release_block(region, offset, len, locked));
+      let Slot {
+        region,
+        buddy,
+        dirty,
+      } = slot;
+      buddy.commit_capture_releasing(|offset, len, locked| {
+        release_block(region, offset, len, locked);
+        dirty.mark(offset, offset.saturating_add(len));
+      });
       released_total =
         released_total.saturating_add(slot.buddy.free_bytes().saturating_sub(before));
     }
@@ -697,9 +747,14 @@ impl ChunkArena {
     let mut released_total = 0usize;
     for slot in self.slots.iter_mut().flatten() {
       let before = slot.buddy.free_bytes();
-      let Slot { region, buddy } = slot;
+      let Slot {
+        region,
+        buddy,
+        dirty,
+      } = slot;
       buddy.abandon_capture_releasing(|offset, len, locked| {
-        release_block(region, offset, len, locked)
+        release_block(region, offset, len, locked);
+        dirty.mark(offset, offset.saturating_add(len));
       });
       released_total =
         released_total.saturating_add(slot.buddy.free_bytes().saturating_sub(before));
@@ -803,6 +858,49 @@ mod tests {
   /// Whether every byte of the `len` bytes at `at` of `bytes` is `value`.
   fn all_are(bytes: &[u8], at: usize, len: usize, value: u8) -> bool {
     bytes[at..at + len].iter().all(|b| *b == value)
+  }
+
+  /// A-110 (macOS). Do: allocate, fill and free a 64 MiB block, purge it, allocate it again and fill it. Expect: the
+  /// purge takes the footprint down by most of the block; the second allocation clears the block's mark first (the
+  /// reuse counter moves by the block); and filling it brings the footprint back up, which happens only when the mark
+  /// was cleared (measured: a marked page written stays out of the footprint, the kernel free to take it). The bytes
+  /// read back as written.
+  #[cfg(target_os = "macos")]
+  #[test]
+  #[cfg_attr(miri, ignore)] // Miri models no madvise
+  fn a_purged_block_leaves_the_footprint_and_is_cleared_before_reuse() {
+    const BLOCK: usize = 64 << 20;
+    const MOST_OF_IT: u64 = (BLOCK / 2) as u64;
+    let _serial = crate::test_serial::Guard::take();
+    let p = page();
+    let mut arena = ChunkArena::new(p).discarding_from(p);
+    arena
+      .add_region(Region::map(BLOCK, p, false).unwrap())
+      .unwrap();
+    let block = arena.alloc(BLOCK).unwrap();
+    arena.bytes_mut(block).unwrap().fill(0xAB);
+    arena.free(block).unwrap();
+    let footprint = crate::test_serial::footprint;
+    let before = footprint().unwrap();
+    assert!(purge_to_the_end(&mut arena) > 0);
+    let purged = footprint().unwrap();
+    assert!(
+      before.saturating_sub(purged) >= MOST_OF_IT,
+      "the purge gave the block back: {before} -> {purged}"
+    );
+    let reused_before = arena.reused_bytes();
+    let again = arena.alloc(BLOCK).unwrap();
+    assert!(
+      arena.reused_bytes() - reused_before >= BLOCK as u64,
+      "the allocation cleared the block's mark"
+    );
+    arena.bytes_mut(again).unwrap().fill(0xCD);
+    let written = footprint().unwrap();
+    assert!(
+      written.saturating_sub(purged) >= MOST_OF_IT,
+      "the written block counts again: {purged} -> {written}"
+    );
+    assert!(arena.bytes(again).unwrap().iter().all(|byte| *byte == 0xCD));
   }
 
   #[test]

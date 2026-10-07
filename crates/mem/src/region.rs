@@ -56,6 +56,9 @@ pub struct Region {
   locked: bool,
   huge: bool,
   numa_node: u16,
+  /// The ranges whose pages may carry the OS's reusable mark (A-110, macOS), cleared by [`Region::prepare`] before
+  /// any of them is handed out. Empty on every platform whose discard leaves no mark.
+  reusable: crate::ranges::UnitSet,
 }
 
 impl Region {
@@ -75,6 +78,7 @@ impl Region {
       locked: false,
       huge,
       numa_node: 0,
+      reusable: crate::ranges::UnitSet::new(if os::DISCARD_LEAVES_A_MARK { len } else { 0 }, page),
     })
   }
 
@@ -85,14 +89,26 @@ impl Region {
   /// whole `page`s) is the region's length; `huge` is not asked of a shared object here.
   /// The object is an [`ExclusiveObject`]: the region hands out references to its bytes, which only
   /// storage no other process reaches may do (AUD-29-09).
+  ///
+  /// Where a discard leaves the kernel's reusable mark (macOS, A-110), the whole region is recorded as possibly
+  /// marked: the marks are on the object's pages and outlive the process or shard that set them, so a range of the
+  /// content object another holder or an earlier daemon purged may carry them. Each block's first allocation clears
+  /// its own range ([`Region::prepare`]), a few microseconds, instead of one call over the region at mapping time
+  /// (2 to 37 ms over 2 GiB, measured), which would stall the write that claimed the region.
   pub fn shared(object: ExclusiveObject, page: usize) -> Region {
     let page = page.max(1);
+    let len = object.bytes().len();
     Region {
       backing: Backing::Shared(object),
       page,
       locked: false,
       huge: false,
       numa_node: 0,
+      reusable: if os::DISCARD_LEAVES_A_MARK {
+        crate::ranges::UnitSet::whole(len, page)
+      } else {
+        crate::ranges::UnitSet::new(0, page)
+      },
     }
   }
 
@@ -191,10 +207,12 @@ impl Region {
     }
   }
 
-  /// Zeroes bytes `offset .. offset + len` (one released, unlocked block) by giving its whole pages back to the OS and
-  /// zeroing any partial page at either end, so the block's RAM is freed rather than kept resident full of zeros.
-  /// `false`, the bytes unchanged, where the OS takes no pages back (see `os::discard_slice`), the block holds no whole
-  /// page, or the range lies outside the region: the caller then zeroes them itself.
+  /// Gives the whole pages of bytes `offset .. offset + len` (one released, unlocked block that holds only zeros) back
+  /// to the OS and zeroes any partial page at either end, so the block's RAM is freed rather than kept resident full
+  /// of zeros. On Linux the pages become a hole that reads zeros. On macOS they are marked reusable (A-110): they read
+  /// their zeros until the kernel takes them, then zero pages, and the range is recorded so [`Region::prepare`] clears
+  /// the mark before the block is handed out again. `false`, the bytes unchanged, where the OS takes no pages back (see
+  /// `os::discard_slice`), the block holds no whole page, or the range lies outside the region.
   pub fn discard(&mut self, offset: usize, len: usize) -> bool {
     let page = self.page.max(1);
     let Some(end) = offset.checked_add(len).filter(|end| *end <= self.len()) else {
@@ -209,8 +227,10 @@ impl Region {
     let Some(interior) = self.backing.bytes_mut().get_mut(first..last) else {
       return false;
     };
-    if !os::discard_slice(interior, shared) {
-      return false;
+    match os::discard_slice(interior, shared) {
+      os::Discarded::Refused => return false,
+      os::Discarded::Hole => {}
+      os::Discarded::Marked => self.reusable.mark(first, last),
     }
     for edge in [offset..first, last..end] {
       if let Some(bytes) = self.backing.bytes_mut().get_mut(edge) {
@@ -218,6 +238,53 @@ impl Region {
       }
     }
     true
+  }
+
+  /// Clears the reusable mark from every page of `offset .. offset + len` that may carry one (A-110), before the range is
+  /// handed out: the bytes cleared, zero when none was recorded (every platform but macOS, and a range never
+  /// discarded). The record is a page's bit, so whole pages are cleared. Refused, with the uncleared pages still
+  /// recorded, when the OS refuses: the caller must not hand the range out. Allocates nothing (the arena's hot path).
+  pub fn prepare(&mut self, offset: usize, len: usize) -> Result<usize, MemError> {
+    if self.reusable.is_empty() {
+      return Ok(0);
+    }
+    let size = self.len();
+    // The range is widened to whole words of the record, within each recorded run: one call clears a word of pages
+    // (1 MiB of 16 KiB pages) for about what one block's call costs. Measured on a fresh daemon's 512 MiB write through
+    // the NFS mount: one call per 64 KiB block cost a fifth of the throughput (964-978 against 1,197-1,240 MB/s). A
+    // neighbour's mark cleared early only counts its page in the footprint again.
+    let word = self.reusable.word_bytes().max(1);
+    let start = offset.saturating_sub(offset.checked_rem(word).unwrap_or(0));
+    let end = offset
+      .saturating_add(len)
+      .checked_next_multiple_of(word)
+      .map_or(size, |end| end.min(size));
+    let mut cleared = 0usize;
+    let mut at = start;
+    while let Some((from, reach)) = self.reusable.next_run_within(at, end) {
+      let (first, last) = (from.max(start), reach.min(end));
+      let refused = match self.backing.bytes_mut().get_mut(first..last) {
+        Some(pages) => os::reuse_slice(pages).err(),
+        None => None,
+      };
+      if let Some(code) = refused {
+        return Err(MemError::OsRefused {
+          call: "madvise(MADV_FREE_REUSE)",
+          code,
+        });
+      }
+      cleared = cleared.saturating_add(self.reusable.take(first, last));
+      at = last;
+    }
+    Ok(cleared)
+  }
+
+  /// Forgets any reusable mark recorded over `offset .. offset + len` without a call to the OS: for a range a recovery
+  /// claims, which no mark can be on (A-110: marks go only on free blocks, a block leaves the free lists only through
+  /// an allocation, which clears it, and a recovery image names only blocks live at its commit, since a freed block
+  /// stays out of the free lists until no committed image names it, A-64).
+  pub fn forget_marks(&mut self, offset: usize, len: usize) {
+    self.reusable.take(offset, offset.saturating_add(len));
   }
 
   /// Unlocks the region.
@@ -384,9 +451,9 @@ mod os {
 
   /// Gives the pages of `bytes` (whole pages of a region's own, unlocked mapping) back to the OS, leaving zeros:
   /// `MADV_REMOVE` frees a shared object's own pages (every mapping of it, the anchor's included, then reads a hole),
-  /// `MADV_DONTNEED` a private mapping's. `false` when the OS refused, the bytes then unchanged.
+  /// `MADV_DONTNEED` a private mapping's. [`Discarded::Refused`] when the OS refused, the bytes then unchanged.
   #[cfg(all(target_os = "linux", not(miri)))]
-  pub(super) fn discard_slice(bytes: &mut [u8], shared: bool) -> bool {
+  pub(super) fn discard_slice(bytes: &mut [u8], shared: bool) -> Discarded {
     let advice = if shared {
       rustix::mm::Advice::LinuxRemove
     } else {
@@ -395,14 +462,83 @@ mod os {
     // SAFETY: `bytes` is a live, page-aligned run of whole pages of the region's own mapping, borrowed mutably for the
     // call, and unlocked (the caller unlocks a locked block first); the advice replaces its bytes with zeros, which is
     // what the caller asks for, and touches no byte outside it.
-    unsafe { rustix::mm::madvise(bytes.as_mut_ptr().cast(), bytes.len(), advice) }.is_ok()
+    match unsafe { rustix::mm::madvise(bytes.as_mut_ptr().cast(), bytes.len(), advice) } {
+      Ok(()) => Discarded::Hole,
+      Err(_) => Discarded::Refused,
+    }
   }
 
-  /// No page goes back here: macOS's `MADV_FREE` and `MADV_FREE_REUSABLE` do not zero at once, and a POSIX shared
-  /// memory object has no hole to punch; Miri models no `madvise`. The caller zeroes the bytes itself.
-  #[cfg(not(all(target_os = "linux", not(miri))))]
-  pub(super) fn discard_slice(_bytes: &mut [u8], _shared: bool) -> bool {
-    false
+  /// Marks the pages of `bytes` (whole pages of zeros, a region's own, unlocked mapping) reusable (A-110,
+  /// `MADV_FREE_REUSABLE`): the footprint drops at once and the kernel may take them, after which they read zeros.
+  /// The caller records the range and clears the mark with [`reuse_slice`] before handing it out.
+  #[cfg(all(target_os = "macos", not(miri)))]
+  pub(super) fn discard_slice(bytes: &mut [u8], _shared: bool) -> Discarded {
+    // SAFETY: `bytes` is a live, page-aligned run of whole pages of the region's own mapping, borrowed mutably for the
+    // call, and unlocked; the advice changes how the kernel accounts and may reclaim those pages and nothing else, and
+    // the bytes are zeros, which a reclaimed page also reads.
+    let refused = unsafe {
+      libc::madvise(
+        bytes.as_mut_ptr().cast(),
+        bytes.len(),
+        libc::MADV_FREE_REUSABLE,
+      )
+    };
+    if refused == 0 {
+      Discarded::Marked
+    } else {
+      Discarded::Refused
+    }
+  }
+
+  /// No page goes back here (Miri models no `madvise`; other Unix targets are not built): the caller keeps them.
+  #[cfg(not(any(
+    all(target_os = "linux", not(miri)),
+    all(target_os = "macos", not(miri))
+  )))]
+  pub(super) fn discard_slice(_bytes: &mut [u8], _shared: bool) -> Discarded {
+    Discarded::Refused
+  }
+
+  /// Clears the reusable mark from the pages of `bytes` (`MADV_FREE_REUSE`, A-110), so the kernel accounts and keeps
+  /// them again; the OS's error code when it refuses.
+  #[cfg(all(target_os = "macos", not(miri)))]
+  pub(super) fn reuse_slice(bytes: &mut [u8]) -> Result<(), Option<i32>> {
+    // SAFETY: `bytes` is a live run of whole pages of the region's own mapping, borrowed mutably for the call; the
+    // advice only returns the pages to normal accounting, leaving every byte as it is.
+    let refused = unsafe {
+      libc::madvise(
+        bytes.as_mut_ptr().cast(),
+        bytes.len(),
+        libc::MADV_FREE_REUSE,
+      )
+    };
+    if refused == 0 {
+      Ok(())
+    } else {
+      Err(std::io::Error::last_os_error().raw_os_error())
+    }
+  }
+
+  /// Nothing to clear where a discard leaves no mark.
+  #[cfg(not(all(target_os = "macos", not(miri))))]
+  pub(super) fn reuse_slice(_bytes: &mut [u8]) -> Result<(), Option<i32>> {
+    Ok(())
+  }
+
+  /// Whether a discard here leaves a mark the pages keep until cleared (macOS's reusable mark, A-110).
+  pub(super) const DISCARD_LEAVES_A_MARK: bool = cfg!(all(target_os = "macos", not(miri)));
+
+  /// What a discard did to a range's pages.
+  #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+  pub(super) enum Discarded {
+    /// The OS took no page; the bytes are unchanged.
+    Refused,
+    /// The pages are a hole that reads zeros and costs nothing (Linux).
+    #[cfg_attr(not(all(target_os = "linux", not(miri))), allow(dead_code))]
+    Hole,
+    /// The pages are marked reusable and must be cleared before reuse (macOS).
+    #[cfg_attr(not(all(target_os = "macos", not(miri))), allow(dead_code))]
+    Marked,
   }
 }
 
@@ -475,9 +611,30 @@ mod os {
   }
 
   /// No page goes back here yet (`DiscardVirtualMemory` leaves the contents undefined, not zero, so it would still need
-  /// the zeroing it saves; owed with a measurement): the caller zeroes the bytes itself.
-  pub(super) fn discard_slice(_bytes: &mut [u8], _shared: bool) -> bool {
-    false
+  /// the zeroing it saves; owed with a measurement): the caller keeps them.
+  pub(super) fn discard_slice(_bytes: &mut [u8], _shared: bool) -> Discarded {
+    Discarded::Refused
+  }
+
+  /// Nothing to clear where a discard leaves no mark.
+  pub(super) fn reuse_slice(_bytes: &mut [u8]) -> Result<(), Option<i32>> {
+    Ok(())
+  }
+
+  /// Whether a discard here leaves a mark the pages keep until cleared: no page goes back on Windows yet.
+  pub(super) const DISCARD_LEAVES_A_MARK: bool = false;
+
+  /// What a discard did to a range's pages.
+  #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+  pub(super) enum Discarded {
+    /// The OS took no page; the bytes are unchanged.
+    Refused,
+    /// The pages are a hole that reads zeros and costs nothing.
+    #[allow(dead_code)]
+    Hole,
+    /// The pages are marked reusable and must be cleared before reuse.
+    #[allow(dead_code)]
+    Marked,
   }
 }
 

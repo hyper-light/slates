@@ -25,6 +25,8 @@ loom = "0.7"
 
 [dev-dependencies]
 iai-callgrind = { workspace = true }
+proptest = { workspace = true }
+slates-test-seeds = { workspace = true }
 
 # Only the instruction-count command builds Valgrind's client-request bindings. Ordinary
 # tests and Miri must not acquire a C binding-generator dependency from a benchmark.

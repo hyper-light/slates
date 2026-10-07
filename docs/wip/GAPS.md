@@ -2151,6 +2151,12 @@ a real `pip install`, and a `kill -9` of the daemon mid-write went through the m
   red first:
   - with the old code, 16,986,112 bytes were allocated before the release and 16,986,112 after it;
   - in the container, the memfd held 168 MiB after a 128 MiB delete, and 128 MiB after a 64 MiB write and its delete.
+- **On macOS a deleted file's RAM still never went back** (A-110). The daemon's footprint through a real NFS mount:
+  24 MB at start, 293 MB after a 256 MiB write, 36 MB six seconds after its delete. The same test was red first on
+  macOS: `content.purged_bytes` stayed at 0 of 64 MiB. Windows remains owed (A-105).
+- **The idle purge gave back the whole free arena after any free** (A-110), including never-touched blocks and blocks
+  a recovery gave back unscrubbed. It also counted them again each time. It now gives back only what was freed since
+  it last ran.
 - **User extended attributes were `EOPNOTSUPP`** on the Linux mount (A-106).
 - **`volume create` on a node never bootstrapped said only `ConsensusNotInitialized`.** It now names
   `slates bootstrap root`. Test `a_create_before_bootstrap_is_refused_naming_the_command_that_fixes_it`, red first.

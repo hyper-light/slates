@@ -1559,8 +1559,10 @@ dependencies = [
  "libc",
  "loom",
  "memmap2",
+ "proptest",
  "rustix",
  "slates-machine",
+ "slates-test-seeds",
  "windows-sys 0.60.2",
 ]
 

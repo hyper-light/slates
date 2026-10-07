@@ -2425,11 +2425,13 @@ fn allocated_in_content(name: &str) -> u64 {
 }
 
 /// Memory, a deleted file's RAM: do write a file of many chunks, publish, delete it and leave the shard idle. Expect
-/// the content object's allocated bytes to fall by most of the file within the bound: an idle shard's free blocks go
-/// back to the OS (A-105), not only zeroed in place. Before 2026-10-06 the scrub wrote
-/// zeros over every freed block, which kept every page resident: a 128 MiB file deleted through a FUSE mount left the
-/// memfd at 168 MiB allocated (an adversarial container run).
-#[cfg(target_os = "linux")]
+/// the daemon to count most of the file given back to the OS within the bound (`content.purged_bytes`: an idle
+/// shard's free blocks go back, A-105, on macOS as reusable pages, A-110), and on Linux the content object's allocated
+/// bytes to fall by as much. Before 2026-10-06 the scrub wrote zeros over every freed block, which kept every page
+/// resident: a 128 MiB file deleted through a FUSE mount left the memfd at 168 MiB allocated (an adversarial container
+/// run). On macOS the count was zero until A-110: no page went back. What macOS then counts in the footprint is the mem
+/// crate's tests' (`a_purged_block_leaves_the_footprint_and_is_cleared_before_reuse`).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn a_deleted_files_memory_goes_back_to_the_os() {
   const MARKER: &[u8] = b"SLATES-RAM-RETURNED-7e19";
@@ -2437,7 +2439,9 @@ fn a_deleted_files_memory_goes_back_to_the_os() {
   const CHUNKS: usize = 256;
   let profile = common::machine_profile();
   let instance = format!("srv-ram-back-{}", std::process::id());
-  let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
+  // One shard, so the purge count after the delete is this file's alone: summed over shards, another shard's purge of
+  // its own freed blocks reached half the file first.
+  let config = DaemonConfig::derive(&profile, &instance, Some(1));
   let chunk = slates_vfs::content::chunk_bytes(config.page).get();
   let tag = format!("ram-back-{}", std::process::id());
   let segment = anchor_segment(&tag, &profile, &config);
@@ -2460,14 +2464,33 @@ fn a_deleted_files_memory_goes_back_to_the_os() {
     .fs_write((volume, attachment), "big", &body, 0o644)
     .unwrap();
   daemon.publish_every_shard().unwrap();
+  let purged = || {
+    daemon
+      .refusals_on_every_shard()
+      .unwrap()
+      .get(slates_server::daemon::CONTENT_PURGED)
+      .copied()
+      .unwrap_or(0)
+  };
+  let purged_before = purged();
+  #[cfg(target_os = "linux")]
   let content = format!("slates-con-{tag}");
+  #[cfg(target_os = "linux")]
   let written = allocated_in_content(&content);
   client.fs_remove((volume, attachment), "big").unwrap();
   // The block is zeroed when its free is released; its pages go back when the shard is next idle at a reap tick (one
-  // tick to see no allocation, the next to purge), so the allocation is watched until it falls or the bound passes.
+  // tick to see no allocation, the next to purge), so the count is watched until it covers most of the file or the
+  // bound passes.
   let file = u64::try_from(body.len()).unwrap();
   let started = Instant::now();
+  let mut given_back = purged().saturating_sub(purged_before);
+  while given_back < file / 2 && started.elapsed() < START_WAIT {
+    std::thread::yield_now();
+    given_back = purged().saturating_sub(purged_before);
+  }
+  #[cfg(target_os = "linux")]
   let mut released = allocated_in_content(&content);
+  #[cfg(target_os = "linux")]
   while written.saturating_sub(released) < file / 2 && started.elapsed() < START_WAIT {
     std::thread::yield_now();
     released = allocated_in_content(&content);
@@ -2475,13 +2498,21 @@ fn a_deleted_files_memory_goes_back_to_the_os() {
   daemon.stop();
   drop(segment);
   assert!(
-    written >= file,
-    "the file's bytes were allocated: {written} of {file}"
+    given_back >= file / 2,
+    "most of the file's pages went back to the OS: {given_back} of {file}"
   );
-  assert!(
-    written.saturating_sub(released) >= file / 2,
-    "most of the file's RAM went back to the OS: {written} allocated with it, {released} after its release"
-  );
+  #[cfg(target_os = "linux")]
+  {
+    assert!(
+      written >= file,
+      "the file's bytes were allocated: {written} of {file}"
+    );
+    assert!(
+      written.saturating_sub(released) >= file / 2,
+      "most of the file's RAM left the object: {written} allocated with it, {released} after its release ({given_back} \
+       counted given back)"
+    );
+  }
 }
 
 /// Shape: the reap ticks an idle shard is watched for further publications once its plaintext has gone.

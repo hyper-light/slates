@@ -9869,10 +9869,9 @@ Status: built 2026-10-06, Linux. macOS and Windows keep their pages (owed below)
   4 KiB-page Linux host, 4 KiB on this M5 Max. Smaller free blocks stay resident, being cheaper to keep than to fault
   back.
 - Owed:
-  - macOS: `MADV_FREE` and `MADV_FREE_REUSABLE` do not zero at once, and a POSIX shared memory object has no hole to
-    punch.
-  - Windows: `DiscardVirtualMemory` leaves the contents undefined.
-  Each needs its own zeroing step and a measurement.
+  - macOS: built by A-110 (2026-10-06).
+  - Windows: `DiscardVirtualMemory` leaves the contents undefined, so it needs its own zeroing step and a
+    measurement.
 
 ### A-106 — Extended attributes through the Linux mount (2026-10-06)
 Applied in the same change to:
@@ -10006,3 +10005,61 @@ Status: built 2026-10-06.
   ext4's default of one inode per 16 KiB.
 - Test: four volumes of a quarter of the shard's admittable bytes each are all admitted. Before the change, the
   second was refused `BudgetExceeded { available: 0 }` (red first).
+
+### A-110 — On macOS an idle shard's free pages go back as reusable pages; the purge gives back only what was freed (2026-10-06)
+Applied in the same change to:
+- `crates/mem/src/ranges.rs` (new: `UnitSet`, one bit per page or granule of a region);
+- `crates/mem/src/region.rs`:
+  - `os::discard_slice` and `os::reuse_slice` on macOS;
+  - `Region::prepare` clears a block's marks before it is handed out, and `Region::forget_marks`;
+  - `Region::shared` starts its record whole;
+- `crates/mem/src/arena.rs`:
+  - each region's `dirty` record of freed, still resident ranges, and the purge rewritten to drain it;
+  - `alloc` clears marks; `claim` forgets them; `reused_bytes`;
+- the tests:
+  - `a_purged_block_leaves_the_footprint_and_is_cleared_before_reuse`;
+  - `the_bit_set_equals_a_unit_map_on_every_history` and `a_whole_bit_set_splits_across_words`;
+  - `a_deleted_files_memory_goes_back_to_the_os`, now macOS too, on one shard;
+- `unsafe-budget.toml` (+4), A-105's owed list, GAPS, BENCHMARKS.
+
+Status: built 2026-10-06. Windows remains owed (A-105).
+- What: the A-105 idle purge on macOS marks freed pages `MADV_FREE_REUSABLE`.
+  - The footprint (what memory pressure and jetsam count) drops at once.
+  - The kernel may take the pages without paging them; a taken page reads zeros, as the zeroed block did.
+  - A block may be handed out again only after `MADV_FREE_REUSE`. Measured: a marked page that is written stays out of
+    the footprint, so the kernel could take it while it holds data.
+- How it stays safe:
+  - Each region records the pages it may have marked, one bit per page, and an allocation clears its block's pages
+    before handing it out.
+  - A region mapped afresh (a pool extent another holder or an earlier daemon used) starts with every bit set,
+    because the marks are on the pages, not in any process's record.
+  - Clearing works a bitmap word (64 pages) at a time, and the search for a run stops at the block's span. Each block
+    starts as one recorded run, but the search for that run's end scanned the whole set on every allocation:
+    `Region::prepare` held 8% of a writing daemon's samples.
+  - With both, a fresh daemon's 512 MiB write through the NFS mount ran at 1,069–1,191 MB/s against 1,067–1,216 MB/s
+    with no record, over six interleaved rounds. One call per block had cost a fifth.
+  - A recovery's claim forgets the record without a call. No mark can be on a claimed block: marks go only on free
+    blocks; a block leaves the free lists only through an allocation, which clears it; and an image names only blocks
+    live at its commit (A-64's deferred frees).
+- The purge, on every platform: it gave back every free block of the arena whenever anything had been freed, including
+  never-touched ones. That had three costs:
+  - on Linux, a `madvise` over the whole free arena after each free, and a count (`content.purged_bytes`) that counted
+    the same blocks again;
+  - on macOS, every untouched block marked, so every later allocation would have paid a reuse call;
+  - blocks a recovery gave back unscrubbed (A-64: their bytes may be claimed again) were discarded too.
+  Now each region records the ranges a scrubbing free released, an allocation or claim takes its block out, and the
+  purge drains the record, giving back the coalesced ranges of at least `discard_from_bytes`. The record is a bit set
+  allocated with the region, because the arena's allocation and free must not reach the system allocator
+  (`no_alloc.rs`: an ordered map of ranges made 233 allocations in its loop).
+- Why not the other advice (measured on this Mac, Darwin 25.4, a 64 MiB shared object mapped twice):
+  - `MADV_DONTNEED` and `MADV_FREE` left the footprint at 65 MiB;
+  - `MADV_ZERO` zeroed the pages in both mappings but kept them counted;
+  - a POSIX shared memory object has no hole punch and is sized only once.
+- Measured, the daemon through a real NFS mount (release build, one shard): footprint 24 MB at start, 293 MB after a
+  256 MiB write, 36 MB six seconds after its delete, and 165 MB after a 128 MiB write that followed (the reused blocks
+  counted again, and the bytes read back).
+- Found on the way: a fresh mapping's first touch of a marked page faults, and the fault cleared the mark (the
+  footprint came back with no reuse call). That is undocumented, so the whole-region record stays as the guarantee;
+  with the word-wide clearing it costs nothing measurable.
+- Not changed: the Linux FUSE write log, the one `SparseObject::discard` caller, does not exist on macOS, so the
+  sparse object needs no mark record.

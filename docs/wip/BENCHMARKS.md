@@ -2719,3 +2719,57 @@ with the whole-file map; the builds differ in nothing else on the write path.
 
 That is 2.7× on a 768 MiB sequential write. The charge oracle (`crates/vfs/tests/charge_oracle.rs`) and the full vfs
 suite pass unchanged, so the charge is the same number, computed over fewer windows.
+
+## macOS: giving free pages back as reusable pages (A-110; 2026-10-06)
+
+This Mac (M5 Max, Darwin 25.4), release builds; scratchpad `macshm/` (the madvise probe) and `mac-a110.sh` (the
+daemon). The footprint is `proc_pid_rusage`'s `ri_phys_footprint`, or `/usr/bin/footprint -p`.
+
+**The advice, on a 64 MiB POSIX shared memory object mapped twice:**
+
+| Advice | Footprint | Reads after it |
+|---|---|---|
+| `MADV_DONTNEED` | 65 → 65 MiB | the old bytes |
+| `MADV_FREE` | 65 → 65 MiB | the old bytes |
+| `MADV_FREE_REUSABLE` | 65 → 1 MiB | the old bytes (until the kernel takes the page) |
+| `MADV_ZERO` (11) | 65 → 65 MiB | zeros, in both mappings |
+
+**The reuse protocol** (`MADV_FREE_REUSABLE`, then write all 64 MiB):
+- with no `MADV_FREE_REUSE`: the footprint stayed at 1 MiB, so the written pages were still marked;
+- with `MADV_FREE_REUSE` first: 65 MiB.
+
+**The cost of `MADV_FREE_REUSE`, five runs:**
+
+| Range | Time |
+|---|---|
+| 2 GiB, 64 MiB marked | 1,726–1,936 µs |
+| 2 GiB, 1 GiB marked | 31,265–37,109 µs |
+| One 64 KiB block | 3–5 µs |
+
+That decided per-block clearing on first use over one call at mapping time.
+
+**The daemon** (one shard, a 512 MiB volume through the NFS mount):
+
+| Step | Daemon footprint |
+|---|---|
+| Start | 24 MB |
+| 256 MiB written | 293 MB |
+| Deleted, 6 s later | 36 MB |
+| 128 MiB written again | 165 MB |
+
+Before A-110, no page went back on macOS: the recovery test's purge count was 0 of 64 MiB. The anchor's footprint was
+275 MB throughout, unrelated to content.
+
+**The cost of the whole-region record on a fresh daemon** (512 MiB `dd` through the NFS mount, a fresh daemon per run,
+load average 10–16). "Empty" is a build whose regions start with no record, which leans on the fault clearing the mark:
+
+| Variant | Rounds | Whole record | Empty record |
+|---|---|---|---|
+| One reuse call per 64 KiB block | 3 | 964–978 MB/s | 1,197–1,240 MB/s |
+| A bitmap word per call, run end searched to the region's end | 6 | 881–993 MB/s | 978–1,173 MB/s |
+| **A bitmap word per call, search bounded by the span (shipped)** | **6** | **1,069–1,191 MB/s** | **1,067–1,216 MB/s** |
+
+The first fix did not move the cost because the cost was not the calls: `MADV_FREE_REUSE` over 512 MiB in 1 MiB spans
+took 150 µs in all, and faulting the pages in afterwards was as fast as without it (12.6–13.9 GB/s). A sample of the
+writing daemon found `Region::prepare` itself, scanning the bit set to the end of the region's one run on every
+allocation.
