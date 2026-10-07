@@ -2200,7 +2200,9 @@ impl Overlay<'_> {
       self.vol.write_room(store, 0, len)?;
       let before = crate::volume::content_by_epoch(store, handle);
       store.inodes.get_mut(handle)?.body = Body::Inline(Vec::new());
-      self.vol.reconcile(before, Vec::new());
+      self
+        .vol
+        .reconcile(before, crate::volume::EpochContent::Empty);
       if !bytes.is_empty() {
         self.vol.apply_write_whole(store, handle, 0, &bytes)?;
       }

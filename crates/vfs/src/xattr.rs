@@ -211,7 +211,7 @@ impl Volume {
     let table = inode.xattrs.as_deref_mut().ok_or(VfsError::NoAttribute)?;
     let removed = table.remove(name).ok_or(VfsError::NoAttribute)?;
     let dropped = match sidecar {
-      Sidecar::Drop => table.sidecar.take(),
+      Sidecar::Drop => table.take_sidecar(),
       Sidecar::Keep => None,
     };
     if inode.xattrs.as_deref().is_some_and(XattrTable::is_vacant) {
@@ -320,7 +320,7 @@ impl Volume {
     let dropped = inode
       .xattrs
       .as_deref_mut()
-      .and_then(|table| table.sidecar.take());
+      .and_then(|table| table.take_sidecar());
     if inode.xattrs.as_deref().is_some_and(XattrTable::is_vacant) {
       inode.xattrs = None;
     }
@@ -339,7 +339,7 @@ impl Volume {
       owner_of(self.namespace_inode(store, no)?)?
         .xattrs
         .as_deref()
-        .and_then(|table| table.sidecar),
+        .and_then(XattrTable::sidecar),
     )
   }
 
@@ -358,7 +358,10 @@ impl Volume {
       Err(refusal) => return Err(self.abandon_attribute(store, fresh, refusal)),
     };
     let inode = store.inodes.get_mut(handle)?;
-    inode.xattrs.get_or_insert_with(Box::default).sidecar = Some(fresh);
+    inode
+      .xattrs
+      .get_or_insert_with(Box::default)
+      .set_sidecar(fresh);
     // The view now shows the empty copy in place of the encoding: its counter moves.
     inode.fold_counter(1);
     Ok(fresh)
@@ -496,7 +499,7 @@ impl Volume {
     let table = inode.xattrs.get_or_insert_with(Box::default);
     let replaced = table.insert(name, fresh);
     let dropped = match sidecar {
-      Sidecar::Drop => table.sidecar.take(),
+      Sidecar::Drop => table.take_sidecar(),
       Sidecar::Keep => None,
     };
     if dropped.is_some() {

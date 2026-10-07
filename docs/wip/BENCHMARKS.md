@@ -3074,6 +3074,7 @@ rounds. `cargo run --release -p slates-vfs --example create_heap` (50,000 files,
 | Dirty sets as sorted `Vec`s, the delta encoded in a kept scratch, one exact buffer per journalled path | 1,420 B | 30.9 | 0.006 |
 | The checkpoint streamed into its slot | 1,024 B | 30.9 | 0.003 |
 | Inode images and publications encoded from the store, never built | 1,024 B | 13.05 | 0.003 |
+| Attribute table sized to its entries; a write's epoch view inline; a create in a current directory records nothing | 936 B | 8.05 | 0.003 |
 
 **Encoded from the store (later again).** A checkpoint built an `InodeImage` per inode and a delta one per changed
 inode, plus a `String` per entry, each copying the inline body, the attribute names and the entry names only to encode
@@ -3086,6 +3087,13 @@ disagree with its variant order. Oracles: the model test's every generated step 
 streamed-checkpoint tests compare the image bytes, and `a_streamed_shard_delta_equals_the_shard_delta_and_recovers`
 the shard delta's. Checkpoint allocations per file 8.87 → 0.01, delta 9.00 → 0; the daemon after 50,000 macOS files
 122, 123 MB (unchanged: these were transient allocations, not retained bytes; load average 8.8–11.5).
+
+**Sized to what is held (later still).** `XattrTable` is a boxed slice with one slot per attribute and a non-zero
+word for the working copy: 24 bytes, not 40, and its entries 24 bytes for one attribute where a `Vec`'s first growth
+reserved four (96). `content_by_epoch` returns an inline view for a body of one part (`EpochContent`), where a `Vec`
+for every body was two allocations per write, the attribute's value write included. `need_current_dir` records only
+a directory it counts, so a create in a current directory allocates nothing there. Per phase: create 430.6 B and 2.0
+allocations, the write 128.7 B and 1.0 (its inline body), the attribute 373.8 B (was 461.8) and 5.0 (was 7.0).
 
 Per phase after the streaming: create 430.6 B and 3.0 allocations, the 100-byte write 128.7 B and 3.0, the provenance attribute
 461.8 B and 7.0, a delta 0 B and 9.0, a checkpoint 2.6 B (was 398.9) and 8.9. Tests:

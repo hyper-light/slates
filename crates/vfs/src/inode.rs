@@ -143,15 +143,21 @@ pub enum Body {
 /// sorted by name bytes so a lookup is a binary search and a listing is canonical. Names are byte
 /// strings, as the hosts' are (Linux names are C strings in a namespace, `user.x`; macOS names are
 /// UTF-8; an NFSv4 named attribute is a UTF-8 component), checked by [`crate::xattr::check_name`].
+///
+/// Sized to what it holds, because every file a macOS client creates carries one attribute
+/// (`com.apple.provenance`): the entries are a boxed slice with exactly one slot per attribute (a
+/// `Vec`'s first growth reserved four, 96 bytes for one), and the working copy is a non-zero word
+/// (an inode number is never zero), so the table is 24 bytes, not 40 (2026-10-06, `create_heap`).
+/// A set or a removal rebuilds the slice; an inode holds a handful of attributes.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct XattrTable {
   /// `(name, attribute inode)`, ascending by name, names unique.
-  entries: Vec<(Box<[u8]>, InodeNo)>,
+  entries: Box<[(Box<[u8]>, InodeNo)]>,
   /// A transport's working copy of an encoding of these attributes (the macOS AppleDouble `._`
   /// file a client writes over NFSv3, §4.6): an attribute inode holding the bytes exactly as the
   /// client last wrote them, so its reads are stable. Not an attribute; dropped whenever the
-  /// attributes change through any other path.
-  pub sidecar: Option<InodeNo>,
+  /// attributes change through any other path. Read through [`XattrTable::sidecar`].
+  sidecar: Option<std::num::NonZeroU64>,
 }
 
 impl XattrTable {
@@ -176,7 +182,12 @@ impl XattrTable {
         .get_mut(at)
         .map(|(_, held)| std::mem::replace(held, no)),
       Err(at) => {
-        self.entries.insert(at, (name.into(), no));
+        let mut entries = Vec::with_capacity(self.entries.len().saturating_add(1));
+        let mut held = std::mem::take(&mut self.entries).into_vec().into_iter();
+        entries.extend(held.by_ref().take(at));
+        entries.push((name.into(), no));
+        entries.extend(held);
+        self.entries = entries.into_boxed_slice();
         None
       }
     }
@@ -184,11 +195,29 @@ impl XattrTable {
 
   /// Removes `name`, returning the attribute inode that held its value.
   pub fn remove(&mut self, name: &[u8]) -> Option<InodeNo> {
-    self
+    let at = self
       .entries
       .binary_search_by(|(held, _)| held.as_ref().cmp(name))
-      .ok()
-      .map(|at| self.entries.remove(at).1)
+      .ok()?;
+    let mut entries = std::mem::take(&mut self.entries).into_vec();
+    let (_, removed) = entries.remove(at);
+    self.entries = entries.into_boxed_slice();
+    Some(removed)
+  }
+
+  /// The attribute inode holding the transport's working copy, if one is kept.
+  pub fn sidecar(&self) -> Option<InodeNo> {
+    self.sidecar.map(|no| InodeNo(no.get()))
+  }
+
+  /// Forgets the working copy, returning its attribute inode.
+  pub fn take_sidecar(&mut self) -> Option<InodeNo> {
+    self.sidecar.take().map(|no| InodeNo(no.get()))
+  }
+
+  /// Keeps `copy` as the working copy; an inode number of zero, which no inode has, keeps none.
+  pub fn set_sidecar(&mut self, copy: InodeNo) {
+    self.sidecar = std::num::NonZeroU64::new(copy.0);
   }
 
   /// The names and attribute inodes, ascending by name.
@@ -222,7 +251,7 @@ impl XattrTable {
       return None;
     }
     Some(Self {
-      entries: pairs,
+      entries: pairs.into_boxed_slice(),
       sidecar: None,
     })
   }

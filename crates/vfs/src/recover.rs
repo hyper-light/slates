@@ -1576,7 +1576,7 @@ impl Volume {
       sidecar: inode
         .xattrs
         .as_deref()
-        .and_then(|table| table.sidecar)
+        .and_then(crate::inode::XattrTable::sidecar)
         .map(|copy| copy.0),
     })
   }
@@ -1686,7 +1686,7 @@ impl Volume {
     }
     inode.attribute_of().map(|owner| owner.0).encode(out);
     table
-      .and_then(|table| table.sidecar)
+      .and_then(crate::inode::XattrTable::sidecar)
       .map(|copy| copy.0)
       .encode(out);
     Ok(())
@@ -2545,7 +2545,7 @@ impl Volume {
         if !self.attribute_of_owner(store, copy, owner) {
           return Err(VfsError::RecoveryIncomplete);
         }
-        table.sidecar = Some(copy);
+        table.set_sidecar(copy);
       }
       let handle =
         trie::get(&store.tries, self.inode_root, owner).ok_or(VfsError::RecoveryIncomplete)?;

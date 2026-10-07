@@ -3441,6 +3441,9 @@ impl Volume {
   /// Counts what making directory `no` and its ancestors current would take. A current directory's
   /// ancestors are current (a copy-up makes the ancestors current first), so the walk stops at the
   /// first current one, or at one already counted (`counted`, shared by a verb's several directories).
+  /// Only a directory counted is recorded: a current one stops every walk that reaches it, so the
+  /// common create in a current directory records nothing and allocates nothing (2026-10-06,
+  /// `create_heap`).
   fn need_current_dir(
     &self,
     store: &Store,
@@ -3453,11 +3456,11 @@ impl Volume {
       if counted.contains(&no) {
         break;
       }
-      counted.push(no);
       let node = store.dirs.get(self.current_dir(store, no)?)?;
       if node.born == self.epoch {
         break;
       }
+      counted.push(no);
       needs.dirs = needs.dirs.saturating_add(1);
       self.need_current_inode(store, no, needs)?;
       if let Some(parent_no) = node.parent {
@@ -4697,7 +4700,7 @@ impl Volume {
         table
           .iter()
           .map(|(_, attribute)| attribute)
-          .chain(table.sidecar)
+          .chain(table.sidecar())
           .collect()
       })
       .unwrap_or_default();
@@ -5329,7 +5332,7 @@ impl Volume {
   }
 
   /// Moves the histogram from one by-epoch view of an inode's content to the next.
-  pub(crate) fn reconcile(&mut self, before: Vec<(Epoch, u64)>, after: Vec<(Epoch, u64)>) {
+  pub(crate) fn reconcile(&mut self, before: EpochContent, after: EpochContent) {
     for (epoch, len) in before {
       self.bytes.sub(epoch, len);
     }
@@ -5646,9 +5649,10 @@ pub struct IdleSweep {
   pub left: u64,
 }
 
-pub(crate) fn content_by_epoch(store: &Store, handle: Handle<Inode>) -> Vec<(Epoch, u64)> {
+pub(crate) fn content_by_epoch(store: &Store, handle: Handle<Inode>) -> EpochContent {
+  let mut out = EpochContent::Empty;
   let Ok(inode) = store.inodes.get(handle) else {
-    return Vec::new();
+    return out;
   };
   let sealed_block = |e: &Extent| match e.src {
     ExtentSrc::Chunk { chunk, .. } => store
@@ -5658,18 +5662,68 @@ pub(crate) fn content_by_epoch(store: &Store, handle: Handle<Inode>) -> Vec<(Epo
     ExtentSrc::Zero => None,
   };
   match &inode.body {
-    Body::Inline(b) => vec![(inode.born, u64::try_from(b.len()).unwrap_or(0))],
-    Body::Sealed(extents) => extents.iter().filter_map(sealed_block).collect(),
+    Body::Inline(b) => out.push((inode.born, u64::try_from(b.len()).unwrap_or(0))),
+    Body::Sealed(extents) => extents
+      .iter()
+      .filter_map(sealed_block)
+      .for_each(|part| out.push(part)),
     Body::Open { open, sealed } => {
-      let mut out: Vec<(Epoch, u64)> = sealed.iter().filter_map(sealed_block).collect();
+      sealed
+        .iter()
+        .filter_map(sealed_block)
+        .for_each(|part| out.push(part));
       out.push((
         open.born,
         u64::try_from(open.block.len()).unwrap_or(u64::MAX),
       ));
-      out
     }
-    Body::Base(b) => b.pinned.iter().filter_map(sealed_block).collect(),
-    _ => Vec::new(),
+    Body::Base(b) => b
+      .pinned
+      .iter()
+      .filter_map(sealed_block)
+      .for_each(|part| out.push(part)),
+    _ => {}
+  }
+  out
+}
+
+/// An inode's content by birth epoch ([`content_by_epoch`]): what the epoch histogram moves on every write. Held inline
+/// for the common bodies (an inline file, a file of one extent) and in a `Vec` only past one part, where a `Vec` for
+/// every body was two allocations per write (2026-10-06, `create_heap`).
+pub(crate) enum EpochContent {
+  /// No content.
+  Empty,
+  /// One part.
+  One((Epoch, u64)),
+  /// Several parts.
+  Many(Vec<(Epoch, u64)>),
+}
+
+impl EpochContent {
+  /// Adds a part.
+  fn push(&mut self, part: (Epoch, u64)) {
+    *self = match std::mem::replace(self, EpochContent::Empty) {
+      EpochContent::Empty => EpochContent::One(part),
+      EpochContent::One(first) => EpochContent::Many(vec![first, part]),
+      EpochContent::Many(mut parts) => {
+        parts.push(part);
+        EpochContent::Many(parts)
+      }
+    };
+  }
+}
+
+impl IntoIterator for EpochContent {
+  type Item = (Epoch, u64);
+  type IntoIter =
+    std::iter::Chain<std::option::IntoIter<(Epoch, u64)>, std::vec::IntoIter<(Epoch, u64)>>;
+
+  fn into_iter(self) -> Self::IntoIter {
+    match self {
+      EpochContent::Empty => None.into_iter().chain(Vec::new()),
+      EpochContent::One(part) => Some(part).into_iter().chain(Vec::new()),
+      EpochContent::Many(parts) => None.into_iter().chain(parts),
+    }
   }
 }
 
