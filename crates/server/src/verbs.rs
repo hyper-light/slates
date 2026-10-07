@@ -1968,6 +1968,7 @@ pub fn shard_report(state: &mut ShardState) -> ShardReport {
           ),
           (CONTENT_SEALED, state.store.content.sealed()),
           (CONTENT_SEAL_REFUSED, state.store.content.seal_refusals()),
+          (CONTENT_FREE_REFUSED, state.store.content.free_refusals()),
         ]
         .into_iter()
         .filter(|(_, count)| *count > 0)
@@ -8038,6 +8039,9 @@ pub(crate) const CONTENT_SEALED: &str = "content.sealed";
 
 /// Format: the status counter of chunk seals that fell back to the clear because the cipher refused (A-99).
 pub(crate) const CONTENT_SEAL_REFUSED: &str = "content.seal_refused";
+
+/// Format: the status counter of frees refused on a seal's paths (a block or a tag run not given back, A-99).
+pub(crate) const CONTENT_FREE_REFUSED: &str = "content.free_refused";
 
 /// Publishes when the shard's arena is short of room only because freed blocks wait on a publication (A-64): a
 /// block the committed recovery image may name is not reused until a newer image commits. Run before each unit of

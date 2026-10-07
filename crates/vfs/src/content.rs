@@ -231,6 +231,12 @@ pub struct ChunkStore {
   sealed: u64,
   /// Seals written to a new block because a recovery image named the open one (A-99 with A-64).
   moved_out_of_image: u64,
+  /// Frees refused on a seal's paths (a block or a tag run that could not be given back): each leaves its bytes held
+  /// until the store is dropped, so it is counted and surfaced (`content.free_refused`), never silent.
+  free_refusals: u64,
+  /// The buffer a seal encrypts a copy of the chunk in before any byte of the chunk changes (one chunk's bytes at most,
+  /// kept for the store's life), zeroed after every seal.
+  seal_scratch: Vec<u8>,
 }
 
 impl std::fmt::Debug for ChunkStore {
@@ -288,6 +294,8 @@ impl ChunkStore {
       seal_refusals: 0,
       sealed: 0,
       moved_out_of_image: 0,
+      free_refusals: 0,
+      seal_scratch: Vec::new(),
     }
   }
 
@@ -312,6 +320,18 @@ impl ChunkStore {
     self.seal_refusals
   }
 
+  /// Frees refused on a seal's paths, so far ([`ChunkStore`]'s `free_refusals`).
+  pub const fn free_refusals(&self) -> u64 {
+    self.free_refusals
+  }
+
+  /// Counts a free refused on a seal's path.
+  fn count_free<T, E>(&mut self, freed: Result<T, E>) {
+    if freed.is_err() {
+      self.free_refusals = self.free_refusals.saturating_add(1);
+    }
+  }
+
   /// Chunks sealed so far.
   pub const fn sealed(&self) -> u64 {
     self.sealed
@@ -325,8 +345,9 @@ impl ChunkStore {
   }
 
   /// Encrypts the first `len` bytes of `block` in place under `key`, one granule a segment, into a fresh tag run:
-  /// the chunk's seal. A refusal partway opens what it sealed, so the block holds its plaintext again, and returns
-  /// `None` (the chunk stays in the clear, counted): content already acknowledged is never lost to the cipher.
+  /// the chunk's seal. A refusal partway puts the plaintext back from the copy taken first ([`Self::seal_segments`])
+  /// and returns `None` (the chunk stays in the clear, counted): content already acknowledged is never lost to the
+  /// cipher.
   /// Seals the `len` bytes of `block` under `key` where no recovery image is hurt: in place when no image names the
   /// block, or else in a new block, the old one retired through the arena's deferral, so the image's plaintext open
   /// extent still reads as plaintext after a crash before the next publication (A-64 shadow paging, as ZFS and WAFL
@@ -342,7 +363,8 @@ impl ChunkStore {
     };
     let seal = self.seal_block(copy, len, key);
     // The free is deferred: the image names the old block until the next commit.
-    let _ = self.arena.free(block);
+    let freed = self.arena.free(block);
+    self.count_free(freed);
     self.moved_out_of_image = self.moved_out_of_image.saturating_add(1);
     (copy, seal)
   }
@@ -368,7 +390,8 @@ impl ChunkStore {
         Some(copy)
       }
       None => {
-        let _ = self.arena.free(copy);
+        let freed = self.arena.free(copy);
+        self.count_free(freed);
         None
       }
     }
@@ -396,14 +419,19 @@ impl ChunkStore {
         })
       }
       None => {
-        let _ = self.tags.free(tags);
+        let freed = self.tags.free(tags);
+        self.count_free(freed);
         self.seal_refusals = self.seal_refusals.saturating_add(1);
         None
       }
     }
   }
 
-  /// [`Self::seal_block`]'s pass: every segment sealed, or the sealed prefix opened back and `None`.
+  /// [`Self::seal_block`]'s pass: every segment sealed in place, or `None` with the block's plaintext back. The
+  /// plaintext is copied aside first (the store's scratch) and copied back on a refusal, so a refusal partway changes
+  /// nothing whatever the cipher does. The block was sealed in place and a refusal opened the sealed prefix back,
+  /// ignoring the open's own refusal: had one been refused, the chunk would have held ciphertext marked plaintext. The
+  /// scratch is zeroed after every pass, so no copy of the plaintext outlives it.
   fn seal_segments(
     &mut self,
     block: Block,
@@ -412,34 +440,50 @@ impl ChunkStore {
     tags: TagRun,
     segments: usize,
   ) -> Option<()> {
+    let mut plain = std::mem::take(&mut self.seal_scratch);
+    let sealed = self.seal_in_place(&mut plain, block, len, (key, version), tags, segments);
+    plain.fill(0);
+    self.seal_scratch = plain;
+    sealed
+  }
+
+  /// Copies the block's first `len` bytes into `plain`, then seals them in place segment by segment, writing each tag;
+  /// at the first refusal the bytes go back from `plain` and `None` is returned (`None` before any byte changed when
+  /// the copy cannot be made).
+  fn seal_in_place(
+    &mut self,
+    plain: &mut Vec<u8>,
+    block: Block,
+    len: usize,
+    (key, version): (u32, u64),
+    tags: TagRun,
+    segments: usize,
+  ) -> Option<()> {
+    plain.clear();
+    plain.try_reserve_exact(len).ok()?;
+    plain.extend_from_slice(self.arena.bytes(block)?.get(..len)?);
     let granule = self.granule;
     let cipher = self.cipher.as_ref()?;
     let bytes = self.arena.bytes_mut(block)?.get_mut(..len)?;
-    let mut sealed = 0usize;
+    let mut refused = false;
     for (index, segment) in bytes.chunks_mut(granule).enumerate() {
       let last = index.saturating_add(1) == segments;
       let tag = u32::try_from(index)
         .ok()
         .and_then(|at| cipher.seal(key, version, at, last, segment).ok());
       match (tag, self.tags.tag_mut(tags, index)) {
-        (Some(tag), Some(slot)) => {
-          slot.copy_from_slice(&tag);
-          sealed = index.saturating_add(1);
+        (Some(tag), Some(slot)) => slot.copy_from_slice(&tag),
+        _ => {
+          refused = true;
+          break;
         }
-        _ => break,
       }
     }
-    if sealed == segments {
-      return Some(());
+    if refused {
+      bytes.copy_from_slice(plain);
+      return None;
     }
-    // Opened back in place: the tags written so far are the ones these segments were sealed under.
-    for (index, segment) in bytes.chunks_mut(granule).take(sealed).enumerate() {
-      let last = index.saturating_add(1) == segments;
-      if let (Ok(at), Some(tag)) = (u32::try_from(index), self.tags.tag(tags, index)) {
-        let _ = cipher.open(key, version, at, last, segment, tag);
-      }
-    }
-    None
+    Some(())
   }
 
   /// Opens the segments of a sealed chunk that a read of `[from, to)` (bytes within the chunk) touches, copying the
@@ -1093,6 +1137,77 @@ mod tests {
     fn key_for_volume(&mut self, volume: [u8; 16]) -> Result<u32, VfsError> {
       Ok(u32::from(volume[0]))
     }
+  }
+
+  /// A cipher that refuses to seal segment [`REFUSED_SEGMENT`] and refuses every open: the worst a seal refused partway
+  /// can meet, where opening back the segments already sealed fails too.
+  struct RefusingCipher;
+
+  /// Shape: the segment [`RefusingCipher`] refuses to seal, after two it sealed.
+  const REFUSED_SEGMENT: u32 = 2;
+
+  impl ChunkCipher for RefusingCipher {
+    fn seal(
+      &self,
+      key: u32,
+      version: u64,
+      index: u32,
+      last: bool,
+      segment: &mut [u8],
+    ) -> Result<Tag, VfsError> {
+      if index == REFUSED_SEGMENT {
+        return Err(VfsError::Integrity);
+      }
+      TestCipher.seal(key, version, index, last, segment)
+    }
+    fn open(
+      &self,
+      _key: u32,
+      _version: u64,
+      _index: u32,
+      _last: bool,
+      _segment: &mut [u8],
+      _tag: &Tag,
+    ) -> Result<(), VfsError> {
+      Err(VfsError::Integrity)
+    }
+    fn identity(&self, key: u32) -> Option<KeyIdentity> {
+      TestCipher.identity(key)
+    }
+    fn reference(&mut self, identity: &KeyIdentity) -> Result<u32, VfsError> {
+      TestCipher.reference(identity)
+    }
+    fn key_for_volume(&mut self, volume: [u8; 16]) -> Result<u32, VfsError> {
+      TestCipher.key_for_volume(volume)
+    }
+  }
+
+  /// A-99 (content acknowledged is never lost to the cipher; 2026-10-06). Do: seal a chunk of three and a part
+  /// segments with a cipher that refuses the third segment and refuses every open, then read the chunk back. Expect:
+  /// the seal refused and counted, the chunk left unsealed, and every byte reading back as written. Before, the seal
+  /// encrypted the first two segments in place and, the open back refused, left them ciphertext under a chunk marked
+  /// plaintext: the read returned the cipher's bytes.
+  #[test]
+  fn a_seal_refused_partway_leaves_the_chunk_plain_even_when_opening_back_would_fail() {
+    let mut s = store();
+    s.set_cipher(Box::new(RefusingCipher));
+    let plain: Vec<u8> = (0..SEALED_LEN)
+      .map(|at| u8::try_from(at % 251).unwrap())
+      .collect();
+    let mut open = s.open(100, SEALED_LEN, Epoch(0), false).unwrap();
+    s.write_open(&mut open, 0, &plain).unwrap();
+    let extent = s.seal(open, Some(KEY)).unwrap().unwrap();
+    let ExtentSrc::Chunk { chunk, .. } = extent.src else {
+      panic!()
+    };
+    assert!(
+      s.chunk(chunk).unwrap().seal.is_none(),
+      "the chunk stays plain"
+    );
+    assert_eq!(s.seal_refusals(), 1, "the refusal is counted");
+    let mut read = vec![0u8; SEALED_LEN];
+    s.read_extent_into(&extent, extent.off, &mut read).unwrap();
+    assert_eq!(read, plain, "every byte reads back as written");
   }
 
   /// Shape: the bytes the sealing test writes: three whole segments and a partial fourth.

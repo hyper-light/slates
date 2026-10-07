@@ -2,7 +2,7 @@
 //! 64 MiB of full chunks are sealed into one store under hyper-seal's `VersionKey` (AES-256-GCM, the server's
 //! cipher) and into another with no cipher; then random 4 KiB reads at granule-aligned offsets, and a whole-file
 //! read, through `ChunkStore::read_extent_into`. Reported: the 4 KiB read's p50, p99 and p999, and the whole read's
-//! throughput, for both. The budget it is judged against: a 4 KiB open at most about 1 µs p99 (A-92, seal.md §1).
+//! throughput, and the seal's cost per chunk, for both. The budget it is judged against: a 4 KiB open at most about 1 µs p99 (A-92, seal.md §1).
 //!
 //! `cargo run --release -p slates-vfs --example sealed_read_bench`
 
@@ -69,8 +69,9 @@ impl ChunkCipher for Cipher {
   }
 }
 
-/// A store holding `CONTENT` bytes in full chunks, sealed when `sealed`; its extents.
-fn filled(sealed: bool) -> Result<(ChunkStore, Vec<Extent>), Box<dyn std::error::Error>> {
+/// A store holding `CONTENT` bytes in full chunks, sealed when `sealed`; its extents, and the nanoseconds the seals
+/// took (each `ChunkStore::seal` timed alone, summed).
+fn filled(sealed: bool) -> Result<(ChunkStore, Vec<Extent>, u128), Box<dyn std::error::Error>> {
   let mut arena = ChunkArena::new(PAGE);
   arena.add_region(Region::map(CONTENT * 2, PAGE, false)?)?;
   let mut store = ChunkStore::new(arena, PAGE, CONTENT / PAGE);
@@ -83,15 +84,19 @@ fn filled(sealed: bool) -> Result<(ChunkStore, Vec<Extent>), Box<dyn std::error:
     .map(|at| u8::try_from(at % 251))
     .collect::<Result<_, _>>()?;
   let mut extents = Vec::new();
+  let mut sealing = 0u128;
   for index in 0..CONTENT / chunk {
     let off = u64::try_from(index.checked_mul(chunk).ok_or(VfsError::Invalid)?)?;
     let mut open = store.open(off, chunk, Epoch(0), false)?;
     store.write_open(&mut open, 0, &plain)?;
-    if let Some(extent) = store.seal(open, sealed.then_some(0))? {
+    let started = Instant::now();
+    let extent = store.seal(open, sealed.then_some(0))?;
+    sealing += started.elapsed().as_nanos();
+    if let Some(extent) = extent {
       extents.push(extent);
     }
   }
-  Ok((store, extents))
+  Ok((store, extents, sealing))
 }
 
 fn percentile(sorted: &[u64], permille: usize) -> u64 {
@@ -100,7 +105,7 @@ fn percentile(sorted: &[u64], permille: usize) -> u64 {
 }
 
 fn measure(label: &str, sealed: bool) -> Result<(), Box<dyn std::error::Error>> {
-  let (store, extents) = filled(sealed)?;
+  let (store, extents, sealing) = filled(sealed)?;
   let chunk = store.chunk_bytes();
   let mut out = vec![0u8; PAGE];
   let mut state = 0x2545_F491_4F6C_DD1D_u64;
@@ -132,12 +137,13 @@ fn measure(label: &str, sealed: bool) -> Result<(), Box<dyn std::error::Error>> 
   }
   let seconds = started.elapsed().as_secs_f64();
   println!(
-    "{label}: 4 KiB read p50 {} ns, p99 {} ns, p999 {} ns; whole {} MiB at {:.2} GB/s ({} seals refused)",
+    "{label}: 4 KiB read p50 {} ns, p99 {} ns, p999 {} ns; whole {} MiB at {:.2} GB/s; seal {} ns a chunk ({} seals refused)",
     percentile(&samples, 500),
     percentile(&samples, 990),
     percentile(&samples, 999),
     CONTENT >> 20,
     CONTENT as f64 / seconds / 1e9,
+    sealing / u128::try_from(extents.len().max(1))?,
     store.seal_refusals()
   );
   Ok(())
