@@ -578,7 +578,7 @@ impl Client {
   /// delivery is the account's client.
   pub fn connect(instance: &str, deadlines: Deadlines) -> Result<Client, ClientError> {
     let delivered = delivered_capability()?;
-    let connected = connect_as(instance, 0)?;
+    let connected = connect_as(instance, 0, deadlines.reconnect_ns)?;
     let mut client = Client::over(instance, connected, 0, deadlines);
     client.bind_delivered(delivered)?;
     Ok(client)
@@ -589,7 +589,7 @@ impl Client {
   /// without waiting, as a reconnected channel binds again.
   pub fn begin_connect(instance: &str, deadlines: Deadlines) -> Result<Connecting, ClientError> {
     let delivered = delivered_capability()?;
-    let claim = begin_connect_as(instance, 0)?;
+    let claim = begin_connect_as(instance, 0, deadlines.reconnect_ns)?;
     Ok(Connecting {
       instance: instance.to_owned(),
       deadlines,
@@ -609,7 +609,7 @@ impl Client {
     deadlines: Deadlines,
   ) -> Result<Client, ClientError> {
     let delivered = delivered_capability()?;
-    let connected = connect_as(instance, session.client_id)?;
+    let connected = connect_as(instance, session.client_id, deadlines.reconnect_ns)?;
     let assigned = connected.region.client_id();
     if assigned != session.client_id {
       return Err(ClientError::SessionTaken { assigned });
@@ -1024,7 +1024,7 @@ impl Client {
   pub fn try_reconnect(&mut self) -> Result<bool, ClientError> {
     let polled = match self.reconnecting.as_mut() {
       Some(claim) => claim.poll(),
-      None => match begin_connect_as(&self.instance, self.client_id) {
+      None => match begin_connect_as(&self.instance, self.client_id, self.deadlines.reconnect_ns) {
         Ok(claim) => self.reconnecting.insert(claim).poll(),
         Err(error) => Err(error),
       },
@@ -1884,7 +1884,7 @@ impl Client {
     let budget = self.deadlines.reconnect_ns;
     let mut pause_ns = self.end.wake_estimate_ns().max(1);
     loop {
-      match connect_as(&self.instance, self.client_id) {
+      match connect_as(&self.instance, self.client_id, self.deadlines.reconnect_ns) {
         Ok(connected) => {
           let assigned = connected.region.client_id();
           if assigned != self.client_id {

@@ -311,26 +311,45 @@ pub const CLAIM_WAIT_NS: u64 = 1_000_000_000;
 
 /// The client's side: connects to `instance` and returns its region, the doorbell for a parked
 /// shard, and the platform's control channel where one exists.
+/// A daemon no anchor holds the rendezvous for (an in-process daemon in a test) has no restart to wait out, so this
+/// connect waits one claim wait; a client of an anchored instance passes its restart bound to [`connect_as`].
 pub fn connect(instance: &str) -> Result<Connected, IpcError> {
-  connect_as(instance, 0)
+  connect_as(instance, 0, CLAIM_WAIT_NS)
 }
 
 /// Connects asking for a client id it held before (a reconnect after the daemon restarted, so
 /// its retries under the old request ids meet their completion records, §4.9); the daemon
 /// honours the id when no live client holds it, else assigns a fresh one. The blocking facade over
 /// [`begin_connect_as`]: the claim, then a wait for its answer of at most the claim wait (twice, when
-/// the daemon took the claim to answer it).
-pub fn connect_as(instance: &str, wanted: u32) -> Result<Connected, IpcError> {
-  begin_connect_as(instance, wanted)?.wait()
+/// the daemon took the claim to answer it). `restart_wait_ns` is how long a claim may wait while the daemon restarts
+/// under an anchor that holds the rendezvous ([`begin_connect_as`]).
+pub fn connect_as(
+  instance: &str,
+  wanted: u32,
+  restart_wait_ns: u64,
+) -> Result<Connected, IpcError> {
+  begin_connect_as(instance, wanted, restart_wait_ns)?.wait()
 }
 
 /// Starts a connect without waiting (AUD-29-19, §4.7 "Rendezvous"): the claim is made and announced to
 /// the daemon, and [`Claim::poll`] reads its answer whenever the caller's event loop looks. Nothing here
 /// waits on the daemon, so an event loop that drives the claim is never held by a slow, stopped or dead
 /// one.
-pub fn begin_connect_as(instance: &str, wanted: u32) -> Result<Claim, IpcError> {
+///
+/// A claim waits one claim wait for its answer, unless the rendezvous is held by a live anchor (A-114): then the daemon
+/// may be restarting, and the claim waits up to `restart_wait_ns` (the caller's bound on a restart — a client passes
+/// its reconnect deadline, the recovery budget plus a reply deadline), so a restart slower than a claim wait (a large
+/// volume to recover, a busy machine) is waited out instead of reported as no daemon. On Linux a listening socket
+/// exists only while its owner lives (a daemon answers at once; the anchor holds it across a restart), so the handoff
+/// may always wait that long; on macOS and Windows the bootstrap header names the holding anchor, whose liveness is
+/// checked.
+pub fn begin_connect_as(
+  instance: &str,
+  wanted: u32,
+  restart_wait_ns: u64,
+) -> Result<Claim, IpcError> {
   Ok(Claim {
-    inner: platform::begin(instance, wanted)?,
+    inner: platform::begin(instance, wanted, restart_wait_ns.max(CLAIM_WAIT_NS))?,
   })
 }
 
@@ -455,7 +474,7 @@ pub mod platform {
   };
   use slates_mem::Handoff;
 
-  use super::{Accepted, CLAIM_WAIT_NS, Connected, Doorbell, Prepared, rendezvous_name};
+  use super::{Accepted, Connected, Doorbell, Prepared, rendezvous_name};
   use crate::error::IpcError;
   use crate::region::ClientRegion;
 
@@ -771,11 +790,14 @@ pub mod platform {
     /// The socket; taken once the claim is answered or refused.
     socket: Option<OwnedFd>,
     started: std::time::Instant,
+    /// How long the handoff may take: the caller's restart bound, since a listening socket means a live daemon or the
+    /// anchor holding the rendezvous across a restart (`super::begin_connect_as`).
+    wait_ns: u64,
   }
 
   /// Connects a non-blocking socket to the daemon's rendezvous and sends the hello; nothing waits (a
   /// stream connect over `AF_UNIX` completes at once or is refused when the daemon's backlog is full).
-  pub(super) fn begin(instance: &str, wanted: u32) -> Result<Claim, IpcError> {
+  pub(super) fn begin(instance: &str, wanted: u32, wait_ns: u64) -> Result<Claim, IpcError> {
     let socket = rustix::net::socket_with(
       AddressFamily::UNIX,
       SocketType::STREAM,
@@ -811,6 +833,7 @@ pub mod platform {
       instance: instance.to_owned(),
       socket: Some(socket),
       started: std::time::Instant::now(),
+      wait_ns,
     })
   }
 
@@ -836,7 +859,7 @@ pub mod platform {
       ) {
         Err(rustix::io::Errno::AGAIN) => {
           let elapsed = u64::try_from(self.started.elapsed().as_nanos()).unwrap_or(u64::MAX);
-          if elapsed < CLAIM_WAIT_NS {
+          if elapsed < self.wait_ns {
             return Ok(None);
           }
           self.socket = None;
@@ -891,7 +914,7 @@ pub mod platform {
           continue;
         };
         let elapsed = u64::try_from(self.started.elapsed().as_nanos()).unwrap_or(u64::MAX);
-        let remaining = CLAIM_WAIT_NS.saturating_sub(elapsed);
+        let remaining = self.wait_ns.saturating_sub(elapsed);
         let timeout = Timespec {
           tv_sec: i64::try_from(remaining / NS_PER_SECOND).unwrap_or(i64::MAX),
           tv_nsec: i64::try_from(remaining % NS_PER_SECOND).unwrap_or(0),
@@ -988,7 +1011,8 @@ pub mod platform {
   /// Format: the bootstrap object's magic, `SLBT` in little-endian ASCII.
   const MAGIC: u32 = 0x5442_4C53;
   /// Format: the bootstrap header: magic (4), slots (4), the daemon-wide doorbell word (4),
-  /// padding (4), the daemon's start stamp (8), the daemon's process id (4), padding to a cache line.
+  /// padding (4), the daemon's start stamp (8), the daemon's process id (4), the holding anchor's process id (4),
+  /// padding to a cache line.
   const HEADER_BYTES: usize = 64;
   /// Format: the slot count's offset in the header (after the magic).
   const AT_SLOT_COUNT: usize = 4;
@@ -1001,6 +1025,9 @@ pub mod platform {
   /// Format: the daemon's process id's offset in the header, written before the start stamp publishes
   /// the header: the process a client's exit watch is taken on (`crate::exit_watch`, AUD-29-20).
   const AT_DAEMON_PID: usize = 24;
+  /// Format: the holding anchor's process id's offset in the header (A-114): written when the anchor creates the
+  /// object, zero in an object a daemon made for itself. A claim made while this process lives may wait out a restart.
+  const AT_ANCHOR_PID: usize = 28;
   /// Shape: claim slots in the bootstrap object: clients connecting inside one control-shard
   /// loop; the loop drains them, so the table only covers one loop of arrivals.
   const SLOTS: usize = 64;
@@ -1311,9 +1338,9 @@ pub mod platform {
 
   impl Held {
     pub(super) fn hold(instance: &str) -> Result<Held, IpcError> {
-      Ok(Held {
-        _object: fresh(instance)?,
-      })
+      let mut object = fresh(instance)?;
+      object.write(AT_ANCHOR_PID, &current_pid().to_le_bytes())?;
+      Ok(Held { _object: object })
     }
 
     pub(super) fn env_value(&self) -> String {
@@ -1655,6 +1682,8 @@ pub mod platform {
     #[cfg(windows)]
     ready_event: crate::wake::Event,
     started: std::time::Instant,
+    /// Whether the deadline was already extended once for a claim the daemon took to answer.
+    extended: bool,
     /// The answer's deadline from `started`: one claim wait, extended by one more when the daemon has
     /// taken the claim to answer it.
     wait_ns: u64,
@@ -1664,8 +1693,21 @@ pub mod platform {
 
   /// Claims a slot and rings the daemon-wide doorbell so a parked control shard sees the claim; nothing
   /// waits.
-  pub(super) fn begin(instance: &str, wanted: u32) -> Result<Claim, IpcError> {
+  pub(super) fn begin(
+    instance: &str,
+    wanted: u32,
+    restart_wait_ns: u64,
+  ) -> Result<Claim, IpcError> {
     let (handoff, mut object, generation) = open_bootstrap(instance)?;
+    // A live holding anchor means the daemon may be restarting: the claim waits out the restart (A-114).
+    let anchor = read_u32(&object, AT_ANCHOR_PID)?;
+    let wait_ns = if anchor != 0
+      && crate::exit_watch::ExitWatch::on(anchor).is_ok_and(|watch| !watch.exited())
+    {
+      restart_wait_ns
+    } else {
+      CLAIM_WAIT_NS
+    };
     let index = claim(&mut object, wanted)?;
     #[cfg(windows)]
     let ready_event = match crate::wake::Event::open(&ready_event_name(instance, index)) {
@@ -1697,7 +1739,8 @@ pub mod platform {
       #[cfg(windows)]
       ready_event,
       started: std::time::Instant::now(),
-      wait_ns: CLAIM_WAIT_NS,
+      extended: false,
+      wait_ns,
       open: true,
     })
   }
@@ -1726,7 +1769,7 @@ pub mod platform {
       let took_back = word
         .compare_exchange(CLAIMED, FREE, Ordering::AcqRel, Ordering::Acquire)
         .is_ok();
-      if took_back || self.wait_ns > CLAIM_WAIT_NS {
+      if took_back || self.extended {
         // Taken back, or the daemon's answer is a whole claim wait late: its slot is left to the
         // daemon's stale reclaim.
         self.open = false;
@@ -1736,6 +1779,7 @@ pub mod platform {
         });
       }
       // The daemon took the claim to answer it: its answer is due; wait one more claim wait for it.
+      self.extended = true;
       self.wait_ns = self.wait_ns.saturating_add(CLAIM_WAIT_NS);
       Ok(None)
     }
@@ -1911,7 +1955,7 @@ pub mod platform {
       let name = instance("dropped");
       let _listener = Listener::open(&name).unwrap();
       let client = client_mapping(&name);
-      let claim = begin(&name, 0).unwrap();
+      let claim = begin(&name, 0, CLAIM_WAIT_NS).unwrap();
       let index = claim.index;
       assert_eq!(state(&client, index).unwrap().load(Acquire), CLAIMED);
       drop(claim);
@@ -1928,7 +1972,7 @@ pub mod platform {
         SharedObject::create(&rendezvous_name(&name), OBJECT_BYTES, bootstrap_words()).unwrap();
       object.write(0, &MAGIC.to_le_bytes()).unwrap();
       assert!(matches!(
-        begin(&name, 0).map(drop),
+        begin(&name, 0, CLAIM_WAIT_NS).map(drop),
         Err(IpcError::DaemonUnavailable {
           why: "the daemon has not yet published its rendezvous object",
           ..
@@ -2037,7 +2081,7 @@ pub mod platform {
     }
   }
 
-  pub(super) fn begin(instance: &str, _wanted: u32) -> Result<Claim, IpcError> {
+  pub(super) fn begin(instance: &str, _wanted: u32, _wait_ns: u64) -> Result<Claim, IpcError> {
     Err(IpcError::DaemonUnavailable {
       endpoint: instance.to_owned(),
       why: "no rendezvous exists on this platform",

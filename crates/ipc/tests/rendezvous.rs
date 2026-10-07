@@ -200,7 +200,8 @@ fn a_claim_is_polled_without_waiting_and_refused_at_the_claim_wait() {
   let instance = format!("test-claim-{}", std::process::id());
   let mut listener = Listener::open(&instance).unwrap();
   let started = Instant::now();
-  let (refusal, polls, longest) = poll_until_refused(begin_connect_as(&instance, 0).unwrap());
+  let (refusal, polls, longest) =
+    poll_until_refused(begin_connect_as(&instance, 0, slates_ipc::CLAIM_WAIT_NS).unwrap());
   assert!(
     matches!(refusal, IpcError::DaemonUnavailable { .. }),
     "{refusal:?}"
@@ -247,7 +248,7 @@ fn poll_while_serving(
   instance: &str,
 ) -> (slates_ipc::Connected, Duration) {
   let pid = std::process::id();
-  let mut claim = begin_connect_as(instance, 0).unwrap();
+  let mut claim = begin_connect_as(instance, 0, slates_ipc::CLAIM_WAIT_NS).unwrap();
   let started = Instant::now();
   let mut longest = Duration::ZERO;
   // The daemon's side of each accepted claim, kept: its region lives while the daemon holds it.
@@ -289,7 +290,7 @@ fn poll_while_serving(
 fn a_claim_whose_daemon_died_before_answering_is_unavailable_not_refused() {
   let instance = format!("test-claim-reset-{}", std::process::id());
   let listener = Listener::open(&instance).unwrap();
-  let claim = begin_connect_as(&instance, 0).unwrap();
+  let claim = begin_connect_as(&instance, 0, slates_ipc::CLAIM_WAIT_NS).unwrap();
   drop(listener);
   let (refusal, _, _) = poll_until_refused(claim);
   assert!(
