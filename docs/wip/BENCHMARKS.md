@@ -3247,3 +3247,31 @@ The cause is delay jitter, not loss and not mainly reordering:
 
 Owed: a jitter-robust delay signal, chosen from the literature and A/B'd on these rows plus the 57-scenario
 bake-off (which had no heavy jitter). Until then the two reordering rows fail at 64 MiB.
+
+#### Measured and rejected: a sample-count floor on Copa's standing RTT (2026-10-07)
+
+The idea: Copa's standing RTT spans `srtt/2`; let it span the last N samples when that is longer (N = RFC 9002's
+initial window, 10), so a small window's minimum is not of a handful of jittered samples (order statistics: N
+samples over a jitter width W have an expected minimum W/(N+1) above the floor).
+
+`fetch_bench`, thin link (10 Mbit/s, 200 ms):
+
+| Scenario | Before | With the floor |
+|---|---|---|
+| jitter ±40 ms in order, 1 MiB | 1.5 Mbit/s | 2.7 Mbit/s |
+| reordering + 2% loss, 1 MiB | 0.6 Mbit/s | 2.3 Mbit/s |
+| jitter ±40 ms in order, 8 MiB | — | 28.2 s at N = 10; 20.4 s at N = 32 |
+| reordering + 2% loss, 8 MiB | — | 55.8 s at N = 10; 23.5 s at N = 32 |
+
+`congestion_bench`, 56 scenarios against `HEAD`, deterministic:
+
+| Variant | Capacity share (geomean) | Ping p99 (geomean) | Wins | Losses |
+|---|---|---|---|---|
+| Floor alone | +0.45% | +1.2% | jitter row 0.534 → 0.706 share; 64 kbit/s at 100 ms | 64 kbit/s at 300 ms: p99 585 → 1,052 ms, share 0.912 → 0.847 |
+| Floor capped at one RTT | −0.2% | +2.9% | jitter row 0.534 → 0.694 | 64 kbit/s at 300 ms: share 0.912 → 0.751; 1 Mbit/s 1% loss: p99 137 → 192 ms |
+
+The floor swaps jitter tolerance for slow-link behaviour. On a slow link, N samples span seconds, the filter keeps a
+stale low minimum, under-reads the queue and over-sends. So it does not land. The owed design is the one the
+starvation result prescribes (Arun, Alizadeh, Balakrishnan, SIGCOMM 2022, §6): estimate the path's non-congestive
+jitter D and hold at least D of delay before reading it as queue. That would separate jitter from queue rather than
+widening a time window, and it must clear this grid with no loss before it lands.
