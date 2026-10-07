@@ -3803,6 +3803,24 @@ shard's own clock that A-65 budgets in (docs/bugs/2026-10-04-the-slow-observatio
     recorded holders, ties its copies and steals a slow holder's backlog (A-91), and `fetch_bench` measures it under
     delay, loss, a slow holder, a silent holder and eight readers (BENCHMARKS). Owed: remote attach (Phase 8 item
     13), larger objects in the grid, and the same pulls between real processes over a shaped path.
+  - **Remote attach, the plan (mapped 2026-10-06, §4.10, AC-8.4).** What exists:
+    - the hedged fetch of a manifest and then any chunks by identity (`fleet::fetch_into_hold`, A-91);
+    - the hold (`cluster::content`, `archive_of`);
+    - the takeover's rebuild of a served volume from held content (`fleet::materialize`).
+    The manifest is the snapshot's Merkle tree (`archive::Archive::manifest`), so metadata-only is a manifest fetch.
+    Owed, in order, each its own piece:
+    1. Head routing for a non-candidate: B learns A's head (sequence, manifest identity, recorded holders) from A or
+       its successor over the record plane. A candidate already holds it (`placed_heads`).
+    2. An attach record on B: read-only, pinned to that head's manifest, serving the namespace from the manifest tree
+       alone (no chunk fetched).
+    3. A body whose chunks may be absent: a read of an absent chunk waits on a hedged fetch of that chunk.
+       - NFS answers it after the fetch, or `NFS3ERR_JUKEBOX`/`NFS4ERR_DELAY` past a derived wait.
+       - FUSE parks the request across turns, as `fallocate` does (A-108).
+       - Verified chunks are kept in B's arena under B's budget.
+    4. The proof between real processes: three `slates daemon --fleet` processes in a container with `tc netem`
+       delay, loss and a rate limit on the fleet ports. Record the remote attach latency (metadata only, AC-8.4), the
+       first-read latency (one hedged fetch) and the throughput against the unshaped path.
+    5. Prefetch learning (observe-first), then a clone of a remote snapshot (lazy base chunks).
 
 ### 2026-10-05: volumes sealed at rest (condition 9; A-92)
 
