@@ -4032,6 +4032,17 @@ budget; the latter refusal ends the sender's authority.
 (the client acknowledges by advancing its sequence window); retries return the original result;
 provisioning is therefore safe to retry after any failure.
 
+> **Status (2026-10-07, the bound built).** The bound this section requires ("exhaustion refuses admission") was not
+> built: a client's records grew until it acknowledged, and a client that never did grew them without end. Each
+> shard now holds at most `2 × slots` unacknowledged records per client: the ring's slots in flight, the half ring
+> `slates_client` acknowledges at, and one lost acknowledgement. Past that a new request is refused
+> `AcknowledgementOwed { retained, bound }`, never run and never recorded; a retry of an answered id and an
+> `Acknowledge` are always served (`verbs::acknowledgement_owed`;
+> `docs/bugs/2026-10-07-a-client-that-never-acknowledged-grew-its-completion-records-without-bound.md`). A conforming
+> client meets the refusal only while it keeps issuing new requests past the bound with an `Unpublished` id still
+> unretried, which holds its acknowledgement back; it retries that id first. Regression
+> `a_client_that_never_acknowledges_is_refused_at_its_bound_and_served_once_it_acknowledges`.
+
 **Flow control.** Credit-based, absolute offsets per stream; windows derived from the measured
 bandwidth-delay product and the class's latency budget; the sender never exceeds credit; a
 stalled receiver stalls only its own class.

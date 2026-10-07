@@ -420,6 +420,14 @@ impl Partition {
       .map_or(Seen::New, |w| w.lookup(sequence))
   }
 
+  /// How many completion records a client's window retains unacknowledged here (zero for a client with none).
+  pub fn retained_completions(&self, origin: u64, client: u32) -> usize {
+    self
+      .completions
+      .get(&(origin, client))
+      .map_or(0, ClientWindow::retained)
+  }
+
   /// The highest sequence a client has acknowledged (its completion window's watermark), or `None` if it has
   /// acknowledged nothing. The origin reads its local client's watermark (`origin` = its own host) to relay
   /// it with a forwarded write, so the owner prunes the forwarded client's completions the same way a local

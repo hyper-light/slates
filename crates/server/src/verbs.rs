@@ -1442,6 +1442,39 @@ pub fn serve(state: &mut ShardState, client: Handle<ClientSlot>, request: &Reque
   )
 }
 
+/// The completion records one client may hold unacknowledged on a shard (§4.9 "Exactly-once"; banned item 8). A
+/// conforming client holds at most its ring's slots in flight, acknowledges every half ring of replies
+/// (`slates_client` `ack_every`: slots / 2), and may lose one acknowledgement sent unawaited before the next is due:
+/// `slots + slots / 2 + slots / 2`. Past it a new request is refused `AcknowledgementOwed`, never run or recorded,
+/// so a client that never acknowledges cannot grow a shard's records, and every snapshot that encodes them, without
+/// bound (RIFL, Lee et al., SOSP 2015, bounds its completion records the same way, by the client's acknowledgements).
+fn completion_bound(state: &ShardState) -> u64 {
+  u64::from(state.config.region.slots).saturating_mul(2)
+}
+
+/// The refusal, counted, a new request from `client` meets when its unacknowledged records here reached their bound
+/// ([`completion_bound`]), or `None`. An acknowledgement is never refused: it is how a client gets under the bound.
+/// Asked where the verb would record its completion, after its retry lookup, so a retry is always answered.
+fn acknowledgement_owed(
+  state: &mut ShardState,
+  origin: u64,
+  client: u32,
+  body: &RequestBody,
+) -> Option<ReplyBody> {
+  if matches!(body, RequestBody::Acknowledge { .. }) {
+    return None;
+  }
+  let retained =
+    u64::try_from(state.db.partition().retained_completions(origin, client)).unwrap_or(u64::MAX);
+  let bound = completion_bound(state);
+  if retained < bound {
+    return None;
+  }
+  let refusal = Refusal::AcknowledgementOwed { retained, bound };
+  state.count(refusal_name(&refusal), 1);
+  Some(refused(refusal))
+}
+
 /// Serves a verb whose owner shard is this one: sent to another host of this region when that host owns its volume
 /// (§4.8 "Lookup", before any completion is recorded here), else run with its completion record.
 fn serve_here(
@@ -1455,6 +1488,9 @@ fn serve_here(
   // A volume another host of this region owns goes to it (§4.8 "Lookup"), before any completion is recorded here.
   if let Some((region, volume)) = owned_by_another_host(state, &body) {
     return forward_to_owner(state, client, request, principal, region, volume, body);
+  }
+  if let Some(owed) = acknowledgement_owed(state, origin, id.client, &body) {
+    return Served::Reply(owed);
   }
   let reply = run_recorded(state, origin, id, client_id, &principal, body);
   // A change this verb was refused for a delegation asked for a recall; it is sent now, after the verb's own
@@ -1589,6 +1625,9 @@ fn run_forwarded(
   }
   // The origin's `ring.request` span context, when the forward carried one (a same-node shard), is the
   // cause of this verb's `shard.op` (§4.14); a cross-node forward carries none yet, and the span says so.
+  if let Some(owed) = acknowledgement_owed(state, origin, id.client, &body) {
+    return Some(owed);
+  }
   state.current_span = cause;
   let reply = run_recorded(state, origin, id, client_id, principal, body);
   state.current_span = None;
@@ -2499,6 +2538,7 @@ pub(crate) fn refusal_name(r: &Refusal) -> &'static str {
     Refusal::ConsensusRecoveryStale => "consensus_recovery_stale",
     Refusal::ConsensusRecoveryUnavailable => "consensus_recovery_unavailable",
     Refusal::LeaseUnconfirmed { .. } => "lease_unconfirmed",
+    Refusal::AcknowledgementOwed { .. } => "acknowledgement_owed",
     Refusal::DurabilityUnmet { .. } => "durability_unmet",
     Refusal::GrantIssuerUnverified => "grant_issuer_unverified",
     Refusal::ConsumerNotEnrolled => "consumer_not_enrolled",

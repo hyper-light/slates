@@ -2257,6 +2257,17 @@ pub enum Refusal {
   /// A granted landing's target lease ended before the landing could start — its term passed while it
   /// waited — so nothing was written; retry (AUD-29-03). Appended for append-only evolution.
   LandingLeaseLost,
+  /// The client holds as many unacknowledged completion records on this shard as its bound allows (§4.9
+  /// "Exactly-once": a record is kept until the client acknowledges it): the request was not run and nothing was
+  /// recorded. Acknowledge what the client has received, retry any id it still owes a retry, then send it again.
+  /// A retry of an id already completed and an `Acknowledge` are always served. Appended for append-only
+  /// evolution.
+  AcknowledgementOwed {
+    /// The completion records the client holds unacknowledged on the refusing shard.
+    retained: u64,
+    /// The bound they reached.
+    bound: u64,
+  },
 }
 
 /// The writes a snapshot is known to include (§4.6 "Writeback and snapshot barrier"): every write the

@@ -5744,6 +5744,9 @@ struct Client {
   end: ClientEnd,
   client: u32,
   sequence: u32,
+  /// The highest sequence this client acknowledged: it acknowledges as `slates_client` does, every half ring of
+  /// replies, so its completion records stay under the daemon's bound (§4.9; `AcknowledgementOwed`).
+  acknowledged: u32,
 }
 
 impl Client {
@@ -5763,6 +5766,7 @@ impl Client {
             end: ClientEnd::connected(connected),
             client,
             sequence: 0,
+            acknowledged: 0,
           };
         }
         Err(IpcError::DaemonUnavailable { .. }) if started.elapsed() < CREDIT_WAIT => {
@@ -5791,8 +5795,30 @@ impl Client {
   }
 
   fn call_once(&mut self, body: &RequestBody) -> ReplyBody {
+    self.acknowledge_if_due();
     self.sequence += 1;
     self.send_at(self.sequence, body)
+  }
+
+  /// Acknowledges every reply received so far once half a ring of them is owed, as `slates_client` does (its
+  /// `ack_every`), before the next new request. Only the latest id is ever retried ([`call_retry`](Self::call_retry)),
+  /// and only before another new request, so no retry meets an acknowledged record. A reply other than
+  /// `Acknowledged` (a late reply left in the ring) leaves the mark where it was, to be tried again.
+  fn acknowledge_if_due(&mut self) {
+    let every = u32::try_from(self.end.region().cmd().slots() / 2)
+      .unwrap()
+      .max(1);
+    if self.sequence.saturating_sub(self.acknowledged) < every {
+      return;
+    }
+    let up_to = self.sequence;
+    self.sequence += 1;
+    if matches!(
+      self.send_at(self.sequence, &RequestBody::Acknowledge { up_to }),
+      ReplyBody::Acknowledged
+    ) {
+      self.acknowledged = up_to;
+    }
   }
 
   /// Re-sends the **same** request id as the last [`call`](Self::call) (its sequence is not advanced): a
@@ -5807,6 +5833,7 @@ impl Client {
   /// (a submit whose acceptance waits for a fleet commit, AUD-11). A reply that arrives after the
   /// deadline sits in the ring; [`drain`](Self::drain) discards it before the next call.
   fn try_call(&mut self, body: &RequestBody, deadline_ns: u64) -> Result<ReplyBody, IpcError> {
+    self.acknowledge_if_due();
     self.sequence += 1;
     let id = RequestId {
       client: self.client,

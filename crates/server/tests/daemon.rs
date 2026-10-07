@@ -115,6 +115,94 @@ impl Client {
   }
 }
 
+/// §4.9 "Exactly-once" (RIFL, Lee et al., SOSP 2015: completion records are kept until the client acknowledges them,
+/// and their number is bounded): a client that never acknowledges must not grow a shard's records without bound.
+/// Found 2026-10-07: a fleet test's raw client polled a status for 24 minutes without acknowledging, and the daemon,
+/// whose every snapshot encodes every retained record, stopped answering within the 5 s deadline. Do: as a raw client
+/// that never acknowledges, ask a volume's status again and again, past twice the ring's slots. Expect: a new request
+/// is refused `AcknowledgementOwed` once the bound is reached, never before; a retry of an id already answered is
+/// still answered from its record; and once the client acknowledges, a new request is served again.
+#[test]
+fn a_client_that_never_acknowledges_is_refused_at_its_bound_and_served_once_it_acknowledges() {
+  let (daemon, instance) = daemon("ackbound");
+  let mut client = Client::connect(&instance);
+  let ReplyBody::Created { id: volume } = client.call(&scratch("ackbound")) else {
+    panic!("create");
+  };
+  let slots = u64::try_from(client.end.region().cmd().slots()).unwrap();
+  let bound = 2 * slots;
+  let (served, refusal) = statuses_until_owed(&mut client, volume, (bound + slots) * 2);
+  let Some(Refusal::AcknowledgementOwed {
+    retained,
+    bound: stated,
+  }) = refusal
+  else {
+    daemon.stop();
+    panic!("no AcknowledgementOwed after {served} unacknowledged statuses (bound {bound})");
+  };
+  let after = after_the_refusal(&mut client, volume);
+  daemon.stop();
+  assert_eq!(stated, bound, "the bound is twice the ring's slots");
+  assert!(
+    retained >= bound,
+    "refused only at the bound: {retained} retained"
+  );
+  // Every status records on the volume's owner shard; the create may have recorded there too.
+  assert!(
+    served + 1 >= bound,
+    "served up to the bound, never refused before it: {served}"
+  );
+  assert!(
+    matches!(
+      after,
+      [
+        ReplyBody::Status { .. },
+        ReplyBody::Acknowledged,
+        ReplyBody::Status { .. },
+        ReplyBody::Status { .. }
+      ]
+    ),
+    "a retry answered from its record, the acknowledgement served, then the refused id and a new request \
+     served: {after:?}"
+  );
+}
+
+/// After an `AcknowledgementOwed` refusal of the client's last id: a retry of the id before it (answered), an
+/// acknowledgement up to that id, the refused id again, and a new status.
+fn after_the_refusal(client: &mut Client, volume: VolumeId) -> [ReplyBody; 4] {
+  let refused_id = RequestId {
+    client: client.client,
+    sequence: client.sequence,
+  };
+  let answered_id = RequestId {
+    client: client.client,
+    sequence: client.sequence - 1,
+  };
+  let retried = client.call_as(answered_id, &RequestBody::Status { volume });
+  let acknowledged = client.call(&RequestBody::Acknowledge {
+    up_to: answered_id.sequence,
+  });
+  let again = client.call_as(refused_id, &RequestBody::Status { volume });
+  let fresh = client.call(&RequestBody::Status { volume });
+  [retried, acknowledged, again, fresh]
+}
+
+/// Asks `volume`'s status up to `most` times, never acknowledging: how many were served before the first
+/// `AcknowledgementOwed`, and that refusal.
+fn statuses_until_owed(client: &mut Client, volume: VolumeId, most: u64) -> (u64, Option<Refusal>) {
+  let mut served = 0u64;
+  for _ in 0..most {
+    match client.call(&RequestBody::Status { volume }) {
+      ReplyBody::Status { .. } => served += 1,
+      ReplyBody::Refused {
+        refusal: found @ Refusal::AcknowledgementOwed { .. },
+      } => return (served, Some(found)),
+      other => panic!("status: {other:?}"),
+    }
+  }
+  (served, None)
+}
+
 fn daemon(name: &str) -> (Daemon, String) {
   let profile = common::machine_profile();
   let instance = format!("srv-{name}-{}", std::process::id());

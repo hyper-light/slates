@@ -4317,3 +4317,11 @@ An 8 MiB file was written on `a1` and read back byte-identical there (sha256 `5b
 
   So `volume placed --mirror` refuses `Unsupported { feature: "mirror" }`, and `promote-region` re-homes routing to
   the mirror region without moving any content there. A promoted region's volumes have no copy to serve.
+
+### 2026-10-07: completion records bounded per client (§4.9, banned item 8)
+
+§4.9 requires completion records to have bounds, with exhaustion refusing admission; none was built. A client that
+never acknowledged grew a shard's records, and every snapshot encoding them, without end. A fleet test's raw client
+made a daemon miss a 5 s deadline after 24 minutes of unacknowledged polling. Each shard now holds at most
+`2 × slots` per client and refuses a new request `AcknowledgementOwed` past it
+(`docs/bugs/2026-10-07-a-client-that-never-acknowledged-grew-its-completion-records-without-bound.md`).
