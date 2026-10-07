@@ -4177,9 +4177,16 @@ moment of loss.
 > neighbourhood in the mirror region and recorded `SnapshotPlaced { mirror }` once `f + 1` there hold it, through
 > the ordinary content rounds. A mirror holder admits only a put from a member of the object's standing home region,
 > and only where its own region is that home's declared mirror. `has_mirror` comes from the manifest,
-> `await placed(mirror)` answers the recorded fact, and `mirror_age` is reported per volume. Owed: the mirrored head
-> record and promotion adoption (the promoted region still serves nothing). `docs/wip/mirroring.md` holds the design
-> and the pieces.
+> `await placed(mirror)` answers the recorded fact, and `mirror_age` is reported per volume. Later the same day:
+> - **The records.** The mirrored head and catalog records are held durably at `f + 1` mirror holders, and the
+>   mirror placement waits for them.
+> - **Promotion adoption.** The mirror council's leader asks every member for its mirror records, adopts once all
+>   but `f` answer, and commits each object's successor (`MirrorAdopt`). The successor rebuilds the volume through
+>   the takeover's materialization and serves it. A volume awaited in the mirror is read byte-identical in the mirror
+>   region after its whole home region is lost and promoted.
+>
+> Owed: the loss-window report, `NotPlaced { mirror }` at a deadline, and the two-network proof.
+> `docs/wip/mirroring.md` holds the design and the pieces.
 
 **Failure matrix.** A recorded holder unreachable during fetch: Masked (another recorded holder,
 hedged). All recorded holders unreachable: Refused (`ContentUnavailable{identity}`) for that

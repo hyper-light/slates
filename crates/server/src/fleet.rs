@@ -1385,6 +1385,14 @@ async fn serve_peer_records(
                 })
               })
               .unwrap_or_default(),
+            crate::mirror::MIRROR_PROMISE_STREAM => state::with_state(|s| {
+              let peer_host = s
+                .learned_members
+                .get(&peer_anchor)
+                .map_or(seed, |learned| learned.host);
+              crate::mirror::serve_promise(s, local, peer_host, &request)
+            })
+            .unwrap_or_default(),
             crate::mirror::MIRROR_RECORD_STREAM => state::with_state(|s| {
               let peer_host = s
                 .learned_members
@@ -3077,6 +3085,23 @@ async fn fetch_into_hold(
   .unwrap_or(false)
 }
 
+/// One period of everything this node adopts: each takeover it owes a confirmation of (one batched phase-one round per
+/// retired host across its recovery neighbourhoods, §4.8 "Promotion and takeover"; the holds and rounds arrive over
+/// this shard's sessions), a region promoted to this one (`crate::mirror`: the council leader's phase one and
+/// assignments, then this node's own assigned adoptions), and the content of each adopted head, served from what this
+/// node holds or a recorded holder on the shard the id routes to.
+async fn adopt_and_serve(
+  origin: u16,
+  local: HostId,
+  budget: CommitBudget,
+  in_flight: &mut Vec<Dispatch>,
+) {
+  in_flight.extend(crate::takeover::drive_takeovers(local, budget).await);
+  in_flight.extend(crate::mirror::drive_promotion(local, budget).await);
+  crate::mirror::adopt_assigned(local, budget, in_flight).await;
+  materialize_adopted_objects(origin, budget).await;
+}
+
 /// One period's materialization of everything this node took over: the plain volumes whose heads it
 /// adopted ([`materialize_pending`]), then the greens whose newest merge records it adopted
 /// ([`materialize_pending_greens`]).
@@ -4382,6 +4407,7 @@ pub(crate) async fn send_council_report(
   budget: CommitBudget,
   in_flight: &mut Vec<Dispatch>,
 ) {
+  let request = command.encode();
   let voters = state::with_state(|s| {
     s.count(REPORT_SENT, 1);
     if s.council.is_leader() {
@@ -4395,7 +4421,6 @@ pub(crate) async fn send_council_report(
   if sessions.is_empty() {
     return;
   }
-  let request = command.encode();
   let requests: Vec<(HostId, Vec<u8>, Endpoint)> = sessions
     .into_iter()
     .map(|(host, endpoint)| (host, request.clone(), endpoint))
@@ -5192,8 +5217,10 @@ async fn drive_root_group(
     let wanted =
       state::with_state(|s| s.recovery.root.is_some() || !s.root.initialized() || root_diverges(s))
         .unwrap_or(false);
+
     if wanted {
-      drive_root_learner_fetch(&voters, budget, in_flight).await;
+      let targets = root_learner_targets(&voters, local);
+      drive_root_learner_fetch(&targets, budget, in_flight).await;
     }
     let timing = derive_group_timing(&voters, |s, timing| s.root_timing = timing);
     lapse_learner_lease(Group::Root, timer, contact, &timing, local, rank);
@@ -5358,6 +5385,31 @@ async fn drive_root_election(
   };
   // Phase two — the real vote round over the same sessions.
   drive_vote_round(Group::Root, vote, sessions, budget, in_flight).await;
+}
+
+/// Whom a root learner asks for the committed root configuration: the voters it knows. The voters it last learned
+/// can all be gone (a lost region's representative was the only one it knew) while the leader has moved the voter set
+/// to each live region's representative; with no session to any voter it knows, it asks those representatives
+/// instead, or it never hears the root's later commits (found 2026-10-07: a region-1 learner stayed on the
+/// pre-promotion root for good, its only known voter the dead region-0 representative, 4,269 fetches finding no
+/// session). A learner that knows no voter yet names none, and so asks every session it holds, as it always has.
+fn root_learner_targets(voters: &[HostId], local: HostId) -> Vec<HostId> {
+  let reachable = state::with_state(|s| {
+    voters
+      .iter()
+      .any(|voter| s.record_sessions.contains_key(voter))
+  })
+  .unwrap_or(false);
+  if reachable || voters.is_empty() {
+    return voters.to_vec();
+  }
+  state::with_state(|s| {
+    alive_representatives(s)
+      .into_values()
+      .filter(|host| *host != local)
+      .collect::<Vec<HostId>>()
+  })
+  .unwrap_or_default()
 }
 
 /// Drives a **root learner** one period: fetches the committed root configuration from the root voters it has
@@ -5817,10 +5869,7 @@ async fn run_record_plane(local: HostId) {
     // across its recovery neighbourhoods, adopting each object once its cohorts have promised and confirming
     // the share once done (§4.8 "Promotion and takeover"; the takeover module). The holds and the rounds are
     // this node's (they arrive over this shard's sessions), so this runs here.
-    in_flight.extend(crate::takeover::drive_takeovers(local, budget).await);
-    // Serve the content of each adopted head, from what this node holds or a recorded holder, on the
-    // shard the taken-over id routes to.
-    materialize_adopted_objects(origin, budget).await;
+    adopt_and_serve(origin, local, budget, &mut in_flight).await;
     crate::daemon::pace(HEARTBEAT_NS).await;
   }
 }

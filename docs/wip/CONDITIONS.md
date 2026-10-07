@@ -166,9 +166,10 @@ in the same commit as the work). Last reviewed 2026-10-07 at `89956659`.
     3 % loss (`docs/wip/bench/multiregion/run.sh`). Both regions formed and bootstrapped. The run found and fixed an
     owner lease that lapsed whenever far members stretched the probe round (`GAPS.md` 2026-10-07).
 - **Owed.**
-  - **Cross-region mirroring, in part** (§4.10; `docs/wip/mirroring.md`). Content shipping, `await placed(mirror)`
-    and `mirror_age` are built and proven in-process. The mirrored head record and promotion adoption are owed, so a
-    promoted region still has nothing to serve.
+  - **Cross-region mirroring and promotion are built and proven in-process** (§4.10; `docs/wip/mirroring.md`): a
+    volume awaited in the mirror is read byte-identical in the mirror region after its home region is lost and
+    promoted. Still owed: the loss-window report, `NotPlaced { mirror }` at a deadline, and the two-network run
+    under a shaped router.
   - Cross-region reads are refused `HomedElsewhere` on the two networks (location rounds `unavailable`).
   - The detector's far-link false deaths are fixed in the vendored copy (2026-10-07); the upstream change is owed,
     and the two-network run still has to show it on the real topology.

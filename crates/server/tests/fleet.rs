@@ -4527,6 +4527,122 @@ fn a_placed_snapshot_is_held_whole_by_f_plus_one_hosts_of_the_mirror_region() {
   );
 }
 
+/// AC-8.15's promotion half (§4.10 "region loss promotes the mirror"; `docs/wip/mirroring.md` decision 4): a volume
+/// awaited in the mirror survives the loss of its whole home region, served from the mirror once the operator promotes
+/// it. Three regions, so the root keeps a voter majority without the lost one: region 0 (a, b, c), region 1 (x, y, z),
+/// the mirror of region 0, and region 2 (w). Do: write a file into a volume on a, snapshot it and await its mirror
+/// placement; stop every region-0 daemon and make the survivors hold them dead; promote region 0 through the root
+/// leader. Expect: a client of x reads the file byte-identical, through the successor the mirror council assigned.
+/// Non-vacuous: before mirroring, a promoted region held nothing to serve (`docs/wip/GAPS.md` 2026-10-07).
+#[test]
+fn a_volume_awaited_in_the_mirror_is_served_there_after_its_home_region_is_lost_and_promoted() {
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c", "x", "y", "z", "w"];
+  let n = names.len();
+  let nodes: Vec<(MachineProfile, HostId, Identity)> =
+    names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+    nodes.iter().map(|(_, _, id)| id.certificate()).collect();
+  let (_serve_lease, serve) = mesh_serve_ports(n);
+  let region_of_index = |index: usize| {
+    RegionId(match index {
+      0..=2 => 0,
+      3..=5 => 1,
+      _ => 2,
+    })
+  };
+  let regions: std::collections::BTreeMap<HostId, RegionId> = hosts
+    .iter()
+    .enumerate()
+    .map(|(index, host)| (*host, region_of_index(index)))
+    .collect();
+  let mirrors: std::collections::BTreeMap<RegionId, RegionId> =
+    [(RegionId(0), RegionId(1))].into_iter().collect();
+  let daemons =
+    start_mesh_with_regions_and_mirrors(nodes, &hosts, &certs, &serve, 1, &regions, &mirrors);
+  let instances: Vec<String> = daemons
+    .iter()
+    .map(|daemon| daemon.instance().to_owned())
+    .collect();
+  let hosts: Vec<HostId> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
+  assert_fleet_forms(&daemons, &hosts, &names);
+
+  let mut client_a = Client::connect(&instances[0].clone());
+  let (id, snapshot) = write_and_snapshot(&mut client_a, "promoted");
+  let observed: Vec<&Daemon> = daemons.iter().collect();
+  let mirrored = poll_until(&observed, PLACEMENT_DEADLINE, || {
+    Ok(matches!(
+      client_a.call(&RequestBody::AwaitPlaced {
+        volume: id,
+        snapshot: Some(snapshot),
+        scope: Scope::Mirror,
+      }),
+      ReplyBody::Placed { placed: true, .. }
+    ))
+  });
+  drop(client_a);
+  let mut daemons = daemons;
+  let survivors: Vec<Daemon> = daemons.split_off(3);
+  for lost in daemons {
+    lost.stop();
+  }
+  for dead in &hosts[..3] {
+    inject_death_into(survivors.iter(), *dead);
+  }
+  let observed: Vec<&Daemon> = survivors.iter().collect();
+  let promoted = poll_until(&observed, COUNCIL_RETIRE_DEADLINE, || {
+    if let Some(leader) = survivors
+      .iter()
+      .find(|daemon| daemon.root_leads() == Ok(true))
+    {
+      // Re-issued each ask: leadership can move between finding the leader and the commit.
+      let _ = leader.promote_region(RegionId(0));
+    }
+    all_hold(survivors.iter().map(|daemon| {
+      daemon
+        .region_home(ObjectId(id.bytes), RegionId(0))
+        .map(|home| home == RegionId(1))
+    }))
+  });
+  let mut client_x = Client::connect(&instances[3].clone());
+  let mut last = None;
+  let served = promoted
+    && poll_until(&observed, COUNCIL_RETIRE_DEADLINE, || {
+      let reply = client_x.call(&RequestBody::Read {
+        volume: id,
+        path: "/hello".to_owned(),
+        at: ReadAt::Head,
+      });
+      let served =
+        matches!(&reply, ReplyBody::ReadBytes { bytes } if bytes == b"hello across regions");
+      last = Some(reply);
+      Ok(served)
+    });
+  // Non-vacuous: the volume reached x through the mirror council's adoption, not another path.
+  let seeded: u64 = survivors
+    .iter()
+    .filter_map(|daemon| daemon.fleet_refusals_within(LIVENESS_BUDGET_NS).ok())
+    .filter_map(|refusals| refusals.get("fleet.mirror.promotion_seeded").copied())
+    .sum();
+  for daemon in survivors {
+    daemon.stop();
+  }
+  assert!(
+    mirrored,
+    "the snapshot was awaited in the mirror before the loss"
+  );
+  assert!(seeded > 0, "a mirror-region successor seeded the adoption");
+  assert!(promoted, "the root promoted region 0 to its mirror");
+  assert!(
+    served,
+    "a client of the mirror region read the file its home region wrote (last reply: {last:?})"
+  );
+}
+
 /// Creates a volume through `client`, writes one file into it under a write attachment, and snapshots it: the
 /// volume and the snapshot.
 fn write_and_snapshot(client: &mut Client, name: &str) -> (VolumeId, SnapshotId) {
@@ -6348,6 +6464,9 @@ fn three_daemons_take_over_a_dead_owners_head() {
     .fleet_holder_head(object.catalog())
     .ok()
     .flatten();
+  // On a failed takeover, both survivors' counters say which step stalled (it has failed only inside slowed full
+  // suites, never alone: docs/wip/GAPS.md 2026-10-07).
+  print_takeover_counters(&daemons, successor_index, served && catalog_served);
 
   for daemon in daemons {
     daemon.stop();
@@ -6373,6 +6492,21 @@ fn three_daemons_take_over_a_dead_owners_head() {
     catalog.name, "taken-over",
     "the taken-over catalog survived the promotion and re-commit"
   );
+}
+
+/// Prints each survivor's refusal counters after a takeover that did not complete (`completed` false): which step
+/// stalled.
+fn print_takeover_counters(survivors: &[Daemon], successor_index: usize, completed: bool) {
+  if completed {
+    return;
+  }
+  for (index, daemon) in survivors.iter().enumerate() {
+    eprintln!(
+      "takeover survivor {index} (successor {}): {:?}",
+      index == successor_index,
+      daemon.fleet_refusals_within(LIVENESS_BUDGET_NS)
+    );
+  }
 }
 
 /// Polls until every survivor in `survivors` holds `object`'s head as a candidate holder

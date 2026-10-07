@@ -4335,3 +4335,19 @@ A warm restart keeps the member id but dropped every held register record and fe
 restarted holder's empty promise and lose a committed head. A-51's statement that records survived was wrong. Records
 and fences now ride the held image and are published before the acknowledgement and before a promise
 (`docs/bugs/2026-10-07-a-warm-restart-dropped-held-register-records.md`).
+
+### 2026-10-07: promotion adoption built; root learners followed only the voters they knew
+
+- **Built:** a promoted region serves its mirror's copies (`docs/wip/mirroring.md` M4). The mirror council's
+  leader runs phase one over its members and commits each object's successor; the successor rebuilds and serves
+  it. Proven in-process across three regions with the home region lost.
+- **Fixed on the way:** a root learner whose only known voter died never fetched the root's later commits, so it
+  never followed the promotion
+  (`docs/bugs/2026-10-07-a-root-learner-never-heard-commits-after-its-only-known-voter-died.md`).
+- **Owed:** the loss-window report, `NotPlaced { mirror }` at a deadline, and the two-network run (M5).
+
+**Open (2026-10-07): `three_daemons_take_over_a_dead_owners_head` failed in 2 of the last 4 full fleet suites.** Both
+were slowed runs (1,136 s and 1,170 s, 43–55 tests over 60 s, other sessions' load near 45). It has never failed
+otherwise: alone 6 of 6, four concurrent copies 8 of 8 at load 34–45, and after the mirror tests in one process 2 of 2.
+The test now prints both survivors' refusal counters when the takeover does not complete, so the next failure says
+which step stalled. Not yet attributed, to the session's changes or to the load.

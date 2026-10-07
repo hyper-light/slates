@@ -158,8 +158,26 @@ What the mirror did not receive is the loss window; the status reports it per vo
    - The mirror placement is recorded only once `f + 1` hold both the content and the records.
    - Fleet test: `f + 1` mirror holders hold the head record naming them, 3 of 3.
 
-   Still to build: the leader's phase one, the council's `MirrorAdopt` and `MirrorAdopted` entries, and the
-   successor's materialization. The head record naming the mirror holders is committed
+   Built later the same day: the adoption itself.
+   - **Council state.** `RegionalConfiguration::adoptions`, with `ConfigCommand::MirrorAdopt` and `MirrorAdopted`;
+     both are in the wire codec and in the council's oracle.
+   - **Phase one.** The leader's round runs on `MIRROR_PROMISE_STREAM`, paged by `takeover::page_budget`. A member
+     answers only once it has installed the promotion.
+   - **The decision.** Once all members but `f` have answered completely, the leader picks each object's successor
+     by rendezvous among the council members its newest head names, and proposes the assignments, a page budget a
+     period.
+   - **The successor.** It seeds home takeover's materialization queue (head and catalog placements, catalog, head),
+     takes ownership once the volume is built, then reports `MirrorAdopted`.
+
+   Fleet test (AC-8.15): `a_volume_awaited_in_the_mirror_is_served_there_after_its_home_region_is_lost_and_promoted`.
+   Three regions, region 0 lost and promoted; a client of region 1 reads the file byte-identical. It passed 4 of 4
+   (5.4–6.4 s). Along the way, root learners that knew only a dead voter were found to never hear the promotion
+   (`docs/bugs/2026-10-07-a-root-learner-never-heard-commits-after-its-only-known-voter-died.md`).
+
+   Still owed:
+   - the loss-window report;
+   - `NotPlaced { mirror }` at a wait's deadline;
+   - the two-network proof (M5). The head record naming the mirror holders is committed
    at `f + 1` of them, under the mirror rule's authority. Promotion then runs the per-host takeover in the mirror
    region. Fleet test (AC-8.15): region 0 killed and promoted, the snapshot's bytes read from region 1, and an
    operation that awaited the mirror intact.

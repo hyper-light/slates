@@ -663,6 +663,12 @@ pub struct ShardState {
   /// object's newest head and catalog record, kept on the control shard and published in its held image before
   /// a shipment is acknowledged. What a promotion's phase one reads. Empty outside a mirror region.
   pub mirror_records: slates_db::mirror::MirrorRecords,
+  /// The promotion rounds this node leads as its council's leader, by lost region (`crate::mirror`). Bounded by the
+  /// regions promoted to this one.
+  pub(crate) mirror_rounds: BTreeMap<slates_db::register::RegionId, crate::mirror::PromotionRound>,
+  /// The promoted objects assigned to this node that it has seeded into its materialization queue, until their
+  /// assignment is dropped (`crate::mirror`). Bounded by the council's adoptions.
+  pub(crate) mirror_seeded: std::collections::BTreeSet<ObjectId>,
   /// The measured put latency of this node's **content class** (§4.8 "Derived constants": "hedge delay =
   /// measured p95 put latency per class"): one reading per binding content acknowledgement this owner
   /// shard has collected — the time from the round's dispatch to that holder's verified acknowledgement.

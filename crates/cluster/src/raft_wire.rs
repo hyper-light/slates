@@ -12,7 +12,7 @@
 use std::mem::size_of;
 
 use slates_db::register::{
-  DomainId, HostEpoch, HostId, Neighbourhood, OBJECT_BYTES, ObjectId, Quorum, RegionId,
+  Adoption, DomainId, HostEpoch, HostId, Neighbourhood, OBJECT_BYTES, ObjectId, Quorum, RegionId,
   RegionalConfiguration, Retirement, RootConfiguration, Settled,
 };
 use slates_transport::connection::Priority;
@@ -748,7 +748,41 @@ pub fn encode_regional_configuration(config: &RegionalConfiguration) -> Vec<u8> 
     encode_hosts(&mut out, &retirement.confirmed);
     encode_hosts(&mut out, &retirement.unconfirmed);
   }
+  put_u32(
+    &mut out,
+    u32::try_from(config.adoptions.len()).unwrap_or(u32::MAX),
+  );
+  for (object, adoption) in &config.adoptions {
+    out.extend_from_slice(&object.0);
+    put_u64(&mut out, adoption.successor.0);
+    put_bytes(&mut out, &adoption.head);
+    put_bytes(&mut out, &adoption.catalog);
+  }
   out
+}
+
+/// Decodes the adoptions map (count, then each `(object, successor, head, catalog)`), bounding the count.
+fn decode_adoptions(
+  bytes: &[u8],
+) -> Result<(std::collections::BTreeMap<ObjectId, Adoption>, &[u8]), RaftWireError> {
+  let (count, mut rest) = take_count(bytes)?;
+  let mut adoptions = std::collections::BTreeMap::new();
+  for _ in 0..count {
+    let (object, tail) = take_object(rest)?;
+    let (successor, tail) = take_u64(tail)?;
+    let (head, tail) = take_bytes(tail)?;
+    let (catalog, tail) = take_bytes(tail)?;
+    adoptions.insert(
+      object,
+      Adoption {
+        successor: HostId(successor),
+        head,
+        catalog,
+      },
+    );
+    rest = tail;
+  }
+  Ok((adoptions, rest))
 }
 
 /// Encodes a domains map: its count, then each `(host, domain)`.
@@ -839,6 +873,7 @@ pub fn decode_regional_configuration(bytes: &[u8]) -> Result<RegionalConfigurati
   let (domains, rest) = decode_domains(rest)?;
   let (settled, rest) = decode_settled_map(rest)?;
   let (retired, rest) = decode_retired(rest)?;
+  let (adoptions, rest) = decode_adoptions(rest)?;
   expect_end(rest)?;
   Ok(RegionalConfiguration {
     version,
@@ -850,6 +885,7 @@ pub fn decode_regional_configuration(bytes: &[u8]) -> Result<RegionalConfigurati
     has_mirror,
     settled,
     retired,
+    adoptions,
   })
 }
 
@@ -1719,8 +1755,23 @@ mod tests {
     let bytes = encode_regional_configuration(&config);
     assert_eq!(
       decode_regional_configuration(&bytes),
-      Ok(config),
+      Ok(config.clone()),
       "round-trip is identity with retirements and a change in flight"
+    );
+    // A promoted object's adoption in flight (docs/wip/mirroring.md decision 4) survives it too.
+    assert!(config.assign_adoption(
+      ObjectId::new(HostId(77), 5),
+      Adoption {
+        successor: B,
+        head: vec![1, 2, 3],
+        catalog: vec![4],
+      },
+    ));
+    let bytes = encode_regional_configuration(&config);
+    assert_eq!(
+      decode_regional_configuration(&bytes),
+      Ok(config),
+      "round-trip is identity with an adoption in flight"
     );
   }
 
@@ -1740,7 +1791,8 @@ mod tests {
     let bytes = encode_regional_configuration(&config);
     // The last retirement ends with its confirmed ids (a count, none here) and its unconfirmed ids (a count,
     // none here): make the confirmed count claim every id there is.
-    let confirmed_count_at = bytes.len() - 2 * size_of::<u32>();
+    // The adoptions' count (none here) follows the last retirement.
+    let confirmed_count_at = bytes.len() - 3 * size_of::<u32>();
     let mut lying = bytes.clone();
     lying[confirmed_count_at..confirmed_count_at + size_of::<u32>()]
       .copy_from_slice(&u32::MAX.to_le_bytes());
@@ -1749,7 +1801,7 @@ mod tests {
       Err(RaftWireError::LengthMismatch),
       "a count beyond the bytes is refused"
     );
-    for cut in 1..=2 * size_of::<u32>() {
+    for cut in 1..=3 * size_of::<u32>() {
       assert!(
         decode_regional_configuration(&bytes[..bytes.len() - cut]).is_err(),
         "a configuration cut {cut} bytes short is refused"

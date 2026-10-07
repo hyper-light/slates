@@ -2142,6 +2142,23 @@ pub struct RegionalConfiguration {
   /// confirmed that share ([`confirm`](RegionalConfiguration::confirm)), and never more than
   /// [`retirement_bound`](RegionalConfiguration::retirement_bound) of them.
   pub retired: std::collections::BTreeMap<HostId, Retirement>,
+  /// The promoted objects this region adopts from the region it mirrors (§4.10 "region loss promotes the mirror";
+  /// `docs/wip/mirroring.md` decision 4): each object's agreed successor, with the head and catalog records it adopts.
+  /// An entry is assigned by the council leader after its phase one and dropped once its successor reports it serves
+  /// the object ([`adopted`](RegionalConfiguration::adopted)), so it holds only adoptions in flight.
+  pub adoptions: std::collections::BTreeMap<ObjectId, Adoption>,
+}
+
+/// One promoted object's adoption in the mirror region (`docs/wip/mirroring.md` decision 4): the member that adopts it,
+/// and the newest head and catalog records phase one found for it, each an encoded [`Record`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Adoption {
+  /// The member that adopts and serves the object.
+  pub successor: HostId,
+  /// The adopted head record.
+  pub head: Vec<u8>,
+  /// The adopted catalog record.
+  pub catalog: Vec<u8>,
 }
 
 impl RegionalConfiguration {
@@ -2168,6 +2185,7 @@ impl RegionalConfiguration {
       has_mirror,
       settled: std::collections::BTreeMap::new(),
       retired: std::collections::BTreeMap::new(),
+      adoptions: std::collections::BTreeMap::new(),
     };
     config.fix_neighbourhoods(scatter);
     // A formed region owns nothing yet: every member's first neighbourhood is already settled.
@@ -2391,6 +2409,48 @@ impl RegionalConfiguration {
     self.version = version;
     self.prune_retirements();
     true
+  }
+
+  /// Assigns `object`'s adoption to `adoption.successor` (`docs/wip/mirroring.md` decision 4): only to a member, and
+  /// only where it changes what is assigned. Returns whether the configuration changed.
+  pub fn assign_adoption(&mut self, object: ObjectId, adoption: Adoption) -> bool {
+    if !self.assigns(object, &adoption) {
+      return false;
+    }
+    let Some(version) = self.version.checked_add(1) else {
+      return false;
+    };
+    self.adoptions.insert(object, adoption);
+    self.version = version;
+    true
+  }
+
+  /// Whether assigning `adoption` to `object` would change the configuration: its successor is a member, and the
+  /// object is not already assigned exactly so.
+  pub fn assigns(&self, object: ObjectId, adoption: &Adoption) -> bool {
+    self.members.contains(&adoption.successor) && self.adoptions.get(&object) != Some(adoption)
+  }
+
+  /// Drops `object`'s adoption once its successor reports it serves the object. Only the assigned successor's report
+  /// changes anything. Returns whether the configuration changed.
+  pub fn adopted(&mut self, object: ObjectId, successor: HostId) -> bool {
+    if !self.owes_adopted(object, successor) {
+      return false;
+    }
+    let Some(version) = self.version.checked_add(1) else {
+      return false;
+    };
+    self.adoptions.remove(&object);
+    self.version = version;
+    true
+  }
+
+  /// Whether `object` is assigned to `successor` and not yet reported adopted.
+  pub fn owes_adopted(&self, object: ObjectId, successor: HostId) -> bool {
+    self
+      .adoptions
+      .get(&object)
+      .is_some_and(|adoption| adoption.successor == successor)
   }
 
   /// Whether `host` still owes a confirmation of its share of `departed`'s takeover: `departed`'s retirement is
@@ -2732,6 +2792,40 @@ impl RootConfiguration {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  /// docs/wip/mirroring.md decision 4. Do: assign a promoted object's adoption to a member and to a non-member, report
+  /// it adopted by another member, then by its successor. Expect: only the member's assignment and only its own
+  /// report change the configuration, each advancing the version, and the adopted entry is gone.
+  #[test]
+  fn an_adoption_is_assigned_to_a_member_and_dropped_only_by_its_successor() {
+    let (a, b, c) = (HostId(1), HostId(2), HostId(3));
+    let mut config =
+      RegionalConfiguration::formed(vec![a, b, c], Quorum { f: 1 }, Default::default(), 3, true);
+    let object = ObjectId::new(HostId(90), 1);
+    let adoption = |successor| Adoption {
+      successor,
+      head: vec![7],
+      catalog: vec![8],
+    };
+    assert!(
+      !config.assign_adoption(object, adoption(HostId(99))),
+      "a non-member is assigned nothing"
+    );
+    let version = config.version;
+    assert!(config.assign_adoption(object, adoption(b)));
+    assert_eq!(config.version, version + 1);
+    assert!(
+      !config.assign_adoption(object, adoption(b)),
+      "the same assignment changes nothing"
+    );
+    assert!(
+      !config.adopted(object, c),
+      "another member's report changes nothing"
+    );
+    assert!(config.adopted(object, b));
+    assert!(config.adoptions.is_empty());
+    assert_eq!(config.version, version + 2);
+  }
 
   /// A record authorized under `config`, at `object`/`sequence` and host `epoch`, carrying `value`.
   fn record_under(

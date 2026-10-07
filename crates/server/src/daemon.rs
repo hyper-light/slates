@@ -2980,6 +2980,8 @@ fn init_shard(
     mirror_seals: std::collections::BTreeMap::new(),
     mirror_neighbourhood: Vec::new(),
     mirror_records: slates_db::mirror::MirrorRecords::new(),
+    mirror_rounds: std::collections::BTreeMap::new(),
+    mirror_seeded: std::collections::BTreeSet::new(),
     put_latency: crate::fleet::LatencyWindow::default(),
     fetch_latency: crate::fleet::LatencyWindow::default(),
     put_outcomes: crate::fleet::PutOutcomes::default(),
