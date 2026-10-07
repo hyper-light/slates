@@ -1059,7 +1059,7 @@ impl PeerDriver {
       stale: false,
       seed_retired: false,
     };
-    let _ = state::with_state(|s| s.plane.peers.insert(peer.anchor, plane_peer));
+    let _ = state::with_state_counted(|s| s.plane.peers.insert(peer.anchor, plane_peer));
     let record = PeerDial {
       anchor: peer.anchor,
       host: peer.host,
@@ -4375,7 +4375,7 @@ fn voters_out(others: &[HostId], taken: &[(HostId, Endpoint)]) -> Vec<HostId> {
 /// Counts a campaign's session take: the voters awaited ([`ELECTION_SESSION_AWAITED`]), and each voter left
 /// unasked by why.
 fn count_campaign_sessions(others: &[HostId], taken: &[(HostId, Endpoint)], awaited: usize) {
-  let _ = state::with_state(|s| {
+  let _ = state::with_state_counted(|s| {
     if awaited > 0 {
       let count = s.refusals.entry(ELECTION_SESSION_AWAITED).or_insert(0);
       *count = count.saturating_add(u64::try_from(awaited).unwrap_or(u64::MAX));
@@ -4679,10 +4679,10 @@ fn lapse_learner_lease(
   match timer.follower_period(contact, timing, local, rank) {
     FollowerStep::Follow => {}
     FollowerStep::LeaderLapsed => {
-      let _ = state::with_state(|s| group.forget_leader(s));
+      let _ = state::with_state_counted(|s| group.forget_leader(s));
     }
     FollowerStep::Campaign => {
-      let _ = state::with_state(|s| group.forget_leader(s));
+      let _ = state::with_state_counted(|s| group.forget_leader(s));
       timer.rebaseline(contact);
     }
   }
@@ -4761,7 +4761,7 @@ async fn drive_config_council(
     .unwrap_or(false);
     if wanted {
       drive_learner_fetch(&voters, budget, in_flight).await;
-      let _ = state::with_state(|s| s.config_refresh_wanted = false);
+      let _ = state::with_state_counted(|s| s.config_refresh_wanted = false);
     }
     let timing = derive_group_timing(&voters, |s, timing| s.council_timing = timing);
     lapse_learner_lease(Group::Council, timer, contact, &timing, local, rank);
@@ -4791,7 +4791,7 @@ async fn drive_config_council(
   }
   if others.is_empty() {
     // The sole voter (a one-node council, the fleet degenerate): self-elect, then it leads next period.
-    let _ = state::with_state(|s| s.council.election_timeout());
+    let _ = state::with_state_counted(|s| s.council.election_timeout());
     timer.reset();
     return;
   }
@@ -4808,7 +4808,7 @@ async fn drive_config_council(
       }
     }
     FollowerStep::LeaderLapsed => {
-      let _ = state::with_state(|s| s.council.forget_leader());
+      let _ = state::with_state_counted(|s| s.council.forget_leader());
     }
     FollowerStep::Follow => {}
   }
@@ -4939,7 +4939,7 @@ async fn drive_root_group(
   }
   if others.is_empty() {
     // The sole root voter (a single-region fleet's degenerate): self-elect, then it leads next period.
-    let _ = state::with_state(|s| s.root.election_timeout());
+    let _ = state::with_state_counted(|s| s.root.election_timeout());
     timer.reset();
     return;
   }
@@ -4954,7 +4954,7 @@ async fn drive_root_group(
       }
     }
     FollowerStep::LeaderLapsed => {
-      let _ = state::with_state(|s| s.root.forget_leader());
+      let _ = state::with_state_counted(|s| s.root.forget_leader());
     }
     FollowerStep::Follow => {}
   }
@@ -5331,13 +5331,13 @@ fn fan_configs_to_shards(origin: u16, shards: &[u16]) {
       crate::lease_wait::resolve(s);
     }) {
       Ok(()) => {
-        let _ = state::with_state(|s| {
+        let _ = state::with_state_counted(|s| {
           s.fanned.record(shard, delivered);
           count_refusal_in(s, FAN_SENT);
         });
       }
       Err(_) => {
-        let _ = state::with_state(|s| count_refusal_in(s, FAN_REFUSED));
+        let _ = state::with_state_counted(|s| count_refusal_in(s, FAN_REFUSED));
       }
     }
   }
@@ -5878,7 +5878,7 @@ async fn ship_head(
   // so the coordinator fetches the committed configuration next period; the head stays unplaced and re-ships
   // under the refreshed generation. Gated on the version being strictly newer than what this node now holds.
   if let Some(version) = committed.stale_version {
-    let _ = state::with_state(|s| {
+    let _ = state::with_state_counted(|s| {
       if version > s.council.configuration().version {
         s.config_refresh_wanted = true;
       }

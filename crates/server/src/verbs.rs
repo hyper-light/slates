@@ -1970,6 +1970,11 @@ pub fn shard_report(state: &mut ShardState) -> ShardReport {
           (CONTENT_SEAL_REFUSED, state.store.content.seal_refusals()),
           (CONTENT_FREE_REFUSED, state.store.content.free_refusals()),
           (STORE_RELEASE_REFUSED, state.store.release_refusals),
+          (STATE_BORROW_REFUSED, crate::state::lost_steps().borrowed),
+          (
+            STATE_RETENTION_REFUSED,
+            crate::state::lost_steps().retention,
+          ),
         ]
         .into_iter()
         .filter(|(_, count)| *count > 0)
@@ -8052,6 +8057,12 @@ pub(crate) const CONTENT_FREE_REFUSED: &str = "content.free_refused";
 /// Format: the status counter of retired objects whose release the store refused (listed twice, or a free refused).
 pub(crate) const STORE_RELEASE_REFUSED: &str = "store.release_refused";
 
+/// Format: the status counter of nested state borrows on this shard (a step that never ran, `state::with_state_counted`).
+pub(crate) const STATE_BORROW_REFUSED: &str = "state.borrow_refused";
+
+/// Format: the status counter of retention checks refused after a counted borrow ran (`state::with_state_counted`).
+pub(crate) const STATE_RETENTION_REFUSED: &str = "state.retention_refused";
+
 /// Publishes when the shard's arena is short of room only because freed blocks wait on a publication (A-64): a
 /// block the committed recovery image may name is not reused until a newer image commits. Run before each unit of
 /// work — a transport request on a volume, a verb — so an operation within the operation headroom (the derived
@@ -8904,6 +8915,20 @@ mod tests {
       len: end - start,
     };
     super::ShardImage::read_from(&slots).unwrap().unwrap()
+  }
+
+  /// A step lost to a borrow is counted, never silent (2026-10-07). Do: on a shard, while the shard's state is borrowed
+  /// (an observation runs inside the borrow), ask for a counted borrow. Expect: it refused (`None`), and this shard's
+  /// nested-borrow count moved by one. Before, 57 call sites discarded such a refusal and the step was lost unseen.
+  #[test]
+  fn a_nested_borrow_is_counted() {
+    let (before, refused, after) = crate::daemon::audit_on_shard(|_state| {
+      let before = crate::state::lost_steps().borrowed;
+      let refused = crate::state::with_state_counted(|_| ()).is_none();
+      (before, refused, crate::state::lost_steps().borrowed)
+    });
+    assert!(refused, "a nested borrow is refused");
+    assert_eq!(after, before + 1, "and counted");
   }
 
   /// AUD-29-43, the laptop degenerate (R8): a destroy's tombstone is owed only to remote candidate holders, and

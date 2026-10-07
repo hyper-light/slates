@@ -397,7 +397,7 @@ where
       if reply_sender.send(answer).is_err() {
         // The asker's wait ended first: the answer is late, discarded, and counted on the shard's
         // ledger while its state is there to count on.
-        let _ = state::with_state(|s| s.count(OBSERVE_LATE_REPLY, 1));
+        let _ = state::with_state_counted(|s| s.count(OBSERVE_LATE_REPLY, 1));
       }
     });
     let receipt = match submitted {

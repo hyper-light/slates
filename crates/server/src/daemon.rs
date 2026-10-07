@@ -3051,7 +3051,7 @@ async fn seal_idle_content() {
   let deferred =
     state::with_state(|s| s.store.content.arena().deferred_bytes() > 0).unwrap_or(false);
   if sealed_this_tick > 0 || deferred {
-    let _ = state::with_state(crate::verbs::publish_shard);
+    let _ = state::with_state_counted(crate::verbs::publish_shard);
     return;
   }
   purge_if_idle().await;

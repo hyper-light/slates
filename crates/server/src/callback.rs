@@ -95,7 +95,7 @@ pub(crate) fn register() -> Option<u64> {
 
 /// Ends a connection: its outbox and the sessions it carried go, and every callback waiting on it fails `Lost`.
 pub(crate) fn unregister(connection: u64) {
-  let _ = state::with_state(|s| {
+  let _ = state::with_state_counted(|s| {
     let table = &mut s.callbacks;
     table.outboxes.remove(&connection);
     table.carriers.retain(|_, carrier| *carrier != connection);
@@ -112,7 +112,7 @@ pub(crate) fn unregister(connection: u64) {
 
 /// Binds `connection` as the carrier of `sessionid`'s back channel (the connection its compounds arrive on).
 pub(crate) fn carry(sessionid: SessionId, connection: u64) {
-  let _ = state::with_state(|s| {
+  let _ = state::with_state_counted(|s| {
     if s.callbacks.outboxes.contains_key(&connection) {
       s.callbacks.carriers.insert(sessionid, connection);
     }
@@ -149,7 +149,7 @@ pub(crate) fn deliver(body: &[u8]) {
     return;
   };
   let outcome = accepted_results(&mut reader).ok_or(CallbackError::Refused);
-  let _ = state::with_state(|s| match s.callbacks.pending.get_mut(&xid) {
+  let _ = state::with_state_counted(|s| match s.callbacks.pending.get_mut(&xid) {
     Some(pending) if pending.reply.is_none() => {
       pending.reply = Some(outcome);
       if let Some(waker) = pending.waker.take() {
@@ -218,7 +218,7 @@ pub(crate) async fn call(
     if !delayed || elapsed.saturating_add(DELAY_RETRY_NS) >= deadline_ns {
       return Ok(results);
     }
-    let _ = state::with_state(|s| s.count(CALLBACK_DELAYED, 1));
+    let _ = state::with_state_counted(|s| s.count(CALLBACK_DELAYED, 1));
     if slates_rt::futures::sleep(DELAY_RETRY_NS).await.is_err() {
       return Ok(results);
     }
@@ -254,7 +254,7 @@ async fn call_once(
     }),
   )
   .await;
-  let _ = state::with_state(|s| s.callbacks.pending.remove(&xid));
+  let _ = state::with_state_counted(|s| s.callbacks.pending.remove(&xid));
   match waited {
     Ok(Some(reply)) => reply,
     Ok(None) => Err(CallbackError::Timeout),

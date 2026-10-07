@@ -109,7 +109,7 @@ fn spawn_recall(
     .ok()
     .and_then(|results| callback::status(&results))
       == Some(slates_bridge_nfs::v4::Nfsstat4::Ok as u32);
-    let _ = state::with_state(|s| {
+    let _ = state::with_state_counted(|s| {
       let counter = if answered {
         RECALL_ANSWERED
       } else {
@@ -123,7 +123,7 @@ fn spawn_recall(
       let _ = futures::detach(task);
     }
     Err(_) => {
-      let _ = state::with_state(|s| s.count(RECALL_UNANSWERED, 1));
+      let _ = state::with_state_counted(|s| s.count(RECALL_UNANSWERED, 1));
     }
   }
 }

@@ -962,7 +962,7 @@ async fn recall_before_finish(granted: &mut GrantedRun, renew: LeaseAsk, key: &s
     let until = *deadline.get_or_insert(now.saturating_add(lease).saturating_add(1));
     if now >= until {
       // The lease passed: the drain revokes what lapsed, and the finish runs over what is left.
-      let _ = crate::state::with_state(crate::delegation::drain);
+      let _ = crate::state::with_state_counted(crate::delegation::drain);
       return;
     }
     let parked = slates_rt::futures::within(

@@ -123,7 +123,7 @@ struct ShardBridge {
 /// Closes device `attachment`'s snapshot view, if it has one, and removes its record, if it has one (its loop's
 /// end, or a refusal); a refused removal is counted.
 fn close_device(attachment: u64) {
-  let _ = state::with_state(|s| {
+  let _ = state::with_state_counted(|s| {
     crate::snapshot_view::end(s, attachment);
     if let Some(record) = s.db.partition().attachment(attachment).cloned()
       && crate::verbs::end_attachment(s, &record, crate::verbs::Ending::Otherwise).is_err()
@@ -349,7 +349,7 @@ async fn serve_guest_device<S: VmmSeam + Send + 'static>(
           .unwrap_or(Err(ReclaimError::VolumeGone)),
       };
       if !reclaimed.is_ok_and(|r| r.references_swept) {
-        let _ = state::with_state(|s| s.count(RECLAIM_INCOMPLETE, 1));
+        let _ = state::with_state_counted(|s| s.count(RECLAIM_INCOMPLETE, 1));
       }
       close_device(attachment);
       on_end(outcome);
@@ -358,11 +358,11 @@ async fn serve_guest_device<S: VmmSeam + Send + 'static>(
   };
   // The device is known to its consumer's revocation and to its record's detach for as long as its loop runs
   // (AUD-29-73).
-  let _ = state::with_state(|s| s.guest_devices.push((id, consumer, attachment)));
+  let _ = state::with_state_counted(|s| s.guest_devices.push((id, consumer, attachment)));
   on_admitted(attachment);
   let end = serve_loop(id, admitted, bridge).await;
   // The loop's terminal step has swept the device's references; now its record and view end.
-  let _ = state::with_state(|s| s.guest_devices.retain(|(device, _, _)| *device != id));
+  let _ = state::with_state_counted(|s| s.guest_devices.retain(|(device, _, _)| *device != id));
   close_device(attachment);
   on_end(GuestDeviceOutcome::Ended(end));
 }

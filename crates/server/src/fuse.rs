@@ -218,7 +218,7 @@ pub(crate) fn defer_attach(state: &mut ShardState, pending: PendingAttach) -> Re
       (deadline_ns, shared, read_only),
     )
     .await;
-    let _ = state::with_state(move |s| {
+    let _ = state::with_state_counted(move |s| {
       let attachment = pending.record.id;
       let reply = complete(s, request, cause, attachment, |s| match mounted {
         Ok(mount) => established(s, pending, mount),
@@ -468,7 +468,7 @@ async fn serve(attachment: u64) {
       return;
     };
     if slates_rt::readiness::readable(raw).await.is_err() {
-      let _ = state::with_state(|s| fail(s, attachment));
+      let _ = state::with_state_counted(|s| fail(s, attachment));
       return;
     }
     loop {
@@ -481,7 +481,7 @@ async fn serve(attachment: u64) {
           // wake (uncached lookup median 23 µs → about 60 µs, p90 33 → 200 µs, Linux 6.12, 2026-10-06).
           slates_rt::registry::with_current(|ctx| ctx.note_activity());
           // A change this request was refused for a delegation asked for a recall; it is sent now (A-79).
-          let _ = state::with_state(crate::delegation::drain);
+          let _ = state::with_state_counted(crate::delegation::drain);
           let _ = futures::yield_now().await;
         }
         Some(Turned::Fenced) => {
@@ -491,7 +491,7 @@ async fn serve(attachment: u64) {
           break;
         }
         Some(Turned::Ended) | None => {
-          let _ = state::with_state(|s| ended(s, attachment));
+          let _ = state::with_state_counted(|s| ended(s, attachment));
           return;
         }
       }
@@ -818,7 +818,7 @@ pub(crate) fn adopt_held() {
     let _ = crate::fuse_hold::release(held.attachment);
   }
   for (record, held) in kept {
-    let _ = state::with_state(move |s| adopt_one(s, record, held));
+    let _ = state::with_state_counted(move |s| adopt_one(s, record, held));
   }
 }
 
@@ -957,7 +957,7 @@ pub(crate) fn leave_stale() {
     return;
   }
   let Ok(table) = slates_bridge_oci::mount_table::mount_table() else {
-    let _ = state::with_state(|s| s.count(UNMOUNT_REFUSED, 1));
+    let _ = state::with_state_counted(|s| s.count(UNMOUNT_REFUSED, 1));
     return;
   };
   let left = stale
@@ -969,7 +969,7 @@ pub(crate) fn leave_stale() {
         .any(|m| &m.mount_point == point && m.fstype == FUSE_TYPE && m.source == source)
     })
     .count();
-  let _ = state::with_state(|s| {
+  let _ = state::with_state_counted(|s| {
     let count = s.refusals.entry(DEAD_MOUNT_LEFT).or_insert(0);
     *count = count.saturating_add(u64::try_from(left).unwrap_or(u64::MAX));
   });
@@ -985,14 +985,14 @@ const FUSE_TYPE: &str = "fuse.slates";
 /// polling at the heartbeat's tick (bounded by the failover bound; the helper is killed and reaped past it).
 fn unmount_owned(mount_point: &str) {
   let Ok(pending) = begin_unmount(mount_point) else {
-    let _ = state::with_state(|s| s.count(UNMOUNT_REFUSED, 1));
+    let _ = state::with_state_counted(|s| s.count(UNMOUNT_REFUSED, 1));
     return;
   };
   if futures::spawn(reap(pending))
     .and_then(futures::detach)
     .is_err()
   {
-    let _ = state::with_state(|s| s.count(UNMOUNT_REFUSED, 1));
+    let _ = state::with_state_counted(|s| s.count(UNMOUNT_REFUSED, 1));
   }
 }
 
@@ -1005,12 +1005,12 @@ async fn reap(mut pending: PendingExit) {
   loop {
     if let Some(done) = pending.poll() {
       if done.is_err() {
-        let _ = state::with_state(|s| s.count(UNMOUNT_REFUSED, 1));
+        let _ = state::with_state_counted(|s| s.count(UNMOUNT_REFUSED, 1));
       }
       return;
     }
     if futures::now_ns().saturating_sub(began) >= bound || futures::sleep(tick).await.is_err() {
-      let _ = state::with_state(|s| s.count(UNMOUNT_REFUSED, 1));
+      let _ = state::with_state_counted(|s| s.count(UNMOUNT_REFUSED, 1));
       return;
     }
   }

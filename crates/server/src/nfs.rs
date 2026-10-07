@@ -684,7 +684,7 @@ fn unmount_capability(_capability: Option<MountCapability>, args: &[u8]) {
   })
   .unwrap_or_default();
   if mounts.is_empty() {
-    let _ = state::with_state(|s| s.count("nfs.unmount_refused", 1));
+    let _ = state::with_state_counted(|s| s.count("nfs.unmount_refused", 1));
     return;
   }
   match futures::spawn(confirm_unmount(name, mounts)) {
@@ -716,7 +716,7 @@ async fn confirm_unmount(name: String, mounts: Vec<(u64, String)>) {
       .map(|(attachment, _)| *attachment)
       .collect();
     if !gone.is_empty() {
-      let _ = state::with_state(|s| {
+      let _ = state::with_state_counted(|s| {
         for attachment in gone {
           let ended = s
             .db
@@ -734,12 +734,12 @@ async fn confirm_unmount(name: String, mounts: Vec<(u64, String)>) {
       return;
     }
     if futures::now_ns().saturating_sub(began) >= UNMOUNT_CONFIRM_NS {
-      let _ = state::with_state(|s| s.count("nfs.unmount_unconfirmed", 1));
+      let _ = state::with_state_counted(|s| s.count("nfs.unmount_unconfirmed", 1));
       return;
     }
     if futures::sleep(poll).await.is_err() {
       // Off a shard no poll can be timed: the confirmation is given up, counted, never spun on.
-      let _ = state::with_state(|s| s.count("nfs.unmount_unconfirmed", 1));
+      let _ = state::with_state_counted(|s| s.count("nfs.unmount_unconfirmed", 1));
       return;
     }
   }
@@ -918,7 +918,7 @@ fn serve_local(
   );
   // The recall gate passes a change by the only holders of a file's delegations: the NFSv4 client this call acts
   // for, if any (A-80). Named for this call alone, and cleared after it.
-  let _ = state::with_state(|s| s.store.recall_gate.act_as(requester.client));
+  let _ = state::with_state_counted(|s| s.store.recall_gate.act_as(requester.client));
   // Only NFSv3 reaches here: an NFSv4 call is served by the v4 front end before routing.
   let served = serve_call(
     &mut service,
@@ -929,7 +929,7 @@ fn serve_local(
     &mut XdrReader::new(args),
     port,
   );
-  let _ = state::with_state(|s| s.store.recall_gate.act_as(None));
+  let _ = state::with_state_counted(|s| s.store.recall_gate.act_as(None));
   // The barrier (§4.8, D-18): a mutation's effect is published into anchor-owned RAM before its
   // reply leaves this shard, so the reply's stability claim is true for daemon-restart survival.
   let result = if matches!(served.0, AcceptStatus::Success)
@@ -940,13 +940,13 @@ fn serve_local(
     served
   };
   if let Some(open) = open {
-    let _ = state::with_state(|s| {
+    let _ = state::with_state_counted(|s| {
       let end_ns = s.clock.monotonic_ns();
       crate::telemetry::emit(s, open.end(procedure, end_ns));
     });
   }
   // A change this call was refused for a delegation asked for a recall; it is sent now (A-79).
-  let _ = state::with_state(crate::delegation::drain);
+  let _ = state::with_state_counted(crate::delegation::drain);
   result
 }
 
@@ -1204,7 +1204,7 @@ async fn serve_v3(
   };
   let elapsed = slates_machine::clock::monotonic_ns().saturating_sub(started);
   let on_cpu = thread_cpu_ns().saturating_sub(started_cpu);
-  let _ = state::with_state(|s| {
+  let _ = state::with_state_counted(|s| {
     if forwarded {
       s.nfs_service.forwarded.record(elapsed);
     } else {
@@ -1263,7 +1263,7 @@ async fn serve_local_held(
     if !refused_by_gate || now >= until {
       return served;
     }
-    let _ = state::with_state(|s| s.count(V3_HELD, 1));
+    let _ = state::with_state_counted(|s| s.count(V3_HELD, 1));
     let parked = futures::within(
       until.saturating_sub(now),
       std::future::poll_fn(|cx| {
@@ -1280,7 +1280,7 @@ async fn serve_local_held(
       Ok(Some(())) => {}
       // The lease passed: revoke the lapsed delegation so the last attempt proceeds.
       Ok(None) => {
-        let _ = state::with_state(crate::delegation::drain);
+        let _ = state::with_state_counted(crate::delegation::drain);
       }
       Err(_) => return served,
     }
@@ -1559,7 +1559,7 @@ const NFS4_NOTE_LOST: &str = "nfs4.notes.lost";
 
 /// Counts one `counter` on this shard; off a shard (no state) nothing is counted.
 fn note(counter: &'static str) {
-  let _ = state::with_state(|s| s.count(counter, 1));
+  let _ = state::with_state_counted(|s| s.count(counter, 1));
 }
 
 /// The v4 front end's backend in the daemon: each v3 call it makes presents the capability of the
@@ -2305,7 +2305,7 @@ async fn send_turn(connection: &Connection, turn: &Turn) -> bool {
     return false;
   }
   if answered > 1 {
-    let _ = state::with_state(|s| {
+    let _ = state::with_state_counted(|s| {
       s.count(NFS_REPLIES_BATCHED, answered);
     });
   }
@@ -2537,7 +2537,7 @@ fn migrate(owner: u16, connection: Connection) {
     // The refused spawn dropped the descriptor; releasing the anchor's copy closes the connection.
     ending.release();
     if let Some((sessionid, departed)) = kept {
-      let _ = state::with_state(|s| {
+      let _ = state::with_state_counted(|s| {
         if let Some(server) = s.nfs_v4.as_mut() {
           server.sessions.return_home(sessionid, departed);
         }

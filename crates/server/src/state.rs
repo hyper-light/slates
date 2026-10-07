@@ -869,6 +869,48 @@ pub fn with_state<R>(f: impl FnOnce(&mut ShardState) -> R) -> Option<R> {
   try_with_state(f).ok()
 }
 
+std::thread_local! {
+  /// Borrows on this shard thread refused in a way that lost a step ([`with_state_counted`]): a nested borrow (the
+  /// closure never ran) and a retention check refused after the closure ran (its effect stands, its result was
+  /// discarded). Per thread because each shard reports its own (a process-wide count would be summed once per shard).
+  static LOST_STEPS: std::cell::Cell<LostSteps> = const { std::cell::Cell::new(LostSteps { borrowed: 0, retention: 0 }) };
+}
+
+/// The borrows this shard thread refused in a way that lost a step, by kind ([`with_state_counted`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LostSteps {
+  /// Nested borrows: the closure never ran.
+  pub borrowed: u64,
+  /// Retention checks refused after the closure ran.
+  pub retention: u64,
+}
+
+/// [`with_state`] for a caller with nothing to do on a refusal (a counter, a cleanup, a drain), which before
+/// 2026-10-07 discarded it at 57 sites: the refusals that lose a step are counted on this thread ([`lost_steps`],
+/// reported in status as `state.borrow_refused` and `state.retention_refused`). A thread with no state, or a fenced
+/// shard, is not a lost step: there is nothing to do there.
+pub fn with_state_counted<R>(f: impl FnOnce(&mut ShardState) -> R) -> Option<R> {
+  let refusal = match try_with_state(f) {
+    Ok(result) => return Some(result),
+    Err(refusal) => refusal,
+  };
+  LOST_STEPS.with(|cell| {
+    let mut lost = cell.get();
+    match refusal {
+      StateAccess::Borrowed => lost.borrowed = lost.borrowed.saturating_add(1),
+      StateAccess::Retention(_) => lost.retention = lost.retention.saturating_add(1),
+      StateAccess::Absent | StateAccess::Fenced => {}
+    }
+    cell.set(lost);
+  });
+  None
+}
+
+/// The borrows this shard thread refused in a way that lost a step, so far.
+pub fn lost_steps() -> LostSteps {
+  LOST_STEPS.with(std::cell::Cell::get)
+}
+
 /// Whether any client ring on this thread holds a request (the poller's question).
 pub fn any_ring_ready() -> bool {
   with_state(|s| ring_ready_in(s)).unwrap_or(false)

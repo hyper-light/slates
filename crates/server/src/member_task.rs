@@ -321,7 +321,7 @@ async fn announce_on(member: HostId, endpoint: &mut Endpoint, canonical: bool) {
       return;
     }
   };
-  let _ = state::with_state(|state| {
+  let _ = state::with_state_counted(|state| {
     let Some(answer) = Announcement::decode(&reply).filter(|answer| answer.epoch == epoch) else {
       crate::fleet::count_refusal_in(state, EPOCH_REFUSED);
       return;
@@ -580,7 +580,7 @@ async fn fold_membership(origin: u16, shards: &[u16]) {
     // leaves it stale.
     if folded.is_err() {
       crate::fleet::count_refusal(FOLD_REFUSED);
-      let _ = state::with_state(|state| {
+      let _ = state::with_state_counted(|state| {
         for (member, _) in &changed {
           state.plane.folded.remove(member);
         }
@@ -607,22 +607,23 @@ async fn resolve_peers(resolver: Option<Kept<Resolver>>) {
   for (anchor, address, certificate) in unresolved {
     let resolved =
       crate::fleet::resolve_peer_address(&address, Plane::Probe, &certificate, resolver).await;
-    let _ = state::with_state(
-      |state| match (resolved, state.plane.peers.get_mut(&anchor)) {
-        (Some(resolved), Some(peer)) => {
-          peer.resolved = Some(resolved);
-          peer.stale = false;
-        }
-        _ => crate::fleet::count_refusal_in(state, ADDRESS_UNRESOLVED),
-      },
-    );
+    let _ =
+      state::with_state_counted(
+        |state| match (resolved, state.plane.peers.get_mut(&anchor)) {
+          (Some(resolved), Some(peer)) => {
+            peer.resolved = Some(resolved);
+            peer.stale = false;
+          }
+          _ => crate::fleet::count_refusal_in(state, ADDRESS_UNRESOLVED),
+        },
+      );
   }
 }
 
 /// Joins to the detector every keyed member whose address is resolved, once (`MemberPlane::join`): a member is judged
 /// only once a probe of it can be sent.
 fn join_addressable() {
-  let _ = state::with_state(|state| {
+  let _ = state::with_state_counted(|state| {
     let ready: Vec<HostId> = state
       .plane
       .keyed
