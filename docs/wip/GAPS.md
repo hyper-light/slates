@@ -2157,6 +2157,9 @@ a real `pip install`, and a `kill -9` of the daemon mid-write went through the m
 - **The idle purge gave back the whole free arena after any free** (A-110), including never-touched blocks and blocks
   a recovery gave back unscrubbed. It also counted them again each time. It now gives back only what was freed since
   it last ran.
+- **An idle anchor held 275 MB** on macOS: freed 128 MiB memcpy-probe buffers that the allocator kept cached
+  (docs/bugs/2026-10-06-the-idle-anchor-kept-the-profiles-probe-buffers.md). The buffers are mappings now, and the
+  idle anchor holds 2.3 MB.
 - **User extended attributes were `EOPNOTSUPP`** on the Linux mount (A-106).
 - **`volume create` on a node never bootstrapped said only `ConsensusNotInitialized`.** It now names
   `slates bootstrap root`. Test `a_create_before_bootstrap_is_refused_naming_the_command_that_fixes_it`, red first.

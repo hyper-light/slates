@@ -2773,3 +2773,20 @@ The first fix did not move the cost because the cost was not the calls: `MADV_FR
 took 150 µs in all, and faulting the pages in afterwards was as fast as without it (12.6–13.9 GB/s). A sample of the
 writing daemon found `Region::prepare` itself, scanning the bit set to the end of the region's one run on every
 allocation.
+
+## The idle anchor's footprint (2026-10-06)
+
+Release anchor, `--quick --shards 1`, nothing mounted, `/usr/bin/footprint -p` on this Mac (M5 Max, Darwin 25.4).
+
+| Build | Anchor footprint | `MALLOC_LARGE` |
+|---|---|---|
+| Before | 275 MB | 3 freed regions still dirty: 128 + 128 + 16 MiB |
+| Probe buffers mapped | 2.3 MB | none |
+
+The profile it measures did not move, three runs per build:
+
+| memcpy size | Before (MB/s) | After (MB/s) |
+|---|---|---|
+| 64 KiB | 82,852–116,612 | 89,898–116,612 |
+| 1 MiB | 71,089–82,241 | 78,152–80,921 |
+| 128 MiB | 21,855–22,733 | 20,404–26,368 |

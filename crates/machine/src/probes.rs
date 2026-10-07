@@ -324,8 +324,10 @@ pub fn memcpy_curve(cache_line: u64, cap: u64, budget: Duration) -> Vec<MemcpyPo
     .checked_div(u32::try_from(sizes.len()).unwrap_or(u32::MAX).max(1))
     .unwrap_or_default();
   let largest = usize::try_from(*sizes.last().unwrap_or(&0)).unwrap_or(0);
-  let src = filled(largest, Xorshift::SEED);
-  let mut dst = vec![0u8; largest];
+  let (Some(mut src), Some(mut dst)) = (scratch(largest), scratch(largest)) else {
+    return Vec::new();
+  };
+  fill(&mut src, Xorshift::SEED);
   sizes
     .into_iter()
     .map(|bytes| {
@@ -350,10 +352,14 @@ pub fn memcpy_curve(cache_line: u64, cap: u64, budget: Duration) -> Vec<MemcpyPo
 
 /// Measures BLAKE3 throughput over a buffer of `bytes`.
 pub fn hash(bytes: u64, budget: Duration) -> HashThroughput {
-  let buf = filled(usize::try_from(bytes).unwrap_or(0), Xorshift::SEED);
+  // A refused mapping hashes nothing and reports the zero bytes it hashed, never the size it asked for.
+  let mut mapped = scratch(usize::try_from(bytes).unwrap_or(0));
+  let buf: &mut [u8] = mapped.as_deref_mut().unwrap_or_default();
+  fill(buf, Xorshift::SEED);
+  let bytes = u64::try_from(buf.len()).unwrap_or(0).min(bytes);
   let per_buffer = measure(
     || {
-      std::hint::black_box(blake3::hash(&buf));
+      std::hint::black_box(blake3::hash(buf));
     },
     budget,
   );
@@ -458,6 +464,23 @@ fn point(
     ratio_permille: ratio,
     bytes,
     quick: c.quick || d.quick,
+  }
+}
+
+/// A probe buffer of `len` bytes in its own anonymous mapping, zeroed, given back to the OS when it is dropped. A heap
+/// buffer is not: the allocator caches a freed large allocation, and macOS kept the memcpy probe's two 128 MiB buffers
+/// dirty for the life of the anchor that ran the profile (272 MB of its 275 MB footprint, 2026-10-06). `None` when the
+/// OS refuses the mapping; the probe then measures nothing.
+fn scratch(len: usize) -> Option<memmap2::MmapMut> {
+  memmap2::MmapMut::map_anon(len.max(1)).ok()
+}
+
+/// Fills `buf` with the seeded generator's bytes, as [`filled`] makes them.
+fn fill(buf: &mut [u8], seed: u64) {
+  let mut rng = Xorshift::new(seed);
+  for piece in buf.chunks_mut(size_of::<u64>()) {
+    let word = rng.next_u64().to_le_bytes();
+    piece.copy_from_slice(word.get(..piece.len()).unwrap_or(&word));
   }
 }
 
