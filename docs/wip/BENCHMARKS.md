@@ -2883,3 +2883,10 @@ The levers, each needing its own A/B:
 - fewer LOOKUP and GETATTR round trips through the attribute and negative-name caching the replies grant;
 - a transport with extended attributes the macOS client speaks (its NFS client does v3 and v4.0; slates' v4 front end
   is 4.1/4.2).
+
+**Measured and rejected, the same day: answering the sidecar's WRITE `FILE_SYNC`.** A WRITE to an AppleDouble view
+was made stable at once and answered `FILE_SYNC` (RFC 1813 §3.3.7), so the macOS client sent no COMMIT. COMMITs went
+from 500 to 0 for 500 files, as intended. But create+close stayed at 626 and 705 µs p50 in two runs, against 621 µs
+before. The COMMIT had cost the server 3 µs, its round trip was not on the create's wait, and the publication moved to
+the WRITE. A dead-even A/B does not land: the change was reverted. The levers left are the LOOKUP and GETATTR round
+trips, which the trace puts at about 6 per file.
