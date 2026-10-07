@@ -114,7 +114,9 @@ fn adopted(raw: RawFd) -> OwnedFd {
   owned
 }
 
-/// Sends `message` to the anchor: `None` without an anchor, else whether it was sent.
+/// Sends `message` to the anchor: `None` without an anchor, else whether it was sent. The channel is blocking, so a
+/// refusal means the anchor's end is gone, and with it every descriptor the anchor held: a refused release
+/// (`Release`, `ReleaseConnection`) leaves nothing held, which is why its callers need not retry it.
 pub(crate) fn send(message: &Outgoing<'_>) -> Option<Result<(), HoldRefusal>> {
   let channel = CHANNEL.get()?;
   Some(held::send(channel.as_fd(), message))
