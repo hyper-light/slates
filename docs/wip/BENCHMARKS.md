@@ -3188,5 +3188,18 @@ had 0.49 ms.
 Open: one stat at one worker is now a round trip (p50 30 µs; the A-89 record's 2.3 µs was the client's attribute
 cache). mountstats counts exactly 1,117 GETATTRs for 2,000 stats on every run. A/B at one worker, two runs each,
 against the build before this day's changes (`43826f76`): stat p50 30.0 / 30.0 µs there and 30.1 / 30.1 µs here, the
-same 1,117 GETATTRs. So the change predates this day's work, and its cause is not measured: a commit between A-89 and
-`43826f76`, or the Docker Desktop kernel's client. The identical count says it is deterministic.
+same 1,117 GETATTRs. So the change predates this day's work. Bisected the same day, one worker, same command:
+
+| Build | stat p50 | GETATTRs per 2,000 stats |
+|---|---|---|
+| A-89 itself (`76520d22`) | 34.1 µs | 1,117 |
+| `e3423db8~1` | 29.5 µs | 1,117 |
+| `e3423db8` (the v4 READDIR rewrite) | 33.0 µs | 1,117 |
+| `43826f76` | 30.0 µs | 1,117 |
+| `462be77e` | 30.1 µs | 1,117 |
+
+The commit that recorded 2.3 µs gives 34 µs today. So no slates change moved it: the environment did (Docker
+Desktop's LinuxKit kernel is 6.12.76-linuxkit now; its NFS client decides when a stat revalidates). 2,000 random
+draws over 2,000 files touch about 1,264 distinct files, near the 1,117 GETATTRs, which suggests the client
+revalidates a file's first stat after its close and serves later ones from its cache. The 2.3 µs row is a reading
+of the older client, not a floor this build lost.
