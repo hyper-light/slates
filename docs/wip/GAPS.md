@@ -3596,7 +3596,11 @@ After every history the outside directory is identical: entries, inodes, sizes, 
 writes only through handles (`openat`-relative creates, renames that replace an entry, never a write in place
 through a name).
 
-Still owed for condition 4: a container's own symlinks followed by a host-side tool. The base overlay's reads: done
+Condition 4's listed vectors are closed as of 2026-10-06. A container's own symlinks followed by a host-side tool:
+A-107 resolves a link out of the volume only for the user who made it. In its Docker run, root and a second user were
+refused on such links, and the owner's own access is the host user's, not an escape of the volume's writes. A landing
+writes a symlink as a symlink, through handles, never following it (`crates/land/tests/oracle.rs`). The base overlay's
+reads: done
 (2026-10-06). The AUD-29-62 swap battery (the root, an intermediate directory and the final component swapped for a
 link to outside the base) ran only on Windows with junctions; it now runs on Unix with symbolic links too, and the
 base plane never followed one (macOS and Linux, 10/10). The NFS names part is done (2026-10-06,
