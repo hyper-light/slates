@@ -2998,3 +2998,34 @@ to the folded forms on generated names, Unicode included; the dirtree's lookups 
 Daemon, the 50,000-file macOS volume (100,101 inodes: each file's provenance attribute is an AppleDouble sidecar
 inode), load average 11: decode 20.9 → 11.6–12.9 ms, claims 2.6–3.1 ms, rebuild 19–22 ms (214 ns an inode, the
 bench's rate); the recovering shard starts in 38.6–44.3 ms, from 70–74 ms this morning.
+
+## macOS NFS: the 13 round trips of one create are the client's (2026-10-06, diagnosis)
+
+The same Mac, the release daemon (`--quick --shards 1`), the mount `slates mount` makes; 200 creates of a 100-byte
+file, client counts from `nfsstat -c` (scratchpad `rpc-count.sh`), and the server's own sequence for three creates
+(procedure, target handle, reply length; a temporary trace, not kept).
+
+Per create: GETATTR 4, LOOKUP 2, CREATE 2, WRITE 2, COMMIT 2, SETATTR 1. The order:
+
+| # | Call | Target | Why it is sent |
+|---|---|---|---|
+| 1 | LOOKUP `f` → NOENT | directory | `open(O_CREAT)` |
+| 2 | CREATE `f` | directory | |
+| 3 | LOOKUP `._f` → NOENT | directory | the provenance attribute's AppleDouble sidecar |
+| 4 | GETATTR | directory | revalidated before the sidecar's create |
+| 5 | CREATE `._f` | directory | |
+| 6 | GETATTR | sidecar | close-to-open, at its open |
+| 7–8 | WRITE, COMMIT | sidecar | the attribute's bytes, flushed at its close |
+| 9 | GETATTR | sidecar | close-to-open, at its close |
+| 10 | SETATTR | file | |
+| 11–12 | WRITE, COMMIT | file | the data, flushed at close |
+| 13 | GETATTR | file | close-to-open, at close |
+
+Every reply already carries the attributes a client could use instead: the failed LOOKUP the directory's (92 bytes),
+CREATE the handle, the object's attributes and the directory's before and after (276), WRITE before and after (136),
+COMMIT after (104). The GETATTRs are close-to-open revalidations, and macOS offers no way to turn them off: its mount
+flags (`<nfs/nfs.h>` `NFS_MFLAG_*`) have no `nocto`, and `mount_nfs(8)` only tunes the attribute-cache timeouts,
+which slates already sets to the finest nonzero value. The sidecar is how the macOS NFSv3 client stores extended
+attributes (NFSv3 has none). The server cannot remove a round trip of this create, only make each one cheaper. The
+remaining levers are outside the v3 server: a transport with extended attributes and delegations that the macOS
+client speaks.
