@@ -4165,3 +4165,15 @@ ms (was exit 3 after 1,014 ms); npm under kills about 30 ms a kill (was about 32
 Open: recovery grows with a volume's files: 50,000 files recover in 70–74 ms on one shard (`restart-big.sh`). A client
 claim still has a one-second wait, so a recovery past a second would fail a connect again; the claim wait should follow
 the anchor's recovery budget when the rendezvous is held.
+
+### 2026-10-06: no write escapes to disk while the daemon is killed mid-install (conditions 3, 4, 11; evidence)
+
+Docker (rust:1.98, Linux 6.12), the release binary under its anchor (`--quick`), a 2 GiB volume FUSE-mounted by an
+ordinary user (scratchpad `install.sh`/`install-inner.sh`). A marker file is made after the build; then `pip install
+requests rich pyyaml numpy pandas` into a venv on the volume, with 8–12 daemon `SIGKILL`s inside it, and `npm install
+lodash express typescript webpack @babel/core eslint` (npm's cache on the volume) with 7 inside it. Afterwards:
+pip's RECORD hashes match for all 3,606 files, numpy and pandas compute, `npm ls --all` is clean (7,419 files), and
+every module loads. Then `find / -xdev -newer` the marker, outside the mount: only the test's own files (the anchor's
+stderr log, the kill timestamps) and npm's own debug log and update-notifier stamp, which npm keeps in the home
+directory whatever the project. No file slates wrote reached the disk; the anchor log shows 15–19 restarts and no
+panic. Each kill costs npm about 30 ms against a 4.5 s run with none.
