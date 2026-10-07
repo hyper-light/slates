@@ -22,6 +22,13 @@
 //! the first decrease, loss ignored in the default mode, persistent congestion collapsing to the minimum
 //! window (mvfst `Copa.cpp` [C]). Windows are Nichols filters as in mvfst, so every structure is bounded.
 //! `δ` is held as the integer `1/δ`, so the law is integer arithmetic throughout.
+//!
+//! One departure from the paper, measured (`docs/wip/BENCHMARKS.md`, "Copa reads independent jitter out of its queue
+//! estimate", 2026-10-07): `d_q` is reduced by the jitter excess `RTTstanding` carries, estimated from each `srtt/2`
+//! epoch's samples ([`Epoch`]), so independent non-congestive jitter of tens of milliseconds is not read as queue
+//! (Arun, Alizadeh & Balakrishnan, "Starvation in End-to-End Congestion Control", SIGCOMM 2022 [A], §6). On a thin
+//! 200 ms link with ±40 ms of independent jitter an 8 MiB pull went from 79–102 s to 24–33 s (median of 8 seeds),
+//! with the 58-scenario grid's share +1.6% and ping p99 −1.9%.
 
 use super::filter::{WindowedMax, WindowedMin};
 use super::{AckEvent, INITIAL_WINDOW_DATAGRAMS, LossEvent, MINIMUM_WINDOW_DATAGRAMS};
@@ -59,6 +66,9 @@ pub struct Copa {
   last_double: Option<u64>,
   min_rtt: Option<WindowedMin>,
   standing_rtt: Option<WindowedMin>,
+  /// The RTT samples of the current `srtt/2` epoch and of the last whole one ([`Epoch`]): the jitter estimate.
+  epoch: Epoch,
+  last_epoch: Option<Epoch>,
   mode_min: Option<WindowedMin>,
   mode_max: Option<WindowedMax>,
   /// The velocity: the window's step multiplier.
@@ -87,6 +97,8 @@ impl Copa {
       last_double: None,
       min_rtt: None,
       standing_rtt: None,
+      epoch: Epoch::default(),
+      last_epoch: None,
       mode_min: None,
       mode_max: None,
       velocity: 1,
@@ -158,7 +170,14 @@ impl Copa {
       None => self.mode_max.insert(WindowedMax::new(now, rtt)).get(),
     };
     self.update_mode(now, srtt, (rtt_min, recent_min, recent_max));
-    let queueing = standing.saturating_sub(rtt_min);
+    if self.epoch.count > 0 && now.saturating_sub(self.epoch.began) > srtt / 2 {
+      self.last_epoch = Some(self.epoch);
+      self.epoch = Epoch::default();
+    }
+    self.epoch.take(now, rtt);
+    let queueing = standing
+      .saturating_sub(rtt_min)
+      .saturating_sub(self.last_epoch.map_or(0, |epoch| epoch.jitter_excess()));
     // Increase when the current rate `cwnd/RTTstanding` is at or below the target `1/(δ·d_q)` (in bytes,
     // `inv_delta·smss/d_q`): `cwnd·d_q ≤ inv_delta·smss·RTTstanding`; an empty queue always increases.
     let increase = queueing == 0
@@ -296,6 +315,62 @@ impl Copa {
   }
 }
 
+/// One `srtt/2` epoch's RTT samples: when it began, how many, the least and the greatest, the first and the last.
+#[derive(Clone, Copy, Debug, Default)]
+struct Epoch {
+  began: u64,
+  count: u64,
+  min: u64,
+  max: u64,
+  first: u64,
+  last: u64,
+  /// The path length: the sum of the absolute differences between successive samples.
+  path: u64,
+}
+
+impl Epoch {
+  fn take(&mut self, now: u64, rtt: u64) {
+    if self.count == 0 {
+      *self = Epoch {
+        began: now,
+        count: 1,
+        min: rtt,
+        max: rtt,
+        first: rtt,
+        last: rtt,
+        path: 0,
+      };
+      return;
+    }
+    self.count = self.count.saturating_add(1);
+    self.min = self.min.min(rtt);
+    self.max = self.max.max(rtt);
+    self.path = self.path.saturating_add(self.last.abs_diff(rtt));
+    self.last = rtt;
+  }
+
+  /// The part of `RTTstanding − RTTmin` independent jitter explains (Arun, Alizadeh & Balakrishnan, SIGCOMM 2022,
+  /// §6: a delay-bounding law must not read non-congestive jitter as queue). With jitter of width `W` independent
+  /// per sample, the least of an epoch's `n` samples sits `W/(n+1)` above the path's floor (order statistics of
+  /// `n` uniform draws), and successive samples differ by `W/3` on average, so the epoch's path length is about
+  /// `(n−1)·W/3`. A queue moves the RTT monotonically within half a round trip, filling or draining, so its path
+  /// length is its net change `|last − first|`: the path length beyond the net change is spread no trend explains,
+  /// `W ≈ 3·(path − |last − first|)/(n−1)`, and the excess `W/(n+1)`. Two samples cannot tell the two apart and
+  /// estimate none, so a slow link's few samples — a packet's 150 ms at 64 kbit/s — are never read as jitter.
+  fn jitter_excess(&self) -> u64 {
+    let zigzag = self.path.saturating_sub(self.last.abs_diff(self.first));
+    let width = zigzag
+      .saturating_mul(UNIFORM_MEAN_STEP_DIVISOR)
+      .checked_div(self.count.saturating_sub(1).max(1))
+      .unwrap_or(0);
+    width.checked_div(self.count.saturating_add(1)).unwrap_or(0)
+  }
+}
+
+/// Format: the mean absolute difference of two independent draws uniform over a width `W` is `W/3`; the jitter
+/// estimate multiplies the mean step by this to recover `W`.
+const UNIFORM_MEAN_STEP_DIVISOR: u64 = 3;
+
 /// Updates a lazily started windowed minimum and returns it.
 fn update_min(filter: &mut Option<WindowedMin>, now: u64, window: u64, value: u64) -> u64 {
   match filter.as_mut() {
@@ -351,6 +426,48 @@ mod tests {
       law.window(),
       2 * start,
       "one doubling after a round trip past the first"
+    );
+  }
+
+  /// The samples of one epoch, taken in order.
+  fn epoch_of(samples: &[u64]) -> Epoch {
+    let mut epoch = Epoch::default();
+    for (at, rtt) in samples.iter().enumerate() {
+      epoch.take(u64::try_from(at).unwrap(), *rtt);
+    }
+    epoch
+  }
+
+  /// Arun, Alizadeh & Balakrishnan (SIGCOMM 2022) §6: jitter is not read as queue, and a queue is not read as
+  /// jitter. Do: estimate the jitter excess of a filling queue (RTT rising monotonically), of two samples, and of
+  /// zigzagging samples spread over 80 ms. Expect: none for the queue and for two samples (a straight line either
+  /// way), and for the zigzag about `W/(n+1)`: within a factor of two of 80 ms over nine samples.
+  #[test]
+  fn the_jitter_estimate_reads_zigzag_and_never_a_monotone_queue() {
+    let ms = 1_000_000;
+    let filling: Vec<u64> = (0..9).map(|step| 200 * ms + step * 5 * ms).collect();
+    assert_eq!(
+      epoch_of(&filling).jitter_excess(),
+      0,
+      "a filling queue is not jitter"
+    );
+    let draining: Vec<u64> = (0..9).rev().map(|step| 200 * ms + step * 5 * ms).collect();
+    assert_eq!(
+      epoch_of(&draining).jitter_excess(),
+      0,
+      "a draining queue is not jitter"
+    );
+    assert_eq!(
+      epoch_of(&[200 * ms, 280 * ms]).jitter_excess(),
+      0,
+      "two samples cannot tell jitter from a queue"
+    );
+    let zigzag = [200, 270, 210, 260, 230, 280, 205, 250, 220].map(|value| value * ms);
+    let excess = epoch_of(&zigzag).jitter_excess();
+    let expected = 80 * ms / 10;
+    assert!(
+      excess >= expected / 2 && excess <= expected * 2,
+      "about W/(n+1) = {expected} ns: {excess} ns"
     );
   }
 

@@ -414,7 +414,13 @@ async fn read(
 
 /// Runs one scenario to completion on a fresh simulation.
 fn run(scenario: &Scenario) -> Outcome {
-  let mut simulation = SimRuntime::new(&config(), 1).unwrap();
+  // The simulation's seed: `FETCH_BENCH_SEED`, else 1 — so an A/B can be judged over several seeds, not one
+  // trajectory.
+  let seed = std::env::var("FETCH_BENCH_SEED")
+    .ok()
+    .and_then(|seed| seed.parse::<u64>().ok())
+    .unwrap_or(1);
+  let mut simulation = SimRuntime::new(&config(), seed).unwrap();
   let shard = simulation.shard_ids()[0];
   let (result_tx, result_rx) = channel();
   let scenario_owned = scenario.clone();
@@ -560,14 +566,14 @@ async fn establish(
     let established = established_tx.clone();
     let (ready_tx, ready_rx) = channel();
     let server_task = slates_rt::futures::spawn(async move {
-      server.establish().await.unwrap();
+      establish_retrying(&mut server).await;
       let _ = ready_tx.send(());
       serve(server, kept, host, stop_rx, stats_tx).await;
     })
     .unwrap();
     let _ = slates_rt::futures::detach(server_task);
     let client_task = slates_rt::futures::spawn(async move {
-      client.establish().await.unwrap();
+      establish_retrying(&mut client).await;
       let ((), _) = receive(ready_rx).await;
       let _ = established.send((reader, host, client));
     })
@@ -809,6 +815,25 @@ fn grid() -> Vec<Scenario> {
       )
     },
   ]
+}
+
+/// Shape: the handshake budgets one side of a pair may spend before the run fails: as the daemon's dialer does,
+/// a budget that runs out (`NotReady`, its pending flight kept) is retried on the same socket; a pair that never
+/// establishes within this many is a failed run, as before.
+const HANDSHAKE_BUDGETS: u32 = 16;
+
+/// Drives `endpoint`'s handshake to the 1-RTT keys, retrying an exhausted budget on the same socket as the
+/// daemon's dialer does (`Endpoint::establish` keeps the pending flight across calls). A run used to abort on
+/// the first exhausted budget: seed 3's reordering-and-loss row, 2026-10-07.
+async fn establish_retrying(endpoint: &mut Endpoint) {
+  for _ in 0..HANDSHAKE_BUDGETS {
+    match endpoint.establish().await {
+      Ok(()) => return,
+      Err(slates_transport::endpoint::EndpointError::NotReady) => continue,
+      Err(other) => panic!("handshake failed: {other:?}"),
+    }
+  }
+  panic!("handshake did not establish within {HANDSHAKE_BUDGETS} budgets");
 }
 
 fn main() {

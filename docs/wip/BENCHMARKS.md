@@ -3399,3 +3399,59 @@ The map for the owed design, from the four:
 
 No floor fixes the independent-jitter (reordering) rows: 68–104 s across all of them. That case needs its own
 mechanism.
+
+#### Landed: Copa reads independent jitter out of its queue estimate (2026-10-07)
+
+The mechanism the independent-jitter rows needed. Copa's queue estimate is `d_q = RTTstanding − RTTmin`.
+`RTTstanding` is the least of the `n` samples in its `srtt/2`; with an empty queue and jitter of width `W`
+independent per sample it sits `W/(n+1)` above the path's floor (order statistics of `n` uniform draws). A small
+window has few samples, reads a large `d_q`, shrinks, and has fewer samples still: the collapse the starvation result
+predicts (Arun, Alizadeh & Balakrishnan, SIGCOMM 2022, §6: a delay-bounding law must keep non-congestive jitter out
+of its delay signal). The law now estimates `W` from each `srtt/2` epoch's samples and subtracts `W/(n+1)`, telling
+jitter from queue by the samples' shape: a queue moves the RTT monotonically within half a round trip, so its path
+length (the sum of the successive differences) is its net change; jitter zigzags. `W ≈ 3·(path − |last − first|)/(n−1)`
+(two independent uniform draws differ by `W/3` on average), from the last whole epoch (`copa.rs`, `Epoch`).
+
+Commands: `cargo run --release -p slates-transport --example congestion_bench` (the 58-scenario grid, three seeds
+each), and `FETCH_BENCH_SEED=<1..8> cargo run --release -p slates-cluster --example fetch_bench thin 128` (8 MiB on the
+thin link; the seed override and the handshake retry added to the bench the same day). Apple M5 Max, simulated
+network and virtual clock.
+
+`fetch_bench`, median of 8 seeds (all eight shown in the scratch record; the in-order row is noisy: `HEAD` alone spans
+8.0–32.0 s):
+
+| Thin link, 10 Mbit/s, 200 ms, 8 MiB | `HEAD` | landed |
+|---|---|---|
+| reordering ±40 ms, no loss | 79.0 s | 24.3 s |
+| reordering ±40 ms, 2% loss | 101.9 s | 32.8 s |
+| jitter ±40 ms in order | 18.1 s (8.0–32.0) | 24.1 s (7.9–30.1) |
+| 2% loss, in order | 8.1 s | 8.0 s |
+
+`congestion_bench` against `HEAD`: capacity share +1.6%, steady ping p99 −1.9% by geomean. Wins over 10%: burst loss
+p99 326 → 148 ms; 10 Mbit/s 100 ms with 1% loss p99 220 → 179 ms, with 5% loss 456 → 312 ms; the reordering row's
+share 0.534 → 0.857; the two-network crossing's share 0.346 → 0.423 at 10 Mbit/s and 0.045 → 0.064 at 100 Mbit/s.
+Losses over 10%: 10 Mbit/s 20 ms 1% loss p99 47 → 52 ms; 100 Mbit/s 20 ms 5% loss p99 82 → 92 ms.
+
+The two-network Docker topology (`docs/wip/bench/multiregion/reads.sh`, 100 ms ± 40 ms one way, 3% loss), cross-region
+reads of 8 MiB, three readers × three rounds: 85.0, 100.9, 103.5, 120.1, 120.6, 121.1, 121.8, 126.7 s byte-identical
+(median about 120 s), against 124.9–144.9 s (median about 135 s) before. One read refused after 54.2 s, its forward
+unanswered within its stall budget (load average 10 from other sessions; recorded in `GAPS.md`). The gain on the real
+crossing is a tenth, not the simulator's threefold: the real path's jitter is not the simulator's uniform draw, and
+the read was bound by more than the window (open).
+
+Measured and rejected on the way, each against the same `HEAD` (fetch medians where eight seeds were run, else seed
+1; grid geomeans):
+
+| Candidate | Reordering, no loss | Reordering + 2% loss | Grid share / p99 | Why it lost |
+|---|---|---|---|---|
+| `range/(n−1)`, `n` from the window in packets | 60.1 s | 64.4 s | — | `n` counted packets; samples come one an acknowledgement |
+| `range/(n−1)`, `n` the samples counted | 14.6 s | 15.7 s | +1.3% / +4.2% | a slow link's queue read as jitter: 64 kbit/s 300 ms p99 585 → 1,199 ms, share 0.912 → 0.750 |
+| range less the net change | 56.4 s | 59.3 s | — | for few samples a jitter's net change is most of its range |
+| `range/(n−1)` × the last epoch's zigzag share | 18.9 s | 31.6 s | +1.4% / +2.0% | burst loss p99 326 → 1,322 ms |
+| the same × the current epoch's share | 61.0 s | 76.6 s | — | the current epoch has too few samples early on |
+| the current window's range × the last epoch's share | 27.7 s | 35.3 s | — | in-order jitter 34.4 s |
+| `range/(n−1)` less one packet's serialization | 26.2 s | 39.7 s | +1.2% / +2.0% | 1 Mbit/s 20 ms 5% loss p99 686 → 1,393 ms |
+
+The second candidate is the strongest on the jitter rows alone (5.4–6.5×), and is kept on record for a design that
+can tell a slow link's queue from jitter without giving those gains back. The landed one keeps 3.1–3.3× with a clean
+grid.
