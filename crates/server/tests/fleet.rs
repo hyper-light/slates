@@ -273,8 +273,10 @@ fn describe(daemons: &[&Daemon]) -> String {
         })
         .collect();
       // The control shard's refusal counts (a bind that failed, a peer refused …), so a daemon whose fleet
-      // never started says why; an observation it could not make is shown as that refusal.
-      let refusals = match daemon.fleet_refusals() {
+      // never started says why; an observation it could not make is shown as that refusal. Within one liveness
+      // budget, never the full observation budget: a trace must not wait out a shard a test holds (the hedge
+      // test's held candidate), or it changes the timing it describes.
+      let refusals = match daemon.fleet_refusals_within(slates_server::daemon::LIVENESS_BUDGET_NS) {
         Ok(counts) => format!("{counts:?}"),
         Err(refusal) => format!("unobserved({refusal:?})"),
       };

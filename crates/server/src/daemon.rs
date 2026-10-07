@@ -1442,6 +1442,21 @@ impl Daemon {
     self.observe(self.shards.first().copied(), |s| s.refusals.clone())
   }
 
+  /// [`Self::fleet_refusals`] within `budget_ns` rather than the generous observation budget: for a reader that
+  /// must not wait out a shard a test deliberately holds (a trace line describing the fleet as a wait begins). The
+  /// fleet test trace observed a held control shard with the full budget and so waited out the hold before the
+  /// poll it was describing began: two traced runs of the hedge test failed at exactly the hold (2026-10-07).
+  pub fn fleet_refusals_within(
+    &self,
+    budget_ns: u64,
+  ) -> Result<std::collections::BTreeMap<&'static str, u64>, ObserveError> {
+    self
+      .observation(self.shards.first().copied(), budget_ns, |s| {
+        s.refusals.clone()
+      })?
+      .wait()
+  }
+
   /// How long this daemon took to serve each NFS call, from the call read to its reply built, summed over every
   /// shard (§4.14): calls served on the shard that read them, then calls forwarded to their volume's owner shard.
   /// What a caller measured beyond these is outside the serve: the kernel client, the socket and the wakes.

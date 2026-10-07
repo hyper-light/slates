@@ -43,6 +43,11 @@ channel. The verbs are owner forwards, region promotions, fleet listings, grants
 | `5404fd78`, before this change | 1 | `a_cross_region_client_finds_the_copyset_successor_instead_of_an_unrelated_live_peer` |
 | This change | 3 | the copyset test twice; `a_slow_first_round_candidate_is_hedged_after_the_measured_p95` once (the traced run, placed at 3.001 s against a 3 s hold) |
 
-Both pass alone: the copyset test 3 of 3, the hedge test 5 of 5. The copyset failure is pre-existing. Whether this
-change moves the hedge test's tail is not established by one failure in three runs against zero in one; both are
-open and recorded here rather than called flakes.
+Both pass alone: the copyset test 3 of 3, the hedge test 5 of 5. The copyset failure is pre-existing and open.
+
+**The hedge failures were the trace, not this change.** Both happened in traced runs (`SLATES_FLEET_TRACE=1`; a
+second traced run failed it the same way, placed at 3.0006 s). With the trace on, a wait's opening line observed
+every daemon's refusal map with the full observation budget, including the candidate whose control shard the test
+holds. So it waited out the 3 s hold before the poll began, and the poll's first answer came after the hold. Fixed:
+the trace reads refusals within one liveness budget (`Daemon::fleet_refusals_within`). Traced, alone: passes 3 of
+3; with the old read restored, it fails. Untraced, it passed in every full-suite run before and after this change.
