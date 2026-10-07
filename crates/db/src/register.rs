@@ -526,12 +526,18 @@ fn rendezvous_weight(host: u64, object: &ObjectId) -> u64 {
 /// its neighbourhood (§4.8 "Promotion and takeover"; the worked example's "rendezvous ranks first
 /// among {B, C, D}").
 pub fn rendezvous_first(hosts: &[HostId], object: ObjectId) -> Option<HostId> {
+  rendezvous_ranked(hosts, object).first().copied()
+}
+
+/// `hosts` in rendezvous order for `object`: the highest weight first, the lowest id breaking a tie (the order
+/// [`rendezvous_first`] takes the head of). A mirror region's cohort is its prefix (`crate::mirror::mirror_cohort`).
+pub fn rendezvous_ranked(hosts: &[HostId], object: ObjectId) -> Vec<HostId> {
   let mut ranked: Vec<(u64, HostId)> = hosts
     .iter()
     .map(|host| (rendezvous_weight(host.0, &object), *host))
     .collect();
   ranked.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
-  ranked.first().map(|(_, host)| *host)
+  ranked.into_iter().map(|(_, host)| host).collect()
 }
 
 /// The number of **distinct copysets** Copyset Replication lays down over `hosts` nodes at scatter width
