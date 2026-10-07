@@ -1834,7 +1834,7 @@ impl Daemon {
   pub fn serve_content_as_authorized(&self, request: Vec<u8>) -> Result<Vec<u8>, ObserveError> {
     self.observe(self.shards.first().copied(), move |s| {
       let local = s.fleet.host();
-      crate::content_holder::serve(s, local, &request, |_, _, _, _| true)
+      crate::content_holder::serve(s, local, &request, |_, _, _, _, _| true)
     })
   }
 
@@ -2907,6 +2907,8 @@ fn init_shard(
     held_content: slates_cluster::content::ContentHold::new(),
     pending_tombstones: std::collections::BTreeMap::new(),
     seals: std::collections::BTreeMap::new(),
+    mirror_seals: std::collections::BTreeMap::new(),
+    mirror_neighbourhood: Vec::new(),
     put_latency: crate::fleet::LatencyWindow::default(),
     fetch_latency: crate::fleet::LatencyWindow::default(),
     put_outcomes: crate::fleet::PutOutcomes::default(),

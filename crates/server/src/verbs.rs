@@ -14,7 +14,7 @@ use slates_db::catalog::{
   SnapshotRecord, VolumeId as DbVolumeId, VolumeRecord, VolumeState,
 };
 use slates_db::register::{HostId, ObjectId, RegionId, RootConfiguration};
-use slates_db::{DbError, DurabilityScope, Partition};
+use slates_db::{DbError, Partition};
 use slates_ipc::protocol::{
   AttachRequest, AttachTransport, DaemonReport, Direction, Established, FleetReport,
   FreshnessBasis, GroupReport, HealthSignal, Intent, NamePolicy, PlacedState, ReadAt,
@@ -6258,9 +6258,34 @@ pub(crate) fn placed_state(state: &ShardState, record: &VolumeRecord) -> PlacedS
   };
   PlacedState {
     region,
-    mirror_age_ns: None,
+    mirror_age_ns: mirror_age_ns(state, record),
     host_epoch: state.fleet.configuration().host_epoch.0,
   }
+}
+
+/// The mirror's lag for a volume (§4.8 "Mirroring"; `docs/wip/mirroring.md` M3): zero once its head snapshot is
+/// recorded in the mirror (or it has none), else the time since that snapshot was taken, on this host's monotonic
+/// clock, an upper bound on the lag from its home placement. `None` where the region has no mirror, and where the
+/// snapshot's time is from another boot of the clock: an unknown lag is never reported as zero.
+fn mirror_age_ns(state: &ShardState, record: &VolumeRecord) -> Option<u64> {
+  if !state.fleet.configuration().has_mirror {
+    return None;
+  }
+  if record.epoch == 0 {
+    return Some(0);
+  }
+  let snapshot = state.db.partition().snapshot(record.id, record.head)?;
+  if matches!(
+    snapshot.placed,
+    PlacementState::Placed {
+      mirror: Some(_),
+      ..
+    }
+  ) {
+    return Some(0);
+  }
+  // The shard's clock is the host's monotonic clock (`HostClock`), read here without borrowing it mutably.
+  slates_machine::clock::monotonic_ns().checked_sub(snapshot.taken_ns)
 }
 
 /// Awaits a durability scope for a volume's head (or a snapshot): at `f = 0` the region is the
@@ -6308,21 +6333,30 @@ fn await_placed(
       placed: region,
       mirror_age_ns: None,
     },
-    Scope::Mirror => match config.await_placed(
-      DurabilityScope::Mirror,
-      &committed_placement(state, object, record.epoch),
-    ) {
-      Ok(placed) => ReplyBody::Placed {
+    // The mirror (§4.10 "Mirroring across regions"; `docs/wip/mirroring.md`): a snapshot is placed there once `f + 1`
+    // of its mirror cohort acknowledged its content and the owner recorded it (`SnapshotPlaced { mirror }`). A volume
+    // with no snapshot yet has nothing mirrored. Refused `Unsupported` where the region declares no mirror.
+    Scope::Mirror if !config.has_mirror => refused(Refusal::Unsupported {
+      feature: "mirror".to_owned(),
+    }),
+    Scope::Mirror => {
+      let placed = target
+        .and_then(|target| state.db.partition().snapshot(record.id, target))
+        .is_some_and(|snapshot| match &snapshot.placed {
+          PlacementState::Placed {
+            mirror: Some(mirror),
+            ..
+          } => {
+            let hosts: Vec<HostId> = mirror.iter().map(|host| HostId(*host)).collect();
+            config.quorum.committed(hosts.len())
+          }
+          _ => false,
+        });
+      ReplyBody::Placed {
         placed,
         mirror_age_ns: None,
-      },
-      Err(slates_db::register::RegisterError::Unsupported { .. }) => {
-        refused(Refusal::Unsupported {
-          feature: "mirror".to_owned(),
-        })
       }
-      Err(_) => refused(Refusal::NotFound),
-    },
+    }
   }
 }
 

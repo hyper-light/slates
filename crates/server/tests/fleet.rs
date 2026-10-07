@@ -4420,6 +4420,130 @@ fn a_client_of_another_node_in_the_owners_region_reads_and_writes_its_volume_thr
   );
 }
 
+/// AC-8.15's first half (§4.10 "Mirroring across regions"; `docs/wip/mirroring.md` M2): a snapshot placed in its home
+/// region is shipped to the owner's neighbourhood in the mirror region and held there whole by `f + 1` hosts. Two
+/// regions of three daemons at `f = 1`, each the other's mirror. Do: write a file into a volume on a (region 0),
+/// snapshot it, and wait for the home placement. Expect: at least `f + 1` of region 1's daemons hold the snapshot's
+/// content by the manifest identity a's head names. Non-vacuous: before mirroring was built no region-1 daemon held
+/// anything of it (`placed --mirror` refused `Unsupported`, two Docker networks, 2026-10-07).
+#[test]
+fn a_placed_snapshot_is_held_whole_by_f_plus_one_hosts_of_the_mirror_region() {
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c", "x", "y", "z"];
+  let n = names.len();
+  let nodes: Vec<(MachineProfile, HostId, Identity)> =
+    names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+    nodes.iter().map(|(_, _, id)| id.certificate()).collect();
+  let (_serve_lease, serve) = mesh_serve_ports(n);
+  let regions: std::collections::BTreeMap<HostId, RegionId> = hosts
+    .iter()
+    .enumerate()
+    .map(|(index, host)| (*host, RegionId(u64::from(index >= 3))))
+    .collect();
+  let mirrors: std::collections::BTreeMap<RegionId, RegionId> =
+    [(RegionId(0), RegionId(1)), (RegionId(1), RegionId(0))]
+      .into_iter()
+      .collect();
+  let daemons =
+    start_mesh_with_regions_and_mirrors(nodes, &hosts, &certs, &serve, 1, &regions, &mirrors);
+  let instances: Vec<String> = daemons
+    .iter()
+    .map(|daemon| daemon.instance().to_owned())
+    .collect();
+  let hosts: Vec<HostId> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
+  assert_fleet_forms(&daemons, &hosts, &names);
+
+  let mut client = Client::connect(&instances[0].clone());
+  let (id, snapshot) = write_and_snapshot(&mut client, "mirrored");
+  let observed: Vec<&Daemon> = daemons.iter().collect();
+  let placed = poll_snapshot_placed(&observed, &mut client, id, snapshot);
+  let manifest = daemons[0].fleet_head_manifest(ObjectId(id.bytes));
+  let mut holding = 0;
+  let mirrored = matches!(manifest, Ok(Some(_)))
+    && poll_until(&observed, PLACEMENT_DEADLINE, || {
+      let Ok(Some(manifest)) = manifest else {
+        return Ok(false);
+      };
+      holding = daemons[3..]
+        .iter()
+        .filter(|daemon| daemon.fleet_holder_content(manifest) == Ok(true))
+        .count();
+      Ok(holding >= 2)
+    });
+  // The owner records the mirror placement once f + 1 there acknowledged: `await placed(mirror)` answers it.
+  let awaited = mirrored
+    && poll_until(&observed, PLACEMENT_DEADLINE, || {
+      Ok(matches!(
+        client.call(&RequestBody::AwaitPlaced {
+          volume: id,
+          snapshot: Some(snapshot),
+          scope: Scope::Mirror,
+        }),
+        ReplyBody::Placed { placed: true, .. }
+      ))
+    });
+  // Caught up, the volume's mirror lag is zero.
+  let mirror_age = match client.call(&RequestBody::Status { volume: id }) {
+    ReplyBody::Status { report } => report.placed.mirror_age_ns,
+    _ => None,
+  };
+  for daemon in daemons {
+    daemon.stop();
+  }
+  assert!(placed, "the snapshot placed in its home region first");
+  assert_eq!(
+    mirror_age,
+    Some(0),
+    "the volume's mirror lag is zero once its head is mirrored"
+  );
+  assert!(
+    awaited,
+    "`await placed(mirror)` answers placed once f + 1 of the mirror region hold the snapshot"
+  );
+  assert!(
+    mirrored,
+    "f + 1 of the mirror region's daemons hold the snapshot whole (held by {holding}; manifest {manifest:?})"
+  );
+}
+
+/// Creates a volume through `client`, writes one file into it under a write attachment, and snapshots it: the
+/// volume and the snapshot.
+fn write_and_snapshot(client: &mut Client, name: &str) -> (VolumeId, SnapshotId) {
+  let ReplyBody::Created { id } = client.call(&scratch(name)) else {
+    panic!("create {name}");
+  };
+  let ReplyBody::Attached { attachment, .. } = client.call(&RequestBody::Attach {
+    volume: id,
+    snapshot: None,
+    intent: Intent::Write,
+    form: AttachRequest::Root,
+  }) else {
+    panic!("attach {name}");
+  };
+  let written = client.call(&RequestBody::FsWrite {
+    volume: id,
+    attachment,
+    path: "/hello".to_owned(),
+    bytes: b"hello across regions".to_vec(),
+    mode: 0o644,
+  });
+  assert!(
+    matches!(written, ReplyBody::FsDone { .. }),
+    "write: {written:?}"
+  );
+  let ReplyBody::Snapshotted { id: snapshot, .. } =
+    client.call(&RequestBody::Snapshot { volume: id })
+  else {
+    panic!("snapshot {name}");
+  };
+  (id, snapshot)
+}
+
 /// Polls a `Status` of `volume` through `client` until it is served or `within` passes: whether it was, and the
 /// last reply, so a wait that fails names what the node answered.
 fn poll_status_served(

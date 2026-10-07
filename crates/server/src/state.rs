@@ -649,6 +649,16 @@ pub struct ShardState {
   /// `f + 1` hold it, and is dropped once the head naming it places and the snapshot is recorded placed.
   /// Empty on a laptop and whenever every owned snapshot is placed.
   pub seals: BTreeMap<ObjectId, crate::head::SealJob>,
+  /// The mirror shipments in progress for volumes this node owns (§4.10 "Mirroring across regions";
+  /// `docs/wip/mirroring.md`), by object: a placed head snapshot's archive put to the owner's neighbourhood in the
+  /// mirror region until `f + 1` there hold it, then recorded (`SnapshotPlaced { mirror }`) and dropped. One per
+  /// object, the newest placed snapshot superseding an older one still shipping. Empty with no mirror declared.
+  pub mirror_seals: BTreeMap<ObjectId, crate::head::SealJob>,
+  /// This node's neighbourhood in its region's declared mirror region (`slates_db::mirror::mirror_neighbourhood`),
+  /// recomputed once a record period from the mirror region's members held alive: the hosts mirror shipments go to.
+  /// Direct contact keeps them already: a member of another region is never in this region's council configuration.
+  /// Empty with no mirror declared or none of its members alive.
+  pub mirror_neighbourhood: Vec<slates_db::HostId>,
   /// The measured put latency of this node's **content class** (§4.8 "Derived constants": "hedge delay =
   /// measured p95 put latency per class"): one reading per binding content acknowledgement this owner
   /// shard has collected — the time from the round's dispatch to that holder's verified acknowledgement.

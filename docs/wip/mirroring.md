@@ -96,12 +96,30 @@ What the mirror did not receive is the loss window; the status reports it per vo
 
    Tests: the cohort is the rendezvous prefix whatever the input order, and every authority clause is checked
    against a table.
-2. **M2, shipping content and the record.** The mirror job, the mirror holders' authority path, and
-   `SnapshotPlaced { mirror }`. Fleet test: two regions of three at `f = 1`; a snapshot in region 0 is held at
-   `f + 1` in region 1.
-3. **M3, `has_mirror` and the waits.** `has_mirror` comes from the manifest; then `await placed(mirror)`,
-   `NotPlaced { mirror }` at its deadline, and `mirror_age` in `slates status ID` and the health signals.
-4. **M4, promotion adoption.** Fleet test (AC-8.15): region 0 killed and promoted, the snapshot's bytes read from
-   region 1, and an operation that awaited the mirror intact.
+2. **M2, shipping the content.** Built 2026-10-07 (`crates/server/src/fleet.rs`):
+   - `advance_mirror_seals` starts a job per owned volume whose head is placed at home and not yet in the mirror.
+     A newer snapshot replaces an older job.
+   - The jobs run the ordinary content rounds over a `Track::Mirror` seal map, with the first round sized
+     `f + 1`, since the owner holds no mirror copy.
+   - The owner's mirror neighbourhood is recomputed each period (`mirror_neighbourhood_of`).
+   - The holder admits a mirror put through `content_holder::MirrorView` (M1's rule).
+   - `record_mirrored_seals` writes `SnapshotPlaced { mirror: Some(holders) }`.
+
+   The head record itself is not mirrored yet: it moves to M4, which needs it for adoption.
+3. **M3, `has_mirror` and the waits.** Built 2026-10-07:
+   - `has_mirror` is set at bootstrap from the manifest, and joiners receive it in the group's base configuration;
+   - `await placed(mirror)` answers from the recorded mirror placement, at `f + 1` holders;
+   - `mirror_age_ns` is in every volume's placed state: zero once mirrored, otherwise the time since the head
+     snapshot was taken, and unknown across a clock boot.
+
+   Still owed: `NotPlaced { mirror }` at a wait's deadline. The verb answers the current fact and does not wait.
+
+   Fleet test for M2 and M3: `a_placed_snapshot_is_held_whole_by_f_plus_one_hosts_of_the_mirror_region`. Two
+   regions of three at `f = 1`; a file written and snapshotted in region 0. It passed 3 of 3 (2.1–3.8 s). The
+   control, with shipping switched off, failed with no mirror host holding anything after 448 s.
+4. **M4, the mirrored head record and promotion adoption.** The head record naming the mirror holders is committed
+   at `f + 1` of them, under the mirror rule's authority. Promotion then runs the per-host takeover in the mirror
+   region. Fleet test (AC-8.15): region 0 killed and promoted, the snapshot's bytes read from region 1, and an
+   operation that awaited the mirror intact.
 5. **M5, the two-network proof.** `docs/wip/bench/multiregion/run.sh` under a shaped router. This waits on the
    detector's far-link fix (`docs/bugs/2026-10-07-a-far-member-condemns-the-near-side-by-its-pooled-deadline.md`).

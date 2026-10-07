@@ -4309,7 +4309,9 @@ An 8 MiB file was written on `a1` and read back byte-identical there (sha256 `5b
   regression `a_client_of_another_node_in_the_owners_region_reads_and_writes_its_volume_through_the_owner`). The
   server had forwarded only volumes homed in another region, so a client of `a0` or `a2` could not read `a1`'s
   volume.
-- **Open, and the core of condition 10: cross-region mirroring is not built.** §4.10 "Mirroring across regions"
+- **Mirroring in part (later the same day):** content shipping, `await placed(mirror)` and `mirror_age` are built
+  (`docs/wip/mirroring.md` M1–M3). The mirrored head record and promotion adoption are still owed (M4).
+- **Open, and the core of condition 10: cross-region mirroring was not built.** §4.10 "Mirroring across regions"
   ships every committed record and its content to the owner's neighbourhood in the mirror region, acknowledged at
   `f + 1` there, with `mirror_age` exposed. In the code:
   - `Placement::mirror_acked` is only ever `None`;

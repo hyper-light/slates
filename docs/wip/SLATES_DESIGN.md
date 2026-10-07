@@ -4173,6 +4173,14 @@ for it; region loss promotes the mirror through the root group; a promoted volum
 chosen in the mirror region by the same rendezvous, and its loss window is the mirror lag at the
 moment of loss.
 
+> **Status (2026-10-07, mirroring in part).** A home-placed head snapshot's content is shipped to the owner's
+> neighbourhood in the mirror region and recorded `SnapshotPlaced { mirror }` once `f + 1` there hold it, through
+> the ordinary content rounds. A mirror holder admits only a put from a member of the object's standing home region,
+> and only where its own region is that home's declared mirror. `has_mirror` comes from the manifest,
+> `await placed(mirror)` answers the recorded fact, and `mirror_age` is reported per volume. Owed: the mirrored head
+> record and promotion adoption (the promoted region still serves nothing). `docs/wip/mirroring.md` holds the design
+> and the pieces.
+
 **Failure matrix.** A recorded holder unreachable during fetch: Masked (another recorded holder,
 hedged). All recorded holders unreachable: Refused (`ContentUnavailable{identity}`) for that
 read, the rest of the namespace continues. Neighbourhood change mid-attach: Masked (chunks are

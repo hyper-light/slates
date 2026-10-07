@@ -1413,8 +1413,9 @@ async fn serve_peer_records(
                 s,
                 local,
                 &request,
-                |regional, records, access, object| {
+                |regional, records, mirror, access, object| {
                   content_authorized(regional, records, local, peer_host, access, object)
+                    || mirror.admits_put(peer_host, access, object)
                 },
               )
             })
@@ -1952,8 +1953,32 @@ fn head_value_of(
   Some((seal.sequence, value(seal.manifest, holders)))
 }
 
+/// Which content placement a seal job serves: the home region's candidates, or the owner's neighbourhood in its
+/// mirror region (§4.10 "Mirroring across regions"; `docs/wip/mirroring.md`). The two run the same rounds over
+/// different candidates and are kept apart, each in its own map on the owner shard.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Track {
+  /// The seal of a new snapshot to the home region's candidates ([`ShardState::seals`]).
+  Home,
+  /// The shipment of a home-placed snapshot to the mirror region ([`ShardState::mirror_seals`]).
+  Mirror,
+}
+
+/// The seal jobs of `track` on this owner shard.
+fn seal_jobs(
+  state: &mut ShardState,
+  track: Track,
+) -> &mut std::collections::BTreeMap<ObjectId, SealJob> {
+  match track {
+    Track::Home => &mut state.seals,
+    Track::Mirror => &mut state.mirror_seals,
+  }
+}
+
 /// A seal whose archive is complete and whose content is not yet placed: the put to run this period.
 struct ContentWork {
+  /// Which placement the seal serves: its map on the owner shard, and the first round's size.
+  track: Track,
   /// The shard that owns the volume — where the seal lives and its acknowledgements are recorded.
   shard: u16,
   object: ObjectId,
@@ -1980,6 +2005,197 @@ struct ContentWork {
 /// base-backed entry whose bytes are on disk, not in RAM; a torn read): the seal stays `Local`, reported.
 /// Format: a refusal name in the daemon's status report, alongside the verbs' refusal kinds.
 const SEAL_REFUSED: &str = "fleet.seal";
+
+/// This node's neighbourhood in its region's mirror region (§4.10 "the owner's neighbourhood in the mirror region";
+/// `docs/wip/mirroring.md` decision 1): the mirror region's members this node holds alive and has authenticated,
+/// ranked by rendezvous keyed on this node. Empty when its region declares no mirror.
+fn mirror_neighbourhood_of(state: &ShardState, local: HostId) -> Vec<HostId> {
+  let own = state
+    .node_regions
+    .get(&local)
+    .copied()
+    .unwrap_or(RegionId(0));
+  let Some(mirror) = state.region_mirrors.get(&own).copied() else {
+    return Vec::new();
+  };
+  if mirror == own {
+    return Vec::new();
+  }
+  let members: Vec<HostId> = state
+    .node_regions
+    .iter()
+    .filter(|(host, region)| {
+      **region == mirror
+        && state.authenticated_members.contains(host)
+        && state
+          .fleet
+          .membership()
+          .state(**host)
+          .is_some_and(|belief| belief.liveness != Liveness::Dead)
+    })
+    .map(|(host, _)| *host)
+    .collect();
+  slates_db::mirror::mirror_neighbourhood(local, &members, state.fleet.configuration().quorum)
+}
+
+/// One period of this node's mirror shipments (§4.10 "Mirroring across regions"; `docs/wip/mirroring.md` piece M2):
+/// for each owned volume whose head snapshot is recorded placed at home and not yet in the mirror, a mirror job is
+/// started (or replaced, when a newer snapshot superseded it), its archive walk advanced one slice, and its content
+/// round to the mirror neighbourhood returned once the archive is complete. A volume whose head the mirror already
+/// holds, or that is being destroyed, keeps no job. Nothing runs with no mirror declared.
+fn advance_mirror_seals(
+  state: &mut ShardState,
+  local: HostId,
+  slice_bytes: u64,
+  created_unix: u64,
+  round: CommitBudget,
+) -> Vec<ContentWork> {
+  state.mirror_neighbourhood = mirror_neighbourhood_of(state, local);
+  if state.mirror_neighbourhood.is_empty() {
+    state.mirror_seals.clear();
+    return Vec::new();
+  }
+  let quorum = state.fleet.configuration().quorum;
+  let mut work = Vec::new();
+  let volumes: Vec<(DbVolumeId, slates_mem::Handle<crate::state::VolumeSlot>)> =
+    state.by_id.iter().map(|(id, h)| (*id, *h)).collect();
+  for (id, handle) in volumes {
+    let object = ObjectId(id.bytes);
+    let Some(head) = mirror_due(state, id) else {
+      state.mirror_seals.remove(&object);
+      continue;
+    };
+    if state
+      .mirror_seals
+      .get(&object)
+      .is_some_and(|job| job.snapshot != head.0)
+    {
+      state.mirror_seals.remove(&object);
+    }
+    if !state.mirror_seals.contains_key(&object)
+      && !start_mirror_seal(state, object, handle, head, created_unix)
+    {
+      continue;
+    }
+    if !advance_seal(state, Track::Mirror, object, handle, slice_bytes) {
+      continue;
+    }
+    if let Some(item) = content_work(state, Track::Mirror, object, quorum, round) {
+      work.push(item);
+    }
+  }
+  work
+}
+
+/// The head snapshot of `id` and its sequence when it is placed at home and its mirror placement is not yet recorded:
+/// what a mirror job ships. `None` before the home placement (content places at home first), once the mirror holds
+/// it, and for a volume being destroyed.
+fn mirror_due(state: &ShardState, id: DbVolumeId) -> Option<(DbSnapshotId, u64)> {
+  let record = state.db.partition().volume(id)?;
+  if record.epoch == 0 || record.state == VolumeState::Destroying {
+    return None;
+  }
+  let snapshot = state.db.partition().snapshot(id, record.head)?;
+  matches!(snapshot.placed, PlacementState::Placed { mirror: None, .. })
+    .then_some((record.head, record.epoch))
+}
+
+/// Starts the mirror shipment of `head` for `object`: the archive walk over the volume's snapshot, put to the
+/// object's cohort in the mirror neighbourhood (its rendezvous order over it), with nothing acknowledged yet: the
+/// owner holds no mirror copy. `false`, counted, if the snapshot cannot be walked.
+fn start_mirror_seal(
+  state: &mut ShardState,
+  object: ObjectId,
+  handle: slates_mem::Handle<crate::state::VolumeSlot>,
+  (head, sequence): (DbSnapshotId, u64),
+  created_unix: u64,
+) -> bool {
+  let Ok(slot) = state.volumes.get(handle) else {
+    return false;
+  };
+  let archiver = SnapshotArchiver::new(
+    &slot.volume,
+    &state.store,
+    verbs::core_snapshot(slates_ipc::protocol::SnapshotId { value: head.value }),
+    object.local(),
+    created_unix,
+    state.config.codec.clone(),
+  );
+  let Ok(archiver) = archiver else {
+    state.count(SEAL_REFUSED, 1);
+    return false;
+  };
+  let candidates = slates_db::register::rendezvous_ranked(&state.mirror_neighbourhood, object);
+  state.mirror_seals.insert(
+    object,
+    SealJob {
+      snapshot: head,
+      sequence,
+      archiver: Some(archiver),
+      archive: None,
+      manifest: None,
+      content: Placement {
+        candidates,
+        acked: Vec::new(),
+        mirror_acked: None,
+        joint: Vec::new(),
+      },
+      rounds: 0,
+      first_round_at_ns: None,
+      healing: false,
+    },
+  );
+  true
+}
+
+/// Records durably each mirror shipment whose content `f + 1` of its mirror cohort hold
+/// (`SnapshotPlaced { mirror: Some(holders) }`, keeping the home placement), and drops it: the fact
+/// `await placed(mirror)` and a mirror's lag answer from. Runs on the owner shard.
+fn record_mirrored_seals(state: &mut ShardState) {
+  let quorum = state.fleet.configuration().quorum;
+  let now = state.clock.monotonic_ns();
+  let done: Vec<(ObjectId, DbSnapshotId, Vec<u64>)> = state
+    .mirror_seals
+    .iter()
+    .filter(|(_, job)| job.manifest.is_some() && job.content.placed(quorum))
+    .map(|(object, job)| {
+      (
+        *object,
+        job.snapshot,
+        job.content.acked.iter().map(|host| host.0).collect(),
+      )
+    })
+    .collect();
+  for (object, snapshot, mirror) in done {
+    let volume = DbVolumeId { bytes: object.0 };
+    let region = match state.db.partition().snapshot(volume, snapshot) {
+      Some(record) => match &record.placed {
+        PlacementState::Placed { region, .. } => region.clone(),
+        PlacementState::Local => Vec::new(),
+      },
+      None => Vec::new(),
+    };
+    let placed = Op::SnapshotPlaced {
+      volume,
+      id: snapshot,
+      placed: PlacementState::Placed {
+        region,
+        mirror: Some(mirror),
+      },
+    };
+    // A snapshot gone meanwhile (destroyed) has nothing to record; the job is dropped either way.
+    let recorded = state.db.mutate(&mut state.segment, &placed, now);
+    if recorded.is_err() {
+      state.count(MIRROR_RECORD_REFUSED, 1);
+    }
+    state.mirror_seals.remove(&object);
+  }
+}
+
+/// The status count of mirror placements the database refused to record (the snapshot destroyed meanwhile, or the
+/// partition refusing): the shipment is dropped and the next period starts it again if the snapshot still stands.
+/// Format: a refusal name in the daemon's status report.
+const MIRROR_RECORD_REFUSED: &str = "fleet.mirror.record_refused";
 
 /// One period of this node's seals (§4.10 "auto-seal" → content replication; §4.3 bounded slices): for each
 /// owned volume whose newest snapshot is not yet placed, a seal job is started (or replaced, when a newer
@@ -2030,10 +2246,10 @@ fn advance_seals(
     {
       continue;
     }
-    if !advance_seal(state, object, handle, slice_bytes) {
+    if !advance_seal(state, Track::Home, object, handle, slice_bytes) {
       continue;
     }
-    if let Some(item) = content_work(state, object, quorum, round) {
+    if let Some(item) = content_work(state, Track::Home, object, quorum, round) {
       work.push(item);
     }
   }
@@ -2213,11 +2429,17 @@ fn start_seal(
 /// `Local`, counted so an operator sees why it never places (§4.4 coverage is never upgraded).
 fn advance_seal(
   state: &mut ShardState,
+  track: Track,
   object: ObjectId,
   handle: slates_mem::Handle<crate::state::VolumeSlot>,
   slice_bytes: u64,
 ) -> bool {
-  let Some(job) = state.seals.get_mut(&object) else {
+  // The track's map is picked field by field, so the job is borrowed beside the volumes and the store.
+  let jobs = match track {
+    Track::Home => &mut state.seals,
+    Track::Mirror => &mut state.mirror_seals,
+  };
+  let Some(job) = jobs.get_mut(&object) else {
     return false;
   };
   let Some(archiver) = job.archiver.as_mut() else {
@@ -2241,7 +2463,7 @@ fn advance_seal(
   let Some(archive) = envelope_of(state, object, archive) else {
     return false;
   };
-  let Some(job) = state.seals.get_mut(&object) else {
+  let Some(job) = seal_jobs(state, track).get_mut(&object) else {
     return false;
   };
   job.manifest = Some(archive.manifest_identity());
@@ -2439,6 +2661,7 @@ fn fold_content_ack(job: &mut SealJob, holder: HostId) {
 /// happen to be driven at (§4.8 "hedged to the remaining candidates after the measured p95 put latency").
 fn content_work(
   state: &mut ShardState,
+  track: Track,
   object: ObjectId,
   quorum: Quorum,
   round: CommitBudget,
@@ -2446,7 +2669,8 @@ fn content_work(
   let hedge_delay = hedge_delay_ns(&state.put_latency);
   let budget = content_budget(&state.put_latency, round);
   let now = state.clock.monotonic_ns();
-  let job = state.seals.get_mut(&object)?;
+  let shard = state.shard;
+  let job = seal_jobs(state, track).get_mut(&object)?;
   if job.content.placed(quorum) {
     return None;
   }
@@ -2457,7 +2681,8 @@ fn content_work(
   };
   let archive = job.archive.take()?;
   Some(ContentWork {
-    shard: state.shard,
+    track,
+    shard,
     object,
     snapshot: job.snapshot,
     sequence: job.sequence,
@@ -2496,7 +2721,15 @@ fn hedge_targets(hedged: bool, remote: Vec<HostId>, first_round: usize) -> Vec<H
 /// dispatch to settle.
 async fn put_seal_content(origin: u16, local: HostId, work: ContentWork) -> Option<Dispatch> {
   let budget = work.budget;
-  let hedge = usize::try_from(work.quorum.f).unwrap_or(0);
+  // The first round reaches `f + 1` copies: at home the owner is one of them, so `f` remote candidates; in the
+  // mirror region the owner holds none, so `f + 1`.
+  let owner_copies = match work.track {
+    Track::Home => 0,
+    Track::Mirror => 1,
+  };
+  let hedge = usize::try_from(work.quorum.f)
+    .unwrap_or(0)
+    .saturating_add(owner_copies);
   let remote: Vec<HostId> = work
     .candidates
     .iter()
@@ -2529,6 +2762,7 @@ async fn put_seal_content(origin: u16, local: HostId, work: ContentWork) -> Opti
       &placed.reusable,
       placed.stragglers,
       LateReplies::Content {
+        track: work.track,
         shard: work.shard,
         object: work.object,
         snapshot: work.snapshot,
@@ -2556,6 +2790,7 @@ async fn put_seal_content(origin: u16, local: HostId, work: ContentWork) -> Opti
   // their latencies (the content class's readings the next hedge is sized from), and note when the first
   // round went out (the hedge is held until it has been outstanding for the measured p95).
   let ContentWork {
+    track,
     shard,
     object,
     snapshot,
@@ -2568,7 +2803,8 @@ async fn put_seal_content(origin: u16, local: HostId, work: ContentWork) -> Opti
     for (_, latency_ns) in &latencies_ns {
       s.put_latency.record(*latency_ns);
     }
-    let Some(job) = s.seals.get_mut(&object) else {
+    // The job is borrowed alone; what the round counts is written after the borrow ends.
+    let Some(job) = seal_jobs(s, track).get_mut(&object) else {
       return; // The seal was superseded meanwhile; its archive is dropped with it.
     };
     if job.snapshot != snapshot {
@@ -2578,24 +2814,28 @@ async fn put_seal_content(origin: u16, local: HostId, work: ContentWork) -> Opti
     if round == 0 && job.first_round_at_ns.is_none() {
       job.first_round_at_ns = Some(dispatched_ns);
     }
-    if let Some(placement) = placement {
-      job.rounds = job.rounds.saturating_add(1);
-      // A healing round that shipped bytes to a holder repaired it: that holder had lost content the
-      // placement recorded it as holding (§4.10 "repairs only differing subtrees").
-      if job.healing {
-        let repaired = refilled
-          .iter()
-          .filter(|host| placement.acked.contains(host))
-          .count();
-        s.repairs = s
-          .repairs
-          .saturating_add(u64::try_from(repaired).unwrap_or(u64::MAX));
-      }
-      for host in placement.acked {
-        fold_content_ack(job, host);
-      }
-      s.put_outcomes.record(job.content.placed(quorum));
+    let Some(placement) = placement else {
+      return;
+    };
+    job.rounds = job.rounds.saturating_add(1);
+    // A healing round that shipped bytes to a holder repaired it: that holder had lost content the
+    // placement recorded it as holding (§4.10 "repairs only differing subtrees").
+    let repaired = if job.healing {
+      refilled
+        .iter()
+        .filter(|host| placement.acked.contains(host))
+        .count()
+    } else {
+      0
+    };
+    for host in placement.acked {
+      fold_content_ack(job, host);
     }
+    let placed = job.content.placed(quorum);
+    s.repairs = s
+      .repairs
+      .saturating_add(u64::try_from(repaired).unwrap_or(u64::MAX));
+    s.put_outcomes.record(placed);
   });
   dispatch
 }
@@ -3689,6 +3929,8 @@ pub(crate) enum LateReplies {
   /// manifest it was put for, and timed into the put-latency window — never discarded: the stop bounds how
   /// long the round waits before hedging, not whether a slow holder's verified hold counts.
   Content {
+    /// Which placement the round served: the seal's map on its owner shard.
+    track: Track,
     /// The owner shard the seal lives on.
     shard: u16,
     /// The object whose seal the round put.
@@ -3771,6 +4013,7 @@ impl Dispatch {
 /// seal ignores the fold. Only a `LateReplies::Content` reaches here.
 fn fold_late_content(late: LateReplies, replies: &[(HostId, TimedReply)]) {
   let LateReplies::Content {
+    track,
     shard,
     object,
     snapshot,
@@ -3796,7 +4039,7 @@ fn fold_late_content(late: LateReplies, replies: &[(HostId, TimedReply)]) {
   crate::xshard::run_on_counted(origin, shard, move |s| {
     for holder in &acked {
       s.put_latency.record(latency_ns);
-      if let Some(job) = s.seals.get_mut(&object)
+      if let Some(job) = seal_jobs(s, track).get_mut(&object)
         && job.snapshot == snapshot
         && job.content.candidates.contains(holder)
       {
@@ -5580,6 +5823,38 @@ async fn follow_configuration(
   }
 }
 
+/// Advances `shard`'s seal jobs of `track` one bounded slice each on the owner shard and runs the content rounds
+/// of those whose archive is complete, keeping each round's dispatch for its stragglers.
+async fn put_track_content(
+  origin: u16,
+  shard: u16,
+  local: HostId,
+  budget: CommitBudget,
+  track: Track,
+  in_flight: &mut Vec<Dispatch>,
+) {
+  let work = call_within(
+    origin,
+    shard,
+    move |s| {
+      let slice_bytes = s.config.archive_slice_bytes();
+      let created_unix = u64::try_from(s.clock.wall_ns()).unwrap_or(0) / NANOS_PER_SECOND;
+      match track {
+        Track::Home => advance_seals(s, local, slice_bytes, created_unix, budget),
+        Track::Mirror => advance_mirror_seals(s, local, slice_bytes, created_unix, budget),
+      }
+    },
+    HEARTBEAT_NS,
+  )
+  .await
+  .unwrap_or_default();
+  for item in work {
+    if let Some(dispatch) = put_seal_content(origin, local, item).await {
+      in_flight.push(dispatch);
+    }
+  }
+}
+
 /// One period of the record plane for the volumes `shard` owns, in the order the design's placement rule
 /// requires: seals advance and their content is put (content places first), then the heads naming placed
 /// content ship, then the seals whose content and head both placed are recorded durably. The seal walk,
@@ -5595,28 +5870,15 @@ async fn run_record_period(
   in_flight: &mut Vec<Dispatch>,
 ) {
   // Advance the shard's seals one bounded slice each and put the completed archives' content to their
-  // candidates (§4.10) — content places before the head that names it ships.
-  let seals = call_within(
-    origin,
-    shard,
-    move |s| {
-      let slice_bytes = s.config.archive_slice_bytes();
-      let created_unix = u64::try_from(s.clock.wall_ns()).unwrap_or(0) / NANOS_PER_SECOND;
-      advance_seals(s, local, slice_bytes, created_unix, budget)
-    },
-    HEARTBEAT_NS,
-  )
-  .await
-  .unwrap_or_default();
-  for work in seals {
-    if let Some(dispatch) = put_seal_content(origin, local, work).await {
-      in_flight.push(dispatch);
-    }
-  }
+  // candidates (§4.10) — content places before the head that names it ships — then the shipments of placed heads
+  // to the mirror region (§4.10 "Mirroring across regions").
+  put_track_content(origin, shard, local, budget, Track::Home, in_flight).await;
+  put_track_content(origin, shard, local, budget, Track::Mirror, in_flight).await;
   deliver_pairs(origin, shard, local, budget).await;
   ship_shard_heads(origin, shard, local, budget, owner_acceptor, in_flight).await;
   // Record durably each seal whose content and head have both placed.
   crate::xshard::run_on_counted(origin, shard, record_placed_seals);
+  crate::xshard::run_on_counted(origin, shard, record_mirrored_seals);
   retire_shard_tombstones(origin, shard, local, owner_acceptor).await;
   // The greens' merge records (§4.16 "Commit"): each green's lowest pending version — its inputs put
   // while unplaced, its record shipped in order once they are.

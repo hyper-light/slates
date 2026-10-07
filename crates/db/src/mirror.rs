@@ -100,6 +100,14 @@ pub fn mirror_cohort(object: ObjectId, members: &[HostId], quorum: Quorum) -> Ve
   ranked
 }
 
+/// The owner's neighbourhood in the mirror region (§4.10 "the owner's neighbourhood in the mirror region";
+/// `docs/wip/mirroring.md` decision 1): the first `2f + 1` of the mirror region's `members` in rendezvous order keyed on
+/// the owner, so every object an owner mirrors goes to the same bounded set and the owner keeps direct contact with
+/// those hosts alone. An object's cohort is this set in its own rendezvous order ([`mirror_cohort`]).
+pub fn mirror_neighbourhood(owner: HostId, members: &[HostId], quorum: Quorum) -> Vec<HostId> {
+  mirror_cohort(ObjectId::new(owner, 0), members, quorum)
+}
+
 /// Why a mirror holder refuses a put of a record or content (`docs/wip/mirroring.md` decision 2).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MirrorRefusal {

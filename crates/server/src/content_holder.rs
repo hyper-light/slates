@@ -10,7 +10,9 @@
 use std::collections::BTreeMap;
 
 use slates_cluster::content::ContentAccess;
-use slates_db::register::{Acceptor, HostId, ObjectId, RegionalConfiguration};
+use slates_db::register::{
+  Acceptor, HostId, ObjectId, RegionId, RegionalConfiguration, RootConfiguration,
+};
 
 use crate::state::ShardState;
 
@@ -26,6 +28,37 @@ pub(crate) fn hold_space(
   }
 }
 
+/// What a holder knows of the regions, for a put from the owner of an object homed in another region
+/// (`docs/wip/mirroring.md` decision 2): the root configuration, each region's declared mirror, every member's
+/// region, and the holder's own.
+pub(crate) struct MirrorView<'a> {
+  /// The root group's committed configuration: homes moved and regions promoted.
+  pub(crate) root: &'a RootConfiguration,
+  /// Each region's declared mirror (the manifest's `mirrors`).
+  pub(crate) mirrors: &'a BTreeMap<RegionId, RegionId>,
+  /// Every member's declared region.
+  pub(crate) regions: &'a BTreeMap<HostId, RegionId>,
+  /// This holder's region.
+  pub(crate) own: RegionId,
+}
+
+impl MirrorView<'_> {
+  /// Whether `peer` may place `object`'s content here as a mirror copy (`slates_db::mirror::admits_mirror_put`):
+  /// only a placement, only at the home's declared mirror, only from a member of the object's standing home.
+  pub(crate) fn admits_put(&self, peer: HostId, access: ContentAccess, object: ObjectId) -> bool {
+    access == ContentAccess::Place
+      && slates_db::mirror::admits_mirror_put(
+        self.root,
+        self.mirrors,
+        self.regions,
+        self.own,
+        peer,
+        object,
+      )
+      .is_ok()
+  }
+}
+
 /// Serves one content request as `local`, with `authorized` deciding the access asked for the object named
 /// from the committed configuration and this holder's records. Returns the reply: an empty one for
 /// anything refused, malformed, unverifiable or unheld.
@@ -36,16 +69,27 @@ pub(crate) fn serve(
   authorized: impl FnOnce(
     &RegionalConfiguration,
     &BTreeMap<ObjectId, Acceptor>,
+    &MirrorView<'_>,
     ContentAccess,
     ObjectId,
   ) -> bool,
 ) -> Vec<u8> {
   let (council, records) = (&state.council, &state.holder_records);
+  let mirror = MirrorView {
+    root: state.root.configuration(),
+    mirrors: &state.region_mirrors,
+    regions: &state.node_regions,
+    own: state
+      .node_regions
+      .get(&local)
+      .copied()
+      .unwrap_or(RegionId(0)),
+  };
   let (reply, held) = state.held_content.serve(
     &mut hold_space(&mut state.store),
     local,
     request,
-    |access, object| authorized(council.configuration(), records, access, object),
+    |access, object| authorized(council.configuration(), records, &mirror, access, object),
     |object, sequence, manifest| {
       crate::content_retention::admits(records, local, object, sequence, manifest)
     },
