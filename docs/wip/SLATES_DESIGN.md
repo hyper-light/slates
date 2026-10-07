@@ -3733,6 +3733,19 @@ snapshot reads need no latest-head lease but still require read rights and verif
 >   `a_change_in_flight_needs_confirmations_in_both_cohorts`,
 >   `an_owner_keeps_direct_contact_with_its_settled_neighbourhood_while_a_change_is_in_flight`, and the
 >   intersection oracle over every set of live candidates.
+>
+> **Status (2026-10-07, renewal).** The owner renews its lease at the lease's cadence, not the failure
+> detector's (`crates/cluster/src/lease_renewal.rs`;
+> `docs/bugs/2026-10-07-an-owner-lease-lapsed-while-far-members-stretched-the-probe-round.md`). Each step the
+> membership plane probes every host of the owner's neighbourhood, settled and current, that it has not probed
+> within one coordinator period; the answer confirms exactly as the detector's acknowledgement does, from its own
+> send. Before, only the detector's rotation over every member renewed it, so on two networks 100 ms ± 40 ms apart
+> the near holders' answers were 966–1,766 ms old against the 900 ms bound and the owner refused its own objects
+> while every member lived. Renewal nonces sit in their own range, checked against the detector's, and each holder
+> keeps only the renewals one bound can still credit. Regression
+> `an_owner_is_answered_by_its_holder_within_the_lease_bound_while_far_members_stretch_the_round` (simulated: 9,886 ms
+> unanswered before, the 100 ms interval after, 10 of 10 runs); on the two Docker networks the lease's unconfirmed
+> verdicts went from every forwarded read to none.
 
 **Authority scope.** Host failure increments the host epoch and fences every object owned by
 that host. Moving one volume changes that object's ownership generation, recorded in the

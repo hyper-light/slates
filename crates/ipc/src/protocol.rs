@@ -987,6 +987,8 @@ pub struct ShardReport {
   pub configuration_version: u64,
   /// The takeover state as this shard's council holds it (live on the control shard).
   pub takeover: TakeoverReport,
+  /// This shard's failure detector's report of each peer (live on the control shard, empty elsewhere).
+  pub detector: Vec<DetectorPeerReport>,
   /// Task admissions this shard's runtime arena refused since boot (§4.3 "a task exceeding the budget
   /// is a counted bug signal"; §4.14): the shard's derived task budget covers every task the daemon
   /// spawns on it — clients' cross-shard work, its own loops, the fleet's share — so a count here is a
@@ -1057,6 +1059,30 @@ pub struct FleetReport {
   /// The takeover state as the control shard's council holds it: this node's neighbourhood settlement and
   /// every retirement kept, so a takeover that stalls shows why in any node's status.
   pub takeover: TakeoverReport,
+  /// What the control shard's failure detector found of each peer by its own probes (§4.8 membership), with
+  /// the theory's allowance beside each count: a count far above its allowance is a detector misjudging a
+  /// live peer, one within it is the network the detector was told about. Empty on a laptop.
+  pub detector: Vec<DetectorPeerReport>,
+}
+
+/// One peer as this node's failure detector judges it (hyper-swim's `PeerReport`): the suspicions and
+/// condemnations its own probes made, each beside the expected number were the peer alive throughout
+/// (Chen, Toueg and Aguilera 2002, Theorem 7, summed over every judged probe), in thousandths.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct DetectorPeerReport {
+  /// The peer's member id.
+  pub peer: u64,
+  /// Whether the pair's own estimator judges its probes (rather than the member's pooled one, or none yet).
+  pub configured: bool,
+  /// Suspicions this node's own probes started.
+  pub suspicions: u64,
+  /// Their allowance in thousandths: the expected suspicions of a peer alive throughout.
+  pub suspicion_allowance_milli: u64,
+  /// Times this node condemned the peer by its own probes.
+  pub condemnations: u64,
+  /// Their allowance in thousandths: over every judged probe, the bound on it and the probe before both
+  /// going unanswered.
+  pub condemnation_allowance_milli: u64,
 }
 
 /// The takeover state a council holds (§4.8 "Neighbourhood changes", "Promotion and takeover"): this node's

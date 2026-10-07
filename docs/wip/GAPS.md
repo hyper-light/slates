@@ -4282,3 +4282,38 @@ test passed 3/3 and the rejoin test 3/3. Their failures are specific to the runn
 
    It is specific to CI's x86_64 runner, where the remaining evidence must come from.
 
+
+### 2026-10-07: two regions on two networks — the lease fixed, three gaps found (condition 10)
+
+Six daemons, three per region, from one manifest, on two Docker networks joined only by a router container. The
+router shapes 100 ms ± 40 ms one way and 3 % loss each way (`docs/wip/bench/multiregion/run.sh`; cross-region ping
+167–451 ms, in-region 0.08 ms). Both regions bootstrapped, and the root leader settled with one voter per region.
+An 8 MiB file was written on `a1` and read back byte-identical there (sha256 `5bb81865…`).
+
+- **Fixed: the owner lease lapsed.** Every read forwarded from region 1 was refused `LeaseUnconfirmed`; the owner's
+  near holders' answers were 966–1,766 ms old against the 900 ms bound. Lease renewal at the coordinator period
+  (`docs/bugs/2026-10-07-an-owner-lease-lapsed-while-far-members-stretched-the-probe-round.md`).
+- **Open: far members falsely condemn the near side.** It happens three or four times a second per pair, on a
+  lossless simulated link too, from the vendored detector's pooled deadline
+  (`docs/bugs/2026-10-07-a-far-member-condemns-the-near-side-by-its-pooled-deadline.md`).
+  - The fix is upstream in `../hyper-raft`. The reproducer is ignored until then.
+  - `slates status` now shows each detector pair's suspicions and condemnations beside their theoretical
+    allowance (`fleet_detector`).
+- **Open: cross-region reads still refused.** After the lease fix, region 1's reads answered `HomedElsewhere`:
+  - three location rounds, all `unavailable`, one counting `no_session`;
+  - in the run before, the same reads went `direct`.
+
+  The likely cause is the false deaths: a creator believed dead is not routed to directly. That is unconfirmed;
+  the copyset-successor hypothesis (`no_session`) is the same path.
+- **Open: same-region non-owners answer `NotFound`.** §4.8 "Lookup" routes a lookup by id to its creator host. The
+  server forwards only volumes homed in another region; a same-region volume takes the local path and is not found
+  (`verbs.rs`, "A single-region request keeps the local fast path"). A client of `a0` or `a2` cannot read `a1`'s
+  volume.
+- **Open, and the core of condition 10: cross-region mirroring is not built.** §4.10 "Mirroring across regions"
+  ships every committed record and its content to the owner's neighbourhood in the mirror region, acknowledged at
+  `f + 1` there, with `mirror_age` exposed. In the code:
+  - `Placement::mirror_acked` is only ever `None`;
+  - `RegionalConfiguration::has_mirror` is never set from the manifest's `mirrors`.
+
+  So `volume placed --mirror` refuses `Unsupported { feature: "mirror" }`, and `promote-region` re-homes routing to
+  the mirror region without moving any content there. A promoted region's volumes have no copy to serve.

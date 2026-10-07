@@ -402,6 +402,10 @@ impl Fleet for StateFleet<'_> {
   fn relays_to(&self, target: HostId) -> bool {
     crate::fleet::keeps_direct_contact_with(self.0, target)
   }
+
+  fn lease_holders(&self, into: &mut Vec<HostId>) {
+    self.0.fleet.configuration().lease_holders_into(into);
+  }
 }
 
 /// Folds the events a datagram produced: each acknowledgement's round trip, owner-lease standing and first arrival.
@@ -696,6 +700,16 @@ fn send(socket: &UdpSocket, addressed: &[(SocketAddrV4, Vec<u8>)]) {
   }
 }
 
+/// How this node renews its owner lease (§4.8 "Leases and reads"; `slates_cluster::lease_renewal`): each holder probed
+/// at least once a coordinator period, the cadence the lease bound is stated in (nine periods: `lease::horizon_ns`), so
+/// eight renewals in a row can be lost before a live, reachable owner's lease lapses; an answer counts within the bound.
+fn lease_renewal() -> slates_cluster::lease_renewal::LeaseRenewal {
+  slates_cluster::lease_renewal::LeaseRenewal {
+    interval_ns: crate::daemon::HEARTBEAT_NS,
+    bound_ns: crate::lease::lease_bound_ns(),
+  }
+}
+
 /// The membership task: for the daemon's life, the plane over `socket`. Each turn it announces any canonical epoch owed,
 /// resolves new peers, steps the detector and sends, then waits for a datagram until the detector's wake (or a
 /// heartbeat, so new sessions are keyed promptly), feeds it in, and folds the detector's view into the fleet.
@@ -712,6 +726,7 @@ pub(crate) async fn run(
       boot_nonce,
       members,
       std::time::Duration::from_nanos(slates_machine::clock::resolution_ns()),
+      lease_renewal(),
     )
     .map(|plane| state.plane.plane = Some(plane))
     .is_ok()

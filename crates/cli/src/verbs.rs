@@ -1789,6 +1789,17 @@ fn daemon_status_text(report: &DaemonReport, telemetry: &[TelemetryReport]) -> S
   out.push_str(&takeover_text(&report.fleet.takeover));
   out.push_str(&group_text("council", &report.fleet.council));
   out.push_str(&group_text("root", &report.fleet.root));
+  for peer in &report.fleet.detector {
+    out.push_str(&format!(
+      "fleet_detector {}: configured={} suspicions={} (allowance {}/1000) condemnations={} (allowance {}/1000)\n",
+      peer.peer,
+      peer.configured,
+      peer.suspicions,
+      peer.suspicion_allowance_milli,
+      peer.condemnations,
+      peer.condemnation_allowance_milli
+    ));
+  }
   for shard in &report.shards {
     out.push_str(&format!(
       "shard {}: clients={} volumes={} served={} replayed={} replay_ns={} torn={} mapped={} locked={} reserve={} committed={} retained={} replicated={} retained_versions={} metadata={} committed_metadata={} tasks_refused={} landings_awaiting={}/{} landings_in_flight={} target_leases={}\n",

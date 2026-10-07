@@ -12,6 +12,7 @@ use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
 
 use slates_cluster::fleet::{FleetNode, apply_peer_state};
+use slates_cluster::lease_renewal::LeaseRenewal;
 use slates_cluster::member_plane::{Fleet, MemberPlane, PlaneEvent};
 use slates_db::register::{
   Configuration, HostId, Lineage, ObjectId, Quorum, RegionalConfiguration,
@@ -34,6 +35,14 @@ const TIMER_LATENESS_NS: u64 = 50_000;
 const BACKED_OBJECTS: u64 = 64;
 /// Shape: the jitter's bound as a divisor of the latency: up to a fifth of it.
 const JITTER_DIVISOR: u64 = 5;
+/// Shape: the extra one-way latency of a far link, nanoseconds: a cross-region path (Japan East to East US is
+/// about 80 ms one way; the escape and KIND lanes shape 80-100 ms).
+const FAR_LATENCY_NS: u64 = 100_000_000;
+/// Shape: the owner lease's bound in the daemon, nanoseconds: three coordinator periods of 100 ms, each dilated
+/// three times (`slates-server` `lease::horizon_ns`, less its 0.1 % clock tolerance).
+const LEASE_BOUND_NS: u64 = 900_000_000;
+/// Shape: the simulated time the lease test observes, nanoseconds: many probe rounds.
+const LEASE_OBSERVED_NS: u64 = 30_000_000_000;
 /// Shape: the simulated time a run may take before it is a failure: long past the detector's evidence and its
 /// detection bound at this latency (hundreds of periods).
 const HORIZON_NS: u64 = 600_000_000_000;
@@ -43,6 +52,8 @@ const HORIZON_NS: u64 = 600_000_000_000;
 #[derive(Default)]
 struct Believing {
   refuses: Option<u64>,
+  /// The holders this member's owner lease is renewed with.
+  holders: Vec<u64>,
 }
 impl Fleet for Believing {
   fn announced_version(&self) -> u64 {
@@ -57,7 +68,16 @@ impl Fleet for Believing {
   fn relays_to(&self, _: HostId) -> bool {
     true
   }
+  fn lease_holders(&self, into: &mut Vec<HostId>) {
+    into.extend(self.holders.iter().map(|holder| HostId(*holder)));
+  }
 }
+
+/// Shape: the lease renewal the daemon runs: every 100 ms coordinator period, within the lease bound.
+const RENEWAL: LeaseRenewal = LeaseRenewal {
+  interval_ns: 100_000_000,
+  bound_ns: LEASE_BOUND_NS,
+};
 
 /// The secret two members' canonical connection exports: any 32 bytes both derive alike.
 fn secret_between(a: u64, b: u64) -> ExporterSecret {
@@ -77,6 +97,8 @@ struct InFlight {
 }
 
 struct Network {
+  /// Members whose datagrams, either way, cross [`FAR_LATENCY_NS`] more: another region.
+  far: Vec<u64>,
   members: BTreeMap<u64, MemberPlane>,
   fleets: BTreeMap<u64, Believing>,
   in_flight: Vec<InFlight>,
@@ -86,20 +108,28 @@ struct Network {
   now_ns: u64,
   /// The jitter generator's state (xorshift64), deterministic.
   jitter: u64,
+  /// Every condemnation a member's own probes made, as `(member, condemned)`, gathered after each step.
+  condemned: Vec<(u64, u64)>,
 }
 
 impl Network {
   fn new() -> Network {
+    Network::sized(MEMBERS, &[])
+  }
+
+  /// `count` members, those in `far` across the far link.
+  fn sized(count: u64, far: &[u64]) -> Network {
     let mut members = BTreeMap::new();
-    for me in 1..=MEMBERS {
+    for me in 1..=count {
       let mut plane = MemberPlane::new(
         HostId(me),
         me * 1_000,
-        NonZeroUsize::new(usize::try_from(MEMBERS).unwrap()).unwrap(),
+        NonZeroUsize::new(usize::try_from(count).unwrap()).unwrap(),
         SIM_RESOLUTION,
+        RENEWAL,
       )
       .unwrap();
-      for peer in (1..=MEMBERS).filter(|peer| *peer != me) {
+      for peer in (1..=count).filter(|peer| *peer != me) {
         // The lower member id dials the canonical connection (transport-quic.md §6).
         let role = if me < peer {
           Role::Initiator
@@ -113,8 +143,9 @@ impl Network {
       }
       members.insert(me, plane);
     }
-    let fleets = (1..=MEMBERS).map(|me| (me, Believing::default())).collect();
+    let fleets = (1..=count).map(|me| (me, Believing::default())).collect();
     Network {
+      far: far.to_vec(),
       members,
       fleets,
       in_flight: Vec::new(),
@@ -122,6 +153,7 @@ impl Network {
       killed: Vec::new(),
       now_ns: 1,
       jitter: 0x9E37_79B9_7F4A_7C15,
+      condemned: Vec::new(),
     }
   }
 
@@ -145,7 +177,12 @@ impl Network {
       }
     });
     for (to, bytes) in sealed {
-      let lands_ns = now + self.next_latency();
+      let crossing = if self.far.contains(&me) != self.far.contains(&to) {
+        FAR_LATENCY_NS
+      } else {
+        0
+      };
+      let lands_ns = now + self.next_latency() + crossing;
       self.in_flight.push(InFlight {
         to,
         lands_ns,
@@ -166,6 +203,7 @@ impl Network {
         if wake.is_none_or(|at| at <= self.now_ns) {
           let fleet = self.fleets.get_mut(me).unwrap();
           self.members.get_mut(me).unwrap().step(self.now_ns, fleet);
+          self.gather_condemnations(*me);
           self.flush(*me);
         }
       }
@@ -189,6 +227,7 @@ impl Network {
         member.receive(&mut bytes, self.now_ns, fleet, events);
         // The detector is polled after every message it is fed, as well as at its wake (hyper-swim `Detector::poll`).
         member.step(self.now_ns, fleet);
+        self.gather_condemnations(to);
         self.flush(to);
       }
       if done(self) {
@@ -218,6 +257,15 @@ impl Network {
       self.now_ns = next;
     }
     false
+  }
+
+  /// Records the condemnations member `me`'s last poll found.
+  fn gather_condemnations(&mut self, me: u64) {
+    for finding in self.members[&me].detector().findings() {
+      if let hyper_swim::detector::Finding::Condemned { target, .. } = finding {
+        self.condemned.push((me, target.0));
+      }
+    }
   }
 
   fn liveness(&self, of: u64, peer: u64) -> Option<Liveness> {
@@ -387,6 +435,7 @@ fn a_message_claiming_another_sender_is_refused_and_counted() {
     2_000,
     NonZeroUsize::new(3).unwrap(),
     SIM_RESOLUTION,
+    RENEWAL,
   )
   .unwrap();
   sender
@@ -397,6 +446,7 @@ fn a_message_claiming_another_sender_is_refused_and_counted() {
     1_000,
     NonZeroUsize::new(3).unwrap(),
     SIM_RESOLUTION,
+    RENEWAL,
   )
   .unwrap();
   receiver
@@ -555,4 +605,75 @@ fn a_silent_member_is_condemned_and_its_objects_are_taken_over() {
     "member 3 left the neighbourhood"
   );
   assert!(taken > 0, "member 1 took over the objects that rank to it");
+}
+
+/// §4.8 "Leases and reads" (AUD-08), found on two Docker networks joined by a shaped router (2026-10-07,
+/// `docs/wip/bench/multiregion/run.sh`). Do: run an owner, one near holder of its objects and four members across
+/// a far link, for many probe rounds, and record when the owner's probes the holder answered were sent. Expect:
+/// the owner is never without a fresh answer from its holder for longer than the lease bound. The owner's lease
+/// counts only answers to probes sent within the bound; if those answers come only from the detector's probe
+/// rotation, a round that spends periods on far members leaves the near holder unprobed past the bound, and the
+/// owner refuses its own objects' latest state while every member is alive.
+#[test]
+fn an_owner_is_answered_by_its_holder_within_the_lease_bound_while_far_members_stretch_the_round() {
+  let (owner, holder) = (1u64, 2u64);
+  let far = [3u64, 4, 5, 6];
+  let mut fleet = Network::sized(6, &far);
+  fleet.fleets.get_mut(&owner).unwrap().holders = vec![holder];
+  fleet.run_until(LEASE_OBSERVED_NS, |_| false);
+  let mut sent: Vec<u64> = fleet.events[&owner]
+    .iter()
+    .filter_map(|event| match event {
+      PlaneEvent::Acked { from, sent_ns, .. } if from.0 == holder => Some(*sent_ns),
+      _ => None,
+    })
+    .collect();
+  sent.sort_unstable();
+  // From the first answer on: before it the pair is still being measured.
+  let longest_gap = sent
+    .windows(2)
+    .map(|pair| pair[1] - pair[0])
+    .chain(sent.last().map(|last| fleet.now_ns - last))
+    .max()
+    .unwrap_or(u64::MAX);
+  eprintln!(
+    "answered probes {}, longest gap {} ms, now {} ms",
+    sent.len(),
+    longest_gap / 1_000_000,
+    fleet.now_ns / 1_000_000
+  );
+  // Non-vacuity: the renewals ran and were answered.
+  let counts = fleet.members[&owner].counts();
+  assert!(
+    counts.renewals_answered > 0,
+    "the holder answered renewals: {counts:?}"
+  );
+  assert!(
+    longest_gap <= LEASE_BOUND_NS,
+    "the owner went {} ms without a fresh answer from its holder, past the {} ms lease bound",
+    longest_gap / 1_000_000,
+    LEASE_BOUND_NS / 1_000_000
+  );
+}
+
+/// §4.8 membership, an OPEN DEFECT in the vendored detector (`docs/bugs/2026-10-07-a-far-member-condemns-the-near-side-by-its-pooled-deadline.md`;
+/// hyper-swim upstream in `../hyper-raft`). Do: run two near members and four far ones, the far link 100 ms one way and
+/// lossless, every member alive throughout. Expect: no member condemns a live one. Measured 2026-10-07: every far member
+/// condemned both near members 20 to 49 times per 10 s for the whole run, each crossing probe judged by a deadline of
+/// 1.9 to 2.7 ms on a 200 ms path: the far member's pooled estimator, fed mostly by its 1 ms same-side round trips,
+/// judges the pair, and the pair's own estimator never takes over.
+#[test]
+#[ignore = "open defect in the vendored detector: docs/bugs/2026-10-07-a-far-member-condemns-the-near-side-by-its-pooled-deadline.md"]
+fn no_live_member_is_condemned_across_a_lossless_far_link() {
+  let far = [3u64, 4, 5, 6];
+  let mut fleet = Network::sized(6, &far);
+  fleet.run_until(LEASE_OBSERVED_NS, |_| false);
+  let mut by_pair: BTreeMap<(u64, u64), usize> = BTreeMap::new();
+  for pair in &fleet.condemned {
+    *by_pair.entry(*pair).or_default() += 1;
+  }
+  assert!(
+    by_pair.is_empty(),
+    "live members condemned, (member, condemned) -> count: {by_pair:?}"
+  );
 }

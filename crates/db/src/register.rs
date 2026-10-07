@@ -1917,6 +1917,21 @@ impl Configuration {
         .is_some_and(|settled| settled.hosts.contains(&host))
   }
 
+  /// The hosts of this owner's neighbourhood, current and — while a change is in flight — settled, the owner
+  /// excluded, each once, appended to `into`: every host a lease cohort can draw from
+  /// ([`lease_cohorts`](Configuration::lease_cohorts)), so every host whose answers confirm this owner's lease.
+  pub fn lease_holders_into(&self, into: &mut Vec<HostId>) {
+    let settled = self
+      .settled
+      .as_ref()
+      .map(|settled| settled.hosts.as_slice());
+    for host in self.neighbourhood.iter().chain(settled.unwrap_or_default()) {
+      if *host != self.owner && !into.contains(host) {
+        into.push(*host);
+      }
+    }
+  }
+
   /// This owner's authority standing ([`Standing`]): the versions its settled and its current neighbourhoods
   /// were fixed at.
   pub fn standing(&self) -> Standing {

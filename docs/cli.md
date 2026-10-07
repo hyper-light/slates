@@ -211,6 +211,12 @@ council can seat fewer voters than its `f` asks, and it tolerates only the losse
 and the same twenty-one `fleet_root_*` lines for the root group across regions. A single daemon shows the same
 lines, degenerate: `f` 0, itself the one member, leading both groups after explicit bootstrap,
 at the floor with no sample.
+Then one `fleet_detector PEER: configured=… suspicions=… (allowance …/1000) condemnations=… (allowance
+…/1000)` line per peer the failure detector holds (JSON: `fleet.detector`): the suspicions and condemnations
+this node's own probes made of that peer, each beside the number the detector's theory expects of a peer
+alive throughout, in thousandths (Chen, Toueg and Aguilera's Theorem 7, summed over every judged probe), and
+whether the pair's own estimator judges it yet. A count far above its allowance is a detector misjudging a live
+peer; a laptop shows none.
 
 Then one block per shard: its counters (`shard N: clients=… volumes=… served=…`), its refusals by
 kind, its health signals (`shard N catalog.volumes: 3 (age 0 ns)` — a signal that is absent prints

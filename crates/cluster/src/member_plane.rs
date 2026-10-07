@@ -26,6 +26,10 @@
 //!     owner lease's holder side;
 //!   - an acknowledgement, an indirect answer or an anti-entropy chunk is folded only from an admitted identity;
 //!   - a relay request is served only for a target this node keeps direct contact with.
+//!
+//! **The owner lease's renewals** ride the same plane ([`crate::lease_renewal`]): each step the plane probes every
+//! holder the fleet names ([`Fleet::lease_holders`]) that it has not probed within the renewal interval, and an
+//! answer to one is an [`PlaneEvent::Acked`] like the detector's own, timed from its own send.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::num::NonZeroUsize;
@@ -37,6 +41,8 @@ use hyper_swim::detector::{Detector, PingReq};
 use hyper_swim::membership::MemberState;
 use hyper_timing::Exposure;
 use slates_db::register::HostId;
+
+use crate::lease_renewal::{LeaseRenewal, Renewal, Renewals};
 
 pub use hyper_datagram::Refusal as PlaneRefusal;
 pub use hyper_datagram::UNMEASURED_DATAGRAM_BYTES;
@@ -70,6 +76,9 @@ pub trait Fleet {
   /// Whether this node relays a probe to `target` for another member: only a member it keeps direct contact with, so
   /// no authenticated peer can name arbitrary targets (AUD-15's bound).
   fn relays_to(&self, target: HostId) -> bool;
+  /// The holders whose answers confirm this node's owner lease, this node excluded: its neighbourhood, settled and
+  /// current (§4.8 "Leases and reads"). Written into `into`, which arrives empty.
+  fn lease_holders(&self, into: &mut Vec<HostId>);
 }
 
 /// What a received datagram told the fleet.
@@ -122,6 +131,12 @@ pub struct PlaneCounts {
   pub relayed: u64,
   /// Indirect answers this node credited: a relay reached the target this node's direct probe could not.
   pub indirect_acked: u64,
+  /// Lease renewals this node sent its holders ([`crate::lease_renewal`]).
+  pub renewals_sent: u64,
+  /// Lease renewals its holders answered, each an [`PlaneEvent::Acked`].
+  pub renewals_answered: u64,
+  /// Whether renewals stopped because a detector nonce reached their range (1) or not (0).
+  pub renewals_exhausted: u64,
 }
 
 /// A node's failure detector and the datagram plane its probes ride.
@@ -143,6 +158,13 @@ pub struct MemberPlane {
   /// This node's probes awaiting an answer: nonce, target and send time, oldest first, at most the view's bound.
   sent: VecDeque<(u64, u64, u64)>,
   sent_bound: usize,
+  /// The peers [`join`](Self::join)ed and not removed: keyed and addressable. Bounded by the plane's peers.
+  joined: std::collections::BTreeSet<u64>,
+  /// The owner lease's renewals over its holders.
+  renewals: Renewals,
+  /// The holders the fleet named this step, and the renewals due: reused, so a step allocates nothing.
+  holders: Vec<HostId>,
+  due: Vec<Renewal>,
   counts: PlaneCounts,
 }
 
@@ -159,12 +181,13 @@ impl MemberPlane {
   /// A plane for `local`, announcing `boot_nonce`, whose view holds at most `members` hosts (itself included: what the
   /// placement lets this node know) and whose plane keeps keys for at most `members − 1` peers.
   /// `resolution` is the owner's clock's: the least step of the readings it stamps the plane with (A-67; hyper-swim
-  /// bounds its wake lateness `G` below by it).
+  /// bounds its wake lateness `G` below by it). `renewal` is how the owner lease is renewed ([`crate::lease_renewal`]).
   pub fn new(
     local: HostId,
     boot_nonce: u64,
     members: NonZeroUsize,
     resolution: std::time::Duration,
+    renewal: LeaseRenewal,
   ) -> Result<Self, PlaneRefusal> {
     let limits = PlaneLimits {
       max_peers: members.get().saturating_sub(1).max(1),
@@ -191,6 +214,10 @@ impl MemberPlane {
       relaying: BTreeMap::new(),
       sent: VecDeque::with_capacity(members.get()),
       sent_bound: members.get(),
+      joined: std::collections::BTreeSet::new(),
+      renewals: Renewals::new(renewal),
+      holders: Vec::new(),
+      due: Vec::new(),
       counts: PlaneCounts::default(),
     };
     member.gossip_room = member.room_beside_ack();
@@ -263,12 +290,14 @@ impl MemberPlane {
     if joined.is_err() {
       self.counts.view_full = self.counts.view_full.saturating_add(1);
     }
+    self.joined.insert(peer.0);
   }
 
   /// Forgets `peer`'s keys and pending messages (a retired member id).
   pub fn remove_peer(&mut self, peer: HostId) {
     self.plane.remove_peer(peer.0);
     self.relaying.remove(&peer.0);
+    self.joined.remove(&peer.0);
   }
 
   /// Tells the detector a belief the fleet holds about `peer` (a death it learned outside the detector: a restarted
@@ -291,7 +320,10 @@ impl MemberPlane {
 
   /// When to [`step`](Self::step) next, on the owner's clock (`None`: on the next datagram).
   pub fn wake(&self) -> Option<u64> {
-    self.detector.wake()
+    match (self.detector.wake(), self.renewals.next_due()) {
+      (Some(detector), Some(renewal)) => Some(detector.min(renewal)),
+      (detector, renewal) => detector.or(renewal),
+    }
   }
 
   /// The detector: its view, verdicts and reports.
@@ -372,7 +404,11 @@ impl MemberPlane {
         },
       );
       self.remember_sent(ping.nonce, ping.to.0, now_ns);
+      self
+        .renewals
+        .detector_probed(HostId(ping.to.0), ping.nonce, now_ns);
     }
+    self.renew(now_ns, fleet);
     while let Some(chunk) = self.detector.sync_into(self.view_room, &mut batch) {
       self.send(
         chunk.to.0,
@@ -386,6 +422,41 @@ impl MemberPlane {
       );
     }
     self.batch = batch;
+  }
+
+  /// Probes the lease holders due a renewal at `now_ns` ([`crate::lease_renewal`]): the detector's probe, without the
+  /// detector, and without gossip.
+  fn renew(&mut self, now_ns: u64, fleet: &mut impl Fleet) {
+    let mut holders = std::mem::take(&mut self.holders);
+    let mut due = std::mem::take(&mut self.due);
+    holders.clear();
+    due.clear();
+    fleet.lease_holders(&mut holders);
+    // Only a joined peer is keyed and addressable: a probe to any other could not be sent. Whether the detector
+    // still holds it is no matter: a holder it condemned or forgot can still answer, and its answer still confirms.
+    holders.retain(|holder| *holder != self.local && self.joined.contains(&holder.0));
+    self.renewals.due(now_ns, &holders, &mut due);
+    let local = hyper_swim::HostId(self.local.0);
+    let announced = fleet.announced_version();
+    for renewal in &due {
+      self.send(
+        renewal.to.0,
+        &SwimMessage::Ping {
+          from: local,
+          nonce: renewal.nonce,
+          boot_nonce: self.boot_nonce,
+          configuration_version: announced,
+          gossip: GossipBatch::Entries(&[]),
+        },
+      );
+    }
+    self.counts.renewals_sent = self
+      .counts
+      .renewals_sent
+      .saturating_add(u64::try_from(due.len()).unwrap_or(u64::MAX));
+    self.counts.renewals_exhausted = u64::from(self.renewals.exhausted());
+    self.holders = holders;
+    self.due = due;
   }
 
   /// Opens one received `datagram`, stamped `stamp_ns` on the owner's clock, hands each message to the detector, queues
@@ -500,7 +571,12 @@ impl MemberPlane {
             self
               .detector
               .on_ack(hyper_swim::HostId(sender), nonce, stamp_ns);
-            if let Some(sent_ns) = self.take_sent(nonce, sender) {
+            let renewal = self.renewals.answered(from, nonce);
+            if renewal.is_some() {
+              self.counts.renewals_answered = self.counts.renewals_answered.saturating_add(1);
+            }
+            let credited = renewal.or_else(|| self.take_sent(nonce, sender));
+            if let Some(sent_ns) = credited {
               events.push(PlaneEvent::Acked {
                 from,
                 boot_nonce,

@@ -1952,6 +1952,14 @@ pub fn daemon_json(r: &DaemonReport, telemetry: &[TelemetryReport]) -> Value {
       "takeover": takeover_json(&r.fleet.takeover),
       "council": group_json(&r.fleet.council),
       "root": group_json(&r.fleet.root),
+      "detector": r.fleet.detector.iter().map(|peer| json!({
+        "peer": peer.peer,
+        "configured": peer.configured,
+        "suspicions": peer.suspicions,
+        "suspicion_allowance_milli": peer.suspicion_allowance_milli,
+        "condemnations": peer.condemnations,
+        "condemnation_allowance_milli": peer.condemnation_allowance_milli,
+      })).collect::<Vec<_>>(),
     },
   })
 }

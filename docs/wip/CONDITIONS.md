@@ -162,8 +162,15 @@ in the same commit as the work). Last reviewed 2026-10-07 at `89956659`.
     successor.
   - The KIND lane's WAN, WAN-with-loss and 350 ms profiles.
   - `fetch_bench`'s content pulls (condition 7).
+  - 2026-10-07: two regions on two Docker networks, joined only by a router shaping 100 ms ± 40 ms one way and
+    3 % loss (`docs/wip/bench/multiregion/run.sh`). Both regions formed and bootstrapped. The run found and fixed an
+    owner lease that lapsed whenever far members stretched the probe round (`GAPS.md` 2026-10-07).
 - **Owed.**
-  - Replication between separate clusters on separate networks: the lanes run one cluster.
+  - **Cross-region mirroring is not built** (§4.10 "Mirroring across regions"): no record or content is shipped to
+    the mirror region, so `placed --mirror` refuses `Unsupported`, and a promoted region has no copy to serve.
+  - Cross-region reads are refused `HomedElsewhere` on the two networks (location rounds `unavailable`).
+  - Same-region non-owners answer `NotFound` instead of routing to the creator (§4.8 "Lookup").
+  - The vendored detector falsely condemns live members across a far link (upstream fix owed).
   - Condition 7's jitter design, which replication's content pulls share.
   - The copyset-successor fleet test fails intermittently under a loaded full suite (4 of 9 untraced runs, passing
     alone). It is instrumented (`fleet.owner_location.no_session`); the hypothesis is a location round that skipped

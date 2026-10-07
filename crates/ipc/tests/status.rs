@@ -4,8 +4,8 @@
 
 use slates_ipc::IpcError;
 use slates_ipc::protocol::{
-  DaemonReport, FleetReport, GroupReport, Refusal, ReplyBody, RequestBody, RetirementReport,
-  TakeoverReport, encode_body,
+  DaemonReport, DetectorPeerReport, FleetReport, GroupReport, Refusal, ReplyBody, RequestBody,
+  RetirementReport, TakeoverReport, encode_body,
 };
 use slates_ipc::status::collect;
 
@@ -76,6 +76,14 @@ fn report() -> ReplyBody {
           }],
           members: 71,
         },
+        detector: vec![DetectorPeerReport {
+          peer: 73,
+          configured: true,
+          suspicions: 79,
+          suspicion_allowance_milli: 83,
+          condemnations: 89,
+          condemnation_allowance_milli: 97,
+        }],
       },
     }),
   }

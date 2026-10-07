@@ -677,6 +677,54 @@ fn takeover_report(state: &ShardState) -> slates_ipc::protocol::TakeoverReport {
   }
 }
 
+/// The scale of a detector allowance on the wire: thousandths, so an expected count well below one survives
+/// as an integer.
+/// Derived: a unit scale (one thousandth), not a tunable.
+const ALLOWANCE_SCALE: f64 = 1_000.0;
+
+/// An allowance in thousandths, rounded; zero for a value that is not a non-negative number, and saturated at
+/// the integer's top.
+fn thousandths(allowance: f64) -> u64 {
+  let scaled = (allowance * ALLOWANCE_SCALE).round();
+  if scaled.is_nan() || scaled <= 0.0 {
+    return 0;
+  }
+  if scaled >= u64::MAX as f64 {
+    return u64::MAX;
+  }
+  // The value is finite, positive and below the integer's top (both checked just above).
+  #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+  let whole = scaled as u64;
+  whole
+}
+
+/// What this shard's failure detector found of each peer by its own probes (§4.8 membership): live on the
+/// control shard, which runs the one detector; empty on every other shard and on a laptop.
+fn detector_report(state: &ShardState) -> Vec<slates_ipc::protocol::DetectorPeerReport> {
+  let Some(plane) = state.plane.plane.as_ref() else {
+    return Vec::new();
+  };
+  let detector = plane.detector();
+  let local = state.fleet.host();
+  detector
+    .membership()
+    .after(None)
+    .filter(|(member, _)| member.0 != local.0)
+    .filter_map(|(member, _)| {
+      detector
+        .report(member)
+        .map(|report| slates_ipc::protocol::DetectorPeerReport {
+          peer: member.0,
+          configured: report.configured,
+          suspicions: report.suspicions,
+          suspicion_allowance_milli: thousandths(report.suspicion_allowance),
+          condemnations: report.condemnations,
+          condemnation_allowance_milli: thousandths(report.condemnation_allowance),
+        })
+    })
+    .collect()
+}
+
 /// The objects this node's takeovers have learned and not yet adopted (§4.8 "Promotion and takeover"; the
 /// takeover module): what a status report shows as pending, so a stalled takeover shows in any node's status.
 fn takeovers_pending(state: &ShardState) -> u64 {
@@ -2061,6 +2109,7 @@ pub fn shard_report(state: &mut ShardState) -> ShardReport {
     takeovers_pending: takeovers_pending(state),
     configuration_version: state.fleet.configuration().version,
     takeover: takeover_report(state),
+    detector: detector_report(state),
     tasks_refused: slates_rt::registry::with_current(|ctx| ctx.counters().admission_refused)
       .unwrap_or(0),
     landings_awaiting: u64::try_from(state.landing.awaiting.len()).unwrap_or(u64::MAX),
@@ -2151,6 +2200,7 @@ fn fleet_report(state: &ShardState, shards: &[ShardReport]) -> FleetReport {
   let council = control.map_or_else(|| council_report(state), |shard| shard.council.clone());
   let root = control.map_or_else(|| root_report(state), |shard| shard.root.clone());
   let takeover = control.map_or_else(|| takeover_report(state), |shard| shard.takeover.clone());
+  let detector = control.map_or_else(|| detector_report(state), |shard| shard.detector.clone());
   let (held_records, takeovers_pending, configuration_version) = control.map_or_else(
     || {
       (
@@ -2191,6 +2241,7 @@ fn fleet_report(state: &ShardState, shards: &[ShardReport]) -> FleetReport {
     takeovers_pending,
     configuration_version,
     takeover,
+    detector,
   }
 }
 
