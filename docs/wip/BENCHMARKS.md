@@ -3109,3 +3109,20 @@ Per phase after the streaming: create 430.6 B and 3.0 allocations, the 100-byte 
 `a_refused_or_abandoned_streamed_checkpoint_leaves_the_committed_one`, and the server's
 `a_streamed_checkpoint_restarts_without_a_volume_it_cannot_capture` (a 2,000-file volume streamed into the slot before
 an overlay without its host refuses; the committed image holds the first volume whole).
+
+## A read touches only the extents it overlaps (2026-10-06)
+
+This Mac (M5 Max, Darwin 25.4), release build. A throwaway A/B example (one volume, one file written in 1 MiB
+writes, 200,000 random 4 KiB reads, best of 5, all 5 shown) run in this tree and in a worktree at `5cfed78b`. The
+store's chunk is 64 KiB, so a 512 MiB file has 8,192 extents.
+
+| File | Before (ns per read, rounds) | After (ns per read, rounds) |
+|---|---|---|
+| 16 MiB | 953 (953 976 990 961 975) | 223 (254 241 241 223 269) |
+| 128 MiB | 5,624 (5881 5738 5786 6093 5624) | 383 (387 383 399 488 469) |
+| 512 MiB | 22,225 (22325 25068 22737 22245 22225) | 514 (553 514 546 584 571) |
+
+`read_body` and `read_in` resolved every extent's chunk and only then tested the overlap. `overlapping`
+binary-searches the extents, which every body keeps ascending and non-overlapping. Found while fixing
+`docs/bugs/2026-10-06-a-truncate-refused-partway-left-its-file-reading-zeros.md`: one unresolvable chunk anywhere
+in a file refused every read of it.

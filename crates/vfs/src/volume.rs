@@ -1355,15 +1355,16 @@ impl Volume {
     .unwrap_or(0);
     let out = buf.get_mut(..want).unwrap_or_default();
     out.fill(0);
+    let read_end = off.saturating_add(u64::try_from(want).unwrap_or(u64::MAX));
     match &inode.body {
       Body::Inline(bytes) => copy_range(bytes, 0, off, out),
       Body::Sealed(extents) => {
-        for e in extents {
+        for e in overlapping(extents, off, read_end) {
           store.content.read_extent_into(e, off, out)?;
         }
       }
       Body::Open { open, sealed } => {
-        for e in sealed {
+        for e in overlapping(sealed, off, read_end) {
           store.content.read_extent_into(e, off, out)?;
         }
         copy_range(store.content.open_bytes(open), open.off, off, out);
@@ -1381,7 +1382,7 @@ impl Volume {
         if unpinned {
           return Err(VfsError::BaseUnavailable(0));
         }
-        for e in &b.pinned {
+        for e in overlapping(&b.pinned, off, read_end) {
           store.content.read_extent_into(e, off, out)?;
         }
       }
@@ -2537,15 +2538,16 @@ impl Volume {
     .unwrap_or(0);
     let out = buf.get_mut(..want).unwrap_or_default();
     out.fill(0);
+    let read_end = off.saturating_add(u64::try_from(want).unwrap_or(u64::MAX));
     match &inode.body {
       Body::Inline(bytes) => copy_range(bytes, 0, off, out),
       Body::Sealed(extents) => {
-        for e in extents {
+        for e in overlapping(extents, off, read_end) {
           store.content.read_extent_into(e, off, out)?;
         }
       }
       Body::Open { open, sealed } => {
-        for e in sealed {
+        for e in overlapping(sealed, off, read_end) {
           store.content.read_extent_into(e, off, out)?;
         }
         copy_range(store.content.open_bytes(open), open.off, off, out);
@@ -2565,7 +2567,7 @@ impl Volume {
         if unpinned {
           return Err(VfsError::BaseUnavailable(0));
         }
-        for e in &b.pinned {
+        for e in overlapping(&b.pinned, off, read_end) {
           store.content.read_extent_into(e, off, out)?;
         }
       }
@@ -5443,67 +5445,74 @@ impl Volume {
     if len >= old_size {
       return Ok(());
     }
+    // Guard, then apply (the shape of `slates-db`'s partition): every chunk the cut releases or clips must resolve
+    // before the body is touched, so the one refusal a release meets in a consistent store (a stale chunk) refuses the
+    // truncate with the file unchanged, as a failed `ftruncate(2)` leaves it.
+    truncated_chunks(&store.inodes.get(handle)?.body, len)
+      .try_for_each(|chunk| store.content.check_chunk(chunk))?;
     let last = self.last_snapshot_epoch();
     let epoch = self.epoch;
     let before = content_by_epoch(store, handle);
     let body = std::mem::replace(&mut store.inodes.get_mut(handle)?.body, Body::None);
     let mut dead = Deadlist::default();
-    let new_body = match body {
+    // A refusal past the guard (the arena or the tag store refusing a free: the store is inconsistent) still leaves a
+    // whole body: whatever was not yet released stays, and the body always goes back before the refusal is returned.
+    let (new_body, refused) = self.cut_body(store, body, len, (last, epoch), &mut dead);
+    self.retain_dead_list(store, dead);
+    store.inodes.get_mut(handle)?.body = new_body;
+    self.reconcile(before, content_by_epoch(store, handle));
+    refused.map_or(Ok(()), Err)
+  }
+
+  /// [`Volume::apply_truncate`]'s cut of `body` to `len`: the body it leaves, whole whatever happened, and the refusal
+  /// that stopped it short, if one did.
+  fn cut_body(
+    &mut self,
+    store: &mut Store,
+    body: Body,
+    len: u64,
+    (last, epoch): (Option<Epoch>, Epoch),
+    dead: &mut Deadlist,
+  ) -> (Body, Option<VfsError>) {
+    let key = self.seal_key;
+    match body {
       Body::Inline(mut v) => {
         v.truncate(usize::try_from(len).unwrap_or(0));
-        Body::Inline(v)
+        (Body::Inline(v), None)
       }
       Body::Sealed(mut extents) => {
-        clip_extents(
-          (store, self.seal_key),
-          &mut extents,
-          len,
-          last,
-          epoch,
-          &mut dead,
-        )?;
-        Body::Sealed(extents)
+        let refused = clip_extents((store, key), &mut extents, len, last, epoch, dead).err();
+        (Body::Sealed(extents), refused)
       }
       Body::Open {
         mut open,
         mut sealed,
       } => {
-        clip_extents(
-          (store, self.seal_key),
-          &mut sealed,
-          len,
-          last,
-          epoch,
-          &mut dead,
-        )?;
+        if let Err(refused) = clip_extents((store, key), &mut sealed, len, last, epoch, dead) {
+          return (Body::Open { open, sealed }, Some(refused));
+        }
         if open.off >= len {
-          store.content.release_open(*open)?;
-          Body::Sealed(sealed)
+          let block = open.block;
+          match store.content.release_block(block) {
+            Ok(()) => (Body::Sealed(sealed), None),
+            Err(refused) => (Body::Open { open, sealed }, Some(refused)),
+          }
         } else {
           let keep = len.saturating_sub(open.off);
-          store.content.shrink_open(&mut open, keep)?;
-          Body::Open { open, sealed }
+          let refused = store.content.shrink_open(&mut open, keep).err();
+          (Body::Open { open, sealed }, refused)
         }
       }
       Body::Base(mut b) => {
-        clip_extents(
-          (store, self.seal_key),
-          &mut b.pinned,
-          len,
-          last,
-          epoch,
-          &mut dead,
-        )?;
-        // Disk bytes past the cut are no longer the file's; a later extension is a hole.
-        b.base_len = b.base_len.min(len);
-        Body::Base(b)
+        let refused = clip_extents((store, key), &mut b.pinned, len, last, epoch, dead).err();
+        if refused.is_none() {
+          // Disk bytes past the cut are no longer the file's; a later extension is a hole.
+          b.base_len = b.base_len.min(len);
+        }
+        (Body::Base(b), refused)
       }
-      other => other,
-    };
-    self.retain_dead_list(store, dead);
-    store.inodes.get_mut(handle)?.body = new_body;
-    self.reconcile(before, content_by_epoch(store, handle));
-    Ok(())
+      other => (other, None),
+    }
   }
 
   fn is_ancestor(
@@ -5881,6 +5890,39 @@ pub(crate) fn insert_extent(list: &mut Vec<Extent>, e: Extent) {
 /// would shrink is rebuilt at its new length (the window's block is always the buddy block its
 /// materialized length takes, §4.2 "allocator rounding"), its old chunk released by the epoch rule
 /// like any window the head rewrites. Returns bytes freed.
+/// The extents of `extents` (ascending by offset and non-overlapping, as every body holds them) that overlap the file
+/// range `[start, end)`: found by binary search, so a read costs the extents it touches, not the file's. A read walked
+/// every extent of the file and resolved each one's chunk before testing the overlap, so it cost O(extents) and a
+/// chunk anywhere in the file that could not be resolved refused every read of it (2026-10-06).
+pub(crate) fn overlapping(extents: &[Extent], start: u64, end: u64) -> &[Extent] {
+  let first = extents.partition_point(|e| e.off.saturating_add(e.len) <= start);
+  let rest = extents.get(first..).unwrap_or_default();
+  let count = rest.partition_point(|e| e.off < end);
+  rest.get(..count).unwrap_or_default()
+}
+
+/// The chunks a cut of `body` to `len` releases or clips: those of the extents reaching past `len`.
+fn truncated_chunks(
+  body: &Body,
+  len: u64,
+) -> impl Iterator<Item = Handle<crate::content::Chunk>> + '_ {
+  let extents: &[Extent] = match body {
+    Body::Sealed(extents)
+    | Body::Open {
+      sealed: extents, ..
+    } => extents,
+    Body::Base(b) => &b.pinned,
+    _ => &[],
+  };
+  extents
+    .iter()
+    .filter(move |e| e.off.saturating_add(e.len) > len)
+    .filter_map(|e| match e.src {
+      ExtentSrc::Chunk { chunk, .. } => Some(chunk),
+      ExtentSrc::Zero => None,
+    })
+}
+
 pub(crate) fn clip_extents(
   (store, key): (&mut Store, Option<u32>),
   extents: &mut Vec<Extent>,
@@ -5891,10 +5933,15 @@ pub(crate) fn clip_extents(
 ) -> Result<u64, VfsError> {
   let mut freed = 0u64;
   let mut keep = Vec::with_capacity(extents.len());
-  for e in extents.drain(..) {
-    if e.off >= len {
-      if let ExtentSrc::Chunk { chunk, .. } = e.src {
-        freed = freed.saturating_add(store.content.release_chunk(chunk, last, dead)?);
+  let mut pending = std::mem::take(extents).into_iter();
+  while let Some(e) = pending.next() {
+    let step = if e.off >= len {
+      match e.src {
+        ExtentSrc::Chunk { chunk, .. } => store
+          .content
+          .release_chunk(chunk, last, dead)
+          .map(|released| freed = freed.saturating_add(released)),
+        ExtentSrc::Zero => Ok(()),
       }
     } else if e.off.saturating_add(e.len) > len {
       let clipped = Extent {
@@ -5902,16 +5949,20 @@ pub(crate) fn clip_extents(
         len: len.saturating_sub(e.off),
         src: e.src,
       };
-      freed = freed.saturating_add(e.len.saturating_sub(clipped.len));
-      keep.push(rebuilt_if_smaller(
-        (store, key),
-        clipped,
-        last,
-        epoch,
-        dead,
-      )?);
+      rebuilt_if_smaller((store, key), clipped, last, epoch, dead).map(|rebuilt| {
+        freed = freed.saturating_add(e.len.saturating_sub(clipped.len));
+        keep.push(rebuilt);
+      })
     } else {
       keep.push(e);
+      Ok(())
+    };
+    if let Err(refusal) = step {
+      // Nothing is dropped on a refusal: the extent refused and every one not yet reached stay, after those kept.
+      keep.push(e);
+      keep.extend(pending);
+      *extents = keep;
+      return Err(refusal);
     }
   }
   *extents = keep;

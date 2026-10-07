@@ -826,6 +826,13 @@ impl ChunkStore {
     self.chunks.get(handle).ok()
   }
 
+  /// Refuses a stale chunk handle with the slab's own refusal: what [`ChunkStore::release_chunk`] would meet first, for
+  /// an operation that checks every chunk it will release before it changes anything.
+  pub fn check_chunk(&self, handle: Handle<Chunk>) -> Result<(), VfsError> {
+    self.chunks.get(handle)?;
+    Ok(())
+  }
+
   /// Releases a chunk by the epoch rule: freed now when born after `last_snapshot`, else sent
   /// to the deadlist. Returns the bytes released from the head's accounting (its length).
   pub fn release_chunk(
