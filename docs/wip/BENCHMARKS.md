@@ -2163,6 +2163,10 @@ activity, after the idle sweep, zero on free and A-101: over 60 s the daemon use
 core) and the anchor 0.00; `top -pid` reported 0.0% CPU, 0 idle wakeups and 0.0 power. The reap tick (1 s) with its
 sweep and the 10 Hz heartbeat cost nothing measurable at rest.
 
+Again on 2026-10-07 at `5ef66e4e` (after the streamed checkpoint, the copy-aside seal and the counted publish paths;
+`idle-cpu.sh`, 30 s windows, load average 6.4–8.0): idle with nothing mounted, daemon 0.07% of a core and anchor
+0.03%; with a volume mounted and idle, daemon 0.03% and anchor 0.00%. Unchanged at rest.
+
 Real workloads, rerun at 15:12–15:22 on HEAD (`realworld_chaos.sh`, `realworld_native.sh`): correct throughout (six
 SIGKILLs, clone tree hash `31a1f6f713d195f5`, the build runs, pip imports), but slow: cargo build 115–134 s on slates
 against 13.5 s on tmpfs, where the morning's record was 3.3 against 3.2. Bisected over Linux release builds of
