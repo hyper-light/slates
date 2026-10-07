@@ -10063,3 +10063,34 @@ Status: built 2026-10-06. Windows remains owed (A-105).
   with the word-wide clearing it costs nothing measurable.
 - Not changed: the Linux FUSE write log, the one `SparseObject::discard` caller, does not exist on macOS, so the
   sparse object needs no mark record.
+
+### A-111 — `O_TMPFILE` through the Linux mount; an orphan named again leaves the orphan record (2026-10-06)
+Applied in the same change to:
+- `crates/bridge-fuse/src/abi.rs` (`TMPFILE`, 51) and `crates/bridge-fuse/src/bridge.rs` (`serve_tmpfile`; it
+  stamps the creator's ids, as a create does);
+- `crates/vfs/src/volume.rs` (`link` of an orphan);
+- the tests `an_orphan_named_again_survives_its_last_close_and_leaks_nothing` (`crates/vfs/tests/lifetime.rs`) and
+  `tmpfile_through_the_mount` (`crates/bridge-fuse/tests/owner_turn.rs`);
+- the ABI tables and GAPS.
+
+Status: built 2026-10-06 (Linux 6.11+; older kernels answer `EOPNOTSUPP` themselves).
+- What: `open(dir, O_TMPFILE)` is served as a create under a hidden name (`.slates-tmpfile.<request id>`), which the
+  same dispatch unlinks before it replies.
+  - The whole sequence is one step of the shard, so no other client ever sees the name.
+  - The open orphan is kept alive by the kernel's lookup reference and the open handle (unlink-while-open, §4.6).
+  - The reply carries one link; the kernel's `d_tmpfile` takes it to zero.
+  - Each failing step undoes the ones before it, so a refusal leaves neither the name nor a held handle.
+- `linkat(AT_SYMLINK_FOLLOW)` through `/proc/self/fd` names the file through `LINK`. The kernel sends `LINK` for an
+  unlinked inode only for an `O_TMPFILE`; for any other it refuses `ENOENT` itself. `Volume::link` now takes a named
+  orphan out of the orphan record and returns the retention its unlink secured.
+  - Before, `unreference` already declined to reclaim a relinked inode, but it dropped the record and its secured
+    bytes.
+  - The new test, with a snapshot pinning three chunks, leaks 196,608 bytes of the shard budget without the fix and
+    none with it.
+- Measured through the kernel (Docker, Linux 6.12, `slates mount` as an ordinary user):
+  - an `O_TMPFILE` written then named reads back by its name;
+  - a 1 MiB unnamed one, closed, leaves no entry, hidden or not;
+  - Python's `tempfile.TemporaryFile` (glibc `O_TMPFILE`) works.
+  - In the owner-turn test, the `LINK` of the tmpfile waited for its barrier.
+- A harness note: Python's `os.link` passed no `AT_SYMLINK_FOLLOW` here, so it linked the `/proc` magic link itself,
+  and the kernel's `EXDEV` for that was right. A caller must pass the flag, as open(2) documents.

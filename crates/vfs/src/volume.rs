@@ -1699,6 +1699,12 @@ impl Volume {
     let path = self.path_of(store, dir, name);
     let prev = self.inode(store, target)?.version;
     self.record(Op::Link, &path, Some(target), prev);
+    // An orphan named again (an `O_TMPFILE` given a name by `linkat`) is in the namespace once more: it leaves the
+    // orphan record, and the retention its unlink secured for a reclaim that will not happen now goes back (§4.2).
+    if let Some(secured) = self.orphans.remove(&target) {
+      self.retention_prepaid = self.retention_prepaid.saturating_add(secured);
+      self.settle_retention(store);
+    }
     Ok(())
   }
 

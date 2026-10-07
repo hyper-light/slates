@@ -350,3 +350,47 @@ fn a_directory_replaced_by_a_rename_while_referenced_stays_valid_until_its_last_
   vol.unreference(&mut store, target).unwrap();
   assert!(vol.to_image(&store, None).is_ok());
 }
+
+/// An `O_TMPFILE` named by `linkat` (FUSE `TMPFILE`, then `LINK`). Do: create and write a file, hold it open, unlink it
+/// (an orphan) after a snapshot pinned its bytes, link it under a new name, drop the last reference, then unlink the new name. Expect: the named file
+/// keeps its bytes after its last close (it is no longer an orphan to reclaim); unlinking it then reclaims it; and, the
+/// snapshot destroyed, the shard budget's committed and retained bytes end where they began, so the retention the first unlink secured went
+/// back at the relink rather than leaking.
+#[test]
+fn an_orphan_named_again_survives_its_last_close_and_leaks_nothing() {
+  let mut store = store();
+  let mut vol = volume(&mut store, 1 << 30);
+  let root = vol.root_inode(&store).unwrap();
+  let budget_before = (store.budget.committed(), store.budget.retained());
+  let file = vol.create_file_no(&mut store, root, "tmp", 0o600).unwrap();
+  // Several chunk windows, so the snapshot pins chunks (inline bytes need no retention).
+  let body: Vec<u8> = (0..3 * store.content.chunk_bytes())
+    .map(|n| u8::try_from(n % 251).unwrap())
+    .collect();
+  vol.write(&mut store, file, 0, &body).unwrap();
+  // A snapshot pins the content, so the unlink must secure retention for it (§4.2).
+  let snapshot = vol.snapshot(&mut store).unwrap();
+  vol.reference(&store, file).unwrap();
+  vol.unlink_no(&mut store, root, "tmp").unwrap();
+  vol.link_no(&mut store, root, "named", file).unwrap();
+  vol.unreference(&mut store, file).unwrap();
+  let named = vol.lookup_no(&store, root, "named").unwrap();
+  let mut buf = vec![0u8; body.len()];
+  assert_eq!(named.inode, file, "the new name names the same inode");
+  let read = vol.read(&store, file, 0, &mut buf).unwrap();
+  assert!(
+    buf[..read] == body[..],
+    "the named file outlives its last close"
+  );
+  vol.unlink_no(&mut store, root, "named").unwrap();
+  assert!(
+    vol.read(&store, file, 0, &mut buf).is_err(),
+    "unlinked with no reference, it is reclaimed"
+  );
+  vol.destroy_snapshot(&mut store, snapshot).unwrap();
+  assert_eq!(
+    (store.budget.committed(), store.budget.retained()),
+    budget_before,
+    "the budget ends where it began"
+  );
+}

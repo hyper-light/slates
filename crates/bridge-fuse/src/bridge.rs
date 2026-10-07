@@ -137,6 +137,7 @@ pub fn dispatch(message: &[u8], bridge: &mut dyn Bridge, cx: &OpContext, out: &m
     Opcode::ReadDir => serve_readdir(bridge, &request, cx, out),
     Opcode::ReadDirPlus => serve_readdirplus(bridge, &request, cx, out),
     Opcode::Create => serve_create(bridge, &request, cx, out),
+    Opcode::TmpFile => serve_tmpfile(bridge, &request, cx, out),
     Opcode::Release | Opcode::ReleaseDir => serve_release(bridge, &request, cx, out),
     // FSYNC/FSYNCDIR are flush-equivalent for slates: the data is already in the anchor segment,
     // which is the source of truth (R1), so there is nothing to force to a lower tier — a success
@@ -181,7 +182,7 @@ pub fn success_reply_bytes(opcode: Opcode) -> Option<usize> {
     Opcode::Lookup | Opcode::MkDir | Opcode::MkNod | Opcode::SymLink | Opcode::Link => {
       EntryOut::LEN
     }
-    Opcode::Create => EntryOut::LEN.saturating_add(OpenOut::LEN),
+    Opcode::Create | Opcode::TmpFile => EntryOut::LEN.saturating_add(OpenOut::LEN),
     Opcode::GetAttr | Opcode::SetAttr => AttrOut::LEN,
     Opcode::Open | Opcode::OpenDir => OpenOut::LEN,
     Opcode::Write => WriteOut::LEN,
@@ -349,7 +350,12 @@ fn body_room(out: &[u8]) -> u32 {
 fn creates(opcode: Opcode) -> bool {
   matches!(
     opcode,
-    Opcode::Create | Opcode::MkNod | Opcode::MkDir | Opcode::SymLink | Opcode::ReadLink
+    Opcode::Create
+      | Opcode::TmpFile
+      | Opcode::MkNod
+      | Opcode::MkDir
+      | Opcode::SymLink
+      | Opcode::ReadLink
   )
 }
 
@@ -964,6 +970,57 @@ fn serve_create(
     }
     Err(e) => reply_err(req.header.unique, e, out),
   }
+}
+
+/// `FUSE_TMPFILE` (Linux 6.11+, `open(dir, O_TMPFILE)`): an unnamed regular file in directory `nodeid`, open. Served as
+/// a create under a hidden name that the dispatch unlinks before it replies, within one step of the shard, so no other
+/// client ever sees the name. What remains is an open orphan, kept alive by the kernel's lookup reference and the open
+/// handle (POSIX unlink-while-open). The reply is the created entry with its one link: the kernel's `d_tmpfile` takes
+/// it to zero. A later `linkat(AT_EMPTY_PATH)` names the file through `LINK`; without one, the last release reclaims it.
+/// Each step that fails undoes the ones before it, so a refusal leaves neither the name nor a held handle.
+fn serve_tmpfile(
+  bridge: &mut dyn Bridge,
+  req: &Request<'_>,
+  cx: &OpContext,
+  out: &mut [u8],
+) -> usize {
+  // Format: fuse_create_in's fixed part before the name: flags, mode, umask, open_flags. The name the kernel sends
+  // ("/", the tmpfile dentry's) names nothing in a volume.
+  const HEAD: usize = 4 * size_of::<u32>();
+  let unique = req.header.unique;
+  if req.body.len() < HEAD {
+    return write_or_drop(ReplyHeader::write_error(unique, EIO, out), out);
+  }
+  let flags = body_u32(req.body, 0).unwrap_or_default();
+  let mode = masked(
+    body_u32(req.body, size_of::<u32>()).unwrap_or_default(),
+    body_u32(req.body, size_of::<u32>().saturating_mul(2)).unwrap_or_default(),
+  );
+  let parent = match resolve(bridge, cx, req.header.nodeid) {
+    Ok(object) => object,
+    Err(e) => return reply_err(unique, e, out),
+  };
+  let hidden = format!(".slates-tmpfile.{unique:016x}");
+  let (node, fh) = match bridge.create(parent, cx, &hidden, mode, flags) {
+    Ok(created) => created,
+    Err(e) => return reply_err(unique, e, out),
+  };
+  let object = ObjectId::new(node.ino, node.generation);
+  if let Err(e) = bridge.reference(object, cx) {
+    let _ = bridge.release(object, cx, fh);
+    let _ = bridge.unlink(parent, cx, &hidden);
+    return reply_err(unique, e, out);
+  }
+  if let Err(e) = bridge.unlink(parent, cx, &hidden) {
+    let _ = bridge.release(object, cx, fh);
+    bridge.forget(object, cx, 1);
+    return reply_err(unique, e, out);
+  }
+  let valid = valid_for(bridge, cx, node.ino);
+  let open_flags = open_flags_for(bridge, cx, ObjectId::new(node.ino, 0), false, flags);
+  let mut body = entry_out(&node, valid).to_bytes();
+  body.extend_from_slice(&OpenOut { fh, open_flags }.to_bytes());
+  write_or_drop(ReplyHeader::write_ok(unique, &body, out), out)
 }
 
 fn serve_release(

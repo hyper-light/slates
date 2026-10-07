@@ -2180,7 +2180,8 @@ a real `pip install`, and a `kill -9` of the daemon mid-write went through the m
   - Fixed: the allowance is the quota over the shard's arena-to-slab ratio (about 2.4 KB per inode on this build,
     ext4's bytes-per-inode rule). Test `bounded_volumes_that_fill_a_shards_bytes_fit_its_version_slab`: four
     volumes of a quarter of the shard's admittable bytes each; before, the second was refused.
-- **`O_TMPFILE` is `EOPNOTSUPP`** (FUSE `TMPFILE`, Linux 6.11+, is unserved).
+- **`O_TMPFILE` on the Linux FUSE mount: built (A-111, 2026-10-06).** Kernels before 6.11 have no FUSE `TMPFILE`
+  and answer `EOPNOTSUPP` themselves, which glibc's `tmpfile` falls back from.
 
 **Closed by A-107: a symlink out of the volume was followed for any caller.**
 - What happened: an agent could plant `out -> /etc/cron.d/x` in a volume, and the kernel followed that link for any later

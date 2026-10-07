@@ -58,6 +58,7 @@ const OPCODES: &[(Opcode, u32)] = &[
   (Opcode::Fallocate, 43),
   (Opcode::ReadDirPlus, 44),
   (Opcode::Rename2, 45),
+  (Opcode::TmpFile, 51),
 ];
 
 /// `enum fuse_opcode` values slates does not serve (the header's remaining enumerators; the codec
@@ -65,7 +66,8 @@ const OPCODES: &[(Opcode, u32)] = &[
 const UNSERVED_OPCODES: &[u32] = &[
   31, 32, 33, 34, // GETLK, SETLK, SETLKW, ACCESS
   36, 37, 39, 40, 41, // INTERRUPT, BMAP, IOCTL, POLL, NOTIFY_REPLY
-  46, 47, 48, 49, 50, 51, 52, 53,   // LSEEK .. COPY_FILE_RANGE_64
+  46, 47, 48, 49, 50, 52,
+  53,   // LSEEK .. SYNCFS, STATX, COPY_FILE_RANGE_64 (51, TMPFILE, is served)
   4096, // CUSE_INIT
 ];
 

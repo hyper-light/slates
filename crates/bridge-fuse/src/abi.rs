@@ -92,6 +92,9 @@ pub enum Opcode {
   ReadDirPlus = 44,
   /// Format: FUSE_RENAME2 — rename with flags (`RENAME_EXCHANGE`, `RENAME_NOREPLACE`).
   Rename2 = 45,
+  /// Format: FUSE_TMPFILE — an unnamed file in a directory, open (`open(dir, O_TMPFILE)`, Linux 6.11+): the body of
+  /// FUSE_CREATE, the reply of FUSE_CREATE.
+  TmpFile = 51,
 }
 
 /// Every opcode slates serves, so `from_wire` needs no number of its own.
@@ -130,6 +133,7 @@ const ALL: &[Opcode] = &[
   Opcode::Fallocate,
   Opcode::ReadDirPlus,
   Opcode::Rename2,
+  Opcode::TmpFile,
 ];
 
 impl Opcode {

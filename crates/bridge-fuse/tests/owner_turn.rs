@@ -281,6 +281,7 @@ fn a_mutations_reply_waits_for_its_barrier_and_a_refused_barrier_answers_eio() {
   let (ok, err) = through_the_mount(&mount_point, "printf hi > \"$1/f\" && cat \"$1/f\"");
   assert!(ok, "write and read back through the mount: {err}");
   allocate_through_the_mount(&mount_point);
+  tmpfile_through_the_mount(&mount_point);
   refuse_tx.send(()).unwrap();
   let (ok, err) = through_the_mount(&mount_point, "mkdir \"$1/d\"");
   assert!(
@@ -332,6 +333,41 @@ fn allocate_through_the_mount(mount_point: &str) {
       "{what} is EOPNOTSUPP: {err}"
     );
   }
+}
+
+/// `O_TMPFILE` through the kernel (FUSE `TMPFILE`, Linux 6.11+). Do: open an unnamed file in the mount's root, write
+/// it, and name it with `linkat` through `/proc/self/fd`; open a second unnamed file and close it unnamed. Expect: the
+/// named file reads back what was written; no other entry appears in the directory, the second file's hidden name
+/// included, since the server unlinks it before it replies. A kernel older than 6.11 answers `EOPNOTSUPP`, which
+/// skips loudly.
+#[allow(clippy::disallowed_methods)] // `linkat` names a file inside the slates mount: the volume's RAM, never the disk (R1)
+fn tmpfile_through_the_mount(mount_point: &str) {
+  use rustix::fs::{AtFlags, CWD, Mode, OFlags};
+  let unnamed = OFlags::TMPFILE | OFlags::RDWR;
+  let fd = match rustix::fs::open(mount_point, unnamed, Mode::from_raw_mode(0o600)) {
+    Ok(fd) => fd,
+    Err(rustix::io::Errno::OPNOTSUPP) => {
+      eprintln!("SKIP: this kernel has no FUSE TMPFILE (Linux 6.11+)");
+      return;
+    }
+    Err(e) => panic!("O_TMPFILE through the mount: {e}"),
+  };
+  assert_eq!(rustix::io::write(&fd, b"made unnamed").unwrap(), 12);
+  let by_fd = format!("/proc/self/fd/{}", std::os::fd::AsRawFd::as_raw_fd(&fd));
+  rustix::fs::linkat(
+    CWD,
+    by_fd.as_str(),
+    CWD,
+    format!("{mount_point}/named").as_str(),
+    AtFlags::SYMLINK_FOLLOW,
+  )
+  .unwrap();
+  drop(fd);
+  drop(rustix::fs::open(mount_point, unnamed, Mode::from_raw_mode(0o600)).unwrap());
+  let (ok, err) = through_the_mount(mount_point, "test \"$(cat \"$1/named\")\" = 'made unnamed'");
+  assert!(ok, "the linked file reads back: {err}");
+  let (ok, err) = through_the_mount(mount_point, "! ls -a \"$1\" | grep -q slates-tmpfile");
+  assert!(ok, "no hidden name is left: {err}");
 }
 
 /// What the loop must have counted: one refused barrier (the `mkdir`'s), the create and the close's flush
