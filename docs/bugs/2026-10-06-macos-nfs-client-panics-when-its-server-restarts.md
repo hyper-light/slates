@@ -77,3 +77,22 @@ devices have been held across restarts since A-61.
 - `crates/server/tests/nfs_hostile.rs` passes (it caught the peer-close case).
 - Not yet run: the kernel client under kills with this fix. That repeats the experiment that panicked the machine
   twice, so it waits for Ada.
+
+## Follow-up, same day: the first commit refused every NFS connection on Linux
+
+`03fc2c1` sized each connection's buffers with `SO_SNDBUF`/`SO_RCVBUF` and refused any connection whose kernel kept
+less than two records (532 KiB). Linux clamps an unprivileged request at `net.core.wmem_max`/`rmem_max` (about 208 KiB
+by default), so every Linux connection was refused at admission. The server NFS suites run on Linux in Docker (rust
+1.98, non-root, io_uring allowed) failed at their first call (`nfs_hostile` 0 of 3).
+
+Fix: Linux leaves the buffers to autotune. A receive low-water mark grows an unlocked buffer to fit it, up to half of
+`tcp_rmem[2]` (`tcp_set_rcvlowat`, net/ipv4/tcp.c), which is the "a whole record sits in the queue" requirement.
+Linux sends are not made whole, so the send buffer needs no floor. The kernel caps the mark without saying so, and a
+capped mark would wake the connection before the record is whole each time, so `want_bytes` reads it back, and a
+connection whose mark was capped is ended and counted (`nfs.stream_refused`) rather than left spinning.
+
+After: Linux `nfs_hostile` 3/3, `nfs_mount` 29/29, `recovery` 29/29; macOS unchanged (3/3, 29/29, 27/27, both held
+tests).
+
+Lesson: a change to a socket's options is cross-OS by nature. Run the Linux lane before committing it, not only Linux
+clippy.

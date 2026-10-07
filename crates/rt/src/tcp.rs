@@ -94,27 +94,69 @@ const TCP_ESTABLISHED: u8 = 4;
 /// The TCP state byte at the head of the kernel's connection record: both kernels copy out as much of the record as the
 /// caller's length asks, so one byte reads the state alone.
 fn tcp_state(fd: &OwnedFd) -> Result<u8, rustix::io::Errno> {
-  let mut state = 0u8;
-  let mut length = libc::socklen_t::try_from(size_of::<u8>()).unwrap_or(0);
-  // SAFETY: `fd` is a live socket this stream owns for the call; the buffer is one byte on this frame that outlives the
-  // call, `length` says so and is a `socklen_t` on this frame the kernel may lower, so it writes at most that byte.
+  let mut state = [0u8; 1];
+  get_option(fd, libc::IPPROTO_TCP, TCP_STATE_OPTION, &mut state)?;
+  Ok(state[0])
+}
+
+/// Reads a socket option `rustix` does not wrap into `into` (the kernel copies at most its length; an option whose
+/// value it shortens below that length is refused, since the caller reads every byte it asked for).
+fn get_option(
+  fd: &OwnedFd,
+  level: libc::c_int,
+  name: libc::c_int,
+  into: &mut [u8],
+) -> Result<(), rustix::io::Errno> {
+  let asked = libc::socklen_t::try_from(into.len()).map_err(|_| rustix::io::Errno::INVAL)?;
+  let mut length = asked;
+  // SAFETY: `fd` is a live socket this stream owns for the call; `into` is a buffer the caller owns for the call, and
+  // `length` (on this frame, which the kernel may lower) says its size, so the kernel writes at most those bytes.
   let result = unsafe {
     libc::getsockopt(
       fd.as_raw_fd(),
-      libc::IPPROTO_TCP,
-      TCP_STATE_OPTION,
-      std::ptr::from_mut(&mut state).cast::<libc::c_void>(),
+      level,
+      name,
+      into.as_mut_ptr().cast::<libc::c_void>(),
       &raw mut length,
     )
   };
-  if result == 0 && length > 0 {
-    Ok(state)
-  } else {
-    Err(
+  if result != 0 {
+    return Err(
       rustix::io::Errno::from_io_error(&std::io::Error::last_os_error())
         .unwrap_or(rustix::io::Errno::INVAL),
-    )
+    );
   }
+  if length < asked {
+    return Err(rustix::io::Errno::INVAL);
+  }
+  Ok(())
+}
+
+/// The BSD arm of [`TcpStream::reserve_buffers`]: both buffers set and read back.
+#[cfg(not(target_os = "linux"))]
+fn reserve_buffers(fd: &OwnedFd, buffer_bytes: usize) -> Result<(), RtError> {
+  use rustix::net::sockopt;
+  sockopt::set_socket_send_buffer_size(fd, buffer_bytes)
+    .map_err(|e| refused("setsockopt(SO_SNDBUF)", e))?;
+  sockopt::set_socket_recv_buffer_size(fd, buffer_bytes)
+    .map_err(|e| refused("setsockopt(SO_RCVBUF)", e))?;
+  let send =
+    sockopt::socket_send_buffer_size(fd).map_err(|e| refused("getsockopt(SO_SNDBUF)", e))?;
+  let receive =
+    sockopt::socket_recv_buffer_size(fd).map_err(|e| refused("getsockopt(SO_RCVBUF)", e))?;
+  if send < buffer_bytes || receive < buffer_bytes {
+    return Err(refused(
+      "setsockopt(SO_SNDBUF/SO_RCVBUF)",
+      rustix::io::Errno::NOBUFS,
+    ));
+  }
+  Ok(())
+}
+
+/// The Linux arm of [`TcpStream::reserve_buffers`]: left to autotune, the receive buffer grown by the low-water mark.
+#[cfg(target_os = "linux")]
+fn reserve_buffers(_fd: &OwnedFd, _buffer_bytes: usize) -> Result<(), RtError> {
+  Ok(())
 }
 
 /// The BSD arm of [`TcpStream::make_sends_whole`]: the send buffer must hold the record, then the low-water mark is it.
@@ -374,26 +416,15 @@ impl TcpStream {
     }
   }
 
-  /// Sizes the stream's kernel buffers to hold `buffer_bytes` each way (`SO_SNDBUF`, `SO_RCVBUF`), refused unless the
-  /// kernel grants at least that much (it reports what it kept; Linux keeps double, for its bookkeeping). A buffer set
-  /// here is no longer auto-tuned.
+  /// Makes the stream's kernel buffers hold `buffer_bytes` each way, so a whole record can sit in the receive queue to
+  /// be peeked and a whole record fits the send queue. On macOS and the BSDs the buffers are set (`SO_SNDBUF`,
+  /// `SO_RCVBUF`, within `kern.ipc.maxsockbuf`), refused unless the kernel keeps at least that much. Linux is left to
+  /// autotune: an unprivileged `SO_RCVBUF` is clamped at `net.core.rmem_max` (about 208 KiB by default, below a record)
+  /// and turns autotuning off, while a receive low-water mark grows an unlocked buffer to fit it, up to half of
+  /// `tcp_rmem[2]` (`tcp_set_rcvlowat`, net/ipv4/tcp.c, read 2026-10-06) — what [`TcpStream::want_bytes`] asks and
+  /// checks. Linux sends are not made whole ([`WholeSends::NotOffered`]), so its send buffer needs no floor.
   pub fn reserve_buffers(&self, buffer_bytes: usize) -> Result<(), RtError> {
-    use rustix::net::sockopt;
-    sockopt::set_socket_send_buffer_size(&self.fd, buffer_bytes)
-      .map_err(|e| refused("setsockopt(SO_SNDBUF)", e))?;
-    sockopt::set_socket_recv_buffer_size(&self.fd, buffer_bytes)
-      .map_err(|e| refused("setsockopt(SO_RCVBUF)", e))?;
-    let send = sockopt::socket_send_buffer_size(&self.fd)
-      .map_err(|e| refused("getsockopt(SO_SNDBUF)", e))?;
-    let receive = sockopt::socket_recv_buffer_size(&self.fd)
-      .map_err(|e| refused("getsockopt(SO_RCVBUF)", e))?;
-    if send < buffer_bytes || receive < buffer_bytes {
-      return Err(refused(
-        "setsockopt(SO_SNDBUF/SO_RCVBUF)",
-        rustix::io::Errno::NOBUFS,
-      ));
-    }
-    Ok(())
+    reserve_buffers(&self.fd, buffer_bytes)
   }
 
   /// Makes every send of at most `record_bytes` whole — all of it or none — where the kernel offers that, and says
@@ -409,10 +440,22 @@ impl TcpStream {
 
   /// Sets the receive low-water mark (`SO_RCVLOWAT`): readability is reported once `bytes` are queued (or at end of
   /// stream), so a reader waiting for a whole record is woken once, not for every segment of it.
+  /// The kernel caps the mark without saying so (Linux at half of `tcp_rmem[2]`, BSD at the receive buffer); a mark it
+  /// kept below `bytes` would report readable before the record is whole, so it is read back and refused.
   pub fn want_bytes(&self, bytes: usize) -> Result<(), RtError> {
     let value = i32::try_from(bytes.max(1)).unwrap_or(i32::MAX);
     set_int_option(&self.fd, libc::SOL_SOCKET, libc::SO_RCVLOWAT, value)
-      .map_err(|e| refused("setsockopt(SO_RCVLOWAT)", e))
+      .map_err(|e| refused("setsockopt(SO_RCVLOWAT)", e))?;
+    let mut kept = [0u8; size_of::<i32>()];
+    get_option(&self.fd, libc::SOL_SOCKET, libc::SO_RCVLOWAT, &mut kept)
+      .map_err(|e| refused("getsockopt(SO_RCVLOWAT)", e))?;
+    if i32::from_ne_bytes(kept) < value {
+      return Err(refused(
+        "setsockopt(SO_RCVLOWAT)",
+        rustix::io::Errno::NOBUFS,
+      ));
+    }
+    Ok(())
   }
 
   /// Whether the connection has left the established state — the peer closed its half (its FIN arrived: close-wait) or

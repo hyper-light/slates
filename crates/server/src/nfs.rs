@@ -1864,8 +1864,8 @@ const NFS_SEND_COMPLETED: &str = "nfs.send_completed";
 /// The status refusal count of connections refused at admission: buffers the kernel would not size, a low-water mark
 /// it would not set, the hold bound reached, or a hold the anchor's channel would not carry. The client reconnects.
 pub(crate) const HOLD_REFUSED: &str = "nfs.connection_hold_refused";
-/// The status refusal count of connections ended because their stream was not a record stream, or carried a record
-/// larger than the connection's receive buffer.
+/// The status refusal count of connections ended because their stream was not a record stream, carried a record
+/// larger than the connection's receive buffer, or needed a receive low-water mark the kernel would not keep.
 const STREAM_REFUSED: &str = "nfs.stream_refused";
 /// The status refusal count of connection releases the anchor's channel would not carry: the anchor keeps a copy of a
 /// connection this daemon ended until the next daemon finds it closed and releases it again.
@@ -2060,11 +2060,18 @@ impl Connection {
     self.ending().release();
   }
 
-  /// Sets the receive low-water mark to `bytes` if it is not already that.
-  fn want(&mut self, bytes: usize) {
-    if self.wanted != bytes && self.stream.want_bytes(bytes).is_ok() {
-      self.wanted = bytes;
+  /// Sets the receive low-water mark to `bytes` if it is not already that; whether the kernel keeps it. A mark it caps
+  /// below `bytes` (Linux at half of `tcp_rmem[2]`) would wake the connection before the record is whole, every time,
+  /// so the caller ends the connection rather than spin.
+  fn want(&mut self, bytes: usize) -> bool {
+    if self.wanted == bytes {
+      return true;
     }
+    if self.stream.want_bytes(bytes).is_err() {
+      return false;
+    }
+    self.wanted = bytes;
+    true
   }
 }
 
@@ -2169,7 +2176,11 @@ async fn serve_connection(mut connection: Connection) {
           connection.end();
           return;
         }
-        connection.want(bytes);
+        if !connection.want(bytes) {
+          crate::fleet::count_refusal(STREAM_REFUSED);
+          connection.end();
+          return;
+        }
         woken = false;
         let standing = match idle(&connection, registration.0).await {
           Idle::Readable => {

@@ -10154,7 +10154,11 @@ Status: built on macOS 2026-10-06; Linux owed (below).
      client drops a reply whose xid it no longer awaits (RFC 5531).
   4. The bounds are exact: `MAX_MESSAGE = MAX_TRANSFER + COMPOUND_HEADER_BYTES`, every reply capped there (READDIR
      budgets at the transfer ceiling), each connection's buffers two records. A record larger than the receive buffer
-     is refused, since it could never sit whole to be peeked.
+     is refused, since it could never sit whole to be peeked. On macOS the buffers are set (`kern.ipc.maxsockbuf`
+     allows 8 MiB). Linux clamps an unprivileged `SO_RCVBUF` at `rmem_max` (about 208 KiB) and stops autotuning, so
+     it is left unset: the receive low-water mark grows the buffer to fit (`tcp_set_rcvlowat`, up to half of
+     `tcp_rmem[2]`). The kernel caps a mark silently, so it is read back, and a capped one ends the connection rather
+     than wake it before every record is whole.
 - Re-running the one request in flight at a death is what the client's own retransmission after a reconnect did
   before, so the semantics are unchanged. NFSv3 has no reply cache here, and NFSv4.1's session slots answer a retried
   request from their cache.
