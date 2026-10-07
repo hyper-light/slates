@@ -3286,3 +3286,61 @@ fn a_stale_resume_and_a_page_with_no_room_are_refused(
     "a page with no room for an entry"
   );
 }
+
+/// LOOKUPP (RFC 8881 §18.14), which a Linux `vers=4.x` client sends to find a directory's parent when it holds only the
+/// directory's handle. Do: in a volume with `d/e`, walk PUTROOTFH, LOOKUP `d`, LOOKUP `e`, LOOKUPP, GETFH, and compare
+/// with the handle LOOKUP `d` gives; then LOOKUPP from the root. Expect: the parent of `e` is `d`; LOOKUPP at the root
+/// is `NFS4ERR_NOENT`, as §18.14.3 specifies. It was `NFS4ERR_NOENT` everywhere before 2026-10-06.
+#[test]
+fn lookupp_names_the_parent_and_is_noent_at_the_root() {
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let mut bridge = VolumeBridge::new(VOLUME, &mut vol, &mut store);
+  let cx = root_cx();
+  let root = bridge.root(&cx).unwrap();
+  let d = bridge
+    .mkdir(ObjectId::new(root, 0), &cx, "d", 0o755)
+    .unwrap()
+    .ino;
+  bridge.mkdir(ObjectId::new(d, 0), &cx, "e", 0o755).unwrap();
+  let mut service = export(&mut bridge, 0);
+  let mut server = Server::standalone();
+  let mut client = Client::connect(&mut service, &mut server, b"host-a");
+
+  let walk =
+    |client: &mut Client, service: &mut _, server: &mut Server, names: &[&[u8]], up: bool| {
+      let mut args = client.sequenced(u32::try_from(names.len()).unwrap() + 2 + u32::from(up));
+      args.u32(op::PUTROOTFH);
+      for name in names {
+        args.u32(op::LOOKUP);
+        args.opaque(name);
+      }
+      if up {
+        args.u32(op::LOOKUPP);
+      }
+      args.u32(op::GETFH);
+      let reply = Client::call(service, server, args.as_slice());
+      if reply.status != Nfsstat4::Ok.wire() {
+        return Err(reply.status);
+      }
+      let mut body = reply.walk();
+      skip_sequence(&mut body);
+      expect_ok(&mut body, op::PUTROOTFH);
+      for _ in names {
+        expect_ok(&mut body, op::LOOKUP);
+      }
+      if up {
+        expect_ok(&mut body, op::LOOKUPP);
+      }
+      expect_ok(&mut body, op::GETFH);
+      Ok(body.opaque(128).unwrap().to_vec())
+    };
+  let d_fh = walk(&mut client, &mut service, &mut server, &[b"d"], false).unwrap();
+  let up_fh = walk(&mut client, &mut service, &mut server, &[b"d", b"e"], true).unwrap();
+  assert_eq!(up_fh, d_fh, "the parent of d/e is d");
+  assert_eq!(
+    walk(&mut client, &mut service, &mut server, &[], true),
+    Err(Nfsstat4::Noent.wire()),
+    "LOOKUPP at the root is NOENT"
+  );
+}

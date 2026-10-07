@@ -593,6 +593,21 @@ impl Bridge for VolumeBridge<'_> {
   fn lookup(&mut self, parent: ObjectId, cx: &OpContext, name: &str) -> Result<NodeAttr, VfsError> {
     self.authorize_read(cx)?;
     let dir = InodeNo(parent.inode);
+    // `.` and `..` (POSIX path resolution): the directory itself, and its parent, the root's being the root. NFSv3
+    // LOOKUP and NFSv4 LOOKUPP send them, and Linux's client asks `..` to reconnect a directory it holds only by
+    // handle (`nfs_get_parent`, after a server restart or for `open_by_handle_at`); the volume core resolves
+    // children only, so both answered `ENOENT`, as knfsd does not (found 2026-10-06 by the hostile-names battery).
+    if name == "." || name == ".." {
+      if self.volume.kind(self.store, dir)? != Kind::Dir {
+        return Err(VfsError::NotDirectory);
+      }
+      let named = if name == "." {
+        dir
+      } else {
+        self.volume.parent_no(self.store, dir)?
+      };
+      return self.attr_of(named.0);
+    }
     // Host-aware for an overlay volume (audit BUG-5): a base entry not yet hydrated into the
     // dirtree is found through the base plane's own lookup, which loads the directory's listing on
     // first use (the OS's bulk call), validates it by the directory's fingerprint on every later

@@ -979,8 +979,14 @@ async fn operation<B: Backend>(
     }
     op::LOOKUP => lookup_operation(backend, reader, frame).await,
     op::LOOKUPP => {
+      // The parent of the current directory. At the root of the namespace (or of a scoped view) the parent the volume
+      // names is the directory itself, and RFC 8881 §18.14.3 answers `NFS4ERR_NOENT` there.
       let dir = current(frame)?.clone();
-      frame.current = Some(lookup(backend, &dir, "..").await?.fh);
+      let parent = lookup(backend, &dir, "..").await?.fh;
+      if parent == dir {
+        return Err(Nfsstat4::Noent);
+      }
+      frame.current = Some(parent);
       Ok(Vec::new())
     }
     _ => object_operation(backend, opnum, reader, frame).await,

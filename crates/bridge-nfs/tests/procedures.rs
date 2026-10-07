@@ -2912,3 +2912,128 @@ fn an_exclusive_create_keeps_its_verifier_and_a_retry_finds_its_own_file() {
     "another verifier's create of the name"
   );
 }
+
+/// LOOKUP and CREATE of `name` in `fh` through the export: both refused, neither answered `NFS3_OK`.
+fn assert_lookup_and_create_refused(export: &mut Export<'_>, fh: &Nfsfh3, name: &[u8]) {
+  let mut args = XdrWriter::new();
+  fh.encode(&mut args);
+  args.opaque(name);
+  let looked = export.lookup(&mut XdrReader::new(args.as_slice()));
+  assert_ne!(
+    status_of(&looked),
+    Nfsstat3::Ok.wire(),
+    "LOOKUP {name:?} is refused"
+  );
+  args.u32(0);
+  sattr(&mut args, Some(0o644), None, None);
+  let created = status_of(
+    &export
+      .serve_nfs(NFSPROC3_CREATE, &mut XdrReader::new(args.as_slice()))
+      .unwrap(),
+  );
+  assert_ne!(created, Nfsstat3::Ok.wire(), "CREATE {name:?} is refused");
+}
+
+/// Condition 4, hostile names over NFSv3. Do: in an export whose root holds `hello` and a directory `d`, LOOKUP `.`
+/// and `..` at the root and in `d`, and LOOKUP and CREATE names that try to climb, carry a separator or a NUL, are
+/// empty, are not UTF-8, or are past the name limit. Expect: `.` and `..` at the root name the root itself and `..` in
+/// `d` names the root (both were `NOENT` before 2026-10-06, so a client reconnecting by handle found no parent), so no
+/// walk leaves the export; every hostile name is refused, never answered `NFS3_OK`; and the
+/// root still lists exactly `hello` and `d`, so no refused CREATE left an entry.
+#[test]
+fn hostile_names_never_reach_outside_the_export_or_leave_an_entry() {
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let mut bridge = VolumeBridge::new(VolumeId { bytes: [0x11; 16] }, &mut vol, &mut store);
+  let cx = write_cx();
+  let root_ino = bridge.root(&cx).unwrap();
+  bridge
+    .create(oid(root_ino), &cx, "hello", 0o644, 0)
+    .unwrap();
+  let dir = bridge.mkdir(oid(root_ino), &cx, "d", 0o755).unwrap().ino;
+  let hostile: Vec<Vec<u8>> = vec![
+    b"../../etc/passwd".to_vec(),
+    b"a/b".to_vec(),
+    b"/".to_vec(),
+    b"d/..".to_vec(),
+    b"hel\0lo".to_vec(),
+    b"\0".to_vec(),
+    b"".to_vec(),
+    vec![0xff, 0xfe, b'x'],
+    vec![b'n'; 4096],
+  ];
+  {
+    let mut export = Export::new(
+      &mut bridge,
+      VolumeId { bytes: [0x11; 16] },
+      Principal::Uid { uid: 0 },
+      Rights {
+        read: true,
+        write: true,
+      },
+    )
+    .unwrap();
+    let root_fh = match export.mnt("/") {
+      MountReply::Ok { handle, .. } => handle,
+      MountReply::Err(status) => panic!("MNT failed: {status:?}"),
+    };
+    let lookup = |export: &mut Export<'_>, fh: &Nfsfh3, name: &[u8]| -> (u32, Option<u64>) {
+      let mut args = XdrWriter::new();
+      fh.encode(&mut args);
+      args.opaque(name);
+      let reply = export.lookup(&mut XdrReader::new(args.as_slice()));
+      let mut r = XdrReader::new(&reply);
+      let status = r.u32().unwrap();
+      if status != Nfsstat3::Ok.wire() {
+        return (status, None);
+      }
+      let _ = Nfsfh3::decode(&mut r).unwrap();
+      (
+        status,
+        PostOpAttr::decode(&mut r).unwrap().0.map(|a| a.fileid),
+      )
+    };
+    let root_id = lookup(&mut export, &root_fh, b".")
+      .1
+      .expect("`.` at the root is the root");
+    assert_eq!(
+      lookup(&mut export, &root_fh, b"..").1,
+      Some(root_id),
+      "`..` at the export root names the root"
+    );
+    let mut d_args = XdrWriter::new();
+    root_fh.encode(&mut d_args);
+    d_args.opaque(b"d");
+    let d_reply = export.lookup(&mut XdrReader::new(d_args.as_slice()));
+    let mut r = XdrReader::new(&d_reply);
+    assert_eq!(r.u32().unwrap(), Nfsstat3::Ok.wire());
+    let d_fh = Nfsfh3::decode(&mut r).unwrap();
+    assert_eq!(
+      lookup(&mut export, &d_fh, b"..").1,
+      Some(root_id),
+      "`..` in `d` is the root"
+    );
+    for name in &hostile {
+      for fh in [&root_fh, &d_fh] {
+        assert_lookup_and_create_refused(&mut export, fh, name);
+      }
+    }
+  }
+  let mut listed: Vec<String> = bridge
+    .readdir(oid(root_ino), &cx, 0, 0, 64)
+    .unwrap()
+    .into_iter()
+    .map(|entry| entry.name)
+    .filter(|name| name != "." && name != "..")
+    .collect();
+  listed.sort();
+  assert_eq!(listed, vec!["d".to_owned(), "hello".to_owned()]);
+  let in_d: Vec<String> = bridge
+    .readdir(oid(dir), &cx, 0, 0, 64)
+    .unwrap()
+    .into_iter()
+    .map(|entry| entry.name)
+    .filter(|name| name != "." && name != "..")
+    .collect();
+  assert!(in_d.is_empty(), "nothing was created in `d`: {in_d:?}");
+}

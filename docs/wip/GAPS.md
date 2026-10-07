@@ -3596,8 +3596,12 @@ After every history the outside directory is identical: entries, inodes, sizes, 
 writes only through handles (`openat`-relative creates, renames that replace an entry, never a write in place
 through a name).
 
-Still owed for condition 4: the same battery against the base overlay's reads, and against the container and NFS
-paths (names with `/` or NUL, `..` at an export root, a container's own symlinks followed by a host-side tool).
+Still owed for condition 4: the same battery against the base overlay's reads, and a container's own symlinks
+followed by a host-side tool. The NFS names part is done (2026-10-06,
+`hostile_names_never_reach_outside_the_export_or_leave_an_entry`): every hostile name is refused and leaves no entry.
+It found that `.`, `..` and v4 LOOKUPP were `NOENT`
+(docs/bugs/2026-10-06-dot-and-dotdot-were-noent-over-nfs.md, fixed). Symlinks out of a volume followed by another
+user are refused since A-107.
 
 ### 2026-10-04: barriers publish deltas (A-68 built); what remains
 

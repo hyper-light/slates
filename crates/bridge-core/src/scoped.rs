@@ -88,6 +88,10 @@ impl Bridge for ScopedBridge<'_> {
 
   fn lookup(&mut self, parent: ObjectId, cx: &OpContext, name: &str) -> Result<NodeAttr, VfsError> {
     self.admit(parent, cx)?;
+    // The scope's root is this view's root: its `..` is itself, as a volume root's is, never the directory above.
+    if name == ".." && parent.inode == self.scope {
+      return self.inner.getattr(parent, cx);
+    }
     let node = self.inner.lookup(parent, cx, name)?;
     self.shown(node, parent, cx)
   }

@@ -1402,3 +1402,35 @@ fn a_lost_write_is_reported_once_to_each_handle_that_predates_the_takeover() {
   );
   assert_eq!(bridge.fsync(oid(kept), &cx, OLD_HANDLES[1]), Ok(()));
 }
+
+/// `.` and `..` through the bridge, whole and scoped (POSIX path resolution; NFSv3 LOOKUP, NFSv4 LOOKUPP). Do: make
+/// `shared/a`; look up `.` and `..` in `a`, in `shared` and at the root through the whole bridge, then `..` in `a` and
+/// in `shared` through a bridge scoped to `shared`, and `.` in a file. Expect: `.` is the directory itself; `..` is its
+/// parent and the root's is the root; scoped, `..` of `a` is `shared` and `..` of `shared` is `shared` itself, never
+/// the directory above the scope; `.` in a file is `ENOTDIR`. Both were `ENOENT` before 2026-10-06.
+#[test]
+fn dot_and_dotdot_resolve_and_never_climb_out_of_a_root_or_a_scope() {
+  use slates_bridge_core::scoped::ScopedBridge;
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let mut inner = VolumeBridge::new(VolumeId { bytes: [0; 16] }, &mut vol, &mut store);
+  let cx = rw_cx();
+  let (shared, _, secret) = shared_and_private(&mut inner, &cx);
+  let a = inner.mkdir(oid(shared), &cx, "a", 0o755).unwrap().ino;
+  let root = inner.root(&cx).unwrap();
+  let ino = |bridge: &mut dyn Bridge, dir: u64, name: &str| {
+    bridge.lookup(oid(dir), &cx, name).map(|n| n.ino)
+  };
+  assert_eq!(ino(&mut inner, a, "."), Ok(a));
+  assert_eq!(ino(&mut inner, a, ".."), Ok(shared));
+  assert_eq!(ino(&mut inner, shared, ".."), Ok(root));
+  assert_eq!(ino(&mut inner, root, ".."), Ok(root));
+  assert_eq!(ino(&mut inner, secret, "."), Err(VfsError::NotDirectory));
+  let mut scoped = ScopedBridge::new(&mut inner, shared);
+  assert_eq!(ino(&mut scoped, a, ".."), Ok(shared));
+  assert_eq!(
+    ino(&mut scoped, shared, ".."),
+    Ok(shared),
+    "the scope's `..` is the scope"
+  );
+}
