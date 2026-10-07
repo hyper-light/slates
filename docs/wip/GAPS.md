@@ -4247,3 +4247,35 @@ first.
   transport as something the client must ask the server about on each use.
 - Or document NFS as owner-only access in multi-user hosts, and keep FUSE for shared mounts.
 
+### 2026-10-07: CI on `origin/main` red since 2026-10-06 18:11 — four failures, diagnosed locally where they reproduce
+
+More than 30 consecutive runs failed, the last at `8a18d907` (run 37561725434). Local `main` is 39 commits ahead and
+unpushed: a push is Ada's decision. Read with `gh run view 37561725434 --log-failed`.
+
+1. **`the_linux_kernel_nfsv4_client_mounts_and_works_a_volume`** (conformance, CI's Ubuntu 6.17 client; Linux
+   6.12 refuses, as the test's own comment records). Cause, from the run's kernel NFS trace: for
+   `O_RDONLY|O_TRUNC` the 6.17 client checks only read access (`nfs_access_exit mask=0x4 permitted=0x4`), opens
+   locally under a write delegation that root's earlier create obtained, and sends the truncate as `SETATTR` under
+   the delegation's state id (`stateid=1:0x2044d050`).
+   - The server refuses that `SETATTR` for a non-root caller by the mode bits (`setattr_denial` under
+     `IoAuthority::Delegation`, first-matching class). So the request almost certainly carried the delegation
+     holder's credentials. The trace does not show credentials, so that is the reading, not a fact.
+   - The server cannot tell who asked. The only server-side defense is a policy: no write delegation where a user
+     of the client could be refused a write by the bits. Typical 0644 files fall under it, so the policy would end
+     most write delegations, which carry the create p99s. **Decision owed (Ada).**
+2. **`a_slow_first_round_candidate_is_hedged_after_the_measured_p95`** (Ubuntu and macOS runners, untraced):
+   placement at 3.0038 s against a 3 s hold. On the loaded runners the hedge did not carry the second seal before
+   the held candidate came back. Locally it passes alone (5/5) and in full suites; the traced failures on this
+   machine were the trace's own blocking read, fixed `755e6924`. Needs a loaded reproduction (six-copy load
+   emulation).
+3. **`peers_that_each_believe_the_other_dead_find_each_other_again`** (Ubuntu): after injected mutual deaths, each
+   peer retired the other and they never re-met within the window. Not yet investigated.
+4. **`a_restarted_daemons_first_answer_is_awaited_for_the_reconnect_budget`** (TSan, Ubuntu x86_64):
+   `Stalled { after_ns: 1000000 }`, the short reply deadline, not the reconnect budget. It does not reproduce here:
+   - macOS TSan: 1 run at HEAD and 3 at `8a18d907`;
+   - Linux in Docker without TSan: 5 runs;
+   - Linux aarch64 TSan in Docker (`rustlang/rust:nightly`, `-Zbuild-std`): the test alone 1/1, the whole binary
+     3/3.
+
+   It is specific to CI's x86_64 runner, where the remaining evidence must come from.
+
