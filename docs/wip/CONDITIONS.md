@@ -174,8 +174,9 @@ in the same commit as the work). Last reviewed 2026-10-07 at `89956659`.
     with 3 % loss, batched read-ahead reads 8 MiB in 28.8–33.9 s (82.3–87.1 s one window per forward). With
     ±40 ms jitter, reads take 125–145 s, bound by the session's congestion window (condition 7's jitter work).
   - The detector's far-link false deaths are fixed in the vendored copy, including the stale-pool follow-up (0 of 100
-    seeds). Upstream is on hyper-raft `swim-pair-deadline` (`f129a55`), owed the owner's review: a misfit pair
-    must still condemn a dead member within a stated bound when every survivor is far.
+    seeds). A misfit pair now condemns a dead member within its stated bound even when every survivor is
+    far (40 of 40). Upstream is on hyper-raft `swim-pair-deadline` (`f129a55`); the hyper-sim port and records are
+    owed there.
   - Open: cross-region membership did not form in 2 of 12 bring-ups, and one node's record session stayed borrowed
     for good (`GAPS.md` 2026-10-07).
   - Condition 7's jitter design, which replication's content pulls share.

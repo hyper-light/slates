@@ -126,3 +126,20 @@ With members 1–2 near and 3 far and 3 killed early, no survivor would condemn 
 The fix owed: a judged deadline for a misfit pair from the evidence it has (the pool's measured shape shifted by the
 pair's measured round trip), derived in hyper-raft `docs/timing.md` beside §2.7, with the test "a far member killed
 early, every survivor far, condemned by every survivor within the stated bound".
+
+**Fixed (2026-10-07).** A misfit pair is judged provisionally until its own estimator configures. The expected
+arrival is its own latest measured round trip `R` (its latest answer, however late, else its handshake). The margin
+is `2R`, RFC 6298 §2.2's first-sample rule (`RTTVAR = R/2`, `RTO = SRTT + 4·RTTVAR = 3R`), or the pool's margin
+where wider (`misfit_verdict`). The provisional verdict claims no Theorem 7 bound (`mistake` 1), because the pair's
+own variance is not yet measured. Only an unanswered probe is judged by it: an answered one ends its period at the
+answer, as a measurement probe does.
+
+- **Rejected on the way:** letting a provisional probe's period run to its deadline as a configured probe's does.
+  It stretched every member's periods past the interval its pairs' estimators were built at, and pairs near and far
+  stopped configuring: the kill case failed 33 of 40 runs.
+- **Test, failing first:** `a_far_member_killed_before_any_far_pair_configures_is_condemned_by_every_survivor`. Two
+  near members and one far one killed from the start. Before the fix it was never held dead in 600 simulated
+  seconds. After it, 40 of 40, every survivor holding it dead within the bound its detector stated, measured on the
+  network's clock from the kill (a peer that never answered has no last answer to measure from).
+- **Regressions:** the far-link test 100 of 100; the kill case 40 of 40; the plane suite 9/9 three times;
+  hyper-swim's suite 74/74.

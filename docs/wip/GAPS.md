@@ -4410,6 +4410,9 @@ With jitter the read is bound by the session's congestion window, which collapse
 
 Both need traces before diagnosis. Their logs and status are kept from the runs.
 
-**Owed:** the hyper-raft owner's review of `swim-pair-deadline` (`f129a55`). Its blocking point: a member that dies
-before its far pairs' own estimators configure is never condemned by them, so it needs a judged deadline for misfit
-pairs derived from their measured path, and the matching test.
+**The hyper-raft owner's review of `swim-pair-deadline` (`f129a55`), blocking point fixed in the vendored copy the same
+day.** A member that died before its far pairs' own estimators configured was never condemned by them; now misfit pairs
+are judged provisionally (RFC 6298 §2.2's `3R` from their own measured round trip), and the early-kill test, failing
+first, passes 40 of 40 (`docs/bugs/2026-10-07-a-far-member-condemns-the-near-side-by-its-pooled-deadline.md`). Still
+owed upstream: the deterministic hyper-sim port on a named seed set, the derivation in hyper-raft's `docs/timing.md`,
+and before/after through `hyper-swim-compare`.

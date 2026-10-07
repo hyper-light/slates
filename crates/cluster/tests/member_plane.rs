@@ -380,12 +380,61 @@ fn condemnations_by_own_probes(fleet: &Network, victim: u64) -> usize {
     }
     own += 1;
     let (after, within) = (report.condemned_after, report.condemned_within);
+    // A peer that never answered has no last answer to measure from: its bound is checked by the test, on the
+    // network's clock from the kill.
+    let never_answered = report.last_answer_ns.is_none() && after.is_none() && within.is_some();
     assert!(
-      matches!((after, within), (Some(after), Some(within)) if after <= within),
+      never_answered || matches!((after, within), (Some(after), Some(within)) if after <= within),
       "member {survivor} condemned within its stated bound: after {after:?}, within {within:?}"
     );
   }
   own
+}
+
+/// §4.8 membership, the liveness half of the far-link fix (the hyper-raft owner's review of `swim-pair-deadline`,
+/// 2026-10-07): a pair the pool does not fit must still be judged, within a bound, before its own estimator has a
+/// verdict. Do: run two near members and one far one, the far one killed from the start, so neither survivor ever
+/// measures it and every survivor is far from it. Expect: both survivors come to hold it dead, at least one by its
+/// own probes within the bound its detector stated, and neither survivor is condemned. Before the fix, a misfit
+/// pair's probes were measurement only and an unanswered one condemned nothing: the dead far member was never held
+/// dead.
+#[test]
+fn a_far_member_killed_before_any_far_pair_configures_is_condemned_by_every_survivor() {
+  let far = [3u64];
+  let members = 3u64;
+  let victim = 3u64;
+  let mut fleet = Network::sized(members, &far);
+  fleet.killed.push(victim);
+  let started = fleet.now_ns;
+  let condemned = fleet.run_until(HORIZON_NS, |fleet| {
+    (1..members).all(|me| matches!(fleet.liveness(me, victim), Some(Liveness::Dead) | None))
+  });
+  let took = std::time::Duration::from_nanos(fleet.now_ns.saturating_sub(started));
+  // The victim never answered, so each condemning survivor's stated bound runs from the kill.
+  let stated = (1..members)
+    .filter_map(|me| {
+      fleet.members[&me]
+        .detector()
+        .report(hyper_swim::HostId(victim))
+        .and_then(|report| report.condemned_within)
+    })
+    .max();
+  let wrongly: Vec<(u64, u64)> = fleet
+    .condemned
+    .iter()
+    .copied()
+    .filter(|(_, target)| *target != victim)
+    .collect();
+  assert!(condemned, "every survivor holds the far member dead");
+  assert!(wrongly.is_empty(), "live members condemned: {wrongly:?}");
+  assert!(
+    condemnations_by_own_probes(&fleet, victim) > 0,
+    "a survivor's own probes condemned the far member"
+  );
+  assert!(
+    stated.is_some_and(|stated| took <= stated),
+    "every survivor held it dead within the bound its detector stated: took {took:?}, stated {stated:?}"
+  );
 }
 
 /// A-67 H-2, T-8.5 (a death report crosses live neighbours; its transmission budget is hyper-swim's gossip_transmits,
@@ -707,9 +756,22 @@ fn a_far_member_that_dies_is_condemned_by_every_survivor_and_no_live_one_is() {
       })
     })
   });
+  let unconfigured: Vec<(u64, u64)> = (1..=members)
+    .flat_map(|me| {
+      (1..=members)
+        .filter(move |peer| *peer != me)
+        .map(move |peer| (me, peer))
+    })
+    .filter(|(me, peer)| {
+      !fleet.members[me]
+        .detector()
+        .report(hyper_swim::HostId(*peer))
+        .is_some_and(|report| report.configured)
+    })
+    .collect();
   assert!(
     judged,
-    "every pair's own estimator configured from its evidence"
+    "every pair's own estimator configured from its evidence; not configured: {unconfigured:?}"
   );
   assert!(
     fleet.condemned.is_empty(),

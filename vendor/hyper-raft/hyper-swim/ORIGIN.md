@@ -197,3 +197,15 @@ compares the handshake with that verdict: 100 of 100 runs condemn no live member
   `a_far_member_that_dies_is_condemned_by_every_survivor_and_no_live_one_is`).
 - Write-up: `docs/bugs/2026-10-07-a-far-member-condemns-the-near-side-by-its-pooled-deadline.md`.
 - Drop this patch when slates re-vendors a hyper-raft main that carries the fix.
+
+Second follow-up the same day, from the hyper-raft owner's review: a misfit pair's probes were measurement only
+until its own estimator configured, and an unanswered one condemned nothing, so a member that died before its far
+pairs configured was never held dead when every survivor was far from it. A misfit pair is now judged
+provisionally by its own latest round trip `R` with RFC 6298 §2.2's first-sample margin (`3R`, or the pool's margin
+where wider; `misfit_verdict`). The provisional verdict promises no bound (`mistake` 1). Its answered probe ends its
+period at the answer, as a measurement probe's does: waiting out the deadline stretched the periods past the
+interval the pairs' estimators were built at, and pairs stopped configuring in 33 of 40 seeds. One misfit rule,
+`misfits_pool`, now serves the verdict and the wait, and `probe_wait` no longer splits `measurement_wait`'s doc.
+Slates' `a_far_member_killed_before_any_far_pair_configures_is_condemned_by_every_survivor` failed before (never
+held dead in 600 simulated seconds) and passes 40 of 40; the far-link test passes 100 of 100 and the kill case 40 of
+40.
