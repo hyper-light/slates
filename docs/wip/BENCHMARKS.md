@@ -3275,3 +3275,34 @@ stale low minimum, under-reads the queue and over-sends. So it does not land. Th
 starvation result prescribes (Arun, Alizadeh, Balakrishnan, SIGCOMM 2022, §6): estimate the path's non-congestive
 jitter D and hold at least D of delay before reading it as queue. That would separate jitter from queue rather than
 widening a time window, and it must clear this grid with no loss before it lands.
+
+#### Measured and rejected: a delivered-BDP floor under Copa's window (2026-10-07)
+
+The idea (BBR's model, Cardwell et al., ACM Queue 2016): Copa's window never drops below `max delivery rate over 10
+round trips × RTTmin`, so jitter read as queue cannot shrink it below the path's bandwidth-delay product.
+
+`fetch_bench`, thin link (10 Mbit/s, 200 ms), 8 MiB:
+
+| Scenario | Completion |
+|---|---|
+| jitter ±40 ms in order | 11.7 s (5.7 Mbit/s; the sample floor's best was 20.4 s) |
+| 2% loss, in order | 7.9 s (unchanged) |
+| reordering ±40 ms, no loss | 67.9 s, 18 spurious losses |
+| reordering ±40 ms, 2% loss | 91.0 s, 123 spurious losses, end window 14.9 KB |
+
+`congestion_bench` against `HEAD`: capacity share +0.9% and ping p99 +0.8% by geomean.
+
+- Wins: 100 Mbit/s at 300 ms share 0.487 → 0.622; 100 Mbit/s at 20 ms with 5% loss, p99 81.9 → 61.6 ms.
+- Losses: the capacity step 10 → 2 → 10 Mbit/s, ping p99 160 → 500 ms (the floor remembers the old rate for 10
+  rounds and holds a queue, BBRv1's stickiness that BBRv2/v3 bound with loss-driven `inflight_hi`); 10 Mbit/s at
+  300 ms with 0.1% loss, p99 409 → 509 ms.
+- Under reordering the floor never forms: spurious retransmissions depress the measured delivery rate.
+
+It does not land. What the two experiments establish for the owed design:
+
+1. In-order jitter is solved by a bandwidth-model floor.
+2. The floor must give way on a capacity drop within a round trip or two, not ten (an `inflight_hi`-style bound,
+   BBRv3 draft-ietf-ccwg-bbr §5.5).
+3. Reordering needs its own fix: the spurious retransmissions themselves, which the adaptive reordering tolerance
+   (`reorder.rs`) still lets through at ±40 ms. That is RACK's reordering window growing too slowly for this
+   jitter.
