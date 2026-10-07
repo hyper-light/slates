@@ -3168,3 +3168,25 @@ from the repository's Dockerfile, smoked, then on a three-pod chart install:
 `cargo xtask kind export` (kubelet mounting a published volume as an `nfs` PersistentVolume over RPC-with-TLS)
 skipped loudly here: Docker Desktop's kernel has no TLS record layer (`CONFIG_TLS`). That leg runs in CI with
 `--require-kernel-tls`.
+
+#### The storm again on the streamed-checkpoint build (2026-10-07)
+
+Same command (`native.sh`), Linux release build at `462be77e`, load average 7.7–10.6:
+
+| workers | op | p50 | p99 | p999 | after A-89 p99 |
+|---|---|---|---|---|---|
+| 1 | create+write+close | 0.18 ms | 0.35 ms | 0.49 ms | 0.38 ms |
+| 1 | open+read+close | 24 µs | 80 µs | 117 µs | 0.17 ms |
+| 1 | stat | 30 µs | 84 µs | 179 µs | 54 µs |
+| 16 | create+write+close | 1.9 ms | 3.37 ms | 4.65 ms | 4.2 ms |
+| 16 | open+read+close | 0.79 ms | 3.39 ms | 20.3 ms | 3.1 ms |
+| 16 | stat | 0.12 ms | 1.63 ms | 3.21 ms | — |
+
+The daemon's own operation time (`nfs.local_p*_ns`, shard 0): p50 1.8–1.9 µs, p99 9.2–10.2 µs. The 2026-10-05 record
+had 0.49 ms.
+
+Open: one stat at one worker is now a round trip (p50 30 µs; the A-89 record's 2.3 µs was the client's attribute
+cache). mountstats counts exactly 1,117 GETATTRs for 2,000 stats on every run. A/B at one worker, two runs each,
+against the build before this day's changes (`43826f76`): stat p50 30.0 / 30.0 µs there and 30.1 / 30.1 µs here, the
+same 1,117 GETATTRs. So the change predates this day's work, and its cause is not measured: a commit between A-89 and
+`43826f76`, or the Docker Desktop kernel's client. The identical count says it is deterministic.
