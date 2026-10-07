@@ -3306,3 +3306,37 @@ It does not land. What the two experiments establish for the owed design:
 3. Reordering needs its own fix: the spurious retransmissions themselves, which the adaptive reordering tolerance
    (`reorder.rs`) still lets through at ±40 ms. That is RACK's reordering window growing too slowly for this
    jitter.
+
+#### Measured and rejected: the floor with a two-round filter and a loss reset (2026-10-07)
+
+The variant: the delivered-BDP floor with BBRv3's two-round maximum (`MaxBwFilterLen`) instead of ten, and a loss
+while the floor binds restarting the filter from the last round's rate (BBRv3's loss-driven `inflight_hi`, in
+spirit).
+
+`congestion_bench` against `HEAD`: capacity share +0.9% and ping p99 −4.4% by geomean.
+
+- The step regression is gone: 10 → 2 → 10 Mbit/s ping p99 160 → 132 ms.
+- Burst loss: 326 → 119 ms. 100 Mbit/s at 300 ms: share 0.487 → 0.621.
+- Losses: 1 Mbit/s at 100 ms with 5% loss, p99 418 → 489 ms; 1 Mbit/s at 300 ms with 0.1% loss, 436 → 499 ms;
+  two-flow fairness share 0.510 → 0.481 (above the Jain floor).
+
+`fetch_bench`, thin link (10 Mbit/s, 200 ms), 8 MiB, against `HEAD` measured the same day:
+
+| Scenario | `HEAD` | Ten-round floor | Two-round floor + loss reset |
+|---|---|---|---|
+| jitter ±40 ms in order | 18.7 s | 11.7 s | 26.3 s |
+| reordering ±40 ms, no loss | 68.2 s | 67.9 s | 90.5 s |
+| reordering ±40 ms, 2% loss | 103.7 s | 91.0 s | 86.6 s |
+| 2% loss, in order | 7.9 s | 7.9 s | 7.9 s |
+
+It does not land. It improves the general grid but is slower than `HEAD` on two of the three jitter rows, the case it
+was for.
+
+The three experiments together:
+- A long memory of the path's rate gives jitter tolerance and holds stale queues on a capacity drop.
+- A short memory fixes the drop and gives the tolerance back.
+- The owed design must tell a capacity drop from jitter by a signal other than how long it remembers. Candidates
+  from the literature: a sustained RTT rise beyond the measured jitter band while the delivery rate falls (a drop),
+  as against RTT spread with a steady delivery rate (jitter).
+- The 1 MiB runs earlier in this record exaggerated the jitter collapse, since slow start dominates them. 8 MiB is
+  the honest size for these rows.
