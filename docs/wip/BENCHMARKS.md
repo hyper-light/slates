@@ -3537,6 +3537,26 @@ Four writers improve clearly. One writer improves on creates and worsens on unli
 A/B does not land. The class also moves work onto performance cores, which costs battery, and it outranks other
 processes. Owed: more rounds, a quiet-machine arm, and the energy cost (`powermetrics`) before any decision.
 
+**Rerun 2026-10-08 on `bcc02163` at load 5–6** (same command, 400 operations a worker, 64 MiB large file; every byte
+identical):
+
+| workers | op | slates p50 | slates p99 | APFS p50 | APFS p99 |
+|---|---|---|---|---|---|
+| 1 | create | 507 µs | 966 µs | 58 µs | 81 µs |
+| 1 | read | 38 µs | 85 µs | 19 µs | 40 µs |
+| 16 | create | 6.2 ms | 15.9 ms | 549 µs | 1.7 ms |
+| 16 | unlink | 6.4 ms | 16.3 ms | 202 µs | 802 µs |
+| 16 | rename | 4.5 ms | 12.3 ms | 234 µs | 1.2 ms |
+| 16 | read | 318 µs | 1.2 ms | 721 µs | 2.1 ms |
+
+- At load 5 rather than 70, the 16-worker create p99 is 15.9 ms rather than 456 ms: most of the old tail was other
+  sessions' load.
+- The daemon's own service time per NFS call stayed p50 3 µs, p99 45 µs (`nfs.local_*`), so the remaining gap to
+  APFS is in macOS's NFS client. It serializes directory changes in one shared directory, and spends about 14 RPCs
+  a create, half of them on AppleDouble sidecars for extended attributes that NFSv3 cannot carry. The macOS
+  extended-attribute transport (NFSv4 named attributes or another) is Ada's decision, owed.
+- Large streams: 1.16–1.40 GB/s written, 2.24–2.54 GB/s read.
+
 ### The real crossing's window, read from the owner's sessions (condition 7; 2026-10-08)
 
 Command: `IMAGE=slates:mr sh docs/wip/bench/multiregion/reads.sh <scratch> <8 MiB payload> 3` at `401e9ad3` (the
