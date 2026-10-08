@@ -4247,6 +4247,17 @@ first.
   transport as something the client must ask the server about on each use.
 - Or document NFS as owner-only access in multi-user hosts, and keep FUSE for shared mounts.
 
+**Rerun 2026-10-08 on `bcc02163`** (`SEEDS="11 12 13 14 15" STEPS=400 sh docs/wip/bench/escape/run-nfs.sh`, Linux
+release build, privileged `rust:1.98.0` container): unchanged in kind.
+- Held: 0 daemon disk writes; the outside tree's hash unchanged (`c74dcfd9498d652f`).
+- Did not hold, as before: the other user was refused 141 times, and read the canary through a planted out-of-volume
+  link 45 times; a renamed link was followed to the canary 55 times.
+- The same day, `realworld_chaos.sh` (daemon SIGKILLed twice inside each workload) passed on the same build:
+  - `git clone`: 0.83 s, fsck passes, tree hash `31a1f6f713d195f5` as on tmpfs;
+  - `cargo build`: 3.81 s, the binary runs;
+  - `pip install`: 2.97 s, the packages import;
+  - 6 restarts, one per kill.
+
 ### 2026-10-07: CI on `origin/main` red since 2026-10-06 18:11 — four failures, diagnosed locally where they reproduce
 
 More than 30 consecutive runs failed, the last at `8a18d907` (run 37561725434). Local `main` is 39 commits ahead and
