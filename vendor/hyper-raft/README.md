@@ -1,10 +1,14 @@
 # Vendored hyper-raft crates
 
 The crates slates shares with focal and mantle (`../hyper-raft`, github.com/hyper-light/hyper-raft), taken as a
-snapshot at one revision whose CI is green on all six targets (`SNAPSHOT`: hyper-raft `41761ff`, 2026-10-07; hyper-swim's source and `ORIGIN.md` changed from `f9a2c8e`, its
+snapshot at one revision whose CI is green on all six targets (`SNAPSHOT`: hyper-raft `f311ab6`, 2026-10-07, after `41761ff`; hyper-swim's source and `ORIGIN.md` changed from `f9a2c8e`, its
 far-link series: a pair the pool does not fit is judged provisionally by its own round trip, the pool is fed only by
 the pairs it fits, an answer after its record was reused still times the path, and a peer with no evidence of its
-path is judged at RFC 6298's initial RTO; hyper-seal, hyper-timing and hyper-datagram unchanged). Never a
+path is judged at RFC 6298's initial RTO; hyper-seal, hyper-timing and hyper-datagram unchanged). All four are
+taken at `f311ab6`: hyper-swim's per-peer `OUTSTANDING` bound is public (slates' member plane imports it), and
+hyper-seal gains `sealed_file` behind a `files` feature, the only thing that enables `hyper-block`, a file device.
+slates leaves `files` off and does not vendor `hyper-block`: it writes files only in `land` (R1). Its hyper-seal
+manifest declares the feature as a known, unset value. Never a
 path or git dependency on the shared repository: slates builds what it reviewed (A-52 §5,
 `docs/wip/transport-quic.md` §5; the scheme mantle and focal use).
 

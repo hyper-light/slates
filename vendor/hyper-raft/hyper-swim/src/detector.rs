@@ -286,8 +286,10 @@ pub struct PeerReport {
 /// Probes of one peer that may still be answered: the one that suspected it, the one that told it,
 /// and the one more an extension can grant (at most one base window of one probe,
 /// [`crate::extension`]). An older probe's acknowledgement is past every deadline that could use
-/// it and is not kept for.
-const OUTSTANDING: usize = 3;
+/// it and is not kept for. Public so an owner that relays probes for its peers can bound what it
+/// keeps by it: an asker waits on no more relayed answers about one target than its detector keeps
+/// records for (slates' member plane keeps that many relayed probes per target and asker).
+pub const OUTSTANDING: usize = 3;
 
 /// How long a measurement period waits before any round trip was measured, nanoseconds: RFC 6298
 /// §2.1, a retransmission timer's value until a round trip has been measured ("the sender SHOULD

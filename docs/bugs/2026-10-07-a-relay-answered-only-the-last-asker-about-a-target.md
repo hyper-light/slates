@@ -53,5 +53,5 @@ stay independent.
 
 hyper-swim's `OUTSTANDING` is private at the vendored revision (`41761ff`), so `RELAYS_PER_ASKER` restates its
 derivation. hyper-raft's owner made it public the same day (`hyper_swim::detector::OUTSTANDING`, branch
-`swim-outstanding-pub`, `7ea1c6c`, value unchanged). When main carries it, slates re-vendors and imports it in place of
-`RELAYS_PER_ASKER`, so the two cannot drift.
+`swim-outstanding-pub`, `7ea1c6c`, value unchanged). Done: slates vendors hyper-swim at `1b3b020`, and
+`RELAYS_PER_ASKER` reads `hyper_swim::detector::OUTSTANDING`.

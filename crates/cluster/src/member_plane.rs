@@ -111,13 +111,11 @@ pub enum PlaneEvent {
 }
 
 /// How many relayed probes about one target this node keeps for one asker: the probes of one peer an asker's detector
-/// may still be waiting on, which hyper-swim bounds at three (`detector.rs` `OUTSTANDING`: the probe that suspected
-/// the peer, the probe that told it, and the one more an extension can grant). An asker sends a relay request per
-/// unanswered probe, so a fourth request about one target means the asker reused its oldest probe's record, and that
-/// probe's answer can no longer be credited: it is the one dropped.
-/// Derived: hyper-swim's `OUTSTANDING` (3) at the vendored revision; imported in place of this copy once hyper-raft
-/// exports it (`docs/bugs/2026-10-07-a-relay-answered-only-the-last-asker-about-a-target.md`).
-const RELAYS_PER_ASKER: usize = 3;
+/// may still be waiting on (hyper-swim's `OUTSTANDING`: the probe that suspected the peer, the probe that told it, and
+/// the one more an extension can grant). An asker sends a relay request per unanswered probe, so a further request
+/// about one target means the asker reused its oldest probe's record, and that probe's answer can no longer be
+/// credited: it is the one dropped. Read from hyper-swim, so the two cannot drift.
+const RELAYS_PER_ASKER: usize = hyper_swim::detector::OUTSTANDING;
 
 /// The probes this node relays about one target for one asker, oldest first: each relayed probe's nonce and the asker's
 /// nonce it answers.
