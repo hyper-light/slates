@@ -117,21 +117,32 @@ impl Query {
   pub(crate) fn reuses(self, state: &ShardState, route: CachedRoute) -> Option<&'static str> {
     if route.query != self {
       Some("fleet.owner_location.route_dropped.query_changed")
-    } else if !eligible(state, route.owner, RegionId(self.region)) {
-      Some("fleet.owner_location.route_dropped.owner_ineligible")
     } else {
-      None
+      ineligibility(state, route.owner, RegionId(self.region))
     }
   }
 }
 
+/// Why `host` is not an eligible owner in `region`, as the counter a dropped route is recorded under, or `None` when
+/// it is: its region is another (or unknown), membership does not know it, or membership holds it dead. A suspected
+/// member stays eligible: SWIM's suspicion is refutable, and only a death removes it (Das, Gupta & Motivala, DSN 2002,
+/// §4.2). The three are counted apart because each has a different source: the root configuration, the member list,
+/// and a death this node's detector judged or a peer gossiped.
+fn ineligibility(state: &ShardState, host: HostId, region: RegionId) -> Option<&'static str> {
+  if state.node_regions.get(&host) != Some(&region) {
+    return Some("fleet.owner_location.route_dropped.owner_ineligible.region");
+  }
+  match state.fleet.membership().state(host) {
+    None => Some("fleet.owner_location.route_dropped.owner_ineligible.unknown"),
+    Some(member) if member.liveness == Liveness::Dead => {
+      Some("fleet.owner_location.route_dropped.owner_ineligible.dead")
+    }
+    Some(_) => None,
+  }
+}
+
 fn eligible(state: &ShardState, host: HostId, region: RegionId) -> bool {
-  state.node_regions.get(&host) == Some(&region)
-    && state
-      .fleet
-      .membership()
-      .state(host)
-      .is_some_and(|member| member.liveness != Liveness::Dead)
+  ineligibility(state, host, region).is_none()
 }
 
 /// Answer from the held-object route, under the council's configuration. A node claims an object only

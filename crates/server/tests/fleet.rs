@@ -5210,11 +5210,23 @@ fn a_cross_region_client_finds_the_copyset_successor_instead_of_an_unrelated_liv
   );
   // The foreign node's detector as its status reports it: whether it condemned the live successor by its own probes,
   // and how that compares with the theory's allowance (2026-10-07: a retry fell into a brief false death there).
-  let foreign_detector = match Client::connect(&foreign_instance).call(&RequestBody::DaemonStatus) {
-    ReplyBody::DaemonStatus { report } => format!("{:?}", report.fleet.detector),
-    other => format!("status unavailable: {other:?}"),
-  };
-  let routing = format!("{routing}; the foreign node's detector {foreign_detector}");
+  // Every node's, not the foreign node's alone: a death any member judges is gossiped, and the foreign node then holds
+  // the member dead (`route_dropped.owner_ineligible.dead`) though its own detector condemned no one (2026-10-08).
+  let detectors: Vec<String> = daemons
+    .iter()
+    .map(
+      |daemon| match Client::connect(daemon.instance()).call(&RequestBody::DaemonStatus) {
+        ReplyBody::DaemonStatus { report } => format!(
+          "{:?} (foreign: {}): {:?}",
+          daemon.member_identity().ok(),
+          daemon.instance() == foreign_instance,
+          report.fleet.detector
+        ),
+        other => format!("status unavailable: {other:?}"),
+      },
+    )
+    .collect();
+  let routing = format!("{routing}; every node's detector {detectors:?}");
   trace_routing_views(&daemons, ObjectId(id.bytes));
   for daemon in daemons {
     daemon.stop();
