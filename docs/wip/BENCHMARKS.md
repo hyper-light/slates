@@ -3586,8 +3586,14 @@ Command: `IMAGE=<image> sh docs/wip/bench/multiregion/reads.sh <scratch> <8 MiB 
 | as landed (the cap and its rate removed) | 26.5, 33.1, 39.6, 41.3, 44.1, 47.9, 47.9, 49.8, 52.2 | 24 | 369 |
 
 Every read in all three arms was byte-identical; none was refused. The median fell from about 119 s to about 44 s.
-Held-session waits fell (`fleet.forward.session_out` 13 → 3). The owner's windows still read about 9–11 KB after the
-reads, so Copa's window is the next bound (above).
+Held-session waits fell (`fleet.forward.session_out` 13 → 3).
+
+**Correction (same day): the record session's window is not shown to be the next bound.** The owner's record sessions
+to the three readers, sampled every 2 s during one round, held 10.8–11.6 KB windows, slowly shrinking, at 199–267 ms
+RTT. The reads in that round took 31.8–46.2 s, about 180–260 KB/s each, but an 11 KB window at 240 ms allows about
+46 KB/s. So either the reads' bytes do not all cross that one window, or the reported window is not what limits the
+send. The read's real path (which sessions carry a batch's windows) must be identified before any controller change;
+the "9 KB bounds the crossing" reading above came from idle snapshots.
 
 The simulator did not show this. `fetch_bench`'s fetch keeps the pipe full, so it never runs app-limited. A
 `crossing` scenario matching this link (1 Gbit/s, 200 ms, ±40 ms reordering each way, 3% loss each way) reads 8 MiB in
