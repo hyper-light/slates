@@ -3456,6 +3456,47 @@ The second candidate is the strongest on the jitter rows alone (5.4–6.5×), an
 can tell a slow link's queue from jitter without giving those gains back. The landed one keeps 3.1–3.3× with a clean
 grid.
 
+### The incumbent baseline: slates against the kernel's own NFS server, one Linux client (condition 12; 2026-10-08)
+
+Command: `docs/wip/bench/mixed/linux_vs_nfsd.sh 400 64` in a privileged `rust:1.98.0` container (the header gives the
+`docker run`). The Linux release build is the day's last code change (`cf35aba6`), and the Docker VM's kernel is
+6.12.76-linuxkit. One Linux NFSv4.2 client over TCP mounts:
+- slates (4 shards);
+- the kernel's nfsd (8 threads) exporting a tmpfs as the v4 root;
+- plain tmpfs, the floor.
+
+`mixed.py` runs 400 operations a worker in one shared directory, then a 64 MiB file is written, fsynced and read
+back. Every byte was identical. Load average 8–11 from other sessions.
+
+| workers | op | slates p50 / p99 | kernel nfsd p50 / p99 | tmpfs p50 / p99 |
+|---|---|---|---|---|
+| 1 | create | 217 µs / 436 µs | 366 µs / 925 µs | 2 µs / 10 µs |
+| 1 | overwrite | 110 µs / 242 µs | 370 µs / 725 µs | 1 µs / 3 µs |
+| 1 | read | 76 µs / 166 µs | 175 µs / 492 µs | 3 µs / 4 µs |
+| 1 | stat | 37 µs / 88 µs | 8 µs / 128 µs | 1 µs / 2 µs |
+| 16 | create | 1.87 ms / 2.97 ms | 2.37 ms / 3.87 ms | 466 µs / 2.46 ms |
+| 16 | overwrite | 136 µs / 1.68 ms | 477 µs / 1.24 ms | 403 µs / 2.14 ms |
+| 16 | read | 99 µs / 2.62 ms | 272 µs / 962 µs | 1.30 ms / 3.89 ms |
+| 16 | stat | 43 µs / 456 µs | 4 µs / 244 µs | 25 µs / 1.24 ms |
+| 16 | rename | 1.62 ms / 2.67 ms | 2.11 ms / 3.81 ms | 96 µs / 1.56 ms |
+| 16 | unlink | 1.74 ms / 2.62 ms | 2.06 ms / 3.50 ms | 154 µs / 1.38 ms |
+
+- **Where slates wins:** the medians of every write-side operation at every concurrency, and the 16-worker tails
+  of create, rename and unlink.
+- **Where slates loses:**
+  - the 16-worker read p99 (2.62 against 0.96 ms) and the overwrite and append p99s (1.68 against 1.24 ms);
+  - `stat` medians (37–44 µs against 4–8 µs). The client keeps answering nfsd's from its cache and asks slates.
+    That is a hypothesis, untraced: nfsd hands out read delegations, and slates' write-delegation policy is Ada's
+    open decision.
+- **Large files:** slates writes 546–817 MB/s against nfsd's 967–1,524 MB/s and the floor's 1.7–2.1 GB/s; slates
+  reads 2.3–2.7 GB/s, about nfsd's.
+
+**Measured and rejected: a 1 MiB transfer size** (Linux's `NFS_MAX_FILE_IO_SIZE`, what nfsd offers, against slates'
+256 KiB). The client mounted `rsize=wsize=1048576`. The large write did not improve: 461–631 against 546–817 MB/s at
+1, 4 and 16 workers. Reads rose a little (2.67–2.71 against 2.31–2.65 GB/s), too little to land on one run. So the
+write gap to nfsd is in slates' own write path, owed a profile. Two tests encode the 256 KiB size as a literal and
+would need deriving from the constant first (`rtmax is one arena chunk`; a listing sized to need two pages).
+
 ### Mixed read-write tails on macOS's own NFS client, and a shard QoS class measured (condition 12; 2026-10-07)
 
 Command: `bash docs/wip/bench/mixed/mixed_mac.sh <release slates> <out dir> OPS LARGE_MIB`. It runs a release anchor
