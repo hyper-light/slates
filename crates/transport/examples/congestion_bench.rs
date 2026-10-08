@@ -76,6 +76,21 @@ const CEILING_BDPS: u64 = 8;
 const ETHERNET_INTERFACE_MTU: usize = 1_500;
 /// Shape: the seeds each scenario runs with.
 const SEEDS: [u64; 3] = [1, 2, 3];
+
+/// The seeds to run: `CONGESTION_BENCH_SEEDS` (comma-separated), so one scenario's spread can be widened when a seed
+/// moves it, else [`SEEDS`].
+fn seeds() -> Vec<u64> {
+  std::env::var("CONGESTION_BENCH_SEEDS")
+    .ok()
+    .map(|list| {
+      list
+        .split(',')
+        .filter_map(|seed| seed.trim().parse().ok())
+        .collect::<Vec<u64>>()
+    })
+    .filter(|list| !list.is_empty())
+    .unwrap_or_else(|| SEEDS.to_vec())
+}
 /// Shape: a run is recorded as stalled once it has taken this many times its transfer's ideal duration
 /// at link rate — it delivered under 1 % of the link's capacity. Far past the worst healthy result in
 /// the first grid (NewReno at 4 % of capacity, about 25× ideal, 2026-09-27), so only a genuine stall
@@ -659,7 +674,7 @@ fn main() {
     {
       continue;
     }
-    for seed in SEEDS {
+    for seed in seeds() {
       let outcome = run(&scenario, seed);
       let goodput = outcome.goodputs.first().copied().unwrap_or(0.0);
       println!(

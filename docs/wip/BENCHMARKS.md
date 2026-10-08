@@ -3724,6 +3724,11 @@ Thin link, 8 MiB, median of 8 seeds (S and T against `HEAD`):
 
 The in-order jitter row's median improved but its spread widened (max 30.1 → 37.5 s).
 
+**The one grid row that worsened, widened to 16 seeds** (`CONGESTION_BENCH_SEEDS=1,…,16 congestion_bench
+"rate=1000000 rtt=100ms loss=5%"`, the commit before and the commit that landed it, same day): steady ping p99 median
+396 → 418 ms (+5.6%), mean 418 → 442 ms (+5.7%), worst seed 557 → 635 ms; share 0.884 → 0.883. A small, real cost on
+a 1 Mbit/s lossy link, not the one seed it looked like at three seeds; recorded against the crossing's 2×.
+
 **The real crossing.** Command: `IMAGE=slates:mr-<arm> sh docs/wip/bench/multiregion/reads.sh <dir> <8 MiB payload> 3`.
 This is the two-network Docker topology, 100 ms ± 40 ms one way with 3% loss. Each run reads 8 MiB from b0, b1 and b2
 in the other region, three rounds each. Both images were built from the same commit (`HEAD` from a worktree, the

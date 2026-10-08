@@ -4687,8 +4687,8 @@ are owed in the report before the next reading.
   - the real crossing's 8 MiB reads: median 49.0 → 24.9 s (18 reads per arm, all byte-identical);
   - the simulated crossing: 20.7 → 9.6 s;
   - the thin link's reordering pulls: 24.3 → 12.6 s and 32.8 → 13.3 s.
-- Open: the grid's 1 Mbit/s 100 ms 5%-loss row worsened by one seed (383 → 635 ms ping p99), and the in-order
-  jitter row's spread widened (max 30.1 → 37.5 s).
+- Open: the grid's 1 Mbit/s 100 ms 5%-loss row worsened: over 16 seeds its steady ping p99 mean rose 418 → 442 ms
+  (+5.7%), share unchanged. The in-order jitter row's spread widened (max 30.1 → 37.5 s).
 
 ### 2026-10-08: a sealed head shipped without its successor's key entry: the copyset flake's other cause (conditions 10, 11)
 
