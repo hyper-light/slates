@@ -3503,6 +3503,26 @@ the client: a write without a delegation carries a GETATTR that keeps them fresh
 
 Rejected as dead even on this client; the patch is kept in the session scratchpad.
 
+### A real tree copied: slates against the kernel's nfsd (condition 12; 2026-10-08)
+
+Command: `docs/wip/bench/mixed/copy_tree.sh /usr 3` (privileged `rust:1.98.0`, the release build of `6d2d5d91`, Linux
+6.12 aarch64): `cp -a /usr` (28,502 entries, 1,565,931,853 bytes) through one Linux NFSv4.2 client into slates and into
+nfsd exporting tmpfs, `sync` and `async`, with tmpfs as the floor; each copy removed, untimed, before the next. Load
+10–80 from other sessions, falling through the run.
+
+| Round | slates | nfsd `sync` | nfsd `async` | tmpfs |
+|---|---|---|---|---|
+| 1 | 21.2 s | 22.2 s | 24.5 s | 2.7 s |
+| 2 | 15.8 s | 15.6 s | 24.4 s | 2.8 s |
+| 3 | 16.2 s | 15.3 s | 18.3 s | 2.3 s |
+
+- Parity with nfsd on a tree copy, within about 5% each round; nothing here is a win to claim.
+- The first version of this bench measured nfsd's NFSv4 grace period: a fresh nfsd refuses new opens for 90 s, and
+  the first copy sat it out (93–105 s against 24–29 s past it). It now shortens the grace period and waits it out, as
+  `pressure/knfsd-fsync.sh` did; `linux_vs_nfsd.sh` was given the same (its earlier runs carried the stall on one
+  operation of 400, a maximum, not a recorded p50 or p99).
+- Holding three copies at once outgrew the 7.6 GiB Docker VM and hung Docker; each copy is now removed before the next.
+
 ### Memory per file on a real tree, against tmpfs (condition 12; 2026-10-08)
 
 **The commands.** Linux 6.12 (Docker Desktop, aarch64, 4 KiB pages), release build of `1e854b56`, privileged

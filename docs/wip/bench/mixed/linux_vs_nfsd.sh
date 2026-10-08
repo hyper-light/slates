@@ -18,8 +18,13 @@ mkdir -p /exp /mnt/knfs /mnt/slates /ram
 mount -t tmpfs tmpfs /exp && mount -t tmpfs tmpfs /ram
 mountpoint -q /proc/fs/nfsd || mount -t nfsd nfsd /proc/fs/nfsd
 echo "/exp 127.0.0.1(rw,sync,no_subtree_check,no_root_squash,fsid=0)" > /etc/exports
+# A fresh nfsd refuses new opens for its v4 grace period (90 s by default); its first open would wait it out. Shorten it
+# and wait it out before measuring (2026-10-08: a tree copy's first round measured the grace period, 93 s against
+# 24-29 s; here it fell on one operation of 400, so only a maximum, not a p50 or p99, carried it).
+echo 10 > /proc/fs/nfsd/nfsv4gracetime 2>/dev/null; echo 10 > /proc/fs/nfsd/nfsv4leasetime 2>/dev/null
 rpcbind >/dev/null 2>&1; rpc.nfsd 8 && exportfs -ra && rpc.mountd >/dev/null 2>&1
 mount -t nfs -o vers=4.2,proto=tcp,hard 127.0.0.1:/ /mnt/knfs || { echo "kernel nfs mount failed"; exit 1; }
+sleep 12; touch /mnt/knfs/.warm && rm -f /mnt/knfs/.warm
 # slates, its export mounted by the same client.
 cp /target/release/slates /usr/local/bin/slates
 slates --instance mx anchor --quick --shards 4 >/out/anchor.out 2>/out/anchor.err &
