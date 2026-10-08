@@ -101,6 +101,7 @@ fn report() -> ReplyBody {
           path_mtu: 137,
         }],
         detector_granularity_ns: 151,
+        served_sessions: Vec::new(),
       },
     }),
   }

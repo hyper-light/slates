@@ -2779,6 +2779,7 @@ pub fn shard_report(state: &mut ShardState) -> ShardReport {
       .unwrap_or_default(),
     nfs_calls: nfs_calls_of(state),
     detector_granularity_ns: detector_granularity_ns(state),
+    served_sessions: state.served_sessions.values().cloned().collect(),
   }
 }
 
@@ -2872,6 +2873,7 @@ fn fleet_report(state: &ShardState, shards: &[ShardReport]) -> FleetReport {
   let takeover = control.map_or_else(|| takeover_report(state), |shard| shard.takeover.clone());
   let detector = control.map_or_else(|| detector_report(state), |shard| shard.detector.clone());
   let sessions = control.map_or_else(Vec::new, |shard| shard.sessions.clone());
+  let served_sessions = control.map_or_else(Vec::new, |shard| shard.served_sessions.clone());
   let detector_granularity_ns = control.map_or_else(
     || detector_granularity_ns(state),
     |shard| shard.detector_granularity_ns,
@@ -2919,6 +2921,7 @@ fn fleet_report(state: &ShardState, shards: &[ShardReport]) -> FleetReport {
     detector,
     sessions,
     detector_granularity_ns,
+    served_sessions,
   }
 }
 

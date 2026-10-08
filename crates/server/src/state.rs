@@ -616,6 +616,10 @@ pub struct ShardState {
   /// which the link task re-establishes; a retired peer's entry is removed with it. Empty on a laptop (no
   /// fleet loop runs).
   pub record_sessions: BTreeMap<slates_db::HostId, RecordLink>,
+  /// The congestion state of each session a peer dialed to this node, as its serve loop last saw it after a request,
+  /// keyed by the peer's stable anchor: the connections a peer's forwards and reads ride, whose sender here is this
+  /// node. One a peer, replaced on a re-dial, so bounded by the roster. Empty on a laptop.
+  pub served_sessions: BTreeMap<u64, slates_ipc::protocol::SessionReport>,
   /// The waker of the discovery exchange pending on each anchor's record link, if one is — at most one per
   /// anchor (the link task drives one exchange at a time), bounded by the roster — so a peer change learned
   /// on contact or folded by the detector wakes the exchange to re-check its link at once rather than at

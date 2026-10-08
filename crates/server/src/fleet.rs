@@ -1517,6 +1517,9 @@ async fn serve_peer_records(
         }
       })
       .await;
+    // The sender's state on the connection the peer dialed: where its forwards and reads come back from this node.
+    let seen = crate::state::RecordLink::seen(peer_anchor, &endpoint);
+    state::with_state(|s| s.served_sessions.insert(peer_anchor.0, seen));
     if served.is_err() {
       return;
     }

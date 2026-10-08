@@ -6354,6 +6354,21 @@ fn a_nodes_status_reports_each_record_session_with_its_congestion_state() {
     )
   });
   let last: Vec<_> = daemons.iter().map(sessions_of).collect();
+  // The sessions peers dialed to each node, as its serve loops saw them: the connections whose sender is this node
+  // when a peer's forwards and reads come back.
+  let served_of =
+    |daemon: &Daemon| match Client::connect(daemon.instance()).call(&RequestBody::DaemonStatus) {
+      ReplyBody::DaemonStatus { report } => report.fleet.served_sessions,
+      _ => Vec::new(),
+    };
+  let served = poll_until(&observed, FORMATION_DEADLINE, || {
+    Ok(daemons.iter().all(|daemon| {
+      served_of(daemon)
+        .iter()
+        .any(|session| session.congestion_window > 0 && session.smoothed_rtt_ns > 0)
+    }))
+  });
+  let served_last: Vec<_> = daemons.iter().map(served_of).collect();
   // Each node's detector names the verdict judging each peer and its own measured lateness, the evidence a false
   // condemnation is read against (hyper-raft's checklist, 2026-10-07).
   let detectors: Vec<_> = daemons
@@ -6386,6 +6401,10 @@ fn a_nodes_status_reports_each_record_session_with_its_congestion_state() {
     detectors.iter().flatten().count(),
     3,
     "every node reported its detector"
+  );
+  assert!(
+    served,
+    "every node reports a session a peer dialed to it, with a window and a round trip: {served_last:?}"
   );
   assert!(
     reported,

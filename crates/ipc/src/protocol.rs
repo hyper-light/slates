@@ -1040,6 +1040,8 @@ pub struct ShardReport {
   /// This shard's detector granularity (its measured wake lateness), nanoseconds: live on the control shard, zero
   /// elsewhere. Appended.
   pub detector_granularity_ns: u64,
+  /// The sessions peers dialed to this shard, as its serve loops last saw them (live on the control shard). Appended.
+  pub served_sessions: Vec<SessionReport>,
 }
 
 /// The daemon's place in its fleet (§4.8; §2.6 boot step 6), as the verbs' placement authority sees it.
@@ -1095,6 +1097,10 @@ pub struct FleetReport {
   /// The member's own wake lateness as its detector measured it (its granularity `G`, which floors every margin),
   /// nanoseconds; zero before measured. A loaded host stalling the condemning node shows here. Appended.
   pub detector_granularity_ns: u64,
+  /// The sessions peers dialed to this node, by the peer's anchor, as its serve loops last saw them after a request:
+  /// the connections a peer's forwards and reads ride, whose sender here is this node (`sessions` are the ones this
+  /// node dialed). Empty on a laptop. Appended.
+  pub served_sessions: Vec<SessionReport>,
 }
 
 impl RequestBody {

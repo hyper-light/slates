@@ -2955,6 +2955,7 @@ fn init_shard(
     probe_windows: crate::fleet::ProbeWindows::default(),
     probe_deaf_to: std::collections::BTreeSet::new(),
     injected_serve_delay_ns: None,
+    served_sessions: std::collections::BTreeMap::new(),
     campaign_session_hold: None,
     record_refused_from: std::collections::BTreeSet::new(),
     // The owner lease starts its bounded startup allowance at boot (§4.8 "Leases and reads", AUD-08): the

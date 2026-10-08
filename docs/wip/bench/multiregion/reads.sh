@@ -51,8 +51,11 @@ done
 # The owner's record session to each reader (a1 sends the bytes): its window, round trip and loss when last seen.
 docker exec mr-a1 /slates status --json 2>/dev/null | python3 -c '
 import json, sys
-for session in json.load(sys.stdin)["fleet"].get("sessions", []):
-    print({key: session[key] for key in ("peer", "lent", "congestion_window", "smoothed_rtt_ns", "pto_ns", "spurious_losses", "persistent_collapses", "bytes_consumed")})'
+fleet = json.load(sys.stdin)["fleet"]
+for kind in ("sessions", "served_sessions"):
+  for session in fleet.get(kind, []):
+    print(kind, end=" ")
+    print({key: session.get(key) for key in ("peer", "lent", "congestion_window", "smoothed_rtt_ns", "pto_ns", "spurious_losses", "persistent_collapses", "bytes_consumed")})'
 docker exec mr-b0 /slates status --json 2>/dev/null | python3 -c '
 import json, sys, collections
 counts = collections.Counter()
