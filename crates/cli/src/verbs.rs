@@ -1791,12 +1791,14 @@ fn daemon_status_text(report: &DaemonReport, telemetry: &[TelemetryReport]) -> S
   out.push_str(&group_text("root", &report.fleet.root));
   for peer in &report.fleet.detector {
     out.push_str(&format!(
-      "fleet_detector {}: configured={} judged_by={} expected_ns={} margin_ns={} suspicions={} (allowance {}/1000) condemnations={} (allowance {}/1000)\n",
+      "fleet_detector {}: configured={} judged_by={} expected_ns={} margin_ns={} samples={} mistake={}/1000 suspicions={} (allowance {}/1000) condemnations={} (allowance {}/1000)\n",
       peer.peer,
       peer.configured,
       peer.judged_by,
       peer.expected_ns,
       peer.margin_ns,
+      peer.samples,
+      peer.mistake_milli,
       peer.suspicions,
       peer.suspicion_allowance_milli,
       peer.condemnations,

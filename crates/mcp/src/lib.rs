@@ -1962,6 +1962,8 @@ pub fn daemon_json(r: &DaemonReport, telemetry: &[TelemetryReport]) -> Value {
         "judged_by": peer.judged_by,
         "expected_ns": peer.expected_ns,
         "margin_ns": peer.margin_ns,
+        "samples": peer.samples,
+        "mistake_milli": peer.mistake_milli,
       })).collect::<Vec<_>>(),
       "detector_granularity_ns": r.fleet.detector_granularity_ns,
       "sessions": r.fleet.sessions.iter().map(|session| json!({

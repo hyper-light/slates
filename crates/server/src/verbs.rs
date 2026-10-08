@@ -681,6 +681,8 @@ fn detector_report(state: &ShardState) -> Vec<slates_ipc::protocol::DetectorPeer
           judged_by: judged_by.to_owned(),
           expected_ns: verdict.map_or(0, |verdict| nanos_of(verdict.round_trip)),
           margin_ns: verdict.map_or(0, |verdict| nanos_of(verdict.margin)),
+          samples: detector.round_trips_taken(member).unwrap_or(0),
+          mistake_milli: verdict.map_or(0, |verdict| thousandths(verdict.mistake)),
         }
       })
     })

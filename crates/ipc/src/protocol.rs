@@ -1275,6 +1275,11 @@ pub struct DetectorPeerReport {
   pub expected_ns: u64,
   /// That verdict's margin past the expected arrival before a probe counts as unanswered, nanoseconds. Appended.
   pub margin_ns: u64,
+  /// The round trips the pair's own estimator has taken (hyper-swim's `round_trips_taken`). Appended.
+  pub samples: u64,
+  /// The judging verdict's mistake bound in thousandths: 1000 for a provisional verdict (no Theorem 7 bound), the
+  /// configured β otherwise; zero while measuring. Appended.
+  pub mistake_milli: u64,
 }
 
 /// The takeover state a council holds (§4.8 "Neighbourhood changes", "Promotion and takeover"): this node's

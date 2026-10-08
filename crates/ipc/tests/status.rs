@@ -86,6 +86,8 @@ fn report() -> ReplyBody {
           judged_by: "provisional".to_owned(),
           expected_ns: 139,
           margin_ns: 149,
+          samples: 157,
+          mistake_milli: 163,
         }],
         sessions: vec![slates_ipc::protocol::SessionReport {
           peer: 101,
