@@ -2233,6 +2233,18 @@ impl Daemon {
     })
   }
 
+  /// Whether this owner's head for `object` is held back because its sealing does not yet cover every live candidate
+  /// (it waits for a pair delivery, A-92 piece 4c), read on the owning shard. A test or an operator reads it when a
+  /// placement does not complete.
+  pub fn fleet_head_awaits_keys(
+    &self,
+    object: slates_db::register::ObjectId,
+  ) -> Result<bool, ObserveError> {
+    self.observe(self.shard_of_object(object), move |s| {
+      crate::fleet::head_awaits_keys(s, object)
+    })
+  }
+
   /// Test support: while `withhold` is set, this node's owner shards deliver no pair keys to their neighbours, as a
   /// neighbour whose recipient answer is late holds its delivery back (A-92 piece 4b). Setting it also forgets the
   /// pairs each owner shard has delivered, so a head this node seals in the meantime has no key entry for any

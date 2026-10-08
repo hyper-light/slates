@@ -70,10 +70,15 @@ and condition 11 (recovery) failing silently: the volume's content was held, but
 
 ## Siblings, reported
 
-- After a head ships, the owner shard's delivered pairs can still grow (a member joining), so a re-ship to a straggler
-  at the same sequence can carry more entries than the first holders hold. Promotion picks a head by (sequence,
-  epoch), so two holders can present different values at one position. The gate narrows this window but does not
-  close it; fixing it means freezing a head's value at its first shipment.
+- After a head ships, the owner shard's delivered pairs can still grow (a member joining), so a re-ship to the new
+  member at the same sequence carries more entries than the first holders hold. Phase one kept the first of tied
+  copies by host order, so the new member, as successor, could adopt a copy without its own entry and refuse the
+  volume as above. **Fixed the same day:** `takeover::newest_of` merges tied sealed heads that name the same manifest
+  under the same lineage key, keeping every entry by anchor (each is valid alone), and the adoption re-commits that
+  value at the new epoch. Unit-tested both fold orders, and that a newer position or different content is never
+  merged. Still open: the register's contract says a committed position is never rewritten differently, and a head
+  gaining entries at one sequence bends it. Closing that means issuing a new head sequence when key coverage changes,
+  which needs a volume-record change.
 - The successor answered its own client `HomedElsewhere` in the window before its adoption (127 times in one run of the
   reproduction, which then waited for adoption as the other successor tests do). `assert_successor_serves` asserts
   none, and holds only because the tests wait for adoption first.

@@ -5382,12 +5382,25 @@ fn place_copyset_routing_case(
   else {
     panic!("seal the selected volume")
   };
-  assert!(poll_snapshot_placed(
+  let placed = poll_snapshot_placed(
     &daemons.iter().collect::<Vec<_>>(),
     &mut local,
     id,
-    snapshot
-  ));
+    snapshot,
+  );
+  assert!(
+    placed,
+    "the selected volume's snapshot places: its head awaits key entries {:?}; the owner's seal counters {:?}",
+    daemons[owner_index].fleet_head_awaits_keys(ObjectId(id.bytes)),
+    daemons[owner_index]
+      .fleet_refusals()
+      .map(|counters| counters
+        .into_iter()
+        .filter(|(name, _)| name.starts_with("fleet.seal")
+          || name.starts_with("fleet.fetch")
+          || name.contains("content"))
+        .collect::<Vec<_>>())
+  );
   let holders: Vec<_> = daemons
     .iter()
     .filter(|daemon| {

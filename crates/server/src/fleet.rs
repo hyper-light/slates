@@ -2020,6 +2020,19 @@ pub(crate) fn sealing_covers(
   })
 }
 
+/// Whether the owner's head for `object` names sealed content it may not ship yet, because its sealing does not cover
+/// every live candidate ([`sealing_covers_candidates`]): the head waits for a pair delivery. Read by
+/// `Daemon::fleet_head_awaits_keys`, so a placement that never completes names this cause.
+pub(crate) fn head_awaits_keys(state: &ShardState, object: ObjectId) -> bool {
+  let Some(record) = state.db.partition().volume(DbVolumeId { bytes: object.0 }) else {
+    return false;
+  };
+  let config = state.fleet.configuration();
+  head_value_of(state, record, object, config.quorum).is_some_and(|(_, value)| {
+    !sealing_covers_candidates(state, config, object, &value, state.fleet.host())
+  })
+}
+
 /// The owner's sealed manifest for `object` once its content has placed: from the snapshot's durable record once the
 /// seal completed, else from the seal in progress once its content placed; `None` before then, or for a volume this
 /// shard does not own (read by `Daemon::fleet_sealed_manifest`).

@@ -4689,5 +4689,22 @@ are owed in the report before the next reading.
 - Fixed: a sealed head ships only once it covers every remote candidate (`fleet::sealing_covers`), and the mirror
   shipment likewise. Reproduced deterministically by withholding the pairs:
   `a_sealed_head_waits_for_every_candidates_key_entry_so_any_successor_can_open_it`, red before, 3 of 3 after.
-- Open: a head's value can still grow at one sequence when a member joins after it shipped; and a successor answers
-  its own client `HomedElsewhere` before its adoption (`docs/bugs/2026-10-08-a-sealed-head-shipped-without-its-successors-key-entry.md`).
+- A head's value can still grow at one sequence when a member joins after it shipped; phase one now merges tied
+  sealed heads' key entries (`takeover::newest_of`), so the new member can open the envelope as successor. Open: the
+  register contract (one value per committed position) is still bent by that growth, and a successor answers its own
+  client `HomedElsewhere` before its adoption (`docs/bugs/2026-10-08-a-sealed-head-shipped-without-its-successors-key-entry.md`).
+
+### 2026-10-08: a refuted false death costs a forward a second of outage: the record link, not the detector (condition 11)
+
+- The copyset test's other failure, now named by its counters: the foreign node held the live successor dead
+  (`route_dropped.owner_ineligible.dead`) though its own detector condemned no one. Another member had condemned it,
+  within the detector's stated allowance (1 against 4.94; every node's detector is now in the failure message), and
+  the death was gossiped. A suspicion never drops a route; only a death does.
+- Measured with an injected false death on one node (`observe_peer_dead`, 4 runs): membership holds the owner alive
+  again after 25–27 ms, yet a forwarded verb from that node is refused `HomedElsewhere` at 1.00 s, and the next call
+  is served. The death tore down the record link to the owner (`DirectContact::BelievedDead`), and a location round
+  only asks peers with a session (`no_session`), so the outage lasts until the link is dialed again, about a second.
+- Measured and not landed: retrying the location round within the forward's one-budget allowance (9 retries in the
+  second, still no session). The fix is a prompt redial when a believed death is refuted, or keeping the link to a
+  believed-dead member until the council retires it. Both are in the record-link task, owed. Patch and test kept in
+  the session scratchpad (`false-death-arm-full.patch`).
