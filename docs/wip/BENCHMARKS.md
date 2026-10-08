@@ -3484,6 +3484,47 @@ passed 79/79 in 272 s (252–299 s before), so membership convergence did not sl
 other tree's compiled crates. Touching the sources did not help. Each arm is now built in its own target volume and
 copied into a distroless image, and the binaries' hashes must differ (A `d6b21905979c`, B `2f469a521c60`).
 
+### Measured and rejected: RFC 9754 delegated timestamps for the `stat` after a delegated write (condition 12; 2026-10-08)
+
+**Why it looked right.** A probe on the Linux 6.12 client (write, close, `stat`, 200 cycles on a write-delegated
+file) made one GETATTR per cycle, a 37.4 µs `stat`, against 0.7 µs for repeated `stat`s of an unchanged file. RFC 9754
+lets the holder of a write delegation keep the file's access and modification times. The 6.12 client defines
+`NFS_CAP_DELEGTIME`, and sets it when the server lists `time_deleg_access`, `time_deleg_modify` and the
+`open_arguments` want for delegated timestamps (`_nfs4_server_capabilities`, v6.12).
+
+**The arm.** It advertised the three attributes and returned `OPEN_DELEGATE_WRITE_ATTRS_DELEG` when asked, accepting
+the holder's times by SETATTR clamped to the wall clock.
+
+**What it showed.** The client asked for and got the attribute delegation; the OPEN reply decoded by tshark carried
+type 5. The probe still made 200 GETATTRs in 200 cycles (51–59 µs per `stat`). Each GETATTR asked only for Type, FSID,
+FileId, NumLinks, Space_Used and Mounted_on_FileId: no times, size or change. So the round trip is the space used
+(and link count) after a write. Delegated timestamps do not cover it. The likely reason, inferred and not traced in
+the client: a write without a delegation carries a GETATTR that keeps them fresh, and one under a delegation does not.
+
+Rejected as dead even on this client; the patch is kept in the session scratchpad.
+
+### Measured and rejected: no write delegation for an open that creates (condition 12; 2026-10-08)
+
+**The idea.** The `stat`, unlink and rename costs of write delegations come from files delegated at their create;
+the reopen speed comes from delegations of existing files. So the arm (E) granted no write delegation to an
+`OPEN4_CREATE`, and still granted one to an open of an existing file.
+
+**The run.** Same command as the four-arm A/B, A and E interleaved three times each, load 4–14. Grants per run: A 2,462
+(one per created file), E 1,123 (reopens only).
+
+| Arm | p50 geomean vs A | p99 geomean vs A |
+|---|---|---|
+| E: no write delegation on create | ×1.05 | ×1.31 |
+
+- E wins `stat` (34 → 6 µs at 1 worker, 58 → 11 µs at 16).
+- E loses the reopens: overwrite 82 → 173 µs and read 63 → 119 µs at 1 worker. The first reopen of each new file now
+  pays the OPEN round trip a create-time delegation saved.
+- Rejected.
+
+At this load A, today's policy, beats every arm measured, B included (×1.27 p50 and ×1.52 p99, from B's earlier runs
+at higher load). So the policy stands: write delegations as today. The `stat` after a delegated write is the client
+revalidating the space used, measured in the entry above.
+
 ### NFSv4 delegation policy, four arms (condition 12; 2026-10-08)
 
 Command: `docs/wip/bench/mixed/linux_vs_nfsd.sh 400 64` (slates' rows). Each arm's Linux release binary was built in

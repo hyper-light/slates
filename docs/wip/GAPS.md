@@ -4285,8 +4285,12 @@ unpushed: a push is Ada's decision. Read with `gh run view 37561725434 --log-fai
      - So write delegations stay. The four-arm A/B (`BENCHMARKS.md`, 2026-10-08) showed them worth their reopen
        speed.
      - Owed: run the CI lane on a client kernel carrying the fix, or skip that case loudly naming the CVE.
-     - Owed: recover the medians a policy without write delegations gained, through RFC 9754 delegated timestamps
-       (`stat` without a GETATTR), open-XOR-delegation, and the cost of journaling a grant, each A/B'd.
+     - Researched the same day:
+       - RFC 9754 delegated timestamps were granted (type 5) but changed nothing: the `stat` after a delegated write
+         revalidates space used and link count, not times.
+       - No write delegation on create was ×1.05 p50 and ×1.31 p99.
+       - Today's policy is the best arm measured (`BENCHMARKS.md`).
+     - Open: open-XOR-delegation, measured only once a client path shows its round trip.
 2. **`a_slow_first_round_candidate_is_hedged_after_the_measured_p95`** (Ubuntu and macOS runners, untraced):
    placement at 3.0038 s against a 3 s hold. On the loaded runners the hedge did not carry the second seal before
    the held candidate came back. Locally it passes alone (5/5) and in full suites; the traced failures on this
