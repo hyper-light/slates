@@ -153,10 +153,21 @@ fn reserve_buffers(fd: &OwnedFd, buffer_bytes: usize) -> Result<(), RtError> {
   Ok(())
 }
 
-/// The Linux arm of [`TcpStream::reserve_buffers`]: left to autotune, the receive buffer grown by the low-water mark.
+/// The Linux arm of [`TcpStream::reserve_buffers`]: the receive buffer grown once, at admission, by raising the
+/// low-water mark to `buffer_bytes` and setting it back (`tcp_set_rcvlowat` raises an unlocked socket's buffer to fit
+/// the mark, up to `tcp_rmem[2]`, with no privilege; `SO_RCVBUF` is capped by `rmem_max` and would lock autotuning).
+/// Without it a reader that peeks and never consumes (A-113) can deadlock: autotuning grows the buffer from what the
+/// application consumes, so it stays at `tcp_rmem`'s default, and the kernel's per-segment overhead filled that with
+/// one third of a record (44,416 bytes of payload charged as 129,984 against a 131,072-byte buffer, Linux 6.12). The
+/// window closes, the record never completes, and the NFS client waited about 10 s and dialed again
+/// (`docs/bugs/2026-10-08-the-first-large-nfs-write-on-linux-stalls-ten-seconds.md`). The send buffer autotunes.
 #[cfg(target_os = "linux")]
-fn reserve_buffers(_fd: &OwnedFd, _buffer_bytes: usize) -> Result<(), RtError> {
-  Ok(())
+fn reserve_buffers(fd: &OwnedFd, buffer_bytes: usize) -> Result<(), RtError> {
+  let value = i32::try_from(buffer_bytes).unwrap_or(i32::MAX);
+  set_int_option(fd, libc::SOL_SOCKET, libc::SO_RCVLOWAT, value)
+    .map_err(|e| refused("setsockopt(SO_RCVLOWAT)", e))?;
+  set_int_option(fd, libc::SOL_SOCKET, libc::SO_RCVLOWAT, 1)
+    .map_err(|e| refused("setsockopt(SO_RCVLOWAT)", e))
 }
 
 /// The BSD arm of [`TcpStream::make_sends_whole`]: the send buffer must hold the record, then the low-water mark is it.

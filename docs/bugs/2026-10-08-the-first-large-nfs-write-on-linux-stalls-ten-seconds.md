@@ -1,8 +1,7 @@
 # The first large NFS write after a mount stalls about ten seconds on Linux: a zero receive window
 
 **Found:** 2026-10-08, comparing slates against the kernel's own NFS server (`docs/wip/bench/mixed/linux_vs_nfsd.sh`).
-**Status: open.** Root cause in the kernel's window not shown yet. The constraints on a fix are below; a fix needs
-Ada's direction.
+**Status: fixed** (same day; see Fix).
 
 ## Description
 
@@ -99,3 +98,27 @@ one record. `tcp_set_rcvlowat`'s own growth of the buffer sometimes rescues it. 
 1. Reproduced without NFS (above).
 2. Read `tcp_set_rcvlowat`, `tcp_grow_window` and receive-buffer autotuning in Linux 6.12, to confirm the reading.
 3. Measure option 1 (a 64 KiB transfer) on the repro and on the Linux NFS bench, then choose with Ada.
+
+## Fix (same day)
+
+The repro first had two bugs of its own: the client counted a one-byte read as a reply, and the server peeked the next
+marker under the previous record's low-water mark. With both fixed it still hung, and `ss -tmni` showed why:
+- the server held 44,416 bytes of payload charged as 129,984 against a 131,072-byte buffer (`rb`), and dropped
+  segments;
+- the client was window-limited for its whole busy time, its persist timer backed off.
+
+The kernel's per-segment overhead filled the default buffer with a third of a record. Autotuning never grew it,
+because a peek consumes nothing.
+
+`slates_rt::tcp::reserve_buffers` now primes the buffer on Linux at admission. It raises the low-water mark to
+`CONNECTION_BUFFER_BYTES` (two records, the one served and the next arriving) and sets it back.
+`tcp_set_rcvlowat` grows an unlocked socket's buffer to fit, up to `tcp_rmem[2]`, with no privilege, and requests
+stay unconsumed in the kernel (A-113).
+
+| | Repro, 4 / 32 in flight, runs hung | First 64 MiB NFS write after a mount |
+|---|---|---|
+| Before | 10/10 and 10/10 | 10.5 s, 6.4 MB/s, 2 reconnects (5 of 5 runs) |
+| Primed to two records | 0/10 and 0/10 (3.2–3.4 GB/s) | 0.061–0.071 s, 0.95–1.1 GB/s, no reconnect (3 of 3) |
+
+The Linux lane (non-root, io_uring allowed) passed on the change: `slates-rt` (23 test binaries) and the server's
+`nfs_hostile`, `nfs_tls` and `nfs_mount`.
