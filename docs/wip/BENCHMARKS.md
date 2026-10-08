@@ -3749,6 +3749,11 @@ The in-order jitter row's median improved but its spread widened (max 30.1 → 3
 396 → 418 ms (+5.6%), mean 418 → 442 ms (+5.7%), worst seed 557 → 635 ms; share 0.884 → 0.883. A small, real cost on
 a 1 Mbit/s lossy link, not the one seed it looked like at three seeds; recorded against the crossing's 2×.
 
+Measured and rejected the same day: the turning-point test applied as a test (no tail term when the epoch has fewer
+turns than independence allows, beyond two standard deviations of variance `(16n−29)/90`) rather than in proportion.
+The worsened row got worse again (16 seeds, mean 442 → 462 ms, worst 635 → 709 ms), and the crossing slowed on seed 1
+(7.9 → 13.8 s, the other seven equal). An epoch that is part trend and part jitter loses its tail evidence whole.
+
 **The real crossing.** Command: `IMAGE=slates:mr-<arm> sh docs/wip/bench/multiregion/reads.sh <dir> <8 MiB payload> 3`.
 This is the two-network Docker topology, 100 ms ± 40 ms one way with 3% loss. Each run reads 8 MiB from b0, b1 and b2
 in the other region, three rounds each. Both images were built from the same commit (`HEAD` from a worktree, the
