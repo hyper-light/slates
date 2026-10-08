@@ -62,9 +62,40 @@ volume is attached (an install, an image layer) sees it once per connection. Con
 it whenever a run starts with a large write; `mixed.py`'s large-file phase did not, because small operations came
 first. Whether those small operations change the window, or only delay the first large record, is not known.
 
+## Reproduced without NFS (same day)
+
+`docs/wip/bench/nfs/peek_lowat_repro.py` runs the same pattern with no NFS: peek a record's marker, set `SO_RCVLOWAT`
+to the whole record, peek it, consume it only after replying. The client sends 256.5 KiB records. Linux 6.12, ten
+runs each, a run killed at 15 s:
+
+| Records in flight | Low-water mark | Runs that hung |
+|---|---|---|
+| 4 | the whole record | 8 of 10 |
+| 32 | the whole record | 9 of 10 |
+| 32 | capped at half the receive buffer, then peeked again | 10 of 10 |
+
+The runs that finished moved 2.2–3.3 GB/s. The kernel container's `net.ipv4.tcp_rmem` was 4096 131072 6291456 and
+`net.core.rmem_max` 212,992. So whether the whole record ever queues depends on the kernel, and lowering the
+low-water mark does not help: the record still cannot complete in the queue.
+
+Reading, from memory and not yet checked against the source: Linux grows a connection's receive buffer and window
+from what the application consumes (receive-buffer autotuning). A peek consumes nothing, so the window stays below
+one record. `tcp_set_rcvlowat`'s own growth of the buffer sometimes rescues it. The NFS client recovers after about
+10 s by dialing again. The plain client never does.
+
+## Options (for Ada; each trades against A-113 or throughput)
+
+1. Records small enough to fit the default receive buffer whole: a transfer size of about 64 KiB, so a WRITE record
+   sits under `tcp_rmem`'s default with room for its successor. More RPCs per megabyte; the 1 MiB experiment showed
+   the transfer size is not what bounds the write path, so the cost may be small. Measurable.
+2. Consume records into the daemon's memory, bounded per connection, and give up A-113's guarantee for unanswered
+   requests. A daemon that dies loses them, and the client resends after its timeout (`timeo`, 60 s on these mounts),
+   using its session slot's replay cache on v4.1.
+3. A fixed `SO_RCVBUF` large enough for two records: impossible unprivileged past `rmem_max` (212,992 here, smaller
+   than one record), and `SO_RCVBUFFORCE` needs `CAP_NET_ADMIN`, which R10 forbids.
+
 ## Next steps
 
-1. Reproduce with a plain TCP server using the same peek and `SO_RCVLOWAT` pattern, no NFS, to isolate the kernel
-   behaviour.
-2. Read `tcp_set_rcvlowat` and the window computation in Linux 6.12.
-3. Choose a fix with Ada that keeps A-113.
+1. Reproduced without NFS (above).
+2. Read `tcp_set_rcvlowat`, `tcp_grow_window` and receive-buffer autotuning in Linux 6.12, to confirm the reading.
+3. Measure option 1 (a 64 KiB transfer) on the repro and on the Linux NFS bench, then choose with Ada.
