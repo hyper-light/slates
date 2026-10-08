@@ -1295,6 +1295,8 @@ struct V4Client {
   back_granted: bool,
   /// The major id of the `server_owner4` EXCHANGE_ID answered with.
   server_owner: Vec<u8>,
+  /// The `AUTH_SYS` identity (uid, gid) calls carry, or `None` for `AUTH_NONE`.
+  caller: Option<(u32, u32)>,
 }
 
 /// Format: `NFS4_OK`, `NFS4ERR_NOENT` and the operation numbers this test sends (RFC 7863).
@@ -1316,15 +1318,35 @@ const OP_ACCESS: u32 = 3;
 const OP_DESTROY_SESSION: u32 = 44;
 
 impl V4Client {
-  /// One ONC RPC call of NFS version `version` (AUTH_SYS as uid 0): the accept status and the rest.
+  /// One ONC RPC call of NFS version `version` under [`V4Client::caller`] (`AUTH_SYS` when set, else `AUTH_NONE`):
+  /// the accept status and the rest.
   fn rpc(&mut self, version: u32, procedure: u32, args: &[u8]) -> (u32, Vec<u8>) {
     use slates_bridge_nfs::xdr::{XdrReader, XdrWriter};
     use std::io::{Read, Write};
     self.xid += 1;
     let mut body = XdrWriter::new();
-    for field in [self.xid, 0, 2, 100_003, version, procedure, 0, 0, 0, 0] {
+    for field in [self.xid, 0, 2, 100_003, version, procedure] {
       body.u32(field);
     }
+    match self.caller {
+      Some((uid, gid)) => {
+        // RFC 5531 §8.2: AUTH_SYS — a stamp, an empty machine name, the uid and gid, no supplementary groups.
+        let mut credential = XdrWriter::new();
+        credential.u32(0);
+        credential.opaque(b"");
+        credential.u32(uid);
+        credential.u32(gid);
+        credential.u32(0);
+        body.u32(1);
+        body.opaque(credential.as_slice());
+      }
+      None => {
+        body.u32(0);
+        body.u32(0);
+      }
+    }
+    body.u32(0);
+    body.u32(0);
     body.fixed(args);
     let marker = 0x8000_0000u32 | u32::try_from(body.len()).unwrap();
     self.stream.write_all(&marker.to_be_bytes()).unwrap();
@@ -1387,6 +1409,7 @@ impl V4Client {
       slots: 0,
       back_granted: false,
       server_owner: Vec::new(),
+      caller: None,
     };
     let mut ops = XdrWriter::new();
     ops.u32(OP_EXCHANGE_ID);
@@ -1964,6 +1987,7 @@ fn reach_from_a_second_connection(v4: &V4Client, port: u16, ops: &[u8]) -> u32 {
     slots: v4.slots,
     back_granted: false,
     server_owner: v4.server_owner.clone(),
+    caller: v4.caller,
   };
   let (status, _) = second.sequenced(2, ops);
   assert_eq!(
@@ -2460,6 +2484,80 @@ impl V4Client {
     self.sequenced(2, ops.as_slice()).0
   }
 
+  /// SETATTR of `fh`'s size under `stateid`: the compound's status.
+  fn setattr_size_under(
+    &mut self,
+    fh: &[u8],
+    stateid: slates_bridge_nfs::v4::types::Stateid,
+    size: u64,
+  ) -> u32 {
+    use slates_bridge_nfs::v4::types::Bitmap;
+    use slates_bridge_nfs::xdr::XdrWriter;
+    /// Format: `OP_SETATTR`.
+    const OP_SETATTR: u32 = 34;
+    /// Format: `FATTR4_SIZE`.
+    const FATTR4_SIZE: u32 = 4;
+    let mut ops = XdrWriter::new();
+    ops.u32(OP_PUTFH);
+    ops.opaque(fh);
+    ops.u32(OP_SETATTR);
+    stateid.encode(&mut ops);
+    Bitmap::of(&[FATTR4_SIZE]).encode(&mut ops);
+    let mut values = XdrWriter::new();
+    values.u64(size);
+    ops.opaque(values.as_slice());
+    self.sequenced(2, ops.as_slice()).0
+  }
+
+  /// SETATTR of `fh`'s mode under `stateid`: the compound's status.
+  fn setattr_mode_under(
+    &mut self,
+    fh: &[u8],
+    stateid: slates_bridge_nfs::v4::types::Stateid,
+    mode: u32,
+  ) -> u32 {
+    use slates_bridge_nfs::v4::types::Bitmap;
+    use slates_bridge_nfs::xdr::XdrWriter;
+    /// Format: `OP_SETATTR`.
+    const OP_SETATTR: u32 = 34;
+    /// Format: `FATTR4_MODE`.
+    const FATTR4_MODE: u32 = 33;
+    let mut ops = XdrWriter::new();
+    ops.u32(OP_PUTFH);
+    ops.opaque(fh);
+    ops.u32(OP_SETATTR);
+    stateid.encode(&mut ops);
+    Bitmap::of(&[FATTR4_MODE]).encode(&mut ops);
+    let mut values = XdrWriter::new();
+    values.u32(mode);
+    ops.opaque(values.as_slice());
+    self.sequenced(2, ops.as_slice()).0
+  }
+
+  /// GETATTR of `fh`'s size: the size, when the compound succeeds.
+  fn size_of(&mut self, fh: &[u8]) -> Option<u64> {
+    use slates_bridge_nfs::v4::types::Bitmap;
+    use slates_bridge_nfs::xdr::{XdrReader, XdrWriter};
+    /// Format: `OP_GETATTR`.
+    const OP_GETATTR: u32 = 9;
+    /// Format: `FATTR4_SIZE`.
+    const FATTR4_SIZE: u32 = 4;
+    let mut ops = XdrWriter::new();
+    ops.u32(OP_PUTFH);
+    ops.opaque(fh);
+    ops.u32(OP_GETATTR);
+    Bitmap::of(&[FATTR4_SIZE]).encode(&mut ops);
+    let (status, results) = self.sequenced(2, ops.as_slice());
+    if status != NFS4_OK {
+      return None;
+    }
+    let mut reader = XdrReader::new(&results);
+    reader.fixed(8 + 8).ok()?;
+    Bitmap::decode(&mut reader).ok()?;
+    let values = reader.opaque(64).ok()?;
+    XdrReader::new(values).u64().ok()
+  }
+
   /// GETATTR of `fh`'s size: the compound's status.
   fn getattr_status(&mut self, fh: &[u8]) -> u32 {
     use slates_bridge_nfs::v4::types::Bitmap;
@@ -2738,6 +2836,53 @@ fn a_write_delegation_serves_its_holders_writes_and_any_other_open_recalls_it() 
   assert_eq!(b.open_with(&component, "w.txt", 1, 0), NFS4_OK, "B's retry");
   drop((a, b, client));
   drop(daemon);
+}
+
+/// Format: `NFS4ERR_ACCESS` (RFC 8881 §15.1.6.1).
+const NFS4ERR_ACCESS: u32 = 13;
+
+/// RFC 8881 §10.4, §18.30 (A-80): a write delegation authorizes its holder client's I/O, never another user's
+/// permission. A client holding one may open the file locally for any of its users, so a truncate it sends under the
+/// delegation's state id must still be checked against the caller's own mode bits (Linux 6.17 sends
+/// `O_RDONLY|O_TRUNC` that way after checking only read access; 2026-10-07 CI). Do: on client A as root, create a file
+/// for writing (a write delegation), write four bytes and set mode 0644; then on A as uid 1000, truncate the file
+/// under the delegation's state id. Expect `NFS4ERR_ACCESS` and the file still four bytes; root's own truncate under
+/// the delegation still succeeds.
+#[test]
+fn a_write_delegation_does_not_lend_its_holders_permission_to_another_users_truncate() {
+  let (daemon, client, mut a, b, component) = holder_and_other("deleg-truncate");
+  a.caller = Some((0, 0));
+  let (open_a, fh, delegation) = a.open_creating(&component, "t.txt");
+  let (kind, delegation) = delegation.expect("root's open for writing is delegated");
+  assert_eq!(kind, 2, "a write delegation");
+  assert_eq!(
+    a.write_under(&fh, delegation, b"four"),
+    NFS4_OK,
+    "root writes under the delegation"
+  );
+  assert_eq!(
+    a.setattr_mode_under(&fh, open_a, 0o644),
+    NFS4_OK,
+    "root sets the mode 0644"
+  );
+  a.caller = Some((1000, 1000));
+  let other = a.setattr_size_under(&fh, delegation, 0);
+  a.caller = Some((0, 0));
+  let kept = a.size_of(&fh);
+  let owner = a.setattr_size_under(&fh, delegation, 0);
+  let after = a.size_of(&fh);
+  drop((a, b, client));
+  drop(daemon);
+  assert_eq!(
+    other, NFS4ERR_ACCESS,
+    "uid 1000 may not truncate a 0644 file it does not own, whatever the state id"
+  );
+  assert_eq!(kept, Some(4), "the refused truncate changed nothing");
+  assert_eq!(
+    (owner, after),
+    (NFS4_OK, Some(0)),
+    "root's own truncate under the delegation is served"
+  );
 }
 
 /// RFC 8881 §10.4.3 (A-80): do read the attributes of a file A holds a write delegation of, from B; expect

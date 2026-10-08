@@ -4274,6 +4274,19 @@ unpushed: a push is Ada's decision. Read with `gh run view 37561725434 --log-fai
    - The server cannot tell who asked. The only server-side defense is a policy: no write delegation where a user
      of the client could be refused a write by the bits. Typical 0644 files fall under it, so the policy would end
      most write delegations, which carry the create p99s. **Decision owed (Ada).**
+   - **Resolved 2026-10-08: a Linux client bug, CVE-2026-64298.** The client's `nfs_open_permission_mask()`
+     requested only `MAY_READ` for `O_RDONLY|O_TRUNC`, so the open passed locally under a write delegation and the
+     truncate went to the server as `SETATTR(size=0)` over the delegation's state id. The fix ("NFSv4: include
+     MAY_WRITE in open … for O_TRUNC", Benjamin Coddington, June 2026) adds `MAY_WRITE` whenever `O_TRUNC` is set;
+     stable fixes were reported for 5.10.261 and 5.15.212.
+     - slates already refuses a truncate whose caller cannot write, under a write delegation:
+       `a_write_delegation_does_not_lend_its_holders_permission_to_another_users_truncate` (`nfs_mount.rs`) passed
+       before any change. Under `AUTH_SYS` the client's own permission check is inside the trust boundary by design.
+     - So write delegations stay. The four-arm A/B (`BENCHMARKS.md`, 2026-10-08) showed them worth their reopen
+       speed.
+     - Owed: run the CI lane on a client kernel carrying the fix, or skip that case loudly naming the CVE.
+     - Owed: recover the medians a policy without write delegations gained, through RFC 9754 delegated timestamps
+       (`stat` without a GETATTR), open-XOR-delegation, and the cost of journaling a grant, each A/B'd.
 2. **`a_slow_first_round_candidate_is_hedged_after_the_measured_p95`** (Ubuntu and macOS runners, untraced):
    placement at 3.0038 s against a 3 s hold. On the loaded runners the hedge did not carry the second seal before
    the held candidate came back. Locally it passes alone (5/5) and in full suites; the traced failures on this
