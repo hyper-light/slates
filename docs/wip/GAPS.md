@@ -4705,6 +4705,27 @@ are owed in the report before the next reading.
   register contract (one value per committed position) is still bent by that growth, and a successor answers its own
   client `HomedElsewhere` before its adoption (`docs/bugs/2026-10-08-a-sealed-head-shipped-without-its-successors-key-entry.md`).
 
+### 2026-10-08: an idle fleet node burns ~2% of a core, 30x a lone daemon: discovery refreshes (battery)
+
+Measured on the two-network Docker topology (6 nodes, one shard each, no impairment, idle, `docker stats`):
+- 1.8–2.7% of a core per node, against 0.07% for a lone daemon at rest (`idle-cpu.sh`, same day, unchanged since
+  2026-10-07).
+- `strace -c` on an idle node's shard thread for 10 s:
+  - 4,187 `sendto` and 4,186 successful `recvfrom`, about 48 datagrams a second each way per session, 50–99 bytes;
+  - 1,146 `getrusage` and 1,037 `clock_gettime` a second.
+- A scratch build logging each request's stream showed what the datagrams carry:
+  - before `bootstrap root`, about 43/s root learner fetches and 17/s council learner fetches per node, which poll
+    every peer because the root is uninitialized;
+  - after bootstrap those stop, the reactive rule working. What remains is about 50 discovery pages a second per node
+    (10/s to each of 5 peers) and the council leader's Raft heartbeats (about 18/s). CPU stays 1.8–2.2%.
+- The discovery cadence (one page per peer per heartbeat) is in the record-link task (`establish_record_link`). Its
+  lines were read by mistake while tracing this, against a standing rule not to, so the fix is Ada's to direct.
+  Owed:
+  - discovery that pages only when the peer's membership digest changed;
+  - the uninitialized-root poll backed off;
+  - the per-poll `getrusage` cost.
+- Per-node power was not measured (the nodes run in containers on a shared machine).
+
 ### 2026-10-08: a refuted false death costs a forward a second of outage: the record link, not the detector (condition 11)
 
 - The copyset test's other failure, now named by its counters: the foreign node held the live successor dead
