@@ -4785,3 +4785,19 @@ Measured on the two-network Docker topology (6 nodes, one shard each, no impairm
   second, still no session). The fix is a prompt redial when a believed death is refuted, or keeping the link to a
   believed-dead member until the council retires it. Both are in the record-link task, owed. Patch and test kept in
   the session scratchpad (`false-death-arm-full.patch`).
+
+**Fixed the same day, by A/B** (`a_refuted_false_death_keeps_a_forward_out_for_less_than_its_location_budget`, five
+injected false deaths per run, two runs per arm, a client polling every 10 ms). After the discovery backoff landed,
+the outage measured 22–217 ms, not a second; one likely reason is that the record sessions are no longer lent to a
+discovery page ten times a second per peer. Every false death still refused a client at least once. The forward now
+resolves its owner again within its one-budget allowance (`verbs::locate_within_budget`):
+
+| Arm | Calls refused per false death | Time to served |
+|---|---|---|
+| A: one resolution, then refuse | 1–2 | 22–217 ms |
+| Location rounds again, paced a heartbeat | 1 | 0.92–1.03 s |
+| Direct route, then a round, paced a heartbeat | 0 | 111–224 ms |
+| Direct route, then a round, paced a tenth of a heartbeat (landed) | 0 | 21–218 ms |
+
+The second arm failed because only a fresh call's direct route (the creator, eligible again once refuted) finds the
+owner quickly; location rounds alone did not within the budget. Fleet suite 80/80.
