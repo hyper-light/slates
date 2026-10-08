@@ -4656,5 +4656,6 @@ are owed in the report before the next reading.
 - Open, and corrected the same day: the owner's record-session window reads 10.8–11.6 KB during the reads too, yet
   each read moves about 180–260 KB/s, which that window at 240 ms cannot carry (about 46 KB/s). Which sessions carry a
   batch's windows has to be traced before Copa is changed; the idle snapshots had suggested the window was the bound.
-  The simulator also does not reproduce the real link (its reordering declares hundreds of spurious losses, the real
-  one none).
+  **Traced (same day, `302ea768`):** reads ride the reader's dialed connection. Its sender state (`served_sessions`)
+  shows windows growing to 50–71 KB during a read, and dozens to over a hundred spurious losses per read: the real
+  crossing reorders, as the simulator does. The next bound is reordering read as loss (`BENCHMARKS.md`, same date).

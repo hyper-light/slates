@@ -3599,3 +3599,27 @@ The simulator did not show this. `fetch_bench`'s fetch keeps the pipe full, so i
 `crossing` scenario matching this link (1 Gbit/s, 200 ms, ±40 ms reordering each way, 3% loss each way) reads 8 MiB in
 35.4–59.7 s with 31–43 KB windows and 196–353 spurious losses, while the real crossing showed 0 spurious losses. The
 simulator's jitter and the real netem's differ, so a controller change is A/B'd on both.
+
+### The crossing's carrying connections, read at last: windows grow, and reordering is read as loss (condition 7; 2026-10-08)
+
+The correction above was right to doubt the 11 KB windows, and the reason is now shown. A forward rides the
+*reader's* dialed record session, whose sender state lives in the owner's serve loop. Status reported only the
+sessions the owner dialed. `302ea768` adds `served_sessions`. Sampled every ~6 s during a crossing round (100 ms ±
+40 ms, 3% loss each way):
+
+| Reader's connection at the owner | Window during its read | Smoothed RTT | Spurious losses |
+|---|---|---|---|
+| first | 25.8 → 28.4 → 41.5 → 50.0 KB, then 37.4 KB | 150–221 ms | 5 → 7 → 21 → 52 → 112 |
+| second | 11.6 → 30.6 → 32.0 → 35.9 → 71.2 KB | 156–218 ms | 0 → 6 → 9 → 22 → 53 |
+| third (not yet reading) | 11.4–11.6 KB | 188–216 ms | 0 |
+
+- **Windows grow during a read, to 50–71 KB.** The 9–11 KB readings, here and in the first table above, were idle
+  connections or the wrong ones.
+- **The real crossing reorders, and the reordering is read as loss.** The carrying connections declared dozens to
+  over a hundred spurious losses per read. The first connection's window fell from 50.0 to 37.4 KB as its spurious
+  losses went from 52 to 112.
+- **So the simulator's crossing scenario is a fair proxy after all:** 31–43 KB end windows, 196–353 spurious losses,
+  35.4–59.7 s for 8 MiB, against about 44 s for the real reads. The "0 spurious losses" in the earlier tables came
+  from the wrong connections.
+- **Next bound, owed:** reordering mistaken for loss. RACK widens its reordering window per spurious retransmission
+  (RFC 8985 §6.2). Each candidate is A/B'd on `fetch_bench crossing` first, then on this crossing.
