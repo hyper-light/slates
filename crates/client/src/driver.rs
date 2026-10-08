@@ -267,7 +267,15 @@ impl Driver {
       .filter(|(ticket, call)| {
         !answered.contains(ticket) && !call.resend && elapsed_ns(call.sent) >= reply_ns
       })
-      .map(|(ticket, call)| (*ticket, call.word, call.patient && call.word.is_some()))
+      .map(|(ticket, call)| {
+        // Patient when submitted so (a granted landing) or when its request is one the daemon may defer past the
+        // deadline, the synchronous call's rule (`Client::defers`): before 2026-10-07 a forwarded verb through an
+        // SDK was failed `Stalled` while its daemon was still answering within its bounds.
+        let patient = call
+          .word
+          .is_some_and(|word| call.patient || client.defers(word));
+        (*ticket, call.word, patient)
+      })
       .collect();
     if !overdue.is_empty() && client.daemon_gone() {
       self.start_recovery();

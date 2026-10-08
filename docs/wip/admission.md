@@ -337,6 +337,14 @@ acknowledging placement", §4.2).
    with `Daemon::inject_pressure_hold`/`pressure_holds` driving the mechanism deterministically), and
    by the pure ledger unit
    (`crates/mem/src/budget.rs::a_pressure_hold_withholds_admission_without_touching_a_committed_claim`).
+   **Amended 2026-10-07: a takeover is recovery, not new admission.** A successor's materialization of a volume its
+   dead owner held (the fetch's staging, the restore, the reservations, the populating writes, a green's chain) runs
+   with the hold lifted for exactly that synchronous work (`fleet::past_the_pressure_hold`). It is a claim the fleet
+   already committed, so the hold, which never revokes a committed claim, does not refuse it, just as boot recovery
+   is admitted at a zero hold. Capacity and the headroom still bound it. Before, a pressured successor adopted the
+   head and never served the volume
+   (`docs/bugs/2026-10-07-a-pressure-hold-kept-a-successor-from-serving-a-taken-over-volume.md`;
+   `a_pressure_hold_does_not_keep_a_successor_from_serving_a_taken_over_volume`).
    Still owed in this dimension (not the pressure hold): the finer pressure source (Linux PSI
    `memory.some` where the kernel offers it, over the coarser `MemAvailable`), and the Windows
    job-object memory limit sub-part of §5.4.

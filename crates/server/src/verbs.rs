@@ -331,62 +331,7 @@ pub(crate) fn next_landing_counter(partition: &Partition) -> u64 {
 
 /// The volume a request is about, when it is about one.
 fn volume_of(body: &RequestBody) -> Option<VolumeId> {
-  match body {
-    RequestBody::Snapshot { volume }
-    | RequestBody::DestroySnapshot { volume, .. }
-    | RequestBody::Versions { green: volume }
-    | RequestBody::ChangedSince { green: volume, .. }
-    | RequestBody::CreateWork { green: volume, .. }
-    | RequestBody::Edit { work: volume, .. }
-    | RequestBody::Declare { work: volume, .. }
-    | RequestBody::Submit { work: volume, .. }
-    | RequestBody::Rebase { work: volume }
-    | RequestBody::Clone { volume, .. }
-    | RequestBody::Attach { volume, .. }
-    | RequestBody::Resize { volume, .. }
-    | RequestBody::Destroy { volume }
-    | RequestBody::Status { volume }
-    | RequestBody::ReadBase { volume, .. }
-    | RequestBody::Digest { volume, .. }
-    | RequestBody::Rewitness { volume, .. }
-    | RequestBody::Pin { volume, .. }
-    | RequestBody::AwaitPlaced { volume, .. }
-    | RequestBody::Read { volume, .. }
-    | RequestBody::ReadRange { volume, .. }
-    | RequestBody::ReadWindow { volume, .. }
-    | RequestBody::ReadDir { volume, .. }
-    | RequestBody::StageBegin { work: volume, .. }
-    | RequestBody::StagePut { work: volume, .. }
-    | RequestBody::EditStaged { work: volume, .. }
-    | RequestBody::FsWrite { volume, .. }
-    | RequestBody::FsWriteStaged { volume, .. }
-    | RequestBody::FsRemove { volume, .. }
-    | RequestBody::FsRename { volume, .. }
-    | RequestBody::FsMkdir { volume, .. }
-    | RequestBody::Land { volume, .. } => Some(*volume),
-    // A green over a base is born on the base volume's owner shard, where the snapshot is walked.
-    RequestBody::CreateGreen { base, .. } => base.map(|b| b.volume),
-    RequestBody::Create { .. }
-    | RequestBody::Advance { .. }
-    | RequestBody::Detach { .. }
-    | RequestBody::BindMount { .. }
-    | RequestBody::List
-    | RequestBody::DaemonStatus
-    | RequestBody::DaemonStatusNext { .. }
-    | RequestBody::Bootstrap { .. }
-    | RequestBody::RecoveryPlan { .. }
-    | RequestBody::Recover { .. }
-    | RequestBody::PromoteRegion { .. }
-    | RequestBody::Grants
-    | RequestBody::Audit { .. }
-    | RequestBody::Acknowledge { .. }
-    | RequestBody::Telemetry { .. }
-    | RequestBody::Grant { .. }
-    | RequestBody::Enroll { .. }
-    | RequestBody::Attest { .. }
-    | RequestBody::Revoke { .. } => None,
-    RequestBody::Share { volume, .. } => Some(*volume),
-  }
+  body.volume()
 }
 
 /// The partition that owns a consumer id — the one its enrollment was recorded on (the id carries it
@@ -791,18 +736,7 @@ pub(crate) fn live_tree_fenced(state: &mut ShardState, volume: DbVolumeId) -> bo
 /// A staging verb forwards the same way: a retried put of bytes already written is answered unchanged, and a
 /// retried begin only strands a charged buffer that expires within a lease (`crate::staging`).
 fn is_forwardable_read(body: &RequestBody) -> bool {
-  matches!(
-    body,
-    RequestBody::Status { .. }
-      | RequestBody::Versions { .. }
-      | RequestBody::ChangedSince { .. }
-      | RequestBody::Read { .. }
-      | RequestBody::ReadRange { .. }
-      | RequestBody::ReadWindow { .. }
-      | RequestBody::ReadDir { .. }
-      | RequestBody::StageBegin { .. }
-      | RequestBody::StagePut { .. }
-  )
+  body.forwards_as_read()
 }
 
 /// Whether a verb is a **write** to an existing volume that is safe to forward to that volume's owner: a
@@ -811,7 +745,7 @@ fn is_forwardable_read(body: &RequestBody) -> bool {
 /// "Lookup"; the owner runs it through [`run_forwarded`]). A create (no existing volume, routed by name) is
 /// not one of these — it is placed by the local partitioning, not a home redirect.
 fn is_forwardable_write(body: &RequestBody) -> bool {
-  volume_of(body).is_some() && mutates_shard_image(body)
+  body.forwards_as_write()
 }
 
 /// Serves a verb forwarded from another node over the fleet transport (§4.8 "Lookup"): decodes the
@@ -1464,6 +1398,7 @@ async fn resolve_and_forward(
   if let Some(refusal) =
     crate::state::with_state(|state| owned_unmaterialized(state, volume)).flatten()
   {
+    await_materialization(ObjectId(volume.bytes)).await;
     return (
       OwnerReplies {
         first: refused(refusal),
@@ -1577,6 +1512,26 @@ fn route_after(
     });
   }
   None
+}
+
+/// Holds a verb on a volume this node owns but has not materialized while its materialization is pending, polled at
+/// the heartbeat, for at most one liveness budget. The client waits for such a verb while its daemon lives
+/// (`defers_reply`), and the refusal that follows meets the materialized volume on the client's retry. Answered at
+/// once before 2026-10-07: a client that retried without a pause was refused 2.8 million times in 400 s while the
+/// successor restored a volume. Ends early once the materialization is no longer pending, done or dropped.
+async fn await_materialization(object: ObjectId) {
+  let deadline = slates_rt::futures::now_ns().saturating_add(crate::daemon::LIVENESS_BUDGET_NS);
+  while crate::state::with_state(|state| state.pending_materializations.contains_key(&object))
+    .unwrap_or(false)
+    && slates_rt::futures::now_ns() < deadline
+  {
+    if slates_rt::futures::sleep(crate::daemon::HEARTBEAT_NS)
+      .await
+      .is_err()
+    {
+      return;
+    }
+  }
 }
 
 /// The refusal for a verb on a volume this node owns but has not materialized yet, asked on the control shard where
@@ -2835,6 +2790,21 @@ pub fn shard_report(state: &mut ShardState) -> ShardReport {
       .as_ref()
       .map(|recipient| recipient.public().id.to_vec())
       .unwrap_or_default(),
+    nfs_calls: nfs_calls_of(state),
+  }
+}
+
+/// The NFS calls this shard served, by NFSv3 procedure (`nfs::ServiceTimes::calls`); empty off Unix, where no NFS
+/// bridge runs.
+fn nfs_calls_of(state: &ShardState) -> Vec<u64> {
+  #[cfg(unix)]
+  {
+    state.nfs_service.calls.to_vec()
+  }
+  #[cfg(not(unix))]
+  {
+    let _ = state;
+    Vec::new()
   }
 }
 
@@ -3120,30 +3090,7 @@ fn claims_placed_durability(body: &RequestBody) -> bool {
 /// recovery image (§4.8). Data-plane content writes go through the mount transport, not here, and
 /// stand behind the same barrier there (`crate::nfs`, after every mutating procedure).
 fn mutates_shard_image(body: &RequestBody) -> bool {
-  matches!(
-    body,
-    RequestBody::Create { .. }
-      | RequestBody::CreateGreen { .. }
-      | RequestBody::CreateWork { .. }
-      | RequestBody::Edit { .. }
-      | RequestBody::EditStaged { .. }
-      | RequestBody::Declare { .. }
-      | RequestBody::Submit { .. }
-      | RequestBody::Rebase { .. }
-      | RequestBody::Clone { .. }
-      | RequestBody::Resize { .. }
-      | RequestBody::Destroy { .. }
-      | RequestBody::Snapshot { .. }
-      | RequestBody::DestroySnapshot { .. }
-      | RequestBody::Share { .. }
-      | RequestBody::Enroll { .. }
-      | RequestBody::Revoke { .. }
-      | RequestBody::FsWrite { .. }
-      | RequestBody::FsWriteStaged { .. }
-      | RequestBody::FsRemove { .. }
-      | RequestBody::FsRename { .. }
-      | RequestBody::FsMkdir { .. }
-  )
+  body.mutates_shard_image()
 }
 
 /// What the owner-lease gate of [`dispatch`] decided.

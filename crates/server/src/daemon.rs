@@ -2211,6 +2211,16 @@ impl Daemon {
     })
   }
 
+  /// Test support: makes this node wait `delay_ns` before answering each location query and each forwarded verb, as
+  /// a slow or distant owner would (`None` restores immediate answers). Each answer still falls within the asker's
+  /// own bound for that step, so a test can drive a forward's total time past a client's reply deadline. Delivered
+  /// like [`Self::inject_probe_deafness`]; `Ok` once installed, else the typed refusal.
+  pub fn inject_serve_delay(&self, delay_ns: Option<u64>) -> Result<(), ObserveError> {
+    self.observe(self.shards.first().copied(), move |s| {
+      s.injected_serve_delay_ns = delay_ns;
+    })
+  }
+
   /// Test support: makes each of this node's campaigns count the record sessions of `voters` as out of their
   /// links for `span_ns` after its round begins, as a discovery page holds one for its round trip, so a test
   /// drives a campaign into sessions that are out for a moment
@@ -2944,6 +2954,7 @@ fn init_shard(
     peer_paths: std::collections::BTreeMap::new(),
     probe_windows: crate::fleet::ProbeWindows::default(),
     probe_deaf_to: std::collections::BTreeSet::new(),
+    injected_serve_delay_ns: None,
     campaign_session_hold: None,
     record_refused_from: std::collections::BTreeSet::new(),
     // The owner lease starts its bounded startup allowance at boot (§4.8 "Leases and reads", AUD-08): the

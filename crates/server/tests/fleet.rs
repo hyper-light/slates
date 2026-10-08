@@ -5254,6 +5254,97 @@ fn a_cross_region_client_finds_the_copyset_successor_instead_of_an_unrelated_liv
   );
 }
 
+/// Shape: how long the successor waits before each location answer and each forwarded verb in
+/// [`a_forward_answered_within_its_bounds_is_never_reported_stalled`]: three fifths of a liveness budget, so each step
+/// ends well inside its own one-budget bound while the round and the forward together pass the client's one-budget
+/// reply deadline.
+const SLOW_OWNER_DELAY_NS: u64 = slates_server::daemon::LIVENESS_BUDGET_NS / 5 * 3;
+
+/// §4.8 Lookup and the client's deadline (`Deadlines::derive`): a forward the daemon answers within its own bounds is
+/// a reply, never a stall. A client waits one liveness budget for a reply; a forwarded verb with no usable route takes
+/// a location round (one budget) and then the forward (one budget plus the path's tail). Do: after the owner dies and
+/// its copyset successor serves, make the successor answer each location query and each forward
+/// [`SLOW_OWNER_DELAY_NS`] late, and write a snapshot from a fresh client of the foreign node. Expect: the snapshot is
+/// served, and the client never reports the live daemon stalled.
+#[test]
+fn a_forward_answered_within_its_bounds_is_never_reported_stalled() {
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c", "d", "foreign"];
+  let nodes: Vec<_> = names.iter().map(|name| fleet_node(name)).collect();
+  let seeds: Vec<_> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<_> = nodes
+    .iter()
+    .map(|(_, _, identity)| identity.certificate())
+    .collect();
+  let regions = seeds
+    .iter()
+    .enumerate()
+    .map(|(index, host)| (*host, RegionId(u64::from(index == names.len() - 1))))
+    .collect();
+  let (_serve_lease, serve) = mesh_serve_ports(names.len());
+  let mut daemons = start_mesh_with_regions(nodes, &seeds, &certs, &serve, 1, &regions);
+  let hosts: Vec<_> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
+  assert_fleet_forms(&daemons, &hosts, &names);
+  let foreign_instance = daemons.last().unwrap().instance().to_owned();
+  let owner_index = (0..names.len() - 1)
+    .max_by_key(|index| hosts[*index])
+    .unwrap();
+  let owner = hosts[owner_index];
+  let neighborhood = daemons[owner_index].placement_neighbourhood().unwrap();
+  let survivors: Vec<_> = hosts[..names.len() - 1]
+    .iter()
+    .copied()
+    .filter(|host| *host != owner)
+    .collect();
+  let (id, successor, _unrelated) =
+    place_copyset_routing_case(&daemons, owner_index, owner, &neighborhood, &survivors);
+  daemons.remove(owner_index).stop();
+  let successor_daemon = daemons
+    .iter()
+    .find(|daemon| daemon.member_identity().unwrap() == successor)
+    .unwrap();
+  assert_copyset_adopted(&daemons, successor_daemon, ObjectId(id.bytes));
+  let mut successor_client = Client::connect(successor_daemon.instance());
+  assert_successor_serves(&mut successor_client, successor_daemon, id);
+  // The foreign node reaches the successor before the delay, so its sessions and the successor's claim are warm.
+  let mut warm = Client::connect(&foreign_instance);
+  let reached = audit_wait(|| Ok(status_answers(&mut warm, id)));
+  let delayed = successor_daemon.inject_serve_delay(Some(SLOW_OWNER_DELAY_NS));
+  let deadlines = slates_client::Deadlines::derive(
+    slates_server::daemon::LIVENESS_BUDGET_NS,
+    slates_db::replay::RECOVERY_BUDGET_NS,
+  )
+  .get();
+  let mut fresh = slates_client::Client::connect(&foreign_instance, deadlines).unwrap();
+  let began = std::time::Instant::now();
+  let written = fresh.call(&RequestBody::Snapshot { volume: id });
+  let took = began.elapsed();
+  let counters = daemons
+    .iter()
+    .find(|daemon| daemon.instance() == foreign_instance)
+    .map(|daemon| {
+      daemon
+        .fleet_refusals()
+        .map(|counters| location_counters(&counters))
+    });
+  for daemon in daemons {
+    daemon.stop();
+  }
+  assert!(
+    reached,
+    "the foreign node reached the successor before the delay"
+  );
+  assert!(delayed.is_ok(), "the delay was installed: {delayed:?}");
+  assert!(
+    matches!(written, Ok(ReplyBody::Snapshotted { .. })),
+    "the slow but bounded forward is served, not reported stalled, after {took:?}: {written:?}; the foreign node's \
+     counters {counters:?}"
+  );
+}
+
 /// Seal a volume that distinguishes a copyset successor from all-member ranking, and establish
 /// its real holds before stopping the owner. All selected candidates must hold the head.
 fn place_copyset_routing_case(
@@ -5916,9 +6007,20 @@ fn an_indirect_probe_through_a_relay_keeps_a_peer_the_direct_path_lost_and_losin
     .expect("the asymmetric loss is installed at B");
 
   // A's direct probes of B now time out; the relay stage must run — A asks C, C reaches B, A credits it.
+  let relay_start = a.fleet_progress();
   let relayed = poll_until(&observed, RETIREMENT_DEADLINE, || {
     Ok(a.fleet_plane_counts()?.indirect_acked >= 1 && c.fleet_plane_counts()?.relayed >= 1)
   });
+  // The relay phase's evidence, read before the hold: each plane's whole counts, A's view and the periods A ran in the
+  // wait. A failed relay phase then says whether A's direct probes ever went unanswered and whether it asked anyone
+  // (2026-10-07, under load 37: acked 0, requested 0 within the whole deadline, with nothing else on record).
+  let relay_evidence = (
+    a.fleet_plane_counts(),
+    b.fleet_plane_counts(),
+    c.fleet_plane_counts(),
+    a.fleet_members(),
+    a.fleet_progress().saturating_sub(relay_start),
+  );
 
   // Hold: across INDIRECT_HOLD_PERIODS of A's own periods B must stay a member of A's fleet. The wait ends
   // early if A retires B (a failure the assertion below then names), else at the period budget.
@@ -5936,6 +6038,12 @@ fn an_indirect_probe_through_a_relay_keeps_a_peer_the_direct_path_lost_and_losin
   let held_periods = a.fleet_progress().saturating_sub(start);
   let plane_a = a.fleet_plane_counts();
   let plane_c = c.fleet_plane_counts();
+  // C's detector as its status reports it: whether C condemned B by its own probes, and how that compares with the
+  // theory's allowance (a count far above it is a detector misjudging a live peer; one within it is the load).
+  let detector_c = match Client::connect(c.instance()).call(&RequestBody::DaemonStatus) {
+    ReplyBody::DaemonStatus { report } => report.fleet.detector,
+    _ => Vec::new(),
+  };
   let counts_a = a.fleet_plane_counts().unwrap_or_default();
   let acked_on_a = counts_a.indirect_acked;
   let requested_by_a = counts_a.relays_asked;
@@ -5945,6 +6053,7 @@ fn an_indirect_probe_through_a_relay_keeps_a_peer_the_direct_path_lost_and_losin
   b.inject_probe_deafness(&[host_a, host_c])
     .expect("the total loss is installed at B");
   let survivors = [&daemons[0], &daemons[2]];
+  let retire_start = [a.fleet_progress(), c.fleet_progress()];
   let retired = poll_until(&survivors, RETIREMENT_DEADLINE, || {
     all_hold(survivors.iter().map(|survivor| {
       survivor
@@ -5952,6 +6061,21 @@ fn an_indirect_probe_through_a_relay_keeps_a_peer_the_direct_path_lost_and_losin
         .map(|members| !members.contains(&host_b))
     }))
   });
+  // Each survivor's view, plane and periods spent at the end of the wait: a failed retirement then says which survivor
+  // still held B, whether its probes and relays ran, and how many of its periods the deadline covered (2026-10-07: it
+  // failed under extreme load with nothing on record).
+  let retire_views: Vec<_> = survivors
+    .iter()
+    .zip(retire_start)
+    .map(|(survivor, start)| {
+      (
+        survivor.member_identity().ok(),
+        survivor.fleet_members(),
+        survivor.fleet_plane_counts(),
+        survivor.fleet_progress().saturating_sub(start),
+      )
+    })
+    .collect();
 
   for daemon in daemons {
     daemon.stop();
@@ -5959,17 +6083,19 @@ fn an_indirect_probe_through_a_relay_keeps_a_peer_the_direct_path_lost_and_losin
   assert!(
     relayed,
     "A's direct probes of B timed out and the indirect stage ran: A credited a relayed answer \
-     (acked={acked_on_a}, requested={requested_by_a}) and C relayed one (relayed={relayed_by_c})"
+     (acked={acked_on_a}, requested={requested_by_a}) and C relayed one (relayed={relayed_by_c}); at the end of the \
+     relay phase (A's plane, B's plane, C's plane, A's members, A's periods waited) {relay_evidence:?}"
   );
   assert!(
     held && kept,
     "B stayed a member of A's fleet for {INDIRECT_HOLD_PERIODS} of A's periods with A's direct path lost \
      (acked={acked_on_a}, relayed={relayed_by_c}, requested={requested_by_a}); it lasted {held_periods}; A's plane \
-     {plane_a:?}; C's plane {plane_c:?}"
+     {plane_a:?}; C's plane {plane_c:?}; C's detector {detector_c:?}"
   );
   assert!(
     retired,
-    "with both paths lost, A and C retired B (the relay stage does not weaken eventual detection)"
+    "with both paths lost, A and C retired B (the relay stage does not weaken eventual detection): B {host_b:?}; each \
+     survivor (id, members, plane, periods waited) {retire_views:?}"
   );
 }
 
@@ -11286,6 +11412,76 @@ fn refused_placeholder(error: &IpcError) -> ReplyBody {
       reason: error.to_string(),
     },
   }
+}
+
+/// admission.md §5.5 and §4e: a memory-pressure hold withholds capacity from **new** admission and never revokes a
+/// committed claim, and an admitted claim survives a restart ahead of any new claim. A taken-over volume is such a
+/// claim: committed and placed fleet-wide, its content already held in the successor's RAM. Do: seal a volume on A,
+/// raise a pressure hold on both survivors that withholds all of their admittable capacity, kill A. Expect: the
+/// successor serves the volume (its materialization is the claim moving, not a new one), and the hold still refuses a
+/// new bounded volume there (the hold is honoured for what it is for).
+#[test]
+fn a_pressure_hold_does_not_keep_a_successor_from_serving_a_taken_over_volume() {
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c"];
+  let n = names.len();
+  let nodes: Vec<(MachineProfile, HostId, Identity)> =
+    names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+    nodes.iter().map(|(_, _, id)| id.certificate()).collect();
+  let pid = std::process::id();
+  let instance_a = format!("fleet3-{}-{pid}", hosts[0].0);
+  let (_serve_lease, serve) = mesh_serve_ports(n);
+  let mut daemons = start_mesh(nodes, &hosts, &certs, &serve);
+  let hosts: Vec<HostId> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
+  assert_fleet_forms(&daemons, &hosts, &names);
+  let id = match seal_hello_on_owner(&instance_a, &daemons, "pressured") {
+    Ok(id) => id,
+    Err(why) => {
+      for daemon in daemons {
+        daemon.stop();
+      }
+      panic!("setup: {why}");
+    }
+  };
+  let object = ObjectId(id.bytes);
+  // The whole admittable withheld on both survivors, as a host far below its boot baseline would make it.
+  let held = daemons[1..]
+    .iter()
+    .map(|daemon| daemon.inject_pressure_hold(u64::MAX))
+    .collect::<Result<Vec<()>, _>>();
+  let owner = daemons.remove(0);
+  owner.stop();
+  let successor = rendezvous_first(&[hosts[1], hosts[2]], object).expect("a survivor takes over");
+  let successor_index = if successor == hosts[1] { 0 } else { 1 };
+  let successor_instance = daemons[successor_index].instance().to_owned();
+  let served = poll_status_answers(&daemons.iter().collect::<Vec<_>>(), &successor_instance, id);
+  let counters = daemons[successor_index]
+    .fleet_refusals()
+    .map(|counters| takeover_counters(&counters));
+  let mut client = Client::connect(&successor_instance);
+  let new_volume = client.call(&scratch("new-under-pressure"));
+  for daemon in daemons {
+    daemon.stop();
+  }
+  assert!(held.is_ok(), "the holds were raised: {held:?}");
+  assert!(
+    served,
+    "the successor serves the taken-over volume under the hold: its counters {counters:?}"
+  );
+  assert!(
+    matches!(
+      new_volume,
+      ReplyBody::Refused {
+        refusal: Refusal::BudgetExceeded { .. }
+      }
+    ),
+    "the hold still refuses a new volume: {new_volume:?}"
+  );
 }
 
 /// Shape: the uid the catalog-takeover test grants read access to.

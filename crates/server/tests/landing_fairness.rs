@@ -487,11 +487,13 @@ fn drive(client: &mut Client, driver: &mut Driver, tickets: &[Ticket]) -> Ended 
 }
 
 /// The async driver's patient path (the sibling of AUD-29-25 fixed 2026-10-01: a client answered `Stalled`
-/// to a landing still at work). Do: land two volumes, each sized by a calibration landing to last twice the reply deadline, under grants through one async
-/// driver, driven by an event loop as an SDK drives it — one call submitted patient (`submit_patient`, as both
-/// SDKs' `land` is), the other plain — both landings outlasting the reply deadline. Expect: the plain call
-/// ends `Stalled` at its deadline (the control: the landings did outlast it, so the patient flag is what this
-/// tests), and the patient call is waited for past it and ends with its landing done and every file written.
+/// to a landing still at work). Do: land two volumes, each sized by a calibration landing to last twice the reply
+/// deadline, under grants through one async driver, driven by an event loop as an SDK drives it — one call submitted
+/// patient (`submit_patient`, as both SDKs' `land` is), the other plain — both landings outlasting the reply deadline.
+/// Expect: both are waited for past it and end with their landing done and every file written. A granted landing
+/// defers its reply (`defers_reply`), and since 2026-10-07 the driver derives patience from the request
+/// (`Client::defers`), as the synchronous call does, so a plain submission of a deferring verb is waited for too;
+/// until then the plain call ended `Stalled` at its deadline, the control this test used to keep.
 #[test]
 fn an_async_patient_landing_outlasting_the_reply_deadline_is_waited_for() {
   let profile = common::machine_profile();
@@ -530,32 +532,34 @@ fn an_async_patient_landing_outlasting_the_reply_deadline_is_waited_for() {
     eprintln!(
       "{files} files; reply deadline {reply:?}; plain call ended at {impatient_at:?}: {impatient_end:?}; patient call at {patient_at:?}"
     );
-    if matches!(impatient_end, Err(ClientError::Stalled { .. })) {
+    if impatient_at > reply && patient_at > reply {
       break (impatient_at, impatient_end, patient_at, patient_end);
     }
     files = files.saturating_mul(2);
     if files > MOST_FILES {
       daemon.stop();
       eprintln!(
-        "SKIP: no landing of up to {MOST_FILES} files outlasted the {reply:?} reply deadline here"
+        "SKIP: no pair of landings of up to {MOST_FILES} files both outlasted the {reply:?} reply deadline here"
       );
       return;
     }
   };
   daemon.stop();
   assert!(
-    matches!(impatient_end, Err(ClientError::Stalled { .. })),
-    "the control: a plain call to a landing outlasting the deadline stalls ({impatient_at:?}): {impatient_end:?}"
+    patient_at > reply && impatient_at > reply,
+    "both landings outlasted the reply deadline (patient {patient_at:?}, plain {impatient_at:?})"
   );
-  assert!(
-    patient_at > reply,
-    "the patient landing outlasted the reply deadline ({patient_at:?})"
-  );
-  let Ok(Some(Landing::Landed(outcome))) = patient_end else {
-    panic!("the patient landing: {patient_end:?}");
-  };
-  assert_eq!(outcome.state, "done");
-  assert_eq!(outcome.written, u64::try_from(files).unwrap());
+  for (which, end) in [("patient", patient_end), ("plain", impatient_end)] {
+    let Ok(Some(Landing::Landed(outcome))) = end else {
+      panic!("the {which} landing is waited for and done: {end:?}");
+    };
+    assert_eq!(outcome.state, "done", "the {which} landing");
+    assert_eq!(
+      outcome.written,
+      u64::try_from(files).unwrap(),
+      "the {which} landing"
+    );
+  }
 }
 
 /// What one patient-and-plain scenario ended with: the plain call's end and when, then the patient call's.

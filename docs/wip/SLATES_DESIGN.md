@@ -3811,6 +3811,16 @@ version.
 > reads. This is the evidence condition 7 needs on the real crossing, whose reads gained a tenth where the simulator
 > gained threefold. Regression `a_nodes_status_reports_each_record_session_with_its_congestion_state`.
 
+> **Status (2026-10-07, a forwarded verb is waited for while the daemon lives).** A client waited one liveness budget
+> for a reply, while the daemon bounds a forwarded verb by a location round (one budget) and the forward (one budget
+> plus the path's tail). So a forwarded write on a live daemon inside its own bounds was reported `Stalled` at 1 s
+> (reproduced with a successor answering each step 0.6 s late). Forwardability is now one rule on `RequestBody` in
+> `slates-ipc` (`may_be_forwarded`), read by the server's routing and by the client's `defers_reply`. A verb the
+> daemon may forward is waited for while the daemon lives, as a page read already was, and the async driver derives
+> patience from the request (`Client::defers`), so the SDKs follow the same rule. Liveness stays the anchor
+> heartbeat's (`daemon_gone`). Regression `a_forward_answered_within_its_bounds_is_never_reported_stalled`
+> (`docs/bugs/2026-10-07-a-client-reported-a-live-daemon-stalled-mid-forward.md`).
+
 > **Status (2026-10-07, a successor's own volume before it serves).** A node that adopted a volume's head in a
 > takeover owns it before its owner shard has materialized the volume. A verb from its own client in that window
 > reaches the forward path, because the catalog lacks the volume. It ran the location round, which asks the peers

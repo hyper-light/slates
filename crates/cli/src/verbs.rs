@@ -1845,6 +1845,20 @@ fn daemon_status_text(report: &DaemonReport, telemetry: &[TelemetryReport]) -> S
         shard.partition, refusal.kind, refusal.count
       ));
     }
+    let calls: Vec<String> = shard
+      .nfs_calls
+      .iter()
+      .zip(NFS_V3_PROCEDURE_NAMES)
+      .filter(|(count, _)| **count > 0)
+      .map(|(count, name)| format!("{name}={count}"))
+      .collect();
+    if !calls.is_empty() {
+      out.push_str(&format!(
+        "shard {} nfs_calls: {}\n",
+        shard.partition,
+        calls.join(" ")
+      ));
+    }
     for signal in &shard.signals {
       out.push_str(&format!(
         "shard {} {}: {} (age {} ns)\n",
@@ -2180,3 +2194,30 @@ mod tests {
     assert_eq!(signal_value(&absent), "absent/unknown");
   }
 }
+
+/// Format: the NFSv3 procedure names in procedure-number order, 0 (`NULL`) to 21 (`COMMIT`), RFC 1813 §3 — the
+/// order of `ShardReport::nfs_calls`.
+const NFS_V3_PROCEDURE_NAMES: [&str; 22] = [
+  "null",
+  "getattr",
+  "setattr",
+  "lookup",
+  "access",
+  "readlink",
+  "read",
+  "write",
+  "create",
+  "mkdir",
+  "symlink",
+  "mknod",
+  "remove",
+  "rmdir",
+  "rename",
+  "link",
+  "readdir",
+  "readdirplus",
+  "fsstat",
+  "fsinfo",
+  "pathconf",
+  "commit",
+];

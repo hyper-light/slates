@@ -643,6 +643,11 @@ pub struct ShardState {
   /// but a relay can), without touching the transport. Empty in production
   /// (`Daemon::inject_probe_deafness`).
   pub probe_deaf_to: std::collections::BTreeSet<slates_db::HostId>,
+  /// Test support (never reachable from the wire): how long this node waits before answering each location query
+  /// and each forwarded verb, as a slow or distant owner would, so a test drives a forward's total time past the
+  /// client's reply deadline while each step stays inside its own bound. `None` in production
+  /// (`Daemon::inject_serve_delay`).
+  pub injected_serve_delay_ns: Option<u64>,
   /// Test support (never reachable from the wire): voters whose record sessions each of this node's
   /// campaigns counts as out of their links, as a discovery page holds one, for the span after the
   /// campaign's round begins (`fleet::take_campaign_sessions`); so a test drives a campaign into sessions

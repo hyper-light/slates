@@ -4513,6 +4513,17 @@ fails under extreme load, on either detector snapshot.**
   - the harness's machine profile timed out measuring the wake probe (`MeasurementTimeout { probe: "wake" }`) before
     the daemons started.
 - The retire failure needs a failing run's evidence before diagnosis.
+- **The remaining hold failures, read (2 of 16 at 8 concurrent, load about 40, after the relay fix).** A's relays all
+  answered: `relays_asked` 105 and 90, `indirect_acked` 105 and 90. So A's own detector kept B, yet B left A's fleet
+  after 3 and 6 periods. C asked for relays 41 and 21 times, 9 of them unanswered in the first run. C asks only when
+  its own direct probes of B time out; B is not deaf to C, so under this load C's probes of B ran late. C's only
+  possible relay is A, which by the test's construction cannot reach B.
+  - Working hypothesis, not yet shown: C condemned B through late probes plus a topology with no spare relay, and the
+    council retired B. That is SWIM working as designed for a three-node fleet whose one relay for (C, B) is the node
+    that cannot reach B, not a relay defect.
+  - Owed: C's detector report (`fleet.detector`: suspicions and condemnations against their allowances) in the hold
+    failure's message, to show whether C's condemnations of B exceed the theory's allowance (a misjudged live peer)
+    or sit inside it (the load the detector was told about).
 - The wake-probe timeout is the tests' budget, not a boot failure:
   - the tests measure with 5 ms per probe (`tests/common` `PROBE_MS`), so 1 ms per round, and the doubling rounds
     add at most 62 ms (`slates-machine` `wake`);
@@ -4523,3 +4534,82 @@ fails under extreme load, on either detector snapshot.**
 
   Owed: decide whether the tests' profile takes the boot's budget (paid once per test process) or the probe's
   backoff grows until its sample floor within a derived wall bound. Busy CI runners would hit the same timeout.
+
+  **Fixed the same day.** It recurred in three test binaries at load 37, so the evidence was in. The wake probe's
+  doubling rounds now continue, while short of the sample floor and given a non-zero budget, until the full profile's
+  per-probe budget (`PROBE_WALL_BUDGET`, 250 ms) is spent, each round capped at what is left. An idle machine pays
+  nothing, and a boot profile is unchanged (its 62 shares already exceed the wall). Regression
+  `a_budget_too_short_for_its_rounds_extends_to_the_full_probe_budget_and_measures` (10 µs budget): 5 of 5 refused
+  `MeasurementTimeout` without the extension, 5 of 5 measured with it.
+
+### 2026-10-07: a write delegation's space limit, weighed (condition 12, A-80)
+
+`BENCHMARKS.md` (hot-directory storm) owes a non-zero space limit on write delegations. Today the limit is zero
+(`encode_write_delegation`, as Linux nfsd encodes it), so the client flushes at every close: the WRITE is 0.21 ms of a
+create's 0.86 ms p50 over Docker Desktop's NFSv4.2.
+- **What a non-zero limit buys.** RFC 8881 §10.4.1: the server promises the client can write up to the limit without
+  `ENOSPC`. Linux's client then skips the flush on close while the file's dirty pages are under the limit
+  (`nfs4_delegation_flush_on_close` against `pagemod_limit`); its close only starts the writeback
+  (`filemap_fdatawrite`).
+- **What it costs.** A file closed in a container is no longer at the server when `close` returns. An agent that
+  writes, closes, then snapshots through the CLI or MCP could seal a snapshot that misses the closed file, while
+  today closed files are in it. A merge submit has the same exposure. A landing does not: it already recalls the
+  volume's delegations before it finishes (A-79, `recall_before_finish` through `recall_gate.recall_volume`).
+- **The design that keeps both:**
+  - a snapshot and a merge submit first recall the volume's outstanding write delegations, as a landing does
+    (`CB_RECALL` makes the client flush and return them), within the same bounded wait, then seal;
+  - the limit is reserved against the volume's quota while the delegation is held, so the promise holds;
+  - the limit is derived (one negotiated `wsize`, the most one WRITE carries).
+- **Owed.** The amendment to §4.6 and A-80, then an A/B on the storm (create p50 and p99, 1 and 16 writers), plus a
+  test that a snapshot taken right after a container's close includes the closed file.
+
+### 2026-10-07: a pressure hold no longer keeps a successor from serving a taken-over volume
+
+Testing the leading hypothesis for the intermittent takeover failure found a real bug, whether or not it was that
+flake's cause (`docs/bugs/2026-10-07-a-pressure-hold-kept-a-successor-from-serving-a-taken-over-volume.md`). Under a
+memory-pressure hold a successor adopted the head and never served the volume: 3,913 refusals in 488 s, the fetch's
+staging refused like a new admission. A takeover is now recovery, admitted past the hold within capacity
+(admission.md §5.5, amended). The test passes in 16 s, and the hold still refuses a new volume.
+- Open: the takeover flake itself, until it recurs with its counters.
+- Done the same day: the successor holds its client's verb while the volume's materialization is pending, for at
+  most one liveness budget, then refuses retryably (`verbs::await_materialization`). A pause-free client had been
+  refused 2.8 million times in 400 s.
+
+### 2026-10-07: fixed (reproduced, then fixed): a client's reply deadline was shorter than a forwarded verb's own bound
+
+A client waits one liveness budget (1 s, `Deadlines::derive`: `reply_ns = liveness_budget_ns`) for a reply, then fails
+`Stalled` unless the verb defers its reply (`defers_reply`: `ReadRange`, a granted `Land`, FUSE attaches). The daemon
+bounds a forwarded verb by more (`verbs::resolve_and_forward`):
+- the location round: one liveness budget (`owner_location::locate`), run when the client has no usable cached route;
+- then the forward: one liveness budget plus the path's measured round-trip tail.
+
+So a forwarded write or status (a `Snapshot` on a volume owned by another node, in another region or the same one)
+on a live daemon that is still within its own bound can be reported `Stalled` by the client after 1 s, up to 2 s plus
+the tail before the daemon would answer. Not yet reproduced: on loopback the tail is near zero, and the window needs
+a location round and a forward to add past 1 s each within its own bound (two session holds in the copyset shape).
+Fix options to weigh with the reproduction:
+- forwardable verbs (`is_forwardable_read`, `is_forwardable_write`) defer their reply while the daemon lives, as
+  `ReadRange` does. The daemon's bound still ends every forward, but a stuck verb on a live daemon is then no longer
+  seen as `Stalled`;
+- or the daemon fits a forward's whole time inside the client's deadline and refuses retryably at its edge, which
+  gives back the WAN tail the forward deadline was widened for.
+
+**Reproduced and fixed the same day** (`docs/bugs/2026-10-07-a-client-reported-a-live-daemon-stalled-mid-forward.md`).
+- A successor answering each step 0.6 s late (`Daemon::inject_serve_delay`) got a fresh client's forwarded snapshot
+  `Stalled` at 1.002 s.
+- The first option was taken, as `ReadRange` already did: forwardability is one rule on `RequestBody` in `slates-ipc`,
+  which the server's routing and the client's `defers_reply` both read.
+- The async driver derives patience from the request (`Client::defers`), so the SDKs follow the same rule.
+- The reproduction passes after the fix.
+
+### 2026-10-07: status counts NFS calls by procedure; a macOS create is two file creates (condition 12)
+
+- Status reports each shard's NFS calls by NFSv3 procedure (`ShardReport::nfs_calls`; an NFSv4 compound counts each
+  operation's v3 call). The CLI prints `nfs_calls` lines, and `--json`/MCP carry the array. A client's own counters
+  cannot answer this on a shared machine (`nfsstat` is machine-wide). Regression
+  `status_counts_the_nfs_calls_each_procedure_served`.
+- A create through macOS's NFSv3 mount costs 14 RPCs, and half are an AppleDouble sidecar. macOS attaches
+  `com.apple.provenance` to every new file, and NFSv3 carries no extended attributes (`BENCHMARKS.md`, mixed tails).
+- Owed, each with an A/B on the mixed matrix: a transport that carries the attribute so the sidecar is never made
+  (NFSv4 named attributes for macOS's v4.0 client, which is a protocol design decision), and the ~5 getattrs per
+  create from close-to-open revalidation.

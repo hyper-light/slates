@@ -1034,6 +1034,9 @@ pub struct ShardReport {
   pub seal_recipient_id: Vec<u8>,
   /// This shard's record session to each peer, as last seen (live on the control shard, empty elsewhere). Appended.
   pub sessions: Vec<SessionReport>,
+  /// NFS calls this shard served, by NFSv3 procedure number (0 `NULL` to 21 `COMMIT`, RFC 1813 §3; an NFSv4
+  /// compound counts each operation's v3 call): the round trips each client operation cost. Appended.
+  pub nfs_calls: Vec<u64>,
 }
 
 /// The daemon's place in its fleet (§4.8; §2.6 boot step 6), as the verbs' placement authority sees it.
@@ -1086,6 +1089,132 @@ pub struct FleetReport {
   /// state as last seen, so a slow cross-region transfer shows whether the window, the round trip or loss bound it.
   /// Empty on a laptop. Appended.
   pub sessions: Vec<SessionReport>,
+}
+
+impl RequestBody {
+  /// The volume a request is about, when it is about one. A green over a base is born on the base volume's owner
+  /// shard, where the snapshot is walked, so `CreateGreen` names its base's volume. One rule for the daemon's routing
+  /// and the client's waiting ([`Self::may_be_forwarded`]).
+  pub fn volume(&self) -> Option<VolumeId> {
+    match self {
+      RequestBody::Snapshot { volume }
+      | RequestBody::DestroySnapshot { volume, .. }
+      | RequestBody::Versions { green: volume }
+      | RequestBody::ChangedSince { green: volume, .. }
+      | RequestBody::CreateWork { green: volume, .. }
+      | RequestBody::Edit { work: volume, .. }
+      | RequestBody::Declare { work: volume, .. }
+      | RequestBody::Submit { work: volume, .. }
+      | RequestBody::Rebase { work: volume }
+      | RequestBody::Clone { volume, .. }
+      | RequestBody::Attach { volume, .. }
+      | RequestBody::Resize { volume, .. }
+      | RequestBody::Destroy { volume }
+      | RequestBody::Status { volume }
+      | RequestBody::ReadBase { volume, .. }
+      | RequestBody::Digest { volume, .. }
+      | RequestBody::Rewitness { volume, .. }
+      | RequestBody::Pin { volume, .. }
+      | RequestBody::AwaitPlaced { volume, .. }
+      | RequestBody::Read { volume, .. }
+      | RequestBody::ReadRange { volume, .. }
+      | RequestBody::ReadWindow { volume, .. }
+      | RequestBody::ReadDir { volume, .. }
+      | RequestBody::StageBegin { work: volume, .. }
+      | RequestBody::StagePut { work: volume, .. }
+      | RequestBody::EditStaged { work: volume, .. }
+      | RequestBody::FsWrite { volume, .. }
+      | RequestBody::FsWriteStaged { volume, .. }
+      | RequestBody::FsRemove { volume, .. }
+      | RequestBody::FsRename { volume, .. }
+      | RequestBody::FsMkdir { volume, .. }
+      | RequestBody::Land { volume, .. } => Some(*volume),
+      // A green over a base is born on the base volume's owner shard, where the snapshot is walked.
+      RequestBody::CreateGreen { base, .. } => base.map(|b| b.volume),
+      RequestBody::Create { .. }
+      | RequestBody::Advance { .. }
+      | RequestBody::Detach { .. }
+      | RequestBody::BindMount { .. }
+      | RequestBody::List
+      | RequestBody::DaemonStatus
+      | RequestBody::DaemonStatusNext { .. }
+      | RequestBody::Bootstrap { .. }
+      | RequestBody::RecoveryPlan { .. }
+      | RequestBody::Recover { .. }
+      | RequestBody::PromoteRegion { .. }
+      | RequestBody::Grants
+      | RequestBody::Audit { .. }
+      | RequestBody::Acknowledge { .. }
+      | RequestBody::Telemetry { .. }
+      | RequestBody::Grant { .. }
+      | RequestBody::Enroll { .. }
+      | RequestBody::Attest { .. }
+      | RequestBody::Revoke { .. } => None,
+      RequestBody::Share { volume, .. } => Some(*volume),
+    }
+  }
+
+  /// Whether a verb changes the set of volumes or a volume's roots, so the owner shard must republish its recovery
+  /// image (§4.8). Data-plane content writes go through the mount transport, not here.
+  pub fn mutates_shard_image(&self) -> bool {
+    matches!(
+      self,
+      RequestBody::Create { .. }
+        | RequestBody::CreateGreen { .. }
+        | RequestBody::CreateWork { .. }
+        | RequestBody::Edit { .. }
+        | RequestBody::EditStaged { .. }
+        | RequestBody::Declare { .. }
+        | RequestBody::Submit { .. }
+        | RequestBody::Rebase { .. }
+        | RequestBody::Clone { .. }
+        | RequestBody::Resize { .. }
+        | RequestBody::Destroy { .. }
+        | RequestBody::Snapshot { .. }
+        | RequestBody::DestroySnapshot { .. }
+        | RequestBody::Share { .. }
+        | RequestBody::Enroll { .. }
+        | RequestBody::Revoke { .. }
+        | RequestBody::FsWrite { .. }
+        | RequestBody::FsWriteStaged { .. }
+        | RequestBody::FsRemove { .. }
+        | RequestBody::FsRename { .. }
+        | RequestBody::FsMkdir { .. }
+    )
+  }
+
+  /// Whether a verb is a **read** a node forwards to a volume's owner without a completion record: a volume-scoped
+  /// query that mutates nothing, so re-serving a retried forward is idempotent (§4.8 "Lookup"). A staging verb
+  /// forwards the same way: a retried put of bytes already written is answered unchanged, and a retried begin only
+  /// strands a charged buffer that expires within a lease.
+  pub fn forwards_as_read(&self) -> bool {
+    matches!(
+      self,
+      RequestBody::Status { .. }
+        | RequestBody::Versions { .. }
+        | RequestBody::ChangedSince { .. }
+        | RequestBody::Read { .. }
+        | RequestBody::ReadRange { .. }
+        | RequestBody::ReadWindow { .. }
+        | RequestBody::ReadDir { .. }
+        | RequestBody::StageBegin { .. }
+        | RequestBody::StagePut { .. }
+    )
+  }
+
+  /// Whether a verb is a **write** to an existing volume a node forwards to that volume's owner under a completion
+  /// record (§4.8 "Lookup"): a volume-scoped mutation ([`Self::volume`] names the volume, [`Self::mutates_shard_image`]
+  /// changes it).
+  pub fn forwards_as_write(&self) -> bool {
+    self.volume().is_some() && self.mutates_shard_image()
+  }
+
+  /// Whether a node may forward this verb to another node, so its reply can take a location round and a forward
+  /// across the fleet, each bounded by the daemon (§4.8 "Lookup"): longer than a client's reply deadline, while the
+  /// daemon always answers. The client waits for such a verb while its daemon lives (`slates_client::defers_reply`).
+  pub fn may_be_forwarded(&self) -> bool {
+    self.forwards_as_read() || self.forwards_as_write()
+  }
 }
 
 /// One record session to a peer, as this node last saw it (§4.8; condition 7's evidence): the sender's congestion

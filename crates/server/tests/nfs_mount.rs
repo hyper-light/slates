@@ -185,6 +185,65 @@ fn the_daemon_serves_a_provisioned_volume_over_nfs() {
   drop(daemon);
 }
 
+/// §4.14: status counts the NFS calls each shard served, by procedure (`ShardReport::nfs_calls`), so the round trips
+/// a client operation cost are read from the daemon, not from a machine-wide client counter. Do: mount a volume
+/// through the protocol, create a file and write it once. Expect: the daemon's status counts one CREATE and one
+/// WRITE more than before, in their procedure slots.
+#[test]
+fn status_counts_the_nfs_calls_each_procedure_served() {
+  let (daemon, instance) = single_shard_daemon("calls");
+  let mut client = Client::connect(&instance);
+  let ReplyBody::Created { .. } = client.call(&scratch("counted")) else {
+    panic!("the volume was not created");
+  };
+  // The product's client, which reassembles the paged status report.
+  let deadlines = slates_client::Deadlines::derive(
+    slates_server::daemon::LIVENESS_BUDGET_NS,
+    slates_db::replay::RECOVERY_BUDGET_NS,
+  )
+  .get();
+  let mut reporter = slates_client::Client::connect(&instance, deadlines).unwrap();
+  let mut calls = || {
+    let report = reporter
+      .daemon_status()
+      .expect("the daemon reports its status");
+    report
+      .shards
+      .iter()
+      .fold(vec![0_u64; 22], |mut sum, shard| {
+        for (total, count) in sum.iter_mut().zip(&shard.nfs_calls) {
+          *total = total.saturating_add(*count);
+        }
+        sum
+      })
+  };
+  let port = daemon.nfs_port().expect("the daemon is serving NFS");
+  let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+  let root = mount(&mut stream, &capability_path(&daemon, "counted"), 1);
+  let before = calls();
+  let file = create(&mut stream, &root, "f", 2);
+  write(&mut stream, &file, b"counted\n", 3);
+  let after = calls();
+  daemon.stop();
+  let delta = |procedure: usize| {
+    after
+      .get(procedure)
+      .zip(before.get(procedure))
+      .map(|(a, b)| a.saturating_sub(*b))
+  };
+  // RFC 1813 §3: CREATE is procedure 8, WRITE 7.
+  assert_eq!(
+    delta(8),
+    Some(1),
+    "one CREATE counted: before {before:?}, after {after:?}"
+  );
+  assert_eq!(
+    delta(7),
+    Some(1),
+    "one WRITE counted: before {before:?}, after {after:?}"
+  );
+}
+
 /// AC (§4.2 "admission stops under pressure"; admission.md §5.5; GAP-A9-1): a memory-pressure hold on
 /// the shard's byte budget refuses a **new** admission while an **admitted** volume's within-entitlement
 /// writes still land. A bounded volume is created and a file written through its mount (its reservation

@@ -3455,3 +3455,84 @@ Measured and rejected on the way, each against the same `HEAD` (fetch medians wh
 The second candidate is the strongest on the jitter rows alone (5.4–6.5×), and is kept on record for a design that
 can tell a slow link's queue from jitter without giving those gains back. The landed one keeps 3.1–3.3× with a clean
 grid.
+
+### Mixed read-write tails on macOS's own NFS client, and a shard QoS class measured (condition 12; 2026-10-07)
+
+Command: `bash docs/wip/bench/mixed/mixed_mac.sh <release slates> <out dir> OPS LARGE_MIB`. It runs a release anchor
+with 4 shards, a 2 GiB bounded volume mounted through `slates mount` (NFSv3 loopback, `mount_nfs`, no sudo), and
+`mixed.py` in one shared directory at 1, 4 and 16 workers. Each worker's operations are weighted: create (open,
+write 4 KiB, close) 30, overwrite 15, append 10, read 25, stat 10, rename 5, unlink 5. Then a large file is written
+sequentially, fsynced and read back by checksum. The scratch APFS directory, which is on disk, is the reference. The
+mount is always removed before the anchor stops (`macos-nfs-kill-test-panics-the-mac`). Apple M5 Max. **Load average
+57 to 77 from other sessions throughout**: this is the busy machine, not a quiet baseline. Every byte read back was
+identical.
+
+One run at 400 operations a worker, load 67 to 74:
+
+| workers | op | slates p50 | slates p99 | APFS p50 | APFS p99 |
+|---|---|---|---|---|---|
+| 1 | create | 4.1 ms | 137.7 ms | 64 µs | 3.6 ms |
+| 1 | read | 73 µs | 2.8 ms | 21 µs | 77 µs |
+| 1 | unlink | 1.3 ms | 108.8 ms | 35 µs | 50 µs |
+| 16 | create | 30.8 ms | 456.2 ms | 265 µs | 54.2 ms |
+| 16 | read | 398 µs | 28.3 ms | 44 µs | 24.5 ms |
+| 16 | unlink | 41.5 ms | 557.8 ms | 98 µs | 31.2 ms |
+
+Large file (64 MiB): slates 199–243 MiB/s write, 475–1,613 MiB/s read; APFS 545–1,489 MiB/s write.
+
+- The daemon itself served each call in 3 µs at p50 and 53 µs at p99 (`nfs.local_p*_ns`) over the whole run. Nearly
+  all of the client's time is outside the daemon's service: the macOS NFS client, the loopback socket, and each of the
+  several cross-process hops an operation makes waiting for a core at load 70. The server sets `TCP_NODELAY` on every
+  accepted connection (`slates-rt` `tcp.rs`).
+- **RPCs per create, counted by the daemon.** Status now reports each shard's NFS calls by procedure
+  (`ShardReport::nfs_calls`). Run with `bash docs/wip/bench/mixed/rpc_per_op.sh <slates> <out> 200`, at load 86:
+  - 14.04 RPCs per create (open `O_CREAT`, write 4 KiB, close): getattr 5.03, lookup 2.0, create 2.0, write 2.0,
+    commit 2.0, setattr 1.0;
+  - p50 16.1 ms and p99 52.5 ms per create.
+  - **Half of it is a file nobody asked for.** macOS attaches `com.apple.provenance` to every new file, and NFSv3
+    carries no extended attributes, so the macOS client writes them into an AppleDouble sidecar (`._name`), which it
+    hides from its own listing. That second file costs its own lookup, create, write and commit, so every create
+    through the macOS v3 mount is two. Shown by `docs/wip/bench/mixed` (`xattr -l` on the new file names
+    `com.apple.provenance`).
+  - The levers sit on the client's side of the protocol: NFSv4 named attributes (macOS's v4.0 client supports them;
+    slates serves 4.1 and 4.2), or another macOS transport. Each is a design question, owed with its A/B.
+- **Each step's calls, cold attribute cache** (`bash docs/wip/bench/mixed/steps.sh <slates> <out>`, one shard):
+
+  | Step | Daemon-counted calls |
+  |---|---|
+  | stat | getattr 2 |
+  | open, read, close | getattr 2, access 1 |
+  | overwrite 4 KiB at 0 | getattr 4, read 1, write 1, commit 1 |
+  | create, close | getattr 4, setattr 1, lookup 2, create 2, write 1, commit 1 |
+  | create, write 4 KiB, close | getattr 5, setattr 1, lookup 2, create 2, write 2, commit 2 |
+  | unlink | getattr 3, lookup 3, access 1, remove 1 |
+
+  - The overwrite's read is the client filling a partial page: Apple Silicon's page is 16 KiB, and a 4 KiB write
+    covers a quarter of it.
+  - An empty create still writes and commits once: the sidecar's provenance attribute.
+  - **The getattrs are the client's, not a missing attribute.** CREATE returns the new file's attributes, and WRITE,
+    COMMIT and SETATTR each return the file's `wcc` with its attributes after. Every reply carries what the client
+    needs, so the getattrs are the macOS client's close-to-open revalidation at open and after the flush at close,
+    and no server change removes them. Over NFSv3 on macOS a create costs about 7 calls at least, and about 7 more
+    for the provenance sidecar.
+- Against Tectonic's published tails (150–200 ms writes, about 100 ms reads; FAST'21): at 16 writers under load 70,
+  slates' create and unlink p99 (456 and 558 ms) are worse, and its read p99 (28 ms) is better. The busy-host tail of
+  the macOS loopback path is open work for condition 12.
+
+**Measured, inconclusive: a `QOS_CLASS_USER_INITIATED` class on the shard threads.** One experiment binary, run with
+and without `SLATES_EXPERIMENT_QOS`, three interleaved rounds a side at 300 operations a worker, load 57 to 62. The
+experiment code was never committed. p50 and p99 in ms, round by round:
+
+| workers | op | default | `USER_INITIATED` |
+|---|---|---|---|
+| 1 | create p99 | 118 / 163 / 179 | 70 / 87 / 146 |
+| 1 | unlink p99 | 20 / 33 / 12 | 47 / 93 / 53 |
+| 4 | create p50 | 7.1 / 27.7 / 16.6 | 4.8 / 2.5 / 4.5 |
+| 4 | create p99 | 74 / 166 / 114 | 83 / 92 / 36 |
+| 4 | unlink p99 | 56 / 109 / 164 | 44 / 19 / 25 |
+| 16 | create p99 | 327 / 465 / 303 | 353 / 442 / 278 |
+| 16 | unlink p99 | 318 / 460 / 256 | 365 / 443 / 266 |
+
+Four writers improve clearly. One writer improves on creates and worsens on unlinks, and sixteen are even. A mixed
+A/B does not land. The class also moves work onto performance cores, which costs battery, and it outranks other
+processes. Owed: more rounds, a quiet-machine arm, and the energy cost (`powermetrics`) before any decision.

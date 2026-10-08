@@ -1490,8 +1490,12 @@ async fn serve_peer_records(
             ROOT_FETCH_STREAM => {
               state::with_state(|s| serve_root_fetch(s, &request)).unwrap_or_default()
             }
-            FORWARD_STREAM => verbs::serve_forward(control, peer_anchor, &request).await,
+            FORWARD_STREAM => {
+              injected_serve_delay().await;
+              verbs::serve_forward(control, peer_anchor, &request).await
+            }
             crate::owner_location::STREAM => {
+              injected_serve_delay().await;
               state::with_state(
                 |state| match crate::owner_location::serve(state, &request) {
                   Ok((reply, declined)) => {
@@ -3029,12 +3033,14 @@ async fn fetch_into_hold(
         let placed = slates_cluster::content::Placed {
           sequence: s.placed_heads.get(&object).map_or(0, |head| head.sequence),
         };
-        s.held_content.stage_fetched(
-          &mut crate::content_holder::hold_space(&mut s.store),
-          object,
-          placed,
-          found,
-        )
+        past_the_pressure_hold(s, |s| {
+          s.held_content.stage_fetched(
+            &mut crate::content_holder::hold_space(&mut s.store),
+            object,
+            placed,
+            found,
+          )
+        })
       });
       match staged {
         Some(Ok(None)) => {
@@ -3050,14 +3056,15 @@ async fn fetch_into_hold(
     },
     |chunk| {
       state::with_state(|s| {
-        s.held_content
-          .stage_piece(
+        past_the_pressure_hold(s, |s| {
+          s.held_content.stage_piece(
             &mut crate::content_holder::hold_space(&mut s.store),
             object,
             &manifest,
             chunk,
           )
-          .is_ok()
+        })
+        .is_ok()
       })
       .unwrap_or(false)
     },
@@ -3080,6 +3087,7 @@ async fn fetch_into_hold(
   });
   if stage_refused {
     count_refusal(MATERIALIZE_REFUSED);
+    count_refusal(FETCH_STAGE_REFUSED);
     return false;
   }
   if already_whole {
@@ -3091,9 +3099,11 @@ async fn fetch_into_hold(
     return false;
   }
   let completed = state::with_state(|s| {
-    s.held_content
-      .complete_stage(&mut crate::content_holder::hold_space(&mut s.store), object)
-      .is_ok()
+    past_the_pressure_hold(s, |s| {
+      s.held_content
+        .complete_stage(&mut crate::content_holder::hold_space(&mut s.store), object)
+    })
+    .is_ok()
   })
   .unwrap_or(false);
   if !completed {
@@ -3106,6 +3116,9 @@ async fn fetch_into_hold(
 /// every one out on loan); it is asked again next period.
 /// Format: a counter name in the daemon's status report.
 const FETCH_NO_HOLDER_SESSION: &str = "fleet.fetch.no_holder_session";
+/// Counter: a takeover fetch's manifest could not be staged in the hold (no capacity, or a refused stage).
+/// Format: a counter name in the daemon's status report.
+const FETCH_STAGE_REFUSED: &str = "fleet.fetch.stage_refused";
 /// Counter: a takeover fetch ended its period without the whole content; what it fetched stays staged.
 /// Format: a counter name in the daemon's status report.
 const FETCH_INCOMPLETE: &str = "fleet.fetch.incomplete";
@@ -3247,7 +3260,9 @@ async fn materialize_pending_greens(origin: u16) {
       origin,
       target,
       move |s| {
-        let served = verbs::materialize_taken_over_green(s, id, recovery).is_ok();
+        let served =
+          past_the_pressure_hold(s, |s| verbs::materialize_taken_over_green(s, id, recovery))
+            .is_ok();
         if served {
           s.placed_heads.insert(object, placed);
         }
@@ -3264,6 +3279,41 @@ async fn materialize_pending_greens(origin: u16) {
       }
     });
   }
+}
+
+/// Waits out a test's injected serve delay (`Daemon::inject_serve_delay`) before a location answer or a forwarded
+/// verb; nothing in production. A sleep the runtime could not time is counted and the answer goes at once.
+async fn injected_serve_delay() {
+  let Some(delay_ns) = state::with_state(|s| s.injected_serve_delay_ns).flatten() else {
+    return;
+  };
+  if slates_rt::futures::sleep(delay_ns).await.is_err() {
+    count_refusal(SERVE_DELAY_UNTIMED);
+  }
+}
+
+/// Counter: a test's injected serve delay the runtime could not time; the answer went at once.
+/// Format: a counter name in the daemon's status report.
+const SERVE_DELAY_UNTIMED: &str = "fleet.serve_delay_untimed";
+
+/// Runs `recovery` on this shard with the memory-pressure hold lifted for exactly its duration, then sets the hold
+/// back. A takeover's materialization (its fetch's staging, the restore, the volume's reservations and the writes
+/// that populate it) moves a claim the fleet already admitted and committed to its successor: admission.md §5.5 keeps
+/// the hold off every committed claim ("it shrinks admittable only, never revoking a committed claim"), and §4e
+/// admits a recovered claim ahead of any new one, which boot recovery gets because its hold starts at zero. Before
+/// 2026-10-07 the takeover was refused like a new volume, so under host pressure a successor adopted the head and
+/// never served it (a fleet test: 3,913 refusals, the volume unavailable until the pressure lifted). Capacity and the
+/// operation headroom still bound it. Exact because a shard runs one task at a time and `recovery` is synchronous:
+/// no other admission can run while the hold is lifted, and the pressure refresh is itself a message to this shard.
+fn past_the_pressure_hold<T>(
+  state: &mut ShardState,
+  recovery: impl FnOnce(&mut ShardState) -> T,
+) -> T {
+  let hold = state.store.budget.hold();
+  state.store.budget.set_hold(0);
+  let recovered = recovery(state);
+  state.store.budget.set_hold(hold);
+  recovered
 }
 
 /// Counter: a taken-over volume's materialization waited a period for its content, which this node does not hold
@@ -3388,8 +3438,10 @@ async fn materialize(origin: u16, object: ObjectId, head: HeadValue) {
         s.count(ENVELOPE_UNOPENED, 1);
         return Err(ENVELOPE_UNOPENED);
       };
-      verbs::materialize_taken_over(s, id, &taken, region, &archive)
-        .map_err(|refusal| materialize_refusal_counter(&refusal))?;
+      past_the_pressure_hold(s, |s| {
+        verbs::materialize_taken_over(s, id, &taken, region, &archive)
+      })
+      .map_err(|refusal| materialize_refusal_counter(&refusal))?;
       // The owner shard now owns the head's and the catalog's placements — its record plane writes the
       // object's next records at the promotion epoch and ships only to holders still missing these.
       s.placed_heads.insert(object, placed);

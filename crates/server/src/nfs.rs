@@ -1205,6 +1205,13 @@ async fn serve_v3(
   let elapsed = slates_machine::clock::monotonic_ns().saturating_sub(started);
   let on_cpu = thread_cpu_ns().saturating_sub(started_cpu);
   let _ = state::with_state_counted(|s| {
+    if program == NFS_PROGRAM
+      && let Some(calls) = usize::try_from(procedure)
+        .ok()
+        .and_then(|procedure| s.nfs_service.calls.get_mut(procedure))
+    {
+      *calls = calls.saturating_add(1);
+    }
     if forwarded {
       s.nfs_service.forwarded.record(elapsed);
     } else {
@@ -1315,7 +1322,14 @@ pub struct ServiceTimes {
   /// Of each local call, the wall time the shard's thread spent off a core (its wall time less its CPU time): a
   /// synchronous serve never waits, so this is the operating system's preemption, not the serve's work.
   pub local_off_cpu: crate::histogram::DurationHistogram,
+  /// Calls served, by NFSv3 procedure number (an NFSv4 compound counts each operation's v3 call): how many round
+  /// trips each client operation cost, which a client's own counters cannot say on a shared machine (`nfsstat` is
+  /// machine-wide). Reported per shard (`ShardReport::nfs_calls`).
+  pub calls: [u64; V3_PROCEDURES],
 }
+
+/// Format: the NFSv3 procedures, numbered 0 (`NULL`) to 21 (`COMMIT`), RFC 1813 §3.
+pub const V3_PROCEDURES: usize = 22;
 
 /// What [`ServiceTimes`] measured, summed over a daemon's shards (`Daemon::nfs_service_times`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

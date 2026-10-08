@@ -69,23 +69,26 @@ impl Deadlines {
 }
 
 /// Whether the daemon defers `body`'s reply until long work ends — a granted landing, which runs in slices for
-/// as long as its tree takes; a FUSE mount, which waits on the OS's mount helper; and a page of a file, which may be
-/// forwarded to its owner across a WAN under a deadline the daemon derives from the measured path — so a caller
-/// waits for it while the daemon lives rather than for one reply deadline.
+/// as long as its tree takes; a FUSE mount, which waits on the OS's mount helper; and any verb the daemon may forward
+/// to its volume's owner across the fleet (`RequestBody::may_be_forwarded`), under a location round and a forward
+/// the daemon bounds by the measured path — so a caller waits for it while the daemon lives rather than for one reply
+/// deadline.
 pub fn defers_reply(body: &RequestBody) -> bool {
-  matches!(
-    body,
-    // A page of a file may be forwarded to its owner on another node, across a WAN; the daemon bounds that forward
-    // by the measured path and always answers, so the client waits for it while its daemon lives.
-    RequestBody::ReadRange { .. }
-      | RequestBody::Land { grant: Some(_), .. }
-      | RequestBody::Attach {
-        form: AttachRequest::FuseMount { .. }
-          | AttachRequest::ScopedFuseMount { .. }
-          | AttachRequest::SharedFuseMount { .. },
-        ..
-      }
-  )
+  // A verb the daemon may forward to its volume's owner on another node, across a WAN: the daemon bounds the location
+  // round and the forward by the measured path and always answers, so the client waits for it while its daemon lives.
+  // Before 2026-10-07 only a page read did; a forwarded write whose round and forward each stayed within their bound
+  // was reported `Stalled` at one liveness budget (`a_forward_answered_within_its_bounds_is_never_reported_stalled`).
+  body.may_be_forwarded()
+    || matches!(
+      body,
+      RequestBody::Land { grant: Some(_), .. }
+        | RequestBody::Attach {
+          form: AttachRequest::FuseMount { .. }
+            | AttachRequest::ScopedFuseMount { .. }
+            | AttachRequest::SharedFuseMount { .. },
+          ..
+        }
+    )
 }
 
 /// Derived: the last sequence a client issues. Sequences run from 1 up to here and never wrap: a wrapped
@@ -978,6 +981,13 @@ impl Client {
   pub fn resend(&mut self, word: u64, body: &RequestBody) -> Result<bool, ClientError> {
     self.bind_without_waiting()?;
     self.try_send(RequestId::from_word(word), body)
+  }
+
+  /// Whether the in-flight request `word` is one whose reply the daemon may defer past one reply deadline
+  /// ([`defers_reply`]): what the async driver waits for while the daemon lives, as the synchronous call does, so a
+  /// forwarded verb is never reported `Stalled` on one path and waited for on the other.
+  pub fn defers(&self, word: u64) -> bool {
+    self.awaited.get(&word).is_some_and(defers_reply)
   }
 
   /// [`Self::resend`] for an outstanding call, with the body it was begun with; `Ok(true)` too for a word no
