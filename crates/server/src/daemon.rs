@@ -4251,6 +4251,51 @@ mod tests {
     );
   }
 
+  /// §4.8 Lookup, takeover: a node that adopted a volume's head owns it before its owner shard has materialized it.
+  /// Its own client's verb is then refused with the owner shard's retryable `Overloaded`, counted, and never with
+  /// `HomedElsewhere`, which names another region (three fleet tests, 2026-10-07, refused a successor's own client so
+  /// for a whole wait). Do: route a volume created by another host to this node, as an adoption does, and ask the
+  /// forward's first question. Expect: `Overloaded`, and the counter moved. Do: route one to its creator. Expect: no
+  /// refusal from this rule (the location round finds the owner).
+  #[test]
+  fn a_successor_refuses_its_unmaterialized_volume_as_retryable_not_homed_elsewhere() {
+    use slates_db::register::{HostId, ObjectId};
+    let (adopted, elsewhere, counted) = audit_on_shard(|state| {
+      let local = state.fleet.host();
+      let adopted = ObjectId::new(HostId(local.0 ^ 1), 1);
+      let elsewhere = ObjectId::new(HostId(local.0 ^ 1), 2);
+      state.fleet.track_object_owner(adopted, local);
+      state
+        .fleet
+        .track_object_owner(elsewhere, HostId(local.0 ^ 1));
+      let adopted_refusal = crate::verbs::owned_unmaterialized(
+        state,
+        slates_ipc::protocol::VolumeId { bytes: adopted.0 },
+      );
+      let elsewhere_refusal = crate::verbs::owned_unmaterialized(
+        state,
+        slates_ipc::protocol::VolumeId { bytes: elsewhere.0 },
+      );
+      let counted = state
+        .refusals
+        .get("fleet.owner_location.owned_unmaterialized")
+        .copied();
+      (adopted_refusal, elsewhere_refusal, counted)
+    });
+    assert!(
+      matches!(
+        adopted,
+        Some(slates_ipc::protocol::Refusal::Overloaded { .. })
+      ),
+      "an owned, unmaterialized volume is refused retryably: {adopted:?}"
+    );
+    assert_eq!(
+      elsewhere, None,
+      "another host's volume is located, not refused here"
+    );
+    assert_eq!(counted, Some(1), "the refusal is counted once");
+  }
+
   /// §4.8 learner fetch (D-14): a voter with nothing newer answers a caught-up fetch with no bytes
   /// (`serve_fetch`). Folding that reply adopts nothing and refuses nothing. The Linux io_uring loop's runs 125
   /// and 147 of 150 (2026-09-29) failed formation on one such reply arriving after its round: the late fold

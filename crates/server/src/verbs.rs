@@ -1461,6 +1461,18 @@ async fn resolve_and_forward(
   cached: Option<crate::owner_location::CachedRoute>,
   requests: Vec<Vec<u8>>,
 ) -> (OwnerReplies, Option<crate::owner_location::CachedRoute>) {
+  if let Some(refusal) =
+    crate::state::with_state(|state| owned_unmaterialized(state, volume)).flatten()
+  {
+    return (
+      OwnerReplies {
+        first: refused(refusal),
+        later: Vec::new(),
+        rate: 0,
+      },
+      None,
+    );
+  }
   let resolved = crate::state::with_state_counted(|state| {
     let query = crate::owner_location::Query::new(state, ObjectId(volume.bytes), region);
     if let Some(dropped) = cached.and_then(|route| query.reuses(state, route)) {
@@ -1565,6 +1577,28 @@ fn route_after(
     });
   }
   None
+}
+
+/// The refusal for a verb on a volume this node owns but has not materialized yet, asked on the control shard where
+/// the routing lives: the routing names this node the owner (it adopted the head in a takeover), yet the verb is being
+/// forwarded, so the owner shard's catalog does not hold the volume. A location round can never answer that, since it
+/// asks the peers and never this node, and it refused `HomedElsewhere`, which names another region and is false
+/// (three fleet tests, 2026-10-07: a successor's own client refused so for a whole wait). The truthful answer is the
+/// owner shard's retryable `Overloaded`, the refusal a forwarded write already gives while its acceptance still waits
+/// on its owner ([`await_deferred_completion`]), counted (`fleet.owner_location.owned_unmaterialized`) beside the
+/// materialization's own refusals (`fleet.materialize.*`). `None` when another host owns the volume, or none is known.
+pub(crate) fn owned_unmaterialized(state: &mut ShardState, volume: VolumeId) -> Option<Refusal> {
+  let local = state.fleet.host();
+  if state.fleet.object_owner(ObjectId(volume.bytes)) != Some(local) {
+    return None;
+  }
+  let shard = state
+    .shards
+    .get(usize::from(owner_of(volume)))
+    .copied()
+    .unwrap_or(state.shard);
+  state.count("fleet.owner_location.owned_unmaterialized", 1);
+  Some(Refusal::Overloaded { shard })
 }
 
 /// What an owner answered a forward: the reply to its first request, the decoded replies to the rest of a batch

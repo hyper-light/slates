@@ -5412,13 +5412,28 @@ fn assert_successor_serves(client: &mut Client, successor_daemon: &Daemon, volum
   let mut last = ReplyBody::Refused {
     refusal: Refusal::NotFound,
   };
+  let mut homed_elsewhere = 0_u32;
   let served = audit_wait(|| {
     last = client.call(&RequestBody::Status { volume });
+    if matches!(
+      last,
+      ReplyBody::Refused {
+        refusal: Refusal::HomedElsewhere { .. }
+      }
+    ) {
+      homed_elsewhere = homed_elsewhere.saturating_add(1);
+    }
     Ok(matches!(last, ReplyBody::Status { .. }))
   });
   let counters = successor_daemon
     .fleet_refusals()
     .map(|counters| takeover_counters(&counters));
+  // The successor owns the volume from its adoption: while it materializes, it refuses its own client retryably,
+  // never `HomedElsewhere`, which names another region (before 2026-10-07 that was the answer in this window).
+  assert_eq!(
+    homed_elsewhere, 0,
+    "the successor never sends its own client elsewhere: last {last:?}; its counters {counters:?}"
+  );
   assert!(
     served,
     "the successor serves the volume it adopted to its own client: last {last:?}; its counters {counters:?}; \
@@ -5915,6 +5930,12 @@ fn an_indirect_probe_through_a_relay_keeps_a_peer_the_direct_path_lost_and_losin
   let kept = a
     .fleet_members()
     .is_ok_and(|members| members.contains(&host_b));
+  // How many of A's periods B lasted, and both planes' whole counts: a failed hold then says whether relay requests
+  // were refused or queued out (`refused_queue`, `view_full`) or answered and still not enough (2026-10-07: 1 in 8
+  // failed under extreme load on either detector snapshot, with only three of these counts on record).
+  let held_periods = a.fleet_progress().saturating_sub(start);
+  let plane_a = a.fleet_plane_counts();
+  let plane_c = c.fleet_plane_counts();
   let counts_a = a.fleet_plane_counts().unwrap_or_default();
   let acked_on_a = counts_a.indirect_acked;
   let requested_by_a = counts_a.relays_asked;
@@ -5943,7 +5964,8 @@ fn an_indirect_probe_through_a_relay_keeps_a_peer_the_direct_path_lost_and_losin
   assert!(
     held && kept,
     "B stayed a member of A's fleet for {INDIRECT_HOLD_PERIODS} of A's periods with A's direct path lost \
-     (acked={acked_on_a}, relayed={relayed_by_c}, requested={requested_by_a})"
+     (acked={acked_on_a}, relayed={relayed_by_c}, requested={requested_by_a}); it lasted {held_periods}; A's plane \
+     {plane_a:?}; C's plane {plane_c:?}"
   );
   assert!(
     retired,

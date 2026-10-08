@@ -47,11 +47,11 @@ const LEASE_OBSERVED_NS: u64 = 30_000_000_000;
 /// detection bound at this latency (hundreds of periods).
 const HORIZON_NS: u64 = 600_000_000_000;
 
-/// A fleet that believes and answers every member (but one it refuses to answer, as for a forged identity), announcing
-/// version 7 and standing 3.
+/// A fleet that believes and answers every member (but those it refuses to answer, as for a forged identity or a lost
+/// path), announcing version 7 and standing 3.
 #[derive(Default)]
 struct Believing {
-  refuses: Option<u64>,
+  refuses: Vec<u64>,
   /// The holders this member's owner lease is renewed with.
   holders: Vec<u64>,
 }
@@ -60,7 +60,7 @@ impl Fleet for Believing {
     7
   }
   fn answer(&mut self, prober: HostId, _: u64, _: u64) -> Option<(u64, Option<u64>)> {
-    (self.refuses != Some(prober.0)).then_some((7, Some(3)))
+    (!self.refuses.contains(&prober.0)).then_some((7, Some(3)))
   }
   fn admit(&mut self, _: HostId, _: u64) -> bool {
     true
@@ -556,7 +556,7 @@ fn a_message_claiming_another_sender_is_refused_and_counted() {
 #[test]
 fn a_probe_the_fleet_refuses_is_neither_answered_nor_folded() {
   let mut fleet = Network::new();
-  fleet.fleets.get_mut(&1).unwrap().refuses = Some(2);
+  fleet.fleets.get_mut(&1).unwrap().refuses = vec![2];
   let heard_from_3 = fleet.run_until(HORIZON_NS, |fleet| {
     fleet.events.get(&2).is_some_and(|events| {
       events
@@ -575,6 +575,41 @@ fn a_probe_the_fleet_refuses_is_neither_answered_nor_folded() {
   assert!(
     fleet.members[&1].counts().refused_by_fleet > 0,
     "member 1 counted its refusals"
+  );
+}
+
+/// §4.8 "direct probe → k indirect proxies" (SWIM, Das, Gupta & Motivala, DSN 2002 §3: the relay forwards the answer
+/// to the member that asked). Two members asking one relay about the same target are each answered. Do: run four
+/// members where member 2 answers neither member 1 nor member 4 directly, while member 3 reaches everyone, so 1 and 4
+/// both keep 2 only through member 3's relays, often at once. Expect: neither condemns member 2, and each was
+/// answered through a relay (`indirect_acked`, the non-vacuity count). Before 2026-10-07 the relay kept one relayed
+/// probe per target: a second request overwrote the first, the first asker was never answered, and it condemned a
+/// live member (memberlist registers one handler per relayed probe's sequence number, so concurrent asks stay apart).
+#[test]
+fn two_members_asking_one_relay_about_the_same_target_are_each_answered() {
+  let mut fleet = Network::sized(4, &[]);
+  fleet.fleets.get_mut(&2).unwrap().refuses = vec![1, 4];
+  let observed_ns = LEASE_OBSERVED_NS;
+  fleet.run_until(observed_ns, |_| false);
+  let condemned_by_askers: Vec<_> = fleet
+    .condemned
+    .iter()
+    .filter(|(member, condemned)| *condemned == 2 && (*member == 1 || *member == 4))
+    .collect();
+  print_evidence(&fleet);
+  assert!(
+    condemned_by_askers.is_empty(),
+    "no asker condemned the member a relay still reaches: {condemned_by_askers:?}; relay counts 1 {:?}, 3 {:?}, 4 {:?}",
+    fleet.members[&1].counts(),
+    fleet.members[&3].counts(),
+    fleet.members[&4].counts()
+  );
+  assert!(fleet.members[&3].counts().relayed > 0, "member 3 relayed");
+  assert!(
+    fleet.members[&1].counts().indirect_acked > 0 && fleet.members[&4].counts().indirect_acked > 0,
+    "both askers were answered through a relay: 1 {:?}, 4 {:?}",
+    fleet.members[&1].counts(),
+    fleet.members[&4].counts()
   );
 }
 

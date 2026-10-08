@@ -4473,3 +4473,53 @@ and says which of its two write pairs failed.
   other processes on this shared machine shrinks every shard's admittable bytes, and the restore is refused
   `BudgetExceeded`. Separately, a node that owns an object it has not yet materialized answers its own client
   `HomedElsewhere`, because its location round never asks itself. That refusal is wrong whatever the cause.
+- **Fixed the same day:** that verb is now refused with the owner shard's retryable `Overloaded`, and counted
+  (`fleet.owner_location.owned_unmaterialized`; design §4.8 "Lookup", status of this date). The fleet tests'
+  successor-serves check fails 2 of 2 with the old answer and passes 6 of 6. The materialization stall itself stays
+  open until its refusal kind is read: 6 sequential and 4 concurrent full suites since its counter landed did not
+  reproduce it.
+
+**Open (2026-10-07): `an_indirect_probe_through_a_relay_keeps_a_peer_the_direct_path_lost_and_losing_both_paths_retires_it`
+fails under extreme load, on either detector snapshot.**
+- It first failed in a pair of concurrent full fleet suites run right after the hyper-swim re-vendor (`40c502fe`).
+- Alone, at 8 concurrent copies: 21 of 24 passed. Every failure was the hold: A retired B within 100 of its periods
+  although it had credited relayed answers (acked 16–31).
+- An interleaved A/B, 4 copies of each snapshot at once over 4 rounds (load average up to 86, with other sessions'
+  work on the machine):
+
+  | Snapshot | Passed | Failed at the hold | Failed at the retire |
+  |---|---|---|---|
+  | `f9a2c8e` (before the re-vendor) | 14 of 16 | 1 | 1 |
+  | `41761ff` | 13 of 16 | 1 | 2 |
+
+  The failures are the same two in both arms, at the same rate, so the re-vendor did not cause them.
+- Two robustness gaps under load, both owed:
+  - a relayed answer that A credited did not keep B;
+  - a peer silent on every path was not retired within `RETIREMENT_DEADLINE`.
+- **Found and fixed the same day: a relay answered only the last member that asked it about a target**
+  (`docs/bugs/2026-10-07-a-relay-answered-only-the-last-asker-about-a-target.md`). A deterministic four-member
+  simulation lost 161 of 2,796 relayed answers in 30 s and condemned a live member; after the fix, no asker condemns
+  it.
+- The server test at 8 concurrent copies, load 58–79:
+
+  | Run | Passed | Hold failures | Retire failures | Wake-probe timeouts |
+  |---|---|---|---|---|
+  | Before the fix | 17 of 24 | 3 | 0 | 4 |
+  | After the fix | 22 of 24 | 0 | 1 | 1 |
+
+  Hold failures fell from 3 to 0, consistent with the simulated mechanism, though not conclusive at n=24.
+- **Still open under load:**
+  - a peer silent on every path was not retired by both survivors within `RETIREMENT_DEADLINE`;
+  - the harness's machine profile timed out measuring the wake probe (`MeasurementTimeout { probe: "wake" }`) before
+    the daemons started.
+- The retire failure needs a failing run's evidence before diagnosis.
+- The wake-probe timeout is the tests' budget, not a boot failure:
+  - the tests measure with 5 ms per probe (`tests/common` `PROBE_MS`), so 1 ms per round, and the doubling rounds
+    add at most 62 ms (`slates-machine` `wake`);
+  - a daemon's boot measures with 250 ms per probe (`PROBE_WALL_BUDGET`), so 50 ms per round and up to about 3.1 s
+    more;
+  - at load 60–80 a fresh waiter can take tens of milliseconds to be scheduled, so 16 samples do not fit in the
+    tests' budget.
+
+  Owed: decide whether the tests' profile takes the boot's budget (paid once per test process) or the probe's
+  backoff grows until its sample floor within a derived wall bound. Busy CI runners would hit the same timeout.

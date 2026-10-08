@@ -110,6 +110,49 @@ pub enum PlaneEvent {
   },
 }
 
+/// How many relayed probes about one target this node keeps for one asker: the probes of one peer an asker's detector
+/// may still be waiting on, which hyper-swim bounds at three (`detector.rs` `OUTSTANDING`: the probe that suspected
+/// the peer, the probe that told it, and the one more an extension can grant). An asker sends a relay request per
+/// unanswered probe, so a fourth request about one target means the asker reused its oldest probe's record, and that
+/// probe's answer can no longer be credited: it is the one dropped.
+/// Derived: hyper-swim's `OUTSTANDING` (3) at the vendored revision; imported in place of this copy once hyper-raft
+/// exports it (`docs/bugs/2026-10-07-a-relay-answered-only-the-last-asker-about-a-target.md`).
+const RELAYS_PER_ASKER: usize = 3;
+
+/// The probes this node relays about one target for one asker, oldest first: each relayed probe's nonce and the asker's
+/// nonce it answers.
+#[derive(Clone, Copy, Debug, Default)]
+struct RelayedProbes {
+  slots: [Option<(u64, u64)>; RELAYS_PER_ASKER],
+}
+
+impl RelayedProbes {
+  /// Keeps a relayed probe `relayed` answering the asker's `asked`, over the oldest when full.
+  fn record(&mut self, relayed: u64, asked: u64) {
+    if let Some(free) = self.slots.iter_mut().find(|slot| slot.is_none()) {
+      *free = Some((relayed, asked));
+      return;
+    }
+    self.slots.rotate_left(1);
+    if let Some(newest) = self.slots.last_mut() {
+      *newest = Some((relayed, asked));
+    }
+  }
+
+  /// The asker's nonce the relayed probe `relayed` answers, taken out, or `None` when it is not one of these.
+  fn take(&mut self, relayed: u64) -> Option<u64> {
+    let slot = self
+      .slots
+      .iter_mut()
+      .find(|slot| slot.is_some_and(|(nonce, _)| nonce == relayed))?;
+    slot.take().map(|(_, asked)| asked)
+  }
+
+  fn is_empty(&self) -> bool {
+    self.slots.iter().all(Option::is_none)
+  }
+}
+
 /// Why the plane refused, counted by kind.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PlaneCounts {
@@ -152,9 +195,12 @@ pub struct MemberPlane {
   batch: Vec<(hyper_swim::HostId, MemberState)>,
   encoded: Vec<u8>,
   requests: Vec<PingReq>,
-  /// Probes this node relays: by target, the relay's nonce, who asked and the asker's nonce. One a target, so bounded
-  /// by the view.
-  relaying: BTreeMap<u64, (u64, hyper_swim::HostId, u64)>,
+  /// Probes this node relays, by target and asker: each relayed probe's nonce and the asker's nonce, oldest first, at
+  /// most [`RELAYS_PER_ASKER`] per pair, so bounded by the view squared. Each relayed probe is answered to its own
+  /// asker (SWIM, Das, Gupta & Motivala, DSN 2002 §3), as memberlist keeps one handler per relayed probe's sequence
+  /// number. Keyed by target alone before 2026-10-07, a second request about one target overwrote the first, whose
+  /// asker was never answered and condemned a live member.
+  relaying: BTreeMap<(u64, u64), RelayedProbes>,
   /// This node's probes awaiting an answer: nonce, target and send time, oldest first, at most the view's bound.
   sent: VecDeque<(u64, u64, u64)>,
   sent_bound: usize,
@@ -296,7 +342,9 @@ impl MemberPlane {
   /// Forgets `peer`'s keys and pending messages (a retired member id).
   pub fn remove_peer(&mut self, peer: HostId) {
     self.plane.remove_peer(peer.0);
-    self.relaying.remove(&peer.0);
+    self
+      .relaying
+      .retain(|(target, asker), _| *target != peer.0 && *asker != peer.0);
     self.joined.remove(&peer.0);
   }
 
@@ -355,6 +403,23 @@ impl MemberPlane {
       self.sent.pop_front();
     }
     self.sent.push_back((nonce, to, sent_ns));
+  }
+
+  /// The asker and its nonce for this node's relayed probe `nonce` of `target`, taken out, or `None` when `nonce` was
+  /// not a probe this node relayed (it is then this node's own probe's answer).
+  fn take_relayed(&mut self, target: u64, nonce: u64) -> Option<(u64, u64)> {
+    let mut found = None;
+    for ((_, asker), probes) in self.relaying.range_mut((target, 0)..=(target, u64::MAX)) {
+      if let Some(asked) = probes.take(nonce) {
+        found = Some((*asker, asked, probes.is_empty()));
+        break;
+      }
+    }
+    let (asker, asked, emptied) = found?;
+    if emptied {
+      self.relaying.remove(&(target, asker));
+    }
+    Some((asker, asked))
   }
 
   /// The send time of this node's probe `nonce` to `to`, taken out.
@@ -552,12 +617,11 @@ impl MemberPlane {
         self
           .detector
           .learn_coordinate(hyper_swim::HostId(sender), coordinate);
-        match self.relaying.get(&sender) {
+        match self.take_relayed(sender, nonce) {
           // An answer to a probe this node relayed goes back to the member that asked.
-          Some(&(relayed, asker, asked)) if relayed == nonce => {
-            self.relaying.remove(&sender);
+          Some((asker, asked)) => {
             self.send(
-              asker.0,
+              asker,
               &SwimMessage::IndirectAck {
                 from: local,
                 target: hyper_swim::HostId(sender),
@@ -604,7 +668,9 @@ impl MemberPlane {
         self.counts.relayed = self.counts.relayed.saturating_add(1);
         self
           .relaying
-          .insert(target.0, (ping.nonce, hyper_swim::HostId(sender), nonce));
+          .entry((target.0, sender))
+          .or_default()
+          .record(ping.nonce, nonce);
         self.send(
           target.0,
           &SwimMessage::Ping {
