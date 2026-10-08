@@ -3623,3 +3623,38 @@ sessions the owner dialed. `302ea768` adds `served_sessions`. Sampled every ~6 s
   from the wrong connections.
 - **Next bound, owed:** reordering mistaken for loss. RACK widens its reordering window per spurious retransmission
   (RFC 8985 §6.2). Each candidate is A/B'd on `fetch_bench crossing` first, then on this crossing.
+
+### Measured-and-rejected: undoing Copa's loss reaction when its losses prove spurious (condition 7; 2026-10-08)
+
+The idea was RFC 4015's Eifel response, as Linux applies it on DSACK. In the competitive mode, Copa halves `1/δ` on a
+loss, at most once per round trip. The arm recorded `1/δ` before each halving and the packets declared lost behind
+it. It restored `1/δ` once every one of those packets had been acknowledged late (`reorder::on_acknowledged`'s
+spurious list). Unit-tested: restored after all losses proved spurious, kept behind any real loss. Counters:
+reactions and undone reactions.
+
+Command, both arms built in release at `7a8748c1` (HEAD in its own worktree and target directory; the arm on top),
+run back to back on this Mac (Apple M5 Max, 2026-10-08):
+`FETCH_BENCH_SEED=$n fetch_bench crossing` for n = 1..8, the default 64 chunks (4 MiB), one reader, one holder.
+
+| Seed | HEAD (ms) | Undo arm (ms) | Reactions undone / taken |
+|---|---|---|---|
+| 1 | 16,576 | 16,576 | 0 / 4 |
+| 2 | 21,013 | 21,013 | 1 / 19 |
+| 3 | 32,431 | 29,546 | 5 / 32 |
+| 4 | 18,549 | 22,230 | 4 / 30 |
+| 5 | 15,010 | 20,206 | 8 / 34 |
+| 6 | 22,647 | 22,647 | 2 / 19 |
+| 7 | 16,577 | 18,385 | 4 / 23 |
+| 8 | 22,632 | 21,808 | 4 / 22 |
+
+The mean was 20.7 s on HEAD and 21.6 s with the arm: worse in three seeds, better in two, equal in three. Rejected;
+the code was removed, not kept behind a switch.
+
+What it showed:
+- **The competitive mode does engage on the crossing** (4–34 loss reactions per 4 MiB read). The ±40 ms reordering
+  keeps the queue from ever looking empty.
+- **Most reactions follow a real loss.** With 3% real loss each way, only 0–8 of 4–34 had every loss behind them prove
+  spurious. So the spurious losses are not what holds the window through `1/δ`.
+- The window's remaining suspect is Copa's delay signal itself: reordering jitter read as queueing delay
+  (`RTTstanding − RTTmin`) shrinks the target rate whether or not any loss is declared. That is the next candidate,
+  A/B'd the same way.
