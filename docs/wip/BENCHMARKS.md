@@ -3456,6 +3456,34 @@ The second candidate is the strongest on the jitter rows alone (5.4–6.5×), an
 can tell a slow link's queue from jitter without giving those gains back. The landed one keeps 3.1–3.3× with a clean
 grid.
 
+### Landed: a settled roster's discovery checks back off to the membership horizon (battery; 2026-10-08)
+
+An idle fleet node sent one discovery exchange to every peer every heartbeat (`GAPS.md`, same day). A record link now
+doubles the wait between pages while its sweep stays complete at one roster generation, from one heartbeat up to the
+membership horizon (`lease::horizon_ns`, 900 ms: the longest the detector takes to declare a death). So a roster
+change is learned no later than a death would be. Any change, new session or sweep under way returns to one
+heartbeat (`fleet::next_discovery_wait`). The non-vacuity counter is `fleet.discovery.pages`.
+
+**Commands:**
+- the two-network Docker topology (`docs/wip/bench/multiregion/run.sh`), six nodes with no impairment;
+- bootstrapped, then idle for 40 s;
+- pages counted on a1 and b1 over 20 s, CPU from `docker stats` (3 samples of 6 nodes);
+- arms alternated A, B, A, B;
+- load average 12–15 from other sessions.
+
+| Arm | Pages per node in 20 s | Mean CPU per idle node |
+|---|---|---|
+| A, a page every heartbeat | 974–1,000 | 1.55%, 1.37% |
+| B, backed off to the horizon | 110–111 | 1.04%, 1.24% |
+
+Pages fell 9×, and mean idle CPU about 20% (1.46% → 1.14%); the rest is probes and Raft heartbeats. The fleet suite
+passed 79/79 in 272 s (252–299 s before), so membership convergence did not slow.
+
+**Build trap, recorded so it is not repeated:** the first two B images ran A's binary. The Dockerfile shares one cached
+`target/` across builds, and BuildKit reuses an unchanged `COPY . .` layer with its old file times, so cargo kept the
+other tree's compiled crates. Touching the sources did not help. Each arm is now built in its own target volume and
+copied into a distroless image, and the binaries' hashes must differ (A `d6b21905979c`, B `2f469a521c60`).
+
 ### The incumbent baseline: slates against the kernel's own NFS server, one Linux client (condition 12; 2026-10-08)
 
 Command: `docs/wip/bench/mixed/linux_vs_nfsd.sh 400 64` in a privileged `rust:1.98.0` container (the header gives the

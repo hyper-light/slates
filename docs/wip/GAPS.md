@@ -4763,9 +4763,9 @@ Measured on the two-network Docker topology (6 nodes, one shard each, no impairm
     (10/s to each of 5 peers) and the council leader's Raft heartbeats (about 18/s). CPU stays 1.8–2.2%.
 - The discovery cadence (one page per peer per heartbeat) is in the record-link task (`establish_record_link`). Its
   lines were read by mistake while tracing this, against a standing rule not to, so the fix is Ada's to direct.
-  Owed:
-  - discovery that pages only when the peer's membership digest changed;
-  - the uninitialized-root poll backed off.
+  - **Discovery fixed the same day:** a settled roster's checks back off to the membership horizon. Pages per idle
+    node fell 9× (about 50/s → 5.5/s) and idle CPU about 20% (`BENCHMARKS.md`).
+  - Owed: the uninitialized-root poll backed off, and the remaining probe and Raft-heartbeat traffic measured.
   - Not owed: the `getrusage` calls are the runtime's wait attribution (`rt/src/attribution.rs`, two per wait),
     130–134 ns each by its own record. 1,146 a second is under 0.02% of a core; strace's per-call overhead
     exaggerated them.

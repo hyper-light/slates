@@ -3892,6 +3892,9 @@ async fn establish_record_link(driver: PeerDriver, dial: PeerDial) {
     resolver,
   } = dial;
   let mut peer_host = seed;
+  // When the next discovery page is due, and the wait after it (see `next_discovery_wait`).
+  let mut discovery_due: u64 = 0;
+  let mut discovery_wait: u64 = HEARTBEAT_NS;
   let mut client: Option<Endpoint> = client_for(
     identity,
     &name,
@@ -3933,11 +3936,34 @@ async fn establish_record_link(driver: PeerDriver, dial: PeerDial) {
       .await;
       client = kept;
       enroll_record_session(session, peer_host, anchor, &mut discovery_cursor, driver).await;
+      discovery_wait = HEARTBEAT_NS;
+      discovery_due = 0;
     }
-    if !absent {
+    if !absent && futures::now_ns() >= discovery_due {
+      let before = discovery_cursor.settled();
       refresh_discovery(peer_host, anchor, &mut discovery_cursor, driver).await;
+      discovery_wait = next_discovery_wait(before, discovery_cursor.settled(), discovery_wait);
+      discovery_due = futures::now_ns().saturating_add(discovery_wait);
     }
     crate::daemon::pace(HEARTBEAT_NS).await;
+  }
+}
+
+/// Counter: a discovery page sent over a record link (a settled roster's pages back off to one per horizon a peer).
+/// Format: a counter name in the daemon's status report.
+const DISCOVERY_PAGES: &str = "fleet.discovery.pages";
+
+/// The wait before a record link's next discovery page. While the sweep stays complete at the same roster generation
+/// the wait doubles, from one heartbeat up to the membership horizon ([`crate::lease::horizon_ns`]); anything else (a
+/// sweep under way, a new generation, a new session) brings it back to one heartbeat. So a settled fleet checks each
+/// peer about once a horizon rather than every heartbeat (it was one exchange a peer a heartbeat, ~2% of a core per idle
+/// node on the two-network topology, 2026-10-08), and a roster change is still learned no later than a death would be.
+fn next_discovery_wait(before: Option<u64>, after: Option<u64>, wait: u64) -> u64 {
+  match (before, after) {
+    (Some(was), Some(now)) if was == now => wait
+      .saturating_mul(2)
+      .clamp(HEARTBEAT_NS, crate::lease::horizon_ns()),
+    _ => HEARTBEAT_NS,
   }
 }
 
@@ -4166,6 +4192,8 @@ async fn exchange_discovery(
     return DiscoveryOutcome::Refused;
   };
   let span_ns = consensus_budget(slowest_path_tail_ns()).max_deadline_ns();
+  // Every page counted: the non-vacuity counter for the record link's discovery backoff (`next_discovery_wait`).
+  count_refusal(DISCOVERY_PAGES);
   let exchanged = {
     let mut exchange =
       std::pin::pin!(session.request(crate::discovery::STREAM, Priority::Metadata, &request));
@@ -6778,6 +6806,47 @@ pub(crate) async fn forward_batch_over_leader_session(
     {
       return None;
     }
+  }
+}
+
+#[cfg(test)]
+mod discovery_wait_tests {
+  use super::{HEARTBEAT_NS, next_discovery_wait};
+
+  /// A settled roster's checks back off and a change brings them back: do a run of pages at one generation, then one
+  /// at a new generation, then one mid-sweep. Expect the wait to double from a heartbeat up to the membership horizon
+  /// and stay there, and to return to one heartbeat at the change and mid-sweep.
+  #[test]
+  fn a_settled_roster_backs_its_discovery_checks_off_to_the_horizon_and_a_change_resets_them() {
+    let horizon = crate::lease::horizon_ns();
+    let mut wait = HEARTBEAT_NS;
+    let mut waits = Vec::new();
+    for _ in 0..8 {
+      wait = next_discovery_wait(Some(7), Some(7), wait);
+      waits.push(wait);
+    }
+    assert_eq!(waits.first(), Some(&(2 * HEARTBEAT_NS)));
+    assert!(waits.windows(2).all(|pair| pair[1] >= pair[0]), "{waits:?}");
+    assert_eq!(
+      waits.last(),
+      Some(&horizon),
+      "the wait stops at the horizon: {waits:?}"
+    );
+    assert_eq!(
+      next_discovery_wait(Some(7), Some(8), horizon),
+      HEARTBEAT_NS,
+      "a new generation resets"
+    );
+    assert_eq!(
+      next_discovery_wait(Some(7), None, horizon),
+      HEARTBEAT_NS,
+      "a sweep under way resets"
+    );
+    assert_eq!(
+      next_discovery_wait(None, Some(7), horizon),
+      HEARTBEAT_NS,
+      "a first completed sweep starts at a heartbeat"
+    );
   }
 }
 
