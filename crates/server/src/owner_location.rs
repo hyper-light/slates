@@ -97,7 +97,7 @@ impl Query {
     cached: Option<CachedRoute>,
   ) -> Option<HostId> {
     cached
-      .filter(|route| route.query == self && eligible(state, route.owner, RegionId(self.region)))
+      .filter(|route| self.reuses(state, *route).is_none())
       .map(|route| route.owner)
       .or_else(|| {
         eligible(
@@ -107,6 +107,21 @@ impl Query {
         )
         .then_some(ObjectId(self.object).creator())
       })
+  }
+}
+
+impl Query {
+  /// Why `route` cannot be reused for this query, as the counter the miss is recorded under, or `None` when it
+  /// can: it was found under another query (another object, region or root view), or its owner is no longer an
+  /// eligible member of the region (another region, or held dead).
+  pub(crate) fn reuses(self, state: &ShardState, route: CachedRoute) -> Option<&'static str> {
+    if route.query != self {
+      Some("fleet.owner_location.route_dropped.query_changed")
+    } else if !eligible(state, route.owner, RegionId(self.region)) {
+      Some("fleet.owner_location.route_dropped.owner_ineligible")
+    } else {
+      None
+    }
   }
 }
 
@@ -125,8 +140,12 @@ fn eligible(state: &ShardState, host: HostId, region: RegionId) -> bool {
 /// false, and the node answers meanwhile. (Refusing then — the placement a version behind its council for most
 /// of a long coordinator period right after a takeover — refused the one owner a lookup could find.) A pending
 /// takeover does not advertise itself until adoption finishes. Peers without this object report no owner;
-/// they never infer one from live membership. The session has already authenticated enrollment.
-pub(crate) fn serve(state: &ShardState, bytes: &[u8]) -> Result<Vec<u8>, LocationError> {
+/// they never infer one from live membership. The session has already authenticated enrollment. Returns the reply
+/// and, when this node does not claim the object, why ([`declined`]), for the caller to count.
+pub(crate) fn serve(
+  state: &ShardState,
+  bytes: &[u8],
+) -> Result<(Vec<u8>, Option<&'static str>), LocationError> {
   let query = Query::from_bytes(bytes).map_err(|_| LocationError::Malformed)?;
   let local = state.fleet.host();
   let root = state.root.configuration();
@@ -147,16 +166,37 @@ pub(crate) fn serve(state: &ShardState, bytes: &[u8]) -> Result<Vec<u8>, Locatio
     return Err(LocationError::OutsideHome);
   }
   let regional = state.council.configuration();
-  Ok(
+  let declined = declined(
+    state,
+    ObjectId(query.object),
+    regional.members.contains(&local),
+  );
+  Ok((
     Reply {
       query,
       generation: regional.version,
-      serves: regional.members.contains(&local)
-        && state.fleet.object_owner(ObjectId(query.object)) == Some(local)
-        && !state.departed_owners.contains_key(&ObjectId(query.object)),
+      serves: declined.is_none(),
     }
     .to_bytes(),
-  )
+    declined,
+  ))
+}
+
+/// Why this node does not claim `object` (`serve`), as the counter it is recorded under on this node, or `None` when
+/// it claims it: not a member of the council's configuration, the object's route naming another owner or none, or the
+/// object retired here as a departed owner's. A lookup that missed the owner then names, on the node that should have
+/// claimed, the rule that refused.
+pub(crate) fn declined(state: &ShardState, object: ObjectId, member: bool) -> Option<&'static str> {
+  let local = state.fleet.host();
+  if !member {
+    Some("fleet.owner_location.declined.not_member")
+  } else if state.fleet.object_owner(object) != Some(local) {
+    Some("fleet.owner_location.declined.not_owner")
+  } else if state.departed_owners.contains_key(&object) {
+    Some("fleet.owner_location.declined.departed")
+  } else {
+    None
+  }
 }
 
 /// Only claims supply a route: the claim at the newest regional generation among them, since an owner

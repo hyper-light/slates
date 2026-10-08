@@ -4423,3 +4423,53 @@ are judged provisionally (RFC 6298 §2.2's `3R` from their own measured round tr
 first, passes 40 of 40 (`docs/bugs/2026-10-07-a-far-member-condemns-the-near-side-by-its-pooled-deadline.md`). Still
 owed upstream: the deterministic hyper-sim port on a named seed set, the derivation in hyper-raft's `docs/timing.md`,
 and before/after through `hyper-swim-compare`.
+
+**Update (same day): the upstream items above are done.** hyper-raft took `swim-pair-deadline` onto `main` (`e6950b6`,
+CI green on its six targets) with the sim port, the `docs/timing.md` derivation and the comparison, and reviewed
+`swim-misfit-late-answer` (the reused-record path bound and RFC 6298 §2.1's first-contact verdict) onto `next`. slates
+re-vendors `hyper-swim` from `main` once both are there.
+
+### 2026-10-07: Copa reads independent jitter out of its queue estimate (condition 7); two open findings
+
+`afd07563` (`BENCHMARKS.md`, "Copa under independent jitter", candidates 1–8 with every number): Copa measures each
+`srtt/2` epoch's delay path and subtracts the jitter it implies from its queueing-delay estimate (Arun, Alizadeh &
+Balakrishnan, SIGCOMM 2022 §6). On a thin 200 ms link with ±40 ms independent jitter, 8 MiB went from 79.0 to 24.3 s
+with reordering and from 101.9 to 32.8 s with reordering and loss (median of 8 seeds). The in-order arm went from 18.1
+to 24.1 s, inside its 8–32 s noise band. The grid's share rose 1.6 % and its ping p99 fell 1.9 %.
+
+On the two-network Docker topology (100 ms ± 40 ms, 3 % loss; `reads.sh`, three rounds, three readers in region 1):
+- Reads took 54.2–126.7 s; 8 of 9 were byte-identical. The median was about 120 s, against about 135 s before.
+- **Open: one read refused** after 54.2 s (`b0`, round 3). The counters name a forward that went out and was never
+  answered within its budget (`fleet.owner_location.forward_unanswered` 1). The client got `HomedElsewhere`, which by
+  design (§4.8 "Lookup") it retries. Owed: a client-side retry of a refused read in `slates read` and the SDKs, under
+  the same exactly-once rules as writes, or a measured case for retrying at the origin.
+
+**Open: `a_cross_region_client_finds_the_copyset_successor_instead_of_an_unrelated_live_peer` failed in 2 of the last 3
+full fleet suites** with "retry not served: HomedElsewhere". It passes alone (4 of 4), at 6 concurrent copies (18 of
+18) and at 12 (36 of 36, load 6.7), so it needs the suite's state, not load (`CONDITIONS.md`, `019a149d`). The
+foreign daemon's counters after the last retry show a third location round that found no claim (`unavailable` 1,
+`not_owner` 6). That reads as a retry that did not reuse its client's route, in a round where the successor, which had
+just served a write, did not claim the object. It is not yet confirmed: the old failure message was the same for the
+test's two write pairs, and it carried no successor counters. Counters now name each step: why the origin dropped a route
+(`fleet.owner_location.route_dropped.{query_changed,owner_ineligible,refused}`), why a node declined to claim
+(`fleet.owner_location.declined.{not_member,not_owner,departed}`), and why a forward was redirected
+(`fleet.forward.redirect.{homed_elsewhere,superseded}`). The test's failure message carries the successor's counters
+and says which of its two write pairs failed.
+
+**Narrowed the same day (9 more full suites, 2 failures).**
+- The failures are not in the location round. In three tests (this one;
+  `a_location_round_asks_a_peer_whose_session_was_out_once_it_returns`; `a_grant_made_after_the_last_seal_survives_a_takeover`),
+  the successor adopted the head (`fleet.takeover.adopted`). Its own client was then refused `HomedElsewhere { region: 0 }`
+  for the whole wait.
+- The volume was never materialized on the successor. `fleet.materialize` counted 298 refusals in one wait, and no
+  fetch or wait counter moved, so the content and every placement were present. The owner shard refused the restore
+  itself.
+- Its typed refusal was discarded (`.is_ok()`). It is now counted on the control shard by kind:
+  `fleet.materialize.refused.{already_exists,budget_exceeded,bad_request,other}` and `fleet.materialize.unanswered`.
+- So are the waits that returned silently before the call: `fleet.materialize.waits.{content,placement,catalog,catalog_placement,shard}`,
+  and `fleet.fetch.{no_holder_session,incomplete,complete_refused}`.
+- The successor-serves checks in these tests print all of these on failure.
+- Hypothesis, not yet shown: the admission hold for host memory pressure (`refresh_pressure_hold`). Memory used by
+  other processes on this shared machine shrinks every shard's admittable bytes, and the restore is refused
+  `BudgetExceeded`. Separately, a node that owns an object it has not yet materialized answers its own client
+  `HomedElsewhere`, because its location round never asks itself. That refusal is wrong whatever the cause.

@@ -1494,7 +1494,12 @@ async fn serve_peer_records(
             crate::owner_location::STREAM => {
               state::with_state(
                 |state| match crate::owner_location::serve(state, &request) {
-                  Ok(reply) => reply,
+                  Ok((reply, declined)) => {
+                    if let Some(declined) = declined {
+                      state.count(declined, 1);
+                    }
+                    reply
+                  }
                   Err(error) => {
                     state.count(error.counter(), 1);
                     Vec::new()
@@ -3003,7 +3008,9 @@ async fn fetch_into_hold(
     holders.contains(&host)
   });
   if sessions.is_empty() {
-    return false; // No recorded holder reachable this period.
+    // No recorded holder reachable this period (none with a session here, or every such session out on loan).
+    count_refusal(FETCH_NO_HOLDER_SESSION);
+    return false;
   }
   let hedge_after_ns =
     state::with_state(|s| hedge_delay_ns(&s.fetch_latency)).unwrap_or(HEARTBEAT_NS);
@@ -3079,15 +3086,32 @@ async fn fetch_into_hold(
     return true;
   }
   if !fetched.complete {
-    return false; // Not whole yet: what was fetched stays staged for the next period (AUD-29-55).
+    // Not whole yet: what was fetched stays staged for the next period (AUD-29-55).
+    count_refusal(FETCH_INCOMPLETE);
+    return false;
   }
-  state::with_state(|s| {
+  let completed = state::with_state(|s| {
     s.held_content
       .complete_stage(&mut crate::content_holder::hold_space(&mut s.store), object)
       .is_ok()
   })
-  .unwrap_or(false)
+  .unwrap_or(false);
+  if !completed {
+    count_refusal(FETCH_COMPLETE_REFUSED);
+  }
+  completed
 }
+
+/// Counter: a takeover fetch found no session to any recorded holder of the head this period (none kept here, or
+/// every one out on loan); it is asked again next period.
+/// Format: a counter name in the daemon's status report.
+const FETCH_NO_HOLDER_SESSION: &str = "fleet.fetch.no_holder_session";
+/// Counter: a takeover fetch ended its period without the whole content; what it fetched stays staged.
+/// Format: a counter name in the daemon's status report.
+const FETCH_INCOMPLETE: &str = "fleet.fetch.incomplete";
+/// Counter: a takeover fetch held every chunk, but the hold refused to complete its stage.
+/// Format: a counter name in the daemon's status report.
+const FETCH_COMPLETE_REFUSED: &str = "fleet.fetch.complete_refused";
 
 /// One period of everything this node adopts: each takeover it owes a confirmation of (one batched phase-one round per
 /// retired host across its recovery neighbourhoods, §4.8 "Promotion and takeover"; the holds and rounds arrive over
@@ -3242,6 +3266,23 @@ async fn materialize_pending_greens(origin: u16) {
   }
 }
 
+/// Counter: a taken-over volume's materialization waited a period for its content, which this node does not hold
+/// whole yet (the archive of the head's manifest).
+/// Format: a counter name in the daemon's status report.
+const MATERIALIZE_WAITS_CONTENT: &str = "fleet.materialize.waits.content";
+/// Counter: a taken-over volume's materialization waited a period for the takeover's placement of its head.
+/// Format: a counter name in the daemon's status report.
+const MATERIALIZE_WAITS_PLACEMENT: &str = "fleet.materialize.waits.placement";
+/// Counter: a taken-over volume's materialization waited a period for its catalog register's adoption (AUD-29-17).
+/// Format: a counter name in the daemon's status report.
+const MATERIALIZE_WAITS_CATALOG: &str = "fleet.materialize.waits.catalog";
+/// Counter: a taken-over volume's materialization waited a period for the placement of its adopted catalog.
+/// Format: a counter name in the daemon's status report.
+const MATERIALIZE_WAITS_CATALOG_PLACEMENT: &str = "fleet.materialize.waits.catalog_placement";
+/// Counter: a taken-over volume's materialization found no runtime shard for the partition its id names.
+/// Format: a counter name in the daemon's status report.
+const MATERIALIZE_WAITS_SHARD: &str = "fleet.materialize.waits.shard";
+
 /// A taken-over green whose chain could not be gathered this period (an input not held, or the adopted
 /// version beyond this node's accepted prefix); it stays pending and is retried.
 const GREEN_TAKEOVER_INCOMPLETE: &str = "merge.takeover_incomplete";
@@ -3263,18 +3304,35 @@ async fn materialize(origin: u16, object: ObjectId, head: HeadValue) {
   let taken = state::with_state(|s| {
     let archive = s
       .held_content
-      .archive_of(s.store.content.arena(), object, &manifest)?;
+      .archive_of(s.store.content.arena(), object, &manifest)
+      .ok_or(MATERIALIZE_WAITS_CONTENT)?;
     // The takeover's placement of the head (its sequence, promotion epoch and acknowledging holders),
     // recorded here where the promotion ran; it moves to the owner shard with the volume.
-    let placed = s.placed_heads.get(&object).cloned()?;
+    let placed = s
+      .placed_heads
+      .get(&object)
+      .cloned()
+      .ok_or(MATERIALIZE_WAITS_PLACEMENT)?;
     // The volume's catalog, adopted in the same round (it is placed before any head that could be adopted
     // is shipped): the volume is served as that catalog describes it (AUD-29-17). Until it is adopted the
-    // materialization waits, uncounted.
-    let (catalog_sequence, catalog) = s.pending_catalogs.get(&object).cloned()?;
-    let catalog_placed = s.placed_heads.get(&object.catalog()).cloned()?;
+    // materialization waits.
+    let (catalog_sequence, catalog) = s
+      .pending_catalogs
+      .get(&object)
+      .cloned()
+      .ok_or(MATERIALIZE_WAITS_CATALOG)?;
+    let catalog_placed = s
+      .placed_heads
+      .get(&object.catalog())
+      .cloned()
+      .ok_or(MATERIALIZE_WAITS_CATALOG_PLACEMENT)?;
     // The partition the id names, as this daemon's runtime shard (the shard list is in partition order).
-    let target = s.shards.get(usize::from(partition)).copied()?;
-    Some((
+    let target = s
+      .shards
+      .get(usize::from(partition))
+      .copied()
+      .ok_or(MATERIALIZE_WAITS_SHARD)?;
+    Ok((
       archive,
       placed,
       catalog_sequence,
@@ -3282,10 +3340,17 @@ async fn materialize(origin: u16, object: ObjectId, head: HeadValue) {
       catalog_placed,
       target,
     ))
-  })
-  .flatten();
-  let Some((archive, placed, catalog_sequence, catalog, catalog_placed, target)) = taken else {
-    return;
+  });
+  let (archive, placed, catalog_sequence, catalog, catalog_placed, target) = match taken {
+    Some(Ok(taken)) => taken,
+    Some(Err(waits)) => {
+      // Each period's wait is counted by what it waits for, so a successor that adopted a head and never serves
+      // its volume names the missing piece (a successor's own client was refused for a whole wait in a full
+      // fleet suite, 2026-10-07, with nothing counted).
+      count_refusal(waits);
+      return;
+    }
+    None => return,
   };
   let region = head.content_holders.clone();
   // The successor's own copy of the volume's lineage key (A-92 piece 4c), unwrapped here on the control shard, which
@@ -3321,29 +3386,60 @@ async fn materialize(origin: u16, object: ObjectId, head: HeadValue) {
       });
       let Some(archive) = opened_archive(s, id, &catalog.owner, adopted, archive) else {
         s.count(ENVELOPE_UNOPENED, 1);
-        return false;
+        return Err(ENVELOPE_UNOPENED);
       };
-      let served = verbs::materialize_taken_over(s, id, &taken, region, &archive).is_ok();
-      if served {
-        // The owner shard now owns the head's and the catalog's placements — its record plane writes the
-        // object's next records at the promotion epoch and ships only to holders still missing these.
-        s.placed_heads.insert(object, placed);
-        s.placed_heads.insert(object.catalog(), catalog_placed);
-      }
-      served
+      verbs::materialize_taken_over(s, id, &taken, region, &archive)
+        .map_err(|refusal| materialize_refusal_counter(&refusal))?;
+      // The owner shard now owns the head's and the catalog's placements — its record plane writes the
+      // object's next records at the promotion epoch and ships only to holders still missing these.
+      s.placed_heads.insert(object, placed);
+      s.placed_heads.insert(object.catalog(), catalog_placed);
+      Ok(())
     },
     HEARTBEAT_NS,
   )
   .await;
-  state::with_state(|s| {
-    if served == Some(true) {
+  state::with_state(|s| match served {
+    Some(Ok(())) => {
       s.pending_materializations.remove(&object);
       s.pending_catalogs.remove(&object);
-    } else {
+    }
+    // Counted on this (control) shard with the refusal's kind, where status and the fleet tests read: the owner
+    // shard's typed refusal was discarded before 2026-10-07, and a successor refused every period for a whole
+    // test wait (298 times) said only `fleet.materialize`.
+    Some(Err(refusal)) => {
       s.count(MATERIALIZE_REFUSED, 1);
+      s.count(refusal, 1);
+    }
+    None => {
+      s.count(MATERIALIZE_REFUSED, 1);
+      s.count(MATERIALIZE_UNANSWERED, 1);
     }
   });
 }
+
+/// The counter a taken-over volume's refused materialization is recorded under, by the owner shard's refusal: a name
+/// already taken on this node, an archive or volume past the shard's budget, a restore that refused the archive, or
+/// another refusal.
+fn materialize_refusal_counter(refusal: &slates_ipc::protocol::ReplyBody) -> &'static str {
+  match refusal {
+    slates_ipc::protocol::ReplyBody::Refused { refusal } => match refusal {
+      slates_ipc::protocol::Refusal::AlreadyExists { .. } => {
+        "fleet.materialize.refused.already_exists"
+      }
+      slates_ipc::protocol::Refusal::BudgetExceeded { .. } => {
+        "fleet.materialize.refused.budget_exceeded"
+      }
+      slates_ipc::protocol::Refusal::BadRequest { .. } => "fleet.materialize.refused.bad_request",
+      _ => "fleet.materialize.refused.other",
+    },
+    _ => "fleet.materialize.refused.other",
+  }
+}
+
+/// Counter: the owner shard did not answer a taken-over volume's materialization within the period.
+/// Format: a counter name in the daemon's status report.
+const MATERIALIZE_UNANSWERED: &str = "fleet.materialize.unanswered";
 
 /// The archive a taken-over volume is served from: a plain archive as it is; an envelope opened under the volume's
 /// lineage and naming keys once this node has adopted them (`adopted`), else `None` — ciphertext is never served as a

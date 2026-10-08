@@ -4961,6 +4961,7 @@ fn a_forward_waits_for_the_owners_session_while_it_is_out() {
     "b's session to a was held out: {held:?}"
   );
   assert_same_snapshot_reply(
+    "b's write",
     written.expect("the write was sent"),
     retry.expect("the retry was sent"),
     "",
@@ -5030,7 +5031,7 @@ fn a_location_round_asks_a_peer_whose_session_was_out_once_it_returns() {
     .unwrap();
   assert_copyset_adopted(&daemons, successor_daemon, ObjectId(id.bytes));
   let mut successor_client = Client::connect(successor_daemon.instance());
-  assert!(audit_wait(|| Ok(status_answers(&mut successor_client, id))));
+  assert_successor_serves(&mut successor_client, successor_daemon, id);
   let foreign_daemon = daemons
     .iter()
     .find(|daemon| daemon.instance() == foreign_instance)
@@ -5155,7 +5156,7 @@ fn a_cross_region_client_finds_the_copyset_successor_instead_of_an_unrelated_liv
     .unwrap();
   assert_copyset_adopted(&daemons, successor_daemon, ObjectId(id.bytes));
   let mut successor_client = Client::connect(successor_daemon.instance());
-  assert!(audit_wait(|| Ok(status_answers(&mut successor_client, id))));
+  assert_successor_serves(&mut successor_client, successor_daemon, id);
   let mut foreign = Client::connect(&foreign_instance);
   let mut last = ReplyBody::Refused {
     refusal: Refusal::NotFound,
@@ -5186,14 +5187,26 @@ fn a_cross_region_client_finds_the_copyset_successor_instead_of_an_unrelated_liv
   ));
   // Shown by a failed pair assertion (the trace is off in a plain run, and the failure appeared only there): how
   // the foreign daemon routed and forwarded, before the writes and after the last retry.
+  // The successor's own counters name why it declined a claim or redirected a forward (`declined.*`,
+  // `fleet.forward.redirect.*`), and the foreign daemon's why it dropped the client's route (`route_dropped.*`).
+  let counters_of = |host: HostId| {
+    daemons
+      .iter()
+      .find(|daemon| daemon.member_identity().ok() == Some(host))
+      .map(|daemon| daemon.fleet_refusals_within(slates_server::daemon::LIVENESS_BUDGET_NS))
+      .map(|counters| counters.map(|counters| location_counters(&counters)))
+  };
   let routing = format!(
-    "foreign location and forward counters before the writes {:?}, after the last retry {:?}",
+    "foreign location and forward counters before the writes {:?}, after the writes {:?}, after the last retry \
+     {:?}; the successor's after the last retry {:?}",
     location_counters(&counters_before),
+    location_counters(&counters_after),
     daemons
       .iter()
       .find(|daemon| daemon.instance() == foreign_instance)
       .map(|daemon| daemon.fleet_refusals_within(slates_server::daemon::LIVENESS_BUDGET_NS))
-      .map(|counters| counters.map(|counters| location_counters(&counters)))
+      .map(|counters| counters.map(|counters| location_counters(&counters))),
+    counters_of(successor)
   );
   trace_routing_views(&daemons, ObjectId(id.bytes));
   for daemon in daemons {
@@ -5204,11 +5217,17 @@ fn a_cross_region_client_finds_the_copyset_successor_instead_of_an_unrelated_liv
     "foreign lookup must reach the actual copyset successor: {last:?}"
   );
   assert_same_snapshot_reply(
+    "the foreign client's write",
     written.expect("the forward path was available"),
     retry.expect("the retry path was available"),
     &routing,
   );
-  assert_same_snapshot_reply(resumed, resumed_retry, &routing);
+  assert_same_snapshot_reply(
+    "the interrupted client's resumed write",
+    resumed,
+    resumed_retry,
+    &routing,
+  );
   assert!(
     counters_before
       .get("fleet.owner_location.round")
@@ -5298,12 +5317,12 @@ fn retry_snapshot_until_served(client: &mut Client, volume: VolumeId) -> ReplyBo
   reply
 }
 
-fn assert_same_snapshot_reply(first: ReplyBody, retry: ReplyBody, routing: &str) {
+fn assert_same_snapshot_reply(which: &str, first: ReplyBody, retry: ReplyBody, routing: &str) {
   let ReplyBody::Snapshotted { id: first, .. } = first else {
-    panic!("write not served: {first:?}; {routing}")
+    panic!("{which} not served: {first:?}; {routing}")
   };
   let ReplyBody::Snapshotted { id: retry, .. } = retry else {
-    panic!("retry not served: {retry:?}; {routing}")
+    panic!("{which}'s retry not served: {retry:?}; {routing}")
   };
   assert_eq!(
     first, retry,
@@ -5383,6 +5402,30 @@ fn assert_copyset_adopted(daemons: &[Daemon], successor_daemon: &Daemon, object:
   assert!(
     adopted,
     "the actual successor must adopt before testing remote lookup"
+  );
+}
+
+/// Waits until the successor, which has adopted `volume`'s head, answers `status` for it to its own client, and
+/// fails with the last reply and the successor's location, forward and takeover counters, so a successor that
+/// adopted and still does not serve names the rule that refused (a bare wait reported nothing).
+fn assert_successor_serves(client: &mut Client, successor_daemon: &Daemon, volume: VolumeId) {
+  let mut last = ReplyBody::Refused {
+    refusal: Refusal::NotFound,
+  };
+  let served = audit_wait(|| {
+    last = client.call(&RequestBody::Status { volume });
+    Ok(matches!(last, ReplyBody::Status { .. }))
+  });
+  let counters = successor_daemon
+    .fleet_refusals()
+    .map(|counters| takeover_counters(&counters));
+  assert!(
+    served,
+    "the successor serves the volume it adopted to its own client: last {last:?}; its counters {counters:?}; \
+     its head {:?}",
+    successor_daemon
+      .fleet_holder_head(ObjectId(volume.bytes))
+      .map(|head| head.map(|(owner, _)| owner))
   );
 }
 
@@ -7216,11 +7259,40 @@ fn poll_status_answers(daemons: &[&Daemon], instance: &str, volume: VolumeId) ->
     Ok(report)
   });
   if !answered {
+    // The serving daemon's takeover counters: which piece its materialization waited for
+    // (`fleet.materialize.waits.*`), its fetches, and why its forwards found no owner.
+    let counters = daemons
+      .iter()
+      .find(|daemon| daemon.instance() == instance)
+      .map(|daemon| {
+        daemon
+          .fleet_refusals()
+          .map(|counters| takeover_counters(&counters))
+      });
     eprintln!(
-      "status for {volume:?} at {instance} never answered a report; its last reply: {last_refusal:?}"
+      "status for {volume:?} at {instance} never answered a report; its last reply: {last_refusal:?}; its \
+       counters {counters:?}"
     );
   }
   answered
+}
+
+/// The takeover, materialization, fetch, location and forward counters of a daemon's refusal map, for a failure
+/// message about a successor that does not serve.
+fn takeover_counters(
+  counters: &std::collections::BTreeMap<&'static str, u64>,
+) -> Vec<(&'static str, u64)> {
+  counters
+    .iter()
+    .filter(|(name, _)| {
+      name.starts_with("fleet.owner_location")
+        || name.starts_with("fleet.forward.")
+        || name.starts_with("fleet.materialize")
+        || name.starts_with("fleet.fetch.")
+        || name.contains("takeover")
+    })
+    .map(|(name, count)| (*name, *count))
+    .collect()
 }
 
 /// Polls the owner's `await placed(snapshot, region)` verb until it answers placed, or the placement

@@ -4246,8 +4246,8 @@ mod tests {
       crate::owner_location::serve(state, &query.to_bytes())
     });
     assert!(
-      claimed.is_ok(),
-      "the owner answers while its placement catches up: {claimed:?}"
+      matches!(claimed, Ok((_, None))),
+      "the owner claims its object while its placement catches up: {claimed:?}"
     );
   }
 

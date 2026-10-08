@@ -860,8 +860,20 @@ pub(crate) async fn serve_forward(control: u16, origin: HostId, bytes: &[u8]) ->
       .fleet
       .object_owner(object)
       .is_some_and(|owner| owner != local);
-    homed_elsewhere(state, volume)
-      .or_else(|| superseded.then(|| state.node_regions.get(&local).map_or(0, |region| region.0)))
+    let redirect = homed_elsewhere(state, volume)
+      .map(|region| (region, "fleet.forward.redirect.homed_elsewhere"))
+      .or_else(|| {
+        superseded.then(|| {
+          (
+            state.node_regions.get(&local).map_or(0, |region| region.0),
+            "fleet.forward.redirect.superseded",
+          )
+        })
+      });
+    if let Some((_, reason)) = redirect {
+      state.count(reason, 1);
+    }
+    redirect.map(|(region, _)| region)
   })
   .flatten();
   if let Some(region) = redirect {
@@ -1451,6 +1463,9 @@ async fn resolve_and_forward(
 ) -> (OwnerReplies, Option<crate::owner_location::CachedRoute>) {
   let resolved = crate::state::with_state_counted(|state| {
     let query = crate::owner_location::Query::new(state, ObjectId(volume.bytes), region);
+    if let Some(dropped) = cached.and_then(|route| query.reuses(state, route)) {
+      state.count(dropped, 1);
+    }
     (query, query.known_owner(state, cached))
   });
   let Some((query, known)) = resolved else {
@@ -1521,11 +1536,7 @@ async fn resolve_and_forward(
   let reply = decoded
     .flatten()
     .unwrap_or_else(|| refused(Refusal::HomedElsewhere { region }));
-  let route = if matches!(&reply, ReplyBody::Refused { .. }) {
-    None
-  } else {
-    owner.map(|owner| query.route(owner))
-  };
+  let route = route_after(&reply, owner, query);
   (
     OwnerReplies {
       first: reply,
@@ -1534,6 +1545,26 @@ async fn resolve_and_forward(
     },
     route,
   )
+}
+
+/// The route a client keeps after its forward's `reply` from `owner`: the owner it reached, unless the reply refused.
+/// The owner's refusal drops the route, so the client's next request looks the owner up again; that drop is counted
+/// (`fleet.owner_location.route_dropped.refused`), so a retry that ran a round after a served request names the
+/// refusal that sent it there.
+fn route_after(
+  reply: &ReplyBody,
+  owner: Option<HostId>,
+  query: crate::owner_location::Query,
+) -> Option<crate::owner_location::CachedRoute> {
+  if !matches!(reply, ReplyBody::Refused { .. }) {
+    return owner.map(|owner| query.route(owner));
+  }
+  if owner.is_some() {
+    crate::state::with_state(|state| {
+      state.count("fleet.owner_location.route_dropped.refused", 1);
+    });
+  }
+  None
 }
 
 /// What an owner answered a forward: the reply to its first request, the decoded replies to the rest of a batch
