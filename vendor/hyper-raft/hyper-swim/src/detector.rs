@@ -205,6 +205,37 @@ fn misfits_pool(peer: &Peer, pooled_span: Option<u64>) -> bool {
             .is_some_and(|(rtt, span)| rtt > span)
 }
 
+/// The verdict that judges a probe of `peer`, given the pool's: the pair's own once its estimator
+/// configures; before that, for a pair the pool does not fit ([`misfits_pool`]), the provisional
+/// [`misfit_verdict`] from its measured round trip (none, measurement only, before any is
+/// measured); otherwise the pool's. With it, whether the verdict is the provisional one. The one
+/// rule [`Detector::verdict`] reports and a probe is judged by.
+fn judging(peer: &Peer, pooled: Option<Verdict>) -> (Option<Verdict>, bool) {
+    if let Some(own) = peer.stream.verdict {
+        return (Some(own), false);
+    }
+    if misfits_pool(peer, pooled.map(|verdict| verdict.span_ns())) {
+        let provisional = pooled
+            .zip(peer.path_rtt_ns)
+            .map(|(pooled, rtt)| misfit_verdict(pooled, rtt));
+        return (provisional, true);
+    }
+    if peer.path_rtt_ns.is_none() && peer.last_answer_ns.is_none() {
+        // No evidence of the pair's path yet: no handshake round trip, no answer. RFC 6298 §2.1:
+        // "until a round-trip time (RTT) measurement has been made ... the sender SHOULD set RTO <- 1
+        // second" — the provisional verdict whose deadline, 3R, is that second. Judged by the pool
+        // instead, a peer joined by gossip before it was ever spoken to was suspected, alive, before
+        // its first answer could return from 200 ms away.
+        let provisional = pooled.map(|pooled| misfit_verdict(pooled, FIRST_CONTACT_RTT_NS));
+        return (provisional, true);
+    }
+    (pooled, false)
+}
+
+/// The round trip a pair with no evidence of its path is judged provisionally by: a third of RFC 6298
+/// §2.1's initial RTO ([`INITIAL_WAIT_NS`], 1 s), so its provisional deadline `3R` is that RTO.
+const FIRST_CONTACT_RTT_NS: u64 = INITIAL_WAIT_NS / 3;
+
 /// The verdict a pair the pool does not fit is judged by until its own estimator configures: its
 /// own latest round trip `R` as the expected arrival, and the margin RFC 6298 §2.2 gives a path
 /// with one measured round trip — `RTTVAR = R/2`, `RTO = SRTT + 4·RTTVAR = 3R`, so `α = 2R` —
@@ -381,6 +412,10 @@ struct Peer {
     /// handshake's. What a misfit pair is judged by until its own estimator configures
     /// ([`misfit_verdict`]).
     path_rtt_ns: Option<u64>,
+    /// The latest probe whose record a later probe wrote over while it was still unanswered: an
+    /// answer that finds no record is for it or for one sent before it, so its round trip is known
+    /// exactly or bounded below ([`Peer::reused_round_trip`]).
+    reused: Option<Sent>,
 }
 
 impl Peer {
@@ -399,6 +434,7 @@ impl Peer {
             report: PeerReport::default(),
             handshake_rtt_ns: None,
             path_rtt_ns: None,
+            reused: None,
         }
     }
 
@@ -410,13 +446,43 @@ impl Peer {
             .and_then(Option::take)
     }
 
-    /// Records a probe sent, over the oldest still outstanding.
+    /// Records a probe sent, over the oldest still outstanding; that one, if still unanswered, is
+    /// kept as the latest reused record.
     fn send(&mut self, sent: Sent) {
         let slots = u64::try_from(OUTSTANDING).unwrap_or(1);
         let at = usize::try_from(sent.seq.checked_rem(slots).unwrap_or(0)).unwrap_or(0);
-        if let Some(slot) = self.outstanding.get_mut(at) {
-            *slot = Some(sent);
+        if let Some(slot) = self.outstanding.get_mut(at)
+            && let Some(written_over) = slot.replace(sent)
+        {
+            self.reused = Some(written_over);
         }
+    }
+
+    /// An answer to `nonce` at `at_ns` whose probe's record later probes already reused: it came back
+    /// long after the pool would have judged it, so the pool does not fit this pair. Its round trip,
+    /// exact or a lower bound ([`Peer::reused_round_trip`]), is the pair's path until one is
+    /// measured, so a misfit pair with no handshake round trip is still judged provisionally
+    /// ([`misfit_verdict`]); without it, such a pair whose member then died was measured for ever and
+    /// never condemned.
+    fn answered_unrecorded(&mut self, nonce: u64, at_ns: u64) {
+        if self.stream.verdict.is_some() {
+            return;
+        }
+        self.pool_misfit = true;
+        if let Some(round_trip) = self.reused_round_trip(nonce, at_ns) {
+            self.path_rtt_ns = Some(
+                self.path_rtt_ns
+                    .map_or(round_trip, |path| path.max(round_trip)),
+            );
+        }
+    }
+
+    /// The round trip of an answer to `nonce` at `at_ns` that found no record: exact when it answers
+    /// the latest reused record; a lower bound when it answers an earlier one, which was sent before
+    /// that record (nonces only increase); `None` for a nonce after it, which no reuse explains.
+    fn reused_round_trip(&self, nonce: u64, at_ns: u64) -> Option<u64> {
+        let reused = self.reused?;
+        (nonce <= reused.nonce).then(|| at_ns.saturating_sub(reused.at_ns))
     }
 
     fn clear_pending(&mut self) {
@@ -861,26 +927,13 @@ impl Detector {
         // long the pair's handshake had measured its path (a near member condemned by a far one in 5
         // of 40 seeds, 2026-10-07).
         let pooled = self.pooled();
-        let pooled_span = pooled.map(|verdict| verdict.span_ns());
         // The handshake that keyed the pair already measured its path: a round trip longer than the
-        // pool's deadline is the same evidence a late answer gives, known before the first probe.
-        let (own, misfit, path) = self.peers.get(&target).map_or((None, false, None), |peer| {
-            (
-                peer.stream.verdict,
-                misfits_pool(peer, pooled_span),
-                peer.path_rtt_ns,
-            )
-        });
-        let provisional = own.is_none() && misfit;
-        let verdict = match own {
-            Some(own) => Some(own),
-            // A pair the pool's verdict does not fit is judged by its own measured round trip until
-            // it has its own estimator's verdict; with no round trip measured at all, measured only.
-            None if misfit => pooled
-                .zip(path)
-                .map(|(pooled, rtt)| misfit_verdict(pooled, rtt)),
-            None => pooled,
-        };
+        // pool's deadline is the same evidence a late answer gives, known before the first probe
+        // ([`misfits_pool`]).
+        let (verdict, provisional) = self
+            .peers
+            .get(&target)
+            .map_or((pooled, false), |peer| judging(peer, pooled));
         let peer = self.peers.entry(target).or_insert_with(Peer::new);
         let seq = peer.sent;
         peer.sent = peer.sent.saturating_add(1);
@@ -1301,11 +1354,7 @@ impl Detector {
         peer.last_answer_ns = Some(peer.last_answer_ns.map_or(at_ns, |last| last.max(at_ns)));
         let pooled_span = self.pool.verdict.map(|verdict| verdict.span_ns());
         let Some(sent) = peer.take(nonce) else {
-            // An answer whose probe's record later probes already reused came back long after the
-            // pool would have judged it: the pool does not fit this pair.
-            if peer.stream.verdict.is_none() {
-                peer.pool_misfit = true;
-            }
+            peer.answered_unrecorded(nonce, at_ns);
             return;
         };
         let rtt = at_ns.saturating_sub(sent.at_ns);
@@ -1326,8 +1375,11 @@ impl Detector {
                 }
             }
             // The pool is fed while it judges: by pairs with no verdict of their own, until it has
-            // one.
-            if !peer.report.configured || self.pool.verdict.is_none() {
+            // one; never by a pair it does not fit ([`misfits_pool`]), whose round trips are another
+            // path's and would stretch the pool's span, and with it every period it judges, over the
+            // paths it does fit.
+            let fits = !misfits_pool(peer, pooled_span);
+            if fits && (!peer.report.configured || self.pool.verdict.is_none()) {
                 self.pool
                     .take(sent.nonce, rtt, granularity, Duration::from_nanos(period));
             }
@@ -1434,12 +1486,14 @@ impl Detector {
         self.peers.get(&peer).map(|held| held.stream.samples)
     }
 
-    /// The verdict that times this member's probes of `peer` now: the pair's, else the pool's.
+    /// The verdict that times this member's probes of `peer` now: the pair's own; before it has one,
+    /// a pair the pool does not fit is judged provisionally ([`misfit_verdict`], `mistake` 1), else
+    /// by the pool's.
     pub fn verdict(&self, peer: HostId) -> Option<Verdict> {
-        self.peers
-            .get(&peer)
-            .and_then(|held| held.stream.verdict)
-            .or(self.pool.verdict)
+        match self.peers.get(&peer) {
+            Some(held) => judging(held, self.pool.verdict).0,
+            None => self.pool.verdict,
+        }
     }
 
     /// The mean of this member's periods, once one has ended.
@@ -2594,6 +2648,246 @@ mod tests {
         for peer in [B, C] {
             assert_eq!(liveness(&detector, peer), Liveness::Alive);
         }
+    }
+
+    /// Drives `detector` from `now` with any number of answers in flight: `answer` gives each probe's
+    /// round trip (none for silence); `heard` is called with each answer's sender, nonce and arrival as
+    /// it is delivered, before the detector sees it, and stops the run by returning true; the run also
+    /// stops at `horizon` or when `done` holds. Returns the time it stopped.
+    fn drive_many(
+        detector: &mut Detector,
+        mut now: u64,
+        horizon: u64,
+        mut answer: impl FnMut(HostId) -> Option<u64>,
+        mut heard: impl FnMut(&Detector, HostId, u64, u64) -> bool,
+        done: impl Fn(&Detector) -> bool,
+    ) -> u64 {
+        let mut requests = Vec::new();
+        let mut pending: Vec<(HostId, u64, u64)> = Vec::new();
+        while now < horizon && !done(detector) {
+            if let Some(ping) = detector.poll(now, &mut requests)
+                && let Some(rtt) = answer(ping.to)
+            {
+                pending.push((ping.to, ping.nonce, now + rtt));
+            }
+            let ack = pending.iter().map(|(_, _, at)| *at).min();
+            now = match (detector.wake().map(|wake| wake + MS / 10), ack) {
+                (Some(wake), Some(at)) => wake.min(at).max(now),
+                (Some(wake), None) => wake.max(now),
+                (None, Some(at)) => at.max(now),
+                (None, None) => {
+                    detector.on_ping(A);
+                    now + MS
+                }
+            };
+            pending.sort_by_key(|(_, _, at)| *at);
+            let due: Vec<(HostId, u64, u64)> = pending
+                .iter()
+                .copied()
+                .filter(|(_, _, at)| *at <= now)
+                .collect();
+            pending.retain(|(_, _, at)| *at > now);
+            for (from, nonce, at) in due {
+                if heard(detector, from, nonce, at) {
+                    return now;
+                }
+                detector.on_ack(from, nonce, at);
+            }
+        }
+        now
+    }
+
+    /// A configured member over near peers A, B and C, and the time its warm-up ended: the member a
+    /// far or late peer then joins.
+    fn warmed() -> (Detector, u64) {
+        let mut detector = detector(&[A, B, C]);
+        let mut world = World::new();
+        configured(&mut detector, &mut world, &[A, B, C]);
+        (detector, world.now)
+    }
+
+    /// RFC 6298 §2.1 for a peer joined with no handshake round trip that has not answered yet: it is
+    /// judged provisionally at the initial RTO, not by the pool. Do: on a configured member, join a far
+    /// peer with no handshake round trip that answers in 200 ms, and run until its first answer
+    /// arrives, then on for 30 s. Expect: it was not suspected before that answer, and never condemned.
+    /// Before: the pool judged it at a few milliseconds, and the live peer was suspected before its
+    /// first answer came back (132 ms in, on the driver of the test below).
+    #[test]
+    fn a_peer_joined_without_a_round_trip_is_not_suspected_before_its_first_answer() {
+        const F: HostId = HostId(5);
+        let (mut detector, now) = warmed();
+        detector.join(F).unwrap();
+        let mut state = 0x9E37_79B9_7F4A_7C15;
+        let mut suspected_before_first_answer = None;
+        drive_many(
+            &mut detector,
+            now,
+            now + 30_000 * MS,
+            |peer| {
+                Some(if peer == F {
+                    200 * MS
+                } else {
+                    jitter(&mut state)
+                })
+            },
+            |detector, from, _, _| {
+                if from == F && suspected_before_first_answer.is_none() {
+                    // Held, alive, with its report: a member condemned and forgotten has neither.
+                    suspected_before_first_answer = Some((
+                        detector.membership().state(F).map(|state| state.liveness),
+                        detector.report(F).map(|report| report.suspicions),
+                    ));
+                }
+                false
+            },
+            |_| false,
+        );
+        assert_eq!(
+            suspected_before_first_answer,
+            Some((Some(Liveness::Alive), Some(0))),
+            "held alive and never suspected when its first answer arrived"
+        );
+        let report = detector.report(F).unwrap_or_default();
+        assert_eq!(report.condemnations, 0, "never condemned while alive");
+        assert_eq!(
+            detector.membership().state(F).map(|state| state.liveness),
+            Some(Liveness::Alive),
+            "held alive"
+        );
+    }
+
+    /// The cost of RFC 6298 §2.1's initial RTO for a near peer joined with no handshake round trip:
+    /// until its first answer it is judged at 1 s, not by the pool. A condemnation takes two judged
+    /// probes (the one that suspects and the one that tells), and each unanswered one waits out its
+    /// direct deadline and then the relays', which includes the target's own span: two initial RTOs a
+    /// probe, so the first detection of a peer that never answers moves by at most four. Do: on a
+    /// configured member, join a near peer that never answers, once with no handshake round trip and
+    /// once with a 1 ms one, and time each from the join to holding it dead. Expect: both held dead,
+    /// the first no more than four initial RTOs after the second (measured: 4,076 ms against 108 ms).
+    #[test]
+    fn a_near_peer_joined_without_a_round_trip_is_condemned_at_most_four_initial_rtos_later() {
+        const D: HostId = HostId(5);
+        let held_dead_after = |handshake: Option<u64>| {
+            let (mut detector, now) = warmed();
+            match handshake {
+                Some(rtt) => detector
+                    .join_measured(D, Duration::from_nanos(rtt))
+                    .unwrap(),
+                None => detector.join(D).unwrap(),
+            }
+            let mut state = 0x9E37_79B9_7F4A_7C15;
+            let end = drive_many(
+                &mut detector,
+                now,
+                now + 600_000 * MS,
+                |peer| (peer != D).then(|| jitter(&mut state)),
+                |_, _, _, _| false,
+                |detector| liveness(detector, D) == Liveness::Dead,
+            );
+            assert_eq!(liveness(&detector, D), Liveness::Dead, "held dead");
+            end - now
+        };
+        let unmeasured = held_dead_after(None);
+        let measured = held_dead_after(Some(MS));
+        eprintln!(
+            "near peer held dead: {:.1} ms with no handshake round trip, {:.1} ms with one",
+            unmeasured as f64 / MS as f64,
+            measured as f64 / MS as f64
+        );
+        assert!(
+            unmeasured <= measured + 4 * INITIAL_WAIT_NS,
+            "at most four initial RTOs later: {unmeasured} ns against {measured} ns"
+        );
+    }
+
+    /// A far peer, joined with no handshake round trip, whose first answers all come after their
+    /// probes' records were reused (the member's near peers answer in 1 ms, so it probes the far one
+    /// three more times before a 40 ms answer comes back), and which dies before any answer of its is
+    /// measured. Do: measure the near peers, join the far one, drive the member until such a reused
+    /// answer has marked the pair misfit with no
+    /// measured answer of the far peer's, then kill the far peer. Expect: it is held dead. Before the
+    /// reused record's age was taken as the path's round trip, the pair had none, so it was never
+    /// judged provisionally and the dead member was measured for ever (the hyper-raft owner's review
+    /// of `swim-pair-deadline`, 2026-10-07).
+    #[test]
+    fn a_far_peer_that_answers_only_after_its_records_are_reused_and_dies_is_condemned() {
+        const F: HostId = HostId(5);
+        // Far enough that three more probes of it go out before its answer returns (the near peers
+        // answer in 1 ms), near enough that the answer returns before the pool configures: so its
+        // first answers find their records reused while nothing yet judges the pair.
+        const FAR_RTT: u64 = 40 * MS;
+        const HORIZON: u64 = 600_000 * MS;
+        // The near peers are measured first, as in a running cluster the far member then joins.
+        let mut detector = detector(&[A, B, C]);
+        let mut world = World::new();
+        let mut warm = 0x2545_F491_4F6C_DD1D;
+        world.run(&mut detector, 12, |_| Some(jitter(&mut warm)));
+        detector.join(F).unwrap();
+        let mut requests = Vec::new();
+        let mut pending: Vec<(HostId, u64, u64)> = Vec::new();
+        let mut state = 0x9E37_79B9_7F4A_7C15;
+        let mut now = world.now;
+        let (mut far_alive, mut far_measured, mut killed) = (true, false, false);
+        while now < HORIZON && !(killed && liveness(&detector, F) == Liveness::Dead) {
+            if let Some(ping) = detector.poll(now, &mut requests) {
+                let rtt = if ping.to == F {
+                    far_alive.then_some(FAR_RTT)
+                } else {
+                    Some(jitter(&mut state))
+                };
+                if let Some(rtt) = rtt {
+                    pending.push((ping.to, ping.nonce, now + rtt));
+                }
+            }
+            let ack = pending.iter().map(|(_, _, at)| *at).min();
+            now = match (detector.wake().map(|wake| wake + MS / 10), ack) {
+                (Some(wake), Some(at)) => wake.min(at).max(now),
+                (Some(wake), None) => wake.max(now),
+                (None, Some(at)) => at.max(now),
+                (None, None) => {
+                    detector.on_ping(A);
+                    now + MS
+                }
+            };
+            pending.sort_by_key(|(_, _, at)| *at);
+            let due: Vec<(HostId, u64, u64)> = pending
+                .iter()
+                .copied()
+                .filter(|(_, _, at)| *at <= now)
+                .collect();
+            pending.retain(|(_, _, at)| *at > now);
+            for (from, nonce, at) in due {
+                if from != F {
+                    detector.on_ack(from, nonce, at);
+                    continue;
+                }
+                if !far_alive {
+                    continue;
+                }
+                let outstanding = detector.peers.get(&F).is_some_and(|peer| {
+                    peer.outstanding
+                        .iter()
+                        .flatten()
+                        .any(|sent| sent.nonce == nonce)
+                });
+                far_measured |= outstanding;
+                detector.on_ack(from, nonce, at);
+                let misfit = detector.peers.get(&F).is_some_and(|peer| peer.pool_misfit);
+                if !outstanding && !far_measured && misfit {
+                    killed = true;
+                    far_alive = false;
+                }
+            }
+        }
+        assert!(
+            killed,
+            "the far pair was made misfit by a reused record's answer before any was measured"
+        );
+        assert_eq!(
+            liveness(&detector, F),
+            Liveness::Dead,
+            "the far peer, dead, is held dead"
+        );
     }
 
     #[test]
