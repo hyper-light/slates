@@ -52,7 +52,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-use crate::bench::{MIN_SAMPLES, nanos};
+use crate::bench::{MIN_SAMPLES, PROBE_WALL_BUDGET, nanos};
 use crate::error::MachineError;
 use crate::placement::Placement;
 use crate::probes::{
@@ -209,8 +209,13 @@ const DONE: u32 = 2;
 /// window, a one-nanosecond step quantum; CI run 36201648573, a 30 ms budget on a macOS runner). So while
 /// the pooled sample is under the stopping rule's floor ([`MIN_SAMPLES`]), up to [`WAKE_ROUNDS`] more rounds
 /// run, each with twice the last one's budget: a slow machine gets exponentially more time, within
-/// `2 + 4 + 8 + 16 + 32 = 62` more shares. Short of the floor even then, the probe refuses
-/// `MeasurementTimeout` rather than report a mean it did not measure.
+/// `2 + 4 + 8 + 16 + 32 = 62` more shares. A short budget (the quick profile's 5 ms, so 1 ms shares) may then keep
+/// doubling until the full profile's own per-probe budget ([`PROBE_WALL_BUDGET`]) is spent, each round capped at what
+/// is left of it: on a machine whose cores are all busy (spinning shards of eight concurrent fleet tests, load 37 to
+/// 80, 2026-10-07) a fresh waiter takes tens of milliseconds to be scheduled, and 62 one-millisecond shares refused
+/// three test binaries' profiles. An idle machine pays nothing for this, and a full profile is unchanged (its 62
+/// shares already exceed the wall). Short of the floor even then, the probe refuses `MeasurementTimeout` rather
+/// than report a mean it did not measure.
 pub fn wake(budget: Duration, placement: &Placement) -> Result<WakeLatency, MachineError> {
   let pairs = core_pairs(placement);
   let saved = SavedAffinity::of_calling_thread();
@@ -222,10 +227,19 @@ pub fn wake(budget: Duration, placement: &Placement) -> Result<WakeLatency, Mach
   let mut same_cpu_samples = 0u32;
   let mut asleep_confirmed = true;
   let mut rounds = 0u32;
-  while rounds < WAKE_ROUNDS || (kept.len() < MIN_SAMPLES && rounds < WAKE_ROUNDS.saturating_mul(2))
-  {
+  let began = Instant::now();
+  // A zero budget doubles to zero: no round could measure, so the wall extension is not given to it.
+  let short_of_floor = |kept: &[u64], rounds: u32| {
+    kept.len() < MIN_SAMPLES
+      && (rounds < WAKE_ROUNDS.saturating_mul(2)
+        || (!budget.is_zero() && began.elapsed() < PROBE_WALL_BUDGET))
+  };
+  while rounds < WAKE_ROUNDS || short_of_floor(&kept, rounds) {
     if rounds >= WAKE_ROUNDS {
       round_budget = round_budget.saturating_mul(2);
+    }
+    if rounds >= WAKE_ROUNDS.saturating_mul(2) {
+      round_budget = round_budget.min(PROBE_WALL_BUDGET.saturating_sub(began.elapsed()));
     }
     let pair = usize::try_from(rounds)
       .ok()
@@ -857,5 +871,28 @@ mod tests {
     );
     let after = std::thread::available_parallelism().map_or(1, |n| n.get());
     assert_eq!(after, before);
+  }
+
+  /// Shape: a wake budget too short for its rounds to confirm a sleeper: 10 µs, so 2 µs shares and at most 124 µs
+  /// more from the doubling rounds, against a thread's schedule-and-wake of tens of microseconds at rest.
+  const TOO_SHORT_BUDGET: Duration = Duration::from_micros(10);
+
+  /// §4.1 refusals, and a busy machine as the norm: a short budget that its doubling rounds cannot fill to the sample
+  /// floor keeps doubling until the full profile's per-probe budget is spent, so a profile measured on a machine whose
+  /// cores are busy still measures (three test binaries' quick profiles were refused at load 37 to 80, 2026-10-07).
+  /// Do: measure the wake with [`TOO_SHORT_BUDGET`]. Expect: a measured mean, and no more wall time than the full
+  /// budget plus one round. Before the extension it refused `MeasurementTimeout`.
+  #[test]
+  fn a_budget_too_short_for_its_rounds_extends_to_the_full_probe_budget_and_measures() {
+    let facts = Facts::query();
+    let began = Instant::now();
+    let measured = wake(TOO_SHORT_BUDGET, &placement_of(&facts));
+    let took = began.elapsed();
+    let w = measured.expect("the extended probe measures a wake");
+    assert_a_measured_mean(&w);
+    assert!(
+      took <= PROBE_WALL_BUDGET.saturating_mul(2),
+      "the extension stays within the full probe budget and its last round: {took:?}"
+    );
   }
 }
