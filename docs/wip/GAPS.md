@@ -4705,6 +4705,20 @@ are owed in the report before the next reading.
   register contract (one value per committed position) is still bent by that growth, and a successor answers its own
   client `HomedElsewhere` before its adoption (`docs/bugs/2026-10-08-a-sealed-head-shipped-without-its-successors-key-entry.md`).
 
+### 2026-10-08: the OCI binding through containerd 1.7 and runc 1.1, rerun on HEAD (condition 2)
+
+`docs/wip/bench/containerd/run.sh` (privileged `rust:1.98.0`, containerd 1.7.24 and runc 1.1.15 from Debian trixie,
+the Linux release build of the day's last code change):
+- `slates attach --oci`'s `mounts[]` entry, applied by `ctr run`, binds the FUSE-mounted volume `rw,nosuid,nodev`.
+- A tar extraction in the container exits 0 in 0.80–0.94 s (a tmpfs bind 0.12 s), and the host sees the same 2,002
+  entries and tar hash.
+- The read-only entry refuses a write.
+- A setuid binary planted on the volume runs as `nobody` and stays uid 65534.
+
+Harness bug fixed the same day: the script pulled the probe's Debian image quietly and discarded a failure, so two
+runs reported `image not found` at the setuid probe and the probe never ran. Pulls now retry three times and keep
+their output in `/out/pull.txt`.
+
 ### 2026-10-08: one macOS provenance attribute costs a file 40% of its memory: a proposal for A-32 (memory)
 
 Measured (`cargo run --release -p slates-vfs --example create_heap`, 50,000 files):

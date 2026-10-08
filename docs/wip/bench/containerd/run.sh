@@ -14,7 +14,17 @@ apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq containerd runc fus
 containerd --version; runc --version | head -1
 containerd >/out/containerd.log 2>&1 &
 for _ in $(seq 1 100); do ctr version >/dev/null 2>&1 && break; sleep 0.1; done
-ctr images pull --snapshotter native -q docker.io/library/alpine:3.20 >/dev/null 2>&1; ctr images pull --snapshotter native -q docker.io/library/debian:trixie-slim >/dev/null 2>&1 || ctr images pull --snapshotter native docker.io/library/alpine:3.20 | tail -1
+# Each image pulled with a bounded retry, its output kept in /out: a failed pull is named, never hidden (the setuid
+# probe's glibc `id` needs the Debian image, and a quiet failure once read as "image not found" at the probe).
+pull() {
+  for attempt in 1 2 3; do
+    ctr images pull --snapshotter native "$1" >>/out/pull.txt 2>&1 && return 0
+    echo "pull of $1 failed (attempt $attempt)" >>/out/pull.txt
+  done
+  echo "== pull of $1 failed three times; see /out/pull.txt"; return 1
+}
+pull docker.io/library/alpine:3.20
+pull docker.io/library/debian:trixie-slim
 cp /target/release/slates /usr/local/bin/slates
 slates --instance cd anchor --quick --shards 2 >/out/anchor.out 2>/out/anchor.err &
 for _ in $(seq 1 200); do slates --instance cd volume list >/dev/null 2>&1 && break; sleep 0.1; done
