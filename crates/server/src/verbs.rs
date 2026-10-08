@@ -662,18 +662,45 @@ fn detector_report(state: &ShardState) -> Vec<slates_ipc::protocol::DetectorPeer
     .after(None)
     .filter(|(member, _)| member.0 != local.0)
     .filter_map(|(member, _)| {
-      detector
-        .report(member)
-        .map(|report| slates_ipc::protocol::DetectorPeerReport {
+      detector.report(member).map(|report| {
+        let verdict = detector.verdict(member);
+        let judged_by = match (report.configured, verdict) {
+          (true, _) => "own",
+          (false, None) => "measuring",
+          // A provisional verdict promises no bound (hyper-swim's `misfit_verdict`: mistake 1).
+          (false, Some(verdict)) if verdict.mistake >= 1.0 => "provisional",
+          (false, Some(_)) => "pool",
+        };
+        slates_ipc::protocol::DetectorPeerReport {
           peer: member.0,
           configured: report.configured,
           suspicions: report.suspicions,
           suspicion_allowance_milli: thousandths(report.suspicion_allowance),
           condemnations: report.condemnations,
           condemnation_allowance_milli: thousandths(report.condemnation_allowance),
-        })
+          judged_by: judged_by.to_owned(),
+          expected_ns: verdict.map_or(0, |verdict| nanos_of(verdict.round_trip)),
+          margin_ns: verdict.map_or(0, |verdict| nanos_of(verdict.margin)),
+        }
+      })
     })
     .collect()
+}
+
+/// A duration as whole nanoseconds, saturating.
+fn nanos_of(duration: std::time::Duration) -> u64 {
+  u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
+}
+
+/// The member's own wake lateness as its detector measured it (granularity), nanoseconds; zero off the control shard
+/// or before measured.
+fn detector_granularity_ns(state: &ShardState) -> u64 {
+  state
+    .plane
+    .plane
+    .as_ref()
+    .and_then(|plane| plane.detector().granularity())
+    .map_or(0, nanos_of)
 }
 
 /// The objects this node's takeovers have learned and not yet adopted (§4.8 "Promotion and takeover"; the
@@ -2791,6 +2818,7 @@ pub fn shard_report(state: &mut ShardState) -> ShardReport {
       .map(|recipient| recipient.public().id.to_vec())
       .unwrap_or_default(),
     nfs_calls: nfs_calls_of(state),
+    detector_granularity_ns: detector_granularity_ns(state),
   }
 }
 
@@ -2884,6 +2912,10 @@ fn fleet_report(state: &ShardState, shards: &[ShardReport]) -> FleetReport {
   let takeover = control.map_or_else(|| takeover_report(state), |shard| shard.takeover.clone());
   let detector = control.map_or_else(|| detector_report(state), |shard| shard.detector.clone());
   let sessions = control.map_or_else(Vec::new, |shard| shard.sessions.clone());
+  let detector_granularity_ns = control.map_or_else(
+    || detector_granularity_ns(state),
+    |shard| shard.detector_granularity_ns,
+  );
   let (held_records, takeovers_pending, configuration_version) = control.map_or_else(
     || {
       (
@@ -2926,6 +2958,7 @@ fn fleet_report(state: &ShardState, shards: &[ShardReport]) -> FleetReport {
     takeover,
     detector,
     sessions,
+    detector_granularity_ns,
   }
 }
 

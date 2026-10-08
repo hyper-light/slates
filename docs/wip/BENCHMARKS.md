@@ -3536,3 +3536,33 @@ experiment code was never committed. p50 and p99 in ms, round by round:
 Four writers improve clearly. One writer improves on creates and worsens on unlinks, and sixteen are even. A mixed
 A/B does not land. The class also moves work onto performance cores, which costs battery, and it outranks other
 processes. Owed: more rounds, a quiet-machine arm, and the energy cost (`powermetrics`) before any decision.
+
+### The real crossing's window, read from the owner's sessions (condition 7; 2026-10-08)
+
+Command: `IMAGE=slates:mr sh docs/wip/bench/multiregion/reads.sh <scratch> <8 MiB payload> 3` at `401e9ad3` (the
+two-network topology, 100 ms ± 40 ms one way, 3% loss each way). The script now prints the owner's record sessions
+(`fleet.sessions` in status). Load average 3–9.
+
+Reads: a0 (same region) 0.15–0.16 s; across regions 91.4, 106.4, 111.9, 113.2, 114.9, 118.8, 119.8, 121.7 s
+byte-identical; one refused after 55.9 s (`b1`, round 2), as in the run before.
+
+The owner's (`a1`) sessions after the reads:
+
+| To | Congestion window | Smoothed RTT | PTO | Spurious losses | Collapses |
+|---|---|---|---|---|---|
+| region-1 reader | 9,184 B | 237.3 ms | 364.7 ms | 0 | 0 |
+| region-1 reader | 7,655 B | 230.0 ms | 450.8 ms | 0 | 0 |
+| region-1 reader | 9,736 B | 247.2 ms | 588.4 ms | 0 | 0 |
+| region-0 peer | 9,400 B | 0.15 ms | 1.15 ms | 0 | 0 |
+| region-0 peer | 9,412 B | 0.18 ms | 1.18 ms | 0 | 0 |
+
+- **The window, not loss, bounds the crossing.** About 9 KB per 240 ms round trip is about 40 KB/s a session. That
+  matches 8 MiB in about 110 s with read-ahead's few windows in flight. No spurious loss and no persistent collapse
+  were declared.
+- **It is Copa's delay signal.** Copa's target rate is `1/(δ·d_q)`. With ±40 ms jitter each way, the standing RTT over
+  `srtt/2` sits about 80 ms above the minimum, so δ = 0.5 gives about 25 packets/s, or about 6 packets (about 8 KB)
+  in flight at 240 ms. That is the measured window. Candidate 4's correction (`W/(n+1)`, landed 2026-10-07) removes
+  too little here: a 6-packet window takes few samples per `srtt/2` epoch.
+- Owed: the controller change, A/B'd on `fetch_bench`'s thin and grid scenarios and on this crossing. Candidate 2
+  read 5.4–6.5× on the jitter rows and failed only on slow links' queues. Before then, the reading needs an epoch
+  that spans enough samples.

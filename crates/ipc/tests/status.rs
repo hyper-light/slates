@@ -83,6 +83,9 @@ fn report() -> ReplyBody {
           suspicion_allowance_milli: 83,
           condemnations: 89,
           condemnation_allowance_milli: 97,
+          judged_by: "provisional".to_owned(),
+          expected_ns: 139,
+          margin_ns: 149,
         }],
         sessions: vec![slates_ipc::protocol::SessionReport {
           peer: 101,
@@ -95,6 +98,7 @@ fn report() -> ReplyBody {
           bytes_consumed: 131,
           path_mtu: 137,
         }],
+        detector_granularity_ns: 151,
       },
     }),
   }

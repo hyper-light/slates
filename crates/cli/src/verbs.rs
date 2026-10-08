@@ -1791,15 +1791,22 @@ fn daemon_status_text(report: &DaemonReport, telemetry: &[TelemetryReport]) -> S
   out.push_str(&group_text("root", &report.fleet.root));
   for peer in &report.fleet.detector {
     out.push_str(&format!(
-      "fleet_detector {}: configured={} suspicions={} (allowance {}/1000) condemnations={} (allowance {}/1000)\n",
+      "fleet_detector {}: configured={} judged_by={} expected_ns={} margin_ns={} suspicions={} (allowance {}/1000) condemnations={} (allowance {}/1000)\n",
       peer.peer,
       peer.configured,
+      peer.judged_by,
+      peer.expected_ns,
+      peer.margin_ns,
       peer.suspicions,
       peer.suspicion_allowance_milli,
       peer.condemnations,
       peer.condemnation_allowance_milli
     ));
   }
+  out.push_str(&format!(
+    "fleet_detector_granularity_ns: {}\n",
+    report.fleet.detector_granularity_ns
+  ));
   for session in &report.fleet.sessions {
     out.push_str(&format!(
       "fleet_session {}: lent={} cwnd={} srtt_ns={} pto_ns={} spurious_losses={} persistent_collapses={} consumed={} mtu={}\n",

@@ -1959,7 +1959,11 @@ pub fn daemon_json(r: &DaemonReport, telemetry: &[TelemetryReport]) -> Value {
         "suspicion_allowance_milli": peer.suspicion_allowance_milli,
         "condemnations": peer.condemnations,
         "condemnation_allowance_milli": peer.condemnation_allowance_milli,
+        "judged_by": peer.judged_by,
+        "expected_ns": peer.expected_ns,
+        "margin_ns": peer.margin_ns,
       })).collect::<Vec<_>>(),
+      "detector_granularity_ns": r.fleet.detector_granularity_ns,
       "sessions": r.fleet.sessions.iter().map(|session| json!({
         "peer": session.peer,
         "lent": session.lent,

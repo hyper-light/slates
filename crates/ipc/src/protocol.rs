@@ -1037,6 +1037,9 @@ pub struct ShardReport {
   /// NFS calls this shard served, by NFSv3 procedure number (0 `NULL` to 21 `COMMIT`, RFC 1813 §3; an NFSv4
   /// compound counts each operation's v3 call): the round trips each client operation cost. Appended.
   pub nfs_calls: Vec<u64>,
+  /// This shard's detector granularity (its measured wake lateness), nanoseconds: live on the control shard, zero
+  /// elsewhere. Appended.
+  pub detector_granularity_ns: u64,
 }
 
 /// The daemon's place in its fleet (§4.8; §2.6 boot step 6), as the verbs' placement authority sees it.
@@ -1089,6 +1092,9 @@ pub struct FleetReport {
   /// state as last seen, so a slow cross-region transfer shows whether the window, the round trip or loss bound it.
   /// Empty on a laptop. Appended.
   pub sessions: Vec<SessionReport>,
+  /// The member's own wake lateness as its detector measured it (its granularity `G`, which floors every margin),
+  /// nanoseconds; zero before measured. A loaded host stalling the condemning node shows here. Appended.
+  pub detector_granularity_ns: u64,
 }
 
 impl RequestBody {
@@ -1260,6 +1266,15 @@ pub struct DetectorPeerReport {
   /// Their allowance in thousandths: over every judged probe, the bound on it and the probe before both
   /// going unanswered.
   pub condemnation_allowance_milli: u64,
+  /// The verdict that judges the pair's probes now: `own` (its estimator configured), `pool` (the member's pooled
+  /// verdict), `provisional` (a pair the pool does not fit, or a first contact: hyper-swim claims no Theorem 7 bound
+  /// for it), or `measuring` (no verdict yet). What tells a false condemnation under a bounded verdict, a defect, from
+  /// one under a provisional verdict, a design limit. Appended.
+  pub judged_by: String,
+  /// That verdict's expected arrival of an answer, nanoseconds (zero while measuring). Appended.
+  pub expected_ns: u64,
+  /// That verdict's margin past the expected arrival before a probe counts as unanswered, nanoseconds. Appended.
+  pub margin_ns: u64,
 }
 
 /// The takeover state a council holds (§4.8 "Neighbourhood changes", "Promotion and takeover"): this node's

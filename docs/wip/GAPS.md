@@ -4633,3 +4633,13 @@ into immediately. Owed:
   with the theory's allowance;
 - whether a client-visible verb should be refused for the length of a refutation, or retried within the forward's
   bound once the member is readmitted.
+
+The hyper-raft owner's checklist for telling a design limit from a detector defect when it recurs:
+1. Which verdict judged the pair then: its own, the pool's, or provisional, and if provisional, misfit or first
+   contact. Provisional verdicts claim no Theorem 7 bound.
+2. The pair's stream state: samples, configured, mistake bound, and the counts against their allowances.
+3. The condemning member's own lateness around the event (wake-lateness folds, scheduler overrun).
+4. A timestamped detector trace window around the believed death.
+
+slates' `DetectorPeerReport` carries only `configured` and the counts against their allowances today. Items 1 and 3
+are owed in the report before the next reading.

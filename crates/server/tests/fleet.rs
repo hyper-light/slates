@@ -6354,9 +6354,39 @@ fn a_nodes_status_reports_each_record_session_with_its_congestion_state() {
     )
   });
   let last: Vec<_> = daemons.iter().map(sessions_of).collect();
+  // Each node's detector names the verdict judging each peer and its own measured lateness, the evidence a false
+  // condemnation is read against (hyper-raft's checklist, 2026-10-07).
+  let detectors: Vec<_> = daemons
+    .iter()
+    .map(
+      |daemon| match Client::connect(daemon.instance()).call(&RequestBody::DaemonStatus) {
+        ReplyBody::DaemonStatus { report } => {
+          Some((report.fleet.detector, report.fleet.detector_granularity_ns))
+        }
+        _ => None,
+      },
+    )
+    .collect();
   for daemon in daemons {
     daemon.stop();
   }
+  for (detector, granularity) in detectors.iter().flatten() {
+    assert!(
+      detector
+        .iter()
+        .all(|peer| ["own", "pool", "provisional", "measuring"].contains(&peer.judged_by.as_str())),
+      "each peer names the verdict judging it: {detector:?}"
+    );
+    assert!(
+      *granularity > 0,
+      "the node's lateness is measured: {granularity}"
+    );
+  }
+  assert_eq!(
+    detectors.iter().flatten().count(),
+    3,
+    "every node reported its detector"
+  );
   assert!(
     reported,
     "every node reports a session to each peer with a window and a round trip: {last:?}"
