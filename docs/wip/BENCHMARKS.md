@@ -3566,3 +3566,30 @@ The owner's (`a1`) sessions after the reads:
 - Owed: the controller change, A/B'd on `fetch_bench`'s thin and grid scenarios and on this crossing. Candidate 2
   read 5.4–6.5× on the jitter rows and failed only on slow links' queues. Before then, the reading needs an epoch
   that spans enough samples.
+
+### The read-ahead batch's rate cap removed: cross-region reads 2.7x faster on the real crossing (condition 7; 2026-10-08)
+
+The owner's sessions (above) showed windows of about 9 KB on the crossing. The question was whether Copa or the read
+path held them there. The read path's batch was capped at what the path's measured delivery rate moves in one
+liveness budget. Every batch is app-limited by construction, since it asks for exactly its windows, so the cap fed
+on its own small batches: a low rate held the next batch to one window, which measured a low rate again.
+Delivery-rate estimation as BBR uses it never lets an app-limited sample lower the estimate
+(draft-cheng-iccrg-delivery-rate-estimation §3.3).
+
+Command: `IMAGE=<image> sh docs/wip/bench/multiregion/reads.sh <scratch> <8 MiB payload> 3` on the two-network topology
+(100 ms ± 40 ms one way, 3% loss each way). Three readers in region 1 × three rounds, all N shown. Load average 4–8.
+
+| Image | Cross-region reads of 8 MiB (s) | Forwards | Windows joined |
+|---|---|---|---|
+| `4f627c6e` (the rate cap) | 97.4, 108.4, 111.3, 117.8, 119.4, 119.7, 124.5, 128.6, 131.1 | 354 | 39 |
+| experiment: the cap removed (uncommitted) | 28.5, 33.9, 34.6, 38.7, 41.3, 42.7, 47.3, 49.2, 51.7 | 24 | 369 |
+| as landed (the cap and its rate removed) | 26.5, 33.1, 39.6, 41.3, 44.1, 47.9, 47.9, 49.8, 52.2 | 24 | 369 |
+
+Every read in all three arms was byte-identical; none was refused. The median fell from about 119 s to about 44 s.
+Held-session waits fell (`fleet.forward.session_out` 13 → 3). The owner's windows still read about 9–11 KB after the
+reads, so Copa's window is the next bound (above).
+
+The simulator did not show this. `fetch_bench`'s fetch keeps the pipe full, so it never runs app-limited. A
+`crossing` scenario matching this link (1 Gbit/s, 200 ms, ±40 ms reordering each way, 3% loss each way) reads 8 MiB in
+35.4–59.7 s with 31–43 KB windows and 196–353 spurious losses, while the real crossing showed 0 spurious losses. The
+simulator's jitter and the real netem's differ, so a controller change is A/B'd on both.

@@ -4643,3 +4643,15 @@ The hyper-raft owner's checklist for telling a design limit from a detector defe
 
 slates' `DetectorPeerReport` carries only `configured` and the counts against their allowances today. Items 1 and 3
 are owed in the report before the next reading.
+
+### 2026-10-08: cross-region reads 2.7x faster: the read-ahead batch's rate cap removed (condition 7)
+
+- The owner's session state showed windows of about 9 KB on the two-network crossing and no losses.
+- An A/B on the real crossing, built from a scratch worktree, removed the batch's cap at the measured delivery rate:
+  8 MiB reads fell from 97–131 s to 28–52 s, 9 of 9 byte-identical in both arms. As landed: 26.5–52.2 s.
+- Root cause: every batch is app-limited, and its rate sample capped the next batch. That is the loop BBR's
+  delivery-rate estimation rules out by never letting app-limited samples lower the estimate.
+- The batch is now bounded by the file and the read-ahead ledger, and given up only when it stalls
+  (`BENCHMARKS.md`, same date).
+- Open: Copa's window is still about 9–11 KB on the crossing. The simulator does not reproduce the real link (its
+  reordering declares hundreds of spurious losses, the real one none), so the controller change is A/B'd on both.

@@ -1064,9 +1064,6 @@ pub(crate) struct ReadAhead {
   window: u64,
   /// The windows the fetch that filled this asked for (the next batch asks twice as many).
   batch: u64,
-  /// The delivery rate, bytes per second, the fetch that filled this was received at ([`delivery_rate`]); zero
-  /// before one is measured. The next batch carries no more than this rate moves in one liveness budget.
-  rate: u64,
   /// The bytes charged to the shard's read-ahead ledger for this window ([`ReadAheadLedger`]); credited when it is
   /// replaced, dropped or its client goes ([`release_read_ahead`]).
   charged: u64,
@@ -1203,14 +1200,12 @@ fn window_for(
           window: ahead.window,
           batch: ahead.batch,
           total: ahead.total,
-          rate: ahead.rate,
         },
       )
     });
     release_read_ahead(read_ahead, slot);
     continued
   });
-  let rate = previous.as_ref().map_or(0, |continued| continued.rate);
   let (window, wanted) = next_batch(previous, offset, read_window_bytes(state));
   // A batch takes what is left of the shard's read-ahead allowance; the session's flow control paces it through
   // the receive window.
@@ -1250,14 +1245,10 @@ fn window_for(
     bytes: Vec::new(),
     window,
     batch,
-    rate,
     charged,
   };
   (bodies, Some(plan))
 }
-
-/// Format: nanoseconds per second, for rates in bytes per second.
-const NANOS_PER_SECOND: u64 = 1_000_000_000;
 
 /// The window a read ended its last fetch with, when its next request continues where that window ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1265,14 +1256,16 @@ struct Continued {
   window: u64,
   batch: u64,
   total: u64,
-  rate: u64,
 }
 
 /// The window size and the windows a read's next fetch at `offset` asks for: one window of `own_window` bytes for a
 /// read that does not continue a window; for one that does, twice its last batch of that window's size, but no more
-/// windows than are left in the file, and — once a delivery rate is measured — no more than that rate moves in one
-/// liveness budget, so a batch holds the owner's session no longer than one forward is already allowed to; at least
-/// one window.
+/// windows than are left in the file; at least one window. The shard's read-ahead ledger bounds the bytes in flight
+/// (the caller), and a batch is given up only when it stalls. No measured rate caps it: every batch is app-limited by
+/// construction (it asks for exactly its windows), and an app-limited delivery sample must not lower the estimate
+/// it feeds (delivery-rate estimation as BBR uses it, draft-cheng-iccrg-delivery-rate-estimation §3.3). The cap it
+/// replaced held each batch to the rate its own small batches measured, a loop that kept a cross-region read at one
+/// window per forward: 97-131 s for 8 MiB on the two-network crossing, 28-52 s without it (2026-10-08).
 fn next_batch(previous: Option<Continued>, offset: u64, own_window: u64) -> (u64, u64) {
   let Some(continued) = previous else {
     return (own_window.max(1), 1);
@@ -1283,20 +1276,7 @@ fn next_batch(previous: Option<Continued>, offset: u64, own_window: u64) -> (u64
     .saturating_sub(offset)
     .div_ceil(window)
     .max(1);
-  let in_budget = if continued.rate > 0 {
-    u128::from(continued.rate)
-      .saturating_mul(u128::from(crate::daemon::LIVENESS_BUDGET_NS))
-      .checked_div(u128::from(NANOS_PER_SECOND).saturating_mul(u128::from(window)))
-      .and_then(|windows| u64::try_from(windows).ok())
-      .unwrap_or(u64::MAX)
-      .max(1)
-  } else {
-    u64::MAX
-  };
-  (
-    window,
-    continued.batch.saturating_mul(2).min(left).min(in_budget),
-  )
+  (window, continued.batch.saturating_mul(2).min(left))
 }
 
 /// Keeps the owner's windows answered for `plan` in the client's slot as one window and returns its first page as
@@ -1312,7 +1292,6 @@ fn keep_window(
   OwnerReplies {
     first,
     later: replies,
-    rate,
   }: OwnerReplies,
 ) -> (ReplyBody, u64) {
   slot.read_ahead_pending = slot.read_ahead_pending.saturating_sub(plan.charged);
@@ -1349,7 +1328,6 @@ fn keep_window(
     bytes,
     window,
     charged: plan.charged.min(kept),
-    rate,
     ..plan
   });
   (
@@ -1432,7 +1410,6 @@ async fn resolve_and_forward(
       OwnerReplies {
         first: refused(refusal),
         later: Vec::new(),
-        rate: 0,
       },
       None,
     );
@@ -1452,7 +1429,6 @@ async fn resolve_and_forward(
       OwnerReplies {
         first: refused(Refusal::HomedElsewhere { region }),
         later: Vec::new(),
-        rate: 0,
       },
       None,
     );
@@ -1496,7 +1472,6 @@ async fn resolve_and_forward(
   // A forward sent but unanswered within its budget comes back empty, and it is counted apart from one never
   // sent: an owner that was reached but did not answer in time is not one that could not be reached.
   let batch = bytes.unwrap_or_default();
-  let rate = delivery_rate(batch.streamed_bytes, batch.streamed_ns);
   let mut replies = batch.replies.into_iter();
   let decoded = replies
     .next()
@@ -1517,7 +1492,6 @@ async fn resolve_and_forward(
     OwnerReplies {
       first: reply,
       later,
-      rate,
     },
     route,
   )
@@ -1585,27 +1559,11 @@ pub(crate) fn owned_unmaterialized(state: &mut ShardState, volume: VolumeId) -> 
   Some(Refusal::Overloaded { shard })
 }
 
-/// What an owner answered a forward: the reply to its first request, the decoded replies to the rest of a batch
-/// (in order, up to the first that did not come back), and the delivery rate the batch was received at
-/// ([`delivery_rate`]).
+/// What an owner answered a forward: the reply to its first request, and the decoded replies to the rest of a batch
+/// (in order, up to the first that did not come back).
 pub(crate) struct OwnerReplies {
   first: ReplyBody,
   later: Vec<ReplyBody>,
-  rate: u64,
-}
-
-/// The rate, bytes per second, a batch streamed at: the bytes the session consumed over the interval they were
-/// arriving in ([`slates_cluster::BatchReplies`]) — delivery timed between deliveries, as BBR times it between
-/// acknowledgements (Cardwell et al., ACM Queue 2016), so neither the request's round trip nor the wait for the
-/// first byte, the fixed cost a batch exists to amortize, reads as a slow path, however the owner interleaves the
-/// windows' streams. Zero — no rate measured — when nothing streamed over a measurable interval: the next batch is
-/// then capped by nothing but the file and the ledger, and measures.
-fn delivery_rate(streamed_bytes: u64, streamed_ns: u64) -> u64 {
-  u128::from(streamed_bytes)
-    .saturating_mul(u128::from(NANOS_PER_SECOND))
-    .checked_div(u128::from(streamed_ns))
-    .and_then(|rate| u64::try_from(rate).ok())
-    .unwrap_or(0)
 }
 
 /// The region and volume of a verb this node must send to another host of its own region (§4.8 "Lookup": a lookup
@@ -9538,7 +9496,7 @@ fn creator_gid() -> u32 {
 
 #[cfg(test)]
 mod tests {
-  use super::{Continued, delivery_rate, next_batch};
+  use super::{Continued, next_batch};
   use super::{
     HostId, ObjectId, Principal, ReadAheadLedger, Refusal, RegionId, ReplyBody, VolumeId,
     home_redirect, join_batch, verify_attestation,
@@ -9592,44 +9550,34 @@ mod tests {
   }
 
   /// §4.8 Lookup read-ahead (`next_batch`). Do: plan the fetch of a read that does not continue a window; of one
-  /// that continues a batch of 4 with 100 windows left and no rate measured; with 3 windows left; at 640 KiB/s
-  /// delivered (10 windows of 64 KiB in the 1 s liveness budget) after a batch of 8; and at a rate too slow for one
-  /// window in the budget. Expect: one window of the node's own size; 8; 3; 10; and 1 — never zero.
+  /// that continues a batch of 4 with 100 windows left; with 3 windows left; with none left; and of a batch of 512
+  /// in a file of 4 GiB. Expect: one window of the node's own size; 8; 3; 1, never zero; and 1,024. No measured
+  /// rate caps a batch (an app-limited sample must not lower the estimate it feeds, `next_batch`): the cap this
+  /// replaced held the two-network crossing to one window per forward.
   #[test]
-  fn a_continuing_read_doubles_its_batch_within_the_file_and_the_measured_rate() {
+  fn a_continuing_read_doubles_its_batch_within_the_file() {
     let window = 64 << 10;
-    let continued = |batch, total, rate| {
+    let continued = |batch, total| {
       Some(Continued {
         window,
         batch,
         total,
-        rate,
       })
     };
     assert_eq!(next_batch(None, 0, 5_000), (5_000, 1));
     assert_eq!(
-      next_batch(continued(4, 200 * window, 0), 100 * window, 1),
+      next_batch(continued(4, 200 * window), 100 * window, 1),
       (window, 8)
     );
     assert_eq!(
-      next_batch(continued(4, 103 * window, 0), 100 * window, 1),
+      next_batch(continued(4, 103 * window), 100 * window, 1),
       (window, 3)
     );
     assert_eq!(
-      next_batch(continued(8, 1 << 30, 640 << 10), 0, 1),
-      (window, 10)
+      next_batch(continued(4, 100 * window), 100 * window, 1),
+      (window, 1)
     );
-    assert_eq!(next_batch(continued(8, 1 << 30, 1_000), 0, 1), (window, 1));
-  }
-
-  /// §4.8 Lookup read-ahead (`delivery_rate`). Do: rate 1 MiB streamed over half a second, nothing over a second,
-  /// and bytes over no measurable interval. Expect: 2 MiB/s, and zero — no rate measured — for both degenerate
-  /// cases, never a division fault.
-  #[test]
-  fn a_batch_delivery_rate_is_its_streamed_bytes_over_their_interval() {
-    assert_eq!(delivery_rate(1 << 20, 500_000_000), 2 << 20);
-    assert_eq!(delivery_rate(0, 1_000_000_000), 0);
-    assert_eq!(delivery_rate(1 << 20, 0), 0);
+    assert_eq!(next_batch(continued(512, 4 << 30), 0, 1), (window, 1_024));
   }
 
   /// §4.8 Lookup read-ahead (`ReadAheadLedger`). Do: charge windows up to the bound, one byte past it, then credit

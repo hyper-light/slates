@@ -771,6 +771,20 @@ fn grid() -> Vec<Scenario> {
       100,
       SimLoss::random(PPM / 10),
     ),
+    // The two-network Docker crossing the cross-region reads run on (`docs/wip/bench/multiregion/run.sh`: 100 ms one
+    // way, ±40 ms jitter that reorders and 3% loss in each direction, a link far faster than any window), so the
+    // simulator reproduces what bounds the real crossing before a controller change is A/B'd there.
+    Scenario {
+      jitter_ns: 40 * NS_PER_MS,
+      ..base(
+        "crossing: 1 Gbit/s, 200 ms, reordering ±40 ms each way, 3% loss each way",
+        1,
+        1,
+        200,
+        1_000,
+        SimLoss::random(PPM / 100 * 3),
+      )
+    },
     // The thin link's two impairments apart, so a slow pull names which one costs it.
     Scenario {
       jitter_ns: 40 * NS_PER_MS,

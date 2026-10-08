@@ -172,7 +172,8 @@ in the same commit as the work). Last reviewed 2026-10-07 at `89956659`.
     under a shaped router.
   - Cross-region reads are correct on the two networks (2026-10-07: 9 of 9 byte-identical on each link). On 100 ms
     with 3 % loss, batched read-ahead reads 8 MiB in 28.8–33.9 s (82.3–87.1 s one window per forward). With
-    ±40 ms jitter, reads take 125–145 s, bound by the session's congestion window (condition 7's jitter work).
+    ±40 ms jitter, 26.5–52.2 s since the read-ahead batch's rate cap was removed (2026-10-08; 97–131 s with it):
+    the cap, not the congestion window, had bound them.
   - The detector's far-link false deaths are fixed, including the stale-pool follow-up (0 of 100 seeds). A misfit
     pair condemns a dead member within its stated bound even when every survivor is far (40 of 40). The fix landed
     on hyper-raft `main` with the hyper-sim port, the `docs/timing.md` derivation and the records, plus two

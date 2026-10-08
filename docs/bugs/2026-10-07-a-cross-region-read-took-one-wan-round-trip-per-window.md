@@ -109,3 +109,20 @@ Load average 2–7 throughout. All N shown.
   the read path, bounds a cross-region read.
 - Reads of a snapshot (immutable) could be served from the reader's own region's mirror holders and never cross
   the WAN. Reads of the head must reach the owner.
+
+## Addendum (2026-10-08): the rate cap was wrong, and is gone
+
+The third cap above, what the measured rate moves in one liveness budget, held every batch on the jitter link to one
+window. The note read that as "the session's congestion window, not the read path, sets the time". It was the read
+path's own loop. Every batch is app-limited, since it asks for exactly its windows, so its delivery rate measured
+its own small size, and the cap fed on it. BBR's delivery-rate estimation never lets an app-limited sample lower the
+estimate (draft-cheng-iccrg-delivery-rate-estimation §3.3). An A/B on the two-network crossing removed the cap:
+
+- with the cap: 97–131 s;
+- without it: 28–52 s, and 26.5–52.2 s as landed;
+- all reads byte-identical in both arms.
+
+The cap's purpose, not holding the owner's session past a forward's budget, is met by the stall rule and the
+read-ahead ledger, and held-session waits fell (13 → 3). `next_batch` no longer takes a rate. `delivery_rate` and
+the rate plumbing are removed. Its unit test is restated as `a_continuing_read_doubles_its_batch_within_the_file`
+(`BENCHMARKS.md`, 2026-10-08).

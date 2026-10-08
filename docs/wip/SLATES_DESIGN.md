@@ -3793,7 +3793,10 @@ version.
 > - what is left of the file;
 > - the shard's read-ahead allowance (`DaemonConfig::read_ahead_bytes`, one session's receive bytes per peer inside
 >   the fleet's receive share), which the batch is charged against before it is fetched;
-> - once measured, what the path delivers in one liveness budget, timed between deliveries.
+> - ~~once measured, what the path delivers in one liveness budget, timed between deliveries~~ — removed 2026-10-08:
+>   every batch is app-limited, so its rate sample fed the cap a loop that held a cross-region read to one window per
+>   forward (97–131 s for 8 MiB on the two-network crossing, 26.5–52.2 s without it); an app-limited delivery sample
+>   must not lower the estimate it feeds (draft-cheng-iccrg-delivery-rate-estimation §3.3).
 >
 > Joined windows must read one state of the file. A batch is given up only when it stalls (no byte for one budget),
 > never at a deadline estimated from its size. Measured on two Docker networks at 100 ms one way with 3 % loss:
