@@ -3484,6 +3484,36 @@ passed 79/79 in 272 s (252–299 s before), so membership convergence did not sl
 other tree's compiled crates. Touching the sources did not help. Each arm is now built in its own target volume and
 copied into a distroless image, and the binaries' hashes must differ (A `d6b21905979c`, B `2f469a521c60`).
 
+### NFSv4 delegation policy, four arms (condition 12; 2026-10-08)
+
+Command: `docs/wip/bench/mixed/linux_vs_nfsd.sh 400 64` (slates' rows). Each arm's Linux release binary was built in
+its own target volume (A `56a4bb36f5ba`, B `e6639415e8f3`, C `e446e78a8291`, D `950fa1940fbd`), and the runs were
+interleaved. Load average 9–28 from other sessions; C and D's second runs fell at the high end. Grants from the
+daemon's status (`nfs4.delegation.granted`): A and C 2,462 a run (a write delegation per created file), B 0, D 1,491
+(read only).
+
+| Arm | Runs | p50 geomean vs A | p99 geomean vs A |
+|---|---|---|---|
+| A: write delegations, read delegations once a file has settled (today) | 5 | ×1.00 | ×1.00 |
+| B: no write delegations | 5 | ×0.85 | ×1.13 |
+| C: A, and read delegations without the settled rule | 2 | ×1.41 | ×2.31 |
+| D: B, and read delegations without the settled rule | 2 | ×1.37 | ×2.94 |
+
+Where B moves, by median p50:
+- **`stat`:** 46–67 → 7–9 µs.
+- **unlink:** 150 → 76 µs at 1 worker, 309 → 115 µs at 4.
+- **create:** 535 → 359 µs at 4 workers.
+- **reopens (overwrite, append, read):** 1.4–3× slower; 141 → 249 µs at 1 worker, 209 → 682 µs at 16.
+
+The daemon's calls explain the reopens: without a delegation the client revalidates every open, with GETATTR
+4,913 → 23,123 and ACCESS 2,713 → 10,975 a run. There were no recalls in any arm. So the cost of write delegations
+sits on the client: it returns the delegation before an unlink or rename, and asks the server on `stat`.
+
+C and D rejected: read delegations without the settled rule put a recall on every later change and sped no read
+(D's read p50 230 µs against B's 196 µs). A against B is a split on performance. B also removes the one correctness
+failure write delegations cause: Linux 6.17's truncate under a delegation, refused by mode bits (`GAPS.md`
+2026-10-07). The choice was put to Ada with B recommended.
+
 ### The incumbent baseline: slates against the kernel's own NFS server, one Linux client (condition 12; 2026-10-08)
 
 Command: `docs/wip/bench/mixed/linux_vs_nfsd.sh 400 64` in a privileged `rust:1.98.0` container (the header gives the

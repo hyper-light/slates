@@ -39,3 +39,5 @@ for W in 1 4 16; do
     python3 /m/mixed.py "$D/w$W" "$W" "$OPS" "$LARGE"
   done
 done
+# The daemon's own account of the run: delegations, recalls and the calls per NFS operation.
+slates --instance mx status --json > /out/status.json 2>/dev/null
