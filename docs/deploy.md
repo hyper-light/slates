@@ -145,8 +145,12 @@ capability its path carries.
 3. Publish a volume and name it in a PersistentVolume:
 
    ```
-   kubectl exec slates-0 -- /slates export <volume-id>
+   kubectl exec slates-0 -- /slates export <volume-id> --uid <the pods' runAsUser>
    ```
+
+   `--uid` binds the export to the identity the pods run as. The node's own processes, root included, then see the
+   mount's attributes and nothing inside it, so a link an agent plants out of the volume can never steer a host tool
+   (A-115). Leave it out only where several identities must share one export.
 
    ```yaml
    apiVersion: v1

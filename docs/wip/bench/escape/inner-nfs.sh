@@ -13,7 +13,9 @@ su tester -c "$B --instance $I anchor --quick > /home/tester/a.log 2>&1 &"
 for _ in $(seq 1 200); do su tester -c "$B --instance $I volume list" >/dev/null 2>&1 && break; sleep 0.1; done
 sleep 1; su tester -c "$B --instance $I bootstrap root" >/dev/null
 ID=$(su tester -c "$B --instance $I volume create esc --bounded 512MiB" | awk '/^id/{print $NF}')
-su tester -c "$B --instance $I export $ID" > /tmp/export.txt 2>&1
+# BOUND=1 binds the export to the agent's identity (A-115): every other caller, root included, sees attributes only.
+BIND=""; [ "${BOUND:-0}" = 1 ] && BIND="--uid $(id -u tester)"
+su tester -c "$B --instance $I export $ID $BIND" > /tmp/export.txt 2>&1
 PORT=$(awk '/^port:/{print $2}' /tmp/export.txt); EXPORT=$(awk '/^export:/{print $2}' /tmp/export.txt)
 [ -n "$PORT" ] || { echo "EXPORT-FAILED: $(cat /tmp/export.txt)"; exit 1; }
 mkdir -p $M
@@ -24,7 +26,12 @@ mount -t nfs -o "vers=4.2,proto=tcp,port=$PORT,hard,timeo=600,nosuid,nodev" "127
 chown tester $M 2>/dev/null; chmod 777 $M
 D=$(pgrep -u tester -f "slates --instance $I daemon" | head -1)
 W0=$(su tester -c "awk '/^write_bytes/{print \$2}' /proc/$D/io"); [ -n "$W0" ] || { echo "CANNOT-READ-DAEMON-IO (vacuous)"; exit 1; }
-su other -s /bin/sh -c "ls $M >/dev/null && echo 'other reaches the mount'" || echo "OTHER-CANNOT-REACH (vacuous)"
+if [ "${BOUND:-0}" = 1 ]; then
+  su other -s /bin/sh -c "ls $M >/dev/null 2>&1" && echo "OTHER REACHES A BOUND MOUNT" || echo "other is refused the bound mount, as A-115 says"
+  su tester -s /bin/sh -c "ls $M >/dev/null && echo 'tester reaches its bound mount'" || echo "TESTER-CANNOT-REACH (vacuous)"
+else
+  su other -s /bin/sh -c "ls $M >/dev/null && echo 'other reaches the mount'" || echo "OTHER-CANNOT-REACH (vacuous)"
+fi
 FAIL=0
 for SEED in ${SEEDS:-1 2 3 4 5}; do python3 /battery.py $M /secret $SEED ${STEPS:-300} || FAIL=1; done
 W1=$(su tester -c "awk '/^write_bytes/{print \$2}' /proc/$D/io")

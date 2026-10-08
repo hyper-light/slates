@@ -210,6 +210,69 @@ fn removing_a_source_mount_removes_its_bindings_and_recovery_agrees() {
   }
 }
 
+/// §4.6 A-115: do record a host mount bound to uid 1000 and scoped to directory 7, then bind its mount point; expect the
+/// form to keep the identity and the scope beside the mount point, live and after recovery. Before A-115 a bind
+/// rewrote every unscoped host mount's form as a chosen path, which for a bound mount would drop the identity and
+/// serve every caller.
+#[test]
+fn binding_a_bound_mount_keeps_its_identity_and_recovery_agrees() {
+  let mut segment = segment("slates-db-bound-mount", LOG_BYTES);
+  let mut db = open(&mut segment);
+  let volume = volume(1, "bound");
+  db.mutate(
+    &mut segment,
+    &Op::VolumeCreated {
+      record: volume.clone(),
+    },
+    0,
+  )
+  .unwrap();
+  let record = AttachmentRecord {
+    id: 1,
+    volume: volume.id,
+    consumer: Consumer::Bridge,
+    snapshot: None,
+    form: AttachForm::BoundMount {
+      uid: 1000,
+      scope: Some(7),
+      mount_point: None,
+    },
+    principal: principal(0),
+    rights: Rights {
+      read: true,
+      write: true,
+      admin: false,
+    },
+    token: [1; 16],
+  };
+  db.mutate(&mut segment, &Op::AttachmentAdded { record }, 0)
+    .unwrap();
+  db.mutate(
+    &mut segment,
+    &Op::AttachmentBound {
+      id: 1,
+      path: "/mnt/agent".into(),
+    },
+    0,
+  )
+  .unwrap();
+  let expected = AttachForm::BoundMount {
+    uid: 1000,
+    scope: Some(7),
+    mount_point: Some("/mnt/agent".into()),
+  };
+  let recovered = recover(&mut segment, 0, caps(), 0).unwrap().0;
+  for partition in [db.partition(), recovered.partition()] {
+    let form = &partition.attachment(1).unwrap().form;
+    assert_eq!(
+      form, &expected,
+      "the identity and the scope survive the bind"
+    );
+    assert_eq!(form.bound_uid(), Some(1000));
+    assert_eq!(form.mount_point(), Some("/mnt/agent"));
+  }
+}
+
 fn vid(n: u64) -> VolumeId {
   let mut bytes = [0u8; 16];
   bytes[..8].copy_from_slice(&n.to_be_bytes());

@@ -4247,6 +4247,19 @@ first.
   transport as something the client must ask the server about on each use.
 - Or document NFS as owner-only access in multi-user hosts, and keep FUSE for shared mounts.
 
+**Closed 2026-10-08 for bound exports (A-115).** `slates export ID --uid UID` binds an export to one identity; every
+other caller, root included, gets attributes and an `ACCESS` that grants nothing, and the Linux client's per-credential
+access cache stops its walk at the root. On the same five seeds × 400 steps
+(`TARGET_VOLUME=slates-esc-bound-target BOUND=1 SEEDS="11 12 13 14 15" STEPS=400 sh docs/wip/bench/escape/run-nfs.sh`):
+- the other user was refused all 135 of its follows of planted links; 0 canary reads (45 unbound), 0 through renamed
+  links (55 unbound);
+- the agent primed the cache by resolving the canary 10 times, and reached its mount;
+- 0 daemon disk writes; the outside tree's hash unchanged.
+- The second candidate (links the client must re-ask about) was rejected: a moving change attribute still leaves an
+  `acregmin` window, and `actimeo=0` costs the whole mount's attribute cache.
+- An unbound export keeps A-107's best-effort rule on NFS, for exports several identities share by design; the
+  deployment guide now binds every PersistentVolume's export to the pods' `runAsUser`.
+
 **Rerun 2026-10-08 on `bcc02163`** (`SEEDS="11 12 13 14 15" STEPS=400 sh docs/wip/bench/escape/run-nfs.sh`, Linux
 release build, privileged `rust:1.98.0` container): unchanged in kind.
 - Held: 0 daemon disk writes; the outside tree's hash unchanged (`c74dcfd9498d652f`).

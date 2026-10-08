@@ -5836,6 +5836,11 @@ fn recorded_form(form: &AttachRequest, established: AttachForm, scope: Option<u6
       path: mount_point.clone(),
       scope,
     },
+    (AttachRequest::BoundHostMount { uid, .. }, scope) => AttachForm::BoundMount {
+      uid: *uid,
+      scope,
+      mount_point: None,
+    },
     _ => established,
   }
 }
@@ -5948,7 +5953,8 @@ pub(crate) fn consumer_of(form: &AttachRequest, client_id: u32) -> Result<Consum
     | AttachRequest::FuseMount { .. }
     | AttachRequest::ScopedHostMount { .. }
     | AttachRequest::ScopedFuseMount { .. }
-    | AttachRequest::SharedFuseMount { .. } => Ok(Consumer::Bridge),
+    | AttachRequest::SharedFuseMount { .. }
+    | AttachRequest::BoundHostMount { .. } => Ok(Consumer::Bridge),
     AttachRequest::Root => Ok(Consumer::Sdk { client: client_id }),
     AttachRequest::Oci { .. } => Err(Refusal::AttachmentUnsupported {
       transport: AttachTransport::Oci,
@@ -5991,8 +5997,9 @@ fn establish_form(
     // and nothing of the daemon's touches the mount table).
     AttachRequest::Root => return Ok(None),
     // A scoped host mount presents the live head beneath one directory; a snapshot of a subtree is not
-    // presented (its scope and its version would both have to hold through one view).
-    AttachRequest::ScopedHostMount { .. } => {
+    // presented (its scope and its version would both have to hold through one view). A bound host mount
+    // presents the live head too (§4.6 A-115).
+    AttachRequest::ScopedHostMount { .. } | AttachRequest::BoundHostMount { .. } => {
       if snapshot.is_some() {
         return Err(Refusal::AttachmentUnsupported {
           transport: AttachTransport::NfsLoopback,

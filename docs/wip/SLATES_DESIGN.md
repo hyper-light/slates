@@ -10049,7 +10049,8 @@ Status: built 2026-10-06.
 - Limits:
   - FUSE asks for `READLINK` on every follow (the kernel keeps no symlink cache for it), so the rule holds per caller.
   - An NFS client caches a symlink's target in its page cache, so after the owner's read another local user may be
-    served the cached target without a request. The rule is therefore exact on FUSE and best-effort on NFS.
+    served the cached target without a request. The rule is therefore exact on FUSE and best-effort on a shared NFS
+    export; an export bound to one identity makes it exact on NFS too (A-115).
   - FUSE cannot tell `readlink(2)` from a path walk, so a non-owner's `readlink` of such a link is refused too, which
     is stricter than Linux (it allows `readlink` and refuses only the follow).
 - Measured (Linux FUSE, Docker `rust:1.98.0`, mount `--shared`, 2026-10-06), as `tester` (the mount's user), `root`
@@ -10312,3 +10313,65 @@ Status: built 2026-10-06 (Linux, macOS; Windows by the shared module, cross-lint
 - With nothing published (the anchor up, no daemon yet), a client is told "not yet published" at once, as with no
   daemon; with a daemon restarting, its claim waits and the next daemon answers it.
 - Measured: a CLI verb started at the kill now succeeds in 14.5–17 ms (it failed after 1,014 ms).
+
+### A-115 — An export bound to one identity (2026-10-08)
+Applied in the same change to:
+- `crates/bridge-core/src/access.rs` (`Caller::stranger`: permitted nothing, owns nothing, never the superuser);
+- `crates/bridge-nfs/src/procedures.rs` (`Export::set_stranger`, `serves_strangers`, `refusal_reply`);
+- `crates/db/src/catalog.rs` (`AttachForm::BoundMount`, appended; `bound_uid`) and `crates/db/src/partition.rs`
+  (a bound mount keeps its identity and scope when its mount point is bound);
+- `crates/ipc/src/protocol.rs` (`AttachRequest::BoundHostMount`, appended), `crates/server/src/verbs.rs` (the
+  form's consumer, establishment and record), `crates/server/src/nfs.rs` (a caller other than the bound uid is
+  served as a stranger; the mount's `UMNT` watch covers the form);
+- `crates/client/src/client.rs` (`attach_bound_mount`) and `crates/cli` (`export ID --uid UID`);
+- the tests `a_bound_export_serves_its_identity_and_shows_any_other_caller_only_attributes`
+  (`crates/server/tests/nfs_mount.rs`), `binding_a_bound_mount_keeps_its_identity_and_recovery_agrees`
+  (`crates/db/tests/model.rs`) and `export_names_a_volume_and_its_options` (`crates/cli/src/args.rs`);
+- the battery's `BOUND=1` and `TARGET_VOLUME` (`docs/wip/bench/escape/`), `docs/cli.md`, `docs/deploy.md`, A-107's
+  limits, GAPS.
+
+Status: built 2026-10-08.
+- What it answers: A-107's rule (a link out of the volume resolves only for its owner) is exact on FUSE and was
+  best-effort on NFS. The Linux NFS client keeps a symbolic link's target in the link inode's page cache and serves
+  every later follow from it, whoever follows, without asking the server (`nfs_get_link` revalidates the mapping by
+  attributes only). The escape battery measured it: another user read the canary through a planted link 45 times
+  in 5 seeds × 400 steps (GAPS, 2026-10-07 and its 2026-10-08 rerun).
+- The rule: an export may be bound to one Unix identity (`slates export ID --uid UID`). A request whose `AUTH_SYS`
+  caller is that uid is served as on any export. Every other caller, the superuser included, is a stranger:
+  - it is answered `GETATTR`, `FSSTAT`, `FSINFO`, `PATHCONF` and `ACCESS`, and the procedures that only release
+    file state (`CLOSE`, `OPEN_DOWNGRADE`, `LOCKU`, `TEST_STATEID`, `FREE_STATEID`, `DELEGRETURN`);
+  - its `ACCESS` grants nothing;
+  - everything else, `LOOKUP`, `READLINK`, `READ`, `OPEN` and every change included, is `NFS4ERR_ACCESS` /
+    `NFS3ERR_ACCES` before it touches the volume.
+- Why this holds where A-107 alone could not: the Linux client's access cache is kept per credential
+  (`nfs_access_get_cached`), and a path walk asks `nfs_permission` for search permission on every directory it
+  crosses, the export's root first. A stranger's walk therefore stops at the root on the stranger's own `ACCESS`
+  answer, before it can reach any cached dentry or link target below. The mount itself still works for root (the
+  kernel's mount reads only the root's attributes), so kubelet and a container runtime mount and bind it unchanged.
+- Rejected:
+  - Squashing other callers to an anonymous uid (nfsd's `all_squash`): the anonymous uid is still judged by the
+    other class, so on a typical 0755 tree it walks in and is served the cached targets as before.
+  - Forcing the client to revalidate links (a change attribute that moves on every `GETATTR`, or `actimeo=0`): the
+    first leaves a window of `acregmin` (3 s by default) in which the cache answers; the second costs every
+    attribute cache on the mount.
+  - `nosymfollow` on the mount: blocks the relative links real trees need (A-107).
+  - Binding every export to its creator by default: a macOS loopback mount and a shared host mount serve several
+    users by design; binding is the export's choice, as `--read-only` and `--subtree` are.
+- Measured (2026-10-08): `TARGET_VOLUME=slates-esc-bound-target BOUND=1 SEEDS="11 12 13 14 15" STEPS=400 sh
+  docs/wip/bench/escape/run-nfs.sh` (Linux 6.12 NFSv4.2 client, privileged `rust:1.98.0` container, the same seeds
+  as the unbound rerun):
+
+  | Export | Other user's follows of a planted out-of-volume link | Refused | Canary read through it | Through a renamed link |
+  |---|---|---|---|---|
+  | Unbound (rerun on `bcc02163`) | 186 | 141 | 45 | 55 |
+  | Bound to the agent (`--uid`) | 135 | 135 | 0 | 0 |
+
+  - Non-vacuous: the agent itself resolved the canary through its links 10 times, priming the client's cache, and
+    the other user was still refused every time; the agent reached its mount and root's `chmod` of the mount point
+    was refused.
+  - Held as before: 0 bytes written to disk by the daemon; the outside tree's hash unchanged.
+  - The kernel paths are Linux v6.12's `fs/nfs/symlink.c` (`nfs_get_link`: the target comes from the page cache once
+    the attributes revalidate) and `fs/nfs/dir.c` (`nfs_permission` → `nfs_do_access`, cached per credential).
+- Limits: `AUTH_SYS` names the caller; a client host that lies about uids is inside the trust boundary, as for every
+  NFS export without Kerberos. A container whose processes run as root shares uid 0 with the host's root, so bind
+  such an export to uid 0 only where the host's root is trusted with the volume.

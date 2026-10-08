@@ -2885,6 +2885,185 @@ fn a_write_delegation_does_not_lend_its_holders_permission_to_another_users_trun
   );
 }
 
+/// §4.6 A-115 (condition 4): an export bound to one identity serves that identity, and shows every other caller only
+/// attributes. A Linux NFS client caches a symbolic link's target per inode, not per user, so on a shared export a link
+/// out of the volume that its owner resolved was served to other users from that cache, the server never asked (the
+/// escape battery, 2026-10-07: 45 reads of the canary through planted links). The client's access cache is per user,
+/// though, so a stranger whose `ACCESS` grants nothing stops at the export's root. Do: bind an export to the owner's
+/// uid; as the owner plant `out -> /etc/passwd` and read it back; then as another uid, and as root, mount, read the
+/// root's attributes, ask `ACCESS`, look the link up, read it and create a file. Expect the mount and the attributes
+/// served, `ACCESS` granting nothing, and everything else `NFS4ERR_ACCESS`; the owner is served throughout.
+#[test]
+fn a_bound_export_serves_its_identity_and_shows_any_other_caller_only_attributes() {
+  let (daemon, instance) = single_shard_daemon("bound-export");
+  let mut client = Client::connect(&instance);
+  let ReplyBody::Created { id } = client.call(&scratch("bound")) else {
+    panic!("the volume is created");
+  };
+  let owner = rustix::process::getuid().as_raw();
+  let ReplyBody::Attached {
+    attachment,
+    token: Some(token),
+    ..
+  } = client.call(&RequestBody::Attach {
+    volume: id,
+    snapshot: None,
+    intent: Intent::Write,
+    form: AttachRequest::BoundHostMount {
+      uid: owner,
+      subtree: None,
+    },
+  })
+  else {
+    panic!("the bound export's attachment was refused");
+  };
+  let token_hex: String = token.iter().map(|byte| format!("{byte:02x}")).collect();
+  let component = format!("bound@{attachment:x}.{token_hex}");
+  let mut v4 = V4Client::connect(daemon.nfs_port().expect("the daemon is serving NFS"));
+  v4.caller = Some((owner, owner));
+  let root = volume_root(&mut v4, &component);
+  assert_eq!(create_link(&mut v4, &root, "out", "/etc/passwd"), NFS4_OK);
+  let link = child_fh(&mut v4, &root, "out").expect("the owner looks its link up");
+  assert_eq!(read_link(&mut v4, &link), Ok("/etc/passwd".to_owned()));
+  let owner_access = access_of(&mut v4, &root).expect("the owner's ACCESS");
+  assert_ne!(owner_access, 0, "the owner is granted access to its root");
+  let strangers = if owner == 0 {
+    vec![1000]
+  } else {
+    vec![owner.wrapping_add(1).max(1), 0]
+  };
+  for stranger in strangers {
+    probe_as_stranger(&mut v4, stranger, &component, (&root, &link));
+  }
+  v4.caller = Some((owner, owner));
+  assert_eq!(
+    read_link(&mut v4, &link),
+    Ok("/etc/passwd".to_owned()),
+    "the owner is still served"
+  );
+  assert_eq!(access_of(&mut v4, &root), Ok(owner_access));
+  drop(client);
+  drop(daemon);
+}
+
+/// Probes the bound export as `stranger`: the mount and the root's attributes are served, `ACCESS` grants nothing,
+/// and a lookup, a link's read and a create are each `NFS4ERR_ACCESS` (A-115).
+fn probe_as_stranger(
+  v4: &mut V4Client,
+  stranger: u32,
+  component: &str,
+  (root, link): (&[u8], &[u8]),
+) {
+  v4.caller = Some((stranger, stranger));
+  let mounted = volume_root(v4, component);
+  assert_eq!(mounted, root, "uid {stranger} mounts the export");
+  assert_eq!(
+    v4.getattr_status(root),
+    NFS4_OK,
+    "uid {stranger} reads attributes"
+  );
+  assert_eq!(
+    access_of(v4, root),
+    Ok(0),
+    "uid {stranger} is granted nothing"
+  );
+  assert_eq!(
+    child_fh(v4, root, "out"),
+    Err(NFS4ERR_ACCESS),
+    "uid {stranger} looks nothing up"
+  );
+  assert_eq!(
+    read_link(v4, link),
+    Err(NFS4ERR_ACCESS),
+    "uid {stranger} follows no link"
+  );
+  assert_eq!(
+    create_link(v4, root, "mine", "x"),
+    NFS4ERR_ACCESS,
+    "uid {stranger} creates nothing"
+  );
+}
+
+/// Format: `OP_CREATE`, `OP_READLINK` and the `NF4LNK` object type (RFC 7863).
+const OP_CREATE: u32 = 6;
+const OP_READLINK: u32 = 27;
+const NF4LNK: u32 = 5;
+
+/// Creates the symbolic link `name -> target` in directory `dir` as `v4`'s caller: the compound's status.
+fn create_link(v4: &mut V4Client, dir: &[u8], name: &str, target: &str) -> u32 {
+  use slates_bridge_nfs::xdr::XdrWriter;
+  let mut ops = XdrWriter::new();
+  ops.u32(OP_PUTFH);
+  ops.opaque(dir);
+  ops.u32(OP_CREATE);
+  ops.u32(NF4LNK);
+  ops.opaque(target.as_bytes());
+  ops.opaque(name.as_bytes());
+  // No attributes: an empty bitmap and an empty attribute list.
+  ops.u32(0);
+  ops.u32(0);
+  v4.sequenced(2, ops.as_slice()).0
+}
+
+/// The handle of `name` in directory `dir`, or the status refusing the lookup, as `v4`'s caller.
+fn child_fh(v4: &mut V4Client, dir: &[u8], name: &str) -> Result<Vec<u8>, u32> {
+  use slates_bridge_nfs::xdr::{XdrReader, XdrWriter};
+  let mut ops = XdrWriter::new();
+  ops.u32(OP_PUTFH);
+  ops.opaque(dir);
+  ops.u32(OP_LOOKUP);
+  ops.opaque(name.as_bytes());
+  ops.u32(OP_GETFH);
+  let (status, results) = v4.sequenced(3, ops.as_slice());
+  if status != NFS4_OK {
+    return Err(status);
+  }
+  let mut reader = XdrReader::new(&results);
+  let malformed = |_| MALFORMED_REPLY;
+  reader.fixed(8 + 8 + 8).map_err(malformed)?;
+  Ok(reader.opaque(128).map_err(malformed)?.to_vec())
+}
+
+/// Shape: the status a test helper answers when the server's reply does not decode (no NFSv4 status uses it).
+const MALFORMED_REPLY: u32 = u32::MAX;
+
+/// The target of the link `link` names, or the status refusing it, as `v4`'s caller.
+fn read_link(v4: &mut V4Client, link: &[u8]) -> Result<String, u32> {
+  use slates_bridge_nfs::xdr::{XdrReader, XdrWriter};
+  let mut ops = XdrWriter::new();
+  ops.u32(OP_PUTFH);
+  ops.opaque(link);
+  ops.u32(OP_READLINK);
+  let (status, results) = v4.sequenced(2, ops.as_slice());
+  if status != NFS4_OK {
+    return Err(status);
+  }
+  let mut reader = XdrReader::new(&results);
+  let malformed = |_| MALFORMED_REPLY;
+  reader.fixed(8 + 8).map_err(malformed)?;
+  let target = reader.opaque(4096).map_err(malformed)?.to_vec();
+  String::from_utf8(target).map_err(|_| MALFORMED_REPLY)
+}
+
+/// The access `v4`'s caller is granted on `object` of every right it asks for, or the status refusing the ask.
+fn access_of(v4: &mut V4Client, object: &[u8]) -> Result<u32, u32> {
+  use slates_bridge_nfs::xdr::{XdrReader, XdrWriter};
+  let mut ops = XdrWriter::new();
+  ops.u32(OP_PUTFH);
+  ops.opaque(object);
+  ops.u32(OP_ACCESS);
+  ops.u32(0x1f);
+  let (status, results) = v4.sequenced(2, ops.as_slice());
+  if status != NFS4_OK {
+    return Err(status);
+  }
+  let mut reader = XdrReader::new(&results);
+  let malformed = |_| MALFORMED_REPLY;
+  reader.fixed(8 + 8).map_err(malformed)?;
+  let _supported = reader.u32().map_err(malformed)?;
+  reader.u32().map_err(malformed)
+}
+
 /// RFC 8881 §10.4.3 (A-80): do read the attributes of a file A holds a write delegation of, from B; expect
 /// `NFS4ERR_DELAY` and A recalled. A's own GETATTR is answered.
 #[test]

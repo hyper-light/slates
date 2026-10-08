@@ -113,6 +113,9 @@ pub struct Caller {
   pub uid: u32,
   /// The groups, or `None` for a caller whose credential named none.
   pub groups: Option<UnixGroups>,
+  /// Whether the caller is a stranger to an export bound to another identity (§4.6 A-115): it is permitted
+  /// nothing and owns nothing, whatever the mode bits and whatever its uid, the superuser's included.
+  pub stranger: bool,
 }
 
 impl Caller {
@@ -122,12 +125,32 @@ impl Caller {
     Caller {
       uid: ROOT_UID,
       groups: None,
+      stranger: false,
     }
   }
 
-  /// Whether the caller is the superuser.
+  /// A caller with Unix identity `uid` and `groups`.
+  pub fn unix(uid: u32, groups: Option<UnixGroups>) -> Caller {
+    Caller {
+      uid,
+      groups,
+      stranger: false,
+    }
+  }
+
+  /// A stranger to an export bound to another identity (§4.6 A-115): no identity, no groups, and no
+  /// permission on any object.
+  pub fn stranger() -> Caller {
+    Caller {
+      uid: INVALID_UID,
+      groups: None,
+      stranger: true,
+    }
+  }
+
+  /// Whether the caller is the superuser. A stranger never is, whatever uid it presented.
   pub fn is_root(&self) -> bool {
-    self.uid == ROOT_UID
+    !self.stranger && self.uid == ROOT_UID
   }
 
   /// Whether `gid` is the caller's primary or one of its supplementary groups.
@@ -140,7 +163,7 @@ impl Caller {
 
   /// Whether the caller owns `node`.
   pub fn owns(&self, node: &NodeAttr) -> bool {
-    self.uid == node.uid
+    !self.stranger && self.uid == node.uid
   }
 }
 
@@ -184,6 +207,9 @@ fn class_bit(caller: &Caller, node: &NodeAttr, want: Want) -> u32 {
 
 /// Whether `caller` may `want` `node` by the POSIX class rule, with the superuser's exemptions.
 pub fn permits(caller: &Caller, node: &NodeAttr, want: Want) -> bool {
+  if caller.stranger {
+    return false;
+  }
   if caller.is_root() {
     // The superuser reads, writes and searches anything, and executes a file that some class may.
     return want != Want::Search || node.kind == Kind::Dir || node.mode & ANY_EXECUTE != 0;
@@ -328,13 +354,13 @@ mod tests {
   }
 
   fn user(uid: u32, gid: u32, supplementary: &[u32]) -> Caller {
-    Caller {
+    Caller::unix(
       uid,
-      groups: Some(UnixGroups {
+      Some(UnixGroups {
         gid,
         supplementary: supplementary.to_vec(),
       }),
-    }
+    )
   }
 
   /// The class rule: the owner is judged by the owner bits alone, a group member by the group bits,
@@ -365,10 +391,7 @@ mod tests {
     let file = node(Kind::File, 0o040, 1000, 2000);
     let supplementary = user(1001, 9, &[2000]);
     assert!(permits(&supplementary, &file, Want::Read));
-    let nobody = Caller {
-      uid: INVALID_UID,
-      groups: None,
-    };
+    let nobody = Caller::unix(INVALID_UID, None);
     assert!(!permits(&nobody, &file, Want::Read));
     assert!(!nobody.in_group(2000));
   }

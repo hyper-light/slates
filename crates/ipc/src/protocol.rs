@@ -1945,6 +1945,16 @@ pub enum AttachRequest {
     /// The directory presented, as a path from the volume's root; the whole volume when absent.
     subtree: Option<String>,
   },
+  /// A host mount bound to one Unix identity (§4.6 A-115): requests whose `AUTH_SYS` caller is `uid` are served;
+  /// every other caller, the superuser's included, is answered attributes and an `ACCESS` granting nothing, so a
+  /// kernel's per-user access cache stops its walk at the export's root and no link target one identity read is
+  /// served to another from the client's cache. Optionally one directory. Appended.
+  BoundHostMount {
+    /// The identity served.
+    uid: u32,
+    /// The directory presented, as a path from the volume's root; the whole volume when absent.
+    subtree: Option<String>,
+  },
 }
 
 impl AttachRequest {
@@ -1962,7 +1972,9 @@ impl AttachRequest {
   pub fn subtree(&self) -> Option<&str> {
     match self {
       Self::ScopedHostMount { subtree } | Self::ScopedFuseMount { subtree, .. } => Some(subtree),
-      Self::SharedFuseMount { subtree, .. } => subtree.as_deref(),
+      Self::SharedFuseMount { subtree, .. } | Self::BoundHostMount { subtree, .. } => {
+        subtree.as_deref()
+      }
       _ => None,
     }
   }

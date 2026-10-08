@@ -256,7 +256,7 @@ slates advance ATTACHMENT [VERSION] [--json]
 slates read VOLUME PATH [--version N | --attachment A]
 slates mount ID PATH [--read-only] [--subtree DIR]
 slates unmount PATH
-slates export ID [--read-only] [--subtree DIR]
+slates export ID [--read-only] [--subtree DIR] [--uid UID]
 slates land ID TARGET [--snapshot N] [--include P] [--exclude P] [--grant N] [--json]
 slates grants [--json]
 slates grant LANDING MANIFEST [--session] [--term SECONDS] [--json]
@@ -315,7 +315,9 @@ never holds up another.
 `slates export ID` prints `export: /<name>@<attachment>.<token>`, the path a Kubernetes PersistentVolume
 names as its `nfs` path on a fleet node's network export (RPC-with-TLS on the node's base port, served when
 the fleet manifest names an operator authority). The export has its own attachment, ending with `slates detach`
-or the volume's destroy. `--read-only` takes no write lease, and `--subtree DIR` presents only that directory.
+or the volume's destroy. `--read-only` takes no write lease, and `--subtree DIR` presents only that directory. `--uid UID` serves only that
+Unix identity: every other caller, root included, is shown the export's attributes and refused everything else, so a
+Linux client never serves one user what another read through the mount (a symbolic link's target above all; A-115).
 
 The merge flow (§4.16): `green NAME` starts a green from scratch, or from a **complete immutable
 base** with `--base VOLUME --snapshot N` — a snapshot of a volume whose whole tree is in memory

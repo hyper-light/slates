@@ -139,7 +139,7 @@ fn export_verb(
   client: &mut Client,
   instance: &str,
   volume: VolumeId,
-  (read_only, subtree): (bool, Option<&str>),
+  (read_only, subtree, uid): (bool, Option<&str>, Option<u32>),
   json: bool,
 ) -> Result<(), Failure> {
   let report = client.status(volume).map_err(|e| failure_of(e, instance))?;
@@ -148,9 +148,10 @@ fn export_verb(
   } else {
     Intent::Write
   };
-  let attachment = match subtree {
-    Some(subtree) => client.attach_scoped_mount(volume, intent, subtree),
-    None => client.attach_mount(volume, intent),
+  let attachment = match (uid, subtree) {
+    (Some(uid), subtree) => client.attach_bound_mount(volume, intent, uid, subtree),
+    (None, Some(subtree)) => client.attach_scoped_mount(volume, intent, subtree),
+    (None, None) => client.attach_mount(volume, intent),
   }
   .map_err(|e| failure_of(e, instance))?;
   let Some(token) = attachment.token else {
@@ -349,13 +350,14 @@ pub(crate) fn run(request: &ClientRequest) -> Result<(), Failure> {
     volume,
     read_only,
     subtree,
+    uid,
   } = &request.verb
   {
     return export_verb(
       &mut client,
       &request.instance,
       *volume,
-      (*read_only, subtree.as_deref()),
+      (*read_only, subtree.as_deref(), *uid),
       request.json,
     );
   }

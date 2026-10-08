@@ -2420,6 +2420,29 @@ impl Client {
     )
   }
 
+  /// Attaches for a host kernel mount of `volume` bound to Unix identity `uid` (§4.6 A-115), optionally presenting
+  /// only directory `subtree`: requests whose caller is `uid` are served; every other caller, the superuser's
+  /// included, is answered attributes and an `ACCESS` granting nothing, so a client's cache of what `uid` read
+  /// (a link's target above all) is never served to another user. The attachment is the mount's, as
+  /// [`Client::attach_mount`]'s.
+  pub fn attach_bound_mount(
+    &mut self,
+    volume: VolumeId,
+    intent: Intent,
+    uid: u32,
+    subtree: Option<&str>,
+  ) -> Result<Attachment, ClientError> {
+    self.attach_with(
+      volume,
+      None,
+      intent,
+      AttachRequest::BoundHostMount {
+        uid,
+        subtree: subtree.map(str::to_owned),
+      },
+    )
+  }
+
   /// Attaches a Linux FUSE mount of `volume` at `mount_point` (§4.6 "Linux"; AUD-29-64): the daemon mounts
   /// through the OS's `fusermount3` and serves the mount on the volume's owner shard; the reply comes once
   /// the mount is established (waited for while the daemon lives, as a granted landing's is), with the

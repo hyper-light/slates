@@ -437,6 +437,17 @@ pub enum AttachForm {
     /// The directory's inode number, when the mount presents one directory.
     scope: Option<u64>,
   },
+  /// A host mount bound to one Unix identity (§4.6 A-115): it serves requests whose caller is `uid`, and to every
+  /// other caller, the superuser's included, only attributes and an `ACCESS` that grants nothing, so no kernel's
+  /// cache of what one identity read through it serves another. Optionally one directory. Appended.
+  BoundMount {
+    /// The identity served.
+    uid: u32,
+    /// The directory's inode number, when the mount presents one directory.
+    scope: Option<u64>,
+    /// The mount point, once bound.
+    mount_point: Option<String>,
+  },
 }
 
 impl AttachForm {
@@ -447,7 +458,9 @@ impl AttachForm {
       | Self::FuseMount { path }
       | Self::ScopedFuseMount { path, .. }
       | Self::SharedFuseMount { path, .. } => Some(path),
-      Self::ScopedMount { mount_point, .. } => mount_point.as_deref(),
+      Self::ScopedMount { mount_point, .. } | Self::BoundMount { mount_point, .. } => {
+        mount_point.as_deref()
+      }
       Self::Root | Self::Oci { .. } | Self::GuestTag { .. } => None,
     }
   }
@@ -456,7 +469,17 @@ impl AttachForm {
   pub fn scope(&self) -> Option<u64> {
     match self {
       Self::ScopedMount { scope, .. } | Self::ScopedFuseMount { scope, .. } => Some(*scope),
-      Self::GuestTag { scope, .. } | Self::SharedFuseMount { scope, .. } => *scope,
+      Self::GuestTag { scope, .. }
+      | Self::SharedFuseMount { scope, .. }
+      | Self::BoundMount { scope, .. } => *scope,
+      _ => None,
+    }
+  }
+
+  /// The one Unix identity a bound mount serves (§4.6 A-115); `None` for a form that serves every caller.
+  pub fn bound_uid(&self) -> Option<u32> {
+    match self {
+      Self::BoundMount { uid, .. } => Some(*uid),
       _ => None,
     }
   }

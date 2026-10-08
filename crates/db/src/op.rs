@@ -113,7 +113,8 @@ pub enum Op {
     id: u64,
   },
   /// A host mount's attachment was bound to the path the mount was established at (§4.4
-  /// `Binding → Bound`; GAP-A9-4): its form becomes `ChosenPath { path }`. Appended.
+  /// `Binding → Bound`; GAP-A9-4): its form becomes `ChosenPath { path }`, a scoped mount's keeps its scope and a
+  /// bound mount's its identity and scope (A-115). Appended.
   AttachmentBound {
     /// The attachment.
     id: u64,

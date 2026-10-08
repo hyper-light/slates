@@ -489,10 +489,7 @@ impl<'b> Export<'b> {
       volume,
       attachments,
       attachment,
-      caller: Caller {
-        uid: caller_uid,
-        groups: None,
-      },
+      caller: Caller::unix(caller_uid, None),
       write_verifier: fsid,
       dialect: Dialect::MACOS_NFS3,
       files: FileSlot::Owned(Box::new(FileState::standalone())),
@@ -522,10 +519,7 @@ impl<'b> Export<'b> {
       volume,
       attachments: Registry::Shared(attachments),
       attachment,
-      caller: Caller {
-        uid: caller_uid,
-        groups: None,
-      },
+      caller: Caller::unix(caller_uid, None),
       write_verifier: fsid,
       dialect: Dialect::MACOS_NFS3,
       files: FileSlot::Absent,
@@ -545,7 +539,17 @@ impl<'b> Export<'b> {
   /// class of every permission check. The daemon's export path calls this per request; a mount with no
   /// such credential leaves it `None` — a parent-inherited group, a caller in no group.
   pub fn set_groups(&mut self, groups: Option<UnixGroups>) {
-    self.caller.groups = groups;
+    if !self.caller.stranger {
+      self.caller.groups = groups;
+    }
+  }
+
+  /// Serves the request being answered as a stranger (§4.6 A-115): its caller is not the identity the export
+  /// is bound to. Only the attribute procedures answer ([`serves_strangers`]); `ACCESS` grants nothing, so the
+  /// client's per-user access cache stops the stranger's walk at the export's root; everything else is refused
+  /// `NFS3ERR_ACCES` before it touches the volume.
+  pub fn set_stranger(&mut self) {
+    self.caller = Caller::stranger();
   }
 
   /// Sets the write verifier (RFC 1813 `writeverf3`) this export answers WRITE and COMMIT with: the
@@ -802,6 +806,9 @@ impl<'b> Export<'b> {
   /// Dispatches one NFSv3 procedure, returning the accepted reply's result bytes, or `None` for a
   /// procedure this slice does not serve (the caller answers `PROC_UNAVAIL`).
   pub fn serve_nfs(&mut self, procedure: u32, args: &mut XdrReader<'_>) -> Option<Vec<u8>> {
+    if self.caller.stranger && !serves_strangers(procedure) {
+      return Some(refusal_reply(Nfsstat3::Acces, procedure));
+    }
     match procedure {
       NFSPROC3_NULL => Some(Vec::new()),
       NFSPROC3_GETATTR => Some(self.getattr(args)),
@@ -2782,6 +2789,41 @@ pub fn io_failure_reply(procedure: u32) -> Option<Vec<u8>> {
     _ => return None,
   }
   Some(writer.into_bytes())
+}
+
+/// Whether a stranger to a bound export (§4.6 A-115) is answered `procedure`: the attribute reads a kernel's
+/// mount of the export makes as root (`GETATTR`, `FSSTAT`, `FSINFO`, `PATHCONF`), `ACCESS` (which grants a
+/// stranger nothing), and the procedures that only release file state, so a client's own state is never
+/// wedged by the identity its kernel sends a release under. Nothing that reads, lists, follows, opens or
+/// changes an object.
+fn serves_strangers(procedure: u32) -> bool {
+  matches!(
+    procedure,
+    NFSPROC3_NULL
+      | NFSPROC3_GETATTR
+      | NFSPROC3_ACCESS
+      | NFSPROC3_FSSTAT
+      | NFSPROC3_FSINFO
+      | NFSPROC3_PATHCONF
+      | extension::STATE_CLOSE
+      | extension::STATE_DOWNGRADE
+      | extension::STATE_LOCKU
+      | extension::STATE_TEST
+      | extension::STATE_FREE
+      | extension::STATE_DELEGRETURN
+  )
+}
+
+/// [`status_failure_reply`] in the shape of any procedure this export serves: a state-carrying I/O extension
+/// (A-36) answers its state status (clear) around the NFSv3 refusal, as [`io_failure_reply`] does.
+pub fn refusal_reply(status: Nfsstat3, procedure: u32) -> Vec<u8> {
+  if let Some(inner) = state_io_inner(procedure) {
+    let mut writer = XdrWriter::new();
+    writer.u32(0);
+    writer.fixed(&status_failure_reply(status, inner));
+    return writer.into_bytes();
+  }
+  status_failure_reply(status, procedure)
 }
 
 /// The reply refusing any procedure with `status` before it touched the volume, in the procedure's
