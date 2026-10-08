@@ -4705,6 +4705,17 @@ are owed in the report before the next reading.
   register contract (one value per committed position) is still bent by that growth, and a successor answers its own
   client `HomedElsewhere` before its adoption (`docs/bugs/2026-10-08-a-sealed-head-shipped-without-its-successors-key-entry.md`).
 
+### 2026-10-08: the transport and VFS suites pass on x86_64 Linux, under Docker's amd64 emulation (condition 6)
+
+`docker run --platform linux/amd64 -e RUSTUP_TOOLCHAIN=1.98.0 … rust:1.98.0 cargo test --release -p slates-vfs -p
+slates-transport` (`uname -m` reports `x86_64`):
+- 42 test binaries, all `ok`, 0 failed, among them:
+  - the transport's 132 unit tests and 17 real-UDP session tests;
+  - the VFS model oracle, recovery (41) and the base host (30).
+- `RUSTUP_TOOLCHAIN` uses the image's toolchain. Without it, rustup fetched the components `rust-toolchain.toml`
+  names, and under emulation that stalled one run for over ten minutes.
+- Owed on x86_64: the server and fleet suites, and the kernel-mount lanes. CI's ubuntu-latest lane runs them natively.
+
 ### 2026-10-08: the OCI binding through containerd 1.7 and runc 1.1, rerun on HEAD (condition 2)
 
 `docs/wip/bench/containerd/run.sh` (privileged `rust:1.98.0`, containerd 1.7.24 and runc 1.1.15 from Debian trixie,
