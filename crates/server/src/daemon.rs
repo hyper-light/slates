@@ -2895,6 +2895,7 @@ fn init_shard(
     peer_recipients: std::collections::BTreeMap::new(),
     content,
     purge_seen_allocations: 0,
+    recovery_returned_at: None,
     content_range,
     delta_range: delta_range(config, partition, content_range),
     journal: slates_vfs::checkpoint_log::Journal::default(),
@@ -3222,6 +3223,52 @@ fn purge_write_log(_s: &mut ShardState) -> usize {
 /// Counter: content bytes an idle shard gave back to the OS (A-105).
 pub const CONTENT_PURGED: &str = "content.purged_bytes";
 
+/// Counter: recovery memory an idle shard gave back because no restart reads it (A-117).
+pub const RECOVERY_RETURNED: &str = "recovery.returned_bytes";
+
+/// Gives back an idle shard's recovery memory that no restart reads (A-117): the checkpoint slot older than the
+/// committed one, and its delta log past the tail (`Journal::dead_ranges`). Once per publication: a later one re-arms
+/// it. A busy shard never runs this, so its next checkpoint and deltas write into resident pages; an idle one stops
+/// holding up to two dead images. The bytes given back.
+fn return_dead_recovery(s: &mut ShardState) -> usize {
+  let generation = s.journal.generation();
+  if s.recovery_returned_at == Some(generation) {
+    return 0;
+  }
+  let (slots_start, slots_end) = s.content_range;
+  let (log_start, log_end) = s.delta_range;
+  let Some(dead) = s.journal.dead_ranges(
+    slots_end.saturating_sub(slots_start),
+    log_end.saturating_sub(log_start),
+  ) else {
+    return 0;
+  };
+  let Some(object) = s.content.as_mut() else {
+    return 0;
+  };
+  let mut returned = 0usize;
+  for (base, (offset, len)) in [
+    (slots_start, dead.stale_slot),
+    (log_start, dead.log_past_tail),
+  ] {
+    if len == 0 {
+      continue;
+    }
+    // A refused range (outside the object) is left resident; the next publication re-arms the attempt.
+    if let Some(at) = base.checked_add(offset)
+      && let Ok(bytes) = object.discard(at, len)
+    {
+      returned = returned.saturating_add(bytes);
+    }
+  }
+  s.recovery_returned_at = Some(generation);
+  s.count(
+    RECOVERY_RETURNED,
+    u64::try_from(returned).unwrap_or(u64::MAX),
+  );
+  returned
+}
+
 /// Gives an idle shard's resident free content, and its emptied write log's pages, back to the OS (A-105): when the
 /// content arena allocated nothing since the last reap tick, its free blocks are purged a slice at a time, yielding
 /// between slices so a request that arrives meanwhile is served first. Decay-based, as jemalloc purges dirty pages after
@@ -3243,7 +3290,11 @@ async fn purge_if_idle() {
         .unwrap_or(0)
         .max(1);
       let purged = s.store.content.arena_mut().purge(slice_blocks);
-      let log = if purged.more { 0 } else { purge_write_log(s) };
+      let log = if purged.more {
+        0
+      } else {
+        purge_write_log(s).saturating_add(return_dead_recovery(s))
+      };
       let bytes = purged.bytes.saturating_add(log);
       s.count(CONTENT_PURGED, u64::try_from(bytes).unwrap_or(u64::MAX));
       Some(purged.more)

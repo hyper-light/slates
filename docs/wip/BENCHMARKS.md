@@ -3542,8 +3542,10 @@ Rejected as dead even on this client; the patch is kept in the session scratchpa
   - The NFS layer adds nothing per entry: the empty-file run's heap growth (496 B per file) equals the volume's
     create cost (498 B).
 - **30.4 MB more in the content object** than the volume's committed blocks (`/memfd:slates-con-mem` 1,686,921,216 B
-  against 1,656,542,072 committed, 15 s idle after the unmount). Not attributed yet. The hypothesis is the shard's
-  recovery image, which A-64 keeps in the same object; it needs a counter before it is a finding.
+  against 1,656,542,072 committed, 15 s idle after the unmount): the shard's recovery memory, A-68's two checkpoint
+  slots and its delta log in the same object, all three resident once written. A-117 gives back the stale slot and
+  the log past its tail when the shard is idle: 12–19 MB of it on `/usr`, and an empty file 844 → 695 B (below
+  tmpfs's 740–754 B). The A/B is A-117's table.
 
 **Hypotheses measured and rejected on the way:**
 - Client file state (opens, write delegations): the unmount, which returns them, freed nothing (Pss rose 16 MB).
@@ -3561,7 +3563,8 @@ kept out of the tree.
 **Owed:**
 - A/B the tail rounding: the arena's buddy blocks against size classes for a window's tail, measured on this bench
   and on the create and read paths. The model above bounds the prize at about 4.5% of content.
-- Attribute the 30.4 MB in the content object with a counter.
+- macOS and Windows: the content object gives no page back there (`SparseObject::discard`), so A-117 and the
+  write log's purge do nothing on those hosts; a measured `madvise`/decommit for each is owed.
 
 ### Measured and rejected: no write delegation for an open that creates (condition 12; 2026-10-08)
 

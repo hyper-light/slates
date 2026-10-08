@@ -39,6 +39,11 @@ umount /mnt/v; sleep 2
 A1=$(pss_kib $ANCHOR); D1=$(pss_kib $DAEMON)
 echo "after: anchor $(detail $ANCHOR)"; echo "after: daemon $(detail $DAEMON)"
 echo "slates: anchor $(( (A1 - A0) * 1024 / COUNT )) + daemon $(( (D1 - D0) * 1024 / COUNT )) bytes per empty file"
+# An idle shard gives back what it no longer needs on its reap ticks (A-105, A-117): read again once several passed.
+sleep 15
+A2=$(pss_kib $ANCHOR); D2=$(pss_kib $DAEMON)
+echo "idle: daemon $(detail $DAEMON)"
+echo "slates idle: anchor $(( (A2 - A0) * 1024 / COUNT )) + daemon $(( (D2 - D0) * 1024 / COUNT )) bytes per empty file"
 slates --instance pe status --json > /tmp/status.json 2>/dev/null; grep -o '"committed_bytes":[0-9]*' /tmp/status.json | head -2
 pkill -f "slates --instance pe"; sleep 1
 K0=$(kernel_kib); make_files /ram; K1=$(kernel_kib)

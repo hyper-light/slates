@@ -10375,3 +10375,36 @@ Status: built 2026-10-08.
 - Limits: `AUTH_SYS` names the caller; a client host that lies about uids is inside the trust boundary, as for every
   NFS export without Kerberos. A container whose processes run as root shares uid 0 with the host's root, so bind
   such an export to uid 0 only where the host's root is trusted with the volume.
+
+### A-117 — An idle shard gives back the recovery memory no restart reads (2026-10-08)
+Applied in the same change to:
+- `crates/vfs/src/recover.rs` (`CommittedSlot::stale_slot`) and `crates/vfs/src/checkpoint_log.rs`
+  (`Journal::dead_ranges`, `DeadRanges`);
+- `crates/server/src/daemon.rs` (`return_dead_recovery` in the idle purge, the `recovery.returned_bytes` counter) and
+  `crates/server/src/state.rs` (`recovery_returned_at`);
+- the test `recovery_memory_no_restart_reads_goes_back_and_a_restart_recovers_every_file`
+  (`crates/server/tests/recovery.rs`), `docs/wip/bench/mem/per_entry.sh` (an idle reading), BENCHMARKS.
+
+Status: built 2026-10-08 (Linux; macOS and Windows keep the pages, as their content object already does for the write
+log, `SparseObject::discard`).
+- What it answers: each shard's range of the anchor's content object holds A-68's two checkpoint slots and its delta
+  log. Once both slots and the log had been written, all three stayed resident: up to the committed image, the stale
+  one and the log's high-water mark. On a `/usr` copy that was 30 MB the volume did not use; for empty files it was
+  330 B of a file's 843 B.
+- The rule: when the shard is idle (the arena purge's test, A-105), once per publication, it gives back the pages of
+  the checkpoint slot older than the committed one and of the delta log past its tail. Nothing else changes:
+  - a restart reads the newer CRC-valid slot, then log frames from the start while each is CRC-valid and names that
+    checkpoint, so the given-back ranges were never read; they now read zeros, which fail the same checks;
+  - a busy shard never runs it, so a checkpoint or a delta never writes into a page it must fault back; an idle one
+    pays at most one page fault per page the next cycle writes (about 1 ms per 10 MB).
+- Measured (Linux 6.12, aarch64, release builds A = HEAD `1e854b56`+bench and B = this change, interleaved A B A B,
+  load 7–8):
+
+  | | A | B |
+  |---|---|---|
+  | 100,000 empty files, daemon bytes per file | 844, 846 | 694, 695 |
+  | Their content object (Pss) | 32,578 KiB | 17,854 KiB |
+  | `/usr`, content object 15 s idle | 1,645,336, 1,645,020 KiB | 1,632,924, 1,626,196 KiB |
+  | `/usr` copy | 18.1, 18.4 s | 21.4, 17.4 s (load noise) |
+
+  An empty file now costs the daemon less than tmpfs's inode and dentry (740–754 B in the same runs).

@@ -2482,6 +2482,107 @@ fn allocated_in_content(name: &str) -> u64 {
   0
 }
 
+/// A-117, the recovery memory no restart reads goes back when idle, and a restart still recovers everything: do write
+/// files in rounds with a publication after each (a checkpoint, then deltas, then a checkpoint into the other slot),
+/// leave the shard idle until it counts recovery memory given back (`recovery.returned_bytes`), restart over the same
+/// anchor and read every file; then write another round, publish, return again and restart again, so the next
+/// checkpoint is written into a slot whose pages went back. Expect every file byte for byte after each restart and, on
+/// Linux (where the content object punches holes), the counter moved both times. Before A-117 the stale slot and the log's dead pages stayed resident: 30 MB of a
+/// `/usr` copy (`docs/wip/BENCHMARKS.md`, memory per file).
+#[test]
+fn recovery_memory_no_restart_reads_goes_back_and_a_restart_recovers_every_file() {
+  /// Shape: rounds of files, each published.
+  const ROUNDS: u64 = 6;
+  /// Shape: files per round, enough that a round's delta is a real fraction of the checkpoint.
+  const PER_ROUND: u64 = 200;
+  let profile = common::machine_profile();
+  let instance = format!("srv-recovery-return-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile, &instance, Some(1));
+  let segment = anchor_segment("recovery-return", &profile, &config);
+  let first = Daemon::start(&profile, config.clone(), source_of(&segment)).unwrap();
+  first
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let mut client = connect(&instance);
+  let volume = client
+    .create(&CreateSpec {
+      size: SizeClass::Bounded { limit: 64 << 20 },
+      ..scratch("return")
+    })
+    .unwrap();
+  let attach = |client: &mut Client| {
+    client
+      .attach(volume, None, slates_ipc::protocol::Intent::Write)
+      .unwrap()
+      .attachment
+  };
+  let attachment = attach(&mut client);
+  let write_round = |client: &mut Client, attachment: u64, round: u64| {
+    for index in round * PER_ROUND..(round + 1) * PER_ROUND {
+      let body = format!("file {index} of round {round}").into_bytes();
+      client
+        .fs_write((volume, attachment), &format!("r{index}"), &body, 0o644)
+        .unwrap();
+    }
+  };
+  for round in 0..ROUNDS {
+    write_round(&mut client, attachment, round);
+    first.publish_every_shard().unwrap();
+  }
+  let returned_first = returned_after_idle(&first, 0);
+  first.stop();
+  let second = Daemon::start(&profile, config.clone(), source_of(&segment)).unwrap();
+  assert_every_file(&mut client, volume, ROUNDS * PER_ROUND, PER_ROUND);
+  // An SDK attachment ends with its daemon; the restarted one is attached afresh.
+  let attachment = attach(&mut client);
+  write_round(&mut client, attachment, ROUNDS);
+  second.publish_every_shard().unwrap();
+  let returned_second = returned_after_idle(&second, 0);
+  second.stop();
+  let third = Daemon::start(&profile, config, source_of(&segment)).unwrap();
+  assert_every_file(&mut client, volume, (ROUNDS + 1) * PER_ROUND, PER_ROUND);
+  third.stop();
+  drop(segment);
+  // Pages go back only where the content object can punch a hole (Linux, `SparseObject::discard`); elsewhere the
+  // return is a no-op and the restarts above are the whole test.
+  if cfg!(target_os = "linux") {
+    assert!(
+      returned_first > 0,
+      "the first daemon gave dead recovery memory back"
+    );
+    assert!(
+      returned_second > 0,
+      "the restarted daemon gave it back again"
+    );
+  }
+}
+
+/// The recovery bytes `daemon` counts given back once its shard goes idle, above `before`, waiting up to the bound.
+fn returned_after_idle(daemon: &Daemon, before: u64) -> u64 {
+  let returned = || {
+    daemon
+      .refusals_on_every_shard()
+      .unwrap()
+      .get(slates_server::daemon::RECOVERY_RETURNED)
+      .copied()
+      .unwrap_or(0)
+  };
+  let started = Instant::now();
+  while cfg!(target_os = "linux") && returned() <= before && started.elapsed() < START_WAIT {
+    std::thread::yield_now();
+  }
+  returned()
+}
+
+/// Reads files `r0` to `r{count - 1}` of `volume` and checks each against what its round wrote.
+fn assert_every_file(client: &mut Client, volume: VolumeId, count: u64, per_round: u64) {
+  for index in 0..count {
+    let expected = format!("file {index} of round {}", index / per_round).into_bytes();
+    let read = read_answered(client, volume, &format!("r{index}"));
+    assert!(read.unwrap() == expected, "file r{index} after the restart");
+  }
+}
+
 /// Memory, a deleted file's RAM: do write a file of many chunks, publish, delete it and leave the shard idle. Expect
 /// the daemon to count most of the file given back to the OS within the bound (`content.purged_bytes`: an idle
 /// shard's free blocks go back, A-105, on macOS as reusable pages, A-110), and on Linux the content object's allocated

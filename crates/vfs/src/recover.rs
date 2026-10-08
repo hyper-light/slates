@@ -1011,6 +1011,15 @@ pub struct CommittedSlot {
 }
 
 impl CommittedSlot {
+  /// The other slot of image memory `total` bytes long, as `(offset, len)`: dead once this one is committed, since a
+  /// restart reads only the newer CRC-valid slot (A-117). Its pages may go back to the OS until the next checkpoint
+  /// writes there.
+  pub fn stale_slot(self, total: usize) -> (usize, usize) {
+    let (first, second) = slots_of(total);
+    let stale = if self.second { first } else { second };
+    (stale.offset, stale.len)
+  }
+
   /// The same committed slot, with the generation the publisher's last publication reached (a delta logged after
   /// the checkpoint, A-68), so the next checkpoint's generation is newer than every frame before it.
   pub(crate) fn advanced_to(self, generation: u64) -> CommittedSlot {

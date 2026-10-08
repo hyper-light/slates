@@ -190,7 +190,31 @@ pub struct Journal {
   logged_bytes: usize,
 }
 
+/// What of a shard's recovery memory no restart reads (A-117), each as `(offset, len)` within its own region: the
+/// checkpoint slot older than the committed one, and the delta log past its tail.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DeadRanges {
+  /// The stale checkpoint slot, within the checkpoint memory.
+  pub stale_slot: (usize, usize),
+  /// The log past the next frame's start, within the log memory.
+  pub log_past_tail: (usize, usize),
+}
+
 impl Journal {
+  /// What no restart reads (A-117), for checkpoint memory `checkpoint_total` and log memory `log_total` bytes long;
+  /// `None` before the first checkpoint commits. A restart takes the newer CRC-valid slot, then the log's frames from
+  /// its start while each is CRC-valid and names that checkpoint, so the other slot and every byte past the tail are
+  /// dead: frames there are torn or name an older base. Returning their pages leaves them reading zeros, which fail
+  /// the same checks.
+  pub fn dead_ranges(&self, checkpoint_total: usize, log_total: usize) -> Option<DeadRanges> {
+    let committed = self.committed?;
+    let tail = self.tail.min(log_total);
+    Some(DeadRanges {
+      stale_slot: committed.stale_slot(checkpoint_total),
+      log_past_tail: (tail, log_total.saturating_sub(tail)),
+    })
+  }
+
   /// The generation of the last committed publication: what a transport's write log since it is stamped with.
   pub fn generation(&self) -> u64 {
     self.generation
