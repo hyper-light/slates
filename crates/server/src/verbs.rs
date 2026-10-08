@@ -2748,6 +2748,12 @@ pub fn shard_report(state: &mut ShardState) -> ShardReport {
           ),
           (CONTENT_SEALED, state.store.content.sealed()),
           (CONTENT_SEAL_REFUSED, state.store.content.seal_refusals()),
+          (CONTENT_TRIMMED, state.store.content.trimmed_bytes()),
+          (
+            CONTENT_TRIM_DECLINED,
+            state.store.content.trim_declined_bytes(),
+          ),
+          (CONTENT_TRIM_REFUSED, state.store.content.trim_refusals()),
           (CONTENT_FREE_REFUSED, state.store.content.free_refusals()),
           (STORE_RELEASE_REFUSED, state.store.release_refusals),
           (STATE_BORROW_REFUSED, crate::state::lost_steps().borrowed),
@@ -8931,6 +8937,15 @@ pub(crate) const CONTENT_SEALED: &str = "content.sealed";
 
 /// Format: the status counter of chunk seals that fell back to the clear because the cipher refused (A-99).
 pub(crate) const CONTENT_SEAL_REFUSED: &str = "content.seal_refused";
+
+/// Format: the status counter of bytes seals gave back by trimming chunks' blocks to their lengths (A-118).
+pub(crate) const CONTENT_TRIMMED: &str = "content.trimmed_bytes";
+
+/// Format: the status counter of bytes trims would have given back but the arena declined (an imaged or locked block).
+pub(crate) const CONTENT_TRIM_DECLINED: &str = "content.trim_declined_bytes";
+
+/// Format: the status counter of trims the arena refused after the chunk was recorded (A-118).
+pub(crate) const CONTENT_TRIM_REFUSED: &str = "content.trim_refused";
 
 /// Format: the status counter of frees refused on a seal's paths (a block or a tag run not given back, A-99).
 pub(crate) const CONTENT_FREE_REFUSED: &str = "content.free_refused";

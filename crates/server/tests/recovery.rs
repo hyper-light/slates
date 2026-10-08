@@ -2583,6 +2583,75 @@ fn assert_every_file(client: &mut Client, volume: VolumeId, count: u64, per_roun
   }
 }
 
+/// A-118, a sealed file's block holds its pages and no more: do write files whose sizes leave a chunk window partly
+/// filled (5, 9 and 13 pages and a little), leave the shard idle until its sweep seals them, restart over the same
+/// anchor and read every file. Expect the daemon to count trimmed bytes (`content.trimmed_bytes`, the non-vacuity
+/// count), every file byte for byte after the restart (the recovery claims each trimmed chunk's pieces), and report the
+/// bytes a trim declined (an imaged block) beside it.
+#[test]
+fn a_sealed_files_block_is_trimmed_to_its_pages_and_survives_a_restart() {
+  /// Shape: the files' lengths in bytes, each leaving its window partly filled.
+  const SIZES: [usize; 4] = [5 * 4096 + 1, 9 * 4096 + 77, 13 * 4096 + 4000, 3 * 4096];
+  let profile = common::machine_profile();
+  let instance = format!("srv-trim-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile, &instance, Some(1));
+  let segment = anchor_segment("trim", &profile, &config);
+  let first = Daemon::start(&profile, config.clone(), source_of(&segment)).unwrap();
+  first
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let mut client = connect(&instance);
+  let volume = client
+    .create(&CreateSpec {
+      size: SizeClass::Bounded { limit: 16 << 20 },
+      ..scratch("trim")
+    })
+    .unwrap();
+  let attachment = client
+    .attach(volume, None, slates_ipc::protocol::Intent::Write)
+    .unwrap()
+    .attachment;
+  let body = |index: usize, len: usize| -> Vec<u8> {
+    (0..len)
+      .map(|at| u8::try_from((at ^ index.wrapping_mul(31)) & 0xFF).unwrap())
+      .collect()
+  };
+  for (index, len) in SIZES.iter().enumerate() {
+    client
+      .fs_write(
+        (volume, attachment),
+        &format!("t{index}"),
+        &body(index, *len),
+        0o644,
+      )
+      .unwrap();
+  }
+  // The content counters ride the daemon's status, beside the shard's own map.
+  let started = Instant::now();
+  while counter(&mut client, "content.trimmed_bytes") == 0 && started.elapsed() < START_WAIT {
+    std::thread::yield_now();
+  }
+  let trimmed = counter(&mut client, "content.trimmed_bytes");
+  let declined = counter(&mut client, "content.trim_declined_bytes");
+  eprintln!("trimmed {trimmed} bytes, declined {declined} bytes");
+  first.publish_every_shard().unwrap();
+  first.stop();
+  let second = Daemon::start(&profile, config, source_of(&segment)).unwrap();
+  for (index, len) in SIZES.iter().enumerate() {
+    let read = read_answered(&mut client, volume, &format!("t{index}"));
+    assert!(
+      read.unwrap() == body(index, *len),
+      "file t{index} after the restart"
+    );
+  }
+  second.stop();
+  drop(segment);
+  assert!(
+    trimmed > 0,
+    "sealed blocks were trimmed: {trimmed} trimmed, {declined} declined"
+  );
+}
+
 /// Memory, a deleted file's RAM: do write a file of many chunks, publish, delete it and leave the shard idle. Expect
 /// the daemon to count most of the file given back to the OS within the bound (`content.purged_bytes`: an idle
 /// shard's free blocks go back, A-105, on macOS as reusable pages, A-110), and on Linux the content object's allocated

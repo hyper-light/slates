@@ -260,22 +260,32 @@ fn a_create_after_a_snapshot_copies_exactly_the_path_nodes() {
 /// AC-1.4: write amplification per mutation is bounded by one extent of content: a one-byte
 /// write into a three-page extent after a snapshot copies that extent (the buddy arena rounds
 /// it to the next power-of-two pages, four), never the whole file; a write into a fresh window
-/// takes one page.
+/// takes one page. The snapshot's version is sealed by the copy-up, which trims its four-page block
+/// to the three pages it holds (A-118), so the arena grows by the copy less that page.
 #[test]
 fn a_write_after_a_snapshot_copies_one_extent_or_takes_one_page() {
   let (mut store, mut vol, _, f) = deep_tree_snapshotted();
   let content_before = store.content.allocated_bytes();
+  let trimmed_before = store.content.trimmed_bytes();
   vol.write(&mut store, f, 0, b"!").unwrap();
+  let trimmed = usize::try_from(store.content.trimmed_bytes() - trimmed_before).unwrap();
   assert_eq!(
-    store.content.allocated_bytes() - content_before,
+    trimmed, PAGE,
+    "the sealed version gave back the page its block did not use"
+  );
+  assert_eq!(
+    store.content.allocated_bytes() - content_before + trimmed,
     (3 * PAGE).next_power_of_two(),
     "the window's extent is copied whole, in the buddy's power-of-two pages"
   );
   let far = u64::try_from(store.content.chunk_bytes()).unwrap() * 4;
   let content_before = store.content.allocated_bytes();
+  let trimmed_before = store.content.trimmed_bytes();
   vol.write(&mut store, f, far, b"!").unwrap();
+  // Leaving the first window seals it, which trims its block to the three pages it holds (A-118).
+  let trimmed = usize::try_from(store.content.trimmed_bytes() - trimmed_before).unwrap();
   assert_eq!(
-    store.content.allocated_bytes() - content_before,
+    store.content.allocated_bytes() + trimmed - content_before,
     PAGE,
     "a fresh window takes one page"
   );

@@ -3561,8 +3561,8 @@ content object 1,646,690 KiB against 1,648,206 KiB): dead even, so A-105's rule 
 kept out of the tree.
 
 **Owed:**
-- A/B the tail rounding: the arena's buddy blocks against size classes for a window's tail, measured on this bench
-  and on the create and read paths. The model above bounds the prize at about 4.5% of content.
+- Tail rounding: done by A-118 (a sealed chunk's block trimmed to its pages): block rounding 88.6 → 44.3 MB on
+  `/usr`, the daemon 34–39 MB smaller at idle, copy time unchanged (the A/B is A-118's table).
 - macOS and Windows: the content object gives no page back there (`SparseObject::discard`), so A-117 and the
   write log's purge do nothing on those hosts; a measured `madvise`/decommit for each is owed.
 

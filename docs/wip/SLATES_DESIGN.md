@@ -7481,7 +7481,7 @@ Applied in the same change to: §4.8 (Membership — a retired peer that returns
 ### A-16 (accepted 2026-09-13) — Admission is all-cost: the buddy-block charge, retention charged by the retaining operation, metadata reserved from a per-shard ledger, effective capacity clamped to the process bound
 Applied in the same change to: D-13 (charge rule), §4.2 (status), T-1.3, GAPS §1 (Machine/memory/runtime, GAP-A9-1), `docs/wip/admission.md`, `crates/mem` (`ShardBudget::charge_retention`/`credit_retention`, `MetadataBudget`), `crates/vfs` (the charge oracle, `edges.rs` T-1.3, `Store::set_metadata_class`), `crates/machine` (`MemoryFacts::limit`, `effective_capacity`), `crates/server` (config derivations, `ShardReport` fields), the CLI status render.
 - Authorization: Ada's "implement all" (2026-09-13); the decision on the two contract changes taken from principles (physical truth over logical convenience; one backing source per dimension; the OpenZFS precedent), recorded here so it can be reverted by name — and **accepted by Ada 2026-09-14** ("Obviously we want both A9-9 and A-16"), so both stand as the contract.
-- The charge rule (D-13): a window is charged the buddy block it takes — `min(chunk, page × next_pow2(ceil(materialized_length / page)))` — not its logical length. Evidence: §4.2 "physical_used includes allocator rounding"; ZFS `referenced` counts allocated bytes [C: OpenZFS dsl_dataset.c]. Without it a sparse writer held `page ×` its quota: sixteen one-byte windows now cap a sixteen-page quota (the model oracle states the rule and found the buddy's power-of-two rounding; 150 generated histories). T-1.3 now expects one page charged for a one-byte write at 10 GiB, `referenced_bytes == allocated_bytes == PAGE`. The rejected alternative: a separate rounding-excess ledger beside a logical charge (more state, the same physical truth).
+- The charge rule (D-13): a window is charged the buddy block it takes — `min(chunk, page × next_pow2(ceil(materialized_length / page)))` — not its logical length. Since A-118 (2026-10-08) that holds while the window is open; a sealed window's block is trimmed to its pages and charged `page × ceil(materialized_length / page)`. Evidence: §4.2 "physical_used includes allocator rounding"; ZFS `referenced` counts allocated bytes [C: OpenZFS dsl_dataset.c]. Without it a sparse writer held `page ×` its quota: sixteen one-byte windows now cap a sixteen-page quota (the model oracle states the rule and found the buddy's power-of-two rounding; 150 generated histories). T-1.3 now expects one page charged for a one-byte write at 10 GiB, `referenced_bytes == allocated_bytes == PAGE`. The rejected alternative: a separate rounding-excess ledger beside a logical charge (more state, the same physical truth).
 - Retention: a snapshot-retained chunk is charged from unpromised capacity by the operation that retains it (a write's reopen, a truncate's cut, an edit, the last name of a file), secured before the mutation and consumed at the deadlist push; a volume whose retention cannot be charged is refused `NoSpace` on unlink/truncate with nothing changed (OpenZFS refuses a delete on a full pool). The rejected alternative — backing retention from the volume's own entitlement — would give one dimension two backing sources; D-13 keeps `referenced`.
 - Metadata: every slab dimension is laid out against the metadata class over true slot costs (`Slab::<T>::slot_bytes`; the old `max_dir_blocks = max_dirs` over the node size alone made the block slab several times the class) and every volume's records are reserved from a per-shard `MetadataBudget` on create/clone/takeover/recovery, released on teardown.
 - Effective capacity: total RAM clamped to the tightest OS/job/cgroup bound (`MemoryFacts::limit`: cgroup v2/v1 from `/proc/self/cgroup`, a finite `RLIMIT_AS`/`RLIMIT_DATA`; the Windows job-object bound owed); `slates status` reports mapped, usable, committed, retained and metadata bytes per shard.
@@ -10408,3 +10408,55 @@ log, `SparseObject::discard`).
   | `/usr` copy | 18.1, 18.4 s | 21.4, 17.4 s (load noise) |
 
   An empty file now costs the daemon less than tmpfs's inode and dentry (740–754 B in the same runs).
+
+### A-118 — A sealed chunk's block is trimmed to its pages (2026-10-08)
+Applied in the same change to:
+- `crates/mem/src/buddy.rs` (`Buddy::trim`, `free_or_defer_trimmed`, `holds_trimmed`, `pieces_of`) and
+  `crates/mem/src/arena.rs` (`ChunkArena::trim`, `free_trimmed`, `give_back_trimmed`, `span`, `claim_trimmed`,
+  `holds_trimmed`);
+- `crates/vfs/src/content.rs` (the trim at seal, `OpenExtent::dirty_to`, `is_trimmed`, `stored_bytes`,
+  `trimmed_size`, reads over the span, trimmed frees and claims, the `trimmed_bytes` / `trim_declined_bytes` /
+  `trim_refusals` counters), `crates/vfs/src/volume.rs` (charges by stored bytes; the snapshot copy-up's seal
+  reconciles; `rebuilt_size`, one rule for a truncate's rebuild and its retention estimate) and
+  `crates/vfs/src/recover.rs` (a recovered chunk's pieces claimed and given back with it);
+- `crates/server/src/verbs.rs` (`content.trimmed_bytes`, `content.trim_declined_bytes`, `content.trim_refused`);
+- the tests: the buddy's random trims and its whole-free through the head, the arena's trim, the volume model (open
+  and sealed windows), the charge oracle, the edge test of a write after a snapshot, and
+  `a_sealed_files_block_is_trimmed_to_its_pages_and_survives_a_restart` (`crates/server/tests/recovery.rs`);
+- D-13's charge rule above, BENCHMARKS (memory per file).
+
+Status: built 2026-10-08.
+- What it answers: a chunk window's block was the smallest power-of-two number of pages holding its bytes, so a tail of
+  36 KiB held 64 KiB for as long as the file lived. On a `/usr` copy that rounding was 88.6 MB, 5.6% of the content.
+- The rule: when a window seals, its block is trimmed to its pages, as Linux's `alloc_pages_exact` trims a
+  power-of-two allocation (`mm/page_alloc.c`, `make_alloc_exact`). The kept prefix becomes the blocks of its binary
+  decomposition, each on its own boundary and contiguous, so the chunk's bytes are still one run; the rest goes back
+  to the buddy, coalescing.
+  - Nothing new is recorded: a chunk is trimmed when its head block is shorter than its length rounded up to a page,
+    and the other pieces follow from that length. The chunk record and the recovery image are unchanged, and an old
+    image reads as untrimmed.
+  - The pieces are freed, claimed and given back only with their head, after the head's incarnation check.
+  - An open window keeps its power-of-two block, so a growing file still copies at most four times per window, not
+    once per page.
+  - A block an image may name is never trimmed (A-64: an image names whole blocks), nor a locked one.
+  - An open extent records how far its block was ever written (`dirty_to`): a trim scrubs the freed tail up to it, so
+    no written byte stays in free memory (A-99), and a tail page nothing wrote is never touched.
+  - The charge follows the allocation (D-13): a sealed window is charged its pages, and every seal that changes a
+    charge reconciles it. One rule sizes a truncate's rebuild and the retention secured before it.
+- Measured (Linux 6.12, aarch64, release builds A = `723b3670`'s tree and B = this change, interleaved A B A B,
+  `docs/wip/bench/mem/per_file.sh /usr`, load 50–75 from other sessions):
+
+  | | A | B |
+  |---|---|---|
+  | Referenced bytes | 1,656,542,072, 1,656,542,072 | 1,612,276,600, 1,612,489,592 |
+  | Block rounding per entry | 3,120 B | 1,561, 1,568 B |
+  | Content object, 15 s idle | 1,630,156, 1,633,668 KiB | 1,595,256, 1,596,172 KiB |
+  | Daemon Pss, 15 s idle | 1,703,252, 1,708,515 KiB | 1,669,170, 1,669,980 KiB |
+  | Copy | 30.2, 19.0 s | 29.3, 18.5 s |
+
+  - `content.trimmed_bytes` 45,375,488 in each B run: the model on the tree's sizes predicted 45,289,472. No trim was
+    declined.
+- Rejected:
+  - Size classes (jemalloc's four per doubling): 1.16% waste at a 512 B granule against 3.21% here, but a second
+    allocator beside the buddy, a sub-page granule the arena does not have, and new recovery-image fields.
+  - A second extent per window for the tail: the same waste as the trim, with an extent and a chunk record per tail.

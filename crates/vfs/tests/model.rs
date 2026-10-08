@@ -66,15 +66,36 @@ struct ModelFile {
   inline_born: u64,
   /// Window index → (materialized bytes from the window's start, birth epoch).
   windows: BTreeMap<u64, (u64, u64)>,
+  /// The window being written (§4.5 chunk rule; A-118): the one window whose block still grows, so it is charged its
+  /// buddy block. Every other window is sealed and charged its length's pages. A write leaves the last window it
+  /// touched open and seals the one it left; a copy of the record seals it.
+  open: Option<u64>,
+  /// The epoch the inode record was last copied in: every mutation copies it once per epoch (the first change
+  /// after a snapshot), and that copy seals the open window.
+  record_born: u64,
 }
 
-/// A window's charge: its arena block — the smallest power-of-two number of pages holding the
+/// An open window's charge: its arena block — the smallest power-of-two number of pages holding the
 /// materialized length (the buddy's block), at most a chunk.
 fn charged_window(materialized: u64, page: u64, chunk: u64) -> u64 {
   if materialized == 0 {
     0
   } else {
     (materialized.div_ceil(page).next_power_of_two() * page).min(chunk)
+  }
+}
+
+/// A sealed window's charge (A-118): its block trimmed to the pages holding the materialized length.
+fn sealed_window(materialized: u64, page: u64) -> u64 {
+  materialized.div_ceil(page) * page
+}
+
+/// A window's charge, open or sealed.
+fn window_charge(window: u64, materialized: u64, open: Option<u64>, page: u64, chunk: u64) -> u64 {
+  if open == Some(window) {
+    charged_window(materialized, page, chunk)
+  } else {
+    sealed_window(materialized, page)
   }
 }
 
@@ -86,10 +107,20 @@ impl ModelFile {
     } else {
       self
         .windows
-        .values()
-        .map(|(m, _)| charged_window(*m, page, chunk))
+        .iter()
+        .map(|(w, (m, _))| window_charge(*w, *m, self.open, page, chunk))
         .sum()
     }
+  }
+
+  /// The record is copied in `epoch` (every mutation does, once per epoch): the first copy in an epoch seals the open
+  /// window, as the copy-up seals the open extent before anything changes. Its inline bytes are reborn.
+  fn copy_record(&mut self, epoch: u64) {
+    if self.record_born != epoch {
+      self.open = None;
+      self.record_born = epoch;
+    }
+    self.inline_born = epoch;
   }
 
   /// The charged bytes born after `last_snapshot`: what dropping the head would free.
@@ -104,9 +135,9 @@ impl ModelFile {
     } else {
       self
         .windows
-        .values()
-        .filter(|(_, born)| fresh(*born))
-        .map(|(m, _)| charged_window(*m, page, chunk))
+        .iter()
+        .filter(|(_, (_, born))| fresh(*born))
+        .map(|(w, (m, _))| window_charge(*w, *m, self.open, page, chunk))
         .sum()
     }
   }
@@ -232,12 +263,16 @@ impl Model {
     let mut fresh = ModelFile {
       inline: true,
       inline_born: epoch,
+      record_born: epoch,
       ..Default::default()
     };
     if !value.is_empty() {
       let end = u64::try_from(value.len()).unwrap();
+      let last = Some((end - 1) / self.chunk);
       let windows = fresh.windows_after(0, end, self.chunk, self.inline, epoch);
-      let after = windows.as_ref().map_or(end, |w| self.charged_windows(w));
+      let after = windows
+        .as_ref()
+        .map_or(end, |w| self.charged_windows(w, last));
       if self.referenced() + after > self.quota {
         return Err(VfsError::NoSpace);
       }
@@ -245,6 +280,7 @@ impl Model {
         Some(w) => {
           fresh.windows = w;
           fresh.inline = false;
+          fresh.open = last;
         }
         None => fresh.inline_len = end,
       }
@@ -256,7 +292,7 @@ impl Model {
       .or_default()
       .insert(name.to_owned(), fresh);
     if let Some(f) = self.files.get_mut(&ino) {
-      f.inline_born = epoch;
+      f.copy_record(epoch);
     }
     Ok(())
   }
@@ -272,16 +308,16 @@ impl Model {
       self.xattrs.remove(&ino);
     }
     if let Some(f) = self.files.get_mut(&ino) {
-      f.inline_born = self.epoch;
+      f.copy_record(self.epoch);
     }
     Ok(())
   }
 
   /// The charge of a window map.
-  fn charged_windows(&self, windows: &BTreeMap<u64, (u64, u64)>) -> u64 {
+  fn charged_windows(&self, windows: &BTreeMap<u64, (u64, u64)>, open: Option<u64>) -> u64 {
     windows
-      .values()
-      .map(|(m, _)| charged_window(*m, self.page, self.chunk))
+      .iter()
+      .map(|(w, (m, _))| window_charge(*w, *m, open, self.page, self.chunk))
       .sum()
   }
 
@@ -340,6 +376,7 @@ impl Model {
       ino,
       ModelFile {
         inline: true,
+        record_born: self.epoch,
         ..Default::default()
       },
     );
@@ -393,7 +430,7 @@ impl Model {
       self.forget(ino);
     } else if let Some(f) = self.files.get_mut(&ino) {
       // The surviving record is copied for its link count.
-      f.inline_born = self.epoch;
+      f.copy_record(self.epoch);
     }
     Ok(())
   }
@@ -422,30 +459,35 @@ impl Model {
     let end = off + bytes.len();
     let (off64, end64) = (u64::try_from(off).unwrap(), u64::try_from(end).unwrap());
     let epoch = self.epoch;
+    // The record is copied first (sealing the open window in a new epoch), then the write lands; it leaves the last
+    // window it touched open.
+    let mut file = file.clone();
+    file.copy_record(epoch);
+    let last = Some((end64 - 1) / self.chunk);
     let windows = file.windows_after(off64, end64, self.chunk, self.inline, epoch);
     let charged = file.charged(self.page, self.chunk);
     let after = windows
       .as_ref()
-      .map_or(end64.max(charged), |w| self.charged_windows(w));
+      .map_or(end64.max(charged), |w| self.charged_windows(w, last));
     let added = after.saturating_sub(charged);
     if self.referenced() + added > self.quota {
       return Err(VfsError::NoSpace);
     }
-    let file = self.files.get_mut(&ino).unwrap();
     match windows {
       Some(w) => {
         file.windows = w;
         file.inline = false;
+        file.open = last;
       }
       None => {
         file.inline_len = file.inline_len.max(end64);
-        file.inline_born = epoch;
       }
     }
     if file.bytes.len() < end {
       file.bytes.resize(end, 0);
     }
     file.bytes[off..end].copy_from_slice(bytes);
+    self.files.insert(ino, file);
     Ok(())
   }
 
@@ -470,15 +512,15 @@ impl Model {
       epoch,
     );
     let charged = file.charged(self.page, self.chunk);
-    let after = probe
-      .as_ref()
-      .map_or(end.max(charged), |w| self.charged_windows(w));
+    let after = probe.as_ref().map_or(end.max(charged), |w| {
+      self.charged_windows(w, Some(end.saturating_sub(1) / self.chunk))
+    });
     if self.referenced() + after.saturating_sub(charged) > self.quota {
       return Err(VfsError::NoSpace);
     }
     self.truncate(ino, at)?;
     if let Some(f) = self.files.get_mut(&ino) {
-      f.inline_born = epoch;
+      f.copy_record(epoch);
     }
     if !bytes.is_empty() {
       self.write(ino, at, bytes)?;
@@ -496,13 +538,27 @@ impl Model {
     file.bytes.resize(len, 0);
     let len64 = u64::try_from(len).unwrap();
     file.inline_len = file.inline_len.min(len64);
-    // The inode record is copied on every truncate, so its inline bytes are reborn.
-    file.inline_born = epoch;
+    // The inode record is copied on every truncate, so its inline bytes are reborn (and, first in an epoch, the open
+    // window is sealed).
+    file.copy_record(epoch);
     file.windows.retain(|w, _| w * chunk < len64);
+    if file
+      .open
+      .is_some_and(|open| !file.windows.contains_key(&open))
+    {
+      file.open = None;
+    }
+    let open = file.open;
     if let Some((w, (m, born))) = file.windows.iter_mut().next_back() {
       let cut = (*m).min(len64 - w * chunk);
-      // A window cut to a smaller page count is rebuilt at its new length, born now.
-      if charged_window(cut, self.page, chunk) < charged_window(*m, self.page, chunk) {
+      // A window cut to fewer pages of its charge is rebuilt at its new length, born now: an open window's buddy block,
+      // a sealed one's trimmed pages (A-118).
+      let smaller = if open == Some(*w) {
+        charged_window(cut, self.page, chunk) < charged_window(*m, self.page, chunk)
+      } else {
+        sealed_window(cut, self.page) < sealed_window(*m, self.page)
+      };
+      if smaller {
         *born = epoch;
       }
       *m = cut;
@@ -544,7 +600,7 @@ impl Model {
       if let Some(ino) = moved_ino
         && let Some(f) = self.files.get_mut(&ino)
       {
-        f.inline_born = self.epoch;
+        f.copy_record(self.epoch);
       }
       return Ok(());
     }
@@ -603,7 +659,7 @@ impl Model {
     if let Some(ino) = moved_ino
       && let Some(f) = self.files.get_mut(&ino)
     {
-      f.inline_born = self.epoch;
+      f.copy_record(self.epoch);
     }
     Ok(())
   }
@@ -620,7 +676,7 @@ impl Model {
     d.insert(name.to_owned(), Node::File { ino });
     *self.links.entry(ino).or_insert(1) += 1;
     if let Some(f) = self.files.get_mut(&ino) {
-      f.inline_born = self.epoch;
+      f.copy_record(self.epoch);
     }
     Ok(())
   }

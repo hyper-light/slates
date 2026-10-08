@@ -682,7 +682,157 @@ impl ChunkArena {
     Ok(())
   }
 
-  /// Allocates exactly the block of `len` bytes at `offset` in region `region` (A-64: a recovery rebuilding
+  /// Trims `extent` to its first `keep` bytes, rounded up to a granule (A-118; [`crate::buddy::Buddy::trim`]): the rest
+  /// goes back to the free lists, and the head of the kept prefix is returned. Every byte of the block past `dirty` is
+  /// zero (the caller's record of what was ever written), so only the freed tail's bytes before `dirty` are scrubbed: a
+  /// tail page nothing wrote is never touched, and no written byte is left in free memory (A-99). The tail is recorded
+  /// for the idle purge like any freed range. `None`, nothing changed, where the buddy declines (the prefix is the whole
+  /// block, the block is locked, or an image may name it).
+  pub fn trim(
+    &mut self,
+    extent: Extent,
+    keep: usize,
+    dirty: usize,
+  ) -> Result<Option<Extent>, MemError> {
+    if self.identity != Some(extent.arena) {
+      return Err(MemError::ForeignExtent {
+        offset: extent.offset(),
+        len: extent.len(),
+        reason: ExtentRefusal::OtherArena,
+      });
+    }
+    let Some(slot) = self.slot_mut(extent.region) else {
+      return Err(MemError::ForeignExtent {
+        offset: extent.offset(),
+        len: extent.len(),
+        reason: ExtentRefusal::NoSuchRegion,
+      });
+    };
+    let before = slot.buddy.free_bytes();
+    let Some(pieces) = slot.buddy.trim(extent.block, keep)? else {
+      return Ok(None);
+    };
+    let kept: usize = pieces.iter().map(|piece| piece.len()).sum();
+    let tail_from = extent.offset().saturating_add(kept);
+    let end = extent.offset().saturating_add(extent.len());
+    let written_to = extent.offset().saturating_add(dirty).min(end);
+    if written_to > tail_from {
+      scrub(
+        &mut slot.region,
+        tail_from,
+        written_to.saturating_sub(tail_from),
+      );
+    }
+    slot.dirty.mark(tail_from, end);
+    let released = slot.buddy.free_bytes().saturating_sub(before);
+    self.allocated_bytes = self.allocated_bytes.saturating_sub(released);
+    self.resident_free = self.resident_free.saturating_add(released);
+    Ok(pieces.first().map(|head| Extent {
+      arena: extent.arena,
+      region: extent.region,
+      block: *head,
+    }))
+  }
+
+  /// Frees a block [`ChunkArena::trim`] cut to `keep` bytes, named by its head (A-118), scrubbing the kept bytes as
+  /// [`ChunkArena::free`] does; refused, nothing changed, as [`crate::buddy::Buddy::free_or_defer_trimmed`] refuses.
+  pub fn free_trimmed(&mut self, head: Extent, keep: usize) -> Result<(), MemError> {
+    self.release_trimmed(head, keep, true)
+  }
+
+  /// [`ChunkArena::free_trimmed`] with the bytes untouched, as [`ChunkArena::give_back`] is to [`ChunkArena::free`].
+  pub fn give_back_trimmed(&mut self, head: Extent, keep: usize) -> Result<(), MemError> {
+    self.release_trimmed(head, keep, false)
+  }
+
+  fn release_trimmed(&mut self, head: Extent, keep: usize, scrubbed: bool) -> Result<(), MemError> {
+    let foreign = |reason| MemError::ForeignExtent {
+      offset: head.offset(),
+      len: head.len(),
+      reason,
+    };
+    if self.identity != Some(head.arena) {
+      return Err(foreign(ExtentRefusal::OtherArena));
+    }
+    let granule = self.granule;
+    let slot = self
+      .slot_mut(head.region)
+      .ok_or_else(|| foreign(ExtentRefusal::NoSuchRegion))?;
+    let before = slot.buddy.free_bytes();
+    let deferred = slot.buddy.free_or_defer_trimmed(head.block, keep)?;
+    let span = keep.max(1).div_ceil(granule).saturating_mul(granule);
+    let mut self_resident = 0usize;
+    if !deferred && scrubbed {
+      // A trimmed block is never locked (the buddy declines to trim one), so only the scrub is owed.
+      scrub(&mut slot.region, head.offset(), span);
+      slot
+        .dirty
+        .mark(head.offset(), head.offset().saturating_add(span));
+      self_resident = span;
+    }
+    let released = slot.buddy.free_bytes().saturating_sub(before);
+    self.allocated_bytes = self.allocated_bytes.saturating_sub(released);
+    self.resident_free = self.resident_free.saturating_add(self_resident);
+    Ok(())
+  }
+
+  /// Whether `head` names a live block of this arena trimmed to `keep` bytes, every piece allocated (A-118).
+  pub fn holds_trimmed(&self, head: Extent, keep: usize) -> bool {
+    self.identity == Some(head.arena)
+      && self
+        .slot(head.region)
+        .is_some_and(|slot| slot.buddy.holds_trimmed(head.block, keep))
+  }
+
+  /// The `len` bytes from the start of `head`, which may run past the head into the rest of a trimmed block's pieces
+  /// (A-118: they are contiguous); `None` past the region.
+  pub fn span(&self, head: Extent, len: usize) -> Option<&[u8]> {
+    let slot = self.slot(head.region)?;
+    slot
+      .region
+      .bytes()
+      .get(head.offset()..head.offset().checked_add(len)?)
+  }
+
+  /// Claims every piece of a block trimmed to `keep` bytes whose head sits at `offset` in region `region` (A-64, A-118:
+  /// a recovery rebuilding a trimmed chunk's blocks), returning the head. All or nothing: a refused piece gives back
+  /// the pieces already claimed, and the refusal is returned.
+  pub fn claim_trimmed(
+    &mut self,
+    region: u16,
+    offset: usize,
+    keep: usize,
+  ) -> Result<Extent, MemError> {
+    let granule = self.granule;
+    let granules = keep.max(1).div_ceil(granule);
+    let mut claimed: Vec<Extent> = Vec::new();
+    let mut at = offset;
+    for order in (0..usize::BITS).rev() {
+      let piece = 1usize.checked_shl(order).unwrap_or(0);
+      if piece == 0 || granules & piece == 0 {
+        continue;
+      }
+      let len = piece.saturating_mul(granule);
+      match self.claim(region, at, len) {
+        Ok(extent) => claimed.push(extent),
+        Err(refusal) => {
+          // A piece just claimed always goes back; should one not, that refusal is the one reported.
+          for extent in claimed {
+            self.give_back(extent)?;
+          }
+          return Err(refusal);
+        }
+      }
+      at = at.saturating_add(len);
+    }
+    claimed.first().copied().ok_or(MemError::ForeignExtent {
+      offset,
+      len: keep,
+      reason: ExtentRefusal::WrongLength,
+    })
+  }
+
+  /// Allocates exactly the block of `len` bytes at `offset` in region `region` (A-64: a recovery rebuilding  /// Allocates exactly the block of `len` bytes at `offset` in region `region` (A-64: a recovery rebuilding
   /// the blocks its image names). Refused as [`crate::buddy::Buddy::claim`] refuses, or `NoSuchRegion`.
   pub fn claim(&mut self, region: u16, offset: usize, len: usize) -> Result<Extent, MemError> {
     let arena = self
@@ -962,6 +1112,48 @@ mod tests {
       all_are(bytes, p, p, 2) && all_are(bytes, 3 * p, p, 4),
       "live blocks keep their bytes"
     );
+  }
+
+  /// A-118, the arena's trim: do allocate a 16-page block, fill its first 5 pages and a byte of the sixth, trim it to
+  /// that length, and read the span; expect the bytes back, 6 pages still allocated and 10 free, the tail free for any
+  /// allocation; then free the trimmed block through its head and expect every byte of the region free and zero.
+  #[test]
+  fn a_trimmed_block_keeps_its_prefix_and_frees_whole() {
+    let p = page();
+    let mut arena = ChunkArena::new(p);
+    arena
+      .add_region(Region::map(p * 16, p, false).unwrap())
+      .unwrap();
+    let block = arena.alloc(p * 16).unwrap();
+    let used = p * 5 + 1;
+    arena.bytes_mut(block).unwrap()[..used].fill(7);
+    // Two bytes past the kept prefix were written too: the trim must scrub them out of the freed tail.
+    arena.bytes_mut(block).unwrap()[p * 6..p * 6 + 2].fill(9);
+    let head = arena.trim(block, used, p * 6 + 2).unwrap().unwrap();
+    assert_eq!(head.offset(), block.offset());
+    assert!(
+      arena
+        .span(head, used)
+        .unwrap()
+        .iter()
+        .all(|byte| *byte == 7),
+      "the prefix reads back"
+    );
+    assert_eq!(arena.allocated_bytes(), p * 6);
+    assert_eq!(arena.free_bytes(), p * 10);
+    let tail = arena.alloc(p * 8).unwrap();
+    assert_eq!(tail.offset(), p * 8, "the freed tail is allocatable");
+    let bytes = arena.slot(head.region).unwrap().region.bytes();
+    assert!(
+      all_are(bytes, p * 6, p * 2, 0),
+      "the written bytes past the prefix were scrubbed"
+    );
+    arena.free(tail).unwrap();
+    arena.free_trimmed(head, used).unwrap();
+    assert_eq!(arena.allocated_bytes(), 0);
+    let bytes = arena.slot(head.region).unwrap().region.bytes();
+    assert!(all_are(bytes, 0, p * 16, 0), "the kept bytes were scrubbed");
+    assert!(arena.alloc(p * 16).is_ok(), "the region is one block again");
   }
 
   /// §4.2 allocator rounding: do: allocate every length from one byte to four granules; expect each block to

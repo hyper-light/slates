@@ -2892,10 +2892,12 @@ impl Claims {
       }
       Some(_) => Err(VfsError::RecoveryIncomplete),
       None => {
-        let block =
-          store
-            .content
-            .claim_block(chunk.block.region, chunk.block.offset, chunk.block.len)?;
+        // A trimmed chunk's image names its head; its other pieces follow from its length (A-118).
+        let block = store.content.claim_chunk_blocks(
+          chunk.block.region,
+          (chunk.block.offset, chunk.block.len),
+          chunk.used,
+        )?;
         let sealed = match &chunk.seal {
           Some(seal) => {
             let key = store
@@ -2906,7 +2908,9 @@ impl Claims {
             match key {
               Ok(key) => Some((key, seal.version, seal.tags.as_slice())),
               Err(refusal) => {
-                return Err(refusal.after_undo(store.content.give_back_block(block)));
+                return Err(
+                  refusal.after_undo(store.content.give_back_chunk_blocks(block, chunk.used)),
+                );
               }
             }
           }
@@ -2925,7 +2929,9 @@ impl Claims {
         let handle = match adopted {
           Ok(handle) => handle,
           Err(refusal) => {
-            return Err(refusal.after_undo(store.content.give_back_block(block)));
+            return Err(
+              refusal.after_undo(store.content.give_back_chunk_blocks(block, chunk.used)),
+            );
           }
         };
         self.held.insert(key, Held::Chunk(handle, chunk.clone()));
@@ -2991,6 +2997,8 @@ impl Claims {
         len: open.len,
         block: *block,
         born: Epoch(open.born),
+        // Writes made after the image may have reached anywhere in the block (A-118).
+        dirty_to: u64::try_from(block.len()).unwrap_or(u64::MAX),
       }),
       _ => Err(VfsError::RecoveryIncomplete),
     }

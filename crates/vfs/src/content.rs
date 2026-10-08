@@ -184,6 +184,10 @@ pub struct OpenExtent {
   pub block: Block,
   /// The birth epoch of the block.
   pub born: Epoch,
+  /// How far into the block bytes may be other than zero (A-118): what was ever written there, which can pass `len`
+  /// after a truncate kept the block or after a restart (writes made after the image). Every byte past it is zero, so
+  /// a seal that trims the block scrubs only up to it and never touches a tail page nothing wrote.
+  pub dirty_to: u64,
 }
 
 /// Copies the overlap of `bytes`, which sit at file offset `base`, with a buffer `out` for file offset `off`, into
@@ -234,6 +238,14 @@ pub struct ChunkStore {
   /// Frees refused on a seal's paths (a block or a tag run that could not be given back): each leaves its bytes held
   /// until the store is dropped, so it is counted and surfaced (`content.free_refused`), never silent.
   free_refusals: u64,
+  /// Bytes a seal gave back by trimming a chunk's block to its length (A-118): the non-vacuity count of the trim.
+  trimmed_bytes: u64,
+  /// Trims the arena refused after the chunk was recorded (the block stays whole, so only the economy is lost):
+  /// counted, never silent.
+  trim_refusals: u64,
+  /// Bytes a trim would have given back but the arena declined, because an image may name the block or it is locked
+  /// (A-118): the economy left on the table.
+  trim_declined_bytes: u64,
   /// The buffer a seal encrypts a copy of the chunk in before any byte of the chunk changes (one chunk's bytes at most,
   /// kept for the store's life), zeroed after every seal.
   seal_scratch: Vec<u8>,
@@ -295,6 +307,9 @@ impl ChunkStore {
       sealed: 0,
       moved_out_of_image: 0,
       free_refusals: 0,
+      trimmed_bytes: 0,
+      trim_refusals: 0,
+      trim_declined_bytes: 0,
       seal_scratch: Vec::new(),
     }
   }
@@ -323,6 +338,54 @@ impl ChunkStore {
   /// Frees refused on a seal's paths, so far ([`ChunkStore`]'s `free_refusals`).
   pub const fn free_refusals(&self) -> u64 {
     self.free_refusals
+  }
+
+  /// Bytes seals gave back by trimming chunks' blocks to their lengths, so far (A-118).
+  pub const fn trimmed_bytes(&self) -> u64 {
+    self.trimmed_bytes
+  }
+
+  /// Trims the arena refused after a chunk was recorded, so far (A-118).
+  pub const fn trim_refusals(&self) -> u64 {
+    self.trim_refusals
+  }
+
+  /// Bytes trims would have given back but the arena declined (an imaged or locked block), so far (A-118).
+  pub const fn trim_declined_bytes(&self) -> u64 {
+    self.trim_declined_bytes
+  }
+
+  /// Whether `chunk`'s block was trimmed to its length (A-118): its head is shorter than its length rounded up to a
+  /// granule, which an untrimmed block never is (a block holds its bytes). The pieces after the head follow from the
+  /// length alone, so the record and its image need nothing more.
+  pub fn is_trimmed(&self, chunk: &Chunk) -> bool {
+    self.granule_round(chunk.len) > chunk.block.len()
+  }
+
+  /// The arena bytes `chunk` holds: its length rounded up to a granule when trimmed, else its block (A-118). What the
+  /// volume charges for it, so the charge and the arena's allocated bytes never diverge (§4.2).
+  pub fn stored_bytes(&self, chunk: &Chunk) -> usize {
+    if self.is_trimmed(chunk) {
+      self.granule_round(chunk.len)
+    } else {
+      chunk.block.len()
+    }
+  }
+
+  /// The arena bytes a sealed chunk of `len` bytes holds once trimmed (A-118): `len` rounded up to a granule.
+  pub fn trimmed_size(&self, len: usize) -> usize {
+    len
+      .max(1)
+      .div_ceil(self.granule)
+      .saturating_mul(self.granule)
+  }
+
+  fn granule_round(&self, len: u32) -> usize {
+    usize::try_from(len)
+      .unwrap_or(usize::MAX)
+      .max(1)
+      .div_ceil(self.granule)
+      .saturating_mul(self.granule)
   }
 
   /// Counts a free refused on a seal's path.
@@ -498,7 +561,10 @@ impl ChunkStore {
   ) -> Result<(), VfsError> {
     let cipher = self.cipher.as_ref().ok_or(VfsError::Integrity)?;
     let used = usize::try_from(chunk.len).map_err(|_| VfsError::Invalid)?;
-    let sealed = self.arena.bytes(chunk.block).ok_or(VfsError::StaleHandle)?;
+    let sealed = self
+      .arena
+      .span(chunk.block, self.stored_bytes(chunk))
+      .ok_or(VfsError::StaleHandle)?;
     let segments = usize::try_from(seal.segments).map_err(|_| VfsError::Invalid)?;
     let mut heap = Vec::new();
     let first = from.checked_div(self.granule).unwrap_or(0);
@@ -645,6 +711,7 @@ impl ChunkStore {
       len: 0,
       block,
       born,
+      dirty_to: 0,
     })
   }
 
@@ -697,6 +764,8 @@ impl ChunkStore {
     }
     self.arena.free(open.block)?;
     open.block = block;
+    // Only the carried bytes were written into the new block.
+    open.dirty_to = u64::try_from(keep).unwrap_or(u64::MAX);
     Ok(())
   }
 
@@ -722,9 +791,11 @@ impl ChunkStore {
       .get_mut(at..end)
       .ok_or(VfsError::StaleHandle)?
       .copy_from_slice(bytes);
-    if end > used {
-      open.len = u64::try_from(end).unwrap_or(u64::MAX);
+    let end = u64::try_from(end).unwrap_or(u64::MAX);
+    if end > open.len {
+      open.len = end;
     }
+    open.dirty_to = open.dirty_to.max(end);
     Ok(())
   }
 
@@ -780,6 +851,12 @@ impl ChunkStore {
       (Some(key), true) => self.seal_where_safe(open.block, len, key),
       _ => (open.block, None),
     };
+    // A block the seal copied into holds the ciphertext alone; one sealed in place keeps whatever was written there.
+    let dirty = if block == open.block {
+      usize::try_from(open.dirty_to).unwrap_or(usize::MAX)
+    } else {
+      len
+    };
     let inserted = self.chunks.insert(Chunk {
       born: open.born,
       len: u32::try_from(open.len).unwrap_or(u32::MAX),
@@ -796,11 +873,46 @@ impl ChunkStore {
         return Err(refusal.into());
       }
     };
+    self.trim_sealed(chunk, block, len, dirty);
     Ok(Some(Extent {
       off: open.off,
       len: open.len,
       src: ExtentSrc::Chunk { chunk, at: 0 },
     }))
+  }
+
+  /// Trims a just-recorded chunk's block to its length (A-118): the tail beyond its last granule goes back to the
+  /// arena, the record keeps the head. Done after the record exists, so a refused insert leaves the caller's open
+  /// extent and its block exactly as they were. A refused trim keeps the whole block and is counted.
+  fn trim_sealed(&mut self, chunk: Handle<Chunk>, block: Block, len: usize, dirty: usize) {
+    match self.arena.trim(block, len, dirty) {
+      Ok(Some(head)) => {
+        let saved = block.len().saturating_sub(
+          len
+            .max(1)
+            .div_ceil(self.granule)
+            .saturating_mul(self.granule),
+        );
+        if let Ok(record) = self.chunks.get_mut(chunk) {
+          record.block = head;
+          self.trimmed_bytes = self
+            .trimmed_bytes
+            .saturating_add(u64::try_from(saved).unwrap_or(u64::MAX));
+        }
+      }
+      Ok(None) => {
+        let unused = block.len().saturating_sub(
+          len
+            .max(1)
+            .div_ceil(self.granule)
+            .saturating_mul(self.granule),
+        );
+        self.trim_declined_bytes = self
+          .trim_declined_bytes
+          .saturating_add(u64::try_from(unused).unwrap_or(u64::MAX));
+      }
+      Err(_) => self.trim_refusals = self.trim_refusals.saturating_add(1),
+    }
   }
 
   /// Copies the part of a sealed extent that overlaps a read of `out.len()` bytes at file offset `off` into the
@@ -838,7 +950,10 @@ impl ChunkStore {
     if let Some(seal) = &c.seal {
       return self.open_into((c, seal), (lo, hi), (lo_file, off), out);
     }
-    let bytes = self.arena.bytes(c.block).ok_or(VfsError::StaleHandle)?;
+    let bytes = self
+      .arena
+      .span(c.block, self.stored_bytes(c))
+      .ok_or(VfsError::StaleHandle)?;
     let source = bytes.get(lo..hi).ok_or(VfsError::StaleHandle)?;
     copy_overlap(source, lo_file, off, out);
     Ok(())
@@ -896,7 +1011,14 @@ impl ChunkStore {
   /// Frees a chunk and its block unconditionally (the deadlist walker's terminal step).
   pub fn free_chunk(&mut self, handle: Handle<Chunk>) -> Result<(), VfsError> {
     let chunk = self.chunks.remove(handle)?;
-    self.arena.free(chunk.block)?;
+    if self.is_trimmed(&chunk) {
+      self.arena.free_trimmed(
+        chunk.block,
+        usize::try_from(chunk.len).unwrap_or(usize::MAX),
+      )?;
+    } else {
+      self.arena.free(chunk.block)?;
+    }
     if let Some(seal) = chunk.seal {
       self.tags.free(seal.tags)?;
     }
@@ -914,6 +1036,46 @@ impl ChunkStore {
       .map_err(|_| VfsError::RecoveryIncomplete)
   }
 
+  /// Claims every block a recovered chunk of `used` bytes holds, its head at `offset` and `len` long (A-64, A-118): the
+  /// head alone for an untrimmed chunk, the head and the rest of its trimmed prefix for a trimmed one (a head shorter
+  /// than `used` rounded up to a granule). Refused `RecoveryIncomplete`, nothing claimed, as [`ChunkStore::claim_block`].
+  pub fn claim_chunk_blocks(
+    &mut self,
+    region: u16,
+    (offset, len): (u64, u64),
+    used: u32,
+  ) -> Result<Block, VfsError> {
+    let len_bytes = usize::try_from(len).map_err(|_| VfsError::RecoveryIncomplete)?;
+    if self.granule_round(used) <= len_bytes {
+      return self.claim_block(region, offset, len);
+    }
+    let offset = usize::try_from(offset).map_err(|_| VfsError::RecoveryIncomplete)?;
+    let head = self
+      .arena
+      .claim_trimmed(region, offset, usize::try_from(used).unwrap_or(usize::MAX))
+      .map_err(|_| VfsError::RecoveryIncomplete)?;
+    if head.len() != len_bytes {
+      // The image's head is not the head the length decomposes into: give the pieces back, refuse.
+      self
+        .arena
+        .give_back_trimmed(head, usize::try_from(used).unwrap_or(usize::MAX))
+        .map_err(|_| VfsError::RecoveryIncomplete)?;
+      return Err(VfsError::RecoveryIncomplete);
+    }
+    Ok(head)
+  }
+
+  /// Gives back what [`ChunkStore::claim_chunk_blocks`] claimed for a chunk of `used` bytes, untouched.
+  pub fn give_back_chunk_blocks(&mut self, head: Block, used: u32) -> Result<(), VfsError> {
+    if self.granule_round(used) > head.len() {
+      self
+        .arena
+        .give_back_trimmed(head, usize::try_from(used).unwrap_or(usize::MAX))?;
+      return Ok(());
+    }
+    self.give_back_block(head)
+  }
+
   /// Records a recovered chunk over a claimed block (A-64); refused when its used bytes exceed the block. A sealed
   /// chunk comes with its key (already registered with the cipher), its version and its tags in segment order
   /// (A-99): the tags are taken into a fresh run.
@@ -922,7 +1084,13 @@ impl ChunkStore {
     mut chunk: Chunk,
     sealed: Option<(u32, u64, &[Tag])>,
   ) -> Result<Handle<Chunk>, VfsError> {
-    if usize::try_from(chunk.len).map_or(true, |len| len > chunk.block.len()) {
+    // A trimmed chunk's pieces were claimed with its head (A-118); every one must be held.
+    if self.is_trimmed(&chunk)
+      && !self.arena.holds_trimmed(
+        chunk.block,
+        usize::try_from(chunk.len).unwrap_or(usize::MAX),
+      )
+    {
       return Err(VfsError::RecoveryIncomplete);
     }
     chunk.seal = match sealed {
@@ -987,7 +1155,14 @@ impl ChunkStore {
   /// block returns to the arena as it was claimed ([`ChunkArena::give_back`]).
   pub fn give_back_chunk(&mut self, handle: Handle<Chunk>) -> Result<(), VfsError> {
     let chunk = self.chunks.remove(handle)?;
-    self.arena.give_back(chunk.block)?;
+    if self.is_trimmed(&chunk) {
+      self.arena.give_back_trimmed(
+        chunk.block,
+        usize::try_from(chunk.len).unwrap_or(usize::MAX),
+      )?;
+    } else {
+      self.arena.give_back(chunk.block)?;
+    }
     if let Some(seal) = chunk.seal {
       self.tags.free(seal.tags)?;
     }

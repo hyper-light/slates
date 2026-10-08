@@ -3704,7 +3704,7 @@ impl Volume {
         Dead::Chunk(handle, born) if self.owns(*born) => store.content.chunk(*handle),
         _ => None,
       })
-      .map(|chunk| u64::try_from(chunk.block.len()).unwrap_or(u64::MAX))
+      .map(|chunk| u64::try_from(store.content.stored_bytes(chunk)).unwrap_or(u64::MAX))
       .fold(0u64, u64::saturating_add)
   }
 
@@ -3744,23 +3744,26 @@ impl Volume {
     &self,
     store: &Store,
     no: InodeNo,
-    touched: impl Fn(u64, u64) -> bool,
+    touched: impl Fn(u64, u64, u64) -> bool,
   ) -> Result<u64, VfsError> {
     let inode = self.inode(store, no)?;
     let block_len = |len: usize| u64::try_from(len).unwrap_or(u64::MAX);
+    // `touched` is told each piece's offset, length and the arena bytes it holds (a chunk's stored bytes; for the
+    // open extent its whole block, the most its seal can leave, A-118), so a rebuild decision is the one
+    // `rebuilt_if_smaller` will make.
     let mut retained = body_extents(&inode.body)
       .iter()
-      .filter(|e| touched(e.off, e.len))
       .filter_map(|e| match e.src {
-        ExtentSrc::Chunk { chunk, .. } => store.content.chunk(chunk),
+        ExtentSrc::Chunk { chunk, .. } => store.content.chunk(chunk).map(|c| (e, c)),
         ExtentSrc::Zero => None,
       })
-      .filter(|chunk| self.retains(chunk.born))
-      .map(|chunk| block_len(chunk.block.len()))
+      .filter(|(e, chunk)| touched(e.off, e.len, block_len(store.content.stored_bytes(chunk))))
+      .filter(|(_, chunk)| self.retains(chunk.born))
+      .map(|(_, chunk)| block_len(store.content.stored_bytes(chunk)))
       .fold(0u64, u64::saturating_add);
     if let Body::Open { open, .. } = &inode.body
       && open.len > 0
-      && touched(open.off, open.len)
+      && touched(open.off, open.len, block_len(open.block.len()))
       && self.retains(open.born)
     {
       retained = retained.saturating_add(block_len(open.block.len()));
@@ -3786,7 +3789,7 @@ impl Volume {
       window_of(off, chunk),
       window_of(end.saturating_sub(1), chunk),
     );
-    self.retention_of_pieces(store, no, |piece, _| {
+    self.retention_of_pieces(store, no, |piece, _, _| {
       let window = window_of(piece, chunk);
       window >= first && window <= last
     })
@@ -3799,13 +3802,11 @@ impl Volume {
     if len >= self.inode(store, no)?.attrs.size {
       return Ok(0);
     }
-    let page = u64::try_from(store.content.granule()).unwrap_or(1);
-    let chunk = u64::try_from(store.content.chunk_bytes()).unwrap_or(u64::MAX);
-    self.retention_of_pieces(store, no, |piece, piece_len| {
+    let locked = self.locked;
+    self.retention_of_pieces(store, no, |piece, piece_len, stored| {
       piece >= len
         || (piece.saturating_add(piece_len) > len
-          && charged_window(len.saturating_sub(piece), page, chunk)
-            < charged_window(piece_len, page, chunk))
+          && rebuilt_size(store, len.saturating_sub(piece), locked) < stored)
     })
   }
 
@@ -3822,21 +3823,20 @@ impl Volume {
     let chunk = u64::try_from(store.content.chunk_bytes())
       .unwrap_or(u64::MAX)
       .max(1);
-    let page = u64::try_from(store.content.granule()).unwrap_or(1);
     let window_start = window_start_of(at, chunk);
-    self.retention_of_pieces(store, no, |piece, piece_len| {
+    let locked = self.locked;
+    self.retention_of_pieces(store, no, |piece, piece_len, stored| {
       piece >= at
         || (piece == window_start
           && (writes
             || (piece.saturating_add(piece_len) > at
-              && charged_window(at.saturating_sub(piece), page, chunk)
-                < charged_window(piece_len, page, chunk))))
+              && rebuilt_size(store, at.saturating_sub(piece), locked) < stored)))
     })
   }
 
   /// The retention the whole content of `no` causes when the head lets go of it.
   fn retention_of_content(&self, store: &Store, no: InodeNo) -> Result<u64, VfsError> {
-    self.retention_of_pieces(store, no, |_, _| true)
+    self.retention_of_pieces(store, no, |_, _, _| true)
   }
 
   /// The retention dropping one link of `no` causes: its whole content, when this is the last name
@@ -3884,10 +3884,9 @@ impl Volume {
       if let Dead::Chunk(handle, born) = item
         && self.retains(born)
       {
-        let len = store
-          .content
-          .chunk(handle)
-          .map_or(0, |c| u64::try_from(c.block.len()).unwrap_or(u64::MAX));
+        let len = store.content.chunk(handle).map_or(0, |c| {
+          u64::try_from(store.content.stored_bytes(c)).unwrap_or(u64::MAX)
+        });
         let covered = len.min(self.retention_prepaid);
         self.retention_prepaid = self.retention_prepaid.saturating_sub(covered);
         let mut charged = covered;
@@ -4179,6 +4178,8 @@ impl Volume {
     // An open extent born earlier is sealed first: the snapshot keeps the sealed bytes and the
     // head continues in a fresh extent on its next write.
     if let Body::Open { open, sealed } = copy.body {
+      // A seal trims the block to its length (A-118), so the charge follows what the arena now holds.
+      let before = content_by_epoch(store, handle);
       let mut extents = sealed;
       if let Some(e) = store.content.seal(*open, self.seal_key)? {
         insert_extent(&mut extents, e);
@@ -4187,6 +4188,7 @@ impl Volume {
       if let Ok(old) = store.inodes.get_mut(handle) {
         old.body = copy.body.clone();
       }
+      self.reconcile(before, content_by_epoch(store, handle));
     }
     // The head's copy of inline content is born now; the old record keeps the snapshot's. Moved only
     // once the copy is installed.
@@ -5683,10 +5685,12 @@ pub(crate) fn content_by_epoch(store: &Store, handle: Handle<Inode>) -> EpochCon
     return out;
   };
   let sealed_block = |e: &Extent| match e.src {
-    ExtentSrc::Chunk { chunk, .. } => store
-      .content
-      .chunk(chunk)
-      .map(|c| (c.born, u64::try_from(c.block.len()).unwrap_or(u64::MAX))),
+    ExtentSrc::Chunk { chunk, .. } => store.content.chunk(chunk).map(|c| {
+      (
+        c.born,
+        u64::try_from(store.content.stored_bytes(c)).unwrap_or(u64::MAX),
+      )
+    }),
     ExtentSrc::Zero => None,
   };
   match &inode.body {
@@ -5764,7 +5768,10 @@ fn content_by_epoch_within(
     if let ExtentSrc::Chunk { chunk, .. } = e.src
       && let Some(c) = store.content.chunk(chunk)
     {
-      out.push((c.born, u64::try_from(c.block.len()).unwrap_or(u64::MAX)));
+      out.push((
+        c.born,
+        u64::try_from(store.content.stored_bytes(c)).unwrap_or(u64::MAX),
+      ));
     }
   };
   let (sealed, open) = match &inode.body {
@@ -6072,6 +6079,19 @@ pub(crate) fn clip_extents(
   Ok(freed)
 }
 
+/// The arena bytes a chunk rebuilt at `len` bytes holds (A-118): its length's granules when it can be trimmed, its
+/// whole power-of-two block when locked (a locked block is never trimmed). One rule for the rebuild and for the
+/// retention estimate before it, so the estimate secures exactly what the rebuild releases.
+fn rebuilt_size(store: &Store, len: u64, locked: bool) -> u64 {
+  let len = usize::try_from(len).unwrap_or(usize::MAX);
+  let bytes = if locked {
+    store.content.block_bytes(len)
+  } else {
+    store.content.trimmed_size(len)
+  };
+  u64::try_from(bytes).unwrap_or(u64::MAX)
+}
+
 /// A clipped extent, rebuilt into a fresh chunk of its new length's page multiple when its old
 /// chunk's block is larger (the old chunk released by the epoch rule); the extent itself otherwise, and when the
 /// smaller block cannot be had now.
@@ -6085,18 +6105,23 @@ fn rebuilt_if_smaller(
   let ExtentSrc::Chunk { chunk, .. } = clipped.src else {
     return Ok(clipped);
   };
-  let block = store.content.chunk(chunk).map_or(0, |c| c.block.len());
-  let need = usize::try_from(clipped.len).unwrap_or(usize::MAX);
-  if store.content.block_bytes(need) >= block {
-    return Ok(clipped);
-  }
-  // The smaller block is an economy, never a requirement: when the arena or the chunk slab cannot give it now, the
-  // clipped extent keeps its block, and its charge follows that block (`content_by_epoch`).
+  let block = store
+    .content
+    .chunk(chunk)
+    .map_or(0, |c| store.content.stored_bytes(c));
   // The rebuilt chunk replaces the clipped one in its volume: locked if that chunk's block was.
   let locked = store
     .content
     .chunk(chunk)
     .is_some_and(|c| store.content.arena().is_locked(c.block));
+  // Rebuild only when the rebuilt chunk holds fewer bytes: one trimmed to its length's granules (A-118), or a locked
+  // one's whole power-of-two block, since a locked block is never trimmed.
+  let need = clipped.len;
+  if rebuilt_size(store, need, locked) >= u64::try_from(block).unwrap_or(u64::MAX) {
+    return Ok(clipped);
+  }
+  // The smaller block is an economy, never a requirement: when the arena or the chunk slab cannot give it now, the
+  // clipped extent keeps its block, and its charge follows that block (`content_by_epoch`).
   let Ok(open) = store.content.reopen(&clipped, epoch, locked) else {
     return Ok(clipped);
   };
