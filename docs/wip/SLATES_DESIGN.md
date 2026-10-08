@@ -9376,9 +9376,15 @@ hands the key to the volume's new owner shard wrapped under its own root, and re
 tenant (`adopt_lineage`), so it seals under the key the dead owner did. Proven in
 `a_takeover_successor_serves_the_dead_owners_content_over_nfs`: a chunk sealed on the owner under the volume's key
 opens on the successor after the owner dies (non-vacuous: without the adoption the successor makes a new key and the
-open fails). Stated window: a neighbour that acknowledged a head before its pair arrived holds that sequence without
-its entry until the next seal; as a successor it then starts a new key for the volume (counted
-`fleet.seal.lineage_unadopted` when the adoption fails outright). The naming key travels with the volume too (a
+open fails). A head naming sealed content ships only once it carries an entry for every remote candidate still in
+the neighbourhood (`fleet::sealing_covers`; the mirror shipment likewise for its mirror holders), every candidate at
+once so the value at its sequence is one register value. A retired candidate is not counted: it stays in the
+placement while a neighbourhood change is in flight, but can never take the volume over. Until 2026-10-08 a head shipped whatever its sealing covered, under a stated
+window ("a neighbour that acknowledged a head before its pair arrived holds that sequence without its entry until the
+next seal; as a successor it then starts a new key"). Once archives became envelopes (piece 3b) that window lost the
+volume: a new key cannot open the old envelope, so such a successor refused it every period
+(`docs/bugs/2026-10-08-a-sealed-head-shipped-without-its-successors-key-entry.md`). A failed adoption is still counted
+`fleet.seal.lineage_unadopted`. The naming key travels with the volume too (a
 successor verifies the names the dead owner made): it is a per-volume child of the lineage key (`SealKeyOwner::Naming
 { volume }`), made with the lineage key when the first seal starts, carried once in the head as its record wrapped
 under the lineage key (`HeadNaming`, no per-neighbour cost), adopted with the lineage key, and erased with it on a

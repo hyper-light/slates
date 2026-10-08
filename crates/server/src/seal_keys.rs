@@ -437,6 +437,19 @@ fn recorded_lineage_secret(
   Some((KeyId(lineage_record.id), secret))
 }
 
+/// Whether `volume` has a lineage key recorded on this partition: its sealed snapshots are envelopes only a holder of
+/// that key can open (A-92 pieces 3b and 4c).
+pub fn lineage_recorded(
+  state: &crate::state::ShardState,
+  volume: slates_db::catalog::VolumeId,
+) -> bool {
+  state
+    .db
+    .partition()
+    .seal_key(&slates_db::catalog::SealKeyOwner::Lineage { volume })
+    .is_some()
+}
+
 /// What a sealed head carries for successors (A-92 piece 4c): the volume's lineage key wrapped under the pair key this
 /// owner shard delivered to each neighbour, in anchor order (deterministic for one set of delivered pairs). `None` while
 /// the volume has no recorded lineage key or this shard has delivered no pair.

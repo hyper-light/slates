@@ -145,6 +145,17 @@ fn owed(state: &ShardState, local: HostId, quorum: Quorum) -> Vec<Owed> {
       manifest: Some(manifest),
       content_holders: job.content.acked.iter().map(|host| host.0).collect(),
     };
+    // A promoted mirror holder opens the envelope with its own entry: the shipment waits until every mirror holder
+    // still in the mirror neighbourhood has one, so the value is fixed at its sequence (`fleet::sealing_covers`).
+    let live_holders = job
+      .content
+      .acked
+      .iter()
+      .copied()
+      .filter(|host| state.mirror_neighbourhood.contains(host));
+    if !crate::fleet::sealing_covers(state, *object, &value, live_holders) {
+      continue;
+    }
     let record = |object: ObjectId, sequence: u64, value: Vec<u8>| Record {
       owner: local,
       object,

@@ -4678,3 +4678,16 @@ are owed in the report before the next reading.
   - the thin link's reordering pulls: 24.3 → 12.6 s and 32.8 → 13.3 s.
 - Open: the grid's 1 Mbit/s 100 ms 5%-loss row worsened by one seed (383 → 635 ms ping p99), and the in-order
   jitter row's spread widened (max 30.1 → 37.5 s).
+
+### 2026-10-08: a sealed head shipped without its successor's key entry: the copyset flake's other cause (conditions 10, 11)
+
+- A full-suite failure of the copyset test showed a successor refused its own client for the whole wait, with 301
+  `fleet.materialize` refusals and no breakdown. The breakdown was `fleet.seal.envelope_unopened`, which the test's
+  counter filter dropped.
+- Cause: a head naming sealed content shipped before a candidate's pair key arrived, with no key entry for it. As
+  successor, that candidate could never open the envelope, and the volume was never served again.
+- Fixed: a sealed head ships only once it covers every remote candidate (`fleet::sealing_covers`), and the mirror
+  shipment likewise. Reproduced deterministically by withholding the pairs:
+  `a_sealed_head_waits_for_every_candidates_key_entry_so_any_successor_can_open_it`, red before, 3 of 3 after.
+- Open: a head's value can still grow at one sequence when a member joins after it shipped; and a successor answers
+  its own client `HomedElsewhere` before its adoption (`docs/bugs/2026-10-08-a-sealed-head-shipped-without-its-successors-key-entry.md`).

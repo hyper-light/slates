@@ -7559,6 +7559,7 @@ fn takeover_counters(
         || name.starts_with("fleet.forward.")
         || name.starts_with("fleet.materialize")
         || name.starts_with("fleet.fetch.")
+        || name.starts_with("fleet.seal.")
         || name.contains("takeover")
     })
     .map(|(name, count)| (*name, *count))
@@ -11538,6 +11539,206 @@ fn a_pressure_hold_does_not_keep_a_successor_from_serving_a_taken_over_volume() 
     ),
     "the hold still refuses a new volume: {new_volume:?}"
   );
+}
+
+/// Shape: the record periods the sealed-head test samples, pair delivery still withheld, after the content has placed
+/// on a survivor. An owner ships a head in the record period after its content places (`put_track_content` runs before
+/// `ship_shard_heads` in each period), so before the fix a survivor held the head within a period or two; four is
+/// headroom for a loaded machine.
+const HEAD_SHIP_PERIODS: u32 = 4;
+
+/// A-92 pieces 3b and 4c (a successor opens the dead owner's envelope with the lineage key the head carries for it):
+/// a head naming sealed content reaches its candidates only with a key entry for each of them, since any candidate
+/// may become the successor. Do: withhold the owner's pair deliveries (forgetting those made), seal a volume on A,
+/// wait until its content has placed on a survivor, sample the survivors' heads for [`HEAD_SHIP_PERIODS`] record
+/// periods more (the window in which an owner ships the head), release the withhold, wait for both survivors to hold
+/// a head naming the content, kill A. Expect: no head naming the content while withheld, each survivor's head then
+/// carrying a key entry for every survivor, and the successor serving the volume. Before the fix the head shipped
+/// during the withhold with no entries; a successor then refused the envelope (`fleet.seal.envelope_unopened`) for
+/// good, the copyset flake of 2026-10-08.
+#[test]
+fn a_sealed_head_waits_for_every_candidates_key_entry_so_any_successor_can_open_it() {
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c"];
+  let nodes: Vec<(MachineProfile, HostId, Identity)> =
+    names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+    nodes.iter().map(|(_, _, id)| id.certificate()).collect();
+  let instance_a = format!("fleet3-{}-{}", hosts[0].0, std::process::id());
+  let (_serve_lease, serve) = mesh_serve_ports(names.len());
+  let mut daemons = start_mesh(nodes, &hosts, &certs, &serve);
+  let withheld = daemons[0].inject_pair_withhold(true);
+  let hosts: Vec<HostId> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
+  assert_fleet_forms(&daemons, &hosts, &names);
+  let sealed = seal_while_pairs_withheld(&instance_a, &daemons, "withheld");
+  let released = daemons[0].inject_pair_withhold(false);
+  let heads = sealed
+    .as_ref()
+    .ok()
+    .map(|sealed| survivors_hold_the_sealed_head(&daemons, sealed));
+  let owner = daemons.remove(0);
+  owner.stop();
+  let serving = sealed.as_ref().ok().map(|sealed| {
+    let successor =
+      rendezvous_first(&[hosts[1], hosts[2]], sealed.object).expect("a survivor takes over");
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+      let successor_daemon = daemons
+        .iter()
+        .find(|daemon| daemon.member_identity().ok() == Some(successor))
+        .expect("the successor is a survivor");
+      assert_copyset_adopted(&daemons, successor_daemon, sealed.object);
+      let mut successor_client = Client::connect(successor_daemon.instance());
+      assert_successor_serves(&mut successor_client, successor_daemon, sealed.volume);
+    }))
+  });
+  for daemon in daemons {
+    daemon.stop();
+  }
+  assert!(
+    withheld.is_ok() && released.is_ok(),
+    "the withhold was installed and lifted: {withheld:?} {released:?}"
+  );
+  let sealed = sealed.unwrap_or_else(|why| panic!("setup: {why}"));
+  assert!(
+    sealed.withheld_heads.iter().all(Option::is_none),
+    "no survivor held a head naming the sealed content while its pair was withheld: {:?}",
+    sealed.withheld_heads
+  );
+  assert_sealed_heads_cover_every_survivor(heads);
+  assert!(
+    serving.is_some_and(|serving| serving.is_ok()),
+    "the successor serves the volume it took over"
+  );
+}
+
+/// What [`seal_while_pairs_withheld`] sealed: the volume, its sealed manifest, and, for each record period sampled
+/// while the pairs were withheld, the head naming that manifest the survivors held (`None` when none did).
+struct WithheldSeal {
+  volume: VolumeId,
+  object: ObjectId,
+  manifest: [u8; 32],
+  withheld_heads: Vec<Option<HeadValue>>,
+}
+
+/// Provisions `name` on the owner (`daemons[0]`), writes into it over NFS and snapshots it, waits for its content to
+/// place on a survivor (`f` holders besides the owner: one survivor of two), then samples the survivors' heads for
+/// [`HEAD_SHIP_PERIODS`] record periods while the owner's pair delivery stays withheld. Returns why not on a failed
+/// step.
+fn seal_while_pairs_withheld(
+  instance: &str,
+  daemons: &[Daemon],
+  name: &str,
+) -> Result<WithheldSeal, String> {
+  let mut client = Client::connect(instance);
+  let ReplyBody::Created { id } = client.call(&scratch(name)) else {
+    return Err("the volume was not created".to_owned());
+  };
+  let object = ObjectId(id.bytes);
+  write_hello_over_nfs(&daemons[0], name);
+  let snapshotted = client.call(&RequestBody::Snapshot { volume: id });
+  if !matches!(snapshotted, ReplyBody::Snapshotted { .. }) {
+    return Err(format!("the snapshot was not taken: {snapshotted:?}"));
+  }
+  let mut manifest = None;
+  let placed = poll_until(
+    &daemons.iter().collect::<Vec<_>>(),
+    PLACEMENT_DEADLINE,
+    || {
+      manifest = daemons[0].fleet_sealed_manifest(object)?;
+      let Some(manifest) = manifest else {
+        return Ok(false);
+      };
+      let mut any = false;
+      for daemon in &daemons[1..] {
+        any |= daemon.fleet_holder_content(manifest)?;
+      }
+      Ok(any)
+    },
+  );
+  let Some(manifest) = manifest.filter(|_| placed) else {
+    return Err("the content did not place on a survivor while the pairs were withheld".to_owned());
+  };
+  let (_pace_sender, pace) = std::sync::mpsc::channel::<()>();
+  let withheld_heads = (0..HEAD_SHIP_PERIODS)
+    .map(|_| {
+      let _ = pace.recv_timeout(Duration::from_nanos(HEARTBEAT_NS));
+      held_head_values(&daemons[1..], object)
+        .into_iter()
+        .flatten()
+        .find(|head| head.manifest == Some(manifest))
+    })
+    .collect();
+  Ok(WithheldSeal {
+    volume: id,
+    object,
+    manifest,
+    withheld_heads,
+  })
+}
+
+/// The head value each of `daemons` holds for `object`, decoded (`None` where it holds none or it was not observed).
+fn held_head_values(daemons: &[Daemon], object: ObjectId) -> Vec<Option<HeadValue>> {
+  daemons
+    .iter()
+    .map(|daemon| {
+      daemon
+        .fleet_holder_head(object)
+        .ok()
+        .flatten()
+        .and_then(|(_, bytes)| HeadValue::from_record_bytes(&bytes))
+    })
+    .collect()
+}
+
+/// Waits until every survivor (`daemons[1..]`) holds a head naming `sealed`'s manifest; returns whether they did and
+/// the heads they held.
+fn survivors_hold_the_sealed_head(
+  daemons: &[Daemon],
+  sealed: &WithheldSeal,
+) -> (bool, Vec<Option<HeadValue>>) {
+  let survivors = &daemons[1..];
+  let headed = poll_until(
+    &survivors.iter().collect::<Vec<_>>(),
+    PLACEMENT_DEADLINE,
+    || {
+      Ok(
+        held_head_values(survivors, sealed.object)
+          .iter()
+          .all(|head| {
+            head
+              .as_ref()
+              .is_some_and(|head| head.manifest == Some(sealed.manifest))
+          }),
+      )
+    },
+  );
+  (headed, held_head_values(survivors, sealed.object))
+}
+
+/// Asserts the survivors held the sealed head and that each carries a key entry for every survivor.
+fn assert_sealed_heads_cover_every_survivor(heads: Option<(bool, Vec<Option<HeadValue>>)>) {
+  let Some((headed, heads)) = heads else {
+    panic!("the survivors' heads were not read");
+  };
+  assert!(
+    headed,
+    "both survivors hold a head naming the content: {heads:?}"
+  );
+  let survivors = heads.len();
+  for head in &heads {
+    let keys = head
+      .as_ref()
+      .and_then(|head| head.sealing.as_ref())
+      .map_or(0, |sealing| sealing.keys.len());
+    assert!(
+      keys >= survivors,
+      "a survivor holds a sealed head with {keys} key entries, short of its {survivors} candidates: {head:?}"
+    );
+  }
 }
 
 /// Shape: the uid the catalog-takeover test grants read access to.

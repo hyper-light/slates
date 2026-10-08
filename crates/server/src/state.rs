@@ -422,6 +422,11 @@ pub struct ShardState {
   /// The candidate nodes, by stable anchor, this shard's pair key was delivered to in this daemon's life (A-92 piece 4b),
   /// bounded by the fleet's peer capacity.
   pub pairs_delivered: std::collections::BTreeSet<u64>,
+  /// The stable anchor of each neighbour, by member id, as this owner shard's pair delivery last resolved them (A-92
+  /// piece 4c): a head naming sealed content ships only once it carries a key entry for every remote candidate's
+  /// anchor. Refreshed each record period, so a member that restarts under a new id with the same anchor resolves;
+  /// bounded by the neighbourhood.
+  pub member_anchors: std::collections::BTreeMap<slates_db::HostId, u64>,
   /// The recipient public keys of peers by stable anchor, asked over their authenticated sessions and kept (A-92 piece
   /// 4b), bounded by the fleet's peer capacity.
   pub peer_recipients: BTreeMap<u64, hyper_seal::recipient::RecipientPublic>,
@@ -652,6 +657,9 @@ pub struct ShardState {
   /// client's reply deadline while each step stays inside its own bound. `None` in production
   /// (`Daemon::inject_serve_delay`).
   pub injected_serve_delay_ns: Option<u64>,
+  /// Test support: while set, this control shard delivers no pair keys (`Daemon::inject_pair_withhold`), as a
+  /// neighbour's recipient answer that has not yet arrived holds a delivery back.
+  pub injected_pair_withhold: bool,
   /// Test support (never reachable from the wire): voters whose record sessions each of this node's
   /// campaigns counts as out of their links, as a discovery page holds one, for the span after the
   /// campaign's round begins (`fleet::take_campaign_sessions`); so a test drives a campaign into sessions

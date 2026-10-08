@@ -1827,6 +1827,9 @@ fn unplaced_heads(state: &ShardState, local: HostId) -> Vec<Head> {
     let Some((sequence, value)) = head_value_of(state, record, object, config.quorum) else {
       continue; // The newest seal's content is not yet placed: the head waits for it.
     };
+    if !sealing_covers_candidates(state, config, object, &value, local) {
+      continue; // A candidate could not open the sealed content as a successor: the head waits for its pair.
+    }
     heads.extend(owed_record(
       state,
       config,
@@ -1963,6 +1966,79 @@ fn owed_record(
     acked,
     quorum: config.quorum,
   })
+}
+
+/// Whether a head may ship given what its sealing covers (A-92 pieces 3b and 4c), over the object's remote candidates
+/// that are still members of the neighbourhood. A candidate the council has retired stays in the placement while the
+/// owner's neighbourhood change is in flight (the settled and the current cohorts are joined), but it can never take
+/// the volume over, so it needs no entry; requiring one held the head back from the new cohort, and the change could
+/// never settle (`an_owner_settles_its_neighbourhood_only_once_its_head_is_placed_on_the_new_cohort`). See
+/// [`sealing_covers`].
+fn sealing_covers_candidates(
+  state: &ShardState,
+  config: &slates_db::register::Configuration,
+  object: ObjectId,
+  value: &HeadValue,
+  local: HostId,
+) -> bool {
+  let placement = config.place(object);
+  let remote = placement
+    .candidates
+    .iter()
+    .copied()
+    .filter(|candidate| *candidate != local && config.neighbourhood.contains(candidate));
+  sealing_covers(state, object, value, remote)
+}
+
+/// Whether a head naming sealed content carries the lineage key for each of `holders` (A-92 pieces 3b and 4c). The
+/// volume has a lineage key, so its archive is an envelope; any holder may become the successor (or a promoted mirror),
+/// and one without its entry could never open the envelope, so the volume would stay unserved after a takeover. Such a
+/// head waits until the owner shard has delivered a pair to every holder. Every holder at once, not each as it is
+/// covered: a head's bytes at one sequence are one register value, and shipping it to some holders now and to the
+/// rest later with more entries would put two values at one position. The wait is bounded: a pair is delivered once
+/// per neighbour and kept, each record period, so only a member new to the neighbourhood, or one unreachable until
+/// it is retired, holds a new sealed head back. A head naming no content, or plain content, needs no keys.
+pub(crate) fn sealing_covers(
+  state: &ShardState,
+  object: ObjectId,
+  value: &HeadValue,
+  mut holders: impl Iterator<Item = HostId>,
+) -> bool {
+  if value.manifest.is_none()
+    || !crate::seal_keys::lineage_recorded(state, DbVolumeId { bytes: object.0 })
+  {
+    return true;
+  }
+  let Some(sealing) = value.sealing.as_ref() else {
+    return false;
+  };
+  holders.all(|holder| {
+    state
+      .member_anchors
+      .get(&holder)
+      .is_some_and(|anchor| sealing.keys.iter().any(|key| key.anchor == *anchor))
+  })
+}
+
+/// The owner's sealed manifest for `object` once its content has placed: from the snapshot's durable record once the
+/// seal completed, else from the seal in progress once its content placed; `None` before then, or for a volume this
+/// shard does not own (read by `Daemon::fleet_sealed_manifest`).
+pub(crate) fn sealed_manifest(state: &ShardState, object: ObjectId) -> Option<[u8; 32]> {
+  let record = state
+    .db
+    .partition()
+    .volume(DbVolumeId { bytes: object.0 })?;
+  if let Some(snapshot) = state.db.partition().snapshot(record.id, record.head)
+    && let PlacementState::Placed { .. } = &snapshot.placed
+    && let Some(identity) = snapshot.identity
+  {
+    return Some(identity);
+  }
+  let seal = state.seals.get(&object)?;
+  if seal.snapshot != record.head || !seal.content.placed(state.fleet.configuration().quorum) {
+    return None;
+  }
+  seal.manifest
 }
 
 /// The head this node should be shipping for `record`'s volume — its sequence and value — or `None` while
@@ -6192,6 +6268,9 @@ async fn run_record_period(
 /// its pair, and the records stay one per (owner shard, candidate). Once per pair per daemon life; a candidate accepts
 /// a repeat of the key it holds, so a restart's redelivery changes nothing there.
 async fn deliver_pairs(origin: u16, shard: u16, local: HostId, budget: CommitBudget) {
+  if state::with_state(|s| s.injected_pair_withhold).unwrap_or(false) {
+    return;
+  }
   let Some((members, delivered)) = call_within(
     origin,
     shard,
@@ -6219,7 +6298,7 @@ async fn deliver_pairs(origin: u16, shard: u16, local: HostId, budget: CommitBud
     return;
   };
   // Each neighbour by its stable anchor, from the identities this control shard has learned.
-  let owed: Vec<(HostId, u64)> = state::with_state(|s| {
+  let anchors: Vec<(HostId, u64)> = state::with_state(|s| {
     members
       .iter()
       .filter_map(|member| {
@@ -6228,10 +6307,27 @@ async fn deliver_pairs(origin: u16, shard: u16, local: HostId, budget: CommitBud
           .find(|(_, learned)| learned.host == *member)
           .map(|(anchor, _)| (*member, anchor.0))
       })
-      .filter(|(_, anchor)| !delivered.contains(anchor))
       .collect()
   })
   .unwrap_or_default();
+  let owed: Vec<(HostId, u64)> = anchors
+    .iter()
+    .copied()
+    .filter(|(_, anchor)| !delivered.contains(anchor))
+    .collect();
+  // The owner shard learns every neighbour's anchor, so it can tell which candidates a head's sealing covers.
+  let resolved: std::collections::BTreeMap<HostId, u64> = anchors.into_iter().collect();
+  if call_within(
+    origin,
+    shard,
+    move |s| s.member_anchors = resolved,
+    HEARTBEAT_NS,
+  )
+  .await
+  .is_none()
+  {
+    count_refusal(MEMBER_ANCHORS_UNSENT);
+  }
   for (member, anchor) in owed {
     let Some(public) = peer_recipient(member, anchor, budget).await else {
       continue;
@@ -6278,6 +6374,11 @@ async fn deliver_pairs(origin: u16, shard: u16, local: HostId, budget: CommitBud
     }
   }
 }
+
+/// Counter: the owner shard did not answer this period's neighbour anchors (A-92 piece 4c); sent again next period,
+/// and until then a sealed head waits for the candidates it cannot resolve.
+/// Format: a counter name in the daemon's status report.
+const MEMBER_ANCHORS_UNSENT: &str = "fleet.seal.member_anchors_unsent";
 
 /// Counter: a pair key that could not be made, wrapped or delivered this period (A-92 piece 4b); tried again next.
 /// Format: a counter name in the daemon's status report.

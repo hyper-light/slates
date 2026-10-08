@@ -2221,6 +2221,35 @@ impl Daemon {
     })
   }
 
+  /// The owner's sealed manifest for `object` once its content has placed on its holders (§4.10), read on the shard
+  /// that owns it; `Ok(None)` before then or when this node does not own it. A test or an operator reads it to follow
+  /// a seal before its head ships.
+  pub fn fleet_sealed_manifest(
+    &self,
+    object: slates_db::register::ObjectId,
+  ) -> Result<Option<[u8; 32]>, ObserveError> {
+    self.observe(self.shard_of_object(object), move |s| {
+      crate::fleet::sealed_manifest(s, object)
+    })
+  }
+
+  /// Test support: while `withhold` is set, this node's owner shards deliver no pair keys to their neighbours, as a
+  /// neighbour whose recipient answer is late holds its delivery back (A-92 piece 4b). Setting it also forgets the
+  /// pairs each owner shard has delivered, so a head this node seals in the meantime has no key entry for any
+  /// neighbour: the state of a head written before its candidates' pairs arrived. Lifting it resumes delivery (the
+  /// same pair keys, found again). `Ok` once installed on every shard, else the first typed refusal.
+  pub fn inject_pair_withhold(&self, withhold: bool) -> Result<(), ObserveError> {
+    self.observe(self.shards.first().copied(), move |s| {
+      s.injected_pair_withhold = withhold;
+    })?;
+    if withhold {
+      for shard in self.shards.iter().copied() {
+        self.observe(Some(shard), |s| s.pairs_delivered.clear())?;
+      }
+    }
+    Ok(())
+  }
+
   /// Test support: makes each of this node's campaigns count the record sessions of `voters` as out of their
   /// links for `span_ns` after its round begins, as a discovery page holds one for its round trip, so a test
   /// drives a campaign into sessions that are out for a moment
@@ -2850,6 +2879,7 @@ fn init_shard(
     seal_state: sealing,
     seal_recipient: None,
     pairs_delivered: std::collections::BTreeSet::new(),
+    member_anchors: std::collections::BTreeMap::new(),
     peer_recipients: std::collections::BTreeMap::new(),
     content,
     purge_seen_allocations: 0,
@@ -2955,6 +2985,7 @@ fn init_shard(
     probe_windows: crate::fleet::ProbeWindows::default(),
     probe_deaf_to: std::collections::BTreeSet::new(),
     injected_serve_delay_ns: None,
+    injected_pair_withhold: false,
     served_sessions: std::collections::BTreeMap::new(),
     campaign_session_hold: None,
     record_refused_from: std::collections::BTreeSet::new(),
