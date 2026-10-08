@@ -2166,6 +2166,19 @@ fn read_head(queued: &[u8]) -> Head {
 /// one of 185,745 calls was forwarded; their service p99 was 115 µs at rest and 1.18 ms with a spinner per core,
 /// `crates/cli/examples/vfs_tails.rs`). Each turn peeks the whole records queued, serves them up to the shard's
 /// quantum, sends their replies in whole records and only then consumes their requests (A-113).
+/// Counter: an NFS connection the peer closed at a record boundary (`Head::Ended`).
+/// Format: a counter name in the daemon's status report.
+const CONNECTION_ENDED_BY_PEER: &str = "nfs.connection.ended_by_peer";
+/// Counter: an NFS connection the peer closed with an unfinished record queued.
+/// Format: a counter name in the daemon's status report.
+const CONNECTION_CLOSED_MID_RECORD: &str = "nfs.connection.closed_mid_record";
+/// Counter: an NFS connection ended because its idle wait failed, or a callback send on it failed.
+/// Format: a counter name in the daemon's status report.
+const CONNECTION_WAIT_FAILED: &str = "nfs.connection.wait_failed";
+/// Counter: an NFS connection ended because a turn's replies could not be sent.
+/// Format: a counter name in the daemon's status report.
+const CONNECTION_SEND_FAILED: &str = "nfs.connection.send_failed";
+
 async fn serve_connection(mut connection: Connection) {
   let this = registry::current_shard().unwrap_or(0);
   // The connection's back-channel outbox on this shard (`crate::callback`), released however the loop ends.
@@ -2176,6 +2189,7 @@ async fn serve_connection(mut connection: Connection) {
   loop {
     match peek_head(&connection.stream) {
       Head::Ended => {
+        crate::fleet::count_refusal(CONNECTION_ENDED_BY_PEER);
         connection.end();
         return;
       }
@@ -2187,6 +2201,7 @@ async fn serve_connection(mut connection: Connection) {
       Head::Waiting(bytes) => {
         if woken && bytes > 1 && connection.stream.peer_closed().unwrap_or(true) {
           // The peer closed with an unfinished record queued: it never completes.
+          crate::fleet::count_refusal(CONNECTION_CLOSED_MID_RECORD);
           connection.end();
           return;
         }
@@ -2205,6 +2220,7 @@ async fn serve_connection(mut connection: Connection) {
           Idle::Failed => false,
         };
         if !standing {
+          crate::fleet::count_refusal(CONNECTION_WAIT_FAILED);
           connection.end();
           return;
         }
@@ -2212,6 +2228,7 @@ async fn serve_connection(mut connection: Connection) {
       Head::Records(records) => {
         let turn = serve_turn(this, &mut connection, records, registration.0).await;
         if !send_turn(&connection, &turn).await {
+          crate::fleet::count_refusal(CONNECTION_SEND_FAILED);
           connection.end();
           return;
         }
