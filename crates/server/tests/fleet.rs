@@ -11766,6 +11766,92 @@ fn assert_sealed_heads_cover_every_survivor(heads: Option<(bool, Vec<Option<Head
   }
 }
 
+/// Shape: the forwarded calls the false-death recovery test times, one false death each.
+const FALSE_DEATH_TRIALS: u32 = 5;
+
+/// §4.8 "Lookup" under the detector's stated accuracy (a live member condemned within its mistake allowance, the death
+/// gossiped and refuted): how long a node holding a live owner dead keeps its clients from that owner's volume. Do: on a
+/// three-node fleet, create a volume on A and reach it from B's client; then, [`FALSE_DEATH_TRIALS`] times, inject a
+/// false death of A into B alone and poll the forwarded status from B's client until it is served. Expect: no call
+/// refused, each trial served within one liveness budget (the forward's location allowance), the times printed for
+/// the A/B of the recovery path (`docs/wip/BENCHMARKS.md`). Before 2026-10-08 every false death refused at least one
+/// call `HomedElsewhere`; the forward now retries its owner's resolution within that allowance.
+#[test]
+fn a_refuted_false_death_keeps_a_forward_out_for_less_than_its_location_budget() {
+  let _serial = serialize_fleet_tests();
+  let (_serve_lease, daemons, hosts) = formed_mesh(&["a", "b", "c"]);
+  let mut owner_client = Client::connect(daemons[0].instance());
+  let ReplyBody::Created { id } = owner_client.call(&scratch("held-dead")) else {
+    for daemon in daemons {
+      daemon.stop();
+    }
+    panic!("setup: the volume was not created on A");
+  };
+  let mut forwarded = Client::connect(daemons[1].instance());
+  let reached = audit_wait(|| {
+    Ok(matches!(
+      forwarded.call(&RequestBody::Status { volume: id }),
+      ReplyBody::Status { .. }
+    ))
+  });
+  let outages: Vec<_> = (0..FALSE_DEATH_TRIALS)
+    .map(|trial| time_false_death(&daemons, &mut forwarded, hosts[0], id, trial))
+    .collect();
+  let counters = daemons[1].fleet_refusals();
+  for daemon in daemons {
+    daemon.stop();
+  }
+  eprintln!("FALSE-DEATH outages: {outages:?}");
+  assert!(
+    reached,
+    "B's client reached A's volume before the false deaths"
+  );
+  for (injected, served, took, refused) in &outages {
+    assert!(*injected, "the false death landed on B");
+    assert_eq!(
+      *refused, 0,
+      "no call was refused while the false death lasted: {outages:?}; B's counters {counters:?}"
+    );
+    assert!(
+      *served && *took < Duration::from_nanos(LIVENESS_BUDGET_NS),
+      "a forward recovered from a refuted false death within its location budget: {outages:?}; B's counters {counters:?}"
+    );
+  }
+}
+
+/// One false-death trial: injects a false death of `owner` into `daemons[1]` and polls `client`'s forwarded status of
+/// `volume` every 10 ms until served (bounded at ten liveness budgets). Returns whether the death landed, whether a
+/// call was served, how long that took and how many calls were refused first; then waits a liveness budget so the
+/// fleet settles before the next trial.
+fn time_false_death(
+  daemons: &[Daemon],
+  client: &mut Client,
+  owner: HostId,
+  volume: VolumeId,
+  trial: u32,
+) -> (bool, bool, Duration, u32) {
+  let (_pace_sender, pace) = std::sync::mpsc::channel::<()>();
+  let injected =
+    daemons[1].observe_peer_dead(owner, FALSE_DEATH_INCARNATION * u64::from(trial + 1));
+  let began = Instant::now();
+  let mut served = false;
+  let mut refused = 0_u32;
+  while began.elapsed() < Duration::from_nanos(LIVENESS_BUDGET_NS) * 10 {
+    if matches!(
+      client.call(&RequestBody::Status { volume }),
+      ReplyBody::Status { .. }
+    ) {
+      served = true;
+      break;
+    }
+    refused = refused.saturating_add(1);
+    let _ = pace.recv_timeout(Duration::from_millis(10));
+  }
+  let took = began.elapsed();
+  let _ = pace.recv_timeout(Duration::from_nanos(LIVENESS_BUDGET_NS));
+  (injected.is_ok(), served, took, refused)
+}
+
 /// Shape: the uid the catalog-takeover test grants read access to.
 const GRANTED_UID: u32 = 7_777;
 

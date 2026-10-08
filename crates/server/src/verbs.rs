@@ -1440,7 +1440,7 @@ async fn resolve_and_forward(
       });
       Some(owner)
     }
-    None => crate::owner_location::locate(query).await.ok(),
+    None => locate_within_budget(query).await,
   };
   let bytes = match owner {
     Some(owner) => {
@@ -1534,6 +1534,40 @@ async fn await_materialization(object: ObjectId) {
     {
       return;
     }
+  }
+}
+
+/// The owner of `query`'s object, resolved again within the one liveness budget a forward allows for finding its owner:
+/// the direct route (the volume's creator while eligible) and then a location round, asked again every tenth of a
+/// heartbeat while the budget lasts. The requests are
+/// not sent until an owner is found, so a retry can never apply a verb twice. The owner can be briefly unfindable
+/// while it is live: the failure detector condemns a live member within its stated mistake allowance, the death is
+/// gossiped, and every node drops its routes and its link to that member until it refutes and is linked again
+/// (2026-10-08: a foreign node held a live successor dead that another node had condemned, 1 against an allowance of
+/// 4.9, and its client was refused `HomedElsewhere`). A takeover's adoption leaves the same window. Measured
+/// (`a_refuted_false_death_keeps_a_forward_out_for_less_than_its_location_budget`, 10 false deaths per arm): without the
+/// retry every false death refused a call, and the next call 10 ms later was served after 22–217 ms; with location
+/// rounds alone, paced a heartbeat, 1 s and still refused; with the direct route first, paced a heartbeat, none refused
+/// and 111–224 ms; paced a tenth of a heartbeat, none refused and 21–218 ms. Each retry is counted
+/// (`fleet.owner_location.retried`); `None` once the budget is spent with no owner found.
+async fn locate_within_budget(query: crate::owner_location::Query) -> Option<HostId> {
+  let deadline = slates_rt::futures::now_ns().saturating_add(crate::daemon::LIVENESS_BUDGET_NS);
+  loop {
+    // The direct route first (the volume's creator, while eligible), as a fresh call would take it.
+    if let Some(owner) = crate::state::with_state(|state| query.known_owner(state, None)).flatten()
+    {
+      return Some(owner);
+    }
+    if let Ok(owner) = crate::owner_location::locate(query).await {
+      return Some(owner);
+    }
+    let pace = crate::daemon::HEARTBEAT_NS / crate::fleet::POLL_PER_PERIOD;
+    if slates_rt::futures::now_ns().saturating_add(pace) >= deadline
+      || slates_rt::futures::sleep(pace).await.is_err()
+    {
+      return None;
+    }
+    crate::state::with_state(|state| state.count("fleet.owner_location.retried", 1));
   }
 }
 
