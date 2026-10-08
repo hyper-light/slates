@@ -4722,8 +4722,10 @@ Measured on the two-network Docker topology (6 nodes, one shard each, no impairm
   lines were read by mistake while tracing this, against a standing rule not to, so the fix is Ada's to direct.
   Owed:
   - discovery that pages only when the peer's membership digest changed;
-  - the uninitialized-root poll backed off;
-  - the per-poll `getrusage` cost.
+  - the uninitialized-root poll backed off.
+  - Not owed: the `getrusage` calls are the runtime's wait attribution (`rt/src/attribution.rs`, two per wait),
+    130–134 ns each by its own record. 1,146 a second is under 0.02% of a core; strace's per-call overhead
+    exaggerated them.
 - Per-node power was not measured (the nodes run in containers on a shared machine).
 
 ### 2026-10-08: a refuted false death costs a forward a second of outage: the record link, not the detector (condition 11)
