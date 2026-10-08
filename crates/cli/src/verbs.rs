@@ -1800,6 +1800,20 @@ fn daemon_status_text(report: &DaemonReport, telemetry: &[TelemetryReport]) -> S
       peer.condemnation_allowance_milli
     ));
   }
+  for session in &report.fleet.sessions {
+    out.push_str(&format!(
+      "fleet_session {}: lent={} cwnd={} srtt_ns={} pto_ns={} spurious_losses={} persistent_collapses={} consumed={} mtu={}\n",
+      session.peer,
+      session.lent,
+      session.congestion_window,
+      session.smoothed_rtt_ns,
+      session.pto_ns,
+      session.spurious_losses,
+      session.persistent_collapses,
+      session.bytes_consumed,
+      session.path_mtu
+    ));
+  }
   for shard in &report.shards {
     out.push_str(&format!(
       "shard {}: clients={} volumes={} served={} replayed={} replay_ns={} torn={} mapped={} locked={} reserve={} committed={} retained={} replicated={} retained_versions={} metadata={} committed_metadata={} tasks_refused={} landings_awaiting={}/{} landings_in_flight={} target_leases={}\n",

@@ -1032,6 +1032,8 @@ pub struct ShardReport {
   /// The node's ML-KEM-1024 recipient id (A-92 piece 4a): live on the control shard, whose partition holds it; empty
   /// on the others and while sealing is unavailable. Appended.
   pub seal_recipient_id: Vec<u8>,
+  /// This shard's record session to each peer, as last seen (live on the control shard, empty elsewhere). Appended.
+  pub sessions: Vec<SessionReport>,
 }
 
 /// The daemon's place in its fleet (§4.8; §2.6 boot step 6), as the verbs' placement authority sees it.
@@ -1080,6 +1082,35 @@ pub struct FleetReport {
   /// the theory's allowance beside each count: a count far above its allowance is a detector misjudging a
   /// live peer, one within it is the network the detector was told about. Empty on a laptop.
   pub detector: Vec<DetectorPeerReport>,
+  /// The control shard's record session to each peer (§4.8, the session forwards and reads ride): its congestion
+  /// state as last seen, so a slow cross-region transfer shows whether the window, the round trip or loss bound it.
+  /// Empty on a laptop. Appended.
+  pub sessions: Vec<SessionReport>,
+}
+
+/// One record session to a peer, as this node last saw it (§4.8; condition 7's evidence): the sender's congestion
+/// state on the session forwards and reads ride. A session out on loan cannot be read, so the report is its state when
+/// it was last returned (`lent` says it is out now); zero everywhere when it has not been seen yet.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct SessionReport {
+  /// The peer's member id.
+  pub peer: u64,
+  /// Whether the session is out on loan now, so these numbers are from its last return.
+  pub lent: bool,
+  /// The congestion window, bytes (RFC 9002 §7; the controller slates runs, Copa).
+  pub congestion_window: u64,
+  /// The smoothed round trip, nanoseconds (RFC 9002 §5.3).
+  pub smoothed_rtt_ns: u64,
+  /// The probe timeout, nanoseconds (RFC 9002 §6.2.1).
+  pub pto_ns: u64,
+  /// Losses declared and then found spurious (a reordering mistaken for loss).
+  pub spurious_losses: u64,
+  /// Persistent-congestion collapses of the window (RFC 9002 §7.6).
+  pub persistent_collapses: u64,
+  /// Stream bytes the session has consumed from its peer.
+  pub bytes_consumed: u64,
+  /// The path MTU discovered, bytes; zero before discovery.
+  pub path_mtu: u64,
 }
 
 /// One peer as this node's failure detector judges it (hyper-swim's `PeerReport`): the suspicions and

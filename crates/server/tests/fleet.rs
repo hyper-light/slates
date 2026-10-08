@@ -6170,6 +6170,72 @@ fn a_fleet_node_under_a_containers_memory_bound_still_admits_a_client() {
   );
 }
 
+/// §4.14 / condition 7's evidence: a node's status reports its record session to each peer with the sender's
+/// congestion state (`fleet.sessions`), so a slow transfer shows whether the window, the round trip or loss bound it.
+/// Do: form a three-node mesh and read each node's `DaemonStatus` until its record sessions are up. Expect: one session
+/// a peer, each with a positive window, a measured round trip, and a probe timeout above it (RFC 9002 §6.2.1:
+/// `PTO = srtt + max(4·rttvar, granularity) + max_ack_delay`).
+#[test]
+fn a_nodes_status_reports_each_record_session_with_its_congestion_state() {
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c"];
+  let nodes: Vec<(MachineProfile, HostId, Identity)> =
+    names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+    nodes.iter().map(|(_, _, id)| id.certificate()).collect();
+  let (_serve_lease, serve) = mesh_serve_ports(names.len());
+  let daemons = start_mesh(nodes, &hosts, &certs, &serve);
+  let hosts: Vec<HostId> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
+  assert_fleet_forms(&daemons, &hosts, &names);
+  let observed: Vec<&Daemon> = daemons.iter().collect();
+  let sessions_of = |daemon: &Daemon| {
+    let mut client = Client::connect(daemon.instance());
+    match client.call(&RequestBody::DaemonStatus) {
+      ReplyBody::DaemonStatus { report } => report.fleet.sessions,
+      _ => Vec::new(),
+    }
+  };
+  let complete = |sessions: &[slates_ipc::protocol::SessionReport], own: HostId| {
+    let peers: std::collections::BTreeSet<u64> =
+      sessions.iter().map(|session| session.peer).collect();
+    let others: std::collections::BTreeSet<u64> = hosts
+      .iter()
+      .filter(|host| **host != own)
+      .map(|host| host.0)
+      .collect();
+    peers == others
+      && sessions
+        .iter()
+        .all(|session| session.congestion_window > 0 && session.smoothed_rtt_ns > 0)
+  };
+  let reported = poll_until(&observed, FORMATION_DEADLINE, || {
+    Ok(
+      daemons
+        .iter()
+        .zip(&hosts)
+        .all(|(daemon, own)| complete(&sessions_of(daemon), *own)),
+    )
+  });
+  let last: Vec<_> = daemons.iter().map(sessions_of).collect();
+  for daemon in daemons {
+    daemon.stop();
+  }
+  assert!(
+    reported,
+    "every node reports a session to each peer with a window and a round trip: {last:?}"
+  );
+  for session in last.iter().flatten() {
+    assert!(
+      session.pto_ns > session.smoothed_rtt_ns,
+      "the probe timeout is above the smoothed round trip: {session:?}"
+    );
+  }
+}
+
 /// A minimal client of a daemon's own rendezvous (as in the other daemon tests): connect and call verbs.
 struct Client {
   end: ClientEnd,

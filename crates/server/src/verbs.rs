@@ -2817,6 +2817,11 @@ pub fn shard_report(state: &mut ShardState) -> ShardReport {
     configuration_version: state.fleet.configuration().version,
     takeover: takeover_report(state),
     detector: detector_report(state),
+    sessions: state
+      .record_sessions
+      .iter()
+      .map(|(peer, link)| link.report(*peer))
+      .collect(),
     tasks_refused: slates_rt::registry::with_current(|ctx| ctx.counters().admission_refused)
       .unwrap_or(0),
     landings_awaiting: u64::try_from(state.landing.awaiting.len()).unwrap_or(u64::MAX),
@@ -2908,6 +2913,7 @@ fn fleet_report(state: &ShardState, shards: &[ShardReport]) -> FleetReport {
   let root = control.map_or_else(|| root_report(state), |shard| shard.root.clone());
   let takeover = control.map_or_else(|| takeover_report(state), |shard| shard.takeover.clone());
   let detector = control.map_or_else(|| detector_report(state), |shard| shard.detector.clone());
+  let sessions = control.map_or_else(Vec::new, |shard| shard.sessions.clone());
   let (held_records, takeovers_pending, configuration_version) = control.map_or_else(
     || {
       (
@@ -2949,6 +2955,7 @@ fn fleet_report(state: &ShardState, shards: &[ShardReport]) -> FleetReport {
     configuration_version,
     takeover,
     detector,
+    sessions,
   }
 }
 

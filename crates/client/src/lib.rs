@@ -48,7 +48,7 @@ pub use slates_ipc::protocol::{
   GroupReport, HostAnswer, HostMountEvidence, HostPathReason, Intent, KernelCache,
   LandingDegradation, LandingDurability, LandingOutcome, LandingSummary, NamePolicy, OciBinding,
   PlacedState, Principal, ReadAt, ReadWritePolicy, Refusal, RefusalCount, Residency,
-  RetirementReport, Rights, Scope, ShardReport, SharingSemantics, Signal, SizeClass,
+  RetirementReport, Rights, Scope, SessionReport, ShardReport, SharingSemantics, Signal, SizeClass,
   SnapshotBoundary, SnapshotCoverage, SnapshotId, SpanRecord, StatusReport, TakeoverReport,
   TargetPathConstraint, TelemetryReport, TransportReport, UnsupportedReason, VolumeId,
   VolumeSummary, WorkOp,

@@ -124,6 +124,9 @@ pub struct RecordLink {
   /// Who borrowed it, while it is out (`fleet::take_sessions`'s label, a status counter name): what a forward that
   /// finds the session out counts, so a session that never comes back names its holder.
   pub lent_to: Option<&'static str>,
+  /// The session's congestion state when it was last returned or established, so status reports it while a borrower
+  /// has it out (a cross-region read keeps it borrowed for the whole transfer).
+  pub last_seen: Option<slates_ipc::protocol::SessionReport>,
 }
 
 impl RecordLink {
@@ -133,6 +136,54 @@ impl RecordLink {
       endpoint: Some(endpoint),
       borrowed: None,
       lent_to: None,
+      last_seen: None,
+    }
+  }
+
+  /// The session's congestion state as `endpoint` holds it now.
+  pub fn seen(
+    peer: slates_db::HostId,
+    endpoint: &slates_transport::endpoint::Endpoint,
+  ) -> slates_ipc::protocol::SessionReport {
+    slates_ipc::protocol::SessionReport {
+      peer: peer.0,
+      lent: false,
+      congestion_window: endpoint.congestion_window(),
+      smoothed_rtt_ns: endpoint.smoothed_rtt(),
+      pto_ns: endpoint.pto(),
+      spurious_losses: endpoint.spurious_losses(),
+      persistent_collapses: endpoint.persistent_collapses(),
+      bytes_consumed: endpoint.bytes_consumed(),
+      path_mtu: endpoint
+        .path_mtu()
+        .and_then(|mtu| u64::try_from(mtu).ok())
+        .unwrap_or(0),
+    }
+  }
+
+  /// The link to `peer` for a status report: read now when the session is here, else as it was last returned, marked
+  /// lent (zero everywhere when it has not been seen yet).
+  pub fn report(&self, peer: slates_db::HostId) -> slates_ipc::protocol::SessionReport {
+    match &self.endpoint {
+      Some(endpoint) => Self::seen(peer, endpoint),
+      None => {
+        let mut last = self
+          .last_seen
+          .clone()
+          .unwrap_or(slates_ipc::protocol::SessionReport {
+            peer: peer.0,
+            lent: true,
+            congestion_window: 0,
+            smoothed_rtt_ns: 0,
+            pto_ns: 0,
+            spurious_losses: 0,
+            persistent_collapses: 0,
+            bytes_consumed: 0,
+            path_mtu: 0,
+          });
+        last.lent = true;
+        last
+      }
     }
   }
 }

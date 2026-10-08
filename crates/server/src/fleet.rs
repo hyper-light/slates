@@ -6501,6 +6501,7 @@ pub(crate) fn return_sessions(sessions: Vec<(HostId, Endpoint)>) {
       let returned = endpoint.connection_id().ok();
       match s.record_sessions.get_mut(&host) {
         Some(link) if link.endpoint.is_none() && link.borrowed == returned => {
+          link.last_seen = Some(crate::state::RecordLink::seen(host, &endpoint));
           link.endpoint = Some(endpoint);
           link.borrowed = None;
           link.lent_to = None;

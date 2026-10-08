@@ -84,6 +84,17 @@ fn report() -> ReplyBody {
           condemnations: 89,
           condemnation_allowance_milli: 97,
         }],
+        sessions: vec![slates_ipc::protocol::SessionReport {
+          peer: 101,
+          lent: true,
+          congestion_window: 103,
+          smoothed_rtt_ns: 107,
+          pto_ns: 109,
+          spurious_losses: 113,
+          persistent_collapses: 127,
+          bytes_consumed: 131,
+          path_mtu: 137,
+        }],
       },
     }),
   }

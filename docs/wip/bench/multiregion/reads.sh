@@ -4,7 +4,8 @@
 # bootstraps the root on a0 and region 1 on b0, creates a volume on a1 and writes PAYLOAD into it, then times ROUNDS
 # whole reads of the file from a0 (same region as the owner) and from b0, b1 and b2 (the other region). Each read
 # prints `node:exit/seconds/sum`, where `sum` is the BSD `sum` checksum of the bytes read (compare with
-# `sum PAYLOAD`); 0 means the read refused. It ends with b0's forwarding and read-ahead counters.
+# `sum PAYLOAD`); 0 means the read refused. It ends with the owner's record sessions to each reader (window, round
+# trip, loss) and b0's forwarding and read-ahead counters.
 #
 #   sh docs/wip/bench/multiregion/reads.sh SCRATCH_DIR PAYLOAD [ROUNDS]
 #   JITTER=0ms IMAGE=slates:mr sh docs/wip/bench/multiregion/reads.sh SCRATCH_DIR PAYLOAD 3
@@ -47,6 +48,11 @@ for round in $(seq 1 "$ROUNDS"); do
   done
   echo "$line"
 done
+# The owner's record session to each reader (a1 sends the bytes): its window, round trip and loss when last seen.
+docker exec mr-a1 /slates status --json 2>/dev/null | python3 -c '
+import json, sys
+for session in json.load(sys.stdin)["fleet"].get("sessions", []):
+    print({key: session[key] for key in ("peer", "lent", "congestion_window", "smoothed_rtt_ns", "pto_ns", "spurious_losses", "persistent_collapses", "bytes_consumed")})'
 docker exec mr-b0 /slates status --json 2>/dev/null | python3 -c '
 import json, sys, collections
 counts = collections.Counter()

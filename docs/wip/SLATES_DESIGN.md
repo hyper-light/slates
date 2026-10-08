@@ -3803,6 +3803,14 @@ version.
 > `a_cross_region_read_is_served_from_read_ahead_windows_and_byte_identical` (7 forwards for 1,041 pages, where
 > one window per forward took 66).
 
+> **Status (2026-10-07, status reports each record session's congestion state).** A node's `DaemonStatus` carries
+> its record session to each peer (`fleet.sessions`): congestion window, smoothed round trip, probe timeout, spurious
+> losses, persistent collapses, bytes consumed and path MTU. A session out on loan (a read keeps one borrowed for the
+> whole transfer) reports its state when last returned, marked `lent`. The CLI prints `fleet_session` lines, `--json`
+> and MCP carry the same fields, and `docs/wip/bench/multiregion/reads.sh` prints the owner's sessions after its
+> reads. This is the evidence condition 7 needs on the real crossing, whose reads gained a tenth where the simulator
+> gained threefold. Regression `a_nodes_status_reports_each_record_session_with_its_congestion_state`.
+
 > **Status (2026-10-07, a successor's own volume before it serves).** A node that adopted a volume's head in a
 > takeover owns it before its owner shard has materialized the volume. A verb from its own client in that window
 > reaches the forward path, because the catalog lacks the volume. It ran the location round, which asks the peers

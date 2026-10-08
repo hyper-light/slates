@@ -1960,6 +1960,17 @@ pub fn daemon_json(r: &DaemonReport, telemetry: &[TelemetryReport]) -> Value {
         "condemnations": peer.condemnations,
         "condemnation_allowance_milli": peer.condemnation_allowance_milli,
       })).collect::<Vec<_>>(),
+      "sessions": r.fleet.sessions.iter().map(|session| json!({
+        "peer": session.peer,
+        "lent": session.lent,
+        "congestion_window": session.congestion_window,
+        "smoothed_rtt_ns": session.smoothed_rtt_ns,
+        "pto_ns": session.pto_ns,
+        "spurious_losses": session.spurious_losses,
+        "persistent_collapses": session.persistent_collapses,
+        "bytes_consumed": session.bytes_consumed,
+        "path_mtu": session.path_mtu,
+      })).collect::<Vec<_>>(),
     },
   })
 }
