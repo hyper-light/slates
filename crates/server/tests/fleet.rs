@@ -5206,8 +5206,15 @@ fn a_cross_region_client_finds_the_copyset_successor_instead_of_an_unrelated_liv
       .find(|daemon| daemon.instance() == foreign_instance)
       .map(|daemon| daemon.fleet_refusals_within(slates_server::daemon::LIVENESS_BUDGET_NS))
       .map(|counters| counters.map(|counters| location_counters(&counters))),
-    counters_of(successor)
+    counters_of(successor),
   );
+  // The foreign node's detector as its status reports it: whether it condemned the live successor by its own probes,
+  // and how that compares with the theory's allowance (2026-10-07: a retry fell into a brief false death there).
+  let foreign_detector = match Client::connect(&foreign_instance).call(&RequestBody::DaemonStatus) {
+    ReplyBody::DaemonStatus { report } => format!("{:?}", report.fleet.detector),
+    other => format!("status unavailable: {other:?}"),
+  };
+  let routing = format!("{routing}; the foreign node's detector {foreign_detector}");
   trace_routing_views(&daemons, ObjectId(id.bytes));
   for daemon in daemons {
     daemon.stop();

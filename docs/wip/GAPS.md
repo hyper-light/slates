@@ -4613,3 +4613,23 @@ Fix options to weigh with the reproduction:
 - Owed, each with an A/B on the mixed matrix: a transport that carries the attribute so the sidecar is never made
   (NFSv4 named attributes for macOS's v4.0 client, which is a protocol design decision), and the ~5 getattrs per
   create from close-to-open revalidation.
+
+### 2026-10-07: the copyset-successor flake, read: a brief false death of the live successor at the foreign node
+
+It recurred in the first full suite after the counters landed (77 of 78), and they name the chain:
+1. The write went out on the client's cached route to the successor (`fleet.owner_location.direct` 2 → 3).
+2. For the immediate retry, the foreign node dropped that route as `route_dropped.owner_ineligible`. Routing accepts
+   an owner only if it is in the region and the node's membership view does not hold it dead. The region does not
+   change, so the foreign node's detector held the live successor, which had just served the write, dead.
+3. The location round then heard no claim (`unavailable` 1). A peer believed dead also loses its record link
+   (`fleet.link.invalid.believed_dead`), so the successor could be neither asked nor forwarded to.
+4. A round after the last retry found the claim again (`claim` 1 → 2): the successor refuted the death and was
+   readmitted.
+
+So routing is not at fault, and relaxing it alone would not help while the link is down. The cause is a false
+condemnation of a live member under the suite's load (both regions on loopback here), which the test's retry falls
+into immediately. Owed:
+- the foreign node's detector report for the successor in this test's failure message, to compare its condemnations
+  with the theory's allowance;
+- whether a client-visible verb should be refused for the length of a refutation, or retried within the forward's
+  bound once the member is readmitted.
