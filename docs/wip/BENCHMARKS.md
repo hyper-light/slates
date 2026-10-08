@@ -3503,6 +3503,66 @@ the client: a write without a delegation carries a GETATTR that keeps them fresh
 
 Rejected as dead even on this client; the patch is kept in the session scratchpad.
 
+### Memory per file on a real tree, against tmpfs (condition 12; 2026-10-08)
+
+**The commands.** Linux 6.12 (Docker Desktop, aarch64, 4 KiB pages), release build of `1e854b56`, privileged
+`rust:1.98.0`, load 7–8 from other sessions:
+- `docs/wip/bench/mem/per_file.sh /usr`: copies `/usr` (28,393 entries, 1,567,942,094 content bytes) into a slates
+  volume over the kernel's NFSv4.2 client, then into tmpfs. slates' side is the anchor's and the daemon's
+  proportional set size (`smaps_rollup` Pss); tmpfs's is the kernel's Shmem plus slab, after dropping clean caches.
+- `docs/wip/bench/mem/per_entry.sh 100000`: 100,000 empty files in 100 directories, the same two sides.
+- `CREATE_HEAP_SIZES=<the tree's sizes> cargo run --release -p slates-vfs --example create_heap`: the volume alone,
+  every allocation counted.
+
+| | slates | tmpfs |
+|---|---|---|
+| Empty file, per entry | 843 B (daemon heap and tables; anchor 0) | 742 B (inode, dentry) |
+| `/usr`, beyond content, per entry | 6,202–6,370 B (6 runs) | 2,083–2,392 B |
+| `/usr`, beyond content, share | 11.2% | 4.3% |
+| `/usr` copy | 13.0–22.0 s | 1.7–6.5 s |
+
+**Where slates' `/usr` overhead is** (178 MB in all):
+- **Block rounding, 88.6 MB (5.6%)**: the volume references 1,656,542,072 bytes for 1,567,942,094 of content. A
+  window's block is the smallest power-of-two number of granules that holds its bytes, up to a 64 KiB chunk (§4.2
+  "allocator rounding"). Modeled on the tree's real sizes:
+
+  | Tail rule | Waste |
+  |---|---|
+  | Power of two, 4 KiB granule (today) | 6.26% |
+  | Power of two, 512 B granule | 4.75% |
+  | Page multiple, 4 KiB (tmpfs) | 3.34% |
+  | Four classes per doubling, 4 KiB (jemalloc's spacing) | 3.56% |
+  | Four classes per doubling, 512 B | 1.16% |
+
+- **Heap, about 62 MB**, attributed by heaptrack at a `SIGKILL` after the copy (live allocations by stack):
+  - the volume's op log, 23.1 MB (`vfs/src/journal.rs:197`, bounded by its derived share of the volume);
+  - the arena's per-region tables, 10.6 MB over 59 region additions;
+  - the volume's content and inode records, about 26 MB: 801 B per file, as `create_heap` measures with the tree's
+    sizes.
+  - The NFS layer adds nothing per entry: the empty-file run's heap growth (496 B per file) equals the volume's
+    create cost (498 B).
+- **30.4 MB more in the content object** than the volume's committed blocks (`/memfd:slates-con-mem` 1,686,921,216 B
+  against 1,656,542,072 committed, 15 s idle after the unmount). Not attributed yet. The hypothesis is the shard's
+  recovery image, which A-64 keeps in the same object; it needs a counter before it is a finding.
+
+**Hypotheses measured and rejected on the way:**
+- Client file state (opens, write delegations): the unmount, which returns them, freed nothing (Pss rose 16 MB).
+- glibc keeping freed 256 KiB write buffers: with `GLIBC_TUNABLES=glibc.malloc.mmap_threshold=131072` the heap was
+  62.9 MB against 64.0 MB.
+- The op log's share: a 2 GiB maximum instead of 8 GiB left the heap at 64.4 MB.
+- `committed_versions` (594,237): a reservation ledger, not live versions.
+
+**Measured and rejected: an idle purge that returns runs below the discard size.** The idle purge (A-105) keeps a
+dirty run shorter than the derived discard size (16 KiB here) resident, and drops it from the dirty set. Returning
+every run instead returned 0.5 MB more of the 1.7 GB (`content.purged_bytes` 348,622,848 against 348,119,040, the
+content object 1,646,690 KiB against 1,648,206 KiB): dead even, so A-105's rule stands. The patch and its test are
+kept out of the tree.
+
+**Owed:**
+- A/B the tail rounding: the arena's buddy blocks against size classes for a window's tail, measured on this bench
+  and on the create and read paths. The model above bounds the prize at about 4.5% of content.
+- Attribute the 30.4 MB in the content object with a counter.
+
 ### Measured and rejected: no write delegation for an open that creates (condition 12; 2026-10-08)
 
 **The idea.** The `stat`, unlink and rename costs of write delegations come from files delegated at their create;

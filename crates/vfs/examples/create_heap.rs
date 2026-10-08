@@ -7,7 +7,9 @@
 //! (2026-10-06, `mem-50k.sh`).
 //!
 //! `cargo run --release -p slates-vfs --example create_heap [FILES]` prints, per phase: live bytes kept per file,
-//! allocations and reallocations per file.
+//! allocations and reallocations per file. With `CREATE_HEAP_SIZES=PATH` (one file size per line, e.g. a real tree's
+//! `find -type f -printf '%s\n'`) it makes one file per line instead, writes each in NFS-sized pieces
+//! ([`WRITE_PIECE`]) and sets no attribute, so the heap a real tree's content costs is charged to the write phase.
 
 // A benchmark harness: an unwrap here is a failed run, which is what it should be.
 #![allow(
@@ -41,6 +43,9 @@ const FILE_BYTES: usize = 100;
 const ATTRIBUTE_BYTES: usize = 60;
 /// Format: the attribute every file macOS creates carries.
 const PROVENANCE: &[u8] = b"com.apple.provenance";
+/// Format: the piece a sized file is written in: the Linux NFS client's write size against this server
+/// (`procedures::MAX_TRANSFER`, 256 KiB).
+const WRITE_PIECE: usize = 256 * 1024;
 /// Format: the page size (the store's granule).
 const PAGE: usize = 4096;
 /// Shape: the RAM region the store maps (address space; only what is written is touched).
@@ -152,10 +157,23 @@ fn charge<R>(phase: &mut Phase, f: impl FnOnce() -> R) -> R {
 }
 
 fn main() {
-  let files: usize = std::env::args()
-    .nth(1)
-    .and_then(|arg| arg.parse().ok())
-    .unwrap_or(FILES);
+  let sizes: Option<Vec<usize>> = std::env::var("CREATE_HEAP_SIZES").ok().map(|path| {
+    std::fs::read_to_string(path)
+      .unwrap()
+      .lines()
+      .filter_map(|line| line.trim().parse().ok())
+      .collect()
+  });
+  let files: usize = sizes.as_ref().map_or_else(
+    || {
+      std::env::args()
+        .nth(1)
+        .and_then(|arg| arg.parse().ok())
+        .unwrap_or(FILES)
+    },
+    Vec::len,
+  );
+  let piece = vec![b'x'; WRITE_PIECE];
   let mut arena = ChunkArena::new(PAGE);
   arena
     .add_region(Region::map(REGION_BYTES, PAGE, false).unwrap())
@@ -222,12 +240,26 @@ fn main() {
     let no = charge(&mut create, || {
       vol.create_file_no(&mut store, dir, name, 0o644).unwrap()
     });
-    charge(&mut write, || vol.write(&mut store, no, 0, &data).unwrap());
-    charge(&mut xattr, || {
-      vol
-        .xattr_set(&mut store, no, PROVENANCE, &attribute, XattrSet::Either)
-        .unwrap()
-    });
+    match sizes.as_ref().and_then(|sizes| sizes.get(file)) {
+      Some(&size) => charge(&mut write, || {
+        let mut offset = 0;
+        while offset < size {
+          let len = (size - offset).min(WRITE_PIECE);
+          vol
+            .write(&mut store, no, offset as u64, &piece[..len])
+            .unwrap();
+          offset += len;
+        }
+      }),
+      None => {
+        charge(&mut write, || vol.write(&mut store, no, 0, &data).unwrap());
+        charge(&mut xattr, || {
+          vol
+            .xattr_set(&mut store, no, PROVENANCE, &attribute, XattrSet::Either)
+            .unwrap()
+        });
+      }
+    }
     // The daemon's delta: each volume's publication streamed into the kept scratch, then logged; a full record means
     // the volume asks for a checkpoint instead (the probe's one volume publishes whole only when the journal does).
     let appended = !journal.wants_checkpoint()
