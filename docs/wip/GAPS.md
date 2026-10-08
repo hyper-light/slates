@@ -4705,6 +4705,24 @@ are owed in the report before the next reading.
   register contract (one value per committed position) is still bent by that growth, and a successor answers its own
   client `HomedElsewhere` before its adoption (`docs/bugs/2026-10-08-a-sealed-head-shipped-without-its-successors-key-entry.md`).
 
+### 2026-10-08: one macOS provenance attribute costs a file 40% of its memory: a proposal for A-32 (memory)
+
+Measured (`cargo run --release -p slates-vfs --example create_heap`, 50,000 files):
+- 904 B retained heap per file: create 415 B, a 100 B write 129 B, and the one `com.apple.provenance` attribute
+  macOS sets on every file 358 B and 5 allocations.
+- The release daemon after 50,000 files written over macOS's NFS client: 20 → 118 MB (`mem-50k.sh`, `footprint`),
+  about 1.96 KB per user file. Each file also gets an AppleDouble sidecar, likely a second inode; not traced.
+
+Cause: A-32 stores every value as an attribute inode (168 B `Inode`, a value body, an owned name, a table entry).
+The design rejects inline values because a copy-on-write of the owner would copy every value, and a megabyte fork
+could not be read at an offset or deduplicated.
+
+Proposal (a design change, so Ada's): a hybrid as ext4 has, small values inline in the owner's table and values past
+a threshold as attribute inodes (ext4's in-inode attributes beside `ea_inode` for large values, Linux 4.13). The
+threshold would be derived from the copy cost against an inode's: values of a few dozen bytes cost less to copy than
+to hold as an inode. Interning attribute names per volume (each file repeats the same 20-byte name) is the smaller
+step within A-32. Expected effect, not measured: most of the 358 B per macOS file, about a third of the per-file heap.
+
 ### 2026-10-08: an idle fleet node burns ~2% of a core, 30x a lone daemon: discovery refreshes (battery)
 
 Measured on the two-network Docker topology (6 nodes, one shard each, no impairment, idle, `docker stats`):
