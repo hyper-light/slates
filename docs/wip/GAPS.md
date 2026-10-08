@@ -4659,3 +4659,22 @@ are owed in the report before the next reading.
   **Traced (same day, `302ea768`):** reads ride the reader's dialed connection. Its sender state (`served_sessions`)
   shows windows growing to 50–71 KB during a read, and dozens to over a hundred spurious losses per read: the real
   crossing reorders, as the simulator does. The next bound is reordering read as loss (`BENCHMARKS.md`, same date).
+
+### 2026-10-08: cross-region reads 2x faster again: Copa reads summed jitter from its two least samples (condition 7)
+
+- Undoing Copa's loss reaction once its losses prove spurious (RFC 4015) was measured and rejected: 20.7 → 21.6 s on
+  `fetch_bench crossing`. Only 0–8 of 4–34 reactions per read had every loss behind them prove spurious.
+- A trace of Copa's inputs then showed what held the window. On an empty bottleneck the queue estimate had a median
+  of 6 ms, because the jitter estimate modelled each sample as uniform. A round trip's jitter is the sum of two
+  directions', and its least sample sits about four times further above the floor (22.1 ms against 5.0 ms over
+  4,000 simulated epochs).
+- Landed: the excess is also read as twice the gap between an epoch's two least samples (order statistics of a
+  lower tail `F(x) ∝ x²`). The gap first loses the sender's own interval per packet, and counts in proportion to
+  the epoch's turning points (the turning-point test), so a queue is not read as jitter. Three gates were A/B'd;
+  the grid is flat with both (share ×0.999, ping p99 ×1.001).
+- Results:
+  - the real crossing's 8 MiB reads: median 49.0 → 24.9 s (18 reads per arm, all byte-identical);
+  - the simulated crossing: 20.7 → 9.6 s;
+  - the thin link's reordering pulls: 24.3 → 12.6 s and 32.8 → 13.3 s.
+- Open: the grid's 1 Mbit/s 100 ms 5%-loss row worsened by one seed (383 → 635 ms ping p99), and the in-order
+  jitter row's spread widened (max 30.1 → 37.5 s).

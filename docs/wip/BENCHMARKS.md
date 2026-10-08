@@ -3658,3 +3658,85 @@ What it showed:
 - The window's remaining suspect is Copa's delay signal itself: reordering jitter read as queueing delay
   (`RTTstanding − RTTmin`) shrinks the target rate whether or not any loss is declared. That is the next candidate,
   A/B'd the same way.
+
+### Landed: Copa reads summed jitter from its two least samples (condition 7; 2026-10-08)
+
+**Why.** A trace of Copa's inputs on `fetch_bench crossing` (seed 1, 427 epoch samples) showed the read sitting at Copa's
+own equilibrium on an empty 1 Gbit/s bottleneck:
+- the queue estimate had a median of 6 ms (p90 25 ms) with no queue at all;
+- `RTTstanding` sat 14 ms above `RTTmin` at the median, of which the jitter estimate removed 7 ms;
+- the window was 30–56 KB, and `cwnd/RTTstanding` was about 385 KB/s, which is Copa's target `2/d_q` at 6 ms;
+- the competitive mode was on in only 8 of 427 samples.
+
+The landed jitter estimate (2026-10-07, above) modelled each sample's jitter as uniform: the least of `n` samples
+`W/(n+1)` above the floor. A round trip's jitter is the sum of the two directions'. Near its floor the density of a
+sum rises from zero (`F(x) ∝ x²`), so the least of 20 samples sits about `a·√(π/2n)` above it. Simulated over 4,000
+epochs of 20 samples, with two one-way jitters uniform over 0–80 ms:
+
+| | Mean excess over the floor |
+|---|---|
+| true (least sample less floor) | 22.1 ms |
+| uniform model | 5.0 ms |
+| landed estimate | 21.0 ms |
+
+**What.** For a lower tail `F(x) ∝ x^α`, the least sample's expected excess is `α` times the expected gap to the
+second least (extreme-value order statistics; Hill, Annals of Statistics 1975). With `α = 2` for summed jitter, the
+epoch's excess is the larger of the uniform estimate and `2·gap`. Two guards keep a queue out of it, each A/B'd:
+- **S:** the gap first loses the sender's own interval per packet, `smss·RTTstanding/cwnd`, because a queue spaces
+  its samples by at least a service time;
+- **T:** the gap counts in proportion to the epoch's turning points against the `2(n−2)/3` independent samples show
+  (the turning-point test; Brockwell & Davis §1.6), because a filling or draining queue turns rarely.
+
+**Commands** (Apple M5 Max; simulated network, virtual clock, deterministic per seed):
+- `FETCH_BENCH_SEED=<1..8> fetch_bench crossing` (4 MiB, 1 Gbit/s, 200 ms, ±40 ms reordering and 3% loss each way);
+- `FETCH_BENCH_SEED=<1..8> fetch_bench thin 128` (8 MiB on the 10 Mbit/s, 200 ms thin link);
+- `congestion_bench` (the 58-scenario grid, three seeds each).
+
+Both arms were built in release from the same tree.
+
+Crossing, 4 MiB, mean of 8 seeds:
+
+| Arm | Mean | Range |
+|---|---|---|
+| `HEAD` | 20.7 s | 15.0–32.4 s |
+| `2·gap`, zigzag share only | 8.5 s | 5.9–10.1 s |
+| T | 6.9 s | 5.6–8.0 s |
+| S | 10.0 s | 7.6–15.6 s |
+| **S and T (landed)** | **9.6 s** | **7.1–14.0 s** |
+
+Grid against `HEAD`, by geomean, with the rows that moved more than 10%:
+
+| Arm | Share | Steady ping p99 | Rows worse > 10% | Rows better > 10% |
+|---|---|---|---|---|
+| zigzag share only | ×1.001 | ×1.025 | 8, incl. burst loss 148 → 254 ms and 1 Mbit/s 100 ms no loss 135 → 183 ms | 3 |
+| T | ×1.001 | ×1.008 | 7, incl. 64 kbit/s 300 ms 0.1% loss 586 → 794 ms | 4 |
+| S | ×1.002 | ×1.003 | 3, incl. 10 Mbit/s 300 ms 1% loss 569 → 766 ms | 1 |
+| **S and T** | **×0.999** | **×1.001** | **2: the reordering row 32.1 → 36.7 ms (its share 0.857 → 0.914); 1 Mbit/s 100 ms 5% loss 402 → 507 ms (one seed 383 → 635 ms, the others +14% and +2%)** | **2: 10 and 100 Mbit/s, 20 ms, 5% loss** |
+
+Thin link, 8 MiB, median of 8 seeds (S and T against `HEAD`):
+
+| Row | `HEAD` | Landed |
+|---|---|---|
+| reordering ±40 ms, no loss | 24.3 s (15.9–34.2) | 12.6 s (9.7–15.0) |
+| reordering ±40 ms, 2% loss | 32.8 s (22.0–49.3) | 13.3 s (11.7–16.9) |
+| jitter ±40 ms in order | 24.1 s (7.9–30.1) | 21.1 s (11.5–37.5) |
+| 2% loss, in order | 8.0 s | 8.0 s |
+
+The in-order jitter row's median improved but its spread widened (max 30.1 → 37.5 s).
+
+**The real crossing.** Command: `IMAGE=slates:mr-<arm> sh docs/wip/bench/multiregion/reads.sh <dir> <8 MiB payload> 3`.
+This is the two-network Docker topology, 100 ms ± 40 ms one way with 3% loss. Each run reads 8 MiB from b0, b1 and b2
+in the other region, three rounds each. Both images were built from the same commit (`HEAD` from a worktree, the
+estimator from the tree), and the runs alternated: `HEAD`, estimator, `HEAD`, estimator. Load average 4–7 from other
+sessions.
+
+| Arm | Reads | Median | Range | All byte-identical |
+|---|---|---|---|---|
+| `HEAD` | 18 | 49.0 s | 31.0–62.6 s | yes |
+| estimator | 18 | 24.9 s | 18.9–33.0 s | yes |
+
+The owner's served sessions ended with windows of 85–127 KB, against 22–44 KB at `HEAD`, still with hundreds of
+spurious losses each (455–676). Reordering read as loss no longer costs window, because Copa's default mode ignores
+loss. The window had been bound by the delay signal.
+
+Cleaned up: the arms' code is the landed code only; the trace used to find this was removed.
