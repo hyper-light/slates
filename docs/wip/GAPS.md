@@ -4914,3 +4914,14 @@ Apple M5 Max, load average 13–14 from other sessions; the tree copied into tmp
 - **Fixed:** the presentation names each conflicting entry with its class (`/b.txt (ModifyModify)`), and the planned
   landing's durable record keeps their count. `a_landing_over_an_outsiders_change_refuses_naming_only_the_conflict`
   now asserts the presentation and failed before.
+
+### 2026-10-09: the escape battery over Linux NFS after A-121–A-124 and the READ copy removal (condition 4, regression)
+
+`SEEDS="1 2 3" STEPS=300 BOUND=1 TARGET_VOLUME=slates-linux-target sh docs/wip/bench/escape/run-nfs.sh` at `e44ebc08`:
+- three seeds, 300 steps each, no invariant violated;
+- the other user was refused the bound mount (24–30 refusals a seed);
+- owner-resolved links to the canary stayed inside the volume;
+- the daemon's disk writes during the battery were 0 bytes, and the outside tree was unchanged.
+
+The day's changes to base symlinks, recalls, the callback slot, the back channel and the READ path left the battery's
+invariants intact.
