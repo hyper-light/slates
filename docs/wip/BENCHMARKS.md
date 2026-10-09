@@ -3957,6 +3957,29 @@ The owner's (`a1`) sessions after the reads:
   read 5.4–6.5× on the jitter rows and failed only on slow links' queues. Before then, the reading needs an epoch
   that spans enough samples.
 
+### Replication to the mirror region across a lossy crossing (condition 10; 2026-10-09)
+
+Command: `IMAGE=slates:mr sh docs/wip/bench/multiregion/mirror.sh <scratch> <64 KiB payload> N` (two networks, a
+router shaping the crossing; each round writes the file, snapshots it, and times its placement at home, then in the
+mirror region by `volume placed --mirror`). Load average 8–24.
+
+| Build | Crossing | Snapshots placed in the mirror | Mirror placement |
+|---|---|---|---|
+| `d26b01b0`, unshaped | none | 1 of 1 | 1.01 s |
+| `d26b01b0` | 100 ms ± 40 ms, 3% loss | 0 of 6 (8 MiB and 64 KiB) | never in 120–300 s |
+| `d4d8d81f` (mirror rounds paced from their path) | same | varies 0–5 of 5 a run | 2–5 s when placed |
+| `aefcc6da` (the home record keeps the mirror placement) | same | 10 of 10 in two runs, then 3 of 15 | 2.1–4.8 s |
+| `962d4a9e` (delivered pair keys recorded apart) | same | 23 of 24 over five runs | 2.0–6.2 s |
+| `962d4a9e` | 150 ms ± 60 ms, 10% loss | 5 of 5 | 6.9, 8.1, 9.6, 17.8, 75.7 s |
+
+- The four faults each stopped every placement in their own way: a mirror round judged stalled at its offer; a late
+  shipment acknowledgement discarded; a healer's home re-record wiping the mirror placement, so a second job shipped
+  other holders at the same position; and a node's own pair key and a delivered one sharing one owner on partition
+  0, so each side refused the other's (GAPS, 2026-10-09).
+- At 10% loss, 71 content rounds and 39 shipments found no free session to their targets: one record session a peer,
+  lent elsewhere. That is the likely cost of the 75.7 s outlier, not yet measured apart.
+- The one snapshot unplaced in the 3% runs was followed by a `NoSpace` write refusal on the owner (open in GAPS).
+
 ### Cross-region reads at HEAD: none refused after an unanswered forward is resent (condition 7; 2026-10-09)
 
 Command: `IMAGE=slates:mr sh docs/wip/bench/multiregion/reads.sh <scratch> <8 MiB payload> 3` (the two-network
