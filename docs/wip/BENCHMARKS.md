@@ -2317,6 +2317,12 @@ given the same changes. Docker Desktop 6.12 kernel, Apple M5 Max, load average 1
   | recalls for the one untouched edit | asked 1, sent 1, answered 1 (A-122, A-123) | — (no delegations in v3) |
 
   Before the day's fixes, the Linux edit was not seen after 5.2 s: 153 recalls asked, 152 unanswered.
+  On macOS over a tree with symlinks (`overlay_mac.sh <release at 07a50710> /usr/lib <scratch>`, 498 files, 29
+  symlinks), A-121 holds through macOS's own client:
+  - the plan was `create=5 delete=3 replace=9`, with no `symlink` entries; one pick was read-only, and its append
+    was refused alike through the mount and on the host copy;
+  - `diff -rq` printed 40 lines for the same changes;
+  - the outsider's edit was seen after 875 ms, and the replaced file was presented `ModifyModify`.
   At `/usr/lib` scale (`overlay_diff.sh /usr/lib 3` at `0e4f378b`, 5,863 files, load spikes from other sessions):
   - over the run, 13,244 delegations granted;
   - the outsider step asked 1 recall, sent 1 and had it answered, and the new bytes read through the mount after
