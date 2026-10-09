@@ -226,12 +226,16 @@ impl MemberPlane {
   /// placement lets this node know) and whose plane keeps keys for at most `members − 1` peers.
   /// `resolution` is the owner's clock's: the least step of the readings it stamps the plane with (A-67; hyper-swim
   /// bounds its wake lateness `G` below by it). `renewal` is how the owner lease is renewed ([`crate::lease_renewal`]).
+  /// `detection_budget` is the longest the owner may take to declare a dead member (its membership horizon): the
+  /// detector's periods last at least the share of it one period may spend, so an idle plane probes at the pace the
+  /// owner needs and not at its round trip's (`hyper_swim::Detector::new`).
   pub fn new(
     local: HostId,
     boot_nonce: u64,
     members: NonZeroUsize,
     resolution: std::time::Duration,
     renewal: LeaseRenewal,
+    detection_budget: std::time::Duration,
   ) -> Result<Self, PlaneRefusal> {
     let limits = PlaneLimits {
       max_peers: members.get().saturating_sub(1).max(1),
@@ -244,6 +248,7 @@ impl MemberPlane {
       Exposure::new(),
       members,
       resolution,
+      detection_budget,
     );
     let mut member = MemberPlane {
       local,

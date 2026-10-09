@@ -5152,3 +5152,24 @@ At `f62847d5`:
   misses are a hedged content put's own late reply, which is benign.
 - Fleet suite 83/84; the failure is the recorded `a_whole_ram_replacement…` flake. An alternating A/B of that test
   failed 1 of 5 on the fix and 2 of 5 on HEAD, at the same assertion.
+
+### 2026-10-09: an idle membership detector probed at its round trip's pace (battery; A-125)
+
+- Found while counting the membership loop's turns for the announcement fix. Two idle in-process nodes each received
+  about 24,000 datagrams in 6 s. Almost all were the detector's own period probes and their acknowledgements, since a
+  judged period ended at its probe's deadline.
+- Fixed: a judged period now lasts at least the owner's detection budget's share of one period, `D / (2(2m − 1) + 1)`,
+  with `D` the 900 ms membership horizon. Measurement periods are not floored.
+- The fix is a local patch to vendored hyper-swim, recorded in its `ORIGIN.md`, and handed to the hyper-raft owner
+  through the inbox: the owner's socket was down.
+- Measured:
+  - pings 10,264 → 134 per node, and loop turns 35,943 → 319, in-process on macOS;
+  - no change on the six-node Docker topology, where deadlines already exceed the floor;
+  - a silent peer condemned in 753 ms in simulation, within the budget (330 ms before).
+- Owed:
+  - upstream review by the hyper-raft owner, and its harnesses (`hyper-swim-compare`, `tests/cluster.rs`) updated for
+    the new constructor argument;
+  - a first fleet-suite run with the floor had two convergence failures at high load. They did not recur alone (2/2
+    each) or in a full rerun (85/85).
+- The announcement fix (`48496cf8`) did not change idle CPU on Docker: 0.83% and 0.99% before, 0.85% and 0.75%
+  after. Its value is the contention it removed.

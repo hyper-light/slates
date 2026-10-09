@@ -10649,3 +10649,42 @@ Status: built 2026-10-08.
     connection that last carried one of its compounds, so the bound connection is its carrier.
 - Measured (the test): a recall the client ignored marked the channel down within its 1 s deadline, the next
   `SEQUENCE` carried both flags, the rebind was answered `BOTH`, the probe was answered, and the flags cleared.
+
+### A-125 — The membership detector's periods are floored by the owner's detection budget (2026-10-09)
+Applied in the same change to:
+- `vendor/hyper-raft/hyper-swim/src/detector.rs` (`Detector::new` takes the detection budget; `period_floor_ns`;
+  `Probe::rests_until`; `stage` and `wake` keep a judged period to its floor). This is a local patch, pending
+  upstream, recorded in that crate's `ORIGIN.md`;
+- `crates/cluster/src/member_plane.rs` (`MemberPlane::new` takes the budget); `crates/server/src/member_task.rs`
+  (passes the membership horizon, `lease::horizon_ns`);
+- the tests `an_idle_member_probes_no_faster_than_its_detection_budget_needs` and
+  `a_member_under_a_detection_budget_condemns_a_silent_peer_within_it` (hyper-swim), GAPS, BENCHMARKS.
+
+Status: built 2026-10-09.
+- What it answers: a judged probe's period ended at its deadline, which tracks the measured round trip. So an idle
+  member probed at its round trip's pace, and the message rate rose as the network got faster. Two idle nodes on
+  loopback each sent about 10,000 pings in 6 s.
+- The rule:
+  - the owner states its detection budget `D`, the longest it may take to declare a dead member: slates' membership
+    horizon, 900 ms, which the lease bound is already stated in;
+  - the detector declares a death within `2(2m − 1) + 1` periods of a member's last answer (hyper-swim
+    `docs/timing.md` §2.7, `m` the members it watches), so a judged period lasts at least `D / (2(2m − 1) + 1)`
+    and detection still meets `D`;
+  - the probe's deadlines and its relay request are unchanged; only an end that comes sooner waits.
+- Literature: SWIM sets its protocol period for load, bounded below by the round trip (Das, Gupta and Motivala 2002
+  §3.1). memberlist's LAN and local profiles probe once a second.
+- Measurement and provisional periods are not floored. They judge nothing, or nothing yet, and stretching them left a
+  lone peer unsuspected 9 s into its silence.
+- Measured:
+  - slates' two-node in-process fleet on macOS loopback, about 6 s: pings 10,264 and 9,922 → 134 and 212; datagrams
+    received about 24,000 → about 280; membership loop turns 35,943 → 319.
+  - In simulation (three peers, 1 ms round trips): 916 → 123 probes in 10 s. A silent peer was condemned in 753 ms,
+    within the 900 ms budget; it was 330 ms before.
+  - On the six-node Docker topology (Linux, a five-peer floor of 47 ms): no change. a1 moved 0.30–0.35 MB in 20 s in
+    both arms, and idle CPU per node was 0.57–1.50% in both. Those nodes' deadlines already exceed the floor.
+  - So the floor binds where round trips are tiny against the budget: a laptop fleet, one host.
+- Fleet suite:
+  - with the floor: 85/85 in 453 s, at load 8–9;
+  - without it: 84/85 in 413 s at the same load, the failure the recorded `a_whole_ram_replacement…` flake;
+  - a first run with the floor at higher load: 83/85 in 726 s. The two failures (a council leader's retirement and an
+    initial voter admission, both convergence waits) each passed twice alone.

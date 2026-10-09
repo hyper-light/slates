@@ -127,6 +127,7 @@ impl Network {
         NonZeroUsize::new(usize::try_from(count).unwrap()).unwrap(),
         SIM_RESOLUTION,
         RENEWAL,
+        std::time::Duration::ZERO,
       )
       .unwrap();
       for peer in (1..=count).filter(|peer| *peer != me) {
@@ -494,6 +495,7 @@ fn a_message_claiming_another_sender_is_refused_and_counted() {
     NonZeroUsize::new(3).unwrap(),
     SIM_RESOLUTION,
     RENEWAL,
+    std::time::Duration::ZERO,
   )
   .unwrap();
   sender
@@ -505,6 +507,7 @@ fn a_message_claiming_another_sender_is_refused_and_counted() {
     NonZeroUsize::new(3).unwrap(),
     SIM_RESOLUTION,
     RENEWAL,
+    std::time::Duration::ZERO,
   )
   .unwrap();
   receiver

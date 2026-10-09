@@ -752,6 +752,7 @@ pub(crate) async fn run(
       members,
       std::time::Duration::from_nanos(slates_machine::clock::resolution_ns()),
       lease_renewal(),
+      std::time::Duration::from_nanos(crate::lease::horizon_ns()),
     )
     .map(|plane| state.plane.plane = Some(plane))
     .is_ok()

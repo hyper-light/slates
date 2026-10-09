@@ -173,3 +173,25 @@ there is no earlier form in service to keep.
     its record's findings. Theorem 7's allowance `Σβ` for live members is printed beside their
     counts, a report, not a test.
   - The counts over hundreds of runs on macOS and Linux are in `docs/benchmarks.md`.
+
+## Local patch in slates, pending upstream (2026-10-09): the period floor
+
+Not yet in `../hyper-raft`. It was handed to the owner through the inbox
+(`.worktrees/hyper-raft-inbox/from-slates-20261009-hyper-swim-probe-rate.md`); the socket was down.
+
+- **What was wrong.** A judged period ended at its probe's deadline, and that deadline tracks the round trip. So an
+  idle member probed at its round trip's pace. In slates' two-node fleet test on loopback, each member sent about
+  10,000 pings in 6 s, and each node received about 24,000 datagrams.
+- **The change.** `Detector::new` takes the owner's detection budget `D`: the longest it may take to declare a dead
+  member. A judged period lasts at least `D / (2(2m − 1) + 1)`, the share of the detection bound one period may spend
+  (`period_floor_ns`), so detection still meets `D`. The deadlines and the relay request are unchanged.
+- **Unfloored periods.** Measurement and provisional periods are not floored: they judge nothing, or nothing yet, so
+  stretching them left a lone peer unsuspected 9 s into its silence. Zero leaves every period as before; the existing
+  tests pass zero.
+- **Tests.**
+  - `an_idle_member_probes_no_faster_than_its_detection_budget_needs`: over three near peers, at most one probe per
+    floor.
+  - `a_member_under_a_detection_budget_condemns_a_silent_peer_within_it`: over three peers the silent one is condemned
+    within `D`, early and late; over one it is suspected within `D` and never condemned, as before.
+- **Measured in slates** (two-node fleet, 6 s): pings went from 10,264 and 9,922 to 134 and 212, datagrams received
+  from about 24,000 to about 280, and membership loop turns from 35,943 to 319.
