@@ -3746,6 +3746,15 @@ shard's own clock that A-65 budgets in (docs/bugs/2026-10-04-the-slow-observatio
 - **Skills extension (SEP-2640): done (A-120, 2026-10-08).** The official MCP Inspector found `skills/list`
   unsupported; the extension is now declared and `skills/list` / `skills/get` serve each skill with a `sha256:`
   manifest that passed the Inspector's conformance rules.
+- **Two agents integrate through `slates mcp`, 2026-10-08** (release build, a local anchor, the agents limited to the
+  slates server's tools; each result read back through the CLI, not from the agent's report):
+  - Claude Code 2.1.293 (`claude -p --mcp-config --strict-mcp-config --allowedTools mcp__slates`): created a bounded
+    volume, attached for writing, made `notes`, wrote `notes/hello.txt`, listed and read it back; 8 turns, $0.17.
+    It learned from the refusal that a write does not create parent directories.
+  - Codex 0.159.0 (`codex exec`, the server given by `-c mcp_servers.slates.*` overrides): the same task through
+    `slates.volume.create`, `slates.attach.attach`, `slates.fs.mkdir`, `slates.fs.write` and `slates.fs.read`;
+    16,022 tokens.
+  - `slates read` returned both files' exact text.
 - **Owed for condition 13, in order:**
   1. `slates skills install` (writing `.agents/skills/` and `.claude/skills/`): **Ada's ruling needed.** It writes a
      user's project directory outside a granted landing, which R1/R10 forbid as written; D-19 lists it. Until then
