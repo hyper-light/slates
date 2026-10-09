@@ -5119,4 +5119,9 @@ file, snapshots it, and times the snapshot's placement at home and then in the m
       It does not fail on the old code, since on loopback the deliveries meet one after the other.
   - **Open:** writes refused `NoSpace` on the owner after a few rounds of 64 KiB (one run's every write, another's fifth
     round), in a 256 MiB dynamic volume on a 1 GiB node: a shard budget, not the volume, to be diagnosed.
+    - A ten-round run after it placed 10 of 10 in the mirror (2.0–5.6 s) with no refusal. Since the pair fix, 23 of 24
+      snapshots have been mirrored.
+    - `mirror.sh` now prints each shard's reserve, committed and retained bytes and its refusals on a refused write,
+      so the next occurrence names its budget. A guess, not yet shown: the host-memory pressure hold
+      (`refresh_pressure_hold`) on the shared Docker VM.
 - Fleet suite 82/83; the failure is the recorded flake.

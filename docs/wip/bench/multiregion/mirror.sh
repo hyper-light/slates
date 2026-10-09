@@ -42,7 +42,15 @@ for round in $(seq 1 "$ROUNDS"); do
   ATTACHMENT=$(docker exec mr-a1 /slates attach "$VOLUME" --write --json |
     python3 -c 'import sys,json; print(json.load(sys.stdin)["attachment"])')
   docker exec -i mr-a1 /slates write "$VOLUME" "$ATTACHMENT" /payload.bin < "$DIR/payload.bin" > /dev/null || {
-    echo "round $round: write refused"; continue; }
+    echo "round $round: write refused"
+    # Where the space went: each shard's reserve, committed bytes, held content and its refusals.
+    docker exec mr-a1 /slates status --json 2>/dev/null | python3 -c '
+import json, sys
+for shard in json.load(sys.stdin)["shards"]:
+    keep = {k: shard.get(k) for k in ("partition", "volumes", "reserve_bytes", "committed_bytes", "retained_bytes", "metadata_bytes", "committed_metadata")}
+    refusals = {r["kind"]: r["count"] for r in shard.get("refusals", []) if "space" in r["kind"] or "budget" in r["kind"] or "hold" in r["kind"] or "content" in r["kind"]}
+    print("  shard", keep, refusals)'
+    continue; }
   SNAPSHOT=$(docker exec mr-a1 /slates volume snapshot "$VOLUME" --json 2>"$DIR/snap.err" |
     python3 -c 'import sys,json; print(json.load(sys.stdin)["snapshot"])' 2>/dev/null)
   [ -n "$SNAPSHOT" ] || { echo "round $round: snapshot refused: $(head -c 200 "$DIR/snap.err")"; continue; }
