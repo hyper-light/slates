@@ -4991,3 +4991,14 @@ to invalidate).
     and both SDKs carry a refusal by its text, so no mapping changed. The copyset test now expects it; fleet suite
     82/82.
   - `slates read`'s own handling of a retryable refusal.
+
+### 2026-10-09: transfer and at-rest encryption re-checked at HEAD (conditions 8, 9)
+
+At `28d49f15`, after the day's changes:
+- the fleet transport's handshake tests (`cargo test -p slates-transport --lib -- handshake`, 8 passed), among them
+  the one asserting both sides negotiate SecP384r1MLKEM1024 (ML-KEM-1024 with P-384; rustls' X25519MLKEM768 after
+  it, which RPC-with-TLS exports also offer);
+- at rest, on Linux (`cargo test -p slates-server --test recovery -- plaintext`, 2 passed): a file's plaintext marker
+  is gone from the anchor's content object once the idle sweep seals the file, and once the file is deleted;
+- on macOS, `sealed_content_reads_back_byte_for_byte_after_a_restart` and
+  `an_idle_small_file_is_sealed_by_the_daemons_sweep` passed.
