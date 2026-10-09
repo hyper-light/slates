@@ -4947,3 +4947,19 @@ Docker's amd64 emulation (`--platform linux/amd64 rust:1.98.0`, `uname -m` = `x8
   outsider-recall tests;
 - `cargo test -p slates-bridge-nfs` at `cf1162ed`: every suite passed, including the read-tail oracle and its
   hostile-input test.
+
+### 2026-10-09: the Windows base host has no watcher (owed; found checking A-122's reach)
+
+`crates/base/src/windows.rs` answers `watch` with `WatchState::Unavailable` and `hints` with nothing, though §4.5
+names `ReadDirectoryChangesW` for Windows (with its overflow signals: zero bytes or `ERROR_NOTIFY_ENUM_DIR`). On a
+Windows overlay, an outsider's edit to the base is seen only at a lookup's live-disk check (A-122's recall has no
+Windows counterpart to feed, since there are no NFS delegations there; WinFsp's own file-info cache is the analogue
+to invalidate).
+- Owed, in order:
+  1. `ReadDirectoryChangesW`, overlapped, on each watched directory handle. The handle must be opened with
+     `FILE_FLAG_OVERLAPPED`. Drained without blocking by `GetOverlappedResult(.., FALSE)`, each record named
+     (`Hint::Entry`), zero bytes or `ERROR_NOTIFY_ENUM_DIR` meaning `Hint::Overflow`.
+  2. Hinted entries invalidated in WinFsp's cache (`FspFileSystemNotify`).
+  3. A Windows-lane test, modelled on `an_in_place_write_to_an_opened_base_file_hints_its_directory`.
+- Not built here: neither the FFI nor its test can be compiled or run from this macOS machine (the Windows cross-lint
+  stops at `zstd-sys`'s C build), and the Windows CI lanes run only on a push.
