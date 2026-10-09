@@ -670,9 +670,7 @@ fn not_landed(
   refusal: LandingRefusal,
 ) -> ReplyBody {
   match refusal {
-    LandingRefusal::GrantRequired(plan) => {
-      present(state, presenter, ids, &plan.manifest, &plan.binding)
-    }
+    LandingRefusal::GrantRequired(plan) => present(state, presenter, ids, &plan),
     // The engine hands back every entry's report; the refusal names the conflicting ones alone (§4.15: a conflict
     // refuses the whole landing, and the person resolving it needs only the entries in conflict). Before 2026-10-06
     // every entry was named, so an entry that would only have been created read as a conflict.
@@ -1625,9 +1623,23 @@ fn present(
   state: &mut ShardState,
   presenter: Presenter<'_>,
   ids: &LandingIds<'_>,
-  manifest: &Manifest,
-  binding: &slates_land::grant::GrantBinding,
+  plan: &slates_land::engine::Presented,
 ) -> ReplyBody {
+  let manifest = &plan.manifest;
+  let binding = &plan.binding;
+  // §4.15 step 2: the conflicts the engine's preliminary verdict pass found (step 4 run without writing), each with
+  // its class, so the human deciding on the grant decides on evidence. Until 2026-10-08 the reply carried none, and a
+  // plan over a disk an outsider had changed looked clean until the granted landing refused.
+  let conflicts: Vec<String> = plan
+    .preliminary
+    .iter()
+    .filter_map(|entry| match entry.verdict {
+      Some(slates_land::verdict::Verdict::Conflict(class)) => {
+        Some(format!("{} ({class:?})", entry.path))
+      }
+      _ => None,
+    })
+    .collect();
   let Presenter { client, principal } = presenter;
   state.landing.next_landing = state.landing.next_landing.saturating_add(1);
   let hash = manifest.hash;
@@ -1659,7 +1671,7 @@ fn present(
     grant: None,
     state: DbLandingState::AwaitingGrant,
     written: 0,
-    conflicts: 0,
+    conflicts: u32::try_from(conflicts.len()).unwrap_or(u32::MAX),
   };
   let ops = [
     Op::LandingRecorded { record },
@@ -1685,7 +1697,7 @@ fn present(
     landing: landing_id,
     manifest: hash,
     summary: summary_of(manifest),
-    conflicts: Vec::new(),
+    conflicts,
   }
 }
 

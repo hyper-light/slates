@@ -1178,8 +1178,9 @@ fn a_granted_landing_consumes_its_presentation() {
 /// §4.15 (AC-1.12, D-27): a granted landing over a base an outsider changed refuses as a conflict, names only the
 /// entries that conflict, and writes nothing. Do: overlay a directory holding `b.txt`; through the volume, change
 /// `b.txt` and create `new.txt`; then, outside the volume, change `b.txt` on disk; snapshot, present, grant and land.
-/// Expect: `LandingConflict` naming `/b.txt` alone (`new.txt` would only be created, which is no conflict), the
-/// outsider's `b.txt` untouched, and no `new.txt`. Before 2026-10-06 the refusal named every entry of the landing
+/// Expect: the presentation's preliminary pass naming `/b.txt (ModifyModify)` alone, then `LandingConflict` naming
+/// `/b.txt` alone (`new.txt` would only be created, which is no conflict), the outsider's `b.txt` untouched, and no
+/// `new.txt`. Before 2026-10-06 the refusal named every entry of the landing
 /// (`["/new.txt", "/b.txt"]`, measured through the CLI), so a person sent to resolve it looked at files that were fine.
 #[test]
 fn a_landing_over_an_outsiders_change_refuses_naming_only_the_conflict() {
@@ -1235,11 +1236,21 @@ fn a_landing_over_an_outsiders_change_refuses_naming_only_the_conflict() {
     grant: None,
   });
   let ReplyBody::GrantRequired {
-    landing, manifest, ..
+    landing,
+    manifest,
+    conflicts,
+    ..
   } = presented
   else {
     panic!("presented: {presented:?}");
   };
+  // §4.15 step 2: the presentation carries the preliminary verdict pass, so the human deciding on the grant sees the
+  // conflict before approving (until 2026-10-08 it was always empty).
+  assert_eq!(
+    conflicts,
+    vec!["/b.txt (ModifyModify)".to_owned()],
+    "the presentation names the conflict"
+  );
   let grant = verified_approval_issues(&mut client, &secret, landing, manifest);
   let landed = client.call(&RequestBody::Land {
     volume: id,

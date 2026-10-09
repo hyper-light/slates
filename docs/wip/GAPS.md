@@ -4892,3 +4892,15 @@ Apple M5 Max, load average 13–14 from other sessions; the tree copied into tmp
   2. ~~macOS: `EVFILT_VNODE` on a directory does not report an in-place write to an existing file.~~ **Fixed the same
      day:** an opened base file is registered on the watcher's kqueue too, its events hinting its directory
      (`an_in_place_write_to_an_opened_base_file_hints_its_directory`, failing before on this Mac).
+
+### 2026-10-08: a landing's presentation never carried its preliminary conflicts (fixed; §4.15 step 2)
+
+- **Found** by the Linux overlay bench's outsider step (`overlay_diff.sh /usr/lib/python3.13`): after an outsider
+  appended to a file the volume had replaced, `status --drift` named it `(Modified)`, but the plan presented for the
+  grant said `conflicts []`. §4.15 step 2 requires the conflicts of a preliminary verdict pass in the presentation,
+  "because a human decides on evidence". The engine computed them (`Presented.preliminary`); the server dropped them
+  and replied `conflicts: Vec::new()` (`crates/server/src/landing.rs`, `present`). Nothing wrong was ever written: the
+  granted landing refused `LandingConflict` at execution. But the human approved a plan that looked clean.
+- **Fixed:** the presentation names each conflicting entry with its class (`/b.txt (ModifyModify)`), and the planned
+  landing's durable record keeps their count. `a_landing_over_an_outsiders_change_refuses_naming_only_the_conflict`
+  now asserts the presentation and failed before.
