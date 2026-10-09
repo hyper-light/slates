@@ -212,6 +212,28 @@ pub fn read(result: &[u8]) -> Result<Result<(bool, &[u8]), Nfsstat3>, Malformed>
   }
 }
 
+/// A READ result's tail as NFSv4 encodes it, or the status: the offset in `result` where the eof word begins. From
+/// there to the end, READ3resok is exactly READ4resok (the eof word, then the data as an opaque with its padding), so
+/// the v4 reply is that tail copied once. Malformed unless the data and its padding end the result.
+pub fn read_tail(result: &[u8]) -> Result<Result<usize, Nfsstat3>, Malformed> {
+  let mut reader = XdrReader::new(result);
+  let status = status(&mut reader)?;
+  post_op(&mut reader)?;
+  match status {
+    Nfsstat3::Ok => {
+      let _count = reader.u32().map_err(|_| Malformed)?;
+      let tail = reader.position();
+      reader.bool().map_err(|_| Malformed)?;
+      reader.opaque(MAX_DATA).map_err(|_| Malformed)?;
+      if reader.remaining() != 0 {
+        return Err(Malformed);
+      }
+      Ok(Ok(tail))
+    }
+    other => Ok(Err(other)),
+  }
+}
+
 /// SEEK extension arguments (A-35, `crate::procedures::extension::SEEK`).
 pub fn seek_args(fh: &Nfsfh3, offset: u64, what: u32) -> Vec<u8> {
   let mut writer = XdrWriter::new();
@@ -590,4 +612,62 @@ pub fn pathconf(result: &[u8]) -> Result<Result<PathConf, Nfsstat3>, Malformed> 
     name_max,
     case_insensitive,
   }))
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  /// A READ3res for `data`, as the owner writes it: `NFS3_OK`, no post-op attributes, the count, the eof flag, the
+  /// data opaque with its padding.
+  fn read3res(data: &[u8], eof: bool) -> Vec<u8> {
+    let mut writer = XdrWriter::new();
+    writer.u32(0);
+    writer.bool(false);
+    writer.u32(u32::try_from(data.len()).unwrap());
+    writer.bool(eof);
+    writer.opaque(data);
+    writer.into_bytes()
+  }
+
+  /// The 2026-10-08 READ copy removal (the v4 reply is the tail of the v3 one). Do: for data of every length up to two
+  /// words past an XDR word (each padding), and both eof values, take `read_tail`'s slice of a READ3res. Expect it to
+  /// equal, byte for byte, READ4resok encoded the old way (the eof word, then the data as an opaque).
+  #[test]
+  fn the_read_tail_is_read4resok_byte_for_byte() {
+    for len in 0..=9usize {
+      let data: Vec<u8> = (0..len).map(|byte| u8::try_from(byte).unwrap()).collect();
+      for eof in [false, true] {
+        let result = read3res(&data, eof);
+        let tail = read_tail(&result).unwrap().unwrap();
+        let mut old = XdrWriter::new();
+        old.bool(eof);
+        old.opaque(&data);
+        assert_eq!(
+          result.get(tail..).unwrap(),
+          old.as_slice(),
+          "len {len}, eof {eof}"
+        );
+      }
+    }
+  }
+
+  /// Hostile input to `read_tail`: do give it a READ3res with a stray word after the data's padding, one truncated
+  /// inside its data, and one whose status is an error. Expect the first two refused `Malformed` (a tail that would
+  /// carry bytes past READ4resok, or too few) and the error returned as the status.
+  #[test]
+  fn a_read_result_that_does_not_end_with_its_data_is_malformed() {
+    let mut stray = read3res(b"abc", true);
+    stray.extend_from_slice(&[0, 0, 0, 7]);
+    assert_eq!(read_tail(&stray), Err(Malformed));
+    let whole = read3res(b"abcdefgh", false);
+    assert_eq!(
+      read_tail(whole.get(..whole.len() - 2).unwrap()),
+      Err(Malformed)
+    );
+    let mut refused = XdrWriter::new();
+    refused.u32(Nfsstat3::Io as u32);
+    refused.bool(false);
+    assert_eq!(read_tail(refused.as_slice()), Ok(Err(Nfsstat3::Io)));
+  }
 }

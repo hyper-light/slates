@@ -226,6 +226,17 @@ pub mod seek_what {
 pub fn is_rfc1813_procedure(procedure: u32) -> bool {
   procedure <= NFSPROC3_COMMIT
 }
+/// What a READ checked before reading: the post-op attributes, the object and the context to read under, where and
+/// how much, and the file's size (the end-of-file flag is computed against it).
+struct ReadPlan {
+  post: Fattr3,
+  object: ObjectId,
+  cx: OpContext,
+  offset: u64,
+  want: u32,
+  size: u64,
+}
+
 /// Format: the maximum bytes in a filename slates resolves (§4.5's name cap), refused before
 /// allocating.
 pub const NFS_MAXNAMELEN: usize = 255;
@@ -976,28 +987,65 @@ impl<'b> Export<'b> {
   /// READ under `authority`: the object's mode, or an NFSv4 open that authorized it (A-38).
   fn read_as(&mut self, args: &mut XdrReader<'_>, authority: IoAuthority) -> Vec<u8> {
     let mut writer = XdrWriter::new();
-    match self.read_result(args, authority) {
-      Ok((post, count, eof, data)) => {
-        Nfsstat3::Ok.encode(&mut writer);
-        PostOpAttr(Some(post)).encode(&mut writer);
-        writer.u32(count);
-        writer.bool(eof);
-        writer.opaque(&data);
-      }
-      Err((status, post)) => {
-        status.encode(&mut writer);
-        PostOpAttr(post.map(|node| self.fattr3(&node))).encode(&mut writer);
-      }
-    }
+    self.read_into(args, authority, &mut writer);
     writer.into_bytes()
   }
 
-  #[allow(clippy::type_complexity)]
-  fn read_result(
+  /// READ3res into `writer`: the bytes are read straight into its buffer after the result's fixed words, which are
+  /// filled in once the read's length is known, so the payload is copied once, from the volume into the reply (until
+  /// 2026-10-08 the bridge read into a buffer of its own and the reply copied it; then the v4 owner path copied the
+  /// whole reply again behind its status word).
+  fn read_into(
     &mut self,
     args: &mut XdrReader<'_>,
     authority: IoAuthority,
-  ) -> Result<(Fattr3, u32, bool, Vec<u8>), (Nfsstat3, Option<NodeAttr>)> {
+    writer: &mut XdrWriter,
+  ) {
+    let plan = match self.read_plan(args, authority) {
+      Ok(plan) => plan,
+      Err((status, post)) => {
+        status.encode(writer);
+        PostOpAttr(post.map(|node| self.fattr3(&node))).encode(writer);
+        return;
+      }
+    };
+    let start = writer.len();
+    Nfsstat3::Ok.encode(writer);
+    PostOpAttr(Some(plan.post)).encode(writer);
+    let count_at = writer.len();
+    writer.u32(0);
+    writer.bool(false);
+    let read = writer.opaque_appended(|out| {
+      self
+        .bridge
+        .read(plan.object, &plan.cx, plan.offset, plan.want, out)
+    });
+    match read {
+      Ok(read) => {
+        let end = plan
+          .offset
+          .saturating_add(u64::try_from(read).unwrap_or(u64::MAX));
+        writer.set_u32_at(count_at, u32::try_from(read).unwrap_or(u32::MAX));
+        writer.set_u32_at(
+          count_at.saturating_add(size_of::<u32>()),
+          u32::from(end >= plan.size),
+        );
+      }
+      Err(e) => {
+        writer.truncate(start);
+        nfsstat_of(&e).encode(writer);
+        PostOpAttr(Some(plan.post)).encode(writer);
+      }
+    }
+  }
+
+  /// A READ's checks before its bytes are read: the file's identity and attributes, the read permission, the
+  /// context and how much to read.
+  fn read_plan(
+    &mut self,
+    args: &mut XdrReader<'_>,
+    authority: IoAuthority,
+  ) -> Result<ReadPlan, (Nfsstat3, Option<NodeAttr>)> {
     // READ3args: the file handle, the offset, the byte count.
     let handle = Nfsfh3::decode(args).map_err(|_| (Nfsstat3::Badhandle, None))?;
     let offset = args.u64().map_err(|_| (Nfsstat3::Inval, None))?;
@@ -1021,15 +1069,14 @@ impl<'b> Export<'b> {
     // allocation and its zeroing (2026-10-05: an overlay tree's cold read 10% slower at a 256 KiB `rsize`).
     let left = u32::try_from(node.size.saturating_sub(offset)).unwrap_or(u32::MAX);
     let want = count.min(MAX_TRANSFER).min(left);
-    let mut data = Vec::new();
-    self
-      .bridge
-      .read(object, &cx, offset, want, &mut data)
-      .map_err(|e| (nfsstat_of(&e), Some(node)))?;
-    let end = offset.saturating_add(u64::try_from(data.len()).unwrap_or(u64::MAX));
-    let eof = end >= node.size;
-    let read = u32::try_from(data.len()).unwrap_or(u32::MAX);
-    Ok((post, read, eof, data))
+    Ok(ReadPlan {
+      post,
+      object,
+      cx,
+      offset,
+      want,
+      size: node.size,
+    })
   }
 
   /// The SEEK extension (A-35, RFC 7862 §15.11): the first data or hole byte at or after an offset,
@@ -1138,12 +1185,12 @@ impl<'b> Export<'b> {
     };
     writer.u32(crate::v4::Nfsstat4::Ok.wire());
     let mut v3_args = XdrReader::new(v3_args);
-    let served = match inner {
-      NFSPROC3_READ => self.read_as(&mut v3_args, authority),
-      NFSPROC3_WRITE => self.write_as(&mut v3_args, authority),
-      _ => self.setattr_as(&mut v3_args, authority),
-    };
-    writer.fixed(&served);
+    match inner {
+      // A READ's reply is written behind the status word in place (`read_into`); the others are small.
+      NFSPROC3_READ => self.read_into(&mut v3_args, authority, &mut writer),
+      NFSPROC3_WRITE => writer.fixed(&self.write_as(&mut v3_args, authority)),
+      _ => writer.fixed(&self.setattr_as(&mut v3_args, authority)),
+    }
     writer.into_bytes()
   }
 

@@ -3,11 +3,11 @@
 # random source, the client's caches dropped, then read back, ROUNDS times, with the daemon's CPU for each transfer. Run in a privileged container with the
 # Linux release build at /target/release/slates:
 #   docker run --rm --privileged -v <target-volume>:/target:ro -v "$PWD/docs/wip/bench/nfs":/n:ro rust:1.98.0 \
-#     bash /n/large_io.sh [ROUNDS]
+#     bash /n/large_io.sh [ROUNDS]     (SLATES names the binary when it is not /target/release/slates)
 set -u
 ROUNDS=${1:-5}
 apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq nfs-common >/dev/null 2>&1
-cp /target/release/slates /usr/local/bin/slates
+cp "${SLATES:-/target/release/slates}" /usr/local/bin/slates
 slates --instance lio anchor --quick --shards 4 >/dev/null 2>&1 &
 for _ in $(seq 1 300); do slates --instance lio volume list >/dev/null 2>&1 && break; sleep 0.1; done
 slates --instance lio bootstrap root >/dev/null 2>&1
@@ -26,7 +26,9 @@ for round in $(seq 1 "$ROUNDS"); do
   C0=$(cpu_ms)
   W=$(dd if=/tmp/src of=/mnt/v/f bs=1M conv=fsync 2>&1 | awk '/copied/{print $(NF-1), $NF}')
   C1=$(cpu_ms)
-  sync -f /mnt/v; echo 3 > /proc/sys/vm/drop_caches
+  # A cold read: the mount is made again, so the client holds nothing of the file. Never the global `drop_caches`,
+  # which walks every superblock in the VM and hung behind a wedged one on 2026-10-08.
+  sync -f /mnt/v && umount /mnt/v && mount -t nfs -o "vers=4.2,proto=tcp,port=$PORT,hard,timeo=600" "127.0.0.1:$EXPORT" /mnt/v
   C2=$(cpu_ms)
   R=$(dd if=/mnt/v/f of=/dev/null bs=1M 2>&1 | awk '/copied/{print $(NF-1), $NF}')
   C3=$(cpu_ms)

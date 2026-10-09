@@ -16,7 +16,9 @@ cp /target/release/slates /usr/local/bin/slates
 pss_kib() { local total=0; for p in "$@"; do total=$((total + $(awk '/^Pss:/{print $2}' /proc/$p/smaps_rollup))); done; echo $total; }
 detail() { awk '/^(Pss|Pss_Anon|Pss_File|Pss_Shmem|Private_Dirty):/{printf "%s %s ", $1, $2}' /proc/$1/smaps_rollup; }
 meminfo_kib() { awk -v k="$1" '$1==k":"{print $2}' /proc/meminfo; }
-kernel_kib() { sync -f /ram; echo 3 > /proc/sys/vm/drop_caches; echo $(( $(meminfo_kib Shmem) + $(meminfo_kib Slab) )); }
+# Kernel memory is Shmem plus the unreclaimable slab: reclaimable caches (dentries, inodes) are left out by definition,
+# with no global `drop_caches`, which walks every superblock in the VM and hangs behind any wedged one (2026-10-08).
+kernel_kib() { sync -f /ram; echo $(( $(meminfo_kib Shmem) + $(meminfo_kib SUnreclaim) )); }
 FILES=$(find "$TREE" -xdev | wc -l); BYTES=$(find "$TREE" -xdev -type f -printf '%s\n' | awk '{s+=$1} END {print s}')
 echo "tree $TREE: $FILES entries, $BYTES content bytes"
 env ${MALLOC_ENV:-} slates --instance mem anchor --quick --shards 2 >/dev/null 2>&1 &

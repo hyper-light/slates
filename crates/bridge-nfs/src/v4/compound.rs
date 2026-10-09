@@ -432,7 +432,28 @@ pub(super) struct Frame {
 }
 
 /// What an operation produced: its result body on success, or the status it failed with.
-pub(super) type Outcome = Result<Vec<u8>, Nfsstat4>;
+pub(super) type Outcome = Result<Body, Nfsstat4>;
+
+/// An operation's result body: `bytes` from `from` on. Almost every body is its own buffer (`from` is zero); a READ's
+/// is the tail of the owner's reply, where `READ4resok` (the eof word, then the data) already sits, so it is encoded
+/// into the compound's reply with one copy and never into a buffer of its own first.
+pub(super) struct Body {
+  bytes: Vec<u8>,
+  from: usize,
+}
+
+impl From<Vec<u8>> for Body {
+  fn from(bytes: Vec<u8>) -> Body {
+    Body { bytes, from: 0 }
+  }
+}
+
+impl Body {
+  /// The body's bytes.
+  pub(super) fn as_slice(&self) -> &[u8] {
+    self.bytes.get(self.from..).unwrap_or_default()
+  }
+}
 
 /// Serves one `COMPOUND` call's arguments against `server` and `backend`, returning its encoded
 /// `COMPOUND4res`.
@@ -502,7 +523,7 @@ pub async fn serve<B: Backend>(backend: &mut B, args: &[u8], request_bytes: usiz
             frame.clientid = Some(clientid);
             frame.session = Some(sessionid);
             backend.act_for(clientid);
-            Ok(body)
+            Ok(body.into())
           }
           Err(status) => Err(status),
         }
@@ -639,7 +660,7 @@ fn record(
   match outcome {
     Ok(body) => {
       results.u32(Nfsstat4::Ok.wire());
-      results.fixed(&body);
+      results.fixed(body.as_slice());
       Ok(())
     }
     Err(status) => {
@@ -707,13 +728,13 @@ async fn outside_session<B: Backend>(
       let sessionid = decode_sessionid(reader).map_err(|_| Nfsstat4::Badxdr)?;
       backend
         .with_v4(|server| server.sessions.destroy_session(&sessionid))?
-        .map(|()| Vec::new())
+        .map(|()| Vec::new().into())
     }
     op::DESTROY_CLIENTID => {
       let clientid = reader.u64().map_err(|_| Nfsstat4::Badxdr)?;
       backend.with_v4(|server| server.sessions.destroy_clientid(clientid))??;
       purge_dropped(backend).await?;
-      Ok(Vec::new())
+      Ok(Vec::new().into())
     }
     _ => bind_conn(backend, reader),
   }
@@ -762,7 +783,7 @@ fn exchange_id<B: Backend>(backend: &mut B, reader: &mut XdrReader<'_>) -> Outco
   body.opaque(&owner.to_be_bytes());
   body.opaque(b"slates"); // server scope
   body.u32(0); // no implementation id
-  Ok(body.into_bytes())
+  Ok(body.into_bytes().into())
 }
 
 /// Format: `CREATE_SESSION4_FLAG_CONN_BACK_CHAN` (RFC 8881 §18.36.1): the creating connection carries the back
@@ -803,7 +824,7 @@ fn create_session<B: Backend>(backend: &mut B, reader: &mut XdrReader<'_>) -> Ou
   });
   granted.fore.encode(&mut body);
   granted.back.encode(&mut body);
-  Ok(body.into_bytes())
+  Ok(body.into_bytes().into())
 }
 
 /// Reads a `callback_sec_parms4<>` (the flavors the client accepts callbacks under, in its order of preference): the
@@ -895,7 +916,7 @@ fn bind_conn<B: Backend>(backend: &mut B, reader: &mut XdrReader<'_>) -> Outcome
   body.fixed(&sessionid);
   body.u32(bound);
   body.bool(false);
-  Ok(body.into_bytes())
+  Ok(body.into_bytes().into())
 }
 
 /// How a compound's `SEQUENCE` came out.
@@ -1017,25 +1038,25 @@ async fn operation<B: Backend>(
   match opnum {
     op::PUTROOTFH | op::PUTPUBFH => {
       frame.current = Some(backend.root_handle());
-      Ok(Vec::new())
+      Ok(Vec::new().into())
     }
     op::PUTFH => {
       let fh = reader.opaque(FHSIZE).map_err(|_| Nfsstat4::Badxdr)?;
       frame.current = Some(Nfsfh3(fh.to_vec()));
-      Ok(Vec::new())
+      Ok(Vec::new().into())
     }
     op::GETFH => {
       let mut body = XdrWriter::new();
       body.opaque(&current(frame)?.0);
-      Ok(body.into_bytes())
+      Ok(body.into_bytes().into())
     }
     op::SAVEFH => {
       frame.saved = Some(current(frame)?.clone());
-      Ok(Vec::new())
+      Ok(Vec::new().into())
     }
     op::RESTOREFH => {
       frame.current = Some(frame.saved.clone().ok_or(Nfsstat4::Restorefh)?);
-      Ok(Vec::new())
+      Ok(Vec::new().into())
     }
     op::LOOKUP => lookup_operation(backend, reader, frame).await,
     op::LOOKUPP => {
@@ -1047,7 +1068,7 @@ async fn operation<B: Backend>(
         return Err(Nfsstat4::Noent);
       }
       frame.current = Some(parent);
-      Ok(Vec::new())
+      Ok(Vec::new().into())
     }
     _ => object_operation(backend, opnum, reader, frame).await,
   }
@@ -1070,14 +1091,14 @@ async fn lookup_operation<B: Backend>(
       dir = crate::multi::root_handle_with(capability);
       if bare.is_empty() {
         frame.current = Some(dir);
-        return Ok(Vec::new());
+        return Ok(Vec::new().into());
       }
       bare.to_owned()
     }
     _ => name,
   };
   frame.current = Some(lookup(backend, &dir, &name).await?.fh);
-  Ok(Vec::new())
+  Ok(Vec::new().into())
 }
 
 /// The operations on the current object's attributes, data and namespace.
@@ -1145,7 +1166,7 @@ fn secinfo_no_name(reader: &mut XdrReader<'_>, frame: &mut Frame) -> Outcome {
   let mut body = XdrWriter::new();
   body.u32(1);
   body.u32(AUTH_SYS);
-  Ok(body.into_bytes())
+  Ok(body.into_bytes().into())
 }
 
 /// `SECINFO` (§18.29): the flavors that protect `name` in the current directory, which the name must
@@ -1163,7 +1184,7 @@ async fn secinfo<B: Backend>(
   let mut body = XdrWriter::new();
   body.u32(1);
   body.u32(AUTH_SYS);
-  Ok(body.into_bytes())
+  Ok(body.into_bytes().into())
 }
 
 /// `VERIFY` (§18.31) and `NVERIFY` (§18.15): whether the attributes the client names equal the current
@@ -1191,12 +1212,12 @@ async fn verify<B: Backend>(
   }
   let fh = current(frame)?.clone();
   let ours = getattr(backend, &fh, (&requested, frame.minor)).await?;
-  let mut ours = XdrReader::new(&ours);
+  let mut ours = XdrReader::new(ours.as_slice());
   Bitmap::decode(&mut ours).map_err(|_| Nfsstat4::Serverfault)?;
   let encoded = ours.rest().len();
   let same = ours.opaque(encoded).map_err(|_| Nfsstat4::Serverfault)? == theirs;
   match (opnum == op::VERIFY, same) {
-    (true, true) | (false, false) => Ok(Vec::new()),
+    (true, true) | (false, false) => Ok(Vec::new().into()),
     (true, false) => Err(Nfsstat4::NotSame),
     (false, true) => Err(Nfsstat4::Same),
   }
@@ -1210,7 +1231,7 @@ fn backchannel_ctl(reader: &mut XdrReader<'_>) -> Outcome {
   if read_callback_sec(reader)?.1 {
     return Err(Nfsstat4::Noent);
   }
-  Ok(Vec::new())
+  Ok(Vec::new().into())
 }
 
 /// `SET_SSV` (§18.47): refused `NFS4ERR_INVAL`, as it must be for a client that did not choose SP4_SSV
@@ -1231,7 +1252,7 @@ async fn readlink<B: Backend>(backend: &mut B, frame: &Frame) -> Outcome {
   let target = v3(v3call::readlink(&result))?;
   let mut body = XdrWriter::new();
   body.opaque(target.as_bytes());
-  Ok(body.into_bytes())
+  Ok(body.into_bytes().into())
 }
 
 /// Format: the ACCESS bits (RFC 8881 §18.1; RFC 8276 §8.5).
@@ -1285,7 +1306,7 @@ async fn access<B: Backend>(
   let mut body = XdrWriter::new();
   body.u32(supported);
   body.u32(granted);
-  Ok(body.into_bytes())
+  Ok(body.into_bytes().into())
 }
 
 /// The operations on the v4 state alone (opens, stateids, reclaim), and the refusals.
@@ -1302,7 +1323,7 @@ fn state_operation(
       server
         .sessions
         .reclaim_complete(clientid)
-        .map(|()| Vec::new())
+        .map(|()| Vec::new().into())
     }
     op::BACKCHANNEL_CTL => backchannel_ctl(reader),
     op::SET_SSV => set_ssv(reader),
@@ -1408,9 +1429,6 @@ impl StateReply {
 /// Format: the state status word an owner's state-carrying reply begins with.
 const STATE_STATUS_BYTES: usize = 4;
 
-/// Format: a READ4resok besides its data: the eof word (4), the data's length word (4) and its padding (at most 3).
-const READ_BODY_FIXED_BYTES: usize = 4 + 4 + 3;
-
 /// A state id's encoding, as an owner call's extra arguments.
 fn stateid_bytes(stateid: &Stateid) -> Vec<u8> {
   let mut writer = XdrWriter::new();
@@ -1467,7 +1485,7 @@ async fn delegreturn<B: Backend>(
     &stateid_bytes(&stateid),
   )
   .await
-  .map(|_| Vec::new())
+  .map(|_| Vec::new().into())
   .map_err(|(status, _)| status)
 }
 
@@ -1486,7 +1504,7 @@ async fn close<B: Backend>(backend: &mut B, reader: &mut XdrReader<'_>, frame: &
   )
   .await
   .map_err(|(status, _)| status)?;
-  Ok(stateid_bytes(&stateid_of(&mut XdrReader::new(&body))?))
+  Ok(stateid_bytes(&stateid_of(&mut XdrReader::new(&body))?).into())
 }
 
 /// OPEN_DOWNGRADE (§18.18) at the file's owner.
@@ -1514,7 +1532,7 @@ async fn open_downgrade<B: Backend>(
   )
   .await
   .map_err(|(status, _)| status)?;
-  Ok(stateid_bytes(&stateid_of(&mut XdrReader::new(&body))?))
+  Ok(stateid_bytes(&stateid_of(&mut XdrReader::new(&body))?).into())
 }
 
 /// LOCK, LOCKT and LOCKU (§18.10–18.12): the arguments are checked here (an undefined type, an invalid
@@ -1540,7 +1558,7 @@ async fn lock_operation<B: Backend>(
     _ => extension::STATE_LOCKU,
   };
   match state_call(backend, procedure, &fh, clientid, &raw).await {
-    Ok(body) => Ok(body),
+    Ok(body) => Ok(body.into()),
     Err((Nfsstat4::Denied, denied)) => {
       frame.denied = Some(denied);
       Err(Nfsstat4::Denied)
@@ -1581,7 +1599,7 @@ async fn test_stateid<B: Backend>(
     };
     body.u32(status.wire());
   }
-  Ok(body.into_bytes())
+  Ok(body.into_bytes().into())
 }
 
 /// FREE_STATEID (§18.38) at the owner its `other` names (D-14).
@@ -1601,7 +1619,7 @@ async fn free_stateid<B: Backend>(
     Some(&stateid),
   )
   .await?;
-  Ok(Vec::new())
+  Ok(Vec::new().into())
 }
 
 /// An id-only state procedure at the owner partition `owner`: the body after its status, or the
@@ -1763,7 +1781,7 @@ async fn getattr<B: Backend>(
   let figures = figures(backend, fh, requested).await?;
   let mut body = XdrWriter::new();
   attr::encode((requested, minor), &attrs, fh, &figures, &mut body)?;
-  Ok(body.into_bytes())
+  Ok(body.into_bytes().into())
 }
 
 /// `READ` (§18.22).
@@ -1780,12 +1798,13 @@ async fn read<B: Backend>(backend: &mut B, reader: &mut XdrReader<'_>, frame: &F
     &stateid,
   )
   .await?;
-  let (eof, data) = v3(v3call::read(result.body()))?;
-  // The eof word, the data's length word, the data and its padding: sized once.
-  let mut body = XdrWriter::with_capacity(data.len().saturating_add(READ_BODY_FIXED_BYTES));
-  body.bool(eof);
-  body.opaque(data);
-  Ok(body.into_bytes())
+  // READ4resok is the tail of the owner's READ3resok (from its eof word on): the reply is lent whole, never encoded
+  // into a body of its own (until 2026-10-08 it was, one more copy of every byte read).
+  let tail = v3(v3call::read_tail(result.body()))?;
+  Ok(Body {
+    from: STATE_STATUS_BYTES.saturating_add(tail),
+    bytes: result.bytes,
+  })
 }
 
 /// `WRITE` (§18.32).
@@ -1810,7 +1829,7 @@ async fn write<B: Backend>(backend: &mut B, reader: &mut XdrReader<'_>, frame: &
   body.u32(count);
   body.u32(committed);
   body.fixed(&verifier);
-  Ok(body.into_bytes())
+  Ok(body.into_bytes().into())
 }
 
 /// `COMMIT` (§18.3).
@@ -1824,7 +1843,7 @@ async fn commit<B: Backend>(backend: &mut B, reader: &mut XdrReader<'_>, frame: 
   let verifier = v3(v3call::commit(&result))?;
   let mut body = XdrWriter::new();
   body.fixed(&verifier);
-  Ok(body.into_bytes())
+  Ok(body.into_bytes().into())
 }
 
 /// `READDIR` (§18.23): a directory in a volume is listed by its owner, which encodes the page from the bridge's rows
@@ -1866,7 +1885,7 @@ async fn readdir<B: Backend>(
     figures,
   };
   let result = backend.call_v3(extension::READDIR4, request.encode()).await;
-  super::listing::page_of(result)
+  super::listing::page_of(result).map(Body::from)
 }
 
 /// `READDIR` of the pseudo-root: a v3 READDIRPLUS of the gathered volumes, the dot entries dropped, the cookies
@@ -1978,7 +1997,7 @@ async fn readdir_of_root<B: Backend>(
   body.fixed(entries.as_slice());
   body.bool(false); // no more entries in this reply
   body.bool(listing.eof && all);
-  Ok(body.into_bytes())
+  Ok(body.into_bytes().into())
 }
 
 /// A listed entry's attributes and handle: as the listing carried them, or — for an entry it carried
@@ -2063,7 +2082,7 @@ async fn open<B: Backend>(
     None => body.u32(OPEN_DELEGATE_NONE),
   }
   frame.current = Some(opened.fh);
-  Ok(body.into_bytes())
+  Ok(body.into_bytes().into())
 }
 
 /// The file an `OPEN` names by its claim (§18.16.3), with `dir` the current file: a name in it (`CLAIM_NULL`, created
@@ -2509,7 +2528,7 @@ async fn setattr<B: Backend>(
   }
   let mut body = XdrWriter::new();
   set_bits(&attrs).encode(&mut body);
-  Ok(body.into_bytes())
+  Ok(body.into_bytes().into())
 }
 
 /// The attribute bits a `sattr3` sets, as a SETATTR or OPEN reply's `attrsset`.
@@ -2614,7 +2633,7 @@ async fn create<B: Backend>(
   let mut attrset = XdrWriter::new();
   set_bits(&attrs).encode(&mut attrset);
   body.extend(attrset.into_bytes());
-  Ok(body)
+  Ok(body.into())
 }
 
 /// `REMOVE` (§18.25): a file or an empty directory.
@@ -2635,7 +2654,7 @@ async fn remove<B: Backend>(backend: &mut B, reader: &mut XdrReader<'_>, frame: 
   if status != Nfsstat3::Ok {
     return Err(Nfsstat4::of_v3(status));
   }
-  Ok(change_info(&dir_wcc))
+  Ok(change_info(&dir_wcc).into())
 }
 
 /// `RENAME` (§18.26): the saved file handle's directory to the current one's.
@@ -2656,7 +2675,7 @@ async fn rename<B: Backend>(backend: &mut B, reader: &mut XdrReader<'_>, frame: 
   }
   let mut body = change_info(&from_wcc);
   body.extend(change_info(&to_wcc));
-  Ok(body)
+  Ok(body.into())
 }
 
 /// `LINK` (§18.9): the saved file handle linked into the current directory.
@@ -2671,7 +2690,7 @@ async fn link<B: Backend>(backend: &mut B, reader: &mut XdrReader<'_>, frame: &F
   if status != Nfsstat3::Ok {
     return Err(Nfsstat4::of_v3(status));
   }
-  Ok(change_info(&dir_wcc))
+  Ok(change_info(&dir_wcc).into())
 }
 
 /// A `change_info4` (§3.3.6) from the `wcc_data` of the one v3 call that made the change. Atomic when

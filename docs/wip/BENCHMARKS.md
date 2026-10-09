@@ -3583,8 +3583,26 @@ answers by resending).
 - Same day, the compound's reply is encoded in place: its header (status, tag, operation count) is written before the
   results and its words filled in at the end, so assembling the reply no longer copies every result into a second
   buffer. A READ allocates 1,574,869 → 1,312,741 bytes (one transfer less); a WRITE is unchanged (526,966).
-- Still copied per READ: the volume's read out of the arena, the v3 reply's encoding, the state wrapper, the v4 body
-  and the record framing; per WRITE, the v3 re-encoding itself. Each is a further step.
+- ~~Still copied per READ: the volume's read out of the arena, the v3 reply's encoding, the state wrapper, the v4 body
+  and the record framing~~; per WRITE, the v3 re-encoding itself. Each is a further step.
+- **READ at two buffers, 2026-10-08.** A READ was copied five times (a trace of every allocation of 256 KiB or more,
+  `V4_IO_TRACE=1`): the bridge's read buffer, the v3 reply's opaque, the state wrapper behind its status word, the v4
+  body and the compound reply. Now:
+  - the bridge reads straight into the v3 reply after its fixed words, which are filled in after (`read_into`,
+    `XdrWriter::opaque_appended`);
+  - `state_io` writes that reply behind its status word in place;
+  - the v4 operation's body is the owner's reply lent from its eof word on (`Body { bytes, from }`, `v3call::read_tail`):
+    READ3resok's tail is READ4resok byte for byte, an equality a unit test checks for every padding case.
+
+  | Per 256 KiB READ (`v4_io_bench`, macOS aarch64) | before | after |
+  |---|---|---|
+  | bytes the server allocates | 1,312,741 | 526,154 (two buffers: the owner's reply and the compound's) |
+  | best of five rounds, three runs | 38.3 µs | 16.6–19.1 µs |
+
+  Through Linux's NFS client (`large_io.sh 3`, cold reads by a fresh mount): every 512 MiB file read back identical;
+  reads at 1.5–2.2 GB/s with 250–360 ms of daemon CPU per 512 MiB, writes 0.7–1.4 GB/s (load 8–12). The script's
+  global `drop_caches` was replaced by the remount the same day: it walks every superblock in the VM and hung for good
+  behind the wedged one (the first attempt's shell is still in D state).
 
 ### A write's retention estimate and window lookup by binary search (condition 12; 2026-10-08)
 
