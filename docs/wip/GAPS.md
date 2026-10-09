@@ -5125,3 +5125,14 @@ file, snapshots it, and times the snapshot's placement at home and then in the m
       so the next occurrence names its budget. A guess, not yet shown: the host-memory pressure hold
       (`refresh_pressure_hold`) on the shared Docker VM.
 - Fleet suite 82/83; the failure is the recorded flake.
+
+### 2026-10-09: the approved-merge gate re-checked at HEAD (condition 3)
+
+At `f62847d5`:
+- `cargo test -p slates-server --test daemon -- grant approv forged land`: 3 passed.
+  - A landing without a grant is only presented (`GrantRequired`, its conflicts named since `2b80063e`).
+  - An approval forged on the agent's own channel, without the issuer's secret, is refused and issues nothing.
+  - A grant is accepted only with a verified proof bound to the presented landing, and the landing consumes its
+    presentation.
+- The same day, the escape battery over Linux NFS (`d26b01b0`) measured 0 bytes written to disk by the daemon outside a
+  granted landing, and the landing engine's crash-at-every-write-instruction oracle passed with the land suites.
