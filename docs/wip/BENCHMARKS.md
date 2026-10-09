@@ -3971,6 +3971,8 @@ mirror region by `volume placed --mirror`). Load average 8–24.
 | `aefcc6da` (the home record keeps the mirror placement) | same | 10 of 10 in two runs, then 3 of 15 | 2.1–4.8 s |
 | `962d4a9e` (delivered pair keys recorded apart) | same | 23 of 24 over five runs | 2.0–6.2 s |
 | `962d4a9e` | 150 ms ± 60 ms, 10% loss | 5 of 5 | 6.9, 8.1, 9.6, 17.8, 75.7 s |
+| `962d4a9e`, every node limited to half a CPU (`CPUS=0.5`) | 100 ms ± 40 ms, 3% loss | 5 of 5 | 2.3–6.9 s |
+| `962d4a9e`, half a CPU each | 150 ms ± 60 ms, 10% loss | 5 of 5 | 4.7, 6.6, 8.0, 13.1, 13.9 s |
 
 - The four faults each stopped every placement in their own way: a mirror round judged stalled at its offer; a late
   shipment acknowledgement discarded; a healer's home re-record wiping the mirror placement, so a second job shipped
