@@ -9,6 +9,7 @@
 #
 #   sh docs/wip/bench/multiregion/reads.sh SCRATCH_DIR PAYLOAD [ROUNDS]
 #   JITTER=0ms IMAGE=slates:mr sh docs/wip/bench/multiregion/reads.sh SCRATCH_DIR PAYLOAD 3
+#   CONCURRENT=1 ... starts the three region-1 readers together each round (contested), instead of one at a time
 #
 # The shaping variables (DELAY, JITTER, LOSS, IMAGE) pass through to `run.sh`. Nothing touches the repository's
 # tree; the payload is copied into the scratch directory, which `run.sh` mounts for the writer.
@@ -41,7 +42,29 @@ docker exec -i mr-a1 /slates write "$VOLUME" "$ATTACHMENT" /payload.bin < "$DIR/
 echo "volume $VOLUME, payload sum $(sum "$DIR/payload.bin" | cut -d' ' -f1)"
 now() { python3 -c 'import time;print(time.time())'; }
 errors=""
-for round in $(seq 1 "$ROUNDS"); do
+if [ "${CONCURRENT:-0}" = 1 ]; then
+  # Contested: each round starts the three region-1 readers at once, all pulling the file across the crossing together.
+  for round in $(seq 1 "$ROUNDS"); do
+    began=$(now)
+    for node in b0 b1 b2; do
+      ( timeout 600 docker exec "mr-$node" /slates read "$VOLUME" /payload.bin > "$DIR/read-$node.out" 2> "$DIR/read-$node.err"
+        echo $? > "$DIR/read-$node.status"
+        python3 -c 'import time;print(time.time())' > "$DIR/read-$node.end" ) &
+    done
+    wait
+    line=""
+    for node in b0 b1 b2; do
+      status=$(cat "$DIR/read-$node.status")
+      checksum=$(sum < "$DIR/read-$node.out" | cut -d' ' -f1)
+      line="$line $node:$status/$(python3 -c "print(round($(cat "$DIR/read-$node.end") - $began, 2))")s/$checksum"
+      [ "$status" -ne 0 ] && errors="$errors
+  round $round $node: $(head -c 300 "$DIR/read-$node.err")"
+    done
+    echo "concurrent$line"
+  done
+fi
+# One reader at a time (skipped in the contested mode; BSD `seq 1 0` counts down, so a zero count is not enough).
+[ "${CONCURRENT:-0}" = 1 ] || for round in $(seq 1 "$ROUNDS"); do
   line=""
   for node in a0 b0 b1 b2; do
     began=$(now)

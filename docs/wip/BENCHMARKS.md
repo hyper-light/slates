@@ -3970,6 +3970,12 @@ topology, 100 ms ± 40 ms one way, 3% loss each way; the image built from the tr
 | resend unless confirmed dead, run 1 | 29.0, 32.0, 23.0, 20.8, 19.0, 22.0, 24.8, 21.9, 21.9 | 0 of 9 (`fleet.forward.retried` 1 on b2) |
 | resend unless confirmed dead, run 2 | 23.5, 24.7, 28.2, 26.3, 33.9, 21.4, 33.6, 27.8, 25.6 | 0 of 9 (`retried` 1 on b0, 1 on b2) |
 
+**Contested, 2026-10-09** (`CONCURRENT=1 IMAGE=slates:mr sh docs/wip/bench/multiregion/reads.sh <scratch> <8 MiB
+payload> 3` at `22e16df3`: each round starts the three region-1 readers at once, all reading the same file across the
+crossing). Rounds: 29.9 / 28.7 / 24.1 s, 22.8 / 24.9 / 27.3 s, 22.5 / 23.6 / 20.3 s. All nine byte-identical, none
+refused. Each contested read took about as long as a read alone, so the crossing carried about three times the bytes
+in the same time. Load average 12–22.
+
 The median read (about 25 s) is about 1.8× faster than the 44 s of 2026-10-08's landed build, from the day's other
 changes or the load; it was not A/B'd.
 
