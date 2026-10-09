@@ -5019,3 +5019,32 @@ At `28d49f15`, after the day's changes:
   - a read-only entry refused a write (`Read-only file system`).
 - `cargo test -p slates-mcp`: 15 unit tests and the end-to-end MCP test (which covers the skills extension, A-120)
   passed.
+
+### 2026-10-09: replication to the mirror region never completed across a shaped crossing (partly fixed; condition 10)
+
+New bench `docs/wip/bench/multiregion/mirror.sh` (two networks, a router shaping the crossing): each round writes a
+file, snapshots it, and times the snapshot's placement at home and then in the mirror region (`volume placed
+--mirror`).
+- **Found:** unshaped, a 64 KiB snapshot placed in the mirror in 1.01 s. Across 100 ms ± 40 ms with 3% loss it never
+  placed (300 s bound, 8 MiB and 64 KiB alike). Counters, each new in this change, showed why:
+  - a1 sent 351 mirror content rounds with 0 acknowledgements (`fleet.mirror.content_rounds`, `fleet.mirror.acks`);
+  - each mirror holder answered about one request a round, the offer's reply only (`fleet.content.answered`).
+- **Cause, fixed:** a content round's hedge delay, which is also its stall window, came from one put-latency window
+  shared by both tracks. On the home region's local network its p95 is far inside a cross-region round trip, so every
+  mirror round was judged stalled at its offer and ended before its chunks went.
+  - Mirror rounds now keep their own window (`ShardState::mirror_put_latency`) and are never hedged or judged stalled
+    sooner than the slowest measured round-trip tail to their candidates (`fleet::content_work`).
+  - After the fix: content acknowledged, and most snapshots place in the mirror in 2–5 s.
+- **Fixed in part:** a holder keeps the first head value at a position and refuses a different one
+  (`conflicting_position`). The shipment named the content holders known when built, and was rebuilt each period, so
+  a holder whose first acknowledgement came back too late refused every later shipment. A mirror job now keeps its
+  first shipment and resends it unchanged (`SealJob::shipment`).
+- **Open:**
+  1. Conflicts still occur, by head record (1–2 snapshots in 5 in some runs, 143–342 refusals). They coincide with
+     mirror jobs being started again (`fleet.mirror.job_started` 6–10 for 5 snapshots); a restarted job builds a new
+     shipment. The shipment must stay fixed per (object, sequence) across a job's restart, or a late acknowledgement
+     must be folded rather than discarded (`mirror::ship`, `LateReplies::Discard`). Not yet built.
+  2. One run's rounds 2–5 shipped nothing (`shipments_sent` 2 for 5 snapshots); not yet diagnosed.
+- New counters: `fleet.mirror.no_neighbourhood`, `job_started`, `content_rounds`, `acks`, `round_failed`,
+  `no_holder_session`, `shipments_sent`, `records_acked`, `ship_no_session`, the `shipment_refused.<reason>` family,
+  `fleet.seal.no_holder_session`, `fleet.content.unauthorized`, `answered` and `answered_empty`.

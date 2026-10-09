@@ -41,6 +41,34 @@ struct ShipmentAck {
 /// than it holds. Format: a refusal name in the daemon's status report.
 const SHIPMENT_REFUSED: &str = "fleet.mirror.shipment_refused";
 
+/// The status counts of mirror shipments refused, by reason (each also in [`SHIPMENT_REFUSED`]): bytes that are not a
+/// shipment; records not the sender's own; the home already promoted; this region not the home's mirror; the sender
+/// outside the object's home; a record older than one held.
+const SHIPMENT_REFUSED_MALFORMED: &str = "fleet.mirror.shipment_refused.malformed";
+/// See [`SHIPMENT_REFUSED_MALFORMED`].
+const SHIPMENT_REFUSED_NOT_OWN: &str = "fleet.mirror.shipment_refused.not_own";
+/// See [`SHIPMENT_REFUSED_MALFORMED`].
+const SHIPMENT_REFUSED_HOME_PROMOTED: &str = "fleet.mirror.shipment_refused.home_promoted";
+/// See [`SHIPMENT_REFUSED_MALFORMED`].
+const SHIPMENT_REFUSED_NOT_ITS_MIRROR: &str = "fleet.mirror.shipment_refused.not_its_mirror";
+/// See [`SHIPMENT_REFUSED_MALFORMED`].
+const SHIPMENT_REFUSED_SENDER_OUTSIDE: &str = "fleet.mirror.shipment_refused.sender_outside_home";
+/// See [`SHIPMENT_REFUSED_MALFORMED`].
+const SHIPMENT_REFUSED_OLDER: &str = "fleet.mirror.shipment_refused.older";
+/// See [`SHIPMENT_REFUSED_MALFORMED`]: a different head value at a position the holder already holds.
+const SHIPMENT_REFUSED_CONFLICTING: &str = "fleet.mirror.shipment_refused.conflicting_position";
+/// See [`SHIPMENT_REFUSED_MALFORMED`]: a different catalog value at a version the holder already holds.
+const SHIPMENT_REFUSED_CONFLICTING_CATALOG: &str =
+  "fleet.mirror.shipment_refused.conflicting_catalog";
+
+/// Owner counters: shipments sent to mirror holders, holders that acknowledged them in the round, and rounds that found
+/// no free session to any owed holder.
+const SHIPMENTS_SENT: &str = "fleet.mirror.shipments_sent";
+/// See [`SHIPMENTS_SENT`].
+const SHIPMENTS_ACKED: &str = "fleet.mirror.records_acked";
+/// See [`SHIPMENTS_SENT`].
+const SHIP_NO_SESSION: &str = "fleet.mirror.ship_no_session";
+
 /// The status count of mirror shipments a holder accepted but did not acknowledge because the publish carrying them
 /// was refused. Format: a refusal name in the daemon's status report.
 const SHIPMENT_UNPUBLISHED: &str = "fleet.mirror.shipment_unpublished";
@@ -56,6 +84,7 @@ pub(crate) fn serve(
 ) -> Vec<u8> {
   let Some((head, catalog)) = decode_shipment(request) else {
     state.count(SHIPMENT_REFUSED, 1);
+    state.count(SHIPMENT_REFUSED_MALFORMED, 1);
     return Vec::new();
   };
   let own = state
@@ -63,27 +92,62 @@ pub(crate) fn serve(
     .get(&local)
     .copied()
     .unwrap_or(slates_db::register::RegionId(0));
-  let admitted = head.owner == peer
-    && catalog.owner == peer
-    && catalog.object == head.object.catalog()
-    && slates_db::mirror::admits_mirror_put(
-      state.root.configuration(),
-      &state.region_mirrors,
-      &state.node_regions,
-      own,
-      peer,
-      head.object,
-    )
-    .is_ok();
-  if !admitted {
+  // Each refusal is counted with its reason as well as in the total: the records not the sender's own, the mirror rule
+  // (`admits_mirror_put`, by its refusal), or a record older than one held.
+  let reason =
+    if head.owner != peer || catalog.owner != peer || catalog.object != head.object.catalog() {
+      Some(SHIPMENT_REFUSED_NOT_OWN)
+    } else {
+      match slates_db::mirror::admits_mirror_put(
+        state.root.configuration(),
+        &state.region_mirrors,
+        &state.node_regions,
+        own,
+        peer,
+        head.object,
+      ) {
+        Ok(()) => None,
+        Err(slates_db::mirror::MirrorRefusal::HomePromoted { .. }) => {
+          Some(SHIPMENT_REFUSED_HOME_PROMOTED)
+        }
+        Err(slates_db::mirror::MirrorRefusal::NotItsMirror { .. }) => {
+          Some(SHIPMENT_REFUSED_NOT_ITS_MIRROR)
+        }
+        Err(slates_db::mirror::MirrorRefusal::SenderOutsideHome { .. }) => {
+          Some(SHIPMENT_REFUSED_SENDER_OUTSIDE)
+        }
+      }
+    };
+  if let Some(reason) = reason {
     state.count(SHIPMENT_REFUSED, 1);
+    state.count(reason, 1);
     return Vec::new();
   }
   let (object, sequence) = (head.object, head.sequence);
-  let accepted =
-    state.mirror_records.accept(catalog).is_ok() && state.mirror_records.accept(head).is_ok();
-  if !accepted {
+  let accepted = state
+    .mirror_records
+    .accept(catalog)
+    .map_err(|refusal| (refusal, "catalog"))
+    .and_then(|_| {
+      state
+        .mirror_records
+        .accept(head)
+        .map_err(|refusal| (refusal, "head"))
+    });
+  if let Err((refusal, record)) = accepted {
     state.count(SHIPMENT_REFUSED, 1);
+    state.count(
+      match (refusal, record) {
+        (slates_db::mirror::MirrorRecordRefusal::Stale { .. }, _) => SHIPMENT_REFUSED_OLDER,
+        (slates_db::mirror::MirrorRecordRefusal::ConflictingPosition, "catalog") => {
+          SHIPMENT_REFUSED_CONFLICTING_CATALOG
+        }
+        (slates_db::mirror::MirrorRecordRefusal::ConflictingPosition, _) => {
+          SHIPMENT_REFUSED_CONFLICTING
+        }
+      },
+      1,
+    );
     return Vec::new();
   }
   if crate::verbs::publish_shard(state).is_err() {
@@ -112,6 +176,8 @@ struct Owed {
   sequence: u64,
   shipment: Vec<u8>,
   targets: Vec<HostId>,
+  /// Built this period (to be kept on the job), rather than resent from it.
+  fresh: bool,
 }
 
 /// The shipments this owner shard owes: every mirror job whose content `f + 1` mirror holders hold, to those of them
@@ -134,6 +200,17 @@ fn owed(state: &ShardState, local: HostId, quorum: Quorum) -> Vec<Owed> {
       .filter(|host| !job.records_acked.contains(host))
       .collect();
     if targets.is_empty() {
+      continue;
+    }
+    // Built once, then resent unchanged ([`crate::head::SealJob::shipment`]).
+    if let Some(shipment) = &job.shipment {
+      owed.push(Owed {
+        object: *object,
+        sequence: job.sequence,
+        shipment: shipment.clone(),
+        targets,
+        fresh: false,
+      });
       continue;
     }
     let id = DbVolumeId { bytes: object.0 };
@@ -178,6 +255,7 @@ fn owed(state: &ShardState, local: HostId, quorum: Quorum) -> Vec<Owed> {
       sequence: job.sequence,
       shipment: shipment.to_bytes(),
       targets,
+      fresh: true,
     });
   }
   owed
@@ -196,7 +274,18 @@ pub(crate) async fn ship(
   let owed = crate::xshard::call_within(
     origin,
     shard,
-    move |s| owed(s, local, s.fleet.configuration().quorum),
+    move |s| {
+      let owed = owed(s, local, s.fleet.configuration().quorum);
+      // A shipment built this period is kept on its job and resent unchanged from now on.
+      for item in owed.iter().filter(|item| item.fresh) {
+        if let Some(job) = s.mirror_seals.get_mut(&item.object)
+          && job.sequence == item.sequence
+        {
+          job.shipment = Some(item.shipment.clone());
+        }
+      }
+      owed
+    },
     crate::daemon::HEARTBEAT_NS,
   )
   .await
@@ -206,9 +295,16 @@ pub(crate) async fn ship(
       item.targets.contains(&host)
     });
     if sessions.is_empty() {
+      let _ = state::with_state_counted(|s| s.count(SHIP_NO_SESSION, 1));
       continue;
     }
     let sent: Vec<HostId> = sessions.iter().map(|(host, _)| *host).collect();
+    let _ = state::with_state_counted(|s| {
+      s.count(
+        SHIPMENTS_SENT,
+        u64::try_from(sent.len()).unwrap_or(u64::MAX),
+      );
+    });
     let outgoing: Vec<(HostId, Vec<u8>, Endpoint)> = sessions
       .into_iter()
       .map(|(host, endpoint)| (host, item.shipment.clone(), endpoint))
@@ -232,6 +328,12 @@ pub(crate) async fn ship(
       LateReplies::Discard,
     ));
     return_sessions(recovered);
+    let _ = state::with_state_counted(|s| {
+      s.count(
+        SHIPMENTS_ACKED,
+        u64::try_from(acked.len()).unwrap_or(u64::MAX),
+      );
+    });
     if acked.is_empty() {
       continue;
     }

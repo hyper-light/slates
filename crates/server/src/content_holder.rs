@@ -87,6 +87,7 @@ pub(crate) fn serve(
       .copied()
       .unwrap_or(RegionId(0)),
   };
+  let unauthorized_before = state.held_content.unauthorized();
   let (reply, held) = state.held_content.serve(
     &mut hold_space(&mut state.store),
     local,
@@ -96,6 +97,24 @@ pub(crate) fn serve(
       crate::content_retention::admits(records, local, object, sequence, manifest)
     },
   );
+  // A request the access rule refused is counted (the hold answers it with the same empty reply as anything unheld,
+  // so without the count a refused placement, a mirror's among them, was invisible).
+  let refused = state
+    .held_content
+    .unauthorized()
+    .saturating_sub(unauthorized_before);
+  if refused > 0 {
+    let count = state.refusals.entry(CONTENT_UNAUTHORIZED).or_insert(0);
+    *count = count.saturating_add(refused);
+  } else {
+    let kind = if reply.is_empty() {
+      CONTENT_ANSWERED_EMPTY
+    } else {
+      CONTENT_ANSWERED
+    };
+    let count = state.refusals.entry(kind).or_insert(0);
+    *count = count.saturating_add(1);
+  }
   let Some(object) = held else {
     return reply;
   };
@@ -111,6 +130,18 @@ pub(crate) fn serve(
   }
   reply
 }
+
+/// The status count of content requests this holder's access rule refused (a placement from a peer that may not
+/// place the object here, a read of an object the peer may not read).
+pub(crate) const CONTENT_UNAUTHORIZED: &str = "fleet.content.unauthorized";
+
+/// The status count of content requests this holder answered (an offer's missing set or acknowledgement, a chunk's
+/// progress, a fetch's archive or piece).
+pub(crate) const CONTENT_ANSWERED: &str = "fleet.content.answered";
+
+/// The status count of content requests the access rule allowed but this holder answered empty: malformed,
+/// unverifiable, past its capacity, refused by its retention rule, unstaged or unheld.
+pub(crate) const CONTENT_ANSWERED_EMPTY: &str = "fleet.content.answered_empty";
 
 /// The status count under which a holder records a put it held but could not publish into its shard's
 /// recovery image, and so did not acknowledge (AUD-29-59).

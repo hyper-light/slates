@@ -3045,6 +3045,7 @@ fn init_shard(
     mirror_rounds: std::collections::BTreeMap::new(),
     mirror_seeded: std::collections::BTreeSet::new(),
     put_latency: crate::fleet::LatencyWindow::default(),
+    mirror_put_latency: crate::fleet::LatencyWindow::default(),
     fetch_latency: crate::fleet::LatencyWindow::default(),
     put_outcomes: crate::fleet::PutOutcomes::default(),
     healer: crate::fleet::HealerCursor::default(),

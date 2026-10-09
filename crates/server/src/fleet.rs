@@ -2191,6 +2191,20 @@ fn advance_mirror_seals(
 ) -> Vec<ContentWork> {
   state.mirror_neighbourhood = mirror_neighbourhood_of(state, local);
   if state.mirror_neighbourhood.is_empty() {
+    // A mirror declared for this node's region with no live, authenticated member of it to ship to is counted: it is
+    // the one way a declared mirror ships nothing without a refusal anywhere.
+    let own = state
+      .node_regions
+      .get(&local)
+      .copied()
+      .unwrap_or(RegionId(0));
+    if state
+      .region_mirrors
+      .get(&own)
+      .is_some_and(|mirror| *mirror != own)
+    {
+      state.count(MIRROR_NO_NEIGHBOURHOOD, 1);
+    }
     state.mirror_seals.clear();
     return Vec::new();
   }
@@ -2211,15 +2225,17 @@ fn advance_mirror_seals(
     {
       state.mirror_seals.remove(&object);
     }
-    if !state.mirror_seals.contains_key(&object)
-      && !start_mirror_seal(state, object, handle, head, created_unix)
-    {
-      continue;
+    if !state.mirror_seals.contains_key(&object) {
+      if !start_mirror_seal(state, object, handle, head, created_unix) {
+        continue;
+      }
+      state.count(MIRROR_JOB_STARTED, 1);
     }
     if !advance_seal(state, Track::Mirror, object, handle, slice_bytes) {
       continue;
     }
     if let Some(item) = content_work(state, Track::Mirror, object, quorum, round) {
+      state.count(MIRROR_CONTENT_ROUNDS, 1);
       work.push(item);
     }
   }
@@ -2283,6 +2299,7 @@ fn start_mirror_seal(
       first_round_at_ns: None,
       healing: false,
       records_acked: Vec::new(),
+      shipment: None,
     },
   );
   true
@@ -2336,6 +2353,28 @@ fn record_mirrored_seals(state: &mut ShardState) {
     state.mirror_seals.remove(&object);
   }
 }
+
+/// Counter: periods in which this node's region declares a mirror but no live, authenticated member of the mirror
+/// region was found to ship to (`advance_mirror_seals`).
+const MIRROR_NO_NEIGHBOURHOOD: &str = "fleet.mirror.no_neighbourhood";
+
+/// Counter: home content rounds that found no free session to any of their targets (`put_seal_content`).
+const SEAL_NO_HOLDER_SESSION: &str = "fleet.seal.no_holder_session";
+
+/// Counter: mirror content rounds that found no free session to any of their targets (`put_seal_content`).
+const MIRROR_NO_HOLDER_SESSION: &str = "fleet.mirror.no_holder_session";
+
+/// Counter: content acknowledgements mirror holders returned within their rounds (`put_seal_content`).
+const MIRROR_ACKS: &str = "fleet.mirror.acks";
+
+/// Counter: mirror content rounds that failed outright (neither placed, uncertain nor short of the quorum).
+const MIRROR_ROUND_FAILED: &str = "fleet.mirror.round_failed";
+
+/// Counter: mirror shipments started (a snapshot placed at home, its archive walk begun for the mirror region).
+const MIRROR_JOB_STARTED: &str = "fleet.mirror.job_started";
+
+/// Counter: content rounds sent to the mirror neighbourhood (a mirror shipment's archive complete and put).
+const MIRROR_CONTENT_ROUNDS: &str = "fleet.mirror.content_rounds";
 
 /// The status count of mirror placements the database refused to record (the snapshot destroyed meanwhile, or the
 /// partition refusing): the shipment is dropped and the next period starts it again if the snapshot still stands.
@@ -2565,6 +2604,7 @@ fn start_seal(
       first_round_at_ns: None,
       healing,
       records_acked: Vec::new(),
+      shipment: None,
     },
   );
   true
@@ -2777,7 +2817,11 @@ fn hedge_delay_ns(latency: &LatencyWindow) -> u64 {
 /// expires there and is hedged); the stall window = the hedge delay itself (an acknowledgement within one
 /// delay is progress); poll = the collection cadence ([`POLL_PER_PERIOD`]).
 fn content_budget(latency: &LatencyWindow, round: CommitBudget) -> CommitBudget {
-  let hedge_delay = hedge_delay_ns(latency);
+  content_budget_at(hedge_delay_ns(latency), round)
+}
+
+/// [`content_budget`] at a given hedge delay (a mirror round's, floored at its path).
+fn content_budget_at(hedge_delay: u64, round: CommitBudget) -> CommitBudget {
   let span = round.max_deadline_ns().max(hedge_delay);
   CommitBudget::with_extension(
     hedge_delay,
@@ -2812,8 +2856,33 @@ fn content_work(
   quorum: Quorum,
   round: CommitBudget,
 ) -> Option<ContentWork> {
-  let hedge_delay = hedge_delay_ns(&state.put_latency);
-  let budget = content_budget(&state.put_latency, round);
+  // Each track is hedged and judged stalled from its own measured puts, and a mirror round never sooner than the
+  // slowest measured round-trip tail to its candidates: until 2026-10-09 both tracks used the home window, whose p95
+  // on a local network is far inside a round trip to another region, so every mirror round was judged stalled at its
+  // offer and the mirror never placed (350 rounds, 0 acknowledgements, on a 200 ms path).
+  let (hedge_delay, budget) = match track {
+    Track::Home => (
+      hedge_delay_ns(&state.put_latency),
+      content_budget(&state.put_latency, round),
+    ),
+    Track::Mirror => {
+      let floor = state
+        .mirror_seals
+        .get(&object)
+        .map(|job| {
+          job
+            .content
+            .candidates
+            .iter()
+            .filter_map(|host| state.peer_paths.get(host).and_then(PathRtt::tail_ns))
+            .max()
+            .unwrap_or(0)
+        })
+        .unwrap_or(0);
+      let hedge = hedge_delay_ns(&state.mirror_put_latency).max(floor);
+      (hedge, content_budget_at(hedge, round))
+    }
+  };
   let now = state.clock.monotonic_ns();
   let shard = state.shard;
   let job = seal_jobs(state, track).get_mut(&object)?;
@@ -2889,6 +2958,13 @@ async fn put_seal_content(origin: u16, local: HostId, work: ContentWork) -> Opti
   let dispatched_ns = futures::now_ns();
   let manifest = work.archive.manifest_identity();
   let (placement, latencies_ns, refilled, dispatch) = if holders.is_empty() {
+    // No session to any target was free (none held, or every one lent): the round sends nothing, counted per track, so
+    // a placement that never progresses names why.
+    let counter = match work.track {
+      Track::Home => SEAL_NO_HOLDER_SESSION,
+      Track::Mirror => MIRROR_NO_HOLDER_SESSION,
+    };
+    let _ = state::with_state_counted(|s| s.count(counter, 1));
     (None, Vec::new(), Vec::new(), None)
   } else {
     let taken: Vec<HostId> = holders.iter().map(|(host, _)| *host).collect();
@@ -2920,6 +2996,19 @@ async fn put_seal_content(origin: u16, local: HostId, work: ContentWork) -> Opti
       },
     );
     return_sessions(placed.reusable);
+    if work.track == Track::Mirror {
+      let acks = u64::try_from(placed.latencies_ns.len()).unwrap_or(u64::MAX);
+      let failed = matches!(
+        placed.outcome,
+        Err(ref error) if !matches!(error, ClusterError::Uncertain { .. } | ClusterError::NotPlaced { .. })
+      );
+      let _ = state::with_state_counted(|s| {
+        s.count(MIRROR_ACKS, acks);
+        if failed {
+          s.count(MIRROR_ROUND_FAILED, 1);
+        }
+      });
+    }
     let placement = match placed.outcome {
       Ok(placement) => Some(placement),
       Err(ClusterError::Uncertain { placement } | ClusterError::NotPlaced { placement }) => {
@@ -2949,7 +3038,10 @@ async fn put_seal_content(origin: u16, local: HostId, work: ContentWork) -> Opti
   } = work;
   crate::xshard::run_on_counted(origin, shard, move |s| {
     for (_, latency_ns) in &latencies_ns {
-      s.put_latency.record(*latency_ns);
+      match track {
+        Track::Home => s.put_latency.record(*latency_ns),
+        Track::Mirror => s.mirror_put_latency.record(*latency_ns),
+      }
     }
     // The job is borrowed alone; what the round counts is written after the borrow ends.
     let Some(job) = seal_jobs(s, track).get_mut(&object) else {
@@ -4464,7 +4556,10 @@ fn fold_late_content(late: LateReplies, replies: &[(HostId, TimedReply)]) {
   let origin = state::with_state(|s| s.shard).unwrap_or_default();
   crate::xshard::run_on_counted(origin, shard, move |s| {
     for holder in &acked {
-      s.put_latency.record(latency_ns);
+      match track {
+        Track::Home => s.put_latency.record(latency_ns),
+        Track::Mirror => s.mirror_put_latency.record(latency_ns),
+      }
       if let Some(job) = seal_jobs(s, track).get_mut(&object)
         && job.snapshot == snapshot
         && job.content.candidates.contains(holder)

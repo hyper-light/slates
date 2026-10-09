@@ -774,6 +774,10 @@ pub struct ShardState {
   /// first content acknowledgement, and on a laptop, where no content round runs — the trigger is then
   /// one period (R8, the same code with an empty window).
   pub put_latency: crate::fleet::LatencyWindow,
+  /// The measured put latency of content rounds to the mirror region (`fleet::content_work`'s mirror track): kept
+  /// apart from [`Self::put_latency`], because a home round's p95 on a local network is far inside one round trip to
+  /// another region, and a mirror round hedged and judged stalled at it never got past its offer.
+  pub mirror_put_latency: crate::fleet::LatencyWindow,
   /// The measured fetch latency of the content class on this shard (A-91): each chunk's time from its first
   /// request to its verified arrival, whose p95 is the hedge trigger for a fetch's chunks. Empty until the first
   /// fetch, and on a laptop, where none runs — the trigger is then one period (R8).
