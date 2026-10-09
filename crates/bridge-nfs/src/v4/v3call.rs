@@ -196,7 +196,7 @@ pub fn read_args(fh: &Nfsfh3, offset: u64, count: u32) -> Vec<u8> {
 }
 
 /// A READ result: whether the end was reached and the bytes, or the status.
-pub fn read(result: &[u8]) -> Result<Result<(bool, Vec<u8>), Nfsstat3>, Malformed> {
+pub fn read(result: &[u8]) -> Result<Result<(bool, &[u8]), Nfsstat3>, Malformed> {
   let mut reader = XdrReader::new(result);
   let status = status(&mut reader)?;
   post_op(&mut reader)?;
@@ -204,7 +204,8 @@ pub fn read(result: &[u8]) -> Result<Result<(bool, Vec<u8>), Nfsstat3>, Malforme
     Nfsstat3::Ok => {
       let _count = reader.u32().map_err(|_| Malformed)?;
       let eof = reader.bool().map_err(|_| Malformed)?;
-      let data = reader.opaque(MAX_DATA).map_err(|_| Malformed)?.to_vec();
+      // The data is lent from the result, never copied out: the caller encodes it once into its reply.
+      let data = reader.opaque(MAX_DATA).map_err(|_| Malformed)?;
       Ok(Ok((eof, data)))
     }
     other => Ok(Err(other)),
@@ -237,9 +238,24 @@ pub fn seek(result: &[u8]) -> Result<Result<(bool, u64, u64), Nfsstat3>, Malform
 /// A v3 result: the procedure's value or its status, or `Malformed` if the reply did not decode.
 pub type Reply<T> = Result<Result<T, Nfsstat3>, Malformed>;
 
+/// Format: a WRITE's arguments besides its data: the handle (a length word and at most `NFS3_FHSIZE`, 64 bytes, as
+/// RFC 1813 bounds it; this server's are smaller), the offset (8), the count (4), the stability (4), the data's length
+/// word (4) and its padding (at most 3).
+const WRITE_ARGS_FIXED_BYTES: usize = 4 + 64 + 8 + 4 + 4 + 4 + 3;
+
+/// Format: what `compound::state_io` appends to a state-carrying call's arguments: the client id (8) and the state id
+/// (a 4-byte sequence id and 12 bytes of `other`, RFC 8881 §3.3.12).
+pub const STATE_SUFFIX_BYTES: usize = 8 + 4 + 12;
+
 /// WRITE arguments.
 pub fn write_args(fh: &Nfsfh3, offset: u64, stable: u32, data: &[u8]) -> Vec<u8> {
-  let mut writer = XdrWriter::new();
+  // Sized once for the arguments, the data and the state suffix `state_io` appends, so the payload is copied in once
+  // and never again by a growth (each was a further copy of up to 256 KiB per WRITE, 2026-10-08).
+  let mut writer = XdrWriter::with_capacity(
+    WRITE_ARGS_FIXED_BYTES
+      .saturating_add(data.len())
+      .saturating_add(STATE_SUFFIX_BYTES),
+  );
   fh.encode(&mut writer);
   writer.u64(offset);
   writer.u32(u32::try_from(data.len()).unwrap_or(u32::MAX));

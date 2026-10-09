@@ -1341,10 +1341,10 @@ impl<'b> Export<'b> {
     let offset = args.u64().map_err(|_| (Nfsstat3::Inval, None))?;
     let _count = args.u32().map_err(|_| (Nfsstat3::Inval, None))?;
     let stable = args.u32().map_err(|_| (Nfsstat3::Inval, None))?;
+    // Lent from the request, never copied: the volume's write copies it once, into the arena.
     let data = args
       .opaque(usize::try_from(MAX_TRANSFER).unwrap_or(0))
-      .map_err(|_| (Nfsstat3::Inval, None))?
-      .to_vec();
+      .map_err(|_| (Nfsstat3::Inval, None))?;
     let identity = self.resolve_handle(&handle).map_err(|s| (s, None))?;
     let node = self.attrs_of(&identity).map_err(|s| (s, None))?;
     // POSIX: writing a file's bytes needs write permission (the owner writes its own file whatever the
@@ -1357,7 +1357,7 @@ impl<'b> Export<'b> {
     let object = ObjectId::new(identity.inode, identity.generation);
     let written = self
       .bridge
-      .write(object, &cx, offset, &data)
+      .write(object, &cx, offset, data)
       .map_err(|e| (nfsstat_of(&e), None))?;
     // POSIX `write(2)`: a write by a caller other than the superuser clears the file's set-user-id and
     // set-group-id bits, so a privileged binary cannot be altered and keep its privilege.

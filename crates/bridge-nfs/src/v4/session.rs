@@ -584,10 +584,12 @@ impl Sessions {
     })
   }
 
-  /// Ends the new request on `slot` of `sessionid`, keeping its reply for its retries when it fits the
-  /// session's negotiated cache size. A reply that does not fit is not kept; its retry is then refused
-  /// `NFS4ERR_RETRY_UNCACHED_REP`, which a client handles by resending as new.
-  pub fn store_reply(&mut self, sessionid: &SessionId, slotid: u32, reply: &[u8]) {
+  /// Ends the new request on `slot` of `sessionid`, keeping its reply for its retries when the client asked for it
+  /// (`sa_cachethis`, `cache`) and it fits the session's negotiated cache size. A reply not kept has its retry refused
+  /// `NFS4ERR_RETRY_UNCACHED_REP`, which a client handles by resending as new (RFC 8881 §2.10.6.1.3: the client asks
+  /// for the cache per request; Linux asks for it on the operations that change state, never on a READ or a WRITE, so
+  /// a full transfer's reply is not copied into the cache on every READ).
+  pub fn store_reply(&mut self, sessionid: &SessionId, slotid: u32, reply: &[u8], cache: bool) {
     let Some(session) = self.sessions.get_mut(sessionid) else {
       return;
     };
@@ -597,7 +599,7 @@ impl Sessions {
       .and_then(|slot| session.slots.get_mut(slot))
     {
       slot.in_flight = false;
-      if fits {
+      if fits && cache {
         slot.reply = Some(reply.to_vec());
       }
     }

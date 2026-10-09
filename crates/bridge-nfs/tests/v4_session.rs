@@ -119,7 +119,7 @@ fn a_slot_runs_each_request_once_and_answers_its_retry_from_the_cache() {
     ),
     "a new request"
   );
-  sessions.store_reply(&sessionid, 0, b"reply one");
+  sessions.store_reply(&sessionid, 0, b"reply one", true);
   assert_eq!(
     sessions.sequence(&seq(sessionid, 0, 1), 2).unwrap(),
     Sequenced::Replay(b"reply one".to_vec()),
@@ -150,11 +150,30 @@ fn a_reply_past_the_cache_size_is_not_kept() {
   let mut sessions = Sessions::new(7, limits());
   let (_, sessionid) = session(&mut sessions, "host-a");
   sessions.sequence(&seq(sessionid, 1, 1), 1).unwrap();
-  sessions.store_reply(&sessionid, 1, &vec![0u8; 8192]);
+  sessions.store_reply(&sessionid, 1, &vec![0u8; 8192], true);
   assert_eq!(
     sessions.sequence(&seq(sessionid, 1, 1), 2),
     Err(Nfsstat4::RetryUncachedRep)
   );
+}
+
+/// §2.10.6.1.3: do end a request whose SEQUENCE did not ask for its reply to be kept (`sa_cachethis` false, as Linux
+/// sends a READ or a WRITE) and retry it; expect `RETRY_UNCACHED_REP`, the client then resending it as new, and the next
+/// request on the slot served as new. The full transfer a READ's reply carries is no longer copied into the cache.
+#[test]
+fn a_reply_the_client_did_not_ask_to_keep_is_not_kept() {
+  let mut sessions = Sessions::new(7, limits());
+  let (_, sessionid) = session(&mut sessions, "host-a");
+  sessions.sequence(&seq(sessionid, 3, 1), 1).unwrap();
+  sessions.store_reply(&sessionid, 3, b"a read's reply", false);
+  assert_eq!(
+    sessions.sequence(&seq(sessionid, 3, 1), 2),
+    Err(Nfsstat4::RetryUncachedRep)
+  );
+  assert!(matches!(
+    sessions.sequence(&seq(sessionid, 3, 2), 3).unwrap(),
+    Sequenced::New { .. }
+  ));
 }
 
 /// §2.10.6.1: do retry a request while it is still being served (its reply not yet stored); expect
@@ -169,7 +188,7 @@ fn a_retry_of_a_request_still_being_served_is_delayed() {
     Err(Nfsstat4::Delay),
     "the original is still in flight"
   );
-  sessions.store_reply(&sessionid, 2, b"done");
+  sessions.store_reply(&sessionid, 2, b"done", true);
   assert_eq!(
     sessions.sequence(&seq(sessionid, 2, 1), 3).unwrap(),
     Sequenced::Replay(b"done".to_vec())
@@ -292,7 +311,7 @@ fn a_departed_session_keeps_its_reply_cache_and_its_home_remembers_it() {
     home.sequence(&seq(sessionid, 0, 1), 1).unwrap(),
     Sequenced::New { .. }
   ));
-  home.store_reply(&sessionid, 0, b"reply one");
+  home.store_reply(&sessionid, 0, b"reply one", true);
   let departed = home
     .depart(&sessionid, GUEST_SHARD)
     .expect("an idle session departs");
@@ -326,7 +345,7 @@ fn a_session_with_a_request_in_flight_does_not_depart() {
   ));
   assert!(home.depart(&sessionid, GUEST_SHARD).is_none());
   assert!(home.holds_session(&sessionid) && home.away(&sessionid).is_none());
-  home.store_reply(&sessionid, 1, b"done");
+  home.store_reply(&sessionid, 1, b"done", true);
   assert!(home.depart(&sessionid, GUEST_SHARD).is_some());
 }
 
@@ -352,7 +371,7 @@ fn a_guest_asks_for_a_renewal_note_at_most_twice_a_lease_and_keeps_its_client_al
       notes += 1;
       home.renew(clientid, now);
     }
-    guest.store_reply(&sessionid, 0, b"r");
+    guest.store_reply(&sessionid, 0, b"r", true);
   }
   assert!(
     notes <= 3 * RENEWALS_PER_LEASE,

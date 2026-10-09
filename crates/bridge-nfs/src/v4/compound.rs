@@ -514,9 +514,12 @@ pub async fn serve<B: Backend>(backend: &mut B, args: &[u8], request_bytes: usiz
   if let Some((sessionid, slotid)) = slot {
     // A reply that cannot be kept for a retry is not sent as if it had been: the client is told the
     // server failed rather than promised exactly-once (RFC 8881 §2.10.6.1).
-    if let Err(status) =
-      backend.with_v4(|server| server.sessions.store_reply(&sessionid, slotid, &encoded))
-    {
+    let cache = limits.is_some_and(|limits| limits.max_cached.is_some());
+    if let Err(status) = backend.with_v4(|server| {
+      server
+        .sessions
+        .store_reply(&sessionid, slotid, &encoded, cache)
+    }) {
       return reply(status, &tag, 0, &[]);
     }
   }
@@ -1317,8 +1320,8 @@ pub(super) async fn state_io<B: Backend>(
   mut v3_args: Vec<u8>,
   clientid: Option<u64>,
   stateid: &Stateid,
-) -> Result<Vec<u8>, Nfsstat4> {
-  let mut suffix = XdrWriter::new();
+) -> Result<StateReply, Nfsstat4> {
+  let mut suffix = XdrWriter::with_capacity(v3call::STATE_SUFFIX_BYTES);
   suffix.u64(clientid.unwrap_or(0));
   stateid.encode(&mut suffix);
   v3_args.extend_from_slice(suffix.as_slice());
@@ -1326,11 +1329,30 @@ pub(super) async fn state_io<B: Backend>(
   let mut reader = XdrReader::new(&result);
   let status = reader.u32().map_err(|_| Nfsstat4::Serverfault)?;
   match Nfsstat4::from_wire(status) {
-    Some(Nfsstat4::Ok) => Ok(reader.rest().to_vec()),
+    Some(Nfsstat4::Ok) => Ok(StateReply { bytes: result }),
     Some(refused) => Err(refused),
     None => Err(Nfsstat4::Serverfault),
   }
 }
+
+/// The owner's reply to a state-carrying call, kept whole: its body (the v3 result) is lent past the state status
+/// word, so a READ's data is never copied out of it before it is encoded into the compound's reply.
+pub(super) struct StateReply {
+  bytes: Vec<u8>,
+}
+
+impl StateReply {
+  /// The v3 result, past the state status word.
+  pub(super) fn body(&self) -> &[u8] {
+    self.bytes.get(STATE_STATUS_BYTES..).unwrap_or_default()
+  }
+}
+
+/// Format: the state status word an owner's state-carrying reply begins with.
+const STATE_STATUS_BYTES: usize = 4;
+
+/// Format: a READ4resok besides its data: the eof word (4), the data's length word (4) and its padding (at most 3).
+const READ_BODY_FIXED_BYTES: usize = 4 + 4 + 3;
 
 /// A state id's encoding, as an owner call's extra arguments.
 fn stateid_bytes(stateid: &Stateid) -> Vec<u8> {
@@ -1701,10 +1723,11 @@ async fn read<B: Backend>(backend: &mut B, reader: &mut XdrReader<'_>, frame: &F
     &stateid,
   )
   .await?;
-  let (eof, data) = v3(v3call::read(&result))?;
-  let mut body = XdrWriter::new();
+  let (eof, data) = v3(v3call::read(result.body()))?;
+  // The eof word, the data's length word, the data and its padding: sized once.
+  let mut body = XdrWriter::with_capacity(data.len().saturating_add(READ_BODY_FIXED_BYTES));
   body.bool(eof);
-  body.opaque(&data);
+  body.opaque(data);
   Ok(body.into_bytes())
 }
 
@@ -1725,7 +1748,7 @@ async fn write<B: Backend>(backend: &mut B, reader: &mut XdrReader<'_>, frame: &
     &stateid,
   )
   .await?;
-  let (count, committed, verifier) = v3(v3call::write(&result))?;
+  let (count, committed, verifier) = v3(v3call::write(result.body()))?;
   let mut body = XdrWriter::new();
   body.u32(count);
   body.u32(committed);
@@ -2423,7 +2446,7 @@ async fn setattr<B: Backend>(
     &stateid,
   )
   .await?;
-  let (status, _) = v3call::wcc_status(&result).map_err(|_| Nfsstat4::Serverfault)?;
+  let (status, _) = v3call::wcc_status(result.body()).map_err(|_| Nfsstat4::Serverfault)?;
   if status != Nfsstat3::Ok {
     return Err(Nfsstat4::of_v3(status));
   }

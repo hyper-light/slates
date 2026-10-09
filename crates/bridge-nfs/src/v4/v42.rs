@@ -205,13 +205,13 @@ async fn next_content<B: Backend>(
     stateid,
   )
   .await?;
-  let (_, data) = v3(v3call::read(&result))?;
+  let (_, data) = v3(v3call::read(result.body()))?;
   if data.is_empty() {
     return Ok(false);
   }
   contents.writer.u32(seek_what::DATA);
   contents.writer.u64(at);
-  contents.writer.opaque(&data);
+  contents.writer.opaque(data);
   contents.entries = contents.entries.saturating_add(1);
   contents.at = at.saturating_add(u64::try_from(data.len()).unwrap_or(u64::MAX));
   Ok(true)
@@ -353,19 +353,19 @@ async fn copy_piece<B: Backend>(
     source_stateid,
   )
   .await?;
-  let (_, data) = v3(v3call::read(&result))?;
+  let (_, data) = v3(v3call::read(result.body()))?;
   if data.is_empty() {
     return Ok((0, [0u8; v3call::VERF_SIZE]));
   }
   let result = state_io(
     backend,
     extension::WRITE_STATE,
-    v3call::write_args(destination, destination_offset, UNSTABLE4, &data),
+    v3call::write_args(destination, destination_offset, UNSTABLE4, data),
     clientid,
     destination_stateid,
   )
   .await?;
-  let (written, _, verifier) = v3(v3call::write(&result))?;
+  let (written, _, verifier) = v3(v3call::write(result.body()))?;
   Ok((written, verifier))
 }
 

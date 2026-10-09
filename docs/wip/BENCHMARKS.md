@@ -3503,6 +3503,39 @@ the client: a write without a delegation carries a GETATTR that keeps them fresh
 
 Rejected as dead even on this client; the patch is kept in the session scratchpad.
 
+### Payload copies out of the NFSv4 READ and WRITE paths (condition 12; 2026-10-08)
+
+**Found by profiling and counting.** In the daemon's large-write profile `memcpy` was about 24% of self time. A
+counting allocator around `serve_compound` (`cargo run --release -p slates-bridge-nfs --example v4_io_bench`, new: a
+session, one file, 2,000 compounds of 256 KiB each per round, five rounds; `V4_IO_TRACE=1` prints the call stack of
+every allocation of 200 KB or more) found the full payload copied into a fresh buffer 5 times per WRITE and 9 times per
+READ before the change:
+- WRITE: `write_args` grown by doubling, again when `state_io` appended its 24-byte suffix to an exactly sized vector,
+  and `Export::write_as` copying the decoded data into a `Vec` before the volume's write copied it into the arena.
+- READ: `state_io` copying the reply body out, `v3call::read` copying the data out, the v4 body grown by doubling, and
+  the session's reply cache keeping every reply, though RFC 8881 §2.10.6.1.3 has the client ask per request
+  (`sa_cachethis`) and Linux asks only for state-changing operations, never a READ or a WRITE.
+
+**The fix.** `write_args` sized once with the suffix's room; the decoded data lent to the volume's write; `state_io`'s
+reply kept whole with its body lent past the status word; the read data lent from it; the READ body sized once; and a
+reply kept only when its SEQUENCE asked (a retry of one that did not is `NFS4ERR_RETRY_UNCACHED_REP`, which a client
+answers by resending).
+
+**Measured** (macOS aarch64, A = `1e461047`, B = the fix, built in separate target directories, interleaved, load
+16–37):
+
+| Per 256 KiB operation | A | B |
+|---|---|---|
+| WRITE, bytes the server allocates | 1,314,026 | 526,970 (−60%) |
+| READ, bytes the server allocates | 2,361,554 | 1,574,869 (−33%) |
+| WRITE, median of 8 best-of-5 runs | 56.1 µs | 54.5 µs (even) |
+| READ, median of 8 best-of-5 runs | 61.0 µs | 41.1 µs (−33%) |
+
+- Through Linux's NFS client (`docs/wip/bench/nfs/large_io.sh 3`, the new byte comparison): every 512 MiB file read
+  back identical. Throughput there moved within the shared machine's noise (load 25–57).
+- Still copied per READ: the volume's read out of the arena, the v3 reply's encoding, the state wrapper, the v4 body,
+  the compound's assembly and the record framing; per WRITE, the v3 re-encoding itself. Each is a further step.
+
 ### A write's retention estimate and window lookup by binary search (condition 12; 2026-10-08)
 
 **Found by profiling.** `perf record -g` of the daemon during 512 MiB `dd` writes through Linux NFS (release build with
