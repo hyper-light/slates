@@ -4275,3 +4275,17 @@ then each round makes 4,000 random page-aligned 4 KiB writes with an fsync every
 **Measured and rejected: one hull per file.** A transaction's random pages span nearly the whole file, so the hull was
 no better than the whole image: 451 against 390 fsyncs/s. Spans carry only the windows written: 4.2× the commit rate
 at about a fifth of the daemon CPU.
+
+**The same random pattern's fsync latency** (`random.sh` now times every fsync; 2026-10-09):
+- arms base (`acb68d89`) and A-126 (`5fd6d3af`) alternated twice, three rounds each, 500 fsyncs a round;
+- load average 15–16 from other sessions.
+
+| arm | fsync p50 | p99 | p999 | max |
+|---|---|---|---|---|
+| base, the whole file per COMMIT | 2.83–3.23 ms | 3.52–6.22 ms | 5.29–12.94 ms | 12.94 ms |
+| A-126, written windows | 0.48–0.74 ms | 0.75–1.37 ms | 2.81–4.36 ms | 4.36 ms |
+
+A database's commit through the kernel client now waits under 1.4 ms at p99 on a busy machine, against 3.5–6.2 ms
+before. Against Tectonic's published tails (blob writes reaching 150–200 ms; FAST'21, Figure 3), the comparison is of
+what a caller waits for under the pattern, not of the media: slates commits to anchor RAM, Tectonic to disks across a
+datacenter.

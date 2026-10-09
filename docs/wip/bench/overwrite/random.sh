@@ -1,8 +1,8 @@
 #!/bin/bash
 # Random small writes with frequent fsyncs (a database's pattern) through Linux's own NFSv4.2 client against a daemon
 # in the same privileged container: a 512 MiB file is written once, then each round makes WRITES random 4 KiB writes
-# at page-aligned offsets with an fsync every SYNC_EVERY writes; prints the round's time, fsyncs per second and the
-# daemon's CPU seconds (utime + stime from /proc). The mount is removed on every exit path while the daemon runs.
+# at page-aligned offsets with an fsync every SYNC_EVERY writes; prints the round's time, fsyncs per second, each
+# fsync's latency at p50, p99, p999 and max, and the daemon's CPU seconds (utime + stime from /proc). The mount is removed on every exit path while the daemon runs.
 #   head -c 536870912 /dev/urandom > <dir>/payload.bin; cp random.sh <dir>/
 #   docker run --rm --privileged -v <linux slates>:/slates:ro -v <dir>:/bench:ro \
 #     python:3.12-slim-trixie bash /bench/random.sh
@@ -43,14 +43,20 @@ rng = random.Random(int(sys.argv[2]))
 fd = os.open(sys.argv[1], os.O_WRONLY)
 pages = os.fstat(fd).st_size // PAGE
 block = os.urandom(PAGE)
+syncs = []
 t = time.time()
 for n in range(WRITES):
     os.pwrite(fd, block, rng.randrange(pages) * PAGE)
     if (n + 1) % SYNC_EVERY == 0:
+        s = time.perf_counter_ns()
         os.fsync(fd)
+        syncs.append(time.perf_counter_ns() - s)
 os.close(fd)
 d = time.time() - t
-print(f"random {WRITES} x 4 KiB, fsync every {SYNC_EVERY}: {d:.2f} s = {WRITES // SYNC_EVERY / d:.0f} fsyncs/s", end="")
+syncs.sort()
+at = lambda q: syncs[min(len(syncs) - 1, int(q * len(syncs)))] / 1e6
+print(f"random {WRITES} x 4 KiB, fsync every {SYNC_EVERY}: {d:.2f} s = {WRITES // SYNC_EVERY / d:.0f} fsyncs/s; "
+      f"fsync p50 {at(0.5):.2f} p99 {at(0.99):.2f} p999 {at(0.999):.2f} max {syncs[-1] / 1e6:.2f} ms", end="")
 PY
   echo " daemon cpu $(python3 -c "print(round($(cpu "$DAEMON") - $before, 2))") s"
 done
