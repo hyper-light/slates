@@ -973,6 +973,12 @@ fn check_publication(
     "the streamed publication after {step:?}"
   );
   let delta = matches!(publication, slates_vfs::delta::VolumeRecord::Delta { .. });
+  if let slates_vfs::delta::VolumeRecord::Delta { delta } = &publication {
+    PATCHES_TAKEN.fetch_add(
+      u64::try_from(delta.patches.len()).unwrap(),
+      std::sync::atomic::Ordering::Relaxed,
+    );
+  }
   match publication {
     slates_vfs::delta::VolumeRecord::Full { image } => *published = Some(image),
     slates_vfs::delta::VolumeRecord::Delta { delta } => published
@@ -993,8 +999,21 @@ fn check_publication(
 /// The deltas the model runs took (A-68's non-vacuity count).
 static DELTAS_TAKEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// The files the model runs' deltas patched rather than imaged whole (A-126's non-vacuity count).
+static PATCHES_TAKEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Shape: a page small enough that the model's writes, at offsets up to `u16::MAX`, cross many chunk windows (sixteen
+/// 512-byte pages: 8 KiB windows), so a publication's patch of a file's written windows (A-126) is exercised across
+/// windows, not within the first alone.
+const SMALL_PAGE: usize = 512;
+
 fn run(steps: Vec<Step>, quota: u64) {
   run_on(store(), steps.clone(), quota);
+  run_on(
+    common::store_shaped(1 << 16, 4, SMALL_PAGE, SMALL_PAGE),
+    steps.clone(),
+    quota,
+  );
   // The daemon's shape on a large-page host: chunks of sixteen 16 KiB pages, blocks in 4 KiB granules. The charge
   // rule rounds to the granule, never the page.
   run_on(
@@ -1040,6 +1059,41 @@ fn run_on(mut store: Store, steps: Vec<Step>, quota: u64) {
       DELTAS_TAKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
   }
+}
+
+/// A-126 (a written file's delta is its written windows): do write a file across several windows, publish, then
+/// overwrite one window, append past the end, rewrite the open window, truncate and write again, checking every
+/// step's publication against the full image on a store whose windows are 8 KiB. Expect patches taken (the writes to a
+/// chunked body after the first publication) and every publication to agree with the full image, the truncate's among
+/// them imaged whole.
+#[test]
+fn a_written_file_publishes_its_written_windows_and_rebuilds_its_full_image() {
+  let name = |n: &str| n.to_owned();
+  let window = 8 * 1024u16;
+  let bytes = |len: usize, fill: u8| vec![fill; len];
+  let steps = vec![
+    Step::Create(vec![], name("f")),
+    Step::Write(0, 0, bytes(40, 1)),
+    Step::Write(0, window - 20, bytes(40, 2)),
+    Step::Write(0, 3 * window, bytes(40, 3)),
+    Step::Write(0, window + 5, bytes(40, 4)),
+    Step::Write(0, 6 * window - 10, bytes(40, 5)),
+    Step::Write(0, 6 * window, bytes(40, 6)),
+    Step::Truncate(0, 2 * window),
+    Step::Write(0, 4 * window, bytes(40, 7)),
+    Step::Write(0, 10, bytes(40, 8)),
+  ];
+  let before = PATCHES_TAKEN.load(std::sync::atomic::Ordering::Relaxed);
+  run_on(
+    common::store_shaped(1 << 16, 4, SMALL_PAGE, SMALL_PAGE),
+    steps,
+    1 << 20,
+  );
+  let taken = PATCHES_TAKEN.load(std::sync::atomic::Ordering::Relaxed) - before;
+  assert!(
+    taken >= 4,
+    "the written file was patched, not imaged whole ({taken})"
+  );
 }
 
 /// A-68 (incremental publication): do run a fixed history of creates, writes, renames, links, unlinks and removals

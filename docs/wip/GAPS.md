@@ -5217,3 +5217,31 @@ At `f62847d5`:
   test's failure rate from 0 of 8 to 3 of 11 until this fix.
 - The unexplained CI failure of the same test on 2026-09-28 (above) was at its second wait, before the floor existed.
   Whether this mechanism caused it is unproven; renewals were rare then.
+
+### 2026-10-09: every barrier re-imaged every extent of a written file (fixed; A-126; conditions 5 and 12)
+
+- **Found** by profiling the daemon on Linux after `acb68d89`. Publication was about 16% of samples, and the kernel
+  client's 1,781 COMMITs in 18 passes each imaged all 8,192 windows of the 512 MiB file being overwritten. A barrier
+  cost the file's size, so a large file written with periodic commits cost work quadratic in its size.
+- **Fixed** (A-126): a file changed only by writes to its chunked body is published as its written windows
+  (`InodePatch`), spans of whole windows recorded per write. Any other change images it whole, as before.
+- **Proven:**
+  - the model suite checks every publication against the full image, now also on 8 KiB windows the model's writes
+    cross;
+  - a fixed history takes at least four patches and agrees at every step;
+  - two deliberate mutants fail it;
+  - span coalescing is checked against a set over 2,000 cases;
+  - recovery, daemon, seal and NFS mount suites pass;
+  - the server package and the daemon-driving crates: 764 passed and 1 failed, the warm-restart fleet test. Its cause
+    was a detector bug exposed by A-125 and fixed in `e6640dd3` (entry above). The fleet suite then passed 85/85.
+- **Measured** (BENCHMARKS):
+  - sequential overwrite through Linux NFSv4.2: daemon CPU per 3 GiB 3.92 → 2.56 s median, throughput 753 → 1,143
+    MiB/s (12 rounds each);
+  - random 4 KiB writes with an fsync every 8: 390 → 1,645 fsyncs/s median (6 rounds each).
+  - Measured and rejected: one hull per file, 451 fsyncs/s.
+- **Format:** delta version 2.
+- **One unexplained run.** In one container run of the new build, the daemon's pid was gone before the first round,
+  and that round took 26 s. It ran while this machine compiled and ran the vfs suite. It did not recur in the next 16
+  runs of the same build (48 rounds): 3 at load 12–26, and 8 alternated with the base build in a soak at load 14–17
+  whose anchor logs show no restart, no lapsed heartbeat and no OOM. `overwrite/linux.sh` now prints the daemon's pid
+  each round, the anchor's log and the kernel's OOM lines, so a recurrence names its cause. No cause is claimed.

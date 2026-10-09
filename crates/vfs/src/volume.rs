@@ -2134,6 +2134,23 @@ impl Volume {
     bytes: &[u8],
     recorded: Recorded,
   ) -> Result<usize, VfsError> {
+    // The write's own marks of its inode leave it patchable (A-126); the mark ends on every outcome.
+    self.dirty.set_writing(Some(no.0));
+    let written = self.write_marked(store, no, off, charge, bytes, recorded);
+    self.dirty.set_writing(None);
+    written
+  }
+
+  /// [`Volume::write_secured`] while its write is marked.
+  fn write_marked(
+    &mut self,
+    store: &mut Store,
+    no: InodeNo,
+    off: u64,
+    charge: u64,
+    bytes: &[u8],
+    recorded: Recorded,
+  ) -> Result<usize, VfsError> {
     store.make_room(self.quota.growth_needed(self.bytes.total(), charge));
     if !self
       .quota
@@ -5208,6 +5225,10 @@ impl Volume {
       u64::try_from(store.content.chunk_bytes()).unwrap_or(u64::MAX),
     );
     let before = content_by_epoch_within(store, handle, touched);
+    // What a publication may patch (A-126): the windows this write can change, or, for a body that is not chunked,
+    // nothing (the inode is imaged whole).
+    let written_no = store.inodes.get(handle)?.no.0;
+    self.dirty.written(written_no, touched);
     let body = std::mem::replace(&mut store.inodes.get_mut(handle)?.body, Body::None);
     let landed = self.write_body(store, body, off, bytes);
     let inode = store.inodes.get_mut(handle)?;

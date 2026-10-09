@@ -28,8 +28,10 @@ use crate::recover::{CommittedSlot, HeldReply, ImageRead, ImageWrite, ShardImage
 
 /// Format: a delta's magic, checked before anything else on decode.
 const DELTA_MAGIC: u32 = u32::from_le_bytes(*b"SLD1");
-/// Format: the delta format's version.
-const DELTA_VERSION: u16 = 1;
+/// Format: the delta format's version, bumped with any change to the delta's types: 1 (A-68, 2026-10-04); 2 (A-126,
+/// 2026-10-09) a file changed only by writes to its chunked body is carried as its written windows
+/// (`delta::InodePatch`), not its whole image.
+const DELTA_VERSION: u16 = 2;
 /// Format: a log frame's header — a little-endian payload length then a CRC-32C of the payload.
 const LOG_HEADER: usize = 2 * size_of::<u32>();
 /// Format: a log frame's payload prefix — its generation and its base checkpoint's generation.

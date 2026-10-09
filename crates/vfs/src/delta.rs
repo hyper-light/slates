@@ -20,13 +20,21 @@
 //! synchronous write instead of committing a whole transaction group; JBD2 journals changed metadata blocks;
 //! Rosenblum and Ousterhout's log-structured filesystem writes only what changed and checkpoints).
 //!
+//! **A written file's windows (A-126).** A file changed since the last publication only by writes to its chunked body
+//! is carried as an [`InodePatch`]: its image with only the extents in the windows those writes could change (each
+//! write's windows and the window open when it began, `touched_windows`), kept as ascending, coalesced spans
+//! ([`Dirty::written`]). Anything else that changes the inode marks it whole. Before, a written file was imaged whole at
+//! every barrier: a 512 MiB file overwritten through Linux NFSv4.2 imaged all 8,192 of its windows at each of 1,781
+//! COMMITs, and random 4 KiB writes with an fsync every 8 managed 390 fsyncs/s against 1,645 after (2026-10-09,
+//! `docs/wip/BENCHMARKS.md`).
+//!
 //! **When a delta is not taken.** A volume with snapshots, a clone origin or a base plane publishes in full: a
 //! head change can move a snapshot's shared file into the snapshot's own image, and the base plane images through
 //! the host; their deltas are owed (GAPS). So is a volume's first publication, and one whose dirty set has grown
 //! to its live inode count, where a full image is no larger than the delta would be (the bound that keeps the
 //! dirty set from growing past the volume).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use slates_wire::Wire;
 
@@ -53,6 +61,18 @@ pub struct Dirty {
   /// The recorded attachments' reference counts taken, forgotten or swept: the attachment's id and the inode number
   /// (A-96). An owner this process alone knows is not recorded, as the image does not carry it.
   references: BTreeSet<(u64, u64)>,
+  /// Inode numbers changed by anything but the write in progress on them ([`Dirty::writing`]), or written while their
+  /// body was not chunked: unsorted, with repeats, until [`Dirty::normalize`]. Such an inode is imaged whole; one
+  /// changed only by writes to its chunked body is patched ([`InodePatch`]). A plain list, as [`Dirty::inodes`] is, so
+  /// a create pays a push, not a node.
+  others: Vec<u64>,
+  /// The file ranges each written inode's writes could have changed since the last publication: every write's windows
+  /// and the window open when it began (`touched_windows`), outside which a chunked body's extents do not change. Each
+  /// file's ranges are ascending, disjoint and coalesced, so there are at most as many as the file has windows, and a
+  /// write adds at most two. One entry per written file; cleared at every publication.
+  windows: BTreeMap<u64, Vec<WindowSpan>>,
+  /// The inode a write is changing now: its own marks are the write's, not [`Dirty::others`].
+  writing: Option<u64>,
   /// Whether anything changed since the last publication, recorded or not: what lets a volume that records no
   /// details (its next publication is full) still answer clean when nothing changed.
   changed: bool,
@@ -99,7 +119,43 @@ impl Dirty {
     self.changed = true;
     if self.recording() {
       self.inodes.push(no);
+      if self.writing != Some(no) {
+        self.others.push(no);
+      }
     }
+  }
+
+  /// Marks the write that is about to change inode `no` (`Some`), or its end (`None`): the write's own marks of `no`
+  /// leave it patchable.
+  pub(crate) fn set_writing(&mut self, no: Option<u64>) {
+    self.writing = no;
+  }
+
+  /// Records a write to inode `no` that could change its extents within `windows` (`touched_windows`), or, with
+  /// `None`, a write to a body that was not chunked, which images the inode whole.
+  pub(crate) fn written(&mut self, no: u64, windows: Option<[(u64, u64); 2]>) {
+    if !self.recording() {
+      return;
+    }
+    let Some([first, second]) = windows else {
+      self.others.push(no);
+      return;
+    };
+    let spans = self.windows.entry(no).or_default();
+    for (from, to) in [first, second] {
+      add_span(spans, WindowSpan { from, to });
+    }
+  }
+
+  /// The ranges a publication may patch inode `no` over, when only writes to its chunked body changed it. Read after
+  /// [`Dirty::normalize`].
+  fn patch_spans(&self, no: u64) -> Option<&[WindowSpan]> {
+    let spans = self.windows.get(&no)?;
+    self
+      .others
+      .binary_search(&no)
+      .is_err()
+      .then_some(spans.as_slice())
   }
 
   /// Records a changed directory entry.
@@ -118,6 +174,8 @@ impl Dirty {
   fn normalize(&mut self) {
     self.inodes.sort_unstable();
     self.inodes.dedup();
+    self.others.sort_unstable();
+    self.others.dedup();
     let names = &self.names;
     let name_of = |range: &std::ops::Range<usize>| names.get(range.clone()).unwrap_or_default();
     self.entries.sort_unstable_by(|(a_dir, a), (b_dir, b)| {
@@ -139,6 +197,8 @@ impl Dirty {
   /// Forgets every recorded change, keeping the buffers' capacity for the next ones.
   fn clear_recorded(&mut self) {
     self.inodes.clear();
+    self.others.clear();
+    self.windows.clear();
     self.entries.clear();
     self.names.clear();
     self.references.clear();
@@ -182,6 +242,61 @@ pub struct EntryChange {
   pub entry: Option<EntryImage>,
 }
 
+/// A range of file offsets `[from, to)`, whole chunk windows, that writes could have changed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Wire)]
+pub struct WindowSpan {
+  /// The first offset.
+  pub from: u64,
+  /// The offset past the last.
+  pub to: u64,
+}
+
+impl WindowSpan {
+  /// Whether `offset` is in the range.
+  pub const fn holds(&self, offset: u64) -> bool {
+    self.from <= offset && offset < self.to
+  }
+}
+
+/// Adds `span` to `spans` (ascending, disjoint), merging it with every span it overlaps or touches.
+fn add_span(spans: &mut Vec<WindowSpan>, span: WindowSpan) {
+  let first = spans.partition_point(|held| held.to < span.from);
+  let last = spans.partition_point(|held| held.from <= span.to);
+  let merged = spans
+    .get(first..last.max(first))
+    .unwrap_or_default()
+    .iter()
+    .fold(span, |acc, held| WindowSpan {
+      from: acc.from.min(held.from),
+      to: acc.to.max(held.to),
+    });
+  spans.splice(first..last.max(first), [merged]);
+}
+
+/// A file changed only by writes to its chunked body since the last publication: its image with only the extents in
+/// `spans`, the ranges its writes could have changed (`touched_windows`). Applied over the previous image, the extents
+/// in those ranges are replaced by these, and every other field is this image's. A barrier's cost is then the windows
+/// written since the last one, not the file: a 512 MiB file overwritten in 1 MiB writes over Linux NFSv4.2 had every
+/// one of its 8,192 extents imaged at each of 1,781 COMMITs (2026-10-09). Ranges, not one hull, so a transaction that
+/// writes a page at each end of a large file carries two windows, not the file between them.
+#[derive(Clone, Debug, PartialEq, Eq, Wire)]
+pub struct InodePatch {
+  /// The ranges the patch covers, ascending and disjoint.
+  pub spans: Vec<WindowSpan>,
+  /// The inode's image, its body `Chunked` with the extents in `spans` alone.
+  pub inode: InodeImage,
+}
+
+/// How a publication carries one recorded inode ([`Volume::delta_class`]).
+enum DeltaClass<'a> {
+  /// No longer in the volume: its number is in `removed`.
+  Removed,
+  /// Imaged whole, without a directory's entries.
+  Whole(&'a crate::inode::Inode),
+  /// Patched over the spans its writes changed.
+  Patched(&'a crate::inode::Inode, &'a [WindowSpan]),
+}
+
 /// What changed in a volume since its last publication (the module doc).
 #[derive(Clone, Debug, PartialEq, Eq, Wire)]
 pub struct VolumeDelta {
@@ -207,6 +322,9 @@ pub struct VolumeDelta {
   pub removed: Vec<u64>,
   /// The changed entries, by directory then name.
   pub entries: Vec<EntryChange>,
+  /// The changed files patched rather than imaged whole ([`InodePatch`]), in number order; none of them is in
+  /// `inodes`. Appended last.
+  pub patches: Vec<InodePatch>,
 }
 
 /// A volume's publication: its whole image, or a delta over its last one.
@@ -335,12 +453,23 @@ impl Volume {
   fn delta(&self, store: &Store) -> Result<VolumeDelta, VfsError> {
     let roots = self.roots(store)?;
     let mut inodes = Vec::new();
+    let mut patches = Vec::new();
     let mut removed = Vec::new();
     for no in &self.dirty.inodes {
       match crate::trie::get(&store.tries, self.inode_root, crate::ids::InodeNo(*no)) {
         Some(handle) => {
           let inode = store.inodes.get(handle)?;
-          inodes.push(self.image_of_inode_without_entries(store, inode)?);
+          let mut image = self.image_of_inode_without_entries(store, inode)?;
+          match self.patch_of(inode) {
+            Some(spans) => {
+              image.body = crate::recover::file_body_image_within(store, &inode.body, spans)?;
+              patches.push(InodePatch {
+                spans: spans.to_vec(),
+                inode: image,
+              });
+            }
+            None => inodes.push(image),
+          }
         }
         None => removed.push(*no),
       }
@@ -374,7 +503,22 @@ impl Volume {
       inodes,
       removed,
       entries,
+      patches,
     })
+  }
+
+  /// The ranges a publication patches `inode` over ([`InodePatch`]), when only writes to its chunked body changed it.
+  fn patch_of(&self, inode: &crate::inode::Inode) -> Option<&[WindowSpan]> {
+    let chunked = matches!(
+      (&inode.body, inode.kind),
+      (
+        crate::inode::Body::Sealed(_) | crate::inode::Body::Open { .. },
+        crate::inode::Kind::File
+      )
+    );
+    chunked
+      .then(|| self.dirty.patch_spans(inode.no.0))
+      .flatten()
   }
 }
 
@@ -405,32 +549,80 @@ impl Volume {
         .attachment_reference_count(*attachment, crate::ids::InodeNo(*inode))
         .encode(out);
     }
-    let present =
-      |no: u64| crate::trie::get(&store.tries, self.inode_root, crate::ids::InodeNo(no));
-    let changed = self
-      .dirty
-      .inodes
-      .iter()
-      .filter(|no| present(**no).is_some())
-      .count();
-    encode_len(changed, out);
-    for no in &self.dirty.inodes {
-      if let Some(handle) = present(*no) {
-        let inode = store.inodes.get(handle)?;
-        self.encode_inode(store, inode, crate::recover::Entries::Omitted, out)?;
-      }
-    }
-    encode_len(self.dirty.inodes.len().saturating_sub(changed), out);
-    for no in &self.dirty.inodes {
-      if present(*no).is_none() {
-        no.encode(out);
-      }
-    }
+    self.encode_changed_inodes(store, out)?;
     encode_len(self.dirty.entries.len(), out);
     for (dir, name) in self.dirty.entry_names() {
       dir.encode(out);
       encode_bytes(name.as_bytes(), out);
       self.encode_entry(store, crate::ids::InodeNo(dir), name, out)?;
+    }
+    self.encode_patches(store, out)
+  }
+
+  /// How a publication carries recorded inode `no`: removed (no longer in the trie), imaged whole, or patched over its
+  /// written spans ([`InodePatch`]).
+  fn delta_class<'a>(&'a self, store: &'a Store, no: u64) -> Result<DeltaClass<'a>, VfsError> {
+    let Some(handle) = crate::trie::get(&store.tries, self.inode_root, crate::ids::InodeNo(no))
+    else {
+      return Ok(DeltaClass::Removed);
+    };
+    let inode = store.inodes.get(handle)?;
+    Ok(match self.patch_of(inode) {
+      Some(spans) => DeltaClass::Patched(inode, spans),
+      None => DeltaClass::Whole(inode),
+    })
+  }
+
+  /// The delta's whole inodes (counted, then each imaged without its entries) and its removed numbers.
+  fn encode_changed_inodes(&self, store: &Store, out: &mut Vec<u8>) -> Result<(), VfsError> {
+    use slates_wire::codec::encode_len;
+    let (mut whole, mut removed) = (0usize, 0usize);
+    for no in &self.dirty.inodes {
+      match self.delta_class(store, *no)? {
+        DeltaClass::Whole(_) => whole = whole.saturating_add(1),
+        DeltaClass::Removed => removed = removed.saturating_add(1),
+        DeltaClass::Patched(..) => {}
+      }
+    }
+    encode_len(whole, out);
+    for no in &self.dirty.inodes {
+      if let DeltaClass::Whole(inode) = self.delta_class(store, *no)? {
+        self.encode_inode(store, inode, crate::recover::Entries::Omitted, out)?;
+      }
+    }
+    encode_len(removed, out);
+    for no in &self.dirty.inodes {
+      if let DeltaClass::Removed = self.delta_class(store, *no)? {
+        no.encode(out);
+      }
+    }
+    Ok(())
+  }
+
+  /// The delta's patched files ([`InodePatch`]), counted, then each with its spans and its image over them.
+  fn encode_patches(&self, store: &Store, out: &mut Vec<u8>) -> Result<(), VfsError> {
+    use slates_wire::codec::encode_len;
+    let mut patches = 0usize;
+    for no in &self.dirty.inodes {
+      if let DeltaClass::Patched(..) = self.delta_class(store, *no)? {
+        patches = patches.saturating_add(1);
+      }
+    }
+    encode_len(patches, out);
+    for no in &self.dirty.inodes {
+      if let DeltaClass::Patched(inode, spans) = self.delta_class(store, *no)? {
+        encode_len(spans.len(), out);
+        for span in spans {
+          span.encode(out);
+        }
+        self.encode_inode_within(
+          store,
+          inode,
+          crate::recover::Entries::Omitted,
+          Some(spans),
+          out,
+        )?;
+      }
     }
     Ok(())
   }
@@ -549,6 +741,9 @@ impl VolumeImage {
       apply_reference(&mut self.references, change);
     }
     self.apply_inodes(&delta.inodes);
+    for patch in &delta.patches {
+      self.apply_patch(patch)?;
+    }
     let policy = crate::recover::policy_from_image(self.policy);
     for change in &delta.entries {
       let Ok(at) = self
@@ -587,6 +782,75 @@ impl VolumeImage {
         self.inodes.remove(at);
       }
     }
+    Ok(())
+  }
+}
+
+impl VolumeImage {
+  /// Applies one [`InodePatch`]: the held image's extents in `[from, to)` are replaced by the patch's, and every other
+  /// field is the patch's. A patch naming an inode the image does not hold, or one whose held body is not chunked, is
+  /// refused [`VfsError::RecoveryIncomplete`]: it does not belong to this image.
+  fn apply_patch(&mut self, patch: &InodePatch) -> Result<(), VfsError> {
+    let at = self
+      .inodes
+      .binary_search_by_key(&patch.inode.no, |inode| inode.no)
+      .map_err(|_| VfsError::RecoveryIncomplete)?;
+    let slot = self
+      .inodes
+      .get_mut(at)
+      .ok_or(VfsError::RecoveryIncomplete)?;
+    let (
+      BodyImage::Chunked { extents: held, .. },
+      BodyImage::Chunked {
+        extents: written,
+        open,
+      },
+    ) = (&mut slot.body, &patch.inode.body)
+    else {
+      return Err(VfsError::RecoveryIncomplete);
+    };
+    // Both lists are ascending by offset: the held extents outside every span, merged with the patch's, which lie
+    // inside them. One pass, so a replay costs the file's extents once, not once per span.
+    let spans = &patch.spans;
+    let inside = |offset: u64| {
+      let at = spans.partition_point(|span| span.to <= offset);
+      spans.get(at).is_some_and(|span| span.holds(offset))
+    };
+    let kept: Vec<crate::recover::ExtentImage> = held
+      .drain(..)
+      .filter(|extent| !inside(extent.offset))
+      .collect();
+    let mut merged = Vec::with_capacity(kept.len().saturating_add(written.len()));
+    let mut kept = kept.into_iter().peekable();
+    let mut written = written.iter().cloned().peekable();
+    loop {
+      let take_kept = match (kept.peek(), written.peek()) {
+        (Some(a), Some(b)) => a.offset < b.offset,
+        (Some(_), None) => true,
+        (None, Some(_)) => false,
+        (None, None) => break,
+      };
+      let next = if take_kept {
+        kept.next()
+      } else {
+        written.next()
+      };
+      if let Some(extent) = next {
+        merged.push(extent);
+      }
+    }
+    *held = merged;
+    let mut body = std::mem::replace(&mut slot.body, BodyImage::Empty);
+    if let BodyImage::Chunked {
+      open: held_open, ..
+    } = &mut body
+    {
+      *held_open = *open;
+    }
+    *slot = InodeImage {
+      body,
+      ..patch.inode.clone()
+    };
     Ok(())
   }
 }
@@ -635,5 +899,40 @@ fn apply_reference(references: &mut Vec<AttachmentReferences>, change: &Referenc
   }
   if owner.inodes.is_empty() {
     references.remove(at);
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::{WindowSpan, add_span};
+  use proptest::prelude::*;
+
+  /// Shape: windows of a small file, so random spans overlap, touch and nest often.
+  const WINDOWS: u64 = 48;
+
+  proptest! {
+    #![proptest_config(slates_test_seeds::unseeded(ProptestConfig { cases: 2000, .. ProptestConfig::default() }))]
+
+    /// A-126: a written file's spans cover exactly the windows its writes named. Do: add random spans of whole windows
+    /// in any order. Expect: the spans stay ascending, disjoint and never touching (coalesced), and cover exactly the
+    /// union of the windows added, against a set of window numbers as the oracle.
+    #[test]
+    fn spans_stay_coalesced_and_cover_exactly_what_was_added(
+      added in prop::collection::vec((0..WINDOWS, 1..6u64), 0..24)
+    ) {
+      let mut spans = Vec::new();
+      let mut oracle = std::collections::BTreeSet::new();
+      for (start, length) in added {
+        let end = (start + length).min(WINDOWS);
+        add_span(&mut spans, WindowSpan { from: start, to: end });
+        oracle.extend(start..end);
+      }
+      for pair in spans.windows(2) {
+        prop_assert!(pair[0].to < pair[1].from, "ascending, disjoint and coalesced: {spans:?}");
+      }
+      let covered: std::collections::BTreeSet<u64> =
+        spans.iter().flat_map(|span| span.from..span.to).collect();
+      prop_assert_eq!(covered, oracle);
+    }
   }
 }

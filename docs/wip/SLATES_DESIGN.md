@@ -10688,3 +10688,47 @@ Status: built 2026-10-09.
   - without it: 84/85 in 413 s at the same load, the failure the recorded `a_whole_ram_replacement…` flake;
   - a first run with the floor at higher load: 83/85 in 726 s. The two failures (a council leader's retirement and an
     initial voter admission, both convergence waits) each passed twice alone.
+
+### A-126 — A written file's delta carries its written windows, not its whole image (2026-10-09)
+Applied in the same change to:
+- `crates/vfs/src/delta.rs` (`Dirty::others`, `Dirty::windows`, `Dirty::writing`, `Dirty::written`, `WindowSpan`,
+  `add_span`, `InodePatch`, `VolumeDelta::patches`, `VolumeImage::apply_patch`);
+- `crates/vfs/src/recover.rs` (`encode_inode_within`, `file_body_image_within`);
+- `crates/vfs/src/volume.rs` (`write_secured` marks its write; `apply_write` records its windows);
+- `crates/vfs/src/checkpoint_log.rs` (delta format version 2);
+- the model suite (`crates/vfs/tests/model.rs`: a 512-byte-page shape and `PATCHES_TAKEN`), GAPS, BENCHMARKS.
+
+Status: built 2026-10-09.
+- What it answers: A-68 made a barrier publish the inodes and entries that changed, but a changed file was imaged
+  whole: every sealed extent. A file written between barriers therefore cost its size at every barrier, and a large
+  file written with periodic commits cost work quadratic in its size. Through Linux's NFSv4.2 client, a 512 MiB file
+  overwritten in 1 MiB writes drew 1,781 COMMITs in 18 passes, each imaging all 8,192 of the file's 64 KiB windows.
+  Publication was about 16% of the daemon's profile: `extent_image` 10.6%, encoding the extent list 3.0%, iterating it
+  2.6%.
+- The rule:
+  - A write to a chunked body can change extents only in the windows it covers and the window of the extent open when
+    it began (`touched_windows`, the invariant the epoch histogram's reconcile already relies on).
+  - A volume records each written file's ranges since its last publication, as ascending, disjoint, coalesced spans
+    of whole windows. A write adds at most two, and a file has at most as many as it has windows.
+  - A file changed only by such writes is published as an `InodePatch`: its image, with only the extents in its
+    spans. Applying it replaces the held image's extents in those spans and takes every other field from the patch.
+  - Spans, not one hull: a transaction that writes a page near each end of a large file carries two windows, not the
+    file between them. A first cut with one hull was measured no better than the whole image on random writes.
+  - Anything else that changes the inode marks it whole: a truncate, an edit, the idle sweep's seal, an attribute
+    change, or a write to a body that was not chunked. These are the marks `Dirty::inode` sees outside the write in
+    progress. The inode is then imaged whole, as before.
+- Proven:
+  - the model suite checks every generated step's publication against the full image on a third store shape, whose
+    8 KiB windows the model's writes cross;
+  - a fixed history (writes across windows, an append, the open window rewritten, a truncate, writes after it) takes at
+    least four patches and agrees at every step;
+  - two deliberate mutants fail it: the held extents inside the spans kept, and the spans without the open window;
+  - the spans' coalescing is checked against a set of window numbers over 2,000 generated histories.
+  - Server recovery, daemon, seal and NFS mount suites pass.
+- Format: delta version 2. A log written by an earlier daemon is refused by version, as every image format change
+  before it was.
+- Measured (BENCHMARKS), through Linux's NFSv4.2 client on loopback in a privileged container:
+  - sequential overwrite: daemon CPU per 3 GiB 3.92 → 2.56 s median, throughput 753 → 1,143 MiB/s, 12 rounds each;
+  - random 4 KiB writes with an fsync every 8: 390 → 1,645 fsyncs/s median, daemon CPU per round 0.96–2.05 →
+    0.22–0.35 s, 6 rounds each.
+  - Measured and rejected: one hull per file, 451 fsyncs/s.

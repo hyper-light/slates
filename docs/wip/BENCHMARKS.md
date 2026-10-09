@@ -4233,3 +4233,45 @@ The macOS A/B was therefore even, as expected: 923–1,243 MiB/s and 6.8–7.6 s
 Daemon CPU per byte fell 20% and throughput rose 18%. The daemon is CPU-bound on this path (CPU about equal to wall
 time), so the CPU it saves is throughput. Linux's own nfsd measured 967–1,524 MB/s on the same storm (above), so the
 remaining gap is still owed a profile.
+
+### Landed: a written file's delta carries its written windows (A-126; conditions 5 and 12; 2026-10-09)
+
+Found by profiling the daemon (`perf record` in the privileged container, 2 s mid-write) after `acb68d89`:
+- `extent_image` was 10.6% of samples, under `encode_publication` and `publish_shard`;
+- encoding the extent list was 3.0%, and iterating it 2.6%.
+
+Every barrier re-imaged every extent of a written file. The kernel client sent 1,781 COMMITs in 18 passes, about
+one per 5 MiB written, and each imaged all 8,192 of the 512 MiB file's 64 KiB windows. A file changed only by writes
+to its chunked body is now published as its written windows: spans of whole windows, ascending and coalesced (A-126).
+
+**Sequential overwrite** (`docs/wip/bench/overwrite/linux.sh`; Linux release builds, each from its own target volume):
+- arms alternated `acb68d89`, patch, `acb68d89`, patch, then the reverse: twelve rounds each, three per container;
+- Apple M5 Max, Docker Desktop 6.12 kernel, load average 7.5–11.4 from other sessions.
+
+| arm | daemon CPU per 3 GiB, median (range) | throughput, median (range) |
+|---|---|---|
+| `acb68d89` | 3.92 s (3.21–5.05) | 753 MiB/s (592–886) |
+| written windows | 2.56 s (2.13–3.06) | 1,143 MiB/s (945–1,358) |
+
+That is 35% less daemon CPU per byte and 52% more throughput. Linux's own nfsd measured 967–1,524 MB/s on the same
+container shape (2026-10-05), so this path now writes at kernel-server speed. After the change, publication is about 5%
+of the daemon's samples (`extent_image` 2.5%, CRC 2.3%). What remains:
+- memcpy, about 31%: RPC record reassembly 6.3%, the arena write 4.5% (the one a write needs), `open_window` 3.3%,
+  `Call::parse` 3.1%, the v4-to-v3 WRITE re-encode 2.6%, seal 1.8%;
+- AES-GCM at rest, 19.7% (condition 9);
+- the kernel's receive copy, 12.8%.
+
+**Random small writes, a database's pattern** (`docs/wip/bench/overwrite/random.sh`): the 512 MiB file is written once,
+then each round makes 4,000 random page-aligned 4 KiB writes with an fsync every 8.
+- Arms rotated base, hull, spans, then spans, hull, base: six rounds each.
+- "Hull" is a first cut that recorded one range per file, the hull of its writes.
+
+| arm | fsyncs per second, median (range) | daemon CPU per round |
+|---|---|---|
+| `acb68d89`, the whole file per COMMIT | 390 (240–527) | 0.96–2.05 s |
+| one hull per file | 451 (385–486) | 1.03–1.29 s |
+| spans (landed) | 1,645 (1,456–2,136) | 0.22–0.35 s |
+
+**Measured and rejected: one hull per file.** A transaction's random pages span nearly the whole file, so the hull was
+no better than the whole image: 451 against 390 fsyncs/s. Spans carry only the windows written: 4.2× the commit rate
+at about a fifth of the daemon CPU.

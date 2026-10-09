@@ -1661,6 +1661,19 @@ impl Volume {
     entries: Entries,
     out: &mut Vec<u8>,
   ) -> Result<(), VfsError> {
+    self.encode_inode_within(store, inode, entries, None, out)
+  }
+
+  /// [`Volume::encode_inode`] with, for a chunked file and `within` given, only the extents whose offsets are in those
+  /// spans: the image an [`crate::delta::InodePatch`] carries.
+  pub(crate) fn encode_inode_within(
+    &self,
+    store: &Store,
+    inode: &Inode,
+    entries: Entries,
+    within: Option<&[crate::delta::WindowSpan]>,
+    out: &mut Vec<u8>,
+  ) -> Result<(), VfsError> {
     inode.no.0.encode(out);
     inode.generation.encode(out);
     inode.born.0.encode(out);
@@ -1693,6 +1706,9 @@ impl Volume {
       }
       (Body::Directory(handle), Kind::Dir) => {
         self.encode_directory(store, *handle, entries, out)?
+      }
+      (Body::Sealed(_) | Body::Open { .. }, Kind::File) if within.is_some() => {
+        file_body_image_within(store, &inode.body, within.unwrap_or_default())?.encode(out)
       }
       _ => self.inode_body(store, inode, entries)?.encode(out),
     }
@@ -1840,6 +1856,43 @@ fn extent_image(store: &Store, extent: &Extent) -> Result<ExtentImage, VfsError>
 }
 
 /// A file's body image, as the store holds it (A-64): no byte is copied but inline content.
+/// A chunked file body's image with only the sealed extents whose offsets are in `spans`, and its open extent (an
+/// [`crate::delta::InodePatch`]'s body). Extents and spans are ascending by offset, so each span's extents are found by
+/// binary search and only they are imaged.
+pub(crate) fn file_body_image_within(
+  store: &Store,
+  body: &Body,
+  spans: &[crate::delta::WindowSpan],
+) -> Result<BodyImage, VfsError> {
+  let within = |sealed: &[Extent]| {
+    let mut images = Vec::new();
+    for span in spans {
+      let first = sealed.partition_point(|extent| extent.off < span.from);
+      let last = sealed.partition_point(|extent| extent.off < span.to);
+      for extent in sealed.get(first..last.max(first)).unwrap_or_default() {
+        images.push(extent_image(store, extent)?);
+      }
+    }
+    Ok::<_, VfsError>(images)
+  };
+  match body {
+    Body::Sealed(sealed) => Ok(BodyImage::Chunked {
+      extents: within(sealed)?,
+      open: None,
+    }),
+    Body::Open { open, sealed } => Ok(BodyImage::Chunked {
+      extents: within(sealed)?,
+      open: Some(OpenImage {
+        offset: open.off,
+        len: open.len,
+        block: block_image(&open.block),
+        born: open.born.0,
+      }),
+    }),
+    _ => Err(VfsError::RecoveryIncomplete),
+  }
+}
+
 fn file_body_image(store: &Store, body: &Body) -> Result<BodyImage, VfsError> {
   let extents = |sealed: &[Extent]| {
     sealed
