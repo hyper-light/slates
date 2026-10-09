@@ -1428,6 +1428,39 @@ impl Daemon {
     })
   }
 
+  /// For each council member, what this node holds of it on the way to a retirement (§4.8): the fleet's belief (the
+  /// liveness the council's death watch reads, as debug text), the membership plane detector's own belief, and the
+  /// death watch's count of consecutive drive periods it has held the member dead
+  /// (`ShardState::council_death_watch`). A one-shot control-shard question ([`Self::observation`]). Exposed so a
+  /// fleet test whose retirement never commits names the step that stopped it: never condemned, condemned and
+  /// refuted, or condemned but not held for the window.
+  pub fn council_death_view(
+    &self,
+  ) -> Result<Vec<(slates_db::HostId, String, String, u32)>, ObserveError> {
+    self.observe(self.shards.first().copied(), |s| {
+      s.council
+        .configuration()
+        .members
+        .iter()
+        .map(|member| {
+          let fleet = format!("{:?}", s.fleet.membership().state(*member));
+          let detector = s.plane.plane.as_ref().map_or_else(
+            || "no plane".to_owned(),
+            |plane| {
+              format!(
+                "{} now_ns={}",
+                plane.diagnose(*member),
+                slates_machine::clock::monotonic_ns()
+              )
+            },
+          );
+          let watched = s.council_death_watch.get(member).copied().unwrap_or(0);
+          (*member, fleet, detector, watched)
+        })
+        .collect()
+    })
+  }
+
   /// The failure domains the regional configuration currently declares, by member (§4.8, D-14 — copysets
   /// form across distinct domains); a member absent from the map is unique-per-host. A one-shot
   /// control-shard question ([`Self::observation`]); an observation the daemon could not make is its typed

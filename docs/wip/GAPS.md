@@ -5193,3 +5193,27 @@ At `f62847d5`:
     the window first. Deferring the read until the window is sealed would let a window filled in pieces skip it too,
     at the cost of reads and images of a partly written open extent: a design change, not built;
   - the rest of the gap to Linux nfsd's large writes (967–1,524 MB/s against 760 MiB/s).
+
+### 2026-10-09: lease-renewal answers starved the detector's pool, and a dead member was never suspected (fixed)
+
+- **Found** by the fleet suite after A-125 (`53e182e6`). The warm-restart test
+  (`a_warm_fleet_restart_recovers_its_root_and_regional_quorums`) failed 3 of 11 runs with the period floor and 0 of
+  8 without it. Each time, the survivors never retired the stopped root leader.
+- **Shown** by a new observation, `Daemon::council_death_view`: the leader's detector held the stopped member alive
+  after 30 s of silence, with verdict `None`, an unconfigured pair, no suspicion, and no pool verdict.
+- **Cause** (`docs/bugs/2026-10-09-renewal-answers-starved-the-detectors-pool.md`):
+  - vendored hyper-swim marked a pair a pool misfit for good on any unrecorded answer, including the answers to
+    slates' own lease-renewal pings;
+  - so the pool was never fed, and a pair with no verdict was measured for ever;
+  - A-125 exposed it by making renewals frequent: 1 → 34 per node.
+- **Fixed** in the vendored detector (`ORIGIN.md`, pending upstream; the inbox note was updated): only an answer that
+  a reused record explains marks a misfit.
+- **Results:**
+  - the failing-first detector test passes; 80/80;
+  - the warm-restart test passed 16 of 16 after the fix;
+  - the full fleet suite passed 85/85 in 340 s, at load 9.5–10.7 (453 s before the fix, with the warm test waiting
+    out its 30 s).
+- **Correction to A-125's record:** its 85/85 fleet run was true, but the regression was there. A-125 raised this
+  test's failure rate from 0 of 8 to 3 of 11 until this fix.
+- The unexplained CI failure of the same test on 2026-09-28 (above) was at its second wait, before the floor existed.
+  Whether this mechanism caused it is unproven; renewals were rare then.

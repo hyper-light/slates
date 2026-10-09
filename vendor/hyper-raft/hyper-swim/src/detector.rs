@@ -466,17 +466,25 @@ impl Peer {
     /// measured, so a misfit pair with no handshake round trip is still judged provisionally
     /// ([`misfit_verdict`]); without it, such a pair whose member then died was measured for ever and
     /// never condemned.
+    ///
+    /// Only an answer a reused record explains is that evidence. Any other unrecorded answer (an owner's own ping on
+    /// the same plane, whose nonce comes from a range the member's probes never reach) is evidence of life only, which
+    /// [`Detector::on_ack`] has already taken. Before 2026-10-09 every unrecorded answer marked the pair: an owner's
+    /// lease renewals made every pair that answered one before configuring a misfit for good, the pool was never fed
+    /// and never configured, and a member that then died was measured for ever and never suspected (slates, a
+    /// warm-restarted three-member fleet, 3 of 11 runs).
     fn answered_unrecorded(&mut self, nonce: u64, at_ns: u64) {
         if self.stream.verdict.is_some() {
             return;
         }
+        let Some(round_trip) = self.reused_round_trip(nonce, at_ns) else {
+            return;
+        };
         self.pool_misfit = true;
-        if let Some(round_trip) = self.reused_round_trip(nonce, at_ns) {
-            self.path_rtt_ns = Some(
-                self.path_rtt_ns
-                    .map_or(round_trip, |path| path.max(round_trip)),
-            );
-        }
+        self.path_rtt_ns = Some(
+            self.path_rtt_ns
+                .map_or(round_trip, |path| path.max(round_trip)),
+        );
     }
 
     /// The round trip of an answer to `nonce` at `at_ns` that found no record: exact when it answers
@@ -2815,6 +2823,56 @@ mod tests {
             unbudgeted_pings > budgeted_pings * 2,
             "with no budget it probes at its round trip: {unbudgeted_pings} against {budgeted_pings}"
         );
+    }
+
+    /// An answer no probe of the pair explains is evidence of life, not of a misfit pool (found 2026-10-09 in slates:
+    /// a warm-restarted fleet whose owner renewed its lease holders with pings of its own, nonces from a disjoint
+    /// range, answered on the same plane; every pair that answered one before configuring its own estimator was
+    /// marked a pool misfit for good, the pool was never fed and never configured, and a member that then died was
+    /// measured for ever and never suspected, 30 s into its silence, in 3 of 11 runs). Do: on a fresh member over
+    /// peers A and B, answer each of A's and B's first probes with an extra acknowledgement carrying a nonce from far
+    /// outside the member's own range, then run with every probe answered until the pool configures, and silence A.
+    /// Expect: neither pair is a misfit, the pool configures, and A is suspected.
+    #[test]
+    fn an_answer_no_probe_explains_marks_no_misfit_and_a_silent_peer_is_suspected() {
+        /// Shape: a nonce from a range no probe of the member reaches (its own count from zero; a renewal's from 2⁶³).
+        const FOREIGN: u64 = 1 << 63;
+        let mut detector = detector(&[A, B]);
+        let mut state = 0x2545_F491_4F6C_DD1D;
+        let mut requests = Vec::new();
+        let mut now = MS;
+        for _ in 0..4 {
+            if let Some(ping) = detector.poll(now, &mut requests) {
+                now += jitter(&mut state);
+                detector.on_ack(ping.to, FOREIGN, now);
+                detector.on_ack(ping.to, ping.nonce, now);
+            }
+            now += MS;
+        }
+        for peer in [A, B] {
+            assert!(
+                !detector.peers.get(&peer).is_some_and(|held| held.pool_misfit),
+                "an answer no probe explains marks no misfit: {peer:?}"
+            );
+        }
+        let silenced = drive_many(
+            &mut detector,
+            now,
+            now + 2_000 * MS,
+            |_| Some(jitter(&mut state)),
+            |_, _, _, _| false,
+            |_| false,
+        );
+        assert!(detector.pool.verdict.is_some(), "the pool configured");
+        drive_many(
+            &mut detector,
+            silenced,
+            silenced + 30_000 * MS,
+            |peer| (peer != A).then(|| jitter(&mut state)),
+            |_, _, _, _| false,
+            |detector| liveness(detector, A) != Liveness::Alive,
+        );
+        assert_ne!(liveness(&detector, A), Liveness::Alive, "the silent peer is suspected");
     }
 
     /// The floor keeps detection within the budget, and only judged periods rest. Do: under a

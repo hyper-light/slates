@@ -195,3 +195,19 @@ Not yet in `../hyper-raft`. It was handed to the owner through the inbox
     within `D`, early and late; over one it is suspected within `D` and never condemned, as before.
 - **Measured in slates** (two-node fleet, 6 s): pings went from 10,264 and 9,922 to 134 and 212, datagrams received
   from about 24,000 to about 280, and membership loop turns from 35,943 to 319.
+
+## Local patch in slates, pending upstream (2026-10-09): only a reused record's answer marks a pool misfit
+
+Not yet in `../hyper-raft`; handed to the owner through the inbox with the period floor above.
+
+- **What was wrong.** `Peer::answered_unrecorded` marked a pair `pool_misfit`, permanently, for any answer whose nonce
+  matched no held record, though only an answer to a reused record is evidence the pool does not fit. An owner's own
+  pings answered on the same plane (slates' lease renewals, nonces from 2⁶³) reached `on_ack`, and so could the answer
+  to an expired relay record.
+  - Every pair that answered one before configuring its own estimator became a misfit, and the pool was never fed.
+  - A member that died in that state was measured for ever and never suspected: slates' warm-restart fleet test, 3
+    of 11 runs once the period floor made renewals frequent.
+- **The change.** The flag, and the reused round trip as the pair's path, are set only when `reused_round_trip`
+  explains the answer.
+- **Test.** `an_answer_no_probe_explains_marks_no_misfit_and_a_silent_peer_is_suspected` fails before and passes
+  after; 80/80. The fleet test passed 16 of 16 after the change.

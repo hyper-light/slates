@@ -387,6 +387,20 @@ impl MemberPlane {
     self.detector.membership().state(hyper_swim::HostId(peer.0))
   }
 
+  /// What the detector holds of `peer`, for an operator or a test diagnosing why a member was or was not judged: its
+  /// belief, the verdict its probes are judged by, its report (configured, suspicions, condemnations, last answer) and
+  /// this member's measured wake lateness `G`.
+  pub fn diagnose(&self, peer: HostId) -> String {
+    let swim = hyper_swim::HostId(peer.0);
+    format!(
+      "belief={:?} verdict={:?} report={:?} granularity={:?}",
+      self.belief(peer),
+      self.detector.verdict(swim),
+      self.detector.report(swim),
+      self.detector.granularity(),
+    )
+  }
+
   /// What the plane refused, by kind.
   pub fn counts(&self) -> PlaneCounts {
     self.counts

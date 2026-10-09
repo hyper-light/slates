@@ -10020,13 +10020,14 @@ fn council_state(daemons: &[Daemon]) -> String {
     .iter()
     .map(|daemon| {
       format!(
-        "[host={:?} leads={:?} voters={:?} members={:?} refusals={:?} council={:?}]",
+        "[host={:?} leads={:?} voters={:?} members={:?} refusals={:?} council={:?} death_view={:?}]",
         daemon.member_identity(),
         daemon.council_leads(),
         daemon.council_voters(),
         daemon.fleet_members(),
         daemon.fleet_refusals(),
-        daemon.council_debug()
+        daemon.council_debug(),
+        daemon.council_death_view()
       )
     })
     .collect::<Vec<_>>()
