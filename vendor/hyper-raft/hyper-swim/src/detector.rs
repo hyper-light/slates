@@ -2125,7 +2125,8 @@ mod tests {
 
     /// A detector for `LOCAL` that knows `peers`.
     fn detector(peers: &[HostId]) -> Detector {
-        let mut detector = Detector::new(LOCAL, Exposure::new(), room(), RESOLUTION, Duration::ZERO);
+        let mut detector =
+            Detector::new(LOCAL, Exposure::new(), room(), RESOLUTION, Duration::ZERO);
         for &peer in peers {
             detector.join(peer).unwrap();
         }
@@ -2282,7 +2283,8 @@ mod tests {
     /// the initial one; a peer joined without one waits the initial wait, backed off.
     #[test]
     fn a_handshake_round_trip_sets_the_first_wait() {
-        let mut detector = Detector::new(LOCAL, Exposure::new(), room(), RESOLUTION, Duration::ZERO);
+        let mut detector =
+            Detector::new(LOCAL, Exposure::new(), room(), RESOLUTION, Duration::ZERO);
         let handshake = Duration::from_micros(100);
         detector.join_measured(A, handshake).unwrap();
         detector.join(B).unwrap();
@@ -2851,7 +2853,10 @@ mod tests {
         }
         for peer in [A, B] {
             assert!(
-                !detector.peers.get(&peer).is_some_and(|held| held.pool_misfit),
+                !detector
+                    .peers
+                    .get(&peer)
+                    .is_some_and(|held| held.pool_misfit),
                 "an answer no probe explains marks no misfit: {peer:?}"
             );
         }
@@ -2872,7 +2877,11 @@ mod tests {
             |_, _, _, _| false,
             |detector| liveness(detector, A) != Liveness::Alive,
         );
-        assert_ne!(liveness(&detector, A), Liveness::Alive, "the silent peer is suspected");
+        assert_ne!(
+            liveness(&detector, A),
+            Liveness::Alive,
+            "the silent peer is suspected"
+        );
     }
 
     /// The floor keeps detection within the budget, and only judged periods rest. Do: under a
@@ -2927,7 +2936,11 @@ mod tests {
                         |_, _, _, _| false,
                         |_| false,
                     );
-                    assert_ne!(liveness(&detector, A), Liveness::Dead, "a lone pair never condemns");
+                    assert_ne!(
+                        liveness(&detector, A),
+                        Liveness::Dead,
+                        "a lone pair never condemns"
+                    );
                 }
             }
         }
@@ -3602,7 +3615,8 @@ mod tests {
     /// A detector for `local` that knows `peers` and has run a few periods, everyone answering: it
     /// has a dissemination window.
     fn running(local: HostId, peers: &[HostId], world: &mut World) -> Detector {
-        let mut detector = Detector::new(local, Exposure::new(), room(), RESOLUTION, Duration::ZERO);
+        let mut detector =
+            Detector::new(local, Exposure::new(), room(), RESOLUTION, Duration::ZERO);
         for &peer in peers {
             detector.join(peer).unwrap();
         }
@@ -3895,7 +3909,13 @@ mod tests {
             }
         }
         let hosts: Vec<HostId> = (0..9u64).map(|i| HostId(100 + i)).collect();
-        let mut detector = Detector::new(hosts[0], Exposure::new(), room(), RESOLUTION, Duration::ZERO);
+        let mut detector = Detector::new(
+            hosts[0],
+            Exposure::new(),
+            room(),
+            RESOLUTION,
+            Duration::ZERO,
+        );
         for (index, &host) in hosts.iter().enumerate().skip(1) {
             detector.join(host).unwrap();
             detector.learn_coordinate(host, Coordinate::Held(engines[index].coordinate()));
