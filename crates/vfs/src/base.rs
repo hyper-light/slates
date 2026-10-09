@@ -731,7 +731,12 @@ impl Volume {
       store,
       self.root,
       |no| plane.is_some_and(|b| b.is_witnessed(no)),
-      |no| matches!(self.inode(store, no).map(|i| &i.body), Ok(Body::Base(_))),
+      |no| {
+        matches!(
+          self.inode(store, no).map(|i| &i.body),
+          Ok(Body::Base(_) | Body::BaseLink(_))
+        )
+      },
     )
   }
 
@@ -747,7 +752,7 @@ impl Volume {
       |no| {
         matches!(
           self.inode_in(store, id, no).map(|i| &i.body),
-          Ok(Body::Base(_))
+          Ok(Body::Base(_) | Body::BaseLink(_))
         )
       },
     ))
@@ -1121,6 +1126,14 @@ impl Overlay<'_> {
         (Some(l), Child::File(no)) if l.kind == HostKind::File && self.unloaded_file(store, no) => {
           changed.push((no, l.fingerprint, e.name.to_owned()));
         }
+        // An untouched base symlink the disk replaced (`ln -sf` makes a new link at the name, so its change time
+        // moves) or turned into another kind leaves the node, and the next lookup serves the disk's entry: its target
+        // was read once, with the listing, and the live disk is what an untouched entry shows (§4.5; 2026-10-08).
+        (Some(l), Child::Symlink(no))
+          if self.unloaded_file(store, no) && self.listed_link_changed(store, no, l) =>
+        {
+          gone.push(e.name.to_owned());
+        }
         (Some(_), _) => {}
         (None, Child::File(no) | Child::Symlink(no) | Child::Fifo(no) | Child::Socket(no))
           if self.unloaded_file(store, no) =>
@@ -1140,6 +1153,17 @@ impl Overlay<'_> {
       }
     }
     Ok((gone, changed))
+  }
+
+  /// Whether the disk's entry at an untouched base symlink's name is no longer the link it was read from: another
+  /// kind, or a link whose size or times differ from the ones the inode took from the listing.
+  fn listed_link_changed(&self, store: &Store, no: InodeNo, listed: &BaseEntry) -> bool {
+    let fp = listed.fingerprint;
+    listed.kind != HostKind::Symlink
+      || self.vol.inode(store, no).map_or(true, |inode| {
+        (inode.attrs.size, inode.attrs.mtime, inode.attrs.ctime)
+          != (fp.size, fp.mtime_ns, fp.ctime_ns)
+      })
   }
 
   /// Whether the descriptor inode `no` holds names a file other than `fp`'s (the listed name was replaced
@@ -1167,7 +1191,7 @@ impl Overlay<'_> {
       && self
         .vol
         .inode(store, no)
-        .is_ok_and(|i| matches!(i.body, Body::Base(_) | Body::Symlink(_)) && i.attrs.nlink == 1)
+        .is_ok_and(|i| matches!(i.body, Body::Base(_) | Body::BaseLink(_)) && i.attrs.nlink == 1)
   }
 
   /// Removes an untouched entry the disk no longer has from the node (no whiteout, no journal).
@@ -1402,8 +1426,11 @@ impl Overlay<'_> {
           .host
           .read_link(parent_dir, &entry.name)
           .map_err(host_refusal)?;
-        let mut inode = Inode::new(no, epoch, Kind::Symlink, fp.mode, Body::Symlink(target));
+        let mut inode = Inode::new(no, epoch, Kind::Symlink, fp.mode, Body::BaseLink(target));
         inode.attrs.size = fp.size;
+        // The disk's times, as a base file takes them (until 2026-10-08 a base symlink reported time zero).
+        inode.attrs.mtime = fp.mtime_ns;
+        inode.attrs.ctime = fp.ctime_ns;
         (inode.attrs.uid, inode.attrs.gid) = (fp.uid, fp.gid);
         inode.home = Home::new(parent_no, self.vol.policy.hash(&entry.name));
         let handle = store.inodes.insert(inode)?;
@@ -2145,6 +2172,18 @@ impl Overlay<'_> {
       return Ok(());
     };
     if plane.is_witnessed(no) {
+      return Ok(());
+    }
+    if let Body::BaseLink(target) = &self.vol.inode(store, no)?.body {
+      // A base symlink's copy-up is its target becoming the volume's own: nothing is read from the disk (the target
+      // was read with the listing), and the link is a created one from here on, so a rename lands it at its new name
+      // and the whiteout left at the old name removes the disk's.
+      let target = target.clone();
+      let handle = self.vol.make_current_inode(store, no)?;
+      let prev = store.inodes.get(handle)?.version;
+      store.inodes.get_mut(handle)?.body = Body::Symlink(target);
+      let path = self.vol.path_of_inode(store, no).unwrap_or_default();
+      self.vol.record(Op::Witness, path, Some(no), prev);
       return Ok(());
     }
     let is_base = matches!(self.vol.inode(store, no)?.body, Body::Base(_));

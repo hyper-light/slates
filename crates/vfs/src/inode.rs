@@ -135,6 +135,11 @@ pub enum Body {
   Symlink(Box<str>),
   /// A base-backed entry.
   Base(BaseBody),
+  /// An untouched base symlink (§4.5): its target as the disk held it when its directory was listed. The symlink
+  /// counterpart of [`Body::Base`]: in no diverged set, and leaving a merged directory when the disk no longer lists
+  /// it. A copy-up makes it a plain [`Body::Symlink`]. Before 2026-10-08 a base symlink was a plain symlink, so a
+  /// landing planned every one of them as a change and a fresh listing dropped every symlink the volume created.
+  BaseLink(Box<str>),
 }
 
 /// An inode's extended attributes (§4.5): each name and the attribute inode that holds its value,

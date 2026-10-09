@@ -2278,6 +2278,35 @@ Apple M5 Max, macOS's own NFS client, 2 shards, load average about 6.
     into the reply's buffer directly (no zeroed buffer of the asked size, no second copy). At 256 KiB, five rounds in
     random order: a median of 119 ms against 124 ms for the walk.
 
+### An overlay of a real tree on Linux: read, change, plan (condition 5; 2026-10-08)
+
+Command: `docker run --rm --privileged -e SLATES=/target/esc/release/slates -v slates-linux-target:/target:ro -v
+"$PWD/docs/wip/bench/overlay":/o:ro rust:1.98.0 bash /o/overlay_diff.sh /usr/lib 3` (the Linux release build at HEAD
+plus A-121). The tree is copied into tmpfs, then each round runs on a fresh volume and fresh mounts. Each round
+creates the overlay (`--base`), then walks, cold-reads and warm-reads it through slates, through the kernel's own NFS
+server exporting the same tmpfs (the same NFSv4.2 client, its floor) and on the host. It then makes 10 appends,
+5 creates and 3 removals, and times `slates land` (the plan, presented, not granted) against `diff -rq` over a host copy
+given the same changes. Docker Desktop 6.12 kernel, Apple M5 Max, load average 13.7 from other sessions.
+/usr/lib: 5,863 files, 7,113 entries, 540.7 MB.
+
+| step | slates | kernel NFS server | host |
+|---|---|---|---|
+| create the overlay volume | 2 ms | — | — |
+| walk every entry | 157–268 ms | 135–158 ms | 4–5 ms |
+| cold read, every byte | 1,761–1,806 ms | 2,066–2,199 ms | 91–92 ms |
+| warm read | 672–734 ms | 1,344–1,580 ms | 90–99 ms |
+| change set after 18 changes | `land` plan 2–3 ms, exactly 10 replace / 5 create / 3 delete | — | `diff -rq` 371–389 ms: 11 differ, 5 + 3 only-in, 8 dangling links |
+
+- Before A-121 the same run (load 14) planned `symlink=657` besides the 18, one per untouched base symlink
+  (`docs/bugs/2026-10-08-base-symlinks-were-planned-as-changes.md`). Reads in that run: cold 1,398–1,544 ms against
+  1,438–1,666 ms for the kernel's server, warm 571–650 against 988–1,548.
+- Where the warm read goes: slates hands out read delegations, so its warm pass sends 1,560 opens against 5,863 for the
+  kernel's server. The client returns the delegations it cannot keep (`DELEGRETURN` 1,560), and no data READ is sent
+  while the page cache holds the tree. At load 27 (2026-10-08, one round) the page cache did not hold it, and both
+  servers re-read about 5,500 READs.
+- `diff -rq` is the less exact baseline: it follows a symlink alias to an appended file (11 differ for 10 appends)
+  and cannot compare a dangling link. The plan compares entries, not what they point to.
+
 ### The daemon under a container memory cap, and large writes over Linux's NFS client on loopback (conditions 11, 12; 2026-10-05)
 
 Commands: `docs/wip/bench/pressure/memory-cap.sh` (privileged `rust:1.98.0`, `--memory 1g --memory-swap 1g`, the Linux

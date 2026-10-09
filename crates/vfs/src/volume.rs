@@ -1315,7 +1315,7 @@ impl Volume {
   /// The target of a symlink.
   pub fn readlink(&self, store: &Store, no: InodeNo) -> Result<Box<str>, VfsError> {
     match &self.inode(store, no)?.body {
-      Body::Symlink(target) => Ok(target.clone()),
+      Body::Symlink(target) | Body::BaseLink(target) => Ok(target.clone()),
       _ => Err(VfsError::Invalid),
     }
   }
@@ -1390,7 +1390,7 @@ impl Volume {
           store.content.read_extent_into(e, off, out)?;
         }
       }
-      Body::None | Body::Directory(_) | Body::Symlink(_) => {}
+      Body::None | Body::Directory(_) | Body::Symlink(_) | Body::BaseLink(_) => {}
     }
     Ok(want)
   }
@@ -2572,7 +2572,7 @@ impl Volume {
           store.content.read_extent_into(e, off, out)?;
         }
       }
-      Body::None | Body::Directory(_) | Body::Symlink(_) => {}
+      Body::None | Body::Directory(_) | Body::Symlink(_) | Body::BaseLink(_) => {}
     }
     Ok(want)
   }
@@ -2585,7 +2585,7 @@ impl Volume {
     no: InodeNo,
   ) -> Result<Box<str>, VfsError> {
     match &self.inode_in(store, id, no)?.body {
-      Body::Symlink(target) => Ok(target.clone()),
+      Body::Symlink(target) | Body::BaseLink(target) => Ok(target.clone()),
       _ => Err(VfsError::Invalid),
     }
   }
@@ -6344,7 +6344,7 @@ fn data_ranges(body: &Body, size: u64) -> Vec<(u64, u64)> {
       ranges.push((open.off, open.off.saturating_add(open.len)));
     }
     Body::Base(_) => ranges.push((0, size)),
-    Body::None | Body::Directory(_) | Body::Symlink(_) => {}
+    Body::None | Body::Directory(_) | Body::Symlink(_) | Body::BaseLink(_) => {}
   }
   ranges.sort_unstable();
   let mut merged: Vec<(u64, u64)> = Vec::with_capacity(ranges.len());

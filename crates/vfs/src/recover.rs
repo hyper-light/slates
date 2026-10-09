@@ -226,6 +226,12 @@ pub enum BodyImage {
     /// The target path.
     target: String,
   },
+  /// An untouched base symlink's target as the disk held it ([`Body::BaseLink`]); appended, so every earlier image
+  /// decodes as it did.
+  BaseLink {
+    /// The target path.
+    target: String,
+  },
 }
 
 /// A block of the shard's arena (A-64): its region, its offset within it and its length (a power-of-two number
@@ -1630,6 +1636,9 @@ impl Volume {
           Body::Symlink(target) => BodyImage::Symlink {
             target: target.to_string(),
           },
+          Body::BaseLink(target) => BodyImage::BaseLink {
+            target: target.to_string(),
+          },
           _ => return Err(VfsError::RecoveryIncomplete),
         },
         Kind::File => file_body_image(store, &inode.body)?,
@@ -1856,7 +1865,9 @@ fn file_body_image(store: &Store, body: &Body) -> Result<BodyImage, VfsError> {
         born: open.born.0,
       }),
     }),
-    Body::Directory(_) | Body::Symlink(_) | Body::Base(_) => Err(VfsError::RecoveryIncomplete),
+    Body::Directory(_) | Body::Symlink(_) | Body::BaseLink(_) | Body::Base(_) => {
+      Err(VfsError::RecoveryIncomplete)
+    }
   }
 }
 
@@ -2649,7 +2660,7 @@ fn body_crc(body: &BodyImage) -> u32 {
     // A chunked body's references and offsets are its identity (the same blocks at another offset are a
     // different file), so the crc covers the body's canonical wire form, as for a base body.
     BodyImage::Inline { .. } | BodyImage::Chunked { .. } => crc32c(&body.to_bytes()),
-    BodyImage::Symlink { target } => crc32c(target.as_bytes()),
+    BodyImage::Symlink { target } | BodyImage::BaseLink { target } => crc32c(target.as_bytes()),
     BodyImage::Empty => crc32c(&[]),
     BodyImage::Directory { .. } => 0,
     BodyImage::Base { .. } => crc32c(&body.to_bytes()),
@@ -2678,6 +2689,7 @@ fn body_for(
     }
     KindImage::Symlink => match &image_inode.body {
       BodyImage::Symlink { target } => Ok(Body::Symlink(target.as_str().into())),
+      BodyImage::BaseLink { target } => Ok(Body::BaseLink(target.as_str().into())),
       _ => Err(VfsError::RecoveryIncomplete),
     },
     KindImage::File => file_body_from_image(claims, &image_inode.body, image_inode.attrs.size),
@@ -2726,7 +2738,9 @@ fn file_body_from_image(claims: &Claims, body: &BodyImage, size: u64) -> Result<
       base_len: *base_len,
       lost: *lost,
     })),
-    BodyImage::Directory { .. } | BodyImage::Symlink { .. } => Err(VfsError::RecoveryIncomplete),
+    BodyImage::Directory { .. } | BodyImage::Symlink { .. } | BodyImage::BaseLink { .. } => {
+      Err(VfsError::RecoveryIncomplete)
+    }
   }
 }
 

@@ -4843,3 +4843,29 @@ resolves its owner again within its one-budget allowance (`verbs::locate_within_
 
 The second arm failed because only a fresh call's direct route (the creator, eligible again once refuted) finds the
 owner quickly; location rounds alone did not within the budget. Fleet suite 80/80.
+
+### 2026-10-08: an overlay of a real tree on Linux: reads at the client's floor, the plan exact after a symlink fix (condition 5)
+
+Measured with `docs/wip/bench/overlay/overlay_diff.sh /usr/lib 3` (Linux NFSv4.2 client, Docker Desktop 6.12 kernel,
+Apple M5 Max, load average 13–14 from other sessions; the tree copied into tmpfs first so every reader starts from RAM):
+
+- **Reads at the NFS client's floor.** 5,863 files, 540.7 MB, a fresh volume and mount each round:
+  - cold read: slates 1.76–1.81 s, the kernel's own NFS server over the same client 2.07–2.20 s, the host 91 ms;
+  - warm read: slates 672–734 ms, the kernel's server 1.34–1.58 s;
+  - the warm pass costs slates 1,560 opens where the kernel's server takes 5,863: slates hands out read delegations,
+    and the client keeps about 4,300 of them (`OPEN_NOATTR`/`DELEGRETURN` counts from `/proc/self/mountstats`).
+  The rest of the gap to the host is the client's per-call cost, as on macOS (2026-10-05).
+- **Change tracking: fixed (A-121).** The first run planned `symlink=657` besides the 18 real changes, one per untouched
+  base symlink, and a symlink the volume created could vanish at the next fresh listing
+  (`docs/bugs/2026-10-08-base-symlinks-were-planned-as-changes.md`). After the fix the plan is exact (`create=5 delete=3
+  replace=10`) in 2–3 ms, against 371–389 ms for `diff -rq`.
+- **Open, found here:**
+  - An untouched base *file* whose disk entry became another kind (a directory, a symlink) is not refreshed:
+    `stale_entries` refreshes a file only while its listed kind is still a file. Same shape as the symlink retarget
+    fixed in A-121; not yet built.
+  - On the second pass over a fresh mount the client re-reads 464 of 590 directories and sends 298 ACCESS calls, then
+    nothing more on passes three and four (cumulative counts, `ovdiag`). Something moves directories' change
+    attributes during the first pass; likely materializing base entries. Diagnosed to that point only.
+  - A container that exits with a slates NFS mount still mounted deadlocks: the daemon's own exiting thread drops the
+    last reference to the mount namespace, and the unmount's DESTROY_SESSION waits on that daemon. Every bench script
+    must unmount in an exit trap; one diagnostic without one left a container only a VM restart clears.

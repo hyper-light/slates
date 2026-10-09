@@ -1841,6 +1841,13 @@ the verdict that every entry beneath still matches its listing fingerprint.
 > before. Owed: an overlay page repeats the base listing's merge check; the hash is FNV-1a, unkeyed, so a writer
 > able to craft a large group of names sharing a cookie can make that directory unlistable through a small page.
 
+> **Status (A-121, 2026-10-08: base symlinks).** An untouched base symlink is `Body::BaseLink`, the symlink counterpart
+> of `Body::Base`. It carries the disk's target, owner and times. It is in no diverged set, and it leaves a merged
+> directory when the disk's entry changes kind, size or times. A rename, link or setattr copies it up into a plain
+> symlink. Before, it shared a created symlink's body: a landing planned every one, and a fresh listing dropped every
+> symlink the volume had created (`docs/bugs/2026-10-08-base-symlinks-were-planned-as-changes.md`). Owed: an
+> untouched base file whose disk entry became another kind is not refreshed (GAPS, 2026-10-08).
+
 ### 4.6 OS bridges (D-1, D-2, D-3)
 
 > **Connection affinity (2026-10-04, D-7 "bridge queues pinned to the owner").** A loopback NFS connection is
@@ -10520,3 +10527,25 @@ Status: built 2026-10-08.
   passed the Inspector's SEP-2640 conformance rules (the name's pattern and its match with the URI's segment, the
   description's length, the manifest listing the skill's own file, the digest's form), and the digests and sizes
   matched the `skills/` files byte for byte.
+
+### A-121 — An untouched base symlink is a base entry (2026-10-08)
+Applied in the same change to:
+- `crates/vfs/src/inode.rs` (`Body::BaseLink`); `crates/vfs/src/base.rs` (`materialize`, `diverged`, `diverged_in`,
+  `unloaded_file`, `copy_up`, `stale_entries`, `listed_link_changed`); `crates/vfs/src/volume.rs` (`readlink`,
+  `readlink_in`); `crates/vfs/src/recover.rs` (`BodyImage::BaseLink`, appended);
+- five tests in `crates/vfs/tests/base.rs`, `docs/wip/bench/overlay/overlay_diff.sh`,
+  `docs/bugs/2026-10-08-base-symlinks-were-planned-as-changes.md`, GAPS, BENCHMARKS.
+
+Status: built 2026-10-08.
+- What it answers: an overlay of `/usr/lib` given 18 changes planned 675 (`symlink=657` besides them). A base symlink
+  was loaded with the body a created symlink has, so the diverged set (§4.15) could not tell them apart. The same
+  ambiguity let a fresh listing drop a symlink the volume created, as if it were an untouched entry the disk had lost.
+- The rule (§4.5), the symlink counterpart of `Body::Base`:
+  - an untouched base symlink holds its target as the listing read it, and the disk's owner and times;
+  - it is in no diverged set, and leaves a merged directory when the disk's entry at its name is gone, of another kind,
+    or a link with other size or times (an outsider's `ln -sf`); the next lookup serves the disk's;
+  - every mutation copies it up as for a file: rename, link and setattr make it a plain symlink of the volume's own, so
+    a rename lands as a delete at the old name and a symlink at the new one.
+- Measured (2026-10-08, `overlay_diff.sh /usr/lib 3`, Linux NFSv4.2, load average 13.7): the plan is `create=5 delete=3
+  replace=10` in 2–3 ms in each round; `diff -rq` over a host copy with the same changes took 371–389 ms and reported 11
+  files differing (it follows a symlink alias to an appended file) and 8 dangling links it could not compare.
