@@ -4939,3 +4939,11 @@ invariants intact.
 - cargo build: 4.68 s, and the binary ran;
 - pip install of requests and flask: 4.58 s, and flask imported;
 - the anchor recorded 6 restarts and no give-up (A-119).
+
+### 2026-10-09: the day's vfs and NFS changes pass on x86_64 Linux (condition 6)
+
+Docker's amd64 emulation (`--platform linux/amd64 rust:1.98.0`, `uname -m` = `x86_64`):
+- `cargo test -p slates-vfs --test base` at `c264b71c`: 38 passed, including the base-symlink, kind-change and
+  outsider-recall tests;
+- `cargo test -p slates-bridge-nfs` at `cf1162ed`: every suite passed, including the read-tail oracle and its
+  hostile-input test.
