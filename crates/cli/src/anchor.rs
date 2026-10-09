@@ -376,15 +376,27 @@ fn observe(
         );
         starting_since = Some(clock.monotonic_ns());
       }
-      slates_anchor::Step::CrashLoop { exit_code } => {
-        return Err(Failure::Failed(format!(
-          "the daemon is in a crash loop (last exit {exit_code:?}); giving up"
-        )));
+      slates_anchor::Step::CrashLoop {
+        exit_code,
+        retry_in_ns,
+      } => {
+        // Never given up on (A-119): every hard mount waits for the daemon. The loop is recorded for the health
+        // plane and the restart comes after the backoff.
+        eprintln!(
+          "slates anchor: the daemon is in a crash loop (last exit {exit_code:?}); restarting it in {} ms",
+          retry_in_ns / NS_PER_MS
+        );
+      }
+      slates_anchor::Step::BackingOff { .. } => {
+        await_observation(supervisor, &mut daemon_watch);
       }
       slates_anchor::Step::Stopped => return Ok(()),
     }
   }
 }
+
+/// Format: nanoseconds in a millisecond, for the anchor's log lines.
+const NS_PER_MS: u64 = 1_000_000;
 
 /// What the observation loop knows between turns to judge a heartbeat fairly: when it last observed, and since when
 /// it may hold the daemon to the budget.

@@ -26,7 +26,7 @@ for round in $(seq 1 "$ROUNDS"); do
   C0=$(cpu_ms)
   W=$(dd if=/tmp/src of=/mnt/v/f bs=1M conv=fsync 2>&1 | awk '/copied/{print $(NF-1), $NF}')
   C1=$(cpu_ms)
-  sync; echo 3 > /proc/sys/vm/drop_caches
+  sync -f /mnt/v; echo 3 > /proc/sys/vm/drop_caches
   C2=$(cpu_ms)
   R=$(dd if=/mnt/v/f of=/dev/null bs=1M 2>&1 | awk '/copied/{print $(NF-1), $NF}')
   C3=$(cpu_ms)

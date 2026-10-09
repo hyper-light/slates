@@ -10,7 +10,7 @@ apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq nfs-common python3 
 cp /target/release/slates /usr/local/bin/slates
 pss_kib() { awk '/^Pss:/{print $2}' /proc/$1/smaps_rollup; }
 detail() { awk '/^(Rss|Pss|Pss_Anon|Pss_File|Pss_Shmem|Shared_Clean|Private_Dirty):/{printf "%s %s ", $1, $2}' /proc/$1/smaps_rollup; }
-kernel_kib() { sync; echo 3 > /proc/sys/vm/drop_caches; awk '$1=="Shmem:"||$1=="Slab:"{s+=$2} END {print s}' /proc/meminfo; }
+kernel_kib() { sync -f /ram; echo 3 > /proc/sys/vm/drop_caches; awk '$1=="Shmem:"||$1=="Slab:"{s+=$2} END {print s}' /proc/meminfo; }
 make_files() { python3 - "$1" "$COUNT" <<'PY'
 import os, sys, time
 root, count = sys.argv[1], int(sys.argv[2])

@@ -10469,3 +10469,29 @@ Status: built 2026-10-08.
   - Size classes (jemalloc's four per doubling): 1.16% waste at a 512 B granule against 3.21% here, but a second
     allocator beside the buddy, a sub-page granule the arena does not have, and new recovery-image fields.
   - A second extent per window for the tail: the same waste as the trim, with an extent and a chunk record per tail.
+
+### A-119 — Supervision never gives up on the daemon; a crash loop backs off (2026-10-08)
+Applied in the same change to:
+- `crates/anchor/src/supervise.rs` (`Step::CrashLoop { exit_code, retry_in_ns }`, `Step::BackingOff`, the scheduled
+  restart, the doubling backoff, `RETRY_CAP_NS`; a stop cancels a backoff) and `crates/cli/src/anchor.rs` (the loop
+  logs the crash loop and keeps supervising);
+- the tests `a_crash_loop_is_restarted_after_a_doubling_backoff_never_given_up` (`crates/anchor/tests/anchor.rs`) and
+  the recorded `docs/wip/bench/kill_storm.sh`;
+- the benches' global `sync` replaced by `sync -f PATH` (`mixed/copy_tree.sh`, `mem/per_file.sh`, `mem/per_entry.sh`,
+  `nfs/large_io.sh`).
+
+Status: built 2026-10-08.
+- What it answers: the anchor counted restarts in a window (the recovery budget) against an allowance of the budget
+  over the longest measured start, and past it stopped supervising for good. On a loaded host a start stretched to
+  160–490 ms (shard recovery contending for the CPU), the allowance fell to one, and `realworld_chaos.sh`'s two kills
+  0.3 s apart ended supervision: pip hung in the dead hard mount. Its unmount, returning a write delegation to the dead
+  server, then pinned a superblock in the Docker VM, and every global `sync` there has blocked since.
+- The rule: the crash loop is still detected by the same derived bound and recorded for the health plane
+  (`State::CrashLoop`), and the daemon is restarted after a backoff instead of never. The backoff starts at the
+  window, doubles with each crash loop, is capped at a hard Linux NFS mount's major timeout (60 s, `nfs(5)` `timeo`
+  600; a longer wait gains a waiting client nothing), and returns to the window once a daemon outlives it. A stop
+  ends a backoff. Kubernetes backs a crash-looping container off the same way and never stops restarting it; a daemon
+  that every mounted client waits on must not be abandoned.
+- Measured: `KILLS=40 GAP=0.02 kill_storm.sh` (Linux 6.12): ten restarts, then a crash loop recorded with a restart
+  in 1,000 ms; the anchor alive and the 8 MiB file on the mount read back identical 0.35 s after the storm. The
+  default storm (8 kills 100 ms apart) restarted eight times with no crash loop on a quiet host.

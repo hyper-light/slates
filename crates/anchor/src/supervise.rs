@@ -41,6 +41,11 @@ pub const ENV_NFS_LISTENER: &str = "SLATES_ANCHOR_NFS";
 /// its plan says. Unix, as the NFS listener's descriptor is.
 pub const ENV_FLEET_SERVE: &str = "SLATES_ANCHOR_FLEET_SERVE";
 
+/// Format: the longest a crash loop's backoff grows to: the major timeout of a hard Linux NFS mount over TCP
+/// (`nfs(5)`: `timeo` defaults to 600 deciseconds, 60 s), the cadence a mounted client retries a silent server at, so
+/// a longer wait gains it nothing (A-119).
+pub const RETRY_CAP_NS: u64 = 60_000_000_000;
+
 /// The restart policy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RestartPolicy {
@@ -82,10 +87,19 @@ pub enum Step {
     /// Restarts inside the window after this one.
     in_window: u32,
   },
-  /// The daemon exited and the policy refused another restart.
+  /// The daemon exited faster than it could recover, past the policy's bound: a crash loop, recorded for the health
+  /// plane, with a restart scheduled after a backoff (A-119; supervision never gives up, since every hard mount waits
+  /// on the daemon).
   CrashLoop {
     /// The exit code.
     exit_code: Option<i32>,
+    /// The backoff before the next restart.
+    retry_in_ns: u64,
+  },
+  /// In a crash loop, waiting out the backoff before the restart due at `retry_at_ns`.
+  BackingOff {
+    /// When the restart is due.
+    retry_at_ns: u64,
   },
   /// Nothing to supervise (stopped by the owner).
   Stopped,
@@ -115,7 +129,13 @@ pub struct Supervisor {
   policy: RestartPolicy,
   child: Option<Child>,
   restarts_at_ns: VecDeque<u64>,
-  crash_loop: bool,
+  /// When a crash loop's backed-off restart is due (A-119); `None` outside a crash loop.
+  retry_at_ns: Option<u64>,
+  /// The backoff the next crash loop waits: the window, doubled by each crash loop to [`RETRY_CAP_NS`], and back to
+  /// the window once a daemon outlives it.
+  backoff_ns: u64,
+  /// When the current daemon was started.
+  started_at_ns: u64,
   /// Ties the daemon's life to the anchor's where the OS offers it (Windows: a job object
   /// that kills its processes when its last handle closes; Linux: the daemon asks for the
   /// parent-death signal itself; macOS: the daemon watches its parent's id).
@@ -189,7 +209,9 @@ impl Supervisor {
       policy,
       child: None,
       restarts_at_ns: VecDeque::new(),
-      crash_loop: false,
+      retry_at_ns: None,
+      backoff_ns: policy.window_ns,
+      started_at_ns: 0,
       lifetime: lifetime::Tie::new(),
       environment: Vec::new(),
       #[cfg(unix)]
@@ -365,6 +387,10 @@ impl Supervisor {
 
   /// Replaces the policy (the anchor re-derives it as daemon starts are measured).
   pub fn set_policy(&mut self, policy: RestartPolicy) {
+    // A backoff under way keeps its length; the next one starts from the new window.
+    if self.retry_at_ns.is_none() {
+      self.backoff_ns = policy.window_ns;
+    }
     self.policy = policy;
   }
 
@@ -383,6 +409,7 @@ impl Supervisor {
     if self.child.is_some() {
       return Ok(());
     }
+    self.started_at_ns = now_ns;
     let mut env = self.segment.handoff_env()?;
     env.push((ENV_ANCHOR_PID.to_owned(), std::process::id().to_string()));
     // Hand the held NFS listener's descriptor over: it is inheritable (not close-on-exec), so the
@@ -428,15 +455,29 @@ impl Supervisor {
     // and everything a dead daemon sent is applied before its successor starts.
     #[cfg(unix)]
     self.drain_devices();
-    if self.crash_loop {
-      return Ok(Step::CrashLoop { exit_code: None });
+    if let Some(retry_at_ns) = self.retry_at_ns {
+      if now_ns < retry_at_ns {
+        return Ok(Step::BackingOff { retry_at_ns });
+      }
+      self.retry_at_ns = None;
+      self.start(now_ns)?;
+      return Ok(Step::Restarted {
+        exit_code: None,
+        in_window: u32::try_from(self.restarts_at_ns.len()).unwrap_or(u32::MAX),
+      });
     }
     let Some(child) = self.child.as_mut() else {
       return Ok(Step::Stopped);
     };
     let status = match child.try_wait() {
       Ok(Some(status)) => status,
-      Ok(None) => return Ok(Step::Running),
+      Ok(None) => {
+        // A daemon that outlived the window recovered: the next crash loop backs off from the window again.
+        if now_ns.saturating_sub(self.started_at_ns) > self.policy.window_ns {
+          self.backoff_ns = self.policy.window_ns;
+        }
+        return Ok(Step::Running);
+      }
       Err(e) => {
         return Err(AnchorError::Spawn {
           code: e.raw_os_error(),
@@ -455,9 +496,18 @@ impl Supervisor {
     }
     let in_window = u32::try_from(self.restarts_at_ns.len()).unwrap_or(u32::MAX);
     if in_window > self.policy.max_restarts {
-      self.crash_loop = true;
+      // Not given up on (A-119): the loop is recorded, and the daemon restarted after a backoff that doubles each time
+      // to the cap, as Kubernetes backs off a crash-looping container. Every hard NFS mount on this daemon waits for
+      // it; a supervisor that stopped restarting left them hung for good (2026-10-08: two kills 0.3 s apart on a
+      // loaded host, whose recovery had stretched to 160-490 ms, ended supervision).
       self.segment.supervision()?.record_exit(true);
-      return Ok(Step::CrashLoop { exit_code });
+      let retry_in_ns = self.backoff_ns;
+      self.backoff_ns = self.backoff_ns.saturating_mul(2).min(RETRY_CAP_NS);
+      self.retry_at_ns = Some(now_ns.saturating_add(retry_in_ns));
+      return Ok(Step::CrashLoop {
+        exit_code,
+        retry_in_ns,
+      });
     }
     self.segment.supervision()?.record_exit(false);
     self.start(now_ns)?;
@@ -501,6 +551,8 @@ impl Supervisor {
     now_ns: u64,
     liveness_budget_ns: u64,
   ) -> Result<Stopping, AnchorError> {
+    // A stop ends a crash loop's backoff too: nothing restarts the daemon after it.
+    self.retry_at_ns = None;
     let Some(child) = self.child.as_mut() else {
       self.segment.supervision()?.record_exit(false);
       return Ok(Stopping::Exited {
@@ -555,6 +607,7 @@ impl Supervisor {
   /// the stop. The graceful path is [`request_stop`](Supervisor::request_stop) then
   /// [`stop_step`](Supervisor::stop_step).
   pub fn stop(&mut self) -> Result<(), AnchorError> {
+    self.retry_at_ns = None;
     if let Some(mut child) = self.child.take() {
       let _ = child.kill();
       let _ = child.wait();

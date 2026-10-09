@@ -36,10 +36,10 @@ echo "tree $TREE: $(find "$TREE" -xdev | wc -l) entries, $(du -sb "$TREE" | cut 
 for run in $(seq 1 "$RUNS"); do
   for target in slates knfs knfs-async ram; do
     case $target in slates) D=/mnt/slates;; knfs) D=/mnt/knfs;; knfs-async) D=/mnt/knfsa;; ram) D=/ram;; esac
-    START=$(date +%s%N); cp -a "$TREE" "$D/r$run"; sync; END=$(date +%s%N)
+    START=$(date +%s%N); cp -a "$TREE" "$D/r$run"; sync -f "$D"; END=$(date +%s%N)
     echo "run $run $target: $(( (END - START) / 1000000 )) ms"
     # Removed untimed, so one copy at a time is held: three targets' copies at once outgrew a 7.6 GiB VM (2026-10-08).
-    rm -rf "${D:?}/r$run"; sync
+    rm -rf "${D:?}/r$run"; sync -f "$D"
   done
 done
 slates --instance ct status --json > /tmp/status.json 2>/dev/null
