@@ -68,6 +68,8 @@ const SHIPMENTS_SENT: &str = "fleet.mirror.shipments_sent";
 const SHIPMENTS_ACKED: &str = "fleet.mirror.records_acked";
 /// See [`SHIPMENTS_SENT`].
 const SHIP_NO_SESSION: &str = "fleet.mirror.ship_no_session";
+/// Owner counter: shipment acknowledgements that came back after their round and were folded into the job.
+const SHIPMENTS_ACKED_LATE: &str = "fleet.mirror.records_acked_late";
 
 /// The status count of mirror shipments a holder accepted but did not acknowledge because the publish carrying them
 /// was refused. Format: a refusal name in the daemon's status report.
@@ -325,7 +327,11 @@ pub(crate) async fn ship(
       sent,
       &recovered,
       stragglers,
-      LateReplies::Discard,
+      LateReplies::MirrorShip {
+        shard,
+        object: item.object,
+        sequence: item.sequence,
+      },
     ));
     return_sessions(recovered);
     let _ = state::with_state_counted(|s| {
@@ -350,6 +356,44 @@ pub(crate) async fn ship(
       }
     });
   }
+}
+
+/// Folds a mirror shipment's late acknowledgements into its job on the owner `shard`: each reply that decodes as the
+/// acknowledgement of `object` at `sequence` adds its holder to the job's acknowledged set (a superseded job ignores
+/// it). Counted, so a late acknowledgement's rescue shows.
+pub(crate) fn fold_late_acks(
+  shard: u16,
+  object: ObjectId,
+  sequence: u64,
+  replies: &[(HostId, slates_cluster::TimedReply)],
+) {
+  let acked: Vec<HostId> = replies
+    .iter()
+    .filter(|(_, reply)| {
+      ShipmentAck::from_bytes(&reply.bytes)
+        .is_ok_and(|ack| ack.object == object.0 && ack.sequence == sequence)
+    })
+    .map(|(host, _)| *host)
+    .collect();
+  if acked.is_empty() {
+    return;
+  }
+  let origin = state::with_state(|s| s.shard).unwrap_or_default();
+  crate::xshard::run_on_counted(origin, shard, move |s| {
+    s.count(
+      SHIPMENTS_ACKED_LATE,
+      u64::try_from(acked.len()).unwrap_or(u64::MAX),
+    );
+    if let Some(job) = s.mirror_seals.get_mut(&object)
+      && job.sequence == sequence
+    {
+      for host in acked {
+        if !job.records_acked.contains(&host) {
+          job.records_acked.push(host);
+        }
+      }
+    }
+  });
 }
 
 /// The mirror holders that hold a mirror job's content and its records: what a promotion can adopt from. Placed

@@ -5045,6 +5045,18 @@ file, snapshots it, and times the snapshot's placement at home and then in the m
      shipment. The shipment must stay fixed per (object, sequence) across a job's restart, or a late acknowledgement
      must be folded rather than discarded (`mirror::ship`, `LateReplies::Discard`). Not yet built.
   2. One run's rounds 2–5 shipped nothing (`shipments_sent` 2 for 5 snapshots); not yet diagnosed.
+- **Same day, a late shipment acknowledgement is folded** into the job (`LateReplies::MirrorShip`,
+  `mirror::fold_late_acks`; counter `fleet.mirror.records_acked_late`), not discarded. Two five-round runs after it:
+  4 of 5 placed with one late acknowledgement rescued, and then 0 of 5 placed (`shipments_sent` 2, content
+  acknowledged 11 times).
+- **Hypothesis for both open items, not yet confirmed by a log:** a shipment is owed only once the head's sealing
+  covers every live mirror holder, each of which needs a pair key entry (`fleet::sealing_covers`). Pair delivery runs
+  over the same lossy crossing (`fleet.seal.pair_undelivered` counted 214–374 in earlier runs).
+  - Pairs that do not land would stop every shipment (item 2).
+  - Pairs that land one at a time would change the sealing, and so the head value, at a single position (item 1, the
+    conflict).
+  - To confirm next: the pair counters beside the mirror ones in the same run. If confirmed, the fix is pair delivery
+    that completes before the head value is fixed, and a value fixed once per (object, sequence).
 - New counters: `fleet.mirror.no_neighbourhood`, `job_started`, `content_rounds`, `acks`, `round_failed`,
   `no_holder_session`, `shipments_sent`, `records_acked`, `ship_no_session`, the `shipment_refused.<reason>` family,
   `fleet.seal.no_holder_session`, `fleet.content.unauthorized`, `answered` and `answered_empty`.

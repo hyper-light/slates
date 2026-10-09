@@ -4462,6 +4462,17 @@ pub(crate) enum LateReplies {
     /// When the round was dispatched, for the straggler's latency reading.
     dispatched_ns: u64,
   },
+  /// A mirror shipment (`crate::mirror::ship`): a holder's acknowledgement that came back after the round's budget is
+  /// folded into the job's acknowledged holders on its owner shard, never discarded. A holder keeps the first value at
+  /// a position, so a resend after a discarded acknowledgement could be refused for good (2026-10-09).
+  MirrorShip {
+    /// The owner shard the mirror job lives on.
+    shard: u16,
+    /// The object shipped.
+    object: ObjectId,
+    /// The head sequence shipped.
+    sequence: u64,
+  },
 }
 
 impl Dispatch {
@@ -4499,10 +4510,14 @@ impl Dispatch {
           replies.push((host, reply));
           recovered.push((host, endpoint));
         }
-        if let LateReplies::Content { .. } = late {
-          fold_late_content(late, &replies);
-        } else {
-          fold_late_replies(late, &replies);
+        match late {
+          LateReplies::Content { .. } => fold_late_content(late, &replies),
+          LateReplies::MirrorShip {
+            shard,
+            object,
+            sequence,
+          } => crate::mirror::fold_late_acks(shard, object, sequence, &replies),
+          _ => fold_late_replies(late, &replies),
         }
         (recovered, done)
       }
@@ -4598,8 +4613,8 @@ fn fold_late_replies(late: LateReplies, replies: &[(HostId, TimedReply)]) {
         LateReplies::RootFetch => {
           crate::consensus::adopt_fetch(s, true, *peer, bytes);
         }
-        // Folded on the seal's owner shard by [`fold_late_content`], outside this borrow.
-        LateReplies::Content { .. } => {}
+        // Folded on the owner shard by [`fold_late_content`] and `mirror::fold_late_acks`, outside this borrow.
+        LateReplies::Content { .. } | LateReplies::MirrorShip { .. } => {}
       }
     }
   });
