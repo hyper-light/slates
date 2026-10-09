@@ -384,6 +384,8 @@ impl McpServer {
       "resources/read" => self.resource_read(&params),
       "prompts/list" => Ok(prompts_list()),
       "prompts/get" => prompt_get(&params),
+      "skills/list" => Ok(skills_list()),
+      "skills/get" => skills_get(&params),
       other => Err(McpError {
         code: code::METHOD_NOT_FOUND,
         message: format!("unknown method: {other}"),
@@ -927,9 +929,38 @@ fn initialize_result(params: &Value) -> Value {
   })
 }
 
-/// What this server offers, as both eras declare it: tools, resources (the skills) and prompts (the skills again).
+/// What this server offers, as both eras declare it: tools, resources (the skills) and prompts (the skills again), and
+/// the Skills extension (SEP-2640) with no settings: `skills/list` and `skills/get`, without `resources/directory/read`
+/// (each skill is one file, its manifest complete).
 fn capabilities() -> Value {
-  json!({ "tools": {}, "resources": {}, "prompts": {} })
+  json!({
+    "tools": {},
+    "resources": {},
+    "prompts": {},
+    "extensions": { SKILLS_EXTENSION: {} },
+  })
+}
+
+/// Format: the Skills extension's identifier (SEP-2640).
+const SKILLS_EXTENSION: &str = "io.modelcontextprotocol/skills";
+
+/// `skills/list` (SEP-2640): every skill's entry, in the fixed order, cacheable as the other lists are.
+fn skills_list() -> Value {
+  let skills: Vec<Value> = skills::SKILLS.iter().map(skills::Skill::entry).collect();
+  json!({ "skills": skills, "ttlMs": CACHE_TTL_MS, "cacheScope": "public" })
+}
+
+/// `skills/get` (SEP-2640): the entry of the skill `uri` names, refused as an unknown resource is.
+fn skills_get(params: &Value) -> Result<Value, McpError> {
+  let uri = params
+    .get("uri")
+    .and_then(Value::as_str)
+    .unwrap_or_default();
+  let skill = skills::by_uri(uri).ok_or_else(|| McpError {
+    code: code::INVALID_PARAMS,
+    message: format!("no skill at {uri}"),
+  })?;
+  Ok(json!({ "skill": skill.entry(), "ttlMs": CACHE_TTL_MS, "cacheScope": "public" }))
 }
 
 /// The `server/discover` result (MCP 2026-07-28): the modern versions this server speaks, its capabilities, and

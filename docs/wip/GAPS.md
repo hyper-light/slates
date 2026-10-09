@@ -3743,6 +3743,9 @@ shard's own clock that A-65 budgets in (docs/bugs/2026-10-04-the-slow-observatio
   - `landing-slates-work-to-disk`.
   Each is checked as a client reads it against the Agent Skills specification's constraints
   (`assert_skills_over_mcp`).
+- **Skills extension (SEP-2640): done (A-120, 2026-10-08).** The official MCP Inspector found `skills/list`
+  unsupported; the extension is now declared and `skills/list` / `skills/get` serve each skill with a `sha256:`
+  manifest that passed the Inspector's conformance rules.
 - **Owed for condition 13, in order:**
   1. `slates skills install` (writing `.agents/skills/` and `.claude/skills/`): **Ada's ruling needed.** It writes a
      user's project directory outside a granted landing, which R1/R10 forbid as written; D-19 lists it. Until then

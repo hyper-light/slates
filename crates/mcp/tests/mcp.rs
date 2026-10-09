@@ -1755,6 +1755,67 @@ fn assert_skills_over_mcp(server: &mut McpServer) {
     names.push(name.to_owned());
   }
   assert_skill_listings_and_refusals(server, &names);
+  assert_skills_extension(server, &names);
+}
+
+/// The Skills extension (SEP-2640, `io.modelcontextprotocol/skills`; condition 13): do discover the server, list the
+/// skills and get each; expect the extension declared, one entry per skill `names` in order whose frontmatter names it
+/// and whose manifest lists its own `SKILL.md` with the `sha256:` digest and size of the document `resources/read`
+/// returns, `skills/get` answering the same entry, and an unknown skill refused `-32602`. Before it was declared the
+/// official MCP Inspector reported `skills_unsupported` (2026-10-08).
+fn assert_skills_extension(server: &mut McpServer, names: &[String]) {
+  let discovered = rpc(server, "server/discover", json!({}));
+  assert!(
+    discovered["capabilities"]["extensions"]["io.modelcontextprotocol/skills"].is_object(),
+    "the extension is declared: {discovered}"
+  );
+  let listed = rpc(server, "skills/list", json!({}));
+  let entries = listed["skills"].as_array().unwrap().clone();
+  let listed_names: Vec<String> = entries
+    .iter()
+    .map(|entry| entry["frontmatter"]["name"].as_str().unwrap().to_owned())
+    .collect();
+  assert_eq!(
+    listed_names, names,
+    "one entry per skill, in the same order"
+  );
+  for entry in &entries {
+    let uri = entry["uri"].as_str().unwrap();
+    let read = rpc(server, "resources/read", json!({ "uri": uri }));
+    let document = read["contents"][0]["text"].as_str().unwrap();
+    let hash = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, document.as_bytes());
+    let hex: String = hash
+      .as_ref()
+      .iter()
+      .map(|byte| format!("{byte:02x}"))
+      .collect();
+    let manifest = entry["resources"].as_array().unwrap();
+    assert_eq!(manifest.len(), 1, "{uri}: the skill is one file");
+    assert_eq!(
+      manifest[0]["uri"], uri,
+      "the manifest lists the skill's own file"
+    );
+    assert_eq!(
+      manifest[0]["digest"],
+      format!("sha256:{hex}"),
+      "{uri}: the digest is the document's"
+    );
+    assert_eq!(
+      manifest[0]["size"],
+      document.len(),
+      "{uri}: the size is the document's"
+    );
+    let got = rpc(server, "skills/get", json!({ "uri": uri }));
+    assert_eq!(
+      &got["skill"], entry,
+      "{uri}: skills/get answers the listed entry"
+    );
+  }
+  let reply = server
+    .handle(&json!({ "jsonrpc": "2.0", "id": 13, "method": "skills/get",
+      "params": { "uri": "skill://slates/nope/SKILL.md" } }))
+    .unwrap();
+  assert_eq!(reply["error"]["code"], -32602, "{reply}");
 }
 
 /// The rest of [`assert_skills_over_mcp`]: the prompt listing matches the skills `names`, the template is served,

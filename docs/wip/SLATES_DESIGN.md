@@ -10495,3 +10495,28 @@ Status: built 2026-10-08.
 - Measured: `KILLS=40 GAP=0.02 kill_storm.sh` (Linux 6.12): ten restarts, then a crash loop recorded with a restart
   in 1,000 ms; the anchor alive and the 8 MiB file on the mount read back identical 0.35 s after the storm. The
   default storm (8 kills 100 ms apart) restarted eight times with no crash loop on a quiet host.
+
+### A-120 — Skills through the MCP Skills extension (2026-10-08)
+Applied in the same change to:
+- `crates/mcp/src/lib.rs` (the `io.modelcontextprotocol/skills` extension declared in the capabilities both eras
+  report; `skills/list`, `skills/get`) and `crates/mcp/src/skills.rs` (`Skill::entry`, its manifest and `sha256:`
+  digests); `crates/mcp/Cargo.toml` (aws-lc-rs for SHA-256);
+- the test `assert_skills_extension` (`crates/mcp/tests/mcp.rs`), GAPS.
+
+Status: built 2026-10-08.
+- What it answers: the official MCP Inspector (`@modelcontextprotocol/inspector` 2.10.1, CLI mode, against
+  `slates mcp`) listed slates' 32 tools, 3 resources, 2 resource templates and 3 prompts, and answered `skills/list`
+  with `skills_unsupported`: "Server does not declare the io.modelcontextprotocol/skills extension". The skills were
+  served as resources and prompts (A-82), and a client following the Skills extension (SEP-2640, negotiated as
+  SEP-2133 extensions are) found none.
+- The rule: the server declares the extension, with no settings, and serves:
+  - `skills/list`: every skill's entry in the fixed order (`uri` `skill://slates/<name>/SKILL.md`, `frontmatter` with
+    `name` and `description`, and a manifest of the skill's files, each with a `sha256:` digest and its size), with
+    the list's `ttlMs` and `cacheScope`;
+  - `skills/get`: one entry by `uri`; an unknown skill is refused `-32602`, as an unknown resource is.
+  - `resources/directory/read` is not declared (`directoryRead` absent): each skill is one file, so its manifest is
+    complete.
+- Measured (2026-10-08, the Inspector against the release build): `skills/list` and `skills/get` answered; each entry
+  passed the Inspector's SEP-2640 conformance rules (the name's pattern and its match with the URI's segment, the
+  description's length, the manifest listing the skill's own file, the digest's form), and the digests and sizes
+  matched the `skills/` files byte for byte.
