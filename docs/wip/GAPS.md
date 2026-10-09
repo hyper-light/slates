@@ -5002,3 +5002,13 @@ At `28d49f15`, after the day's changes:
   is gone from the anchor's content object once the idle sweep seals the file, and once the file is deleted;
 - on macOS, `sealed_content_reads_back_byte_for_byte_after_a_restart` and
   `an_idle_small_file_is_sealed_by_the_daemons_sweep` passed.
+
+### 2026-10-09: the OCI binding through containerd and the MCP suites, re-checked at HEAD (conditions 2, 13)
+
+- `docs/wip/bench/containerd/run.sh` (containerd 1.7.24, runc 1.1.15, the Linux release build at `ee3e09b4`):
+  - `ctr run` applied the mount entry `slates attach --oci` returned; the workload extracted 2,002 entries in 1.08 s
+    (0.12 s on a tmpfs bind), and the host side saw the same tree (tar hash `bd4afa682283b722`);
+  - a setuid binary planted in the volume ran as `nobody` (65534) inside the container (`nosuid`);
+  - a read-only entry refused a write (`Read-only file system`).
+- `cargo test -p slates-mcp`: 15 unit tests and the end-to-end MCP test (which covers the skills extension, A-120)
+  passed.

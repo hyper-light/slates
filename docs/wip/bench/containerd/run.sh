@@ -25,7 +25,7 @@ pull() {
 }
 pull docker.io/library/alpine:3.20
 pull docker.io/library/debian:trixie-slim
-cp /target/release/slates /usr/local/bin/slates
+cp "${SLATES:-/target/release/slates}" /usr/local/bin/slates
 slates --instance cd anchor --quick --shards 2 >/out/anchor.out 2>/out/anchor.err &
 for _ in $(seq 1 200); do slates --instance cd volume list >/dev/null 2>&1 && break; sleep 0.1; done
 slates --instance cd bootstrap root >/dev/null 2>&1
