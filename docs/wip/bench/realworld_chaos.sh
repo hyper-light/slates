@@ -5,7 +5,7 @@
 # waits for the anchor, a background child of this script that never exits, and hung the first run (2026-10-05).
 set -u
 apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq nfs-common python3-venv git >/dev/null 2>&1
-cp /target/release/slates /usr/local/bin/slates
+cp "${SLATES:-/target/release/slates}" /usr/local/bin/slates
 slates --instance ch anchor --quick --shards 4 >/out/anchor.out 2>/out/anchor.err &
 for _ in $(seq 1 200); do slates --instance ch volume list >/dev/null 2>&1 && break; sleep 0.1; done
 slates --instance ch bootstrap root >/dev/null 2>&1

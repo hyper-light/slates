@@ -4925,3 +4925,13 @@ Apple M5 Max, load average 13–14 from other sessions; the tree copied into tmp
 
 The day's changes to base symlinks, recalls, the callback slot, the back channel and the READ path left the battery's
 invariants intact.
+
+### 2026-10-09: real workloads under daemon kills, rerun at HEAD (condition 11)
+
+`docs/wip/bench/realworld_chaos.sh` (Linux NFSv4.2, the daemon SIGKILLed twice in each workload, the release build at
+`d26b01b0`; no in-container `timeout`, whose kill of the shell had skipped the unmount trap and left a wedge on
+2026-10-08):
+- git clone: 0.99 s, `fsck` clean;
+- cargo build: 4.68 s, and the binary ran;
+- pip install of requests and flask: 4.58 s, and flask imported;
+- the anchor recorded 6 restarts and no give-up (A-119).
