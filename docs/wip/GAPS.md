@@ -5063,6 +5063,11 @@ file, snapshots it, and times the snapshot's placement at home and then in the m
   Three runs: one hit the conflict again (132/134), and two mirrored nothing at all (5 jobs started, nothing shipped,
   home placement slower at 0.9–3.5 s). Not better; not landed (patch kept in the session scratchpad,
   `mirror-map.patch`).
+- **Narrowed, same day:** every conflicting head differs from the held one in `content_holders` alone; the manifest
+  and sealing are equal (`fleet.mirror.conflict.*`, 132–415 refusals a holder). So it is one snapshot's head, built
+  twice with different holder sets. The per-(object, sequence) freeze, re-measured on that evidence, still conflicted
+  (415/408 in one run of three) and is rejected again (`mirror-map2.patch`). A likely source not yet shown: the frozen
+  entry dropped at the mirror placement's record, followed by a restarted job for the same snapshot.
 - **Open, sharpened:** the conflicting head value at one position has a source not yet found, and runs that ship
   nothing need the content-round counters beside `job_started` to place the stall. The next step is a log of each
   shipment's head bytes (hash) per (object, sequence) on the owner, to name which field differs.
