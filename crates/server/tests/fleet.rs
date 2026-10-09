@@ -12391,3 +12391,64 @@ fn assert_probe_opened(opened: Option<&[u8]>) {
     "the successor opens a chunk sealed on the dead owner under the lineage key it adopted from the head"
   );
 }
+
+/// Battery (2026-10-09; measured 2026-10-08: about 43 root and 17 council fetches a second per node before any
+/// `bootstrap`): do start two fleet nodes that know each other and never bootstrap either group, and let them idle for
+/// a window. Expect each node's configuration fetches to stay within what the uninitialized learner's backoff allows
+/// (the wait doubling from a heartbeat to the membership horizon, so about one round a horizon per group once ramped,
+/// each round asking the one peer), and its paced-fetch counter to have moved. Before, a learner fetched every period.
+#[test]
+fn an_unbootstrapped_fleet_paces_its_configuration_fetches_to_the_horizon() {
+  let _serial = serialize_fleet_tests();
+  let (_ports, [pa_probe, pa_record, pb_probe, pb_record]) = four_free_ports();
+  let a = node("a", pa_probe, pa_record);
+  let b = node("b", pb_probe, pb_record);
+  let peer_of_a = Peer {
+    anchor: b.origin_anchor,
+    host: b.host,
+    address: b.address,
+    record_address: b.record_address,
+    certificate: b.identity.certificate(),
+  };
+  let peer_of_b = Peer {
+    anchor: a.origin_anchor,
+    host: a.host,
+    address: a.address,
+    record_address: a.record_address,
+    certificate: a.identity.certificate(),
+  };
+  let daemon_a = start(a, peer_of_a);
+  let daemon_b = start(b, peer_of_b);
+  /// Shape: the idle window: long enough for the backoff to reach the horizon and hold there for several rounds.
+  const WINDOW: Duration = Duration::from_secs(6);
+  let began = Instant::now();
+  while began.elapsed() < WINDOW {
+    #[allow(clippy::disallowed_methods)]
+    // a test may sleep (the lint's stated exception): it idles the fleet
+    std::thread::sleep(Duration::from_millis(100));
+  }
+  let counts: Vec<(u64, u64)> = [&daemon_a, &daemon_b]
+    .iter()
+    .map(|daemon| {
+      (
+        refusal_count(daemon, "fleet.learner.fetches").unwrap_or(u64::MAX),
+        refusal_count(daemon, "fleet.learner.fetch_paced").unwrap_or(0),
+      )
+    })
+    .collect();
+  daemon_a.stop();
+  daemon_b.stop();
+  // Two groups, one peer each; per group the ramp (2, 4, 8 heartbeats) then one round a horizon. The bound allows
+  // the ramp's rounds plus one round a horizon over the whole window, and the window's session setup besides.
+  let horizon_ms = slates_server::lease::horizon_ns() / 1_000_000;
+  let rounds_per_group = u64::try_from(WINDOW.as_millis()).unwrap() / horizon_ms + 4;
+  let bound = 2 * rounds_per_group;
+  for (node, (fetches, paced)) in ["a", "b"].iter().zip(&counts) {
+    eprintln!("{node}: {fetches} fetches, {paced} paced in {WINDOW:?} (bound {bound})");
+    assert!(
+      *fetches <= bound,
+      "{node} sent {fetches} fetches in {WINDOW:?}, more than the paced bound {bound}"
+    );
+    assert!(*paced > 0, "{node}'s backoff paced its fetches");
+  }
+}

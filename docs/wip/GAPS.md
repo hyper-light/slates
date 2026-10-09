@@ -4809,7 +4809,11 @@ Measured on the two-network Docker topology (6 nodes, one shard each, no impairm
   lines were read by mistake while tracing this, against a standing rule not to, so the fix is Ada's to direct.
   - **Discovery fixed the same day:** a settled roster's checks back off to the membership horizon. Pages per idle
     node fell 9× (about 50/s → 5.5/s) and idle CPU about 20% (`BENCHMARKS.md`).
-  - Owed: the uninitialized-root poll backed off, and the remaining probe and Raft-heartbeat traffic measured.
+  - ~~Owed: the uninitialized-root poll backed off~~ **done 2026-10-09:** an uninitialized root or council learner
+    backs its fetches off from a heartbeat to the membership horizon (`fleet::next_learner_wait`). A/B in-process
+    (`an_unbootstrapped_fleet_paces_its_configuration_fetches_to_the_horizon`, two unbootstrapped nodes for 6 s): 96
+    fetches a node before, 12 after (102 periods paced). Owed: the remaining probe and Raft-heartbeat traffic
+    measured.
   - Not owed: the `getrusage` calls are the runtime's wait attribution (`rt/src/attribution.rs`, two per wait),
     130–134 ns each by its own record. 1,146 a second is under 0.02% of a core; strace's per-call overhead
     exaggerated them.

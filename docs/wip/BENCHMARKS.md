@@ -3526,6 +3526,21 @@ heartbeat (`fleet::next_discovery_wait`). The non-vacuity counter is `fleet.disc
 Pages fell 9×, and mean idle CPU about 20% (1.46% → 1.14%); the rest is probes and Raft heartbeats. The fleet suite
 passed 79/79 in 272 s (252–299 s before), so membership convergence did not slow.
 
+**Follow-up, 2026-10-09: an unbootstrapped fleet's configuration fetches.** Before any `bootstrap`, a root and council
+learner fetched every period (their empty configurations make every live peer look like a divergence). They now back
+off from a heartbeat to the horizon while the group stays uninitialized. Recovery and a stale-configuration refusal
+still fetch at once (`fleet::next_learner_wait`; non-vacuity counter `fleet.learner.fetch_paced`, fetches counted in
+`fleet.learner.fetches`). A/B by the in-process test
+`an_unbootstrapped_fleet_paces_its_configuration_fetches_to_the_horizon` (two nodes, never bootstrapped, 6 s; A is HEAD
+with only the counter added, built in its own target directory):
+
+| Arm | Fetches per node in 6 s | Periods paced |
+|---|---|---|
+| A, a fetch every period | 96 | 0 (the test fails) |
+| B, backed off to the horizon | 12 | 102 |
+
+The fleet suite passed 80/80 in 276 s, so formation and bootstrap learning did not slow.
+
 **Build trap, recorded so it is not repeated:** the first two B images ran A's binary. The Dockerfile shares one cached
 `target/` across builds, and BuildKit reuses an unchanged `COPY . .` layer with its old file times, so cargo kept the
 other tree's compiled crates. Touching the sources did not help. Each arm is now built in its own target volume and

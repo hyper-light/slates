@@ -2993,6 +2993,8 @@ fn init_shard(
     holder_records: std::collections::BTreeMap::new(),
     host_takeovers: std::collections::BTreeMap::new(),
     config_refresh_wanted: false,
+    council_learner_pace: crate::fleet::LearnerPace::default(),
+    root_learner_pace: crate::fleet::LearnerPace::default(),
     record_sessions: std::collections::BTreeMap::new(),
     link_waiters: std::collections::BTreeMap::new(),
     discovery_withhold_replies: false,

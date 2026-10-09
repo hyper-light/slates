@@ -3967,6 +3967,64 @@ fn next_discovery_wait(before: Option<u64>, after: Option<u64>, wait: u64) -> u6
   }
 }
 
+/// An uninitialized learner's fetch pace: when its next fetch is due and the wait after that one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct LearnerPace {
+  /// The runtime clock's time the next fetch is due.
+  due_ns: u64,
+  /// The wait after the next fetch.
+  wait_ns: u64,
+}
+
+impl Default for LearnerPace {
+  fn default() -> Self {
+    LearnerPace {
+      due_ns: 0,
+      wait_ns: HEARTBEAT_NS,
+    }
+  }
+}
+
+impl LearnerPace {
+  /// Whether a fetch is due at `now_ns`.
+  fn due(&self, now_ns: u64) -> bool {
+    now_ns >= self.due_ns
+  }
+
+  /// Paces the next fetch after one made at `now_ns`.
+  fn fetched(&mut self, now_ns: u64, still_uninitialized: bool) {
+    self.wait_ns = next_learner_wait(still_uninitialized, self.wait_ns);
+    self.due_ns = now_ns.saturating_add(self.wait_ns);
+  }
+
+  /// Back to fetching at once (the group is initialized, or another reason to fetch arrived).
+  fn reset(&mut self) {
+    *self = LearnerPace::default();
+  }
+}
+
+/// The wait before an uninitialized learner's next fetch (no group has been bootstrapped yet, so its configuration is
+/// empty and every live peer looks like a divergence): it doubles while the group stays uninitialized, from one
+/// heartbeat up to the membership horizon ([`crate::lease::horizon_ns`]), and is one heartbeat once it is initialized.
+/// A fleet left unbootstrapped then polls each voter about once a horizon rather than every heartbeat (measured
+/// 2026-10-08: about 43 root and 17 council fetches a second per node before `bootstrap root`), and a bootstrap is
+/// still learned within a horizon; a stale-configuration refusal or recovery fetches at once, as before.
+fn next_learner_wait(still_uninitialized: bool, wait_ns: u64) -> u64 {
+  if still_uninitialized {
+    wait_ns
+      .saturating_mul(2)
+      .clamp(HEARTBEAT_NS, crate::lease::horizon_ns())
+  } else {
+    HEARTBEAT_NS
+  }
+}
+
+/// Counter: learner fetches skipped while an uninitialized group's backoff ran (the backoff's non-vacuity counter).
+const LEARNER_FETCH_PACED: &str = "fleet.learner.fetch_paced";
+
+/// Counter: configuration fetch requests a learner sent, root and council (one per voter asked).
+const LEARNER_FETCHES: &str = "fleet.learner.fetches";
+
 /// The member id the link should address now (task #22). A change — the peer restarted — removes the
 /// previous member's record entry (the session to its previous incarnation is dead by definition), drops a
 /// dial still in its handshake (it points at the old incarnation's address and keys, so driving it on is
@@ -5374,16 +5432,32 @@ async fn drive_config_council(
   // configuration). The adopted configuration is installed into placement by `sync_config_from_council`,
   // exactly as a voter's committed one is.
   if !is_voter && !is_leader {
+    // An uninitialized council paces its fetches (`next_learner_wait`): its empty configuration makes every live peer
+    // a divergence, which is no evidence. Recovery and a stale-configuration refusal fetch at once.
+    let now = futures::now_ns();
     let wanted = state::with_state(|s| {
-      s.recovery.council.is_some()
-        || !s.council.initialized()
-        || s.config_refresh_wanted
-        || membership_diverges_from_config(s)
+      if s.recovery.council.is_some() || s.config_refresh_wanted {
+        s.council_learner_pace.reset();
+        true
+      } else if !s.council.initialized() {
+        let due = s.council_learner_pace.due(now);
+        if !due {
+          s.count(LEARNER_FETCH_PACED, 1);
+        }
+        due
+      } else {
+        s.council_learner_pace.reset();
+        membership_diverges_from_config(s)
+      }
     })
     .unwrap_or(false);
     if wanted {
       drive_learner_fetch(&voters, budget, in_flight).await;
-      let _ = state::with_state_counted(|s| s.config_refresh_wanted = false);
+      let _ = state::with_state_counted(|s| {
+        s.config_refresh_wanted = false;
+        let still = !s.council.initialized();
+        s.council_learner_pace.fetched(futures::now_ns(), still);
+      });
     }
     let timing = derive_group_timing(&voters, |s, timing| s.council_timing = timing);
     lapse_learner_lease(Group::Council, timer, contact, &timing, local, rank);
@@ -5531,13 +5605,32 @@ async fn drive_root_group(
     // reactively, only when its own alive view of the regions diverges from the root configuration it holds
     // ([`root_diverges`]), so a converged learner sends nothing. The cross-region parallel of the config
     // learner's reactive fetch.
-    let wanted =
-      state::with_state(|s| s.recovery.root.is_some() || !s.root.initialized() || root_diverges(s))
-        .unwrap_or(false);
+    // As the council learner: an uninitialized root paces its fetches; recovery fetches at once.
+    let now = futures::now_ns();
+    let wanted = state::with_state(|s| {
+      if s.recovery.root.is_some() {
+        s.root_learner_pace.reset();
+        true
+      } else if !s.root.initialized() {
+        let due = s.root_learner_pace.due(now);
+        if !due {
+          s.count(LEARNER_FETCH_PACED, 1);
+        }
+        due
+      } else {
+        s.root_learner_pace.reset();
+        root_diverges(s)
+      }
+    })
+    .unwrap_or(false);
 
     if wanted {
       let targets = root_learner_targets(&voters, local);
       drive_root_learner_fetch(&targets, budget, in_flight).await;
+      let _ = state::with_state_counted(|s| {
+        let still = !s.root.initialized();
+        s.root_learner_pace.fetched(futures::now_ns(), still);
+      });
     }
     let timing = derive_group_timing(&voters, |s, timing| s.root_timing = timing);
     lapse_learner_lease(Group::Root, timer, contact, &timing, local, rank);
@@ -5765,6 +5858,12 @@ async fn drive_root_learner_fetch(
   let sent: Vec<HostId> = requests.iter().map(|(host, _, _)| *host).collect();
   let (replied, stragglers) =
     broadcast(requests, ROOT_FETCH_STREAM, Priority::Metadata, budget).await;
+  let _ = state::with_state_counted(|s| {
+    s.count(
+      LEARNER_FETCHES,
+      u64::try_from(sent.len()).unwrap_or(u64::MAX),
+    );
+  });
   let mut recovered = Vec::with_capacity(replied.len());
   let mut fetched = Vec::with_capacity(replied.len());
   for (host, reply, endpoint) in replied {
@@ -5833,6 +5932,12 @@ async fn drive_learner_fetch(
   let sent: Vec<HostId> = requests.iter().map(|(host, _, _)| *host).collect();
   let (replied, stragglers) =
     broadcast(requests, CONFIG_FETCH_STREAM, Priority::Metadata, budget).await;
+  let _ = state::with_state_counted(|s| {
+    s.count(
+      LEARNER_FETCHES,
+      u64::try_from(sent.len()).unwrap_or(u64::MAX),
+    );
+  });
   let mut recovered = Vec::with_capacity(replied.len());
   let mut fetched = Vec::with_capacity(replied.len());
   for (host, reply, endpoint) in replied {
@@ -6806,6 +6911,34 @@ pub(crate) async fn forward_batch_over_leader_session(
     {
       return None;
     }
+  }
+}
+
+#[cfg(test)]
+mod learner_wait_tests {
+  use super::{HEARTBEAT_NS, next_learner_wait};
+
+  /// The uninitialized-learner backoff (battery, 2026-10-09). Do: step the wait while the group stays uninitialized,
+  /// then once it is initialized. Expect it to double from a heartbeat and stop at the membership horizon, and to be
+  /// one heartbeat again once the group is initialized.
+  #[test]
+  fn an_uninitialized_learner_backs_its_fetches_off_to_the_horizon_and_an_initialized_one_returns()
+  {
+    let horizon = crate::lease::horizon_ns();
+    let mut wait = HEARTBEAT_NS;
+    let mut waits = Vec::new();
+    for _ in 0..8 {
+      wait = next_learner_wait(true, wait);
+      waits.push(wait);
+    }
+    assert_eq!(waits.first(), Some(&HEARTBEAT_NS.saturating_mul(2)));
+    assert!(waits.windows(2).all(|pair| pair[0] <= pair[1]), "{waits:?}");
+    assert_eq!(
+      waits.last(),
+      Some(&horizon),
+      "the wait stops at the horizon: {waits:?}"
+    );
+    assert_eq!(next_learner_wait(false, horizon), HEARTBEAT_NS);
   }
 }
 

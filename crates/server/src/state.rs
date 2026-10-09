@@ -623,6 +623,10 @@ pub struct ShardState {
   /// nothing, replacing the per-period conditional poll. Only meaningful on the control shard (which drives
   /// and serves the council); inert elsewhere and on a laptop.
   pub config_refresh_wanted: bool,
+  /// When an uninitialized council learner fetches next, and the wait after it (`fleet::next_learner_wait`).
+  pub(crate) council_learner_pace: crate::fleet::LearnerPace,
+  /// When an uninitialized root learner fetches next, and the wait after it.
+  pub(crate) root_learner_pace: crate::fleet::LearnerPace,
   /// This node's client record sessions to its candidate holder peers (§4.8), keyed by peer host: each
   /// per-peer link task ([`crate::fleet::establish_record_link`]) brings its session up on one socket and
   /// installs it here as `Some`; the record-plane coordinator borrows a session for each dispatch — leaving
