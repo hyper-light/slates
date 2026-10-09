@@ -1845,8 +1845,9 @@ the verdict that every entry beneath still matches its listing fingerprint.
 > of `Body::Base`. It carries the disk's target, owner and times. It is in no diverged set, and it leaves a merged
 > directory when the disk's entry changes kind, size or times. A rename, link or setattr copies it up into a plain
 > symlink. Before, it shared a created symlink's body: a landing planned every one, and a fresh listing dropped every
-> symlink the volume had created (`docs/bugs/2026-10-08-base-symlinks-were-planned-as-changes.md`). Owed: an
-> untouched base file whose disk entry became another kind is not refreshed (GAPS, 2026-10-08).
+> symlink the volume had created (`docs/bugs/2026-10-08-base-symlinks-were-planned-as-changes.md`). The same
+> relisting now drops an untouched file or empty merged directory whose disk entry changed kind; before, the old kind
+> stayed at the name.
 
 ### 4.6 OS bridges (D-1, D-2, D-3)
 

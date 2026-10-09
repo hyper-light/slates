@@ -2108,3 +2108,67 @@ fn an_untouched_base_symlink_follows_the_disk() {
   assert_eq!(&*vol.readlink(&store, link).unwrap(), "libz.so.2");
   assert_eq!(vol.diverged(&store), Vec::new());
 }
+
+/// §4.5 "an untouched entry shows the live disk" (the sibling of A-121's symlink retarget, 2026-10-08): an untouched
+/// base file whose name the disk now gives a directory shows the directory once its parent is listed again. Do:
+/// overlay a base file and resolve it, then replace it on the disk with a directory holding a file, and list the
+/// parent. Expect the name to resolve to a directory, its child readable, and nothing diverged.
+#[test]
+fn an_untouched_base_file_the_disk_made_a_directory_shows_the_directory() {
+  let mut host = SimHost::new();
+  host.mkdir("/d");
+  host.replace_file("/d/x", b"a file");
+  host.advance_ns(2);
+  let mut store = store();
+  let mut vol = overlay(&mut host, &mut store);
+  let d = dir_at(&mut vol, &mut host, &mut store, "/d");
+  vol
+    .with_host(&mut host)
+    .resolve(&mut store, "/d/x")
+    .unwrap();
+  host.advance_ns(2);
+  host.remove("/d/x");
+  host.mkdir("/d/x");
+  host.replace_file("/d/x/inner", b"inside");
+  host.advance_ns(2);
+  vol.with_host(&mut host).readdir(&mut store, d).unwrap();
+  let located = vol
+    .with_host(&mut host)
+    .resolve(&mut store, "/d/x")
+    .unwrap();
+  assert!(
+    matches!(located.child, Child::Dir(_)),
+    "{:?}",
+    located.child
+  );
+  assert_eq!(
+    read_all(&mut vol, &mut host, &mut store, "/d/x/inner").unwrap(),
+    b"inside"
+  );
+  assert_eq!(vol.diverged(&store), Vec::new());
+}
+
+/// §4.5 (with the file case above, 2026-10-08): an untouched base directory whose name the disk now gives a file shows
+/// the file once its parent is listed again. Do: overlay an empty base directory and resolve it, then replace it on
+/// the disk with a file, and list the parent. Expect the name to read as the file, and nothing diverged.
+#[test]
+fn an_untouched_base_directory_the_disk_made_a_file_shows_the_file() {
+  let mut host = SimHost::new();
+  host.mkdir("/d");
+  host.mkdir("/d/x");
+  host.advance_ns(2);
+  let mut store = store();
+  let mut vol = overlay(&mut host, &mut store);
+  let d = dir_at(&mut vol, &mut host, &mut store, "/d");
+  dir_at(&mut vol, &mut host, &mut store, "/d/x");
+  host.advance_ns(2);
+  host.remove("/d/x");
+  host.replace_file("/d/x", b"now a file");
+  host.advance_ns(2);
+  vol.with_host(&mut host).readdir(&mut store, d).unwrap();
+  assert_eq!(
+    read_all(&mut vol, &mut host, &mut store, "/d/x").unwrap(),
+    b"now a file"
+  );
+  assert_eq!(vol.diverged(&store), Vec::new());
+}

@@ -61,8 +61,9 @@ After the fix, the same bench planned `create=5 delete=3 replace=10` in 2–3 ms
 
 ## Siblings checked
 
-- Untouched base files can also change kind on the disk (a file replaced by a directory). `stale_entries` refreshes a
-  file only while its listed kind is still a file; the other kinds fall through unchanged. This is the same shape as
-  the symlink retarget. It was not changed here, and is reported in GAPS.
+- Untouched base files can also change kind on the disk (a file replaced by a directory). `stale_entries` refreshed a
+  file only while its listed kind was still a file, and the other kinds fell through unchanged; an empty merged
+  directory the disk made a file stayed a directory too. Fixed in the next commit the same day: both are dropped at the
+  relisting, with a failing-first test each.
 - Devices, fifos and sockets on the base are `HostKind::Other`: listed, never served (`crates/vfs/src/host/mod.rs`), so
   no base body exists for them to be confused with.

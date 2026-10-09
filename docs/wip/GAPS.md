@@ -4860,9 +4860,11 @@ Apple M5 Max, load average 13–14 from other sessions; the tree copied into tmp
   (`docs/bugs/2026-10-08-base-symlinks-were-planned-as-changes.md`). After the fix the plan is exact (`create=5 delete=3
   replace=10`) in 2–3 ms, against 371–389 ms for `diff -rq`.
 - **Open, found here:**
-  - An untouched base *file* whose disk entry became another kind (a directory, a symlink) is not refreshed:
-    `stale_entries` refreshes a file only while its listed kind is still a file. Same shape as the symlink retarget
-    fixed in A-121; not yet built.
+  - **Fixed the same day:** an untouched base file whose disk entry became another kind stayed a file, and an
+    untouched empty base directory the disk made a file stayed a directory. `stale_entries` now drops either when its
+    listed kind changed, as it drops a retargeted link, and the next lookup serves the disk's entry
+    (`an_untouched_base_file_the_disk_made_a_directory_shows_the_directory`,
+    `an_untouched_base_directory_the_disk_made_a_file_shows_the_file`, each failing before).
   - On the second pass over a fresh mount the client re-reads 464 of 590 directories and sends 298 ACCESS calls, then
     nothing more on passes three and four (cumulative counts, `ovdiag`). Something moves directories' change
     attributes during the first pass; likely materializing base entries. Diagnosed to that point only.

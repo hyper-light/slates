@@ -663,6 +663,15 @@ impl BasePlane {
   }
 }
 
+/// Whether a directory node is an untouched merged base directory: it shows the disk, holds nothing of the volume's
+/// own and was never moved, so dropping it loses nothing the volume did.
+fn untouched_merged_dir(store: &Store, dir: Handle<DirNode>) -> bool {
+  store
+    .dirs
+    .get(dir)
+    .is_ok_and(|n| n.base == BaseDirState::Merged && n.is_empty() && n.origin.is_none())
+}
+
 fn host_refusal(e: HostError) -> VfsError {
   match e {
     HostError::NotFound => VfsError::NotFound,
@@ -1134,6 +1143,15 @@ impl Overlay<'_> {
         {
           gone.push(e.name.to_owned());
         }
+        // An untouched file or merged directory whose name the disk now gives another kind leaves the node the same
+        // way, and the next lookup serves the disk's entry (until 2026-10-08 the old kind stayed, serving a file the
+        // disk no longer had at a name that was now a directory).
+        (Some(l), Child::File(no)) if l.kind != HostKind::File && self.unloaded_file(store, no) => {
+          gone.push(e.name.to_owned());
+        }
+        (Some(l), Child::Dir(h)) if l.kind != HostKind::Dir && untouched_merged_dir(store, h) => {
+          gone.push(e.name.to_owned());
+        }
         (Some(_), _) => {}
         (None, Child::File(no) | Child::Symlink(no) | Child::Fifo(no) | Child::Socket(no))
           if self.unloaded_file(store, no) =>
@@ -1141,11 +1159,7 @@ impl Overlay<'_> {
           gone.push(e.name.to_owned());
         }
         (None, Child::Dir(h)) => {
-          if store
-            .dirs
-            .get(h)
-            .is_ok_and(|n| n.base == BaseDirState::Merged && n.is_empty() && n.origin.is_none())
-          {
+          if untouched_merged_dir(store, h) {
             gone.push(e.name.to_owned());
           }
         }
