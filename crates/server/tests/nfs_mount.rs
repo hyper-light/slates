@@ -3297,3 +3297,86 @@ fn a_granted_landing_waits_out_an_unreturned_delegation_and_lands() {
   drop((a, client, v3));
   drop(daemon);
 }
+
+/// RFC 8881 §2.10.6 (a session's back channel has one slot; found 2026-10-08 by the Linux overlay bench, where an
+/// outsider's edit asked 153 recalls of one client and 152 went unanswered): do give client A read delegations of two
+/// files, then write both over NFSv3 at once, so two recalls to A's one session are asked together. Expect A to be
+/// called back for both, one after the other, the second's slot sequence the first's plus one (the slot advanced by
+/// the answered callback only), both writes to succeed once A returns the delegations, and no recall unanswered.
+/// Before, the second recall was refused busy on the occupied slot and never sent, and the slot's sequence had moved
+/// for it anyway.
+#[test]
+fn recalls_asked_together_reach_the_one_slot_in_turn() {
+  let (daemon, instance) = two_shard_daemon_with("recall-burst", |config| {
+    config.failover_slo_ns = RECALL_LEASE.as_nanos().try_into().unwrap();
+  });
+  let mut client = Client::connect(&instance);
+  let volume = local_volume_name(&mut client);
+  let path = capability_path(&daemon, &volume);
+  let port = daemon.nfs_port().expect("the daemon is serving NFS");
+  let mut v3 = TcpStream::connect(("127.0.0.1", port)).unwrap();
+  let root = mount(&mut v3, &path, 1);
+  let first = create(&mut v3, &root, "one.txt", 2);
+  let second = create(&mut v3, &root, "two.txt", 3);
+  write(&mut v3, &first, b"before", 4);
+  write(&mut v3, &second, b"before", 5);
+  // A file changed within the lease is not delegated (A-78): the test waits the short lease out.
+  let written = Instant::now();
+  while written.elapsed() < RECALL_LEASE + RECALL_LEASE / 2 {
+    std::thread::yield_now();
+  }
+  let mut a = V4Client::connect_full(port, b"holder-a", 4, Some(CB_PROGRAM));
+  a.prove_back_channel(&daemon);
+  let component = path.trim_start_matches('/').to_owned();
+  let (_, fh_one, one) = a.open_for_reading(&component, "one.txt");
+  let (_, fh_two, two) = a.open_for_reading(&component, "two.txt");
+  let (one, two) = (
+    one.expect("one.txt is delegated"),
+    two.expect("two.txt is delegated"),
+  );
+  let other = TcpStream::connect(("127.0.0.1", port)).unwrap();
+  let writers = [
+    write_in_background(v3, first, b"after!"),
+    write_in_background(other, second, b"after!"),
+  ];
+  let recalled = answer_two_recalls(&mut a);
+  assert_eq!(
+    recalled,
+    [one.other, two.other].into_iter().collect(),
+    "each delegation recalled once"
+  );
+  assert_eq!(a.delegreturn(&fh_one, one), NFS4_OK);
+  assert_eq!(a.delegreturn(&fh_two, two), NFS4_OK);
+  for writer in writers {
+    let (status, took) = writer.join().unwrap();
+    assert_eq!(status, 0, "the held write succeeded (took {took:?})");
+  }
+  assert_eq!(counter(&daemon, "nfs4.recall.unanswered"), 0);
+  assert_eq!(counter(&daemon, "nfs4.recall.answered"), 2);
+  drop((a, client));
+  drop(daemon);
+}
+
+/// Answers the next two callbacks A receives, checking the second's slot sequence is the first's plus one: the state
+/// ids they recalled.
+fn answer_two_recalls(a: &mut V4Client) -> std::collections::BTreeSet<[u8; 12]> {
+  let call = a.next_message();
+  assert!(is_call(&call), "A is called back");
+  let (first, sequence_first) = a.answer_callback_with(&call, NFS4_OK);
+  let call = a.next_message();
+  assert!(
+    is_call(&call),
+    "A is called back again, for the other delegation"
+  );
+  let (second, sequence_second) = a.answer_callback_with(&call, NFS4_OK);
+  assert_eq!(
+    sequence_second,
+    sequence_first.wrapping_add(1),
+    "the slot advanced by one answered callback"
+  );
+  [first, second]
+    .into_iter()
+    .flatten()
+    .map(|stateid| stateid.other)
+    .collect()
+}

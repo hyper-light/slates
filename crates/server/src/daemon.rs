@@ -2918,6 +2918,8 @@ fn init_shard(
     #[cfg(unix)]
     nfs_v4_files: None,
     #[cfg(unix)]
+    recall_queues: std::collections::BTreeMap::new(),
+    #[cfg(unix)]
     nfs_v4_instance: None,
     db,
     fleet,
@@ -3159,6 +3161,10 @@ async fn reap_loop() {
 /// Counter: overlay volumes whose watcher hints the reap tick could not process (the host refused a re-check); the
 /// hints are taken again at the next tick's listing, so none is lost, but a refusal is never silent.
 const BASE_HINTS_REFUSED: &str = "base.hints_refused";
+/// Counter: watcher hints the reap tick drained, over every overlay volume (the drain's non-vacuity counter).
+const BASE_HINTS_DRAINED: &str = "base.hints_drained";
+/// Counter: delegation recalls an outsider's edit beneath an untouched base entry asked for (A-122).
+const OUTSIDE_RECALLS: &str = "nfs4.recall.outside_asked";
 
 /// Drains every overlay volume's watcher hints, once a reap tick (§4.5, §4.15; RFC 8881 §10.2): a changed base
 /// directory has its listing invalidated, its witnessed entries re-checked for drift, and every delegation held on an
@@ -3173,19 +3179,37 @@ const BASE_HINTS_REFUSED: &str = "base.hints_refused";
 /// destroy closes while the task may still be waiting on it.
 fn process_base_hints(s: &mut ShardState) {
   let mut refused = 0u64;
+  let mut drained = 0u64;
+  let recalls_before = s.store.recall_gate.outside_recalls();
   for (_, slot) in s.volumes.iter_mut_all() {
-    if let Some(host) = slot.host.as_mut()
-      && slot
-        .volume
-        .with_host(host)
-        .process_hints(&mut s.store)
-        .is_err()
+    let Some(host) = slot.host.as_mut() else {
+      continue;
+    };
+    let seq_before = slot.volume.base_plane().map_or(0, |plane| plane.hint_seq());
+    if slot
+      .volume
+      .with_host(host)
+      .process_hints(&mut s.store)
+      .is_err()
     {
       refused = refused.saturating_add(1);
     }
+    let seq_after = slot.volume.base_plane().map_or(0, |plane| plane.hint_seq());
+    drained = drained.saturating_add(seq_after.saturating_sub(seq_before));
   }
+  let asked = s
+    .store
+    .recall_gate
+    .outside_recalls()
+    .saturating_sub(recalls_before);
   if refused > 0 {
     s.count(BASE_HINTS_REFUSED, refused);
+  }
+  if drained > 0 {
+    s.count(BASE_HINTS_DRAINED, drained);
+  }
+  if asked > 0 {
+    s.count(OUTSIDE_RECALLS, asked);
   }
 }
 

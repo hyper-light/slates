@@ -2306,6 +2306,17 @@ given the same changes. Docker Desktop 6.12 kernel, Apple M5 Max, load average 1
   servers re-read about 5,500 READs.
 - `diff -rq` is the less exact baseline: it follows a symlink alias to an appended file (11 differ for 10 appends)
   and cannot compare a dangling link. The plan compares entries, not what they point to.
+- **Outsider edits, 2026-10-08** (the bench's outsider step; Linux: `overlay_diff.sh /usr/lib/python3.13 1`, 1,252
+  files; macOS: `overlay_mac.sh <release> crates/vfs <scratch>`, 79 files over macOS's NFSv3 client). An outsider
+  appends to a file the volume replaced and to one it never touched, after the client has read it:
+
+  | | Linux NFSv4.2 (delegations held) | macOS NFSv3 |
+  |---|---|---|
+  | untouched file's new bytes through the mount | 157 ms | 377–520 ms |
+  | replaced file | `(Modified)` drift; plan presents `ModifyModify` | same |
+  | recalls for the one untouched edit | asked 1, sent 1, answered 1 (A-122, A-123) | — (no delegations in v3) |
+
+  Before the day's fixes, the Linux edit was not seen after 5.2 s: 153 recalls asked, 152 unanswered.
 
 ### The daemon under a container memory cap, and large writes over Linux's NFS client on loopback (conditions 11, 12; 2026-10-05)
 

@@ -2908,24 +2908,53 @@ impl Overlay<'_> {
   }
 
   /// Asks for the recall of every delegation held on an untouched base entry the watcher's hints may have changed:
-  /// those homed in a hinted directory, or every one after an overflow. RFC 8881 §10.2: "operations done outside the
+  /// the entry a hint names, every one homed in a directory a nameless hint names, or every one after an overflow. RFC 8881 §10.2: "operations done outside the
   /// NFSv4.1 protocol ... also need to result in delegation recall". An untouched entry shows the disk, so an
   /// outsider's edit beneath it changes what the volume serves, and a holder that is not told keeps serving its own
   /// cached bytes; a copied-up entry's bytes are the volume's own and are not recalled (its drift is reported instead,
-  /// §4.15). Bounded by the delegation table (one pass over this volume's delegated inodes per drain).
-  fn recall_hinted(&self, store: &mut Store, all: bool, dirs: &BTreeSet<InodeNo>) {
-    if !all && dirs.is_empty() {
+  /// §4.15). Bounded by the delegation table (one pass over this volume's delegated inodes per drain with a nameless
+  /// hint) and by the named entries (one lookup each). Measured 2026-10-08: one outsider's append beneath a delegated
+  /// directory recalled all 153 of its files when hints named only directories.
+  fn recall_hinted(
+    &self,
+    store: &mut Store,
+    all: bool,
+    whole: &BTreeSet<InodeNo>,
+    named: &BTreeSet<(InodeNo, Box<str>)>,
+  ) {
+    if !all && whole.is_empty() && named.is_empty() {
       return;
     }
-    let witnessed = |no: InodeNo| self.vol.base.as_ref().is_some_and(|b| b.is_witnessed(no));
-    for no in store.recall_gate.delegated_in(self.vol.prefix()) {
-      let no = InodeNo(no);
-      let untouched_in_hinted = self.vol.inode(store, no).is_ok_and(|inode| {
-        matches!(inode.body, Body::Base(_) | Body::BaseLink(_))
-          && (all || inode.home.is_some_and(|home| dirs.contains(&home.parent())))
-      });
-      if untouched_in_hinted && !witnessed(no) {
-        store.recall_gate.recall(no.0);
+    let untouched = |store: &Store, no: InodeNo| {
+      self.vol.base.as_ref().is_some_and(|b| !b.is_witnessed(no))
+        && self
+          .vol
+          .inode(store, no)
+          .is_ok_and(|inode| matches!(inode.body, Body::Base(_) | Body::BaseLink(_)))
+    };
+    if all || !whole.is_empty() {
+      for no in store.recall_gate.delegated_in(self.vol.prefix()) {
+        let no = InodeNo(no);
+        let in_whole = all
+          || self.vol.inode(store, no).is_ok_and(|inode| {
+            inode
+              .home
+              .is_some_and(|home| whole.contains(&home.parent()))
+          });
+        if in_whole && untouched(store, no) {
+          store.recall_gate.recall(no.0);
+        }
+      }
+    }
+    for (dir_no, name) in named {
+      let entry = self
+        .vol
+        .current_dir(store, *dir_no)
+        .and_then(|dir| self.vol.lookup(store, dir, name));
+      if let Ok(located) = entry
+        && untouched(store, located.inode)
+      {
+        store.recall_gate.recall(located.inode.0);
       }
     }
   }
@@ -2944,23 +2973,15 @@ impl Overlay<'_> {
       let loaded = &plane.listings;
       plane.stale_since.retain(|no, _| loaded.contains_key(no));
     }
+    // The recalls the hints ask (A-122): every untouched entry of a directory a nameless hint names, or the named
+    // entry alone.
+    let mut whole: BTreeSet<InodeNo> = BTreeSet::new();
+    let mut named: BTreeSet<(InodeNo, Box<str>)> = BTreeSet::new();
     for hint in hints {
       plane.hint_seq = plane.hint_seq.saturating_add(1);
-      match hint {
-        Hint::Changed(dir) => {
-          let hit = plane
-            .listings
-            .iter()
-            .find(|(_, l)| l.dir == dir)
-            .map(|(no, _)| *no);
-          if let Some(no) = hit {
-            if let Some(l) = plane.listings.get_mut(&no) {
-              l.entries = None;
-            }
-            plane.recheck.insert(no);
-            plane.stale_since.insert(no, plane.hint_seq);
-          }
-        }
+      let (dir, entry) = match hint {
+        Hint::Changed(dir) => (dir, None),
+        Hint::Entry(dir, name) => (dir, Some(name)),
         Hint::Overflow => {
           plane.watch = WatchState::Overflowed;
           let seq = plane.hint_seq;
@@ -2969,12 +2990,33 @@ impl Overlay<'_> {
             plane.stale_since.insert(*no, seq);
           }
           plane.recheck_all = true;
+          continue;
+        }
+      };
+      let hit = plane
+        .listings
+        .iter()
+        .find(|(_, l)| l.dir == dir)
+        .map(|(no, _)| *no);
+      if let Some(no) = hit {
+        if let Some(l) = plane.listings.get_mut(&no) {
+          l.entries = None;
+        }
+        plane.recheck.insert(no);
+        plane.stale_since.insert(no, plane.hint_seq);
+        match entry {
+          Some(name) => {
+            named.insert((no, name));
+          }
+          None => {
+            whole.insert(no);
+          }
         }
       }
     }
     let all = std::mem::take(&mut plane.recheck_all);
     let dirs = std::mem::take(&mut plane.recheck);
-    self.recall_hinted(store, all, &dirs);
+    self.recall_hinted(store, all, &whole, &named);
     let plane = self.vol.base.as_ref().ok_or(VfsError::NotOverlay)?;
     let witnessed: Vec<InodeNo> = plane.witnesses.iter_head().map(|(no, _)| *no).collect();
     let targets: Vec<InodeNo> = witnessed

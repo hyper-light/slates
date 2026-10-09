@@ -106,6 +106,15 @@ for round in $(seq 1 "$ROUNDS"); do
     B=$(now)
     echo "  outsider edit of an untouched file seen through the mount: $seen after $(ms "$A" "$B") ms"
     echo "  drifted: $(slates --instance ov status "$ID" --drift 2>&1 | tr '\n' ' ')"
+    # The chain an outsider's edit takes to a delegation holder, counter by counter: hints drained, recalls asked,
+    # recalls sent and answered, delegations revoked.
+    slates --instance ov status --json > /root/status-outsider.json 2>/dev/null
+    echo "  counters: $(python3 -c 'import json, sys
+seen = {}
+for shard in json.load(open(sys.argv[1])).get("shards", []):
+    for r in shard.get("refusals", []):
+        seen[r["kind"]] = seen.get(r["kind"], 0) + r["count"]
+print(" ".join(f"{k}={v}" for k, v in sorted(seen.items()) if k.startswith(("base.", "nfs4.recall", "nfs4.delegation", "nfs4.callback"))))' /root/status-outsider.json)"
     slates --instance ov land "$ID" /base --json > /root/plan2.json 2>&1
     echo "  land plan after the outsider: $(python3 -c 'import json; j = json.load(open("/root/plan2.json")); print("conflicts", j.get("conflicts"))')"
   fi

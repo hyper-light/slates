@@ -10559,7 +10559,7 @@ Applied in the same change to:
 - the test `an_outsider_edit_beneath_an_untouched_base_file_asks_for_its_recall` (`crates/vfs/tests/base.rs`), the
   outsider check in `docs/wip/bench/overlay/overlay_diff.sh`, GAPS.
 
-Status: built 2026-10-08; the end-to-end check through a Linux mount is owed (below).
+Status: built 2026-10-08; proven end to end through the Linux kernel client the same day (below).
 - What it answers: RFC 8881 §10.2 requires that "operations done outside the NFSv4.1 protocol ... also need to result
   in delegation recall", and A-79's gate held that for every change made through slates. An outsider editing the disk
   beneath an untouched base file is a change too: the file shows the disk, so what the volume serves changed. Nothing
@@ -10575,12 +10575,51 @@ Status: built 2026-10-08; the end-to-end check through a Linux mount is owed (be
   attribute cache times out (`acregmin`, 3 s by default, nfs(5)).
 - Rejected for now: a task per volume awaiting its watcher's descriptor (no tick). A destroy closes that descriptor
   while the task may still wait on it, so it needs its own cancellation protocol first.
-- Owed: the end-to-end check (`overlay_diff.sh`'s outsider step: an edit of an untouched file seen through the mount,
-  the drifted path reported, the plan naming the conflict) did not run on 2026-10-08. The Docker VM was at load
-  150–250, and two attempts hit their 900 s bound before round one.
+- End to end, 2026-10-08 (`overlay_diff.sh /usr/lib/python3.13 1`, Linux NFSv4.2):
+  - The client held all 1,267 read delegations; its repeat pass sent no OPEN.
+  - One outsider append to an untouched file: `base.hints_drained=2`, `nfs4.recall.outside_asked=1`, `sent=1`,
+    `answered=1`.
+  - The new bytes read through the mount after 157 ms.
+  - Its first runs found three faults, fixed the same day:
+    - hints named only directories, so one append recalled all 153 delegated files there. Hints now name the entry
+      (`Hint::Entry`, from inotify's event name and the kqueue file registration), and a named hint recalls that entry
+      alone;
+    - the burst then met A-123's slot fault: 152 of 153 unanswered;
+    - the presentation dropped its conflicts (GAPS, 2026-10-08).
+  - The earlier attempts' 900 s bounds were the Docker VM's API under load, not the daemon. The engine was running;
+    a container list took 480 s.
 - macOS, the same day: `EVFILT_VNODE` on a directory reports namespace changes only, so an outsider's in-place write to
   an existing file was not hinted at all. A base file the host opens beneath a watched directory (a read-through
   descriptor, which every open of an untouched file takes) is now registered on the same kqueue, its events hinting
   its directory; closing the file forgets it first (`crates/base/src/unix.rs`, `Watcher::add_file`/`forget_file`;
   no-ops on Linux, where `IN_MODIFY` on the directory already reports it). Test
   `an_in_place_write_to_an_opened_base_file_hints_its_directory` (`crates/base/tests/host.rs`) failed before.
+
+### A-123 — A session's callbacks take its one slot in turn (2026-10-08)
+Applied in the same change to:
+- `crates/bridge-nfs/src/v4/session.rs` (`next_callback` no longer advances the slot; `callback_used`,
+  `callback_resync`); `crates/server/src/callback.rs` (`call_on_slot`); `crates/server/src/delegation.rs` (a queue
+  per session, `RecallQueue`, and one sender, `send_recalls`); `crates/server/src/nfs.rs` (the back channel's probe
+  through `call_on_slot`); `crates/server/src/state.rs` (`recall_queues`);
+- the test `recalls_asked_together_reach_the_one_slot_in_turn` (`crates/server/tests/nfs_mount.rs`), GAPS.
+
+Status: built 2026-10-08.
+- What it answers: RFC 8881 §2.10.6 gives a session's back channel the slots its `CREATE_SESSION` negotiated. slates
+  calls on slot 0 alone, and its callback table refused a second callback on a busy session (`CallbackError::Busy`).
+  Each recall was sent at once in its own task, and each first advanced the slot's sequence. A burst of 153 recalls
+  (one outsider's edit, A-122) had 152 refused busy, and left the server's sequence 152 ahead of the client's, so
+  every later callback on that session was misordered too.
+- The rule, as Linux knfsd does it (`nfsd41_cb_get_slot` serializes on the slot; `nfsd4_cb_sequence_done` advances
+  `se_cb_seq_nr` only after a reply, and starts it over at 1 once on `NFS4ERR_SEQ_MISORDERED`):
+  - recalls wait in a queue per session, each delegation at most once, and one sender task sends them in turn;
+  - a callback takes the slot's next sequence when it is sent, and the slot advances only when the reply shows the
+    client used it;
+  - a callback refused as misordered starts the slot over at 1 and is sent once more;
+  - a callback that finds the slot held (the back channel's probe) waits for it, within its deadline.
+  A Linux client takes two operations per callback compound (`NFS4_MAX_BACK_CHANNEL_OPS`), so recalls cannot share
+  one compound.
+- Measured: the test (two recalls asked together reach the client in turn, the second's sequence the first's plus
+  one) failed on the code before, where the second callback never came. After the fix, the Linux bench's recalls were
+  answered 1 of 1 with nothing unanswered (A-122).
+- Bounds: a queue holds each delegation at most once, so the delegations its client holds bound it; a session has at
+  most one sender, which ends with its queue.

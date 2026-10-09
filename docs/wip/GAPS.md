@@ -4885,10 +4885,18 @@ Apple M5 Max, load average 13–14 from other sessions; the tree copied into tmp
   directory, and the daemon drains every overlay volume's hints once a reap tick (1 s), then sends the recalls.
   `an_outsider_edit_beneath_an_untouched_base_file_asks_for_its_recall` failed before (no recall asked), and passes
   after (exactly the two untouched files, not the copied-up one).
+- **End to end, the same day** (`overlay_diff.sh /usr/lib/python3.13 1`, Linux NFSv4.2):
+  - First run, outsider step: the edit was not seen after 5.2 s. Counters: `outside_asked=153`, `sent=153`,
+    `answered=1`, `unanswered=152`.
+    - One append recalled every delegated file in the directory: hints named only directories.
+    - The recalls were sent at once on the session's one slot: A-123.
+  - Fixed: hints now name the entry (`Hint::Entry`); recalls take the slot in turn (A-123).
+  - Rerun: 1,267 delegations held; `outside_asked=1`, `sent=1`, `answered=1`; the new bytes read through the mount
+    after 157 ms.
+  - The earlier attempts' 900 s bounds were the Docker VM's API (a container list took 480 s), not slates: the
+    engine was running.
 - **Owed:**
-  1. The end-to-end check through a real Linux mount (`overlay_diff.sh`, outsider step). Two attempts on 2026-10-08
-     hit their 900 s bound with the Docker VM at load 150–250 (not slates: the load was there before the daemon
-     started).
+  1. ~~The end-to-end check through a real Linux mount.~~ Done (above).
   2. ~~macOS: `EVFILT_VNODE` on a directory does not report an in-place write to an existing file.~~ **Fixed the same
      day:** an opened base file is registered on the watcher's kqueue too, its events hinting its directory
      (`an_in_place_write_to_an_opened_base_file_hints_its_directory`, failing before on this Mac).

@@ -691,17 +691,38 @@ impl Sessions {
       .and_then(|session| session.back.clone())
   }
 
-  /// The next callback on `sessionid`'s back channel: its program, its credential and the sequence id slot 0 takes,
-  /// advanced.
+  /// The next callback on `sessionid`'s back channel: its program, its credential and the sequence id slot 0 takes
+  /// next. The slot is not advanced here: only a reply shows the client used it ([`Self::callback_used`]), so a
+  /// callback that never left, or whose reply never came, does not move the server's sequence ahead of the client's
+  /// (RFC 8881 §2.10.6.1; Linux knfsd advances `se_cb_seq_nr` only in `nfsd4_cb_sequence_done`). Until 2026-10-08
+  /// every call advanced it, so a burst of recalls refused as busy left every later callback misordered.
   pub fn next_callback(&mut self, sessionid: &SessionId) -> Option<NextCallback> {
-    let back = self.sessions.get_mut(sessionid)?.back.as_mut()?;
-    back.sequence = back.sequence.wrapping_add(1);
+    let back = self.sessions.get(sessionid)?.back.as_ref()?;
     Some(NextCallback {
       program: back.program,
       credential: back.credential.clone(),
       minor: back.minor,
-      sequence: back.sequence,
+      sequence: back.sequence.wrapping_add(1),
     })
+  }
+
+  /// Records that the client used slot 0 at `sequence` (its reply came, with a `CB_SEQUENCE` it did not refuse as
+  /// misordered).
+  pub fn callback_used(&mut self, sessionid: &SessionId, sequence: u32) {
+    if let Some(back) = self
+      .sessions
+      .get_mut(sessionid)
+      .and_then(|session| session.back.as_mut())
+    {
+      back.sequence = sequence;
+    }
+  }
+
+  /// Starts slot 0 over at sequence 1, after the client refused a callback as misordered: the server cannot know the
+  /// client's slot, and a client whose slot was reset expects 1 (Linux knfsd's `nfsd4_cb_sequence_done` does the
+  /// same, once, before giving up).
+  pub fn callback_resync(&mut self, sessionid: &SessionId) {
+    self.callback_used(sessionid, 0);
   }
 
   /// Records the minor version `sessionid`'s client uses, for its callbacks to name.

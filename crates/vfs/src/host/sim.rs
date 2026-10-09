@@ -446,11 +446,13 @@ impl SimHost {
       parent.mtime_ns = now;
       parent.ctime_ns = now;
     }
-    self.hint_for(parts);
+    self.hint_for(parts, None);
   }
 
-  /// A hint for the watched directory at or above `parts`.
-  fn hint_for(&mut self, parts: &[Box<str>]) {
+  /// A hint for the watched directory at or above `parts`: naming `entry` when the change was to it alone (an in-place
+  /// write, as inotify's `IN_MODIFY` names it), else the directory (a namespace change; inotify would name the entry
+  /// too, so the simulation recalls more widely than the real watcher, never less).
+  fn hint_for(&mut self, parts: &[Box<str>], entry: Option<&str>) {
     if self.watch_state != WatchState::Live {
       return;
     }
@@ -464,7 +466,10 @@ impl SimHost {
       .collect();
     for (h, p) in watched {
       if p.as_slice() == parts {
-        self.hints.push(Hint::Changed(HostDir(h)));
+        self.hints.push(match entry {
+          Some(name) => Hint::Entry(HostDir(h), name.into()),
+          None => Hint::Changed(HostDir(h)),
+        });
       }
     }
   }
@@ -524,11 +529,11 @@ impl SimHost {
       n.mtime_ns = now;
       n.ctime_ns = now;
     }
-    let parent = parts
+    let (name, parent) = parts
       .split_last()
-      .map(|(_, parent)| parent.to_vec())
+      .map(|(name, parent)| (Some(name.clone()), parent.to_vec()))
       .unwrap_or_default();
-    self.hint_for(&parent);
+    self.hint_for(&parent, name.as_deref());
   }
 
   /// Creates a symlink.

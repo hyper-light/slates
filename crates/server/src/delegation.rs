@@ -15,6 +15,16 @@
 //!
 //! The gate's set follows the file state: `nfs_state::record_files` rebuilds it whenever a delegation changes, so
 //! every revocation and return here is persisted and reflected in the gate by the record call that ends [`drain`].
+//!
+//! A session's back channel has one slot (RFC 8881 §2.10.6), so its recalls wait in a queue per session and one sender
+//! task sends them in turn through `callback::call_on_slot`, as Linux knfsd serializes its callbacks on the slot
+//! (`nfsd41_cb_get_slot`). A Linux client takes two operations per callback compound (`NFS4_MAX_BACK_CHANNEL_OPS`),
+//! so recalls cannot share one. Until 2026-10-08 each recall was sent at once in its own task: of a burst of 153 (one
+//! outsider's edit beneath a delegated directory), 152 were refused busy and the slot's sequence ran ahead of the
+//! client's. Bounds: a queue holds each delegation at most once (by its state id), so it is bounded by the delegations
+//! its client holds; a session has at most one sender, which ends when its queue is empty.
+
+use std::collections::VecDeque;
 
 use slates_bridge_nfs::v4::callback;
 use slates_bridge_nfs::v4::delegation::Recall;
@@ -59,10 +69,7 @@ pub(crate) fn drain(s: &mut ShardState) {
   }
   for recall in sends {
     match recall_target(s, recall.clientid) {
-      Some((sessionid, next)) => {
-        s.count(RECALL_SENT, 1);
-        spawn_recall(sessionid, next, recall);
-      }
+      Some(sessionid) => enqueue(s, sessionid, recall),
       None => {
         s.count(REVOKED_UNREACHABLE, 1);
         if let Some(files) = s.nfs_v4_files.as_mut() {
@@ -74,35 +81,82 @@ pub(crate) fn drain(s: &mut ShardState) {
   crate::nfs_state::record_files(s);
 }
 
-/// The session a recall to `clientid` goes to, and that callback's program, credential, minor version and sequence:
-/// a session of the client held on this shard whose back channel has answered.
-fn recall_target(
-  s: &mut ShardState,
-  clientid: u64,
-) -> Option<(SessionId, slates_bridge_nfs::v4::session::NextCallback)> {
-  let sessions = &mut s.nfs_v4.as_mut()?.sessions;
-  let sessionid = sessions.session_with_back_channel(clientid)?;
-  let next = sessions.next_callback(&sessionid)?;
-  Some((sessionid, next))
+/// The session a recall to `clientid` goes to: a session of the client held on this shard whose back channel has
+/// answered.
+fn recall_target(s: &mut ShardState, clientid: u64) -> Option<SessionId> {
+  s.nfs_v4
+    .as_ref()?
+    .sessions
+    .session_with_back_channel(clientid)
 }
 
-/// Sends `CB_RECALL` for `recall` on `sessionid`'s back channel in a detached task, counting whether it was answered.
-fn spawn_recall(
-  sessionid: SessionId,
-  next: slates_bridge_nfs::v4::session::NextCallback,
-  recall: Recall,
-) {
-  let task = futures::spawn(async move {
-    let args = callback::recall(
-      (&sessionid, next.minor, next.sequence),
-      &recall.stateid,
-      false,
-      &recall.fh.0,
-    );
-    let answered = crate::callback::call(
+/// The recalls waiting for one session's back channel, and whether its sender runs.
+#[derive(Debug, Default)]
+pub(crate) struct RecallQueue {
+  /// The recalls not yet sent, oldest first; each delegation at most once.
+  pending: VecDeque<Recall>,
+  /// Whether a sender task is draining the queue.
+  sending: bool,
+}
+
+/// Queues `recall` for `sessionid`'s back channel (once per delegation) and starts the session's sender when none runs.
+fn enqueue(s: &mut ShardState, sessionid: SessionId, recall: Recall) {
+  let queue = s.recall_queues.entry(sessionid).or_default();
+  if !queue
+    .pending
+    .iter()
+    .any(|queued| queued.stateid.other == recall.stateid.other)
+  {
+    queue.pending.push_back(recall);
+  }
+  if queue.sending {
+    return;
+  }
+  queue.sending = true;
+  match futures::spawn(send_recalls(sessionid)) {
+    Ok(task) => {
+      let _ = futures::detach(task);
+    }
+    Err(_) => {
+      // No task to send them: the queue waits for the next drain to start one, and the delegations lapse to
+      // revocation if none does (§10.4.5). Counted, never silent.
+      if let Some(queue) = s.recall_queues.get_mut(&sessionid) {
+        queue.sending = false;
+      }
+      s.count(RECALL_SENDER_REFUSED, 1);
+    }
+  }
+}
+
+/// Counter: recall senders the shard's task arena refused (their recalls wait for the next drain).
+const RECALL_SENDER_REFUSED: &str = "nfs4.recall.sender_refused";
+
+/// Sends `sessionid`'s queued recalls one at a time until the queue is empty, counting each answered or not.
+async fn send_recalls(sessionid: SessionId) {
+  loop {
+    let next = state::with_state(|s| {
+      let queue = s.recall_queues.get_mut(&sessionid)?;
+      let recall = queue.pending.pop_front();
+      if recall.is_none() {
+        s.recall_queues.remove(&sessionid);
+      }
+      recall
+    })
+    .flatten();
+    let Some(recall) = next else {
+      return;
+    };
+    let _ = state::with_state_counted(|s| s.count(RECALL_SENT, 1));
+    let answered = crate::callback::call_on_slot(
       sessionid,
-      (next.program, &next.credential),
-      &args,
+      |next| {
+        callback::recall(
+          (&sessionid, next.minor, next.sequence),
+          &recall.stateid,
+          false,
+          &recall.fh.0,
+        )
+      },
       crate::daemon::LIVENESS_BUDGET_NS,
     )
     .await
@@ -110,20 +164,14 @@ fn spawn_recall(
     .and_then(|results| callback::status(&results))
       == Some(slates_bridge_nfs::v4::Nfsstat4::Ok as u32);
     let _ = state::with_state_counted(|s| {
-      let counter = if answered {
-        RECALL_ANSWERED
-      } else {
-        RECALL_UNANSWERED
-      };
-      s.count(counter, 1);
+      s.count(
+        if answered {
+          RECALL_ANSWERED
+        } else {
+          RECALL_UNANSWERED
+        },
+        1,
+      );
     });
-  });
-  match task {
-    Ok(task) => {
-      let _ = futures::detach(task);
-    }
-    Err(_) => {
-      let _ = state::with_state_counted(|s| s.count(RECALL_UNANSWERED, 1));
-    }
   }
 }

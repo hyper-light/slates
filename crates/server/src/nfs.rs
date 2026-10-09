@@ -2483,14 +2483,9 @@ fn bind_back_channel(sessionid: SessionId, id: u64, minor: Option<u32>) {
 /// Probes `sessionid`'s back channel with `CB_SEQUENCE` alone and records whether the client answered `NFS4_OK`
 /// within a liveness budget.
 async fn probe_back_channel(sessionid: SessionId) {
-  let Some(next) = with_v4_sessions(|sessions| sessions.next_callback(&sessionid)).flatten() else {
-    return;
-  };
-  let args = slates_bridge_nfs::v4::callback::probe(&sessionid, next.minor, next.sequence);
-  let outcome = crate::callback::call(
+  let outcome = crate::callback::call_on_slot(
     sessionid,
-    (next.program, &next.credential),
-    &args,
+    |next| slates_bridge_nfs::v4::callback::probe(&sessionid, next.minor, next.sequence),
     crate::daemon::LIVENESS_BUDGET_NS,
   )
   .await;

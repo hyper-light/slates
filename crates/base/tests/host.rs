@@ -418,7 +418,7 @@ fn a_real_directory_shows_descriptor_semantics_nofollow_and_hints() {
   assert!(
     hints
       .iter()
-      .any(|h| matches!(h, slates_vfs::host::Hint::Changed(d) if *d == root)),
+      .any(|h| matches!(h, slates_vfs::host::Hint::Changed(d) | slates_vfs::host::Hint::Entry(d, _) if *d == root)),
     "a hint for the root after the rename: {hints:?}"
   );
   host.close_file(file);
@@ -630,8 +630,8 @@ fn an_in_place_write_to_an_opened_base_file_hints_its_directory() {
   append(b", two");
   let hints = host.hints();
   assert!(
-    hints.contains(&slates_vfs::host::Hint::Changed(root)),
-    "an in-place write hints the directory: {hints:?}"
+    hints.contains(&slates_vfs::host::Hint::Entry(root, "f".into())),
+    "an in-place write hints the file in its directory: {hints:?}"
   );
   host.close_file(file);
   append(b", three");

@@ -278,6 +278,13 @@ pub struct ShardState {
   /// derived bounds.
   #[cfg(unix)]
   pub nfs_v4_files: Option<slates_bridge_nfs::v4::files::FileState>,
+  /// The delegation recalls waiting for each session's back channel (`crate::delegation`; bounded by the delegations
+  /// each client holds).
+  #[cfg(unix)]
+  pub(crate) recall_queues: std::collections::BTreeMap<
+    slates_bridge_nfs::v4::types::SessionId,
+    crate::delegation::RecallQueue,
+  >,
   /// This daemon life's NFSv4 instance on the shard's partition (§4.6 A-37), advanced durably on first
   /// use; every NFSv4 id the shard mints names it.
   #[cfg(unix)]

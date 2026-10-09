@@ -52,11 +52,17 @@ pub struct HostFacts {
   pub timestamp_granularity_ns: u64,
 }
 
-/// A watcher's word, never the truth (§4.5): a directory changed, or events were lost.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// A watcher's word, never the truth (§4.5): a directory or one of its entries changed, or events were lost.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Hint {
-  /// Something under this directory changed.
+  /// Something under this directory changed, the watcher not saying what (the directory itself moved, or the event
+  /// named no entry).
   Changed(HostDir),
+  /// The named entry of this directory changed (inotify names the child of every event it reports; a watched file's
+  /// own registration knows its name). Everything a [`Hint::Changed`] of the directory does, and the recall it asks
+  /// (A-122) is of that entry's delegations alone: a directory delegation is never granted, so a change to one entry
+  /// changes no other file a client holds a delegation of.
+  Entry(HostDir, Box<str>),
   /// The watcher overflowed: every listing is suspect and every witness is re-checked.
   Overflow,
 }

@@ -40,6 +40,9 @@ pub struct RecallGate {
   acting: Option<u64>,
   /// Changes refused at the gate, ever (the non-vacuity counter, and how a caller tells the gate's refusal apart).
   refused: u64,
+  /// Recalls asked for changes made outside any NFSv4 session ([`RecallGate::recall`]), ever: the outsider path's
+  /// non-vacuity counter.
+  outside: u64,
   /// Bumped whenever an inode may have left the gate (a release or a reset).
   generation: u64,
   /// The tasks parked until the next release or reset.
@@ -141,6 +144,7 @@ impl RecallGate {
     let held = self.delegated.contains_key(&no);
     if held {
       self.requested.insert((no, None));
+      self.outside = self.outside.saturating_add(1);
     }
     held
   }
@@ -153,6 +157,11 @@ impl RecallGate {
   /// How many changes the gate has refused, ever.
   pub fn refusals(&self) -> u64 {
     self.refused
+  }
+
+  /// How many recalls changes outside any NFSv4 session have asked for, ever.
+  pub fn outside_recalls(&self) -> u64 {
+    self.outside
   }
 
   /// The gate's generation: it moves whenever an inode may have left the gate.

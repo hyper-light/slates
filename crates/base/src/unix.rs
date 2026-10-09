@@ -254,7 +254,7 @@ impl HostFs for OsHost {
       return Err(HostError::NotFile);
     }
     let h = self.allocate()?;
-    self.watcher.add_file(dir, &fd);
+    self.watcher.add_file(dir, name, &fd);
     self.files.insert(h, fd);
     Ok(HostFile(h))
   }
@@ -408,7 +408,7 @@ mod watch {
     }
 
     /// Nothing on Linux: the directory's watch already reports a write to any file in it (`IN_MODIFY`).
-    pub(super) fn add_file(&mut self, _dir: HostDir, _fd: &OwnedFd) {}
+    pub(super) fn add_file(&mut self, _dir: HostDir, _name: &str, _fd: &OwnedFd) {}
 
     /// Nothing on Linux (see [`Self::add_file`]).
     pub(super) fn forget_file(&mut self, _fd: &OwnedFd) {}
@@ -431,7 +431,14 @@ mod watch {
         if event.events().contains(ReadFlags::QUEUE_OVERFLOW) {
           out.push(Hint::Overflow);
         } else if let Some(dir) = self.by_wd.get(&event.wd()) {
-          out.push(Hint::Changed(*dir));
+          // inotify names the child an event on a watched directory is about; an event on the directory itself
+          // (moved, deleted) names none.
+          out.push(
+            match event.file_name().and_then(|name| name.to_str().ok()) {
+              Some(name) if !name.is_empty() => Hint::Entry(*dir, name.into()),
+              _ => Hint::Changed(*dir),
+            },
+          );
         }
       }
       out.dedup();
@@ -457,8 +464,9 @@ mod watch {
 
   pub(super) struct Watcher {
     queue: Option<OwnedFd>,
-    /// Each registered descriptor (a watched directory's, or an opened file's) and the directory its events hint.
-    by_fd: BTreeMap<i32, HostDir>,
+    /// Each registered descriptor (a watched directory's, or an opened file's) and the directory its events hint, with
+    /// the file's name for a file.
+    by_fd: BTreeMap<i32, (HostDir, Option<Box<str>>)>,
     /// The directories registered, so a file is watched only beneath a watched directory.
     watched: BTreeSet<HostDir>,
   }
@@ -473,7 +481,12 @@ mod watch {
     }
 
     /// Registers `fd` for `flags` with events hinting `dir`; whether the kernel took it.
-    fn register(&mut self, dir: HostDir, fd: &OwnedFd, flags: VnodeEvents) -> bool {
+    fn register(
+      &mut self,
+      (dir, name): (HostDir, Option<Box<str>>),
+      fd: &OwnedFd,
+      flags: VnodeEvents,
+    ) -> bool {
       let Some(queue) = &self.queue else {
         return false;
       };
@@ -490,7 +503,7 @@ mod watch {
       // empty and stays empty (its capacity is zero), so the kernel writes nothing.
       let registered = unsafe { kevent(queue, &[change], &mut none, None) };
       if registered.is_ok() {
-        self.by_fd.insert(fd.as_raw_fd(), dir);
+        self.by_fd.insert(fd.as_raw_fd(), (dir, name));
       }
       registered.is_ok()
     }
@@ -502,7 +515,7 @@ mod watch {
         | VnodeEvents::ATTRIBUTES
         | VnodeEvents::EXTEND
         | VnodeEvents::LINK;
-      if self.register(dir, fd, flags) {
+      if self.register((dir, None), fd, flags) {
         self.watched.insert(dir);
         WatchState::Live
       } else {
@@ -514,7 +527,7 @@ mod watch {
     /// a directory reports namespace changes only, so an outsider's in-place write to an existing file is seen only on
     /// the file's own descriptor. A file beneath an unwatched directory, or one the kernel refuses, is not watched; the
     /// lookup's live-disk check still sees the change.
-    pub(super) fn add_file(&mut self, dir: HostDir, fd: &OwnedFd) {
+    pub(super) fn add_file(&mut self, dir: HostDir, name: &str, fd: &OwnedFd) {
       if !self.watched.contains(&dir) {
         return;
       }
@@ -523,7 +536,7 @@ mod watch {
         | VnodeEvents::ATTRIBUTES
         | VnodeEvents::DELETE
         | VnodeEvents::RENAME;
-      self.register(dir, fd, flags);
+      self.register((dir, Some(name.into())), fd, flags);
     }
 
     /// Forgets an opened file, before its descriptor closes (closing removes the kernel's registration; the number may
@@ -563,7 +576,12 @@ mod watch {
       let mut out: Vec<Hint> = events
         .iter()
         .filter_map(|e| match e.filter() {
-          EventFilter::Vnode { vnode, .. } => self.by_fd.get(&vnode).map(|d| Hint::Changed(*d)),
+          EventFilter::Vnode { vnode, .. } => {
+            self.by_fd.get(&vnode).map(|(dir, name)| match name {
+              Some(name) => Hint::Entry(*dir, name.clone()),
+              None => Hint::Changed(*dir),
+            })
+          }
           _ => None,
         })
         .collect();
