@@ -4986,7 +4986,8 @@ to invalidate).
   - Fleet suite 81/82: the one failure is the recorded `a_whole_ram_replacement…` flake, which failed 2 of 5 on HEAD
     and 3 of 5 with the change, interleaved.
 - **Owed:**
-  - The refusal is mistyped. `HomedElsewhere` means "the volume is homed in another region; re-route there", and an
-    owner that did not answer within the takeover bound is not that. A typed refusal for it (a new `Refusal`
-    variant, appended), mapped through the CLI, MCP and both SDKs.
+  - ~~The refusal is mistyped.~~ **Done the same day:** an owner that did not answer within the takeover bound is
+    refused `OwnerUnreachable { region }`, appended to `Refusal` (retryable with the same request id). The CLI, MCP
+    and both SDKs carry a refusal by its text, so no mapping changed. The copyset test now expects it; fleet suite
+    82/82.
   - `slates read`'s own handling of a retryable refusal.

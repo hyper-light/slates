@@ -988,8 +988,9 @@ pub(crate) const VOLUME_ALLOWANCE_REFUSED: &str = "volume.allowance_refused";
 
 /// Resolves a remotely homed volume by its creator, this client's cached route or a read-only
 /// location exchange, then forwards the verb once (§4.8 Lookup, §4.9 RIFL). Discovery never
-/// executes a write. A transport failure invalidates the hint and returns HomedElsewhere;
-/// retrying the original request id remains the caller's choice and meets its completion record.
+/// executes a write. An owner that does not answer is sent the forward again until it is confirmed dead or the takeover
+/// bound passes, and then the client is refused `OwnerUnreachable` (retrying the original request id meets its
+/// completion record).
 fn forward_to_owner(
   state: &mut ShardState,
   client: Handle<ClientSlot>,
@@ -1394,7 +1395,7 @@ fn forwarded_request(
 /// On the control shard, where the fleet's sessions live: finds `volume`'s owner in `region` (the cached route,
 /// the live creator, else the read-only location round) and forwards `requests` to it once — one verb, or a
 /// read-ahead batch of windows, sent together. Returns the owner's reply to the first, or
-/// `HomedElsewhere` when no owner was found or none answered, with the decoded replies to the rest that came back
+/// `OwnerUnreachable` when no owner was found or none answered within the takeover bound, with the decoded replies to the rest that came back
 /// (in order, up to the first that did not), and the route to cache when the owner served.
 async fn resolve_and_forward(
   volume: VolumeId,
@@ -1478,7 +1479,7 @@ async fn resolve_and_forward(
   };
   let reply = decoded
     .flatten()
-    .unwrap_or_else(|| refused(Refusal::HomedElsewhere { region }));
+    .unwrap_or_else(|| refused(Refusal::OwnerUnreachable { region }));
   let route = route_after(&reply, owner, query);
   (
     OwnerReplies {
@@ -3122,6 +3123,7 @@ pub(crate) fn refusal_name(r: &Refusal) -> &'static str {
     Refusal::GrantMismatch => "grant_mismatch",
     Refusal::GrantInvalid => "grant_invalid",
     Refusal::HomedElsewhere { .. } => "homed_elsewhere",
+    Refusal::OwnerUnreachable { .. } => "owner_unreachable",
     Refusal::NotRootLeader => "not_root_leader",
     Refusal::ConsensusNotInitialized => "consensus_not_initialized",
     Refusal::ConsensusAlreadyInitialized => "consensus_already_initialized",

@@ -2483,6 +2483,14 @@ pub enum Refusal {
     /// The bound they reached.
     bound: u64,
   },
+  /// No owner of a volume homed in this region's fleet answered a forwarded verb within the takeover bound (the
+  /// operator's failover SLO): the forward was sent again while the owner was not confirmed dead, and none came back
+  /// (§4.8 "Lookup"). Retryable with the same request id: a successor serves once a takeover installs it. Until
+  /// 2026-10-09 this case was answered `HomedElsewhere`, which names another region and sends the caller there.
+  OwnerUnreachable {
+    /// The region whose fleet the volume's owner was sought in.
+    region: u64,
+  },
 }
 
 /// The writes a snapshot is known to include (§4.6 "Writeback and snapshot barrier"): every write the

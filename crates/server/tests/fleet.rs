@@ -5145,7 +5145,7 @@ fn a_cross_region_client_finds_the_copyset_successor_instead_of_an_unrelated_liv
     matches!(
       unavailable,
       ReplyBody::Refused {
-        refusal: Refusal::HomedElsewhere { .. }
+        refusal: Refusal::OwnerUnreachable { .. }
       }
     ),
     "a stopped owner cannot execute the forwarded write: {unavailable:?}"
