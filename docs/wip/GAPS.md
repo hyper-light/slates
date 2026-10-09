@@ -5057,6 +5057,15 @@ file, snapshots it, and times the snapshot's placement at home and then in the m
     conflict).
   - To confirm next: the pair counters beside the mirror ones in the same run. If confirmed, the fix is pair delivery
     that completes before the head value is fixed, and a value fixed once per (object, sequence).
+  - **Not confirmed, same day:** in two more runs the owner counted no `pair_undelivered`; only region-1 nodes did,
+    for their own neighbours. The conflict recurred anyway (133–140 refusals, 1 snapshot in 10).
+- **Measured and rejected, same day:** freezing each shipment per (object, sequence) on the shard rather than per job.
+  Three runs: one hit the conflict again (132/134), and two mirrored nothing at all (5 jobs started, nothing shipped,
+  home placement slower at 0.9–3.5 s). Not better; not landed (patch kept in the session scratchpad,
+  `mirror-map.patch`).
+- **Open, sharpened:** the conflicting head value at one position has a source not yet found, and runs that ship
+  nothing need the content-round counters beside `job_started` to place the stall. The next step is a log of each
+  shipment's head bytes (hash) per (object, sequence) on the owner, to name which field differs.
 - New counters: `fleet.mirror.no_neighbourhood`, `job_started`, `content_rounds`, `acks`, `round_failed`,
   `no_holder_session`, `shipments_sent`, `records_acked`, `ship_no_session`, the `shipment_refused.<reason>` family,
   `fleet.seal.no_holder_session`, `fleet.content.unauthorized`, `answered` and `answered_empty`.
