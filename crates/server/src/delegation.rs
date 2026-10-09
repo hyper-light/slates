@@ -13,8 +13,9 @@
 //! lease loses it the same way (§10.4.5). The refused change is retried by its caller and proceeds once the file
 //! leaves the gate.
 //!
-//! The gate's set follows the file state: `nfs_state::record_files` rebuilds it whenever a delegation changes, so
-//! every revocation and return here is persisted and reflected in the gate by the record call that ends [`drain`].
+//! The gate's set follows the file state: `nfs_state::record_files` updates the holders of each inode whose
+//! delegations changed (never a rebuild over every delegation, A-80), so every revocation and return here is persisted
+//! and reflected in the gate by the record call that ends [`drain`].
 //!
 //! A session's back channel has one slot (RFC 8881 §2.10.6), so its recalls wait in a queue per session and one sender
 //! task sends them in turn through `callback::call_on_slot`, as Linux knfsd serializes its callbacks on the slot
