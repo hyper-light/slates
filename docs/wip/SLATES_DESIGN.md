@@ -10623,3 +10623,29 @@ Status: built 2026-10-08.
   answered 1 of 1 with nothing unanswered (A-122).
 - Bounds: a queue holds each delegation at most once, so the delegations its client holds bound it; a session has at
   most one sender, which ends with its queue.
+
+### A-124 — A back channel that stops answering is reported and repaired (2026-10-08)
+Applied in the same change to:
+- `crates/bridge-nfs/src/v4/session.rs` (`callback_path_down`, `rebind_back_channel`); `crates/bridge-nfs/src/v4/compound.rs`
+  (the `SEQUENCE` reply's status flags; `bind_conn`); `crates/server/src/delegation.rs` (a lost recall marks the back
+  channel down; `nfs4.callback.path_down`);
+- the test `a_back_channel_that_stopped_answering_is_reported_and_repaired_by_a_rebind`
+  (`crates/server/tests/nfs_mount.rs`), GAPS.
+
+Status: built 2026-10-08.
+- What it answers: a session's back channel had a `Down` state, documented as "`SEQ4_STATUS_CB_PATH_DOWN` until it
+  answers again", but no `SEQUENCE` reply ever carried that flag. A recall the transport lost did not mark the channel
+  down, and `BIND_CONN_TO_SESSION` was always answered fore-only. So a back channel that stopped answering stayed
+  unusable for the session's life: its delegations were revoked as unreachable, and the client was never told to
+  repair it.
+- The rule (RFC 8881 §18.46.3, §18.34):
+  - a callback the transport lost (no reply within its deadline, no carrier, the connection gone, a refused RPC)
+    marks the session's back channel down; one the client answered, whatever its status, proves it works;
+  - while it is down, the session's `SEQUENCE` replies carry `SEQ4_STATUS_CB_PATH_DOWN_SESSION`, and
+    `SEQ4_STATUS_CB_PATH_DOWN` too when none of the client's probed back channels is up;
+  - `BIND_CONN_TO_SESSION` asking for the back channel (`CDFC4_BACK`, `_FORE_OR_BOTH`, `_BACK_OR_BOTH`) on a session
+    that has one is answered `CDFS4_BACK` or `CDFS4_BOTH`, and the back channel is probed again before its next use.
+    The Linux client rebinds this way on either flag (`nfs41_handle_cb_path_down`). A session's callbacks ride the
+    connection that last carried one of its compounds, so the bound connection is its carrier.
+- Measured (the test): a recall the client ignored marked the channel down within its 1 s deadline, the next
+  `SEQUENCE` carried both flags, the rebind was answered `BOTH`, the probe was answered, and the flags cleared.

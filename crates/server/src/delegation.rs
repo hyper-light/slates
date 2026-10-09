@@ -128,6 +128,9 @@ fn enqueue(s: &mut ShardState, sessionid: SessionId, recall: Recall) {
   }
 }
 
+/// Counter: back channels a lost recall marked down (the client is told `SEQ4_STATUS_CB_PATH_DOWN_SESSION`).
+const CALLBACK_PATH_DOWN: &str = "nfs4.callback.path_down";
+
 /// Counter: recall senders the shard's task arena refused (their recalls wait for the next drain).
 const RECALL_SENDER_REFUSED: &str = "nfs4.recall.sender_refused";
 
@@ -159,11 +162,29 @@ async fn send_recalls(sessionid: SessionId) {
       },
       crate::daemon::LIVENESS_BUDGET_NS,
     )
-    .await
-    .ok()
-    .and_then(|results| callback::status(&results))
+    .await;
+    // A callback the transport lost (no reply, no carrier, a refused RPC) marks the back channel down, so the client is
+    // told on its next SEQUENCE and can bind it again (RFC 8881 §18.46.3); one the client answered, whatever its
+    // status, proves the channel works.
+    let path_down = matches!(
+      answered,
+      Err(
+        crate::callback::CallbackError::Timeout
+          | crate::callback::CallbackError::Lost
+          | crate::callback::CallbackError::NoCarrier
+          | crate::callback::CallbackError::Refused
+      )
+    );
+    let answered = answered.ok().and_then(|results| callback::status(&results))
       == Some(slates_bridge_nfs::v4::Nfsstat4::Ok as u32);
     let _ = state::with_state_counted(|s| {
+      if path_down && let Some(server) = s.nfs_v4.as_mut() {
+        server.sessions.set_callback_state(
+          &sessionid,
+          slates_bridge_nfs::v4::session::CallbackState::Down,
+        );
+        s.count(CALLBACK_PATH_DOWN, 1);
+      }
       s.count(
         if answered {
           RECALL_ANSWERED

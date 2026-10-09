@@ -259,6 +259,19 @@ mod claim {
 }
 /// Format: `channel_dir_from_server4` `CDFS4_FORE`: a bound connection carries the fore channel only.
 const CDFS4_FORE: u32 = 1;
+/// Format: `channel_dir_from_server4` `CDFS4_BACK`: the back channel only.
+const CDFS4_BACK: u32 = 2;
+/// Format: `channel_dir_from_server4` `CDFS4_BOTH`: both channels.
+const CDFS4_BOTH: u32 = 3;
+/// Format: `channel_dir_from_client4` `CDFC4_FORE` (the others ask for the back channel too: `CDFC4_BACK` 2,
+/// `CDFC4_FORE_OR_BOTH` 3, `CDFC4_BACK_OR_BOTH` 7; RFC 8881 §18.34.1).
+const CDFC4_FORE: u32 = 1;
+/// Format: `channel_dir_from_client4` `CDFC4_BACK`: the back channel only.
+const CDFC4_BACK: u32 = 2;
+/// Format: `SEQ4_STATUS_CB_PATH_DOWN` (RFC 8881 §18.46.3): no back channel of the client answers.
+const SEQ4_STATUS_CB_PATH_DOWN: u32 = 0x0000_0001;
+/// Format: `SEQ4_STATUS_CB_PATH_DOWN_SESSION` (RFC 8881 §18.46.3): this session's back channel does not answer.
+const SEQ4_STATUS_CB_PATH_DOWN_SESSION: u32 = 0x0000_0200;
 use super::listing::{COOKIE_SHIFT, ENTRY_FIXED, ENTRY_TYPICAL};
 /// Format: the most a v3 READDIRPLUS `entryplus3` encodes beyond the v4 `entry4` built from it, their names (encoded
 /// alike) aside: the v3 entry's fixed fields (value-follows 4, `fileid` 8, `cookie` 8, the name's length 4), its
@@ -853,17 +866,34 @@ fn read_callback_sec(reader: &mut XdrReader<'_>) -> Result<(Option<Vec<u8>>, boo
   Ok((credential, names_gss))
 }
 
-/// `BIND_CONN_TO_SESSION` (§18.34): the connection carries the session's fore channel.
+/// `BIND_CONN_TO_SESSION` (§18.34): the connection carries the session's fore channel, and its back channel too when
+/// the client asks and the session has one. A session's callbacks ride whichever connection last carried one of its
+/// compounds, so a connection bound for the back channel is its carrier from its first compound; the back channel is
+/// probed again before it is used, which is how a client repairs it after `SEQ4_STATUS_CB_PATH_DOWN` (Linux:
+/// `nfs41_handle_cb_path_down`). Until 2026-10-08 every bind was answered fore-only and a back channel once down was
+/// never probed again.
 fn bind_conn<B: Backend>(backend: &mut B, reader: &mut XdrReader<'_>) -> Outcome {
   let sessionid = decode_sessionid(reader).map_err(|_| Nfsstat4::Badxdr)?;
-  let _dir = reader.u32().map_err(|_| Nfsstat4::Badxdr)?;
+  let dir = reader.u32().map_err(|_| Nfsstat4::Badxdr)?;
   let _rdma = reader.bool().map_err(|_| Nfsstat4::Badxdr)?;
   backend
     .with_v4(|server| server.sessions.client_of(&sessionid))?
     .ok_or(Nfsstat4::Badsession)?;
+  let bound = if dir == CDFC4_FORE {
+    CDFS4_FORE
+  } else {
+    let has_back = backend.with_v4(|server| server.sessions.rebind_back_channel(&sessionid))?;
+    match (dir, has_back) {
+      (CDFC4_BACK, true) => CDFS4_BACK,
+      // The back channel alone, asked of a session that has none.
+      (CDFC4_BACK, false) => return Err(Nfsstat4::Inval),
+      (_, true) => CDFS4_BOTH,
+      (_, false) => CDFS4_FORE,
+    }
+  };
   let mut body = XdrWriter::new();
   body.fixed(&sessionid);
-  body.u32(CDFS4_FORE);
+  body.u32(bound);
   body.bool(false);
   Ok(body.into_bytes())
 }
@@ -946,12 +976,26 @@ fn sequence<B: Backend>(
       body.u32(slotid);
       body.u32(table_highest);
       body.u32(table_highest); // target highest slot
-      // A client holding a revoked delegation it has not freed is told on every SEQUENCE until it frees it (§10.4.5).
-      body.u32(if backend.revoked_state(clientid) {
+      // A client holding a revoked delegation it has not freed is told on every SEQUENCE until it frees it (§10.4.5);
+      // one whose back channel stopped answering is told so it can bind it again (§18.46.3).
+      let revoked = if backend.revoked_state(clientid) {
         SEQ4_STATUS_RECALLABLE_STATE_REVOKED
       } else {
         0
-      });
+      };
+      let (session_down, client_down) = backend
+        .with_v4(|server| server.sessions.callback_path_down(&sessionid, clientid))
+        .unwrap_or((false, false));
+      let path = if session_down {
+        SEQ4_STATUS_CB_PATH_DOWN_SESSION
+      } else {
+        0
+      } | if client_down {
+        SEQ4_STATUS_CB_PATH_DOWN
+      } else {
+        0
+      };
+      body.u32(revoked | path);
       Ok(SequenceOutcome::New {
         body: body.into_bytes(),
         sessionid,

@@ -706,6 +706,44 @@ impl Sessions {
     })
   }
 
+  /// Whether `sessionid`'s back channel is down, and whether every back channel of its client that has been probed is
+  /// (RFC 8881 §18.46.3: `SEQ4_STATUS_CB_PATH_DOWN_SESSION` and `SEQ4_STATUS_CB_PATH_DOWN`). A back channel not yet
+  /// probed is neither up nor down, so it raises neither.
+  pub fn callback_path_down(&self, sessionid: &SessionId, clientid: u64) -> (bool, bool) {
+    let state_of = |session: &Session| session.back.as_ref().map(|back| back.state);
+    let session_down = self
+      .sessions
+      .get(sessionid)
+      .and_then(state_of)
+      .is_some_and(|state| state == CallbackState::Down);
+    let mut any_down = false;
+    let mut any_up = false;
+    for session in self.sessions.values().filter(|s| s.clientid == clientid) {
+      match state_of(session) {
+        Some(CallbackState::Down) => any_down = true,
+        Some(CallbackState::Up) => any_up = true,
+        Some(CallbackState::Unproven) | None => {}
+      }
+    }
+    (session_down, any_down && !any_up)
+  }
+
+  /// A connection was bound to `sessionid` for its back channel too (`BIND_CONN_TO_SESSION`, §18.34): its back channel
+  /// is probed again before it is used (a client rebinds after `SEQ4_STATUS_CB_PATH_DOWN`); whether it has one.
+  pub fn rebind_back_channel(&mut self, sessionid: &SessionId) -> bool {
+    match self
+      .sessions
+      .get_mut(sessionid)
+      .and_then(|session| session.back.as_mut())
+    {
+      Some(back) => {
+        back.state = CallbackState::Unproven;
+        true
+      }
+      None => false,
+    }
+  }
+
   /// Records that the client used slot 0 at `sequence` (its reply came, with a `CB_SEQUENCE` it did not refuse as
   /// misordered).
   pub fn callback_used(&mut self, sessionid: &SessionId, sequence: u32) {

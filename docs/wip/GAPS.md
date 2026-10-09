@@ -3703,7 +3703,9 @@ shard's own clock that A-65 budgets in (docs/bugs/2026-10-04-the-slow-observatio
   (`docs/bugs/2026-10-04-a-callback-answered-delay-marked-the-back-channel-down.md`).
 - **Owed:**
   - FUSE and SDK callers parked rather than refused;
-  - `SEQ4_STATUS_CB_PATH_DOWN`;
+  - ~~`SEQ4_STATUS_CB_PATH_DOWN`~~ **done 2026-10-08 (A-124):** a recall the transport lost marks the back channel
+    down, `SEQUENCE` reports `CB_PATH_DOWN_SESSION` and `CB_PATH_DOWN`, and `BIND_CONN_TO_SESSION` asking for both
+    channels binds both and re-probes (`a_back_channel_that_stopped_answering_is_reported_and_repaired_by_a_rebind`);
   - a forwarded NFSv3 call held, not answered `JUKEBOX`;
   - write delegations: **done (A-80)**, with a zero-byte space limit; a space reservation that would let a holder
     cache writes past close is owed, as is `CB_GETATTR` in place of the GETATTR recall;

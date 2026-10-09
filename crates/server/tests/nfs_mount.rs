@@ -2405,6 +2405,12 @@ const NFS4ERR_DELAY: u32 = 10008;
 impl V4Client {
   /// Sends one compound and answers its SEQUENCE's probe while waiting, until the back channel is recorded up.
   fn prove_back_channel(&mut self, daemon: &Daemon) {
+    self.prove_back_channel_up(daemon, 1);
+  }
+
+  /// [`V4Client::prove_back_channel`], waiting for the daemon to have recorded a back channel up `times` times (a
+  /// back channel probed again after a rebind is up a second time).
+  fn prove_back_channel_up(&mut self, daemon: &Daemon, times: u64) {
     let xid = self.send_sequence();
     let (mut replied, mut probed) = (false, false);
     while !(replied && probed) {
@@ -2418,7 +2424,7 @@ impl V4Client {
       }
     }
     assert!(
-      counter_reaches(daemon, "nfs4.callback.up", 1),
+      counter_reaches(daemon, "nfs4.callback.up", times),
       "the back channel is up"
     );
   }
@@ -3379,4 +3385,99 @@ fn answer_two_recalls(a: &mut V4Client) -> std::collections::BTreeSet<[u8; 12]> 
     .flatten()
     .map(|stateid| stateid.other)
     .collect()
+}
+
+/// Format: `OP_BIND_CONN_TO_SESSION`, its `CDFC4_FORE_OR_BOTH` request and `CDFS4_BOTH` answer, and the two
+/// back-channel `SEQUENCE` status flags (RFC 8881 §18.34, §18.46.3).
+const OP_BIND_CONN_TO_SESSION: u32 = 41;
+const CDFC4_FORE_OR_BOTH: u32 = 3;
+const CDFS4_BOTH: u32 = 3;
+const SEQ4_STATUS_CB_PATH_DOWN: u32 = 0x1;
+const SEQ4_STATUS_CB_PATH_DOWN_SESSION: u32 = 0x200;
+
+impl V4Client {
+  /// A compound of `SEQUENCE` alone on slot 0: its `sr_status_flags`.
+  fn sequence_flags(&mut self) -> u32 {
+    use slates_bridge_nfs::xdr::{XdrReader, XdrWriter};
+    self.sequence += 1;
+    let mut seq = XdrWriter::new();
+    seq.u32(OP_SEQUENCE);
+    seq.fixed(&self.sessionid);
+    seq.u32(self.sequence);
+    seq.u32(0);
+    seq.u32(0);
+    seq.bool(false);
+    let (status, results) = self.compound(1, seq.as_slice());
+    assert_eq!(status, NFS4_OK, "SEQUENCE");
+    let mut reader = XdrReader::new(&results);
+    assert_eq!(reader.u32().unwrap(), OP_SEQUENCE);
+    assert_eq!(reader.u32().unwrap(), NFS4_OK);
+    reader.fixed(16).unwrap(); // session
+    for _ in 0..4 {
+      reader.u32().unwrap(); // sequence, slot, highest slot, target highest slot
+    }
+    reader.u32().unwrap()
+  }
+
+  /// `BIND_CONN_TO_SESSION` asking `CDFC4_FORE_OR_BOTH`: its status and the direction bound.
+  fn bind_conn_both(&mut self) -> (u32, u32) {
+    use slates_bridge_nfs::xdr::{XdrReader, XdrWriter};
+    let mut op = XdrWriter::new();
+    op.u32(OP_BIND_CONN_TO_SESSION);
+    op.fixed(&self.sessionid);
+    op.u32(CDFC4_FORE_OR_BOTH);
+    op.bool(false);
+    let (status, results) = self.compound(1, op.as_slice());
+    if status != NFS4_OK {
+      return (status, 0);
+    }
+    let mut reader = XdrReader::new(&results);
+    reader.u32().unwrap(); // opnum
+    reader.u32().unwrap(); // status
+    reader.fixed(16).unwrap(); // session
+    (status, reader.u32().unwrap())
+  }
+}
+
+/// RFC 8881 §18.46.3, §18.34 (with A-123, 2026-10-08): do give client A a read delegation, write the file over NFSv3 so
+/// A is recalled, and have A never answer the recall. Expect the lost callback to mark A's back channel down, A's next
+/// `SEQUENCE` to carry `SEQ4_STATUS_CB_PATH_DOWN_SESSION` and `SEQ4_STATUS_CB_PATH_DOWN`, a `BIND_CONN_TO_SESSION`
+/// asking for both channels to be answered `CDFS4_BOTH`, the back channel probed again (A answers) and then up, and A's
+/// `SEQUENCE` flags clear. Before, the flags were never set and the bind was answered fore-only, so a back channel once
+/// down stayed down for the session's life.
+#[test]
+fn a_back_channel_that_stopped_answering_is_reported_and_repaired_by_a_rebind() {
+  let (daemon, client, mut a, _fh_a, _delegation, v3, file) = delegated_to_a("cb-path-down");
+  let writer = write_in_background(v3, file, b"after!");
+  let ignored = a.next_message();
+  assert!(is_call(&ignored), "A is called back, and does not answer");
+  assert!(
+    counter_reaches(&daemon, "nfs4.callback.path_down", 1),
+    "the lost recall marked the back channel down"
+  );
+  let flags = a.sequence_flags();
+  assert_eq!(
+    flags & (SEQ4_STATUS_CB_PATH_DOWN | SEQ4_STATUS_CB_PATH_DOWN_SESSION),
+    SEQ4_STATUS_CB_PATH_DOWN | SEQ4_STATUS_CB_PATH_DOWN_SESSION,
+    "A is told its back channel is down: {flags:#x}"
+  );
+  assert_eq!(
+    a.bind_conn_both(),
+    (NFS4_OK, CDFS4_BOTH),
+    "both channels bound"
+  );
+  a.prove_back_channel_up(&daemon, 2);
+  let flags = a.sequence_flags();
+  assert_eq!(
+    flags & (SEQ4_STATUS_CB_PATH_DOWN | SEQ4_STATUS_CB_PATH_DOWN_SESSION),
+    0,
+    "the repaired back channel clears the flags: {flags:#x}"
+  );
+  let (status, _) = writer.join().unwrap();
+  assert_eq!(
+    status, 0,
+    "the held write proceeded once the delegation was revoked"
+  );
+  drop((a, client));
+  drop(daemon);
 }
