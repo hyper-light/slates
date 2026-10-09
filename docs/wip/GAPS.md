@@ -4963,3 +4963,30 @@ to invalidate).
   3. A Windows-lane test, modelled on `an_in_place_write_to_an_opened_base_file_hints_its_directory`.
 - Not built here: neither the FFI nor its test can be compiled or run from this macOS machine (the Windows cross-lint
   stops at `zstd-sys`'s C build), and the Windows CI lanes run only on a push.
+
+### 2026-10-09: a cross-region read was refused when one forward went unanswered (fixed; condition 7)
+
+- **Found** by the two-network reads bench (`docs/wip/bench/multiregion/reads.sh`, 100 ms ± 40 ms one way, 3% loss
+  each way): reads came back with checksum 0 while the script printed exit 0, because its `$?` was `cut`'s. With the
+  read's own status and error kept, the refusal was `HomedElsewhere { region: 0 }`, mid-file. 1 or 2 reads in 9 were
+  refused across three runs.
+- **Cause:** a forward the owner was sent but did not answer within its budget (one liveness budget plus the path's
+  round-trip tail) refused the client at once (`verbs::resolve_and_forward`); its comment left the retry to the
+  caller, and `slates read` does not retry.
+- **Fixed:** the forward is sent again to the same owner while the detector has not confirmed it dead and the
+  operator's failover SLO allows. Nothing is re-located: a first cut that re-located on every miss reached a successor
+  that had not adopted the volume, which answered `NotFound`; it also slowed five takeover tests' polls past their
+  deadlines. A second cut that resent only to members `alive()` held still refused one read in nine, because a
+  suspect is not `alive()`. A resend is exactly once by the request id (RIFL); a dead owner is confirmed within the
+  horizon and ends the resends.
+  - Test: `an_unanswered_forward_is_sent_again_within_the_takeover_bound` (fails on the old code with
+    `HomedElsewhere` after 1.21 s).
+  - Two bench runs after the fix: 18 of 18 cross-region reads byte-identical; `fleet.forward.retried` moved on the
+    nodes whose forward went unanswered.
+  - Fleet suite 81/82: the one failure is the recorded `a_whole_ram_replacement…` flake, which failed 2 of 5 on HEAD
+    and 3 of 5 with the change, interleaved.
+- **Owed:**
+  - The refusal is mistyped. `HomedElsewhere` means "the volume is homed in another region; re-route there", and an
+    owner that did not answer within the takeover bound is not that. A typed refusal for it (a new `Refusal`
+    variant, appended), mapped through the CLI, MCP and both SDKs.
+  - `slates read`'s own handling of a retryable refusal.

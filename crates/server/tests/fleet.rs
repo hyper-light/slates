@@ -12452,3 +12452,89 @@ fn an_unbootstrapped_fleet_paces_its_configuration_fetches_to_the_horizon() {
     assert!(*paced > 0, "{node}'s backoff paced its fetches");
   }
 }
+
+/// Condition 7 (found 2026-10-09 by the two-network reads bench: one cross-region read in nine was refused
+/// `HomedElsewhere` mid-file on a 200 ms path with 3% loss, after one forward went unanswered): do form a fleet of three
+/// region-0 nodes and a foreign region-1 node, create a volume on a region-0 node, warm the foreign node's route to it,
+/// then make the owner answer every forward late enough that one forward's budget runs out, lift that delay while the
+/// first forward waits, and snapshot the volume from a fresh client of the foreign node. Expect the snapshot served (the
+/// unanswered forward sent again, the resend exactly-once by its request id), the foreign node's resend counter moved,
+/// and one snapshot taken. Before, the client was refused `HomedElsewhere` after the first forward's budget.
+#[test]
+fn an_unanswered_forward_is_sent_again_within_the_takeover_bound() {
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c", "foreign"];
+  let nodes: Vec<_> = names.iter().map(|name| fleet_node(name)).collect();
+  let seeds: Vec<_> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<_> = nodes
+    .iter()
+    .map(|(_, _, identity)| identity.certificate())
+    .collect();
+  let regions = seeds
+    .iter()
+    .enumerate()
+    .map(|(index, host)| (*host, RegionId(u64::from(index == names.len() - 1))))
+    .collect();
+  let (_serve_lease, serve) = mesh_serve_ports(names.len());
+  let daemons = start_mesh_with_regions(nodes, &seeds, &certs, &serve, 1, &regions);
+  let hosts: Vec<_> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
+  assert_fleet_forms(&daemons, &hosts, &names);
+  let owner_daemon = &daemons[0];
+  let foreign_instance = daemons[names.len() - 1].instance().to_owned();
+  let ReplyBody::Created { id } = Client::connect(owner_daemon.instance()).call(&scratch("resent"))
+  else {
+    panic!("create on the owner");
+  };
+  let mut warm = Client::connect(&foreign_instance);
+  let reached = audit_wait(|| Ok(status_answers(&mut warm, id)));
+  /// Shape: the owner's delay: past one forward's budget on loopback (one liveness budget, the path's tail near zero).
+  const LATE_NS: u64 = slates_server::daemon::LIVENESS_BUDGET_NS / 2 * 3;
+  /// Shape: when the delay is lifted: inside the first forward's wait, so only that one goes unanswered.
+  const LIFT_AFTER: Duration = Duration::from_millis(1_200);
+  let delayed = owner_daemon.inject_serve_delay(Some(LATE_NS));
+  let deadlines = slates_client::Deadlines::derive(
+    slates_server::daemon::LIVENESS_BUDGET_NS,
+    slates_db::replay::RECOVERY_BUDGET_NS,
+  )
+  .get();
+  let mut fresh = slates_client::Client::connect(&foreign_instance, deadlines).unwrap();
+  let began = Instant::now();
+  // The client's call runs on its own thread; this one owns the daemons (a daemon is not shared across threads) and
+  // lifts the delay while the first forward waits.
+  let call = std::thread::spawn(move || fresh.call(&RequestBody::Snapshot { volume: id }));
+  #[allow(clippy::disallowed_methods)]
+  // a test may sleep (the lint's stated exception): the lift's timing
+  std::thread::sleep(LIFT_AFTER);
+  let lift = owner_daemon.inject_serve_delay(None);
+  let written = call.join().unwrap();
+  let took = began.elapsed();
+  let retried = refusal_count(&daemons[names.len() - 1], "fleet.forward.retried").unwrap_or(0);
+  let snapshots =
+    match Client::connect(owner_daemon.instance()).call(&RequestBody::Status { volume: id }) {
+      ReplyBody::Status { report } => report.snapshots,
+      other => panic!("status on the owner: {other:?}"),
+    };
+  for daemon in daemons {
+    daemon.stop();
+  }
+  assert!(
+    reached,
+    "the foreign node reached the owner before the delay"
+  );
+  assert!(
+    delayed.is_ok() && lift.is_ok(),
+    "the delay was installed and lifted"
+  );
+  assert!(
+    matches!(written, Ok(ReplyBody::Snapshotted { .. })),
+    "the unanswered forward was sent again and served, after {took:?}: {written:?}"
+  );
+  assert!(retried >= 1, "the foreign node resent the forward");
+  assert_eq!(
+    snapshots, 1,
+    "the resend took no second snapshot (its request id was answered once)"
+  );
+}

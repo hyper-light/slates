@@ -1433,6 +1433,18 @@ async fn resolve_and_forward(
       None,
     );
   };
+  // A forward the owner was sent but did not answer within its budget is sent again to the same owner while the
+  // detector has not confirmed that owner dead and the takeover bound (the operator's failover SLO) allows. On a lossy path
+  // the reply is most often still being recovered by the transport. A dead owner is declared within the membership
+  // horizon, which ends the resends, and the client is refused as before, so a takeover's window is unchanged. Nothing
+  // is re-located here: a successor that has not yet adopted the volume would answer `NotFound`, which tells a client
+  // the volume does not exist. A resend is safe: a read is idempotent, and a forwarded write carries its request id,
+  // which the owner's completion record answers exactly once (§4.9 RIFL); the client waits for a forwarded verb while
+  // the daemon lives (`RequestBody::defers_reply`). Until 2026-10-09 one unanswered forward refused the client at once:
+  // one cross-region read in nine was refused mid-file on a 200 ms path with 3% loss.
+  let began = slates_rt::futures::now_ns();
+  let bound = crate::state::with_state(|state| state.config.failover_slo_ns)
+    .unwrap_or(crate::daemon::LIVENESS_BUDGET_NS);
   let owner = match known {
     Some(owner) => {
       crate::state::with_state(|state| {
@@ -1442,36 +1454,79 @@ async fn resolve_and_forward(
     }
     None => locate_within_budget(query).await,
   };
-  let bytes = match owner {
-    Some(owner) => {
-      // One liveness budget, plus the measured round-trip tail of the path to the owner: a WAN forward's reply is
-      // never refused for crossing a path the local budget did not allow for.
-      let tail_ns = crate::state::with_state(|state| {
+  let (decoded, later) = loop {
+    let (decoded, later) = forward_once(owner, &requests).await;
+    let unanswered = matches!(decoded, Some(None));
+    // Alive or only suspected: a suspect is still a member until it is confirmed dead or refutes the suspicion, and
+    // on a lossy path suspicion is common (the 2026-10-09 run that held to `alive()` alone still refused one read in
+    // nine). A confirmed death ends the resends.
+    let alive = owner.is_some_and(|owner| {
+      crate::state::with_state(|state| {
         state
-          .peer_paths
-          .get(&owner)
-          .and_then(slates_cluster::timing::PathRtt::tail_ns)
+          .fleet
+          .membership()
+          .state(owner)
+          .is_some_and(|member| member.liveness != slates_cluster::membership::Liveness::Dead)
       })
-      .flatten()
-      .unwrap_or(0);
-      let forwarded = crate::fleet::forward_batch_over_leader_session(
-        owner,
-        requests,
-        crate::daemon::LIVENESS_BUDGET_NS.saturating_add(tail_ns),
-      )
-      .await;
-      if forwarded.is_none() {
-        crate::state::with_state(|state| {
-          state.count("fleet.owner_location.forward_unsent", 1);
-        });
-      }
-      forwarded
+      .unwrap_or(false)
+    });
+    let elapsed = slates_rt::futures::now_ns().saturating_sub(began);
+    if !unanswered || !alive || elapsed >= bound {
+      break (decoded, later);
     }
-    None => None,
+    crate::state::with_state_counted(|state| state.count(FORWARD_RETRIED, 1));
   };
-  // A forward sent but unanswered within its budget comes back empty, and it is counted apart from one never
-  // sent: an owner that was reached but did not answer in time is not one that could not be reached.
-  let batch = bytes.unwrap_or_default();
+  let reply = decoded
+    .flatten()
+    .unwrap_or_else(|| refused(Refusal::HomedElsewhere { region }));
+  let route = route_after(&reply, owner, query);
+  (
+    OwnerReplies {
+      first: reply,
+      later,
+    },
+    route,
+  )
+}
+
+/// Counter: forwards sent again to an owner the detector has not confirmed dead because it did not answer the last within its
+/// budget (`resolve_and_forward`).
+const FORWARD_RETRIED: &str = "fleet.forward.retried";
+
+/// One forward of `requests` to `owner`, within one liveness budget plus the measured round-trip tail of the path to
+/// it: the decoded reply to the first (`None` when nothing was sent, `Some(None)` when it went unanswered) and the
+/// decoded replies to the rest that came back, in order, up to the first that did not.
+async fn forward_once(
+  owner: Option<HostId>,
+  requests: &[Vec<u8>],
+) -> (Option<Option<ReplyBody>>, Vec<ReplyBody>) {
+  let Some(owner) = owner else {
+    return (None, Vec::new());
+  };
+  // One liveness budget, plus the measured round-trip tail of the path to the owner: a WAN forward's reply is never
+  // refused for crossing a path the local budget did not allow for.
+  let tail_ns = crate::state::with_state(|state| {
+    state
+      .peer_paths
+      .get(&owner)
+      .and_then(slates_cluster::timing::PathRtt::tail_ns)
+  })
+  .flatten()
+  .unwrap_or(0);
+  let forwarded = crate::fleet::forward_batch_over_leader_session(
+    owner,
+    requests,
+    crate::daemon::LIVENESS_BUDGET_NS.saturating_add(tail_ns),
+  )
+  .await;
+  if forwarded.is_none() {
+    crate::state::with_state(|state| {
+      state.count("fleet.owner_location.forward_unsent", 1);
+    });
+  }
+  // A forward sent but unanswered within its budget comes back empty, and it is counted apart from one never sent: an
+  // owner that was reached but did not answer in time is not one that could not be reached.
+  let batch = forwarded.unwrap_or_default();
   let mut replies = batch.replies.into_iter();
   let decoded = replies
     .next()
@@ -1484,17 +1539,7 @@ async fn resolve_and_forward(
       state.count("fleet.owner_location.forward_unanswered", 1);
     });
   }
-  let reply = decoded
-    .flatten()
-    .unwrap_or_else(|| refused(Refusal::HomedElsewhere { region }));
-  let route = route_after(&reply, owner, query);
-  (
-    OwnerReplies {
-      first: reply,
-      later,
-    },
-    route,
-  )
+  (decoded, later)
 }
 
 /// The route a client keeps after its forward's `reply` from `owner`: the owner it reached, unless the reply refused.

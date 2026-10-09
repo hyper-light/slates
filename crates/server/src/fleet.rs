@@ -6834,7 +6834,7 @@ pub(crate) async fn forward_over_leader_session(
   request: Vec<u8>,
   deadline_ns: u64,
 ) -> Option<Vec<u8>> {
-  forward_batch_over_leader_session(peer, vec![request], deadline_ns)
+  forward_batch_over_leader_session(peer, &[request], deadline_ns)
     .await
     .map(|batch| {
       batch
@@ -6854,7 +6854,7 @@ pub(crate) async fn forward_over_leader_session(
 /// budget.
 pub(crate) async fn forward_batch_over_leader_session(
   peer: HostId,
-  requests: Vec<Vec<u8>>,
+  requests: &[Vec<u8>],
   stall_ns: u64,
 ) -> Option<slates_cluster::BatchReplies> {
   let began = futures::now_ns();
@@ -6872,7 +6872,7 @@ pub(crate) async fn forward_batch_over_leader_session(
         endpoint,
         FORWARD_STREAM,
         Priority::Metadata,
-        &requests,
+        requests,
         stall_ns.saturating_sub(waited),
       )
       .await;

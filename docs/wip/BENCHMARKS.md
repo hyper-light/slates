@@ -3957,6 +3957,22 @@ The owner's (`a1`) sessions after the reads:
   read 5.4–6.5× on the jitter rows and failed only on slow links' queues. Before then, the reading needs an epoch
   that spans enough samples.
 
+### Cross-region reads at HEAD: none refused after an unanswered forward is resent (condition 7; 2026-10-09)
+
+Command: `IMAGE=slates:mr sh docs/wip/bench/multiregion/reads.sh <scratch> <8 MiB payload> 3` (the two-network
+topology, 100 ms ± 40 ms one way, 3% loss each way; the image built from the tree under test). Load average 9–19.
+
+| Build | Cross-region reads of 8 MiB (s), byte-identical | Refused |
+|---|---|---|
+| `c264b71c` | 30.2, 24.3, 28.2, 19.4, 34.3, 23.5, 18.3 | 2 of 9 (`HomedElsewhere`) |
+| `cf1162ed`, the script's exit status fixed | 24.8, 25.4, 24.8, 26.1, 20.0, 29.3, 19.4, 19.3 | 1 of 9 |
+| resend to an `alive()` owner | 22.8, 27.7, 31.9, 29.8, 31.4, 31.4, 26.3, 24.2 | 1 of 9 |
+| resend unless confirmed dead, run 1 | 29.0, 32.0, 23.0, 20.8, 19.0, 22.0, 24.8, 21.9, 21.9 | 0 of 9 (`fleet.forward.retried` 1 on b2) |
+| resend unless confirmed dead, run 2 | 23.5, 24.7, 28.2, 26.3, 33.9, 21.4, 33.6, 27.8, 25.6 | 0 of 9 (`retried` 1 on b0, 1 on b2) |
+
+The median read (about 25 s) is about 1.8× faster than the 44 s of 2026-10-08's landed build, from the day's other
+changes or the load; it was not A/B'd.
+
 ### The read-ahead batch's rate cap removed: cross-region reads 2.7x faster on the real crossing (condition 7; 2026-10-08)
 
 The owner's sessions (above) showed windows of about 9 KB on the crossing. The question was whether Copa or the read
