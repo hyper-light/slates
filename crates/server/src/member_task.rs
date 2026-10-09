@@ -73,6 +73,11 @@ const SEND_REFUSED: &str = "fleet.plane.send_refused";
 const RECEIVE_REFUSED: &str = "fleet.plane.receive_refused";
 const ADDRESS_UNRESOLVED: &str = "fleet.plane.address_unresolved";
 const FOLD_REFUSED: &str = "fleet.plane.fold_refused";
+/// Event counters (`slates status`): record sessions lent to the announcement pass, and announcements sent on them. A
+/// session is lent only when its connection owes an announcement, so the two move together; lends outrunning sends is
+/// the pass borrowing sessions that owe nothing.
+const EPOCH_LENT: &str = "fleet.plane.announce_lends";
+const EPOCH_SENT: &str = "fleet.plane.announcements_sent";
 
 /// One side's identity in an epoch exchange.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -242,34 +247,45 @@ fn forget_address(state: &mut ShardState, anchor: HostId) {
 /// The dialer side: every record session this node dialed announces its identity once per connection, so the peer
 /// learns who dialed (or refuses and counts a forged identity) whatever the pair's keying. The **canonical** one (this
 /// node the lower anchor) also announces the pair's next epoch, installed once the acceptor answers with a valid
-/// identity; any other announces [`IDENTITY_ONLY`]. The sessions are borrowed from the record links and returned, as
-/// the record coordinator borrows them.
+/// identity; any other announces [`IDENTITY_ONLY`].
+///
+/// Only a session whose connection has not announced yet is owed, decided in the state's borrow from the session
+/// still in its slot, and each owed session is borrowed alone for its own exchange and returned before the next. The
+/// membership loop runs this on every turn: borrowing every session on each turn, all of them held while one
+/// announcement waited, kept the whole record plane lent about a hundred times a second per node and held every
+/// session for up to 3.1 s behind one unanswered announcement (diagnostic run at 10% loss, 2026-10-09).
 async fn announce_epochs() {
   // Decided in one borrow: `take_sessions` runs its filter inside the state's borrow, so the filter must not borrow the
   // state again.
-  let owed: BTreeMap<HostId, bool> = state::with_state(|state| {
-    state
+  let owed: Vec<(HostId, bool)> = state::with_state(|state| {
+    let origin = state.origin_anchor;
+    let anchors: BTreeMap<HostId, HostId> = state
       .record_sessions
       .keys()
-      .copied()
-      .filter_map(|member| {
-        let anchor = anchor_of(state, member)?;
-        Some((member, anchor > state.origin_anchor))
+      .filter_map(|member| Some((*member, anchor_of(state, *member)?)))
+      .collect();
+    let announced_on = &state.plane.announced_on;
+    state
+      .record_sessions
+      .iter_mut()
+      .filter_map(|(member, link)| {
+        let anchor = anchors.get(member)?;
+        let connection = link.endpoint.as_mut()?.connection_id().ok()?;
+        (announced_on.get(member) != Some(&connection)).then_some((*member, *anchor > origin))
       })
       .collect()
   })
   .unwrap_or_default();
-  if owed.is_empty() {
-    return;
+  for (member, canonical) in owed {
+    let mut sessions =
+      crate::fleet::take_sessions("fleet.lent_to.announce_epochs", |host| host == member);
+    let lent = u64::try_from(sessions.len()).unwrap_or(u64::MAX);
+    let _ = state::with_state_counted(|s| s.count(EPOCH_LENT, lent));
+    for (_, endpoint) in &mut sessions {
+      announce_on(member, endpoint, canonical).await;
+    }
+    crate::fleet::return_sessions(sessions);
   }
-  let mut sessions = crate::fleet::take_sessions("fleet.lent_to.announce_epochs", |member| {
-    owed.contains_key(&member)
-  });
-  for (member, endpoint) in &mut sessions {
-    let canonical = owed.get(member).copied().unwrap_or(false);
-    announce_on(*member, endpoint, canonical).await;
-  }
-  crate::fleet::return_sessions(sessions);
 }
 
 /// One announcement on one borrowed session, once per connection: the pair's next epoch on its `canonical` session,
@@ -307,6 +323,7 @@ async fn announce_on(member: HostId, endpoint: &mut Endpoint, canonical: bool) {
   .flatten() else {
     return;
   };
+  crate::fleet::count_refusal(EPOCH_SENT);
   let budget = crate::fleet::record_exchange_budget_ns();
   let answered = futures::within(
     budget,

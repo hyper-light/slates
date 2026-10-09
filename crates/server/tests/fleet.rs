@@ -12674,3 +12674,61 @@ fn two_nodes_pair_keys_delivered_both_ways_are_both_accepted() {
     "no delivery refused (served {served:?})"
   );
 }
+
+/// The announcement pass lends only owed sessions (found 2026-10-09 by timing every record-session borrow on the
+/// two-network bench at 10% loss: each node lent every record session to the epoch announcement pass on every
+/// membership turn — 23,754 lends on one node in one run, 11 after — and held all of them while one announcement
+/// waited, for up to 3.1 s; the mirror's content rounds then found no session 123 times, 3 after). Do: form a two-node
+/// fleet and let the membership loop turn for some heartbeats. Expect each node to have announced on its session and
+/// to have lent a session to the pass only to send an announcement: lends equal sends. Before, the lends ran far
+/// ahead of the sends, one per session per turn.
+#[test]
+fn the_announcement_pass_lends_a_session_only_to_announce_on_it() {
+  let _serial = serialize_fleet_tests();
+  let (_ports, [pa_probe, pa_record, pb_probe, pb_record]) = four_free_ports();
+  let a = node("a", pa_probe, pa_record);
+  let b = node("b", pb_probe, pb_record);
+  let peer_of_a = Peer {
+    anchor: b.origin_anchor,
+    host: b.host,
+    address: b.address,
+    record_address: b.record_address,
+    certificate: b.identity.certificate(),
+  };
+  let peer_of_b = Peer {
+    anchor: a.origin_anchor,
+    host: a.host,
+    address: a.address,
+    record_address: a.record_address,
+    certificate: a.identity.certificate(),
+  };
+  let daemon_a = start(a, peer_of_a);
+  let daemon_b = start(b, peer_of_b);
+  assert!(
+    form_and_settle(&[&daemon_a, &daemon_b]),
+    "the fleet formed before the test acts"
+  );
+  /// Shape: membership turns enough to show a per-turn lend — the loop turns at least once a heartbeat.
+  const SETTLE: Duration = Duration::from_secs(3);
+  let began = Instant::now();
+  while began.elapsed() < SETTLE {
+    #[allow(clippy::disallowed_methods)]
+    // a test may sleep (the lint's stated exception): membership turns run
+    std::thread::sleep(Duration::from_millis(100));
+  }
+  let counted = |name: &'static str| -> Vec<u64> {
+    [&daemon_a, &daemon_b]
+      .iter()
+      .map(|daemon| refusal_count(daemon, name).unwrap_or(0))
+      .collect()
+  };
+  let lends = counted("fleet.plane.announce_lends");
+  let sent = counted("fleet.plane.announcements_sent");
+  daemon_a.stop();
+  daemon_b.stop();
+  assert!(
+    sent.iter().all(|count| *count > 0),
+    "each node announced on its session: {sent:?}"
+  );
+  assert_eq!(lends, sent, "a session lent only to announce on it");
+}

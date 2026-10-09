@@ -5137,3 +5137,18 @@ At `f62847d5`:
     presentation.
 - The same day, the escape battery over Linux NFS (`d26b01b0`) measured 0 bytes written to disk by the daemon outside a
   granted landing, and the landing engine's crash-at-every-write-instruction oracle passed with the land suites.
+
+### 2026-10-09: the epoch announcement pass lent every record session on every membership turn (conditions 7, 10)
+
+- Found by timing each record-session borrow per borrower on the two-network bench at 10% loss
+  (`docs/bugs/2026-10-09-the-announcement-pass-lent-every-record-session-every-turn.md`).
+  - Before: 13,089–23,754 lends per node in a five-round run, all sessions held behind a pending announcement for up
+    to 3.1 s, and 123 mirror rounds that found no free session.
+  - After: 8–46 lends per node and 3 or 12 such rounds, in two runs.
+- Fix: a session is lent only when its connection owes an announcement, and each is lent alone.
+- The regression test fails on the old pass (18,933 lends against 2 sends) and passes on the new.
+- Mirror placement time is not shown to change: 4.9–8.3 s and 5.4–30.0 s after, 5.5–27.0 s before, at load 13.
+- The session-sharing redesign (one session lent whole to one borrower) is not owed on this evidence. The remaining
+  misses are a hedged content put's own late reply, which is benign.
+- Fleet suite 83/84; the failure is the recorded `a_whole_ram_replacement…` flake. An alternating A/B of that test
+  failed 1 of 5 on the fix and 2 of 5 on HEAD, at the same assertion.
