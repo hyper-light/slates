@@ -126,6 +126,9 @@ pub(crate) fn serve(
     return Vec::new();
   }
   let (object, sequence) = (head.object, head.sequence);
+  // Which field of a conflicting head differs from the held one, counted before the refusal: the position is the same,
+  // so the value is the question (a diagnosis the conflict loop of 2026-10-09 needed).
+  let conflict_fields = conflicting_head_fields(state, &head);
   let accepted = state
     .mirror_records
     .accept(catalog)
@@ -137,6 +140,9 @@ pub(crate) fn serve(
         .map_err(|refusal| (refusal, "head"))
     });
   if let Err((refusal, record)) = accepted {
+    for field in conflict_fields {
+      state.count(field, 1);
+    }
     state.count(SHIPMENT_REFUSED, 1);
     state.count(
       match (refusal, record) {
@@ -162,6 +168,44 @@ pub(crate) fn serve(
   }
   .to_bytes()
 }
+
+/// The fields in which `head` differs from the head this holder holds at the same epoch and sequence (none when it holds
+/// none there, or the values agree): each a counter name.
+fn conflicting_head_fields(state: &ShardState, head: &Record) -> Vec<&'static str> {
+  let Some(held) = state.mirror_records.newest(head.object) else {
+    return Vec::new();
+  };
+  if (held.epoch, held.sequence) != (head.epoch, head.sequence) || held.value == head.value {
+    return Vec::new();
+  }
+  let (Some(was), Some(now)) = (
+    HeadValue::from_record_bytes(&held.value),
+    HeadValue::from_record_bytes(&head.value),
+  ) else {
+    return vec![CONFLICT_UNDECODED];
+  };
+  let mut fields = Vec::new();
+  if was.manifest != now.manifest {
+    fields.push(CONFLICT_MANIFEST);
+  }
+  if was.content_holders != now.content_holders {
+    fields.push(CONFLICT_HOLDERS);
+  }
+  if was.sealing != now.sealing {
+    fields.push(CONFLICT_SEALING);
+  }
+  fields
+}
+
+/// Holder counters: the field a conflicting head differs in from the head held at its position (manifest, content
+/// holders, sealing), or that one of the two did not decode.
+const CONFLICT_MANIFEST: &str = "fleet.mirror.conflict.manifest";
+/// See [`CONFLICT_MANIFEST`].
+const CONFLICT_HOLDERS: &str = "fleet.mirror.conflict.content_holders";
+/// See [`CONFLICT_MANIFEST`].
+const CONFLICT_SEALING: &str = "fleet.mirror.conflict.sealing";
+/// See [`CONFLICT_MANIFEST`].
+const CONFLICT_UNDECODED: &str = "fleet.mirror.conflict.undecoded";
 
 /// The two records of a shipment, or `None` for bytes that are not one.
 fn decode_shipment(request: &[u8]) -> Option<(Record, Record)> {
