@@ -117,16 +117,32 @@ impl RecallGate {
   /// change that will touch the volume's files wholesale (a landing's advance of its overlay); whether any was held.
   /// A recall asked for this way is not a refused change, so the refusal count does not move.
   pub fn recall_volume(&mut self, prefix: u16) -> bool {
-    let held: Vec<u64> = self
-      .delegated
-      .keys()
-      .copied()
-      .filter(|no| crate::ids::InodeNo(*no).prefix() == prefix)
-      .collect();
+    let held = self.delegated_in(prefix);
     for no in &held {
       self.requested.insert((*no, None));
     }
     !held.is_empty()
+  }
+
+  /// The delegated inodes of the volume whose inode numbers carry `prefix`.
+  pub fn delegated_in(&self, prefix: u16) -> Vec<u64> {
+    self
+      .delegated
+      .keys()
+      .copied()
+      .filter(|no| crate::ids::InodeNo(*no).prefix() == prefix)
+      .collect()
+  }
+
+  /// Asks for the recall of every delegation held on inode `no`, for a change made outside any NFSv4 session that has
+  /// already happened (an outsider's edit of the disk beneath an untouched base file, RFC 8881 §10.2); whether any was
+  /// held. Like [`Self::recall_volume`], it is not a refused change, so the refusal count does not move.
+  pub fn recall(&mut self, no: u64) -> bool {
+    let held = self.delegated.contains_key(&no);
+    if held {
+      self.requested.insert((no, None));
+    }
+    held
   }
 
   /// The inodes, each with the actor of the change refused on it, whose recall was asked for since the last call.

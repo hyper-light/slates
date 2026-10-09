@@ -3147,7 +3147,45 @@ async fn reap_loop() {
       CLIENTS_REAPED.fetch_add(u64::try_from(reaped).unwrap_or(u64::MAX), Ordering::AcqRel);
     }
     refresh_pressure_hold();
+    state::with_state(|s| {
+      process_base_hints(s);
+      // The recalls the hints asked for are sent now: nothing else runs the drain while no call is served.
+      crate::delegation::drain(s);
+    });
     seal_idle_content().await;
+  }
+}
+
+/// Counter: overlay volumes whose watcher hints the reap tick could not process (the host refused a re-check); the
+/// hints are taken again at the next tick's listing, so none is lost, but a refusal is never silent.
+const BASE_HINTS_REFUSED: &str = "base.hints_refused";
+
+/// Drains every overlay volume's watcher hints, once a reap tick (§4.5, §4.15; RFC 8881 §10.2): a changed base
+/// directory has its listing invalidated, its witnessed entries re-checked for drift, and every delegation held on an
+/// untouched entry in it asked to be recalled, so an outsider's edit reaches a delegation holder within a tick and a
+/// round trip. Before 2026-10-08 hints were drained only by `status` and the FUSE coherence path, so over NFS a client
+/// holding a read delegation kept serving its cached bytes after an outsider changed the file.
+///
+/// Derived: the cadence is the reap loop's (the liveness budget), which already wakes the shard, so draining adds one
+/// non-blocking read of each watcher per tick and no wakeup. A client without a delegation sees an outsider's edit only
+/// after its attribute cache times out (`acregmin`, 3 s by default on Linux, nfs(5)), so the tick bounds the delegated
+/// client inside that. Rejected for now: a task per volume awaiting its watcher's descriptor, whose descriptor a
+/// destroy closes while the task may still be waiting on it.
+fn process_base_hints(s: &mut ShardState) {
+  let mut refused = 0u64;
+  for (_, slot) in s.volumes.iter_mut_all() {
+    if let Some(host) = slot.host.as_mut()
+      && slot
+        .volume
+        .with_host(host)
+        .process_hints(&mut s.store)
+        .is_err()
+    {
+      refused = refused.saturating_add(1);
+    }
+  }
+  if refused > 0 {
+    s.count(BASE_HINTS_REFUSED, refused);
   }
 }
 

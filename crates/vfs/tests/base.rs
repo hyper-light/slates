@@ -2172,3 +2172,44 @@ fn an_untouched_base_directory_the_disk_made_a_file_shows_the_file() {
   );
   assert_eq!(vol.diverged(&store), Vec::new());
 }
+
+/// RFC 8881 §10.2 (A-79's gate; found 2026-10-08 reading why an outsider's edit under an NFSv4 mount might never reach
+/// a delegation holder): "operations done outside the NFSv4.1 protocol ... also need to result in delegation recall".
+/// An outsider editing the disk beneath an untouched base file changes what the volume serves for it, so the watcher's
+/// hint must ask for the recall of every delegation held on such a file in the hinted directory. Do: overlay a
+/// directory of two untouched files and a copied-up one, delegate all three, have an outsider write the first in place,
+/// and drain the hints. Expect a recall asked for the first and the second (the hint names the directory, and each
+/// shows the disk), and none for the copied-up one, whose bytes are the volume's own.
+#[test]
+fn an_outsider_edit_beneath_an_untouched_base_file_asks_for_its_recall() {
+  let mut host = SimHost::new();
+  host.mkdir("/d");
+  host.replace_file("/d/edited", b"one");
+  host.replace_file("/d/neighbour", b"two");
+  host.replace_file("/d/copied", b"three");
+  host.advance_ns(2);
+  let mut store = store();
+  let mut vol = overlay(&mut host, &mut store);
+  let mut o = vol.with_host(&mut host);
+  let edited = o.resolve(&mut store, "/d/edited").unwrap().inode;
+  let neighbour = o.resolve(&mut store, "/d/neighbour").unwrap().inode;
+  let copied = o.resolve(&mut store, "/d/copied").unwrap().inode;
+  o.write(&mut store, copied, 0, b"THREE").unwrap();
+  drop(o);
+  for no in [edited, neighbour, copied] {
+    store.recall_gate.delegate(no.0, 7);
+  }
+  assert_eq!(store.recall_gate.take_requested(), Vec::new());
+  host.write_in_place("/d/edited", b"one, edited", 2);
+  vol.with_host(&mut host).process_hints(&mut store).unwrap();
+  let asked: BTreeSet<u64> = store
+    .recall_gate
+    .take_requested()
+    .into_iter()
+    .map(|(no, actor)| {
+      assert_eq!(actor, None, "an outsider acts as no client");
+      no
+    })
+    .collect();
+  assert_eq!(asked, [edited.0, neighbour.0].into_iter().collect());
+}

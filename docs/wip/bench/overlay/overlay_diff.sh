@@ -31,6 +31,8 @@ ms() { echo $(( ($2 - $1) / 1000000 )); }
 now() { date +%s%N; }
 # The changes: 10 appends, 5 creates, 3 removals, on files picked by a fixed stride so every round picks the same ones.
 mapfile -t PICKS < <(cd /base && find . -type f -size +0 | sort | awk -v n="$FILES" 'NR % int(n / 14 + 1) == 1' | head -13)
+# A file none of the changes touch, for the outsider's edit.
+UNTOUCHED=$(cd /base && find . -type f -size +0 | sort | awk -v n="$FILES" 'NR % int(n / 14 + 1) == 2' | head -1)
 change() {
   local root=$1
   for k in $(seq 0 9); do printf 'appended\n' >> "$root/${PICKS[$k]}"; done
@@ -92,6 +94,21 @@ for round in $(seq 1 "$ROUNDS"); do
   C=$(now); diff -rq /base /copy > /root/diff.txt 2>&1; E=$(now)
   echo "round $round: land plan $(ms "$A" "$B") ms, $(plan_summary) | diff -rq $(ms "$C" "$E") ms, $(grep -c '^Files .* differ$' /root/diff.txt) differ, $(grep -c '^Only in /copy' /root/diff.txt) only in the copy, $(grep -c '^Only in /base' /root/diff.txt) only in the base, $(grep -vc '^Files .* differ$\|^Only in' /root/diff.txt) other lines"
   [ "$round" = 1 ] && grep -v '^Files .* differ$\|^Only in' /root/diff.txt | head -5
+  if [ "$round" = 1 ]; then
+    # An outsider edits the disk under the volume: a file the volume replaced (drift, so the landing must name a
+    # conflict) and one it never touched (the mount must show the new bytes; the volume holds read delegations, so
+    # this also checks that an outside edit reaches the client). Read once through the mount first, so the client
+    # holds the old bytes.
+    cat "/mnt/slates/$UNTOUCHED" > /dev/null
+    printf 'outsider\n' >> "/base/${PICKS[0]}"; printf 'outsider\n' >> "/base/$UNTOUCHED"
+    A=$(now); seen=no
+    for _ in $(seq 1 100); do cmp -s "/mnt/slates/$UNTOUCHED" "/base/$UNTOUCHED" && { seen=yes; break; }; sleep 0.05; done
+    B=$(now)
+    echo "  outsider edit of an untouched file seen through the mount: $seen after $(ms "$A" "$B") ms"
+    echo "  drifted: $(slates --instance ov status "$ID" --drift 2>&1 | tr '\n' ' ')"
+    slates --instance ov land "$ID" /base --json > /root/plan2.json 2>&1
+    echo "  land plan after the outsider: $(python3 -c 'import json; j = json.load(open("/root/plan2.json")); print("conflicts", j.get("conflicts"))')"
+  fi
   umount /mnt/slates /mnt/knfs
 done
 slates --instance ov status --json > /root/status.json 2>/dev/null

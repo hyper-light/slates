@@ -2907,6 +2907,29 @@ impl Overlay<'_> {
     })
   }
 
+  /// Asks for the recall of every delegation held on an untouched base entry the watcher's hints may have changed:
+  /// those homed in a hinted directory, or every one after an overflow. RFC 8881 §10.2: "operations done outside the
+  /// NFSv4.1 protocol ... also need to result in delegation recall". An untouched entry shows the disk, so an
+  /// outsider's edit beneath it changes what the volume serves, and a holder that is not told keeps serving its own
+  /// cached bytes; a copied-up entry's bytes are the volume's own and are not recalled (its drift is reported instead,
+  /// §4.15). Bounded by the delegation table (one pass over this volume's delegated inodes per drain).
+  fn recall_hinted(&self, store: &mut Store, all: bool, dirs: &BTreeSet<InodeNo>) {
+    if !all && dirs.is_empty() {
+      return;
+    }
+    let witnessed = |no: InodeNo| self.vol.base.as_ref().is_some_and(|b| b.is_witnessed(no));
+    for no in store.recall_gate.delegated_in(self.vol.prefix()) {
+      let no = InodeNo(no);
+      let untouched_in_hinted = self.vol.inode(store, no).is_ok_and(|inode| {
+        matches!(inode.body, Body::Base(_) | Body::BaseLink(_))
+          && (all || inode.home.is_some_and(|home| dirs.contains(&home.parent())))
+      });
+      if untouched_in_hinted && !witnessed(no) {
+        store.recall_gate.recall(no.0);
+      }
+    }
+  }
+
   /// Drains the watcher's hints: a changed directory invalidates its listing, marks it stale for
   /// every attached transport's kernel cache (see [`Overlay::take_stale_base_entries`]),
   /// re-checks the witnessed entries homed there and re-verifies the digests kept beneath it
@@ -2951,6 +2974,8 @@ impl Overlay<'_> {
     }
     let all = std::mem::take(&mut plane.recheck_all);
     let dirs = std::mem::take(&mut plane.recheck);
+    self.recall_hinted(store, all, &dirs);
+    let plane = self.vol.base.as_ref().ok_or(VfsError::NotOverlay)?;
     let witnessed: Vec<InodeNo> = plane.witnesses.iter_head().map(|(no, _)| *no).collect();
     let targets: Vec<InodeNo> = witnessed
       .into_iter()

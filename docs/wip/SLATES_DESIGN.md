@@ -10550,3 +10550,32 @@ Status: built 2026-10-08.
 - Measured (2026-10-08, `overlay_diff.sh /usr/lib 3`, Linux NFSv4.2, load average 13.7): the plan is `create=5 delete=3
   replace=10` in 2–3 ms in each round; `diff -rq` over a host copy with the same changes took 371–389 ms and reported 11
   files differing (it follows a symlink alias to an appended file) and 8 dangling links it could not compare.
+
+### A-122 — An outsider's edit beneath an untouched base file recalls its delegations (2026-10-08)
+Applied in the same change to:
+- `crates/vfs/src/recall_gate.rs` (`delegated_in`, `recall`); `crates/vfs/src/base.rs` (`recall_hinted`, called by
+  `process_hints`); `crates/server/src/daemon.rs` (`process_base_hints` on the reap tick, then the recall drain;
+  `base.hints_refused`);
+- the test `an_outsider_edit_beneath_an_untouched_base_file_asks_for_its_recall` (`crates/vfs/tests/base.rs`), the
+  outsider check in `docs/wip/bench/overlay/overlay_diff.sh`, GAPS.
+
+Status: built 2026-10-08; the end-to-end check through a Linux mount is owed (below).
+- What it answers: RFC 8881 §10.2 requires that "operations done outside the NFSv4.1 protocol ... also need to result
+  in delegation recall", and A-79's gate held that for every change made through slates. An outsider editing the disk
+  beneath an untouched base file is a change too: the file shows the disk, so what the volume serves changed. Nothing
+  turned it into a recall. Watcher hints were drained only by `status` and the FUSE coherence path, so over NFS a
+  client holding a read delegation kept serving its cached bytes.
+- The rule:
+  - draining the hints asks for the recall of every delegation held on an untouched base entry homed in a hinted
+    directory (every one after an overflow), acting as no client;
+  - a copied-up entry is not recalled: its bytes are the volume's own, and its drift is reported (§4.15);
+  - every overlay volume's hints are drained once a reap tick, and the drain that sends recalls runs after them.
+- Derived: the cadence is the reap loop's (the liveness budget, 1 s), which already wakes the shard. An outsider's edit
+  reaches a delegation holder within a tick and a round trip. A client without a delegation sees it only after its
+  attribute cache times out (`acregmin`, 3 s by default, nfs(5)).
+- Rejected for now: a task per volume awaiting its watcher's descriptor (no tick). A destroy closes that descriptor
+  while the task may still wait on it, so it needs its own cancellation protocol first.
+- Owed: the end-to-end check (`overlay_diff.sh`'s outsider step: an edit of an untouched file seen through the mount,
+  the drifted path reported, the plan naming the conflict) did not run on 2026-10-08. The Docker VM was at load
+  150–250, and two attempts hit their 900 s bound before round one. On macOS, `EVFILT_VNODE` on a directory reports
+  namespace changes only, so an outsider's in-place write to an existing file is not hinted there at all.

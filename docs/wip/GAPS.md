@@ -4874,3 +4874,20 @@ Apple M5 Max, load average 13–14 from other sessions; the tree copied into tmp
   - A container that exits with a slates NFS mount still mounted deadlocks: the daemon's own exiting thread drops the
     last reference to the mount namespace, and the unmount's DESTROY_SESSION waits on that daemon. Every bench script
     must unmount in an exit trap; one diagnostic without one left a container only a VM restart clears.
+
+### 2026-10-08: an outsider's edit under an NFSv4 mount never reached a delegation holder (fixed in the core, A-122; e2e owed)
+
+- **Found by reading**, while adding an outsider check to the overlay bench: watcher hints were drained only by
+  `status` and the FUSE coherence path. Over NFS, a client holding a read delegation of an untouched base file is
+  never sent GETATTR or OPEN, so it kept serving its cached bytes after an outsider changed the file. That is the
+  coherence RFC 8881 §10.2 requires.
+- **Fixed:** draining hints asks for the recall of every delegation held on an untouched base entry in a hinted
+  directory, and the daemon drains every overlay volume's hints once a reap tick (1 s), then sends the recalls.
+  `an_outsider_edit_beneath_an_untouched_base_file_asks_for_its_recall` failed before (no recall asked), and passes
+  after (exactly the two untouched files, not the copied-up one).
+- **Owed:**
+  1. The end-to-end check through a real Linux mount (`overlay_diff.sh`, outsider step). Two attempts on 2026-10-08
+     hit their 900 s bound with the Docker VM at load 150–250 (not slates: the load was there before the daemon
+     started).
+  2. macOS: `EVFILT_VNODE` on a directory does not report an in-place write to an existing file, so such an edit is
+     not hinted. The edit is seen only at a lookup's live-disk check, which a delegation holder never makes.
