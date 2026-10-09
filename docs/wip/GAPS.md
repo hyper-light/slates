@@ -5074,3 +5074,22 @@ file, snapshots it, and times the snapshot's placement at home and then in the m
 - New counters: `fleet.mirror.no_neighbourhood`, `job_started`, `content_rounds`, `acks`, `round_failed`,
   `no_holder_session`, `shipments_sent`, `records_acked`, `ship_no_session`, the `shipment_refused.<reason>` family,
   `fleet.seal.no_holder_session`, `fleet.content.unauthorized`, `answered` and `answered_empty`.
+
+### 2026-10-09: the mirror conflict loop's cause, found and fixed: a home record wiped the mirror placement (condition 10)
+
+- **Cause, shown by a counter:** `fleet::record_placed_seals` wrote a snapshot's home placement as
+  `Placed { region, mirror: None }`, and a home seal that completed again for an already-mirrored snapshot (the
+  healer's re-offer) wiped its recorded mirror placement. `mirror_due` then started a second mirror job for the
+  snapshot, whose shipment named other content holders at the same position. Holders keep the first value there and
+  refused it for good: the `conflicting_position` loop, differing in `content_holders` alone.
+- **Fixed:** the home record keeps a mirror placement already recorded. `fleet.mirror.kept_on_home_record` moved 6 and
+  3 times in the two runs after the fix: the overwrite happened, and was kept from wiping the placement.
+- **Measured** (`mirror.sh`, 64 KiB, 100 ms ± 40 ms and 3% loss, five rounds a run):
+  - two runs placed 10 of 10 snapshots in the mirror in 2.1–4.8 s each, with no conflict refusal and exactly one
+    mirror job a snapshot;
+  - three runs just before, with this fix but without the counter, placed 3 of 15, with no conflicts; two of them
+    shipped nothing at all.
+- **Open:** that intermittent "ships nothing" run. Content is acknowledged (9–10 times for 5 snapshots), no shipment is
+  owed, and the counters added to place it (`fleet.mirror.awaits_sealing`, `fleet.seal.pair_recipient_unknown`) have
+  not yet seen a failing run.
+- Fleet suite 82/83; the failure is the recorded flake.

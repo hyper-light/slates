@@ -68,6 +68,10 @@ const SHIPMENTS_SENT: &str = "fleet.mirror.shipments_sent";
 const SHIPMENTS_ACKED: &str = "fleet.mirror.records_acked";
 /// See [`SHIPMENTS_SENT`].
 const SHIP_NO_SESSION: &str = "fleet.mirror.ship_no_session";
+/// Owner counter: shipments held back in a period because the head's sealing does not yet cover every live mirror
+/// holder (a pair key entry each, `fleet::sealing_covers`).
+const AWAITS_SEALING: &str = "fleet.mirror.awaits_sealing";
+
 /// Owner counter: shipment acknowledgements that came back after their round and were folded into the job.
 const SHIPMENTS_ACKED_LATE: &str = "fleet.mirror.records_acked_late";
 
@@ -228,9 +232,10 @@ struct Owed {
 
 /// The shipments this owner shard owes: every mirror job whose content `f + 1` mirror holders hold, to those of them
 /// that have not yet acknowledged its records. Built on the owner shard, where the volumes and their catalogs live.
-fn owed(state: &ShardState, local: HostId, quorum: Quorum) -> Vec<Owed> {
+fn owed(state: &mut ShardState, local: HostId, quorum: Quorum) -> Vec<Owed> {
   let epoch = state.fleet.configuration().host_epoch;
   let mut owed = Vec::new();
+  let mut awaits_sealing = 0u64;
   for (object, job) in &state.mirror_seals {
     let Some(manifest) = job.manifest else {
       continue;
@@ -277,6 +282,7 @@ fn owed(state: &ShardState, local: HostId, quorum: Quorum) -> Vec<Owed> {
       .copied()
       .filter(|host| state.mirror_neighbourhood.contains(host));
     if !crate::fleet::sealing_covers(state, *object, &value, live_holders) {
+      awaits_sealing = awaits_sealing.saturating_add(1);
       continue;
     }
     let record = |object: ObjectId, sequence: u64, value: Vec<u8>| Record {
@@ -303,6 +309,9 @@ fn owed(state: &ShardState, local: HostId, quorum: Quorum) -> Vec<Owed> {
       targets,
       fresh: true,
     });
+  }
+  if awaits_sealing > 0 {
+    state.count(AWAITS_SEALING, awaits_sealing);
   }
   owed
 }

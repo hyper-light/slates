@@ -2370,6 +2370,10 @@ const MIRROR_ACKS: &str = "fleet.mirror.acks";
 /// Counter: mirror content rounds that failed outright (neither placed, uncertain nor short of the quorum).
 const MIRROR_ROUND_FAILED: &str = "fleet.mirror.round_failed";
 
+/// Counter: home placements recorded again for a snapshot already placed in the mirror, which kept its mirror
+/// placement (`record_placed_seals`).
+const MIRROR_KEPT_ON_HOME_RECORD: &str = "fleet.mirror.kept_on_home_record";
+
 /// Counter: mirror shipments started (a snapshot placed at home, its archive walk begun for the mirror region).
 const MIRROR_JOB_STARTED: &str = "fleet.mirror.job_started";
 
@@ -3107,6 +3111,22 @@ fn record_placed_seals(state: &mut ShardState) {
     .collect();
   for (object, snapshot, identity, region) in done {
     let volume = DbVolumeId { bytes: object.0 };
+    // A mirror placement already recorded is kept: a home seal that completes again for a mirrored snapshot (the
+    // healer's re-offer) wrote `mirror: None` over it until 2026-10-09, which started a second mirror job for the
+    // snapshot, whose shipment named other content holders at the same position and was refused for good.
+    let mirror = match state.db.partition().snapshot(volume, snapshot) {
+      Some(record) => match &record.placed {
+        PlacementState::Placed {
+          mirror: Some(mirror),
+          ..
+        } => Some(mirror.clone()),
+        _ => None,
+      },
+      None => None,
+    };
+    if mirror.is_some() {
+      state.count(MIRROR_KEPT_ON_HOME_RECORD, 1);
+    }
     let ops = [
       Op::SnapshotIdentified {
         volume,
@@ -3116,10 +3136,7 @@ fn record_placed_seals(state: &mut ShardState) {
       Op::SnapshotPlaced {
         volume,
         id: snapshot,
-        placed: PlacementState::Placed {
-          region,
-          mirror: None,
-        },
+        placed: PlacementState::Placed { region, mirror },
       },
     ];
     for op in &ops {
@@ -6586,6 +6603,8 @@ async fn deliver_pairs(origin: u16, shard: u16, local: HostId, budget: CommitBud
   }
   for (member, anchor) in owed {
     let Some(public) = peer_recipient(member, anchor, budget).await else {
+      // The neighbour's recipient key did not come back this period: its pair is owed again next period, counted.
+      count_refusal(PAIR_RECIPIENT_UNKNOWN);
       continue;
     };
     let delivery = call_within(
@@ -6639,6 +6658,9 @@ const MEMBER_ANCHORS_UNSENT: &str = "fleet.seal.member_anchors_unsent";
 /// Counter: a pair key that could not be made, wrapped or delivered this period (A-92 piece 4b); tried again next.
 /// Format: a counter name in the daemon's status report.
 const PAIR_UNDELIVERED: &str = "fleet.seal.pair_undelivered";
+
+/// Counter: a neighbour's recipient key that did not come back in a period, so its pair was not built (`deliver_pairs`).
+const PAIR_RECIPIENT_UNKNOWN: &str = "fleet.seal.pair_recipient_unknown";
 
 /// The recipient public key of the node with stable `anchor`, reached as `member` (A-92 piece 4b): kept from an earlier
 /// answer, or asked over its authenticated record session now and kept by anchor (bounded by the fleet's peer
