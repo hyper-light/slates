@@ -4196,3 +4196,40 @@ spurious losses each (455–676). Reordering read as loss no longer costs window
 loss. The window had been bound by the delay signal.
 
 Cleaned up: the arms' code is the landed code only; the trace used to find this was removed.
+
+### Landed: a write that covers a sealed window whole opens it without reading it (conditions 5 and 12; 2026-10-09)
+
+Found by profiling a sustained overwrite over the macOS NFS mount (`sample` of the daemon, 2 s mid-write). Of the busy
+shard's active samples, 665 were the socket receive, 290 memmove, 226 AES-GCM encrypt and 201 AES-GCM decrypt. A
+pure write stream should decrypt nothing. Each WRITE reopened its window's sealed extent (`ChunkStore::reopen`):
+- it decrypted the old chunk (A-99);
+- it copied the old bytes twice;
+- then the write overwrote them.
+
+Now a write from a window's start at least as long as the window's sealed extent opens the window fresh
+(`ChunkStore::replace`, non-vacuity counter `replaced_unread`). The old chunk is released by the same epoch rule, so a
+snapshot keeps it. The fresh block holds the write's first window whole, so the write cannot stop partway with the old
+bytes gone.
+
+**Where it applies.** The window is 16 pages:
+- on Linux, 64 KiB, and the kernel client writes 256 KiB (`wsize=262144`), so every aligned WRITE covers whole
+  windows;
+- on macOS, 256 KiB, and the mount asks for 128 KiB transfers (`MACOS_TRANSFER_BYTES`), so no WRITE covers one.
+
+The macOS A/B was therefore even, as expected: 923–1,243 MiB/s and 6.8–7.6 s of daemon CPU in both arms, client-bound.
+
+**Command:** `docs/wip/bench/overwrite/linux.sh` in a privileged `python:3.12-slim-trixie` container.
+- A Linux release build of each arm, from its own target volume and source tree.
+- A 512 MiB random file is overwritten six times per round in 1 MiB writes, with an fsync per pass, through the kernel's
+  NFSv4.2 client on loopback; three rounds per container.
+- Arms run new, base, new, base after base, new, base, new: twelve rounds each.
+- Apple M5 Max, Docker Desktop 6.12 kernel, load average 10–17 from other sessions.
+
+| arm | daemon CPU per 3 GiB, median (range) | throughput, median (range) |
+|---|---|---|
+| base (`53e182e6`) | 4.55 s (3.91–7.84) | 644 MiB/s (365–759) |
+| replace unread | 3.64 s (3.07–4.86) | 760 MiB/s (599–912) |
+
+Daemon CPU per byte fell 20% and throughput rose 18%. The daemon is CPU-bound on this path (CPU about equal to wall
+time), so the CPU it saves is throughput. Linux's own nfsd measured 967–1,524 MB/s on the same storm (above), so the
+remaining gap is still owed a profile.

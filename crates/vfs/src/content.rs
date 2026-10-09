@@ -240,6 +240,9 @@ pub struct ChunkStore {
   free_refusals: u64,
   /// Bytes a seal gave back by trimming a chunk's block to its length (A-118): the non-vacuity count of the trim.
   trimmed_bytes: u64,
+  /// Windows opened for a write that covers their sealed extent whole, without reading it ([`ChunkStore::replace`]):
+  /// the non-vacuity count of that path.
+  replaced_unread: u64,
   /// Trims the arena refused after the chunk was recorded (the block stays whole, so only the economy is lost):
   /// counted, never silent.
   trim_refusals: u64,
@@ -308,6 +311,7 @@ impl ChunkStore {
       moved_out_of_image: 0,
       free_refusals: 0,
       trimmed_bytes: 0,
+      replaced_unread: 0,
       trim_refusals: 0,
       trim_declined_bytes: 0,
       seal_scratch: Vec::new(),
@@ -343,6 +347,12 @@ impl ChunkStore {
   /// Bytes seals gave back by trimming chunks' blocks to their lengths, so far (A-118).
   pub const fn trimmed_bytes(&self) -> u64 {
     self.trimmed_bytes
+  }
+
+  /// Windows opened without reading their sealed extent, because the write covers it whole, so far
+  /// ([`ChunkStore::replace`]).
+  pub const fn replaced_unread(&self) -> u64 {
+    self.replaced_unread
   }
 
   /// Trims the arena refused after a chunk was recorded, so far (A-118).
@@ -957,6 +967,25 @@ impl ChunkStore {
     let source = bytes.get(lo..hi).ok_or(VfsError::StaleHandle)?;
     copy_overlap(source, lo_file, off, out);
     Ok(())
+  }
+
+  /// Opens `extent`'s window for a write of `want` bytes from its start that covers it whole: a fresh extent at its
+  /// offset, and nothing read. [`ChunkStore::reopen`] would open the sealed chunk (decrypt it when the store seals,
+  /// A-99) and copy it twice, only for the write to overwrite every byte. The caller releases the old chunk by the
+  /// epoch rule, as after a reopen, so a snapshot still holds it. A block sized for `want` takes the write's first
+  /// window whole, so [`ChunkStore::write_open`] never grows it: the write cannot stop partway with the old bytes
+  /// gone. Measured: a 512 MiB file overwritten in 1 MiB writes over the macOS NFS mount spent 228 of the busy
+  /// shard's samples in 2 s reading back the windows it replaced, 201 of them decrypting (2026-10-09).
+  pub fn replace(
+    &mut self,
+    extent: &Extent,
+    want: usize,
+    born: Epoch,
+    locked: bool,
+  ) -> Result<OpenExtent, VfsError> {
+    let open = self.open(extent.off, want, born, locked)?;
+    self.replaced_unread = self.replaced_unread.saturating_add(1);
+    Ok(open)
   }
 
   /// Copies a sealed extent's bytes into a new open extent (copy-on-write), zero-filling

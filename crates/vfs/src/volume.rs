@@ -5379,8 +5379,9 @@ impl Volume {
   /// Writes into an open extent, sealing and reopening as the write crosses chunk boundaries
   /// or leaves the open extent's range.
   /// Opens the chunk window holding `cursor` for writing: the window's sealed extent, if it
-  /// has one, is reopened (copied, its chunk retired by the epoch rule), else a fresh extent
-  /// starts at the window's start. Every extent thus begins at a window boundary and a window
+  /// has one, is reopened (copied, its chunk retired by the epoch rule) unless the write of `want`
+  /// bytes from `cursor` covers it whole, when the window opens fresh and the chunk is retired
+  /// unread; else a fresh extent starts at the window's start. Every extent thus begins at a window boundary and a window
   /// has at most one extent, which is what the chunk rule of §4.5 charges.
   pub(crate) fn open_window(
     &mut self,
@@ -5397,7 +5398,15 @@ impl Volume {
       return store.content.open(window_start, want, epoch, self.locked);
     };
     let e = sealed.remove(pos);
-    let open = match store.content.reopen(&e, epoch, self.locked) {
+    // A write from the window's start at least as long as the sealed extent overwrites every byte of it: the
+    // window opens fresh, and the old bytes are never read (`ChunkStore::replace`).
+    let covers = cursor == window_start && u64::try_from(want).is_ok_and(|want| want >= e.len);
+    let opened = if covers {
+      store.content.replace(&e, want, epoch, self.locked)
+    } else {
+      store.content.reopen(&e, epoch, self.locked)
+    };
+    let open = match opened {
       Ok(open) => open,
       Err(refusal) => {
         // Refused before anything changed: the window keeps its sealed extent.

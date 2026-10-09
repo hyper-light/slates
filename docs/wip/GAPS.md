@@ -5173,3 +5173,23 @@ At `f62847d5`:
     each) or in a full rerun (85/85).
 - The announcement fix (`48496cf8`) did not change idle CPU on Docker: 0.83% and 0.99% before, 0.85% and 0.75%
   after. Its value is the contention it removed.
+
+### 2026-10-09: an overwrite decrypted and copied every window it replaced (fixed; conditions 5 and 12)
+
+- **Found** by profiling the daemon during a sustained overwrite over the macOS NFS mount: 201 of the busy shard's
+  samples in 2 s were AES-GCM decryption, on a pure write stream. `open_window` reopened each window's sealed extent,
+  decrypting and copying it twice, even when the write replaced every byte.
+- **Fixed:** a write from a window's start at least as long as the sealed extent opens the window fresh
+  (`ChunkStore::replace`, counter `replaced_unread`).
+  - Test: `a_write_covering_a_sealed_window_whole_replaces_it_unread_and_a_partial_one_keeps_its_tail`
+    (`crates/vfs/tests/edges.rs`). The counter moves by exactly the two covered windows, a half-covered window keeps
+    its tail, and a snapshot taken before still reads every old byte.
+  - vfs, bridge-core, bridge-nfs and land suites: 546 passed.
+- **Measured** through Linux's NFSv4.2 client (BENCHMARKS, 12 rounds per arm): daemon CPU per 3 GiB 4.55 → 3.64 s
+  median, throughput 644 → 760 MiB/s.
+- On macOS no WRITE takes this path: the mount's 128 KiB transfers are half a 256 KiB window.
+- **Owed:**
+  - a write that covers a window in pieces (macOS, or any client whose writes are smaller than a window) still reads
+    the window first. Deferring the read until the window is sealed would let a window filled in pieces skip it too,
+    at the cost of reads and images of a partly written open extent: a design change, not built;
+  - the rest of the gap to Linux nfsd's large writes (967–1,524 MB/s against 760 MiB/s).
