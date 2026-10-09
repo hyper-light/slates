@@ -3503,6 +3503,31 @@ the client: a write without a delegation carries a GETATTR that keeps them fresh
 
 Rejected as dead even on this client; the patch is kept in the session scratchpad.
 
+### A write's retention estimate and window lookup by binary search (condition 12; 2026-10-08)
+
+**Found by profiling.** `perf record -g` of the daemon during 512 MiB `dd` writes through Linux NFS (release build with
+line tables, `docs/wip/bench` style container, 2026-10-08): the self time was `memcpy` about 24%, AES-GCM sealing at
+rest 14.5%, the kernel's `copy_to_user` 11.2%, first-touch page faults on the content object about 8%, then
+`Volume::retention_of_write` 4.5% and `Volume::open_window` 2.1%: both walked every extent of the file on each write
+(the retention estimate tested each piece; the window lookup was a linear `position`), so a write cost O(file
+windows), the shape the read path and `write_charge` lost on 2026-10-06.
+
+**The fix.** The estimate visits only the extents its operation can touch (`overlapping`, two binary searches: a
+write's windows, a truncate's or an edit's tail), and the window is found by `binary_search_by_key` on the ascending
+offsets.
+
+**Measured.** `cargo run --release -p slates-vfs --example large_file_bench` (macOS aarch64, A = `aa725a57`'s tree in
+a worktree, B = the fix, interleaved, load 17–37 from other sessions; best of 5 rounds per run):
+
+| File | A: random 4 KiB overwrite | B | A: sequential µs per MiB | B |
+|---|---|---|---|---|
+| 512 MiB (8,192 extents) | 33.8, 35.3, 37.0, 37.2 µs | 15.7, 18.3, 24.3, 15.6 µs | 126, 119, 100, 106 | 295 (load), 81, 72, 79 |
+| 128 MiB | 13.5, 14.4, 13.3, 17.1 µs | 12.1, 14.8, 13.6, 13.5 µs | 111, 126, 75, 80 | 194 (load), 74, 71, 68 |
+| 16 MiB, 10 runs | 7.8–14.5 µs, median about 10.3 | 9.4–17.1 µs (one 23.5 load spike), median about 11.2 | | |
+
+- The 512 MiB overwrite halves and stops growing with the file; the 16 MiB row is within this load's noise (the change
+  only removes work).
+
 ### A real tree copied: slates against the kernel's nfsd (condition 12; 2026-10-08)
 
 Command: `docs/wip/bench/mixed/copy_tree.sh /usr 3` (privileged `rust:1.98.0`, the release build of `6d2d5d91`, Linux

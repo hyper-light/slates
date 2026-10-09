@@ -3744,14 +3744,17 @@ impl Volume {
     &self,
     store: &Store,
     no: InodeNo,
+    (start, end): (u64, u64),
     touched: impl Fn(u64, u64, u64) -> bool,
   ) -> Result<u64, VfsError> {
     let inode = self.inode(store, no)?;
     let block_len = |len: usize| u64::try_from(len).unwrap_or(u64::MAX);
+    // Only the pieces overlapping `[start, end)` can be touched, found by binary search: walking every extent of the
+    // file cost each write O(file windows) (4.5% of a daemon's large-write profile, 2026-10-08).
     // `touched` is told each piece's offset, length and the arena bytes it holds (a chunk's stored bytes; for the
     // open extent its whole block, the most its seal can leave, A-118), so a rebuild decision is the one
     // `rebuilt_if_smaller` will make.
-    let mut retained = body_extents(&inode.body)
+    let mut retained = overlapping(body_extents(&inode.body), start, end)
       .iter()
       .filter_map(|e| match e.src {
         ExtentSrc::Chunk { chunk, .. } => store.content.chunk(chunk).map(|c| (e, c)),
@@ -3789,7 +3792,11 @@ impl Volume {
       window_of(off, chunk),
       window_of(end.saturating_sub(1), chunk),
     );
-    self.retention_of_pieces(store, no, |piece, _, _| {
+    let range = (
+      first.saturating_mul(chunk),
+      last.saturating_add(1).saturating_mul(chunk),
+    );
+    self.retention_of_pieces(store, no, range, |piece, _, _| {
       let window = window_of(piece, chunk);
       window >= first && window <= last
     })
@@ -3803,7 +3810,7 @@ impl Volume {
       return Ok(0);
     }
     let locked = self.locked;
-    self.retention_of_pieces(store, no, |piece, piece_len, stored| {
+    self.retention_of_pieces(store, no, (len, u64::MAX), |piece, piece_len, stored| {
       piece >= len
         || (piece.saturating_add(piece_len) > len
           && rebuilt_size(store, len.saturating_sub(piece), locked) < stored)
@@ -3825,18 +3832,23 @@ impl Volume {
       .max(1);
     let window_start = window_start_of(at, chunk);
     let locked = self.locked;
-    self.retention_of_pieces(store, no, |piece, piece_len, stored| {
-      piece >= at
-        || (piece == window_start
-          && (writes
-            || (piece.saturating_add(piece_len) > at
-              && rebuilt_size(store, at.saturating_sub(piece), locked) < stored)))
-    })
+    self.retention_of_pieces(
+      store,
+      no,
+      (window_start, u64::MAX),
+      |piece, piece_len, stored| {
+        piece >= at
+          || (piece == window_start
+            && (writes
+              || (piece.saturating_add(piece_len) > at
+                && rebuilt_size(store, at.saturating_sub(piece), locked) < stored)))
+      },
+    )
   }
 
   /// The retention the whole content of `no` causes when the head lets go of it.
   fn retention_of_content(&self, store: &Store, no: InodeNo) -> Result<u64, VfsError> {
-    self.retention_of_pieces(store, no, |_, _, _| true)
+    self.retention_of_pieces(store, no, (0, u64::MAX), |_, _, _| true)
   }
 
   /// The retention dropping one link of `no` causes: its whole content, when this is the last name
@@ -5380,7 +5392,8 @@ impl Volume {
     let chunk = u64::try_from(store.content.chunk_bytes()).unwrap_or(u64::MAX);
     let epoch = self.epoch;
     let window_start = window_start_of(cursor, chunk);
-    let Some(pos) = sealed.iter().position(|e| e.off == window_start) else {
+    // The sealed extents are ascending by offset: the window's is found by binary search, not a walk of the file.
+    let Some(pos) = sealed.binary_search_by_key(&window_start, |e| e.off).ok() else {
       return store.content.open(window_start, want, epoch, self.locked);
     };
     let e = sealed.remove(pos);
