@@ -103,6 +103,14 @@ impl XdrWriter {
       .extend(std::iter::repeat_n(0u8, padding(bytes.len())));
   }
 
+  /// Overwrites the 32-bit word at byte `at` with `value` (a header word filled in once what it counts is known);
+  /// nothing changes when no whole word was written there.
+  pub fn set_u32_at(&mut self, at: usize, value: u32) {
+    if let Some(slot) = self.out.get_mut(at..at.saturating_add(size_of::<u32>())) {
+      slot.copy_from_slice(&value.to_be_bytes());
+    }
+  }
+
   /// The bytes written so far.
   pub fn as_slice(&self) -> &[u8] {
     &self.out

@@ -3533,8 +3533,11 @@ answers by resending).
 
 - Through Linux's NFS client (`docs/wip/bench/nfs/large_io.sh 3`, the new byte comparison): every 512 MiB file read
   back identical. Throughput there moved within the shared machine's noise (load 25–57).
-- Still copied per READ: the volume's read out of the arena, the v3 reply's encoding, the state wrapper, the v4 body,
-  the compound's assembly and the record framing; per WRITE, the v3 re-encoding itself. Each is a further step.
+- Same day, the compound's reply is encoded in place: its header (status, tag, operation count) is written before the
+  results and its words filled in at the end, so assembling the reply no longer copies every result into a second
+  buffer. A READ allocates 1,574,869 → 1,312,741 bytes (one transfer less); a WRITE is unchanged (526,966).
+- Still copied per READ: the volume's read out of the arena, the v3 reply's encoding, the state wrapper, the v4 body
+  and the record framing; per WRITE, the v3 re-encoding itself. Each is a further step.
 
 ### A write's retention estimate and window lookup by binary search (condition 12; 2026-10-08)
 

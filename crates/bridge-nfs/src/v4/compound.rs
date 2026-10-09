@@ -452,7 +452,15 @@ pub async fn serve<B: Backend>(backend: &mut B, args: &[u8], request_bytes: usiz
     session: None,
     denied: None,
   };
+  // The reply's header (status, tag, operation count) is written first and its words filled in at the end, so the
+  // results are encoded once, in place: assembling them into a second buffer copied every reply whole (a READ's full
+  // transfer among them, 2026-10-08).
   let mut results = XdrWriter::new();
+  results.u32(Nfsstat4::Ok.wire());
+  results.opaque(&tag);
+  let count_at = results.len();
+  results.u32(0);
+  let header = results.len();
   let mut done = 0u32;
   let mut last = Nfsstat4::Ok;
   let mut last_op = 0u32;
@@ -496,9 +504,12 @@ pub async fn serve<B: Backend>(backend: &mut B, args: &[u8], request_bytes: usiz
     let recorded = record(&mut results, opnum, outcome, &mut frame);
     // The result that would carry the reply past the session's sizes is replaced by the refusal that
     // says so, and the compound ends there (RFC 8881 §2.10.6.4).
-    if let Some(too_big) =
-      limits.and_then(|limits| oversize(limits, reply_bytes_so_far(&tag, results.len())))
-    {
+    if let Some(too_big) = limits.and_then(|limits| {
+      oversize(
+        limits,
+        reply_bytes_so_far(&tag, results.len().saturating_sub(header)),
+      )
+    }) {
       results.truncate(before);
       let _ = record(&mut results, opnum, Err(too_big), &mut frame);
       last = too_big;
@@ -510,7 +521,9 @@ pub async fn serve<B: Backend>(backend: &mut B, args: &[u8], request_bytes: usiz
     }
   }
   backend.finished(last_op, last);
-  let encoded = reply(last, &tag, done, results.as_slice());
+  results.set_u32_at(0, last.wire());
+  results.set_u32_at(count_at, done);
+  let encoded = results.into_bytes();
   if let Some((sessionid, slotid)) = slot {
     // A reply that cannot be kept for a retry is not sent as if it had been: the client is told the
     // server failed rather than promised exactly-once (RFC 8881 §2.10.6.1).
