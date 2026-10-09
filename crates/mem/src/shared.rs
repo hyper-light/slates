@@ -278,6 +278,23 @@ pub struct SparseObject {
   len: usize,
   commits: platform::Commits,
   words: Layout,
+  /// The page a discard gives back whole.
+  page: usize,
+  /// Where a discard leaves the kernel's reusable mark (macOS, A-110), the ranges that may carry one: written only
+  /// after the mark is cleared ([`SparseObject::prepare`]), since a marked page that is written stays the kernel's to
+  /// take. The whole object at creation and at opening, because marks are on the object's pages and outlive the
+  /// process that set them (a restarted daemon over the anchor's object). Empty where a discard leaves none.
+  reusable: crate::ranges::UnitSet,
+}
+
+/// The ranges of a shared object of `len` bytes that may carry a reusable mark when it is mapped: all of it where a
+/// discard leaves one (an earlier holder may have discarded any range), none elsewhere.
+fn possibly_marked(len: usize, page: usize) -> crate::ranges::UnitSet {
+  if crate::region::DISCARD_LEAVES_A_MARK {
+    crate::ranges::UnitSet::whole(len, page)
+  } else {
+    crate::ranges::UnitSet::new(0, page)
+  }
 }
 
 impl std::fmt::Debug for SparseObject {
@@ -295,11 +312,14 @@ impl SparseObject {
     let words = words.layout(len)?;
     let inner = platform::create_sparse(name, len)?;
     let commits = platform::Commits::new(len)?;
+    let page = platform::mapping_granule()?.max(1);
     Ok(SparseObject {
       inner,
       len,
       commits,
       words,
+      page,
+      reusable: possibly_marked(len, page),
     })
   }
 
@@ -309,11 +329,14 @@ impl SparseObject {
     let words = words.layout(len)?;
     let inner = platform::open(handoff, len)?;
     let commits = platform::Commits::new(len)?;
+    let page = platform::mapping_granule()?.max(1);
     Ok(SparseObject {
       inner,
       len,
       commits,
       words,
+      page,
+      reusable: possibly_marked(len, page),
     })
   }
 
@@ -344,6 +367,7 @@ impl SparseObject {
   /// Copies `from` in at `offset` (committed first); refused past the end or touching a declared word.
   pub fn write(&mut self, offset: usize, from: &[u8]) -> Result<(), MemError> {
     check_copy(&self.words, offset, from.len(), self.len)?;
+    self.prepare(offset, from.len())?;
     self.commits.commit(&self.inner, offset, from.len())?;
     copy_in(&mut self.inner, offset, from);
     Ok(())
@@ -366,18 +390,75 @@ impl SparseObject {
     Ok(())
   }
 
-  /// Gives the whole pages inside `offset .. offset + len` back to the OS (A-105), where it takes them (Linux): the
-  /// range then reads as zeros and costs no RAM until written again. For a range that already holds only zeros (a
-  /// cleared write log), so the partial pages at its ends need nothing. The bytes given back, zero where the OS took
-  /// none. Refused as [`SparseObject::write`] is.
+  /// Gives the whole pages inside `offset .. offset + len` back to the OS (A-105, A-117): on Linux the range becomes a
+  /// hole that reads zeros and costs no RAM until written again; on macOS its pages are marked reusable (A-110), out
+  /// of the footprint at once, reading what they held until the kernel takes them and zeros after, and recorded so the
+  /// next write clears the mark first. For a range nothing reads until it is written again (a cleared write log, a
+  /// stale checkpoint slot), so the partial pages at its ends need nothing. The bytes given back, zero where the OS
+  /// took none. Refused as [`SparseObject::write`] is.
   pub fn discard(&mut self, offset: usize, len: usize) -> Result<usize, MemError> {
     check_copy(&self.words, offset, len, self.len)?;
+    if crate::region::DISCARD_LEAVES_A_MARK {
+      return Ok(self.mark_reusable(offset, len));
+    }
     Ok(
       self
         .inner
         .discard(offset, len)
         .map_or(0, |(first, last)| last.saturating_sub(first)),
     )
+  }
+
+  /// Marks the whole pages inside `offset .. offset + len` reusable and records them: the bytes marked.
+  fn mark_reusable(&mut self, offset: usize, len: usize) -> usize {
+    let page = self.page;
+    let end = offset.saturating_add(len).min(self.len);
+    let first = offset.next_multiple_of(page);
+    let last = end.saturating_sub(end.checked_rem(page).unwrap_or(0));
+    if first >= last {
+      return 0;
+    }
+    let Some(pages) = self.inner.bytes_mut().get_mut(first..last) else {
+      return 0;
+    };
+    match crate::region::discard_slice(pages, true) {
+      crate::region::Discarded::Marked => {
+        self.reusable.mark(first, last);
+        last.saturating_sub(first)
+      }
+      crate::region::Discarded::Hole => last.saturating_sub(first),
+      crate::region::Discarded::Refused => 0,
+    }
+  }
+
+  /// Clears the reusable mark from every page of `offset .. offset + len` that may carry one (A-110), before it is
+  /// written: widened to whole words of the record within each recorded run, so one call clears a word of pages, as
+  /// [`crate::region::Region::prepare`] does. Nothing to do where no mark is recorded. Refused when the OS refuses,
+  /// the pages still recorded, so the write does not happen.
+  fn prepare(&mut self, offset: usize, len: usize) -> Result<(), MemError> {
+    if self.reusable.is_empty() {
+      return Ok(());
+    }
+    let size = self.len;
+    let word = self.reusable.word_bytes().max(1);
+    let start = offset.saturating_sub(offset.checked_rem(word).unwrap_or(0));
+    let end = offset
+      .saturating_add(len)
+      .checked_next_multiple_of(word)
+      .map_or(size, |end| end.min(size));
+    let mut at = start;
+    while let Some((from, reach)) = self.reusable.next_run_within(at, end) {
+      let (first, last) = (from.max(start), reach.min(end));
+      if let Some(pages) = self.inner.bytes_mut().get_mut(first..last) {
+        crate::region::reuse_slice(pages).map_err(|code| MemError::OsRefused {
+          call: "madvise(MADV_FREE_REUSE)",
+          code,
+        })?;
+      }
+      self.reusable.take(first, last);
+      at = last;
+    }
+    Ok(())
   }
 
   /// Copies the `into.len()` racy bytes at `offset` out, byte by byte through `AtomicU8` (committed first):
@@ -394,6 +475,7 @@ impl SparseObject {
   /// Refused unless the span lies wholly inside one declared racy span.
   pub fn write_racy(&mut self, offset: usize, from: &[u8]) -> Result<(), MemError> {
     check_racy(&self.words, offset, from.len(), self.len)?;
+    self.prepare(offset, from.len())?;
     self.commits.commit(&self.inner, offset, from.len())?;
     racy_in(&self.inner, offset, from);
     Ok(())
@@ -1322,6 +1404,52 @@ mod tests {
       Err(MemError::LayoutRefused { reason, .. }) => Some(reason),
       _ => None,
     }
+  }
+
+  /// A-117 on macOS (A-110's mark on the shared content object). Do: fill 64 MiB of a sparse object, zero and discard
+  /// it, then write it again through a second mapping opened afterwards (a restarted daemon over the anchor's object).
+  /// Expect: the discard takes the footprint down by most of it (measured 67 -> 3 MiB on a shared object, 2026-10-08);
+  /// the second mapping's writes count in the footprint again, which happens only when the mark was cleared first (a
+  /// marked page written stays the kernel's to take, A-110), though its own record never saw the discard; and the
+  /// bytes read back as written.
+  #[cfg(target_os = "macos")]
+  #[test]
+  #[cfg_attr(miri, ignore)] // Miri models no madvise or shared memory
+  fn a_discarded_range_leaves_the_footprint_and_a_later_mapping_clears_it_before_writing() {
+    const BYTES: usize = 64 << 20;
+    const MOST_OF_IT: u64 = (BYTES / 2) as u64;
+    let _serial = crate::test_serial::Guard::take();
+    let footprint = crate::test_serial::footprint;
+    let name = format!("slates-mem-reusable-{}", std::process::id());
+    let mut first = SparseObject::create(&name, BYTES, Words::new()).unwrap();
+    let piece = vec![0xABu8; 1 << 20];
+    for at in (0..BYTES).step_by(piece.len()) {
+      first.write(at, &piece).unwrap();
+    }
+    first.zero(0, BYTES).unwrap();
+    let written = footprint().unwrap();
+    assert_eq!(first.discard(0, BYTES).unwrap(), BYTES);
+    let discarded = footprint().unwrap();
+    assert!(
+      written.saturating_sub(discarded) >= MOST_OF_IT,
+      "the discard left the footprint: {written} -> {discarded}"
+    );
+    let mut second = SparseObject::open(&first.handoff().unwrap(), BYTES, Words::new()).unwrap();
+    let again = vec![0xCDu8; 1 << 20];
+    for at in (0..BYTES).step_by(again.len()) {
+      second.write(at, &again).unwrap();
+    }
+    let rewritten = footprint().unwrap();
+    assert!(
+      rewritten.saturating_sub(discarded) >= MOST_OF_IT,
+      "the later mapping cleared the marks before writing: {discarded} -> {rewritten}"
+    );
+    let mut back = vec![0u8; 1 << 20];
+    first.read(BYTES - back.len(), &mut back).unwrap();
+    assert!(
+      back.iter().all(|byte| *byte == 0xCD),
+      "the bytes read back as written"
+    );
   }
 
   /// AUD-29-09. Do: create an object with declared words, copy bytes in, store a word, and read both

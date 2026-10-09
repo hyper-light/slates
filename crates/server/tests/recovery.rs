@@ -2487,7 +2487,7 @@ fn allocated_in_content(name: &str) -> u64 {
 /// leave the shard idle until it counts recovery memory given back (`recovery.returned_bytes`), restart over the same
 /// anchor and read every file; then write another round, publish, return again and restart again, so the next
 /// checkpoint is written into a slot whose pages went back. Expect every file byte for byte after each restart and, on
-/// Linux (where the content object punches holes), the counter moved both times. Before A-117 the stale slot and the log's dead pages stayed resident: 30 MB of a
+/// Linux and macOS (where the content object punches holes or marks pages reusable), the counter moved both times. Before A-117 the stale slot and the log's dead pages stayed resident: 30 MB of a
 /// `/usr` copy (`docs/wip/BENCHMARKS.md`, memory per file).
 #[test]
 fn recovery_memory_no_restart_reads_goes_back_and_a_restart_recovers_every_file() {
@@ -2543,9 +2543,9 @@ fn recovery_memory_no_restart_reads_goes_back_and_a_restart_recovers_every_file(
   assert_every_file(&mut client, volume, (ROUNDS + 1) * PER_ROUND, PER_ROUND);
   third.stop();
   drop(segment);
-  // Pages go back only where the content object can punch a hole (Linux, `SparseObject::discard`); elsewhere the
-  // return is a no-op and the restarts above are the whole test.
-  if cfg!(target_os = "linux") {
+  // Pages go back where the content object can punch a hole (Linux) or mark them reusable (macOS,
+  // `SparseObject::discard`); on Windows the return is a no-op and the restarts above are the whole test.
+  if cfg!(any(target_os = "linux", target_os = "macos")) {
     assert!(
       returned_first > 0,
       "the first daemon gave dead recovery memory back"
@@ -2568,7 +2568,10 @@ fn returned_after_idle(daemon: &Daemon, before: u64) -> u64 {
       .unwrap_or(0)
   };
   let started = Instant::now();
-  while cfg!(target_os = "linux") && returned() <= before && started.elapsed() < START_WAIT {
+  while cfg!(any(target_os = "linux", target_os = "macos"))
+    && returned() <= before
+    && started.elapsed() < START_WAIT
+  {
     std::thread::yield_now();
   }
   returned()

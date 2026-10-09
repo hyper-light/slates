@@ -3583,8 +3583,8 @@ kept out of the tree.
 **Owed:**
 - Tail rounding: done by A-118 (a sealed chunk's block trimmed to its pages): block rounding 88.6 → 44.3 MB on
   `/usr`, the daemon 34–39 MB smaller at idle, copy time unchanged (the A/B is A-118's table).
-- macOS and Windows: the content object gives no page back there (`SparseObject::discard`), so A-117 and the
-  write log's purge do nothing on those hosts; a measured `madvise`/decommit for each is owed.
+- Windows: the content object gives no page back there (`SparseObject::discard`), so A-117 does nothing on that host;
+  a measured decommit is owed. macOS marks the pages reusable since 2026-10-08 (A-117's macOS note).
 
 ### Measured and rejected: no write delegation for an open that creates (condition 12; 2026-10-08)
 

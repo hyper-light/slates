@@ -10385,8 +10385,17 @@ Applied in the same change to:
 - the test `recovery_memory_no_restart_reads_goes_back_and_a_restart_recovers_every_file`
   (`crates/server/tests/recovery.rs`), `docs/wip/bench/mem/per_entry.sh` (an idle reading), BENCHMARKS.
 
-Status: built 2026-10-08 (Linux; macOS and Windows keep the pages, as their content object already does for the write
-log, `SparseObject::discard`).
+Status: built 2026-10-08 (Linux by hole punch; macOS by the reusable mark since the same day, below; Windows keeps the
+pages, its content object having no page to give back yet, `SparseObject::discard`).
+- macOS (same day): the content object's discard marks the pages `MADV_FREE_REUSABLE`, as the arena's does (A-110),
+  and records them; every write clears the mark first (`MADV_FREE_REUSE`), since a marked page that is written stays
+  out of the footprint and the kernel's to take. The record starts as the whole object at creation and at opening:
+  marks are on the object's pages and outlive the daemon that set them, so a restarted daemon clears them before its
+  first write, as `Region::shared` does for the arena.
+  - Measured (`a_discarded_range_leaves_the_footprint_and_a_later_mapping_clears_it_before_writing`): a 64 MiB discard
+    took the footprint from 67 to 3 MiB; a later mapping's writes counted again.
+  - Mutation check: with the clearing disabled, that mapping's 64 MiB of writes stayed out of the footprint
+    (2.98 → 4.06 MB): the data-loss shape the record prevents.
 - What it answers: each shard's range of the anchor's content object holds A-68's two checkpoint slots and its delta
   log. Once both slots and the log had been written, all three stayed resident: up to the committed image, the stale
   one and the log's high-water mark. On a `/usr` copy that was 30 MB the volume did not use; for empty files it was
