@@ -5100,6 +5100,23 @@ file, snapshots it, and times the snapshot's placement at home and then in the m
   - **Measured and rejected:** a pair delivery's deadline widened to one liveness budget plus the member's measured
     round-trip tail, as a forward's is. Unanswered rose from 137 to 175 over three runs each, so the deadline is not the
     cause; reverted.
-  - **Open:** why a pair delivery goes unanswered when its receiver refuses nothing. One silent path to rule out first:
-    `accept_pair_delivery` answers a request it cannot parse with an empty reply, uncounted.
+  - ~~**Open:** why a pair delivery goes unanswered when its receiver refuses nothing.~~ **Found and fixed the same
+    day.**
+    - The receiver did refuse, uncounted: `accept_pair_delivery` runs inside the state borrow, and its
+      `count_refusal` borrowed again and silently did nothing (memory: "with_state nested borrow is silent"). It now
+      counts in place (`count_refusal_in`). The counts then showed receivers refusing nearly every delivery they
+      served (38 of 42, 40 of 44).
+    - The refusal was "another key for a recorded pair". A node's own key with a peer
+      (`SealKeyOwner::Pair { host, partition }`) and the key that peer delivered to it shared one owner whenever both
+      owner shards were partition 0, as every one-shard node's is. Across a crossing where both sides make their key
+      before either delivery lands, each refused the other's for good, and an owner's heads never covered its mirror
+      holders.
+    - A delivered pair is now recorded under `SealKeyOwner::PairReceived`, appended.
+    - Three runs after: every node served exactly 5 deliveries (one a peer), refused none, and counted no unanswered
+      or sessionless delivery and no `awaits_sealing`. 13 of 14 snapshots placed in the mirror in 2.3–6.2 s; the one
+      that did not was followed by a `NoSpace` write refusal (below).
+    - A loopback regression test (`two_nodes_pair_keys_delivered_both_ways_are_both_accepted`) guards both directions.
+      It does not fail on the old code, since on loopback the deliveries meet one after the other.
+  - **Open:** writes refused `NoSpace` on the owner after a few rounds of 64 KiB (one run's every write, another's fifth
+    round), in a 256 MiB dynamic volume on a 1 GiB node: a shard budget, not the volume, to be diagnosed.
 - Fleet suite 82/83; the failure is the recorded flake.

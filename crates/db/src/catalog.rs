@@ -842,6 +842,17 @@ pub enum SealKeyOwner {
     /// The owner's partition.
     partition: u16,
   },
+  /// A pair key another node's owner shard delivered to this node (A-92 piece 4b), on its control shard (partition 0),
+  /// wrapped by this node's root: `host` the owner, `partition` the owner's shard. Kept apart from [`Self::Pair`], this
+  /// node's own key with that node: when this node's owner shard is partition 0 as well, the two shared one owner
+  /// until 2026-10-09, and whichever was recorded first made the other "another key for a recorded pair", refused for
+  /// good (an owner's heads then never covered that holder, and its mirror shipments were never owed). Appended.
+  PairReceived {
+    /// The owner node.
+    host: u64,
+    /// The owner's partition.
+    partition: u16,
+  },
 }
 
 /// Format: the most bytes a sealed recipient record holds: hyper-seal's `Recipient::seal` of a hybrid recipient is one

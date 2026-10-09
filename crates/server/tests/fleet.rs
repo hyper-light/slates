@@ -12272,7 +12272,7 @@ fn an_owner_shards_pair_key_reaches_its_candidate_under_its_recipient() {
     "the fleet's direct probe mesh formed before the test acts"
   );
   let budget = slates_server::daemon::OBSERVE_BUDGET_NS;
-  let at_candidate = SealKeyOwner::Pair {
+  let at_candidate = SealKeyOwner::PairReceived {
     host: anchor_a.0,
     partition: 0,
   };
@@ -12610,4 +12610,67 @@ fn a_read_whose_owner_answered_past_the_takeover_bound_is_retried_by_the_client(
     "the read returned the file after {retries} client retries: {bytes:?}"
   );
   assert!(retries >= 1, "the client sent its page again");
+}
+
+/// A-92 piece 4b (found 2026-10-09: an owner's pair deliveries to its mirror holders were refused for good, so its heads
+/// never covered them and no mirror shipment was ever owed): do form a two-node fleet, in which each node's owner shard
+/// delivers its pair key to the other, and let the record periods run. Expect neither node to refuse a delivery. Before,
+/// a node's own key with its peer and the key its peer delivered to it were recorded under one owner (`Pair { host,
+/// partition }`, the partitions both 0), so whichever was recorded first made the other "another key for a recorded
+/// pair" and refused every time. A regression guard: on loopback the deliveries meet one after the other and the
+/// old code passed it too (the second node reused the key it had just accepted); the two-network bench, where both
+/// sides make their keys before either delivery lands, is what showed the refusals (`mirror.sh`).
+#[test]
+fn two_nodes_pair_keys_delivered_both_ways_are_both_accepted() {
+  let _serial = serialize_fleet_tests();
+  let (_ports, [pa_probe, pa_record, pb_probe, pb_record]) = four_free_ports();
+  let a = node("a", pa_probe, pa_record);
+  let b = node("b", pb_probe, pb_record);
+  let peer_of_a = Peer {
+    anchor: b.origin_anchor,
+    host: b.host,
+    address: b.address,
+    record_address: b.record_address,
+    certificate: b.identity.certificate(),
+  };
+  let peer_of_b = Peer {
+    anchor: a.origin_anchor,
+    host: a.host,
+    address: a.address,
+    record_address: a.record_address,
+    certificate: a.identity.certificate(),
+  };
+  let daemon_a = start(a, peer_of_a);
+  let daemon_b = start(b, peer_of_b);
+  assert!(
+    form_and_settle(&[&daemon_a, &daemon_b]),
+    "the fleet formed before the test acts"
+  );
+  /// Shape: record periods enough for each owner shard to deliver its pair and for a refused one to be retried.
+  const SETTLE: Duration = Duration::from_secs(3);
+  let began = Instant::now();
+  while began.elapsed() < SETTLE {
+    #[allow(clippy::disallowed_methods)]
+    // a test may sleep (the lint's stated exception): record periods run
+    std::thread::sleep(Duration::from_millis(100));
+  }
+  let refused: Vec<u64> = [&daemon_a, &daemon_b]
+    .iter()
+    .map(|daemon| refusal_count(daemon, "fleet.seal.pair_refused").unwrap_or(u64::MAX))
+    .collect();
+  let served: Vec<u64> = [&daemon_a, &daemon_b]
+    .iter()
+    .map(|daemon| refusal_count(daemon, "fleet.seal.pair_served").unwrap_or(0))
+    .collect();
+  daemon_a.stop();
+  daemon_b.stop();
+  assert!(
+    served.iter().all(|count| *count > 0),
+    "each node was delivered a pair: {served:?}"
+  );
+  assert_eq!(
+    refused,
+    vec![0, 0],
+    "no delivery refused (served {served:?})"
+  );
 }

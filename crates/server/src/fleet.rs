@@ -6750,20 +6750,25 @@ async fn request_peer(
 /// recipient, accepted from the node with stable anchor `peer` (the session's authenticated certificate, never a field of
 /// the request) and recorded under that anchor.
 fn accept_pair_delivery(s: &mut ShardState, peer: HostId, request: &[u8]) -> Vec<u8> {
-  let Some((partition, rest)) = request.split_at_checked(size_of::<u16>()) else {
-    return Vec::new();
-  };
-  let Some((id, delivery)) = rest.split_at_checked(PAIR_ID_BYTES) else {
-    return Vec::new();
-  };
-  let (Ok(partition), Ok(id)) = (partition.try_into().map(u16::from_le_bytes), id.try_into())
-  else {
+  count_refusal_in(s, PAIR_SERVED);
+  // A request too short for its fields is answered empty, counted: the sender sees no answer, and without the count
+  // the receiver's side of a delivery that fails would not show.
+  let parsed = request
+    .split_at_checked(size_of::<u16>())
+    .and_then(|(partition, rest)| {
+      let (id, delivery) = rest.split_at_checked(PAIR_ID_BYTES)?;
+      let partition = u16::from_le_bytes(partition.try_into().ok()?);
+      let id: [u8; PAIR_ID_BYTES] = id.try_into().ok()?;
+      Some((partition, id, delivery))
+    });
+  let Some((partition, id, delivery)) = parsed else {
+    count_refusal_in(s, PAIR_MALFORMED);
     return Vec::new();
   };
   match crate::seal_keys::accept_pair(s, (peer.0, partition), id, delivery) {
     Ok(()) => vec![PAIR_ACCEPTED],
     Err(_) => {
-      count_refusal(PAIR_REFUSED);
+      count_refusal_in(s, PAIR_REFUSED);
       Vec::new()
     }
   }
@@ -6774,6 +6779,10 @@ const PAIR_ID_BYTES: usize = 16;
 /// Counter: a pair key delivery this node refused (malformed, not for its recipient, or another key for a recorded pair).
 /// Format: a counter name in the daemon's status report.
 const PAIR_REFUSED: &str = "fleet.seal.pair_refused";
+/// Counter: pair key deliveries that reached this receiver's serve path (the receiving side of `pair_unanswered`).
+const PAIR_SERVED: &str = "fleet.seal.pair_served";
+/// Counter: a pair key delivery too short for its partition and key id, answered empty.
+const PAIR_MALFORMED: &str = "fleet.seal.pair_malformed";
 
 /// Ships each of `shard`'s unplaced heads — catalogs, heads and tombstones — to all its candidate holders at
 /// once, committed at `f + 1`.

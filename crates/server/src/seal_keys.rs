@@ -373,7 +373,7 @@ pub fn accept_pair(
   id: [u8; 16],
   delivery: &[u8],
 ) -> Result<(), SealKeyError> {
-  let owner = slates_db::catalog::SealKeyOwner::Pair { host, partition };
+  let owner = slates_db::catalog::SealKeyOwner::PairReceived { host, partition };
   if let Some(record) = state.db.partition().seal_key(&owner) {
     return if record.id == id {
       Ok(())
@@ -511,7 +511,7 @@ pub fn successor_lineage(
     .find(|key| key.anchor == state.origin_anchor.0)?;
   let pair = pair_key(
     state,
-    slates_db::catalog::SealKeyOwner::Pair {
+    slates_db::catalog::SealKeyOwner::PairReceived {
       host: sealing.owner_anchor,
       partition: sealing.partition,
     },
