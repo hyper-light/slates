@@ -2317,6 +2317,13 @@ given the same changes. Docker Desktop 6.12 kernel, Apple M5 Max, load average 1
   | recalls for the one untouched edit | asked 1, sent 1, answered 1 (A-122, A-123) | — (no delegations in v3) |
 
   Before the day's fixes, the Linux edit was not seen after 5.2 s: 153 recalls asked, 152 unanswered.
+  At `/usr/lib` scale (`overlay_diff.sh /usr/lib 3` at `0e4f378b`, 5,863 files, load spikes from other sessions):
+  - over the run, 13,244 delegations granted;
+  - the outsider step asked 1 recall, sent 1 and had it answered, and the new bytes read through the mount after
+    121 ms;
+  - the replaced file was presented `ModifyModify`;
+  - every round's plan was exact in 1–3 ms (`diff -rq` 333–479 ms);
+  - cold reads: slates 1.7–2.8 s, the kernel's server 1.7–6.5 s.
 
 ### The daemon under a container memory cap, and large writes over Linux's NFS client on loopback (conditions 11, 12; 2026-10-05)
 
