@@ -3,8 +3,9 @@
 //! stream is `Incomplete` (not an error), an oversized record is refused, a call header parses, and
 //! a reply builds to the exact bytes the kernel expects. All pure, every host — no socket, no mount.
 
+use proptest::prelude::*;
 use slates_bridge_nfs::rpc::{
-  AcceptStatus, RpcError, parse_call, read_record, reply_bytes, write_record,
+  AcceptStatus, RpcError, parse_call, read_record, reply_bytes, reply_record, write_record,
 };
 use slates_bridge_nfs::xdr::{XdrError, XdrReader, XdrWriter};
 
@@ -235,4 +236,36 @@ fn rpc_prog_mismatch_reply_carries_the_range() {
   assert_eq!(r.u32().unwrap(), 3); // low
   assert_eq!(r.u32().unwrap(), 3); // high
   assert_eq!(r.remaining(), 0, "no results on a mismatch");
+}
+
+/// Every accept status, a mismatch with any version range.
+#[allow(clippy::disallowed_types)] // proptest's `prop_oneof!` holds its arms in an `Arc` (D-8's test-harness exception).
+fn accept_status() -> impl Strategy<Value = AcceptStatus> {
+  prop_oneof![
+    Just(AcceptStatus::Success),
+    Just(AcceptStatus::ProgUnavail),
+    (any::<u32>(), any::<u32>()).prop_map(|(low, high)| AcceptStatus::ProgMismatch { low, high }),
+    Just(AcceptStatus::ProcUnavail),
+    Just(AcceptStatus::GarbageArgs),
+    Just(AcceptStatus::SystemErr),
+  ]
+}
+
+proptest! {
+  #![proptest_config(slates_test_seeds::unseeded(ProptestConfig { cases: 2000, .. ProptestConfig::default() }))]
+
+  /// A reply built as its own record is the reply framed (2026-10-09: the server builds READ replies this way to skip
+  /// two copies of their data). Do: build replies of every accept status with random xids and results, both ways.
+  /// Expect: `reply_record` is byte for byte `write_record(&reply_bytes(..))`.
+  #[test]
+  fn a_reply_built_as_a_record_is_the_reply_framed(
+    xid in any::<u32>(),
+    status in accept_status(),
+    results in prop::collection::vec(any::<u8>(), 0..512),
+  ) {
+    prop_assert_eq!(
+      reply_record(xid, status, &results),
+      write_record(&reply_bytes(xid, status, &results))
+    );
+  }
 }

@@ -99,7 +99,7 @@ use slates_bridge_nfs::v4::{NFS_V4, NFSPROC4_COMPOUND, NFSPROC4_NULL, Nfsstat4};
 use slates_bridge_nfs::xdr::{XdrReader, XdrWriter};
 use slates_bridge_nfs::{
   AcceptStatus, MultiExport, Nfsstat3, UnixGroups, VolumeSet, auth_sys_identity, parse_call,
-  reply_bytes, request_volume, root_volume, serve_call, write_record,
+  reply_record, request_volume, root_volume, serve_call,
 };
 use slates_db::catalog::{AttachForm, Consumer, Principal, VolumeId};
 use slates_db::register::ObjectId;
@@ -824,20 +824,24 @@ fn encode_mount_path(name: &str) -> Vec<u8> {
 fn presented_capability(
   program: u32,
   procedure: u32,
-  args: &mut Vec<u8>,
-) -> Option<MountCapability> {
+  args: &[u8],
+) -> (Option<MountCapability>, Option<Vec<u8>>) {
   if program == MOUNT_PROGRAM && procedure == MOUNTPROC3_UMNT {
     // The kernel's `UMNT` names the volume by the mount's source (`slates:/<name>` gives `/<name>`), with
     // no capability (§4.6 A-34); it presents none, and the unmount is confirmed against the kernel's
     // mount table before anything ends ([`unmount_capability`]).
-    return None;
+    return (None, None);
   }
   if is_mount_request(program, procedure) {
-    let (name, capability) = split_mount_capability(args)?;
-    *args = encode_mount_path(&name);
-    return Some(capability);
+    return match split_mount_capability(args) {
+      Some((name, capability)) => (Some(capability), Some(encode_mount_path(&name))),
+      None => (None, None),
+    };
   }
-  slates_bridge_nfs::request_capability(&XdrReader::new(args))
+  (
+    slates_bridge_nfs::request_capability(&XdrReader::new(args)),
+    None,
+  )
 }
 
 /// Counter: NFSv4 `GETATTR`s answered `NFS4ERR_DELAY` while another client's write delegation of the file was
@@ -1152,7 +1156,7 @@ fn spawn_connection(connection: Connection) {
 pub(crate) const SERVE_SPAWN_REFUSED: &str = "nfs.serve_spawn";
 
 /// One call of the NFS program's `version`, MOUNT or portmap (every program but NFSv4, which
-/// [`reply_v4`] serves): its RPC reply payload. A `program` of 0 is a garbage call whose reply carries
+/// [`reply_v4`] serves): its RPC reply, framed as one record ([`reply_record`]). A `program` of 0 is a garbage call whose reply carries
 /// xid 0; an NFS version other than 3 or 4 is `PROG_MISMATCH` naming the versions served.
 #[allow(clippy::too_many_arguments)] // one RPC call's whole identity: where, its xid, who, program, version, procedure, args, port
 async fn reply_for(
@@ -1166,17 +1170,17 @@ async fn reply_for(
   port: u16,
 ) -> Vec<u8> {
   if program == 0 {
-    return reply_bytes(0, AcceptStatus::GarbageArgs, &[]);
+    return reply_record(0, AcceptStatus::GarbageArgs, &[]);
   }
   if program == NFS_PROGRAM && version != NFS_VERSION {
     let mismatch = AcceptStatus::ProgMismatch {
       low: NFS_VERSION,
       high: NFS_V4,
     };
-    return reply_bytes(xid, mismatch, &[]);
+    return reply_record(xid, mismatch, &[]);
   }
   let (status, results) = serve_v3(this, xid, requester, program, procedure, args, port).await;
-  reply_bytes(xid, status, &results)
+  reply_record(xid, status, &results)
 }
 
 /// Serves one NFSv3, MOUNT or portmap call, routing it locally, to a volume's owner shard over the
@@ -1370,7 +1374,7 @@ fn is_v4_compound(call: &Call) -> bool {
 /// connection's `home`. A session this shard neither holds nor (as home) knows departed is answered here, with
 /// `NFS4ERR_BADSESSION`, so a connection never bounces between shards: the client makes a new session at home.
 fn v4_elsewhere(this: u16, home: u16, call: &Call) -> Option<u16> {
-  match compound::placement(&call.args) {
+  match compound::placement(call.args()) {
     compound::Placement::Session(sessionid) => state::with_state(|s| {
       let server = s.nfs_v4.as_ref()?;
       if server.sessions.holds_session(&sessionid) || this != home {
@@ -1391,12 +1395,14 @@ async fn serve_v4(this: u16, home: u16, call: Call, port: u16) -> (Vec<u8>, Opti
     xid,
     requester,
     procedure,
-    args,
     request_bytes,
+    body,
+    args_at,
     ..
   } = call;
+  let args = body.get(args_at..).unwrap_or_default();
   match procedure {
-    NFSPROC4_NULL => (reply_bytes(xid, AcceptStatus::Success, &[]), None),
+    NFSPROC4_NULL => (reply_record(xid, AcceptStatus::Success, &[]), None),
     NFSPROC4_COMPOUND => {
       // Each operation's v3 call answers for the front end: no AppleDouble views (a v4 client carries
       // attributes itself, §4.6 A-33) and the change counters its attributes need (A-38).
@@ -1413,13 +1419,13 @@ async fn serve_v4(this: u16, home: u16, call: Call, port: u16) -> (Vec<u8>, Opti
         forwarded_to: None,
       };
       note(NFS4_COMPOUNDS);
-      let results = compound::serve(&mut backend, &args, request_bytes).await;
+      let results = compound::serve(&mut backend, args, request_bytes).await;
       (
-        reply_bytes(xid, AcceptStatus::Success, &results),
+        reply_record(xid, AcceptStatus::Success, &results),
         backend.forwarded_to,
       )
     }
-    _ => (reply_bytes(xid, AcceptStatus::ProcUnavail, &[]), None),
+    _ => (reply_record(xid, AcceptStatus::ProcUnavail, &[]), None),
   }
 }
 
@@ -1618,7 +1624,10 @@ impl compound::Backend for RoutedBackend {
       } else {
         NFS4_V3_LOCAL
       });
-      let capability = presented_capability(NFS_PROGRAM, procedure, &mut args);
+      let (capability, rewritten) = presented_capability(NFS_PROGRAM, procedure, &args);
+      if let Some(rewritten) = rewritten {
+        args = rewritten;
+      }
       let requester = requester.with_capability(capability);
       match serve_v3(this, xid, requester, NFS_PROGRAM, procedure, args, port).await {
         (AcceptStatus::Success, results) => results,
@@ -1797,24 +1806,43 @@ struct Call {
   program: u32,
   version: u32,
   procedure: u32,
-  args: Vec<u8>,
+  /// The record's body, kept whole: the arguments are its bytes from `args_at` ([`Call::args`]). Copying them out
+  /// of the record cost a 256 KiB WRITE's data once more per call, 3.1% of the daemon's samples on a Linux NFSv4.2
+  /// overwrite (2026-10-09).
+  body: Vec<u8>,
+  /// Where the arguments start in [`Call::body`].
+  args_at: usize,
   /// The whole call's encoded size, its RPC headers included (not its record marker): what an NFSv4
   /// session's request size bounds (RFC 8881 §18.36.3).
   request_bytes: usize,
 }
 
 impl Call {
-  /// The call a record body holds, or a garbage call if its header does not parse.
-  fn parse(body: &[u8]) -> Call {
-    match parse_call(body) {
-      Ok((call, args)) => Call {
-        xid: call.xid,
-        requester: Requester::of(body),
-        program: call.program,
-        version: call.version,
-        procedure: call.procedure,
-        args: args.rest().to_vec(),
-        request_bytes: body.len(),
+  /// The call a record body holds, or a garbage call if its header does not parse. The body is kept, its arguments in
+  /// place.
+  fn parse(body: Vec<u8>) -> Call {
+    let request_bytes = body.len();
+    let parsed = parse_call(&body).map(|(call, args)| {
+      let args_at = request_bytes.saturating_sub(args.rest().len());
+      (
+        call.xid,
+        Requester::of(&body),
+        call.program,
+        call.version,
+        call.procedure,
+        args_at,
+      )
+    });
+    match parsed {
+      Ok((xid, requester, program, version, procedure, args_at)) => Call {
+        xid,
+        requester,
+        program,
+        version,
+        procedure,
+        body,
+        args_at,
+        request_bytes,
       },
       Err(_) => Call {
         xid: 0,
@@ -1822,20 +1850,40 @@ impl Call {
         program: 0,
         version: 0,
         procedure: 0,
-        args: Vec::new(),
-        request_bytes: body.len(),
+        body: Vec::new(),
+        args_at: 0,
+        request_bytes,
       },
     }
   }
+
+  /// The call's arguments, in place in its body.
+  fn args(&self) -> &[u8] {
+    self.body.get(self.args_at..).unwrap_or_default()
+  }
+
+  /// Replaces the call's arguments (a `MOUNT`'s path, rewritten to the bare name).
+  fn set_args(&mut self, args: Vec<u8>) {
+    self.body = args;
+    self.args_at = 0;
+  }
+
+  /// The call's arguments as an owned buffer: the body with its headers shifted out in place, so no new buffer is
+  /// allocated for them.
+  fn into_args(self) -> Vec<u8> {
+    let mut body = self.body;
+    body.drain(..self.args_at.min(body.len()));
+    body
+  }
 }
 
-/// The RPC reply payload for one deframed call message: the entry the network export's TLS session serves
-/// its plaintext calls through ([`crate::nfs_tls`]), exactly as [`serve_one`] serves the loopback's.
-pub(crate) async fn reply_to_message(this: u16, message: &[u8], port: u16) -> Vec<u8> {
+/// The RPC reply for one deframed call message, framed as one record: the entry the network export's TLS session
+/// serves its plaintext calls through ([`crate::nfs_tls`]), exactly as [`serve_one`] serves the loopback's.
+pub(crate) async fn reply_to_message(this: u16, message: Vec<u8>, port: u16) -> Vec<u8> {
   reply_to(this, Call::parse(message), port).await
 }
 
-/// The RPC reply payload for one call. An NFSv4 call goes to the v4 front end, which presents a
+/// The RPC reply for one call, framed as one record ([`reply_record`]). An NFSv4 call goes to the v4 front end, which presents a
 /// capability per operation inside the compound (A-35). Any other call presents its mount capability
 /// (AUD-01): a `MNT`'s from its path (`<name>@<attachment>.<token>`, rewritten to the bare name for the
 /// routing), every other call's from the file handle it names. It rides to the owner shard, which
@@ -1849,18 +1897,23 @@ async fn reply_to(this: u16, mut call: Call, port: u16) -> Vec<u8> {
   if call.program == NFS_PROGRAM
     && !slates_bridge_nfs::procedures::is_rfc1813_procedure(call.procedure)
   {
-    return reply_bytes(call.xid, AcceptStatus::ProcUnavail, &[]);
+    return reply_record(call.xid, AcceptStatus::ProcUnavail, &[]);
   }
-  let capability = presented_capability(call.program, call.procedure, &mut call.args);
-  let requester = call.requester.with_capability(capability);
+  let (capability, rewritten) = presented_capability(call.program, call.procedure, call.args());
+  if let Some(args) = rewritten {
+    call.set_args(args);
+  }
+  let requester =
+    std::mem::replace(&mut call.requester, Requester::root()).with_capability(capability);
+  let (xid, program, version, procedure) = (call.xid, call.program, call.version, call.procedure);
   reply_for(
     this,
-    call.xid,
+    xid,
     requester,
-    call.program,
-    call.version,
-    call.procedure,
-    call.args,
+    program,
+    version,
+    procedure,
+    call.into_args(),
     port,
   )
   .await
@@ -2282,7 +2335,7 @@ async fn serve_turn(
       turn.handled.push((Vec::new(), end));
       continue;
     }
-    let call = Call::parse(&body);
+    let call = Call::parse(body);
     let elsewhere = if is_v4_compound(&call) {
       v4_elsewhere(this, connection.home, &call)
     } else {
@@ -2300,7 +2353,7 @@ async fn serve_turn(
     } else {
       reply_to(this, call, connection.port).await
     };
-    turn.handled.push((bounded_record(xid, &reply), end));
+    turn.handled.push((bounded_record(xid, reply), end));
     if turn.moving.is_some() || futures::now_ns().saturating_sub(started) >= quantum {
       break;
     }
@@ -2308,15 +2361,15 @@ async fn serve_turn(
   turn
 }
 
-/// `reply` framed as one record, or — past [`RECORD_WIRE_BYTES`], which no reply reaches since every result is capped
-/// at the transfer ceiling — a `SYSTEM_ERR` for its `xid`, counted: a connection sends only records it can send whole.
-fn bounded_record(xid: u32, reply: &[u8]) -> Vec<u8> {
-  let record = write_record(reply);
+/// `record`, a reply framed as one record, or — past [`RECORD_WIRE_BYTES`], which no reply reaches since every result is
+/// capped at the transfer ceiling — a `SYSTEM_ERR` for its `xid`, counted: a connection sends only records it can send
+/// whole.
+fn bounded_record(xid: u32, record: Vec<u8>) -> Vec<u8> {
   if record.len() <= RECORD_WIRE_BYTES {
     return record;
   }
   note(NFS_REPLY_PAST_BOUND);
-  write_record(&reply_bytes(xid, AcceptStatus::SystemErr, &[]))
+  reply_record(xid, AcceptStatus::SystemErr, &[])
 }
 
 /// Sends a turn's replies in runs of whole records no longer than [`RECORD_WIRE_BYTES`], and after each run consumes
@@ -2325,18 +2378,24 @@ fn bounded_record(xid: u32, reply: &[u8]) -> Vec<u8> {
 /// and at worst a reply sent twice, which the client drops by its xid (RFC 5531 §9) (A-113). Whether the connection
 /// still stands.
 async fn send_turn(connection: &Connection, turn: &Turn) -> bool {
-  let mut run: Vec<u8> = Vec::new();
+  // A run is its records' slices, sent by one vectored write: never copied into one buffer first.
+  let mut run: Vec<&[u8]> = Vec::new();
+  let mut run_bytes = 0usize;
   let mut run_end = 0usize;
   let mut consumed = 0usize;
   let mut answered = 0u64;
   for (reply, end) in &turn.handled {
-    if !run.is_empty() && run.len().saturating_add(reply.len()) > RECORD_WIRE_BYTES {
+    if run_bytes > 0 && run_bytes.saturating_add(reply.len()) > RECORD_WIRE_BYTES {
       if !send_run(connection, &run, run_end, &mut consumed).await {
         return false;
       }
       run.clear();
+      run_bytes = 0;
     }
-    run.extend_from_slice(reply);
+    if !reply.is_empty() {
+      run.push(reply);
+      run_bytes = run_bytes.saturating_add(reply.len());
+    }
     run_end = *end;
     if !reply.is_empty() {
       answered = answered.saturating_add(1);
@@ -2361,12 +2420,12 @@ async fn send_turn(connection: &Connection, turn: &Turn) -> bool {
 /// Sends one run of whole records (if any), then consumes the receive queue through `through`; whether both succeeded.
 async fn send_run(
   connection: &Connection,
-  run: &[u8],
+  run: &[&[u8]],
   through: usize,
   consumed: &mut usize,
 ) -> bool {
   if !run.is_empty() {
-    match connection.stream.send_records(run).await {
+    match connection.stream.send_records_vectored(run).await {
       Ok(slates_rt::tcp::Sent::Whole) => {}
       Ok(slates_rt::tcp::Sent::Completed) => note(NFS_SEND_COMPLETED),
       Err(_) => return false,
@@ -2445,9 +2504,9 @@ async fn serve_v4_on(
   call: Call,
   registration: Option<u64>,
 ) -> (Vec<u8>, Option<u16>) {
-  let placement = compound::placement(&call.args);
+  let placement = compound::placement(call.args());
   if let (compound::Placement::Session(sessionid), Some(id)) = (placement, registration) {
-    bind_back_channel(sessionid, id, compound::minor_version(&call.args));
+    bind_back_channel(sessionid, id, compound::minor_version(call.args()));
   }
   let (reply, forwarded_to) = serve_v4(this, connection.home, call, connection.port).await;
   v4_after(this, connection.home);
@@ -2530,11 +2589,11 @@ fn owner_elsewhere(call: &Call) -> Option<u16> {
   if call.program != NFS_PROGRAM
     || call.version != NFS_VERSION
     || !slates_bridge_nfs::procedures::is_rfc1813_procedure(call.procedure)
-    || is_root_listing(call.program, call.procedure, &call.args)
+    || is_root_listing(call.program, call.procedure, call.args())
   {
     return None;
   }
-  route(call.program, call.procedure, &call.args)
+  route(call.program, call.procedure, call.args())
 }
 
 /// Moves `connection` to `owner`, where the call that named it — still at the head of the receive queue (A-113) — is
@@ -2600,6 +2659,7 @@ const MIGRATE_REFUSED: &str = "nfs.connection_move_refused";
 #[cfg(test)]
 mod tests {
   use super::*;
+  use slates_bridge_nfs::{reply_bytes, write_record};
 
   /// AC-2.6 / T-4.3: queue two complete RPC calls on one connection. Serving the first must
   /// give another task a turn before the second, even though neither socket direction blocks.

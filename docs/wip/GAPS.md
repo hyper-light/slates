@@ -5263,3 +5263,26 @@ At `f62847d5`:
 - **Linux NFSv4.2 read bench after the fix:** `nfs4.callback.probes` 1, `up` 1, one delegation granted, no timeouts,
   delays or slot waits. The build without the fix, in the same run, counted 2 down, 19 up, 6 delays and 3 slot waits,
   and granted no delegation.
+
+### 2026-10-09: NFS replies built as records (landed), and what remains on the read path
+
+- Landed: a reply is framed once (`rpc::reply_record`), a turn's records are sent by one `writev`, and a call's arguments
+  stay in their record. A 256 KiB READ reply cost 15.1–17.0 µs to frame and gather before, 3.77–3.85 µs after
+  (BENCHMARKS).
+- Tests:
+  - `a_reply_built_as_a_record_is_the_reply_framed` holds the record byte for byte to `write_record(&reply_bytes(..))`
+    over 2,000 cases;
+  - `a_vectored_run_of_records_arrives_whole_and_in_order` sends a whole run and a run completed after a short send;
+    it passed on macOS and on Linux as a non-root user with io_uring available;
+  - the NFS mount, hostile, TLS, daemon, attach and snapshot-landing suites pass.
+- Owed, measured on the same reads:
+  - the compound's copy of each operation's result (5.3%); headroom for the marker and headers in the READ producer's
+    buffer would remove it;
+  - AES-GCM decryption, 29% of samples. A-99 opens sealed chunks into the reader's buffer on every read, and states
+    plaintext lives only in open extents and readers' buffers. A bounded plaintext cache of actively read chunks,
+    resealed by the idle sweep, would meet condition 9's wording ("encrypted at rest when not being modified or read
+    actively") but changes that posture: Ada's decision, with the measurement here.
+  - The daemon disappeared once more during one write run, on a build without A-126's newest changes. It did not recur
+    in the next 20 runs at load 21–39, with every anchor log and kernel log kept: no restart, no lapsed heartbeat, and no
+    OOM kill of a slates process. The VM's OOM killer fired 20 times in the window, always at another session's
+    `hyperscale`. Cause still unknown.

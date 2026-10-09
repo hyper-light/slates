@@ -4289,3 +4289,37 @@ A database's commit through the kernel client now waits under 1.4 ms at p99 on a
 before. Against Tectonic's published tails (blob writes reaching 150–200 ms; FAST'21, Figure 3), the comparison is of
 what a caller waits for under the pattern, not of the media: slates commits to anchor RAM, Tectonic to disks across a
 datacenter.
+
+### Landed: NFS replies built as their own records and sent without gathering (2026-10-09)
+
+Found by profiling the daemon during O_DIRECT reads through Linux's NFSv4.2 client (`docs/wip/bench/overwrite/` with a
+read script; reads at 1.6–1.9 GB/s with the daemon CPU-bound). Each 256 KiB READ reply was copied four times in user
+space before the kernel's own copy:
+
+| copy | share of samples |
+|---|---|
+| into the compound's buffer (`compound::record`) | 5.3% |
+| into the RPC reply (`reply_bytes`) | 4.1% |
+| into a framed record (`write_record`) | 4.8% |
+| into the turn's send run (`serve_connection`) | 3.4% |
+
+The reply is now built as its own record (`rpc::reply_record`: the marker reserved, the header and the results written
+once). A turn's records go out as slices in one `writev` (`TcpStream::send_records_vectored`), so a run is never
+copied into one buffer, and the whole-send guarantee of A-113 still holds (XNU's `sosend` judges the whole request).
+The arguments of each call are kept in place in their record body (`Call::args`), not copied out.
+
+**Measured in process** (`reply_record` against `reply_bytes` then `write_record` then the run copy, a 256 KiB result,
+20,000 replies, three passes, release build on Apple M5 Max at load 14–28): 15.1–17.0 µs per reply before,
+3.77–3.85 µs after.
+
+**In the daemon's profile:**
+- memcpy fell from 21.9% to 16.8% of samples during reads;
+- `reply_bytes`, `write_record` and the run's copy are gone;
+- `reply_record` is the one copy of the results (5.6%).
+
+**Through the kernel client the throughput A/B was within noise:**
+- the `Call` change alone against the full change: 1,819 against 1,844 MiB/s median over nine rounds each;
+- against the storm-fixed base, four alternations at load 21–52 spanned 351–2,051 MiB/s in both arms.
+
+The change is landed on the in-process and profile measurements, not on that A/B. The compound's copy of the READ
+data (5.3%) and AES-GCM decryption (29%, A-99's per-read open) remain.

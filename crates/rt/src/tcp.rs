@@ -427,6 +427,53 @@ impl TcpStream {
     }
   }
 
+  /// [`TcpStream::send_records`] for a run held in pieces: one `writev` of `records` in order, so a run of replies is
+  /// sent without first being copied into one buffer (each 256 KiB READ reply was copied into the run once more,
+  /// 3.4% of the daemon's samples on a Linux NFSv4.2 read, 2026-10-09). The kernel takes a vectored send by its total
+  /// length (XNU `sosend` judges `uio_resid` against the send low-water mark), so a run no longer than the record bound
+  /// on a whole-send stream is still taken all or nothing (A-113). A short send is completed here and answered
+  /// [`Sent::Completed`].
+  pub async fn send_records_vectored(&self, records: &[&[u8]]) -> Result<Sent, RtError> {
+    let total = records
+      .iter()
+      .map(|record| record.len())
+      .fold(0usize, usize::saturating_add);
+    let slices: Vec<std::io::IoSlice<'_>> = records
+      .iter()
+      .map(|record| std::io::IoSlice::new(record))
+      .collect();
+    loop {
+      match rustix::io::writev(&self.fd, &slices) {
+        Ok(0) if total > 0 => return Err(refused("writev", rustix::io::Errno::PIPE)),
+        Ok(n) if n >= total => return Ok(Sent::Whole),
+        Ok(n) => {
+          self.write_all_from(records, n).await?;
+          return Ok(Sent::Completed);
+        }
+        Err(rustix::io::Errno::AGAIN) => writable(self.fd.as_raw_fd()).await?,
+        Err(rustix::io::Errno::INTR) => continue,
+        Err(e) => return Err(refused("writev", e)),
+      }
+    }
+  }
+
+  /// Writes every byte of `records` from byte `sent` of their concatenation on, record by record, awaiting writability
+  /// whenever the send buffer is full.
+  async fn write_all_from(&self, records: &[&[u8]], sent: usize) -> Result<(), RtError> {
+    let mut skip = sent;
+    for record in records {
+      if skip >= record.len() {
+        skip = skip.saturating_sub(record.len());
+        continue;
+      }
+      self
+        .write_all(record.get(skip..).unwrap_or_default())
+        .await?;
+      skip = 0;
+    }
+    Ok(())
+  }
+
   /// Makes the stream's kernel buffers hold `buffer_bytes` each way, so a whole record can sit in the receive queue to
   /// be peeked and a whole record fits the send queue. On macOS and the BSDs the buffers are set (`SO_SNDBUF`,
   /// `SO_RCVBUF`, within `kern.ipc.maxsockbuf`), refused unless the kernel keeps at least that much. Linux is left to
