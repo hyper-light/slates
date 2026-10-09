@@ -120,6 +120,12 @@ pub enum CallbackState {
   Up,
   /// Failed or did not answer its last callback (`SEQ4_STATUS_CB_PATH_DOWN` until it answers again).
   Down,
+  /// A probe is in flight ([`Sessions::claim_probe`]): neither up nor down, so no `SEQUENCE` reports it down, and a
+  /// rebind leaves it. Before 2026-10-09 a probed back channel was marked down to keep a second compound from starting
+  /// another probe; with down reported to the client (A-124), every probe told the client to rebind, every rebind made
+  /// the channel unproven, and each next compound started another probe beside the last (one Linux mount: 7,210 probes
+  /// failed and 556,803 waits for the callback slot in six seconds).
+  Probing,
 }
 
 /// What the next callback on a session's back channel carries.
@@ -722,14 +728,15 @@ impl Sessions {
       match state_of(session) {
         Some(CallbackState::Down) => any_down = true,
         Some(CallbackState::Up) => any_up = true,
-        Some(CallbackState::Unproven) | None => {}
+        Some(CallbackState::Unproven | CallbackState::Probing) | None => {}
       }
     }
     (session_down, any_down && !any_up)
   }
 
   /// A connection was bound to `sessionid` for its back channel too (`BIND_CONN_TO_SESSION`, §18.34): its back channel
-  /// is probed again before it is used (a client rebinds after `SEQ4_STATUS_CB_PATH_DOWN`); whether it has one.
+  /// is probed again before it is used (a client rebinds after `SEQ4_STATUS_CB_PATH_DOWN`), unless a probe is already in
+  /// flight, whose answer decides; whether it has one.
   pub fn rebind_back_channel(&mut self, sessionid: &SessionId) -> bool {
     match self
       .sessions
@@ -737,10 +744,29 @@ impl Sessions {
       .and_then(|session| session.back.as_mut())
     {
       Some(back) => {
-        back.state = CallbackState::Unproven;
+        if back.state != CallbackState::Probing {
+          back.state = CallbackState::Unproven;
+        }
         true
       }
       None => false,
+    }
+  }
+
+  /// Claims the probe of `sessionid`'s back channel: an unproven back channel becomes [`CallbackState::Probing`] and the
+  /// caller sends the one probe; any other state (already probing, up, down, or no back channel) claims nothing. So at
+  /// most one probe of a back channel is ever in flight.
+  pub fn claim_probe(&mut self, sessionid: &SessionId) -> bool {
+    match self
+      .sessions
+      .get_mut(sessionid)
+      .and_then(|session| session.back.as_mut())
+    {
+      Some(back) if back.state == CallbackState::Unproven => {
+        back.state = CallbackState::Probing;
+        true
+      }
+      _ => false,
     }
   }
 

@@ -5245,3 +5245,21 @@ At `f62847d5`:
   runs of the same build (48 rounds): 3 at load 12–26, and 8 alternated with the base build in a soak at load 14–17
   whose anchor logs show no restart, no lapsed heartbeat and no OOM. `overwrite/linux.sh` now prints the daemon's pid
   each round, the anchor's log and the kernel's OOM lines, so a recurrence names its cause. No cause is claimed.
+
+### 2026-10-09: a back channel being probed was reported down, and Linux clients started probe storms (fixed)
+
+- **Found** by profiling the daemon during reads through Linux's NFSv4.2 client: `clock_gettime` was 5.9% of samples,
+  under `probe_back_channel`. On one mount, six seconds of reads counted:
+  - 7,210 back channels marked down, 4,596 probe timeouts, 8,127 `NFS4ERR_DELAY` answers;
+  - 556,803 waits for the callback slot, against 16 probes answered.
+- **Cause** (`docs/bugs/2026-10-09-a-back-channel-being-probed-was-reported-down.md`):
+  - a probed channel was marked `Down` so no second probe would start;
+  - since A-124 a down channel is reported in every `SEQUENCE` reply, so the client rebound, the rebind made the
+    channel unproven, and the next compound started another probe beside the first.
+- **Fixed:** a `Probing` state, neither up nor down. `Sessions::claim_probe` starts one probe at a time, and a rebind
+  leaves `Probing` alone.
+  - The failing-first test (`a_back_channel_being_probed_is_not_reported_down_and_is_probed_once`) carried flags
+    `0x201` on the compound that started the probe before the fix; it passes after.
+- **Linux NFSv4.2 read bench after the fix:** `nfs4.callback.probes` 1, `up` 1, one delegation granted, no timeouts,
+  delays or slot waits. The build without the fix, in the same run, counted 2 down, 19 up, 6 delays and 3 slot waits,
+  and granted no delegation.

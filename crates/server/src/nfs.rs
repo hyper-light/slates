@@ -2467,18 +2467,28 @@ fn bind_back_channel(sessionid: SessionId, id: u64, minor: Option<u32>) {
     with_v4_sessions(|sessions| sessions.set_callback_minor(&sessionid, minor));
   }
   crate::callback::carry(sessionid, id);
-  if back.state == CallbackState::Unproven {
-    // Probed once before the first use (RFC 8881 §10.2): marked down while the probe runs, so a second compound does
-    // not start another, and up only when the client answers.
-    with_v4_sessions(|sessions| sessions.set_callback_state(&sessionid, CallbackState::Down));
+  // Probed once before the first use (RFC 8881 §10.2), by whoever claims the probe: the back channel is `Probing` while
+  // it runs (neither up nor down, so no `SEQUENCE` tells the client it is down and no rebind starts another), and up
+  // only when the client answers.
+  if back.state == CallbackState::Unproven
+    && with_v4_sessions(|sessions| sessions.claim_probe(&sessionid)) == Some(true)
+  {
+    note(NFS4_CALLBACK_PROBES);
     match futures::spawn(probe_back_channel(sessionid)) {
       Ok(task) => {
         let _ = futures::detach(task);
       }
-      Err(_) => note(NFS4_CALLBACK_DOWN),
+      Err(_) => {
+        // No probe runs: the back channel is down until a rebind asks for another.
+        note(NFS4_CALLBACK_DOWN);
+        with_v4_sessions(|sessions| sessions.set_callback_state(&sessionid, CallbackState::Down));
+      }
     }
   }
 }
+
+/// Counter: back-channel probes started (§10.2; one at a time per session, `Sessions::claim_probe`).
+const NFS4_CALLBACK_PROBES: &str = "nfs4.callback.probes";
 
 /// Probes `sessionid`'s back channel with `CB_SEQUENCE` alone and records whether the client answered `NFS4_OK`
 /// within a liveness budget.

@@ -3481,3 +3481,99 @@ fn a_back_channel_that_stopped_answering_is_reported_and_repaired_by_a_rebind() 
   drop((a, client));
   drop(daemon);
 }
+
+/// The `sr_status_flags` of the `SEQUENCE` reply `message` to call `xid` (a COMPOUND whose first result is SEQUENCE's).
+fn sequence_reply_flags(message: &[u8], xid: u32) -> u32 {
+  use slates_bridge_nfs::xdr::XdrReader;
+  let mut reader = XdrReader::new(message);
+  assert_eq!(reader.u32().unwrap(), xid, "the reply to the SEQUENCE sent");
+  for _ in 0..3 {
+    reader.u32().unwrap(); // message type, reply status, verifier flavor
+  }
+  reader.opaque(400).unwrap(); // verifier body
+  reader.u32().unwrap(); // accept status
+  assert_eq!(reader.u32().unwrap(), NFS4_OK, "the COMPOUND");
+  reader.opaque(1024).unwrap(); // tag
+  reader.u32().unwrap(); // result count
+  assert_eq!(reader.u32().unwrap(), OP_SEQUENCE);
+  assert_eq!(reader.u32().unwrap(), NFS4_OK, "SEQUENCE");
+  reader.fixed(16).unwrap(); // session
+  for _ in 0..4 {
+    reader.u32().unwrap(); // sequence, slot, highest slot, target highest slot
+  }
+  reader.u32().unwrap()
+}
+
+/// RFC 8881 §2.10.3.1, §18.46.3 (found 2026-10-09: one Linux NFSv4.2 mount's daemon counted 7,210 back channels marked
+/// down, 4,596 probe timeouts and 556,803 waits for the callback slot in six seconds of reads, against 16 probes
+/// answered). A back channel was marked down while its first probe ran, to keep a second compound from starting
+/// another; since A-124 a down back channel is reported in every `SEQUENCE` reply, so the client rebound, the rebind
+/// made it unproven, and the next compound started another probe beside the first. Do: rebind client A's proven back
+/// channel, send a `SEQUENCE` (which starts the probe) and hold the probe unanswered, send more `SEQUENCE`s, rebind
+/// again, send another. Expect no reply to report the back channel down while it is probed, exactly one probe started,
+/// and the back channel up once A answers it.
+#[test]
+fn a_back_channel_being_probed_is_not_reported_down_and_is_probed_once() {
+  let (daemon, client, mut a, _fh_a, _delegation, _v3, _file) = delegated_to_a("cb-probe-once");
+  let path_down = SEQ4_STATUS_CB_PATH_DOWN | SEQ4_STATUS_CB_PATH_DOWN_SESSION;
+  let up_before = counter(&daemon, "nfs4.callback.up");
+  assert_eq!(
+    a.bind_conn_both(),
+    (NFS4_OK, CDFS4_BOTH),
+    "both channels bound"
+  );
+  let probes_before = counter(&daemon, "nfs4.callback.probes");
+  let (probe, first_flags) = a.start_probe_held();
+  assert_eq!(
+    first_flags & path_down,
+    0,
+    "the compound that starts the probe is not told the back channel is down"
+  );
+  a.assert_not_reported_down(3, "a back channel being probed is not reported down");
+  assert_eq!(
+    a.bind_conn_both(),
+    (NFS4_OK, CDFS4_BOTH),
+    "rebound while probed"
+  );
+  a.assert_not_reported_down(1, "still not reported down after the rebind");
+  assert_eq!(
+    counter(&daemon, "nfs4.callback.probes") - probes_before,
+    1,
+    "a rebind while the probe is outstanding starts no second probe"
+  );
+  a.answer_callback(&probe);
+  assert!(
+    counter_reaches(&daemon, "nfs4.callback.up", up_before + 1),
+    "the back channel is up once A answers"
+  );
+  drop((a, client));
+  drop(daemon);
+}
+
+impl V4Client {
+  /// Sends a `SEQUENCE` that starts a back-channel probe and reads both the probe (held, unanswered) and the reply, in
+  /// whatever order they come: the probe's call and the reply's `sr_status_flags`.
+  fn start_probe_held(&mut self) -> (Vec<u8>, u32) {
+    let xid = self.send_sequence();
+    let (mut probe, mut flags) = (None, None);
+    while probe.is_none() || flags.is_none() {
+      let message = self.next_message();
+      if is_call(&message) {
+        assert!(probe.is_none(), "one probe at a time");
+        probe = Some(message);
+      } else {
+        flags = Some(sequence_reply_flags(&message, xid));
+      }
+    }
+    (probe.unwrap(), flags.unwrap())
+  }
+
+  /// Sends `times` `SEQUENCE`s and asserts no reply reports the back channel down (`because` names why not).
+  fn assert_not_reported_down(&mut self, times: usize, because: &str) {
+    let path_down = SEQ4_STATUS_CB_PATH_DOWN | SEQ4_STATUS_CB_PATH_DOWN_SESSION;
+    for _ in 0..times {
+      let flags = self.sequence_flags();
+      assert_eq!(flags & path_down, 0, "{because}: {flags:#x}");
+    }
+  }
+}
