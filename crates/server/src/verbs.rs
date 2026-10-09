@@ -1434,7 +1434,8 @@ async fn resolve_and_forward(
       None,
     );
   };
-  // A forward the owner was sent but did not answer within its budget is sent again to the same owner while the
+  // A forward the owner was sent but did not answer within its budget, or one that could not be sent because the
+  // session to the owner stayed busy, is sent again to the same owner while the
   // detector has not confirmed that owner dead and the takeover bound (the operator's failover SLO) allows. On a lossy path
   // the reply is most often still being recovered by the transport. A dead owner is declared within the membership
   // horizon, which ends the resends, and the client is refused as before, so a takeover's window is unchanged. Nothing
@@ -1457,7 +1458,10 @@ async fn resolve_and_forward(
   };
   let (decoded, later) = loop {
     let (decoded, later) = forward_once(owner, &requests).await;
-    let unanswered = matches!(decoded, Some(None));
+    // Unanswered (sent, no reply in time) or unsent (the session to the owner stayed with another task the whole
+    // budget): on a lossy path both are transient while the owner lives (measured 2026-10-09 at 10% loss: contested
+    // reads refused after forwards that never left, `fleet.owner_location.forward_unsent`).
+    let unanswered = matches!(decoded, Some(None)) || (decoded.is_none() && owner.is_some());
     // Alive or only suspected: a suspect is still a member until it is confirmed dead or refutes the suspicion, and
     // on a lossy path suspicion is common (the 2026-10-09 run that held to `alive()` alone still refused one read in
     // nine). A confirmed death ends the resends.

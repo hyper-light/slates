@@ -12538,3 +12538,76 @@ fn an_unanswered_forward_is_sent_again_within_the_takeover_bound() {
     "the resend took no second snapshot (its request id was answered once)"
   );
 }
+
+/// Condition 7 (2026-10-09, contested reads at 10% loss: reads refused `OwnerUnreachable` when no owner answered within
+/// the takeover bound, though one answered moments later): do form the mesh of a region-0 owner and a foreign region-1
+/// node, write a file on the owner, warm the foreign node's route, then make the owner answer every forward later than
+/// the takeover bound, and lift that delay just after the bound while a fresh client of the foreign node reads the file.
+/// Expect the read to return the file's bytes (the client sending its page again after the daemon's `OwnerUnreachable`,
+/// a page being idempotent) and the client's count of such retries to have moved. Before, the read failed
+/// `Refused(OwnerUnreachable)`.
+#[test]
+fn a_read_whose_owner_answered_past_the_takeover_bound_is_retried_by_the_client() {
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c", "foreign"];
+  let nodes: Vec<_> = names.iter().map(|name| fleet_node(name)).collect();
+  let seeds: Vec<_> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<_> = nodes
+    .iter()
+    .map(|(_, _, identity)| identity.certificate())
+    .collect();
+  let regions = seeds
+    .iter()
+    .enumerate()
+    .map(|(index, host)| (*host, RegionId(u64::from(index == names.len() - 1))))
+    .collect();
+  let (_serve_lease, serve) = mesh_serve_ports(names.len());
+  let daemons = start_mesh_with_regions(nodes, &seeds, &certs, &serve, 1, &regions);
+  let hosts: Vec<_> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
+  assert_fleet_forms(&daemons, &hosts, &names);
+  let owner_daemon = &daemons[0];
+  let foreign_instance = daemons[names.len() - 1].instance().to_owned();
+  let (id, _snapshot) =
+    write_and_snapshot(&mut Client::connect(owner_daemon.instance()), "retried");
+  let mut warm = Client::connect(&foreign_instance);
+  let reached = audit_wait(|| Ok(status_answers(&mut warm, id)));
+  let bound = Duration::from_nanos(slates_server::config::FAILOVER_SLO_NS);
+  let delayed = owner_daemon.inject_serve_delay(Some(
+    u64::try_from((bound + Duration::from_secs(2)).as_nanos()).unwrap(),
+  ));
+  let deadlines = slates_client::Deadlines::derive(
+    slates_server::daemon::LIVENESS_BUDGET_NS,
+    slates_db::replay::RECOVERY_BUDGET_NS,
+  )
+  .get();
+  let mut fresh = slates_client::Client::connect(&foreign_instance, deadlines).unwrap();
+  let read = std::thread::spawn(move || {
+    let bytes = fresh.read(id, "/hello", ReadAt::Head);
+    (bytes, fresh.transient_retries())
+  });
+  #[allow(clippy::disallowed_methods)]
+  // a test may sleep (the lint's stated exception): the lift's timing
+  std::thread::sleep(bound + Duration::from_secs(1));
+  let lift = owner_daemon.inject_serve_delay(None);
+  let (bytes, retries) = read.join().unwrap();
+  for daemon in daemons {
+    daemon.stop();
+  }
+  assert!(
+    reached,
+    "the foreign node reached the owner before the delay"
+  );
+  assert!(
+    delayed.is_ok() && lift.is_ok(),
+    "the delay was installed and lifted"
+  );
+  assert_eq!(
+    bytes.as_deref().ok(),
+    Some(&b"hello across regions"[..]),
+    "the read returned the file after {retries} client retries: {bytes:?}"
+  );
+  assert!(retries >= 1, "the client sent its page again");
+}

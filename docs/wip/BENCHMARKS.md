@@ -3976,6 +3976,15 @@ crossing). Rounds: 29.9 / 28.7 / 24.1 s, 22.8 / 24.9 / 27.3 s, 22.5 / 23.6 / 20.
 refused. Each contested read took about as long as a read alone, so the crossing carried about three times the bytes
 in the same time. Load average 12–22.
 
+**Contested on a harsher crossing, 2026-10-09** (`CONCURRENT=1 DELAY=150ms JITTER=60ms LOSS=10% IMAGE=slates:mr sh
+docs/wip/bench/multiregion/reads.sh <scratch> <8 MiB payload> 3`, three region-1 readers at once, 10% loss each way):
+
+| Build | Contested reads served (of 9) | Refusals |
+|---|---|---|
+| `22e16df3` (resend only an unanswered forward) | 4 | 5 × `HomedElsewhere`, within 1.1–1.5 s: forwards never sent (`forward_unsent`, the session held), and one location round unavailable |
+| + resend an unsent forward to a live owner | 7 | `LeaseUnconfirmed` (the owner's lease not yet confirmed) and `OwnerUnreachable` (no owner located), both in round 1 |
+| + the client sends a read page again after either refusal | 9 | none; reads 34.7–65.5 s, all byte-identical |
+
 The median read (about 25 s) is about 1.8× faster than the 44 s of 2026-10-08's landed build, from the day's other
 changes or the load; it was not A/B'd.
 

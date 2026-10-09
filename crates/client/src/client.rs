@@ -192,6 +192,8 @@ pub struct Client {
   deadlines: Deadlines,
   /// Reconnects made (a non-vacuity counter for the tests of the restart path).
   reconnects: u64,
+  /// Read pages sent again after a transient refusal (a non-vacuity counter, `Client::call_through_transient`).
+  transient_retries: u64,
   /// The highest sequence acknowledged (its completion records released, §4.9).
   acknowledged: u32,
   /// Derived: how many replies the client receives before it acknowledges them: half the
@@ -644,6 +646,7 @@ impl Client {
       sequence,
       deadlines,
       reconnects: 0,
+      transient_retries: 0,
       acknowledged: 0,
       ack_every,
       unpublished: std::collections::BTreeSet::new(),
@@ -730,6 +733,11 @@ impl Client {
   /// never pays a wake when the daemon meets it.
   pub fn spin_for(&mut self, spin_ns: Option<u64>) {
     self.end.set_spin_ns(spin_ns);
+  }
+
+  /// Read and listing pages sent again after a transient refusal, so far.
+  pub fn transient_retries(&self) -> u64 {
+    self.transient_retries
   }
 
   /// Reconnects made so far.
@@ -1890,6 +1898,33 @@ impl Client {
     }
   }
 
+  /// One read-only page request (`ReadRange`, `ReadDir`), sent again while the daemon refuses it with a transient
+  /// refusal: no owner answered within the takeover bound (`OwnerUnreachable`, a successor serves once a takeover
+  /// installs it) or the owner's lease is not confirmed yet (`LeaseUnconfirmed`). A page changes nothing, so a resend
+  /// under a fresh id is safe. The resends back off as a reconnect does and stop at the reconnect budget (the restart's
+  /// recovery budget plus one reply deadline, `Deadlines::derive`), after which the last refusal is the caller's. Until
+  /// 2026-10-09 the first such refusal failed the whole read (contested cross-region reads at 10% loss, 2 in 9).
+  fn call_through_transient(&mut self, body: &RequestBody) -> Result<ReplyBody, ClientError> {
+    // The budget runs from the first transient refusal: the daemon bounds each attempt itself (its resends to an owner
+    // stop at the takeover bound), so the client's budget bounds only how long it keeps asking after being refused.
+    let mut refused_since: Option<Instant> = None;
+    let budget = self.deadlines.reconnect_ns;
+    let mut pause_ns = self.end.wake_estimate_ns().max(1);
+    loop {
+      match self.call(body) {
+        Err(ClientError::Refused(
+          slates_ipc::protocol::Refusal::OwnerUnreachable { .. }
+          | slates_ipc::protocol::Refusal::LeaseUnconfirmed { .. },
+        )) if elapsed_ns(*refused_since.get_or_insert_with(Instant::now)) < budget => {
+          self.transient_retries = self.transient_retries.saturating_add(1);
+          std::thread::park_timeout(std::time::Duration::from_nanos(pause_ns));
+          pause_ns = next_pause_ns(pause_ns, budget);
+        }
+        other => return other,
+      }
+    }
+  }
+
   /// Reconnects under the client's id inside the reconnect budget; refused when the budget
   /// passes or a live client holds the id. The fresh channel is the account's until the client
   /// binds it again (`rebind_if_needed`), which every send path does before sending.
@@ -2045,7 +2080,7 @@ impl Client {
     let mut first_stamp = None;
     loop {
       let offset = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-      let reply = self.call(&RequestBody::ReadRange {
+      let reply = self.call_through_transient(&RequestBody::ReadRange {
         volume,
         path: path.to_owned(),
         at,
@@ -2088,7 +2123,7 @@ impl Client {
     let mut entries = Vec::new();
     let mut cursor = 0u64;
     loop {
-      let reply = self.call(&RequestBody::ReadDir {
+      let reply = self.call_through_transient(&RequestBody::ReadDir {
         volume,
         path: path.to_owned(),
         at,

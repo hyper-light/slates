@@ -4990,7 +4990,14 @@ to invalidate).
     refused `OwnerUnreachable { region }`, appended to `Refusal` (retryable with the same request id). The CLI, MCP
     and both SDKs carry a refusal by its text, so no mapping changed. The copyset test now expects it; fleet suite
     82/82.
-  - `slates read`'s own handling of a retryable refusal.
+  - ~~`slates read`'s own handling of a retryable refusal.~~ **Done the same day:** the client sends a read or
+    listing page again after `OwnerUnreachable` or `LeaseUnconfirmed`, backing off as a reconnect does, within the
+    reconnect budget counted from the first refusal (`Client::call_through_transient`; non-vacuity counter
+    `Client::transient_retries`). The daemon also resends an unsent forward (the session to a live owner held by
+    another task), not only an unanswered one. Test
+    `a_read_whose_owner_answered_past_the_takeover_bound_is_retried_by_the_client` failed before
+    (`Refused(OwnerUnreachable)`). Contested reads at 10% loss: 4 of 9 served before these, 9 of 9 after
+    (BENCHMARKS).
 
 ### 2026-10-09: transfer and at-rest encryption re-checked at HEAD (conditions 8, 9)
 
