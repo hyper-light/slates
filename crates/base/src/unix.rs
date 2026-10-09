@@ -254,6 +254,7 @@ impl HostFs for OsHost {
       return Err(HostError::NotFile);
     }
     let h = self.allocate()?;
+    self.watcher.add_file(dir, &fd);
     self.files.insert(h, fd);
     Ok(HostFile(h))
   }
@@ -281,7 +282,9 @@ impl HostFs for OsHost {
   }
 
   fn close_file(&mut self, file: HostFile) {
-    self.files.remove(&file.0);
+    if let Some(fd) = self.files.remove(&file.0) {
+      self.watcher.forget_file(&fd);
+    }
   }
 
   fn close_dir(&mut self, dir: HostDir) {
@@ -404,6 +407,12 @@ mod watch {
       }
     }
 
+    /// Nothing on Linux: the directory's watch already reports a write to any file in it (`IN_MODIFY`).
+    pub(super) fn add_file(&mut self, _dir: HostDir, _fd: &OwnedFd) {}
+
+    /// Nothing on Linux (see [`Self::add_file`]).
+    pub(super) fn forget_file(&mut self, _fd: &OwnedFd) {}
+
     pub(super) fn forget(&mut self, dir: HostDir, _fd: &OwnedFd) {
       if let (Some(inotify), Some(wd)) = (&self.inotify, self.wd_of.remove(&dir)) {
         let _ = rustix::fs::inotify::remove_watch(inotify, wd);
@@ -437,7 +446,7 @@ mod watch {
   //! descriptor stays open for the listing anyway), drained with a zero timeout. kqueue does
   //! not report lost events; a registration failure is `Unavailable`.
 
-  use std::collections::BTreeMap;
+  use std::collections::{BTreeMap, BTreeSet};
   use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 
   use rustix::event::kqueue::{Event, EventFilter, EventFlags, VnodeEvents, kevent, kqueue};
@@ -448,7 +457,10 @@ mod watch {
 
   pub(super) struct Watcher {
     queue: Option<OwnedFd>,
+    /// Each registered descriptor (a watched directory's, or an opened file's) and the directory its events hint.
     by_fd: BTreeMap<i32, HostDir>,
+    /// The directories registered, so a file is watched only beneath a watched directory.
+    watched: BTreeSet<HostDir>,
   }
 
   impl Watcher {
@@ -456,19 +468,15 @@ mod watch {
       Self {
         queue: kqueue().ok(),
         by_fd: BTreeMap::new(),
+        watched: BTreeSet::new(),
       }
     }
 
-    pub(super) fn add(&mut self, dir: HostDir, fd: &OwnedFd) -> WatchState {
+    /// Registers `fd` for `flags` with events hinting `dir`; whether the kernel took it.
+    fn register(&mut self, dir: HostDir, fd: &OwnedFd, flags: VnodeEvents) -> bool {
       let Some(queue) = &self.queue else {
-        return WatchState::Unavailable;
+        return false;
       };
-      let flags = VnodeEvents::WRITE
-        | VnodeEvents::DELETE
-        | VnodeEvents::RENAME
-        | VnodeEvents::ATTRIBUTES
-        | VnodeEvents::EXTEND
-        | VnodeEvents::LINK;
       let change = Event::new(
         EventFilter::Vnode {
           vnode: fd.as_fd().as_raw_fd(),
@@ -481,18 +489,53 @@ mod watch {
       // SAFETY: the change list is one event on a descriptor this host owns; the output list is
       // empty and stays empty (its capacity is zero), so the kernel writes nothing.
       let registered = unsafe { kevent(queue, &[change], &mut none, None) };
-      match registered {
-        Ok(_) => {
-          self.by_fd.insert(fd.as_raw_fd(), dir);
-          WatchState::Live
-        }
-        Err(_) => WatchState::Unavailable,
+      if registered.is_ok() {
+        self.by_fd.insert(fd.as_raw_fd(), dir);
+      }
+      registered.is_ok()
+    }
+
+    pub(super) fn add(&mut self, dir: HostDir, fd: &OwnedFd) -> WatchState {
+      let flags = VnodeEvents::WRITE
+        | VnodeEvents::DELETE
+        | VnodeEvents::RENAME
+        | VnodeEvents::ATTRIBUTES
+        | VnodeEvents::EXTEND
+        | VnodeEvents::LINK;
+      if self.register(dir, fd, flags) {
+        self.watched.insert(dir);
+        WatchState::Live
+      } else {
+        WatchState::Unavailable
       }
     }
 
-    pub(super) fn forget(&mut self, _dir: HostDir, fd: &OwnedFd) {
+    /// Watches a file opened beneath a watched directory, its events hinting the directory (A-122): `EVFILT_VNODE` on
+    /// a directory reports namespace changes only, so an outsider's in-place write to an existing file is seen only on
+    /// the file's own descriptor. A file beneath an unwatched directory, or one the kernel refuses, is not watched; the
+    /// lookup's live-disk check still sees the change.
+    pub(super) fn add_file(&mut self, dir: HostDir, fd: &OwnedFd) {
+      if !self.watched.contains(&dir) {
+        return;
+      }
+      let flags = VnodeEvents::WRITE
+        | VnodeEvents::EXTEND
+        | VnodeEvents::ATTRIBUTES
+        | VnodeEvents::DELETE
+        | VnodeEvents::RENAME;
+      self.register(dir, fd, flags);
+    }
+
+    /// Forgets an opened file, before its descriptor closes (closing removes the kernel's registration; the number may
+    /// be reused at once).
+    pub(super) fn forget_file(&mut self, fd: &OwnedFd) {
+      self.by_fd.remove(&fd.as_raw_fd());
+    }
+
+    pub(super) fn forget(&mut self, dir: HostDir, fd: &OwnedFd) {
       // Closing the descriptor removes its registration.
       self.by_fd.remove(&fd.as_raw_fd());
+      self.watched.remove(&dir);
     }
 
     pub(super) fn drain(&mut self) -> Vec<Hint> {

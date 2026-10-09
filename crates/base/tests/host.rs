@@ -601,3 +601,43 @@ fn a_final_component_swapped_for_a_link_is_refused_and_an_open_file_keeps_its_by
   host.close_file(before);
   host.close_dir(root);
 }
+
+/// A-122 on a real filesystem (2026-10-08): an outsider's in-place write to an existing base file hints its directory,
+/// so the drain can recall the delegations held on it. kqueue's `EVFILT_VNODE` on a directory reports namespace changes
+/// only, so on macOS the write was never hinted; inotify's `IN_MODIFY` on the directory already reported it on Linux.
+/// Do: watch a real directory in the build output, open a file in it as a read-through does, drain the hints, then
+/// append to the file in place (same inode, no namespace change). Expect a hint naming the directory, and after the
+/// file is closed a further append hints nothing about it.
+#[cfg(unix)]
+#[test]
+fn an_in_place_write_to_an_opened_base_file_hints_its_directory() {
+  // A-50: a real base directory in the build output, never `/tmp` or a RAM directory.
+  let owned = BuildOutputDir::new("inplace");
+  let dir = owned.0.clone();
+  std::fs::write(dir.join("f"), b"one").unwrap();
+  let (mut host, root) = OsHost::open_root(&dir).unwrap();
+  assert_eq!(host.watch(root), WatchState::Live);
+  let file = host.open_file(root, "f").unwrap();
+  let _ = host.hints();
+  let append = |bytes: &[u8]| {
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new()
+      .append(true)
+      .open(dir.join("f"))
+      .unwrap();
+    f.write_all(bytes).unwrap();
+  };
+  append(b", two");
+  let hints = host.hints();
+  assert!(
+    hints.contains(&slates_vfs::host::Hint::Changed(root)),
+    "an in-place write hints the directory: {hints:?}"
+  );
+  host.close_file(file);
+  append(b", three");
+  assert_eq!(
+    host.hints(),
+    Vec::new(),
+    "a closed file is no longer watched"
+  );
+}

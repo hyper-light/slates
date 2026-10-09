@@ -4889,5 +4889,6 @@ Apple M5 Max, load average 13–14 from other sessions; the tree copied into tmp
   1. The end-to-end check through a real Linux mount (`overlay_diff.sh`, outsider step). Two attempts on 2026-10-08
      hit their 900 s bound with the Docker VM at load 150–250 (not slates: the load was there before the daemon
      started).
-  2. macOS: `EVFILT_VNODE` on a directory does not report an in-place write to an existing file, so such an edit is
-     not hinted. The edit is seen only at a lookup's live-disk check, which a delegation holder never makes.
+  2. ~~macOS: `EVFILT_VNODE` on a directory does not report an in-place write to an existing file.~~ **Fixed the same
+     day:** an opened base file is registered on the watcher's kqueue too, its events hinting its directory
+     (`an_in_place_write_to_an_opened_base_file_hints_its_directory`, failing before on this Mac).

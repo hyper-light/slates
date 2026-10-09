@@ -10577,5 +10577,10 @@ Status: built 2026-10-08; the end-to-end check through a Linux mount is owed (be
   while the task may still wait on it, so it needs its own cancellation protocol first.
 - Owed: the end-to-end check (`overlay_diff.sh`'s outsider step: an edit of an untouched file seen through the mount,
   the drifted path reported, the plan naming the conflict) did not run on 2026-10-08. The Docker VM was at load
-  150–250, and two attempts hit their 900 s bound before round one. On macOS, `EVFILT_VNODE` on a directory reports
-  namespace changes only, so an outsider's in-place write to an existing file is not hinted there at all.
+  150–250, and two attempts hit their 900 s bound before round one.
+- macOS, the same day: `EVFILT_VNODE` on a directory reports namespace changes only, so an outsider's in-place write to
+  an existing file was not hinted at all. A base file the host opens beneath a watched directory (a read-through
+  descriptor, which every open of an untouched file takes) is now registered on the same kqueue, its events hinting
+  its directory; closing the file forgets it first (`crates/base/src/unix.rs`, `Watcher::add_file`/`forget_file`;
+  no-ops on Linux, where `IN_MODIFY` on the directory already reports it). Test
+  `an_in_place_write_to_an_opened_base_file_hints_its_directory` (`crates/base/tests/host.rs`) failed before.
