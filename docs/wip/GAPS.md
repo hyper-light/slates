@@ -4865,9 +4865,12 @@ Apple M5 Max, load average 13–14 from other sessions; the tree copied into tmp
     listed kind changed, as it drops a retargeted link, and the next lookup serves the disk's entry
     (`an_untouched_base_file_the_disk_made_a_directory_shows_the_directory`,
     `an_untouched_base_directory_the_disk_made_a_file_shows_the_file`, each failing before).
-  - On the second pass over a fresh mount the client re-reads 464 of 590 directories and sends 298 ACCESS calls, then
-    nothing more on passes three and four (cumulative counts, `ovdiag`). Something moves directories' change
-    attributes during the first pass; likely materializing base entries. Diagnosed to that point only.
+  - On the second pass over a fresh mount the client re-read 464 of 590 directories and sent 298 ACCESS calls, then
+    nothing more on passes three and four (cumulative counts from `/proc/self/mountstats`). **Not slates, measured:** a
+    directory's change counter stays put through a listing, every child's lookup, a subdirectory's lookup and a second
+    listing (a probe over the simulated host, `Overlay::observe`). The kernel's own server showed the same re-reads
+    at load 27 (READDIR 526 on its repeat walk), so this is the client's directory cache under memory pressure. Wrong
+    in the first version of this entry: "likely materializing base entries".
   - A container that exits with a slates NFS mount still mounted deadlocks: the daemon's own exiting thread drops the
     last reference to the mount namespace, and the unmount's DESTROY_SESSION waits on that daemon. Every bench script
     must unmount in an exit trap; one diagnostic without one left a container only a VM restart clears.
