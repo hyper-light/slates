@@ -6621,6 +6621,7 @@ async fn deliver_pairs(origin: u16, shard: u16, local: HostId, budget: CommitBud
     .flatten();
     let Some((partition, id, record)) = delivery else {
       count_refusal(PAIR_UNDELIVERED);
+      count_refusal(PAIR_UNBUILT);
       continue;
     };
     let mut request = Vec::with_capacity(
@@ -6631,7 +6632,7 @@ async fn deliver_pairs(origin: u16, shard: u16, local: HostId, budget: CommitBud
     request.extend_from_slice(&partition.to_le_bytes());
     request.extend_from_slice(&id);
     request.extend_from_slice(&record);
-    let accepted = request_peer(member, PAIR_KEY_STREAM, &request, budget).await;
+    let accepted = send_pair(member, &request, budget).await;
     if accepted.as_deref() == Some(&[PAIR_ACCEPTED][..]) {
       let _ = call_within(
         origin,
@@ -6650,6 +6651,34 @@ async fn deliver_pairs(origin: u16, shard: u16, local: HostId, budget: CommitBud
   }
 }
 
+/// One pair key delivery to `member` over its record session, within the round's budget: the member's reply, or `None`
+/// with the way it failed counted (no free session to the member, or no answer within the budget).
+async fn send_pair(member: HostId, request: &[u8], budget: CommitBudget) -> Option<Vec<u8>> {
+  let mut sessions = take_sessions("fleet.lent_to.deliver_pairs", |candidate| {
+    candidate == member
+  });
+  let taken = sessions.pop();
+  return_sessions(sessions);
+  let Some((holder, endpoint)) = taken else {
+    count_refusal(PAIR_NO_SESSION);
+    return None;
+  };
+  let (reply, endpoint) = request_within(
+    endpoint,
+    PAIR_KEY_STREAM,
+    Priority::Metadata,
+    request,
+    budget.max_deadline_ns(),
+  )
+  .await;
+  return_sessions(vec![(holder, endpoint)]);
+  if reply.bytes.is_empty() {
+    count_refusal(PAIR_UNANSWERED);
+    return None;
+  }
+  Some(reply.bytes)
+}
+
 /// Counter: the owner shard did not answer this period's neighbour anchors (A-92 piece 4c); sent again next period,
 /// and until then a sealed head waits for the candidates it cannot resolve.
 /// Format: a counter name in the daemon's status report.
@@ -6658,6 +6687,15 @@ const MEMBER_ANCHORS_UNSENT: &str = "fleet.seal.member_anchors_unsent";
 /// Counter: a pair key that could not be made, wrapped or delivered this period (A-92 piece 4b); tried again next.
 /// Format: a counter name in the daemon's status report.
 const PAIR_UNDELIVERED: &str = "fleet.seal.pair_undelivered";
+
+/// Counters: which way a pair delivery failed (each also in [`PAIR_UNDELIVERED`]): the owner shard did not build it, no
+/// session to the member was free, or the member did not answer within the budget (a refusal is the member's own
+/// `fleet.seal.pair_refused`).
+const PAIR_UNBUILT: &str = "fleet.seal.pair_unbuilt";
+/// See [`PAIR_UNBUILT`].
+const PAIR_NO_SESSION: &str = "fleet.seal.pair_no_session";
+/// See [`PAIR_UNBUILT`].
+const PAIR_UNANSWERED: &str = "fleet.seal.pair_unanswered";
 
 /// Counter: a neighbour's recipient key that did not come back in a period, so its pair was not built (`deliver_pairs`).
 const PAIR_RECIPIENT_UNKNOWN: &str = "fleet.seal.pair_recipient_unknown";

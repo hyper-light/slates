@@ -5089,7 +5089,17 @@ file, snapshots it, and times the snapshot's placement at home and then in the m
     mirror job a snapshot;
   - three runs just before, with this fix but without the counter, placed 3 of 15, with no conflicts; two of them
     shipped nothing at all.
-- **Open:** that intermittent "ships nothing" run. Content is acknowledged (9–10 times for 5 snapshots), no shipment is
-  owed, and the counters added to place it (`fleet.mirror.awaits_sealing`, `fleet.seal.pair_recipient_unknown`) have
-  not yet seen a failing run.
+- **The intermittent "ships nothing" run, placed by its counters the same day:** in both failing runs of three, the owner
+  counted `fleet.mirror.awaits_sealing` (727 and 390 periods) and `fleet.seal.pair_undelivered` (772 and 864). A
+  shipment waits until the head's sealing covers every live mirror holder, and the owner's pair key deliveries to them
+  kept failing; in the good runs the owner delivered every pair. The earlier "not confirmed" came from runs without the
+  failure.
+  - The failure is now split by way (`fleet.seal.pair_unbuilt`, `pair_no_session`, `pair_unanswered`). Across nodes it
+    is mostly `pair_unanswered` (29–85 a node a run), some `pair_no_session`, and never `pair_refused` on any receiver.
+    Nine more runs since: 43 of 43 snapshots placed in the mirror in 1.9–8.9 s, the owner's deliveries clean each time.
+  - **Measured and rejected:** a pair delivery's deadline widened to one liveness budget plus the member's measured
+    round-trip tail, as a forward's is. Unanswered rose from 137 to 175 over three runs each, so the deadline is not the
+    cause; reverted.
+  - **Open:** why a pair delivery goes unanswered when its receiver refuses nothing. One silent path to rule out first:
+    `accept_pair_delivery` answers a request it cannot parse with an empty reply, uncounted.
 - Fleet suite 82/83; the failure is the recorded flake.
