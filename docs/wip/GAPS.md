@@ -5460,3 +5460,14 @@ On a Linux release build of `faad1562` (A-126, the probe-storm fix and the reply
 - **Bug doc:** `docs/bugs/2026-10-10-the-pressure-hold-was-split-per-shard-while-the-pool-is-shared.md`.
 - **Open:** the debt is told to every shard alike, so shards growing within one refresh each hold it until the next.
   An exact shared debt word would need room in the anchor segment; recorded, not built.
+
+### 2026-10-10: a node alone answered an id it never created `OwnerUnreachable` (fixed)
+
+- **Found** by the CLI's gated anchor flow: `volume stat` of an unknown id exited 1 with `OwnerUnreachable { region: 0 }`
+  instead of `NotFound`. A regression from the 2026-10-07 lookup-by-id forward (`358aa47d`). The flow runs only with
+  `SLATES_TEST_CLI=1` and had not run here since.
+- **Fixed:** the forward is taken only when the fleet has a member besides this node, the same rule at N = 1.
+  `a_single_node_answers_an_id_it_never_created_not_found` failed first. Bug doc:
+  `docs/bugs/2026-10-10-a-node-alone-answered-an-unknown-id-owner-unreachable.md`.
+- **Open:** in a fleet, an id whose creator is no member, live or retired, still waits out a location round before
+  `OwnerUnreachable`; `NotFound` may be decidable there from the retirement records.

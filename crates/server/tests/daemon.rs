@@ -221,6 +221,35 @@ fn daemon(name: &str) -> (Daemon, String) {
   (daemon, instance)
 }
 
+/// §4.8 "Lookup" (found 2026-10-10 by the CLI's anchor flow): a daemon with no other host has nobody to forward a
+/// volume to, so a verb on an id it never created is answered `NotFound`. Do: on a fresh single-node daemon, ask the
+/// status of a volume id of zeros. Expect `NotFound`, well inside the takeover bound. Before: the lookup-by-id forward
+/// (2026-10-07, `358aa47d`) sent it to "another host of this region", found none, and answered `OwnerUnreachable`.
+#[test]
+fn a_single_node_answers_an_id_it_never_created_not_found() {
+  let (daemon, instance) = daemon("unknown-id");
+  let mut client = Client::connect(&instance);
+  let began = Instant::now();
+  let reply = client.call(&RequestBody::Status {
+    volume: VolumeId { bytes: [0; 16] },
+  });
+  let took = began.elapsed();
+  daemon.stop();
+  assert!(
+    matches!(
+      reply,
+      ReplyBody::Refused {
+        refusal: Refusal::NotFound
+      }
+    ),
+    "an id this node never created is not found: {reply:?}"
+  );
+  assert!(
+    took < Duration::from_nanos(slates_server::daemon::LIVENESS_BUDGET_NS),
+    "answered at once, not after a location round: {took:?}"
+  );
+}
+
 fn scratch(name: &str) -> RequestBody {
   RequestBody::Create {
     name: name.to_owned(),

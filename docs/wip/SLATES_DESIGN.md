@@ -3796,6 +3796,11 @@ version.
 > this node created and no longer holds stays `NotFound` (GAP-A9-7). Attachments stay owner-local: a write from
 > another node uses an attachment taken at the owner. Regression
 > `a_client_of_another_node_in_the_owners_region_reads_and_writes_its_volume_through_the_owner`.
+> **Amended 2026-10-10: only another member can own it.** A node alone (a laptop: the fleet of one) has no host to
+> forward to. It went looking anyway, found none, and answered an id it never created `OwnerUnreachable`; the CLI's
+> anchor flow expected `NotFound`. The forward is now taken only when the fleet has a member besides this node. That
+> is the same rule at N = 1, not a mode switch. Regression `a_single_node_answers_an_id_it_never_created_not_found`
+> (`docs/bugs/2026-10-10-a-node-alone-answered-an-unknown-id-owner-unreachable.md`).
 
 > **Status (2026-10-07, forwarded reads read ahead in doubling batches).** A forwarded `ReadRange` is asked of the
 > owner as a read-ahead window (`RequestBody::ReadWindow`, half the client's ring of pages). The origin keeps the

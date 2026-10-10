@@ -1662,8 +1662,15 @@ fn owned_by_another_host(state: &ShardState, body: &RequestBody) -> Option<(u64,
     return None;
   }
   let volume = volume_of(body)?;
+  let host = state.fleet.host();
   let creator = ObjectId(volume.bytes).creator();
-  if creator == state.fleet.host() || state.db.partition().volume(to_db_volume(volume)).is_some() {
+  if creator == host || state.db.partition().volume(to_db_volume(volume)).is_some() {
+    return None;
+  }
+  // Only another member can own it. A node alone (a laptop: the fleet of one) answers the verb here, `NotFound` for an
+  // id it never created; before 2026-10-10 it went looking for another host, found none, and answered
+  // `OwnerUnreachable` (`a_single_node_answers_an_id_it_never_created_not_found`).
+  if !state.fleet.members().iter().any(|member| *member != host) {
     return None;
   }
   let region = state
