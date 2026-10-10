@@ -4384,3 +4384,27 @@ The throughput A/B (three alternations at load 21–28) was swamped by load spik
 rounds: 578, 612 and 908 MiB/s, against 1,714–1,993 MiB/s in its unloaded rounds and 1,576–2,026 MiB/s for HEAD. It is
 landed on the profile and on the copy removed, measured above at about 3.8 µs per 256 KiB reply. A wire test holds the
 in-place framing byte for byte to `reply_record` over 2,000 cases.
+
+### Measured and rejected: a deeper macOS NFS read-ahead (2026-10-09)
+
+The macOS mount leaves `NFS_MATTR_READAHEAD` at the kernel's default of 16 READs ahead. An experiment binary set it
+from the environment (attribute 6 in `MountArgs::encode`, never committed).
+- Each run: 3 GiB read six times through `slates mount` with `F_NOCACHE`, from a cold client cache. The file was written,
+  then the volume unmounted and mounted again.
+- Arms alternated twice; Apple M5 Max at load 23–30.
+
+| read-ahead | 3 GiB read rate | daemon CPU per run |
+|---|---|---|
+| default (16) | 570–1,247 MiB/s | 4.7–5.7 s |
+| 32 | 775–1,388 MiB/s | 4.5–5.6 s |
+| 64 | 526–834 MiB/s | 5.3–5.9 s |
+| 128 | 303–1,280 MiB/s | 4.8–5.9 s |
+
+Dead even within the load's noise, so it does not land.
+
+A first sweep had read the cached copy at about 10 GB/s with 0.5 s of daemon CPU: `F_NOCACHE` stops caching but
+does not evict what the write cached. Any macOS read benchmark must remount after writing.
+
+On these cold reads (428–473 MiB/s on HEAD at load 20) the daemon's samples are mostly waits in `kevent`. Under that
+load the macOS `sample` tool also counts preempted threads at whatever user function they were in, so small functions'
+counts are not their CPU time.
