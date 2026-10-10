@@ -81,9 +81,13 @@ pub struct Buddy {
   deferring: WordSet,
   /// Whether a capture is open (taken, neither committed nor abandoned).
   capturing: bool,
-  /// Whether any image may name a block: set by the first capture and kept. Until then neither an allocation nor
-  /// a free touches a bitmap (an allocator nothing publishes from pays one flag test for the deferral).
+  /// Whether any image may name a block: set by the first capture and kept, or from the start for a published arena's
+  /// allocator ([`Buddy::new_imaged`]). Until then neither an allocation nor a free touches a bitmap (an allocator
+  /// nothing publishes from pays one flag test for the deferral).
   imaged: bool,
+  /// Granules a first capture read from the state bytes to find the live heads: the deferral's cost, paid once, in
+  /// one step. Zero for an allocator started imaged (the published arena's non-vacuity count).
+  scanned_granules: u64,
   deferred_bytes: usize,
   /// The heads of blocks locked in RAM (§4.2 D-12: a strict volume's content): set by [`Buddy::lock_block`], cleared
   /// when the block is released, whichever way, so the owner unlocks exactly the blocks that were locked.
@@ -291,10 +295,27 @@ impl Buddy {
       deferring: WordSet::new(granules.div_ceil(Bits::WORD_BITS)),
       capturing: false,
       imaged: false,
+      scanned_granules: 0,
       deferred_bytes: 0,
       locked: Bits::new(granules),
       locked_bytes: 0,
     })
+  }
+
+  /// [`Buddy::new`], keeping its live heads from the start (A-64): the allocator of a published arena. A fresh region
+  /// holds no block, so the set its first capture would read from the state bytes is empty and no capture ever reads
+  /// them; every allocation and claim keeps the heads as it does after a first capture. Before 2026-10-10 a published
+  /// region's first capture scanned every granule inside whichever verb's shard step published first: 8,388,608
+  /// granules, 64.6 ms in a debug build, one probe held behind it.
+  pub fn new_imaged(granule: usize, max_order: u32) -> Result<Self, MemError> {
+    let mut buddy = Self::new(granule, max_order)?;
+    buddy.imaged = true;
+    Ok(buddy)
+  }
+
+  /// Granules first captures read from the state bytes: zero for an allocator started imaged.
+  pub const fn scanned_granules(&self) -> u64 {
+    self.scanned_granules
   }
 
   /// Every allocated block, deferred ones included, as `(offset, len)`, in address order: a walk of the heads that
@@ -795,6 +816,9 @@ impl Buddy {
         }
       }
       self.imaged = true;
+      self.scanned_granules = self
+        .scanned_granules
+        .saturating_add(u64::try_from(self.state.len()).unwrap_or(u64::MAX));
       self.changed.insert_all(self.live.words.len());
     }
     self.capturing = true;
@@ -1748,7 +1772,23 @@ mod tests {
   #[test]
   fn no_block_an_image_names_is_ever_handed_out_again() {
     let granule = 256;
-    let mut b = Buddy::new(granule, 8).unwrap();
+    let b = Buddy::new(granule, 8).unwrap();
+    let scanned = deferral_history(b, granule);
+    assert!(scanned > 0, "the first capture read the state bytes");
+  }
+
+  /// A-64 with a published arena's allocator. Do: the same history over an allocator started imaged. Expect: the same
+  /// rules hold at every step, and no capture ever read the state bytes — the scan the deferral pays is gone, not moved.
+  #[test]
+  fn an_allocator_started_imaged_keeps_every_rule_without_scanning() {
+    let granule = 256;
+    let b = Buddy::new_imaged(granule, 8).unwrap();
+    assert_eq!(deferral_history(b, granule), 0, "no capture scanned");
+  }
+
+  /// The random history of [`no_block_an_image_names_is_ever_handed_out_again`] over `b`, checked against the model at
+  /// every step; the granules its captures scanned.
+  fn deferral_history(mut b: Buddy, granule: usize) -> u64 {
     let mut rng = Xorshift::new(Xorshift::SEED);
     let mut model = DeferralModel::default();
     let steps = if cfg!(miri) { 2_000 } else { 20_000 };
@@ -1764,6 +1804,7 @@ mod tests {
       }
       model.check_totals(&b);
     }
+    b.scanned_granules()
   }
 
   /// T-1.1's preflight. Do: in a region of eight granules, ask for blocks of each size, then take one granule.

@@ -8703,6 +8703,12 @@ Status: built 2026-10-03. A barrier's publication went from 75.4 ms to 0.11–0.
   from its origin snapshot, recovered by `Volume::clone_from_image` over the recovered origin — rebuilt copies had
   leaked every unchanged record at the clone's destroy. Image version 13. The allocator's deferral costs an
   allocator nothing publishes from one flag test (`d256cde`: CI's instruction-count gate had seen +1.7%).
+- Followed 2026-10-10: the deferral's price was a scan of every granule of a region at its first capture, inside the
+  shard step of whichever mutating verb published first. That was 2.9–3.4 ms for a 32 GiB region in release and 64.6 ms
+  in a debug build, where it held a probe in the landing-fairness lane. A published arena (`ChunkArena::published`, the
+  daemon's shard arenas) now starts each region it adds imaged (`Buddy::new_imaged`): a fresh region holds no block, so
+  its bitmap starts empty, and recovery's claims and every allocation keep it as they did after a first capture. The
+  first capture then costs 1–3 µs, and an allocator nothing publishes from keeps its one flag test.
 
 ### A-65 — An observation's budget is counted in the observed shard's own time (2026-10-03)
 Applied in the same change to: §4.14 (observation status), §4.2 (lock-on-fault status), GAPS (2026-10-03 entry),

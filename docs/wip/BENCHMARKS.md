@@ -4756,3 +4756,24 @@ behind it. The 2026-10-01 runs, at load 4–6, saw longest steps of 13.8–25.5 
   was 3–7% faster in two quiet rounds.
 - **Threads:** a barrier starts one scoped thread per file but the caller's (up to 15), and joins them. A one-file
   batch starts none.
+
+### Landed: a published arena's regions keep their live heads from creation, so no publication scans one (A-64; 2026-10-10)
+
+**Commands:**
+- **Release:** a scratch example (not kept). Build `Buddy::new(4096, 23)` (a 32 GiB region of 4 KiB granules) or
+  `Buddy::new_imaged(4096, 23)`, allocate 64 blocks, and time the first `capture`. Three rounds, this machine at load
+  about 25.
+- **Debug:** a scratch print in the first-capture branch during `landing_fairness a_large_landing`.
+
+| round | deferred (before) | started imaged (after) |
+|---|---|---|
+| 0 | 3,442 µs, 8,388,608 granules scanned | 3 µs, none |
+| 1 | 2,865 µs, 8,388,608 | 1 µs, none |
+| 2 | 2,904 µs, 8,388,608 | 1 µs, none |
+
+- **In the daemon (debug):** one first capture per run before, 8,388,608 granules in 64.6 ms inside one verb's shard
+  step. After, none in two runs with the print restored.
+- **The fairness lane's longest step after the fix:** 20–147 ms over twelve runs, nine of them 97–147 ms. That is
+  another long step, open (GAPS, the same day).
+- **Cost elsewhere:** none. Allocations and claims in a published arena keep the bitmap, as they did after a first
+  capture, and an allocator nothing publishes from keeps the deferral's one flag test.

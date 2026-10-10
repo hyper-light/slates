@@ -5749,8 +5749,9 @@ On a Linux release build of `faad1562` (A-126, the probe-storm fix and the reply
   - client: 10, consumer 2 (2 ignored), presentation 1.
 
   macOS: the same, plus the gates.
-- **Seen in both arms of the fairness A/B, located the same day (open):** one shard step of 126–185 ms per run at load
-  27–29, and one probe per run waiting behind it. The 2026-10-01 runs, at load 4–6, saw longest steps of 13.8–25.5 ms.
+- **Seen in both arms of the fairness A/B: one cause found and fixed, one still open.** One shard step of 126–185 ms
+  per run at load 27–29, and one probe per run waiting behind it. The 2026-10-01 runs, at load 4–6, saw longest steps
+  of 13.8–25.5 ms.
   - **Not the landing:** timed in a scratch build, its begin took 5.1 ms, its finish 16.5 ms and its slices at most
     4.3 ms.
   - **The cause:** `sample` of the test process during a run (debug build) put 131 of the shard thread's 600 samples
@@ -5759,6 +5760,18 @@ On a Linux release build of `faad1562` (A-126, the probe-storm fix and the reply
   - **Why it scans:** a buddy keeps no live-block bitmap until its first capture (`imaged`), so an allocator nothing
     publishes from pays nothing. So the first capture of each region scans its whole state, one byte per granule, in
     the step of whichever mutating verb publishes first; later captures are incremental.
-  - **Owed:** the cost in a release build, then the scan taken off the verb path. A region that will be published
-    could start imaged with an empty bitmap, since a fresh region has no allocations; to be confirmed against the
-    recovery path, which rebuilds a buddy from saved state bytes.
+  - **Fixed the same day (A-64's follow-up):** a published arena (`ChunkArena::published`, the daemon's shard arenas)
+    starts each region imaged (`Buddy::new_imaged`), its bitmap empty because a fresh region holds no block, and kept
+    by every claim and allocation.
+    - In release, a region of 8,388,608 granules (32 GiB) took 2.9–3.4 ms to first-capture, and now takes 1–3 µs.
+    - In the daemon, no first-capture scan runs at all; a scratch print in the scan's branch is silent, where it had
+      printed 8,388,608 granules in 64.6 ms.
+    - Proven on both OSes. macOS: mem 103 (the changed tests under Miri too), server recovery 39, daemon 22, client 10,
+      vfs 256, and the held-connection restart flows 3/3. Linux (bounded lane): clippy clean, mem 103, recovery 41,
+      daemon 22.
+    - Bug doc: `docs/bugs/2026-10-10-a-regions-first-publication-scanned-every-granule-on-a-verbs-path.md`.
+  - **Still open:** the fairness lane's longest step after the fix is 20–147 ms over twelve runs, nine of them
+    97–147 ms. Profiling
+    can't name the task at load 25: the sampler gets about 1,000 of 5,000 samples on the shard thread. Next step: log
+    the long poll's attribution (own CPU, blocked, preempted, unattributed), which only the late-beat log reports
+    today.

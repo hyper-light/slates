@@ -144,6 +144,9 @@ pub struct ChunkArena {
   /// Bytes whose reusable mark an allocation cleared before handing them out (A-110, macOS), monotone: the counter a
   /// test of the give-back asserts moved, so a dead clearing path cannot pass as one that had nothing to clear.
   reused: u64,
+  /// Whether recovery publications name this arena's blocks ([`ChunkArena::published`]): each region it adds then keeps
+  /// its live heads from the start ([`Buddy::new_imaged`]), so no publication scans a region's state.
+  published: bool,
 }
 
 /// What one [`ChunkArena::purge`] call did.
@@ -190,7 +193,27 @@ impl ChunkArena {
       purge_cursor: None,
       allocations: 0,
       reused: 0,
+      published: false,
     }
+  }
+
+  /// Marks this arena's blocks as named by recovery publications (A-64): every region added from here on keeps its live
+  /// heads from the start ([`Buddy::new_imaged`]), so a publication never reads a region's state bytes to find them.
+  /// Without it a region's first capture scanned every granule inside whichever verb's shard step published first
+  /// (8,388,608 granules, 64.6 ms in a debug build; 2026-10-10). An arena nothing publishes from leaves it unset and
+  /// keeps no bitmap.
+  pub fn published(mut self) -> Self {
+    self.published = true;
+    self
+  }
+
+  /// Granules the regions' first captures read from their state bytes: zero for a published arena's regions.
+  pub fn scanned_granules(&self) -> u64 {
+    self
+      .slots
+      .iter()
+      .map(|slot| slot.buddy.scanned_granules())
+      .fold(0u64, u64::saturating_add)
   }
 
   /// Lets an idle purge give free blocks of at least `bytes` back to the OS
@@ -447,7 +470,11 @@ impl ChunkArena {
       id,
       dirty: crate::ranges::UnitSet::new(region.len(), self.granule),
       region,
-      buddy: Buddy::new(self.granule, max_order)?,
+      buddy: if self.published {
+        Buddy::new_imaged(self.granule, max_order)?
+      } else {
+        Buddy::new(self.granule, max_order)?
+      },
     };
     let at = usize::from(id);
     if self.position.len() <= at {
@@ -1477,5 +1504,83 @@ mod tests {
     assert_eq!(arena.allocated_bytes(), 0);
     assert!(arena.remove_region(300).is_ok());
     assert_eq!(arena.regions(), 0);
+  }
+
+  /// A-64 with a published arena (2026-10-10). Do: in an unpublished arena and in a published one, each of two regions
+  /// of sixteen pages, allocate blocks, free one, capture, commit, allocate again, and capture; and claim a block in a
+  /// fresh region of each, as recovery does, then capture. Expect: both arenas name exactly the same blocks at every
+  /// capture; the unpublished arena's captures scanned every granule of its three regions once, the published arena's
+  /// none — the scan gone, not moved.
+  #[test]
+  fn a_published_arena_names_what_a_scanning_one_names_and_scans_nothing() {
+    let p = page();
+    let mut scanning = arena_of_regions(p, false);
+    let mut published = arena_of_regions(p, true);
+    compare_captures(&mut scanning, &mut published, p);
+    let claimed_a = claim_in_a_fresh_region(&mut scanning, p);
+    let claimed_b = claim_in_a_fresh_region(&mut published, p);
+    assert!(scanning.imaged(claimed_a) && published.imaged(claimed_b));
+    let granules = u64::try_from((REGIONS + 1) * PAGES).unwrap();
+    assert_eq!(
+      scanning.scanned_granules(),
+      granules,
+      "each region scanned once"
+    );
+    assert_eq!(published.scanned_granules(), 0, "no region scanned");
+  }
+
+  /// Shape: the regions [`arena_of_regions`] adds, and the pages each holds.
+  const REGIONS: usize = 2;
+  /// Shape: see [`REGIONS`].
+  const PAGES: usize = 16;
+
+  /// An arena of [`REGIONS`] regions of [`PAGES`] pages each, published or not.
+  fn arena_of_regions(p: usize, published: bool) -> ChunkArena {
+    let arena = ChunkArena::new(p);
+    let mut arena = if published { arena.published() } else { arena };
+    for _ in 0..REGIONS {
+      arena
+        .add_region(Region::map(p * PAGES, p, false).unwrap())
+        .unwrap();
+    }
+    arena
+  }
+
+  /// The same allocations, free, captures and commit in both arenas; both must name the same blocks.
+  fn compare_captures(scanning: &mut ChunkArena, published: &mut ChunkArena, p: usize) {
+    let mut held: Vec<(Extent, Extent)> = [p, 2 * p, p, 4 * p]
+      .into_iter()
+      .map(|len| (scanning.alloc(len).unwrap(), published.alloc(len).unwrap()))
+      .collect();
+    let (gone_a, gone_b) = held.remove(1);
+    scanning.free(gone_a).unwrap();
+    published.free(gone_b).unwrap();
+    for arena in [&mut *scanning, &mut *published] {
+      arena.capture();
+      arena.commit_capture();
+    }
+    held.push((scanning.alloc(p).unwrap(), published.alloc(p).unwrap()));
+    scanning.capture();
+    published.capture();
+    for (a, b) in &held {
+      assert_eq!(scanning.imaged(*a), published.imaged(*b), "{a:?} / {b:?}");
+      assert!(
+        published.imaged(*b),
+        "a live block is named by the open capture"
+      );
+    }
+    assert!(!published.imaged(gone_b) && !scanning.imaged(gone_a));
+    scanning.commit_capture();
+    published.commit_capture();
+  }
+
+  /// Recovery's shape: a fresh region added, a block in it claimed, a capture; the claimed block.
+  fn claim_in_a_fresh_region(arena: &mut ChunkArena, p: usize) -> Extent {
+    let id = arena
+      .add_region(Region::map(p * PAGES, p, false).unwrap())
+      .unwrap();
+    let claimed = arena.claim(id, 2 * p, 2 * p).unwrap();
+    arena.capture();
+    claimed
   }
 }

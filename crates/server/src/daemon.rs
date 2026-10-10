@@ -2821,8 +2821,11 @@ fn shard_arena(
   let (handoff, len) = handoff_of(env)?;
   let segment = AnchorSegment::attach(&handoff, len, identity)?;
   let mut pool = crate::content_pool::ContentPool::open(config, partition, env, segment);
-  let mut arena =
-    ChunkArena::new(config.content_granule()).discarding_from(config.discard_from_bytes);
+  // Published: every capture of this arena is a recovery publication (A-64), so its regions keep their live heads from
+  // the start and no verb's step scans a region's state.
+  let mut arena = ChunkArena::new(config.content_granule())
+    .discarding_from(config.discard_from_bytes)
+    .published();
   for (id, region) in pool.held()? {
     arena.add_region_at(id, region)?;
   }
