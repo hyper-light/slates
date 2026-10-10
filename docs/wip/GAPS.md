@@ -5428,3 +5428,15 @@ On a Linux release build of `faad1562` (A-126, the probe-storm fix and the reply
   - Tests, failing first: `a_refused_admission_leaves_the_pool_to_the_other_shards`,
     `making_room_the_pool_cannot_cover_claims_nothing`, `room_another_arena_took_first_returns_what_was_claimed`.
   - Bug doc: `docs/bugs/2026-10-09-a-refused-admission-claimed-the-whole-pool.md`.
+
+### 2026-10-09: every shard sampled memory pressure and sent its hold to every shard (fixed)
+
+- Every shard runs a reap loop, and each one ran `refresh_pressure_hold`: N samplers, each sending N holds a second,
+  each baseline its own. At rest that is N² cross-shard messages a second, each able to wake a parked shard.
+- **Fixed:** only the control shard samples (`verbs::is_control_shard`), and a hold is sent only when it differs from
+  the last one sent to that shard (`ShardState::pressure_sent`). A refused send is counted (`pressure.send_refused`)
+  and sent again at the next refresh.
+- **Measured** (BENCHMARKS, "one pressure sampler a daemon"): idle context switches 36–39 → 27 a second at 5 shards and
+  113–142 → 39–43 at 16 shards.
+- **Owed:** a `powermetrics` idle-wakeup count on a quiet machine. This one's load (75–109) leaves no idle core to wake,
+  so `top`'s idle-wakeup column reads 0.

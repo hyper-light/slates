@@ -2889,7 +2889,7 @@ fn nfs_calls_of(state: &ShardState) -> Vec<u64> {
 
 /// Whether `state` is the control shard's — the first of the daemon's shards, the one that runs the
 /// membership loop and drives the consensus groups (`Daemon::council_leads` observes the same shard).
-fn is_control_shard(state: &ShardState) -> bool {
+pub(crate) fn is_control_shard(state: &ShardState) -> bool {
   state.shards.first() == Some(&state.shard)
 }
 

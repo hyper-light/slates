@@ -4496,3 +4496,32 @@ the client asks to be kept, and closes with another, so both are recorded.
   in both the base build and this one, three alternations each. The 1.2 s runs are the anchor's crash-loop backoff
   (A-119): its log says "restarting it in 1000 ms" when kills come faster than the restart bound derived from the start
   p99, which load raises. A-113's 123–126 ms was recorded at lower load.
+
+### Landed: one pressure sampler a daemon, holds sent only when they change (battery; 2026-10-09)
+
+**Command:** `idle_csw.sh <binary> <instance> 60 [shards]` (a scratch script, its whole body below). It starts `slates
+anchor` from a release build, waits 15 s after the daemon appears, and reads the daemon's context switches from
+`top -l 1 -pid <daemon> -stats csw` before and after 60 s. Arms alternated: the base `5dd8f3dd` and the change.
+macOS 26 on this 18-core machine, load average 75–109 from other sessions.
+
+```sh
+"$BIN" --instance "$INSTANCE" anchor ${4:+--shards $4} > /dev/null 2>&1 &
+# … wait for `pgrep -f "instance $INSTANCE daemon"`, sleep 15 …
+A=$(top -l 1 -pid "$D" -stats csw | tail -1 | tr -dc '0-9'); sleep 60
+B=$(top -l 1 -pid "$D" -stats csw | tail -1 | tr -dc '0-9')
+echo "csw_per_s=$(( (B - A) / 60 ))"
+```
+
+| shards | base: context switches/s (per 60 s run) | one sampler, sent on change |
+|---|---|---|
+| 5 (this machine's default) | 36, 36, 39 | 27, 27, 27 |
+| 16 | 113, 142 | 43, 39 |
+
+- **Cause:** every shard runs a reap loop, and each loop sampled the host's memory and sent its hold to every shard
+  every second. N shards sent N² messages a second at rest, and a message to a parked shard wakes it.
+- **Change:** only the control shard samples, and a hold goes to a shard only when it differs from the last one sent. A
+  daemon at rest sends none.
+- The saving grows with the square of the shards: 25–30% of an idle 5-shard daemon's switches, 65–72% of a 16-shard
+  one's.
+- `top`'s idle-wakeup column read 0 for every process at this load, since no core was idle. Context switches are the
+  measurable stand-in here; a quiet machine's `powermetrics` run is owed.

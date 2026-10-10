@@ -327,11 +327,14 @@ acknowledging placement", §4.2).
    (§5.5).** The hold is on each shard's byte budget — `admittable = capacity − committed − headroom
    − hold` (`ShardBudget::set_hold`/`hold`, `crates/mem/src/budget.rs`) — and shrinks admittable
    only, never revoking a committed claim, so no admitted volume's within-entitlement write is
-   touched. The daemon's reap loop samples `Facts::memory_available_now` at the liveness cadence (the
+   touched. The control shard's reap loop samples `Facts::memory_available_now` at the liveness cadence (the
    cheap refresh), captures a boot baseline, and fans the host-wide shortfall below it, divided
    evenly among the shards, as each shard's hold (`daemon::refresh_pressure_hold` over
    `xshard::run_on`); the hold releases to zero as the sample recovers, and a host with no sampler
-   leaves it at zero (admits exactly as before). Proven by use: a raised hold refuses a new bounded
+   leaves it at zero (admits exactly as before). **Amended 2026-10-09: one sampler, holds sent on change.** Every
+   shard runs a reap loop, and until this date each one sampled and sent its hold to every shard: N² messages a second
+   on a daemon at rest. Now only the control shard samples, and a hold is sent to a shard only when it changes
+   (BENCHMARKS: an idle 16-shard daemon's context switches fell from 113–142 to 39–43 a second). Proven by use: a raised hold refuses a new bounded
    create `BudgetExceeded` while an admitted volume's further write within its limit still lands
    (`crates/server/tests/nfs_mount.rs::a_memory_pressure_hold_refuses_new_admission_but_not_an_admitted_volumes_writes`,
    with `Daemon::inject_pressure_hold`/`pressure_holds` driving the mechanism deterministically), and

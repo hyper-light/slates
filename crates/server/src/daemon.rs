@@ -3077,6 +3077,7 @@ fn init_shard(
     injected_available: None,
     injected_resident: None,
     pressure_resident_baseline: None,
+    pressure_sent: vec![0; config_shards.len()],
     answers_given: crate::lease::AnswersGiven::default(),
     departed_owners: std::collections::BTreeMap::new(),
     green_retention: std::collections::BTreeMap::new(),
@@ -3451,7 +3452,9 @@ pub(crate) fn pressure_hold(baseline: u64, available: u64, own_growth: u64, capa
 }
 
 /// Samples the host's available memory and sets each shard's pressure hold (§4.2; admission.md §5.5),
-/// run on the reap loop's shard at the liveness cadence — the design's "cheap-refresh". The hold is
+/// run by the control shard's reap loop at the liveness cadence — the design's "cheap-refresh", one sampler a
+/// daemon (every shard runs a reap loop; before 2026-10-09 each sampled and sent its own reading to every shard, N²
+/// cross-shard messages a second on a daemon at rest, each waking a parked shard). The hold is
 /// the host-wide shortfall below the boot baseline, less the daemon's own resident growth since then (that is
 /// committed content, charged already), divided evenly among the shards (so the total
 /// held across the shards is the shortfall, not a multiple of it); it shrinks each shard's admittable
@@ -3461,6 +3464,9 @@ pub(crate) fn pressure_hold(baseline: u64, available: u64, own_growth: u64, capa
 /// budget then admits exactly as before, no worse than not sampling. The read is one cheap syscall or
 /// `/proc` line per cadence, not per request.
 fn refresh_pressure_hold() {
+  if state::with_state(|s| crate::verbs::is_control_shard(s)) != Some(true) {
+    return;
+  }
   let injected = state::with_state(|s| s.injected_available).flatten();
   let Some(available) = injected.or_else(slates_machine::facts::Facts::memory_available_now) else {
     return;
@@ -3492,14 +3498,35 @@ fn refresh_pressure_hold() {
   let per_shard = pressure_hold(baseline, available, own_growth, capacity)
     .checked_div(u64::try_from(shards.len().max(1)).unwrap_or(1))
     .unwrap_or(0);
-  for shard in shards {
-    crate::xshard::run_on_counted(origin, shard, move |s| {
+  for (index, shard) in shards.into_iter().enumerate() {
+    // Sent only when it changes: a daemon at rest sends nothing. A send the target's admission bound refuses is
+    // counted and left unrecorded, so the next refresh sends it again.
+    if state::with_state(|s| s.pressure_sent.get(index).copied()).flatten() == Some(per_shard) {
+      continue;
+    }
+    let sent = crate::xshard::run_on(origin, shard, move |s| {
       if !s.pressure_pinned {
         s.store.budget.set_hold(per_shard);
       }
     });
+    match sent {
+      Ok(()) => {
+        state::with_state(|s| {
+          if let Some(slot) = s.pressure_sent.get_mut(index) {
+            *slot = per_shard;
+          }
+        });
+      }
+      Err(_) => {
+        state::with_state_counted(|s| s.count(PRESSURE_SEND_REFUSED, 1));
+      }
+    }
   }
 }
+
+/// Counter: a pressure hold the sampler could not send a shard (its admission bound refused the message); sent again at
+/// the next refresh, so none is lost, but a refusal is never silent.
+const PRESSURE_SEND_REFUSED: &str = "pressure.send_refused";
 
 /// Ends the shard's FUSE mounts when its serve loop ends (§4.6 "Linux"; AUD-29-64): the loop is perpetual,
 /// so it ends only when the daemon's stop cancels every task on the shard, and its drop runs on the shard's
