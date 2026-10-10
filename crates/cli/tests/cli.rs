@@ -422,6 +422,52 @@ fn strict_volume_or_typed_refusal(instance: &str) -> Option<String> {
   None
 }
 
+/// §4.14 `daemon.alive` (2026-10-10, when the anchor began waiting for the lapse instead of looking every beat): a daemon
+/// that stops beating is killed at its heartbeat lapse and restarted. Do: start an anchor, freeze its daemon
+/// (`SIGSTOP`: alive and silent), and wait for another daemon to answer. Expect the frozen one gone, killed once, and the
+/// new one answering no sooner than the liveness budget less one heartbeat after the freeze (the lapse runs from the last
+/// beat, which may precede the freeze by a beat) and within the suite's start wait after that.
+#[test]
+fn a_frozen_daemon_is_killed_at_its_heartbeat_lapse_and_restarted() {
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the frozen-daemon flow: set SLATES_TEST_CLI=1 to run it (an anchor and its daemon)"
+    );
+    return;
+  }
+  let instance = format!("cli-frozen-{}", std::process::id());
+  let anchor = start_anchor(&instance);
+  let frozen = daemon_pid(&instance).expect("the daemon answers");
+  assert!(
+    Command::new("kill")
+      .args(["-STOP", &frozen.to_string()])
+      .status()
+      .unwrap()
+      .success()
+  );
+  let stopped = Instant::now();
+  let successor = await_daemon(&instance, Some(frozen), &[]);
+  let replaced_after = stopped.elapsed();
+  let frozen_alive = Command::new("kill")
+    .args(["-0", &frozen.to_string()])
+    .status()
+    .unwrap()
+    .success();
+  drop(anchor);
+  let budget = Duration::from_nanos(slates_server::daemon::LIVENESS_BUDGET_NS);
+  let beat = Duration::from_nanos(slates_server::daemon::HEARTBEAT_NS);
+  assert_ne!(successor, frozen);
+  assert!(!frozen_alive, "the frozen daemon was killed");
+  assert!(
+    replaced_after >= budget.saturating_sub(beat),
+    "not killed before its heartbeat lapsed: replaced after {replaced_after:?}"
+  );
+  assert!(
+    replaced_after <= budget + START_WAIT,
+    "killed at the lapse and replaced: after {replaced_after:?}"
+  );
+}
+
 /// Kills the daemon (`SIGKILL`) and waits for the anchor's restarted one to answer.
 fn kill_the_daemon_and_await_its_successor(instance: &str) {
   let killed = daemon_pid(instance).unwrap();

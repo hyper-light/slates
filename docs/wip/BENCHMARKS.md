@@ -4582,3 +4582,30 @@ pool owner word (`pool_owner`) of a fresh segment 200 times and reports the mean
   11,752,832 bytes before against 11,751,200 after, machine code within 648 bytes.
 - `every_region_is_found_at_its_place_in_the_layout_and_no_other` holds the arithmetic to the layout's own list for
   four shapes of geometry, and refuses kinds past it.
+
+### Landed: the anchor looks at a running daemon when its heartbeat could lapse, not every beat (battery; 2026-10-10)
+
+**Command:** `anchor_csw.sh <binary> <instance> 30`, a scratch script. It starts a one-shard `slates anchor`, settles
+15 s, and reads `top`'s context switches for the anchor and the daemon over 30 s. Arms alternated: the build with the
+daemon's stop watch, and the change. Load average 26–30.
+
+| build | anchor, context switches/s | daemon |
+|---|---|---|
+| before | 11, 11 | 26, 25 |
+| the change | 2, 2 | 26, 25 |
+
+- **Cause:** the anchor's observation loop polled every heartbeat (100 ms) for a lapse, though exits and held devices
+  already wake it through descriptors.
+- **Change:** a running daemon is looked at when its heartbeat could first be found lapsed, the last beat plus the
+  liveness budget, and at least every half budget. The half keeps the loop's own gap under the budget, which it would
+  otherwise read as the host having slept (`lapse_wait`).
+  - A starting daemon is still looked at every beat, since its first beat times its start.
+  - A silent daemon is now found lapsed at the budget's end, not up to a beat later.
+- **Found on the way:** once a lapse's kill was sent, the loop judged the same stale heartbeat again each turn and
+  killed and logged again until the daemon was reaped. With the old 100 ms pause that was 21 log lines for one freeze;
+  with the new zero wait it spun (102). A kill is now sent once and the loop waits on the exit.
+- **Proven by use:** `a_frozen_daemon_is_killed_at_its_heartbeat_lapse_and_restarted` (new: `SIGSTOP` the daemon; it is
+  replaced after the budget less one beat, one kill logged), 3 of 3. The anchor-death, restart, signal-drain and
+  `nfs_held` flows pass.
+- At rest, one shard's daemon and anchor together: 48 context switches a second this morning (37 + 11), 27 now
+  (25 + 2).

@@ -48,12 +48,12 @@ impl DaemonWatch {
   }
 }
 
-/// Waits out one observation pause, or less: when a daemon sends a hold (A-113), or when the daemon exits. Both
-/// descriptors are polled with the pause as the timeout, so a hold is taken as it arrives and a dead daemon is
-/// restarted the moment it dies — a kill cost up to a whole pause (100 ms) of detection before its restart could begin,
-/// time every kernel client of a held mount waited. A signal ends the wait early, as it ended the park.
+/// Waits out `pause`, or less: when a daemon sends a hold (A-113), or when the daemon exits. Both descriptors are
+/// polled with the pause as the timeout, so a hold is taken as it arrives and a dead daemon is restarted the moment it
+/// dies — a kill cost up to a whole pause (100 ms) of detection before its restart could begin, time every kernel client
+/// of a held mount waited. A signal ends the wait early, as it ended the park.
 #[cfg(unix)]
-fn await_observation(supervisor: &Supervisor, watch: &mut DaemonWatch) {
+fn await_observation(supervisor: &Supervisor, watch: &mut DaemonWatch, pause: Duration) {
   use std::os::fd::BorrowedFd;
   let exit = watch
     .on(supervisor.child_pid())
@@ -61,14 +61,14 @@ fn await_observation(supervisor: &Supervisor, watch: &mut DaemonWatch) {
   let descriptors: Vec<BorrowedFd<'_>> =
     supervisor.hold_channel().into_iter().chain(exit).collect();
   if descriptors.is_empty() {
-    std::thread::park_timeout(observation_pause());
+    std::thread::park_timeout(pause);
     return;
   }
   let mut interest: Vec<rustix::event::PollFd<'_>> = descriptors
     .iter()
     .map(|fd| rustix::event::PollFd::new(fd, rustix::event::PollFlags::IN))
     .collect();
-  let timeout = rustix::event::Timespec::try_from(observation_pause()).ok();
+  let timeout = rustix::event::Timespec::try_from(pause).ok();
   // Readable, timed out or interrupted, the loop's next turn drains the channel and observes the daemon; an error
   // here only shortens the wait.
   let _ = rustix::event::poll(&mut interest, timeout.as_ref());
@@ -81,8 +81,8 @@ struct DaemonWatch;
 
 /// See the Unix arm: no hold channel off Unix.
 #[cfg(not(unix))]
-fn await_observation(_supervisor: &Supervisor, _watch: &mut DaemonWatch) {
-  std::thread::park_timeout(observation_pause());
+fn await_observation(_supervisor: &Supervisor, _watch: &mut DaemonWatch, pause: Duration) {
+  std::thread::park_timeout(pause);
 }
 
 /// Binds the NFS loopback listener the anchor holds across daemon restarts (§4.6) and hands it to
@@ -325,6 +325,10 @@ fn observe(
   let mut longest_start_ns = 0u64;
   let mut watch = Watch::default();
   let mut daemon_watch = DaemonWatch::default();
+  // A kill already sent to the daemon that has not been reaped yet: it is not sent again, and the loop waits on the
+  // daemon's exit (its exit watch ends the wait) rather than judging the same stale heartbeat each turn. Before
+  // 2026-10-10 a lapsed daemon was killed and logged again every pause until reaped.
+  let mut kill_sent = false;
   loop {
     if signal::stop_requested() {
       stop_gracefully(supervisor, clock)?;
@@ -344,6 +348,13 @@ fn observe(
           // a span the anchor itself did not observe.
           (sup.heartbeat_ns(), sup.alive(now, u64::MAX).0 && !dead)
         };
+        // A starting daemon is looked at every beat (its first beat times its start, which sets the restart policy);
+        // a running one only when its heartbeat could next be found lapsed (`lapse_wait`).
+        let pause = if starting_since.is_some() {
+          observation_pause()
+        } else {
+          Duration::from_nanos(lapse_wait(watch, heartbeat_ns, now, LIVENESS_BUDGET_NS))
+        };
         match starting_since {
           Some(since) if heartbeat_ns >= since => {
             longest_start_ns = longest_start_ns.max(now.saturating_sub(since));
@@ -351,21 +362,28 @@ fn observe(
               .set_policy(RestartPolicy::derive(RECOVERY_BUDGET_NS, longest_start_ns).get());
             starting_since = None;
           }
-          Some(since) if now.saturating_sub(since) > RECOVERY_BUDGET_NS => {
+          Some(since) if now.saturating_sub(since) > RECOVERY_BUDGET_NS && !kill_sent => {
             eprintln!(
               "slates anchor: the daemon never beat inside the recovery budget; killing it"
             );
             supervisor.kill().map_err(|e| failed("kill", e))?;
+            kill_sent = true;
             starting_since = None;
           }
           Some(_) => {}
-          None if !alive => {
+          None if !alive && !kill_sent => {
             eprintln!("slates anchor: the daemon's heartbeat lapsed; killing it");
             supervisor.kill().map_err(|e| failed("kill", e))?;
+            kill_sent = true;
           }
           None => {}
         }
-        await_observation(supervisor, &mut daemon_watch);
+        let pause = if kill_sent {
+          observation_pause()
+        } else {
+          pause
+        };
+        await_observation(supervisor, &mut daemon_watch, pause);
       }
       slates_anchor::Step::Restarted {
         exit_code,
@@ -375,6 +393,7 @@ fn observe(
           "slates anchor: daemon exited ({exit_code:?}); restarted ({in_window} in the window)"
         );
         starting_since = Some(clock.monotonic_ns());
+        kill_sent = false;
       }
       slates_anchor::Step::CrashLoop {
         exit_code,
@@ -386,9 +405,10 @@ fn observe(
           "slates anchor: the daemon is in a crash loop (last exit {exit_code:?}); restarting it in {} ms",
           retry_in_ns / NS_PER_MS
         );
+        kill_sent = false;
       }
       slates_anchor::Step::BackingOff { .. } => {
-        await_observation(supervisor, &mut daemon_watch);
+        await_observation(supervisor, &mut daemon_watch, observation_pause());
       }
       slates_anchor::Step::Stopped => return Ok(()),
     }
@@ -433,6 +453,26 @@ fn lapsed(watch: Watch, beat_ns: u64, now_ns: u64, budget_ns: u64) -> (bool, Wat
   )
 }
 
+/// Shape: the observation loop waits at most the liveness budget divided by this (half): its own gap then stays under
+/// the budget through any scheduling delay shorter than the other half, since a longer gap reads as the host having
+/// slept and restarts the budget ([`lapsed`]).
+const OBSERVATION_GAP_PARTS: u64 = 2;
+
+/// How long the observation loop may wait before it must look at a running daemon again (§4.14): until the first
+/// instant [`lapsed`] could find its heartbeat (last beaten at `beat_ns`) lapsed, and never more than the budget over
+/// [`OBSERVATION_GAP_PARTS`]. A daemon beating every heartbeat is looked at twice a budget; one that stops is found
+/// lapsed at the budget's end, not up to a beat later. Exits, holds and signals end the wait sooner
+/// ([`await_observation`]). Before 2026-10-10 the loop looked every heartbeat, eleven wakeups a second at rest.
+fn lapse_wait(watch: Watch, beat_ns: u64, now_ns: u64, budget_ns: u64) -> u64 {
+  let lapses_at = beat_ns
+    .max(watch.resumed_ns)
+    .saturating_add(budget_ns)
+    .saturating_add(1);
+  lapses_at
+    .saturating_sub(now_ns)
+    .min(budget_ns / OBSERVATION_GAP_PARTS)
+}
+
 #[cfg(test)]
 mod lapse_tests {
   use super::*;
@@ -467,6 +507,43 @@ mod lapse_tests {
     }
     let killed_at = killed_at.expect("the silent daemon lapsed");
     assert!(killed_at - last_beat > BUDGET && killed_at - last_beat <= BUDGET + TURN);
+  }
+
+  /// §4.14 (2026-10-10): the loop waits for the lapse, not for the next beat. Do: follow `lapse_wait` from turn to turn
+  /// over a daemon that beats every tenth of a budget, then stops. Expect every wait at most half a budget while it
+  /// beats, and the lapse found exactly one budget and a nanosecond after its last beat.
+  #[test]
+  fn the_loop_wakes_twice_a_budget_and_finds_a_lapse_at_the_budgets_end() {
+    let mut watch = Watch::default();
+    let mut now = BUDGET;
+    let mut last_beat = now;
+    for _ in 0..30 {
+      if now.saturating_sub(last_beat) >= TURN {
+        last_beat = now - (now - last_beat) % TURN;
+      }
+      let (dead, next) = lapsed(watch, last_beat, now, BUDGET);
+      assert!(!dead, "a beating daemon never lapses");
+      watch = next;
+      let wait = lapse_wait(watch, last_beat, now, BUDGET);
+      assert!(wait <= BUDGET / 2, "{wait}");
+      now += wait;
+    }
+    let stopped_at = last_beat;
+    let mut found = None;
+    for _ in 0..10 {
+      let (dead, next) = lapsed(watch, stopped_at, now, BUDGET);
+      watch = next;
+      if dead {
+        found = Some(now);
+        break;
+      }
+      now += lapse_wait(watch, stopped_at, now, BUDGET);
+    }
+    assert_eq!(
+      found,
+      Some(stopped_at + BUDGET + 1),
+      "found at the budget's end"
+    );
   }
 
   /// §4.14 (2026-10-04): do suspend the whole host for an hour between two observations — the daemon's last beat

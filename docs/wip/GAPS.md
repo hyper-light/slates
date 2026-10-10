@@ -5506,3 +5506,12 @@ On a Linux release build of `faad1562` (A-126, the probe-storm fix and the reply
   partitions.
 - **Fixed:** the region is found by arithmetic over the layout's order. A structural test holds it to the list.
 - **Measured** (BENCHMARKS): a pool owner word 189–340 → 9–15 ns; a whole-pool scan 60/391 → 3–4/10–16 µs.
+
+### 2026-10-10: the anchor polled every heartbeat, and killed a lapsed daemon again each turn until reaped (fixed)
+
+- The anchor's observation loop woke every 100 ms at rest, 11 context switches a second. Now a running daemon is looked
+  at when its heartbeat could first lapse, at most every half budget (`anchor::lapse_wait`): 2 a second.
+- A lapse's kill was re-sent and re-logged every turn until the daemon was reaped. It is sent once, and the loop waits
+  on the exit.
+- No test froze a daemon under its anchor. `a_frozen_daemon_is_killed_at_its_heartbeat_lapse_and_restarted` does now
+  (gated by `SLATES_TEST_CLI=1`).
