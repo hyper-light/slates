@@ -4345,3 +4345,29 @@ release build of `faad1562`.
 
 Every byte the writer wrote survived 80 SIGKILLs in all, each recovery replaying windowed patches. No fsync waited
 longer than 70 ms across a kill: the anchor restarts the daemon from its RAM in milliseconds.
+
+### The hot-directory storm after the probe-storm fix: delegations granted again (condition 12; 2026-10-09)
+
+Command: `docs/wip/bench/hotdir/native.sh WORKERS 500` (Linux's own NFSv4.2 client against a daemon in the same
+privileged container). Arms:
+- spans (`5fd6d3af`-era, before `9c0d5057`, its back channel caught in the probe storm);
+- HEAD (`faad1562`).
+
+Alternated twice at 1 and 16 workers; load average 4.7–8.2.
+
+| workers | op | before p50 / p99 | after p50 / p99 |
+|---|---|---|---|
+| 1 | create+write+close | 450–466 / 758–841 µs | 178–232 / 359–508 µs |
+| 1 | open+read+close | 294–301 / 524–643 µs | 27–35 / 83–135 µs |
+| 1 | ops/s | 3,582–3,748 | 9,485–12,684 |
+| 16 | create+write+close | 4,019–4,149 / 6,075–6,593 µs | 1,698–1,740 / 3,186–3,390 µs |
+| 16 | open+read+close | 1,362–1,431 / 4,566–4,799 µs | 948–981 / 3,458–3,933 µs |
+| 16 | stat | 45–58 / 1,952–1,993 µs | 131–137 / 1,896–1,994 µs |
+
+- With the back channel up, the client holds read delegations and serves an open of a file it delegated from its
+  cache. A single writer's open+read fell about 9×, and CLOSEs halved (1,000 → 500).
+- At 16 workers the elapsed time stays about 7 s: tmpfs takes the same, so Python's GIL bounds it, not the file system.
+- Against Tectonic's published tails (writes reaching 150–200 ms, reads about 100 ms; FAST'21): sixteen writers in one
+  directory now see create p99 3.4 ms and read p99 3.9 ms.
+- Owed: at 16 workers `stat`'s p50 rose from 45–58 to 131–137 µs (its p99 is unchanged), with GETATTRs at 91–697 against
+  81. The client revalidates more under delegations; not yet traced.

@@ -5310,3 +5310,11 @@ On a Linux release build of `faad1562` (A-126, the probe-storm fix and the reply
   - the read-only entry refuses writes (`Read-only file system`).
 - Owed: the same container workload on a tmpfs bind took 0.14 s, against 0.79 s on the FUSE mount. The FUSE path's
   small-file cost is open work for condition 12.
+
+### 2026-10-09: what the probe-storm fix bought real NFSv4 workloads (condition 12)
+
+- The hot-directory storm through Linux's NFSv4.2 client, before (`9c0d5057`'s parent) against after (BENCHMARKS):
+  - one writer's open+read p50 fell from 294–301 µs to 27–35 µs, as read delegations were granted again;
+  - create+write p50 fell from about 460 to about 200 µs;
+  - sixteen writers' create p99 fell from 6.1–6.6 to 3.2–3.4 ms.
+- Owed: `stat` p50 at 16 workers rose 45–58 → 131–137 µs, p99 unchanged.
