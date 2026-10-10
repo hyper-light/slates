@@ -424,15 +424,19 @@ impl Model {
       None => return Err(VfsError::NotFound),
     };
     d.remove(&key);
+    self.drop_link(ino);
+    Ok(())
+  }
+
+  /// Takes one link from `ino`: the file goes with its last link; a surviving record is copied for its link count.
+  fn drop_link(&mut self, ino: u64) {
     let links = self.links.entry(ino).or_insert(1);
     *links -= 1;
     if *links == 0 {
       self.forget(ino);
     } else if let Some(f) = self.files.get_mut(&ino) {
-      // The surviving record is copied for its link count.
       f.copy_record(self.epoch);
     }
-    Ok(())
   }
 
   fn rmdir(&mut self, dir: &[String], name: &str) -> Result<(), VfsError> {
@@ -632,12 +636,10 @@ impl Model {
       return Err(VfsError::IsDirectory);
     }
     if let Some(Node::File { ino }) | Some(Node::Symlink { ino, .. }) = &target {
-      let ino = *ino;
-      let links = self.links.entry(ino).or_insert(1);
-      *links -= 1;
-      if *links == 0 {
-        self.forget(ino);
-      }
+      // A replaced target loses its link as `unlink` takes one, its surviving record copied for its link count (found
+      // 2026-10-10 by a fresh seed: `Link d` to `A`, a one-byte edit, `Snapshot`, then a symlink renamed over `A`; the
+      // volume sealed A's open window at the copy, 16384 → 12288 bytes referenced, while the model left it open).
+      self.drop_link(*ino);
     }
     let fd = self.dir_mut(from_dir).unwrap();
     let node = fd.remove(&from_key).unwrap();

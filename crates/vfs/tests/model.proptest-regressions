@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc 87ae6d047a36d6e2f91fb53a98349b166c812026d09901f339c903fd262ce0c1 # shrinks to steps = [Mkdir([], "a"), Mkdir(["a"], "A"), Rename(["A"], "A", ["a"], "a")]
+cc 71e2bd32324cfbef38095c49287acfe92675b95b64060ff664f1a8d4ceddd394 # shrinks to steps = [Create([], "A"), Symlink([], "C"), Link([], "d", 0), Edit(0, 0, 0, [0]), Snapshot, Rename([], "C", [], "A")]
