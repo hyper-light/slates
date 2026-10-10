@@ -296,16 +296,29 @@ impl ChunkArena {
   /// Grows from the source by what a commitment of `bytes` lacks in `budget`, and extends `budget` by what was added
   /// (A-98): the bytes added. Nothing grows when the commitment is admittable already; the deficit counts the
   /// budget's pressure hold ([`crate::budget::ShardBudget::deficit`]).
+  ///
+  /// All of the deficit or nothing (§4.2: an admission is refused whole, with nothing changed). A commitment the pool
+  /// cannot cover is refused by the admission that follows whatever this arena claims, so it claims nothing for it;
+  /// and when another arena claims first, between the look and the claims, what this one took goes back. Before
+  /// 2026-10-09 a refused create claimed every free extent on its way to the refusal, and its shard kept them until its
+  /// next publication: one oversized request on an idle shard refused every other shard's admissions.
   pub fn make_room(&mut self, budget: &mut crate::budget::ShardBudget, bytes: u64) -> u64 {
     if bytes == 0 {
       return 0;
     }
     let deficit = budget.deficit(bytes);
-    if deficit == 0 {
+    if deficit == 0 || u64::try_from(self.claimable()).unwrap_or(u64::MAX) < deficit {
       return 0;
     }
+    let before = self.capacity();
     let added =
       u64::try_from(self.grow(usize::try_from(deficit).unwrap_or(usize::MAX))).unwrap_or(u64::MAX);
+    if added < deficit {
+      // The claims just taken hold no block, so they are wholly free and go back first (the newest regions are
+      // returned first), down to the capacity the arena had before.
+      self.shrink(before);
+      return 0;
+    }
     budget.extend(added);
     added
   }
@@ -1339,6 +1352,72 @@ mod tests {
       arena.add_region_at(7, Region::map(p * 4, p, false).unwrap()),
       Err(MemError::RegionOccupied { region: 7 })
     ));
+  }
+
+  /// A pool whose look at its free bytes counts `phantom` more than it can hand out: another arena claiming between an
+  /// arena's look and its claims.
+  struct RacedPool {
+    pool: TestPool,
+    phantom: usize,
+  }
+
+  impl ExtentSource for RacedPool {
+    fn claim(&mut self) -> Option<(u16, Region)> {
+      self.pool.claim()
+    }
+    fn release(&mut self, id: u16, region: Region) {
+      self.pool.release(id, region);
+    }
+    fn refused(&self) -> u64 {
+      0
+    }
+    fn available(&self) -> usize {
+      self.pool.available().saturating_add(self.phantom)
+    }
+  }
+
+  /// A-98, §4.2 ("refused whole, with nothing changed"). Do: over a pool of two four-granule regions, make room for
+  /// twelve granules, then for six. Expect: the first claims nothing (the pool cannot cover it, and the admission it is
+  /// for is refused whatever is claimed), leaving both regions in the pool; the second claims both. Before 2026-10-09
+  /// the first claimed both regions on its way to a refusal.
+  #[test]
+  fn making_room_the_pool_cannot_cover_claims_nothing() {
+    let p = page();
+    let mut arena = pooled(p, &[3, 9]);
+    let mut budget = crate::budget::ShardBudget::new(0, 0);
+    let refused = arena.make_room(&mut budget, u64::try_from(p * 12).unwrap());
+    assert_eq!((refused, arena.capacity(), budget.capacity()), (0, 0, 0));
+    assert_eq!(arena.claimable(), p * 8, "both regions stay in the pool");
+    let admitted = arena.make_room(&mut budget, u64::try_from(p * 6).unwrap());
+    assert_eq!(admitted, u64::try_from(p * 8).unwrap(), "two whole regions");
+    assert_eq!(budget.capacity(), admitted);
+  }
+
+  /// A-98, §4.2. Do: over a pool that looks one granule larger than it is (another arena claimed between the look and
+  /// the claims), make room for all it looks to hold. Expect: nothing kept — the regions claimed go back to the pool,
+  /// the arena's capacity and the budget unchanged.
+  #[test]
+  fn room_another_arena_took_first_returns_what_was_claimed() {
+    let p = page();
+    let mut arena = ChunkArena::new(p);
+    arena.set_source(Box::new(RacedPool {
+      pool: TestPool {
+        free: [5u16, 6]
+          .iter()
+          .map(|id| (*id, Region::map(p * 4, p, false).unwrap()))
+          .collect(),
+      },
+      phantom: p,
+    }));
+    let mut budget = crate::budget::ShardBudget::new(0, 0);
+    let added = arena.make_room(&mut budget, u64::try_from(p * 9).unwrap());
+    assert_eq!((added, arena.capacity(), budget.capacity()), (0, 0, 0));
+    assert_eq!(arena.regions(), 0);
+    assert_eq!(
+      arena.claimable(),
+      p * 9,
+      "both regions are back, as the look counts them"
+    );
   }
 
   /// A-98 recovery: do add a region under a high id to a fresh arena and claim a block in it; expect the claim to land

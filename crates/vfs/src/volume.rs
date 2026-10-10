@@ -224,23 +224,41 @@ impl Store {
   }
 
   /// Reserves `bytes` for a bounded volume against the shard budget, growing the arena from its pool first when the
-  /// budget lacks the capacity (A-98).
+  /// budget lacks the capacity (A-98). A refusal names what an admission could take now, the pool's free extents
+  /// included ([`Store::admittable`]): the arena claims nothing for a commitment the pool cannot cover, so the budget
+  /// alone would name only what the shard already holds.
   pub fn reserve(
     &mut self,
     bytes: u64,
   ) -> Result<slates_mem::budget::Reservation, slates_mem::MemError> {
     self.make_room(bytes);
-    self.budget.reserve(bytes)
+    self
+      .budget
+      .reserve(bytes)
+      .map_err(|e| self.with_admittable(e))
   }
 
   /// Grows a dynamic charge by `bytes` against the shard budget, growing the arena from its pool first when the
-  /// budget lacks the capacity (A-98).
+  /// budget lacks the capacity (A-98); a refusal names [`Store::admittable`], as [`Store::reserve`]'s does.
   pub fn grow(
     &mut self,
     bytes: u64,
   ) -> Result<slates_mem::budget::Reservation, slates_mem::MemError> {
     self.make_room(bytes);
-    self.budget.grow(bytes)
+    self.budget.grow(bytes).map_err(|e| self.with_admittable(e))
+  }
+
+  /// A budget refusal with its `available` taken from [`Store::admittable`]; any other refusal as it is.
+  fn with_admittable(&self, refusal: slates_mem::MemError) -> slates_mem::MemError {
+    match refusal {
+      slates_mem::MemError::BudgetExceeded { requested, .. } => {
+        slates_mem::MemError::BudgetExceeded {
+          requested,
+          available: self.admittable(),
+        }
+      }
+      other => other,
+    }
   }
 
   /// Returns the arena's wholly free extents to its pool, keeping the capacity every commitment and the operation

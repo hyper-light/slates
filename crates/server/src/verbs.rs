@@ -7133,10 +7133,13 @@ pub(crate) fn materialize_taken_over(
     state.store.make_room(needed.min(volume_cap));
   }
   let restore_budget = volume_cap.min(state.store.budget.admittable());
+  // A refusal names what the shard could admit now, the pool's free extents included: the arena claims nothing for a
+  // restore the pool cannot cover (A-98), so the budget alone names only what the shard already holds.
+  let room = volume_cap.min(state.store.admittable());
   let restored = slates_archive::restore(archive, restore_budget).map_err(|e| match e {
-    slates_archive::ArchiveError::OverBudget { .. } => refused(Refusal::BudgetExceeded {
-      available: restore_budget,
-    }),
+    slates_archive::ArchiveError::OverBudget { .. } => {
+      refused(Refusal::BudgetExceeded { available: room })
+    }
     other => refused(Refusal::BadRequest {
       reason: format!("taken-over content archive: {other}"),
     }),

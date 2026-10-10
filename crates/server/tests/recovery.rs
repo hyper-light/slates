@@ -2188,6 +2188,49 @@ fn a_shard_is_refused_while_another_holds_the_pool_and_admitted_once_it_returns(
   daemon.stop();
 }
 
+/// A-98, §4.2 ("refused whole, with nothing changed"): a refused admission takes nothing from the pool. Do: on two
+/// shards of [`SLICE`] each, ask shard 1 for a volume larger than the whole pool, then ask shard 0 for a quarter of its
+/// own slice. Expect: the first refused `BudgetExceeded` naming at least a slice available (the pool's free room, not
+/// only what shard 1 holds), and the second admitted at once. Found 2026-10-09 reading the
+/// pool beside the pressure hold: the refused create had claimed every free extent into shard 1's arena on its way to
+/// the refusal, and an idle shard returns extents only after its next publication.
+#[test]
+fn a_refused_admission_leaves_the_pool_to_the_other_shards() {
+  let profile = common::machine_profile();
+  let instance = format!("srv-pool-refused-{}", std::process::id());
+  let mut config = DaemonConfig::derive(&profile, &instance, Some(POOL_SHARDS));
+  config.reserve_per_shard = SLICE;
+  let segment = anchor_segment("pool-refused", &profile, &config);
+  let daemon = Daemon::start(&profile, config, source_of(&segment)).unwrap();
+  daemon
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let mut client = connect(&instance);
+  let bounded = |name: String, limit: u64| CreateSpec {
+    size: SizeClass::Bounded { limit },
+    ..scratch(&name)
+  };
+  let oversized = client.create(&bounded(
+    name_on(1, "oversized"),
+    SLICE * u64::from(POOL_SHARDS) + SLICE,
+  ));
+  let modest = client.create(&bounded(name_on(0, "modest"), SLICE / 4));
+  daemon.stop();
+  assert!(
+    matches!(
+      oversized,
+      Err(ClientError::Refused(
+        slates_ipc::protocol::Refusal::BudgetExceeded { available }
+      )) if available >= SLICE
+    ),
+    "a volume larger than the whole pool is refused, naming the pool's free room as available: {oversized:?}"
+  );
+  assert!(
+    modest.is_ok(),
+    "the refused create left the pool to shard 0: {modest:?}"
+  );
+}
+
 /// Shape: the pool extent the crash test leaves claimed: partition 1's slice, its first (and, at a power-of-two
 /// [`SLICE`], only) part (`POOL_EXTENTS_PER_PARTITION × 1 + 0`).
 const OTHER_SLICE_EXTENT: usize = slates_anchor::layout::POOL_EXTENTS_PER_PARTITION;

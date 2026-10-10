@@ -9674,6 +9674,13 @@ memory cap") and GAPS.
   - A shard claims lazily, at admission: when its budget would refuse for want of capacity, the store grows the arena
     by the deficit (`Store::make_room`). The arena preference is the shard's own slice's parts, largest first, then
     other slices' parts. The budget's capacity is extended by what was added.
+    - **All of the deficit or nothing (amended 2026-10-09).** An admission the pool cannot cover is refused whatever is
+      claimed, so nothing is claimed for it. When another shard claims first, between the look and the claims, what
+      was taken goes back. A refusal names what the shard could admit now, the pool's free extents included.
+    - **Wrong before the amendment:** a refused create claimed every free extent on its way to the refusal, and an
+      idle shard returns extents only after its next publication. One oversized request refused every other shard's
+      admissions until then (`docs/bugs/2026-10-09-a-refused-admission-claimed-the-whole-pool.md`;
+      `a_refused_admission_leaves_the_pool_to_the_other_shards`).
   - A shard returns an extent once it is wholly free after a committed publication, keeping what its commitments
     need (piece 5).
   - Not done, and why: the first design kept a fixed base per shard and a separate pool cut from it. Its split had no
