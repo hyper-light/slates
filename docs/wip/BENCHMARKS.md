@@ -4323,3 +4323,25 @@ The arguments of each call are kept in place in their record body (`Call::args`)
 
 The change is landed on the in-process and profile measurements, not on that A/B. The compound's copy of the READ
 data (5.3%) and AES-GCM decryption (29%, A-99's per-read open) remain.
+
+### Kills during random writes against A-126's written-window deltas (condition 11; 2026-10-09)
+
+**Command:** `docs/wip/bench/kill_writes.sh` (new) in a privileged `python:3.12-slim-trixie` container, on a Linux
+release build of `faad1562`.
+- A writer makes random 4 KiB writes into a 64 MiB file on an NFSv4.2 hard mount, with an fsync every 8, keeping its own
+  copy of the file.
+- Meanwhile the daemon is SIGKILLed `KILLS` times, `GAP` seconds apart, and the anchor restarts it. Every restart replays
+  the journal, whose deltas carry written windows (A-126).
+- After the writer's last fsync the volume is remounted, so the client's cache is cold, and the file is compared with
+  the writer's copy.
+- Load average 9–15 from other sessions.
+
+| run | writes / fsyncs | kills | restarts | writer time | longest fsync | file after remount |
+|---|---|---|---|---|---|---|
+| `KILLS=10 GAP=1.5` | 200,000 / 25,000 | 10 | 10 | 25.7 s | 0.07 s | identical |
+| `KILLS=10 GAP=1.5` | 200,000 / 25,000 | 10 | 10 | 15.6 s | 0.03 s | identical |
+| `KILLS=30 GAP=0.3` | 200,000 / 25,000 | 30 | 30 | 14.8 s | 0.03 s | identical |
+| `KILLS=30 GAP=0.3` | 200,000 / 25,000 | 30 | 30 | 13.6 s | 0.03 s | identical |
+
+Every byte the writer wrote survived 80 SIGKILLs in all, each recovery replaying windowed patches. No fsync waited
+longer than 70 ms across a kill: the anchor restarts the daemon from its RAM in milliseconds.

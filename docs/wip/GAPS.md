@@ -5286,3 +5286,11 @@ At `f62847d5`:
     in the next 20 runs at load 21–39, with every anchor log and kernel log kept: no restart, no lapsed heartbeat, and no
     OOM kill of a slates process. The VM's OOM killer fired 20 times in the window, always at another session's
     `hyperscale`. Cause still unknown.
+
+### 2026-10-09: A-126's recovery path under kills during writes (condition 11)
+
+- `docs/wip/bench/kill_writes.sh` (new): random 4 KiB writes with an fsync every 8 into a 64 MiB file on an NFSv4.2 hard
+  mount, while the daemon is SIGKILLed again and again. The writer keeps its own copy, and after a cold remount the
+  file must equal it.
+- 4 runs, 80 kills, 100,000 fsyncs: identical every time, longest fsync 70 ms (BENCHMARKS). The journal's windowed
+  patches recovered every acknowledged byte.
