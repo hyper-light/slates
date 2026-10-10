@@ -4525,3 +4525,31 @@ echo "csw_per_s=$(( (B - A) / 60 ))"
   one's.
 - `top`'s idle-wakeup column read 0 for every process at this load, since no core was idle. Context switches are the
   measurable stand-in here; a quiet machine's `powermetrics` run is owed.
+
+### Landed: the daemon process's thread waits on the heartbeat instead of polling (battery; 2026-10-10)
+
+**Command:** the same `idle_csw.sh` as the one-sampler entry above (release builds, a 15 s settle, then `top`'s context
+switches over 30 s), alternating `8d2343a6` and the change, one shard each. macOS 26 on this 18-core machine, load
+average 18–30.
+
+| build | context switches/s at rest, one shard |
+|---|---|
+| `8d2343a6` | 34, 32 |
+| the change | 24, 23 |
+
+- **Found by fitting idle switches against the shard count** at `8d2343a6`: 38, 36, 40 and 51 a second at 1, 2, 4 and 8
+  shards. That is about 35 a second per daemon and about 2 per shard. `sample` of an idle one-shard daemon showed
+  three threads:
+  - the shard, in `kevent`;
+  - the doorbell thread, in a one-second `os_sync_wait_on_address_with_timeout`;
+  - the process's main thread, in `park_timeout` every heartbeat (100 ms), asking whether a signal arrived, whether the
+    anchor asked for a stop, and whether the anchor still lives. Each ask of the anchor's stop word also allocated: it
+    rebuilds the segment's whole region list to find one region.
+- **Change:** the control shard's heartbeat, which beats at that cadence anyway, asks the same three questions
+  (`Daemon::wait_for_stop`), and the process's thread blocks on a channel until one holds. Stop latency is unchanged:
+  one heartbeat.
+- **Proven by use:** the CLI's anchor-death flow ("the anchor is gone; leaving"), the SIGTERM drain flow ("stop
+  requested; drained", leadership handed off before exit) and the restart flows, all with `SLATES_TEST_CLI=1`.
+- **Left as it is:** the anchor's own 11 switches a second at rest (it reads the daemon's heartbeat each beat, so a
+  wedged daemon is caught within one beat of the liveness budget; crashes reach it through its exit watch), and the
+  doorbell thread's one-second bound.

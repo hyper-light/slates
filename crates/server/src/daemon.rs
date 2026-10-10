@@ -1322,6 +1322,28 @@ impl Daemon {
       .is_some()
   }
 
+  /// Blocks the calling thread until this daemon has a reason to stop: its anchor's stop request (`SUP_STOP`), or `also`
+  /// returning true (the caller's own reasons: a signal, a gone parent). Both are asked at the control shard's
+  /// heartbeat, which beats at this cadence anyway, so the waiting thread wakes for nothing else. Before 2026-10-10 the
+  /// daemon process's thread polled the same three questions every heartbeat on its own, ten wakeups a second at rest
+  /// (BENCHMARKS). Returns once a reason holds, or when the control shard's state ends (its watch dropped); the caller
+  /// asks which reason it was. A refusal to install the watch is the control shard's typed refusal.
+  pub fn wait_for_stop(
+    &self,
+    also: impl Fn() -> bool + Clone + Send + 'static,
+  ) -> Result<(), ObserveError> {
+    let (wake, woken) = std::sync::mpsc::sync_channel::<()>(1);
+    self.observe(self.shards.first().copied(), move |s| {
+      s.stop_watch = Some(StopWatch {
+        also: Box::new(also.clone()),
+        wake: wake.clone(),
+      });
+    })?;
+    // Either a reason was sent, or the watch's sender went with the control shard's state: both end the wait.
+    let _reason_or_gone = woken.recv();
+    Ok(())
+  }
+
   /// Hands off every consensus leadership this daemon holds before it stops (thesis §3.10;
   /// `docs/wip/research/consensus-enhancements.md` §3.2), so a planned stop costs the group a handoff rather
   /// than the election timeout a leader loss waits out. For each group it leads it invites the most
@@ -3109,6 +3131,7 @@ fn init_shard(
     injected_resident: None,
     pressure_resident_baseline: None,
     pressure_sent: vec![(0, 0); config_shards.len()],
+    stop_watch: None,
     answers_given: crate::lease::AnswersGiven::default(),
     departed_owners: std::collections::BTreeMap::new(),
     green_retention: std::collections::BTreeMap::new(),
@@ -4119,11 +4142,32 @@ async fn heartbeat_loop(segment: AnchorSegment) {
       log_late_beat(now.saturating_sub(beat), &before, &counters);
     }
     last = Some((now, counters));
-    if let Ok(sup) = segment.supervision() {
-      sup.beat(now);
-    }
+    let requested = match segment.supervision() {
+      Ok(sup) => {
+        sup.beat(now);
+        sup.stop_requested_at().is_some()
+      }
+      Err(_) => false,
+    };
+    state::with_state(|s| {
+      if let Some(watch) = s.stop_watch.as_ref()
+        && (requested || (watch.also)())
+      {
+        // Bounded by one: a reason already sent and not yet taken is the same news.
+        let _full_or_gone = watch.wake.try_send(());
+      }
+    });
     pace(HEARTBEAT_NS).await;
   }
+}
+
+/// A process thread's wait for a reason to stop ([`Daemon::wait_for_stop`]), asked at each heartbeat on the control
+/// shard.
+pub(crate) struct StopWatch {
+  /// The caller's own reasons (a signal, a gone parent).
+  also: Box<dyn Fn() -> bool + Send>,
+  /// Wakes the waiting thread: sent once a reason holds; dropped with the control shard's state.
+  wake: std::sync::mpsc::SyncSender<()>,
 }
 
 /// Logs a beat that came [`LATE_BEAT_SHARE`] of the liveness budget or more after the one before (§4.14

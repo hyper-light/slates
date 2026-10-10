@@ -738,6 +738,9 @@ pub struct ShardState {
   /// one sampler): they are sent only when they change, so a daemon at rest sends none. Every shard's hold and debt
   /// start at zero at boot, and so does this. Bounded by the shards.
   pub(crate) pressure_sent: Vec<(u64, u64)>,
+  /// The process thread's wait for a reason to stop (`Daemon::wait_for_stop`), asked at each heartbeat on the control
+  /// shard; `None` until a process installs it (and on every other shard).
+  pub(crate) stop_watch: Option<crate::daemon::StopWatch>,
   /// The holder side of the owner lease (§4.8; AUD-08): when this node last answered each peer's direct
   /// probe reporting it alive, and the newest configuration version each announced — the evidence that
   /// gates a successor's promotion of a departed owner's objects at this holder

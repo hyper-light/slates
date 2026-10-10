@@ -7,7 +7,6 @@ use std::time::Duration;
 use slates_anchor::{AnchorSegment, RegionKind};
 use slates_machine::facts::Facts;
 use slates_machine::{MachineProfile, ProfileOptions};
-use slates_server::daemon::HEARTBEAT_NS;
 use slates_server::{Daemon, DaemonConfig, SegmentSource};
 
 use crate::args::ProcessOptions;
@@ -146,21 +145,23 @@ pub(crate) fn run(options: &ProcessOptions) -> Result<(), Failure> {
       " alone"
     }
   );
-  loop {
-    if signal::stop_requested() || daemon.stop_requested() {
-      // A planned stop: hand off any consensus leadership first, so the groups pay a handoff rather than the
-      // election timeout a leader loss waits out (bounded; the anchor holds the daemon to its declaration).
-      match daemon.drain_leadership() {
-        Ok(report) => eprintln!("slates daemon: stop requested; drained: {report:?}"),
-        Err(refusal) => eprintln!("slates daemon: stop requested; drain refused: {refusal}"),
-      }
-      break;
+  // The process thread waits for a reason to stop without polling: the control shard's heartbeat asks the anchor's
+  // stop request and these two at its own cadence and wakes this thread once one holds.
+  let watch = parent;
+  let waited = daemon.wait_for_stop(move || signal::stop_requested() || !watch.anchor_alive());
+  if let Err(refusal) = waited {
+    eprintln!("slates daemon: the stop watch could not be installed ({refusal}); stopping");
+  } else if signal::stop_requested() || daemon.stop_requested() {
+    // A planned stop: hand off any consensus leadership first, so the groups pay a handoff rather than the
+    // election timeout a leader loss waits out (bounded; the anchor holds the daemon to its declaration).
+    match daemon.drain_leadership() {
+      Ok(report) => eprintln!("slates daemon: stop requested; drained: {report:?}"),
+      Err(refusal) => eprintln!("slates daemon: stop requested; drain refused: {refusal}"),
     }
-    if !parent.anchor_alive() {
-      eprintln!("slates daemon: the anchor is gone; leaving");
-      break;
-    }
-    std::thread::park_timeout(Duration::from_nanos(HEARTBEAT_NS));
+  } else if !parent.anchor_alive() {
+    eprintln!("slates daemon: the anchor is gone; leaving");
+  } else {
+    eprintln!("slates daemon: the control shard's watch ended; stopping");
   }
   daemon.stop();
   Ok(())

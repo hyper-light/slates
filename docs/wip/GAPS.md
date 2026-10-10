@@ -5485,3 +5485,14 @@ On a Linux release build of `faad1562` (A-126, the probe-storm fix and the reply
   Both now ask each node's own listing. Passes in 5.2 s; no NFS mount is left behind.
 - All of these flows run only with `SLATES_TEST_CLI=1`. Rerun locally 2026-10-10: the anchor, signal-drain, restart,
   bootstrap, JSON, profile, run, inherited-socket, fleet-deploy and core-dump flows, and `nfs_held`, all pass.
+
+### 2026-10-10: the daemon process's thread polled every heartbeat at rest (fixed; battery)
+
+- The `slates daemon` process's main thread woke every 100 ms to ask whether a signal arrived, whether the anchor asked
+  for a stop, and whether the anchor lived: ten wakeups a second at rest, beside the control shard's heartbeat at the
+  same cadence.
+- **Fixed:** `Daemon::wait_for_stop` installs the process's questions on the control shard; its heartbeat asks them each
+  beat, beside the anchor's stop word, and wakes the waiting thread once one holds.
+- **Measured** (BENCHMARKS): one idle shard's context switches 32–34 → 23–24 a second.
+- **Owed:** the anchor's 11 switches a second at rest, if a coarser lapse check is ever worth a slower wedge
+  detection, and a `powermetrics` idle-wakeup count on a quiet machine.
