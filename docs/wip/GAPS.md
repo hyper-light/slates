@@ -5515,3 +5515,23 @@ On a Linux release build of `faad1562` (A-126, the probe-storm fix and the reply
   on the exit.
 - No test froze a daemon under its anchor. `a_frozen_daemon_is_killed_at_its_heartbeat_lapse_and_restarted` does now
   (gated by `SLATES_TEST_CLI=1`).
+
+### 2026-10-10: a dropped NFSv4 client's purge is owed only in memory (open; the next piece)
+
+- When a client is dropped (lease expiry, `DESTROY_CLIENTID`) or a session destroyed, the shard holding it clears the
+  record durably at once (`Op::NfsClientCleared`, `Op::NfsSessionCleared`). The purge it then owes every owner shard
+  (`STATE_PURGE`, `STATE_PURGE_SESSION`) lives only in memory (`Server::pending_purges`, `take_dropped`,
+  `take_destroyed`).
+- A daemon death between the clear and every owner's acknowledgement leaves the client's opens, locks and delegations
+  on the owners, and its call records. After the restart no shard knows the client: no lease of its can expire, so its
+  byte-range locks can block other clients indefinitely. A destroyed session's leftover records only take room, and go
+  when its client is purged.
+- The window is short while every owner answers (cross-shard calls), and unbounded while one does not (the purge stays
+  queued in memory).
+- **Design, to build next:** the obligation commits with the drop. Each (purge, owner) pair goes into the dropping
+  shard's partition in the same transaction as the clear (`Op::NfsPurgeOwed`), and is settled by `Op::NfsPurgeSettled`
+  when that owner acknowledges. A shard loads its owed purges at boot and sends them before serving. Sessions move
+  between shards (A-76) and each shard journals its own, so each shard owes its own purges; no daemon-wide live set is
+  needed.
+- Proof owed: a kill between the drop and the purge (a fault hook holding the purge), then a restart, and the owner's
+  lock released.
