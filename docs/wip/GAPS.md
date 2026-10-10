@@ -5654,3 +5654,29 @@ On a Linux release build of `faad1562` (A-126, the probe-storm fix and the reply
   - The load stayed 10–45 throughout: idle fleet daemons now park, so 24 test copies load the machine to about 12.
     The failures before ran at 60–117, from other sessions' work. Under that load the fix rests on the model and the
     deterministic tests, not on these runs.
+
+### 2026-10-10: the fleet's timers were never derived from data (A-129 proposed; open)
+
+- **Ada's question:** why is the detection budget 900 ms? The membership horizon is `HEARTBEAT_NS (100 ms) ×
+  (LOCAL_HEALTH_CAP + 1) × (SUSPICION_PERIODS + 1)`. None of the three is measured or ratified (§5 lists neither).
+  §4.8 asks for the horizon from measured round trips. The ratified recovery budget is the only stated requirement in
+  the family.
+- **Evidence the family is inconsistent with it:** after an owner's crash, detection (up to 900 ms) plus the council's
+  death-confirmation window (an election timeout floored at 10 × 100 ms = 1 s) already exceed the 1 s recovery budget
+  before the takeover begins.
+- **The heartbeat's reach:** `HEARTBEAT_NS` is read at 143 sites and `LIVENESS_BUDGET_NS` at 100. It floors the
+  council's election timeout and death-confirmation window, paces the coordinator, renews the owner lease, beats the
+  anchor, and starts and caps two backoffs.
+- **Proposed:** A-129. Every fleet timer is the slowest value that still meets the recovery budget, never faster than
+  the measured paths require. The detection and election shares of the budget are split to minimize the steady message
+  rate. The owner lease becomes per grant. The anchor's liveness budget is the recovery budget less the measured
+  start, and the beat follows from it. Seven pieces, in order, in A-129.
+- **Upstream (hyper-raft), asked for 2026-10-10:**
+  - `Detector::set_detection_budget`;
+  - `least_detection_bound`;
+  - a promise on each direct acknowledgement (`promise_ns`), for the per-grant lease;
+  - `set_condemnation_cost`, already offered by the hyper-raft agent.
+
+  Inbox: `from-slates-20261010-detection-budget-and-lease-api.md`.
+- **What `T = 1 s` costs:** the current timers deliver about 2 s. Honouring 1 s halves a three-node fleet's
+  coordinator period, to about 50 ms. A laptop's idle beat drops from ten a second to about one.
