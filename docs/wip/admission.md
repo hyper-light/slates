@@ -345,6 +345,15 @@ acknowledging placement", §4.2).
    head and never served the volume
    (`docs/bugs/2026-10-07-a-pressure-hold-kept-a-successor-from-serving-a-taken-over-volume.md`;
    `a_pressure_hold_does_not_keep_a_successor_from_serving_a_taken_over_volume`).
+   **Amended 2026-10-09: the hold never exceeds the daemon's unbacked room.** The hold is now the smaller of the
+   shortfall (as above) and the daemon's room — its whole content capacity less its own growth since the first sample —
+   less the host's free memory (`daemon::pressure_hold`). That is the invariant itself: what the daemon can still fill
+   must fit in what the host has free. On a host with no slack at the first sample the hold is the shortfall, as
+   before. On a roomy host, memory other processes take from the slack beyond anything the daemon could fill holds
+   nothing. Before, a 64 MiB daemon refused a 1 MiB create while the host had 92% of its memory free, because another
+   process's swing counted as pressure
+   (`docs/bugs/2026-10-09-the-pressure-hold-counted-other-processes-swings-on-a-roomy-host.md`;
+   `memory_others_take_from_a_roomy_host_is_held_only_where_it_eats_into_the_daemons_room`).
    Still owed in this dimension (not the pressure hold): the finer pressure source (Linux PSI
    `memory.some` where the kernel offers it, over the coarser `MemAvailable`), and the Windows
    job-object memory limit sub-part of §5.4.

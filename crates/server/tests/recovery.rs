@@ -694,13 +694,19 @@ fn an_abandoned_transfer_returns_every_charge_when_replaced() {
   assert_eq!(abandoned_held, Ok(false));
 }
 
-/// Shape: the host memory the pressure test's first daemon reads at its first sample.
-const SAMPLED_AVAILABLE: u64 = 8 << 30;
-/// Shape: how much less the second daemon reads at its own first sample — a process that grew between
-/// two daemons' starts (the fleet test binary grows by its leaked sockets and buffers).
-const GROWN_BETWEEN_STARTS: u64 = 1 << 30;
-/// Shape: a further drop the second daemon reads later, which is real pressure on it.
-const LATER_DROP: u64 = 256 << 20;
+/// Shape: the pressure tests' host has exactly the daemon's whole capacity free at the first sample (no slack beyond
+/// what it could fill, so every drop it did not cause is pressure on it, admission.md §5.5). The parts of that capacity
+/// the tests move the host by, each a fraction of it so they hold on any machine's derived capacity:
+/// how much less the second daemon reads at its own first sample — a process that grew between two daemons' starts
+/// (the fleet test binary grows by its leaked sockets and buffers) — as a divisor of the capacity.
+const GROWN_BETWEEN_STARTS_PARTS: u64 = 4;
+/// Shape: a further drop a daemon reads later, which is real pressure on it, as a divisor of the capacity.
+const LATER_DROP_PARTS: u64 = 8;
+
+/// A pressure test daemon's whole content capacity: what its sampler is first shown as the host's free memory.
+fn pressure_capacity(config: &DaemonConfig) -> u64 {
+  config.reserve_per_shard * u64::from(TEST_SHARDS)
+}
 /// Shape: how long the test waits for a sampler to act — many liveness cadences (one second each).
 const SAMPLER_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
@@ -723,8 +729,9 @@ fn within_sampler_wait(mut done: impl FnMut() -> bool) -> bool {
 }
 
 /// §4.2, admission.md §5.5 (found by the AUD-29-43 churn test's CI failures). Do: start one daemon whose
-/// sampler reads a host's available memory; start a second in the same process that reads 1 GiB less at
-/// its first sample; then let the second read a further 256 MiB less. Expect: neither daemon holds
+/// sampler reads a host's available memory (exactly its capacity, no slack); start a second in the same process that
+/// reads a quarter of the capacity less at its first sample; then let the second read a further eighth less. Expect:
+/// neither daemon holds
 /// anything back for the difference between their starts — each measures pressure from its own first
 /// sample — and the second's later drop is held back across its shards. Before the fix the baseline was
 /// process-wide, fixed by whichever daemon sampled first, so the second daemon withheld the first's
@@ -735,31 +742,39 @@ fn two_daemons_in_one_process_measure_memory_pressure_from_their_own_start() {
   let start = |name: &str| {
     let instance = format!("srv-pressure-{name}-{}", std::process::id());
     let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
+    let capacity = pressure_capacity(&config);
     let segment = anchor_segment(&format!("pressure-{name}"), &profile, &config);
     let daemon = Daemon::start(&profile, config, source_of(&segment)).unwrap();
-    (daemon, segment)
+    (daemon, segment, capacity)
   };
-  let (first, first_segment) = start("first");
+  let (first, first_segment, capacity) = start("first");
+  // The shapes the test moves the host by: the host free at the first sample, the growth between the starts, the
+  // later drop.
+  let (sampled_available, grown_between_starts, later_drop) = (
+    capacity,
+    capacity / GROWN_BETWEEN_STARTS_PARTS,
+    capacity / LATER_DROP_PARTS,
+  );
   // The process's resident memory is pinned too: the hold subtracts the daemon's own resident growth, and a real
   // reading of a test process (both daemons and the harness) moves with whatever else runs, which made this test fail
   // under x86_64 emulation at load 60 (2026-10-05).
   first.inject_resident_memory(SAMPLED_RESIDENT).unwrap();
-  first.inject_available_memory(SAMPLED_AVAILABLE).unwrap();
+  first.inject_available_memory(sampled_available).unwrap();
   let first_sampled =
-    within_sampler_wait(|| first.pressure_baseline() == Ok(Some(SAMPLED_AVAILABLE)));
-  let (second, second_segment) = start("second");
+    within_sampler_wait(|| first.pressure_baseline() == Ok(Some(sampled_available)));
+  let (second, second_segment, _) = start("second");
   second.inject_resident_memory(SAMPLED_RESIDENT).unwrap();
   second
-    .inject_available_memory(SAMPLED_AVAILABLE - GROWN_BETWEEN_STARTS)
+    .inject_available_memory(sampled_available - grown_between_starts)
     .unwrap();
   let second_sampled = within_sampler_wait(|| {
-    second.pressure_baseline() == Ok(Some(SAMPLED_AVAILABLE - GROWN_BETWEEN_STARTS))
+    second.pressure_baseline() == Ok(Some(sampled_available - grown_between_starts))
   });
   let second_hold_at_start = second.pressure_hold();
   second
-    .inject_available_memory(SAMPLED_AVAILABLE - GROWN_BETWEEN_STARTS - LATER_DROP)
+    .inject_available_memory(sampled_available - grown_between_starts - later_drop)
     .unwrap();
-  let per_shard = LATER_DROP / u64::from(TEST_SHARDS);
+  let per_shard = later_drop / u64::from(TEST_SHARDS);
   let pressure_held = within_sampler_wait(|| second.pressure_hold() == Ok(per_shard));
   let first_hold = first.pressure_hold();
   first.stop();
@@ -788,14 +803,15 @@ fn two_daemons_in_one_process_measure_memory_pressure_from_their_own_start() {
 
 /// Shape: the pressure test's daemon's own resident memory at its first sample.
 const SAMPLED_RESIDENT: u64 = 64 << 20;
-/// Shape: the bytes the daemon itself takes after its first sample (content it stored): the host's available memory
-/// falls by them and its own resident memory rises by them.
-const OWN_GROWTH: u64 = 512 << 20;
+/// Shape: the bytes the daemon itself takes after its first sample (content it stored), as a divisor of its capacity:
+/// the host's available memory falls by them and its own resident memory rises by them.
+const OWN_GROWTH_PARTS: u64 = 4;
 
 /// §4.2, admission.md §5.5 (found 2026-10-05 in a 1 GiB container: one volume refused at 244 MB with a hold of 111 MB
 /// per shard for memory the daemon had itself filled). Do: let a daemon's sampler read a host's available memory and
-/// its own resident memory; then let available fall by [`OWN_GROWTH`] while its resident memory rises by the same;
-/// then let available fall a further [`LATER_DROP`] with its resident memory unchanged. Expect: no hold for its own
+/// its own resident memory (the host's free memory exactly the daemon's capacity, no slack); then let available fall by
+/// a quarter of the capacity ([`OWN_GROWTH_PARTS`]) while its resident memory rises by the same; then let available fall
+/// a further eighth ([`LATER_DROP_PARTS`]) with its resident memory unchanged. Expect: no hold for its own
 /// growth (that is committed content, charged already), and the further drop held back across its shards. Before the
 /// fix the hold counted the daemon's own growth as pressure, so every stored byte was charged twice and one volume
 /// reached about half the content capacity.
@@ -804,23 +820,30 @@ fn a_daemons_own_growth_is_not_memory_pressure() {
   let profile = common::machine_profile();
   let instance = format!("srv-pressure-own-{}", std::process::id());
   let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
+  let capacity = pressure_capacity(&config);
+  // The shapes the test moves the host by: the host free at the first sample, the daemon's own growth, the later drop.
+  let (sampled_available, own_growth, later_drop) = (
+    capacity,
+    capacity / OWN_GROWTH_PARTS,
+    capacity / LATER_DROP_PARTS,
+  );
   let segment = anchor_segment("pressure-own", &profile, &config);
   let daemon = Daemon::start(&profile, config, source_of(&segment)).unwrap();
-  daemon.inject_available_memory(SAMPLED_AVAILABLE).unwrap();
+  daemon.inject_available_memory(sampled_available).unwrap();
   daemon.inject_resident_memory(SAMPLED_RESIDENT).unwrap();
-  let sampled = within_sampler_wait(|| daemon.pressure_baseline() == Ok(Some(SAMPLED_AVAILABLE)));
+  let sampled = within_sampler_wait(|| daemon.pressure_baseline() == Ok(Some(sampled_available)));
   daemon
-    .inject_resident_memory(SAMPLED_RESIDENT + OWN_GROWTH)
+    .inject_resident_memory(SAMPLED_RESIDENT + own_growth)
     .unwrap();
   daemon
-    .inject_available_memory(SAMPLED_AVAILABLE - OWN_GROWTH)
+    .inject_available_memory(sampled_available - own_growth)
     .unwrap();
   // Two sampler periods: the hold a wrong reading would set has had its chance to appear.
   let wrongly_held = within_sampler_wait(|| daemon.pressure_hold().is_ok_and(|hold| hold > 0));
   daemon
-    .inject_available_memory(SAMPLED_AVAILABLE - OWN_GROWTH - LATER_DROP)
+    .inject_available_memory(sampled_available - own_growth - later_drop)
     .unwrap();
-  let per_shard = LATER_DROP / u64::from(TEST_SHARDS);
+  let per_shard = later_drop / u64::from(TEST_SHARDS);
   let pressure_held = within_sampler_wait(|| daemon.pressure_hold() == Ok(per_shard));
   let hold = daemon.pressure_hold();
   daemon.stop();
@@ -3237,4 +3260,44 @@ fn a_destroyed_sessions_records_are_purged_and_stay_purged_across_a_restart() {
   );
   second.stop();
   drop(segment);
+}
+
+/// §4.2, admission.md §5.5 (found as the flake of `an_extent_claimed_just_before_a_crash_is_returned_at_the_first_publication`
+/// on a shared host, 2026-10-09: a 64 MiB daemon refused a 1 MiB create `BudgetExceeded { available: 0 }` while the host
+/// reported 92% of its memory free, because another process's swing of a few hundred megabytes below the daemon's
+/// first sample was held back as pressure). Do: start a daemon whose sampler first reads four times its whole capacity
+/// free; let another process take as much as the daemon's capacity (the host still has three times it free); then let
+/// others take more, until the host has half the daemon's capacity free. Expect: the first drop holds nothing — the
+/// host can still back every byte the daemon could fill — and the second holds exactly what the daemon's unfilled room
+/// exceeds the host's free memory by, divided among its shards.
+#[test]
+fn memory_others_take_from_a_roomy_host_is_held_only_where_it_eats_into_the_daemons_room() {
+  let profile = common::machine_profile();
+  let instance = format!("srv-pressure-room-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
+  let capacity = config.reserve_per_shard * u64::from(TEST_SHARDS);
+  let segment = anchor_segment("pressure-room", &profile, &config);
+  let daemon = Daemon::start(&profile, config, source_of(&segment)).unwrap();
+  daemon.inject_resident_memory(SAMPLED_RESIDENT).unwrap();
+  daemon.inject_available_memory(4 * capacity).unwrap();
+  let sampled = within_sampler_wait(|| daemon.pressure_baseline() == Ok(Some(4 * capacity)));
+  daemon.inject_available_memory(3 * capacity).unwrap();
+  // Two sampler periods: a hold the swing would wrongly set has had its chance to appear.
+  let wrongly_held = within_sampler_wait(|| daemon.pressure_hold().is_ok_and(|hold| hold > 0));
+  daemon.inject_available_memory(capacity / 2).unwrap();
+  let per_shard = (capacity / 2) / u64::from(TEST_SHARDS);
+  let held = within_sampler_wait(|| daemon.pressure_hold() == Ok(per_shard));
+  let hold = daemon.pressure_hold();
+  daemon.stop();
+  drop(segment);
+  assert!(sampled, "the daemon took its first sample");
+  assert!(
+    !wrongly_held,
+    "memory others took from the host's slack, beyond anything the daemon could fill, is not held back"
+  );
+  assert!(
+    held,
+    "memory others took from the daemon's own room is held back, divided among its shards: {hold:?} against \
+     {per_shard} a shard"
+  );
 }

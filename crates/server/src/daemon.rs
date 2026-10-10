@@ -3415,6 +3415,26 @@ async fn purge_if_idle() {
   }
 }
 
+/// The pressure hold across a daemon's shards (§4.2, admission.md §5.5), from the host's free memory at the daemon's
+/// first sample (`baseline`) and now (`available`), the daemon's own resident growth since then (`own_growth`), and its
+/// whole content capacity (`capacity`). The invariant it keeps: what the daemon can still fill must fit in what the
+/// host has free, `capacity − filled ≤ available`. So the hold is the smaller of:
+/// - the shortfall: the host's drop below the baseline that the daemon did not cause itself (its own growth is
+///   committed content, charged already: 2026-10-05);
+/// - the daemon's room — its capacity not yet filled — less what the host still has free.
+///
+/// On a host with no slack at the first sample (as much free as the daemon could fill, or less) the second never binds
+/// and the hold is the shortfall, as before. On a roomy host, memory other processes take from the slack beyond
+/// anything the daemon could fill holds nothing: a 64 MiB daemon refused a 1 MiB create while the host had 92% of its
+/// memory free, because another process's swing of a few hundred megabytes counted as pressure (2026-10-09).
+pub(crate) fn pressure_hold(baseline: u64, available: u64, own_growth: u64, capacity: u64) -> u64 {
+  let shortfall = baseline
+    .saturating_sub(available)
+    .saturating_sub(own_growth);
+  let room = capacity.saturating_sub(own_growth);
+  shortfall.min(room.saturating_sub(available))
+}
+
 /// Samples the host's available memory and sets each shard's pressure hold (§4.2; admission.md §5.5),
 /// run on the reap loop's shard at the liveness cadence — the design's "cheap-refresh". The hold is
 /// the host-wide shortfall below the boot baseline, less the daemon's own resident growth since then (that is
@@ -3451,10 +3471,10 @@ fn refresh_pressure_hold() {
   let own_growth = resident
     .zip(resident_baseline)
     .map_or(0, |(now, then)| now.saturating_sub(then));
-  let shortfall = baseline
-    .saturating_sub(available)
-    .saturating_sub(own_growth);
-  let per_shard = shortfall
+  let capacity = state::with_state(|s| s.config.reserve_per_shard)
+    .unwrap_or(0)
+    .saturating_mul(u64::try_from(shards.len()).unwrap_or(u64::MAX));
+  let per_shard = pressure_hold(baseline, available, own_growth, capacity)
     .checked_div(u64::try_from(shards.len().max(1)).unwrap_or(1))
     .unwrap_or(0);
   for shard in shards {
@@ -4102,6 +4122,58 @@ mod limits {
 pub(crate) use tests::{
   audit_daemon, audit_on_shard, audit_on_shard_configured, observe_first, test_profile,
 };
+
+#[cfg(test)]
+mod pressure_tests {
+  use super::pressure_hold;
+
+  /// Shape: a daemon's whole content capacity in the hold's cases.
+  const CAPACITY: u64 = 1 << 30;
+
+  /// admission.md §5.5: with no slack at the first sample (the host had exactly what the daemon could fill), a drop
+  /// the daemon did not cause is held whole, and the daemon's own growth is never held.
+  #[test]
+  fn with_no_slack_a_drop_is_held_whole_and_own_growth_never() {
+    assert_eq!(pressure_hold(CAPACITY, CAPACITY - 100, 0, CAPACITY), 100);
+    assert_eq!(
+      pressure_hold(CAPACITY, CAPACITY - 100, 100, CAPACITY),
+      0,
+      "its own growth"
+    );
+    assert_eq!(
+      pressure_hold(CAPACITY, CAPACITY - 300, 100, CAPACITY),
+      200,
+      "the drop beyond its own growth"
+    );
+  }
+
+  /// admission.md §5.5 (2026-10-09): on a roomy host, memory others take from the slack holds nothing, and holds only
+  /// what eats into the daemon's unfilled room.
+  #[test]
+  fn on_a_roomy_host_only_a_drop_into_the_daemons_room_is_held() {
+    let baseline = 4 * CAPACITY;
+    assert_eq!(
+      pressure_hold(baseline, 3 * CAPACITY, 0, CAPACITY),
+      0,
+      "the slack"
+    );
+    assert_eq!(
+      pressure_hold(baseline, CAPACITY, 0, CAPACITY),
+      0,
+      "exactly its room left"
+    );
+    assert_eq!(
+      pressure_hold(baseline, CAPACITY / 2, 0, CAPACITY),
+      CAPACITY / 2,
+      "half its room taken"
+    );
+    assert_eq!(
+      pressure_hold(baseline, CAPACITY / 4, CAPACITY / 2, CAPACITY),
+      CAPACITY / 4,
+      "a half-filled daemon needs only its other half backed"
+    );
+  }
+}
 
 #[cfg(test)]
 mod tests {

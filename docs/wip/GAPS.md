@@ -5374,8 +5374,25 @@ On a Linux release build of `faad1562` (A-126, the probe-storm fix and the reply
   - the base commit (`caaeba85`) and this change alternated three times showed both modes in both arms;
   - A-113 recorded 123–126 ms at lower load.
   The 1.2 s mode is owed a trace.
-- **Found flaky, pre-existing:** `an_extent_claimed_just_before_a_crash_is_returned_at_the_first_publication`
-  (`crates/server/tests/recovery.rs`) sometimes refuses its post-restart create with `BudgetExceeded { available: 0 }`:
-  - 3 of 6 runs failed at `caaeba85`;
-  - 1 of 6, then 1 of 3, at head.
-  Owed: its cause.
+- **Found flaky, pre-existing, fixed the same day (entry below):**
+  `an_extent_claimed_just_before_a_crash_is_returned_at_the_first_publication` refused its post-restart create with
+  `BudgetExceeded { available: 0 }` (3 of 6 runs at `caaeba85`). The cause was the pressure hold.
+
+### 2026-10-09: the pressure hold counted other processes' memory swings on a roomy host as pressure (fixed; conditions 11 and 12)
+
+- **Found** as the flake above. A 64 MiB daemon refused a 1 MiB create `BudgetExceeded { available: 0 }`: its pressure
+  hold was 50 MiB or more a shard while the host had 92% of its memory free.
+- **Cause** (`docs/bugs/2026-10-09-the-pressure-hold-counted-other-processes-swings-on-a-roomy-host.md`): the hold
+  was the host's drop below the daemon's first sample, less the daemon's own growth. On a busy shared machine another
+  process's swing of hundreds of megabytes held back admission, though the host could still back everything the daemon
+  could fill.
+- **Fixed** (admission.md §5.5, amended): the hold never exceeds the daemon's unfilled room less the host's free memory
+  (`daemon::pressure_hold`). With no slack at the first sample it is the shortfall, as before.
+- **Proven:**
+  - failing first: `memory_others_take_from_a_roomy_host_is_held_only_where_it_eats_into_the_daemons_room`;
+  - two unit tests of the pure hold;
+  - the two earlier pressure tests, now injecting a host with exactly the daemon's capacity free, so they hold at any
+    machine's derived capacity (they injected 8 GiB before);
+  - the pool-crash test, 10 of 10 at load 73.
+- **Owed (sibling):** the hold is divided evenly among the shards, while the content pool lets one shard own more of the
+  capacity.
