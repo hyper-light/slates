@@ -4493,4 +4493,6 @@ the client asks to be kept, and closes with another, so both are recorded.
 - After, a successor restored 7–23 held replies per death that printed. Most were replies whose requests had already
   been consumed, and those are never asked for.
 - A-113's WRITE-burst flow at the same load: longest kill-to-answer about 1.2 s in some runs and 190–270 ms in others,
-  in both the base build and this one, three alternations each. A-113's 123–126 ms was recorded at lower load.
+  in both the base build and this one, three alternations each. The 1.2 s runs are the anchor's crash-loop backoff
+  (A-119): its log says "restarting it in 1000 ms" when kills come faster than the restart bound derived from the start
+  p99, which load raises. A-113's 123–126 ms was recorded at lower load.

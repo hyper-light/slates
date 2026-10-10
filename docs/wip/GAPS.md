@@ -5373,7 +5373,9 @@ On a Linux release build of `faad1562` (A-126, the probe-storm fix and the reply
   - about 1.2 s in some runs and 190–270 ms in others;
   - the base commit (`caaeba85`) and this change alternated three times showed both modes in both arms;
   - A-113 recorded 123–126 ms at lower load.
-  The 1.2 s mode is owed a trace.
+  The 1.2 s mode is the anchor's crash-loop backoff (A-119), confirmed by its log line in those runs ("the daemon is in a
+  crash loop …; restarting it in 1000 ms"). The flow's kills come faster than the restart bound derived from the start
+  p99 allows, and load raises that p99. This is the policy working, not a slower restart.
 - **Found flaky, pre-existing, fixed the same day (entry below):**
   `an_extent_claimed_just_before_a_crash_is_returned_at_the_first_publication` refused its post-restart create with
   `BudgetExceeded { available: 0 }` (3 of 6 runs at `caaeba85`). The cause was the pressure hold.
