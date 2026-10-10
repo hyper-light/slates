@@ -4371,3 +4371,16 @@ Alternated twice at 1 and 16 workers; load average 4.7–8.2.
   directory now see create p99 3.4 ms and read p99 3.9 ms.
 - Owed: at 16 workers `stat`'s p50 rose from 45–58 to 131–137 µs (its p99 is unchanged), with GETATTRs at 91–697 against
   81. The client revalidates more under delegations; not yet traced.
+
+**Follow-up, same day: NFSv4 replies framed in place.** The compound now encodes its results after the record marker
+and RPC header reserved by the server (`compound::serve_into`, `rpc::success_record_head`), which fills them in last
+(`rpc::finish_success_record`). The results are no longer copied to be framed:
+- `reply_record`'s 5.6% is gone;
+- memcpy fell from 16.8% to 10.1% of the daemon's samples on the O_DIRECT reads;
+- the remaining copies are the decrypted chunk's into the read buffer (6.1%, the one a read needs) and the compound's
+  `record` of the READ result (3.7%).
+
+The throughput A/B (three alternations at load 21–28) was swamped by load spikes that landed on the in-place arm's
+rounds: 578, 612 and 908 MiB/s, against 1,714–1,993 MiB/s in its unloaded rounds and 1,576–2,026 MiB/s for HEAD. It is
+landed on the profile and on the copy removed, measured above at about 3.8 µs per 256 KiB reply. A wire test holds the
+in-place framing byte for byte to `reply_record` over 2,000 cases.

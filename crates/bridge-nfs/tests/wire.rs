@@ -5,7 +5,8 @@
 
 use proptest::prelude::*;
 use slates_bridge_nfs::rpc::{
-  AcceptStatus, RpcError, parse_call, read_record, reply_bytes, reply_record, write_record,
+  AcceptStatus, RpcError, finish_success_record, parse_call, read_record, reply_bytes,
+  reply_record, success_record_head, write_record,
 };
 use slates_bridge_nfs::xdr::{XdrError, XdrReader, XdrWriter};
 
@@ -266,6 +267,22 @@ proptest! {
     prop_assert_eq!(
       reply_record(xid, status, &results),
       write_record(&reply_bytes(xid, status, &results))
+    );
+  }
+
+  /// A successful reply encoded after reserved room is framed in place (2026-10-09: the server frames NFSv4 replies
+  /// this way, never copying a READ's data to frame it). Do: append random results to `success_record_head` and frame
+  /// it with `finish_success_record`. Expect: byte for byte `reply_record(xid, Success, results)`.
+  #[test]
+  fn a_reply_framed_in_place_is_the_reply_framed(
+    xid in any::<u32>(),
+    results in prop::collection::vec(any::<u8>(), 0..512),
+  ) {
+    let mut record = success_record_head();
+    record.extend_from_slice(&results);
+    prop_assert_eq!(
+      finish_success_record(xid, record),
+      reply_record(xid, AcceptStatus::Success, &results)
     );
   }
 }

@@ -73,6 +73,13 @@ impl XdrWriter {
     }
   }
 
+  /// A writer appending to `out`, whose bytes are kept: a reply encoded after room its caller reserved in front of it
+  /// (the record marker and RPC header [`crate::rpc::finish_success_record`] fills in), so it is never copied to be
+  /// framed.
+  pub fn continuing(out: Vec<u8>) -> XdrWriter {
+    XdrWriter { out }
+  }
+
   /// Forgets everything written, keeping the buffer for reuse.
   pub fn clear(&mut self) {
     self.out.clear();

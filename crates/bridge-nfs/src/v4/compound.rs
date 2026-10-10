@@ -458,25 +458,38 @@ impl Body {
 /// Serves one `COMPOUND` call's arguments against `server` and `backend`, returning its encoded
 /// `COMPOUND4res`.
 pub async fn serve<B: Backend>(backend: &mut B, args: &[u8], request_bytes: usize) -> Vec<u8> {
+  serve_into(backend, args, request_bytes, Vec::new()).await.0
+}
+
+/// [`serve`], encoding the reply after the bytes already in `out` (the record marker and RPC header a caller reserved,
+/// `crate::rpc::success_record_head`), so the caller frames it in place. Returns the buffer and where in it the
+/// `COMPOUND4res` starts: `out`'s length when the reply was encoded there, zero when it is a buffer of its own (a refusal
+/// before the first operation, or a reply replayed from the slot cache).
+pub async fn serve_into<B: Backend>(
+  backend: &mut B,
+  args: &[u8],
+  request_bytes: usize,
+  out: Vec<u8>,
+) -> (Vec<u8>, usize) {
   let mut reader = XdrReader::new(args);
   let Ok(tag) = reader.opaque(OPAQUE_LIMIT).map(<[u8]>::to_vec) else {
-    return reply(Nfsstat4::Badxdr, &[], 0, &[]);
+    return (reply(Nfsstat4::Badxdr, &[], 0, &[]), 0);
   };
   let Ok(minor) = reader.u32() else {
-    return reply(Nfsstat4::Badxdr, &tag, 0, &[]);
+    return (reply(Nfsstat4::Badxdr, &tag, 0, &[]), 0);
   };
   if !(MINOR_LOWEST..=MINOR_HIGHEST).contains(&minor) {
-    return reply(Nfsstat4::MinorVersMismatch, &tag, 0, &[]);
+    return (reply(Nfsstat4::MinorVersMismatch, &tag, 0, &[]), 0);
   }
   let Ok(count) = reader.u32() else {
-    return reply(Nfsstat4::Badxdr, &tag, 0, &[]);
+    return (reply(Nfsstat4::Badxdr, &tag, 0, &[]), 0);
   };
   let max_operations = match backend.with_v4(|server| server.limits.offer.max_operations) {
     Ok(max_operations) => max_operations,
-    Err(status) => return reply(status, &tag, 0, &[]),
+    Err(status) => return (reply(status, &tag, 0, &[]), 0),
   };
   if count > max_operations {
-    return reply(Nfsstat4::TooManyOps, &tag, 0, &[]);
+    return (reply(Nfsstat4::TooManyOps, &tag, 0, &[]), 0);
   }
   let mut frame = Frame {
     minor,
@@ -489,7 +502,8 @@ pub async fn serve<B: Backend>(backend: &mut B, args: &[u8], request_bytes: usiz
   // The reply's header (status, tag, operation count) is written first and its words filled in at the end, so the
   // results are encoded once, in place: assembling them into a second buffer copied every reply whole (a READ's full
   // transfer among them, 2026-10-08).
-  let mut results = XdrWriter::new();
+  let base = out.len();
+  let mut results = XdrWriter::continuing(out);
   results.u32(Nfsstat4::Ok.wire());
   results.opaque(&tag);
   let count_at = results.len();
@@ -510,7 +524,7 @@ pub async fn serve<B: Backend>(backend: &mut B, args: &[u8], request_bytes: usiz
     let outcome = if index == 0 {
       if opnum == op::SEQUENCE {
         match sequence(backend, &mut reader, (request_bytes, count)) {
-          Ok(SequenceOutcome::Replay(kept)) => return kept,
+          Ok(SequenceOutcome::Replay(kept)) => return (kept, 0),
           Ok(SequenceOutcome::New {
             body,
             sessionid,
@@ -555,7 +569,7 @@ pub async fn serve<B: Backend>(backend: &mut B, args: &[u8], request_bytes: usiz
     }
   }
   backend.finished(last_op, last);
-  results.set_u32_at(0, last.wire());
+  results.set_u32_at(base, last.wire());
   results.set_u32_at(count_at, done);
   let encoded = results.into_bytes();
   if let Some((sessionid, slotid)) = slot {
@@ -563,14 +577,17 @@ pub async fn serve<B: Backend>(backend: &mut B, args: &[u8], request_bytes: usiz
     // server failed rather than promised exactly-once (RFC 8881 §2.10.6.1).
     let cache = limits.is_some_and(|limits| limits.max_cached.is_some());
     if let Err(status) = backend.with_v4(|server| {
-      server
-        .sessions
-        .store_reply(&sessionid, slotid, &encoded, cache)
+      server.sessions.store_reply(
+        &sessionid,
+        slotid,
+        encoded.get(base..).unwrap_or_default(),
+        cache,
+      )
     }) {
-      return reply(status, &tag, 0, &[]);
+      return (reply(status, &tag, 0, &[]), 0);
     }
   }
-  encoded
+  (encoded, base)
 }
 
 /// What a compound must be served with (A-76), read from its first operation without serving it: the session it

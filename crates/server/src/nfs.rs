@@ -1419,11 +1419,21 @@ async fn serve_v4(this: u16, home: u16, call: Call, port: u16) -> (Vec<u8>, Opti
         forwarded_to: None,
       };
       note(NFS4_COMPOUNDS);
-      let results = compound::serve(&mut backend, args, request_bytes).await;
-      (
-        reply_record(xid, AcceptStatus::Success, &results),
-        backend.forwarded_to,
-      )
+      // The reply is encoded after the record's marker and header, reserved here, and framed in place: a READ's data
+      // is never copied to be framed. A reply in a buffer of its own (a refusal before the first operation, a replay)
+      // is framed by copy.
+      let reserved = slates_bridge_nfs::rpc::success_record_head();
+      let (encoded, from) = compound::serve_into(&mut backend, args, request_bytes, reserved).await;
+      let record = if from == slates_bridge_nfs::rpc::SUCCESS_RECORD_HEAD {
+        slates_bridge_nfs::rpc::finish_success_record(xid, encoded)
+      } else {
+        reply_record(
+          xid,
+          AcceptStatus::Success,
+          encoded.get(from..).unwrap_or_default(),
+        )
+      };
+      (record, backend.forwarded_to)
     }
     _ => (reply_record(xid, AcceptStatus::ProcUnavail, &[]), None),
   }

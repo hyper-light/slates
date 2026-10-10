@@ -309,6 +309,38 @@ pub fn reply_record(xid: u32, status: AcceptStatus, results: &[u8]) -> Vec<u8> {
   out
 }
 
+/// Format: the bytes in front of a successful reply's results once framed: the record marker and the accepted reply's
+/// header ([`REPLY_HEADER_BYTES`]).
+pub const SUCCESS_RECORD_HEAD: usize = size_of::<u32>() + REPLY_HEADER_BYTES;
+
+/// A buffer holding [`SUCCESS_RECORD_HEAD`] reserved bytes, for a successful reply's results to be encoded after
+/// ([`crate::xdr::XdrWriter::continuing`]) and framed in place by [`finish_success_record`].
+pub fn success_record_head() -> Vec<u8> {
+  vec![0u8; SUCCESS_RECORD_HEAD]
+}
+
+/// Frames `record` in place: its first [`SUCCESS_RECORD_HEAD`] bytes, reserved by [`success_record_head`], become the
+/// record marker and a successful reply's header for `xid`, and the results already after them are not moved. Byte
+/// for byte `reply_record(xid, AcceptStatus::Success, results)`, which a wire test holds it to. Encoding an NFSv4
+/// reply into a separate buffer and framing it copied a READ's whole transfer once more (5.6% of the daemon's samples
+/// on a Linux NFSv4.2 read, 2026-10-09).
+pub fn finish_success_record(xid: u32, mut record: Vec<u8>) -> Vec<u8> {
+  let message = record.len().saturating_sub(size_of::<u32>());
+  let marker = u32::try_from(message).unwrap_or(u32::MAX) | LAST_FRAGMENT;
+  let mut head = XdrWriter::with_capacity(SUCCESS_RECORD_HEAD);
+  head.u32(marker);
+  head.u32(xid);
+  head.u32(MSG_REPLY);
+  head.u32(REPLY_ACCEPTED);
+  head.u32(AUTH_NONE); // verifier flavor
+  head.opaque(&[]); // empty verifier body
+  head.u32(AcceptStatus::Success.wire());
+  if let Some(slot) = record.get_mut(..SUCCESS_RECORD_HEAD) {
+    slot.copy_from_slice(head.as_slice());
+  }
+  record
+}
+
 /// Parses an RPC call from a message body, returning the header and a reader positioned at the
 /// procedure arguments. Refuses a message that is not a version-2 call.
 pub fn parse_call(body: &[u8]) -> Result<(RpcCall, XdrReader<'_>), RpcError> {
