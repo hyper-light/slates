@@ -216,7 +216,19 @@ Then one `fleet_detector PEER: configured=… suspicions=… (allowance …/1000
 this node's own probes made of that peer, each beside the number the detector's theory expects of a peer
 alive throughout, in thousandths (Chen, Toueg and Aguilera's Theorem 7, summed over every judged probe), and
 whether the pair's own estimator judges it yet. A count far above its allowance is a detector misjudging a live
-peer; a laptop shows none.
+peer; a laptop shows none. Each line also says how the pair is judged now:
+- `judged_by`: `own`, `pool`, `provisional` or `measuring`;
+- `expected_ns`, `margin_ns`, `samples` and `mistake`;
+- `pool_misfit`: whether the member's pooled verdict does not fit the pair;
+- `refused`: why the pair's own estimator last refused to configure.
+
+Then `fleet_detector_pool: configured=… samples=… refused=…` (JSON: `fleet.detector_pool`): the member's pooled verdict,
+which judges every pair without its own. A peer shown `measuring` with the pool unconfigured is judged by nothing until it
+has been silent past RFC 6298's timeout (at least 1 s).
+
+Then `fleet_detector_relays: timeout_ns=… samples=… late=… longest_ns=…` (JSON: `fleet.detector_relays`): the relay
+stage's own timer, RFC 6298's over the relayed round trips the detector measured (late ones included), which no relay
+stage ends before. `late` counts relayed answers that came after their probe's period had ended.
 
 Then one block per shard: its counters (`shard N: clients=… volumes=… served=…`), its refusals by
 kind, its health signals (`shard N catalog.volumes: 3 (age 0 ns)` — a signal that is absent prints

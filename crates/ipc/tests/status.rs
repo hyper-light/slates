@@ -88,6 +88,8 @@ fn report() -> ReplyBody {
           margin_ns: 149,
           samples: 157,
           mistake_milli: 163,
+          pool_misfit: true,
+          refused: "CorrelationUnmeasured".to_owned(),
         }],
         sessions: vec![slates_ipc::protocol::SessionReport {
           peer: 101,
@@ -102,6 +104,19 @@ fn report() -> ReplyBody {
         }],
         detector_granularity_ns: 151,
         served_sessions: Vec::new(),
+        detector_pool: slates_ipc::protocol::DetectorPoolReport {
+          configured: true,
+          samples: 167,
+          refused: "Unavailable".to_owned(),
+          expected_ns: 173,
+          margin_ns: 179,
+        },
+        detector_relays: slates_ipc::protocol::DetectorRelayReport {
+          timeout_ns: 181,
+          samples: 191,
+          late: 193,
+          longest_ns: 197,
+        },
       },
     }),
   }

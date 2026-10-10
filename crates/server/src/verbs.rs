@@ -683,10 +683,49 @@ fn detector_report(state: &ShardState) -> Vec<slates_ipc::protocol::DetectorPeer
           margin_ns: verdict.map_or(0, |verdict| nanos_of(verdict.margin)),
           samples: detector.round_trips_taken(member).unwrap_or(0),
           mistake_milli: verdict.map_or(0, |verdict| thousandths(verdict.mistake)),
+          pool_misfit: report.pool_misfit,
+          refused: report
+            .refused
+            .map(|refusal| format!("{refusal:?}"))
+            .unwrap_or_default(),
         }
       })
     })
     .collect()
+}
+
+/// This shard's failure detector's pooled verdict (live on the control shard, empty elsewhere and on a laptop).
+fn detector_pool_report(state: &ShardState) -> slates_ipc::protocol::DetectorPoolReport {
+  let Some(plane) = state.plane.plane.as_ref() else {
+    return slates_ipc::protocol::DetectorPoolReport::default();
+  };
+  let pool = plane.detector().pool();
+  slates_ipc::protocol::DetectorPoolReport {
+    configured: pool.verdict.is_some(),
+    samples: pool.samples,
+    refused: pool
+      .refused
+      .map(|refusal| format!("{refusal:?}"))
+      .unwrap_or_default(),
+    expected_ns: pool
+      .verdict
+      .map_or(0, |verdict| nanos_of(verdict.round_trip)),
+    margin_ns: pool.verdict.map_or(0, |verdict| nanos_of(verdict.margin)),
+  }
+}
+
+/// This shard's failure detector's relay-stage timer (live on the control shard, empty elsewhere and on a laptop).
+fn detector_relay_report(state: &ShardState) -> slates_ipc::protocol::DetectorRelayReport {
+  let Some(plane) = state.plane.plane.as_ref() else {
+    return slates_ipc::protocol::DetectorRelayReport::default();
+  };
+  let relays = plane.detector().relays();
+  slates_ipc::protocol::DetectorRelayReport {
+    timeout_ns: relays.timeout.map_or(0, nanos_of),
+    samples: relays.samples,
+    late: relays.late,
+    longest_ns: nanos_of(relays.longest),
+  }
 }
 
 /// A duration as whole nanoseconds, saturating.
@@ -2877,6 +2916,8 @@ pub fn shard_report(state: &mut ShardState) -> ShardReport {
     nfs_calls: nfs_calls_of(state),
     detector_granularity_ns: detector_granularity_ns(state),
     served_sessions: state.served_sessions.values().cloned().collect(),
+    detector_pool: detector_pool_report(state),
+    detector_relays: detector_relay_report(state),
   }
 }
 
@@ -2975,6 +3016,14 @@ fn fleet_report(state: &ShardState, shards: &[ShardReport]) -> FleetReport {
     || detector_granularity_ns(state),
     |shard| shard.detector_granularity_ns,
   );
+  let detector_pool = control.map_or_else(
+    || detector_pool_report(state),
+    |shard| shard.detector_pool.clone(),
+  );
+  let detector_relays = control.map_or_else(
+    || detector_relay_report(state),
+    |shard| shard.detector_relays.clone(),
+  );
   let (held_records, takeovers_pending, configuration_version) = control.map_or_else(
     || {
       (
@@ -3019,6 +3068,8 @@ fn fleet_report(state: &ShardState, shards: &[ShardReport]) -> FleetReport {
     sessions,
     detector_granularity_ns,
     served_sessions,
+    detector_pool,
+    detector_relays,
   }
 }
 

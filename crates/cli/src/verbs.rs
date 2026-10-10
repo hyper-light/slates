@@ -1793,7 +1793,7 @@ fn daemon_status_text(report: &DaemonReport, telemetry: &[TelemetryReport]) -> S
   out.push_str(&group_text("root", &report.fleet.root));
   for peer in &report.fleet.detector {
     out.push_str(&format!(
-      "fleet_detector {}: configured={} judged_by={} expected_ns={} margin_ns={} samples={} mistake={}/1000 suspicions={} (allowance {}/1000) condemnations={} (allowance {}/1000)\n",
+      "fleet_detector {}: configured={} judged_by={} expected_ns={} margin_ns={} samples={} mistake={}/1000 suspicions={} (allowance {}/1000) condemnations={} (allowance {}/1000) pool_misfit={} refused={}\n",
       peer.peer,
       peer.configured,
       peer.judged_by,
@@ -1804,9 +1804,21 @@ fn daemon_status_text(report: &DaemonReport, telemetry: &[TelemetryReport]) -> S
       peer.suspicions,
       peer.suspicion_allowance_milli,
       peer.condemnations,
-      peer.condemnation_allowance_milli
+      peer.condemnation_allowance_milli,
+      peer.pool_misfit,
+      peer.refused
     ));
   }
+  let pool = &report.fleet.detector_pool;
+  out.push_str(&format!(
+    "fleet_detector_pool: configured={} samples={} refused={} expected_ns={} margin_ns={}\n",
+    pool.configured, pool.samples, pool.refused, pool.expected_ns, pool.margin_ns
+  ));
+  let relays = &report.fleet.detector_relays;
+  out.push_str(&format!(
+    "fleet_detector_relays: timeout_ns={} samples={} late={} longest_ns={}\n",
+    relays.timeout_ns, relays.samples, relays.late, relays.longest_ns
+  ));
   out.push_str(&format!(
     "fleet_detector_granularity_ns: {}\n",
     report.fleet.detector_granularity_ns

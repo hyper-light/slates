@@ -1042,6 +1042,10 @@ pub struct ShardReport {
   pub detector_granularity_ns: u64,
   /// The sessions peers dialed to this shard, as its serve loops last saw them (live on the control shard). Appended.
   pub served_sessions: Vec<SessionReport>,
+  /// This shard's detector's pooled verdict: live on the control shard, empty elsewhere. Appended.
+  pub detector_pool: DetectorPoolReport,
+  /// This shard's detector's relay-stage timer: live on the control shard, empty elsewhere. Appended.
+  pub detector_relays: DetectorRelayReport,
 }
 
 /// The daemon's place in its fleet (§4.8; §2.6 boot step 6), as the verbs' placement authority sees it.
@@ -1101,6 +1105,12 @@ pub struct FleetReport {
   /// the connections a peer's forwards and reads ride, whose sender here is this node (`sessions` are the ones this
   /// node dialed). Empty on a laptop. Appended.
   pub served_sessions: Vec<SessionReport>,
+  /// The control shard's failure detector's pooled verdict: whether it configured, on how many round trips, and why it
+  /// last refused. Empty on a laptop. Appended.
+  pub detector_pool: DetectorPoolReport,
+  /// The control shard's failure detector's relay-stage timer: its timeout, and how many relayed answers came late.
+  /// Empty on a laptop. Appended.
+  pub detector_relays: DetectorRelayReport,
 }
 
 impl RequestBody {
@@ -1286,6 +1296,46 @@ pub struct DetectorPeerReport {
   /// The judging verdict's mistake bound in thousandths: 1000 for a provisional verdict (no Theorem 7 bound), the
   /// configured β otherwise; zero while measuring. Appended.
   pub mistake_milli: u64,
+  /// Whether the member's pooled verdict does not fit the pair (hyper-swim's `misfits_pool`): its round trips do not feed
+  /// the pool, and before its own estimator configures it is judged provisionally by its own round trip (while the pool
+  /// has no verdict, only once it has been silent past RFC 6298's timeout). Appended.
+  pub pool_misfit: bool,
+  /// Why the pair's own estimator last refused to configure (hyper-timing's `Refusal`), empty once it configured or
+  /// before it tried. Appended.
+  pub refused: String,
+}
+
+/// The relay stage as the member's failure detector timed it (hyper-swim's `RelayReport`): RFC 6298's timer over the
+/// relayed round trips it measured, late ones included, which no relay stage ends before. A relay-reachable peer
+/// condemned under load says here whether its relayed answers were late, and by how much.
+#[derive(Wire, Clone, Debug, Default, PartialEq, Eq)]
+pub struct DetectorRelayReport {
+  /// The relay stage's measured timeout, nanoseconds (zero before a relayed round trip was measured).
+  pub timeout_ns: u64,
+  /// Relayed round trips measured: the first relayed answer to each relay stage.
+  pub samples: u64,
+  /// Of them, answers that came after their probe's period had ended.
+  pub late: u64,
+  /// The longest measured, nanoseconds.
+  pub longest_ns: u64,
+}
+
+/// The member's pooled verdict as its failure detector holds it (hyper-swim's `PoolReport`): what judges every pair that
+/// has no verdict of its own and fits the pool, so a peer shown `measuring` says whether the pool never configured,
+/// and why.
+#[derive(Wire, Clone, Debug, Default, PartialEq, Eq)]
+pub struct DetectorPoolReport {
+  /// Whether the pool has a verdict (it keeps one once configured).
+  pub configured: bool,
+  /// The round trips the pool took.
+  pub samples: u64,
+  /// Why the pool's latest configuration refused (hyper-timing's `Refusal`), empty after one succeeded or before any
+  /// was tried.
+  pub refused: String,
+  /// The pool's verdict's expected arrival of an answer, nanoseconds (zero before configured).
+  pub expected_ns: u64,
+  /// The pool's verdict's margin, nanoseconds (zero before configured).
+  pub margin_ns: u64,
 }
 
 /// The takeover state a council holds (§4.8 "Neighbourhood changes", "Promotion and takeover"): this node's

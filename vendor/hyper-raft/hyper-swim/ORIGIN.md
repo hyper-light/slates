@@ -211,3 +211,93 @@ Not yet in `../hyper-raft`; handed to the owner through the inbox with the perio
   explains the answer.
 - **Test.** `an_answer_no_probe_explains_marks_no_misfit_and_a_silent_peer_is_suspected` fails before and passes
   after; 80/80. The fleet test passed 16 of 16 after the change.
+
+## Local patch in slates, pending upstream (2026-10-10): a pair silent past RFC 6298's timeout is judged while the pool has no verdict
+
+Not yet in `../hyper-raft`; handed to the owner through the inbox.
+
+- **What was wrong.** While the pool had no verdict, `judging` gave a pair without its own verdict none either. That
+  holds for a misfit pair (its provisional verdict needed the pool's) and for any other (it was judged by the pool),
+  so its probes were measurement only, and the design expected the pool to configure "within a few dozen round
+  trips". Nothing guaranteed it would.
+  - The pool is fed only by the pairs it fits, so when every pair is misfit it is never fed.
+  - A peer that went silent before its own estimator configured gave no more samples, so it was measured for ever and
+    never suspected.
+- **Found in slates.** A three-member fleet at load 80, one run in about 20.
+  - A stall made each of a member's two pairs a misfit (an answer after three later probes reused its record), so its
+    pool took 5 round trips and refused (`CorrelationUnmeasured`).
+  - One pair's own estimator had 141 samples and also refused for correlation. That peer then stopped answering, and
+    for 4,000 coordinator periods it was judged by nothing: 0 suspicions, no relay asked.
+- **The change.** While the pool has no verdict, a pair without its own verdict is judged provisionally once it has
+  been silent, from its earliest probe still unanswered (`Peer::silent_since_ns`, cleared by any answer, direct or
+  relayed), for the whole of that verdict's deadline (`silent_verdict`).
+  - The deadline is RFC 6298's timeout from the pair's latest round trip `R`: `3R` (§2.2), rounded up to the RFC's
+    1 s minimum (§2.4, `MINIMUM_RTO_NS`). With no round trip, it is the first-contact `R`, so 1 s.
+  - Where the pool has a verdict, its margin floors provisional deadlines as before. Without it, nothing has measured
+    the host's stalls, which is the case the RFC's conservative minimum is for.
+  - The verdict claims no bound (`mistake` 1). With no loss measured, it asks one relay.
+  - Before a pair's silence reaches the deadline, its probes are measurement only as before, so the start-up
+    measurement phase is unchanged for pairs that answer.
+- **Rejected first form.** Judging every pair provisionally whenever the pool had no verdict failed 25 of the 81
+  tests. It turned the whole measurement phase into judged periods of at least 1 s, which also changed when periods
+  ended and when estimators configured.
+- **Diagnostics.**
+  - `PeerReport` gains `pool_misfit` and `refused` (why the pair's estimator last refused).
+  - `Detector::pool()` returns a `PoolReport`: the verdict, the round trips taken, and why its latest configuration
+    refused (`Stream::refused`).
+  - slates reports both in `status`; that is how the cause above was found.
+- **Tests.**
+  - `a_silent_peer_is_condemned_when_every_pair_is_misfit_and_the_pool_never_configured` fails before (alive after
+    600 s simulated, verdict `None`, `refused: CorrelationUnmeasured`) and passes after.
+  - `nothing_is_judged_before_the_estimates_exist` is restated at the boundary. Before 1 s of silence, and while the
+    pool has none, there is no verdict and no suspicion; past it there is a provisional verdict at 1 s.
+  - Its old form asserted no verdict after 40 periods (1.07 s). That held only because the pool had not configured
+    yet: unpatched, it configures at 56 round trips (1.19 s) and the silent peer is condemned by 5.3 s.
+  - 81 of 81 pass. The shared workspace's sim harness (`tests/sim.rs`) has not run against this change.
+
+## Local patch in slates, pending upstream (2026-10-10): the relay stage is timed by its own measured round trips
+
+Not yet in `../hyper-raft`; handed to the owner through the inbox with the patch above.
+
+- **What was wrong.** The relay stage's deadline was the slowest relay's span plus the target's. Both come from
+  direct-path verdicts, and a target whose direct path was lost keeps the verdict it had then, since no direct answer
+  renews it. The detector times every other probe stream from its own samples, but never this one, and it dropped
+  every relayed answer that came after its probe's period.
+- **Found in slates.** A three-member fleet at load 100. B was deaf to A only, so A reached B only through C.
+  - A's verdict for B dated from before the loss: expected 250 µs, margin 125 µs, mistake bound 0.713.
+  - The relay stage gave about 1 ms; the period floor (900 ms budget, two members watched) gave 128 ms.
+  - All 37 relay requests were answered. Two answers came after their periods ended, and each made a suspicion.
+  - Each told probe's relays were late too, so each suspicion became a condemnation of a live member: 2 of each, in
+    3 of 48 runs.
+- **The change.** `RelayTimer` is RFC 6298's estimator over relayed round trips: from the relay request to the first
+  relayed answer, late ones included.
+  - `SRTT` and `RTTVAR` follow §2.2 and §2.3, with `α = 1/8` and `β = 1/4`.
+  - The timeout is `SRTT + max(G, 4·RTTVAR)`, with the member's granularity as `G`.
+  - Relayed probes come only when direct ones go unanswered, not at an interval, so they are a sporadic sample stream.
+    That is TCP's case, not the heartbeat estimators'.
+  - `request_indirect` waits at least that timeout once a relayed round trip has been measured.
+  - A sample taken while the period's probe still awaits its relays lengthens that wait (`lengthen_relay_wait`). The
+    burst that made one answer late also delays the told probe's relays, which the timeout from before the burst would
+    judge.
+  - The last `OUTSTANDING` relay stages are remembered (`RelayAsked`), so a late answer is still timed. Only the first
+    relayed answer to a stage is a sample.
+  - `period_bound` counts the relay wait as the longer of two spans and the measured timeout, so the stated detection
+    bound includes it.
+  - `Detector::relays()` returns a `RelayReport`: the timeout, samples, late answers and the longest.
+- **Test.** `a_peer_answering_only_through_a_slow_relay_is_never_condemned`, under a 900 ms budget:
+  - setup: no direct answers from A; relayed answers 150 to 160 ms after each request; refutations 500 ms after each
+    suspicion;
+  - before: condemned 491 ms in (with the timer disabled in a scratch copy);
+  - after: not condemned in 60 s simulated.
+- **Sweep, after.**
+  - Relayed latency 20, 150 and 400 ms, spread 1, 10 and 100 ms, four seeds each.
+  - 20 and 150 ms: 0 condemnations in every case, with 0 to 4 late answers in about 170 to 244.
+  - 400 ms: 1 condemnation, with no relayed round trip measured yet. The told probe resolves (about 330 ms in) before
+    the first relayed answer could arrive.
+  - That cold case is a limit of judging a path before it is measured. Waiting RFC 6298's initial 1 s there would
+    slow a crashed member's detection past slates' 900 ms budget, so it is left as is and reported.
+- **Counts.** 82 of 82 pass.
+- **In slates' fleet** (with the patch above):
+  - the relay test: 0 failures in 84 runs (48 at load 60–67, 36 beside other fleet tests at load 10–45), against 3 hold
+    failures in 48 with the first patch alone, at load 90–106;
+  - the full fleet suite: 85 of 85.
