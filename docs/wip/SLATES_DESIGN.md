@@ -10912,7 +10912,7 @@ Status: built 2026-10-09.
   - The WRITE-burst and commit-oracle flows of A-113 pass unchanged.
 - Format: image version 19 and delta version 4; earlier images and logs are refused by version, as before.
 
-### A-129 — The fleet's timers are derived from the recovery budget and the measured paths (proposed 2026-10-10)
+### A-129 — The fleet's timers are derived from the operator's failover SLO and the measured paths (proposed 2026-10-10)
 Applied in pieces, each with its regression and the fleet suite; this entry gains each piece's "applied to" list as it
 lands.
 
@@ -10930,14 +10930,23 @@ Status: proposed 2026-10-10.
 - **The same heartbeat floors the council.** Its election timeout is 10 × max(tail, heartbeat) = 1 s, and that timeout
   is also the death-confirmation window. The horizon (nine periods) feeds hyper-swim's period floor (A-125), the owner
   lease, the holder gate and two backoff caps. `HEARTBEAT_NS` is read at 143 sites.
-- **Consequence.** Recovery after an owner's crash is detection (up to 900 ms), then confirmation (at least 1 s), then
-  the takeover: about 2 s or more, against the ratified recovery budget of 1 s. The timers were never derived from the
-  budget they serve.
-- **The principle.** Every fleet timer is the slowest value that still meets the operator's recovery budget `T`, and
-  never faster than the measured paths require.
-  - `T` is the one stated requirement: ratified default 1 s (GAPS §5). The deployment manifest carries the operator's
-    value, the same on every node.
-  - Measurements set the floors. `T` sets the ceiling, and so the tempo: a tighter budget costs wakeups, a looser one
+- **Consequence.** The failover delay after an owner's crash is detection (up to 900 ms) plus confirmation (at least
+  1 s): about 2 s, then the takeover itself. The timers were never derived from the requirement they serve.
+- **Which requirement.** §4.4 states it: "Lease term = k × measured renewal RTT p99 with k chosen so that the failover
+  delay (one term) stays under the operator's failover SLO".
+  - The **failover SLO** `F` bounds the failover delay: detection plus confirmation, until a successor may be
+    promoted. Its default, `config::FAILOVER_SLO_NS`, is 10 s, a placeholder "until the operator gives `slates anchor`
+    a value", and unratified (§5 does not list it). It also sets the landing lease term and the NFSv4 lease.
+  - The **recovery budget** `T` (1 s, ratified, GAPS §5) bounds the takeover's own work: replay, rebuild, the
+    takeover time D-14 measures against it.
+  - Correction, same day: the first form of this entry measured the failover delay against `T` and called the
+    current timers infeasible. That was wrong: about 2 s is well inside `F`. What is wrong is that neither the timers
+    nor `F`'s default is derived or ratified.
+- **The principle.** Every failover timer is the slowest value that still meets the failover SLO `F`, and never faster
+  than the measured paths require.
+  - `F` is the stated requirement. The deployment manifest carries the operator's value, the same on every node. Its
+    default needs Ada's ratification: 10 s would slow failover from about 2 s to up to 10 s, where the battery gains.
+  - Measurements set the floors. `F` sets the ceiling, and so the tempo: a tighter SLO costs wakeups, a looser one
     saves battery.
 - **The chain.** Each value is re-derived every coordinator period from the latest measurements and logged with its
   inputs.
@@ -10946,11 +10955,11 @@ Status: proposed 2026-10-10.
      ten times per election timeout, today's ratio. There is no heartbeat floor; the period follows `E`, not the
      reverse.
   2. **The death-confirmation window** `W = E`: a death outlasts one election timeout, as now.
-  3. **The detection budget** `D = T − W − the measured takeover cost` (phase one over the recovery cohort, then the
-     rebuild; zero until measured, then the measured tail). hyper-swim's period floor follows `D` (A-125).
-  4. **The split** of `T − takeover` between `D` and `E` minimizes the fleet's steady message rate.
+  3. **The detection budget** `D = F − W`. hyper-swim's period floor follows `D` (A-125). The takeover that follows is
+     measured against the recovery budget `T`, not charged to `F`.
+  4. **The split** of `F` between `D` and `E` minimizes the fleet's steady message rate.
      - Let `c_D` be the detector's messages per detection window and `c_E` the coordinator's per election timeout,
-       both counted. The rate `c_D/D + c_E/E` under `D + E = T − takeover` is least at `D/E = √(c_D/c_E)`.
+       both counted. The rate `c_D/D + c_E/E` under `D + E = F` is least at `D/E = √(c_D/c_E)`.
      - Each then rises to its floor: `E` to Raft's, `D` to the least detection bound the detector's measured deadlines
        support.
      - Where the floors exceed the budget, the fleet runs at the floors and reports the overrun as a health signal:
@@ -10962,7 +10971,7 @@ Status: proposed 2026-10-10.
      - This is safe under any per-node `D`. Until it lands, nodes must share one horizon, which keeps the current
        horizon in place.
   6. **The supervision pair.** The anchor's liveness budget is `L = T − the anchor's measured longest daemon start`,
-     so a hung daemon is restarted within `T`. The daemon beats the anchor every `L − the control shard's measured
+     so a hung daemon is restarted within the recovery budget `T` (a warm restart is recovery work, not a failover). The daemon beats the anchor every `L − the control shard's measured
      scheduler stall tail` (`scheduler_overrun_ns`), so a healthy daemon's beat lands within `L`. On a laptop that is
      about one beat a second instead of ten.
   7. **The backoffs.** The discovery-page and uninitialized-learner backoffs cap at `D` and start from `h`.
@@ -10971,11 +10980,11 @@ Status: proposed 2026-10-10.
   (`W`), and the remaining loops reviewed one by one.
 - **Laptop (R8).** With no voters and no detector peers, `c_D = c_E = 0` and `D` and `E` degenerate in the same code.
   Only the beat (6) and the local loops remain.
-- **What `T = 1 s` costs.** The current timers deliver about 2 s. At `T = 1 s` the split gives a three-node fleet
-  `D ≈ E ≈ 0.5 s`, so `h ≈ 50 ms`: the coordinator ticks twice as often as today. At `T = 2 s` the tempo is about
-  today's. The ratified default stands until Ada restates it.
+- **What `F` costs.** The current timers deliver about 2 s. At `F = 2 s` the split gives a three-node fleet
+  `D ≈ E ≈ 1 s` and `h ≈ 100 ms`, about today's tempo. At the 10 s placeholder the coordinator would tick about every
+  half second. `F`'s default is Ada's to ratify.
 - **Pieces, in order:**
-  1. `T` as the operator's input (manifest and CLI), the same on every node.
+  1. `F` and `T` as the operator's inputs (manifest and CLI), the same on every node, once `F`'s default is ratified.
   2. The supervision pair (6), decoupled from the coordinator period.
   3. The council (1–2) and the split (4); the coordinator's cadences follow `h`.
   4. `D` (3), through hyper-swim's `set_detection_budget` and `least_detection_bound`, requested upstream 2026-10-10.

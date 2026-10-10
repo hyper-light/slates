@@ -5659,11 +5659,14 @@ On a Linux release build of `faad1562` (A-126, the probe-storm fix and the reply
 
 - **Ada's question:** why is the detection budget 900 ms? The membership horizon is `HEARTBEAT_NS (100 ms) ×
   (LOCAL_HEALTH_CAP + 1) × (SUSPICION_PERIODS + 1)`. None of the three is measured or ratified (§5 lists neither).
-  §4.8 asks for the horizon from measured round trips. The ratified recovery budget is the only stated requirement in
-  the family.
-- **Evidence the family is inconsistent with it:** after an owner's crash, detection (up to 900 ms) plus the council's
-  death-confirmation window (an election timeout floored at 10 × 100 ms = 1 s) already exceed the 1 s recovery budget
-  before the takeover begins.
+  §4.8 asks for the horizon from measured round trips.
+- **The governing requirement** is the operator's failover SLO (§4.4: "Lease term = k × measured renewal RTT p99 with
+  k chosen so that the failover delay (one term) stays under the operator's failover SLO"). Its default,
+  `FAILOVER_SLO_NS` = 10 s, is a placeholder "until the operator gives `slates anchor` a value" and is also
+  unratified. The ratified recovery budget (1 s) bounds the takeover's work, not the failover delay.
+- **Correction, same day:** this entry's first form said detection plus confirmation (about 2 s) already exceed "the
+  1 s recovery budget". That compared against the wrong requirement. About 2 s is inside the failover SLO; the defect
+  is that nothing in the family, the SLO's default included, is derived or ratified.
 - **The heartbeat's reach:** `HEARTBEAT_NS` is read at 143 sites and `LIVENESS_BUDGET_NS` at 100. It floors the
   council's election timeout and death-confirmation window, paces the coordinator, renews the owner lease, beats the
   anchor, and starts and caps two backoffs.
@@ -5678,5 +5681,7 @@ On a Linux release build of `faad1562` (A-126, the probe-storm fix and the reply
   - `set_condemnation_cost`, already offered by the hyper-raft agent.
 
   Inbox: `from-slates-20261010-detection-budget-and-lease-api.md`.
-- **What `T = 1 s` costs:** the current timers deliver about 2 s. Honouring 1 s halves a three-node fleet's
-  coordinator period, to about 50 ms. A laptop's idle beat drops from ten a second to about one.
+- **What the failover SLO's default decides:** at `F = 2 s` the derived tempo is about today's (coordinator period
+  about 100 ms in a three-node fleet). At the 10 s placeholder, failover could take up to 10 s, with fewer wakeups. A
+  laptop's idle beat, derived from the recovery budget less the measured start, drops from ten a second to about one
+  either way. `F`'s default is Ada's to ratify.
