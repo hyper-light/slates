@@ -5416,3 +5416,15 @@ On a Linux release build of `faad1562` (A-126, the probe-storm fix and the reply
   `fleet::direct_contact_reason`). The next occurrence names which side dropped the other and why.
 - Nothing in this day's changes touches session formation or the contact rule: A-127 and A-128 are NFS state and its
   records, and the pressure hold is admission.
+
+### 2026-10-09: a refused admission claimed the whole content pool (fixed)
+
+- **Found** reading the pool (A-98) beside the pressure hold. Two shards with a 32 MiB slice each. A create of 96 MiB on
+  shard 1 was refused, as it should be, but it had claimed every free extent first. An 8 MiB create on shard 0 was then
+  refused `BudgetExceeded { available: 0 }`. An idle shard returns extents only after its next publication, so the
+  starvation lasted until shard 1 mutated again.
+- **Fixed:** `ChunkArena::make_room` takes all of the deficit or nothing, and gives back a race's partial claim.
+  `Store::reserve` and `Store::grow` refusals name `Store::admittable`.
+  - Tests, failing first: `a_refused_admission_leaves_the_pool_to_the_other_shards`,
+    `making_room_the_pool_cannot_cover_claims_nothing`, `room_another_arena_took_first_returns_what_was_claimed`.
+  - Bug doc: `docs/bugs/2026-10-09-a-refused-admission-claimed-the-whole-pool.md`.
