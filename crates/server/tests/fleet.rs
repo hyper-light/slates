@@ -6151,17 +6151,21 @@ fn assert_fleet_forms(daemons: &[Daemon], _hosts: &[HostId], names: &[&str]) {
   // (the period budget ran out: a genuine non-convergence) or frozen (no progress: a wedge), and which
   // sessions never formed. The 2026-09-14 formation failure under load carried only "sees members",
   // which could not distinguish the two (`docs/bugs/2026-09-14-handshake-retry-forgets-its-flight.md`).
+  // Each node's contact reason per peer comes last: on 2026-10-09 a pair formed no session in either direction for
+  // 4,000 periods, one side counting itself meshed without the other, and the report could not say which side dropped
+  // the other or why.
   let report: Vec<String> = daemons
     .iter()
     .enumerate()
     .map(|(i, daemon)| {
       format!(
-        "{}: meshed={:?} members={:?} formed_probe_peers={:?} periods={}",
+        "{}: meshed={:?} members={:?} formed_probe_peers={:?} periods={} contacts={:?}",
         names[i],
         daemon.fleet_meshed(),
         daemon.fleet_members(),
         daemon.fleet_formed_probe_peers(),
-        daemon.fleet_progress()
+        daemon.fleet_progress(),
+        daemon.fleet_contacts()
       )
     })
     .collect();

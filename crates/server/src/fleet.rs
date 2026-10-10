@@ -3900,6 +3900,14 @@ pub(crate) fn keeps_direct_contact_with(state: &ShardState, peer: HostId) -> boo
   direct_contact(state, peer).kept()
 }
 
+/// Why this node keeps or drops direct contact with `peer` ([`keeps_direct_contact_with`]'s rule), named: what a
+/// formation failure's report shows for each peer, so a pair that never meshes says which side dropped the other and
+/// why (2026-10-09: a pair formed no probe session in either direction for 4,000 periods under load, one side counting
+/// itself meshed without the other).
+pub(crate) fn direct_contact_reason(state: &ShardState, peer: HostId) -> String {
+  format!("{:?}", direct_contact(state, peer))
+}
+
 /// Why this node keeps, or drops, direct contact with a peer — the one rule behind
 /// [`keeps_direct_contact_with`], with its reason, so a probe task's idle and resume transitions can be
 /// logged by cause.

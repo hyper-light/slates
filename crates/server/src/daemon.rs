@@ -1221,6 +1221,21 @@ impl Daemon {
     })
   }
 
+  /// Why this node keeps or drops direct contact with each other member it holds (`fleet::keeps_direct_contact_with`'s
+  /// rule, named per peer): for a formation failure's report, so a pair that never meshes says which side dropped the
+  /// other and why.
+  pub fn fleet_contacts(&self) -> Result<Vec<(slates_db::HostId, String)>, ObserveError> {
+    self.observe(self.shards.first().copied(), |s| {
+      let host = s.fleet.host();
+      s.fleet
+        .members()
+        .iter()
+        .filter(|&&peer| peer != host)
+        .map(|&peer| (peer, crate::fleet::direct_contact_reason(s, peer)))
+        .collect()
+    })
+  }
+
   /// Whether this daemon's fleet has formed its **direct probe mesh** (§4.8): every peer this node keeps
   /// direct contact with — its record neighbourhood and its council and root voters
   /// (`fleet::keeps_direct_contact_with`) — has a live probe session: the handshake completed and the peer

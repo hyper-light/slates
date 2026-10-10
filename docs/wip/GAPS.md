@@ -5398,3 +5398,21 @@ On a Linux release build of `faad1562` (A-126, the probe-storm fix and the reply
   - the pool-crash test, 10 of 10 at load 73.
 - **Owed (sibling):** the hold is divided evenly among the shards, while the content pool lets one shard own more of the
   capacity.
+
+### 2026-10-09: a fleet pair formed no probe session in either direction under suite-wide load (open; diagnostics added)
+
+- **Observed:** one failure in the full fleet suite (84 of 85 passed, 833 s, load 73–82 from other sessions):
+  `a_cross_region_client_finds_the_copyset_successor_instead_of_an_unrelated_live_peer`.
+  - Node d did not mesh within the formation budget (4,032 periods).
+  - The report's formed-peer lists show that one pair, a and d (ids 6473… and 11613…), formed no probe session in
+    either direction. Every other pair formed.
+  - a still reported itself meshed, so a was not counting d among the peers it keeps direct contact with. d was
+    counting a.
+  - Run alone, the test passes (2 of 2, 5–6 s).
+- **Not explained yet:** the direct-contact rule (`fleet::direct_contact`) drops a peer only as `BelievedDead` or
+  `OutsideNeighbourhood`. Neighbourhoods are computed per node, so the relation can be asymmetric while they settle. The
+  report did not say which reason a held for d.
+- **Added:** each node's contact reason per peer in the formation failure report (`Daemon::fleet_contacts`,
+  `fleet::direct_contact_reason`). The next occurrence names which side dropped the other and why.
+- Nothing in this day's changes touches session formation or the contact rule: A-127 and A-128 are NFS state and its
+  records, and the pressure hold is admission.
