@@ -5471,3 +5471,17 @@ On a Linux release build of `faad1562` (A-126, the probe-storm fix and the reply
   `docs/bugs/2026-10-10-a-node-alone-answered-an-unknown-id-owner-unreachable.md`.
 - **Open:** in a fleet, an id whose creator is no member, live or retired, still waits out a location round before
   `OwnerUnreachable`; `NotFound` may be decidable there from the retirement records.
+
+### 2026-10-10: zero counts stood in the status counter map, and gated CLI flows encoded old rules (fixed)
+
+- `ShardState::count` inserted an entry for an increment of zero. Each boot's zero restores (`nfs4.replay.restored`)
+  and each idle tick's zero purges (`content.purged_bytes`) stood in the map as events that never happened. The CLI's
+  fleet formation check (`a_terminated_council_leader_process_hands_off_before_it_exits`) reads that map and failed on
+  them. Adding zero now changes nothing.
+- The formation check's allow-list predated five event counters of formation's normal work: discovery pages, learner
+  fetches and paced fetches, and announcement lends and sends. They are allowed, named.
+- `three_daemon_processes_deploy_a_fleet_from_one_manifest_and_survive_the_owners_death` still asserted the
+  pre-2026-10-07 lookup rule: `NotFound` on a holder, and the successor taken as the first node whose `stat` answered.
+  Both now ask each node's own listing. Passes in 5.2 s; no NFS mount is left behind.
+- All of these flows run only with `SLATES_TEST_CLI=1`. Rerun locally 2026-10-10: the anchor, signal-drain, restart,
+  bootstrap, JSON, profile, run, inherited-socket, fleet-deploy and core-dump flows, and `nfs_held`, all pass.

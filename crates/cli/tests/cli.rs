@@ -2347,6 +2347,15 @@ fn assert_formed(views: &[Option<FleetView>]) -> Vec<String> {
             "fleet.accept.replaced:",
             "fleet.fan.sent:",
             "fleet.fan.unchanged:",
+            // Events of formation's normal work, added to the map since this list was last kept (2026-10-10): the
+            // discovery pages sent, the learner's configuration fetches and those its backoff skipped, the
+            // announcement pass's lent sessions and sends, and the idle purge's freed bytes.
+            "fleet.discovery.pages:",
+            "fleet.learner.fetches:",
+            "fleet.learner.fetch_paced:",
+            "fleet.plane.announce_lends:",
+            "fleet.plane.announcements_sent:",
+            "content.purged_bytes:",
           ]
           .iter()
           .any(|counter| line.split_whitespace().nth(3) == Some(counter))
@@ -2444,13 +2453,20 @@ fn wait_placed(instance: &str, id: &str, snapshot: &str) {
   }
 }
 
-/// Before the owner dies its peers hold the head as candidates but serve no such volume: `volume stat`
-/// refuses on both — the transition the takeover makes is then observable, not vacuous.
+/// Before the owner dies its peers hold the head as candidates but own no such volume: neither lists it among its own
+/// volumes, while a `volume stat` there is answered by the owner itself (a lookup by id reaches the volume's creator
+/// from any node of its region, §4.8 "Lookup", since 2026-10-07). The transition the takeover makes is then observable,
+/// not vacuous. Until 2026-10-10 this asserted the old rule (`NotFound` on a holder) and failed under the new one.
 fn assert_not_served(instances: &[String], id: &str) {
   for instance in instances {
+    let (code, out, err) = run(instance, &["volume", "list"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(
+      !out.contains(id),
+      "a holder does not own the owner's volume: {out}"
+    );
     let (code, _, err) = run(instance, &["volume", "stat", id]);
-    assert_eq!(code, 1, "a holder does not serve the owner's volume: {err}");
-    assert!(err.contains("NotFound"), "{err}");
+    assert_eq!(code, 0, "a holder's stat reaches the owner: {err}");
   }
 }
 
@@ -2480,6 +2496,12 @@ fn wait_successor(instances: &[String], id: &str) -> String {
   let deadline = Instant::now() + FLEET_WAIT;
   loop {
     for instance in instances {
+      // The successor is the survivor that owns the volume: it lists it among its own. A `volume stat` alone answers on
+      // every node of the region once any owns it (a lookup by id reaches the owner, §4.8), so it cannot name which.
+      let (code, listed, _) = run(instance, &["volume", "list"]);
+      if code != 0 || !listed.contains(id) {
+        continue;
+      }
       let (code, out, _) = run(instance, &["volume", "stat", id]);
       if code == 0 {
         assert_eq!(value_of(&out, "name"), FLEET_VOLUME);

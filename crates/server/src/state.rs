@@ -909,8 +909,14 @@ impl std::fmt::Debug for PendingForward {
 }
 
 impl ShardState {
-  /// Adds `by` to the count of refusal or event `kind`, saturating (a count never wraps to a small number).
+  /// Adds `by` to the count of refusal or event `kind`, saturating (a count never wraps to a small number). Adding zero
+  /// changes nothing: an entry stands in the status report's counter map only once something happened (2026-10-10: a
+  /// boot's zero restores and an idle tick's zero purges stood there as events, and a formation check that reads the
+  /// map failed on them).
   pub(crate) fn count(&mut self, kind: &'static str, by: u64) {
+    if by == 0 {
+      return;
+    }
     let count = self.refusals.entry(kind).or_insert(0);
     *count = count.saturating_add(by);
   }
