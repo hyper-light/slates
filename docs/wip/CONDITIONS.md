@@ -12,7 +12,7 @@ A status is a reviewed judgement:
 - **failing**: measured not to meet the condition.
 
 Every limit names what is owed. Updated whenever a condition's evidence changes (CLAUDE.md §6: the record changes
-in the same commit as the work). Last reviewed 2026-10-07 at `89956659`.
+in the same commit as the work). Last reviewed 2026-10-09 at `e494963d`.
 
 | # | Condition | Status |
 |---|---|---|
@@ -61,6 +61,12 @@ in the same commit as the work). Last reviewed 2026-10-07 at `89956659`.
   - A CRI-level integration beyond the kubelet NFS PersistentVolume (no CSI driver: a node plugin needs privileged
     mount propagation, which R10 forbids).
   - The kubelet leg cannot run on Docker Desktop: its kernel has no `CONFIG_TLS`, so it skips loudly here.
+- **2026-10-09.**
+  - containerd 1.7.24 with runc re-run on `faad1562`: the 2,000-file workload, the setuid probe and the read-only
+    entry all as before (`GAPS.md` "the day's builds re-checked through real workloads").
+  - Every Linux NFSv4 client, kubelet's and Docker's among them, had its back channel caught in a storm of probes,
+    and was granted no delegation. Fixed in `9c0d5057`; one writer's open+read p50 fell from about 300 to about 30 µs
+    once delegations returned (`BENCHMARKS.md` "The hot-directory storm after the probe-storm fix").
 
 ## 3. No disk escape except a granted landing
 
@@ -105,7 +111,11 @@ in the same commit as the work). Last reviewed 2026-10-07 at `89956659`.
   - The base overlay's tests (`crates/vfs/tests/base.rs`), with drift, witnesses and digests against a simulated
     host with outsider edits.
   - 2026-10-07: a drift re-check the host refuses is reported unverified, never as a match.
-- **Owed.** Nothing named.
+  - 2026-10-08, an overlay of `/usr/lib`: the landing plan is exact (base symlinks were planned as changes, A-121).
+    An outsider's edit is visible through the mount in 121–157 ms on Linux and 377–875 ms on macOS (A-122, A-123),
+    and a landing's presentation names its conflicts.
+- **Owed.** Windows has no base watcher (`ReadDirectoryChangesW`): an outsider's edit is seen only at a lookup's
+  live-disk check (`GAPS.md` 2026-10-09).
 
 ## 6. Cross-OS and cross-architecture
 
@@ -118,6 +128,8 @@ in the same commit as the work). Last reviewed 2026-10-07 at `89956659`.
 - **Owed.**
   - Native x86_64 performance numbers (emulation proves behaviour, not speed).
   - Windows beyond create, write, read, list and delete.
+  - The Windows base watcher, which cannot be built or linted from this machine without the Windows C headers (a tool
+    install awaiting Ada) or a CI push.
 
 ## 7. Remote pulls under contention and bad networks
 
@@ -132,6 +144,10 @@ in the same commit as the work). Last reviewed 2026-10-07 at `89956659`.
   records are in `BENCHMARKS.md`.
 - **Owed.** A delay signal that separates jitter from queueing without a long memory of the path's rate, clearing
   `congestion_bench`'s 56 scenarios with no regression and the jitter rows at 8 MiB.
+- **2026-10-09.** Contested cross-region reads on the two networks at 10% loss went from 4 of 9 to 9 of 9 complete:
+  - an unanswered forward is resent to the same owner while it is not confirmed dead;
+  - the client retries a read refused as transiently unreachable;
+  - an unbootstrapped fleet's learners back off (`GAPS.md` 2026-10-09).
 
 ## 8. Post-quantum protected transfer
 
@@ -184,6 +200,18 @@ in the same commit as the work). Last reviewed 2026-10-07 at `89956659`.
     no local patch.
   - Open: cross-region membership did not form in 2 of 12 bring-ups, and one node's record session stayed borrowed
     for good (`GAPS.md` 2026-10-07).
+  - **2026-10-08/09: mirroring across the shaped crossing** (`docs/wip/bench/multiregion/mirror.sh`). Snapshots
+    placed in the mirror region:
+    - before the day's fixes: 0 of 6;
+    - after them: 43 of 44 at 3% loss;
+    - 5 of 5 at 10% loss with 150 ± 60 ms;
+    - 5 of 5 with every node held to half a CPU.
+
+    The fixes: the mirror's hedge, late acknowledgements folded, pair keys accepted both ways, and an announcement
+    pass that lent every record session about a hundred times a second (`48496cf8`).
+  - **2026-10-09:** a detector bug left a member that died soon after a warm restart unsuspected for good. Answers to
+    lease renewals marked every pair a pool misfit. Fixed in the vendored detector (`e6640dd3`, pending upstream);
+    the warm-restart test went from failing 3 of 11 runs to passing 16 of 16.
   - Condition 7's jitter design, which replication's content pulls share.
   - The copyset-successor fleet test fails intermittently in the full suite (4 of 9 untraced runs earlier; 1 of 3
     full suites on 2026-10-07, "retry not served: HomedElsewhere", one forward unanswered, location rounds answering
@@ -205,9 +233,16 @@ in the same commit as the work). Last reviewed 2026-10-07 at `89956659`.
     `crates/db/tests/model.rs`, with drops and recoveries at random points.
   - The 2026-10-07 sweep of discarded results fixed a seal, a descriptor leak, dropped replies, a truncate and a
     scrub, and made every remaining refusal counted in status.
-- **Owed.** Nothing named. The goal's "batteries" are the suites above; a generated fault-injection campaign across
-  a live fleet (the deterministic simulation's nemesis library over the seed budget, CLAUDE.md §4) is the
-  strengthening.
+- **2026-10-09.**
+  - `docs/wip/bench/kill_writes.sh`: 80 SIGKILLs across 100,000 fsyncs of random 4 KiB writes. The file read back
+    identical every time, each recovery replaying A-126's windowed deltas, and the longest fsync was 70 ms.
+  - `realworld_chaos.sh` on the day's build: git, cargo and pip each finished exactly, under two SIGKILLs each.
+- **Owed.**
+  - A generated fault-injection campaign across a live fleet (the deterministic simulation's nemesis library over the
+    seed budget, CLAUDE.md §4) is the strengthening.
+  - Open: the daemon disappeared twice in about 70 container runs under heavy host load. No OOM kill of slates,
+    restart or lapsed heartbeat was seen in the logged runs that followed. Cause unknown; the benchmarks now print
+    what would name it (`GAPS.md` 2026-10-09).
 
 ## 12. Tail latency against Tectonic
 
@@ -219,9 +254,19 @@ in the same commit as the work). Last reviewed 2026-10-07 at `89956659`.
 
   Against Tectonic's published 150–200 ms write and about 100 ms read tails (FAST'21), with the media difference
   stated.
+- **2026-10-09**, through Linux's own NFSv4.2 client:
+  - random 4 KiB writes with an fsync every 8 have fsync p99 0.75–1.37 ms at load 15, against 3.5–6.2 ms before
+    A-126;
+  - sequential overwrite runs at 1,143 MiB/s median, inside Linux nfsd's 967–1,524 MB/s;
+  - sixteen writers in one directory see create p99 3.2–3.4 ms after the probe-storm fix (6.1–6.6 ms before);
+  - O_DIRECT reads run at 1.6–2.0 GB/s.
+
+  (`BENCHMARKS.md`, the day's entries.)
 - **Owed.**
-  - A broader p99 matrix: mixed read-write, large files, a loaded fleet, remote pulls.
+  - A broader p99 matrix: a loaded fleet, remote pulls.
   - Condition 7's jitter tail.
+  - Reads spend 29% of their CPU decrypting sealed chunks (A-99 opens per read). A bounded plaintext cache of
+    actively read chunks is Ada's decision (condition 9's posture).
 
 ## 13. MCP with codemode and skills
 
