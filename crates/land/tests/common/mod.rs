@@ -109,9 +109,6 @@ pub(crate) fn request(landing_id: u64) -> LandingRequest {
     now_ns: 1,
     media_durability: false,
     large_class_bytes: LARGE,
-    cores: 2,
-    max_depth: 8,
-    variance_permille: 100,
   }
 }
 

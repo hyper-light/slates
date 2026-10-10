@@ -2140,7 +2140,7 @@ pub struct LandingSummary {
 }
 
 /// A finished landing's outcome (§4.15): the counts, and what the landing achieved and met — its
-/// durability, every Degraded cell, the entries it kept private, and the concurrency it settled on (AUD-29-05:
+/// durability, every Degraded cell, the entries it kept private, and the barriers it took (AUD-29-05:
 /// until 2026-09-29 the reply carried the counts only, and a landing that did not sync read as done).
 #[derive(Wire, Clone, Debug, PartialEq, Eq)]
 pub struct LandingOutcome {
@@ -2165,14 +2165,15 @@ pub struct LandingOutcome {
   pub durability: LandingDurability,
   /// Every Degraded cell the landing met, in the order met.
   pub degraded: Vec<LandingDegradation>,
-  /// The in-flight depth the landing's ramp settled on (§4.15 step 7).
-  pub ramp_depth: u32,
+  /// The batch barriers the landing took (§4.15 step 8, A-130): each made a batch of written-out files durable
+  /// before any of them was placed, so fewer than the files written whenever a batch held more than one.
+  pub barriers: u64,
 }
 
 /// The durability a landing achieved (§4.15 step 8).
 #[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LandingDurability {
-  /// Every written file's data sync ran before its link or exchange.
+  /// Every written file was written out, and behind its batch's barrier, before its link or exchange.
   pub data_synced: bool,
   /// Every directory the landing touched was synced.
   pub dirs_synced: bool,

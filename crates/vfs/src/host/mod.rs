@@ -166,8 +166,15 @@ pub trait LandFs: HostFs {
   fn create_temp(&mut self, dir: HostDir, name: &str) -> Result<HostFile, HostError>;
   /// Writes at an offset (the whole buffer, or a refusal).
   fn write_at(&mut self, file: HostFile, off: u64, bytes: &[u8]) -> Result<(), HostError>;
-  /// Makes the file's data durable (`fdatasync`, or the platform's barrier).
-  fn sync_file(&mut self, file: HostFile) -> Result<(), HostError>;
+  /// The file's own share of its durability, once its bytes, mode and mtime are final (§4.15 step 8, A-130): its data
+  /// and attributes handed to the device (macOS `fsync`), or made durable outright where the filesystem has no barrier
+  /// that covers other files (Linux `fdatasync`). A change to the file after it needs another.
+  fn write_out(&mut self, file: HostFile) -> Result<(), HostError>;
+  /// The durability barrier of a batch of temporaries, each written out ([`LandFs::write_out`]) since its last change:
+  /// when it returns, every one is durable ahead of any write that follows, so a placement after it never shows a name
+  /// whose bytes a power loss could take (macOS one `F_BARRIERFSYNC` per device among them, ordering every earlier
+  /// write-out; nothing more where the write-out made each file durable).
+  fn barrier(&mut self, files: &[HostFile]) -> Result<(), HostError>;
   /// Sets the file's mode.
   fn set_mode(&mut self, file: HostFile, mode: u32) -> Result<(), HostError>;
   /// Sets the file's modification time in nanoseconds.

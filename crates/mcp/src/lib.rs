@@ -1790,7 +1790,7 @@ pub fn outcome_json(o: &LandingOutcome) -> Value {
       "dirs": o.durability.dirs,
     },
     "degraded": o.degraded.iter().map(degradation_json).collect::<Vec<_>>(),
-    "ramp_depth": o.ramp_depth,
+    "barriers": o.barriers,
   })
 }
 

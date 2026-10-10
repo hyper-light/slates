@@ -1528,7 +1528,7 @@ fn print_landing(landing: slates_client::Landing) {
       for degradation in &outcome.degraded {
         println!("degraded: {}", slates_mcp::degradation_json(degradation));
       }
-      println!("ramp_depth: {}", outcome.ramp_depth);
+      println!("barriers: {}", outcome.barriers);
     }
     slates_client::Landing::GrantRequired {
       landing,

@@ -210,7 +210,7 @@ pub struct LandingSummaryJs {
 
 /// A finished landing's outcome (§4.15): its id, terminal `state`, the per-entry and byte counts, the
 /// entries `held` in the overlay because they did not reach the durability boundary, the `durability`
-/// achieved, every `degraded` cell met, and the ramp's settled `rampDepth` (AUD-29-05).
+/// achieved, every `degraded` cell met, and the batch `barriers` it took (AUD-29-05, A-130).
 #[napi(object)]
 pub struct LandingOutcomeJs {
   pub landing: i64,
@@ -223,7 +223,7 @@ pub struct LandingOutcomeJs {
   pub held: i64,
   pub durability: LandingDurabilityJs,
   pub degraded: Vec<LandingDegradationJs>,
-  pub ramp_depth: i64,
+  pub barriers: i64,
 }
 
 /// The durability a landing achieved (§4.15 step 8).
@@ -362,7 +362,7 @@ fn landing_result(landing: Landing) -> Result<LandingResult> {
           .iter()
           .map(degradation_js)
           .collect::<Result<Vec<_>>>()?,
-        ramp_depth: i64::from(o.ramp_depth),
+        barriers: status_i64(o.barriers, "barriers")?,
       }),
       landing: None,
       manifest: None,

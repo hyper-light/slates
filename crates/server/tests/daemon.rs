@@ -1058,7 +1058,8 @@ fn grant_scenario() {
 
 /// AUD-29-05: the reply carries what the landing achieved, not the counts alone — its durability (synced,
 /// media neither asked for nor reached), its Degraded cells (barriers only: the supported level, since the
-/// verb asks for no media barrier), nothing held, and the ramp's settled depth. Until 2026-09-29 the reply
+/// verb asks for no media barrier), nothing held, and the batch barriers it took (A-130: none when nothing was
+/// written, else at least one and at most one a written file). Until 2026-09-29 the reply
 /// dropped all of it. (This scenario's plan is the grant's: its content is the engine tests' to check,
 /// `crates/land/tests/durability.rs`; here, that the facts cross the wire.)
 fn assert_landed_reply_carries_what_it_achieved(outcome: &slates_ipc::protocol::LandingOutcome) {
@@ -1073,7 +1074,12 @@ fn assert_landed_reply_carries_what_it_achieved(outcome: &slates_ipc::protocol::
     vec![slates_ipc::protocol::LandingDegradation::BarriersOnly]
   );
   assert_eq!(outcome.held, 0);
-  assert!(outcome.ramp_depth > 0, "{outcome:?}");
+  assert_eq!(
+    outcome.barriers == 0,
+    outcome.written == 0,
+    "a barrier exactly when files were written: {outcome:?}"
+  );
+  assert!(outcome.barriers <= outcome.written, "{outcome:?}");
 }
 
 /// A grant request for `landing` under `proof`, scoped once for the test's deadline.

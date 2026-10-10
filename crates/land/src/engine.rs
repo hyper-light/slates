@@ -10,8 +10,8 @@
 //! - nothing is written while any entry's verdict is a conflict: validation runs over every
 //!   entry first and a single conflict refuses the whole landing;
 //! - every written entry is old or new, never torn: a file lands as a temporary that is
-//!   written, given its mode and mtime, data-synced and only then linked at its name (a create)
-//!   or exchanged with the old file (a replacement);
+//!   written, given its mode and mtime and written out, and only after the barrier of its batch
+//!   (A-130) linked at its name (a create) or exchanged with the old file (a replacement);
 //! - a compare-and-swap lost to an outsider is undone and reported: after the exchange the
 //!   file at the displaced name is opened and verified against the witness. An exchange's
 //!   own ctime change requires a stable content hash; a mismatch exchanges back, removes
@@ -29,14 +29,17 @@
 //!   siblings lists those parents only.
 //!
 //! Phase 1 shape (the design's Phase 2 and 4 pieces named where they replace this): entries
-//! run one at a time, and the ramp records the depth the policy would have chosen; bytes are
+//! run one at a time; files are staged in batches of at most one copy window of pages and placed
+//! after one durability barrier each (A-130: macOS 3–5× faster than a barrier per file; on Linux,
+//! where no barrier covers a batch without flushing other writers' data, each write-out is the
+//! file's `fdatasync` and the batch barrier adds nothing); bytes are
 //! read from the volume into a buffer and written through the seam (arena pages through
 //! io_uring in Phase 4); grants, leases and the audit log are the in-process records of
 //! [`crate::grant`] and [`Audit`]. Every temporary stays inside the granted directory; replacing
 //! the target itself would write its ungranted parent (R1, §4.15 step 10). Reflinks are not used
 //! (the probe is recorded as `false`).
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::Instant;
 
 use slates_vfs::base::{BaseConfig, Landed};
@@ -50,7 +53,6 @@ use crate::grant::{
   LandingLeaseHeld, TargetIdentity, lease_key,
 };
 use crate::manifest::{Action, Filter, LandingEntry, Manifest, OverlayIdentity, Summary, plan};
-use crate::ramp::{Ramp, StepSample};
 pub use crate::source::Source;
 use crate::verdict::{ConflictClass, DiskState, Verdict, verdict};
 
@@ -262,6 +264,8 @@ pub struct LandingCosts {
   pub verify_ns: u64,
   /// One directory sync, nanoseconds.
   pub dir_sync_ns: u64,
+  /// One batch barrier (A-130), nanoseconds.
+  pub barrier_ns: u64,
   /// Samples behind the numbers.
   pub samples: u64,
 }
@@ -295,8 +299,9 @@ pub struct LandingReport {
   pub durability: Durability,
   /// The Degraded cells hit.
   pub degraded: Vec<Degradation>,
-  /// The depth the concurrency ramp settled on (recorded; Phase 1 runs one entry at a time).
-  pub ramp_depth: u32,
+  /// The batch barriers the landing took (A-130): each made a batch of written-out files durable before any of them
+  /// was placed, so fewer than the files written whenever a batch held more than one.
+  pub barriers: usize,
   /// The costs measured.
   pub costs: LandingCosts,
   /// Hidden siblings of an earlier landing swept before this one ran.
@@ -454,12 +459,6 @@ pub struct LandingRequest {
   pub media_durability: bool,
   /// Derived: the large-class boundary a scratch volume's new base uses (`BaseConfig`).
   pub large_class_bytes: u64,
-  /// Measured: the landing pool's cores (the ramp's start).
-  pub cores: u32,
-  /// Derived: the most in-flight entries the pool can carry.
-  pub max_depth: u32,
-  /// Measured: the sample variance the ramp treats as noise, parts per thousand.
-  pub variance_permille: u64,
 }
 
 /// What the caller may run before each entry's write: the oracle injects outsider edits here
@@ -490,6 +489,7 @@ struct CostSamples {
   exchange_ns: Vec<u64>,
   verify_ns: Vec<u64>,
   dir_sync_ns: Vec<u64>,
+  barrier_ns: Vec<u64>,
 }
 
 fn median(samples: &mut [u64]) -> u64 {
@@ -508,7 +508,8 @@ impl CostSamples {
         .len()
         .saturating_add(self.write_ns_per_kib.len())
         .saturating_add(self.exchange_ns.len())
-        .saturating_add(self.verify_ns.len()),
+        .saturating_add(self.verify_ns.len())
+        .saturating_add(self.barrier_ns.len()),
     )
     .unwrap_or(u64::MAX);
     LandingCosts {
@@ -517,6 +518,7 @@ impl CostSamples {
       exchange_ns: median(&mut self.exchange_ns),
       verify_ns: median(&mut self.verify_ns),
       dir_sync_ns: median(&mut self.dir_sync_ns),
+      barrier_ns: median(&mut self.barrier_ns),
       samples,
     }
   }
@@ -542,7 +544,8 @@ struct Landing<'a, H: LandFs> {
   widest_window_ns: u64,
   degraded: Vec<Degradation>,
   costs: CostSamples,
-  ramp: Ramp,
+  /// The batch barriers taken (A-130).
+  barriers: usize,
   /// The host errno that ended the landing, when one did.
   crashed: Option<i32>,
   /// Touched directories that could not be opened or synced: entries in them are not advanced.
@@ -574,18 +577,24 @@ struct WriteContext<'x, H: LandFs> {
   audit: &'x mut Audit,
 }
 
-/// The write phase's timing across the entries it writes (the ramp's per-class steps), kept between slices.
+/// The write phase's state across the entries it writes, kept between slices: the class being written, the file being
+/// copied, and the batch staged for its barrier (A-130).
 struct WriteProgress {
   /// When the write phase began: the landing's elapsed clock for its grant and lease checks.
   started: Instant,
+  /// The class of the entry last begun (§4.15 step 5): a batch takes its barrier before an entry of another class.
   class: Option<u8>,
-  step_started: Instant,
-  step_entries: u64,
-  step_max_ns: u64,
   /// When the entry being written began, on the landing's clock (its `land.entry` span's start).
   entry_start_ns: u64,
   /// The file being copied, a window per unit, when the entry is a file past one window.
   copy: Option<FileCopy>,
+  /// The files written out and waiting for their batch's barrier, in entry order; once the barrier has returned
+  /// (`placing`), the ones still to place. At most [`batch_pages`] of them.
+  staged: VecDeque<Staged>,
+  /// The pages the staged files count for ([`file_pages`]): at most [`batch_pages`], unless one file alone is larger.
+  staged_pages: u64,
+  /// Whether the staged batch's barrier has returned: its files are being placed, one per unit.
+  placing: bool,
 }
 
 impl WriteProgress {
@@ -593,13 +602,36 @@ impl WriteProgress {
     Self {
       started: Instant::now(),
       class: None,
-      step_started: Instant::now(),
-      step_entries: 0,
-      step_max_ns: 0,
       entry_start_ns: 0,
       copy: None,
+      staged: VecDeque::new(),
+      staged_pages: 0,
+      placing: false,
     }
   }
+}
+
+/// Where one unit left its entry.
+enum EntryStep {
+  /// Its file is still being copied, a window per unit.
+  Copying,
+  /// Done with for now without an outcome: its file is staged for its batch's barrier (the outcome lands when it is
+  /// placed), or it had no verdict to act on.
+  Staged,
+  /// Done, with this outcome to record.
+  Done(Written),
+}
+
+/// A file staged for its batch's barrier (A-130): written out and open at its hidden name, placed only after the
+/// barrier returned.
+struct Staged {
+  /// Its entry's place in the manifest, and in the reports.
+  index: usize,
+  copy: FileCopy,
+  /// The witness a replacement's exchange checks, taken when the file was staged.
+  witness: Option<Witness>,
+  /// When its entry began, on the landing's clock (its `land.entry` span's start).
+  entry_start_ns: u64,
 }
 
 /// A file being copied into its temporary, a window per unit (AUD-29-25), so a landing's memory and each
@@ -943,174 +975,393 @@ impl<H: LandFs> Landing<'_, H> {
 
   // ------------------------------------------------------------- writing
 
-  /// Writes one entry under the write phase's `progress` (the unit a sliced landing writes per step): its
-  /// verdict decides whether it is written, skipped or refused, and its outcome lands in its report.
-  /// Returns whether the entry is done: `false` while its file is still being copied (`copy` holds it), so
-  /// a large file is many units, a window each, and no unit's work grows with a file's size (AUD-29-25).
+  /// One unit of the write phase (§4.15 steps 5–8, A-130) under its `progress`, `next` the cursor over the manifest:
+  /// a placement from the batch whose barrier has returned, the barrier of a batch that closes before the next entry,
+  /// or a unit of the next entry (a window of the file being copied, or the entry itself). Returns whether the phase
+  /// is done: every entry taken and no batch left.
+  fn write_unit(
+    &mut self,
+    manifest: &Manifest,
+    reports: &mut [EntryReport],
+    next: &mut usize,
+    cx: &mut WriteContext<'_, H>,
+    progress: &mut WriteProgress,
+  ) -> bool {
+    if progress.placing {
+      if self.crashed.is_some() {
+        self.abandon_batch(manifest, progress);
+      } else if let Some(staged) = progress.staged.pop_front() {
+        self.place_staged(manifest, reports, staged, cx, progress);
+        if progress.staged.is_empty() {
+          progress.placing = false;
+          progress.staged_pages = 0;
+        }
+        return false;
+      }
+      progress.placing = false;
+      progress.staged_pages = 0;
+    }
+    let entry = manifest.entries.get(*next);
+    if progress.copy.is_none()
+      && !progress.staged.is_empty()
+      && self.batch_closes(entry, reports.get(*next), progress, cx.store)
+    {
+      self.barrier_unit(manifest, reports, cx, progress);
+      return false;
+    }
+    let (Some(entry), Some(report)) = (entry, reports.get_mut(*next)) else {
+      return true;
+    };
+    if self.crashed.is_some() {
+      return true;
+    }
+    if self.write_one(manifest, entry, report, *next, cx, progress) {
+      *next = next.saturating_add(1);
+    }
+    false
+  }
+
+  /// One unit of the entry at `index`: its verdict decides whether it is written, skipped or refused. A file is copied
+  /// into its temporary — a window per unit past one window, so no unit's work grows with a file's size (AUD-29-25) —
+  /// and staged for its batch's barrier (A-130); its outcome lands in its report when it is placed. Anything else is
+  /// written, or not, here, and its outcome lands now. Returns whether the entry is done with: `false` while its file
+  /// is still being copied (`copy` holds it).
   fn write_one(
     &mut self,
     manifest: &Manifest,
     entry: &LandingEntry,
     report: &mut EntryReport,
+    index: usize,
     cx: &mut WriteContext<'_, H>,
     progress: &mut WriteProgress,
   ) -> bool {
-    let WriteContext {
-      vol,
-      store,
-      grant,
-      lease,
-      observer,
-      audit,
-    } = cx;
-    let grant = *grant;
-    let lease = *lease;
-    let started = progress.started;
-    let window = store.content.chunk_bytes().max(1);
-    let fenced = |now_ns: u64| {
-      if grant_ended(grant, now_ns) {
-        Some(Outcome::Skipped(SkipReason::GrantEnded))
-      } else if lease.expires_ns <= now_ns {
-        Some(Outcome::Skipped(SkipReason::LeaseEnded))
-      } else {
-        None
+    let step = match progress.copy.take() {
+      Some(copy) => self.copy_unit(entry, index, copy, cx, progress),
+      None => self.begin_entry(entry, report, index, cx, progress),
+    };
+    match step {
+      EntryStep::Copying => false,
+      EntryStep::Staged => true,
+      EntryStep::Done(outcome) => {
+        let entry_start_ns = progress.entry_start_ns;
+        self.record_entry(
+          manifest,
+          report,
+          outcome,
+          cx,
+          progress.started,
+          entry_start_ns,
+        );
+        true
+      }
+    }
+  }
+
+  /// The first unit of the entry at `index`, by its verdict: a write it applies (a file's begun, and staged if it fits
+  /// one window), or the outcome a skip, an identity or a conflict records.
+  fn begin_entry(
+    &mut self,
+    entry: &LandingEntry,
+    report: &EntryReport,
+    index: usize,
+    cx: &mut WriteContext<'_, H>,
+    progress: &mut WriteProgress,
+  ) -> EntryStep {
+    progress.class = Some(entry.class());
+    // The `land.entry` chokepoint span (§4.14) brackets one entry's processing, whatever its verdict: a file's, from
+    // here to its placement.
+    progress.entry_start_ns = self
+      .request
+      .now_ns
+      .saturating_add(elapsed_ns(progress.started));
+    let outcome = match report.verdict {
+      Some(Verdict::Apply) => match self.fence(cx, progress.started) {
+        Some(skipped) => skipped,
+        None => {
+          cx.observer.before_write(self.host, entry);
+          if matches!(entry.action, Action::Create | Action::Replace) {
+            return self.begin_file(entry, index, cx, progress);
+          }
+          return EntryStep::Done(self.write_entry(entry));
+        }
+      },
+      Some(Verdict::Skip) => Outcome::Skipped(skip_reason(entry)),
+      Some(Verdict::AcceptIdentical) => Outcome::AcceptedIdentical,
+      Some(Verdict::Conflict(c)) => Outcome::Conflict(c),
+      // No verdict: nothing to record (the entry was never validated).
+      None => return EntryStep::Staged,
+    };
+    EntryStep::Done(Written {
+      outcome,
+      window_ns: None,
+    })
+  }
+
+  /// A file's first unit: its temporary created and, for a file within one window, its bytes copied and the file
+  /// staged; a larger one is copied a window per unit from the next.
+  fn begin_file(
+    &mut self,
+    entry: &LandingEntry,
+    index: usize,
+    cx: &mut WriteContext<'_, H>,
+    progress: &mut WriteProgress,
+  ) -> EntryStep {
+    let window = cx.store.content.chunk_bytes().max(1);
+    let mut copy = match self.begin_copy(entry, cx.vol, cx.store) {
+      Ok(copy) => copy,
+      Err(failure) => return EntryStep::Done(self.written_of(Err(failure))),
+    };
+    if copy.overlay.size > u64::try_from(window).unwrap_or(u64::MAX) {
+      progress.copy = Some(copy);
+      return EntryStep::Copying;
+    }
+    if let Err(failure) = self.copy_rest(&mut copy, cx.vol, cx.store, window) {
+      self.drop_copy(&entry.path, copy);
+      return EntryStep::Done(self.written_of(Err(failure)));
+    }
+    self.stage_step(entry, index, copy, cx.store, progress)
+  }
+
+  /// One window of a file past one window; once it is all copied, the file staged — only while the grant and lease
+  /// still hold, since a long copy can outlive them.
+  fn copy_unit(
+    &mut self,
+    entry: &LandingEntry,
+    index: usize,
+    mut copy: FileCopy,
+    cx: &mut WriteContext<'_, H>,
+    progress: &mut WriteProgress,
+  ) -> EntryStep {
+    let window = cx.store.content.chunk_bytes().max(1);
+    match self.copy_chunk(&mut copy, cx.vol, cx.store, window) {
+      Ok(true) => {
+        progress.copy = Some(copy);
+        EntryStep::Copying
+      }
+      Ok(false) => match self.fence(cx, progress.started) {
+        Some(skipped) => {
+          self.drop_copy(&entry.path, copy);
+          EntryStep::Done(Written {
+            outcome: skipped,
+            window_ns: None,
+          })
+        }
+        None => self.stage_step(entry, index, copy, cx.store, progress),
+      },
+      Err(failure) => {
+        self.drop_copy(&entry.path, copy);
+        EntryStep::Done(self.written_of(Err(failure)))
+      }
+    }
+  }
+
+  /// [`Landing::stage_file`] as an entry's step: staged, or its refusal as the entry's outcome.
+  fn stage_step(
+    &mut self,
+    entry: &LandingEntry,
+    index: usize,
+    copy: FileCopy,
+    store: &Store,
+    progress: &mut WriteProgress,
+  ) -> EntryStep {
+    match self.stage_file(entry, index, copy, store, progress) {
+      Ok(()) => EntryStep::Staged,
+      Err(failure) => EntryStep::Done(self.written_of(Err(failure))),
+    }
+  }
+
+  /// The skip an ended grant or lease imposes on an entry's next write-capable step, on the landing's elapsed clock
+  /// since `started`; `None` while both hold.
+  fn fence(&self, cx: &WriteContext<'_, H>, started: Instant) -> Option<Outcome> {
+    let now_ns = self.request.now_ns.saturating_add(elapsed_ns(started));
+    if grant_ended(cx.grant, now_ns) {
+      Some(Outcome::Skipped(SkipReason::GrantEnded))
+    } else if cx.lease.expires_ns <= now_ns {
+      Some(Outcome::Skipped(SkipReason::LeaseEnded))
+    } else {
+      None
+    }
+  }
+
+  /// Whether the staged batch takes its barrier before `entry` (none: the entries are done) (A-130): the landing
+  /// crashed (its batch is then abandoned), the entries are done, the entry opens another class (a class starts only
+  /// when the one before it is placed, §4.15 step 5), or it is a file the batch has no room for. A batch holds at most
+  /// a copy window of pages, each file counted as at least one: its barrier's work is bounded by the window, as every
+  /// other unit's is (AUD-29-25), and so are the temporaries it holds open.
+  fn batch_closes(
+    &self,
+    entry: Option<&LandingEntry>,
+    report: Option<&EntryReport>,
+    progress: &WriteProgress,
+    store: &Store,
+  ) -> bool {
+    if self.crashed.is_some() {
+      return true;
+    }
+    let (Some(entry), Some(report)) = (entry, report) else {
+      return true;
+    };
+    if progress.class != Some(entry.class()) {
+      return true;
+    }
+    let size = entry.overlay.map_or(0, |overlay| overlay.size);
+    stages_a_file(entry, report)
+      && progress
+        .staged_pages
+        .saturating_add(file_pages(size, store))
+        > batch_pages(store)
+  }
+
+  /// The barrier of the staged batch (§4.15 step 8, A-130): every staged file durable before any of them is placed;
+  /// the placements follow, one per unit. A crashed landing abandons its batch instead (its entries stay unwritten,
+  /// and the resume lands them); a grant or lease that ended skips the batch's entries; a barrier the host refuses
+  /// fails every entry of the batch, as a refused sync failed its one file before batches.
+  fn barrier_unit(
+    &mut self,
+    manifest: &Manifest,
+    reports: &mut [EntryReport],
+    cx: &mut WriteContext<'_, H>,
+    progress: &mut WriteProgress,
+  ) {
+    if self.crashed.is_some() {
+      self.abandon_batch(manifest, progress);
+      return;
+    }
+    let refused = match self.fence(cx, progress.started) {
+      Some(skipped) => Ok(skipped),
+      None => {
+        let temps: Vec<HostFile> = progress
+          .staged
+          .iter()
+          .map(|staged| staged.copy.temp)
+          .collect();
+        let started = Instant::now();
+        match self.host.barrier(&temps) {
+          Ok(()) => {
+            self.costs.barrier_ns.push(elapsed_ns(started));
+            self.barriers = self.barriers.saturating_add(1);
+            progress.placing = true;
+            return;
+          }
+          Err(error) => Err(error),
+        }
       }
     };
-    if let Some(mut copy) = progress.copy.take() {
-      let written = match self.copy_chunk(&mut copy, vol, store, window) {
-        Ok(true) => {
-          progress.copy = Some(copy);
-          return false;
-        }
-        // Copied: placed only while the grant and lease still hold — a long copy can outlive them.
-        Ok(false) => match fenced(self.request.now_ns.saturating_add(elapsed_ns(started))) {
-          Some(skipped) => {
-            self.drop_copy(&entry.path, copy);
-            Written {
-              outcome: skipped,
-              window_ns: None,
-            }
-          }
-          None => {
-            let entry_started = copy.started;
-            let witness = match entry.action {
-              Action::Replace => self.witness_of(entry),
-              _ => None,
-            };
-            let finished = self.finish_copy(entry, copy, witness.as_ref());
-            let w = self.written_of(finished);
-            progress.step_entries = progress.step_entries.saturating_add(1);
-            progress.step_max_ns = progress.step_max_ns.max(elapsed_ns(entry_started));
-            w
-          }
+    progress.staged_pages = 0;
+    while let Some(staged) = progress.staged.pop_front() {
+      let path = manifest
+        .entries
+        .get(staged.index)
+        .map_or("/", |entry| entry.path.as_ref());
+      self.drop_copy(path, staged.copy);
+      let written = match &refused {
+        Ok(skipped) => Written {
+          outcome: skipped.clone(),
+          window_ns: None,
         },
-        Err(failure) => {
-          self.drop_copy(&entry.path, copy);
-          self.written_of(Err(failure))
-        }
+        Err(error) => self.written_of(Err((*error).into())),
       };
+      if let Some(report) = reports.get_mut(staged.index) {
+        self.record_entry(
+          manifest,
+          report,
+          written,
+          cx,
+          progress.started,
+          staged.entry_start_ns,
+        );
+      }
+    }
+  }
+
+  /// A crashed landing's batch abandoned: each staged temporary closed and removed (a removal the host refuses is
+  /// reported, as any temporary left behind is); its entries stay unwritten, and the resume lands them.
+  fn abandon_batch(&mut self, manifest: &Manifest, progress: &mut WriteProgress) {
+    progress.placing = false;
+    progress.staged_pages = 0;
+    while let Some(staged) = progress.staged.pop_front() {
+      let path = manifest
+        .entries
+        .get(staged.index)
+        .map_or("/", |entry| entry.path.as_ref());
+      self.drop_copy(path, staged.copy);
+    }
+  }
+
+  /// One staged file placed after its batch's barrier, its outcome landing in its report: linked at its name, or
+  /// exchanged with the witnessed file it replaces — unless the grant or lease ended since, when it is removed
+  /// unplaced.
+  fn place_staged(
+    &mut self,
+    manifest: &Manifest,
+    reports: &mut [EntryReport],
+    staged: Staged,
+    cx: &mut WriteContext<'_, H>,
+    progress: &WriteProgress,
+  ) {
+    let Staged {
+      index,
+      copy,
+      witness,
+      entry_start_ns,
+    } = staged;
+    let Some(entry) = manifest.entries.get(index) else {
+      self.drop_copy("/", copy);
+      return;
+    };
+    let written = match self.fence(cx, progress.started) {
+      Some(skipped) => {
+        self.drop_copy(&entry.path, copy);
+        Written {
+          outcome: skipped,
+          window_ns: None,
+        }
+      }
+      None => {
+        let placed = self.place_file(entry, copy, witness.as_ref());
+        self.written_of(placed)
+      }
+    };
+    if let Some(report) = reports.get_mut(index) {
       self.record_entry(
         manifest,
         report,
         written,
-        grant,
-        &mut **observer,
-        audit,
-        progress,
+        cx,
+        progress.started,
+        entry_start_ns,
       );
-      return true;
     }
-    if progress.class != Some(entry.class()) {
-      if progress.class.is_some() {
-        self.ramp.observe(StepSample {
-          entries: progress.step_entries,
-          wall_ns: elapsed_ns(progress.step_started),
-          p99_ns: progress.step_max_ns,
-        });
-      }
-      progress.class = Some(entry.class());
-      progress.step_started = Instant::now();
-      progress.step_entries = 0;
-      progress.step_max_ns = 0;
-    }
-    // The `land.entry` chokepoint span (§4.14) brackets one entry's processing, whatever its verdict.
-    progress.entry_start_ns = self.request.now_ns.saturating_add(elapsed_ns(started));
-    let outcome = match report.verdict {
-      Some(Verdict::Apply) => {
-        match fenced(self.request.now_ns.saturating_add(elapsed_ns(started))) {
-          Some(skipped) => Written {
-            outcome: skipped,
-            window_ns: None,
-          },
-          None => {
-            observer.before_write(self.host, entry);
-            let large = matches!(entry.action, Action::Create | Action::Replace)
-              && entry
-                .overlay
-                .is_some_and(|o| o.size > u64::try_from(window).unwrap_or(u64::MAX));
-            if large {
-              // A file past one window is copied a window per unit.
-              match self.begin_copy(entry, vol, store) {
-                Ok(copy) => {
-                  progress.copy = Some(copy);
-                  return false;
-                }
-                Err(failure) => self.written_of(Err(failure)),
-              }
-            } else {
-              let entry_started = Instant::now();
-              let w = self.write_entry(entry, vol, store);
-              progress.step_entries = progress.step_entries.saturating_add(1);
-              progress.step_max_ns = progress.step_max_ns.max(elapsed_ns(entry_started));
-              w
-            }
-          }
-        }
-      }
-      Some(Verdict::Skip) => Written {
-        outcome: Outcome::Skipped(skip_reason(entry)),
-        window_ns: None,
-      },
-      Some(Verdict::AcceptIdentical) => Written {
-        outcome: Outcome::AcceptedIdentical,
-        window_ns: None,
-      },
-      Some(Verdict::Conflict(c)) => Written {
-        outcome: Outcome::Conflict(c),
-        window_ns: None,
-      },
-      None => return true,
-    };
-    self.record_entry(
-      manifest,
-      report,
-      outcome,
-      grant,
-      &mut **observer,
-      audit,
-      progress,
-    );
-    true
   }
 
-  /// An entry's outcome recorded: its `land.entry` span, its audit record, its report.
-  #[allow(clippy::too_many_arguments)] // the entry, its outcome, and the three sinks it is recorded in
+  /// The write phase's open temporaries closed when its run is abandoned: the file being copied and every staged one,
+  /// none placed. A named one stays at its hidden name for the resume's sweep, the state a crash leaves; before
+  /// 2026-10-10 an abandoned run left the copy's descriptor open in the host for as long as the host lived.
+  fn release_write(&mut self, progress: &mut WriteProgress) {
+    if let Some(copy) = progress.copy.take() {
+      self.host.close_file(copy.temp);
+    }
+    while let Some(staged) = progress.staged.pop_front() {
+      self.host.close_file(staged.copy.temp);
+    }
+    progress.placing = false;
+    progress.staged_pages = 0;
+  }
+
+  /// An entry's outcome recorded: its `land.entry` span (from `entry_start_ns` to now, on the clock started at
+  /// `started`), its audit record, its report.
   fn record_entry(
     &mut self,
     manifest: &Manifest,
     report: &mut EntryReport,
     outcome: Written,
-    grant: Option<&GrantRecord>,
-    observer: &mut dyn Observer<H>,
-    audit: &mut Audit,
-    progress: &WriteProgress,
+    cx: &mut WriteContext<'_, H>,
+    started: Instant,
+    entry_start_ns: u64,
   ) {
-    let now_ns = self
-      .request
-      .now_ns
-      .saturating_add(elapsed_ns(progress.started));
-    observer.after_entry(progress.entry_start_ns, now_ns);
-    audit.push(AuditRecord {
+    let now_ns = self.request.now_ns.saturating_add(elapsed_ns(started));
+    cx.observer.after_entry(entry_start_ns, now_ns);
+    cx.audit.push(AuditRecord {
       seq: 0,
       at_ns: now_ns,
       kind: if outcome.outcome == Outcome::Written {
@@ -1118,7 +1369,7 @@ impl<H: LandFs> Landing<'_, H> {
       } else {
         AuditKind::EntryRefused
       },
-      grant: grant.map(|g| g.id),
+      grant: cx.grant.map(|g| g.id),
       landing: self.request.landing_id,
       manifest: manifest.hash,
       outcome: None,
@@ -1127,21 +1378,10 @@ impl<H: LandFs> Landing<'_, H> {
     report.window_ns = outcome.window_ns;
   }
 
-  /// Ends the write phase: the last class's ramp step.
-  fn close_write(&mut self, progress: &WriteProgress) {
-    if progress.class.is_some() {
-      self.ramp.observe(StepSample {
-        entries: progress.step_entries,
-        wall_ns: elapsed_ns(progress.step_started),
-        p99_ns: progress.step_max_ns,
-      });
-    }
-  }
-
-  /// Writes one entry, mapping a host refusal to its outcome: a full disk fails the entry, any
+  /// Writes one entry other than a file, mapping a host refusal to its outcome: a full disk fails the entry, any
   /// other unavailability ends the landing (the target is gone or the disk is).
-  fn write_entry(&mut self, entry: &LandingEntry, vol: &mut Volume, store: &mut Store) -> Written {
-    let attempted = self.try_write_entry(entry, vol, store);
+  fn write_entry(&mut self, entry: &LandingEntry) -> Written {
+    let attempted = self.try_write_entry(entry);
     self.written_of(attempted)
   }
 
@@ -1175,12 +1415,7 @@ impl<H: LandFs> Landing<'_, H> {
     }
   }
 
-  fn try_write_entry(
-    &mut self,
-    entry: &LandingEntry,
-    vol: &mut Volume,
-    store: &mut Store,
-  ) -> Result<Written, WriteFailure> {
+  fn try_write_entry(&mut self, entry: &LandingEntry) -> Result<Written, WriteFailure> {
     let (dir_path, name) = split(&entry.path);
     let outcome = match &entry.action {
       Action::Mkdir => {
@@ -1202,11 +1437,8 @@ impl<H: LandFs> Landing<'_, H> {
           Err(e) => return Err(e.into()),
         }
       }
-      Action::Create => return self.write_file(entry, vol, store, None),
-      Action::Replace => {
-        let witness = self.witness_of(entry);
-        return self.write_file(entry, vol, store, witness.as_ref());
-      }
+      // A file is staged for its batch's barrier by `write_one` (A-130), never written here.
+      Action::Create | Action::Replace => return Err(WriteFailure::Volume(VfsError::Invalid)),
       Action::Delete => self.delete(dir_path, name, entry.witnessed.as_ref())?,
       Action::Rmdir => self.remove_tree_entry(dir_path, name, entry.witnessed.as_ref())?,
       Action::Clear => return self.clear_entry(dir_path, name, entry),
@@ -1232,28 +1464,17 @@ impl<H: LandFs> Landing<'_, H> {
     }
   }
 
-  /// Writes a file: temporary, bytes, mode, mtime, data sync, then link at the name (a create)
-  /// or exchange with the old file and verify the displaced one (a replacement).
-  fn write_file(
+  /// The rest of a file no larger than one window copied into its temporary (one window; a short read from the volume
+  /// takes another).
+  fn copy_rest(
     &mut self,
-    entry: &LandingEntry,
+    copy: &mut FileCopy,
     vol: &mut Volume,
     store: &mut Store,
-    witnessed: Option<&Witness>,
-  ) -> Result<Written, WriteFailure> {
-    let window = store.content.chunk_bytes().max(1);
-    let mut copy = self.begin_copy(entry, vol, store)?;
-    loop {
-      match self.copy_chunk(&mut copy, vol, store, window) {
-        Ok(true) => {}
-        Ok(false) => break,
-        Err(failure) => {
-          self.drop_copy(&entry.path, copy);
-          return Err(failure);
-        }
-      }
-    }
-    self.finish_copy(entry, copy, witnessed)
+    window: usize,
+  ) -> Result<(), WriteFailure> {
+    while self.copy_chunk(copy, vol, store, window)? {}
+    Ok(())
   }
 
   /// A file's copy begun: its temporary created at a plain hidden name in its directory. Every temporary is
@@ -1319,39 +1540,65 @@ impl<H: LandFs> Landing<'_, H> {
     Ok(copy.next < copy.overlay.size)
   }
 
-  /// The copied file finished — its mode, mtime and data sync — and placed: linked at its name, or exchanged
-  /// with the witnessed file it replaces.
-  fn finish_copy(
+  /// A copied file staged for its batch's barrier (A-130): its mode and mtime set and its write-out done, then held open
+  /// at its hidden name with the witness its placement will check. A refusal removes the temporary and is the entry's.
+  fn stage_file(
+    &mut self,
+    entry: &LandingEntry,
+    index: usize,
+    copy: FileCopy,
+    store: &Store,
+    progress: &mut WriteProgress,
+  ) -> Result<(), WriteFailure> {
+    let (dir_path, _) = split(&entry.path);
+    let filled = self
+      .host
+      .set_mode(copy.temp, copy.overlay.mode)
+      .and_then(|()| self.host.set_mtime(copy.temp, copy.overlay.mtime_ns))
+      .and_then(|()| self.host.write_out(copy.temp));
+    if let Err(e) = filled {
+      self.give_up_temp(copy.dir, dir_path, &copy.created, copy.temp);
+      return Err(e.into());
+    }
+    /// Format: bytes per KiB.
+    const KIB: u64 = 1024;
+    let kib = copy.overlay.size.div_ceil(KIB).max(1);
+    self
+      .costs
+      .write_ns_per_kib
+      .push(elapsed_ns(copy.started).checked_div(kib).unwrap_or(0));
+    let witness = match entry.action {
+      Action::Replace => self.witness_of(entry),
+      _ => None,
+    };
+    progress.staged_pages = progress
+      .staged_pages
+      .saturating_add(file_pages(copy.overlay.size, store));
+    progress.staged.push_back(Staged {
+      index,
+      copy,
+      witness,
+      entry_start_ns: progress.entry_start_ns,
+    });
+    Ok(())
+  }
+
+  /// A staged file placed after its batch's barrier: linked at its name, or exchanged with the witnessed file it
+  /// replaces; then closed, the fingerprint its placement left read through its own descriptor first.
+  fn place_file(
     &mut self,
     entry: &LandingEntry,
     copy: FileCopy,
     witnessed: Option<&Witness>,
   ) -> Result<Written, WriteFailure> {
-    let (dir_path, name) = split(&entry.path);
+    let (_, name) = split(&entry.path);
     let FileCopy {
       temp,
       dir,
       created,
       overlay,
-      started,
       ..
     } = copy;
-    let filled = self
-      .host
-      .set_mode(temp, overlay.mode)
-      .and_then(|()| self.host.set_mtime(temp, overlay.mtime_ns))
-      .and_then(|()| self.host.sync_file(temp));
-    if let Err(e) = filled {
-      self.give_up_temp(dir, dir_path, &created, temp);
-      return Err(e.into());
-    }
-    /// Format: bytes per KiB.
-    const KIB: u64 = 1024;
-    let kib = overlay.size.div_ceil(KIB).max(1);
-    self
-      .costs
-      .write_ns_per_kib
-      .push(elapsed_ns(started).checked_div(kib).unwrap_or(0));
     let result = match witnessed {
       None => self.link_create(temp, dir, &created, name),
       Some(witness) => {
@@ -2381,6 +2628,32 @@ fn grant_ended(grant: Option<&GrantRecord>, now_ns: u64) -> bool {
   grant.is_some_and(|g| g.expires_ns <= now_ns)
 }
 
+/// Whether an entry's write is a file staged for a batch's barrier (A-130): a create or a replacement it applies.
+fn stages_a_file(entry: &LandingEntry, report: &EntryReport) -> bool {
+  matches!(report.verdict, Some(Verdict::Apply))
+    && matches!(entry.action, Action::Create | Action::Replace)
+}
+
+/// The pages a staged file of `size` bytes counts for in its batch (A-130): its size in the content store's pages, at
+/// least one — the least a write-out hands the device.
+fn file_pages(size: u64, store: &Store) -> u64 {
+  let page = u64::try_from(store.content.page())
+    .unwrap_or(u64::MAX)
+    .max(1);
+  size.div_ceil(page).max(1)
+}
+
+/// The pages one batch holds at most (A-130): the copy window's (`chunk_bytes`, the bound on every unit's work,
+/// AUD-29-25), so at most that many files.
+fn batch_pages(store: &Store) -> u64 {
+  let pages = store
+    .content
+    .chunk_bytes()
+    .checked_div(store.content.page().max(1))
+    .unwrap_or(0);
+  u64::try_from(pages).unwrap_or(u64::MAX).max(1)
+}
+
 fn no_exchange(errno: i32) -> bool {
   errno == ERRNO_INVAL || errno == ERRNO_NOTSUP_MACOS || errno == ERRNO_NOTSUP_LINUX
 }
@@ -2658,7 +2931,7 @@ struct Saved {
   widest_window_ns: u64,
   degraded: Vec<Degradation>,
   costs: CostSamples,
-  ramp: Ramp,
+  barriers: usize,
   crashed: Option<i32>,
   unsynced: BTreeSet<Box<str>>,
   media_failed: bool,
@@ -2668,7 +2941,7 @@ struct Saved {
 
 impl Saved {
   /// A fresh landing's state over `target`, with what its filesystem supports.
-  fn start(target: &LandingTarget, request: &LandingRequest, caps: LandCapabilities) -> Self {
+  fn start(target: &LandingTarget, caps: LandCapabilities) -> Self {
     Self {
       root: target.dir,
       dirs: BTreeMap::new(),
@@ -2680,7 +2953,7 @@ impl Saved {
       widest_window_ns: 0,
       degraded: Vec::new(),
       costs: CostSamples::default(),
-      ramp: Ramp::new(request.cores, request.max_depth, request.variance_permille),
+      barriers: 0,
       crashed: None,
       unsynced: BTreeSet::new(),
       media_failed: false,
@@ -2697,7 +2970,7 @@ impl<'a, H: LandFs> Landing<'a, H> {
     request: &'a LandingRequest,
     caps: LandCapabilities,
   ) -> Self {
-    Self::resume(host, request, Saved::start(target, request, caps))
+    Self::resume(host, request, Saved::start(target, caps))
   }
 
   /// The landing over its saved state, with its host and request lent for one slice.
@@ -2715,7 +2988,7 @@ impl<'a, H: LandFs> Landing<'a, H> {
       widest_window_ns: saved.widest_window_ns,
       degraded: saved.degraded,
       costs: saved.costs,
-      ramp: saved.ramp,
+      barriers: saved.barriers,
       crashed: saved.crashed,
       unsynced: saved.unsynced,
       media_failed: saved.media_failed,
@@ -2737,7 +3010,7 @@ impl<'a, H: LandFs> Landing<'a, H> {
       widest_window_ns: self.widest_window_ns,
       degraded: self.degraded,
       costs: self.costs,
-      ramp: self.ramp,
+      barriers: self.barriers,
       crashed: self.crashed,
       unsynced: self.unsynced,
       media_failed: self.media_failed,
@@ -2775,7 +3048,7 @@ enum Phase {
   Sweep { parents: Vec<Box<str>>, next: usize },
   /// Taking each entry's verdict against the disk, one entry per unit.
   Validate { ours: BTreeSet<String>, next: usize },
-  /// Writing, one entry per unit.
+  /// Writing: per unit, one entry, one window of a large file, one batch's barrier or one staged file placed (A-130).
   Write {
     next: usize,
     progress: WriteProgress,
@@ -2832,7 +3105,7 @@ impl<'h, H: LandFs> LandingRun<'h, H> {
       Some(Err(error)) => return Err((host, LandingRefusal::Target(error))),
       None => return Err((host, LandingRefusal::HostAway)),
     };
-    let saved = Saved::start(&target, &request, caps);
+    let saved = Saved::start(&target, caps);
     let parents = sweep_parents(&manifest);
     Ok(Self {
       host,
@@ -2993,6 +3266,9 @@ impl<'h, H: LandFs> LandingRun<'h, H> {
   pub fn abandon(&mut self) {
     if let (Some(host), Some(saved)) = (self.host.get(), self.saved.take()) {
       let mut landing = Landing::resume(host, &self.request, saved);
+      if let Phase::Write { progress, .. } = &mut self.phase {
+        landing.release_write(progress);
+      }
       landing.close_dirs();
       self.saved = Some(landing.suspend());
     }
@@ -3078,35 +3354,26 @@ impl<'h, H: LandFs> LandingRun<'h, H> {
         }
       },
       Phase::Write { next, progress } => {
-        let entry = manifest.entries.get(*next);
-        match (entry, reports.get_mut(*next)) {
-          (Some(entry), Some(report)) if landing.crashed.is_none() => {
-            let done = landing.write_one(
-              manifest,
-              entry,
-              report,
-              &mut WriteContext {
-                vol,
-                store,
-                grant: Some(grant),
-                lease,
-                observer,
-                audit,
-              },
-              progress,
-            );
-            if done {
-              *next = next.saturating_add(1);
-            }
-          }
-          _ => {
-            landing.close_write(progress);
-            next_phase = Some(Phase::Sync {
-              touched: landing.touched.iter().cloned().collect(),
-              next: 0,
-              progress: SyncProgress::default(),
-            });
-          }
+        let done = landing.write_unit(
+          manifest,
+          reports,
+          next,
+          &mut WriteContext {
+            vol,
+            store,
+            grant: Some(grant),
+            lease,
+            observer,
+            audit,
+          },
+          progress,
+        );
+        if done {
+          next_phase = Some(Phase::Sync {
+            touched: landing.touched.iter().cloned().collect(),
+            next: 0,
+            progress: SyncProgress::default(),
+          });
         }
       }
       Phase::Sync {
@@ -3269,7 +3536,7 @@ fn finish_landing<H: LandFs>(
     bytes_written: landing.bytes_written,
     durability,
     degraded: landing.degraded,
-    ramp_depth: landing.ramp.depth,
+    barriers: landing.barriers,
     costs,
     swept,
     target: target_dir,

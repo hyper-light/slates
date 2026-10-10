@@ -5,10 +5,14 @@
 //!
 //! Shape: every verb is relative to a descriptor the base host holds (`OsHost`, which resolves
 //! the one root path with `O_NOFOLLOW` and hands out handles); no verb takes a path string.
-//! Linux: `O_TMPFILE` temporaries linked by `linkat` through `/proc/self/fd`, `fdatasync`,
-//! `renameat2(RENAME_EXCHANGE)`, `fsync` on directories. macOS: hidden-name temporaries
-//! (`O_CREAT|O_EXCL`), `fcntl(F_BARRIERFSYNC)` as the data barrier, `renameatx_np(RENAME_SWAP)`,
-//! `fcntl(F_FULLFSYNC)` on the target as the media barrier when the grant asked for it. Both:
+//! Linux: `O_TMPFILE` temporaries linked by `linkat` through `/proc/self/fd`, `fdatasync` as each
+//! file's write-out (durable alone, so a batch's barrier adds nothing), `renameat2(RENAME_EXCHANGE)`,
+//! `fsync` on directories. macOS: hidden-name temporaries (`O_CREAT|O_EXCL`), `fsync` as each file's
+//! write-out and one `fcntl(F_BARRIERFSYNC)` per device as a batch's barrier (A-130),
+//! `renameatx_np(RENAME_SWAP)`, `fcntl(F_FULLFSYNC)` on the target as the media barrier when the grant
+//! asked for it. Linux's one call that covers a batch, `syncfs`, flushes every other writer's dirty data
+//! too: beside one busy writer a barrier took up to 3.7 s and a 16-file batch cost 4.0–7.8 ms a file
+//! against `fdatasync`'s 0.65–0.79 ms (2026-10-10, `BENCHMARKS.md`), so it is not used. Both:
 //! `fchmod` (on files and on each made directory, so the umask never edits a recorded mode),
 //! `futimens`, `unlinkat`, `mkdirat`, `symlinkat`, `renameat`. The three `unsafe`
 //! sites are the libc calls rustix does not wrap (`F_BARRIERFSYNC`, `F_FULLFSYNC`,
@@ -313,6 +317,34 @@ impl OsLand {
       rustix::io::Errno::OPNOTSUPP.raw_os_error(),
     ))
   }
+
+  /// The batch barrier on macOS: one `F_BARRIERFSYNC` per device among `files`, on that device's last file. The
+  /// barrier applies to everything `fsync`ed on its device before it, so it orders every file written out there; files
+  /// on another device (a mount inside the target) need that device's own.
+  #[cfg(target_os = "macos")]
+  fn order_written_out(&self, files: &[HostFile]) -> Result<(), HostError> {
+    let mut last_on_device = BTreeMap::new();
+    for file in files {
+      let device = rustix::fs::fstat(self.file(*file)?)
+        .map_err(refusal)?
+        .st_dev;
+      last_on_device.insert(device, *file);
+    }
+    for file in last_on_device.into_values() {
+      data_barrier(self.file(file)?)?;
+    }
+    Ok(())
+  }
+
+  /// The batch barrier elsewhere: each file's write-out (`fdatasync`) already made it durable, so nothing remains but
+  /// to refuse a handle this writer does not hold.
+  #[cfg(not(target_os = "macos"))]
+  fn order_written_out(&self, files: &[HostFile]) -> Result<(), HostError> {
+    for file in files {
+      self.file(*file)?;
+    }
+    Ok(())
+  }
 }
 
 /// The exchange: Linux `renameat2(RENAME_EXCHANGE)`.
@@ -406,14 +438,25 @@ fn exchange_names(_dir: BorrowedFd<'_>, _a: &str, _b: &str) -> Result<(), HostEr
   ))
 }
 
-/// The data barrier: Linux `fdatasync`.
+/// A file's write-out: Linux and the other unixes `fdatasync`, which makes the file durable alone; their batch barrier
+/// then adds nothing.
 #[cfg(not(target_os = "macos"))]
-fn data_barrier(fd: BorrowedFd<'_>) -> Result<(), HostError> {
+fn write_out_file(fd: BorrowedFd<'_>) -> Result<(), HostError> {
   rustix::fs::fdatasync(fd).map_err(refusal)
 }
 
-/// The data barrier: macOS `fcntl(F_BARRIERFSYNC)` (ordered against later writes, not a
-/// media flush; the media barrier is `sync_media`).
+/// A file's write-out: macOS `fsync`, which hands the file's data and attributes to the device (not a media flush);
+/// the batch's barrier after it orders them ahead of every later write.
+#[cfg(target_os = "macos")]
+#[allow(clippy::disallowed_methods)] // the write seam's own write-out (R1, D-26; AUD-29-31).
+fn write_out_file(fd: BorrowedFd<'_>) -> Result<(), HostError> {
+  rustix::fs::fsync(fd).map_err(refusal)
+}
+
+/// The data barrier: macOS `fcntl(F_BARRIERFSYNC)`: `fsync` of the file, then a barrier that "applies to I/O that have
+/// been flushed with fsync(2) on the same device before" — ordered against later writes, not a media flush (the media
+/// barrier is `sync_media`). fcntl(2) names the batch's use: "execute operations of phase one, then fsync(2) each FD and
+/// issue a single barrier. Finally execute operations of phase two" (implemented on HFS and APFS) [B: macOS fcntl(2)].
 #[cfg(target_os = "macos")]
 fn data_barrier(fd: BorrowedFd<'_>) -> Result<(), HostError> {
   // SAFETY: `fcntl` with `F_BARRIERFSYNC` takes no pointer argument; `fd` is a descriptor
@@ -540,8 +583,12 @@ impl LandFs for OsLand {
     Ok(())
   }
 
-  fn sync_file(&mut self, file: HostFile) -> Result<(), HostError> {
-    data_barrier(self.file(file)?)
+  fn write_out(&mut self, file: HostFile) -> Result<(), HostError> {
+    write_out_file(self.file(file)?)
+  }
+
+  fn barrier(&mut self, files: &[HostFile]) -> Result<(), HostError> {
+    self.order_written_out(files)
   }
 
   fn set_mode(&mut self, file: HostFile, mode: u32) -> Result<(), HostError> {

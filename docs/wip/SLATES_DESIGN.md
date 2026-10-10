@@ -4967,7 +4967,7 @@ for trace context. Status exposes these definitions consistently through CLI/MCP
 
 *Health signal catalog.* Every signal is `(value, freshness_ns)` and host-observed where a host can observe it: `daemon.alive` (the anchor's view: the child is running and answered its last heartbeat), `daemon.restarts` (the anchor's count), `segment.generation` (the anchor segment's generation word), `shard.loop_lag_ns{shard}` (the driver's measured lateness), `shard.tasks{shard}` (live tasks against the arena), `ring.depth{client}` (command slots pending), `client.parked{client}`, `memory.locked_bytes` and `memory.unlocked_bytes` (per shard and rolled up), `memory.pressure` (PSI slope, macOS level, Windows notification), `catalog.volumes{shard}`, `log.bytes{partition}` and `log.replay_ns` (the last replay's duration against the recovery budget), `lease.expiring` (leases within one term of expiry), `base.watcher{volume}` (live, overflowed, unavailable), `land.active` (landings in flight), `placed.pending` (records awaiting f+1), `mirror_age{volume}`, `config.version`, and the NFS service times a shard measured since boot, `nfs.local_p50_ns`, `nfs.local_p99_ns`, `nfs.local_off_cpu_p99_ns` and `nfs.forwarded_p99_ns` (so a slow client is split into the serve, the scheduler's share of it, and the cross-shard forward).
 
-*Metric names.* One namespace, dotted, unit-suffixed, labels in braces; counters end in `_total`, histograms in `_ns` or `_bytes`. Per host: `slates.requests_total{kind,outcome}`, `slates.refusals_total{kind}`, `slates.provision_ns` (the AC-2.1 histogram: p50, p99, p999, max, spinning and parked), `slates.ring_wait_ns{client}`, `slates.wake_ns`, `slates.spin_to_park_ratio`. Per shard: `slates.shard.step_ns`, `slates.shard.batch`, `slates.shard.parks_total`, `slates.shard.kicks_total`, `slates.shard.arena_exhausted_total`. Per volume (readable through `status`): `referenced_bytes`, `unique_bytes`, `locked_bytes`, `unlocked_bytes`, `hashing_backlog_bytes`, `dedup_hit_ratio`, `compression_ratio`, `lease_epoch`, `attachments`, `base_cache_hit_ratio`, `drifted_entries`, `watcher_state`; per green: `head_version`, `merges_per_s`, `verdict_p99_ns`, `merge_path_p99_ns`, `conflict_rate{source}`, `rebase_retry_rate`, `base_lag_p99_ns`, `stale_epoch_refusals_total`, `holder_mismatch_total`. Per landing (in the report and the audit log): `entries{outcome}`, `bytes_written`, `dir_sync_ns`, `window_ns_max`, `ramp_depth`. The machine profile and every derived constant are exported as `slates.derived{name}` with their inputs.
+*Metric names.* One namespace, dotted, unit-suffixed, labels in braces; counters end in `_total`, histograms in `_ns` or `_bytes`. Per host: `slates.requests_total{kind,outcome}`, `slates.refusals_total{kind}`, `slates.provision_ns` (the AC-2.1 histogram: p50, p99, p999, max, spinning and parked), `slates.ring_wait_ns{client}`, `slates.wake_ns`, `slates.spin_to_park_ratio`. Per shard: `slates.shard.step_ns`, `slates.shard.batch`, `slates.shard.parks_total`, `slates.shard.kicks_total`, `slates.shard.arena_exhausted_total`. Per volume (readable through `status`): `referenced_bytes`, `unique_bytes`, `locked_bytes`, `unlocked_bytes`, `hashing_backlog_bytes`, `dedup_hit_ratio`, `compression_ratio`, `lease_epoch`, `attachments`, `base_cache_hit_ratio`, `drifted_entries`, `watcher_state`; per green: `head_version`, `merges_per_s`, `verdict_p99_ns`, `merge_path_p99_ns`, `conflict_rate{source}`, `rebase_retry_rate`, `base_lag_p99_ns`, `stale_epoch_refusals_total`, `holder_mismatch_total`. Per landing (in the report and the audit log): `entries{outcome}`, `bytes_written`, `dir_sync_ns`, `window_ns_max`, `barriers`. The machine profile and every derived constant are exported as `slates.derived{name}` with their inputs.
 
 *Content-freedom.* No metric, span or health signal carries a path, a name or file content; the audit log carries the paths a landing touched and nothing else; a test in the observability crate asserts every emitted label against this rule.
 
@@ -5137,8 +5137,9 @@ entry either old or new, never torn).
    still refuses. The server refuses grant creation on the ring and MCP channels.
 4. *Lease and validate.* Take the landing lease on the canonical target (refuse
    `LandingLeaseHeld` while any other landing attempt holds it — another session's, or another of
-   the same session's; A-47), and start each entry only while the lease's term runs: an entry that
-   would start after it is `Skipped(LeaseEnded)` and the landing `Partial`; open the target
+   the same session's; A-47), and take each entry's write-capable steps only while the lease's term runs:
+   an entry that would start after it, or a staged file whose batch would be placed after it (A-130), is
+   `Skipped(LeaseEnded)` and the landing `Partial`; open the target
    directory descriptor with containment (Linux `openat2` with
    `RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS` for every component;
    `O_NOFOLLOW` chains on macOS; reparse-tag checks on Windows), refuse `EscapesTarget`,
@@ -5170,7 +5171,8 @@ entry either old or new, never torn).
    the landing never sees a referenced entry missing.
 6. *Write one entry.* Linux: `openat(dirfd, ".", O_TMPFILE|O_WRONLY)`; `writev` from the arena
    pages (io_uring, registered buffers, one linked chain per file: open → writev → fdatasync →
-   linkat to a hidden sibling name → `renameat2(RENAME_EXCHANGE)` with the target); reflink
+   linkat to a hidden sibling name → `renameat2(RENAME_EXCHANGE)` with the target; a batch's chains
+   wait on its barrier before their link, step 8, A-130); reflink
    (`FICLONE`) instead of writev when the target filesystem supports it and an identical file
    already exists in the target tree (found through the landing's own hash index of the
    manifest, never by scanning the disk); `futimens` before the exchange so incremental builds
@@ -5181,7 +5183,8 @@ entry either old or new, never torn).
    unchanged across that bounded read. A descriptor opened before the exchange cannot prove
    which inode was displaced. If verification fails, exchange back, remove the temporary, and record
    `Conflict(TargetInUse)` for the entry. macOS: a hidden sibling name, `pwritev` on a pool
-   thread, `fcntl(F_BARRIERFSYNC)`, `renamex_np(RENAME_SWAP)`, the same verify-and-undo;
+   thread, `fsync` and then the batch's `fcntl(F_BARRIERFSYNC)` (A-130), `renamex_np(RENAME_SWAP)`,
+   the same verify-and-undo;
    `clonefile` for reflinks where `VOL_CAP_INT_CLONE` says so. Windows: open the target with
    `FILE_SHARE_READ|FILE_SHARE_DELETE` and no write sharing (an outsider's handle without delete
    sharing is a sharing violation → `Conflict(TargetInUse)` before any write), validate through
@@ -5203,16 +5206,22 @@ entry either old or new, never torn).
    lands there. An exchange back removes only the temporary by its descriptor's inode, or the fresh
    directory by the identity it had at its hidden name; anything else there is kept. The seam offers
    no rename that replaces its destination.
-7. *Concurrency inside the landing.* In-flight entries start at the measured count of the
-   landing pool's cores and double while measured throughput rises by more than its variance and
-   per-entry latency p99 stays within the previous step's by the measured variance fraction
-   (Little's law applied online); the ramp backs off otherwise; the settled depth is remembered
-   in the profile for the session and for that target's filesystem. No disk is probed at boot.
-8. *Sync.* Data syncs happen inside each entry's chain; after the last entry, one directory sync
-   per touched directory in parallel (Linux `fsync` on the directory descriptors, or `syncfs`
-   once when the measured per-directory cost times the directory count exceeds the measured
-   `syncfs` cost; macOS one `F_FULLFSYNC` after the barriers when the grant asked for media
-   durability, otherwise the barriers only; Windows `FlushFileBuffers` on the directory handles).
+7. *Batches inside the landing (A-130).* A file is staged — written, given its mode and mtime, and
+   written out — and waits, open at its hidden name, for its batch's barrier; then the batch's files
+   are placed. A batch holds at most one copy window of pages (`chunk_bytes`), each file counted as at
+   least one page, so its barrier's work and the temporaries it holds open are bounded as every unit's
+   work is (AUD-29-25), and it closes before an entry of another class, before a file it has no room
+   for, at the end of the entries, and at a crash (abandoned: its temporaries removed, its entries left
+   for the resume). Its boundaries depend only on the manifest, the page and the window, never on where
+   a slice ends. The barrier per platform is step 8's. No disk is probed at boot.
+8. *Sync.* A file's data is durable before it is placed: its write-out, then its batch's barrier
+   (A-130; macOS `fsync` each, then one `F_BARRIERFSYNC` per device, the device's barrier ordering every
+   earlier write-out; Linux `fdatasync` each, the batch's `fdatasync`s to be issued together so journal
+   group commit merges them, owed). After the last entry, one directory sync per touched directory in
+   parallel (Linux `fsync` on the directory descriptors — never `syncfs`, which also flushes every other
+   writer's dirty data on the filesystem: beside one busy writer a `syncfs` took up to 3.7 s, A-130;
+   macOS one `F_FULLFSYNC` after the barriers when the grant asked for media durability, otherwise the
+   barriers only; Windows `FlushFileBuffers` on the directory handles).
    The outcome record states which durability the landing achieved, and the reply carries it with
    every Degraded cell met (A-45): a directory it could not open or sync (`Unsynced`), a media barrier
    asked for that failed (`MediaUnsynced`, as against `BarriersOnly` when not asked for), an entry of
@@ -5276,8 +5285,9 @@ of its own name by a later outsider edit: Degraded (`Kept`, the entry kept besid
 listed in the report). Sharing violation on Windows: same. Lease held by another
 attempt: Refused (`LandingLeaseHeld{holder}`), nothing written. Lease ended before the landing
 started (its wait for the lease outlasted the term): Refused (`LandingLeaseLost`), nothing written.
-Lease ended mid-landing (a holder paused past its term): the current entry finishes, no further
-entry starts (`Skipped(LeaseEnded)`), `Partial`; the resume takes a new lease. The landing's daemon
+Lease ended mid-landing (a holder paused past its term): nothing is placed after it — a staged file
+is removed unplaced and no further entry starts (`Skipped(LeaseEnded)`, A-130), `Partial`; the resume
+takes a new lease. The landing's daemon
 ends mid-landing (a crash, a cancellation): the lease is a durable record and holds the target
 until its term (A-47). Target escapes, not owned, or inside a
 slates mount: Refused before the lease is taken. Exchange unsupported on the filesystem: Degraded
@@ -5297,9 +5307,9 @@ with every finished entry listed.
 
 | Constant | Formula | Anchors |
 |---|---|---|
-| In-flight entries per landing | online ramp: start at pool cores; double while throughput rises by more than its variance and latency p99 holds; back off otherwise | per-entry latency and throughput samples inside the landing |
-| Landing pool size (macOS thread pool) | the settled in-flight depth, bounded by measured free cores | the ramp; the profile's core classes |
-| Directory sync strategy (Linux) | per-directory `fsync` unless directories × measured per-directory cost > measured `syncfs` cost | the first directory syncs of the landing |
+| Files per landing batch (A-130) | at most one copy window of pages, each file counted as at least one page (`chunk_bytes / page`, 16) | the content store's page and window |
+| Landing pool size (macOS thread pool) | the batch bound, bounded by measured free cores | the batch rule; the profile's core classes |
+| Directory sync strategy (Linux) | per-directory `fsync`; never `syncfs`, which flushes every writer's dirty data (measured, A-130) | — |
 | Racy window | filesystem timestamp granularity (cited table by filesystem type) + measured clock resolution | `statfs` type; `clock_getres` |
 | Landing lease term | measured landing duration p99 × k, renewed by keepalive while entries are in flight | landing duration histogram |
 | Grant term | the session's lifetime for session grants; the measured plan-to-grant interval p99 × k for single-use grants | audit log intervals |
@@ -5330,7 +5340,7 @@ stays in the overlay.
 > **Status (2026-09-05).** Implemented in `crates/land` (GAPS §8c, Phase 1 tasks 11–13):
 > steps 1–6, 8, 9 and 11 as written, with grants, leases and the audit log as in-process
 > records until Phase 2; step 7's ramp as a recorded policy (entries run one at a time until
-> the runtime's pool); step 10 for an empty target (a populated target waits on a hard-link
+> the runtime's pool; replaced by batches, A-130, 2026-10-10); step 10 for an empty target (a populated target waits on a hard-link
 > verb in the seam); reflinks and `syncfs` waiting on their measured costs; Windows waiting on
 > Phase 4. Two additions the oracle forced: a `Clear` action (a base directory the overlay
 > removed and recreated opaque: a fresh directory exchanged with the old one, the displaced
@@ -5410,6 +5420,19 @@ stays in the overlay.
 > without the exchange: a crash inside the fallback's window leaves the old entry aside, and the resume
 > puts it back before its verdicts. Record:
 > `docs/bugs/2026-09-29-a-landing-removal-could-remove-an-outsiders-replacement.md`.
+
+> **Status (2026-10-10, A-130).** A landing's files reach the disk in batches.
+> - **The flow:** each file is staged (written, its mode and mtime set, written out); each batch of at most one copy
+>   window of pages takes one barrier; then its files are placed.
+> - **macOS:** one `F_BARRIERFSYNC` per device a batch, after each file's `fsync`, as fcntl(2) prescribes.
+> - **Linux:** one `fdatasync` a file, until its batch barrier (the batch's syncs issued together) is built; `syncfs`
+>   is measured and rejected.
+> - The ramp is gone; the report carries `barriers`. Nothing is placed after the grant or lease ends, and an abandoned
+>   run closes its temporaries.
+> - **Held by the oracle:** the simulated host now fails a placement of an undurable temporary, and an advanced entry
+>   whose directory was not synced. Before, it recorded syncs no test read.
+> - **Measured on APFS:** 1.5–4.2× faster through the engine; the shard's other work waits 2–3× less during a landing.
+> - Record: `docs/bugs/2026-10-10-a-landings-durability-order-was-untested-and-an-abandoned-run-kept-its-temporaries-open.md`.
 
 **Integration points.** §4.4 (verbs, refusals, states), §4.5 (whiteouts, redirects, witnesses,
 copy-up, drift), §4.6 (base reads, invalidation on drift), §4.8 (grant, lease and
@@ -10991,3 +11014,104 @@ Status: proposed 2026-10-10.
   5. The per-grant lease (5), through hyper-swim's acknowledgement promise, requested upstream.
   6. The takeover's measured cost (3), also fed to hyper-swim's `set_condemnation_cost`.
   7. The remaining `HEARTBEAT_NS` sites.
+
+### A-130 — A landing's files reach the disk in batches, each behind one durability barrier (2026-10-10)
+Applied in the same change to:
+- §4.15 steps 4, 6, 7 and 8, its failure row for a lease that ends mid-landing, its derived-constants rows (files per
+  batch; the landing pool; the Linux directory sync), its status; §4.14's per-landing metrics (`barriers` replaces
+  `ramp_depth`);
+- `crates/vfs/src/host/mod.rs` (`LandFs::write_out` and `LandFs::barrier` replace `sync_file`);
+  `crates/vfs/src/host/sim.rs` (a temporary's durability: dirty, written out, durable behind a barrier, read by
+  `visible_before_durable`; directories changed since their last sync, read by `unsynced_dir`; `SimVerb::WriteOut` and
+  `SimVerb::Barrier`; the unread `take_synced_files` and `take_synced_dirs` removed);
+- `crates/land/src/os.rs` (macOS: `fsync` as the write-out, one `F_BARRIERFSYNC` per device as the barrier; Linux and
+  the other unixes: `fdatasync` as the write-out, nothing more at the barrier);
+- `crates/land/src/engine.rs` (stage, barrier, place; the fence at the barrier and at each placement; `release_write`
+  on abandon; `LandingReport::barriers`, `LandingCosts::barrier_ns`; the ramp and `LandingRequest::{cores, max_depth,
+  variance_permille}` removed) and `crates/land/src/ramp.rs` (deleted);
+- `crates/server/src/landing.rs` (its hardcoded `cores: 1, max_depth: 1, variance_permille: 0` gone with the fields),
+  `crates/ipc` (`LandingOutcome::barriers` replaces `ramp_depth`), and the CLI, MCP and Node SDK renderings;
+- tests: `crates/land/tests/oracle.rs` (`a_landed_file_is_durable_before_it_is_visible`,
+  `a_temporary_placed_before_its_barrier_is_recorded`, `every_landed_entry_has_its_directory_synced_before_it_advances`),
+  `durability.rs` (`a_refused_barrier_fails_its_whole_batch_and_shows_none_of_it`,
+  `files_land_in_batches_of_at_most_a_window_of_pages_behind_one_barrier_each`,
+  `an_abandoned_landing_leaves_no_handle_open`), `lease.rs` (`a_holder_paused_past_its_term_places_nothing_after_it`),
+  `crates/server/tests/daemon.rs`;
+- GAPS, BENCHMARKS, `docs/bugs/2026-10-10-a-landings-durability-order-was-untested-and-an-abandoned-run-kept-its-temporaries-open.md`.
+
+Status: built 2026-10-10 for macOS. Linux keeps one `fdatasync` a file until its batch barrier (below) is built.
+- **What it answers.**
+  - A landing made every file durable alone before placing it: Linux `fdatasync`, macOS `F_BARRIERFSYNC`. That one
+    call was about 97% of a Linux landing's cost a file (573–913 µs with it, 15–21 µs stubbed; ext4 in Docker) and
+    about half of macOS's (697–904 µs with it, 326–384 µs stubbed; APFS).
+  - The cost per file was flat from 1,000 to 16,000 files, over the simulated host (3.7–4.4 µs) and on both disks.
+    The 2026-10-01 finding that a landing's cost grew faster than its file count was the per-file sync's variance on a
+    shared disk, not growth.
+  - Step 7's concurrency ramp was never applied: entries ran one at a time, and its depth was only recorded. Its
+    latency rule is also wrong for batches. A batch's files all finish at its barrier, so per-file latency grows with
+    the batch by construction. Doubling while latency holds within the variance fraction `v` stops a batch once its
+    files' own work passes `v` of the batch's time, while the barrier is still about `1 − v` of it, near `v` of the
+    throughput batching can reach.
+- **The rule.**
+  - **Stage.** A file is written to its temporary, given its mode and mtime, and written out: its own share of its
+    durability. It then waits, open at its hidden name.
+  - **Barrier, then place.** A batch takes one barrier, then its files are placed, one per unit. Nothing of a batch is
+    placed before its barrier returns. Fsync-before-rename holds (Pillai et al., OSDI 2014): each rename waits on
+    its batch's barrier instead of its own file's.
+  - **When a batch closes:** before an entry of another class (step 5), before a file it has no room for, at the end
+    of the entries, and at a crash. A crashed landing abandons its batch: the temporaries are closed and removed, and
+    the entries left unwritten for the resume.
+  - **Room.** A batch holds at most one copy window of pages (`chunk_bytes`, 16 pages), each file counted as at least
+    one page. Its barrier's work and the temporaries it holds open are then bounded as every unit's work is
+    (AUD-29-25).
+  - **Deterministic.** Batch boundaries depend only on the manifest, the page and the window. A sliced landing
+    batches exactly as the one call does, and the crash oracle's write steps are the same on every run.
+  - **The lease fence.** Nothing is placed after the grant or lease ends. The barrier and each placement check the
+    fence, and a file staged under the term but placed after it is removed unplaced and `Skipped(LeaseEnded)`. Before,
+    a small file's whole write was one unit behind one check, so a paused holder's started entry landed after the term,
+    while a large file was already refused at its placement.
+  - **A refused barrier** fails every entry of its batch, as a refused per-file sync failed its one file: `ENOSPC` fails
+    the entries and the landing goes on, any other errno ends it. None of them is visible.
+  - **An abandoned run** closes the temporaries it holds: a staged batch, or a large file mid-copy. Before, they stayed
+    open in the host for as long as it lived.
+- **Per platform.**
+  - **macOS:** the write-out is `fsync`, which hands the file's data and attributes to the device. The barrier is one
+    `F_BARRIERFSYNC` per device among the batch, on its last file. fcntl(2) prescribes exactly this [B: macOS
+    fcntl(2), read 2026-10-10]:
+    - "The barrier applies to I/O that have been flushed with fsync(2) on the same device before", hence one barrier
+      per device.
+    - To order two phases over a set of descriptors, "execute operations of phase one, then fsync(2) each FD and issue
+      a single barrier. Finally execute operations of phase two."
+    - It is "currently implemented on HFS and APFS" and needs hardware support "which Apple SSDs are guaranteed to
+      provide".
+
+    On any other filesystem, each file still gets what the per-file barrier gave it: its own `fsync`, then the same
+    call before its placement. git's `core.fsyncMethod=batch` makes the same trade, "expected to be as safe as fsync
+    on macOS for repos stored on HFS+ or APFS filesystems and on Windows for repos stored on NTFS or ReFS filesystems".
+    It claims nothing for Linux [C: git-config(1), git 2.50.1].
+  - **Linux and the other unixes:** the write-out is `fdatasync`, which makes the file durable alone, so the barrier
+    adds nothing. Linux's only call that covers a batch, `syncfs`, flushes every writer's dirty data on the filesystem.
+    Measured beside one busy writer, it is the worst choice, so it is rejected for files and for directories.
+  - **Owed, Linux:** the batch's `fdatasync`s issued together, which journal group commit merges into one commit and
+    one flush. Beside a busy writer, 16 at once cost 142–177 µs a file against 756–1,666 µs one at a time (measured
+    below). A thread or io_uring per barrier is its own change, with its own A/B through the engine.
+- **Measured** (2026-10-10; scratch A/B, not kept: 2,000 files of 4 KiB in a fresh directory, per batch size `n`;
+  µs a file over three rounds, as ranges; `BENCHMARKS.md` has every round):
+  - macOS APFS, this machine, load 13–16 from other sessions: a barrier a file 604–954; batched `n=16` 192–211,
+    `n=64` 162–170, `n=2000` 139–170. Batches of 16 take 89–94% of the gain.
+  - Linux ext4, Docker Desktop's VM, kernel 6.12:
+    - `fdatasync` a file: 403–948 quiet, 648–795 beside a busy writer;
+    - `syncfs` batched: `n=16` 108–146 quiet but 4,045–7,847 busy, with single barriers up to 3.7 s; `n=2000` 19–25
+      quiet, 97–256 busy;
+    - concurrent `fdatasync`: 16 at once 255–631 quiet and 142–177 busy, against 756–1,666 busy one at a time.
+  - Through the engine (`land_bench flat`, interleaved with HEAD, 1,000 to 16,000 new files onto APFS, load
+    24–37): 423–713 µs a file against 916–1,764, 1.5–4.2× faster, steady as the load rose while the per-file barrier
+    was not. Over the simulated host the arms are within noise.
+  - The landing's percentile lane (600 files, one shard, interleaved with HEAD, load 27–29): the landing took
+    0.86–1.93 s against 1.24–1.97 s, slice p999 3.7–11.5 ms against 8.4–21.0 ms, and the reads, provisions and
+    leases served meanwhile waited 2–3× less at the median.
+- **Rejected:**
+  - `syncfs` as Linux's barrier and its directory sync (the busy rows above);
+  - the ramp as the batch's controller (its latency rule, above);
+  - a batch sized by a share of the process's descriptors: 64 files would take another 15–20% on macOS, but the daemon
+    accounts no descriptor share yet. Recorded for when it does.

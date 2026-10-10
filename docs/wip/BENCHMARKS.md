@@ -4609,3 +4609,103 @@ daemon's stop watch, and the change. Load average 26–30.
   `nfs_held` flows pass.
 - At rest, one shard's daemon and anchor together: 48 context switches a second this morning (37 + 11), 27 now
   (25 + 2).
+
+### Landed: a landing's files reach the disk in batches, one durability barrier each (A-130; 2026-10-10)
+
+**Commands:**
+- The batch-size sweep: a scratch A/B (`crates/land/examples/sync_ab.rs`, not kept), release, 2,000 files of 4 KiB in a
+  fresh directory per arm and three rounds. Per file: create a temporary and write it, then write it out (macOS
+  `fsync`; Linux nothing). Per batch of `n`: one barrier (macOS `F_BARRIERFSYNC` on the batch's last file; Linux
+  `syncfs`), then rename each file. "Per file" is the engine before A-130: Linux `fdatasync`, macOS `F_BARRIERFSYNC`
+  on each file. The busy rounds run the same while a second thread rewrites a 256 MiB region of a file on the same
+  filesystem in 1 MiB writes, never syncing.
+- Concurrent `fdatasync` (`sync_ab concurrent`): `d` threads each write and `fdatasync` their share, then every file
+  is renamed.
+- macOS: this machine (Apple Silicon, APFS), load 13–16. Linux: Docker Desktop's VM (kernel 6.12.76-linuxkit, ext4
+  on the VM's virtio disk), a container capped at 2 GiB and 2 build jobs, run as a non-root user; load on the host
+  23–26.
+
+**macOS APFS, µs a file** (longest single barrier in parentheses, µs):
+
+| round | per file | n=1 | n=2 | n=4 | n=8 | n=16 | n=32 | n=64 | n=256 | n=2000 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| quiet 0 | 953.9 | 882.7 (2,518) | 471.2 | 274.7 | 203.9 | 205.8 (2,485) | 173.0 | 161.9 | 151.6 | 169.5 (11,403) |
+| quiet 1 | 604.2 | 477.7 (7,345) | 338.3 | 309.6 | 228.3 | 191.9 (1,460) | 177.2 | 169.7 | 187.0 | 168.3 (11,175) |
+| quiet 2 | 869.3 | 646.2 (16,308) | 535.2 | 329.3 | 251.6 | 210.9 (3,542) | 174.8 | 170.2 | 133.1 | 139.4 (5,488) |
+| busy 0 | 860.2 | 1,382.8 | 583.5 | 481.3 | 261.5 | 171.3 (1,311) | 148.3 | 167.9 | 209.8 | 178.6 (5,286) |
+| busy 1 | 590.0 | 558.9 | 329.7 | 277.3 | 536.5 | 467.9 (38,989) | 199.5 | 164.4 | 154.5 | 166.7 (4,032) |
+| busy 2 | 676.3 | 586.1 | 452.7 | 339.2 | 256.0 | 219.0 (2,809) | 228.5 | 193.0 | 180.7 | 181.2 (5,046) |
+
+The macOS busy writer rewrote at memory speed (372,226 MiB in 25.9 s): APFS absorbed it in the page cache, so it loaded CPU
+and memory more than the disk.
+
+**Linux ext4, µs a file:**
+
+| round | per file (`fdatasync`) | n=1 | n=4 | n=16 | n=64 | n=256 | n=2000 |
+|---|---|---|---|---|---|---|---|
+| quiet 0 | 948.2 | 1,753.4 | 629.0 | 107.6 | 70.4 | 50.1 | 24.6 |
+| quiet 1 | 685.0 | 1,283.9 | 316.8 | 146.2 | 43.0 | 23.5 | 18.6 |
+| quiet 2 | 403.2 | 1,509.1 | 436.6 | 111.1 | 45.3 | 27.0 | 20.2 |
+| busy 0 | 648.5 | 76,054.6 | 23,901.6 | 4,045.1 | 1,361.4 | 439.1 | 96.9 |
+| busy 1 | 776.7 | 92,060.3 | 27,518.1 | 7,847.4 | 2,443.5 | 412.9 | 255.6 |
+| busy 2 | 794.5 | 71,951.7 | 37,585.6 | 6,432.9 | 2,513.7 | 733.1 | 163.3 |
+
+Longest single `syncfs` beside the busy writer: 604 ms, 3.72 s and 2.80 s (rounds 0–2).
+
+**Linux concurrent `fdatasync`, µs a file:**
+
+| round | d=1 | d=2 | d=4 | d=8 | d=16 |
+|---|---|---|---|---|---|
+| quiet 0 | 1,690.0 | 1,410.2 | 1,073.1 | 598.6 | 565.5 |
+| quiet 1 | 4,765.1 | 3,066.3 | 1,776.8 | 1,454.6 | 630.8 |
+| quiet 2 | 2,518.9 | 2,417.3 | 1,676.1 | 276.2 | 255.1 |
+| busy 0 | 1,665.5 | 553.8 | 374.5 | 204.6 | 176.8 |
+| busy 1 | 755.8 | 660.7 | 368.0 | 219.4 | 148.8 |
+| busy 2 | 844.9 | 488.0 | 333.5 | 173.5 | 142.4 |
+
+**Through the engine, macOS APFS** (`land_bench flat`, release; the per-file barrier is HEAD `85958800` built in a
+scratch worktree, interleaved with the change; µs a new file, median of 5 runs; load 24–37 from other sessions):
+
+| round | arm | 1,000 | 2,000 | 4,000 | 8,000 | 16,000 |
+|---|---|---|---|---|---|---|
+| 1 | barrier a file | 916 | 1,068 | 1,072 | 961 | 1,137 |
+| 1 | batched (my test builds overlapped it) | 449 | 602 | 713 | 641 | 591 |
+| 2 | barrier a file | 1,764 | 1,538 | 1,366 | 1,361 | 1,199 |
+| 2 | batched | 423 | 429 | 446 | 461 | 525 |
+
+Batched is 1.5–4.2× faster, and it held its cost while the load rose between rounds; the per-file barrier did not.
+Over the simulated host the arms are within noise, 4.4–5.3 against 4.2–5.6 µs an entry. A third arm with the
+simulated host's new bookkeeping stubbed ran 4.9–5.4, so the oracle adds no measurable cost at this load. The gated
+`land.land_per_entry_sim_1000_of_100000_engine_only` row ran 13.6–14.1 µs (HEAD) against 14.0–15.8 µs (medians, three
+rounds), with intervals overlapping. Both arms are about twice the row's 7,016 ns ceiling at this load, so the
+ratchet would fail them alike until the machine quiets.
+
+**The landing's percentile lane, before and after** (`landing_fairness a_large_landing -- --nocapture`, debug; HEAD's
+binary from the same scratch worktree, interleaved; 600 files on a one-shard daemon probed by reads, provisions and
+leases; load 27–29):
+
+| arm | landing | slices | slice p99 | slice p999 | slice max | read p50 | provision p50 | lease p50 |
+|---|---|---|---|---|---|---|---|---|
+| barrier a file | 1.24 s | 642 | 5.2 ms | 10.4 ms | 10.4 ms | 1.49 ms | 2.98 ms | 2.78 ms |
+| barrier a file | 1.97 s | 1,206 | 7.3 ms | 21.0 ms | 28.0 ms | 0.96 ms | 2.18 ms | 1.27 ms |
+| barrier a file | 1.26 s | 1,172 | 3.1 ms | 8.4 ms | 8.7 ms | 1.03 ms | 2.67 ms | 2.22 ms |
+| batched | 0.86 s | 1,790 | 1.2 ms | 4.2 ms | 4.7 ms | 0.36 ms | 0.98 ms | 0.73 ms |
+| batched | 0.88 s | 1,844 | 1.0 ms | 3.7 ms | 4.6 ms | 0.38 ms | 0.91 ms | 0.71 ms |
+| batched | 1.93 s | 1,663 | 3.1 ms | 11.5 ms | 21.7 ms | 0.64 ms | 1.42 ms | 1.13 ms |
+
+No slice ran past its budget in either arm. The work a landing's shard serves meanwhile waits 2–3× less at the
+median, because fewer units block it on a sync.
+
+**Seen in both arms, not caused by the change:** one shard step of 126–185 ms per run, and one probe per run waiting
+behind it. The 2026-10-01 runs, at load 4–6, saw longest steps of 13.8–25.5 ms. Open (GAPS, the same day).
+
+- **macOS:** batches of 16 take 89–94% of the gain to 2,000 (the copy window's bound, A-130); 64 take another 15–20%,
+  not taken until the daemon accounts a descriptor share.
+- **Linux, `syncfs` rejected:** fastest when the disk is quiet (19–25 µs a file at 2,000) and worst beside any other
+  writer, because it writes back that writer's dirty data too. At 16 files a batch it costs 5–12 times the per-file
+  `fdatasync`, with single barriers of seconds: one stalls the shard that runs it. Rejected for files and for §4.15's
+  directory sync.
+- **Linux, owed:** concurrent `fdatasync` holds up beside the busy writer (142–177 µs a file at 16, against 756–1,666
+  at one), because journal group commit merges in-flight fsyncs without touching other writers' data. It is Linux's
+  batch barrier, built next with its own A/B through the engine. The quiet rounds were noisy (the d=1 baseline ran
+  1,690–4,765 µs, against 403–948 in the sweep an hour earlier).

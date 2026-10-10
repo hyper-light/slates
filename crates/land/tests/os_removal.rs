@@ -229,9 +229,13 @@ impl LandFs for Interfering {
     self.tick();
     self.inner.write_at(file, off, bytes)
   }
-  fn sync_file(&mut self, file: HostFile) -> Result<(), HostError> {
+  fn write_out(&mut self, file: HostFile) -> Result<(), HostError> {
     self.tick();
-    self.inner.sync_file(file)
+    self.inner.write_out(file)
+  }
+  fn barrier(&mut self, files: &[HostFile]) -> Result<(), HostError> {
+    self.tick();
+    self.inner.barrier(files)
   }
   fn set_mode(&mut self, file: HostFile, mode: u32) -> Result<(), HostError> {
     self.tick();

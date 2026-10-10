@@ -169,11 +169,13 @@ impl Observer<SimHost> for Pause {
 }
 
 /// AUD-29-03 (a paused old holder). Do: land two replacements under a lease whose term is shorter than a
-/// pause the holder takes before its first write. Expect: the entry it had started lands, the next is
-/// `Skipped(LeaseEnded)` and left as it was on the disk, the landing is `Partial` and keeps the skipped entry
-/// in the overlay; a new holder's lease then lands the rest.
+/// pause the holder takes before its first write. Expect: nothing placed after the term — the entry it had
+/// started is staged but removed unplaced at its batch's barrier (A-130), the next never starts; both are
+/// `Skipped(LeaseEnded)` and left as they were on the disk, the landing is `Partial` and keeps both in the
+/// overlay; a new holder's lease then lands them. Before 2026-10-10 the started entry landed after the term:
+/// its whole write was one unit behind one fence check.
 #[test]
-fn a_holder_paused_past_its_term_starts_no_entry_after_it() {
+fn a_holder_paused_past_its_term_places_nothing_after_it() {
   let (mut host, mut store, mut vol, target) = two_files();
   let mut session = Session::new();
   let req = granted(&mut host, &mut store, &mut vol, &target, &mut session);
@@ -196,17 +198,31 @@ fn a_holder_paused_past_its_term_starts_no_entry_after_it() {
   assert_eq!(
     outcomes,
     vec![
-      Some(Outcome::Written),
+      Some(Outcome::Skipped(SkipReason::LeaseEnded)),
       Some(Outcome::Skipped(SkipReason::LeaseEnded))
     ],
     "{report:?}"
   );
   assert_eq!(report.state, LandingState::Partial);
-  assert_eq!(host.bytes("/a").unwrap(), b"new a");
+  assert_eq!(
+    host.bytes("/a").unwrap(),
+    b"old a",
+    "nothing placed after the term"
+  );
   assert_eq!(
     host.bytes("/b").unwrap(),
     b"old b",
     "no entry started after the term"
+  );
+  let hidden: Vec<String> = host
+    .paths()
+    .into_iter()
+    .map(|(path, _)| path)
+    .filter(|path| path.contains("/.slates-"))
+    .collect();
+  assert!(
+    hidden.is_empty(),
+    "the unplaced temporary was removed: {hidden:?}"
   );
   leases.release(&short);
   let resumed = Setup {
@@ -219,5 +235,6 @@ fn a_holder_paused_past_its_term_starts_no_entry_after_it() {
   .land(request(2))
   .unwrap();
   assert_eq!(resumed.state, LandingState::Done, "{resumed:?}");
+  assert_eq!(host.bytes("/a").unwrap(), b"new a");
   assert_eq!(host.bytes("/b").unwrap(), b"new b");
 }

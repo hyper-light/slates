@@ -911,6 +911,150 @@ fn crash_at_every_instruction(fs: Filesystem) -> usize {
     .sum()
 }
 
+/// §4.15 step 8, by use: a file the landing writes is durable before it is visible. Do: land the crash scenario (new
+/// files, replacements, removals and renames) on each simulated filesystem, in one call and stepped one unit per
+/// slice, on a host that records any landing temporary made visible under a real name while its bytes, mode or
+/// modification time were unsynced. Expect: none; every placement comes after its file's sync. Before 2026-10-10 no
+/// test read that order: the simulated host recorded syncs nobody checked.
+#[test]
+fn a_landed_file_is_durable_before_it_is_visible() {
+  for fs in [
+    LINUX,
+    MACOS,
+    Filesystem {
+      exchange: false,
+      unnamed_temporaries: true,
+    },
+    Filesystem {
+      exchange: false,
+      unnamed_temporaries: false,
+    },
+  ] {
+    for mut session in [Session::new(), Session::sliced()] {
+      let (mut host, mut store, mut vol) = crash_scenario(fs);
+      let target = root_target(&mut host);
+      let report = Setup {
+        host: &mut host,
+        target: &target,
+        vol: &mut vol,
+        store: &mut store,
+        session: &mut session,
+      }
+      .land(request(1))
+      .unwrap();
+      assert_eq!(report.state, LandingState::Done, "{report:?}");
+      assert!(report.written > 0, "the scenario wrote files: {report:?}");
+      assert!(
+        host.visible_before_durable().is_empty(),
+        "exchange {} unnamed {}: visible before durable: {:?}",
+        fs.exchange,
+        fs.unnamed_temporaries,
+        host.visible_before_durable()
+      );
+    }
+  }
+}
+
+/// §4.15 step 9, by use: an entry advances out of the overlay only once its directory is synced, and a rename's source
+/// directory too. Do: land the crash scenario on each simulated filesystem, in one call and stepped one unit per slice,
+/// on a host that tracks each directory changed since its last sync. Expect: the landing `Done` (every entry advanced),
+/// and every entry's directory that still exists, and a rename's source directory, synced after its last change.
+/// Before 2026-10-10 the simulated host recorded directory syncs nobody read.
+#[test]
+fn every_landed_entry_has_its_directory_synced_before_it_advances() {
+  for fs in [
+    LINUX,
+    MACOS,
+    Filesystem {
+      exchange: false,
+      unnamed_temporaries: true,
+    },
+    Filesystem {
+      exchange: false,
+      unnamed_temporaries: false,
+    },
+  ] {
+    for mut session in [Session::new(), Session::sliced()] {
+      let (mut host, mut store, mut vol) = crash_scenario(fs);
+      let target = root_target(&mut host);
+      let report = Setup {
+        host: &mut host,
+        target: &target,
+        vol: &mut vol,
+        store: &mut store,
+        session: &mut session,
+      }
+      .land(request(1))
+      .unwrap();
+      assert_eq!(report.state, LandingState::Done, "{report:?}");
+      let unsynced: Vec<String> = report
+        .entries
+        .iter()
+        .flat_map(|entry| {
+          let from = match &entry.action {
+            Action::Rename { from } => Some(split(from).0.to_owned()),
+            _ => None,
+          };
+          std::iter::once(split(&entry.path).0.to_owned()).chain(from)
+        })
+        .filter(|dir| {
+          let exists = dir == "/"
+            || host
+              .paths()
+              .iter()
+              .any(|(path, kind)| path == dir && *kind == HostKind::Dir);
+          exists && host.unsynced_dir(dir)
+        })
+        .collect();
+      assert!(
+        unsynced.is_empty(),
+        "exchange {} unnamed {}: advanced with their directory unsynced: {unsynced:?}",
+        fs.exchange,
+        fs.unnamed_temporaries
+      );
+    }
+  }
+}
+
+/// The check behind [`a_landed_file_is_durable_before_it_is_visible`] can fail, in each way a placement can come too
+/// early. Do: on the simulated host, place temporaries at real names after: nothing; a write-out alone; a barrier
+/// alone; a write-out, a later write, then a barrier; a write-out then a barrier. Expect: every name but the last
+/// recorded — a file is durable only once a barrier follows a write-out made after its last change (A-130).
+#[test]
+fn a_temporary_placed_before_its_barrier_is_recorded() {
+  use slates_vfs::host::LandFs;
+  let mut host = SimHost::new();
+  let root = host.root();
+  let temp = |host: &mut SimHost, n: u32| {
+    let file = host
+      .create_temp(root, &format!(".slates-0000000000000001-{n}"))
+      .unwrap();
+    host.write_at(file, 0, b"bytes").unwrap();
+    file
+  };
+  let unsynced = temp(&mut host, 0);
+  host.place(unsynced, root, "unsynced").unwrap();
+  let written_out = temp(&mut host, 1);
+  host.write_out(written_out).unwrap();
+  host.place(written_out, root, "written_out").unwrap();
+  let barrier_only = temp(&mut host, 2);
+  host.barrier(&[barrier_only]).unwrap();
+  host.place(barrier_only, root, "barrier_only").unwrap();
+  let changed = temp(&mut host, 3);
+  host.write_out(changed).unwrap();
+  host.write_at(changed, 5, b" more").unwrap();
+  host.barrier(&[changed]).unwrap();
+  host.place(changed, root, "changed").unwrap();
+  let durable = temp(&mut host, 4);
+  host.write_out(durable).unwrap();
+  host.barrier(&[durable]).unwrap();
+  host.place(durable, root, "durable").unwrap();
+  assert_eq!(
+    host.visible_before_durable(),
+    ["/unsynced", "/written_out", "/barrier_only", "/changed"].map(str::to_owned)
+  );
+}
+
 /// AUD-29-25. Do: land the crash scenario on each simulated filesystem in one call, then again stepped one
 /// unit per slice. Expect: the sliced run leaves the same disk, the same report (every entry's outcome and the
 /// counts) and the same overlay, and it took more slices than the manifest has entries — the slicing is

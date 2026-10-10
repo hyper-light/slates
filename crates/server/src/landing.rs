@@ -576,9 +576,6 @@ fn run_landing(
     now_ns: state.clock.monotonic_ns(),
     media_durability: false,
     large_class_bytes: state.config.large_class_bytes,
-    cores: 1,
-    max_depth: 1,
-    variance_permille: 0,
   };
   let slot = match state.volumes.get_mut(prepared.handle) {
     Ok(s) => s,
@@ -1082,9 +1079,6 @@ fn begin_granted(
     now_ns: state.clock.monotonic_ns(),
     media_durability: false,
     large_class_bytes: state.config.large_class_bytes,
-    cores: 1,
-    max_depth: 1,
-    variance_permille: 0,
   };
   let was_overlay = slot.volume.is_overlay();
   let not_run = |refusal: LandingRefusal, principal: Principal| {
@@ -1466,7 +1460,7 @@ pub(crate) fn deferred_reply() -> ReplyBody {
         dirs: 0,
       },
       degraded: Vec::new(),
-      ramp_depth: 0,
+      barriers: 0,
     },
   }
 }
@@ -1776,7 +1770,7 @@ fn finish(
       held: u64::try_from(report.held).unwrap_or(u64::MAX),
       durability: durability_of(&report.durability),
       degraded: report.degraded.iter().map(degradation_of).collect(),
-      ramp_depth: report.ramp_depth,
+      barriers: u64::try_from(report.barriers).unwrap_or(u64::MAX),
     },
   }
 }
