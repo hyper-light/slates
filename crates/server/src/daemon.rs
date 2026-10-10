@@ -1222,8 +1222,11 @@ impl Daemon {
   }
 
   /// Why this node keeps or drops direct contact with each other member it holds (`fleet::keeps_direct_contact_with`'s
-  /// rule, named per peer): for a formation failure's report, so a pair that never meshes says which side dropped the
-  /// other and why.
+  /// rule, named per peer), with the plane's facts about the pair: whether an epoch keys it (and the peer joined the
+  /// detector), and whether this node is the pair's canonical dialer, the lower anchor, which announces its epoch. For a
+  /// formation failure's report, so a pair that never meshes says which side dropped the other, why, and whether the
+  /// pair was ever keyed (2026-10-10: the next occurrence is to say whether an idle canonical dialer left a pair
+  /// unkeyed).
   pub fn fleet_contacts(&self) -> Result<Vec<(slates_db::HostId, String)>, ObserveError> {
     self.observe(self.shards.first().copied(), |s| {
       let host = s.fleet.host();
@@ -1231,7 +1234,18 @@ impl Daemon {
         .members()
         .iter()
         .filter(|&&peer| peer != host)
-        .map(|&peer| (peer, crate::fleet::direct_contact_reason(s, peer)))
+        .map(|&peer| {
+          let keyed = s.plane.keyed.get(&peer).copied();
+          let canonical =
+            crate::member_task::anchor_of(s, peer).map(|anchor| s.origin_anchor < anchor);
+          (
+            peer,
+            format!(
+              "{} keyed={keyed:?} canonical={canonical:?}",
+              crate::fleet::direct_contact_reason(s, peer)
+            ),
+          )
+        })
         .collect()
     })
   }

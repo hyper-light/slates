@@ -5414,6 +5414,19 @@ On a Linux release build of `faad1562` (A-126, the probe-storm fix and the reply
   report did not say which reason a held for d.
 - **Added:** each node's contact reason per peer in the formation failure report (`Daemon::fleet_contacts`,
   `fleet::direct_contact_reason`). The next occurrence names which side dropped the other and why.
+- **Second occurrence, 2026-10-10** (`a_location_round_asks_a_peer_whose_session_was_out_once_it_returns`, full suite
+  at load 90, 84 of 85):
+  - d held a as `Neighbour`, so it needs a probe session to a;
+  - a held d as `OutsideNeighbourhood`. Neighbourhoods are per owner: a holds d's content, d holds none of a's;
+  - d had no acknowledgement from a.
+- **Hypothesis, to test:** a pair's plane keys come from one canonical record session, which the lower-anchored node
+  dials. If that node is the side that dropped contact, its per-peer task idles once the consensus groups form, and
+  removes the record session each heartbeat. An epoch not announced by then is never announced, so d's probes to a are
+  never answered. That is load-dependent, as observed: formation's everyone-contacts-everyone window closes before
+  the slow side keys.
+- **Added:** each peer's line in the report now carries `keyed` (an epoch keys the pair, and the peer joined the
+  detector) and `canonical` (this node is the pair's dialer). The next occurrence confirms or refutes the hypothesis.
+  The fix it points to is a contact rule that also keeps a holder in contact with the owners it holds for.
 - Nothing in this day's changes touches session formation or the contact rule: A-127 and A-128 are NFS state and its
   records, and the pressure hold is admission.
 

@@ -165,7 +165,7 @@ impl std::fmt::Debug for PlaneState {
 
 /// The anchor a member id belongs to: the anchor whose learned id it is, or whose seed id it is (`FleetPeer::host`,
 /// what its record session is keyed by before it announces itself).
-fn anchor_of(state: &ShardState, member: HostId) -> Option<HostId> {
+pub(crate) fn anchor_of(state: &ShardState, member: HostId) -> Option<HostId> {
   state
     .learned_members
     .iter()
