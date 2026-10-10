@@ -8,7 +8,8 @@
 //! - an identity heard from a peer, for learn-on-contact.
 //!
 //! The shape is hyper-swim's own five-process test (hyper-raft `crates/hyper-swim/tests/cluster.rs`):
-//! 1. `step` polls the detector and queues the probe, its relay requests and its anti-entropy chunks;
+//! 1. `step` polls the detector and queues the probe, its relay requests and its anti-entropy chunks, and tells each
+//!    asker whose relayed probe passed this node's own deadline unanswered (a nack);
 //! 2. `receive` opens a datagram and hands each message to the detector;
 //! 3. `flush` seals at most one datagram per peer.
 //!
@@ -24,7 +25,8 @@
 //! - Before anything reaches the detector, the fleet decides ([`Fleet`]), as it did on a probe session:
 //!   - a probe is answered only for an identity learn-on-contact accepts, and the fleet records the answer for the
 //!     owner lease's holder side;
-//!   - an acknowledgement, an indirect answer or an anti-entropy chunk is folded only from an admitted identity;
+//!   - an acknowledgement, an indirect answer, a nack or an anti-entropy chunk is folded only from an admitted
+//!     identity;
 //!   - a relay request is served only for a target this node keeps direct contact with.
 //!
 //! **The owner lease's renewals** ride the same plane ([`crate::lease_renewal`]): each step the plane probes every
@@ -121,33 +123,71 @@ pub enum PlaneEvent {
 /// credited: it is the one dropped. Read from hyper-swim, so the two cannot drift.
 const RELAYS_PER_ASKER: usize = hyper_swim::detector::OUTSTANDING;
 
-/// The probes this node relays about one target for one asker, oldest first: each relayed probe's nonce and the asker's
-/// nonce it answers.
+/// A probe this node relays: its own nonce, the asker's nonce it answers, when this node's own deadline for the target
+/// passes (hyper-swim's `Ping::due_ns` for the relayed ping), and whether the asker has been told it passed unanswered.
+#[derive(Clone, Copy, Debug)]
+struct Relayed {
+  relayed: u64,
+  asked: u64,
+  due_ns: u64,
+  nacked: bool,
+}
+
+/// The probes this node relays about one target for one asker, oldest first.
 #[derive(Clone, Copy, Debug, Default)]
 struct RelayedProbes {
-  slots: [Option<(u64, u64)>; RELAYS_PER_ASKER],
+  slots: [Option<Relayed>; RELAYS_PER_ASKER],
 }
 
 impl RelayedProbes {
-  /// Keeps a relayed probe `relayed` answering the asker's `asked`, over the oldest when full.
-  fn record(&mut self, relayed: u64, asked: u64) {
+  /// Keeps a relayed probe `relayed` answering the asker's `asked`, due by `due_ns`, over the oldest when full.
+  fn record(&mut self, relayed: u64, asked: u64, due_ns: u64) {
+    let probe = Relayed {
+      relayed,
+      asked,
+      due_ns,
+      nacked: false,
+    };
     if let Some(free) = self.slots.iter_mut().find(|slot| slot.is_none()) {
-      *free = Some((relayed, asked));
+      *free = Some(probe);
       return;
     }
     self.slots.rotate_left(1);
     if let Some(newest) = self.slots.last_mut() {
-      *newest = Some((relayed, asked));
+      *newest = Some(probe);
     }
   }
 
-  /// The asker's nonce the relayed probe `relayed` answers, taken out, or `None` when it is not one of these.
+  /// The asker's nonce the relayed probe `relayed` answers, taken out, or `None` when it is not one of these. An answer
+  /// after its nack still goes back: the asker counts it as the target's evidence of life.
   fn take(&mut self, relayed: u64) -> Option<u64> {
     let slot = self
       .slots
       .iter_mut()
-      .find(|slot| slot.is_some_and(|(nonce, _)| nonce == relayed))?;
-    slot.take().map(|(_, asked)| asked)
+      .find(|slot| slot.is_some_and(|probe| probe.relayed == relayed))?;
+    slot.take().map(|probe| probe.asked)
+  }
+
+  /// Marks each relayed probe whose deadline has passed by `now_ns` unanswered, and not yet told, as told, handing its
+  /// asker's nonce to `nack`.
+  fn nack_due(&mut self, now_ns: u64, mut nack: impl FnMut(u64)) {
+    for probe in self.slots.iter_mut().flatten() {
+      if !probe.nacked && probe.due_ns <= now_ns {
+        probe.nacked = true;
+        nack(probe.asked);
+      }
+    }
+  }
+
+  /// When the next relayed probe not yet told passes its deadline.
+  fn next_due(&self) -> Option<u64> {
+    self
+      .slots
+      .iter()
+      .flatten()
+      .filter(|probe| !probe.nacked)
+      .map(|probe| probe.due_ns)
+      .min()
   }
 
   fn is_empty(&self) -> bool {
@@ -176,6 +216,10 @@ pub struct PlaneCounts {
   pub relayed: u64,
   /// Indirect answers this node credited: a relay reached the target this node's direct probe could not.
   pub indirect_acked: u64,
+  /// Nacks this node sent: a probe it relayed went unanswered by its own deadline for the target (Lifeguard's nack).
+  pub nacks_sent: u64,
+  /// Nacks this node took: a relay it asked judged its own leg to the target unanswered.
+  pub nacked: u64,
   /// Lease renewals this node sent its holders ([`crate::lease_renewal`]).
   pub renewals_sent: u64,
   /// Lease renewals its holders answered, each an [`PlaneEvent::Acked`].
@@ -197,6 +241,8 @@ pub struct MemberPlane {
   batch: Vec<(hyper_swim::HostId, MemberState)>,
   encoded: Vec<u8>,
   requests: Vec<PingReq>,
+  /// The nacks a step sends, each the asker, the target and the asker's nonce: reused, so a step allocates nothing.
+  nacks: Vec<(u64, u64, u64)>,
   /// Probes this node relays, by target and asker: each relayed probe's nonce and the asker's nonce, oldest first, at
   /// most [`RELAYS_PER_ASKER`] per pair, so bounded by the view squared. Each relayed probe is answered to its own
   /// asker (SWIM, Das, Gupta & Motivala, DSN 2002 §3), as memberlist keeps one handler per relayed probe's sequence
@@ -264,6 +310,7 @@ impl MemberPlane {
       batch: Vec::new(),
       encoded: Vec::new(),
       requests: Vec::new(),
+      nacks: Vec::new(),
       relaying: BTreeMap::new(),
       sent: VecDeque::with_capacity(members.get()),
       sent_bound: members.get(),
@@ -294,6 +341,8 @@ impl MemberPlane {
       boot_nonce: self.boot_nonce,
       configuration_version: u64::MAX,
       standing: Some(u64::MAX),
+      promise_ns: u64::MAX,
+      relay_within_ns: u64::MAX,
       gossip: GossipBatch::Entries(&[]),
       coordinate: Coordinate::Held(&coordinate),
     }
@@ -373,12 +422,21 @@ impl MemberPlane {
     self.plane.set_path(peer.0, max_datagram)
   }
 
-  /// When to [`step`](Self::step) next, on the owner's clock (`None`: on the next datagram).
+  /// When to [`step`](Self::step) next, on the owner's clock (`None`: on the next datagram): the detector's wake, the
+  /// next renewal, or the deadline of a probe this node relays, at which its asker is told it passed unanswered.
   pub fn wake(&self) -> Option<u64> {
-    match (self.detector.wake(), self.renewals.next_due()) {
-      (Some(detector), Some(renewal)) => Some(detector.min(renewal)),
-      (detector, renewal) => detector.or(renewal),
-    }
+    [
+      self.detector.wake(),
+      self.renewals.next_due(),
+      self
+        .relaying
+        .values()
+        .filter_map(RelayedProbes::next_due)
+        .min(),
+    ]
+    .into_iter()
+    .flatten()
+    .min()
   }
 
   /// The detector: its view, verdicts and reports.
@@ -455,9 +513,33 @@ impl MemberPlane {
   /// Polls the detector at `now_ns` and queues what it asks: its relay requests, the period's probe (carrying this
   /// node's gossip, its suspicion of the target first) and its anti-entropy chunks.
   pub fn step(&mut self, now_ns: u64, fleet: &mut impl Fleet) {
+    let local = hyper_swim::HostId(self.local.0);
+    // A probe this node relays, unanswered by its own deadline for the target: its asker is told so (Lifeguard's nack,
+    // hyper-swim's `SwimMessage::Nack`), and an answer after it still goes back.
+    let mut nacks = std::mem::take(&mut self.nacks);
+    nacks.clear();
+    for ((target, asker), probes) in &mut self.relaying {
+      probes.nack_due(now_ns, |asked| nacks.push((*asker, *target, asked)));
+    }
+    for &(asker, target, asked) in &nacks {
+      self.send(
+        asker,
+        &SwimMessage::Nack {
+          from: local,
+          target: hyper_swim::HostId(target),
+          nonce: asked,
+          boot_nonce: self.boot_nonce,
+          gossip: GossipBatch::Entries(&[]),
+        },
+      );
+    }
+    self.counts.nacks_sent = self
+      .counts
+      .nacks_sent
+      .saturating_add(u64::try_from(nacks.len()).unwrap_or(u64::MAX));
+    self.nacks = nacks;
     let mut requests = std::mem::take(&mut self.requests);
     let ping = self.detector.poll(now_ns, &mut requests);
-    let local = hyper_swim::HostId(self.local.0);
     self.counts.relays_asked = self
       .counts
       .relays_asked
@@ -614,6 +696,9 @@ impl MemberPlane {
             boot_nonce: self.boot_nonce,
             configuration_version: version,
             standing,
+            // No per-grant lease promise yet: the owner lease does not read one.
+            promise_ns: 0,
+            relay_within_ns: ack.relay_within_ns,
             gossip: GossipBatch::Entries(&batch),
             coordinate: Coordinate::Held(&coordinate),
           },
@@ -630,6 +715,7 @@ impl MemberPlane {
         boot_nonce,
         configuration_version,
         standing,
+        relay_within_ns,
         gossip,
         coordinate,
         ..
@@ -659,7 +745,7 @@ impl MemberPlane {
           _ => {
             self
               .detector
-              .on_ack(hyper_swim::HostId(sender), nonce, stamp_ns);
+              .on_ack(hyper_swim::HostId(sender), nonce, stamp_ns, relay_within_ns);
             let renewal = self.renewals.answered(from, nonce);
             if renewal.is_some() {
               self.counts.renewals_answered = self.counts.renewals_answered.saturating_add(1);
@@ -689,13 +775,15 @@ impl MemberPlane {
           return;
         }
         self.detector.apply_gossip(gossip);
-        let ping = self.detector.on_ping_req(target);
+        let ping = self
+          .detector
+          .on_ping_req(hyper_swim::HostId(sender), target, stamp_ns);
         self.counts.relayed = self.counts.relayed.saturating_add(1);
         self
           .relaying
           .entry((target.0, sender))
           .or_default()
-          .record(ping.nonce, nonce);
+          .record(ping.nonce, nonce, ping.due_ns);
         self.send(
           target.0,
           &SwimMessage::Ping {
@@ -721,6 +809,28 @@ impl MemberPlane {
         self.detector.apply_gossip(gossip);
         self.detector.on_indirect_ack(target, nonce, stamp_ns);
         self.counts.indirect_acked = self.counts.indirect_acked.saturating_add(1);
+        events.push(PlaneEvent::Heard {
+          from,
+          boot_nonce,
+          configuration_version: 0,
+        });
+      }
+      SwimMessage::Nack {
+        target,
+        nonce,
+        boot_nonce,
+        gossip,
+        ..
+      } => {
+        if !fleet.admit(from, boot_nonce) {
+          self.counts.refused_by_fleet = self.counts.refused_by_fleet.saturating_add(1);
+          return;
+        }
+        self.detector.apply_gossip(gossip);
+        self
+          .detector
+          .on_indirect_nack(hyper_swim::HostId(sender), target, nonce, stamp_ns);
+        self.counts.nacked = self.counts.nacked.saturating_add(1);
         events.push(PlaneEvent::Heard {
           from,
           boot_nonce,
@@ -768,6 +878,7 @@ fn message_sender(message: &SwimMessage<'_>) -> u64 {
     | SwimMessage::Ack { from, .. }
     | SwimMessage::PingReq { from, .. }
     | SwimMessage::IndirectAck { from, .. }
+    | SwimMessage::Nack { from, .. }
     | SwimMessage::Sync { from, .. } => from.0,
   }
 }

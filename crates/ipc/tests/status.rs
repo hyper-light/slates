@@ -112,10 +112,8 @@ fn report() -> ReplyBody {
           margin_ns: 179,
         },
         detector_relays: slates_ipc::protocol::DetectorRelayReport {
-          timeout_ns: 181,
-          samples: 191,
-          late: 193,
-          longest_ns: 197,
+          due_ns: 181,
+          stated: 191,
         },
       },
     }),

@@ -67,3 +67,22 @@ test prints it at both phases.
 - **Failures inflate the failure rate.** Every adopted death counts as a failure in the detector's MTBF estimate,
   false and refuted ones included. A false condemnation therefore makes the next verdicts more aggressive. That is in
   the handoff too.
+
+## Upstream (2026-10-10)
+
+hyper-raft took the three handoff items and replaced the local patch (`docs/timing.md` §2.7, "The relay stage" and
+"The margin"; `crates/hyper-swim/ORIGIN.md` items 15, 17 and 19):
+- **The relay stage.** A relay judges its own leg to the target by its own deadline and nacks when it passes
+  unanswered (Lifeguard's nack); each acknowledgement states when a relay's response is due (its longest deadline for
+  any member but the asker, plus `G`). The asker's stage ends once every relay asked has nacked, or at its span for
+  the slowest relay plus that relay's stated bound. A timer over relayed round trips was rejected: relays are asked
+  only when a probe goes unanswered, so on a network that answers every probe it takes no sample and rests at its
+  cold second in every bound. A late answer to a told probe takes back its pending condemnation.
+- **The cold case** is closed: a relay's deadline is its own, known before any relayed round trip.
+- **Unpriced condemnations.** The 0.713 came from the margin being capped at `η − G`, not from the pricing; the
+  margin is searched over every margin, and an owner states a condemnation's cost (`set_condemnation_cost`).
+- **Failures inflate the failure rate.** A death counts once it stands, once per member and incarnation.
+
+slates' member plane relays as the detector asks: each relayed ping carries its deadline, a nack goes to its asker
+when it passes, and a later answer still goes back. `status` shows the relay stage's bound
+(`fleet_detector_relays: due_ns stated`) in place of the timer.

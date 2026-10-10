@@ -714,17 +714,16 @@ fn detector_pool_report(state: &ShardState) -> slates_ipc::protocol::DetectorPoo
   }
 }
 
-/// This shard's failure detector's relay-stage timer (live on the control shard, empty elsewhere and on a laptop).
+/// This shard's failure detector's relay stage, as it bounds it (live on the control shard, empty elsewhere and on a
+/// laptop).
 fn detector_relay_report(state: &ShardState) -> slates_ipc::protocol::DetectorRelayReport {
   let Some(plane) = state.plane.plane.as_ref() else {
     return slates_ipc::protocol::DetectorRelayReport::default();
   };
   let relays = plane.detector().relays();
   slates_ipc::protocol::DetectorRelayReport {
-    timeout_ns: relays.timeout.map_or(0, nanos_of),
-    samples: relays.samples,
-    late: relays.late,
-    longest_ns: nanos_of(relays.longest),
+    due_ns: relays.due.map_or(0, nanos_of),
+    stated: u64::try_from(relays.stated).unwrap_or(u64::MAX),
   }
 }
 

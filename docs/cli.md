@@ -226,9 +226,11 @@ Then `fleet_detector_pool: configured=… samples=… refused=…` (JSON: `fleet
 which judges every pair without its own. A peer shown `measuring` with the pool unconfigured is judged by nothing until it
 has been silent past RFC 6298's timeout (at least 1 s).
 
-Then `fleet_detector_relays: timeout_ns=… samples=… late=… longest_ns=…` (JSON: `fleet.detector_relays`): the relay
-stage's own timer, RFC 6298's over the relayed round trips the detector measured (late ones included), which no relay
-stage ends before. `late` counts relayed answers that came after their probe's period had ended.
+Then `fleet_detector_relays: due_ns=… stated=…` (JSON: `fleet.detector_relays`): the relay stage as the detector bounds
+it. Each relay judges its own leg to the target by its own deadline and nacks when that passes unanswered; a stage
+ends once every relay asked has nacked, or when the slowest has its response due: the member's span for it plus the
+bound the relay stated on its acknowledgements. `due_ns` is that due for the slowest relay the member could ask (zero
+while no alive peer has stated a bound), and `stated` counts the peers that have stated one.
 
 Then one block per shard: its counters (`shard N: clients=… volumes=… served=…`), its refusals by
 kind, its health signals (`shard N catalog.volumes: 3 (age 0 ns)` — a signal that is absent prints

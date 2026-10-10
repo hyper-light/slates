@@ -1305,19 +1305,17 @@ pub struct DetectorPeerReport {
   pub refused: String,
 }
 
-/// The relay stage as the member's failure detector timed it (hyper-swim's `RelayReport`): RFC 6298's timer over the
-/// relayed round trips it measured, late ones included, which no relay stage ends before. A relay-reachable peer
-/// condemned under load says here whether its relayed answers were late, and by how much.
+/// The relay stage as the member's failure detector bounds it (hyper-swim's `RelayReport`): each relay judges its own
+/// leg to the target by its own deadline and nacks when that passes unanswered, and the stage ends once every relay
+/// asked has nacked, or when the slowest has its response due, by the member's span for it and the bound it stated.
+/// A relay-reachable peer condemned under load says here how long its relay stages could wait.
 #[derive(Wire, Clone, Debug, Default, PartialEq, Eq)]
 pub struct DetectorRelayReport {
-  /// The relay stage's measured timeout, nanoseconds (zero before a relayed round trip was measured).
-  pub timeout_ns: u64,
-  /// Relayed round trips measured: the first relayed answer to each relay stage.
-  pub samples: u64,
-  /// Of them, answers that came after their probe's period had ended.
-  pub late: u64,
-  /// The longest measured, nanoseconds.
-  pub longest_ns: u64,
+  /// The latest any relay the member could ask has its response due, from the request, nanoseconds (zero while no
+  /// alive peer has stated a relay bound, when an unanswered probe asks no relay).
+  pub due_ns: u64,
+  /// The peers that have stated a relay bound.
+  pub stated: u64,
 }
 
 /// The member's pooled verdict as its failure detector holds it (hyper-swim's `PoolReport`): what judges every pair that

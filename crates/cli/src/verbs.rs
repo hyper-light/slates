@@ -1816,8 +1816,8 @@ fn daemon_status_text(report: &DaemonReport, telemetry: &[TelemetryReport]) -> S
   ));
   let relays = &report.fleet.detector_relays;
   out.push_str(&format!(
-    "fleet_detector_relays: timeout_ns={} samples={} late={} longest_ns={}\n",
-    relays.timeout_ns, relays.samples, relays.late, relays.longest_ns
+    "fleet_detector_relays: due_ns={} stated={}\n",
+    relays.due_ns, relays.stated
   ));
   out.push_str(&format!(
     "fleet_detector_granularity_ns: {}\n",
