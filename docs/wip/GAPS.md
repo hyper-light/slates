@@ -4588,13 +4588,34 @@ fails under extreme load, on either detector snapshot.**
   - The test's "both paths lost" was a one-way loss. It now makes A and C deaf to B too.
   - Bug doc: `docs/bugs/2026-10-10-the-relay-retirement-test-modeled-a-one-way-loss.md`.
   - **Verified:** retire-phase failures fell from 6 in 14 concurrent runs to 0 in 36 (load 60–117).
-- **Still open, both in the detector (hyper-swim, the hyper-raft owner's code):** 4 failures in 36 runs remain, with
-  full evidence now in the messages.
-  - **Phase 1 (2 of 36):** A's detector never suspected B (`suspicions: 0`) in 4,000 periods while B refused 6,766 of
-    A's probes, so no relay was ever asked. A's detector still judged C as `measuring` (`configured: false`). This is
-    the shape of 2026-10-04's lost-first-probe wedge.
-  - **The hold (2 of 36):** A retired B after 4 and 12 periods with every relay request answered (17 asked, 17
-    credited). C's detector condemned nothing. A's detector report is now in the message for the next occurrence.
+- **Two detector-level failures remained after that** (4 in 36 runs). Their evidence is now in the messages.
+  - **Phase 1 (3 of 60): root cause found and fixed, 2026-10-10.**
+    - A never asked a relay because its detector held no verdict for B at all (`measuring`).
+    - Both of A's pairs had been made pool misfits by early stalled answers, so A's pool took 5 round trips and
+      refused for good (`CorrelationUnmeasured`).
+    - B's own estimator refused at 141 samples. Once B went silent it gave no more samples, so it was never judged.
+    - Fix: a local hyper-swim patch, pending upstream. While the pool has no verdict, a pair silent past RFC 6298's
+      timeout (at least 1 s) is judged provisionally.
+    - The status report now shows each pair's misfit flag and refusal, and the pool's.
+    - Bug doc: `docs/bugs/2026-10-10-a-silent-peer-was-never-judged-while-every-pair-was-a-pool-misfit.md`.
+    - My first reading of this, in the entry `bc11feba` added, was **wrong**. It named C as the `measuring` peer, but
+      C was the one with 3,445 samples. And it likened this to 2026-10-04's lost-first-probe wedge, which it is not.
+  - **The hold (2 of 36, then 3 of 48 after the phase-1 fix): root cause found and fixed, 2026-10-10.**
+    - In every failure A's own detector condemned B. In one: 2 suspicions, 2 condemnations, with all 37 relay requests
+      answered, 2 of them after their periods had ended. C condemned nothing.
+    - A judged the relay stage by borrowed direct spans. B's had been frozen since its direct path was lost (expected
+      250 µs, margin 125 µs, mistake bound 0.713).
+    - At load 100 a relayed round trip sometimes passed the 128 ms period floor. Each late answer was a suspicion, and
+      the told probe's relays, late in the same burst, made it a condemnation.
+    - Fix: a local hyper-swim patch, pending upstream. The relay stage is timed by RFC 6298's estimator over its own
+      relayed round trips, late ones included.
+    - Bug doc: `docs/bugs/2026-10-10-a-relay-reachable-peer-was-condemned-by-a-relay-stage-timed-from-stale-direct-spans.md`.
+    - The 2026-10-07 hypothesis below (C condemning B) did not fit these runs: C's detector condemned nothing.
+    - **Verified:** the relay test 0 failures in 84 runs after the fix (48 at load 60–67, 36 at 10–45), against 3 in
+      48 at load 90–106 before it. Phase-1 failures: 0 in 132 runs since the first patch.
+    - **Known limit (the cold case).** Before any relayed round trip is measured, a relay path slower than a told
+      probe's resolution (about 330 ms) still condemns. Waiting RFC 6298's initial 1 s would break the 900 ms
+      detection budget for crashes; that is Ada's call (A-125).
 - **The remaining hold failures, read (2 of 16 at 8 concurrent, load about 40, after the relay fix).** A's relays all
   answered: `relays_asked` 105 and 90, `indirect_acked` 105 and 90. So A's own detector kept B, yet B left A's fleet
   after 3 and 6 periods. C asked for relays 41 and 21 times, 9 of them unanswered in the first run. C asks only when
@@ -5609,3 +5630,27 @@ On a Linux release build of `faad1562` (A-126, the probe-storm fix and the reply
   precondition and had no exchange for the interruption to end.
 - **Fixed:** the precondition waits for a pending exchange itself (`Daemon::fleet_pending_discovery`, the exchange's
   registered waker). The failure message keeps each survivor's links, members, periods and exchange bound.
+
+### 2026-10-10: the probe-deafness fault let acknowledgements and anti-entropy through (fixed)
+
+- `a_council_leader_the_failure_detector_holds_dead_is_replaced_and_retired` failed 2 of 8 runs at `bc11feba` and 2 of
+  8 with the detector patches, so the detector patches did not cause it.
+- **Evidence.** In each failure the isolated leader was condemned and refuted over and over: 604 and 643 times within
+  the test's window. Neither survivor ever led.
+- **Cause.** `inject_probe_deafness` refused only the named peers' direct probes. Their acknowledgements, relayed
+  answers and anti-entropy chunks were still admitted. So the leader heard of its condemnation, and its refutations
+  reached the survivors, through anti-entropy.
+- Three of the fault's four uses meant total isolation: the council-leader test, the lease tests' owner isolation,
+  and the relay test's retire phase.
+- **Fixed.** `Fleet::hears` drops every datagram from a peer a node is deaf to. A deaf node models the one-way loss
+  from that peer; two deaf to each other are isolated.
+  - Bug doc: `docs/bugs/2026-10-10-the-probe-deafness-fault-let-anti-entropy-through.md`.
+  - **After the fix:**
+    - the council-leader test: 0 failures in 44 runs (8 alone; 16 beside 16 relay copies; 20 beside 20 relay and 8
+      whole-RAM copies);
+    - the relay test: 36 of 36;
+    - the whole-RAM replacement test: 8 of 8;
+    - the full fleet suite: 85 of 85 (315 s).
+  - The load stayed 10–45 throughout: idle fleet daemons now park, so 24 test copies load the machine to about 12.
+    The failures before ran at 60–117, from other sessions' work. Under that load the fix rests on the model and the
+    deterministic tests, not on these runs.

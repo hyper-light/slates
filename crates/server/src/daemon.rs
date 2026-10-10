@@ -2332,13 +2332,15 @@ impl Daemon {
     Ok(counters)
   }
 
-  /// Test support: makes this node's probe serve side leave the **direct** probes of `peers` unanswered
-  /// (an empty reply, which the prober reads as a timed-out probe), so a prober among them cannot reach this
-  /// node directly while every other peer still can — the asymmetric path loss the indirect-probe stage
-  /// exists for (§4.8 "direct probe → k indirect proxies"; AUD-15). Replaces any earlier set; an empty
-  /// `peers` restores full service. Relayed traffic is unaffected: a relay's own probe of this node, and
-  /// the ping-requests and indirect acknowledgements it carries, are answered as usual. Delivered like
-  /// [`Self::inject_discovery_fault`]; `Ok` once installed, else the typed refusal.
+  /// Test support: makes this node hear nothing from `peers` on the probe plane — every datagram from one of them is
+  /// dropped once opened, as a lost one would be — the one-way loss from each of them to this node (§4.8 "direct
+  /// probe → k indirect proxies"; AUD-15). A peer among them then reaches this node only through a relay, and this
+  /// node's own probes of it go unanswered too, since its answers are lost; two nodes deaf to each other are isolated
+  /// on the plane, while the record plane stays whole. Replaces any earlier set; an empty `peers` restores full
+  /// service. Before 2026-10-10 it only left their direct probes unanswered, while their acknowledgements, relayed
+  /// answers and anti-entropy still arrived, so an "isolated" council leader refuted its condemnation through
+  /// anti-entropy hundreds of times and was never retired. Delivered like [`Self::inject_discovery_fault`]; `Ok` once
+  /// installed, else the typed refusal.
   pub fn inject_probe_deafness(&self, peers: &[slates_db::HostId]) -> Result<(), ObserveError> {
     let deaf_to: std::collections::BTreeSet<slates_db::HostId> = peers.iter().copied().collect();
     self.observe(self.shards.first().copied(), move |s| {

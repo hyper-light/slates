@@ -59,6 +59,9 @@ impl Fleet for Believing {
   fn announced_version(&self) -> u64 {
     7
   }
+  fn hears(&self, _: HostId) -> bool {
+    true
+  }
   fn answer(&mut self, prober: HostId, _: u64, _: u64) -> Option<(u64, Option<u64>)> {
     (!self.refuses.contains(&prober.0)).then_some((7, Some(3)))
   }

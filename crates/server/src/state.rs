@@ -682,10 +682,9 @@ pub struct ShardState {
   /// Completed probes and live uses of the measured scheduler floor (§4.8), observed through
   /// `Daemon::fleet_probe_windows`. Fixed-size counters on their owning control shard.
   pub probe_windows: crate::fleet::ProbeWindows,
-  /// Test support (never reachable from the wire): peers whose **direct** probes this node's serve side
-  /// leaves unanswered — the asymmetric path loss the indirect-probe regression imposes (A cannot reach B,
-  /// but a relay can), without touching the transport. Empty in production
-  /// (`Daemon::inject_probe_deafness`).
+  /// Test support (never reachable from the wire): peers this node hears nothing from on the probe plane — the one-way
+  /// loss from each of them, which the indirect-probe and isolation regressions impose without touching the transport.
+  /// Empty in production (`Daemon::inject_probe_deafness`).
   pub probe_deaf_to: std::collections::BTreeSet<slates_db::HostId>,
   /// Test support (never reachable from the wire): how long this node waits before answering each location query
   /// and each forwarded verb, as a slow or distant owner would, so a test drives a forward's total time past the

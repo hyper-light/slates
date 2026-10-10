@@ -6002,16 +6002,17 @@ fn three_daemons_form_a_fleet_and_the_survivors_retire_a_dead_node() {
 const INDIRECT_HOLD_PERIODS: u64 = 100;
 
 /// AC (§4.8 "direct probe → k indirect proxies → SUSPECT → DEAD"; AUD-15): the live SWIM path runs the
-/// **indirect** stage. A cannot reach B directly (B leaves A's probes unanswered — an asymmetric path
-/// loss, injected at B's serve side so the transport is untouched), but A reaches C and C reaches B. A's
+/// **indirect** stage. A cannot reach B directly (B hears nothing from A on the probe plane — the one-way loss
+/// from A to B, injected at B so the transport is untouched; B's own probes of A go unanswered too, since A's
+/// answers are lost), but A reaches C and C reaches B. A's
 /// direct probe times out, A asks C to reach B, C's probe of B is acknowledged and C carries that answer
 /// back, and A credits it before the suspicion verdict — so B stays a member of A's fleet across a hold far
 /// longer than a direct-only detector needs to retire a silent peer. Non-vacuous on both sides: A counted a
 /// relayed answer credited and C counted itself relaying one (the membership plane's counts, A-67 H-2:
 /// `indirect_acked`, `relayed`), so a direct-only implementation cannot pass by B happening to answer.
-/// Then every path between B and the others goes, in both directions — B answers neither A nor C, and neither answers
-/// B — and the fleet **retires** B: the relay stage does not weaken eventual detection, it only spares a peer one path
-/// can still reach. Both directions, since a member that can still probe refutes its suspicion from the answers.
+/// Then every path between B and the others goes, in both directions — B hears neither A nor C, and neither hears B —
+/// and the fleet **retires** B: the relay stage does not weaken eventual detection, it only spares a peer one path can
+/// still reach. Both directions, since a member that still hears anyone learns its suspicion and refutes it.
 #[test]
 fn an_indirect_probe_through_a_relay_keeps_a_peer_the_direct_path_lost_and_losing_both_paths_retires_it()
  {
@@ -6034,10 +6035,10 @@ fn an_indirect_probe_through_a_relay_keeps_a_peer_the_direct_path_lost_and_losin
   let (host_a, host_b, host_c) = (hosts[0], hosts[1], hosts[2]);
   let observed = [a, b, c];
 
-  // B stops answering A's direct probes — and only A's. C's probes of B, and everything relayed, still
-  // work.
+  // B hears nothing from A on the probe plane, the one-way loss from A to B. B and C still hear each other, so every
+  // relay through C works, for A's probes of B and for B's of A.
   b.inject_probe_deafness(&[host_a])
-    .expect("the asymmetric loss is installed at B");
+    .expect("the one-way loss from A is installed at B");
 
   // A's direct probes of B now time out; the relay stage must run — A asks C, C reaches B, A credits it.
   let relay_start = a.fleet_progress();
@@ -6058,8 +6059,12 @@ fn an_indirect_probe_through_a_relay_keeps_a_peer_the_direct_path_lost_and_losin
   // refused about as many probes as A sent lease renewals) either never probed B or held B already condemned, and
   // these say which.
   let detector_a = match Client::connect(a.instance()).call(&RequestBody::DaemonStatus) {
-    ReplyBody::DaemonStatus { report } => report.fleet.detector,
-    _ => Vec::new(),
+    ReplyBody::DaemonStatus { report } => (
+      report.fleet.detector,
+      report.fleet.detector_pool,
+      report.fleet.detector_relays,
+    ),
+    _ => Default::default(),
   };
   let b_on_a = a.fleet_member_state(host_b);
 
@@ -6083,8 +6088,12 @@ fn an_indirect_probe_through_a_relay_keeps_a_peer_the_direct_path_lost_and_losin
   // answered (2026-10-10: 17 asked, 17 credited, B gone after 12 periods, C's detector condemning nothing) says here
   // whether A's detector condemned B, on what evidence, or whether B left A's fleet by another path.
   let detector_a_held = match Client::connect(a.instance()).call(&RequestBody::DaemonStatus) {
-    ReplyBody::DaemonStatus { report } => report.fleet.detector,
-    _ => Vec::new(),
+    ReplyBody::DaemonStatus { report } => (
+      report.fleet.detector,
+      report.fleet.detector_pool,
+      report.fleet.detector_relays,
+    ),
+    _ => Default::default(),
   };
   let b_on_a_held = a.fleet_member_state(host_b);
   // C's detector as its status reports it: whether C condemned B by its own probes, and how that compares with the
@@ -6098,16 +6107,16 @@ fn an_indirect_probe_through_a_relay_keeps_a_peer_the_direct_path_lost_and_losin
   let requested_by_a = counts_a.relays_asked;
   let relayed_by_c = c.fleet_plane_counts().unwrap_or_default().relayed;
 
-  // Now no path joins B and the others, in either direction: B answers neither A nor C, and neither answers B, and the
-  // fleet must retire it. Both directions, because a member that can still probe hears its suspicion in the answers and
-  // refutes it (hyper-swim's buddy system, by design): with B deaf alone, two failing runs found A and C holding B alive
-  // at incarnations 930 and 967, each a refutation its own probes carried (2026-10-10).
+  // Now no path joins B and the others, in either direction: B hears neither A nor C, and neither hears B, and the
+  // fleet must retire it. Both directions, because a member that still hears anyone learns its suspicion and refutes
+  // it (hyper-swim's buddy system, by design): with B deaf alone, two failing runs found A and C holding B alive at
+  // incarnations 930 and 967, each a refutation its own probes carried (2026-10-10).
   b.inject_probe_deafness(&[host_a, host_c])
     .expect("the total loss is installed at B");
   a.inject_probe_deafness(&[host_b])
-    .expect("A no longer answers B");
+    .expect("A no longer hears B");
   c.inject_probe_deafness(&[host_b])
-    .expect("C no longer answers B");
+    .expect("C no longer hears B");
   let survivors = [&daemons[0], &daemons[2]];
   let retire_start = [a.fleet_progress(), c.fleet_progress()];
   let retired = poll_until(&survivors, RETIREMENT_DEADLINE, || {
@@ -10912,7 +10921,7 @@ fn a_council_leader_the_failure_detector_holds_dead_is_replaced_and_retired() {
   for &index in &others {
     daemons[index]
       .inject_probe_deafness(&[hosts[leader]])
-      .expect("the others stop answering the leader's probes");
+      .expect("the others hear nothing from the leader");
   }
   let survivors: Vec<&Daemon> = others.iter().map(|index| &daemons[*index]).collect();
   let retired = poll_until(&survivors, RETIREMENT_DEADLINE, || {
@@ -10953,10 +10962,10 @@ fn isolate_owner_on_the_probe_plane(daemons: &[Daemon], hosts: &[HostId]) {
     .expect("A is isolated from B and C");
   daemons[1]
     .inject_probe_deafness(&[hosts[0]])
-    .expect("B stops answering A");
+    .expect("B hears nothing from A");
   daemons[2]
     .inject_probe_deafness(&[hosts[0]])
-    .expect("C stops answering A");
+    .expect("C hears nothing from A");
 }
 
 /// Format: `NFS3_OK` (RFC 1813 §2.6) — a READ served.

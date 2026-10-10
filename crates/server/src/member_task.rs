@@ -396,11 +396,6 @@ impl Fleet for StateFleet<'_> {
     {
       return None;
     }
-    // Test support: a peer this node is deaf to gets no acknowledgement of its direct probe, the asymmetric path loss
-    // the indirect-probe regression imposes.
-    if state.probe_deaf_to.contains(&prober) {
-      return None;
-    }
     // The holder side of the owner lease (§4.8 "Leases and reads"; AUD-08): when this node answered, and the
     // configuration version the prober announced.
     let now = slates_machine::clock::monotonic_ns();
@@ -408,6 +403,11 @@ impl Fleet for StateFleet<'_> {
     state.answers_given.announced(prober, configuration_version);
     let regional = state.council.configuration();
     Some((regional.version, regional.standing_of(prober)))
+  }
+
+  fn hears(&self, from: HostId) -> bool {
+    // Test support: nothing from a peer this node is deaf to reaches the plane, the probe-plane loss a test imposes.
+    !self.0.probe_deaf_to.contains(&from)
   }
 
   fn admit(&mut self, from: HostId, boot_nonce: u64) -> bool {

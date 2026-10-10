@@ -60,9 +60,13 @@ const WINDOW_LIMIT: usize = 1_024;
 pub trait Fleet {
   /// The newest configuration version this node knows (installed, or announced by a peer): what its probes announce.
   fn announced_version(&self) -> u64;
-  /// Whether to answer `prober`'s probe, which announced `boot_nonce` and `configuration_version`. `None` refuses: a
-  /// forged identity (learn-on-contact refused it) or a peer this node is deaf to; neither its gossip nor the probe
-  /// is folded. `Some((version, standing))` answers with the owner-lease evidence: the configuration version this
+  /// Whether this node takes any message from `from` on the plane: `false` only for a peer it is deaf to, the
+  /// probe-plane loss a test imposes, so every datagram from it is dropped once opened, as a lost one would be (a node
+  /// deaf to a peer models the one-way loss from that peer; two deaf to each other are isolated). Asked before any
+  /// message of the datagram is handled.
+  fn hears(&self, from: HostId) -> bool;
+  /// Whether to answer `prober`'s probe, which announced `boot_nonce` and `configuration_version`. `None` refuses a
+  /// forged identity (learn-on-contact refused it); neither its gossip nor the probe is folded. `Some((version, standing))` answers with the owner-lease evidence: the configuration version this
   /// node read the prober's `standing` at (§4.8 "Leases and reads"). The fleet records that it answered.
   fn answer(
     &mut self,
@@ -160,7 +164,7 @@ pub struct PlaneCounts {
   pub malformed: u64,
   /// Messages whose claimed sender was not the datagram's.
   pub impersonated: u64,
-  /// Messages the fleet refused: a forged identity, or a peer this node is deaf to.
+  /// Messages the fleet refused (a forged identity), and datagrams from a peer this node is deaf to, each counted once.
   pub refused_by_fleet: u64,
   /// Messages the plane refused to queue: no epoch for the peer, or a datagram already full.
   pub refused_queue: u64,
@@ -557,6 +561,10 @@ impl MemberPlane {
       return;
     };
     let sender = opened.sender;
+    if !fleet.hears(HostId(sender)) {
+      self.counts.refused_by_fleet = self.counts.refused_by_fleet.saturating_add(1);
+      return;
+    }
     for bytes in opened.messages() {
       match SwimMessage::decode(bytes) {
         Ok(message) if message_sender(&message) == sender => {
