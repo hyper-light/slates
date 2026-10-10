@@ -5496,3 +5496,13 @@ On a Linux release build of `faad1562` (A-126, the probe-storm fix and the reply
 - **Measured** (BENCHMARKS): one idle shard's context switches 32–34 → 23–24 a second.
 - **Owed:** the anchor's 11 switches a second at rest, if a coarser lapse check is ever worth a slower wedge
   detection, and a `powermetrics` idle-wakeup count on a quiet machine.
+
+### 2026-10-10: every anchor word read rebuilt the segment's region list (fixed; CPU)
+
+- Found in `sample` of an idle daemon: the process thread's stop check allocated on each heartbeat inside
+  `Geometry::regions`.
+- **Cause:** `Geometry::region` built every region to find one, 128–233 ns a lookup at 5–18 partitions. Every anchor
+  word read goes through it: about seven per log append, and partitions × 64 per pool scan, 391 µs for one scan at 18
+  partitions.
+- **Fixed:** the region is found by arithmetic over the layout's order. A structural test holds it to the list.
+- **Measured** (BENCHMARKS): a pool owner word 189–340 → 9–15 ns; a whole-pool scan 60/391 → 3–4/10–16 µs.

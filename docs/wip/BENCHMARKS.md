@@ -4553,3 +4553,32 @@ average 18–30.
 - **Left as it is:** the anchor's own 11 switches a second at rest (it reads the daemon's heartbeat each beat, so a
   wedged daemon is caught within one beat of the liveness budget; crashes reach it through its exit watch), and the
   doorbell thread's one-second bound.
+
+### Landed: an anchor region found by arithmetic, not by building the layout (CPU; 2026-10-10)
+
+**Command:** a scratch test, not kept, over a real `AnchorSegment` (release, this machine, load 20–45). It reads every
+pool owner word (`pool_owner`) of a fresh segment 200 times and reports the mean per read and per whole-pool scan:
+5 and 18 partitions, 64 owner words each. Arms: `ce01b29b`, the cached-table cut, and the final arithmetic lookup.
+
+| build | per owner word, 5 / 18 partitions | one whole-pool scan, 5 / 18 partitions |
+|---|---|---|
+| `ce01b29b` (each lookup builds the region list) | 189 ns / 340 ns | 60 µs / 391 µs |
+| final: `Geometry::region` by arithmetic (three runs) | 11–15 ns / 9–14 ns | 3–4 µs / 10–16 µs |
+
+- **Cause:** every word of the anchor segment is read through its region, and `Geometry::region` built the whole list,
+  about 65 entries at 18 partitions, to find one. It cost 128–233 ns a lookup (a second scratch timing over
+  `Geometry` alone).
+- **Where it fell:**
+  - a log append does about seven lookups;
+  - a pool scan does partitions × 64. One scan runs on every `Store::admittable` (a dynamic volume's `statfs`, every
+    refusal), every admission that grows from the pool, and every pressure refresh.
+- **Measured and rejected:**
+  - a region table built once per attachment and indexed: 6–8 ns a word, but it adds a field to `AnchorSegment`, which
+    every shard's state carries;
+  - keeping the arithmetic lookup out of line (`#[inline(never)]`): 8–15 ns against 9–15 ns inlined, dead even.
+- **Observed, not a cost:** `provision_bench`'s release binary grew from 5.9 to 8.1 MB of machine code with any of the
+  cuts, about 2,250 more symbols, nearly all fleet and TLS code. Under the whole-program LTO, the base build had dropped
+  code this in-process bench never reaches. The shipped `slates` binary is the same size either way:
+  11,752,832 bytes before against 11,751,200 after, machine code within 648 bytes.
+- `every_region_is_found_at_its_place_in_the_layout_and_no_other` holds the arithmetic to the layout's own list for
+  four shapes of geometry, and refuses kinds past it.
