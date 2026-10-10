@@ -287,9 +287,11 @@ pub struct Sessions {
   clients: BTreeMap<u64, Client>,
   owners: BTreeMap<Vec<u8>, u64>,
   sessions: BTreeMap<SessionId, Session>,
-  /// The clients dropped since the last [`Sessions::take_dropped`], whose state the owners must drop
-  /// too; never more than the client table held.
-  dropped: Vec<u64>,
+  /// The purges this table owes every owner (2026-10-10): one per client dropped and session destroyed here, held
+  /// until a round reaches every owner ([`Sessions::settle`]) and journaled with the drop where the table is durable,
+  /// so a restart owes them still ([`Sessions::restore`]). Bounded by the drops a round has not settled: every owner is
+  /// a shard of this daemon, so one owed past a round is a shard that could not make its drop durable, sent again.
+  owed: Vec<Purge>,
   /// The client changes since the last [`Sessions::take_changes`], for the listener's partition to
   /// record, when the table is durable (`None` for a standalone server); drained after every compound.
   changes: Option<Vec<ClientChange>>,
@@ -301,9 +303,6 @@ pub struct Sessions {
   guest_drops: Vec<(SessionId, u16)>,
   /// Guest sessions destroyed here, for their home to forget; never more than the guests held.
   forgotten: Vec<SessionId>,
-  /// Sessions destroyed here since the last [`Sessions::take_destroyed`], with their clients, whose call records every
-  /// owner must drop (A-127); never more than the sessions the table held.
-  destroyed: Vec<(u64, SessionId)>,
 }
 
 /// A client as a durable record carries it (§4.6 A-37): enough for a restarted listener to keep the
@@ -353,6 +352,21 @@ pub enum ClientChange {
   SessionSet(SessionRecord),
   /// A session was destroyed.
   SessionCleared(SessionId),
+  /// A purge became owed to every owner, journaled with the drop that made it (2026-10-10).
+  PurgeOwed(Purge),
+  /// An owed purge reached every owner.
+  PurgeSettled(Purge),
+}
+
+/// What a purge drops at an owner: a dropped client's file state and call records, or a destroyed session's call
+/// records (A-127). Owed from the drop until every owner acknowledged it, durably where the table is (2026-10-10): a
+/// death between the two otherwise left a dropped client's locks at an owner, with no lease of its left to expire them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Purge {
+  /// A client the table dropped (replaced, expired or destroyed).
+  Client(u64),
+  /// A session the table destroyed, of the client named.
+  Session(u64, SessionId),
 }
 
 impl Sessions {
@@ -366,12 +380,11 @@ impl Sessions {
       clients: BTreeMap::new(),
       owners: BTreeMap::new(),
       sessions: BTreeMap::new(),
-      dropped: Vec::new(),
+      owed: Vec::new(),
       changes: None,
       away: BTreeMap::new(),
       guest_drops: Vec::new(),
       forgotten: Vec::new(),
-      destroyed: Vec::new(),
     }
   }
 
@@ -384,11 +397,13 @@ impl Sessions {
   pub fn restore(
     boot: u32,
     limits: Limits,
-    records: Vec<ClientRecord>,
-    sessions_kept: Vec<SessionRecord>,
+    (records, sessions_kept, owed): (Vec<ClientRecord>, Vec<SessionRecord>, Vec<Purge>),
     now_ns: u64,
   ) -> Sessions {
     let mut sessions = Sessions::new(boot, limits);
+    sessions.owed = owed;
+    sessions.owed.sort_unstable();
+    sessions.owed.dedup();
     for record in records {
       sessions
         .owners
@@ -771,10 +786,10 @@ impl Sessions {
         }
         client.sessions.retain(|id| id != sessionid);
       }
-      if let Some(clientid) = owner {
-        self.destroyed.push((clientid, *sessionid));
-      }
       self.journal_session(sessionid);
+      if let Some(clientid) = owner {
+        self.owe(Purge::Session(clientid, *sessionid));
+      }
       return Ok(());
     }
     let session = self
@@ -790,14 +805,39 @@ impl Sessions {
     if let Some(client) = self.clients.get_mut(&session.clientid) {
       client.sessions.retain(|id| id != sessionid);
     }
-    self.destroyed.push((session.clientid, *sessionid));
+    self.owe(Purge::Session(session.clientid, *sessionid));
     Ok(())
   }
 
-  /// The sessions destroyed here since the last call, each with its client, whose call records every owner must drop
-  /// (A-127).
-  pub fn take_destroyed(&mut self) -> Vec<(u64, SessionId)> {
-    std::mem::take(&mut self.destroyed)
+  /// Owes `purge` to every owner, journaled after the drop that made it, so the two are recorded together.
+  fn owe(&mut self, purge: Purge) {
+    if !self.owed.contains(&purge) {
+      self.owed.push(purge);
+    }
+    if let Some(changes) = self.changes.as_mut() {
+      changes.push(ClientChange::PurgeOwed(purge));
+    }
+  }
+
+  /// The purges this table owes every owner, oldest first.
+  pub fn owed(&self) -> Vec<Purge> {
+    self.owed.clone()
+  }
+
+  /// Whether this table owes any purge.
+  pub fn owes(&self) -> bool {
+    !self.owed.is_empty()
+  }
+
+  /// Settles `purge`: every owner acknowledged it. Journaled, so a restart no longer owes it.
+  pub fn settle(&mut self, purge: &Purge) {
+    let before = self.owed.len();
+    self.owed.retain(|owed| owed != purge);
+    if self.owed.len() != before
+      && let Some(changes) = self.changes.as_mut()
+    {
+      changes.push(ClientChange::PurgeSettled(*purge));
+    }
   }
 
   /// The guest sessions destroyed here since the last call, for their home to forget ([`Sessions::forget_away`]).
@@ -1097,13 +1137,8 @@ impl Sessions {
           }
         }
       }
-      self.dropped.push(clientid);
       self.journal_client(clientid);
+      self.owe(Purge::Client(clientid));
     }
-  }
-
-  /// The clients dropped (replaced, expired or destroyed) since the last call.
-  pub fn take_dropped(&mut self) -> Vec<u64> {
-    std::mem::take(&mut self.dropped)
   }
 }

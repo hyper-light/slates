@@ -13,12 +13,12 @@
 use slates_bridge_nfs::v4::compound::Server as V4Server;
 use slates_bridge_nfs::v4::files::{FileChange, FileState, LockRecord, OpenRecord, Share};
 use slates_bridge_nfs::v4::lock::{LockKind, Range};
-use slates_bridge_nfs::v4::session::{ClientChange, ClientRecord, SessionRecord};
+use slates_bridge_nfs::v4::session::{ClientChange, ClientRecord, Purge, SessionRecord};
 use slates_bridge_nfs::v4::types::ChannelAttrs;
 use slates_db::Op;
 use slates_db::catalog::{
   NfsCallbackRecord, NfsChannelRecord, NfsClientRecord, NfsLockRange, NfsLockRecord, NfsOpenRecord,
-  NfsSessionRecord,
+  NfsPurgeRecord, NfsSessionRecord,
 };
 
 use crate::state::ShardState;
@@ -196,7 +196,10 @@ pub(crate) fn server(s: &mut ShardState) -> Option<V4Server> {
   let limits = crate::nfs::v4_limits(s);
   let now = slates_vfs::clock::Clock::monotonic_ns(&mut s.clock);
   let owner = server_owner(s.origin_anchor.0, &s.config.instance);
-  Some(V4Server::restore(instance, limits, (clients(s), sessions(s)), now).with_owner(owner))
+  Some(
+    V4Server::restore(instance, limits, (clients(s), sessions(s), purges(s)), now)
+      .with_owner(owner),
+  )
 }
 
 /// The `server_owner4` major id of the daemon instance `instance` on the host whose anchor identity is `anchor`
@@ -232,6 +235,34 @@ pub(crate) fn clients(s: &ShardState) -> Vec<ClientRecord> {
 }
 
 /// The sessions this shard's listener keeps, from its partition's records (A-127).
+/// The purges this shard's table owes its owners, from the partition's records (2026-10-10): what a restart left owed,
+/// sent by the next purge round.
+fn purges(s: &ShardState) -> Vec<Purge> {
+  s.db.partition().nfs_purges().map(purge_of).collect()
+}
+
+/// A purge from its record.
+fn purge_of(record: &NfsPurgeRecord) -> Purge {
+  match record.session {
+    Some(sessionid) => Purge::Session(record.clientid, sessionid),
+    None => Purge::Client(record.clientid),
+  }
+}
+
+/// A purge's record.
+fn purge_record(purge: Purge) -> NfsPurgeRecord {
+  match purge {
+    Purge::Client(clientid) => NfsPurgeRecord {
+      clientid,
+      session: None,
+    },
+    Purge::Session(clientid, sessionid) => NfsPurgeRecord {
+      clientid,
+      session: Some(sessionid),
+    },
+  }
+}
+
 pub(crate) fn sessions(s: &ShardState) -> Vec<SessionRecord> {
   s.db
     .partition()
@@ -356,6 +387,12 @@ fn client_op(change: ClientChange) -> Op {
       },
     },
     ClientChange::SessionCleared(sessionid) => Op::NfsSessionCleared { sessionid },
+    ClientChange::PurgeOwed(purge) => Op::NfsPurgeOwed {
+      record: purge_record(purge),
+    },
+    ClientChange::PurgeSettled(purge) => Op::NfsPurgeSettled {
+      record: purge_record(purge),
+    },
   }
 }
 

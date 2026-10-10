@@ -345,6 +345,16 @@ pub enum Op {
     /// Format: the session id (16 bytes).
     sessionid: [u8; 16],
   },
+  /// An NFSv4 purge became owed to every owner, with the drop that made it (2026-10-10). Appended.
+  NfsPurgeOwed {
+    /// The purge.
+    record: crate::catalog::NfsPurgeRecord,
+  },
+  /// An owed NFSv4 purge was acknowledged by every owner (2026-10-10). Appended.
+  NfsPurgeSettled {
+    /// The purge.
+    record: crate::catalog::NfsPurgeRecord,
+  },
 }
 
 impl Op {
@@ -402,6 +412,8 @@ impl Op {
       Op::NfsSessionCleared { .. } => "nfs_session_cleared",
       Op::NfsCallSet { .. } => "nfs_call_set",
       Op::NfsCallsCleared { .. } => "nfs_calls_cleared",
+      Op::NfsPurgeOwed { .. } => "nfs_purge_owed",
+      Op::NfsPurgeSettled { .. } => "nfs_purge_settled",
     }
   }
 }

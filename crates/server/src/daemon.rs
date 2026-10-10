@@ -2254,6 +2254,16 @@ impl Daemon {
     Ok(pooled.map(|pool| pool.saturating_add(held).saturating_add(debt)))
   }
 
+  /// Test support: every shard refuses (or takes again) the NFSv4 purges sent to it, as an owner that cannot make a
+  /// drop durable answers `NFS4ERR_DELAY` (2026-10-10). A test leaves a dropped client's purge owed with it, then proves
+  /// the purge outlives a restart.
+  pub fn inject_nfs_purge_refusal(&self, refused: bool) -> Result<(), ObserveError> {
+    for shard in self.shards.iter().copied() {
+      self.observe(Some(shard), move |s| s.nfs_purges_refused = refused)?;
+    }
+    Ok(())
+  }
+
   /// The memory-pressure hold now on each shard's byte budget (§4.2), in shard order — the capacity
   /// each withholds from new admission. Zero when the host is not under pressure (or has no sampler).
   /// An observation a shard could not answer is its typed refusal.
@@ -3132,6 +3142,7 @@ fn init_shard(
     pressure_resident_baseline: None,
     pressure_sent: vec![(0, 0); config_shards.len()],
     stop_watch: None,
+    nfs_purges_refused: false,
     answers_given: crate::lease::AnswersGiven::default(),
     departed_owners: std::collections::BTreeMap::new(),
     green_retention: std::collections::BTreeMap::new(),
@@ -3265,6 +3276,7 @@ async fn reap_loop() {
       CLIENTS_REAPED.fetch_add(u64::try_from(reaped).unwrap_or(u64::MAX), Ordering::AcqRel);
     }
     refresh_pressure_hold().await;
+    crate::nfs::purge_owed_here().await;
     state::with_state(|s| {
       process_base_hints(s);
       // The recalls the hints asked for are sent now: nothing else runs the drain while no call is served.

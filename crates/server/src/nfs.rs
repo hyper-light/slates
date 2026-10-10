@@ -1782,6 +1782,105 @@ fn note(counter: &'static str) {
 /// The v4 front end's backend in the daemon: each v3 call it makes presents the capability of the
 /// handle it names and is routed to the volume's owner shard as an NFSv3 call is; the v4 state is this
 /// shard's, reached through [`state::with_state`] and borrowed only inside each closure.
+/// The backend of a shard's own purge rounds (2026-10-10): what its NFSv4 table owes its owners and no compound's round
+/// settled, or a restart left owed ([`purge_owed_here`]). It serves only what a purge round calls: the owners and their
+/// file-state calls, and the table. A purge round makes no v3 call and acts for no client.
+struct PurgeBackend {
+  this: u16,
+}
+
+impl compound::Backend for PurgeBackend {
+  fn call_v3(
+    &mut self,
+    _procedure: u32,
+    _args: Vec<u8>,
+  ) -> impl std::future::Future<Output = Vec<u8>> {
+    // No v3 call is a purge's; an empty result decodes as malformed.
+    std::future::ready(Vec::new())
+  }
+
+  fn call_owner(
+    &mut self,
+    owner: u16,
+    procedure: u32,
+    args: Vec<u8>,
+  ) -> impl std::future::Future<Output = Vec<u8>> {
+    let this = self.this;
+    async move {
+      let Some(shard) = state::with_state(|s| s.shards.get(usize::from(owner)).copied()).flatten()
+      else {
+        return status_word(Nfsstat4::BadStateid);
+      };
+      let Ok(call) = crate::xshard::call_on(this, shard, move || {
+        Some(serve_file_state_here(procedure, &args, None))
+      }) else {
+        return status_word(Nfsstat4::Delay);
+      };
+      crate::xshard::within(call, crate::daemon::LIVENESS_BUDGET_NS)
+        .await
+        .unwrap_or_else(|| status_word(Nfsstat4::Delay))
+    }
+  }
+
+  fn owners(&self) -> Vec<u16> {
+    state::with_state(|s| {
+      (0..s.shards.len())
+        .filter_map(|partition| u16::try_from(partition).ok())
+        .collect()
+    })
+    .unwrap_or_default()
+  }
+
+  fn root_handle(&self) -> Nfsfh3 {
+    slates_bridge_nfs::multi::root_handle_with(NO_CAPABILITY)
+  }
+
+  fn principal(&self) -> u32 {
+    slates_bridge_nfs::access::INVALID_UID
+  }
+
+  fn now_ns(&self) -> u64 {
+    futures::now_ns()
+  }
+
+  fn with_v4<R>(&mut self, f: impl FnOnce(&mut V4Server) -> R) -> Result<R, Nfsstat4> {
+    state::with_state(|s| {
+      let result = s.nfs_v4.as_mut().map(f)?;
+      crate::nfs_state::record_clients(s).then_some(result)
+    })
+    .flatten()
+    .ok_or(Nfsstat4::Delay)
+  }
+}
+
+/// Sends the purges this shard's NFSv4 table owes its owners, if it owes any (2026-10-10): at the reap loop's cadence,
+/// so a purge an owner could not take, and every purge a restart left owed, goes out without waiting for a client. A
+/// table that is not built yet is built when its partition owes purges, as its first compound would build it.
+pub(crate) async fn purge_owed_here() {
+  let owes = state::with_state(|s| {
+    if s.nfs_v4.is_none() && s.db.partition().nfs_purges().next().is_some() {
+      s.nfs_v4 = crate::nfs_state::server(s);
+    }
+    s.nfs_v4
+      .as_ref()
+      .is_some_and(|server| server.sessions.owes())
+  })
+  .unwrap_or(false);
+  let Some(this) = state::with_state(|s| s.shard).filter(|_| owes) else {
+    return;
+  };
+  let mut backend = PurgeBackend { this };
+  if compound::purge_owed(&mut backend).await.is_err() {
+    note(NFS4_PURGE_ROUND_REFUSED);
+  }
+}
+
+/// Counter: a shard's own purge round its table refused to record (2026-10-10); the purges stay owed for the next round.
+const NFS4_PURGE_ROUND_REFUSED: &str = "nfs4.purge.round_refused";
+/// Counter: purges this shard refused because a test asked it to (`Daemon::inject_nfs_purge_refusal`): the hook's
+/// non-vacuity count.
+const NFS4_PURGES_REFUSED_INJECTED: &str = "nfs4.purge.refused_injected";
+
 struct RoutedBackend {
   this: u16,
   xid: u32,
@@ -2009,6 +2108,13 @@ fn serve_file_state_here(
       if crate::nfs_replay::refused(s, call) {
         return Some(status_word(Nfsstat4::Delay));
       }
+    }
+    let purge = procedure == slates_bridge_nfs::procedures::extension::STATE_PURGE_SESSION
+      || procedure == slates_bridge_nfs::procedures::extension::STATE_PURGE;
+    if purge && s.nfs_purges_refused {
+      // Test support (`Daemon::inject_nfs_purge_refusal`): refused as an owner that cannot make the drop durable is.
+      s.count(NFS4_PURGES_REFUSED_INJECTED, 1);
+      return Some(status_word(Nfsstat4::Delay));
     }
     if procedure == slates_bridge_nfs::procedures::extension::STATE_PURGE_SESSION {
       return Some(purge_session_here(s, args));

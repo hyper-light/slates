@@ -5516,7 +5516,7 @@ On a Linux release build of `faad1562` (A-126, the probe-storm fix and the reply
 - No test froze a daemon under its anchor. `a_frozen_daemon_is_killed_at_its_heartbeat_lapse_and_restarted` does now
   (gated by `SLATES_TEST_CLI=1`).
 
-### 2026-10-10: a dropped NFSv4 client's purge is owed only in memory (open; the next piece)
+### 2026-10-10: a dropped NFSv4 client's purge is owed only in memory (fixed the same day; see the bug doc)
 
 - When a client is dropped (lease expiry, `DESTROY_CLIENTID`) or a session destroyed, the shard holding it clears the
   record durably at once (`Op::NfsClientCleared`, `Op::NfsSessionCleared`). The purge it then owes every owner shard
@@ -5535,3 +5535,14 @@ On a Linux release build of `faad1562` (A-126, the probe-storm fix and the reply
   needed.
 - Proof owed: a kill between the drop and the purge (a fault hook holding the purge), then a restart, and the owner's
   lock released.
+
+### 2026-10-10: purges are owed durably (fixed)
+
+- The obligation is journaled with the drop and settled when every owner has acknowledged it. A restarted table reloads
+  what it owes, and each shard's reap loop sends a round.
+- `a_dropped_clients_purge_owed_at_a_restart_is_sent_after_it`: B's open is admitted after the restart. With the
+  restore of owed purges taken out it stays `NFS4ERR_SHARE_DENIED`.
+- Bug doc: `docs/bugs/2026-10-10-a-dropped-clients-purge-was-owed-only-in-memory.md`.
+- **Open:**
+  - departed sessions' guest drops (A-76) are memory-only, and harmless;
+  - the Docker kill bench is owed a run once the VM is restarted (Ada's call).

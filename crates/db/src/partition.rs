@@ -10,7 +10,7 @@
 //! handles (D-8). The lease expiry wheel is the runtime's hierarchical timing wheel keyed by
 //! the volume's slot, so expiry is a pop per tick, never a scan.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use slates_mem::{Handle, Slab};
 use slates_rt::timer::Wheel;
@@ -21,7 +21,7 @@ use crate::Art;
 use crate::catalog::{
   AttachmentRecord, AuditRecord, CompletionRecord, Consumer, ConsumerRecord, GrantRecord,
   LandingLeaseRecord, LandingRecord, LeaseRecord, LineageEdge, NfsCallRecord, NfsClientRecord,
-  NfsDelegationRecord, NfsLockRecord, NfsOpenRecord, NfsSessionRecord, Principal,
+  NfsDelegationRecord, NfsLockRecord, NfsOpenRecord, NfsPurgeRecord, NfsSessionRecord, Principal,
   SEAL_KEY_RECORD_BYTES, SEAL_RECIPIENT_RECORD_MAX, SealKeyOwner, SealKeyRecord, SnapshotId,
   SnapshotRecord, Tombstone, VolumeId, VolumeRecord,
 };
@@ -126,6 +126,8 @@ pub struct PartitionSnapshot {
   pub nfs_sessions: Vec<NfsSessionRecord>,
   /// The NFSv4.1 call records this partition's file-state changes carried, by session slot (A-127; appended).
   pub nfs_calls: Vec<NfsCallRecord>,
+  /// The NFSv4 purges this partition's shard owes its owners, not yet acknowledged by all (2026-10-10; appended).
+  pub nfs_purges: Vec<NfsPurgeRecord>,
 }
 
 /// The partition.
@@ -173,6 +175,9 @@ pub struct Partition {
   nfs_sessions: BTreeMap<[u8; 16], NfsSessionRecord>,
   /// The call records file-state changes carried (A-127), one per session slot, bounded by the shard's records.
   nfs_calls: BTreeMap<[u8; 20], NfsCallRecord>,
+  /// The purges this shard owes its owners (2026-10-10): one per client dropped or session destroyed here and not yet
+  /// acknowledged by every owner, bounded by the drops a round could not settle.
+  nfs_purges: BTreeSet<NfsPurgeRecord>,
   nfs_instance: u32,
   /// The destroyed volumes whose tombstone this owner still owes its candidate holders (AUD-29-43), by volume,
   /// each with the register sequence it is written at. A tombstone keeps its volume's slot of the volume
@@ -225,6 +230,7 @@ impl Partition {
       nfs_clients: BTreeMap::new(),
       nfs_sessions: BTreeMap::new(),
       nfs_calls: BTreeMap::new(),
+      nfs_purges: BTreeSet::new(),
       nfs_instance: 0,
       landing_leases: Art::new(),
       landings: BTreeMap::new(),
@@ -516,6 +522,11 @@ impl Partition {
     self.nfs_calls.values()
   }
 
+  /// The NFSv4 purges this partition's shard owes its owners (2026-10-10).
+  pub fn nfs_purges(&self) -> impl Iterator<Item = &NfsPurgeRecord> {
+    self.nfs_purges.iter()
+  }
+
   /// The partition's NFSv4 instance: the last one a daemon life advanced to.
   pub fn nfs_instance(&self) -> u32 {
     self.nfs_instance
@@ -585,6 +596,12 @@ impl Partition {
         self
           .nfs_calls
           .retain(|key, _| key.get(..sessionid.len()) != Some(&sessionid[..]));
+      }
+      Op::NfsPurgeOwed { record } => {
+        self.nfs_purges.insert(*record);
+      }
+      Op::NfsPurgeSettled { record } => {
+        self.nfs_purges.remove(record);
       }
       Op::NfsInstanceAdvanced { instance } => {
         self.nfs_instance = self.nfs_instance.max(*instance);
@@ -758,7 +775,9 @@ impl Partition {
       | Op::NfsSessionSet { .. }
       | Op::NfsSessionCleared { .. }
       | Op::NfsCallSet { .. }
-      | Op::NfsCallsCleared { .. } => Ok(()),
+      | Op::NfsCallsCleared { .. }
+      | Op::NfsPurgeOwed { .. }
+      | Op::NfsPurgeSettled { .. } => Ok(()),
       // A key is made once: a second record for its owner would leave two keys sealing one owner's content. A record
       // is hyper-seal's fixed length, so a malformed one never enters the log.
       Op::SealKeySet { record } => {
@@ -1032,6 +1051,8 @@ impl Partition {
       | Op::NfsSessionCleared { .. }
       | Op::NfsCallSet { .. }
       | Op::NfsCallsCleared { .. }
+      | Op::NfsPurgeOwed { .. }
+      | Op::NfsPurgeSettled { .. }
       | Op::NfsInstanceAdvanced { .. } => {
         self.apply_nfs(op);
         Ok(())
@@ -1363,6 +1384,7 @@ impl Partition {
       nfs_clients: self.nfs_clients.values().cloned().collect(),
       nfs_sessions: self.nfs_sessions.values().cloned().collect(),
       nfs_calls: self.nfs_calls.values().cloned().collect(),
+      nfs_purges: self.nfs_purges.iter().copied().collect(),
       nfs_instance: self.nfs_instance,
       tombstones: self.tombstones().collect(),
       green_chains: {
@@ -1415,6 +1437,9 @@ impl Partition {
     }
     for record in &snapshot.nfs_calls {
       self.nfs_calls.insert(record.key, record.clone());
+    }
+    for record in &snapshot.nfs_purges {
+      self.nfs_purges.insert(*record);
     }
     self.nfs_instance = snapshot.nfs_instance;
     for record in &snapshot.seal_keys {

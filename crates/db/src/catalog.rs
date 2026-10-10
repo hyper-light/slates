@@ -869,6 +869,18 @@ pub struct NfsCallRecord {
   pub record: Vec<u8>,
 }
 
+/// An NFSv4 purge a shard owes every owner shard (2026-10-10): a dropped client's file state and call records, or a
+/// destroyed session's call records. Recorded in the same transaction as the drop that makes it owed, and settled once
+/// every owner acknowledged it, so a death between the two cannot leave a dropped client's locks at an owner with no
+/// lease left to expire them.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct NfsPurgeRecord {
+  /// The client.
+  pub clientid: u64,
+  /// Format: the destroyed session's id (16 bytes), or `None` for the dropped client's whole state.
+  pub session: Option<[u8; 16]>,
+}
+
 /// Format: the bytes of hyper-seal's wrapped key record (version, parent id, parent generation, AES-256-KW of the key;
 /// seal.md §3.3).
 pub const SEAL_KEY_RECORD_BYTES: usize = 61;

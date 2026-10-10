@@ -166,6 +166,16 @@ impl Session {
     XdrReader::new(&reply).u32().unwrap()
   }
 
+  /// DESTROY_CLIENTID of this session's client (RFC 8881 §18.50), alone in its compound: its status. The client's
+  /// sessions must be destroyed first.
+  pub(crate) fn destroy_clientid(&mut self) -> u32 {
+    let mut args = frame(1);
+    args.u32(op::DESTROY_CLIENTID);
+    args.u64(self.clientid);
+    let reply = self.compound(args.as_slice());
+    XdrReader::new(&reply).u32().unwrap()
+  }
+
   /// Continues this session over a new connection to `port`, as a client reconnects after its server restarted.
   pub(crate) fn reconnect(&mut self, port: u16) {
     self.stream = TcpStream::connect(("127.0.0.1", port)).expect("connect to the NFS port");

@@ -3237,6 +3237,147 @@ fn an_open_and_a_close_retried_across_a_daemon_restart_are_answered_never_run_ag
   drop(segment);
 }
 
+/// Format: `NFS4ERR_SHARE_DENIED` (RFC 8881 §15.1.3.6): an OPEN whose access another open denies.
+const NFS4ERR_SHARE_DENIED: u32 = 10015;
+/// Format: `OPEN4_SHARE_DENY_NONE` and `OPEN4_SHARE_DENY_WRITE` (RFC 8881 §18.16).
+const DENY_NONE: u32 = 0;
+/// See [`DENY_NONE`].
+const DENY_WRITE: u32 = 2;
+
+/// OPEN of `name` in the volume at `capability` for open owner `owner`, for reading and writing and denying `deny` to
+/// every other open, creating it (guarded) when `create`: the compound's last result, or its status.
+fn open_denying(
+  session: &mut common::nfs4::Session,
+  capability: &str,
+  (owner, name): (&[u8], &str),
+  create: bool,
+  deny: u32,
+) -> Result<Vec<u8>, u32> {
+  /// Format: `OPEN4_SHARE_ACCESS_BOTH`, `OPEN4_NOCREATE`, `OPEN4_CREATE`, `GUARDED4`, `CLAIM_NULL` (RFC 7863).
+  const ACCESS_BOTH: u32 = 3;
+  const OPEN4_NOCREATE: u32 = 0;
+  const OPEN4_CREATE: u32 = 1;
+  const GUARDED4: u32 = 1;
+  const CLAIM_NULL: u32 = 0;
+  /// Format: `FATTR4_MODE` (attribute 33): bit 1 of the bitmap's second word.
+  const MODE_WORD: u32 = 1 << (33 - 32);
+  let clientid = session.clientid();
+  session.at_with(true, capability, &[], 1, |args| {
+    args.u32(slates_bridge_nfs::v4::compound::op::OPEN);
+    args.u32(0); // seqid, unused in NFSv4.1
+    args.u32(ACCESS_BOTH);
+    args.u32(deny);
+    args.u64(clientid);
+    args.opaque(owner);
+    if create {
+      args.u32(OPEN4_CREATE);
+      args.u32(GUARDED4);
+      args.u32(2); // the bitmap's words
+      args.u32(0);
+      args.u32(MODE_WORD);
+      args.opaque(&0o644u32.to_be_bytes());
+    } else {
+      args.u32(OPEN4_NOCREATE);
+    }
+    args.u32(CLAIM_NULL);
+    args.opaque(name.as_bytes());
+  })
+}
+
+/// 2026-10-10 (A-127's purges, made durable): a dropped client's purge outlives a restart. Do: client A opens a file
+/// denying writers, and client B's open of it for writing is refused `NFS4ERR_SHARE_DENIED`; every owner is made to
+/// refuse purges, and A destroys its session and its client id, so their purges are left owed; the daemon is stopped
+/// and started again over the same anchor. Expect B's open admitted once the restarted daemon's purge round has run.
+/// Before: the purge was owed only in memory, so after the restart no shard knew A, and A's open denied B for good.
+#[test]
+fn a_dropped_clients_purge_owed_at_a_restart_is_sent_after_it() {
+  let profile = common::machine_profile();
+  let instance = format!("srv-v4-purge-owed-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
+  let segment = anchor_segment("v4purgeowed", &profile, &config);
+  let first = Daemon::start(&profile, config.clone(), source_of(&segment)).unwrap();
+  first
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let mut client = connect(&instance);
+  client.create(&scratch("shared")).unwrap();
+  let capability = capability_path(&first, "shared");
+  let port = first.nfs_port().expect("the daemon is serving NFS");
+  let mut holder = common::nfs4::Session::open(port, b"purge-holder");
+  let mut writer = common::nfs4::Session::open(port, b"purge-writer");
+  let held = open_denying(
+    &mut holder,
+    &capability,
+    (b"holder", "denied"),
+    true,
+    DENY_WRITE,
+  );
+  let denied = open_denying(
+    &mut writer,
+    &capability,
+    (b"writer", "denied"),
+    false,
+    DENY_NONE,
+  );
+  first.inject_nfs_purge_refusal(true).unwrap();
+  let destroyed = holder.destroy();
+  let dropped = holder.destroy_clientid();
+  let refused = first
+    .refusals_on_every_shard()
+    .unwrap()
+    .get("nfs4.purge.refused_injected")
+    .copied()
+    .unwrap_or(0);
+  first.stop();
+
+  let second = Daemon::start(&profile, config, source_of(&segment)).unwrap();
+  let port = second
+    .nfs_port()
+    .expect("the restarted daemon is serving NFS");
+  writer.reconnect(port);
+  let mut admitted = open_denying(
+    &mut writer,
+    &capability,
+    (b"writer", "denied"),
+    false,
+    DENY_NONE,
+  );
+  let began = Instant::now();
+  while admitted.is_err() && began.elapsed() < SAMPLER_WAIT {
+    // The harness paces its poll of a purge round that runs at the reap cadence; shipped code parks on its driver.
+    #[allow(clippy::disallowed_methods)]
+    std::thread::sleep(SAMPLER_POLL);
+    admitted = open_denying(
+      &mut writer,
+      &capability,
+      (b"writer", "denied"),
+      false,
+      DENY_NONE,
+    );
+  }
+  second.stop();
+  drop(segment);
+  assert!(held.is_ok(), "A's open is granted: {held:?}");
+  assert_eq!(
+    denied.err(),
+    Some(NFS4ERR_SHARE_DENIED),
+    "while A's open lives, B's open for writing is denied"
+  );
+  assert_eq!(
+    (destroyed, dropped),
+    (0, 0),
+    "A destroyed its session, then its client id"
+  );
+  assert!(
+    refused >= 1,
+    "the owners refused the purges ({refused}), so they were left owed"
+  );
+  assert!(
+    admitted.is_ok(),
+    "after the restart the owed purge dropped A's open, and B's open is admitted: {admitted:?}"
+  );
+}
+
 /// A-127 (bounds): a destroyed session's call records are dropped at every owner, and the drop is made durable before
 /// it is acknowledged, so records never outlive their session. Do: a kept REMOVE on one session (its record kept at
 /// the volume's owner), then DESTROY_SESSION. Expect: the destroy succeeds and the daemon counts the record purged;

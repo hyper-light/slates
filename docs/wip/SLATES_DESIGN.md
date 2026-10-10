@@ -2364,6 +2364,14 @@ therefore one implementation shared by both versions.
   - A replaced, expired or destroyed client's state is purged at every owner partition, a bounded
     broadcast (the shard count). An owner that cannot be reached keeps its purge queued, retried on
     the next drop.
+    - **Amended 2026-10-10: a purge is owed durably.** The obligation is journaled in the same transaction as the drop
+      that makes it (`ClientChange::PurgeOwed`, `Op::NfsPurgeOwed`). It is settled only once every owner acknowledged
+      it (`Op::NfsPurgeSettled`). A restarted table reloads what it still owes, and each shard's reap loop sends a
+      round (`nfs::purge_owed_here`) besides a compound's own.
+    - Before, the obligation lived only in memory. A daemon death between a client's durable clear and every owner's
+      acknowledgement left its opens, locks and delegations at the owners, with no shard left knowing the client and so
+      no lease to expire them (`a_dropped_clients_purge_owed_at_a_restart_is_sent_after_it`;
+      `docs/bugs/2026-10-10-a-dropped-clients-purge-was-owed-only-in-memory.md`).
   - The front end reaches the owner through the state extension procedures (`STATE_*`), routed by the
     file handle as every v3 call is.
   - READ, WRITE and SETATTR carry their state id to the owner inside one call (`*_STATE`): the NFSv3

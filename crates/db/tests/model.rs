@@ -357,6 +357,10 @@ enum Step {
   NfsCall(u8, u8, u8),
   /// A destroyed session's call records dropped.
   NfsCallsClear(u8, u8),
+  /// An NFSv4 purge owed with a drop (2026-10-10): the client, and which of its sessions (or its whole state).
+  NfsPurgeOwe(u8, Option<u8>),
+  /// An owed purge settled by every owner.
+  NfsPurgeSettle(u8, Option<u8>),
   /// A sealing key recorded (A-92): its owner's kind (tenant, naming or lineage) and who.
   SealKey(u8, u8),
   /// A sealing key destroyed (crypto-erase).
@@ -403,6 +407,8 @@ fn step() -> impl Strategy<Value = Step> {
     1 => (0..4u8, 0..2u8).prop_map(|(c, n)| Step::NfsSessionClear(c, n)),
     2 => (0..4u8, 0..2u8, 0..4u8).prop_map(|(c, n, l)| Step::NfsCall(c, n, l)),
     1 => (0..4u8, 0..2u8).prop_map(|(c, n)| Step::NfsCallsClear(c, n)),
+    1 => (0..4u8, proptest::option::of(0..2u8)).prop_map(|(c, n)| Step::NfsPurgeOwe(c, n)),
+    1 => (0..4u8, proptest::option::of(0..2u8)).prop_map(|(c, n)| Step::NfsPurgeSettle(c, n)),
     1 => (0..3u8, 0..4u8).prop_map(|(k, w)| Step::SealKey(k, w)),
     1 => (0..3u8, 0..4u8).prop_map(|(k, w)| Step::SealKeyDestroy(k, w)),
     1 => Just(Step::Crash),
@@ -633,7 +639,9 @@ fn op_for(step: &Step, ids: &mut Ids, now_ns: u64) -> Option<Op> {
     step @ (Step::NfsSession(..)
     | Step::NfsSessionClear(..)
     | Step::NfsCall(..)
-    | Step::NfsCallsClear(..)) => return op_for_nfs_session(step),
+    | Step::NfsCallsClear(..)
+    | Step::NfsPurgeOwe(..)
+    | Step::NfsPurgeSettle(..)) => return op_for_nfs_session(step),
     Step::Crash => return None,
   })
 }
@@ -874,8 +882,22 @@ fn op_for_nfs_session(step: &Step) -> Option<Op> {
     Step::NfsCallsClear(client, session) => Op::NfsCallsCleared {
       sessionid: model_sessionid(*client, *session),
     },
+    Step::NfsPurgeOwe(client, session) => Op::NfsPurgeOwed {
+      record: model_purge(*client, *session),
+    },
+    Step::NfsPurgeSettle(client, session) => Op::NfsPurgeSettled {
+      record: model_purge(*client, *session),
+    },
     _ => return None,
   })
+}
+
+/// The purge record of client `client`'s session `session`, or of its whole state.
+fn model_purge(client: u8, session: Option<u8>) -> slates_db::catalog::NfsPurgeRecord {
+  slates_db::catalog::NfsPurgeRecord {
+    clientid: u64::from(client),
+    session: session.map(|session| model_sessionid(client, session)),
+  }
 }
 
 /// A sealing key's owner: a tenant, its naming key, or a volume's lineage, by `kind`.

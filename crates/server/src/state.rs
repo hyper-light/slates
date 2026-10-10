@@ -741,6 +741,9 @@ pub struct ShardState {
   /// The process thread's wait for a reason to stop (`Daemon::wait_for_stop`), asked at each heartbeat on the control
   /// shard; `None` until a process installs it (and on every other shard).
   pub(crate) stop_watch: Option<crate::daemon::StopWatch>,
+  /// Test support: this shard refuses every NFSv4 purge sent to it (`Daemon::inject_nfs_purge_refusal`), as an owner
+  /// that cannot make the drop durable does, so a test can leave a purge owed across a restart.
+  pub(crate) nfs_purges_refused: bool,
   /// The holder side of the owner lease (§4.8; AUD-08): when this node last answered each peer's direct
   /// probe reporting it alive, and the newest configuration version each announced — the evidence that
   /// gates a successor's promotion of a departed owner's objects at this holder
