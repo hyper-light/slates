@@ -1197,6 +1197,16 @@ impl Daemon {
     })
   }
 
+  /// The bound one record-plane exchange runs under on the control shard now (`fleet::record_exchange_budget_ns`):
+  /// derived from the slowest measured path tail, so it grows with load. A test that waits for an exchange to end at
+  /// its deadline reads it, rather than assuming its own wait outlasts it (2026-10-10: an interrupted discovery
+  /// exchange that ended at neither an invalidation nor a deadline inside a 30 s wait).
+  pub fn record_exchange_budget_ns(&self) -> Result<u64, ObserveError> {
+    self.observe(self.shards.first().copied(), |_| {
+      crate::fleet::record_exchange_budget_ns()
+    })
+  }
+
   /// What this node's fleet membership holds about `host` (its liveness and the incarnation it was asserted under), or
   /// `None` for a member it has never seen: what a rejoin test reads to tell a refutation (a higher incarnation, which
   /// only the member itself asserts) from a stale re-admission.
@@ -2460,10 +2470,23 @@ impl Daemon {
     })
   }
 
+  /// The members whose record link has a discovery exchange waiting now (the exchange registers its waker while it
+  /// waits, `ShardState::link_waiters`): what a test reads to know an exchange is pending, rather than inferring it from
+  /// a borrowed session, which a coordinator dispatch borrows too (2026-10-10: the whole-RAM replacement test took a
+  /// dispatch's borrow for a pending exchange, and failed when that survivor had no exchange to end).
+  pub fn fleet_pending_discovery(&self) -> Result<Vec<slates_db::HostId>, ObserveError> {
+    self.observe(self.shards.first().copied(), |s| {
+      s.link_waiters
+        .keys()
+        .filter_map(|anchor| s.learned_members.get(anchor).map(|learned| learned.host))
+        .collect()
+    })
+  }
+
   /// This node's record links (§4.8, `ShardState::record_sessions`): each peer with an entry, and whether
   /// its session is out on a borrow at the moment of the read — a dispatch's, or the link task's own
-  /// discovery exchange. A test reads it to prove an exchange is pending on a link before interrupting it,
-  /// and that a link to a fresh member exists after. The typed refusal when the control shard could not be
+  /// discovery exchange, which this cannot tell apart ([`Daemon::fleet_pending_discovery`] names a pending exchange).
+  /// A test reads it to prove a link to a fresh member exists. The typed refusal when the control shard could not be
   /// observed.
   pub fn fleet_record_links(&self) -> Result<Vec<(slates_db::HostId, bool)>, ObserveError> {
     self.observe(self.shards.first().copied(), |s| {

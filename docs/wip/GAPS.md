@@ -4580,6 +4580,21 @@ fails under extreme load, on either detector snapshot.**
   among them.
 - **Next:** check whether anything but a direct or relayed probe answer refreshes B's liveness. Lease renewals are
   answered on another path than the probe the test makes B deaf to.
+- **Root cause found and fixed, 2026-10-10.**
+  - Lease renewals are ordinary probes, gated alike, so that idea was ruled out. A led the council in every failure,
+    so a deaf leader holding off an election was ruled out too.
+  - Two failing runs then held B alive at incarnations 930 and 967 on both survivors. B, deaf only as a responder,
+    still probed A and C and heard its suspicion in their answers (the buddy system), and refuted each time.
+  - The test's "both paths lost" was a one-way loss. It now makes A and C deaf to B too.
+  - Bug doc: `docs/bugs/2026-10-10-the-relay-retirement-test-modeled-a-one-way-loss.md`.
+  - **Verified:** retire-phase failures fell from 6 in 14 concurrent runs to 0 in 36 (load 60–117).
+- **Still open, both in the detector (hyper-swim, the hyper-raft owner's code):** 4 failures in 36 runs remain, with
+  full evidence now in the messages.
+  - **Phase 1 (2 of 36):** A's detector never suspected B (`suspicions: 0`) in 4,000 periods while B refused 6,766 of
+    A's probes, so no relay was ever asked. A's detector still judged C as `measuring` (`configured: false`). This is
+    the shape of 2026-10-04's lost-first-probe wedge.
+  - **The hold (2 of 36):** A retired B after 4 and 12 periods with every relay request answered (17 asked, 17
+    credited). C's detector condemned nothing. A's detector report is now in the message for the next occurrence.
 - **The remaining hold failures, read (2 of 16 at 8 concurrent, load about 40, after the relay fix).** A's relays all
   answered: `relays_asked` 105 and 90, `indirect_acked` 105 and 90. So A's own detector kept B, yet B left A's fleet
   after 3 and 6 periods. C asked for relays 41 and 21 times, 9 of them unanswered in the first run. C asks only when
@@ -5580,3 +5595,17 @@ On a Linux release build of `faad1562` (A-126, the probe-storm fix and the reply
 - **Open:**
   - departed sessions' guest drops (A-76) are memory-only, and harmless;
   - the Docker kill bench is owed a run once the VM is restarted (Ada's call).
+
+### 2026-10-10: the whole-RAM replacement test took a dispatch's borrow for a pending discovery exchange (fixed)
+
+- `a_whole_ram_replacement_joins_as_a_fresh_voter_and_commits_after_another_loss` failed about 1 run in 12 under load.
+  One survivor's interrupted discovery exchange "ended typed" by neither an invalidation nor a deadline.
+- **Evidence** (the failure message, extended):
+  - that survivor's exchange bound was 1.1 s;
+  - it held no link to the dead incarnation and counted no discovery fault;
+  - it counted `fleet.link.stale_return`, a coordinator dispatch's late return.
+- **Cause:** the precondition waited for each survivor's link to the victim to be *borrowed*. A dispatch borrows the
+  same session, so a survivor whose link was out on a dispatch, and whose own exchange was not pending, passed the
+  precondition and had no exchange for the interruption to end.
+- **Fixed:** the precondition waits for a pending exchange itself (`Daemon::fleet_pending_discovery`, the exchange's
+  registered waker). The failure message keeps each survivor's links, members, periods and exchange bound.

@@ -6009,8 +6009,9 @@ const INDIRECT_HOLD_PERIODS: u64 = 100;
 /// longer than a direct-only detector needs to retire a silent peer. Non-vacuous on both sides: A counted a
 /// relayed answer credited and C counted itself relaying one (the membership plane's counts, A-67 H-2:
 /// `indirect_acked`, `relayed`), so a direct-only implementation cannot pass by B happening to answer.
-/// Then B goes silent to C as well — both paths lost — and the fleet **retires** B: the relay stage does
-/// not weaken eventual detection, it only spares a peer one path can still reach.
+/// Then every path between B and the others goes, in both directions — B answers neither A nor C, and neither answers
+/// B — and the fleet **retires** B: the relay stage does not weaken eventual detection, it only spares a peer one path
+/// can still reach. Both directions, since a member that can still probe refutes its suspicion from the answers.
 #[test]
 fn an_indirect_probe_through_a_relay_keeps_a_peer_the_direct_path_lost_and_losing_both_paths_retires_it()
  {
@@ -6053,6 +6054,14 @@ fn an_indirect_probe_through_a_relay_keeps_a_peer_the_direct_path_lost_and_losin
     a.fleet_members(),
     a.fleet_progress().saturating_sub(relay_start),
   );
+  // A's own detector, and what A holds about B: an A that never asked a relay (2026-10-10: requested 0, while B
+  // refused about as many probes as A sent lease renewals) either never probed B or held B already condemned, and
+  // these say which.
+  let detector_a = match Client::connect(a.instance()).call(&RequestBody::DaemonStatus) {
+    ReplyBody::DaemonStatus { report } => report.fleet.detector,
+    _ => Vec::new(),
+  };
+  let b_on_a = a.fleet_member_state(host_b);
 
   // Hold: across INDIRECT_HOLD_PERIODS of A's own periods B must stay a member of A's fleet. The wait ends
   // early if A retires B (a failure the assertion below then names), else at the period budget.
@@ -6070,6 +6079,14 @@ fn an_indirect_probe_through_a_relay_keeps_a_peer_the_direct_path_lost_and_losin
   let held_periods = a.fleet_progress().saturating_sub(start);
   let plane_a = a.fleet_plane_counts();
   let plane_c = c.fleet_plane_counts();
+  // A's own detector at the end of the hold, and what A's fleet holds about B: a hold lost with every relay request
+  // answered (2026-10-10: 17 asked, 17 credited, B gone after 12 periods, C's detector condemning nothing) says here
+  // whether A's detector condemned B, on what evidence, or whether B left A's fleet by another path.
+  let detector_a_held = match Client::connect(a.instance()).call(&RequestBody::DaemonStatus) {
+    ReplyBody::DaemonStatus { report } => report.fleet.detector,
+    _ => Vec::new(),
+  };
+  let b_on_a_held = a.fleet_member_state(host_b);
   // C's detector as its status reports it: whether C condemned B by its own probes, and how that compares with the
   // theory's allowance (a count far above it is a detector misjudging a live peer; one within it is the load).
   let detector_c = match Client::connect(c.instance()).call(&RequestBody::DaemonStatus) {
@@ -6081,9 +6098,16 @@ fn an_indirect_probe_through_a_relay_keeps_a_peer_the_direct_path_lost_and_losin
   let requested_by_a = counts_a.relays_asked;
   let relayed_by_c = c.fleet_plane_counts().unwrap_or_default().relayed;
 
-  // Now B goes silent to C too: no path reaches it, and the fleet must retire it.
+  // Now no path joins B and the others, in either direction: B answers neither A nor C, and neither answers B, and the
+  // fleet must retire it. Both directions, because a member that can still probe hears its suspicion in the answers and
+  // refutes it (hyper-swim's buddy system, by design): with B deaf alone, two failing runs found A and C holding B alive
+  // at incarnations 930 and 967, each a refutation its own probes carried (2026-10-10).
   b.inject_probe_deafness(&[host_a, host_c])
     .expect("the total loss is installed at B");
+  a.inject_probe_deafness(&[host_b])
+    .expect("A no longer answers B");
+  c.inject_probe_deafness(&[host_b])
+    .expect("C no longer answers B");
   let survivors = [&daemons[0], &daemons[2]];
   let retire_start = [a.fleet_progress(), c.fleet_progress()];
   let retired = poll_until(&survivors, RETIREMENT_DEADLINE, || {
@@ -6108,6 +6132,18 @@ fn an_indirect_probe_through_a_relay_keeps_a_peer_the_direct_path_lost_and_losin
       )
     })
     .collect();
+  // Who leads the council at the end of the wait, and what B itself holds: a leader that is deaf only on the probe
+  // plane still beats on the record plane, so no election would replace it, and a retirement of B would need B to
+  // commit it (2026-10-10: the next failing run is to say whether B led).
+  let leads = (a.council_leads(), b.council_leads(), c.council_leads());
+  let b_members = b.fleet_members();
+  // What each of A, C and B itself holds about B (liveness and incarnation): an incarnation climbing past the one B
+  // started at is B refuting suspicion, through its own probes or relayed ones, which keeps it a member by design.
+  let b_held = (
+    a.fleet_member_state(host_b),
+    c.fleet_member_state(host_b),
+    b.fleet_member_state(host_b),
+  );
 
   for daemon in daemons {
     daemon.stop();
@@ -6116,18 +6152,21 @@ fn an_indirect_probe_through_a_relay_keeps_a_peer_the_direct_path_lost_and_losin
     relayed,
     "A's direct probes of B timed out and the indirect stage ran: A credited a relayed answer \
      (acked={acked_on_a}, requested={requested_by_a}) and C relayed one (relayed={relayed_by_c}); at the end of the \
-     relay phase (A's plane, B's plane, C's plane, A's members, A's periods waited) {relay_evidence:?}"
+     relay phase (A's plane, B's plane, C's plane, A's members, A's periods waited) {relay_evidence:?}; A's detector \
+     {detector_a:?}; B as A holds it {b_on_a:?}"
   );
   assert!(
     held && kept,
     "B stayed a member of A's fleet for {INDIRECT_HOLD_PERIODS} of A's periods with A's direct path lost \
      (acked={acked_on_a}, relayed={relayed_by_c}, requested={requested_by_a}); it lasted {held_periods}; A's plane \
-     {plane_a:?}; C's plane {plane_c:?}; C's detector {detector_c:?}"
+     {plane_a:?}; C's plane {plane_c:?}; C's detector {detector_c:?}; A's detector {detector_a_held:?}; B as A's \
+     fleet holds it {b_on_a_held:?}"
   );
   assert!(
     retired,
     "with both paths lost, A and C retired B (the relay stage does not weaken eventual detection): B {host_b:?}; each \
-     survivor (id, members, plane, periods waited) {retire_views:?}"
+     survivor (id, members, plane, periods waited) {retire_views:?}; council leadership (A, B, C) {leads:?}; B's \
+     members {b_members:?}; B as held by A, C and B {b_held:?}"
   );
 }
 
@@ -9483,7 +9522,8 @@ fn a_fresh_restart_keeps_its_serve_session_while_the_predecessor_retires() {
 /// `docs/bugs/2026-09-16-discovery-await-strands-a-replacement-raft-voter.md`). Expect, before the voter
 /// set converges: each survivor's exchange ends typed (at its deadline, or invalidated by the replacement's
 /// identity), each survivor holds a record link to the fresh member, and the leader's appends reach it (its
-/// council contact climbs). Non-vacuous: the links to the victim are shown borrowed before it is stopped.
+/// council contact climbs). Non-vacuous: each survivor's discovery exchange to the victim is shown pending before the
+/// victim is stopped (`Daemon::fleet_pending_discovery`, not a borrowed session, which a dispatch borrows too).
 #[test]
 fn a_whole_ram_replacement_joins_as_a_fresh_voter_and_commits_after_another_loss() {
   let _serial = serialize_fleet_tests();
@@ -9919,17 +9959,18 @@ fn hold_the_victims_discovery_replies(daemons: &[Daemon], replaced: usize, old: 
         if node == replaced {
           return Ok(true);
         }
-        daemon.fleet_record_links().map(|links| {
-          links
-            .iter()
-            .any(|(host, borrowed)| *host == old && *borrowed)
-        })
+        // A discovery exchange pending on the link, not merely a borrowed session: a coordinator dispatch borrows the
+        // same session, and a survivor whose link was out on a dispatch had no exchange for the interruption to end
+        // (2026-10-10: it counted neither an invalidation nor a deadline, only the dispatch's late return).
+        daemon
+          .fleet_pending_discovery()
+          .map(|pending| pending.contains(&old))
       }))
     ),
-    "each survivor's record link to the victim is borrowed by a pending discovery exchange: {:?}",
+    "each survivor has a discovery exchange to the victim pending: {:?}",
     daemons
       .iter()
-      .map(Daemon::fleet_record_links)
+      .map(Daemon::fleet_pending_discovery)
       .collect::<Vec<_>>()
   );
 }
@@ -9956,10 +9997,23 @@ fn discovery_ended_typed(daemon: &Daemon) -> Result<bool, ObserveError> {
 fn assert_survivors_reach_the_replacement(daemons: &[Daemon], survivors: usize, fresh: HostId) {
   assert!(
     audit_wait(|| all_hold(daemons[..survivors].iter().map(discovery_ended_typed))),
-    "each survivor's discovery exchange to the dead incarnation ended typed: {:?}",
+    "each survivor's discovery exchange to the dead incarnation ended typed: {:?}; each survivor's record links \
+     (host, out on loan), the members it holds, its periods and its exchange bound (ns) {:?}",
     daemons[..survivors]
       .iter()
       .map(Daemon::fleet_refusals)
+      .collect::<Vec<_>>(),
+    // Whether an exchange is still out on its link at the end of the wait, and whether the survivor learned the fresh
+    // member, say which of the two failures it is: an exchange waiting out a long deadline, or one never woken by the
+    // replacement's learning (2026-10-10: survivor 1 counted neither an invalidation nor a deadline).
+    daemons[..survivors]
+      .iter()
+      .map(|daemon| (
+        daemon.fleet_record_links(),
+        daemon.fleet_members(),
+        daemon.fleet_progress(),
+        daemon.record_exchange_budget_ns()
+      ))
       .collect::<Vec<_>>()
   );
   assert!(
