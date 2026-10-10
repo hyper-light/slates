@@ -213,9 +213,11 @@ impl VolumeSet for ShardVolumeSet {
       let reply = with_export(s, volume, requester, rights, capability, |export| {
         export.serve_nfs(procedure, args)
       });
-      // A file state procedure's changes are durable before its reply leaves (§4.6 A-37); a change
-      // that could not be recorded has rebuilt the state from its records, and the call is refused.
-      if crate::nfs_state::record_files(s) {
+      // A file state procedure's changes are durable before its reply leaves (§4.6 A-37), with the record of the
+      // compound it belongs to (A-127); a change that could not be recorded has rebuilt the state from its records,
+      // and the call is refused.
+      let served = reply.as_ref().and_then(|reply| reply.as_deref());
+      if crate::nfs_state::record_files(s, served) {
         reply
       } else {
         Some(Some(status_word(Nfsstat4::Serverfault)))
@@ -255,7 +257,8 @@ impl VolumeSet for ShardVolumeSet {
   }
 
   fn serve_file_state(&mut self, procedure: u32, args: &mut XdrReader<'_>) -> Vec<u8> {
-    serve_file_state_here(procedure, args.rest())
+    // Reached inside `serve_local`, which answers and records a recorded compound's call around it (A-127).
+    serve_file_state_here(procedure, args.rest(), None)
   }
 }
 
@@ -441,6 +444,14 @@ fn needs_barrier(program: u32, procedure: u32, args: &[u8], results: &[u8]) -> b
   }
 }
 
+/// Whether a served call changed what a shard publication makes durable (A-127): every call [`needs_barrier`] names,
+/// and an `UNSTABLE` write, whose change a later publication carries.
+fn changes_volume(program: u32, procedure: u32, args: &[u8], results: &[u8]) -> bool {
+  let write = slates_bridge_nfs::procedures::state_io_inner(procedure).unwrap_or(procedure);
+  needs_barrier(program, procedure, args, results)
+    || (program == NFS_PROGRAM && write == NFSPROC3_WRITE && nfs_ok(results))
+}
+
 /// Whether an NFS reply's leading status is `NFS3_OK` (RFC 1813: every NFS result starts with its
 /// `nfsstat3`).
 fn nfs_ok(results: &[u8]) -> bool {
@@ -517,6 +528,10 @@ struct Requester {
   /// The NFSv4 client an operation's v3 call acts for (the client its compound's `SEQUENCE` named, A-80), so the
   /// owner's recall gate passes a delegation holder's own change; `None` for every other call.
   client: Option<u64>,
+  /// The recorded compound this call belongs to and its key in it (A-127): the shard that serves it answers it from
+  /// its records when it served it before a restart, and records it otherwise. `None` for a call of a compound whose
+  /// reply was not asked to be kept, and for every NFSv3 wire call.
+  call: Option<crate::nfs_replay::RecordedCall>,
 }
 
 impl Requester {
@@ -532,6 +547,7 @@ impl Requester {
         capability: None,
         dialect: Dialect::LOOPBACK_NFS3,
         client: None,
+        call: None,
       },
       None => Requester::root(),
     }
@@ -547,6 +563,7 @@ impl Requester {
       capability: None,
       dialect: Dialect::LOOPBACK_NFS3,
       client: None,
+      call: None,
     }
   }
 
@@ -904,8 +921,27 @@ fn serve_local(
   // procedure — content-free (an operation code, never a path or bytes). The clock and ring are reached
   // through `with_state`, taken at the call's edges — outside `serve_call`'s own per-operation borrows,
   // so there is no re-entrant borrow.
+  // A call of a recorded compound (A-127) that this shard served for the same compound before a restart is answered
+  // from its record, never served again. Answering changes nothing, so it comes before any refusal a change would meet.
+  let call = requester.call;
+  if let Some(answer) = call
+    .as_ref()
+    .and_then(|call| state::with_state(|s| crate::nfs_replay::answered(s, call)).flatten())
+  {
+    return (AcceptStatus::Success, answer);
+  }
   if let Some(refused) = refused_for_write_delegation(&requester, program, procedure, args) {
     return refused;
+  }
+  // Refused before it runs when recording it would pass the records' bound (A-127).
+  if call
+    .as_ref()
+    .is_some_and(|call| state::with_state(|s| crate::nfs_replay::refused(s, call)) == Some(true))
+  {
+    return (
+      AcceptStatus::Success,
+      status_failure_reply(Nfsstat3::Jukebox, procedure),
+    );
   }
   let request = RequestId {
     client: u32::from(port),
@@ -932,7 +968,12 @@ fn serve_local(
   );
   // The recall gate passes a change by the only holders of a file's delegations: the NFSv4 client this call acts
   // for, if any (A-80). Named for this call alone, and cleared after it.
-  let _ = state::with_state_counted(|s| s.store.recall_gate.act_as(requester.client));
+  // The call in flight is the shard's for the call's span (it is served synchronously, nothing interleaves), so a
+  // file-state change it makes carries its compound's record in the change's own transaction (A-127).
+  let _ = state::with_state_counted(|s| {
+    s.store.recall_gate.act_as(requester.client);
+    s.nfs_call = call;
+  });
   // Only NFSv3 reaches here: an NFSv4 call is served by the v4 front end before routing.
   let served = serve_call(
     &mut service,
@@ -943,13 +984,33 @@ fn serve_local(
     &mut XdrReader::new(args),
     port,
   );
-  let _ = state::with_state_counted(|s| s.store.recall_gate.act_as(None));
+  let _ = state::with_state_counted(|s| {
+    s.store.recall_gate.act_as(None);
+    s.nfs_call = None;
+  });
+  // A recorded compound's call is recorded before the barrier, so the publication that makes its effect durable
+  // carries what it answered (A-127): a change to a volume rides that publication (an UNSTABLE write's, the next one).
+  if let Some(call) = call.as_ref()
+    && matches!(served.0, AcceptStatus::Success)
+  {
+    let changed = changes_volume(program, procedure, args, &served.1);
+    let _ = state::with_state_counted(|s| {
+      crate::nfs_replay::record(s, call, procedure, &served.1, changed);
+    });
+  }
   // The barrier (§4.8, D-18): a mutation's effect is published into anchor-owned RAM before its
   // reply leaves this shard, so the reply's stability claim is true for daemon-restart survival.
   let result = if matches!(served.0, AcceptStatus::Success)
     && needs_barrier(program, procedure, args, &served.1)
   {
-    barrier(procedure, target_volume(program, procedure, args), served)
+    let barriered = barrier(procedure, target_volume(program, procedure, args), served);
+    // A refused barrier told the client the change is not stable: that is what its record answers too.
+    if let Some(call) = call.as_ref() {
+      let _ = state::with_state_counted(|s| {
+        crate::nfs_replay::record(s, call, procedure, &barriered.1, true);
+      });
+    }
+    barriered
   } else {
     served
   };
@@ -1043,7 +1104,8 @@ impl VolumeSet for GatheredVolumeSet {
   }
 
   fn serve_file_state(&mut self, procedure: u32, args: &mut XdrReader<'_>) -> Vec<u8> {
-    serve_file_state_here(procedure, args.rest())
+    // Reached inside `serve_local`, which answers and records a recorded compound's call around it (A-127).
+    serve_file_state_here(procedure, args.rest(), None)
   }
 }
 
@@ -1417,6 +1479,8 @@ async fn serve_v4(this: u16, home: u16, call: Call, port: u16) -> (Vec<u8>, Opti
         port,
         home,
         forwarded_to: None,
+        recorded: None,
+        occurrences: std::collections::BTreeMap::new(),
       };
       note(NFS4_COMPOUNDS);
       // The reply is encoded after the record's marker and header, reserved here, and framed in place: a READ's data
@@ -1538,7 +1602,13 @@ fn adopt_session(sessionid: SessionId, departed: DepartedSession) {
 fn with_v4_sessions<R>(
   f: impl FnOnce(&mut slates_bridge_nfs::v4::session::Sessions) -> R,
 ) -> Option<R> {
-  state::with_state(|s| s.nfs_v4.as_mut().map(|server| f(&mut server.sessions))).flatten()
+  state::with_state(|s| {
+    let result = s.nfs_v4.as_mut().map(|server| f(&mut server.sessions))?;
+    // What the table journaled (a session forgotten, a callback's minor version) is durable before the work goes on
+    // (A-127); a change that could not be recorded has rebuilt the table from its records.
+    crate::nfs_state::record_clients(s).then_some(result)
+  })
+  .flatten()
 }
 
 /// Sends `work` to shard `to` and awaits its outcome in a detached task of this shard, counting `lost` when it could
@@ -1614,6 +1684,30 @@ struct RoutedBackend {
   home: u16,
   /// The owner shard a v3 call of this compound was forwarded to, if any.
   forwarded_to: Option<u16>,
+  /// The recorded compound this compound is (A-127), when its SEQUENCE asked for its reply to be kept.
+  recorded: Option<slates_bridge_nfs::v4::replay::CallIdentity>,
+  /// How many of the compound's calls so far had each procedure and digest: the next one's occurrence (A-127).
+  occurrences: std::collections::BTreeMap<(u32, u64), u32>,
+}
+
+impl RoutedBackend {
+  /// The record identity of this compound's next call of `procedure` with `args`, when the compound is recorded
+  /// (A-127): its key counts the earlier calls with the same procedure and digest.
+  fn next_call(&mut self, procedure: u32, args: &[u8]) -> Option<crate::nfs_replay::RecordedCall> {
+    let identity = self.recorded?;
+    let digest = slates_bridge_nfs::v4::replay::digest(procedure, args);
+    let seen = self.occurrences.entry((procedure, digest)).or_insert(0);
+    let occurrence = *seen;
+    *seen = seen.saturating_add(1);
+    Some(crate::nfs_replay::RecordedCall {
+      identity,
+      key: slates_bridge_nfs::v4::replay::CallKey {
+        procedure,
+        digest,
+        occurrence,
+      },
+    })
+  }
 }
 
 impl compound::Backend for RoutedBackend {
@@ -1623,7 +1717,8 @@ impl compound::Backend for RoutedBackend {
     mut args: Vec<u8>,
   ) -> impl std::future::Future<Output = Vec<u8>> {
     let (this, xid, port) = (self.this, self.xid, self.port);
-    let requester = self.requester.clone();
+    let mut requester = self.requester.clone();
+    requester.call = self.next_call(procedure, &args);
     let forwarded = route(NFS_PROGRAM, procedure, &args).filter(|&owner| owner != this);
     if forwarded.is_some() {
       self.forwarded_to = forwarded;
@@ -1655,6 +1750,7 @@ impl compound::Backend for RoutedBackend {
     args: Vec<u8>,
   ) -> impl std::future::Future<Output = Vec<u8>> {
     let this = self.this;
+    let call = self.next_call(procedure, &args);
     async move {
       // The owner partition a state id names is served by that partition's shard (D-14); a name no
       // shard carries is a state id this daemon never minted.
@@ -1668,7 +1764,7 @@ impl compound::Backend for RoutedBackend {
         NFS4_STATE_FORWARDED
       });
       let Ok(call) = crate::xshard::call_on(this, shard, move || {
-        Some(serve_file_state_here(procedure, &args))
+        Some(serve_file_state_here(procedure, &args, call))
       }) else {
         return status_word(Nfsstat4::Delay);
       };
@@ -1736,6 +1832,11 @@ impl compound::Backend for RoutedBackend {
     }
   }
 
+  fn record_calls(&mut self, compound: Option<slates_bridge_nfs::v4::replay::CallIdentity>) {
+    self.recorded = compound;
+    self.occurrences.clear();
+  }
+
   fn renew_home(&mut self, clientid: u64) {
     let now = futures::now_ns();
     send_note(self.this, self.home, NFS4_NOTE_LOST, move || {
@@ -1786,20 +1887,76 @@ pub(crate) fn v4_limits(s: &ShardState) -> Limits {
 }
 
 /// Serves an id-only NFSv4 state procedure on this shard's file state (§4.6 A-36), created on first
-/// use.
-fn serve_file_state_here(procedure: u32, args: &[u8]) -> Vec<u8> {
+/// use; a call of a recorded compound (`call`, A-127) is answered from its record or recorded, as [`serve_local`]
+/// does. A purge drops the client's or the session's call records too.
+fn serve_file_state_here(
+  procedure: u32,
+  args: &[u8],
+  call: Option<crate::nfs_replay::RecordedCall>,
+) -> Vec<u8> {
   state::with_state(|s| {
+    if let Some(call) = call.as_ref() {
+      if let Some(answer) = crate::nfs_replay::answered(s, call) {
+        return Some(answer);
+      }
+      if crate::nfs_replay::refused(s, call) {
+        return Some(status_word(Nfsstat4::Delay));
+      }
+    }
+    if procedure == slates_bridge_nfs::procedures::extension::STATE_PURGE_SESSION {
+      return Some(purge_session_here(s, args));
+    }
     if s.nfs_v4_files.is_none() {
       s.nfs_v4_files = crate::nfs_state::file_state(s);
     }
     let reply = s.nfs_v4_files.as_mut().map(|files| {
       slates_bridge_nfs::v4::files::serve_by_id(files, procedure, &mut XdrReader::new(args))
     })?;
-    // The changes are durable before the reply leaves (§4.6 A-37).
-    crate::nfs_state::record_files(s).then_some(reply)
+    // The changes are durable before the reply leaves (§4.6 A-37), with the compound's record (A-127): this call's,
+    // or, reached inside `serve_local`, the call in flight there.
+    let prior = s.nfs_call;
+    s.nfs_call = call.or(prior);
+    let recorded = crate::nfs_state::record_files(s, Some(&reply));
+    s.nfs_call = prior;
+    if !recorded {
+      return None;
+    }
+    if let Some(call) = call.as_ref() {
+      crate::nfs_replay::record(s, call, procedure, &reply, false);
+    }
+    // A dropped client's call records go with its state (A-127), dropped from the image before the purge is
+    // acknowledged; a purge that could not be made durable stays queued at its sender.
+    if procedure == slates_bridge_nfs::procedures::extension::STATE_PURGE
+      && let Ok(clientid) = XdrReader::new(args).u64()
+      && !crate::nfs_replay::purge(s, crate::nfs_replay::Purged::Client(clientid))
+    {
+      return Some(status_word(Nfsstat4::Delay));
+    }
+    Some(reply)
   })
   .flatten()
   .unwrap_or_else(|| status_word(Nfsstat4::Serverfault))
+}
+
+/// Drops a destroyed session's call records at this shard (A-127; `STATE_PURGE_SESSION`): `NFS4ERR_DELAY` when the
+/// drop could not be made durable, so its sender keeps it queued.
+fn purge_session_here(s: &mut ShardState, args: &[u8]) -> Vec<u8> {
+  let mut reader = XdrReader::new(args);
+  let parsed = reader.u64().ok().and(
+    reader
+      .fixed(slates_bridge_nfs::v4::types::SESSIONID_SIZE)
+      .ok(),
+  );
+  let Some(session) = parsed else {
+    return status_word(Nfsstat4::Badxdr);
+  };
+  let mut sessionid = [0u8; slates_bridge_nfs::v4::types::SESSIONID_SIZE];
+  sessionid.copy_from_slice(session);
+  if crate::nfs_replay::purge(s, crate::nfs_replay::Purged::Session(sessionid)) {
+    status_word(Nfsstat4::Ok)
+  } else {
+    status_word(Nfsstat4::Delay)
+  }
 }
 
 /// A reply of only a status word.

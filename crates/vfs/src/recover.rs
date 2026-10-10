@@ -70,9 +70,11 @@ const SHARD_MAGIC: u32 = u32::from_le_bytes(*b"SLS1");
 /// base entry's fingerprint carries its owner, so an overlay reports a base file's owner as the disk holds it.
 /// 17 (A-99, 2026-10-05) a sealed chunk's image carries its key identity, its version and its segments' tags, so
 /// a restarted daemon re-opens the ciphertext the arena still holds instead of reading it as clear bytes.
+/// 18 (A-127, 2026-10-09) the call records a barrier publishes with the effects their calls made, so a compound the
+/// dead daemon applied is answered on its client's retry, never run again.
 /// Format: the image layout version, bumped with any change to the types below or to the held replicas'
 /// image they carry.
-const IMAGE_VERSION: u16 = 17;
+const IMAGE_VERSION: u16 = 18;
 
 /// A recorded attachment's references in an image (A-61): its durable id and its share by inode.
 #[derive(Clone, Debug, PartialEq, Eq, Wire)]
@@ -504,6 +506,9 @@ pub struct ShardImage {
   /// The replies a barrier published with its effect and had not yet delivered (A-61): at most one per FUSE
   /// mount, opaque here (the transport encodes them).
   pub replies: Vec<HeldReply>,
+  /// The call records published with the effects their calls made (A-127), in key order: at most one per session
+  /// slot of the transport's clients, opaque here.
+  pub calls: Vec<HeldCall>,
 }
 
 /// A transport's reply published with the effect it answers (A-61): the mount's attachment, the request's unique
@@ -518,6 +523,19 @@ pub struct HeldReply {
   pub reply: Vec<u8>,
 }
 
+/// Format: the bytes of a held call record's key: an NFSv4.1 session id (16 bytes) and its slot (a big-endian word).
+pub const HELD_CALL_KEY_BYTES: usize = 16 + size_of::<u32>();
+
+/// A transport's call record published with the effects its calls made (A-127): the session slot it answers for, and
+/// the record's bytes, opaque here (the transport encodes them).
+#[derive(Clone, Debug, PartialEq, Eq, Wire)]
+pub struct HeldCall {
+  /// The session slot.
+  pub key: [u8; HELD_CALL_KEY_BYTES],
+  /// The record's bytes.
+  pub record: Vec<u8>,
+}
+
 impl ShardImage {
   /// Starts a streamed shard image's encoding in `out` (for [`ShardImage::encode_finish`]): what `ShardImage::new` then
   /// `encode` writes before its `volumes` volumes. The caller then appends exactly that many, each as its key's 16
@@ -530,13 +548,21 @@ impl ShardImage {
     slates_wire::codec::encode_len(volumes, out);
   }
 
-  /// Ends a streamed shard image: the held replicas and the replies, as
-  /// `ShardImage::new(volumes).with_held(held).with_replies(replies).encode` writes them after the volumes.
-  pub fn encode_finish(out: &mut Vec<u8>, held: &[u8], replies: &mut Vec<HeldReply>) {
+  /// Ends a streamed shard image: the held replicas, the replies and the call records, as
+  /// `ShardImage::new(volumes).with_held(held).with_replies(replies).with_calls(calls).encode` writes them after the
+  /// volumes.
+  pub fn encode_finish(
+    out: &mut Vec<u8>,
+    held: &[u8],
+    replies: &mut Vec<HeldReply>,
+    calls: &mut Vec<HeldCall>,
+  ) {
     slates_wire::codec::encode_len(held.len(), out);
     out.extend_from_slice(held);
     replies.sort_by_key(|reply| reply.attachment);
     replies.encode(out);
+    calls.sort_by_key(|call| call.key);
+    calls.encode(out);
   }
 
   /// A shard image of the given volumes, in key order, holding nothing for others.
@@ -548,6 +574,7 @@ impl ShardImage {
       volumes,
       held: Vec::new(),
       replies: Vec::new(),
+      calls: Vec::new(),
     }
   }
 
@@ -560,6 +587,12 @@ impl ShardImage {
   pub fn with_replies(self, mut replies: Vec<HeldReply>) -> ShardImage {
     replies.sort_by_key(|reply| reply.attachment);
     ShardImage { replies, ..self }
+  }
+
+  /// This image carrying `calls`, the call records (A-127), in key order.
+  pub fn with_calls(self, mut calls: Vec<HeldCall>) -> ShardImage {
+    calls.sort_by_key(|call| call.key);
+    ShardImage { calls, ..self }
   }
 
   /// Decodes a shard image from content-object bytes, refusing a foreign magic, an unknown version

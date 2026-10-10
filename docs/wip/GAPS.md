@@ -5318,3 +5318,41 @@ On a Linux release build of `faad1562` (A-126, the probe-storm fix and the reply
   - create+write p50 fell from about 460 to about 200 µs;
   - sixteen writers' create p99 fell from 6.1–6.6 to 3.2–3.4 ms.
 - Owed: `stat` p50 at 16 workers rose 45–58 → 131–137 µs, p99 unchanged.
+
+### 2026-10-09: a compound the daemon applied before it died ran again on the client's retry (fixed; A-127; conditions 2 and 11)
+
+- **Found** by the new mixed kill bench (`docs/wip/bench/kill_mixed.sh`: 30,000 random operations through Linux's
+  NFSv4.2 client under 30 SIGKILLs). Three of 13 seed runs failed: an `unlink` or `rename` the daemon had applied was
+  answered `ENOENT`. In seed 9 the renamed file was in the tree while the application was told the rename failed.
+- **Cause** (`docs/bugs/2026-10-09-a-compound-the-daemon-applied-before-it-died-ran-again-on-the-clients-retry.md`):
+  - the daemon died after a barrier and before the reply;
+  - sessions were not durable (A-37), so the retry met `NFS4ERR_BADSESSION`, the client made a new session, and the
+    restarted daemon ran the operation a second time.
+- **Fixed** (A-127, RFC 8881 §2.10.6.5):
+  - durable sessions;
+  - call records for compounds that asked for their reply to be kept, each riding the commit that makes its call's effect
+    durable: the barrier's publication for a volume change, the transaction for a file-state change;
+  - a retry after a restart is answered from its records, never served again;
+  - the records are bounded by `nfs_v4_record_bytes`, and a dropped client's or destroyed session's records are purged at
+    every owner.
+- **Proven:**
+  - failing-first: `a_compound_retried_across_a_daemon_restart_is_answered_never_run_again`, which failed with
+    `NFS4ERR_BADSESSION`, then with sessions alone `NFS4ERR_NOENT`;
+  - the file-state leg: an OPEN keeps its state id and seqid, and a CLOSE is not `BAD_STATEID`;
+  - a destroyed session's records stay purged across a restart;
+  - twelve unit tests of the records, hostile decoding among them;
+  - the database oracle's crashed histories carry sessions and call records;
+  - the streamed checkpoint and delta tests carry call records;
+  - the bench: 450 kills over 15 seeds on three builds without a failed operation. The final build's lives restored
+    29–49 records per seed and answered one retry from its record.
+- **Measured** (BENCHMARKS):
+  - a single writer's create storm, undisturbed rounds: +4 to +11 µs on a p50 near 195 µs (2–5%);
+  - in one daemon, kept against not-kept OPEN+CLOSE pairs: +1 to +5 µs a pair.
+  - The first cut cost 12% (192 → 216 µs); it was measured and replaced (BENCHMARKS).
+- **Owed:**
+  - macOS NFSv3 over a held connection re-runs a request applied and unanswered at a death (A-113 accepted it). A-61's
+    held reply, keyed by the connection and the xid, is the remedy.
+  - The in-memory purge queue does not outlive a daemon. This is pre-existing for client state.
+  - Splitting a state transaction's record from the publication's would trim the remaining cost.
+  - The `#[cfg(not(unix))]` publication helpers are left to the Windows CI lane. `zstd-sys` cannot be cross-compiled for
+    Windows from this Mac now.

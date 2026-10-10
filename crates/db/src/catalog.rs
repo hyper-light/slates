@@ -791,7 +791,7 @@ pub struct NfsLockRecord {
 
 /// An NFSv4 client held at the listener's partition (§4.6 A-37): its id, owner, verifier, principal
 /// and next CREATE_SESSION sequence, so a restarted listener still knows it and its state ids stay
-/// valid; its sessions are not kept (a client re-creates them after `NFS4ERR_BADSESSION`).
+/// valid; its sessions are records of their own ([`NfsSessionRecord`], A-127).
 #[derive(Wire, Clone, Debug, PartialEq, Eq)]
 pub struct NfsClientRecord {
   /// The client id.
@@ -804,6 +804,69 @@ pub struct NfsClientRecord {
   pub principal: u32,
   /// The next CREATE_SESSION sequence it must send.
   pub create_seq: u32,
+}
+
+/// An NFSv4.1 channel's attributes as negotiated (RFC 8881 §18.36, `channel_attrs4`), as a session record carries them
+/// (A-127).
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NfsChannelRecord {
+  /// `ca_headerpadsize`.
+  pub header_pad: u32,
+  /// `ca_maxrequestsize`.
+  pub max_request: u32,
+  /// `ca_maxresponsesize`.
+  pub max_response: u32,
+  /// `ca_maxresponsesize_cached`.
+  pub max_response_cached: u32,
+  /// `ca_maxoperations`.
+  pub max_operations: u32,
+  /// `ca_maxrequests`: the slot count.
+  pub max_requests: u32,
+}
+
+/// A session's back channel as its record carries it (A-127): the client's callback program, the RPC credential its
+/// callbacks carry (an encoded `opaque_auth` the client listed), and the minor version they name.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct NfsCallbackRecord {
+  /// The callback program number.
+  pub program: u32,
+  /// The encoded credential.
+  pub credential: Vec<u8>,
+  /// The minor version callbacks name.
+  pub minor: u32,
+}
+
+/// An NFSv4.1 session held at its client's listener partition (A-127): enough for a restarted listener to serve it
+/// again, so a client retries on its own slots after a daemon restart and carries on with no CREATE_SESSION. Its
+/// slots' sequence ids are not kept: a restored slot takes its next request as it comes.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct NfsSessionRecord {
+  /// Format: the session id, an NFSv4.1 `sessionid4` (16 bytes, RFC 8881 §2.10.3).
+  pub sessionid: [u8; 16],
+  /// The client it belongs to.
+  pub clientid: u64,
+  /// The CREATE_SESSION sequence id that created it.
+  pub sequence: u32,
+  /// The fore channel.
+  pub fore: NfsChannelRecord,
+  /// The back channel.
+  pub back: NfsChannelRecord,
+  /// The back channel's callback, when the client asked for one.
+  pub callback: Option<NfsCallbackRecord>,
+}
+
+/// An NFSv4.1 call record held at the partition of the shard that served its calls (A-127): the session slot it
+/// answers for, the client it belongs to, and the record's bytes (`slates_bridge_nfs::v4::replay`, opaque here). It
+/// rides the file-state transaction a call of it changed, so a compound retried after a restart is answered with what
+/// it did, never run again.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct NfsCallRecord {
+  /// Format: the session slot: an NFSv4.1 session id (16 bytes) then the slot as a big-endian word.
+  pub key: [u8; 20],
+  /// The client the session belongs to.
+  pub clientid: u64,
+  /// The record's bytes.
+  pub record: Vec<u8>,
 }
 
 /// Format: the bytes of hyper-seal's wrapped key record (version, parent id, parent generation, AES-256-KW of the key;

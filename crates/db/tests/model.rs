@@ -349,6 +349,14 @@ enum Step {
   NfsDelegation(u8, u8, bool),
   /// A delegation returned or revoked.
   NfsDelegationClear(usize),
+  /// An NFSv4.1 session recorded (A-127): its client and which of the client's sessions.
+  NfsSession(u8, u8),
+  /// An NFSv4.1 session destroyed.
+  NfsSessionClear(u8, u8),
+  /// A call record of a session's slot recorded with a file-state change (A-127): the client, the session, the slot.
+  NfsCall(u8, u8, u8),
+  /// A destroyed session's call records dropped.
+  NfsCallsClear(u8, u8),
   /// A sealing key recorded (A-92): its owner's kind (tenant, naming or lineage) and who.
   SealKey(u8, u8),
   /// A sealing key destroyed (crypto-erase).
@@ -391,6 +399,10 @@ fn step() -> impl Strategy<Value = Step> {
     1 => Just(Step::NfsInstance),
     1 => (0..4u8, 0..8u8, any::<bool>()).prop_map(|(c, f, w)| Step::NfsDelegation(c, f, w)),
     1 => (0..8usize).prop_map(Step::NfsDelegationClear),
+    1 => (0..4u8, 0..2u8).prop_map(|(c, n)| Step::NfsSession(c, n)),
+    1 => (0..4u8, 0..2u8).prop_map(|(c, n)| Step::NfsSessionClear(c, n)),
+    2 => (0..4u8, 0..2u8, 0..4u8).prop_map(|(c, n, l)| Step::NfsCall(c, n, l)),
+    1 => (0..4u8, 0..2u8).prop_map(|(c, n)| Step::NfsCallsClear(c, n)),
     1 => (0..3u8, 0..4u8).prop_map(|(k, w)| Step::SealKey(k, w)),
     1 => (0..3u8, 0..4u8).prop_map(|(k, w)| Step::SealKeyDestroy(k, w)),
     1 => Just(Step::Crash),
@@ -618,6 +630,10 @@ fn op_for(step: &Step, ids: &mut Ids, now_ns: u64) -> Option<Op> {
     | Step::NfsDelegationClear(..)
     | Step::SealKey(..)
     | Step::SealKeyDestroy(..)) => return op_for_nfs(step, ids),
+    step @ (Step::NfsSession(..)
+    | Step::NfsSessionClear(..)
+    | Step::NfsCall(..)
+    | Step::NfsCallsClear(..)) => return op_for_nfs_session(step),
     Step::Crash => return None,
   })
 }
@@ -800,6 +816,63 @@ fn op_for_nfs(step: &Step, ids: &mut Ids) -> Option<Op> {
     },
     Step::SealKeyDestroy(kind, who) => Op::SealKeyDestroyed {
       owner: seal_owner(*kind, *who),
+    },
+    _ => return None,
+  })
+}
+
+/// The session id the model's `session` of `client` is (A-127): the client in its first bytes, as a minted one is.
+fn model_sessionid(client: u8, session: u8) -> [u8; 16] {
+  let mut id = [0u8; 16];
+  id[7] = client;
+  id[15] = session;
+  id
+}
+
+/// The NFSv4.1 session and call-record operations (A-127), split from [`op_for`]: sessions and slot records named by
+/// small numbers, so sets, clears, a client's purge and a client's drop meet each other.
+fn op_for_nfs_session(step: &Step) -> Option<Op> {
+  use slates_db::catalog::{NfsCallRecord, NfsCallbackRecord, NfsChannelRecord, NfsSessionRecord};
+  let channel = NfsChannelRecord {
+    header_pad: 0,
+    max_request: 1 << 20,
+    max_response: 1 << 20,
+    max_response_cached: 4096,
+    max_operations: 16,
+    max_requests: 4,
+  };
+  Some(match step {
+    Step::NfsSession(client, session) => Op::NfsSessionSet {
+      record: NfsSessionRecord {
+        sessionid: model_sessionid(*client, *session),
+        clientid: u64::from(*client),
+        sequence: u32::from(*session) + 1,
+        fore: channel,
+        back: channel,
+        callback: (*session == 0).then(|| NfsCallbackRecord {
+          program: 0x4000_0000,
+          credential: vec![0; 8],
+          minor: 2,
+        }),
+      },
+    },
+    Step::NfsSessionClear(client, session) => Op::NfsSessionCleared {
+      sessionid: model_sessionid(*client, *session),
+    },
+    Step::NfsCall(client, session, slot) => {
+      let mut key = [0u8; 20];
+      key[..16].copy_from_slice(&model_sessionid(*client, *session));
+      key[16..].copy_from_slice(&u32::from(*slot).to_be_bytes());
+      Op::NfsCallSet {
+        record: NfsCallRecord {
+          key,
+          clientid: u64::from(*client),
+          record: vec![*client, *session, *slot],
+        },
+      }
+    }
+    Step::NfsCallsClear(client, session) => Op::NfsCallsCleared {
+      sessionid: model_sessionid(*client, *session),
     },
     _ => return None,
   })

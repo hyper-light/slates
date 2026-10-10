@@ -237,7 +237,14 @@ in the same commit as the work). Last reviewed 2026-10-09 at `e494963d`.
   - `docs/wip/bench/kill_writes.sh`: 80 SIGKILLs across 100,000 fsyncs of random 4 KiB writes. The file read back
     identical every time, each recovery replaying A-126's windowed deltas, and the longest fsync was 70 ms.
   - `realworld_chaos.sh` on the day's build: git, cargo and pip each finished exactly, under two SIGKILLs each.
+  - `docs/wip/bench/kill_mixed.sh`: random creates, writes, truncates, appends, unlinks and renames through Linux's
+    NFSv4.2 client under 30 SIGKILLs a run. It found an operation the daemon applied before a kill answered `ENOENT` on
+    the client's retry. A-127 made sessions durable and a retry answered from call records that ride their effects'
+    commits. Since then, 450 kills over 15 seeds have passed without a failed operation, and one retry was answered
+    from its record.
 - **Owed.**
+  - macOS NFSv3 over a held connection still re-runs a request applied and unanswered at a death (A-61's held reply is
+    the remedy).
   - A generated fault-injection campaign across a live fleet (the deterministic simulation's nemesis library over the
     seed budget, CLAUDE.md §4) is the strengthening.
   - Open: the daemon disappeared twice in about 70 container runs under heavy host load. No OOM kill of slates,

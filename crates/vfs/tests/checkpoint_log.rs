@@ -230,12 +230,15 @@ fn a_full_log_refuses_and_a_checkpoint_follows() {
   assert_eq!(recovered, Some(full(&vol, &store)));
 }
 
-/// The streamed shard delta (2026-10-06). Do: checkpoint a shard of three volumes, change one (its record is then a
-/// delta) and make a fourth never published (its record is its full image), and stream a shard delta in key order with
-/// `ShardDelta::encode_start`, each key then `Volume::encode_publication`, and `encode_finish` naming the other two as
-/// removed (unsorted), with held bytes and replies; log it with `Journal::append_encoded`, and log the same records as
-/// a `ShardDelta` value in a copy of the journal. Expect: the bytes equal `ShardDelta::new(…).encode()`, both journals
-/// recover the same image, and it holds the changed volume brought up to date and the fresh one, without the removed.
+/// The streamed shard delta (2026-10-06; call records A-127). Do: checkpoint a shard of three volumes and two call
+/// records, change one volume (its record is then a delta) and make a fourth never published (its record is its full
+/// image), and stream a shard delta in key order with `ShardDelta::encode_start`, each key then
+/// `Volume::encode_publication`, and `encode_finish` naming the other two as removed (unsorted), with held bytes,
+/// replies, a changed call record and a new one (unsorted) and the other checkpointed record purged; log it with
+/// `Journal::append_encoded`, and log the same records as a `ShardDelta` value in a copy of the journal. Expect: the
+/// bytes equal `ShardDelta::new(…).with_calls(…).encode()`, both journals recover the same image, and it holds the
+/// changed volume brought up to date and the fresh one, without the removed, and the call records changed, added and
+/// gone as the delta said.
 #[test]
 fn a_streamed_shard_delta_equals_the_shard_delta_and_recovers() {
   let mut store = store();
@@ -255,9 +258,16 @@ fn a_streamed_shard_delta_equals_the_shard_delta_and_recovers() {
     });
   }
   let (mut checkpoints, mut log) = (vec![0u8; MEMORY], vec![0u8; MEMORY]);
+  let call = |key: u8, record: &[u8]| slates_vfs::recover::HeldCall {
+    key: [key; slates_vfs::recover::HELD_CALL_KEY_BYTES],
+    record: record.to_vec(),
+  };
   let mut journal = Journal::default();
   journal
-    .checkpoint(&mut checkpoints, &ShardImage::new(in_checkpoint))
+    .checkpoint(
+      &mut checkpoints,
+      &ShardImage::new(in_checkpoint).with_calls(vec![call(1, b"one"), call(5, b"five")]),
+    )
     .unwrap();
   published.mark_published(&store);
   create(
@@ -281,6 +291,8 @@ fn a_streamed_shard_delta_equals_the_shard_delta_and_recovers() {
     vol.encode_publication(&store, None, &mut streamed).unwrap();
   }
   let mut unsorted = removed.clone();
+  let calls = vec![call(7, b"seven"), call(5, b"five, later")];
+  let calls_removed = vec![[1; slates_vfs::recover::HELD_CALL_KEY_BYTES]];
   ShardDelta::encode_finish(
     &mut streamed,
     at,
@@ -288,6 +300,8 @@ fn a_streamed_shard_delta_equals_the_shard_delta_and_recovers() {
     &mut unsorted,
     Some(&held),
     Some(&replies),
+    &mut calls.clone(),
+    &mut calls_removed.clone(),
   )
   .unwrap();
   let value = ShardDelta::new(
@@ -304,7 +318,8 @@ fn a_streamed_shard_delta_equals_the_shard_delta_and_recovers() {
     removed,
     Some(held),
     Some(replies),
-  );
+  )
+  .with_calls(calls, calls_removed);
   assert!(
     matches!(
       value.volumes[0].record,
@@ -338,5 +353,15 @@ fn a_streamed_shard_delta_equals_the_shard_delta_and_recovers() {
     recovered.volumes[0].image,
     published.to_image(&store, None).unwrap(),
     "the changed volume brought up to date"
+  );
+  assert_recovered_calls(&recovered, vec![call(5, b"five, later"), call(7, b"seven")]);
+}
+
+/// The streamed delta's call records, as recovered: the changed one replaced, the new one added, the purged one gone,
+/// in key order.
+fn assert_recovered_calls(recovered: &ShardImage, expected: Vec<slates_vfs::recover::HeldCall>) {
+  assert_eq!(
+    recovered.calls, expected,
+    "the call records changed and added, the purged one gone, in key order"
   );
 }

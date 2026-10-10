@@ -271,7 +271,8 @@ fn main() {
         vol.encode_publication(&store, None, &mut scratch).unwrap();
         let whole =
           scratch.get(tag_at..tag_at + 4) == Some(&VolumeRecord::WIRE_TAG_FULL.to_le_bytes()[..]);
-        ShardDelta::encode_finish(&mut scratch, at, 1, &mut [], None, None).unwrap();
+        ShardDelta::encode_finish(&mut scratch, at, 1, &mut [], None, None, &mut [], &mut [])
+          .unwrap();
         !whole && journal.append_encoded(&mut log, &scratch).is_ok()
       });
     if !appended {
@@ -281,7 +282,7 @@ fn main() {
         ShardImage::encode_start(stream.buf(), 1);
         stream.buf().extend_from_slice(&[1; 16]);
         vol.encode_image_into(&store, None, &mut stream).unwrap();
-        ShardImage::encode_finish(stream.buf(), &[], &mut Vec::new());
+        ShardImage::encode_finish(stream.buf(), &[], &mut Vec::new(), &mut Vec::new());
         journal.finish_checkpoint(stream).unwrap();
       });
     }

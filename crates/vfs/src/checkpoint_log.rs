@@ -24,14 +24,18 @@ use slates_wire::crc32c::{crc32c, crc32c_append};
 
 use crate::delta::VolumeRecord;
 use crate::error::VfsError;
-use crate::recover::{CommittedSlot, HeldReply, ImageRead, ImageWrite, ShardImage, StreamedImage};
+use crate::recover::{
+  CommittedSlot, HELD_CALL_KEY_BYTES, HeldCall, HeldReply, ImageRead, ImageWrite, ShardImage,
+  StreamedImage,
+};
 
 /// Format: a delta's magic, checked before anything else on decode.
 const DELTA_MAGIC: u32 = u32::from_le_bytes(*b"SLD1");
 /// Format: the delta format's version, bumped with any change to the delta's types: 1 (A-68, 2026-10-04); 2 (A-126,
 /// 2026-10-09) a file changed only by writes to its chunked body is carried as its written windows
-/// (`delta::InodePatch`), not its whole image.
-const DELTA_VERSION: u16 = 2;
+/// (`delta::InodePatch`), not its whole image; 3 (A-127, 2026-10-09) the call records changed and purged since the
+/// last publication.
+const DELTA_VERSION: u16 = 3;
 /// Format: a log frame's header — a little-endian payload length then a CRC-32C of the payload.
 const LOG_HEADER: usize = 2 * size_of::<u32>();
 /// Format: a log frame's payload prefix — its generation and its base checkpoint's generation.
@@ -62,6 +66,10 @@ pub struct ShardDelta {
   pub held: Option<Vec<u8>>,
   /// The undelivered barrier replies now, when they changed.
   pub replies: Option<Vec<HeldReply>>,
+  /// The call records changed since the last publication (A-127), in key order, each whole.
+  pub calls: Vec<HeldCall>,
+  /// The call records purged since the last publication, in key order.
+  pub calls_removed: Vec<[u8; HELD_CALL_KEY_BYTES]>,
 }
 
 impl ShardDelta {
@@ -77,7 +85,9 @@ impl ShardDelta {
   }
 
   /// Ends a streamed shard delta: the volume count patched in at `at`, then the volumes gone (sorted here), the held
-  /// replicas' image and the replies, as `ShardDelta::new(volumes, removed, held, replies).encode` writes them.
+  /// replicas' image, the replies, and the call records changed and purged (each sorted here), as
+  /// `ShardDelta::new(volumes, removed, held, replies).with_calls(calls, calls_removed).encode` writes them.
+  #[allow(clippy::too_many_arguments)] // one delta's whole tail, each part written in the format's order
   pub fn encode_finish(
     out: &mut Vec<u8>,
     at: usize,
@@ -85,6 +95,8 @@ impl ShardDelta {
     removed: &mut [[u8; 16]],
     held: Option<&[u8]>,
     replies: Option<&[HeldReply]>,
+    calls: &mut [HeldCall],
+    calls_removed: &mut [[u8; HELD_CALL_KEY_BYTES]],
   ) -> Result<(), VfsError> {
     if !slates_wire::codec::patch_len(out, at, volumes) {
       return Err(VfsError::RecoveryIncomplete);
@@ -105,6 +117,16 @@ impl ShardDelta {
         }
       }
     }
+    calls.sort_unstable_by_key(|call| call.key);
+    slates_wire::codec::encode_len(calls.len(), out);
+    for call in calls.iter() {
+      call.encode(out);
+    }
+    calls_removed.sort_unstable();
+    slates_wire::codec::encode_len(calls_removed.len(), out);
+    for key in calls_removed.iter() {
+      key.encode(out);
+    }
     Ok(())
   }
 
@@ -124,6 +146,24 @@ impl ShardDelta {
       removed,
       held,
       replies,
+      calls: Vec::new(),
+      calls_removed: Vec::new(),
+    }
+  }
+
+  /// This delta carrying the call records changed (`calls`) and purged (`calls_removed`) since the last publication
+  /// (A-127), each sorted by key.
+  pub fn with_calls(
+    self,
+    mut calls: Vec<HeldCall>,
+    mut calls_removed: Vec<[u8; HELD_CALL_KEY_BYTES]>,
+  ) -> ShardDelta {
+    calls.sort_unstable_by_key(|call| call.key);
+    calls_removed.sort_unstable();
+    ShardDelta {
+      calls,
+      calls_removed,
+      ..self
     }
   }
 }
@@ -172,6 +212,19 @@ impl ShardImage {
     if let Some(replies) = &delta.replies {
       self.replies.clone_from(replies);
     }
+    for call in &delta.calls {
+      match self.calls.binary_search_by_key(&call.key, |held| held.key) {
+        Ok(at) => {
+          if let Some(held) = self.calls.get_mut(at) {
+            held.record.clone_from(&call.record);
+          }
+        }
+        Err(at) => self.calls.insert(at, call.clone()),
+      }
+    }
+    self
+      .calls
+      .retain(|held| delta.calls_removed.binary_search(&held.key).is_err());
     Ok(())
   }
 }

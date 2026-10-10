@@ -2921,3 +2921,320 @@ fn an_idle_small_file_is_sealed_by_the_daemons_sweep() {
   daemon.stop();
   drop(segment);
 }
+
+/// Format: `NFS4ERR_NOENT` (RFC 8881 §15.1.4.6).
+const NFS4ERR_NOENT: u32 = 2;
+/// Format: `NFS4ERR_EXIST` (RFC 8881 §15.1.4.5).
+const NFS4ERR_EXIST: u32 = 17;
+/// Format: the bytes of an NFSv4 `stateid4`: its seqid and its 12-byte `other`.
+const STATEID_BYTES: usize = 16;
+
+/// A REMOVE of `name` in the directory the session's `at` reaches, asking for its reply to be kept (a client sets
+/// `sa_cachethis` on a compound that changes state).
+fn remove_kept(
+  session: &mut common::nfs4::Session,
+  capability: &str,
+  name: &str,
+) -> Result<Vec<u8>, u32> {
+  session.at_with(true, capability, &[], 1, |args| {
+    args.u32(slates_bridge_nfs::v4::compound::op::REMOVE);
+    args.opaque(name.as_bytes());
+  })
+}
+
+/// A RENAME of `from` to `to` within the directory the session's `at` reaches (SAVEFH, then RENAME from the saved
+/// directory to the current one), asking for its reply to be kept.
+fn rename_kept(
+  session: &mut common::nfs4::Session,
+  capability: &str,
+  (from, to): (&str, &str),
+) -> Result<Vec<u8>, u32> {
+  session.at_with(true, capability, &[], 2, |args| {
+    args.u32(slates_bridge_nfs::v4::compound::op::SAVEFH);
+    args.u32(slates_bridge_nfs::v4::compound::op::RENAME);
+    args.opaque(from.as_bytes());
+    args.opaque(to.as_bytes());
+  })
+}
+
+/// Whether `name` is found in the directory the session's `at` reaches (a LOOKUP then GETFH, not kept): `Ok` with
+/// its handle, or the status that refused it.
+fn found(
+  session: &mut common::nfs4::Session,
+  capability: &str,
+  name: &str,
+) -> Result<Vec<u8>, u32> {
+  session.at(capability, &[name], |args| {
+    args.u32(slates_bridge_nfs::v4::compound::op::GETFH);
+  })
+}
+
+/// RFC 8881 §2.10.6.5 (A-127): a compound the daemon applied before it died is answered, when its client retries it
+/// on the same slot and sequence id after the restart, with what it did — never run a second time. A REMOVE and a
+/// RENAME (each the last compound on its own client's slot, as when the daemon was killed after applying it and
+/// before its reply left): the retry over a new connection to the restarted daemon is answered `NFS4_OK` — run
+/// again it would be `NFS4ERR_NOENT`, its file already gone, which is what a Linux client's `unlink` and `rename`
+/// returned under the mixed kill bench — the session carries on with no CREATE_SESSION, and the tree shows each
+/// change once. Non-vacuous: the restarted daemon counts the retried calls it answered from what it recorded.
+#[test]
+fn a_compound_retried_across_a_daemon_restart_is_answered_never_run_again() {
+  let profile = common::machine_profile();
+  let instance = format!("srv-v4-retry-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
+  let segment = anchor_segment("v4retry", &profile, &config);
+
+  let first = Daemon::start(&profile, config.clone(), source_of(&segment)).unwrap();
+  first
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let mut client = connect(&instance);
+  client.create(&scratch("retried")).unwrap();
+  let capability = capability_path(&first, "retried");
+  {
+    let mut stream = nfs_stream(&first);
+    let root = mount(&mut stream, &capability, 1);
+    create(&mut stream, &root, "gone", 2);
+    create(&mut stream, &root, "moved", 3);
+  }
+  let port = first.nfs_port().expect("the daemon is serving NFS");
+  let mut remover = common::nfs4::Session::open(port, b"retry-remove");
+  let mut renamer = common::nfs4::Session::open(port, b"retry-rename");
+  assert!(
+    remove_kept(&mut remover, &capability, "gone").is_ok(),
+    "the REMOVE"
+  );
+  assert!(
+    rename_kept(&mut renamer, &capability, ("moved", "renamed")).is_ok(),
+    "the RENAME"
+  );
+  first.stop();
+
+  let second = Daemon::start(&profile, config, source_of(&segment)).unwrap();
+  let port = second
+    .nfs_port()
+    .expect("the restarted daemon is serving NFS");
+  remover.reconnect(port);
+  renamer.reconnect(port);
+  assert_eq!(
+    remover.resend().map(|_| ()),
+    Ok(()),
+    "the retried REMOVE is answered with what it did, not run again into NFS4ERR_NOENT"
+  );
+  assert_eq!(
+    renamer.resend().map(|_| ()),
+    Ok(()),
+    "the retried RENAME is answered with what it did, not run again into NFS4ERR_NOENT"
+  );
+  assert_eq!(
+    found(&mut remover, &capability, "gone").map(|_| ()),
+    Err(NFS4ERR_NOENT),
+    "the session carries on after the restart, and the removed file is gone"
+  );
+  assert!(
+    found(&mut renamer, &capability, "renamed").is_ok(),
+    "the renamed file is there under its new name"
+  );
+  assert_eq!(
+    found(&mut renamer, &capability, "moved").map(|_| ()),
+    Err(NFS4ERR_NOENT),
+    "and not under its old one"
+  );
+  let answered = second
+    .refusals_on_every_shard()
+    .unwrap()
+    .get("nfs4.replay.answered")
+    .copied()
+    .unwrap_or(0);
+  assert!(
+    answered >= 2,
+    "the restarted daemon answered both retried calls from its records ({answered})"
+  );
+  second.stop();
+  drop(segment);
+}
+
+/// An OPEN of `name` in the directory the session's `at` reaches, creating it `GUARDED` with mode 0644 for the
+/// session's client and `owner`, asking for its reply to be kept: the OPEN's result body (its state id first).
+fn open_guarded(
+  session: &mut common::nfs4::Session,
+  capability: &str,
+  (owner, name): (&[u8], &str),
+) -> Result<Vec<u8>, u32> {
+  /// Format: `OPEN4_SHARE_ACCESS_BOTH`, `OPEN4_SHARE_DENY_NONE`, `OPEN4_CREATE`, `GUARDED4`, `CLAIM_NULL` (RFC 7863).
+  const ACCESS_BOTH: u32 = 3;
+  const DENY_NONE: u32 = 0;
+  const OPEN4_CREATE: u32 = 1;
+  const GUARDED4: u32 = 1;
+  const CLAIM_NULL: u32 = 0;
+  /// Format: `FATTR4_MODE` (attribute 33): bit 1 of the bitmap's second word.
+  const MODE_WORD: u32 = 1 << (33 - 32);
+  let clientid = session.clientid();
+  session.at_with(true, capability, &[], 1, |args| {
+    args.u32(slates_bridge_nfs::v4::compound::op::OPEN);
+    args.u32(0); // seqid, unused in NFSv4.1
+    args.u32(ACCESS_BOTH);
+    args.u32(DENY_NONE);
+    args.u64(clientid);
+    args.opaque(owner);
+    args.u32(OPEN4_CREATE);
+    args.u32(GUARDED4);
+    args.u32(2); // the bitmap's words
+    args.u32(0);
+    args.u32(MODE_WORD);
+    args.opaque(&0o644u32.to_be_bytes());
+    args.u32(CLAIM_NULL);
+    args.opaque(name.as_bytes());
+  })
+}
+
+/// A CLOSE of the open `stateid` of the file `name` the session's `at` reaches, asking for its reply to be kept.
+fn close_kept(
+  session: &mut common::nfs4::Session,
+  capability: &str,
+  name: &str,
+  stateid: &[u8],
+) -> Result<Vec<u8>, u32> {
+  session.at_with(true, capability, &[name], 1, |args| {
+    args.u32(slates_bridge_nfs::v4::compound::op::CLOSE);
+    args.u32(0); // seqid, unused in NFSv4.1
+    args.fixed(stateid);
+  })
+}
+
+/// RFC 8881 §2.10.6.5 (A-127), the file-state leg: a compound whose call changed file state (A-37) carries its record
+/// in the change's own transaction, so a retry after the restart is answered with what it did. An OPEN that created
+/// its file `GUARDED`, retried, is answered with the same state id — run again it would be `NFS4ERR_EXIST`, its file
+/// already made; a CLOSE, retried, is answered `NFS4_OK` with the state id it closed — run again it would be
+/// `NFS4ERR_BAD_STATEID`, its open already gone. Non-vacuous: the restarted daemon counts what it answered from its
+/// records.
+#[test]
+fn an_open_and_a_close_retried_across_a_daemon_restart_are_answered_never_run_again() {
+  let profile = common::machine_profile();
+  let instance = format!("srv-v4-state-retry-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
+  let segment = anchor_segment("v4stateretry", &profile, &config);
+
+  let first = Daemon::start(&profile, config.clone(), source_of(&segment)).unwrap();
+  first
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let mut client = connect(&instance);
+  client.create(&scratch("opened")).unwrap();
+  let capability = capability_path(&first, "opened");
+  let port = first.nfs_port().expect("the daemon is serving NFS");
+  let mut opener = common::nfs4::Session::open(port, b"retry-open");
+  let mut closer = common::nfs4::Session::open(port, b"retry-close");
+  let opened = open_guarded(&mut opener, &capability, (b"opener", "made")).expect("the OPEN");
+  let to_close =
+    open_guarded(&mut closer, &capability, (b"closer", "closed")).expect("the OPEN to close");
+  let stateid = &to_close[..STATEID_BYTES];
+  let closed = close_kept(&mut closer, &capability, "closed", stateid).expect("the CLOSE");
+  first.stop();
+
+  let second = Daemon::start(&profile, config, source_of(&segment)).unwrap();
+  let port = second
+    .nfs_port()
+    .expect("the restarted daemon is serving NFS");
+  opener.reconnect(port);
+  closer.reconnect(port);
+  let again = opener.resend();
+  assert_ne!(
+    again.as_ref().err(),
+    Some(&NFS4ERR_EXIST),
+    "the retried OPEN is not run again into NFS4ERR_EXIST"
+  );
+  assert_eq!(
+    again.map(|body| body[..STATEID_BYTES].to_vec()),
+    Ok(opened[..STATEID_BYTES].to_vec()),
+    "the retried OPEN is answered with the state id it granted"
+  );
+  assert_eq!(
+    closer.resend().map(|body| body[..STATEID_BYTES].to_vec()),
+    Ok(closed[..STATEID_BYTES].to_vec()),
+    "the retried CLOSE is answered with the state id it closed, not run again into NFS4ERR_BAD_STATEID"
+  );
+  let counters = second.refusals_on_every_shard().unwrap();
+  let answered = counters.get("nfs4.replay.answered").copied().unwrap_or(0);
+  assert!(
+    answered >= 2,
+    "the restarted daemon answered the retried calls from its records ({answered})"
+  );
+  assert_eq!(
+    counters.get("nfs4.replay.diverged"),
+    None,
+    "no retried call met its record under another digest"
+  );
+  second.stop();
+  drop(segment);
+}
+
+/// A-127 (bounds): a destroyed session's call records are dropped at every owner, and the drop is made durable before
+/// it is acknowledged, so records never outlive their session. Do: a kept REMOVE on one session (its record kept at
+/// the volume's owner), then DESTROY_SESSION. Expect: the destroy succeeds and the daemon counts the record purged;
+/// after a restart over the same segment, the destroyed session's retry is refused `NFS4ERR_BADSESSION` and nothing is
+/// answered from a record.
+#[test]
+fn a_destroyed_sessions_records_are_purged_and_stay_purged_across_a_restart() {
+  /// Format: `NFS4ERR_BADSESSION` (RFC 8881 §15.1.11.3).
+  const NFS4ERR_BADSESSION: u32 = 10052;
+  let profile = common::machine_profile();
+  let instance = format!("srv-v4-purge-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
+  let segment = anchor_segment("v4purge", &profile, &config);
+
+  let first = Daemon::start(&profile, config.clone(), source_of(&segment)).unwrap();
+  first
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let mut client = connect(&instance);
+  client.create(&scratch("purged")).unwrap();
+  let capability = capability_path(&first, "purged");
+  {
+    let mut stream = nfs_stream(&first);
+    let root = mount(&mut stream, &capability, 1);
+    create(&mut stream, &root, "gone", 2);
+  }
+  let port = first.nfs_port().expect("the daemon is serving NFS");
+  let mut session = common::nfs4::Session::open(port, b"purge-on-destroy");
+  assert!(
+    remove_kept(&mut session, &capability, "gone").is_ok(),
+    "the REMOVE"
+  );
+  assert_eq!(session.destroy(), 0, "DESTROY_SESSION");
+  let purged = first
+    .refusals_on_every_shard()
+    .unwrap()
+    .get("nfs4.replay.purged")
+    .copied()
+    .unwrap_or(0);
+  assert!(
+    purged >= 1,
+    "the destroyed session's record was purged ({purged})"
+  );
+  first.stop();
+
+  let second = Daemon::start(&profile, config, source_of(&segment)).unwrap();
+  session.reconnect(
+    second
+      .nfs_port()
+      .expect("the restarted daemon is serving NFS"),
+  );
+  assert_eq!(
+    session.resend().map(|_| ()),
+    Err(NFS4ERR_BADSESSION),
+    "the destroyed session stays destroyed"
+  );
+  let counters = second.refusals_on_every_shard().unwrap();
+  assert_eq!(
+    counters.get("nfs4.replay.answered"),
+    None,
+    "nothing answered"
+  );
+  assert_eq!(
+    counters.get("nfs4.replay.restored").copied().unwrap_or(0),
+    0,
+    "no record of the destroyed session came back"
+  );
+  second.stop();
+  drop(segment);
+}

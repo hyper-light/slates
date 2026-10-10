@@ -10,6 +10,13 @@
 //!   answered from that slot's cached reply byte for byte (exactly-once semantics, §2.10.6); any other id
 //!   is misordered. Every reply that fits the negotiated cache size is kept, so a retry never has to be
 //!   refused as uncached.
+//! - **Durable sessions (A-127).** A durable table journals each session with its client ([`SessionRecord`]), so a
+//!   restarted listener serves it again: a client reconnects and retries on its own slot, with no
+//!   `NFS4ERR_BADSESSION` and no `CREATE_SESSION` (RFC 8881 §2.10.6.5 lets a server re-animate a session whose
+//!   client id, its `CREATE_SESSION` sequence and its principal it kept, as A-37 keeps them). A restored slot's last
+//!   sequence id was not recorded per request, so its first request after the restart is taken as it comes; whether
+//!   that request is a retry of one the dead daemon applied is answered by the call records the request's calls meet
+//!   at their owners (`crate::v4::replay`), never by the slot.
 //! - **Leases.** Every `SEQUENCE` renews its client's lease; [`Sessions::expire`] drops the clients whose
 //!   lease has lapsed, and their sessions.
 //! - **Bounds.** The client table and each client's sessions are bounded ([`Limits`]); a request past a
@@ -227,19 +234,39 @@ struct Client {
   restored: bool,
 }
 
-/// One slot: its last sequence id, that request's kept reply, and whether that request is still being
-/// served (a compound can await another shard, so its retry may arrive before it finishes).
+/// One slot: its last sequence id, that request's kept reply, whether that request is still being
+/// served (a compound can await another shard, so its retry may arrive before it finishes), and whether the slot
+/// came back from a record after a restart and has served nothing since (A-127: its sequence id is unknown, so its
+/// next request is taken as it comes).
 #[derive(Clone, Debug)]
 struct Slot {
   seq: u32,
   reply: Option<Vec<u8>>,
   in_flight: bool,
+  restored: bool,
+}
+
+impl Slot {
+  /// A slot of a new session: sequence id zero, so its first request is one.
+  fn fresh() -> Slot {
+    Slot {
+      seq: 0,
+      reply: None,
+      in_flight: false,
+      restored: false,
+    }
+  }
 }
 
 #[derive(Clone, Debug)]
 struct Session {
   clientid: u64,
+  /// The `CREATE_SESSION` sequence id that created it, which a retry of that call carries.
+  created_seq: u32,
   fore: ChannelAttrs,
+  /// The back channel as negotiated, whether or not the client asked for one (a retried `CREATE_SESSION`'s grant
+  /// names it).
+  back_attrs: ChannelAttrs,
   slots: Vec<Slot>,
   /// A session that arrived from its home (A-76): its client's record is there, not here.
   guest: bool,
@@ -274,10 +301,13 @@ pub struct Sessions {
   guest_drops: Vec<(SessionId, u16)>,
   /// Guest sessions destroyed here, for their home to forget; never more than the guests held.
   forgotten: Vec<SessionId>,
+  /// Sessions destroyed here since the last [`Sessions::take_destroyed`], with their clients, whose call records every
+  /// owner must drop (A-127); never more than the sessions the table held.
+  destroyed: Vec<(u64, SessionId)>,
 }
 
 /// A client as a durable record carries it (§4.6 A-37): enough for a restarted listener to keep the
-/// client id valid. Its sessions are not kept: the client re-creates them after `NFS4ERR_BADSESSION`.
+/// client id valid. Its sessions are records of their own ([`SessionRecord`], A-127).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ClientRecord {
   /// The client id.
@@ -292,13 +322,37 @@ pub struct ClientRecord {
   pub create_seq: u32,
 }
 
+/// A session as a durable record carries it (A-127): what a restarted listener needs to serve it again — its client,
+/// the `CREATE_SESSION` sequence id that created it (so a retry of that call gets this session back), both channels as
+/// negotiated, and the back channel's callback program, credential and minor version when the client asked for one.
+/// Its slots' sequence ids are not kept (`Slot::restored`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionRecord {
+  /// The session id.
+  pub sessionid: SessionId,
+  /// The client it belongs to.
+  pub clientid: u64,
+  /// The `CREATE_SESSION` sequence id that created it.
+  pub sequence: u32,
+  /// The fore channel as negotiated.
+  pub fore: ChannelAttrs,
+  /// The back channel as negotiated.
+  pub back: ChannelAttrs,
+  /// The back channel's callback program, credential and minor version, when the client asked for one.
+  pub callback: Option<(u32, Vec<u8>, u32)>,
+}
+
 /// One change to the client table, as the listener's partition records it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ClientChange {
   /// A client was recorded or changed.
   Set(ClientRecord),
-  /// A client was dropped.
+  /// A client was dropped, and every session of it with it.
   Cleared(u64),
+  /// A session was recorded or changed (A-127).
+  SessionSet(SessionRecord),
+  /// A session was destroyed.
+  SessionCleared(SessionId),
 }
 
 impl Sessions {
@@ -317,13 +371,23 @@ impl Sessions {
       away: BTreeMap::new(),
       guest_drops: Vec::new(),
       forgotten: Vec::new(),
+      destroyed: Vec::new(),
     }
   }
 
   /// A durable table (§4.6 A-37): every change is journaled for the listener's partition, and the
   /// clients kept before a restart are back, their leases starting now. A kept client that had created
   /// a session is confirmed; new client ids carry the new `boot`, so they never collide with kept ones.
-  pub fn restore(boot: u32, limits: Limits, records: Vec<ClientRecord>, now_ns: u64) -> Sessions {
+  /// Each kept session of a kept client is back too (A-127), held here, its slots restored and its back channel
+  /// down (the connection that carried it ended with the daemon, so the client is told to bind another); the session
+  /// its client's last `CREATE_SESSION` made gives that call's grant back to a retry of it.
+  pub fn restore(
+    boot: u32,
+    limits: Limits,
+    records: Vec<ClientRecord>,
+    sessions_kept: Vec<SessionRecord>,
+    now_ns: u64,
+  ) -> Sessions {
     let mut sessions = Sessions::new(boot, limits);
     for record in records {
       sessions
@@ -345,8 +409,88 @@ impl Sessions {
         },
       );
     }
+    for record in sessions_kept {
+      sessions.restore_session(record, now_ns);
+    }
     sessions.changes = Some(Vec::new());
     sessions
+  }
+
+  /// Takes back one kept session (A-127) whose client is held here; a session of a client not held, or beyond the
+  /// client's session bound, is left out (its client's record went, or the bound shrank since).
+  fn restore_session(&mut self, record: SessionRecord, now_ns: u64) {
+    let limits = self.limits;
+    let Some(client) = self.clients.get_mut(&record.clientid) else {
+      return;
+    };
+    if client.sessions.len() >= limits.max_sessions_per_client {
+      return;
+    }
+    let slots = usize::try_from(record.fore.max_requests)
+      .unwrap_or(1)
+      .max(1);
+    if record.sequence == client.create_seq.wrapping_sub(1) {
+      client.last_create = Some(SessionGranted {
+        sessionid: record.sessionid,
+        sequence: record.sequence,
+        fore: record.fore,
+        back: record.back,
+        back_channel: record.callback.is_some(),
+      });
+      client.restored = false;
+    }
+    client.confirmed = true;
+    client.sessions.push(record.sessionid);
+    self.sessions.insert(
+      record.sessionid,
+      Session {
+        clientid: record.clientid,
+        created_seq: record.sequence,
+        fore: record.fore,
+        back_attrs: record.back,
+        slots: (0..slots)
+          .map(|_| Slot {
+            restored: true,
+            ..Slot::fresh()
+          })
+          .collect(),
+        guest: false,
+        back: record
+          .callback
+          .map(|(program, credential, minor)| BackChannel {
+            program,
+            credential,
+            minor,
+            attrs: record.back,
+            sequence: 0,
+            state: CallbackState::Down,
+          }),
+        noted_ns: now_ns,
+      },
+    );
+  }
+
+  /// Journals the current record of `sessionid`, held here as this table's own, or its clearing (A-127). A guest's
+  /// record is its home's, never journaled here.
+  fn journal_session(&mut self, sessionid: &SessionId) {
+    let Some(changes) = self.changes.as_mut() else {
+      return;
+    };
+    changes.push(match self.sessions.get(sessionid) {
+      Some(session) if session.guest => return,
+      Some(session) => ClientChange::SessionSet(SessionRecord {
+        sessionid: *sessionid,
+        clientid: session.clientid,
+        sequence: session.created_seq,
+        fore: session.fore,
+        back: session.back_attrs,
+        callback: session
+          .back
+          .as_ref()
+          .map(|back| (back.program, back.credential.clone(), back.minor)),
+      }),
+      None => ClientChange::SessionCleared(*sessionid),
+    });
   }
 
   /// The changes since the last call, for the listener's partition to record; none for a standalone
@@ -498,14 +642,10 @@ impl Sessions {
       sessionid,
       Session {
         clientid: args.clientid,
+        created_seq: args.sequence,
         fore,
-        slots: (0..slots)
-          .map(|_| Slot {
-            seq: 0,
-            reply: None,
-            in_flight: false,
-          })
-          .collect(),
+        back_attrs: back,
+        slots: (0..slots).map(|_| Slot::fresh()).collect(),
         guest: false,
         back: args
           .callback
@@ -522,6 +662,7 @@ impl Sessions {
       },
     );
     self.journal_client(clientid);
+    self.journal_session(&sessionid);
     Ok(granted)
   }
 
@@ -554,6 +695,13 @@ impl Sessions {
       .ok_or(Nfsstat4::Badslot)?;
     if args.highest_slotid > highest {
       return Err(Nfsstat4::BadHighSlot);
+    }
+    // A slot restored after a restart takes its first request as new, whatever its sequence id (A-127): the dead
+    // daemon's last sequence id on it was not recorded, and a retry of a request it applied is answered by that
+    // request's call records, not by this slot.
+    if slot.restored {
+      slot.restored = false;
+      slot.seq = args.sequenceid.wrapping_sub(1);
     }
     if args.sequenceid == slot.seq {
       // A retry of the request still being served waits for it (§2.10.6.1: `NFS4ERR_DELAY`); one whose
@@ -616,9 +764,17 @@ impl Sessions {
   pub fn destroy_session(&mut self, sessionid: &SessionId) -> Result<(), Nfsstat4> {
     if let Some(to) = self.away.remove(sessionid) {
       self.guest_drops.push((*sessionid, to));
-      for client in self.clients.values_mut() {
+      let mut owner = None;
+      for (clientid, client) in &mut self.clients {
+        if client.sessions.contains(sessionid) {
+          owner = Some(*clientid);
+        }
         client.sessions.retain(|id| id != sessionid);
       }
+      if let Some(clientid) = owner {
+        self.destroyed.push((clientid, *sessionid));
+      }
+      self.journal_session(sessionid);
       return Ok(());
     }
     let session = self
@@ -626,12 +782,22 @@ impl Sessions {
       .remove(sessionid)
       .ok_or(Nfsstat4::Badsession)?;
     if session.guest {
+      // Its record is its home's, cleared when the home forgets it.
       self.forgotten.push(*sessionid);
+    } else {
+      self.journal_session(sessionid);
     }
     if let Some(client) = self.clients.get_mut(&session.clientid) {
       client.sessions.retain(|id| id != sessionid);
     }
+    self.destroyed.push((session.clientid, *sessionid));
     Ok(())
+  }
+
+  /// The sessions destroyed here since the last call, each with its client, whose call records every owner must drop
+  /// (A-127).
+  pub fn take_destroyed(&mut self) -> Vec<(u64, SessionId)> {
+    std::mem::take(&mut self.destroyed)
   }
 
   /// The guest sessions destroyed here since the last call, for their home to forget ([`Sessions::forget_away`]).
@@ -789,14 +955,22 @@ impl Sessions {
     self.callback_used(sessionid, 0);
   }
 
-  /// Records the minor version `sessionid`'s client uses, for its callbacks to name.
+  /// Records the minor version `sessionid`'s client uses, for its callbacks to name; a change is journaled, since a
+  /// restored session's callbacks must name it too (A-127).
   pub fn set_callback_minor(&mut self, sessionid: &SessionId, minor: u32) {
-    if let Some(back) = self
+    let changed = match self
       .sessions
       .get_mut(sessionid)
       .and_then(|session| session.back.as_mut())
     {
-      back.minor = minor;
+      Some(back) if back.minor != minor => {
+        back.minor = minor;
+        true
+      }
+      _ => false,
+    };
+    if changed {
+      self.journal_session(sessionid);
     }
   }
 
@@ -834,6 +1008,7 @@ impl Sessions {
       for client in self.clients.values_mut() {
         client.sessions.retain(|id| id != sessionid);
       }
+      self.journal_session(sessionid);
     }
   }
 

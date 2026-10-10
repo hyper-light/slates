@@ -289,6 +289,14 @@ pub struct ShardState {
   /// use; every NFSv4 id the shard mints names it.
   #[cfg(unix)]
   pub nfs_v4_instance: Option<u32>,
+  /// The call records of the recorded compounds whose calls this shard served (A-127), bounded by the configuration's
+  /// derived record bytes; what answers a compound retried after a restart.
+  #[cfg(unix)]
+  pub(crate) nfs_calls: slates_bridge_nfs::v4::replay::CallRecords,
+  /// The call of a recorded compound this shard is serving right now (A-127), set for the synchronous span of one
+  /// call so a file-state change it makes carries the compound's record in its own transaction.
+  #[cfg(unix)]
+  pub(crate) nfs_call: Option<crate::nfs_replay::RecordedCall>,
   /// The partition.
   pub db: Db,
   /// The owner runtime this node takes part in a region as (§4.8, boot step 6): the SWIM membership

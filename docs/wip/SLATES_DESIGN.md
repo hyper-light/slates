@@ -2338,7 +2338,9 @@ operation becomes the v3 procedure that means the same thing, answered by the sa
 (`v4/compound.rs` over `v4/v3call.rs`). Handles, permission, name rules and the volume's refusals are
 therefore one implementation shared by both versions.
 - **Sessions** (`v4/session.rs`, RFC 8881 §2.10): client ids, sessions, and a per-slot reply cache that
-  answers a retried request with its kept reply byte for byte and never runs it twice. Every table is
+  answers a retried request with its kept reply byte for byte and never runs it twice. Across a daemon
+  restart the sessions come back from their records, and a retried compound is answered from the call
+  records its calls left at their owners (A-127). Every table is
   bounded, with a refusal RFC 8881 §15.2 allows the operation at its bound: `NFS4ERR_DELAY` for a full
   client table (a lapsed client frees room), `NFS4ERR_NOSPC` for a client's sessions and for opens,
   `NFS4ERR_DELAY` for locks, `NFS4ERR_TOO_MANY_OPS` and `NFS4ERR_REQ_TOO_BIG` for a compound (checked
@@ -2354,7 +2356,8 @@ therefore one implementation shared by both versions.
   states live in a `FileState` on the owner shard of its volume (`v4/files.rs`), whichever listener
   or connection made them. So a share or lock check sees every open and lock of the file, and two
   listeners serving one volume (a fleet node each) share one lock table rather than enforcing two.
-  - The listener keeps only client ids, sessions, slot caches and leases.
+  - The listener keeps only client ids, sessions, slot caches and leases. The call records that answer a
+    compound retried after a restart are kept where its calls were served (A-127).
   - A state id names its owner: its `other` carries the owner's partition, as an attachment id
     carries its owner (D-14). TEST_STATEID and FREE_STATEID, which name no file, are routed by the id
     itself (`files::owner_of`, `Backend::call_owner`).
@@ -2374,9 +2377,10 @@ therefore one implementation shared by both versions.
   next CREATE_SESSION sequence. Each call commits its changes as one transaction of the partition's
   log, which the anchor segment keeps across a restart and the copyset replicates.
   - A restarted daemon rebuilds the file state and the client table from those records. The client's
-    id and its state ids stay valid, so there is no grace period and no reclaim. The client re-creates
-    only its session: sessions are not durable, as RFC 8881 §2.10.13 allows. A CREATE_SESSION retried
-    across the restart, whose grant was not kept, is served afresh.
+    id and its state ids stay valid, so there is no grace period and no reclaim. Since A-127 the sessions
+    are durable too (their records live beside their clients'), so the client keeps its session and retries
+    on its own slot; a CREATE_SESSION retried across the restart gets the grant of the session it made.
+    (Before A-127, sessions were not durable, as RFC 8881 §2.10.13 allows, and a retry ran again.)
   - Memory never runs ahead of the record. A transaction that cannot commit rolls the partition back
     to its durable state (the database's own rule). The state in memory is then rebuilt from those
     records, and the call is answered `NFS4ERR_SERVERFAULT`.
@@ -2394,7 +2398,7 @@ therefore one implementation shared by both versions.
   EXCLUSIVE4_1, and NFSv3 `EXCLUSIVE`) keeps its verifier in the new file's modification and access
   times (`procedures::exclusive_times`, RFC 1813 §3.3.8, RFC 8881 §18.16.3), which the volume and its
   recovery image keep. So a retry of the same create finds its own file and opens it — after a daemon
-  restart too, when the slot cache is gone — while any other existing name is `EXIST`. The OPEN reply's
+  restart too, when no record of the create answers it (A-127) — while any other existing name is `EXIST`. The OPEN reply's
   `attrset` names the times, and the client sets its own right after (the Linux v4 and macOS v3 clients
   both do). `suppattr_exclcreat` names the size, mode, owner and group, not the times; a create that
   sets a time is `NFS4ERR_INVAL` (A-38). Expired, replaced and destroyed clients' opens are purged with
@@ -10289,8 +10293,9 @@ Status: built on macOS 2026-10-06; Linux owed (below).
      `tcp_rmem[2]`). The kernel caps a mark silently, so it is read back, and a capped one ends the connection rather
      than wake it before every record is whole.
 - Re-running the one request in flight at a death is what the client's own retransmission after a reconnect did
-  before, so the semantics are unchanged. NFSv3 has no reply cache here, and NFSv4.1's session slots answer a retried
-  request from their cache.
+  before, so the semantics are unchanged. NFSv3 has no reply cache here, so a request applied and unanswered at a death
+  is applied again (owed: A-61's held reply, keyed by the held connection and the xid); an NFSv4.1 request retried
+  after a restart is answered from its call records (A-127).
 - Linux is owed. Linux keeps `SO_SNDLOWAT` fixed and copies what fits, so a send can end mid-record; a successor
   resuming such a stream would hand the client the next reply's bytes as the rest of the torn one. The remedy is an
   exact check at adoption: the bytes the kernel says were written (`tcpi_bytes_acked` plus `SIOCOUTQ`) against the
@@ -10732,3 +10737,93 @@ Status: built 2026-10-09.
   - random 4 KiB writes with an fsync every 8: 390 → 1,645 fsyncs/s median, daemon CPU per round 0.96–2.05 →
     0.22–0.35 s, 6 rounds each.
   - Measured and rejected: one hull per file, 451 fsyncs/s.
+
+### A-127 — A compound applied before a restart is answered on its retry, never run again (2026-10-09)
+Applied in the same change to:
+- `crates/bridge-nfs/src/v4/session.rs` (`SessionRecord`, `ClientChange::SessionSet` and `SessionCleared`,
+  `journal_session`, `restore_session`, `Slot::restored`, `take_destroyed`);
+- `crates/bridge-nfs/src/v4/replay.rs` (new: `CallRecords`, `CallIdentity`, `CallKey`, `digest`, `is_bulk`);
+- `crates/bridge-nfs/src/v4/compound.rs` (`Backend::record_calls`, the SEQUENCE outcome's sequence id and
+  `sa_cachethis`, `Purge`, the session purge in `purge_dropped`);
+- `crates/bridge-nfs/src/procedures.rs` (`STATE_PURGE_SESSION`);
+- `crates/db` (`NfsSessionRecord`, `NfsChannelRecord`, `NfsCallbackRecord`, `NfsCallRecord`; `Op::NfsSessionSet`,
+  `NfsSessionCleared`, `NfsCallSet` and `NfsCallsCleared`, all appended; two snapshot fields, appended);
+- `crates/vfs` (`HeldCall`; `ShardImage::calls`, image version 18; `ShardDelta::calls` and `calls_removed`, delta
+  version 3);
+- `crates/server/src/nfs_replay.rs` (new); `nfs.rs` (`Requester::call`, `RoutedBackend::next_call`, the answer and
+  record around `serve_local` and `serve_file_state_here`, `changes_volume`, `purge_session_here`); `nfs_state.rs`
+  (session records; `record_files(s, reply)` carries the call's record); `verbs.rs` (both publication paths, recovery);
+  `config.rs` (`nfs_v4_record_bytes`);
+- §4.6 "Sessions", "The state is durable", the A-113 status, the database model histories, GAPS, BENCHMARKS,
+  `docs/bugs/2026-10-09-a-compound-the-daemon-applied-before-it-died-ran-again-on-the-clients-retry.md`.
+
+Status: built 2026-10-09.
+- What it answers: the mixed kill bench (a Linux NFSv4.2 client's creates, writes, truncates, appends, unlinks and
+  renames under 30 SIGKILLs) failed two seeds of six. Each time, an `unlink` or `rename` the daemon had applied was
+  answered `ENOENT`. The daemon died after the barrier and before the reply; the client's retry met no session
+  (`NFS4ERR_BADSESSION`, sessions were not durable), made a new one, and the restarted daemon ran the operation again.
+  RFC 8881 §2.10.6.5 permits that; a restart that is invisible to a mounted client does not.
+- The evidence: RFC 8881 §2.10.6.5 ("Persistence"). A replier that persists a session's id and its slot table with
+  each slot's reply gives exactly-once across a restart. It may re-animate the session when it also kept the client
+  id, its CREATE_SESSION sequence and its principal, which A-37 keeps. Executing a compound and placing its result in
+  the persistent cache must be atomic, as in HA-NFS (Bhide, Elnozahy and Morgan, USENIX 1991, the RFC's reference
+  [46]), which logged the reply cache in the same transaction as the update. A-61 is the same rule for a FUSE reply.
+- The rule:
+  - **Durable sessions.** A session is recorded with its client in the listener's partition at CREATE_SESSION, and
+    cleared when it is destroyed or its client is dropped. A restarted listener serves it again:
+    - its back channel is down, so the client is told to bind a connection to it;
+    - its slots are restored. A slot's last sequence id was not recorded per request, so a restored slot takes its
+      first request as it comes;
+    - its client's last CREATE_SESSION gets its grant back.
+  - **Call records.** A compound whose SEQUENCE asked for its reply to be kept (`sa_cachethis`, the client's word that
+    it is not idempotent; Linux sets it on OPEN, CLOSE, REMOVE, RENAME, LINK, CREATE, SETATTR, LOCK, LOCKU and
+    DELEGRETURN, never on READ or WRITE) has each of its calls recorded at the shard that serves it. A call is keyed
+    by its procedure, a digest of its arguments, and how many earlier calls of the compound had both. It is recorded
+    with its result, except that a bulk read is recorded by its key alone and served again on a retry. One record per
+    slot; a later compound replaces it.
+  - **The record rides the commit that makes the effect durable.** A call that changed a volume rides the barrier's
+    publication; an UNSTABLE write's call rides the next publication. A call that changed file state rides that
+    change's own transaction. So no restart can keep an effect and lose its record. The calls before a compound's
+    first change ride the same commit, which keeps the retry's path through them the original's. A call recorded after
+    the compound's last change rides nothing new: a retry serves it again, past every recorded change.
+  - **Answered, not served.** On a retry, the compound runs its own logic again. Each call that meets its key at its
+    owner is answered from the record, and the rest are served. The logic is deterministic in its calls' results, so
+    the retry takes the original's path through every recorded call. A record made in the same daemon life is never
+    asked, since a retry within one life is the slot cache's; so while no restored record is held, answering costs
+    nothing.
+  - **The digest** is FxHash's word mix over the procedure, the arguments' length and the arguments. It tells calls
+    apart; it need not resist an adversary, since a client can only confuse its own retry. What a retry need not
+    repeat is left out: a WRITE's data, and a STATE_OPEN's delegation wish and clock. A retried call that meets its
+    procedure and occurrence in a restored record under another digest is served again and counted
+    (`nfs4.replay.diverged`), never silent.
+  - **Bounds.** A shard's records are bounded by `nfs_v4_record_bytes`, half the NFSv4 client share of its reserve;
+    the slot caches they are the durable twin of take the other half. A call that would record past the bound is
+    refused `NFS4ERR_DELAY` before it runs. A dropped client's and a destroyed session's records are purged at every
+    owner (`STATE_PURGE`, `STATE_PURGE_SESSION`). A purge is acknowledged only once a publication carries it;
+    otherwise its sender keeps it queued.
+- Stated limits:
+  - a compound that reads bytes after changing them, cut by a restart after the change and retried, reads them as they
+    are at the retry;
+  - a compound that did not ask for its reply to be kept is served again after a restart, which RFC 8881
+    §2.10.6.1.3 allows for a reply the server did not keep;
+  - the in-memory purge queue does not outlive the daemon (pre-existing for client state).
+- Proven:
+  - `crates/server/tests/recovery.rs`: a REMOVE and a RENAME retried after a restart are answered `NFS4_OK` (failed
+    before the change with `NFS4ERR_BADSESSION`, and with sessions alone `NFS4ERR_NOENT`);
+  - an OPEN that created `GUARDED` and a CLOSE, retried, keep their state ids (the file-state leg);
+  - a destroyed session's records are purged and stay purged across a restart;
+  - twelve unit tests of the records (T-127.1 to T-127.12, hostile decoding among them);
+  - the streamed checkpoint and delta tests carry call records;
+  - the database oracle's crashed histories recover sessions and call records exactly.
+- Measured (BENCHMARKS):
+  - the mixed kill bench: 3 of 13 seeds failed before; 450 kills over 15 seeds without a failed operation after, one
+    retry answered from its record;
+  - a single writer's create storm through Linux's NFSv4.2 client: +4 to +11 µs on a p50 near 195 µs (2–5%), against
+    12% for the first cut;
+  - kept against not-kept OPEN+CLOSE pairs in one daemon: +1 to +5 µs a pair.
+- Measured and rejected (the first cut):
+  - a durable record re-carried by every publication;
+  - file-state records riding publications;
+  - BLAKE3 as the digest.
+- Format: image version 18 and delta version 3. A log or image written by an earlier daemon is refused by version, as
+  every image format change before it was. The database's appended fields and operations follow its own rule.

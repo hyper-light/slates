@@ -1976,7 +1976,10 @@ fn stream_into(
   store: &Store,
   volumes: &[([u8; 16], Volume)],
   held: &[u8],
-  replies: &mut Vec<slates_vfs::recover::HeldReply>,
+  (replies, calls): (
+    &mut Vec<slates_vfs::recover::HeldReply>,
+    &mut Vec<slates_vfs::recover::HeldCall>,
+  ),
 ) -> Result<usize, VfsError> {
   let mut stage = Vec::new();
   let mut stream = journal.begin_checkpoint(slots, &mut stage)?;
@@ -1985,7 +1988,7 @@ fn stream_into(
     stream.buf().extend_from_slice(key);
     vol.encode_image_into(store, None, &mut stream)?;
   }
-  ShardImage::encode_finish(stream.buf(), held, replies);
+  ShardImage::encode_finish(stream.buf(), held, replies, calls);
   journal.finish_checkpoint(stream)
 }
 
@@ -1994,7 +1997,10 @@ fn shard_of(
   store: &Store,
   volumes: &[([u8; 16], Volume)],
   held: &[u8],
-  replies: &[slates_vfs::recover::HeldReply],
+  (replies, calls): (
+    &[slates_vfs::recover::HeldReply],
+    &[slates_vfs::recover::HeldCall],
+  ),
 ) -> ShardImage {
   ShardImage::new(
     volumes
@@ -2007,18 +2013,29 @@ fn shard_of(
   )
   .with_held(held.to_vec())
   .with_replies(replies.to_vec())
+  .with_calls(calls.to_vec())
 }
 
-/// The streamed checkpoint (2026-10-06). Do: stream a shard — the varied volumes plus one of 2,000 files, so the image
-/// is several stages long — straight into a journal's checkpoint slot, with held bytes and replies, and recover it.
-/// Expect: the frame is exactly the header, the generation and `ShardImage::new(…).with_held(…).with_replies(…)`'s
-/// encoding, and the journal recovers that shard image; the image is longer than two stages (non-vacuity: the stream
-/// flushed mid-image).
+/// The streamed checkpoint (2026-10-06; call records A-127). Do: stream a shard — the varied volumes plus one of 2,000
+/// files, so the image is several stages long — straight into a journal's checkpoint slot, with held bytes, replies and
+/// call records given out of key order, and recover it. Expect: the frame is exactly the header, the generation and
+/// `ShardImage::new(…).with_held(…).with_replies(…).with_calls(…)`'s encoding, and the journal recovers that shard
+/// image; the image is longer than two stages (non-vacuity: the stream flushed mid-image).
 #[test]
 fn a_streamed_shard_checkpoint_equals_the_shard_image_and_recovers() {
   let mut store = store();
   let (volumes, held, mut replies) = streamed_shard(&mut store);
-  let expected = shard_of(&store, &volumes, &held, &replies);
+  let mut calls = vec![
+    slates_vfs::recover::HeldCall {
+      key: [9; slates_vfs::recover::HELD_CALL_KEY_BYTES],
+      record: b"later slot".to_vec(),
+    },
+    slates_vfs::recover::HeldCall {
+      key: [1; slates_vfs::recover::HELD_CALL_KEY_BYTES],
+      record: b"earlier slot".to_vec(),
+    },
+  ];
+  let expected = shard_of(&store, &volumes, &held, (&replies, &calls));
   let encoded = expected.to_content();
   assert!(
     encoded.len() > 2 * slates_vfs::recover::STREAM_STAGE_BYTES,
@@ -2033,7 +2050,7 @@ fn a_streamed_shard_checkpoint_equals_the_shard_image_and_recovers() {
     &store,
     &volumes,
     &held,
-    &mut replies,
+    (&mut replies, &mut calls),
   )
   .unwrap();
   assert_eq!(frame, FRAME_BYTES + encoded.len(), "the frame's bytes");
@@ -2065,7 +2082,7 @@ fn a_refused_or_abandoned_streamed_checkpoint_leaves_the_committed_one() {
   let (volumes, _, _) = streamed_shard(&mut store);
   let mut small_sorted = varied_volumes(&mut store);
   small_sorted.sort_by_key(|(key, _)| *key);
-  let small_image = shard_of(&store, &small_sorted, &[], &[]);
+  let small_image = shard_of(&store, &small_sorted, &[], (&[], &[]));
   let slot_bytes = small_image.to_content().len() + slates_vfs::recover::STREAM_STAGE_BYTES;
   let mut slots = vec![0u8; 2 * slot_bytes];
   let mut journal = slates_vfs::checkpoint_log::Journal::default();
@@ -2075,7 +2092,7 @@ fn a_refused_or_abandoned_streamed_checkpoint_leaves_the_committed_one() {
     &store,
     &small_sorted,
     &[],
-    &mut Vec::new(),
+    (&mut Vec::new(), &mut Vec::new()),
   )
   .unwrap();
 

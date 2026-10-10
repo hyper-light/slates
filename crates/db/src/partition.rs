@@ -20,10 +20,10 @@ use slates_wire::request::{ClientWindow, Seen};
 use crate::Art;
 use crate::catalog::{
   AttachmentRecord, AuditRecord, CompletionRecord, Consumer, ConsumerRecord, GrantRecord,
-  LandingLeaseRecord, LandingRecord, LeaseRecord, LineageEdge, NfsClientRecord,
-  NfsDelegationRecord, NfsLockRecord, NfsOpenRecord, Principal, SEAL_KEY_RECORD_BYTES,
-  SEAL_RECIPIENT_RECORD_MAX, SealKeyOwner, SealKeyRecord, SnapshotId, SnapshotRecord, Tombstone,
-  VolumeId, VolumeRecord,
+  LandingLeaseRecord, LandingRecord, LeaseRecord, LineageEdge, NfsCallRecord, NfsClientRecord,
+  NfsDelegationRecord, NfsLockRecord, NfsOpenRecord, NfsSessionRecord, Principal,
+  SEAL_KEY_RECORD_BYTES, SEAL_RECIPIENT_RECORD_MAX, SealKeyOwner, SealKeyRecord, SnapshotId,
+  SnapshotRecord, Tombstone, VolumeId, VolumeRecord,
 };
 use crate::error::DbError;
 use crate::op::Op;
@@ -122,6 +122,10 @@ pub struct PartitionSnapshot {
   pub nfs_delegations: Vec<NfsDelegationRecord>,
   /// The sealing keys recorded at this partition, wrapped by their parents, by owner (A-92; appended).
   pub seal_keys: Vec<SealKeyRecord>,
+  /// The NFSv4.1 sessions this partition's listener holds, by session id (A-127; appended).
+  pub nfs_sessions: Vec<NfsSessionRecord>,
+  /// The NFSv4.1 call records this partition's file-state changes carried, by session slot (A-127; appended).
+  pub nfs_calls: Vec<NfsCallRecord>,
 }
 
 /// The partition.
@@ -165,6 +169,10 @@ pub struct Partition {
   seal_keys: BTreeMap<SealKeyOwner, SealKeyRecord>,
   nfs_locks: BTreeMap<[u8; 12], NfsLockRecord>,
   nfs_clients: BTreeMap<u64, NfsClientRecord>,
+  /// The listener's sessions (A-127), bounded by its session table: each client's sessions under its bound.
+  nfs_sessions: BTreeMap<[u8; 16], NfsSessionRecord>,
+  /// The call records file-state changes carried (A-127), one per session slot, bounded by the shard's records.
+  nfs_calls: BTreeMap<[u8; 20], NfsCallRecord>,
   nfs_instance: u32,
   /// The destroyed volumes whose tombstone this owner still owes its candidate holders (AUD-29-43), by volume,
   /// each with the register sequence it is written at. A tombstone keeps its volume's slot of the volume
@@ -215,6 +223,8 @@ impl Partition {
       seal_keys: BTreeMap::new(),
       nfs_locks: BTreeMap::new(),
       nfs_clients: BTreeMap::new(),
+      nfs_sessions: BTreeMap::new(),
+      nfs_calls: BTreeMap::new(),
       nfs_instance: 0,
       landing_leases: Art::new(),
       landings: BTreeMap::new(),
@@ -496,6 +506,16 @@ impl Partition {
     self.nfs_clients.values()
   }
 
+  /// The NFSv4.1 sessions this partition's listener holds (A-127).
+  pub fn nfs_sessions(&self) -> impl Iterator<Item = &NfsSessionRecord> {
+    self.nfs_sessions.values()
+  }
+
+  /// The NFSv4.1 call records this partition's file-state changes carried (A-127).
+  pub fn nfs_calls(&self) -> impl Iterator<Item = &NfsCallRecord> {
+    self.nfs_calls.values()
+  }
+
   /// The partition's NFSv4 instance: the last one a daemon life advanced to.
   pub fn nfs_instance(&self) -> u32 {
     self.nfs_instance
@@ -537,12 +557,34 @@ impl Partition {
         self
           .nfs_delegations
           .retain(|_, record| record.clientid != *clientid);
+        // Its call records go with its state (A-127).
+        self
+          .nfs_calls
+          .retain(|_, record| record.clientid != *clientid);
       }
       Op::NfsClientSet { record } => {
         self.nfs_clients.insert(record.clientid, record.clone());
       }
       Op::NfsClientCleared { clientid } => {
         self.nfs_clients.remove(clientid);
+        // A dropped client's sessions go with it (A-127).
+        self
+          .nfs_sessions
+          .retain(|_, record| record.clientid != *clientid);
+      }
+      Op::NfsSessionSet { record } => {
+        self.nfs_sessions.insert(record.sessionid, record.clone());
+      }
+      Op::NfsSessionCleared { sessionid } => {
+        self.nfs_sessions.remove(sessionid);
+      }
+      Op::NfsCallSet { record } => {
+        self.nfs_calls.insert(record.key, record.clone());
+      }
+      Op::NfsCallsCleared { sessionid } => {
+        self
+          .nfs_calls
+          .retain(|key, _| key.get(..sessionid.len()) != Some(&sessionid[..]));
       }
       Op::NfsInstanceAdvanced { instance } => {
         self.nfs_instance = self.nfs_instance.max(*instance);
@@ -712,7 +754,11 @@ impl Partition {
       | Op::NfsLockCleared { .. }
       | Op::NfsClientStateCleared { .. }
       | Op::NfsClientSet { .. }
-      | Op::NfsClientCleared { .. } => Ok(()),
+      | Op::NfsClientCleared { .. }
+      | Op::NfsSessionSet { .. }
+      | Op::NfsSessionCleared { .. }
+      | Op::NfsCallSet { .. }
+      | Op::NfsCallsCleared { .. } => Ok(()),
       // A key is made once: a second record for its owner would leave two keys sealing one owner's content. A record
       // is hyper-seal's fixed length, so a malformed one never enters the log.
       Op::SealKeySet { record } => {
@@ -982,6 +1028,10 @@ impl Partition {
       | Op::NfsClientStateCleared { .. }
       | Op::NfsClientSet { .. }
       | Op::NfsClientCleared { .. }
+      | Op::NfsSessionSet { .. }
+      | Op::NfsSessionCleared { .. }
+      | Op::NfsCallSet { .. }
+      | Op::NfsCallsCleared { .. }
       | Op::NfsInstanceAdvanced { .. } => {
         self.apply_nfs(op);
         Ok(())
@@ -1311,6 +1361,8 @@ impl Partition {
       seal_keys: self.seal_keys.values().cloned().collect(),
       nfs_locks: self.nfs_locks.values().cloned().collect(),
       nfs_clients: self.nfs_clients.values().cloned().collect(),
+      nfs_sessions: self.nfs_sessions.values().cloned().collect(),
+      nfs_calls: self.nfs_calls.values().cloned().collect(),
       nfs_instance: self.nfs_instance,
       tombstones: self.tombstones().collect(),
       green_chains: {
@@ -1357,6 +1409,12 @@ impl Partition {
     }
     for record in &snapshot.nfs_clients {
       self.nfs_clients.insert(record.clientid, record.clone());
+    }
+    for record in &snapshot.nfs_sessions {
+      self.nfs_sessions.insert(record.sessionid, record.clone());
+    }
+    for record in &snapshot.nfs_calls {
+      self.nfs_calls.insert(record.key, record.clone());
     }
     self.nfs_instance = snapshot.nfs_instance;
     for record in &snapshot.seal_keys {

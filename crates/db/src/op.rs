@@ -324,6 +324,27 @@ pub enum Op {
     /// Whose key.
     owner: crate::catalog::SealKeyOwner,
   },
+  /// An NFSv4.1 session was recorded or changed at its client's listener (A-127). Appended.
+  NfsSessionSet {
+    /// The record.
+    record: crate::catalog::NfsSessionRecord,
+  },
+  /// An NFSv4.1 session was destroyed at its client's listener (A-127). Appended.
+  NfsSessionCleared {
+    /// Format: the session id (16 bytes).
+    sessionid: [u8; 16],
+  },
+  /// An NFSv4.1 call record was recorded or replaced with the file-state change one of its calls made (A-127).
+  /// Appended.
+  NfsCallSet {
+    /// The record.
+    record: crate::catalog::NfsCallRecord,
+  },
+  /// Every call record of a destroyed NFSv4.1 session was dropped (A-127). Appended.
+  NfsCallsCleared {
+    /// Format: the session id (16 bytes).
+    sessionid: [u8; 16],
+  },
 }
 
 impl Op {
@@ -377,6 +398,10 @@ impl Op {
       Op::NfsDelegationCleared { .. } => "nfs_delegation_cleared",
       Op::SealKeySet { .. } => "seal_key_set",
       Op::SealKeyDestroyed { .. } => "seal_key_destroyed",
+      Op::NfsSessionSet { .. } => "nfs_session_set",
+      Op::NfsSessionCleared { .. } => "nfs_session_cleared",
+      Op::NfsCallSet { .. } => "nfs_call_set",
+      Op::NfsCallsCleared { .. } => "nfs_calls_cleared",
     }
   }
 }

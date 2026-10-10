@@ -2954,6 +2954,10 @@ fn init_shard(
     recall_queues: std::collections::BTreeMap::new(),
     #[cfg(unix)]
     nfs_v4_instance: None,
+    #[cfg(unix)]
+    nfs_calls: slates_bridge_nfs::v4::replay::CallRecords::new(config.nfs_v4.record_bytes),
+    #[cfg(unix)]
+    nfs_call: None,
     db,
     fleet,
     durability_shortfall,

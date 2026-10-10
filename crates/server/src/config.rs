@@ -861,7 +861,16 @@ pub struct NfsV4Caps {
   pub opens: usize,
   /// Derived: the byte-range lock ranges (and lock states holding none) the listener records at once.
   pub locks: usize,
+  /// Derived: the bytes of call records a shard holds at once (A-127): what answers a compound retried after a
+  /// restart, bounded beside the slot caches it is the durable twin of.
+  pub record_bytes: usize,
 }
+
+/// Shape: the holders the NFSv4 client share of a shard's reserve is split between (A-127): the slot caches (a kept
+/// reply per slot) and the call records (what a kept reply becomes across a restart, published with its effects).
+/// Each takes an equal part, so neither crowds out the other.
+#[cfg(unix)]
+const NFS_V4_CLIENT_SHARE_HOLDERS: u64 = 2;
 
 /// Shape: the sessions one NFSv4 client holds at once: the live one and its successor, which a client
 /// creates before destroying the old when it replaces a session (RFC 8881 §2.10.13); a client that
@@ -873,8 +882,10 @@ pub const NFS_V4_SESSIONS_PER_CLIENT: usize = 2;
 /// store's inode bound:
 /// - **slots** = the shard count: a session's requests are served by the volumes' owner shards, so more
 ///   in flight than there are shards to serve them only queues;
-/// - **clients** = the client share of the listener shard's reserve over one client's slot caches (every
-///   session's slots, each keeping a reply of up to one compound header, the cached-reply ceiling);
+/// - **clients** = the slot caches' part of the client share of the listener shard's reserve over one client's slot
+///   caches (every session's slots, each keeping a reply of up to one compound header, the cached-reply ceiling);
+/// - **record bytes** = the call records' part of the same share (A-127): the records a shard keeps for the compounds
+///   whose calls it served;
 /// - **opens** = the store's inode bound × the shard count: an open names a file, and every shard's
 ///   store holds at most that many;
 /// - **locks** = the same bound: a lock range names a byte range of an open file, and one lock-owner's
@@ -902,20 +913,25 @@ fn nfs_v4_caps(
       slates_bridge_nfs::v4::compound::COMPOUND_HEADER_BYTES,
     ))
     .max(1);
+  let part = reserve_per_shard
+    .saturating_mul(CLIENT_SHARE_PERMILLE)
+    .checked_div(PERMILLE)
+    .and_then(|share| share.checked_div(NFS_V4_CLIENT_SHARE_HOLDERS))
+    .unwrap_or(0);
   let clients: Derived<usize> = derived!(
-    usize::try_from(
-      reserve_per_shard
-        .saturating_mul(CLIENT_SHARE_PERMILLE)
-        .checked_div(PERMILLE)
-        .and_then(|share| share.checked_div(client_bytes))
-        .unwrap_or(0)
-    )
-    .unwrap_or(usize::MAX)
-    .max(1),
-    "reserve_per_shard × CLIENT_SHARE_PERMILLE / 1000 / (nfs_v4_slots × NFS_V4_SESSIONS_PER_CLIENT × COMPOUND_HEADER_BYTES)",
+    usize::try_from(part.checked_div(client_bytes).unwrap_or(0))
+      .unwrap_or(usize::MAX)
+      .max(1),
+    "reserve_per_shard × CLIENT_SHARE_PERMILLE / 1000 / NFS_V4_CLIENT_SHARE_HOLDERS / (nfs_v4_slots × NFS_V4_SESSIONS_PER_CLIENT × COMPOUND_HEADER_BYTES)",
     ["reserve_per_shard", "shards"]
   );
   derivations.push(note("nfs_v4_clients", &clients));
+  let record_bytes: Derived<usize> = derived!(
+    usize::try_from(part).unwrap_or(usize::MAX),
+    "reserve_per_shard × CLIENT_SHARE_PERMILLE / 1000 / NFS_V4_CLIENT_SHARE_HOLDERS",
+    ["reserve_per_shard"]
+  );
+  derivations.push(note("nfs_v4_record_bytes", &record_bytes));
   let opens: Derived<usize> = derived!(
     max_inodes.saturating_mul(usize::from(shards.max(1))),
     "max_inodes × shards",
@@ -933,6 +949,7 @@ fn nfs_v4_caps(
     clients: clients.get(),
     opens: opens.get(),
     locks: locks.get(),
+    record_bytes: record_bytes.get(),
   }
 }
 

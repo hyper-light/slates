@@ -75,6 +75,8 @@ mod lock_ledger;
 #[cfg(unix)]
 pub mod nfs;
 #[cfg(unix)]
+mod nfs_replay;
+#[cfg(unix)]
 mod nfs_state;
 #[cfg(unix)]
 pub mod nfs_tls;

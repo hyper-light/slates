@@ -88,6 +88,12 @@ pub trait Backend {
   fn finished(&mut self, opnum: u32, status: Nfsstat4) {
     let _ = (opnum, status);
   }
+  /// The compound's calls are to be recorded as calls of `compound` (A-127): its SEQUENCE asked for the reply to be
+  /// kept, so a retry of it after a restart must be answered with what its calls did (`super::replay`). `None` for a
+  /// compound whose calls are not recorded. A server that never restarts under a client records nothing.
+  fn record_calls(&mut self, compound: Option<super::replay::CallIdentity>) {
+    let _ = compound;
+  }
 }
 
 /// Format: the operation numbers (RFC 7863 `nfs_opnum4`).
@@ -328,13 +334,23 @@ const fn derived_compound_header_bytes() -> u32 {
 /// Format: the smallest encoded operation: its four-byte number and a four-byte argument.
 pub const MIN_OPERATION_BYTES: u32 = 8;
 
+/// What a purge drops at an owner: a dropped client's state and call records, or a destroyed session's call records
+/// (A-127).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Purge {
+  /// A client the table dropped (replaced, expired or destroyed).
+  Client(u64),
+  /// A session the table destroyed, of the client named.
+  Session(u64, SessionId),
+}
+
 /// The v4 server's state: sessions, open and lock state, and the figures its attributes report.
 pub struct Server {
   /// Client ids and sessions.
   pub sessions: Sessions,
-  /// Purges an owner could not take, retried on the next drop: `(client, owner partition)`, never more
-  /// than the clients the table held times the owners.
-  pending_purges: Vec<(u64, u16)>,
+  /// Purges an owner could not take, retried on the next drop: what to purge and the owner partition, never
+  /// more than the clients and sessions the table held times the owners.
+  pending_purges: Vec<(Purge, u16)>,
   limits: Limits,
   /// The major id of the `server_owner4` EXCHANGE_ID answers (RFC 8881 §2.10.5): what names this server, the same
   /// across its restarts and different from every other server's. A client takes two servers with one major id (and
@@ -364,16 +380,19 @@ impl Server {
     self
   }
 
-  /// A durable listener (§4.6 A-37): its client table rebuilt from the records kept before a restart
-  /// and journaled from now on (`Sessions::restore`).
+  /// A durable listener (§4.6 A-37): its client table and its sessions (A-127) rebuilt from the records kept before a
+  /// restart and journaled from now on (`Sessions::restore`).
   pub fn restore(
     boot: u32,
     limits: Limits,
-    records: Vec<super::session::ClientRecord>,
+    (clients, sessions): (
+      Vec<super::session::ClientRecord>,
+      Vec<super::session::SessionRecord>,
+    ),
     now_ns: u64,
   ) -> Server {
     let mut server = Server::new(boot, limits);
-    server.sessions = Sessions::restore(boot, limits, records, now_ns);
+    server.sessions = Sessions::restore(boot, limits, clients, sessions, now_ns);
     server
   }
 
@@ -529,14 +548,24 @@ pub async fn serve_into<B: Backend>(
             body,
             sessionid,
             slotid,
+            sequenceid,
             clientid,
             limits: reply_limits,
+            cache_this,
           }) => {
             slot = Some((sessionid, slotid));
             limits = Some(reply_limits);
             frame.clientid = Some(clientid);
             frame.session = Some(sessionid);
             backend.act_for(clientid);
+            // A compound whose reply the client asked to be kept has its calls recorded where they are served, so a
+            // retry after a restart is answered with what they did (A-127).
+            backend.record_calls(cache_this.then_some(super::replay::CallIdentity {
+              session: sessionid,
+              slot: slotid,
+              sequence: sequenceid,
+              clientid,
+            }));
             Ok(body.into())
           }
           Err(status) => Err(status),
@@ -743,9 +772,10 @@ async fn outside_session<B: Backend>(
     op::CREATE_SESSION => create_session(backend, reader),
     op::DESTROY_SESSION => {
       let sessionid = decode_sessionid(reader).map_err(|_| Nfsstat4::Badxdr)?;
-      backend
-        .with_v4(|server| server.sessions.destroy_session(&sessionid))?
-        .map(|()| Vec::new().into())
+      backend.with_v4(|server| server.sessions.destroy_session(&sessionid))??;
+      // Its call records go at every owner (A-127).
+      purge_dropped(backend).await?;
+      Ok(Vec::new().into())
     }
     op::DESTROY_CLIENTID => {
       let clientid = reader.u64().map_err(|_| Nfsstat4::Badxdr)?;
@@ -938,13 +968,16 @@ fn bind_conn<B: Backend>(backend: &mut B, reader: &mut XdrReader<'_>) -> Outcome
 
 /// How a compound's `SEQUENCE` came out.
 enum SequenceOutcome {
-  /// A new request: its result body, its slot and its client.
+  /// A new request: its result body, its slot, its sequence id, its client, and whether it asked for its reply to be
+  /// kept.
   New {
     body: Vec<u8>,
     sessionid: SessionId,
     slotid: u32,
+    sequenceid: u32,
     clientid: u64,
     limits: ReplyLimits,
+    cache_this: bool,
   },
   /// A retry: the kept reply, to send as it is.
   Replay(Vec<u8>),
@@ -1038,8 +1071,10 @@ fn sequence<B: Backend>(
         body: body.into_bytes(),
         sessionid,
         slotid,
+        sequenceid,
         clientid,
         limits,
+        cache_this,
       })
     }
   }
@@ -1665,25 +1700,47 @@ async fn owner_call<B: Backend>(
   }
 }
 
-/// Tells every owner to drop the file state of each client the session table dropped. An owner that
-/// cannot be reached keeps its purge queued, retried on the next drop, so no dead client's state is
+/// Tells every owner to drop the file state and call records of each client the session table dropped, and the call
+/// records of each session it destroyed (A-127). An owner that cannot be reached, or cannot make the drop durable,
+/// keeps its purge queued, retried on the next drop, so no dead client's state and no destroyed session's records are
 /// forgotten.
 async fn purge_dropped<B: Backend>(backend: &mut B) -> Result<(), Nfsstat4> {
   let owners = backend.owners();
   let purges = backend.with_v4(|server| {
     let mut purges = std::mem::take(&mut server.pending_purges);
     for clientid in server.take_dropped() {
-      purges.extend(owners.iter().map(|owner| (clientid, *owner)));
+      purges.extend(owners.iter().map(|owner| (Purge::Client(clientid), *owner)));
+    }
+    for (clientid, sessionid) in server.sessions.take_destroyed() {
+      purges.extend(
+        owners
+          .iter()
+          .map(|owner| (Purge::Session(clientid, sessionid), *owner)),
+      );
     }
     purges
   })?;
   let mut failed = Vec::new();
-  for (clientid, owner) in purges {
-    if owner_call(backend, owner, extension::STATE_PURGE, clientid, None)
-      .await
-      .is_err()
-    {
-      failed.push((clientid, owner));
+  for (purge, owner) in purges {
+    let sent = match purge {
+      Purge::Client(clientid) => {
+        owner_call(backend, owner, extension::STATE_PURGE, clientid, None).await
+      }
+      Purge::Session(clientid, sessionid) => {
+        let mut args = XdrWriter::new();
+        args.u64(clientid);
+        args.fixed(&sessionid);
+        let result = backend
+          .call_owner(owner, extension::STATE_PURGE_SESSION, args.into_bytes())
+          .await;
+        match XdrReader::new(&result).u32().map(Nfsstat4::from_wire) {
+          Ok(Some(Nfsstat4::Ok)) => Ok(Vec::new()),
+          _ => Err(Nfsstat4::Delay),
+        }
+      }
+    };
+    if sent.is_err() {
+      failed.push((purge, owner));
     }
   }
   backend.with_v4(|server| server.pending_purges.extend(failed))

@@ -177,6 +177,10 @@ pub mod extension {
   /// Format: one READDIR page encoded at the directory's owner (RFC 8881 §18.23; A-95). Arguments:
   /// `crate::v4::listing::PageRequest`. Result: the NFSv4 status, then (when it is OK) the READDIR4resok body.
   pub const READDIR4: u32 = 1054;
+  /// Format: drop a destroyed session's call records at an owner (A-127), sent to every owner (no file handle).
+  /// Arguments: the client id and the session id (16 bytes). Result: the status (`NFS4ERR_DELAY` when the drop could
+  /// not be made durable, so the sender keeps it queued).
+  pub const STATE_PURGE_SESSION: u32 = 1055;
 }
 
 /// Format: the bytes a state-carrying I/O procedure appends to its NFSv3 arguments: the client id (8)

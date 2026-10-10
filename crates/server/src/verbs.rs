@@ -8067,7 +8067,13 @@ pub fn rebuild_recovered(state: &mut ShardState) -> Rebuilt {
     volumes: images,
     held,
     replies,
+    calls,
   } = recover_images(state);
+  // The call records the dead daemon published and committed, which answer its clients' retries (A-127).
+  #[cfg(unix)]
+  crate::nfs_replay::restore(state, calls);
+  #[cfg(not(unix))]
+  drop(calls);
   // The barrier replies the dead daemon published and never delivered, for the mounts the anchor held (A-61).
   #[cfg(target_os = "linux")]
   {
@@ -8567,6 +8573,7 @@ fn recover_images(state: &mut ShardState) -> RecoveredImages {
           .collect(),
         held: shard.held,
         replies: shard.replies,
+        calls: shard.calls,
       }
     }
     Ok((None, _)) => RecoveredImages::default(),
@@ -8581,12 +8588,13 @@ fn recover_images(state: &mut ShardState) -> RecoveredImages {
 }
 
 /// What a shard's last committed image held: its volumes by id, the replicas it held for other owners
-/// (AUD-29-59), and the barrier replies it had not delivered (A-61).
+/// (AUD-29-59), the barrier replies it had not delivered (A-61), and its call records (A-127).
 #[derive(Default)]
 struct RecoveredImages {
   volumes: std::collections::BTreeMap<[u8; 16], VolumeImage>,
   held: Vec<u8>,
   replies: Vec<slates_vfs::recover::HeldReply>,
+  calls: Vec<slates_vfs::recover::HeldCall>,
 }
 
 /// What a shard publish committed (§4.8): the volumes the new image carries, and the ones it could
@@ -8709,6 +8717,55 @@ fn being_destroyed(volume: &slates_vfs::volume::Volume) -> bool {
   )
 }
 
+/// The call records a delta carries (A-127): the durable ones changed since the last publication, and the slots purged
+/// since.
+#[cfg(unix)]
+fn call_records_delta(
+  state: &ShardState,
+) -> (
+  Vec<slates_vfs::recover::HeldCall>,
+  Vec<[u8; slates_vfs::recover::HELD_CALL_KEY_BYTES]>,
+) {
+  crate::nfs_replay::delta(state)
+}
+
+/// The call records a delta carries: none where the NFS transport is not served (A-127).
+#[cfg(not(unix))]
+fn call_records_delta(
+  state: &ShardState,
+) -> (
+  Vec<slates_vfs::recover::HeldCall>,
+  Vec<[u8; slates_vfs::recover::HELD_CALL_KEY_BYTES]>,
+) {
+  let _ = state;
+  (Vec::new(), Vec::new())
+}
+
+/// The call records a checkpoint carries: every durable one (A-127).
+#[cfg(unix)]
+fn call_records_checkpoint(state: &ShardState) -> Vec<slates_vfs::recover::HeldCall> {
+  crate::nfs_replay::checkpoint(state)
+}
+
+/// The call records a checkpoint carries: none where the NFS transport is not served (A-127).
+#[cfg(not(unix))]
+fn call_records_checkpoint(state: &ShardState) -> Vec<slates_vfs::recover::HeldCall> {
+  let _ = state;
+  Vec::new()
+}
+
+/// A publication carrying the call records committed: nothing of them is owed to the next one (A-127).
+#[cfg(unix)]
+fn call_records_published(state: &mut ShardState) {
+  state.nfs_calls.published();
+}
+
+/// A publication committed where the NFS transport is not served: no call records to settle (A-127).
+#[cfg(not(unix))]
+fn call_records_published(state: &mut ShardState) {
+  let _ = state;
+}
+
 /// The barrier replies not yet delivered, which ride with the effects they answer (A-61).
 fn pending_replies(state: &ShardState) -> Vec<slates_vfs::recover::HeldReply> {
   #[cfg(target_os = "linux")]
@@ -8740,12 +8797,13 @@ fn publish_checkpoint(state: &mut ShardState) -> Result<Published, slates_vfs::V
   // content put only once a publish carrying it commits.
   let held = crate::content_holder::held_image(state);
   let mut replies = pending_replies(state);
+  let mut calls = call_records_checkpoint(state);
   // A volume that cannot be captured restarts the checkpoint without it: the image's bytes before it may already be
   // in the slot, and the slot commits only when its header is written last, so the abandoned stream commits nothing.
   // Each restart leaves out one more volume, so there are at most as many restarts as volumes.
   let mut skipped: Vec<(DbVolumeId, slates_vfs::VfsError)> = Vec::new();
   let outcome = loop {
-    match stream_checkpoint(state, &handles, &skipped, &held, &mut replies) {
+    match stream_checkpoint(state, &handles, &skipped, &held, (&mut replies, &mut calls)) {
       Ok(Streamed::Uncaptured(id, e)) => skipped.push((id, e)),
       Ok(Streamed::Committed(published)) => break Ok(published),
       Ok(Streamed::Refused(e)) => break Err(publish_refused(state, e)),
@@ -8771,6 +8829,7 @@ fn publish_checkpoint(state: &mut ShardState) -> Result<Published, slates_vfs::V
   }
   state.published_keys = published.volumes.iter().map(|id| id.bytes).collect();
   state.published_held = held;
+  call_records_published(state);
   // Every volume captured: this image holds every logged write, so the write log empties, stamped with this
   // generation (A-63). A volume skipped keeps the log, so its writes stay replayable.
   #[cfg(target_os = "linux")]
@@ -8802,7 +8861,10 @@ fn stream_checkpoint(
   handles: &[Handle<VolumeSlot>],
   skipped: &[(DbVolumeId, slates_vfs::VfsError)],
   held: &[u8],
-  replies: &mut Vec<slates_vfs::recover::HeldReply>,
+  (replies, calls): (
+    &mut Vec<slates_vfs::recover::HeldReply>,
+    &mut Vec<slates_vfs::recover::HeldCall>,
+  ),
 ) -> Result<Streamed, slates_vfs::VfsError> {
   let left_out = |slot: &VolumeSlot| {
     being_destroyed(&slot.volume) || skipped.iter().any(|(id, _)| *id == slot.id)
@@ -8854,7 +8916,7 @@ fn stream_checkpoint(
     }
     published.volumes.push(id);
   }
-  ShardImage::encode_finish(stream.buf(), held, replies);
+  ShardImage::encode_finish(stream.buf(), held, replies, calls);
   match state.journal.finish_checkpoint(stream) {
     Ok(frame_bytes) => published.frame_bytes = frame_bytes,
     Err(e) => return Ok(Streamed::Refused(e)),
@@ -8937,6 +8999,7 @@ fn publish_delta_into(
     .collect();
   let held = crate::content_holder::held_image(state);
   let held_changed = held != state.published_held;
+  let (mut calls, mut calls_removed) = call_records_delta(state);
   slates_vfs::checkpoint_log::ShardDelta::encode_finish(
     encoded,
     count_at,
@@ -8944,6 +9007,8 @@ fn publish_delta_into(
     &mut removed,
     held_changed.then_some(&held[..]),
     Some(&pending_replies(state)),
+    &mut calls,
+    &mut calls_removed,
   )?;
   let (start, end) = state.delta_range;
   let Some(object) = state.content.as_mut() else {
@@ -8967,6 +9032,7 @@ fn publish_delta_into(
   if held_changed {
     state.published_held = held;
   }
+  call_records_published(state);
   #[cfg(target_os = "linux")]
   clear_write_log(
     state,

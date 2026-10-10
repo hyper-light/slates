@@ -1,6 +1,7 @@
 //! The daemon's durable NFSv4 state (§4.6 A-37): a file's opens and locks recorded in its owner
-//! partition, the listener's clients in its own, so a daemon restart forces no grace period — the
-//! client's id and its state ids stay valid, and it re-creates only its session (RFC 8881 §2.10.13).
+//! partition, the listener's clients and their sessions (A-127) in its own, so a daemon restart forces no grace
+//! period and no new session — the client's id, its state ids and its sessions stay valid, and it retries on its own
+//! slots (RFC 8881 §2.10.6.5: a server may re-animate a session whose client it kept).
 //!
 //! Every call that changes the state commits its changes as one transaction of the partition's log
 //! (`slates_db::Db::begin` … `commit`), which the anchor segment keeps across a restart and the
@@ -12,9 +13,13 @@
 use slates_bridge_nfs::v4::compound::Server as V4Server;
 use slates_bridge_nfs::v4::files::{FileChange, FileState, LockRecord, OpenRecord, Share};
 use slates_bridge_nfs::v4::lock::{LockKind, Range};
-use slates_bridge_nfs::v4::session::{ClientChange, ClientRecord};
+use slates_bridge_nfs::v4::session::{ClientChange, ClientRecord, SessionRecord};
+use slates_bridge_nfs::v4::types::ChannelAttrs;
 use slates_db::Op;
-use slates_db::catalog::{NfsClientRecord, NfsLockRange, NfsLockRecord, NfsOpenRecord};
+use slates_db::catalog::{
+  NfsCallbackRecord, NfsChannelRecord, NfsClientRecord, NfsLockRange, NfsLockRecord, NfsOpenRecord,
+  NfsSessionRecord,
+};
 
 use crate::state::ShardState;
 
@@ -41,12 +46,19 @@ fn commit(s: &mut ShardState, ops: &[Op]) -> bool {
   false
 }
 
+/// Commits `ops` as one transaction of the shard's partition, for a caller outside this module (A-127's purges).
+pub(crate) fn commit_ops(s: &mut ShardState, ops: &[Op]) -> bool {
+  commit(s, ops)
+}
+
 /// Counter: delegations granted (or advanced) at this shard's files (A-78).
 const DELEGATIONS_GRANTED: &str = "nfs4.delegation.granted";
 
 /// Records the changes the owner's file state made in the call just served. `false` when they could
-/// not be recorded; the file state has then been rebuilt from the partition's records.
-pub(crate) fn record_files(s: &mut ShardState) -> bool {
+/// not be recorded; the file state has then been rebuilt from the partition's records. When the call belongs to a
+/// recorded compound (A-127, the shard's call in flight) and it changed file state, its `reply` is recorded and the
+/// slot's record rides the same transaction, so no restart keeps the change and loses what the call answered.
+pub(crate) fn record_files(s: &mut ShardState, reply: Option<&[u8]>) -> bool {
   let Some(files) = s.nfs_v4_files.as_mut() else {
     return true;
   };
@@ -67,7 +79,14 @@ pub(crate) fn record_files(s: &mut ShardState) -> bool {
       u64::try_from(granted).unwrap_or(u64::MAX),
     );
   }
-  let ops: Vec<Op> = changes.into_iter().map(file_op).collect();
+  let mut ops: Vec<Op> = changes.into_iter().map(file_op).collect();
+  if !ops.is_empty()
+    && let (Some(call), Some(reply)) = (s.nfs_call, reply)
+  {
+    // The record rides this transaction, not a publication: the change is file state (A-127).
+    crate::nfs_replay::record(s, &call, call.key.procedure, reply, false);
+    ops.extend(crate::nfs_replay::committed_op(s, &call));
+  }
   if commit(s, &ops) {
     return true;
   }
@@ -177,7 +196,7 @@ pub(crate) fn server(s: &mut ShardState) -> Option<V4Server> {
   let limits = crate::nfs::v4_limits(s);
   let now = slates_vfs::clock::Clock::monotonic_ns(&mut s.clock);
   let owner = server_owner(s.origin_anchor.0, &s.config.instance);
-  Some(V4Server::restore(instance, limits, clients(s), now).with_owner(owner))
+  Some(V4Server::restore(instance, limits, (clients(s), sessions(s)), now).with_owner(owner))
 }
 
 /// The `server_owner4` major id of the daemon instance `instance` on the host whose anchor identity is `anchor`
@@ -210,6 +229,52 @@ pub(crate) fn clients(s: &ShardState) -> Vec<ClientRecord> {
       create_seq: record.create_seq,
     })
     .collect()
+}
+
+/// The sessions this shard's listener keeps, from its partition's records (A-127).
+pub(crate) fn sessions(s: &ShardState) -> Vec<SessionRecord> {
+  s.db
+    .partition()
+    .nfs_sessions()
+    .map(|record| SessionRecord {
+      sessionid: record.sessionid,
+      clientid: record.clientid,
+      sequence: record.sequence,
+      fore: channel_of(&record.fore),
+      back: channel_of(&record.back),
+      callback: record.callback.as_ref().map(|callback| {
+        (
+          callback.program,
+          callback.credential.clone(),
+          callback.minor,
+        )
+      }),
+    })
+    .collect()
+}
+
+/// A channel's attributes from their record.
+fn channel_of(record: &NfsChannelRecord) -> ChannelAttrs {
+  ChannelAttrs {
+    header_pad: record.header_pad,
+    max_request: record.max_request,
+    max_response: record.max_response,
+    max_response_cached: record.max_response_cached,
+    max_operations: record.max_operations,
+    max_requests: record.max_requests,
+  }
+}
+
+/// A channel's attributes as their record carries them.
+fn channel_record(attrs: &ChannelAttrs) -> NfsChannelRecord {
+  NfsChannelRecord {
+    header_pad: attrs.header_pad,
+    max_request: attrs.max_request,
+    max_response: attrs.max_response,
+    max_response_cached: attrs.max_response_cached,
+    max_operations: attrs.max_operations,
+    max_requests: attrs.max_requests,
+  }
 }
 
 /// The partition operation one file-state change is.
@@ -274,6 +339,23 @@ fn client_op(change: ClientChange) -> Op {
       },
     },
     ClientChange::Cleared(clientid) => Op::NfsClientCleared { clientid },
+    ClientChange::SessionSet(record) => Op::NfsSessionSet {
+      record: NfsSessionRecord {
+        sessionid: record.sessionid,
+        clientid: record.clientid,
+        sequence: record.sequence,
+        fore: channel_record(&record.fore),
+        back: channel_record(&record.back),
+        callback: record
+          .callback
+          .map(|(program, credential, minor)| NfsCallbackRecord {
+            program,
+            credential,
+            minor,
+          }),
+      },
+    },
+    ClientChange::SessionCleared(sessionid) => Op::NfsSessionCleared { sessionid },
   }
 }
 

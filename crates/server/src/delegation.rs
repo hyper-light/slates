@@ -79,7 +79,7 @@ pub(crate) fn drain(s: &mut ShardState) {
       }
     }
   }
-  crate::nfs_state::record_files(s);
+  crate::nfs_state::record_files(s, None);
 }
 
 /// The session a recall to `clientid` goes to: a session of the client held on this shard whose back channel has

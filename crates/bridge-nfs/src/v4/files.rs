@@ -129,6 +129,9 @@ fn by_id(
   let mut body = XdrWriter::new();
   match procedure {
     extension::STATE_PURGE => files.purge(clientid),
+    // A destroyed session's call records are the daemon's (A-127), not the file state's: nothing of it is here, so the
+    // purge succeeds (a refusal would keep it queued at its sender for ever).
+    extension::STATE_PURGE_SESSION => {}
     extension::STATE_TEST => {
       let stateid = Stateid::decode(args).map_err(|_| Nfsstat4::Badxdr)?;
       let status = files.test(&stateid.other, clientid);

@@ -4408,3 +4408,68 @@ does not evict what the write cached. Any macOS read benchmark must remount afte
 On these cold reads (428–473 MiB/s on HEAD at load 20) the daemon's samples are mostly waits in `kevent`. Under that
 load the macOS `sample` tool also counts preempted threads at whatever user function they were in, so small functions'
 counts are not their CPU time.
+
+### Exactly-once across daemon kills: the mixed kill bench, before and after A-127 (condition 11; 2026-10-09)
+
+**Command:** `docs/wip/bench/kill_mixed.sh` (new) in a privileged `python:3.12-slim-trixie` container, with
+`SEED=<seed> OPS=30000 KILLS=30 GAP=0.4`, on Linux release builds.
+- A Linux NFSv4.2 client makes 30,000 random operations over at most 16 files: creates, writes inside and past the end,
+  truncates shorter and longer, appends, unlinks and renames. Each opens, acts and closes its file.
+- Meanwhile the daemon is SIGKILLed 30 times, 0.4 s apart, and the anchor restarts it.
+- The workload keeps a model of every file and records any operation that fails, with whether its file exists afterwards.
+- After the storm the volume is remounted, so the client's cache is cold, and the tree must equal the model name for name
+  and byte for byte.
+- Since A-127 the bench also reads each daemon life's `nfs4.replay.*` counters just before killing it, and sums them.
+- Load average 14–40 from other sessions.
+
+Before (`e494963d`-era build, `linux-inplace`):
+
+| seed | result |
+|---|---|
+| 101 (first attempt, 20 kills) | `unlink` raised `ENOENT` for a file the model held |
+| 101 (5 reruns) | identical |
+| 8 | `unlink("r1668")` raised `ENOENT`; the file was gone after |
+| 9 | `rename("f23670", "r23676")` raised `ENOENT`; the tree held `r23676`, the model did not |
+| 7, 10, 11 | identical |
+
+After (A-127), three builds as the change was refined:
+
+| build | seeds | kills | result |
+|---|---|---|---|
+| first cut | 8, 9, 101, 7, 10, 11 | 180 | identical; the divergence counter fired 2–14 times a life, false positives fixed in the next build |
+| divergence fix | 11, 8, 9 | 90 | identical; no divergence |
+| final | 8, 9, 101, 7, 10, 11 | 180 | identical; no divergence. Per seed, 29–49 records restored over the killed lives; seed 11's lives answered one retry from its record |
+
+- 450 kills across 15 seeds without a failed operation, against 3 of 13 seeds failing before.
+- The window the bug needs, between a barrier and its reply's send, is narrow: the final 180 kills hit it once, and that
+  retry was answered from its record instead of being run again.
+
+### The cost of call records: a single writer's create storm, before and after A-127 (2026-10-09)
+
+**Command:** `docs/wip/bench/hotdir/creates.sh` (new), alternating a build without A-127 (`e494963d`-era) and the final
+A-127 build, six rounds each, in privileged containers on this machine. Every create opens with a compound whose reply
+the client asks to be kept, and closes with another, so both are recorded.
+
+| round | load (1 min) | before: creates/s, p50, p99 | after: creates/s, p50, p99 |
+|---|---|---|---|
+| 1 | 40 / 34 | 4,675, 187.6 µs, 438.5 µs | 4,708, 191.8 µs, 401.1 µs |
+| 2 | 28 / 25 | 4,618, 195.9 µs, 410.0 µs | 4,434, 202.2 µs, 420.3 µs |
+| 3 | 17 / 15 | 4,549, 195.4 µs, 426.6 µs | 4,385, 206.4 µs, 423.3 µs |
+| 4 | 15 / 13 | 4,674, 192.5 µs, 408.0 µs | 3,098, 239.5 µs, 2,814 µs |
+| 5 | 17 / 18 | 1,500, 241.6 µs, 7,523 µs | 3,595, 228.8 µs, 1,707 µs |
+| 6 | 20 / 18 | 1,851, 214.4 µs, 5,303 µs | 4,333, 199.8 µs, 459.5 µs |
+
+- Rounds 1–3 are undisturbed in both arms: +4, +6 and +11 µs on a p50 near 195 µs (2–5%), and −4% to +1% in creates per
+  second. Rounds 4–6 each have one arm hit by a load spike, in both directions.
+- In one daemon, the same OPEN+CLOSE pair alternately kept and not kept, 4,000 pairs each in interleaved blocks of 250
+  (a scratch harness over the restart suite's NFSv4 client, macOS release, three runs): p50 57/57/58 µs not kept against
+  59/62/59 µs kept. That difference includes the slot cache's copy of a kept reply, which predates A-127.
+- Measured and rejected, in the first cut, at 192 → 216 µs median p50 and 4,519 → 4,061 creates/s (five alternated
+  rounds):
+  - a record that rode every publication once durable, re-carried for each read after its change;
+  - a record that rode publications for file-state changes too;
+  - BLAKE3 as the argument digest, 0.47% of the daemon's samples, on its portable path.
+  The replacements: a record rides a publication only for a volume change, a file-state change's record rides its own
+  transaction, the digest is FxHash's word mix, and answering skips the lookup while no restored record is held.
+- Owed: a state transaction carries the slot's whole record, the entries a publication already carried included. A record
+  split between the image's prefix and the transaction's suffix, merged at restore, would trim those entries.

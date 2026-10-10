@@ -36,6 +36,7 @@ pub mod delegation;
 pub mod files;
 pub mod listing;
 pub mod lock;
+pub mod replay;
 pub mod session;
 pub mod status;
 pub mod types;
