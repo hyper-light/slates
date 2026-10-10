@@ -452,6 +452,62 @@ fn changes_volume(program: u32, procedure: u32, args: &[u8], results: &[u8]) -> 
     || (program == NFS_PROGRAM && write == NFSPROC3_WRITE && nfs_ok(results))
 }
 
+/// Counter: NFSv3 requests a dead daemon applied and left unanswered on a held connection, answered by its successor
+/// from the reply published with the effect instead of being applied again (A-128).
+const HELD_REPLY_ANSWERED: &str = "nfs.held_reply.answered";
+
+/// Counter: held NFSv3 replies a restarted shard took back from its image (A-128), each waiting for its request to be
+/// read again.
+pub(crate) const HELD_REPLY_RESTORED: &str = "nfs.held_reply.restored";
+
+/// The reply a dead daemon published for request `xid` on held connection `connection` (A-128), taken (a request is
+/// read again once), counted.
+fn held_reply_answer(
+  s: &mut ShardState,
+  connection: u64,
+  xid: u32,
+) -> Option<(AcceptStatus, Vec<u8>)> {
+  let (accepted, results) = s.recovered_nfs_replies.remove(&(connection, xid))?;
+  s.count(HELD_REPLY_ANSWERED, 1);
+  Some(if accepted {
+    (AcceptStatus::Success, results)
+  } else {
+    (AcceptStatus::SystemErr, Vec::new())
+  })
+}
+
+/// Holds `reply` for request `key` (connection, xid) of a held connection (A-128) until its turn's replies are sent:
+/// the shard's next publication carries it.
+fn hold_reply(s: &mut ShardState, key: (u64, u32), reply: &(AcceptStatus, Vec<u8>)) {
+  let accepted = matches!(reply.0, AcceptStatus::Success);
+  let results = if accepted {
+    reply.1.clone()
+  } else {
+    Vec::new()
+  };
+  s.held_nfs_replies.insert(key, (accepted, results));
+  s.held_nfs_replies_changed = true;
+}
+
+/// A turn's replies are in the kernel and its requests consumed (A-128): a held connection's replies held for them are
+/// owed to no one, since no successor reads those requests again.
+fn turn_sent(connection: &Connection, turn: &Turn) {
+  let Some(held) = connection.held else {
+    return;
+  };
+  let _ = state::with_state_counted(|s| {
+    for xid in turn
+      .handled
+      .iter()
+      .filter_map(|(record, _)| record_xid(record))
+    {
+      if s.held_nfs_replies.remove(&(held, xid)).is_some() {
+        s.held_nfs_replies_changed = true;
+      }
+    }
+  });
+}
+
 /// Whether an NFS reply's leading status is `NFS3_OK` (RFC 1813: every NFS result starts with its
 /// `nfsstat3`).
 fn nfs_ok(results: &[u8]) -> bool {
@@ -532,6 +588,10 @@ struct Requester {
   /// its records when it served it before a restart, and records it otherwise. `None` for a call of a compound whose
   /// reply was not asked to be kept, and for every NFSv3 wire call.
   call: Option<crate::nfs_replay::RecordedCall>,
+  /// The connection the anchor holds that this NFSv3 wire call came on (A-128): a mutation's reply is then held, keyed
+  /// by the connection and the xid, and published with its effect, so a successor that reads the request again
+  /// answers it from there. `None` for every other call.
+  held: Option<u64>,
 }
 
 impl Requester {
@@ -548,6 +608,7 @@ impl Requester {
         dialect: Dialect::LOOPBACK_NFS3,
         client: None,
         call: None,
+        held: None,
       },
       None => Requester::root(),
     }
@@ -564,6 +625,7 @@ impl Requester {
       dialect: Dialect::LOOPBACK_NFS3,
       client: None,
       call: None,
+      held: None,
     }
   }
 
@@ -914,6 +976,10 @@ fn serve_local(
   args: &[u8],
   port: u16,
 ) -> (AcceptStatus, Vec<u8>) {
+  if let Some(early) = answered_or_refused(&requester, xid, program, procedure, args) {
+    return early;
+  }
+  let call = requester.call;
   // The `bridge.request` chokepoint span (§4.14): one NFS bridge call from arrival to reply, served on
   // this shard's volumes, opened as a root — the kernel's call is the entry point of its trace. Its
   // request identity for replay is the RPC transaction id under the mount's port (an NFS client
@@ -921,28 +987,6 @@ fn serve_local(
   // procedure — content-free (an operation code, never a path or bytes). The clock and ring are reached
   // through `with_state`, taken at the call's edges — outside `serve_call`'s own per-operation borrows,
   // so there is no re-entrant borrow.
-  // A call of a recorded compound (A-127) that this shard served for the same compound before a restart is answered
-  // from its record, never served again. Answering changes nothing, so it comes before any refusal a change would meet.
-  let call = requester.call;
-  if let Some(answer) = call
-    .as_ref()
-    .and_then(|call| state::with_state(|s| crate::nfs_replay::answered(s, call)).flatten())
-  {
-    return (AcceptStatus::Success, answer);
-  }
-  if let Some(refused) = refused_for_write_delegation(&requester, program, procedure, args) {
-    return refused;
-  }
-  // Refused before it runs when recording it would pass the records' bound (A-127).
-  if call
-    .as_ref()
-    .is_some_and(|call| state::with_state(|s| crate::nfs_replay::refused(s, call)) == Some(true))
-  {
-    return (
-      AcceptStatus::Success,
-      status_failure_reply(Nfsstat3::Jukebox, procedure),
-    );
-  }
   let request = RequestId {
     client: u32::from(port),
     sequence: xid,
@@ -988,32 +1032,12 @@ fn serve_local(
     s.store.recall_gate.act_as(None);
     s.nfs_call = None;
   });
-  // A recorded compound's call is recorded before the barrier, so the publication that makes its effect durable
-  // carries what it answered (A-127): a change to a volume rides that publication (an UNSTABLE write's, the next one).
-  if let Some(call) = call.as_ref()
-    && matches!(served.0, AcceptStatus::Success)
-  {
-    let changed = changes_volume(program, procedure, args, &served.1);
-    let _ = state::with_state_counted(|s| {
-      crate::nfs_replay::record(s, call, procedure, &served.1, changed);
-    });
-  }
-  // The barrier (§4.8, D-18): a mutation's effect is published into anchor-owned RAM before its
-  // reply leaves this shard, so the reply's stability claim is true for daemon-restart survival.
-  let result = if matches!(served.0, AcceptStatus::Success)
-    && needs_barrier(program, procedure, args, &served.1)
-  {
-    let barriered = barrier(procedure, target_volume(program, procedure, args), served);
-    // A refused barrier told the client the change is not stable: that is what its record answers too.
-    if let Some(call) = call.as_ref() {
-      let _ = state::with_state_counted(|s| {
-        crate::nfs_replay::record(s, call, procedure, &barriered.1, true);
-      });
-    }
-    barriered
-  } else {
-    served
-  };
+  let result = record_and_publish(
+    (call, requester.held),
+    xid,
+    (program, procedure, args),
+    served,
+  );
   if let Some(open) = open {
     let _ = state::with_state_counted(|s| {
       let end_ns = s.clock.monotonic_ns();
@@ -1023,6 +1047,89 @@ fn serve_local(
   // A change this call was refused for a delegation asked for a recall; it is sent now (A-79).
   let _ = state::with_state_counted(crate::delegation::drain);
   result
+}
+
+/// What a call is answered with before it is served, if anything:
+/// - an NFSv3 request a dead daemon applied and left unanswered on a held connection, from the reply it published with
+///   the effect (A-128), never applied twice;
+/// - a call of a recorded compound this shard served for the same compound before a restart, from its record (A-127);
+/// - a change another client's write delegation refuses (A-79);
+/// - a call of a recorded compound that recording would carry past the records' bound, refused before it runs (A-127).
+///
+/// Answering changes nothing, so the answers come before any refusal a change would meet.
+fn answered_or_refused(
+  requester: &Requester,
+  xid: u32,
+  program: u32,
+  procedure: u32,
+  args: &[u8],
+) -> Option<(AcceptStatus, Vec<u8>)> {
+  if let Some(answer) = requester
+    .held
+    .and_then(|connection| state::with_state(|s| held_reply_answer(s, connection, xid)).flatten())
+  {
+    return Some(answer);
+  }
+  let call = requester.call;
+  if let Some(answer) = call
+    .as_ref()
+    .and_then(|call| state::with_state(|s| crate::nfs_replay::answered(s, call)).flatten())
+  {
+    return Some((AcceptStatus::Success, answer));
+  }
+  if let Some(refused) = refused_for_write_delegation(requester, program, procedure, args) {
+    return Some(refused);
+  }
+  call
+    .as_ref()
+    .is_some_and(|call| state::with_state(|s| crate::nfs_replay::refused(s, call)) == Some(true))
+    .then(|| {
+      (
+        AcceptStatus::Success,
+        status_failure_reply(Nfsstat3::Jukebox, procedure),
+      )
+    })
+}
+
+/// A served call's record and barrier:
+/// - a recorded compound's call is recorded before the barrier, so the publication that makes its effect durable
+///   carries what it answered (A-127): a change to a volume rides that publication (an UNSTABLE write's, the next one);
+/// - the barrier (§4.8, D-18) publishes a mutation's effect into anchor-owned RAM before its reply leaves this shard,
+///   so the reply's stability claim is true for daemon-restart survival;
+/// - a held connection's mutation holds its reply before the barrier, so the publication carries both (A-128);
+/// - a refused barrier told the client the change is not stable, and that is what its record and held reply answer.
+fn record_and_publish(
+  (call, held): (Option<crate::nfs_replay::RecordedCall>, Option<u64>),
+  xid: u32,
+  (program, procedure, args): (u32, u32, &[u8]),
+  served: (AcceptStatus, Vec<u8>),
+) -> (AcceptStatus, Vec<u8>) {
+  if let Some(call) = call.as_ref()
+    && matches!(served.0, AcceptStatus::Success)
+  {
+    let changed = changes_volume(program, procedure, args, &served.1);
+    let _ = state::with_state_counted(|s| {
+      crate::nfs_replay::record(s, call, procedure, &served.1, changed);
+    });
+  }
+  if !matches!(served.0, AcceptStatus::Success)
+    || !needs_barrier(program, procedure, args, &served.1)
+  {
+    return served;
+  }
+  if let Some(connection) = held {
+    let _ = state::with_state_counted(|s| hold_reply(s, (connection, xid), &served));
+  }
+  let barriered = barrier(procedure, target_volume(program, procedure, args), served);
+  if let Some(connection) = held {
+    let _ = state::with_state_counted(|s| hold_reply(s, (connection, xid), &barriered));
+  }
+  if let Some(call) = call.as_ref() {
+    let _ = state::with_state_counted(|s| {
+      crate::nfs_replay::record(s, call, procedure, &barriered.1, true);
+    });
+  }
+  barriered
 }
 
 /// Serves one call on the volume's `owner` shard over the bridge queue: spawns the serve on the owner
@@ -2047,7 +2154,7 @@ impl Call {
 /// The RPC reply for one deframed call message, framed as one record: the entry the network export's TLS session
 /// serves its plaintext calls through ([`crate::nfs_tls`]), exactly as [`serve_one`] serves the loopback's.
 pub(crate) async fn reply_to_message(this: u16, message: Vec<u8>, port: u16) -> Vec<u8> {
-  reply_to(this, Call::parse(message), port).await
+  reply_to(this, Call::parse(message), port, None).await
 }
 
 /// The RPC reply for one call, framed as one record ([`reply_record`]). An NFSv4 call goes to the v4 front end, which presents a
@@ -2056,7 +2163,7 @@ pub(crate) async fn reply_to_message(this: u16, message: Vec<u8>, port: u16) -> 
 /// routing), every other call's from the file handle it names. It rides to the owner shard, which
 /// validates it against the attachment record; no state is kept per connection, so the kernel's later
 /// requests — on this connection or any other — self-authorize through the handles the mount returned.
-async fn reply_to(this: u16, mut call: Call, port: u16) -> Vec<u8> {
+async fn reply_to(this: u16, mut call: Call, port: u16, held: Option<u64>) -> Vec<u8> {
   if call.program == NFS_PROGRAM && call.version == NFS_V4 {
     return reply_v4(this, call, port).await;
   }
@@ -2070,8 +2177,9 @@ async fn reply_to(this: u16, mut call: Call, port: u16) -> Vec<u8> {
   if let Some(args) = rewritten {
     call.set_args(args);
   }
-  let requester =
+  let mut requester =
     std::mem::replace(&mut call.requester, Requester::root()).with_capability(capability);
+  requester.held = held;
   let (xid, program, version, procedure) = (call.xid, call.program, call.version, call.procedure);
   reply_for(
     this,
@@ -2462,6 +2570,7 @@ async fn serve_connection(mut connection: Connection) {
           connection.end();
           return;
         }
+        turn_sent(&connection, &turn);
         if let Some(owner) = turn.moving {
           migrate(owner, connection);
           return;
@@ -2518,7 +2627,7 @@ async fn serve_turn(
       turn.moving = moving;
       reply
     } else {
-      reply_to(this, call, connection.port).await
+      reply_to(this, call, connection.port, connection.held).await
     };
     turn.handled.push((bounded_record(xid, reply), end));
     if turn.moving.is_some() || futures::now_ns().saturating_sub(started) >= quantum {
@@ -2526,6 +2635,18 @@ async fn serve_turn(
     }
   }
   turn
+}
+
+/// Format: where a framed reply record's xid sits: after its four-byte record marker.
+const RECORD_XID_AT: usize = size_of::<u32>();
+
+/// The xid of a framed reply record (its first word after the record marker), or `None` for an empty one (a callback's
+/// answer, which carries no reply).
+fn record_xid(record: &[u8]) -> Option<u32> {
+  let word = record.get(RECORD_XID_AT..RECORD_XID_AT.checked_add(size_of::<u32>())?)?;
+  let mut bytes = [0u8; size_of::<u32>()];
+  bytes.copy_from_slice(word);
+  Some(u32::from_be_bytes(bytes))
 }
 
 /// `record`, a reply framed as one record, or — past [`RECORD_WIRE_BYTES`], which no reply reaches since every result is

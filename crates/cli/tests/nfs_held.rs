@@ -615,3 +615,243 @@ fn every_committed_file_survives_daemon_kills_byte_for_byte() {
     "a kill changed the verifier under the client at least once"
   );
 }
+
+/// Shape: daemon kills in the mutation flow, each inside a burst: enough that a kill lands, more than once, after a
+/// turn's barriers and before its replies left.
+const MUTATION_KILLS: usize = 20;
+/// Shape: the most kills the mutation flow makes while no successor has yet answered a request from a held reply
+/// (the non-vacuity bound: the window a kill must land in is a turn's, which a few rounds in twenty hit).
+const MUTATION_KILLS_MAX: usize = 60;
+/// Shape: the MKDIRs one burst pipelines: several turns' worth on one connection.
+const MUTATION_BURST: usize = 24;
+/// Format: NFSPROC3_MKDIR (RFC 1813 §3.3.9).
+const MKDIR: u32 = 9;
+/// Format: `NFS3ERR_EXIST` (RFC 1813 §2.6).
+const NFS3ERR_EXIST: u32 = 17;
+
+/// MKDIR3args: `name` in `dir`, mode 0755, every other attribute unset.
+fn mkdir_args(dir: &[u8], name: &str) -> Vec<u8> {
+  let mut args = Vec::new();
+  nfs::opaque(dir, &mut args);
+  nfs::opaque(name.as_bytes(), &mut args);
+  args.extend_from_slice(&1u32.to_be_bytes()); // set_mode
+  args.extend_from_slice(&0o755u32.to_be_bytes());
+  for _unset in 0..5 {
+    args.extend_from_slice(&0u32.to_be_bytes()); // uid, gid, size unset; atime, mtime DONT_CHANGE
+  }
+  args
+}
+
+/// Format: NFSPROC3_LOOKUP (RFC 1813 §3.3.3).
+const LOOKUP: u32 = 3;
+
+/// LOOKUP of `name` in `dir` over `stream`: its status, read past any late duplicate of an earlier reply (a successor
+/// may answer again a request its predecessor had answered).
+fn lookup_answered(stream: &mut TcpStream, dir: &[u8], name: &str, xid: u32) -> u32 {
+  let mut args = Vec::new();
+  nfs::opaque(dir, &mut args);
+  nfs::opaque(name.as_bytes(), &mut args);
+  stream.write_all(&framed_call(LOOKUP, &args, xid)).unwrap();
+  loop {
+    let (answered, results) = next_reply(stream);
+    if answered == xid {
+      return nfs::status(&results);
+    }
+  }
+}
+
+/// A-61 for NFSv3 over a held connection (A-113). A held connection serves a turn of pipelined requests, publishing
+/// each mutation's barrier, and sends the turn's replies at its end; a daemon killed between a barrier and the send
+/// leaves applied requests unanswered in the socket, which its successor reads again. Do: under `slates anchor`,
+/// pipeline bursts of MKDIRs of fresh names on one held connection and `kill -9` the daemon at a different moment
+/// inside each burst. Expect: the first reply to every MKDIR is `NFS3_OK` — never `NFS3ERR_EXIST`, which a successor
+/// that ran again a MKDIR the dead daemon applied would answer (a client acts on the first reply to an xid and drops
+/// any later one, RFC 5531 §9); every directory is found afterwards; and at least one kill landed inside a burst.
+#[test]
+fn a_mutation_applied_before_its_daemons_kill_is_answered_never_run_again() {
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the held-connection mutation flow: set SLATES_TEST_CLI=1 to run it (an anchor and its daemons)"
+    );
+    return;
+  }
+  if cfg!(target_os = "linux") {
+    eprintln!(
+      "skipping the held-connection mutation flow: Linux does not hold NFS connections yet (A-113, GAPS)"
+    );
+    return;
+  }
+  let instance = format!("nfs-held-mkdir-{}", std::process::id());
+  let _anchor = start_anchor(&instance);
+  let mut run = MutationRun {
+    held: HeldSession::open(&instance),
+    first: BTreeMap::new(),
+    names: Vec::new(),
+    kills_inside_a_burst: 0,
+    answered_from_held: 0,
+  };
+  let mut pid = daemon_pid(&instance).expect("a daemon answers");
+  let mut round = 0usize;
+  while round < MUTATION_KILLS || (run.answered_from_held == 0 && round < MUTATION_KILLS_MAX) {
+    run.kill_inside_a_mkdir_burst(round, pid);
+    pid = await_new_daemon(&instance, pid, round);
+    // The successor answered the requests it read again before the burst's last reply arrived; its counter says how
+    // many it answered from the replies its predecessor held.
+    let (restored, answered) = (
+      held_counter(&instance, "nfs.held_reply.restored"),
+      held_counter(&instance, "nfs.held_reply.answered"),
+    );
+    if restored + answered > 0 {
+      eprintln!(
+        "round {round}: the successor restored {restored} held replies and answered {answered} from them"
+      );
+    }
+    run.answered_from_held += answered;
+    round += 1;
+  }
+  run.assert_each_applied_once(round);
+}
+
+/// The mutation flow's state: its connection, each MKDIR's first answer by xid, the names made, and the evidence.
+struct MutationRun {
+  held: HeldSession,
+  first: BTreeMap<u32, (String, u32)>,
+  names: Vec<String>,
+  kills_inside_a_burst: usize,
+  answered_from_held: u64,
+}
+
+impl MutationRun {
+  /// Pipelines `round`'s burst of MKDIRs, kills daemon `pid` partway in, and reads a first reply for every one of them
+  /// (a later reply to the same xid is counted as a duplicate). An even round kills as soon as the burst's first reply
+  /// arrives: the daemon is serving the burst then, and a burst spans several turns, so a later turn is in flight. An
+  /// odd round kills at a fixed delay from the burst's start, which can land before the daemon starts serving it.
+  fn kill_inside_a_mkdir_burst(&mut self, round: usize, pid: u32) {
+    let mut burst = Vec::new();
+    let mut expected = BTreeMap::new();
+    for index in 0..MUTATION_BURST {
+      let name = format!("d{round:02}-{index:02}");
+      burst.extend_from_slice(&framed_call(
+        MKDIR,
+        &mkdir_args(&self.held.root, &name),
+        self.held.xid,
+      ));
+      expected.insert(self.held.xid, name.clone());
+      self.names.push(name);
+      self.held.xid += 1;
+    }
+    let mut writer = self.held.stream.try_clone().unwrap();
+    let sending = std::thread::spawn(move || writer.write_all(&burst).map(|()| Instant::now()));
+    if round.is_multiple_of(2) {
+      self.read_first_replies(&expected, 1);
+    } else {
+      #[allow(clippy::disallowed_methods)] // the test places the kill inside the burst
+      std::thread::sleep(Duration::from_micros(((round * 977) % 3_000) as u64));
+    }
+    let killed_at = Instant::now();
+    let killed = Command::new("kill")
+      .args(["-9", &pid.to_string()])
+      .status()
+      .unwrap();
+    assert!(killed.success(), "kill the daemon");
+    self.read_first_replies(&expected, expected.len());
+    let sent_at = sending.join().unwrap().unwrap();
+    self.kills_inside_a_burst += usize::from(sent_at > killed_at);
+  }
+
+  /// Reads replies until `wanted` requests of `expected` have a first reply, counting a later reply to an xid as a
+  /// duplicate.
+  fn read_first_replies(&mut self, expected: &BTreeMap<u32, String>, wanted: usize) {
+    let answered = |first: &BTreeMap<u32, (String, u32)>| {
+      expected
+        .keys()
+        .filter(|xid| first.contains_key(xid))
+        .count()
+    };
+    while answered(&self.first) < wanted {
+      let (xid, results) = next_reply(&mut self.held.stream);
+      let Some(name) = expected.get(&xid) else {
+        panic!("a reply to a request of this burst: {xid}");
+      };
+      if self.first.contains_key(&xid) {
+        self.held.duplicates += 1;
+        continue;
+      }
+      self
+        .first
+        .insert(xid, (name.clone(), nfs::status(&results)));
+    }
+  }
+
+  /// After `rounds` kills: no MKDIR first answered `NFS3ERR_EXIST` or refused otherwise, every directory found, and at
+  /// least one request answered from a held reply.
+  fn assert_each_applied_once(&mut self, rounds: usize) {
+    let run_again: Vec<&String> = self
+      .first
+      .values()
+      .filter(|(_, status)| *status == NFS3ERR_EXIST)
+      .map(|(name, _)| name)
+      .collect();
+    let refused: Vec<(&String, u32)> = self
+      .first
+      .values()
+      .filter(|(_, status)| *status != 0 && *status != NFS3ERR_EXIST)
+      .map(|(name, status)| (name, *status))
+      .collect();
+    let mut xid = self.held.xid;
+    let stream = &mut self.held.stream;
+    let root = &self.held.root;
+    let missing: Vec<&String> = self
+      .names
+      .iter()
+      .filter(|name| {
+        xid += 1;
+        lookup_answered(stream, root, name, xid) != 0
+      })
+      .collect();
+    eprintln!(
+      "held connection, mutations: {rounds} kills ({} inside a burst), {} MKDIRs, {} duplicate replies, {} answered \
+       from held replies, {} first answered NFS3ERR_EXIST",
+      self.kills_inside_a_burst,
+      self.names.len(),
+      self.held.duplicates,
+      self.answered_from_held,
+      run_again.len()
+    );
+    assert!(
+      run_again.is_empty(),
+      "MKDIRs the dead daemon applied were run again by its successor and answered NFS3ERR_EXIST: {run_again:?}"
+    );
+    assert!(refused.is_empty(), "MKDIRs refused otherwise: {refused:?}");
+    assert!(
+      missing.is_empty(),
+      "directories missing afterwards: {missing:?}"
+    );
+    assert!(
+      self.answered_from_held > 0,
+      "a successor answered at least one request its predecessor applied from the reply it held (non-vacuity)"
+    );
+  }
+}
+
+/// A held-reply counter of the daemon at `instance` (A-128), from its status, summed over its shards:
+/// `nfs.held_reply.restored` (taken back from the image) or `nfs.held_reply.answered` (requests answered from them).
+fn held_counter(instance: &str, counter: &str) -> u64 {
+  let (code, out, _) = run(instance, &["status", "--json"]);
+  if code != 0 {
+    return 0;
+  }
+  out
+    .split(&format!("\"{counter}\""))
+    .skip(1)
+    .filter_map(|after| {
+      let after = after.split("\"count\":").nth(1)?;
+      after
+        .trim_start()
+        .split(|c: char| !c.is_ascii_digit())
+        .next()?
+        .parse::<u64>()
+        .ok()
+    })
+    .sum()
+}

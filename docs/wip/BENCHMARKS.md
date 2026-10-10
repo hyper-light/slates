@@ -4473,3 +4473,24 @@ the client asks to be kept, and closes with another, so both are recorded.
   transaction, the digest is FxHash's word mix, and answering skips the lookup while no restored record is held.
 - Owed: a state transaction carries the slot's whole record, the entries a publication already carried included. A record
   split between the image's prefix and the transaction's suffix, merged at restore, would trim those entries.
+
+### NFSv3 mutations on a held connection under kills, before and after A-128 (condition 11; 2026-10-09)
+
+**Command:** `SLATES_TEST_CLI=1 cargo test -p slates-cli --test nfs_held a_mutation_applied_before -- --nocapture`
+(macOS 26, debug build, the real `slates anchor`).
+- One held loopback connection pipelines bursts of 24 MKDIRs of fresh names.
+- Each burst's daemon is `kill -9`ed partway in: half the kills follow the burst's first reply, half come at a fixed
+  delay.
+- A burst's requests stay in the socket until the turn that answers them has sent its replies (A-113).
+- Load average 70–85 from other sessions.
+
+| build | runs | kills | MKDIRs first answered `NFS3ERR_EXIST` | answered from held replies |
+|---|---|---|---|---|
+| before (A-127, no held replies) | 1 | 20 | 10 of 480 | (counter absent) |
+| A-128 | 8 | about 160 | 0 | 1–38 per run |
+
+- Before, the run-again requests came in runs of one turn (`d03-00`…`d03-03`, `d06-09`…`d06-12`).
+- After, a successor restored 7–23 held replies per death that printed. Most were replies whose requests had already
+  been consumed, and those are never asked for.
+- A-113's WRITE-burst flow at the same load: longest kill-to-answer about 1.2 s in some runs and 190–270 ms in others,
+  in both the base build and this one, three alternations each. A-113's 123–126 ms was recorded at lower load.

@@ -120,10 +120,10 @@ with `Err(2)` (`NFS4ERR_NOENT`), the double run itself.
 
 ## Siblings (reported, not changed here)
 
-- **macOS NFSv3 over a held connection (A-113)** re-runs the one request in flight at a death: a successor reads it
-  again from the held socket. A REMOVE that was applied but unanswered is therefore answered `NFS3ERR_NOENT`. The
-  design accepted this ("what the client's own retransmission after a reconnect did before"). The A-61 remedy applies
-  unchanged: publish a reply keyed by the held connection and the xid, and answer a re-read request with it. Owed.
+- **macOS NFSv3 over a held connection (A-113)** re-ran the requests a turn had applied and not yet answered at a
+  death: a successor read them again from the held socket. A new test pipelined MKDIRs under 20 kills; 10 of 480 were
+  first answered `NFS3ERR_EXIST`. **Fixed the same day (A-128):** a mutation's reply is held, keyed by the connection
+  and the xid, and published with its effect; the successor answers the request it reads again from it.
 - **Pending purges are not durable.** `pending_purges` lives only in the home's memory, so a purge queued when a
   daemon dies is forgotten: the client's file state (pre-existing) and now its call records stay at an owner the purge
   never reached. Within one daemon every owner is a shard of the same process and is reachable, so the gap needs a

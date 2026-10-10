@@ -10292,10 +10292,9 @@ Status: built on macOS 2026-10-06; Linux owed (below).
      it is left unset: the receive low-water mark grows the buffer to fit (`tcp_set_rcvlowat`, up to half of
      `tcp_rmem[2]`). The kernel caps a mark silently, so it is read back, and a capped one ends the connection rather
      than wake it before every record is whole.
-- Re-running the one request in flight at a death is what the client's own retransmission after a reconnect did
-  before, so the semantics are unchanged. NFSv3 has no reply cache here, so a request applied and unanswered at a death
-  is applied again (owed: A-61's held reply, keyed by the held connection and the xid); an NFSv4.1 request retried
-  after a restart is answered from its call records (A-127).
+- A request applied and unanswered at a death is never applied again. An NFSv3 mutation's reply is held, keyed by the
+  held connection and the xid, and published with its effect, so the successor answers the request it reads again
+  from that reply (A-128). An NFSv4.1 request retried after a restart is answered from its call records (A-127).
 - Linux is owed. Linux keeps `SO_SNDLOWAT` fixed and copies what fits, so a send can end mid-record; a successor
   resuming such a stream would hand the client the next reply's bytes as the rest of the torn one. The remedy is an
   exact check at adoption: the bytes the kernel says were written (`tcpi_bytes_acked` plus `SIOCOUTQ`) against the
@@ -10827,3 +10826,45 @@ Status: built 2026-10-09.
   - BLAKE3 as the digest.
 - Format: image version 18 and delta version 3. A log or image written by an earlier daemon is refused by version, as
   every image format change before it was. The database's appended fields and operations follow its own rule.
+
+### A-128 — An NFSv3 request applied before a death is answered on its held connection, never applied twice (2026-10-09)
+Applied in the same change to:
+- `crates/vfs` (`HeldNfsReply`; `ShardImage::nfs_replies`, image version 19; `ShardDelta::nfs_replies`, delta
+  version 4);
+- `crates/server/src/nfs.rs` (`Requester::held`, set by `reply_to` for a held connection's NFSv3 call;
+  `answered_or_refused` answers from a recovered reply; `record_and_publish` holds a mutation's reply around its
+  barrier; `turn_sent` drops a turn's held replies once its replies are in the kernel; `record_xid`);
+- `crates/server/src/state.rs` (`held_nfs_replies`, `held_nfs_replies_changed`, `recovered_nfs_replies`);
+- `crates/server/src/verbs.rs` (both publication paths carry the held replies, and `restore_nfs_answers` takes them
+  back);
+- `crates/cli/tests/nfs_held.rs` (the mutation flow), the A-113 status, GAPS, BENCHMARKS,
+  `docs/bugs/2026-10-09-a-compound-the-daemon-applied-before-it-died-ran-again-on-the-clients-retry.md` (its sibling).
+
+Status: built 2026-10-09.
+- What it answers: A-113 keeps a loopback connection across a daemon's death, and a successor answers the requests
+  the dead daemon left in the socket by serving them again. A connection serves a turn of pipelined requests,
+  publishing each mutation's barrier, and sends the turn's replies at its end. So a death between a barrier and the
+  send left applied requests to be applied a second time. On macOS, 10 of 480 MKDIRs pipelined on one held connection
+  under 20 kills were first answered `NFS3ERR_EXIST`, in runs of a turn's requests (the new mutation flow, before the
+  change). A REMOVE or RENAME is answered `NFS3ERR_NOENT` the same way. A-113 had accepted this as "what the client's
+  own retransmission after a reconnect did before"; A-61 had already solved it for FUSE.
+- The rule (A-61's, for NFSv3):
+  - A mutation on a held connection holds its reply, keyed by the connection's id and the request's xid, before its
+    barrier publishes. The publication carries the reply with the effect, and a refused barrier's answer replaces it.
+  - The held replies of a turn are dropped once the turn's replies are in the kernel and its requests consumed. No
+    successor reads those requests again; a later publication drops them from the image.
+  - A successor takes back the held replies its image carries, and answers a request read again on the same connection
+    with the same xid from its reply, never serving it.
+  - A held reply whose request was consumed before the death (the image not yet republished) is never asked for and
+    lives only until the daemon ends. A client reuses an xid on one connection only after 2³² requests (RFC 5531 §9).
+- Bounds: held replies on a shard are its held connections' turns in progress; recovered ones are at most the previous
+  image's.
+- Proven (macOS; Linux holds no connection yet, A-113):
+  - `a_mutation_applied_before_its_daemons_kill_is_answered_never_run_again` pipelines MKDIR bursts on one held
+    connection and kills the daemon inside each. Every MKDIR's first reply must be `NFS3_OK` and every directory must
+    exist after. A successor must have answered at least one request from a held reply, counted as
+    `nfs.held_reply.answered`; the test kills up to 60 times until one has.
+  - Before the change: 10 of 480 first answered `NFS3ERR_EXIST`. After: none in about 160 kills over 8 runs, with 1–38
+    requests answered from held replies per run.
+  - The WRITE-burst and commit-oracle flows of A-113 pass unchanged.
+- Format: image version 19 and delta version 4; earlier images and logs are refused by version, as before.

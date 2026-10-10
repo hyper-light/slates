@@ -71,10 +71,12 @@ const SHARD_MAGIC: u32 = u32::from_le_bytes(*b"SLS1");
 /// 17 (A-99, 2026-10-05) a sealed chunk's image carries its key identity, its version and its segments' tags, so
 /// a restarted daemon re-opens the ciphertext the arena still holds instead of reading it as clear bytes.
 /// 18 (A-127, 2026-10-09) the call records a barrier publishes with the effects their calls made, so a compound the
-/// dead daemon applied is answered on its client's retry, never run again.
+/// dead daemon applied is answered on its client's retry, never run again. 19 (A-128, 2026-10-09) the replies an NFSv3
+/// barrier publishes for a connection the anchor holds, so a request the dead daemon applied and never answered is
+/// answered on the same socket by its successor, never applied twice.
 /// Format: the image layout version, bumped with any change to the types below or to the held replicas'
 /// image they carry.
-const IMAGE_VERSION: u16 = 18;
+const IMAGE_VERSION: u16 = 19;
 
 /// A recorded attachment's references in an image (A-61): its durable id and its share by inode.
 #[derive(Clone, Debug, PartialEq, Eq, Wire)]
@@ -509,6 +511,24 @@ pub struct ShardImage {
   /// The call records published with the effects their calls made (A-127), in key order: at most one per session
   /// slot of the transport's clients, opaque here.
   pub calls: Vec<HeldCall>,
+  /// The NFSv3 replies a barrier published for connections the anchor holds and had not yet sent (A-128), in
+  /// (connection, xid) order: the mutations of each held connection's turn in progress.
+  pub nfs_replies: Vec<HeldNfsReply>,
+}
+
+/// An NFSv3 reply published with the effect it answers (A-128): the anchor-held connection the request came on, the
+/// request's xid, whether the call was accepted (a refused barrier answers `SYSTEM_ERR`), and the procedure's results,
+/// opaque here.
+#[derive(Clone, Debug, PartialEq, Eq, Wire)]
+pub struct HeldNfsReply {
+  /// The held connection's id.
+  pub connection: u64,
+  /// The request's xid.
+  pub xid: u32,
+  /// Whether the call was accepted with these results; `false` for a system error with none.
+  pub accepted: bool,
+  /// The procedure's results.
+  pub results: Vec<u8>,
 }
 
 /// A transport's reply published with the effect it answers (A-61): the mount's attachment, the request's unique
@@ -548,14 +568,17 @@ impl ShardImage {
     slates_wire::codec::encode_len(volumes, out);
   }
 
-  /// Ends a streamed shard image: the held replicas, the replies and the call records, as
-  /// `ShardImage::new(volumes).with_held(held).with_replies(replies).with_calls(calls).encode` writes them after the
-  /// volumes.
+  /// Ends a streamed shard image: the held replicas, the replies, the call records and the held NFSv3 replies, as
+  /// `ShardImage::new(volumes).with_held(held).with_replies(replies).with_calls(calls).with_nfs_replies(nfs)`'s
+  /// `encode` writes them after the volumes.
   pub fn encode_finish(
     out: &mut Vec<u8>,
     held: &[u8],
-    replies: &mut Vec<HeldReply>,
-    calls: &mut Vec<HeldCall>,
+    (replies, calls, nfs_replies): (
+      &mut Vec<HeldReply>,
+      &mut Vec<HeldCall>,
+      &mut Vec<HeldNfsReply>,
+    ),
   ) {
     slates_wire::codec::encode_len(held.len(), out);
     out.extend_from_slice(held);
@@ -563,6 +586,8 @@ impl ShardImage {
     replies.encode(out);
     calls.sort_by_key(|call| call.key);
     calls.encode(out);
+    nfs_replies.sort_by_key(|reply| (reply.connection, reply.xid));
+    nfs_replies.encode(out);
   }
 
   /// A shard image of the given volumes, in key order, holding nothing for others.
@@ -575,6 +600,7 @@ impl ShardImage {
       held: Vec::new(),
       replies: Vec::new(),
       calls: Vec::new(),
+      nfs_replies: Vec::new(),
     }
   }
 
@@ -593,6 +619,15 @@ impl ShardImage {
   pub fn with_calls(self, mut calls: Vec<HeldCall>) -> ShardImage {
     calls.sort_by_key(|call| call.key);
     ShardImage { calls, ..self }
+  }
+
+  /// This image carrying `nfs_replies`, the held NFSv3 replies not yet sent (A-128), in (connection, xid) order.
+  pub fn with_nfs_replies(self, mut nfs_replies: Vec<HeldNfsReply>) -> ShardImage {
+    nfs_replies.sort_by_key(|reply| (reply.connection, reply.xid));
+    ShardImage {
+      nfs_replies,
+      ..self
+    }
   }
 
   /// Decodes a shard image from content-object bytes, refusing a foreign magic, an unknown version

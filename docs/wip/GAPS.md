@@ -5350,9 +5350,32 @@ On a Linux release build of `faad1562` (A-126, the probe-storm fix and the reply
   - in one daemon, kept against not-kept OPEN+CLOSE pairs: +1 to +5 µs a pair.
   - The first cut cost 12% (192 → 216 µs); it was measured and replaced (BENCHMARKS).
 - **Owed:**
-  - macOS NFSv3 over a held connection re-runs a request applied and unanswered at a death (A-113 accepted it). A-61's
-    held reply, keyed by the connection and the xid, is the remedy.
+  - ~~macOS NFSv3 over a held connection re-runs a request applied and unanswered at a death~~ **fixed the same day
+    (A-128):** a mutation's reply is held, keyed by connection and xid, and published with its effect.
   - The in-memory purge queue does not outlive a daemon. This is pre-existing for client state.
   - Splitting a state transaction's record from the publication's would trim the remaining cost.
   - The `#[cfg(not(unix))]` publication helpers are left to the Windows CI lane. `zstd-sys` cannot be cross-compiled for
     Windows from this Mac now.
+
+### 2026-10-09: an NFSv3 request applied before a death was applied again on its held connection (fixed; A-128; condition 11)
+
+- **Found** sweeping A-127's siblings. A held connection (A-113) serves a turn of pipelined requests, publishing each
+  mutation's barrier, and sends the replies at the turn's end. A daemon killed in between left applied requests in the
+  socket for its successor to serve again. The new mutation flow (`crates/cli/tests/nfs_held.rs`) found 10 of 480
+  MKDIRs first answered `NFS3ERR_EXIST` under 20 kills, in runs of one turn's requests.
+- **Fixed** (A-128, A-61's rule for NFSv3): a mutation's reply is held, keyed by the connection and the xid, before
+  its barrier; the publication carries it with the effect; the successor answers the request it reads again from it;
+  a turn's held replies are dropped once its replies are in the kernel.
+- **Proven:** none of about 160 kills over 8 runs answered `NFS3ERR_EXIST`. Each run answered 1–38 requests from
+  held replies (`nfs.held_reply.answered`, which the test requires to move; `nfs.held_reply.restored` counts what a
+  successor took back, mostly replies whose requests were consumed before the death).
+- **Observed, not caused here:** A-113's WRITE-burst flow's longest kill-to-answer is bimodal at load 70–85:
+  - about 1.2 s in some runs and 190–270 ms in others;
+  - the base commit (`caaeba85`) and this change alternated three times showed both modes in both arms;
+  - A-113 recorded 123–126 ms at lower load.
+  The 1.2 s mode is owed a trace.
+- **Found flaky, pre-existing:** `an_extent_claimed_just_before_a_crash_is_returned_at_the_first_publication`
+  (`crates/server/tests/recovery.rs`) sometimes refuses its post-restart create with `BudgetExceeded { available: 0 }`:
+  - 3 of 6 runs failed at `caaeba85`;
+  - 1 of 6, then 1 of 3, at head.
+  Owed: its cause.

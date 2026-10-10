@@ -297,6 +297,19 @@ pub struct ShardState {
   /// call so a file-state change it makes carries the compound's record in its own transaction.
   #[cfg(unix)]
   pub(crate) nfs_call: Option<crate::nfs_replay::RecordedCall>,
+  /// The NFSv3 replies held for connections the anchor holds (A-128), by (connection, xid): each mutation's reply,
+  /// recorded before its barrier publishes so the publication carries it with the effect, and dropped once its turn's
+  /// replies are sent. At most a turn's mutations per held connection on this shard.
+  #[cfg(unix)]
+  pub(crate) held_nfs_replies: std::collections::BTreeMap<(u64, u32), (bool, Vec<u8>)>,
+  /// Whether [`ShardState::held_nfs_replies`] changed since the last publication, which a delta then carries whole.
+  #[cfg(unix)]
+  pub(crate) held_nfs_replies_changed: bool,
+  /// The held NFSv3 replies the previous daemon published and never sent (A-128), by (connection, xid): a request it
+  /// applied and left unanswered on a held connection is answered from here, never applied twice. Each is taken when
+  /// its request is read again; at most the previous image's.
+  #[cfg(unix)]
+  pub(crate) recovered_nfs_replies: std::collections::BTreeMap<(u64, u32), (bool, Vec<u8>)>,
   /// The partition.
   pub db: Db,
   /// The owner runtime this node takes part in a region as (§4.8, boot step 6): the SWIM membership

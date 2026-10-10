@@ -243,8 +243,8 @@ in the same commit as the work). Last reviewed 2026-10-09 at `e494963d`.
     commits. Since then, 450 kills over 15 seeds have passed without a failed operation, and one retry was answered
     from its record.
 - **Owed.**
-  - macOS NFSv3 over a held connection still re-runs a request applied and unanswered at a death (A-61's held reply is
-    the remedy).
+  - ~~macOS NFSv3 over a held connection re-ran a request applied and unanswered at a death~~ fixed (A-128): about 160
+    kills with no MKDIR answered `NFS3ERR_EXIST`, against 10 of 480 before.
   - A generated fault-injection campaign across a live fleet (the deterministic simulation's nemesis library over the
     seed budget, CLAUDE.md §4) is the strengthening.
   - Open: the daemon disappeared twice in about 70 container runs under heavy host load. No OOM kill of slates,

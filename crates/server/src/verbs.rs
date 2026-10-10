@@ -8068,12 +8068,9 @@ pub fn rebuild_recovered(state: &mut ShardState) -> Rebuilt {
     held,
     replies,
     calls,
+    nfs_replies,
   } = recover_images(state);
-  // The call records the dead daemon published and committed, which answer its clients' retries (A-127).
-  #[cfg(unix)]
-  crate::nfs_replay::restore(state, calls);
-  #[cfg(not(unix))]
-  drop(calls);
+  restore_nfs_answers(state, calls, nfs_replies);
   // The barrier replies the dead daemon published and never delivered, for the mounts the anchor held (A-61).
   #[cfg(target_os = "linux")]
   {
@@ -8574,6 +8571,7 @@ fn recover_images(state: &mut ShardState) -> RecoveredImages {
         held: shard.held,
         replies: shard.replies,
         calls: shard.calls,
+        nfs_replies: shard.nfs_replies,
       }
     }
     Ok((None, _)) => RecoveredImages::default(),
@@ -8595,6 +8593,7 @@ struct RecoveredImages {
   held: Vec<u8>,
   replies: Vec<slates_vfs::recover::HeldReply>,
   calls: Vec<slates_vfs::recover::HeldCall>,
+  nfs_replies: Vec<slates_vfs::recover::HeldNfsReply>,
 }
 
 /// What a shard publish committed (§4.8): the volumes the new image carries, and the ones it could
@@ -8717,6 +8716,44 @@ fn being_destroyed(volume: &slates_vfs::volume::Volume) -> bool {
   )
 }
 
+/// Takes back what answers the NFS requests a dead daemon applied and left unanswered: the call records it published
+/// and committed, which answer its NFSv4.1 clients' retries (A-127), and the NFSv3 replies it published for its held
+/// connections and never sent, which answer their requests read again (A-128). Counted.
+#[cfg(unix)]
+fn restore_nfs_answers(
+  state: &mut ShardState,
+  calls: Vec<slates_vfs::recover::HeldCall>,
+  nfs_replies: Vec<slates_vfs::recover::HeldNfsReply>,
+) {
+  crate::nfs_replay::restore(state, calls);
+  state.recovered_nfs_replies = nfs_replies
+    .into_iter()
+    .map(|reply| {
+      (
+        (reply.connection, reply.xid),
+        (reply.accepted, reply.results),
+      )
+    })
+    .collect();
+  let restored = state.recovered_nfs_replies.len();
+  if restored > 0 {
+    state.count(
+      crate::nfs::HELD_REPLY_RESTORED,
+      u64::try_from(restored).unwrap_or(u64::MAX),
+    );
+  }
+}
+
+/// Takes back what answers the NFS requests a dead daemon left: nothing where the NFS transport is not served.
+#[cfg(not(unix))]
+fn restore_nfs_answers(
+  state: &mut ShardState,
+  calls: Vec<slates_vfs::recover::HeldCall>,
+  nfs_replies: Vec<slates_vfs::recover::HeldNfsReply>,
+) {
+  let _ = (state, calls, nfs_replies);
+}
+
 /// The call records a delta carries (A-127): the durable ones changed since the last publication, and the slots purged
 /// since.
 #[cfg(unix)]
@@ -8754,10 +8791,49 @@ fn call_records_checkpoint(state: &ShardState) -> Vec<slates_vfs::recover::HeldC
   Vec::new()
 }
 
-/// A publication carrying the call records committed: nothing of them is owed to the next one (A-127).
+/// A publication carrying the call records and the held NFSv3 replies committed: nothing of them is owed to the next
+/// one (A-127, A-128).
 #[cfg(unix)]
 fn call_records_published(state: &mut ShardState) {
   state.nfs_calls.published();
+  state.held_nfs_replies_changed = false;
+}
+
+/// The held NFSv3 replies a publication carries (A-128): every reply held for a held connection's turn in progress.
+#[cfg(unix)]
+fn held_nfs_replies(state: &ShardState) -> Vec<slates_vfs::recover::HeldNfsReply> {
+  state
+    .held_nfs_replies
+    .iter()
+    .map(
+      |(&(connection, xid), (accepted, results))| slates_vfs::recover::HeldNfsReply {
+        connection,
+        xid,
+        accepted: *accepted,
+        results: results.clone(),
+      },
+    )
+    .collect()
+}
+
+/// The held NFSv3 replies a publication carries: none where the NFS transport is not served (A-128).
+#[cfg(not(unix))]
+fn held_nfs_replies(state: &ShardState) -> Vec<slates_vfs::recover::HeldNfsReply> {
+  let _ = state;
+  Vec::new()
+}
+
+/// Whether the held NFSv3 replies changed since the last publication, which a delta then carries whole (A-128).
+#[cfg(unix)]
+fn held_nfs_replies_changed(state: &ShardState) -> bool {
+  state.held_nfs_replies_changed
+}
+
+/// Whether the held NFSv3 replies changed: never where the NFS transport is not served (A-128).
+#[cfg(not(unix))]
+fn held_nfs_replies_changed(state: &ShardState) -> bool {
+  let _ = state;
+  false
 }
 
 /// A publication committed where the NFS transport is not served: no call records to settle (A-127).
@@ -8798,12 +8874,19 @@ fn publish_checkpoint(state: &mut ShardState) -> Result<Published, slates_vfs::V
   let held = crate::content_holder::held_image(state);
   let mut replies = pending_replies(state);
   let mut calls = call_records_checkpoint(state);
+  let mut nfs_replies = held_nfs_replies(state);
   // A volume that cannot be captured restarts the checkpoint without it: the image's bytes before it may already be
   // in the slot, and the slot commits only when its header is written last, so the abandoned stream commits nothing.
   // Each restart leaves out one more volume, so there are at most as many restarts as volumes.
   let mut skipped: Vec<(DbVolumeId, slates_vfs::VfsError)> = Vec::new();
   let outcome = loop {
-    match stream_checkpoint(state, &handles, &skipped, &held, (&mut replies, &mut calls)) {
+    match stream_checkpoint(
+      state,
+      &handles,
+      &skipped,
+      &held,
+      (&mut replies, &mut calls, &mut nfs_replies),
+    ) {
       Ok(Streamed::Uncaptured(id, e)) => skipped.push((id, e)),
       Ok(Streamed::Committed(published)) => break Ok(published),
       Ok(Streamed::Refused(e)) => break Err(publish_refused(state, e)),
@@ -8861,9 +8944,10 @@ fn stream_checkpoint(
   handles: &[Handle<VolumeSlot>],
   skipped: &[(DbVolumeId, slates_vfs::VfsError)],
   held: &[u8],
-  (replies, calls): (
+  (replies, calls, nfs_replies): (
     &mut Vec<slates_vfs::recover::HeldReply>,
     &mut Vec<slates_vfs::recover::HeldCall>,
+    &mut Vec<slates_vfs::recover::HeldNfsReply>,
   ),
 ) -> Result<Streamed, slates_vfs::VfsError> {
   let left_out = |slot: &VolumeSlot| {
@@ -8916,7 +9000,7 @@ fn stream_checkpoint(
     }
     published.volumes.push(id);
   }
-  ShardImage::encode_finish(stream.buf(), held, replies, calls);
+  ShardImage::encode_finish(stream.buf(), held, (replies, calls, nfs_replies));
   match state.journal.finish_checkpoint(stream) {
     Ok(frame_bytes) => published.frame_bytes = frame_bytes,
     Err(e) => return Ok(Streamed::Refused(e)),
@@ -9000,6 +9084,7 @@ fn publish_delta_into(
   let held = crate::content_holder::held_image(state);
   let held_changed = held != state.published_held;
   let (mut calls, mut calls_removed) = call_records_delta(state);
+  let mut nfs_replies = held_nfs_replies_changed(state).then(|| held_nfs_replies(state));
   slates_vfs::checkpoint_log::ShardDelta::encode_finish(
     encoded,
     count_at,
@@ -9007,8 +9092,8 @@ fn publish_delta_into(
     &mut removed,
     held_changed.then_some(&held[..]),
     Some(&pending_replies(state)),
-    &mut calls,
-    &mut calls_removed,
+    (&mut calls, &mut calls_removed),
+    nfs_replies.as_deref_mut(),
   )?;
   let (start, end) = state.delta_range;
   let Some(object) = state.content.as_mut() else {

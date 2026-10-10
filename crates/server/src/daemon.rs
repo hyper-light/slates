@@ -2958,6 +2958,12 @@ fn init_shard(
     nfs_calls: slates_bridge_nfs::v4::replay::CallRecords::new(config.nfs_v4.record_bytes),
     #[cfg(unix)]
     nfs_call: None,
+    #[cfg(unix)]
+    held_nfs_replies: std::collections::BTreeMap::new(),
+    #[cfg(unix)]
+    held_nfs_replies_changed: false,
+    #[cfg(unix)]
+    recovered_nfs_replies: std::collections::BTreeMap::new(),
     db,
     fleet,
     durability_shortfall,

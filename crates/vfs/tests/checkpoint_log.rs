@@ -293,6 +293,20 @@ fn a_streamed_shard_delta_equals_the_shard_delta_and_recovers() {
   let mut unsorted = removed.clone();
   let calls = vec![call(7, b"seven"), call(5, b"five, later")];
   let calls_removed = vec![[1; slates_vfs::recover::HELD_CALL_KEY_BYTES]];
+  let nfs_replies = vec![
+    slates_vfs::recover::HeldNfsReply {
+      connection: 8,
+      xid: 3,
+      accepted: true,
+      results: b"mkdir".to_vec(),
+    },
+    slates_vfs::recover::HeldNfsReply {
+      connection: 2,
+      xid: 9,
+      accepted: true,
+      results: b"remove".to_vec(),
+    },
+  ];
   ShardDelta::encode_finish(
     &mut streamed,
     at,
@@ -300,8 +314,8 @@ fn a_streamed_shard_delta_equals_the_shard_delta_and_recovers() {
     &mut unsorted,
     Some(&held),
     Some(&replies),
-    &mut calls.clone(),
-    &mut calls_removed.clone(),
+    (&mut calls.clone(), &mut calls_removed.clone()),
+    Some(&mut nfs_replies.clone()),
   )
   .unwrap();
   let value = ShardDelta::new(
@@ -319,7 +333,8 @@ fn a_streamed_shard_delta_equals_the_shard_delta_and_recovers() {
     Some(held),
     Some(replies),
   )
-  .with_calls(calls, calls_removed);
+  .with_calls(calls, calls_removed)
+  .with_nfs_replies(nfs_replies.clone());
   assert!(
     matches!(
       value.volumes[0].record,
@@ -354,14 +369,27 @@ fn a_streamed_shard_delta_equals_the_shard_delta_and_recovers() {
     published.to_image(&store, None).unwrap(),
     "the changed volume brought up to date"
   );
-  assert_recovered_calls(&recovered, vec![call(5, b"five, later"), call(7, b"seven")]);
+  assert_recovered_calls(
+    &recovered,
+    vec![call(5, b"five, later"), call(7, b"seven")],
+    nfs_replies,
+  );
 }
 
 /// The streamed delta's call records, as recovered: the changed one replaced, the new one added, the purged one gone,
-/// in key order.
-fn assert_recovered_calls(recovered: &ShardImage, expected: Vec<slates_vfs::recover::HeldCall>) {
+/// in key order; and its held NFSv3 replies, whole, in (connection, xid) order.
+fn assert_recovered_calls(
+  recovered: &ShardImage,
+  expected: Vec<slates_vfs::recover::HeldCall>,
+  mut nfs_replies: Vec<slates_vfs::recover::HeldNfsReply>,
+) {
   assert_eq!(
     recovered.calls, expected,
     "the call records changed and added, the purged one gone, in key order"
+  );
+  nfs_replies.sort_by_key(|reply| (reply.connection, reply.xid));
+  assert_eq!(
+    recovered.nfs_replies, nfs_replies,
+    "the held NFSv3 replies, whole, in order"
   );
 }
