@@ -2239,6 +2239,22 @@ impl RegionalConfiguration {
     })
   }
 
+  /// Whether `host` holds `owner`'s content: it is in `owner`'s neighbourhood, current or — while `owner`'s change is
+  /// in flight — settled. The holder's side of [`Configuration::neighbours`], asked without building `owner`'s
+  /// configuration, for a contact rule asked per probe event (2026-10-10: a holder that kept no contact with an owner
+  /// left the pair's probe plane unkeyed when it was the pair's canonical dialer).
+  pub fn holds_for(&self, owner: HostId, host: HostId) -> bool {
+    let Some(neighbourhood) = self.neighbourhoods.get(&owner) else {
+      return false;
+    };
+    neighbourhood.hosts.contains(&host)
+      || self
+        .settled
+        .get(&owner)
+        .filter(|settled| settled.generation != neighbourhood.generation)
+        .is_some_and(|settled| settled.hosts.contains(&host))
+  }
+
   /// The version this configuration fixed `host`'s settled neighbourhood at — its authority generation as a
   /// holder sees it ([`Standing`]) — or `None` when `host` is no member (not yet admitted here, or retired).
   pub fn standing_of(&self, host: HostId) -> Option<u64> {
@@ -3644,6 +3660,38 @@ mod tests {
     assert!(
       regional.configuration_for(HostId(99)).is_none(),
       "a non-member has no configuration"
+    );
+  }
+
+  /// §4.8 (2026-10-10): a holder's view of whom it holds for agrees with each owner's own view of its neighbourhood.
+  /// Do: for a formed configuration and for one with a change in flight, ask every member pair both ways. Expect
+  /// `holds_for(owner, host)` exactly when `owner`'s configuration `neighbours(host)`, settled cohort included.
+  #[test]
+  fn a_holders_view_agrees_with_each_owners_neighbourhood() {
+    let members: Vec<HostId> = (1..=7).map(HostId).collect();
+    let formed = RegionalConfiguration::formed(
+      members.clone(),
+      Quorum { f: 1 },
+      std::collections::BTreeMap::new(),
+      3,
+      false,
+    );
+    let (in_flight, ..) = change_in_flight();
+    for regional in [&formed, &in_flight] {
+      for &owner in &regional.members {
+        let configuration = regional.configuration_for(owner).unwrap();
+        for &host in &regional.members {
+          assert_eq!(
+            regional.holds_for(owner, host),
+            configuration.neighbours(host),
+            "owner {owner:?}, host {host:?}"
+          );
+        }
+      }
+    }
+    assert!(
+      !formed.holds_for(HostId(99), HostId(1)),
+      "a non-member is held by nobody"
     );
   }
 

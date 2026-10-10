@@ -3934,11 +3934,23 @@ enum DirectContact {
   /// In this node's neighbourhood: its current one, or its settled one while a change is in flight, since its
   /// joint writes and its joint lease reach both.
   Neighbour,
+  /// This node holds the peer's content: it is in the peer's neighbourhood, whose writes, lease probes and takeover
+  /// rounds reach it. Kept from this side too, so the pair's probe plane is keyed whichever of the two is its canonical
+  /// dialer: the reverse of [`DirectContact::Neighbour`], as [`DirectContact::AsVoter`] is of [`DirectContact::Voter`]
+  /// (2026-10-10). A pair's plane epoch is announced only by its lower anchor, so contact kept from one side alone left
+  /// the pair unkeyed whenever the side that dropped it was the lower anchor.
+  Holder,
   /// A voter of the council or the root group.
   Voter,
   /// A member this node, leading the council or the root group, is catching up to join its voters (thesis
   /// §4.2.1): its rounds need a session to it wherever it sits.
   Staged,
+  /// This node is a voter of the council or the root group, and every member keeps contact with the voters
+  /// ([`DirectContact::Voter`]): kept from this side too, so the pair's probe plane is keyed whichever of the two is its
+  /// canonical dialer. Found 2026-10-10 by the formation report's keying facts: a voter, the pair's lower anchor, had
+  /// dropped a member outside its neighbourhood, never announced the pair's epoch once formation's
+  /// everyone-contacts-everyone window closed, and the member's probes to it went unanswered for 4,000 periods.
+  AsVoter,
   /// Dropped: this node believes the peer dead.
   BelievedDead,
   /// Dropped: a council member outside this node's neighbourhood and no voter.
@@ -3969,10 +3981,18 @@ fn direct_contact(state: &ShardState, peer: HostId) -> DirectContact {
     DirectContact::NotInCouncilConfiguration
   } else if state.fleet.configuration().neighbours(peer) {
     DirectContact::Neighbour
+  } else if state
+    .council
+    .configuration()
+    .holds_for(peer, state.fleet.host())
+  {
+    DirectContact::Holder
   } else if state.council.is_voter(peer) || state.root.is_voter(peer) {
     DirectContact::Voter
   } else if state.council.is_staged(peer) || state.root.is_staged(peer) {
     DirectContact::Staged
+  } else if state.council.is_voter(state.fleet.host()) || state.root.is_voter(state.fleet.host()) {
+    DirectContact::AsVoter
   } else {
     DirectContact::OutsideNeighbourhood
   }

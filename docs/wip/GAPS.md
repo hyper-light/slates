@@ -4568,6 +4568,18 @@ fails under extreme load, on either detector snapshot.**
   - the harness's machine profile timed out measuring the wake probe (`MeasurementTimeout { probe: "wake" }`) before
     the daemons started.
 - The retire failure needs a failing run's evidence before diagnosis.
+- **A failing run's evidence, 2026-10-10** (full suite at load 50–57): neither survivor retired B within 4,000 periods
+  (A waited 4,000, C 4,578). Both still held B a member. The plane counts:
+
+  | survivor | relays asked | relayed | relayed answers credited | lease renewals sent | renewals answered |
+  |---|---|---|---|---|---|
+  | A | 715 | 510 | 75 | 8,703 | 4,382 |
+  | C | 522 | 722 | 13 | 8,848 | 4,538 |
+
+  A also counted 62 refused for a full queue. The counts are the whole test's, so the hold phase's relayed answers are
+  among them.
+- **Next:** check whether anything but a direct or relayed probe answer refreshes B's liveness. Lease renewals are
+  answered on another path than the probe the test makes B deaf to.
 - **The remaining hold failures, read (2 of 16 at 8 concurrent, load about 40, after the relay fix).** A's relays all
   answered: `relays_asked` 105 and 90, `indirect_acked` 105 and 90. So A's own detector kept B, yet B left A's fleet
   after 3 and 6 periods. C asked for relays 41 and 21 times, 9 of them unanswered in the first run. C asks only when
@@ -5427,6 +5439,15 @@ On a Linux release build of `faad1562` (A-126, the probe-storm fix and the reply
 - **Added:** each peer's line in the report now carries `keyed` (an epoch keys the pair, and the peer joined the
   detector) and `canonical` (this node is the pair's dialer). The next occurrence confirms or refutes the hypothesis.
   The fix it points to is a contact rule that also keeps a holder in contact with the owners it holds for.
+- **Confirmed and fixed, 2026-10-10.** The next failing run showed the unmeshed node d keeping a as a `Voter`. a held d
+  `OutsideNeighbourhood` with `canonical=true`, and the pair had `keyed=None` on both sides. The contact rule now keeps
+  both reverses:
+  - `Holder`: this node is in the peer's neighbourhood;
+  - `AsVoter`: this node is a voter, and every member contacts the voters.
+  Bug doc: `docs/bugs/2026-10-10-a-pair-whose-lower-anchor-dropped-contact-was-never-keyed.md`.
+- **Validated:** before the fix, 3 of 5 full fleet runs under load left a node unmeshed. After it, 2 of 2 full runs
+  (load 50–57) formed every mesh. Each still failed one other test: the whole-RAM replacement test, then the
+  relay-retirement test. Both are intermittent, are owed root causes, and are not tolerated.
 - Nothing in this day's changes touches session formation or the contact rule: A-127 and A-128 are NFS state and its
   records, and the pressure hold is admission.
 

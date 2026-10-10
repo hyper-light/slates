@@ -3083,6 +3083,18 @@ hard links and snapshot versions. No live kernel endpoint state is part of the i
 > observation accessors are `Option`-typed, so a shard that did not answer never satisfies a test
 > predicate. Record:
 > `docs/bugs/2026-09-13-consensus-voters-outside-record-neighbourhood.md`.
+>
+> **Amended 2026-10-10: contact is kept from both sides.** A pair's probe plane is keyed by an epoch only its lower
+> anchor announces, over the record session it dials. The dial set was one-sided: a node kept its own neighbourhood and
+> the voters. So a voter, or a holder, that was a pair's lower anchor dropped the member that needed it, and once
+> formation's everyone-contacts-everyone window closed it never announced the pair's epoch. The member's probes to it
+> then went unanswered for good. Found under suite-wide load: two runs left a member unmeshed for 4,000 periods, and the
+> formation report's keying facts showed it (`keyed=None`, `canonical=true` on the side that dropped the pair).
+> The rule now keeps its reverses too:
+> - `DirectContact::Holder`: this node is in the peer's neighbourhood (`RegionalConfiguration::holds_for`);
+> - `DirectContact::AsVoter`: this node is a voter, and every member contacts the voters.
+> The mesh stays O(N·k) sessions plus the voters' O(N·v). Record:
+> `docs/bugs/2026-10-10-a-pair-whose-lower-anchor-dropped-contact-was-never-keyed.md`.
 > Same day, the load-41 flap that record left owed — SWIM retiring a *live*, CPU-starved voter and the
 > root leader retiring/re-admitting its region in a loop — is fixed at its four causes. The probe deadline
 > is now **derived** ("detection timeout for membership from RTT p99 × k"): the transport's RFC 9002 probe
