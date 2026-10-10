@@ -5294,3 +5294,19 @@ At `f62847d5`:
   file must equal it.
 - 4 runs, 80 kills, 100,000 fsyncs: identical every time, longest fsync 70 ms (BENCHMARKS). The journal's windowed
   patches recovered every acknowledged byte.
+
+### 2026-10-09: the day's builds re-checked through real workloads (conditions 2 and 11)
+
+On a Linux release build of `faad1562` (A-126, the probe-storm fix and the reply path):
+- **`realworld_chaos.sh`**, each workload with the daemon SIGKILLed twice in its middle, 6 restarts in all:
+  - `git clone` in 0.88 s, `git fsck --full` clean;
+  - a release `cargo build` in 3.8 s, the binary printing `{"n":2}`;
+  - `pip install flask` in 3.19 s, `import flask` working.
+- **`containerd/run.sh`**, containerd 1.7.24 with runc 1.1.15, the OCI `mounts[]` entry from `slates attach --oci`, on the
+  FUSE mount:
+  - a 2,000-file workload with a hard link, a symlink and a tar round trip: exit 0 in 0.79 s, the host side seeing the
+    same 2,002 entries and tar checksum;
+  - the setuid probe run as `nobody` reports uid 65534, since `nosuid` holds;
+  - the read-only entry refuses writes (`Read-only file system`).
+- Owed: the same container workload on a tmpfs bind took 0.14 s, against 0.79 s on the FUSE mount. The FUSE path's
+  small-file cost is open work for condition 12.
