@@ -5685,3 +5685,20 @@ On a Linux release build of `faad1562` (A-126, the probe-storm fix and the reply
   about 100 ms in a three-node fleet). At the 10 s placeholder, failover could take up to 10 s, with fewer wakeups. A
   laptop's idle beat, derived from the recovery budget less the measured start, drops from ten a second to about one
   either way. `F`'s default is Ada's to ratify.
+
+### 2026-10-10: the Linux lane over the day's commits (two test bugs found and fixed)
+
+- **What ran:** CI's Linux test step reproduced in a container over `3cf3265e`: io_uring driver, non-root, 2 build
+  jobs, 4 test threads, a 3 GiB memory cap. The cap came after my first, unbounded attempt starved the shared Docker
+  VM (see memory `docker-lane-must-be-bounded`).
+- **Clippy** (`--workspace --all-targets -D warnings`): clean.
+- **`cargo test --workspace`:** 251 of 253 test binaries passed, among them the fleet suite at 86 of 86, recovery 41,
+  daemon 22, anchor 23, member plane 10 and NFSv4 sessions 15. The CLI flow passed 31 of 31, with its loud Linux
+  skips.
+- **The two failures were tests, not the product.**
+  - An A-122 base test asked macOS's kqueue answer of Linux's inotify; it had never run on Linux CI.
+  - The lock-on-fault pair raced on the process-wide `VmLck`: 8 of 30 parallel runs failed; 30 of 30 pass after
+    serialising.
+  - Bug doc: `docs/bugs/2026-10-10-two-tests-the-linux-lane-failed-a-macos-expectation-and-a-shared-counter.md`.
+- **Not run here:** the release-mode explorers, the differential and disk lanes, TSan, and the live guest. Those are
+  CI's other jobs; its last run, on `8a18d907`, was red on one fleet test and on TSan and iai-callgrind.

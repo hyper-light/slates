@@ -606,8 +606,12 @@ fn a_final_component_swapped_for_a_link_is_refused_and_an_open_file_keeps_its_by
 /// so the drain can recall the delegations held on it. kqueue's `EVFILT_VNODE` on a directory reports namespace changes
 /// only, so on macOS the write was never hinted; inotify's `IN_MODIFY` on the directory already reported it on Linux.
 /// Do: watch a real directory in the build output, open a file in it as a read-through does, drain the hints, then
-/// append to the file in place (same inode, no namespace change). Expect a hint naming the directory, and after the
-/// file is closed a further append hints nothing about it.
+/// append to the file in place (same inode, no namespace change); close it and append again. Expect a hint naming the
+/// file in its directory for the first append. For the append after the close, the two watch backends differ, and
+/// each is right: kqueue (every unix but Linux) heard the write only through the open file's own registration, which
+/// the close releases, so it hints nothing; inotify's directory watch hears a write to any file in it (`IN_MODIFY`),
+/// open or not, so it hints the file again, which drift detection wants. Before 2026-10-10 the test asked kqueue's
+/// answer of Linux too, and failed there on every run (found by the Linux lane; CI had not yet run it).
 #[cfg(unix)]
 #[test]
 fn an_in_place_write_to_an_opened_base_file_hints_its_directory() {
@@ -635,9 +639,16 @@ fn an_in_place_write_to_an_opened_base_file_hints_its_directory() {
   );
   host.close_file(file);
   append(b", three");
+  let after_close = host.hints();
+  #[cfg(not(target_os = "linux"))]
   assert_eq!(
-    host.hints(),
+    after_close,
     Vec::new(),
-    "a closed file is no longer watched"
+    "kqueue: a closed file's own registration is released, so its write hints nothing"
+  );
+  #[cfg(target_os = "linux")]
+  assert!(
+    after_close.contains(&slates_vfs::host::Hint::Entry(root, "f".into())),
+    "inotify: the directory's watch hears a write to any file in it, open or not: {after_close:?}"
   );
 }
