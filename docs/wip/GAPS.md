@@ -5440,3 +5440,23 @@ On a Linux release build of `faad1562` (A-126, the probe-storm fix and the reply
   113–142 → 39–43 at 16 shards.
 - **Owed:** a `powermetrics` idle-wakeup count on a quiet machine. This one's load (75–109) leaves no idle core to wake,
   so `top`'s idle-wakeup column reads 0.
+
+### 2026-10-10: the pressure hold was split per shard while the content pool is shared (fixed)
+
+- **Found** 2026-10-09 as the sibling of the roomy-host hold fix. A volume on one shard was held back by its shard's
+  share of the hold alone, though the pool (A-98) lets it reach every free extent. On two shards a 19.1 MB hold shrank
+  each shard's room by 9.6 MB.
+- **Fixed:** the control shard withholds the daemon's whole hold, in order:
+  1. from the pool's free extents, under the hold's own owner (`content_pool::hold_toward`);
+  2. from the shards' free room, in proportion to it (`daemon::apportion`);
+  3. as a debt the next shard to grow takes on (`slates_mem::budget::Pressure`).
+  Takeovers may take the hold's extents.
+- **Tests,** the first two failing first:
+  - `a_pressured_daemons_hold_is_withheld_whole_from_a_volume_on_any_one_shard`;
+  - `a_hold_the_pool_cannot_cover_is_taken_from_the_free_room_the_shards_hold`;
+  - `a_hold_finer_than_the_pools_free_extents_is_owed_by_the_next_shard_to_grow`;
+  - unit tests of `apportion`, the budget's debt and `make_room`'s debt.
+  - Miri: 24 mem budget and arena tests clean.
+- **Bug doc:** `docs/bugs/2026-10-10-the-pressure-hold-was-split-per-shard-while-the-pool-is-shared.md`.
+- **Open:** the debt is told to every shard alike, so shards growing within one refresh each hold it until the next.
+  An exact shared debt word would need room in the anchor segment; recorded, not built.

@@ -117,6 +117,26 @@ pub struct ShardBudget {
   /// transient scratch a put verifies in. Like `retained`, a running charge taken only from unpromised
   /// capacity, so another owner's content never spends an admitted volume's entitlement.
   replicated: u64,
+  /// The pressure state the daemon's sampler sets beside the hold (§4.2, admission.md §5.5).
+  pressure: Pressure,
+}
+
+/// The part of a shard's pressure state beyond the hold itself (§4.2, admission.md §5.5).
+///
+/// The daemon's hold is withheld first from the content pool, in whole extents, then from the free room shards hold.
+/// What neither covers (the pool's free extents being too coarse, and no shard holding room) is a **debt**: owed by
+/// whichever shard next grows its arena from the pool, which takes it on as hold when it does
+/// ([`ShardBudget::absorb_debt`]). Every shard is told the same debt, so two shards growing before the next refresh both
+/// hold it: conservative, never under, and recomputed exactly at that refresh. Claiming one more extent instead would
+/// over-hold by up to that extent, several GiB under a derived layout (2026-10-09: a 2.3 GB hold over parts of 8 GiB,
+/// 512 MiB, 32 MiB and 2 MiB left 1.2 GB to cover).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Pressure {
+  /// Hold owed by this shard's next growth from the pool.
+  debt: u64,
+  /// Capacity this budget was extended by since its free room was last read for a refresh ([`ShardBudget::mark_room`]):
+  /// room that refresh did not see, which takes on the debt the refresh sends back ([`ShardBudget::set_pressure`]).
+  extended_since_mark: u64,
 }
 
 /// A reservation of bytes for one bounded volume.
@@ -135,6 +155,10 @@ impl ShardBudget {
       ledger: Ledger::new(reserve, headroom),
       retained: 0,
       replicated: 0,
+      pressure: Pressure {
+        debt: 0,
+        extended_since_mark: 0,
+      },
     }
   }
 
@@ -204,6 +228,51 @@ impl ShardBudget {
   /// Raises the capacity by `bytes` the arena added (A-98: an extent claimed from the pool).
   pub fn extend(&mut self, bytes: u64) {
     self.ledger.reserve = self.ledger.reserve.saturating_add(bytes);
+    self.pressure.extended_since_mark = self.pressure.extended_since_mark.saturating_add(bytes);
+  }
+
+  /// The hold this shard owes at its next growth from the pool ([`Pressure`]).
+  pub const fn debt(&self) -> u64 {
+    self.pressure.debt
+  }
+
+  /// Takes on the debt as hold: run once this shard has grown from the pool by what an admission lacks and the debt
+  /// together (`ChunkArena::make_room`), so the hold is backed by capacity it holds.
+  pub fn absorb_debt(&mut self) {
+    self.ledger.hold = self.ledger.hold.saturating_add(self.pressure.debt);
+    self.pressure.debt = 0;
+  }
+
+  /// This shard's free room for the daemon's sampler (§4.2): the capacity it holds beyond its commitments and its
+  /// operation headroom. Marks the moment, so capacity it grows by after this read takes on the debt the refresh sends
+  /// back ([`ShardBudget::set_pressure`]).
+  pub fn mark_room(&mut self) -> u64 {
+    self.pressure.extended_since_mark = 0;
+    self
+      .ledger
+      .reserve
+      .saturating_sub(self.ledger.committed)
+      .saturating_sub(self.ledger.headroom)
+  }
+
+  /// Sets the hold and the debt the daemon's sampler computed from the free room it read (§4.2). Capacity this shard
+  /// grew by since that read was room the sampler did not see: it takes on the debt now, as a growth after this call
+  /// would, so a refresh racing a growth never drops a debt the growth took on.
+  pub fn set_pressure(&mut self, hold: u64, debt: u64) {
+    let owed_now = debt.min(self.pressure.extended_since_mark);
+    self.ledger.hold = hold.saturating_add(owed_now);
+    self.pressure.debt = debt.saturating_sub(owed_now);
+    self.pressure.extended_since_mark = 0;
+  }
+
+  /// The pressure state beside the hold, saved so a recovery past the hold can restore it (`fleet::past_the_pressure_hold`).
+  pub const fn pressure(&self) -> Pressure {
+    self.pressure
+  }
+
+  /// Restores a pressure state [`ShardBudget::pressure`] saved.
+  pub fn restore_pressure(&mut self, pressure: Pressure) {
+    self.pressure = pressure;
   }
 
   /// Lowers the capacity by `bytes` the arena is returning (A-98), if what remains still covers every commitment
@@ -647,6 +716,30 @@ mod tests {
     assert_eq!(claim.bytes, 50);
     b.credit_replicated(30);
     assert_eq!((b.replicated(), b.committed(), b.admittable()), (0, 50, 30));
+  }
+
+  /// §4.2 (2026-10-09): a debt is taken on as hold by the growth that backs it. Do: set a debt of 30 on a budget of
+  /// 100, extend it by 50 (a growth from the pool), and absorb. Expect the hold 30 and no debt left.
+  #[test]
+  fn a_debt_becomes_hold_when_the_shard_grows_from_the_pool() {
+    let mut budget = ShardBudget::new(100, 0);
+    budget.set_pressure(0, 30);
+    assert_eq!((budget.hold(), budget.debt()), (0, 30));
+    budget.extend(50);
+    budget.absorb_debt();
+    assert_eq!((budget.hold(), budget.debt()), (30, 0));
+  }
+
+  /// §4.2: a refresh that read this shard's room before it grew does not drop the debt the growth took on. Do: read the
+  /// room (100), grow by 20, then set the hold 10 and a debt of 50 computed from the earlier read. Expect the hold 30
+  /// (10, plus the 20 grown since the read taking on that much of the debt) and a debt of 30 still owed.
+  #[test]
+  fn capacity_grown_since_the_samplers_read_takes_on_its_debt() {
+    let mut budget = ShardBudget::new(100, 0);
+    assert_eq!(budget.mark_room(), 100);
+    budget.extend(20);
+    budget.set_pressure(10, 50);
+    assert_eq!((budget.hold(), budget.debt()), (30, 30));
   }
 
   #[test]

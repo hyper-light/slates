@@ -210,14 +210,15 @@ impl Store {
   }
 
   /// The bytes an admission could take now (A-98): the arena's held capacity and what it could still claim from its
-  /// pool, less what is committed, the operation headroom and the pressure hold. What a refusal names as available
+  /// pool, less what is committed, the operation headroom and the pressure hold. A growth from the pool takes on the
+  /// pressure debt as well (§4.2), so what the pool could add counts less the debt. What a refusal names as available
   /// and a dynamic volume's `statfs` counts on; a snapshot, since another shard may claim the pool's extents first.
   pub fn admittable(&self) -> u64 {
     let claimable = u64::try_from(self.content.arena().claimable()).unwrap_or(u64::MAX);
     self
       .budget
       .capacity()
-      .saturating_add(claimable)
+      .saturating_add(claimable.saturating_sub(self.budget.debt()))
       .saturating_sub(self.budget.committed())
       .saturating_sub(self.budget.headroom())
       .saturating_sub(self.budget.hold())
@@ -261,14 +262,17 @@ impl Store {
     }
   }
 
-  /// Returns the arena's wholly free extents to its pool, keeping the capacity every commitment and the operation
-  /// headroom need (A-98): the bytes returned. Run after a committed publication, when no deferred free holds an
-  /// extent the committed image might still name.
+  /// Returns the arena's wholly free extents to its pool, keeping the capacity every commitment, the operation
+  /// headroom and the pressure hold need (A-98): the bytes returned. Run after a committed publication, when no
+  /// deferred free holds an extent the committed image might still name. The hold is kept because it is free room the
+  /// daemon's sampler took from this shard (§4.2): returned to the pool, it would be claimable by any shard until the
+  /// next refresh withheld it again.
   pub fn release_idle(&mut self) -> u64 {
     let keep = self
       .budget
       .committed()
-      .saturating_add(self.budget.headroom());
+      .saturating_add(self.budget.headroom())
+      .saturating_add(self.budget.hold());
     let returned = self
       .content
       .arena_mut()

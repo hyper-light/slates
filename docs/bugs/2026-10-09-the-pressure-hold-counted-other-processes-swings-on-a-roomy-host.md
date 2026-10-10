@@ -58,4 +58,6 @@ part of that slack. The formula held back any drop, slack or not.
 
 - The hold is divided evenly among the shards, while the content pool (A-98) lets one shard own more of the capacity
   than another. On a host under real pressure, the hold could withhold a shard's admission while another shard's
-  capacity sits idle. Not changed here.
+  capacity sits idle. Not changed here. **Fixed 2026-10-10:**
+  `docs/bugs/2026-10-10-the-pressure-hold-was-split-per-shard-while-the-pool-is-shared.md`. The hold is the daemon's,
+  withheld once: from the pool's extents, then from the shards' free room, then as a debt.

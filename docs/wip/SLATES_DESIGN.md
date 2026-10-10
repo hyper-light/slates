@@ -9696,6 +9696,17 @@ memory cap") and GAPS.
     Claiming maps no RAM, and the hold keeps the claimed bytes from being admitted. **Wrong in the first cut:** growth
     stopped while any hold was set, so on a loaded host a shard that held nothing admitted nothing (seven fleet tests
     refused every create, `bytes[capacity=0 … headroom=10485760]`).
+    - **Amended 2026-10-10: the hold is the daemon's, withheld once.** Divided evenly among the shards, each share
+      claimed only by its own shard's admissions, it held a volume on one shard back by that shard's share alone: half
+      the hold on two shards, a fifth on five. The control shard's sampler withholds the whole hold in three places,
+      in order:
+      1. the pool's free extents, claimed under the hold's own owner (`content_pool::hold_toward`, greedy over the
+         divisible part lengths);
+      2. the free room shards already hold, in proportion to it, as their ledger holds;
+      3. a debt every shard is told, which the next shard to grow from the pool takes on as hold at that growth
+         (`slates_mem::budget::Pressure`).
+      A takeover's recovery may take the hold's extents. Bug doc:
+      `docs/bugs/2026-10-10-the-pressure-hold-was-split-per-shard-while-the-pool-is-shared.md`.
   - Still per shard: the chunk, inode and directory slabs and the metadata class are sized from the shard's slice.
     A volume of large files reaches the pool's whole capacity (a chunk is sixteen granules); a volume of many small
     files stays bounded by its shard's slabs. Recorded in GAPS.

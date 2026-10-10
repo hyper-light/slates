@@ -734,10 +734,10 @@ pub struct ShardState {
   /// The process's resident memory at the pressure sampler's first sample (§4.2): its growth since then is the
   /// daemon's own use, subtracted from the host's shortfall so only pressure from elsewhere is held back.
   pub(crate) pressure_resident_baseline: Option<u64>,
-  /// The pressure hold the sampler last sent each shard, in shard order (§4.2; kept on the control shard, the one
-  /// sampler): a hold is sent only when it changes, so a daemon at rest sends none. Every shard's hold starts at zero
-  /// at boot, and so does this. Bounded by the shards.
-  pub(crate) pressure_sent: Vec<u64>,
+  /// The pressure hold and debt the sampler last sent each shard, in shard order (§4.2; kept on the control shard, the
+  /// one sampler): they are sent only when they change, so a daemon at rest sends none. Every shard's hold and debt
+  /// start at zero at boot, and so does this. Bounded by the shards.
+  pub(crate) pressure_sent: Vec<(u64, u64)>,
   /// The holder side of the owner lease (§4.8; AUD-08): when this node last answered each peer's direct
   /// probe reporting it alive, and the newest configuration version each announced — the evidence that
   /// gates a successor's promotion of a departed owner's objects at this holder

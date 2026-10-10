@@ -3506,14 +3506,21 @@ const SERVE_DELAY_UNTIMED: &str = "fleet.serve_delay_untimed";
 /// never served it (a fleet test: 3,913 refusals, the volume unavailable until the pressure lifted). Capacity and the
 /// operation headroom still bound it. Exact because a shard runs one task at a time and `recovery` is synchronous:
 /// no other admission can run while the hold is lifted, and the pressure refresh is itself a message to this shard.
+/// The hold is the daemon's (2026-10-09): its part withheld from the content pool is a set of extents under the hold's
+/// own owner, so the recovery may take those too while it runs (`ExtentSource::open_hold`), as it lifts this shard's
+/// part and its debt (restored after, with the debt's mark, so the recovery's own growth takes none of it on); the
+/// sampler withholds what was taken from the pool again at its next refresh.
 fn past_the_pressure_hold<T>(
   state: &mut ShardState,
   recovery: impl FnOnce(&mut ShardState) -> T,
 ) -> T {
-  let hold = state.store.budget.hold();
-  state.store.budget.set_hold(0);
+  let (hold, pressure) = (state.store.budget.hold(), state.store.budget.pressure());
+  state.store.budget.set_pressure(0, 0);
+  state.store.content.arena_mut().open_hold(true);
   let recovered = recovery(state);
+  state.store.content.arena_mut().open_hold(false);
   state.store.budget.set_hold(hold);
+  state.store.budget.restore_pressure(pressure);
   recovered
 }
 

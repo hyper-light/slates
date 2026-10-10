@@ -733,7 +733,7 @@ fn within_sampler_wait(mut done: impl FnMut() -> bool) -> bool {
 /// reads a quarter of the capacity less at its first sample; then let the second read a further eighth less. Expect:
 /// neither daemon holds
 /// anything back for the difference between their starts — each measures pressure from its own first
-/// sample — and the second's later drop is held back across its shards. Before the fix the baseline was
+/// sample — and the second's later drop is held back whole. Before the fix the baseline was
 /// process-wide, fixed by whichever daemon sampled first, so the second daemon withheld the first's
 /// growth as if it were pressure.
 #[test]
@@ -770,13 +770,12 @@ fn two_daemons_in_one_process_measure_memory_pressure_from_their_own_start() {
   let second_sampled = within_sampler_wait(|| {
     second.pressure_baseline() == Ok(Some(sampled_available - grown_between_starts))
   });
-  let second_hold_at_start = second.pressure_hold();
+  let second_hold_at_start = withheld(&second);
   second
     .inject_available_memory(sampled_available - grown_between_starts - later_drop)
     .unwrap();
-  let per_shard = later_drop / u64::from(TEST_SHARDS);
-  let pressure_held = within_sampler_wait(|| second.pressure_hold() == Ok(per_shard));
-  let first_hold = first.pressure_hold();
+  let pressure_held = within_sampler_wait(|| withheld(&second) == Some(later_drop));
+  let first_hold = withheld(&first);
   first.stop();
   second.stop();
   drop((first_segment, second_segment));
@@ -787,18 +786,23 @@ fn two_daemons_in_one_process_measure_memory_pressure_from_their_own_start() {
   );
   assert_eq!(
     second_hold_at_start,
-    Ok(0),
+    Some(0),
     "the second daemon withholds nothing for the process's growth before it started"
   );
   assert!(
     pressure_held,
-    "a later drop on the second daemon is held back, divided among its shards"
+    "a later drop on the second daemon is held back whole"
   );
   assert_eq!(
     first_hold,
-    Ok(0),
+    Some(0),
     "the first daemon saw no pressure of its own"
   );
+}
+
+/// The whole pressure hold `daemon` withholds now ([`Daemon::pressure_withheld`]), `None` when it could not be read.
+fn withheld(daemon: &Daemon) -> Option<u64> {
+  daemon.pressure_withheld().ok().and_then(Result::ok)
 }
 
 /// Shape: the pressure test's daemon's own resident memory at its first sample.
@@ -812,7 +816,7 @@ const OWN_GROWTH_PARTS: u64 = 4;
 /// its own resident memory (the host's free memory exactly the daemon's capacity, no slack); then let available fall by
 /// a quarter of the capacity ([`OWN_GROWTH_PARTS`]) while its resident memory rises by the same; then let available fall
 /// a further eighth ([`LATER_DROP_PARTS`]) with its resident memory unchanged. Expect: no hold for its own
-/// growth (that is committed content, charged already), and the further drop held back across its shards. Before the
+/// growth (that is committed content, charged already), and the further drop held back whole. Before the
 /// fix the hold counted the daemon's own growth as pressure, so every stored byte was charged twice and one volume
 /// reached about half the content capacity.
 #[test]
@@ -839,19 +843,18 @@ fn a_daemons_own_growth_is_not_memory_pressure() {
     .inject_available_memory(sampled_available - own_growth)
     .unwrap();
   // Two sampler periods: the hold a wrong reading would set has had its chance to appear.
-  let wrongly_held = within_sampler_wait(|| daemon.pressure_hold().is_ok_and(|hold| hold > 0));
+  let wrongly_held = within_sampler_wait(|| withheld(&daemon).is_some_and(|hold| hold > 0));
   daemon
     .inject_available_memory(sampled_available - own_growth - later_drop)
     .unwrap();
-  let per_shard = later_drop / u64::from(TEST_SHARDS);
-  let pressure_held = within_sampler_wait(|| daemon.pressure_hold() == Ok(per_shard));
-  let hold = daemon.pressure_hold();
+  let pressure_held = within_sampler_wait(|| withheld(&daemon) == Some(later_drop));
+  let hold = withheld(&daemon);
   daemon.stop();
   assert!(sampled, "the daemon took its first sample");
   assert!(!wrongly_held, "its own growth is not held back as pressure");
   assert!(
     pressure_held,
-    "a drop it did not cause is held back, divided among its shards: {hold:?}"
+    "a drop it did not cause is held back whole: {hold:?} against {later_drop}"
   );
 }
 
@@ -3312,7 +3315,7 @@ fn a_destroyed_sessions_records_are_purged_and_stay_purged_across_a_restart() {
 /// free; let another process take as much as the daemon's capacity (the host still has three times it free); then let
 /// others take more, until the host has half the daemon's capacity free. Expect: the first drop holds nothing — the
 /// host can still back every byte the daemon could fill — and the second holds exactly what the daemon's unfilled room
-/// exceeds the host's free memory by, divided among its shards.
+/// exceeds the host's free memory by.
 #[test]
 fn memory_others_take_from_a_roomy_host_is_held_only_where_it_eats_into_the_daemons_room() {
   let profile = common::machine_profile();
@@ -3326,11 +3329,11 @@ fn memory_others_take_from_a_roomy_host_is_held_only_where_it_eats_into_the_daem
   let sampled = within_sampler_wait(|| daemon.pressure_baseline() == Ok(Some(4 * capacity)));
   daemon.inject_available_memory(3 * capacity).unwrap();
   // Two sampler periods: a hold the swing would wrongly set has had its chance to appear.
-  let wrongly_held = within_sampler_wait(|| daemon.pressure_hold().is_ok_and(|hold| hold > 0));
+  let wrongly_held = within_sampler_wait(|| withheld(&daemon).is_some_and(|hold| hold > 0));
   daemon.inject_available_memory(capacity / 2).unwrap();
-  let per_shard = (capacity / 2) / u64::from(TEST_SHARDS);
-  let held = within_sampler_wait(|| daemon.pressure_hold() == Ok(per_shard));
-  let hold = daemon.pressure_hold();
+  let expected = capacity / 2;
+  let held = within_sampler_wait(|| withheld(&daemon) == Some(expected));
+  let hold = withheld(&daemon);
   daemon.stop();
   drop(segment);
   assert!(sampled, "the daemon took its first sample");
@@ -3340,7 +3343,227 @@ fn memory_others_take_from_a_roomy_host_is_held_only_where_it_eats_into_the_daem
   );
   assert!(
     held,
-    "memory others took from the daemon's own room is held back, divided among its shards: {hold:?} against \
-     {per_shard} a shard"
+    "memory others took from the daemon's own room is held back whole: {hold:?} against {expected}"
+  );
+}
+
+/// Shape: the hold-placement tests' slice, in pool units ([`DaemonConfig::pool_unit`]): 255, so each slice cuts into
+/// parts of 128, 64, 32, 16, 8, 4, 2 and 1 units (A-98), and the operation headroom (about 40 units on macOS) is a
+/// small part of it.
+const PLACEMENT_SLICE_UNITS: u64 = 255;
+/// Shape: the placement test's hold, in pool units: 64, 8 and 1, a sum of the slices' parts, so the pool can withhold it
+/// exactly in whole extents.
+const PLACEMENT_HOLD_UNITS: u64 = 73;
+
+/// What a create on `shard` could take now: the `available` its refusal names when the volume asked for is larger than
+/// the daemon's whole `capacity` (a refused create takes nothing, so asking changes nothing); `None` for any other
+/// answer.
+fn room_on(client: &mut Client, shard: u16, capacity: u64) -> Option<u64> {
+  let oversized = CreateSpec {
+    size: SizeClass::Bounded {
+      limit: capacity.saturating_mul(2),
+    },
+    ..scratch(&name_on(shard, "room"))
+  };
+  match client.create(&oversized) {
+    Err(ClientError::Refused(slates_ipc::protocol::Refusal::BudgetExceeded { available })) => {
+      Some(available)
+    }
+    _ => None,
+  }
+}
+
+/// A placement-test daemon: two shards whose slices are `slice_units` pool units, its sampler shown a host with exactly
+/// its capacity free (no slack) and its own resident memory pinned. Returns the daemon, its anchor, a client, its
+/// capacity and its pool unit, once the sampler has taken its first sample.
+fn placement_daemon(name: &str, slice_units: u64) -> (Daemon, AnchorSegment, Client, u64, u64) {
+  let profile = common::machine_profile();
+  let instance = format!("srv-placement-{name}-{}", std::process::id());
+  let mut config = DaemonConfig::derive(&profile, &instance, Some(POOL_SHARDS));
+  let unit = u64::try_from(config.pool_unit()).unwrap();
+  config.reserve_per_shard = slice_units * unit;
+  let capacity = config.reserve_per_shard * u64::from(POOL_SHARDS);
+  let segment = anchor_segment(&format!("placement-{name}"), &profile, &config);
+  let daemon = Daemon::start(&profile, config, source_of(&segment)).unwrap();
+  daemon
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  daemon.inject_resident_memory(SAMPLED_RESIDENT).unwrap();
+  daemon.inject_available_memory(capacity).unwrap();
+  assert!(
+    within_sampler_wait(|| daemon.pressure_baseline() == Ok(Some(capacity))),
+    "the daemon took its first sample"
+  );
+  let client = connect(&instance);
+  (daemon, segment, client, capacity, unit)
+}
+
+/// §4.2, admission.md §5.5 (found 2026-10-09 reading the content pool beside the hold): the hold is the daemon's, so it
+/// is withheld from a volume on any one shard whole. Do: on [`placement_daemon`], read each shard's room, let the host's
+/// free memory fall by [`PLACEMENT_HOLD_UNITS`] (a drop the daemon did not cause), and read each shard's room again.
+/// Expect: each shard's room smaller by the whole hold. Before: the hold was divided evenly among the shards and each
+/// share claimed only by its own shard's admissions, so a volume on one shard was held back by its shard's share alone
+/// (half the hold here; a fifth on a 5-shard laptop), while the pool (A-98) let it reach the whole capacity.
+#[test]
+fn a_pressured_daemons_hold_is_withheld_whole_from_a_volume_on_any_one_shard() {
+  let (daemon, segment, mut client, capacity, unit) =
+    placement_daemon("whole", PLACEMENT_SLICE_UNITS);
+  let hold = PLACEMENT_HOLD_UNITS * unit;
+  let before = [
+    room_on(&mut client, 0, capacity),
+    room_on(&mut client, 1, capacity),
+  ];
+  daemon.inject_available_memory(capacity - hold).unwrap();
+  let mut after = before;
+  let moved = within_sampler_wait(|| {
+    after = [
+      room_on(&mut client, 0, capacity),
+      room_on(&mut client, 1, capacity),
+    ];
+    after[0] != before[0] && after[1] != before[1]
+  });
+  let pooled = daemon.pressure_pooled();
+  let holds = daemon.pressure_holds();
+  daemon.stop();
+  drop(segment);
+  assert!(
+    moved,
+    "the hold reached both shards: before {before:?} after {after:?}"
+  );
+  assert!(
+    matches!(pooled, Ok(Ok(bytes)) if bytes == hold),
+    "the pool withholds the whole hold in whole extents: {pooled:?}"
+  );
+  assert_eq!(holds, Ok(vec![0, 0]), "no shard's own room is taken");
+  for shard in 0..usize::from(POOL_SHARDS) {
+    let shrank = before[shard].zip(after[shard]).map(|(was, now)| was - now);
+    assert_eq!(
+      shrank,
+      Some(hold),
+      "shard {shard}'s room shrank by the whole hold ({hold} bytes): before {before:?} after {after:?}"
+    );
+  }
+}
+
+/// §4.2, admission.md §5.5: a hold the pool cannot cover is taken from the free room the shards hold. Do: on
+/// [`placement_daemon`], create a one-unit volume on shard 0 (it claims its slice's 128-unit part and holds most of it
+/// free), then a volume on shard 1 of exactly its room (it claims every other free extent, so the pool is empty and
+/// shard 1 holds no free room); then let the host's free memory fall by half of shard 0's room. Expect: shard 0's room
+/// smaller by the whole hold, and shard 1's still none. Before: each shard was held back by half the hold, so shard 0
+/// could still fill half of it.
+#[test]
+fn a_hold_the_pool_cannot_cover_is_taken_from_the_free_room_the_shards_hold() {
+  let (daemon, segment, mut client, capacity, unit) =
+    placement_daemon("residual", PLACEMENT_SLICE_UNITS);
+  let bounded = |name: String, limit: u64| CreateSpec {
+    size: SizeClass::Bounded { limit },
+    ..scratch(&name)
+  };
+  let small = client.create(&bounded(name_on(0, "small"), unit));
+  let filler = room_on(&mut client, 1, capacity)
+    .map(|room| client.create(&bounded(name_on(1, "filler"), room)));
+  let shard_1_left = room_on(&mut client, 1, capacity);
+  let before = room_on(&mut client, 0, capacity);
+  let hold = before.map_or(0, |room| room / 2);
+  daemon.inject_available_memory(capacity - hold).unwrap();
+  let mut after = before;
+  let moved = within_sampler_wait(|| {
+    after = room_on(&mut client, 0, capacity);
+    after != before
+  });
+  let shard_1_after = room_on(&mut client, 1, capacity);
+  let holds = daemon.pressure_holds();
+  daemon.stop();
+  drop(segment);
+  assert!(small.is_ok(), "the small volume is admitted: {small:?}");
+  assert_eq!(
+    holds,
+    Ok(vec![hold, 0]),
+    "the hold is taken from shard 0's free room, the only room left"
+  );
+  assert!(
+    matches!(filler, Some(Ok(_))),
+    "the filler takes shard 1's whole room: {filler:?}"
+  );
+  assert_eq!(
+    shard_1_left,
+    Some(0),
+    "the pool is empty and shard 1 holds no free room"
+  );
+  assert!(hold > 0, "shard 0 holds free room: {before:?}");
+  assert!(
+    moved,
+    "the hold reached shard 0: before {before:?} after {after:?}"
+  );
+  assert_eq!(
+    before.zip(after).map(|(was, now)| was - now),
+    Some(hold),
+    "shard 0's room shrank by the whole hold ({hold} bytes): before {before:?} after {after:?}"
+  );
+  assert_eq!(shard_1_after, Some(0), "shard 1 still has no room");
+}
+
+/// Shape: the debt test's slice, in pool units: 129, so each slice cuts into a part of 128 units and a part of 1 (A-98),
+/// too coarse for the pool to withhold [`DEBT_HOLD_UNITS`] in whole extents.
+const DEBT_SLICE_UNITS: u64 = 129;
+/// Shape: the debt test's hold, in pool units: 64, half a coarse part.
+const DEBT_HOLD_UNITS: u64 = 64;
+
+/// §4.2, admission.md §5.5: a hold finer than the pool's free extents is owed by the next shard to grow. Do: on
+/// [`placement_daemon`] with slices of a 128-unit part and a 1-unit part, and no shard holding anything, let the host's
+/// free memory fall by [`DEBT_HOLD_UNITS`]; read each shard's room; create a volume on shard 1 of exactly its room.
+/// Expect: each shard's room smaller by exactly the hold (the two 1-unit parts withheld whole, the other 62 units
+/// owed); the create admitted; then shard 1 holding the debt as hold and shard 0 left no room. Withholding the
+/// remainder with one more extent would hold back 128 units for a hold of 64, and leaving it out would hold back 2.
+#[test]
+fn a_hold_finer_than_the_pools_free_extents_is_owed_by_the_next_shard_to_grow() {
+  let (daemon, segment, mut client, capacity, unit) = placement_daemon("debt", DEBT_SLICE_UNITS);
+  let hold = DEBT_HOLD_UNITS * unit;
+  let before = [
+    room_on(&mut client, 0, capacity),
+    room_on(&mut client, 1, capacity),
+  ];
+  daemon.inject_available_memory(capacity - hold).unwrap();
+  let mut after = before;
+  let moved = within_sampler_wait(|| {
+    after = [
+      room_on(&mut client, 0, capacity),
+      room_on(&mut client, 1, capacity),
+    ];
+    after[0] != before[0] && after[1] != before[1]
+  });
+  let filled = after[1].map(|room| {
+    client.create(&CreateSpec {
+      size: SizeClass::Bounded { limit: room },
+      ..scratch(&name_on(1, "debtor"))
+    })
+  });
+  let shard_0_left = room_on(&mut client, 0, capacity);
+  let pooled = daemon.pressure_pooled();
+  let holds = daemon.pressure_holds();
+  daemon.stop();
+  drop(segment);
+  assert!(
+    moved,
+    "the hold reached both shards: before {before:?} after {after:?}"
+  );
+  for shard in 0..usize::from(POOL_SHARDS) {
+    assert_eq!(
+      before[shard].zip(after[shard]).map(|(was, now)| was - now),
+      Some(hold),
+      "shard {shard}'s room shrank by exactly the hold ({hold} bytes): before {before:?} after {after:?}"
+    );
+  }
+  assert!(
+    matches!(filled, Some(Ok(_))),
+    "shard 1's whole room is admitted: {filled:?}"
+  );
+  assert_eq!(shard_0_left, Some(0), "shard 0 has no room left");
+  let pooled = pooled.ok().and_then(Result::ok);
+  let shard_1_hold = holds.as_ref().ok().and_then(|holds| holds.get(1).copied());
+  assert_eq!(
+    pooled.zip(shard_1_hold).map(|(pool, shard)| pool + shard),
+    Some(hold),
+    "the pool's two small parts and the debt shard 1 took on make the hold: {pooled:?} and {holds:?}"
   );
 }

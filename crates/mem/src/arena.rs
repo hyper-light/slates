@@ -109,6 +109,10 @@ pub trait ExtentSource: Send {
   /// The bytes of free extents this source could still hand out now, as an arena would hold them: what an admission
   /// may count on beyond the arena's own capacity. A snapshot: another arena may claim them first.
   fn available(&self) -> usize;
+  /// Lets this source hand out the extents a pressure hold has withheld, as well as free ones, while `open` (§4.2,
+  /// admission.md §5.5: a takeover's recovery runs past the hold, which never revokes a committed claim). A source
+  /// with no hold has nothing to open.
+  fn open_hold(&mut self, _open: bool) {}
 }
 
 /// The arena.
@@ -307,19 +311,26 @@ impl ChunkArena {
       return 0;
     }
     let deficit = budget.deficit(bytes);
-    if deficit == 0 || u64::try_from(self.claimable()).unwrap_or(u64::MAX) < deficit {
+    if deficit == 0 {
+      return 0;
+    }
+    // Growing from the pool takes on the pressure debt the daemon's sampler left for the next shard to grow (§4.2,
+    // `budget::Pressure`): the arena grows by it too, and the budget holds it once grown.
+    let needed = deficit.saturating_add(budget.debt());
+    if u64::try_from(self.claimable()).unwrap_or(u64::MAX) < needed {
       return 0;
     }
     let before = self.capacity();
     let added =
-      u64::try_from(self.grow(usize::try_from(deficit).unwrap_or(usize::MAX))).unwrap_or(u64::MAX);
-    if added < deficit {
+      u64::try_from(self.grow(usize::try_from(needed).unwrap_or(usize::MAX))).unwrap_or(u64::MAX);
+    if added < needed {
       // The claims just taken hold no block, so they are wholly free and go back first (the newest regions are
       // returned first), down to the capacity the arena had before.
       self.shrink(before);
       return 0;
     }
     budget.extend(added);
+    budget.absorb_debt();
     added
   }
 
@@ -362,6 +373,14 @@ impl ChunkArena {
   /// The bytes this arena could still claim from its source ([`ExtentSource::available`]); zero without a source.
   pub fn claimable(&self) -> usize {
     self.source.as_ref().map_or(0, |source| source.available())
+  }
+
+  /// Opens or closes the source's pressure hold to this arena's growth ([`ExtentSource::open_hold`]); nothing without a
+  /// source.
+  pub fn open_hold(&mut self, open: bool) {
+    if let Some(source) = self.source.as_mut() {
+      source.open_hold(open);
+    }
   }
 
   /// Claims the source could not hand out so far ([`ExtentSource::refused`]); zero without a source.
@@ -1391,6 +1410,28 @@ mod tests {
     let admitted = arena.make_room(&mut budget, u64::try_from(p * 6).unwrap());
     assert_eq!(admitted, u64::try_from(p * 8).unwrap(), "two whole regions");
     assert_eq!(budget.capacity(), admitted);
+  }
+
+  /// §4.2 (2026-10-09): a growth from the pool takes on the pressure debt. Do: over a pool of two four-granule regions,
+  /// owe a debt of four granules and make room for two. Expect both regions claimed (two granules and the debt need
+  /// more than one), the hold four granules and no debt left; with the debt larger than the pool can add beside the
+  /// admission, nothing claimed.
+  #[test]
+  fn making_room_takes_on_the_pressure_debt() {
+    let p = page();
+    let granules = |n: usize| u64::try_from(p * n).unwrap();
+    let mut arena = pooled(p, &[1, 2]);
+    let mut budget = crate::budget::ShardBudget::new(0, 0);
+    budget.set_pressure(0, granules(7));
+    assert_eq!(
+      arena.make_room(&mut budget, granules(2)),
+      0,
+      "nine granules exceed the pool"
+    );
+    assert_eq!(arena.claimable(), p * 8);
+    budget.set_pressure(0, granules(4));
+    assert_eq!(arena.make_room(&mut budget, granules(2)), granules(8));
+    assert_eq!((budget.hold(), budget.debt()), (granules(4), 0));
   }
 
   /// A-98, §4.2. Do: over a pool that looks one granule larger than it is (another arena claimed between the look and

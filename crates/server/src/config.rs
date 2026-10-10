@@ -377,6 +377,18 @@ impl DaemonConfig {
     content_granule(self.page)
   }
 
+  /// Derived (A-98): the unit a shard's arena range is cut into pool parts on. It is one chunk window
+  /// (`slates_vfs::content::chunk_bytes`) rounded up to the mapping granule and the page, as a power of two, so every
+  /// part holds whole chunks and maps on its own.
+  pub fn pool_unit(&self) -> usize {
+    slates_mem::mapping_granule()
+      .unwrap_or(self.page)
+      .max(self.page)
+      .max(slates_vfs::content::chunk_bytes(self.page).get())
+      .checked_next_power_of_two()
+      .unwrap_or(usize::MAX)
+  }
+
   /// Derived: each shard's FUSE write log in the anchor's content object (A-63): a quarter of the shard's reserve.
   /// A log that fills forces a publication, which empties it, so its size trades publications against resident log
   /// pages, never durability; a quarter of the reserve lets a write stream of that much ride between barriers

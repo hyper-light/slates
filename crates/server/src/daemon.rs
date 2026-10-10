@@ -2201,6 +2201,37 @@ impl Daemon {
     Ok(())
   }
 
+  /// The bytes of content-pool extents this daemon's memory-pressure hold owns now (§4.2, admission.md §5.5): the part
+  /// of the hold withheld from the pool, read through the control shard's attachment. With [`Daemon::pressure_holds`]
+  /// (the free room taken from each shard), the whole hold. A pool word the segment refuses to reach is its typed
+  /// refusal.
+  pub fn pressure_pooled(&self) -> Result<Result<u64, slates_anchor::AnchorError>, ObserveError> {
+    self.observe(self.shards.first().copied(), |s| {
+      crate::content_pool::hold_bytes(
+        &s.segment,
+        &crate::content_pool::PoolGeometry::of(&s.config),
+      )
+    })
+  }
+
+  /// The whole memory-pressure hold this daemon withholds now (§4.2, admission.md §5.5): the pool extents the hold owns
+  /// ([`Daemon::pressure_pooled`]), the free room taken from each shard ([`Daemon::pressure_holds`]), and the debt the
+  /// next shard to grow from the pool takes on (told to every shard alike, so counted once). A pool word the segment
+  /// refuses to reach is its typed refusal.
+  pub fn pressure_withheld(&self) -> Result<Result<u64, slates_anchor::AnchorError>, ObserveError> {
+    let pooled = self.pressure_pooled()?;
+    let mut held = 0u64;
+    let mut debt = 0u64;
+    for shard in self.shards.iter().copied() {
+      let (hold, owed) = self.observe(Some(shard), |s| {
+        (s.store.budget.hold(), s.store.budget.debt())
+      })?;
+      held = held.saturating_add(hold);
+      debt = debt.max(owed);
+    }
+    Ok(pooled.map(|pool| pool.saturating_add(held).saturating_add(debt)))
+  }
+
   /// The memory-pressure hold now on each shard's byte budget (§4.2), in shard order — the capacity
   /// each withholds from new admission. Zero when the host is not under pressure (or has no sampler).
   /// An observation a shard could not answer is its typed refusal.
@@ -3077,7 +3108,7 @@ fn init_shard(
     injected_available: None,
     injected_resident: None,
     pressure_resident_baseline: None,
-    pressure_sent: vec![0; config_shards.len()],
+    pressure_sent: vec![(0, 0); config_shards.len()],
     answers_given: crate::lease::AnswersGiven::default(),
     departed_owners: std::collections::BTreeMap::new(),
     green_retention: std::collections::BTreeMap::new(),
@@ -3210,7 +3241,7 @@ async fn reap_loop() {
     if reaped > 0 {
       CLIENTS_REAPED.fetch_add(u64::try_from(reaped).unwrap_or(u64::MAX), Ordering::AcqRel);
     }
-    refresh_pressure_hold();
+    refresh_pressure_hold().await;
     state::with_state(|s| {
       process_base_hints(s);
       // The recalls the hints asked for are sent now: nothing else runs the drain while no call is served.
@@ -3451,69 +3482,182 @@ pub(crate) fn pressure_hold(baseline: u64, available: u64, own_growth: u64, capa
   shortfall.min(room.saturating_sub(available))
 }
 
-/// Samples the host's available memory and sets each shard's pressure hold (§4.2; admission.md §5.5),
-/// run by the control shard's reap loop at the liveness cadence — the design's "cheap-refresh", one sampler a
+/// Samples the host's available memory and withholds the daemon's pressure hold from admission (§4.2; admission.md
+/// §5.5), run by the control shard's reap loop at the liveness cadence — the design's "cheap-refresh", one sampler a
 /// daemon (every shard runs a reap loop; before 2026-10-09 each sampled and sent its own reading to every shard, N²
-/// cross-shard messages a second on a daemon at rest, each waking a parked shard). The hold is
-/// the host-wide shortfall below the boot baseline, less the daemon's own resident growth since then (that is
-/// committed content, charged already), divided evenly among the shards (so the total
-/// held across the shards is the shortfall, not a multiple of it); it shrinks each shard's admittable
-/// so a new reservation is refused under pressure while an admitted volume's within-entitlement writes
-/// land, and it releases to zero as the sample recovers toward the baseline. A host with no memory
-/// sampler (`memory_available_now` is `None` on an unsupported platform) leaves the hold at zero — the
-/// budget then admits exactly as before, no worse than not sampling. The read is one cheap syscall or
-/// `/proc` line per cadence, not per request.
-fn refresh_pressure_hold() {
-  if state::with_state(|s| crate::verbs::is_control_shard(s)) != Some(true) {
-    return;
-  }
-  let injected = state::with_state(|s| s.injected_available).flatten();
-  let Some(available) = injected.or_else(slates_machine::facts::Facts::memory_available_now) else {
+/// cross-shard messages a second on a daemon at rest, each waking a parked shard).
+///
+/// The hold is the host-wide shortfall below the boot baseline, less the daemon's own resident growth since then (that
+/// is committed content, charged already), and never more than the daemon's unfilled room exceeds the host's free
+/// memory ([`pressure_hold`]). It is the daemon's, withheld once, wherever the room it holds back lies:
+/// - first from the content pool, as extents the hold claims under its own owner (`content_pool::hold_toward`), so no
+///   shard can grow into them;
+/// - what the pool's whole extents miss, from the free room the shards already hold (each shard's capacity beyond its
+///   commitments and headroom), in proportion to that room, as each shard's ledger hold ([`apportion`]);
+/// - and what neither covers, as a debt every shard is told, taken on as hold by whichever shard next grows from the
+///   pool (`slates_mem::budget::Pressure`).
+///
+/// Before 2026-10-09 the hold was divided evenly among the shards and each share was claimed only when its own shard
+/// admitted, so with the pool (A-98) a volume on one shard of five could fill all but a fifth of it. The hold shrinks
+/// admittable only, so a new reservation is refused under pressure while an admitted volume's within-entitlement writes
+/// land, and it releases to zero as the sample recovers toward the baseline. A host with no memory sampler
+/// (`memory_available_now` is `None` on an unsupported platform) leaves the hold at zero — the budget then admits
+/// exactly as before, no worse than not sampling. The read is one cheap syscall or `/proc` line per cadence, not per
+/// request; the shards are asked for their free room only while the pool cannot cover the hold.
+async fn refresh_pressure_hold() {
+  let Some((origin, shards, hold)) = sample_pressure_hold() else {
     return;
   };
+  let pooled = state::with_state(|s| {
+    let geometry = crate::content_pool::PoolGeometry::of(&s.config);
+    crate::content_pool::hold_toward(&s.segment, &geometry, hold)
+  });
+  let pooled = match pooled {
+    Some(Ok(bytes)) => bytes,
+    Some(Err(_)) => {
+      state::with_state_counted(|s| s.count(PRESSURE_POOL_REFUSED, 1));
+      0
+    }
+    None => return,
+  };
+  let residual = hold.saturating_sub(pooled);
+  let (holds, debt) = if residual == 0 {
+    (vec![0; shards.len()], 0)
+  } else {
+    let free = free_room_of(origin, &shards).await;
+    let holds = apportion(residual, &free);
+    let placed = holds
+      .iter()
+      .fold(0u64, |total, part| total.saturating_add(*part));
+    (holds, residual.saturating_sub(placed))
+  };
+  send_pressure_holds(origin, &shards, &holds, debt);
+}
+
+/// The control shard's sample of the pressure hold (§4.2): this shard, the daemon's shards and the daemon-wide hold,
+/// or `None` off the control shard or on a host with no memory sampler.
+fn sample_pressure_hold() -> Option<(u16, Vec<u16>, u64)> {
+  if state::with_state(|s| crate::verbs::is_control_shard(s)) != Some(true) {
+    return None;
+  }
+  let injected = state::with_state(|s| s.injected_available).flatten();
+  let available = injected.or_else(slates_machine::facts::Facts::memory_available_now)?;
   // This daemon's first sample fixes its baseline (kept by the sampling shard, so each daemon in a
   // process has its own); a later sample above it only lowers the shortfall.
   let resident = state::with_state(|s| s.injected_resident)
     .flatten()
     .or_else(slates_machine::facts::Facts::resident_now);
-  let Some((origin, shards, baseline, resident_baseline)) = state::with_state(|s| {
+  let (origin, shards, baseline, resident_baseline, reserve) = state::with_state(|s| {
     let baseline = *s.pressure_baseline.get_or_insert(available);
     let resident_baseline = match resident {
       Some(now) => Some(*s.pressure_resident_baseline.get_or_insert(now)),
       None => s.pressure_resident_baseline,
     };
-    (s.shard, s.shards.clone(), baseline, resident_baseline)
-  }) else {
-    return;
-  };
+    (
+      s.shard,
+      s.shards.clone(),
+      baseline,
+      resident_baseline,
+      s.config.reserve_per_shard,
+    )
+  })?;
   // The daemon's own growth since the baseline (its content, metadata and heap) is not pressure: those bytes are
   // committed already, so holding them back as well charged every stored byte twice (2026-10-05: one volume refused
   // at 244 MB of a 358 MB pool under a 1 GiB cap, held back 111 MB per shard for memory it had itself filled).
   let own_growth = resident
     .zip(resident_baseline)
     .map_or(0, |(now, then)| now.saturating_sub(then));
-  let capacity = state::with_state(|s| s.config.reserve_per_shard)
-    .unwrap_or(0)
-    .saturating_mul(u64::try_from(shards.len()).unwrap_or(u64::MAX));
-  let per_shard = pressure_hold(baseline, available, own_growth, capacity)
-    .checked_div(u64::try_from(shards.len().max(1)).unwrap_or(1))
-    .unwrap_or(0);
-  for (index, shard) in shards.into_iter().enumerate() {
-    // Sent only when it changes: a daemon at rest sends nothing. A send the target's admission bound refuses is
-    // counted and left unrecorded, so the next refresh sends it again.
-    if state::with_state(|s| s.pressure_sent.get(index).copied()).flatten() == Some(per_shard) {
+  let capacity = reserve.saturating_mul(u64::try_from(shards.len()).unwrap_or(u64::MAX));
+  let hold = pressure_hold(baseline, available, own_growth, capacity);
+  Some((origin, shards, hold))
+}
+
+/// Each shard's free room (§4.2), in shard order: the capacity it holds beyond its commitments and its operation
+/// headroom, asked of each shard (`ShardBudget::mark_room`, which marks the read so later growth takes on the debt the
+/// refresh sends back). Zero for a shard that does not answer within a heartbeat (counted), and for one whose hold a test
+/// pinned, which the sampler leaves alone.
+async fn free_room_of(origin: u16, shards: &[u16]) -> Vec<u64> {
+  let mut free = Vec::with_capacity(shards.len());
+  for &shard in shards {
+    let room = crate::xshard::call_within(
+      origin,
+      shard,
+      |s| {
+        if s.pressure_pinned {
+          return 0;
+        }
+        s.store.budget.mark_room()
+      },
+      HEARTBEAT_NS,
+    )
+    .await;
+    if room.is_none() {
+      state::with_state_counted(|s| s.count(PRESSURE_ROOM_UNANSWERED, 1));
+    }
+    free.push(room.unwrap_or(0));
+  }
+  free
+}
+
+/// Divides `residual` bytes of a pressure hold among the shards in proportion to the free room each holds (`free`, in
+/// shard order), never more than a shard's room (§4.2). While the rooms can absorb it the parts sum to `residual`
+/// exactly: the flooring's remainder, fewer bytes than there are shards, goes a byte each to shards with room left, in
+/// order. With `residual` at or past the rooms' total, each shard gives up all its room.
+pub(crate) fn apportion(residual: u64, free: &[u64]) -> Vec<u64> {
+  let total = free
+    .iter()
+    .fold(0u128, |sum, room| sum.saturating_add(u128::from(*room)));
+  if total == 0 {
+    return vec![0; free.len()];
+  }
+  if u128::from(residual) >= total {
+    return free.to_vec();
+  }
+  let mut holds: Vec<u64> = free
+    .iter()
+    .map(|room| {
+      let share = u128::from(residual)
+        .saturating_mul(u128::from(*room))
+        .checked_div(total)
+        .unwrap_or(0);
+      u64::try_from(share).unwrap_or(*room).min(*room)
+    })
+    .collect();
+  let given = holds
+    .iter()
+    .fold(0u64, |sum, hold| sum.saturating_add(*hold));
+  let mut left = residual.saturating_sub(given);
+  for (hold, room) in holds.iter_mut().zip(free) {
+    if left == 0 {
+      break;
+    }
+    if *hold < *room {
+      *hold = hold.saturating_add(1);
+      left = left.saturating_sub(1);
+    }
+  }
+  holds
+}
+
+/// Sends each shard its pressure hold and the debt (`ShardBudget::set_pressure`), only where they differ from the last
+/// sent: a daemon at rest sends nothing. A send the target's admission bound refuses is counted and left unrecorded, so
+/// the next refresh sends it again.
+fn send_pressure_holds(origin: u16, shards: &[u16], holds: &[u64], debt: u64) {
+  for (index, (&shard, &hold)) in shards.iter().zip(holds).enumerate() {
+    let pressure = (hold, debt);
+    if state::with_state(|s| s.pressure_sent.get(index).copied()).flatten() == Some(pressure) {
       continue;
     }
     let sent = crate::xshard::run_on(origin, shard, move |s| {
       if !s.pressure_pinned {
-        s.store.budget.set_hold(per_shard);
+        s.store.budget.set_pressure(hold, debt);
       }
     });
     match sent {
       Ok(()) => {
         state::with_state(|s| {
           if let Some(slot) = s.pressure_sent.get_mut(index) {
-            *slot = per_shard;
+            *slot = pressure;
           }
         });
       }
@@ -3523,6 +3667,13 @@ fn refresh_pressure_hold() {
     }
   }
 }
+
+/// Counter: a pool owner word the pressure hold's claims or releases could not reach (a layout fault); the refresh
+/// withholds what it could and tries again at the next one.
+const PRESSURE_POOL_REFUSED: &str = "pressure.pool_refused";
+/// Counter: a shard that did not answer the sampler's question of its free room within a heartbeat; nothing is taken
+/// from it this refresh.
+const PRESSURE_ROOM_UNANSWERED: &str = "pressure.room_unanswered";
 
 /// Counter: a pressure hold the sampler could not send a shard (its admission bound refused the message); sent again at
 /// the next refresh, so none is lost, but a refusal is never silent.
@@ -4167,7 +4318,7 @@ pub(crate) use tests::{
 
 #[cfg(test)]
 mod pressure_tests {
-  use super::pressure_hold;
+  use super::{apportion, pressure_hold};
 
   /// Shape: a daemon's whole content capacity in the hold's cases.
   const CAPACITY: u64 = 1 << 30;
@@ -4214,6 +4365,56 @@ mod pressure_tests {
       CAPACITY / 4,
       "a half-filled daemon needs only its other half backed"
     );
+  }
+
+  /// §4.2 (2026-10-09): the part of a hold the pool cannot cover is taken from the shards' free room in proportion to
+  /// it. Do: divide 10 bytes over rooms of 30, 10 and 0. Expect 8, 2 and 0: the floor of each share (7, 2, 0) and the
+  /// one byte of remainder to the first shard with room left, summing to 10 exactly.
+  #[test]
+  fn a_residual_hold_is_divided_by_the_shards_free_room_and_sums_exactly() {
+    assert_eq!(apportion(10, &[30, 10, 0]), [8, 2, 0]);
+  }
+
+  /// §4.2: no shard gives up more than its room. Do: divide more than the rooms hold, and anything over no room. Expect
+  /// every room taken whole, then nothing.
+  #[test]
+  fn a_residual_hold_never_takes_more_than_a_shards_room() {
+    assert_eq!(apportion(50, &[30, 10]), [30, 10]);
+    assert_eq!(apportion(40, &[30, 10]), [30, 10]);
+    assert_eq!(apportion(5, &[0, 0]), [0, 0]);
+    assert_eq!(apportion(0, &[7, 9]), [0, 0]);
+  }
+
+  /// §4.2: across rooms of every shape, the parts sum to the residual exactly and stay within each room. Do: divide
+  /// residuals below each total over rooms that include zeros, ones and the largest values. Expect both, every time.
+  #[test]
+  fn a_residual_hold_sums_exactly_within_the_rooms_for_any_rooms() {
+    let rooms: [&[u64]; 5] = [
+      &[1, 1, 1],
+      &[u64::MAX, u64::MAX],
+      &[3, 0, 5, 7, 0, 11],
+      &[1 << 40, 1, 1 << 20],
+      &[999_999_937, 2, 1],
+    ];
+    for room in rooms {
+      let total = room.iter().fold(0u128, |sum, each| sum + u128::from(*each));
+      let samples = [1u128, total / 3, total / 2, total - 1];
+      for residual in samples.map(|each| u64::try_from(each.min(u128::from(u64::MAX))).unwrap()) {
+        let holds = apportion(residual, room);
+        let given = holds
+          .iter()
+          .fold(0u128, |sum, each| sum + u128::from(*each));
+        assert_eq!(
+          given,
+          u128::from(residual),
+          "{residual} over {room:?}: {holds:?}"
+        );
+        assert!(
+          holds.iter().zip(room).all(|(hold, each)| hold <= each),
+          "{holds:?} within {room:?}"
+        );
+      }
+    }
   }
 }
 
