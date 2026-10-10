@@ -624,10 +624,9 @@ Deviations and owed items from tasks 11–13:
   batches of at most one copy window of pages, each batch behind one durability barrier, and
   the ramp is gone (its latency rule stops a batch while the barrier still dominates; the
   report carries `barriers` in place of `ramp_depth`). macOS: each file `fsync`ed, then one
-  `F_BARRIERFSYNC` per device, as fcntl(2) prescribes. **Owed (Linux):** the batch's
-  `fdatasync`s issued together, so journal group commit merges them (measured beside a busy
-  writer: 142–177 µs a file at 16 in flight against 756–1,666 one at a time); until then each
-  file is synced alone, as before. `syncfs` is measured and rejected (it flushes every writer's
+  `F_BARRIERFSYNC` per device, as fcntl(2) prescribes. Linux (the same day): the batch's
+  `fdatasync`s in flight at once, so journal group commit merges them (3.0–7.4× faster through
+  the engine on a busy VM). `syncfs` is measured and rejected (it flushes every writer's
   data: single barriers up to 3.7 s beside a busy writer). **Option on record:** a batch sized
   by a descriptor share (64 files: another 15–20% on macOS) once the daemon accounts one. The
   linked io_uring chains and arena-page writes arrive with Phase 4's Linux bridge (bytes are
@@ -5711,7 +5710,7 @@ On a Linux release build of `faad1562` (A-126, the probe-storm fix and the reply
 - **Not run here:** the release-mode explorers, the differential and disk lanes, TSan, and the live guest. Those are
   CI's other jobs; its last run, on `8a18d907`, was red on one fleet test and on TSan and iai-callgrind.
 
-### 2026-10-10: a landing's files reach the disk in batches, one barrier each (A-130; Linux's batch barrier owed)
+### 2026-10-10: a landing's files reach the disk in batches, one barrier each (A-130)
 
 - **Why:** the per-file data sync was the landing's cost. It ran 573–913 µs a file on ext4 in Docker against 15–21
   µs without it, and 697–904 µs on APFS against 326–384 µs. Per-entry cost is flat from 1,000 to 16,000 files, which
@@ -5736,9 +5735,12 @@ On a Linux release build of `faad1562` (A-126, the probe-storm fix and the reply
   caught.
 - **Linux:** `syncfs`, the one call that covers a batch, is rejected. Beside one busy writer, a 16-file batch cost
   4.0–7.8 ms a file against `fdatasync`'s 0.65–0.79 ms, and a single barrier took up to 3.7 s.
-  - **Owed:** the batch's `fdatasync`s issued together, for journal group commit. Measured beside the busy writer:
-    142–177 µs a file at 16 in flight.
-  - Until then each Linux file is synced alone, as before A-130.
+  - **Built the same day:** the batch's `fdatasync`s in flight at once, for journal group commit.
+    - Through the engine on ext4, interleaved with `20b302aa` at VM load 35–39: 965–1,618 µs a file against
+      3,426–11,091, 3.0–7.4× faster; 182–219 µs once the VM quieted.
+    - Starting each file's writeback at write time gained 21–45% in five of six syscall rounds and lost 10% in one. It
+      waits for a quieter measurement, since it needs an `unsafe` call rustix does not wrap.
+    - Its Linux lane: clippy clean, every `slates-land` test (the OS writer's real-disk tests on ext4 among them).
 - **Linux lane over the change** (a snapshot worktree in a container: io_uring, non-root, 2 build jobs, a 3 GiB
   cap):
   - clippy `--workspace --all-targets -D warnings`: clean;
@@ -5747,6 +5749,16 @@ On a Linux release build of `faad1562` (A-126, the probe-storm fix and the reply
   - client: 10, consumer 2 (2 ignored), presentation 1.
 
   macOS: the same, plus the gates.
-- **Open, seen in both arms of the fairness A/B:** one shard step of 126–185 ms per run at load 27–29, and one probe
-  per run waiting behind it. The 2026-10-01 runs, at load 4–6, saw longest steps of 13.8–25.5 ms. Not located yet;
-  it bears on p99 under load.
+- **Seen in both arms of the fairness A/B, located the same day (open):** one shard step of 126–185 ms per run at load
+  27–29, and one probe per run waiting behind it. The 2026-10-01 runs, at load 4–6, saw longest steps of 13.8–25.5 ms.
+  - **Not the landing:** timed in a scratch build, its begin took 5.1 ms, its finish 16.5 ms and its slices at most
+    4.3 ms.
+  - **The cause:** `sample` of the test process during a run (debug build) put 131 of the shard thread's 600 samples
+    in `publish_shard` → `ChunkArena::capture` → `Buddy::capture`, a byte-by-byte scan of a region's state map. That
+    run's longest step was 178 ms.
+  - **Why it scans:** a buddy keeps no live-block bitmap until its first capture (`imaged`), so an allocator nothing
+    publishes from pays nothing. So the first capture of each region scans its whole state, one byte per granule, in
+    the step of whichever mutating verb publishes first; later captures are incremental.
+  - **Owed:** the cost in a release build, then the scan taken off the verb path. A region that will be published
+    could start imaged with an empty bitmap, since a fresh region has no allocations; to be confirmed against the
+    recovery path, which rebuilds a buddy from saved state bytes.

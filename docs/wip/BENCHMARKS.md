@@ -4709,3 +4709,50 @@ behind it. The 2026-10-01 runs, at load 4–6, saw longest steps of 13.8–25.5 
   at one), because journal group commit merges in-flight fsyncs without touching other writers' data. It is Linux's
   batch barrier, built next with its own A/B through the engine. The quiet rounds were noisy (the d=1 baseline ran
   1,690–4,765 µs, against 403–948 in the sweep an hour earlier).
+
+### Landed: Linux's batch barrier, every file's `fdatasync` in flight at once (A-130; 2026-10-10)
+
+**Commands:**
+- **The syscall A/B:** a scratch (`sync_ab.rs`, not kept) in the engine's shape. Batches of `n` files of 4 KiB: per
+  file a temporary created and written, optionally its writeback started (`sync_file_range(SYNC_FILE_RANGE_WRITE)`);
+  per batch the barrier; then each file renamed. 2,000 files per arm, three rounds, quiet and beside the busy writer
+  of the entry above.
+- **The engine A/B:** `land_bench flat` for `20b302aa` (one `fdatasync` a file) and the change, each built in its own
+  target directory in one container and interleaved.
+- **Where:** Docker Desktop's VM, kernel 6.12.76-linuxkit, ext4, 2 build jobs, a 3 GiB cap, non-root. The VM was far
+  busier than at noon (load 24–49 inside it, from other sessions' containers): the same per-file `fdatasync` that cost
+  403–948 µs then costs 2,670–7,003 µs now. The arms ran interleaved, so they saw the same VM.
+
+**The syscall A/B, µs a file** (longest barrier in parentheses, ms):
+
+| round | sequential, one a file | sequential, n=16 | writeback first, then sequential, n=16 | concurrent, n=16 | writeback first, then concurrent, n=16 | concurrent, n=8 |
+|---|---|---|---|---|---|---|
+| quiet 0 | 7,003 | 9,554 (527) | 2,198 | 1,846 (213) | 1,034 (142) | 2,327 |
+| quiet 1 | 5,685 | 7,699 (615) | 1,968 | 890 (68) | 636 (31) | 861 |
+| quiet 2 | 3,152 | 2,232 (142) | 429 | 644 (55) | 507 (45) | 598 |
+| busy 0 | 2,670 | 4,591 (474) | 1,726 | 624 (75) | 689 (81) | 1,377 |
+| busy 1 | 3,795 | 3,477 (259) | 822 | 446 (27) | 316 (13) | 1,249 |
+| busy 2 | 4,142 | 5,558 (509) | 816 | 1,122 (129) | 618 (46) | 1,300 |
+
+**Through the engine, µs a new file** (median of 5 runs; load inside the VM at each arm's start):
+
+| round | arm | load | 1,000 | 2,000 | 4,000 | 8,000 | 16,000 |
+|---|---|---|---|---|---|---|---|
+| 1 | one `fdatasync` a file | 39 | 4,800 | 5,331 | 11,091 | 4,846 | 3,426 |
+| 1 | concurrent barrier | 35 | 1,618 | 1,198 | 1,501 | 1,435 | 965 |
+| 2 | one `fdatasync` a file | 49 | 1,793 | 2,395 | 2,193 | 3,185 | 781 |
+| 2 | concurrent barrier | 24 | 208 | 182 | 219 | 218 | 206 |
+
+- **Round 1, at like load:** the concurrent barrier is 3.0–7.4× faster. Round 2's arms met different loads, so its
+  3.8–14.6× is not quoted as the gain. Round 2's 182–219 µs is what the change costs when the VM quiets.
+- **Why it works:** a batch of `fdatasync`s in flight together waits on one journal commit and one device flush in
+  ext4 (jbd2 joins every sync waiting on the running transaction to its commit). One at a time, each forces its own.
+  Each file is durable when its own call returns, so the guarantee is exactly the per-file one.
+- **Writeback first** (`sync_file_range` at write time) helped the concurrent barrier in five of six rounds, by 21–45%,
+  and lost 10% in the sixth (busy 0). It needs an `unsafe` libc call, since rustix wraps no `sync_file_range`. Not taken: its gain is
+  inside this VM's noise, so it waits for a quieter measurement.
+- **Sequential barriers in a batch are no better than one a file** (2,232–9,554 µs): every `fdatasync` still forces
+  its own commit. Sixteen at once beat eight at once in four of six rounds, by up to 2.8× beside the busy writer; eight
+  was 3–7% faster in two quiet rounds.
+- **Threads:** a barrier starts one scoped thread per file but the caller's (up to 15), and joins them. A one-file
+  batch starts none.

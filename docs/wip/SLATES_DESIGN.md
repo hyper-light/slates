@@ -5216,8 +5216,8 @@ entry either old or new, never torn).
    a slice ends. The barrier per platform is step 8's. No disk is probed at boot.
 8. *Sync.* A file's data is durable before it is placed: its write-out, then its batch's barrier
    (A-130; macOS `fsync` each, then one `F_BARRIERFSYNC` per device, the device's barrier ordering every
-   earlier write-out; Linux `fdatasync` each, the batch's `fdatasync`s to be issued together so journal
-   group commit merges them, owed). After the last entry, one directory sync per touched directory in
+   earlier write-out; Linux every file's `fdatasync` in flight at once, so journal group commit merges
+   them into few commits and flushes). After the last entry, one directory sync per touched directory in
    parallel (Linux `fsync` on the directory descriptors — never `syncfs`, which also flushes every other
    writer's dirty data on the filesystem: beside one busy writer a `syncfs` took up to 3.7 s, A-130;
    macOS one `F_FULLFSYNC` after the barriers when the grant asked for media durability, otherwise the
@@ -5425,8 +5425,8 @@ stays in the overlay.
 > - **The flow:** each file is staged (written, its mode and mtime set, written out); each batch of at most one copy
 >   window of pages takes one barrier; then its files are placed.
 > - **macOS:** one `F_BARRIERFSYNC` per device a batch, after each file's `fsync`, as fcntl(2) prescribes.
-> - **Linux:** one `fdatasync` a file, until its batch barrier (the batch's syncs issued together) is built; `syncfs`
->   is measured and rejected.
+> - **Linux:** the batch's `fdatasync`s in flight at once, so journal group commit merges them: 3.0–7.4× faster
+>   through the engine on a busy VM. `syncfs` is measured and rejected.
 > - The ramp is gone; the report carries `barriers`. Nothing is placed after the grant or lease ends, and an abandoned
 >   run closes its temporaries.
 > - **Held by the oracle:** the simulated host now fails a placement of an undurable temporary, and an advanced entry
@@ -11039,7 +11039,8 @@ Applied in the same change to:
   `crates/server/tests/daemon.rs`;
 - GAPS, BENCHMARKS, `docs/bugs/2026-10-10-a-landings-durability-order-was-untested-and-an-abandoned-run-kept-its-temporaries-open.md`.
 
-Status: built 2026-10-10 for macOS. Linux keeps one `fdatasync` a file until its batch barrier (below) is built.
+Status: built 2026-10-10: the batches and macOS's barrier first, Linux's barrier the same day (`crates/land/src/os.rs`,
+the seam's docs, this entry, GAPS, BENCHMARKS).
 - **What it answers.**
   - A landing made every file durable alone before placing it: Linux `fdatasync`, macOS `F_BARRIERFSYNC`. That one
     call was about 97% of a Linux landing's cost a file (573–913 µs with it, 15–21 µs stubbed; ext4 in Docker) and
@@ -11089,12 +11090,18 @@ Status: built 2026-10-10 for macOS. Linux keeps one `fdatasync` a file until its
     call before its placement. git's `core.fsyncMethod=batch` makes the same trade, "expected to be as safe as fsync
     on macOS for repos stored on HFS+ or APFS filesystems and on Windows for repos stored on NTFS or ReFS filesystems".
     It claims nothing for Linux [C: git-config(1), git 2.50.1].
-  - **Linux and the other unixes:** the write-out is `fdatasync`, which makes the file durable alone, so the barrier
-    adds nothing. Linux's only call that covers a batch, `syncfs`, flushes every writer's dirty data on the filesystem.
-    Measured beside one busy writer, it is the worst choice, so it is rejected for files and for directories.
-  - **Owed, Linux:** the batch's `fdatasync`s issued together, which journal group commit merges into one commit and
-    one flush. Beside a busy writer, 16 at once cost 142–177 µs a file against 756–1,666 µs one at a time (measured
-    below). A thread or io_uring per barrier is its own change, with its own A/B through the engine.
+  - **Linux:** the write-out does nothing yet; the barrier issues every file's `fdatasync` at once, from one scoped
+    thread a file but the caller's, and joins them all. Journal group commit merges them into few commits and flushes:
+    ext4's jbd2 joins every sync waiting on the running transaction to its commit. Each file is durable when its own
+    call returns, exactly as alone, and the batch is refused when any is. A thread the system refuses to start leaves
+    its file to the caller.
+    - Linux's only call that covers a batch, `syncfs`, flushes every writer's dirty data on the filesystem. Measured
+      beside one busy writer, it is the worst choice, so it is rejected for files and for directories.
+    - Starting each file's writeback at write time (`sync_file_range`) gained 21–45% in five of six syscall rounds and
+      lost 10% in one. It needs an `unsafe` libc call (rustix wraps none), so it waits for a measurement outside this
+      day's VM noise.
+  - **The other unixes:** the write-out is `fdatasync`, which makes the file durable alone, so the barrier adds
+    nothing.
 - **Measured** (2026-10-10; scratch A/B, not kept: 2,000 files of 4 KiB in a fresh directory, per batch size `n`;
   µs a file over three rounds, as ranges; `BENCHMARKS.md` has every round):
   - macOS APFS, this machine, load 13–16 from other sessions: a barrier a file 604–954; batched `n=16` 192–211,
@@ -11103,10 +11110,14 @@ Status: built 2026-10-10 for macOS. Linux keeps one `fdatasync` a file until its
     - `fdatasync` a file: 403–948 quiet, 648–795 beside a busy writer;
     - `syncfs` batched: `n=16` 108–146 quiet but 4,045–7,847 busy, with single barriers up to 3.7 s; `n=2000` 19–25
       quiet, 97–256 busy;
-    - concurrent `fdatasync`: 16 at once 255–631 quiet and 142–177 busy, against 756–1,666 busy one at a time.
+    - concurrent `fdatasync`: 16 at once 255–631 quiet and 142–177 busy, against 756–1,666 busy one at a time;
+      rerun in the engine's shape (threads started per barrier) on a much busier VM that evening, 446–1,846 against
+      2,670–7,003.
   - Through the engine (`land_bench flat`, interleaved with HEAD, 1,000 to 16,000 new files onto APFS, load
     24–37): 423–713 µs a file against 916–1,764, 1.5–4.2× faster, steady as the load rose while the per-file barrier
     was not. Over the simulated host the arms are within noise.
+  - Linux's barrier through the engine (`land_bench flat`, interleaved with `20b302aa`, ext4 in Docker's VM at load
+    35–39 for both arms): 965–1,618 µs a file against 3,426–11,091, 3.0–7.4× faster; 182–219 µs once the VM quieted.
   - The landing's percentile lane (600 files, one shard, interleaved with HEAD, load 27–29): the landing took
     0.86–1.93 s against 1.24–1.97 s, slice p999 3.7–11.5 ms against 8.4–21.0 ms, and the reads, provisions and
     leases served meanwhile waited 2–3× less at the median.
