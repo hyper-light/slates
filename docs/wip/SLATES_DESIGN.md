@@ -3879,6 +3879,17 @@ version.
 > refusal had been discarded. Regressions: `a_successor_refuses_its_unmaterialized_volume_as_retryable_not_homed_elsewhere`
 > (unit), and the fleet tests' successor-serves check, which failed 2 of 2 with the old answer and passes 6 of 6.
 
+> **Status (2026-10-11, a contentless volume materializes head-only).** `owned_unmaterialized` is a *transient*
+> window only if materialization eventually completes. It did not for a **contentless** volume (a scratch volume
+> created but never sealed — no content manifest): `materialize_pending` dropped every `manifest=None` volume
+> without building its db catalog entry, so a taken-over scratch volume stayed `owned_unmaterialized`/`Overloaded`
+> forever, and a forwarded read answered false `NotFound`. Now `materialize` builds a **head-only** entry from the
+> adopted head and catalog registers (no archive: `materialize_taken_over` takes `Option<&Archive>` and skips the
+> restore), identical to a fresh scratch `Create`. A 1024-volume takeover reproduction served both ends at ~24/33
+> periods (was: never served, 1024 dropped); the crash-at-every-step recovery oracle is 39/0. A small transient
+> false `NotFound` remains in the settle window before the successor processes the retirement (a pre-existing
+> ownership-propagation race, now visible — open). `docs/bugs/2026-10-11-taken-over-scratch-volumes-never-become-servable.md`.
+
 > **Owner location (2026-09-17).** A foreign node cannot reconstruct a historic copyset from
 > present membership. After its creator route stops being usable, it asks authenticated
 > home-region peers through a bounded read-only exchange. A peer claims itself only when its

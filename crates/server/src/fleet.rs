@@ -3170,15 +3170,17 @@ async fn materialize_pending(origin: u16, budget: CommitBudget) {
   })
   .unwrap_or_default();
   for (object, head) in pending {
-    let Some(manifest) = head.manifest else {
-      // A head naming no content (the volume was never sealed): nothing to serve beyond the head.
-      state::with_state(|s| s.pending_materializations.remove(&object));
-      continue;
-    };
-    let held =
-      state::with_state(|s| s.held_content.holds_manifest(object, &manifest)).unwrap_or(false);
-    if !held && !fetch_into_hold(object, &head, manifest, budget).await {
-      continue; // Not whole yet: what was fetched stays staged for the next period (AUD-29-55).
+    // A head that names content waits until this node holds that content; a contentless volume (a scratch
+    // volume never sealed) has nothing to fetch and materializes from its adopted head and catalog registers
+    // alone. Both then go to `materialize`, which builds the servable db entry. A head-only volume was dropped
+    // here unmaterialized before 2026-10-11, so a taken-over scratch volume stayed `owned_unmaterialized`
+    // forever (docs/bugs/2026-10-11-taken-over-scratch-volumes-never-become-servable.md).
+    if let Some(manifest) = head.manifest {
+      let held =
+        state::with_state(|s| s.held_content.holds_manifest(object, &manifest)).unwrap_or(false);
+      if !held && !fetch_into_hold(object, &head, manifest, budget).await {
+        continue; // Not whole yet: what was fetched stays staged for the next period (AUD-29-55).
+      }
     }
     materialize(origin, object, head).await;
   }
@@ -3554,16 +3556,19 @@ const GREEN_TAKEOVER_REFUSED: &str = "merge.takeover_refused";
 /// the head move there by value; on success the object is no longer pending, on a refusal (or a shard
 /// that does not answer this period) it is counted and stays pending.
 async fn materialize(origin: u16, object: ObjectId, head: HeadValue) {
-  let Some(manifest) = head.manifest else {
-    return;
-  };
   let id = DbVolumeId { bytes: object.0 };
   let partition = verbs::owner_of(slates_ipc::protocol::VolumeId { bytes: object.0 });
   let taken = state::with_state(|s| {
-    let archive = s
-      .held_content
-      .archive_of(s.store.content.arena(), object, &manifest)
-      .ok_or(MATERIALIZE_WAITS_CONTENT)?;
+    // A contentless volume (never sealed) has no manifest and no archive: it materializes from its adopted
+    // head and catalog registers alone. A volume with content waits until this node holds that content.
+    let archive = match &head.manifest {
+      Some(manifest) => Some(
+        s.held_content
+          .archive_of(s.store.content.arena(), object, manifest)
+          .ok_or(MATERIALIZE_WAITS_CONTENT)?,
+      ),
+      None => None,
+    };
     // The takeover's placement of the head (its sequence, promotion epoch and acknowledging holders),
     // recorded here where the promotion ran; it moves to the owner shard with the volume.
     let placed = s
@@ -3642,12 +3647,19 @@ async fn materialize(origin: u16, object: ObjectId, head: HeadValue) {
         }
         adopted
       });
-      let Some(archive) = opened_archive(s, id, &catalog.owner, adopted, archive) else {
-        s.count(ENVELOPE_UNOPENED, 1);
-        return Err(ENVELOPE_UNOPENED);
+      // Open a content archive (a sealed one needs the lineage key); a contentless volume has none to open.
+      let opened = match archive {
+        Some(archive) => match opened_archive(s, id, &catalog.owner, adopted, archive) {
+          Some(opened) => Some(opened),
+          None => {
+            s.count(ENVELOPE_UNOPENED, 1);
+            return Err(ENVELOPE_UNOPENED);
+          }
+        },
+        None => None,
       };
       past_the_pressure_hold(s, |s| {
-        verbs::materialize_taken_over(s, id, &taken, region, &archive)
+        verbs::materialize_taken_over(s, id, &taken, region, opened.as_ref())
       })
       .map_err(|refusal| materialize_refusal_counter(&refusal))?;
       // The owner shard now owns the head's and the catalog's placements — its record plane writes the

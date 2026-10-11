@@ -7048,6 +7048,313 @@ fn poll_all_hold(survivors: &[&Daemon], object: ObjectId) -> bool {
   })
 }
 
+/// How many highest-id objects the takeover measurement watches as the tail of the paged round: `list_page`
+/// pages a retired host's objects in object-id order, so the highest ids are recovered last, and when they are
+/// placed on their successors the round has drained. A handful covers both survivors' shares.
+const TAKEOVER_TAIL_SENTINELS: usize = 4;
+
+/// Measurement (not a gate): **does takeover recovery latency scale with the retired host's object count?** The
+/// condition-11 question — `crates/server/src/takeover.rs` pages a retired host's objects at a *fixed*
+/// `page_budget()` (~55 objects, the initial receive window, in `list_page`) and advances **one page per member
+/// per coordinator period** (`ask_pages` sends one; `drive_host_takeover` runs once per `adopt_and_serve`
+/// period), which *predicts* O(N) periods to recover an N-object host. Ada's LAW says confirm it end-to-end, not
+/// from the code, and rule out a mitigation (parallel successors, pipelining) that reading alone cannot. This
+/// provisions `volumes` scratch volumes on A (owner = creator = A), waits until both survivors hold the tail of
+/// the heads, kills A, waits for the retirement, then counts the fleet-coordinator **periods**
+/// ([`Daemon::fleet_progress`], load-independent — robust under shared-machine load) each survivor runs until
+/// the tail is recovered. Periods that climb with the object count confirm the tail; flat periods refute it.
+/// Run: `cargo test --release -p slates-server --test fleet takeover_periods_scale -- --ignored --nocapture`.
+#[test]
+#[ignore = "measurement, not a gate; prints periods-to-recover vs the retired host's object count"]
+fn takeover_periods_scale_with_the_retired_hosts_object_count() {
+  for volumes in [1024usize, 4096, 16384] {
+    let _serial = serialize_fleet_tests();
+    let names = ["a", "b", "c"];
+    let n = names.len();
+    let nodes: Vec<(MachineProfile, HostId, Identity)> =
+      names.iter().map(|name| fleet_node(name)).collect();
+    let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
+    let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+      nodes.iter().map(|(_, _, id)| id.certificate()).collect();
+    let pid = std::process::id();
+    // start_mesh names node A's instance `fleet3-{host}-{pid}` (from its pre-start routing-seed host); the
+    // client must dial that exact name.
+    let instance_a = format!("fleet3-{}-{pid}", hosts[0].0);
+    let (_serve_lease, serve) = mesh_serve_ports(n);
+    let mut daemons = start_mesh(nodes, &hosts, &certs, &serve);
+    let hosts: Vec<HostId> = daemons
+      .iter()
+      .map(|daemon| daemon.member_identity().unwrap())
+      .collect();
+    assert_fleet_forms(&daemons, &hosts, &names);
+
+    // Provision scratch volumes on A — each volume's object is owned by its creator (A), so A's death leaves
+    // exactly these objects for the survivors to take over. Stop early if the daemon refuses one (a capacity
+    // bound); the measurement uses whatever landed.
+    let mut client = Client::connect(&instance_a);
+    let mut objects = Vec::with_capacity(volumes);
+    for index in 0..volumes {
+      match client.call(&scratch(&format!("v{index}"))) {
+        ReplyBody::Created { id } => objects.push(ObjectId(id.bytes)),
+        other => {
+          eprintln!("takeover periods: provisioning stopped at {index}/{volumes}: {other:?}");
+          break;
+        }
+      }
+    }
+    if objects.len() < TAKEOVER_TAIL_SENTINELS {
+      for daemon in daemons {
+        daemon.stop();
+      }
+      continue;
+    }
+    // The tail of the paged round: the highest-id objects, recovered last in object-id order.
+    objects.sort_by_key(|object| object.0);
+    let sentinels: Vec<ObjectId> = objects
+      .iter()
+      .rev()
+      .take(TAKEOVER_TAIL_SENTINELS)
+      .copied()
+      .collect();
+
+    // Every sentinel must reach both survivors before A dies, so the f + 1 = 2 promise quorum (successor plus
+    // the other holder) is available for each.
+    let survivors_hold = {
+      let survivors: Vec<&Daemon> = daemons[1..].iter().collect();
+      poll_until(&survivors, SERVE_DEADLINE, || {
+        all_hold(sentinels.iter().flat_map(|object| {
+          [
+            daemons[1].fleet_holder_head(*object).map(|h| h.is_some()),
+            daemons[2].fleet_holder_head(*object).map(|h| h.is_some()),
+          ]
+        }))
+      })
+    };
+    assert!(
+      survivors_hold,
+      "both survivors hold the tail of A's heads before A dies ({volumes} volumes)"
+    );
+
+    // A dies; the survivors retire it.
+    let dead = hosts[0];
+    let owner = daemons.remove(0);
+    owner.stop();
+    assert!(
+      poll_survivors_retire(&daemons, dead),
+      "the survivors retired A ({volumes} volumes)"
+    );
+
+    // Count the paging periods from AFTER the retirement commits, isolating the paged recovery round from the
+    // (object-count-independent) death-detection and retirement-commit periods that precede it.
+    let survivors: Vec<&Daemon> = daemons.iter().collect();
+    let start = each_progress(&survivors);
+    let recovered = poll_until(&survivors, SERVE_DEADLINE, || {
+      all_hold(sentinels.iter().map(|object| {
+        daemons[0]
+          .fleet_head_placed(*object)
+          .and_then(|a| daemons[1].fleet_head_placed(*object).map(|b| a || b))
+      }))
+    });
+    let end = each_progress(&survivors);
+    let periods: Vec<u64> = end
+      .iter()
+      .zip(&start)
+      .map(|(e, s)| e.saturating_sub(*s))
+      .collect();
+    assert!(
+      recovered,
+      "the tail of A's objects was recovered ({volumes} volumes)"
+    );
+
+    let created = objects.len();
+    for daemon in daemons {
+      daemon.stop();
+    }
+    eprintln!(
+      "takeover periods: {created} volumes ({} register objects) on A | paging periods per survivor {periods:?}",
+      created * 2
+    );
+  }
+}
+
+/// Regression (§4.8 "Promotion and takeover"; `docs/bugs/2026-10-11-taken-over-scratch-volumes-never-become-servable.md`):
+/// **a taken-over contentless (scratch) volume must become servable.** Provisions many scratch volumes on A, kills
+/// A, then from a client on the successor reads a low-id and a high-id object (first and last in `list_page`'s
+/// object-id order) with one-period backoff until each is served, classifying every reply. Before the fix,
+/// `materialize_pending` dropped every `manifest=None` volume without building its db catalog entry, so the owner
+/// answered `Overloaded` forever (`owned_unmaterialized`) and a forwarded read answered false `NotFound`; the
+/// counters (`fleet.materialize.head_only_dropped` = the volume count, `route_dropped.refused` ≈ `NotFound`) pinned
+/// it. It also reports a residual transient `NotFound` in the early settle window (Bug 1, open). Kept `#[ignore]`
+/// because fleet tests must run alone and this one provisions 1024 volumes (~70 s); run it with
+/// `cargo test --release -p slates-server --test fleet a_taken_over_scratch_volume -- --ignored --nocapture`.
+#[test]
+#[ignore = "heavy fleet regression (1024-volume takeover); run alone"]
+// One end-to-end takeover scenario (setup, provision, kill, read-until-served, diagnose): splitting the body would
+// scatter the scenario, so the cognitive-complexity threshold is allowed for this test.
+#[allow(clippy::cognitive_complexity)]
+fn a_taken_over_scratch_volume_becomes_servable() {
+  const VOLUMES: usize = 1024;
+  let _serial = serialize_fleet_tests();
+  let names = ["a", "b", "c"];
+  let n = names.len();
+  let nodes: Vec<(MachineProfile, HostId, Identity)> =
+    names.iter().map(|name| fleet_node(name)).collect();
+  let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
+  let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+    nodes.iter().map(|(_, _, id)| id.certificate()).collect();
+  let pid = std::process::id();
+  let instance_a = format!("fleet3-{}-{pid}", hosts[0].0);
+  let (_serve_lease, serve) = mesh_serve_ports(n);
+  let mut daemons = start_mesh(nodes, &hosts, &certs, &serve);
+  let hosts: Vec<HostId> = daemons
+    .iter()
+    .map(|daemon| daemon.member_identity().unwrap())
+    .collect();
+  assert_fleet_forms(&daemons, &hosts, &names);
+
+  let mut client = Client::connect(&instance_a);
+  let mut created: Vec<(VolumeId, ObjectId)> = Vec::with_capacity(VOLUMES);
+  for index in 0..VOLUMES {
+    match client.call(&scratch(&format!("v{index}"))) {
+      ReplyBody::Created { id } => created.push((id, ObjectId(id.bytes))),
+      other => {
+        for daemon in daemons {
+          daemon.stop();
+        }
+        panic!("volume {index} of {VOLUMES} not created: {other:?}");
+      }
+    }
+  }
+  // The object recovered LAST: the highest object id (list_page pages in id order).
+  created.sort_by_key(|created| created.1.0);
+  let (sentinel_volume, sentinel_object) = *created.last().expect("at least one volume");
+
+  // Both survivors must hold the sentinel before A dies, so its takeover can promote.
+  let survivors_hold = {
+    let survivors: Vec<&Daemon> = daemons[1..].iter().collect();
+    poll_until(&survivors, SERVE_DEADLINE, || {
+      all_hold([
+        daemons[1]
+          .fleet_holder_head(sentinel_object)
+          .map(|h| h.is_some()),
+        daemons[2]
+          .fleet_holder_head(sentinel_object)
+          .map(|h| h.is_some()),
+      ])
+    })
+  };
+  assert!(
+    survivors_hold,
+    "both survivors hold the sentinel before A dies"
+  );
+
+  let dead = hosts[0];
+  let successor =
+    rendezvous_first(&[hosts[1], hosts[2]], sentinel_object).expect("a survivor succeeds");
+  // Index into the post-remove daemons ([B, C]) and the successor's instance name (pre-remove [A, B, C]).
+  let successor_index = if successor == hosts[1] { 0 } else { 1 };
+  let successor_instance = daemons[if successor == hosts[1] { 1 } else { 2 }]
+    .instance()
+    .to_owned();
+
+  let owner = daemons.remove(0);
+  owner.stop();
+  assert!(
+    poll_survivors_retire(&daemons, dead),
+    "the survivors retired A"
+  );
+
+  // Read BOTH a low-id object (first in object-id order, so first paged) and the high-id sentinel (last), with
+  // one-period backoff, until each is served or the deadline. A low that serves fast while the high lags is a
+  // last-in-queue latency; neither serving is a universal scratch-volume failure. Backoff (not hammering) is
+  // essential: a no-backoff loop saturates the owner shard (observed 2026-10-11: 1.3M `Overloaded`, never
+  // recovered). The reader sits on the sentinel's successor; the low object forwards to its own owner.
+  let (low_volume, low_object) = *created.first().expect("at least one volume");
+  let mut reader = Client::connect(&successor_instance);
+  let start_period = daemons[successor_index].fleet_progress();
+  let mut not_found = 0u64;
+  let mut refusals: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+  let mut served_low: Option<u64> = None;
+  let mut served_high: Option<u64> = None;
+  let deadline = Instant::now() + SERVE_DEADLINE;
+  while Instant::now() < deadline && (served_low.is_none() || served_high.is_none()) {
+    for (tag, volume, slot) in [
+      ("low", low_volume, &mut served_low),
+      ("high", sentinel_volume, &mut served_high),
+    ] {
+      if slot.is_some() {
+        continue;
+      }
+      match reader.call(&RequestBody::Status { volume }) {
+        ReplyBody::Status { .. } => {
+          *slot = Some(
+            daemons[successor_index]
+              .fleet_progress()
+              .saturating_sub(start_period),
+          );
+        }
+        ReplyBody::Refused {
+          refusal: Refusal::NotFound,
+        } => not_found = not_found.saturating_add(1),
+        ReplyBody::Refused { refusal } => {
+          *refusals.entry(format!("{tag}:{refusal:?}")).or_default() += 1;
+        }
+        other => {
+          *refusals.entry(format!("{tag}:{other:?}")).or_default() += 1;
+        }
+      }
+    }
+    #[allow(clippy::disallowed_methods)]
+    // a test may sleep (the lint's stated exception): a well-behaved client backs off one period between retries
+    std::thread::sleep(Duration::from_millis(HEARTBEAT_NS / 1_000_000));
+  }
+  let window = daemons[successor_index]
+    .fleet_progress()
+    .saturating_sub(start_period);
+
+  // For any object still not served, dump where it is stuck: is its head and catalog register adopted (placed)
+  // on each survivor, and which materialize step is each survivor still waiting on?
+  let mut diagnosis = String::new();
+  for (tag, object, served) in [
+    ("low", low_object, served_low),
+    ("high", sentinel_object, served_high),
+  ] {
+    if served.is_some() {
+      continue;
+    }
+    for (index, daemon) in daemons.iter().enumerate() {
+      let head = daemon.fleet_head_placed(object).ok();
+      let catalog = daemon.fleet_head_placed(object.catalog()).ok();
+      let counters = daemon.fleet_refusals().ok().map(|c| takeover_counters(&c));
+      diagnosis.push_str(&format!(
+        "\n  {tag} stuck on survivor{index}: head_placed={head:?} catalog_placed={catalog:?} counters={counters:?}"
+      ));
+    }
+  }
+  for daemon in daemons {
+    daemon.stop();
+  }
+  eprintln!(
+    "recovering-object read: {VOLUMES} volumes | NotFound replies: {not_found} | \
+     served low {served_low:?} / high {served_high:?} periods (window {window}) | refusals {refusals:?}{diagnosis}"
+  );
+  // The invariant this gate asserts (the fix for Bug 2,
+  // docs/bugs/2026-10-11-taken-over-scratch-volumes-never-become-servable.md): a taken-over scratch (contentless)
+  // volume must become servable. Before the fix, every scratch volume was dropped from materialization, so the
+  // owner answered `Overloaded` forever and the volume was a lost object; now both ends serve (~24/33 periods).
+  assert!(
+    served_low.is_some() && served_high.is_some(),
+    "taken-over scratch volumes must become servable (low {served_low:?}, high {served_high:?})"
+  );
+  // `not_found` is reported, not yet asserted zero: a small, transient false `NotFound` remains in the early
+  // takeover window (before the successor processes the retirement — `resolve_held_objects` — and so cannot yet
+  // answer "mine, retrying"). That is Bug 1 in the bug doc, a pre-existing ownership-propagation race revealed by
+  // this fix; the `not_found == 0` assertion lands with its fix.
+  if not_found > 0 {
+    eprintln!("note: {not_found} transient NotFound replies in the settle window (Bug 1, open)");
+  }
+}
+
 /// AC (§4.8 "Promotion and takeover", one batched phase-one round across the neighbourhood): **five** daemons
 /// form one `f = 2` fleet; a volume is provisioned on the node that then dies, and the survivor rendezvous
 /// ranks first takes over its head by promoting over **several** surviving holders — the `f + 1 = 3` promise

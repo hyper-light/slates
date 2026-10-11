@@ -7162,7 +7162,7 @@ pub(crate) fn materialize_taken_over(
   id: DbVolumeId,
   taken: &TakenOver<'_>,
   region: Vec<u64>,
-  archive: &slates_archive::Archive,
+  archive: Option<&slates_archive::Archive>,
 ) -> Result<(), Box<ReplyBody>> {
   let (head, catalog, sequence) = (taken.head, taken.catalog, taken.sequence);
   if state.by_id.contains_key(&id) {
@@ -7185,22 +7185,30 @@ pub(crate) fn materialize_taken_over(
     SizeClass::Dynamic { max } => max,
   };
   // A shard that claims its arena lazily makes room for what the restore needs first (A-98); an archive that does not
-  // plan is refused by the restore below, as before.
-  if let Ok(needed) = slates_archive::restore_needed(archive) {
-    state.store.make_room(needed.min(volume_cap));
-  }
-  let restore_budget = volume_cap.min(state.store.budget.admittable());
-  // A refusal names what the shard could admit now, the pool's free extents included: the arena claims nothing for a
-  // restore the pool cannot cover (A-98), so the budget alone names only what the shard already holds.
-  let room = volume_cap.min(state.store.admittable());
-  let restored = slates_archive::restore(archive, restore_budget).map_err(|e| match e {
-    slates_archive::ArchiveError::OverBudget { .. } => {
-      refused(Refusal::BudgetExceeded { available: room })
+  // plan is refused by the restore below, as before. A contentless volume (a scratch volume never sealed, taken
+  // over) has no archive: it restores nothing and serves its empty tree from its adopted head and catalog registers.
+  let restored = match archive {
+    Some(archive) => {
+      if let Ok(needed) = slates_archive::restore_needed(archive) {
+        state.store.make_room(needed.min(volume_cap));
+      }
+      let restore_budget = volume_cap.min(state.store.budget.admittable());
+      // A refusal names what the shard could admit now, the pool's free extents included: the arena claims nothing
+      // for a restore the pool cannot cover (A-98), so the budget alone names only what the shard already holds.
+      let room = volume_cap.min(state.store.admittable());
+      Some(
+        slates_archive::restore(archive, restore_budget).map_err(|e| match e {
+          slates_archive::ArchiveError::OverBudget { .. } => {
+            refused(Refusal::BudgetExceeded { available: room })
+          }
+          other => refused(Refusal::BadRequest {
+            reason: format!("taken-over content archive: {other}"),
+          }),
+        })?,
+      )
     }
-    other => refused(Refusal::BadRequest {
-      reason: format!("taken-over content archive: {other}"),
-    }),
-  })?;
+    None => None,
+  };
   let reservation = match size {
     SizeClass::Bounded { limit } => match state.store.reserve(limit) {
       Ok(r) => Some(r),
@@ -7296,7 +7304,9 @@ pub(crate) fn materialize_taken_over(
       refusal_of_vfs(&e),
     )));
   }
-  if let Err(e) = populate_restored(&mut state.store, &mut volume, &restored) {
+  if let Some(restored) = &restored
+    && let Err(e) = populate_restored(&mut state.store, &mut volume, restored)
+  {
     let discarded = volume.discard_partial(&mut state.store);
     count_kept(state, VOLUME_DISCARD_REFUSED, discarded);
     return Err(Box::new(give_back(
@@ -10644,7 +10654,7 @@ mod tests {
       catalog_sequence: 0,
       sequence: 1,
     };
-    super::materialize_taken_over(state, id, &taken, Vec::new(), archive)
+    super::materialize_taken_over(state, id, &taken, Vec::new(), Some(archive))
   }
 
   /// AUD-29-17: do: take over a volume whose catalog carries a consumer's grant, and one whose catalog
