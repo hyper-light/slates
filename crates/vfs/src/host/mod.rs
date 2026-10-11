@@ -174,7 +174,7 @@ pub trait LandFs: HostFs {
   /// The durability barrier of a batch of temporaries, each written out ([`LandFs::write_out`]) since its last change:
   /// when it returns, every one is durable ahead of any write that follows, so a placement after it never shows a name
   /// whose bytes a power loss could take (macOS one `F_BARRIERFSYNC` per device among them, ordering every earlier
-  /// write-out; Linux every file's `fdatasync` in flight at once, merged by journal group commit; nothing more where
+  /// write-out; Linux the files' `fdatasync`s on ⌈√n⌉ streams, merged by journal group commit; nothing more where
   /// the write-out made each file durable).
   fn barrier(&mut self, files: &[HostFile]) -> Result<(), HostError>;
   /// Sets the file's mode.

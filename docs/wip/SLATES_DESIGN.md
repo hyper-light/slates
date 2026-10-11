@@ -5217,8 +5217,8 @@ entry either old or new, never torn).
    a slice ends. The barrier per platform is step 8's. No disk is probed at boot.
 8. *Sync.* A file's data is durable before it is placed: its write-out, then its batch's barrier
    (A-130; macOS `fsync` each, then one `F_BARRIERFSYNC` per device, the device's barrier ordering every
-   earlier write-out; Linux every file's `fdatasync` in flight at once, so journal group commit merges
-   them into few commits and flushes). After the last entry, one directory sync per touched directory in
+   earlier write-out; Linux the files' `fdatasync`s on ⌈√n⌉ streams for n files, so journal group commit
+   merges the syncs in flight into few commits and flushes). After the last entry, one directory sync per touched directory in
    parallel (Linux `fsync` on the directory descriptors — never `syncfs`, which also flushes every other
    writer's dirty data on the filesystem: beside one busy writer a `syncfs` took up to 3.7 s, A-130;
    macOS one `F_FULLFSYNC` after the barriers when the grant asked for media durability, otherwise the
@@ -5310,6 +5310,7 @@ with every finished entry listed.
 | Constant | Formula | Anchors |
 |---|---|---|
 | Files per landing batch (A-130) | at most one copy window of pages, each file counted as at least one page (`chunk_bytes / page`, 16) | the content store's page and window |
+| Barrier streams (Linux, A-130) | ⌈√n⌉ for a batch of n files: k streams cost about a·k (threads started and joined) plus b·n/k (each stream's chain of syncs), least at √(b·n/a), with a ≈ b measured | the batch's file count |
 | Landing pool size (macOS thread pool) | the batch bound, bounded by measured free cores | the batch rule; the profile's core classes |
 | Directory sync strategy (Linux) | per-directory `fsync`; never `syncfs`, which flushes every writer's dirty data (measured, A-130) | — |
 | Racy window | filesystem timestamp granularity (cited table by filesystem type) + measured clock resolution | `statfs` type; `clock_getres` |
@@ -5427,8 +5428,10 @@ stays in the overlay.
 > - **The flow:** each file is staged (written, its mode and mtime set, written out); each batch of at most one copy
 >   window of pages takes one barrier; then its files are placed.
 > - **macOS:** one `F_BARRIERFSYNC` per device a batch, after each file's `fsync`, as fcntl(2) prescribes.
-> - **Linux:** the batch's `fdatasync`s in flight at once, so journal group commit merges them: 3.0–7.4× faster
->   through the engine on a busy VM. `syncfs` is measured and rejected.
+> - **Linux:** the batch's `fdatasync`s on ⌈√n⌉ streams (four for a full batch), so journal group commit merges those in
+>   flight: 3.0–7.4× faster through the engine on a busy VM than one sync a file. Sixteen threads at once spent a
+>   CPU-capped container's quota in a burst (43.5–188.8 s throttled over a bench at one CPU, against 0.2–0.4 s for four
+>   streams). `syncfs` is measured and rejected.
 > - The ramp is gone; the report carries `barriers`. Nothing is placed after the grant or lease ends, and an abandoned
 >   run closes its temporaries.
 > - **Held by the oracle:** the simulated host now fails a placement of an undurable temporary, and an advanced entry
@@ -11099,11 +11102,22 @@ the seam's docs, this entry, GAPS, BENCHMARKS).
     on macOS for repos stored on HFS+ or APFS filesystems and on Windows for repos stored on NTFS or ReFS filesystems".
     It claims nothing for Linux [C: git-config(1), git 2.50.1].
   - **Linux:** the write-out starts the file's writeback (`sync_file_range(SYNC_FILE_RANGE_WRITE)`, which neither waits
-    nor writes metadata), and the barrier issues every file's `fdatasync` at once, from one scoped thread a file but
-    the caller's, and joins them all. Journal group commit merges them into few commits and flushes:
-    ext4's jbd2 joins every sync waiting on the running transaction to its commit. Each file is durable when its own
-    call returns, exactly as alone, and the batch is refused when any is. A thread the system refuses to start leaves
-    its file to the caller.
+    nor writes metadata). The barrier spreads the batch's `fdatasync`s over ⌈√n⌉ streams for n files: the caller
+    takes one, a scoped thread each of the others, and each syncs its share in turn, every thread joined. Journal group
+    commit merges the syncs in flight into few commits and flushes: ext4's jbd2 joins every sync waiting on the running
+    transaction to its commit. Each file is durable when its own call returns, exactly as alone, and the batch is
+    refused when any is. A thread the system refuses to start leaves its share to the caller.
+    - **The count, derived:** k streams cost about a·k to start and join their threads, plus b·n/k for each stream's
+      serial chain of syncs. That is least at k = √(b·n/a), and the measurement puts a and b about equal.
+    - **Amended the same evening; until then, one thread a file.** Sixteen threads started at once for a full batch
+      spent a CPU-capped container's quota in a burst, and the cgroup was throttled until the next period: 43.5–188.8
+      s throttled over a bench at one CPU, against 0.2–0.4 s for four streams. Four streams were 1.9–24× faster there at
+      every size but one outlier, faster quiet at every size but one, and 3.7 s against no throttling at two CPUs.
+    - **Contended I/O, the other way:** in one round with every CPU and a VM contended by other sessions' containers,
+      four streams were 2.1–2.8× slower at 8,000 and 16,000 files. Sixteen syncs in flight merge into fewer commits when
+      commits are slow and CPU is spare.
+    - **Why √n is still chosen:** the burst throttles every thread in the cgroup — a daemon's shards with the landing —
+      while the extra commits slow the landing alone.
     - Linux's only call that covers a batch, `syncfs`, flushes every writer's dirty data on the filesystem. Measured
       beside one busy writer, it is the worst choice, so it is rejected for files and for directories.
     - Starting each file's writeback at write time won all ten rounds of a rerun on a quieter VM, the arms' order
@@ -11133,6 +11147,9 @@ the seam's docs, this entry, GAPS, BENCHMARKS).
     leases served meanwhile waited 2–3× less at the median.
 - **Rejected:**
   - `syncfs` as Linux's barrier and its directory sync (the busy rows above);
+  - one thread a file at Linux's barrier (the CPU-quota burst, above);
+  - an online ramp over Linux's stream count: a barrier's time varies about 6× at one count on a shared disk, so two
+    samples mismeasured the noise, and the ramp settled on one stream in 9,620 of 9,690 barriers;
   - the ramp as the batch's controller (its latency rule, above);
   - a batch sized by a share of the process's descriptors: 64 files would take another 15–20% on macOS, but the daemon
     accounts no descriptor share yet. Recorded for when it does.

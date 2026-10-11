@@ -4878,3 +4878,63 @@ Writeback first won every round: 1.5–2.5× quiet and 1.6–2.6× beside the bu
   change at the higher load.
 - **Cost:** one `unsafe` libc call (rustix wraps no `sync_file_range`); slates-land's unsafe budget went from 3 to 4.
 - **Since the morning on Linux:** one `fdatasync` a file cost 573–913 µs on a quiet VM; the head runs 71–127 µs.
+
+### Landed: Linux's batch barrier on ⌈√n⌉ streams, not one thread a file (A-130; 2026-10-10)
+
+**Commands:**
+- **Engine A/B:** `land_bench flat`, 1,000 to 16,000 new files. Arm A was HEAD, with every file's `fdatasync` on a
+  thread of its own (sixteen threads a full batch). Arm B was the change: ⌈√n⌉ streams, four a full batch, each syncing
+  its share in turn. Each arm was built in its own target directory.
+- **Order:** rounds interleaved, the arms' order alternating round by round.
+- **CPU throttling:** the container's `cpu.stat` `throttled_usec` was read before and after each arm. It sums every
+  CPU's throttled time, so it can exceed the wall time.
+- **Where:** ext4 in Docker's VM, three containers:
+  - `--cpus=1 --memory=256m`, no swap;
+  - `--cpus=2 --memory=256m`, no swap;
+  - all of the VM's CPUs and 3 GB.
+
+**µs a new file:**
+
+| container | round | arm | 1,000 | 2,000 | 4,000 | 8,000 | 16,000 | throttled |
+|---|---|---|---|---|---|---|---|---|
+| 1 CPU, 256 MB | 1 | sixteen threads | 485 | 430 | 296 | 397 | 289 | 188.8 s |
+| 1 CPU, 256 MB | 1 | √n streams | 172 | 105 | 109 | 114 | 150 | 0.4 s |
+| 1 CPU, 256 MB | 2 | √n streams | 97 | 99 | 95 | 108 | 1,075 | 0.2 s |
+| 1 CPU, 256 MB | 2 | sixteen threads | 1,987 | 2,414 | 395 | 778 | 357 | 79.8 s |
+| 1 CPU, 256 MB | 3 | sixteen threads | 2,247 | 2,029 | 2,100 | 1,392 | 694 | 43.5 s |
+| 1 CPU, 256 MB | 3 | √n streams | 207 | 168 | 114 | 112 | 105 | 0.3 s |
+| 2 CPUs, 256 MB | 1 | sixteen threads | 772 | 786 | 771 | 1,242 | 178 | 3.7 s |
+| 2 CPUs, 256 MB | 1 | √n streams | 329 | 1,337 | 2,086 | 155 | 136 | 0 |
+| 2 CPUs, 256 MB | 2 | √n streams | 548 | 847 | 175 | 180 | 246 | 0 |
+| all, 3 GB | 1 | sixteen threads | 129 | 163 | 99 | 99 | 107 | 0 |
+| all, 3 GB | 1 | √n streams | 86 | 83 | 83 | 86 | 81 | 0 |
+| all, 3 GB | 2 | √n streams | 118 | 108 | 93 | 117 | 103 | 0 |
+| all, 3 GB | 2 | sixteen threads | 109 | 164 | 340 | 139 | 123 | 0 |
+| all, 3 GB | 3 | sixteen threads | 1,393 | 1,148 | 617 | 914 | 679 | 0 |
+| all, 3 GB | 3 | √n streams | 746 | 498 | 653 | 1,903 | 1,921 | 0 |
+
+**What it shows:**
+- **At one CPU, the decision.**
+  - Sixteen threads started at once spend the container's CPU quota in a burst. The cgroup is then throttled until the
+    next period: 43.5–188.8 s of throttled time over a bench, against 0.2–0.4 s for four streams.
+  - Four streams were 1.9–24× faster at every size but one. The exception is a 16,000-file outlier (1,075 µs) of the
+    kind seen at 256 MB before; the hypothesis there, unshown, is the cgroup's dirty page cache.
+  - The throttling falls on everything in the cgroup, so it would stall every shard of a daemon, not only the landing.
+- **At two CPUs:** throttled 3.7 s against none. The sizes are mixed: four streams were faster at 1,000, 8,000 and
+  16,000 files, and slower at 2,000 and 4,000. Round 2's sixteen-thread arm was lost when Docker Desktop restarted, which
+  also killed the container.
+- **With every CPU:**
+  - Quiet (rounds 1 and 2): four streams were 1.15–3.7× faster at every size but one, 1,000 files in round 2 (118
+    against 109).
+  - Round 3 ran while the VM was contended by other sessions' containers, and both arms slowed 5–20×. Four streams were
+    1.9–2.3× faster at 1,000 and 2,000 files, about even at 4,000 (653 against 617), and **2.1–2.8× slower at 8,000
+    and 16,000**.
+  - With CPU to spare and slow commits, sixteen syncs in flight merge into fewer journal commits than four streams of
+    four.
+- **No count wins everywhere** under the cost model k·a + (n/k)·b:
+  - CPU contention raises a, the cost of starting a thread, and favours fewer streams.
+  - I/O contention raises b, a round of commits, and favours more.
+  - ⌈√n⌉ is the balance where the two are equal. It is chosen because the CPU burst throttles the whole cgroup, while
+    the extra commits slow only the landing.
+- **Open, to measure:** threads kept for the landing rather than started per barrier would cut a toward zero. Every
+  file's sync could then be in flight with no burst, which might win in all three containers.

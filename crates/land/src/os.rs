@@ -7,7 +7,7 @@
 //! the one root path with `O_NOFOLLOW` and hands out handles); no verb takes a path string.
 //! Linux: `O_TMPFILE` temporaries linked by `linkat` through `/proc/self/fd`, each file's writeback
 //! started as it is written out (`sync_file_range`) and a batch's barrier as its files' `fdatasync`s
-//! all in flight at once (A-130: journal group commit merges them into few commits and flushes),
+//! on ⌈√n⌉ streams (A-130: journal group commit merges those in flight into few commits and flushes),
 //! `renameat2(RENAME_EXCHANGE)`, `fsync` on directories. macOS: hidden-name
 //! temporaries (`O_CREAT|O_EXCL`), `fsync` as each file's write-out and one `fcntl(F_BARRIERFSYNC)` per
 //! device as a batch's barrier, `renameatx_np(RENAME_SWAP)`, `fcntl(F_FULLFSYNC)` on the target as the
@@ -338,43 +338,32 @@ impl OsLand {
     Ok(())
   }
 
-  /// The batch barrier on Linux: every file's `fdatasync` in flight at once, from one scoped thread a file but the
-  /// caller's, so the journal's group commit (ext4's jbd2 joins every sync waiting on a commit to it; XFS forces its
-  /// log once for all) merges them into few commits and device flushes instead of one each. Each file is durable when
-  /// its own call returns, exactly as alone; the batch is refused when any file's is, and every thread is joined first.
-  /// A thread the system refuses to start leaves its file to the caller, in turn. Measured (2026-10-10,
-  /// `BENCHMARKS.md`): 16 at once against one at a time, 446–1,122 µs a file against 2,670–4,142 beside a busy writer.
+  /// The batch barrier on Linux: the batch's `fdatasync`s spread over ⌈√n⌉ streams for n files, the caller and a
+  /// scoped thread per further stream, each syncing its share in turn, every thread joined. The journal's group commit
+  /// merges the syncs in flight together (ext4's jbd2 joins every sync waiting on the running transaction to its
+  /// commit); each file is durable when its own call returns, exactly as alone, and the batch is refused when any is. A
+  /// thread the system refuses to start leaves its share to the caller.
+  ///
+  /// Derived: k streams cost about a·k for their threads' start and join and b·n/k for each stream's serial chain of
+  /// syncs, least at k = √(b·n/a). The measurement (2026-10-10, `BENCHMARKS.md`) puts a and b about equal: for 16-file
+  /// batches, four streams beat two and sixteen at 1, 2, 4 and 18 CPUs, quiet and beside a busy writer, while sixteen
+  /// threads at once stalled a 1-CPU container 31–43 ms a barrier and spent 27–37 s of a bench throttled by its CPU
+  /// quota. An online ramp over the count was tried the same day and rejected: a barrier's time varies about 6× at one
+  /// count on a shared disk, so two samples mismeasured the noise and the ramp settled on one stream in 9,620 of 9,690
+  /// barriers.
   #[cfg(target_os = "linux")]
   fn order_written_out(&self, files: &[HostFile]) -> Result<(), HostError> {
     let fds = files
       .iter()
       .map(|file| self.file(*file))
       .collect::<Result<Vec<_>, _>>()?;
-    let Some((first, rest)) = fds.split_first() else {
-      return Ok(());
-    };
-    std::thread::scope(|scope| {
-      let mut started = Vec::with_capacity(rest.len());
-      let mut refused = Vec::new();
-      for fd in rest.iter().copied() {
-        match std::thread::Builder::new().spawn_scoped(scope, move || rustix::fs::fdatasync(fd)) {
-          Ok(thread) => started.push(thread),
-          Err(_) => refused.push(fd),
-        }
-      }
-      let mut synced = rustix::fs::fdatasync(*first).map_err(refusal);
-      for fd in refused {
-        synced = synced.and(rustix::fs::fdatasync(fd).map_err(refusal));
-      }
-      for thread in started {
-        let joined = thread.join().map_or(
-          Err(HostError::Unavailable(rustix::io::Errno::IO.raw_os_error())),
-          |own| own.map_err(refusal),
-        );
-        synced = synced.and(joined);
-      }
-      synced
-    })
+    sync_on_streams(
+      &fds,
+      fds
+        .len()
+        .isqrt()
+        .saturating_add(usize::from(!is_square(fds.len()))),
+    )
   }
 
   /// The batch barrier on the other unixes: each file's write-out (`fdatasync`) already made it durable, so nothing
@@ -523,6 +512,54 @@ fn write_out_file(fd: BorrowedFd<'_>) -> Result<(), HostError> {
       std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
     )))
   }
+}
+
+/// Whether `n` is a perfect square (so ⌈√n⌉ is `n.isqrt()` itself).
+#[cfg(target_os = "linux")]
+fn is_square(n: usize) -> bool {
+  let root = n.isqrt();
+  root.checked_mul(root) == Some(n)
+}
+
+/// A batch's `fdatasync`s on `streams` streams: the caller takes stream zero and a scoped thread each further stream,
+/// every thread joined before the return; the first refusal.
+#[cfg(target_os = "linux")]
+fn sync_on_streams(fds: &[BorrowedFd<'_>], streams: usize) -> Result<(), HostError> {
+  let streams = streams.clamp(1, fds.len().max(1));
+  std::thread::scope(|scope| {
+    let mut started = Vec::with_capacity(streams.saturating_sub(1));
+    let mut refused = Vec::new();
+    for stream in 1..streams {
+      match std::thread::Builder::new()
+        .spawn_scoped(scope, move || sync_stream(fds, stream, streams))
+      {
+        Ok(thread) => started.push(thread),
+        Err(_) => refused.push(stream),
+      }
+    }
+    let mut synced = sync_stream(fds, 0, streams);
+    for stream in refused {
+      synced = synced.and(sync_stream(fds, stream, streams));
+    }
+    for thread in started {
+      let joined = thread.join().unwrap_or(Err(HostError::Unavailable(
+        rustix::io::Errno::IO.raw_os_error(),
+      )));
+      synced = synced.and(joined);
+    }
+    synced
+  })
+}
+
+/// One stream's share of a batch: files `stream`, `stream + streams`, and so on, each `fdatasync`ed in turn; the first
+/// refusal (the rest are still synced).
+#[cfg(target_os = "linux")]
+fn sync_stream(fds: &[BorrowedFd<'_>], stream: usize, streams: usize) -> Result<(), HostError> {
+  let mut synced = Ok(());
+  for fd in fds.iter().skip(stream).step_by(streams.max(1)) {
+    synced = synced.and(rustix::fs::fdatasync(*fd).map_err(refusal));
+  }
+  synced
 }
 
 /// A file's write-out on the other unixes: `fdatasync`, which makes the file durable alone; their batch barrier then

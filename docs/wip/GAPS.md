@@ -5840,6 +5840,25 @@ On a Linux release build of `faad1562` (A-126, the probe-storm fix and the reply
     failed.
   - In production one daemon is one process. Owed: the test harness locks the region once for the largest daemon a
     binary starts.
+  - **Closed the same evening.** `crates/server/tests/common/mod.rs` sizes the region for the larger of the profile's
+    default shard count and `MOST_NAMED_TEST_SHARDS` (2, the most any server test names). The three tests pass in a
+    `--cpus=1 --memory=256m` container as the non-root user.
 - **3. Fixed-size test volumes refused at 128 MB (product correct, typed).** Two recovery tests create volumes larger
   than a 128 MB daemon holds and are refused `BudgetExceeded { available: 42074112 }`. Owed: size them from the
   daemon's budget, or skip loudly, as other suites do.
+
+### 2026-10-10: Linux's batch barrier on ⌈√n⌉ streams (A-130, amended)
+
+- **What changed.** The barrier's `fdatasync`s run on ⌈√n⌉ streams for n files, four for a full batch. Before, every
+  file had a thread of its own, sixteen for a full batch.
+- **Why.** Sixteen threads started at once spent a CPU-capped container's quota in a burst, and the whole cgroup was
+  throttled until the next period: 43.5–188.8 s throttled over a bench at one CPU, against 0.2–0.4 s for four streams.
+  The throttling stalls every shard of a daemon, not only the landing.
+- **Not won everywhere** (`BENCHMARKS.md`): with every CPU and a VM contended by other sessions' containers, four
+  streams were 2.1–2.8× slower at 8,000 and 16,000 files, because more syncs in flight merge into fewer commits when
+  commits are slow.
+- **Open, measured next:** sync threads kept for the landing rather than started per barrier. That would let every
+  file's sync be in flight without the CPU burst.
+- **Linux lane** (bounded container, non-root): workspace clippy clean, run with 1.98.0's clippy and rustfmt installed
+  from checksum-verified tarballs, since the Docker VM has had no network since Docker Desktop restarted. `slates-land`
+  59/59; the seal suite 2/2.
