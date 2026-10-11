@@ -254,7 +254,20 @@ impl<H: LandFs> Setup<'_, H> {
         continue;
       }
       if run.ready_to_finish() {
-        break run.finish(self.vol, self.store, &mut self.session.audit, observer);
+        // The finish is sliced too (A-133): step its advance one unit at a time, as the server does, so the sliced
+        // oracle exercises it and a drift query between slices sees a consistent overlay.
+        break loop {
+          self.session.slices += 1;
+          if let Some(finished) = run.finish_step(
+            self.vol,
+            self.store,
+            &mut self.session.audit,
+            observer,
+            self.session.slice_budget_ns,
+          ) {
+            break finished;
+          }
+        };
       }
     };
     settle_grant(&mut self.session.grants, run.grant(), &result);

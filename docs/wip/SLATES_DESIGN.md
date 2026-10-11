@@ -5239,9 +5239,13 @@ entry either old or new, never torn).
    volume now reads it from disk, and its cached bytes are evictable); clear whiteouts and redirects
    that landed; a scratch volume gains `Base::Path` on the target. Entries that failed stay in the
    overlay with their outcome, and so do entries on the disk that did not reach the boundary (`held`;
-   A-45): the resume re-validates them, syncs their directories and advances them then. Record
+   A-45): the resume re-validates them, syncs their directories and advances them then. The advance is
+   sliced one entry a unit under the shard's step budget (A-133), accumulating the report's figures as it
+   goes, so a landing of many entries does not hold the shard for its whole O(entries) advance; the
+   advance is in-memory (no durable op), so a crash before the completion commits rebuilds the
+   un-advanced overlay and the resume re-lands. Record
    `LandingFinished{Done | Partial}` — `Done` only when every entry advanced — release the lease,
-   consume the grant, and reply with the report.
+   consume the grant, and reply with the report, the completion's records committed as one atom.
 10. *Containment of every write.* The target directory is the grant boundary and retains its
     identity throughout the landing. Create each temporary inside that boundary and use the
     per-entry exchange in step 6. Never build a sibling beside the target or replace the target
@@ -5455,6 +5459,18 @@ stays in the overlay.
 > - **Owed:** the unsliced finish, the directory syncs, the metadata calls, the base plane's cold reads, and a thread
 >   kept for the landing. GAPS holds each, with its measurement.
 > - Record: `docs/bugs/2026-10-10-a-landings-durability-waits-held-its-shard-on-a-busy-machine.md`.
+
+> **Status (2026-10-11, A-133).** A landing's finish is sliced; its advance no longer holds the shard.
+> - **How:** the advance runs one entry a unit under the step budget, driven by the server between yields, the report's
+>   figures accumulated as it goes (the old `advanced` map + `Vec` and the terminal count passes folded in). It records
+>   no durable op, so the completion's records still commit as one atom (A-127); a crash before that rebuilds the
+>   un-advanced overlay and the resume re-lands.
+> - **Measured** (in-memory host, 125 µs budget): one unsliced ~105 ms step at 100k entries → steps of p50 126 µs,
+>   p99 130–752 µs, flat from 1k to 100k; the max is a rare tail outlier on the loaded VM, not an O(n) step.
+> - **Equivalent and safe:** the sliced-vs-one-call oracle holds; reads return the landed content at every slice; a
+>   concurrent drift query sees no new drift (a modified file's transient self-drift is pre-existing and cleared by the
+>   advance).
+> - Record: `docs/bugs/2026-10-11-a-landings-finish-advanced-every-entry-in-one-unsliced-step.md`.
 
 **Integration points.** §4.4 (verbs, refusals, states), §4.5 (whiteouts, redirects, witnesses,
 copy-up, drift), §4.6 (base reads, invalidation on drift), §4.8 (grant, lease and
@@ -11274,11 +11290,10 @@ Status: built 2026-10-10.
   - **macOS throughput** (`land_bench flat` at load 40–81): no arm won consistently, so moving the `fsync` into the
     barrier is recorded as costing nothing measurable.
 - **Owed, each the next piece by the same measurement:**
-  - the finish, which advances every landed entry in one unsliced step: about 1.7 µs of CPU an entry on Linux, so a
-    100,000-file landing would hold its shard about 170 ms, and throttling stretches it further. Slicing it must keep
-    its records one atom with the completion (step 9);
+  - ~~the finish, which advances every landed entry in one unsliced step~~ — done, A-133 below;
   - each barrier starting its thread and stream threads anew: a thread kept for the landing, and the next batch staged
-    while a barrier is away, would give back the landing's time under CPU contention;
+    while a barrier is away, would give back the landing's time under CPU contention (a persistent per-landing barrier
+    worker was measured-and-rejected 2026-10-10: thread spawn was 8.7 ms over 503 barriers, 2.5% of a 1.8 s landing);
   - the directory syncs and the media barrier, still on the shard;
   - the metadata calls (create, rename, `fchmod`, `futimens`): a placement took up to 11.6 ms on the busy Mac;
   - the base plane's reads of cold host files, on the shard for every overlay read (unmeasured).
@@ -11287,3 +11302,43 @@ Status: built 2026-10-10.
     be a second mechanism beside the thread every platform needs anyway;
   - moving the whole landing engine to a thread of its own: the volume and its store are the shard's, so every content
     window and every audit record would cross back. It stays the end state if the residual calls for it.
+
+### A-133 — A landing's finish is sliced; its advance no longer holds the shard (2026-10-11)
+Applied in the same change to:
+- §4.15 step 9 (the advance, sliced one entry a unit) and its status;
+- `crates/vfs/src/base.rs` (`land_advance` splits into `land_advance_begin`, `land_advance_one`, `land_advance_end`;
+  the original stays as a wrapper for the one-call path);
+- `crates/land/src/engine.rs` (`Phase::Advance(AdvanceState)`; `LandingRun::{finish_step, advancing}`; `finish` loops
+  `finish_step`; the finish's figures are accumulated over the sliced advance, not swept; `advanced` and `terminal_state`
+  removed, folded in);
+- `crates/server/src/landing.rs` (`step_finish` + `complete_finish` replace `finish_granted`; `drive_granted_landing`
+  loops `step_finish` across `with_state` with yields, then commits the completion as one atom);
+- tests: `crates/land/tests/common/mod.rs` (the sliced harness drives `finish_step`), `oracle.rs`
+  (`a_sliced_advance_reads_consistently_and_leaves_the_base_clean`);
+- GAPS, BENCHMARKS, `docs/bugs/2026-10-11-a-landings-finish-advanced-every-entry-in-one-unsliced-step.md`.
+
+Status: built 2026-10-11.
+- **What it answers.** After A-132 moved the barriers off the shard, the finish was the one unbounded shard step left: its
+  advance (forget each landed entry, or rebase it from the snapshot, then invalidate the listings) ran as one synchronous
+  `with_state`, O(entries) — **~105 ms at 100k files, ~1 s at 1M**, measured ~1.0 µs an entry over the in-memory host.
+  Real OCI images and monorepos reach those counts. It breaks R4's bounded-work rule and condition 12's p99 at scale.
+- **The rule:** the advance is sliced one entry a unit, under the shard's step budget, driven by the server between
+  yields like the write and sync phases — nothing O(entries) runs in one unit.
+  - **The figures are accumulated as the loop passes each entry** (the report's counts, the held count, whether every
+    entry advanced), so the start and the end are O(1): the former `advanced` (which built a manifest-keyed `BTreeMap` and
+    a `Vec`) and the six terminal count passes are folded into the slice.
+  - **Equivalent to the one call.** The sliced-vs-one-call oracle (one unit a slice) holds, and the crash oracle's write
+    steps are unchanged; `advance.state == Aborted` iff the landing crashed, so the per-entry filter needs no whole-report
+    pass.
+  - **Durable as one atom (A-127).** The advance records no durable op — it mutates the anchor-held overlay (RAM) — so a
+    crash before the completion commits rebuilds the un-advanced overlay from the log and the resume re-lands. The
+    completion's records still commit in one transaction at the end.
+  - **Read- and drift-consistent between slices.** A read returns the landed content whether or not its entry is advanced
+    yet (the overlay's private copy, or the base). A concurrent drift query sees no new drift from the advance; a modified
+    base file's transient self-drift (copied up yet keeping its base witness, from the write-phase placement until its
+    advance) is pre-existing and the advance's `base_forget` clears it.
+- **Measured** (2026-10-11, `BENCHMARKS.md`; in-memory host, 125 µs budget, p50/p99 flat 1k→100k):
+  - one unsliced ~105 ms step → steps of **p50 126 µs, p99 130–752 µs** at every size; the max is a rare tail outlier on
+    the loaded VM (6.4 ms at 100k over 793 steps), not an algorithmic step — per-unit instrumentation found no O(n) unit.
+- **Owed:** the start's `close_dirs` and the end's listing invalidation are O(open dirs)/O(dirs), not O(entries), and
+  stay one unit each (bounded by the delta's directories, as the sweep and sync phases are).

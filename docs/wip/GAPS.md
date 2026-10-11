@@ -5963,3 +5963,30 @@ from the snapshot, then invalidate listings) timed over the simulated host (`lan
   see a landed entry whose witness is still the old base — a transient false drift. Needs the drift path read to confirm
   whether it ignores overlay-shadowed entries (likely safe) or must be fenced during the advance. Confirm scope with Ada
   per the debugging protocol before building.
+
+### 2026-10-11: the landing's finish is sliced (A-133) — the confirmed O(entries) advance, closed
+
+Closes the confirmed finding of 2026-10-10 (the finish advanced every entry in one unsliced step, ~1 µs/entry,
+~105 ms at 100k — an R4 bound at OCI/monorepo scale).
+
+- **Built.** The advance runs one entry a unit under the shard's step budget, driven by the server between yields; the
+  report's counts, the held count and the all-advanced flag are accumulated over the loop, so the former `advanced`
+  (a manifest-keyed `BTreeMap` + `Vec`) and the six terminal count passes are folded in and nothing O(entries) runs in
+  one unit. `land_advance` split into begin/one/end; `Phase::Advance`; `finish_step`; `step_finish`/`complete_finish`.
+- **Bounded, measured** (in-memory host, 125 µs budget, p50/p99 flat 1k→100k): steps of p50 126 µs, p99 130–752 µs at
+  every size, against the one unsliced ~105 ms step. The max is a rare tail outlier on the shared VM (6.4 ms at 100k over
+  793 steps), not an algorithmic step — per-unit instrumentation found no O(n) unit (one 556 µs outlier across 100k).
+- **The drift question, resolved.** The earlier "no false drift" note was wrong for a *modified* base file: it is copied
+  up yet keeps its base witness, so from the write-phase placement until its advance a `status` query sees it as transient
+  self-drift. This is **pre-existing** (the write phase is already sliced) and the advance's `base_forget` clears both the
+  witness and the recorded drift, so the drift set only shrinks during the advance. The real guarantee, tested
+  (`a_sliced_advance_reads_consistently_and_leaves_the_base_clean`): reads return the landed content at every slice, the
+  drift set never grows, and the base is clean once the advance is done.
+- **Equivalent and durable.** The sliced-vs-one-call oracle holds (62 land tests); the completion's records commit as one
+  atom (A-127), the advance being in-memory so a crash before the commit rebuilds the un-advanced overlay and the resume
+  re-lands. Server landing suites (29) and vfs (256) green; workspace clippy and `xtask check` clean.
+- **Owed (smaller, noted):** `begin`'s `close_dirs` and `end`'s listing invalidation are O(open dirs)/O(dirs), one unit
+  each, bounded by the delta's directories as the sweep and sync phases are — not O(entries).
+- **Still open from A-132:** a thread kept for the landing's barriers (persistent worker measured-and-rejected
+  2026-10-10, spawn 8.7 ms/503 barriers), the directory syncs and media barrier still on the shard, the metadata calls,
+  and the base plane's cold reads.

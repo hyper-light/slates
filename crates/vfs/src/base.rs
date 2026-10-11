@@ -3064,6 +3064,22 @@ impl Overlay<'_> {
     base: Option<BaseConfig>,
     source: Option<SnapshotId>,
   ) -> Result<(), VfsError> {
+    self.land_advance_begin(store, base)?;
+    for entry in landed {
+      self.land_advance_one(store, entry, source)?;
+    }
+    self.land_advance_end();
+    Ok(())
+  }
+
+  /// The one-time setup of a landing's advance (A-133): the overlay's base plane, if a fresh (non-overlay) volume is
+  /// gaining one. The per-entry advance ([`WithHost::land_advance_one`]) and its end ([`WithHost::land_advance_end`])
+  /// follow, so a large landing's O(entries) advance is sliced across the shard's steps rather than held in one.
+  pub fn land_advance_begin(
+    &mut self,
+    store: &mut Store,
+    base: Option<BaseConfig>,
+  ) -> Result<(), VfsError> {
     if self.vol.base.is_none() {
       let base = base.ok_or(VfsError::NotOverlay)?;
       let root = self.vol.root();
@@ -3071,19 +3087,33 @@ impl Overlay<'_> {
       let root_no = store.dirs.get(root)?.inode;
       self.vol.base = Some(BasePlane::new(base, root_no));
     }
-    for entry in landed {
-      match source {
-        None => self.forget_landed(store, &entry.path)?,
-        Some(id) => self.advance_from_snapshot(store, id, entry)?,
-      }
+    Ok(())
+  }
+
+  /// One entry of a landing's advance (A-133): the overlay surgery for a single landed path — pure in-memory, no
+  /// durable op, so a crash before the completion commits rebuilds the un-advanced overlay and the resume re-lands.
+  /// Each entry is independent, re-evaluated against the current head, so slicing the loop across the shard's steps
+  /// is equivalent to one call ([`WithHost::land_advance`]).
+  pub fn land_advance_one(
+    &mut self,
+    store: &mut Store,
+    entry: &Landed,
+    source: Option<SnapshotId>,
+  ) -> Result<(), VfsError> {
+    match source {
+      None => self.forget_landed(store, &entry.path),
+      Some(id) => self.advance_from_snapshot(store, id, entry),
     }
-    // Every listing is stale: the landing changed the directories beneath.
+  }
+
+  /// The one-time end of a landing's advance (A-133): every base listing is now stale, since the landing changed the
+  /// directories beneath, so each is re-read from the disk on its next access.
+  pub fn land_advance_end(&mut self) {
     if let Some(plane) = self.vol.base.as_mut() {
       for l in plane.listings.values_mut() {
         l.entries = None;
       }
     }
-    Ok(())
   }
 
   /// One path a landing of snapshot `id` advanced, applied to the head by how the head's entry there

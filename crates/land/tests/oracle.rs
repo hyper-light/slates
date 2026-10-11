@@ -1023,6 +1023,88 @@ fn every_landed_entry_has_its_directory_synced_before_it_advances() {
 }
 
 /// The check behind [`a_landed_file_is_durable_before_it_is_visible`] can fail, in each way a placement can come too
+/// A-133 (the sliced finish's advance is read-consistent between its slices, and leaves the base clean). Do: over an
+/// overlay, modify a base file and add a new one, write the landed bytes onto the base disk as the landing's write
+/// phase would, then advance the overlay one entry at a time — reading every landed path after each slice. Expect:
+/// every read returns the landed content at every point (a not-yet-advanced path reads the overlay's private copy = the
+/// landed bytes; an advanced one reads the base, also the landed bytes), the advance takes more than one slice
+/// (non-vacuity), and once the advance is done no drift remains — the advance clears each entry's witness as it goes.
+///
+/// It also pins the corrected finding: a *modified* base file is copied up yet keeps its base witness, so from the
+/// write-phase placement until its own advance a `status` query sees it as transient self-drift (pre-existing: the
+/// write phase is already sliced). The advance clears it (`base_forget` removes the witness and the recorded drift), so
+/// the drift set only shrinks during the advance and is empty after.
+#[test]
+fn a_sliced_advance_reads_consistently_and_leaves_the_base_clean() {
+  use slates_vfs::base::Landed;
+  let mut host = SimHost::new();
+  example_base(&mut host, 6);
+  let mut store = store();
+  let mut vol = overlay(&mut host, &mut store);
+  // The overlay's changes a landing would advance: a modified base file (copied up) and a fresh file.
+  write_file(&mut vol, &mut host, &mut store, "/src/f0.rs", b"landed 0");
+  write_file(
+    &mut vol,
+    &mut host,
+    &mut store,
+    "/src/new.rs",
+    b"landed new",
+  );
+  // The landing's write phase already put the landed bytes on the disk; the advance only moves the overlay to match.
+  host.replace_file("/src/f0.rs", b"landed 0");
+  host.replace_file("/src/new.rs", b"landed new");
+  let landed = [
+    Landed {
+      path: "/src/f0.rs".to_owned(),
+      written: None,
+    },
+    Landed {
+      path: "/src/new.rs".to_owned(),
+      written: None,
+    },
+  ];
+  // Every landed path reads its landed content, whether or not it has been advanced yet.
+  let reads_landed = |vol: &mut Volume, host: &mut SimHost, store: &mut Store| {
+    assert_eq!(read_through(vol, host, store, "/src/f0.rs"), b"landed 0");
+    assert_eq!(read_through(vol, host, store, "/src/new.rs"), b"landed new");
+  };
+  let drift_set = |vol: &mut Volume, host: &mut SimHost, store: &mut Store| {
+    vol.with_host(host).status(store).unwrap().drift.len()
+  };
+  vol
+    .with_host(&mut host)
+    .land_advance_begin(&mut store, None)
+    .unwrap();
+  let mut slices = 0;
+  let mut prev_drift = drift_set(&mut vol, &mut host, &mut store);
+  for entry in &landed {
+    reads_landed(&mut vol, &mut host, &mut store);
+    let during = drift_set(&mut vol, &mut host, &mut store);
+    assert!(
+      during <= prev_drift,
+      "the advance never adds drift: {during} after {prev_drift}"
+    );
+    prev_drift = during;
+    vol
+      .with_host(&mut host)
+      .land_advance_one(&mut store, entry, None)
+      .unwrap();
+    slices += 1;
+  }
+  vol.with_host(&mut host).land_advance_end();
+  reads_landed(&mut vol, &mut host, &mut store);
+  // The advance cleared every landed entry's witness, so the base reports no drift once it is done.
+  assert_eq!(
+    drift_set(&mut vol, &mut host, &mut store),
+    0,
+    "the advance left the base clean"
+  );
+  assert!(
+    slices > 1,
+    "the advance ran in more than one slice: {slices}"
+  );
+}
+
 /// early. Do: on the simulated host, place temporaries at real names after: nothing; a write-out alone; a barrier
 /// alone; a write-out, a later write, then a barrier; a write-out, a barrier taken, a write while it runs (A-132) and
 /// another write-out before its outcome came back; a write-out then a barrier. Expect: every name but the last

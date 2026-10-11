@@ -3139,8 +3139,32 @@ enum Phase {
   },
   /// Advancing the overlay and reporting.
   Finish { durability: Durability },
+  /// Advancing the overlay past what reached the disk durably, one entry a unit (A-133): the finish sliced, so a
+  /// landing of many entries does not hold the shard for its whole O(entries) advance (boxed to keep the enum small).
+  Advance(Box<AdvanceState>),
   /// The run has returned its outcome.
   Ended,
+}
+
+/// The finish's sliced advance (A-133): the report's counts, taken once in a single pass at the start, and the cursor.
+/// `begun` gates the one-time base-plane setup; `next` is the cursor over the reports, each advanced where it landed
+/// (the per-entry work that was `advanced` + `land_advance`, now folded into the slice so nothing O(entries) runs in one
+/// unit). `state`, `held`, the four counts and `durability` are carried to the report.
+struct AdvanceState {
+  durability: Durability,
+  /// The landing crashed mid-write; its state is `Aborted` and nothing advances.
+  crashed: bool,
+  base: Option<BaseConfig>,
+  next: usize,
+  begun: bool,
+  // The report's figures, accumulated over the advance loop so the finish does no O(entries) work in one unit:
+  written: usize,
+  skipped: usize,
+  conflicts: usize,
+  failed: usize,
+  held: usize,
+  /// Whether every report so far took its entry out of the overlay (the landing is `Done` only if all did).
+  all_advances: bool,
 }
 
 /// A granted landing as an owned, resumable operation (AUD-29-25; §4.15, §4.3): everything after its grant
@@ -3219,7 +3243,7 @@ impl<'h, H: LandFs> LandingRun<'h, H> {
     let mut mark = began;
     self.last_step_ns = 0;
     loop {
-      if self.ready_to_finish() || self.awaiting_barrier() {
+      if self.ready_to_finish() || self.advancing() || self.awaiting_barrier() {
         return None;
       }
       let ended = self.unit(vol, store, audit, observer);
@@ -3253,6 +3277,12 @@ impl<'h, H: LandFs> LandingRun<'h, H> {
   /// Whether every host step is done and only the finish (the volume's advance and the report) remains.
   pub fn ready_to_finish(&self) -> bool {
     matches!(self.phase, Phase::Finish { .. })
+  }
+
+  /// Whether the run is in its sliced advance (A-133): the finish has begun and more entries remain. `finish_step`
+  /// drives it; `step` never does.
+  pub fn advancing(&self) -> bool {
+    matches!(self.phase, Phase::Advance(_))
   }
 
   /// Whether the run waits on a batch's barrier away from it (A-132): taken and not yet given out, or given out and its
@@ -3296,14 +3326,45 @@ impl<'h, H: LandFs> LandingRun<'h, H> {
     audit: &mut Audit,
     observer: &mut dyn Observer<H>,
   ) -> Result<LandingReport, LandingRefusal> {
-    if !self.ready_to_finish() {
-      return Err(LandingRefusal::Ended);
+    // The one-call finish: step the sliced advance with no budget, so it runs to the report in one call.
+    self
+      .finish_step(vol, store, audit, observer, u64::MAX)
+      .unwrap_or(Err(LandingRefusal::Ended))
+  }
+
+  /// One budgeted step of the sliced finish (A-133): the overlay advanced past what reached the disk, one entry a unit,
+  /// for `budget_ns` (checked between units, so a step overruns by at most one entry). `Some` with the outcome once the
+  /// finish is done or has failed; `None` when the advance has more to do and the caller should yield and step again.
+  /// The caller runs it only once [`LandingRun::ready_to_finish`], after any delegation recall, so it never races the
+  /// delegations a finished landing changes; its completion record commits as one atom when it returns (A-127).
+  pub fn finish_step(
+    &mut self,
+    vol: &mut Volume,
+    store: &mut Store,
+    audit: &mut Audit,
+    observer: &mut dyn Observer<H>,
+    budget_ns: u64,
+  ) -> Option<Result<LandingReport, LandingRefusal>> {
+    if !self.ready_to_finish() && !self.advancing() {
+      return Some(Err(LandingRefusal::Ended));
     }
-    let finished = self
-      .unit(vol, store, audit, observer)
-      .unwrap_or(Err(LandingRefusal::Ended));
-    self.phase = Phase::Ended;
-    finished
+    let began = Instant::now();
+    let mut mark = began;
+    self.last_step_ns = 0;
+    loop {
+      let ended = self.unit(vol, store, audit, observer);
+      let now = Instant::now();
+      self.last_unit_ns = nanos_between(mark, now);
+      self.last_step_ns = nanos_between(began, now);
+      mark = now;
+      if let Some(ended) = ended {
+        self.phase = Phase::Ended;
+        return Some(ended);
+      }
+      if self.last_step_ns >= budget_ns {
+        return None;
+      }
+    }
   }
 
   /// Steps the run through to its outcome, finish included, without a budget: the one-call landing.
@@ -3509,22 +3570,41 @@ impl<'h, H: LandFs> LandingRun<'h, H> {
         }
       },
       Phase::Finish { durability } => {
-        let finished = finish_landing(
-          landing,
-          Finishing {
-            target,
-            vol,
-            store,
-            audit,
-            request,
-            manifest,
-            grant,
-            reports: std::mem::take(reports),
-            durability: *durability,
-            swept: *swept,
-          },
-        );
-        return Some(finished);
+        match begin_advance(&mut landing, vol, target, request, *durability) {
+          Ok(advance) => next_phase = Some(Phase::Advance(Box::new(advance))),
+          Err(error) => ended = Some(Err(error)),
+        }
+      }
+      Phase::Advance(advance) => {
+        match advance_step(
+          &mut landing,
+          advance,
+          reports.as_slice(),
+          manifest,
+          vol,
+          store,
+          request,
+        ) {
+          None => {}
+          Some(Err(error)) => ended = Some(Err(error)),
+          Some(Ok(())) => {
+            let durability = advance.durability;
+            return Some(Ok(finish_report(
+              landing,
+              Finishing {
+                target,
+                audit,
+                request,
+                manifest,
+                grant,
+                reports: std::mem::take(reports),
+                durability,
+                swept: *swept,
+              },
+              advance,
+            )));
+          }
+        }
       }
       Phase::Ended => {
         *saved = Some(landing.suspend());
@@ -3542,8 +3622,6 @@ impl<'h, H: LandFs> LandingRun<'h, H> {
 /// What finishing a landing needs besides the landing itself.
 struct Finishing<'x> {
   target: &'x LandingTarget,
-  vol: &'x mut Volume,
-  store: &'x mut Store,
   audit: &'x mut Audit,
   request: &'x LandingRequest,
   manifest: &'x Manifest,
@@ -3553,25 +3631,17 @@ struct Finishing<'x> {
   swept: usize,
 }
 
-/// The end of a landing after its sync: its degradations, its terminal state, the overlay advanced past what
-/// reached the disk durably, the audit record and the report.
-fn finish_landing<H: LandFs>(
-  mut landing: Landing<'_, H>,
-  finishing: Finishing<'_>,
-) -> Result<LandingReport, LandingRefusal> {
-  let Finishing {
-    target,
-    vol,
-    store,
-    audit,
-    request,
-    manifest,
-    grant,
-    reports,
-    durability,
-    swept,
-  } = finishing;
-  let target_dir = target.dir;
+/// The start of a landing's sliced finish (A-133): its degradations recorded, its directories closed, and a fresh
+/// (non-overlay) volume's base config read — all O(1). The report's figures are accumulated over the advance loop
+/// ([`advance_step`]), not swept here, so a large landing's finish does no O(entries) work in any one unit; the advance
+/// and the report ([`finish_report`]) follow.
+fn begin_advance<H: LandFs>(
+  landing: &mut Landing<'_, H>,
+  vol: &Volume,
+  target: &LandingTarget,
+  request: &LandingRequest,
+  durability: Durability,
+) -> Result<AdvanceState, LandingRefusal> {
   if let Some(errno) = landing.crashed {
     landing.degraded.push(Degradation::Crashed { errno });
   }
@@ -3581,38 +3651,169 @@ fn finish_landing<H: LandFs>(
     });
   }
   landing.close_dirs();
-  // An entry that landed but did not reach the durability boundary (its directory, or the media barrier the
-  // grant asked for, did not sync) stays in the overlay: the resume syncs it and advances it then
-  // (AUD-29-05; before 2026-09-29 such entries were advanced, and a lost sync lost the private work).
-  let held = reports
-    .iter()
-    .filter(|r| advances(r.outcome.as_ref()) && !landing.durable(r))
-    .count();
-  let state = terminal_state(&reports, landing.crashed.is_some(), held);
-  let facts = if vol.is_overlay() {
+  // A fresh volume gains a base; an overlay already has one.
+  let base = if vol.is_overlay() {
     None
   } else {
-    Some(
-      landing
-        .host
-        .facts(target_dir)
-        .map_err(LandingRefusal::Target)?,
-    )
+    let facts = landing
+      .host
+      .facts(target.dir)
+      .map_err(LandingRefusal::Target)?;
+    Some(BaseConfig {
+      root: target.dir,
+      facts,
+      large_class_bytes: request.large_class_bytes,
+    })
   };
-  // Advance.
-  // A landed rename leaves the overlay with the whiteout at its origin. An aborted landing
-  // advances nothing: its entries stay in the overlay so the resume re-plans them all, finds
-  // the landed ones already there, and syncs their directories again.
-  let landed = advanced(&reports, state, manifest, request, &landing);
-  let base = facts.map(|facts| BaseConfig {
-    root: target_dir,
-    facts,
-    large_class_bytes: request.large_class_bytes,
-  });
-  vol
+  Ok(AdvanceState {
+    durability,
+    crashed: landing.crashed.is_some(),
+    base,
+    next: 0,
+    begun: false,
+    written: 0,
+    skipped: 0,
+    conflicts: 0,
+    failed: 0,
+    held: 0,
+    all_advances: true,
+  })
+}
+
+/// One unit of the sliced finish's advance (A-133): the one-time base setup, then one report — advanced where it landed
+/// (the same rule as the former `advanced` + `land_advance`, folded per entry so no unit is O(entries)) — then the end
+/// (every base listing marked stale). `None` while more remains, `Some(Ok(()))` once the advance is complete (the report
+/// follows), `Some(Err)` on a host refusal that fails the finish. A report is advanced only on a completed landing where
+/// its outcome takes it out of the overlay and its write reached the durability boundary; a rename also advances the
+/// whiteout at its origin.
+fn advance_step<H: LandFs>(
+  landing: &mut Landing<'_, H>,
+  advance: &mut AdvanceState,
+  reports: &[EntryReport],
+  manifest: &Manifest,
+  vol: &mut Volume,
+  store: &mut Store,
+  request: &LandingRequest,
+) -> Option<Result<(), LandingRefusal>> {
+  if !advance.begun {
+    return match vol
+      .with_host(landing.host)
+      .land_advance_begin(store, advance.base.take())
+    {
+      Ok(()) => {
+        advance.begun = true;
+        None
+      }
+      Err(error) => Some(Err(LandingRefusal::Volume(error))),
+    };
+  }
+  let Some(report) = reports.get(advance.next) else {
+    vol.with_host(landing.host).land_advance_end();
+    return Some(Ok(()));
+  };
+  advance.next = advance.next.saturating_add(1);
+  // Accumulate the report's figures as the loop passes each entry, so the finish never sweeps them in one O(entries)
+  // unit (the counts and the held count were a pass each at the start/end before).
+  match report.outcome {
+    Some(Outcome::Written) => advance.written = advance.written.saturating_add(1),
+    Some(Outcome::Skipped(_) | Outcome::AcceptedIdentical) => {
+      advance.skipped = advance.skipped.saturating_add(1);
+    }
+    Some(Outcome::Conflict(_) | Outcome::Undone(_)) => {
+      advance.conflicts = advance.conflicts.saturating_add(1);
+    }
+    Some(Outcome::Failed { .. }) => advance.failed = advance.failed.saturating_add(1),
+    _ => {}
+  }
+  let takes_out = advances(report.outcome.as_ref());
+  advance.all_advances = advance.all_advances && takes_out;
+  let durable = landing.durable(report);
+  // An entry that landed but did not reach the durability boundary (its directory, or the media barrier the grant
+  // asked for, did not sync) stays in the overlay: the resume syncs and advances it then (AUD-29-05).
+  if takes_out && !durable {
+    advance.held = advance.held.saturating_add(1);
+  }
+  // Only a completed landing advances (`Aborted` iff it crashed, §4.15), and only an entry that left the overlay and
+  // reached the durability boundary.
+  if advance.crashed || !takes_out || !durable {
+    return None;
+  }
+  // The landing's own write left a fresh ctime, so its witness is racy by the design's rule (A-49): a later verdict
+  // re-hashes the file rather than trust its fingerprint. The identity is the manifest entry's content hash (the
+  // reports and the manifest entries are built in lock-step, so they share an index).
+  let written = landing
+    .placed
+    .get(report.path.as_ref())
+    .copied()
+    .zip(
+      manifest
+        .entries
+        .get(advance.next.saturating_sub(1))
+        .and_then(|entry| entry.overlay.as_ref())
+        .map(|overlay| overlay.hash),
+    )
+    .map(|(fingerprint, identity)| Witness {
+      fingerprint,
+      identity,
+      witnessed_at: request.now_ns,
+      racy: true,
+    });
+  let source = request.source.snapshot();
+  let dest = Landed {
+    path: report.path.to_string(),
+    written,
+  };
+  let rename_from = match &report.action {
+    Action::Rename { from } => Some(from.to_string()),
+    _ => None,
+  };
+  if let Err(error) = vol
     .with_host(landing.host)
-    .land_advance(store, &landed, base, request.source.snapshot())
-    .map_err(LandingRefusal::Volume)?;
+    .land_advance_one(store, &dest, source)
+  {
+    return Some(Err(LandingRefusal::Volume(error)));
+  }
+  if let Some(from) = rename_from {
+    let origin = Landed {
+      path: from,
+      written: None,
+    };
+    if let Err(error) = vol
+      .with_host(landing.host)
+      .land_advance_one(store, &origin, source)
+    {
+      return Some(Err(LandingRefusal::Volume(error)));
+    }
+  }
+  None
+}
+
+/// The landing's report, once its advance is done (A-133): the audit record, the counts and the overlay's state.
+/// The advance already ran ([`advance_step`]); this touches no disk.
+fn finish_report<H: LandFs>(
+  mut landing: Landing<'_, H>,
+  finishing: Finishing<'_>,
+  advance: &AdvanceState,
+) -> LandingReport {
+  let Finishing {
+    target,
+    audit,
+    request,
+    manifest,
+    grant,
+    reports,
+    durability,
+    swept,
+  } = finishing;
+  // The terminal state from the accumulated figures: `Aborted` if the landing crashed, `Done` only if every entry
+  // advanced and none was held, else `Partial` (AUD-29-05).
+  let state = if advance.crashed {
+    LandingState::Aborted
+  } else if advance.held == 0 && advance.all_advances {
+    LandingState::Done
+  } else {
+    LandingState::Partial
+  };
   audit.push(AuditRecord {
     seq: 0,
     at_ns: request.now_ns,
@@ -3623,32 +3824,16 @@ fn finish_landing<H: LandFs>(
     outcome: Some(state),
   });
   let costs = std::mem::take(&mut landing.costs).fold();
-  Ok(LandingReport {
+  LandingReport {
     state,
     manifest_hash: manifest.hash,
     summary: manifest.summary.clone(),
-    written: reports
-      .iter()
-      .filter(|r| r.outcome == Some(Outcome::Written))
-      .count(),
-    skipped: reports
-      .iter()
-      .filter(|r| {
-        matches!(
-          r.outcome,
-          Some(Outcome::Skipped(_) | Outcome::AcceptedIdentical)
-        )
-      })
-      .count(),
-    conflicts: reports
-      .iter()
-      .filter(|r| matches!(r.outcome, Some(Outcome::Conflict(_) | Outcome::Undone(_))))
-      .count(),
-    failed: reports
-      .iter()
-      .filter(|r| matches!(r.outcome, Some(Outcome::Failed { .. })))
-      .count(),
-    held,
+    // The counts were taken in one pass at the advance's start ([`begin_advance`]); the reports do not change during it.
+    written: advance.written,
+    skipped: advance.skipped,
+    conflicts: advance.conflicts,
+    failed: advance.failed,
+    held: advance.held,
     entries: reports,
     bytes_written: landing.bytes_written,
     durability,
@@ -3656,57 +3841,8 @@ fn finish_landing<H: LandFs>(
     barriers: landing.barriers,
     costs,
     swept,
-    target: target_dir,
-  })
-}
-
-/// Whether an outcome takes its entry out of the overlay: the disk holds the overlay's state.
-/// The paths a landing advances, each written file with the witness of what it wrote: the fingerprint its
-/// placement left and the identity of the source's bytes (A-49). A landed rename leaves the overlay with
-/// the whiteout at its origin. An aborted landing advances nothing: its entries stay in the overlay so the
-/// resume re-plans them all, finds the landed ones already there, and syncs their directories again.
-fn advanced<H: LandFs>(
-  reports: &[EntryReport],
-  state: LandingState,
-  manifest: &Manifest,
-  request: &LandingRequest,
-  landing: &Landing<'_, H>,
-) -> Vec<Landed> {
-  let identities: BTreeMap<&str, [u8; 32]> = manifest
-    .entries
-    .iter()
-    .filter_map(|entry| Some((entry.path.as_ref(), entry.overlay?.hash)))
-    .collect();
-  let mut landed = Vec::with_capacity(reports.len());
-  let completed = state != LandingState::Aborted;
-  for r in reports
-    .iter()
-    .filter(|r| completed && advances(r.outcome.as_ref()) && landing.durable(r))
-  {
-    // The landing's own write left a fresh ctime, so its witness is racy by the design's rule: a later
-    // verdict re-hashes the file rather than trust its fingerprint.
-    let written = landing
-      .placed
-      .get(&r.path)
-      .zip(identities.get(r.path.as_ref()))
-      .map(|(fingerprint, identity)| Witness {
-        fingerprint: *fingerprint,
-        identity: *identity,
-        witnessed_at: request.now_ns,
-        racy: true,
-      });
-    landed.push(Landed {
-      path: r.path.to_string(),
-      written,
-    });
-    if let Action::Rename { from } = &r.action {
-      landed.push(Landed {
-        path: from.to_string(),
-        written: None,
-      });
-    }
+    target: target.dir,
   }
-  landed
 }
 
 fn advances(outcome: Option<&Outcome>) -> bool {
@@ -3718,21 +3854,4 @@ fn advances(outcome: Option<&Outcome>) -> bool {
         | Outcome::Skipped(SkipReason::AlreadyThere | SkipReason::Drift)
     )
   )
-}
-
-/// The landing's terminal state: `Aborted` after a crash; `Done` only when every entry landed or was
-/// already there (so it leaves the overlay) and every one reached the durability boundary (`held` counts
-/// those that did not); `Partial` otherwise.
-fn terminal_state(reports: &[EntryReport], crashed: bool, held: usize) -> LandingState {
-  if crashed {
-    return LandingState::Aborted;
-  }
-  // Done only when every entry reached its landed state: a skip that left an entry private (its parent
-  // missing, the grant ended) is Partial, as the failure matrix states (AUD-29-05; before 2026-09-29 every
-  // skip counted as done).
-  if held == 0 && reports.iter().all(|r| advances(r.outcome.as_ref())) {
-    LandingState::Done
-  } else {
-    LandingState::Partial
-  }
 }

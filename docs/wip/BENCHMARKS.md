@@ -5039,3 +5039,47 @@ Writeback first won every round: 1.5–2.5× quiet and 1.6–2.6× beside the bu
 - Moving macOS's `fsync` from the write-out into the barrier costs no measurable throughput here, and neither stream
   count beat the other. Recorded as inconclusive, not as a win: macOS keeps Linux's derived rule, one rule for every
   platform.
+
+### Landed: a landing's finish is sliced; its advance is bounded, not O(entries) (A-133; 2026-10-11)
+
+**What changed.** The landing's finish advanced the overlay past what reached the disk (forget each landed entry or
+rebase it, then invalidate the listings) in **one synchronous shard step**, O(entries). A-133 slices it one entry a unit
+under the step budget, driven by the server between yields, the report's figures accumulated over the loop so nothing
+O(entries) runs in one unit; the completion's records still commit as one atom.
+
+**Command.** `land_bench` scratch mode (not kept): for each entry count, an overlay of N flat files over the in-memory
+host is stepped to its finish, then the advance is driven by `finish_step(budget)` with a 125 µs budget, every step
+timed. Reported: steps, and the step-time p50/p99/max. The in-memory host isolates the advance from disk; the per-entry
+cost on a real volume is ~1.7× higher (the 600-entry server measurement).
+
+**Before — the one-call advance (`land_advance`), µs an entry, 2 runs:**
+
+| entries | advance (one step) | per entry |
+|---|---|---|
+| 1,000 | 0.95–0.99 ms | 0.95 µs |
+| 10,000 | 10.0–11.0 ms | 1.05 µs |
+| 25,000 | 25.2–29.1 ms | 1.08 µs |
+| 50,000 | 52.3–53.2 ms | 1.05 µs |
+
+Linear at ~1.0 µs an entry → ~105 ms at 100k, ~1 s at 1M, all in one shard step.
+
+**After — the sliced finish's step time (125 µs budget):**
+
+| entries | steps | p50 | p99 | max |
+|---|---|---|---|---|
+| 1,000 | 7 | 125 µs | 130 µs | 130 µs |
+| 10,000 | 82 | 126 µs | 752 µs | 752 µs |
+| 50,000 | 436 | 126 µs | 235 µs | 3.1 ms |
+| 100,000 | 793 | 126 µs | 135 µs | 6.4 ms |
+
+- **p50 and p99 are flat at the budget (≈126 µs) across 1k→100k** — the advance is bounded per step, independent of the
+  entry count.
+- **The max is a tail outlier,** not an O(n) step: it varied run to run (9.1 → 7.2 → 6.5 → 6.4 ms at 100k) and grows with
+  the number of steps (more samples hit the shared VM's scheduling/allocator tail), while p50/p99 stay flat. Per-unit
+  instrumentation found no O(n) unit — one 556 µs unit across 100k entries, the rest under 500 µs.
+- **The fold mattered:** before folding `advanced()` (a manifest-keyed `BTreeMap` + `Vec`) and the count passes into the
+  slice, the longest step was 25 ms at 100k (the begin/terminal O(n·log n) in one unit); after, p50/p99 are at budget.
+
+**Correctness.** The sliced-vs-one-call oracle holds (`crates/land` 62 tests); reads return the landed content at every
+slice and the base is clean after (`a_sliced_advance_reads_consistently_and_leaves_the_base_clean`); the server landing
+suites and vfs suite are green.

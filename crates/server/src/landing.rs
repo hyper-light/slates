@@ -919,15 +919,28 @@ async fn drive_granted_landing(
       }
       Stepped::Ready => {
         recall_before_finish(&mut granted, renew, &key).await;
+        // The finish's O(entries) advance is sliced (A-133): stepped a quantum at a time, the shard serving its other
+        // clients between, the lease kept alive — then its completion commits as one atom.
+        let outcome = loop {
+          match crate::state::with_state(|s| {
+            let stepped = step_finish(s, &mut granted);
+            crate::delegation::drain(s);
+            stepped
+          })? {
+            FinishStepped::More => {
+              keep_lease_alive(&mut granted, renew, &key).await;
+              slates_rt::futures::yield_now().await;
+            }
+            FinishStepped::Done(outcome) => break *outcome,
+          }
+        };
         return crate::state::with_state(move |s| {
-          complete_landing_with(s, request, cause, |s| finish_granted(s, *granted, None))
+          complete_landing_with(s, request, cause, |s| complete_finish(s, *granted, outcome))
         });
       }
       Stepped::Ended(ended) => {
         return crate::state::with_state(move |s| {
-          complete_landing_with(s, request, cause, |s| {
-            finish_granted(s, *granted, Some(*ended))
-          })
+          complete_landing_with(s, request, cause, |s| complete_finish(s, *granted, *ended))
         });
       }
     }
@@ -1425,35 +1438,69 @@ fn step_granted(state: &mut ShardState, granted: &mut GrantedRun) -> Stepped {
 /// once-grant consumed, its spans drained, the writer's host settled, the implicit snapshot destroyed, and
 /// the reply with the landing's records.
 #[cfg(unix)]
-fn finish_granted(
+/// Where one step of the sliced finish left the advance (A-133).
+#[cfg(unix)]
+enum FinishStepped {
+  /// The advance has more entries; the caller yields and steps again.
+  More,
+  /// The finish is done (or failed), with this outcome to complete.
+  Done(Box<Result<LandingReport, LandingRefusal>>),
+}
+
+/// One step of a granted landing's finish (A-133): the overlay advanced past what reached the disk, for a slice of the
+/// shard's quantum, the base host lent back after — the same shape as [`step_granted`], so the shard serves its other
+/// clients between the advance's steps rather than holding them for its whole O(entries) run. A volume gone or a host
+/// away ends the finish with that refusal.
+#[cfg(unix)]
+fn step_finish(state: &mut ShardState, granted: &mut GrantedRun) -> FinishStepped {
+  let budget_ns = state
+    .config
+    .step_quantum_ns()
+    .saturating_mul(LANDING_SLICE_PERMILLE)
+    / PERMILLE;
+  let Ok(slot) = state.volumes.get_mut(granted.handle) else {
+    granted.run.abandon();
+    return FinishStepped::Done(Box::new(Err(LandingRefusal::Volume(
+      slates_vfs::error::VfsError::StaleHandle,
+    ))));
+  };
+  if granted.was_overlay && !take_for_slice(slot, granted) {
+    granted.run.abandon();
+    return FinishStepped::Done(Box::new(Err(LandingRefusal::HostAway)));
+  }
+  let began = state.clock.monotonic_ns();
+  let finished = granted.run.finish_step(
+    &mut slot.volume,
+    &mut state.store,
+    &mut state.landing.audit,
+    &mut granted.spans,
+    budget_ns,
+  );
+  if granted.was_overlay {
+    lend_back(slot, granted);
+  }
+  let took = state.clock.monotonic_ns().saturating_sub(began);
+  state.landing.slice_times.record(took);
+  state.landing.slice_budget_ns = budget_ns;
+  if granted.run.last_step_ns() > budget_ns.saturating_add(granted.run.last_unit_ns()) {
+    state.landing.slices_past_budget = state.landing.slices_past_budget.saturating_add(1);
+  }
+  match finished {
+    Some(outcome) => FinishStepped::Done(Box::new(outcome)),
+    None => FinishStepped::More,
+  }
+}
+
+/// Completes a granted landing once its advance is done (A-133): its grant settled, its spans drained, its writer's host
+/// settled back into the volume's slot, the implicit snapshot destroyed, and the reply with the landing's records (the
+/// completion commits as one atom around this, A-127). `outcome` is the finish's, or the refusal a run that ended early
+/// carried.
+#[cfg(unix)]
+fn complete_finish(
   state: &mut ShardState,
   mut granted: GrantedRun,
-  ended: Option<Result<LandingReport, LandingRefusal>>,
+  outcome: Result<LandingReport, LandingRefusal>,
 ) -> ReplyBody {
-  let outcome = match ended {
-    Some(ended) => ended,
-    None => match state.volumes.get_mut(granted.handle) {
-      Ok(slot) => {
-        if !granted.was_overlay || take_for_slice(slot, &mut granted) {
-          granted.run.finish(
-            &mut slot.volume,
-            &mut state.store,
-            &mut state.landing.audit,
-            &mut granted.spans,
-          )
-        } else {
-          granted.run.abandon();
-          Err(LandingRefusal::HostAway)
-        }
-      }
-      Err(_) => {
-        granted.run.abandon();
-        Err(LandingRefusal::Volume(
-          slates_vfs::error::VfsError::StaleHandle,
-        ))
-      }
-    },
-  };
   settle_grant(&mut state.landing.grants, granted.run.grant(), &outcome);
   let spans = std::mem::replace(&mut granted.spans, SpanObserver::with_capacity(1));
   drain_land_spans(state, spans);
