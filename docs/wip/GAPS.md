@@ -5771,10 +5771,20 @@ On a Linux release build of `faad1562` (A-126, the probe-storm fix and the reply
       daemon 22.
     - Bug doc: `docs/bugs/2026-10-10-a-regions-first-publication-scanned-every-granule-on-a-verbs-path.md`.
   - **Still open:** the fairness lane's longest step after the fix is 20–147 ms over twelve runs, nine of them
-    97–147 ms. Profiling
-    can't name the task at load 25: the sampler gets about 1,000 of 5,000 samples on the shard thread. Next step: log
-    the long poll's attribution (own CPU, blocked, preempted, unattributed), which only the late-beat log reports
-    today.
+    97–147 ms. Profiling can't name the task at load 25: the sampler gets about 1,000 of 5,000 samples on the shard
+    thread. Next step: log the long poll's attribution (own CPU, blocked, preempted, unattributed), which only the
+    late-beat log reports today.
+  - **What the evening added (same day):**
+    - **It tracks the host's load:** most runs show it at load 25–30, 2 of 5 at 15–17 (268 and 131 ms), and none of
+      14 at 10–14, where every longest step was 19–28 ms.
+    - **It is not a landing unit:** the landing's slices never passed 22 ms in those runs.
+    - **A scratch print of each long poll's attribution** (in `attribute_poll`) never fired in 8 runs at load 10–14,
+      so the attribution is still unread.
+    - **Hypothesis, not yet shown:** the operating system keeps the shard thread off the CPU when the machine is
+      oversubscribed. That is the open shard-QoS question of 2026-10-07 (`BENCHMARKS.md`, inconclusive, owed more
+      rounds, a quiet arm and the energy cost).
+    - **Next:** the attribution print under load from other sessions, without generating load on the shared
+      machine.
 
 ### 2026-10-10: a named temporary is placed by one rename that replaces nothing (A-131)
 
