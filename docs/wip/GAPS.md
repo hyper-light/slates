@@ -5990,3 +5990,18 @@ Closes the confirmed finding of 2026-10-10 (the finish advanced every entry in o
 - **Still open from A-132:** a thread kept for the landing's barriers (persistent worker measured-and-rejected
   2026-10-10, spawn 8.7 ms/503 barriers), the directory syncs and media barrier still on the shard, the metadata calls,
   and the base plane's cold reads.
+
+### 2026-10-11: condition 5 re-validated at HEAD; base reads are at the NFS floor, not a shard hold (A-132 read-path owed, answered)
+
+`docs/wip/bench/overlay/overlay_diff.sh /usr/lib 3` on the Linux NFSv4.2 client at `864ec139` (release build, Docker VM,
+load 11; tree copied to tmpfs so readers start from RAM):
+- **No regression from A-130/132/133.** slates cold read 1.58–1.78 s, warm 621–985 ms for 5,863 files / 540 MB —
+  faster than the kernel's own NFS server (cold 1.77–2.03 s, warm 1.20–1.29 s), at the client's floor; the land plan is
+  exact (`create=5 delete=3 replace=10`) in 2–3 ms against `diff -rq` 406–461 ms.
+- **Adversarial (condition 4/5):** an outsider edit of an untouched base file was seen through the mount in 1 ms and the
+  next `slates land` planned it as a `ModifyModify` conflict, never silently merged.
+- **Answers A-132's owed "base cold reads on the shard are unmeasured" for the read path.** The cold read is ~270 µs a
+  file and is NFS client per-call overhead, not the base `pread`: on fast storage (page cache / tmpfs) the host read is
+  sub-µs, so it is not a shard hold. Moving base reads off the shard is therefore **lower value than feared** — it would
+  matter only for a slow or contended *base* disk, a narrower case. Deprioritized by measurement before building; revisit
+  only with a measured slow-disk signal.
