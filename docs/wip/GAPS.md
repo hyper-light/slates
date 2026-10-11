@@ -3625,10 +3625,15 @@ is about 9% of a macOS bsdtar round's wall time (docs/wip/BENCHMARKS.md, A-68). 
   copy-on-write diff of two tables) is the likely tool. **Measured 2026-10-11 (conditions 2, 12):** this is the OCI
   write path — every overlay volume is base-backed — and it makes filling a directory O(N²). A plain create is flat at
   ~42 µs (FUSE) / ~3 µs on the shard; an overlay create grows with the directory (p50 196 → 714 µs over 4000 creates),
-  and `publish_shard` is 70 % of the shard's CPU (`encode_inode_within`, `encode_directory`'s sort). Refined fix: a
-  **create of a new file touches the base plane not at all**, so a base-only overlay can publish a **delta whenever its
-  base plane is unchanged since the last publish** (keep whole-image for copy-ups/whiteouts, snapshots and clones) —
-  a smaller, recovery-oracle-gated step than full base-plane delta carriage. See
+  and `publish_shard` is 70 % of the shard's CPU (`encode_inode_within`, `encode_directory`'s sort). A first attempt —
+  delta whenever the base plane is unchanged (a complete `BasePlane::durable_change_token` over the versioned tables'
+  write counts + drift) — was **reverted**: the recovery oracle
+  (`an_overlays_copied_up_and_created_files_survive_a_restart_over_their_base`) caught a newly created file in the
+  overlay's base-backed **root directory** going `NOENT` after a restart. The real gap is the base-backed **directory**
+  (its merged base+upper entry state is carried only by the whole image), not the base witnesses. The token idea is
+  sound and reusable; the fix must make a base-backed directory's upper-entry delta recovery-correct (or restrict
+  deltas to upper-only directories), with the oracle broadened to new entries in base-backed vs upper-only directories,
+  copy-ups, whiteouts and renames across a crash. See
   `docs/bugs/2026-10-11-overlay-volumes-republish-whole-image-per-operation.md`.
 - **macOS round trips.** About 100 µs of kernel client per RPC, times about 37 RPCs per extracted file. NFSv4 named
   attributes would end the AppleDouble sidecars, but the macOS client speaks NFSv4.0 and slates serves 4.1 and 4.2.

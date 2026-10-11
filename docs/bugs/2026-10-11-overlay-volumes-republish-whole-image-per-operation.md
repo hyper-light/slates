@@ -72,23 +72,41 @@ copied-up files are **store** inodes (a delta carries them), whiteouts are entry
 `BaseRef` in the prior image. The open question for a base-only delta is whether the base **witnesses** recorded on
 copy-up are carried (per-inode, hence in the delta) or imaged separately by the base plane (hence missed by a delta).
 
-## Proposed fix (scoped; recovery-correctness-gated)
+## Attempted fix and what the oracle rejected (2026-10-11)
 
-Narrow `publishes_whole` so a **base-only** volume whose shape is unchanged publishes **deltas** (keep whole-image for
-snapshots, clones, shape changes, the first publish, and the `changed >= live_inodes` case). Concretely, replace the
-blanket `shape != Shape::default()` with a predicate that forces whole-image only for the shapes a delta cannot carry
-(snapshots, clones) and for base-plane state a delta does not yet carry — and extend `encode_delta`/recovery to carry
-any base witness delta that recovery needs.
+The first attempt narrowed `publishes_whole` so a base-backed volume whose **base plane is unchanged** since the last
+publication takes a delta (keeping whole-image for snapshots, clones, shape changes, the first publish, and
+`changed >= live_inodes`). The signal was a `BasePlane::durable_change_token` — the sum of the four versioned tables'
+own write counts (a new counter inside `Versioned::set`, so an in-place head overwrite is counted too, which
+`version_count` misses) plus a drift-write counter. `VolumeImage::apply` (delta.rs) was confirmed to preserve
+`self.base` across a delta, so recovery = checkpoint (carries the base plane) + deltas (patched over it). All 256 vfs
+tests passed.
 
-**The arbiter is the recovery oracle, not reasoning.** `crates/server/tests/recovery.rs`
-(`an_overlays_copied_up_and_created_files_survive_a_restart_over_their_base`) and the crash-at-every-durable-step
-oracle must pass byte-for-byte with the gate relaxed; if they fail, the delta is missing base state (name it, carry
-it, or keep whole-image for that case). Only a green oracle justifies the relaxation.
+**The server recovery oracle rejected it.** `an_overlays_copied_up_and_created_files_survive_a_restart_over_their_base`
+failed: after the restart the copied-up base file (`outside`) read back correctly, but a **newly created file (`g`) in
+the overlay's base-backed root directory was `NFS3ERR_NOENT`** — the create did not survive. So the gap is not the base
+*witnesses* (which the token caught); it is the base-backed **directory** itself. Creating an entry in a base-backed
+directory is not recovery-correct through a plain `EntryChange` delta: the directory's merged (base + upper) entry
+state is carried only by the whole image, so a delta that adds `g` to a base-backed directory is lost on recovery. The
+change was reverted (correctness first — never ship broken recovery).
 
-Expected impact: overlay create falls from O(dir)/O(volume) to O(1) delta (plain-volume parity, ~42 µs flat),
-removing the O(N²) directory fill on the OCI write path.
+## The real fix (owed; larger than the gate)
+
+A base-backed volume can publish deltas only once the **base-backed directory** representation is delta-recoverable:
+the upper entries of a base-backed directory must be carried and applied as a delta over the checkpoint's merged
+directory (not assumed already materialized as a plain `BodyImage::Directory`). Options to scope: (a) carry a
+base-backed directory's upper-entry delta explicitly and apply it against the recovered merged directory; or (b) allow
+deltas only for creates in **upper-only** (non-base-backed) directories — which helps real OCI workloads that create
+under their own new subdirectories, while base-directory creates keep whole-image — with the oracle extended to prove
+upper-dir creates survive a restart. Either needs the recovery oracle to cover: new entries in a base-backed directory,
+new entries in an upper-only directory, copy-ups, whiteouts, and renames, each with a crash and restart.
+
+The `durable_change_token` idea (a complete, cheap base-plane change signal via per-table write counts) is sound and
+reusable for whichever option is chosen; it is necessary but not sufficient.
 
 ## Status
 
-Measured and root-caused 2026-10-11. The fix is a recovery-format-sensitive change (data-loss stakes) that the design
-tracks as a separate refinement; it proceeds only behind a green recovery oracle. Not yet implemented.
+Measured and root-caused 2026-10-11; one fix attempt made and **reverted** after the recovery oracle caught a
+base-backed-directory create not surviving a restart. The real fix is the design's separately-tracked incremental
+refinement and needs the broadened oracle above; not landed. The measurement, root cause and the oracle-proven gap
+stand as the record for the next attempt.
