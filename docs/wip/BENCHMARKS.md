@@ -5171,3 +5171,47 @@ single largest p99 lever for condition 12 — far larger than any landing-side g
 closer but still ~12–14×. Next: profile one FUSE write end to end (client → kernel FUSE → daemon shard → overlay
 copy-up → reply) to attribute the 277 µs, and A/B against the NFSv4.2 mount path (kernel-side caching/readahead may beat
 FUSE).
+
+### Condition 12/2: the overlay write path is O(volume) per op — whole-image publish, not a delta (2026-10-11)
+
+A fresh Linux aarch64 release build (in Docker, kernel 6.12) re-validated the write path and attributed the earlier
+"277 µs create." The daemon's **recovery barrier** (`publish_shard`, which every mount mutation waits on) is a
+**delta** for a plain volume — measured ~3 µs on the shard, create ~42 µs end-to-end over FUSE, **flat** as the volume
+grows — refuting the earlier working hypothesis that the barrier dominates the write path. The `perf` split of a plain
+FUSE create shows the daemon's own logic at single digits of CPU (`fuse::serve` 1.7 %, `fuse::reply` 0.4 %,
+`encode_publication` 0.85 %); the cost is the **FUSE kernel transport** (`fuse_request_end` 18 %, syscall entry/exit
+~25 %, `fuse_copy_one`, `fuse_dev_write`) — the intrinsic userspace-FS premium, consistent with the ~13 µs FUSE floor
+already recorded (2026-10-06).
+
+**But overlay (base-backed) volumes do not take the delta.** `publishes_whole()` forces the whole image for any volume
+with a base, a snapshot or a clone, so every mutation re-encodes the entire volume. Measured (`plain_vs_overlay_scale.sh`,
+4000 creates in one directory, p50 by window):
+
+| volume | [0,500) | [1500,2000) | [3500,4000) |
+|---|---|---|---|
+| plain (`--dynamic`) | 99 µs | 68 µs | 97 µs — **flat, O(1) delta** |
+| overlay (`--dynamic --base`) | 196 µs | 714 µs | 490 µs — **grows, O(dir) whole-image** |
+
+`perf` of overlay creates: `publish_shard` is **70 %** of the shard's CPU (vs 0.85 % plain), in `encode_inode_within`
+(51 %) and `encode_directory` → quicksort by `NameEquivalence::compare` (33 %+21 %). The cost scales with the **upper**
+directory, not the base (base 100→8000 files held create p50 at 128–159 µs for a fixed depth). So the b8fb3d9b "277 µs
+create" was the overlay whole-image re-encode of a ~1500-entry directory — not a copy-up (134 µs, cheaper) and not VM
+load. This is the OCI/container write path (condition 2) and a bounded-work (R4) concern: filling a directory is O(N²).
+Root cause and the oracle-gated fix: `docs/bugs/2026-10-11-overlay-volumes-republish-whole-image-per-operation.md`.
+
+**Real-container re-validation at this build (conditions 2, 3, 4, 11; Docker, privileged):**
+- **Condition 4 (escape fuzz):** `battery.py`, 5 seeds × 300 hostile ops (path traversal `../`×8, device-node `mknod`,
+  cross-user, write-through to `/etc`, setuid, hardlink/symlink escapes) through a FUSE mount — **no invariant violated**;
+  the daemon's `/proc/<pid>/io` write_bytes moved **0 bytes** (condition 3: zero disk escape) and the whole outside-tree
+  hash was unchanged (condition 4).
+- **Condition 2 (containerd 1.7.24 + runc 1.1.15):** `slates attach --oci` → `{dst:/work, options:[bind,rw,private,nosuid,nodev]}`,
+  `ctr run` ran a 2000-file workload inside a real container (exit 0, 2002 entries, 0.97 s), the setuid-root probe ran as
+  **uid 65534 (nobody), not root** (A-94 under the OCI mount), the read-only attach refused writes, and the host side saw
+  all 2002 entries with an identical tar sha.
+- **Condition 11 (chaos):** git clone / cargo build / pip install on a kernel NFSv4.2 mount, daemon **SIGKILLed twice**
+  per workload — anchor restarted it **6 times over held RAM** (generation 7, restarts 6), every workload finished
+  byte-correct (git `fsck` clean, the built binary ran, `import flask 2.34.2` worked).
+
+Commands (committed lanes): `docs/wip/bench/fuse/fuse-perf.sh`, `docs/wip/bench/escape/{inner.sh,battery.py}`,
+`docs/wip/bench/containerd/run.sh`, `docs/wip/bench/realworld_chaos.sh`; the overlay A/B and perf lanes are scratch
+(`plain_vs_overlay_scale.sh`, `overlay_perf.sh`).

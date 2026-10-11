@@ -3622,7 +3622,14 @@ The quadratic barrier is fixed: create and untar rounds are flat as the volume g
 is about 9% of a macOS bsdtar round's wall time (docs/wip/BENCHMARKS.md, A-68). Owed:
 - **Snapshot-aware and base-plane deltas.** A volume with snapshots, a clone origin or a base plane still publishes in
   full at every barrier, so a snapshotted volume's barriers stay linear in its size. `trie::changed` (the
-  copy-on-write diff of two tables) is the likely tool.
+  copy-on-write diff of two tables) is the likely tool. **Measured 2026-10-11 (conditions 2, 12):** this is the OCI
+  write path — every overlay volume is base-backed — and it makes filling a directory O(N²). A plain create is flat at
+  ~42 µs (FUSE) / ~3 µs on the shard; an overlay create grows with the directory (p50 196 → 714 µs over 4000 creates),
+  and `publish_shard` is 70 % of the shard's CPU (`encode_inode_within`, `encode_directory`'s sort). Refined fix: a
+  **create of a new file touches the base plane not at all**, so a base-only overlay can publish a **delta whenever its
+  base plane is unchanged since the last publish** (keep whole-image for copy-ups/whiteouts, snapshots and clones) —
+  a smaller, recovery-oracle-gated step than full base-plane delta carriage. See
+  `docs/bugs/2026-10-11-overlay-volumes-republish-whole-image-per-operation.md`.
 - **macOS round trips.** About 100 µs of kernel client per RPC, times about 37 RPCs per extracted file. NFSv4 named
   attributes would end the AppleDouble sidecars, but the macOS client speaks NFSv4.0 and slates serves 4.1 and 4.2.
 - **Daemon memory grows** about 120 MB per round of 4,000 small files (160 → 283 MB in two rounds). Attributed and
