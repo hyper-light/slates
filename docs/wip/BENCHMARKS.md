@@ -5263,3 +5263,26 @@ is the class one in the "Condition 12 … honest comparison to TectonicFS" entry
 Tectonic gives up, and beats the runnable same-machine competitor (the kernel's NFS server) on read latency. The
 remaining refinement to the slates-side number is a **quiet-machine** p99 histogram (vs this session's load-6–15
 figures); the competitor side is a published-figure comparison by necessity.
+
+### Condition 12: overlay p99 histogram and A-134 confirmed in practice (2026-10-11, host load 3.5→VM 6.7)
+
+A quiet-ish-machine p99 histogram of the OCI write path (overlay volume, Linux FUSE, A-134), 10k creates + 5k
+create+fsync, with the publish path instrumented (`PUBDBG`, reverted):
+
+| op | p50 | p90 | p99 | p999 | max | stalls >1 ms |
+|---|---|---|---|---|---|---|
+| overlay create | 102 µs | 220 µs | 3,129 µs | 7,006 µs | 13,437 µs | 798 / 10,000 |
+| overlay create+fsync | 103 µs | 138 µs | **232 µs** | 610 µs | 2,489 µs | **3 / 5,000** |
+| plain create (same workload) | 76 µs | 137 µs | 221 µs | 437 µs | 1,516 µs | 4 / 10,000 |
+
+**A-134 confirmed in practice, not just asymptotically.** The instrumented publish path showed the overlay publishing
+**small deltas of 471–757 bytes** (not whole images), with checkpoints rare (~1 per 2,000 publishes, same as a plain
+volume). So the O(volume)-per-op publish is genuinely gone on the real daemon under load — the delta bytes are constant
+and tiny, matching the deterministic allocation proof.
+
+**The durability-critical path is clean:** overlay create+**fsync** is p99 232 µs with only 3 stalls in 5,000 — on par
+with a plain volume (p99 221 µs). The tail appears only in overlay create **without** fsync (798 stalls, p99 3.1 ms).
+Since the same volume and base with fsync is clean, the tail is not the publish or a base-plane read (those run on the
+fsync path too) — it is consistent with the kernel's FUSE async write-back bursting under VM load on the unsynced path,
+not a daemon cost A-134 left behind. A dedicated isolation of that unsynced-writeback tail (and a bare-metal, not-VM
+run) is the remaining condition-12 refinement; the durability path and the publish cost are both established.
