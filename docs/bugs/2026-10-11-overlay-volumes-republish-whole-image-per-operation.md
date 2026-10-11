@@ -84,29 +84,42 @@ tests passed.
 
 **The server recovery oracle rejected it.** `an_overlays_copied_up_and_created_files_survive_a_restart_over_their_base`
 failed: after the restart the copied-up base file (`outside`) read back correctly, but a **newly created file (`g`) in
-the overlay's base-backed root directory was `NFS3ERR_NOENT`** — the create did not survive. So the gap is not the base
-*witnesses* (which the token caught); it is the base-backed **directory** itself. Creating an entry in a base-backed
-directory is not recovery-correct through a plain `EntryChange` delta: the directory's merged (base + upper) entry
-state is carried only by the whole image, so a delta that adds `g` to a base-backed directory is lost on recovery. The
-change was reverted (correctness first — never ship broken recovery).
+the overlay was `NFS3ERR_NOENT`** — the create did not survive.
 
-## The real fix (owed; larger than the gate)
+**What the debug pass showed, and what it did not (honest record).** With the gate hacked to let base-only volumes
+delta (`SLATES_DELTADBG`), the overlay volume's logged delta publications carried **empty change sets** (`changed=0`,
+`dirty.inodes=[]`, no entries) and recovery applied no entry changes — the delta never carried `g`. **But this does not
+by itself establish the mechanism:** the overlay create path delegates to `self.vol.create_file` (and `mknod_no`,
+`mkdir`, `symlink`) — the *same* volume methods a plain create uses, which *do* record `dirty.inode`/`dirty.entry`. So
+a plain overlay create should dirty the volume. The empty-delta the hack produced is therefore most likely a
+publish-timing or shard-ownership artifact of the hack (e.g. an earlier forced delta cleared the dirty set before the
+logged publishes, or the logged publishes were a non-owner shard's clean view with `TEST_SHARDS=2`), **not** a proven
+"overlay does not dirty" bug. The precise recovery-loss mechanism is **not yet pinned**.
 
-A base-backed volume can publish deltas only once the **base-backed directory** representation is delta-recoverable:
-the upper entries of a base-backed directory must be carried and applied as a delta over the checkpoint's merged
-directory (not assumed already materialized as a plain `BodyImage::Directory`). Options to scope: (a) carry a
-base-backed directory's upper-entry delta explicitly and apply it against the recovered merged directory; or (b) allow
-deltas only for creates in **upper-only** (non-base-backed) directories — which helps real OCI workloads that create
-under their own new subdirectories, while base-directory creates keep whole-image — with the oracle extended to prove
-upper-dir creates survive a restart. Either needs the recovery oracle to cover: new entries in a base-backed directory,
-new entries in an upper-only directory, copy-ups, whiteouts, and renames, each with a crash and restart.
+The change was reverted (correctness first — never ship broken recovery).
 
-The `durable_change_token` idea (a complete, cheap base-plane change signal via per-table write counts) is sound and
-reusable for whichever option is chosen; it is necessary but not sufficient.
+## The real fix (owed; mechanism not yet pinned)
+
+The gate relaxation is oracle-proven unsafe; the exact reason an overlay delta loses a create is still open. A concrete
+finding for the next attempt: there are **two publish paths**, chosen per shard by `journal.wants_checkpoint()` —
+`publish_delta` → `Volume::encode_publication` (where `publishes_whole`/`encode_delta` live, `verbs.rs:9116`), and
+`publish_checkpoint` → `Volume::encode_image_into` (`verbs.rs:9051`), which walks the whole volume and always captures
+`g`. A clean debug pass (logging in `encode_publication`, no gate hack) produced **no** `encode_publication` calls for
+this short test — it publishes entirely via the **checkpoint** path, which is why whole-image recovery always works and
+why the gate hack's failure involves the delta path only under a specific checkpoint cadence. The next debug step is a
+cleaner repro that logs, per NFS operation, the volume id, the owning shard, which path (delta vs checkpoint) and record
+(Full vs Delta) each barrier produces, and whether the create's *own* publish carried `g` — so the delta-vs-checkpoint
+cadence and shard ownership are pinned before concluding anything about the dirty set or the base-backed directory. Only once the mechanism is
+pinned should `publishes_whole` be relaxed, behind a recovery oracle broadened to cover: a create in a base-backed
+directory, a create in an upper-only directory, a copy-up, a whiteout and a rename, each surviving a crash+restart via
+a delta (not just the whole image). The `durable_change_token` idea (a complete, cheap base-plane change signal via
+per-table write counts) remains sound and reusable for the base-plane half of whatever the fix turns out to need.
 
 ## Status
 
-Measured and root-caused 2026-10-11; one fix attempt made and **reverted** after the recovery oracle caught a
-base-backed-directory create not surviving a restart. The real fix is the design's separately-tracked incremental
-refinement and needs the broadened oracle above; not landed. The measurement, root cause and the oracle-proven gap
-stand as the record for the next attempt.
+Measured and root-caused the cost 2026-10-11 (overlay publishes the whole image per op → O(N²) directory fill). One
+gate-relaxation attempt made and **reverted** after the recovery oracle caught an overlay create not surviving a
+restart. A debug pass was inconclusive on the precise mechanism (the empty-delta it showed is likely a hack artifact,
+since overlay creates delegate to the dirtying volume path). The fix is the design's separately-tracked incremental
+refinement; not landed. The measurement, the root cause of the *cost*, and the oracle-proven unsafety of the naive gate
+stand as the record; the precise recovery-loss mechanism is the first task of the next attempt.

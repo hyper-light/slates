@@ -3628,12 +3628,14 @@ is about 9% of a macOS bsdtar round's wall time (docs/wip/BENCHMARKS.md, A-68). 
   and `publish_shard` is 70 % of the shard's CPU (`encode_inode_within`, `encode_directory`'s sort). A first attempt —
   delta whenever the base plane is unchanged (a complete `BasePlane::durable_change_token` over the versioned tables'
   write counts + drift) — was **reverted**: the recovery oracle
-  (`an_overlays_copied_up_and_created_files_survive_a_restart_over_their_base`) caught a newly created file in the
-  overlay's base-backed **root directory** going `NOENT` after a restart. The real gap is the base-backed **directory**
-  (its merged base+upper entry state is carried only by the whole image), not the base witnesses. The token idea is
-  sound and reusable; the fix must make a base-backed directory's upper-entry delta recovery-correct (or restrict
-  deltas to upper-only directories), with the oracle broadened to new entries in base-backed vs upper-only directories,
-  copy-ups, whiteouts and renames across a crash. See
+  (`an_overlays_copied_up_and_created_files_survive_a_restart_over_their_base`) caught a newly created overlay file
+  going `NOENT` after a restart. A debug pass showed the overlay's logged delta publications had empty change sets, but
+  that is **not** conclusive — overlay creates delegate to the same `create_file`/`mknod_no`/`mkdir` volume methods
+  (which do dirty) as plain creates, so the empty delta is most likely a hack-induced publish-timing/shard artifact,
+  not a proven missing-dirty bug. The precise recovery-loss mechanism is **not yet pinned**; the next attempt must first
+  rule out timing/ownership (log per-op volume id, owning shard, and whether the create's own publish was Full or
+  Delta) before relaxing `publishes_whole` behind a broadened oracle (base-backed vs upper-only creates, copy-ups,
+  whiteouts, renames across a crash). The `durable_change_token` idea remains sound and reusable. See
   `docs/bugs/2026-10-11-overlay-volumes-republish-whole-image-per-operation.md`.
 - **macOS round trips.** About 100 µs of kernel client per RPC, times about 37 RPCs per extracted file. NFSv4 named
   attributes would end the AppleDouble sidecars, but the macOS client speaks NFSv4.0 and slates serves 4.1 and 4.2.
