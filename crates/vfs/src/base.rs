@@ -403,6 +403,10 @@ pub struct BasePlane {
   witness_homes: Versioned<InodeNo, (InodeNo, Box<str>)>,
   /// Drift by inode number.
   drift: BTreeMap<InodeNo, DriftKind>,
+  /// One per change to [`Self::drift`]: the base plane's durable-change token
+  /// ([`Self::durable_change_token`]) counts it beside the versioned tables' writes, so an overlay publication
+  /// takes a delta — which carries no base-plane state — only while the whole durable base plane is unchanged.
+  drift_writes: u64,
   /// Open file descriptors by inode number (large-class copies and read-through).
   descriptors: BTreeMap<InodeNo, HostFile>,
   /// Descriptors taken out of `descriptors` by a reclaim that had no host to close them with (the volume reclaims an
@@ -463,6 +467,7 @@ impl BasePlane {
       witnesses: Versioned::default(),
       witness_homes: Versioned::default(),
       drift: BTreeMap::new(),
+      drift_writes: 0,
       descriptors: BTreeMap::new(),
       closing: Vec::new(),
       whiteouts: Versioned::default(),
@@ -510,6 +515,22 @@ impl BasePlane {
     plane.whiteouts = self.whiteouts.view_at(epoch);
     plane.redirects = self.redirects.view_at(epoch);
     plane
+  }
+
+  /// A token that changes whenever any durable base-plane state a delta publication does not carry has been written
+  /// since it was last read: the witnesses, their homes, the whiteouts and the redirects (each counts its own writes,
+  /// including an in-place head overwrite), and the drift set. An overlay's publication takes a delta (which carries
+  /// no base plane) only while this token equals what its last committed publication saw, so a copy-up, whiteout,
+  /// rename or drift forces the next publication to be the whole image — the only record that carries the base plane
+  /// (A-48). Listings are not counted: recovery re-reads them from the host.
+  pub(crate) fn durable_change_token(&self) -> u64 {
+    self
+      .witnesses
+      .writes()
+      .wrapping_add(self.witness_homes.writes())
+      .wrapping_add(self.whiteouts.writes())
+      .wrapping_add(self.redirects.writes())
+      .wrapping_add(self.drift_writes)
   }
 
   /// The witness of an inode, if it was copied up.
@@ -953,7 +974,9 @@ impl Volume {
     if plane.forget_digest(store, no) {
       plane.digest_stats.invalidated = plane.digest_stats.invalidated.saturating_add(1);
     }
-    plane.drift.remove(&no);
+    if plane.drift.remove(&no).is_some() {
+      plane.drift_writes = plane.drift_writes.saturating_add(1);
+    }
     let descriptor = plane.descriptors.remove(&no);
     let at = self.witness_clock();
     if let Some(plane) = self.base.as_mut() {
@@ -2804,11 +2827,13 @@ impl Overlay<'_> {
 
   /// Records a drift of `kind` for the inode (once per kind) and journals it.
   fn record_drift(&mut self, store: &mut Store, no: InodeNo, kind: DriftKind) {
-    let fresh = self
-      .vol
-      .base
-      .as_mut()
-      .is_some_and(|b| b.drift.insert(no, kind) != Some(kind));
+    let fresh = self.vol.base.as_mut().is_some_and(|b| {
+      let changed = b.drift.insert(no, kind) != Some(kind);
+      if changed {
+        b.drift_writes = b.drift_writes.saturating_add(1);
+      }
+      changed
+    });
     if fresh {
       let path = self.vol.path_of_inode(store, no).unwrap_or_default();
       self.vol.record(Op::Drift, path, Some(no), 0);
@@ -3232,7 +3257,9 @@ impl Overlay<'_> {
       plane.digest_stats.invalidated = plane.digest_stats.invalidated.saturating_add(1);
     }
     plane.record_witness(no, written, Some((dir, name.into())), at);
-    plane.drift.remove(&no);
+    if plane.drift.remove(&no).is_some() {
+      plane.drift_writes = plane.drift_writes.saturating_add(1);
+    }
     if let Some(stale) = plane.descriptors.remove(&no) {
       self.host.close_file(stale);
     }
@@ -3417,7 +3444,9 @@ impl Overlay<'_> {
       let at = self.vol.witness_clock();
       let plane = self.plane()?;
       plane.record_witness(no, witness, None, at);
-      plane.drift.remove(&no);
+      if plane.drift.remove(&no).is_some() {
+        plane.drift_writes = plane.drift_writes.saturating_add(1);
+      }
       let handle = self.vol.make_current_inode(store, no)?;
       let prev = store.inodes.get(handle)?.version;
       let keep_descriptor = if let Body::Base(b) = &mut store.inodes.get_mut(handle)?.body {

@@ -98,28 +98,50 @@ logged publishes, or the logged publishes were a non-owner shard's clean view wi
 
 The change was reverted (correctness first — never ship broken recovery).
 
-## The real fix (owed; mechanism not yet pinned)
+## The mechanism, pinned (and the earlier debug's capture error)
 
-The gate relaxation is oracle-proven unsafe; the exact reason an overlay delta loses a create is still open. A concrete
-finding for the next attempt: there are **two publish paths**, chosen per shard by `journal.wants_checkpoint()` —
-`publish_delta` → `Volume::encode_publication` (where `publishes_whole`/`encode_delta` live, `verbs.rs:9116`), and
-`publish_checkpoint` → `Volume::encode_image_into` (`verbs.rs:9051`), which walks the whole volume and always captures
-`g`. A clean debug pass (logging in `encode_publication`, no gate hack) produced **no** `encode_publication` calls for
-this short test — it publishes entirely via the **checkpoint** path, which is why whole-image recovery always works and
-why the gate hack's failure involves the delta path only under a specific checkpoint cadence. The next debug step is a
-cleaner repro that logs, per NFS operation, the volume id, the owning shard, which path (delta vs checkpoint) and record
-(Full vs Delta) each barrier produces, and whether the create's *own* publish carried `g` — so the delta-vs-checkpoint
-cadence and shard ownership are pinned before concluding anything about the dirty set or the base-backed directory. Only once the mechanism is
-pinned should `publishes_whole` be relaxed, behind a recovery oracle broadened to cover: a create in a base-backed
-directory, a create in an upper-only directory, a copy-up, a whiteout and a rename, each surviving a crash+restart via
-a delta (not just the whole image). The `durable_change_token` idea (a complete, cheap base-plane change signal via
-per-table write counts) remains sound and reusable for the base-plane half of whatever the fix turns out to need.
+The first gate-relaxation attempt left the delta empty because of a **second, coupled gate I had missed**:
+`Dirty::recording()` returned `self.published && self.published_shape == Shape::default()`, so for any base/snapshot/
+clone volume it **skipped recording changes into the dirty set** (a 2026-10-05 memory optimization — a volume that
+always publishes whole need not hold "a name and a number per change"). Relaxing only `publishes_whole` therefore asked
+`encode_delta` to encode an **empty** dirty set → the create was never carried → lost on restart.
+
+My intervening debug passes read "zero publishes" and "the landing test doesn't call `publish_shard`" — both were a
+**`--nocapture` capture error**: libtest hides a passing test's output, and the daemon runs on in-process shard threads
+whose `eprintln` the harness swallowed. With `--nocapture`, `publish_shard` is called on every NFS barrier (proc 7
+WRITE / proc 8 CREATE, `outcome_some=true`), the overlay's deltas were empty (`changed=0 dirty_inodes=[]`), and that
+emptiness is exactly `recording()` skipping base volumes — not a shard/ownership or directory-representation issue.
+
+## The fix (landed 2026-10-11)
+
+Two coupled changes, gated by one predicate (an overlay with a stable base plane and no snapshots/clone may delta):
+
+- **`crates/vfs/src/delta.rs`** — `recording()` now records for a base-only volume (`published && no snapshots &&
+  no clone`); it still skips snapshot/clone volumes (they always publish whole), and still skips before the first
+  publish. `publishes_whole()` drops the blanket `shape != Shape::default()` and instead forces the whole image only
+  for snapshots, clones, a shape change, `changed >= live_inodes`, the first publish, or **`base_plane_changed()`** —
+  so an overlay publishes a delta while its base plane holds still, and the whole image on any copy-up/whiteout/rename/
+  drift. `is_clean` and `mark_published` track the base token; `Dirty` carries `published_base_token`.
+- **`crates/vfs/src/base.rs` + `base_versions.rs`** — `BasePlane::durable_change_token()` = the sum of the four
+  versioned tables' own write counts (`Versioned::writes`, bumped in `set`, so an in-place head overwrite counts too —
+  `version_count` would miss it) plus a drift-write counter. Complete and cheap; it moves on every durable base-plane
+  write, so `base_plane_changed()` forces the whole image whenever the base plane a delta cannot carry has changed.
+
+**Why it is safe:** recovery applies a delta over the last checkpoint, and `VolumeImage::apply` leaves `self.base`
+untouched — so the checkpoint's base plane is preserved and the delta carries only the store changes (created/copied-up
+inodes, entries, whiteouts). A base-plane change forces a whole image (which carries the plane), so no base-plane delta
+is ever dropped.
+
+**Proven:** `crates/server/tests/recovery.rs` 39/0 — the overlay oracle
+(`an_overlays_copied_up_and_created_files_survive_a_restart_over_their_base`) and the crash-at-every-durable-step oracle
+pass; the full `crates/vfs` suite is green; and a new load-independent regression,
+`crates/vfs/tests/delta_cost.rs::an_overlay_create_publishes_a_delta_costing_the_same_in_a_large_upper_as_in_a_small_one`,
+asserts an overlay create now publishes a **delta** whose publication+replay allocate the **same** in a 4,096-entry
+upper as in a 64-entry one (was O(volume), O(N²) to fill a directory). `cargo clippy --workspace --all-targets
+-- -D warnings` and `cargo xtask check` clean.
 
 ## Status
 
-Measured and root-caused the cost 2026-10-11 (overlay publishes the whole image per op → O(N²) directory fill). One
-gate-relaxation attempt made and **reverted** after the recovery oracle caught an overlay create not surviving a
-restart. A debug pass was inconclusive on the precise mechanism (the empty-delta it showed is likely a hack artifact,
-since overlay creates delegate to the dirtying volume path). The fix is the design's separately-tracked incremental
-refinement; not landed. The measurement, the root cause of the *cost*, and the oracle-proven unsafety of the naive gate
-stand as the record; the precise recovery-loss mechanism is the first task of the next attempt.
+**FIXED 2026-10-11.** Overlay (base-backed) volumes publish deltas per barrier while their base plane is unchanged,
+recovery is byte-correct (oracle-proven), and the write path is no longer O(volume) per operation. Owed, separately:
+snapshot/clone deltas (still whole-image — the head-into-snapshot and shared-root problems a delta cannot carry).

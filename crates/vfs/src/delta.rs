@@ -84,6 +84,11 @@ pub struct Dirty {
   /// The volume's roots when it was last published: a resize or an attachment changes them without touching an
   /// inode, so a volume whose roots moved is not clean.
   published_roots: Option<Roots>,
+  /// An overlay's base-plane change token (`BasePlane::durable_change_token`) when it was last published, or `None`
+  /// for a volume with no base. A delta carries no base plane, so an overlay publishes one only while this still
+  /// equals the plane's token now; a copy-up, whiteout, rename or drift since forces the whole image. Set by
+  /// `mark_published`, read by `publishes_whole` and `is_clean`.
+  published_base_token: Option<u64>,
 }
 
 /// A volume's small roots, carried in full by every delta.
@@ -107,11 +112,17 @@ struct Shape {
 
 impl Dirty {
   /// Whether a change is worth recording: only while the next publication may be a delta. Before a volume's first
-  /// committed publication, and while its published shape has snapshots, a clone origin or a base plane, the next one
-  /// is its full image whatever changed, so recording would hold a name and a number per change for nothing (measured
-  /// 2026-10-05: 134 heap bytes a file, a million files created into a never-published volume, 443 → 578 MB).
+  /// committed publication the next one is its full image whatever changed, so recording would hold a name and a
+  /// number per change for nothing (measured 2026-10-05: 134 heap bytes a file, a million files created into a
+  /// never-published volume, 443 → 578 MB). A **snapshot or a clone origin** also always publishes whole (a head
+  /// change can move a snapshot's shared file into its own image; a clone shares its delta root), so neither records.
+  /// A **base plane** does **not** force the whole image on its own: an overlay's delta carries its store changes
+  /// (created and copied-up inodes, entries and whiteouts) over the checkpoint's base plane, which recovery preserves
+  /// (`VolumeImage::apply` leaves `base` untouched), and it publishes per barrier so the recorded set stays small. An
+  /// overlay publishes whole only when its base plane itself changed since the last publish (`base_plane_changed`),
+  /// which the publication decides; recording while a delta is possible is what lets that delta carry anything.
   fn recording(&self) -> bool {
-    self.published && self.published_shape == Shape::default()
+    self.published && self.published_shape.snapshots == 0 && !self.published_shape.clone
   }
 
   /// Records a changed inode.
@@ -386,15 +397,30 @@ impl Volume {
     encoded
   }
 
-  /// Whether this volume's next publication is its whole image: never published, a shape a delta does not carry
-  /// (snapshots, a clone, a base), a shape changed since, or as many inodes changed as it holds.
+  /// Whether this volume's next publication is its whole image: never published; a shape a delta cannot carry
+  /// (snapshots — a head change can move a shared file into a snapshot's own image; a clone — it shares its delta
+  /// root); a shape changed since; as many inodes changed as it holds; or an overlay whose base plane changed since
+  /// the last publish (a delta carries no base plane, so a copy-up, whiteout, rename or drift takes the whole image).
   fn publishes_whole(&self) -> bool {
     let changed = u64::try_from(self.dirty.inodes.len()).unwrap_or(u64::MAX);
     let shape = self.shape();
     !self.dirty.published
-      || shape != Shape::default()
       || self.dirty.published_shape != shape
       || changed >= self.live_inodes
+      || shape.snapshots > 0
+      || shape.clone
+      || self.base_plane_changed()
+  }
+
+  /// This volume's base-plane change token now ([`BasePlane::durable_change_token`]), or `None` with no base.
+  fn base_change_token(&self) -> Option<u64> {
+    self.base.as_ref().map(|plane| plane.durable_change_token())
+  }
+
+  /// Whether the base plane has changed since the last committed publication (always false for a volume that never
+  /// had a base): a delta carries no base plane, so such a volume must publish the whole image.
+  fn base_plane_changed(&self) -> bool {
+    self.base_change_token() != self.dirty.published_base_token
   }
 
   /// Whether nothing changed since this volume's last committed publication: a barrier need not record it.
@@ -407,6 +433,7 @@ impl Volume {
       && self.dirty.published_shape == self.shape()
       && self.dirty.published_roots.is_some()
       && self.dirty.published_roots == self.roots(store).ok()
+      && !self.base_plane_changed()
   }
 
   /// Records that this volume's last [`Volume::publication`] was published and committed: the changes it carried are
@@ -417,6 +444,7 @@ impl Volume {
     self.dirty.published = true;
     self.dirty.published_shape = self.shape();
     self.dirty.published_roots = self.roots(store).ok();
+    self.dirty.published_base_token = self.base_change_token();
   }
 
   /// This volume's roots now.

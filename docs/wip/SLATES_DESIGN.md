@@ -1251,6 +1251,13 @@ ring and kicks the driver; a stale generation is ignored.
 > heartbeat kill. Whole-image publication still scales with retained bytes and needs its
 > separately tracked incremental/cooperative refinement. Evidence:
 > `docs/bugs/2026-09-19-nfs-ready-connection-starves-heartbeat.md`.
+>
+> **Update (A-134, 2026-10-11):** the incremental refinement landed for plain volumes (A-68) and now for **overlay
+> (base-backed) volumes** — every OCI/container volume: a barrier publishes a delta while the base plane is unchanged,
+> forcing the whole image only on a copy-up/whiteout/rename/drift (gated by `BasePlane::durable_change_token`), so the
+> overlay write path is O(delta) not O(volume) (was O(N²) to fill a directory). Snapshot and clone volumes still
+> publish whole (the head-into-snapshot and shared-root cases a delta cannot carry). Evidence:
+> `docs/bugs/2026-10-11-overlay-volumes-republish-whole-image-per-operation.md`.
 
 **Loop.** Each iteration: drain the driver's completions (io_uring CQ / kqueue events / IOCP
 packets) into the run queue; drain inbound rings (client command rings, cross-shard rings, the

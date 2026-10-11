@@ -5215,3 +5215,26 @@ Root cause and the oracle-gated fix: `docs/bugs/2026-10-11-overlay-volumes-repub
 Commands (committed lanes): `docs/wip/bench/fuse/fuse-perf.sh`, `docs/wip/bench/escape/{inner.sh,battery.py}`,
 `docs/wip/bench/containerd/run.sh`, `docs/wip/bench/realworld_chaos.sh`; the overlay A/B and perf lanes are scratch
 (`plain_vs_overlay_scale.sh`, `overlay_perf.sh`).
+
+### Condition 2/12: overlay volumes publish deltas, not their whole image (A-134; 2026-10-11)
+
+The overlay O(volume)-per-op write path (previous entry) is **fixed**. An overlay (base-backed) volume — every
+OCI/container volume — now publishes a **delta** per barrier while its base plane is unchanged, instead of re-imaging
+the whole volume. Two coupled gates both had to move: `Dirty::recording()` (which had skipped recording changes for any
+base/snapshot/clone volume, so the delta was empty) now records for a base-only volume, and `publishes_whole()` takes
+the delta unless the base plane changed since the last publish (`BasePlane::durable_change_token` = the four versioned
+tables' own write counts — bumped in `Versioned::set`, so an in-place head overwrite counts, which `version_count`
+misses — plus a drift counter). A copy-up/whiteout/rename/drift still publishes the whole image (the only record that
+carries the base plane); recovery applies the delta over the checkpoint, and `VolumeImage::apply` preserves `self.base`.
+
+**Proof (load-independent — allocation-counted, valid under any machine load).**
+`crates/vfs/tests/delta_cost.rs::an_overlay_create_publishes_a_delta_costing_the_same_in_a_large_upper_as_in_a_small_one`:
+one create in an overlay now publishes a `VolumeRecord::Delta` (asserted, was `Full`), and its publication + replay
+allocate **identically** in a 4,096-entry upper directory and a 64-entry one — i.e. O(delta), not O(volume). Before the
+fix the publication was the whole image, allocating with the directory (O(N²) to fill one). Recovery byte-correctness is
+proven by `crates/server/tests/recovery.rs` 39/0 (the overlay restart oracle and the crash-at-every-durable-step
+oracle). `cargo clippy --workspace --all-targets -- -D warnings` and `cargo xtask check` clean.
+
+A wall-clock p99 A/B (overlay create flat vs the earlier 196 → 714 µs growth) is owed on a quiet machine — this session's
+host was at load 48 (other sessions), where timing is unreliable; the allocation-count proof above is load-independent
+and establishes the asymptotic win now. Snapshot/clone volumes still publish whole (owed, a separate delta refinement).

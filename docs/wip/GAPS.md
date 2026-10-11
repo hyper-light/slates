@@ -3620,23 +3620,22 @@ user are refused since A-107.
 
 The quadratic barrier is fixed: create and untar rounds are flat as the volume grows, and the daemon's own service
 is about 9% of a macOS bsdtar round's wall time (docs/wip/BENCHMARKS.md, A-68). Owed:
-- **Snapshot-aware and base-plane deltas.** A volume with snapshots, a clone origin or a base plane still publishes in
-  full at every barrier, so a snapshotted volume's barriers stay linear in its size. `trie::changed` (the
-  copy-on-write diff of two tables) is the likely tool. **Measured 2026-10-11 (conditions 2, 12):** this is the OCI
-  write path — every overlay volume is base-backed — and it makes filling a directory O(N²). A plain create is flat at
-  ~42 µs (FUSE) / ~3 µs on the shard; an overlay create grows with the directory (p50 196 → 714 µs over 4000 creates),
-  and `publish_shard` is 70 % of the shard's CPU (`encode_inode_within`, `encode_directory`'s sort). A first attempt —
-  delta whenever the base plane is unchanged (a complete `BasePlane::durable_change_token` over the versioned tables'
-  write counts + drift) — was **reverted**: the recovery oracle
-  (`an_overlays_copied_up_and_created_files_survive_a_restart_over_their_base`) caught a newly created overlay file
-  going `NOENT` after a restart. A debug pass showed the overlay's logged delta publications had empty change sets, but
-  that is **not** conclusive — overlay creates delegate to the same `create_file`/`mknod_no`/`mkdir` volume methods
-  (which do dirty) as plain creates, so the empty delta is most likely a hack-induced publish-timing/shard artifact,
-  not a proven missing-dirty bug. The precise recovery-loss mechanism is **not yet pinned**; the next attempt must first
-  rule out timing/ownership (log per-op volume id, owning shard, and whether the create's own publish was Full or
-  Delta) before relaxing `publishes_whole` behind a broadened oracle (base-backed vs upper-only creates, copy-ups,
-  whiteouts, renames across a crash). The `durable_change_token` idea remains sound and reusable. See
+- **Base-plane deltas — DONE 2026-10-11 (conditions 2, 12).** Overlay (base-backed) volumes used to publish their whole
+  image at every barrier — the OCI write path, O(volume) per op, O(N²) to fill a directory (overlay create p50 grew
+  196 → 714 µs over 4000 creates; `publish_shard` 70 % of the shard's CPU in `encode_inode_within`/`encode_directory`'s
+  sort). **Fixed:** the cost's second gate was `Dirty::recording()`, which skipped recording changes for base/snapshot/
+  clone volumes, so relaxing `publishes_whole` alone left an empty delta (a `--nocapture` capture error hid this for two
+  passes). Now `recording()` records for a base-only volume, and `publishes_whole()` takes a delta while the base plane
+  is unchanged (`BasePlane::durable_change_token` = the versioned tables' own write counts + drift, complete incl.
+  in-place overwrites), forcing the whole image on any copy-up/whiteout/rename/drift. Recovery is byte-correct because
+  `VolumeImage::apply` preserves `self.base`. Proven: `crates/server/tests/recovery.rs` 39/0 (the overlay oracle + the
+  crash-at-every-step), full `crates/vfs` green, and the load-independent
+  `delta_cost.rs::an_overlay_create_publishes_a_delta_costing_the_same_in_a_large_upper_as_in_a_small_one`. See
   `docs/bugs/2026-10-11-overlay-volumes-republish-whole-image-per-operation.md`.
+- **Snapshot-aware and clone deltas — still owed.** A volume with snapshots or a clone origin still publishes in full
+  at every barrier (a head change can move a snapshot's shared file into its own image; a clone shares its delta root —
+  neither is carried by a delta), so a snapshotted volume's barriers stay linear in its size. `trie::changed` (the
+  copy-on-write diff of two tables) is the likely tool.
 - **macOS round trips.** About 100 µs of kernel client per RPC, times about 37 RPCs per extracted file. NFSv4 named
   attributes would end the AppleDouble sidecars, but the macOS client speaks NFSv4.0 and slates serves 4.1 and 4.2.
 - **Daemon memory grows** about 120 MB per round of 4,000 small files (160 → 283 MB in two rounds). Attributed and
