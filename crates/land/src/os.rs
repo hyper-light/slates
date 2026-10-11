@@ -423,6 +423,33 @@ fn rename_without_replacing(
   renameatx(dir, from, to_dir, to, libc::RENAME_EXCL)
 }
 
+/// A named temporary moved from `from` to `to`, refused `EEXIST` when `to` exists, holding the one name after: the
+/// rename that never replaces, one metadata operation where a link and an unlink were two. APFS measured 46–57 µs a
+/// file against 198–259 µs for the pair (2026-10-10, `BENCHMARKS.md`).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn move_without_replacing(
+  dir: BorrowedFd<'_>,
+  from: &str,
+  to_dir: BorrowedFd<'_>,
+  to: &str,
+) -> Result<(), HostError> {
+  rename_without_replacing(dir, from, to_dir, to)
+}
+
+/// A named temporary moved where no rename refuses an existing name: a link (which refuses one) and the old name's
+/// removal, the temporary at both names between the two; the sweep removes a hidden one a crash leaves.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[allow(clippy::disallowed_methods)] // the write seam's own placement (R1, D-26; AUD-29-31).
+fn move_without_replacing(
+  dir: BorrowedFd<'_>,
+  from: &str,
+  to_dir: BorrowedFd<'_>,
+  to: &str,
+) -> Result<(), HostError> {
+  rustix::fs::linkat(dir, from, to_dir, to, AtFlags::empty()).map_err(refusal)?;
+  rustix::fs::unlinkat(dir, from, AtFlags::empty()).map_err(refusal)
+}
+
 /// Where neither exists, the rename that never replaces is unavailable: a removal refuses rather than race.
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn rename_without_replacing(
@@ -669,14 +696,17 @@ impl LandFs for OsLand {
     match temp.created_as {
       None => self.link_unnamed(file, dir, name),
       Some(created) if temp.dir == dir && created.as_ref() == name => Ok(()),
-      Some(created) => rustix::fs::linkat(
-        self.dir(temp.dir)?,
-        created.as_ref(),
-        self.dir(dir)?,
-        name,
-        AtFlags::empty(),
-      )
-      .map_err(refusal),
+      Some(created) => {
+        move_without_replacing(self.dir(temp.dir)?, created.as_ref(), self.dir(dir)?, name)?;
+        self.temps.insert(
+          file.0,
+          Temp {
+            dir,
+            created_as: Some(name.into()),
+          },
+        );
+        Ok(())
+      }
     }
   }
 

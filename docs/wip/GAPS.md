@@ -5775,3 +5775,23 @@ On a Linux release build of `faad1562` (A-126, the probe-storm fix and the reply
     can't name the task at load 25: the sampler gets about 1,000 of 5,000 samples on the shard thread. Next step: log
     the long poll's attribution (own CPU, blocked, preempted, unattributed), which only the late-beat log reports
     today.
+
+### 2026-10-10: a named temporary is placed by one rename that replaces nothing (A-131)
+
+- **Why:** on APFS, placement was most of a landing's time after A-130. A named temporary reached its name by `linkat`
+  plus `unlinkat`: 370 of 653 landing samples in a debug profile, and 198–259 µs a file alone against 46–57 µs for one
+  `renameatx_np(RENAME_EXCL)`.
+- **Built:** `LandFs::place` leaves a temporary at its one name.
+  - A named temporary moves by the rename that refuses an existing name (Linux `RENAME_NOREPLACE`, macOS
+    `RENAME_EXCL`). Elsewhere it takes a link and the old name's removal.
+  - The engine's unlinks of creation names are gone.
+  - A crash now leaves a named temporary at one name, never two.
+- **Measured through the engine on APFS:** 1.6–3.0× against `56d309dc` with the change at the higher load, 2.0–3.6×
+  the other way. macOS landing is now 165–359 µs a file, against about 700–900 this morning.
+- **Proven:**
+  - the crash-at-every-instruction oracle on the named shapes;
+  - the durability and directory-sync oracles;
+  - the OS writer's real-disk tests on APFS and ext4.
+
+- **Linux lane** (bounded container, io_uring, non-root): clippy clean; `slates-land` and `slates-vfs` 315 passed, the
+  OS writer's real-disk tests on ext4 among them.

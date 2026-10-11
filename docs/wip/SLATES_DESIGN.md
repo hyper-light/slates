@@ -5183,7 +5183,8 @@ entry either old or new, never torn).
    unchanged across that bounded read. A descriptor opened before the exchange cannot prove
    which inode was displaced. If verification fails, exchange back, remove the temporary, and record
    `Conflict(TargetInUse)` for the entry. macOS: a hidden sibling name, `pwritev` on a pool
-   thread, `fsync` and then the batch's `fcntl(F_BARRIERFSYNC)` (A-130), `renamex_np(RENAME_SWAP)`,
+   thread, `fsync` and then the batch's `fcntl(F_BARRIERFSYNC)` (A-130), the new file moved to its
+   name by one `renameatx_np(RENAME_EXCL)` (A-131), `renamex_np(RENAME_SWAP)` for a replacement,
    the same verify-and-undo;
    `clonefile` for reflinks where `VOL_CAP_INT_CLONE` says so. Windows: open the target with
    `FILE_SHARE_READ|FILE_SHARE_DELETE` and no write sharing (an outsider's handle without delete
@@ -5252,8 +5253,9 @@ entry either old or new, never torn).
     own temporary or empty fresh directory is removed; anything else goes back, or is kept. After a
     reboot the manifest is gone; the re-plan is still idempotent by hash. Every temporary is created at
     a plain hidden name and written, given its mode and mtime, and synced there; only a complete
-    temporary takes an aside name (a link, its creation name then dropped), so a crash mid-write leaves
-    it where the sweep removes it as the landing's own. Until 2026-09-30 a replacement's temporary was
+    temporary takes an aside name (moved there by a rename that replaces nothing, A-131, so it holds one
+    name at every instant), so a crash mid-write leaves it where the sweep removes it as the landing's
+    own. Until 2026-09-30 a replacement's temporary was
     created at its aside name, and on a filesystem whose temporaries are named from creation (APFS) a
     crash mid-write left bytes the resume could not own
     (`docs/bugs/2026-09-30-a-crash-mid-write-left-a-temporary-the-resume-could-not-own.md`).
@@ -11132,3 +11134,35 @@ the seam's docs, this entry, GAPS, BENCHMARKS).
   - the ramp as the batch's controller (its latency rule, above);
   - a batch sized by a share of the process's descriptors: 64 files would take another 15–20% on macOS, but the daemon
     accounts no descriptor share yet. Recorded for when it does.
+
+### A-131 — A named temporary is placed by one rename that replaces nothing (2026-10-10)
+Applied in the same change to:
+- §4.15 step 6 (macOS) and step 11 (an aside name taken by a move);
+- `crates/vfs/src/host/mod.rs` (`LandFs::place` leaves the temporary at its one name);
+- `crates/vfs/src/host/sim.rs` (a named temporary moves, its ctime changed as a rename changes it);
+- `crates/land/src/os.rs` (`move_without_replacing`: Linux `renameat2(RENAME_NOREPLACE)`, macOS
+  `renameatx_np(RENAME_EXCL)`, elsewhere a link and the old name's removal);
+- `crates/land/src/engine.rs` (a create's and a replacement's unlink of the creation name removed; `Swap::created`
+  gone);
+- GAPS and BENCHMARKS.
+
+Status: built 2026-10-10.
+- **Why:** a named temporary, the only kind APFS has, reached its name in two metadata operations: a `linkat` to the
+  name, then an `unlinkat` of its hidden name. A replacement's move to its aside name was the same pair.
+  - Sampled on APFS (debug, the landing-fairness lane), placement was 370 of the landing's 653 samples: `linkat` 286
+    and `unlinkat` 84, against the per-file `fsync`'s 42.
+  - Measured alone (2,000 files, three rounds): the pair cost 198–259 µs a file, and one `renameatx_np(RENAME_EXCL)`
+    46–57 µs.
+- **The rule:** `place` leaves a temporary at exactly one name. An unnamed one (`O_TMPFILE`) is linked there; a named
+  one is moved there by a rename that refuses an existing name, so `EEXIST` is still the conflict it was. A crash leaves
+  a named temporary at its hidden name or at its new name, never both, so the sweep's cases shrink.
+- **Other unixes:** without a rename that refuses an existing name, a link (which refuses one) and the old name's
+  removal keep the contract. A crash between the two leaves both names, as before.
+- **Linux:** temporaries are unnamed where `O_TMPFILE` works, so placement is unchanged there. A create no longer asks
+  to remove a hidden name it never had (an `unlinkat` that answered `ENOENT` per file).
+- **Measured through the engine** (`land_bench flat`, APFS, interleaved with `56d309dc`, 1,000 to 16,000 new files):
+  237–359 µs a file against 393–750 when the change ran at the higher load (1.6–3.0×), and 165–241 against 467–611 the
+  other way round (2.0–3.6×).
+- **Proven:** the crash-at-every-instruction oracle on the named-temporary shapes (APFS, and no exchange), the
+  durability and directory-sync oracles, and the OS writer's real-disk tests (creates, replacements, the removal oracle
+  with outsiders at every seam call) on APFS and on ext4.

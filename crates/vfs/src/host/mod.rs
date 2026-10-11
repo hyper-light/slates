@@ -181,8 +181,10 @@ pub trait LandFs: HostFs {
   fn set_mode(&mut self, file: HostFile, mode: u32) -> Result<(), HostError>;
   /// Sets the file's modification time in nanoseconds.
   fn set_mtime(&mut self, file: HostFile, mtime_ns: i64) -> Result<(), HostError>;
-  /// Gives the temporary the hidden sibling name `name` under `dir` (a link for an unnamed
-  /// temporary; nothing for one created by name).
+  /// Gives the temporary the name `name` under `dir`, refused `EEXIST` when the name exists, so that it holds that
+  /// one name after: an unnamed temporary is linked there; a named one is moved there from the name it holds (Linux
+  /// `renameat2(RENAME_NOREPLACE)`, macOS `renameatx_np(RENAME_EXCL)`; elsewhere a link and the old name's removal);
+  /// nothing for one already at `name`.
   fn place(&mut self, file: HostFile, dir: HostDir, name: &str) -> Result<(), HostError>;
   /// Atomically exchanges the entries `a` and `b` under `dir` (both must exist).
   fn exchange(&mut self, dir: HostDir, a: &str, b: &str) -> Result<(), HostError>;

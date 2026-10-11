@@ -4777,3 +4777,33 @@ behind it. The 2026-10-01 runs, at load 4–6, saw longest steps of 13.8–25.5 
   another long step, open (GAPS, the same day).
 - **Cost elsewhere:** none. Allocations and claims in a published arena keep the bitmap, as they did after a first
   capture, and an allocator nothing publishes from keeps the deferral's one flag test.
+
+### Landed: a named temporary is placed by one rename that replaces nothing (A-131; 2026-10-10)
+
+**Commands:**
+- **The syscall A/B:** a scratch (not kept), release, this machine at load about 12–16. 2,000 fresh named temporaries
+  per arm, three rounds: `linkat` to the name then `unlinkat` of the hidden name, against one
+  `renameatx_np(RENAME_EXCL)`.
+- **The engine A/B:** `land_bench flat`, HEAD `56d309dc` built in a scratch worktree and interleaved with the change,
+  two rounds, onto APFS.
+
+| round | `linkat` + `unlinkat`, µs a file | `renameatx_np(RENAME_EXCL)` |
+|---|---|---|
+| 0 | 259.1 | 56.5 |
+| 1 | 208.8 | 46.2 |
+| 2 | 197.5 | 45.9 |
+
+**Through the engine, µs a new file** (median of 5 runs):
+
+| round | arm | load | 1,000 | 2,000 | 4,000 | 8,000 | 16,000 |
+|---|---|---|---|---|---|---|---|
+| 1 | link and unlink (`56d309dc`) | 17 | 393 | 480 | 634 | 592 | 750 |
+| 1 | one rename | 26 | 240 | 237 | 271 | 359 | 247 |
+| 2 | link and unlink | 26 | 581 | 611 | 517 | 467 | 477 |
+| 2 | one rename | 15 | 165 | 168 | 177 | 198 | 241 |
+
+- **The change ran under the higher load in round 1 and still won 1.6–3.0×.** Round 2, with the loads reversed, shows
+  2.0–3.6×.
+- **Where the time had gone:** sampled on APFS (debug, the fairness lane), the landing spent 286 samples in `linkat`
+  and 84 in `unlinkat` of 653, against the per-file `fsync`'s 42 and the temporary's `openat` 134.
+- **The day's three changes on macOS, end to end:** about 700–900 µs a file this morning; 165–359 µs now.

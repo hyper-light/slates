@@ -1082,16 +1082,32 @@ impl LandFs for SimHost {
       // Placed at the name it was created with: nothing to do.
       return Ok(());
     }
-    // A named temporary gains a second link at `name` (the current bytes, same inode); an
-    // unnamed one is linked for the first time. An existing name refuses, as `linkat` does.
+    // An existing name refuses, as the rename that never replaces and `linkat` do.
+    if self
+      .node(&parts)
+      .is_some_and(|p| p.children.contains_key(name))
+    {
+      return Err(HostError::Unavailable(SIM_EEXIST));
+    }
+    // A named temporary moves to `name` (the same inode, its one name after; the move changes its ctime, as a rename
+    // does); an unnamed one is linked for the first time.
     let node = match already {
-      Some(path) => self.node(&path).cloned().ok_or(HostError::StaleHandle)?,
+      Some(path) => {
+        let moved = self.node(&path).cloned().ok_or(HostError::StaleHandle)?;
+        let (old_parent, old_name) = path.split_at(path.len().saturating_sub(1));
+        if let (Some(p), Some(old_name)) = (self.node_mut(old_parent), old_name.first()) {
+          p.children.remove(old_name);
+        }
+        let old_parent = old_parent.to_vec();
+        self.touch_parent(&old_parent);
+        SimNode {
+          ctime_ns: self.now_ns,
+          ..moved
+        }
+      }
       None => node,
     };
     if let Some(p) = self.node_mut(&parts) {
-      if p.children.contains_key(name) {
-        return Err(HostError::Unavailable(SIM_EEXIST));
-      }
       p.children.insert(name.into(), node);
     }
     if let Some(Open::Temp { placed: slot, .. }) = self.opens.get_mut(&file.0) {

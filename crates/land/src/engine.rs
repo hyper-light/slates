@@ -1606,7 +1606,6 @@ impl<H: LandFs> Landing<'_, H> {
         self.swap_replace(Swap {
           temp,
           dir,
-          created: &created,
           hidden: &aside,
           name,
           path: &entry.path,
@@ -1666,17 +1665,19 @@ impl<H: LandFs> Landing<'_, H> {
     let started = Instant::now();
     let placed = self.host.place(temp, dir, name);
     self.costs.link_ns.push(elapsed_ns(started));
+    // The placement leaves the temporary at its name alone (a named one moved there from its hidden name); a name that
+    // appeared meanwhile refused it, and it stays at its hidden name for the give-up below.
     let outcome = match placed {
       Ok(()) => Outcome::Written,
-      Err(HostError::Unavailable(ERRNO_EXIST)) => Outcome::Conflict(ConflictClass::TargetInUse),
+      Err(HostError::Unavailable(ERRNO_EXIST)) => {
+        match self.host.unlink(dir, hidden) {
+          Ok(()) | Err(HostError::NotFound) => {}
+          Err(e) => return Err(e.into()),
+        }
+        Outcome::Conflict(ConflictClass::TargetInUse)
+      }
       Err(e) => return Err(e.into()),
     };
-    // A named temporary still hangs at its hidden name; an unnamed one never had it (a host
-    // that fell back to a name for this one file is covered by the same unlink).
-    match self.host.unlink(dir, hidden) {
-      Ok(()) | Err(HostError::NotFound) => {}
-      Err(e) => return Err(e.into()),
-    }
     Ok(Written {
       outcome,
       window_ns: None,
@@ -1686,14 +1687,9 @@ impl<H: LandFs> Landing<'_, H> {
   /// A replacement: place the temporary at its hidden name, hold the old file, exchange, and
   /// verify the displaced file is the witnessed one; else exchange back.
   fn swap_replace(&mut self, swap: Swap<'_>) -> Result<Written, WriteFailure> {
-    // The complete temporary takes its aside name (a link), then leaves its creation name if it had one.
+    // The complete temporary takes its aside name, its one name after (a named one moved there from its creation
+    // name).
     self.host.place(swap.temp, swap.dir, swap.hidden)?;
-    if !self.unnamed_temporaries {
-      match self.host.unlink(swap.dir, swap.created) {
-        Ok(()) | Err(HostError::NotFound) => {}
-        Err(e) => return Err(e.into()),
-      }
-    }
     let old = match self.host.open_file(swap.dir, swap.name) {
       Ok(f) => f,
       Err(HostError::NotFound | HostError::NotFile) => {
@@ -2713,8 +2709,6 @@ struct Swap<'a> {
   temp: HostFile,
   /// The entry's directory.
   dir: HostDir,
-  /// The plain hidden name the temporary was created at (a named temporary still holds it).
-  created: &'a str,
   /// The temporary's hidden name: the entry's aside name, where the exchange leaves the displaced file.
   hidden: &'a str,
   /// The entry's name.
