@@ -5808,3 +5808,38 @@ On a Linux release build of `faad1562` (A-126, the probe-storm fix and the reply
 
 - **Linux lane** (bounded container, io_uring, non-root): clippy clean; `slates-land` and `slates-vfs` 315 passed, the
   OS writer's real-disk tests on ext4 among them.
+
+### 2026-10-10: the server suites at 1–2 CPUs and 128–256 MB (Ada's law: test at extremes)
+
+- **What ran.** The daemon, landing-fairness and recovery test binaries, built in a bounded container and run in a
+  second one capped at `--cpus=1 --memory=256m` and at `--cpus=2 --memory=128m`, with no swap and one test at a time.
+  The cgroup's peak memory and OOM kills were read after each binary.
+- **Results.** No OOM kill in either configuration; the cgroup peaked at 15–141 MiB, and the profile read the cgroup's
+  bound (`effective_capacity_bytes = 268435456`). daemon 22/22 in both; landing fairness 1/3 in both; recovery 38/41
+  at 256 MB and 37/41 at 128 MB.
+- **1. A landing refused `NoSpace` after writing every file (open: the §4.2 question of 2026-10-01, Ada's).**
+  - The calibration volume is `Dynamic { max: 256 MB }`, the size of the whole container, and holds 500 files of
+    3,890 bytes. Its inode allowance, its maximum's share of the version slab, is capped at the entire slab less
+    headroom, and all of it is promised to the volume.
+  - The landing wrote all 500 files. Then `land_advance` made the root directory current, which retains its old
+    version for the implicit snapshot. A retained version draws only on slab capacity promised to no volume
+    (`charge_retention`), and none was left: `NoSpace`, at the first entry (scratch prints in a constrained run:
+    `drop_entry NoSpace at /f0000`, `land_advance refused: NoSpace (500 landed entries)`). The store held 500 of its
+    38,836 slots.
+  - The disk had changed and the reply was a refusal. A resume finds the files already there.
+  - **Recommendation, from the evidence:** a Dynamic volume, which reserves no bytes up front, should not promise its
+    maximum's inode share up front either. It should draw slots as it creates inodes, against unpromised capacity,
+    with the maximum's share as a ceiling. A Bounded volume keeps its promise. Separately, a landing should check its
+    advance's room before its first write, so a refusal never follows the disk work.
+- **2. Sealing switched off in the sealing tests (a test-harness artifact, product correct).**
+  - hyper-seal's key region is process-wide and sized once, by the first daemon in the process
+    (`seal_key_slots = page / 32 × shards`).
+  - Run serially at 1–2 CPUs, an early 1-shard daemon locked 128 keys, and a later 2-shard daemon needing 256 was told
+    `AlreadyLocked` and ran unsealed. So `an_idle_small_file_is_sealed_by_the_daemons_sweep`,
+    `a_sealed_files_plaintext_leaves_the_content_object` and `sealed_content_reads_back_byte_for_byte_after_a_restart`
+    failed.
+  - In production one daemon is one process. Owed: the test harness locks the region once for the largest daemon a
+    binary starts.
+- **3. Fixed-size test volumes refused at 128 MB (product correct, typed).** Two recovery tests create volumes larger
+  than a 128 MB daemon holds and are refused `BudgetExceeded { available: 42074112 }`. Owed: size them from the
+  daemon's budget, or skip loudly, as other suites do.
