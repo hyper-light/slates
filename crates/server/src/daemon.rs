@@ -5380,6 +5380,94 @@ mod tests {
     );
   }
 
+  /// Measurement (not a gate): the condemnation cost — slates' own takeover work per retired-host object —
+  /// for the detection-budget F decision (`docs/wip/fleet-under-load.md` Part 6). The takeover is one batched,
+  /// paged phase-one round per retired host (§4.8 "Promotion and takeover", `crate::takeover`), so its work is
+  /// O(the retired host's objects), not O(fleet). This drives the sync phase-one locally — a host settled
+  /// beside this one on a formation cohort (one promise recovers it), holding `n` objects, is taken over and
+  /// this node promises and readies its own share — and reports the per-object cost, which is load-independent
+  /// (allocation- and CPU-bound, no wall-clock path). Run:
+  /// `cargo test --release -p slates-server condemnation_cost_per_object -- --ignored --nocapture`.
+  #[test]
+  #[ignore = "measurement, not a gate; prints the per-object takeover cost"]
+  fn condemnation_cost_per_object_is_flat_and_sub_microsecond() {
+    use slates_cluster::config_group::{Reconfiguration, RegionalCouncil};
+    use slates_db::register::{Acceptor, Authority, FIRST_EPOCH, HostId, ObjectId, Quorum, Record};
+    for objects in [256usize, 4_096, 16_384] {
+      let (readied, resolve_ns, round_ns) = audit_on_shard(move |state| {
+        let local = state.fleet.host();
+        let departed = HostId(local.0 ^ 1);
+        let third = HostId(local.0 ^ 2);
+        // A sole-voter council that admits the departed host and a third beside it: the departed is settled on
+        // the two-host formation cohort {local, third}, which one promise recovers (Flexible Paxos; the
+        // sibling test above), so this node adopts its share with no dispatch — a purely local measurement.
+        state.council = RegionalCouncil::new(
+          local,
+          vec![local],
+          vec![local],
+          Quorum { f: 1 },
+          std::collections::BTreeMap::new(),
+          3,
+          false,
+        );
+        for host in [departed, third] {
+          assert!(
+            state
+              .council
+              .propose(Reconfiguration::Admit { host, domain: None })
+          );
+        }
+        install_council(state);
+        let generation = state.fleet.configuration().version;
+        for index in 0..objects {
+          let object = ObjectId::new(departed, u64::try_from(index).unwrap_or(u64::MAX));
+          let mut acceptor = Acceptor::new(
+            local,
+            Authority {
+              generation,
+              owner: departed,
+            },
+          );
+          acceptor
+            .accept(&Record {
+              owner: departed,
+              object,
+              sequence: 0,
+              epoch: FIRST_EPOCH,
+              generation,
+              value: b"head".to_vec(),
+            })
+            .unwrap();
+          state.holder_records.insert(object, acceptor);
+          state.fleet.track_object_owner(object, departed);
+        }
+        assert!(state.council.propose(Reconfiguration::TakeOver(departed)));
+        install_council(state);
+        // Phase one, timed: resolve the owners of every held object, then run the successor's round — promise
+        // this node's own copies and ready the objects whose cohort is met.
+        let t0 = slates_machine::clock::monotonic_ns();
+        crate::takeover::resolve_held_objects(state, local);
+        let t1 = slates_machine::clock::monotonic_ns();
+        let requests = crate::takeover::begin_round(state, departed, local);
+        let ready = crate::takeover::ready_objects(state, departed, local);
+        let t2 = slates_machine::clock::monotonic_ns();
+        assert!(
+          requests.is_none_or(|r| r.is_empty()),
+          "a formation cohort recovers with no dispatch, so the round stays local"
+        );
+        (ready.len(), t1.saturating_sub(t0), t2.saturating_sub(t1))
+      });
+      assert!(readied > 0, "this node adopts the objects that rank to it");
+      let resolve_per = resolve_ns as f64 / objects as f64;
+      let round_per = round_ns as f64 / readied as f64;
+      eprintln!(
+        "condemnation cost: {objects} objects held, {readied} ranked here | \
+         resolve {resolve_ns} ns ({resolve_per:.1} ns/object) | \
+         round {round_ns} ns ({round_per:.1} ns/readied object)"
+      );
+    }
+  }
+
   /// AC-6.3, §4.16; AUD-12: a stale epoch, foreign generation or conflicting accepted position
   /// must refuse before holder recomputation. A later legitimate origin must still seed and serve.
   #[test]

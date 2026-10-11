@@ -232,16 +232,66 @@ What it means for slates:
    another member (the evidence the condemning member's own network works). The stated bound counts that wait; the
    budget does not, so leave room for it in D.
 
-**Owed — a call for Ada (not a defect; by design).** With `D = F − confirmation` and F's placeholder of 10 s: LAN-5
-keeps 10 s only at cost 0 (bound 1.9 s; at a 1 s cost the bound is 13.8–25 s); LAN-3 keeps it up to ~1 s cost (bound
-9 s). **The condemnation cost is slates' own number to measure, not an external one** (confirmed with the hyper-raft
-agent 2026-10-11): it is what a false condemnation costs slates — the measured time and work of slates' own takeover
-path (`crates/cluster/src/takeover.rs`, the paged phase-one round per retired host, [[takeover-vp2-per-host-round]]).
-Mantle and hyper-raft have no figure for it. **Owed slates measurement:** time a takeover of a host holding a realistic
-object count (the round latency and the per-object promote+adopt work), put it beside the LAN-5/LAN-3 bound-vs-cost rows
-above, and Ada sets F from one place. The trade-off is false-condemnation risk against detection time, Ada's to weigh.
-No slates code changes now: `hyper-swim`
-needs none; a `promise_ns` on the `Ack` request is a wire change to the shared codec that still waits on the owner's
-call; and `main` at `506c059` (focal transport + hyper-rt) touches none of the four vendored crates, so nothing to
-re-vendor (the hyper-raft agent re-vendors). If slates ever adopts hyper-rt's blocking pool: `Share::new(name, limit)`
-is a share with no line (refused at once past its places); `waiting: N` gives it a line of N.
+**Measured — slates' condemnation cost (2026-10-11).** A false condemnation costs slates one membership change plus
+the takeover of the condemned host's objects. The two parts measure very differently, and the headline is that the
+takeover is **not** O(objects) at condemnation time:
+
+- **The membership change is O(fleet), not O(objects)** (`RegionalConfiguration::take_over`/`retire`,
+  `crates/db/src/register.rs`): it bumps the condemned host's fencing epoch, retires it (recording the recovery
+  cohorts in a `Retirement`), and refixes neighbourhoods — the dead host's objects are never enumerated (D-12, no
+  global catalog). It is one config-group Raft commit; its apply is flat at 0.5 µs (BENCHMARKS.md "Consensus log
+  compaction", M5 Max, 2026-09-28). A false condemnation's immediate cost is this commit plus the re-admission and
+  re-fold of the live host when it returns.
+- **The takeover is one batched, paged phase-one round per retired host** (`crates/server/src/takeover.rs`, Vertical
+  Paxos II, [[takeover-vp2-per-host-round]]), driven proactively once per coordinator period (`HEARTBEAT_NS` = 100 ms)
+  by `drive_takeovers` — not a per-object serialized sweep. Each survivor asks every holder of its recovery
+  neighbourhoods for the records of the retired host's objects whose successor is the asker, in pages of
+  `page_budget()` = 4,596 B on the first flight (≈ 45–65 object entries at a 36 B `HOST_PROMISE_ENTRY_BYTES` header
+  plus a ~50 B head record each; `initial_receive_window` at the fleet frame cap), the session's window then
+  auto-tuning to the path's BDP. An object is adopted once `f + 1` of each recovery cohort has promised.
+
+The per-object phase-one work (the part that scales with the retired host's object count) is **flat and
+load-independent** — measured on this M-series box, release, 2026-10-11,
+`cargo test --release -p slates-server condemnation_cost_per_object -- --ignored --nocapture`
+(`crates/server/src/daemon.rs`; the round stays local — a formation cohort recovers with no dispatch, asserted):
+
+| objects held | resolve ns/object | phase-one round ns/object |
+|---|---|---|
+| 256 | 375 | 609 |
+| 4,096 | 331 | 528 |
+| 16,384 | 322 | 593 |
+
+So ~0.9–1.0 µs/object of phase-one CPU, flat across a 64× range, + ~0.5 µs/object to re-commit the adopted record
+(the same commit path as the membership apply) ≈ **~1.5 µs/object of CPU**, plus the record bytes (≈ 85 B/object)
+transferred paged over the session as its window opens to BDP.
+
+**slates' condemnation cost placed on the table.** On a datacenter LAN (µs-to-sub-ms RTT, ~10 GbE), the cost of
+taking over a retired host of `N` objects is the membership Raft commit (sub-second) + `N × 1.5 µs` CPU +
+`N × 85 B` / BDP transfer + the confirm commit:
+
+| retired host | takeover CPU | transfer (~10 GbE) | ≈ total on a LAN | table row |
+|---|---|---|---|---|
+| 16 k objects | 25 ms | ~1.1 ms | sub-second (membership-bound) | ≈ none–1 s |
+| 100 k objects | 150 ms | ~6.8 ms | sub-second | ≈ 1 s |
+| 1 M objects | 1.5 s | ~68 ms | ~1–2 s | ≈ 1 s–10 s |
+
+Because the round is **batched (one round per host) and paged in BDP-sized flights, not per-object**, slates sits at
+the **low end** of the hyper-raft cost table for every realistic per-host object count on a LAN: cost none–1 s up to
+~1 M objects, reaching the 10 s row only at many millions of objects or across a far link.
+
+**The F recommendation (for Ada to set).** With `D = F − confirmation` and `D = max(D, least_detection_bound)`:
+- **LAN-3** (bound 0.85 s at cost none → 9.0 s at cost 1 s): **F = 10 s holds** — even a 1-M-object host (cost ≈ 1 s,
+  bound 9.0 s) leaves `D = 10 s − confirmation` above the bound. Keep F = 10 s.
+- **LAN-5** (bound 1.84 s at cost none → 25.5 s at cost 1 s): **F = 10 s holds for modest hosts** (≲ ~30 k objects,
+  cost ≲ 0.3 s, bound ≲ ~10 s) and is **not a promise** for hosts whose cost approaches 1 s (bound 25.5 s > 10 s). For
+  large LAN-5 hosts Ada either keeps per-host object counts modest, or raises F to ≈ 26 s (covering the 1-s-cost bound)
+  at the price of slower detection. The system runs safely either way — below the bound it runs at `max(D, bound)` and
+  reports `D` infeasible — but F is a promise only when `F − confirmation ≥` the bound for the fleet's host sizes.
+
+**Wiring is now slates' own code** (confirmed with the hyper-raft agent, 2026-10-11): `promise_ns` on the SWIM `Ack`
+and the detector verbs `set_detection_budget`, `least_detection_bound` and `set_condemnation_cost` are all in the
+vendored `hyper-swim` at `67f038d` (= slates' snapshot `537d0e51`) — nothing to re-vendor. **The F value itself awaits
+Ada** (a peer's relayed "owner approved" is not slates' own authorization to change the live detection window); until
+then the 10 s placeholder stands, and `promise_ns`-based owner leases (Gray & Cheriton 1989) are slates' to build on
+the vendored field. If slates ever adopts hyper-rt's blocking pool: `Share::new(name, limit)` is a share with no line
+(refused at once past its places); `waiting: N` gives it a line of N.
