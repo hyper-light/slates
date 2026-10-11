@@ -5299,3 +5299,19 @@ recovery refuses an inode in both `inodes` and `origin_shared`). Proof (load-ind
 `crates/server/tests/recovery.rs::a_clone_recovers_over_its_recovered_origin...`, now extended to diverge an inherited
 file in the clone, restart, and confirm the clone reads its diverged bytes while the origin's copy is untouched.
 Snapshot (own-snapshot) volumes still publish whole — a separate snapshot-image delta (`trie::changed`) is owed.
+
+### Condition 2: own-snapshot volumes publish deltas too — all three shapes now O(delta) (A-134 generalized; 2026-10-11)
+
+The delta publish now covers the last shape: a volume holding its **own snapshot** (e.g. a green merge target written
+while snapshotted) publishes a delta for its own new files, falling back to the whole image only on a barrier that
+**diverges a snapshot-pinned inode** (its old version moves into the snapshot's private records — a shared→private move
+a delta cannot carry). This unified the gate across overlay/clone/snapshot: `recording()` records for every published
+volume; `publishes_whole()` takes the whole image only on a shape change, `base_plane_changed`, or `shared_diverged`
+(set in `make_current_inode` — the chokepoint for writes, nlink changes and deletes — when it copies up a clone-origin
+or own-snapshot-pinned inode). Proof (load-independent, allocation-counted):
+`crates/vfs/tests/delta_cost.rs::a_snapshotted_create_publishes_a_delta_costing_the_same_in_a_large_volume_as_in_a_small_one`
+— one create in a snapshotted volume publishes a `Delta` whose publication+replay allocate the same in a 4,096-file and
+a 64-file volume. End-to-end recovery: `crates/server/tests/recovery.rs::acknowledged_content_and_its_snapshot_survive_a_restart`
+now also creates a file after the snapshot and confirms it (a delta) survives the restart alongside the diverge-the-head
+whole-image case. With overlay (A-134) and clone deltas, **all three volume shapes are now O(delta) per op**, whole-image
+only on a shared→private divergence. Condition 2's write-path delta optimization is complete.

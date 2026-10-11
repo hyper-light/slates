@@ -152,12 +152,14 @@ delta path), through a real Linux FUSE mount:
 
 ## Status
 
-**FIXED 2026-10-11 (A-134, `d4d0a3e3`); clone deltas extended the same day.** Overlay (base-backed) volumes publish
-deltas per barrier while their base plane is unchanged; **clones** publish deltas for their own new files, falling back
-to the whole image only on a barrier that diverges an origin inode (`origin_diverged`). Recovery is byte-correct
-(oracle 39/0, the clone oracle now also diverges an inherited file and recovers it), the escape guarantee holds on the
-delta path (0 disk bytes across 1,500 hostile ops), the write path is O(delta) (deterministic allocation proofs for
-overlay and clone + wall-clock ~5–7× at depth). Owed, separately: **snapshot** deltas (a volume with its *own*
-snapshots still publishes whole — the head-into-snapshot shared→private move needs a snapshot-image delta,
-`trie::changed`); and a quiet-machine p99-vs-TectonicFS single-number bench (Tectonic publishes no comparable small-op
-p99).
+**FIXED 2026-10-11 (A-134, `d4d0a3e3`); extended the same day to clones and own-snapshot volumes.** Every volume shape
+— plain, overlay (base-backed), clone, and own-snapshot — now publishes deltas for its own new files, falling back to
+the whole image only on a barrier that **diverges a shared inode** (`Dirty::shared_diverged`, set in
+`make_current_inode` when it copies up a clone-origin inode `!owns(born)` or an own-snapshot-pinned inode
+`retains(born)`) or changes an overlay's base plane (`base_plane_changed`). Recovery is byte-correct (oracle 39/0: the
+clone oracle diverges an inherited file and recovers it with the origin untouched; the snapshot oracle recovers both a
+post-snapshot delta file and a diverge-the-head whole image), the escape guarantee holds on the delta path (0 disk
+bytes across 1,500 hostile ops), and the write path is O(delta) for all three shapes (deterministic allocation proofs
+in `delta_cost.rs` + wall-clock ~5–7× at depth for overlays). The shared→private move a delta cannot carry is handled
+by the gate (whole image), not dropped. Owed, separately: only a quiet-machine p99-vs-TectonicFS single-number bench
+(Tectonic is closed-source and publishes no comparable small-op p99).

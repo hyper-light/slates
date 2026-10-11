@@ -4168,13 +4168,16 @@ impl Volume {
     Ok(removed)
   }
 
-  /// If this volume is a clone and `born` is at or before its origin epoch, records that it diverged an origin
-  /// inode (A-134): the copy-up about to retire that version moves the inode out of `origin_shared` into the clone's
-  /// own inodes — a shared→private move a delta does not carry (recovery refuses an inode in both `inodes` and
-  /// `origin_shared`, `recover.rs`), so the publication that follows must be the whole image.
-  fn note_clone_divergence(&mut self, born: Epoch) {
-    if self.origin_epoch.is_some_and(|origin| born <= origin) {
-      self.dirty.mark_origin_diverged();
+  /// Records a shared→private divergence when the copy-up about to run retires a version a clone's origin snapshot or
+  /// this volume's own snapshot holds (A-134): a clone's origin inode (`!self.owns(born)` — born at or before the
+  /// origin epoch) leaves `origin_shared` for the clone's own inodes, and an own-snapshot-pinned inode
+  /// (`self.retains(born)`) moves its old version into the snapshot's private image. Neither move is something a delta
+  /// carries (recovery refuses an inode in both `inodes` and `origin_shared`, and a snapshot's private inode lives in
+  /// `self.snapshots`, which `apply` leaves untouched), so the publication that follows must be the whole image. This
+  /// is called from `make_current_inode`, the chokepoint every inode mutation — write, nlink change, delete — passes.
+  fn note_shared_divergence(&mut self, born: Epoch) {
+    if !self.owns(born) || self.retains(born) {
+      self.dirty.mark_shared_diverged();
     }
   }
 
@@ -4200,7 +4203,7 @@ impl Volume {
     if born == self.epoch {
       return Ok(handle);
     }
-    self.note_clone_divergence(born);
+    self.note_shared_divergence(born);
     // This copy-up retires the old version; if a snapshot pins it (its birth is at or before the last
     // snapshot's epoch — the same rule `retire` uses to keep it), it is retained on that snapshot's
     // deadlist. Charge it against the retention allowance (§4.2): refuse before the copy-up if the

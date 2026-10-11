@@ -328,3 +328,62 @@ fn a_clone_create_publishes_a_delta_costing_the_same_in_a_large_clone_as_in_a_sm
     "(publication, replay) allocations in a {LARGE}-file clone vs a {SMALL}-file one"
   );
 }
+
+// --- Own-snapshot volumes: a delta for new files, whole only on divergence (condition 2; 2026-10-11) ---
+
+/// A published volume that holds a snapshot and `upper` of its own new files born after it. The first create after
+/// the snapshot diverges the snapshot-pinned root directory (a whole image), so the volume is marked published after
+/// growing, and the create measured below (root already current, no snapshot-pinned inode touched) is a delta.
+fn published_snapshotted(store: &mut Store, upper: usize) -> (Volume, VolumeImage) {
+  let mut vol = volume(store, 1 << 30);
+  let root = vol.root_inode(store).unwrap();
+  vol.create_file_no(store, root, "pinned", 0o644).unwrap();
+  let _snap = vol.snapshot(store).unwrap();
+  for at in 0..upper.max(1) {
+    vol
+      .create_file_no(store, root, &format!("own{at:05}"), 0o644)
+      .unwrap();
+  }
+  let image = vol.to_image(store, None).unwrap();
+  vol.mark_published(store);
+  (vol, image)
+}
+
+/// One create's publication and replay in a published snapshotted volume whose root already diverged (so the create
+/// touches no snapshot-pinned inode): the allocations each made, after checking it publishes a **delta** and the
+/// replayed delta equals the volume's full image.
+fn one_create_snapshotted(upper: usize) -> (usize, usize) {
+  let mut store = store();
+  let (mut vol, mut image) = published_snapshotted(&mut store, upper);
+  let root = vol.root_inode(&store).unwrap();
+  vol
+    .create_file_no(&mut store, root, "Fresh.txt", 0o644)
+    .unwrap();
+  let (published_calls, record) = counted(|| vol.publication(&store, None).unwrap());
+  let slates_vfs::delta::VolumeRecord::Delta { delta } = record else {
+    panic!("a snapshotted volume that only grew its own files publishes a delta, not its whole image");
+  };
+  let (replayed_calls, applied) = counted(|| image.apply(&delta));
+  applied.unwrap();
+  assert_eq!(
+    image,
+    vol.to_image(&store, None).unwrap(),
+    "the replayed snapshotted-volume delta equals its full image"
+  );
+  (published_calls, replayed_calls)
+}
+
+/// Condition 2, A-68 extended to own-snapshot volumes (2026-10-11): a volume holding a snapshot publishes a delta for
+/// its own new files — one create's publication and replay allocate the same in a 4,096-file volume as in a 64-file
+/// one — so a green merge target written while it holds a snapshot no longer re-images the whole volume per op. A
+/// write or delete of a snapshot-pinned inode still publishes the whole image (the shared→private move into the
+/// snapshot's private records a delta cannot carry).
+#[test]
+fn a_snapshotted_create_publishes_a_delta_costing_the_same_in_a_large_volume_as_in_a_small_one() {
+  let small = one_create_snapshotted(SMALL);
+  let large = one_create_snapshotted(LARGE);
+  assert_eq!(
+    large, small,
+    "(publication, replay) allocations in a {LARGE}-file snapshotted volume vs a {SMALL}-file one"
+  );
+}

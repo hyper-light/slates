@@ -351,6 +351,10 @@ fn acknowledged_content_and_its_snapshot_survive_a_daemon_restart_byte_for_byte(
       AFTER,
       "the head diverged before the restart"
     );
+    // A new file born after the snapshot is the head's own: writing it is a delta (A-134), not the whole image a
+    // snapshot-pinned write takes, and the delta must survive the restart.
+    let post = create(&mut stream, &root, "post-snap", 6);
+    write(&mut stream, &post, BEFORE, 7);
   }
   let snapshot = client.status(kept).unwrap().head;
   let member = first.member_identity().unwrap();
@@ -380,6 +384,11 @@ fn acknowledged_content_and_its_snapshot_survive_a_daemon_restart_byte_for_byte(
     read_file(&second, "kept", "f"),
     AFTER,
     "the head's acknowledged bytes, written after the snapshot, survived the restart"
+  );
+  assert_eq!(
+    read_file(&second, "kept", "post-snap"),
+    BEFORE,
+    "a file created after the snapshot (published as a delta) survived the restart"
   );
   // The snapshot's frozen bytes, read through a clone of it — the only path that serves a snapshot's
   // content over the mount transport.
