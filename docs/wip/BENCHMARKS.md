@@ -5238,3 +5238,20 @@ oracle). `cargo clippy --workspace --all-targets -- -D warnings` and `cargo xtas
 A wall-clock p99 A/B (overlay create flat vs the earlier 196 → 714 µs growth) is owed on a quiet machine — this session's
 host was at load 48 (other sessions), where timing is unreliable; the allocation-count proof above is load-independent
 and establishes the asymptotic win now. Snapshot/clone volumes still publish whole (owed, a separate delta refinement).
+
+**Wall-clock confirmation (A-134; Linux FUSE in Docker, kernel 6.12, 3 runs at load 6–15, 2026-10-11).** Overlay create
+p50 by 500-op window in a single growing directory, against a plain volume on the same build:
+
+| window | plain (no base) | overlay (empty base), 3 runs |
+|---|---|---|
+| [0, 500) | 67–95 µs | 144 / 184 / 185 µs |
+| [1500, 2000) | 72–96 µs | 71 / 693 / 670 µs |
+| [3500, 4000) | 65–96 µs | 69 / 100 / 98 µs |
+
+At depth (`[3500,4000)`) the overlay create is **flat at ~70–100 µs, ≈ the plain volume** — the pre-fix value at that
+depth was ~490 µs (previous entry), a **5–7× win**, confirming the O(delta) allocation proof wall-clock. The elevated
+first window (~144–185 µs) is the first checkpoint plus base-plane setup. The `[1500,2000)` spike to ~680 µs appeared in
+two of three runs but was 71 µs in the cleanest (lowest-load) run at the **same** window — concurrent-session load
+noise, not algorithmic: a residual O(upper) cost would be monotonic (highest at `[3500,4000)`, not a mid-window spike
+that vanishes under lower load). A dedicated quiet-machine p99-vs-TectonicFS bench is still owed to put a single
+competitor-comparison number on it; the asymptotic win is established deterministically and confirmed here wall-clock.

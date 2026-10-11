@@ -140,8 +140,20 @@ asserts an overlay create now publishes a **delta** whose publication+replay all
 upper as in a 64-entry one (was O(volume), O(N²) to fill a directory). `cargo clippy --workspace --all-targets
 -- -D warnings` and `cargo xtask check` clean.
 
+## Adversarial validation on the new delta path (conditions 3, 4, 12; real Docker, 2026-10-11)
+
+With the A-134 binary (`d4d0a3e3`), on a **base-backed overlay** volume (so every create/write/whiteout takes the new
+delta path), through a real Linux FUSE mount:
+- **Escape battery** (`battery.py`, 5 seeds × 300 hostile ops — device-node `mknod`, `../`×8 traversal, cross-user,
+  setuid, hardlink/symlink escapes): no invariant violated; **daemon disk `write_bytes` = 0** across all 1,500 ops
+  (condition 3 — the delta publish writes to anchor RAM, never disk, on the new code); whole outside-tree hash
+  unchanged (condition 4). The delta path has the same zero-escape guarantee as the old whole-image path.
+- **Wall-clock** (above): overlay create flat at ~70–100 µs at depth, ≈ the plain volume, vs ~490 µs pre-fix.
+
 ## Status
 
-**FIXED 2026-10-11.** Overlay (base-backed) volumes publish deltas per barrier while their base plane is unchanged,
-recovery is byte-correct (oracle-proven), and the write path is no longer O(volume) per operation. Owed, separately:
-snapshot/clone deltas (still whole-image — the head-into-snapshot and shared-root problems a delta cannot carry).
+**FIXED 2026-10-11 (A-134, `d4d0a3e3`).** Overlay (base-backed) volumes publish deltas per barrier while their base
+plane is unchanged; recovery is byte-correct (oracle 39/0), the escape guarantee holds on the delta path (0 disk bytes
+across 1,500 hostile ops), the write path is O(delta) (deterministic allocation proof + wall-clock ~5–7× at depth).
+Owed, separately: snapshot/clone deltas (still whole-image — the head-into-snapshot and shared-root problems a delta
+cannot carry); and a quiet-machine p99-vs-TectonicFS single-number bench.
