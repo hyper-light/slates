@@ -5907,3 +5907,59 @@ On a Linux release build of `faad1562` (A-126, the probe-storm fix and the reply
   once, and failed once on a loaded Mac ("measured: 0"). It now polls for the measurement, as it does for the sessions.
   The hyper-raft agent confirms that the new detector's first measurement can come later: a period is floored by the
   detection budget.
+
+### 2026-10-10 (late): conditions 3 and 4 re-validated at HEAD; the per-barrier thread measured, not a regression
+
+At `097e1cf7` (A-130 ⌈√n⌉, A-132 off-shard barriers, the fleet-test poll), on the Linux release build and the macOS CLI:
+
+- **Condition 4 — the generated escape battery** (`docs/wip/bench/escape/{inner.sh,battery.py}`, a `--shared` FUSE
+  mount, 8 seeds × 400 steps = 3,200 seeded hostile operations as two principals: planted symlinks out of the volume,
+  hard links in from `/etc`, device nodes, setuid copies, `..` climbing, renamed links, churn and removal):
+  - **no invariant violated on any seed.** The non-owner was refused every planted link (40–57 a seed); the owner
+    resolving its own link fired as the positive control (1–8 a seed), so links are not merely dead. No hard link in, no
+    device node, no setuid escalation, no `..` reached the canary.
+  - **Condition 3 on the same run:** the daemon wrote **0 bytes** to disk over the whole battery (from
+    `/proc/<pid>/io` `write_bytes`), the outside tree hashed identical before and after, the canary intact.
+- **Real CLI landing, byte-identical at HEAD (conditions 3, 12).** `git archive HEAD` (3,686 files, 110 MB) copied into
+  a dynamic volume over the loopback NFS mount, then landed through `slates land`/`grant`/`land --grant` into an empty
+  directory: `state done`, 4,173 entries written, **`diff -r` silent every run**, 503 barriers.
+  - **Timing is load-dominated, not an A-132 regression.** Three runs at load 21–40 took 4.7–7.5 s; one run at load 13
+    took **1.8 s**, in line with the 1.54 s median recorded before A-132 (which was at load 12–16).
+  - **Measured-and-rejected: a persistent per-landing barrier worker.** The hypothesis was that A-132's one thread a
+    barrier (503 for this tree) cost the landing. Instrumented on HEAD during the real landing: thread spawn was
+    **8.7 ms total over 503 barriers (17 µs each)**, against the barriers' own `fdatasync`/`F_BARRIERFSYNC` work of
+    369 ms and a whole-await overhead (spawn + park + unpark + lease) of 46 ms (2.5% of the 1.8 s). Reusing one worker
+    thread would save ~8 ms on a 1.8 s landing. Not built; recorded so it is not re-proposed. The barrier's **I/O** is
+    the cost, and it already runs off the shard.
+
+### 2026-10-10 (late): CONFIRMED — a landing's finish advances every entry in one unsliced step (R4, condition 12)
+
+The last unbounded step on the shard during a landing, after A-132 moved the barriers off it. **Measured**, not estimated:
+the engine's in-memory advance (`land_advance`, `crates/vfs/src/base.rs`: forget each landed overlay entry or rebase it
+from the snapshot, then invalidate listings) timed over the simulated host (`land_bench finscan`, scratch, 2 runs):
+
+| entries | advance | per entry |
+|---|---|---|
+| 1,000 | 0.95–0.99 ms | 0.95 µs |
+| 10,000 | 10.0–11.0 ms | 1.05 µs |
+| 25,000 | 25.2–29.1 ms | 1.08 µs |
+| 50,000 | 52.3–53.2 ms | 1.05 µs |
+
+- **Linear at ~1.0 µs/entry** (≈1.68 µs/entry on a real volume, from the 600-entry server measurement). So **~105 ms at
+  100k files, ~1 s at 1M** — one step, on the shard, holding every other client for its whole duration. Real OCI images
+  and monorepos reach those counts (condition 2). This breaks R4's bounded-work rule and condition 12's p99 at scale;
+  the common case (≤16k files, ≤17 ms) does not feel it.
+- **Not a correctness bug:** the landing lands correctly; it is a scalability/latency bound. Not a regression (it
+  predates A-132). A-132's `finish_granted` runs it inside one synchronous `with_state`, so today it is atomic — no
+  concurrent verb sees a partial advance.
+- **The fix — slice the advance** (the next piece, for its own run): a resumable cursor over `landed`, stepped under
+  the shard's per-iteration budget, driven by the server's `drive_granted_landing` between yields like the write and
+  sync phases, with the completion's DB record still committed as one atom at the true end (A-127). Crash mid-advance
+  is safe by construction — the in-memory advance is not durable until that commit, so a restart rebuilds the
+  un-advanced overlay from the log and the resume re-lands.
+- **The open question to resolve first (why it is not a rushed fix):** slicing makes the overlay→base read flip
+  non-atomic. Reads stay consistent (a forgotten entry reads the base, which now holds the identical landed content),
+  but a concurrent **drift** query (§4.5/§4.6) could, for the window between an entry's placement and its witness update,
+  see a landed entry whose witness is still the old base — a transient false drift. Needs the drift path read to confirm
+  whether it ignores overlay-shadowed entries (likely safe) or must be fenced during the advance. Confirm scope with Ada
+  per the debugging protocol before building.
