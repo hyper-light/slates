@@ -4807,3 +4807,32 @@ behind it. The 2026-10-01 runs, at load 4–6, saw longest steps of 13.8–25.5 
 - **Where the time had gone:** sampled on APFS (debug, the fairness lane), the landing spent 286 samples in `linkat`
   and 84 in `unlinkat` of 653, against the per-file `fsync`'s 42 and the temporary's `openat` 134.
 - **The day's three changes on macOS, end to end:** about 700–900 µs a file this morning; 165–359 µs now.
+
+### Real use: the slates tree landed through the CLI, before and after A-130/A-131 (macOS; 2026-10-10)
+
+**Command:** `land_e2e.sh BIN SRC WORK`, a scratch script (not kept). Per run:
+- a fresh `slates anchor`, an explicit `bootstrap root`, and a dynamic 2 GiB volume;
+- the volume mounted over the loopback NFS bridge (`slates mount`) and the tree copied in with `cp -R`, then the mount
+  removed (always before the anchor stops);
+- `slates land` presented, `slates grant` issued with the anchor's exported variables, and `slates land --grant` timed
+  into an empty directory;
+- then `diff -r` of the source against the target.
+
+**Inputs and arms:**
+- The tree: `git archive` of the slates repository at `f9f0c081`: 3,685 files and 110 MB, 4,172 landed entries with
+  the directories.
+- The arms: release binaries of `85958800` (before A-130) and of the day's head, interleaved over five rounds.
+- This machine at load 12–16.
+
+| round | before (`85958800`) | after (the day's head) |
+|---|---|---|
+| 1 | 4.221 s | 1.447 s |
+| 2 | 3.824 s | 2.995 s |
+| 3 | 5.477 s | 1.486 s |
+| 4 | 4.626 s | 1.544 s |
+| 5 | 5.632 s | 1.723 s |
+
+- **Medians:** 4.63 s before and 1.54 s after, 3.0× faster; pair by pair 1.3–3.7×.
+- **Every run:** `state: done`, 4,172 entries written, and `diff -r` silent. The day's head took 502 barriers for the
+  3,685 files: files larger than a batch's window take a barrier each, and the small ones share them.
+- **The mount:** checked absent after every run.
