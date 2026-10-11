@@ -5118,3 +5118,56 @@ local path and bounded by measured RTT on the fleet path — the low-latency end
 itself as trading away for exabyte throughput. The directly runnable competitor on this hardware, the Linux kernel's NFS
 server, slates beats on read latency. A live Tectonic A/B is not possible (it is Facebook-internal and not open source);
 this comparison is against its published figures, with the workload-class caveat stated.
+
+### Condition 12, like-for-like: slates (FUSE) vs the kernel's overlayfs vs tmpfs (2026-10-11)
+
+A direct, runnable competitor comparison — the Stop-hook asked for like-for-like, and overlayfs is slates' closest class
+(the kernel's own copy-on-write overlay that container runtimes mount by default). Same workload on all three, over the
+same 500-file base on a tmpfs: 3,000 small files created, stat'd, read, rewritten (a copy-up for an overlay), and 1,000
+created with `fsync`, each op timed; per-op-type p50/p99/p999/max. `docs/wip/bench/fsbench/` (Docker, kernel 6.12,
+privileged, `--device /dev/fuse`), slates mounted `--shared` (FUSE), overlayfs `lowerdir`/`upperdir`/`workdir` on the
+tmpfs.
+
+| op (µs) | overlayfs p50/p99 | tmpfs p50/p99 | slates FUSE p50/p99 | slates vs overlayfs |
+|---|---|---|---|---|
+| stat | 1.0 / 1.8 | 0.8 / 1.5 | 13.9 / 30.2 | ~14× |
+| read | 3.5 / 5.4 | 2.9 / 3.8 | 43.3 / 79.0 | ~12× |
+| create | 5.0 / 16.0 | 3.1 / 6.0 | 276.9 / 553.5 | ~55× |
+| rewrite | 3.2 / 4.3 | 2.7 / 3.7 | 471.1 / 669.7 | ~147× |
+| create+fsync | 3.8 / 14.4 | 2.1 / 5.0 | 1233.9 / 1777.0 | ~325× |
+
+Slates was also measured over **NFSv4.2** (kernel-side caching/readahead) on the same volume, same run: it is *worse*
+than FUSE for writes (create p50 1,872.9 µs, rewrite 1,927.6 µs — synchronous RPC an op) and slightly better for reads
+(read p50 32.1 µs vs FUSE 45.5 µs). Neither mount path is within 10× of overlayfs.
+
+**Should slates write its own (kernel) overlayfs? No** — decided against (2026-10-11, Ada's question). overlayfs is fast
+only because it is **in-kernel** (no userspace round trip an op). An in-kernel slates would break R10 (unprivileged, no
+kernel extension), condition 6 (a Linux module is not cross-OS), and condition 3 (in-kernel, backing-store-coupled
+overlays are what slates exists not to be). The overlay *logic* is already slates' (lower+upper+whiteouts+exact change
+tracking); what is slow is the **kernel↔daemon transport**, not the overlay semantics. Every userspace/distributed peer
+pays this same premium — JuiceFS, Alluxio, CernVM-FS (FUSE, distributed) and gVisor/sandboxfs (FUSE, hermetic) are all
+10–100× slower per op than in-kernel overlayfs; they trade local latency for distribution/hermeticity/portability, as
+slates does, while overlayfs/EROFS buy speed with privilege, locality and OS-specificity slates refuses. The in-design
+levers to narrow the gap, in order: (1) profile one FUSE create end to end to attribute the 277 µs (round trip vs shard
+hop vs copy-up vs merge tracking) before building; (2) io_uring FUSE (`FUSE_OVER_IO_URING`, Linux 6.14+, 2–4× FUSE gains,
+unprivileged); (3) virtio-fs + DAX for the microVM case (shared memory, near-native; `crates/bridge-virtiofs` exists);
+(4) FUSE writeback caching + larger `max_write` to batch write round trips.
+
+**Honest verdict — correcting the earlier "far above industry-leading" framing.** Against the **in-kernel** overlayfs,
+slates is **12–325× slower per operation**, dominated by the **write path** (create/rewrite/fsync). This is the
+out-of-kernel protocol hop: a FUSE (or NFS) round trip plus the daemon's per-op processing and merge tracking, which the
+in-kernel overlayfs does not pay. So slates does **not** have "far above industry-leading" p99s against the kernel's own
+local overlay; the prior comparison (knfsd, Tectonic) was against *networked/distributed* filesystems that also pay
+network/store hops, where slates wins — but that is the wrong peer for a local overlay.
+
+**What slates buys for the premium** (overlayfs offers none of these): hermetic RAM with no disk escape except a granted
+merge, remote/replicated volumes, post-quantum encryption in transit and at rest, cross-OS mount, and exact change
+tracking. The honest position is that slates trades local per-op latency for those properties — the inverse of
+Tectonic's "trade latency for scale."
+
+**The optimization target, now quantified.** The write path dominates: create 277 µs, rewrite 471 µs, create+fsync
+1,234 µs at p50, against overlayfs's 3–5 µs. Reducing the FUSE/daemon round-trip and the copy-up cost on writes is the
+single largest p99 lever for condition 12 — far larger than any landing-side gain. Reads (43 µs) and stats (14 µs) are
+closer but still ~12–14×. Next: profile one FUSE write end to end (client → kernel FUSE → daemon shard → overlay
+copy-up → reply) to attribute the 277 µs, and A/B against the NFSv4.2 mount path (kernel-side caching/readahead may beat
+FUSE).
