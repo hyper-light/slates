@@ -5083,3 +5083,38 @@ Linear at ~1.0 µs an entry → ~105 ms at 100k, ~1 s at 1M, all in one shard st
 **Correctness.** The sliced-vs-one-call oracle holds (`crates/land` 62 tests); reads return the landed content at every
 slice and the base is clean after (`a_sliced_advance_reads_consistently_and_leaves_the_base_clean`); the server landing
 suites and vfs suite are green.
+
+### Condition 12: slates' measured p99s, and an honest comparison to TectonicFS (2026-10-11)
+
+**The competitor, read first.** TectonicFS (Pan et al., "Facebook's Tectonic Filesystem", FAST '21) is an
+**exabyte-scale warehouse/blob filesystem** — 1,590 PB, 10.7 billion files, 15 billion blocks, 4,208 storage nodes
+(Table 2). It reports **throughput and scale, not small-operation p99 latency**: metadata shards serve up to **10 KQPS**,
+and ~1% of Name-layer shards hit that limit and retry after backoff (§6.3, Fig 4c). On latency it is explicit (§6.5,
+"The impact of higher metadata latency"): *"HDFS metadata operations are in-memory and all metadata for a namespace is
+stored on a single disk. In contrast, Tectonic stores its metadata in a sharded key-value store and disaggregates
+metadata layers. This means Tectonic metadata operations may require one or more network calls (e.g., a file open
+operation will interact with the Name and File layers)… compute engines parallelize this step to hide the extra latency
+of individual Tectonic rename operations."* So Tectonic deliberately trades higher per-operation metadata latency for
+exabyte scale, and hides it with parallelism; it publishes no small-op p99.
+
+**Why the classes differ.** slates is an **in-memory copy-on-write VFS** — exactly the in-memory metadata class
+(HDFS-like) that Tectonic contrasts itself against as the lower-latency design. A slates metadata or read operation on
+the local path touches RAM, with no key-value-store hop and no network call; a cross-region one is bounded by the
+measured RTT (§4.8), not by added store hops. So a single-operation p99 comparison favours the in-memory design by
+construction — the honest framing is that slates occupies the low-latency end Tectonic gave up for scale, while Tectonic
+occupies a scale point slates does not claim (EB warehouse blobs).
+
+**slates' measured p99s (this session and prior, in-memory host / loopback NFS / fleet):**
+- **Landing finish, sliced (A-133):** step p50 126 µs, p99 130–752 µs, flat from 1k to 100k entries (125 µs budget).
+- **Other clients during a landing (A-132), 2-CPU/256 MB, quiet + a syncing writer + CPU hogs:** worst p99 **0.07–0.28 ms**
+  (was 1.26–126.72 ms before the barriers moved off the shard).
+- **Local NFS op p99 5.7 µs** (`overlay_diff.sh`, `nfs.local_p99_ns`).
+- **Overlay real-tree reads at the NFS client's floor:** cold 1.58–1.78 s for 5,863 files / 540 MB — **faster than the
+  Linux kernel's own NFS server** on the same client (1.77–2.03 s), the apt live same-machine competitor.
+- **Change tracking:** an exact diff plan in 2–3 ms against `diff -rq`'s 406–461 ms (~150×).
+
+**Verdict.** For single-operation latency under non-ideal (contended) access, slates' p99s are microsecond-scale on the
+local path and bounded by measured RTT on the fleet path — the low-latency end of the design space Tectonic documents
+itself as trading away for exabyte throughput. The directly runnable competitor on this hardware, the Linux kernel's NFS
+server, slates beats on read latency. A live Tectonic A/B is not possible (it is Facebook-internal and not open source);
+this comparison is against its published figures, with the workload-class caveat stated.

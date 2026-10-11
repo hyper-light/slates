@@ -6032,3 +6032,32 @@ them.
 
 All green; no regression from A-130/132/133. The FUSE small-file write cost remains the open condition-12 item
 (host-side 2,000 creates on the FUSE mount 0.26 s against 0.13 s on a tmpfs bind).
+
+### 2026-10-11: conditions 1, 6, 7, 10, 12 — status at HEAD (b4beca05)
+
+Covering the conditions not re-touched by the landing rework, so the full 13-condition picture at HEAD is on record.
+
+- **Condition 1 (single binary, laptop-to-global, one code path).** The workspace produces **one 11.8 MB `slates`
+  binary** (`crates/cli` `[[bin]] name = "slates"`) carrying anchor + daemon + MCP + the full volume lifecycle + mount
+  /attach (OCI) + merge (green/work/submit/rebase) + consensus (bootstrap/recover) + CRI (`oci-check`/`oci-runtime`).
+  The laptop≡fleet one-code-path rule (R8) is proven by `crates/db` `register` tests 55/0, incl.
+  `the_commit_rule_is_the_same_code_at_f` — the commit rule runs the same code at f=0 (laptop) and simulated f=1 (fleet),
+  with no mode switch.
+- **Condition 6 (cross-OS/arch).** macOS aarch64 (native, this session's suites) and Linux aarch64 (Docker) already
+  green. **x86_64 Linux re-validated at HEAD under Docker amd64 emulation: `slates-land` + `slates-vfs` 318/0**,
+  bit-identical to aarch64 — the VFS core and the landing (incl. A-133) are cross-arch. Windows (WinFsp) is built and
+  CI-covered; it cannot run on this macOS host.
+- **Conditions 7 and 10 (remote pull under contention; cross-cluster replication under horrific networks).** The fleet
+  transport, cross-region reads and mirror replication live in `crates/cluster`, `crates/transport`, `crates/db` and
+  `vendor/hyper-raft`, which are **byte-identical since the fleet suite passed 86/86 on Linux this session** (the
+  `537d0e51..b4beca05` diff of those paths is empty; only `crates/server/src/landing.rs` changed, for A-132/133). So
+  both stand at HEAD as validated: cross-region reads over the real transport with simulated WAN delay/loss, and mirror
+  placement (recently 43/44 snapshots at 3% loss, 100 ms ± 40 ms). Re-running unchanged code on the shared machine was
+  not warranted.
+- **Condition 12 (p99 vs industry).** Recorded in `BENCHMARKS.md` ("Condition 12: slates' measured p99s, and an honest
+  comparison to TectonicFS"): slates' single-op p99s are µs-scale on the local path (landing step p99 130–752 µs; other
+  clients during a landing 0.07–0.28 ms; local NFS op 5.7 µs) and bounded by measured RTT on the fleet path, the
+  low-latency end of the space TectonicFS (FAST '21) documents trading away for exabyte scale (its metadata is
+  10 KQPS/shard with "one or more network calls" an op, no published small-op p99). The runnable same-machine
+  competitor, the Linux kernel's NFS server, slates beats on read latency. A live Tectonic A/B is not possible (closed
+  source); the comparison is against published figures with the workload-class caveat stated.
