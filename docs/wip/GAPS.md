@@ -6005,3 +6005,30 @@ load 11; tree copied to tmpfs so readers start from RAM):
   sub-µs, so it is not a shard hold. Moving base reads off the shard is therefore **lower value than feared** — it would
   matter only for a slow or contended *base* disk, a narrower case. Deprioritized by measurement before building; revisit
   only with a measured slow-disk signal.
+
+### 2026-10-11: broad e2e re-validation at HEAD (864ec139/8376139c), after the A-130/132/133 landing changes
+
+Real-world and adversarial lanes rerun at HEAD on the Linux NFSv4.2 client and macOS; the landing rework broke none of
+them.
+
+- **Condition 11 — recovery under kills** (`realworld_chaos.sh`, release, Linux): git clone, a real `cargo build`
+  (regex/serde/serde_json) and `pip install` (requests/flask), each with the daemon SIGKILLed **twice mid-workload**
+  (6 restarts, generation 7). Every one finished byte-correct: clone fsck clean + tree `31a1f6f7…`, the binary prints
+  `{"n":2}`, `import flask` works. The anchor restarts over its RAM and the hard mount retries.
+- **Condition 2 — OCI through containerd 1.7.24 + runc 1.1.15** (`containerd/run.sh`): a slates volume as an OCI
+  `mounts[]` entry (`slates attach --oci`), `ctr run` of a 2,000-file workload (creates, a hard link, a symlink, a tar
+  round trip) in a real alpine container — exit 0 in 1.09 s, 2,002 entries, tar `69fa8a7a…`, and the host side sees the
+  same count and sha (bidirectional).
+- **Conditions 3 and 4 — no escape, adversarial:** the read-only OCI entry refuses writes (`Read-only file system`);
+  the setuid probe runs as uid 65534 in the container (`nosuid` holds); the escape battery (0 bytes, 3,200 ops) and the
+  outsider-edit→`ModifyModify` conflict from the prior entries stand.
+- **Condition 5 — reads/diff:** `overlay_diff.sh` at the NFS client's floor, exact diff plan (above).
+- **Condition 8 — post-quantum transfer:** `cargo test -p slates-transport --lib -- handshake` 8/0, incl.
+  `a_fleet_handshake_negotiates_the_hybrid_post_quantum_group`, which asserts both sides negotiate
+  `SECP384R1_MLKEM1024` (ML-KEM-1024 with P-384).
+- **Condition 9 — at rest:** `cargo test -p slates-server --test seal` 2/0 (sealed content reads back after a restart;
+  the idle sweep seals a small file).
+- **Condition 13 — MCP:** `cargo test -p slates-mcp` 16/0.
+
+All green; no regression from A-130/132/133. The FUSE small-file write cost remains the open condition-12 item
+(host-side 2,000 creates on the FUSE mount 0.26 s against 0.13 s on a tmpfs bind).
