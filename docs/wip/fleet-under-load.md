@@ -234,8 +234,13 @@ What it means for slates:
 
 **Owed — a call for Ada (not a defect; by design).** With `D = F − confirmation` and F's placeholder of 10 s: LAN-5
 keeps 10 s only at cost 0 (bound 1.9 s; at a 1 s cost the bound is 13.8–25 s); LAN-3 keeps it up to ~1 s cost (bound
-9 s). Once slates states the takeover's **measured** condemnation cost, F must be set knowing these numbers — the
-trade-off is false-condemnation risk against detection time, Ada's to weigh. No slates code changes now: `hyper-swim`
+9 s). **The condemnation cost is slates' own number to measure, not an external one** (confirmed with the hyper-raft
+agent 2026-10-11): it is what a false condemnation costs slates — the measured time and work of slates' own takeover
+path (`crates/cluster/src/takeover.rs`, the paged phase-one round per retired host, [[takeover-vp2-per-host-round]]).
+Mantle and hyper-raft have no figure for it. **Owed slates measurement:** time a takeover of a host holding a realistic
+object count (the round latency and the per-object promote+adopt work), put it beside the LAN-5/LAN-3 bound-vs-cost rows
+above, and Ada sets F from one place. The trade-off is false-condemnation risk against detection time, Ada's to weigh.
+No slates code changes now: `hyper-swim`
 needs none; a `promise_ns` on the `Ack` request is a wire change to the shared codec that still waits on the owner's
 call; and `main` at `506c059` (focal transport + hyper-rt) touches none of the four vendored crates, so nothing to
 re-vendor (the hyper-raft agent re-vendors). If slates ever adopts hyper-rt's blocking pool: `Share::new(name, limit)`
