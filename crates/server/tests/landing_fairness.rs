@@ -101,6 +101,34 @@ fn write_files(daemon: &Daemon, volume: &str, count: usize) {
   }
 }
 
+/// The barriers the daemon ran on threads of their own (A-132's counter).
+fn barriers_away(daemon: &Daemon) -> u64 {
+  daemon
+    .refusals_on_every_shard()
+    .unwrap()
+    .get("landing.barriers_away")
+    .copied()
+    .unwrap_or(0)
+}
+
+/// The landing is done with every file written, it took barriers, and every one ran on a thread of its own, none on
+/// the shard (A-132): `away` barriers counted by the daemon.
+fn assert_landed_with_every_barrier_away(landed: &Result<Landing, ClientError>, away: u64) {
+  let Ok(Landing::Landed(outcome)) = landed else {
+    panic!("the granted landing: {landed:?}");
+  };
+  assert_eq!(outcome.state, "done");
+  assert_eq!(outcome.written, u64::try_from(FILES).unwrap());
+  assert!(
+    outcome.barriers > 0,
+    "the landing took barriers: {outcome:?}"
+  );
+  assert_eq!(
+    away, outcome.barriers,
+    "every barrier ran on a thread of its own (A-132)"
+  );
+}
+
 /// Prints each probe kind's quantiles inside the landing (`began`, lasting `took`) beside its baseline, asserts
 /// every kind was answered more than once while the landing ran, and returns the longest probe inside it.
 fn report_probes(
@@ -146,8 +174,10 @@ fn report_probes(
 /// destroy) and a write lease taken and given back, in turn. Expect: the landing is done with every file
 /// written and ran in many slices; every kind of probe was answered while it ran; no probe waited for the
 /// whole landing; no slice ran past its budget by more than its own last unit (the daemon counts any that
-/// did); and the run publishes, per probe kind and for the slices, p50/p99/p999/max, with the shard's
-/// longest step — the recorded lane (`docs/wip/BENCHMARKS.md`, "The landing's percentile lane").
+/// did); every barrier the landing took ran on a thread of its own, never in a slice (A-132: the daemon's count of
+/// barriers away equals the landing's barriers, and there were some); and the run publishes, per probe kind and for
+/// the slices, p50/p99/p999/max, with the shard's longest step — the recorded lane (`docs/wip/BENCHMARKS.md`, "The
+/// landing's percentile lane").
 #[test]
 fn a_large_landing_leaves_its_shard_serving_between_its_slices() {
   let profile = common::machine_profile();
@@ -199,6 +229,7 @@ fn a_large_landing_leaves_its_shard_serving_between_its_slices() {
   }
   let (began, took, landed) = landing.join().unwrap();
   let slices = daemon.landing_slices().unwrap();
+  let away = barriers_away(&daemon);
   let longest_step = daemon
     .shard_pulses()
     .iter()
@@ -208,14 +239,10 @@ fn a_large_landing_leaves_its_shard_serving_between_its_slices() {
   drop(prober);
   daemon.stop();
 
-  let Ok(Landing::Landed(outcome)) = landed else {
-    panic!("the granted landing: {landed:?}");
-  };
-  assert_eq!(outcome.state, "done");
-  assert_eq!(outcome.written, u64::try_from(FILES).unwrap());
+  assert_landed_with_every_barrier_away(&landed, away);
   eprintln!(
     "landing of {FILES} files: {took:?} in {} slices of a {} ns budget: p50 {} ns, p99 {} ns, p999 {} ns, \
-     max {} ns; {} past budget; the shard's longest step {longest_step} ns",
+     max {} ns; {} past budget; {away} barriers away; the shard's longest step {longest_step} ns",
     slices.slices,
     slices.budget_ns,
     slices.p50_ns,

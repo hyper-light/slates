@@ -9,8 +9,8 @@
 pub(crate) mod removal;
 
 use slates_land::engine::{
-  Audit, HostSlot, LandingRefusal, LandingReport, LandingRequest, LandingTarget, Observer,
-  Presented, Unobserved, begin_landing, land, settle_grant,
+  Audit, HostSlot, LandingRefusal, LandingReport, LandingRequest, LandingRun, LandingTarget,
+  Observer, Presented, Unobserved, begin_landing, land, settle_grant,
 };
 use slates_land::grant::{GrantScope, Grants, Leases, Surface};
 use slates_land::manifest::Filter;
@@ -122,6 +122,11 @@ pub(crate) struct Session {
   pub(crate) slice_budget_ns: u64,
   /// The slices the session's sliced landings took (the sliced oracles' non-vacuity counter).
   pub(crate) slices: u64,
+  /// The slices a sliced landing is stepped while each barrier it took is away, before the barrier runs (A-132): the
+  /// run must step nothing meanwhile.
+  pub(crate) hold_barrier_slices: u64,
+  /// The barriers the session's sliced landings gave out and ran away from the run (A-132's non-vacuity counter).
+  pub(crate) barriers_away: u64,
 }
 
 impl Default for Session {
@@ -138,6 +143,8 @@ impl Session {
       audit: Audit::new(1 << 10),
       slice_budget_ns: u64::MAX,
       slices: 0,
+      hold_barrier_slices: 0,
+      barriers_away: 0,
     }
   }
 
@@ -146,6 +153,15 @@ impl Session {
     Self {
       slice_budget_ns: 0,
       ..Self::new()
+    }
+  }
+
+  /// A session whose granted landings run one unit per slice, each barrier held away for `slices` slices before it
+  /// runs, as a busy disk holds a barrier while the shard steps on (A-132).
+  pub(crate) fn sliced_holding_barriers(slices: u64) -> Self {
+    Self {
+      hold_barrier_slices: slices,
+      ..Self::sliced()
     }
   }
 }
@@ -230,6 +246,12 @@ impl<H: LandFs> Setup<'_, H> {
         self.session.slice_budget_ns,
       ) {
         break ended;
+      }
+      if let Some(barrier) = run.take_barrier() {
+        step_while_away(&mut run, self.vol, self.store, self.session, observer);
+        self.session.barriers_away += 1;
+        run.barrier_ran(barrier.run());
+        continue;
       }
       if run.ready_to_finish() {
         break run.finish(self.vol, self.store, &mut self.session.audit, observer);
@@ -405,4 +427,31 @@ pub(crate) fn read_through<H: HostFs>(
     .read(store, located.inode, 0, &mut buf)
     .unwrap();
   buf[..n].to_vec()
+}
+
+/// Steps a run whose barrier is away (A-132) the session's `hold_barrier_slices` times, as a shard steps on while a busy
+/// disk holds the barrier: each step must end nothing, the run must still wait, and it must give no barrier out twice.
+fn step_while_away<H: LandFs, O: Observer<H>>(
+  run: &mut LandingRun<'_, H>,
+  vol: &mut Volume,
+  store: &mut Store,
+  session: &mut Session,
+  observer: &mut O,
+) {
+  for _ in 0..session.hold_barrier_slices {
+    session.slices += 1;
+    let stepped = run.step(
+      vol,
+      store,
+      &mut session.audit,
+      observer,
+      session.slice_budget_ns,
+    );
+    assert!(
+      stepped.is_none(),
+      "a run waiting on its barrier ended: {stepped:?}"
+    );
+    assert!(run.awaiting_barrier());
+    assert!(run.take_barrier().is_none(), "a barrier given out twice");
+  }
 }

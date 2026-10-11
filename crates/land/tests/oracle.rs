@@ -709,6 +709,8 @@ fn crash_reference_in(fs: Filesystem, mut session: Session) -> (Disk, Disk, u64,
     ),
     diverged: format!("{:?}", vol.diverged(&store)),
     slices: session.slices,
+    barriers_away: session.barriers_away,
+    visible_before_durable: host.visible_before_durable().to_vec(),
   };
   (before, disk(&host), host.write_steps() - writes, landed)
 }
@@ -720,6 +722,10 @@ struct Landed {
   counts: (usize, usize, usize, usize, usize),
   diverged: String,
   slices: u64,
+  /// The barriers a sliced run gave out to run away from it (A-132).
+  barriers_away: u64,
+  /// Every name a temporary was visible under before it was durable.
+  visible_before_durable: Vec<String>,
 }
 
 /// Every path on `now` is as on `before` or as on `after`: old or new, never torn.
@@ -1018,11 +1024,13 @@ fn every_landed_entry_has_its_directory_synced_before_it_advances() {
 
 /// The check behind [`a_landed_file_is_durable_before_it_is_visible`] can fail, in each way a placement can come too
 /// early. Do: on the simulated host, place temporaries at real names after: nothing; a write-out alone; a barrier
-/// alone; a write-out, a later write, then a barrier; a write-out then a barrier. Expect: every name but the last
-/// recorded — a file is durable only once a barrier follows a write-out made after its last change (A-130).
+/// alone; a write-out, a later write, then a barrier; a write-out, a barrier taken, a write while it runs (A-132) and
+/// another write-out before its outcome came back; a write-out then a barrier. Expect: every name but the last
+/// recorded — a file is durable only once a barrier taken after a write-out made after its last change has returned
+/// (A-130), however it changed while the barrier ran.
 #[test]
 fn a_temporary_placed_before_its_barrier_is_recorded() {
-  use slates_vfs::host::LandFs;
+  use slates_vfs::host::{HostFile, LandFs};
   let mut host = SimHost::new();
   let root = host.root();
   let temp = |host: &mut SimHost, n: u32| {
@@ -1032,26 +1040,47 @@ fn a_temporary_placed_before_its_barrier_is_recorded() {
     host.write_at(file, 0, b"bytes").unwrap();
     file
   };
+  let barrier = |host: &mut SimHost, files: &[HostFile]| {
+    let ran = host.begin_barrier(files).unwrap().run();
+    host.end_barrier(files, ran).unwrap();
+  };
   let unsynced = temp(&mut host, 0);
   host.place(unsynced, root, "unsynced").unwrap();
   let written_out = temp(&mut host, 1);
   host.write_out(written_out).unwrap();
   host.place(written_out, root, "written_out").unwrap();
   let barrier_only = temp(&mut host, 2);
-  host.barrier(&[barrier_only]).unwrap();
+  barrier(&mut host, &[barrier_only]);
   host.place(barrier_only, root, "barrier_only").unwrap();
   let changed = temp(&mut host, 3);
   host.write_out(changed).unwrap();
   host.write_at(changed, 5, b" more").unwrap();
-  host.barrier(&[changed]).unwrap();
+  barrier(&mut host, &[changed]);
   host.place(changed, root, "changed").unwrap();
-  let durable = temp(&mut host, 4);
+  let changed_while_running = temp(&mut host, 4);
+  host.write_out(changed_while_running).unwrap();
+  let running = host.begin_barrier(&[changed_while_running]).unwrap();
+  host.write_at(changed_while_running, 5, b" more").unwrap();
+  host.write_out(changed_while_running).unwrap();
+  let ran = running.run();
+  host.end_barrier(&[changed_while_running], ran).unwrap();
+  host
+    .place(changed_while_running, root, "changed_while_running")
+    .unwrap();
+  let durable = temp(&mut host, 5);
   host.write_out(durable).unwrap();
-  host.barrier(&[durable]).unwrap();
+  barrier(&mut host, &[durable]);
   host.place(durable, root, "durable").unwrap();
   assert_eq!(
     host.visible_before_durable(),
-    ["/unsynced", "/written_out", "/barrier_only", "/changed"].map(str::to_owned)
+    [
+      "/unsynced",
+      "/written_out",
+      "/barrier_only",
+      "/changed",
+      "/changed_while_running"
+    ]
+    .map(str::to_owned)
   );
 }
 
@@ -1088,6 +1117,34 @@ fn a_landing_stepped_one_unit_per_slice_lands_exactly_as_the_one_call() {
       sliced.slices,
       sliced.outcomes.len()
     );
+  }
+}
+
+/// A-132. Do: land the crash scenario on each simulated filesystem in one call, then sliced with each barrier held away
+/// from the run for three slices before it runs — a busy disk holding the barrier while the shard steps on. Expect: the
+/// held run leaves the same disk, the same host writes, the same report and the same overlay as the one call; no name
+/// was visible before its temporary was durable; and barriers were held (the non-vacuity), the run stepping nothing
+/// and giving no barrier out twice while each was away (asserted by the driver).
+#[test]
+fn a_landing_waits_on_each_barrier_away_and_lands_exactly_as_the_one_call() {
+  for fs in [
+    LINUX,
+    MACOS,
+    Filesystem {
+      exchange: false,
+      unnamed_temporaries: true,
+    },
+  ] {
+    let (before, after, writes, whole) = crash_reference_in(fs, Session::new());
+    let (held_before, held_after, held_writes, held) =
+      crash_reference_in(fs, Session::sliced_holding_barriers(3));
+    assert_eq!((held_before, held_after), (before, after));
+    assert_eq!(held_writes, writes, "the same host writes");
+    assert_eq!(held.outcomes, whole.outcomes);
+    assert_eq!(held.counts, whole.counts);
+    assert_eq!(held.diverged, whole.diverged);
+    assert!(held.visible_before_durable.is_empty(), "{held:?}");
+    assert!(held.barriers_away > 0, "no barrier was held away");
   }
 }
 

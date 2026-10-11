@@ -5216,13 +5216,19 @@ entry either old or new, never torn).
    for the resume). Its boundaries depend only on the manifest, the page and the window, never on where
    a slice ends. The barrier per platform is step 8's. No disk is probed at boot.
 8. *Sync.* A file's data is durable before it is placed: its write-out, then its batch's barrier
-   (A-130; macOS `fsync` each, then one `F_BARRIERFSYNC` per device, the device's barrier ordering every
-   earlier write-out; Linux the files' `fdatasync`s on ⌈√n⌉ streams for n files, so journal group commit
-   merges the syncs in flight into few commits and flushes). After the last entry, one directory sync per touched directory in
-   parallel (Linux `fsync` on the directory descriptors — never `syncfs`, which also flushes every other
+   (A-130; macOS each file's `fsync` and then one `F_BARRIERFSYNC` per device, the device's barrier ordering
+   every earlier sync; Linux the files' `fdatasync`s on ⌈√n⌉ streams for n files, so journal group commit
+   merges the syncs in flight into few commits and flushes; the other unixes each file's `fdatasync`). The
+   barrier waits on the device and on every other writer of the filesystem, so it never runs on the shard
+   (A-132): it is a job over its own descriptors of the batch's files, run on a thread the landing's task
+   owns, and the run steps nothing until its outcome is back while the shard serves its other clients. The
+   write-out waits on nothing (Linux starts the file's writeback with `sync_file_range`; elsewhere it does
+   nothing, and the barrier's sync covers the file). After the last entry, one directory sync per touched
+   directory, one a unit (Linux `fsync` on the directory descriptors — never `syncfs`, which also flushes every other
    writer's dirty data on the filesystem: beside one busy writer a `syncfs` took up to 3.7 s, A-130;
    macOS one `F_FULLFSYNC` after the barriers when the grant asked for media durability, otherwise the
-   barriers only; Windows `FlushFileBuffers` on the directory handles).
+   barriers only; Windows `FlushFileBuffers` on the directory handles). The directory syncs and the media
+   barrier still run on the shard: A-132's measured residual, the next piece (GAPS).
    The outcome record states which durability the landing achieved, and the reply carries it with
    every Degraded cell met (A-45): a directory it could not open or sync (`Unsynced`), a media barrier
    asked for that failed (`MediaUnsynced`, as against `BarriersOnly` when not asked for), an entry of
@@ -5438,6 +5444,17 @@ stays in the overlay.
 >   whose directory was not synced. Before, it recorded syncs no test read.
 > - **Measured on APFS:** 1.5–4.2× faster through the engine; the shard's other work waits 2–3× less during a landing.
 > - Record: `docs/bugs/2026-10-10-a-landings-durability-order-was-untested-and-an-abandoned-run-kept-its-temporaries-open.md`.
+
+> **Status (2026-10-10, A-132).** A landing's durability waits run off the shard.
+> - **How:** a batch's barrier is a job over its own descriptors of the files. It runs on a thread the landing's task
+>   owns, and the run steps nothing until its outcome is back. macOS's `fsync` and the other unixes' `fdatasync` moved
+>   from the write-out into it.
+> - **Measured on Linux,** in a 2-CPU, 256 MB container quiet, beside a syncing writer, and under CPU hogs: other
+>   clients' worst p99 during a landing went from 1.26–126.72 ms to 0.07–0.28 ms. The landing's longest hold on its
+>   shard went from 3–91 ms to at most 8.5 ms.
+> - **Owed:** the unsliced finish, the directory syncs, the metadata calls, the base plane's cold reads, and a thread
+>   kept for the landing. GAPS holds each, with its measurement.
+> - Record: `docs/bugs/2026-10-10-a-landings-durability-waits-held-its-shard-on-a-busy-machine.md`.
 
 **Integration points.** §4.4 (verbs, refusals, states), §4.5 (whiteouts, redirects, witnesses,
 copy-up, drift), §4.6 (base reads, invalidation on drift), §4.8 (grant, lease and
@@ -11185,3 +11202,88 @@ Status: built 2026-10-10.
 - **Proven:** the crash-at-every-instruction oracle on the named-temporary shapes (APFS, and no exchange), the
   durability and directory-sync oracles, and the OS writer's real-disk tests (creates, replacements, the removal oracle
   with outsiders at every seam call) on APFS and on ext4.
+
+### A-132 — A landing's durability waits run off the shard (2026-10-10)
+Applied in the same change to:
+- §4.15 step 8 (where the barrier waits; macOS's write-out; the directory syncs described as built, one a unit) and
+  its status;
+- `crates/vfs/src/host/mod.rs` (`Barrier`, a batch's barrier as a job; `LandFs::begin_barrier` and
+  `LandFs::end_barrier` replace `LandFs::barrier`; `write_out` waits on nothing);
+- `crates/vfs/src/host/sim.rs` (the barrier taken at its begin, the crash point, and its durability applied at its end
+  to the files it found written out and unchanged since; `SimVerb::BarrierRun`);
+- `crates/land/src/os.rs` (`OsBarrier` over `dup`ed descriptors; macOS's `fsync` and the other unixes' `fdatasync`
+  move from the write-out into the barrier, on the same ⌈√n⌉ streams as Linux's);
+- `crates/land/src/engine.rs` (the barrier unit takes the barrier and the run waits; `LandingRun::{take_barrier,
+  barrier_ran, awaiting_barrier}`; the one-call landing runs a barrier in place);
+- `crates/server/src/landing.rs` (`BarrierThread`, `run_barrier_away`, the lease kept alive while a barrier waits; the
+  counters `landing.barriers_away` and `landing.barrier_thread_refused`);
+- tests: `crates/land/tests/common/mod.rs` (the sliced driver holds each barrier away for N slices), `oracle.rs`
+  (`a_landing_waits_on_each_barrier_away_and_lands_exactly_as_the_one_call`; `a_temporary_placed_before_its_barrier_is_recorded`
+  with a change while the barrier runs), `durability.rs`
+  (`a_barrier_refused_while_it_runs_away_fails_its_whole_batch_and_shows_none_of_it`), `os_escape.rs` and
+  `os_removal.rs` (their wrappers), `crates/server/tests/landing_fairness.rs` (every barrier away);
+- GAPS, BENCHMARKS, `docs/bugs/2026-10-10-a-landings-durability-waits-held-its-shard-on-a-busy-machine.md`.
+
+Status: built 2026-10-10.
+- **What it answers.** A busy machine is the condition the daemon meets (Ada, 2026-10-10). Measured there, a granted
+  landing held its shard for every durability wait, and every other client of that shard waited with it.
+  - **Linux,** in a 2-CPU, 256 MB container: the batch barrier was the only unit over 1 ms. The shard's longest step was
+    23–160 ms, and probes served during the landing waited up to 124–242 ms, against at most 8 ms before it.
+  - **macOS,** at load 17–25: the write-out's `fsync` took up to 206 ms in a write unit, a placement 11.6 ms, a barrier
+    18 ms. Probes waited up to 265 ms.
+  - Slicing (AUD-29-25) bounds a slice by its last unit, and a unit that waits on the device has no bound the landing
+    controls.
+- **The rule:** no landing durability wait runs on a shard.
+  - **The job.** A batch's barrier is taken from the host as a job (`Barrier`) over its own descriptors of the batch's
+    files, so the host may close a file while it runs.
+  - **The thread.** It runs on a thread the landing's task owns: started for the barrier, joined when its outcome
+    comes, joined on drop. The thread sends the outcome over a channel of one and then wakes the task, so a wake always
+    finds the outcome.
+  - **The wait.** The run steps nothing until the outcome is back, so nothing of the batch is placed before its files
+    are durable, exactly as before. The shard serves its other clients meanwhile and parks when it has none, and the
+    landing's lease is renewed while the barrier waits.
+  - **Failures are typed:** a barrier refused as it runs fails its whole batch as a refused barrier always did, and a
+    thread the system refuses to start does the same.
+- **Per platform:**
+  - **Linux:** the write-out still starts each file's writeback on the shard (`sync_file_range`, which does not wait).
+  - **macOS and the other unixes:** their only call that starts a file's writeback also waits for it, so `fsync`
+    (macOS) and `fdatasync` (elsewhere) move from the write-out into the barrier. The barrier syncs every file on
+    ⌈√n⌉ streams, then macOS orders them with one `F_BARRIERFSYNC` per device.
+  - The same calls, in the same order for each file; only where they wait changed.
+- **The shape's evidence.** Thread-per-core runtimes keep blocking file calls off the reactor thread.
+  - Seastar's `posix_file_impl::fdatasync` submits the sync to the I/O backend where it supports one, and otherwise
+    to `engine()._thread_pool`. Its rename, remove, link and open go through `_thread_pool->submit`, on a per-reactor
+    thread named `syscall-<id>` [C: scylladb/seastar master, `src/core/file.cc` and `src/core/reactor.cc`, read
+    2026-10-10].
+  - slates has no io_uring on macOS or under Docker's default seccomp, so a thread is the one mechanism every platform
+    has.
+- **Measured** (2026-10-10, `BENCHMARKS.md`; the landing-fairness lane, release, the arms interleaved against
+  `078bb5e2`):
+  - **Linux,** in a 2-CPU, 256 MB container, nine rounds over three conditions (quiet, a syncing writer beside it, two
+    CPU hogs in its cgroup):
+    - the probes' worst p99 during a landing was 0.07–0.28 ms in every round, against 1.26–126.72 ms;
+    - the landing's own longest hold on the shard was at most 8.5 ms, against 3.0–90.6 ms.
+  - **macOS,** in five quieter rounds: both arms held the shard about 4–5 ms at most, and the worst p99 was lower in
+    four (0.52–1.44 against 0.91–3.95 ms).
+  - **Left over, from outside the landing's slices:**
+    - Linux probe maxima of 51–113 ms in contended rounds. Under the CPU hogs, instrumented runs attribute them to the
+      cgroup's quota: a poll held off the CPU, and the unsliced finish stretched from about 1 ms of CPU to 52 ms.
+    - A ~145 ms step on the contended Mac, in both arms.
+  - **The landing's own time** is about as fast or faster when quiet and 1.6–3.4× slower under the CPU hogs. The shard
+    now serves the prober during each barrier instead of blocking it.
+  - **macOS throughput** (`land_bench flat` at load 40–81): no arm won consistently, so moving the `fsync` into the
+    barrier is recorded as costing nothing measurable.
+- **Owed, each the next piece by the same measurement:**
+  - the finish, which advances every landed entry in one unsliced step: about 1.7 µs of CPU an entry on Linux, so a
+    100,000-file landing would hold its shard about 170 ms, and throttling stretches it further. Slicing it must keep
+    its records one atom with the completion (step 9);
+  - each barrier starting its thread and stream threads anew: a thread kept for the landing, and the next batch staged
+    while a barrier is away, would give back the landing's time under CPU contention;
+  - the directory syncs and the media barrier, still on the shard;
+  - the metadata calls (create, rename, `fchmod`, `futimens`): a placement took up to 11.6 ms on the busy Mac;
+  - the base plane's reads of cold host files, on the shard for every overlay read (unmeasured).
+- **Rejected:**
+  - io_uring's `IORING_OP_FSYNC` as the mechanism: it is absent on macOS and under Docker's default seccomp, so it would
+    be a second mechanism beside the thread every platform needs anyway;
+  - moving the whole landing engine to a thread of its own: the volume and its store are the shard's, so every content
+    window and every audit record would cross back. It stays the end state if the residual calls for it.

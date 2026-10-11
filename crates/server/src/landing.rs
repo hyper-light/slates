@@ -53,7 +53,7 @@ use slates_land::os::{Away, OsLand, TargetRefusal};
 use slates_land::source::Source;
 use slates_vfs::clock::Clock;
 #[cfg(unix)]
-use slates_vfs::host::{HostError, HostFs, LandFs};
+use slates_vfs::host::{Barrier, HostError, HostFs, LandFs};
 #[cfg(unix)]
 use slates_wire::observe::Chokepoint;
 
@@ -867,6 +867,8 @@ enum Begun {
 enum Stepped {
   /// More host work remains.
   More,
+  /// The run took a batch's barrier and waits on it (A-132): it runs on a thread of its own, never the shard.
+  Barrier(Box<dyn Barrier>),
   /// Only the finish remains.
   Ready,
   /// The run ended early with this outcome (a refusal).
@@ -910,6 +912,10 @@ async fn drive_granted_landing(
       Stepped::More => {
         keep_lease_alive(&mut granted, renew, &key).await;
         slates_rt::futures::yield_now().await;
+      }
+      Stepped::Barrier(barrier) => {
+        let ran = run_barrier_away(barrier, &mut granted, renew, &key).await;
+        granted.run.barrier_ran(ran);
       }
       Stepped::Ready => {
         recall_before_finish(&mut granted, renew, &key).await;
@@ -1036,6 +1042,133 @@ const LEASE_RENEWED: &str = "landing.lease_renewed";
 /// target, or the control shard did not answer): its term then ends the landing's writes.
 #[cfg(unix)]
 const LEASE_NOT_RENEWED: &str = "landing.lease_not_renewed";
+
+/// Counter: a landing batch's barrier run on a thread of its own while the shard served on (A-132).
+/// Format: a counter name in the daemon's status report.
+#[cfg(unix)]
+const BARRIERS_AWAY: &str = "landing.barriers_away";
+
+/// Counter: a barrier thread the system refused to start (a process or cgroup thread limit): the batch's entries
+/// fail with the refusal and the landing stops writing, for its resume, as at any refused host step.
+/// Format: a counter name in the daemon's status report.
+#[cfg(unix)]
+const BARRIER_THREAD_REFUSED: &str = "landing.barrier_thread_refused";
+
+/// A landing batch's barrier on a thread of its own (A-132), owned by the landing's task: the thread sends the
+/// barrier's outcome over a channel of one and then wakes the task, so the wake always finds the outcome. Dropped
+/// before the outcome came (a shutdown while the barrier waits), it joins the thread first, so no thread outlives
+/// its owner; the join waits out the one barrier.
+#[cfg(unix)]
+struct BarrierThread {
+  outcome: std::sync::mpsc::Receiver<Result<(), HostError>>,
+  thread: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(unix)]
+impl BarrierThread {
+  /// Starts `barrier` on its own thread, `waker` woken once its outcome is sent; refused with the system's errno when
+  /// no thread can start (the barrier is dropped unrun, its descriptors closed).
+  fn start(barrier: Box<dyn Barrier>, waker: std::task::Waker) -> Result<Self, HostError> {
+    let (send, outcome) = std::sync::mpsc::sync_channel(1);
+    let thread = std::thread::Builder::new()
+      .name("slates-land-barrier".to_owned())
+      .spawn(move || {
+        // The receiver outlives the thread (its owner joins before it drops), so the send cannot fail; were it to,
+        // nobody is left to tell.
+        if send.send(barrier.run()).is_ok() {
+          waker.wake();
+        }
+      })
+      .map_err(|error| HostError::Unavailable(error.raw_os_error().unwrap_or(0)))?;
+    Ok(Self {
+      outcome,
+      thread: Some(thread),
+    })
+  }
+
+  /// The barrier's outcome once it is back (its thread joined: it has only to exit), `None` while it runs. A thread
+  /// gone without an outcome (it cannot be: shipped code does not panic, and a panic aborts) reads as `EIO`.
+  fn returned(&mut self) -> Option<Result<(), HostError>> {
+    let ran = match self.outcome.try_recv() {
+      Ok(ran) => ran,
+      Err(std::sync::mpsc::TryRecvError::Empty) => return None,
+      Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+        Err(HostError::Unavailable(rustix::io::Errno::IO.raw_os_error()))
+      }
+    };
+    self.join();
+    Some(ran)
+  }
+
+  fn join(&mut self) {
+    if let Some(thread) = self.thread.take()
+      && thread.join().is_err()
+    {
+      eprintln!("slates-server: a landing barrier thread panicked");
+    }
+  }
+}
+
+#[cfg(unix)]
+impl Drop for BarrierThread {
+  fn drop(&mut self) {
+    self.join();
+  }
+}
+
+/// Runs a landing batch's barrier away from the shard and waits for it without holding the shard (A-132): the shard
+/// serves its other clients meanwhile, and parks when it has none, where the barrier on the shard held every one of
+/// them for its whole wait (1–160 ms a batch on a busy Linux machine, an `fsync` up to 206 ms a file on a busy Mac,
+/// 2026-10-10). The landing's lease is kept alive while the barrier lasts, as between slices. The outcome: the
+/// barrier's, or the refusal that no thread could start for it.
+#[cfg(unix)]
+async fn run_barrier_away(
+  barrier: Box<dyn Barrier>,
+  granted: &mut GrantedRun,
+  renew: LeaseAsk,
+  key: &str,
+) -> Result<(), HostError> {
+  let waker = std::future::poll_fn(|cx| std::task::Poll::Ready(cx.waker().clone())).await;
+  let started = BarrierThread::start(barrier, waker);
+  crate::state::with_state(|s| {
+    let counter = if started.is_ok() {
+      BARRIERS_AWAY
+    } else {
+      BARRIER_THREAD_REFUSED
+    };
+    s.count(counter, 1);
+  });
+  let mut away = started?;
+  loop {
+    if let Some(ran) = away.returned() {
+      return ran;
+    }
+    keep_lease_alive(granted, renew, key).await;
+    // Woken by the thread, or at the lease's next renewal: whichever is first. With no renewal due ahead (refused, or
+    // overdue), the thread's wake alone, never a spin.
+    match renewal_wait_ns(granted, renew) {
+      Some(wait) => {
+        if slates_rt::futures::within(wait, slates_rt::futures::idle())
+          .await
+          .is_err()
+        {
+          slates_rt::futures::idle().await;
+        }
+      }
+      None => slates_rt::futures::idle().await,
+    }
+  }
+}
+
+/// How long until the landing's lease is due its renewal ([`keep_lease_alive`]), `None` when it is due already (a
+/// renewal just refused leaves it so) or the shard's clock cannot be read.
+#[cfg(unix)]
+fn renewal_wait_ns(granted: &GrantedRun, ask: LeaseAsk) -> Option<u64> {
+  let margin = ask.term.saturating_mul(RENEW_AT_REMAINING_PERMILLE) / PERMILLE;
+  let due = granted.run.lease().expires_ns.saturating_sub(margin);
+  let now = crate::state::with_state(|s| s.clock.monotonic_ns())?;
+  due.checked_sub(now).filter(|wait| *wait > 0)
+}
 
 /// Begins a granted landing on its owner shard: its id and request, the head's implicit snapshot for an
 /// unnamed landing, the writer (inside an overlay's own base host), and the engine's plan, grant and lease
@@ -1280,8 +1413,11 @@ fn step_granted(state: &mut ShardState, granted: &mut GrantedRun) -> Stepped {
   }
   match stepped {
     Some(ended) => Stepped::Ended(Box::new(ended)),
-    None if granted.run.ready_to_finish() => Stepped::Ready,
-    None => Stepped::More,
+    None => match granted.run.take_barrier() {
+      Some(barrier) => Stepped::Barrier(barrier),
+      None if granted.run.ready_to_finish() => Stepped::Ready,
+      None => Stepped::More,
+    },
   }
 }
 

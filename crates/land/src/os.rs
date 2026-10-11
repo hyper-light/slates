@@ -5,14 +5,16 @@
 //!
 //! Shape: every verb is relative to a descriptor the base host holds (`OsHost`, which resolves
 //! the one root path with `O_NOFOLLOW` and hands out handles); no verb takes a path string.
+//! A batch's barrier is a job over its own descriptors of the batch's files (`dup`), run on a thread of the landing's
+//! and never on the shard that owns it (A-132): it waits on the device and on every other writer of the filesystem.
 //! Linux: `O_TMPFILE` temporaries linked by `linkat` through `/proc/self/fd`, each file's writeback
 //! started as it is written out (`sync_file_range`) and a batch's barrier as its files' `fdatasync`s
 //! on ⌈√n⌉ streams (A-130: journal group commit merges those in flight into few commits and flushes),
 //! `renameat2(RENAME_EXCHANGE)`, `fsync` on directories. macOS: hidden-name
-//! temporaries (`O_CREAT|O_EXCL`), `fsync` as each file's write-out and one `fcntl(F_BARRIERFSYNC)` per
-//! device as a batch's barrier, `renameatx_np(RENAME_SWAP)`, `fcntl(F_FULLFSYNC)` on the target as the
-//! media barrier when the grant asked for it. Other unixes: `fdatasync` as each file's write-out, the
-//! barrier adding nothing. Linux's one call that covers a batch, `syncfs`, flushes every other writer's
+//! temporaries (`O_CREAT|O_EXCL`), a batch's barrier as each file's `fsync` and then one `fcntl(F_BARRIERFSYNC)` per
+//! device, `renameatx_np(RENAME_SWAP)`, `fcntl(F_FULLFSYNC)` on the target as the
+//! media barrier when the grant asked for it. Other unixes: a batch's barrier as each file's `fdatasync`. Linux's one
+//! call that covers a batch, `syncfs`, flushes every other writer's
 //! dirty data too: beside one busy writer a barrier took up to 3.7 s and a 16-file batch cost 4.0–7.8 ms
 //! a file against `fdatasync`'s 0.65–0.79 ms (2026-10-10, `BENCHMARKS.md`), so it is not used. Both:
 //! `fchmod` (on files and on each made directory, so the umask never edits a recorded mode),
@@ -32,8 +34,8 @@ use std::path::{Component, Path};
 use rustix::fs::{AtFlags, Mode, OFlags};
 use slates_base::OsHost;
 use slates_vfs::host::{
-  BaseEntry, Hint, HostDir, HostError, HostFacts, HostFile, HostFs, LandCapabilities, LandFs,
-  WatchState,
+  Barrier, BaseEntry, Hint, HostDir, HostError, HostFacts, HostFile, HostFs, LandCapabilities,
+  LandFs, WatchState,
 };
 use slates_vfs::inode::Fingerprint;
 
@@ -319,62 +321,6 @@ impl OsLand {
       rustix::io::Errno::OPNOTSUPP.raw_os_error(),
     ))
   }
-
-  /// The batch barrier on macOS: one `F_BARRIERFSYNC` per device among `files`, on that device's last file. The
-  /// barrier applies to everything `fsync`ed on its device before it, so it orders every file written out there; files
-  /// on another device (a mount inside the target) need that device's own.
-  #[cfg(target_os = "macos")]
-  fn order_written_out(&self, files: &[HostFile]) -> Result<(), HostError> {
-    let mut last_on_device = BTreeMap::new();
-    for file in files {
-      let device = rustix::fs::fstat(self.file(*file)?)
-        .map_err(refusal)?
-        .st_dev;
-      last_on_device.insert(device, *file);
-    }
-    for file in last_on_device.into_values() {
-      data_barrier(self.file(file)?)?;
-    }
-    Ok(())
-  }
-
-  /// The batch barrier on Linux: the batch's `fdatasync`s spread over ⌈√n⌉ streams for n files, the caller and a
-  /// scoped thread per further stream, each syncing its share in turn, every thread joined. The journal's group commit
-  /// merges the syncs in flight together (ext4's jbd2 joins every sync waiting on the running transaction to its
-  /// commit); each file is durable when its own call returns, exactly as alone, and the batch is refused when any is. A
-  /// thread the system refuses to start leaves its share to the caller.
-  ///
-  /// Derived: k streams cost about a·k for their threads' start and join and b·n/k for each stream's serial chain of
-  /// syncs, least at k = √(b·n/a). The measurement (2026-10-10, `BENCHMARKS.md`) puts a and b about equal: for 16-file
-  /// batches, four streams beat two and sixteen at 1, 2, 4 and 18 CPUs, quiet and beside a busy writer, while sixteen
-  /// threads at once stalled a 1-CPU container 31–43 ms a barrier and spent 27–37 s of a bench throttled by its CPU
-  /// quota. An online ramp over the count was tried the same day and rejected: a barrier's time varies about 6× at one
-  /// count on a shared disk, so two samples mismeasured the noise and the ramp settled on one stream in 9,620 of 9,690
-  /// barriers.
-  #[cfg(target_os = "linux")]
-  fn order_written_out(&self, files: &[HostFile]) -> Result<(), HostError> {
-    let fds = files
-      .iter()
-      .map(|file| self.file(*file))
-      .collect::<Result<Vec<_>, _>>()?;
-    sync_on_streams(
-      &fds,
-      fds
-        .len()
-        .isqrt()
-        .saturating_add(usize::from(!is_square(fds.len()))),
-    )
-  }
-
-  /// The batch barrier on the other unixes: each file's write-out (`fdatasync`) already made it durable, so nothing
-  /// remains but to refuse a handle this writer does not hold.
-  #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-  fn order_written_out(&self, files: &[HostFile]) -> Result<(), HostError> {
-    for file in files {
-      self.file(*file)?;
-    }
-    Ok(())
-  }
 }
 
 /// The exchange: Linux `renameat2(RENAME_EXCHANGE)`.
@@ -514,16 +460,49 @@ fn write_out_file(fd: BorrowedFd<'_>) -> Result<(), HostError> {
   }
 }
 
+/// A file's write-out on macOS and the other unixes: nothing reaches the device here. Their only call that starts a
+/// file's writeback also waits for it (`fsync`, `fdatasync`), so it belongs to the batch's barrier, off the shard
+/// (A-132): on the shard a macOS `fsync` held every other client up to 206 ms a file on a busy machine (2026-10-10).
+#[cfg(not(target_os = "linux"))]
+fn write_out_file(_fd: BorrowedFd<'_>) -> Result<(), HostError> {
+  Ok(())
+}
+
+/// A batch's barrier away from its host (A-132): its own descriptor of each file, so the host may close a file while it
+/// runs, and the platform's syncs over them when it runs — each file synced ([`sync_file`]) on ⌈√n⌉ streams for n
+/// files, then the syncs ordered ahead of every later write ([`order_synced`]).
+struct OsBarrier {
+  files: Vec<OwnedFd>,
+}
+
+impl Barrier for OsBarrier {
+  fn run(self: Box<Self>) -> Result<(), HostError> {
+    let fds: Vec<BorrowedFd<'_>> = self.files.iter().map(AsFd::as_fd).collect();
+    let streams = fds
+      .len()
+      .isqrt()
+      .saturating_add(usize::from(!is_square(fds.len())));
+    sync_on_streams(&fds, streams).and_then(|()| order_synced(&fds))
+  }
+}
+
 /// Whether `n` is a perfect square (so ⌈√n⌉ is `n.isqrt()` itself).
-#[cfg(target_os = "linux")]
 fn is_square(n: usize) -> bool {
   let root = n.isqrt();
   root.checked_mul(root) == Some(n)
 }
 
-/// A batch's `fdatasync`s on `streams` streams: the caller takes stream zero and a scoped thread each further stream,
-/// every thread joined before the return; the first refusal.
-#[cfg(target_os = "linux")]
+/// A batch's syncs on `streams` streams: the caller takes stream zero and a scoped thread each further stream, every
+/// thread joined before the return; the first refusal. A thread the system refuses to start leaves its share to the
+/// caller.
+///
+/// Derived: k streams cost about a·k for their threads' start and join and b·n/k for each stream's serial chain of
+/// syncs, least at k = √(b·n/a). The measurement (2026-10-10, `BENCHMARKS.md`) puts a and b about equal on Linux: for
+/// 16-file batches, four streams beat two and sixteen at 1, 2, 4 and 18 CPUs, quiet and beside a busy writer, while
+/// sixteen threads at once stalled a 1-CPU container 31–43 ms a barrier and spent 27–37 s of a bench throttled by its
+/// CPU quota. An online ramp over the count was tried the same day and rejected: a barrier's time varies about 6× at
+/// one count on a shared disk, so two samples mismeasured the noise and the ramp settled on one stream in 9,620 of
+/// 9,690 barriers.
 fn sync_on_streams(fds: &[BorrowedFd<'_>], streams: usize) -> Result<(), HostError> {
   let streams = streams.clamp(1, fds.len().max(1));
   std::thread::scope(|scope| {
@@ -551,30 +530,53 @@ fn sync_on_streams(fds: &[BorrowedFd<'_>], streams: usize) -> Result<(), HostErr
   })
 }
 
-/// One stream's share of a batch: files `stream`, `stream + streams`, and so on, each `fdatasync`ed in turn; the first
-/// refusal (the rest are still synced).
-#[cfg(target_os = "linux")]
+/// One stream's share of a batch: files `stream`, `stream + streams`, and so on, each synced in turn; the first refusal
+/// (the rest are still synced).
 fn sync_stream(fds: &[BorrowedFd<'_>], stream: usize, streams: usize) -> Result<(), HostError> {
   let mut synced = Ok(());
   for fd in fds.iter().skip(stream).step_by(streams.max(1)) {
-    synced = synced.and(rustix::fs::fdatasync(*fd).map_err(refusal));
+    synced = synced.and(sync_file(*fd));
   }
   synced
 }
 
-/// A file's write-out on the other unixes: `fdatasync`, which makes the file durable alone; their batch barrier then
-/// adds nothing.
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn write_out_file(fd: BorrowedFd<'_>) -> Result<(), HostError> {
+/// One file of a batch made durable on Linux and the other unixes: `fdatasync` (on Linux its writeback was started at
+/// the write-out, and the journal's group commit merges the syncs in flight together: ext4's jbd2 joins every sync
+/// waiting on the running transaction to its commit).
+#[cfg(not(target_os = "macos"))]
+fn sync_file(fd: BorrowedFd<'_>) -> Result<(), HostError> {
   rustix::fs::fdatasync(fd).map_err(refusal)
 }
 
-/// A file's write-out: macOS `fsync`, which hands the file's data and attributes to the device (not a media flush);
-/// the batch's barrier after it orders them ahead of every later write.
+/// One file of a batch handed to the device on macOS: `fsync`, its data and attributes (not a media flush); the
+/// batch's barrier after every one orders them ahead of every later write ([`order_synced`]).
 #[cfg(target_os = "macos")]
-#[allow(clippy::disallowed_methods)] // the write seam's own write-out (R1, D-26; AUD-29-31).
-fn write_out_file(fd: BorrowedFd<'_>) -> Result<(), HostError> {
+#[allow(clippy::disallowed_methods)] // the write seam's own barrier (R1, D-26; AUD-29-31).
+fn sync_file(fd: BorrowedFd<'_>) -> Result<(), HostError> {
   rustix::fs::fsync(fd).map_err(refusal)
+}
+
+/// The batch's syncs ordered on macOS: one `F_BARRIERFSYNC` per device among the files, on that device's last file.
+/// The barrier applies to everything `fsync`ed on its device before it, so it orders every file synced there; files on
+/// another device (a mount inside the target) need that device's own.
+#[cfg(target_os = "macos")]
+fn order_synced(fds: &[BorrowedFd<'_>]) -> Result<(), HostError> {
+  let mut last_on_device = BTreeMap::new();
+  for fd in fds {
+    let device = rustix::fs::fstat(*fd).map_err(refusal)?.st_dev;
+    last_on_device.insert(device, *fd);
+  }
+  for fd in last_on_device.into_values() {
+    data_barrier(fd)?;
+  }
+  Ok(())
+}
+
+/// The batch's syncs ordered on Linux and the other unixes: each `fdatasync` returned with its file durable, so nothing
+/// remains.
+#[cfg(not(target_os = "macos"))]
+fn order_synced(_fds: &[BorrowedFd<'_>]) -> Result<(), HostError> {
+  Ok(())
 }
 
 /// The data barrier: macOS `fcntl(F_BARRIERFSYNC)`: `fsync` of the file, then a barrier that "applies to I/O that have
@@ -711,8 +713,25 @@ impl LandFs for OsLand {
     write_out_file(self.file(file)?)
   }
 
-  fn barrier(&mut self, files: &[HostFile]) -> Result<(), HostError> {
-    self.order_written_out(files)
+  fn begin_barrier(&mut self, files: &[HostFile]) -> Result<Box<dyn Barrier>, HostError> {
+    let files = files
+      .iter()
+      .map(|file| {
+        self
+          .file(*file)?
+          .try_clone_to_owned()
+          .map_err(|error| HostError::Unavailable(error.raw_os_error().unwrap_or(0)))
+      })
+      .collect::<Result<Vec<_>, _>>()?;
+    Ok(Box::new(OsBarrier { files }))
+  }
+
+  fn end_barrier(
+    &mut self,
+    _files: &[HostFile],
+    ran: Result<(), HostError>,
+  ) -> Result<(), HostError> {
+    ran
   }
 
   fn set_mode(&mut self, file: HostFile, mode: u32) -> Result<(), HostError> {

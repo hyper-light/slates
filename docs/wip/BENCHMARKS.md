@@ -4938,3 +4938,104 @@ Writeback first won every round: 1.5–2.5× quiet and 1.6–2.6× beside the bu
     the extra commits slow only the landing.
 - **Open, to measure:** threads kept for the landing rather than started per barrier would cut a toward zero. Every
   file's sync could then be in flight with no burst, which might win in all three containers.
+
+### Landed: a landing's durability waits run off the shard (A-132; 2026-10-10)
+
+**Commands:**
+- **The lane:** the landing-fairness lane (`landing_fairness`, release): 600 files landed while a second client probes
+  the same shard in turn with reads, provisions (a volume created and destroyed) and lease takes.
+- **The arms:** A is `078bb5e2`, with the barrier on the shard and macOS's `fsync` in the write-out. B is A-132. Each
+  was built in its own target directory.
+- **Linux:** ext4 in Docker's VM. One fresh `--cpus=2 --memory=256m` container a run, no swap. Three conditions, three
+  interleaved rounds each, the arms' order alternating:
+  - `quiet`: the VM as it was;
+  - `syncwriter`: a sibling container rewriting a 512 MiB file with `fsync` after each pass;
+  - `hog2`: two spinning processes in the test's own cgroup.
+- **macOS:** APFS on this Mac, six interleaved rounds at load 22–24 from other sessions.
+- **Each run** reports the landing's time, its slices' maximum (its own longest hold on the shard), the shard's longest
+  step (anyone's), and each probe kind's p99 and maximum inside the landing.
+
+**Linux** (ms; probes give the worst kind's p99 / max):
+
+| condition | round | arm | landing | slice max | longest step | probe p99 | probe max |
+|---|---|---|---|---|---|---|---|
+| quiet | 1 | A | 237 | 18.7 | 18.7 | 18.94 | 18.94 |
+| quiet | 1 | B | 58 | 0.3 | 10.5 | 0.13 | 1.63 |
+| quiet | 2 | B | 59 | 0.4 | 1.3 | 0.12 | 1.28 |
+| quiet | 2 | A | 53 | 3.0 | 3.0 | 1.26 | 3.26 |
+| quiet | 3 | A | 1,328 | 64.4 | 64.4 | 63.56 | 64.47 |
+| quiet | 3 | B | 87 | 0.3 | 1.8 | 0.10 | 2.12 |
+| syncwriter | 1 | A | 1,080 | 90.6 | 90.6 | 108.39 | 108.39 |
+| syncwriter | 1 | B | 351 | 0.7 | 5.5 | 0.08 | 9.27 |
+| syncwriter | 2 | B | 283 | 0.6 | 1.9 | 0.21 | 6.10 |
+| syncwriter | 2 | A | 139 | 6.7 | 6.7 | 6.75 | 6.75 |
+| syncwriter | 3 | A | 1,081 | 79.7 | 79.7 | 126.72 | 126.72 |
+| syncwriter | 3 | B | 2,067 | 8.5 | 112.4 | 0.13 | 112.54 |
+| hog2 | 1 | A | 389 | 35.9 | 35.9 | 72.67 | 72.67 |
+| hog2 | 1 | B | 607 | 2.0 | 19.2 | 0.28 | 51.08 |
+| hog2 | 2 | B | 1,667 | 4.5 | 49.9 | 0.07 | 60.59 |
+| hog2 | 2 | A | 667 | 59.9 | 59.9 | 85.42 | 85.42 |
+| hog2 | 3 | A | 170 | 18.9 | 18.9 | 19.11 | 19.11 |
+| hog2 | 3 | B | 571 | 1.0 | 47.1 | 0.09 | 54.04 |
+
+- **The shard's tail, the change's purpose.**
+  - With B, the probes' worst p99 was 0.07–0.28 ms in every run, against 1.26–126.72 ms with A.
+  - The landing's own longest hold was at most 8.5 ms, against 3.0–90.6 ms.
+  - With A, the longest step was always a landing slice: a barrier.
+- **What B leaves:** probe maxima of 51–113 ms in contended runs, from steps outside the landing's slices.
+  - Under `hog2`, instrumented runs attribute them to the cgroup's CPU quota, not to blocking calls:
+    - a poll held off the CPU 49.8 ms (`Preempted`);
+    - the landing's finish, about 1 ms of CPU at 600 files and unsliced, stretched to 52 ms by throttling;
+    - two unattributed polls up to 34.7 ms.
+  - The 112 ms step beside the syncing writer did not recur in three instrumented runs: the longest step was 1.9–4.2 ms
+    there, and the finish 1.4–1.6 ms.
+- **The landing's own time is mixed:**
+  - quiet: about as fast or faster;
+  - `syncwriter`: faster once (351 against 1,080 ms), slower twice (283 against 139, 2,067 against 1,081);
+  - `hog2`: 1.6–3.4× slower.
+  - The prober now gets the shard during each barrier where A blocked it, so the landing shares the shard. Each barrier
+    also starts its thread and its stream threads inside the throttled cgroup.
+
+**macOS** (ms; rounds at load 22–24):
+
+| round | arm | landing | slice max | longest step | probe p99 (worst) | probe max |
+|---|---|---|---|---|---|---|
+| 1 | A | 1,807 | 15.6 | 148.9 | 20.98 | 151.49 |
+| 1 | B | 2,898 | 17.6 | 144.2 | 18.16 | 165.07 |
+| 2 | B | 208 | 4.1 | 4.1 | 1.26 | 4.26 |
+| 2 | A | 210 | 5.0 | 5.0 | 3.95 | 5.30 |
+| 3 | A | 222 | 4.3 | 4.3 | 3.86 | 4.54 |
+| 3 | B | 240 | 4.2 | 4.2 | 0.52 | 4.51 |
+| 4 | B | 265 | 4.6 | 4.6 | 1.44 | 5.07 |
+| 4 | A | 242 | 4.4 | 4.4 | 0.91 | 4.64 |
+| 5 | A | 249 | 4.8 | 4.8 | 3.66 | 4.98 |
+| 5 | B | 225 | 4.0 | 5.2 | 0.52 | 7.55 |
+| 6 | B | 235 | 4.4 | 4.4 | 0.63 | 4.45 |
+| 6 | A | 251 | 4.2 | 4.2 | 0.96 | 8.40 |
+
+- **Five quieter rounds:** both arms held the shard about 4–5 ms at most. B's worst p99 was lower in four of five rounds,
+  0.52–1.44 against 0.91–3.95 ms.
+- **The first round was contended:** the landing ran 1.8–2.9 s, and both arms took a ~145 ms step outside the landing's
+  slices. It is not a durability wait, since B moved those off the shard and A's slices stayed under 16 ms. The open
+  hypothesis is the shard thread descheduled on an oversubscribed machine (the shard-QoS question in GAPS).
+- **Before this A/B,** an instrumented run on this Mac caught the per-file `fsync` holding a write unit 206 ms. B has no
+  such unit.
+
+**macOS throughput** (`land_bench flat`, the one-call landing, so every barrier runs in place; µs a new file):
+
+| round | arm | load | 1,000 | 2,000 | 4,000 | 8,000 | 16,000 |
+|---|---|---|---|---|---|---|---|
+| 1 | A | 39.7 | 313 | 335 | 258 | 259 | 340 |
+| 1 | B, ⌈√n⌉ streams | 40.6 | 434 | 426 | 467 | 420 | 429 |
+| 1 | B, one stream | 56.5 | 416 | 465 | 402 | 389 | 348 |
+| 2 | B, ⌈√n⌉ streams | 55.0 | 214 | 225 | 245 | 268 | 271 |
+| 2 | B, one stream | 58.5 | 267 | 344 | 318 | 377 | 380 |
+| 2 | A | 80.7 | 336 | 378 | 367 | 399 | 326 |
+| 3 | B, one stream | 74.5 | 202 | 245 | 249 | 261 | 279 |
+| 3 | A | 53.1 | 231 | 250 | 248 | 287 | 285 |
+| 3 | B, ⌈√n⌉ streams | 48.9 | 256 | 227 | 233 | 270 | 261 |
+
+- No arm won consistently at loads of 40–81; each round's winner differed.
+- Moving macOS's `fsync` from the write-out into the barrier costs no measurable throughput here, and neither stream
+  count beat the other. Recorded as inconclusive, not as a win: macOS keeps Linux's derived rule, one rule for every
+  platform.

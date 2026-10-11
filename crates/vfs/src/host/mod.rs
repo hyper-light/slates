@@ -154,6 +154,17 @@ pub struct LandCapabilities {
   pub unnamed_temporaries: bool,
 }
 
+/// A batch's durability barrier taken from its host to run where waiting costs nothing (A-132): a thread of its own,
+/// never the shard that owns the landing. The wait is the device's and every other writer's on the filesystem, not the
+/// landing's own: on a busy machine a barrier measured 1–160 ms a batch on Linux and an `fsync` up to 206 ms a file on
+/// macOS (2026-10-10, `BENCHMARKS.md`), and while one ran on the shard every other client of that shard waited for it.
+/// It holds what it syncs by its own descriptors, so its host may close the files meanwhile.
+pub trait Barrier: Send {
+  /// Blocks until every file the barrier names is durable ahead of any write that follows: the first refusal (every file
+  /// is still synced).
+  fn run(self: Box<Self>) -> Result<(), HostError>;
+}
+
 /// The write side of the seam, for the landing engine only (D-26): every verb is relative to
 /// a directory handle inside the granted target, and the only crate that implements it over
 /// the operating system is `slates-land`. The simulated host implements it too, with crash and
@@ -166,17 +177,24 @@ pub trait LandFs: HostFs {
   fn create_temp(&mut self, dir: HostDir, name: &str) -> Result<HostFile, HostError>;
   /// Writes at an offset (the whole buffer, or a refusal).
   fn write_at(&mut self, file: HostFile, off: u64, bytes: &[u8]) -> Result<(), HostError>;
-  /// The file's own share of its durability, once its bytes, mode and mtime are final (§4.15 step 8, A-130): its data
-  /// and attributes handed to the device (macOS `fsync`), its writeback started where the barrier syncs the batch
-  /// (Linux `sync_file_range`), or the file made durable outright where there is no batch barrier (`fdatasync`
-  /// elsewhere). A change to the file after it needs another.
+  /// The file is final — its bytes, mode and mtime written (§4.15 step 8, A-130) — and joins its batch: its writeback
+  /// started where that never waits on the device (Linux `sync_file_range`), nothing more elsewhere. Never durability:
+  /// the batch's barrier makes the file durable, off the shard (A-132). A change to the file after it needs another.
   fn write_out(&mut self, file: HostFile) -> Result<(), HostError>;
-  /// The durability barrier of a batch of temporaries, each written out ([`LandFs::write_out`]) since its last change:
-  /// when it returns, every one is durable ahead of any write that follows, so a placement after it never shows a name
-  /// whose bytes a power loss could take (macOS one `F_BARRIERFSYNC` per device among them, ordering every earlier
-  /// write-out; Linux the files' `fdatasync`s on ⌈√n⌉ streams, merged by journal group commit; nothing more where
-  /// the write-out made each file durable).
-  fn barrier(&mut self, files: &[HostFile]) -> Result<(), HostError>;
+  /// The durability barrier of a batch of temporaries, each written out ([`LandFs::write_out`]) since its last change,
+  /// taken to run elsewhere ([`Barrier::run`]): once it has run, every one is durable ahead of any write that follows,
+  /// so a placement after it never shows a name whose bytes a power loss could take (Linux the files' `fdatasync`s on
+  /// ⌈√n⌉ streams, merged by journal group commit; macOS each file's `fsync` and then one `F_BARRIERFSYNC` per device
+  /// among them; elsewhere every file's `fdatasync`). The outcome comes back through
+  /// [`LandFs::end_barrier`]; nothing of the batch may be placed before.
+  fn begin_barrier(&mut self, files: &[HostFile]) -> Result<Box<dyn Barrier>, HostError>;
+  /// The outcome of the barrier [`LandFs::begin_barrier`] took for `files`, after it ran: the files are durable when it
+  /// is `Ok`.
+  fn end_barrier(
+    &mut self,
+    files: &[HostFile],
+    ran: Result<(), HostError>,
+  ) -> Result<(), HostError>;
   /// Sets the file's mode.
   fn set_mode(&mut self, file: HostFile, mode: u32) -> Result<(), HostError>;
   /// Sets the file's modification time in nanoseconds.

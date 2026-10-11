@@ -391,6 +391,25 @@ fn a_refused_barrier_fails_its_whole_batch_and_shows_none_of_it() {
   assert_eq!(resumed.barriers, 1, "{resumed:?}");
 }
 
+/// A-132 (a barrier refused while it runs away from the run). Do: land the two-directory batch sliced, its barrier
+/// held away for three slices and its run answering `ENOSPC` once (an `fdatasync` the device fails on its own thread).
+/// Expect: exactly as for a barrier refused when taken — both entries fail `ENOSPC`, neither is visible, both
+/// temporaries are removed, the landing is `Partial` with no barrier counted — and a resume without the fault reaches
+/// the reference with one barrier.
+#[test]
+fn a_barrier_refused_while_it_runs_away_fails_its_whole_batch_and_shows_none_of_it() {
+  let mut history = History::new(two_directories());
+  history.session = Session::sliced_holding_barriers(3);
+  history
+    .host
+    .fail(SimVerb::BarrierRun, "", HostError::Unavailable(ENOSPC), 1);
+  let report = history.land(request(1));
+  assert_eq!(history.session.barriers_away, 1);
+  assert_the_batch_failed_unseen(&mut history, &report);
+  let resumed = assert_resume_reaches_the_reference(&mut history, request(1));
+  assert_eq!(resumed.barriers, 1, "{resumed:?}");
+}
+
 /// Both entries of the two-directory batch failed `ENOSPC` at its barrier: neither visible, no temporary left, the
 /// landing `Partial` with both entries private and no barrier counted.
 fn assert_the_batch_failed_unseen(history: &mut History, report: &LandingReport) {

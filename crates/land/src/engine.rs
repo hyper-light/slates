@@ -44,7 +44,7 @@ use std::time::Instant;
 
 use slates_vfs::base::{BaseConfig, Landed};
 use slates_vfs::error::VfsError;
-use slates_vfs::host::{HostDir, HostError, HostFile, HostKind, LandCapabilities, LandFs};
+use slates_vfs::host::{Barrier, HostDir, HostError, HostFile, HostKind, LandCapabilities, LandFs};
 use slates_vfs::inode::{Fingerprint, Witness};
 use slates_vfs::volume::{Store, Volume};
 
@@ -595,6 +595,8 @@ struct WriteProgress {
   staged_pages: u64,
   /// Whether the staged batch's barrier has returned: its files are being placed, one per unit.
   placing: bool,
+  /// The staged batch's barrier while it is away from the host (A-132).
+  barrier: BarrierState,
 }
 
 impl WriteProgress {
@@ -607,8 +609,48 @@ impl WriteProgress {
       staged: VecDeque::new(),
       staged_pages: 0,
       placing: false,
+      barrier: BarrierState::Idle,
     }
   }
+}
+
+/// Where the staged batch's barrier is (A-132): taken from the host, it runs wherever the run's driver puts it — a
+/// thread of its own under the server, in place under the one-call landing — and the run steps nothing until its
+/// outcome is back, so nothing of the batch is placed before its files are durable.
+enum BarrierState {
+  /// No barrier is out.
+  Idle,
+  /// Taken ([`LandFs::begin_barrier`]), waiting for the driver ([`LandingRun::take_barrier`]).
+  Taken {
+    barrier: Box<dyn Barrier>,
+    began: Instant,
+  },
+  /// With the driver, running.
+  Running { began: Instant },
+  /// Run, its outcome waiting for the next unit to end it ([`LandFs::end_barrier`]).
+  Ran {
+    ran: Result<(), HostError>,
+    began: Instant,
+  },
+}
+
+impl BarrierState {
+  /// Whether the run waits on the barrier: taken or running, its outcome not yet back.
+  fn awaited(&self) -> bool {
+    matches!(
+      self,
+      BarrierState::Taken { .. } | BarrierState::Running { .. }
+    )
+  }
+}
+
+/// The staged batch's temporaries, in entry order.
+fn staged_temps(progress: &WriteProgress) -> Vec<HostFile> {
+  progress
+    .staged
+    .iter()
+    .map(|staged| staged.copy.temp)
+    .collect()
 }
 
 /// Where one unit left its entry.
@@ -976,9 +1018,10 @@ impl<H: LandFs> Landing<'_, H> {
   // ------------------------------------------------------------- writing
 
   /// One unit of the write phase (§4.15 steps 5–8, A-130) under its `progress`, `next` the cursor over the manifest:
-  /// a placement from the batch whose barrier has returned, the barrier of a batch that closes before the next entry,
-  /// or a unit of the next entry (a window of the file being copied, or the entry itself). Returns whether the phase
-  /// is done: every entry taken and no batch left.
+  /// the end of a barrier whose outcome is back (A-132), a placement from the batch whose barrier has returned, the
+  /// barrier of a batch that closes before the next entry, or a unit of the next entry (a window of the file being
+  /// copied, or the entry itself). Nothing while a barrier is away. Returns whether the phase is done: every entry
+  /// taken and no batch left.
   fn write_unit(
     &mut self,
     manifest: &Manifest,
@@ -987,6 +1030,13 @@ impl<H: LandFs> Landing<'_, H> {
     cx: &mut WriteContext<'_, H>,
     progress: &mut WriteProgress,
   ) -> bool {
+    if progress.barrier.awaited() {
+      return false;
+    }
+    if matches!(progress.barrier, BarrierState::Ran { .. }) {
+      self.end_barrier_unit(manifest, reports, cx, progress);
+      return false;
+    }
     if progress.placing {
       if self.crashed.is_some() {
         self.abandon_batch(manifest, progress);
@@ -1212,10 +1262,12 @@ impl<H: LandFs> Landing<'_, H> {
         > batch_pages(store)
   }
 
-  /// The barrier of the staged batch (§4.15 step 8, A-130): every staged file durable before any of them is placed;
-  /// the placements follow, one per unit. A crashed landing abandons its batch instead (its entries stay unwritten,
-  /// and the resume lands them); a grant or lease that ended skips the batch's entries; a barrier the host refuses
-  /// fails every entry of the batch, as a refused sync failed its one file before batches.
+  /// The barrier of the staged batch taken (§4.15 step 8, A-130, A-132): every staged file is to be durable before any
+  /// of them is placed, so the run waits while the barrier runs away from it ([`LandingRun::take_barrier`]), and a
+  /// later unit ends it ([`Landing::end_barrier_unit`]); the placements follow, one per unit. A crashed landing abandons
+  /// its batch instead (its entries stay unwritten, and the resume lands them); a grant or lease that ended skips the
+  /// batch's entries; a barrier the host refuses fails every entry of the batch, as a refused sync failed its one file
+  /// before batches.
   fn barrier_unit(
     &mut self,
     manifest: &Manifest,
@@ -1230,23 +1282,53 @@ impl<H: LandFs> Landing<'_, H> {
     let refused = match self.fence(cx, progress.started) {
       Some(skipped) => Ok(skipped),
       None => {
-        let temps: Vec<HostFile> = progress
-          .staged
-          .iter()
-          .map(|staged| staged.copy.temp)
-          .collect();
-        let started = Instant::now();
-        match self.host.barrier(&temps) {
-          Ok(()) => {
-            self.costs.barrier_ns.push(elapsed_ns(started));
-            self.barriers = self.barriers.saturating_add(1);
-            progress.placing = true;
+        let began = Instant::now();
+        match self.host.begin_barrier(&staged_temps(progress)) {
+          Ok(barrier) => {
+            progress.barrier = BarrierState::Taken { barrier, began };
             return;
           }
           Err(error) => Err(error),
         }
       }
     };
+    self.settle_batch(manifest, reports, cx, progress, &refused);
+  }
+
+  /// The staged batch's barrier ended once its outcome is back (A-132): placed from the next unit on when every file is
+  /// durable, its entries failed when the barrier was refused.
+  fn end_barrier_unit(
+    &mut self,
+    manifest: &Manifest,
+    reports: &mut [EntryReport],
+    cx: &mut WriteContext<'_, H>,
+    progress: &mut WriteProgress,
+  ) {
+    let BarrierState::Ran { ran, began } =
+      std::mem::replace(&mut progress.barrier, BarrierState::Idle)
+    else {
+      return;
+    };
+    match self.host.end_barrier(&staged_temps(progress), ran) {
+      Ok(()) => {
+        self.costs.barrier_ns.push(elapsed_ns(began));
+        self.barriers = self.barriers.saturating_add(1);
+        progress.placing = true;
+      }
+      Err(error) => self.settle_batch(manifest, reports, cx, progress, &Err(error)),
+    }
+  }
+
+  /// A staged batch that will not be placed: each temporary closed and removed, each entry given `refused` — skipped
+  /// (its grant or lease ended) or failed (its barrier refused).
+  fn settle_batch(
+    &mut self,
+    manifest: &Manifest,
+    reports: &mut [EntryReport],
+    cx: &mut WriteContext<'_, H>,
+    progress: &mut WriteProgress,
+    refused: &Result<Outcome, HostError>,
+  ) {
     progress.staged_pages = 0;
     while let Some(staged) = progress.staged.pop_front() {
       let path = manifest
@@ -1254,7 +1336,7 @@ impl<H: LandFs> Landing<'_, H> {
         .get(staged.index)
         .map_or("/", |entry| entry.path.as_ref());
       self.drop_copy(path, staged.copy);
-      let written = match &refused {
+      let written = match refused {
         Ok(skipped) => Written {
           outcome: skipped.clone(),
           window_ns: None,
@@ -1338,6 +1420,8 @@ impl<H: LandFs> Landing<'_, H> {
   /// none placed. A named one stays at its hidden name for the resume's sweep, the state a crash leaves; before
   /// 2026-10-10 an abandoned run left the copy's descriptor open in the host for as long as the host lived.
   fn release_write(&mut self, progress: &mut WriteProgress) {
+    // A barrier still with the run goes unrun: its own descriptors close with it.
+    progress.barrier = BarrierState::Idle;
     if let Some(copy) = progress.copy.take() {
       self.host.close_file(copy.temp);
     }
@@ -3117,10 +3201,11 @@ impl<'h, H: LandFs> LandingRun<'h, H> {
     })
   }
 
-  /// Runs units until the landing ends early, reaches its finish, or `budget_ns` of this slice has passed
-  /// (checked between units, so a slice ends within one unit of its budget): `Some` with the outcome when it
-  /// ended early (a refusal: a target that cannot be read, a conflict), `None` otherwise. It never runs the
-  /// finish, which advances the volume: once [`LandingRun::ready_to_finish`], the caller runs
+  /// Runs units until the landing ends early, reaches its finish, waits on a barrier (A-132), or `budget_ns` of this
+  /// slice has passed (checked between units, so a slice ends within one unit of its budget): `Some` with the outcome
+  /// when it ended early (a refusal: a target that cannot be read, a conflict), `None` otherwise. A run that waits on
+  /// a barrier gives it to its caller ([`LandingRun::take_barrier`]) and steps nothing until the outcome is back. It
+  /// never runs the finish, which advances the volume: once [`LandingRun::ready_to_finish`], the caller runs
   /// [`LandingRun::finish`] where its records commit as one atom with the landing's completion.
   pub fn step(
     &mut self,
@@ -3134,7 +3219,7 @@ impl<'h, H: LandFs> LandingRun<'h, H> {
     let mut mark = began;
     self.last_step_ns = 0;
     loop {
-      if self.ready_to_finish() {
+      if self.ready_to_finish() || self.awaiting_barrier() {
         return None;
       }
       let ended = self.unit(vol, store, audit, observer);
@@ -3170,6 +3255,38 @@ impl<'h, H: LandFs> LandingRun<'h, H> {
     matches!(self.phase, Phase::Finish { .. })
   }
 
+  /// Whether the run waits on a batch's barrier away from it (A-132): taken and not yet given out, or given out and its
+  /// outcome not yet back. It steps nothing meanwhile.
+  pub fn awaiting_barrier(&self) -> bool {
+    matches!(&self.phase, Phase::Write { progress, .. } if progress.barrier.awaited())
+  }
+
+  /// The batch barrier the run has taken (A-132), for its driver to run where waiting costs nothing — a thread of its
+  /// own, never the shard that owns the landing — and to hand the outcome back with [`LandingRun::barrier_ran`].
+  /// `None` when the run has no barrier to give (none taken, or this one already given out).
+  pub fn take_barrier(&mut self) -> Option<Box<dyn Barrier>> {
+    let Phase::Write { progress, .. } = &mut self.phase else {
+      return None;
+    };
+    let BarrierState::Taken { began, .. } = progress.barrier else {
+      return None;
+    };
+    match std::mem::replace(&mut progress.barrier, BarrierState::Running { began }) {
+      BarrierState::Taken { barrier, .. } => Some(barrier),
+      _ => None,
+    }
+  }
+
+  /// The outcome of the barrier [`LandingRun::take_barrier`] gave out: the run's next step ends it. Ignored when no
+  /// barrier is out.
+  pub fn barrier_ran(&mut self, ran: Result<(), HostError>) {
+    if let Phase::Write { progress, .. } = &mut self.phase
+      && let BarrierState::Running { began } = progress.barrier
+    {
+      progress.barrier = BarrierState::Ran { ran, began };
+    }
+  }
+
   /// The finish: the overlay advanced past what reached the disk durably, the audit record, the report.
   /// `LandingRefusal::Ended` before [`LandingRun::ready_to_finish`] or after the run ended.
   pub fn finish(
@@ -3197,9 +3314,15 @@ impl<'h, H: LandFs> LandingRun<'h, H> {
     audit: &mut Audit,
     observer: &mut dyn Observer<H>,
   ) -> Result<LandingReport, LandingRefusal> {
-    match self.step(vol, store, audit, observer, u64::MAX) {
-      Some(ended) => ended,
-      None => self.finish(vol, store, audit, observer),
+    loop {
+      if let Some(ended) = self.step(vol, store, audit, observer, u64::MAX) {
+        return ended;
+      }
+      // The one-call driver has nothing else to do while a barrier waits: it runs it in place.
+      match self.take_barrier() {
+        Some(barrier) => self.barrier_ran(barrier.run()),
+        None => return self.finish(vol, store, audit, observer),
+      }
     }
   }
 

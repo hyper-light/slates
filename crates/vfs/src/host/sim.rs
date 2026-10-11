@@ -9,8 +9,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::{
-  BaseEntry, Hint, HostDir, HostError, HostFacts, HostFile, HostFs, HostKind, LandCapabilities,
-  LandFs, WatchState,
+  Barrier, BaseEntry, Hint, HostDir, HostError, HostFacts, HostFile, HostFs, HostKind,
+  LandCapabilities, LandFs, WatchState,
 };
 use crate::inode::Fingerprint;
 
@@ -119,6 +119,10 @@ pub struct SimHost {
   /// power loss could take, until a barrier that names them returns (the seam's contract, the strictest of its
   /// platforms: macOS orders a write-out only by the barrier after it).
   written_out: BTreeSet<u64>,
+  /// The temporaries (by inode) a barrier now running away from the host found written out when it was taken (A-132):
+  /// when its outcome comes back, those still written out — unchanged since — are durable, and nothing else is, however
+  /// it was written out meanwhile.
+  barrier_covers: BTreeSet<u64>,
   /// Every name a landing temporary became visible under, other than a hidden landing name, while it was not yet
   /// durable ([`SimHost::visible_before_durable`]): a power loss then could leave that name holding bytes or a mode the
   /// landing never wrote (§4.15 step 8: an entry is placed only after the barrier that covers it).
@@ -145,12 +149,26 @@ pub enum SimVerb {
   SyncMedia,
   /// `write_out`, by no path (every file matches an empty prefix).
   WriteOut,
-  /// `barrier`, by no path (every batch matches an empty prefix).
+  /// `begin_barrier`, by no path (every batch matches an empty prefix): the barrier refused as it is taken.
   Barrier,
+  /// A barrier's run, by no path: refused while it runs away from the host (an `fdatasync` the device fails, A-132).
+  BarrierRun,
   /// `unlink`, by the entry's path.
   Unlink,
   /// `open_file`, by the file's path: a read the host refuses (an I/O error on the disk the volume overlays).
   OpenFile,
+}
+
+/// A barrier the simulated host took (A-132): running it changes nothing — the host applies its durability when the
+/// outcome comes back ([`LandFs::end_barrier`]) — and it fails when a test armed [`SimVerb::BarrierRun`].
+struct SimBarrier {
+  refusal: Option<HostError>,
+}
+
+impl Barrier for SimBarrier {
+  fn run(self: Box<Self>) -> Result<(), HostError> {
+    self.refusal.map_or(Ok(()), Err)
+  }
 }
 
 /// An armed failure: the next `times` calls of `verb` whose path starts with `prefix` answer `error`.
@@ -225,6 +243,7 @@ impl SimHost {
       unsynced_dirs: BTreeSet::new(),
       dirty_temps: BTreeSet::new(),
       written_out: BTreeSet::new(),
+      barrier_covers: BTreeSet::new(),
       visible_unsynced: Vec::new(),
       calls: 0,
       armed: Vec::new(),
@@ -365,6 +384,7 @@ impl SimHost {
   /// A landing temporary's bytes, mode or modification time changed: dirty again until its next write-out.
   fn temp_changed(&mut self, ino: u64) {
     self.written_out.remove(&ino);
+    self.barrier_covers.remove(&ino);
     self.dirty_temps.insert(ino);
   }
 
@@ -998,16 +1018,36 @@ impl LandFs for SimHost {
     Ok(())
   }
 
-  fn barrier(&mut self, files: &[HostFile]) -> Result<(), HostError> {
+  fn begin_barrier(&mut self, files: &[HostFile]) -> Result<Box<dyn Barrier>, HostError> {
     self.write_step()?;
     self.fault(SimVerb::Barrier, "")?;
-    let mut covered = Vec::with_capacity(files.len());
+    let mut covers = BTreeSet::new();
     for file in files {
-      covered.extend(self.temp_ino(*file)?);
+      // Only a file written out since its last change is covered: a dirty one stays dirty.
+      covers.extend(
+        self
+          .temp_ino(*file)?
+          .filter(|ino| self.written_out.contains(ino)),
+      );
     }
-    // Only a file written out since its last change is made durable: a dirty one stays dirty.
-    for ino in covered {
-      self.written_out.remove(&ino);
+    self.barrier_covers = covers;
+    let refusal = self.fault(SimVerb::BarrierRun, "").err();
+    Ok(Box::new(SimBarrier { refusal }))
+  }
+
+  fn end_barrier(
+    &mut self,
+    files: &[HostFile],
+    ran: Result<(), HostError>,
+  ) -> Result<(), HostError> {
+    let covers = std::mem::take(&mut self.barrier_covers);
+    ran?;
+    for file in files {
+      if let Some(ino) = self.temp_ino(*file)?
+        && covers.contains(&ino)
+      {
+        self.written_out.remove(&ino);
+      }
     }
     Ok(())
   }

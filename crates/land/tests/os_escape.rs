@@ -25,8 +25,8 @@ use slates_land::grant::{GrantScope, Surface};
 use slates_land::os::OsLand;
 use slates_vfs::base::BaseConfig;
 use slates_vfs::host::{
-  BaseEntry, Hint, HostDir, HostError, HostFacts, HostFile, HostFs, LandCapabilities, LandFs,
-  WatchState,
+  Barrier, BaseEntry, Hint, HostDir, HostError, HostFacts, HostFile, HostFs, LandCapabilities,
+  LandFs, WatchState,
 };
 use slates_vfs::inode::Fingerprint;
 
@@ -255,9 +255,17 @@ impl LandFs for Interfering {
     self.tick();
     self.inner.write_out(file)
   }
-  fn barrier(&mut self, files: &[HostFile]) -> Result<(), HostError> {
+  fn begin_barrier(&mut self, files: &[HostFile]) -> Result<Box<dyn Barrier>, HostError> {
     self.tick();
-    self.inner.barrier(files)
+    self.inner.begin_barrier(files)
+  }
+
+  fn end_barrier(
+    &mut self,
+    files: &[HostFile],
+    ran: Result<(), HostError>,
+  ) -> Result<(), HostError> {
+    self.inner.end_barrier(files, ran)
   }
   fn set_mode(&mut self, file: HostFile, mode: u32) -> Result<(), HostError> {
     self.tick();

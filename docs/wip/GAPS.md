@@ -5862,3 +5862,44 @@ On a Linux release build of `faad1562` (A-126, the probe-storm fix and the reply
 - **Linux lane** (bounded container, non-root): workspace clippy clean, run with 1.98.0's clippy and rustfmt installed
   from checksum-verified tarballs, since the Docker VM has had no network since Docker Desktop restarted. `slates-land`
   59/59; the seal suite 2/2.
+
+### 2026-10-10: a landing's durability waits run off the shard (A-132)
+
+- **What it closes.** A granted landing held its shard for every durability wait.
+  - The barrier's `fdatasync` on Linux took 1–160 ms a batch on a busy machine; the write-out's `fsync` on macOS took
+    up to 206 ms a file.
+  - Every other client of the shard waited with it: probes up to 124–265 ms
+    (`docs/bugs/2026-10-10-a-landings-durability-waits-held-its-shard-on-a-busy-machine.md`).
+- **Now:** a batch's barrier runs on a thread the landing's task owns, and macOS's `fsync` belongs to the barrier.
+  - Linux at 2 CPUs and 256 MB, quiet, beside a syncing writer and under CPU hogs: other clients' worst p99 during a
+    landing was 0.07–0.28 ms, against 1.26–126.72 ms before.
+  - The landing's longest hold on its shard was at most 8.5 ms (`BENCHMARKS.md`).
+- **Proven:**
+  - the land and vfs suites, 317 tests on macOS and on Linux, including:
+    - the run held away from each barrier for three slices, landing exactly as the one call;
+    - a barrier refused while it runs, failing its whole batch;
+    - a change made while a barrier runs, not made durable by it;
+  - the server's landing suites (daemon, landing fairness, lease, snapshot landing);
+  - workspace clippy on macOS and Linux.
+- **Owed, each measured, each the next piece:**
+  1. **The finish is unsliced and O(entries):** about 1.7 µs of CPU an entry on Linux, 1.4–1.6 ms at 600 files. A
+     100,000-file landing would hold its shard about 170 ms in one step. Under the CPU hogs, throttling stretched one
+     finish to 52 ms. Slicing it must keep its records one atom with the completion (§4.15 step 9). This breaks the
+     bounded-work rule at scale.
+  2. **The landing's own time under CPU contention** is 1.6–3.4× slower than with the barrier on the shard. The
+     candidates are a thread kept for the landing instead of one started per barrier, and the next batch staged while
+     a barrier is away.
+  3. **The directory syncs and the media barrier** still run on the shard, one unit each. One directory sync took
+     2.4 ms under CPU hogs.
+  4. **Metadata calls stay on the shard:** create, rename, `fchmod`, `futimens`. A placement took up to 11.6 ms on a
+     busy Mac. Seastar runs these on its per-reactor syscall thread.
+  5. **The base plane's reads of cold host files** run on the shard for every overlay read. Unmeasured.
+  6. **Beside a syncing writer,** one 112 ms step outside the landing's slices went unexplained. It did not recur in
+     three instrumented runs (longest step 1.9–4.2 ms).
+  7. **On the contended Mac,** both arms took a ~145 ms step outside the landing's slices. This is the shard-QoS
+     hypothesis already open: the shard thread descheduled on an oversubscribed machine.
+- **Also measured:**
+  - **macOS throughput** (`land_bench flat` at load 40–81): neither A-132's ⌈√n⌉ streams, nor one stream, nor the
+    former arm won consistently. macOS keeps the one rule.
+  - **Linux lane timing:** the two calibrated fairness tests, sized to outlast a term and a reply deadline, took 875 s
+    together in a debug build in a 4-CPU container. They passed. No baseline was taken there, so it is noted, not judged.
