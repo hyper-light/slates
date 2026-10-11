@@ -20,7 +20,7 @@ use slates_vfs::recover::VolumeImage;
 use slates_vfs::volume::{Store, Volume, VolumeConfig};
 
 mod common;
-use common::{store, volume_with};
+use common::{clone_config, store, volume, volume_with};
 
 struct Counting;
 thread_local! {
@@ -263,5 +263,68 @@ fn an_overlay_create_publishes_a_delta_costing_the_same_in_a_large_upper_as_in_a
   assert_eq!(
     large, small,
     "(publication, replay) allocations in a {LARGE}-entry overlay upper vs a {SMALL}-entry one"
+  );
+}
+
+// --- Clones: a clone publishes a delta for its own new files, whole only on divergence (condition 2; 2026-10-11) ---
+
+/// A published clone of an origin snapshot with `upper` of its own new files in its root. The clone's first create
+/// diverges its inherited root directory (a whole image — the root leaves `origin_shared`), so the clone is marked
+/// published after growing, and the create measured below (root already current) is the delta A-68 now allows.
+fn published_clone(store: &mut Store, upper: usize) -> (Volume, VolumeImage) {
+  let mut origin = volume(store, 1 << 30);
+  let oroot = origin.root_inode(store).unwrap();
+  origin
+    .create_file_no(store, oroot, "inherited", 0o644)
+    .unwrap();
+  let snap = origin.snapshot(store).unwrap();
+  let mut clone = Volume::clone_of(store, &mut origin, snap, clone_config(9)).unwrap();
+  let croot = clone.root_inode(store).unwrap();
+  for at in 0..upper.max(1) {
+    clone
+      .create_file_no(store, croot, &format!("own{at:05}"), 0o644)
+      .unwrap();
+  }
+  let image = clone.to_image(store, None).unwrap();
+  clone.mark_published(store);
+  (clone, image)
+}
+
+/// One create's publication and replay in a published clone whose root already diverged (so the create touches no
+/// origin inode): the allocations each made, after checking the clone publishes a **delta** and the replayed delta
+/// equals the clone's full image.
+fn one_create_clone(upper: usize) -> (usize, usize) {
+  let mut store = store();
+  let (mut clone, mut image) = published_clone(&mut store, upper);
+  let root = clone.root_inode(&store).unwrap();
+  clone
+    .create_file_no(&mut store, root, "Fresh.txt", 0o644)
+    .unwrap();
+  let (published_calls, record) = counted(|| clone.publication(&store, None).unwrap());
+  let slates_vfs::delta::VolumeRecord::Delta { delta } = record else {
+    panic!("a clone that only grew its own files publishes a delta, not its whole image");
+  };
+  let (replayed_calls, applied) = counted(|| image.apply(&delta));
+  applied.unwrap();
+  assert_eq!(
+    image,
+    clone.to_image(&store, None).unwrap(),
+    "the replayed clone delta equals the clone's full image"
+  );
+  (published_calls, replayed_calls)
+}
+
+/// Condition 2, A-68 extended to clones (2026-10-11): a clone — an agent's work volume — publishes a delta for its own
+/// new files, so one create's publication and replay allocate the same in a 4,096-file clone as in a 64-file one; an
+/// agent growing a cloned version no longer re-images the whole volume per op. A create that *diverges* an inherited
+/// inode still publishes the whole image (the shared→private move a delta cannot carry); growing with own files does
+/// not. Recovery byte-correctness: `crates/server/tests/recovery.rs::a_clone_recovers_over_its_recovered_origin...`.
+#[test]
+fn a_clone_create_publishes_a_delta_costing_the_same_in_a_large_clone_as_in_a_small_one() {
+  let small = one_create_clone(SMALL);
+  let large = one_create_clone(LARGE);
+  assert_eq!(
+    large, small,
+    "(publication, replay) allocations in a {LARGE}-file clone vs a {SMALL}-file one"
   );
 }

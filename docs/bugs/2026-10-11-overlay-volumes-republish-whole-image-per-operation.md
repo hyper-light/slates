@@ -152,8 +152,12 @@ delta path), through a real Linux FUSE mount:
 
 ## Status
 
-**FIXED 2026-10-11 (A-134, `d4d0a3e3`).** Overlay (base-backed) volumes publish deltas per barrier while their base
-plane is unchanged; recovery is byte-correct (oracle 39/0), the escape guarantee holds on the delta path (0 disk bytes
-across 1,500 hostile ops), the write path is O(delta) (deterministic allocation proof + wall-clock ~5–7× at depth).
-Owed, separately: snapshot/clone deltas (still whole-image — the head-into-snapshot and shared-root problems a delta
-cannot carry); and a quiet-machine p99-vs-TectonicFS single-number bench.
+**FIXED 2026-10-11 (A-134, `d4d0a3e3`); clone deltas extended the same day.** Overlay (base-backed) volumes publish
+deltas per barrier while their base plane is unchanged; **clones** publish deltas for their own new files, falling back
+to the whole image only on a barrier that diverges an origin inode (`origin_diverged`). Recovery is byte-correct
+(oracle 39/0, the clone oracle now also diverges an inherited file and recovers it), the escape guarantee holds on the
+delta path (0 disk bytes across 1,500 hostile ops), the write path is O(delta) (deterministic allocation proofs for
+overlay and clone + wall-clock ~5–7× at depth). Owed, separately: **snapshot** deltas (a volume with its *own*
+snapshots still publishes whole — the head-into-snapshot shared→private move needs a snapshot-image delta,
+`trie::changed`); and a quiet-machine p99-vs-TectonicFS single-number bench (Tectonic publishes no comparable small-op
+p99).

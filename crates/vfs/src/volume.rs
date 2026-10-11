@@ -4168,6 +4168,16 @@ impl Volume {
     Ok(removed)
   }
 
+  /// If this volume is a clone and `born` is at or before its origin epoch, records that it diverged an origin
+  /// inode (A-134): the copy-up about to retire that version moves the inode out of `origin_shared` into the clone's
+  /// own inodes — a shared→private move a delta does not carry (recovery refuses an inode in both `inodes` and
+  /// `origin_shared`, `recover.rs`), so the publication that follows must be the whole image.
+  fn note_clone_divergence(&mut self, born: Epoch) {
+    if self.origin_epoch.is_some_and(|origin| born <= origin) {
+      self.dirty.mark_origin_diverged();
+    }
+  }
+
   /// The current-epoch version of an inode, copying an older version and re-pointing the table.
   pub(crate) fn make_current_inode(
     &mut self,
@@ -4190,6 +4200,7 @@ impl Volume {
     if born == self.epoch {
       return Ok(handle);
     }
+    self.note_clone_divergence(born);
     // This copy-up retires the old version; if a snapshot pins it (its birth is at or before the last
     // snapshot's epoch — the same rule `retire` uses to keep it), it is retained on that snapshot's
     // deadlist. Charge it against the retention allowance (§4.2): refuse before the copy-up if the

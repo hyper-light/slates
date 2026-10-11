@@ -51,6 +51,9 @@ const BEFORE: &[u8] = b"the bytes the snapshot froze: alpha bravo charlie delta 
 /// [`BEFORE`] and written at offset zero, so the head's file is exactly these bytes.
 const AFTER: &[u8] =
   b"the bytes the head holds after the snapshot: golf hotel india juliet kilo lima mike november\n";
+/// Shape: the bytes a clone writes over an inherited file — diverging it out of the origin snapshot's shared records
+/// (A-134 `origin_diverged`): the clone's publication that follows is its whole image, and the origin keeps [`BEFORE`].
+const DIVERGED: &[u8] = b"the bytes the clone diverged an inherited file to: oscar papa quebec romeo sierra tango\n";
 
 /// The product's own deadlines (`Deadlines::derive` over the anchor's liveness budget and the recovery
 /// budget), never a shorter hand-picked reply clock that calls a live daemon stalled
@@ -1959,6 +1962,10 @@ fn a_clone_recovers_over_its_recovered_origin_serving_inherited_and_its_own_file
   let (mut stream, root) = mounted_on(&first, "clone-origin");
   let inherited = create(&mut stream, &root, "inherited", 2);
   write(&mut stream, &inherited, BEFORE, 3);
+  // A second inherited file the clone will diverge (A-134): it exercises the shared→private move that forces the
+  // clone's whole-image publication, while `inherited` stays shared to prove the untouched path still recovers.
+  let inherited2 = create(&mut stream, &root, "inherited2", 12);
+  write(&mut stream, &inherited2, BEFORE, 13);
   drop(stream);
   let snapshot = client.snapshot(origin).unwrap();
   // A clone lives on its origin's partition; its name must route there too to be mounted by name.
@@ -1969,6 +1976,11 @@ fn a_clone_recovers_over_its_recovered_origin_serving_inherited_and_its_own_file
   let (mut stream, root) = mounted_on(&first, &clone_name);
   let own = create(&mut stream, &root, "own", 4);
   write(&mut stream, &own, AFTER, 5);
+  // Diverge an inherited file in the clone: it copies up (born > origin), leaving `origin_shared` for the clone's own
+  // inodes — the shared→private move that makes the clone's publication its whole image (A-134), and must survive the
+  // restart without touching the origin's own copy.
+  let diverge = lookup(&mut stream, &root, "inherited2", 14);
+  write(&mut stream, &diverge, DIVERGED, 15);
   drop(stream);
   first.stop();
 
@@ -1982,10 +1994,25 @@ fn a_clone_recovers_over_its_recovered_origin_serving_inherited_and_its_own_file
   );
   let own = lookup(&mut stream, &root, "own", 8);
   assert_eq!(read(&mut stream, &own, 9), AFTER, "the clone's own file");
+  // The diverged inherited file reads the clone's own bytes after the restart (its whole-image publication carried
+  // the shared→private move).
+  let diverged = lookup(&mut stream, &root, "inherited2", 16);
+  assert_eq!(
+    read(&mut stream, &diverged, 17),
+    DIVERGED,
+    "the clone's diverged inherited file"
+  );
   drop(stream);
   let (mut stream, root) = mounted_on(&second, "clone-origin");
   let file = lookup(&mut stream, &root, "inherited", 10);
   assert_eq!(read(&mut stream, &file, 11), BEFORE, "the origin's file");
+  // The clone's divergence never touched the origin's own copy of that file.
+  let origin2 = lookup(&mut stream, &root, "inherited2", 18);
+  assert_eq!(
+    read(&mut stream, &origin2, 19),
+    BEFORE,
+    "the origin's copy is untouched by the clone's divergence"
+  );
   drop(stream);
   drop(client);
   second.stop();

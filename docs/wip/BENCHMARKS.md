@@ -5286,3 +5286,16 @@ Since the same volume and base with fsync is clean, the tail is not the publish 
 fsync path too) — it is consistent with the kernel's FUSE async write-back bursting under VM load on the unsynced path,
 not a daemon cost A-134 left behind. A dedicated isolation of that unsynced-writeback tail (and a bare-metal, not-VM
 run) is the remaining condition-12 refinement; the durability path and the publish cost are both established.
+
+### Condition 2: clones publish deltas for their own new files (A-134 extended; 2026-10-11)
+
+A clone (an agent's work volume) used to publish its whole image at every barrier. It now records and publishes a
+**delta** for its own new files, falling back to the whole image only on a barrier that **diverges** an origin inode
+(copies up an inode born at or before the origin epoch — the move out of `origin_shared` a delta cannot carry, since
+recovery refuses an inode in both `inodes` and `origin_shared`). Proof (load-independent, allocation-counted):
+`crates/vfs/tests/delta_cost.rs::a_clone_create_publishes_a_delta_costing_the_same_in_a_large_clone_as_in_a_small_one`
+— one create in a published clone publishes a `VolumeRecord::Delta` whose publication+replay allocate the same in a
+4,096-file clone and a 64-file one (O(delta), not O(volume)). Recovery byte-correctness incl. divergence:
+`crates/server/tests/recovery.rs::a_clone_recovers_over_its_recovered_origin...`, now extended to diverge an inherited
+file in the clone, restart, and confirm the clone reads its diverged bytes while the origin's copy is untouched.
+Snapshot (own-snapshot) volumes still publish whole — a separate snapshot-image delta (`trie::changed`) is owed.

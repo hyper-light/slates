@@ -3632,19 +3632,22 @@ is about 9% of a macOS bsdtar round's wall time (docs/wip/BENCHMARKS.md, A-68). 
   crash-at-every-step), full `crates/vfs` green, and the load-independent
   `delta_cost.rs::an_overlay_create_publishes_a_delta_costing_the_same_in_a_large_upper_as_in_a_small_one`. See
   `docs/bugs/2026-10-11-overlay-volumes-republish-whole-image-per-operation.md`.
-- **Snapshot-aware and clone deltas — still owed; mechanism verified 2026-10-11.** A volume with snapshots or a clone
-  origin still publishes in full at every barrier, so a snapshotted volume's barriers stay linear in its size. This is
-  **not** the same shape as the overlay fix (A-134), and was traced in code, not assumed: `VolumeImage::apply` preserves
-  `self.base` (so an overlay delta works over the checkpoint's base plane) **and** preserves `self.snapshots` /
-  `origin_*` — but a snapshot's data lives in `SnapshotImage.inodes` (private copies) plus a `shared` list of inodes
-  identical to the head. When the head diverges a shared file, that inode must **move from the snapshot's `shared` list
-  into its private `inodes`** (volume.rs ~4193/4244, "the old record keeps the snapshot's"), which lives in
-  `self.snapshots` — exactly what `apply` leaves untouched. So a plain delta drops the shared→private move and loses
-  snapshot data on restart; the fix needs a **snapshot-image delta** (new private inodes + shared→private moves per
-  snapshot), the `trie::changed` copy-on-write diff the design names — a data-loss-critical refinement for a dedicated
-  effort, not a gate relaxation. **Escape holds meanwhile (condition 3):** a snapshotted head (the whole-image path)
-  under the escape battery (3×200 hostile ops) wrote **0 daemon disk bytes** with the outside tree unchanged — the
-  publish is anchor-RAM-only whether whole-image or delta. See
+- **Clone deltas — DONE 2026-10-11 (A-134 extended; condition 2).** A clone (an agent's work volume) used to publish
+  its whole image at every barrier. Now it records and publishes a **delta for its own new files**, falling back to the
+  whole image only on a barrier that **diverges** an origin inode (`Dirty::origin_diverged`, set in
+  `make_current_inode`/`note_clone_divergence` when it copies up an inode born ≤ the origin epoch — the shared→private
+  move out of `origin_shared` that a delta cannot carry, since recovery refuses an inode in both `inodes` and
+  `origin_shared`). `recording()` now records for a clone (not just a plain/overlay volume). Proven: the load-independent
+  `delta_cost.rs::a_clone_create_publishes_a_delta_costing_the_same_in_a_large_clone_as_in_a_small_one`, and the
+  extended recovery oracle `a_clone_recovers_over_its_recovered_origin...` — which now **diverges an inherited file** in
+  the clone, restarts, and checks the clone reads its diverged bytes while the origin's copy is untouched.
+- **Snapshot deltas — still owed (verified-substantial).** A volume with its own snapshots still publishes in full at
+  every barrier (`recording()` keeps `published_shape.snapshots == 0`). Traced in code, not assumed: a snapshot's data
+  is `SnapshotImage.inodes` (private) + a `shared` list; a head write that diverges a shared file moves the inode into
+  the snapshot's private `inodes` in `self.snapshots`, which `apply` leaves untouched — so a plain delta loses it. The
+  fix is a **snapshot-image delta** (`trie::changed`) — a data-loss-critical dedicated effort, not a gate relaxation.
+  Escape holds meanwhile (condition 3): a snapshotted head under the escape battery (3×200 hostile ops) wrote **0 daemon
+  disk bytes**, outside tree unchanged. See
   `docs/bugs/2026-10-11-overlay-volumes-republish-whole-image-per-operation.md`.
 - **macOS round trips.** About 100 µs of kernel client per RPC, times about 37 RPCs per extracted file. NFSv4 named
   attributes would end the AppleDouble sidecars, but the macOS client speaks NFSv4.0 and slates serves 4.1 and 4.2.

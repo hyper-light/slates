@@ -76,6 +76,12 @@ pub struct Dirty {
   /// Whether anything changed since the last publication, recorded or not: what lets a volume that records no
   /// details (its next publication is full) still answer clean when nothing changed.
   changed: bool,
+  /// Whether a clone diverged one of its origin snapshot's inodes since the last publication — copied an inode born
+  /// at or before the origin epoch up to the head's epoch (`Volume::make_current_inode`). That inode leaves
+  /// `origin_shared` for the clone's own inodes, a shared→private move a delta does not carry (recovery refuses an
+  /// inode in both `inodes` and `origin_shared`, `recover.rs`), so the publication that follows a divergence is the
+  /// whole image. Set regardless of recording (a gate, like `changed`); cleared by `mark_published`.
+  origin_diverged: bool,
   /// Whether the last publication of this volume committed, so a delta has an image to apply to.
   published: bool,
   /// The volume's shape when it was last published: a delta carries only inodes and entries, so a volume whose
@@ -120,9 +126,13 @@ impl Dirty {
   /// (created and copied-up inodes, entries and whiteouts) over the checkpoint's base plane, which recovery preserves
   /// (`VolumeImage::apply` leaves `base` untouched), and it publishes per barrier so the recorded set stays small. An
   /// overlay publishes whole only when its base plane itself changed since the last publish (`base_plane_changed`),
-  /// which the publication decides; recording while a delta is possible is what lets that delta carry anything.
+  /// which the publication decides; recording while a delta is possible is what lets that delta carry anything. A
+  /// **clone** likewise records: a delta carries its own new inodes over the checkpoint's `origin_shared`, which
+  /// recovery preserves; a publication only falls back to the whole image on a barrier that *diverged* an origin
+  /// inode (`origin_diverged`). A **snapshot** still records nothing (it always publishes whole — a head change can
+  /// move a shared file into the snapshot's own image, which a delta does not carry).
   fn recording(&self) -> bool {
-    self.published && self.published_shape.snapshots == 0 && !self.published_shape.clone
+    self.published && self.published_shape.snapshots == 0
   }
 
   /// Records a changed inode.
@@ -134,6 +144,12 @@ impl Dirty {
         self.others.push(no);
       }
     }
+  }
+
+  /// Records that a clone diverged an origin-snapshot inode (see [`Self::origin_diverged`]): the next publication must
+  /// be the whole image, as the inode's move out of `origin_shared` is not something a delta carries.
+  pub(crate) fn mark_origin_diverged(&mut self) {
+    self.origin_diverged = true;
   }
 
   /// Marks the write that is about to change inode `no` (`Some`), or its end (`None`): the write's own marks of `no`
@@ -398,9 +414,11 @@ impl Volume {
   }
 
   /// Whether this volume's next publication is its whole image: never published; a shape a delta cannot carry
-  /// (snapshots — a head change can move a shared file into a snapshot's own image; a clone — it shares its delta
-  /// root); a shape changed since; as many inodes changed as it holds; or an overlay whose base plane changed since
-  /// the last publish (a delta carries no base plane, so a copy-up, whiteout, rename or drift takes the whole image).
+  /// (snapshots — a head change can move a shared file into a snapshot's own image); a shape changed since; as many
+  /// inodes changed as it holds; a clone that **diverged** an origin inode this interval (`origin_diverged` — the
+  /// move out of `origin_shared` a delta does not carry); or an overlay whose base plane changed since the last
+  /// publish (a delta carries no base plane, so a copy-up, whiteout, rename or drift takes the whole image). A clone
+  /// that only grew — created its own new files — publishes a delta.
   fn publishes_whole(&self) -> bool {
     let changed = u64::try_from(self.dirty.inodes.len()).unwrap_or(u64::MAX);
     let shape = self.shape();
@@ -408,7 +426,7 @@ impl Volume {
       || self.dirty.published_shape != shape
       || changed >= self.live_inodes
       || shape.snapshots > 0
-      || shape.clone
+      || self.dirty.origin_diverged
       || self.base_plane_changed()
   }
 
@@ -441,6 +459,7 @@ impl Volume {
   pub fn mark_published(&mut self, store: &Store) {
     self.dirty.clear_recorded();
     self.dirty.changed = false;
+    self.dirty.origin_diverged = false;
     self.dirty.published = true;
     self.dirty.published_shape = self.shape();
     self.dirty.published_roots = self.roots(store).ok();
