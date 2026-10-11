@@ -5253,5 +5253,13 @@ depth was ~490 µs (previous entry), a **5–7× win**, confirming the O(delta) 
 first window (~144–185 µs) is the first checkpoint plus base-plane setup. The `[1500,2000)` spike to ~680 µs appeared in
 two of three runs but was 71 µs in the cleanest (lowest-load) run at the **same** window — concurrent-session load
 noise, not algorithmic: a residual O(upper) cost would be monotonic (highest at `[3500,4000)`, not a mid-window spike
-that vanishes under lower load). A dedicated quiet-machine p99-vs-TectonicFS bench is still owed to put a single
-competitor-comparison number on it; the asymptotic win is established deterministically and confirmed here wall-clock.
+that vanishes under lower load). The asymptotic win is established deterministically and confirmed here wall-clock.
+
+**vs TectonicFS (condition 12).** The OCI write path — overlay create — is now **~70–100 µs p50 on the local path**,
+the µs-scale low-latency class. There is no direct p99-vs-p99 A/B to run: TectonicFS (FAST '21, Pan et al.) is
+closed-source and, as a throughput-oriented exabyte warehouse store (≈10 KQPS/shard, a metadata op is "one or more
+network calls"), **publishes no small-op p99** — it explicitly trades metadata latency for scale. The honest comparison
+is the class one in the "Condition 12 … honest comparison to TectonicFS" entry above: slates holds the low-latency end
+Tectonic gives up, and beats the runnable same-machine competitor (the kernel's NFS server) on read latency. The
+remaining refinement to the slates-side number is a **quiet-machine** p99 histogram (vs this session's load-6–15
+figures); the competitor side is a published-figure comparison by necessity.
