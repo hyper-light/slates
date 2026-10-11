@@ -160,9 +160,11 @@
 # slates-bridge-fuse (0): the FUSE ABI codec is byte slices read and written in field order
 #   through a sequential reader/writer (`wire.rs`), never a cast; the /dev/fuse transport and
 #   mount (Unix, added later) will carry their own budgeted sites.
-# slates-land (3): the macOS libc calls rustix does not wrap, each on a descriptor the writer
-#   owns: fcntl(F_BARRIERFSYNC) as the data barrier, fcntl(F_FULLFSYNC) as the media barrier,
-#   renameatx_np(RENAME_SWAP) as the exchange.
+# slates-land (4): the libc calls rustix does not wrap, each on a descriptor the writer owns:
+#   macOS fcntl(F_BARRIERFSYNC) as the data barrier, fcntl(F_FULLFSYNC) as the media barrier,
+#   renameatx_np(RENAME_SWAP, RENAME_EXCL) as the exchange and the rename that replaces nothing;
+#   and (raised 3 -> 4 on 2026-10-10, A-130) Linux sync_file_range(SYNC_FILE_RANGE_WRITE) as a
+#   file's write-out, measured 1.5-2.6x faster a file with the concurrent barrier, quiet and busy.
 #   the Winsock `getsockopt(SO_RCVBUF)` of a live socket (§4.10a, added 2026-09-10 for the
 #   demultiplexer's per-session queue sizing; Win32, unsafe by signature, 1).
 #
@@ -233,7 +235,7 @@ slates-mem = 36
 slates-rt = 75
 slates-base = 10
 slates-vfs = 0
-slates-land = 3
+slates-land = 4
 slates-anchor = 6
 slates-db = 0
 slates-ipc = 47

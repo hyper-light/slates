@@ -167,9 +167,9 @@ pub trait LandFs: HostFs {
   /// Writes at an offset (the whole buffer, or a refusal).
   fn write_at(&mut self, file: HostFile, off: u64, bytes: &[u8]) -> Result<(), HostError>;
   /// The file's own share of its durability, once its bytes, mode and mtime are final (§4.15 step 8, A-130): its data
-  /// and attributes handed to the device (macOS `fsync`), nothing yet where the barrier syncs the batch (Linux), or the
-  /// file made durable outright where there is no batch barrier (`fdatasync` elsewhere). A change to the file after it
-  /// needs another.
+  /// and attributes handed to the device (macOS `fsync`), its writeback started where the barrier syncs the batch
+  /// (Linux `sync_file_range`), or the file made durable outright where there is no batch barrier (`fdatasync`
+  /// elsewhere). A change to the file after it needs another.
   fn write_out(&mut self, file: HostFile) -> Result<(), HostError>;
   /// The durability barrier of a batch of temporaries, each written out ([`LandFs::write_out`]) since its last change:
   /// when it returns, every one is durable ahead of any write that follows, so a placement after it never shows a name

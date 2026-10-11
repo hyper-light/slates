@@ -5,9 +5,10 @@
 //!
 //! Shape: every verb is relative to a descriptor the base host holds (`OsHost`, which resolves
 //! the one root path with `O_NOFOLLOW` and hands out handles); no verb takes a path string.
-//! Linux: `O_TMPFILE` temporaries linked by `linkat` through `/proc/self/fd`, a batch's barrier as
-//! its files' `fdatasync`s all in flight at once (A-130: journal group commit merges them into few
-//! commits and flushes), `renameat2(RENAME_EXCHANGE)`, `fsync` on directories. macOS: hidden-name
+//! Linux: `O_TMPFILE` temporaries linked by `linkat` through `/proc/self/fd`, each file's writeback
+//! started as it is written out (`sync_file_range`) and a batch's barrier as its files' `fdatasync`s
+//! all in flight at once (A-130: journal group commit merges them into few commits and flushes),
+//! `renameat2(RENAME_EXCHANGE)`, `fsync` on directories. macOS: hidden-name
 //! temporaries (`O_CREAT|O_EXCL`), `fsync` as each file's write-out and one `fcntl(F_BARRIERFSYNC)` per
 //! device as a batch's barrier, `renameatx_np(RENAME_SWAP)`, `fcntl(F_FULLFSYNC)` on the target as the
 //! media barrier when the grant asked for it. Other unixes: `fdatasync` as each file's write-out, the
@@ -15,9 +16,9 @@
 //! dirty data too: beside one busy writer a barrier took up to 3.7 s and a 16-file batch cost 4.0–7.8 ms
 //! a file against `fdatasync`'s 0.65–0.79 ms (2026-10-10, `BENCHMARKS.md`), so it is not used. Both:
 //! `fchmod` (on files and on each made directory, so the umask never edits a recorded mode),
-//! `futimens`, `unlinkat`, `mkdirat`, `symlinkat`, `renameat`. The three `unsafe`
-//! sites are the libc calls rustix does not wrap (`F_BARRIERFSYNC`, `F_FULLFSYNC`,
-//! `renameatx_np`), each on a descriptor this host owns.
+//! `futimens`, `unlinkat`, `mkdirat`, `symlinkat`, `renameat`. The four `unsafe`
+//! sites are the libc calls rustix does not wrap (macOS `F_BARRIERFSYNC`, `F_FULLFSYNC`,
+//! `renameatx_np`; Linux `sync_file_range`), each on a descriptor this host owns.
 //!
 //! Containment (§4.15 step 4, §4.13): [`OsLand::open_target`] opens the target path one
 //! component at a time with `O_DIRECTORY|O_NOFOLLOW`; an unfollowed symlink is classified
@@ -505,10 +506,23 @@ fn exchange_names(_dir: BorrowedFd<'_>, _a: &str, _b: &str) -> Result<(), HostEr
   ))
 }
 
-/// A file's write-out on Linux: nothing yet — the batch's barrier syncs every file of the batch at once.
+/// A file's write-out on Linux: its writeback started (`sync_file_range(SYNC_FILE_RANGE_WRITE)`, which neither waits
+/// nor writes metadata), so its data is in flight and its blocks allocated before the batch's barrier syncs every file
+/// at once. The barrier, not this, makes the file durable. Measured (2026-10-10, `BENCHMARKS.md`, ten rounds, the arms'
+/// order alternated): with the concurrent barrier, 64–129 µs a file against 112–197 for the barrier alone when the disk
+/// is quiet, and 115–3,688 against 211–6,120 beside a busy writer. Its errors are the file's: `ENOSPC` where starting
+/// writeback allocates, `EIO` where the device refuses.
 #[cfg(target_os = "linux")]
-fn write_out_file(_fd: BorrowedFd<'_>) -> Result<(), HostError> {
-  Ok(())
+fn write_out_file(fd: BorrowedFd<'_>) -> Result<(), HostError> {
+  // SAFETY: `sync_file_range` takes no pointer argument; `fd` is a descriptor this host owns for the call's duration.
+  let rc = unsafe { libc::sync_file_range(fd.as_raw_fd(), 0, 0, libc::SYNC_FILE_RANGE_WRITE) };
+  if rc == 0 {
+    Ok(())
+  } else {
+    Err(refusal(rustix::io::Errno::from_raw_os_error(
+      std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
+    )))
+  }
 }
 
 /// A file's write-out on the other unixes: `fdatasync`, which makes the file durable alone; their batch barrier then

@@ -5738,8 +5738,11 @@ On a Linux release build of `faad1562` (A-126, the probe-storm fix and the reply
   - **Built the same day:** the batch's `fdatasync`s in flight at once, for journal group commit.
     - Through the engine on ext4, interleaved with `20b302aa` at VM load 35–39: 965–1,618 µs a file against
       3,426–11,091, 3.0–7.4× faster; 182–219 µs once the VM quieted.
-    - Starting each file's writeback at write time gained 21–45% in five of six syscall rounds and lost 10% in one. It
-      waits for a quieter measurement, since it needs an `unsafe` call rustix does not wrap.
+    - **Starting each file's writeback at write time** (`sync_file_range`), built the same evening:
+      - it won all ten rounds of a syscall rerun on a quieter VM;
+      - through the engine, interleaved with `f9f0c081`, it took 71–127 µs a file against 177–231 in two rounds, and
+        was mixed in the first;
+      - slates-land's unsafe budget went from 3 to 4 for the one libc call.
     - Its Linux lane: clippy clean, every `slates-land` test (the OS writer's real-disk tests on ext4 among them).
 - **Linux lane over the change** (a snapshot worktree in a container: io_uring, non-root, 2 build jobs, a 3 GiB
   cap):

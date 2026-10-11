@@ -11098,16 +11098,18 @@ the seam's docs, this entry, GAPS, BENCHMARKS).
     call before its placement. git's `core.fsyncMethod=batch` makes the same trade, "expected to be as safe as fsync
     on macOS for repos stored on HFS+ or APFS filesystems and on Windows for repos stored on NTFS or ReFS filesystems".
     It claims nothing for Linux [C: git-config(1), git 2.50.1].
-  - **Linux:** the write-out does nothing yet; the barrier issues every file's `fdatasync` at once, from one scoped
-    thread a file but the caller's, and joins them all. Journal group commit merges them into few commits and flushes:
+  - **Linux:** the write-out starts the file's writeback (`sync_file_range(SYNC_FILE_RANGE_WRITE)`, which neither waits
+    nor writes metadata), and the barrier issues every file's `fdatasync` at once, from one scoped thread a file but
+    the caller's, and joins them all. Journal group commit merges them into few commits and flushes:
     ext4's jbd2 joins every sync waiting on the running transaction to its commit. Each file is durable when its own
     call returns, exactly as alone, and the batch is refused when any is. A thread the system refuses to start leaves
     its file to the caller.
     - Linux's only call that covers a batch, `syncfs`, flushes every writer's dirty data on the filesystem. Measured
       beside one busy writer, it is the worst choice, so it is rejected for files and for directories.
-    - Starting each file's writeback at write time (`sync_file_range`) gained 21–45% in five of six syscall rounds and
-      lost 10% in one. It needs an `unsafe` libc call (rustix wraps none), so it waits for a measurement outside this
-      day's VM noise.
+    - Starting each file's writeback at write time won all ten rounds of a rerun on a quieter VM, the arms' order
+      alternated: 64–129 µs a file against 112–197 quiet, and 115–3,688 against 211–6,120 beside the busy writer.
+      Through the engine it was 1.4–2.9× faster in two of three rounds and mixed in the first. It is one `unsafe` libc
+      call, since rustix wraps none; slates-land's budget went from 3 to 4 for it.
   - **The other unixes:** the write-out is `fdatasync`, which makes the file durable alone, so the barrier adds
     nothing.
 - **Measured** (2026-10-10; scratch A/B, not kept: 2,000 files of 4 KiB in a fresh directory, per batch size `n`;

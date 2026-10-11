@@ -4836,3 +4836,45 @@ behind it. The 2026-10-01 runs, at load 4–6, saw longest steps of 13.8–25.5 
 - **Every run:** `state: done`, 4,172 entries written, and `diff -r` silent. The day's head took 502 barriers for the
   3,685 files: files larger than a batch's window take a barrier each, and the small ones share them.
 - **The mount:** checked absent after every run.
+
+### Landed: Linux's write-out starts each file's writeback before the batch's barrier (A-130; 2026-10-10)
+
+**Commands:**
+- **Syscall rerun:** the A/B of the entry above, on a quieter VM (another session's container at about two cores),
+  three arms, five rounds quiet and five beside the busy writer. The two deciding arms' order alternates round by round.
+- **Engine A/B:** `land_bench flat` for `f9f0c081` (the concurrent barrier alone) and the change, each built in its
+  own target directory, three interleaved rounds.
+- **Where:** ext4 in Docker's VM, non-root, a 3 GiB cap.
+
+**Syscall, µs a file:**
+
+| round | one `fdatasync` a file | concurrent, n=16 | writeback first, then concurrent, n=16 |
+|---|---|---|---|
+| quiet 0 | 789.5 | 129.2 | 76.2 |
+| quiet 1 | 385.7 | 157.4 | 64.0 |
+| quiet 2 | 510.0 | 142.4 | 74.5 |
+| quiet 3 | 483.3 | 112.2 | 76.0 |
+| quiet 4 | 376.4 | 197.4 | 128.7 |
+| busy 0 | 12,959.5 | 6,119.8 | 2,323.4 |
+| busy 1 | 19,538.9 | 6,034.0 | 3,688.2 |
+| busy 2 | 8,882.9 | 3,867.6 | 2,206.7 |
+| busy 3 | 602.9 | 225.6 | 123.5 |
+| busy 4 | 620.9 | 211.1 | 114.8 |
+
+Writeback first won every round: 1.5–2.5× quiet and 1.6–2.6× beside the busy writer.
+
+**Through the engine, µs a new file** (median of 5 runs; load inside the VM at each arm's start):
+
+| round | arm | load | 1,000 | 2,000 | 4,000 | 8,000 | 16,000 |
+|---|---|---|---|---|---|---|---|
+| 1 | barrier alone | 13 | 321 | 245 | 266 | 230 | 265 |
+| 1 | writeback first | 17 | 186 | 310 | 179 | 120 | 161 |
+| 2 | barrier alone | 16 | 177 | 178 | 192 | 213 | 184 |
+| 2 | writeback first | 15 | 128 | 99 | 90 | 105 | 127 |
+| 3 | barrier alone | 12 | 216 | 208 | 191 | 212 | 231 |
+| 3 | writeback first | 14 | 77 | 71 | 76 | 74 | 82 |
+
+- **Rounds 2 and 3, at like loads:** 1.4–2.1× and 2.6–2.9× faster. Round 1 was mixed: slower at 2,000 only, with the
+  change at the higher load.
+- **Cost:** one `unsafe` libc call (rustix wraps no `sync_file_range`); slates-land's unsafe budget went from 3 to 4.
+- **Since the morning on Linux:** one `fdatasync` a file cost 573–913 µs on a quiet VM; the head runs 71–127 µs.
