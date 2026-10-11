@@ -5903,3 +5903,7 @@ On a Linux release build of `faad1562` (A-126, the probe-storm fix and the reply
     former arm won consistently. macOS keeps the one rule.
   - **Linux lane timing:** the two calibrated fairness tests, sized to outlast a term and a reply deadline, took 875 s
     together in a debug build in a 4-CPU container. They passed. No baseline was taken there, so it is noted, not judged.
+- **The fleet test** `a_nodes_status_reports_each_record_session_with_its_congestion_state` read the detector's lateness
+  once, and failed once on a loaded Mac ("measured: 0"). It now polls for the measurement, as it does for the sessions.
+  The hyper-raft agent confirms that the new detector's first measurement can come later: a period is floored by the
+  detection budget.

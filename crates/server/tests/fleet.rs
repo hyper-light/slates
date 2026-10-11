@@ -6448,20 +6448,37 @@ fn a_nodes_status_reports_each_record_session_with_its_congestion_state() {
   let served_last: Vec<_> = daemons.iter().map(served_of).collect();
   // Each node's detector names the verdict judging each peer and its own measured lateness, the evidence a false
   // condemnation is read against (hyper-raft's checklist, 2026-10-07).
-  let detectors: Vec<_> = daemons
-    .iter()
-    .map(
-      |daemon| match Client::connect(daemon.instance()).call(&RequestBody::DaemonStatus) {
-        ReplyBody::DaemonStatus { report } => {
-          Some((report.fleet.detector, report.fleet.detector_granularity_ns))
-        }
-        _ => None,
-      },
-    )
-    .collect();
+  let (measured, detectors) = measured_detectors(&daemons, &observed);
   for daemon in daemons {
     daemon.stop();
   }
+  assert_detectors_measured(measured, &detectors);
+  assert!(
+    served,
+    "every node reports a session a peer dialed to it, with a window and a round trip: {served_last:?}"
+  );
+  assert!(
+    reported,
+    "every node reports a session to each peer with a window and a round trip: {last:?}"
+  );
+  for session in last.iter().flatten() {
+    assert!(
+      session.pto_ns > session.smoothed_rtt_ns,
+      "the probe timeout is above the smoothed round trip: {session:?}"
+    );
+  }
+}
+
+/// One node's detector report and its measured lateness in nanoseconds, as its status gave them (`None`: no status).
+type DetectorReading = Option<(Vec<slates_ipc::protocol::DetectorPeerReport>, u64)>;
+
+/// Every node of the three reported its detector, every one measured its lateness within the deadline (`measured`),
+/// and each names the verdict judging each peer.
+fn assert_detectors_measured(measured: bool, detectors: &[DetectorReading]) {
+  assert!(
+    measured,
+    "every node's detector measured its lateness: {detectors:?}"
+  );
   for (detector, granularity) in detectors.iter().flatten() {
     assert!(
       detector
@@ -6479,20 +6496,28 @@ fn a_nodes_status_reports_each_record_session_with_its_congestion_state() {
     3,
     "every node reported its detector"
   );
-  assert!(
-    served,
-    "every node reports a session a peer dialed to it, with a window and a round trip: {served_last:?}"
-  );
-  assert!(
-    reported,
-    "every node reports a session to each peer with a window and a round trip: {last:?}"
-  );
-  for session in last.iter().flatten() {
-    assert!(
-      session.pto_ns > session.smoothed_rtt_ns,
-      "the probe timeout is above the smoothed round trip: {session:?}"
-    );
-  }
+}
+
+/// Each node's detector report and its measured lateness once every node has measured it, and whether every one did
+/// within the formation deadline. Status reports the lateness as zero until the detector has measured it, so it is
+/// polled for as the sessions are: one read right after formation found it unmeasured on a loaded Mac (2026-10-10,
+/// "the node's lateness is measured: 0"; 6 of 6 green when repeated).
+fn measured_detectors(daemons: &[Daemon], observed: &[&Daemon]) -> (bool, Vec<DetectorReading>) {
+  let detector_of =
+    |daemon: &Daemon| match Client::connect(daemon.instance()).call(&RequestBody::DaemonStatus) {
+      ReplyBody::DaemonStatus { report } => {
+        Some((report.fleet.detector, report.fleet.detector_granularity_ns))
+      }
+      _ => None,
+    };
+  let measured = poll_until(observed, FORMATION_DEADLINE, || {
+    Ok(
+      daemons
+        .iter()
+        .all(|daemon| detector_of(daemon).is_some_and(|(_, granularity)| granularity > 0)),
+    )
+  });
+  (measured, daemons.iter().map(detector_of).collect())
 }
 
 /// A minimal client of a daemon's own rendezvous (as in the other daemon tests): connect and call verbs.
