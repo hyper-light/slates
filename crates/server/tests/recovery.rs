@@ -53,7 +53,8 @@ const AFTER: &[u8] =
   b"the bytes the head holds after the snapshot: golf hotel india juliet kilo lima mike november\n";
 /// Shape: the bytes a clone writes over an inherited file — diverging it out of the origin snapshot's shared records
 /// (A-134 `origin_diverged`): the clone's publication that follows is its whole image, and the origin keeps [`BEFORE`].
-const DIVERGED: &[u8] = b"the bytes the clone diverged an inherited file to: oscar papa quebec romeo sierra tango\n";
+const DIVERGED: &[u8] =
+  b"the bytes the clone diverged an inherited file to: oscar papa quebec romeo sierra tango\n";
 
 /// The product's own deadlines (`Deadlines::derive` over the anchor's liveness budget and the recovery
 /// budget), never a shorter hand-picked reply clock that calls a live daemon stalled

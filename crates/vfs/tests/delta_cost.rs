@@ -361,7 +361,9 @@ fn one_create_snapshotted(upper: usize) -> (usize, usize) {
     .unwrap();
   let (published_calls, record) = counted(|| vol.publication(&store, None).unwrap());
   let slates_vfs::delta::VolumeRecord::Delta { delta } = record else {
-    panic!("a snapshotted volume that only grew its own files publishes a delta, not its whole image");
+    panic!(
+      "a snapshotted volume that only grew its own files publishes a delta, not its whole image"
+    );
   };
   let (replayed_calls, applied) = counted(|| image.apply(&delta));
   applied.unwrap();

@@ -196,3 +196,47 @@ accept-side handshakes.
   thread with no shard round-trip, so an observer distinguishes a shard that is stepping-but-slow from one
   parked-with-no-kick or held in a long poll — the instrument a stall diagnosis needs when the shard will
   not answer a query.
+
+## Part 6 — the detection budget D, the least bound, and F (hyper-raft measurement, 2026-10-11)
+
+Cross-session measurement from the hyper-raft agent (its `docs/benchmarks.md`, last section, `main` at `cddcc47`;
+rerun `cargo test -p hyper-swim --test sim --release -- --ignored --nocapture record_detection_budget` against the
+vendored `hyper-swim` `Detector`, unchanged since `67f038d`). It measured what the detector's budget D can promise
+against the probe period and the condemnation cost — the evidence slates needs to set **F**, its detection→failover
+window (`crates/cluster/src/member_plane.rs` sets the per-pair budget as the detector's `promise_ns`; `root_group.rs`
+owns the failover/condemnation). Fleets: LAN-5, LAN-3, and a far link of 6 (2 near, 4 at 100 ms one way); budgets none/
+900 ms/10 s; condemnation costs none and 1 s…1,000 s by decades; 16 seeds. Every run held **no live member dead** and
+every survivor stayed within its stated bound.
+
+Worst-over-seeds **least detection bound** (= `2(2m−1)+1` periods — 15 for 5 members, 7 for 3 — each at its longest
+unanswered length: the direct span plus the relay stage):
+
+| Fleet | Cost none | 1 s | 10 s | 100 s | 1,000 s |
+|---|---|---|---|---|---|
+| LAN-5 | 1.84 s | 25.5 s | 37.9 s | 70.9 s | 150 s |
+| LAN-3 | 0.85–0.96 s | 9.0 s | 20.2 s | — | — |
+| far link, 6 | 14.5 s | — | 18.2 s | — | — |
+
+What it means for slates:
+1. **The budget floor only stretches judged periods** — it never holds a live member dead. On LAN-5, probes fall
+   29.5/s → 17/s at D=900 ms → 1.5/s at D=10 s. So D is a CPU/battery lever as well as a latency one.
+2. **D is a promise only when D ≥ least_detection_bound.** Keep running at `max(D, least_detection_bound)` and report
+   `D < least` as **infeasible** (recommendation a — slates' plan; `promise_ns` is a placeholder today). At cost 0,
+   D=900 ms is not a promise on LAN-5 (bound 1.84 s, though every seed met it); on LAN-3 the bound is 0.93 s and one
+   seed took 1.03 s.
+3. **The condemnation cost sets the bound** — a verdict that may condemn must be surer the more a false condemnation
+   costs, so the margin widens ~10× at a 1 s cost and the bound grows ~14× on LAN-5. Realized detection stays far
+   below the bound (the "detected" column runs 3–8× under it), so for *typical* failover use the realized figure, not
+   the bound.
+4. **Detection is measured to the condemnation**, which waits — after the budget's periods — for an answer from
+   another member (the evidence the condemning member's own network works). The stated bound counts that wait; the
+   budget does not, so leave room for it in D.
+
+**Owed — a call for Ada (not a defect; by design).** With `D = F − confirmation` and F's placeholder of 10 s: LAN-5
+keeps 10 s only at cost 0 (bound 1.9 s; at a 1 s cost the bound is 13.8–25 s); LAN-3 keeps it up to ~1 s cost (bound
+9 s). Once slates states the takeover's **measured** condemnation cost, F must be set knowing these numbers — the
+trade-off is false-condemnation risk against detection time, Ada's to weigh. No slates code changes now: `hyper-swim`
+needs none; a `promise_ns` on the `Ack` request is a wire change to the shared codec that still waits on the owner's
+call; and `main` at `506c059` (focal transport + hyper-rt) touches none of the four vendored crates, so nothing to
+re-vendor (the hyper-raft agent re-vendors). If slates ever adopts hyper-rt's blocking pool: `Share::new(name, limit)`
+is a share with no line (refused at once past its places); `waiting: N` gives it a line of N.
