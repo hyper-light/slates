@@ -3886,9 +3886,10 @@ version.
 > forever, and a forwarded read answered false `NotFound`. Now `materialize` builds a **head-only** entry from the
 > adopted head and catalog registers (no archive: `materialize_taken_over` takes `Option<&Archive>` and skips the
 > restore), identical to a fresh scratch `Create`. A 1024-volume takeover reproduction served both ends at ~24/33
-> periods (was: never served, 1024 dropped); the crash-at-every-step recovery oracle is 39/0. A small transient
-> false `NotFound` remains in the settle window before the successor processes the retirement (a pre-existing
-> ownership-propagation race, now visible — open). `docs/bugs/2026-10-11-taken-over-scratch-volumes-never-become-servable.md`.
+> periods (was: never served, 1024 dropped); the crash-at-every-step recovery oracle is 39/0. A transient false
+> `NotFound` in the settle window before the successor processes the retirement was fixed in the same pass: `find`
+> answers a retryable `Overloaded` for an object this node holds a copy of (a recovery candidate), never `NotFound`
+> for an object that exists. `docs/bugs/2026-10-11-taken-over-scratch-volumes-never-become-servable.md`.
 
 > **Owner location (2026-09-17).** A foreign node cannot reconstruct a historic copyset from
 > present membership. After its creator route stops being usable, it asks authenticated

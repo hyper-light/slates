@@ -112,15 +112,21 @@ pre-existing ownership-propagation race, revealed — not caused — by this fix
   the head-only materialization is recovery-correct.
 - The temporary `fleet.materialize.head_only_dropped` counter was removed with the fix (the branch no longer drops).
 
-## Bug 1 (open) — transient false `NotFound` in the settle window
+## Bug 1 (fixed 2026-10-11) — transient false `NotFound` in the settle window
 
 A client reading a taken-over object in the window between the retirement committing and the successor processing
-it (`resolve_held_objects`) can get `NotFound` for an object that exists. The fix is to not answer `NotFound` for
-an object this node holds a copy of or is a recovery successor for (`holder_records`/the retirement's lineage) —
-return a retryable `Overloaded`/`OwnerUnreachable` instead. To be root-caused and fixed next; the gate's
-`not_found == 0` assertion lands with it.
+it (`resolve_held_objects`) got `NotFound` for an object that exists: a forwarded request is handled locally by the
+forward target (never re-forwarded), which runs `find()`; in the gap the object is not in its catalog and
+`object_owner` is not yet `local`, so `owned_unmaterialized` returns `None` and `find()` answered `NotFound`.
+
+**Fix** (`crates/server/src/verbs.rs::find`): when `by_id` lacks the volume but this node **holds a copy**
+(`holder_records`), answer a retryable `Overloaded` rather than `NotFound` — holding a copy is evidence the object
+exists (it is a recovery candidate mid-takeover), so a read is retried, never told the volume is gone. Universal
+(every verb looks up through `find`) and principled (do not claim absence for an object you hold). After: the
+1024-volume reproduction reads **0** `NotFound` (was 0–4 transient); both ends serve at ~21/28 periods; the gate's
+`not_found == 0` assertion is restored.
 
 ## Status
 
-**Bug 2 FIXED 2026-10-11** (taken-over scratch volumes are servable). **Bug 1 OPEN** (transient settle-window false
-`NotFound`, pre-existing, now visible).
+**Bug 2 and Bug 1 both FIXED 2026-10-11.** Taken-over scratch volumes are servable, and no existing object answers
+false `NotFound` during takeover, even transiently.

@@ -3917,10 +3917,22 @@ pub(crate) fn find(
   volume: VolumeId,
 ) -> Result<(Handle<VolumeSlot>, VolumeRecord), Box<ReplyBody>> {
   let id = to_db_volume(volume);
-  let handle = *state
-    .by_id
-    .get(&id)
-    .ok_or_else(|| Box::new(refused(Refusal::NotFound)))?;
+  let handle = *state.by_id.get(&id).ok_or_else(|| {
+    // An object this node holds a copy of (a recovery candidate) but has not yet materialized is NOT absent:
+    // answer a retryable `Overloaded`, never `NotFound`, so a read in the takeover settle window — before this
+    // node has processed the retirement and recognized its ownership (`resolve_held_objects`) — is retried, not
+    // told the volume is gone (Bug 1, docs/bugs/2026-10-11-taken-over-scratch-volumes-never-become-servable.md).
+    if state.holder_records.contains_key(&ObjectId(volume.bytes)) {
+      let shard = state
+        .shards
+        .get(usize::from(owner_of(volume)))
+        .copied()
+        .unwrap_or(state.shard);
+      Box::new(refused(Refusal::Overloaded { shard }))
+    } else {
+      Box::new(refused(Refusal::NotFound))
+    }
+  })?;
   let record = state
     .db
     .partition()

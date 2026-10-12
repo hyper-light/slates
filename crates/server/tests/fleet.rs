@@ -7178,21 +7178,22 @@ fn takeover_periods_scale_with_the_retired_hosts_object_count() {
 }
 
 /// Regression (§4.8 "Promotion and takeover"; `docs/bugs/2026-10-11-taken-over-scratch-volumes-never-become-servable.md`):
-/// **a taken-over contentless (scratch) volume must become servable.** Provisions many scratch volumes on A, kills
-/// A, then from a client on the successor reads a low-id and a high-id object (first and last in `list_page`'s
-/// object-id order) with one-period backoff until each is served, classifying every reply. Before the fix,
-/// `materialize_pending` dropped every `manifest=None` volume without building its db catalog entry, so the owner
-/// answered `Overloaded` forever (`owned_unmaterialized`) and a forwarded read answered false `NotFound`; the
-/// counters (`fleet.materialize.head_only_dropped` = the volume count, `route_dropped.refused` ≈ `NotFound`) pinned
-/// it. It also reports a residual transient `NotFound` in the early settle window (Bug 1, open). Kept `#[ignore]`
-/// because fleet tests must run alone and this one provisions 1024 volumes (~70 s); run it with
-/// `cargo test --release -p slates-server --test fleet a_taken_over_scratch_volume -- --ignored --nocapture`.
+/// **a taken-over contentless (scratch) volume must become servable, and a taken-over object that exists must never
+/// answer `NotFound`.** Provisions many scratch volumes on A, kills A, then from a client on the successor reads a
+/// low-id and a high-id object (first and last in `list_page`'s object-id order) with one-period backoff until each
+/// is served, classifying every reply. Before the fixes, `materialize_pending` dropped every `manifest=None` volume
+/// without building its db catalog entry, so the owner answered `Overloaded` forever (`owned_unmaterialized`) and a
+/// forwarded read answered false `NotFound` (Bug 2); the counters (`fleet.materialize.head_only_dropped` = the
+/// volume count, `route_dropped.refused` ≈ `NotFound`) pinned it. A residual transient `NotFound` in the settle
+/// window (Bug 1) was then fixed by `find` answering retryable `Overloaded` for an object this node holds a copy
+/// of. Kept `#[ignore]` because fleet tests must run alone and this one provisions 1024 volumes (~70 s); run it
+/// with `cargo test --release -p slates-server --test fleet a_taken_over_scratch_volume -- --ignored --nocapture`.
 #[test]
 #[ignore = "heavy fleet regression (1024-volume takeover); run alone"]
 // One end-to-end takeover scenario (setup, provision, kill, read-until-served, diagnose): splitting the body would
 // scatter the scenario, so the cognitive-complexity threshold is allowed for this test.
 #[allow(clippy::cognitive_complexity)]
-fn a_taken_over_scratch_volume_becomes_servable() {
+fn a_taken_over_scratch_volume_becomes_servable_and_never_answers_notfound() {
   const VOLUMES: usize = 1024;
   let _serial = serialize_fleet_tests();
   let names = ["a", "b", "c"];
@@ -7338,21 +7339,20 @@ fn a_taken_over_scratch_volume_becomes_servable() {
     "recovering-object read: {VOLUMES} volumes | NotFound replies: {not_found} | \
      served low {served_low:?} / high {served_high:?} periods (window {window}) | refusals {refusals:?}{diagnosis}"
   );
-  // The invariant this gate asserts (the fix for Bug 2,
-  // docs/bugs/2026-10-11-taken-over-scratch-volumes-never-become-servable.md): a taken-over scratch (contentless)
-  // volume must become servable. Before the fix, every scratch volume was dropped from materialization, so the
-  // owner answered `Overloaded` forever and the volume was a lost object; now both ends serve (~24/33 periods).
+  // The two invariants this gate asserts (docs/bugs/2026-10-11-taken-over-scratch-volumes-never-become-servable.md):
+  // Bug 2 — a taken-over scratch (contentless) volume must become servable (was dropped from materialization,
+  // `Overloaded` forever, a lost object); Bug 1 — a taken-over object that exists must NEVER answer `NotFound`,
+  // even transiently in the settle window before the successor processes the retirement (`find` now answers a
+  // retryable `Overloaded` for an object this node holds a copy of). Now both ends serve (~21/28 periods) and no
+  // read is ever told the volume is gone.
   assert!(
     served_low.is_some() && served_high.is_some(),
     "taken-over scratch volumes must become servable (low {served_low:?}, high {served_high:?})"
   );
-  // `not_found` is reported, not yet asserted zero: a small, transient false `NotFound` remains in the early
-  // takeover window (before the successor processes the retirement — `resolve_held_objects` — and so cannot yet
-  // answer "mine, retrying"). That is Bug 1 in the bug doc, a pre-existing ownership-propagation race revealed by
-  // this fix; the `not_found == 0` assertion lands with its fix.
-  if not_found > 0 {
-    eprintln!("note: {not_found} transient NotFound replies in the settle window (Bug 1, open)");
-  }
+  assert_eq!(
+    not_found, 0,
+    "a taken-over object that exists must never answer NotFound (got {not_found})"
+  );
 }
 
 /// AC (§4.8 "Promotion and takeover", one batched phase-one round across the neighbourhood): **five** daemons
