@@ -1,9 +1,11 @@
 # Vendored hyper-raft crates
 
 The crates slates shares with focal and mantle (`../hyper-raft`, github.com/hyper-light/hyper-raft), taken as a
-snapshot at one revision whose CI is green on all six targets (`SNAPSHOT`: hyper-raft `67f038d`, 2026-10-10, PR #17,
-green on all six targets, Miri, the TLC models and the explorer). hyper-swim's source and `ORIGIN.md` changed from
-`5d68252` (its items 14 to 20): the owner's detection budget floors a judged period and is re-derived at run time
+snapshot at one revision whose CI is green on all six targets (`SNAPSHOT`: hyper-raft `aa82ada`, 2026-10-12, green on
+all six targets, Miri, the TLC models and the explorer: the revision mantle and focal re-vendor to as well). The four
+crates' sources and `ORIGIN.md` are those of `67f038d` (2026-10-10, PR #17), unchanged upstream since. At `67f038d`,
+hyper-swim's source and `ORIGIN.md` changed from `5d68252` (its items 14 to 20): the owner's detection budget floors a
+judged period and is re-derived at run time
 (`set_detection_budget`, `least_detection_bound`); a verdict's margin is searched over every margin and a false
 condemnation priced (`set_condemnation_cost`); a pair's fit to the pool follows its latest evidence; a death counts
 once it stands; every probe is judged, by its pair's RFC 6298 timer until an estimator judges it; a relay judges its
