@@ -5315,3 +5315,26 @@ a 64-file volume. End-to-end recovery: `crates/server/tests/recovery.rs::acknowl
 now also creates a file after the snapshot and confirms it (a delta) survives the restart alongside the diverge-the-head
 whole-image case. With overlay (A-134) and clone deltas, **all three volume shapes are now O(delta) per op**, whole-image
 only on a shared→private divergence. Condition 2's write-path delta optimization is complete.
+
+### Measured-and-rejected: draining many pages per period does not speed takeover recovery (2026-10-11)
+
+Hypothesis: `crates/server/src/takeover.rs::list_page` fixes each recovery page at `page_budget()` (the initial
+receive window, ~55 objects) and `drive_host_takeover` asks one page per member per 100 ms coordinator period, so a
+large retired host recovers in O(N) periods — "minutes for a very large host." Implemented a bounded drain loop
+(`drive_host_takeover` pulls pages until the host is drained or one period elapses, via an extracted
+`next_page_requests` that advances the round without re-promising local copies; each page stays one-flight-sized).
+
+**Rejected — the A/B is dead-even.** Periods-to-recover (in-process 3-node fleet, kill the owner, measure
+`Daemon::fleet_progress` periods to the last-id object placed; `takeover_periods_scale`, this M-series box):
+
+| retired host | before (one page/period) | after (drain loop) |
+|---|---|---|
+| 1,024 volumes | 20 periods | 18 |
+| 4,096 volumes | 34 periods | 33 |
+
+A fixed ~1–2-period saving that **shrinks** with N — so recovery is **not paging-bound**. The ~18-period floor is
+the required safety horizons (AUD-08 owner lease + SWIM detection, each ~900 ms ≈ 9 periods, correctness-required),
+and the part that grows with N is the **O(N) required adopt + materialize** per object, not the paging. The
+"slow paging" premise was wrong; the loop was reverted (the recovery oracle stayed 39/0 and the servable/`NotFound`
+gate read 0 `NotFound` throughout, so the loop was *correct* — just not a win). Recovery of realistic hosts is ~2 s
+(1,024 volumes), dominated by the horizons and per-object work, neither a cheap lever.
