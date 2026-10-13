@@ -458,3 +458,52 @@ pub fn reply_bytes(xid: u32, status: AcceptStatus, results: &[u8]) -> Vec<u8> {
   }
   out
 }
+
+#[cfg(test)]
+mod tests {
+  #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+  use super::*;
+  use crate::xdr::XdrWriter;
+
+  /// Builds an `authsys_parms` body (RFC 5531): stamp, machinename, uid, gid, the *claimed* gid count, then the
+  /// gids actually present (which may be fewer than the claim — a hostile credential).
+  fn authsys_parms(uid: u32, gid: u32, claimed: u32, gids: &[u32]) -> Vec<u8> {
+    let mut w = XdrWriter::new();
+    w.u32(0); // stamp
+    w.opaque(b"host"); // machinename
+    w.u32(uid);
+    w.u32(gid);
+    w.u32(claimed); // the count the credential claims — a hostile one lies
+    for gid in gids {
+      w.u32(*gid);
+    }
+    w.into_bytes()
+  }
+
+  /// §4.13 hostile input (RFC 5531: `AUTH_SYS` supplementary groups are bounded at sixteen). A credential
+  /// claiming a colossal group count is refused before any allocation — never a four-billion-entry `Vec`, an OOM
+  /// or a panic — and the bound is exact (17 is refused, 16 accepted); a well-formed credential decodes.
+  #[test]
+  fn a_colossal_auth_sys_gid_count_is_refused_before_allocating() {
+    // Claims u32::MAX groups but carries none: the count check refuses it before `Vec::with_capacity`.
+    assert!(
+      parse_authsys_parms(&authsys_parms(1000, 100, u32::MAX, &[])).is_none(),
+      "a colossal claimed gid count is refused, not allocated"
+    );
+    // The bound is exact.
+    assert!(
+      parse_authsys_parms(&authsys_parms(1000, 100, 17, &[7; 17])).is_none(),
+      "17 groups (past the 16 bound) is refused"
+    );
+    let at_bound = parse_authsys_parms(&authsys_parms(1000, 100, 16, &[7; 16]))
+      .expect("16 groups (at the bound) decodes");
+    assert_eq!(at_bound.groups.supplementary.len(), 16);
+    // A well-formed small credential decodes to its identity.
+    let id = parse_authsys_parms(&authsys_parms(1000, 100, 3, &[10, 20, 30]))
+      .expect("a valid credential decodes");
+    assert_eq!(
+      (id.uid, id.groups.gid, id.groups.supplementary.len()),
+      (1000, 100, 3)
+    );
+  }
+}
