@@ -319,6 +319,36 @@ fn a_create_then_unlink_cancels() {
   assert!(doc.paths.paths().is_empty());
 }
 
+/// A work journal naming a path that climbs out of the volume with `..` composes to a document that
+/// carries the key verbatim: the deriver is a pure state delta over path strings and never interprets a
+/// `..` as a walk into a parent (the merge service keys a path by only trimming a leading slash,
+/// `merge_service::canonical_path`, so a `..` reaches the deriver intact). The containment that keeps such
+/// a key from ever reaching disk outside a landing's target is the host seam's, proven on a real directory
+/// by `slates-land`'s `a_landing_component_never_steps_out_of_the_target`. Here the deriver's half is
+/// pinned: the climbing path stays one opaque key and does not alias the sibling `escape` that a resolved
+/// `..` would reach, so a green holds it inertly rather than resolving it.
+#[test]
+fn a_climbing_path_is_an_inert_key_not_a_resolved_parent() {
+  let doc = derive(
+    &[],
+    &[VolumeOp::Create {
+      path: "../escape".to_owned(),
+    }],
+  )
+  .expect("a climbing path composes to a document");
+  assert_eq!(doc.ops.len(), 1);
+  assert_eq!(doc.paths.path(doc.ops[0].path), Some("../escape"));
+  // It is not the sibling `escape` that interpreting `..` would resolve to.
+  let sibling = derive(
+    &[],
+    &[VolumeOp::Create {
+      path: "escape".to_owned(),
+    }],
+  )
+  .expect("valid");
+  assert_eq!(sibling.paths.path(sibling.ops[0].path), Some("escape"));
+}
+
 /// Unlinking a base file is one `Unlink`.
 #[test]
 fn unlinking_a_base_file_is_one_unlink() {

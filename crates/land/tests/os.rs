@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 use slates_land::engine::{Degradation, LandingState, Outcome};
 use slates_land::os::{OsLand, TargetRefusal};
 use slates_vfs::base::BaseConfig;
-use slates_vfs::host::HostFs;
+use slates_vfs::host::{HostError, HostFs, LandFs};
 use slates_vfs::volume::{Store, Volume};
 
 mod common;
@@ -237,6 +237,42 @@ fn a_target_path_that_escapes_is_refused() {
     OsLand::open_target(&ws.path.join("alias/child")).err(),
     Some(TargetRefusal::EscapesTarget)
   );
+}
+
+/// Containment *during* a landing, not only of the target root (`a_target_path_that_escapes_is_refused`
+/// covers the root the human names). The engine resolves every manifest entry's path one component at a
+/// time through the host's `open_dir` (`engine::open_dir_path`, which splits on the last separator and
+/// opens each component), so a component that would leave the target is refused at that seam. The merge
+/// service keys a path by only trimming a leading slash (`merge_service::canonical_path`), never rejecting
+/// a `..`, so a green could hold an entry keyed `"../escape"`; the containment that makes such a key
+/// harmless is the host seam's, proven here on a real directory. Every traversal seam the landing walk
+/// steps through refuses `..` (the parent that holds the secret), `.`, and an embedded separator as a
+/// single component, and the leaf write seam refuses `..` too, so the directory beside the target keeps
+/// its file and its bytes and gains no entry — the landing opens, creates and writes only beneath the
+/// target it was granted (R1, §4.15 containment).
+#[test]
+fn a_landing_component_never_steps_out_of_the_target() {
+  let ram = build_output();
+  let ws = Workspace::new(&ram, "contain");
+  seed_dir(&ws.path.join("target"));
+  seed_file(&ws.path.join("SECRET"), b"outside the target");
+  let (mut host, target) = OsLand::open_target(&ws.path.join("target")).unwrap();
+  let root = target.dir;
+  // The one seam the landing walk steps through refuses every component that would leave the target.
+  assert_eq!(host.open_dir(root, "..").err(), Some(HostError::NotFound), "open_dir ..");
+  assert_eq!(host.open_dir(root, ".").err(), Some(HostError::NotFound), "open_dir .");
+  assert_eq!(
+    host.open_dir(root, "mid/escape").err(),
+    Some(HostError::NotFound),
+    "open_dir embedded separator"
+  );
+  assert_eq!(host.open_file(root, "..").err(), Some(HostError::NotFound), "open_file ..");
+  // The leaf write seam never creates in the parent either: `..` already exists, so an exclusive
+  // create of it is refused rather than reaching outside.
+  assert!(host.create_temp(root, "..").is_err(), "create_temp ..");
+  // Beside the target: the secret keeps its bytes and the parent gained no entry (only SECRET and target).
+  assert_eq!(read(&ws.path.join("SECRET")).unwrap(), b"outside the target");
+  assert_eq!(names_in(&ws.path).len(), 2, "{:?}", names_in(&ws.path));
 }
 
 /// AC-1.10 / R1: a scratch landing preserves the real target directory and writes its tree
