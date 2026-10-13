@@ -890,6 +890,63 @@ fn assert_land(server: &mut McpServer) {
   );
 }
 
+/// R10, the real run: `slates.land.materialize` over MCP only *plans* a landing — it never writes the host disk
+/// without a human grant, not even when the agent writes real content and sneaks a `grant` argument. The target
+/// is a real, writable, empty host directory (under `CARGO_TARGET_TMPDIR`); after the call it is still empty, and
+/// the tool answered `grant_required`. This is the agent-surface half of R10: the grant is a human-only CLI act,
+/// and no MCP argument can forge one (`land_materialize` hardcodes no grant).
+// The test is the outsider: it reads a real host directory to confirm slates wrote nothing there (R1). The
+// crate under test touches no disk — exactly what this asserts — so `std::fs` here is the observer, not slates.
+#[allow(clippy::disallowed_methods)]
+fn assert_materialize_never_writes_without_a_grant(server: &mut McpServer) {
+  let volume = call(
+    server,
+    "slates.volume.create",
+    json!({ "name": "r10", "bounded": 1u64 << 20 }),
+  )["volume"]
+    .as_str()
+    .unwrap()
+    .to_owned();
+  let writer = call(
+    server,
+    "slates.attach.attach",
+    json!({ "volume": volume, "write": true }),
+  )["attachment"]
+    .as_u64()
+    .unwrap();
+  call(
+    server,
+    "slates.fs.write",
+    json!({ "volume": volume, "attachment": writer, "path": "escape.txt", "text": "must not reach disk without a grant\n" }),
+  );
+
+  let target = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+    .join(format!("slates-r10-{}", std::process::id()));
+  let _ = std::fs::remove_dir_all(&target);
+  std::fs::create_dir(&target).unwrap();
+
+  // The agent tries to force the write by sneaking a `grant`; the tool reads no such argument and plans only.
+  let structured = call(
+    server,
+    "slates.land.materialize",
+    json!({
+      "volume": volume,
+      "target": target.to_str().unwrap(),
+      "grant": "0123456789abcdef0123456789abcdef",
+    }),
+  );
+  assert_eq!(
+    structured["grant_required"], true,
+    "materialize over MCP only plans a landing: {structured}"
+  );
+  let wrote = std::fs::read_dir(&target).unwrap().count();
+  assert_eq!(
+    wrote, 0,
+    "no bytes reached the host disk without a grant — the target is still empty"
+  );
+  let _ = std::fs::remove_dir_all(&target);
+}
+
 /// Malformed calls are typed JSON-RPC errors, not panics: an unknown tool, a bad volume id, and an
 /// unknown method.
 fn assert_malformed(server: &mut McpServer) {
@@ -1009,6 +1066,7 @@ fn the_mcp_surface_serves_the_tools() {
   assert_files_change_through_mcp(&mut server);
   assert_attach_base(&mut server);
   assert_land(&mut server);
+  assert_materialize_never_writes_without_a_grant(&mut server);
   assert_malformed(&mut server);
   assert_http_transport(&profile, &instance);
 
