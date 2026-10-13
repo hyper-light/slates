@@ -26,6 +26,7 @@ use slates_land::os::{OsLand, TargetRefusal};
 use slates_vfs::base::BaseConfig;
 use slates_vfs::host::{HostError, HostFs, LandFs};
 use slates_vfs::volume::{Store, Volume};
+use slates_vfs::xattr::XattrSet;
 
 mod common;
 use common::{
@@ -470,6 +471,87 @@ fn a_landed_setuid_file_is_owned_by_the_daemon_never_the_recorded_root() {
     0o4755,
     "the setuid file landed {:o}, not 04755 (A-94: the bit lands as recorded)",
     meta.mode() & 0o7777
+  );
+}
+
+/// A landing materializes no extended attribute, so a file an agent marks with `security.capability` (a Linux
+/// file capability) reaches the human's disk carrying no such attribute — the capability analog of the setuid
+/// guard above. The volume is a faithful byte store and holds any attribute name (`check_name` filters only NUL
+/// and length, never the `security`/`trusted`/`system` namespaces, as it should for an in-memory store); the
+/// host-safety boundary is the landing, whose write seam (`HostFs`) has no set-xattr verb and whose landing
+/// manifest carries no attribute, so every one is dropped. Without this, a future "xattr fidelity" verb added to
+/// `land` would turn a recorded `security.capability = cap_setuid+ep` into a real file capability on a binary an
+/// agent planted — privilege on the host from inside the sandbox, exactly the shape of CVE-2023-0386's capability
+/// cousins. Do: write a file, set `security.capability` on it in the volume (asserting the volume holds it), land
+/// it, read the disk file back. Expect: the file's bytes land (non-vacuity: the landing ran to completion), and
+/// `security.capability` is absent on disk (reading it fails: no such attribute).
+#[test]
+fn a_landing_never_materializes_a_security_capability_xattr() {
+  let ram = build_output();
+  let ws = Workspace::new(&ram, "capxattr");
+  seed_dir(&ws.path.join("out"));
+  let (mut host, target) = OsLand::open_target(&ws.path.join("out")).unwrap();
+  let mut store = store();
+  let mut vol = scratch(&mut store);
+
+  // A real binary an agent would plant, then mark with a Linux file capability.
+  write_file(&mut vol, &mut host, &mut store, "/exploit", b"#!/bin/sh\nid\n");
+  let no = {
+    let (dir, name) = common::split("/exploit");
+    let d = common::dir_of(&mut vol, &mut host, &mut store, dir);
+    vol.with_host(&mut host)
+      .lookup(&mut store, d, name)
+      .unwrap()
+      .inode
+  };
+  // VFS_CAP_DATA for cap_setuid, effective: revision-2 magic with the effective flag, CAP_SETUID (bit 7) in the
+  // permitted set. The exact bits are immaterial to the guard — the point is this attribute never reaches disk.
+  let cap_name: &[u8] = b"security.capability";
+  let cap_value: [u8; 20] = [
+    0x00, 0x80, 0x00, 0x02, // magic_etc: VFS_CAP_REVISION_2 | VFS_CAP_FLAGS_EFFECTIVE (little-endian)
+    0x80, 0x00, 0x00, 0x00, // permitted[0]: CAP_SETUID (bit 7)
+    0x80, 0x00, 0x00, 0x00, // inheritable[0]: CAP_SETUID (bit 7)
+    0x00, 0x00, 0x00, 0x00, // permitted[1]
+    0x00, 0x00, 0x00, 0x00, // inheritable[1]
+  ];
+  vol
+    .xattr_set(&mut store, no, cap_name, &cap_value, XattrSet::Create)
+    .unwrap();
+  // Non-vacuity: the volume really holds the attribute, so "absent on disk" means the landing dropped it.
+  assert!(
+    vol
+      .xattr_names(&store, no)
+      .unwrap()
+      .iter()
+      .any(|n| &**n == cap_name),
+    "the volume must hold security.capability before landing, or the disk check is vacuous"
+  );
+
+  let mut session = Session::new();
+  let mut setup = Setup {
+    host: &mut host,
+    target: &target,
+    vol: &mut vol,
+    store: &mut store,
+    session: &mut session,
+  };
+  let report = setup.land(request(2)).unwrap();
+  assert_eq!(report.state, LandingState::Done, "{report:?}");
+
+  let landed = ws.path.join("out").join("exploit");
+  // Non-vacuity: the file itself landed with its bytes — the landing ran, so an absent attribute is a drop,
+  // not a failed landing.
+  #[allow(clippy::disallowed_methods)] // the test's own landed file, read back
+  let bytes = std::fs::read(&landed).unwrap();
+  assert_eq!(bytes, b"#!/bin/sh\nid\n", "the planted file did not land");
+
+  // The escalation boundary: the landed file carries no security.capability — reading the attribute fails (no
+  // such attribute) because the landing materialized no extended attribute at all.
+  let mut buf = [0u8; 64];
+  let read = rustix::fs::getxattr(&landed, "security.capability", &mut buf[..]);
+  assert!(
+    read.is_err(),
+    "security.capability reached the disk ({read:?}) — a file capability landed from inside the sandbox"
   );
 }
 
