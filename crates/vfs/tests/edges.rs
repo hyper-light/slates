@@ -547,3 +547,61 @@ fn a_symlink_cannot_name_an_absolute_host_path_cve_2026_47243() {
     "an absolute-path target is a stored RAM string (no host write without a grant), read back verbatim"
   );
 }
+
+/// A symlink inode answers only `readlink` — reading, writing, or seeking it as file content is refused `Invalid`
+/// (POSIX `EINVAL`), like a directory and an IPC name beside it in the content paths. Found by attacking: before
+/// this, `read` of a symlink's number returned its target bytes as if they were a file's content, and `write`
+/// returned `Ok(n)` while silently dropping the bytes — the body is a target string, not a content body, so the
+/// write was a no-op that still charged quota and lied about success. The kernel follows a symlink, but an SDK or
+/// a crafted FUSE/NFS op can name its inode directly. Do: make a symlink; read, write, and seek it; then a regular
+/// file. Expect: every symlink content op refused `Invalid`, the target unchanged and still readable through
+/// `readlink`; the regular file's read and write still work (non-vacuity — the refusal is symlink-specific).
+#[test]
+fn a_symlink_answers_only_readlink_not_file_content() {
+  let mut store = store();
+  let mut vol = volume(&mut store, 1 << 20);
+  let root = vol.root_inode(&store).unwrap();
+  let link = vol.symlink_no(&mut store, root, "l", "the-target").unwrap();
+  let mut buf = [0u8; 16];
+
+  assert_eq!(
+    vol.read(&store, link, 0, &mut buf),
+    Err(VfsError::Invalid),
+    "a read of a symlink's number must be EINVAL, never its target returned as file content"
+  );
+  assert_eq!(
+    vol.write(&mut store, link, 0, b"overwrite"),
+    Err(VfsError::Invalid),
+    "a write of a symlink's number must be EINVAL, never a no-op that charges quota and lies Ok"
+  );
+  assert_eq!(
+    vol.seek(&store, link, 0, slates_vfs::volume::Seek::Data),
+    Err(VfsError::Invalid),
+    "a seek of a symlink's number must be EINVAL"
+  );
+  assert_eq!(
+    vol.truncate(&mut store, link, 100),
+    Err(VfsError::Invalid),
+    "a truncate of a symlink's number must be EINVAL, never a no-op that lies Ok"
+  );
+  assert_eq!(
+    vol.admit_allocation(&mut store, link, 0, 100),
+    Err(VfsError::Invalid),
+    "an allocation of a symlink's number must be EINVAL (the match's _ => Ok formerly admitted it)"
+  );
+  assert_eq!(
+    vol.edit(&mut store, link, 0, 0, b"x"),
+    Err(VfsError::Invalid),
+    "an SDK edit of a symlink's number must be EINVAL, refused at the kind check not a later offset check"
+  );
+  assert_eq!(
+    &*vol.readlink(&store, link).unwrap(),
+    "the-target",
+    "the target is unchanged and still reachable through readlink, the symlink's one read"
+  );
+
+  // Non-vacuity: a regular file still reads and writes — the refusal is symlink-specific, not a blanket break.
+  let file = vol.create_file_no(&mut store, root, "f", 0o644).unwrap();
+  assert_eq!(vol.write(&mut store, file, 0, b"hello").unwrap(), 5);
+  assert_eq!(vol.read(&store, file, 0, &mut buf).unwrap(), 5);
+}

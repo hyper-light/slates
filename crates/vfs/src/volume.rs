@@ -1377,6 +1377,13 @@ impl Volume {
     if inode.kind == Kind::Dir {
       return Err(VfsError::IsDirectory);
     }
+    // A symlink is reached through `readlink`, never read or sought as file content (POSIX: `read(2)`/`lseek(2)`
+    // on a symlink is `EINVAL`), refused like a directory and an IPC name above, so a crafted operation on a
+    // symlink's number can never read its target as bytes or seek within it. An attribute inode is `Kind::File`,
+    // so this never fires for the xattr-value read this body also serves.
+    if inode.kind == Kind::Symlink {
+      return Err(VfsError::Invalid);
+    }
     let size = inode.attrs.size;
     if off >= size {
       return Ok(0);
@@ -1445,6 +1452,13 @@ impl Volume {
     }
     if inode.kind == Kind::Dir {
       return Err(VfsError::IsDirectory);
+    }
+    // A symlink is reached through `readlink`, never read or sought as file content (POSIX: `read(2)`/`lseek(2)`
+    // on a symlink is `EINVAL`), refused like a directory and an IPC name above, so a crafted operation on a
+    // symlink's number can never read its target as bytes or seek within it. An attribute inode is `Kind::File`,
+    // so this never fires for the xattr-value read this body also serves.
+    if inode.kind == Kind::Symlink {
+      return Err(VfsError::Invalid);
     }
     let size = inode.attrs.size;
     if off >= size {
@@ -2152,6 +2166,14 @@ impl Volume {
     if kind == Kind::Dir {
       return Err(VfsError::IsDirectory);
     }
+    // A symlink's target is set by `symlink` and read by `readlink`, never overwritten as file content (POSIX:
+    // `write(2)` on a symlink is `EINVAL`). Refused here, before `write_charge`, so a crafted write to a symlink's
+    // number can neither charge quota for bytes it silently drops (the body is a `Box<str>`, not a content body,
+    // so the write was a no-op that still returned `Ok`) nor corrupt the target. An attribute value is written on
+    // a `Kind::File` attribute inode (the unrecorded path), so this never fires for it.
+    if kind == Kind::Symlink {
+      return Err(VfsError::Invalid);
+    }
     if bytes.is_empty() {
       return Ok(0);
     }
@@ -2286,12 +2308,15 @@ impl Volume {
     Ok(())
   }
 
-  /// Refuses an allocation of anything but a regular file, as a write is refused.
+  /// Refuses an allocation of anything but a regular file, as a write is refused: a directory is
+  /// `IsDirectory`, an IPC name `SpecialFileOperation`, and a symlink `Invalid` (POSIX `EINVAL` — a symlink is
+  /// reached through `readlink`, never allocated as content; the `_ => Ok` arm formerly admitted it).
   fn allocatable(&self, store: &Store, no: InodeNo) -> Result<(), VfsError> {
     match self.kind(store, no)? {
+      Kind::File => Ok(()),
       Kind::Dir => Err(VfsError::IsDirectory),
-      kind if kind.is_special() => Err(VfsError::SpecialFileOperation),
-      _ => Ok(()),
+      Kind::Symlink => Err(VfsError::Invalid),
+      Kind::Fifo | Kind::Socket => Err(VfsError::SpecialFileOperation),
     }
   }
 
@@ -2372,6 +2397,12 @@ impl Volume {
     }
     if kind == Kind::Dir {
       return Err(VfsError::IsDirectory);
+    }
+    // A symlink's length is its target's, set by `symlink` and read by `readlink`, never truncated as file
+    // content (POSIX: `ftruncate(2)` on a symlink is `EINVAL`). Refused before any effect, so a crafted truncate
+    // of a symlink's number can neither no-op-succeed (its body is a target string) nor resize it.
+    if kind == Kind::Symlink {
+      return Err(VfsError::Invalid);
     }
     // The windows a truncate cuts away retain their chunks when a snapshot pins them (§4.2
     // retention): secured before anything changes.
@@ -2563,8 +2594,16 @@ impl Volume {
     off: u64,
     buf: &mut [u8],
   ) -> Result<usize, VfsError> {
-    if self.inode_in(store, id, no)?.attribute_of().is_some() {
+    let inode = self.inode_in(store, id, no)?;
+    if inode.attribute_of().is_some() {
       return Err(VfsError::NotFound);
+    }
+    // A symlink is read through `readlink` at a snapshot as at the head, never as file content (POSIX `EINVAL`).
+    // The export serializes a symlink as a file whose bytes are its target through `read_in_body` directly (§4.16
+    // "carried as a file … never at the head"), which this public snapshot read is not — so refuse it here,
+    // leaving that serialization untouched.
+    if inode.kind == Kind::Symlink {
+      return Err(VfsError::Invalid);
     }
     self.read_in_body(store, id, no, off, buf)
   }
@@ -2833,6 +2872,12 @@ impl Volume {
     }
     if self.kind(store, no)? == Kind::Dir {
       return Err(VfsError::IsDirectory);
+    }
+    // A symlink is edited only by replacing it (`symlink`), never spliced as file content (POSIX: an SDK edit of
+    // a symlink is `EINVAL`). Refused explicitly rather than relying on a later body check, which depended on the
+    // offsets, so a crafted edit of a symlink's number is always refused before any effect.
+    if self.kind(store, no)? == Kind::Symlink {
+      return Err(VfsError::Invalid);
     }
     let size = self.inode(store, no)?.attrs.size;
     if at > size {
