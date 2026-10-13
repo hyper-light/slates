@@ -72,3 +72,34 @@ fn rename_into_a_sibling_carries_the_subtree() {
   assert_eq!(v.lookup_no(&store, sib, "a").unwrap().inode, a, "'a' moved under 'sib'");
   assert_eq!(v.lookup_no(&store, a, "b").unwrap().inode, b, "its subtree came along");
 }
+
+/// §4.6 (POSIX `EPERM` "the target is a directory"). A hard link to a *directory* would make the tree a graph
+/// with cycles — the same corruption rename-into-subtree is refused for, reached a different way. slates refuses
+/// it and plants no alias; a hard link to a *file* works (non-vacuity).
+#[test]
+fn a_hard_link_to_a_directory_is_refused() {
+  let mut store = store();
+  let mut v = volume(&mut store, 1 << 20);
+  let root = v.root_inode(&store).unwrap();
+  let dir = v.mkdir_no(&mut store, root, "d", 0o755).unwrap();
+  let file = v.create_file_no(&mut store, root, "f", 0o644).unwrap();
+
+  assert!(
+    v.link_no(&mut store, root, "dir_alias", dir).is_err(),
+    "a hard link to a directory is refused"
+  );
+  assert!(
+    v.lookup_no(&store, root, "dir_alias").is_err(),
+    "no alias was planted for the directory"
+  );
+  // Non-vacuity: a hard link to a file works and names the same inode.
+  assert!(
+    v.link_no(&mut store, root, "f_alias", file).is_ok(),
+    "a hard link to a file works"
+  );
+  assert_eq!(
+    v.lookup_no(&store, root, "f_alias").unwrap().inode,
+    file,
+    "the file alias names the file's inode"
+  );
+}
