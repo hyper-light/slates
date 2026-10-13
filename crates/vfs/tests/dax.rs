@@ -22,7 +22,7 @@
   clippy::indexing_slicing
 )]
 
-use slates_vfs::dax::DAX_PAGE;
+use slates_vfs::dax::{DAX_PAGE, Mapping};
 use slates_vfs::ids::InodeNo;
 use slates_vfs::volume::{Store, Volume};
 
@@ -234,6 +234,67 @@ fn a_guest_cannot_read_across_a_volume_boundary() {
   assert!(
     !raw.contains(&SECRET),
     "the hardware read did not cross the volume boundary"
+  );
+}
+
+/// §4.6, AC-4.12, the tamper-proof-registry requirement (Ada: "no agent could interfere with, fabricate, or tamper
+/// with said registry"). The registry — not the passed `Mapping` struct — is the source of truth: the hardware path
+/// gates every access on `is_live`, an exact-identity membership test. So a mapping the daemon never minted
+/// (fabricated, even onto a victim's live block) and a legitimately-minted one whose fields a caller mutated (here
+/// the read-only attacker flipping `writable` to escalate) are both a different, unregistered identity, hence inert:
+/// the fabricated write never reaches the victim's block and its read is zeros, and the escalated write does not
+/// take effect. In the real device, the guest's page table is daemon-configured and the MMU prevents a fabricated
+/// entry; `is_live` is the daemon's shadow of that, so the model and the hardware agree. (The remaining theoretical
+/// case — forging the *exact* registered tuple — needs unguessable internal state and is closed for good by the
+/// owed daemon-minted opaque mapping-id, GAPS §4.6 step 2.)
+#[test]
+fn a_fabricated_or_tampered_mapping_is_inert() {
+  let mut store = store();
+  let mut attacker = volume(&mut store, 1 << 20);
+  let mut victim = Volume::create(&mut store, clone_config(9)).unwrap();
+  const VICTIM: u8 = 0x5A;
+
+  let fb = file_of(&mut store, &mut victim, "fb", VICTIM, DAX_PAGE);
+  let vm = victim.dax_map_read(&mut store, fb).unwrap();
+  let fa = file_of(&mut store, &mut attacker, "fa", 0x11, DAX_PAGE);
+  let am = attacker.dax_map_read(&mut store, fa).unwrap();
+
+  // Fabricated: a writable mapping onto the victim's live block, never registered.
+  let fabricated = Mapping {
+    inode: am.inode,
+    block: vm.block,
+    file_len: DAX_PAGE,
+    writable: true,
+  };
+  assert!(!store.dax_is_live(&fabricated), "a fabricated mapping is not live");
+  store.dax_write_raw(&fabricated, 0, &[POISON; 64]);
+  let mut got = vec![0u8; 64];
+  victim.read(&store, fb, 0, &mut got).unwrap();
+  assert!(
+    got.iter().all(|&b| b == VICTIM),
+    "the fabricated write never reached the victim's block (got {:?})",
+    &got[..8]
+  );
+  assert!(
+    store.dax_read_raw(&fabricated, 0, DAX_PAGE).iter().all(|&b| b == 0),
+    "the fabricated read is zeros, never the victim's bytes"
+  );
+
+  // Tampered: the attacker flips its own read-only mapping to writable — a different, unregistered identity.
+  let escalated = Mapping {
+    writable: true,
+    ..am
+  };
+  assert!(
+    !store.dax_is_live(&escalated),
+    "flipping writable yields an unregistered mapping"
+  );
+  store.dax_write_raw(&escalated, 0, &[POISON; 64]);
+  let mut own = vec![0u8; 64];
+  attacker.read(&store, fa, 0, &mut own).unwrap();
+  assert!(
+    own.iter().all(|&b| b == 0x11),
+    "the escalated write did not take effect on the read-only-mapped file"
   );
 }
 
