@@ -2287,3 +2287,82 @@ fn an_overlay_never_follows_a_base_path_the_host_swaps_under_it_cve_2026_77179()
     "a directory the host swapped into a symlink must not be descended into the host target"
   );
 }
+
+/// The canonical overlay / container escape (CWE-59, symlink following out of the lower directory): a base
+/// directory that LEGITIMATELY holds a symlink whose target escapes the overlaid subtree — an absolute host path
+/// (`/etc/passwd`) or a `../../..` climb — must never be followed by the overlay's own resolver into the host
+/// filesystem. slates resolves one path component at a time and stops at a symlink: a symlink as a non-terminal
+/// component is `NotDirectory` (never walked through), and a symlink as the terminal component is returned for the
+/// caller to `readlink`, so the kernel does any following — against the mount, as the agent's own uid, the control
+/// plane being same-uid (`crates/ipc/src/rendezvous.rs` refuses a peer whose `SO_PEERCRED` uid differs). This is
+/// the STATIC companion to the dynamic host-swap case (`...cve_2026_77179`): there the host swaps a symlink in
+/// under a witnessed path; here the base holds the escaping symlinks from the start and they are reached through
+/// ordinary resolution. Do: overlay a base with `evil -> /etc/passwd`, `up -> ../../../../etc`, and a real
+/// `d/inner`. Expect: resolving `evil`/`up` returns the symlink terminal and `readlink` returns the RAW target
+/// (slates never opens it); resolving THROUGH either (`evil/x`, `up/x`, `evil/../etc`) is `NotDirectory`; a content
+/// read of an escaping symlink is `Invalid` (this session's symlink content-op refusal, reaching a `BaseLink`); a
+/// literal `..` component is `NotFound` (slates does not climb — the kernel resolves `..` before a request
+/// arrives); and a real base path still resolves and reads (non-vacuity).
+#[test]
+fn an_overlay_never_follows_a_base_symlink_out_of_the_overlaid_subtree_cwe_59() {
+  let mut host = SimHost::new();
+  host.symlink("/evil", "/etc/passwd");
+  host.symlink("/up", "../../../../etc");
+  host.mkdir("/d");
+  host.replace_file("/d/inner", b"legitimate");
+  let mut store = store();
+  let mut vol = overlay(&mut host, &mut store);
+
+  // Each escaping symlink resolves as a TERMINAL component; readlink returns the RAW target, which slates reports
+  // and never opens. The kernel, not slates, resolves the target (against the mount, as the agent's own uid).
+  let evil = vol
+    .with_host(&mut host)
+    .resolve(&mut store, "/evil")
+    .unwrap()
+    .inode;
+  assert_eq!(&*vol.readlink(&store, evil).unwrap(), "/etc/passwd");
+  let up = vol
+    .with_host(&mut host)
+    .resolve(&mut store, "/up")
+    .unwrap()
+    .inode;
+  assert_eq!(&*vol.readlink(&store, up).unwrap(), "../../../../etc");
+
+  // Resolving THROUGH either symlink is refused NotDirectory — the resolver stops at a symlink component and never
+  // walks it into the host filesystem (no /etc/passwd, no climb above the overlaid root).
+  for path in ["/evil/anything", "/up/anything", "/evil/../etc", "/up/passwd"] {
+    assert_eq!(
+      vol
+        .with_host(&mut host)
+        .resolve(&mut store, path)
+        .map(|l| l.inode),
+      Err(VfsError::NotDirectory),
+      "resolving through a base symlink must not follow it into the host: {path}"
+    );
+  }
+
+  // A content read of an escaping base symlink is Invalid (the symlink content-op refusal reaches a BaseLink): the
+  // symlink's target bytes are never returned as file content, only through readlink.
+  assert_eq!(
+    read_all(&mut vol, &mut host, &mut store, "/evil"),
+    Err(VfsError::Invalid),
+    "a content read of a base symlink must refuse, never return its target as content"
+  );
+
+  // A literal `..` path component is a name lookup, not a climb: slates does not implement `..` (the kernel
+  // resolves it before a request arrives), so it is NotFound — it can never walk above the overlaid root.
+  assert_eq!(
+    vol
+      .with_host(&mut host)
+      .resolve(&mut store, "/../etc")
+      .map(|l| l.inode),
+    Err(VfsError::NotFound),
+    "a literal `..` component must not climb above the overlaid root"
+  );
+
+  // Non-vacuity: a real base path still resolves and reads, so the refusals above are symlink/escape-specific.
+  assert_eq!(
+    read_all(&mut vol, &mut host, &mut store, "/d/inner").unwrap(),
+    b"legitimate"
+  );
+}
