@@ -50,7 +50,9 @@ fn a_truncated_files_mapping_does_not_leak_the_bytes_past_its_new_length() {
     "the authorized length is the truncated size"
   );
 
-  let page = mapper.guest_read(&store, &mapping, 0, DAX_PAGE).unwrap();
+  let page = mapper
+    .guest_read(&store, &volume, &mapping, 0, DAX_PAGE)
+    .unwrap();
   assert!(
     page[100..].iter().all(|&b| b == 0),
     "the bytes past the file's new length are zero, not the truncated-away secret: {:?}",
@@ -77,7 +79,7 @@ fn a_writable_mapping_of_a_snapshot_shared_block_does_not_corrupt_the_snapshot()
     .setup_write_mapping(&mut store, &mut volume, f)
     .unwrap();
   mapper
-    .guest_write(&mut store, &mapping, 0, &[GUEST; 200])
+    .guest_write(&mut store, &volume, &mapping, 0, &[GUEST; 200])
     .unwrap();
 
   // Non-vacuity: the guest's write really landed on the live file's now-private block — the test would pass
@@ -121,20 +123,62 @@ fn a_guest_write_past_the_authorized_length_is_refused() {
 
   assert!(
     mapper
-      .guest_write(&mut store, &mapping, 0, &[G; 100])
+      .guest_write(&mut store, &volume, &mapping, 0, &[G; 100])
       .is_ok(),
     "a write within the file's length is allowed"
   );
   assert!(
     mapper
-      .guest_write(&mut store, &mapping, 100, &[G; 16])
+      .guest_write(&mut store, &volume, &mapping, 100, &[G; 16])
       .is_err(),
     "a write past the file's length is refused, not kept in the block's tail"
   );
   assert!(
     mapper
-      .guest_write(&mut store, &mapping, 95, &[G; 16])
+      .guest_write(&mut store, &volume, &mapping, 95, &[G; 16])
       .is_err(),
     "a write straddling the file's end is refused whole"
+  );
+}
+
+/// Vector 5 (use-after-free: a mapping outliving its file). Do: map a file read-only, unlink it (its block is
+/// freed — and zeroed, A-99), then create a different file that reuses the block and fill it with a new secret.
+/// Expect: the stale mapping does **not** read the new file's secret. Without pinning the mapper holds a raw block
+/// the arena then hands to the next file, so the old mapping reads a neighbour it was never authorized to see —
+/// and a writable one would corrupt it. The fix is to pin the block for the mapping's life.
+#[test]
+fn a_mapping_does_not_outlive_its_file_into_a_neighbour_that_reused_the_block() {
+  let mut store = store();
+  let mut volume = volume(&mut store, 1 << 20);
+  const SECRET_G: u8 = 0x55;
+  let f = file_of(&mut store, &mut volume, "f", 0x44, DAX_PAGE);
+  let root = volume.root_inode(&store).unwrap();
+
+  let mut mapper = DaxMapper::new();
+  let m_f = mapper.setup_read_mapping(&mut store, &volume, f).unwrap();
+  let freed = m_f.block;
+
+  volume.unlink_no(&mut store, root, "f").unwrap();
+
+  // A different file reuses the freed block.
+  let g = file_of(&mut store, &mut volume, "g", SECRET_G, DAX_PAGE);
+  let m_g = mapper.setup_read_mapping(&mut store, &volume, g).unwrap();
+
+  // The attack only bites if the *physical* block was reused — the arena bumps the generational incarnation on
+  // reuse, so the Extents are not equal, but `arena.bytes` slices by region+offset and ignores the incarnation,
+  // so a stale mapping still reads the new block's bytes. Assert the physical reuse so a non-reuse cannot pass
+  // the test vacuously.
+  assert!(
+    m_g.block.region() == freed.region() && m_g.block.offset() == freed.offset(),
+    "the new file reused the freed physical block (the use-after-free precondition)"
+  );
+
+  // The still-current check makes the stale mapping a typed miss: the arena bumped the block's incarnation on
+  // reuse, so it no longer equals the mapping's extent, and the read is refused rather than serving the neighbour.
+  assert!(
+    mapper
+      .guest_read(&store, &volume, &m_f, 0, DAX_PAGE)
+      .is_err(),
+    "the stale mapping is refused, not served the neighbour that reused the block"
   );
 }

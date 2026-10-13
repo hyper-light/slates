@@ -88,17 +88,31 @@ impl DaxMapper {
     Ok(mapping)
   }
 
+  /// Whether `mapping` still names its file's current content block. The arena bumps the generational incarnation
+  /// on free and reuse, so a block freed under a mapping and handed to another file no longer equals the mapping's
+  /// extent. Enforcing that here makes a stale mapping a **typed miss** — the pinning/teardown that raw
+  /// `arena.bytes` (which slices by region+offset and ignores the incarnation) does not do on its own, and the
+  /// reason a mapped file's content must not move or free under a live mapping.
+  fn still_current(&self, store: &Store, volume: &Volume, mapping: &Mapping) -> bool {
+    matches!(
+      file_block(store, volume, mapping.inode),
+      Ok((block, file_len)) if block == mapping.block && file_len == mapping.file_len
+    )
+  }
+
   /// What a guest reads from a mapped page: the **raw** bytes of the block, `[off, off + len)`, exactly as its
   /// page table exposes them. Past the block's end reads as zero (the page's remainder). The authorized file is
-  /// only `[0, file_len)`; anything the guest reads past that which is **not** zero is a leak.
+  /// only `[0, file_len)`; anything the guest reads past that which is **not** zero is a leak. Refused if the
+  /// mapping is stale (its block freed or reused — [`Self::still_current`]).
   pub fn guest_read(
     &self,
     store: &Store,
+    volume: &Volume,
     mapping: &Mapping,
     off: usize,
     len: usize,
   ) -> Result<Vec<u8>, VfsError> {
-    if !self.mappings.contains(mapping) {
+    if !self.mappings.contains(mapping) || !self.still_current(store, volume, mapping) {
       return Err(VfsError::Invalid);
     }
     let block = store
@@ -151,15 +165,20 @@ impl DaxMapper {
   }
 
   /// A guest writing `bytes` at `off` into a writable mapping — straight into the arena block, as a DAX guest
-  /// would, with no `Volume::write` and so no copy-up. Refused if the mapping is read-only or past the block.
+  /// would, with no `Volume::write` and so no copy-up. Refused if the mapping is read-only, past the authorized
+  /// length, or stale (its block freed or reused — [`Self::still_current`]).
   pub fn guest_write(
     &self,
     store: &mut Store,
+    volume: &Volume,
     mapping: &Mapping,
     off: usize,
     bytes: &[u8],
   ) -> Result<(), VfsError> {
-    if !mapping.writable || !self.mappings.contains(mapping) {
+    if !mapping.writable
+      || !self.mappings.contains(mapping)
+      || !self.still_current(&*store, volume, mapping)
+    {
       return Err(VfsError::Invalid);
     }
     let end = off.checked_add(bytes.len()).ok_or(VfsError::NoSpace)?;
