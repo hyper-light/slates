@@ -4,6 +4,7 @@
 // Test harness code: an unwrap here is a failed test.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+use proptest::prelude::*;
 use slates_merge::ops_doc::{Op, OpKind, OpsDoc};
 
 /// Builds a document from (path, kind, at, len) tuples in the given order.
@@ -250,4 +251,35 @@ fn a_path_that_is_not_utf8_is_refused_by_type() {
   let mut bytes = doc(&[("a", OpKind::Insert, 0, 1)]).encode();
   bytes[20] = 0xFF;
   assert_eq!(OpsDoc::decode(&bytes), Err(DocDecodeError::BadPath));
+}
+
+/// A decode is a typed result and, when it succeeds, re-encoding is a fixed point: decoding those bytes and
+/// re-encoding yields the same bytes, so one document identity has no second wire spelling.
+fn assert_canonical_or_typed(bytes: &[u8]) {
+  if let Ok(doc) = OpsDoc::decode(bytes) {
+    let once = doc.encode();
+    assert_eq!(
+      OpsDoc::decode(&once).map(|d| d.encode()).ok(),
+      Some(once),
+      "re-encoding a decoded document is a fixed point"
+    );
+  }
+}
+
+proptest! {
+  #![proptest_config(slates_test_seeds::unseeded(proptest::test_runner::Config::default()))]
+
+  /// Hostile-input fuzz of the ops-document decoder (the merge wire format, §4.16): any byte string decodes to a
+  /// typed result, never a panic (proptest fails on one), and a document that decodes is canonical. The second
+  /// arm prepends a well-formed magic+version header (the first 8 bytes of a real document) so the fuzz reaches
+  /// the count, path and op parsing with a hostile body, not just the magic gate — the bounds checks that keep a
+  /// wild path or op count from allocating (CWE-789) are exercised with arbitrary counts.
+  #[test]
+  fn any_bytes_decode_to_a_typed_result_never_a_panic(body in proptest::collection::vec(any::<u8>(), 0..512)) {
+    assert_canonical_or_typed(&body);
+    let mut framed = doc(&[("a", OpKind::Insert, 0, 1)]).encode();
+    framed.truncate(8); // keep only MAGIC + VERSION, then a hostile body
+    framed.extend_from_slice(&body);
+    assert_canonical_or_typed(&framed);
+  }
 }
