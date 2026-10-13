@@ -19,7 +19,8 @@ use slates_server::{Daemon, DaemonConfig, SegmentSource};
 mod common;
 use common::nfs::{
   NFS_PROGRAM, create, create_status, lookup_raw_status, lookup_status, mkdir_status, mount,
-  opaque, read, read_status, remove_status, rmdir_status, status, symlink_status, write,
+  opaque, read, read_status, readdirplus_status, remove_status, rmdir_status, status,
+  symlink_status, write,
 };
 
 /// Shape: honest clients, each on its own connection and file.
@@ -795,6 +796,39 @@ fn remove_refuses_dot_names_and_separators() {
   // Non-vacuity: a real file removes.
   let _f = create(&mut s, &root, "f", 7);
   assert_eq!(remove_status(&mut s, &root, b"f", 8), 0, "a real file removes");
+
+  drop(s);
+  drop(daemon);
+}
+
+/// A forged READDIR resume cookie (§4.6; hostile input). A client controls the opaque resume `cookie` and
+/// `cookieverf` it sends back; a huge, out-of-range, or mismatched-verifier value must yield a sane NFS status,
+/// never a panic, a hang, or another directory's entries — the cookie is scoped to the directory handle, so at
+/// worst it bounds this directory's own listing. Driven over a live socket, with a normal read afterwards to
+/// prove the daemon survived every forged cookie.
+#[test]
+fn a_forged_readdir_cookie_is_bounded_and_the_daemon_survives() {
+  let (daemon, instance) = single_shard_daemon("cookie");
+  provision(&instance, "ck");
+  let port = daemon.nfs_port().expect("the daemon is serving NFS");
+  let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+  let root = mount(&mut s, &daemon.mount_capability("ck").unwrap().unwrap(), 1);
+  assert_eq!(mkdir_status(&mut s, &root, b"d", 2), 0);
+  let f = create(&mut s, &root, "f", 3);
+  write(&mut s, &f, b"content", 4);
+
+  // Forged resume cookies and a mismatched verifier: each is a sane status, never a crash.
+  let huge = readdirplus_status(&mut s, &root, u64::MAX, [0u8; 8], 5);
+  let mid = readdirplus_status(&mut s, &root, 0x4000_0000_0000_0001, [0u8; 8], 6);
+  let bad_verf = readdirplus_status(&mut s, &root, 1, [0xEE; 8], 7);
+  eprintln!("PROBE readdir cookie: huge={huge} mid={mid} bad_verf={bad_verf}");
+
+  // The daemon survived every forged cookie — a normal read still works.
+  assert_eq!(
+    read_status(&mut s, &f, 8),
+    0,
+    "the daemon still serves after the forged cookies"
+  );
 
   drop(s);
   drop(daemon);

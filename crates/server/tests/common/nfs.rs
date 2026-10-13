@@ -327,6 +327,24 @@ pub(crate) fn rmdir_status(
   status(&call(stream, NFS_PROGRAM, 13, &args, xid))
 }
 
+/// NFS READDIRPLUS of `dir_fh` from `cookie` with `cookieverf` → the status (so a test can present a forged or
+/// out-of-range resume cookie and a mismatched verifier without asserting success).
+pub(crate) fn readdirplus_status(
+  stream: &mut (impl Read + Write),
+  dir_fh: &[u8],
+  cookie: u64,
+  cookieverf: [u8; 8],
+  xid: u32,
+) -> u32 {
+  let mut args = Vec::new();
+  opaque(dir_fh, &mut args);
+  args.extend_from_slice(&cookie.to_be_bytes());
+  args.extend_from_slice(&cookieverf);
+  args.extend_from_slice(&512u32.to_be_bytes()); // dircount (advisory)
+  args.extend_from_slice(&8192u32.to_be_bytes()); // maxcount
+  status(&call(stream, NFS_PROGRAM, 17, &args, xid))
+}
+
 /// NFS MKDIR `name` in `dir_fh` with mode 0755 → the new directory's handle.
 pub(crate) fn mkdir(
   stream: &mut (impl Read + Write),
