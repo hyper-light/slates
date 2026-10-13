@@ -36,6 +36,14 @@ const ROOT_MODE: u32 = 0o755;
 /// Format: POSIX symlink mode bits are always `rwxrwxrwx`; the bits of a symlink are unused.
 const SYMLINK_MODE: u32 = 0o777;
 
+/// Derived: the longest symlink target the volume accepts, in bytes — the archive's path ceiling
+/// (`slates_archive::manifest::PATH_MAX_BYTES`, Linux's `PATH_MAX`, 4096). A symlink target is a path, so a
+/// target no host could resolve and no placed archive could carry is refused `NameTooLong` (`ENAMETOOLONG`), as
+/// a host `symlink(2)` of an over-long target is — the same ceiling discipline as `XATTR_NAME_MAX_BYTES`. Without
+/// it a target was stored uncharged and unbounded as inline inode bytes, which an agent can repeat to exhaust
+/// memory far past its byte quota (a file's content is charged; a symlink's inline target was not).
+const SYMLINK_TARGET_MAX_BYTES: usize = slates_archive::manifest::PATH_MAX_BYTES;
+
 /// Format: the most snapshot slots a volume can hold, the slot field of a handle (`u32`).
 const SNAPSHOT_SLOT_CAP: usize = u32::MAX as usize;
 
@@ -1626,6 +1634,11 @@ impl Volume {
   ) -> Result<InodeNo, VfsError> {
     self.live()?;
     names::check(name)?;
+    // A target is a path: cap it at the host/archive path ceiling, refused before any effect, so an unbounded
+    // target cannot be stored uncharged as inline inode bytes (memory exhaustion past the byte quota).
+    if target.len() > SYMLINK_TARGET_MAX_BYTES {
+      return Err(VfsError::NameTooLong);
+    }
     self.refuse_existing(store, dir, name)?;
     self.admit_namespace(true)?;
     let mut needs = Needs::default();

@@ -444,3 +444,37 @@ fn a_write_or_read_at_a_colossal_offset_is_refused_or_empty_never_wrapped() {
   assert_eq!(vol.read(&store, f, 0, &mut got).unwrap(), 2);
   assert_eq!(&got, b"ok", "a normal write reads back");
 }
+
+/// MEMORY-EXHAUSTION ATTACK → FIX (CLAUDE.md #8 no unbounded growth; CWE-789). A symlink's target is stored
+/// inline in its inode and, before the fix, was neither length-capped nor byte-charged: an agent created
+/// symlinks with wire-cap targets and committed target memory far past its quota (a real run put 81.9 MB of
+/// targets behind a 64 KiB quota). A target is a path, so it is now capped at the host/archive path ceiling
+/// (`PATH_MAX`), refused `NameTooLong` (`ENAMETOOLONG`) before any effect — a bound on each target, config-
+/// independent, that a host `symlink(2)` also imposes. Do: create a symlink one byte past the ceiling, and one
+/// exactly at it. Expect: the first refused `NameTooLong` with nothing created; the second lands and reads back.
+#[test]
+fn a_symlink_target_past_the_path_ceiling_is_refused() {
+  let mut store = store();
+  let mut vol = volume(&mut store, 1 << 20);
+  let root = vol.root_inode(&store).unwrap();
+  let ceiling = slates_archive::manifest::PATH_MAX_BYTES;
+
+  let over = "x".repeat(ceiling + 1);
+  assert_eq!(
+    vol.symlink_no(&mut store, root, "toolong", &over),
+    Err(VfsError::NameTooLong),
+    "a symlink target past the path ceiling must be refused ENAMETOOLONG, not stored"
+  );
+  assert!(
+    vol.lookup_no(&store, root, "toolong").is_err(),
+    "nothing was created for the refused over-long target"
+  );
+
+  let at = "y".repeat(ceiling);
+  let no = vol.symlink_no(&mut store, root, "ok", &at).unwrap();
+  assert_eq!(
+    vol.readlink(&store, no).unwrap().len(),
+    ceiling,
+    "a target exactly at the ceiling lands and reads back whole"
+  );
+}
