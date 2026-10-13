@@ -358,3 +358,60 @@ fn fuse_mknod_refuses_a_character_or_block_device() {
     "a FIFO is allowed"
   );
 }
+
+/// A FUSE message framed with a custom `nodeid` (the `message` helper uses the root).
+fn message_nodeid(opcode: Opcode, unique: u64, nodeid: u64, body: &[u8]) -> Vec<u8> {
+  let total = IN_HEADER_LEN + body.len();
+  let mut m = vec![0u8; total];
+  m[0..4].copy_from_slice(&u32::try_from(total).unwrap().to_le_bytes());
+  m[4..8].copy_from_slice(&(opcode as u32).to_le_bytes());
+  m[8..16].copy_from_slice(&unique.to_le_bytes());
+  m[16..24].copy_from_slice(&nodeid.to_le_bytes());
+  m[24..28].copy_from_slice(&CREATOR_UID.to_le_bytes());
+  m[28..32].copy_from_slice(&CREATOR_GID.to_le_bytes());
+  m[IN_HEADER_LEN..].copy_from_slice(body);
+  m
+}
+
+/// §4.6, the FUSE analog of NFS handle forgery (a guest sends a raw opcode with a crafted `nodeid`). A node id is
+/// resolved within this mount's own volume (counter-keyed `inode_root`), so a forged one is this volume's own
+/// inode (which the guest owns) or a typed miss — never another volume's object and never a panic. Here a wildly
+/// forged node id GETATTR is refused typed, and the bridge still serves.
+#[test]
+fn a_fuse_getattr_with_a_forged_node_id_is_refused_without_a_panic() {
+  let mut store = store();
+  let mut volume = volume_for_owner(&mut store, ENROLLED, ENROLLED_GROUP);
+  let mut attachments = Attachments::new();
+  let id = attachments
+    .attach(
+      VOLUME,
+      View::Current,
+      Principal::Uid { uid: ENROLLED },
+      Rights {
+        read: true,
+        write: true,
+      },
+    )
+    .unwrap();
+  let cx = attachments.context(id).unwrap();
+  let mut bridge = VolumeBridge::new(VOLUME, &mut volume, &mut store);
+
+  // fuse_getattr_in: getattr_flags, dummy, fh (16 bytes), all zero.
+  let getattr = vec![0u8; 16];
+  let mut out = vec![0u8; REPLY_BYTES];
+  slates_bridge_fuse::bridge::dispatch(
+    &message_nodeid(Opcode::GetAttr, 1, 0xDEAD_BEEF_DEAD_BEEF, &getattr),
+    &mut bridge,
+    &cx,
+    &mut out,
+  );
+  let errno = i32::from_le_bytes(out[4..8].try_into().unwrap());
+  assert_ne!(errno, 0, "a forged node id is refused, never served or paniced");
+
+  // The bridge still serves a real operation afterwards.
+  assert_eq!(
+    fuse_errno(&mut bridge, &cx, Opcode::Create, 2, create(S_IFREG | 0o644, 0, "real")),
+    0,
+    "the bridge survives a forged node id"
+  );
+}
