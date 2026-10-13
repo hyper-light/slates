@@ -205,3 +205,49 @@ fn hostile_documents_refuse_by_type() {
   bad_kind[op_start] = 0xff;
   assert_eq!(OpsDoc::decode(&bad_kind), Err(DocDecodeError::BadKind));
 }
+
+/// Injection: a path a merge keyed carries control bytes the tree path's `names::check` would reject,
+/// because the merge service canonicalizes a path by only trimming a leading slash
+/// (`merge_service::canonical_path`) — an embedded NUL, the document's own `SLOP` magic as text, and bytes
+/// shaped like a four-byte length prefix. Each round-trips through the length-prefixed encoding
+/// byte-exact and injects nothing: the decoded document has the same paths (none split by a control byte,
+/// none merged), the same number of ops, and re-encodes to the same bytes (the identity is unchanged).
+/// This is why the codec needs no name check of its own — every field is length-delimited, never a
+/// separator a payload could forge (§4.16).
+#[test]
+fn a_path_with_control_and_framing_bytes_round_trips_without_injection() {
+  let original = doc(&[
+    ("a\u{0}b", OpKind::Insert, 0, 1),
+    ("SLOP", OpKind::Overwrite, 2, 3),
+    ("\u{4}\u{0}\u{0}\u{0}x", OpKind::Insert, 4, 5),
+  ]);
+  let bytes = original.encode();
+  let decoded = OpsDoc::decode(&bytes).expect("a control-laden document round-trips");
+  assert_eq!(
+    decoded.paths.paths(),
+    original.paths.paths(),
+    "every path is byte-identical; no control byte split or merged one"
+  );
+  assert_eq!(
+    decoded.ops.len(),
+    3,
+    "three ops in, three ops out: no entry injected or dropped"
+  );
+  assert_eq!(
+    decoded.encode(),
+    bytes,
+    "the identity is unchanged by the round trip"
+  );
+}
+
+/// A path whose bytes are not valid UTF-8 is refused `BadPath` at decode, never decoded into a lossy or
+/// replaced string: the single path of a good document (its one byte at offset 20, after the 16-byte
+/// header and the 4-byte length prefix) set to a lone `0xFF` is a hostile wire document, refused by type,
+/// never a panic.
+#[test]
+fn a_path_that_is_not_utf8_is_refused_by_type() {
+  use slates_merge::ops_doc::DocDecodeError;
+  let mut bytes = doc(&[("a", OpKind::Insert, 0, 1)]).encode();
+  bytes[20] = 0xFF;
+  assert_eq!(OpsDoc::decode(&bytes), Err(DocDecodeError::BadPath));
+}
