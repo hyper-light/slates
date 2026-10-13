@@ -61,6 +61,44 @@ fn owner() -> FileState {
   )
 }
 
+/// Bounds (banned unbounded growth; RFC 8881 §15.2): a client cannot hold unbounded open state on an
+/// owner shard and starve it. A new open past the file state's derived `max_opens` is `NFS4ERR_NOSPC`,
+/// while an upgrade of an open the client already holds still succeeds (it joins shares, adds no entry),
+/// and a share that conflicts with another owner's open is still told apart as `NFS4ERR_SHARE_DENIED`
+/// rather than masked by the bound. The exhaustion here is the per-file open table's; the client and
+/// session tables' bounds are `v4_session::the_tables_refuse_at_their_bounds`.
+#[test]
+fn opens_past_the_bound_are_refused_without_starving_the_owner() {
+  let mut files = FileState::new(owner_tag(0, 1), 3, 3);
+  files.open(A, b"a".to_vec(), &handle(10, 1), read_only()).unwrap();
+  files.open(A, b"a".to_vec(), &handle(11, 1), read_only()).unwrap();
+  files.open(A, b"a".to_vec(), &handle(12, 1), read_only()).unwrap();
+  assert_eq!(files.open_count(), 3, "the table is full at its bound");
+  // A fourth distinct file is refused NOSPC, not admitted past the bound.
+  assert_eq!(
+    files.open(A, b"a".to_vec(), &handle(13, 1), read_only()),
+    Err(Nfsstat4::Nospc)
+  );
+  // An upgrade of an open the client already holds still succeeds and adds no entry.
+  files
+    .open(A, b"a".to_vec(), &handle(10, 1), read_write())
+    .unwrap();
+  assert_eq!(files.open_count(), 3, "an upgrade is not a new open");
+  // A conflicting share from another owner is told apart from exhaustion, even with the table full.
+  assert_eq!(
+    files.open(
+      B,
+      b"b".to_vec(),
+      &handle(10, 1),
+      Share {
+        access: share::READ,
+        deny: share::WRITE,
+      },
+    ),
+    Err(Nfsstat4::ShareDenied)
+  );
+}
+
 /// §10.4: do open a file read-only from A and ask for a delegation; expect one granted, and asking again answered with
 /// the same one. With B holding the file open for writing, expect none for a third client.
 #[test]
