@@ -556,6 +556,88 @@ fn a_write_then_read_round_trips_over_the_export() {
   assert_eq!(data, payload, "the bytes round-trip");
 }
 
+/// CVE-2022-49280 (Linux nfsd `nfssvc_decode_writeargs` underflow, CVSS 9.8): the kernel trusted WRITE's
+/// advisory byte count, so a negative/huge count became `ULONG_MAX` and `svc_fill_write_vector` walked off the
+/// request's pages, reading out-of-bounds memory. slates ignores the advisory count — `write_result` decodes it
+/// into `_count` and takes the opaque **data length** as authoritative, bounds-checked against the offered
+/// transfer size and the bytes actually present. Proven here: a count of `u32::MAX` with six bytes of data
+/// writes six bytes (the count is ignored, not walked), and a data-length prefix claiming more bytes than the
+/// request carries is refused `NFS3ERR_INVAL` before anything is read — never an overrun. The file ends holding
+/// exactly the six bytes, never the lie's.
+#[test]
+fn a_write_count_that_lies_or_overruns_the_request_never_reads_out_of_bounds() {
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let mut bridge = VolumeBridge::new(VolumeId { bytes: [0x11; 16] }, &mut vol, &mut store);
+  let cx = write_cx();
+  let root_ino = bridge.root(&cx).unwrap();
+  let (created, _fh) = bridge.create(oid(root_ino), &cx, "data", 0o644, 0).unwrap();
+  let file_fh = slates_bridge_nfs::FileHandle {
+    volume: VolumeId { bytes: [0x11; 16] },
+    inode: created.ino,
+    generation: 0,
+    attachment: 0,
+    token: [0u8; 16],
+  }
+  .to_fh();
+  let mut export = Export::new(
+    &mut bridge,
+    VolumeId { bytes: [0x11; 16] },
+    Principal::Uid { uid: 0 },
+    Rights {
+      read: true,
+      write: true,
+    },
+  )
+  .unwrap();
+
+  // A count of u32::MAX with six bytes of data: the data length is authoritative, so six bytes are written.
+  let mut lying = XdrWriter::new();
+  file_fh.encode(&mut lying);
+  lying.u64(0);
+  lying.u32(u32::MAX);
+  lying.u32(2);
+  lying.opaque(b"slates");
+  let reply = export
+    .serve_nfs(NFSPROC3_WRITE, &mut XdrReader::new(lying.as_slice()))
+    .unwrap();
+  assert_eq!(
+    XdrReader::new(&reply).u32().unwrap(),
+    Nfsstat3::Ok.wire(),
+    "the lying count is ignored; the six data bytes are written"
+  );
+
+  // A data-length prefix claiming a thousand bytes with only four present overruns nothing: INVAL.
+  let mut overrun = XdrWriter::new();
+  file_fh.encode(&mut overrun);
+  overrun.u64(0);
+  overrun.u32(4);
+  overrun.u32(2);
+  overrun.u32(1000); // the opaque length prefix claims a thousand bytes...
+  overrun.fixed(&[0xAB; 4]); // ...but only four follow
+  let reply = export
+    .serve_nfs(NFSPROC3_WRITE, &mut XdrReader::new(overrun.as_slice()))
+    .unwrap();
+  assert_eq!(
+    XdrReader::new(&reply).u32().unwrap(),
+    Nfsstat3::Inval.wire(),
+    "a data length that overruns the request is refused before any read"
+  );
+
+  // The file holds exactly the six bytes the first write stored, never the lie's count of bytes.
+  let mut rargs = XdrWriter::new();
+  file_fh.encode(&mut rargs);
+  rargs.u64(0);
+  rargs.u32(64);
+  let rreply = export
+    .serve_nfs(NFSPROC3_READ, &mut XdrReader::new(rargs.as_slice()))
+    .unwrap();
+  let mut rr = XdrReader::new(&rreply);
+  assert_eq!(rr.u32().unwrap(), Nfsstat3::Ok.wire());
+  PostOpAttr::decode(&mut rr).unwrap();
+  assert_eq!(rr.u32().unwrap(), 6, "the file is the six bytes written, not u32::MAX");
+}
+
 /// COMMIT over the export reports the file's writes stable and returns the same `writeverf3` a WRITE
 /// returns — a client's `fsync` (which the kernel issues as COMMIT) succeeds, since every slates
 /// write already lands FILE_SYNC. Without COMMIT the fsync would fail PROC_UNAVAIL. The matching
