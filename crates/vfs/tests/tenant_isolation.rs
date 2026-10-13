@@ -10,6 +10,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 
 use proptest::prelude::*;
+use slates_vfs::error::VfsError;
 use slates_vfs::ids::InodeNo;
 use slates_vfs::volume::{Store, Volume};
 
@@ -92,6 +93,75 @@ proptest! {
           "the second volume's {} diverged from its own history after a step on the {} volume",
           nm,
           if on_second { "second" } else { "first" }
+        );
+      }
+    }
+  }
+
+  /// Cross-tenant isolation holds through the attacker volume's FAILURE paths, not only its successes (§4.13,
+  /// AC-4.12; [[test-at-extremes-law]] — force the refusal paths the ample-quota history never reaches). The
+  /// attacker has a tiny quota and storms large writes that, after the first few fit, every one refuses
+  /// `NoSpace` — running the quota-admission and the retention-settle/reopen paths repeatedly — while the victim
+  /// (ample quota) churns small creates, overwrites and removals over the same shared arena. Each attacker write
+  /// is either a clean success or a clean `NoSpace`, never any other error (a corrupt failure would show here);
+  /// and after every step the victim reads back exactly its own history: the attacker's refusals, and the shard
+  /// arena pressure they create, reached nothing of the victim's bytes.
+  #[test]
+  fn an_attacker_under_quota_pressure_never_corrupts_the_victim(
+    history in proptest::collection::vec(
+      (
+        any::<bool>(),
+        any::<bool>(),
+        0usize..NAMES.len(),
+        proptest::collection::vec(any::<u8>(), 0..8),
+      ),
+      1..60,
+    )
+  ) {
+    let mut store = store();
+    // The attacker: 64 KiB, so a storm of 20 KiB writes fits three then refuses NoSpace from there on.
+    let mut attacker = volume(&mut store, 1 << 16);
+    // The victim: the ample clone (prefix 9), whose own small ops always succeed.
+    let mut victim = Volume::create(&mut store, clone_config(9)).unwrap();
+    let attacker_root = attacker.root_inode(&store).unwrap();
+    let victim_root = victim.root_inode(&store).unwrap();
+    let storm = attacker
+      .create_file_no(&mut store, attacker_root, "storm", 0o644)
+      .unwrap();
+    let big = vec![0xA5u8; 20_000];
+    let mut frontier = 0u64;
+    let mut model: [Option<Vec<u8>>; NAMES.len()] = [None, None, None];
+
+    for (victim_remove, attacker_reopens_window_zero, index, bytes) in history {
+      // The attacker hammers its own file: a growing frontier (fresh windows) or a reopen of window zero (the
+      // retention path). Once its quota is full every write refuses NoSpace — the point of the storm. Any other
+      // error (a corrupt or crossed failure) fails the test here.
+      let at = if attacker_reopens_window_zero { 0 } else { frontier };
+      match attacker.write(&mut store, storm, at, &big) {
+        Ok(_) | Err(VfsError::NoSpace) => {}
+        other => prop_assert!(false, "attacker write at {} was neither Ok nor NoSpace: {:?}", at, other),
+      }
+      if !attacker_reopens_window_zero {
+        frontier = frontier.saturating_add(u64::try_from(big.len()).unwrap_or(u64::MAX));
+      }
+
+      // The victim's own small op, within its ample quota, always succeeds and advances its model.
+      let name = NAMES[index];
+      if victim_remove {
+        remove(&mut store, &mut victim, victim_root, name);
+        model[index] = None;
+      } else {
+        set_bytes(&mut store, &mut victim, victim_root, name, &bytes);
+        model[index] = Some(bytes);
+      }
+
+      // The victim reads exactly its own history — the attacker's NoSpace storm reached nothing here.
+      for (i, nm) in NAMES.iter().enumerate() {
+        prop_assert_eq!(
+          read_name(&store, &victim, victim_root, nm),
+          model[i].clone(),
+          "the victim's {} diverged under the attacker's quota-pressure storm",
+          nm
         );
       }
     }
