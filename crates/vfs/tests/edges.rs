@@ -511,3 +511,39 @@ fn a_symlink_target_with_an_interior_nul_is_refused_but_a_path_is_kept() {
     "a legitimate multi-component path target (slashes, no NUL) is unaffected and reads back whole"
   );
 }
+
+/// CVE-2026-47243 (Kata runtime-rs virtiofs guest→host, 2026): a guest-root submits a raw `FUSE_SYMLINK` whose
+/// NAME is an absolute host path (`/etc/cron.d/evil`) to drop a root-owned symlink in a sensitive host directory.
+/// Replicated here at the layer that defends it — a symlink NAME is a single path component, so `names::check`
+/// refuses one holding a separator (`/`) with `InvalidName` and nothing is created; the CVE's primitive cannot
+/// name a host path. The companion leg: a symlink whose valid name carries an absolute-path TARGET is stored (a
+/// target is just inline bytes in the RAM volume, capped and NUL-free), and reaching the host from it is R1's
+/// grant-gated landing — which writes only inside the human's named target via per-component `O_NOFOLLOW`
+/// (`land/tests/os.rs`), never `/etc/cron.d`. Do: create a symlink whose name is an absolute host path, then one
+/// whose target is. Expect: the first refused `InvalidName` with nothing created; the second stored in the volume
+/// and read back verbatim (inert until a landing a human grants, which cannot step out of its target).
+#[test]
+fn a_symlink_cannot_name_an_absolute_host_path_cve_2026_47243() {
+  let mut store = store();
+  let mut vol = volume(&mut store, 1 << 20);
+  let root = vol.root_inode(&store).unwrap();
+
+  assert_eq!(
+    vol.symlink_no(&mut store, root, "/etc/cron.d/evil", "payload"),
+    Err(VfsError::InvalidName),
+    "a symlink NAME that is an absolute host path must be refused — the CVE-2026-47243 primitive names a host path"
+  );
+  assert!(
+    vol.lookup_no(&store, root, "/etc/cron.d/evil").is_err(),
+    "nothing was created for the refused absolute-path name"
+  );
+
+  // A valid name with an absolute-path target: stored as inline RAM bytes (R1), inert until a granted landing.
+  let target = "/etc/cron.d/x";
+  let no = vol.symlink_no(&mut store, root, "evil", target).unwrap();
+  assert_eq!(
+    &*vol.readlink(&store, no).unwrap(),
+    target,
+    "an absolute-path target is a stored RAM string (no host write without a grant), read back verbatim"
+  );
+}
