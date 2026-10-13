@@ -415,3 +415,46 @@ fn a_fuse_getattr_with_a_forged_node_id_is_refused_without_a_panic() {
     "the bridge survives a forged node id"
   );
 }
+
+/// A truncated or malformed FUSE body is a typed error, never a panic or out-of-bounds read (§4.6; the device
+/// loop's `req.body.len() < HEAD` guards and the `?`-propagating parsers). A guest cannot wedge the bridge with a
+/// short message: a body shorter than the opcode's fixed header is refused, a header with no name is refused, and
+/// the bridge still serves a well-formed request.
+#[test]
+fn a_truncated_fuse_body_is_a_typed_error_not_a_panic() {
+  let mut store = store();
+  let mut volume = volume_for_owner(&mut store, ENROLLED, ENROLLED_GROUP);
+  let mut attachments = Attachments::new();
+  let id = attachments
+    .attach(
+      VOLUME,
+      View::Current,
+      Principal::Uid { uid: ENROLLED },
+      Rights {
+        read: true,
+        write: true,
+      },
+    )
+    .unwrap();
+  let cx = attachments.context(id).unwrap();
+  let mut bridge = VolumeBridge::new(VOLUME, &mut volume, &mut store);
+
+  // A CREATE body far shorter than its fixed header (flags, mode, umask, open_flags).
+  assert_ne!(
+    fuse_errno(&mut bridge, &cx, Opcode::Create, 1, vec![0u8; 2]),
+    0,
+    "a CREATE body shorter than its header is a typed error"
+  );
+  // A CREATE with the header present but no name after it.
+  assert_ne!(
+    fuse_errno(&mut bridge, &cx, Opcode::Create, 2, vec![0u8; 16]),
+    0,
+    "a CREATE with no name is refused"
+  );
+  // The bridge still serves a well-formed request.
+  assert_eq!(
+    fuse_errno(&mut bridge, &cx, Opcode::Create, 3, create(S_IFREG | 0o644, 0, "real")),
+    0,
+    "the bridge survives a truncated body"
+  );
+}
