@@ -672,3 +672,44 @@ fn every_content_operation_is_refused_on_a_non_file_kind() {
     check_content_ops(&mut vol, &mut store, inode, kind);
   }
 }
+
+/// A snapshot read (`read_in`) of a non-file inode is refused with the head read's errno, not `Ok(0)` or the
+/// directory's body: a directory `IsDirectory`, a symlink `Invalid`, an IPC name `SpecialFileOperation`. Before,
+/// `read_in` relied on a directory's size being zero (answering `Ok(0)`) and did not refuse a symlink (returning
+/// its target) — a divergence from the head read, and fragile if a directory ever reported a size. The export's
+/// own symlink-as-content serialization uses `read_in_body` directly and is untouched. Do: snapshot a volume with
+/// one of each kind; `read_in` each. Expect: the file reads its bytes; every non-file is refused with its errno.
+#[test]
+fn a_snapshot_read_of_a_non_file_is_refused_like_the_head() {
+  use slates_vfs::inode::Kind;
+  let mut store = store();
+  let mut vol = volume(&mut store, 1 << 20);
+  let root = vol.root_inode(&store).unwrap();
+  let file = vol.create_file_no(&mut store, root, "f", 0o644).unwrap();
+  vol.write(&mut store, file, 0, b"hello").unwrap();
+  let dir = vol.mkdir_no(&mut store, root, "d", 0o755).unwrap();
+  let link = vol.symlink_no(&mut store, root, "l", "target").unwrap();
+  let fifo = vol.mknod_no(&mut store, root, "p", 0o644, Kind::Fifo).unwrap();
+  let snap = vol.snapshot(&mut store).unwrap();
+  let mut buf = [0u8; 16];
+  assert_eq!(
+    vol.read_in(&store, snap, file, 0, &mut buf).unwrap(),
+    5,
+    "a regular file reads its bytes at a snapshot"
+  );
+  assert_eq!(
+    vol.read_in(&store, snap, dir, 0, &mut buf),
+    Err(VfsError::IsDirectory),
+    "a snapshot read of a directory must be EISDIR, not Ok(0)"
+  );
+  assert_eq!(
+    vol.read_in(&store, snap, link, 0, &mut buf),
+    Err(VfsError::Invalid),
+    "a snapshot read of a symlink must be EINVAL, not its target"
+  );
+  assert_eq!(
+    vol.read_in(&store, snap, fifo, 0, &mut buf),
+    Err(VfsError::SpecialFileOperation),
+    "a snapshot read of an IPC name must be refused"
+  );
+}

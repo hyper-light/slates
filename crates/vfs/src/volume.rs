@@ -2605,6 +2605,12 @@ impl Volume {
     if inode.kind == Kind::Symlink {
       return Err(VfsError::Invalid);
     }
+    // A directory is `IsDirectory` at a snapshot as at the head (`read_body`), never read as content. Today a
+    // directory's `size` is zero, so `read_in_body` would answer `Ok(0)`, but that is fragile — were a directory
+    // ever to report a size, the body read would run — and it diverges from the head. Refused explicitly here.
+    if inode.kind == Kind::Dir {
+      return Err(VfsError::IsDirectory);
+    }
     self.read_in_body(store, id, no, off, buf)
   }
 
