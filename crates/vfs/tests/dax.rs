@@ -663,3 +663,33 @@ fn a_daemon_write_while_mapped_revokes_the_read_window() {
   volume.read(&store, f, 0, &mut now).unwrap();
   assert_eq!(&now, &[0x22; 4], "the daemon path shows the written bytes");
 }
+
+/// §4.6, AC-4.12 (cross-volume clone share under DAX): two volumes sharing a snapshot's blocks via `clone_of` are
+/// isolated under a writable mapping — mapping a shared file writable copies it up through the write boundary (CoW),
+/// so the mapping is on this volume's own private block, and a write through it never reaches the other volume's
+/// shared copy. Origin writes a page of `0x41` and snapshots; a clone shares the block; the clone maps the file
+/// writable and writes "BBB" the hardware way; the origin still reads `0x41`, the clone its own "BBB". (A mappable
+/// file is a single content block, not a tiny inline file, so the page size matters.)
+#[test]
+fn a_writable_map_in_a_clone_copies_up_and_spares_the_shared_origin() {
+  let mut store = store();
+  let mut origin = volume(&mut store, 1 << 20);
+  let f = file_of(&mut store, &mut origin, "f", 0x41, DAX_PAGE);
+  let snap = origin.snapshot(&mut store).unwrap();
+  let mut clone = Volume::clone_of(&store, &mut origin, snap, clone_config(9)).unwrap();
+
+  let clone_root = clone.root_inode(&store).unwrap();
+  let cf = clone.lookup_no(&store, clone_root, "f").unwrap().inode;
+  let m = clone.dax_map_write(&mut store, cf).unwrap();
+  store.dax_write_raw(&m, 0, b"BBB");
+
+  let mut origin_bytes = vec![0u8; 3];
+  origin.read(&store, f, 0, &mut origin_bytes).unwrap();
+  assert_eq!(
+    &origin_bytes, &[0x41; 3],
+    "the write through the clone's DAX mapping spared the shared origin block"
+  );
+  let mut clone_bytes = vec![0u8; 3];
+  clone.read(&store, cf, 0, &mut clone_bytes).unwrap();
+  assert_eq!(&clone_bytes, b"BBB", "the clone sees its own copied-up write");
+}
