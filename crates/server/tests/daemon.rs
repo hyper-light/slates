@@ -2483,6 +2483,112 @@ fn green_chain_scenario() {
   daemon.stop();
 }
 
+/// The owner's green, a work over it, and one edit — the state a cross-principal test then attacks.
+fn owner_green_and_work(owner: &mut Client) -> (VolumeId, VolumeId) {
+  let ReplyBody::GreenCreated { id: green } = owner.call(&RequestBody::CreateGreen {
+    name: "green".to_owned(),
+    require_evidence: false,
+    base: None,
+  }) else {
+    panic!("the owner creates the green");
+  };
+  let ReplyBody::WorkCreated { id: work, .. } = owner.call(&RequestBody::CreateWork {
+    green,
+    name: "w".to_owned(),
+  }) else {
+    panic!("the owner creates the work");
+  };
+  assert!(matches!(
+    owner.call(&RequestBody::Edit {
+      work,
+      path: "f".to_owned(),
+      at: 0,
+      delete_len: 0,
+      bytes: b"owned".to_vec(),
+    }),
+    ReplyBody::Edited
+  ));
+  (green, work)
+}
+
+/// A merge verb a foreign principal aimed at another account's green or work must be refused `Forbidden`
+/// before any effect (never silently succeed, never leak existence as something other than a refusal).
+fn assert_foreign_merge_refused(reply: ReplyBody) {
+  assert!(
+    matches!(
+      reply,
+      ReplyBody::Refused {
+        refusal: Refusal::Forbidden { .. }
+      }
+    ),
+    "a foreign principal's merge verb must be Forbidden, got {reply:?}"
+  );
+}
+
+/// A foreign principal cannot drive another account's merge through the real daemon (§4.13 "Principals",
+/// §4.16). The merge verbs authorize through the same `rights_of` the volume verbs do
+/// (`distinct_consumers_under_one_uid_...` proves it for Share and VFS reads), but on their own code path
+/// (`merge_service::require_green`/`require_work`). The owner creates a green and a work and edits it; a
+/// second channel, bound to a *different* consumer under the same uid, then names the owner's green and
+/// work at every merge verb — create-work and version reads (green rights), edit, declare, submit and
+/// rebase (work rights) — and each is refused `Forbidden` before any effect. Non-vacuous: the owner itself
+/// drives its own submit to success afterwards, and the green's head only moves then — never under a
+/// foreign call.
+#[test]
+fn a_foreign_principal_cannot_drive_another_accounts_merge() {
+  let (daemon, instance) = daemon("merge-authz");
+  let secret = daemon.segment().issuer_secret().unwrap();
+  let account = current_uid();
+  let mut owner = Client::connect(&instance);
+  let mut intruder = Client::connect(&instance);
+  // Bind the intruder's channel to a distinct consumer principal under the same uid.
+  let (consumer, capability) = enroll(&mut owner, &secret, account);
+  let proof = slates_server::landing::attest_proof(&capability, intruder.client);
+  assert!(matches!(
+    intruder.call(&RequestBody::Attest { consumer, proof }),
+    ReplyBody::Attested
+  ));
+  let (green, work) = owner_green_and_work(&mut owner);
+  // The intruder names the owner's green and work at every merge verb.
+  assert_foreign_merge_refused(intruder.call(&RequestBody::CreateWork {
+    green,
+    name: "x".to_owned(),
+  }));
+  assert_foreign_merge_refused(intruder.call(&RequestBody::Versions { green }));
+  assert_foreign_merge_refused(intruder.call(&RequestBody::Edit {
+    work,
+    path: "f".to_owned(),
+    at: 0,
+    delete_len: 0,
+    bytes: b"stolen".to_vec(),
+  }));
+  assert_foreign_merge_refused(intruder.call(&RequestBody::Declare {
+    work,
+    op: slates_ipc::protocol::WorkOp::Mkdir {
+      path: "d".to_owned(),
+    },
+  }));
+  assert_foreign_merge_refused(intruder.call(&RequestBody::Submit {
+    work,
+    evidence: Vec::new(),
+  }));
+  assert_foreign_merge_refused(intruder.call(&RequestBody::Rebase { work }));
+  // The green never advanced under the foreign calls; the owner still drives its own submit to success.
+  let ReplyBody::Submitted { version, conflicts } = owner.call(&RequestBody::Submit {
+    work,
+    evidence: Vec::new(),
+  }) else {
+    panic!("the owner submits its own work");
+  };
+  assert!(conflicts.is_empty(), "the owner's submit is clean: {conflicts:?}");
+  assert_eq!(
+    version,
+    Some(1),
+    "the green's first version is the owner's, not the intruder's"
+  );
+  daemon.stop();
+}
+
 /// The merge submit flow and the verdict (§4.16 Phase 6 Task 6): two agents create work volumes over
 /// a green, both based on version 0. The first's edit merges on the fast path (the chain advances to
 /// version 1); the second, still based on version 0, declared the same file the first just committed,
