@@ -908,3 +908,34 @@ fn write_absent_wcc(writer: &mut XdrWriter) {
   writer.bool(false); // before: absent
   writer.bool(false); // after: absent
 }
+
+#[cfg(test)]
+mod tests {
+  #![allow(clippy::unwrap_used)]
+  use super::parse_capability;
+
+  /// The client-supplied mount capability `<attachment_hex>.<token_hex>` (§4.13, AUD-01). A malformed capability
+  /// — no separator, a non-hex or overflowing attachment, a token that is not exactly 32 hex digits, or a non-hex
+  /// token digit — is refused (`None`), never a panic; a well-formed one decodes to its attachment and 16-byte
+  /// token. (A `None` here means the mount presents no capability, so it authorizes nothing — AUD-01.)
+  #[test]
+  fn a_malformed_mount_capability_is_refused_not_a_panic() {
+    let malformed = [
+      "",                                                                // empty
+      "ff",                                                              // no separator
+      "@",                                                               // no separator
+      "ff.",                                                             // empty token
+      "zz.000102030405060708090a0b0c0d0e0f",                             // non-hex attachment
+      "ff.00010203040506070809",                                        // token too short
+      "ff.000102030405060708090a0b0c0d0e0f00",                          // token too long
+      "ff.000102030405060708090a0b0c0d0e0g",                            // non-hex token digit
+      "fffffffffffffffffffff.000102030405060708090a0b0c0d0e0f",          // attachment overflows u64
+    ];
+    for bad in malformed {
+      assert!(parse_capability(bad).is_none(), "{bad:?} must be refused");
+    }
+    let (attachment, token) = parse_capability("1a.000102030405060708090a0b0c0d0e0f").unwrap();
+    assert_eq!(attachment, 0x1a);
+    assert_eq!(token, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]);
+  }
+}
