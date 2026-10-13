@@ -2874,6 +2874,37 @@ fn the_callers_directory_replaces_one_it_does_not_own_in_its_own_sticky_director
   }
 }
 
+/// Reserved and malformed names in RENAME, the sibling of the UNCHECKED CREATE "." echo (§4.6,
+/// docs/bugs/2026-10-13-nfs-create-echoes-dot-names.md): a rename whose target component is `.`, `..`
+/// or carries a separator is refused by `names::check` (volume.rs `admit_rename`), and one whose *source*
+/// component is `.` or `..` must not resolve to the directory or its parent and move it — the lookup of
+/// `from_name` is not name-checked, so this proves `.`/`..` never name a renamable entry. Every case is
+/// refused (never `NFS3_OK`), and the tree is intact afterwards: `f` still there, no `x` or `y` created.
+#[test]
+fn rename_refuses_reserved_and_malformed_names() {
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let mut bridge = VolumeBridge::new(VolumeId { bytes: [0x11; 16] }, &mut vol, &mut store);
+  let cx = write_cx();
+  let root_ino = bridge.root(&cx).unwrap();
+  let dir = bridge.mkdir(oid(root_ino), &cx, "d", 0o755).unwrap();
+  bridge.create(oid(dir.ino), &cx, "f", 0o644, 0).unwrap();
+  let d = fh_of(dir.ino);
+  let mut caller = export_as(&mut bridge, 0, 0);
+  let ok = Nfsstat3::Ok.wire();
+  // A target component that is reserved or carries a separator is refused.
+  assert_ne!(rename_status(&mut caller, &d, "f", &d, "."), ok, "rename to \".\"");
+  assert_ne!(rename_status(&mut caller, &d, "f", &d, ".."), ok, "rename to \"..\"");
+  assert_ne!(rename_status(&mut caller, &d, "f", &d, "a/b"), ok, "rename to \"a/b\"");
+  // A source component that is `.` or `..` must not rename the directory itself or its parent.
+  assert_ne!(rename_status(&mut caller, &d, ".", &d, "x"), ok, "rename from \".\"");
+  assert_ne!(rename_status(&mut caller, &d, "..", &d, "y"), ok, "rename from \"..\"");
+  drop(caller);
+  assert!(bridge.lookup(oid(dir.ino), &cx, "f").is_ok(), "f survives every refused rename");
+  assert!(bridge.lookup(oid(dir.ino), &cx, "x").is_err(), "no x was created");
+  assert!(bridge.lookup(oid(dir.ino), &cx, "y").is_err(), "no y was created");
+}
+
 /// A rename needs write and search permission on both directories (`NFS3ERR_ACCES`), and the sticky
 /// bit of the source directory holds for the entry moved (`NFS3ERR_PERM`).
 #[test]
