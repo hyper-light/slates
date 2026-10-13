@@ -400,6 +400,24 @@ pub(crate) fn write_status(
   status(&call(stream, NFS_PROGRAM, 7, &args, xid))
 }
 
+/// NFS WRITE `data` at `offset` to `file_fh` (FILE_SYNC) → the status, so a test can present a colossal offset
+/// whose `offset + count` would overflow or exceed the maximum file size.
+pub(crate) fn write_at_status(
+  stream: &mut (impl Read + Write),
+  file_fh: &[u8],
+  offset: u64,
+  data: &[u8],
+  xid: u32,
+) -> u32 {
+  let mut args = Vec::new();
+  opaque(file_fh, &mut args);
+  args.extend_from_slice(&offset.to_be_bytes());
+  args.extend_from_slice(&u32::try_from(data.len()).unwrap().to_be_bytes());
+  args.extend_from_slice(&2u32.to_be_bytes()); // stable: FILE_SYNC
+  opaque(data, &mut args);
+  status(&call(stream, NFS_PROGRAM, 7, &args, xid))
+}
+
 /// NFS READ up to 400 bytes at offset zero from `file_fh`.
 pub(crate) fn read(stream: &mut (impl Read + Write), file_fh: &[u8], xid: u32) -> Vec<u8> {
   read_bytes_status(stream, file_fh, xid)

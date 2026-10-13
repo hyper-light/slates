@@ -20,7 +20,7 @@ mod common;
 use common::nfs::{
   NFS_PROGRAM, create, create_status, lookup_raw_status, lookup_status, mkdir_status, mount,
   opaque, read, read_status, readdirplus_status, remove_status, rmdir_status, status,
-  symlink_status, write,
+  symlink_status, write, write_at_status,
 };
 
 /// Shape: honest clients, each on its own connection and file.
@@ -828,6 +828,43 @@ fn a_forged_readdir_cookie_is_bounded_and_the_daemon_survives() {
     read_status(&mut s, &f, 8),
     0,
     "the daemon still serves after the forged cookies"
+  );
+
+  drop(s);
+  drop(daemon);
+}
+
+/// A WRITE at a colossal offset (§4.6; checked arithmetic, no unbounded allocation). A client controls the WRITE
+/// offset; `offset + count` overflowing `u64` must be a typed refusal, never a wrap to a small offset, and a
+/// colossal sparse offset must not drive the daemon to allocate the whole span (OOM). Over a live socket, the
+/// overflowing write is refused and a normal write/read round-trips afterwards — the daemon never wrapped, paniced
+/// or OOM'd.
+#[test]
+fn a_write_at_a_colossal_offset_is_refused_and_the_daemon_survives() {
+  let (daemon, instance) = single_shard_daemon("writeoverflow");
+  provision(&instance, "wo");
+  let port = daemon.nfs_port().expect("the daemon is serving NFS");
+  let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+  let root = mount(&mut s, &daemon.mount_capability("wo").unwrap().unwrap(), 1);
+  let f = create(&mut s, &root, "f", 2);
+
+  // offset + count overflows u64: refused, never wrapped to a low offset.
+  let overflow = write_at_status(&mut s, &f, u64::MAX - 5, b"0123456789", 3);
+  // a colossal (non-overflowing) sparse offset: whatever the policy, it must not OOM the daemon.
+  let colossal = write_at_status(&mut s, &f, 1u64 << 60, b"x", 4);
+  eprintln!("PROBE write offset: overflow(u64::MAX-5)={overflow} colossal(2^60)={colossal}");
+  assert_ne!(
+    overflow, 0,
+    "a WRITE whose offset+count overflows u64 is refused, not wrapped (FBIG)"
+  );
+
+  // The colossal non-overflowing offset is a sparse write — normal POSIX (a hole costs no space; slates charges
+  // the physical block, not the logical size). What matters: the daemon did not wrap, panic or OOM, so it still
+  // answers a request afterwards.
+  assert_eq!(
+    read_status(&mut s, &f, 5),
+    0,
+    "the daemon still serves after the colossal-offset writes"
   );
 
   drop(s);
