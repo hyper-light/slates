@@ -1998,6 +1998,13 @@ impl<'b> Export<'b> {
     if !access::permits(&self.caller, &dir_node, Want::Search) {
       return (Nfsstat3::Acces, None, dir_post);
     }
+    // `.` and `..` are the directory's own and its parent's entries, never names a client creates. Without this
+    // guard an UNCHECKED create finds the existing directory by the lookup below and echoes its handle as if it
+    // had created a file — reporting success for a create that made nothing. They are refused `EXIST` (the name
+    // exists, as a directory), the same reserved-component discipline RMDIR and RENAME already apply (§4.6).
+    if name == "." || name == ".." {
+      return (Nfsstat3::Exist, None, dir_post);
+    }
     let existing = match self.bridge.lookup(parent, &cx, &name) {
       Ok(node) if mode_kind == CREATE_UNCHECKED => Some(ObjectId::new(node.ino, node.generation)),
       // A retried exclusive create finds its own file: a regular file holding the verifier's times.

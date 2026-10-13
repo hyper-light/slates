@@ -230,6 +230,41 @@ pub(crate) fn create(
   read_opaque(&reply, 8).0
 }
 
+/// NFS CREATE (UNCHECKED) raw `name` bytes in `dir_fh` with mode 0644 → the status the server answered,
+/// without asserting it succeeded (so a test can present a name the server refuses, such as one with a
+/// separator or a NUL byte).
+pub(crate) fn create_status(
+  stream: &mut (impl Read + Write),
+  dir_fh: &[u8],
+  name: &[u8],
+  xid: u32,
+) -> u32 {
+  let mut args = Vec::new();
+  opaque(dir_fh, &mut args);
+  opaque(name, &mut args);
+  args.extend_from_slice(&0u32.to_be_bytes()); // createmode3 UNCHECKED
+  args.extend_from_slice(&1u32.to_be_bytes()); // set_mode: yes
+  args.extend_from_slice(&0o644u32.to_be_bytes());
+  for _unset in 0..5 {
+    args.extend_from_slice(&0u32.to_be_bytes()); // uid, gid, size: no; atime, mtime: DONT_CHANGE
+  }
+  status(&call(stream, NFS_PROGRAM, 8, &args, xid))
+}
+
+/// NFS LOOKUP of raw `name` bytes in `dir_fh` → the status (so a test can present a name with a NUL byte or
+/// a separator, which `&str` would reject before the wire).
+pub(crate) fn lookup_raw_status(
+  stream: &mut (impl Read + Write),
+  dir_fh: &[u8],
+  name: &[u8],
+  xid: u32,
+) -> u32 {
+  let mut args = Vec::new();
+  opaque(dir_fh, &mut args);
+  opaque(name, &mut args);
+  status(&call(stream, NFS_PROGRAM, 3, &args, xid))
+}
+
 /// NFS MKDIR `name` in `dir_fh` with mode 0755 → the new directory's handle.
 pub(crate) fn mkdir(
   stream: &mut (impl Read + Write),

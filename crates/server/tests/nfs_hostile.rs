@@ -17,7 +17,10 @@ use slates_ipc::protocol::{NamePolicy, SizeClass};
 use slates_server::{Daemon, DaemonConfig, SegmentSource};
 
 mod common;
-use common::nfs::{NFS_PROGRAM, create, mount, opaque, read, read_status, status, write};
+use common::nfs::{
+  NFS_PROGRAM, create, create_status, lookup_raw_status, lookup_status, mount, opaque, read,
+  read_status, status, write,
+};
 
 /// Shape: honest clients, each on its own connection and file.
 const HONEST: usize = 4;
@@ -653,5 +656,85 @@ fn a_valid_capability_cannot_be_restamped_onto_another_tenants_handle() {
   drop(owner_b);
   drop(attacker);
   drop(guesser);
+  drop(daemon);
+}
+
+/// Name injection at the NFS name layer (§4.6; CWE-22 path traversal, CWE-158 NUL-byte injection). One NFS name
+/// is a single path component: it must never be split on a separator, truncated at a NUL to a shorter name, or
+/// used to climb out of its directory, since the same bytes later name a host path at the disk boundary (base
+/// read, landing write). Against a live daemon over a real socket: a NUL-bearing name does not resolve to its
+/// prefix, a name with a separator neither matches nor forms a traversable entry, `.` and `..` cannot be
+/// created, and an over-length name is refused. Non-vacuous: the honest name resolves.
+#[test]
+fn a_crafted_name_cannot_split_truncate_or_create_a_control_entry() {
+  let (daemon, instance) = single_shard_daemon("names");
+  provision(&instance, "names");
+  let port = daemon.nfs_port().expect("the daemon is serving NFS");
+  let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+  let root = mount(&mut s, &daemon.mount_capability("names").unwrap().unwrap(), 1);
+
+  // The honest file resolves — the test is not vacuous.
+  let _secret = create(&mut s, &root, "secret", 2);
+  assert!(
+    lookup_status(&mut s, &root, "secret", 3).is_ok(),
+    "the honest name resolves"
+  );
+
+  // A NUL-bearing name must not resolve to its prefix `secret` (no C-string truncation).
+  assert_ne!(
+    lookup_raw_status(&mut s, &root, b"secret\0ignored", 4),
+    0,
+    "a NUL-terminated name did not truncate to 'secret'"
+  );
+  // A separator makes the name a non-matching single component, never a path walk.
+  assert_ne!(
+    lookup_raw_status(&mut s, &root, b"secret/", 5),
+    0,
+    "a trailing separator does not match the file"
+  );
+  assert_ne!(
+    lookup_raw_status(&mut s, &root, b"nope/../secret", 6),
+    0,
+    "a name with path syntax is one component, not a walk"
+  );
+
+  // `.` and `..` are the directory's own and its parent's entries — a client cannot create them. Without the
+  // guard, UNCHECKED CREATE found the existing directory by the inner lookup and echoed its handle as a
+  // successful create; now they are refused `NFS3ERR_EXIST`, never echoed.
+  const NFS3ERR_EXIST: u32 = 17;
+  assert_eq!(
+    create_status(&mut s, &root, b".", 7),
+    NFS3ERR_EXIST,
+    "CREATE '.' is refused, not echoed as a create"
+  );
+  assert_eq!(
+    create_status(&mut s, &root, b"..", 8),
+    NFS3ERR_EXIST,
+    "CREATE '..' is refused, not echoed as a create"
+  );
+
+  // A separator or a NUL in a CREATE name is refused by the name check (`slates_vfs::names::check`): the name
+  // is never split into a path nor truncated into a shorter one — the same bytes would otherwise name a host
+  // path at the disk boundary.
+  assert_ne!(
+    create_status(&mut s, &root, b"a/b", 9),
+    0,
+    "a '/'-bearing create is refused, not split"
+  );
+  assert_ne!(
+    create_status(&mut s, &root, b"x\0y", 11),
+    0,
+    "a NUL-bearing create is refused, not truncated"
+  );
+
+  // An over-length name (past NFS_MAXNAMELEN 255) is refused, never truncated to a valid one.
+  let long = vec![b'z'; 300];
+  assert_ne!(
+    create_status(&mut s, &root, &long, 13),
+    0,
+    "an over-length name is refused, not truncated"
+  );
+
+  drop(s);
   drop(daemon);
 }
