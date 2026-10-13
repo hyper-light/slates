@@ -87,6 +87,9 @@ The other `ScopedBridge` methods that forward without `admit` were reviewed:
 `release`/`forget` give back a reference or handle this view already took (they reach nothing new);
 `flush`/`fsync` act on a file handle this view opened through an admitted `open`/`create`, and flush no data
 outward; `now` carries no object; `seen` returns only a cursor. `cache_lifetime` forwards an object to the inner
-policy without `admit` — it returns a duration hint, not object content or existence (the inner policy answers
-the same hint for a live-source vs overlay inode regardless of the caller), so it is not a disclosure; left as
-is and noted for Ada. Only `invalidations` revealed out-of-scope identity.
+policy without `admit`, and that policy does distinguish a live-source-backed inode (`Bounded`) from the rest
+(`Forever`) — but it is unreachable for an out-of-scope object: the transport calls `cache_lifetime` only on an
+object it already obtained through an admitted `getattr`/`lookup`/`readdir` (all in-scope), and a raw
+out-of-scope filehandle meets `admit` → `NotFound` first. Adding a second `admit` there would be redundant
+layering on an unreachable path (and a per-reply `within` climb on the hot path), so it is left as is and noted
+for Ada. Only `invalidations` revealed out-of-scope identity.
