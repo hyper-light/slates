@@ -14,7 +14,7 @@ use slates_vfs::ids::InodeNo;
 use slates_vfs::volume::{Store, Volume};
 
 mod common;
-use common::{store, volume};
+use common::{clone_config, store, volume};
 
 /// A byte that stands for a secret the user meant to be gone — old content truncated away. If the guest reads it
 /// back through a mapping, the truncate did not remove it from the guest's view: a leak.
@@ -324,7 +324,7 @@ fn a_write_through_a_read_only_mapping_is_refused() {
 #[test]
 fn mapping_a_directory_is_refused() {
   let mut store = store();
-  let mut volume = volume(&mut store, 1 << 20);
+  let volume = volume(&mut store, 1 << 20);
   let root = volume.root_inode(&store).unwrap();
 
   let mut mapper = DaxMapper::new();
@@ -455,7 +455,7 @@ fn the_hardware_write_path_corrupts_a_neighbour_that_reused_the_block() {
   let mut gbytes = vec![0u8; 100];
   volume.read(&store, g, 0, &mut gbytes).unwrap();
   assert!(
-    gbytes.iter().any(|&b| b == 0xEE),
+    gbytes.contains(&0xEE),
     "the hardware write corrupted the neighbour's reused block"
   );
 }
@@ -487,7 +487,7 @@ fn the_hardware_write_path_writes_past_the_authorized_length() {
   mapper.guest_write_raw(&mut store, &m, 100, &[0xEE; 50]);
   let tail = mapper.guest_read_raw(&store, &m, 100, 50);
   assert!(
-    tail.iter().any(|&b| b == 0xEE),
+    tail.contains(&0xEE),
     "the hardware write escaped past the authorized length into the page tail"
   );
 }
@@ -516,7 +516,346 @@ fn the_hardware_write_path_corrupts_a_snapshot_despite_reassert_private() {
   let mut frozen = vec![0u8; 100];
   volume.read_in(&store, snap, f, 0, &mut frozen).unwrap();
   assert!(
-    frozen.iter().any(|&b| b == 0xEE),
+    frozen.contains(&0xEE),
     "the hardware write corrupted the snapshot despite reassert_private — only revocation closes it"
+  );
+}
+
+/// THE FAILURE — run it and watch isolation break. This asserts the security property slates MUST uphold: a guest,
+/// through a DAX mapping, may touch only its own authorized content, never another file. It **fails** — via the
+/// hardware path a stale mapping corrupts a neighbour that reused the block, and no daemon-side check runs on the
+/// guest's own page accesses. It can pass only once the **pinning + revocation gate** exists (a mapped block is
+/// never freed, reused, or shared, and its page table is torn down before any of those), the gate this whole
+/// experiment proves mandatory. `#[ignore]` so the suite stays green; run it to see the red:
+/// `cargo test -p slates-vfs --test dax -- --ignored writable_dax_upholds_cross_file_isolation`.
+#[test]
+#[ignore = "DEMONSTRATION: fails on purpose — writable DAX breaks cross-file isolation on the hardware path until pinning + revocation exist"]
+fn writable_dax_upholds_cross_file_isolation() {
+  let mut store = store();
+  let mut volume = volume(&mut store, 1 << 20);
+  const NEIGHBOUR: u8 = 0x5A;
+  let f = file_of(&mut store, &mut volume, "f", 0x11, DAX_PAGE);
+  let root = volume.root_inode(&store).unwrap();
+
+  let mut mapper = DaxMapper::new();
+  let m = mapper
+    .setup_write_mapping(&mut store, &mut volume, f)
+    .unwrap();
+
+  // The guest's file is unlinked and a different file reuses its block.
+  volume.unlink_no(&mut store, root, "f").unwrap();
+  let g = file_of(&mut store, &mut volume, "g", NEIGHBOUR, DAX_PAGE);
+
+  // The guest writes its OWN (now-freed) mapping the hardware way — no daemon check runs.
+  mapper.guest_write_raw(&mut store, &m, 0, &[0xEE; 100]);
+
+  // THE GUARANTEE: the neighbour g is untouched. It is not — a guest corrupted another file through DAX.
+  let mut gbytes = vec![0u8; 100];
+  volume.read(&store, g, 0, &mut gbytes).unwrap();
+  assert!(
+    gbytes.iter().all(|&b| b == NEIGHBOUR),
+    "ISOLATION BROKEN: a DAX guest corrupted another file through the hardware path (got {:?}); only pinning + revocation uphold this",
+    &gbytes[..8]
+  );
+}
+
+// ───────────────────────────────────────────────────────────────────────────────────────────────────────────────
+// FAILING GUARANTEE SUITE (`cargo test -p slates-vfs --test dax -- --ignored`). Each test asserts a security
+// property slates MUST uphold for writable DAX and FAILS today, because the guest's hardware path (`guest_*_raw`)
+// obeys no daemon-side guard. Together they are the specification of what the pinning + revocation gate must close:
+// a mapped block is never freed, reused, or shared, and its guest page table is torn down and quiesced before any
+// of those. Each goes green only when that gate exists. One test per attack class: exfiltration, injection, volume
+// escape, TOCTOU, race / lost update, and teardown (deadlock-adjacent). Marked `#[ignore]` so the suite stays
+// green; they are demonstrations, not regressions.
+// ───────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+/// EXFILTRATION (confidentiality, same volume). Guarantee: a guest reads only its own authorized content, never a
+/// neighbour's bytes. Fails: map a file read-only, free it, let a different file reuse the block with a secret, and
+/// the guest reads that secret through the stale mapping the hardware way — the arena slices by region+offset and
+/// ignores the generational incarnation, so `guest_read_raw` hands the guest a file it never opened.
+#[test]
+#[ignore = "DEMONSTRATION: fails on purpose — a writable-DAX guest exfiltrates a neighbour's secret on the hardware path until pinning + revocation exist"]
+fn writable_dax_must_not_exfiltrate_a_neighbours_secret() {
+  const NEIGHBOUR_SECRET: u8 = 0xAB;
+  let mut store = store();
+  let mut volume = volume(&mut store, 1 << 20);
+  let f = file_of(&mut store, &mut volume, "f", 0x11, DAX_PAGE);
+  let root = volume.root_inode(&store).unwrap();
+
+  let mut mapper = DaxMapper::new();
+  let m = mapper.setup_read_mapping(&mut store, &volume, f).unwrap();
+  let freed = m.block;
+
+  volume.unlink_no(&mut store, root, "f").unwrap();
+  let g = file_of(&mut store, &mut volume, "g", NEIGHBOUR_SECRET, DAX_PAGE);
+  let gblock = mapper.setup_read_mapping(&mut store, &volume, g).unwrap().block;
+  assert!(
+    gblock.region() == freed.region() && gblock.offset() == freed.offset(),
+    "the neighbour reused the freed physical block (the exfiltration precondition)"
+  );
+
+  // The hardware read of the guest's OWN stale mapping returns the neighbour's secret.
+  let raw = mapper.guest_read_raw(&store, &m, 0, DAX_PAGE);
+  assert!(
+    !raw.contains(&NEIGHBOUR_SECRET),
+    "EXFILTRATION: a DAX guest read another file's secret through the hardware path (0x{NEIGHBOUR_SECRET:02X} present); only pinning (never reuse a mapped block) upholds confidentiality"
+  );
+}
+
+/// VOLUME ESCAPE — INJECTION (integrity, cross tenant). Guarantee: a guest in one volume can never alter a file in
+/// another volume. Fails: the shard's content arena is shared across every volume it hosts, so an attacker volume's
+/// freed block is handed to a victim volume, and the attacker's stale hardware write corrupts the other tenant's
+/// file. This is the escape out of the volume boundary — the daemon never sees the write.
+#[test]
+#[ignore = "DEMONSTRATION: fails on purpose — a writable-DAX guest escapes its volume and corrupts another tenant on the hardware path until pinning + revocation exist"]
+fn writable_dax_must_not_let_a_guest_escape_into_another_volume() {
+  const POISON: u8 = 0xEE;
+  const VICTIM: u8 = 0x5A;
+  let mut store = store();
+  let mut attacker = volume(&mut store, 1 << 20); // volume A (prefix 7)
+  let mut victim = Volume::create(&mut store, clone_config(9)).unwrap(); // volume B (prefix 9), same shard arena
+
+  let fa = file_of(&mut store, &mut attacker, "fa", 0x11, DAX_PAGE);
+  let root_a = attacker.root_inode(&store).unwrap();
+  let mut mapper = DaxMapper::new();
+  let m = mapper
+    .setup_write_mapping(&mut store, &mut attacker, fa)
+    .unwrap();
+  let freed = m.block;
+  attacker.unlink_no(&mut store, root_a, "fa").unwrap();
+
+  // The OTHER volume allocates a file from the same arena and reuses the freed block.
+  let fb = file_of(&mut store, &mut victim, "fb", VICTIM, DAX_PAGE);
+  let vblock = mapper
+    .setup_read_mapping(&mut store, &victim, fb)
+    .unwrap()
+    .block;
+  assert!(
+    vblock.region() == freed.region() && vblock.offset() == freed.offset(),
+    "the victim volume reused the attacker's freed physical block (the escape precondition)"
+  );
+
+  mapper.guest_write_raw(&mut store, &m, 0, &[POISON; 100]);
+  let mut got = vec![0u8; 100];
+  victim.read(&store, fb, 0, &mut got).unwrap();
+  assert!(
+    got.iter().all(|&b| b == VICTIM),
+    "VOLUME ESCAPE: a DAX guest in one volume corrupted a file in ANOTHER volume on the same shard (got {:?}); the arena is shared, so only pinning + revocation confine a guest to its own volume",
+    &got[..8]
+  );
+}
+
+/// VOLUME ESCAPE — EXFILTRATION (confidentiality, cross tenant). Guarantee: a guest in one volume can never read a
+/// file in another volume. Fails: the attacker maps and frees a file; the victim volume reuses the block for a
+/// secret; the attacker reads it the hardware way — a cross-tenant confidentiality breach straight through the
+/// shared arena.
+#[test]
+#[ignore = "DEMONSTRATION: fails on purpose — a writable-DAX guest reads across the volume boundary on the hardware path until pinning + revocation exist"]
+fn writable_dax_must_not_read_across_a_volume_boundary() {
+  const SECRET_B: u8 = 0xAB;
+  let mut store = store();
+  let mut attacker = volume(&mut store, 1 << 20);
+  let mut victim = Volume::create(&mut store, clone_config(9)).unwrap();
+
+  let fa = file_of(&mut store, &mut attacker, "fa", 0x11, DAX_PAGE);
+  let root_a = attacker.root_inode(&store).unwrap();
+  let mut mapper = DaxMapper::new();
+  let m = mapper.setup_read_mapping(&mut store, &attacker, fa).unwrap();
+  let freed = m.block;
+  attacker.unlink_no(&mut store, root_a, "fa").unwrap();
+
+  let fb = file_of(&mut store, &mut victim, "fb", SECRET_B, DAX_PAGE);
+  let vblock = mapper
+    .setup_read_mapping(&mut store, &victim, fb)
+    .unwrap()
+    .block;
+  assert!(
+    vblock.region() == freed.region() && vblock.offset() == freed.offset(),
+    "the victim volume reused the attacker's freed physical block (the exfiltration precondition)"
+  );
+
+  let raw = mapper.guest_read_raw(&store, &m, 0, DAX_PAGE);
+  assert!(
+    !raw.contains(&SECRET_B),
+    "CROSS-VOLUME EXFILTRATION: a DAX guest read another tenant's secret through the hardware path (0x{SECRET_B:02X} present); only pinning + revocation confine a guest to its own volume"
+  );
+}
+
+/// TOCTOU (time-of-check to time-of-use). Guarantee: the check that authorizes an access governs the access. Fails:
+/// the daemon's `still_current` check and the guest's hardware use are on DIFFERENT code paths with an unbounded
+/// window between map and access. Here the check CAN see the staleness (the daemon-mediated write is refused), yet
+/// the hardware use is not gated by it and corrupts the reuser anyway. Re-checking at the daemon cannot close this —
+/// the guest never calls the daemon; only pinning the block and revoking the page table can.
+#[test]
+#[ignore = "DEMONSTRATION: fails on purpose — the daemon's check and the guest's hardware use are decoupled (TOCTOU) until pinning + revocation exist"]
+fn writable_dax_check_must_govern_the_hardware_use_not_a_different_path() {
+  const NEIGHBOUR: u8 = 0x5A;
+  let mut store = store();
+  let mut volume = volume(&mut store, 1 << 20);
+  let f = file_of(&mut store, &mut volume, "f", 0x11, DAX_PAGE);
+  let root = volume.root_inode(&store).unwrap();
+
+  let mut mapper = DaxMapper::new();
+  let m = mapper
+    .setup_write_mapping(&mut store, &mut volume, f)
+    .unwrap(); // check OK at map time (T0)
+
+  // The world changes after the check: the file is freed and a neighbour reuses the block.
+  volume.unlink_no(&mut store, root, "f").unwrap();
+  let g = file_of(&mut store, &mut volume, "g", NEIGHBOUR, DAX_PAGE);
+
+  // TIME OF CHECK: the daemon-mediated path refuses — `still_current` CAN detect the staleness.
+  assert!(
+    mapper
+      .guest_write(&mut store, &volume, &m, 0, &[0xEE; 50])
+      .is_err(),
+    "the daemon's still_current check (TOC) detects the stale mapping"
+  );
+  // TIME OF USE: the guest's hardware path is gated by nothing and corrupts the neighbour anyway.
+  mapper.guest_write_raw(&mut store, &m, 0, &[0xEE; 50]);
+
+  let mut got = vec![0u8; 50];
+  volume.read(&store, g, 0, &mut got).unwrap();
+  assert!(
+    got.iter().all(|&b| b == NEIGHBOUR),
+    "TOCTOU: the check refused the access but the hardware use was not bound by that verdict and corrupted the neighbour (got {:?}); the check and the use must be the same gate — pinning + revocation, not re-checking",
+    &got[..8]
+  );
+}
+
+/// RACE / LOST UPDATE. Guarantee: a guest's write to its own file is durably applied to that file or cleanly
+/// refused — never silently discarded or redirected. Fails: a concurrent VFS writer grows the file, moving its
+/// content block and freeing the old one WITHOUT revoking the guest. The guest's in-flight hardware write lands on
+/// the stale block, so its write vanishes from its own file (and, if the old block was reused, lands in a stranger).
+/// The move must revoke and quiesce the guest first.
+#[test]
+#[ignore = "DEMONSTRATION: fails on purpose — a block move under a live mapping loses the guest's write (race) until pinning + revocation exist"]
+fn writable_dax_a_block_move_must_not_lose_a_guest_write() {
+  const GUEST: u8 = 0xEE;
+  let mut store = store();
+  let mut volume = volume(&mut store, 1 << 20);
+  let f = file_of(&mut store, &mut volume, "f", 0x11, DAX_PAGE);
+
+  let mut mapper = DaxMapper::new();
+  let m = mapper
+    .setup_write_mapping(&mut store, &mut volume, f)
+    .unwrap(); // mapping on the file's current block B
+
+  // A concurrent writer grows f, reallocating it to a new block B' and freeing B — the guest is not revoked.
+  volume
+    .write(&mut store, f, 0, &vec![0x22; DAX_PAGE * 4])
+    .unwrap();
+
+  // The guest's in-flight hardware write hits the stale block B, not f's live block B'.
+  mapper.guest_write_raw(&mut store, &m, 0, &[GUEST; 100]);
+
+  let mut got = vec![0u8; 100];
+  volume.read(&store, f, 0, &mut got).unwrap();
+  assert!(
+    got.iter().all(|&b| b == GUEST),
+    "LOST UPDATE: a block move under a live mapping silently discarded the guest's write to its OWN file (f reads {:?}, not the guest's bytes); the move must revoke and quiesce the guest before freeing the block",
+    &got[..8]
+  );
+}
+
+/// TEARDOWN / DEADLOCK-ADJACENT. Guarantee: once a mapping is revoked, the guest can no longer reach the block, so
+/// the block is safe to free and reuse. Fails: `revoke` is daemon-side bookkeeping (it drops the record); it does
+/// not tear down the guest's page table, so after `revoke` returns true a pile of hardware writes still corrupt the
+/// block's reuser. This is also the ordering whose naive lock-based form deadlocks — the free waits for the teardown
+/// to quiesce the guest while the guest faults into the daemon — so the gate must revoke+quiesce, then free, with a
+/// pinned block in between.
+#[test]
+#[ignore = "DEMONSTRATION: fails on purpose — revoke does not quiesce the guest's hardware mapping before a free until pinning + revocation exist"]
+fn writable_dax_revoke_must_quiesce_before_the_block_is_freed() {
+  const POISON: u8 = 0xEE;
+  const VICTIM: u8 = 0x5A;
+  let mut store = store();
+  let mut volume = volume(&mut store, 1 << 20);
+  let f = file_of(&mut store, &mut volume, "f", 0x11, DAX_PAGE);
+  let root = volume.root_inode(&store).unwrap();
+
+  let mut mapper = DaxMapper::new();
+  let m = mapper
+    .setup_write_mapping(&mut store, &mut volume, f)
+    .unwrap();
+
+  // The daemon revokes the mapping — it believes the guest can no longer reach the block.
+  assert!(mapper.revoke(&m), "the mapping was revoked");
+
+  // ...but the block is freed and reused while the guest's page table is still standing.
+  volume.unlink_no(&mut store, root, "f").unwrap();
+  let g = file_of(&mut store, &mut volume, "g", VICTIM, DAX_PAGE);
+  let gblock = mapper
+    .setup_read_mapping(&mut store, &volume, g)
+    .unwrap()
+    .block;
+  assert!(
+    gblock.region() == m.block.region() && gblock.offset() == m.block.offset(),
+    "the victim reused the revoked mapping's block (the teardown-gap precondition)"
+  );
+
+  // A guest ignoring the revoke writes the hardware way — revoke did not stop it.
+  mapper.guest_write_raw(&mut store, &m, 0, &[POISON; 100]);
+  let mut got = vec![0u8; 100];
+  volume.read(&store, g, 0, &mut got).unwrap();
+  assert!(
+    got.iter().all(|&b| b == VICTIM),
+    "REVOKE IS A NO-OP ON THE HARDWARE PATH: after revoke() returned true a guest still corrupted the block's reuser (got {:?}); revoke must tear down the guest page table and the block must stay pinned until that teardown quiesces",
+    &got[..8]
+  );
+}
+
+/// RACE / PILE (many concurrent broken writers). Guarantee: no live file is ever touched by a guest whose own file
+/// is gone. Fails: a pile of guests map writable, their files are freed, a live victim reuses one of the blocks, and
+/// then every stale guest hammers its old mapping the hardware way. The victim that reused a freed block is
+/// corrupted by whichever stale guest held it — every freed-but-still-mapped block is a loaded gun.
+#[test]
+#[ignore = "DEMONSTRATION: fails on purpose — a pile of stale hardware writers corrupts a live file until pinning + revocation exist"]
+fn writable_dax_a_pile_of_stale_writers_must_not_corrupt_a_live_file() {
+  const POISON: u8 = 0xEE;
+  const VICTIM: u8 = 0x5A;
+  const PILE: usize = 16;
+  let mut store = store();
+  let mut volume = volume(&mut store, 1 << 24);
+  let root = volume.root_inode(&store).unwrap();
+  let mut mapper = DaxMapper::new();
+
+  let mut stale = Vec::new();
+  for i in 0..PILE {
+    let name = format!("p{i}");
+    let f = file_of(&mut store, &mut volume, &name, 0x11, DAX_PAGE);
+    let m = mapper
+      .setup_write_mapping(&mut store, &mut volume, f)
+      .unwrap();
+    stale.push((name, m));
+  }
+  for (name, _) in &stale {
+    volume.unlink_no(&mut store, root, name).unwrap();
+  }
+
+  // One live victim reuses one of the freed blocks.
+  let v = file_of(&mut store, &mut volume, "victim", VICTIM, DAX_PAGE);
+  let vblock = mapper
+    .setup_read_mapping(&mut store, &volume, v)
+    .unwrap()
+    .block;
+  assert!(
+    stale
+      .iter()
+      .any(|(_, m)| m.block.region() == vblock.region() && m.block.offset() == vblock.offset()),
+    "the victim reused one of the piled-up freed blocks (the pile precondition)"
+  );
+
+  // The pile: every stale guest writes poison the hardware way.
+  for (_, m) in &stale {
+    mapper.guest_write_raw(&mut store, m, 0, &[POISON; DAX_PAGE]);
+  }
+
+  let mut got = vec![0u8; DAX_PAGE];
+  volume.read(&store, v, 0, &mut got).unwrap();
+  assert!(
+    got.iter().all(|&b| b == VICTIM),
+    "PILE ESCAPE: one of {PILE} piled stale hardware writes corrupted a live file that reused a freed block (victim holds {:?}); every freed-but-still-mapped block is live until pinning + revocation",
+    &got[..8]
   );
 }
