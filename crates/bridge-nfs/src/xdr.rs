@@ -268,3 +268,54 @@ impl<'a> XdrReader<'a> {
     std::str::from_utf8(bytes).map_err(|_| XdrError::BadLength)
   }
 }
+
+#[cfg(test)]
+mod tests {
+  #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+  use super::*;
+
+  /// An XDR variable-opaque body: a 4-byte big-endian length (the *claimed* count, which may lie) then `bytes`.
+  fn framed(claimed: u32, bytes: &[u8]) -> Vec<u8> {
+    let mut v = claimed.to_be_bytes().to_vec();
+    v.extend_from_slice(bytes);
+    v
+  }
+
+  /// The foundational-parser guard (CWE-789/CWE-125: never allocate or read from an untrusted length). A declared
+  /// opaque length past the caller's cap or the bytes that remain is refused `BadLength` before any bytes are
+  /// taken — the reader returns a borrowed slice, so nothing is ever allocated sized by the length — and a
+  /// truncated length word is `Truncated`.
+  #[test]
+  fn a_hostile_opaque_length_is_refused_before_reading() {
+    assert!(matches!(
+      XdrReader::new(&framed(u32::MAX, &[])).opaque(1 << 20),
+      Err(XdrError::BadLength)
+    ));
+    assert!(matches!(
+      XdrReader::new(&framed(100, &[7u8; 100])).opaque(16),
+      Err(XdrError::BadLength)
+    ));
+    assert!(matches!(
+      XdrReader::new(&framed(100, &[7u8; 4])).opaque(1 << 20),
+      Err(XdrError::BadLength)
+    ));
+    assert!(matches!(
+      XdrReader::new(&[0u8; 2]).opaque(16),
+      Err(XdrError::Truncated)
+    ));
+  }
+
+  /// A well-formed opaque reads its bytes (3 bytes + one XDR pad), and a string that is not UTF-8 is `BadLength`,
+  /// never a panic.
+  #[test]
+  fn a_well_formed_opaque_reads_and_bad_utf8_is_refused() {
+    assert_eq!(
+      XdrReader::new(&framed(3, &[1, 2, 3, 0])).opaque(16).unwrap(),
+      &[1u8, 2, 3]
+    );
+    assert!(matches!(
+      XdrReader::new(&framed(2, &[0xFF, 0xFE, 0, 0])).string(16),
+      Err(XdrError::BadLength)
+    ));
+  }
+}
