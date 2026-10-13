@@ -1512,6 +1512,7 @@ fn distinct_consumers_under_one_uid_hold_only_the_rights_shared_with_them_until_
   let (consumer, capability) = enroll(&mut owner, &secret, account);
   only_the_genuine_capability_binds_the_channel(&mut workload, consumer, &capability);
   let id = the_consumer_holds_only_the_right_shared(&mut owner, &mut workload, account, consumer);
+  a_consumer_lists_the_shared_volume_and_not_an_unshared_one(&mut owner, &mut workload, id);
   once_revoked_every_verb_refuses_before_any_effect(
     &mut owner,
     &mut workload,
@@ -1520,6 +1521,33 @@ fn distinct_consumers_under_one_uid_hold_only_the_rights_shared_with_them_until_
     id,
   );
   daemon.stop();
+}
+
+/// §4.13 access lists at the volume listing: a consumer's `List` shows exactly the volumes shared with it for
+/// reading — the one already shared (`shared`), never a second volume the owner keeps private. The list verb
+/// filters by `rights_of(v, principal).read` (verbs::list), so an unshared volume's very name and size stay
+/// invisible to the consumer, not merely unreadable. Guards against a listing that leaks other tenants' volume
+/// names across the shared uid (the same filter the MCP `volumes()` query relies on).
+fn a_consumer_lists_the_shared_volume_and_not_an_unshared_one(
+  owner: &mut Client,
+  workload: &mut Client,
+  shared: VolumeId,
+) {
+  let ReplyBody::Created { id: private } = owner.call(&scratch("owner-kept-private")) else {
+    panic!("create the owner-only volume");
+  };
+  let ReplyBody::Listed { volumes } = workload.call(&RequestBody::List) else {
+    panic!("the consumer lists its accessible volumes");
+  };
+  let ids: Vec<VolumeId> = volumes.iter().map(|v| v.id).collect();
+  assert!(
+    ids.contains(&shared),
+    "the consumer must list the volume shared with it for reading: {ids:?}"
+  );
+  assert!(
+    !ids.contains(&private),
+    "the consumer must not list a volume the owner kept private — its name must stay invisible: {ids:?}"
+  );
 }
 
 /// A forged proof of issuer authority refuses: an agent cannot enroll itself.
