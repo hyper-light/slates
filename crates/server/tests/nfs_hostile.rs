@@ -18,9 +18,9 @@ use slates_server::{Daemon, DaemonConfig, SegmentSource};
 
 mod common;
 use common::nfs::{
-  MOUNT_PROGRAM, NFS_PROGRAM, call_accept_status, create, create_status, lookup_raw_status,
-  lookup_status, mkdir_status, mount, opaque, read, read_status, readdirplus_status, remove_status,
-  rmdir_status, status, symlink_status, write, write_at_status,
+  MOUNT_PROGRAM, NFS_PROGRAM, call_accept_status, create, create_status, lookup, lookup_raw_status,
+  lookup_status, mkdir, mkdir_status, mount, opaque, read, read_status, readdirplus_status,
+  remove_status, rmdir_status, status, symlink_status, write, write_at_status,
 };
 
 /// Shape: honest clients, each on its own connection and file.
@@ -845,6 +845,57 @@ fn mkdir_and_symlink_refuse_dot_names() {
   // Non-vacuity: a normal name still creates through both.
   assert_eq!(mkdir_status(&mut s, &root, b"realdir", 6), 0, "a normal MKDIR works");
   assert_eq!(symlink_status(&mut s, &root, b"reallink", "target", 7), 0, "a normal SYMLINK works");
+
+  drop(s);
+  drop(daemon);
+}
+
+/// CWE-22 (the classic NFS "`..` at the export root climbs out") over a raw socket. Unlike CREATE/MKDIR/REMOVE,
+/// LOOKUP `..` is a legitimate traversal that MUST resolve — Linux's client sends it to reconnect a directory it
+/// holds only by handle (`nfs_get_parent`, `open_by_handle_at`, after a server restart) — so it cannot simply be
+/// refused; it must resolve to the parent and no further. slates resolves `..` to `volume.parent_no`, whose root
+/// case returns the root itself (`crates/bridge-core/src/volume_bridge.rs`, the pin added 2026-10-06 by the
+/// hostile-names battery), and a scoped subtree mount pins `..` at its own scope root too
+/// (`crates/bridge-core/src/scoped.rs`). So the volume root's `..` is the root, never the synthetic root above the
+/// volumes (from which a tenant could enumerate or enter others) nor a host parent. Against a live daemon over a
+/// real socket (no kernel mount): `..` from a subdirectory reaches the volume root where `sub` lives
+/// (non-vacuity — a legitimate climb to the parent), `..` at the volume root returns the root itself (the same
+/// `sub` resolves through it to the BYTE-IDENTICAL handle), and a second `..` from the root still names the root.
+/// No `..`, however many, reaches a wider view.
+#[test]
+fn lookup_dotdot_never_climbs_out_of_the_mount_cwe_22() {
+  let (daemon, instance) = single_shard_daemon("dotdot");
+  provision(&instance, "dd");
+  let port = daemon.nfs_port().expect("the daemon is serving NFS");
+  let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+  let root = mount(&mut s, &daemon.mount_capability("dd").unwrap().unwrap(), 1);
+
+  let sub = mkdir(&mut s, &root, "sub", 2);
+
+  // Non-vacuity: `..` from the subdirectory legitimately reaches its parent, the volume root, where `sub` lives —
+  // so LOOKUP `..` is not vacuously "always refused".
+  let from_sub = lookup(&mut s, &sub, "..", 3);
+  assert_eq!(
+    lookup(&mut s, &from_sub, "sub", 4),
+    sub,
+    "`..` from a subdirectory reaches the volume root (sub's parent), where sub resolves to its own handle"
+  );
+
+  // The escape: `..` at the volume root. It is the root itself (pinned) — `sub` resolves through it to the
+  // identical handle — never a wider parent (the synthetic root or a host directory, where `sub` would be absent).
+  let from_root = lookup(&mut s, &root, "..", 5);
+  assert_eq!(
+    lookup(&mut s, &from_root, "sub", 6),
+    sub,
+    "`..` at the volume root is the root itself — sub resolves through it to the identical handle, no climb out"
+  );
+  // A second `..` from the root still names the root: `..` is a fixed point at the mount top, never a staircase.
+  let from_root_again = lookup(&mut s, &from_root, "..", 7);
+  assert_eq!(
+    lookup(&mut s, &from_root_again, "sub", 8),
+    sub,
+    "a second `..` from the root still names the root — `..` never climbs above the mount"
+  );
 
   drop(s);
   drop(daemon);
