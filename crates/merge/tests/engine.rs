@@ -831,6 +831,45 @@ fn a_truncated_increment_refuses() {
   );
 }
 
+/// A decode is a typed result and, when it succeeds, re-encoding is a fixed point.
+fn assert_increment_canonical_or_typed(bytes: &[u8]) {
+  if let Ok(inc) = Increment::decode(bytes) {
+    let once = inc.encode();
+    assert_eq!(
+      Increment::decode(&once).map(|i| i.encode()).ok(),
+      Some(once),
+      "re-encoding a decoded increment is a fixed point"
+    );
+  }
+}
+
+proptest! {
+  #![proptest_config(slates_test_seeds::unseeded(proptest::test_runner::Config::default()))]
+
+  /// Hostile-input fuzz of the increment decoder (the fleet chain's wire form, §4.8/§4.16): any byte string
+  /// decodes to a typed result, never a panic (proptest fails on one), and a decode is canonical. The second arm
+  /// flips one byte of a valid increment at a random index - a torn or bit-flipped chain entry (CLAUDE.md §4) -
+  /// and still decodes to a typed result, exercising the id/base/length framing and the evidence-count bound.
+  #[test]
+  fn any_increment_bytes_decode_to_a_typed_result_never_a_panic(
+    body in proptest::collection::vec(any::<u8>(), 0..512),
+    index in any::<usize>(),
+    mask in 1u8..=255,
+  ) {
+    assert_increment_canonical_or_typed(&body);
+    let mut bytes = Build::new()
+      .create("f", b"hi")
+      .setxattr("f", "user.k", b"v")
+      .at(1, 0)
+      .encode();
+    if !bytes.is_empty() {
+      let i = index % bytes.len();
+      bytes[i] ^= mask;
+    }
+    assert_increment_canonical_or_typed(&bytes);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // The content verdict's generative oracle (§4.16 "The verdict, two pure passes", D-27; D-20's
 // model-based tests): the block reference in `tests/common/mod.rs`, shared with the sixteen-agent
