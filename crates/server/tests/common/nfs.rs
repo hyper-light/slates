@@ -547,6 +547,61 @@ pub(crate) fn readdirplus(
   names
 }
 
+/// NFS READDIRPLUS of `dir_fh` → the `(name, file handle)` of each entry, keeping the `name_handle` the
+/// READDIRPLUS reply hands out directly (absent when the reply carried none). This is the surface of
+/// CVE-2021-3178, where a scoped NFS export's `..` entry leaked the parent directory's handle through the
+/// listing itself — a client that follows a READDIRPLUS entry handle never does a LOOKUP, so confining LOOKUP
+/// `..` alone is not enough; the entry handle must be confined too.
+pub(crate) fn readdirplus_entries(
+  stream: &mut (impl Read + Write),
+  dir_fh: &[u8],
+  xid: u32,
+) -> Vec<(String, Option<Vec<u8>>)> {
+  let mut args = Vec::new();
+  opaque(dir_fh, &mut args);
+  args.extend_from_slice(&0u64.to_be_bytes()); // cookie
+  args.extend_from_slice(&[0u8; 8]); // cookieverf
+  args.extend_from_slice(&512u32.to_be_bytes()); // dircount (advisory)
+  args.extend_from_slice(&8192u32.to_be_bytes()); // maxcount
+  let reply = call(stream, NFS_PROGRAM, 17, &args, xid);
+  assert_eq!(status(&reply), 0, "READDIRPLUS");
+  let mut off = 4;
+  let dir_follows = u32::from_be_bytes(reply[off..off + 4].try_into().unwrap());
+  off += 4;
+  if dir_follows == 1 {
+    off += 84; // dir post_op_attr
+  }
+  off += 8; // cookieverf
+  let mut entries = Vec::new();
+  loop {
+    let follows = u32::from_be_bytes(reply[off..off + 4].try_into().unwrap());
+    off += 4;
+    if follows == 0 {
+      break;
+    }
+    off += 8; // fileid
+    let (name, next) = read_opaque(&reply, off);
+    off = next;
+    off += 8; // cookie
+    let name_attr = u32::from_be_bytes(reply[off..off + 4].try_into().unwrap());
+    off += 4;
+    if name_attr == 1 {
+      off += 84; // name_attributes
+    }
+    let name_handle = u32::from_be_bytes(reply[off..off + 4].try_into().unwrap());
+    off += 4;
+    let handle = if name_handle == 1 {
+      let (handle, next) = read_opaque(&reply, off);
+      off = next;
+      Some(handle)
+    } else {
+      None
+    };
+    entries.push((String::from_utf8_lossy(&name).into_owned(), handle));
+  }
+  entries
+}
+
 /// An `nfstime3` as (seconds, nanoseconds).
 pub(crate) type Time3 = (u32, u32);
 

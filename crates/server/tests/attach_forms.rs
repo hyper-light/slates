@@ -845,6 +845,81 @@ fn a_scoped_host_mount_reaches_nothing_outside_its_directory() {
   drop(daemon);
 }
 
+/// CVE-2021-3178, over a raw socket: an NFSv3 READDIRPLUS of a SCOPED export's root must not hand out the parent
+/// directory's handle through the listing itself. In the Linux kernel's nfsd this exact bug — READDIRPLUS of a
+/// mounted subdirectory emitting the `..` entry with the *parent's* file handle — let a client that followed that
+/// entry handle (never doing a LOOKUP) climb out of the export. So confining LOOKUP `..` (tested in
+/// `a_scoped_host_mount_reaches_nothing_outside_its_directory`) is not enough; the handle a READDIRPLUS entry
+/// carries must be confined too. slates remaps a scoped readdir's `..` entry to the scope root
+/// (`crates/bridge-core/src/scoped.rs` `fn readdir`), so the listing hands out the scope root's handle, not the
+/// real parent's. Do: scope `/shared` with `/private/secret` OUTSIDE it; READDIRPLUS the scoped root; take the
+/// `..` entry's OWN handle from the reply and follow it directly. Expect: it lists the scope's contents (`g`),
+/// never the volume root's `private`/`shared`, and a LOOKUP of `private`/`secret` through it is refused.
+#[cfg(unix)]
+#[test]
+fn a_scoped_readdirplus_dotdot_entry_handle_cannot_climb_out_cve_2021_3178() {
+  let (daemon, instance) = single_shard_daemon("scoped-readdirplus-dotdot");
+  let Some(port) = daemon.nfs_port() else {
+    eprintln!("SKIP: the loopback export did not bind, so no host mount is offered here");
+    return;
+  };
+  let mut client = Client::connect(&instance);
+  let volume = create(&mut client, "scoped");
+  let owner_path = daemon.mount_capability("scoped").unwrap().unwrap();
+  let mut owner = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+  let owner_root = common::nfs::mount(&mut owner, &owner_path, 1);
+  let shared = common::nfs::mkdir(&mut owner, &owner_root, "shared", 2);
+  let private = common::nfs::mkdir(&mut owner, &owner_root, "private", 3);
+  let secret = common::nfs::create(&mut owner, &private, "secret", 4);
+  common::nfs::write(&mut owner, &secret, b"hidden", 5);
+  let inside = common::nfs::create(&mut owner, &shared, "g", 6);
+  common::nfs::write(&mut owner, &inside, b"inside", 7);
+  let _ = owner_root;
+
+  let path = scoped_mount(&mut client, volume, "/shared", "scoped");
+  let mut scoped = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+  let root = common::nfs::mount(&mut scoped, &path, 1);
+
+  // READDIRPLUS the scope root and take the `..` ENTRY's own handle straight from the listing — the surface the
+  // CVE leaked. (A reply that carried no `..` handle would be equally safe — the leak surface absent — but slates
+  // does emit one, remapped; `expect` makes a silent "no handle" a visible failure rather than a vacuous pass.)
+  let entries = common::nfs::readdirplus_entries(&mut scoped, &root, 2);
+  assert!(
+    entries.iter().any(|(name, handle)| name == "g" && handle.is_some()),
+    "non-vacuity: READDIRPLUS carries entry handles at all ({entries:?})"
+  );
+  let dotdot = entries
+    .iter()
+    .find(|(name, _)| name == "..")
+    .and_then(|(_, handle)| handle.clone())
+    .expect("the scoped READDIRPLUS reply carries a handle for the `..` entry");
+
+  // Following that handle directly must stay inside the scope: it lists the scope's own contents, NEVER the
+  // volume root's `private`/`shared` (which is what the real parent would show).
+  let via_dotdot = common::nfs::readdirplus(&mut scoped, &dotdot, 3);
+  assert!(
+    via_dotdot.iter().all(|name| name != "private" && name != "shared"),
+    "the `..` entry handle from a scoped READDIRPLUS must not expose the volume root's siblings: {via_dotdot:?}"
+  );
+  assert!(
+    via_dotdot.iter().any(|name| name == "g"),
+    "the `..` entry handle is the scope root itself, which lists the scope's own `g`: {via_dotdot:?}"
+  );
+
+  // And a LOOKUP of the out-of-scope siblings through the `..` entry handle is refused.
+  assert!(
+    common::nfs::lookup_status(&mut scoped, &dotdot, "private", 4).is_err(),
+    "a LOOKUP of `private` through the scoped `..` entry handle must be refused"
+  );
+  assert!(
+    common::nfs::lookup_status(&mut scoped, &dotdot, "secret", 5).is_err(),
+    "a LOOKUP of `secret` through the scoped `..` entry handle must be refused"
+  );
+
+  drop(client);
+  drop(daemon);
+}
+
 /// Every handle in `outside` (private, its secret, the volume's root), forged with the scoped mount's capability
 /// (`root`), is refused by GETATTR, LOOKUP and READ alike.
 #[cfg(unix)]
