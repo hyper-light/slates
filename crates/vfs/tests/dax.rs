@@ -606,3 +606,35 @@ fn destroying_a_volume_revokes_all_its_mappings() {
     "destroy revoked every mapping of the volume"
   );
 }
+
+/// §4.6, AC-4.12 (teardown on truncate): a writable mapping held across a daemon-path truncate that SHRINKS the file
+/// is revoked before the truncate frees the tail, so the guest's stale window can never reach the bytes the truncate
+/// released — which the arena may scrub and reuse for another file. Map a full page writable, truncate to 100 bytes
+/// through the daemon, then drive the hardware path via the STALE mapping: it is not live, its read is zeros (never
+/// the freed tail), and its write is a no-op, and the file stays the truncated size.
+#[test]
+fn a_truncate_while_mapped_revokes_the_window_so_the_freed_tail_is_inert() {
+  let mut store = store();
+  let mut volume = volume(&mut store, 1 << 20);
+  let f = file_of(&mut store, &mut volume, "f", 0x44, DAX_PAGE);
+  let m = volume.dax_map_write(&mut store, f).unwrap();
+  assert_eq!(m.file_len, DAX_PAGE, "the file is mapped at its full page");
+
+  // Truncate small through the daemon: this revokes the held mapping and frees the tail.
+  volume.truncate(&mut store, f, 100).unwrap();
+  assert!(!store.dax_is_live(&m), "the truncate revoked the held mapping");
+
+  // The stale window cannot reach the freed tail: its hardware read is zeros, its write a no-op.
+  let tail = store.dax_read_raw(&m, 200, 100);
+  assert!(
+    tail.iter().all(|&b| b == 0),
+    "the stale mapping reads zeros, never the freed tail ({:?})",
+    &tail[..8]
+  );
+  store.dax_write_raw(&m, 200, &[0xEE; 100]);
+  assert_eq!(
+    volume.stat(&store, f).unwrap().size,
+    100,
+    "the file stays the truncated size; the stale write went nowhere"
+  );
+}
