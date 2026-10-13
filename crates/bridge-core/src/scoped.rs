@@ -430,7 +430,24 @@ impl Bridge for ScopedBridge<'_> {
     cursor: InvalidationCursor,
     out: &mut Vec<Invalidation>,
   ) -> Result<InvalidationCursor, VfsError> {
-    self.inner.invalidations(cx, cursor, out)
+    // The inner bridge draws its invalidations from the whole volume's journal, so the stream names objects
+    // across every scope. The scope invariant holds here too — an `Inode` invalidation names an inode and an
+    // `Entry` names a directory and a file name, and a scoped view must reveal neither an out-of-scope inode nor
+    // a name in an out-of-scope directory (§4.6; "nothing outside is ever shown"). Keep only those the scope
+    // admits, by the same `within` climb every other verb uses; the parent's membership is the test for an
+    // entry, exactly as a listing checks its entries.
+    let start = out.len();
+    let next = self.inner.invalidations(cx, cursor, out)?;
+    for invalidation in out.split_off(start) {
+      let object = match &invalidation {
+        Invalidation::Inode { ino, .. } => *ino,
+        Invalidation::Entry { parent, .. } => *parent,
+      };
+      if self.inner.within(ObjectId::new(object, 0), self.scope, cx)? {
+        out.push(invalidation);
+      }
+    }
+    Ok(next)
   }
 
   fn seen(&mut self, cx: &OpContext) -> InvalidationCursor {

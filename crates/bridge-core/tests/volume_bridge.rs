@@ -1312,6 +1312,75 @@ fn an_alias_homed_in_another_directory_inside_the_scope_is_listed_and_found() {
   assert_eq!(scoped.lookup(oid(b), &cx, "alias").unwrap().ino, f.ino);
 }
 
+/// AUD-29-76, §4.6 (the scope invariant "nothing outside is ever shown", `scoped.rs`). The cache-invalidation
+/// stream a scoped view hands its transport must name only objects within the scope. An `Inode`/`Entry`
+/// invalidation carries a real inode number and, for an entry, a real file name, drawn from the *whole volume's*
+/// journal; forwarded unfiltered, a tenant confined to one directory would learn the inode numbers, change
+/// activity, and even the file names of other tenants' directories in the same volume — a cross-scope
+/// side-channel. Do: build `/shared` (the scope) and `/private/secret` (outside it), take the scoped cursor,
+/// then — as another attachment (the SDK path) would — write `private/secret`, create `private/leaked`, and
+/// create one in-scope `shared/visible`; read the scoped view's owed invalidations. Expect: not one names
+/// `private`, `secret`, or `leaked`; the in-scope `visible` is present (non-vacuity: the filter is not blanket).
+#[test]
+fn a_scoped_view_never_leaks_an_out_of_scope_cache_invalidation() {
+  use slates_bridge_core::Invalidation;
+  use slates_bridge_core::scoped::ScopedBridge;
+  use slates_vfs::ids::InodeNo;
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let cx = rw_cx();
+
+  // Build the scope and an out-of-scope neighbour, then take the scoped cursor so only later changes appear.
+  let (shared, private, secret, cursor) = {
+    let mut inner = VolumeBridge::new(VolumeId { bytes: [0; 16] }, &mut vol, &mut store);
+    let (shared, private, secret) = shared_and_private(&mut inner, &cx);
+    let mut scoped = ScopedBridge::new(&mut inner, shared);
+    let cursor = scoped.seen(&cx);
+    (shared, private, secret, cursor)
+  };
+
+  // Another attachment changes out-of-scope objects, and one in-scope object for non-vacuity.
+  vol
+    .write(&mut store, InodeNo(secret), 0, b"top secret bytes")
+    .unwrap();
+  let leaked = vol
+    .create_file_no(&mut store, InodeNo(private), "leaked", 0o600)
+    .unwrap();
+  vol
+    .create_file_no(&mut store, InodeNo(shared), "visible", 0o644)
+    .unwrap();
+
+  // The scoped view reads its owed invalidations.
+  let mut owed = Vec::new();
+  {
+    let mut inner = VolumeBridge::new(VolumeId { bytes: [0; 16] }, &mut vol, &mut store);
+    let mut scoped = ScopedBridge::new(&mut inner, shared);
+    scoped.invalidations(&cx, cursor, &mut owed).unwrap();
+  }
+
+  // Not one invalidation may name an out-of-scope object.
+  for inv in &owed {
+    match inv {
+      Invalidation::Inode { ino, .. } => assert!(
+        *ino != private && *ino != secret && *ino != leaked.0,
+        "an out-of-scope inode leaked through the scoped invalidation stream: {inv:?}"
+      ),
+      Invalidation::Entry { parent, name, .. } => assert!(
+        *parent != private && *parent != secret,
+        "an out-of-scope entry leaked ({name}) through the scoped invalidation stream: {inv:?}"
+      ),
+    }
+  }
+  // Non-vacuity: the in-scope change is still delivered — the filter is confinement, not a blanket drop.
+  assert!(
+    owed.iter().any(|inv| matches!(
+      inv,
+      Invalidation::Entry { parent, name, .. } if *parent == shared && name == "visible"
+    )),
+    "the in-scope invalidation was dropped — the stream is not vacuously empty: {owed:?}"
+  );
+}
+
 /// A-61 (a mount taken over after its daemon died). Do: serve a volume holding `lost` and `kept` through a bridge
 /// told `lost` lost writes; flush `lost` twice through a handle the dead daemon issued (one this bridge never
 /// did), then fsync it twice and flush it; flush `kept` through another; flush `lost` through a handle opened
