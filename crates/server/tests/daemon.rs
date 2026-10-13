@@ -1513,6 +1513,7 @@ fn distinct_consumers_under_one_uid_hold_only_the_rights_shared_with_them_until_
   only_the_genuine_capability_binds_the_channel(&mut workload, consumer, &capability);
   let id = the_consumer_holds_only_the_right_shared(&mut owner, &mut workload, account, consumer);
   a_consumer_lists_the_shared_volume_and_not_an_unshared_one(&mut owner, &mut workload, id);
+  a_read_only_consumer_cannot_grant_itself_more_rights(&mut workload, account, consumer, id);
   once_revoked_every_verb_refuses_before_any_effect(
     &mut owner,
     &mut workload,
@@ -1521,6 +1522,45 @@ fn distinct_consumers_under_one_uid_hold_only_the_rights_shared_with_them_until_
     id,
   );
   daemon.stop();
+}
+
+/// §4.13 (the classic privilege-escalation: a reader bootstrapping itself to admin). The consumer holds a shared
+/// *read* on `id`; it tries to `Share` the volume to its own principal with write+admin. `Share` itself needs the
+/// `admin` right (verbs::share gates on `rights_of(record, principal).admin`), which the reader lacks — refused
+/// `Forbidden`, and the refused self-share grants nothing, so an admin verb (Destroy) is still refused after it.
+fn a_read_only_consumer_cannot_grant_itself_more_rights(
+  workload: &mut Client,
+  account: u32,
+  consumer: u64,
+  id: VolumeId,
+) {
+  let escalate = RequestBody::Share {
+    volume: id,
+    principal: slates_ipc::protocol::Principal::Consumer { account, consumer },
+    rights: slates_ipc::protocol::Rights {
+      read: true,
+      write: true,
+      admin: true,
+    },
+  };
+  assert!(
+    matches!(
+      workload.call(&escalate),
+      ReplyBody::Refused {
+        refusal: Refusal::Forbidden { .. }
+      }
+    ),
+    "a read-only consumer must not grant itself more rights by sharing to its own principal"
+  );
+  assert!(
+    matches!(
+      workload.call(&RequestBody::Destroy { volume: id }),
+      ReplyBody::Refused {
+        refusal: Refusal::Forbidden { .. }
+      }
+    ),
+    "the refused self-share granted no admin — Destroy is still Forbidden"
+  );
 }
 
 /// §4.13 access lists at the volume listing: a consumer's `List` shows exactly the volumes shared with it for
