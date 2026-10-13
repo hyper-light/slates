@@ -194,6 +194,59 @@ fn a_lookup_that_is_not_one_entry_never_leaves_the_base() {
   host.close_dir(root);
 }
 
+/// AUD-29-62 / R1 (containment through a symlink). A symlink in a base directory that points OUTSIDE the base —
+/// an absolute host path, or one climbing out with `..` — must never be followed by the host reader to read the
+/// outside file's bytes. slates exposes the symlink's target string (the guest resolves it in the guest's own
+/// namespace) but never resolves it server-side, so a base can never become a window onto an arbitrary host
+/// path (which would be a disk escape past R1). Over a real base directory in the build output: opening the link
+/// as a file or a directory is refused (`O_NOFOLLOW` guards the final component), reading the link returns its
+/// raw target (never the target's bytes), a real file in the base still reads, and no followed-link handle leaks.
+#[cfg(unix)]
+#[test]
+fn a_base_symlink_pointing_outside_is_never_followed_to_the_host() {
+  let owned = BuildOutputDir::new("symlink-escape");
+  let base = owned.0.clone();
+  // A secret file OUTSIDE the base (a sibling in the build output) the climbing link aims at, and the base's
+  // own file for the non-vacuity read.
+  let base_name = base.file_name().unwrap().to_str().unwrap().to_owned();
+  let outside = base.with_file_name(format!("{base_name}-secret"));
+  std::fs::write(&outside, b"OUTSIDE SECRET the base must never read\n").unwrap();
+  std::fs::write(base.join("inside.txt"), b"inside").unwrap();
+  // Symlinks in the base aimed out of it: an absolute host path, a relative climb to the sibling secret, and a
+  // deep `..` climb to an absolute host file.
+  std::os::unix::fs::symlink("/etc/hosts", base.join("evil_abs")).unwrap();
+  std::os::unix::fs::symlink(&outside, base.join("evil_rel")).unwrap();
+  std::os::unix::fs::symlink("../../../../../../../etc/hosts", base.join("evil_climb")).unwrap();
+
+  let (mut host, root) = OsHost::open_root(&base).unwrap();
+  for link in ["evil_abs", "evil_rel", "evil_climb"] {
+    assert!(
+      host.open_file(root, link).is_err(),
+      "the host followed {link} as a file and could read outside the base"
+    );
+    assert!(
+      host.open_dir(root, link).is_err(),
+      "the host followed {link} as a directory"
+    );
+  }
+  // The links are exposed as their raw targets (the guest, not the server, resolves them), never read here.
+  assert_eq!(host.read_link(root, "evil_abs").unwrap().as_ref(), "/etc/hosts");
+  assert_eq!(
+    host.read_link(root, "evil_rel").unwrap().as_ref(),
+    outside.to_str().unwrap()
+  );
+
+  // Non-vacuity: a real file in the base still opens and reads its disk bytes.
+  let inside = host.open_file(root, "inside.txt").unwrap();
+  let mut buf = [0u8; 6];
+  let n = host.read_at(inside, 0, &mut buf).unwrap();
+  assert_eq!(&buf[..n], b"inside", "a genuine base file still reads");
+  host.close_file(inside);
+
+  assert_eq!(host.open_handles(), 1, "no followed symlink kept a handle");
+  host.close_dir(root);
+}
+
 /// AC-1.9 on a real tree: an overlay over `crates/` costs one directory open and one node; a
 /// path resolution opens only the directories on it, and a read returns the disk's bytes.
 #[test]
