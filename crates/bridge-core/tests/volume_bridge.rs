@@ -1372,6 +1372,73 @@ fn an_alias_homed_in_another_directory_inside_the_scope_is_listed_and_found() {
   assert_eq!(scoped.lookup(oid(b), &cx, "alias").unwrap().ino, f.ino);
 }
 
+/// AUD-29-76, the scoped listing PAGINATED (not just one page). A directory inside the scope can hold entries the
+/// scope drops — hard-link aliases of a file homed outside it — interleaved with in-scope files. If the scoped
+/// readdir filtered each inner page in isolation, a page that is entirely out-of-scope aliases would come back
+/// empty, and a client paging by cookie reads an empty page as end-of-directory — silently missing the in-scope
+/// files in later pages. Do: in `/shared/d` link an out-of-scope file in as twenty aliases `a00..a19` (sorted
+/// before) and create two in-scope files `z0`, `z1`; page the scoped view by cookie with a small limit, as a
+/// client does. Expect: `z0` and `z1` are both listed (no in-scope entry is lost behind a fully-dropped page),
+/// and no alias ever appears.
+#[test]
+fn a_scoped_directory_paged_by_cookie_never_loses_an_in_scope_entry_behind_dropped_pages() {
+  use slates_bridge_core::scoped::ScopedBridge;
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let mut inner = VolumeBridge::new(VolumeId { bytes: [0; 16] }, &mut vol, &mut store);
+  let cx = rw_cx();
+  let (shared, _, _) = shared_and_private(&mut inner, &cx);
+  let d = inner.mkdir(oid(shared), &cx, "d", 0o755).unwrap().ino;
+  // A file homed OUTSIDE the scope, hard-linked into the in-scope directory many times: each alias is dropped by
+  // the scope (homed elsewhere). Many of them, so that in the directory's (hash) order some run of a page's worth
+  // falls between in-scope files — the case that makes a scoped page come back empty with more still to come.
+  let root = inner.root(&cx).unwrap();
+  let outside = inner.mkdir(oid(root), &cx, "outside", 0o755).unwrap().ino;
+  // One name space ("e{nn}"), so entries interleave by the directory's own order rather than clustering by
+  // prefix; scope-membership is set by HOME, not name. A spread subset is in-scope (homed in `d`); the rest are
+  // distinct out-of-scope inodes linked in (dropped by the scope). A late-ordered in-scope entry sitting behind a
+  // page's worth of droppable ones is the case that loses it.
+  let in_scope_ix: [u32; 4] = [1, 2, 3, 67];
+  let mut in_scope: Vec<String> = Vec::new();
+  for n in 0..68u32 {
+    let name = format!("e{n:02}");
+    if in_scope_ix.contains(&n) {
+      let (z, zfh) = inner.create(oid(d), &cx, &name, 0o644, 0).unwrap();
+      inner.release(oid(z.ino), &cx, zfh).unwrap();
+      in_scope.push(name);
+    } else {
+      let (g, gfh) = inner.create(oid(outside), &cx, &format!("g{n:02}"), 0o644, 0).unwrap();
+      inner.release(oid(g.ino), &cx, gfh).unwrap();
+      inner.link(oid(g.ino), oid(d), &cx, &name).unwrap();
+    }
+  }
+
+  let mut scoped = ScopedBridge::new(&mut inner, shared);
+  // Page as a client does: resume at the last entry's cookie, stop at the first empty page (its EOF signal, the
+  // same rule NFS encodes at procedures.rs `eof = sent == rows.len() && rows.len() < limit`).
+  let mut seen: Vec<String> = Vec::new();
+  let mut cookie = 0u64;
+  for _ in 0..200 {
+    let page = scoped.readdir(oid(d), &cx, 0, cookie, 4).unwrap();
+    let Some(last) = page.last() else { break };
+    cookie = last.cookie;
+    for entry in &page {
+      if entry.name != "." && entry.name != ".." {
+        seen.push(entry.name.clone());
+      }
+    }
+  }
+  assert!(
+    seen.iter().all(|n| !n.starts_with('a')),
+    "an out-of-scope alias leaked into the scoped listing: {seen:?}"
+  );
+  let missed: Vec<&String> = in_scope.iter().filter(|z| !seen.contains(z)).collect();
+  assert!(
+    missed.is_empty(),
+    "a paged scoped listing lost in-scope files behind fully-dropped pages: missed {missed:?}, saw {seen:?}"
+  );
+}
+
 /// AUD-29-76, §4.6 (the scope invariant "nothing outside is ever shown", `scoped.rs`). The cache-invalidation
 /// stream a scoped view hands its transport must name only objects within the scope. An `Inode`/`Entry`
 /// invalidation carries a real inode number and, for an entry, a real file name, drawn from the *whole volume's*
