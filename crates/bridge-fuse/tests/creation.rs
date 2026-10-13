@@ -168,3 +168,62 @@ fn a_creation_takes_the_creators_umask_and_ids_and_the_setgid_parents_group() {
     (0o775 | S_ISGID, CREATOR_UID, ENROLLED_GROUP)
   );
 }
+
+/// Dispatches one FUSE request and returns the reply's errno (0 is success, negative is `-errno`).
+fn fuse_errno(
+  bridge: &mut VolumeBridge<'_>,
+  cx: &OpContext,
+  opcode: Opcode,
+  unique: u64,
+  body: Vec<u8>,
+) -> i32 {
+  let mut out = vec![0u8; REPLY_BYTES];
+  slates_bridge_fuse::bridge::dispatch(&message(opcode, unique, &body), bridge, cx, &mut out);
+  i32::from_le_bytes(out[4..8].try_into().unwrap())
+}
+
+/// §4.6, the sibling of the NFS CREATE dot-name fix. A virtio-fs guest can send raw FUSE opcodes, bypassing its
+/// own kernel's handling of `.` and `..`. Unlike NFSv3's UNCHECKED CREATE (which looked the name up first and
+/// echoed the directory), FUSE_CREATE and FUSE_MKDIR go straight to `bridge.create`/`mkdir` → the volume core's
+/// name check (`slates_vfs::names::check`), so `.` and `..` are refused, never echoed. A normal name still
+/// creates. Driven by dispatching real FUSE messages against a VolumeBridge.
+#[test]
+fn fuse_create_and_mkdir_refuse_dot_names() {
+  let mut store = store();
+  let mut volume = volume_for_owner(&mut store, ENROLLED, ENROLLED_GROUP);
+  let mut attachments = Attachments::new();
+  let id = attachments
+    .attach(
+      VOLUME,
+      View::Current,
+      Principal::Uid { uid: ENROLLED },
+      Rights {
+        read: true,
+        write: true,
+      },
+    )
+    .unwrap();
+  let cx = attachments.context(id).unwrap();
+  let mut bridge = VolumeBridge::new(VOLUME, &mut volume, &mut store);
+
+  assert_ne!(
+    fuse_errno(&mut bridge, &cx, Opcode::Create, 1, create(S_IFREG | 0o644, 0, ".")),
+    0,
+    "FUSE_CREATE '.' is refused, not echoed"
+  );
+  assert_ne!(
+    fuse_errno(&mut bridge, &cx, Opcode::Create, 2, create(S_IFREG | 0o644, 0, "..")),
+    0,
+    "FUSE_CREATE '..' is refused"
+  );
+  assert_ne!(
+    fuse_errno(&mut bridge, &cx, Opcode::MkDir, 3, mkdir(0o755, 0, ".")),
+    0,
+    "FUSE_MKDIR '.' is refused"
+  );
+  assert_eq!(
+    fuse_errno(&mut bridge, &cx, Opcode::Create, 4, create(S_IFREG | 0o644, 0, "real")),
+    0,
+    "a normal name still creates"
+  );
+}
