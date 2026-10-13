@@ -314,3 +314,47 @@ fn a_huge_symlink_target_is_handled_without_a_panic() {
     "the bridge still serves after a huge symlink target"
   );
 }
+
+/// §4.6, A-26 (and double defense with A-94 `nodev`). A character or block device node is a window onto a host
+/// device; slates creates no real device, so MKNOD of `S_IFCHR`/`S_IFBLK` is refused — only a FIFO or socket
+/// (which carry no stream or listener) are made. A guest cannot plant a `/dev/mem`-style node in its volume.
+#[test]
+fn fuse_mknod_refuses_a_character_or_block_device() {
+  /// Format: `S_IFCHR`, a character device.
+  const S_IFCHR: u32 = 0o020_000;
+  /// Format: `S_IFBLK`, a block device.
+  const S_IFBLK: u32 = 0o060_000;
+  let mut store = store();
+  let mut volume = volume_for_owner(&mut store, ENROLLED, ENROLLED_GROUP);
+  let mut attachments = Attachments::new();
+  let id = attachments
+    .attach(
+      VOLUME,
+      View::Current,
+      Principal::Uid { uid: ENROLLED },
+      Rights {
+        read: true,
+        write: true,
+      },
+    )
+    .unwrap();
+  let cx = attachments.context(id).unwrap();
+  let mut bridge = VolumeBridge::new(VOLUME, &mut volume, &mut store);
+
+  assert_ne!(
+    fuse_errno(&mut bridge, &cx, Opcode::MkNod, 1, mknod(S_IFCHR | 0o644, 0, "chr")),
+    0,
+    "a character device node is refused (no host-device window)"
+  );
+  assert_ne!(
+    fuse_errno(&mut bridge, &cx, Opcode::MkNod, 2, mknod(S_IFBLK | 0o644, 0, "blk")),
+    0,
+    "a block device node is refused"
+  );
+  // Non-vacuity: a FIFO (no stream) is allowed (A-26).
+  assert_eq!(
+    fuse_errno(&mut bridge, &cx, Opcode::MkNod, 3, mknod(S_IFIFO | 0o644, 0, "fifo")),
+    0,
+    "a FIFO is allowed"
+  );
+}
