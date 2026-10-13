@@ -295,3 +295,16 @@ Ada** (a peer's relayed "owner approved" is not slates' own authorization to cha
 then the 10 s placeholder stands, and `promise_ns`-based owner leases (Gray & Cheriton 1989) are slates' to build on
 the vendored field. If slates ever adopts hyper-rt's blocking pool: `Share::new(name, limit)` is a share with no line
 (refused at once past its places); `waiting: N` gives it a line of N.
+
+**Resolved (2026-10-12) — the condemnation cost is zero, measured; the owner lease, not a slower detector, carries
+false-positive safety.** The recommendation above weighed charging the detector a cost proportional to a takeover,
+which would slow detection for large hosts. Measuring the real cost of a *transient* false condemnation
+(`crates/server/tests/fleet.rs::transient_false_condemnation_cost_is_flat_in_the_owners_object_count`, BENCHMARKS.md
+2026-10-12) settled it: a wrongly-retired **live** owner keeps serving its own objects throughout (0 refusals of ~10
+samples) under its owner lease (§4.8, AUD-08, `crates/server/src/lease.rs` — already built), and is re-admitted in
+**one period, flat across a 16× object range** (256 and 4,096 objects) — membership refutation is O(fleet), never
+enumerating objects (D-12). So a transient false positive causes **zero** unavailability however many objects the
+owner holds; the unavailability is exactly the cost `set_condemnation_cost` wants, so it is set explicitly to **zero**
+(`crates/cluster/src/member_plane.rs`). Detection then runs at its least bound (~0.9–1.84 s on a LAN), fast for
+**every** host size — the caveat (slow detection for large hosts) would appear only if the detector were charged a
+takeover it need not fear. F = 10 s (`FAILOVER_SLO_NS`) stands; the owner lease carries the correctness.

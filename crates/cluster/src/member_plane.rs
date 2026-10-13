@@ -293,13 +293,24 @@ impl MemberPlane {
       window_limit: WINDOW_LIMIT,
     };
     let plane = Plane::new(local.0, limits)?;
-    let detector = Detector::new(
+    let mut detector = Detector::new(
       hyper_swim::HostId(local.0),
       Exposure::new(),
       members,
       resolution,
       detection_budget,
     );
+    // Derived: slates charges the detector **no** false-condemnation margin, and so detects at its least bound
+    // (~0.9–1.84 s), fast for every host size. A false condemnation's cost is the unavailability it causes, and
+    // slates' is zero: an owner the fleet wrongly retires keeps serving its own objects under its lease (§4.8,
+    // AUD-08, `crate::lease`) until it refutes and is re-admitted — which is membership-only, O(fleet), never
+    // enumerating objects (D-12). Measured 2026-10-12 (`slates-server` fleet test
+    // `transient_false_condemnation_cost_is_flat_in_the_owners_object_count`): a wrongly-retired live owner refused
+    // 0 of ~10 reads of its own object and was re-admitted in one period, both flat across a 16× object range
+    // (256 and 4,096 objects). So the owner lease — not a slower detector — carries safety against a false
+    // positive; charging the condemned host's whole takeover would only slow detection for large hosts and buy
+    // nothing. Set explicitly, not left to the vendored default, so a change there cannot silently slow detection.
+    detector.set_condemnation_cost(std::time::Duration::ZERO);
     let mut member = MemberPlane {
       local,
       boot_nonce,

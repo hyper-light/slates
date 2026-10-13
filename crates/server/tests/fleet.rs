@@ -7177,6 +7177,151 @@ fn takeover_periods_scale_with_the_retired_hosts_object_count() {
   }
 }
 
+/// Measurement (not a gate): the cost of a **transient false condemnation** — a live owner its survivors wrongly
+/// retire, then re-admit when it refutes (§4.8 rejoin; AUD-08 owner lease). The question is whether that cost is
+/// **size-independent** (so a cost-weighted detection budget need not slow for large hosts): membership retire and
+/// re-admit are O(fleet), never enumerating objects (D-12), and the owner lease keeps the live owner serving its own
+/// objects throughout, so a transient false positive should cause little or no unavailability however many objects
+/// the owner holds. This provisions N scratch volumes on A, has both survivors (B, C) falsely observe A dead — the
+/// fold A's own detector performs when it ages a peer to death — and, while A refutes and is re-admitted, samples A's
+/// service of one of its objects (the lease) and counts the re-admission window in load-independent periods, for N a
+/// 16x apart. Expect: A keeps serving (few or no refusals) and the window flat in N. Run:
+/// `cargo test --release -p slates-server --test fleet transient_false_condemnation -- --ignored --nocapture`.
+#[test]
+#[ignore = "heavy fleet measurement (false condemnation of an N-object owner); run alone"]
+// One end-to-end scenario (form, provision, replicate, falsely condemn, sample while re-admitting): splitting it would
+// scatter the scenario, so the cognitive-complexity threshold is allowed here.
+#[allow(clippy::cognitive_complexity)]
+fn transient_false_condemnation_cost_is_flat_in_the_owners_object_count() {
+  for volumes in [256usize, 4096] {
+    let _serial = serialize_fleet_tests();
+    let names = ["a", "b", "c"];
+    let n = names.len();
+    let nodes: Vec<(MachineProfile, HostId, Identity)> =
+      names.iter().map(|name| fleet_node(name)).collect();
+    let hosts: Vec<HostId> = nodes.iter().map(|(_, host, _)| *host).collect();
+    let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+      nodes.iter().map(|(_, _, id)| id.certificate()).collect();
+    let pid = std::process::id();
+    let instance_a = format!("fleet3-{}-{pid}", hosts[0].0);
+    let (_serve_lease, serve) = mesh_serve_ports(n);
+    let daemons = start_mesh(nodes, &hosts, &certs, &serve);
+    let hosts: Vec<HostId> = daemons
+      .iter()
+      .map(|daemon| daemon.member_identity().unwrap())
+      .collect();
+    assert_fleet_forms(&daemons, &hosts, &names);
+
+    // Provision scratch volumes on A; stop early at a capacity bound and measure what landed.
+    let mut client = Client::connect(&instance_a);
+    let mut objects: Vec<(VolumeId, ObjectId)> = Vec::with_capacity(volumes);
+    for index in 0..volumes {
+      match client.call(&scratch(&format!("v{index}"))) {
+        ReplyBody::Created { id } => objects.push((id, ObjectId(id.bytes))),
+        other => {
+          eprintln!("false condemnation: provisioning stopped at {index}/{volumes}: {other:?}");
+          break;
+        }
+      }
+    }
+    if objects.len() < TAKEOVER_TAIL_SENTINELS {
+      for daemon in daemons {
+        daemon.stop();
+      }
+      continue;
+    }
+    // Both survivors hold the tail of A's heads, so retiring A would actually begin a takeover of them (the wasted
+    // work a false condemnation does), not a no-op.
+    objects.sort_by_key(|(_, object)| object.0);
+    let sentinels: Vec<ObjectId> = objects
+      .iter()
+      .rev()
+      .take(TAKEOVER_TAIL_SENTINELS)
+      .map(|(_, object)| *object)
+      .collect();
+    let survivors_hold = {
+      let survivors: Vec<&Daemon> = daemons[1..].iter().collect();
+      poll_until(&survivors, SERVE_DEADLINE, || {
+        all_hold(sentinels.iter().flat_map(|object| {
+          [
+            daemons[1].fleet_holder_head(*object).map(|h| h.is_some()),
+            daemons[2].fleet_holder_head(*object).map(|h| h.is_some()),
+          ]
+        }))
+      })
+    };
+    assert!(
+      survivors_hold,
+      "both survivors hold the tail of A's heads ({volumes} volumes)"
+    );
+
+    let sentinel_volume = objects.last().map(|(id, _)| *id).unwrap_or_default();
+    let owner_host = hosts[0];
+    let survivors: Vec<&Daemon> = daemons[1..].iter().collect();
+
+    // Both survivors falsely observe A dead — the council retires A though A is alive and still probing them — and A
+    // refutes and is re-admitted. Across the whole window, sample A's own service of one object and count the periods.
+    let start = each_progress(&survivors);
+    inject_death_into(survivors.iter().copied(), owner_host);
+    let (_pace_sender, pace) = std::sync::mpsc::channel::<()>();
+    let began = Instant::now();
+    let mut served = 0u32;
+    let mut refused = 0u32;
+    let mut saw_retired = false;
+    let mut rejoined = false;
+    while began.elapsed() < RETIREMENT_DEADLINE + REJOIN_DEADLINE {
+      match client.call(&RequestBody::Status {
+        volume: sentinel_volume,
+      }) {
+        ReplyBody::Status { .. } => served = served.saturating_add(1),
+        _ => refused = refused.saturating_add(1),
+      }
+      let membership: Vec<Option<bool>> = survivors
+        .iter()
+        .map(|daemon| {
+          daemon
+            .fleet_members()
+            .map(|members| members.contains(&owner_host))
+            .ok()
+        })
+        .collect();
+      let both_dropped = membership.iter().all(|seen| *seen == Some(false));
+      let both_hold = membership.iter().all(|seen| *seen == Some(true));
+      if both_dropped {
+        saw_retired = true;
+      }
+      if saw_retired && both_hold {
+        rejoined = true;
+        break;
+      }
+      let _ = pace.recv_timeout(Duration::from_millis(10));
+    }
+    let end = each_progress(&survivors);
+    let periods: Vec<u64> = end
+      .iter()
+      .zip(&start)
+      .map(|(e, s)| e.saturating_sub(*s))
+      .collect();
+
+    let created = objects.len();
+    for daemon in daemons {
+      daemon.stop();
+    }
+    eprintln!(
+      "false condemnation: {created} volumes on A | retired {saw_retired} rejoined {rejoined} | survivor periods to \
+       re-admit {periods:?} | A served {served} / refused {refused} of its own object while falsely retired"
+    );
+    assert!(
+      saw_retired,
+      "the false condemnation took hold — both survivors dropped A ({created} volumes)"
+    );
+    assert!(
+      rejoined,
+      "A was re-admitted after refuting the false condemnation ({created} volumes)"
+    );
+  }
+}
+
 /// Regression (§4.8 "Promotion and takeover"; `docs/bugs/2026-10-11-taken-over-scratch-volumes-never-become-servable.md`):
 /// **a taken-over contentless (scratch) volume must become servable, and a taken-over object that exists must never
 /// answer `NotFound`.** Provisions many scratch volumes on A, kills A, then from a client on the successor reads a

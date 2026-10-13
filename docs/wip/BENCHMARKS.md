@@ -5397,3 +5397,18 @@ swings under load, unrelated to this change).
 (O(V × skipped)). `skipped` is empty in the normal path — every volume captured — so it did not enter this measurement
 and bites only in the degenerate many-skips failure mode; a measurement-first fix awaits a scenario that forces skips
 at scale.
+
+### Measured: a transient false condemnation is harmless and its recovery is size-independent — so no detection-cost margin is owed (condition 11; 2026-10-12)
+
+**Why.** slates can weight its SWIM detector's surety by a condemnation cost (`Detector::set_condemnation_cost`): the more a false condemnation would cost, the surer — and so slower — the detector is before it fires. The natural cost looks like the condemned host's whole takeover (N × ~1.5 µs, up to ~1.5 s at 1 M objects), which would slow detection for large hosts (the LAN-3 least-detection bound grows none→9 s as the cost grows none→1 s; Part 6, `fleet-under-load.md`). This measures the **real** cost of a transient false positive, to set the margin from evidence, not the worst case.
+
+**Command.** `transient_false_condemnation_cost_is_flat_in_the_owners_object_count` (a `#[test] #[ignore]` fleet measurement in `crates/server/tests/fleet.rs`): a three-node mesh, N scratch volumes on A, both survivors made to falsely observe A dead (the fold A's own detector performs when it ages a peer to death), and while A refutes and is re-admitted, A's service of one of its objects is sampled and the re-admission window counted in load-independent periods. `cargo test --release -p slates-server --test fleet transient_false_condemnation -- --ignored --nocapture`. macOS, Darwin 25.4, 18 cores, host load ~14.
+
+| owner's objects | re-admitted (after a real retirement) | periods to re-admit, per survivor | A's reads refused / sampled |
+|---|---|---|---|
+| 256 | yes | [1, 1] | 0 / 9 |
+| 4,096 | yes | [1, 1] | 0 / 10 |
+
+- **Zero unavailability.** The wrongly-retired *live* owner kept serving its own objects throughout (0 refusals), at both sizes — the owner lease (AUD-08) holds while the owner refutes.
+- **Re-admission is O(fleet), size-independent.** One period to re-admit, flat across a 16× object range — membership refutation never enumerates objects (D-12).
+- **So the condemnation cost is ~0** (the measured unavailability), not N × 1.5 µs. `set_condemnation_cost` is now set explicitly to zero in `crates/cluster/src/member_plane.rs` with this derivation, so the detector detects at its least bound (~0.9–1.84 s), fast for every host size, and a change to the vendored default cannot silently slow it. slates' safety against a false positive is the owner lease, not a slower detector. F = 10 s (the failover SLO, `FAILOVER_SLO_NS`) stands unchanged.
