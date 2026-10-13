@@ -291,6 +291,57 @@ fn the_mount_protocol_refuses_dump_and_export_so_no_tenant_enumerates_the_rest()
   );
 }
 
+/// §4.13 (the portmap responder cannot register, enumerate or proxy): slates' portmap answers only NULL and
+/// GETPORT. SET (register a mapping — a tenant pointing NFS at an impostor port, an MITM) and UNSET (remove one),
+/// DUMP (enumerate every registered service) and CALLIT (proxy an indirect RPC) are all PROC_UNAVAIL. Here SET,
+/// UNSET, DUMP and CALLIT are refused while GETPORT still answers, so the responder stays usable but inert as an
+/// attack surface.
+#[test]
+fn the_portmap_responder_refuses_set_unset_dump_and_callit() {
+  let (daemon, instance) = two_shard_daemon("portmap");
+  let _ = provision_remote_volume(&instance);
+  let port = daemon.nfs_port().unwrap();
+  let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+
+  /// RFC 5531 §9 accept_stat: the procedure is not available.
+  const PROC_UNAVAIL: u32 = 3;
+  /// RFC 5531 §9 accept_stat: the procedure ran.
+  const SUCCESS: u32 = 0;
+  /// The portmap program number (RFC 1833).
+  const PORTMAP_PROGRAM: u32 = 100_000;
+  // SET=1 (register an impostor → MITM), UNSET=2, DUMP=4 (enumerate), CALLIT=5 (proxy an indirect call).
+  assert_eq!(
+    call_accept_status(&mut stream, PORTMAP_PROGRAM, 1, &[], 1),
+    PROC_UNAVAIL,
+    "portmap SET is refused — no tenant registers an impostor service"
+  );
+  assert_eq!(
+    call_accept_status(&mut stream, PORTMAP_PROGRAM, 2, &[], 2),
+    PROC_UNAVAIL,
+    "portmap UNSET is refused"
+  );
+  assert_eq!(
+    call_accept_status(&mut stream, PORTMAP_PROGRAM, 4, &[], 3),
+    PROC_UNAVAIL,
+    "portmap DUMP is refused — no service enumeration"
+  );
+  assert_eq!(
+    call_accept_status(&mut stream, PORTMAP_PROGRAM, 5, &[], 4),
+    PROC_UNAVAIL,
+    "portmap CALLIT is refused — no indirect-call proxy"
+  );
+  // GETPORT (3) is still answered: a `(program, version, proto, port)` mapping argument.
+  let mut getport = Vec::new();
+  for field in [NFS_PROGRAM, 3u32, 6u32, 0u32] {
+    getport.extend_from_slice(&field.to_be_bytes());
+  }
+  assert_eq!(
+    call_accept_status(&mut stream, PORTMAP_PROGRAM, 3, &getport, 5),
+    SUCCESS,
+    "portmap GETPORT is answered — the responder stays usable"
+  );
+}
+
 /// §4.6, §4.13 (2026-10-04): do run honest clients and breakers against one mounted volume under a spinner per
 /// core; expect every honest read to return exactly what that client last wrote, no flipped handle to read
 /// anything but the file it was flipped from, the daemon still serving a fresh mount afterwards, and every broken
