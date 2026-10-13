@@ -301,6 +301,32 @@ pub(crate) fn symlink_status(
   status(&call(stream, NFS_PROGRAM, 10, &args, xid))
 }
 
+/// NFS REMOVE of raw `name` bytes in `dir_fh` → the status (so a test can present `.`/`..` or a separator).
+pub(crate) fn remove_status(
+  stream: &mut (impl Read + Write),
+  dir_fh: &[u8],
+  name: &[u8],
+  xid: u32,
+) -> u32 {
+  let mut args = Vec::new();
+  opaque(dir_fh, &mut args);
+  opaque(name, &mut args);
+  status(&call(stream, NFS_PROGRAM, 12, &args, xid))
+}
+
+/// NFS RMDIR of raw `name` bytes in `dir_fh` → the status.
+pub(crate) fn rmdir_status(
+  stream: &mut (impl Read + Write),
+  dir_fh: &[u8],
+  name: &[u8],
+  xid: u32,
+) -> u32 {
+  let mut args = Vec::new();
+  opaque(dir_fh, &mut args);
+  opaque(name, &mut args);
+  status(&call(stream, NFS_PROGRAM, 13, &args, xid))
+}
+
 /// NFS MKDIR `name` in `dir_fh` with mode 0755 → the new directory's handle.
 pub(crate) fn mkdir(
   stream: &mut (impl Read + Write),

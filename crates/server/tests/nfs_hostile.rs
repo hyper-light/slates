@@ -19,7 +19,7 @@ use slates_server::{Daemon, DaemonConfig, SegmentSource};
 mod common;
 use common::nfs::{
   NFS_PROGRAM, create, create_status, lookup_raw_status, lookup_status, mkdir_status, mount,
-  opaque, read, read_status, status, symlink_status, write,
+  opaque, read, read_status, remove_status, rmdir_status, status, symlink_status, write,
 };
 
 /// Shape: honest clients, each on its own connection and file.
@@ -759,6 +759,42 @@ fn mkdir_and_symlink_refuse_dot_names() {
   // Non-vacuity: a normal name still creates through both.
   assert_eq!(mkdir_status(&mut s, &root, b"realdir", 6), 0, "a normal MKDIR works");
   assert_eq!(symlink_status(&mut s, &root, b"reallink", "target", 7), 0, "a normal SYMLINK works");
+
+  drop(s);
+  drop(daemon);
+}
+
+/// The remove family (§4.6): RMDIR already guards `.`/`..`, but the guard sits inside `if is_dir`, so REMOVE
+/// (unlink) of `.`/`..` takes the unguarded path — `bridge.lookup(".")` resolves the directory, then
+/// `bridge.unlink(parent, ".")` runs. This test drives REMOVE of `.`/`..` over a live socket and requires it to
+/// be refused (never 0), so a client can neither unlink its own directory by `.` nor its parent by `..`; a
+/// separator name is refused too, and a real file still removes. Reports the statuses for the record.
+#[test]
+fn remove_refuses_dot_names_and_separators() {
+  let (daemon, instance) = single_shard_daemon("removedots");
+  provision(&instance, "rd");
+  let port = daemon.nfs_port().expect("the daemon is serving NFS");
+  let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+  let root = mount(&mut s, &daemon.mount_capability("rd").unwrap().unwrap(), 1);
+
+  // RMDIR's explicit guard (for reference): '.' is Inval, '..' is Notempty.
+  let rmdir_dot = rmdir_status(&mut s, &root, b".", 2);
+  let rmdir_dotdot = rmdir_status(&mut s, &root, b"..", 3);
+  // REMOVE (unlink) of the dot-names — the path whose guard is inside `if is_dir`, so it is not taken here.
+  let rm_dot = remove_status(&mut s, &root, b".", 4);
+  let rm_dotdot = remove_status(&mut s, &root, b"..", 5);
+  let rm_sep = remove_status(&mut s, &root, b"a/b", 6);
+  eprintln!(
+    "PROBE remove: RMDIR '.'={rmdir_dot} RMDIR '..'={rmdir_dotdot} REMOVE '.'={rm_dot} REMOVE '..'={rm_dotdot} REMOVE 'a/b'={rm_sep}"
+  );
+
+  assert_ne!(rm_dot, 0, "REMOVE '.' must be refused, never unlink the directory itself");
+  assert_ne!(rm_dotdot, 0, "REMOVE '..' must be refused");
+  assert_ne!(rm_sep, 0, "REMOVE of a separator name is refused");
+
+  // Non-vacuity: a real file removes.
+  let _f = create(&mut s, &root, "f", 7);
+  assert_eq!(remove_status(&mut s, &root, b"f", 8), 0, "a real file removes");
 
   drop(s);
   drop(daemon);
