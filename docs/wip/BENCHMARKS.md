@@ -5338,3 +5338,62 @@ and the part that grows with N is the **O(N) required adopt + materialize** per 
 "slow paging" premise was wrong; the loop was reverted (the recovery oracle stayed 39/0 and the servable/`NotFound`
 gate read 0 `NotFound` throughout, so the loop was *correct* — just not a win). Recovery of realistic hosts is ~2 s
 (1,024 volumes), dominated by the horizons and per-object work, neither a cheap lever.
+
+### Landed: a checkpoint marks its volumes by set, not a scan — O(V²) → O(V log V) in a shard's volumes (§4.8; 2026-10-12)
+
+**What changed.** A barrier's common path is `publish_delta` (its cost is its changes, A-68); `publish_checkpoint`
+(§4.8, the periodic amortized compaction when the journal `wants_checkpoint`) re-images the whole shard, then sweeps
+every hosted volume to mark it published or not. That sweep asked `published.volumes.contains(&slot.id)` — a linear
+scan of the committed list — once per volume, so the mark was **O(V²)** in the volumes a shard holds. The committed ids
+are now built once into a `BTreeSet` (the volumes' own key type, matching the server's other membership sets), so the
+sweep is **O(V log V)**. The slates case is a shard holding thousands of tiny agent volumes (provisioned in <50 µs, many
+per host); the checkpoint stalls the shard's single thread, so a quadratic term there is a p99 tail under real load.
+
+**Command.** `checkpoint_cost_scales_with_the_hosted_volume_count` (a `#[test] #[ignore]` measurement in
+`crates/server/src/verbs.rs`): on one shard create V empty bounded volumes, then time `publish_checkpoint`, best of 5.
+The volumes are empty, so the image's streaming is metadata only and the mark sweep stands out.
+`cargo test --release -p slates-server --lib checkpoint_cost_scales_with_the_hosted_volume_count -- --ignored --nocapture`.
+macOS, Darwin 25.4, 18 cores, host load ~13.9 (a shared machine — wall-clock, so the *shape* across V is the reading,
+not the absolute points); best of 5.
+
+**Before — the linear-scan mark (`published.volumes.contains`), best of 5:**
+
+| volumes | checkpoint (best) | ns/volume |
+|---|---|---|
+| 512 | 208 µs | 406 |
+| 1,024 | 483 µs | 472 |
+| 2,048 | 1.30 ms | 634 |
+| 4,096 | 3.71 ms | 906 |
+| 8,192 | 11.83 ms | 1,444 |
+
+ns/volume climbs 406 → 1,444 (super-linear). Fitting `a·V + b·V²`: a ≈ 337 ns/vol (streaming/sort, linear),
+b ≈ 0.135 ns/vol² (the scan). At 8,192 the quadratic is ~9 of the 11.8 ms (77%); extrapolated it is ~145 ms at 32,768
+volumes and ~0.4 s at 55,000 (a million volumes over eighteen shards) — a pure-waste single-thread stall per checkpoint.
+
+**After — the set-membership mark (`BTreeSet::contains`), best of 5:**
+
+| volumes | checkpoint (best) | ns/volume |
+|---|---|---|
+| 512 | 275 µs | 537 |
+| 1,024 | 458 µs | 447 |
+| 2,048 | 1.11 ms | 544 |
+| 4,096 | 2.00 ms | 488 |
+| 8,192 | 3.36 ms | 410 |
+
+- **ns/volume is flat (~410–540 across 512 → 8,192)** — the quadratic term is gone; the cost is the linear streaming/sort.
+- **8,192 volumes: 11.83 ms → 3.36 ms (3.5×),** and the gap widens with V (the removed term is quadratic): ~12× at
+  32,768, ~18× at 55,000.
+- At V=512 the after is a shade higher (275 vs 208 µs) — the set build's fixed cost, where the quadratic it removes is
+  still negligible; the win is at the scale that matters.
+
+**Correctness.** Same membership (a duplicate in the Vec, which the set folds, never changed a membership answer), so
+behaviour is identical. The publish-path arbiter is green: `cargo test --release -p slates-server --test recovery` —
+the two checkpoint-recovery oracles pass (`an_overlays_copied_up_and_created_files_survive_a_restart_over_their_base`,
+`a_clone_recovers_over_its_recovered_origin...`), 38/39 with one pre-existing pressure-hold timing flake
+(`a_hold_finer_than_the_pools_free_extents_...`, 3/3 on isolated re-run; it reads the shared machine's real memory
+swings under load, unrelated to this change).
+
+**Sibling (reported, not fixed here).** `stream_checkpoint`'s `left_out` closure scans `skipped` linearly per volume
+(O(V × skipped)). `skipped` is empty in the normal path — every volume captured — so it did not enter this measurement
+and bites only in the degenerate many-skips failure mode; a measurement-first fix awaits a scenario that forces skips
+at scale.

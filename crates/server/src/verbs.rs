@@ -8983,9 +8983,16 @@ fn publish_checkpoint(state: &mut ShardState) -> Result<Published, slates_vfs::V
   }
   let mut published = outcome?;
   published.skipped = skipped.into_iter().map(|(id, _)| id).collect();
+  // Membership by set, not a scan: this sweep marks every hosted volume published or not, and a linear `contains`
+  // over the committed list per volume made it O(V²) in the volumes a shard holds. Measured 2026-10-12
+  // (`checkpoint_cost_scales_with_the_hosted_volume_count`, BENCHMARKS.md §4.8): an 8,192-volume shard's checkpoint
+  // spent about 9 of its 12 ms in this scan, a term that grows with the square of the volume count. Built once as an
+  // ordered set over the volumes' own key type, the sweep is O(V log V).
+  let committed: std::collections::BTreeSet<DbVolumeId> =
+    published.volumes.iter().copied().collect();
   for handle in handles {
     if let Ok(slot) = state.volumes.get_mut(handle) {
-      if published.volumes.contains(&slot.id) {
+      if committed.contains(&slot.id) {
         slot.volume.mark_published(&state.store);
       } else {
         slot.volume.mark_unpublished();
@@ -10003,6 +10010,86 @@ mod tests {
       },
       |config| config.reserve_per_shard = RELIEF_RESERVE,
     );
+  }
+
+  /// Measurement (not a gate): the per-checkpoint CPU cost as the number of volumes one shard hosts grows. A barrier's
+  /// common path is `publish_delta` (its cost is its changes, A-68); `publish_checkpoint` re-images the whole shard,
+  /// periodically and amortized, when the journal `wants_checkpoint`. This drives one checkpoint over a shard holding
+  /// `volumes` tiny volumes and reports the best-of-[`ROUNDS`] wall time, so a cost that grows faster than the volume
+  /// count — a scan nested in the per-volume mark-published sweep — shows as super-linear growth. Wall-clock, best-of-N
+  /// (BENCHMARKS discipline; quiesce the machine for an honest reading). Run:
+  /// `cargo test --release -p slates-server checkpoint_cost_scales -- --ignored --nocapture`.
+  #[test]
+  #[ignore = "measurement, not a gate; prints the per-checkpoint cost vs the hosted-volume count"]
+  #[allow(clippy::cast_precision_loss)]
+  fn checkpoint_cost_scales_with_the_hosted_volume_count() {
+    /// Shape: the best of this many back-to-back checkpoints is reported.
+    const ROUNDS: usize = 5;
+    /// Shape: each measured volume's quota, a small bounded one above the inode allowance (A-109); the volumes are
+    /// empty, so the checkpoint's streaming is metadata only and the sweep's cost stands out.
+    const VOLUME_LIMIT: u64 = 1 << 13;
+    for volumes in [512usize, 1024, 2048, 4096, 8192] {
+      let (hosted, published, best_ns) = crate::daemon::audit_on_shard_configured(
+        move |state| {
+          let principal = Principal::Uid { uid: 1234 };
+          for n in 0..volumes {
+            let reply = super::dispatch(
+              state,
+              1,
+              &principal,
+              super::RequestBody::Create {
+                name: format!("v{n:07}"),
+                size: super::SizeClass::Bounded {
+                  limit: VOLUME_LIMIT,
+                },
+                names: super::NamePolicy::Exact,
+                require_locked: false,
+                base: None,
+              },
+            );
+            assert!(
+              matches!(reply, super::ReplyBody::Created { .. }),
+              "volume {n} of {volumes}: {reply:?}"
+            );
+          }
+          let mut best = u64::MAX;
+          let mut published = 0usize;
+          for _ in 0..ROUNDS {
+            let t0 = slates_machine::clock::monotonic_ns();
+            match super::publish_checkpoint(state) {
+              Ok(out) => {
+                let t1 = slates_machine::clock::monotonic_ns();
+                best = best.min(t1.saturating_sub(t0));
+                published = out.volumes.len();
+              }
+              // A repeat may find no free content slot; the rounds that ran still give a best.
+              Err(_) => break,
+            }
+          }
+          assert!(best < u64::MAX, "at least one checkpoint ran");
+          (state.volumes.len(), published, best)
+        },
+        move |config| {
+          let cap = volumes.saturating_add(volumes / 4).saturating_add(64);
+          config.store.max_inodes = config.store.max_inodes.max(cap);
+          config.store.max_dirs = config.store.max_dirs.max(cap);
+          config.store.max_dir_blocks = config.store.max_dir_blocks.max(cap);
+          config.store.max_chunks = config.store.max_chunks.max(cap);
+          let cap64 = u64::try_from(cap).unwrap_or(u64::MAX);
+          config.store.metadata_class_bytes = config
+            .store
+            .metadata_class_bytes
+            .max(cap64.saturating_mul(1 << 12));
+          config.reserve_per_shard = config
+            .reserve_per_shard
+            .max(cap64.saturating_mul(VOLUME_LIMIT).saturating_add(128 << 20));
+        },
+      );
+      let per = best_ns as f64 / hosted as f64;
+      eprintln!(
+        "checkpoint: {hosted} volumes hosted, {published} published | best {best_ns} ns ({per:.1} ns/volume)"
+      );
+    }
   }
 
   /// §4.2 (the resource vector's inode dimension; GAPS 2026-10-06). Do: on one shard, create four bounded volumes
