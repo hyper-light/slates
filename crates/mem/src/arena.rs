@@ -147,6 +147,30 @@ pub struct ChunkArena {
   /// Whether recovery publications name this arena's blocks ([`ChunkArena::published`]): each region it adds then keeps
   /// its live heads from the start ([`Buddy::new_imaged`]), so no publication scans a region's state.
   published: bool,
+  /// Blocks a live DAX mapping holds (§4.6, AC-4.12: mapping isolation, pinning and teardown). While a block is pinned
+  /// the arena never hands it to another allocation and never returns it to the free lists: a [`ChunkArena::free`] of a
+  /// pinned block is *deferred* — its bytes kept unscrubbed for the mapping's page-table view — until the last
+  /// [`ChunkArena::unpin`]. This is the memory-level invariant behind the gate: a guest's mapping can never fall onto
+  /// another file's bytes because the block it names is neither reused nor cleared while mapped (the per-access check a
+  /// hardware DAX guest bypasses is thereby made unnecessary). Keyed by the block's physical place `(region, offset)`,
+  /// which a reuse would change. Bounded structurally by the arena's block count — one entry per distinct allocated
+  /// block, so it cannot grow past what [`ChunkArena::capacity`] holds — and empty on any arena no guest maps.
+  pins: std::collections::BTreeMap<(u16, usize), PinnedBlock>,
+}
+
+/// One pinned block's state (§4.6): the extent as issued, the count of live DAX mappings holding it, and whether a
+/// `free` arrived while it was pinned and is waiting for the last holder to drop.
+#[derive(Clone, Copy, Debug)]
+struct PinnedBlock {
+  /// The extent as issued, so the deferred free can release exactly it when the last holder unpins.
+  extent: Extent,
+  /// Live DAX mappings holding this block; the block is reusable again only at zero.
+  holders: u32,
+  /// A `free` of this block arrived while it was pinned and waits for the last unpin.
+  free_waiting: bool,
+  /// Whether that waiting free is to scrub on release (a [`ChunkArena::free`]) rather than give it back untouched (a
+  /// recovery [`ChunkArena::give_back`]).
+  scrub_on_release: bool,
 }
 
 /// What one [`ChunkArena::purge`] call did.
@@ -194,6 +218,7 @@ impl ChunkArena {
       allocations: 0,
       reused: 0,
       published: false,
+      pins: std::collections::BTreeMap::new(),
     }
   }
 
@@ -716,6 +741,17 @@ impl ChunkArena {
     if self.identity != Some(extent.arena) {
       return Err(foreign(ExtentRefusal::OtherArena));
     }
+    // A pinned block's free waits for the last unpin (§4.6): its bytes stay readable for the mapping and it is never
+    // returned to the free lists, so a guest's page table can never fall onto another file's bytes. The deferred
+    // release runs in [`ChunkArena::unpin`] once the last holder drops; `unpin` removes the pin entry before it calls
+    // back here, so a deferred free is released exactly once and this never recurses.
+    if let Some(pinned) = self.pins.get_mut(&(extent.region(), extent.offset()))
+      && pinned.holders > 0
+    {
+      pinned.free_waiting = true;
+      pinned.scrub_on_release = scrubbed;
+      return Ok(());
+    }
     let mut self_resident = 0usize;
     let slot = self
       .slot_mut(extent.region)
@@ -741,6 +777,83 @@ impl ChunkArena {
     Ok(())
   }
 
+  /// Pins the block `extent` names for one live DAX mapping (§4.6, AC-4.12). Until it is unpinned the arena will not
+  /// hand the block to another allocation and will not free it: a [`ChunkArena::free`] of it is deferred, its bytes
+  /// kept, so a guest's page-table view can never fall onto another file's bytes. Idempotent per holder — each `pin`
+  /// is matched by one [`ChunkArena::unpin`]. Refused [`MemError::ForeignExtent`] for an extent this arena did not
+  /// issue for a live block, so a stale or forged extent can never pin memory.
+  pub fn pin(&mut self, extent: Extent) -> Result<(), MemError> {
+    if !self.holds(extent) {
+      return Err(MemError::ForeignExtent {
+        offset: extent.offset(),
+        len: extent.len(),
+        reason: ExtentRefusal::NotAllocated,
+      });
+    }
+    let entry = self
+      .pins
+      .entry((extent.region(), extent.offset()))
+      .or_insert(PinnedBlock {
+        extent,
+        holders: 0,
+        free_waiting: false,
+        scrub_on_release: true,
+      });
+    // Saturating, never wrapping: 2^32 live mappings of one block cannot be made, and a saturated count only keeps the
+    // block pinned (it is never under-freed), which is safe.
+    entry.holders = entry.holders.saturating_add(1);
+    Ok(())
+  }
+
+  /// Drops one DAX mapping's hold on `extent`'s block (§4.6: teardown). When the last holder goes and a [`ChunkArena::free`]
+  /// arrived while the block was pinned, the block is released now — scrubbed (A-99) unless its deferred free was a
+  /// give-back — and this returns `true`. Returns `false` when holders remain or no free was waiting. Refused
+  /// [`MemError::ForeignExtent`] ([`ExtentRefusal::NotPinned`]) for a block no mapping holds, so an unbalanced unpin
+  /// is a typed miss, never a double free.
+  pub fn unpin(&mut self, extent: Extent) -> Result<bool, MemError> {
+    let key = (extent.region(), extent.offset());
+    let Some(entry) = self.pins.get_mut(&key) else {
+      return Err(MemError::ForeignExtent {
+        offset: extent.offset(),
+        len: extent.len(),
+        reason: ExtentRefusal::NotPinned,
+      });
+    };
+    entry.holders = entry.holders.saturating_sub(1);
+    if entry.holders > 0 {
+      return Ok(false);
+    }
+    let waiting = entry.free_waiting;
+    let scrub = entry.scrub_on_release;
+    let pinned = entry.extent;
+    self.pins.remove(&key);
+    if waiting {
+      self.release_extent(pinned, scrub)?;
+      Ok(true)
+    } else {
+      Ok(false)
+    }
+  }
+
+  /// Whether `extent`'s block is held by at least one live DAX mapping (§4.6): while true the arena neither reuses nor
+  /// frees it.
+  pub fn is_pinned(&self, extent: Extent) -> bool {
+    self
+      .pins
+      .get(&(extent.region(), extent.offset()))
+      .is_some_and(|entry| entry.holders > 0)
+  }
+
+  /// Blocks held by a live DAX mapping whose file has already been freed — a `free` arrived while they were pinned and
+  /// waits for the last unpin (§4.6). A test asserts this moved, so a dead deferral path cannot pass for a live one.
+  pub fn pinned_free_waiting(&self) -> usize {
+    self
+      .pins
+      .values()
+      .filter(|entry| entry.holders > 0 && entry.free_waiting)
+      .count()
+  }
+
   /// Trims `extent` to its first `keep` bytes, rounded up to a granule (A-118; [`crate::buddy::Buddy::trim`]): the rest
   /// goes back to the free lists, and the head of the kept prefix is returned. Every byte of the block past `dirty` is
   /// zero (the caller's record of what was ever written), so only the freed tail's bytes before `dirty` are scrubbed: a
@@ -759,6 +872,12 @@ impl ChunkArena {
         len: extent.len(),
         reason: ExtentRefusal::OtherArena,
       });
+    }
+    // A pinned block keeps its whole extent (§4.6): trimming it would return the cut tail to the free lists, where a
+    // reuse could fall under the mapping's page. Decline the trim (the caller keeps the whole block, as it does for a
+    // locked or imaged one); the tail is reclaimed once the mapping unpins.
+    if self.is_pinned(extent) {
+      return Ok(None);
     }
     let Some(slot) = self.slot_mut(extent.region) else {
       return Err(MemError::ForeignExtent {
@@ -1171,6 +1290,178 @@ mod tests {
       all_are(bytes, p, p, 2) && all_are(bytes, 3 * p, p, 4),
       "live blocks keep their bytes"
     );
+  }
+
+  /// §4.6, AC-4.12 (pinning, the memory-level gate). Do: allocate a page, fill it, pin it, then free it. Expect: the
+  /// free is deferred — the block keeps its bytes (unscrubbed), `pinned_free_waiting` counts it, and a fresh allocation
+  /// lands elsewhere, never on the pinned block. Then unpin: the deferred free runs now, the bytes are scrubbed (A-99),
+  /// and the place is reusable. This is why a DAX guest's page can never fall onto another file's bytes.
+  #[test]
+  fn a_pinned_blocks_free_is_deferred_until_unpin_and_the_block_is_never_reused_meanwhile() {
+    let p = page();
+    let mut arena = ChunkArena::new(p);
+    arena
+      .add_region(Region::map(p * 4, p, false).unwrap())
+      .unwrap();
+    let a = arena.alloc(p).unwrap();
+    arena.bytes_mut(a).unwrap().fill(0xAA);
+    arena.pin(a).unwrap();
+    assert!(arena.is_pinned(a));
+
+    // The file frees its block, but a mapping still holds it: the free is deferred, the bytes kept.
+    arena.free(a).unwrap();
+    assert_eq!(arena.pinned_free_waiting(), 1, "the deferred free is counted");
+    assert!(
+      arena.bytes(a).unwrap().iter().all(|&b| b == 0xAA),
+      "the pinned block keeps its bytes while mapped"
+    );
+
+    // A fresh allocation never lands on the pinned block.
+    let b = arena.alloc(p).unwrap();
+    assert!(
+      b.offset() != a.offset(),
+      "a new allocation did not reuse the pinned block"
+    );
+
+    // The last unpin runs the deferred free now: the bytes are scrubbed and the place is reusable.
+    assert!(arena.unpin(a).unwrap(), "the last unpin released the block");
+    assert_eq!(arena.pinned_free_waiting(), 0);
+    assert!(
+      arena.bytes(a).unwrap().iter().all(|&b| b == 0),
+      "the released block is scrubbed (A-99)"
+    );
+  }
+
+  /// §4.6. Do: pin a live block, then unpin it with no free waiting. Expect: the block stays allocated (the unpin was a
+  /// no-op release), and a later free reuses its place normally — pinning that is matched by an unpin leaves no trace.
+  #[test]
+  fn an_unpin_with_no_waiting_free_leaves_the_block_live_and_reusable() {
+    let p = page();
+    let mut arena = ChunkArena::new(p);
+    arena
+      .add_region(Region::map(p * 2, p, false).unwrap())
+      .unwrap();
+    let a = arena.alloc(p).unwrap();
+    arena.pin(a).unwrap();
+    assert!(!arena.unpin(a).unwrap(), "no free was waiting");
+    assert!(arena.holds(a), "the block is still allocated after the unpin");
+    arena.free(a).unwrap();
+    let b = arena.alloc(p).unwrap();
+    assert_eq!(
+      b.offset(),
+      a.offset(),
+      "with the pin gone the block is reused normally"
+    );
+  }
+
+  /// §4.6. Do: fill a region, pin one block, free it, then allocate. Expect: the allocation is refused — the pinned
+  /// block is the only space but the arena never hands it out — and after the unpin the same allocation succeeds on it.
+  #[test]
+  fn a_pinned_block_is_never_handed_out_even_when_it_is_the_only_space() {
+    let p = page();
+    let mut arena = ChunkArena::new(p);
+    arena
+      .add_region(Region::map(p * 2, p, false).unwrap())
+      .unwrap();
+    let a = arena.alloc(p).unwrap();
+    let _b = arena.alloc(p).unwrap(); // region full
+    arena.pin(a).unwrap();
+    arena.free(a).unwrap(); // deferred: a's page is not on the free list
+    assert!(
+      arena.alloc(p).is_err(),
+      "the pinned block is not handed out though it is the only free space"
+    );
+    assert!(arena.unpin(a).unwrap(), "unpin releases it");
+    assert!(
+      arena.alloc(p).is_ok(),
+      "once unpinned, the block allocates again"
+    );
+  }
+
+  /// §4.6. Do: unpin a block that was never pinned, and unpin one more time than it was pinned. Expect: a typed miss
+  /// ([`ExtentRefusal::NotPinned`]) both times — never a panic, never a double free.
+  #[test]
+  fn an_unbalanced_unpin_is_a_typed_miss_not_a_double_free() {
+    let p = page();
+    let mut arena = ChunkArena::new(p);
+    arena
+      .add_region(Region::map(p * 2, p, false).unwrap())
+      .unwrap();
+    let a = arena.alloc(p).unwrap();
+    assert!(matches!(
+      arena.unpin(a),
+      Err(MemError::ForeignExtent {
+        reason: ExtentRefusal::NotPinned,
+        ..
+      })
+    ));
+    arena.pin(a).unwrap();
+    assert!(!arena.unpin(a).unwrap());
+    assert!(
+      matches!(
+        arena.unpin(a),
+        Err(MemError::ForeignExtent {
+          reason: ExtentRefusal::NotPinned,
+          ..
+        })
+      ),
+      "a second unpin finds nothing to drop"
+    );
+  }
+
+  /// §4.6. Do: pin a block through two holders, free it, and drop one holder. Expect: the block stays pinned and
+  /// deferred until the *second* unpin releases it — a shared mapping keeps the bytes until the last holder leaves.
+  #[test]
+  fn two_holders_keep_a_block_until_the_last_unpin() {
+    let p = page();
+    let mut arena = ChunkArena::new(p);
+    arena
+      .add_region(Region::map(p * 4, p, false).unwrap())
+      .unwrap();
+    let a = arena.alloc(p).unwrap();
+    arena.bytes_mut(a).unwrap().fill(0xCD);
+    arena.pin(a).unwrap();
+    arena.pin(a).unwrap();
+    arena.free(a).unwrap();
+    assert!(!arena.unpin(a).unwrap(), "one holder remains");
+    assert!(
+      arena.bytes(a).unwrap().iter().all(|&b| b == 0xCD),
+      "the block's bytes survive while a holder remains"
+    );
+    assert!(arena.unpin(a).unwrap(), "the last holder releases it");
+    assert!(arena.bytes(a).unwrap().iter().all(|&b| b == 0));
+  }
+
+  /// §4.6. Do: pin a block, then try to pin a freed one. Expect: pinning a block no live allocation names is refused
+  /// ([`ExtentRefusal::NotAllocated`]), so a stale extent can never pin memory; and trimming a pinned block is declined
+  /// (`Ok(None)`), so a truncate cannot cut a mapped block's tail back to the free lists.
+  #[test]
+  fn pinning_refuses_a_stale_extent_and_declines_to_trim_a_pinned_block() {
+    let p = page();
+    let mut arena = ChunkArena::new(p);
+    arena
+      .add_region(Region::map(p * 16, p, false).unwrap())
+      .unwrap();
+    let a = arena.alloc(p).unwrap();
+    arena.free(a).unwrap();
+    assert!(
+      matches!(
+        arena.pin(a),
+        Err(MemError::ForeignExtent {
+          reason: ExtentRefusal::NotAllocated,
+          ..
+        })
+      ),
+      "a freed extent cannot be pinned"
+    );
+    let big = arena.alloc(p * 16).unwrap();
+    arena.pin(big).unwrap();
+    assert!(
+      arena.trim(big, p * 5, p * 5).unwrap().is_none(),
+      "a pinned block is not trimmed"
+    );
+    assert!(!arena.unpin(big).unwrap(), "no free was waiting");
+    assert!(arena.holds(big), "the block is still allocated after the unpin");
   }
 
   /// A-118, the arena's trim: do allocate a 16-page block, fill its first 5 pages and a byte of the sixth, trim it to

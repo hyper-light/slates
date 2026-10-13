@@ -121,6 +121,11 @@ pub struct Store {
   /// Releases of retired objects the store refused (an object already gone, or a free the arena refused): each is an
   /// object listed twice or one left held, so it is counted and surfaced (`store.release_refused`), never silent.
   pub release_refusals: u64,
+  /// The shard's DAX mapping registry (§4.6, AC-4.12): every live guest window, so the content paths revoke before
+  /// they move, share, land or take over a mapped block, and the hardware access path tells a live mapping from a
+  /// revoked one. Daemon-only RAM — no agent, SDK, MCP or guest reaches it; a mapping is minted here, never supplied.
+  /// Empty on any shard no guest maps, so it costs a length check on the hot paths.
+  pub dax: crate::dax::DaxRegistry,
 }
 
 impl std::fmt::Debug for Store {
@@ -199,6 +204,9 @@ impl Store {
         crate::base::digest_capacity(config.max_inodes).get(),
       ),
       release_refusals: 0,
+      // Derived: a mapping pins a chunk, and the shard holds no more chunks than `max_chunks`, so that is the most
+      // mappings it can hold at once — the registry's bound, not a tunable.
+      dax: crate::dax::DaxRegistry::new(config.max_chunks),
     }
   }
 
@@ -2134,6 +2142,10 @@ impl Volume {
     if bytes.is_empty() {
       return Ok(0);
     }
+    // A VFS write to a DAX-mapped file is a second write boundary onto content a guest holds mapped: revoke its
+    // mappings first so the one boundary stays single (§4.6, AC-4.12). The guest re-maps and gets the new block after
+    // its page faults. Empty on any file no guest maps (the common case), so this is a length check.
+    store.dax_revoke_inode(no);
     let charge = self.write_charge(store, no, off, end)?;
     // The windows this write reopens retain their old chunks (§4.2 retention): secure those bytes
     // from unpromised capacity before anything changes, then admit the quota, then mutate; what the
@@ -2352,6 +2364,9 @@ impl Volume {
     if kind == Kind::Dir {
       return Err(VfsError::IsDirectory);
     }
+    // A truncate changes the file's blocks under any DAX guest holding it mapped: revoke its mappings first (§4.6),
+    // the same single-write-boundary rule as a write. The guest re-maps after its fault.
+    store.dax_revoke_inode(no);
     // The windows a truncate cuts away retain their chunks when a snapshot pins them (§4.2
     // retention): secured before anything changes.
     let retention = self.retention_of_truncate(store, no, len)?;
@@ -2471,7 +2486,11 @@ impl Volume {
   /// Takes a snapshot: one record; O(1).
   pub fn snapshot(&mut self, store: &mut Store) -> Result<SnapshotId, VfsError> {
     self.live()?;
-    let _ = store;
+    // A snapshot shares this volume's current blocks with the frozen version (§4.6, AC-4.12): a writable DAX mapping
+    // of one must be torn down before the share, or the guest's later write would reach the frozen version. Read-only
+    // mappings survive — immutable shared content is the gate's allowed DAX case. Empty when no guest maps this volume.
+    let prefix = self.prefix();
+    store.dax_revoke_writable_of_prefix(prefix);
     let record = Snapshot {
       epoch: self.epoch,
       root: self.root,

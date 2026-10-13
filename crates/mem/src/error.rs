@@ -148,6 +148,9 @@ pub enum ExtentRefusal {
   /// A claim names a span that is already allocated, wholly or in part (A-64: a recovery image naming one
   /// block twice, or two overlapping blocks).
   Claimed,
+  /// An `unpin` of a block no DAX mapping holds (§4.6): it was never pinned, or its last holder already
+  /// unpinned it.
+  NotPinned,
 }
 
 impl fmt::Display for MemError {
