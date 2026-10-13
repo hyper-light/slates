@@ -2223,3 +2223,67 @@ fn an_outsider_edit_beneath_an_untouched_base_file_asks_for_its_recall() {
   );
   assert_eq!(store.recall_gate.outside_recalls(), 3);
 }
+
+/// CVE-2026-77179 (a host VMM's virtio-fs server followed a symlink swapped in at a path it reopened by name,
+/// reading an arbitrary host file) for the OVERLAY's read side. slates never reopens a base path by name after it
+/// has witnessed it (the content is in RAM), and the base seam opens every path component `O_DIRECTORY|O_NOFOLLOW`,
+/// so a host swap of a base path never redirects the agent to host content. The RAM-volume leg is
+/// `lifetime::an_open_handle_survives_unlink_and_recreate_reaching_the_original_inode`; this is the base/overlay
+/// leg, and it exercises this session's symlink content-op refusal on a base symlink. Do: edit a base file
+/// (witnessing it), then from the host (1) swap its content, (2) remove it, (3) swap a base file to a symlink to a
+/// sensitive host path, (4) swap an intermediate directory to a symlink to a host directory. Expect: the agent
+/// keeps reading its witnessed copy through (1) and (2); a read of a base path the host turned into a symlink is
+/// `Invalid` (never the symlink's host target as content); a resolve through a directory the host turned into a
+/// symlink is `NotDirectory` (never descended into the host target).
+#[test]
+fn an_overlay_never_follows_a_base_path_the_host_swaps_under_it_cve_2026_77179() {
+  let mut host = SimHost::new();
+  host.replace_file("/witnessed", b"ORIGINAL");
+  host.mkdir("/realdir");
+  host.replace_file("/realdir/f", b"inside-realdir");
+  host.replace_file("/victim", b"VICTIM");
+  let mut store = store();
+  let mut vol = overlay(&mut host, &mut store);
+
+  // Witness `/witnessed` by editing it: its content now lives in the volume's RAM, not the host.
+  let w = vol.with_host(&mut host).resolve(&mut store, "/witnessed").unwrap().inode;
+  vol.with_host(&mut host).write(&mut store, w, 0, b"EDITED!!").unwrap();
+
+  // (1) Host swaps the content underneath, (2) host removes it: the agent still reads its witnessed copy.
+  host.replace_file("/witnessed", b"SWAPPED!!");
+  assert_eq!(
+    read_all(&mut vol, &mut host, &mut store, "/witnessed").unwrap(),
+    b"EDITED!!",
+    "a host content swap must not reach the agent's witnessed copy"
+  );
+  host.remove("/witnessed");
+  assert_eq!(
+    read_all(&mut vol, &mut host, &mut store, "/witnessed").unwrap(),
+    b"EDITED!!",
+    "a host removal must not strip the agent's witnessed copy"
+  );
+
+  // (3) Host turns a base file into a symlink to a sensitive host path: the agent's read is refused, never the
+  // symlink's host target returned as content (this session's symlink content-op refusal, on a base symlink).
+  host.remove("/victim");
+  host.symlink("/victim", "/etc/passwd");
+  assert_eq!(
+    read_all(&mut vol, &mut host, &mut store, "/victim"),
+    Err(VfsError::Invalid),
+    "a base path the host swapped into a symlink must refuse the read, never return its host target as content"
+  );
+
+  // (4) Host turns an intermediate directory into a symlink to a host directory: the resolve does not descend
+  // through it into the host target.
+  host.remove("/realdir/f");
+  host.remove("/realdir");
+  host.symlink("/realdir", "/etc");
+  assert_eq!(
+    vol
+      .with_host(&mut host)
+      .resolve(&mut store, "/realdir/f")
+      .map(|located| located.inode),
+    Err(VfsError::NotDirectory),
+    "a directory the host swapped into a symlink must not be descended into the host target"
+  );
+}
