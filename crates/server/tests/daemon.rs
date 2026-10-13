@@ -1588,6 +1588,27 @@ fn a_consumer_lists_the_shared_volume_and_not_an_unshared_one(
     !ids.contains(&private),
     "the consumer must not list a volume the owner kept private — its name must stay invisible: {ids:?}"
   );
+  // Nor READ it: the same principal gate the MCP read-only `volumes()`/`read()` query relies on (client.read ->
+  // ReadRange -> the read path authorizes the principal). An unshared volume's bytes are unreachable, and the
+  // refusal must not be a bare NotFound that would leak whether a path exists.
+  let read = RequestBody::ReadRange {
+    volume: private,
+    path: "/anything".to_owned(),
+    at: slates_ipc::protocol::ReadAt::Head,
+    offset: 0,
+    max: 64,
+  };
+  let reply = workload.call(&read);
+  assert!(
+    matches!(
+      reply,
+      ReplyBody::Refused {
+        refusal: Refusal::Forbidden { .. }
+      }
+    ),
+    "a consumer reading an unshared volume must be refused Forbidden by rights (not a bare NotFound that \
+     leaks path existence), got {reply:?}"
+  );
 }
 
 /// A forged proof of issuer authority refuses: an agent cannot enroll itself.
