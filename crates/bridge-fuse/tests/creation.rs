@@ -227,3 +227,56 @@ fn fuse_create_and_mkdir_refuse_dot_names() {
     "a normal name still creates"
   );
 }
+
+/// `fuse_symlink_in`: the body is `name\0 target\0`.
+fn symlink_body(name: &str, target: &str) -> Vec<u8> {
+  with_name(with_name(Vec::new(), name), target)
+}
+
+/// Replicates CVE-2026-47243 (the Kata Containers virtio-fs guest-root → host-root escape) against slates. There,
+/// a guest took over the virtio-fs device and submitted a raw `FUSE_SYMLINK` whose *name* was an absolute host
+/// path (e.g. `/etc/cron.d/...`), which `virtiofsd` honored *outside* the shared directory, planting a root-owned
+/// symlink on the host. slates refuses it two ways: a name is one path component (`slates_vfs::names::check`
+/// rejects `/`), and a slates write never reaches the host at all (R1 — it lands in the in-RAM volume). So a
+/// create whose name is an absolute path or a `..` traversal is refused across CREATE, MKDIR and SYMLINK; the
+/// target string (resolved by the guest, never the server) is free to be anything.
+#[test]
+fn fuse_create_family_refuses_a_path_or_absolute_name() {
+  let mut store = store();
+  let mut volume = volume_for_owner(&mut store, ENROLLED, ENROLLED_GROUP);
+  let mut attachments = Attachments::new();
+  let id = attachments
+    .attach(
+      VOLUME,
+      View::Current,
+      Principal::Uid { uid: ENROLLED },
+      Rights {
+        read: true,
+        write: true,
+      },
+    )
+    .unwrap();
+  let cx = attachments.context(id).unwrap();
+  let mut bridge = VolumeBridge::new(VOLUME, &mut volume, &mut store);
+
+  assert_ne!(
+    fuse_errno(&mut bridge, &cx, Opcode::Create, 1, create(S_IFREG | 0o644, 0, "/etc/cron.d/evil")),
+    0,
+    "an absolute-path CREATE name is refused"
+  );
+  assert_ne!(
+    fuse_errno(&mut bridge, &cx, Opcode::MkDir, 2, mkdir(0o755, 0, "../../escape")),
+    0,
+    "a '..' traversal MKDIR name is refused"
+  );
+  assert_ne!(
+    fuse_errno(&mut bridge, &cx, Opcode::SymLink, 3, symlink_body("/etc/cron.d/evil", "payload")),
+    0,
+    "an absolute-path SYMLINK name is refused (CVE-2026-47243's exact vector)"
+  );
+  assert_ne!(
+    fuse_errno(&mut bridge, &cx, Opcode::SymLink, 4, symlink_body("../escape", "payload")),
+    0,
+    "a '..' traversal SYMLINK name is refused"
+  );
+}
