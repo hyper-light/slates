@@ -58,8 +58,13 @@ working behaviour is removed.
 
 ## Scope of the fix / not touched
 
-Only the journal step is guarded. The base-plane step (watcher hints for live base sources) is left as is: it is
-reached only for a volume with a host base plane, and whether a pinned view of a base-overlay volume does live
-base passthrough (and so legitimately needs base-drift hints) is a §4.4/§4.5 question not resolved here and not
-demonstrated to leak. The proven defect — current-head *journal* mutations reaching a pinned view — is fixed;
-the base-plane question for pinned views of base-overlay volumes is noted for Ada, unproven.
+Only the journal step is guarded, and that is the correct scope. The base-plane step (watcher hints for live base
+sources) is deliberately left running for a pinned view, because a pinned view *is* affected by base drift: a
+snapshot serves its own pinned extents plus the base's unpinned ranges read from the disk "only while the disk
+still holds the snapshot's witnessed base, else `BaseDrift`" (A-49, `base.rs` `view_read`). So when an outsider
+edits a base entry, the pinned view's next read of that entry's unpinned ranges turns from witnessed bytes into a
+`BaseDrift` refusal — a real change in what the view serves, whose kernel cache must be invalidated. The journal,
+by contrast, records current-*head* mutations, which a pinned view never sees at all. Hence the journal step is
+gated on `View::Current` and the base-plane step is not. (An earlier draft flagged the base-plane step as an
+unproven question for Ada; reading A-49 resolved it — it belongs for pinned views.) The `ScopedBridge` scope
+filter still confines base-plane hints to in-scope entries, since it filters the whole appended tail.
