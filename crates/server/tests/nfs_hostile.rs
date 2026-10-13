@@ -17,7 +17,7 @@ use slates_ipc::protocol::{NamePolicy, SizeClass};
 use slates_server::{Daemon, DaemonConfig, SegmentSource};
 
 mod common;
-use common::nfs::{NFS_PROGRAM, create, mount, opaque, read, status, write};
+use common::nfs::{NFS_PROGRAM, create, mount, opaque, read, read_status, status, write};
 
 /// Shape: honest clients, each on its own connection and file.
 const HONEST: usize = 4;
@@ -516,4 +516,142 @@ fn pipelined_calls_are_answered_in_order_and_their_replies_share_writes() {
   drop(stream);
   drop(daemon);
   assert!(batched > 0, "pipelined replies shared writes: {refusals:?}");
+}
+
+/// A one-shard daemon, so every volume this test provisions shares one shard's volume set — the
+/// co-located-tenant case a cross-volume forgery would exploit.
+fn single_shard_daemon(name: &str) -> (Daemon, String) {
+  let profile = common::machine_profile();
+  let instance = format!("srv-{name}-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile, &instance, Some(1));
+  let daemon = Daemon::start(
+    &profile,
+    config,
+    SegmentSource::Create {
+      name: format!("slates-seg-{name}-{}", std::process::id()),
+    },
+  )
+  .unwrap();
+  daemon.bootstrap(true).unwrap();
+  (daemon, instance)
+}
+
+/// Provisions a bounded volume named `name` on `instance`.
+fn provision(instance: &str, name: &str) {
+  let deadlines = slates_client::Deadlines::derive(
+    slates_server::daemon::LIVENESS_BUDGET_NS,
+    slates_db::replay::RECOVERY_BUDGET_NS,
+  )
+  .get();
+  let mut client = slates_client::Client::connect(instance, deadlines).unwrap();
+  client
+    .create(&slates_client::CreateSpec {
+      name: name.to_owned(),
+      size: SizeClass::Bounded { limit: 1 << 20 },
+      names: NamePolicy::Exact,
+      require_locked: false,
+      base: None,
+    })
+    .unwrap();
+}
+
+/// The attachment id and 16-byte token of a mount-capability path `/<name>@<att_hex>.<token_hex>`
+/// (§4.13; AUD-01).
+fn capability_bytes(path: &str) -> (u64, [u8; 16]) {
+  let (_, capability) = path.rsplit_once('@').expect("a capability path");
+  let (att_hex, tok_hex) = capability.split_once('.').expect("attachment.token");
+  let attachment = u64::from_str_radix(att_hex, 16).expect("hex attachment");
+  assert_eq!(tok_hex.len(), 32, "a 16-byte token is 32 hex digits");
+  let mut token = [0u8; 16];
+  for (byte, [high, low]) in token.iter_mut().zip(tok_hex.as_bytes().as_chunks::<2>().0) {
+    let high = char::from(*high).to_digit(16).expect("hex");
+    let low = char::from(*low).to_digit(16).expect("hex");
+    *byte = u8::try_from(high * 16 + low).expect("byte");
+  }
+  (attachment, token)
+}
+
+/// Deliberate cross-tenant file-handle forgery (§4.6, §4.13, AUD-01; the NFS filehandle-guessing attack
+/// from the literature — https://lwn.net/Articles/1056968/ — extended past a random bit flip to an
+/// *existing* victim volume). A client holds a valid mount capability for its own volume A, learns a real
+/// handle of a co-located tenant's volume B (both on the one shard), and **re-stamps B's object with A's
+/// attachment and token** — the handle self-authorizes, so the attacker never mounts B. Expect: every read
+/// of the forged handle is `NFS3ERR_ACCES`, because the owner shard binds the capability to its own volume
+/// (`authorized_rights`: `record.volume != volume`), so A's token never authorizes B, and a zero capability
+/// (an unbound guess) is refused too. Non-vacuous: B's own handle answers B's bytes, and the forged read
+/// discloses none of them.
+#[test]
+fn a_valid_capability_cannot_be_restamped_onto_another_tenants_handle() {
+  /// Format: `NFS3ERR_ACCES` (RFC 1813 §2.6) — a handle whose capability does not authorize its volume.
+  const NFS3ERR_ACCES: u32 = 13;
+  const SECRET: &[u8] = b"tenant B's private bytes, never disclosed to tenant A\n";
+  const VOLUME_AT: usize = 1; // the 16-byte volume id follows the 1-byte version
+  const ATTACHMENT_AT: usize = 1 + 16 + 8 + 8; // after version, volume, inode, generation
+  const TOKEN_AT: usize = ATTACHMENT_AT + 8;
+
+  let (daemon, instance) = single_shard_daemon("restamp");
+  provision(&instance, "mine"); // the attacker's own volume A
+  provision(&instance, "victim"); // the co-located tenant B
+  let port = daemon.nfs_port().expect("the daemon is serving NFS");
+
+  let cap_a = daemon.mount_capability("mine").unwrap().unwrap();
+  let cap_b = daemon.mount_capability("victim").unwrap().unwrap();
+  let (att_a, tok_a) = capability_bytes(&cap_a);
+
+  // B's owner writes a private file in B through B's own capability.
+  let mut owner_b = TcpStream::connect(("127.0.0.1", port)).unwrap();
+  let root_b = mount(&mut owner_b, &cap_b, 1);
+  let file_b = create(&mut owner_b, &root_b, "secret", 2);
+  write(&mut owner_b, &file_b, SECRET, 3);
+  assert_eq!(file_b.len(), 57, "a version-2 handle is 57 bytes");
+
+  // Non-vacuity: B's own handle, under B's own capability, answers B's bytes.
+  assert_eq!(read_status(&mut owner_b, &file_b, 4), 0, "B serves its own file");
+  assert_eq!(read(&mut owner_b, &file_b, 5), SECRET, "...with its private bytes");
+
+  // Sanity: the handle really names volume B, not A, so the re-stamp is a true cross-volume forgery.
+  let root_a = mount(
+    &mut TcpStream::connect(("127.0.0.1", port)).unwrap(),
+    &cap_a,
+    6,
+  );
+  assert_ne!(
+    file_b.get(VOLUME_AT..VOLUME_AT + 16),
+    root_a.get(VOLUME_AT..VOLUME_AT + 16),
+    "A and B are different volumes"
+  );
+
+  // The forgery: B's real file handle, re-stamped with A's attachment and token.
+  let mut forged = file_b.clone();
+  if let Some(slot) = forged.get_mut(ATTACHMENT_AT..ATTACHMENT_AT + 8) {
+    slot.copy_from_slice(&att_a.to_be_bytes());
+  }
+  if let Some(slot) = forged.get_mut(TOKEN_AT..TOKEN_AT + 16) {
+    slot.copy_from_slice(&tok_a);
+  }
+
+  // A fresh connection — the handle self-authorizes, so no mount of B is needed to present it.
+  let mut attacker = TcpStream::connect(("127.0.0.1", port)).unwrap();
+  let forged_status = read_status(&mut attacker, &forged, 7);
+  assert_eq!(
+    forged_status, NFS3ERR_ACCES,
+    "A's capability must not authorize B's object (got {forged_status})"
+  );
+
+  // A zero capability (an unbound guesser with no token) is refused as well.
+  let mut zeroed = file_b.clone();
+  if let Some(slot) = zeroed.get_mut(ATTACHMENT_AT..TOKEN_AT + 16) {
+    slot.fill(0);
+  }
+  let mut guesser = TcpStream::connect(("127.0.0.1", port)).unwrap();
+  assert_eq!(
+    read_status(&mut guesser, &zeroed, 8),
+    NFS3ERR_ACCES,
+    "a zero capability is refused"
+  );
+
+  drop(owner_b);
+  drop(attacker);
+  drop(guesser);
+  drop(daemon);
 }
