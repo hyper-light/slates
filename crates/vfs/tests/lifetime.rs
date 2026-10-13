@@ -288,6 +288,34 @@ fn a_forget_drops_only_the_owners_share() {
   );
 }
 
+/// §4.6 the reference model, at the extreme (the FUSE FORGET-underflow class, a kernel that lies about its
+/// `nlookup`): a forget of `u64::MAX` for a node an attachment holds once drops exactly one — `forget_for`
+/// caps the drop at what the owner holds (`min(n, owned)` over a `u64→u32` saturation), so the count never
+/// underflows or wraps. The node reclaims once (no other holder), and a *second* `u64::MAX` forget of the now
+/// reclaimed node is a safe no-op (owned is zero): it never underflows the count negative, never resurrects or
+/// corrupts a freed inode, never panics.
+#[test]
+fn a_u64_max_forget_drops_only_what_is_held_and_a_repeat_is_inert() {
+  let mut store = store();
+  let mut vol = volume(&mut store, 1 << 30);
+  let root = vol.root_inode(&store).unwrap();
+  let f = vol.create_file_no(&mut store, root, "f", 0o644).unwrap();
+  vol.reference_for(&store, f, RefOwner::Process(1)).unwrap();
+  vol.unlink_no(&mut store, root, "f").unwrap();
+
+  // A colossal forget caps at the one reference held: the inode reclaims exactly once.
+  vol
+    .forget_for(&mut store, f, RefOwner::Process(1), u64::MAX)
+    .unwrap();
+  assert!(vol.stat(&store, f).is_err(), "the single reference was dropped exactly once");
+
+  // A repeat colossal forget of the reclaimed node is inert — no underflow, no resurrection, no panic.
+  vol
+    .forget_for(&mut store, f, RefOwner::Process(1), u64::MAX)
+    .unwrap();
+  assert!(vol.stat(&store, f).is_err(), "the reclaimed inode stays gone, never resurrected");
+}
+
 /// A directory removed while a transport still holds it — a kernel's lookup of a directory it made, kept until
 /// its forget (2026-10-01: `rm -r` through the daemon's FUSE mount, after which every barrier on the volume was
 /// refused and the kernel answered `EIO`). Do: hold a reference on a directory, empty it, remove it; image
