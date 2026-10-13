@@ -1441,6 +1441,42 @@ fn a_scoped_view_never_leaks_an_out_of_scope_cache_invalidation() {
   );
 }
 
+/// §4.6 (AppleDouble sidecars under a scoped export). A sidecar's derived inode (owner | `DERIVED_BIT`) names no
+/// real inode of its own; it lives at its owner, so it is within the scope exactly when its owner is. A scoped
+/// client must be able to read the sidecar of a file in its own scope, and must not reach the sidecar of one
+/// outside it. Do: in `/shared` (the scope) create `f` and its sidecar, in `/private` (outside) create `s` and
+/// its sidecar; serve `shared` scoped and `getattr` both sidecars by their derived inode. Expect: the in-scope
+/// sidecar is read (its owner is in scope); the out-of-scope one is `NotFound`.
+#[test]
+fn a_scoped_view_reaches_an_in_scope_sidecar_and_refuses_an_out_of_scope_one() {
+  use slates_bridge_core::scoped::ScopedBridge;
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let cx = rw_cx();
+  let (shared, f_sidecar, s_sidecar) = {
+    let mut inner = VolumeBridge::new(VolumeId { bytes: [0; 16] }, &mut vol, &mut store);
+    let root = inner.root(&cx).unwrap();
+    let shared = inner.mkdir(oid(root), &cx, "shared", 0o755).unwrap().ino;
+    let private = inner.mkdir(oid(root), &cx, "private", 0o700).unwrap().ino;
+    inner.create(oid(shared), &cx, "f", 0o644, 0).unwrap();
+    let f_view = inner.appledouble_create(oid(shared), &cx, "f", true).unwrap();
+    inner.create(oid(private), &cx, "s", 0o644, 0).unwrap();
+    let s_view = inner.appledouble_create(oid(private), &cx, "s", true).unwrap();
+    (shared, f_view.ino, s_view.ino)
+  };
+  let mut inner = VolumeBridge::new(VolumeId { bytes: [0; 16] }, &mut vol, &mut store);
+  let mut scoped = ScopedBridge::new(&mut inner, shared);
+  assert!(
+    scoped.getattr(oid(f_sidecar), &cx).is_ok(),
+    "the sidecar of an in-scope file must be reachable through the scoped view"
+  );
+  assert_eq!(
+    scoped.getattr(oid(s_sidecar), &cx),
+    Err(VfsError::NotFound),
+    "the sidecar of an out-of-scope file must not be reachable"
+  );
+}
+
 /// A-61 (a mount taken over after its daemon died). Do: serve a volume holding `lost` and `kept` through a bridge
 /// told `lost` lost writes; flush `lost` twice through a handle the dead daemon issued (one this bridge never
 /// did), then fsync it twice and flush it; flush `kept` through another; flush `lost` through a handle opened
