@@ -2188,9 +2188,11 @@ pub fn revoke_proof(
 /// golden vector below pins it.
 pub use slates_ipc::delivery::attest_proof;
 
-/// Whether two proofs are equal, visiting every byte whatever the first difference (no early exit), so
-/// the comparison's time does not depend on how much of a forged proof happened to match.
-pub(crate) fn constant_time_eq(a: &[u8; 32], b: &[u8; 32]) -> bool {
+/// Whether two fixed-size secrets are equal, visiting every byte whatever the first difference (no early
+/// exit), so the comparison's time does not depend on how much of a forged secret happened to match. Used
+/// for the 32-byte grant proof (above) and the 16-byte mount capability token (`crate::nfs`); the const
+/// length couples both operands to one size, so there is no length branch to leak either.
+pub(crate) fn constant_time_eq<const N: usize>(a: &[u8; N], b: &[u8; N]) -> bool {
   let mut difference = 0u8;
   for (x, y) in a.iter().zip(b.iter()) {
     difference |= x ^ y;

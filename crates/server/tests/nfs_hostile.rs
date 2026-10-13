@@ -901,6 +901,57 @@ fn lookup_dotdot_never_climbs_out_of_the_mount_cwe_22() {
   drop(daemon);
 }
 
+/// §4.13 / AUD-01, over a raw socket: a file handle's trailing 16 bytes are the mount capability token
+/// (`crates/bridge-nfs/src/handle.rs`) — a bearer secret the daemon matches against the attachment record
+/// (`authorized_rights`). A handle that keeps a valid attachment id but carries a WRONG token must be refused,
+/// and the match is constant-time (`crate::landing::constant_time_eq`, the same discipline as the grant proof),
+/// so a forged token leaks no byte of the real one through timing. Against a live daemon: a file reads with its
+/// honest handle (non-vacuity); the same handle with its token bytes overwritten by a wrong non-zero value is
+/// refused; the all-zero token (the "no capability presented" sentinel) is refused. Complements the fuzzed
+/// single-bit flip under load (`a_mount_survives_connections_broken_and_tampered_mid_call_under_load`) with a
+/// deterministic whole-token forgery.
+#[test]
+fn a_handle_with_a_valid_attachment_but_a_wrong_mount_token_is_refused() {
+  let (daemon, instance) = single_shard_daemon("wrongtoken");
+  provision(&instance, "wt");
+  let port = daemon.nfs_port().expect("the daemon is serving NFS");
+  let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+  let root = mount(&mut s, &daemon.mount_capability("wt").unwrap().unwrap(), 1);
+
+  // A real file, read with the correct handle (which carries the real mount token) — the test is not vacuous.
+  let file = create(&mut s, &root, "secret.txt", 2);
+  write(&mut s, &file, b"tenant bytes", 3);
+  assert_eq!(read_status(&mut s, &file, 4), 0, "the honest handle (correct token) reads");
+
+  // The same handle with its last 16 bytes — the capability token — replaced by a wrong, non-zero value; the
+  // valid attachment id ahead of them is left intact. The token no longer matches the attachment record's, so
+  // the mount is unauthorized and the READ is refused (never served from the valid attachment alone).
+  let mut forged = file.clone();
+  let keep = forged.len().saturating_sub(16);
+  for byte in forged.iter_mut().skip(keep) {
+    *byte = 0xff;
+  }
+  assert_ne!(
+    read_status(&mut s, &forged, 5),
+    0,
+    "a valid attachment id with a wrong token is refused — the token alone authorizes, and it did not match"
+  );
+
+  // The all-zero token is the 'no capability presented' sentinel, refused before any compare.
+  let mut zeroed = file.clone();
+  for byte in zeroed.iter_mut().skip(keep) {
+    *byte = 0x00;
+  }
+  assert_ne!(
+    read_status(&mut s, &zeroed, 6),
+    0,
+    "the all-zero token (no capability) is refused"
+  );
+
+  drop(s);
+  drop(daemon);
+}
+
 /// The remove family (§4.6): RMDIR already guards `.`/`..`, but the guard sits inside `if is_dir`, so REMOVE
 /// (unlink) of `.`/`..` takes the unguarded path — `bridge.lookup(".")` resolves the directory, then
 /// `bridge.unlink(parent, ".")` runs. This test drives REMOVE of `.`/`..` over a live socket and requires it to
