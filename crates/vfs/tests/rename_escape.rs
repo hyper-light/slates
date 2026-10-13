@@ -10,7 +10,7 @@ use slates_vfs::ids::InodeNo;
 use slates_vfs::volume::{Store, Volume};
 
 mod common;
-use common::{store, volume};
+use common::{clone_config, store, volume};
 
 /// Builds `/a/b/c/d` and returns `(a, b, c, d)` inode numbers.
 fn tree(store: &mut Store, v: &mut Volume) -> (InodeNo, InodeNo, InodeNo, InodeNo) {
@@ -101,5 +101,28 @@ fn a_hard_link_to_a_directory_is_refused() {
     v.lookup_no(&store, root, "f_alias").unwrap().inode,
     file,
     "the file alias names the file's inode"
+  );
+}
+
+/// §4.6 cross-tenant containment. Two volumes share the shard's one store; an inode number is prefix-encoded per
+/// volume. A hard link that names ANOTHER volume's inode as its target must be refused — otherwise a tenant could
+/// give itself a name for another tenant's file, a cross-volume read/write escape. Driven against the volume core
+/// with two volumes of different prefixes in one store.
+#[test]
+fn a_hard_link_cannot_target_another_volumes_inode() {
+  let mut store = store();
+  let mut a = volume(&mut store, 1 << 20); // prefix 7
+  let mut b = Volume::create(&mut store, clone_config(9)).unwrap(); // prefix 9, same store
+  let root_a = a.root_inode(&store).unwrap();
+  let root_b = b.root_inode(&store).unwrap();
+  let b_file = b.create_file_no(&mut store, root_b, "secret", 0o644).unwrap();
+
+  assert!(
+    a.link_no(&mut store, root_a, "stolen", b_file).is_err(),
+    "volume A cannot hard-link volume B's inode"
+  );
+  assert!(
+    a.lookup_no(&store, root_a, "stolen").is_err(),
+    "no cross-volume alias was planted"
   );
 }
