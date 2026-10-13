@@ -64,7 +64,21 @@ unchanged); the whole `volume_bridge` suite (34) and `scope` (1) are green.
 
 ## Note
 
-A pathological case remains theoretical and is governed by the inner bound: a single cookie group larger than the
-limit that is also entirely droppable would stop the loop with a short page (the `next == cursor` break). The
-inner readdir already signals overflow for an oversized cookie group (FUSE `EOVERFLOW`), so this is the inner
-layer's to bound; no case of it was reproduced here. Noted for Ada.
+Two things left honest rather than rounded up:
+
+- **Per-call cost.** The loop crosses dropped entries to reach in-scope ones. Because the client resumes from the
+  last *shown* entry's cookie, each dropped entry is crossed exactly once across the whole listing, so the total
+  work to list a directory is O(entries) — the same as before. But a single `readdir` call can cross one
+  run of droppable entries, so its worst case is O(run) rather than O(limit): a directory that is almost entirely
+  out-of-scope aliases with one in-scope entry at the end makes the call that reaches it O(directory). It is
+  bounded by the directory's entry count (itself quota-bounded), not unbounded, and the common case (few
+  droppable entries) is ~one inner page. Slicing it under a per-iteration budget would need an explicit
+  "more to come" signal added to the readdir contract (today a short page *is* the end signal); that is a
+  larger change and the pathological directory is owner-created, so it is noted, not done.
+
+- **Oversized droppable cookie group.** A single cookie group larger than the limit that is also entirely
+  droppable stops the loop with a short page (the `next == cursor` break). The inner readdir already signals
+  overflow for an oversized cookie group (FUSE `EOVERFLOW`), so this is the inner layer's to bound; no case of it
+  was reproduced here.
+
+Both noted for Ada.
