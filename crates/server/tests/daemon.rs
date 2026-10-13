@@ -1611,7 +1611,32 @@ fn the_consumer_holds_only_the_right_shared(
       refusal: Refusal::Forbidden { .. }
     }
   ));
+  a_shared_read_consumer_cannot_destroy_the_owner_volume(owner, workload, id);
   id
+}
+
+/// The most catastrophic cross-principal verb: destroying another principal's volume needs the `admin` right,
+/// which a shared read grant never confers (verbs::destroy gates on `rights_of(record, principal).admin`). The
+/// consumer's Destroy is refused Forbidden, and the owner still sees its volume live — the refused destroy
+/// touched nothing.
+fn a_shared_read_consumer_cannot_destroy_the_owner_volume(
+  owner: &mut Client,
+  workload: &mut Client,
+  id: VolumeId,
+) {
+  assert!(matches!(
+    workload.call(&RequestBody::Destroy { volume: id }),
+    ReplyBody::Refused {
+      refusal: Refusal::Forbidden { .. }
+    }
+  ));
+  assert!(
+    matches!(
+      owner.call(&RequestBody::Status { volume: id }),
+      ReplyBody::Status { .. }
+    ),
+    "the owner's volume survived the consumer's refused destroy"
+  );
 }
 
 /// The human revokes the consumer: its next verb refuses before any effect, and stays refused.
