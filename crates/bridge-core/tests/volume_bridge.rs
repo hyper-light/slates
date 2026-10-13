@@ -632,6 +632,66 @@ fn a_write_is_refused_on_a_pinned_view() {
   );
 }
 
+/// §4.16, §4.6 — a pinned immutable view owes no content-journal cache invalidations. The journal records
+/// current-head mutations; a snapshot/green-volume attachment does not see the head, so a head mutation is never
+/// staleness in its frozen view, and the one thing that changes its content — an `advance` re-pin — carries its
+/// own invalidated paths in the `Advanced` reply (server `snapshot_view::advance`), not this stream. Delivering
+/// head invalidations to a pinned view would drop caches still valid for its version and disclose current-head
+/// file names and inodes created after its snapshot. Do: with a file in place, take a current-view and a
+/// pinned-view cursor at the same journal point, then (another writer) create `posthead` on the head; ask both
+/// views for their owed invalidations. Expect: the current view is owed the `posthead` entry (non-vacuity: the
+/// mechanism works); the pinned view is owed nothing.
+#[test]
+fn a_pinned_view_owes_no_content_journal_invalidation() {
+  use slates_bridge_core::Invalidation;
+  use slates_vfs::ids::InodeNo;
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let current = rw_cx();
+  let pinned = context(
+    View::Version(1),
+    Rights {
+      read: true,
+      write: false,
+    },
+  );
+
+  // A file exists; take both views' cursors at the same journal point (after the setup churn).
+  let (root, cursor_current, cursor_pinned) = {
+    let mut b = VolumeBridge::new(VolumeId { bytes: [0; 16] }, &mut vol, &mut store);
+    let root = b.root(&current).unwrap();
+    let (f, fh) = b.create(oid(root), &current, "f", 0o644, 0).unwrap();
+    b.release(oid(f.ino), &current, fh).unwrap();
+    (root, b.seen(&current), b.seen(&pinned))
+  };
+
+  // Another writer changes the CURRENT head after the pinned view's snapshot point.
+  vol
+    .create_file_no(&mut store, InodeNo(root), "posthead", 0o644)
+    .unwrap();
+
+  let mut current_owed = Vec::new();
+  let mut pinned_owed = Vec::new();
+  {
+    let mut b = VolumeBridge::new(VolumeId { bytes: [0; 16] }, &mut vol, &mut store);
+    b.invalidations(&current, cursor_current, &mut current_owed)
+      .unwrap();
+    b.invalidations(&pinned, cursor_pinned, &mut pinned_owed)
+      .unwrap();
+  }
+  assert!(
+    current_owed.iter().any(|inv| matches!(
+      inv,
+      Invalidation::Entry { parent, name, .. } if *parent == root && name == "posthead"
+    )),
+    "the current view is owed the head change (non-vacuity): {current_owed:?}"
+  );
+  assert!(
+    pinned_owed.is_empty(),
+    "a pinned immutable view was owed a current-head invalidation it must never see: {pinned_owed:?}"
+  );
+}
+
 /// Unlink-while-open works end to end through the bridge via the OPEN reference (the handle a
 /// create holds): a created file survives an unlink and still serves reads, and is reclaimed once
 /// its open handle is released. The open reference is transport-neutral — both FUSE and NFS hold an
