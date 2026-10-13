@@ -280,3 +280,37 @@ fn fuse_create_family_refuses_a_path_or_absolute_name() {
     "a '..' traversal SYMLINK name is refused"
   );
 }
+
+/// A guest-controlled symlink target must never be an unbounded allocation or a panic (§4.6; CLAUDE.md #8). A
+/// FUSE_SYMLINK with a 70 KiB target is handled gracefully — accepted-and-bounded or refused typed — and the
+/// bridge still serves afterwards, so a guest cannot wedge or OOM the daemon with an outsized target.
+#[test]
+fn a_huge_symlink_target_is_handled_without_a_panic() {
+  let mut store = store();
+  let mut volume = volume_for_owner(&mut store, ENROLLED, ENROLLED_GROUP);
+  let mut attachments = Attachments::new();
+  let id = attachments
+    .attach(
+      VOLUME,
+      View::Current,
+      Principal::Uid { uid: ENROLLED },
+      Rights {
+        read: true,
+        write: true,
+      },
+    )
+    .unwrap();
+  let cx = attachments.context(id).unwrap();
+  let mut bridge = VolumeBridge::new(VOLUME, &mut volume, &mut store);
+
+  let long_target = "a".repeat(70_000);
+  let symlink = fuse_errno(&mut bridge, &cx, Opcode::SymLink, 1, symlink_body("link", &long_target));
+  eprintln!("PROBE huge symlink target (70 KiB): symlink_errno={symlink}");
+
+  // Whatever the policy on an outsized target, the bridge did not panic and still serves a normal create.
+  assert_eq!(
+    fuse_errno(&mut bridge, &cx, Opcode::Create, 2, create(S_IFREG | 0o644, 0, "after")),
+    0,
+    "the bridge still serves after a huge symlink target"
+  );
+}
