@@ -605,3 +605,70 @@ fn a_symlink_answers_only_readlink_not_file_content() {
   assert_eq!(vol.write(&mut store, file, 0, b"hello").unwrap(), 5);
   assert_eq!(vol.read(&store, file, 0, &mut buf).unwrap(), 5);
 }
+
+/// The errno a content operation owes an inode of `kind`, or `None` for a regular file (it is allowed). The one
+/// place the "a content op is allowed only on a regular file" rule is stated for the matrix test below.
+fn content_refusal(kind: slates_vfs::inode::Kind) -> Option<VfsError> {
+  use slates_vfs::inode::Kind;
+  match kind {
+    Kind::File => None,
+    Kind::Dir => Some(VfsError::IsDirectory),
+    Kind::Symlink => Some(VfsError::Invalid),
+    Kind::Fifo | Kind::Socket => Some(VfsError::SpecialFileOperation),
+  }
+}
+
+/// Asserts one content operation's `result` on an inode of `kind` matches [`content_refusal`] (recomputed per
+/// call so the error need not be `Copy`).
+fn assert_content(op: &str, result: Result<(), VfsError>, kind: slates_vfs::inode::Kind) {
+  match content_refusal(kind) {
+    None => assert!(result.is_ok(), "{op} on a regular file must succeed, got {result:?}"),
+    Some(err) => assert_eq!(result, Err(err), "{op} on a {kind:?} must be refused with its errno"),
+  }
+}
+
+/// Runs every content operation on `inode` and checks each against the kind's expected refusal.
+fn check_content_ops(
+  vol: &mut Volume,
+  store: &mut Store,
+  inode: slates_vfs::ids::InodeNo,
+  kind: slates_vfs::inode::Kind,
+) {
+  let mut buf = [0u8; 8];
+  assert_content("read", vol.read(store, inode, 0, &mut buf).map(|_| ()), kind);
+  assert_content("write", vol.write(store, inode, 0, b"x").map(|_| ()), kind);
+  assert_content(
+    "seek",
+    vol.seek(store, inode, 0, slates_vfs::volume::Seek::Data).map(|_| ()),
+    kind,
+  );
+  assert_content("truncate", vol.truncate(store, inode, 4), kind);
+  assert_content("allocate", vol.admit_allocation(store, inode, 0, 4), kind);
+  assert_content("edit", vol.edit(store, inode, 0, 0, b"x").map(|_| ()), kind);
+}
+
+/// The full (kind x content operation) refusal matrix: every content op (read, write, seek, truncate, allocate,
+/// edit) succeeds on a regular file and is refused on every other kind with its exact errno — a directory
+/// `IsDirectory` (`EISDIR`), a symlink `Invalid` (`EINVAL`), an IPC name `SpecialFileOperation`. This is the
+/// generative guard the oracles lacked: `model.rs ino_of` picks only file inodes, and the differential follows a
+/// symlink by path, so neither ran a direct content op on a non-file inode — which is how the symlink content-op
+/// type confusion slipped past them. One table catches the whole class, including a future op or kind that forgets
+/// a check. Do: make an inode of each kind, run every content op on each. Expect: a file's ops succeed; every
+/// non-file's are refused with its errno.
+#[test]
+fn every_content_operation_is_refused_on_a_non_file_kind() {
+  use slates_vfs::inode::Kind;
+  let mut store = store();
+  let mut vol = volume(&mut store, 1 << 20);
+  let root = vol.root_inode(&store).unwrap();
+  let inodes = [
+    (Kind::File, vol.create_file_no(&mut store, root, "f", 0o644).unwrap()),
+    (Kind::Dir, vol.mkdir_no(&mut store, root, "d", 0o755).unwrap()),
+    (Kind::Symlink, vol.symlink_no(&mut store, root, "l", "target").unwrap()),
+    (Kind::Fifo, vol.mknod_no(&mut store, root, "p", 0o644, Kind::Fifo).unwrap()),
+    (Kind::Socket, vol.mknod_no(&mut store, root, "s", 0o644, Kind::Socket).unwrap()),
+  ];
+  for (kind, inode) in inodes {
+    check_content_ops(&mut vol, &mut store, inode, kind);
+  }
+}
