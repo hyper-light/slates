@@ -405,3 +405,42 @@ fn dropping_one_name_of_a_linked_file_advances_the_survivors_ctime() {
     "the renamed file took the name"
   );
 }
+
+/// CWE-190 (integer overflow) at the write/read offset. A client's write offset plus its length must be checked,
+/// not wrapped: `off.checked_add(len)` refuses `FileTooLarge` rather than wrapping to a low offset and writing
+/// out of place, and a read at a colossal offset returns no bytes rather than underflowing `size - off`. Do:
+/// write four bytes at `u64::MAX - 2` and at `u64::MAX` (both overflow the end), read at `u64::MAX`. Expect:
+/// each write refused `FileTooLarge`, the file still empty (no wrapped write), the read returns zero bytes, and
+/// a normal write at offset 0 still works.
+#[test]
+fn a_write_or_read_at_a_colossal_offset_is_refused_or_empty_never_wrapped() {
+  let mut store = store();
+  let mut vol = volume(&mut store, 1 << 20);
+  let root = vol.root_inode(&store).unwrap();
+  let f = vol.create_file_no(&mut store, root, "f", 0o644).unwrap();
+
+  for off in [u64::MAX - 2, u64::MAX] {
+    assert_eq!(
+      vol.write(&mut store, f, off, b"data"),
+      Err(VfsError::FileTooLarge),
+      "a write whose offset {off} plus length overflows must be refused, not wrapped"
+    );
+  }
+  assert_eq!(
+    vol.stat(&store, f).unwrap().size,
+    0,
+    "the overflowing writes wrote nothing — no wraparound to a low offset"
+  );
+
+  let mut buf = vec![0u8; 16];
+  assert_eq!(
+    vol.read(&store, f, u64::MAX, &mut buf).unwrap(),
+    0,
+    "a read at a colossal offset returns nothing, never an out-of-bounds or underflowing read"
+  );
+
+  vol.write(&mut store, f, 0, b"ok").unwrap();
+  let mut got = vec![0u8; 2];
+  assert_eq!(vol.read(&store, f, 0, &mut got).unwrap(), 2);
+  assert_eq!(&got, b"ok", "a normal write reads back");
+}
