@@ -1548,6 +1548,42 @@ fn seek_finds_the_holes_and_the_data_of_a_sparse_file() {
   assert_eq!(status, Nfsstat4::Nxio.wire());
 }
 
+/// A-35 / §4.2 (the allocate family is not served over NFS, `v42.rs`): ALLOCATE and DEALLOCATE are refused
+/// `NFS4ERR_NOTSUPP`, so there is no server-side hole-punch on the NFS channel — and thus no stale-block-leak
+/// surface (the FUSE channel refuses the same, `owner_turn.rs` `fallocate -p`). Do: over a real sparse file,
+/// send OP_ALLOCATE and OP_DEALLOCATE (each a stateid, an offset and a length) in a 4.2 compound. Expect: each
+/// is refused `NOTSUPP`, and the file's hole/data map is unchanged — nothing was allocated or punched.
+#[test]
+fn allocate_and_deallocate_are_refused_notsupp_over_nfs() {
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let mut bridge = VolumeBridge::new(VOLUME, &mut vol, &mut store);
+  sparse_file(&mut bridge, "sparse");
+  let mut service = export(&mut bridge, 0);
+  let mut server = Server::standalone();
+  let mut client = Client::connect(&mut service, &mut server, b"host-a");
+  client.minor = 2;
+
+  for op_code in [op::ALLOCATE, op::DEALLOCATE] {
+    let (status, _) = at_root_file(&mut client, &mut service, &mut server, "sparse", |args| {
+      args.u32(op_code);
+      Stateid::default().encode(args);
+      args.u64(0);
+      args.u64(4);
+    });
+    assert_eq!(
+      status,
+      Nfsstat4::Notsupp.wire(),
+      "op {op_code} (allocate family) must be NFS4ERR_NOTSUPP over NFS, not served"
+    );
+  }
+
+  // Non-vacuity: the file's map is untouched — SEEK still finds its data at 0 and the hole after it.
+  let (status, data) = seek(&mut client, &mut service, &mut server, 0, CONTENT_DATA);
+  assert_eq!(status, Nfsstat4::Ok.wire());
+  assert_eq!(data, Some((false, 0)), "the sparse file's data at 0 survived the refused allocate/deallocate");
+}
+
 /// A-35 (RFC 7862 §15.10): READ_PLUS of the whole sparse file returns its contents in order — the first
 /// write's data, then the hole reported whole, then the second write's data — contiguous, with
 /// `rpr_eof` set only once the contents reach the end.
