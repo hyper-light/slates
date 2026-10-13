@@ -9,8 +9,10 @@ use slates_bridge_nfs::nfs::Nfsfh3;
 use slates_bridge_nfs::v4::Nfsstat4;
 use slates_bridge_nfs::v4::delegation::{Conflict, DelegationRecord};
 use slates_bridge_nfs::v4::files::{
-  FileChange, FileState, IoAuthority, IoWant, Share, owner_tag, share,
+  FileChange, FileState, IoAuthority, IoWant, LockRefused, LockRequest, Locker, Share, owner_tag,
+  share,
 };
+use slates_bridge_nfs::v4::lock::{LockKind, Range};
 use slates_db::catalog::VolumeId;
 
 /// Shape: the opens and lock ranges the test owner holds.
@@ -96,6 +98,55 @@ fn opens_past_the_bound_are_refused_without_starving_the_owner() {
       },
     ),
     Err(Nfsstat4::ShareDenied)
+  );
+}
+
+/// Bounds, the lock table's sibling of the open table's (RFC 8881 §15.2): a client cannot hold unbounded
+/// lock state either. Past the derived `max_locks` the only exhaustion status LOCK allows is
+/// `NFS4ERR_DELAY` (not `NFS4ERR_NOSPC`), on both paths — growing a lock-owner's ranges past the bound
+/// (`LockTable::set_ranges`) and a brand-new lock-owner while the table is already at it
+/// (`LockTable::state_for`). A later unlock frees room, so the delay is honest back-pressure, not a dead
+/// end.
+#[test]
+fn locks_past_the_bound_are_delayed_not_admitted() {
+  let mut files = FileState::new(owner_tag(0, 1), 8, 3);
+  let fh = handle(10, 1);
+  let open = files.open(A, b"a".to_vec(), &fh, read_write()).unwrap();
+  let range = |start| LockRequest::Lock {
+    kind: LockKind::Write,
+    range: Range::of(start, 10).unwrap(),
+    locker: Locker::New {
+      open,
+      owner: b"lk".to_vec(),
+    },
+  };
+  // Three disjoint ranges under one lock-owner fill the table to its bound.
+  files.lock(range(0), &fh, A).unwrap();
+  files.lock(range(20), &fh, A).unwrap();
+  files.lock(range(40), &fh, A).unwrap();
+  assert_eq!(files.lock_state_count(), 1, "one lock-owner holds the three ranges");
+  // A fourth disjoint range would pass the bound: DELAY, not admitted.
+  assert_eq!(
+    files.lock(range(60), &fh, A).err(),
+    Some(LockRefused::Status(Nfsstat4::Delay))
+  );
+  // A brand-new lock-owner while the table is at its bound is delayed too, not admitted.
+  assert_eq!(
+    files
+      .lock(
+        LockRequest::Lock {
+          kind: LockKind::Write,
+          range: Range::of(100, 10).unwrap(),
+          locker: Locker::New {
+            open,
+            owner: b"other".to_vec(),
+          },
+        },
+        &fh,
+        A,
+      )
+      .err(),
+    Some(LockRefused::Status(Nfsstat4::Delay))
   );
 }
 
