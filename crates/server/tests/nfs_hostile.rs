@@ -18,8 +18,8 @@ use slates_server::{Daemon, DaemonConfig, SegmentSource};
 
 mod common;
 use common::nfs::{
-  NFS_PROGRAM, create, create_status, lookup_raw_status, lookup_status, mount, opaque, read,
-  read_status, status, write,
+  NFS_PROGRAM, create, create_status, lookup_raw_status, lookup_status, mkdir_status, mount,
+  opaque, read, read_status, status, symlink_status, write,
 };
 
 /// Shape: honest clients, each on its own connection and file.
@@ -734,6 +734,31 @@ fn a_crafted_name_cannot_split_truncate_or_create_a_control_entry() {
     0,
     "an over-length name is refused, not truncated"
   );
+
+  drop(s);
+  drop(daemon);
+}
+
+/// The rest of the create family (§4.6): MKDIR and SYMLINK of `.` and `..` are refused too — they reach the
+/// volume core's name check (`slates_vfs::names::check` in `create_leaf`) directly, with no UNCHECKED
+/// lookup-echo like CREATE had, so the dot-name fix needed to touch only CREATE. Driven against a live daemon
+/// over a real socket; non-vacuous, since a normal name still creates.
+#[test]
+fn mkdir_and_symlink_refuse_dot_names() {
+  let (daemon, instance) = single_shard_daemon("dotfamily");
+  provision(&instance, "df");
+  let port = daemon.nfs_port().expect("the daemon is serving NFS");
+  let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+  let root = mount(&mut s, &daemon.mount_capability("df").unwrap().unwrap(), 1);
+
+  assert_ne!(mkdir_status(&mut s, &root, b".", 2), 0, "MKDIR '.' is refused");
+  assert_ne!(mkdir_status(&mut s, &root, b"..", 3), 0, "MKDIR '..' is refused");
+  assert_ne!(symlink_status(&mut s, &root, b".", "t", 4), 0, "SYMLINK '.' is refused");
+  assert_ne!(symlink_status(&mut s, &root, b"..", "t", 5), 0, "SYMLINK '..' is refused");
+
+  // Non-vacuity: a normal name still creates through both.
+  assert_eq!(mkdir_status(&mut s, &root, b"realdir", 6), 0, "a normal MKDIR works");
+  assert_eq!(symlink_status(&mut s, &root, b"reallink", "target", 7), 0, "a normal SYMLINK works");
 
   drop(s);
   drop(daemon);

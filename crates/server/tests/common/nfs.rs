@@ -265,6 +265,42 @@ pub(crate) fn lookup_raw_status(
   status(&call(stream, NFS_PROGRAM, 3, &args, xid))
 }
 
+/// NFS MKDIR of raw `name` bytes in `dir_fh` with mode 0755 → the status (so a test can present `.`/`..`).
+pub(crate) fn mkdir_status(
+  stream: &mut (impl Read + Write),
+  dir_fh: &[u8],
+  name: &[u8],
+  xid: u32,
+) -> u32 {
+  let mut args = Vec::new();
+  opaque(dir_fh, &mut args);
+  opaque(name, &mut args);
+  args.extend_from_slice(&1u32.to_be_bytes()); // set_mode: yes
+  args.extend_from_slice(&0o755u32.to_be_bytes());
+  for _unset in 0..5 {
+    args.extend_from_slice(&0u32.to_be_bytes()); // uid, gid, size: no; atime, mtime: DONT_CHANGE
+  }
+  status(&call(stream, NFS_PROGRAM, 9, &args, xid))
+}
+
+/// NFS SYMLINK of raw `name` bytes in `dir_fh` to `target` → the status (so a test can present `.`/`..`).
+pub(crate) fn symlink_status(
+  stream: &mut (impl Read + Write),
+  dir_fh: &[u8],
+  name: &[u8],
+  target: &str,
+  xid: u32,
+) -> u32 {
+  let mut args = Vec::new();
+  opaque(dir_fh, &mut args);
+  opaque(name, &mut args);
+  for _unset in 0..6 {
+    args.extend_from_slice(&0u32.to_be_bytes()); // symlink_attributes (sattr3): all unset
+  }
+  opaque(target.as_bytes(), &mut args); // symlink_data (nfspath3)
+  status(&call(stream, NFS_PROGRAM, 10, &args, xid))
+}
+
 /// NFS MKDIR `name` in `dir_fh` with mode 0755 → the new directory's handle.
 pub(crate) fn mkdir(
   stream: &mut (impl Read + Write),
