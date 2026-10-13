@@ -275,6 +275,43 @@ fn a_landing_component_never_steps_out_of_the_target() {
   assert_eq!(names_in(&ws.path).len(), 2, "{:?}", names_in(&ws.path));
 }
 
+/// CVE-2026-17106 (moby/go-archive) and the CVE-2025-9566 (Podman) / CVE-2026-23954 (LXD) class: an
+/// archive or manifest carries a symlink entry, then a *later* entry is written *through* it, and because
+/// the extractor's check was lexical (the link target "looked local") while the OS resolved the link, the
+/// later write landed outside the destination. slates never does a lexical check: a landing resolves every
+/// manifest component with `O_DIRECTORY|O_NOFOLLOW` (`os.rs dir_flags`, base `open_dir`/`open_file`), so a
+/// component that is a symlink is refused at that seam rather than followed — whatever a green keyed as the
+/// parent of a later entry (a green is a flat map of path strings, so it *can* hold both `"through"` and
+/// `"through/evil"`). Proven on a real directory with a symlink aimed at the parent that holds the secret:
+/// the walk step (open as a directory) and the leaf step (open as a file) both refuse, so a sibling entry
+/// keyed through it can never be created outside, and the secret keeps its bytes (R1, §4.15 containment).
+#[test]
+fn a_landing_never_walks_a_manifest_path_through_a_symlink() {
+  let ram = build_output();
+  let ws = Workspace::new(&ram, "symthrough");
+  seed_dir(&ws.path.join("target"));
+  seed_file(&ws.path.join("SECRET"), b"outside the target");
+  // A symlink inside the target aimed at the parent that holds the secret, as a malicious manifest's
+  // symlink entry would leave it before a later entry tried to write `through/<name>`.
+  #[allow(clippy::disallowed_methods)]
+  std::os::unix::fs::symlink(&ws.path, ws.path.join("target/through")).unwrap();
+  let (mut host, target) = OsLand::open_target(&ws.path.join("target")).unwrap();
+  let root = target.dir;
+  // The walk step — descending into the symlink to create a child under it — is refused (NOFOLLOW).
+  assert!(
+    host.open_dir(root, "through").is_err(),
+    "a symlink is never descended as a directory"
+  );
+  // The leaf step — opening the symlink itself as a file — is refused too (never the outside target).
+  assert!(
+    host.open_file(root, "through").is_err(),
+    "a symlink is never opened as a file"
+  );
+  // The secret beside the target keeps its bytes and the parent gained no entry.
+  assert_eq!(read(&ws.path.join("SECRET")).unwrap(), b"outside the target");
+  assert_eq!(names_in(&ws.path).len(), 2, "{:?}", names_in(&ws.path));
+}
+
 /// AC-1.10 / R1: a scratch landing preserves the real target directory and writes its tree
 /// beneath that directory, without leaving a sibling outside the grant.
 #[test]
