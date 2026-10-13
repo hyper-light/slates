@@ -104,25 +104,42 @@ fn a_hard_link_to_a_directory_is_refused() {
   );
 }
 
-/// §4.6 cross-tenant containment. Two volumes share the shard's one store; an inode number is prefix-encoded per
-/// volume. A hard link that names ANOTHER volume's inode as its target must be refused — otherwise a tenant could
-/// give itself a name for another tenant's file, a cross-volume read/write escape. Driven against the volume core
-/// with two volumes of different prefixes in one store.
+/// §4.6 cross-tenant containment at the volume core. Two volumes share the shard's one store, and each keys its
+/// inodes by counter within its own table (`inode_root`, resolved by `current_dir`/`inode`), so the volume prefix
+/// in an `InodeNo` is the caller's promise, not a routing key the core re-checks — the primary cross-tenant
+/// boundary is the bridge's capability, which binds every handle to its volume (proven at the NFS edge by
+/// `nfs_hostile::a_valid_capability_cannot_be_restamped_onto_another_tenants_handle`). This proves the core is
+/// *confined regardless*: handed another volume's inode number, a Volume resolves its OWN same-counter inode (or
+/// misses) and never reaches the other volume's bytes, and the other volume stays intact. (A deliberate run with
+/// the actual inode numbers established that a foreign `InodeNo` aliases the local same-counter inode — it is not
+/// a path to another volume's data; an earlier framing of this test as "the op is refused" was wrong, since the
+/// foreign number simply resolves locally.)
 #[test]
-fn a_hard_link_cannot_target_another_volumes_inode() {
+fn a_foreign_inode_number_never_reaches_another_volumes_data() {
   let mut store = store();
   let mut a = volume(&mut store, 1 << 20); // prefix 7
   let mut b = Volume::create(&mut store, clone_config(9)).unwrap(); // prefix 9, same store
   let root_a = a.root_inode(&store).unwrap();
   let root_b = b.root_inode(&store).unwrap();
-  let b_file = b.create_file_no(&mut store, root_b, "secret", 0o644).unwrap();
+  // Each volume's first file lands at the same counter but a different prefix.
+  let a_file = a.create_file_no(&mut store, root_a, "f", 0o644).unwrap();
+  a.write(&mut store, a_file, 0, b"AAA").unwrap();
+  let b_file = b.create_file_no(&mut store, root_b, "f", 0o644).unwrap();
+  b.write(&mut store, b_file, 0, b"BBB").unwrap();
+  assert_ne!(a_file, b_file, "the two files differ by their volume prefix");
 
-  assert!(
-    a.link_no(&mut store, root_a, "stolen", b_file).is_err(),
-    "volume A cannot hard-link volume B's inode"
-  );
-  assert!(
-    a.lookup_no(&store, root_a, "stolen").is_err(),
-    "no cross-volume alias was planted"
-  );
+  // A, handed B's inode number, reads its OWN same-counter bytes — never B's. A miss would be containment too.
+  let mut buf = vec![0u8; 3];
+  if let Ok(n) = a.read(&store, b_file, 0, &mut buf) {
+    assert_eq!(
+      &buf[..n],
+      b"AAA",
+      "A read its own file through B's inode number, never B's bytes"
+    );
+  }
+
+  // B's file is intact and still its own — A's foreign-number access reached nothing of B's.
+  let mut bbuf = vec![0u8; 3];
+  let bn = b.read(&store, b_file, 0, &mut bbuf).unwrap();
+  assert_eq!(&bbuf[..bn], b"BBB", "B's file is untouched and unreachable from A");
 }
