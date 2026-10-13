@@ -1666,3 +1666,46 @@ fn dot_and_dotdot_resolve_and_never_climb_out_of_a_root_or_a_scope() {
     "the scope's `..` is the scope"
   );
 }
+
+/// Attack the scoped-readdir loop (8adc3738) with a crafted resume cookie: it must terminate and never emit an
+/// out-of-scope entry, whatever cookie a client resumes from (a forged one, or one landing in a dropped run).
+/// Do: in `/shared/d`, out-of-scope aliases plus one in-scope `z`; read with `cookie = u64::MAX`, and with a
+/// cookie taken mid-listing. Expect: the `u64::MAX` resume returns empty (past the end, no hang); no page ever
+/// contains an alias.
+#[test]
+fn a_scoped_readdir_with_a_crafted_cookie_terminates_and_leaks_no_alias() {
+  use slates_bridge_core::scoped::ScopedBridge;
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let mut inner = VolumeBridge::new(VolumeId { bytes: [0; 16] }, &mut vol, &mut store);
+  let cx = rw_cx();
+  let (shared, _, _) = shared_and_private(&mut inner, &cx);
+  let d = inner.mkdir(oid(shared), &cx, "d", 0o755).unwrap().ino;
+  let root = inner.root(&cx).unwrap();
+  let outside = inner.mkdir(oid(root), &cx, "out", 0o755).unwrap().ino;
+  for n in 0..12u32 {
+    let (g, gfh) = inner.create(oid(outside), &cx, &format!("g{n:02}"), 0o644, 0).unwrap();
+    inner.release(oid(g.ino), &cx, gfh).unwrap();
+    inner.link(oid(g.ino), oid(d), &cx, &format!("a{n:02}")).unwrap();
+  }
+  let (z, zfh) = inner.create(oid(d), &cx, "z", 0o644, 0).unwrap();
+  inner.release(oid(z.ino), &cx, zfh).unwrap();
+
+  let mut scoped = ScopedBridge::new(&mut inner, shared);
+  // A forged cookie past every entry: the loop must stop (empty), not spin.
+  let past = scoped.readdir(oid(d), &cx, 0, u64::MAX, 4).unwrap();
+  assert!(past.is_empty(), "a resume past the end returns nothing: {past:?}");
+  // Paging from 0 with a crafted small limit: terminates, never shows an alias.
+  let mut cookie = 0u64;
+  let mut pages = 0u32;
+  loop {
+    let page = scoped.readdir(oid(d), &cx, 0, cookie, 2).unwrap();
+    for e in &page {
+      assert!(!e.name.starts_with('a'), "an out-of-scope alias leaked: {:?}", e.name);
+    }
+    let Some(last) = page.last() else { break };
+    cookie = last.cookie;
+    pages += 1;
+    assert!(pages < 1000, "the scoped readdir loop did not terminate");
+  }
+}
