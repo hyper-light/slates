@@ -693,3 +693,28 @@ fn a_writable_map_in_a_clone_copies_up_and_spares_the_shared_origin() {
   clone.read(&store, cf, 0, &mut clone_bytes).unwrap();
   assert_eq!(&clone_bytes, b"BBB", "the clone sees its own copied-up write");
 }
+
+/// §4.6 (the raw hardware path bounds a colossal offset or length too, not only the daemon-mediated path): a guest's
+/// page table can present any offset or length, so `dax_read_raw`/`dax_write_raw` clamp to the mapped page span
+/// (saturating), making a colossal offset an empty access and a colossal length a span-bounded one — never an
+/// out-of-bounds read, an overflow, an unbounded allocation, or a panic.
+#[test]
+fn the_raw_hardware_path_bounds_a_colossal_offset_or_length() {
+  let mut store = store();
+  let mut volume = volume(&mut store, 1 << 20);
+  let f = file_of(&mut store, &mut volume, "f", 0x11, DAX_PAGE);
+  let m = volume.dax_map_write(&mut store, f).unwrap();
+  assert!(
+    store.dax_read_raw(&m, usize::MAX, 100).is_empty(),
+    "a colossal offset reads nothing, clamped to the span"
+  );
+  assert!(
+    store.dax_read_raw(&m, 0, usize::MAX).len() <= m.page_span(),
+    "a colossal length clamps to the mapped span, never an unbounded allocation"
+  );
+  store.dax_write_raw(&m, usize::MAX, &[0xEE; 100]);
+  assert!(
+    store.dax_read_raw(&m, 0, 4).iter().all(|&b| b == 0x11),
+    "the out-of-range write touched nothing"
+  );
+}
