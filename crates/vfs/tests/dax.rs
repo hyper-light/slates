@@ -638,3 +638,28 @@ fn a_truncate_while_mapped_revokes_the_window_so_the_freed_tail_is_inert() {
     "the file stays the truncated size; the stale write went nowhere"
   );
 }
+
+/// §4.6, AC-4.12 (teardown on write, the sibling of truncate): a read-only mapping held while the daemon writes the
+/// same inode — a concurrent NFS/FUSE WRITE, or a landing/snapshot copy-up — is revoked before the write changes the
+/// block, so the guest's stale window never serves a torn or pre-write view, nor a block the write may have moved
+/// and freed. Map a file read-only, write it through the daemon, then drive the hardware path via the STALE mapping:
+/// it is no longer live and its read is zeros, while the daemon path shows the new bytes.
+#[test]
+fn a_daemon_write_while_mapped_revokes_the_read_window() {
+  let mut store = store();
+  let mut volume = volume(&mut store, 1 << 20);
+  let f = file_of(&mut store, &mut volume, "f", 0x11, DAX_PAGE);
+  let m = volume.dax_map_read(&mut store, f).unwrap();
+  assert!(store.dax_is_live(&m), "the read mapping starts live");
+
+  volume.write(&mut store, f, 0, &[0x22; 64]).unwrap();
+  assert!(!store.dax_is_live(&m), "the daemon write revoked the held read mapping");
+
+  assert!(
+    store.dax_read_raw(&m, 0, 64).iter().all(|&b| b == 0),
+    "the stale read window is inert after the revoke"
+  );
+  let mut now = vec![0u8; 4];
+  volume.read(&store, f, 0, &mut now).unwrap();
+  assert_eq!(&now, &[0x22; 4], "the daemon path shows the written bytes");
+}
