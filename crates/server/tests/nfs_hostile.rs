@@ -18,9 +18,9 @@ use slates_server::{Daemon, DaemonConfig, SegmentSource};
 
 mod common;
 use common::nfs::{
-  NFS_PROGRAM, create, create_status, lookup_raw_status, lookup_status, mkdir_status, mount,
-  opaque, read, read_status, readdirplus_status, remove_status, rmdir_status, status,
-  symlink_status, write, write_at_status,
+  MOUNT_PROGRAM, NFS_PROGRAM, call_accept_status, create, create_status, lookup_raw_status,
+  lookup_status, mkdir_status, mount, opaque, read, read_status, readdirplus_status, remove_status,
+  rmdir_status, status, symlink_status, write, write_at_status,
 };
 
 /// Shape: honest clients, each on its own connection and file.
@@ -255,6 +255,40 @@ fn live_tasks(daemon: &Daemon) -> u64 {
     .iter()
     .map(|pulse| pulse.spawns.saturating_sub(pulse.completed))
     .sum()
+}
+
+/// §4.13 (no cross-tenant enumeration via the MOUNT protocol): the server answers only `MNT` and `UMNT`; `DUMP`
+/// (the current mount list) and `EXPORT` (the export list) are `PROC_UNAVAIL`, so one tenant cannot enumerate the
+/// server's mounts or other tenants' exports — it can only turn an export path it already holds (its capability)
+/// into a root handle. Here `DUMP` and `EXPORT` are refused `PROC_UNAVAIL` while `MNT` of a held export still
+/// returns a root handle (the protocol stays usable), and the daemon survives both.
+#[test]
+fn the_mount_protocol_refuses_dump_and_export_so_no_tenant_enumerates_the_rest() {
+  let (daemon, instance) = two_shard_daemon("mount-enum");
+  let name = provision_remote_volume(&instance);
+  let export = daemon.mount_capability(&name).unwrap().unwrap();
+  let port = daemon.nfs_port().unwrap();
+  let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+
+  /// RFC 5531 §9 accept_stat: the procedure is not available in this program/version.
+  const PROC_UNAVAIL: u32 = 3;
+  /// MOUNTPROC3_DUMP / MOUNTPROC3_EXPORT (RFC 1813 Appendix I) — list mounts / exports.
+  const MOUNTPROC3_DUMP: u32 = 2;
+  const MOUNTPROC3_EXPORT: u32 = 5;
+  assert_eq!(
+    call_accept_status(&mut stream, MOUNT_PROGRAM, MOUNTPROC3_DUMP, &[], 1),
+    PROC_UNAVAIL,
+    "MOUNT DUMP discloses no mount list"
+  );
+  assert_eq!(
+    call_accept_status(&mut stream, MOUNT_PROGRAM, MOUNTPROC3_EXPORT, &[], 2),
+    PROC_UNAVAIL,
+    "MOUNT EXPORT discloses no export list"
+  );
+  assert!(
+    !mount(&mut stream, &export, 3).is_empty(),
+    "MNT of a held export still returns a root handle — only enumeration is refused"
+  );
 }
 
 /// §4.6, §4.13 (2026-10-04): do run honest clients and breakers against one mounted volume under a spinner per

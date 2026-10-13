@@ -81,6 +81,36 @@ pub(crate) fn call_version(
   reply[accept_off + 4..].to_vec()
 }
 
+/// One ONC RPC call of `program`/`procedure` at version 3 (AUTH_NONE), returning the RPC *accept status*
+/// (RFC 5531 §9) rather than asserting it was `SUCCESS` — for probing a procedure the server may not serve (e.g. a
+/// MOUNT `DUMP`/`EXPORT` that must be `PROC_UNAVAIL` so no tenant enumerates the others), where [`call_version`]
+/// would panic on the non-success reply.
+pub(crate) fn call_accept_status(
+  stream: &mut (impl Read + Write),
+  program: u32,
+  procedure: u32,
+  args: &[u8],
+  xid: u32,
+) -> u32 {
+  let mut body = Vec::new();
+  for field in [xid, 0, 2, program, VERSION_3, procedure, 0, 0, 0, 0] {
+    body.extend_from_slice(&field.to_be_bytes());
+  }
+  body.extend_from_slice(args);
+  let marker = 0x8000_0000u32 | u32::try_from(body.len()).unwrap();
+  stream.write_all(&marker.to_be_bytes()).unwrap();
+  stream.write_all(&body).unwrap();
+
+  let mut marker_buf = [0u8; 4];
+  stream.read_exact(&mut marker_buf).unwrap();
+  let len = (u32::from_be_bytes(marker_buf) & 0x7fff_ffff) as usize;
+  let mut reply = vec![0u8; len];
+  stream.read_exact(&mut reply).unwrap();
+  let verf_len = u32::from_be_bytes(reply[16..20].try_into().unwrap()) as usize;
+  let accept_off = 20 + verf_len + (4 - verf_len % 4) % 4;
+  u32::from_be_bytes(reply[accept_off..accept_off + 4].try_into().unwrap())
+}
+
 pub(crate) fn status(results: &[u8]) -> u32 {
   u32::from_be_bytes(results[0..4].try_into().unwrap())
 }
