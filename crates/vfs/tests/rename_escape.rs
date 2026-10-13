@@ -143,3 +143,38 @@ fn a_foreign_inode_number_never_reaches_another_volumes_data() {
   let bn = b.read(&store, b_file, 0, &mut bbuf).unwrap();
   assert_eq!(&bbuf[..bn], b"BBB", "B's file is untouched and unreachable from A");
 }
+
+/// §4.2 cross-tenant resource isolation (CLAUDE.md #8, no unbounded growth). Two bounded volumes share the shard;
+/// one tenant writing until its own quota refuses must not starve another tenant — a bounded volume's quota caps
+/// it, so A's exhaustion is A's alone. A writes until `NoSpace`; B, within its own quota, still writes.
+#[test]
+fn one_volumes_exhaustion_does_not_starve_another() {
+  let mut store = store();
+  let mut a = volume(&mut store, 1 << 20); // A: 1 MiB quota
+  let mut b = volume(&mut store, 1 << 20); // B: its own 1 MiB quota
+  let root_a = a.root_inode(&store).unwrap();
+  let root_b = b.root_inode(&store).unwrap();
+
+  // A writes a growing file until it is refused — it can only ever exhaust its OWN quota.
+  let fa = a.create_file_no(&mut store, root_a, "big", 0o644).unwrap();
+  let chunk = vec![0u8; 64 << 10];
+  let mut off = 0u64;
+  let mut a_refused = false;
+  for _ in 0..64 {
+    match a.write(&mut store, fa, off, &chunk) {
+      Ok(_) => off = off.saturating_add(chunk.len() as u64),
+      Err(_) => {
+        a_refused = true;
+        break;
+      }
+    }
+  }
+  assert!(a_refused, "A hits its own quota (bounded growth)");
+
+  // B, with its own reservation, is unaffected — A's exhaustion did not consume B's bytes.
+  let fb = b.create_file_no(&mut store, root_b, "f", 0o644).unwrap();
+  assert!(
+    b.write(&mut store, fb, 0, b"B still works").is_ok(),
+    "A exhausting its quota did not starve B"
+  );
+}
