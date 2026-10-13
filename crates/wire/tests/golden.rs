@@ -107,6 +107,39 @@ fn the_sample_encoding_is_frozen_and_round_trips() {
   assert_eq!(Sample::from_bytes(&bytes).unwrap(), sample());
 }
 
+/// A Wire message is decoded without a panic from any single-byte mutation or truncation of a valid one (§4.9
+/// hostile input — the codec is the agent↔daemon IPC wire and the durable db encoding). The codec is
+/// length-delimited and bounds-checked (`take_len` refuses a length past the bytes before allocating), so a torn or
+/// bit-flipped message is a typed error or a valid parse — never a panic, an out-of-bounds read, or an unbounded
+/// allocation. The valid message round-trips, and trailing bytes past a complete one are refused.
+#[test]
+fn a_mutated_or_truncated_wire_message_never_panics() {
+  let good = sample().to_bytes();
+  assert_eq!(Sample::from_bytes(&good).unwrap(), sample(), "the valid message round-trips");
+
+  // Every truncation decodes to a typed result, never a panic.
+  for n in 0..=good.len() {
+    if let Some(prefix) = good.get(..n) {
+      let _ = Sample::from_bytes(prefix);
+    }
+  }
+  // Every single-byte flip decodes to a typed result, never a panic or a wild read/allocation.
+  for i in 0..good.len() {
+    let mut mutated = good.clone();
+    if let Some(byte) = mutated.get_mut(i) {
+      *byte ^= 0xFF;
+    }
+    let _ = Sample::from_bytes(&mutated);
+  }
+  // Trailing bytes past a complete message are refused.
+  let mut trailing = good.clone();
+  trailing.push(0);
+  assert!(
+    Sample::from_bytes(&trailing).is_err(),
+    "trailing bytes past a complete message are refused"
+  );
+}
+
 #[test]
 fn every_reflection_is_append_only_against_its_record() {
   let current = [
