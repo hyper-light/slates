@@ -2,11 +2,23 @@
 
 - **Date:** 2026-10-13
 - **Area:** `crates/bridge-core/src/volume_bridge.rs` (`VolumeBridge::invalidations`), §4.16, §4.6
-- **Severity:** low — a snapshot/green-volume reader already holds whole-volume read authority *as of its
-  version*, so the disclosure is only of objects created **after** its snapshot (post-snapshot file names and
-  inode numbers) plus the activity timing. It is also a correctness waste: the frozen view is told to drop
-  caches that are still valid for its version. Found while hardening after the cross-scope invalidation leak
-  (same class, the view axis instead of the scope axis).
+- **Severity:** **DEFENSIVE hardening, not a reachable leak (corrected 2026-10-13).** See the reachability
+  correction below: no current mount serves a `View::Version` attachment through this bridge, so this path is not
+  reached in practice. The fix is a correct guard should such an attachment ever be served here, but the original
+  "a pinned reader gets post-snapshot names" framing overstated it — I asserted reachability from the code and a
+  synthetic `View::Version` context without confirming the real attach path.
+
+## Reachability correction (2026-10-13)
+
+Every real attach in the server passes `View::Current` (`server/src/fuse.rs`, `fs_verbs.rs`, `nfs.rs`), and a
+snapshot or green **view is served as a clone pinned at that version** (`snapshot_view::open` /
+`verbs::clone_green` call `Volume::clone_of`), i.e. `View::Current` over the clone — its own journal is the
+clone's, which is correct to deliver. `View::Version` exists in the authority model (and `authorize_write`
+refuses it), but nothing wires it onto an attachment served through `VolumeBridge`, and invalidations are
+FUSE-only over the attachment's context. So `cx.view == Version` does not reach `VolumeBridge::invalidations`
+today. The fix below is kept as a correct guard (defence in depth), **not** a reachable-leak fix. The sibling
+scope-axis leak (`ScopedBridge::invalidations`) *is* reachable — scoped exports are served through `ScopedBridge`
+over FUSE/virtio-fs, which use the invalidation stream.
 
 ## Description
 
