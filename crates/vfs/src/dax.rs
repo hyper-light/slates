@@ -32,6 +32,19 @@ pub struct Mapping {
   pub writable: bool,
 }
 
+impl Mapping {
+  /// The window bytes this mapping occupies — whole pages (`file_len` rounded up to [`DAX_PAGE`]). A guest's page
+  /// table covers exactly these pages and no more; a read or write past them is out of the mapping.
+  #[must_use]
+  pub fn page_span(&self) -> usize {
+    self
+      .file_len
+      .div_ceil(DAX_PAGE)
+      .max(1)
+      .saturating_mul(DAX_PAGE)
+  }
+}
+
 /// A file's content block and its authorized length (`attrs.size`). The experiment maps single-block unsealed
 /// files (`Body::Open`), the shape a freshly written file takes.
 fn file_block(store: &Store, volume: &Volume, no: InodeNo) -> Result<(Block, usize), VfsError> {
@@ -115,6 +128,13 @@ impl DaxMapper {
     if !self.mappings.contains(mapping) || !self.still_current(store, volume, mapping) {
       return Err(VfsError::Invalid);
     }
+    // Bound the read to the mapped page span — the pages the guest's table actually covers. A guest-chosen length
+    // is otherwise an arbitrary allocation (`vec![0u8; len]`): a colossal one makes the daemon try to allocate
+    // exabytes and abort (CLAUDE.md #8, no unbounded growth). Refuse before allocating a single byte.
+    let end = off.checked_add(len).ok_or(VfsError::NoSpace)?;
+    if end > mapping.page_span() {
+      return Err(VfsError::Invalid);
+    }
     let block = store
       .content
       .arena()
@@ -127,6 +147,54 @@ impl DaxMapper {
       }
     }
     Ok(out)
+  }
+
+  /// What the guest's page table exposes **directly** — the raw mapped block bytes, with **no daemon check**. Real
+  /// DAX is exactly this: the guest reads the mapped physical page in hardware, never calling the daemon, so the
+  /// daemon's per-access revalidation ([`Self::still_current`]) never runs on the guest's reads. This models that
+  /// hardware path, bounded only to the page the table covers. It is why a freed-and-reused block under a live
+  /// mapping is a true escape, and why the only defenses are **pinning** (never free or reuse a mapped block) and
+  /// **revocation** (tear the page table down before any free), not revalidation.
+  #[must_use]
+  pub fn guest_read_raw(
+    &self,
+    store: &Store,
+    mapping: &Mapping,
+    off: usize,
+    len: usize,
+  ) -> Vec<u8> {
+    let span = mapping.page_span();
+    let want = len.min(span.saturating_sub(off.min(span)));
+    let block = store
+      .content
+      .arena()
+      .bytes(mapping.block)
+      .unwrap_or_default();
+    let mut out = vec![0u8; want];
+    for (i, slot) in out.iter_mut().enumerate() {
+      if let Some(&b) = block.get(off.saturating_add(i)) {
+        *slot = b;
+      }
+    }
+    out
+  }
+
+  /// The guest's page table writing **directly** — raw into the mapped block, no daemon check, as hardware does.
+  /// Like [`Self::guest_read_raw`] this is the real DAX path, and it bypasses every daemon-side guard (the
+  /// `file_len` bound, copy-up, `still_current`). It writes only within the mapped page span — the page table's
+  /// extent — but nothing within that page stops it, which is why those guards are fiction for a real guest.
+  pub fn guest_write_raw(&self, store: &mut Store, mapping: &Mapping, off: usize, bytes: &[u8]) {
+    let span = mapping.page_span();
+    if let Some(block) = store.content.arena_mut().bytes_mut(mapping.block) {
+      let end = off.saturating_add(bytes.len()).min(span).min(block.len());
+      if off < end
+        && let Some((dst, src)) = block
+          .get_mut(off..end)
+          .zip(bytes.get(..end.saturating_sub(off)))
+      {
+        dst.copy_from_slice(src);
+      }
+    }
   }
 
   /// Maps inode `no`'s content block **writable**, **copying it up first** so the block the guest writes is this
@@ -196,6 +264,68 @@ impl DaxMapper {
       .get_mut(off..end)
       .ok_or(VfsError::NoSpace)?
       .copy_from_slice(bytes);
+    Ok(())
+  }
+
+  /// Revokes a mapping — the teardown before the content it covers is landed, taken over, or freed. After it the
+  /// guest's held mapping is dead: every access is a typed miss (it is no longer in the table). Returns whether it
+  /// was mapped.
+  pub fn revoke(&mut self, mapping: &Mapping) -> bool {
+    let before = self.mappings.len();
+    self.mappings.retain(|m| m != mapping);
+    self.mappings.len() != before
+  }
+
+  /// The blocks this mapper holds mapped **writable** — the blocks a snapshot or clone must copy up rather than
+  /// share, so the guest's in-place writes can never reach the frozen version ([`Self::guest_write`] alone cannot
+  /// stop a snapshot taken *after* setup from re-sharing a copied-up block).
+  #[must_use]
+  pub fn writable_blocks(&self) -> Vec<Block> {
+    self
+      .mappings
+      .iter()
+      .filter(|m| m.writable)
+      .map(|m| m.block)
+      .collect()
+  }
+
+  /// Re-asserts that every writable mapping names a block this version alone holds — the copy-up a snapshot or
+  /// clone taken *after* the mapping must trigger, since it re-shares the block an earlier copy-up made private.
+  /// The snapshot path runs this: each writable mapping's file is copied up onto a new private block and the
+  /// mapping re-pointed there, so the frozen version keeps the block it shared and the guest writes the new one. A
+  /// guest holding the pre-reassert mapping finds it a typed miss (the block moved — [`Self::still_current`]).
+  pub fn reassert_private(
+    &mut self,
+    store: &mut Store,
+    volume: &mut Volume,
+  ) -> Result<(), VfsError> {
+    let targets: Vec<(InodeNo, usize)> = self
+      .mappings
+      .iter()
+      .filter(|m| m.writable)
+      .map(|m| (m.inode, m.file_len))
+      .collect();
+    for (no, file_len) in targets {
+      let mut current = vec![0u8; file_len];
+      volume.read(&*store, no, 0, &mut current)?;
+      volume.write(store, no, 0, &current)?;
+      let (block, _) = file_block(&*store, volume, no)?;
+      if let Some(tail) = store
+        .content
+        .arena_mut()
+        .bytes_mut(block)
+        .and_then(|bytes| bytes.get_mut(file_len..))
+      {
+        tail.fill(0);
+      }
+      for mapping in self
+        .mappings
+        .iter_mut()
+        .filter(|m| m.inode == no && m.writable)
+      {
+        mapping.block = block;
+      }
+    }
     Ok(())
   }
 }
