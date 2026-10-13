@@ -1050,6 +1050,78 @@ fn a_rename_over_the_export_moves_the_entry() {
   );
 }
 
+/// "Test at extremes": a SETATTR that sets the size to `u64::MAX` (truncate-to-colossal via the metadata path —
+/// a different route than a WRITE at a huge offset) is a sparse hole that charges the quota **nothing**, never
+/// overflows the page arithmetic, and never wedges the daemon. Proven on a `Bounded { 1 GiB }` volume: the
+/// colossal SETATTR is accepted (it would be `BudgetExceeded` had the hole been charged), the size reads back as
+/// the colossal value, and — the point — a real write to a *second* file still succeeds, so the hole exhausted no
+/// quota (a truncate that extends charges nothing, model.rs §4.5; §4.2, §4.6). NB `used` mirrors the logical size
+/// here, not the physical bytes — a reporting-fidelity nit for Ada, not a DoS, since the quota charge is the
+/// separate, physical one proven below.
+#[test]
+fn a_setattr_to_a_colossal_size_is_a_sparse_hole_that_charges_no_quota() {
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let mut bridge = VolumeBridge::new(VolumeId { bytes: [0x11; 16] }, &mut vol, &mut store);
+  let cx = write_cx();
+  let root_ino = bridge.root(&cx).unwrap();
+  let (f, _) = bridge.create(oid(root_ino), &cx, "f", 0o644, 0).unwrap();
+  let (g, _) = bridge.create(oid(root_ino), &cx, "g", 0o644, 0).unwrap();
+  let fh_f = fh_of(f.ino);
+  let fh_g = fh_of(g.ino);
+  let mut export = Export::new(
+    &mut bridge,
+    VolumeId { bytes: [0x11; 16] },
+    Principal::Uid { uid: 0 },
+    Rights {
+      read: true,
+      write: true,
+    },
+  )
+  .unwrap();
+
+  // SETATTR f with only the size set, to the largest possible value.
+  let mut args = XdrWriter::new();
+  fh_f.encode(&mut args);
+  args.bool(false); // mode unset
+  args.bool(false); // uid unset
+  args.bool(false); // gid unset
+  args.bool(true); // size set...
+  args.u64(u64::MAX); // ...to the largest possible
+  args.u32(0); // atime DONT_CHANGE
+  args.u32(0); // mtime DONT_CHANGE
+  args.bool(false); // guard unset
+  let reply = export
+    .serve_nfs(NFSPROC3_SETATTR, &mut XdrReader::new(args.as_slice()))
+    .unwrap();
+  assert_eq!(
+    status_of(&reply),
+    Nfsstat3::Ok.wire(),
+    "the colossal size is accepted as a sparse hole, not refused BudgetExceeded for a charged u64::MAX"
+  );
+  assert_eq!(
+    getattr_of(&mut export, &fh_f).size,
+    u64::MAX,
+    "the size reads back as the colossal value"
+  );
+
+  // The point: the sparse hole charged no quota, so a real write to a second file still succeeds.
+  let mut wargs = XdrWriter::new();
+  fh_g.encode(&mut wargs);
+  wargs.u64(0);
+  wargs.u32(6);
+  wargs.u32(2);
+  wargs.opaque(b"slates");
+  let wreply = export
+    .serve_nfs(NFSPROC3_WRITE, &mut XdrReader::new(wargs.as_slice()))
+    .unwrap();
+  assert_eq!(
+    XdrReader::new(&wreply).u32().unwrap(),
+    Nfsstat3::Ok.wire(),
+    "a real write still succeeds — the colossal sparse size exhausted no quota"
+  );
+}
+
 /// SETATTR over the export changes the mode (a chmod), and a following GETATTR shows it stuck; the
 /// reply's wcc carries the new attributes.
 #[test]
