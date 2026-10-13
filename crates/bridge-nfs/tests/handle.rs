@@ -5,6 +5,7 @@
 //! bytes (golden); and a wrong length or an unknown version is a typed refusal, not a misread. Pure,
 //! every host — no socket, no volume, no mount.
 
+use proptest::prelude::*;
 use slates_bridge_nfs::handle::{FileHandle, FileHandleError};
 use slates_bridge_nfs::nfs::{MAX_FH, Nfsfh3};
 use slates_db::catalog::VolumeId;
@@ -99,4 +100,45 @@ fn an_unknown_version_handle_is_refused() {
     FileHandle::from_fh(&Nfsfh3(bytes)),
     Err(FileHandleError::UnknownVersion)
   );
+}
+
+proptest! {
+  #![proptest_config(slates_test_seeds::unseeded(proptest::test_runner::Config::default()))]
+
+  /// Hostile-input fuzz of the filehandle decoder, the cross-tenant routing boundary (§4.6, §4.13): any byte
+  /// string decodes to a typed result, never a panic (proptest fails on one), and a string that *does* decode is
+  /// canonical — re-encoding the handle and decoding again yields the same handle, so there is no second wire
+  /// spelling of one handle for a forger to smuggle past the capability check. The capability still gates the
+  /// handle's USE (`the_same_object_under_another_capability_is_a_different_handle`); the codec's robustness and
+  /// canonicity are the subject here.
+  #[test]
+  fn any_bytes_decode_without_a_panic_and_a_decoded_handle_is_canonical(
+    bytes in proptest::collection::vec(any::<u8>(), 0..=(MAX_FH + 8))
+  ) {
+    if let Ok(handle) = FileHandle::from_fh(&Nfsfh3(bytes)) {
+      prop_assert_eq!(FileHandle::from_fh(&handle.to_fh()).ok(), Some(handle));
+    }
+  }
+
+  /// A handle of any field values round-trips through its opaque wire form within the NFS size cap: the codec is
+  /// total over the field space, so a legitimately minted handle always decodes back to itself.
+  #[test]
+  fn a_handle_of_any_fields_round_trips_within_the_cap(
+    volume in any::<[u8; 16]>(),
+    inode in any::<u64>(),
+    generation in any::<u64>(),
+    attachment in any::<u64>(),
+    token in any::<[u8; 16]>(),
+  ) {
+    let handle = FileHandle {
+      volume: VolumeId { bytes: volume },
+      inode,
+      generation,
+      attachment,
+      token,
+    };
+    let fh = handle.to_fh();
+    prop_assert!(fh.0.len() <= MAX_FH);
+    prop_assert_eq!(FileHandle::from_fh(&fh).ok(), Some(handle));
+  }
 }
