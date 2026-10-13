@@ -952,6 +952,57 @@ fn a_handle_with_a_valid_attachment_but_a_wrong_mount_token_is_refused() {
   drop(daemon);
 }
 
+/// §4.13 / AUD-01 cross-tenant isolation (CWE-863, incorrect authorization), over a raw socket: a VALID mount
+/// capability for one volume cannot be crafted onto another volume's handle to read it. A file handle is
+/// `[version][volume][inode][generation][attachment][token]` (`crates/bridge-nfs/src/handle.rs`); its last 24
+/// bytes are the capability (an 8-byte attachment id and a 16-byte token). A tenant holding a valid capability for
+/// volume A, who splices it onto volume B's handle (B's volume+inode, A's capability), is refused: `authorized_rights`
+/// looks A's attachment up, finds its volume is A, and `A != B` refuses it ("not a capability for another volume").
+/// This is the confused-deputy sibling of the wrong-token test — here the token is a real, valid capability, just
+/// for the wrong volume. Two volumes on ONE shard, so A's attachment record is found on B's shard and the
+/// volume-mismatch branch fires (not a bare not-found). Do: read B's own file through B's handle (non-vacuity),
+/// then present B's handle with A's capability spliced over its last 24 bytes. Expect: refused.
+#[test]
+fn a_valid_capability_for_one_volume_cannot_read_another_cwe_863() {
+  let (daemon, instance) = single_shard_daemon("crosstenant");
+  provision(&instance, "va");
+  provision(&instance, "vb");
+  let port = daemon.nfs_port().expect("the daemon is serving NFS");
+  let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+
+  // Mount A (the attacker's own volume) and B (the victim). The test holds B's capability only to obtain B's
+  // handle shape and witness a legitimate read; the attack itself uses A's capability, never B's.
+  let root_a = mount(&mut s, &daemon.mount_capability("va").unwrap().unwrap(), 1);
+  let root_b = mount(&mut s, &daemon.mount_capability("vb").unwrap().unwrap(), 2);
+  let file_a = create(&mut s, &root_a, "a.txt", 3);
+  let file_b = create(&mut s, &root_b, "secret_b.txt", 4);
+  write(&mut s, &file_b, b"volume B's private bytes", 5);
+
+  // Non-vacuity: B's own handle (carrying B's real capability) reads B's file.
+  assert_eq!(read_status(&mut s, &file_b, 6), 0, "B's own handle reads B's file");
+
+  // The craft: B's volume+inode handle with A's capability spliced over its last 24 bytes (attachment id +
+  // token). The volume field ahead of them stays B, so it routes to B; the capability presented is A's valid one.
+  let a_cap: Vec<u8> = file_a
+    .iter()
+    .skip(file_a.len().saturating_sub(24))
+    .copied()
+    .collect();
+  let mut crafted = file_b.clone();
+  let cap_at = crafted.len().saturating_sub(24);
+  for (dst, src) in crafted.iter_mut().skip(cap_at).zip(a_cap.iter()) {
+    *dst = *src;
+  }
+  assert_ne!(
+    read_status(&mut s, &crafted, 7),
+    0,
+    "A's valid capability on B's handle is refused — a capability authorizes only its own volume, never another"
+  );
+
+  drop(s);
+  drop(daemon);
+}
+
 /// The remove family (§4.6): RMDIR already guards `.`/`..`, but the guard sits inside `if is_dir`, so REMOVE
 /// (unlink) of `.`/`..` takes the unguarded path — `bridge.lookup(".")` resolves the directory, then
 /// `bridge.unlink(parent, ".")` runs. This test drives REMOVE of `.`/`..` over a live socket and requires it to
