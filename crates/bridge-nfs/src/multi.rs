@@ -912,6 +912,8 @@ fn write_absent_wcc(writer: &mut XdrWriter) {
 #[cfg(test)]
 mod tests {
   #![allow(clippy::unwrap_used)]
+  use proptest::prelude::*;
+
   use super::parse_capability;
 
   /// The client-supplied mount capability `<attachment_hex>.<token_hex>` (§4.13, AUD-01). A malformed capability
@@ -937,5 +939,29 @@ mod tests {
     let (attachment, token) = parse_capability("1a.000102030405060708090a0b0c0d0e0f").unwrap();
     assert_eq!(attachment, 0x1a);
     assert_eq!(token, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]);
+  }
+
+  proptest! {
+    #![proptest_config(slates_test_seeds::unseeded(proptest::test_runner::Config::default()))]
+
+    /// Hostile-input fuzz of the mount-capability parser (the cross-tenant auth token in the mount path,
+    /// AUD-01): any string parses to `None` or a valid `(attachment, token)`, never a panic (proptest fails on
+    /// one), and a string that parses round-trips — formatting the pair and re-parsing yields it, so a token has
+    /// exactly one spelling a forger cannot vary.
+    #[test]
+    fn any_string_parses_to_an_option_never_a_panic(text in ".*") {
+      if let Some((attachment, token)) = parse_capability(&text) {
+        let hex: String = token.iter().map(|b| format!("{b:02x}")).collect();
+        prop_assert_eq!(parse_capability(&format!("{attachment:x}.{hex}")), Some((attachment, token)));
+      }
+    }
+
+    /// A well-formed capability of any attachment and token round-trips: formatting the pair and parsing it
+    /// yields the pair (the parser is total over the field space, the inverse of the mount path's formatting).
+    #[test]
+    fn a_well_formed_capability_round_trips(attachment in any::<u64>(), token in any::<[u8; 16]>()) {
+      let hex: String = token.iter().map(|b| format!("{b:02x}")).collect();
+      prop_assert_eq!(parse_capability(&format!("{attachment:x}.{hex}")), Some((attachment, token)));
+    }
   }
 }
