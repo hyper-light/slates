@@ -2652,6 +2652,27 @@ content goes through the VFS write boundary so witness, journal, quota and lease
 The baseline contract does not require DAX; a requested DAX capability cannot be advertised
 until mapping isolation, pinning and teardown have been established for that VMM.
 
+> **Status (DAX gate, 2026-10-12).** Mapping isolation, pinning and teardown are **built in the VFS** and proven by
+> use (`crates/vfs/src/dax.rs`, `crates/vfs/tests/dax.rs`, 21 tests; `crates/mem/src/arena.rs` pin set, 6 tests,
+> Miri-clean; recovery oracle 39/0). **Pinning:** a mapped block is pinned in the arena
+> (`ChunkArena::pin`/`unpin`) — a `free` of it is deferred (bytes kept, unscrubbed) and it is never handed to another
+> allocation or trimmed until the last unpin releases and scrubs it (A-99). This is the memory-level invariant a
+> hardware DAX guest cannot bypass: the block a mapping names is never reused, in this volume or any other on the
+> shard's shared arena, so a guest page can never fall onto another file's bytes. **Teardown:** a shard-local
+> `DaxRegistry` in `Store` records every live mapping; `write`/`truncate` revoke the inode's mappings (the single
+> write boundary), `snapshot` revokes writable mappings before sharing (read-only survive — the allowed
+> immutable-shared case), and `destroy` revokes the whole volume's (eventual reclamation). A revoked mapping's
+> hardware access is inert (the window is `munmap`'d; modeled by `Store::dax_read_raw`/`dax_write_raw`). **Rights:** a
+> writable mapping copies the file up first, so no writable mapping of immutable or snapshot-shared content. The eight
+> escapes an earlier experiment on this branch demonstrated — exfiltration, cross-file and cross-volume injection, a
+> concurrent pile, TOCTOU, a block-move lost update, a snapshot-share corruption, and a revoke-then-reuse — are closed.
+> **Still owed before DAX is advertised:** wire the gate to the virtio-fs device seam (map/revoke on admission and on
+> `advance`; `crates/server/src/virtiofs.rs`); and make the registry **un-fabricable and tamper-proof across the
+> fleet** — it is daemon-local RAM today and a mapping is minted here, never supplied by a caller, so no agent can
+> reach or forge it, but the fleet-integrity design (a daemon-minted mapping capability, VMM-enforced teardown, and
+> the version a mapping pins riding the fenced retention protocol) is recorded in `GAPS.md` and is the next step. DAX
+> stays unadvertised and a DAX request is refused `AttachmentUnsupported` until both are done.
+
 > **Status (virtio-fs, 2026-09-13).** The owned FUSE-over-virtio device exists
 > (`crates/bridge-virtiofs`) and the daemon serves it on the volume's owning shard
 > (`crates/server/src/virtiofs.rs`): the split virtqueue is walked sans-io over a bounded

@@ -6086,3 +6086,50 @@ Covering the conditions not re-touched by the landing rework, so the full 13-con
   10 KQPS/shard with "one or more network calls" an op, no published small-op p99). The runnable same-machine
   competitor, the Linux kernel's NFS server, slates beats on read latency. A live Tectonic A/B is not possible (closed
   source); the comparison is against published figures with the workload-class caveat stated.
+
+### 2026-10-12: the DAX mapping gate is built in the VFS (§4.6, A-9, AC-4.12)
+
+"Mapping isolation, pinning and teardown" — the invariants §4.6 requires before a VMM's DAX capability may be
+advertised — are **built and proven by use**. An earlier experiment on this branch (`writable-dax`) demonstrated, with
+eight red tests, that *no daemon-side check can make writable DAX safe* (a hardware DAX guest accesses the page through
+its own page table and never calls the daemon), so the defense had to be at the memory level. It now is:
+
+- **Pinning** (`crates/mem/src/arena.rs`): `ChunkArena::pin`/`unpin`/`is_pinned`, layered above the buddy (untouched).
+  A `free` of a pinned block is deferred (bytes kept, unscrubbed) and the block is never handed to another allocation
+  or trimmed, until the last unpin releases and scrubs it (A-99). 6 by-use tests, Miri-clean.
+- **Registry + teardown** (`crates/vfs/src/dax.rs`, a `DaxRegistry` in `Store`): `dax_map_read`/`dax_map_write` pin and
+  register a mapping; `dax_revoke`/`dax_revoke_inode`/`dax_revoke_writable_of_prefix`/`dax_revoke_volume`/
+  `dax_revoke_block` tear down. `write`/`truncate` revoke the inode's mappings (one write boundary); `snapshot` revokes
+  writable mappings before sharing (read-only survive — the allowed immutable-shared case); `destroy` revokes the whole
+  volume's. The hardware path (`dax_read_raw`/`dax_write_raw`) models the MMU — inert for a revoked mapping.
+- **Evidence:** `crates/vfs/tests/dax.rs` 21/0 (every former escape now closed: exfiltration, cross-file and
+  cross-volume injection, the concurrent pile, TOCTOU, block-move lost update, snapshot-share corruption,
+  revoke-then-reuse, past-length tail scrub, reclamation); recovery oracle 39/0; vfs + mem suites green; clippy clean.
+
+**Owed before DAX is advertised (the next steps):**
+
+1. **Wire the gate to the virtio-fs device seam** (`crates/server/src/virtiofs.rs`): the device maps through
+   `dax_map_*` on an authenticated admission and revokes through `dax_revoke_*` on detach and on `advance` (a version
+   move). Until then DAX stays unadvertised and a request is refused `AttachmentUnsupported`.
+
+2. **Make the registry un-fabricable and tamper-proof, including across the fleet.** No agent may interfere with,
+   fabricate or tamper with the registry. The design, given slates' distributed nature:
+   - *Agent isolation (already holds).* The registry is daemon-local RAM. Agents reach the daemon only over the ring/
+     wire (command verbs) or the guest virtqueue — never its address space (R1, R10). No verb supplies a `Mapping`;
+     `dax_map_*` **mint** it, and only after device admission authenticates the consumer and reads its rights from the
+     volume's access list (§4.6). An agent can request a map, never forge or edit an entry.
+   - *Unforgeable handle.* A guest must reference a mapping by a daemon-minted opaque capability (a generational id),
+     not a raw `Mapping`, so it can neither name a mapping it was not granted nor forge the block/length fields. (The
+     `Mapping` is daemon-internal today; the device wiring adds the id.)
+   - *Integrity at pin.* `ChunkArena::pin` already refuses an extent that is not a live allocation (`ForeignExtent`),
+     so even a daemon-internal slip cannot pin a forged or stale block.
+   - *VMM-enforced teardown.* Revocation is not "ask the guest": the daemon tells the VMM/hypervisor to remove the DAX
+     window from the guest's address space (the MMU then faults the guest). The VMM is the OS-shipped trusted broker
+     (R10); the guest cannot refuse. The in-process and inherited-fd forms are mmaps the daemon owns outright.
+   - *Fleet.* A DAX mapping is **host-local** — the guest is co-located with the owner shard that serves its content —
+     so the registry is per-owner and never replicated; a mapping cannot exist on a node that does not serve the
+     content, and there is no distributed registry to tamper with. Cross-host safety is a *version-lifetime*
+     obligation: a mapping pins a version, and that pin must ride the existing fenced retention protocol (D-26,
+     "Destroy/revoke releases credits only after … mappings"), so no other node's merge/`advance`/landing reclaims a
+     version a remote mapping pins. On takeover the dead owner's guests die with it, so the successor starts with no
+     mappings — nothing to inherit or forge.

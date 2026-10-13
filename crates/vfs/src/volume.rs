@@ -3235,6 +3235,10 @@ impl Volume {
       return Err(VfsError::Destroying);
     }
     self.state = VolumeState::Destroying;
+    // The volume is going away: tear down every DAX mapping of it (§4.6, AC-4.12 "eventual reclamation") so its
+    // mapped blocks are not held pinned — their deferred frees would otherwise outlive the volume. Empty when no
+    // guest maps it.
+    store.dax_revoke_volume(self.prefix());
     // The whole volume's retention returns to the shard budgets (§4.2): settled here, at destroy,
     // while `destroy_step` frees the objects in slices afterward; bounded by what this volume
     // charged, so a re-entered destroy credits zero. The bytes secured for open-unlinked orphans

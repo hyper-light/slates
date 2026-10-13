@@ -396,6 +396,24 @@ impl Store {
       .count()
   }
 
+  /// Revokes every mapping of the volume with `prefix` (§4.6: "eventual reclamation", AC-4.12): the teardown a
+  /// `destroy` runs so the volume's mapped blocks are not held pinned (their frees deferred) after it is gone. Unlike
+  /// [`Store::dax_revoke_writable_of_prefix`] this takes read-only mappings too — the whole volume is going away.
+  /// Returns how many were revoked.
+  pub fn dax_revoke_volume(&mut self, prefix: u16) -> usize {
+    let victims: Vec<Mapping> = self
+      .dax
+      .mappings
+      .iter()
+      .filter(|mapping| mapping.inode.prefix() == prefix)
+      .copied()
+      .collect();
+    victims
+      .iter()
+      .filter(|mapping| self.dax_revoke(mapping))
+      .count()
+  }
+
   /// Revokes every mapping of a specific block (§4.6): the teardown a landing or takeover runs before it reclaims or
   /// moves content that block holds. Returns how many were revoked.
   pub fn dax_revoke_block(&mut self, block: Block) -> usize {

@@ -526,3 +526,22 @@ fn revocation_empties_the_registry_and_counts() {
   assert_eq!(store.dax_mappings(), 0, "the registry is empty");
   assert_eq!(store.dax.revoked() - before, 8, "every revoke was counted");
 }
+
+/// §4.6, AC-4.12 ("eventual reclamation"). Do: map two files of a volume (one read, one write), then destroy the
+/// volume. Expect: every mapping is revoked, so no mapped block is left held pinned after the volume is gone.
+#[test]
+fn destroying_a_volume_revokes_all_its_mappings() {
+  let mut store = store();
+  let mut volume = volume(&mut store, 1 << 20);
+  let f = file_of(&mut store, &mut volume, "f", 0x11, DAX_PAGE);
+  let g = file_of(&mut store, &mut volume, "g", 0x22, DAX_PAGE);
+  let _mf = volume.dax_map_read(&mut store, f).unwrap();
+  let _mg = volume.dax_map_write(&mut store, g).unwrap();
+  assert_eq!(store.dax_mappings(), 2);
+  volume.destroy(&mut store).unwrap();
+  assert_eq!(
+    store.dax_mappings(),
+    0,
+    "destroy revoked every mapping of the volume"
+  );
+}
