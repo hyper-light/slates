@@ -400,6 +400,79 @@ fn a_landed_directory_keeps_its_mode_whatever_the_umask() {
   }
 }
 
+/// §4.13, §4.15 step 6, A-94, R10 — the privilege-escalation boundary of the one disk-write path. A setuid file
+/// whose *volume* owner is root (uid 0) lands as a file owned by the daemon's own euid, never root, so it is
+/// setuid to an unprivileged self — not a setuid-root binary. On a loopback mount AUTH_NONE maps the caller to
+/// root (§4.13), so an agent can create a uid-0, setuid file inside its own volume; the containment is that
+/// `land` creates every file with `openat(O_CREAT)` as its own euid and has no `fchown` (R10: no privilege is
+/// ever required or taken), so a recorded owner cannot reach the disk. A-94 keeps the setuid *bit* — root-fs
+/// images stay buildable through slates — inert here because the owner is the unprivileged daemon. Do: record a
+/// file owned by a uid that is not this process's euid (uid 0 when unprivileged, else a nonzero uid) with mode
+/// `04755`, land it, and read the disk file. Expect: owned by the process's euid, never the recorded uid; the
+/// setuid bit present. A regression against a future `fchown` added to `land` for "ownership fidelity", which
+/// would turn a recorded uid-0 setuid file into a setuid-root binary on disk.
+#[test]
+fn a_landed_setuid_file_is_owned_by_the_daemon_never_the_recorded_root() {
+  use std::os::unix::fs::MetadataExt;
+  let ram = build_output();
+  let ws = Workspace::new(&ram, "setuid");
+  seed_dir(&ws.path.join("out"));
+  let (mut host, target) = OsLand::open_target(&ws.path.join("out")).unwrap();
+  let mut store = store();
+  let mut vol = scratch(&mut store);
+
+  // A real binary an agent would plant: a shell script, owner-executable and world-readable, setuid.
+  write_file(&mut vol, &mut host, &mut store, "/exploit", b"#!/bin/sh\nid\n");
+  let no = {
+    let (dir, name) = common::split("/exploit");
+    let d = common::dir_of(&mut vol, &mut host, &mut store, dir);
+    vol.with_host(&mut host)
+      .lookup(&mut store, d, name)
+      .unwrap()
+      .inode
+  };
+  // Record an owner that is NOT this process's euid, so the assertion proves land used its own euid and ignored
+  // the recorded one. uid 0 (root) is the escalation case when the daemon is unprivileged; when the test itself
+  // runs as root (a container lane), a nonzero uid keeps the claim non-vacuous either way.
+  let euid = rustix::process::geteuid().as_raw();
+  let recorded_uid = if euid == 0 { 65_534 } else { 0 };
+  vol.chown(&mut store, no, recorded_uid, recorded_uid).unwrap();
+  vol.chmod(&mut store, no, 0o104_755).unwrap();
+
+  let mut session = Session::new();
+  let mut setup = Setup {
+    host: &mut host,
+    target: &target,
+    vol: &mut vol,
+    store: &mut store,
+    session: &mut session,
+  };
+  let report = setup.land(request(2)).unwrap();
+  assert_eq!(report.state, LandingState::Done, "{report:?}");
+
+  #[allow(clippy::disallowed_methods)] // the test's own landed file, read back
+  let meta = std::fs::metadata(ws.path.join("out").join("exploit")).unwrap();
+  // The escalation boundary: the disk file is owned by this process's euid, never the volume-recorded uid.
+  assert_eq!(
+    meta.uid(),
+    euid,
+    "land created the file as recorded uid {recorded_uid} rather than its own euid {euid}: a chown reached disk"
+  );
+  assert_ne!(
+    meta.uid(),
+    recorded_uid,
+    "the volume-recorded owner {recorded_uid} reached the disk — a setuid-to-that-uid binary"
+  );
+  // A-94: the setuid bit lands as recorded (root-fs images stay buildable); inert because the owner above is the
+  // unprivileged daemon, not root.
+  assert_eq!(
+    meta.mode() & 0o7777,
+    0o4755,
+    "the setuid file landed {:o}, not 04755 (A-94: the bit lands as recorded)",
+    meta.mode() & 0o7777
+  );
+}
+
 // ---------------------------------------------------------------- kill -9
 
 /// The bytes of file `f` in round `r`.
