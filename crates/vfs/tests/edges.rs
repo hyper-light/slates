@@ -478,3 +478,36 @@ fn a_symlink_target_past_the_path_ceiling_is_refused() {
     "a target exactly at the ceiling lands and reads back whole"
   );
 }
+
+/// A symlink target with an interior NUL byte is refused `InvalidName`, never stored (CWE-158; POSIX.1-2017
+/// §3.271 — a pathname is a NUL-terminated string, and `symlink(2)` returns `EINVAL`). Without this, the stored
+/// target diverges from what resolves: a FUSE readlink is NUL-terminated and truncates `"a\0b"` to `"a"` at the
+/// kernel, while an NFS (length-prefixed XDR) readlink returns the whole `"a\0b"`, and a host `symlink(2)` or the
+/// placed archive would refuse or truncate it — a volume must not hold a target it cannot carry consistently. Do:
+/// create a symlink whose target has an interior NUL, then (non-vacuity) a legitimate multi-component path target.
+/// Expect: the first refused `InvalidName` with nothing created; the second (containing `/`, no NUL) lands and
+/// reads back byte-for-byte, proving the check refuses only the NUL, not a path's separators.
+#[test]
+fn a_symlink_target_with_an_interior_nul_is_refused_but_a_path_is_kept() {
+  let mut store = store();
+  let mut vol = volume(&mut store, 1 << 20);
+  let root = vol.root_inode(&store).unwrap();
+
+  assert_eq!(
+    vol.symlink_no(&mut store, root, "nul", "a\0b"),
+    Err(VfsError::InvalidName),
+    "a symlink target with an interior NUL must be refused, not stored with a byte that truncates on readlink"
+  );
+  assert!(
+    vol.lookup_no(&store, root, "nul").is_err(),
+    "nothing was created for the refused NUL target"
+  );
+
+  let path = "../some/deep/relative/target";
+  let no = vol.symlink_no(&mut store, root, "rel", path).unwrap();
+  assert_eq!(
+    &*vol.readlink(&store, no).unwrap(),
+    path,
+    "a legitimate multi-component path target (slashes, no NUL) is unaffected and reads back whole"
+  );
+}

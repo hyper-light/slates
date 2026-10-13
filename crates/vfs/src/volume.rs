@@ -1639,6 +1639,14 @@ impl Volume {
     if target.len() > SYMLINK_TARGET_MAX_BYTES {
       return Err(VfsError::NameTooLong);
     }
+    // A path is a NUL-terminated string, so an interior NUL cannot appear in one (POSIX.1-2017 §3.271,
+    // and `symlink(2)` returns `EINVAL`). A name refuses NUL (`names::check`); a target must too, or the
+    // stored bytes diverge from what a NUL-terminated readlink (FUSE) resolves, from what a length-prefixed
+    // one (NFS XDR) returns, and from what a host `symlink(2)` or the placed archive can carry. A target is
+    // a path, not a component, so `/` is allowed — only the NUL is refused.
+    if target.bytes().any(|byte| byte == 0) {
+      return Err(VfsError::InvalidName);
+    }
     self.refuse_existing(store, dir, name)?;
     self.admit_namespace(true)?;
     let mut needs = Needs::default();
