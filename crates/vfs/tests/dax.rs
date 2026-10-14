@@ -22,7 +22,7 @@
   clippy::indexing_slicing
 )]
 
-use slates_vfs::dax::{DAX_PAGE, Mapping};
+use slates_vfs::dax::{DAX_PAGE, Mapping, stripe_target};
 use slates_vfs::ids::InodeNo;
 use slates_vfs::volume::{Store, Volume};
 
@@ -870,5 +870,116 @@ fn the_raw_hardware_path_bounds_a_colossal_offset_or_length() {
   assert!(
     store.dax_read_raw(&m, 0, 4).iter().all(|&b| b == 0x11),
     "the out-of-range write touched nothing"
+  );
+}
+
+// ───────────────────────────────────────────────────────────── L2 the moving target (stripe-shift migration)
+
+/// Whether every byte of `bytes` equals `v` — keeps the assert closures out of the test bodies (the complexity budget).
+fn all_bytes(bytes: &[u8], v: u8) -> bool {
+  bytes.iter().all(|&b| b == v)
+}
+
+/// §4.6 multi-tenancy **L2** (the moving target; the `dax_migrate` stripe-shift primitive the periodic Rowhammer
+/// defence composes from). Do: map a file writable, write a known marker the hardware way, migrate it. Expect: the
+/// content moves to a *physically different* block with every byte preserved; the inode follows, so the daemon path
+/// and a plain non-DAX read both reach the moved bytes; the new mapping is live, the old is inert; the counter moved.
+#[test]
+fn a_migration_moves_the_content_to_a_new_block_and_repoints_the_inode() {
+  let mut store = store();
+  let mut volume = volume(&mut store, 1 << 20);
+  let f = file_of(&mut store, &mut volume, "f", 0x41, DAX_PAGE);
+  let m = volume.dax_map_write(&mut store, f).unwrap();
+  store.dax_write_raw(&m, 0, &[0x55; 8]); // a known marker written through the guest's own page table
+
+  let m2 = volume.dax_migrate(&mut store, &m).unwrap();
+
+  assert_ne!(m2.block, m.block, "the content moved to a physically different block (the moving target)");
+  assert!(store.dax_is_live(&m2), "the new mapping is live");
+  assert!(!store.dax_is_live(&m), "the old mapping is inert (revoked-pending)");
+  assert_eq!(store.dax.migrated(), 1, "the migration counter moved (non-vacuity)");
+  // Every byte survived the shift: the marker and the file's body.
+  assert_eq!(store.dax_read_raw(&m2, 0, 8), vec![0x55; 8], "the written marker moved with the content");
+  assert!(all_bytes(&store.dax_read_raw(&m2, 8, 16), 0x41), "the rest of the file moved intact");
+  // The inode follows the move, so the daemon path and a plain non-DAX read reach the moved bytes, not a stale block.
+  assert_eq!(volume.dax_read(&store, &m2, 0, 8).unwrap(), vec![0x55; 8], "the daemon path sees the moved block");
+  let mut buf = [0u8; 8];
+  volume.read(&store, f, 0, &mut buf).unwrap();
+  assert_eq!(&buf, &[0x55; 8], "a non-DAX reader reaches the moved content");
+}
+
+/// §4.6 L2 (the stale-TLB hold). Do: migrate a writable mapping, then release the old mapping as the device would
+/// after confirming the window unmap. Expect: the old window is inert immediately, but the old block stays **pinned**
+/// (its free deferred, its bytes kept) across the migrate, and is unpinned — reusable by a neighbour — only after the
+/// release. This is why teardown holds the pin across the unmap: a neighbour can never take the block while the
+/// guest's possibly-stale page table still maps it.
+#[test]
+fn a_migration_holds_the_old_block_pinned_until_the_release() {
+  let mut store = store();
+  let mut volume = volume(&mut store, 1 << 20);
+  let f = file_of(&mut store, &mut volume, "f", 0x41, DAX_PAGE);
+  let m = volume.dax_map_write(&mut store, f).unwrap();
+  let old_block = m.block;
+
+  let _m2 = volume.dax_migrate(&mut store, &m).unwrap();
+
+  assert!(all_bytes(&store.dax_read_raw(&m, 0, 8), 0), "the old window is inert after the migrate");
+  assert!(store.content.arena().is_pinned(old_block), "the old block is still pinned — the stale-TLB hold");
+  assert!(store.dax_release_after_unmap(&m), "the release after the confirmed unmap drops the hold");
+  assert!(
+    !store.content.arena().is_pinned(old_block),
+    "the old block is unpinned and reusable only after the release"
+  );
+}
+
+/// §4.6 L2. Do: migrate a *read-only* mapping. Expect: refused `Invalid` — the moving target is for writable blocks a
+/// guest can hammer; read-only DAX is immutable shared content a guest cannot hammer into a neighbour, and moving it
+/// would break the share. Non-vacuity: a writable mapping of the same file migrates.
+#[test]
+fn a_read_only_mapping_is_not_migrated() {
+  use slates_vfs::error::VfsError;
+  let mut store = store();
+  let mut volume = volume(&mut store, 1 << 20);
+  let f = file_of(&mut store, &mut volume, "f", 0x41, DAX_PAGE);
+
+  let ro = volume.dax_map_read(&mut store, f).unwrap();
+  assert!(
+    matches!(volume.dax_migrate(&mut store, &ro), Err(VfsError::Invalid)),
+    "a read-only mapping is not migrated"
+  );
+  assert_eq!(store.dax.migrated(), 0, "nothing migrated");
+
+  // Non-vacuity: the same file, mapped writable, does migrate.
+  store.dax_revoke(&ro);
+  let rw = volume.dax_map_write(&mut store, f).unwrap();
+  assert!(volume.dax_migrate(&mut store, &rw).is_ok(), "a writable mapping of the same file migrates");
+  assert_eq!(store.dax.migrated(), 1);
+}
+
+/// §4.6 L2 (the stripe-shift placement, [`stripe_target`]). Do: over a seeded generator, draw many targets for every
+/// slot of an 8-slot sandbox. Expect: every target is inside the sandbox `[0, 8)` and never the current slot (a shift
+/// must move), and every slot is reachable as a target over the sweep (non-vacuity — the placement is not stuck); a
+/// one-slot sandbox returns its only slot, signalling no shift is available. This is the bounded, no-quarantine
+/// placement: the content walks a capped physical sandbox, never a growing quarantine pool.
+#[test]
+fn the_stripe_target_stays_in_the_sandbox_and_always_moves() {
+  use core::num::NonZeroUsize;
+  use slates_machine::stats::Xorshift;
+  let mut rng = Xorshift::new(0x0BAD_F00D_1234_5678);
+  let slots = NonZeroUsize::new(8).unwrap();
+  let mut seen = [false; 8];
+  for current in 0..8usize {
+    for _ in 0..2000 {
+      let t = stripe_target(slots, current, &mut rng);
+      assert!(t < 8, "the target stays strictly inside the sandbox");
+      assert_ne!(t, current, "a shift always moves to a different slot");
+      seen[t] = true;
+    }
+  }
+  assert!(seen.iter().all(|&s| s), "every slot in the sandbox is reachable (the placement is not stuck)");
+  assert_eq!(
+    stripe_target(NonZeroUsize::new(1).unwrap(), 0, &mut rng),
+    0,
+    "a one-slot sandbox cannot move: it returns its only slot (no shift available)"
   );
 }

@@ -779,6 +779,45 @@ impl ChunkStore {
     Ok(())
   }
 
+  /// Relocates `open`'s content to a freshly allocated block of the same size and lockedness — the arena half of a DAX
+  /// migration (§4.6 L2, the moving target). The new block is allocated and the **whole** old block copied into it
+  /// (so nothing written past `len`, A-118's `dirty_to`, is lost) *before* the old block is freed; because a live DAX
+  /// mapping keeps the old block **pinned**, that free is *deferred* — its bytes are kept — until the mapping is
+  /// released, which is exactly the stale-TLB hold the two-phase revoke needs. `open.block` becomes the new block and
+  /// the old block is returned (the caller releases it once the VMM confirms the window unmap). On any failure `open`
+  /// is untouched and no block is left allocated: nothing moves. The new block is left **unpinned** — pinning it for
+  /// the new mapping is the caller's step, as a fresh map pins the block it mints.
+  pub fn relocate(&mut self, open: &mut OpenExtent) -> Result<Block, VfsError> {
+    let old_block = open.block;
+    let size = self
+      .arena
+      .bytes(old_block)
+      .map(<[u8]>::len)
+      .ok_or(VfsError::StaleHandle)?;
+    let locked = self.arena.is_locked(old_block);
+    let new_block = self.alloc(size, locked)?;
+    let carry = self.arena.bytes(old_block).map(<[u8]>::to_vec);
+    let copied = match (carry, self.arena.bytes_mut(new_block)) {
+      (Some(carry), Some(dst)) => match dst.get_mut(..carry.len()) {
+        Some(slot) => {
+          slot.copy_from_slice(&carry);
+          true
+        }
+        None => false,
+      },
+      _ => false,
+    };
+    if !copied {
+      // The new block is unpinned, so this free is immediate; the old block and `open` are untouched.
+      self.arena.free(new_block)?;
+      return Err(VfsError::StaleHandle);
+    }
+    // Deferred while the old block stays pinned by the live mapping, so its bytes survive the handoff.
+    self.arena.free(old_block)?;
+    open.block = new_block;
+    Ok(old_block)
+  }
+
   /// Writes into an open extent at `at` (relative to the extent), zero-filling any gap, growing
   /// the block as needed.
   pub fn write_open(

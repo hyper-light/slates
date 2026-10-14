@@ -153,11 +153,31 @@ fn main() {
     black_box(dstb[0]);
   });
 
+  // DAX migration (§4.6 L2, the moving target): relocate the mapped block to a fresh block and hand off, releasing
+  // the old as the device would once it confirms the window unmap. This is the per-migration stall the periodic
+  // defence pays — an in-arena DRAM copy of the block plus the pin/registry bookkeeping — and it is the number the
+  // *adaptive migration interval* is derived from: a migration must cost far less than the interval between them, or
+  // the moving target starves the guest it protects. Minting the writable mapping copies the file up and revokes the
+  // read mapping used above.
+  let mut cur = vol.dax_map_write(&mut store, no).expect("map write for migrate");
+  let (migrate_ns, migrate_runs) = best_of(ITERS / 100, || {
+    let next = vol.dax_migrate(&mut store, &cur).expect("migrate");
+    store.dax_release_after_unmap(&cur); // the device confirmed the unmap; drop the old block's hold
+    cur = next;
+  });
+
   println!("# DAX access path on the real arena block ({OP_BYTES}-byte op, best of {RUNS}), ns/op");
   println!("dax_read\t{read_ns}\truns={read_runs:?}");
   println!("dax_write\t{write_ns}\truns={write_runs:?}");
   println!("dax_map_read_setup\t{map_read_ns}\truns={map_read_runs:?}");
   println!("dax_map_write_setup\t{map_write_ns}\truns={map_write_runs:?}");
+  println!();
+  println!("# DAX migration (L2 moving target), a {OP_BYTES}-byte block relocated + handed off, ns/migration");
+  println!("dax_migrate\t{migrate_ns}\truns={migrate_runs:?}");
+  println!(
+    "# derived: migration interval floor = cost / stall budget; a 1% stall budget => >= 100 x {migrate_ns} = {} ns",
+    migrate_ns.saturating_mul(100)
+  );
   println!();
   println!("# Mediated round-trip DAX replaces (recorded, BENCHMARKS.md 2026-10-08/11), ns/op");
   println!("fuse_read\t{FUSE_READ_NS}\nfuse_write\t{FUSE_WRITE_NS}\nnfs_op\t{NFS_OP_NS}");

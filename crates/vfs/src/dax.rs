@@ -23,6 +23,9 @@
 //! (see `docs/wip/GAPS.md`); nothing here precludes it — the mapping carries no caller-trusted field, and the block
 //! it names is validated against the live arena before it is pinned.
 
+use core::num::NonZeroUsize;
+
+use slates_machine::stats::Xorshift;
 use slates_mem::arena::Extent as Block;
 
 use crate::error::VfsError;
@@ -33,6 +36,38 @@ use crate::volume::{Store, Volume};
 /// Derived: the DAX mapping granule — the host page, the unit a guest page table can point at. One page (4 KiB) is
 /// the smallest mapping a virtio-fs DAX window grants; a block spans a whole number of them.
 pub const DAX_PAGE: usize = 4096;
+
+/// The pseudo-random **stripe target** within a file's bounded DAX shift sandbox (§4.6 L2, the moving target's
+/// placement): given a sandbox of `slots` physical rows and the slot the content sits in now, a uniformly chosen
+/// *different* slot to shift it to. Bounded strictly to `[0, slots)` (never out of the sandbox) and never `current`
+/// (a shift must move the bytes to escape a hammer), so the content walks the sandbox unpredictably while the memory
+/// footprint stays capped — a pre-bounded physical sandbox, no quarantine pool to exhaust (Ada's scale answer to
+/// blind-migration quarantine exhaustion at agentic scale).
+///
+/// The choice is unbiased ([`Xorshift::below`], Lemire). `rng` carries the randomness source: a deterministic
+/// xorshift64* (Vigna 2016) seeded **from boot entropy**, so the sequence is unpredictable to a co-located attacker
+/// — who cannot observe the daemon's RNG state (it is daemon-only RAM, like the registry), which is what makes a
+/// non-cryptographic generator sound here; a cryptographic source may replace it without touching this selection
+/// logic. When the L1 hugetlb sandbox lands, [`Volume::dax_migrate`] draws its shift target's slot from here instead
+/// of the general arena allocator, binding the offset to a physically-contiguous sandbox so the shift actually moves
+/// physical rows — the stated deployment requirement (without contiguity, a virtual shift is security theatre).
+#[must_use]
+pub fn stripe_target(slots: NonZeroUsize, current: usize, rng: &mut Xorshift) -> usize {
+  let n = slots.get();
+  if n <= 1 {
+    // A one-slot sandbox cannot move; the caller reads this as "no shift available" and keeps the block in place.
+    return 0;
+  }
+  // Pick uniformly in `[0, n-1)` over the *other* slots, then skip `current` by shifting the upper half up one — a
+  // bijection onto `{0..n} \ {current}`, so the result is uniform and never `current`, with no reject loop.
+  let pick = rng.below(n.saturating_sub(1));
+  let current = current.checked_rem(n).unwrap_or(0);
+  if pick >= current {
+    pick.saturating_add(1)
+  } else {
+    pick
+  }
+}
 
 /// One active mapping of a file's content block into a guest's DAX window. Minted by the daemon
 /// ([`Volume::dax_map_read`]/[`Volume::dax_map_write`]); never constructed from caller input.
@@ -76,6 +111,10 @@ pub struct DaxRegistry {
   revoked: u64,
   /// Maps refused at the bound, monotone.
   refused: u64,
+  /// Migrations performed (§4.6 L2 moving target): a mapped block relocated to a fresh block and the mapping
+  /// re-minted on it. Monotone; the non-vacuity counter a migration test asserts moved, so a dead moving-target path
+  /// cannot pass for a live one.
+  migrated: u64,
 }
 
 impl DaxRegistry {
@@ -87,7 +126,13 @@ impl DaxRegistry {
       cap,
       revoked: 0,
       refused: 0,
+      migrated: 0,
     }
+  }
+
+  /// Counts a completed migration (§4.6 L2): the moving target's non-vacuity counter.
+  fn count_migration(&mut self) {
+    self.migrated = self.migrated.saturating_add(1);
   }
 
   /// Records a daemon-minted mapping, or refuses `NoSpace` at the bound.
@@ -140,6 +185,12 @@ impl DaxRegistry {
   #[must_use]
   pub fn refused(&self) -> u64 {
     self.refused
+  }
+
+  /// Migrations performed so far (§4.6 L2 moving target; the non-vacuity counter).
+  #[must_use]
+  pub fn migrated(&self) -> u64 {
+    self.migrated
   }
 }
 
@@ -232,6 +283,83 @@ impl Volume {
       }
       return Err(refusal);
     }
+    Ok(mapping)
+  }
+
+  /// **Migrates** a live writable mapping to a fresh block (§4.6 L2, the moving target) — the stripe-shift primitive
+  /// the periodic defence composes from. The file's content is relocated to a physically different block (so a
+  /// Rowhammer attacker tracking the old physical rows loses its target), the inode repointed to it (so every
+  /// non-DAX reader — the daemon path, recovery, another client — reaches the moved content, never a stale block),
+  /// and the window handed off with the two-phase revoke: the **new** block is pinned and its mapping minted *before*
+  /// the **old** mapping is revoked-pending, and the old block stays **pinned** — its free deferred, its bytes kept —
+  /// until the device confirms the window unmap and calls [`Store::dax_release_after_unmap`] (the stale-TLB hold). So
+  /// at no point is a block both reachable through the guest's possibly-stale page table and reusable by a neighbour.
+  ///
+  /// The device remaps the guest window old→new (an atomic `MAP_FIXED`/`mremap` over the same guest address), so the
+  /// guest re-faults transparently onto the moved bytes. Refused `Invalid` for a read-only mapping (immutable shared
+  /// content a guest cannot hammer into a neighbour, and moving it would break the share), a revoked mapping, or one
+  /// whose block already moved; `NoSpace`/`PublishNeeded` if no fresh block can back the shift — the caller keeps the
+  /// old mapping and retries, never a lost window. The pseudo-random *placement* of the fresh block within a bounded
+  /// physically-contiguous sandbox ([`stripe_target`]) is the L1 step bound to the hugetlb sandbox; here the arena
+  /// provides the fresh block and the handoff mechanics are complete and exact.
+  pub fn dax_migrate(&mut self, store: &mut Store, old: &Mapping) -> Result<Mapping, VfsError> {
+    if !old.writable || !store.dax.is_live(old) {
+      return Err(VfsError::Invalid);
+    }
+    let Some(handle) = crate::trie::get(&store.tries, self.inode_root, old.inode) else {
+      return Err(VfsError::NotFound);
+    };
+    let body = std::mem::replace(&mut store.inodes.get_mut(handle)?.body, Body::None);
+    let Body::Open { mut open, sealed } = body else {
+      store.inodes.get_mut(handle)?.body = body;
+      return Err(VfsError::Invalid);
+    };
+    if !sealed.is_empty() || open.block != old.block {
+      store.inodes.get_mut(handle)?.body = Body::Open { open, sealed };
+      return Err(VfsError::Invalid);
+    }
+    // Relocate the content to a fresh block; the old block, pinned by `old`, is freed *deferred* (its bytes kept) —
+    // the stale-TLB hold. On a refusal nothing moved: restore the body and surface it.
+    if let Err(refusal) = store.content.relocate(open.as_mut()) {
+      store.inodes.get_mut(handle)?.body = Body::Open { open, sealed };
+      return Err(refusal);
+    }
+    let new_block = open.block;
+    // The inode now reaches the moved block; non-DAX readers see the file unchanged.
+    store.inodes.get_mut(handle)?.body = Body::Open { open, sealed };
+    // Pin the moved-to block for the new mapping and scrub its tail past the file, as a fresh map does, so the
+    // whole-page guest view never reaches the arena's prior bytes.
+    if let Err(refusal) = store.content.arena_mut().pin(new_block) {
+      // A pin of a just-allocated block failing is a broken arena invariant; the content is safe at `new_block` (the
+      // inode points there) and the old mapping is still inert-pending — surface it typed, never a panic.
+      return Err(refusal.into());
+    }
+    if let Some(tail) = store
+      .content
+      .arena_mut()
+      .bytes_mut(new_block)
+      .and_then(|bytes| bytes.get_mut(old.file_len..))
+    {
+      tail.fill(0);
+    }
+    // Phase one of the handoff: the OLD mapping goes inert (leaves the registry); its block stays pinned until
+    // [`Store::dax_release_after_unmap`] is called after the VMM confirms the unmap and cross-core TLB flush.
+    store.dax_revoke_pending(old);
+    let mapping = Mapping {
+      inode: old.inode,
+      block: new_block,
+      file_len: old.file_len,
+      writable: true,
+    };
+    if let Err(refusal) = store.dax.register(mapping) {
+      // The registry had room (we just removed `old`), so this is defensive: unpin the new block so a refused
+      // migration leaves nothing held, and surface the refusal.
+      if store.content.arena_mut().unpin(new_block).is_err() {
+        store.release_refusals = store.release_refusals.saturating_add(1);
+      }
+      return Err(refusal);
+    }
+    store.dax.count_migration();
     Ok(mapping)
   }
 
