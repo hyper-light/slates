@@ -107,6 +107,37 @@ fn mapping_a_directory_is_refused() {
   assert!(volume.dax_map_read(&mut store, root).is_err());
 }
 
+/// Defence in depth for the device seam: a DAX map of an attribute (xattr-value) inode is refused `NotFound`,
+/// never a window onto an attribute's bytes. A file's xattr lives in its own attribute inode and the map verbs
+/// resolve the raw inode number, so without the `namespace_inode` gate a crafted or confused map of the attribute's
+/// number would reach its content — the same `namespace_inode` refusal the NFS/FUSE transports apply, now mirrored
+/// in the gate. Do: give a file an xattr, take the attribute inode's number, map it for read and for write. Expect:
+/// both `NotFound`; the file's own content still maps (non-vacuity).
+#[test]
+fn a_dax_map_of_an_attribute_inode_is_refused() {
+  use slates_vfs::error::VfsError;
+  use slates_vfs::xattr::XattrSet;
+  let mut store = store();
+  let mut volume = volume(&mut store, 1 << 20);
+  let file = file_of(&mut store, &mut volume, "f", SECRET, DAX_PAGE);
+  volume
+    .xattr_set(&mut store, file, b"user.secret", b"attribute value bytes", XattrSet::Either)
+    .unwrap();
+  let attr = volume.xattr_inode(&store, file, b"user.secret").unwrap();
+  assert!(
+    matches!(volume.dax_map_read(&mut store, attr), Err(VfsError::NotFound)),
+    "an attribute inode cannot be DAX-mapped for read"
+  );
+  assert!(
+    matches!(volume.dax_map_write(&mut store, attr), Err(VfsError::NotFound)),
+    "an attribute inode cannot be DAX-mapped for write"
+  );
+  assert!(
+    volume.dax_map_read(&mut store, file).is_ok(),
+    "non-vacuity: the file's own content still maps"
+  );
+}
+
 /// §4.6 (CLAUDE.md #8, no unbounded growth / no panic). Do: colossal and overflowing offsets and lengths on a valid
 /// mapping. Expect: no panic, no out-of-bounds — a read past the mapped span is refused before any allocation, an
 /// overflowing write is refused.

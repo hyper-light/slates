@@ -160,6 +160,10 @@ impl Volume {
   /// whole-page view never reaches a truncate's leftover tail or a prior allocation's bytes. Refused for a directory,
   /// a sealed or multi-block file, or when the registry is at its bound.
   pub fn dax_map_read(&mut self, store: &mut Store, no: InodeNo) -> Result<Mapping, VfsError> {
+    // Defence in depth for the device seam: a mapping is of a namespace object only, never an attribute
+    // (xattr-value) inode — so a crafted or confused map of an attribute number is `NotFound`, never a window onto
+    // an attribute's bytes, mirroring the transports' `namespace_inode` gate.
+    self.namespace_inode(&*store, no)?;
     let (block, file_len) = file_block(&*store, self, no)?;
     store.content.arena_mut().pin(block)?;
     if let Some(tail) = store
@@ -191,6 +195,9 @@ impl Volume {
   /// VFS write boundary (where copy-on-write, quota and journal live); the now-private block is **pinned**, its tail
   /// past the file scrubbed, and the mapping recorded. Refused as [`Volume::dax_map_read`] is.
   pub fn dax_map_write(&mut self, store: &mut Store, no: InodeNo) -> Result<Mapping, VfsError> {
+    // Defence in depth: a writable mapping, like a read mapping, is of a namespace object only — never an
+    // attribute inode (`Volume::dax_map_read`).
+    self.namespace_inode(&*store, no)?;
     let file_len = usize::try_from(self.stat(&*store, no)?.size).map_err(|_| VfsError::NoSpace)?;
     let mut current = vec![0u8; file_len];
     self.read(&*store, no, 0, &mut current)?;
