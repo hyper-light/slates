@@ -201,6 +201,13 @@ impl DaxRegistry {
     std::mem::take(&mut self.pending_revokes)
   }
 
+  /// How many inodes await a device-side revoke (the step-5 queue depth; bounded by `cap`). For the bound/dedup
+  /// hardening test — a write storm on a mapped inode must not grow it past the one deduped entry.
+  #[must_use]
+  pub fn pending_len(&self) -> usize {
+    self.pending_revokes.len()
+  }
+
   /// Counts a completed migration (§4.6 L2): the moving target's non-vacuity counter.
   fn count_migration(&mut self) {
     self.migrated = self.migrated.saturating_add(1);

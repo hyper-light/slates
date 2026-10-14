@@ -6133,11 +6133,25 @@ its own page table and never calls the daemon), so the defense had to be at the 
   SETUPMAPPING cache window, the counter moving 0→1). A **correctness pass fixed a latent leak**: phase-one revoke
   (`dax_revoke_pending`) now drops a read-only mapping's integrity guard (B2) and frees its clean copy — it only
   unregistered before, so a guarded read-only mapping revoked two-phase (a `write`/`truncate` of a guarded inode, a
-  device window teardown) leaked the guard's pinned clean copy until the volume dropped. **Still synchronous (owed —
-  the same stale-TLB hazard once DAX is advertised):** the snapshot/clone (`dax_revoke_writable_of_prefix`), destroy
-  (`dax_revoke_volume`) and landing/takeover (`dax_revoke_block`) paths still unpin at once rather than two-phase;
-  safe only while no live window exists (DAX unadvertised), they must route through the pending-enqueue before
-  advertisement.
+  device window teardown) leaked the guard's pinned clean copy until the volume dropped. The queue is bounded +
+  deduped + non-vacuous by test (`the_pending_revoke_queue_is_bounded_and_deduped`, `pending_len`): a write storm on
+  one mapped inode enqueues it once, distinct inodes once each, never past the registry cap (CLAUDE.md #8).
+- **The sibling teardown paths — investigated, each is a *different* case (an earlier note wrongly said all three
+  should route through the pending-enqueue; that would break destroy). All are safe today — DAX is unadvertised, so
+  no live window exists — and each is gated on the advertisement decision:**
+  - **destroy** (`dax_revoke_volume`) **stays synchronous by design**: its own comment says it unpins so the volume's
+    blocks are reclaimed; two-phase would keep them pinned (deferred frees outliving the volume), the opposite of
+    what it must do. Its correctness rests on a *server-ordering invariant* — the device attachment is torn down
+    first (`release_dax` munmaps every window), so by the time `dax_revoke_volume` runs there is no live window to
+    munmap. Owed: assert that ordering at the server once DAX is advertised. Not a VFS change.
+  - **snapshot/clone** (`dax_revoke_writable_of_prefix`) needs a **writable-only, synchronous recall**, which the
+    step-5 channel does not provide: the sync `dax_revoke` never munmaps the guest window at all, and the
+    *inode-keyed* channel would over-tear the **read-only** windows snapshot must keep (immutable shared content is
+    the allowed DAX case). The correct shape is a writable DAX window treated as a **write-holder** in the existing
+    delegation-recall machinery (recalled synchronously before the freeze), the same exclusion a write delegation
+    needs — gated on the registry decision (banned item 7).
+  - **advance/version-move** (`dax_revoke_block`) is **unwired** (no caller): the same writable-mapping subtlety, to
+    be wired with the recall model.
 
 **Owed before DAX is advertised (the next steps):**
 

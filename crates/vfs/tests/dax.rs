@@ -1117,6 +1117,47 @@ fn the_two_phase_revoke_drops_a_guarded_mappings_clean_copy() {
   }
 }
 
+/// §4.6 step 5 + CLAUDE.md #8 (the daemon→device pending-revoke queue is bounded, deduped, and non-vacuous — a
+/// silently-dead enqueue cannot pass for a working channel). A write or truncate of a mapped inode enqueues it for
+/// the device to munmap; the queue must (a) enqueue a mapped inode exactly once however many times it is written
+/// before the device drains (a write storm cannot grow it per write), and (b) never exceed the registry cap, since
+/// only a *mapped* inode enqueues and live mappings are themselves cap-bounded. Do: write one mapped inode twice
+/// (re-mapping between, as a guest would) without a drain, then several distinct mapped inodes once each; drain and
+/// count. Expect: the storm leaves one entry; the distinct inodes leave one each; the drain clears the queue.
+#[test]
+fn the_pending_revoke_queue_is_bounded_and_deduped() {
+  use std::collections::BTreeSet;
+  const CAP: usize = 16;
+  let mut store = store_capped_chunks(CAP);
+  let mut volume = volume(&mut store, 1 << 20);
+
+  // A write storm on one mapped inode: each write revokes-and-enqueues, but the inode is deduped to one entry. The
+  // guest re-maps after each write (its window was torn), exactly as the device path makes it; the queue still holds
+  // the inode once until a drain.
+  let f = file_of(&mut store, &mut volume, "f", 0x11, DAX_PAGE);
+  for round in 0..5u8 {
+    let m = volume.dax_map_read(&mut store, f).unwrap();
+    assert!(store.dax_is_live(&m), "the re-map is live, round {round}");
+    volume.write(&mut store, f, 0, &[round; 8]).unwrap();
+    assert!(store.dax.pending_len() <= 1, "the storm never grows the queue past the one deduped inode");
+  }
+  assert_eq!(store.dax.take_pending_revokes(), vec![f], "a write storm on one mapped inode enqueues it once");
+  assert!(store.dax.take_pending_revokes().is_empty(), "the drain cleared the queue");
+
+  // Several distinct mapped inodes, each written once: each enqueued exactly once, and the queue stays within the cap.
+  let mut want: BTreeSet<u64> = BTreeSet::new();
+  for name in ["a", "b", "c", "d"] {
+    let no = file_of(&mut store, &mut volume, name, 0x22, DAX_PAGE);
+    let m = volume.dax_map_read(&mut store, no).unwrap();
+    assert!(store.dax_is_live(&m));
+    volume.write(&mut store, no, 0, &[0xCD; 8]).unwrap();
+    want.insert(no.0);
+  }
+  assert!(store.dax.pending_len() <= CAP, "the queue never exceeds the registry cap");
+  let drained: BTreeSet<u64> = store.dax.take_pending_revokes().into_iter().map(|no| no.0).collect();
+  assert_eq!(drained, want, "each distinct mapped inode was enqueued exactly once");
+}
+
 /// §4.6 (the DAX device-window backing seam, Unix). Do: on the scratch (anonymous-backed) test store, map a file
 /// writable and ask for its DAX backing; then revoke and ask again. Expect: `None` both times — a scratch volume's
 /// content is private process RAM with no descriptor to hand a VMM (so DAX is served only on anchor-backed volumes),
