@@ -436,4 +436,27 @@ impl Bridge for ScopedBridge<'_> {
   fn seen(&mut self, cx: &OpContext) -> InvalidationCursor {
     self.inner.seen(cx)
   }
+
+  fn dax_map(
+    &mut self,
+    object: ObjectId,
+    cx: &OpContext,
+    writable: bool,
+  ) -> Result<slates_vfs::dax::Mapping, VfsError> {
+    // A scoped guest may map only an inode in its subtree: admit before the gate mints the window mapping, so a
+    // DAX window never opens onto content outside the scope (the "one missing predicate per method" discipline).
+    self.admit(object, cx)?;
+    self.inner.dax_map(object, cx, writable)
+  }
+
+  fn dax_unmap(
+    &mut self,
+    mapping: &slates_vfs::dax::Mapping,
+    cx: &OpContext,
+  ) -> Result<bool, VfsError> {
+    // The mapping's inode must lie in the scope — a scoped guest cannot revoke a mapping outside its subtree
+    // (unreachable through the per-guest window table, but checked here for the same confinement discipline).
+    self.admit(ObjectId::new(mapping.inode.0, 0), cx)?;
+    self.inner.dax_unmap(mapping, cx)
+  }
 }

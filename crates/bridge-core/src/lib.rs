@@ -444,6 +444,37 @@ pub trait Bridge {
     Ok(object.inode == scope)
   }
 
+  /// Mint a DAX mapping of `object`'s single content block (§4.6 A-9, AC-4.12; `slates_vfs::dax`): the daemon
+  /// pins the arena block and registers the mapping, and the returned [`slates_vfs::dax::Mapping`] names the block
+  /// the virtio-fs device places in its DAX window (a `MAP_FIXED` of the content arena's memfd), so the guest
+  /// reaches the block through its own page table with no per-access daemon call. `writable` copies the block up
+  /// first (`Volume::dax_map_write`) so it is this version's alone. The default is *no DAX window on this
+  /// transport* — plain `/dev/fuse` and the scratch bridges never serve it — refused `SpecialFileOperation`
+  /// (EOPNOTSUPP); a transport advertises DAX in FUSE_INIT only when its bridge overrides this behind the gate.
+  fn dax_map(
+    &mut self,
+    object: ObjectId,
+    cx: &OpContext,
+    writable: bool,
+  ) -> Result<slates_vfs::dax::Mapping, VfsError> {
+    let _ = (object, cx, writable);
+    Err(VfsError::SpecialFileOperation)
+  }
+
+  /// Revoke a DAX mapping a guest gave up (FUSE_REMOVEMAPPING): unregister it and unpin its block so the block may
+  /// be reused. The caller (the device) must have already torn the guest's window range down — the unpin is here,
+  /// **after** the window `munmap`, never before, or the guest's page table could outlive the pin and reach a
+  /// reused block. `Ok(true)` if the mapping was live, `Ok(false)` if it was already gone. The default holds no
+  /// mappings.
+  fn dax_unmap(
+    &mut self,
+    mapping: &slates_vfs::dax::Mapping,
+    cx: &OpContext,
+  ) -> Result<bool, VfsError> {
+    let _ = (mapping, cx);
+    Ok(false)
+  }
+
   /// The AppleDouble view of `owner_name`'s extended attributes in directory `parent` (§4.6
   /// "Extended attributes over NFSv3"): the `._owner_name` file a macOS NFSv3 client keeps
   /// attributes in, served from the volume's attribute store. Its number is the owner's derived

@@ -1442,4 +1442,41 @@ impl Bridge for VolumeBridge<'_> {
       case_sensitive: self.volume.policy().case_sensitive(),
     })
   }
+
+  fn dax_map(
+    &mut self,
+    object: ObjectId,
+    cx: &OpContext,
+    writable: bool,
+  ) -> Result<slates_vfs::dax::Mapping, VfsError> {
+    // A writable mapping copies the block up, which is a write; a read mapping needs only read rights.
+    if writable {
+      self.authorize_write(cx)?;
+    } else {
+      self.authorize_read(cx)?;
+    }
+    // The DAX core gates an attribute inode through `namespace_inode`; the raw number is otherwise this volume's
+    // (the transport routed the request to this bridge by the handle's volume).
+    let no = InodeNo(object.inode);
+    if writable {
+      self.volume.dax_map_write(self.store, no)
+    } else {
+      self.volume.dax_map_read(self.store, no)
+    }
+  }
+
+  fn dax_unmap(
+    &mut self,
+    mapping: &slates_vfs::dax::Mapping,
+    cx: &OpContext,
+  ) -> Result<bool, VfsError> {
+    // Giving up a window mapping needs no particular right (it only drops access), but it must name this volume.
+    self.authorize_read(cx)?;
+    // Defence in depth: a mapping of another volume is not this bridge's to revoke. The device's window table is
+    // per-guest, so this is unreachable in practice, but a stray cross-volume mapping is refused, never revoked.
+    if mapping.inode.prefix() != self.volume.prefix() {
+      return Err(VfsError::NotFound);
+    }
+    Ok(self.store.dax_revoke(mapping))
+  }
 }

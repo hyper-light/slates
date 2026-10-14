@@ -1434,3 +1434,42 @@ fn dot_and_dotdot_resolve_and_never_climb_out_of_a_root_or_a_scope() {
     "the scope's `..` is the scope"
   );
 }
+
+/// §4.6 A-9 / AC-4.12 (DAX confinement, the "one predicate per method" discipline): a DAX map is minted for an
+/// in-scope file but refused for one outside a scoped mount's subtree, so a DAX window never opens onto content
+/// the scope does not grant. Do: a volume with `/shared/f` and `/private/secret`, each a mappable single content
+/// block; through a `ScopedBridge` on `/shared`, map `f` (Ok) and `secret` (NotFound, refused before any pin);
+/// the unscoped bridge maps `secret` too (non-vacuity — the refusal is the scope's, not the file's).
+#[test]
+fn a_scoped_dax_map_is_confined_to_its_subtree() {
+  use slates_bridge_core::scoped::ScopedBridge;
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let mut inner = VolumeBridge::new(VolumeId { bytes: [0; 16] }, &mut vol, &mut store);
+  let cx = rw_cx();
+  let root = inner.root(&cx).unwrap();
+  let shared = inner.mkdir(oid(root), &cx, "shared", 0o755).unwrap();
+  let private = inner.mkdir(oid(root), &cx, "private", 0o755).unwrap();
+  // One content block each (a page), so each is a mappable file, not inline.
+  let (f, _) = inner.create(oid(shared.ino), &cx, "f", 0o644, 0).unwrap();
+  inner.write(oid(f.ino), &cx, 0, &[0xABu8; 4096]).unwrap();
+  let (secret, _) = inner.create(oid(private.ino), &cx, "secret", 0o644, 0).unwrap();
+  inner.write(oid(secret.ino), &cx, 0, &[0xCDu8; 4096]).unwrap();
+
+  {
+    let mut scoped = ScopedBridge::new(&mut inner, shared.ino);
+    assert!(
+      scoped.dax_map(oid(f.ino), &cx, false).is_ok(),
+      "the scoped mount maps its own file"
+    );
+    assert!(
+      matches!(scoped.dax_map(oid(secret.ino), &cx, false), Err(VfsError::NotFound)),
+      "the scoped mount cannot map a file outside its subtree"
+    );
+  }
+  // Non-vacuity: the private file IS mappable — the scope was the only thing refusing it.
+  assert!(
+    inner.dax_map(oid(secret.ino), &cx, false).is_ok(),
+    "the unscoped bridge maps the private file"
+  );
+}
