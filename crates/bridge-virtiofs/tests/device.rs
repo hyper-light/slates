@@ -1252,13 +1252,14 @@ fn the_copy_buffers_a_device_keeps_stay_charged_to_its_attachment() {
 /// A store whose content arena is a shared-object (anchor-backed) region, so a mapped block has a descriptor the DAX
 /// window can map (a scratch/anonymous store has none). `page` is the host page so blocks are page-aligned for `mmap`.
 #[cfg(unix)]
-fn dax_shared_store(page: usize) -> slates_vfs::volume::Store {
+fn dax_shared_store(page: usize, tag: &str) -> slates_vfs::volume::Store {
   use slates_mem::arena::ChunkArena;
   use slates_mem::region::Region;
   use slates_mem::{ExclusiveObject, SharedObject, Words};
   const REGION_PAGES: usize = 64;
+  // The name is unique per test (tag), so parallel tests never collide on one `shm` object.
   let object =
-    SharedObject::create(&format!("sl-daxdev-{}", std::process::id()), page * REGION_PAGES, Words::new())
+    SharedObject::create(&format!("sl-ds-{tag}-{}", std::process::id()), page * REGION_PAGES, Words::new())
       .unwrap();
   let mut arena = ChunkArena::new(page);
   // SAFETY: this test is the object's only mapper; it declares no words.
@@ -1309,7 +1310,7 @@ fn dax_exchange(
 fn a_guest_setupmapping_maps_the_file_into_the_dax_window_and_removemapping_tears_it_down() {
   use slates_mem::{SharedObject, Words};
   let page = rustix::param::page_size().max(1);
-  let mut store = dax_shared_store(page);
+  let mut store = dax_shared_store(page, "e2e");
   let mut vol = volume(&mut store);
   vol.enable_writable_dax();
   let root = vol.root_inode(&store).unwrap();
@@ -1367,5 +1368,107 @@ fn a_guest_setupmapping_maps_the_file_into_the_dax_window_and_removemapping_tear
   assert_eq!(reply_error(&remove_reply), 0, "REMOVEMAPPING succeeded");
   assert_eq!(device.dax_window_count(), 0, "the window mapping was torn down");
 
+  drop(cache);
+}
+
+/// A 64-byte FUSE_INIT body (major 7, minor 38): the codec reads what it needs.
+#[cfg(unix)]
+fn dax_init_body() -> Vec<u8> {
+  let mut b = Vec::new();
+  b.extend_from_slice(&7u32.to_le_bytes());
+  b.extend_from_slice(&38u32.to_le_bytes());
+  b.extend_from_slice(&0u32.to_le_bytes());
+  b.extend_from_slice(&0u32.to_le_bytes());
+  b.resize(64, 0);
+  b
+}
+
+/// A FUSE_SETUPMAPPING body: fh=0, `foffset`, `len`, write flag per `writable`, `moffset`.
+#[cfg(unix)]
+fn dax_setup_body(foffset: u64, len: u64, writable: bool, moffset: u64) -> Vec<u8> {
+  let flags = if writable {
+    slates_bridge_fuse::request::SETUPMAPPING_FLAG_WRITE
+  } else {
+    0
+  };
+  let mut b = Vec::new();
+  for field in [0u64, foffset, len, flags, moffset] {
+    b.extend_from_slice(&field.to_le_bytes());
+  }
+  b
+}
+
+/// §4.6 L0, through the device (AC-4.12). Do: on a shared-backed volume that has *not* opted in to writable DAX, a
+/// guest asks SETUPMAPPING writable, then read-only. Expect: the writable one is refused `EPERM` with no window (L0
+/// gates it through the whole device path, not just the gate), the read-only one is served (immutable DAX needs no
+/// opt-in).
+#[cfg(unix)]
+#[test]
+fn a_writable_dax_setupmapping_without_opt_in_is_refused() {
+  use slates_mem::{SharedObject, Words};
+  let page = rustix::param::page_size().max(1);
+  let mut store = dax_shared_store(page, "noopt");
+  let mut vol = volume(&mut store); // NOT opted in to writable DAX
+  let root = vol.root_inode(&store).unwrap();
+  let no = vol.create_file_no(&mut store, root, "f", 0o644).unwrap();
+  vol.write(&mut store, no, 0, &vec![0x33; page]).unwrap();
+  let nodeid = no.0;
+
+  let (mut device, mut driver) = device_and_driver();
+  let cache = SharedObject::create(&format!("sl-daxA-{}", std::process::id()), page * 4, Words::new()).unwrap();
+  device.install_dax_window(Some(
+    slates_bridge_virtiofs::dax::DaxCacheRegion::new(cache.as_fd(), (page * 4) as u64).unwrap(),
+  ));
+  let cx = context();
+  let mut bridge = VolumeBridge::new(vid(), &mut vol, &mut store);
+  dax_exchange(&mut device, &mut driver, &mut bridge, &cx, (Opcode::Init, 1, ROOT), &dax_init_body());
+
+  let w = dax_exchange(
+    &mut device, &mut driver, &mut bridge, &cx,
+    (Opcode::SetupMapping, 2, nodeid), &dax_setup_body(0, page as u64, true, 0),
+  );
+  assert_eq!(reply_error(&w), -1, "writable DAX refused EPERM without opt-in");
+  assert_eq!(device.dax_window_count(), 0, "no window for the refused writable map");
+
+  let r = dax_exchange(
+    &mut device, &mut driver, &mut bridge, &cx,
+    (Opcode::SetupMapping, 3, nodeid), &dax_setup_body(0, page as u64, false, 0),
+  );
+  assert_eq!(reply_error(&r), 0, "read-only DAX served without opt-in");
+  assert_eq!(device.dax_window_count(), 1, "the read-only window is live");
+  drop(cache);
+}
+
+/// §4.6 (AC-4.12, bounds). Do: a guest asks SETUPMAPPING at a window offset past the end of the cache region. Expect:
+/// refused `EINVAL` with no window — a hostile or confused guest cannot map beyond the window the VMM gave it.
+#[cfg(unix)]
+#[test]
+fn a_setupmapping_past_the_window_is_refused() {
+  use slates_mem::{SharedObject, Words};
+  let page = rustix::param::page_size().max(1);
+  let mut store = dax_shared_store(page, "bounds");
+  let mut vol = volume(&mut store);
+  vol.enable_writable_dax();
+  let root = vol.root_inode(&store).unwrap();
+  let no = vol.create_file_no(&mut store, root, "f", 0o644).unwrap();
+  vol.write(&mut store, no, 0, &vec![0x44; page]).unwrap();
+  let nodeid = no.0;
+
+  let (mut device, mut driver) = device_and_driver();
+  let cache = SharedObject::create(&format!("sl-daxB-{}", std::process::id()), page * 4, Words::new()).unwrap();
+  device.install_dax_window(Some(
+    slates_bridge_virtiofs::dax::DaxCacheRegion::new(cache.as_fd(), (page * 4) as u64).unwrap(),
+  ));
+  let cx = context();
+  let mut bridge = VolumeBridge::new(vid(), &mut vol, &mut store);
+  dax_exchange(&mut device, &mut driver, &mut bridge, &cx, (Opcode::Init, 1, ROOT), &dax_init_body());
+
+  // moffset = the window's end: the whole requested range is outside it.
+  let reply = dax_exchange(
+    &mut device, &mut driver, &mut bridge, &cx,
+    (Opcode::SetupMapping, 2, nodeid), &dax_setup_body(0, page as u64, true, (page * 4) as u64),
+  );
+  assert_eq!(reply_error(&reply), -22, "a map past the window is refused EINVAL");
+  assert_eq!(device.dax_window_count(), 0, "nothing mapped past the window");
   drop(cache);
 }
