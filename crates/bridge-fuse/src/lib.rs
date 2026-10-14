@@ -36,6 +36,7 @@ pub mod notify;
 pub mod reply;
 pub mod request;
 pub mod session;
+pub mod shards_fs;
 pub mod volume_bridge;
 pub mod wire;
 
