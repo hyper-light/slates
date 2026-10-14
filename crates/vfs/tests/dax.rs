@@ -318,8 +318,8 @@ fn a_guest_cannot_read_across_a_volume_boundary() {
 /// the fabricated write never reaches the victim's block and its read is zeros, and the escalated write does not
 /// take effect. In the real device, the guest's page table is daemon-configured and the MMU prevents a fabricated
 /// entry; `is_live` is the daemon's shadow of that, so the model and the hardware agree. (The remaining theoretical
-/// case — forging the *exact* registered tuple — needs unguessable internal state and is closed for good by the
-/// owed daemon-minted opaque mapping-id, GAPS §4.6 step 2.)
+/// case — forging the *exact* registered tuple — is now closed by construction: a `Mapping` carries a daemon-minted
+/// `MappingId` whose inner is module-private, so a mapping the daemon never minted cannot be formed at all (§4.6 step 2).)
 #[test]
 fn a_fabricated_or_tampered_mapping_is_inert() {
   let mut store = store();
@@ -332,13 +332,13 @@ fn a_fabricated_or_tampered_mapping_is_inert() {
   let fa = file_of(&mut store, &mut attacker, "fa", 0x11, DAX_PAGE);
   let am = attacker.dax_map_read(&mut store, fa).unwrap();
 
-  // Fabricated: a writable mapping onto the victim's live block, never registered.
+  // Fabricated: a writable mapping onto the victim's live block, never registered. The attacker cannot forge a
+  // `MappingId` (its inner is module-private), so the strongest it can do is tamper a copy of a mapping it *was*
+  // minted — here its own `am`, repointed at the victim's block — which is a different, unregistered identity.
   let fabricated = Mapping {
-    inode: am.inode,
     block: vm.block,
-    file_len: DAX_PAGE,
     writable: true,
-    snapshot: false,
+    ..am
   };
   assert!(!store.dax_is_live(&fabricated), "a fabricated mapping is not live");
   store.dax_write_raw(&fabricated, 0, &[POISON; 64]);

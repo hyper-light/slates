@@ -69,10 +69,24 @@ pub fn stripe_target(slots: NonZeroUsize, current: usize, rng: &mut Xorshift) ->
   }
 }
 
+/// A daemon-minted opaque mapping identity (§4.6 step 2, the tamper-proof registry). The inner value is private to
+/// this module, so a [`Mapping`] — and thus its id — can be formed only by the mint path here
+/// ([`DaxRegistry::mint_id`]), never from caller input or by tampering: a mapping the daemon never minted cannot be
+/// constructed at all, so it can never pass [`DaxRegistry::is_live`]. Identity is decoupled from the (inode, block)
+/// tuple — a re-mint of the same block (a migration) is a distinct mapping — which closes the theoretical
+/// forge-the-exact-tuple case by construction (the tuple identity was already safe by R1/R10 + the MMU; this makes it
+/// un-fabricable at the type level). Monotone and per-`Store`, so it never crosses a host.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MappingId(u64);
+
 /// One active mapping of a file's content block into a guest's DAX window. Minted by the daemon
-/// ([`Volume::dax_map_read`]/[`Volume::dax_map_write`]); never constructed from caller input.
+/// ([`Volume::dax_map_read`]/[`Volume::dax_map_write`]); never constructed from caller input — its [`MappingId`] has
+/// a module-private inner, so a `Mapping` can be formed only by the mint paths in this module.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Mapping {
+  /// The daemon-minted identity: un-fabricable (private inner) and distinct per mint, so a tampered or fabricated
+  /// mapping is a different identity the registry never holds.
+  pub id: MappingId,
   /// The inode mapped (prefix-encoded, so its volume is `inode.prefix()`).
   pub inode: InodeNo,
   /// The arena block holding the content — what the guest's page table points at. Pinned while this mapping lives.
@@ -168,6 +182,10 @@ pub struct DaxRegistry {
   /// a snapshot shares the block read-only). Empty on any shard with no device drain pending; bounded by `cap`
   /// distinct live inodes (deduped on enqueue, `writable_only=false` superseding `true` for the same inode).
   pending_revokes: Vec<(InodeNo, bool)>,
+  /// The next mapping identity to mint (§4.6 step 2). Monotone and per-`Store`, incremented on every mint; starts at
+  /// 1 so a zero id is never minted. It never crosses a host (a taken-over successor starts from its own fresh
+  /// registry), so it needs no coordination.
+  next_id: u64,
 }
 
 impl DaxRegistry {
@@ -185,6 +203,7 @@ impl DaxRegistry {
       flips: 0,
       healed: 0,
       pending_revokes: Vec::new(),
+      next_id: 1,
     }
   }
 
@@ -240,6 +259,15 @@ impl DaxRegistry {
   /// Counts a completed migration (§4.6 L2): the moving target's non-vacuity counter.
   fn count_migration(&mut self) {
     self.migrated = self.migrated.saturating_add(1);
+  }
+
+  /// Mints the next opaque [`MappingId`] (§4.6 step 2). The only way to form a [`MappingId`] — its inner is private —
+  /// so a `Mapping` carrying a real identity exists only because the daemon minted it here. Monotone; saturating so
+  /// an impossibly long-lived shard never wraps to a reused id.
+  fn mint_id(&mut self) -> MappingId {
+    let id = MappingId(self.next_id);
+    self.next_id = self.next_id.saturating_add(1);
+    id
   }
 
   /// Records a daemon-minted mapping, or refuses `NoSpace` at the bound.
@@ -357,6 +385,7 @@ impl Volume {
       tail.fill(0);
     }
     let mapping = Mapping {
+      id: store.dax.mint_id(),
       inode: no,
       block,
       file_len,
@@ -438,6 +467,7 @@ impl Volume {
       return Err(VfsError::Memory(pin));
     }
     let mapping = Mapping {
+      id: store.dax.mint_id(),
       inode: no,
       block,
       file_len,
@@ -485,6 +515,7 @@ impl Volume {
       tail.fill(0);
     }
     let mapping = Mapping {
+      id: store.dax.mint_id(),
       inode: no,
       block,
       file_len,
@@ -560,6 +591,7 @@ impl Volume {
     // [`Store::dax_release_after_unmap`] is called after the VMM confirms the unmap and cross-core TLB flush.
     store.dax_revoke_pending(old);
     let mapping = Mapping {
+      id: store.dax.mint_id(),
       inode: old.inode,
       block: new_block,
       file_len: old.file_len,
