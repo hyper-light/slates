@@ -24,6 +24,10 @@
 //!
 //! Command: `cargo run --release -p slates-vfs --example dax_bench`. Best-of-N with all runs shown.
 
+// Measurement harness (as `vfs_bench.rs`): fixed-size indexing into buffers this file owns, and an `expect` on setup
+// that must succeed or the measurement is meaningless — neither is a production path.
+#![allow(clippy::indexing_slicing, clippy::expect_used)]
+
 use std::hint::black_box;
 use std::time::Instant;
 
@@ -84,6 +88,10 @@ fn volume(store: &mut Store) -> Volume {
       clock: Box::new(StepClock::new(0, 1_000)),
     },
   )
+  .map(|mut v| {
+    v.enable_writable_dax(); // L0: this bench measures writable-mapping cost, so opt the volume in.
+    v
+  })
   .expect("volume")
 }
 

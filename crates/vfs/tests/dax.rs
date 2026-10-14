@@ -27,7 +27,17 @@ use slates_vfs::ids::InodeNo;
 use slates_vfs::volume::{Store, Volume};
 
 mod common;
-use common::{clone_config, store, store_capped_chunks, volume};
+use common::{clone_config, store, store_capped_chunks};
+
+/// The gate's standard test volume, **with writable DAX opted in** (L0). The mapping-gate tests below exercise what a
+/// writable mapping does *after* a volume opts in — pinning, teardown, migration — so the shared fixture opts in. The
+/// opt-in policy itself (writable DAX refused by default, read-only served) is proven separately by
+/// `a_writable_dax_map_is_refused_until_the_volume_opts_in`, which uses a plain `common::volume`.
+fn volume(store: &mut Store, quota: u64) -> Volume {
+  let mut v = common::volume(store, quota);
+  v.enable_writable_dax();
+  v
+}
 
 /// A byte that stands for a secret a neighbour holds — if a guest reads it through another file's mapping, that is a
 /// leak.
@@ -96,6 +106,38 @@ fn a_write_through_a_read_only_mapping_is_refused() {
   let f = file_of(&mut store, &mut volume, "f", 0x11, DAX_PAGE);
   let m = volume.dax_map_read(&mut store, f).unwrap();
   assert!(volume.dax_write(&mut store, &m, 0, &[0x99; 10]).is_err());
+}
+
+/// §4.6 multi-tenancy **L0** (the Rowhammer gate's outermost layer; the "#3 active address: writable-DAX opt-in /
+/// read-only default" the hardening owed). Do: on a plain volume that has *not* opted in, map a file read-only, then
+/// writable; opt in; map writable again. Expect: read-only always succeeds (immutable shared content a guest reaches
+/// but cannot hammer into a neighbour is the safe default), a writable map is refused `NotPermitted` until the opt-in,
+/// and is served after — so the one DAX mode a guest can Rowhammer stays off unless the owner deliberately enables it.
+#[test]
+fn a_writable_dax_map_is_refused_until_the_volume_opts_in() {
+  use slates_vfs::error::VfsError;
+  let mut store = store();
+  let mut plain = common::volume(&mut store, 1 << 20); // the plain fixture, not the opted-in `volume` wrapper above
+  let f = file_of(&mut store, &mut plain, "f", 0x11, DAX_PAGE);
+
+  assert!(
+    plain.dax_map_read(&mut store, f).is_ok(),
+    "read-only DAX is the default and needs no opt-in"
+  );
+  assert!(
+    matches!(
+      plain.dax_map_write(&mut store, f),
+      Err(VfsError::NotPermitted)
+    ),
+    "a writable map is refused until the volume opts in"
+  );
+  assert!(!plain.writable_dax_enabled(), "still not opted in");
+
+  plain.enable_writable_dax();
+  assert!(
+    plain.dax_map_write(&mut store, f).is_ok(),
+    "after opt-in a writable map is served"
+  );
 }
 
 /// §4.6. Do: map the root directory. Expect: refused — only a regular file's single content block may be mapped.
@@ -788,6 +830,7 @@ fn a_writable_map_in_a_clone_copies_up_and_spares_the_shared_origin() {
   let f = file_of(&mut store, &mut origin, "f", 0x41, DAX_PAGE);
   let snap = origin.snapshot(&mut store).unwrap();
   let mut clone = Volume::clone_of(&store, &mut origin, snap, clone_config(9)).unwrap();
+  clone.enable_writable_dax(); // a clone does not inherit the opt-in; its own owner enables it (L0, per-volume).
 
   let clone_root = clone.root_inode(&store).unwrap();
   let cf = clone.lookup_no(&store, clone_root, "f").unwrap().inode;

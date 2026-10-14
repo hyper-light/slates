@@ -377,6 +377,14 @@ pub struct Volume {
   /// Whether the volume's content is locked in RAM (§4.2 D-12, a strict `--locked` volume): every block it allocates
   /// is locked, and only its blocks, so a plain volume beside it is never pinned by its neighbour's policy.
   pub(crate) locked: bool,
+  /// Whether this volume has **opted in to writable DAX** (§4.6 multi-tenancy L0, the Rowhammer threat model's
+  /// outermost gate). Read-only DAX — immutable, shared content a guest reaches but cannot hammer into a neighbour —
+  /// is the default and needs no opt-in; a *writable* mapping hands a guest a private page it can hammer, so
+  /// [`Volume::dax_map_write`] refuses `NotPermitted` unless the owner has enabled it here. Keeping the dangerous mode
+  /// off by default keeps it rare, so the moving-target and zone defences cover few blocks — bounded cost at agentic
+  /// scale (the quarantine-exhaustion worry is answered by there being little to quarantine). Default `false`; a clone
+  /// does not inherit it (the capability is each owner's own deliberate choice).
+  pub(crate) writable_dax: bool,
   /// The inodes written since an idle sweep, each by the sweep tick it was last written in (A-99): a sweep seals the
   /// open extent of each one not written since the sweep before, so a file smaller than a chunk is not left in
   /// plaintext while idle. Bounded by the volume's inodes; empty for a volume that does not seal.
@@ -632,6 +640,7 @@ impl Volume {
       journal: OpLog::new(config.journal_bytes),
       seal_key: None,
       locked: false,
+      writable_dax: false,
       written: BTreeMap::new(),
       sweep_tick: 0,
       idle_pending: std::collections::BTreeSet::new(),
@@ -705,6 +714,7 @@ impl Volume {
       journal: OpLog::new(config.journal_bytes),
       seal_key: None,
       locked: false,
+      writable_dax: false,
       written: BTreeMap::new(),
       sweep_tick: 0,
       idle_pending: std::collections::BTreeSet::new(),
@@ -798,6 +808,7 @@ impl Volume {
       journal: OpLog::new(journal_bytes),
       seal_key: None,
       locked: false,
+      writable_dax: false,
       written: BTreeMap::new(),
       sweep_tick: 0,
       idle_pending: std::collections::BTreeSet::new(),
@@ -1147,6 +1158,20 @@ impl Volume {
   /// Whether the volume's content is locked in RAM.
   pub fn locked(&self) -> bool {
     self.locked
+  }
+
+  /// Opts this volume in to **writable DAX** (§4.6 multi-tenancy L0): from here a writable mapping
+  /// ([`Volume::dax_map_write`]) is allowed; before it, every writable map is refused `NotPermitted` and only
+  /// read-only DAX is served. The owner sets it deliberately — writable DAX is the one mode a guest can Rowhammer, so
+  /// it is off until explicitly asked for. Idempotent.
+  pub fn enable_writable_dax(&mut self) {
+    self.writable_dax = true;
+  }
+
+  /// Whether writable DAX is opted in on this volume ([`Volume::enable_writable_dax`]); read-only DAX needs no opt-in.
+  #[must_use]
+  pub fn writable_dax_enabled(&self) -> bool {
+    self.writable_dax
   }
 
   /// The idle sweep (A-99) in one call: [`Volume::age_writes`], then [`Volume::seal_pending`] within `budget_bytes`.

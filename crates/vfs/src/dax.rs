@@ -195,6 +195,13 @@ impl Volume {
   /// VFS write boundary (where copy-on-write, quota and journal live); the now-private block is **pinned**, its tail
   /// past the file scrubbed, and the mapping recorded. Refused as [`Volume::dax_map_read`] is.
   pub fn dax_map_write(&mut self, store: &mut Store, no: InodeNo) -> Result<Mapping, VfsError> {
+    // L0 (§4.6 multi-tenancy, the Rowhammer gate's outermost layer): a *writable* mapping is the only DAX mode a guest
+    // can hammer, so it is refused unless the volume's owner has opted in ([`Volume::enable_writable_dax`]). Read-only
+    // DAX (immutable shared content) is the default and never reaches here. Checked before the copy-up below, so a
+    // refused writable map mutates nothing.
+    if !self.writable_dax {
+      return Err(VfsError::NotPermitted);
+    }
     // Defence in depth: a writable mapping, like a read mapping, is of a namespace object only — never an
     // attribute inode (`Volume::dax_map_read`).
     self.namespace_inode(&*store, no)?;
