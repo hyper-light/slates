@@ -1458,6 +1458,15 @@ impl Bridge for VolumeBridge<'_> {
     // The DAX core gates an attribute inode through `namespace_inode`; the raw number is otherwise this volume's
     // (the transport routed the request to this bridge by the handle's volume).
     let no = InodeNo(object.inode);
+    // A directory is mapped as a flat read-only snapshot of its entries (metadata DAX, READDIR) — a guest reads the
+    // directory through its own page table with no READDIR round-trip. A writable directory map is nonsensical
+    // (dirents are not written through DAX) and refused.
+    if self.volume.kind(self.store, no)? == Kind::Dir {
+      if writable {
+        return Err(VfsError::NotPermitted);
+      }
+      return self.volume.dax_map_dir(self.store, no);
+    }
     if writable {
       self.volume.dax_map_write(self.store, no)
     } else {

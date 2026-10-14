@@ -1781,3 +1781,72 @@ fn hostile_dax_requests_are_refused_and_establish_no_window() {
   assert_eq!(device.dax_window_count(), 1, "exactly the one valid window is live");
   drop(cache);
 }
+
+/// The names in a flat directory snapshot (`Volume::dax_map_dir`'s layout): a u32 count, then per entry a u64 inode,
+/// a kind byte, a u8 name length, and the name's bytes.
+#[cfg(unix)]
+fn dir_snapshot_names(raw: &[u8]) -> Vec<String> {
+  let mut names = Vec::new();
+  let count = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
+  let mut off = 4usize;
+  for _ in 0..count {
+    let name_len = usize::from(raw[off + 9]);
+    names.push(String::from_utf8_lossy(&raw[off + 10..off + 10 + name_len]).into_owned());
+    off += 10 + name_len;
+  }
+  names
+}
+
+/// §4.6 metadata DAX through the device (READDIR). Do: create three named files in the root, offer a cache window,
+/// serve FUSE_INIT, then a guest FUSE_SETUPMAPPING of the ROOT **directory** read-only; read the window as a guest
+/// would, then REMOVEMAPPING. Expect: the window is the directory's entries as a flat snapshot (count + records),
+/// so a guest lists the directory through its own page table with no READDIR round-trip; the teardown frees the
+/// throwaway snapshot block. No VMM, no KVM — a simulated guest, as the data-path DAX test is.
+#[cfg(unix)]
+#[test]
+fn a_guest_setupmapping_of_a_directory_maps_its_entries() {
+  use slates_mem::{SharedObject, Words};
+  let page = rustix::param::page_size().max(1);
+  let mut store = dax_shared_store(page, "dirmap");
+  let mut vol = volume(&mut store);
+  let root = vol.root_inode(&store).unwrap();
+  let names = ["alpha", "beta", "gamma"];
+  for name in names {
+    vol.create_file_no(&mut store, root, name, 0o644).unwrap();
+  }
+  let root_no = root.0;
+
+  let (mut device, mut driver) = device_and_driver();
+  let cache =
+    SharedObject::create(&format!("sl-daxdir-{}", std::process::id()), page * 4, Words::new()).unwrap();
+  device.install_dax_window(Some(
+    slates_bridge_virtiofs::dax::DaxCacheRegion::new(cache.as_fd(), (page * 4) as u64).unwrap(),
+  ));
+  let cx = context();
+  let mut bridge = VolumeBridge::new(vid(), &mut vol, &mut store);
+  dax_exchange(&mut device, &mut driver, &mut bridge, &cx, (Opcode::Init, 1, ROOT), &dax_init_body());
+
+  // SETUPMAPPING the root directory, read-only: the device maps its entries snapshot into the window.
+  let reply = dax_exchange(
+    &mut device, &mut driver, &mut bridge, &cx,
+    (Opcode::SetupMapping, 2, root_no), &dax_setup_body(0, page as u64, false, 0),
+  );
+  assert_eq!(reply_error(&reply), 0, "a directory SETUPMAPPING maps its entries");
+  assert_eq!(device.dax_window_count(), 1, "one live directory window");
+
+  let raw = device.dax_window_bytes(0, page as u64).unwrap();
+  let got = dir_snapshot_names(&raw);
+  for name in names {
+    assert!(got.iter().any(|g| g == name), "entry {name} readable from the directory window: {got:?}");
+  }
+
+  let mut remove = Vec::new();
+  remove.extend_from_slice(&1u32.to_le_bytes());
+  remove.extend_from_slice(&0u64.to_le_bytes());
+  remove.extend_from_slice(&(page as u64).to_le_bytes());
+  let removed =
+    dax_exchange(&mut device, &mut driver, &mut bridge, &cx, (Opcode::RemoveMapping, 3, root_no), &remove);
+  assert_eq!(reply_error(&removed), 0, "REMOVEMAPPING tears the directory window down");
+  assert_eq!(device.dax_window_count(), 0, "the directory window was torn down");
+  drop(cache);
+}
