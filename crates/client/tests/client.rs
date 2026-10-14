@@ -1020,7 +1020,6 @@ fn status_across_a_slow_restart(
   let short = Deadlines {
     reply_ns: short_reply_ns(),
     reconnect_ns: reconnect_budget_ns(),
-    ..deadlines()
   };
   let mut client = Client::connect(&instance, short).unwrap();
   first.stop();
