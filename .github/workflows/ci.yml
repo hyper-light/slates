@@ -65,6 +65,13 @@ jobs:
           # only with a failing test, so a takeover that never completes says which daemon stopped advancing (fleet
           # tests failed on 4 of 8 runs on 2026-10-06 with no evidence beyond a timeout).
           SLATES_FLEET_TRACE: "1"
+          # The hedge test (a_slow_first_round_candidate_is_hedged_after_the_measured_p95) holds a candidate
+          # down while the hedge places the second seal, and asserts the seal placed before the hold ends. The
+          # hedge fires on the measured put p95 (tens of ms); the placement-and-observation path is ~360 ms
+          # unloaded but inflates with runner load (a 180x-overloaded runner once took 3.003 s, racing the
+          # default 3 s window). Widen the window on CI so a loaded shared runner does not false-fail; a normal
+          # local run keeps the prompt 3 s default. The hedge behaviour is unchanged (crates/server/tests/fleet.rs).
+          SLATES_TEST_HEDGE_STARVATION_SECS: "20"
         run: cargo test --workspace
       # The vendored AWS-LC crates' own suites, each against the other's vendored copy (vendor/UPSTREAM.md).
       - name: The vendored crates' suites

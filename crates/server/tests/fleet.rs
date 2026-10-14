@@ -8228,7 +8228,21 @@ fn a_sealed_snapshots_content_replicates_to_the_holder_and_places() {
 /// the SWIM starvation test uses: far past any measured put p95 on loopback (sub-millisecond to tens of
 /// milliseconds), so a hedge that fires on the measured p95 places the seal through the third candidate long
 /// before the hold ends, while a first round that waits out the hold itself does not.
-const HEDGE_STARVATION_NS: u64 = 3 * LIVENESS_BUDGET_NS;
+/// Shape: how long the hedge test holds the first-round candidate's control shard down (nanoseconds) — the
+/// window the hedge must place the second seal within, which proves the hedge (not the candidate recovering)
+/// carried it. Default three liveness budgets: far past the measured put p95 (sub-ms to tens of ms) and the
+/// unloaded placement-and-observation path (measured ~360 ms here, ~18x the p95), so a normal run stays prompt.
+/// A heavily loaded or shared CI runner inflates that whole path — a 180x-overloaded runner once took 3.003 s,
+/// racing the fixed 3 s window and false-failing — so an exceptionally slow environment widens the window
+/// through `SLATES_TEST_HEDGE_STARVATION_SECS`. The hedge's behaviour (it fires on the measured p95) is
+/// unchanged; only the observation window the test allows it grows.
+static HEDGE_STARVATION_NS: std::sync::LazyLock<u64> = std::sync::LazyLock::new(|| {
+  std::env::var("SLATES_TEST_HEDGE_STARVATION_SECS")
+    .ok()
+    .and_then(|secs| secs.parse::<u64>().ok())
+    .map(|secs| secs.saturating_mul(1_000_000_000))
+    .unwrap_or(3 * LIVENESS_BUDGET_NS)
+});
 
 /// The owner's two remote content candidates, read in the exact order used by its
 /// owner shard, including committed failure domains. Return indexes into `hosts`:
@@ -8296,7 +8310,7 @@ fn a_slow_first_round_candidate_is_hedged_after_the_measured_p95() {
   // Hold the first-round candidate's control shard, then seal again: the second put cannot be answered
   // by it, so the hedge must carry the seal to the other candidate on the measured p95.
   write_hello_over_nfs(&daemons[0], "hedged");
-  let hold = daemons[first_index].starve_control_shard(HEDGE_STARVATION_NS);
+  let hold = daemons[first_index].starve_control_shard(*HEDGE_STARVATION_NS);
   let started = Instant::now();
   let ReplyBody::Snapshotted { id: second, .. } =
     client.call(&RequestBody::Snapshot { volume: id })
@@ -8349,7 +8363,8 @@ fn assert_hedged_through_the_measured_p95(outcome: &HedgeOutcome) {
     held_ns,
     after,
   } = outcome;
-  let held_still_starved = *placed_after < Duration::from_nanos(HEDGE_STARVATION_NS);
+  let hold_ns = *HEDGE_STARVATION_NS;
+  let held_still_starved = *placed_after < Duration::from_nanos(hold_ns);
   assert!(
     measured
       .as_ref()
@@ -8359,17 +8374,17 @@ fn assert_hedged_through_the_measured_p95(outcome: &HedgeOutcome) {
   assert!(
     held_ns
       .as_ref()
-      .is_ok_and(|&held| held >= HEDGE_STARVATION_NS),
+      .is_ok_and(|&held| held >= hold_ns),
     "the first-round candidate's control shard was held for the whole span ({held_ns:?} ns)"
   );
   eprintln!(
     "hedge: measured before the hold {measured:?} (readings, p95 ns); second seal placed after \
-     {placed_after:?} against a {HEDGE_STARVATION_NS} ns hold; readings after {after:?}"
+     {placed_after:?} against a {hold_ns} ns hold; readings after {after:?}"
   );
   assert!(
     *placed && held_still_starved,
     "the second seal placed through the hedge while the first-round candidate was still held \
-     (placed={placed} after {placed_after:?}, hold {HEDGE_STARVATION_NS} ns)"
+     (placed={placed} after {placed_after:?}, hold {hold_ns} ns)"
   );
   assert!(
     hedge_holds,
