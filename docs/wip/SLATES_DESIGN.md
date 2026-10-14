@@ -2673,6 +2673,33 @@ until mapping isolation, pinning and teardown have been established for that VMM
 > the version a mapping pins riding the fenced retention protocol) is recorded in `GAPS.md` and is the next step. DAX
 > stays unadvertised and a DAX request is refused `AttachmentUnsupported` until both are done.
 
+> **DAX multi-tenancy threat model (2026-10-14).** With the strict per-volume spatial separation above, a guest
+> reaches only its own file's pinned, per-volume arena block (the inode number carries the volume prefix, distinct
+> and never reused across volumes), so cross-tenant *memory* leakage — the shared-host-page-cache hazard of naive
+> virtio-fs DAX — is closed by construction, not by a per-access check a hardware guest bypasses. The residuals,
+> once spatial isolation holds, are low-level execution and hardware:
+> 1. **Asynchronous revocation / TLB race.** When a block is reclaimed (write, truncate, snapshot, destroy,
+>    takeover) the host must invalidate the guest's MMU page tables and flush every physical core's TLB *before* the
+>    block returns to the pool or a new volume — a race there is the only way a neighbour could catch dirty state.
+>    **Addressed:** the pin is held across the unmap. `Store::dax_revoke_pending` unregisters the mapping (the
+>    hardware path goes inert, no new access authorized) but keeps the block pinned; `Store::dax_release_after_unmap`
+>    unpins only after the device confirms the VMM window unmap and the cross-core TLB flush. The daemon never unpins
+>    first (`crates/vfs/tests/dax.rs` `a_pending_revoke_keeps_the_block_pinned_until_the_unmap_is_confirmed`); the
+>    synchronous `dax_revoke` is kept only for the no-live-guest path.
+> 2. **Map/unmap-storm or page-fault DoS.** A guest cannot steal data but could try to starve the host orchestration
+>    by flooding SETUPMAPPING/REMOVEMAPPING or faulting the DAX BAR. **Addressed, bounded at three levels:** the
+>    mapping registry's cap is the shard's chunk budget (`DaxRegistry::new(max_chunks)`), a map past it refused
+>    `NoSpace` and counted (`a_map_storm_is_refused_at_the_registry_bound`); the §4.9 credit window bounds in-flight
+>    requests and bytes (`crates/bridge-virtiofs/src/credit.rs`); and the device serve loop is cooperative per pass,
+>    so one guest's storm cannot starve another guest or the host.
+> 3. **Rowhammer / hardware co-location.** Two untrusted tenants with write access to physically adjacent DRAM rows
+>    face bit-flip risk at the silicon layer, independent of software isolation — slates cannot prevent this in
+>    software, and does not claim to. **Posture (residual, at the right layer):** the mitigation is host memory
+>    policy — the host/VMM not co-locating untrusted tenants on adjacent rows (guard rows), ECC, and DDR4/5 Target
+>    Row Refresh — together with slates' own levers: a writable DAX mapping is opt-in (it copies up first), and a
+>    read-only mapping (the common case, and the only one immutable-shared content allows) cannot hammer, so slates
+>    serves read-only DAX wherever write access is not needed. Recorded as a known hardware-layer residual.
+
 > **Status (virtio-fs, 2026-09-13).** The owned FUSE-over-virtio device exists
 > (`crates/bridge-virtiofs`) and the daemon serves it on the volume's owning shard
 > (`crates/server/src/virtiofs.rs`): the split virtqueue is walked sans-io over a bounded
