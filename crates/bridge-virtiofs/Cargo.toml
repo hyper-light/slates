@@ -20,10 +20,13 @@ slates-rt = { workspace = true }
 slates-mem = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
-# Descriptor and memory-object syscalls, never a host path (R1): the DAX cache region's `mmap`/`munmap`
+# Descriptor and memory-object syscalls, never a host path (R1): the DAX cache region's `MAP_FIXED` overlays
 # (`src/dax.rs`, every Unix host — exercised on macOS over an `shm` object), and on Linux the vhost-user back end's
 # socket peer credentials, `SCM_RIGHTS` descriptors, the kick/call eventfds and the epoll doorbell.
 rustix = { workspace = true }
+# The DAX cache region's reservation is an `MmapMut` (Send, provenance-correct, safe slice reads) the device overlays
+# with `MAP_FIXED`; holding the mapping as `MmapMut` keeps `AdmittedDevice` `Send` without an `unsafe impl` (§4.6).
+memmap2 = { workspace = true }
 
 [dev-dependencies]
 

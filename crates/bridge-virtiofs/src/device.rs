@@ -465,12 +465,10 @@ impl Device {
   #[cfg(unix)]
   #[must_use]
   pub fn dax_window_bytes(&self, moffset: u64, len: u64) -> Option<Vec<u8>> {
-    // SAFETY: the caller reads a range a prior SETUPMAPPING established (readable); `window_bytes` bounds it to the
-    // window, and this copies the bytes out, forming no lasting borrow.
     self
       .dax_cache
       .as_ref()
-      .and_then(|cache| unsafe { cache.window_bytes(moffset, len) }.map(<[u8]>::to_vec))
+      .and_then(|cache| cache.window_bytes(moffset, len).map(<[u8]>::to_vec))
   }
 
   /// The live DAX window count (non-vacuity for tests). Unix only.

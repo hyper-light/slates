@@ -15,6 +15,7 @@
 
 use std::os::fd::BorrowedFd;
 
+use memmap2::{MmapMut, MmapOptions};
 use rustix::mm::{MapFlags, ProtFlags};
 
 /// Why a DAX cache-region operation was refused (a typed refusal, never a panic).
@@ -27,13 +28,12 @@ pub enum DaxCacheError {
 }
 
 /// A VMM's DAX cache region, reserved whole and overlaid per mapping. One per guest device; owned by the device, so it
-/// is not behind the guest-memory borrow (the SETUPMAPPING path needs both at once). Not `Send`/`Sync` (a raw window
-/// pointer into this process's address space, used only on the owning shard's thread).
+/// is not behind the guest-memory borrow (the SETUPMAPPING path needs both at once). The reservation is an `MmapMut`,
+/// so the type is `Send` (it holds no raw pointer) and its window reads are safe slices; the device overlays sub-ranges
+/// with `MAP_FIXED`, and dropping the `MmapMut` unmaps the whole window, overlays included.
 pub struct DaxCacheRegion {
-  /// The window's base in this process's address space (the reservation).
-  base: *mut core::ffi::c_void,
-  /// The window length in bytes (a whole number of pages).
-  len: usize,
+  /// The reservation of the VMM's cache object: an owned shared mapping the device overlays with `MAP_FIXED`.
+  window: MmapMut,
   /// The page granule a map offset and length must be a multiple of.
   page: usize,
   /// Mappings established and torn down so far — non-vacuity counters a test asserts moved.
@@ -44,7 +44,7 @@ pub struct DaxCacheRegion {
 impl std::fmt::Debug for DaxCacheRegion {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
     f.debug_struct("DaxCacheRegion")
-      .field("len", &self.len)
+      .field("len", &self.window.len())
       .field("mapped", &self.mapped)
       .field("unmapped", &self.unmapped)
       .finish()
@@ -52,53 +52,52 @@ impl std::fmt::Debug for DaxCacheRegion {
 }
 
 impl DaxCacheRegion {
-  /// Reserves the whole cache window `fd` presents, `PROT_NONE` (inaccessible until a block is mapped in). `len` must
-  /// be a non-zero whole number of pages. The guest sees the same object; the device overlays block pages with
-  /// [`DaxCacheRegion::map`] and restores the reservation with [`DaxCacheRegion::unmap`].
+  /// Reserves the whole cache window `fd` presents as a shared mapping. `len` must be a non-zero whole number of pages.
+  /// The guest sees the same object; the device overlays block pages with [`DaxCacheRegion::map`] and restores the
+  /// reservation with [`DaxCacheRegion::unmap`]. Dropping the region unmaps the whole window.
   pub fn new(fd: BorrowedFd<'_>, len: u64) -> Result<Self, DaxCacheError> {
     let page = rustix::param::page_size().max(1);
     let len = usize::try_from(len).map_err(|_| DaxCacheError::BadRange)?;
     if len == 0 || !len.is_multiple_of(page) {
       return Err(DaxCacheError::BadRange);
     }
-    // SAFETY: a fresh reservation at a kernel-chosen address (`ptr` null), of the VMM's cache object `fd` (valid for
-    // this call). `PROT_NONE` so nothing is reachable until a block is mapped in. We own the returned range
-    // `[base, base+len)` and release it in `Drop`.
-    let base = unsafe {
-      rustix::mm::mmap(
-        core::ptr::null_mut(),
-        len,
-        ProtFlags::empty(),
-        MapFlags::SHARED,
-        fd,
-        0,
-      )
+    // SAFETY: a shared mapping of the VMM's cache object `fd` (valid for this call; `map_mut` maps it and does not take
+    // ownership of the descriptor). The device is the window's only user, on its shard thread; the `MAP_FIXED` overlays
+    // below stay within `[0, len)`, and `MmapMut` owns and unmaps the whole range (overlays included) on drop.
+    let window = unsafe {
+      MmapOptions::new()
+        .len(len)
+        .map_mut(std::os::fd::AsRawFd::as_raw_fd(&fd))
     }
-    .map_err(|e| DaxCacheError::Host(e.raw_os_error()))?;
+    .map_err(|e| DaxCacheError::Host(e.raw_os_error().unwrap_or(0)))?;
     Ok(DaxCacheRegion {
-      base,
-      len,
+      window,
       page,
       mapped: 0,
       unmapped: 0,
     })
   }
 
-  /// The host address of a validated `[moffset, moffset+len)` sub-range of the window, with both bounds page-aligned
-  /// and the range inside the window — else [`DaxCacheError::BadRange`].
-  fn range_ptr(&self, moffset: u64, len: u64) -> Result<(*mut core::ffi::c_void, usize), DaxCacheError> {
+  /// The host address of a validated `[moffset, moffset+len)` sub-range of the window (for a `MAP_FIXED` overlay), with
+  /// both bounds page-aligned and the range inside the window — else [`DaxCacheError::BadRange`]. The address is formed
+  /// by `wrapping_add` (not dereferenced here; it is a syscall address argument) and stays within the reservation.
+  fn fixed_addr(&self, moffset: u64, len: u64) -> Result<(*mut core::ffi::c_void, usize), DaxCacheError> {
     let moffset = usize::try_from(moffset).map_err(|_| DaxCacheError::BadRange)?;
     let len = usize::try_from(len).map_err(|_| DaxCacheError::BadRange)?;
     if len == 0 || !moffset.is_multiple_of(self.page) || !len.is_multiple_of(self.page) {
       return Err(DaxCacheError::BadRange);
     }
     let end = moffset.checked_add(len).ok_or(DaxCacheError::BadRange)?;
-    if end > self.len {
+    if end > self.window.len() {
       return Err(DaxCacheError::BadRange);
     }
-    // SAFETY: `moffset <= self.len` (checked above), so `base + moffset` is within the owned reservation.
-    let ptr = unsafe { self.base.cast::<u8>().add(moffset) }.cast::<core::ffi::c_void>();
-    Ok((ptr, len))
+    let addr = self
+      .window
+      .as_ptr()
+      .wrapping_add(moffset)
+      .cast::<core::ffi::c_void>()
+      .cast_mut();
+    Ok((addr, len))
   }
 
   /// Maps `len` bytes at `foffset` of block descriptor `fd` into the window at `moffset`, read-only or writable per
@@ -111,93 +110,68 @@ impl DaxCacheRegion {
     foffset: u64,
     writable: bool,
   ) -> Result<(), DaxCacheError> {
-    let (ptr, len) = self.range_ptr(moffset, len)?;
+    let (addr, len) = self.fixed_addr(moffset, len)?;
     let prot = if writable {
       ProtFlags::READ | ProtFlags::WRITE
     } else {
       ProtFlags::READ
     };
-    // SAFETY: `ptr` is a page-aligned sub-range strictly within the owned reservation (`range_ptr`); `MAP_FIXED`
-    // replaces only that sub-range (never memory we do not own); `fd` is the pinned content block's object, valid and
-    // stable for this call and while the mapping lives.
+    // SAFETY: `addr` is a page-aligned sub-range strictly within the window reservation (`fixed_addr`); `MAP_FIXED`
+    // replaces only that sub-range (never memory outside the reservation); `fd` is the pinned content block's object,
+    // valid and stable for this call and while the mapping lives. The reservation's `MmapMut` still owns the range.
     unsafe {
-      rustix::mm::mmap(ptr, len, prot, MapFlags::SHARED | MapFlags::FIXED, fd, foffset)
+      rustix::mm::mmap(addr, len, prot, MapFlags::SHARED | MapFlags::FIXED, fd, foffset)
     }
     .map_err(|e| DaxCacheError::Host(e.raw_os_error()))?;
     self.mapped = self.mapped.saturating_add(1);
     Ok(())
   }
 
-  /// Restores `[moffset, moffset+len)` to the inert `PROT_NONE` reservation (FUSE_REMOVEMAPPING, and the teardown half
-  /// of a revoke): a fresh anonymous `MAP_FIXED` over the sub-range, so the block's descriptor is no longer reachable
-  /// through the window and a stale guest access faults. The caller unpins the block only after this returns.
+  /// Restores `[moffset, moffset+len)` to an inert, inaccessible mapping (FUSE_REMOVEMAPPING, and the teardown half of a
+  /// revoke): a fresh anonymous `MAP_FIXED` over the sub-range, so the block's descriptor is no longer reachable through
+  /// the window and a stale guest access faults. The caller unpins the block only after this returns.
   pub fn unmap(&mut self, moffset: u64, len: u64) -> Result<(), DaxCacheError> {
-    let (ptr, len) = self.range_ptr(moffset, len)?;
-    // SAFETY: as `map` — a page-aligned sub-range within the owned reservation; `MAP_FIXED | ANON` replaces it with a
-    // private, inaccessible mapping, detaching the block's descriptor from the window.
+    let (addr, len) = self.fixed_addr(moffset, len)?;
+    // SAFETY: as `map` — a page-aligned sub-range within the reservation; `MAP_FIXED | ANON` replaces it with a
+    // private, inaccessible mapping, detaching the block's descriptor from the window. The reservation still owns it.
     unsafe {
-      rustix::mm::mmap_anonymous(
-        ptr,
-        len,
-        ProtFlags::empty(),
-        MapFlags::PRIVATE | MapFlags::FIXED,
-      )
+      rustix::mm::mmap_anonymous(addr, len, ProtFlags::empty(), MapFlags::PRIVATE | MapFlags::FIXED)
     }
     .map_err(|e| DaxCacheError::Host(e.raw_os_error()))?;
     self.unmapped = self.unmapped.saturating_add(1);
     Ok(())
   }
 
-  /// The host address of a validated `[moffset, moffset+len)` byte sub-range of the window — bounds only, no page
-  /// alignment, since a guest reads and writes arbitrary bytes within pages it has mapped. `None` if the range
-  /// overflows or runs past the window.
-  fn byte_ptr(&self, moffset: u64, len: u64) -> Option<(*mut u8, usize)> {
+  /// The window bytes at `[moffset, moffset+len)` — how a simulated guest reads its DAX window (a real guest's CPU
+  /// reaches the same pages directly). Sub-page ranges are allowed. `None` for an out-of-window range. A safe slice of
+  /// the owned mapping (the `MAP_FIXED` overlays stay within it), so no `unsafe` and no fault for an in-window range.
+  #[must_use]
+  pub fn window_bytes(&self, moffset: u64, len: u64) -> Option<&[u8]> {
     let moffset = usize::try_from(moffset).ok()?;
     let len = usize::try_from(len).ok()?;
     let end = moffset.checked_add(len)?;
-    if end > self.len {
-      return None;
-    }
-    // SAFETY: `moffset <= self.len`, so `base + moffset` is within the owned reservation.
-    Some((unsafe { self.base.cast::<u8>().add(moffset) }, len))
-  }
-
-  /// The window bytes at `[moffset, moffset+len)` — how a simulated guest reads its DAX window (a real guest's CPU
-  /// reaches the same pages directly). Sub-page ranges are allowed; the range must lie within a currently mapped
-  /// region. `None` for an out-of-window range.
-  ///
-  /// # Safety
-  ///
-  /// The caller guarantees `[moffset, moffset+len)` is currently mapped by [`DaxCacheRegion::map`] (readable), not a
-  /// `PROT_NONE` hole; reading a hole faults. The returned slice borrows the window for `&self`.
-  pub unsafe fn window_bytes(&self, moffset: u64, len: u64) -> Option<&[u8]> {
-    let (ptr, len) = self.byte_ptr(moffset, len)?;
-    // SAFETY: `byte_ptr` bounded the range to the window; the caller guarantees it is mapped readable, so the bytes
-    // are initialised and the slice does not outlive `&self`.
-    Some(unsafe { core::slice::from_raw_parts(ptr, len) })
+    self.window.get(moffset..end)
   }
 
   /// The window bytes at `[moffset, moffset+len)`, writable — how a simulated guest writes its DAX window.
-  ///
-  /// # Safety
-  ///
-  /// As [`DaxCacheRegion::window_bytes`], and the range must be mapped **writable**, or the write faults.
-  pub unsafe fn window_bytes_mut(&mut self, moffset: u64, len: u64) -> Option<&mut [u8]> {
-    let (ptr, len) = self.byte_ptr(moffset, len)?;
-    // SAFETY: as `window_bytes`, for a writable mapping; `&mut self` makes the mutable borrow exclusive.
-    Some(unsafe { core::slice::from_raw_parts_mut(ptr, len) })
+  #[must_use]
+  pub fn window_bytes_mut(&mut self, moffset: u64, len: u64) -> Option<&mut [u8]> {
+    let moffset = usize::try_from(moffset).ok()?;
+    let len = usize::try_from(len).ok()?;
+    let end = moffset.checked_add(len)?;
+    self.window.get_mut(moffset..end)
   }
 
   /// The window length in bytes.
   #[must_use]
   pub fn len(&self) -> usize {
-    self.len
+    self.window.len()
   }
 
   /// Whether the window is empty (never, for a constructed region).
   #[must_use]
   pub fn is_empty(&self) -> bool {
-    self.len == 0
+    self.window.is_empty()
   }
 
   /// Mappings established so far (non-vacuity).
@@ -210,14 +184,6 @@ impl DaxCacheRegion {
   #[must_use]
   pub fn unmapped(&self) -> u64 {
     self.unmapped
-  }
-}
-
-impl Drop for DaxCacheRegion {
-  fn drop(&mut self) {
-    // SAFETY: we own `[base, base+len)` (our reservation and every `MAP_FIXED` overlay within it); the device drops
-    // the region only after its guest is gone, so no borrow of the window outlives this unmap.
-    let _ = unsafe { rustix::mm::munmap(self.base, self.len) };
   }
 }
 
@@ -259,13 +225,12 @@ mod tests {
       .unwrap();
 
     // The window shows the block's bytes (shared mapping of the same object).
-    // SAFETY: the range was just mapped readable.
-    let seen = unsafe { region.window_bytes(page as u64, 64) }.unwrap();
+    let seen = region.window_bytes(page as u64, 64).unwrap();
     assert_eq!(seen, &[0x5A; 64], "the window reaches the block's bytes");
 
     // A write through the window reaches the block (the guest's writable DAX).
-    // SAFETY: the range is mapped writable.
-    unsafe { region.window_bytes_mut(page as u64, 4) }
+    region
+      .window_bytes_mut(page as u64, 4)
       .unwrap()
       .copy_from_slice(b"HERE");
     let mut back = [0u8; 4];

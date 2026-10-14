@@ -293,18 +293,17 @@ slates-bridge-fskit = 9
 # descriptor. All are Win32/WinFsp FFI without a safe wrapper; there is no `unsafe impl Send`/`Sync`
 # (the volume is owned by one thread and shared only over channels, R2/D-7).
 slates-bridge-winfsp = 86
-# slates-bridge-virtiofs (10): the virtqueue machine and the FUSE-over-virtio device read and write
+# slates-bridge-virtiofs (3): the virtqueue machine and the FUSE-over-virtio device read and write
 # guest memory only through the `GuestMemory` seam — bounded, checked copies into byte arrays, fields
 # decoded in order, never a cast or a pointer into the guest (the FUSE codec's discipline). The
 # simulated seams are `Vec<u8>` and `Cell`/`RefCell`; the doorbell descriptors are `rustix` reads and
-# writes on owned descriptors. The 10 sites are all in `src/dax.rs`, the DAX cache region (§4.6): the
-# window's reservation `mmap` and its `Drop` `munmap`; each `MAP_FIXED` overlay of a pinned content
-# block's descriptor (`map`) and the anonymous `MAP_FIXED` that restores the inert reservation
-# (`unmap`); the `base + moffset` pointer arithmetic for a bounds-checked sub-range (`range_ptr`,
-# `byte_ptr`); and the two `from_raw_parts`/`from_raw_parts_mut` a simulated guest reads/writes its
-# window through. Each `MAP_FIXED` stays strictly within the owned reservation, and the block it maps is
-# pinned by the gate, so its pages are stable — the invariants on each `// SAFETY:` line.
-slates-bridge-virtiofs = 10
+# writes on owned descriptors. The 3 sites are all in `src/dax.rs`, the DAX cache region (§4.6): the
+# window's reservation `map_mut` (held as an `MmapMut`, which owns and unmaps the whole range on drop,
+# so the region is `Send` and its window reads are safe slices — no raw pointer, no manual `Drop`); and
+# the two `MAP_FIXED` overlays — a pinned content block's descriptor (`map`) and the anonymous restore
+# (`unmap`). Each overlay stays strictly within the owned reservation, and the block it maps is pinned
+# by the gate, so its pages are stable — the invariants on each `// SAFETY:` line.
+slates-bridge-virtiofs = 3
 # slates-bridge-oci (1): the macOS `getfsstat(MNT_NOWAIT)` pair — the count query and the fill of a
 # buffer sized for exactly that count, plus the `set_len` to what the kernel wrote — in one block
 # (added 2026-09-14 for the OCI attachment form, §4.6 A-9): rustix has no mount-table query, and a
