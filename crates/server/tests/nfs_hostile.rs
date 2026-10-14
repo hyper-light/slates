@@ -1198,6 +1198,123 @@ fn a_cross_tenant_craft_never_reads_through_under_contention_and_churn() {
   drop(daemon);
 }
 
+/// §4.4 / §4.6 under PRESSURE (use-after-free-by-handle): a generational file handle whose inode was freed must
+/// keep MISSING even while that inode number is reused by a storm of create/delete churn. If the server resolved a
+/// handle by inode number alone, a concurrently-created file that reused the number would be served through the
+/// stale handle — reading another file's bytes. slates names every inode by a generational handle (a stale handle
+/// is a typed miss, never a dangling read). Under a spinner per core, three churn threads create and delete files
+/// over a small name set (so inode numbers are freed and reallocated rapidly) while attacker threads hammer a
+/// stale handle's READ. Expect: the stale handle NEVER returns status-0 data — it always misses, however often its
+/// inode number is reused — and never the victim's secret; the attempt count is the non-vacuity evidence.
+#[test]
+fn a_stale_handle_never_reads_a_reused_inode_under_churn() {
+  const SECRET: &[u8] = b"the victim inode's secret, never served through a stale handle after inode reuse";
+  /// How long the pressure runs — bounded so the test stays CI-safe.
+  const PRESSURE: Duration = Duration::from_secs(2);
+  let (daemon, instance) = single_shard_daemon("stale-handle-race");
+  provision(&instance, "sh");
+  let port = daemon.nfs_port().expect("the daemon is serving NFS");
+  let export = daemon.mount_capability("sh").unwrap().unwrap();
+
+  let mut setup = TcpStream::connect(("127.0.0.1", port)).unwrap();
+  let root = mount(&mut setup, &export, 1);
+  let victim = create(&mut setup, &root, "victim", 2);
+  write(&mut setup, &victim, SECRET, 3);
+  // A stale handle: create a file, take its handle, then delete it — its inode is freed and may be reused.
+  let stale = create(&mut setup, &root, "doomed", 4);
+  assert_eq!(remove_status(&mut setup, &root, b"doomed", 5), 0, "the doomed file is deleted");
+  drop(setup);
+
+  let cores = std::thread::available_parallelism().map_or(1, usize::from);
+  let stop = AtomicBool::new(false);
+  let attempts = AtomicU64::new(0);
+  let resolved = AtomicU64::new(0); // the stale handle returned status-0 (resolved to a reused inode) — a bug
+  let secret_leaks = AtomicU64::new(0); // ... and the bytes were the victim's secret
+  std::thread::scope(|scope| {
+    for _ in 0..cores {
+      scope.spawn(|| spin(&stop));
+    }
+    // Churn: create and delete files on persistent connections over a small name set, so inode NUMBERS are freed
+    // and reallocated rapidly while the stale handle is hammered.
+    for churn in 0..3u32 {
+      let (export, stop) = (&export, &stop);
+      scope.spawn(move || {
+        let Ok(mut s) = TcpStream::connect(("127.0.0.1", port)) else {
+          return;
+        };
+        let root = mount(&mut s, export, 1);
+        let mut round = 0u32;
+        while !stop.load(Ordering::Relaxed) {
+          let name = format!("c{churn}-{}", round % 16);
+          let _ = create_status(&mut s, &root, name.as_bytes(), round.wrapping_add(10));
+          let _ = remove_status(&mut s, &root, name.as_bytes(), round.wrapping_add(11));
+          round = round.wrapping_add(16);
+        }
+      });
+    }
+    // Attacker: hammer the stale handle; every read must miss. A status-0 read means it resolved to a reused inode.
+    for _ in 0..cores.max(2) {
+      let (stale, stop, attempts, resolved, secret_leaks) =
+        (&stale, &stop, &attempts, &resolved, &secret_leaks);
+      scope.spawn(move || {
+        let Ok(mut s) = TcpStream::connect(("127.0.0.1", port)) else {
+          return;
+        };
+        let _ = s.set_read_timeout(Some(Duration::from_secs(2)));
+        let mut xid = 1u32;
+        while !stop.load(Ordering::Relaxed) {
+          xid = xid.wrapping_add(1);
+          if s.write_all(&record(NFSPROC3_READ, &read_args(stale), xid)).is_err() {
+            let Ok(fresh) = TcpStream::connect(("127.0.0.1", port)) else {
+              return;
+            };
+            s = fresh;
+            let _ = s.set_read_timeout(Some(Duration::from_secs(2)));
+            continue;
+          }
+          match read_reply(&mut s) {
+            Some((0, data)) => {
+              resolved.fetch_add(1, Ordering::Relaxed);
+              if data.windows(SECRET.len()).any(|w| w == SECRET) {
+                secret_leaks.fetch_add(1, Ordering::Relaxed);
+              }
+            }
+            Some(_) => {}
+            None => {
+              let Ok(fresh) = TcpStream::connect(("127.0.0.1", port)) else {
+                return;
+              };
+              s = fresh;
+              let _ = s.set_read_timeout(Some(Duration::from_secs(2)));
+            }
+          }
+          attempts.fetch_add(1, Ordering::Relaxed);
+        }
+      });
+    }
+    #[allow(clippy::disallowed_methods)]
+    std::thread::sleep(PRESSURE);
+    stop.store(true, Ordering::Relaxed);
+  });
+  let total = attempts.load(Ordering::Relaxed);
+  assert!(
+    total > 1000,
+    "non-vacuity: the attackers hammered the stale handle many times ({total})"
+  );
+  assert_eq!(
+    secret_leaks.load(Ordering::Relaxed),
+    0,
+    "a stale handle never reads the victim's secret after inode reuse"
+  );
+  assert_eq!(
+    resolved.load(Ordering::Relaxed),
+    0,
+    "a stale handle always misses, even as its inode number is reused under churn"
+  );
+  eprintln!("stale-handle race: {total} stale reads under churn+contention, 0 resolved");
+  drop(daemon);
+}
+
 /// The remove family (§4.6): RMDIR already guards `.`/`..`, but the guard sits inside `if is_dir`, so REMOVE
 /// (unlink) of `.`/`..` takes the unguarded path — `bridge.lookup(".")` resolves the directory, then
 /// `bridge.unlink(parent, ".")` runs. This test drives REMOVE of `.`/`..` over a live socket and requires it to
