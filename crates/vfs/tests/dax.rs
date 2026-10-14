@@ -1073,6 +1073,50 @@ fn revoking_a_guarded_mapping_drops_the_guard() {
   assert_eq!(store.dax.guards(), 0, "the revoke dropped the guard and freed its clean copy");
 }
 
+/// §4.6 B2 + the step-5 two-phase revoke. A write or truncate of a DAX-mapped inode revokes *every* mapping of it —
+/// including a read-only guarded one — through the two-phase path (`dax_revoke_pending`, pin kept until the device
+/// confirms the unmap), not the synchronous `dax_revoke`. The guard's clean copy is a separate pinned block that the
+/// phase-one revoke must free, or it leaks (the mapped block it protected is gone). Do: guard a read-only mapping,
+/// revoke it pending, then release. Expect: phase one drops the guard and frees its clean copy; the mapped block's
+/// pin is kept until phase two; and far more guard/revoke cycles than the arena holds never exhaust it (a leaked
+/// clean copy per cycle would). Before the fix, phase one only unregistered the mapping and left the guard pinned.
+#[test]
+fn the_two_phase_revoke_drops_a_guarded_mappings_clean_copy() {
+  let mut store = store_capped_chunks(16);
+  let mut volume = volume(&mut store, 1 << 20);
+  let f = file_of(&mut store, &mut volume, "f", 0x41, DAX_PAGE);
+  let m = volume.dax_map_read(&mut store, f).unwrap();
+  let block = m.block;
+  store.dax_guard(&m).unwrap();
+  assert_eq!(store.dax.guards(), 1, "the read-only mapping is guarded");
+
+  assert!(store.dax_revoke_pending(&m), "phase one: the mapping was held");
+  assert_eq!(
+    store.dax.guards(),
+    0,
+    "phase one dropped the guard and freed its clean copy — no pinned clean block is left behind"
+  );
+  assert!(
+    store.content.arena().is_pinned(block),
+    "phase one still keeps the MAPPED block pinned (the stale-TLB hold); only the guard's clean copy was freed"
+  );
+  assert!(store.dax_release_after_unmap(&m), "phase two releases the mapped block's pin");
+
+  // No leak across cycles: the 16-chunk arena would be exhausted by a leaked clean copy (guard + mapped block + the
+  // clean copy are three blocks per cycle), but a freed clean copy lets every cycle reuse the space.
+  for cycle in 0..64 {
+    let m = volume
+      .dax_map_read(&mut store, f)
+      .unwrap_or_else(|e| panic!("map after {cycle} guarded two-phase revokes: {e:?} — a leaked clean copy exhausted the arena"));
+    store
+      .dax_guard(&m)
+      .unwrap_or_else(|e| panic!("guard on cycle {cycle}: {e:?} — a leaked clean copy exhausted the arena"));
+    assert!(store.dax_revoke_pending(&m), "phase one, cycle {cycle}");
+    assert_eq!(store.dax.guards(), 0, "guard dropped on cycle {cycle}");
+    assert!(store.dax_release_after_unmap(&m), "phase two, cycle {cycle}");
+  }
+}
+
 /// §4.6 (the DAX device-window backing seam, Unix). Do: on the scratch (anonymous-backed) test store, map a file
 /// writable and ask for its DAX backing; then revoke and ask again. Expect: `None` both times — a scratch volume's
 /// content is private process RAM with no descriptor to hand a VMM (so DAX is served only on anchor-backed volumes),

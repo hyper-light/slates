@@ -159,6 +159,13 @@ pub struct DaxRegistry {
   scrubbed: u64,
   flips: u64,
   healed: u64,
+  /// Inodes a daemon-side revoke (`Store::dax_revoke_inode`, on a write/truncate/dir-mutation of a mapped inode)
+  /// marked **revoke-pending**: their mappings left the registry but their blocks stay pinned until the device
+  /// munmaps the guest's window (§4.6 step 5, the daemon-initiated half of the two-phase revoke). The device serve
+  /// loop drains this and calls `Device::request_revoke_inode`, which munmaps then unpins — so the block is unmapped
+  /// before it is reused. Empty on any shard with no device drain pending; bounded in effect by `cap` distinct live
+  /// inodes (deduped on enqueue).
+  pending_revokes: Vec<InodeNo>,
 }
 
 impl DaxRegistry {
@@ -175,7 +182,23 @@ impl DaxRegistry {
       scrubbed: 0,
       flips: 0,
       healed: 0,
+      pending_revokes: Vec::new(),
     }
+  }
+
+  /// Marks inode `no` revoke-pending for the device to munmap (§4.6 step 5), deduped so a burst of writes to one
+  /// mapped inode enqueues it once. Bounded by `cap` distinct inodes.
+  fn enqueue_pending_revoke(&mut self, no: InodeNo) {
+    if !self.pending_revokes.contains(&no) {
+      self.pending_revokes.push(no);
+    }
+  }
+
+  /// Takes the inodes awaiting a device-side revoke and clears the queue — the device serve loop calls this each
+  /// pass and asks its device to munmap each inode's window (`Device::request_revoke_inode`). Empty when none wait.
+  #[must_use]
+  pub fn take_pending_revokes(&mut self) -> Vec<InodeNo> {
+    std::mem::take(&mut self.pending_revokes)
   }
 
   /// Counts a completed migration (§4.6 L2): the moving target's non-vacuity counter.
@@ -800,7 +823,19 @@ impl Store {
   /// device calls after the VMM acknowledges the unmap. Synchronous callers with no live guest keep using
   /// [`Store::dax_revoke`] (unregister and unpin at once); this pair is for the device path. Returns whether held.
   pub fn dax_revoke_pending(&mut self, mapping: &Mapping) -> bool {
-    self.dax.remove(mapping)
+    if !self.dax.remove(mapping) {
+      return false;
+    }
+    // The mapping is leaving the registry (inert to the hardware path), so its integrity guard (§4.6 B2) — a pinned
+    // clean copy of a read-only block, kept to heal a Rowhammer flip — has no live mapping left to protect and must
+    // not stay pinned. Drop it now, in phase one: the guard's clean copy is a *separate* block, never the guest's
+    // window, so freeing it has no stale-TLB bearing — only `mapping.block` must stay pinned until
+    // [`Store::dax_release_after_unmap`]. The synchronous [`Store::dax_revoke`] already drops the guard; without
+    // this, a read-only guarded mapping revoked through the two-phase path (a write or truncate of its inode, which
+    // revokes every mapping including the read-only ones, or a device window teardown) left its clean copy pinned
+    // until the volume was dropped — a guard-sized leak per such revoke.
+    self.drop_guard(mapping);
+    true
   }
 
   /// Phase two: unpin the block of a mapping revoked by [`Store::dax_revoke_pending`], once the VMM has confirmed
@@ -862,10 +897,21 @@ impl Store {
       .filter(|mapping| mapping.inode == no)
       .copied()
       .collect();
-    victims
+    // §4.6 step 5 (two-phase): leave each block **pinned** and enqueue the inode for the device to munmap the
+    // guest's window before unpinning, so a block the daemon is about to move/reuse is never reachable through a
+    // stale TLB. The mapping leaves the registry now (inert to the hardware-path model); the device serve loop drains
+    // `take_pending_revokes` and calls `Device::request_revoke_inode` (munmap, then release-after-unmap = unpin). If
+    // no device holds the window (a daemon-only volume, a VFS test), the mapping is still revoked (inert) and the
+    // block is reclaimed on the device's terminal teardown (`release_dax`) or when the volume is dropped. (DAX is
+    // unadvertised, so no live mapping exists in production yet — this changes only the mapped-inode path.)
+    let count = victims
       .iter()
-      .filter(|mapping| self.dax_revoke(mapping))
-      .count()
+      .filter(|mapping| self.dax_revoke_pending(mapping))
+      .count();
+    if count > 0 {
+      self.dax.enqueue_pending_revoke(no);
+    }
+    count
   }
 
   /// Revokes every **writable** mapping of the volume with `prefix` (§4.6): a snapshot or clone shares the volume's

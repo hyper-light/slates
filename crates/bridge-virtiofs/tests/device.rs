@@ -1902,3 +1902,72 @@ fn request_revoke_inode_tears_down_the_daemons_mapping() {
   assert_eq!(store.dax.revoked(), 1, "the block was unpinned through the two-phase (release after unmap)");
   drop(cache);
 }
+
+/// §4.6 step 5 — the daemon→device coherence channel, end to end through a real window. A client on the shard that
+/// writes a DAX-mapped file enqueues a step-5 revoke in the VFS; the device's next service pass drains that queue
+/// and tears the guest's now-stale window down, so the guest re-faults onto the new block. The daemon builds a
+/// *transient* `VolumeBridge` per pass over the shard's state (serve.rs), so dropping and rebuilding the bridge
+/// between the map, the mutation and the drain models exactly what the shard does between the device loop's passes.
+/// Do: map a file writable through the device, drop the bridge, write the file (a client mutation on the shard),
+/// rebuild the bridge, drain its pending revokes and feed each to `request_revoke_inode`. Expect: the write
+/// enqueued the inode and revoked its registry mapping (phase one, block still pinned); the drain yields exactly
+/// that inode; the device tears the one window down; and the block is unpinned (phase two) — a reused block is
+/// never reachable through the guest's stale TLB.
+#[cfg(unix)]
+#[test]
+fn a_write_of_a_mapped_file_enqueues_a_revoke_the_next_service_pass_drains() {
+  use slates_mem::{SharedObject, Words};
+  let page = rustix::param::page_size().max(1);
+  let mut store = dax_shared_store(page, "channel");
+  let mut vol = volume(&mut store);
+  vol.enable_writable_dax();
+  let root = vol.root_inode(&store).unwrap();
+  let no = vol.create_file_no(&mut store, root, "f", 0o644).unwrap();
+  vol.write(&mut store, no, 0, &vec![0x5A; page]).unwrap();
+  let nodeid = no.0;
+
+  let (mut device, mut driver) = device_and_driver();
+  let cache =
+    SharedObject::create(&format!("sl-daxchan-{}", std::process::id()), page * 4, Words::new()).unwrap();
+  device.install_dax_window(Some(
+    slates_bridge_virtiofs::dax::DaxCacheRegion::new(cache.as_fd(), (page * 4) as u64).unwrap(),
+  ));
+  let cx = context();
+
+  // Pass one: a transient bridge brings the connection up and maps the file writable — one live guest window.
+  {
+    let mut bridge = VolumeBridge::new(vid(), &mut vol, &mut store);
+    dax_exchange(&mut device, &mut driver, &mut bridge, &cx, (Opcode::Init, 1, ROOT), &dax_init_body());
+    let r = dax_exchange(
+      &mut device, &mut driver, &mut bridge, &cx,
+      (Opcode::SetupMapping, 2, nodeid), &dax_setup_body(0, page as u64, true, 0),
+    );
+    assert_eq!(reply_error(&r), 0, "mapped");
+  }
+  assert_eq!(device.dax_window_count(), 1, "one live window after the map pass");
+  assert_eq!(store.dax.len(), 1, "the registry holds the live mapping");
+
+  // Between passes a client on the shard writes the mapped file. The VFS write boundary revokes the inode's mappings
+  // (phase one): the registry entry goes, the block stays pinned, and the inode is enqueued for the device.
+  vol.write(&mut store, no, 0, &vec![0xA5; page]).unwrap();
+  assert_eq!(store.dax.len(), 0, "the write revoked the mapping (phase one)");
+  assert_eq!(store.dax.revoked(), 1, "phase one counted the revoke; the block is still pinned");
+
+  // Pass two: a fresh transient bridge. The daemon drains its pending revokes and tears the guest window down.
+  {
+    let mut bridge = VolumeBridge::new(vid(), &mut vol, &mut store);
+    let pending = bridge.take_pending_dax_revokes();
+    assert_eq!(pending, vec![nodeid], "the write enqueued exactly the mutated inode for the device");
+    assert_eq!(
+      device.request_revoke_inode(nodeid, &mut bridge, &cx),
+      1,
+      "the device tore down the inode's one window"
+    );
+    assert!(
+      bridge.take_pending_dax_revokes().is_empty(),
+      "the queue is drained — a later pass does no redundant work"
+    );
+  }
+  assert_eq!(device.dax_window_count(), 0, "the guest window was unmapped");
+  drop(cache);
+}

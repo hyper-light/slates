@@ -513,6 +513,15 @@ pub trait Bridge {
     Ok(false)
   }
 
+  /// The inode numbers a daemon-side revoke marked revoke-pending (§4.6 step 5): a write/truncate/dir-mutation of a
+  /// mapped inode left its mapping revoked but its block pinned, awaiting the device to munmap the guest's window.
+  /// The device serve loop drains this each pass and calls [`crate::...Device::request_revoke_inode`] for each, so a
+  /// block the daemon is about to reuse is unmapped from the guest before it is unpinned. A bridge with no DAX
+  /// registry has none.
+  fn take_pending_dax_revokes(&mut self) -> Vec<u64> {
+    Vec::new()
+  }
+
   /// The AppleDouble view of `owner_name`'s extended attributes in directory `parent` (§4.6
   /// "Extended attributes over NFSv3"): the `._owner_name` file a macOS NFSv3 client keeps
   /// attributes in, served from the volume's attribute store. Its number is the owner's derived

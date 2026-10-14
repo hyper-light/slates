@@ -487,4 +487,11 @@ impl Bridge for ScopedBridge<'_> {
     self.admit(ObjectId::new(mapping.inode.0, 0), cx)?;
     self.inner.dax_release_after_unmap(mapping, cx)
   }
+
+  fn take_pending_dax_revokes(&mut self) -> Vec<u64> {
+    // The pending-revoke queue is the shard registry's, not this scope's; a scope narrows which objects a caller may
+    // name, not which the daemon must unmap to stay coherent. Forward unchanged — the device half still munmaps only
+    // the windows it actually holds.
+    self.inner.take_pending_dax_revokes()
+  }
 }

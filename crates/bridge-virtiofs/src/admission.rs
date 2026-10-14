@@ -327,6 +327,11 @@ pub struct AdmissionCounters {
   pub passes: u64,
   /// Used-buffer notifications raised.
   pub notifications: u64,
+  /// Guest DAX windows torn down by a daemon-initiated revoke (§4.6 step 5): the non-vacuity counter for the
+  /// daemon→device coherence channel, so a silently-dead drain cannot pass for a working one. Bumped by
+  /// [`AdmittedDevice::request_revoke_inode`], whether called directly or from the per-pass drain in
+  /// [`AdmittedDevice::service`].
+  pub dax_window_revokes: u64,
 }
 
 /// A device admitted for one attachment: the seam, the device, the authority record, the credit
@@ -581,7 +586,48 @@ impl<S: VmmSeam> AdmittedDevice<S> {
       self.counters.notifications = self.counters.notifications.saturating_add(1);
     }
     self.counters.passes = self.counters.passes.saturating_add(1);
+    // §4.6 step 5: before the pass returns, honour any daemon-initiated DAX revokes the bridge enqueued since the
+    // last pass (a write, truncate or move of a mapped inode on this shard — [`slates_vfs::volume::Store`] enqueues
+    // the inode, and the bridge hands the queue over here). Draining in the same pass that served the guest's own
+    // requests tears each now-stale window down under this attachment's authority, with no separate wake channel for
+    // the in-process seam the device loop drives itself. Bounded: a mutation enqueues at most one inode, and each
+    // inode's live windows are finite. An empty queue — the common case, since DAX is unadvertised — is a no-op.
+    for no in bridge.take_pending_dax_revokes() {
+      self.tear_down_inode_windows(no, bridge, &cx);
+    }
     Ok(total)
+  }
+
+  /// Revokes every live DAX window of inode `no` at the **daemon's** request (§4.6 step 5 — the daemon-initiated
+  /// counterpart of a guest's REMOVEMAPPING), under the attachment's authority (derived from `registry` as every
+  /// service pass derives it). Returns how many windows were torn down, or the registry's refusal if the
+  /// attachment's authority is gone. A no-op (`Ok(0)`) once the device is not live: a revoked device's windows are
+  /// swept by the terminal step ([`Self::reclaim`]). [`Self::service`] calls the same teardown from its per-pass
+  /// drain; this is the explicit verb a daemon (or a test) uses to force a revoke without a service pass.
+  pub fn request_revoke_inode(
+    &mut self,
+    no: u64,
+    bridge: &mut dyn Bridge,
+    registry: &Attachments,
+  ) -> Result<usize, ServeError> {
+    if self.state != AttachmentState::Live {
+      return Ok(0);
+    }
+    let cx = registry
+      .context(self.attachment)
+      .map_err(ServeError::Authority)?;
+    Ok(self.tear_down_inode_windows(no, bridge, &cx))
+  }
+
+  /// Tears down inode `no`'s live windows on the device under the already-derived `cx` and records them in the
+  /// non-vacuity counter. The shared core of the per-pass drain and the explicit [`Self::request_revoke_inode`].
+  fn tear_down_inode_windows(&mut self, no: u64, bridge: &mut dyn Bridge, cx: &OpContext) -> usize {
+    let torn = self.device.request_revoke_inode(no, bridge, cx);
+    self.counters.dax_window_revokes = self
+      .counters
+      .dax_window_revokes
+      .saturating_add(u64::try_from(torn).unwrap_or(u64::MAX));
+    torn
   }
 
   /// Completes the chain a pass held for the owner's barrier (AUD-29-82): `captured` says whether the owner's

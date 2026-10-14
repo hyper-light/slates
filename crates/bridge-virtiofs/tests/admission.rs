@@ -653,3 +653,93 @@ fn the_terminal_step_releases_everything_whatever_the_sweep_did() {
     "a dropped device released its seam"
   );
 }
+
+/// §4.6 step 5 through the production serve path (AC-4.12): the daemon→device DAX coherence channel driven by
+/// `AdmittedDevice::service`, the entry point the shard's device loop uses. Do: admit a device offering a DAX cache
+/// window on an anchor-backed volume; drive FUSE_INIT then a writable FUSE_SETUPMAPPING of a file (one live guest
+/// window); then, between service passes, write the file (a client mutation on the shard enqueues a step-5 revoke in
+/// the VFS); then run one more service pass. Expect: the mapping is established; the write revokes it in the VFS; and
+/// the next `service` pass drains the pending revoke and tears the guest's now-stale window down — the non-vacuity
+/// counter `dax_window_revokes` moves from 0 to 1 — so a reused block is never reachable through the guest's stale
+/// TLB. The transient `VolumeBridge` per pass models the shard exactly. No VMM, no KVM.
+#[cfg(unix)]
+#[test]
+fn a_service_pass_drains_a_pending_dax_revoke_and_tears_the_window_down() {
+  use common::{dax_init_body, dax_setup_body, dax_shared_store};
+  const ROOT: u64 = 1;
+  let rq = usize::from(FIRST_REQUEST_QUEUE);
+  // The DAX window maps whole host pages, so sizes here are the real page size (16 KiB on macOS arm64), not the
+  // fixed `PAGE` the non-DAX helpers use.
+  let page_bytes = rustix::param::page_size().max(1);
+  let page = page_bytes as u64;
+
+  let mut store = dax_shared_store("admit-drain");
+  let mut vol = volume(&mut store);
+  vol.enable_writable_dax();
+  let root = vol.root_inode(&store).unwrap();
+  let no = vol.create_file_no(&mut store, root, "f", 0o644).unwrap();
+  vol.write(&mut store, no, 0, &vec![0x5A; page_bytes]).unwrap();
+  let nodeid = no.0;
+
+  let mut registry = Attachments::new();
+  let seam =
+    SimVmm::new(&QUEUE_SIZES, Ok(Principal::Uid { uid: 0 })).with_dax_window("admit-drain", page * 4);
+  let mut admitted = admit(
+    request(GuestTransport::InProcess),
+    seam,
+    config(),
+    roomy(),
+    rw,
+    &mut registry,
+  )
+  .unwrap();
+  assert!(
+    admitted.device().dax_offered(),
+    "the admitted device offers DAX — the seam's cache window was installed"
+  );
+
+  // Pass one: FUSE_INIT brings the connection up, then a writable SETUPMAPPING maps the file — one live window.
+  {
+    let mut bridge = VolumeBridge::new(vid(), &mut vol, &mut store);
+    admitted
+      .seam_mut()
+      .guest_mut()
+      .submit(rq, &message(Opcode::Init.to_wire(), 1, ROOT, &dax_init_body()), 4096, 1);
+    admitted.service(&mut bridge, &registry).unwrap();
+    let (id, len) = admitted.seam_mut().guest_mut().reap(rq).unwrap();
+    let reply = admitted.seam_mut().guest_mut().reply_of(rq, id, len);
+    assert_eq!(reply_error(&reply), 0, "INIT served");
+
+    admitted.seam_mut().guest_mut().submit(
+      rq,
+      &message(Opcode::SetupMapping.to_wire(), 2, nodeid, &dax_setup_body(0, page, true, 0)),
+      4096,
+      1,
+    );
+    admitted.service(&mut bridge, &registry).unwrap();
+    let (id, len) = admitted.seam_mut().guest_mut().reap(rq).unwrap();
+    let reply = admitted.seam_mut().guest_mut().reply_of(rq, id, len);
+    assert_eq!(reply_error(&reply), 0, "SETUPMAPPING served over the DAX window");
+  }
+  assert_eq!(admitted.device().dax_window_count(), 1, "one live guest window after the map pass");
+  assert_eq!(admitted.counters().dax_window_revokes, 0, "no daemon revoke drained yet");
+
+  // A client on the shard writes the mapped file between passes: the VFS write boundary enqueues a step-5 revoke.
+  vol.write(&mut store, no, 0, &vec![0xA5; page_bytes]).unwrap();
+
+  // Pass two: the production serve path drains the pending revoke and tears the stale window down.
+  {
+    let mut bridge = VolumeBridge::new(vid(), &mut vol, &mut store);
+    admitted.service(&mut bridge, &registry).unwrap();
+  }
+  assert_eq!(
+    admitted.device().dax_window_count(),
+    0,
+    "the service pass drained the pending revoke and unmapped the guest window"
+  );
+  assert_eq!(
+    admitted.counters().dax_window_revokes,
+    1,
+    "the non-vacuity counter moved: the drain tore down exactly one window"
+  );
+}

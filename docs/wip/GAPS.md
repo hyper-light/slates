@@ -6118,6 +6118,27 @@ its own page table and never calls the daemon), so the defense had to be at the 
   real physical rows) and the adaptive migration trigger from a privileged PEBS/IBS broker — both wired into the
   device loop with L0/L2/B2.
 
+- **The daemon→device revoke channel, built end to end (2026-10-14).** The two-phase revoke's device half now rides
+  the production serve loop. A VFS mutation of a mapped inode (`write`/`truncate` → `Store::dax_revoke_inode`) revokes
+  phase-one (registry entry gone, block kept **pinned**) and **enqueues the inode** on the shard's `DaxRegistry`
+  (`pending_revokes`); the device drains that queue every service pass (`AdmittedDevice::service` →
+  `Bridge::take_pending_dax_revokes` → `Device::request_revoke_inode`), munmapping the guest's window and only then
+  unpinning (`dax_release_after_unmap`) — so a reused block is never reachable through a stale TLB. It rides the real
+  loop for free (`serve_loop` → `one_pass` → `service`; `crates/server/src/virtiofs.rs` serves through it unchanged),
+  and the in-process seam the loop drives itself needs no separate wake. Non-vacuity counter
+  `AdmissionCounters::dax_window_revokes`. Proven by use: `crates/vfs/tests/dax.rs` (enqueue on the mutation; the guard
+  freed at phase one), `crates/bridge-virtiofs/tests/device.rs` (a write of a mapped file drained with a **real**
+  window, the transient per-pass bridge modelling the shard), and `tests/admission.rs`
+  (`a_service_pass_drains_a_pending_dax_revoke_and_tears_the_window_down`: the same through `service` over a real
+  SETUPMAPPING cache window, the counter moving 0→1). A **correctness pass fixed a latent leak**: phase-one revoke
+  (`dax_revoke_pending`) now drops a read-only mapping's integrity guard (B2) and frees its clean copy — it only
+  unregistered before, so a guarded read-only mapping revoked two-phase (a `write`/`truncate` of a guarded inode, a
+  device window teardown) leaked the guard's pinned clean copy until the volume dropped. **Still synchronous (owed —
+  the same stale-TLB hazard once DAX is advertised):** the snapshot/clone (`dax_revoke_writable_of_prefix`), destroy
+  (`dax_revoke_volume`) and landing/takeover (`dax_revoke_block`) paths still unpin at once rather than two-phase;
+  safe only while no live window exists (DAX unadvertised), they must route through the pending-enqueue before
+  advertisement.
+
 **Owed before DAX is advertised (the next steps):**
 
 1. **Wire the gate to the virtio-fs device seam** (`crates/server/src/virtiofs.rs`): the device maps through

@@ -411,6 +411,66 @@ pub fn vid() -> VolumeId {
   VolumeId { bytes: [7; 16] }
 }
 
+/// A DAX-capable store: its content arena is backed by a shared object (an anchor-backed volume), so `dax_backing`
+/// yields a descriptor a VMM can map — the precondition for serving a DAX window. Mirrors [`store`] but with a
+/// shared region in place of the anonymous one. `tag` keeps the `shm` name unique per test. Unix only (DAX is a
+/// vhost-user feature).
+#[cfg(unix)]
+pub fn dax_shared_store(tag: &str) -> Store {
+  use slates_mem::{ExclusiveObject, SharedObject, Words};
+  // The DAX cache window validates offsets and lengths against the host's real page size (`rustix::param`), so a
+  // DAX store's chunk size must be that page size — not the fixed `PAGE` the non-DAX helpers use, which differs from
+  // the real page on macOS arm64 (16 KiB). The region holds a small, fixed number of those pages.
+  let page = rustix::param::page_size().max(1);
+  const PAGES: usize = 64;
+  let object =
+    SharedObject::create(&format!("sl-cmn-ds-{tag}-{}", std::process::id()), page * PAGES, Words::new())
+      .unwrap();
+  let mut arena = ChunkArena::new(page);
+  // SAFETY: this test is the object's only mapper; it declares no words.
+  arena
+    .add_region(Region::shared(unsafe { ExclusiveObject::new(object) }, page))
+    .unwrap();
+  Store::new(
+    &StoreConfig {
+      page,
+      cache_line: 128,
+      max_dirs: 64,
+      max_inodes: 256,
+      max_chunks: PAGES,
+      max_dir_blocks: 64,
+      dir_cutover: 16,
+    },
+    arena,
+    0,
+  )
+}
+
+/// A 64-byte FUSE_INIT body (major 7, minor 38): the codec reads what it needs.
+pub fn dax_init_body() -> Vec<u8> {
+  let mut b = Vec::new();
+  b.extend_from_slice(&7u32.to_le_bytes());
+  b.extend_from_slice(&38u32.to_le_bytes());
+  b.extend_from_slice(&0u32.to_le_bytes());
+  b.extend_from_slice(&0u32.to_le_bytes());
+  b.resize(64, 0);
+  b
+}
+
+/// A FUSE_SETUPMAPPING body: fh=0, `foffset`, `len`, the write flag per `writable`, `moffset`.
+pub fn dax_setup_body(foffset: u64, len: u64, writable: bool, moffset: u64) -> Vec<u8> {
+  let flags = if writable {
+    slates_bridge_fuse::request::SETUPMAPPING_FLAG_WRITE
+  } else {
+    0
+  };
+  let mut b = Vec::new();
+  for field in [0u64, foffset, len, flags, moffset] {
+    b.extend_from_slice(&field.to_le_bytes());
+  }
+  b
+}
+
 /// A read-write current-view context, minted through the attachment registry (the only way).
 pub fn context() -> OpContext {
   let mut attachments = Attachments::new();
@@ -474,6 +534,11 @@ pub struct SimVmm {
   released: bool,
   /// The call the harness made fail, if any.
   failing: Option<SeamCall>,
+  /// The DAX cache window this VMM offers the device at admission (§4.6), if any: a shared object kept alive for
+  /// the seam's life (the device mmaps its fd once into a `DaxCacheRegion`), and its length in bytes. `None` is the
+  /// default — the in-process form offers no DAX.
+  #[cfg(unix)]
+  dax_window: Option<(slates_mem::SharedObject, u64)>,
 }
 
 impl std::fmt::Debug for SimVmm {
@@ -496,6 +561,8 @@ impl SimVmm {
       notified: Vec::new(),
       released: false,
       failing: None,
+      #[cfg(unix)]
+      dax_window: None,
     }
   }
 
@@ -503,6 +570,23 @@ impl SimVmm {
   /// space not published — so a test drives an admission's refusal at that step.
   pub fn failing(mut self, call: SeamCall) -> SimVmm {
     self.failing = Some(call);
+    self
+  }
+
+  /// The same VMM offering a DAX cache window of `bytes` (§4.6): a fresh shared object the device maps once at
+  /// admission to build its `DaxCacheRegion`, so an admitted device can serve FUSE_SETUPMAPPING over a real
+  /// mapping — what a hardware-DAX guest reaches through its own page table. Unix only (DAX is a vhost-user
+  /// feature). `name` is unique per test so parallel tests never collide on one `shm` object.
+  #[cfg(unix)]
+  pub fn with_dax_window(mut self, name: &str, bytes: u64) -> SimVmm {
+    let len = usize::try_from(bytes).unwrap_or(usize::MAX);
+    let object = slates_mem::SharedObject::create(
+      &format!("sl-simvmm-{name}-{}", std::process::id()),
+      len,
+      slates_mem::Words::new(),
+    )
+    .unwrap();
+    self.dax_window = Some((object, bytes));
     self
   }
 
@@ -578,5 +662,13 @@ impl VmmSeam for SimVmm {
   fn release(&mut self) {
     self.released = true;
     SEAM_RELEASES.with(|n| n.set(n.get() + 1));
+  }
+
+  #[cfg(unix)]
+  fn dax_window(&mut self) -> Option<(std::os::fd::BorrowedFd<'_>, u64)> {
+    self
+      .dax_window
+      .as_ref()
+      .map(|(object, bytes)| (object.as_fd(), *bytes))
   }
 }
