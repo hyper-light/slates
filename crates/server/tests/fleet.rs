@@ -6373,7 +6373,9 @@ fn a_fleet_node_under_a_containers_memory_bound_still_admits_a_client() {
     .member_identity()
     .expect("A has its fresh identity");
   // B's probe session to A is up — A accepted it and serves it — before the client arrives.
-  let served_b = poll_until(&[&daemon_b], formation_deadline(), || daemon_b.fleet_meshed());
+  let served_b = poll_until(&[&daemon_b], formation_deadline(), || {
+    daemon_b.fleet_meshed()
+  });
   let mut client = Client::connect(&instance_a);
   let report = match client.call(&RequestBody::DaemonStatus) {
     ReplyBody::DaemonStatus { report } => report,
@@ -8384,9 +8386,7 @@ fn assert_hedged_through_the_measured_p95(outcome: &HedgeOutcome) {
     "the first seal left measured put-latency readings on the owner: {measured:?}"
   );
   assert!(
-    held_ns
-      .as_ref()
-      .is_ok_and(|&held| held >= hold_ns),
+    held_ns.as_ref().is_ok_and(|&held| held >= hold_ns),
     "the first-round candidate's control shard was held for the whole span ({held_ns:?} ns)"
   );
   eprintln!(
