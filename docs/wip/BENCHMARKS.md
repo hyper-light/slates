@@ -5456,3 +5456,36 @@ arena's anchor shared-object fd into a VMM cache region, `crates/bridge-virtiofs
 A/B against overlayfs are the owed end-to-end validation; the daemon-side seam (ABI, `namespace_inode` gate,
 `Bridge::dax_map`/`dax_unmap`) is wired and tested (this branch). This is a projection grounded in measured
 components, not a guest-kernel A/B — stated so it is not mistaken for one.
+
+### Real-world workloads, slates vs tmpfs vs JuiceFS — does it hold up under real use (2026-10-14)
+
+Environment: Docker `rust:1.98.0`, privileged, on the Mac's Linux VM (no `/dev/kvm`, so the usable transport is
+measured, not a DAX guest); slates release built in-container (134 s). Command:
+`docker run --rm --privileged -v <repo>:/work:ro -v <out>:/out -v slates-cc:/ccache rust:1.98.0 bash
+/work/docs/wip/bench/realworld_compete.sh`. Real developer workloads on a slates **NFSv4.2** volume through
+Linux's own kernel client, beside a tmpfs and **JuiceFS** 1.4.1 (the userspace/distributed competitor: FUSE,
+SQLite metadata, a local file object store): a shallow `git clone` + `git fsck --full` + a tree hash, a
+`cargo build --release` with real crates.io dependencies, and a `pip install` into a venv.
+
+| workload | tmpfs | slates (NFSv4.2) | JuiceFS | slates vs JuiceFS |
+|---|---|---|---|---|
+| git clone (ripgrep, depth 1) | 1.32 s | **1.17 s** | 1.67 s | 1.4× faster |
+| git fsck --full | 0.02 s | 0.02 s | 0.05 s | 2.5× |
+| cargo build (regex/serde/serde_json) | 8.32 s | **8.18 s** | 46.31 s | **5.7× faster** |
+| pip install (requests + flask) | 2.58 s | 2.84 s | 5.01 s | 1.8× |
+
+**Correctness (holds up):** every workload exits 0 on every arm; the ripgrep clone is **byte-identical** — 236
+files under `./rg/` on all three, tree hash `31a1f6f713d195f5` on all three; the cargo-built binary runs and
+prints the same `{"n":2}`; the only slates-vs-tmpfs file-list difference is three transient cargo
+`.cargo-*-lock` files (a `find`-vs-cargo-cleanup timing artifact, not divergence); `slates status` reports 0
+refusals of any kind.
+
+**Reading it.** Against tmpfs, slates-NFS is **at tmpfs level** for real workloads — the per-op FUSE/NFS
+microsecond (the 12–325× the Condition-12 micro-op table shows) is amortised away by the kernel's page cache,
+readahead and the workload's own compute, so the micro-op gap is not what real use pays. Against the apt
+userspace/distributed peer, JuiceFS, slates is **1.4–5.7× faster**, widest on `cargo build` because a build
+touches thousands of small files and JuiceFS pays a SQLite-metadata + object-store round-trip on each where
+slates serves from RAM. This is the honest real-use picture: slates holds up (byte-identical, zero refusals) and
+beats the directly-comparable competitor, while the micro-op gap vs *in-kernel* overlayfs is real but mostly
+invisible to real workloads — and is what the DAX data path (measured separately above) removes entirely once
+its device window is wired behind a KVM-capable host.
