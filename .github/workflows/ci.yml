@@ -72,6 +72,13 @@ jobs:
           # default 3 s window). Widen the window on CI so a loaded shared runner does not false-fail; a normal
           # local run keeps the prompt 3 s default. The hedge behaviour is unchanged (crates/server/tests/fleet.rs).
           SLATES_TEST_HEDGE_STARVATION_SECS: "20"
+          # a_restarted_daemons_first_answer_is_awaited_for_the_reconnect_budget runs an in-process daemon, whose
+          # stop cannot fire the client's process-exit watch, so the client detects the restart only when the
+          # successor republishes its bootstrap stamp. A loaded shared runner publishes that far slower than a dev
+          # machine, racing the reply deadline (it reported Stalled{1ms} on macOS + TSan, run 38537130473). Scale the
+          # restart timings together so the publish has room; the invariant publish << reply << recovery << reconnect
+          # holds at any scale (crates/client/tests/client.rs). A normal local run keeps the prompt default of 1.
+          SLATES_TEST_RESTART_SLOWDOWN: "10"
         run: cargo test --workspace
       # The vendored AWS-LC crates' own suites, each against the other's vendored copy (vendor/UPSTREAM.md).
       - name: The vendored crates' suites
@@ -699,6 +706,11 @@ jobs:
           components: rust-src
       - uses: Swatinem/rust-cache@v2
       - name: TSan (the race canary must be reported; then the suites, any report fails)
+        env:
+          # ThreadSanitizer's 10-20x slowdown inflates the restart-detection publish window far past a native run, so
+          # the slow-restart client test needs a larger scale than the plain Test lane (same reason; the invariant
+          # publish << reply << recovery << reconnect holds at any scale). crates/client/tests/client.rs.
+          SLATES_TEST_RESTART_SLOWDOWN: "25"
         run: cargo xtask tsan
 
   # The KIND fleet lane (docs/wip/kind-lane.md; docs/deploy.md; §4.8 "Deployment" and the WAN timing status
