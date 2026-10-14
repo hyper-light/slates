@@ -729,6 +729,25 @@ impl Store {
     }
   }
 
+  /// The backing descriptor, byte offset and length a **live** mapping's block occupies in the content arena's shared
+  /// object (§4.6), for the virtio-fs device to map its pages into a VMM's DAX cache region. `Some((fd, offset, len))`
+  /// only when the mapping is live *and* its block lives in a shared-object (anchor-backed) region; `None` for a
+  /// revoked mapping (nothing to map) or a private (scratch, anonymous) volume — so DAX is served only on anchor-backed
+  /// volumes, the ones whose content survives a restart and has a descriptor to hand a VMM. Unix only (the DAX window
+  /// is Linux/vhost-user). The mapping's pin keeps the block alive, so the fd's bytes are stable while the device maps
+  /// them; the caller maps `[offset, offset + len)` read-only or writable per `mapping.writable`.
+  #[cfg(unix)]
+  #[must_use]
+  pub fn dax_backing(
+    &self,
+    mapping: &Mapping,
+  ) -> Option<(std::os::fd::BorrowedFd<'_>, usize, usize)> {
+    if !self.dax.is_live(mapping) {
+      return None;
+    }
+    self.content.arena().block_backing(mapping.block)
+  }
+
   /// Revokes every mapping of inode `no` (§4.6): a VFS mutation of a DAX-mapped file tears its mappings down, so the
   /// one write boundary stays single (the guest re-maps after). Returns how many were revoked.
   pub fn dax_revoke_inode(&mut self, no: InodeNo) -> usize {

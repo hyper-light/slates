@@ -1071,3 +1071,23 @@ fn revoking_a_guarded_mapping_drops_the_guard() {
   assert!(store.dax_revoke(&m), "the mapping is revoked");
   assert_eq!(store.dax.guards(), 0, "the revoke dropped the guard and freed its clean copy");
 }
+
+/// §4.6 (the DAX device-window backing seam, Unix). Do: on the scratch (anonymous-backed) test store, map a file
+/// writable and ask for its DAX backing; then revoke and ask again. Expect: `None` both times — a scratch volume's
+/// content is private process RAM with no descriptor to hand a VMM (so DAX is served only on anchor-backed volumes),
+/// and a revoked mapping has nothing to map. This confines the DAX device window to anchor-backed volumes by
+/// construction, not by a check the device could skip.
+#[cfg(unix)]
+#[test]
+fn a_scratch_volume_has_no_dax_backing_and_a_revoked_mapping_has_none() {
+  let mut store = store();
+  let mut volume = volume(&mut store, 1 << 20);
+  let f = file_of(&mut store, &mut volume, "f", 0x41, DAX_PAGE);
+  let m = volume.dax_map_write(&mut store, f).unwrap();
+  assert!(
+    store.dax_backing(&m).is_none(),
+    "a scratch (anonymous-backed) volume has no DAX backing fd to hand a VMM"
+  );
+  store.dax_revoke(&m);
+  assert!(store.dax_backing(&m).is_none(), "a revoked mapping has no DAX backing");
+}
