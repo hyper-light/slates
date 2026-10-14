@@ -3318,10 +3318,14 @@ async fn reap_loop() {
       CLIENTS_REAPED.fetch_add(u64::try_from(reaped).unwrap_or(u64::MAX), Ordering::AcqRel);
     }
     refresh_pressure_hold().await;
+    // NFS owed-work purge and delegation recalls are the Unix transports' state (`crate::nfs`/`crate::delegation`
+    // are `#[cfg(unix)]`); Windows has no NFS mount, so the maintenance loop skips them and keeps the rest.
+    #[cfg(unix)]
     crate::nfs::purge_owed_here().await;
     state::with_state(|s| {
       process_base_hints(s);
       // The recalls the hints asked for are sent now: nothing else runs the drain while no call is served.
+      #[cfg(unix)]
       crate::delegation::drain(s);
     });
     seal_idle_content().await;
