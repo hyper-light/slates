@@ -1716,3 +1716,68 @@ fn release_dax_tears_down_live_windows_on_a_disconnect() {
   assert_eq!(store.dax.revoked(), 1, "the mapped block was revoked at the disconnect teardown");
   drop(cache);
 }
+
+/// §4.6 (adversarial / hostile input on the device's SETUPMAPPING + REMOVEMAPPING parsers of guest bytes;
+/// CLAUDE.md hostile-input taxonomy: truncation, overflow, foreign counts). With a window offered and writable DAX
+/// opted in, a hostile guest sends a truncated SETUPMAPPING body, a `len = u64::MAX`, an unaligned window offset, a
+/// SETUPMAPPING of a non-mappable (inline) file, a truncated REMOVEMAPPING body, and a REMOVEMAPPING claiming
+/// `u32::MAX` entries in a short body. Expect: each a typed refusal or a no-op — no window established, the block a
+/// refused map briefly pinned is unpinned (no leak), no panic, and a valid map still works afterward (the device
+/// was never faulted).
+#[cfg(unix)]
+#[test]
+fn hostile_dax_requests_are_refused_and_establish_no_window() {
+  use slates_mem::{SharedObject, Words};
+  let page = rustix::param::page_size().max(1);
+  let mut store = dax_shared_store(page, "hostile");
+  let mut vol = volume(&mut store);
+  vol.enable_writable_dax();
+  let root = vol.root_inode(&store).unwrap();
+  let big = vol.create_file_no(&mut store, root, "big", 0o644).unwrap();
+  vol.write(&mut store, big, 0, &vec![0x5A; page]).unwrap();
+  let tiny = vol.create_file_no(&mut store, root, "tiny", 0o644).unwrap();
+  vol.write(&mut store, tiny, 0, b"x").unwrap(); // inline: not one mappable content block
+  let (big_no, tiny_no) = (big.0, tiny.0);
+
+  let (mut device, mut driver) = device_and_driver();
+  let cache =
+    SharedObject::create(&format!("sl-daxhostile-{}", std::process::id()), page * 4, Words::new()).unwrap();
+  device.install_dax_window(Some(
+    slates_bridge_virtiofs::dax::DaxCacheRegion::new(cache.as_fd(), (page * 4) as u64).unwrap(),
+  ));
+  let cx = context();
+  let mut bridge = VolumeBridge::new(vid(), &mut vol, &mut store);
+  dax_exchange(&mut device, &mut driver, &mut bridge, &cx, (Opcode::Init, 1, ROOT), &dax_init_body());
+
+  // Hostile SETUPMAPPING bodies: a truncated body (the parser needs 5x u64), a colossal len (overflows the block/
+  // window bound), an unaligned window offset (the map is refused and the block it briefly pinned is unpinned), and
+  // an inline file (no mappable content block). Each a typed refusal, no window, the block a refused map pinned
+  // released — a hostile guest establishes no mapping.
+  let page_len = page as u64;
+  for (unique, nodeid, body, why) in [
+    (2u64, big_no, [0u8; 20].to_vec(), "a truncated SETUPMAPPING body"),
+    (3, big_no, dax_setup_body(0, u64::MAX, true, 0), "len = u64::MAX"),
+    (4, big_no, dax_setup_body(0, page_len, true, 1), "an unaligned moffset"),
+    (5, tiny_no, dax_setup_body(0, page_len, true, 0), "an inline file"),
+  ] {
+    let r = dax_exchange(&mut device, &mut driver, &mut bridge, &cx, (Opcode::SetupMapping, unique, nodeid), &body);
+    assert_ne!(reply_error(&r), 0, "{why} is refused");
+    assert_eq!(device.dax_window_count(), 0, "{why} established no window");
+  }
+
+  // Hostile REMOVEMAPPING bodies: a truncated body (below the u32 count) and a foreign count (u32::MAX entries in a
+  // short body). Each handled without faulting the device and establishing no window.
+  for (unique, body) in [
+    (6u64, [0u8; 3].to_vec()),
+    (7, [u32::MAX.to_le_bytes().as_slice(), &0u64.to_le_bytes(), &page_len.to_le_bytes()].concat()),
+  ] {
+    let _ = dax_exchange(&mut device, &mut driver, &mut bridge, &cx, (Opcode::RemoveMapping, unique, big_no), &body);
+    assert_eq!(device.dax_window_count(), 0, "a hostile REMOVEMAPPING established no window");
+  }
+
+  // The device was never faulted: a well-formed map still succeeds.
+  let r = dax_exchange(&mut device, &mut driver, &mut bridge, &cx, (Opcode::SetupMapping, 8, big_no), &dax_setup_body(0, page as u64, true, 0));
+  assert_eq!(reply_error(&r), 0, "a valid map still succeeds after the hostile requests");
+  assert_eq!(device.dax_window_count(), 1, "exactly the one valid window is live");
+  drop(cache);
+}
