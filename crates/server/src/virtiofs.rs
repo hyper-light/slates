@@ -515,6 +515,23 @@ pub(crate) fn revoke_volume_devices(s: &ShardState, volume: DbVolumeId) -> usize
     .count()
 }
 
+/// Kicks every device loop serving volume `volume` to drain its pending DAX revokes now, without ending it (§4.6):
+/// a `snapshot` recall marks the volume's writable windows revoke-pending in the store and calls this so the device
+/// munmaps them promptly rather than on the guest's next doorbell kick. The number kicked (0 if the volume has no
+/// guest device here). A no-op in production while DAX is unadvertised (no live window, so no pending revoke).
+pub(crate) fn kick_volume_devices(s: &ShardState, volume: DbVolumeId) -> usize {
+  let partition = s.db.partition();
+  s.guest_devices
+    .iter()
+    .filter(|(_, _, attachment)| {
+      partition
+        .attachment(*attachment)
+        .is_some_and(|record| record.volume == volume)
+    })
+    .filter(|(device, _, _)| slates_bridge_virtiofs::serve::kick(*device))
+    .count()
+}
+
 /// Asks the device loop serving attachment record `attachment` to revoke (its `detach`, or its volume's
 /// destroy): the loop checks at its next pass boundary and runs its terminal step. Whether one was asked.
 pub(crate) fn revoke_attachment_device(s: &ShardState, attachment: u64) -> bool {

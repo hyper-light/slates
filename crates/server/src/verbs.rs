@@ -4490,8 +4490,10 @@ fn snapshot(state: &mut ShardState, principal: &Principal, volume: VolumeId) -> 
     state.store.dax_revoke_writable_of_prefix(prefix);
   }
   if state.store.dax.has_pending_of_prefix(prefix) {
-    // The device munmaps the recalled windows on its next service pass; the client's retry meets the
-    // frozen-safe volume once they are drained (the retryable-refusal shape `await_deferred_completion` uses).
+    // Kick the volume's device loops to munmap the recalled windows now (not on the guest's next doorbell kick),
+    // then refuse retryable: the client's retry meets the frozen-safe volume once the device has drained — the
+    // retryable-refusal shape `await_deferred_completion` uses.
+    crate::virtiofs::kick_volume_devices(state, record.id);
     return refused(Refusal::Overloaded { shard: state.shard });
   }
   // The volume's next epoch, checked before any effect: an epoch with no successor refuses the snapshot

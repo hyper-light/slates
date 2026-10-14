@@ -39,10 +39,13 @@ use crate::admission::{
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct DeviceId(u64);
 
-/// A loop's control entry: the waker to interrupt it with, and whether revocation was asked for.
+/// A loop's control entry: the waker to interrupt it with, whether revocation was asked for, and whether a daemon
+/// recall asked the loop to drain its pending DAX revokes now (a *kick*, distinct from a revoke — the loop drains
+/// and keeps serving).
 struct LoopControl {
   waker: Option<Waker>,
   revoke: bool,
+  drain: bool,
 }
 
 thread_local! {
@@ -89,6 +92,7 @@ pub fn register(bound: usize) -> Result<DeviceId, LoopError> {
       LoopControl {
         waker: None,
         revoke: false,
+        drain: false,
       },
     );
     Ok(DeviceId(id))
@@ -108,6 +112,34 @@ pub fn request_revoke(id: DeviceId) -> bool {
       waker.wake();
     }
     true
+  })
+}
+
+/// Kicks the loop `id` to drain its pending DAX revokes on its next turn, without a guest doorbell kick and without
+/// ending it (§4.6: a daemon recall — e.g. a `snapshot`'s writable-window teardown — marks the inode revoke-pending
+/// and kicks the owning device loop so the munmap happens promptly, not on the guest's next kick). `false` when no
+/// such loop runs on this shard. Idempotent: a second kick before the loop drains is folded into the one flag.
+pub fn kick(id: DeviceId) -> bool {
+  CONTROL.with(|control| {
+    let mut control = control.borrow_mut();
+    let Some(entry) = control.get_mut(&id.0) else {
+      return false;
+    };
+    entry.drain = true;
+    if let Some(waker) = entry.waker.take() {
+      waker.wake();
+    }
+    true
+  })
+}
+
+/// Reads and clears the drain request for loop `id` (a kick); whether one was pending.
+fn take_drain_requested(id: DeviceId) -> bool {
+  CONTROL.with(|control| {
+    control
+      .borrow_mut()
+      .get_mut(&id.0)
+      .is_some_and(|e| std::mem::take(&mut e.drain))
   })
 }
 
@@ -295,6 +327,13 @@ async fn serve_round<S: VmmSeam, B: BridgeAccess>(
     return Some(EndReason::Revoked);
   }
   RegisterWaker { id }.await;
+  // A daemon recall kicked the loop (§4.6; e.g. `snapshot` recalling a volume's writable DAX windows): drain the
+  // pending revokes now — munmap the guest windows the recall marked — without waiting for the guest's next
+  // doorbell kick, then resume. Additive to the doorbell path below (unchanged): a loop with no kick falls straight
+  // through to its doorbell wait.
+  if take_drain_requested(id) {
+    return serve_until_idle(id, admitted, bridge, counters).await;
+  }
   let raw = match admitted.doorbell() {
     Doorbell::InProcess => return Some(EndReason::NoDoorbell),
     Doorbell::Descriptor(raw) => raw,
@@ -343,5 +382,31 @@ pub async fn serve_loop<S: VmmSeam, B: BridgeAccess>(
     wakes: counters.wakes,
     passes: counters.passes,
     fenced_waits: counters.fenced_waits,
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::{DeviceId, kick, register, request_revoke, revoke_requested, take_drain_requested};
+
+  /// §4.6 — a daemon recall *kick* marks a device loop to drain its pending DAX revokes once, read-and-cleared, and
+  /// is a separate flag from a revoke. Do: register a loop; kick it; read the drain request twice; then revoke it.
+  /// Expect: the kick finds the loop and marks it; the first take is true and the second false (one-shot, cleared);
+  /// a kick does not revoke; revoke is its own flag; and a kick of an unknown loop is false.
+  #[test]
+  fn a_kick_marks_the_loop_to_drain_once_and_is_distinct_from_revoke() {
+    // A generous bound: this thread-local control map may hold loops from other tests sharing the thread.
+    let id = register(1024).unwrap();
+    assert!(!take_drain_requested(id), "no drain is pending before a kick");
+    assert!(kick(id), "the kick finds the registered loop");
+    assert!(take_drain_requested(id), "the kick marked the loop to drain");
+    assert!(
+      !take_drain_requested(id),
+      "the drain request is one-shot — the take cleared it, so the loop drains once per kick"
+    );
+    assert!(!revoke_requested(id), "a kick drains; it does not revoke");
+    assert!(request_revoke(id), "the same loop can be revoked");
+    assert!(revoke_requested(id), "revoke is its own flag, independent of the drain flag");
+    assert!(!kick(DeviceId(u64::MAX)), "a kick of a loop that does not run here is false");
   }
 }
