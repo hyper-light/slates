@@ -19,8 +19,9 @@ use slates_server::{Daemon, DaemonConfig, SegmentSource};
 mod common;
 use common::nfs::{
   MOUNT_PROGRAM, NFS_PROGRAM, call_accept_status, create, create_status, lookup, lookup_raw_status,
-  lookup_status, mkdir, mkdir_status, mount, opaque, read, read_status, readdirplus_status,
-  readlink, remove_status, rmdir_status, status, symlink_status, write, write_at_status,
+  lookup_status, mkdir, mkdir_status, mount, mount_status, opaque, read, read_status,
+  readdirplus_status, readlink, remove_status, rmdir_status, status, symlink_status, write,
+  write_at_status,
 };
 
 /// Shape: honest clients, each on its own connection and file.
@@ -1052,6 +1053,148 @@ fn a_symlink_target_naming_a_host_path_is_stored_opaque_and_a_nul_or_overlong_ta
   assert_eq!(readlink(&mut s, &rel, 10), Ok(b"sibling.txt".to_vec()));
 
   drop(s);
+  drop(daemon);
+}
+
+/// §4.13 / AUD-01 under PRESSURE (timing / TOCTOU): the cross-tenant and no-capability read refusals must hold
+/// even while the target volume's authorization and content state churns under CPU contention. A quiescent
+/// single-shot refusal (`a_valid_capability_for_one_volume_cannot_read_another_cwe_863`) can hide a window that
+/// only opens when an attachment is created or torn down, or a volume's epoch advances, while a crafted read is in
+/// flight — a serial shard still yields at its awaits, so interleavings exist. Many attacker threads hammer two
+/// crafted handles for volume B's secret — one carrying volume A's VALID capability, one a zero capability — while
+/// churn threads reconnect+mount B and write/remove in it (attachment-id and epoch churn), all under a spinner per
+/// core. Expect: across every attempt, B's secret bytes are NEVER returned; the attempt count proves the attackers
+/// actually ran (non-vacuity).
+#[test]
+fn a_cross_tenant_craft_never_reads_through_under_contention_and_churn() {
+  const SECRET: &[u8] = b"volume B's private bytes, never disclosed to another tenant under churn";
+  /// How long the pressure runs — bounded so the test stays CI-safe.
+  const PRESSURE: Duration = Duration::from_secs(2);
+  let (daemon, instance) = single_shard_daemon("cross-tenant-race");
+  provision(&instance, "va");
+  provision(&instance, "vb");
+  let port = daemon.nfs_port().expect("the daemon is serving NFS");
+  let export_b = daemon.mount_capability("vb").unwrap().unwrap();
+
+  // A's capability (the last 24 bytes of any A handle) and B's secret file handle.
+  let mut sa = TcpStream::connect(("127.0.0.1", port)).unwrap();
+  let root_a = mount(&mut sa, &daemon.mount_capability("va").unwrap().unwrap(), 1);
+  let file_a = create(&mut sa, &root_a, "a.txt", 2);
+  drop(sa);
+  let mut sb = TcpStream::connect(("127.0.0.1", port)).unwrap();
+  let root_b = mount(&mut sb, &export_b, 1);
+  let secret_b = create(&mut sb, &root_b, "secret", 2);
+  write(&mut sb, &secret_b, SECRET, 3);
+  drop(sb);
+
+  // Two crafts of B's secret handle: A's valid capability spliced over the last 24 bytes, and a zero capability.
+  let a_cap: Vec<u8> = file_a.iter().skip(file_a.len().saturating_sub(24)).copied().collect();
+  let cut = secret_b.len().saturating_sub(24);
+  let mut with_a_cap = secret_b.clone();
+  for (dst, src) in with_a_cap.iter_mut().skip(cut).zip(a_cap.iter()) {
+    *dst = *src;
+  }
+  let mut zero_cap = secret_b.clone();
+  for byte in zero_cap.iter_mut().skip(cut) {
+    *byte = 0;
+  }
+  let crafts = [with_a_cap, zero_cap];
+
+  let cores = std::thread::available_parallelism().map_or(1, usize::from);
+  let stop = AtomicBool::new(false);
+  let attempts = AtomicU64::new(0);
+  let leaks = AtomicU64::new(0);
+  std::thread::scope(|scope| {
+    for _ in 0..cores {
+      scope.spawn(|| spin(&stop));
+    }
+    // Epoch + inode churn: two persistent connections create and remove files in B, so its epoch and inode table
+    // move while the attackers probe. Persistent (not reconnecting), so no connection storm.
+    for churn in 0..2u32 {
+      let (export_b, stop) = (&export_b, &stop);
+      scope.spawn(move || {
+        let Ok(mut s) = TcpStream::connect(("127.0.0.1", port)) else {
+          return;
+        };
+        let root = mount(&mut s, export_b, 1);
+        let mut round = 0u32;
+        while !stop.load(Ordering::Relaxed) {
+          let name = format!("churn-{churn}-{}", round % 8);
+          let _ = create_status(&mut s, &root, name.as_bytes(), round.wrapping_add(10));
+          let _ = remove_status(&mut s, &root, name.as_bytes(), round.wrapping_add(11));
+          round = round.wrapping_add(16);
+        }
+      });
+    }
+    // Attachment churn: one thread reconnects at a bounded rate and mounts B (attach), then drops the connection
+    // (detach), so the attachment table reuses ids while the attackers present their stale/crafted capabilities.
+    {
+      let (export_b, stop) = (&export_b, &stop);
+      scope.spawn(move || {
+        let mut round = 0u32;
+        while !stop.load(Ordering::Relaxed) {
+          if let Ok(mut s) = TcpStream::connect(("127.0.0.1", port)) {
+            let _ = mount_status(&mut s, export_b, round.wrapping_add(1));
+          }
+          round = round.wrapping_add(1);
+          #[allow(clippy::disallowed_methods)]
+          std::thread::sleep(Duration::from_millis(5));
+        }
+      });
+    }
+    // Attackers: hammer both crafts; B's secret must never come back under any interleaving.
+    for _ in 0..cores.max(4) {
+      let (crafts, stop, attempts, leaks) = (&crafts, &stop, &attempts, &leaks);
+      scope.spawn(move || {
+        let Ok(mut s) = TcpStream::connect(("127.0.0.1", port)) else {
+          return;
+        };
+        let _ = s.set_read_timeout(Some(Duration::from_secs(2)));
+        let mut xid = 1u32;
+        while !stop.load(Ordering::Relaxed) {
+          for craft in crafts {
+            xid = xid.wrapping_add(1);
+            if s.write_all(&record(NFSPROC3_READ, &read_args(craft), xid)).is_err() {
+              let Ok(fresh) = TcpStream::connect(("127.0.0.1", port)) else {
+                return;
+              };
+              s = fresh;
+              let _ = s.set_read_timeout(Some(Duration::from_secs(2)));
+              continue;
+            }
+            match read_reply(&mut s) {
+              Some((0, data)) if data.windows(SECRET.len()).any(|w| w == SECRET) => {
+                leaks.fetch_add(1, Ordering::Relaxed);
+              }
+              Some(_) => {}
+              None => {
+                let Ok(fresh) = TcpStream::connect(("127.0.0.1", port)) else {
+                  return;
+                };
+                s = fresh;
+                let _ = s.set_read_timeout(Some(Duration::from_secs(2)));
+              }
+            }
+            attempts.fetch_add(1, Ordering::Relaxed);
+          }
+        }
+      });
+    }
+    #[allow(clippy::disallowed_methods)]
+    std::thread::sleep(PRESSURE);
+    stop.store(true, Ordering::Relaxed);
+  });
+  let total = attempts.load(Ordering::Relaxed);
+  assert!(
+    total > 1000,
+    "non-vacuity: the attackers hammered the crafts many times ({total})"
+  );
+  assert_eq!(
+    leaks.load(Ordering::Relaxed),
+    0,
+    "B's secret never reads through a cross-tenant or zero-capability craft under contention and churn"
+  );
+  eprintln!("cross-tenant race: {total} crafted reads under churn+contention, 0 leaks");
   drop(daemon);
 }
 
