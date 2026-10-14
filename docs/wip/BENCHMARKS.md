@@ -5412,3 +5412,47 @@ at scale.
 - **Zero unavailability.** The wrongly-retired *live* owner kept serving its own objects throughout (0 refusals), at both sizes — the owner lease (AUD-08) holds while the owner refutes.
 - **Re-admission is O(fleet), size-independent.** One period to re-admit, flat across a 16× object range — membership refutation never enumerates objects (D-12).
 - **So the condemnation cost is ~0** (the measured unavailability), not N × 1.5 µs. `set_condemnation_cost` is now set explicitly to zero in `crates/cluster/src/member_plane.rs` with this derivation, so the detector detects at its least bound (~0.9–1.84 s), fast for every host size, and a change to the vendored default cannot silently slow it. slates' safety against a false positive is the owner lease, not a slower detector. F = 10 s (the failover SLO, `FAILOVER_SLO_NS`) stands unchanged.
+
+### Writable+readable DAX: the per-access win that closes the FUSE write/read gap (§4.6 A-9; 2026-10-13)
+
+Environment: Apple M5 Max, macOS 26.4.1, Rust 1.98.0, release profile; branch `writable-dax`. Command:
+`cargo run --release -p slates-vfs --example dax_bench`. Best-of-5, each the mean of 100,000 inner iterations;
+all runs shown. The DAX access and setup numbers are **measured here** on the real content arena block the gate
+pins and exposes (`Volume::dax_map_*`, `ChunkArena::bytes`); the mediated per-op costs are the **recorded** FUSE
+and NFS figures from the Condition-12 sections above (2026-10-08/11), the round-trip DAX removes.
+
+**Why.** slates over FUSE is 12–325× slower per op than in-kernel overlayfs, and the gap is the kernel↔daemon
+round-trip, not the store (the arena is already RAM). Writable+readable DAX maps a file's content block into the
+guest's DAX window, so a read or write is a memory access through the guest's own page table — no daemon call —
+after a one-time `FUSE_SETUPMAPPING`.
+
+| op (4 KiB) | DAX, measured | runs (ns) | mediated, recorded |
+|---|---|---|---|
+| read (memcpy out of the arena block) | **37 ns** | [45, 40, 37, 38, 38] | FUSE 43,000 / NFS 5,700 |
+| write (memcpy into the arena block) | **33 ns** | [34, 54, 33, 38, 38] | FUSE 277,000 |
+| `dax_map_read` setup (pin + register) | 82 ns | [85, 82, 82, 83, 84] | — |
+| `dax_map_write` setup (copy-up + pin + register) | 573 ns | [622, 612, 627, 573, 573] | — |
+
+**Amortised** — a file touched N times, mediated N×round-trip vs DAX (one SETUPMAPPING round-trip + the measured
+mint, then N memory accesses):
+
+| N | read vs FUSE | write vs FUSE | read vs NFS | write vs NFS |
+|---|---|---|---|---|
+| 1 | 1.0× | 1.0× | 1.0× | 0.9× |
+| 16 | 15.8× | 15.9× | 14.3× | 13.4× |
+| 256 | 209× | 248× | 96× | 99× |
+| 4,096 | 905× | **2,749×** | 148× | 165× |
+
+**Reading it honestly.** A single access does not benefit (DAX pays one round-trip to set the mapping up); the
+win is the repeated access that is the whole reason to map a file, and it is 15× by N=16 and two to three orders
+of magnitude by N=4,096. Per-access DAX (33–37 ns, pure memory) is faster than even in-kernel overlayfs
+(read 3.5 µs, Condition-12 above) — once mapped, the kernel VFS layer is out of the path. The numbers measure
+**warm** access (the arena block resident); a guest's first touch of each window page takes a one-time page
+fault, folded into the mapping's setup, not per access.
+
+**Scope — what is measured vs owed.** This quantifies the mechanism's read+write win on the real arena + gate,
+with the mediated side from the recorded baseline. The wired device window (the `MAP_FIXED` of the content
+arena's anchor shared-object fd into a VMM cache region, `crates/bridge-virtiofs`) and a live virtio-fs DAX guest
+A/B against overlayfs are the owed end-to-end validation; the daemon-side seam (ABI, `namespace_inode` gate,
+`Bridge::dax_map`/`dax_unmap`) is wired and tested (this branch). This is a projection grounded in measured
+components, not a guest-kernel A/B — stated so it is not mistaken for one.
