@@ -459,6 +459,27 @@ impl Device {
     self.dax_cache.is_some()
   }
 
+  /// A copy of the DAX window bytes at `[moffset, moffset+len)` — a diagnostic/test read of what a guest's CPU would
+  /// see through its page table (a live guest reads the window directly, not through this). `None` without a window, or
+  /// for an out-of-window range. The caller reads only a range it mapped (a `PROT_NONE` hole faults). Unix only.
+  #[cfg(unix)]
+  #[must_use]
+  pub fn dax_window_bytes(&self, moffset: u64, len: u64) -> Option<Vec<u8>> {
+    // SAFETY: the caller reads a range a prior SETUPMAPPING established (readable); `window_bytes` bounds it to the
+    // window, and this copies the bytes out, forming no lasting borrow.
+    self
+      .dax_cache
+      .as_ref()
+      .and_then(|cache| unsafe { cache.window_bytes(moffset, len) }.map(<[u8]>::to_vec))
+  }
+
+  /// The live DAX window count (non-vacuity for tests). Unix only.
+  #[cfg(unix)]
+  #[must_use]
+  pub fn dax_window_count(&self) -> usize {
+    self.dax_windows.len()
+  }
+
   /// Installs the driver's queue layouts — exactly the high-priority queue and the request queues
   /// the configuration publishes, in queue order — validating each (the ring walk's configuration
   /// checks) before any queue exists. Configuring is a reset: the FUSE connection and any fault are

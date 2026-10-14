@@ -1246,3 +1246,126 @@ fn the_copy_buffers_a_device_keeps_stay_charged_to_its_attachment() {
   assert_eq!(reply_error(&attr), 0);
   charged_as_kept(&device, &ledger, "GETATTR");
 }
+
+// ───────────────────────────────────────────────── the DAX device window, end to end over a simulated guest (§4.6)
+
+/// A store whose content arena is a shared-object (anchor-backed) region, so a mapped block has a descriptor the DAX
+/// window can map (a scratch/anonymous store has none). `page` is the host page so blocks are page-aligned for `mmap`.
+#[cfg(unix)]
+fn dax_shared_store(page: usize) -> slates_vfs::volume::Store {
+  use slates_mem::arena::ChunkArena;
+  use slates_mem::region::Region;
+  use slates_mem::{ExclusiveObject, SharedObject, Words};
+  const REGION_PAGES: usize = 64;
+  let object =
+    SharedObject::create(&format!("sl-daxdev-{}", std::process::id()), page * REGION_PAGES, Words::new())
+      .unwrap();
+  let mut arena = ChunkArena::new(page);
+  // SAFETY: this test is the object's only mapper; it declares no words.
+  arena
+    .add_region(Region::shared(unsafe { ExclusiveObject::new(object) }, page))
+    .unwrap();
+  slates_vfs::volume::Store::new(
+    &slates_vfs::volume::StoreConfig {
+      page,
+      cache_line: 128,
+      max_dirs: 64,
+      max_inodes: 256,
+      max_chunks: REGION_PAGES,
+      max_dir_blocks: 64,
+      dir_cutover: 16,
+    },
+    arena,
+    0,
+  )
+}
+
+/// One request straight through the device (no differential leg — the DAX reply is the device's, not dispatch's).
+#[cfg(unix)]
+fn dax_exchange(
+  device: &mut Device,
+  driver: &mut SimDriver,
+  bridge: &mut VolumeBridge<'_>,
+  cx: &OpContext,
+  (opcode, unique, nodeid): (Opcode, u64, u64),
+  body: &[u8],
+) -> Vec<u8> {
+  let request = message(opcode.to_wire(), unique, nodeid, body);
+  let queue = FIRST_REQUEST_QUEUE;
+  let head = driver.submit(usize::from(queue), &request, 4096, 1);
+  serve(device, queue, driver, bridge, cx, BATCH).unwrap();
+  let (id, len) = driver.reap(usize::from(queue)).expect("a used element");
+  assert_eq!(id, head);
+  driver.reply_of(usize::from(queue), head, len)
+}
+
+/// §4.6 (AC-4.12, the device DAX window end to end). Do: on a shared-backed volume with a file of known bytes and
+/// writable DAX opted in, offer the device a cache region, serve FUSE_INIT, then a guest FUSE_SETUPMAPPING for the
+/// file writable; read the window; write through it; then FUSE_REMOVEMAPPING. Expect: setup succeeds, the window shows
+/// the file's bytes (a real shared mapping — what a guest reaches through its own page table), a write through the
+/// window reaches the file's block, and removemapping tears the window down (no live window left). No VMM, no KVM.
+#[cfg(unix)]
+#[test]
+fn a_guest_setupmapping_maps_the_file_into_the_dax_window_and_removemapping_tears_it_down() {
+  use slates_mem::{SharedObject, Words};
+  let page = rustix::param::page_size().max(1);
+  let mut store = dax_shared_store(page);
+  let mut vol = volume(&mut store);
+  vol.enable_writable_dax();
+  let root = vol.root_inode(&store).unwrap();
+  let no = vol.create_file_no(&mut store, root, "f", 0o644).unwrap();
+  vol.write(&mut store, no, 0, &vec![0x5A; page]).unwrap();
+  let nodeid = no.0;
+
+  let (mut device, mut driver) = device_and_driver();
+  // The VMM's cache window: a shared object the device maps block pages into.
+  let cache = SharedObject::create(&format!("sl-daxwin-{}", std::process::id()), page * 4, Words::new()).unwrap();
+  device.install_dax_window(Some(
+    slates_bridge_virtiofs::dax::DaxCacheRegion::new(cache.as_fd(), (page * 4) as u64).unwrap(),
+  ));
+  assert!(device.dax_offered(), "the device serves DAX now a window is installed");
+
+  let cx = context();
+  let mut bridge = VolumeBridge::new(vid(), &mut vol, &mut store);
+
+  // FUSE_INIT brings the connection up (fuse_init_in: major, minor, max_readahead, flags = 4 u32, then flags2/unused).
+  let mut init = Vec::new();
+  init.extend_from_slice(&7u32.to_le_bytes()); // major
+  init.extend_from_slice(&38u32.to_le_bytes()); // minor
+  init.extend_from_slice(&0u32.to_le_bytes()); // max_readahead
+  init.extend_from_slice(&0u32.to_le_bytes()); // flags
+  init.resize(64, 0); // the kernel sends a 64-byte init_in; the codec reads what it needs
+  let init_reply = dax_exchange(&mut device, &mut driver, &mut bridge, &cx, (Opcode::Init, 1, ROOT), &init);
+  assert_eq!(reply_error(&init_reply), 0, "INIT served");
+
+  // FUSE_SETUPMAPPING: fh, foffset=0, len=page, flags=WRITE, moffset=0.
+  let mut setup = Vec::new();
+  setup.extend_from_slice(&0u64.to_le_bytes()); // fh (slates maps by nodeid)
+  setup.extend_from_slice(&0u64.to_le_bytes()); // foffset
+  setup.extend_from_slice(&(page as u64).to_le_bytes()); // len
+  setup.extend_from_slice(&slates_bridge_fuse::request::SETUPMAPPING_FLAG_WRITE.to_le_bytes()); // flags = write
+  setup.extend_from_slice(&0u64.to_le_bytes()); // moffset
+  let setup_reply =
+    dax_exchange(&mut device, &mut driver, &mut bridge, &cx, (Opcode::SetupMapping, 2, nodeid), &setup);
+  assert_eq!(reply_error(&setup_reply), 0, "SETUPMAPPING succeeded over the DAX window");
+  assert_eq!(device.dax_window_count(), 1, "one live window mapping");
+
+  // The window shows the file's bytes — the guest would reach these through its own page table, no daemon call.
+  assert_eq!(
+    device.dax_window_bytes(0, 64).unwrap(),
+    vec![0x5A; 64],
+    "the DAX window reaches the file's content block"
+  );
+
+  // FUSE_REMOVEMAPPING: count=1, (moffset=0, len=page).
+  let mut remove = Vec::new();
+  remove.extend_from_slice(&1u32.to_le_bytes()); // count
+  remove.extend_from_slice(&0u64.to_le_bytes()); // moffset
+  remove.extend_from_slice(&(page as u64).to_le_bytes()); // len
+  let remove_reply =
+    dax_exchange(&mut device, &mut driver, &mut bridge, &cx, (Opcode::RemoveMapping, 3, nodeid), &remove);
+  assert_eq!(reply_error(&remove_reply), 0, "REMOVEMAPPING succeeded");
+  assert_eq!(device.dax_window_count(), 0, "the window mapping was torn down");
+
+  drop(cache);
+}
