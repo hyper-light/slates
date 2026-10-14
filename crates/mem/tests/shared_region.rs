@@ -133,3 +133,38 @@ fn a_range_off_the_mapping_granule_is_refused() {
     "{refused:?}"
   );
 }
+
+/// The virtio-fs DAX window's foundation (§4.6): a block in a shared-object-backed region exposes its backing
+/// descriptor and byte offset, so the device can map the block's pages into a guest's page table through a VMM's
+/// cache region. A private (anonymous) region exposes no descriptor — there is none to hand a VMM — so DAX is
+/// confined to anchor-backed volumes. The offset and length are the block's own, and the fd is the region's object
+/// (the very descriptor whose bytes the arena already serves, proven by the first test above).
+#[cfg(unix)]
+#[test]
+fn block_backing_exposes_a_shared_regions_fd_and_none_for_a_private_one() {
+  use std::os::fd::AsRawFd;
+  let object = SharedObject::create(&object_name("daxfd"), LEN, Words::new()).unwrap();
+  let mut arena = ChunkArena::new(PAGE);
+  // SAFETY: this test is the object's only mapper, and the object declares no words.
+  arena
+    .add_region(Region::shared(unsafe { ExclusiveObject::new(object) }, PAGE))
+    .unwrap();
+  let extent = arena.alloc(PAGE).unwrap();
+
+  let (fd, off, len) = arena
+    .block_backing(extent)
+    .expect("a shared-object region exposes its backing fd for the DAX window");
+  assert_eq!(off, extent.offset(), "the offset is the block's offset within the object");
+  assert_eq!(len, extent.len(), "the length is the block's length");
+  assert!(fd.as_raw_fd() >= 0, "a live descriptor is handed back");
+  arena.free(extent).unwrap();
+
+  // A private (anonymous) region has no descriptor, so no DAX fd.
+  let mut private = ChunkArena::new(PAGE);
+  private.add_region(Region::map(LEN, PAGE, false).unwrap()).unwrap();
+  let anon = private.alloc(PAGE).unwrap();
+  assert!(
+    private.block_backing(anon).is_none(),
+    "a private (anonymous) region exposes no DAX fd"
+  );
+}

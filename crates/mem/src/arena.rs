@@ -1172,6 +1172,25 @@ impl ChunkArena {
   pub fn region_mut(&mut self, index: u16) -> Option<&mut Region> {
     self.slot_mut(index).map(|s| &mut s.region)
   }
+
+  /// The backing descriptor, byte offset and length of `extent`'s block, for the virtio-fs DAX window to map its
+  /// pages into a VMM's cache region (§4.6): `(fd, offset, len)` when the block lives in a shared-object (anchor-
+  /// backed) region and the extent lies within it, or `None` for a private (anonymous) region, an unknown region id,
+  /// or an out-of-range extent. The device maps `[offset, offset + len)` of the fd read-only or writable per the
+  /// mapping's rights; the caller holds the gate's pin, so the block is neither reused nor freed while mapped and the
+  /// bytes behind the fd are stable. Unix only (the DAX window is Linux/vhost-user). No reference to the bytes is
+  /// formed, so the arena's exclusive ownership of its own mappings is untouched.
+  #[cfg(unix)]
+  pub fn block_backing(
+    &self,
+    extent: Extent,
+  ) -> Option<(std::os::fd::BorrowedFd<'_>, usize, usize)> {
+    // Bounds-check the extent against the region exactly as `bytes` does, so an out-of-range or foreign extent is
+    // `None`, never an fd + offset that would map past the object.
+    self.bytes(extent)?;
+    let fd = self.region(extent.region())?.backing_fd()?;
+    Some((fd, extent.offset(), extent.len()))
+  }
 }
 
 #[cfg(test)]

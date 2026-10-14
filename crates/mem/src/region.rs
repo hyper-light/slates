@@ -62,6 +62,18 @@ pub struct Region {
 }
 
 impl Region {
+  /// A borrow of the region's shared-object descriptor, or `None` for a private (anonymous) region — the virtio-fs
+  /// DAX window maps a content block's pages into a VMM's cache region from this fd, and only a shared-object-backed
+  /// region (anchor-owned content RAM, §4.7/§4.8) has one; a private region's pages are the process's own, with no
+  /// descriptor to hand a VMM. Unix only (the DAX window is Linux/vhost-user). No reference to the bytes is formed.
+  #[cfg(unix)]
+  pub fn backing_fd(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
+    match &self.backing {
+      Backing::Shared(object) => Some(object.as_fd()),
+      Backing::Anon(_) => None,
+    }
+  }
+
   /// Maps `len` bytes (rounded up to whole pages of `page` bytes). `huge` asks the OS to back
   /// the region with transparent huge pages where that exists (Linux `MADV_HUGEPAGE`).
   pub fn map(len: usize, page: usize, huge: bool) -> Result<Region, MemError> {

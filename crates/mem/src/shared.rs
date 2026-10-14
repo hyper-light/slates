@@ -103,6 +103,13 @@ impl SharedObject {
     self.inner.handoff()
   }
 
+  /// A borrow of the object's descriptor, for mapping a range of it into a VMM's DAX cache region (§4.6). Unix only
+  /// (the DAX window is a Linux/vhost-user feature); no reference to the bytes is formed.
+  #[cfg(unix)]
+  pub fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+    self.inner.as_fd()
+  }
+
   /// The mapped length.
   pub fn len(&self) -> usize {
     self.len
@@ -254,6 +261,13 @@ impl ExclusiveObject {
   /// The object's handoff, for the process that re-wraps it after this one.
   pub fn handoff(&self) -> Result<Handoff, MemError> {
     self.0.handoff()
+  }
+
+  /// A borrow of the object's descriptor, for the virtio-fs DAX window mapping a content block's pages into a VMM's
+  /// cache region (§4.6). Unix only; no reference to the bytes is formed, so the arena's exclusivity is kept.
+  #[cfg(unix)]
+  pub fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+    self.0.as_fd()
   }
 
   /// Locks the whole object into RAM (D-12).
@@ -944,6 +958,14 @@ mod platform {
     /// The whole map, writable, for [`super::ExclusiveObject`] only.
     pub(super) fn bytes_mut(&mut self) -> &mut [u8] {
       &mut self.map
+    }
+
+    /// A borrow of the object's descriptor (its `memfd`/`shm` fd), for a caller that maps a range of the object
+    /// *elsewhere* — the virtio-fs DAX window mapping a content block's pages into a VMM's cache region (§4.6). No
+    /// reference to the bytes is formed; the borrow lasts only as long as `&self`.
+    pub(super) fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+      use std::os::fd::AsFd;
+      self.fd.as_fd()
     }
 
     /// Gives the whole pages inside `offset .. offset + len` back to the OS, leaving a hole that reads as zeros in
