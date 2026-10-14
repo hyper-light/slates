@@ -1,0 +1,30 @@
+# syntax=ghcr.io/hyper-light/shards
+#
+# A shards microVM that applies a slates VFS over shards' NATIVE virtio-fs backend (§4.6, the slates integration).
+# The guest mounts a slates volume by its virtio-fs tag `shards0` — no kernel NFS, no host mount, no 9p. slates'
+# `bridge-fuse` `shards_fs::serve` is the backend; it speaks the same le32-length + FUSE framing shards' fs device
+# speaks (`Slot::ask`/`write_frame`/`read_frame`), so the device, pointed at a slates daemon's socket, reaches the
+# volume directly.
+#
+# DAX compatibility: the slates side IS DAX-capable (the device DAX window — FUSE SETUPMAPPING over a pinned
+# arena block — is built and hardened; see ../../wip/SLATES_DESIGN.md §4.6 and the [[dax-mapping-gate]] memory). The
+# shards microVM gets the NON-DAX FUSE path here, because shards' fs device has no guest-physical DAX cache window
+# yet; when it gains one, the same backend serves SETUPMAPPING and the guest reaches the block through its own page
+# table. So "DAX-compatible" = the backend supports DAX; the microVM is accelerated once shards adds the window.
+#
+# STATUS of the directive below: the `SLATES` line is the INTENDED high-level packaging. It is NOT yet a shards
+# Agentfile directive — the daemon-side wiring (connect to the slates socket, hand the descriptor to the VM's fs
+# share slot, as the daemon already does for its share process) is the shards-side follow-up. The WORKING mechanism
+# today is the low-level `run --kernel … --slates-fs-fd <N>` flag, which this repo builds and proves end to end
+# (slates `crates/bridge-fuse`; shards `crates/shards/src/vm_run.rs` + `crates/shards/tests/slates_fs.rs`). See
+# README.md for the full runnable recipe.
+
+FROM alpine:3.22
+
+# Mount a slates volume, served by a slates daemon on SLATES_SOCK, at tag `shards0` -> /slates.
+# (Proposed directive; today this is `--slates-fs-fd <N>`, the daemon filling the share slot from the socket.)
+SLATES ${SLATES_SOCK} shards0 /slates
+
+# Hand off to the workload once the slates volume is mounted.
+ENTRYPOINT ["/bin/sh", "-c", "mount -t virtiofs shards0 /slates && exec \"$@\"", "--"]
+CMD ["cat", "/slates/hello"]
