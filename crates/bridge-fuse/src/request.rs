@@ -409,3 +409,137 @@ impl FallocateIn {
     })
   }
 }
+
+/// Format: the `fuse_setupmapping_in` flag asking for a writable DAX mapping (`FUSE_SETUPMAPPING_FLAG_WRITE`);
+/// `1 << 1` is the read flag. slates copies a file up before a writable mapping (`Volume::dax_map_write`), so a
+/// writable request is the one that must not land on immutable or snapshot-shared content.
+pub const SETUPMAPPING_FLAG_WRITE: u64 = 1 << 0;
+
+/// The fields of a `FUSE_SETUPMAPPING` body (`struct fuse_setupmapping_in`): the open handle, the file offset and
+/// length to map, the flags (bit 0 writable), and the offset in the guest's DAX window to place the mapping at.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SetupMappingIn {
+  /// The open file handle.
+  pub fh: u64,
+  /// The first file byte to map.
+  pub foffset: u64,
+  /// The length to map.
+  pub len: u64,
+  /// The flags (`SETUPMAPPING_FLAG_WRITE` asks for a writable mapping).
+  pub flags: u64,
+  /// The offset in the DAX window the guest wants the mapping placed at.
+  pub moffset: u64,
+}
+
+impl SetupMappingIn {
+  /// Parses a setupmapping body; refuses one shorter than its five fields.
+  pub fn parse(opcode: u32, body: &[u8]) -> Result<SetupMappingIn, FuseError> {
+    let mut r = Reader::new(body);
+    Ok(SetupMappingIn {
+      fh: r.u64(opcode)?,
+      foffset: r.u64(opcode)?,
+      len: r.u64(opcode)?,
+      flags: r.u64(opcode)?,
+      moffset: r.u64(opcode)?,
+    })
+  }
+
+  /// Whether the guest asked for a writable mapping.
+  #[must_use]
+  pub fn writable(&self) -> bool {
+    self.flags & SETUPMAPPING_FLAG_WRITE != 0
+  }
+}
+
+/// One entry of a `FUSE_REMOVEMAPPING` body (`struct fuse_removemapping_one`): a window offset and length to unmap.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RemoveMappingOne {
+  /// The window offset to unmap.
+  pub moffset: u64,
+  /// The length to unmap.
+  pub len: u64,
+}
+
+/// The fields of a `FUSE_REMOVEMAPPING` body (`struct fuse_removemapping_in`): a count, then that many
+/// `fuse_removemapping_one` entries. A count claiming more entries than the body carries is refused `ShortBody`
+/// (the per-entry `u64` read below bounds-checks), so a hostile count never over-reads or over-allocates.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RemoveMappingIn {
+  /// The window ranges to unmap.
+  pub entries: Vec<RemoveMappingOne>,
+}
+
+impl RemoveMappingIn {
+  /// Parses a removemapping body; refuses one whose count claims more entries than the body carries.
+  pub fn parse(opcode: u32, body: &[u8]) -> Result<RemoveMappingIn, FuseError> {
+    let mut r = Reader::new(body);
+    let count = r.u32(opcode)?;
+    let mut entries = Vec::new();
+    for _ in 0..count {
+      entries.push(RemoveMappingOne {
+        moffset: r.u64(opcode)?,
+        len: r.u64(opcode)?,
+      });
+    }
+    Ok(RemoveMappingIn { entries })
+  }
+}
+
+#[cfg(test)]
+mod dax_mapping_parse_tests {
+  use super::{RemoveMappingIn, RemoveMappingOne, SetupMappingIn};
+  use crate::abi::Opcode;
+
+  /// A well-formed SETUPMAPPING body parses to its five fields and reports writability from the flag.
+  #[test]
+  fn a_well_formed_setupmapping_parses_and_reads_the_write_flag() {
+    let op = Opcode::SetupMapping.to_wire();
+    let mut body = Vec::new();
+    for field in [7u64, 4096, 8192, super::SETUPMAPPING_FLAG_WRITE, 0x10_0000] {
+      body.extend_from_slice(&field.to_le_bytes());
+    }
+    let parsed = SetupMappingIn::parse(op, &body).expect("a full setupmapping body parses");
+    assert_eq!(parsed.fh, 7);
+    assert_eq!(parsed.foffset, 4096);
+    assert_eq!(parsed.len, 8192);
+    assert_eq!(parsed.moffset, 0x10_0000);
+    assert!(parsed.writable(), "the write flag is read");
+    // A read-only (flags = 0) request is not writable.
+    body[24..32].copy_from_slice(&0u64.to_le_bytes());
+    assert!(!SetupMappingIn::parse(op, &body).unwrap().writable());
+  }
+
+  /// A SETUPMAPPING body shorter than its five fields is refused, never read past its end.
+  #[test]
+  fn a_short_setupmapping_is_refused() {
+    let op = Opcode::SetupMapping.to_wire();
+    assert!(SetupMappingIn::parse(op, &[0u8; 39]).is_err(), "39 bytes is one short of the five u64s");
+    assert!(SetupMappingIn::parse(op, &[]).is_err(), "an empty body is refused");
+  }
+
+  /// REMOVEMAPPING parses its count's worth of entries; a count larger than the body is refused, never
+  /// over-read or over-allocated.
+  #[test]
+  fn removemapping_parses_its_entries_and_refuses_a_count_past_the_body() {
+    let op = Opcode::RemoveMapping.to_wire();
+    let mut body = 2u32.to_le_bytes().to_vec();
+    for (moffset, len) in [(0u64, 4096u64), (8192, 4096)] {
+      body.extend_from_slice(&moffset.to_le_bytes());
+      body.extend_from_slice(&len.to_le_bytes());
+    }
+    let parsed = RemoveMappingIn::parse(op, &body).expect("two entries parse");
+    assert_eq!(
+      parsed.entries,
+      vec![
+        RemoveMappingOne { moffset: 0, len: 4096 },
+        RemoveMappingOne { moffset: 8192, len: 4096 },
+      ]
+    );
+    // A count of 1000 with only two entries' worth of bytes is refused, not over-read.
+    let mut lying = 1000u32.to_le_bytes().to_vec();
+    lying.extend_from_slice(&body[4..]);
+    assert!(RemoveMappingIn::parse(op, &lying).is_err(), "a count past the body is refused");
+    // A huge count does not over-allocate before it refuses.
+    assert!(RemoveMappingIn::parse(op, &u32::MAX.to_le_bytes()).is_err());
+  }
+}

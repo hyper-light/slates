@@ -92,6 +92,12 @@ pub enum Opcode {
   ReadDirPlus = 44,
   /// Format: FUSE_RENAME2 — rename with flags (`RENAME_EXCHANGE`, `RENAME_NOREPLACE`).
   Rename2 = 45,
+  /// Format: FUSE_SETUPMAPPING — map a file range into the virtio-fs DAX window so the guest reaches the content
+  /// arena's block through its own page table, with no per-access daemon call (§4.6 A-9, AC-4.12). Served only
+  /// behind the DAX gate (`slates_vfs::dax`); plain `/dev/fuse` has no window and the seam replies unsupported.
+  SetupMapping = 48,
+  /// Format: FUSE_REMOVEMAPPING — tear down DAX window mappings the guest no longer holds.
+  RemoveMapping = 49,
   /// Format: FUSE_TMPFILE — an unnamed file in a directory, open (`open(dir, O_TMPFILE)`, Linux 6.11+): the body of
   /// FUSE_CREATE, the reply of FUSE_CREATE.
   TmpFile = 51,
@@ -133,6 +139,8 @@ const ALL: &[Opcode] = &[
   Opcode::Fallocate,
   Opcode::ReadDirPlus,
   Opcode::Rename2,
+  Opcode::SetupMapping,
+  Opcode::RemoveMapping,
   Opcode::TmpFile,
 ];
 

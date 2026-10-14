@@ -169,6 +169,34 @@ pub fn dispatch(message: &[u8], bridge: &mut dyn Bridge, cx: &OpContext, out: &m
     // stepping channel serves it (`crate::allocate`, A-108), and a transport that only dispatches answers that it is
     // not supported, which glibc's `posix_fallocate` answers by writing zeros itself.
     Opcode::Fallocate => write_or_drop(ReplyHeader::write_error(unique, EOPNOTSUPP, out), out),
+    // SETUPMAPPING/REMOVEMAPPING are the virtio-fs DAX window verbs. The DAX gate (`slates_vfs::dax`) is built
+    // and hardened, but the device-side window is not yet wired, so DAX stays unadvertised in FUSE_INIT — a
+    // conformant guest never sends these. A guest that sends one anyway (unnegotiated, hostile or confused) is
+    // handled defensively: the body is parsed so a malformed one is refused before any effect, SETUPMAPPING is
+    // declined EOPNOTSUPP (the guest falls back to ordinary READ/WRITE) and REMOVEMAPPING of nothing is a success
+    // no-op. When the window is wired these route to the bridge's mapping verbs behind the gate.
+    Opcode::SetupMapping => serve_setup_mapping(&request, out),
+    Opcode::RemoveMapping => serve_remove_mapping(&request, out),
+  }
+}
+
+/// FUSE_SETUPMAPPING served defensively while the DAX window is unwired (above): parse (refusing a malformed body
+/// `EIO`), then decline `EOPNOTSUPP` since no window is established for the mapping.
+fn serve_setup_mapping(req: &Request<'_>, out: &mut [u8]) -> usize {
+  let unique = req.header.unique;
+  match crate::request::SetupMappingIn::parse(Opcode::SetupMapping.to_wire(), req.body) {
+    Ok(_) => write_or_drop(ReplyHeader::write_error(unique, EOPNOTSUPP, out), out),
+    Err(e) => refuse_unparsed(unique, e, out),
+  }
+}
+
+/// FUSE_REMOVEMAPPING served defensively while the DAX window is unwired: parse (refusing a malformed body `EIO`),
+/// then succeed as a no-op — there is no window mapping to remove.
+fn serve_remove_mapping(req: &Request<'_>, out: &mut [u8]) -> usize {
+  let unique = req.header.unique;
+  match crate::request::RemoveMappingIn::parse(Opcode::RemoveMapping.to_wire(), req.body) {
+    Ok(_) => reply(unique, Ok::<(), VfsError>(()), |()| Vec::new(), out),
+    Err(e) => refuse_unparsed(unique, e, out),
   }
 }
 

@@ -58,6 +58,8 @@ const OPCODES: &[(Opcode, u32)] = &[
   (Opcode::Fallocate, 43),
   (Opcode::ReadDirPlus, 44),
   (Opcode::Rename2, 45),
+  (Opcode::SetupMapping, 48),
+  (Opcode::RemoveMapping, 49),
   (Opcode::TmpFile, 51),
 ];
 
@@ -66,8 +68,8 @@ const OPCODES: &[(Opcode, u32)] = &[
 const UNSERVED_OPCODES: &[u32] = &[
   31, 32, 33, 34, // GETLK, SETLK, SETLKW, ACCESS
   36, 37, 39, 40, 41, // INTERRUPT, BMAP, IOCTL, POLL, NOTIFY_REPLY
-  46, 47, 48, 49, 50, 52,
-  53,   // LSEEK .. SYNCFS, STATX, COPY_FILE_RANGE_64 (51, TMPFILE, is served)
+  46, 47, 50, 52, // LSEEK, COPY_FILE_RANGE, SYNCFS, STATX (48/49 SETUPMAPPING/REMOVEMAPPING now served)
+  53,   // COPY_FILE_RANGE_64 (51, TMPFILE, is served)
   4096, // CUSE_INIT
 ];
 
