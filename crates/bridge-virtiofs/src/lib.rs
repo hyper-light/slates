@@ -55,6 +55,10 @@
 pub mod admission;
 pub mod capability;
 pub mod credit;
+// The DAX cache region maps content blocks' pages into a guest's page table (`MAP_FIXED`), which is a Unix feature;
+// the primitive is exercised on macOS over an `shm` object, so it is `cfg(unix)`, not Linux-only.
+#[cfg(unix)]
+pub mod dax;
 pub mod device;
 pub mod memory;
 // The device loop rides the runtime's descriptor readiness, which is Unix (kqueue/epoll); a guest

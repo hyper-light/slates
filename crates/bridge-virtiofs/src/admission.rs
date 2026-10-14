@@ -140,47 +140,15 @@ pub trait VmmSeam {
   /// action, and the cleanup of a failed admission. Idempotent.
   fn release(&mut self);
 
-  /// The DAX cache region this seam offers (§4.6), or `None` when the VMM set up none — then DAX cannot be served and
-  /// is not advertised. The device places a content block's pages at a page-aligned offset within `[0, window.len)`.
-  /// Default: none (the in-process form and any seam that has not wired a cache region offer no DAX). Unix only (the
-  /// DAX window is a Linux/vhost-user feature).
+  /// The DAX cache region this seam offers (§4.6): the VMM's cache-window descriptor and its length in bytes, or
+  /// `None` when the VMM set up none — then DAX cannot be served and is not advertised. The device maps this fd once
+  /// to build a [`crate::dax::DaxCacheRegion`] and places content blocks' pages into it with `MAP_FIXED`. Asked once
+  /// at admission. Default: none (the in-process form and any seam that has not wired a cache region offer no DAX).
+  /// Unix only (the DAX window is a Linux/vhost-user feature).
   #[cfg(unix)]
-  fn dax_window(&self) -> Option<DaxWindow> {
+  fn dax_window(&mut self) -> Option<(std::os::fd::BorrowedFd<'_>, u64)> {
     None
   }
-
-  /// Maps `len` bytes at `foffset` of `fd` into the DAX cache region at `moffset`, writable or read-only per
-  /// `writable` — a content block's pages placed in the guest's page table for FUSE_SETUPMAPPING, so the guest reaches
-  /// the arena bytes through its own MMU with no daemon call. Refuses [`SeamError::DaxMapRefused`] for a seam with no
-  /// window, a range outside it, or an `mmap` the host refused. Default: refuses. Unix only.
-  #[cfg(unix)]
-  fn dax_map(
-    &mut self,
-    _moffset: u64,
-    _len: u64,
-    _fd: std::os::fd::BorrowedFd<'_>,
-    _foffset: u64,
-    _writable: bool,
-  ) -> Result<(), SeamError> {
-    Err(SeamError::DaxMapRefused)
-  }
-
-  /// Unmaps `len` bytes of the DAX cache region at `moffset`, replacing them with an inert (faulting/zero) mapping —
-  /// FUSE_REMOVEMAPPING, and the teardown half of a revoke (the guest's stale page table no longer reaches the block).
-  /// Idempotent where supported. Refuses [`SeamError::DaxMapRefused`] by default (no window). Unix only.
-  #[cfg(unix)]
-  fn dax_unmap(&mut self, _moffset: u64, _len: u64) -> Result<(), SeamError> {
-    Err(SeamError::DaxMapRefused)
-  }
-}
-
-/// The DAX cache region a VMM presents to the device (§4.6): a shared window the guest sees as its DAX BAR, into which
-/// the device maps content blocks' pages. The device places mappings at page-aligned offsets within `[0, len)`.
-#[cfg(unix)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct DaxWindow {
-  /// The cache region's size in bytes.
-  pub len: u64,
 }
 
 /// Why a requested form is unsupported (the `reason` of `AttachmentUnsupported`).

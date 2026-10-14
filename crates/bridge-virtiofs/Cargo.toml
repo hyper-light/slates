@@ -19,10 +19,10 @@ slates-rt = { workspace = true }
 # The inherited-descriptor binding maps the guest's memory objects through `SharedObject` (Linux).
 slates-mem = { workspace = true }
 
-[target.'cfg(target_os = "linux")'.dependencies]
-# The vhost-user back end: the socket's peer credentials, descriptors by `SCM_RIGHTS`, the kick and call
-# eventfds and the epoll doorbell — descriptor calls on memory objects and an inherited socket, never a host
-# path (R1).
+[target.'cfg(unix)'.dependencies]
+# Descriptor and memory-object syscalls, never a host path (R1): the DAX cache region's `mmap`/`munmap`
+# (`src/dax.rs`, every Unix host — exercised on macOS over an `shm` object), and on Linux the vhost-user back end's
+# socket peer credentials, `SCM_RIGHTS` descriptors, the kick/call eventfds and the epoll doorbell.
 rustix = { workspace = true }
 
 [dev-dependencies]
