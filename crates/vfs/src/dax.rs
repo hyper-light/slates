@@ -81,6 +81,10 @@ pub struct Mapping {
   pub file_len: usize,
   /// Whether the guest may write these pages.
   pub writable: bool,
+  /// Whether this mapping **owns** its block — a materialized metadata snapshot (§4.6 metadata DAX: a directory's
+  /// entries serialized into a throwaway content block, [`Volume::dax_map_dir`]), freed when the mapping is revoked.
+  /// `false` for a file's content block, which the inode owns and a revoke only unpins (never frees) — the common case.
+  pub snapshot: bool,
 }
 
 impl Mapping {
@@ -298,12 +302,83 @@ impl Volume {
       block,
       file_len,
       writable: false,
+      snapshot: false,
     };
     if let Err(refusal) = store.dax.register(mapping) {
       // The registry is full: undo the pin so a refused map leaves nothing held.
       if store.content.arena_mut().unpin(block).is_err() {
         store.release_refusals = store.release_refusals.saturating_add(1);
       }
+      return Err(refusal);
+    }
+    Ok(mapping)
+  }
+
+  /// Maps directory inode `no`'s entries into a guest window, **read-only**, as a flat guest-readable snapshot
+  /// (§4.6 metadata DAX, READDIR). A directory's entries are not stored in a mappable content block (they live in a
+  /// copy-on-write B+-tree of slotted slab blocks, `dirtree`), so the daemon serializes them into a freshly allocated
+  /// content block and maps that — a guest then lists the directory by reading the block through its own page table,
+  /// with no FUSE READDIR round-trip per listing. The block is a throwaway the mapping **owns**
+  /// ([`Mapping::snapshot`]): pinned while mapped, freed when the mapping is revoked. A read-only snapshot taken at
+  /// map time — a later daemon change to the directory revokes the mapping (an inode's mappings are revoked on its
+  /// mutation, as a file's are on write), so the guest re-maps to see the change.
+  ///
+  /// Refused as [`Volume::dax_map_read`] is (an attribute inode is `NotFound`, defence in depth for the device seam);
+  /// `NotDirectory` for a non-directory; `NoSpace` if the entry count overflows or the registry is full;
+  /// `NameTooLong` for a name past 255 bytes. Layout (little-endian): `u32` entry count, then that many records —
+  /// `u64` inode, `u8` kind (1 file, 2 dir, 3 symlink, 4 fifo, 5 socket), `u8` name length, the name's UTF-8 bytes.
+  pub fn dax_map_dir(&mut self, store: &mut Store, no: InodeNo) -> Result<Mapping, VfsError> {
+    self.namespace_inode(&*store, no)?;
+    // Serialize while the rows borrow the store immutably; the block allocation below is the mutable step.
+    let serialized = {
+      let rows = self.readdir_no(&*store, no)?;
+      let count = u32::try_from(rows.len()).map_err(|_| VfsError::NoSpace)?;
+      let mut buf = Vec::new();
+      buf.extend_from_slice(&count.to_le_bytes());
+      for row in &rows {
+        let name = row.name.as_bytes();
+        let name_len = u8::try_from(name.len()).map_err(|_| VfsError::NameTooLong)?;
+        let kind = match row.kind {
+          crate::inode::Kind::File => 1u8,
+          crate::inode::Kind::Dir => 2,
+          crate::inode::Kind::Symlink => 3,
+          crate::inode::Kind::Fifo => 4,
+          crate::inode::Kind::Socket => 5,
+        };
+        buf.extend_from_slice(&row.inode.0.to_le_bytes());
+        buf.push(kind);
+        buf.push(name_len);
+        buf.extend_from_slice(name);
+      }
+      buf
+    };
+    let file_len = serialized.len();
+    let block = store.content.alloc_block(file_len.max(1), false)?;
+    if let Some(bytes) = store.content.arena_mut().bytes_mut(block) {
+      if let Some(head) = bytes.get_mut(..file_len) {
+        head.copy_from_slice(&serialized);
+      }
+      if let Some(tail) = bytes.get_mut(file_len..) {
+        tail.fill(0);
+      }
+    }
+    if let Err(pin) = store.content.arena_mut().pin(block) {
+      // Allocated but unpinnable: free the throwaway so a refused map leaves nothing held.
+      let _ = store.content.arena_mut().free(block);
+      return Err(VfsError::Memory(pin));
+    }
+    let mapping = Mapping {
+      inode: no,
+      block,
+      file_len,
+      writable: false,
+      snapshot: true,
+    };
+    if let Err(refusal) = store.dax.register(mapping) {
+      if store.content.arena_mut().unpin(block).is_err() {
+        store.release_refusals = store.release_refusals.saturating_add(1);
+      }
+      let _ = store.content.arena_mut().free(block);
       return Err(refusal);
     }
     Ok(mapping)
@@ -344,6 +419,7 @@ impl Volume {
       block,
       file_len,
       writable: true,
+      snapshot: false,
     };
     if let Err(refusal) = store.dax.register(mapping) {
       if store.content.arena_mut().unpin(block).is_err() {
@@ -418,6 +494,7 @@ impl Volume {
       block: new_block,
       file_len: old.file_len,
       writable: true,
+      snapshot: old.snapshot,
     };
     if let Err(refusal) = store.dax.register(mapping) {
       // The registry had room (we just removed `old`), so this is defensive: unpin the new block so a refused
@@ -571,6 +648,9 @@ impl Store {
     }
     // A revoked mapping's integrity guard (§4.6 B2), if any, goes with it so its clean copy is not left pinned.
     self.drop_guard(mapping);
+    // A metadata snapshot owns its throwaway block (no inode references it); free it now the pin is gone, or it would
+    // leak. A file's content block (the common case) is inode-owned — a revoke only unpinned it, never freed it.
+    self.free_snapshot_block(mapping);
     true
   }
 
@@ -721,11 +801,24 @@ impl Store {
   /// `release_refusals`, never a silent double-free.
   pub fn dax_release_after_unmap(&mut self, mapping: &Mapping) -> bool {
     match self.content.arena_mut().unpin(mapping.block) {
-      Ok(_) => true,
+      Ok(_) => {
+        // A metadata snapshot owns its throwaway block; free it now the pin is gone (phase two), or it would leak.
+        self.free_snapshot_block(mapping);
+        true
+      }
       Err(_) => {
         self.release_refusals = self.release_refusals.saturating_add(1);
         false
       }
+    }
+  }
+
+  /// Frees the throwaway content block a metadata-snapshot mapping ([`Volume::dax_map_dir`]) owns, once its pin is
+  /// gone. A no-op for a file's content block (the inode owns it; only the inode's own lifecycle frees it). A free
+  /// the arena refuses is counted, never a silent leak or double-free.
+  fn free_snapshot_block(&mut self, mapping: &Mapping) {
+    if mapping.snapshot && self.content.arena_mut().free(mapping.block).is_err() {
+      self.release_refusals = self.release_refusals.saturating_add(1);
     }
   }
 
