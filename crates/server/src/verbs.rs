@@ -4474,6 +4474,26 @@ fn snapshot(state: &mut ShardState, principal: &Principal, volume: VolumeId) -> 
   if !rights_of(&record, principal).write {
     return forbidden("snapshot");
   }
+  // Before freezing, recall any live WRITABLE DAX window of this volume (§4.6): the snapshot shares the window's
+  // block with the frozen version, and a guest's direct DAX write through a stale writable window would reach that
+  // frozen version (CoW cannot see a hardware write). `dax_revoke_writable_of_prefix` hands each writable window to
+  // the device to munmap (two-phase, writable-only — read-only windows survive as immutable shared content); the
+  // snapshot is refused **retryable** until the device has drained them (`has_pending_of_prefix` clears), so it
+  // freezes only once no writable window can still reach a shared block — the writable-DAX↔snapshot exclusion, the
+  // same shape a write delegation needs. A no-op on a volume with no writable DAX window — the production case,
+  // since DAX stays unadvertised (§4.6 A-9); reached only once a guest holds a writable window.
+  let prefix = match state.volumes.get(handle) {
+    Ok(slot) => slot.volume.prefix(),
+    Err(_) => return refused(Refusal::NotFound),
+  };
+  if state.store.dax.has_writable_of_prefix(prefix) {
+    state.store.dax_revoke_writable_of_prefix(prefix);
+  }
+  if state.store.dax.has_pending_of_prefix(prefix) {
+    // The device munmaps the recalled windows on its next service pass; the client's retry meets the
+    // frozen-safe volume once they are drained (the retryable-refusal shape `await_deferred_completion` uses).
+    return refused(Refusal::Overloaded { shard: state.shard });
+  }
   // The volume's next epoch, checked before any effect: an epoch with no successor refuses the snapshot
   // rather than repeat one (AUD-29-26's sibling; reachable only through a maximal recorded epoch).
   let Some(next_epoch) = record.epoch.checked_add(1) else {
