@@ -1472,3 +1472,108 @@ fn a_setupmapping_past_the_window_is_refused() {
   assert_eq!(device.dax_window_count(), 0, "nothing mapped past the window");
   drop(cache);
 }
+
+/// §4.6 (adversarial: a guest remaps a window slot). Do: opt in to writable DAX, map file A's block into window
+/// offset 0, then SETUPMAPPING file B's block into the SAME window offset 0 (a remap). Expect: the remap replaces A
+/// — one live window entry (not two), the window shows B's bytes, and after a later REMOVEMAPPING of offset 0 the
+/// registry holds no live mapping and both A (revoked at the remap) and B (revoked at REMOVEMAPPING) were released.
+/// Without the remap teardown A's entry and pin leak behind B's — `position` at REMOVEMAPPING finds one, the other
+/// stays pinned forever.
+#[cfg(unix)]
+#[test]
+fn a_remap_over_an_occupied_window_slot_revokes_the_old_mapping() {
+  use slates_mem::{SharedObject, Words};
+  let page = rustix::param::page_size().max(1);
+  let mut store = dax_shared_store(page, "remap");
+  let mut vol = volume(&mut store);
+  vol.enable_writable_dax();
+  let root = vol.root_inode(&store).unwrap();
+  let a = vol.create_file_no(&mut store, root, "a", 0o644).unwrap();
+  vol.write(&mut store, a, 0, &vec![0xAA; page]).unwrap();
+  let b = vol.create_file_no(&mut store, root, "b", 0o644).unwrap();
+  vol.write(&mut store, b, 0, &vec![0xBB; page]).unwrap();
+  let (a_no, b_no) = (a.0, b.0);
+
+  let (mut device, mut driver) = device_and_driver();
+  let cache =
+    SharedObject::create(&format!("sl-daxremap-{}", std::process::id()), page * 4, Words::new()).unwrap();
+  device.install_dax_window(Some(
+    slates_bridge_virtiofs::dax::DaxCacheRegion::new(cache.as_fd(), (page * 4) as u64).unwrap(),
+  ));
+  let cx = context();
+  let mut bridge = VolumeBridge::new(vid(), &mut vol, &mut store);
+  dax_exchange(&mut device, &mut driver, &mut bridge, &cx, (Opcode::Init, 1, ROOT), &dax_init_body());
+
+  let ra = dax_exchange(
+    &mut device, &mut driver, &mut bridge, &cx,
+    (Opcode::SetupMapping, 2, a_no), &dax_setup_body(0, page as u64, true, 0),
+  );
+  assert_eq!(reply_error(&ra), 0, "A mapped at window offset 0");
+  assert_eq!(device.dax_window_count(), 1, "one window after A");
+
+  let rb = dax_exchange(
+    &mut device, &mut driver, &mut bridge, &cx,
+    (Opcode::SetupMapping, 3, b_no), &dax_setup_body(0, page as u64, true, 0),
+  );
+  assert_eq!(reply_error(&rb), 0, "B remapped over A's slot");
+  assert_eq!(device.dax_window_count(), 1, "still one window after the remap — A's entry did not leak");
+  assert_eq!(device.dax_window_bytes(0, 64).unwrap(), vec![0xBB; 64], "the window now shows B, not A");
+
+  let mut remove = Vec::new();
+  remove.extend_from_slice(&1u32.to_le_bytes());
+  remove.extend_from_slice(&0u64.to_le_bytes());
+  remove.extend_from_slice(&(page as u64).to_le_bytes());
+  let rr = dax_exchange(
+    &mut device, &mut driver, &mut bridge, &cx, (Opcode::RemoveMapping, 4, b_no), &remove,
+  );
+  assert_eq!(reply_error(&rr), 0, "REMOVEMAPPING of offset 0 served");
+  assert_eq!(device.dax_window_count(), 0, "no window entry left");
+
+  drop(bridge);
+  assert_eq!(store.dax.len(), 0, "no live mapping in the registry — neither A nor B leaked");
+  assert_eq!(store.dax.revoked(), 2, "both A (at the remap) and B (at REMOVEMAPPING) were revoked");
+  drop(cache);
+}
+
+/// §4.6 (terminal teardown). Do: opt in, map a file's block, then send FUSE_DESTROY (the guest unmounting) with no
+/// prior REMOVEMAPPING. Expect: DESTROY tears the live window down — no window entry left, the registry holds no
+/// live mapping, and the block's pin was released (`store.dax.revoked()` moved). Without the teardown drain an
+/// unmount leaks the mapped block's pin for the attachment's life (the deferred free could never reclaim it).
+#[cfg(unix)]
+#[test]
+fn fuse_destroy_tears_down_live_dax_windows() {
+  use slates_mem::{SharedObject, Words};
+  let page = rustix::param::page_size().max(1);
+  let mut store = dax_shared_store(page, "destroy");
+  let mut vol = volume(&mut store);
+  vol.enable_writable_dax();
+  let root = vol.root_inode(&store).unwrap();
+  let no = vol.create_file_no(&mut store, root, "f", 0o644).unwrap();
+  vol.write(&mut store, no, 0, &vec![0x5A; page]).unwrap();
+  let nodeid = no.0;
+
+  let (mut device, mut driver) = device_and_driver();
+  let cache =
+    SharedObject::create(&format!("sl-daxdestroy-{}", std::process::id()), page * 4, Words::new()).unwrap();
+  device.install_dax_window(Some(
+    slates_bridge_virtiofs::dax::DaxCacheRegion::new(cache.as_fd(), (page * 4) as u64).unwrap(),
+  ));
+  let cx = context();
+  let mut bridge = VolumeBridge::new(vid(), &mut vol, &mut store);
+  dax_exchange(&mut device, &mut driver, &mut bridge, &cx, (Opcode::Init, 1, ROOT), &dax_init_body());
+  let r = dax_exchange(
+    &mut device, &mut driver, &mut bridge, &cx,
+    (Opcode::SetupMapping, 2, nodeid), &dax_setup_body(0, page as u64, true, 0),
+  );
+  assert_eq!(reply_error(&r), 0, "mapped");
+  assert_eq!(device.dax_window_count(), 1, "one live window");
+
+  let d = dax_exchange(&mut device, &mut driver, &mut bridge, &cx, (Opcode::Destroy, 3, ROOT), &[]);
+  assert_eq!(reply_error(&d), 0, "DESTROY served");
+  assert_eq!(device.dax_window_count(), 0, "the live window was torn down at unmount");
+
+  drop(bridge);
+  assert_eq!(store.dax.len(), 0, "the registry holds no live mapping after unmount — the pin was not leaked");
+  assert_eq!(store.dax.revoked(), 1, "the mapped block was revoked at teardown");
+  drop(cache);
+}

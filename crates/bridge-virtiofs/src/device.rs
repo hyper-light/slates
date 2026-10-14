@@ -811,6 +811,21 @@ impl Device {
     self.reply.resize(reply_room, 0);
     let header = InHeader::parse(&self.request).ok();
     self.observe(header.as_ref());
+    // The guest unmounting (FUSE_DESTROY) with live DAX windows: tear each down (revoke, unmap, unpin) so a block
+    // mapped and never explicitly REMOVEMAPPING'd is not left pinned — otherwise an unmount would leak every mapped
+    // block's pin and the deferred free could never reclaim it (§4.6 terminal teardown).
+    #[cfg(unix)]
+    if matches!(
+      header.as_ref().and_then(|h| Opcode::from_wire(h.opcode)),
+      Some(Opcode::Destroy)
+    ) {
+      let windows = std::mem::take(&mut self.dax_windows);
+      if let Some(cache) = self.dax_cache.as_mut() {
+        for entry in &windows {
+          teardown_dax_window(cache, bridge, cx, entry);
+        }
+      }
+    }
     // A request whose success reply cannot fit the room the guest posted is not dispatched (AUD-29-85): its
     // effect — a created file, an open handle, a reference, changed bytes — would happen and its reply, naming
     // what it granted, would be lost. It is answered `EIO` below, with no effect.
@@ -1019,6 +1034,28 @@ fn vfs_dax_errno(e: &slates_vfs::error::VfsError) -> i32 {
 /// FUSE codec's `dispatch` answers (EOPNOTSUPP for setup, a no-op for remove). The guest reaches the arena bytes
 /// through its own page table after this; the daemon is not called per access.
 #[cfg(unix)]
+/// Tears one live DAX window mapping down (§4.6): the two-phase revoke — unregister so the hardware path is inert,
+/// unmap the window so the guest's page table loses it, then unpin the block so a deferred free can reclaim it.
+/// Shared by REMOVEMAPPING, a remap over the same window region, and the terminal teardown, so no path leaves a
+/// pinned block held.
+#[cfg(unix)]
+fn teardown_dax_window(
+  cache: &mut crate::dax::DaxCacheRegion,
+  bridge: &mut dyn slates_bridge_core::Bridge,
+  cx: &slates_bridge_core::OpContext,
+  entry: &DaxWindowEntry,
+) {
+  let _ = bridge.dax_revoke_pending(&entry.mapping, cx);
+  let _ = cache.unmap(entry.moffset, entry.len);
+  let _ = bridge.dax_release_after_unmap(&entry.mapping, cx);
+}
+
+/// Whether two window byte ranges `[off, off+len)` overlap, saturating so no bound can overflow.
+#[cfg(unix)]
+fn dax_ranges_overlap(a_off: u64, a_len: u64, b_off: u64, b_len: u64) -> bool {
+  a_off < b_off.saturating_add(b_len) && b_off < a_off.saturating_add(a_len)
+}
+
 fn serve_dax(
   request: &[u8],
   bridge: &mut dyn slates_bridge_core::Bridge,
@@ -1040,6 +1077,21 @@ fn serve_dax(
         return err(dax_errno::EINVAL, out);
       };
       let writable = m.writable();
+      // Remap: this SETUPMAPPING may cover a window region that already holds mappings. Tear each overlapping one
+      // down (revoke, unmap, unpin) before establishing the new one — otherwise its pin leaks and its stale entry
+      // shadows the new mapping when REMOVEMAPPING looks the window offset up (adversarial: a guest remapping a
+      // window slot to another block). Done before the new block is pinned, so no backing descriptor is borrowed
+      // across the `&mut bridge` teardown calls.
+      let mut index = 0;
+      while index < dax_windows.len() {
+        match dax_windows.get(index).copied() {
+          Some(held) if dax_ranges_overlap(held.moffset, held.len, m.moffset, m.len) => {
+            teardown_dax_window(cache, bridge, cx, &held);
+            dax_windows.swap_remove(index);
+          }
+          _ => index = index.saturating_add(1),
+        }
+      }
       let object = ObjectId::new(req.header.nodeid, 0);
       let mapping = match bridge.dax_map(object, cx, writable) {
         Ok(mapping) => mapping,
@@ -1079,10 +1131,7 @@ fn serve_dax(
       for one in &m.entries {
         if let Some(index) = dax_windows.iter().position(|w| w.moffset == one.moffset) {
           if let Some(entry) = dax_windows.get(index).copied() {
-            // Two-phase: unregister (hardware path inert), unmap the window (guest's page table loses it), then unpin.
-            let _ = bridge.dax_revoke_pending(&entry.mapping, cx);
-            let _ = cache.unmap(entry.moffset, entry.len);
-            let _ = bridge.dax_release_after_unmap(&entry.mapping, cx);
+            teardown_dax_window(cache, bridge, cx, &entry);
           }
           dax_windows.swap_remove(index);
         } else {
