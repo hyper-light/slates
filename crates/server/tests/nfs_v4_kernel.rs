@@ -327,8 +327,6 @@ fn exclusive_create_keeps_its_mode(root: &Path) {
 /// and a member of the file's group, mode 0747.
 #[cfg(target_os = "linux")]
 fn truncating_open_needs_write_permission(root: &Path) {
-  // TEMPORARY: trace the server's full SETATTR decision tuple for the truncate run (stderr → CI log).
-  slates_bridge_nfs::procedures::enable_setattr_trace();
   let departures = truncating_departures(root, "plain");
   if departures.is_empty() {
     return;
@@ -502,8 +500,6 @@ fn traced<T>(run: impl FnOnce() -> T) -> (T, String) {
 /// trace and reported with it.
 #[cfg(target_os = "linux")]
 fn the_owners_own_file_refuses_a_truncating_open_without_write_permission(root: &Path, tag: &str) {
-  // TEMPORARY: trace the server's full SETATTR decision tuple for the truncate run (stderr → CI log).
-  slates_bridge_nfs::procedures::enable_setattr_trace();
   let departures = open07_departures(&root.join(format!("open07-{tag}")));
   if departures.is_empty() {
     return;

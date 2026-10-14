@@ -197,26 +197,6 @@ pub fn state_io_inner(procedure: u32) -> Option<u32> {
   }
 }
 
-// TEMPORARY instrumentation (remove after the 6.17 truncate escape is root-caused). The coarse counters
-// (root/non-root/open-despite-bits) refuted both the privileged-flush and merged-open hypotheses: the
-// escape is allowed under Mode/Delegation with `permits` returning TRUE for uid 65534 on a 0477 file,
-// which is impossible for the tuple `(0477, owner 65534)` + `user(65534)` — so the server is seeing a
-// different caller or node. This traces the FULL decision tuple for every size-change SETATTR while
-// enabled, so the kernel conformance test (which runs the daemon in-process) prints exactly what the
-// server computed. Enabled by the test right before the truncate departures; a shard thread's `eprintln`
-// reaches the CI job log.
-static SETATTR_TRACE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
-
-/// TEMPORARY: start tracing the decision tuple of every size-change SETATTR to stderr.
-pub fn enable_setattr_trace() {
-  SETATTR_TRACE.store(true, core::sync::atomic::Ordering::Relaxed);
-}
-
-/// TEMPORARY: whether the size-change SETATTR trace is on.
-pub(crate) fn setattr_trace_on() -> bool {
-  SETATTR_TRACE.load(core::sync::atomic::Ordering::Relaxed)
-}
-
 /// Format: XATTR_SET's `how` values, RFC 8276's `setxattr_option4`.
 pub mod setxattr_how {
   /// Format: `SETXATTR4_EITHER`: create or replace.
@@ -1848,28 +1828,9 @@ impl<'b> Export<'b> {
     // times need ownership, the owner and group follow `_POSIX_CHOWN_RESTRICTED`, the size needs write
     // permission — refused typed (`PERM`/`ACCES`) before any effect. An allowed change carries the
     // set-id side effects a non-superuser's chown or chmod has (`crate::access`).
-    let denial = access::setattr_denial(&self.caller, &node, &changes, explicit_times, authority);
-    // TEMPORARY instrumentation (see `setattr_trace_on`): the FULL decision tuple for a size-change
-    // SETATTR, to root-cause the 6.17 truncate escape — exactly which caller and node the server saw.
-    #[allow(clippy::print_stderr)]
-    if changes.size.is_some() && setattr_trace_on() {
-      eprintln!(
-        "SETATTR-TRACE size={:?} caller.uid={} is_root={} stranger={} owns={} in_group(node.gid)={} node.uid={} node.gid={} node.mode={:o} authority={:?} permits_write={} denial={:?}",
-        changes.size,
-        self.caller.uid,
-        self.caller.is_root(),
-        self.caller.stranger,
-        self.caller.owns(&node),
-        self.caller.in_group(node.gid),
-        node.uid,
-        node.gid,
-        node.mode,
-        authority,
-        access::permits(&self.caller, &node, Want::Write),
-        denial,
-      );
-    }
-    if let Some(denial) = denial {
+    if let Some(denial) =
+      access::setattr_denial(&self.caller, &node, &changes, explicit_times, authority)
+    {
       return (status_of_denial(denial), self.unchanged(&node));
     }
     let changes = access::with_setid_side_effects(&self.caller, &node, changes);
