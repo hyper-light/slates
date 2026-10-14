@@ -478,6 +478,33 @@ impl Device {
     self.dax_windows.len()
   }
 
+  /// Tears every live DAX window down (§4.6 terminal teardown), the two-phase revoke per mapping so no block is
+  /// left pinned. The terminal step of a device whose guest never sent FUSE_DESTROY — a VMM that disconnected or
+  /// crashed — calls this with the attachment's bridge, which FUSE_DESTROY does for a clean unmount. Idempotent:
+  /// a device with no live window drains nothing.
+  #[cfg(unix)]
+  pub fn release_dax(
+    &mut self,
+    bridge: &mut dyn slates_bridge_core::Bridge,
+    cx: &slates_bridge_core::OpContext,
+  ) {
+    let windows = std::mem::take(&mut self.dax_windows);
+    if let Some(cache) = self.dax_cache.as_mut() {
+      for entry in &windows {
+        teardown_dax_window(cache, bridge, cx, entry);
+      }
+    }
+  }
+
+  /// No DAX window exists off Unix, so the terminal teardown drains nothing.
+  #[cfg(not(unix))]
+  pub fn release_dax(
+    &mut self,
+    _bridge: &mut dyn slates_bridge_core::Bridge,
+    _cx: &slates_bridge_core::OpContext,
+  ) {
+  }
+
   /// Installs the driver's queue layouts — exactly the high-priority queue and the request queues
   /// the configuration publishes, in queue order — validating each (the ring walk's configuration
   /// checks) before any queue exists. Configuring is a reset: the FUSE connection and any fault are

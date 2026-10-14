@@ -1577,3 +1577,47 @@ fn fuse_destroy_tears_down_live_dax_windows() {
   assert_eq!(store.dax.revoked(), 1, "the mapped block was revoked at teardown");
   drop(cache);
 }
+
+/// §4.6 (terminal teardown on a disconnect, no FUSE_DESTROY). Do: opt in, map a file's block, then call the
+/// device's terminal `release_dax` directly — what `AdmittedDevice::reclaim` runs when the VMM disconnects or
+/// crashes without unmounting (the guest never sent FUSE_DESTROY). Expect: the live window is torn down — no entry
+/// left, the registry holds no live mapping, and the block's pin was released. This is the leak path FUSE_DESTROY
+/// cannot cover.
+#[cfg(unix)]
+#[test]
+fn release_dax_tears_down_live_windows_on_a_disconnect() {
+  use slates_mem::{SharedObject, Words};
+  let page = rustix::param::page_size().max(1);
+  let mut store = dax_shared_store(page, "disc");
+  let mut vol = volume(&mut store);
+  vol.enable_writable_dax();
+  let root = vol.root_inode(&store).unwrap();
+  let no = vol.create_file_no(&mut store, root, "f", 0o644).unwrap();
+  vol.write(&mut store, no, 0, &vec![0x5A; page]).unwrap();
+  let nodeid = no.0;
+
+  let (mut device, mut driver) = device_and_driver();
+  let cache =
+    SharedObject::create(&format!("sl-daxdisc-{}", std::process::id()), page * 4, Words::new()).unwrap();
+  device.install_dax_window(Some(
+    slates_bridge_virtiofs::dax::DaxCacheRegion::new(cache.as_fd(), (page * 4) as u64).unwrap(),
+  ));
+  let cx = context();
+  let mut bridge = VolumeBridge::new(vid(), &mut vol, &mut store);
+  dax_exchange(&mut device, &mut driver, &mut bridge, &cx, (Opcode::Init, 1, ROOT), &dax_init_body());
+  let r = dax_exchange(
+    &mut device, &mut driver, &mut bridge, &cx,
+    (Opcode::SetupMapping, 2, nodeid), &dax_setup_body(0, page as u64, true, 0),
+  );
+  assert_eq!(reply_error(&r), 0, "mapped");
+  assert_eq!(device.dax_window_count(), 1, "one live window");
+
+  // The disconnect terminal step (no DESTROY): reclaim calls this with the attachment's bridge.
+  device.release_dax(&mut bridge, &cx);
+  assert_eq!(device.dax_window_count(), 0, "the live window was torn down on the disconnect");
+
+  drop(bridge);
+  assert_eq!(store.dax.len(), 0, "the registry holds no live mapping after the disconnect — no leaked pin");
+  assert_eq!(store.dax.revoked(), 1, "the mapped block was revoked at the disconnect teardown");
+  drop(cache);
+}

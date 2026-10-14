@@ -645,7 +645,14 @@ impl<S: VmmSeam> AdmittedDevice<S> {
     }
     let in_flight_at_revoke = self.revoke();
     let swept = match registry.context(self.attachment) {
-      Ok(cx) => bridge.sweep_attachment(&cx).map_err(ReclaimError::Sweep),
+      Ok(cx) => {
+        // Tear every live DAX window down (revoke, unmap, unpin) before the attachment sweep: a guest that
+        // disconnected or crashed without FUSE_DESTROY left its mapped blocks pinned, and only this terminal step
+        // still has the bridge to release them (§4.6 teardown). A clean unmount already drained them, so a device
+        // with no live window drains nothing here.
+        self.device.release_dax(bridge, &cx);
+        bridge.sweep_attachment(&cx).map_err(ReclaimError::Sweep)
+      }
       Err(e) => Err(ReclaimError::Authority(e)),
     };
     Ok(self.release_all(registry, in_flight_at_revoke, swept.err()))
