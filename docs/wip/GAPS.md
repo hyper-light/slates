@@ -6144,6 +6144,14 @@ its own page table and never calls the daemon), so the defense had to be at the 
   inode→window index (revoke → O(windows-of-inode)) is **deferred, not premature-built**: the path is empty in
   production until DAX is advertised, and a positional index through `swap_remove` is error-prone; the optimization
   hierarchy says measure a real advertised guest's drain pattern first.
+- **Directory-window coherence — decided point-in-time (not an open design call).** A directory DAX window
+  (`dax_map_dir`, the READDIR/READDIRPLUS snapshot) is a point-in-time view the guest re-maps to refresh, and that
+  is correct, not an owed revoke: POSIX/NFS `readdir` guarantees no consistent snapshot across concurrent mutations
+  (a listing is inherently racy — the same NFS readdir-cookie semantics slates already serves), and revoke-on-every-
+  dir-mutation would be pathological in the create-storm (every CREATE would tear the parent's window). It does not
+  leak (a re-map at the same slot frees the old throwaway block; a held stale window pins one cap-bounded block). So
+  unlike a file *content* window — where a stale read after a write must re-fault, hence `dax_revoke_inode` on
+  write/truncate — a directory window needs **no** coherence wiring. File bytes may not be stale; a dir listing may.
 - **The sibling teardown paths — investigated, each is a *different* case (an earlier note wrongly said all three
   should route through the pending-enqueue; that would break destroy). All are safe today — DAX is unadvertised, so
   no live window exists — and each is gated on the advertisement decision:**
