@@ -275,14 +275,16 @@ pub fn setattr_denial(
   {
     return Some(Denial::NotOwner);
   }
-  // A size change is a write. An NFSv4 open for writing authorized it when it was made; a delegation's state id stands
-  // for the whole client, whose local open checked only the open mode's access, never `O_TRUNC`'s write, so the bits
-  // decide strictly (pjdfstest `open/07.t`, 2026-10-05: any user of the client truncated through it); otherwise the
-  // mode decides with the I/O owner override.
+  // A size change is a write, and `O_TRUNC` needs write permission by the bits for the acting caller, the file's own
+  // owner included (pjdfstest `open/07.t`). Only a write-capable open authorizes it without that check — the open was
+  // checked when it was made, and a descriptor keeps its access whatever the mode becomes (`IoAuthority::Open`). A
+  // delegation's state id stands for the whole client, and a special state id (`IoAuthority::Mode`) holds no open at
+  // all, so neither inherits a write right: both decide strictly, with no owner override (2026-10-05 fixed the
+  // delegation path for the Linux client's local-open-then-SETATTR truncate; 2026-10-14 the same for a special state
+  // id, which a 6.17 client reached — the owner of a 0477 file truncated through `permits_io`'s owner override).
   let size_denied = match authority {
     IoAuthority::Open => false,
-    IoAuthority::Delegation => !permits(caller, node, Want::Write),
-    IoAuthority::Mode => !permits_io(caller, node, Want::Write),
+    IoAuthority::Delegation | IoAuthority::Mode => !permits(caller, node, Want::Write),
   };
   if changes.size.is_some() && size_denied {
     return Some(Denial::NoAccess);
@@ -538,6 +540,67 @@ mod tests {
       ),
       None,
       "an open for writing keeps its access whatever the mode became"
+    );
+  }
+
+  /// The same, under a *special* state id (`IoAuthority::Mode`: one that holds no open — a bare
+  /// `truncate()`, or a client that opened read-only and set the size outside that open). A truncate
+  /// still needs write permission by the bits, the file's own owner included (pjdfstest `open/07.t`).
+  /// A 6.17 Linux NFS client reached this path and truncated a 0477 file as its owner, which
+  /// `permits_io`'s owner override wrongly allowed (CI, 2026-10-14); the bits now decide strictly, as
+  /// the delegation path does. Only a write-capable open keeps its access across a chmod
+  /// (`IoAuthority::Open`, covered above).
+  #[test]
+  fn a_truncate_under_a_special_state_id_needs_write_permission_by_the_bits() {
+    let truncate = SetAttr {
+      size: Some(0),
+      ..SetAttr::default()
+    };
+    let owner_denied = node(Kind::File, 0o477, 65534, 65534);
+    for (caller, file, why) in [
+      (
+        user(65534, 65534, &[]),
+        &owner_denied,
+        "the owner of a 0477 file has no write bit",
+      ),
+      (
+        user(65533, 65534, &[]),
+        &node(Kind::File, 0o747, 65534, 65534),
+        "a group member the group bits deny",
+      ),
+      (
+        user(65533, 65533, &[]),
+        &node(Kind::File, 0o774, 65534, 65534),
+        "another user the other bits deny",
+      ),
+    ] {
+      assert_eq!(
+        setattr_denial(&caller, file, &truncate, false, IoAuthority::Mode),
+        Some(Denial::NoAccess),
+        "{why}: {caller:?}"
+      );
+    }
+    assert_eq!(
+      setattr_denial(
+        &user(65533, 65533, &[]),
+        &node(Kind::File, 0o666, 65534, 65534),
+        &truncate,
+        false,
+        IoAuthority::Mode
+      ),
+      None,
+      "the other bits grant write"
+    );
+    assert_eq!(
+      setattr_denial(
+        &user(65534, 65534, &[]),
+        &node(Kind::File, 0o644, 65534, 65534),
+        &truncate,
+        false,
+        IoAuthority::Mode
+      ),
+      None,
+      "0644: the owner bits grant write"
     );
   }
 
