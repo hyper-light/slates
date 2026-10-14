@@ -1851,3 +1851,54 @@ fn a_guest_setupmapping_of_a_directory_maps_its_entries() {
   assert_eq!(device.dax_window_count(), 0, "the directory window was torn down");
   drop(cache);
 }
+
+/// §4.6 step 5 (daemon-initiated revoke → the device munmaps the window BEFORE the daemon unpins). Do: opt in, map
+/// a file writable through the device, then call `request_revoke_inode` for that inode — what the daemon signals
+/// before it moves, writes, shares, lands or takes over the block. Expect: the window is torn down (the two-phase
+/// revoke — unregister, unmap, unpin), the registry mapping is revoked and the block released, so a reused block is
+/// never reachable through a stale TLB; a second call tears nothing down (idempotent). This is the device half of
+/// coherence for both data and metadata DAX — the daemon-initiated counterpart of a guest's REMOVEMAPPING.
+#[cfg(unix)]
+#[test]
+fn request_revoke_inode_tears_down_the_daemons_mapping() {
+  use slates_mem::{SharedObject, Words};
+  let page = rustix::param::page_size().max(1);
+  let mut store = dax_shared_store(page, "reqrevoke");
+  let mut vol = volume(&mut store);
+  vol.enable_writable_dax();
+  let root = vol.root_inode(&store).unwrap();
+  let no = vol.create_file_no(&mut store, root, "f", 0o644).unwrap();
+  vol.write(&mut store, no, 0, &vec![0x5A; page]).unwrap();
+  let nodeid = no.0;
+
+  let (mut device, mut driver) = device_and_driver();
+  let cache =
+    SharedObject::create(&format!("sl-daxreq-{}", std::process::id()), page * 4, Words::new()).unwrap();
+  device.install_dax_window(Some(
+    slates_bridge_virtiofs::dax::DaxCacheRegion::new(cache.as_fd(), (page * 4) as u64).unwrap(),
+  ));
+  let cx = context();
+  let mut bridge = VolumeBridge::new(vid(), &mut vol, &mut store);
+  dax_exchange(&mut device, &mut driver, &mut bridge, &cx, (Opcode::Init, 1, ROOT), &dax_init_body());
+  let r = dax_exchange(
+    &mut device, &mut driver, &mut bridge, &cx,
+    (Opcode::SetupMapping, 2, nodeid), &dax_setup_body(0, page as u64, true, 0),
+  );
+  assert_eq!(reply_error(&r), 0, "mapped");
+  assert_eq!(device.dax_window_count(), 1, "one live window");
+
+  // The daemon signals the device to revoke the inode's windows before it touches the block (step 5).
+  let torn = device.request_revoke_inode(nodeid, &mut bridge, &cx);
+  assert_eq!(torn, 1, "the daemon-initiated revoke tore down the inode's one window");
+  assert_eq!(device.dax_window_count(), 0, "the window was munmapped");
+  assert_eq!(
+    device.request_revoke_inode(nodeid, &mut bridge, &cx),
+    0,
+    "idempotent: nothing left to revoke"
+  );
+
+  drop(bridge);
+  assert_eq!(store.dax.len(), 0, "the registry mapping was revoked");
+  assert_eq!(store.dax.revoked(), 1, "the block was unpinned through the two-phase (release after unmap)");
+  drop(cache);
+}

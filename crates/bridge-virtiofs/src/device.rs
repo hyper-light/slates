@@ -505,6 +505,50 @@ impl Device {
   ) {
   }
 
+  /// Revokes every live DAX window of inode `no` at the **daemon's** request (§4.6 step 5 — the daemon-initiated
+  /// counterpart of a guest's REMOVEMAPPING). Before the daemon moves, writes, shares, lands or takes over an
+  /// inode's content it signals the device here, which munmaps the guest's window and completes the two-phase revoke
+  /// (unregister, unmap, then unpin) so the block is unmapped from the guest's page table **before** it is unpinned —
+  /// a reused block is never reachable through a stale TLB (the async-revoke hazard §4.6 #1 names). Returns how many
+  /// windows were torn down (0 if the inode has none). The daemon holds the inode's pin until this returns, so the
+  /// window never outlives the pin. This is the device half; the VFS half (`Store::dax_revoke_inode`) stays the
+  /// synchronous unpin for the no-live-window case, and the per-shard channel that routes a daemon revoke to this
+  /// (so a `Volume::write`/`truncate`/dir-mutation on a mapped inode calls it) is the remaining integration.
+  #[cfg(unix)]
+  pub fn request_revoke_inode(
+    &mut self,
+    no: u64,
+    bridge: &mut dyn slates_bridge_core::Bridge,
+    cx: &slates_bridge_core::OpContext,
+  ) -> usize {
+    let mut torn = 0usize;
+    if let Some(cache) = self.dax_cache.as_mut() {
+      let mut index = 0;
+      while index < self.dax_windows.len() {
+        match self.dax_windows.get(index).copied() {
+          Some(entry) if entry.mapping.inode.0 == no => {
+            teardown_dax_window(cache, bridge, cx, &entry);
+            self.dax_windows.swap_remove(index);
+            torn = torn.saturating_add(1);
+          }
+          _ => index = index.saturating_add(1),
+        }
+      }
+    }
+    torn
+  }
+
+  /// No DAX window exists off Unix, so a daemon-initiated revoke tears nothing down.
+  #[cfg(not(unix))]
+  pub fn request_revoke_inode(
+    &mut self,
+    _no: u64,
+    _bridge: &mut dyn slates_bridge_core::Bridge,
+    _cx: &slates_bridge_core::OpContext,
+  ) -> usize {
+    0
+  }
+
   /// Installs the driver's queue layouts — exactly the high-priority queue and the request queues
   /// the configuration publishes, in queue order — validating each (the ring walk's configuration
   /// checks) before any queue exists. Configuring is a reset: the FUSE connection and any fault are
