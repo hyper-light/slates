@@ -1093,37 +1093,42 @@ fn a_scratch_volume_has_no_dax_backing_and_a_revoked_mapping_has_none() {
   assert!(store.dax_backing(&m).is_none(), "a revoked mapping has no DAX backing");
 }
 
-/// Parses the flat directory snapshot `dax_map_dir` writes (§4.6 metadata DAX): a u32 count, then per entry a u64
-/// inode, a kind byte, a name length, and the name bytes. Returns name → inode.
-fn parse_dir_snapshot(raw: &[u8]) -> std::collections::BTreeMap<String, u64> {
+/// Parses the flat READDIRPLUS directory snapshot `dax_map_dir` writes (§4.6 metadata DAX): a u32 count, then per
+/// entry a u64 inode, a kind byte, a u64 size, an i64 mtime, u32 mode/uid/gid/nlink, a name length, and the name.
+/// Returns name → (inode, size, mode), so the test checks each entry's attributes came through, not just its name.
+fn parse_dir_snapshot(raw: &[u8]) -> std::collections::BTreeMap<String, (u64, u64, u32)> {
   let mut out = std::collections::BTreeMap::new();
   let count = u32::from_le_bytes(raw[0..4].try_into().unwrap());
   let mut off = 4usize;
   for _ in 0..count {
     let inode = u64::from_le_bytes(raw[off..off + 8].try_into().unwrap());
-    let name_len = usize::from(raw[off + 9]);
-    let name = String::from_utf8(raw[off + 10..off + 10 + name_len].to_vec()).unwrap();
-    out.insert(name, inode);
-    off += 10 + name_len;
+    let size = u64::from_le_bytes(raw[off + 9..off + 17].try_into().unwrap());
+    let mode = u32::from_le_bytes(raw[off + 25..off + 29].try_into().unwrap());
+    let name_len = usize::from(raw[off + 41]);
+    let name = String::from_utf8(raw[off + 42..off + 42 + name_len].to_vec()).unwrap();
+    out.insert(name, (inode, size, mode));
+    off += 42 + name_len;
   }
   out
 }
 
-/// §4.6 metadata DAX (READDIR). Do: create three named files in a directory, map the directory with `dax_map_dir`,
-/// and read the window the way a guest would (through its own page table). Expect: the mapped block is the flat
-/// snapshot — a count then a record (inode, kind, name) per entry — matching the directory's `readdir`, so a guest
-/// lists the directory with no FUSE READDIR round-trip. Then revoke and confirm the mapping is dead and its throwaway
-/// block is **freed, not leaked**: mapping and revoking far more times than the (chunk-capped) content arena holds
-/// would exhaust it on a leak, but a freed-and-reused block never does.
+/// §4.6 metadata DAX (READDIRPLUS). Do: create three named files in a directory, map the directory with
+/// `dax_map_dir`, and read the window the way a guest would (through its own page table). Expect: the mapped block
+/// is the flat snapshot — a count then a record per entry carrying the inode, kind, and the entry's attributes
+/// (size, mode, …) and name — matching the directory's `readdir` plus each entry's `stat`, so a guest lists the
+/// directory AND reads each entry's attributes with no FUSE READDIR or GETATTR round-trip. Then revoke and confirm
+/// the mapping is dead and its throwaway block is **freed, not leaked**: mapping and revoking far more times than the
+/// (chunk-capped) content arena holds would exhaust it on a leak, but a freed-and-reused block never does.
 #[test]
 fn a_directory_maps_its_entries_flat_and_revoke_frees_the_snapshot_block() {
   let mut store = store_capped_chunks(16);
   let mut volume = volume(&mut store, 1 << 20);
   let root = volume.root_inode(&store).unwrap();
-  let mut want: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+  let mut want: std::collections::BTreeMap<String, (u64, u64, u32)> = std::collections::BTreeMap::new();
   for name in ["alpha", "beta", "gamma"] {
     let no = volume.create_file_no(&mut store, root, name, 0o644).unwrap();
-    want.insert(name.to_owned(), no.0);
+    let a = volume.stat(&store, no).unwrap();
+    want.insert(name.to_owned(), (no.0, a.size, a.mode));
   }
 
   let mapping = volume.dax_map_dir(&mut store, root).unwrap();

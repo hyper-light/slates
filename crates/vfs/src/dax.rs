@@ -325,8 +325,9 @@ impl Volume {
   ///
   /// Refused as [`Volume::dax_map_read`] is (an attribute inode is `NotFound`, defence in depth for the device seam);
   /// `NotDirectory` for a non-directory; `NoSpace` if the entry count overflows or the registry is full;
-  /// `NameTooLong` for a name past 255 bytes. Layout (little-endian): `u32` entry count, then that many records —
-  /// `u64` inode, `u8` kind (1 file, 2 dir, 3 symlink, 4 fifo, 5 socket), `u8` name length, the name's UTF-8 bytes.
+  /// `NameTooLong` for a name past 255 bytes. Layout (little-endian, READDIRPLUS — each entry carries its `stat`):
+  /// `u32` entry count, then that many records — `u64` inode, `u8` kind (1 file, 2 dir, 3 symlink, 4 fifo, 5 socket),
+  /// `u64` size, `i64` mtime (ns), `u32` mode, `u32` uid, `u32` gid, `u32` nlink, `u8` name length, the name's bytes.
   pub fn dax_map_dir(&mut self, store: &mut Store, no: InodeNo) -> Result<Mapping, VfsError> {
     self.namespace_inode(&*store, no)?;
     // Serialize while the rows borrow the store immutably; the block allocation below is the mutable step.
@@ -345,8 +346,18 @@ impl Volume {
           crate::inode::Kind::Fifo => 4,
           crate::inode::Kind::Socket => 5,
         };
+        // READDIRPLUS: each entry carries its attributes, so a guest gets the `stat` of every entry from the one
+        // mapped block — no per-entry GETATTR round-trip (the metadata the kernel's readdirplus batches, served
+        // through the guest's page table instead of a FUSE call).
+        let attrs = self.stat(&*store, row.inode)?;
         buf.extend_from_slice(&row.inode.0.to_le_bytes());
         buf.push(kind);
+        buf.extend_from_slice(&attrs.size.to_le_bytes());
+        buf.extend_from_slice(&attrs.mtime.to_le_bytes());
+        buf.extend_from_slice(&attrs.mode.to_le_bytes());
+        buf.extend_from_slice(&attrs.uid.to_le_bytes());
+        buf.extend_from_slice(&attrs.gid.to_le_bytes());
+        buf.extend_from_slice(&attrs.nlink.to_le_bytes());
         buf.push(name_len);
         buf.extend_from_slice(name);
       }

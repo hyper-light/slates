@@ -1782,17 +1782,18 @@ fn hostile_dax_requests_are_refused_and_establish_no_window() {
   drop(cache);
 }
 
-/// The names in a flat directory snapshot (`Volume::dax_map_dir`'s layout): a u32 count, then per entry a u64 inode,
-/// a kind byte, a u8 name length, and the name's bytes.
+/// The names in a flat READDIRPLUS directory snapshot (`Volume::dax_map_dir`'s layout): a u32 count, then per entry
+/// a u64 inode, a kind byte, the attributes (u64 size, i64 mtime, u32 mode/uid/gid/nlink = 32 bytes), a u8 name
+/// length, and the name's bytes — so the fixed part before the name is 8 + 1 + 32 + 1 = 42 bytes.
 #[cfg(unix)]
 fn dir_snapshot_names(raw: &[u8]) -> Vec<String> {
   let mut names = Vec::new();
   let count = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
   let mut off = 4usize;
   for _ in 0..count {
-    let name_len = usize::from(raw[off + 9]);
-    names.push(String::from_utf8_lossy(&raw[off + 10..off + 10 + name_len]).into_owned());
-    off += 10 + name_len;
+    let name_len = usize::from(raw[off + 41]);
+    names.push(String::from_utf8_lossy(&raw[off + 42..off + 42 + name_len]).into_owned());
+    off += 42 + name_len;
   }
   names
 }
