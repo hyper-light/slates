@@ -159,13 +159,15 @@ pub struct DaxRegistry {
   scrubbed: u64,
   flips: u64,
   healed: u64,
-  /// Inodes a daemon-side revoke (`Store::dax_revoke_inode`, on a write/truncate/dir-mutation of a mapped inode)
-  /// marked **revoke-pending**: their mappings left the registry but their blocks stay pinned until the device
-  /// munmaps the guest's window (§4.6 step 5, the daemon-initiated half of the two-phase revoke). The device serve
-  /// loop drains this and calls `Device::request_revoke_inode`, which munmaps then unpins — so the block is unmapped
-  /// before it is reused. Empty on any shard with no device drain pending; bounded in effect by `cap` distinct live
-  /// inodes (deduped on enqueue).
-  pending_revokes: Vec<InodeNo>,
+  /// Inodes a daemon-side revoke (`Store::dax_revoke_inode` on a write/truncate of a mapped inode;
+  /// `Store::dax_revoke_writable_of_prefix` on a snapshot/clone) marked **revoke-pending**: their mappings left the
+  /// registry but their blocks stay pinned until the device munmaps the guest's window (§4.6 step 5, the
+  /// daemon-initiated half of the two-phase revoke). The device serve loop drains this each pass; the `bool` is
+  /// `writable_only` — `false` tears *every* window of the inode (`Device::request_revoke_inode`, a write/truncate
+  /// makes all stale), `true` tears only the writable ones and keeps the read-only (`request_revoke_writable_inode`,
+  /// a snapshot shares the block read-only). Empty on any shard with no device drain pending; bounded by `cap`
+  /// distinct live inodes (deduped on enqueue, `writable_only=false` superseding `true` for the same inode).
+  pending_revokes: Vec<(InodeNo, bool)>,
 }
 
 impl DaxRegistry {
@@ -187,17 +189,24 @@ impl DaxRegistry {
   }
 
   /// Marks inode `no` revoke-pending for the device to munmap (§4.6 step 5), deduped so a burst of writes to one
-  /// mapped inode enqueues it once. Bounded by `cap` distinct inodes.
-  fn enqueue_pending_revoke(&mut self, no: InodeNo) {
-    if !self.pending_revokes.contains(&no) {
-      self.pending_revokes.push(no);
+  /// mapped inode enqueues it once. `writable_only` false (a write/truncate — every window stale) **supersedes** a
+  /// prior true (a snapshot — writable windows only) for the same inode, since tearing all windows subsumes tearing
+  /// the writable ones. Bounded by `cap` distinct inodes.
+  fn enqueue_pending_revoke(&mut self, no: InodeNo, writable_only: bool) {
+    if let Some(entry) = self.pending_revokes.iter_mut().find(|(held, _)| *held == no) {
+      // `false` (all) wins: once any revoke needs every window, the drain must tear every window.
+      entry.1 = entry.1 && writable_only;
+    } else {
+      self.pending_revokes.push((no, writable_only));
     }
   }
 
   /// Takes the inodes awaiting a device-side revoke and clears the queue — the device serve loop calls this each
-  /// pass and asks its device to munmap each inode's window (`Device::request_revoke_inode`). Empty when none wait.
+  /// pass and asks its device to munmap each inode's windows (all, or writable-only per the `bool`). Empty when none
+  /// wait. The clear is what a retrying `snapshot` watches ([`Self::has_pending_of_prefix`]): once the queue no
+  /// longer holds the volume's inodes, the device has drained them (take and munmap are one cooperative pass).
   #[must_use]
-  pub fn take_pending_revokes(&mut self) -> Vec<InodeNo> {
+  pub fn take_pending_revokes(&mut self) -> Vec<(InodeNo, bool)> {
     std::mem::take(&mut self.pending_revokes)
   }
 
@@ -206,6 +215,26 @@ impl DaxRegistry {
   #[must_use]
   pub fn pending_len(&self) -> usize {
     self.pending_revokes.len()
+  }
+
+  /// Whether any inode of the volume `prefix` still awaits a device-side revoke (§4.6 step 5). A snapshot/clone that
+  /// enqueued its volume's writable windows retries until this is false — the device has then munmapped them (a
+  /// taken revoke is munmapped in the same cooperative pass), so the frozen blocks can no longer be written through
+  /// a live guest window. `false` when the queue holds nothing for the volume.
+  #[must_use]
+  pub fn has_pending_of_prefix(&self, prefix: u16) -> bool {
+    self.pending_revokes.iter().any(|(no, _)| no.prefix() == prefix)
+  }
+
+  /// Whether any **writable** mapping of the volume `prefix` is still live (not yet revoke-pending). A snapshot/clone
+  /// enqueues these for the device to munmap before it freezes the shared blocks; `false` once every writable
+  /// mapping of the volume has left the registry.
+  #[must_use]
+  pub fn has_writable_of_prefix(&self, prefix: u16) -> bool {
+    self
+      .mappings
+      .iter()
+      .any(|mapping| mapping.writable && mapping.inode.prefix() == prefix)
   }
 
   /// Counts a completed migration (§4.6 L2): the moving target's non-vacuity counter.
@@ -916,7 +945,9 @@ impl Store {
       .filter(|mapping| self.dax_revoke_pending(mapping))
       .count();
     if count > 0 {
-      self.dax.enqueue_pending_revoke(no);
+      // A write/truncate makes **every** window of the inode stale, so the drain tears them all (`writable_only`
+      // false).
+      self.dax.enqueue_pending_revoke(no, false);
     }
     count
   }
@@ -924,7 +955,11 @@ impl Store {
   /// Revokes every **writable** mapping of the volume with `prefix` (§4.6): a snapshot or clone shares the volume's
   /// current blocks, so a writable mapping of one must be torn down before the share, or the guest's later write
   /// would reach the frozen version. Read-only mappings survive — immutable shared content is the gate's allowed DAX
-  /// case. Returns how many were revoked.
+  /// case. Two-phase (§4.6 step 5), so the device actually munmaps the guest window: each writable mapping leaves the
+  /// registry **revoke-pending** (its block kept pinned) and is enqueued `writable_only` for the device to munmap,
+  /// which a retrying `snapshot` awaits ([`DaxRegistry::has_pending_of_prefix`]) before it freezes. The inode-keyed
+  /// enqueue carries `writable_only=true` so the drain tears only the writable windows and keeps the read-only ones.
+  /// Returns how many were revoked-pending. Empty on any volume no guest maps writable (the common case).
   pub fn dax_revoke_writable_of_prefix(&mut self, prefix: u16) -> usize {
     let victims: Vec<Mapping> = self
       .dax
@@ -933,10 +968,14 @@ impl Store {
       .filter(|mapping| mapping.writable && mapping.inode.prefix() == prefix)
       .copied()
       .collect();
-    victims
-      .iter()
-      .filter(|mapping| self.dax_revoke(mapping))
-      .count()
+    let mut count = 0usize;
+    for mapping in &victims {
+      if self.dax_revoke_pending(mapping) {
+        self.dax.enqueue_pending_revoke(mapping.inode, true);
+        count = count.saturating_add(1);
+      }
+    }
+    count
   }
 
   /// Revokes every mapping of the volume with `prefix` (§4.6: "eventual reclamation", AC-4.12): the teardown a

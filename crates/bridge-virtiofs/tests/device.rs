@@ -1279,6 +1279,25 @@ fn dax_profiling_store(page: usize, pages: usize, tag: &str) -> slates_vfs::volu
   )
 }
 
+/// Adds `dt` to `first` while `i` is in the leading `batch`, and to `last` while `i` is in the trailing `batch`
+/// (of `n`). Factored out of the profiling loops so each stays under the cognitive-complexity lint.
+#[cfg(unix)]
+fn bucket(
+  i: usize,
+  n: usize,
+  batch: usize,
+  dt: std::time::Duration,
+  first: &mut std::time::Duration,
+  last: &mut std::time::Duration,
+) {
+  if i < batch {
+    *first = first.saturating_add(dt);
+  }
+  if i >= n.saturating_sub(batch) {
+    *last = last.saturating_add(dt);
+  }
+}
+
 /// PROFILING (§4.6, the device DAX map path; run with `--ignored --nocapture`). Map N files' blocks into N distinct
 /// window slots and report the per-map latency of the first and last batch. Each map pays the pin (copy-up for a
 /// writable map) + the `MAP_FIXED` syscall + the remap overlap scan over the live windows (O(live), bounded by the
@@ -1327,12 +1346,7 @@ fn t_dax_device_map_path_latency_profile() {
     );
     let dt = at.elapsed();
     assert_eq!(reply_error(&r), 0, "map {i}");
-    if i < batch {
-      first = first.saturating_add(dt);
-    }
-    if i >= n.saturating_sub(batch) {
-      last = last.saturating_add(dt);
-    }
+    bucket(i, n, batch, dt, &mut first, &mut last);
   }
   assert_eq!(device.dax_window_count(), n, "all N mapped");
   let first_ns = first.as_nanos() / (batch as u128);
@@ -1359,12 +1373,7 @@ fn t_dax_device_map_path_latency_profile() {
     let torn = device.request_revoke_inode(nodeid, &mut bridge, &cx);
     let dt = at.elapsed();
     assert_eq!(torn, 1, "revoke {i} tore its one window");
-    if i < batch {
-      tfirst = tfirst.saturating_add(dt);
-    }
-    if i >= n.saturating_sub(batch) {
-      tlast = tlast.saturating_add(dt);
-    }
+    bucket(i, n, batch, dt, &mut tfirst, &mut tlast);
   }
   assert_eq!(device.dax_window_count(), 0, "all N revoked");
   let tfirst_ns = tfirst.as_nanos() / (batch as u128);
@@ -2053,7 +2062,11 @@ fn a_write_of_a_mapped_file_enqueues_a_revoke_the_next_service_pass_drains() {
   {
     let mut bridge = VolumeBridge::new(vid(), &mut vol, &mut store);
     let pending = bridge.take_pending_dax_revokes();
-    assert_eq!(pending, vec![nodeid], "the write enqueued exactly the mutated inode for the device");
+    assert_eq!(
+      pending,
+      vec![(nodeid, false)],
+      "the write enqueued exactly the mutated inode, writable_only=false (every window stale)"
+    );
     assert_eq!(
       device.request_revoke_inode(nodeid, &mut bridge, &cx),
       1,

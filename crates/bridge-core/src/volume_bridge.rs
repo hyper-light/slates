@@ -1527,16 +1527,16 @@ impl Bridge for VolumeBridge<'_> {
     Ok(self.store.dax_release_after_unmap(mapping))
   }
 
-  fn take_pending_dax_revokes(&mut self) -> Vec<u64> {
-    // Drain the shard DAX registry's step-5 queue as raw inode numbers. The registry is this shard's; an entry's
-    // inode carries its volume prefix, and the device this bridge serves only holds windows for its own volume, so
-    // `Device::request_revoke_inode` munmaps just the ones it has and no-ops the rest.
+  fn take_pending_dax_revokes(&mut self) -> Vec<(u64, bool)> {
+    // Drain the shard DAX registry's step-5 queue as `(raw inode, writable_only)`. The registry is this shard's; an
+    // entry's inode carries its volume prefix, and the device this bridge serves only holds windows for its own
+    // volume, so the device munmaps just the ones it has (all, or writable-only per the flag) and no-ops the rest.
     self
       .store
       .dax
       .take_pending_revokes()
       .into_iter()
-      .map(|no| no.0)
+      .map(|(no, writable_only)| (no.0, writable_only))
       .collect()
   }
 }

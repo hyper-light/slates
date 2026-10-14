@@ -1141,7 +1141,11 @@ fn the_pending_revoke_queue_is_bounded_and_deduped() {
     volume.write(&mut store, f, 0, &[round; 8]).unwrap();
     assert!(store.dax.pending_len() <= 1, "the storm never grows the queue past the one deduped inode");
   }
-  assert_eq!(store.dax.take_pending_revokes(), vec![f], "a write storm on one mapped inode enqueues it once");
+  assert_eq!(
+    store.dax.take_pending_revokes(),
+    vec![(f, false)],
+    "a write storm on one mapped inode enqueues it once, writable_only=false (every window stale)"
+  );
   assert!(store.dax.take_pending_revokes().is_empty(), "the drain cleared the queue");
 
   // Several distinct mapped inodes, each written once: each enqueued exactly once, and the queue stays within the cap.
@@ -1154,8 +1158,51 @@ fn the_pending_revoke_queue_is_bounded_and_deduped() {
     want.insert(no.0);
   }
   assert!(store.dax.pending_len() <= CAP, "the queue never exceeds the registry cap");
-  let drained: BTreeSet<u64> = store.dax.take_pending_revokes().into_iter().map(|no| no.0).collect();
+  let drained: BTreeSet<u64> = store.dax.take_pending_revokes().into_iter().map(|(no, _)| no.0).collect();
   assert_eq!(drained, want, "each distinct mapped inode was enqueued exactly once");
+}
+
+/// §4.6 step 5 — snapshot/clone now revokes its volume's writable DAX windows **two-phase** (the device munmaps),
+/// and a retrying `snapshot` watches the registry to know when it is safe to freeze. Do: map one file writable and
+/// another read-only in a volume, then `dax_revoke_writable_of_prefix`. Expect: the writable mapping leaves the
+/// registry revoke-pending (its block kept pinned) and is enqueued `writable_only=true` (the device tears only the
+/// writable window); the read-only mapping stays live; `has_writable_of_prefix` goes false (snapshot's "windows
+/// handed to the device") and `has_pending_of_prefix` goes true (snapshot retries until the device drains it); and
+/// the two-phase release then unpins. This is the VFS half of the writable-DAX↔snapshot recall; the device half is
+/// `request_revoke_writable_inode`, and the retry is in the `snapshot` verb.
+#[test]
+fn a_snapshot_revokes_the_volumes_writable_windows_two_phase_and_keeps_read_only() {
+  let mut store = store();
+  let mut volume = volume(&mut store, 1 << 20);
+  let prefix = volume.prefix();
+  let w = file_of(&mut store, &mut volume, "w", 0x11, DAX_PAGE);
+  let r = file_of(&mut store, &mut volume, "r", 0x22, DAX_PAGE);
+  let wm = volume.dax_map_write(&mut store, w).unwrap();
+  let rm = volume.dax_map_read(&mut store, r).unwrap();
+
+  // The snapshot's teardown: writable windows go revoke-pending + enqueued; the read-only one survives.
+  assert_eq!(store.dax_revoke_writable_of_prefix(prefix), 1, "exactly the writable mapping was revoked-pending");
+  let state_after = (
+    store.dax.has_writable_of_prefix(prefix),
+    store.dax.has_pending_of_prefix(prefix),
+    store.dax_is_live(&rm),
+    store.content.arena().is_pinned(wm.block),
+  );
+  assert_eq!(
+    state_after,
+    (false, true, true, true),
+    "writable handed to the device (not live), pending for snapshot to await, read-only survives, block still \
+     pinned (phase-one stale-TLB hold)"
+  );
+
+  // The device drains (modelled: take the queue writable_only=true, then release-after-unmap).
+  assert_eq!(
+    store.dax.take_pending_revokes(),
+    vec![(wm.inode, true)],
+    "the writable revoke is enqueued writable_only=true (device keeps the read-only window)"
+  );
+  let drained_state = (store.dax.has_pending_of_prefix(prefix), store.dax_release_after_unmap(&wm));
+  assert_eq!(drained_state, (false, true), "the take cleared the queue (snapshot may freeze) and phase two unpins");
 }
 
 /// §4.6 (the DAX device-window backing seam, Unix). Do: on the scratch (anonymous-backed) test store, map a file

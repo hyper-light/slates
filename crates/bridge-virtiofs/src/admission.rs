@@ -592,8 +592,8 @@ impl<S: VmmSeam> AdmittedDevice<S> {
     // requests tears each now-stale window down under this attachment's authority, with no separate wake channel for
     // the in-process seam the device loop drives itself. Bounded: a mutation enqueues at most one inode, and each
     // inode's live windows are finite. An empty queue — the common case, since DAX is unadvertised — is a no-op.
-    for no in bridge.take_pending_dax_revokes() {
-      self.tear_down_inode_windows(no, bridge, &cx);
+    for (no, writable_only) in bridge.take_pending_dax_revokes() {
+      self.tear_down_inode_windows(no, writable_only, bridge, &cx);
     }
     Ok(total)
   }
@@ -616,13 +616,25 @@ impl<S: VmmSeam> AdmittedDevice<S> {
     let cx = registry
       .context(self.attachment)
       .map_err(ServeError::Authority)?;
-    Ok(self.tear_down_inode_windows(no, bridge, &cx))
+    Ok(self.tear_down_inode_windows(no, false, bridge, &cx))
   }
 
   /// Tears down inode `no`'s live windows on the device under the already-derived `cx` and records them in the
-  /// non-vacuity counter. The shared core of the per-pass drain and the explicit [`Self::request_revoke_inode`].
-  fn tear_down_inode_windows(&mut self, no: u64, bridge: &mut dyn Bridge, cx: &OpContext) -> usize {
-    let torn = self.device.request_revoke_inode(no, bridge, cx);
+  /// non-vacuity counter. `writable_only` false tears every window (a write/truncate makes all stale), true tears
+  /// only the writable ones and keeps the read-only (a snapshot shares the block read-only). The shared core of the
+  /// per-pass drain and the explicit [`Self::request_revoke_inode`].
+  fn tear_down_inode_windows(
+    &mut self,
+    no: u64,
+    writable_only: bool,
+    bridge: &mut dyn Bridge,
+    cx: &OpContext,
+  ) -> usize {
+    let torn = if writable_only {
+      self.device.request_revoke_writable_inode(no, bridge, cx)
+    } else {
+      self.device.request_revoke_inode(no, bridge, cx)
+    };
     self.counters.dax_window_revokes = self
       .counters
       .dax_window_revokes
