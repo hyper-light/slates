@@ -253,3 +253,41 @@ fn the_slates_backend_answers_a_guests_full_mount_and_read_of_a_file() {
     "the guest reads the slates file's own bytes through the shards fs backend"
   );
 }
+
+/// Hostile-input pass on the frame parser (every parser of external bytes gets one — CLAUDE.md Part 6). The frame
+/// length is attacker-controlled (the first four bytes off the socket), so a guest can claim a colossal or a
+/// truncated frame. Expect: a length past the caller's bound is refused `InvalidData` BEFORE any allocation (never
+/// a `u32::MAX`-byte `Vec`); a truncated frame errors rather than hanging or over-reading; and a clean EOF is
+/// `None`, not an error. Cross-platform: it drives the parser over byte slices, no socket.
+#[test]
+fn a_hostile_or_truncated_shards_fs_frame_is_refused_before_allocating() {
+  use std::io::ErrorKind;
+
+  // A u32::MAX length: refused by the bound before a vec is sized — no attempt to allocate ~4 GiB.
+  let colossal = u32::MAX.to_le_bytes();
+  let mut src = colossal.as_slice();
+  let err = read_shards_frame(&mut src, 1 << 16).unwrap_err();
+  assert_eq!(err.kind(), ErrorKind::InvalidData, "a colossal frame length is refused, not allocated");
+
+  // One byte past the caller's bound (the reply buffer): the same refusal.
+  let over = 65_537u32.to_le_bytes();
+  let mut src = over.as_slice();
+  let err = read_shards_frame(&mut src, 1 << 16).unwrap_err();
+  assert_eq!(err.kind(), ErrorKind::InvalidData, "a frame one byte past the bound is refused");
+
+  // A truncated frame: claims 100 bytes, supplies 4 — an error, never a hang or an over-read.
+  let mut truncated = 100u32.to_le_bytes().to_vec();
+  truncated.extend_from_slice(&[0xAB; 4]);
+  let mut src = truncated.as_slice();
+  assert!(
+    read_shards_frame(&mut src, 1 << 16).is_err(),
+    "a frame shorter than its declared length errors"
+  );
+
+  // A clean EOF before any length is a clean end (the guest closed the socket), not an error.
+  let mut src: &[u8] = &[];
+  assert!(
+    read_shards_frame(&mut src, 1 << 16).unwrap().is_none(),
+    "EOF before a length is a clean end"
+  );
+}
