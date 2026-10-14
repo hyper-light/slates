@@ -6102,9 +6102,21 @@ its own page table and never calls the daemon), so the defense had to be at the 
   `dax_revoke_block` tear down. `write`/`truncate` revoke the inode's mappings (one write boundary); `snapshot` revokes
   writable mappings before sharing (read-only survive — the allowed immutable-shared case); `destroy` revokes the whole
   volume's. The hardware path (`dax_read_raw`/`dax_write_raw`) models the MMU — inert for a revoked mapping.
-- **Evidence:** `crates/vfs/tests/dax.rs` 21/0 (every former escape now closed: exfiltration, cross-file and
+- **Evidence:** `crates/vfs/tests/dax.rs` 42/0 (every former escape now closed: exfiltration, cross-file and
   cross-volume injection, the concurrent pile, TOCTOU, block-move lost update, snapshot-share corruption,
-  revoke-then-reuse, past-length tail scrub, reclamation); recovery oracle 39/0; vfs + mem suites green; clippy clean.
+  revoke-then-reuse, past-length tail scrub, reclamation; plus the multi-tenancy layers below); vfs + mem suites
+  green; clippy `--all-targets -D warnings` clean.
+
+- **Multi-tenancy (the §4.6 Rowhammer threat model, 2026-10-13).** The async-revocation/TLB race is closed by the
+  two-phase revoke (`dax_revoke_pending` keeps the block pinned; `dax_release_after_unmap` unpins only after the VMM
+  confirms the unmap + cross-core TLB flush); the map-storm/fault DoS is bounded three ways (registry cap, §4.9 credit
+  window, cooperative serve loop). The Rowhammer layered defence is built in the VFS: **L0** writable DAX is a
+  per-volume opt-in (`Volume::enable_writable_dax`; read-only default, 4b411da9); **L2** the moving target
+  (`Volume::dax_migrate` + `stripe_target`, bounded no-quarantine placement, measured 242 ns/migration, 68b4a9c5);
+  **B2** the self-healing net for read-only content (`Store::dax_guard`/`dax_scrub`, BLAKE3 checksum + heal, 6922fcf2).
+  **Owed:** **L1** physically-contiguous hugetlb zones + guard rows (the deployment layer that makes L2's shift move
+  real physical rows) and the adaptive migration trigger from a privileged PEBS/IBS broker — both wired into the
+  device loop with L0/L2/B2.
 
 **Owed before DAX is advertised (the next steps):**
 

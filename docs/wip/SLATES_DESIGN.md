@@ -2692,13 +2692,42 @@ until mapping isolation, pinning and teardown have been established for that VMM
 >    `NoSpace` and counted (`a_map_storm_is_refused_at_the_registry_bound`); the §4.9 credit window bounds in-flight
 >    requests and bytes (`crates/bridge-virtiofs/src/credit.rs`); and the device serve loop is cooperative per pass,
 >    so one guest's storm cannot starve another guest or the host.
-> 3. **Rowhammer / hardware co-location.** Two untrusted tenants with write access to physically adjacent DRAM rows
->    face bit-flip risk at the silicon layer, independent of software isolation — slates cannot prevent this in
->    software, and does not claim to. **Posture (residual, at the right layer):** the mitigation is host memory
->    policy — the host/VMM not co-locating untrusted tenants on adjacent rows (guard rows), ECC, and DDR4/5 Target
->    Row Refresh — together with slates' own levers: a writable DAX mapping is opt-in (it copies up first), and a
->    read-only mapping (the common case, and the only one immutable-shared content allows) cannot hammer, so slates
->    serves read-only DAX wherever write access is not needed. Recorded as a known hardware-layer residual.
+> 3. **Rowhammer / hardware co-location.** Two untrusted tenants whose writable DAX blocks land on physically
+>    adjacent DRAM rows face bit-flip risk at the silicon layer, independent of software isolation — slates cannot
+>    prevent the physics and does not claim to. The hardware floor stays the host/VMM's: ECC/Chipkill, DDR4/5 Target
+>    Row Refresh, and not co-locating untrusted tenants on adjacent rows. On top of that floor slates runs a layered
+>    software defence whose per-event cost is bounded and whose memory footprint stays **capped** — the agentic-scale
+>    answer to quarantine exhaustion (there is nothing to quarantine):
+>    - **L0 — opt-in gate (built, 4b411da9).** A *writable* mapping is the only DAX mode a guest can hammer; it is off
+>      by default and `Volume::dax_map_write` refuses `NotPermitted` until the owner opts in
+>      (`Volume::enable_writable_dax`). Read-only DAX (immutable shared content, the common case) cannot hammer a
+>      neighbour. Keeping the dangerous mode rare bounds how many blocks every layer below must cover.
+>    - **L1 — zones + guard rows (owed, the device/deployment layer).** Per-tenant writable-DAX blocks placed in a
+>      pre-reserved, physically-contiguous hugetlb sandbox with guard rows between tenants (CATT-style). This is the
+>      stated deployment requirement that makes the moving target *real* — without physical contiguity a virtual shift
+>      moves no physical rows (security theatre). A low-trust *sacrificial pool* may deliberately co-locate mutually-
+>      untrusted tenants so they absorb each other's leakage rather than the host — sound only paired with B2.
+>    - **L2 — moving target (built, 68b4a9c5).** `Volume::dax_migrate` relocates a writable block to a physically
+>      different block under the two-phase revoke (the new block pinned and its mapping minted before the old is
+>      revoked-pending, the old held until the VMM confirms the unmap), so an attacker tracking physical rows loses
+>      the target; the inode follows, so non-DAX readers never see a stale block. Placement is a pseudo-random stride
+>      within the bounded sandbox (`stripe_target`), so memory stays capped and deterministic — no quarantine pool.
+>      Measured 242 ns/migration for a 4 KiB block (`dax_bench`), so even *unconditional* migration at the 16–32 ms
+>      RowPress cadence costs <0.01% throughput; migration is meant to be *adaptive* — triggered only for blocks
+>      showing a hammer signature — so honest agents run at native DAX speed with zero migration overhead. The trigger
+>      must come from a signal the unprivileged daemon can see (SETUPMAPPING / fault cadence) or a privileged
+>      OS-shipped broker's PEBS/IBS, since a pure direct-write hammer is invisible to the daemon; this is why the
+>      strategy leans on *contain* (L1 zones) and *heal* (B2) over *detect*. slates is RAM-only, so the migration copy
+>      is DRAM↔DRAM with no write-endurance cost — the PMEM-endurance concern does not apply to slates' arena.
+>    - **B2 — self-healing net (built, 6922fcf2).** `Store::dax_guard` records a read-only mapping's clean BLAKE3 and
+>      a pinned clean copy; a periodic `Store::dax_scrub` catches a flip the daemon never saw and restores the block
+>      from the clean copy (`Healed`), or reports `Unhealable` if both are corrupt. Sound only for read-only content
+>      (a writable block changes legitimately, so a checksum cannot tell a flip from a write); read-only is the L0
+>      default, so B2 covers the common case. The clean copy is bounded by the registry cap and freed on revoke.
+>    The modern window is 16–32 ms and RowPress leaks across refresh windows, so the migration interval is derived
+>    from the lowest hammer threshold, not the classic 64 ms. Wiring L1 (hugetlb zones + guard rows) and the adaptive
+>    broker trigger into the device loop is the owed step; the L0/L2/B2 primitives are built and proven by use in
+>    `crates/vfs/tests/dax.rs`.
 
 > **Status (virtio-fs, 2026-09-13).** The owned FUSE-over-virtio device exists
 > (`crates/bridge-virtiofs`) and the daemon serves it on the volume's owning shard
