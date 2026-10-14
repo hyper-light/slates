@@ -53,7 +53,7 @@ mount -t tmpfs -o size=4g tmpfs /mnt/ram && echo "## tmpfs mounted"
 
 # --- JuiceFS: SQLite metadata + a local file object store, mounted through FUSE. ---
 if command -v juicefs >/dev/null 2>&1; then
-  rm -f /ccache/jfs-meta.db; mkdir -p /ccache/jfs-store
+  rm -f /ccache/jfs-meta.db; rm -rf /ccache/jfs-store; mkdir -p /ccache/jfs-store
   juicefs format --storage file --bucket /ccache/jfs-store "sqlite3:///ccache/jfs-meta.db" rwjfs \
     >/out/jfs-format.log 2>&1 || echo "WARN juicefs format failed"
   juicefs mount "sqlite3:///ccache/jfs-meta.db" /mnt/jfs --background >/out/jfs-mount.log 2>&1 || echo "WARN juicefs mount failed"

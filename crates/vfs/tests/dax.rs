@@ -27,7 +27,7 @@ use slates_vfs::ids::InodeNo;
 use slates_vfs::volume::{Store, Volume};
 
 mod common;
-use common::{clone_config, store, volume};
+use common::{clone_config, store, store_capped_chunks, volume};
 
 /// A byte that stands for a secret a neighbour holds — if a guest reads it through another file's mapping, that is a
 /// leak.
@@ -617,6 +617,86 @@ fn revocation_empties_the_registry_and_counts() {
   }
   assert_eq!(store.dax_mappings(), 0, "the registry is empty");
   assert_eq!(store.dax.revoked() - before, 8, "every revoke was counted");
+}
+
+/// §4.6 A-9 / AC-4.12 — the asynchronous-revocation ordering (multi-tenancy threat #1, the one cross-tenant hazard
+/// left once spatial isolation holds). A mapping a live DAX guest holds must keep its block PINNED through phase-one
+/// revoke (the registry entry gone, the hardware path inert, no new access authorized) and become reusable only at
+/// phase-two release — which the device calls after the VMM has unmapped the guest's window and flushed every
+/// physical core's TLB. If the block were freed at phase one, a neighbour taking it could be read or written through
+/// the guest's stale TLB entry. Do: map a file, revoke it pending, then release. Expect: inert-but-pinned after
+/// pending; reusable only after release; a double release refused.
+#[test]
+fn a_pending_revoke_keeps_the_block_pinned_until_the_unmap_is_confirmed() {
+  let mut store = store();
+  let mut volume = volume(&mut store, 1 << 20);
+  let no = file_of(&mut store, &mut volume, "f", SECRET, DAX_PAGE);
+  let mapping = volume.dax_map_read(&mut store, no).unwrap();
+  let block = mapping.block;
+  assert!(store.content.arena().is_pinned(block), "a live mapping pins its block");
+
+  assert!(store.dax_revoke_pending(&mapping), "phase one: the mapping was held");
+  assert!(
+    !store.dax_is_live(&mapping),
+    "phase one: the hardware path is inert — no new access authorized"
+  );
+  assert!(
+    store.content.arena().is_pinned(block),
+    "phase one KEEPS the pin: the block cannot be reused until the VMM confirms the unmap + cross-core TLB flush"
+  );
+
+  assert!(
+    store.dax_release_after_unmap(&mapping),
+    "phase two releases the pin, only after the confirmed unmap"
+  );
+  assert!(
+    !store.content.arena().is_pinned(block),
+    "only now, after the confirmed unmap, is the block reusable"
+  );
+  assert!(
+    !store.dax_release_after_unmap(&mapping),
+    "a double release is refused, never a double-free"
+  );
+}
+
+/// §4.6 (CLAUDE.md #8, no unbounded growth) — map-storm DoS (multi-tenancy threat #2). A malicious guest cannot
+/// exhaust the daemon by flooding SETUPMAPPING: the mapping registry is bounded (its cap is the shard's chunk
+/// budget, `max_chunks`), so a storm is refused typed, counted, and the daemon keeps serving. Do: with a small
+/// chunk budget, re-map one file past the registry cap. Expect: maps succeed up to the cap, the next is `NoSpace`,
+/// the registry never exceeds the cap, the refusal is counted, and after one is freed the file maps again
+/// (non-vacuity + recovery).
+#[test]
+fn a_map_storm_is_refused_at_the_registry_bound() {
+  const CAP: usize = 32;
+  let mut store = store_capped_chunks(CAP);
+  let mut volume = volume(&mut store, 1 << 20);
+  let no = file_of(&mut store, &mut volume, "f", SECRET, DAX_PAGE);
+  let before = store.dax.refused();
+  let mut held = Vec::new();
+  let mut refused = false;
+  for _ in 0..(CAP * 4) {
+    match volume.dax_map_read(&mut store, no) {
+      Ok(m) => held.push(m),
+      Err(_) => {
+        refused = true;
+        break;
+      }
+    }
+  }
+  assert!(refused, "a re-map storm is refused at the bound, never grown without limit");
+  assert!(
+    store.dax_mappings() <= CAP,
+    "the registry never exceeds its cap ({} > {CAP})",
+    store.dax_mappings()
+  );
+  assert!(store.dax.refused() > before, "the refusal at the bound is counted");
+  // Non-vacuity + recovery: free one mapping, and the file maps again — the bound is live, not a dead wall.
+  let freed = held.pop().expect("at least one map succeeded");
+  assert!(store.dax_revoke(&freed));
+  assert!(
+    volume.dax_map_read(&mut store, no).is_ok(),
+    "once a slot is freed the file maps again"
+  );
 }
 
 /// §4.6, AC-4.12 ("eventual reclamation"). Do: map two files of a volume (one read, one write), then destroy the

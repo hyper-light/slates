@@ -60,6 +60,28 @@ pub(crate) fn store_shaped(
   )
 }
 
+/// A store whose chunk budget — and so its DAX mapping-registry cap (`DaxRegistry::new(max_chunks)`) — is
+/// `max_chunks`, small enough that a map-storm bound is reachable in a test.
+pub(crate) fn store_capped_chunks(max_chunks: usize) -> Store {
+  let mut arena = ChunkArena::new(PAGE);
+  arena
+    .add_region(Region::map(PAGE * REGION_PAGES, PAGE, false).unwrap())
+    .unwrap();
+  Store::new(
+    &StoreConfig {
+      page: PAGE,
+      cache_line: 64,
+      max_dirs: 1 << 16,
+      max_inodes: 1 << 16,
+      max_chunks,
+      max_dir_blocks: 1 << 16,
+      dir_cutover: 4,
+    },
+    arena,
+    0,
+  )
+}
+
 /// A bounded, name-folding volume with prefix 7 and a stepping clock.
 pub(crate) fn volume(store: &mut Store, quota: u64) -> Volume {
   volume_with(

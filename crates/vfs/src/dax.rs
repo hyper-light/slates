@@ -369,6 +369,35 @@ impl Store {
     true
   }
 
+  /// Phase one of revoking a mapping a **live DAX guest** holds (§4.6 teardown; the asynchronous-revocation
+  /// ordering): remove it from the registry — so the hardware path goes inert and no new access is authorized —
+  /// but **keep the block pinned**. The guest's page table may still map the block until the VMM has unmapped the
+  /// window and flushed every physical core's TLB; the block must not be reused in that gap, or a neighbour that
+  /// took it could be read or written through the guest's stale TLB entry (the one cross-tenant dirty-state hazard
+  /// left once spatial isolation holds). The pin is released only by [`Store::dax_release_after_unmap`], which the
+  /// device calls after the VMM acknowledges the unmap. Synchronous callers with no live guest keep using
+  /// [`Store::dax_revoke`] (unregister and unpin at once); this pair is for the device path. Returns whether held.
+  pub fn dax_revoke_pending(&mut self, mapping: &Mapping) -> bool {
+    self.dax.remove(mapping)
+  }
+
+  /// Phase two: unpin the block of a mapping revoked by [`Store::dax_revoke_pending`], once the VMM has confirmed
+  /// the window unmap and the cross-core TLB flush, so the block may now be freed and reused. The daemon must never
+  /// call this before that acknowledgement — holding the pin across the unmap is exactly what closes the stale-TLB
+  /// cross-tenant read. `true` when the hold was dropped (the block is no longer pinned here, and a deferred free,
+  /// if one was waiting, is released and scrubbed); `false` only when the arena refused the unpin
+  /// ([`MemError::ForeignExtent`] — a double release or a block this held no pin on), counted in
+  /// `release_refusals`, never a silent double-free.
+  pub fn dax_release_after_unmap(&mut self, mapping: &Mapping) -> bool {
+    match self.content.arena_mut().unpin(mapping.block) {
+      Ok(_) => true,
+      Err(_) => {
+        self.release_refusals = self.release_refusals.saturating_add(1);
+        false
+      }
+    }
+  }
+
   /// Revokes every mapping of inode `no` (§4.6): a VFS mutation of a DAX-mapped file tears its mappings down, so the
   /// one write boundary stays single (the guest re-maps after). Returns how many were revoked.
   pub fn dax_revoke_inode(&mut self, no: InodeNo) -> usize {
