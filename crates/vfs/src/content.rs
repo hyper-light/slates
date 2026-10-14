@@ -779,6 +779,13 @@ impl ChunkStore {
     Ok(())
   }
 
+  /// Allocates a bare block of `len` bytes (rounded to the granule), locked if asked — the arena half of a DAX
+  /// integrity guard's clean copy (§4.6 B2) and any caller that needs a block to fill itself. `ArenaExhausted` with
+  /// deferred frees waiting surfaces as `PublishNeeded`, as every allocation here does.
+  pub fn alloc_block(&mut self, len: usize, locked: bool) -> Result<Block, VfsError> {
+    self.alloc(len, locked)
+  }
+
   /// Relocates `open`'s content to a freshly allocated block of the same size and lockedness — the arena half of a DAX
   /// migration (§4.6 L2, the moving target). The new block is allocated and the **whole** old block copied into it
   /// (so nothing written past `len`, A-118's `dirty_to`, is lost) *before* the old block is freed; because a live DAX

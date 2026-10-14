@@ -22,7 +22,7 @@
   clippy::indexing_slicing
 )]
 
-use slates_vfs::dax::{DAX_PAGE, Mapping, stripe_target};
+use slates_vfs::dax::{DAX_PAGE, DaxScrub, Mapping, stripe_target};
 use slates_vfs::ids::InodeNo;
 use slates_vfs::volume::{Store, Volume};
 
@@ -982,4 +982,92 @@ fn the_stripe_target_stays_in_the_sandbox_and_always_moves() {
     0,
     "a one-slot sandbox cannot move: it returns its only slot (no shift available)"
   );
+}
+
+// ───────────────────────────────────────────────────────────── B2 the self-healing safety net (checksum + heal)
+
+/// A synthetic Rowhammer bit flip: invert a byte of a block directly in the arena, behind the daemon's back — exactly
+/// what a hardware hammer does to a mapped page that the daemon never sees written.
+fn flip_a_byte(store: &mut Store, block: slates_mem::arena::Extent) {
+  if let Some(bytes) = store.content.arena_mut().bytes_mut(block)
+    && let Some(b) = bytes.get_mut(0)
+  {
+    *b ^= 0xFF;
+  }
+}
+
+/// §4.6 multi-tenancy **B2** (the self-healing safety net). Do: guard a read-only mapping (immutable content), then
+/// inject a synthetic bit flip into its block and scrub. Expect: the fresh guard scrubs clean; after the flip the
+/// scrub catches it and heals the block from the clean copy, the victim byte erased; a re-scrub confirms it; the
+/// flip and heal counters moved. This is the asynchronous net for the one hazard the daemon cannot see directly.
+#[test]
+fn a_flip_in_a_guarded_read_only_block_is_caught_and_healed() {
+  let mut store = store();
+  let mut volume = volume(&mut store, 1 << 20);
+  let f = file_of(&mut store, &mut volume, "f", 0x41, DAX_PAGE);
+  let m = volume.dax_map_read(&mut store, f).unwrap();
+  store.dax_guard(&m).unwrap();
+  assert_eq!(store.dax_scrub(&m), DaxScrub::Clean, "a freshly guarded block scrubs clean");
+
+  flip_a_byte(&mut store, m.block);
+  assert_eq!(store.dax_scrub(&m), DaxScrub::Healed, "the flip is caught and the block restored");
+  assert!(all_bytes(&store.dax_read_raw(&m, 0, 64), 0x41), "the victim byte is erased — the clean content is back");
+  assert_eq!(store.dax_scrub(&m), DaxScrub::Clean, "a re-scrub confirms the heal");
+  assert_eq!(store.dax.flips(), 1, "one flip caught (non-vacuity)");
+  assert_eq!(store.dax.healed(), 1, "one block healed (non-vacuity)");
+}
+
+/// §4.6 B2. Do: guard a read-only mapping and scrub it twice without any flip. Expect: both scrubs are clean, nothing
+/// heals (no false positive on untouched immutable content), and the scrub counter moved.
+#[test]
+fn a_guarded_block_without_a_flip_scrubs_clean() {
+  let mut store = store();
+  let mut volume = volume(&mut store, 1 << 20);
+  let f = file_of(&mut store, &mut volume, "f", 0x41, DAX_PAGE);
+  let m = volume.dax_map_read(&mut store, f).unwrap();
+  store.dax_guard(&m).unwrap();
+
+  assert_eq!(store.dax_scrub(&m), DaxScrub::Clean);
+  assert_eq!(store.dax_scrub(&m), DaxScrub::Clean);
+  assert_eq!(store.dax.flips(), 0, "no false-positive flip on untouched content");
+  assert!(store.dax.scrubbed() >= 2, "the scrub counter moved (non-vacuity)");
+}
+
+/// §4.6 B2 (the honest scope). Do: try to guard a *writable* mapping. Expect: refused `Invalid` — a writable block
+/// changes legitimately through the guest's own page table, so the daemon cannot tell a flip from a write and a
+/// content checksum would false-positive on every write; writable blocks are defended by the zones and the moving
+/// target, not by B2. Non-vacuity: a read-only mapping of the same file guards.
+#[test]
+fn a_writable_mapping_cannot_be_guarded() {
+  use slates_vfs::error::VfsError;
+  let mut store = store();
+  let mut volume = volume(&mut store, 1 << 20);
+  let f = file_of(&mut store, &mut volume, "f", 0x41, DAX_PAGE);
+
+  let w = volume.dax_map_write(&mut store, f).unwrap();
+  assert!(
+    matches!(store.dax_guard(&w), Err(VfsError::Invalid)),
+    "a writable mapping cannot be content-guarded"
+  );
+  assert_eq!(store.dax.guards(), 0, "no guard was registered for the writable mapping");
+
+  store.dax_revoke(&w);
+  let r = volume.dax_map_read(&mut store, f).unwrap();
+  assert!(store.dax_guard(&r).is_ok(), "a read-only mapping of the same file guards");
+  assert_eq!(store.dax.guards(), 1);
+}
+
+/// §4.6 B2. Do: guard a read-only mapping, then revoke it. Expect: the revoke drops the guard (and frees its clean
+/// copy), so a guarded mapping never leaves a pinned clean block behind after teardown.
+#[test]
+fn revoking_a_guarded_mapping_drops_the_guard() {
+  let mut store = store();
+  let mut volume = volume(&mut store, 1 << 20);
+  let f = file_of(&mut store, &mut volume, "f", 0x41, DAX_PAGE);
+  let m = volume.dax_map_read(&mut store, f).unwrap();
+  store.dax_guard(&m).unwrap();
+  assert_eq!(store.dax.guards(), 1);
+
+  assert!(store.dax_revoke(&m), "the mapping is revoked");
+  assert_eq!(store.dax.guards(), 0, "the revoke dropped the guard and freed its clean copy");
 }

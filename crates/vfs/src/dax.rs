@@ -96,6 +96,38 @@ impl Mapping {
   }
 }
 
+/// A read-only mapping's **integrity guard** (§4.6 multi-tenancy B2, the self-healing safety net): the BLAKE3 of the
+/// block's clean bytes and a pinned clean copy to heal from. A read-only DAX block is immutable, so *any* change to
+/// its bytes is a bit flip — a Rowhammer victim — never a legitimate write, which is why B2 is sound for read-only
+/// content and **not** for writable (there the daemon cannot tell a flip from the guest's own direct write, so a
+/// content checksum would false-positive on every write; writable blocks are defended by the zones and the moving
+/// target, not here). The clean copy is a separate arena block; at L1 it lives in a guard-separated zone so one
+/// hammer cannot reach both. Today it is an explicit 2× copy (opt-in, for integrity-critical content); when the gate
+/// maps base-backed read-only content, the base/seal origin is the clean source with no extra memory.
+#[derive(Clone, Copy, Debug)]
+struct DaxGuard {
+  /// The guarded read-only mapping.
+  mapping: Mapping,
+  /// BLAKE3 of the clean block bytes — the checksum a scrub compares the live block against.
+  identity: [u8; 32],
+  /// A pinned arena block holding the clean bytes: the heal source a scrub restores from.
+  clean: Block,
+}
+
+/// The outcome of a [`Store::dax_scrub`] integrity pass over a read-only mapping (§4.6 B2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DaxScrub {
+  /// No guard is registered for the mapping — nothing was checked.
+  Unguarded,
+  /// The block's checksum matched its guard: no flip.
+  Clean,
+  /// A flip was detected and the block was restored from the clean copy, which re-verified — the victim is erased.
+  Healed,
+  /// A flip was detected but the clean copy no longer verifies either (both corrupted): the block could not be
+  /// healed. The caller revokes the mapping and surfaces the corruption rather than serving bad bytes.
+  Unhealable,
+}
+
 /// The shard's DAX mapping registry (§4.6), owned by [`Store`]. It records every live mapping so the content paths
 /// (move, snapshot, landing, takeover) can revoke before they share or reclaim a block, and so the hardware access
 /// path can tell a live mapping from a revoked one. Bounded by `cap` (the shard's chunk count), with a typed refusal
@@ -115,6 +147,14 @@ pub struct DaxRegistry {
   /// re-minted on it. Monotone; the non-vacuity counter a migration test asserts moved, so a dead moving-target path
   /// cannot pass for a live one.
   migrated: u64,
+  /// Integrity guards for read-only mappings (§4.6 B2, the self-healing safety net). Bounded by `cap` as the
+  /// mappings are; empty on any shard that guards nothing.
+  guards: Vec<DaxGuard>,
+  /// Scrubs run, flips caught, and blocks healed (§4.6 B2 non-vacuity counters): a test asserts the one it drove
+  /// moved, so a dead scrub or a dead heal path cannot pass for a live one.
+  scrubbed: u64,
+  flips: u64,
+  healed: u64,
 }
 
 impl DaxRegistry {
@@ -127,6 +167,10 @@ impl DaxRegistry {
       revoked: 0,
       refused: 0,
       migrated: 0,
+      guards: Vec::new(),
+      scrubbed: 0,
+      flips: 0,
+      healed: 0,
     }
   }
 
@@ -191,6 +235,30 @@ impl DaxRegistry {
   #[must_use]
   pub fn migrated(&self) -> u64 {
     self.migrated
+  }
+
+  /// Live integrity guards (§4.6 B2).
+  #[must_use]
+  pub fn guards(&self) -> usize {
+    self.guards.len()
+  }
+
+  /// Integrity scrubs run so far (§4.6 B2 non-vacuity counter).
+  #[must_use]
+  pub fn scrubbed(&self) -> u64 {
+    self.scrubbed
+  }
+
+  /// Bit flips caught by a scrub so far (§4.6 B2 non-vacuity counter).
+  #[must_use]
+  pub fn flips(&self) -> u64 {
+    self.flips
+  }
+
+  /// Blocks healed from their clean copy after a caught flip so far (§4.6 B2 non-vacuity counter).
+  #[must_use]
+  pub fn healed(&self) -> u64 {
+    self.healed
   }
 }
 
@@ -499,6 +567,134 @@ impl Store {
       return false;
     }
     if self.content.arena_mut().unpin(mapping.block).is_err() {
+      self.release_refusals = self.release_refusals.saturating_add(1);
+    }
+    // A revoked mapping's integrity guard (§4.6 B2), if any, goes with it so its clean copy is not left pinned.
+    self.drop_guard(mapping);
+    true
+  }
+
+  /// Registers an integrity guard for a **read-only** mapping (§4.6 B2, the self-healing safety net): captures the
+  /// BLAKE3 of the block's clean bytes and a pinned clean copy to heal from, so a later [`Store::dax_scrub`] catches a
+  /// Rowhammer bit flip and restores it. Refused `Invalid` for a *writable* mapping — a writable block changes
+  /// legitimately, so a content checksum cannot tell a flip from the guest's own direct write; writable blocks are
+  /// defended by the zones and the moving target, never a checksum — or for a revoked mapping; `NoSpace`/
+  /// `PublishNeeded` if no block can back the clean copy or the guard bound is reached. Re-guarding a mapping refreshes
+  /// it (the old clean copy is freed).
+  pub fn dax_guard(&mut self, mapping: &Mapping) -> Result<(), VfsError> {
+    if mapping.writable || !self.dax.is_live(mapping) {
+      return Err(VfsError::Invalid);
+    }
+    if self.dax.guards.len() >= self.dax.cap {
+      return Err(VfsError::NoSpace);
+    }
+    // The clean bytes and their checksum, captured now while the content is known good.
+    let identity = match self.content.arena().bytes(mapping.block) {
+      Some(bytes) => *blake3::hash(bytes).as_bytes(),
+      None => return Err(VfsError::Invalid),
+    };
+    let size = self
+      .content
+      .arena()
+      .bytes(mapping.block)
+      .map(<[u8]>::len)
+      .unwrap_or(0);
+    let locked = self.content.arena().is_locked(mapping.block);
+    let clean = self.content.alloc_block(size, locked)?;
+    if let Err(refusal) = self.content.arena_mut().pin(clean) {
+      if self.content.arena_mut().free(clean).is_err() {
+        self.release_refusals = self.release_refusals.saturating_add(1);
+      }
+      return Err(refusal.into());
+    }
+    // Copy the clean bytes into the heal source (both blocks are `size` bytes).
+    let carry = self
+      .content
+      .arena()
+      .bytes(mapping.block)
+      .map(<[u8]>::to_vec)
+      .unwrap_or_default();
+    if let Some(dst) = self.content.arena_mut().bytes_mut(clean)
+      && let Some(slot) = dst.get_mut(..carry.len())
+    {
+      slot.copy_from_slice(&carry);
+    }
+    // Replace any existing guard for this mapping (free its old clean copy), then record the fresh one.
+    self.drop_guard(mapping);
+    self.dax.guards.push(DaxGuard {
+      mapping: *mapping,
+      identity,
+      clean,
+    });
+    Ok(())
+  }
+
+  /// Scrubs a guarded read-only mapping (§4.6 B2): re-checksums the live block and, on a mismatch (a bit flip),
+  /// restores it from the clean copy and re-verifies — the asynchronous safety net for the one hazard the daemon
+  /// cannot see directly (a hardware write/flip on a mapped page). Returns [`DaxScrub`]. A background scanner calls
+  /// this over its guards a bounded number per step; an explicit validation pass calls it on demand.
+  pub fn dax_scrub(&mut self, mapping: &Mapping) -> DaxScrub {
+    let Some(guard) = self.dax.guards.iter().find(|g| &g.mapping == mapping).copied() else {
+      return DaxScrub::Unguarded;
+    };
+    self.dax.scrubbed = self.dax.scrubbed.saturating_add(1);
+    let clean = match self.content.arena().bytes(mapping.block) {
+      Some(live) => *blake3::hash(live).as_bytes() == guard.identity,
+      None => return DaxScrub::Unguarded,
+    };
+    if clean {
+      return DaxScrub::Clean;
+    }
+    // A flip. Heal from the clean copy — but only if the clean copy itself still verifies (else both are corrupt).
+    self.dax.flips = self.dax.flips.saturating_add(1);
+    let clean_ok = matches!(
+      self.content.arena().bytes(guard.clean),
+      Some(c) if *blake3::hash(c).as_bytes() == guard.identity
+    );
+    if !clean_ok {
+      return DaxScrub::Unhealable;
+    }
+    let restore = self
+      .content
+      .arena()
+      .bytes(guard.clean)
+      .map(<[u8]>::to_vec)
+      .unwrap_or_default();
+    if let Some(dst) = self.content.arena_mut().bytes_mut(mapping.block) {
+      let n = dst.len().min(restore.len());
+      if let (Some(d), Some(s)) = (dst.get_mut(..n), restore.get(..n)) {
+        d.copy_from_slice(s);
+      }
+    }
+    // Re-verify after the heal: the victim must be erased, or it is unhealable and the caller revokes.
+    let healed = matches!(
+      self.content.arena().bytes(mapping.block),
+      Some(after) if *blake3::hash(after).as_bytes() == guard.identity
+    );
+    if healed {
+      self.dax.healed = self.dax.healed.saturating_add(1);
+      DaxScrub::Healed
+    } else {
+      DaxScrub::Unhealable
+    }
+  }
+
+  /// Drops a mapping's integrity guard (§4.6 B2) if it has one, freeing the clean copy; returns whether one was held.
+  /// The explicit teardown a caller runs before it revokes a guarded mapping; [`Store::dax_revoke`] also calls it.
+  pub fn dax_unguard(&mut self, mapping: &Mapping) -> bool {
+    self.drop_guard(mapping)
+  }
+
+  /// Removes `mapping`'s guard and releases its clean copy (unpin then free). Internal to the B2 paths.
+  fn drop_guard(&mut self, mapping: &Mapping) -> bool {
+    let Some(index) = self.dax.guards.iter().position(|g| &g.mapping == mapping) else {
+      return false;
+    };
+    let guard = self.dax.guards.swap_remove(index);
+    if self.content.arena_mut().unpin(guard.clean).is_err() {
+      self.release_refusals = self.release_refusals.saturating_add(1);
+    }
+    if self.content.arena_mut().free(guard.clean).is_err() {
       self.release_refusals = self.release_refusals.saturating_add(1);
     }
     true
