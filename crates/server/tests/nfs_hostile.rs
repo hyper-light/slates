@@ -20,7 +20,7 @@ mod common;
 use common::nfs::{
   MOUNT_PROGRAM, NFS_PROGRAM, call_accept_status, create, create_status, lookup, lookup_raw_status,
   lookup_status, mkdir, mkdir_status, mount, opaque, read, read_status, readdirplus_status,
-  remove_status, rmdir_status, status, symlink_status, write, write_at_status,
+  readlink, remove_status, rmdir_status, status, symlink_status, write, write_at_status,
 };
 
 /// Shape: honest clients, each on its own connection and file.
@@ -998,6 +998,58 @@ fn a_valid_capability_for_one_volume_cannot_read_another_cwe_863() {
     0,
     "A's valid capability on B's handle is refused — a capability authorizes only its own volume, never another"
   );
+
+  drop(s);
+  drop(daemon);
+}
+
+/// Hostile SYMLINK targets over a raw socket (§4.6; CWE-158 NUL injection, bounded storage). A client controls a
+/// symlink's target bytes; slates stores the target opaquely and NEVER resolves it (the kernel does, as the
+/// mounting user), so an absolute or `..`-laden target is accepted and read back byte-for-byte — the server
+/// itself never opens it. But a target with an interior NUL must be refused (so the stored bytes cannot diverge
+/// from what a C-string readlink at the disk boundary would see), and an over-length target past the symlink cap
+/// must be refused, never truncated. Driven against a live daemon; the escaping targets round-trip through
+/// READLINK unchanged (proving no host access), the NUL and over-length ones are refused, and a normal symlink
+/// still resolves.
+#[test]
+fn a_symlink_target_naming_a_host_path_is_stored_opaque_and_a_nul_or_overlong_target_is_refused() {
+  let (daemon, instance) = single_shard_daemon("symlinktarget");
+  provision(&instance, "sl");
+  let port = daemon.nfs_port().expect("the daemon is serving NFS");
+  let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+  let root = mount(&mut s, &daemon.mount_capability("sl").unwrap().unwrap(), 1);
+
+  // An absolute host path and a `..`-climb as targets are accepted and stored opaquely — slates never resolves
+  // them, so READLINK returns the exact bytes and no host file is ever opened by the server.
+  for (xid, name, target) in [(2u32, b"abs".as_slice(), "/etc/passwd"), (3, b"up", "../../../../etc/shadow")] {
+    assert_eq!(symlink_status(&mut s, &root, name, target, xid), 0, "an opaque symlink target is accepted");
+    let fh = lookup(&mut s, &root, std::str::from_utf8(name).unwrap(), xid + 100);
+    assert_eq!(
+      readlink(&mut s, &fh, xid + 200),
+      Ok(target.as_bytes().to_vec()),
+      "the target is stored and returned byte-for-byte, never resolved to a host file"
+    );
+  }
+
+  // A target carrying an interior NUL is refused (no C-string truncation at the disk boundary).
+  assert_ne!(
+    symlink_status(&mut s, &root, b"nul", "safe\0/etc/passwd", 6),
+    0,
+    "a symlink target with an interior NUL is refused"
+  );
+
+  // An over-length target (well past any PATH_MAX) is refused, never truncated to a valid shorter one.
+  let overlong: String = std::iter::repeat_n('a', 100_000).collect();
+  assert_ne!(
+    symlink_status(&mut s, &root, b"long", &overlong, 7),
+    0,
+    "an over-length symlink target is refused, not truncated"
+  );
+
+  // Non-vacuity: a normal relative symlink still creates and reads back.
+  assert_eq!(symlink_status(&mut s, &root, b"rel", "sibling.txt", 8), 0, "a normal symlink is created");
+  let rel = lookup(&mut s, &root, "rel", 9);
+  assert_eq!(readlink(&mut s, &rel, 10), Ok(b"sibling.txt".to_vec()));
 
   drop(s);
   drop(daemon);

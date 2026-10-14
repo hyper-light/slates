@@ -602,6 +602,28 @@ pub(crate) fn readdirplus_entries(
   entries
 }
 
+/// NFS READLINK of `link_fh` → the raw target bytes the server stored, or the status it answered. slates stores
+/// a symlink target as an opaque string and never resolves it (the kernel does, as the mounting user), so a
+/// target naming a host path comes back byte-for-byte, proving the server itself never opened it.
+pub(crate) fn readlink(
+  stream: &mut (impl Read + Write),
+  link_fh: &[u8],
+  xid: u32,
+) -> Result<Vec<u8>, u32> {
+  let mut args = Vec::new();
+  opaque(link_fh, &mut args);
+  let reply = call(stream, NFS_PROGRAM, 5, &args, xid);
+  match status(&reply) {
+    0 => {
+      // READLINK3resok: symlink_attributes (post_op_attr), then the nfspath3 target (opaque).
+      let follows = u32::from_be_bytes(reply[4..8].try_into().unwrap());
+      let off = 8 + if follows == 1 { 84 } else { 0 };
+      Ok(read_opaque(&reply, off).0)
+    }
+    answered => Err(answered),
+  }
+}
+
 /// An `nfstime3` as (seconds, nanoseconds).
 pub(crate) type Time3 = (u32, u32);
 
