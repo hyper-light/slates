@@ -1251,6 +1251,101 @@ fn the_copy_buffers_a_device_keeps_stay_charged_to_its_attachment() {
 
 /// A store whose content arena is a shared-object (anchor-backed) region, so a mapped block has a descriptor the DAX
 /// window can map (a scratch/anonymous store has none). `page` is the host page so blocks are page-aligned for `mmap`.
+/// A shared-backed store sized for `pages` mappable blocks — for the DAX map-path profiling at scale.
+#[cfg(unix)]
+fn dax_profiling_store(page: usize, pages: usize, tag: &str) -> slates_vfs::volume::Store {
+  use slates_mem::arena::ChunkArena;
+  use slates_mem::region::Region;
+  use slates_mem::{ExclusiveObject, SharedObject, Words};
+  let object =
+    SharedObject::create(&format!("sl-dp-{tag}-{}", std::process::id()), page * pages, Words::new()).unwrap();
+  let mut arena = ChunkArena::new(page);
+  // SAFETY: this test is the object's only mapper; it declares no words.
+  arena
+    .add_region(Region::shared(unsafe { ExclusiveObject::new(object) }, page))
+    .unwrap();
+  slates_vfs::volume::Store::new(
+    &slates_vfs::volume::StoreConfig {
+      page,
+      cache_line: 128,
+      max_dirs: 64,
+      max_inodes: pages + 64,
+      max_chunks: pages,
+      max_dir_blocks: 256,
+      dir_cutover: 16,
+    },
+    arena,
+    0,
+  )
+}
+
+/// PROFILING (§4.6, the device DAX map path; run with `--ignored --nocapture`). Map N files' blocks into N distinct
+/// window slots and report the per-map latency of the first and last batch. Each map pays the pin (copy-up for a
+/// writable map) + the `MAP_FIXED` syscall + the remap overlap scan over the live windows (O(live), bounded by the
+/// registry cap). If the scan were the bottleneck the last batch would be far slower than the first; a flat ratio
+/// means the path is syscall-bound and the scan is negligible within the bound (so an index over the windows would
+/// be a premature optimization of a control-plane op — Ada's optimization hierarchy: measure first).
+#[cfg(unix)]
+#[test]
+#[ignore = "profiling: run explicitly with --ignored --nocapture"]
+fn t_dax_device_map_path_latency_profile() {
+  use slates_mem::{SharedObject, Words};
+  use std::time::{Duration, Instant};
+  let page = rustix::param::page_size().max(1);
+  // Bounded by the sim driver's guest memory and the arena's chunk budget; large enough that an O(live) overlap
+  // scan would show as per-map growth (last batch vs first) if it were the bottleneck.
+  let n = 300usize;
+  let mut store = dax_profiling_store(page, n + 256, "prof");
+  let mut vol = volume(&mut store);
+  vol.enable_writable_dax();
+  let root = vol.root_inode(&store).unwrap();
+  let mut files = Vec::with_capacity(n);
+  for i in 0..n {
+    let no = vol.create_file_no(&mut store, root, &format!("f{i}"), 0o644).unwrap();
+    vol.write(&mut store, no, 0, &vec![0x5A; page]).unwrap();
+    files.push(no.0);
+  }
+  let (mut device, mut driver) = device_and_driver();
+  let cache =
+    SharedObject::create(&format!("sl-dpwin-{}", std::process::id()), page * n, Words::new()).unwrap();
+  device.install_dax_window(Some(
+    slates_bridge_virtiofs::dax::DaxCacheRegion::new(cache.as_fd(), (page * n) as u64).unwrap(),
+  ));
+  let cx = context();
+  let mut bridge = VolumeBridge::new(vid(), &mut vol, &mut store);
+  dax_exchange(&mut device, &mut driver, &mut bridge, &cx, (Opcode::Init, 1, ROOT), &dax_init_body());
+
+  let batch = 128usize;
+  let (mut first, mut last) = (Duration::ZERO, Duration::ZERO);
+  for (i, &nodeid) in files.iter().enumerate() {
+    let moffset = (i * page) as u64;
+    let unique = u64::try_from(i).unwrap_or(0).saturating_add(2);
+    let at = Instant::now();
+    let r = dax_exchange(
+      &mut device, &mut driver, &mut bridge, &cx,
+      (Opcode::SetupMapping, unique, nodeid), &dax_setup_body(0, page as u64, true, moffset),
+    );
+    let dt = at.elapsed();
+    assert_eq!(reply_error(&r), 0, "map {i}");
+    if i < batch {
+      first = first.saturating_add(dt);
+    }
+    if i >= n.saturating_sub(batch) {
+      last = last.saturating_add(dt);
+    }
+  }
+  assert_eq!(device.dax_window_count(), n, "all N mapped");
+  let first_ns = first.as_nanos() / (batch as u128);
+  let last_ns = last.as_nanos() / (batch as u128);
+  let ratio = (last_ns as f64) / (first_ns.max(1) as f64);
+  eprintln!(
+    "dax device map path: n={n}, first-{batch} {first_ns} ns/map, last-{batch} {last_ns} ns/map, ratio {ratio:.2} \
+     (flat => syscall-bound, the O(live) overlap scan negligible within the registry cap)"
+  );
+  drop(bridge);
+  drop(cache);
+}
+
 #[cfg(unix)]
 fn dax_shared_store(page: usize, tag: &str) -> slates_vfs::volume::Store {
   use slates_mem::arena::ChunkArena;
