@@ -6174,11 +6174,18 @@ its own page table and never calls the daemon), so the defense had to be at the 
     block. A sync verb cannot block, so this refuse-retry (the write-delegation shape) is the correctness gate; it is
     a **no-op in production** (DAX unadvertised, `virtiofs.rs:233` asserts the device does not advertise it), so
     `snapshot` proceeds unchanged — recovery arbiter 39/0, server lib clippy clean, the check's components tested in
-    `vfs/tests/dax.rs`. **Owed (liveness refinement, not correctness):** a device-loop *kick* so an idle-guest device
-    drains on the recall rather than on its next service cycle — it needs a change to the serve loop's post-wake
-    doorbell wait (`serve_round`), which every device's loop depends on, so it is built deliberately (not rushed into
-    load-bearing code), and a through-the-client e2e that needs a live writable window is advertisement-gated like all
-    DAX e2e.
+    `vfs/tests/dax.rs`. **The liveness kick is also built** (`serve::kick` + `serve_round`'s additive drain-on-kick
+    branch + `virtiofs::kick_volume_devices`; the snapshot verb kicks the volume's device loops so an idle-guest
+    device munmaps on the recall, not on its next doorbell kick; unit-tested, recovery 39/0). **Owed — an adversarial
+    hardening pass (advertisement-gated, not correctness):** (a) a malicious guest could **re-map** a writable window
+    between the snapshot's retries (`dax_map_write` re-adds it after the recall removed it), **livelocking** the
+    retry; the mitigation mirrors the delegation quiet-period — refuse a new writable DAX map of a volume whose
+    snapshot is recalling (a per-prefix "recalling" state `dax_map_write` checks, set by the verb, cleared on
+    completion/timeout) — deferred because its flag lifecycle (across retries + an abandoned snapshot) is tricky and
+    the path is empty until advertisement; (b) the refuse-retry has no server-side deadline — a stuck device never
+    completes the snapshot, so a bounded recall (revoke the window if the device does not drain within a lease, as a
+    delegation is revoked on lapse) is the companion hardening. A through-the-client e2e needs a live writable
+    window, advertisement-gated like all DAX e2e.
   - **advance/takeover/landing** (`dax_revoke_block`) is **unwired — and, investigated, unneeded for the realistic
     design** (not owed wiring): a **read** DAX mapping **pins its version** (§4.6/§4.2 retention, SLATES_DESIGN.md:199;
     "Destroy/revoke releases credits only after … mappings"), so an advance retains the pinned version and the guest
