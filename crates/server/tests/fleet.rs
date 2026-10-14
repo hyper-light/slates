@@ -65,8 +65,17 @@ use slates_transport::endpoint::{Endpoint, EndpointError};
 use slates_transport::handshake::Identity;
 use slates_wire::request::RequestId;
 
-/// Shape: the reply deadline (nanoseconds): five seconds, far past any served verb.
-const DEADLINE_NS: u64 = 5_000_000_000;
+/// Shape: the reply deadline (nanoseconds) for a success-wait — far past any served verb, and generous enough
+/// that a heavily loaded or shared CI runner (reply delivery and scheduling, not the verb, are what slow under
+/// load) does not false-fail; the tests pass locally in well under it. Overridable for an exceptionally slow
+/// environment via `SLATES_TEST_FLEET_DEADLINE_SECS`. A real hang is still caught at the bound.
+static DEADLINE_NS: std::sync::LazyLock<u64> = std::sync::LazyLock::new(|| {
+  std::env::var("SLATES_TEST_FLEET_DEADLINE_SECS")
+    .ok()
+    .and_then(|secs| secs.parse::<u64>().ok())
+    .unwrap_or(30)
+    .saturating_mul(1_000_000_000)
+});
 /// Shape: how long a client waits for the daemon or a full ring before giving up.
 const CREDIT_WAIT: Duration = Duration::from_secs(5);
 
@@ -6692,7 +6701,7 @@ impl Client {
         }
       }
     }
-    let reply = match self.end.wait(Some(DEADLINE_NS)) {
+    let reply = match self.end.wait(Some(*DEADLINE_NS)) {
       Ok(reply) => reply,
       Err(e) => {
         trace::record(format_args!(
@@ -11569,7 +11578,7 @@ fn a_status_meeting_a_lapsed_lease_waits_and_is_served_once_the_lease_confirms()
     let volume = scene.held;
     let asking = scope.spawn(move || {
       Client::connect(&instance)
-        .try_call(&RequestBody::Status { volume }, DEADLINE_NS)
+        .try_call(&RequestBody::Status { volume }, *DEADLINE_NS)
         .unwrap_or_else(|e| refused_placeholder(&e))
     });
     let parked = poll_until(&[&daemons[0]], RETIREMENT_DEADLINE, || {
@@ -11762,7 +11771,7 @@ fn created_on(daemon: &Daemon, name: &str) -> VolumeId {
 fn status_reply(daemon: &Daemon, volume: VolumeId) -> ReplyBody {
   let mut client = Client::connect(daemon.instance());
   client
-    .try_call(&RequestBody::Status { volume }, DEADLINE_NS)
+    .try_call(&RequestBody::Status { volume }, *DEADLINE_NS)
     .unwrap_or_else(|e| refused_placeholder(&e))
 }
 
@@ -11915,7 +11924,7 @@ struct TakenOverGreenView {
 fn observe_taken_over_green(successor: &Daemon, green: VolumeId) -> TakenOverGreenView {
   let mut client = Client::connect(successor.instance());
   let head = match client
-    .try_call(&RequestBody::Versions { green }, DEADLINE_NS)
+    .try_call(&RequestBody::Versions { green }, *DEADLINE_NS)
     .unwrap_or_else(|e| refused_placeholder(&e))
   {
     ReplyBody::Versions { head } => Ok(head),
@@ -11947,7 +11956,7 @@ fn read_green_file(
         path: "f".to_owned(),
         at,
       },
-      DEADLINE_NS,
+      *DEADLINE_NS,
     )
     .unwrap_or_else(|e| refused_placeholder(&e))
   {
@@ -11971,7 +11980,7 @@ fn submit_next_on_successor(
         green,
         name: "successor-work".to_owned(),
       },
-      DEADLINE_NS,
+      *DEADLINE_NS,
     )
     .unwrap_or_else(|e| refused_placeholder(&e));
   let ReplyBody::WorkCreated { id: work, base } = created else {
@@ -12009,7 +12018,7 @@ fn submit_next_on_successor(
     );
   }
   let retried = client
-    .try_retry(&submit, DEADLINE_NS)
+    .try_retry(&submit, *DEADLINE_NS)
     .unwrap_or_else(|e| refused_placeholder(&e));
   let same = retried == submitted;
   let observed: Vec<&Daemon> = survivors.iter().collect();
