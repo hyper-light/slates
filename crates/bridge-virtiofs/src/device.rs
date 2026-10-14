@@ -521,12 +521,47 @@ impl Device {
     bridge: &mut dyn slates_bridge_core::Bridge,
     cx: &slates_bridge_core::OpContext,
   ) -> usize {
+    self.revoke_inode_windows(no, bridge, cx, false)
+  }
+
+  /// Revokes only the **writable** live DAX windows of inode `no` at the daemon's request (§4.6): what a snapshot or
+  /// clone of the volume needs — a writable mapping of a block about to be shared-frozen must be torn down (its next
+  /// write would reach the frozen version), while **read-only** mappings survive (immutable shared content is the
+  /// gate's allowed DAX case, and read-only windows cannot corrupt a snapshot). Unlike [`Self::request_revoke_inode`]
+  /// (which tears every window, as a write or truncate makes all of them stale), this keeps the inode's read-only
+  /// windows. Returns how many writable windows were torn. The device half for the snapshot teardown path; the
+  /// synchronous server-side recall that drives it (so `snapshot` tears a live guest's writable windows before it
+  /// freezes) is the remaining cross-task integration (`docs/wip/GAPS.md`).
+  #[cfg(unix)]
+  pub fn request_revoke_writable_inode(
+    &mut self,
+    no: u64,
+    bridge: &mut dyn slates_bridge_core::Bridge,
+    cx: &slates_bridge_core::OpContext,
+  ) -> usize {
+    self.revoke_inode_windows(no, bridge, cx, true)
+  }
+
+  /// Tears down inode `no`'s live DAX windows — every one, or only the writable ones when `writable_only` — munmap
+  /// then unpin (the two-phase revoke), so each block is unmapped from the guest's page table before it is unpinned
+  /// (the async-revoke stale-TLB hazard §4.6 #1). The daemon holds each inode pin until this returns, so a window
+  /// never outlives its pin. Returns how many were torn.
+  #[cfg(unix)]
+  fn revoke_inode_windows(
+    &mut self,
+    no: u64,
+    bridge: &mut dyn slates_bridge_core::Bridge,
+    cx: &slates_bridge_core::OpContext,
+    writable_only: bool,
+  ) -> usize {
     let mut torn = 0usize;
     if let Some(cache) = self.dax_cache.as_mut() {
       let mut index = 0;
       while index < self.dax_windows.len() {
         match self.dax_windows.get(index).copied() {
-          Some(entry) if entry.mapping.inode.0 == no => {
+          Some(entry)
+            if entry.mapping.inode.0 == no && (!writable_only || entry.mapping.writable) =>
+          {
             teardown_dax_window(cache, bridge, cx, &entry);
             self.dax_windows.swap_remove(index);
             torn = torn.saturating_add(1);
@@ -541,6 +576,17 @@ impl Device {
   /// No DAX window exists off Unix, so a daemon-initiated revoke tears nothing down.
   #[cfg(not(unix))]
   pub fn request_revoke_inode(
+    &mut self,
+    _no: u64,
+    _bridge: &mut dyn slates_bridge_core::Bridge,
+    _cx: &slates_bridge_core::OpContext,
+  ) -> usize {
+    0
+  }
+
+  /// No DAX window exists off Unix, so a daemon-initiated writable revoke tears nothing down.
+  #[cfg(not(unix))]
+  pub fn request_revoke_writable_inode(
     &mut self,
     _no: u64,
     _bridge: &mut dyn slates_bridge_core::Bridge,

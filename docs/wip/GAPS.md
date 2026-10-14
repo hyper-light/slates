@@ -6144,12 +6144,18 @@ its own page table and never calls the daemon), so the defense had to be at the 
     what it must do. Its correctness rests on a *server-ordering invariant* — the device attachment is torn down
     first (`release_dax` munmaps every window), so by the time `dax_revoke_volume` runs there is no live window to
     munmap. Owed: assert that ordering at the server once DAX is advertised. Not a VFS change.
-  - **snapshot/clone** (`dax_revoke_writable_of_prefix`) needs a **writable-only, synchronous recall**, which the
-    step-5 channel does not provide: the sync `dax_revoke` never munmaps the guest window at all, and the
-    *inode-keyed* channel would over-tear the **read-only** windows snapshot must keep (immutable shared content is
-    the allowed DAX case). The correct shape is a writable DAX window treated as a **write-holder** in the existing
-    delegation-recall machinery (recalled synchronously before the freeze), the same exclusion a write delegation
-    needs — gated on the registry decision (banned item 7).
+  - **snapshot/clone** (`dax_revoke_writable_of_prefix`) needs a **writable-only, synchronous recall** (the sync
+    `dax_revoke` never munmaps the guest window, and the inode-keyed step-5 channel would over-tear the **read-only**
+    windows snapshot must keep). The **device half is built + tested**: `Device::request_revoke_writable_inode` tears
+    an inode's writable windows and keeps its read-only ones (`request_revoke_writable_inode_keeps_the_read_only_window`,
+    bridge-virtiofs/tests/device.rs). **Owed:** the *synchronous server-side* recall that drives it at `snapshot`.
+    Verified why it is a real build, not an Ada decision: a verb cannot reach the device — the server holds only
+    device **ids** in `ShardState.guest_devices` and its only coordination is `serve::request_revoke` (an async flag
+    that ends the *whole* device at its next pass); the device's window state is encapsulated in its serve-loop task.
+    So the owed piece is a new **cross-task per-inode recall request→confirm** on the shard (the snapshot verb signals
+    the owner's device loops to recall the volume's writable windows, then awaits confirmation before it freezes) —
+    the DAX-window-as-write-holder model, the same exclusion a write delegation needs. Unreachable in production until
+    DAX is advertised (no writable window exists), so it is sequenced with advertisement.
   - **advance/version-move** (`dax_revoke_block`) is **unwired** (no caller): the same writable-mapping subtlety, to
     be wired with the recall model.
 

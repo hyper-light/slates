@@ -1903,6 +1903,69 @@ fn request_revoke_inode_tears_down_the_daemons_mapping() {
   drop(cache);
 }
 
+/// §4.6 — the device half of the snapshot/clone teardown (`Device::request_revoke_writable_inode`). A snapshot shares
+/// the volume's current blocks with the frozen version, so a **writable** DAX window of one must be torn down (its
+/// next write would reach the frozen version), while a **read-only** window survives (immutable shared content is the
+/// allowed DAX case, and a read-only window cannot corrupt a snapshot). Do: map one inode both writable (one window
+/// slot) and read-only (another slot), then revoke the inode's *writable* windows. Expect: the writable window is
+/// torn (1), the read-only window survives, a second writable revoke tears nothing, and the all-windows revoke then
+/// tears the read-only one — so the writable filter keeps exactly the windows a snapshot must keep. This is the leaf
+/// primitive; the synchronous server-side recall that drives it at `snapshot` is the owed cross-task integration.
+#[cfg(unix)]
+#[test]
+fn request_revoke_writable_inode_keeps_the_read_only_window() {
+  use slates_mem::{SharedObject, Words};
+  let page = rustix::param::page_size().max(1);
+  let mut store = dax_shared_store(page, "reqrevwr");
+  let mut vol = volume(&mut store);
+  vol.enable_writable_dax();
+  let root = vol.root_inode(&store).unwrap();
+  let no = vol.create_file_no(&mut store, root, "f", 0o644).unwrap();
+  vol.write(&mut store, no, 0, &vec![0x5A; page]).unwrap();
+  let nodeid = no.0;
+
+  let (mut device, mut driver) = device_and_driver();
+  let cache =
+    SharedObject::create(&format!("sl-daxrw-{}", std::process::id()), page * 4, Words::new()).unwrap();
+  device.install_dax_window(Some(
+    slates_bridge_virtiofs::dax::DaxCacheRegion::new(cache.as_fd(), (page * 4) as u64).unwrap(),
+  ));
+  let cx = context();
+  let mut bridge = VolumeBridge::new(vid(), &mut vol, &mut store);
+  dax_exchange(&mut device, &mut driver, &mut bridge, &cx, (Opcode::Init, 1, ROOT), &dax_init_body());
+  // A writable window at window offset 0 and a read-only window at offset `page`, both of the same inode.
+  let w = dax_exchange(
+    &mut device, &mut driver, &mut bridge, &cx,
+    (Opcode::SetupMapping, 2, nodeid), &dax_setup_body(0, page as u64, true, 0),
+  );
+  assert_eq!(reply_error(&w), 0, "writable mapped");
+  let r = dax_exchange(
+    &mut device, &mut driver, &mut bridge, &cx,
+    (Opcode::SetupMapping, 3, nodeid), &dax_setup_body(0, page as u64, false, page as u64),
+  );
+  assert_eq!(reply_error(&r), 0, "read-only mapped");
+  assert_eq!(device.dax_window_count(), 2, "both windows live");
+
+  // Snapshot's teardown: revoke only the inode's writable windows.
+  let torn = device.request_revoke_writable_inode(nodeid, &mut bridge, &cx);
+  assert_eq!(torn, 1, "exactly the writable window was torn");
+  assert_eq!(device.dax_window_count(), 1, "the read-only window survives a writable revoke");
+  assert_eq!(
+    device.request_revoke_writable_inode(nodeid, &mut bridge, &cx),
+    0,
+    "no writable window remains to revoke"
+  );
+  // The all-windows revoke (the write/truncate path) then tears the surviving read-only one.
+  assert_eq!(
+    device.request_revoke_inode(nodeid, &mut bridge, &cx),
+    1,
+    "the read-only window is torn by the all-windows revoke"
+  );
+  assert_eq!(device.dax_window_count(), 0, "no window remains");
+  drop(bridge);
+  drop(cache);
+}
+
 /// §4.6 step 5 — the daemon→device coherence channel, end to end through a real window. A client on the shard that
 /// writes a DAX-mapped file enqueues a step-5 revoke in the VFS; the device's next service pass drains that queue
 /// and tears the guest's now-stale window down, so the guest re-faults onto the new block. The daemon builds a
