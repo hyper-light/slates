@@ -778,6 +778,52 @@ pub fn parse_strace_with_cwd(log: &str, cwd: &str) -> Vec<WriteEvent> {
   events
 }
 
+/// The thread ids a landing's writes may come from: the daemon's own threads, grown to include any that
+/// lived only for the landing. strace `-f` names every event by its thread, and A-130's barrier syncs a
+/// batch's files on ⌈√n⌉ scoped threads the daemon spawns and joins inside the barrier
+/// (`crates/land/src/os.rs`), so a `/proc/<pid>/task` snapshot read after the landing misses them and
+/// their `fdatasync` of a staged file inside the target reads as "not the landing's". This recovers them
+/// from the trace itself: seeded with `roots` (the daemon id and the threads `/proc` still lists), every
+/// `clone`/`clone3` whose caller is already in the group contributes the id it returned. A thread is
+/// created before it can write, so its creation line is in the log before its writes; the pass repeats to
+/// a fixed point so a thread that itself spawns a thread is reached whatever the unfinished/resumed
+/// interleave leaves. The daemon spawns no in-target writer it does not join this way, so no real landing
+/// write is left outside the group, and a write by any other process stays outside it (a stranger's thread
+/// is never cloned by one of the daemon's).
+pub fn strace_thread_group(log: &str, roots: &[u32]) -> Vec<u32> {
+  let lines = joined_lines(log);
+  let mut group: std::collections::BTreeSet<u32> = roots.iter().copied().collect();
+  loop {
+    let mut added = false;
+    for joined in &lines {
+      let Some(caller) = joined.pid else { continue };
+      if !group.contains(&caller) {
+        continue;
+      }
+      let spawns = matches!(call_and_args(&joined.body), Some((name, _)) if name == "clone" || name == "clone3");
+      if spawns
+        && let Some(child) = clone_child(&joined.body)
+        && group.insert(child)
+      {
+        added = true;
+      }
+    }
+    if !added {
+      break;
+    }
+  }
+  group.into_iter().collect()
+}
+
+/// The thread id a `clone`/`clone3` returned (its whole line ends `) = <tid>`): `None` for a refused call
+/// (`= -1 …`, which does not parse as an unsigned id) or a line with no parseable return.
+fn clone_child(body: &str) -> Option<u32> {
+  body
+    .rsplit_once(") = ")
+    .and_then(|(_, returned)| returned.split_whitespace().next())
+    .and_then(|first| first.parse::<u32>().ok())
+}
+
 /// Format: the OS-shipped mount brokers a Linux mount runs (R10: "the only privileged pieces are
 /// OS-shipped brokers installed once"): `fusermount3`, the setuid helper libfuse ships, and util-linux's
 /// `mount`, which `fusermount3` runs for an `allow_other` mount. Their writes are the operating system's
@@ -1509,6 +1555,64 @@ mod tests {
     assert!(!eslogger_has_activity("not json\n{}\n"));
   }
 
+  /// R1 / AUD-29-42: a thread the daemon spawns only for the landing is the landing's. strace names
+  /// events by thread, and A-130's barrier `fdatasync`s a staged file on a scoped thread
+  /// (`crates/land/src/os.rs`) whose id no post-landing `/proc/<pid>/task` snapshot kept.
+  /// `strace_thread_group` recovers it from the trace's own `clone3`, so the judge places its write
+  /// inside the target; a thread the daemon never spawned, writing inside the target, stays a violation.
+  #[test]
+  fn a_thread_the_daemon_spawns_for_the_landing_is_counted_as_the_landings() {
+    let log = stamped(
+      "\
+200 clone3({flags=CLONE_VM|CLONE_FS|CLONE_FILES|CLONE_SIGHAND|CLONE_THREAD|CLONE_SYSVSEM|CLONE_SETTLS|CLONE_PARENT_SETTID|CLONE_CHILD_CLEARTID, child_tid=0x7f, parent_tid=0x7f, exit_signal=0, stack=0x7f, stack_size=0x1, tls=0x7f}, 88) = 250
+250 fdatasync(6</scratch/land-target/d/#9474106>(deleted)) = 0
+900 fdatasync(7</scratch/land-target/stranger>) = 0",
+    );
+    // The daemon's /proc snapshot named only its long-lived thread 200; 250 lived only for the barrier
+    // and 900 is not the daemon's at all.
+    let group = strace_thread_group(&log, &[200]);
+    assert!(
+      group.contains(&250),
+      "the spawned barrier thread joins the group: {group:?}"
+    );
+    assert!(
+      !group.contains(&900),
+      "a thread the daemon never spawned does not: {group:?}"
+    );
+
+    let events = parse_strace_with_cwd(&log, "/scratch/cwd");
+    let judged = judge(
+      &events,
+      &Policy {
+        target: TARGET,
+        working_directory: "/scratch/cwd",
+        landing: Some(Landing {
+          writers: &group,
+          from_ns: WINDOW.0,
+          until_ns: WINDOW.1,
+        }),
+        mounts: &[],
+      },
+    );
+    assert_eq!(
+      judged.write_calls, 2,
+      "the two fdatasyncs; clone3 is not a write"
+    );
+    assert_eq!(
+      judged.inside_target, 1,
+      "the barrier thread's fdatasync of a staged file is the landing's"
+    );
+    assert_eq!(
+      judged.outside, 1,
+      "the stranger's write inside the target is still a violation: {:?}",
+      judged.violations
+    );
+    assert_eq!(
+      paths(&judged.violations),
+      vec!["/scratch/land-target/stranger"]
+    );
+  }
+
   const STRACE: &str = "\
 100 openat(AT_FDCWD, \"/proc/self/status\", O_RDONLY|O_CLOEXEC) = 3</proc/100/status>
 100 openat(5</scratch/land-target>, \".slates-tmp-1\", O_WRONLY|O_CREAT|O_EXCL|O_CLOEXEC, 0600) = 6</scratch/land-target/.slates-tmp-1>
@@ -1685,6 +1789,19 @@ mod tests {
       quoted("\"a\\303\\251b\\\"c\\n\"").unwrap(),
       "a\u{c3}\u{a9}b\"c\n"
     );
+    // The thread-group walk over hostile clone lines — unfinished, empty and refused returns, a return
+    // that overflows a u32, a clone by a non-member — never panics and adds only a member's valid clone.
+    let clones = "1 clone3(<unfinished ...>\n1 clone() = \n1 clone3({) = -1 EAGAIN (x)\n7 clone(((() = 99999999999999999999\n1 clone3({flags=CLONE_THREAD}, 88) = 42\n";
+    let group = strace_thread_group(clones, &[1]);
+    assert!(
+      group.contains(&1) && group.contains(&42),
+      "a member's valid clone joins, nothing else does: {group:?}"
+    );
+    assert!(
+      !group.contains(&7),
+      "a non-member's clone adds nothing: {group:?}"
+    );
+    assert_eq!(strace_thread_group(garbage, &[]), Vec::<u32>::new());
   }
 
   /// Rows in the shape Apple's `fs_usage.c` prints (`format_print`, `print_open`): an `open` with
