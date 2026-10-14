@@ -6166,18 +6166,19 @@ its own page table and never calls the daemon), so the defense had to be at the 
     serve-loop drain dispatches `Device::request_revoke_writable_inode` (tears writable windows, keeps read-only) vs
     `request_revoke_inode` (all); and `DaxRegistry::has_writable_of_prefix` / `has_pending_of_prefix` let a caller see
     when the device has drained. Proven: `a_snapshot_revokes_the_volumes_writable_windows_two_phase_and_keeps_read_only`
-    (vfs), `request_revoke_writable_inode_keeps_the_read_only_window` (device). **The one remaining piece is the
-    `snapshot` verb TRIGGER**: before it freezes, wait until the recall has drained (`has_writable`/`has_pending` both
-    false). A sync verb can only *wait* by deferring, so this is a real protocol build, verified two ways and neither
-    a reflexive deferral: (a) a **deferred-continuation** — `snapshot` registers a `Deferred` (the `state::deliver`
-    machinery the landing/FUSE verbs use), a device-drain signal confirms, the reply is delivered then; or (b) a
-    **new retryable `Refusal`** + a client that retries it — but a `Refusal` variant is a **wide wire-format change**
-    (matched/encoded across ~10 crates + both SDK bindings + determinism golden vectors), and `Client::snapshot`
-    errors on any non-`Snapshotted` reply today. Both are no-op in production (DAX unadvertised → `has_writable` is
-    false → `snapshot` proceeds unchanged) and unexercisable e2e on a macOS host with no DAX-capable VMM, so the
-    trigger is sequenced with advertisement and built with the deferred-continuation (option a, no wire change) when
-    exercisable. A device-loop *kick* (wake-to-drain without revoke, `serve::request_revoke` minus the revoke flag)
-    is the small piece of infrastructure it needs.
+    (vfs), `request_revoke_writable_inode_keeps_the_read_only_window` (device). **The verb TRIGGER is now BUILT**
+    (`server(dax)`, 2026-10-14): `snapshot` (`crates/server/src/verbs.rs`), before it freezes, checks
+    `has_writable_of_prefix`; if a writable window is live it hands it to the device (`dax_revoke_writable_of_prefix`)
+    and refuses **retryable** (`Overloaded`, the shape `await_deferred_completion` uses) while `has_pending_of_prefix`
+    holds, so it freezes only once the device has drained the recall — no live writable window can reach a shared
+    block. A sync verb cannot block, so this refuse-retry (the write-delegation shape) is the correctness gate; it is
+    a **no-op in production** (DAX unadvertised, `virtiofs.rs:233` asserts the device does not advertise it), so
+    `snapshot` proceeds unchanged — recovery arbiter 39/0, server lib clippy clean, the check's components tested in
+    `vfs/tests/dax.rs`. **Owed (liveness refinement, not correctness):** a device-loop *kick* so an idle-guest device
+    drains on the recall rather than on its next service cycle — it needs a change to the serve loop's post-wake
+    doorbell wait (`serve_round`), which every device's loop depends on, so it is built deliberately (not rushed into
+    load-bearing code), and a through-the-client e2e that needs a live writable window is advertisement-gated like all
+    DAX e2e.
   - **advance/version-move** (`dax_revoke_block`) is **unwired** (no caller): the same writable-mapping subtlety, to
     be wired with the recall model.
 
