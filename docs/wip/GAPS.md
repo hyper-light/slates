@@ -6160,18 +6160,24 @@ its own page table and never calls the daemon), so the defense had to be at the 
     what it must do. Its correctness rests on a *server-ordering invariant* — the device attachment is torn down
     first (`release_dax` munmaps every window), so by the time `dax_revoke_volume` runs there is no live window to
     munmap. Owed: assert that ordering at the server once DAX is advertised. Not a VFS change.
-  - **snapshot/clone** (`dax_revoke_writable_of_prefix`) needs a **writable-only, synchronous recall** (the sync
-    `dax_revoke` never munmaps the guest window, and the inode-keyed step-5 channel would over-tear the **read-only**
-    windows snapshot must keep). The **device half is built + tested**: `Device::request_revoke_writable_inode` tears
-    an inode's writable windows and keeps its read-only ones (`request_revoke_writable_inode_keeps_the_read_only_window`,
-    bridge-virtiofs/tests/device.rs). **Owed:** the *synchronous server-side* recall that drives it at `snapshot`.
-    Verified why it is a real build, not an Ada decision: a verb cannot reach the device — the server holds only
-    device **ids** in `ShardState.guest_devices` and its only coordination is `serve::request_revoke` (an async flag
-    that ends the *whole* device at its next pass); the device's window state is encapsulated in its serve-loop task.
-    So the owed piece is a new **cross-task per-inode recall request→confirm** on the shard (the snapshot verb signals
-    the owner's device loops to recall the volume's writable windows, then awaits confirmation before it freezes) —
-    the DAX-window-as-write-holder model, the same exclusion a write delegation needs. Unreachable in production until
-    DAX is advertised (no writable window exists), so it is sequenced with advertisement.
+  - **snapshot/clone** (`dax_revoke_writable_of_prefix`) — the **writable-only recall mechanism is now BUILT and
+    tested, end to end through the step-5 channel** (2026-10-14): `dax_revoke_writable_of_prefix` is two-phase
+    (enqueues `writable_only=true`, block kept pinned); the bridge carries `(inode, writable_only)`; the device
+    serve-loop drain dispatches `Device::request_revoke_writable_inode` (tears writable windows, keeps read-only) vs
+    `request_revoke_inode` (all); and `DaxRegistry::has_writable_of_prefix` / `has_pending_of_prefix` let a caller see
+    when the device has drained. Proven: `a_snapshot_revokes_the_volumes_writable_windows_two_phase_and_keeps_read_only`
+    (vfs), `request_revoke_writable_inode_keeps_the_read_only_window` (device). **The one remaining piece is the
+    `snapshot` verb TRIGGER**: before it freezes, wait until the recall has drained (`has_writable`/`has_pending` both
+    false). A sync verb can only *wait* by deferring, so this is a real protocol build, verified two ways and neither
+    a reflexive deferral: (a) a **deferred-continuation** — `snapshot` registers a `Deferred` (the `state::deliver`
+    machinery the landing/FUSE verbs use), a device-drain signal confirms, the reply is delivered then; or (b) a
+    **new retryable `Refusal`** + a client that retries it — but a `Refusal` variant is a **wide wire-format change**
+    (matched/encoded across ~10 crates + both SDK bindings + determinism golden vectors), and `Client::snapshot`
+    errors on any non-`Snapshotted` reply today. Both are no-op in production (DAX unadvertised → `has_writable` is
+    false → `snapshot` proceeds unchanged) and unexercisable e2e on a macOS host with no DAX-capable VMM, so the
+    trigger is sequenced with advertisement and built with the deferred-continuation (option a, no wire change) when
+    exercisable. A device-loop *kick* (wake-to-drain without revoke, `serve::request_revoke` minus the revoke flag)
+    is the small piece of infrastructure it needs.
   - **advance/version-move** (`dax_revoke_block`) is **unwired** (no caller): the same writable-mapping subtlety, to
     be wired with the recall model.
 
