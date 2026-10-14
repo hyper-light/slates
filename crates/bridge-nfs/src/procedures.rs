@@ -197,6 +197,35 @@ pub fn state_io_inner(procedure: u32) -> Option<u32> {
   }
 }
 
+// TEMPORARY instrumentation (remove after the 6.17 truncate-escape creds are confirmed): a size change
+// allowed under a stateless (`Mode`) or delegation authority — i.e. a truncate reaching the server
+// outside a write-capable open, which is the escape pattern — records whether the acting caller was root.
+// A write-capable open (`IoAuthority::Open`) is never counted, so the setup's own `O_WRONLY` writes are
+// excluded. The kernel conformance test reads these in its departure report to tell apart "the 6.17
+// client flushed the truncate as root" from "the server saw the acting uid and still allowed it".
+static STATELESS_SIZE_OK_ROOT: core::sync::atomic::AtomicU64 =
+  core::sync::atomic::AtomicU64::new(0);
+static STATELESS_SIZE_OK_NONROOT: core::sync::atomic::AtomicU64 =
+  core::sync::atomic::AtomicU64::new(0);
+
+/// TEMPORARY: record that a stateless/delegation size change was allowed, by whether the caller was root.
+pub(crate) fn record_stateless_size_ok(is_root: bool) {
+  let counter = if is_root {
+    &STATELESS_SIZE_OK_ROOT
+  } else {
+    &STATELESS_SIZE_OK_NONROOT
+  };
+  counter.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// TEMPORARY: the `(root, non-root)` counts of stateless/delegation size changes allowed since start.
+pub fn stateless_size_ok_counts() -> (u64, u64) {
+  (
+    STATELESS_SIZE_OK_ROOT.load(core::sync::atomic::Ordering::Relaxed),
+    STATELESS_SIZE_OK_NONROOT.load(core::sync::atomic::Ordering::Relaxed),
+  )
+}
+
 /// Format: XATTR_SET's `how` values, RFC 8276's `setxattr_option4`.
 pub mod setxattr_how {
   /// Format: `SETXATTR4_EITHER`: create or replace.
@@ -1832,6 +1861,11 @@ impl<'b> Export<'b> {
       access::setattr_denial(&self.caller, &node, &changes, explicit_times, authority)
     {
       return (status_of_denial(denial), self.unchanged(&node));
+    }
+    // TEMPORARY instrumentation (see `record_stateless_size_ok`): the escape is a truncate allowed outside
+    // a write-capable open, so record a size change allowed under `Mode`/`Delegation` by caller rootness.
+    if changes.size.is_some() && matches!(authority, IoAuthority::Mode | IoAuthority::Delegation) {
+      record_stateless_size_ok(self.caller.is_root());
     }
     let changes = access::with_setid_side_effects(&self.caller, &node, changes);
     let cx = match self.op_context() {

@@ -334,7 +334,11 @@ fn truncating_open_needs_write_permission(root: &Path) {
   // A departure is re-run in fresh files under the kernel's NFS trace, so a failure on another kernel says what its
   // client sent (CI's Ubuntu 6.17 client let the owner of a 0477 file truncate it while Linux 6.12 refused).
   let (again, trace) = traced(|| truncating_departures(root, "traced"));
-  panic!("truncating-open departures: {departures:#?}\nunder the trace: {again:#?}\n{trace}");
+  // TEMPORARY (confirm the escape's caller): (root, non-root) stateless/delegation size changes allowed.
+  let (root_ok, nonroot_ok) = slates_bridge_nfs::procedures::stateless_size_ok_counts();
+  panic!(
+    "truncating-open departures: {departures:#?}\nstateless-size-ok allowed: root={root_ok} nonroot={nonroot_ok}\nunder the trace: {again:#?}\n{trace}"
+  );
 }
 
 /// One run of [`truncating_open_needs_write_permission`]'s cases on files named with `tag`; every step that did not
@@ -505,7 +509,11 @@ fn the_owners_own_file_refuses_a_truncating_open_without_write_permission(root: 
     return;
   }
   let (again, trace) = traced(|| open07_departures(&root.join(format!("open07-{tag}-traced"))));
-  panic!("open/07 departures ({tag} mount): {departures:#?}\nunder the trace: {again:#?}\n{trace}");
+  // TEMPORARY (confirm the escape's caller): (root, non-root) stateless/delegation size changes allowed.
+  let (root_ok, nonroot_ok) = slates_bridge_nfs::procedures::stateless_size_ok_counts();
+  panic!(
+    "open/07 departures ({tag} mount): {departures:#?}\nstateless-size-ok allowed: root={root_ok} nonroot={nonroot_ok}\nunder the trace: {again:#?}\n{trace}"
+  );
 }
 
 /// `mkfifo` and a UNIX socket's `bind` create their names through the kernel client (NFSv4 CREATE of
