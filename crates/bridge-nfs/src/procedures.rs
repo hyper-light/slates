@@ -197,32 +197,41 @@ pub fn state_io_inner(procedure: u32) -> Option<u32> {
   }
 }
 
-// TEMPORARY instrumentation (remove after the 6.17 truncate-escape creds are confirmed): a size change
-// allowed under a stateless (`Mode`) or delegation authority — i.e. a truncate reaching the server
-// outside a write-capable open, which is the escape pattern — records whether the acting caller was root.
-// A write-capable open (`IoAuthority::Open`) is never counted, so the setup's own `O_WRONLY` writes are
-// excluded. The kernel conformance test reads these in its departure report to tell apart "the 6.17
-// client flushed the truncate as root" from "the server saw the acting uid and still allowed it".
+// TEMPORARY instrumentation (remove after the 6.17 truncate-escape path is confirmed): records a size
+// change the server ALLOWED, split by how it was authorized, to tell the escape's path apart. The
+// kernel conformance test reads these in its departure report. root=0 (2026-10-14 run) already ruled
+// out a privileged flush; this adds the direct candidate-2 signal:
+//  - under Mode/Delegation (a truncate outside a write-capable open) a size change is allowed only when
+//    the caller has write by the bits, so these are legitimate workload truncates; root vs non-root is
+//    kept to re-confirm no privileged flush.
+//  - under a write-capable open (`IoAuthority::Open`) the size check is skipped, so a size change
+//    allowed there DESPITE the caller lacking write by the bits is the escape — a read-only open whose
+//    state id merged a sibling's write access (§4.6 `FileState::open`'s per-open-owner `access |=`).
 static STATELESS_SIZE_OK_ROOT: core::sync::atomic::AtomicU64 =
   core::sync::atomic::AtomicU64::new(0);
 static STATELESS_SIZE_OK_NONROOT: core::sync::atomic::AtomicU64 =
   core::sync::atomic::AtomicU64::new(0);
+static OPEN_SIZE_OK_NOWRITE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
-/// TEMPORARY: record that a stateless/delegation size change was allowed, by whether the caller was root.
-pub(crate) fn record_stateless_size_ok(is_root: bool) {
-  let counter = if is_root {
-    &STATELESS_SIZE_OK_ROOT
-  } else {
-    &STATELESS_SIZE_OK_NONROOT
+/// TEMPORARY: record a size change the server allowed, by its authority, the caller's rootness, and
+/// whether the caller had write by the bits.
+pub(crate) fn record_size_ok_allowed(authority: IoAuthority, is_root: bool, permits_write: bool) {
+  let counter = match authority {
+    IoAuthority::Open if !permits_write => &OPEN_SIZE_OK_NOWRITE,
+    IoAuthority::Open => return,
+    IoAuthority::Mode | IoAuthority::Delegation if is_root => &STATELESS_SIZE_OK_ROOT,
+    IoAuthority::Mode | IoAuthority::Delegation => &STATELESS_SIZE_OK_NONROOT,
   };
   counter.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
 }
 
-/// TEMPORARY: the `(root, non-root)` counts of stateless/delegation size changes allowed since start.
-pub fn stateless_size_ok_counts() -> (u64, u64) {
+/// TEMPORARY: `(open-despite-bits, stateless-root, stateless-non-root)` counts of allowed size changes.
+pub fn stateless_size_ok_counts() -> (u64, u64, u64) {
+  use core::sync::atomic::Ordering::Relaxed;
   (
-    STATELESS_SIZE_OK_ROOT.load(core::sync::atomic::Ordering::Relaxed),
-    STATELESS_SIZE_OK_NONROOT.load(core::sync::atomic::Ordering::Relaxed),
+    OPEN_SIZE_OK_NOWRITE.load(Relaxed),
+    STATELESS_SIZE_OK_ROOT.load(Relaxed),
+    STATELESS_SIZE_OK_NONROOT.load(Relaxed),
   )
 }
 
@@ -1862,10 +1871,14 @@ impl<'b> Export<'b> {
     {
       return (status_of_denial(denial), self.unchanged(&node));
     }
-    // TEMPORARY instrumentation (see `record_stateless_size_ok`): the escape is a truncate allowed outside
-    // a write-capable open, so record a size change allowed under `Mode`/`Delegation` by caller rootness.
-    if changes.size.is_some() && matches!(authority, IoAuthority::Mode | IoAuthority::Delegation) {
-      record_stateless_size_ok(self.caller.is_root());
+    // TEMPORARY instrumentation (see `record_size_ok_allowed`): record every allowed size change by its
+    // authority and whether the caller had write by the bits, to confirm the escape's path.
+    if changes.size.is_some() {
+      record_size_ok_allowed(
+        authority,
+        self.caller.is_root(),
+        access::permits(&self.caller, &node, Want::Write),
+      );
     }
     let changes = access::with_setid_side_effects(&self.caller, &node, changes);
     let cx = match self.op_context() {

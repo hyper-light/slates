@@ -335,9 +335,10 @@ fn truncating_open_needs_write_permission(root: &Path) {
   // client sent (CI's Ubuntu 6.17 client let the owner of a 0477 file truncate it while Linux 6.12 refused).
   let (again, trace) = traced(|| truncating_departures(root, "traced"));
   // TEMPORARY (confirm the escape's caller): (root, non-root) stateless/delegation size changes allowed.
-  let (root_ok, nonroot_ok) = slates_bridge_nfs::procedures::stateless_size_ok_counts();
+  let (open_nowrite, root_ok, nonroot_ok) =
+    slates_bridge_nfs::procedures::stateless_size_ok_counts();
   panic!(
-    "truncating-open departures: {departures:#?}\nstateless-size-ok allowed: root={root_ok} nonroot={nonroot_ok}\nunder the trace: {again:#?}\n{trace}"
+    "truncating-open departures: {departures:#?}\nsize-ok allowed: open-despite-bits={open_nowrite} stateless-root={root_ok} stateless-nonroot={nonroot_ok}\nunder the trace: {again:#?}\n{trace}"
   );
 }
 
@@ -510,9 +511,10 @@ fn the_owners_own_file_refuses_a_truncating_open_without_write_permission(root: 
   }
   let (again, trace) = traced(|| open07_departures(&root.join(format!("open07-{tag}-traced"))));
   // TEMPORARY (confirm the escape's caller): (root, non-root) stateless/delegation size changes allowed.
-  let (root_ok, nonroot_ok) = slates_bridge_nfs::procedures::stateless_size_ok_counts();
+  let (open_nowrite, root_ok, nonroot_ok) =
+    slates_bridge_nfs::procedures::stateless_size_ok_counts();
   panic!(
-    "open/07 departures ({tag} mount): {departures:#?}\nstateless-size-ok allowed: root={root_ok} nonroot={nonroot_ok}\nunder the trace: {again:#?}\n{trace}"
+    "open/07 departures ({tag} mount): {departures:#?}\nsize-ok allowed: open-despite-bits={open_nowrite} stateless-root={root_ok} stateless-nonroot={nonroot_ok}\nunder the trace: {again:#?}\n{trace}"
   );
 }
 
