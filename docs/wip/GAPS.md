@@ -6179,8 +6179,16 @@ its own page table and never calls the daemon), so the defense had to be at the 
     doorbell wait (`serve_round`), which every device's loop depends on, so it is built deliberately (not rushed into
     load-bearing code), and a through-the-client e2e that needs a live writable window is advertisement-gated like all
     DAX e2e.
-  - **advance/version-move** (`dax_revoke_block`) is **unwired** (no caller): the same writable-mapping subtlety, to
-    be wired with the recall model.
+  - **advance/takeover/landing** (`dax_revoke_block`) is **unwired — and, investigated, unneeded for the realistic
+    design** (not owed wiring): a **read** DAX mapping **pins its version** (§4.6/§4.2 retention, SLATES_DESIGN.md:199;
+    "Destroy/revoke releases credits only after … mappings"), so an advance retains the pinned version and the guest
+    reads it validly, never a stale-dangling block — no revoke needed; a **write**-advance changes content through the
+    write path, which already revokes (`dax_revoke_inode`, step-5); **migration** (L2 `dax_migrate`) does its own
+    two-phase revoke+remap; **takeover** starts the successor with **no** mappings (the dead owner's guests die with
+    it — host-local registry), so there is nothing to recall; and **landing** reads content out to disk without moving
+    the arena block. So `dax_revoke_block` is a defensive entry for a block genuinely *moved/reclaimed* under a live
+    window — a case the realistic paths do not create. If a future path does move a mapped block, it uses the
+    now-built writable recall pattern (enqueue + `request_revoke_writable_inode`/`request_revoke_inode` + kick).
 
 **Owed before DAX is advertised (the next steps):**
 
