@@ -226,9 +226,10 @@ const ACE4_ACCESS_ALLOWED_ACE_TYPE: u32 = 0;
 const OPEN4_SHARE_ACCESS_WANT_DELEG_MASK: u32 = 0xFF00;
 /// Format: see [`OPEN4_SHARE_ACCESS_WANT_DELEG_MASK`].
 const OPEN4_SHARE_ACCESS_WANT_NO_DELEG: u32 = 0x0400;
-/// Format: `OPEN4_SHARE_ACCESS_WANT_READ_DELEG` (RFC 8881 §18.16.1): the client wants a read delegation, not a write
-/// one.
-const OPEN4_SHARE_ACCESS_WANT_READ_DELEG: u32 = 0x0100;
+/// Format: `OPEN4_SHARE_ACCESS_WANT_WRITE_DELEG` (RFC 8881 §18.16.1): the client explicitly wants a write delegation.
+/// A write delegation is offered only on this want (never unilaterally), so a client that does not ask is not handed
+/// one it would return unused (measured: the create-storm's dominant avoidable cost, §4.6 / A-80).
+const OPEN4_SHARE_ACCESS_WANT_WRITE_DELEG: u32 = 0x0200;
 /// Format: `OPEN_DELEGATE_WRITE` (RFC 8881 §18.16.2).
 const OPEN_DELEGATE_WRITE: u32 = 2;
 /// Format: `NFS_LIMIT_SIZE` (RFC 8881 §18.16.1, `limit_by4`).
@@ -2182,8 +2183,14 @@ async fn open_claim<B: Backend>(
 /// The delegations an open may be granted (A-78, A-80), as [`MAY_DELEGATE_READ`] and [`MAY_DELEGATE_WRITE`] bits:
 /// none unless the session's back channel has answered (RFC 8881 §10.2: never before it is known to exist), the
 /// client did not ask for no delegation, and the file's owner is the shard serving the session, so its recall,
-/// revocation and the revocation's notice all happen where the session lives; a read one only when the client asked
-/// for that kind.
+/// revocation and the revocation's notice all happen where the session lives. A **read** delegation is offered by
+/// default (and on a read want); a **write** delegation only when the client explicitly wants one
+/// (`OPEN4_SHARE_ACCESS_WANT_WRITE_DELEG`) — never unilaterally. Measured on the 96k-file kernel clone (§4.6,
+/// 2026-10-13): the Linux client sets no want bit, and an unilaterally-offered write delegation on each create is
+/// returned unused (`DELEGRETURN` ≈ one per file, ~13% of RPCs) and then forces attribute revalidation after the
+/// return; offering read-by-default instead cut the clone's RPCs ~26% and its wall-clock, and it removes the
+/// write-delegation ↔ writable-DAX conflict for every client that does not ask. A client that benefits from a write
+/// delegation asks for it and still gets one.
 fn delegations_allowed<B: Backend>(
   backend: &mut B,
   frame: &Frame,
@@ -2203,10 +2210,11 @@ fn delegations_allowed<B: Backend>(
       .back_channel(&sessionid)
       .is_some_and(|back| back.state == super::session::CallbackState::Up)
   })?;
+  // A write delegation is offered only on an explicit want; a read one by default — see this function's doc.
   Ok(match (answering, wish) {
     (false, _) => 0,
-    (true, OPEN4_SHARE_ACCESS_WANT_READ_DELEG) => MAY_DELEGATE_READ,
-    (true, _) => MAY_DELEGATE_READ | MAY_DELEGATE_WRITE,
+    (true, OPEN4_SHARE_ACCESS_WANT_WRITE_DELEG) => MAY_DELEGATE_READ | MAY_DELEGATE_WRITE,
+    (true, _) => MAY_DELEGATE_READ,
   })
 }
 

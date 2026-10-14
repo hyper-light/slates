@@ -6145,3 +6145,26 @@ its own page table and never calls the daemon), so the defense had to be at the 
      "Destroy/revoke releases credits only after … mappings"), so no other node's merge/`advance`/landing reclaims a
      version a remote mapping pins. On takeover the dead owner's guests die with it, so the successor starts with no
      mappings — nothing to inherit or forge.
+
+### 2026-10-13: write delegations were offered unilaterally, costing ~26% of the create-storm's RPCs (A-80 amended)
+
+Profiling a 96k-file Linux-kernel clone on a slates NFSv4.2 mount (the Linux kernel client, in Docker;
+`/proc/self/mountstats` per-op counters) found the create-storm issues ~708k RPCs (~7.4 per file), with the ops
+near 1-per-file each: GETATTR 15%, OPEN 14%, WRITE 14%, LOOKUP 14%, SETATTR 13.5%, CLOSE 13.5%, **DELEGRETURN 13%**.
+The DELEGRETURN ≈ one-per-file was the tell: `delegations_allowed` (compound.rs) offered a **write** delegation on
+essentially every owned-file open with a live back channel *even when the client set no delegation-want bit* (the
+Linux client sends `wishes=0x2`/`0x3`, want-mask 0 — confirmed by logging), and the write-once-close clone returned
+each one unused. This is the same write delegation that conflicts with writable DAX (§4.6).
+
+Fix (A-80 amended, measured): offer a **read** delegation by default and a **write** one only on an explicit
+`OPEN4_SHARE_ACCESS_WANT_WRITE_DELEG`. A/B on the same binary (daemon toggle): keeping read-but-not-write delegations
+cut the clone's RPCs ~26% (695,978 → 512,538; DELEGRETURN 91,034 → 4; GETATTR 101,368 → 5,424 — the kept read
+delegation also spares the post-return attribute revalidation) and its wall-clock (9–25% across two single runs under
+shared load — a controlled best-of-N is owed for a precise figure). It also removes the write-delegation ↔
+writable-DAX conflict for every client that does not ask; the mechanism is unchanged for one that does
+(`a_plain_open_is_not_pushed_a_write_delegation` + the four write-delegation tests, which now set the want). Native
+tests green (v4 suites 63/0, nfs_mount delegation subset 10/0); clippy `--all-targets -D warnings` clean.
+
+**Owed:** the next metadata levers toward 2×-vs-tmpfs — GETATTR (still ~1/file in the baseline op mix) and SETATTR
+(~1/file, git's per-file mode/mtime) — profiled but not yet addressed; and the controlled best-of-N wall-clock for
+the delegation change.

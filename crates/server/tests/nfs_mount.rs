@@ -1688,6 +1688,23 @@ impl V4Client {
     Vec<u8>,
     Option<(u32, slates_bridge_nfs::v4::types::Stateid)>,
   ) {
+    // A plain create-for-writing with no delegation want: the server offers a read delegation by default and no
+    // write one (A-80; the server only offers write on an explicit want).
+    self.open_creating_wanting(component, name, 0)
+  }
+
+  /// As [`open_creating`], but the OPEN's share_access carries `want` delegation-want bits (e.g.
+  /// `WANT_WRITE_DELEG` to ask for a write delegation).
+  fn open_creating_wanting(
+    &mut self,
+    component: &str,
+    name: &str,
+    want: u32,
+  ) -> (
+    slates_bridge_nfs::v4::types::Stateid,
+    Vec<u8>,
+    Option<(u32, slates_bridge_nfs::v4::types::Stateid)>,
+  ) {
     use slates_bridge_nfs::v4::types::{Bitmap, Stateid};
     use slates_bridge_nfs::xdr::{XdrReader, XdrWriter};
     let mut ops = XdrWriter::new();
@@ -1696,7 +1713,7 @@ impl V4Client {
     ops.opaque(component.as_bytes());
     ops.u32(OP_OPEN);
     ops.u32(0);
-    ops.u32(3);
+    ops.u32(3 | want);
     ops.u32(0);
     ops.u64(0);
     ops.opaque(b"open-owner");
@@ -2792,6 +2809,11 @@ fn a_probe_answered_delay_is_retried_on_the_same_slot_sequence() {
   drop(daemon);
 }
 
+/// Format: `OPEN4_SHARE_ACCESS_WANT_WRITE_DELEG` (RFC 8881 §18.16.1): the delegation-want bit a client sets to ask
+/// for a write delegation. slates offers a write delegation only on this want (A-80), so these delegation tests set
+/// it; a plain `open_creating` without it gets a read delegation at most.
+const WANT_WRITE_DELEG: u32 = 0x0200;
+
 /// A client with an answering back channel on a short-lease daemon, and a second client without one: the daemon,
 /// its instance's client, the holder, the other client, and the volume's component.
 fn holder_and_other(name: &str) -> (Daemon, Client, V4Client, V4Client, String) {
@@ -2817,7 +2839,7 @@ fn holder_and_other(name: &str) -> (Daemon, Client, V4Client, V4Client, String) 
 #[test]
 fn a_write_delegation_serves_its_holders_writes_and_any_other_open_recalls_it() {
   let (daemon, client, mut a, mut b, component) = holder_and_other("write-deleg");
-  let (open_a, fh, delegation) = a.open_creating(&component, "w.txt");
+  let (open_a, fh, delegation) = a.open_creating_wanting(&component, "w.txt", WANT_WRITE_DELEG);
   let (kind, delegation) = delegation.expect("A's open for writing is delegated");
   assert_eq!(kind, 2, "a write delegation");
   assert_eq!(
@@ -2844,6 +2866,23 @@ fn a_write_delegation_serves_its_holders_writes_and_any_other_open_recalls_it() 
   drop(daemon);
 }
 
+/// A-80 (the delegation grant policy; measured 2026-10-13): a plain create-for-writing open sets no delegation want,
+/// so the server offers it **no write delegation** — a read delegation at most — rather than pushing a write one the
+/// client returns unused (the create-storm's dominant avoidable RPC cost, and the writable-DAX conflict). The same
+/// open asking with `WANT_WRITE_DELEG` still gets a write one (the write-delegation tests, which now set the want).
+#[test]
+fn a_plain_open_is_not_pushed_a_write_delegation() {
+  let (daemon, client, mut a, _b, component) = holder_and_other("no-push-deleg");
+  let (_open, _fh, delegation) = a.open_creating(&component, "p.txt");
+  assert_ne!(
+    delegation.map(|(kind, _)| kind),
+    Some(2),
+    "a plain open (no want) is not pushed a write delegation"
+  );
+  drop((a, client));
+  drop(daemon);
+}
+
 /// Format: `NFS4ERR_ACCESS` (RFC 8881 §15.1.6.1).
 const NFS4ERR_ACCESS: u32 = 13;
 
@@ -2858,7 +2897,7 @@ const NFS4ERR_ACCESS: u32 = 13;
 fn a_write_delegation_does_not_lend_its_holders_permission_to_another_users_truncate() {
   let (daemon, client, mut a, b, component) = holder_and_other("deleg-truncate");
   a.caller = Some((0, 0));
-  let (open_a, fh, delegation) = a.open_creating(&component, "t.txt");
+  let (open_a, fh, delegation) = a.open_creating_wanting(&component, "t.txt", WANT_WRITE_DELEG);
   let (kind, delegation) = delegation.expect("root's open for writing is delegated");
   assert_eq!(kind, 2, "a write delegation");
   assert_eq!(
@@ -3075,7 +3114,7 @@ fn access_of(v4: &mut V4Client, object: &[u8]) -> Result<u32, u32> {
 #[test]
 fn another_clients_getattr_of_a_write_delegated_file_recalls_it() {
   let (daemon, client, mut a, mut b, component) = holder_and_other("write-getattr");
-  let (_, fh, delegation) = a.open_creating(&component, "g.txt");
+  let (_, fh, delegation) = a.open_creating_wanting(&component, "g.txt", WANT_WRITE_DELEG);
   let (_, delegation) = delegation.expect("delegated");
   assert_eq!(a.getattr_status(&fh), NFS4_OK, "the holder's own");
   assert_eq!(b.getattr_status(&fh), NFS4ERR_DELAY, "another client waits");
@@ -3094,7 +3133,7 @@ fn another_clients_getattr_of_a_write_delegated_file_recalls_it() {
 #[test]
 fn an_open_denying_reads_recalls_a_read_delegation() {
   let (daemon, client, mut a, mut b, component) = holder_and_other("deny-read");
-  let (open_a, fh, created) = a.open_creating(&component, "r.txt");
+  let (open_a, fh, created) = a.open_creating_wanting(&component, "r.txt", WANT_WRITE_DELEG);
   let (_, created) = created.expect("the create is write delegated");
   assert_eq!(a.delegreturn(&fh, created), NFS4_OK);
   assert_eq!(a.close(&fh, open_a), NFS4_OK);

@@ -9240,11 +9240,24 @@ Status: built 2026-10-05 (B, second half). Directory delegations and `CB_GETATTR
 - Why: an open for writing that nobody else shares is the common case of a build: the client writes, closes, reopens
   and reads files only it knows. A write delegation lets it handle those opens, closes and locks itself (RFC 8881
   §10.4, §10.4.2).
-- Grant: on an open with write access, when the session's back channel answers, the file is owned where the session
-  lives, no other client holds the file open or delegated, and it was not recalled within the quiet period. No
-  settled period applies, because a file just created has been seen by nobody else. A client that asked for read
-  delegations only (`OPEN4_SHARE_ACCESS_WANT_READ_DELEG`) gets none. A client that already holds a write delegation
-  is never granted a read one (a test found the daemon handing back the write delegation's state id as a read one).
+- Grant: a **write** delegation is granted only when the client **explicitly asks** for one
+  (`OPEN4_SHARE_ACCESS_WANT_WRITE_DELEG`; amended 2026-10-13, below), the session's back channel answers, the file is
+  owned where the session lives, no other client holds the file open or delegated, and it was not recalled within the
+  quiet period. No settled period applies, because a file just created has been seen by nobody else. A plain
+  write-open that sets no delegation want gets a **read** delegation by default, never a pushed write one. A client
+  that already holds a write delegation is never granted a read one (a test found the daemon handing back the write
+  delegation's state id as a read one).
+- Amended 2026-10-13 (write delegations are opt-in, not unilateral; applied in the same change to
+  `crates/bridge-nfs/src/v4/compound.rs` `delegations_allowed` + `OPEN4_SHARE_ACCESS_WANT_WRITE_DELEG`,
+  `crates/server/tests/nfs_mount.rs` `open_creating_wanting` + `a_plain_open_is_not_pushed_a_write_delegation`, this
+  section and GAPS): profiling a 96k-file kernel clone on a slates NFSv4.2 mount (the Linux client) showed the client
+  sets no delegation-want bit, yet the server offered a write delegation on every create; the client returned each
+  unused (`DELEGRETURN` ≈ one per file, ~13% of all RPCs) and then revalidated attributes (`GETATTR` ≈ one per file).
+  Offering a read delegation by default and a write one only on an explicit want cut the clone's RPCs ~26%
+  (695,978 → 512,538; `DELEGRETURN` 91,034 → 4, `GETATTR` 101,368 → 5,424) and its wall-clock (9–25% across two
+  single runs under shared load; a controlled best-of-N is owed), and it removes the write-delegation ↔ writable-DAX
+  conflict (§4.6) for every client that does not ask. The write-delegation mechanism is unchanged for a client that
+  does ask — a read delegation, which the client keeps, is strictly better here than a write one it returns unused.
 - Space limit: zero bytes (`NFS_LIMIT_SIZE`, filesize 0). §10.4.1 lets the server choose limits "that will always
   force modified data to be flushed to the server on close". Linux nfsd encodes exactly this
   (`nfsd4_encode_open_write_delegation4`), and the Linux client then flushes at every close
