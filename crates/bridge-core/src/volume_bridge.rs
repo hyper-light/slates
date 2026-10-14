@@ -1479,4 +1479,42 @@ impl Bridge for VolumeBridge<'_> {
     }
     Ok(self.store.dax_revoke(mapping))
   }
+
+  #[cfg(unix)]
+  fn dax_backing(
+    &self,
+    mapping: &slates_vfs::dax::Mapping,
+  ) -> Option<(std::os::fd::BorrowedFd<'_>, usize, usize)> {
+    // A mapping of another volume is not this bridge's to back (the per-guest window table makes this unreachable in
+    // practice; a stray cross-volume mapping is refused, never mapped).
+    if mapping.inode.prefix() != self.volume.prefix() {
+      return None;
+    }
+    self.store.dax_backing(mapping)
+  }
+
+  fn dax_revoke_pending(
+    &mut self,
+    mapping: &slates_vfs::dax::Mapping,
+    cx: &OpContext,
+  ) -> Result<bool, VfsError> {
+    // Giving up a window needs no particular right (it only drops access), but it must name this volume.
+    self.authorize_read(cx)?;
+    if mapping.inode.prefix() != self.volume.prefix() {
+      return Err(VfsError::NotFound);
+    }
+    Ok(self.store.dax_revoke_pending(mapping))
+  }
+
+  fn dax_release_after_unmap(
+    &mut self,
+    mapping: &slates_vfs::dax::Mapping,
+    cx: &OpContext,
+  ) -> Result<bool, VfsError> {
+    self.authorize_read(cx)?;
+    if mapping.inode.prefix() != self.volume.prefix() {
+      return Err(VfsError::NotFound);
+    }
+    Ok(self.store.dax_release_after_unmap(mapping))
+  }
 }

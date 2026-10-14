@@ -475,6 +475,44 @@ pub trait Bridge {
     Ok(false)
   }
 
+  /// The backing descriptor, byte offset and length of a **live** mapping's block (FUSE_SETUPMAPPING), for the device
+  /// to map its pages into the VMM's DAX cache region. `None` for a revoked mapping, a scratch (anonymous-backed)
+  /// volume with no descriptor to hand a VMM, a mapping of another volume, or a bridge that serves no DAX. Unix only
+  /// (the DAX window is a Linux/vhost-user feature). The default serves none.
+  #[cfg(unix)]
+  fn dax_backing(
+    &self,
+    mapping: &slates_vfs::dax::Mapping,
+  ) -> Option<(std::os::fd::BorrowedFd<'_>, usize, usize)> {
+    let _ = mapping;
+    None
+  }
+
+  /// Phase one of a live-guest DAX revoke (FUSE_REMOVEMAPPING, or a content-path teardown): unregister the mapping so
+  /// the hardware path is inert and no new access is authorized, but **keep the block pinned** until the device has
+  /// unmapped the window and the guest's TLB is flushed. `Ok(true)` if it was live. The default holds no mappings.
+  fn dax_revoke_pending(
+    &mut self,
+    mapping: &slates_vfs::dax::Mapping,
+    cx: &OpContext,
+  ) -> Result<bool, VfsError> {
+    let _ = (mapping, cx);
+    Ok(false)
+  }
+
+  /// Phase two: unpin the block of a mapping revoked by [`Bridge::dax_revoke_pending`], **after** the device confirms
+  /// the window unmap and the cross-core TLB flush, so the block may be reused — never before, or a stale guest page
+  /// table could reach a reused block (the one cross-tenant hazard once spatial isolation holds). `Ok(true)` when the
+  /// hold was dropped. The default holds no mappings.
+  fn dax_release_after_unmap(
+    &mut self,
+    mapping: &slates_vfs::dax::Mapping,
+    cx: &OpContext,
+  ) -> Result<bool, VfsError> {
+    let _ = (mapping, cx);
+    Ok(false)
+  }
+
   /// The AppleDouble view of `owner_name`'s extended attributes in directory `parent` (§4.6
   /// "Extended attributes over NFSv3"): the `._owner_name` file a macOS NFSv3 client keeps
   /// attributes in, served from the volume's attribute store. Its number is the owner's derived

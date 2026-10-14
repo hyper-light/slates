@@ -459,4 +459,32 @@ impl Bridge for ScopedBridge<'_> {
     self.admit(ObjectId::new(mapping.inode.0, 0), cx)?;
     self.inner.dax_unmap(mapping, cx)
   }
+
+  #[cfg(unix)]
+  fn dax_backing(
+    &self,
+    mapping: &slates_vfs::dax::Mapping,
+  ) -> Option<(std::os::fd::BorrowedFd<'_>, usize, usize)> {
+    // The mapping was admitted when it was minted; backing a mapping the guest already holds needs no re-admit, and
+    // the inner bridge confines it to this volume.
+    self.inner.dax_backing(mapping)
+  }
+
+  fn dax_revoke_pending(
+    &mut self,
+    mapping: &slates_vfs::dax::Mapping,
+    cx: &OpContext,
+  ) -> Result<bool, VfsError> {
+    self.admit(ObjectId::new(mapping.inode.0, 0), cx)?;
+    self.inner.dax_revoke_pending(mapping, cx)
+  }
+
+  fn dax_release_after_unmap(
+    &mut self,
+    mapping: &slates_vfs::dax::Mapping,
+    cx: &OpContext,
+  ) -> Result<bool, VfsError> {
+    self.admit(ObjectId::new(mapping.inode.0, 0), cx)?;
+    self.inner.dax_release_after_unmap(mapping, cx)
+  }
 }
