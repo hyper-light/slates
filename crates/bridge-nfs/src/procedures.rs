@@ -197,42 +197,24 @@ pub fn state_io_inner(procedure: u32) -> Option<u32> {
   }
 }
 
-// TEMPORARY instrumentation (remove after the 6.17 truncate-escape path is confirmed): records a size
-// change the server ALLOWED, split by how it was authorized, to tell the escape's path apart. The
-// kernel conformance test reads these in its departure report. root=0 (2026-10-14 run) already ruled
-// out a privileged flush; this adds the direct candidate-2 signal:
-//  - under Mode/Delegation (a truncate outside a write-capable open) a size change is allowed only when
-//    the caller has write by the bits, so these are legitimate workload truncates; root vs non-root is
-//    kept to re-confirm no privileged flush.
-//  - under a write-capable open (`IoAuthority::Open`) the size check is skipped, so a size change
-//    allowed there DESPITE the caller lacking write by the bits is the escape — a read-only open whose
-//    state id merged a sibling's write access (§4.6 `FileState::open`'s per-open-owner `access |=`).
-static STATELESS_SIZE_OK_ROOT: core::sync::atomic::AtomicU64 =
-  core::sync::atomic::AtomicU64::new(0);
-static STATELESS_SIZE_OK_NONROOT: core::sync::atomic::AtomicU64 =
-  core::sync::atomic::AtomicU64::new(0);
-static OPEN_SIZE_OK_NOWRITE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+// TEMPORARY instrumentation (remove after the 6.17 truncate escape is root-caused). The coarse counters
+// (root/non-root/open-despite-bits) refuted both the privileged-flush and merged-open hypotheses: the
+// escape is allowed under Mode/Delegation with `permits` returning TRUE for uid 65534 on a 0477 file,
+// which is impossible for the tuple `(0477, owner 65534)` + `user(65534)` — so the server is seeing a
+// different caller or node. This traces the FULL decision tuple for every size-change SETATTR while
+// enabled, so the kernel conformance test (which runs the daemon in-process) prints exactly what the
+// server computed. Enabled by the test right before the truncate departures; a shard thread's `eprintln`
+// reaches the CI job log.
+static SETATTR_TRACE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
-/// TEMPORARY: record a size change the server allowed, by its authority, the caller's rootness, and
-/// whether the caller had write by the bits.
-pub(crate) fn record_size_ok_allowed(authority: IoAuthority, is_root: bool, permits_write: bool) {
-  let counter = match authority {
-    IoAuthority::Open if !permits_write => &OPEN_SIZE_OK_NOWRITE,
-    IoAuthority::Open => return,
-    IoAuthority::Mode | IoAuthority::Delegation if is_root => &STATELESS_SIZE_OK_ROOT,
-    IoAuthority::Mode | IoAuthority::Delegation => &STATELESS_SIZE_OK_NONROOT,
-  };
-  counter.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+/// TEMPORARY: start tracing the decision tuple of every size-change SETATTR to stderr.
+pub fn enable_setattr_trace() {
+  SETATTR_TRACE.store(true, core::sync::atomic::Ordering::Relaxed);
 }
 
-/// TEMPORARY: `(open-despite-bits, stateless-root, stateless-non-root)` counts of allowed size changes.
-pub fn stateless_size_ok_counts() -> (u64, u64, u64) {
-  use core::sync::atomic::Ordering::Relaxed;
-  (
-    OPEN_SIZE_OK_NOWRITE.load(Relaxed),
-    STATELESS_SIZE_OK_ROOT.load(Relaxed),
-    STATELESS_SIZE_OK_NONROOT.load(Relaxed),
-  )
+/// TEMPORARY: whether the size-change SETATTR trace is on.
+pub(crate) fn setattr_trace_on() -> bool {
+  SETATTR_TRACE.load(core::sync::atomic::Ordering::Relaxed)
 }
 
 /// Format: XATTR_SET's `how` values, RFC 8276's `setxattr_option4`.
@@ -1866,19 +1848,29 @@ impl<'b> Export<'b> {
     // times need ownership, the owner and group follow `_POSIX_CHOWN_RESTRICTED`, the size needs write
     // permission — refused typed (`PERM`/`ACCES`) before any effect. An allowed change carries the
     // set-id side effects a non-superuser's chown or chmod has (`crate::access`).
-    if let Some(denial) =
-      access::setattr_denial(&self.caller, &node, &changes, explicit_times, authority)
-    {
-      return (status_of_denial(denial), self.unchanged(&node));
-    }
-    // TEMPORARY instrumentation (see `record_size_ok_allowed`): record every allowed size change by its
-    // authority and whether the caller had write by the bits, to confirm the escape's path.
-    if changes.size.is_some() {
-      record_size_ok_allowed(
-        authority,
+    let denial = access::setattr_denial(&self.caller, &node, &changes, explicit_times, authority);
+    // TEMPORARY instrumentation (see `setattr_trace_on`): the FULL decision tuple for a size-change
+    // SETATTR, to root-cause the 6.17 truncate escape — exactly which caller and node the server saw.
+    #[allow(clippy::print_stderr)]
+    if changes.size.is_some() && setattr_trace_on() {
+      eprintln!(
+        "SETATTR-TRACE size={:?} caller.uid={} is_root={} stranger={} owns={} in_group(node.gid)={} node.uid={} node.gid={} node.mode={:o} authority={:?} permits_write={} denial={:?}",
+        changes.size,
+        self.caller.uid,
         self.caller.is_root(),
+        self.caller.stranger,
+        self.caller.owns(&node),
+        self.caller.in_group(node.gid),
+        node.uid,
+        node.gid,
+        node.mode,
+        authority,
         access::permits(&self.caller, &node, Want::Write),
+        denial,
       );
+    }
+    if let Some(denial) = denial {
+      return (status_of_denial(denial), self.unchanged(&node));
     }
     let changes = access::with_setid_side_effects(&self.caller, &node, changes);
     let cx = match self.op_context() {

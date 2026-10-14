@@ -327,6 +327,8 @@ fn exclusive_create_keeps_its_mode(root: &Path) {
 /// and a member of the file's group, mode 0747.
 #[cfg(target_os = "linux")]
 fn truncating_open_needs_write_permission(root: &Path) {
+  // TEMPORARY: trace the server's full SETATTR decision tuple for the truncate run (stderr → CI log).
+  slates_bridge_nfs::procedures::enable_setattr_trace();
   let departures = truncating_departures(root, "plain");
   if departures.is_empty() {
     return;
@@ -334,12 +336,7 @@ fn truncating_open_needs_write_permission(root: &Path) {
   // A departure is re-run in fresh files under the kernel's NFS trace, so a failure on another kernel says what its
   // client sent (CI's Ubuntu 6.17 client let the owner of a 0477 file truncate it while Linux 6.12 refused).
   let (again, trace) = traced(|| truncating_departures(root, "traced"));
-  // TEMPORARY (confirm the escape's caller): (root, non-root) stateless/delegation size changes allowed.
-  let (open_nowrite, root_ok, nonroot_ok) =
-    slates_bridge_nfs::procedures::stateless_size_ok_counts();
-  panic!(
-    "truncating-open departures: {departures:#?}\nsize-ok allowed: open-despite-bits={open_nowrite} stateless-root={root_ok} stateless-nonroot={nonroot_ok}\nunder the trace: {again:#?}\n{trace}"
-  );
+  panic!("truncating-open departures: {departures:#?}\nunder the trace: {again:#?}\n{trace}");
 }
 
 /// One run of [`truncating_open_needs_write_permission`]'s cases on files named with `tag`; every step that did not
@@ -505,17 +502,14 @@ fn traced<T>(run: impl FnOnce() -> T) -> (T, String) {
 /// trace and reported with it.
 #[cfg(target_os = "linux")]
 fn the_owners_own_file_refuses_a_truncating_open_without_write_permission(root: &Path, tag: &str) {
+  // TEMPORARY: trace the server's full SETATTR decision tuple for the truncate run (stderr → CI log).
+  slates_bridge_nfs::procedures::enable_setattr_trace();
   let departures = open07_departures(&root.join(format!("open07-{tag}")));
   if departures.is_empty() {
     return;
   }
   let (again, trace) = traced(|| open07_departures(&root.join(format!("open07-{tag}-traced"))));
-  // TEMPORARY (confirm the escape's caller): (root, non-root) stateless/delegation size changes allowed.
-  let (open_nowrite, root_ok, nonroot_ok) =
-    slates_bridge_nfs::procedures::stateless_size_ok_counts();
-  panic!(
-    "open/07 departures ({tag} mount): {departures:#?}\nsize-ok allowed: open-despite-bits={open_nowrite} stateless-root={root_ok} stateless-nonroot={nonroot_ok}\nunder the trace: {again:#?}\n{trace}"
-  );
+  panic!("open/07 departures ({tag} mount): {departures:#?}\nunder the trace: {again:#?}\n{trace}");
 }
 
 /// `mkfifo` and a UNIX socket's `bind` create their names through the kernel client (NFSv4 CREATE of
