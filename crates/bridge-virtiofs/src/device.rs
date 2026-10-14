@@ -399,6 +399,15 @@ pub struct Device {
   fault: Option<DeviceError>,
   awaiting: Option<AwaitingBarrier>,
   counters: DeviceCounters,
+  /// The DAX cache region the VMM offered, installed once at admission ([`Device::install_dax_window`]); `None` when
+  /// no window is offered (then FUSE_SETUPMAPPING is declined and DAX is not advertised). Content blocks' pages are
+  /// mapped into it per SETUPMAPPING (§4.6). Unix only (the DAX window is a Linux/vhost-user feature).
+  #[cfg(unix)]
+  dax_cache: Option<crate::dax::DaxCacheRegion>,
+  /// The live DAX window mappings, so REMOVEMAPPING (and the terminal teardown) finds each mapping to revoke and its
+  /// window range to unmap. Bounded by the cache region's pages; empty when no window is offered.
+  #[cfg(unix)]
+  dax_windows: Vec<DaxWindowEntry>,
 }
 
 impl fmt::Debug for Device {
@@ -424,12 +433,30 @@ impl Device {
       fault: None,
       awaiting: None,
       counters: DeviceCounters::default(),
+      #[cfg(unix)]
+      dax_cache: None,
+      #[cfg(unix)]
+      dax_windows: Vec::new(),
     }
   }
 
   /// The configuration space.
   pub fn config(&self) -> &DeviceConfig {
     &self.config
+  }
+
+  /// Installs the DAX cache region the VMM offered (§4.6), once at admission; `None` leaves DAX unserved (SETUPMAPPING
+  /// stays declined). From here the device maps content blocks' pages into it per FUSE_SETUPMAPPING. Unix only.
+  #[cfg(unix)]
+  pub fn install_dax_window(&mut self, cache: Option<crate::dax::DaxCacheRegion>) {
+    self.dax_cache = cache;
+  }
+
+  /// Whether the device serves DAX (the VMM offered a cache region). Unix only.
+  #[cfg(unix)]
+  #[must_use]
+  pub fn dax_offered(&self) -> bool {
+    self.dax_cache.is_some()
   }
 
   /// Installs the driver's queue layouts — exactly the high-priority queue and the request queues
@@ -776,7 +803,24 @@ impl Device {
     let mut written = if room_short {
       0
     } else {
-      dispatch(&self.request, bridge, cx, &mut self.reply)
+      // On Unix, FUSE_SETUPMAPPING / FUSE_REMOVEMAPPING go through the DAX cache region when the VMM offered one
+      // (§4.6); every other opcode — and these when no window is offered — are answered by the FUSE codec's dispatch.
+      #[cfg(unix)]
+      {
+        serve_dax(
+          &self.request,
+          bridge,
+          cx,
+          &mut self.dax_cache,
+          &mut self.dax_windows,
+          &mut self.reply,
+        )
+        .unwrap_or_else(|| dispatch(&self.request, bridge, cx, &mut self.reply))
+      }
+      #[cfg(not(unix))]
+      {
+        dispatch(&self.request, bridge, cx, &mut self.reply)
+      }
     };
     if written == 0 && expects_reply(header.as_ref()) && reply_room >= OUT_HEADER_LEN {
       // The reply does not fit the guest's buffers (a driver posted less room than the ABI's reply
@@ -912,4 +956,123 @@ fn scatter(
     rest = after;
   }
   Ok(())
+}
+
+/// A live DAX window mapping the device holds (§4.6): the guest-window offset and length it occupies, and the gate
+/// mapping it covers — so REMOVEMAPPING (and a teardown) finds the mapping to revoke and the window range to unmap.
+/// Bounded by the cache region's pages (one per live SETUPMAPPING).
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct DaxWindowEntry {
+  /// The offset in the guest's DAX window.
+  moffset: u64,
+  /// The length mapped.
+  len: u64,
+  /// The gate mapping whose block backs the window range.
+  mapping: slates_vfs::dax::Mapping,
+}
+
+/// Linux errno values a DAX reply carries (a guest reads them as Linux, whatever the host).
+#[cfg(unix)]
+mod dax_errno {
+  pub(super) const ENOENT: i32 = 2;
+  pub(super) const EPERM: i32 = 1;
+  pub(super) const EINVAL: i32 = 22;
+  pub(super) const ENOSPC: i32 = 28;
+  pub(super) const EOPNOTSUPP: i32 = 95;
+}
+
+/// The Linux errno a DAX reply carries for a volume-core refusal.
+#[cfg(unix)]
+fn vfs_dax_errno(e: &slates_vfs::error::VfsError) -> i32 {
+  use slates_vfs::error::VfsError as E;
+  match e {
+    E::NotPermitted | E::LinkProtected => dax_errno::EPERM,
+    E::NotFound | E::StaleHandle => dax_errno::ENOENT,
+    E::NoSpace | E::FileTooLarge => dax_errno::ENOSPC,
+    E::SpecialFileOperation => dax_errno::EOPNOTSUPP,
+    _ => dax_errno::EINVAL,
+  }
+}
+
+/// Serves FUSE_SETUPMAPPING / FUSE_REMOVEMAPPING through the DAX cache region (§4.6) when the VMM offered one. Returns
+/// `Some(reply_len)` when it handled the request, `None` when it is not a DAX verb or no window is offered — then the
+/// FUSE codec's `dispatch` answers (EOPNOTSUPP for setup, a no-op for remove). The guest reaches the arena bytes
+/// through its own page table after this; the daemon is not called per access.
+#[cfg(unix)]
+fn serve_dax(
+  request: &[u8],
+  bridge: &mut dyn slates_bridge_core::Bridge,
+  cx: &slates_bridge_core::OpContext,
+  dax_cache: &mut Option<crate::dax::DaxCacheRegion>,
+  dax_windows: &mut Vec<DaxWindowEntry>,
+  out: &mut [u8],
+) -> Option<usize> {
+  use slates_bridge_core::ObjectId;
+  use slates_bridge_fuse::request::{RemoveMappingIn, Request, SetupMappingIn};
+
+  let cache = dax_cache.as_mut()?; // no window offered: let dispatch answer EOPNOTSUPP / no-op
+  let req = Request::parse(request).ok()?;
+  let unique = req.header.unique;
+  let err = |errno: i32, out: &mut [u8]| Some(ReplyHeader::write_error(unique, errno, out).unwrap_or(0));
+  match Opcode::from_wire(req.header.opcode)? {
+    Opcode::SetupMapping => {
+      let Ok(m) = SetupMappingIn::parse(Opcode::SetupMapping.to_wire(), req.body) else {
+        return err(dax_errno::EINVAL, out);
+      };
+      let writable = m.writable();
+      let object = ObjectId::new(req.header.nodeid, 0);
+      let mapping = match bridge.dax_map(object, cx, writable) {
+        Ok(mapping) => mapping,
+        Err(e) => return err(vfs_dax_errno(&e), out),
+      };
+      // The block's backing descriptor, its byte offset in the arena object, and its length.
+      let Some((fd, region_off, block_len)) = bridge.dax_backing(&mapping) else {
+        let _ = bridge.dax_unmap(&mapping, cx); // undo the pin (no window established yet)
+        return err(dax_errno::EOPNOTSUPP, out);
+      };
+      // Bound the requested file range to the block, and compute the object offset to map from.
+      let bound = usize::try_from(m.foffset)
+        .ok()
+        .and_then(|foffset| usize::try_from(m.len).ok().map(|len| (foffset, len)))
+        .filter(|&(foffset, len)| foffset.checked_add(len).is_some_and(|end| end <= block_len))
+        .and_then(|(foffset, _)| region_off.checked_add(foffset))
+        .and_then(|off| u64::try_from(off).ok());
+      let Some(object_off) = bound else {
+        let _ = bridge.dax_unmap(&mapping, cx);
+        return err(dax_errno::EINVAL, out);
+      };
+      if cache.map(m.moffset, m.len, fd, object_off, writable).is_err() {
+        let _ = bridge.dax_unmap(&mapping, cx);
+        return err(dax_errno::EINVAL, out);
+      }
+      dax_windows.push(DaxWindowEntry {
+        moffset: m.moffset,
+        len: m.len,
+        mapping,
+      });
+      Some(ReplyHeader::write_ok(unique, &[], out).unwrap_or(0))
+    }
+    Opcode::RemoveMapping => {
+      let Ok(m) = RemoveMappingIn::parse(Opcode::RemoveMapping.to_wire(), req.body) else {
+        return err(dax_errno::EINVAL, out);
+      };
+      for one in &m.entries {
+        if let Some(index) = dax_windows.iter().position(|w| w.moffset == one.moffset) {
+          if let Some(entry) = dax_windows.get(index).copied() {
+            // Two-phase: unregister (hardware path inert), unmap the window (guest's page table loses it), then unpin.
+            let _ = bridge.dax_revoke_pending(&entry.mapping, cx);
+            let _ = cache.unmap(entry.moffset, entry.len);
+            let _ = bridge.dax_release_after_unmap(&entry.mapping, cx);
+          }
+          dax_windows.swap_remove(index);
+        } else {
+          // A range the device holds no mapping for: make the window inert anyway (defensive), nothing to revoke.
+          let _ = cache.unmap(one.moffset, one.len);
+        }
+      }
+      Some(ReplyHeader::write_ok(unique, &[], out).unwrap_or(0))
+    }
+    _ => None,
+  }
 }

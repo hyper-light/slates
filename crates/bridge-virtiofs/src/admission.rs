@@ -435,6 +435,16 @@ pub fn admit<S: VmmSeam>(
     withdraw(registry, attachment);
     return Err(refuse(seam, AdmissionError::Seam(e)));
   }
+  // Install the DAX cache region on the device from the window the VMM offered (if any), once, now the device is up.
+  // The window fd is borrowed only for the mapping; `seam` is moved into the attachment afterwards. On a seam with no
+  // window this is a no-op, and SETUPMAPPING stays declined.
+  #[cfg(unix)]
+  {
+    let cache = seam
+      .dax_window()
+      .and_then(|(fd, len)| crate::dax::DaxCacheRegion::new(fd, len).ok());
+    device.install_dax_window(cache);
+  }
   Ok(AdmittedDevice {
     seam,
     device,
