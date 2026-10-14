@@ -2540,6 +2540,32 @@ impl V4Client {
     self.sequenced(2, ops.as_slice()).0
   }
 
+  /// SETATTR of `fh`'s owner uid under `stateid` (a numeric-id `owner` string, RFC 8881 §5.9): the
+  /// compound's status. A chown needs the superuser, so `caller` must be root.
+  fn setattr_owner_under(
+    &mut self,
+    fh: &[u8],
+    stateid: slates_bridge_nfs::v4::types::Stateid,
+    uid: u32,
+  ) -> u32 {
+    use slates_bridge_nfs::v4::types::Bitmap;
+    use slates_bridge_nfs::xdr::XdrWriter;
+    /// Format: `OP_SETATTR`.
+    const OP_SETATTR: u32 = 34;
+    /// Format: `FATTR4_OWNER` (RFC 8881 §5.8).
+    const FATTR4_OWNER: u32 = 36;
+    let mut ops = XdrWriter::new();
+    ops.u32(OP_PUTFH);
+    ops.opaque(fh);
+    ops.u32(OP_SETATTR);
+    stateid.encode(&mut ops);
+    Bitmap::of(&[FATTR4_OWNER]).encode(&mut ops);
+    let mut values = XdrWriter::new();
+    values.opaque(uid.to_string().as_bytes());
+    ops.opaque(values.as_slice());
+    self.sequenced(2, ops.as_slice()).0
+  }
+
   /// GETATTR of `fh`'s size: the size, when the compound succeeds.
   fn size_of(&mut self, fh: &[u8]) -> Option<u64> {
     use slates_bridge_nfs::v4::types::Bitmap;
@@ -2848,12 +2874,14 @@ fn a_write_delegation_serves_its_holders_writes_and_any_other_open_recalls_it() 
 const NFS4ERR_ACCESS: u32 = 13;
 
 /// RFC 8881 §10.4, §18.30 (A-80): a write delegation authorizes its holder client's I/O, never another user's
-/// permission. A client holding one may open the file locally for any of its users, so a truncate it sends under the
-/// delegation's state id must still be checked against the caller's own mode bits (Linux 6.17 sends
-/// `O_RDONLY|O_TRUNC` that way after checking only read access; 2026-10-07 CI). Do: on client A as root, create a file
-/// for writing (a write delegation), write four bytes and set mode 0644; then on A as uid 1000, truncate the file
-/// under the delegation's state id. Expect `NFS4ERR_ACCESS` and the file still four bytes; root's own truncate under
-/// the delegation still succeeds.
+/// permission. A client holding one may open the file locally for any of its users, so it could flush a truncate for
+/// a user whose own open would be refused under the delegation's state id (Linux 6.17 sends `O_RDONLY|O_TRUNC` that
+/// way after checking only read access; 2026-10-07 CI). Setting a mode some class cannot write recalls the
+/// delegation, since it could otherwise launder that class's forbidden truncate; once the holder returns it, there is
+/// no delegation to launder through. Do: on client A as root, create a file for writing (a write delegation), write
+/// four bytes and set mode 0644; the delegation is recalled and returned; then on A as uid 1000 (`other`, which 0644
+/// forbids writing) truncate under the returned state id. Expect it refused and the file still four bytes; root still
+/// truncates its own file through its own write-capable open.
 #[test]
 fn a_write_delegation_does_not_lend_its_holders_permission_to_another_users_truncate() {
   let (daemon, client, mut a, b, component) = holder_and_other("deleg-truncate");
@@ -2871,24 +2899,141 @@ fn a_write_delegation_does_not_lend_its_holders_permission_to_another_users_trun
     NFS4_OK,
     "root sets the mode 0644"
   );
+  // 0644 leaves group and other unable to write, so the write delegation is recalled; the holder returns it.
+  let recall = a.next_message();
+  assert!(
+    is_call(&recall),
+    "the restricted mode recalls the write delegation"
+  );
+  assert_eq!(a.answer_callback(&recall), Some(delegation));
+  assert_eq!(
+    a.delegreturn(&fh, delegation),
+    NFS4_OK,
+    "the holder returns it"
+  );
+  // uid 1000 (other) may not truncate a 0644 file it does not own; with the delegation gone it has nothing to
+  // launder through, so the truncate under the returned state id is refused and the file is unchanged.
   a.caller = Some((1000, 1000));
   let other = a.setattr_size_under(&fh, delegation, 0);
   a.caller = Some((0, 0));
   let kept = a.size_of(&fh);
-  let owner = a.setattr_size_under(&fh, delegation, 0);
+  // Root truncates its own 0644 file (owner `rw-`) through its own write-capable open — not the recalled delegation.
+  let owner = a.setattr_size_under(&fh, open_a, 0);
   let after = a.size_of(&fh);
   drop((a, b, client));
   drop(daemon);
-  assert_eq!(
-    other, NFS4ERR_ACCESS,
+  assert_ne!(
+    other, NFS4_OK,
     "uid 1000 may not truncate a 0644 file it does not own, whatever the state id"
   );
   assert_eq!(kept, Some(4), "the refused truncate changed nothing");
   assert_eq!(
     (owner, after),
     (NFS4_OK, Some(0)),
-    "root's own truncate under the delegation is served"
+    "root's own truncate through its write-capable open is served"
   );
+}
+
+/// pjdfstest `open/07.t` over the Linux 6.17 client (the conformance escape, CI run 38634013980). The
+/// 6.17 client flushes a read-only owner's `O_RDONLY|O_TRUNC` under the write-delegation *holder's*
+/// identity, not the acting opener's; the full server trace showed `caller.uid=1001` (the holder),
+/// `node.uid=65534 node.mode=0477 authority=Delegation permits_write=true` — 1001 is `other` to the
+/// 65534-owned 0477 file, whose `other` bits are `rwx`, so the delegation launders the owner's forbidden
+/// truncate through the holder's incidental class write. Do: uid 1001 creates a file for writing (a write
+/// delegation) and chmods it 0477, root chowns it to 65534, then uid 1001 truncates under the delegation.
+/// Expect the truncate refused and the file unchanged: the `chmod 0477` leaves the file owner without write,
+/// which recalls the write delegation (its basis — a writable owner — is gone), so there is no delegation to
+/// launder the truncate through, and the file survives.
+#[test]
+fn a_write_delegation_does_not_truncate_a_file_its_holder_no_longer_owns() {
+  let (daemon, client, mut a, b, component) = holder_and_other("deleg-exowner-truncate");
+  // A client opens the file for writing (a write delegation) and prepares it as the 6.17 escape's file:
+  // mode 0477, owned by uid 65534. The `chmod 0477` clears the owner's write bit.
+  a.caller = Some((0, 0));
+  let (open_a, fh, delegation) = a.open_creating(&component, "x.txt");
+  let (kind, delegation) = delegation.expect("the open for writing is delegated");
+  assert_eq!(kind, 2, "a write delegation");
+  assert_eq!(
+    a.write_under(&fh, delegation, b"four"),
+    NFS4_OK,
+    "four bytes written"
+  );
+  assert_eq!(
+    a.setattr_mode_under(&fh, open_a, 0o477),
+    NFS4_OK,
+    "mode set 0477"
+  );
+  // Clearing the owner's write bit recalled the write delegation (its basis is gone); the holder returns it,
+  // exactly as a conforming client does on a CB_RECALL.
+  let recall = a.next_message();
+  assert!(
+    is_call(&recall),
+    "the owner losing write recalls the write delegation"
+  );
+  assert_eq!(a.answer_callback(&recall), Some(delegation));
+  assert_eq!(
+    a.delegreturn(&fh, delegation),
+    NFS4_OK,
+    "the holder returns it"
+  );
+  assert_eq!(
+    a.setattr_owner_under(&fh, open_a, 65534),
+    NFS4_OK,
+    "owner set to uid 65534"
+  );
+  // Now uid 1001 — a non-owner, `other` to the 65534-owned 0477 file (`other=rwx`) — tries the truncate the
+  // 6.17 client would flush under the (now-returned) write delegation. With no delegation to launder through,
+  // it is refused and the file is not emptied.
+  a.caller = Some((1001, 1001));
+  let truncate = a.setattr_size_under(&fh, delegation, 0);
+  let kept = a.size_of(&fh);
+  drop((a, b, client));
+  drop(daemon);
+  assert_ne!(
+    truncate, NFS4_OK,
+    "a truncate laundered through a recalled write delegation is refused, not served"
+  );
+  assert_eq!(
+    kept,
+    Some(4),
+    "the refused truncate left the file untouched"
+  );
+}
+
+/// The recall is targeted, not a blanket revoke on every chmod: a mode where EVERY class can write (0666) leaves no
+/// class that could be laundered, so the write delegation is NOT recalled and still serves a legitimate truncate by
+/// a user its bits allow. Do: create a file for writing (a write delegation), set mode 0666; then as uid 1000
+/// (`other`, which 0666 lets write) truncate under the delegation. Expect no recall and the truncate served — the
+/// fix does not over-restrict a fully writable file.
+#[test]
+fn a_write_delegation_on_a_fully_writable_file_survives_a_chmod_and_serves_a_truncate() {
+  let (daemon, client, mut a, b, component) = holder_and_other("deleg-0666");
+  a.caller = Some((0, 0));
+  let (open_a, fh, delegation) = a.open_creating(&component, "w.txt");
+  let (kind, delegation) = delegation.expect("the open for writing is delegated");
+  assert_eq!(kind, 2, "a write delegation");
+  assert_eq!(
+    a.write_under(&fh, delegation, b"four"),
+    NFS4_OK,
+    "four bytes written"
+  );
+  assert_eq!(
+    a.setattr_mode_under(&fh, open_a, 0o666),
+    NFS4_OK,
+    "mode set 0666 (all may write)"
+  );
+  // No class lacks write, so nothing is recalled: uid 1000 (other, 0666 `rw-`) truncates under the surviving
+  // delegation and it is served — a truncate the acting user's own bits allow.
+  a.caller = Some((1000, 1000));
+  let truncate = a.setattr_size_under(&fh, delegation, 0);
+  let after = a.size_of(&fh);
+  drop((a, b, client));
+  drop(daemon);
+  assert_eq!(
+    truncate, NFS4_OK,
+    "a 0666 file stays writable by `other`, so the delegated truncate is served"
+  );
+  assert_eq!(after, Some(0), "the served truncate emptied the file");
 }
 
 /// §4.6 A-115 (condition 4): an export bound to one identity serves that identity, and shows every other caller only
