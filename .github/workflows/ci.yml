@@ -79,6 +79,12 @@ jobs:
           # restart timings together so the publish has room; the invariant publish << reply << recovery << reconnect
           # holds at any scale (crates/client/tests/client.rs). A normal local run keeps the prompt default of 1.
           SLATES_TEST_RESTART_SLOWDOWN: "10"
+          # The fleet deadlines (DEADLINE_NS reply wait and formation_deadline convergence poll, crates/server/tests/
+          # fleet.rs) default to 30 s — ample locally, but a loaded shared runner takes far longer to converge a
+          # multi-node takeover (a_cross_region_client_finds_the_copyset_successor passed locally in 5.7 s yet exceeded
+          # a fixed 30 s on this lane). Scale both to 120 s here so a loaded runner does not false-fail; a real
+          # non-convergence is still caught at the bound, and a normal local run keeps the prompt 30 s default.
+          SLATES_TEST_FLEET_DEADLINE_SECS: "120"
         run: cargo test --workspace
       # The vendored AWS-LC crates' own suites, each against the other's vendored copy (vendor/UPSTREAM.md).
       - name: The vendored crates' suites
