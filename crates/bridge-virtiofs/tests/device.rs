@@ -1342,6 +1342,39 @@ fn t_dax_device_map_path_latency_profile() {
     "dax device map path: n={n}, first-{batch} {first_ns} ns/map, last-{batch} {last_ns} ns/map, ratio {ratio:.2} \
      (flat => syscall-bound, the O(live) overlap scan negligible within the registry cap)"
   );
+
+  // The teardown path (the step-5 revoke channel's work): revoke each inode's one window and time it. Each
+  // `request_revoke_inode` scans the live windows for the inode (O(live), shrinking by one per revoke via
+  // swap_remove) then munmaps + unpins. The first batch scans ~n windows, the last ~1. MEASURED (M5 Max, release,
+  // n=300): first ~781 ns/revoke, last ~477 ns/revoke, first/last ~1.64 — so, unlike the map path (whose ~4.5 µs
+  // `MAP_FIXED` dwarfs the scan, ratio 0.94), the revoke's base (~477 ns munmap+unpin) is cheap enough that the
+  // O(live) scan is visible (~1.8 ns/window). A *bulk* drain of P pending inodes is therefore O(P × live) — fine at
+  // these sizes, but it would dominate at a large registry cap. The fix (an inode→window index making a revoke
+  // O(windows-of-that-inode)) is deliberately NOT taken yet: it is a control-plane path that is empty in production
+  // until DAX is advertised, and maintaining positional indices through `swap_remove` is fiddly to get right — per
+  // the optimization hierarchy, measure a real advertised guest's drain pattern before adding it. Recorded in GAPS.
+  let (mut tfirst, mut tlast) = (Duration::ZERO, Duration::ZERO);
+  for (i, &nodeid) in files.iter().enumerate() {
+    let at = Instant::now();
+    let torn = device.request_revoke_inode(nodeid, &mut bridge, &cx);
+    let dt = at.elapsed();
+    assert_eq!(torn, 1, "revoke {i} tore its one window");
+    if i < batch {
+      tfirst = tfirst.saturating_add(dt);
+    }
+    if i >= n.saturating_sub(batch) {
+      tlast = tlast.saturating_add(dt);
+    }
+  }
+  assert_eq!(device.dax_window_count(), 0, "all N revoked");
+  let tfirst_ns = tfirst.as_nanos() / (batch as u128);
+  let tlast_ns = tlast.as_nanos() / (batch as u128);
+  let tratio = (tfirst_ns as f64) / (tlast_ns.max(1) as f64);
+  eprintln!(
+    "dax device revoke path: n={n}, first-{batch} {tfirst_ns} ns/revoke (scans ~n), last-{batch} {tlast_ns} \
+     ns/revoke (scans ~1), first/last {tratio:.2} (>1 => the O(live) scan is visible over the ~{tlast_ns} ns \
+     munmap base; a bulk drain is O(P×live), an inode→window index deferred until advertised — see GAPS)"
+  );
   drop(bridge);
   drop(cache);
 }

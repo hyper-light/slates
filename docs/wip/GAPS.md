@@ -6136,6 +6136,14 @@ its own page table and never calls the daemon), so the defense had to be at the 
   device window teardown) leaked the guard's pinned clean copy until the volume dropped. The queue is bounded +
   deduped + non-vacuous by test (`the_pending_revoke_queue_is_bounded_and_deduped`, `pending_len`): a write storm on
   one mapped inode enqueues it once, distinct inodes once each, never past the registry cap (CLAUDE.md #8).
+- **Profiling pass (M5 Max, release, `t_dax_device_map_path_latency_profile`, n=300):** the SETUPMAPPING map path is
+  ~4.5 µs/map, first/last 0.94 — **flat, syscall-bound**: the O(live) overlap scan is negligible against the
+  `MAP_FIXED` cost, so no map-side index is warranted. The teardown (`request_revoke_inode`) is ~477 ns base
+  (munmap + unpin) with the O(live) window scan **visible** at ~1.8 ns/window (first/last 1.64 at n=300), so a *bulk*
+  drain of P pending inodes is O(P × live) — fine at these sizes, dominant only at a large registry cap. An
+  inode→window index (revoke → O(windows-of-inode)) is **deferred, not premature-built**: the path is empty in
+  production until DAX is advertised, and a positional index through `swap_remove` is error-prone; the optimization
+  hierarchy says measure a real advertised guest's drain pattern first.
 - **The sibling teardown paths — investigated, each is a *different* case (an earlier note wrongly said all three
   should route through the pending-enqueue; that would break destroy). All are safe today — DAX is unadvertised, so
   no live window exists — and each is gated on the advertisement decision:**
