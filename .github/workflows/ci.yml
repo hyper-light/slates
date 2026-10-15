@@ -437,7 +437,15 @@ jobs:
         timeout-minutes: 10
         env:
           SLATES_ETW_CAPTURE: "1"
+          SLATES_ETW_DUMP: etw-dump
         run: cargo test -p slates-conformance --test etw_windows -- --nocapture
+      - name: Upload the ETW probe dump (real vector for the parser)
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: etw-probe-dump
+          path: etw-dump/
+          if-no-files-found: warn
 
   # D-20: instruction-count gates. callgrind counts are deterministic for a given binary, so
   # they see the one-percent change the wall clock cannot. valgrind is non-Rust tooling, admitted
