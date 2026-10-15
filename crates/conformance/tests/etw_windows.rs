@@ -207,6 +207,24 @@ fn etw_captures_a_known_file_write_workload() {
     eprintln!("{line}");
   }
 
+  // Validate the parser against these real bytes on the real runner: parse_etw must find the known
+  // file's write events (its creation, a data write, the rename and the delete), proving the Windows leg
+  // end to end — not only against a reconstructed vector.
+  let parsed = slates_conformance::trace::parse_etw(&dump);
+  let ours_writes: Vec<(&str, &str)> = parsed
+    .iter()
+    .filter(|write| write.path.contains(short.as_str()))
+    .map(|write| (write.call.as_str(), write.path.as_str()))
+    .collect();
+  let calls: BTreeSet<&str> = ours_writes.iter().map(|(call, _)| *call).collect();
+  eprintln!(
+    "=== parse_etw: {} write events naming the known file; calls {calls:?} ===",
+    ours_writes.len()
+  );
+  for (call, path) in ours_writes.iter().take(30) {
+    eprintln!("  {call}  {path}");
+  }
+
   // Persist the whole dump for the CI artifact (built-against-real-bytes parser and golden vector).
   if let Some(dest) = std::env::var_os("SLATES_ETW_DUMP") {
     let dest = std::path::Path::new(&dest);
@@ -238,5 +256,26 @@ fn etw_captures_a_known_file_write_workload() {
   assert!(
     !ours.is_empty(),
     "at least one provider event named the known file"
+  );
+  // parse_etw, over the real bytes, must classify the known file's write-capable operations.
+  assert!(
+    ours_writes.iter().any(|(call, _)| *call == "CreateNewFile"),
+    "parse_etw finds the known file's creation among the real bytes: {calls:?}"
+  );
+  assert!(
+    ours_writes.iter().any(|(call, _)| *call == "Write"),
+    "parse_etw finds the known file's data write: {calls:?}"
+  );
+  assert!(
+    ours_writes
+      .iter()
+      .any(|(call, _)| *call == "RenamePath" || *call == "Rename"),
+    "parse_etw finds the known file's rename: {calls:?}"
+  );
+  assert!(
+    ours_writes
+      .iter()
+      .any(|(call, _)| matches!(*call, "NameDelete" | "DeletePath" | "SetDelete")),
+    "parse_etw finds the known file's delete: {calls:?}"
   );
 }

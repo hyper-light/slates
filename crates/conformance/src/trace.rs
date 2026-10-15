@@ -1465,35 +1465,74 @@ pub struct EtwEvent {
   pub name: Option<String>,
 }
 
-/// Format: the Kernel-File event ids that bind a handle to a name — `NameCreate` (10), `Create`/open (12)
-/// and `CreateNewFile` (30) carry both a handle and a `FileName` (the provider manifest, evidence B;
-/// deployed ETW tooling that reads it, evidence C). Verified against the probe's dump before the live lane.
-const ETW_NAME_BINDERS: &[u16] = &[10, 12, 30];
+// Microsoft-Windows-Kernel-File manifest event ids, verified against the probe's dump (run 38659345322).
+// The sets and the name table below are built from these named ids, so no bare id appears in a list.
+/// Format: `NameCreate` — a name first referenced, binding a FileKey to it.
+const ETW_NAME_CREATE: u16 = 10;
+/// Format: `NameDelete` — a name removed (a delete), carrying the removed path.
+const ETW_NAME_DELETE: u16 = 11;
+/// Format: `Create` — a file opened, binding its FileObject to the name (opening is not itself a write).
+const ETW_CREATE: u16 = 12;
+/// Format: `Close` — a file handle (FileObject) freed.
+const ETW_CLOSE: u16 = 14;
+/// Format: `Write` — file data written; carries the handles, not the name.
+const ETW_WRITE: u16 = 16;
+/// Format: `SetInformation` — set end-of-file (the truncate), allocation or disposition.
+const ETW_SET_INFORMATION: u16 = 17;
+/// Format: `SetDelete` — a delete disposition set on the file.
+const ETW_SET_DELETE: u16 = 18;
+/// Format: `Rename` — a rename (its new path arrives separately as `RenamePath`).
+const ETW_RENAME: u16 = 19;
+/// Format: `DeletePath` — a delete, carrying the deleted path.
+const ETW_DELETE_PATH: u16 = 26;
+/// Format: `RenamePath` — a rename, carrying the new path.
+const ETW_RENAME_PATH: u16 = 27;
+/// Format: `SetLinkPath` — a hard link created at a path.
+const ETW_SET_LINK_PATH: u16 = 28;
+/// Format: `CreateNewFile` — a new file created (a write), carrying its name.
+const ETW_CREATE_NEW_FILE: u16 = 30;
 
-/// Format: the event ids that write to disk — `Write` (16) of file data, `SetInformation` (17, carrying
-/// `SetEndOfFile`, the truncate, and `SetAllocation`), `SetDelete` (18), `Rename` (19), `DeletePath` (26),
-/// `RenamePath` (27), `SetLinkPath` (28) and `CreateNewFile` (30, a file's creation). A read (15) and the
-/// query, directory and cleanup events are not writes. Verified against the probe's dump before the live lane.
-const ETW_WRITERS: &[u16] = &[16, 17, 18, 19, 26, 27, 28, 30];
+/// The event ids that bind a handle to a name: a name-create, an open and a new-file creation each carry
+/// both a handle and a `FileName` (the provider manifest, evidence B; deployed ETW tooling, evidence C).
+const ETW_NAME_BINDERS: &[u16] = &[ETW_NAME_CREATE, ETW_CREATE, ETW_CREATE_NEW_FILE];
 
-/// Format: the event id that frees a file handle (`Close`, 14), so a handle number the kernel reuses never
-/// borrows a closed file's name.
-const ETW_HANDLE_CLOSE: u16 = 14;
+/// The event ids that write to disk. A read (15), the query and directory events, `OperationEnd` (24) and
+/// the cleanup events are not writes. Known refinement for the hardening pass: a `Create` that supersedes
+/// or overwrites an existing file truncates it at open, which the daemon's create-new-then-rename landing
+/// never does, so it is deferred to an adversarial test of an overwrite-open outside the grant (the event
+/// carries no `DesiredAccess`, so a write-open cannot be told from a read-open by the event alone).
+const ETW_WRITERS: &[u16] = &[
+  ETW_NAME_DELETE,
+  ETW_WRITE,
+  ETW_SET_INFORMATION,
+  ETW_SET_DELETE,
+  ETW_RENAME,
+  ETW_DELETE_PATH,
+  ETW_RENAME_PATH,
+  ETW_SET_LINK_PATH,
+  ETW_CREATE_NEW_FILE,
+];
+
+/// The display name for each write-capable Kernel-File event id (its id matches [`ETW_WRITERS`]).
+const ETW_CALL_NAMES: &[(u16, &str)] = &[
+  (ETW_NAME_DELETE, "NameDelete"),
+  (ETW_WRITE, "Write"),
+  (ETW_SET_INFORMATION, "SetInformation"),
+  (ETW_SET_DELETE, "SetDelete"),
+  (ETW_RENAME, "Rename"),
+  (ETW_DELETE_PATH, "DeletePath"),
+  (ETW_RENAME_PATH, "RenamePath"),
+  (ETW_SET_LINK_PATH, "SetLinkPath"),
+  (ETW_CREATE_NEW_FILE, "CreateNewFile"),
+];
 
 /// A human name for a Kernel-File event id, for a `WriteEvent`'s call. An unknown id prints its number, so
 /// a classification gap is visible, never silent.
 fn etw_call_name(id: u16) -> String {
-  match id {
-    16 => "Write".to_owned(),
-    17 => "SetInformation".to_owned(),
-    18 => "SetDelete".to_owned(),
-    19 => "Rename".to_owned(),
-    26 => "DeletePath".to_owned(),
-    27 => "RenamePath".to_owned(),
-    28 => "SetLinkPath".to_owned(),
-    30 => "CreateNewFile".to_owned(),
-    other => format!("KernelFile{other}"),
-  }
+  ETW_CALL_NAMES
+    .iter()
+    .find(|(event, _)| *event == id)
+    .map_or_else(|| format!("KernelFile{id}"), |(_, name)| (*name).to_owned())
 }
 
 /// The write-capable events a decoded Kernel-File stream contributes, each named through the handle table
@@ -1532,13 +1571,96 @@ pub fn etw_write_events(events: &[EtwEvent]) -> Vec<WriteEvent> {
         at_ns: decoded.at_ns,
       });
     }
-    if decoded.id == ETW_HANDLE_CLOSE
+    if decoded.id == ETW_CLOSE
       && let Some(handle) = decoded.handle
     {
       names.remove(&handle);
     }
   }
   out
+}
+
+/// Format: how `tracerpt` labels the provider whose events the judgement reads (`-of XML` tags each event
+/// with its provider name); the session's own header events carry a different provider and are skipped.
+const ETW_PROVIDER_NAME: &str = "Microsoft-Windows-Kernel-File";
+
+/// The text between two markers in `block`, in order; `None` if either is absent.
+fn etw_between<'a>(block: &'a str, open: &str, close: &str) -> Option<&'a str> {
+  let start = block.find(open)?.checked_add(open.len())?;
+  let rest = block.get(start..)?;
+  let end = rest.find(close)?;
+  rest.get(..end)
+}
+
+/// The value of the XML attribute `name="value"` in `block`.
+fn etw_attribute<'a>(block: &'a str, name: &str) -> Option<&'a str> {
+  etw_between(block, &format!("{name}=\""), "\"")
+}
+
+/// The value of the `<Data Name="field">value</Data>` element in `block`, trimmed.
+fn etw_data<'a>(block: &'a str, field: &str) -> Option<&'a str> {
+  etw_between(block, &format!("<Data Name=\"{field}\">"), "</Data>").map(str::trim)
+}
+
+/// A `tracerpt` `SystemTime` (`2026-10-15T00:11:17.223197300+00:00`, UTC with an explicit zero offset or
+/// `Z`, a nanosecond fraction) as nanoseconds since the Unix epoch, through the eslogger leg's [`iso_ns`].
+fn etw_time_ns(text: &str) -> Option<u64> {
+  let utc = text
+    .strip_suffix("+00:00")
+    .or_else(|| text.strip_suffix("-00:00"))
+    .map_or_else(|| text.to_owned(), |head| format!("{head}Z"));
+  iso_ns(&utc)
+}
+
+/// Format: the radix of a `tracerpt` handle value (`FileObject`/`FileKey` print as hexadecimal).
+const ETW_HANDLE_RADIX: u32 = 16;
+
+/// A hex (or `0x`-prefixed hex) handle value as a `u64`; `None` if it is not hex.
+fn etw_handle(text: &str) -> Option<u64> {
+  let trimmed = text.trim();
+  let hex = trimmed
+    .strip_prefix("0x")
+    .or_else(|| trimmed.strip_prefix("0X"))
+    .unwrap_or(trimmed);
+  u64::from_str_radix(hex, ETW_HANDLE_RADIX).ok()
+}
+
+/// Decodes a `tracerpt` XML dump (`-of XML`) into the Kernel-File provider's events. Each `<Event>` whose
+/// provider is Kernel-File is read for its `EventID`, the `ProcessID` and `SystemTime` of its `System`
+/// header, the file handle it references (`FileObject`, the open an operation runs on, else `FileKey`),
+/// and the name it carries (`FileName`, or `FilePath` on a rename's target). The session's own header
+/// events (a different provider) are skipped, and an event with no id is skipped, never guessed. The
+/// handle field preference and the event-id classification are verified against the capture probe's dump.
+pub fn etw_events_from_xml(xml: &str) -> Vec<EtwEvent> {
+  let mut out = Vec::new();
+  for (index, block) in xml.split("</Event>").enumerate() {
+    if !block.contains(ETW_PROVIDER_NAME) {
+      continue;
+    }
+    let Some(id) = etw_between(block, "<EventID>", "</EventID>")
+      .and_then(|text| text.trim().parse::<u16>().ok())
+    else {
+      continue;
+    };
+    out.push(EtwEvent {
+      line: index.saturating_add(1),
+      id,
+      pid: etw_attribute(block, "ProcessID").and_then(|text| text.parse::<u32>().ok()),
+      at_ns: etw_attribute(block, "SystemTime").and_then(etw_time_ns),
+      handle: etw_data(block, "FileObject")
+        .or_else(|| etw_data(block, "FileKey"))
+        .and_then(etw_handle),
+      name: etw_data(block, "FileName")
+        .or_else(|| etw_data(block, "FilePath"))
+        .map(str::to_owned),
+    });
+  }
+  out
+}
+
+/// Parses a `tracerpt` XML dump of the `Microsoft-Windows-Kernel-File` provider into its write events.
+pub fn parse_etw(xml: &str) -> Vec<WriteEvent> {
+  etw_write_events(&etw_events_from_xml(xml))
 }
 
 #[cfg(test)]
@@ -1608,6 +1730,160 @@ mod tests {
         .iter()
         .all(|w| w.pid == Some(7) && w.at_ns == Some(1_000_001_000) && w.descriptor.is_none()),
       "every write carries its process and time for the authority and window checks",
+    );
+  }
+
+  /// Format: a faithful `tracerpt` (`-of XML`) event in the real shape the probe captured (run
+  /// 38659345322) — a named provider, an `EventID`, a `SystemTime`, an `Execution` with a `ProcessID`, and
+  /// an `EventData` of `<Data Name="...">value</Data>` fields.
+  fn etw_event(provider: &str, id: u16, pid: u32, time: &str, data: &[(&str, &str)]) -> String {
+    let body: String = data
+      .iter()
+      .map(|(name, value)| format!("\t\t<Data Name=\"{name}\">{value}</Data>\n"))
+      .collect();
+    format!(
+      "<Event xmlns=\"http://schemas.microsoft.com/win/2004/08/events/event\">\n\
+       \t<System>\n\
+       \t\t<Provider Name=\"{provider}\" Guid=\"{{edd08927-9cc4-4e65-b970-c2560fb5c289}}\" />\n\
+       \t\t<EventID>{id}</EventID>\n\
+       \t\t<TimeCreated SystemTime=\"{time}\" />\n\
+       \t\t<Execution ProcessID=\"{pid}\" ThreadID=\"6872\" ProcessorID=\"0\" />\n\
+       \t</System>\n\
+       \t<EventData>\n{body}\t</EventData>\n\
+       </Event>"
+    )
+  }
+
+  /// R1 / AUD-29-42 (Windows leg): `parse_etw` reads the real `tracerpt` XML (run 38659345322) — device
+  /// paths, hex `FileObject`/`FileKey`, a `+00:00` nanosecond `SystemTime` — skips the session's own
+  /// header provider and the read/query events, binds a create's `FileObject` to its name so a later write
+  /// (which carries only the handle) resolves to it, and names a rename and a delete by their own path.
+  #[test]
+  fn parse_etw_reads_the_real_tracerpt_dump() {
+    const KF: &str = "Microsoft-Windows-Kernel-File";
+    const EPOCH1: &str = "1970-01-01T00:00:01.000000000+00:00"; // one second past the epoch, UTC
+    let known =
+      r"\Device\HarddiskVolume4\Users\runneradmin\AppData\Local\Temp\probe\slates-known.txt";
+    let renamed = r"\Device\HarddiskVolume4\Users\runneradmin\AppData\Local\Temp\probe\slates-known-renamed.txt";
+    let fobj = "0xFFFF958C4BCA3620";
+    let fkey = "0xFFFFDA035BA40180";
+    let dump = [
+      // The session's own header event, a different provider: skipped, never judged.
+      etw_event(
+        "MSNT_SystemTrace",
+        0,
+        7692,
+        EPOCH1,
+        &[("SessionNameString", "probe")],
+      ),
+      // Create (open): binds the FileObject to the name, but opening is not writing.
+      etw_event(
+        KF,
+        12,
+        6040,
+        EPOCH1,
+        &[("FileObject", fobj), ("FileName", known)],
+      ),
+      // CreateNewFile: the file's creation is a write; it carries the name.
+      etw_event(
+        KF,
+        30,
+        6040,
+        EPOCH1,
+        &[("FileObject", fobj), ("FileName", known)],
+      ),
+      // Write: carries only the handles, resolved to the create's name.
+      etw_event(
+        KF,
+        16,
+        6040,
+        EPOCH1,
+        &[("FileObject", fobj), ("FileKey", fkey), ("IOSize", "5")],
+      ),
+      // SetInformation (truncate): resolved through the handle.
+      etw_event(
+        KF,
+        17,
+        6040,
+        EPOCH1,
+        &[("FileObject", fobj), ("FileKey", fkey), ("InfoClass", "20")],
+      ),
+      // QueryInformation: a read, not a write.
+      etw_event(
+        KF,
+        22,
+        6040,
+        EPOCH1,
+        &[("FileObject", fobj), ("FileKey", fkey), ("InfoClass", "5")],
+      ),
+      // RenamePath: a write that names its new path.
+      etw_event(
+        KF,
+        27,
+        6040,
+        EPOCH1,
+        &[
+          ("FileObject", fobj),
+          ("FileKey", fkey),
+          ("FilePath", renamed),
+        ],
+      ),
+      // NameDelete: the name's removal, a write, naming the removed path.
+      etw_event(
+        KF,
+        11,
+        6040,
+        EPOCH1,
+        &[("FileKey", fkey), ("FileName", renamed)],
+      ),
+    ]
+    .join("\n");
+
+    let writes = parse_etw(&dump);
+    let seen: Vec<(&str, &str)> = writes
+      .iter()
+      .map(|w| (w.call.as_str(), w.path.as_str()))
+      .collect();
+    assert_eq!(
+      seen,
+      vec![
+        ("CreateNewFile", known),
+        ("Write", known),
+        ("SetInformation", known),
+        ("RenamePath", renamed),
+        ("NameDelete", renamed),
+      ],
+      "the header provider and the query are skipped; the open binds but does not write",
+    );
+    assert!(
+      writes
+        .iter()
+        .all(|w| w.pid == Some(6040) && w.at_ns == Some(1_000_000_000)),
+      "the ProcessID and the +00:00 nanosecond SystemTime parse from the real format",
+    );
+  }
+
+  /// Hostile input to the Windows parser: a torn event, a missing id, absent `EventData`, a foreign
+  /// provider and empty text never panic, and a write whose handle no create bound keeps an unresolved
+  /// path rather than vanishing.
+  #[test]
+  fn hostile_etw_input_never_panics() {
+    for garbage in [
+      "",
+      "<Event><System><EventID>",
+      "not xml at all",
+      "<Event>Microsoft-Windows-Kernel-File<EventID>16</EventID></Event>",
+      "</Event></Event></Event>",
+    ] {
+      let _ = parse_etw(garbage);
+    }
+    let orphan = r#"<Event><System><Provider Name="Microsoft-Windows-Kernel-File" /><EventID>16</EventID><Execution ProcessID="5" /></System><EventData><Data Name="FileObject">0x10</Data></EventData></Event>"#;
+    let writes = parse_etw(orphan);
+    assert_eq!(writes.len(), 1);
+    assert!(
+      writes[0].path.starts_with(UNRESOLVED_PREFIX),
+      "an unbound write keeps an unresolved path: {}",
+      writes[0].path
     );
   }
 
