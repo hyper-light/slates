@@ -16,9 +16,14 @@
 //!   is open; Microsoft, "Process Handles and Identifiers"), asked with `WaitForSingleObject` and a zero
 //!   timeout.
 //!
-//! A stopped process has not exited, so a stall stays a stall. Linux needs no watch: the control
-//! socket's peer end closes with the daemon's process. The question is a cold path, asked only after a
-//! reply is overdue.
+//! - Linux: a pidfd (`pidfd_open(2)`, Linux 5.3), bound to the process as the kqueue note is, readable once it
+//!   exits.
+//!
+//! A stopped process has not exited, so a stall stays a stall. A Linux client needs no watch (the control socket's
+//! peer end closes with the daemon's process); the supervising anchor does, to restart a daemon the moment it dies
+//! rather than at its next observation (A-113's follow-up): on Unix the watch's descriptor
+//! ([`ExitWatch::readiness`]) becomes readable at the exit, so the anchor waits on it beside its hold channel. For a
+//! client the question is a cold path, asked only after a reply is overdue.
 
 use crate::error::IpcError;
 
@@ -52,6 +57,13 @@ impl ExitWatch {
   /// vouched for, and the caller's recovery reconnects to whichever daemon holds the instance now.
   pub fn exited(&self) -> bool {
     self.inner.exited()
+  }
+
+  /// A descriptor readable once the watched process has exited, to wait on with `poll` (the kqueue on macOS, the pidfd
+  /// on Linux); `None` for a watch taken after the process was already gone, which needs no wait.
+  #[cfg(unix)]
+  pub fn readiness(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
+    self.inner.readiness()
   }
 }
 
@@ -132,6 +144,65 @@ mod platform {
       self.exited.set(exited);
       exited
     }
+
+    pub(super) fn readiness(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
+      (!self.exited.get()).then(|| std::os::fd::AsFd::as_fd(&self.queue))
+    }
+  }
+}
+
+#[cfg(target_os = "linux")]
+mod platform {
+  use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+
+  use rustix::event::{PollFd, PollFlags, Timespec, poll};
+  use rustix::process::{Pid, PidfdFlags, pidfd_open};
+
+  use crate::error::IpcError;
+
+  pub(super) struct ExitWatch {
+    /// The pidfd; `None` when the process was already gone at the watch.
+    process: Option<OwnedFd>,
+  }
+
+  impl ExitWatch {
+    pub(super) fn on(pid: u32) -> Result<ExitWatch, IpcError> {
+      let process = i32::try_from(pid)
+        .ok()
+        .and_then(Pid::from_raw)
+        .ok_or(IpcError::Layout {
+          reason: "the watched pid is out of range",
+        })?;
+      match pidfd_open(process, PidfdFlags::empty()) {
+        Ok(fd) => Ok(ExitWatch { process: Some(fd) }),
+        // No such process: it exited before the watch.
+        Err(rustix::io::Errno::SRCH) => Ok(ExitWatch { process: None }),
+        Err(e) => Err(IpcError::OsRefused {
+          call: "pidfd_open",
+          code: Some(e.raw_os_error()),
+        }),
+      }
+    }
+
+    pub(super) fn exited(&self) -> bool {
+      let Some(process) = &self.process else {
+        return true;
+      };
+      let mut interest = [PollFd::new(process, PollFlags::IN)];
+      let zero = Timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+      };
+      match poll(&mut interest, Some(&zero)) {
+        Ok(ready) => ready > 0,
+        Err(rustix::io::Errno::INTR) => false,
+        Err(_) => true,
+      }
+    }
+
+    pub(super) fn readiness(&self) -> Option<BorrowedFd<'_>> {
+      self.process.as_ref().map(AsFd::as_fd)
+    }
   }
 }
 
@@ -185,7 +256,7 @@ mod platform {
   }
 }
 
-#[cfg(not(any(target_os = "macos", windows)))]
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
 mod platform {
   use crate::error::IpcError;
 
@@ -202,10 +273,15 @@ mod platform {
     pub(super) fn exited(&self) -> bool {
       match *self {}
     }
+
+    #[cfg(unix)]
+    pub(super) fn readiness(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
+      match *self {}
+    }
   }
 }
 
-#[cfg(all(test, any(target_os = "macos", windows)))]
+#[cfg(all(test, any(target_os = "macos", target_os = "linux", windows)))]
 mod tests {
   #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -232,6 +308,49 @@ mod tests {
     assert!(watch.exited(), "a killed process has exited");
     assert!(watch.exited(), "the exit is remembered once read");
     assert!(ExitWatch::on(0).is_err());
+  }
+
+  /// A-113's follow-up (the anchor restarts a daemon the moment it dies). Do: watch a child process and wait on its
+  /// readiness descriptor with a long timeout while it runs briefly, then kill it from another thread. Expect: the wait
+  /// returns at the kill, not at its timeout, and the watch reads exited.
+  #[cfg(any(target_os = "macos", target_os = "linux"))]
+  #[test]
+  fn the_readiness_descriptor_wakes_a_wait_at_the_exit() {
+    let _gate = crate::descriptor_test_gate();
+    let mut child = std::process::Command::new("/bin/sleep")
+      .arg("30")
+      .spawn()
+      .unwrap();
+    let watch = ExitWatch::on(child.id()).unwrap();
+    let pid = child.id();
+    let killer = std::thread::spawn(move || {
+      #[allow(clippy::disallowed_methods)] // the test lets the wait begin before the kill
+      std::thread::sleep(std::time::Duration::from_millis(50));
+      let pid = rustix::process::Pid::from_raw(i32::try_from(pid).unwrap()).unwrap();
+      rustix::process::kill_process(pid, rustix::process::Signal::KILL).unwrap();
+    });
+    let started = std::time::Instant::now();
+    let fd = watch
+      .readiness()
+      .expect("a running process has a readiness descriptor");
+    let mut interest = [rustix::event::PollFd::new(
+      &fd,
+      rustix::event::PollFlags::IN,
+    )];
+    let timeout = rustix::event::Timespec {
+      tv_sec: 10,
+      tv_nsec: 0,
+    };
+    let ready = rustix::event::poll(&mut interest, Some(&timeout)).unwrap();
+    let waited = started.elapsed();
+    killer.join().unwrap();
+    child.wait().unwrap();
+    assert_eq!(ready, 1, "the wait returned readable");
+    assert!(
+      waited < std::time::Duration::from_secs(5),
+      "it returned at the kill ({waited:?}), not its timeout"
+    );
+    assert!(watch.exited(), "the watch reads exited");
   }
 
   /// AUD-29-20 (Windows). Do: watch a child process, then kill it and reap it. Expect: not exited while

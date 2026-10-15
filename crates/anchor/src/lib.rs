@@ -25,9 +25,9 @@
 // workspace-wide.
 #![cfg_attr(not(test), deny(clippy::arithmetic_side_effects))]
 
-#[cfg(target_os = "linux")]
-pub mod devices;
 pub mod error;
+#[cfg(unix)]
+pub mod held;
 pub mod layout;
 pub mod segment;
 pub mod supervise;

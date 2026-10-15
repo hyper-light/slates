@@ -778,6 +778,52 @@ pub fn parse_strace_with_cwd(log: &str, cwd: &str) -> Vec<WriteEvent> {
   events
 }
 
+/// The thread ids a landing's writes may come from: the daemon's own threads, grown to include any that
+/// lived only for the landing. strace `-f` names every event by its thread, and A-130's barrier syncs a
+/// batch's files on ⌈√n⌉ scoped threads the daemon spawns and joins inside the barrier
+/// (`crates/land/src/os.rs`), so a `/proc/<pid>/task` snapshot read after the landing misses them and
+/// their `fdatasync` of a staged file inside the target reads as "not the landing's". This recovers them
+/// from the trace itself: seeded with `roots` (the daemon id and the threads `/proc` still lists), every
+/// `clone`/`clone3` whose caller is already in the group contributes the id it returned. A thread is
+/// created before it can write, so its creation line is in the log before its writes; the pass repeats to
+/// a fixed point so a thread that itself spawns a thread is reached whatever the unfinished/resumed
+/// interleave leaves. The daemon spawns no in-target writer it does not join this way, so no real landing
+/// write is left outside the group, and a write by any other process stays outside it (a stranger's thread
+/// is never cloned by one of the daemon's).
+pub fn strace_thread_group(log: &str, roots: &[u32]) -> Vec<u32> {
+  let lines = joined_lines(log);
+  let mut group: std::collections::BTreeSet<u32> = roots.iter().copied().collect();
+  loop {
+    let mut added = false;
+    for joined in &lines {
+      let Some(caller) = joined.pid else { continue };
+      if !group.contains(&caller) {
+        continue;
+      }
+      let spawns = matches!(call_and_args(&joined.body), Some((name, _)) if name == "clone" || name == "clone3");
+      if spawns
+        && let Some(child) = clone_child(&joined.body)
+        && group.insert(child)
+      {
+        added = true;
+      }
+    }
+    if !added {
+      break;
+    }
+  }
+  group.into_iter().collect()
+}
+
+/// The thread id a `clone`/`clone3` returned (its whole line ends `) = <tid>`): `None` for a refused call
+/// (`= -1 …`, which does not parse as an unsigned id) or a line with no parseable return.
+fn clone_child(body: &str) -> Option<u32> {
+  body
+    .rsplit_once(") = ")
+    .and_then(|(_, returned)| returned.split_whitespace().next())
+    .and_then(|first| first.parse::<u32>().ok())
+}
+
 /// Format: the OS-shipped mount brokers a Linux mount runs (R10: "the only privileged pieces are
 /// OS-shipped brokers installed once"): `fusermount3`, the setuid helper libfuse ships, and util-linux's
 /// `mount`, which `fusermount3` runs for an `allow_other` mount. Their writes are the operating system's
@@ -1387,6 +1433,236 @@ pub fn parse_eslogger(log: &str) -> Vec<WriteEvent> {
   out
 }
 
+// --- Windows ETW (Microsoft-Windows-Kernel-File) ---------------------------------------------
+//
+// The Linux leg records with `strace` and the macOS leg with `eslogger`; the Windows leg records the
+// `Microsoft-Windows-Kernel-File` provider (`{EDD08927-9CC4-4E65-B970-C2560FB5C289}`) with the built-in
+// `logman` and dumps it with `tracerpt` (`crates/conformance/tests/etw_windows.rs` is the capture probe
+// that establishes the dump's real shape). This half — a decoded event stream to write events — is
+// independent of the dump's XML: a provider event names a file only when it opens or creates it, and
+// gives a later write just the file's handle, so the name is resolved across events through a handle
+// table (as `parse_fs_usage` resolves a descriptor). The XML-to-`EtwEvent` front end and the exact event
+// ids are finalized against the probe's dump before the live Windows lane is enabled.
+
+/// One `Microsoft-Windows-Kernel-File` event, decoded from a `tracerpt` dump into the fields the
+/// judgement needs: its 1-based position, its manifest event id, the process and time its `System` header
+/// carries, the file handle it references, and the name it carries when it is a name-bearing event.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EtwEvent {
+  /// The 1-based event position in the dump.
+  pub line: usize,
+  /// The provider's manifest event id.
+  pub id: u16,
+  /// The process that made the call (`System/Execution/@ProcessID`).
+  pub pid: Option<u32>,
+  /// When the call was made, nanoseconds since the Unix epoch (`System/TimeCreated/@SystemTime`).
+  pub at_ns: Option<u64>,
+  /// The file handle the event references: the `FileObject` on an open's operations (a write carries
+  /// only this), bound to a name by the create that opened it. The front end puts the field a write
+  /// shares with its create here, so binders and writers resolve in one handle space.
+  pub handle: Option<u64>,
+  /// The file's name, on the events that carry one (create, open, a rename's new path, a delete by path).
+  pub name: Option<String>,
+}
+
+// Microsoft-Windows-Kernel-File manifest event ids, verified against the probe's dump (run 38659345322).
+// The sets and the name table below are built from these named ids, so no bare id appears in a list.
+/// Format: `NameCreate` — a name first referenced, binding a FileKey to it.
+const ETW_NAME_CREATE: u16 = 10;
+/// Format: `NameDelete` — a name removed (a delete), carrying the removed path.
+const ETW_NAME_DELETE: u16 = 11;
+/// Format: `Create` — a file opened, binding its FileObject to the name (opening is not itself a write).
+const ETW_CREATE: u16 = 12;
+/// Format: `Close` — a file handle (FileObject) freed.
+const ETW_CLOSE: u16 = 14;
+/// Format: `Write` — file data written; carries the handles, not the name.
+const ETW_WRITE: u16 = 16;
+/// Format: `SetInformation` — set end-of-file (the truncate), allocation or disposition.
+const ETW_SET_INFORMATION: u16 = 17;
+/// Format: `SetDelete` — a delete disposition set on the file.
+const ETW_SET_DELETE: u16 = 18;
+/// Format: `Rename` — a rename (its new path arrives separately as `RenamePath`).
+const ETW_RENAME: u16 = 19;
+/// Format: `DeletePath` — a delete, carrying the deleted path.
+const ETW_DELETE_PATH: u16 = 26;
+/// Format: `RenamePath` — a rename, carrying the new path.
+const ETW_RENAME_PATH: u16 = 27;
+/// Format: `SetLinkPath` — a hard link created at a path.
+const ETW_SET_LINK_PATH: u16 = 28;
+/// Format: `CreateNewFile` — a new file created (a write), carrying its name.
+const ETW_CREATE_NEW_FILE: u16 = 30;
+
+/// The event ids that bind a handle to a name: a name-create, an open and a new-file creation each carry
+/// both a handle and a `FileName` (the provider manifest, evidence B; deployed ETW tooling, evidence C).
+const ETW_NAME_BINDERS: &[u16] = &[ETW_NAME_CREATE, ETW_CREATE, ETW_CREATE_NEW_FILE];
+
+/// The event ids that write to disk. A read (15), the query and directory events, `OperationEnd` (24) and
+/// the cleanup events are not writes. Known refinement for the hardening pass: a `Create` that supersedes
+/// or overwrites an existing file truncates it at open, which the daemon's create-new-then-rename landing
+/// never does, so it is deferred to an adversarial test of an overwrite-open outside the grant (the event
+/// carries no `DesiredAccess`, so a write-open cannot be told from a read-open by the event alone).
+const ETW_WRITERS: &[u16] = &[
+  ETW_NAME_DELETE,
+  ETW_WRITE,
+  ETW_SET_INFORMATION,
+  ETW_SET_DELETE,
+  ETW_RENAME,
+  ETW_DELETE_PATH,
+  ETW_RENAME_PATH,
+  ETW_SET_LINK_PATH,
+  ETW_CREATE_NEW_FILE,
+];
+
+/// The display name for each write-capable Kernel-File event id (its id matches [`ETW_WRITERS`]).
+const ETW_CALL_NAMES: &[(u16, &str)] = &[
+  (ETW_NAME_DELETE, "NameDelete"),
+  (ETW_WRITE, "Write"),
+  (ETW_SET_INFORMATION, "SetInformation"),
+  (ETW_SET_DELETE, "SetDelete"),
+  (ETW_RENAME, "Rename"),
+  (ETW_DELETE_PATH, "DeletePath"),
+  (ETW_RENAME_PATH, "RenamePath"),
+  (ETW_SET_LINK_PATH, "SetLinkPath"),
+  (ETW_CREATE_NEW_FILE, "CreateNewFile"),
+];
+
+/// A human name for a Kernel-File event id, for a `WriteEvent`'s call. An unknown id prints its number, so
+/// a classification gap is visible, never silent.
+fn etw_call_name(id: u16) -> String {
+  ETW_CALL_NAMES
+    .iter()
+    .find(|(event, _)| *event == id)
+    .map_or_else(|| format!("KernelFile{id}"), |(_, name)| (*name).to_owned())
+}
+
+/// The write-capable events a decoded Kernel-File stream contributes, each named through the handle table
+/// a name-bearing event filled. A write that names no handle the stream bound is kept with an unresolved
+/// path, never dropped, so a gap is a counted violation rather than silence.
+pub fn etw_write_events(events: &[EtwEvent]) -> Vec<WriteEvent> {
+  let mut names: HashMap<u64, String> = HashMap::new();
+  let mut out = Vec::new();
+  for decoded in events {
+    if ETW_NAME_BINDERS.contains(&decoded.id)
+      && let (Some(handle), Some(name)) = (decoded.handle, decoded.name.as_deref())
+    {
+      names.insert(handle, name.to_owned());
+    }
+    if ETW_WRITERS.contains(&decoded.id) {
+      let path = decoded
+        .name
+        .clone()
+        .or_else(|| {
+          decoded
+            .handle
+            .and_then(|handle| names.get(&handle).cloned())
+        })
+        .unwrap_or_else(|| {
+          format!(
+            "{UNRESOLVED_PREFIX}etw handle {:?} unnamed>",
+            decoded.handle
+          )
+        });
+      out.push(WriteEvent {
+        line: decoded.line,
+        call: etw_call_name(decoded.id),
+        path,
+        descriptor: None,
+        pid: decoded.pid,
+        at_ns: decoded.at_ns,
+      });
+    }
+    if decoded.id == ETW_CLOSE
+      && let Some(handle) = decoded.handle
+    {
+      names.remove(&handle);
+    }
+  }
+  out
+}
+
+/// Format: how `tracerpt` labels the provider whose events the judgement reads (`-of XML` tags each event
+/// with its provider name); the session's own header events carry a different provider and are skipped.
+const ETW_PROVIDER_NAME: &str = "Microsoft-Windows-Kernel-File";
+
+/// The text between two markers in `block`, in order; `None` if either is absent.
+fn etw_between<'a>(block: &'a str, open: &str, close: &str) -> Option<&'a str> {
+  let start = block.find(open)?.checked_add(open.len())?;
+  let rest = block.get(start..)?;
+  let end = rest.find(close)?;
+  rest.get(..end)
+}
+
+/// The value of the XML attribute `name="value"` in `block`.
+fn etw_attribute<'a>(block: &'a str, name: &str) -> Option<&'a str> {
+  etw_between(block, &format!("{name}=\""), "\"")
+}
+
+/// The value of the `<Data Name="field">value</Data>` element in `block`, trimmed.
+fn etw_data<'a>(block: &'a str, field: &str) -> Option<&'a str> {
+  etw_between(block, &format!("<Data Name=\"{field}\">"), "</Data>").map(str::trim)
+}
+
+/// A `tracerpt` `SystemTime` (`2026-10-15T00:11:17.223197300+00:00`, UTC with an explicit zero offset or
+/// `Z`, a nanosecond fraction) as nanoseconds since the Unix epoch, through the eslogger leg's [`iso_ns`].
+fn etw_time_ns(text: &str) -> Option<u64> {
+  let utc = text
+    .strip_suffix("+00:00")
+    .or_else(|| text.strip_suffix("-00:00"))
+    .map_or_else(|| text.to_owned(), |head| format!("{head}Z"));
+  iso_ns(&utc)
+}
+
+/// Format: the radix of a `tracerpt` handle value (`FileObject`/`FileKey` print as hexadecimal).
+const ETW_HANDLE_RADIX: u32 = 16;
+
+/// A hex (or `0x`-prefixed hex) handle value as a `u64`; `None` if it is not hex.
+fn etw_handle(text: &str) -> Option<u64> {
+  let trimmed = text.trim();
+  let hex = trimmed
+    .strip_prefix("0x")
+    .or_else(|| trimmed.strip_prefix("0X"))
+    .unwrap_or(trimmed);
+  u64::from_str_radix(hex, ETW_HANDLE_RADIX).ok()
+}
+
+/// Decodes a `tracerpt` XML dump (`-of XML`) into the Kernel-File provider's events. Each `<Event>` whose
+/// provider is Kernel-File is read for its `EventID`, the `ProcessID` and `SystemTime` of its `System`
+/// header, the file handle it references (`FileObject`, the open an operation runs on, else `FileKey`),
+/// and the name it carries (`FileName`, or `FilePath` on a rename's target). The session's own header
+/// events (a different provider) are skipped, and an event with no id is skipped, never guessed. The
+/// handle field preference and the event-id classification are verified against the capture probe's dump.
+pub fn etw_events_from_xml(xml: &str) -> Vec<EtwEvent> {
+  let mut out = Vec::new();
+  for (index, block) in xml.split("</Event>").enumerate() {
+    if !block.contains(ETW_PROVIDER_NAME) {
+      continue;
+    }
+    let Some(id) = etw_between(block, "<EventID>", "</EventID>")
+      .and_then(|text| text.trim().parse::<u16>().ok())
+    else {
+      continue;
+    };
+    out.push(EtwEvent {
+      line: index.saturating_add(1),
+      id,
+      pid: etw_attribute(block, "ProcessID").and_then(|text| text.parse::<u32>().ok()),
+      at_ns: etw_attribute(block, "SystemTime").and_then(etw_time_ns),
+      handle: etw_data(block, "FileObject")
+        .or_else(|| etw_data(block, "FileKey"))
+        .and_then(etw_handle),
+      name: etw_data(block, "FileName")
+        .or_else(|| etw_data(block, "FilePath"))
+        .map(str::to_owned),
+    });
+  }
+  out
+}
+
+/// Parses a `tracerpt` XML dump of the `Microsoft-Windows-Kernel-File` provider into its write events.
+pub fn parse_etw(xml: &str) -> Vec<WriteEvent> {
+  etw_write_events(&etw_events_from_xml(xml))
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -1405,6 +1681,210 @@ mod tests {
     }
     assert!(fs_usage_has_activity(&format!("{read}\n")));
     assert!(parse_fs_usage(&format!("{read}\n")).is_empty());
+  }
+
+  /// R1 / AUD-29-42 (Windows leg): the Kernel-File correlation resolves a write's file through the handle
+  /// a create bound, names a rename by its own path, keeps an unbound write's path unresolved (never
+  /// dropped), and forgets a handle on close so a reused number cannot borrow a closed file's name. The
+  /// open binds but does not write, and a read is not a write.
+  #[test]
+  fn etw_writes_are_named_through_the_handle_a_create_bound() {
+    let ev = |line, id, handle: Option<u64>, name: Option<&str>| EtwEvent {
+      line,
+      id,
+      pid: Some(7),
+      at_ns: Some(1_000_001_000),
+      handle,
+      name: name.map(str::to_owned),
+    };
+    let target = r"C:\scratch\land-target\f.txt";
+    let renamed = r"C:\scratch\land-target\g.txt";
+    let events = vec![
+      ev(1, 12, Some(0xA), Some(target)), // Create: binds handle 0xA -> f.txt (an open, not a write)
+      ev(2, 16, Some(0xA), None),         // Write: no name -> resolves to f.txt through the table
+      ev(3, 17, Some(0xA), None),         // SetInformation (truncate): resolves to f.txt
+      ev(4, 19, Some(0xA), Some(renamed)), // Rename: carries its own new name -> g.txt
+      ev(5, 16, Some(0xB), None),         // Write on an unbound handle -> unresolved, not dropped
+      ev(6, 14, Some(0xA), None),         // Close 0xA: forgets the binding
+      ev(7, 16, Some(0xA), None),         // Write after close -> unresolved (no stale f.txt)
+      ev(8, 15, Some(0xA), None),         // Read: not a write, contributes nothing
+    ];
+    let writes = etw_write_events(&events);
+    let seen: Vec<(&str, &str)> = writes
+      .iter()
+      .map(|w| (w.call.as_str(), w.path.as_str()))
+      .collect();
+    assert_eq!(
+      seen,
+      vec![
+        ("Write", target),
+        ("SetInformation", target),
+        ("Rename", renamed),
+        ("Write", "<fd etw handle Some(11) unnamed>"),
+        ("Write", "<fd etw handle Some(10) unnamed>"),
+      ],
+      "the open binds but does not write, a read is not a write, and a closed handle's name is gone",
+    );
+    assert!(
+      writes
+        .iter()
+        .all(|w| w.pid == Some(7) && w.at_ns == Some(1_000_001_000) && w.descriptor.is_none()),
+      "every write carries its process and time for the authority and window checks",
+    );
+  }
+
+  /// Format: a faithful `tracerpt` (`-of XML`) event in the real shape the probe captured (run
+  /// 38659345322) — a named provider, an `EventID`, a `SystemTime`, an `Execution` with a `ProcessID`, and
+  /// an `EventData` of `<Data Name="...">value</Data>` fields.
+  fn etw_event(provider: &str, id: u16, pid: u32, time: &str, data: &[(&str, &str)]) -> String {
+    let body: String = data
+      .iter()
+      .map(|(name, value)| format!("\t\t<Data Name=\"{name}\">{value}</Data>\n"))
+      .collect();
+    format!(
+      "<Event xmlns=\"http://schemas.microsoft.com/win/2004/08/events/event\">\n\
+       \t<System>\n\
+       \t\t<Provider Name=\"{provider}\" Guid=\"{{edd08927-9cc4-4e65-b970-c2560fb5c289}}\" />\n\
+       \t\t<EventID>{id}</EventID>\n\
+       \t\t<TimeCreated SystemTime=\"{time}\" />\n\
+       \t\t<Execution ProcessID=\"{pid}\" ThreadID=\"6872\" ProcessorID=\"0\" />\n\
+       \t</System>\n\
+       \t<EventData>\n{body}\t</EventData>\n\
+       </Event>"
+    )
+  }
+
+  /// R1 / AUD-29-42 (Windows leg): `parse_etw` reads the real `tracerpt` XML (run 38659345322) — device
+  /// paths, hex `FileObject`/`FileKey`, a `+00:00` nanosecond `SystemTime` — skips the session's own
+  /// header provider and the read/query events, binds a create's `FileObject` to its name so a later write
+  /// (which carries only the handle) resolves to it, and names a rename and a delete by their own path.
+  #[test]
+  fn parse_etw_reads_the_real_tracerpt_dump() {
+    const KF: &str = "Microsoft-Windows-Kernel-File";
+    const EPOCH1: &str = "1970-01-01T00:00:01.000000000+00:00"; // one second past the epoch, UTC
+    let known =
+      r"\Device\HarddiskVolume4\Users\runneradmin\AppData\Local\Temp\probe\slates-known.txt";
+    let renamed = r"\Device\HarddiskVolume4\Users\runneradmin\AppData\Local\Temp\probe\slates-known-renamed.txt";
+    let fobj = "0xFFFF958C4BCA3620";
+    let fkey = "0xFFFFDA035BA40180";
+    let dump = [
+      // The session's own header event, a different provider: skipped, never judged.
+      etw_event(
+        "MSNT_SystemTrace",
+        0,
+        7692,
+        EPOCH1,
+        &[("SessionNameString", "probe")],
+      ),
+      // Create (open): binds the FileObject to the name, but opening is not writing.
+      etw_event(
+        KF,
+        12,
+        6040,
+        EPOCH1,
+        &[("FileObject", fobj), ("FileName", known)],
+      ),
+      // CreateNewFile: the file's creation is a write; it carries the name.
+      etw_event(
+        KF,
+        30,
+        6040,
+        EPOCH1,
+        &[("FileObject", fobj), ("FileName", known)],
+      ),
+      // Write: carries only the handles, resolved to the create's name.
+      etw_event(
+        KF,
+        16,
+        6040,
+        EPOCH1,
+        &[("FileObject", fobj), ("FileKey", fkey), ("IOSize", "5")],
+      ),
+      // SetInformation (truncate): resolved through the handle.
+      etw_event(
+        KF,
+        17,
+        6040,
+        EPOCH1,
+        &[("FileObject", fobj), ("FileKey", fkey), ("InfoClass", "20")],
+      ),
+      // QueryInformation: a read, not a write.
+      etw_event(
+        KF,
+        22,
+        6040,
+        EPOCH1,
+        &[("FileObject", fobj), ("FileKey", fkey), ("InfoClass", "5")],
+      ),
+      // RenamePath: a write that names its new path.
+      etw_event(
+        KF,
+        27,
+        6040,
+        EPOCH1,
+        &[
+          ("FileObject", fobj),
+          ("FileKey", fkey),
+          ("FilePath", renamed),
+        ],
+      ),
+      // NameDelete: the name's removal, a write, naming the removed path.
+      etw_event(
+        KF,
+        11,
+        6040,
+        EPOCH1,
+        &[("FileKey", fkey), ("FileName", renamed)],
+      ),
+    ]
+    .join("\n");
+
+    let writes = parse_etw(&dump);
+    let seen: Vec<(&str, &str)> = writes
+      .iter()
+      .map(|w| (w.call.as_str(), w.path.as_str()))
+      .collect();
+    assert_eq!(
+      seen,
+      vec![
+        ("CreateNewFile", known),
+        ("Write", known),
+        ("SetInformation", known),
+        ("RenamePath", renamed),
+        ("NameDelete", renamed),
+      ],
+      "the header provider and the query are skipped; the open binds but does not write",
+    );
+    assert!(
+      writes
+        .iter()
+        .all(|w| w.pid == Some(6040) && w.at_ns == Some(1_000_000_000)),
+      "the ProcessID and the +00:00 nanosecond SystemTime parse from the real format",
+    );
+  }
+
+  /// Hostile input to the Windows parser: a torn event, a missing id, absent `EventData`, a foreign
+  /// provider and empty text never panic, and a write whose handle no create bound keeps an unresolved
+  /// path rather than vanishing.
+  #[test]
+  fn hostile_etw_input_never_panics() {
+    for garbage in [
+      "",
+      "<Event><System><EventID>",
+      "not xml at all",
+      "<Event>Microsoft-Windows-Kernel-File<EventID>16</EventID></Event>",
+      "</Event></Event></Event>",
+    ] {
+      let _ = parse_etw(garbage);
+    }
+    let orphan = r#"<Event><System><Provider Name="Microsoft-Windows-Kernel-File" /><EventID>16</EventID><Execution ProcessID="5" /></System><EventData><Data Name="FileObject">0x10</Data></EventData></Event>"#;
+    let writes = parse_etw(orphan);
+    assert_eq!(writes.len(), 1);
+    assert!(
+      writes[0].path.starts_with(UNRESOLVED_PREFIX),
+      "an unbound write keeps an unresolved path: {}",
+      writes[0].path
+    );
   }
 
   const TARGET: &str = "/scratch/land-target";
@@ -1507,6 +1987,64 @@ mod tests {
     );
     assert!(eslogger_has_activity(&log));
     assert!(!eslogger_has_activity("not json\n{}\n"));
+  }
+
+  /// R1 / AUD-29-42: a thread the daemon spawns only for the landing is the landing's. strace names
+  /// events by thread, and A-130's barrier `fdatasync`s a staged file on a scoped thread
+  /// (`crates/land/src/os.rs`) whose id no post-landing `/proc/<pid>/task` snapshot kept.
+  /// `strace_thread_group` recovers it from the trace's own `clone3`, so the judge places its write
+  /// inside the target; a thread the daemon never spawned, writing inside the target, stays a violation.
+  #[test]
+  fn a_thread_the_daemon_spawns_for_the_landing_is_counted_as_the_landings() {
+    let log = stamped(
+      "\
+200 clone3({flags=CLONE_VM|CLONE_FS|CLONE_FILES|CLONE_SIGHAND|CLONE_THREAD|CLONE_SYSVSEM|CLONE_SETTLS|CLONE_PARENT_SETTID|CLONE_CHILD_CLEARTID, child_tid=0x7f, parent_tid=0x7f, exit_signal=0, stack=0x7f, stack_size=0x1, tls=0x7f}, 88) = 250
+250 fdatasync(6</scratch/land-target/d/#9474106>(deleted)) = 0
+900 fdatasync(7</scratch/land-target/stranger>) = 0",
+    );
+    // The daemon's /proc snapshot named only its long-lived thread 200; 250 lived only for the barrier
+    // and 900 is not the daemon's at all.
+    let group = strace_thread_group(&log, &[200]);
+    assert!(
+      group.contains(&250),
+      "the spawned barrier thread joins the group: {group:?}"
+    );
+    assert!(
+      !group.contains(&900),
+      "a thread the daemon never spawned does not: {group:?}"
+    );
+
+    let events = parse_strace_with_cwd(&log, "/scratch/cwd");
+    let judged = judge(
+      &events,
+      &Policy {
+        target: TARGET,
+        working_directory: "/scratch/cwd",
+        landing: Some(Landing {
+          writers: &group,
+          from_ns: WINDOW.0,
+          until_ns: WINDOW.1,
+        }),
+        mounts: &[],
+      },
+    );
+    assert_eq!(
+      judged.write_calls, 2,
+      "the two fdatasyncs; clone3 is not a write"
+    );
+    assert_eq!(
+      judged.inside_target, 1,
+      "the barrier thread's fdatasync of a staged file is the landing's"
+    );
+    assert_eq!(
+      judged.outside, 1,
+      "the stranger's write inside the target is still a violation: {:?}",
+      judged.violations
+    );
+    assert_eq!(
+      paths(&judged.violations),
+      vec!["/scratch/land-target/stranger"]
+    );
   }
 
   const STRACE: &str = "\
@@ -1685,6 +2223,19 @@ mod tests {
       quoted("\"a\\303\\251b\\\"c\\n\"").unwrap(),
       "a\u{c3}\u{a9}b\"c\n"
     );
+    // The thread-group walk over hostile clone lines — unfinished, empty and refused returns, a return
+    // that overflows a u32, a clone by a non-member — never panics and adds only a member's valid clone.
+    let clones = "1 clone3(<unfinished ...>\n1 clone() = \n1 clone3({) = -1 EAGAIN (x)\n7 clone(((() = 99999999999999999999\n1 clone3({flags=CLONE_THREAD}, 88) = 42\n";
+    let group = strace_thread_group(clones, &[1]);
+    assert!(
+      group.contains(&1) && group.contains(&42),
+      "a member's valid clone joins, nothing else does: {group:?}"
+    );
+    assert!(
+      !group.contains(&7),
+      "a non-member's clone adds nothing: {group:?}"
+    );
+    assert_eq!(strace_thread_group(garbage, &[]), Vec::<u32>::new());
   }
 
   /// Rows in the shape Apple's `fs_usage.c` prints (`format_print`, `print_open`): an `open` with

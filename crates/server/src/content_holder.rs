@@ -10,7 +10,11 @@
 use std::collections::BTreeMap;
 
 use slates_cluster::content::ContentAccess;
-use slates_db::register::{Acceptor, HostId, ObjectId, RegionalConfiguration};
+use slates_db::register::{
+  Acceptor, Authority, HostEpoch, HostId, ObjectId, RegionId, RegionalConfiguration,
+  RootConfiguration,
+};
+use slates_wire::Wire;
 
 use crate::state::ShardState;
 
@@ -26,6 +30,37 @@ pub(crate) fn hold_space(
   }
 }
 
+/// What a holder knows of the regions, for a put from the owner of an object homed in another region
+/// (`docs/wip/mirroring.md` decision 2): the root configuration, each region's declared mirror, every member's
+/// region, and the holder's own.
+pub(crate) struct MirrorView<'a> {
+  /// The root group's committed configuration: homes moved and regions promoted.
+  pub(crate) root: &'a RootConfiguration,
+  /// Each region's declared mirror (the manifest's `mirrors`).
+  pub(crate) mirrors: &'a BTreeMap<RegionId, RegionId>,
+  /// Every member's declared region.
+  pub(crate) regions: &'a BTreeMap<HostId, RegionId>,
+  /// This holder's region.
+  pub(crate) own: RegionId,
+}
+
+impl MirrorView<'_> {
+  /// Whether `peer` may place `object`'s content here as a mirror copy (`slates_db::mirror::admits_mirror_put`):
+  /// only a placement, only at the home's declared mirror, only from a member of the object's standing home.
+  pub(crate) fn admits_put(&self, peer: HostId, access: ContentAccess, object: ObjectId) -> bool {
+    access == ContentAccess::Place
+      && slates_db::mirror::admits_mirror_put(
+        self.root,
+        self.mirrors,
+        self.regions,
+        self.own,
+        peer,
+        object,
+      )
+      .is_ok()
+  }
+}
+
 /// Serves one content request as `local`, with `authorized` deciding the access asked for the object named
 /// from the committed configuration and this holder's records. Returns the reply: an empty one for
 /// anything refused, malformed, unverifiable or unheld.
@@ -36,20 +71,50 @@ pub(crate) fn serve(
   authorized: impl FnOnce(
     &RegionalConfiguration,
     &BTreeMap<ObjectId, Acceptor>,
+    &MirrorView<'_>,
     ContentAccess,
     ObjectId,
   ) -> bool,
 ) -> Vec<u8> {
   let (council, records) = (&state.council, &state.holder_records);
+  let mirror = MirrorView {
+    root: state.root.configuration(),
+    mirrors: &state.region_mirrors,
+    regions: &state.node_regions,
+    own: state
+      .node_regions
+      .get(&local)
+      .copied()
+      .unwrap_or(RegionId(0)),
+  };
+  let unauthorized_before = state.held_content.unauthorized();
   let (reply, held) = state.held_content.serve(
     &mut hold_space(&mut state.store),
     local,
     request,
-    |access, object| authorized(council.configuration(), records, access, object),
+    |access, object| authorized(council.configuration(), records, &mirror, access, object),
     |object, sequence, manifest| {
       crate::content_retention::admits(records, local, object, sequence, manifest)
     },
   );
+  // A request the access rule refused is counted (the hold answers it with the same empty reply as anything unheld,
+  // so without the count a refused placement, a mirror's among them, was invisible).
+  let refused = state
+    .held_content
+    .unauthorized()
+    .saturating_sub(unauthorized_before);
+  if refused > 0 {
+    let count = state.refusals.entry(CONTENT_UNAUTHORIZED).or_insert(0);
+    *count = count.saturating_add(refused);
+  } else {
+    let kind = if reply.is_empty() {
+      CONTENT_ANSWERED_EMPTY
+    } else {
+      CONTENT_ANSWERED
+    };
+    let count = state.refusals.entry(kind).or_insert(0);
+    *count = count.saturating_add(1);
+  }
   let Some(object) = held else {
     return reply;
   };
@@ -66,7 +131,171 @@ pub(crate) fn serve(
   reply
 }
 
+/// The status count of content requests this holder's access rule refused (a placement from a peer that may not
+/// place the object here, a read of an object the peer may not read).
+pub(crate) const CONTENT_UNAUTHORIZED: &str = "fleet.content.unauthorized";
+
+/// The status count of content requests this holder answered (an offer's missing set or acknowledgement, a chunk's
+/// progress, a fetch's archive or piece).
+pub(crate) const CONTENT_ANSWERED: &str = "fleet.content.answered";
+
+/// The status count of content requests the access rule allowed but this holder answered empty: malformed,
+/// unverifiable, past its capacity, refused by its retention rule, unstaged or unheld.
+pub(crate) const CONTENT_ANSWERED_EMPTY: &str = "fleet.content.answered_empty";
+
 /// The status count under which a holder records a put it held but could not publish into its shard's
 /// recovery image, and so did not acknowledge (AUD-29-59).
 /// Format: a refusal name in the daemon's status report, alongside the verbs' refusal kinds.
 pub(crate) const CONTENT_UNPUBLISHED: &str = "fleet.content.unpublished";
+
+/// One held register as a recovery image keeps it (§4.8 "persistence before reply"): the owner and configuration
+/// generation it serves under, the epoch its fence has seen, and every position it accepted.
+#[derive(Clone, Debug, PartialEq, Eq, Wire)]
+struct HeldRegister {
+  object: [u8; 16],
+  owner: u64,
+  generation: u64,
+  promised: u64,
+  accepted: Vec<HeldPosition>,
+}
+
+/// One accepted position of a held register.
+#[derive(Clone, Debug, PartialEq, Eq, Wire)]
+struct HeldPosition {
+  object: [u8; 16],
+  sequence: u64,
+  epoch: u64,
+  value: Vec<u8>,
+}
+
+/// What a holder keeps for other owners in its shard's recovery image: the content it holds (`ContentHold`'s own
+/// image, AUD-29-59) and the register records it acknowledged, each with its fence. A warm restart keeps the member
+/// id, so both must survive it: an acknowledged record a restarted holder no longer had would let its takeover
+/// promise count toward `f + 1` without it (Vertical Paxos II's acceptor; Raft, Figure 2: persistent state before
+/// responding).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Wire)]
+struct HeldImage {
+  content: Vec<u8>,
+  registers: Vec<HeldRegister>,
+  /// The mirror records this node holds for another region's owners (`crate::mirror`), each an encoded record.
+  mirrored: Vec<Vec<u8>>,
+}
+
+/// The bytes of everything this shard holds for other owners, for its recovery image: empty when it holds nothing,
+/// so a laptop's image is unchanged.
+pub(crate) fn held_image(state: &ShardState) -> Vec<u8> {
+  let content = state.held_content.to_image();
+  if content.is_empty() && state.holder_records.is_empty() && state.mirror_records.is_empty() {
+    return Vec::new();
+  }
+  let registers = state
+    .holder_records
+    .iter()
+    .map(|(object, acceptor)| {
+      let (promised, accepted) = acceptor.persisted();
+      HeldRegister {
+        object: object.0,
+        owner: acceptor.owner().0,
+        generation: acceptor.generation(),
+        promised: promised.0,
+        accepted: accepted
+          .into_iter()
+          .map(|(object, sequence, epoch, value)| HeldPosition {
+            object: object.0,
+            sequence,
+            epoch: epoch.0,
+            value,
+          })
+          .collect(),
+      }
+    })
+    .collect();
+  let mirrored = state
+    .mirror_records
+    .iter()
+    .map(|(_, record)| record.encode())
+    .collect();
+  HeldImage {
+    content,
+    registers,
+    mirrored,
+  }
+  .to_bytes()
+}
+
+/// A recovered held image, split: the content hold's own image, and the held registers to rebuild.
+pub(crate) struct RecoveredHeld {
+  /// The content hold's image (`ContentHold::claim_image` reads it).
+  pub(crate) content: Vec<u8>,
+  registers: Vec<HeldRegister>,
+  mirrored: Vec<Vec<u8>>,
+}
+
+/// Splits a recovered held image. Empty bytes hold nothing; bytes that do not decode are refused, never read as
+/// nothing held: a holder that cannot restore what it acknowledged must not serve as though it had.
+pub(crate) fn split_held(bytes: &[u8]) -> Result<RecoveredHeld, slates_wire::WireError> {
+  if bytes.is_empty() {
+    return Ok(RecoveredHeld {
+      content: Vec::new(),
+      registers: Vec::new(),
+      mirrored: Vec::new(),
+    });
+  }
+  let image = HeldImage::from_bytes(bytes)?;
+  Ok(RecoveredHeld {
+    content: image.content,
+    registers: image.registers,
+    mirrored: image.mirrored,
+  })
+}
+
+/// Rebuilds the held registers of a recovered image as `local`, each with its fence and accepted positions
+/// (`Acceptor::recovered`); the count rebuilt.
+pub(crate) fn restore_held_registers(
+  state: &mut ShardState,
+  local: HostId,
+  held: RecoveredHeld,
+) -> usize {
+  let count = held.registers.len();
+  // The mirror records, each the newest of its object as it was published. One that does not decode, or that the
+  // register refuses, is counted: the image held it, and this holder no longer does.
+  for bytes in &held.mirrored {
+    let restored = slates_db::register::Record::decode(bytes)
+      .ok()
+      .is_some_and(|record| state.mirror_records.accept(record).is_ok());
+    if !restored {
+      state.count(MIRROR_RESTORE_REFUSED, 1);
+    }
+  }
+  for register in held.registers {
+    let accepted = register
+      .accepted
+      .into_iter()
+      .map(|position| {
+        (
+          ObjectId(position.object),
+          position.sequence,
+          HostEpoch(position.epoch),
+          position.value,
+        )
+      })
+      .collect();
+    let acceptor = Acceptor::recovered(
+      local,
+      Authority {
+        generation: register.generation,
+        owner: HostId(register.owner),
+      },
+      HostEpoch(register.promised),
+      accepted,
+    );
+    state
+      .holder_records
+      .insert(ObjectId(register.object), acceptor);
+  }
+  count
+}
+
+/// The status count of mirror records a recovered held image carried that could not be held again.
+/// Format: a refusal name in the daemon's status report.
+const MIRROR_RESTORE_REFUSED: &str = "fleet.mirror.restore_refused";

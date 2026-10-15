@@ -27,6 +27,12 @@ use slates_machine::{MachineError, MachineProfile, ProfileOptions};
 /// measured once per test process ([`machine_profile`]), so the budget is paid once.
 const PROBE_MS: u64 = 5;
 
+/// Shape: the most shards a server test asks for by name (`TEST_SHARDS`, `POOL_SHARDS`, the fleet's `TWO_SHARDS`). The
+/// key region is made for the larger of this and the profile's default, so a daemon a test starts with more shards than
+/// the machine's default still finds its keys. Before 2026-10-10 the region followed the default alone, and in a 1–2
+/// CPU container a 2-shard test daemon ran unsealed (128 keys held against 256 needed).
+const MOST_NAMED_TEST_SHARDS: u16 = 2;
+
 /// The machine profile a test binary's daemons derive from, measured once per process (§4.1).
 /// Production measures the machine once, at the anchor's boot, and derives every configuration from
 /// that one profile; the fixture keeps that shape. A helper that measured afresh for each daemon ran
@@ -34,11 +40,11 @@ const PROBE_MS: u64 = 5;
 /// the machine, or measured nothing and was refused `MeasurementTimeout`
 /// (`docs/bugs/2026-09-25-test-fixtures-measured-the-machine-beside-each-other.md`).
 ///
-/// It also makes the process's one key region (A-92, A-99), sized for the largest daemon this profile derives (its
-/// default shard count), before any daemon starts. Production runs one daemon per process, so its region is always its
-/// own; a test process runs many, and whichever started first sized the region for its own shards, so a later daemon
-/// with more shards found sealing unavailable depending on test order (2026-10-05: 512 slots held against 1024 needed,
-/// one run in three of the recovery suite).
+/// It also makes the process's one key region (A-92, A-99), sized for the largest daemon a test of this binary starts
+/// (the larger of the profile's default shard count and [`MOST_NAMED_TEST_SHARDS`]), before any daemon starts.
+/// Production runs one daemon per process, so its region is always its own; a test process runs many, and whichever
+/// started first sized the region for its own shards, so a later daemon with more shards found sealing unavailable
+/// depending on test order (2026-10-05: 512 slots held against 1024 needed, one run in three of the recovery suite).
 pub(crate) fn machine_profile() -> MachineProfile {
   static PROFILE: OnceLock<Result<MachineProfile, MachineError>> = OnceLock::new();
   PROFILE
@@ -48,7 +54,10 @@ pub(crate) fn machine_profile() -> MachineProfile {
         codecs: false,
         core_matrix: false,
       })?;
-      let largest = slates_server::config::DaemonConfig::derive(&profile, "key-region", None);
+      let default = slates_server::config::DaemonConfig::derive(&profile, "key-region", None);
+      let shards = default.runtime.shards.max(MOST_NAMED_TEST_SHARDS);
+      let largest =
+        slates_server::config::DaemonConfig::derive(&profile, "key-region", Some(shards));
       // A region the OS will not lock leaves sealing unavailable in every daemon alike, which they report.
       let _ = hyper_seal::lock_keys(largest.seal_key_slots);
       Ok(profile)

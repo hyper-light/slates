@@ -217,7 +217,7 @@ pub(crate) enum Verb {
     /// runtime to bind (§4.6 A-9).
     shared: bool,
   },
-  /// Print a network export path for the volume (`export ID [--read-only] [--subtree DIR]`; §4.6 "Kubernetes
+  /// Print a network export path for the volume (`export ID [--read-only] [--subtree DIR] [--uid UID]`; §4.6 "Kubernetes
   /// publication without privilege", AUD-29-75): the export's own attachment, and the path
   /// `/<name>@<attachment>.<token>` its mount capability authorizes — what a PersistentVolume names as its `nfs`
   /// path on a fleet node's RPC-with-TLS export. The attachment ends with `detach` or the volume's destroy.
@@ -228,6 +228,9 @@ pub(crate) enum Verb {
     read_only: bool,
     /// `--subtree DIR`: present only that directory of the volume (AUD-29-76).
     subtree: Option<String>,
+    /// `--uid UID`: serve only that Unix identity (§4.6 A-115); every other caller, root included, sees attributes
+    /// and nothing else, so no client cache of what UID read is served to another user.
+    uid: Option<u32>,
   },
   /// Unmount a loopback bridge mount at a path (`unmount PATH`).
   Unmount {
@@ -575,6 +578,7 @@ const VALUES: &[&str] = &[
   "--version",
   "--attachment",
   "--account",
+  "--uid",
 ];
 /// Every switch, across the verbs.
 const SWITCHES: &[&str] = &[
@@ -1306,20 +1310,28 @@ pub(crate) fn parse(arguments: &[String]) -> Result<Command, ParseError> {
     )),
     ["export", id] => {
       taken.only(&Spec {
-        values: &["--subtree"],
+        values: &["--subtree", "--uid"],
         switches: &["--read-only"],
       })?;
+      let uid = match taken.value("--uid") {
+        Some(text) => Some(text.parse::<u32>().map_err(|e| ParseError::BadValue {
+          what: "--uid",
+          reason: e.to_string(),
+        })?),
+        None => None,
+      };
       Ok(client(
         &taken,
         Verb::Export {
           volume: volume(id)?,
           read_only: taken.switch("--read-only"),
           subtree: taken.value("--subtree").map(str::to_owned),
+          uid,
         },
       ))
     }
     ["export", ..] => Err(ParseError::Missing(
-      "export ID [--read-only] [--subtree DIR]",
+      "export ID [--read-only] [--subtree DIR] [--uid UID]",
     )),
     ["unmount", path] => {
       taken.only(&NONE)?;
@@ -1720,6 +1732,15 @@ mod tests {
     };
     assert!(read_only);
     assert_eq!(subtree.as_deref(), Some("/data"));
+    // A-115: `--uid` binds the export to one identity; a value that is not a uid is refused, never guessed.
+    let Command::Client(request) = parse(&args(&format!("export {id} --uid 1000"))).unwrap() else {
+      panic!("export is a client request");
+    };
+    let Verb::Export { uid, .. } = request.verb else {
+      panic!("export parses to the export verb");
+    };
+    assert_eq!(uid, Some(1000));
+    assert!(parse(&args(&format!("export {id} --uid tester"))).is_err());
     assert!(parse(&args("export")).is_err(), "a volume is required");
     assert!(
       parse(&args(&format!("export {id} --shared"))).is_err(),

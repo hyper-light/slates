@@ -453,7 +453,7 @@ mod os {
   /// `MADV_REMOVE` frees a shared object's own pages (every mapping of it, the anchor's included, then reads a hole),
   /// `MADV_DONTNEED` a private mapping's. [`Discarded::Refused`] when the OS refused, the bytes then unchanged.
   #[cfg(all(target_os = "linux", not(miri)))]
-  pub(super) fn discard_slice(bytes: &mut [u8], shared: bool) -> Discarded {
+  pub(crate) fn discard_slice(bytes: &mut [u8], shared: bool) -> Discarded {
     let advice = if shared {
       rustix::mm::Advice::LinuxRemove
     } else {
@@ -472,7 +472,7 @@ mod os {
   /// `MADV_FREE_REUSABLE`): the footprint drops at once and the kernel may take them, after which they read zeros.
   /// The caller records the range and clears the mark with [`reuse_slice`] before handing it out.
   #[cfg(all(target_os = "macos", not(miri)))]
-  pub(super) fn discard_slice(bytes: &mut [u8], _shared: bool) -> Discarded {
+  pub(crate) fn discard_slice(bytes: &mut [u8], _shared: bool) -> Discarded {
     // SAFETY: `bytes` is a live, page-aligned run of whole pages of the region's own mapping, borrowed mutably for the
     // call, and unlocked; the advice changes how the kernel accounts and may reclaim those pages and nothing else, and
     // the bytes are zeros, which a reclaimed page also reads.
@@ -495,14 +495,14 @@ mod os {
     all(target_os = "linux", not(miri)),
     all(target_os = "macos", not(miri))
   )))]
-  pub(super) fn discard_slice(_bytes: &mut [u8], _shared: bool) -> Discarded {
+  pub(crate) fn discard_slice(_bytes: &mut [u8], _shared: bool) -> Discarded {
     Discarded::Refused
   }
 
   /// Clears the reusable mark from the pages of `bytes` (`MADV_FREE_REUSE`, A-110), so the kernel accounts and keeps
   /// them again; the OS's error code when it refuses.
   #[cfg(all(target_os = "macos", not(miri)))]
-  pub(super) fn reuse_slice(bytes: &mut [u8]) -> Result<(), Option<i32>> {
+  pub(crate) fn reuse_slice(bytes: &mut [u8]) -> Result<(), Option<i32>> {
     // SAFETY: `bytes` is a live run of whole pages of the region's own mapping, borrowed mutably for the call; the
     // advice only returns the pages to normal accounting, leaving every byte as it is.
     let refused = unsafe {
@@ -521,16 +521,16 @@ mod os {
 
   /// Nothing to clear where a discard leaves no mark.
   #[cfg(not(all(target_os = "macos", not(miri))))]
-  pub(super) fn reuse_slice(_bytes: &mut [u8]) -> Result<(), Option<i32>> {
+  pub(crate) fn reuse_slice(_bytes: &mut [u8]) -> Result<(), Option<i32>> {
     Ok(())
   }
 
   /// Whether a discard here leaves a mark the pages keep until cleared (macOS's reusable mark, A-110).
-  pub(super) const DISCARD_LEAVES_A_MARK: bool = cfg!(all(target_os = "macos", not(miri)));
+  pub(crate) const DISCARD_LEAVES_A_MARK: bool = cfg!(all(target_os = "macos", not(miri)));
 
   /// What a discard did to a range's pages.
   #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-  pub(super) enum Discarded {
+  pub(crate) enum Discarded {
     /// The OS took no page; the bytes are unchanged.
     Refused,
     /// The pages are a hole that reads zeros and costs nothing (Linux).
@@ -542,6 +542,8 @@ mod os {
   }
 }
 
+/// What the shared content object discards with too (A-117 on macOS): the same advice and its mark.
+pub(crate) use os::{DISCARD_LEAVES_A_MARK, Discarded, discard_slice, reuse_slice};
 #[cfg(unix)]
 pub(crate) use os::{lock_map, lock_map_range};
 
@@ -612,21 +614,21 @@ mod os {
 
   /// No page goes back here yet (`DiscardVirtualMemory` leaves the contents undefined, not zero, so it would still need
   /// the zeroing it saves; owed with a measurement): the caller keeps them.
-  pub(super) fn discard_slice(_bytes: &mut [u8], _shared: bool) -> Discarded {
+  pub(crate) fn discard_slice(_bytes: &mut [u8], _shared: bool) -> Discarded {
     Discarded::Refused
   }
 
   /// Nothing to clear where a discard leaves no mark.
-  pub(super) fn reuse_slice(_bytes: &mut [u8]) -> Result<(), Option<i32>> {
+  pub(crate) fn reuse_slice(_bytes: &mut [u8]) -> Result<(), Option<i32>> {
     Ok(())
   }
 
   /// Whether a discard here leaves a mark the pages keep until cleared: no page goes back on Windows yet.
-  pub(super) const DISCARD_LEAVES_A_MARK: bool = false;
+  pub(crate) const DISCARD_LEAVES_A_MARK: bool = false;
 
   /// What a discard did to a range's pages.
   #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-  pub(super) enum Discarded {
+  pub(crate) enum Discarded {
     /// The OS took no page; the bytes are unchanged.
     Refused,
     /// The pages are a hole that reads zeros and costs nothing.

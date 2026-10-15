@@ -278,7 +278,7 @@ async fn deadline_timer() {
     };
     // A refused sleep (the timer wheel full) still resolves now; the next turn sleeps again.
     let _ = slates_rt::futures::sleep(wait.max(1)).await;
-    let _ = state::with_state(resolve);
+    let _ = state::with_state_counted(resolve);
   }
 }
 

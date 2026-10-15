@@ -384,6 +384,8 @@ impl McpServer {
       "resources/read" => self.resource_read(&params),
       "prompts/list" => Ok(prompts_list()),
       "prompts/get" => prompt_get(&params),
+      "skills/list" => Ok(skills_list()),
+      "skills/get" => skills_get(&params),
       other => Err(McpError {
         code: code::METHOD_NOT_FOUND,
         message: format!("unknown method: {other}"),
@@ -927,9 +929,38 @@ fn initialize_result(params: &Value) -> Value {
   })
 }
 
-/// What this server offers, as both eras declare it: tools, resources (the skills) and prompts (the skills again).
+/// What this server offers, as both eras declare it: tools, resources (the skills) and prompts (the skills again), and
+/// the Skills extension (SEP-2640) with no settings: `skills/list` and `skills/get`, without `resources/directory/read`
+/// (each skill is one file, its manifest complete).
 fn capabilities() -> Value {
-  json!({ "tools": {}, "resources": {}, "prompts": {} })
+  json!({
+    "tools": {},
+    "resources": {},
+    "prompts": {},
+    "extensions": { SKILLS_EXTENSION: {} },
+  })
+}
+
+/// Format: the Skills extension's identifier (SEP-2640).
+const SKILLS_EXTENSION: &str = "io.modelcontextprotocol/skills";
+
+/// `skills/list` (SEP-2640): every skill's entry, in the fixed order, cacheable as the other lists are.
+fn skills_list() -> Value {
+  let skills: Vec<Value> = skills::SKILLS.iter().map(skills::Skill::entry).collect();
+  json!({ "skills": skills, "ttlMs": CACHE_TTL_MS, "cacheScope": "public" })
+}
+
+/// `skills/get` (SEP-2640): the entry of the skill `uri` names, refused as an unknown resource is.
+fn skills_get(params: &Value) -> Result<Value, McpError> {
+  let uri = params
+    .get("uri")
+    .and_then(Value::as_str)
+    .unwrap_or_default();
+  let skill = skills::by_uri(uri).ok_or_else(|| McpError {
+    code: code::INVALID_PARAMS,
+    message: format!("no skill at {uri}"),
+  })?;
+  Ok(json!({ "skill": skill.entry(), "ttlMs": CACHE_TTL_MS, "cacheScope": "public" }))
 }
 
 /// The `server/discover` result (MCP 2026-07-28): the modern versions this server speaks, its capabilities, and
@@ -1759,7 +1790,7 @@ pub fn outcome_json(o: &LandingOutcome) -> Value {
       "dirs": o.durability.dirs,
     },
     "degraded": o.degraded.iter().map(degradation_json).collect::<Vec<_>>(),
-    "ramp_depth": o.ramp_depth,
+    "barriers": o.barriers,
   })
 }
 
@@ -1952,6 +1983,41 @@ pub fn daemon_json(r: &DaemonReport, telemetry: &[TelemetryReport]) -> Value {
       "takeover": takeover_json(&r.fleet.takeover),
       "council": group_json(&r.fleet.council),
       "root": group_json(&r.fleet.root),
+      "detector": r.fleet.detector.iter().map(|peer| json!({
+        "peer": peer.peer,
+        "configured": peer.configured,
+        "suspicions": peer.suspicions,
+        "suspicion_allowance_milli": peer.suspicion_allowance_milli,
+        "condemnations": peer.condemnations,
+        "condemnation_allowance_milli": peer.condemnation_allowance_milli,
+        "judged_by": peer.judged_by,
+        "expected_ns": peer.expected_ns,
+        "margin_ns": peer.margin_ns,
+        "samples": peer.samples,
+        "mistake_milli": peer.mistake_milli,
+      })).collect::<Vec<_>>(),
+      "detector_granularity_ns": r.fleet.detector_granularity_ns,
+      "served_sessions": r.fleet.served_sessions.iter().map(|session| json!({
+        "peer": session.peer,
+        "congestion_window": session.congestion_window,
+        "smoothed_rtt_ns": session.smoothed_rtt_ns,
+        "pto_ns": session.pto_ns,
+        "spurious_losses": session.spurious_losses,
+        "persistent_collapses": session.persistent_collapses,
+        "bytes_consumed": session.bytes_consumed,
+        "path_mtu": session.path_mtu,
+      })).collect::<Vec<_>>(),
+      "sessions": r.fleet.sessions.iter().map(|session| json!({
+        "peer": session.peer,
+        "lent": session.lent,
+        "congestion_window": session.congestion_window,
+        "smoothed_rtt_ns": session.smoothed_rtt_ns,
+        "pto_ns": session.pto_ns,
+        "spurious_losses": session.spurious_losses,
+        "persistent_collapses": session.persistent_collapses,
+        "bytes_consumed": session.bytes_consumed,
+        "path_mtu": session.path_mtu,
+      })).collect::<Vec<_>>(),
     },
   })
 }
@@ -2029,6 +2095,7 @@ fn shard_json(s: &ShardReport, telemetry: Option<&TelemetryReport>) -> Value {
     "landings_awaiting_bound": s.landings_awaiting_bound,
     "landings_in_flight": s.landings_in_flight,
     "target_leases": s.target_leases,
+    "nfs_calls": s.nfs_calls,
     "telemetry": telemetry.map(telemetry_json),
   })
 }

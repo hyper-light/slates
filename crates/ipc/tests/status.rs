@@ -4,8 +4,8 @@
 
 use slates_ipc::IpcError;
 use slates_ipc::protocol::{
-  DaemonReport, FleetReport, GroupReport, Refusal, ReplyBody, RequestBody, RetirementReport,
-  TakeoverReport, encode_body,
+  DaemonReport, DetectorPeerReport, FleetReport, GroupReport, Refusal, ReplyBody, RequestBody,
+  RetirementReport, TakeoverReport, encode_body,
 };
 use slates_ipc::status::collect;
 
@@ -75,6 +75,45 @@ fn report() -> ReplyBody {
             unconfirmed: vec![67],
           }],
           members: 71,
+        },
+        detector: vec![DetectorPeerReport {
+          peer: 73,
+          configured: true,
+          suspicions: 79,
+          suspicion_allowance_milli: 83,
+          condemnations: 89,
+          condemnation_allowance_milli: 97,
+          judged_by: "provisional".to_owned(),
+          expected_ns: 139,
+          margin_ns: 149,
+          samples: 157,
+          mistake_milli: 163,
+          pool_misfit: true,
+          refused: "CorrelationUnmeasured".to_owned(),
+        }],
+        sessions: vec![slates_ipc::protocol::SessionReport {
+          peer: 101,
+          lent: true,
+          congestion_window: 103,
+          smoothed_rtt_ns: 107,
+          pto_ns: 109,
+          spurious_losses: 113,
+          persistent_collapses: 127,
+          bytes_consumed: 131,
+          path_mtu: 137,
+        }],
+        detector_granularity_ns: 151,
+        served_sessions: Vec::new(),
+        detector_pool: slates_ipc::protocol::DetectorPoolReport {
+          configured: true,
+          samples: 167,
+          refused: "Unavailable".to_owned(),
+          expected_ns: 173,
+          margin_ns: 179,
+        },
+        detector_relays: slates_ipc::protocol::DetectorRelayReport {
+          due_ns: 181,
+          stated: 191,
         },
       },
     }),

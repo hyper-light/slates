@@ -260,25 +260,80 @@ fn a_create_after_a_snapshot_copies_exactly_the_path_nodes() {
 /// AC-1.4: write amplification per mutation is bounded by one extent of content: a one-byte
 /// write into a three-page extent after a snapshot copies that extent (the buddy arena rounds
 /// it to the next power-of-two pages, four), never the whole file; a write into a fresh window
-/// takes one page.
+/// takes one page. The snapshot's version is sealed by the copy-up, which trims its four-page block
+/// to the three pages it holds (A-118), so the arena grows by the copy less that page.
 #[test]
 fn a_write_after_a_snapshot_copies_one_extent_or_takes_one_page() {
   let (mut store, mut vol, _, f) = deep_tree_snapshotted();
   let content_before = store.content.allocated_bytes();
+  let trimmed_before = store.content.trimmed_bytes();
   vol.write(&mut store, f, 0, b"!").unwrap();
+  let trimmed = usize::try_from(store.content.trimmed_bytes() - trimmed_before).unwrap();
   assert_eq!(
-    store.content.allocated_bytes() - content_before,
+    trimmed, PAGE,
+    "the sealed version gave back the page its block did not use"
+  );
+  assert_eq!(
+    store.content.allocated_bytes() - content_before + trimmed,
     (3 * PAGE).next_power_of_two(),
     "the window's extent is copied whole, in the buddy's power-of-two pages"
   );
   let far = u64::try_from(store.content.chunk_bytes()).unwrap() * 4;
   let content_before = store.content.allocated_bytes();
+  let trimmed_before = store.content.trimmed_bytes();
   vol.write(&mut store, f, far, b"!").unwrap();
+  // Leaving the first window seals it, which trims its block to the three pages it holds (A-118).
+  let trimmed = usize::try_from(store.content.trimmed_bytes() - trimmed_before).unwrap();
   assert_eq!(
-    store.content.allocated_bytes() - content_before,
+    store.content.allocated_bytes() + trimmed - content_before,
     PAGE,
     "a fresh window takes one page"
   );
+}
+
+/// AC-1.4 (found 2026-10-09 profiling a 512 MiB overwrite over the macOS NFS mount: the busy shard spent 228 of its
+/// samples in 2 s reading back, and mostly decrypting, the windows each write replaced). Do: write three windows of a
+/// file, snapshot, overwrite the first two whole in one write from the file's start, then the third window's first
+/// half. Expect: the two covered windows open without reading their sealed extents and the half-covered one is read
+/// (the counter moves by exactly two); the head reads the new bytes and the third window's untouched tail; the
+/// snapshot still reads every old byte.
+#[test]
+fn a_write_covering_a_sealed_window_whole_replaces_it_unread_and_a_partial_one_keeps_its_tail() {
+  let mut store = store();
+  let mut vol = volume(&mut store, 1 << 26);
+  let root = vol.root();
+  let f = vol.create_file(&mut store, root, "f", 0o644).unwrap();
+  let chunk = store.content.chunk_bytes();
+  let old: Vec<u8> = (0..3 * chunk)
+    .map(|at| u8::try_from(at % 251).unwrap())
+    .collect();
+  vol.write(&mut store, f, 0, &old).unwrap();
+  let s = vol.snapshot(&mut store).unwrap();
+  let replaced_before = store.content.replaced_unread();
+  let covering = vec![0xA5u8; 2 * chunk];
+  vol.write(&mut store, f, 0, &covering).unwrap();
+  let half = vec![0x5Au8; chunk / 2];
+  let third = u64::try_from(2 * chunk).unwrap();
+  vol.write(&mut store, f, third, &half).unwrap();
+  assert_eq!(
+    store.content.replaced_unread() - replaced_before,
+    2,
+    "the two covered windows were replaced unread; the half-covered one was read"
+  );
+  let mut expected = covering.clone();
+  expected.extend_from_slice(&half);
+  expected.extend_from_slice(&old[2 * chunk + chunk / 2..]);
+  let mut head = vec![0u8; 3 * chunk];
+  let read = vol.read(&store, f, 0, &mut head).unwrap();
+  assert_eq!(read, 3 * chunk);
+  assert!(
+    head == expected,
+    "the head reads the new bytes and the third window's old tail"
+  );
+  let mut snapshot = vec![0u8; 3 * chunk];
+  let read = vol.read_in(&store, s, f, 0, &mut snapshot).unwrap();
+  assert_eq!(read, 3 * chunk);
+  assert!(snapshot == old, "the snapshot still reads every old byte");
 }
 
 /// AC-1.6: inode numbers are never reused within a volume and survive snapshot and clone.

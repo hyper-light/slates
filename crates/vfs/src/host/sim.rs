@@ -6,11 +6,11 @@
 //! Exchange changes both inodes' ctime (§4.15); the Linux tmpfs kill/restart test exposed
 //! the earlier simulation's missing metadata effect (2026-09-20 landing exchange record).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use super::{
-  BaseEntry, Hint, HostDir, HostError, HostFacts, HostFile, HostFs, HostKind, LandCapabilities,
-  LandFs, WatchState,
+  Barrier, BaseEntry, Hint, HostDir, HostError, HostFacts, HostFile, HostFs, HostKind,
+  LandCapabilities, LandFs, WatchState,
 };
 use crate::inode::Fingerprint;
 
@@ -109,10 +109,24 @@ pub struct SimHost {
   exchange_supported: bool,
   /// Whether it offers unnamed temporaries.
   unnamed_temporaries: bool,
-  /// Directories synced since the last drain, by handle.
-  synced_dirs: Vec<u64>,
-  /// Files synced since the last drain.
-  synced_files: Vec<u64>,
+  /// The directories (by path) whose entries changed since their last `sync_dir`: what a power loss could take from
+  /// their namespace ([`SimHost::unsynced_dir`]).
+  unsynced_dirs: BTreeSet<Vec<Box<str>>>,
+  /// The landing temporaries (by inode) whose bytes, mode or modification time changed since their last write-out: what
+  /// a power loss could take from them. A temporary is dirty from its creation.
+  dirty_temps: BTreeSet<u64>,
+  /// The landing temporaries (by inode) written out since their last change and not yet behind a barrier: still what a
+  /// power loss could take, until a barrier that names them returns (the seam's contract, the strictest of its
+  /// platforms: macOS orders a write-out only by the barrier after it).
+  written_out: BTreeSet<u64>,
+  /// The temporaries (by inode) a barrier now running away from the host found written out when it was taken (A-132):
+  /// when its outcome comes back, those still written out — unchanged since — are durable, and nothing else is, however
+  /// it was written out meanwhile.
+  barrier_covers: BTreeSet<u64>,
+  /// Every name a landing temporary became visible under, other than a hidden landing name, while it was not yet
+  /// durable ([`SimHost::visible_before_durable`]): a power loss then could leave that name holding bytes or a mode the
+  /// landing never wrote (§4.15 step 8: an entry is placed only after the barrier that covers it).
+  visible_unsynced: Vec<String>,
   /// Every seam call so far, read or write, for proportionality checks (AC-1.14).
   calls: u64,
   /// Outsider edits armed for later seam calls ([`SimHost::interfere_at_call`]): the call count each fires
@@ -133,10 +147,28 @@ pub enum SimVerb {
   SyncDir,
   /// `sync_media`, by the directory's path.
   SyncMedia,
-  /// `sync_file`, by no path (every file matches an empty prefix).
-  SyncFile,
+  /// `write_out`, by no path (every file matches an empty prefix).
+  WriteOut,
+  /// `begin_barrier`, by no path (every batch matches an empty prefix): the barrier refused as it is taken.
+  Barrier,
+  /// A barrier's run, by no path: refused while it runs away from the host (an `fdatasync` the device fails, A-132).
+  BarrierRun,
   /// `unlink`, by the entry's path.
   Unlink,
+  /// `open_file`, by the file's path: a read the host refuses (an I/O error on the disk the volume overlays).
+  OpenFile,
+}
+
+/// A barrier the simulated host took (A-132): running it changes nothing — the host applies its durability when the
+/// outcome comes back ([`LandFs::end_barrier`]) — and it fails when a test armed [`SimVerb::BarrierRun`].
+struct SimBarrier {
+  refusal: Option<HostError>,
+}
+
+impl Barrier for SimBarrier {
+  fn run(self: Box<Self>) -> Result<(), HostError> {
+    self.refusal.map_or(Ok(()), Err)
+  }
 }
 
 /// An armed failure: the next `times` calls of `verb` whose path starts with `prefix` answer `error`.
@@ -208,8 +240,11 @@ impl SimHost {
       crashed: false,
       exchange_supported: true,
       unnamed_temporaries: true,
-      synced_dirs: Vec::new(),
-      synced_files: Vec::new(),
+      unsynced_dirs: BTreeSet::new(),
+      dirty_temps: BTreeSet::new(),
+      written_out: BTreeSet::new(),
+      barrier_covers: BTreeSet::new(),
+      visible_unsynced: Vec::new(),
       calls: 0,
       armed: Vec::new(),
       interfered: Vec::new(),
@@ -327,20 +362,59 @@ impl SimHost {
     self.unnamed_temporaries = supported;
   }
 
-  /// The directory handles synced since the last call.
-  pub fn take_synced_dirs(&mut self) -> Vec<HostDir> {
-    std::mem::take(&mut self.synced_dirs)
-      .into_iter()
-      .map(HostDir)
-      .collect()
+  /// Whether the directory at `path` had an entry added, removed or renamed since its last `sync_dir` (or since it
+  /// was made): a power loss could still take that change. §4.15 step 9 advances an entry only once its directory,
+  /// and a rename's source directory, are synced.
+  pub fn unsynced_dir(&self, path: &str) -> bool {
+    let parts: Vec<Box<str>> = path
+      .split('/')
+      .filter(|part| !part.is_empty())
+      .map(Box::from)
+      .collect();
+    self.unsynced_dirs.contains(&parts)
   }
 
-  /// The file handles synced since the last call.
-  pub fn take_synced_files(&mut self) -> Vec<HostFile> {
-    std::mem::take(&mut self.synced_files)
-      .into_iter()
-      .map(HostFile)
-      .collect()
+  /// Every name a landing temporary was made visible under while its bytes, mode or modification time were not yet
+  /// durable: empty when every placement came after a write-out and then a barrier that covered the file, as §4.15
+  /// step 8 orders. Hidden landing names (`.slates-…`) do not count; a temporary may sit under one undurable.
+  pub fn visible_before_durable(&self) -> &[String] {
+    &self.visible_unsynced
+  }
+
+  /// A landing temporary's bytes, mode or modification time changed: dirty again until its next write-out.
+  fn temp_changed(&mut self, ino: u64) {
+    self.written_out.remove(&ino);
+    self.barrier_covers.remove(&ino);
+    self.dirty_temps.insert(ino);
+  }
+
+  /// The inode of an open landing temporary; `None` for another open file; `StaleHandle` for no open file.
+  fn temp_ino(&self, file: HostFile) -> Result<Option<u64>, HostError> {
+    match self.opens.get(&file.0) {
+      Some(Open::Temp { node, .. }) => Ok(Some(node.ino)),
+      Some(_) => Ok(None),
+      None => Err(HostError::StaleHandle),
+    }
+  }
+
+  /// Records `parts` if the node now there is a landing temporary not yet durable (dirty, or written out and behind
+  /// no barrier) and the name is not a hidden landing name.
+  fn check_durable_before_visible(&mut self, parts: &[Box<str>]) {
+    /// Format: the prefix of every name a landing gives a temporary or a set-aside entry (`slates-land`'s
+    /// `HIDDEN_PREFIX`).
+    const HIDDEN_LANDING_PREFIX: &str = ".slates-";
+    let Some(name) = parts.last() else {
+      return;
+    };
+    if name.starts_with(HIDDEN_LANDING_PREFIX) {
+      return;
+    }
+    let undurable = self.node(parts).is_some_and(|node| {
+      self.dirty_temps.contains(&node.ino) || self.written_out.contains(&node.ino)
+    });
+    if undurable {
+      self.visible_unsynced.push(format!("/{}", parts.join("/")));
+    }
   }
 
   /// One write verb: refuses once the crash point is reached.
@@ -444,11 +518,14 @@ impl SimHost {
       parent.mtime_ns = now;
       parent.ctime_ns = now;
     }
-    self.hint_for(parts);
+    self.unsynced_dirs.insert(parts.to_vec());
+    self.hint_for(parts, None);
   }
 
-  /// A hint for the watched directory at or above `parts`.
-  fn hint_for(&mut self, parts: &[Box<str>]) {
+  /// A hint for the watched directory at or above `parts`: naming `entry` when the change was to it alone (an in-place
+  /// write, as inotify's `IN_MODIFY` names it), else the directory (a namespace change; inotify would name the entry
+  /// too, so the simulation recalls more widely than the real watcher, never less).
+  fn hint_for(&mut self, parts: &[Box<str>], entry: Option<&str>) {
     if self.watch_state != WatchState::Live {
       return;
     }
@@ -462,7 +539,10 @@ impl SimHost {
       .collect();
     for (h, p) in watched {
       if p.as_slice() == parts {
-        self.hints.push(Hint::Changed(HostDir(h)));
+        self.hints.push(match entry {
+          Some(name) => Hint::Entry(HostDir(h), name.into()),
+          None => Hint::Changed(HostDir(h)),
+        });
       }
     }
   }
@@ -522,11 +602,11 @@ impl SimHost {
       n.mtime_ns = now;
       n.ctime_ns = now;
     }
-    let parent = parts
+    let (name, parent) = parts
       .split_last()
-      .map(|(_, parent)| parent.to_vec())
+      .map(|(name, parent)| (Some(name.clone()), parent.to_vec()))
       .unwrap_or_default();
-    self.hint_for(&parent);
+    self.hint_for(&parent, name.as_deref());
   }
 
   /// Creates a symlink.
@@ -719,6 +799,7 @@ impl HostFs for SimHost {
     self.tick();
     let mut parts = self.dir_parts(dir)?;
     parts.push(name.into());
+    self.fault(SimVerb::OpenFile, &format!("/{}", parts.join("/")))?;
     let node = match self.node(&parts) {
       Some(n) if n.kind == HostKind::File => n.clone(),
       Some(_) => return Err(HostError::NotFile),
@@ -874,6 +955,7 @@ impl LandFs for SimHost {
     self.write_step()?;
     let parts = self.dir_parts(dir)?;
     let node = self.fresh(HostKind::File);
+    self.temp_changed(node.ino);
     let h = self.next_handle;
     self.next_handle = self.next_handle.saturating_add(1);
     if self.unnamed_temporaries {
@@ -913,6 +995,7 @@ impl LandFs for SimHost {
       Some(Open::File { .. }) => return Err(HostError::Unavailable(SIM_EINVAL)),
       _ => return Err(HostError::StaleHandle),
     };
+    self.temp_changed(node_ino);
     // A named temporary's bytes live in the tree too.
     if let Some(parts) = placed
       && let Some(n) = self.node_mut(&parts)
@@ -924,13 +1007,48 @@ impl LandFs for SimHost {
     Ok(())
   }
 
-  fn sync_file(&mut self, file: HostFile) -> Result<(), HostError> {
+  fn write_out(&mut self, file: HostFile) -> Result<(), HostError> {
     self.write_step()?;
-    self.fault(SimVerb::SyncFile, "")?;
-    if !self.opens.contains_key(&file.0) {
-      return Err(HostError::StaleHandle);
+    self.fault(SimVerb::WriteOut, "")?;
+    if let Some(ino) = self.temp_ino(file)?
+      && self.dirty_temps.remove(&ino)
+    {
+      self.written_out.insert(ino);
     }
-    self.synced_files.push(file.0);
+    Ok(())
+  }
+
+  fn begin_barrier(&mut self, files: &[HostFile]) -> Result<Box<dyn Barrier>, HostError> {
+    self.write_step()?;
+    self.fault(SimVerb::Barrier, "")?;
+    let mut covers = BTreeSet::new();
+    for file in files {
+      // Only a file written out since its last change is covered: a dirty one stays dirty.
+      covers.extend(
+        self
+          .temp_ino(*file)?
+          .filter(|ino| self.written_out.contains(ino)),
+      );
+    }
+    self.barrier_covers = covers;
+    let refusal = self.fault(SimVerb::BarrierRun, "").err();
+    Ok(Box::new(SimBarrier { refusal }))
+  }
+
+  fn end_barrier(
+    &mut self,
+    files: &[HostFile],
+    ran: Result<(), HostError>,
+  ) -> Result<(), HostError> {
+    let covers = std::mem::take(&mut self.barrier_covers);
+    ran?;
+    for file in files {
+      if let Some(ino) = self.temp_ino(*file)?
+        && covers.contains(&ino)
+      {
+        self.written_out.remove(&ino);
+      }
+    }
     Ok(())
   }
 
@@ -943,6 +1061,7 @@ impl LandFs for SimHost {
         node.ctime_ns = now;
         let placed = placed.clone();
         let ino = node.ino;
+        self.temp_changed(ino);
         if let Some(parts) = placed
           && let Some(n) = self.node_mut(&parts)
           && n.ino == ino
@@ -970,6 +1089,7 @@ impl LandFs for SimHost {
         node.mtime_ns = mtime_ns;
         let placed = placed.clone();
         let ino = node.ino;
+        self.temp_changed(ino);
         if let Some(parts) = placed
           && let Some(n) = self.node_mut(&parts)
           && n.ino == ino
@@ -1002,22 +1122,39 @@ impl LandFs for SimHost {
       // Placed at the name it was created with: nothing to do.
       return Ok(());
     }
-    // A named temporary gains a second link at `name` (the current bytes, same inode); an
-    // unnamed one is linked for the first time. An existing name refuses, as `linkat` does.
+    // An existing name refuses, as the rename that never replaces and `linkat` do.
+    if self
+      .node(&parts)
+      .is_some_and(|p| p.children.contains_key(name))
+    {
+      return Err(HostError::Unavailable(SIM_EEXIST));
+    }
+    // A named temporary moves to `name` (the same inode, its one name after; the move changes its ctime, as a rename
+    // does); an unnamed one is linked for the first time.
     let node = match already {
-      Some(path) => self.node(&path).cloned().ok_or(HostError::StaleHandle)?,
+      Some(path) => {
+        let moved = self.node(&path).cloned().ok_or(HostError::StaleHandle)?;
+        let (old_parent, old_name) = path.split_at(path.len().saturating_sub(1));
+        if let (Some(p), Some(old_name)) = (self.node_mut(old_parent), old_name.first()) {
+          p.children.remove(old_name);
+        }
+        let old_parent = old_parent.to_vec();
+        self.touch_parent(&old_parent);
+        SimNode {
+          ctime_ns: self.now_ns,
+          ..moved
+        }
+      }
       None => node,
     };
     if let Some(p) = self.node_mut(&parts) {
-      if p.children.contains_key(name) {
-        return Err(HostError::Unavailable(SIM_EEXIST));
-      }
       p.children.insert(name.into(), node);
     }
     if let Some(Open::Temp { placed: slot, .. }) = self.opens.get_mut(&file.0) {
-      *slot = Some(placed);
+      *slot = Some(placed.clone());
     }
     self.touch_parent(&parts);
+    self.check_durable_before_visible(&placed);
     Ok(())
   }
 
@@ -1040,6 +1177,11 @@ impl LandFs for SimHost {
     p.children.insert(a.into(), nb);
     p.children.insert(b.into(), na);
     self.touch_parent(&parts);
+    for name in [a, b] {
+      let mut named = parts.clone();
+      named.push(name.into());
+      self.check_durable_before_visible(&named);
+    }
     Ok(())
   }
 
@@ -1069,6 +1211,7 @@ impl LandFs for SimHost {
     if let Some(moved) = self.node_mut(&t) {
       moved.ctime_ns = now;
     }
+    self.check_durable_before_visible(&t);
     Ok(())
   }
 
@@ -1138,7 +1281,6 @@ impl LandFs for SimHost {
     self.write_step()?;
     let parts = self.dir_parts(dir)?;
     self.fault(SimVerb::SyncMedia, &format!("/{}", parts.join("/")))?;
-    self.synced_dirs.push(dir.0);
     Ok(())
   }
 
@@ -1146,7 +1288,7 @@ impl LandFs for SimHost {
     self.write_step()?;
     let parts = self.dir_parts(dir)?;
     self.fault(SimVerb::SyncDir, &format!("/{}", parts.join("/")))?;
-    self.synced_dirs.push(dir.0);
+    self.unsynced_dirs.remove(&parts);
     Ok(())
   }
 }

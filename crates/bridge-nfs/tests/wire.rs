@@ -3,8 +3,10 @@
 //! stream is `Incomplete` (not an error), an oversized record is refused, a call header parses, and
 //! a reply builds to the exact bytes the kernel expects. All pure, every host — no socket, no mount.
 
+use proptest::prelude::*;
 use slates_bridge_nfs::rpc::{
-  AcceptStatus, RpcError, parse_call, read_record, reply_bytes, write_record,
+  AcceptStatus, RpcError, finish_success_record, parse_call, read_record, reply_bytes,
+  reply_record, success_record_head, write_record,
 };
 use slates_bridge_nfs::xdr::{XdrError, XdrReader, XdrWriter};
 
@@ -110,9 +112,9 @@ fn rpc_oversized_record_is_refused() {
 /// framing budget even though they add no payload. A maximum-size byte-fragmented record fits.
 #[test]
 fn rpc_empty_fragments_cannot_extend_a_record_without_limit() {
-  // The published server message limit is 2 MiB. Allow one marker per payload byte and a terminal
+  // The published server message limit is `MAX_MESSAGE`. Allow one marker per payload byte and a terminal
   // marker; one further marker must be refused even when no payload has arrived.
-  let payload_limit = 2 * 1024 * 1024;
+  let payload_limit = slates_bridge_nfs::rpc::MAX_MESSAGE;
   let markers = vec![0; (payload_limit + 2) * size_of::<u32>()];
   assert_eq!(read_record(&markers), Err(RpcError::RecordTooLarge));
 }
@@ -122,7 +124,7 @@ fn rpc_empty_fragments_cannot_extend_a_record_without_limit() {
 #[test]
 fn rpc_incremental_records_preserve_maximal_fragmentation_and_stream_boundaries() {
   use slates_bridge_nfs::rpc::RecordReader;
-  let payload = vec![42; 2 * 1024 * 1024];
+  let payload = vec![42; slates_bridge_nfs::rpc::MAX_MESSAGE];
   let mut wire = Vec::new();
   for byte in &payload {
     wire.extend_from_slice(&1u32.to_be_bytes());
@@ -155,7 +157,7 @@ fn rpc_incremental_records_preserve_maximal_fragmentation_and_stream_boundaries(
 fn rpc_fragment_budget_survives_tcp_read_boundaries() {
   use slates_bridge_nfs::rpc::RecordReader;
   let mut reader = RecordReader::default();
-  let fragments = 2 * 1024 * 1024 + 1;
+  let fragments = slates_bridge_nfs::rpc::MAX_MESSAGE + 1;
   for _ in 0..fragments {
     assert_eq!(reader.read(&[0; 4]), Ok((None, 4)));
   }
@@ -235,4 +237,52 @@ fn rpc_prog_mismatch_reply_carries_the_range() {
   assert_eq!(r.u32().unwrap(), 3); // low
   assert_eq!(r.u32().unwrap(), 3); // high
   assert_eq!(r.remaining(), 0, "no results on a mismatch");
+}
+
+/// Every accept status, a mismatch with any version range.
+#[allow(clippy::disallowed_types)] // proptest's `prop_oneof!` holds its arms in an `Arc` (D-8's test-harness exception).
+fn accept_status() -> impl Strategy<Value = AcceptStatus> {
+  prop_oneof![
+    Just(AcceptStatus::Success),
+    Just(AcceptStatus::ProgUnavail),
+    (any::<u32>(), any::<u32>()).prop_map(|(low, high)| AcceptStatus::ProgMismatch { low, high }),
+    Just(AcceptStatus::ProcUnavail),
+    Just(AcceptStatus::GarbageArgs),
+    Just(AcceptStatus::SystemErr),
+  ]
+}
+
+proptest! {
+  #![proptest_config(slates_test_seeds::unseeded(ProptestConfig { cases: 2000, .. ProptestConfig::default() }))]
+
+  /// A reply built as its own record is the reply framed (2026-10-09: the server builds READ replies this way to skip
+  /// two copies of their data). Do: build replies of every accept status with random xids and results, both ways.
+  /// Expect: `reply_record` is byte for byte `write_record(&reply_bytes(..))`.
+  #[test]
+  fn a_reply_built_as_a_record_is_the_reply_framed(
+    xid in any::<u32>(),
+    status in accept_status(),
+    results in prop::collection::vec(any::<u8>(), 0..512),
+  ) {
+    prop_assert_eq!(
+      reply_record(xid, status, &results),
+      write_record(&reply_bytes(xid, status, &results))
+    );
+  }
+
+  /// A successful reply encoded after reserved room is framed in place (2026-10-09: the server frames NFSv4 replies
+  /// this way, never copying a READ's data to frame it). Do: append random results to `success_record_head` and frame
+  /// it with `finish_success_record`. Expect: byte for byte `reply_record(xid, Success, results)`.
+  #[test]
+  fn a_reply_framed_in_place_is_the_reply_framed(
+    xid in any::<u32>(),
+    results in prop::collection::vec(any::<u8>(), 0..512),
+  ) {
+    let mut record = success_record_head();
+    record.extend_from_slice(&results);
+    prop_assert_eq!(
+      finish_success_record(xid, record),
+      reply_record(xid, AcceptStatus::Success, &results)
+    );
+  }
 }

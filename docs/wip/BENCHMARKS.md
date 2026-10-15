@@ -2163,6 +2163,10 @@ activity, after the idle sweep, zero on free and A-101: over 60 s the daemon use
 core) and the anchor 0.00; `top -pid` reported 0.0% CPU, 0 idle wakeups and 0.0 power. The reap tick (1 s) with its
 sweep and the 10 Hz heartbeat cost nothing measurable at rest.
 
+Again on 2026-10-07 at `5ef66e4e` (after the streamed checkpoint, the copy-aside seal and the counted publish paths;
+`idle-cpu.sh`, 30 s windows, load average 6.4–8.0): idle with nothing mounted, daemon 0.07% of a core and anchor
+0.03%; with a volume mounted and idle, daemon 0.03% and anchor 0.00%. Unchanged at rest.
+
 Real workloads, rerun at 15:12–15:22 on HEAD (`realworld_chaos.sh`, `realworld_native.sh`): correct throughout (six
 SIGKILLs, clone tree hash `31a1f6f713d195f5`, the build runs, pip imports), but slow: cargo build 115–134 s on slates
 against 13.5 s on tmpfs, where the morning's record was 3.3 against 3.2. Bisected over Linux release builds of
@@ -2273,6 +2277,59 @@ Apple M5 Max, macOS's own NFS client, 2 shards, load average about 6.
   - With it, a READ is sized to the bytes the file has past its offset, not to the asked count, and the bridge reads
     into the reply's buffer directly (no zeroed buffer of the asked size, no second copy). At 256 KiB, five rounds in
     random order: a median of 119 ms against 124 ms for the walk.
+
+### An overlay of a real tree on Linux: read, change, plan (condition 5; 2026-10-08)
+
+Command: `docker run --rm --privileged -e SLATES=/target/esc/release/slates -v slates-linux-target:/target:ro -v
+"$PWD/docs/wip/bench/overlay":/o:ro rust:1.98.0 bash /o/overlay_diff.sh /usr/lib 3` (the Linux release build at HEAD
+plus A-121). The tree is copied into tmpfs, then each round runs on a fresh volume and fresh mounts. Each round
+creates the overlay (`--base`), then walks, cold-reads and warm-reads it through slates, through the kernel's own NFS
+server exporting the same tmpfs (the same NFSv4.2 client, its floor) and on the host. It then makes 10 appends,
+5 creates and 3 removals, and times `slates land` (the plan, presented, not granted) against `diff -rq` over a host copy
+given the same changes. Docker Desktop 6.12 kernel, Apple M5 Max, load average 13.7 from other sessions.
+/usr/lib: 5,863 files, 7,113 entries, 540.7 MB.
+
+| step | slates | kernel NFS server | host |
+|---|---|---|---|
+| create the overlay volume | 2 ms | — | — |
+| walk every entry | 157–268 ms | 135–158 ms | 4–5 ms |
+| cold read, every byte | 1,761–1,806 ms | 2,066–2,199 ms | 91–92 ms |
+| warm read | 672–734 ms | 1,344–1,580 ms | 90–99 ms |
+| change set after 18 changes | `land` plan 2–3 ms, exactly 10 replace / 5 create / 3 delete | — | `diff -rq` 371–389 ms: 11 differ, 5 + 3 only-in, 8 dangling links |
+
+- Before A-121 the same run (load 14) planned `symlink=657` besides the 18, one per untouched base symlink
+  (`docs/bugs/2026-10-08-base-symlinks-were-planned-as-changes.md`). Reads in that run: cold 1,398–1,544 ms against
+  1,438–1,666 ms for the kernel's server, warm 571–650 against 988–1,548.
+- Where the warm read goes: slates hands out read delegations, so its warm pass sends 1,560 opens against 5,863 for the
+  kernel's server. The client returns the delegations it cannot keep (`DELEGRETURN` 1,560), and no data READ is sent
+  while the page cache holds the tree. At load 27 (2026-10-08, one round) the page cache did not hold it, and both
+  servers re-read about 5,500 READs.
+- `diff -rq` is the less exact baseline: it follows a symlink alias to an appended file (11 differ for 10 appends)
+  and cannot compare a dangling link. The plan compares entries, not what they point to.
+- **Outsider edits, 2026-10-08** (the bench's outsider step; Linux: `overlay_diff.sh /usr/lib/python3.13 1`, 1,252
+  files; macOS: `overlay_mac.sh <release> crates/vfs <scratch>`, 79 files over macOS's NFSv3 client). An outsider
+  appends to a file the volume replaced and to one it never touched, after the client has read it:
+
+  | | Linux NFSv4.2 (delegations held) | macOS NFSv3 |
+  |---|---|---|
+  | untouched file's new bytes through the mount | 157 ms | 377–520 ms |
+  | replaced file | `(Modified)` drift; plan presents `ModifyModify` | same |
+  | recalls for the one untouched edit | asked 1, sent 1, answered 1 (A-122, A-123) | — (no delegations in v3) |
+
+  Before the day's fixes, the Linux edit was not seen after 5.2 s: 153 recalls asked, 152 unanswered.
+  On macOS over a tree with symlinks (`overlay_mac.sh <release at 07a50710> /usr/lib <scratch>`, 498 files, 29
+  symlinks), A-121 holds through macOS's own client:
+  - the plan was `create=5 delete=3 replace=9`, with no `symlink` entries; one pick was read-only, and its append
+    was refused alike through the mount and on the host copy;
+  - `diff -rq` printed 40 lines for the same changes;
+  - the outsider's edit was seen after 875 ms, and the replaced file was presented `ModifyModify`.
+  At `/usr/lib` scale (`overlay_diff.sh /usr/lib 3` at `0e4f378b`, 5,863 files, load spikes from other sessions):
+  - over the run, 13,244 delegations granted;
+  - the outsider step asked 1 recall, sent 1 and had it answered, and the new bytes read through the mount after
+    121 ms;
+  - the replaced file was presented `ModifyModify`;
+  - every round's plan was exact in 1–3 ms (`diff -rq` 333–479 ms);
+  - cold reads: slates 1.7–2.8 s, the kernel's server 1.7–6.5 s.
 
 ### The daemon under a container memory cap, and large writes over Linux's NFS client on loopback (conditions 11, 12; 2026-10-05)
 
@@ -2915,3 +2972,2443 @@ user (scratchpad `crash-inner.sh`).
   `volume stat` reported `referenced_bytes` 2,147,483,588 of the 2 GiB quota.
 - **Harness lessons:** the first versions ignored `os.write`'s short return near the quota and leaked a descriptor on
   a failed write. Both read as slates faults (a "mismatched" file, a wall of `EMFILE`), and neither was one.
+
+## macOS NFS: a daemon restart under the held connection (A-113, 2026-10-06)
+
+This Mac (M5 Max, Darwin 25.4), release binaries, the anchor with `--quick --shards 1` (A/B) or `--shards 2` (kills).
+
+**The restart, before and after.** Before, through the kernel mount: each `SIGKILL` of the daemon stalled the writer
+1,003–1,015 ms (six kills); four kills in quick succession stalled one call 4,006 ms. After, through one userspace NFS
+connection (`crates/cli/tests/nfs_held.rs`, `SLATES_TEST_CLI=1`, six kills inside bursts of 12 pipelined FILE_SYNC
+WRITEs): the longest time from a kill until the next request was answered was 126.1, 122.7 and 123.9 ms over three
+runs. That is the anchor's restart of the daemon; nothing reconnected.
+
+**Every request's new cost, A/B.** The held connection peeks each request, consumes it after its reply, and sends whole
+records. `8a18d90` (base) against the change (held), interleaved base, held, base, held, four rounds each, through the
+kernel mount `slates mount` makes (scratchpad `ab.sh`, `ab-work.py`: 500 files of create+write 4 KiB+close, open+read
+4 KiB+close, unlink; 200 × 256 KiB write+fsync). Load average 4.3–6.6.
+
+| Operation | base p50 | held p50 | base p99 | held p99 |
+|---|---|---|---|---|
+| create+write+close | 433, 442, 452, 446 µs | 438, 442, 457, 432 µs | 897, 840, 895, 887 µs | 849, 877, 1,010, 899 µs |
+| open+read+close | 31, 31, 31, 32 µs | 31, 32, 33, 33 µs | 54, 41, 86, 60 µs | 41, 42, 56, 56 µs |
+| unlink | 136, 131, 156, 141 µs | 135, 126, 143, 154 µs | 309, 290, 334, 285 µs | 641, 297, 316, 274 µs |
+| 256 KiB write+fsync | 528, 572, 597, 572 µs | 545, 542, 575, 550 µs | 909, 1,856, 1,673, 1,016 µs | 845, 854, 954, 956 µs |
+
+Medians are even (open+read+close perhaps 1 µs dearer: the discard is one more call). The 256 KiB write's p99 is
+tighter with the change, likely because each connection's buffers now hold two whole records where the default was
+128 KiB. The held unlink p99 of 641 µs did not repeat in three more rounds.
+
+**The anchor waits on the daemon's exit (same day).** The anchor's loop, since A-113, polled only its hold channel
+with a 100 ms pause as the timeout, so it learned of a dead daemon up to a whole pause late. It now polls the
+daemon's exit too: a pidfd on Linux, a kqueue `NOTE_EXIT` on macOS (`slates_ipc::exit_watch`).
+- macOS, `nfs_held` (six kills inside write bursts), the longest kill-to-answer: 122.7–128.7 ms before, 54.7–55.3 ms
+  after, in three runs each.
+- Linux, Docker, the npm install with kills (scratchpad `install.sh`; lodash, express, typescript, webpack,
+  @babel/core, eslint; 7,419 files): 4.5 s with no kills; 8.3 s with 12 kills before (about 320 ms a kill); 4.7 s with
+  7 kills after (about 30 ms a kill). Every run: `npm ls` clean, and pip's RECORD hashes for 3,606 files intact under
+  10–11 kills.
+
+**A client connecting during a restart (A-114, same day).** `slates status` started at the moment the daemon was
+killed: before, exit 3 after 1,013.8 and 1,016.3 ms (the claim wait); after, exit 0 in 14.5 ms on Linux and
+15.6–17.0 ms on macOS (`crates/cli/tests/held_rendezvous.rs`, six kills a run, the longest; a debug CLI). A trace
+of the restart, release build, macOS: the anchor restarts the daemon at +2 ms, the control loop runs at +6.6 ms, and
+the pending claim is accepted at +6.7 ms. For scale, a `slates` invocation costs 3.4 ms whether or not it reaches the
+daemon (`--help` 3.4 ms, `status` 3.5 ms, p50 of 20).
+
+## A restart's volume rebuild against the file count (2026-10-06)
+
+This Mac (M5 Max, Darwin 25.4). `cargo run --release -p slates-vfs --example recover_bench`: one volume of N 100-byte
+files in directories of 1,000, imaged, then claimed and rebuilt into a fresh store, best of 5 (all five shown by the
+bench). The daemon-level figure is `restart-big.sh` (scratchpad): a 50,000-file volume made through the macOS mount,
+unmounted, then the daemon killed three times under its anchor (`--quick --shards 2`), the recovering shard's start
+from its log.
+
+| Step | ns a file (10k / 50k / 200k) | Daemon, 50,000 files |
+|---|---|---|
+| Before | 366 / 400 / 392 | shard start 70–74 ms (rebuild 61 ms) |
+| The rebuild reuses the handles placing returned (no second trie walk) and a flat kind table | 325 / 326 / 344 | — |
+| Inodes placed through a leaf cursor (15 of 16 numbers share the last leaf; each set walked all 12 levels twice) | 191 / 204 / 223 | — |
+| Entries inserted in the tree's key order, and an append past the rightmost block leaves the full block full | 144 / 164 / 181 | shard start 45.8–46.4 ms |
+
+Directory blocks after the rebuild: 301 / 1,503 / 6,007, against 551 / 2,753 / 11,011 for the same volume built by
+creates in name order. That is 45% fewer page-sized blocks, about 20 MB less for 200,000 files. The split rule is
+PostgreSQL nbtree's rightmost-page split and SQLite's `balance_quick`. `set` also stopped allocating a path vector it
+never read, which every create paid.
+
+The daemon's remaining 46 ms is mostly the image decode and the block claims, which come before the rebuild; that is
+the next lever.
+
+**Then the image decode (same day).** A recovery found the committed checkpoint by checking both slots' CRCs, then
+found and read it again (`read_from`): four passes over the image, a zeroed span buffer each, and a copy. It now reads
+the frame each slot claims without its CRC, takes the newest, and copies and checks it once, falling back to the
+other only when that fails (the same slot checking both would choose). And a replayed delta binary-searches its
+directory's entries, each comparison stepping two folded-name iterators a character at a time: an exact name now
+compares as bytes and two ASCII names under folding as lowercased bytes (a property test holds `compare` and `same`
+to the folded forms on generated names, Unicode included; the dirtree's lookups take the same path).
+
+| `recover_bench`, 10k / 50k / 200k files | Before | After |
+|---|---|---|
+| checkpoint decode, ns a file | 102 / 105 / 111 | 64 / 64 / 64 |
+| journal replay as the daemon publishes (a delta a create), µs | 2,791 / 14,115 / 39,949 | 1,761 / 8,869 / 20,248 |
+
+Daemon, the 50,000-file macOS volume (100,101 inodes: each file's provenance attribute is an AppleDouble sidecar
+inode), load average 11: decode 20.9 → 11.6–12.9 ms, claims 2.6–3.1 ms, rebuild 19–22 ms (214 ns an inode, the
+bench's rate); the recovering shard starts in 38.6–44.3 ms, from 70–74 ms this morning.
+
+## macOS NFS: the 13 round trips of one create are the client's (2026-10-06, diagnosis)
+
+The same Mac, the release daemon (`--quick --shards 1`), the mount `slates mount` makes; 200 creates of a 100-byte
+file, client counts from `nfsstat -c` (scratchpad `rpc-count.sh`), and the server's own sequence for three creates
+(procedure, target handle, reply length; a temporary trace, not kept).
+
+Per create: GETATTR 4, LOOKUP 2, CREATE 2, WRITE 2, COMMIT 2, SETATTR 1. The order:
+
+| # | Call | Target | Why it is sent |
+|---|---|---|---|
+| 1 | LOOKUP `f` → NOENT | directory | `open(O_CREAT)` |
+| 2 | CREATE `f` | directory | |
+| 3 | LOOKUP `._f` → NOENT | directory | the provenance attribute's AppleDouble sidecar |
+| 4 | GETATTR | directory | revalidated before the sidecar's create |
+| 5 | CREATE `._f` | directory | |
+| 6 | GETATTR | sidecar | close-to-open, at its open |
+| 7–8 | WRITE, COMMIT | sidecar | the attribute's bytes, flushed at its close |
+| 9 | GETATTR | sidecar | close-to-open, at its close |
+| 10 | SETATTR | file | |
+| 11–12 | WRITE, COMMIT | file | the data, flushed at close |
+| 13 | GETATTR | file | close-to-open, at close |
+
+Every reply already carries the attributes a client could use instead: the failed LOOKUP the directory's (92 bytes),
+CREATE the handle, the object's attributes and the directory's before and after (276), WRITE before and after (136),
+COMMIT after (104). The GETATTRs are close-to-open revalidations, and macOS offers no way to turn them off: its mount
+flags (`<nfs/nfs.h>` `NFS_MFLAG_*`) have no `nocto`, and `mount_nfs(8)` only tunes the attribute-cache timeouts,
+which slates already sets to the finest nonzero value. The sidecar is how the macOS NFSv3 client stores extended
+attributes (NFSv3 has none). The server cannot remove a round trip of this create, only make each one cheaper. The
+remaining levers are outside the v3 server: a transport with extended attributes and delegations that the macOS
+client speaks.
+
+## The daemon's memory against a volume's file count: checkpoints streamed (2026-10-06)
+
+This Mac (M5 Max, Darwin 25.4). Scratchpad `mem-50k.sh`: the release daemon under its anchor (`--quick --shards 2`), a
+1 GiB volume mounted through the macOS NFS mount, 50,000 files of 100 bytes made in directories of 1,000 (100,101
+inodes with the AppleDouble sidecars), `footprint -p` of each process before and after.
+
+| | Daemon before files | Daemon after 50,000 files | Anchor |
+|---|---|---|---|
+| Before | 20 MB | 270, 307 MB | 2.4 MB |
+| Checkpoints streamed | 20 MB | 163 MB | 2.4 MB |
+| … and the buffer reserved at the expected size | 20 MB | 139, 141 MB | 2.4–2.5 MB |
+| … and streamed straight into the slot (no kept buffer) | 20 MB | 122, 122 MB | 2.4 MB |
+
+How it was found: `footprint -v` put the growth in `MALLOC_LARGE` (188 of 307 MB dirty, none reclaimable), and
+`malloc_zone_pressure_relief` returned nothing, so it was not freed-and-cached. A probe that built the same volume in
+one process grew 47 MB without publishing and 144 MB publishing as the daemon does, rising in steps at each
+checkpoint: +20, +28 and +43 MB at the checkpoints after 18,401, 29,157 and 46,199 files. Each checkpoint built the
+whole `VolumeImage` (every inode image, every directory's entries) and then its encoding, and the allocator kept each
+such high-water mark.
+
+The change: `Volume::encode_image` writes exactly the bytes `to_image().encode()` did, encoding each head inode as it
+is captured and dropping it; the server streams the shard image (`ShardImage::encode_start` … `encode_finish`) into
+one buffer the shard keeps, reserved at `Journal::expected_checkpoint_bytes`, and frames it with
+`Journal::checkpoint_encoded`. Two oracle tests hold the streamed bytes equal to the old encoding on volumes with a
+snapshot, a clone, an attribute, a hard link and an open orphan, and the streamed checkpoint recovers to the same shard
+image.
+
+What remained above the volume's own 47 MB was then mostly the kept buffer (one image's worth, reused) and the
+per-create delta path.
+
+**Streamed into the slot (later the same day).** `Journal::begin_checkpoint` returns a `StreamedImage` that writes the
+image into the free slot as it is encoded, through a 64 KiB stage the shard keeps (`STREAM_STAGE_BYTES`): the slot's
+old header is zeroed first and the new one written last, so a refused, crashed or abandoned stream never commits and
+the committed slot is never touched. Counts are written before their items (a trie visit counts the head's inodes; a
+volume that cannot be captured restarts the checkpoint without it, at most once per volume), so nothing is patched
+after it may already be in the slot. The release daemon (load average 8.7–9.5, the machine shared): 122 MB in both
+rounds. `cargo run --release -p slates-vfs --example create_heap` (50,000 files, one process, the allocator counting):
+
+| | Retained heap per file | Allocations per file | Reallocations per file |
+|---|---|---|---|
+| Before this day's allocation work | 1,897 B | 39.9 | 9.0 |
+| Dirty sets as sorted `Vec`s, the delta encoded in a kept scratch, one exact buffer per journalled path | 1,420 B | 30.9 | 0.006 |
+| The checkpoint streamed into its slot | 1,024 B | 30.9 | 0.003 |
+| Inode images and publications encoded from the store, never built | 1,024 B | 13.05 | 0.003 |
+| Attribute table sized to its entries; a write's epoch view inline; a create in a current directory records nothing | 936 B | 8.05 | 0.003 |
+| `BaseBody`'s never-read `descriptor` removed: `Inode` 184 → 168 B | 904 B | 8.05 | 0.003 |
+
+**Encoded from the store (later again).** A checkpoint built an `InodeImage` per inode and a delta one per changed
+inode, plus a `String` per entry, each copying the inline body, the attribute names and the entry names only to encode
+and drop them. `Volume::encode_inode` and `Volume::encode_publication` write the same bytes from the store (the inline
+and directory bodies and the attribute table field by field, the rarer bodies through their `BodyImage`; a directory's
+entries are gathered by reference and sorted, one allocation a directory). The derive now emits each enum variant's
+discriminant (`BodyImage::WIRE_TAG_INLINE`, `VolumeRecord::WIRE_TAG_DELTA`, …), so a field-by-field encoder cannot
+disagree with its variant order. Oracles: the model test's every generated step compares `encode_publication` with
+`publication().encode()` byte for byte (a mutation writing every entry as absent failed it at the first create), the
+streamed-checkpoint tests compare the image bytes, and `a_streamed_shard_delta_equals_the_shard_delta_and_recovers`
+the shard delta's. Checkpoint allocations per file 8.87 → 0.01, delta 9.00 → 0; the daemon after 50,000 macOS files
+122, 123 MB (unchanged: these were transient allocations, not retained bytes; load average 8.8–11.5).
+
+**Sized to what is held (later still).** `XattrTable` is a boxed slice with one slot per attribute and a non-zero
+word for the working copy: 24 bytes, not 40, and its entries 24 bytes for one attribute where a `Vec`'s first growth
+reserved four (96). `content_by_epoch` returns an inline view for a body of one part (`EpochContent`), where a `Vec`
+for every body was two allocations per write, the attribute's value write included. `need_current_dir` records only
+a directory it counts, so a create in a current directory allocates nothing there. Per phase: create 430.6 B and 2.0
+allocations, the write 128.7 B and 1.0 (its inline body), the attribute 373.8 B (was 461.8) and 5.0 (was 7.0).
+
+`BaseBody.descriptor` was written `None` at every construction and never read (held descriptors live in the base
+plane's `descriptors` map), yet its `Option<u64>` made every inode's `Body` 64 bytes: removed, `Body` 48 and `Inode`
+168. `tree_heap` (real trees, heap bytes per entry): npm 316 → 300, pip 352 → 336, cargo 402 → 386. Measured and not
+taken: `Body` reaches 32 bytes only with `lost` packed into `base_len`'s top bit (a rustc layout probe: 40 with a
+lazily boxed `pinned` alone), which every length write would then have to refuse at 2^63; 8 bytes an inode does not
+buy that risk to the overlay's sizes.
+
+Per phase after the streaming: create 430.6 B and 3.0 allocations, the 100-byte write 128.7 B and 3.0, the provenance attribute
+461.8 B and 7.0, a delta 0 B and 9.0, a checkpoint 2.6 B (was 398.9) and 8.9. Tests:
+`a_streamed_shard_checkpoint_equals_the_shard_image_and_recovers` (an image several stages long, framed byte for byte),
+`a_refused_or_abandoned_streamed_checkpoint_leaves_the_committed_one`, and the server's
+`a_streamed_checkpoint_restarts_without_a_volume_it_cannot_capture` (a 2,000-file volume streamed into the slot before
+an overlay without its host refuses; the committed image holds the first volume whole).
+
+## A read touches only the extents it overlaps (2026-10-06)
+
+This Mac (M5 Max, Darwin 25.4), release build. A throwaway A/B example (one volume, one file written in 1 MiB
+writes, 200,000 random 4 KiB reads, best of 5, all 5 shown) run in this tree and in a worktree at `5cfed78b`. The
+store's chunk is 64 KiB, so a 512 MiB file has 8,192 extents.
+
+| File | Before (ns per read, rounds) | After (ns per read, rounds) |
+|---|---|---|
+| 16 MiB | 953 (953 976 990 961 975) | 223 (254 241 241 223 269) |
+| 128 MiB | 5,624 (5881 5738 5786 6093 5624) | 383 (387 383 399 488 469) |
+| 512 MiB | 22,225 (22325 25068 22737 22245 22225) | 514 (553 514 546 584 571) |
+
+`read_body` and `read_in` resolved every extent's chunk and only then tested the overlap. `overlapping`
+binary-searches the extents, which every body keeps ascending and non-overlapping. Found while fixing
+`docs/bugs/2026-10-06-a-truncate-refused-partway-left-its-file-reading-zeros.md`: one unresolvable chunk anywhere
+in a file refused every read of it.
+
+## A write reconciles only the windows it can change (2026-10-06)
+
+Same machine and method as the read row above. A random 4 KiB overwrite recounted the file's every extent twice for
+the epoch histogram (`content_by_epoch` before and after), so it grew with the file. Before: 16.8 µs in a 16 MiB
+file, 39.2 µs at 128 MiB, 74.4 µs at 512 MiB. A write on a chunked body now reconciles only the windows it covers
+and the window of the extent open before it (`touched_windows`). Every extent begins at a window boundary and a
+window holds one, so nothing outside those windows changes. After, best of 5: 16.6 µs, 14.5 µs, 16.8 µs.
+
+The recorded command is `cargo run --release -p slates-vfs --example large_file_bench`. Its first run, at load
+average ~11:
+
+| File (extents) | Sequential µs/MiB | Read ns (rounds) | Overwrite ns (rounds) |
+|---|---|---|---|
+| 16 MiB (256) | 70 | 249 (255 283 261 249 268) | 24,554 (24754 25442 25420 24554 25085) |
+| 128 MiB (2,048) | 69 | 384 (396 384 421 464 437) | 11,998 (25218 25243 23412 11998 12926) |
+| 512 MiB (8,192) | 83 | 457 (528 507 457 463 491) | 18,345 (22277 26886 29905 29157 18345) |
+
+Oracle: `a_writes_accounting_equals_a_recount_after_every_step`. A seeded history of 300 overwrites and truncates
+runs on a six-window file; after every step, the live volume's referenced and unique bytes must equal those of a
+rebuild, which recounts from the bodies. A mutation that dropped the written windows failed it. Dropping only the
+open extent's window passes, because sealing keeps the extent's epoch and block when there is no cipher. That window
+is kept anyway: a seal under a cipher may move the block.
+
+## The KIND lane on the streamed-checkpoint build (2026-10-07)
+
+This Mac (M5 Max), Docker Desktop, kind, `cargo xtask kind all` at `3ba73241` (load average 8–10): the image built
+from the repository's Dockerfile, smoked, then on a three-pod chart install:
+
+| Step | Result |
+|---|---|
+| Install and formation | 3 replicas installed and formed in 7.5 s |
+| Placement | A volume's snapshot placed at `f + 1` across pods in 7.5 s |
+| Takeover | The owner's pod deleted (SIGKILL): `slates-0` took the volume over and served it placed 3.5 s after the delete, every byte of its 4 files |
+| Rejoin | The replacement pod rejoined with a fresh identity 3.7 s after deletion |
+| `wan` (80 ± 20 ms) | 18 samples over 183 s, 0 leader changes |
+| `wan-loss` (80 ± 20 ms, 1 % loss) | 18 samples over 183 s, 0 leader changes |
+| `ceiling` (350 ms) | formed in 4.8 s; 18 samples over 183 s, 0 leader changes |
+
+`cargo xtask kind export` (kubelet mounting a published volume as an `nfs` PersistentVolume over RPC-with-TLS)
+skipped loudly here: Docker Desktop's kernel has no TLS record layer (`CONFIG_TLS`). That leg runs in CI with
+`--require-kernel-tls`.
+
+#### The storm again on the streamed-checkpoint build (2026-10-07)
+
+Same command (`native.sh`), Linux release build at `462be77e`, load average 7.7–10.6:
+
+| workers | op | p50 | p99 | p999 | after A-89 p99 |
+|---|---|---|---|---|---|
+| 1 | create+write+close | 0.18 ms | 0.35 ms | 0.49 ms | 0.38 ms |
+| 1 | open+read+close | 24 µs | 80 µs | 117 µs | 0.17 ms |
+| 1 | stat | 30 µs | 84 µs | 179 µs | 54 µs |
+| 16 | create+write+close | 1.9 ms | 3.37 ms | 4.65 ms | 4.2 ms |
+| 16 | open+read+close | 0.79 ms | 3.39 ms | 20.3 ms | 3.1 ms |
+| 16 | stat | 0.12 ms | 1.63 ms | 3.21 ms | — |
+
+The daemon's own operation time (`nfs.local_p*_ns`, shard 0): p50 1.8–1.9 µs, p99 9.2–10.2 µs. The 2026-10-05 record
+had 0.49 ms.
+
+Open: one stat at one worker is now a round trip (p50 30 µs; the A-89 record's 2.3 µs was the client's attribute
+cache). mountstats counts exactly 1,117 GETATTRs for 2,000 stats on every run. A/B at one worker, two runs each,
+against the build before this day's changes (`43826f76`): stat p50 30.0 / 30.0 µs there and 30.1 / 30.1 µs here, the
+same 1,117 GETATTRs. So the change predates this day's work. Bisected the same day, one worker, same command:
+
+| Build | stat p50 | GETATTRs per 2,000 stats |
+|---|---|---|
+| A-89 itself (`76520d22`) | 34.1 µs | 1,117 |
+| `e3423db8~1` | 29.5 µs | 1,117 |
+| `e3423db8` (the v4 READDIR rewrite) | 33.0 µs | 1,117 |
+| `43826f76` | 30.0 µs | 1,117 |
+| `462be77e` | 30.1 µs | 1,117 |
+
+The commit that recorded 2.3 µs gives 34 µs today. So no slates change moved it: the environment did (Docker
+Desktop's LinuxKit kernel is 6.12.76-linuxkit now; its NFS client decides when a stat revalidates). 2,000 random
+draws over 2,000 files touch about 1,264 distinct files, near the 1,117 GETATTRs, which suggests the client
+revalidates a file's first stat after its close and serves later ones from its cache. The 2.3 µs row is a reading
+of the older client, not a floor this build lost.
+
+### Remote pulls under horrific networks: delay jitter collapses Copa (condition 7; 2026-10-07)
+
+`fetch_bench` gained harsh rows (reordering jitter via `SimPath::reordering`, in-order jitter, 10% loss) and two
+holder counters per row: spurious losses (declared lost, then acknowledged) and the smallest end congestion
+window. Release build, this Mac, simulated network and virtual clock.
+
+At 1,024 chunks (64 MiB):
+
+| Scenario | Result |
+|---|---|
+| 3 holders, 8 readers, 10% loss (80 ms) | completes, 15.2–21.5 s, 199.6 of 300 Mbit/s |
+| 250 ms, reordering ±60 ms, 5% loss, 3 holders | **not complete within 600 s** |
+| thin 10 Mbit/s, 200 ms, reordering ±40 ms, 2% loss | **not complete within 600 s** |
+
+The thin link's parts apart, at 16 chunks (1 MiB):
+
+| Thin link, 200 ms | Goodput | End window | Spurious losses |
+|---|---|---|---|
+| no impairment (`wan`, for scale, 80 ms 100 Mbit/s) | 20.9 Mbit/s | 749 KB | 0 |
+| 2% loss, in order | 5.1 Mbit/s | 361 KB | 0 |
+| jitter ±40 ms, kept in order, no loss | 1.5 Mbit/s | 24 KB | 0 |
+| jitter ±40 ms, reordering, no loss | 0.8 Mbit/s | 19.6 KB | 9 |
+| jitter ±40 ms, reordering, 2% loss | 0.6 Mbit/s | 17.1 KB | 15 |
+
+The cause is delay jitter, not loss and not mainly reordering:
+
+- Loss alone keeps a 361 KB window.
+- Jitter alone, with no reordering and no spurious loss, collapses it to 24 KB.
+- Copa in its default mode ignores loss (`on_loss` acts only in the competitive mode or on persistent congestion),
+  so an Eifel-style undo of spurious loss responses (RFC 4015) would not help; it was considered and is not the
+  fix.
+- Copa sizes its window from `standing RTT − minimum RTT`. With ±40 ms jitter the minimum locks onto the fast
+  tail while the standing RTT (a minimum over half a round trip) sees few samples once the window is small. The
+  spread is read as queue and the window shrinks further: a feedback loop.
+- Reordering on top doubles the cost through spurious retransmissions (the adaptive tolerance, `reorder.rs`,
+  bounds those).
+
+Owed: a jitter-robust delay signal, chosen from the literature and A/B'd on these rows plus the 57-scenario
+bake-off (which had no heavy jitter). Until then the two reordering rows fail at 64 MiB.
+
+#### The two-network topology's crossing on `congestion_bench` (2026-10-07)
+
+`cargo run --release -p slates-transport --example congestion_bench "wan jitter"` runs two rows added for the Docker
+topology's link (`docs/wip/bench/multiregion/run.sh`): 200 ms, ±40 ms reordering jitter, 3 % loss. Simulated
+network, virtual clock, seeds 1–3.
+
+| Row | Goodput (Mbit/s) | Capacity share (mean) | Steady ping p99 (mean) |
+|---|---|---|---|
+| 10 Mbit/s | 4.24, 3.57, 2.58 | 0.346 | 522 ms |
+| 100 Mbit/s | 5.21, 4.20, 4.08 | 0.045 | 513 ms |
+
+These are long-lived flows, after a 20-round-trip warm-up. A cross-region read on the real topology is short
+request/response exchanges, and there the session delivered 65–100 KB/s (`docs/bugs/2026-10-07-a-cross-region-read-took-one-wan-round-trip-per-window.md`).
+That matches `fetch_bench`'s short transfers above, not this steady state.
+
+#### Measured and rejected: a sample-count floor on Copa's standing RTT (2026-10-07)
+
+The idea: Copa's standing RTT spans `srtt/2`; let it span the last N samples when that is longer (N = RFC 9002's
+initial window, 10), so a small window's minimum is not of a handful of jittered samples (order statistics: N
+samples over a jitter width W have an expected minimum W/(N+1) above the floor).
+
+`fetch_bench`, thin link (10 Mbit/s, 200 ms):
+
+| Scenario | Before | With the floor |
+|---|---|---|
+| jitter ±40 ms in order, 1 MiB | 1.5 Mbit/s | 2.7 Mbit/s |
+| reordering + 2% loss, 1 MiB | 0.6 Mbit/s | 2.3 Mbit/s |
+| jitter ±40 ms in order, 8 MiB | — | 28.2 s at N = 10; 20.4 s at N = 32 |
+| reordering + 2% loss, 8 MiB | — | 55.8 s at N = 10; 23.5 s at N = 32 |
+
+`congestion_bench`, 56 scenarios against `HEAD`, deterministic:
+
+| Variant | Capacity share (geomean) | Ping p99 (geomean) | Wins | Losses |
+|---|---|---|---|---|
+| Floor alone | +0.45% | +1.2% | jitter row 0.534 → 0.706 share; 64 kbit/s at 100 ms | 64 kbit/s at 300 ms: p99 585 → 1,052 ms, share 0.912 → 0.847 |
+| Floor capped at one RTT | −0.2% | +2.9% | jitter row 0.534 → 0.694 | 64 kbit/s at 300 ms: share 0.912 → 0.751; 1 Mbit/s 1% loss: p99 137 → 192 ms |
+
+The floor swaps jitter tolerance for slow-link behaviour. On a slow link, N samples span seconds, the filter keeps a
+stale low minimum, under-reads the queue and over-sends. So it does not land. The owed design is the one the
+starvation result prescribes (Arun, Alizadeh, Balakrishnan, SIGCOMM 2022, §6): estimate the path's non-congestive
+jitter D and hold at least D of delay before reading it as queue. That would separate jitter from queue rather than
+widening a time window, and it must clear this grid with no loss before it lands.
+
+#### Measured and rejected: a delivered-BDP floor under Copa's window (2026-10-07)
+
+The idea (BBR's model, Cardwell et al., ACM Queue 2016): Copa's window never drops below `max delivery rate over 10
+round trips × RTTmin`, so jitter read as queue cannot shrink it below the path's bandwidth-delay product.
+
+`fetch_bench`, thin link (10 Mbit/s, 200 ms), 8 MiB:
+
+| Scenario | Completion |
+|---|---|
+| jitter ±40 ms in order | 11.7 s (5.7 Mbit/s; the sample floor's best was 20.4 s) |
+| 2% loss, in order | 7.9 s (unchanged) |
+| reordering ±40 ms, no loss | 67.9 s, 18 spurious losses |
+| reordering ±40 ms, 2% loss | 91.0 s, 123 spurious losses, end window 14.9 KB |
+
+`congestion_bench` against `HEAD`: capacity share +0.9% and ping p99 +0.8% by geomean.
+
+- Wins: 100 Mbit/s at 300 ms share 0.487 → 0.622; 100 Mbit/s at 20 ms with 5% loss, p99 81.9 → 61.6 ms.
+- Losses: the capacity step 10 → 2 → 10 Mbit/s, ping p99 160 → 500 ms (the floor remembers the old rate for 10
+  rounds and holds a queue, BBRv1's stickiness that BBRv2/v3 bound with loss-driven `inflight_hi`); 10 Mbit/s at
+  300 ms with 0.1% loss, p99 409 → 509 ms.
+- Under reordering the floor never forms: spurious retransmissions depress the measured delivery rate.
+
+It does not land. What the two experiments establish for the owed design:
+
+1. In-order jitter is solved by a bandwidth-model floor.
+2. The floor must give way on a capacity drop within a round trip or two, not ten (an `inflight_hi`-style bound,
+   BBRv3 draft-ietf-ccwg-bbr §5.5).
+3. Reordering needs its own fix: the spurious retransmissions themselves, which the adaptive reordering tolerance
+   (`reorder.rs`) still lets through at ±40 ms. That is RACK's reordering window growing too slowly for this
+   jitter.
+
+#### Measured and rejected: the floor with a two-round filter and a loss reset (2026-10-07)
+
+The variant: the delivered-BDP floor with BBRv3's two-round maximum (`MaxBwFilterLen`) instead of ten, and a loss
+while the floor binds restarting the filter from the last round's rate (BBRv3's loss-driven `inflight_hi`, in
+spirit).
+
+`congestion_bench` against `HEAD`: capacity share +0.9% and ping p99 −4.4% by geomean.
+
+- The step regression is gone: 10 → 2 → 10 Mbit/s ping p99 160 → 132 ms.
+- Burst loss: 326 → 119 ms. 100 Mbit/s at 300 ms: share 0.487 → 0.621.
+- Losses: 1 Mbit/s at 100 ms with 5% loss, p99 418 → 489 ms; 1 Mbit/s at 300 ms with 0.1% loss, 436 → 499 ms;
+  two-flow fairness share 0.510 → 0.481 (above the Jain floor).
+
+`fetch_bench`, thin link (10 Mbit/s, 200 ms), 8 MiB, against `HEAD` measured the same day:
+
+| Scenario | `HEAD` | Ten-round floor | Two-round floor + loss reset |
+|---|---|---|---|
+| jitter ±40 ms in order | 18.7 s | 11.7 s | 26.3 s |
+| reordering ±40 ms, no loss | 68.2 s | 67.9 s | 90.5 s |
+| reordering ±40 ms, 2% loss | 103.7 s | 91.0 s | 86.6 s |
+| 2% loss, in order | 7.9 s | 7.9 s | 7.9 s |
+
+It does not land. It improves the general grid but is slower than `HEAD` on two of the three jitter rows, the case it
+was for.
+
+The three experiments together:
+- A long memory of the path's rate gives jitter tolerance and holds stale queues on a capacity drop.
+- A short memory fixes the drop and gives the tolerance back.
+- The owed design must tell a capacity drop from jitter by a signal other than how long it remembers. Candidates
+  from the literature: a sustained RTT rise beyond the measured jitter band while the delivery rate falls (a drop),
+  as against RTT spread with a steady delivery rate (jitter).
+- The 1 MiB runs earlier in this record exaggerated the jitter collapse, since slow start dominates them. 8 MiB is
+  the honest size for these rows.
+
+#### The reordering rows are independent jitter (2026-10-07)
+
+`fetch_bench` now also reports the holders' persistent-congestion collapses (`Endpoint::persistent_collapses`). On
+the thin link with ±40 ms reordering and no loss, 8 MiB, there were 0 collapses, 15 spurious losses and an end window
+of 18.5 KB. So neither persistent congestion nor retransmission explains the 68 s.
+
+Likely reading (an interpretation of `sim.rs`'s path model, not separately measured): the simulator's in-order
+jitter clamps each datagram to arrive no earlier than the one before. Its delays therefore bunch together, and Copa
+sees little variance; with reordering each datagram's delay is drawn independently over the full band. The
+reordering rows are the true independent-jitter case, and their collapse is the delay ambiguity the starvation
+result proves, not a reordering defect: retransmissions are few. The owed design brief stands, sharpened: the delay
+signal must separate independent non-congestive jitter of tens of milliseconds from queueing, without a long memory
+of the path's rate, which the capacity-step row punishes.
+
+#### Measured and rejected: the ten-round floor with the loss reset (2026-10-07)
+
+The fourth combination, to separate the two effects variant three bundled: the ten-round filter (best for jitter)
+with the loss reset (credited with fixing the capacity step).
+
+| | Result |
+|---|---|
+| `congestion_bench` (geomean) | share +0.9%, ping p99 +5.0% |
+| Burst loss, p99 | 326 → 2,845 ms |
+| The 10 → 2 → 10 Mbit/s step, p99 | 160 → 500 ms, unchanged from the plain ten-round floor |
+| `fetch_bench` thin link, 8 MiB: jitter in order | 11.7 s (as the plain floor) |
+| reordering, no loss | 67.9 s |
+| reordering + 2% loss | 99.2 s |
+
+So the loss reset did not fix the step. Variant three's fix came from its two-round memory, and its reset rarely
+fires when the losses come, since the floor is not the binding limit then. The reset also leaves the window high
+through bursts.
+
+The map for the owed design, from the four:
+
+| Variant | Jitter in order | Capacity step | Grid p99 (geomean) |
+|---|---|---|---|
+| Sample floor | helps | regresses slow links | +1.2% |
+| Ten-round floor | 11.7 s, best | 500 ms | +0.8% |
+| Two-round floor + loss reset | 26.3 s, worse than `HEAD`'s 18.7 | 132 ms, fixed | −4.4% |
+| Ten-round floor + loss reset | 11.7 s | 500 ms | +5.0% |
+
+No floor fixes the independent-jitter (reordering) rows: 68–104 s across all of them. That case needs its own
+mechanism.
+
+#### Landed: Copa reads independent jitter out of its queue estimate (2026-10-07)
+
+The mechanism the independent-jitter rows needed. Copa's queue estimate is `d_q = RTTstanding − RTTmin`.
+`RTTstanding` is the least of the `n` samples in its `srtt/2`; with an empty queue and jitter of width `W`
+independent per sample it sits `W/(n+1)` above the path's floor (order statistics of `n` uniform draws). A small
+window has few samples, reads a large `d_q`, shrinks, and has fewer samples still: the collapse the starvation result
+predicts (Arun, Alizadeh & Balakrishnan, SIGCOMM 2022, §6: a delay-bounding law must keep non-congestive jitter out
+of its delay signal). The law now estimates `W` from each `srtt/2` epoch's samples and subtracts `W/(n+1)`, telling
+jitter from queue by the samples' shape: a queue moves the RTT monotonically within half a round trip, so its path
+length (the sum of the successive differences) is its net change; jitter zigzags. `W ≈ 3·(path − |last − first|)/(n−1)`
+(two independent uniform draws differ by `W/3` on average), from the last whole epoch (`copa.rs`, `Epoch`).
+
+Commands: `cargo run --release -p slates-transport --example congestion_bench` (the 58-scenario grid, three seeds
+each), and `FETCH_BENCH_SEED=<1..8> cargo run --release -p slates-cluster --example fetch_bench thin 128` (8 MiB on the
+thin link; the seed override and the handshake retry added to the bench the same day). Apple M5 Max, simulated
+network and virtual clock.
+
+`fetch_bench`, median of 8 seeds (all eight shown in the scratch record; the in-order row is noisy: `HEAD` alone spans
+8.0–32.0 s):
+
+| Thin link, 10 Mbit/s, 200 ms, 8 MiB | `HEAD` | landed |
+|---|---|---|
+| reordering ±40 ms, no loss | 79.0 s | 24.3 s |
+| reordering ±40 ms, 2% loss | 101.9 s | 32.8 s |
+| jitter ±40 ms in order | 18.1 s (8.0–32.0) | 24.1 s (7.9–30.1) |
+| 2% loss, in order | 8.1 s | 8.0 s |
+
+`congestion_bench` against `HEAD`: capacity share +1.6%, steady ping p99 −1.9% by geomean. Wins over 10%: burst loss
+p99 326 → 148 ms; 10 Mbit/s 100 ms with 1% loss p99 220 → 179 ms, with 5% loss 456 → 312 ms; the reordering row's
+share 0.534 → 0.857; the two-network crossing's share 0.346 → 0.423 at 10 Mbit/s and 0.045 → 0.064 at 100 Mbit/s.
+Losses over 10%: 10 Mbit/s 20 ms 1% loss p99 47 → 52 ms; 100 Mbit/s 20 ms 5% loss p99 82 → 92 ms.
+
+The two-network Docker topology (`docs/wip/bench/multiregion/reads.sh`, 100 ms ± 40 ms one way, 3% loss), cross-region
+reads of 8 MiB, three readers × three rounds: 85.0, 100.9, 103.5, 120.1, 120.6, 121.1, 121.8, 126.7 s byte-identical
+(median about 120 s), against 124.9–144.9 s (median about 135 s) before. One read refused after 54.2 s, its forward
+unanswered within its stall budget (load average 10 from other sessions; recorded in `GAPS.md`). The gain on the real
+crossing is a tenth, not the simulator's threefold: the real path's jitter is not the simulator's uniform draw, and
+the read was bound by more than the window (open).
+
+Measured and rejected on the way, each against the same `HEAD` (fetch medians where eight seeds were run, else seed
+1; grid geomeans):
+
+| Candidate | Reordering, no loss | Reordering + 2% loss | Grid share / p99 | Why it lost |
+|---|---|---|---|---|
+| `range/(n−1)`, `n` from the window in packets | 60.1 s | 64.4 s | — | `n` counted packets; samples come one an acknowledgement |
+| `range/(n−1)`, `n` the samples counted | 14.6 s | 15.7 s | +1.3% / +4.2% | a slow link's queue read as jitter: 64 kbit/s 300 ms p99 585 → 1,199 ms, share 0.912 → 0.750 |
+| range less the net change | 56.4 s | 59.3 s | — | for few samples a jitter's net change is most of its range |
+| `range/(n−1)` × the last epoch's zigzag share | 18.9 s | 31.6 s | +1.4% / +2.0% | burst loss p99 326 → 1,322 ms |
+| the same × the current epoch's share | 61.0 s | 76.6 s | — | the current epoch has too few samples early on |
+| the current window's range × the last epoch's share | 27.7 s | 35.3 s | — | in-order jitter 34.4 s |
+| `range/(n−1)` less one packet's serialization | 26.2 s | 39.7 s | +1.2% / +2.0% | 1 Mbit/s 20 ms 5% loss p99 686 → 1,393 ms |
+
+The second candidate is the strongest on the jitter rows alone (5.4–6.5×), and is kept on record for a design that
+can tell a slow link's queue from jitter without giving those gains back. The landed one keeps 3.1–3.3× with a clean
+grid.
+
+### Landed: a settled roster's discovery checks back off to the membership horizon (battery; 2026-10-08)
+
+An idle fleet node sent one discovery exchange to every peer every heartbeat (`GAPS.md`, same day). A record link now
+doubles the wait between pages while its sweep stays complete at one roster generation, from one heartbeat up to the
+membership horizon (`lease::horizon_ns`, 900 ms: the longest the detector takes to declare a death). So a roster
+change is learned no later than a death would be. Any change, new session or sweep under way returns to one
+heartbeat (`fleet::next_discovery_wait`). The non-vacuity counter is `fleet.discovery.pages`.
+
+**Commands:**
+- the two-network Docker topology (`docs/wip/bench/multiregion/run.sh`), six nodes with no impairment;
+- bootstrapped, then idle for 40 s;
+- pages counted on a1 and b1 over 20 s, CPU from `docker stats` (3 samples of 6 nodes);
+- arms alternated A, B, A, B;
+- load average 12–15 from other sessions.
+
+| Arm | Pages per node in 20 s | Mean CPU per idle node |
+|---|---|---|
+| A, a page every heartbeat | 974–1,000 | 1.55%, 1.37% |
+| B, backed off to the horizon | 110–111 | 1.04%, 1.24% |
+
+Pages fell 9×, and mean idle CPU about 20% (1.46% → 1.14%); the rest is probes and Raft heartbeats. The fleet suite
+passed 79/79 in 272 s (252–299 s before), so membership convergence did not slow.
+
+**Follow-up, 2026-10-09: an unbootstrapped fleet's configuration fetches.** Before any `bootstrap`, a root and council
+learner fetched every period (their empty configurations make every live peer look like a divergence). They now back
+off from a heartbeat to the horizon while the group stays uninitialized. Recovery and a stale-configuration refusal
+still fetch at once (`fleet::next_learner_wait`; non-vacuity counter `fleet.learner.fetch_paced`, fetches counted in
+`fleet.learner.fetches`). A/B by the in-process test
+`an_unbootstrapped_fleet_paces_its_configuration_fetches_to_the_horizon` (two nodes, never bootstrapped, 6 s; A is HEAD
+with only the counter added, built in its own target directory):
+
+| Arm | Fetches per node in 6 s | Periods paced |
+|---|---|---|
+| A, a fetch every period | 96 | 0 (the test fails) |
+| B, backed off to the horizon | 12 | 102 |
+
+The fleet suite passed 80/80 in 276 s, so formation and bootstrap learning did not slow.
+
+**Build trap, recorded so it is not repeated:** the first two B images ran A's binary. The Dockerfile shares one cached
+`target/` across builds, and BuildKit reuses an unchanged `COPY . .` layer with its old file times, so cargo kept the
+other tree's compiled crates. Touching the sources did not help. Each arm is now built in its own target volume and
+copied into a distroless image, and the binaries' hashes must differ (A `d6b21905979c`, B `2f469a521c60`).
+
+### Measured and rejected: RFC 9754 delegated timestamps for the `stat` after a delegated write (condition 12; 2026-10-08)
+
+**Why it looked right.** A probe on the Linux 6.12 client (write, close, `stat`, 200 cycles on a write-delegated
+file) made one GETATTR per cycle, a 37.4 µs `stat`, against 0.7 µs for repeated `stat`s of an unchanged file. RFC 9754
+lets the holder of a write delegation keep the file's access and modification times. The 6.12 client defines
+`NFS_CAP_DELEGTIME`, and sets it when the server lists `time_deleg_access`, `time_deleg_modify` and the
+`open_arguments` want for delegated timestamps (`_nfs4_server_capabilities`, v6.12).
+
+**The arm.** It advertised the three attributes and returned `OPEN_DELEGATE_WRITE_ATTRS_DELEG` when asked, accepting
+the holder's times by SETATTR clamped to the wall clock.
+
+**What it showed.** The client asked for and got the attribute delegation; the OPEN reply decoded by tshark carried
+type 5. The probe still made 200 GETATTRs in 200 cycles (51–59 µs per `stat`). Each GETATTR asked only for Type, FSID,
+FileId, NumLinks, Space_Used and Mounted_on_FileId: no times, size or change. So the round trip is the space used
+(and link count) after a write. Delegated timestamps do not cover it. The likely reason, inferred and not traced in
+the client: a write without a delegation carries a GETATTR that keeps them fresh, and one under a delegation does not.
+
+Rejected as dead even on this client; the patch is kept in the session scratchpad.
+
+### Payload copies out of the NFSv4 READ and WRITE paths (condition 12; 2026-10-08)
+
+**Found by profiling and counting.** In the daemon's large-write profile `memcpy` was about 24% of self time. A
+counting allocator around `serve_compound` (`cargo run --release -p slates-bridge-nfs --example v4_io_bench`, new: a
+session, one file, 2,000 compounds of 256 KiB each per round, five rounds; `V4_IO_TRACE=1` prints the call stack of
+every allocation of 200 KB or more) found the full payload copied into a fresh buffer 5 times per WRITE and 9 times per
+READ before the change:
+- WRITE: `write_args` grown by doubling, again when `state_io` appended its 24-byte suffix to an exactly sized vector,
+  and `Export::write_as` copying the decoded data into a `Vec` before the volume's write copied it into the arena.
+- READ: `state_io` copying the reply body out, `v3call::read` copying the data out, the v4 body grown by doubling, and
+  the session's reply cache keeping every reply, though RFC 8881 §2.10.6.1.3 has the client ask per request
+  (`sa_cachethis`) and Linux asks only for state-changing operations, never a READ or a WRITE.
+
+**The fix.** `write_args` sized once with the suffix's room; the decoded data lent to the volume's write; `state_io`'s
+reply kept whole with its body lent past the status word; the read data lent from it; the READ body sized once; and a
+reply kept only when its SEQUENCE asked (a retry of one that did not is `NFS4ERR_RETRY_UNCACHED_REP`, which a client
+answers by resending).
+
+**Measured** (macOS aarch64, A = `1e461047`, B = the fix, built in separate target directories, interleaved, load
+16–37):
+
+| Per 256 KiB operation | A | B |
+|---|---|---|
+| WRITE, bytes the server allocates | 1,314,026 | 526,970 (−60%) |
+| READ, bytes the server allocates | 2,361,554 | 1,574,869 (−33%) |
+| WRITE, median of 8 best-of-5 runs | 56.1 µs | 54.5 µs (even) |
+| READ, median of 8 best-of-5 runs | 61.0 µs | 41.1 µs (−33%) |
+
+- Through Linux's NFS client (`docs/wip/bench/nfs/large_io.sh 3`, the new byte comparison): every 512 MiB file read
+  back identical. Throughput there moved within the shared machine's noise (load 25–57).
+- Same day, the compound's reply is encoded in place: its header (status, tag, operation count) is written before the
+  results and its words filled in at the end, so assembling the reply no longer copies every result into a second
+  buffer. A READ allocates 1,574,869 → 1,312,741 bytes (one transfer less); a WRITE is unchanged (526,966).
+- ~~Still copied per READ: the volume's read out of the arena, the v3 reply's encoding, the state wrapper, the v4 body
+  and the record framing~~; per WRITE, the v3 re-encoding itself. Each is a further step.
+- **READ at two buffers, 2026-10-08.** A READ was copied five times (a trace of every allocation of 256 KiB or more,
+  `V4_IO_TRACE=1`): the bridge's read buffer, the v3 reply's opaque, the state wrapper behind its status word, the v4
+  body and the compound reply. Now:
+  - the bridge reads straight into the v3 reply after its fixed words, which are filled in after (`read_into`,
+    `XdrWriter::opaque_appended`);
+  - `state_io` writes that reply behind its status word in place;
+  - the v4 operation's body is the owner's reply lent from its eof word on (`Body { bytes, from }`, `v3call::read_tail`):
+    READ3resok's tail is READ4resok byte for byte, an equality a unit test checks for every padding case.
+
+  | Per 256 KiB READ (`v4_io_bench`, macOS aarch64) | before | after |
+  |---|---|---|
+  | bytes the server allocates | 1,312,741 | 526,154 (two buffers: the owner's reply and the compound's) |
+  | best of five rounds, three runs | 38.3 µs | 16.6–19.1 µs |
+
+  Through Linux's NFS client (`large_io.sh 3`, cold reads by a fresh mount): every 512 MiB file read back identical;
+  reads at 1.5–2.2 GB/s with 250–360 ms of daemon CPU per 512 MiB, writes 0.7–1.4 GB/s (load 8–12). The script's
+  global `drop_caches` was replaced by the remount the same day: it walks every superblock in the VM and hung for good
+  behind the wedged one (the first attempt's shell is still in D state).
+
+### A write's retention estimate and window lookup by binary search (condition 12; 2026-10-08)
+
+**Found by profiling.** `perf record -g` of the daemon during 512 MiB `dd` writes through Linux NFS (release build with
+line tables, `docs/wip/bench` style container, 2026-10-08): the self time was `memcpy` about 24%, AES-GCM sealing at
+rest 14.5%, the kernel's `copy_to_user` 11.2%, first-touch page faults on the content object about 8%, then
+`Volume::retention_of_write` 4.5% and `Volume::open_window` 2.1%: both walked every extent of the file on each write
+(the retention estimate tested each piece; the window lookup was a linear `position`), so a write cost O(file
+windows), the shape the read path and `write_charge` lost on 2026-10-06.
+
+**The fix.** The estimate visits only the extents its operation can touch (`overlapping`, two binary searches: a
+write's windows, a truncate's or an edit's tail), and the window is found by `binary_search_by_key` on the ascending
+offsets.
+
+**Measured.** `cargo run --release -p slates-vfs --example large_file_bench` (macOS aarch64, A = `aa725a57`'s tree in
+a worktree, B = the fix, interleaved, load 17–37 from other sessions; best of 5 rounds per run):
+
+| File | A: random 4 KiB overwrite | B | A: sequential µs per MiB | B |
+|---|---|---|---|---|
+| 512 MiB (8,192 extents) | 33.8, 35.3, 37.0, 37.2 µs | 15.7, 18.3, 24.3, 15.6 µs | 126, 119, 100, 106 | 295 (load), 81, 72, 79 |
+| 128 MiB | 13.5, 14.4, 13.3, 17.1 µs | 12.1, 14.8, 13.6, 13.5 µs | 111, 126, 75, 80 | 194 (load), 74, 71, 68 |
+| 16 MiB, 10 runs | 7.8–14.5 µs, median about 10.3 | 9.4–17.1 µs (one 23.5 load spike), median about 11.2 | | |
+
+- The 512 MiB overwrite halves and stops growing with the file; the 16 MiB row is within this load's noise (the change
+  only removes work).
+
+### A real tree copied: slates against the kernel's nfsd (condition 12; 2026-10-08)
+
+Command: `docs/wip/bench/mixed/copy_tree.sh /usr 3` (privileged `rust:1.98.0`, the release build of `6d2d5d91`, Linux
+6.12 aarch64): `cp -a /usr` (28,502 entries, 1,565,931,853 bytes) through one Linux NFSv4.2 client into slates and into
+nfsd exporting tmpfs, `sync` and `async`, with tmpfs as the floor; each copy removed, untimed, before the next. Load
+10–80 from other sessions, falling through the run.
+
+| Round | slates | nfsd `sync` | nfsd `async` | tmpfs |
+|---|---|---|---|---|
+| 1 | 21.2 s | 22.2 s | 24.5 s | 2.7 s |
+| 2 | 15.8 s | 15.6 s | 24.4 s | 2.8 s |
+| 3 | 16.2 s | 15.3 s | 18.3 s | 2.3 s |
+
+- Parity with nfsd on a tree copy, within about 5% each round; nothing here is a win to claim.
+- The first version of this bench measured nfsd's NFSv4 grace period: a fresh nfsd refuses new opens for 90 s, and
+  the first copy sat it out (93–105 s against 24–29 s past it). It now shortens the grace period and waits it out, as
+  `pressure/knfsd-fsync.sh` did; `linux_vs_nfsd.sh` was given the same (its earlier runs carried the stall on one
+  operation of 400, a maximum, not a recorded p50 or p99).
+- Holding three copies at once outgrew the 7.6 GiB Docker VM and hung Docker; each copy is now removed before the next.
+
+### Memory per file on a real tree, against tmpfs (condition 12; 2026-10-08)
+
+**The commands.** Linux 6.12 (Docker Desktop, aarch64, 4 KiB pages), release build of `1e854b56`, privileged
+`rust:1.98.0`, load 7–8 from other sessions:
+- `docs/wip/bench/mem/per_file.sh /usr`: copies `/usr` (28,393 entries, 1,567,942,094 content bytes) into a slates
+  volume over the kernel's NFSv4.2 client, then into tmpfs. slates' side is the anchor's and the daemon's
+  proportional set size (`smaps_rollup` Pss); tmpfs's is the kernel's Shmem plus slab, after dropping clean caches.
+- `docs/wip/bench/mem/per_entry.sh 100000`: 100,000 empty files in 100 directories, the same two sides.
+- `CREATE_HEAP_SIZES=<the tree's sizes> cargo run --release -p slates-vfs --example create_heap`: the volume alone,
+  every allocation counted.
+
+| | slates | tmpfs |
+|---|---|---|
+| Empty file, per entry | 843 B (daemon heap and tables; anchor 0) | 742 B (inode, dentry) |
+| `/usr`, beyond content, per entry | 6,202–6,370 B (6 runs) | 2,083–2,392 B |
+| `/usr`, beyond content, share | 11.2% | 4.3% |
+| `/usr` copy | 13.0–22.0 s | 1.7–6.5 s |
+
+**Where slates' `/usr` overhead is** (178 MB in all):
+- **Block rounding, 88.6 MB (5.6%)**: the volume references 1,656,542,072 bytes for 1,567,942,094 of content. A
+  window's block is the smallest power-of-two number of granules that holds its bytes, up to a 64 KiB chunk (§4.2
+  "allocator rounding"). Modeled on the tree's real sizes:
+
+  | Tail rule | Waste |
+  |---|---|
+  | Power of two, 4 KiB granule (today) | 6.26% |
+  | Power of two, 512 B granule | 4.75% |
+  | Page multiple, 4 KiB (tmpfs) | 3.34% |
+  | Four classes per doubling, 4 KiB (jemalloc's spacing) | 3.56% |
+  | Four classes per doubling, 512 B | 1.16% |
+
+- **Heap, about 62 MB**, attributed by heaptrack at a `SIGKILL` after the copy (live allocations by stack):
+  - the volume's op log, 23.1 MB (`vfs/src/journal.rs:197`, bounded by its derived share of the volume);
+  - the arena's per-region tables, 10.6 MB over 59 region additions;
+  - the volume's content and inode records, about 26 MB: 801 B per file, as `create_heap` measures with the tree's
+    sizes.
+  - The NFS layer adds nothing per entry: the empty-file run's heap growth (496 B per file) equals the volume's
+    create cost (498 B).
+- **30.4 MB more in the content object** than the volume's committed blocks (`/memfd:slates-con-mem` 1,686,921,216 B
+  against 1,656,542,072 committed, 15 s idle after the unmount): the shard's recovery memory, A-68's two checkpoint
+  slots and its delta log in the same object, all three resident once written. A-117 gives back the stale slot and
+  the log past its tail when the shard is idle: 12–19 MB of it on `/usr`, and an empty file 844 → 695 B (below
+  tmpfs's 740–754 B). The A/B is A-117's table.
+
+**Hypotheses measured and rejected on the way:**
+- Client file state (opens, write delegations): the unmount, which returns them, freed nothing (Pss rose 16 MB).
+- glibc keeping freed 256 KiB write buffers: with `GLIBC_TUNABLES=glibc.malloc.mmap_threshold=131072` the heap was
+  62.9 MB against 64.0 MB.
+- The op log's share: a 2 GiB maximum instead of 8 GiB left the heap at 64.4 MB.
+- `committed_versions` (594,237): a reservation ledger, not live versions.
+
+**Measured and rejected: an idle purge that returns runs below the discard size.** The idle purge (A-105) keeps a
+dirty run shorter than the derived discard size (16 KiB here) resident, and drops it from the dirty set. Returning
+every run instead returned 0.5 MB more of the 1.7 GB (`content.purged_bytes` 348,622,848 against 348,119,040, the
+content object 1,646,690 KiB against 1,648,206 KiB): dead even, so A-105's rule stands. The patch and its test are
+kept out of the tree.
+
+**Owed:**
+- Tail rounding: done by A-118 (a sealed chunk's block trimmed to its pages): block rounding 88.6 → 44.3 MB on
+  `/usr`, the daemon 34–39 MB smaller at idle, copy time unchanged (the A/B is A-118's table).
+- Windows: the content object gives no page back there (`SparseObject::discard`), so A-117 does nothing on that host;
+  a measured decommit is owed. macOS marks the pages reusable since 2026-10-08 (A-117's macOS note).
+
+### Measured and rejected: no write delegation for an open that creates (condition 12; 2026-10-08)
+
+**The idea.** The `stat`, unlink and rename costs of write delegations come from files delegated at their create;
+the reopen speed comes from delegations of existing files. So the arm (E) granted no write delegation to an
+`OPEN4_CREATE`, and still granted one to an open of an existing file.
+
+**The run.** Same command as the four-arm A/B, A and E interleaved three times each, load 4–14. Grants per run: A 2,462
+(one per created file), E 1,123 (reopens only).
+
+| Arm | p50 geomean vs A | p99 geomean vs A |
+|---|---|---|
+| E: no write delegation on create | ×1.05 | ×1.31 |
+
+- E wins `stat` (34 → 6 µs at 1 worker, 58 → 11 µs at 16).
+- E loses the reopens: overwrite 82 → 173 µs and read 63 → 119 µs at 1 worker. The first reopen of each new file now
+  pays the OPEN round trip a create-time delegation saved.
+- Rejected.
+
+At this load A, today's policy, beats every arm measured, B included (×1.27 p50 and ×1.52 p99, from B's earlier runs
+at higher load). So the policy stands: write delegations as today. The `stat` after a delegated write is the client
+revalidating the space used, measured in the entry above.
+
+### NFSv4 delegation policy, four arms (condition 12; 2026-10-08)
+
+Command: `docs/wip/bench/mixed/linux_vs_nfsd.sh 400 64` (slates' rows). Each arm's Linux release binary was built in
+its own target volume (A `56a4bb36f5ba`, B `e6639415e8f3`, C `e446e78a8291`, D `950fa1940fbd`), and the runs were
+interleaved. Load average 9–28 from other sessions; C and D's second runs fell at the high end. Grants from the
+daemon's status (`nfs4.delegation.granted`): A and C 2,462 a run (a write delegation per created file), B 0, D 1,491
+(read only).
+
+| Arm | Runs | p50 geomean vs A | p99 geomean vs A |
+|---|---|---|---|
+| A: write delegations, read delegations once a file has settled (today) | 5 | ×1.00 | ×1.00 |
+| B: no write delegations | 5 | ×0.85 | ×1.13 |
+| C: A, and read delegations without the settled rule | 2 | ×1.41 | ×2.31 |
+| D: B, and read delegations without the settled rule | 2 | ×1.37 | ×2.94 |
+
+Where B moves, by median p50:
+- **`stat`:** 46–67 → 7–9 µs.
+- **unlink:** 150 → 76 µs at 1 worker, 309 → 115 µs at 4.
+- **create:** 535 → 359 µs at 4 workers.
+- **reopens (overwrite, append, read):** 1.4–3× slower; 141 → 249 µs at 1 worker, 209 → 682 µs at 16.
+
+The daemon's calls explain the reopens: without a delegation the client revalidates every open, with GETATTR
+4,913 → 23,123 and ACCESS 2,713 → 10,975 a run. There were no recalls in any arm. So the cost of write delegations
+sits on the client: it returns the delegation before an unlink or rename, and asks the server on `stat`.
+
+C and D rejected: read delegations without the settled rule put a recall on every later change and sped no read
+(D's read p50 230 µs against B's 196 µs). A against B is a split on performance. B also removes the one correctness
+failure write delegations cause: Linux 6.17's truncate under a delegation, refused by mode bits (`GAPS.md`
+2026-10-07). The choice was put to Ada with B recommended.
+
+### The incumbent baseline: slates against the kernel's own NFS server, one Linux client (condition 12; 2026-10-08)
+
+Command: `docs/wip/bench/mixed/linux_vs_nfsd.sh 400 64` in a privileged `rust:1.98.0` container (the header gives the
+`docker run`). The Linux release build is the day's last code change (`cf35aba6`), and the Docker VM's kernel is
+6.12.76-linuxkit. One Linux NFSv4.2 client over TCP mounts:
+- slates (4 shards);
+- the kernel's nfsd (8 threads) exporting a tmpfs as the v4 root;
+- plain tmpfs, the floor.
+
+`mixed.py` runs 400 operations a worker in one shared directory, then a 64 MiB file is written, fsynced and read
+back. Every byte was identical. Load average 8–11 from other sessions.
+
+| workers | op | slates p50 / p99 | kernel nfsd p50 / p99 | tmpfs p50 / p99 |
+|---|---|---|---|---|
+| 1 | create | 217 µs / 436 µs | 366 µs / 925 µs | 2 µs / 10 µs |
+| 1 | overwrite | 110 µs / 242 µs | 370 µs / 725 µs | 1 µs / 3 µs |
+| 1 | read | 76 µs / 166 µs | 175 µs / 492 µs | 3 µs / 4 µs |
+| 1 | stat | 37 µs / 88 µs | 8 µs / 128 µs | 1 µs / 2 µs |
+| 16 | create | 1.87 ms / 2.97 ms | 2.37 ms / 3.87 ms | 466 µs / 2.46 ms |
+| 16 | overwrite | 136 µs / 1.68 ms | 477 µs / 1.24 ms | 403 µs / 2.14 ms |
+| 16 | read | 99 µs / 2.62 ms | 272 µs / 962 µs | 1.30 ms / 3.89 ms |
+| 16 | stat | 43 µs / 456 µs | 4 µs / 244 µs | 25 µs / 1.24 ms |
+| 16 | rename | 1.62 ms / 2.67 ms | 2.11 ms / 3.81 ms | 96 µs / 1.56 ms |
+| 16 | unlink | 1.74 ms / 2.62 ms | 2.06 ms / 3.50 ms | 154 µs / 1.38 ms |
+
+- **Where slates wins:** the medians of every write-side operation at every concurrency, and the 16-worker tails
+  of create, rename and unlink.
+- **Where slates loses:**
+  - the 16-worker read p99 (2.62 against 0.96 ms) and the overwrite and append p99s (1.68 against 1.24 ms);
+  - `stat` medians (37–44 µs against 4–8 µs). The client keeps answering nfsd's from its cache and asks slates.
+    That is a hypothesis, untraced: nfsd hands out read delegations, and slates' write-delegation policy is Ada's
+    open decision.
+- **Large files:** slates writes 546–817 MB/s against nfsd's 967–1,524 MB/s and the floor's 1.7–2.1 GB/s; slates
+  reads 2.3–2.7 GB/s, about nfsd's.
+
+**Measured and rejected: a 1 MiB transfer size** (Linux's `NFS_MAX_FILE_IO_SIZE`, what nfsd offers, against slates'
+256 KiB). The client mounted `rsize=wsize=1048576`. The large write did not improve: 461–631 against 546–817 MB/s at
+1, 4 and 16 workers. Reads rose a little (2.67–2.71 against 2.31–2.65 GB/s), too little to land on one run. So the
+write gap to nfsd is in slates' own write path, owed a profile. Two tests encode the 256 KiB size as a literal and
+would need deriving from the constant first (`rtmax is one arena chunk`; a listing sized to need two pages).
+
+### Mixed read-write tails on macOS's own NFS client, and a shard QoS class measured (condition 12; 2026-10-07)
+
+Command: `bash docs/wip/bench/mixed/mixed_mac.sh <release slates> <out dir> OPS LARGE_MIB`. It runs a release anchor
+with 4 shards, a 2 GiB bounded volume mounted through `slates mount` (NFSv3 loopback, `mount_nfs`, no sudo), and
+`mixed.py` in one shared directory at 1, 4 and 16 workers. Each worker's operations are weighted: create (open,
+write 4 KiB, close) 30, overwrite 15, append 10, read 25, stat 10, rename 5, unlink 5. Then a large file is written
+sequentially, fsynced and read back by checksum. The scratch APFS directory, which is on disk, is the reference. The
+mount is always removed before the anchor stops (`macos-nfs-kill-test-panics-the-mac`). Apple M5 Max. **Load average
+57 to 77 from other sessions throughout**: this is the busy machine, not a quiet baseline. Every byte read back was
+identical.
+
+One run at 400 operations a worker, load 67 to 74:
+
+| workers | op | slates p50 | slates p99 | APFS p50 | APFS p99 |
+|---|---|---|---|---|---|
+| 1 | create | 4.1 ms | 137.7 ms | 64 µs | 3.6 ms |
+| 1 | read | 73 µs | 2.8 ms | 21 µs | 77 µs |
+| 1 | unlink | 1.3 ms | 108.8 ms | 35 µs | 50 µs |
+| 16 | create | 30.8 ms | 456.2 ms | 265 µs | 54.2 ms |
+| 16 | read | 398 µs | 28.3 ms | 44 µs | 24.5 ms |
+| 16 | unlink | 41.5 ms | 557.8 ms | 98 µs | 31.2 ms |
+
+Large file (64 MiB): slates 199–243 MiB/s write, 475–1,613 MiB/s read; APFS 545–1,489 MiB/s write.
+
+- The daemon itself served each call in 3 µs at p50 and 53 µs at p99 (`nfs.local_p*_ns`) over the whole run. Nearly
+  all of the client's time is outside the daemon's service: the macOS NFS client, the loopback socket, and each of the
+  several cross-process hops an operation makes waiting for a core at load 70. The server sets `TCP_NODELAY` on every
+  accepted connection (`slates-rt` `tcp.rs`).
+- **RPCs per create, counted by the daemon.** Status now reports each shard's NFS calls by procedure
+  (`ShardReport::nfs_calls`). Run with `bash docs/wip/bench/mixed/rpc_per_op.sh <slates> <out> 200`, at load 86:
+  - 14.04 RPCs per create (open `O_CREAT`, write 4 KiB, close): getattr 5.03, lookup 2.0, create 2.0, write 2.0,
+    commit 2.0, setattr 1.0;
+  - p50 16.1 ms and p99 52.5 ms per create.
+  - **Half of it is a file nobody asked for.** macOS attaches `com.apple.provenance` to every new file, and NFSv3
+    carries no extended attributes, so the macOS client writes them into an AppleDouble sidecar (`._name`), which it
+    hides from its own listing. That second file costs its own lookup, create, write and commit, so every create
+    through the macOS v3 mount is two. Shown by `docs/wip/bench/mixed` (`xattr -l` on the new file names
+    `com.apple.provenance`).
+  - The levers sit on the client's side of the protocol: NFSv4 named attributes (macOS's v4.0 client supports them;
+    slates serves 4.1 and 4.2), or another macOS transport. Each is a design question, owed with its A/B.
+- **Each step's calls, cold attribute cache** (`bash docs/wip/bench/mixed/steps.sh <slates> <out>`, one shard):
+
+  | Step | Daemon-counted calls |
+  |---|---|
+  | stat | getattr 2 |
+  | open, read, close | getattr 2, access 1 |
+  | overwrite 4 KiB at 0 | getattr 4, read 1, write 1, commit 1 |
+  | create, close | getattr 4, setattr 1, lookup 2, create 2, write 1, commit 1 |
+  | create, write 4 KiB, close | getattr 5, setattr 1, lookup 2, create 2, write 2, commit 2 |
+  | unlink | getattr 3, lookup 3, access 1, remove 1 |
+
+  - The overwrite's read is the client filling a partial page: Apple Silicon's page is 16 KiB, and a 4 KiB write
+    covers a quarter of it.
+  - An empty create still writes and commits once: the sidecar's provenance attribute.
+  - **The getattrs are the client's, not a missing attribute.** CREATE returns the new file's attributes, and WRITE,
+    COMMIT and SETATTR each return the file's `wcc` with its attributes after. Every reply carries what the client
+    needs, so the getattrs are the macOS client's close-to-open revalidation at open and after the flush at close,
+    and no server change removes them. Over NFSv3 on macOS a create costs about 7 calls at least, and about 7 more
+    for the provenance sidecar.
+- Against Tectonic's published tails (150–200 ms writes, about 100 ms reads; FAST'21): at 16 writers under load 70,
+  slates' create and unlink p99 (456 and 558 ms) are worse, and its read p99 (28 ms) is better. The busy-host tail of
+  the macOS loopback path is open work for condition 12.
+
+**Measured, inconclusive: a `QOS_CLASS_USER_INITIATED` class on the shard threads.** One experiment binary, run with
+and without `SLATES_EXPERIMENT_QOS`, three interleaved rounds a side at 300 operations a worker, load 57 to 62. The
+experiment code was never committed. p50 and p99 in ms, round by round:
+
+| workers | op | default | `USER_INITIATED` |
+|---|---|---|---|
+| 1 | create p99 | 118 / 163 / 179 | 70 / 87 / 146 |
+| 1 | unlink p99 | 20 / 33 / 12 | 47 / 93 / 53 |
+| 4 | create p50 | 7.1 / 27.7 / 16.6 | 4.8 / 2.5 / 4.5 |
+| 4 | create p99 | 74 / 166 / 114 | 83 / 92 / 36 |
+| 4 | unlink p99 | 56 / 109 / 164 | 44 / 19 / 25 |
+| 16 | create p99 | 327 / 465 / 303 | 353 / 442 / 278 |
+| 16 | unlink p99 | 318 / 460 / 256 | 365 / 443 / 266 |
+
+Four writers improve clearly. One writer improves on creates and worsens on unlinks, and sixteen are even. A mixed
+A/B does not land. The class also moves work onto performance cores, which costs battery, and it outranks other
+processes. Owed: more rounds, a quiet-machine arm, and the energy cost (`powermetrics`) before any decision.
+
+**Rerun 2026-10-08 on `bcc02163` at load 5–6** (same command, 400 operations a worker, 64 MiB large file; every byte
+identical):
+
+| workers | op | slates p50 | slates p99 | APFS p50 | APFS p99 |
+|---|---|---|---|---|---|
+| 1 | create | 507 µs | 966 µs | 58 µs | 81 µs |
+| 1 | read | 38 µs | 85 µs | 19 µs | 40 µs |
+| 16 | create | 6.2 ms | 15.9 ms | 549 µs | 1.7 ms |
+| 16 | unlink | 6.4 ms | 16.3 ms | 202 µs | 802 µs |
+| 16 | rename | 4.5 ms | 12.3 ms | 234 µs | 1.2 ms |
+| 16 | read | 318 µs | 1.2 ms | 721 µs | 2.1 ms |
+
+- At load 5 rather than 70, the 16-worker create p99 is 15.9 ms rather than 456 ms: most of the old tail was other
+  sessions' load.
+- The daemon's own service time per NFS call stayed p50 3 µs, p99 45 µs (`nfs.local_*`), so the remaining gap to
+  APFS is in macOS's NFS client. It serializes directory changes in one shared directory, and spends about 14 RPCs
+  a create, half of them on AppleDouble sidecars for extended attributes that NFSv3 cannot carry. The macOS
+  extended-attribute transport (NFSv4 named attributes or another) is Ada's decision, owed.
+- Large streams: 1.16–1.40 GB/s written, 2.24–2.54 GB/s read.
+
+### The real crossing's window, read from the owner's sessions (condition 7; 2026-10-08)
+
+Command: `IMAGE=slates:mr sh docs/wip/bench/multiregion/reads.sh <scratch> <8 MiB payload> 3` at `401e9ad3` (the
+two-network topology, 100 ms ± 40 ms one way, 3% loss each way). The script now prints the owner's record sessions
+(`fleet.sessions` in status). Load average 3–9.
+
+Reads: a0 (same region) 0.15–0.16 s; across regions 91.4, 106.4, 111.9, 113.2, 114.9, 118.8, 119.8, 121.7 s
+byte-identical; one refused after 55.9 s (`b1`, round 2), as in the run before.
+
+The owner's (`a1`) sessions after the reads:
+
+| To | Congestion window | Smoothed RTT | PTO | Spurious losses | Collapses |
+|---|---|---|---|---|---|
+| region-1 reader | 9,184 B | 237.3 ms | 364.7 ms | 0 | 0 |
+| region-1 reader | 7,655 B | 230.0 ms | 450.8 ms | 0 | 0 |
+| region-1 reader | 9,736 B | 247.2 ms | 588.4 ms | 0 | 0 |
+| region-0 peer | 9,400 B | 0.15 ms | 1.15 ms | 0 | 0 |
+| region-0 peer | 9,412 B | 0.18 ms | 1.18 ms | 0 | 0 |
+
+- **The window, not loss, bounds the crossing.** About 9 KB per 240 ms round trip is about 40 KB/s a session. That
+  matches 8 MiB in about 110 s with read-ahead's few windows in flight. No spurious loss and no persistent collapse
+  were declared.
+- **It is Copa's delay signal.** Copa's target rate is `1/(δ·d_q)`. With ±40 ms jitter each way, the standing RTT over
+  `srtt/2` sits about 80 ms above the minimum, so δ = 0.5 gives about 25 packets/s, or about 6 packets (about 8 KB)
+  in flight at 240 ms. That is the measured window. Candidate 4's correction (`W/(n+1)`, landed 2026-10-07) removes
+  too little here: a 6-packet window takes few samples per `srtt/2` epoch.
+- Owed: the controller change, A/B'd on `fetch_bench`'s thin and grid scenarios and on this crossing. Candidate 2
+  read 5.4–6.5× on the jitter rows and failed only on slow links' queues. Before then, the reading needs an epoch
+  that spans enough samples.
+
+### Replication to the mirror region across a lossy crossing (condition 10; 2026-10-09)
+
+Command: `IMAGE=slates:mr sh docs/wip/bench/multiregion/mirror.sh <scratch> <64 KiB payload> N` (two networks, a
+router shaping the crossing; each round writes the file, snapshots it, and times its placement at home, then in the
+mirror region by `volume placed --mirror`). Load average 8–24.
+
+| Build | Crossing | Snapshots placed in the mirror | Mirror placement |
+|---|---|---|---|
+| `d26b01b0`, unshaped | none | 1 of 1 | 1.01 s |
+| `d26b01b0` | 100 ms ± 40 ms, 3% loss | 0 of 6 (8 MiB and 64 KiB) | never in 120–300 s |
+| `d4d8d81f` (mirror rounds paced from their path) | same | varies 0–5 of 5 a run | 2–5 s when placed |
+| `aefcc6da` (the home record keeps the mirror placement) | same | 10 of 10 in two runs, then 3 of 15 | 2.1–4.8 s |
+| `962d4a9e` (delivered pair keys recorded apart) | same | 23 of 24 over five runs | 2.0–6.2 s |
+| `962d4a9e` | 150 ms ± 60 ms, 10% loss | 5 of 5 | 6.9, 8.1, 9.6, 17.8, 75.7 s |
+| `962d4a9e`, every node limited to half a CPU (`CPUS=0.5`) | 100 ms ± 40 ms, 3% loss | 5 of 5 | 2.3–6.9 s |
+| `962d4a9e`, half a CPU each | 150 ms ± 60 ms, 10% loss | 5 of 5 | 4.7, 6.6, 8.0, 13.1, 13.9 s |
+
+- The four faults each stopped every placement in their own way: a mirror round judged stalled at its offer; a late
+  shipment acknowledgement discarded; a healer's home re-record wiping the mirror placement, so a second job shipped
+  other holders at the same position; and a node's own pair key and a delivered one sharing one owner on partition
+  0, so each side refused the other's (GAPS, 2026-10-09).
+- At 10% loss, 71 content rounds and 39 shipments found no free session to their targets: one record session a peer,
+  lent elsewhere. That is the likely cost of the 75.7 s outlier, not yet measured apart.
+- The one snapshot unplaced in the 3% runs was followed by a `NoSpace` write refusal on the owner (open in GAPS).
+
+### Cross-region reads at HEAD: none refused after an unanswered forward is resent (condition 7; 2026-10-09)
+
+Command: `IMAGE=slates:mr sh docs/wip/bench/multiregion/reads.sh <scratch> <8 MiB payload> 3` (the two-network
+topology, 100 ms ± 40 ms one way, 3% loss each way; the image built from the tree under test). Load average 9–19.
+
+| Build | Cross-region reads of 8 MiB (s), byte-identical | Refused |
+|---|---|---|
+| `c264b71c` | 30.2, 24.3, 28.2, 19.4, 34.3, 23.5, 18.3 | 2 of 9 (`HomedElsewhere`) |
+| `cf1162ed`, the script's exit status fixed | 24.8, 25.4, 24.8, 26.1, 20.0, 29.3, 19.4, 19.3 | 1 of 9 |
+| resend to an `alive()` owner | 22.8, 27.7, 31.9, 29.8, 31.4, 31.4, 26.3, 24.2 | 1 of 9 |
+| resend unless confirmed dead, run 1 | 29.0, 32.0, 23.0, 20.8, 19.0, 22.0, 24.8, 21.9, 21.9 | 0 of 9 (`fleet.forward.retried` 1 on b2) |
+| resend unless confirmed dead, run 2 | 23.5, 24.7, 28.2, 26.3, 33.9, 21.4, 33.6, 27.8, 25.6 | 0 of 9 (`retried` 1 on b0, 1 on b2) |
+
+**Contested, 2026-10-09** (`CONCURRENT=1 IMAGE=slates:mr sh docs/wip/bench/multiregion/reads.sh <scratch> <8 MiB
+payload> 3` at `22e16df3`: each round starts the three region-1 readers at once, all reading the same file across the
+crossing). Rounds: 29.9 / 28.7 / 24.1 s, 22.8 / 24.9 / 27.3 s, 22.5 / 23.6 / 20.3 s. All nine byte-identical, none
+refused. Each contested read took about as long as a read alone, so the crossing carried about three times the bytes
+in the same time. Load average 12–22.
+
+**Contested on a harsher crossing, 2026-10-09** (`CONCURRENT=1 DELAY=150ms JITTER=60ms LOSS=10% IMAGE=slates:mr sh
+docs/wip/bench/multiregion/reads.sh <scratch> <8 MiB payload> 3`, three region-1 readers at once, 10% loss each way):
+
+| Build | Contested reads served (of 9) | Refusals |
+|---|---|---|
+| `22e16df3` (resend only an unanswered forward) | 4 | 5 × `HomedElsewhere`, within 1.1–1.5 s: forwards never sent (`forward_unsent`, the session held), and one location round unavailable |
+| + resend an unsent forward to a live owner | 7 | `LeaseUnconfirmed` (the owner's lease not yet confirmed) and `OwnerUnreachable` (no owner located), both in round 1 |
+| + the client sends a read page again after either refusal | 9 | none; reads 34.7–65.5 s, all byte-identical |
+
+The median read (about 25 s) is about 1.8× faster than the 44 s of 2026-10-08's landed build, from the day's other
+changes or the load; it was not A/B'd.
+
+### The read-ahead batch's rate cap removed: cross-region reads 2.7x faster on the real crossing (condition 7; 2026-10-08)
+
+The owner's sessions (above) showed windows of about 9 KB on the crossing. The question was whether Copa or the read
+path held them there. The read path's batch was capped at what the path's measured delivery rate moves in one
+liveness budget. Every batch is app-limited by construction, since it asks for exactly its windows, so the cap fed
+on its own small batches: a low rate held the next batch to one window, which measured a low rate again.
+Delivery-rate estimation as BBR uses it never lets an app-limited sample lower the estimate
+(draft-cheng-iccrg-delivery-rate-estimation §3.3).
+
+Command: `IMAGE=<image> sh docs/wip/bench/multiregion/reads.sh <scratch> <8 MiB payload> 3` on the two-network topology
+(100 ms ± 40 ms one way, 3% loss each way). Three readers in region 1 × three rounds, all N shown. Load average 4–8.
+
+| Image | Cross-region reads of 8 MiB (s) | Forwards | Windows joined |
+|---|---|---|---|
+| `4f627c6e` (the rate cap) | 97.4, 108.4, 111.3, 117.8, 119.4, 119.7, 124.5, 128.6, 131.1 | 354 | 39 |
+| experiment: the cap removed (uncommitted) | 28.5, 33.9, 34.6, 38.7, 41.3, 42.7, 47.3, 49.2, 51.7 | 24 | 369 |
+| as landed (the cap and its rate removed) | 26.5, 33.1, 39.6, 41.3, 44.1, 47.9, 47.9, 49.8, 52.2 | 24 | 369 |
+
+Every read in all three arms was byte-identical; none was refused. The median fell from about 119 s to about 44 s.
+Held-session waits fell (`fleet.forward.session_out` 13 → 3).
+
+**Correction (same day): the record session's window is not shown to be the next bound.** The owner's record sessions
+to the three readers, sampled every 2 s during one round, held 10.8–11.6 KB windows, slowly shrinking, at 199–267 ms
+RTT. The reads in that round took 31.8–46.2 s, about 180–260 KB/s each, but an 11 KB window at 240 ms allows about
+46 KB/s. So either the reads' bytes do not all cross that one window, or the reported window is not what limits the
+send. The read's real path (which sessions carry a batch's windows) must be identified before any controller change;
+the "9 KB bounds the crossing" reading above came from idle snapshots.
+
+The simulator did not show this. `fetch_bench`'s fetch keeps the pipe full, so it never runs app-limited. A
+`crossing` scenario matching this link (1 Gbit/s, 200 ms, ±40 ms reordering each way, 3% loss each way) reads 8 MiB in
+35.4–59.7 s with 31–43 KB windows and 196–353 spurious losses, while the real crossing showed 0 spurious losses. The
+simulator's jitter and the real netem's differ, so a controller change is A/B'd on both.
+
+### The crossing's carrying connections, read at last: windows grow, and reordering is read as loss (condition 7; 2026-10-08)
+
+The correction above was right to doubt the 11 KB windows, and the reason is now shown. A forward rides the
+*reader's* dialed record session, whose sender state lives in the owner's serve loop. Status reported only the
+sessions the owner dialed. `302ea768` adds `served_sessions`. Sampled every ~6 s during a crossing round (100 ms ±
+40 ms, 3% loss each way):
+
+| Reader's connection at the owner | Window during its read | Smoothed RTT | Spurious losses |
+|---|---|---|---|
+| first | 25.8 → 28.4 → 41.5 → 50.0 KB, then 37.4 KB | 150–221 ms | 5 → 7 → 21 → 52 → 112 |
+| second | 11.6 → 30.6 → 32.0 → 35.9 → 71.2 KB | 156–218 ms | 0 → 6 → 9 → 22 → 53 |
+| third (not yet reading) | 11.4–11.6 KB | 188–216 ms | 0 |
+
+- **Windows grow during a read, to 50–71 KB.** The 9–11 KB readings, here and in the first table above, were idle
+  connections or the wrong ones.
+- **The real crossing reorders, and the reordering is read as loss.** The carrying connections declared dozens to
+  over a hundred spurious losses per read. The first connection's window fell from 50.0 to 37.4 KB as its spurious
+  losses went from 52 to 112.
+- **So the simulator's crossing scenario is a fair proxy after all:** 31–43 KB end windows, 196–353 spurious losses,
+  35.4–59.7 s for 8 MiB, against about 44 s for the real reads. The "0 spurious losses" in the earlier tables came
+  from the wrong connections.
+- **Next bound, owed:** reordering mistaken for loss. RACK widens its reordering window per spurious retransmission
+  (RFC 8985 §6.2). Each candidate is A/B'd on `fetch_bench crossing` first, then on this crossing.
+
+### Measured-and-rejected: undoing Copa's loss reaction when its losses prove spurious (condition 7; 2026-10-08)
+
+The idea was RFC 4015's Eifel response, as Linux applies it on DSACK. In the competitive mode, Copa halves `1/δ` on a
+loss, at most once per round trip. The arm recorded `1/δ` before each halving and the packets declared lost behind
+it. It restored `1/δ` once every one of those packets had been acknowledged late (`reorder::on_acknowledged`'s
+spurious list). Unit-tested: restored after all losses proved spurious, kept behind any real loss. Counters:
+reactions and undone reactions.
+
+Command, both arms built in release at `7a8748c1` (HEAD in its own worktree and target directory; the arm on top),
+run back to back on this Mac (Apple M5 Max, 2026-10-08):
+`FETCH_BENCH_SEED=$n fetch_bench crossing` for n = 1..8, the default 64 chunks (4 MiB), one reader, one holder.
+
+| Seed | HEAD (ms) | Undo arm (ms) | Reactions undone / taken |
+|---|---|---|---|
+| 1 | 16,576 | 16,576 | 0 / 4 |
+| 2 | 21,013 | 21,013 | 1 / 19 |
+| 3 | 32,431 | 29,546 | 5 / 32 |
+| 4 | 18,549 | 22,230 | 4 / 30 |
+| 5 | 15,010 | 20,206 | 8 / 34 |
+| 6 | 22,647 | 22,647 | 2 / 19 |
+| 7 | 16,577 | 18,385 | 4 / 23 |
+| 8 | 22,632 | 21,808 | 4 / 22 |
+
+The mean was 20.7 s on HEAD and 21.6 s with the arm: worse in three seeds, better in two, equal in three. Rejected;
+the code was removed, not kept behind a switch.
+
+What it showed:
+- **The competitive mode does engage on the crossing** (4–34 loss reactions per 4 MiB read). The ±40 ms reordering
+  keeps the queue from ever looking empty.
+- **Most reactions follow a real loss.** With 3% real loss each way, only 0–8 of 4–34 had every loss behind them prove
+  spurious. So the spurious losses are not what holds the window through `1/δ`.
+- The window's remaining suspect is Copa's delay signal itself: reordering jitter read as queueing delay
+  (`RTTstanding − RTTmin`) shrinks the target rate whether or not any loss is declared. That is the next candidate,
+  A/B'd the same way.
+
+### Landed: Copa reads summed jitter from its two least samples (condition 7; 2026-10-08)
+
+**Why.** A trace of Copa's inputs on `fetch_bench crossing` (seed 1, 427 epoch samples) showed the read sitting at Copa's
+own equilibrium on an empty 1 Gbit/s bottleneck:
+- the queue estimate had a median of 6 ms (p90 25 ms) with no queue at all;
+- `RTTstanding` sat 14 ms above `RTTmin` at the median, of which the jitter estimate removed 7 ms;
+- the window was 30–56 KB, and `cwnd/RTTstanding` was about 385 KB/s, which is Copa's target `2/d_q` at 6 ms;
+- the competitive mode was on in only 8 of 427 samples.
+
+The landed jitter estimate (2026-10-07, above) modelled each sample's jitter as uniform: the least of `n` samples
+`W/(n+1)` above the floor. A round trip's jitter is the sum of the two directions'. Near its floor the density of a
+sum rises from zero (`F(x) ∝ x²`), so the least of 20 samples sits about `a·√(π/2n)` above it. Simulated over 4,000
+epochs of 20 samples, with two one-way jitters uniform over 0–80 ms:
+
+| | Mean excess over the floor |
+|---|---|
+| true (least sample less floor) | 22.1 ms |
+| uniform model | 5.0 ms |
+| landed estimate | 21.0 ms |
+
+**What.** For a lower tail `F(x) ∝ x^α`, the least sample's expected excess is `α` times the expected gap to the
+second least (extreme-value order statistics; Hill, Annals of Statistics 1975). With `α = 2` for summed jitter, the
+epoch's excess is the larger of the uniform estimate and `2·gap`. Two guards keep a queue out of it, each A/B'd:
+- **S:** the gap first loses the sender's own interval per packet, `smss·RTTstanding/cwnd`, because a queue spaces
+  its samples by at least a service time;
+- **T:** the gap counts in proportion to the epoch's turning points against the `2(n−2)/3` independent samples show
+  (the turning-point test; Brockwell & Davis §1.6), because a filling or draining queue turns rarely.
+
+**Commands** (Apple M5 Max; simulated network, virtual clock, deterministic per seed):
+- `FETCH_BENCH_SEED=<1..8> fetch_bench crossing` (4 MiB, 1 Gbit/s, 200 ms, ±40 ms reordering and 3% loss each way);
+- `FETCH_BENCH_SEED=<1..8> fetch_bench thin 128` (8 MiB on the 10 Mbit/s, 200 ms thin link);
+- `congestion_bench` (the 58-scenario grid, three seeds each).
+
+Both arms were built in release from the same tree.
+
+Crossing, 4 MiB, mean of 8 seeds:
+
+| Arm | Mean | Range |
+|---|---|---|
+| `HEAD` | 20.7 s | 15.0–32.4 s |
+| `2·gap`, zigzag share only | 8.5 s | 5.9–10.1 s |
+| T | 6.9 s | 5.6–8.0 s |
+| S | 10.0 s | 7.6–15.6 s |
+| **S and T (landed)** | **9.6 s** | **7.1–14.0 s** |
+
+Grid against `HEAD`, by geomean, with the rows that moved more than 10%:
+
+| Arm | Share | Steady ping p99 | Rows worse > 10% | Rows better > 10% |
+|---|---|---|---|---|
+| zigzag share only | ×1.001 | ×1.025 | 8, incl. burst loss 148 → 254 ms and 1 Mbit/s 100 ms no loss 135 → 183 ms | 3 |
+| T | ×1.001 | ×1.008 | 7, incl. 64 kbit/s 300 ms 0.1% loss 586 → 794 ms | 4 |
+| S | ×1.002 | ×1.003 | 3, incl. 10 Mbit/s 300 ms 1% loss 569 → 766 ms | 1 |
+| **S and T** | **×0.999** | **×1.001** | **2: the reordering row 32.1 → 36.7 ms (its share 0.857 → 0.914); 1 Mbit/s 100 ms 5% loss 402 → 507 ms (one seed 383 → 635 ms, the others +14% and +2%)** | **2: 10 and 100 Mbit/s, 20 ms, 5% loss** |
+
+Thin link, 8 MiB, median of 8 seeds (S and T against `HEAD`):
+
+| Row | `HEAD` | Landed |
+|---|---|---|
+| reordering ±40 ms, no loss | 24.3 s (15.9–34.2) | 12.6 s (9.7–15.0) |
+| reordering ±40 ms, 2% loss | 32.8 s (22.0–49.3) | 13.3 s (11.7–16.9) |
+| jitter ±40 ms in order | 24.1 s (7.9–30.1) | 21.1 s (11.5–37.5) |
+| 2% loss, in order | 8.0 s | 8.0 s |
+
+The in-order jitter row's median improved but its spread widened (max 30.1 → 37.5 s).
+
+**The one grid row that worsened, widened to 16 seeds** (`CONGESTION_BENCH_SEEDS=1,…,16 congestion_bench
+"rate=1000000 rtt=100ms loss=5%"`, the commit before and the commit that landed it, same day): steady ping p99 median
+396 → 418 ms (+5.6%), mean 418 → 442 ms (+5.7%), worst seed 557 → 635 ms; share 0.884 → 0.883. A small, real cost on
+a 1 Mbit/s lossy link, not the one seed it looked like at three seeds; recorded against the crossing's 2×.
+
+Measured and rejected the same day: the turning-point test applied as a test (no tail term when the epoch has fewer
+turns than independence allows, beyond two standard deviations of variance `(16n−29)/90`) rather than in proportion.
+The worsened row got worse again (16 seeds, mean 442 → 462 ms, worst 635 → 709 ms), and the crossing slowed on seed 1
+(7.9 → 13.8 s, the other seven equal). An epoch that is part trend and part jitter loses its tail evidence whole.
+
+**The real crossing.** Command: `IMAGE=slates:mr-<arm> sh docs/wip/bench/multiregion/reads.sh <dir> <8 MiB payload> 3`.
+This is the two-network Docker topology, 100 ms ± 40 ms one way with 3% loss. Each run reads 8 MiB from b0, b1 and b2
+in the other region, three rounds each. Both images were built from the same commit (`HEAD` from a worktree, the
+estimator from the tree), and the runs alternated: `HEAD`, estimator, `HEAD`, estimator. Load average 4–7 from other
+sessions.
+
+| Arm | Reads | Median | Range | All byte-identical |
+|---|---|---|---|---|
+| `HEAD` | 18 | 49.0 s | 31.0–62.6 s | yes |
+| estimator | 18 | 24.9 s | 18.9–33.0 s | yes |
+
+The owner's served sessions ended with windows of 85–127 KB, against 22–44 KB at `HEAD`, still with hundreds of
+spurious losses each (455–676). Reordering read as loss no longer costs window, because Copa's default mode ignores
+loss. The window had been bound by the delay signal.
+
+Cleaned up: the arms' code is the landed code only; the trace used to find this was removed.
+
+### Landed: a write that covers a sealed window whole opens it without reading it (conditions 5 and 12; 2026-10-09)
+
+Found by profiling a sustained overwrite over the macOS NFS mount (`sample` of the daemon, 2 s mid-write). Of the busy
+shard's active samples, 665 were the socket receive, 290 memmove, 226 AES-GCM encrypt and 201 AES-GCM decrypt. A
+pure write stream should decrypt nothing. Each WRITE reopened its window's sealed extent (`ChunkStore::reopen`):
+- it decrypted the old chunk (A-99);
+- it copied the old bytes twice;
+- then the write overwrote them.
+
+Now a write from a window's start at least as long as the window's sealed extent opens the window fresh
+(`ChunkStore::replace`, non-vacuity counter `replaced_unread`). The old chunk is released by the same epoch rule, so a
+snapshot keeps it. The fresh block holds the write's first window whole, so the write cannot stop partway with the old
+bytes gone.
+
+**Where it applies.** The window is 16 pages:
+- on Linux, 64 KiB, and the kernel client writes 256 KiB (`wsize=262144`), so every aligned WRITE covers whole
+  windows;
+- on macOS, 256 KiB, and the mount asks for 128 KiB transfers (`MACOS_TRANSFER_BYTES`), so no WRITE covers one.
+
+The macOS A/B was therefore even, as expected: 923–1,243 MiB/s and 6.8–7.6 s of daemon CPU in both arms, client-bound.
+
+**Command:** `docs/wip/bench/overwrite/linux.sh` in a privileged `python:3.12-slim-trixie` container.
+- A Linux release build of each arm, from its own target volume and source tree.
+- A 512 MiB random file is overwritten six times per round in 1 MiB writes, with an fsync per pass, through the kernel's
+  NFSv4.2 client on loopback; three rounds per container.
+- Arms run new, base, new, base after base, new, base, new: twelve rounds each.
+- Apple M5 Max, Docker Desktop 6.12 kernel, load average 10–17 from other sessions.
+
+| arm | daemon CPU per 3 GiB, median (range) | throughput, median (range) |
+|---|---|---|
+| base (`53e182e6`) | 4.55 s (3.91–7.84) | 644 MiB/s (365–759) |
+| replace unread | 3.64 s (3.07–4.86) | 760 MiB/s (599–912) |
+
+Daemon CPU per byte fell 20% and throughput rose 18%. The daemon is CPU-bound on this path (CPU about equal to wall
+time), so the CPU it saves is throughput. Linux's own nfsd measured 967–1,524 MB/s on the same storm (above), so the
+remaining gap is still owed a profile.
+
+### Landed: a written file's delta carries its written windows (A-126; conditions 5 and 12; 2026-10-09)
+
+Found by profiling the daemon (`perf record` in the privileged container, 2 s mid-write) after `acb68d89`:
+- `extent_image` was 10.6% of samples, under `encode_publication` and `publish_shard`;
+- encoding the extent list was 3.0%, and iterating it 2.6%.
+
+Every barrier re-imaged every extent of a written file. The kernel client sent 1,781 COMMITs in 18 passes, about
+one per 5 MiB written, and each imaged all 8,192 of the 512 MiB file's 64 KiB windows. A file changed only by writes
+to its chunked body is now published as its written windows: spans of whole windows, ascending and coalesced (A-126).
+
+**Sequential overwrite** (`docs/wip/bench/overwrite/linux.sh`; Linux release builds, each from its own target volume):
+- arms alternated `acb68d89`, patch, `acb68d89`, patch, then the reverse: twelve rounds each, three per container;
+- Apple M5 Max, Docker Desktop 6.12 kernel, load average 7.5–11.4 from other sessions.
+
+| arm | daemon CPU per 3 GiB, median (range) | throughput, median (range) |
+|---|---|---|
+| `acb68d89` | 3.92 s (3.21–5.05) | 753 MiB/s (592–886) |
+| written windows | 2.56 s (2.13–3.06) | 1,143 MiB/s (945–1,358) |
+
+That is 35% less daemon CPU per byte and 52% more throughput. Linux's own nfsd measured 967–1,524 MB/s on the same
+container shape (2026-10-05), so this path now writes at kernel-server speed. After the change, publication is about 5%
+of the daemon's samples (`extent_image` 2.5%, CRC 2.3%). What remains:
+- memcpy, about 31%: RPC record reassembly 6.3%, the arena write 4.5% (the one a write needs), `open_window` 3.3%,
+  `Call::parse` 3.1%, the v4-to-v3 WRITE re-encode 2.6%, seal 1.8%;
+- AES-GCM at rest, 19.7% (condition 9);
+- the kernel's receive copy, 12.8%.
+
+**Random small writes, a database's pattern** (`docs/wip/bench/overwrite/random.sh`): the 512 MiB file is written once,
+then each round makes 4,000 random page-aligned 4 KiB writes with an fsync every 8.
+- Arms rotated base, hull, spans, then spans, hull, base: six rounds each.
+- "Hull" is a first cut that recorded one range per file, the hull of its writes.
+
+| arm | fsyncs per second, median (range) | daemon CPU per round |
+|---|---|---|
+| `acb68d89`, the whole file per COMMIT | 390 (240–527) | 0.96–2.05 s |
+| one hull per file | 451 (385–486) | 1.03–1.29 s |
+| spans (landed) | 1,645 (1,456–2,136) | 0.22–0.35 s |
+
+**Measured and rejected: one hull per file.** A transaction's random pages span nearly the whole file, so the hull was
+no better than the whole image: 451 against 390 fsyncs/s. Spans carry only the windows written: 4.2× the commit rate
+at about a fifth of the daemon CPU.
+
+**The same random pattern's fsync latency** (`random.sh` now times every fsync; 2026-10-09):
+- arms base (`acb68d89`) and A-126 (`5fd6d3af`) alternated twice, three rounds each, 500 fsyncs a round;
+- load average 15–16 from other sessions.
+
+| arm | fsync p50 | p99 | p999 | max |
+|---|---|---|---|---|
+| base, the whole file per COMMIT | 2.83–3.23 ms | 3.52–6.22 ms | 5.29–12.94 ms | 12.94 ms |
+| A-126, written windows | 0.48–0.74 ms | 0.75–1.37 ms | 2.81–4.36 ms | 4.36 ms |
+
+A database's commit through the kernel client now waits under 1.4 ms at p99 on a busy machine, against 3.5–6.2 ms
+before. Against Tectonic's published tails (blob writes reaching 150–200 ms; FAST'21, Figure 3), the comparison is of
+what a caller waits for under the pattern, not of the media: slates commits to anchor RAM, Tectonic to disks across a
+datacenter.
+
+### Landed: NFS replies built as their own records and sent without gathering (2026-10-09)
+
+Found by profiling the daemon during O_DIRECT reads through Linux's NFSv4.2 client (`docs/wip/bench/overwrite/` with a
+read script; reads at 1.6–1.9 GB/s with the daemon CPU-bound). Each 256 KiB READ reply was copied four times in user
+space before the kernel's own copy:
+
+| copy | share of samples |
+|---|---|
+| into the compound's buffer (`compound::record`) | 5.3% |
+| into the RPC reply (`reply_bytes`) | 4.1% |
+| into a framed record (`write_record`) | 4.8% |
+| into the turn's send run (`serve_connection`) | 3.4% |
+
+The reply is now built as its own record (`rpc::reply_record`: the marker reserved, the header and the results written
+once). A turn's records go out as slices in one `writev` (`TcpStream::send_records_vectored`), so a run is never
+copied into one buffer, and the whole-send guarantee of A-113 still holds (XNU's `sosend` judges the whole request).
+The arguments of each call are kept in place in their record body (`Call::args`), not copied out.
+
+**Measured in process** (`reply_record` against `reply_bytes` then `write_record` then the run copy, a 256 KiB result,
+20,000 replies, three passes, release build on Apple M5 Max at load 14–28): 15.1–17.0 µs per reply before,
+3.77–3.85 µs after.
+
+**In the daemon's profile:**
+- memcpy fell from 21.9% to 16.8% of samples during reads;
+- `reply_bytes`, `write_record` and the run's copy are gone;
+- `reply_record` is the one copy of the results (5.6%).
+
+**Through the kernel client the throughput A/B was within noise:**
+- the `Call` change alone against the full change: 1,819 against 1,844 MiB/s median over nine rounds each;
+- against the storm-fixed base, four alternations at load 21–52 spanned 351–2,051 MiB/s in both arms.
+
+The change is landed on the in-process and profile measurements, not on that A/B. The compound's copy of the READ
+data (5.3%) and AES-GCM decryption (29%, A-99's per-read open) remain.
+
+### Kills during random writes against A-126's written-window deltas (condition 11; 2026-10-09)
+
+**Command:** `docs/wip/bench/kill_writes.sh` (new) in a privileged `python:3.12-slim-trixie` container, on a Linux
+release build of `faad1562`.
+- A writer makes random 4 KiB writes into a 64 MiB file on an NFSv4.2 hard mount, with an fsync every 8, keeping its own
+  copy of the file.
+- Meanwhile the daemon is SIGKILLed `KILLS` times, `GAP` seconds apart, and the anchor restarts it. Every restart replays
+  the journal, whose deltas carry written windows (A-126).
+- After the writer's last fsync the volume is remounted, so the client's cache is cold, and the file is compared with
+  the writer's copy.
+- Load average 9–15 from other sessions.
+
+| run | writes / fsyncs | kills | restarts | writer time | longest fsync | file after remount |
+|---|---|---|---|---|---|---|
+| `KILLS=10 GAP=1.5` | 200,000 / 25,000 | 10 | 10 | 25.7 s | 0.07 s | identical |
+| `KILLS=10 GAP=1.5` | 200,000 / 25,000 | 10 | 10 | 15.6 s | 0.03 s | identical |
+| `KILLS=30 GAP=0.3` | 200,000 / 25,000 | 30 | 30 | 14.8 s | 0.03 s | identical |
+| `KILLS=30 GAP=0.3` | 200,000 / 25,000 | 30 | 30 | 13.6 s | 0.03 s | identical |
+
+Every byte the writer wrote survived 80 SIGKILLs in all, each recovery replaying windowed patches. No fsync waited
+longer than 70 ms across a kill: the anchor restarts the daemon from its RAM in milliseconds.
+
+### The hot-directory storm after the probe-storm fix: delegations granted again (condition 12; 2026-10-09)
+
+Command: `docs/wip/bench/hotdir/native.sh WORKERS 500` (Linux's own NFSv4.2 client against a daemon in the same
+privileged container). Arms:
+- spans (`5fd6d3af`-era, before `9c0d5057`, its back channel caught in the probe storm);
+- HEAD (`faad1562`).
+
+Alternated twice at 1 and 16 workers; load average 4.7–8.2.
+
+| workers | op | before p50 / p99 | after p50 / p99 |
+|---|---|---|---|
+| 1 | create+write+close | 450–466 / 758–841 µs | 178–232 / 359–508 µs |
+| 1 | open+read+close | 294–301 / 524–643 µs | 27–35 / 83–135 µs |
+| 1 | ops/s | 3,582–3,748 | 9,485–12,684 |
+| 16 | create+write+close | 4,019–4,149 / 6,075–6,593 µs | 1,698–1,740 / 3,186–3,390 µs |
+| 16 | open+read+close | 1,362–1,431 / 4,566–4,799 µs | 948–981 / 3,458–3,933 µs |
+| 16 | stat | 45–58 / 1,952–1,993 µs | 131–137 / 1,896–1,994 µs |
+
+- With the back channel up, the client holds read delegations and serves an open of a file it delegated from its
+  cache. A single writer's open+read fell about 9×, and CLOSEs halved (1,000 → 500).
+- At 16 workers the elapsed time stays about 7 s: tmpfs takes the same, so Python's GIL bounds it, not the file system.
+- Against Tectonic's published tails (writes reaching 150–200 ms, reads about 100 ms; FAST'21): sixteen writers in one
+  directory now see create p99 3.4 ms and read p99 3.9 ms.
+- Owed: at 16 workers `stat`'s p50 rose from 45–58 to 131–137 µs (its p99 is unchanged), with GETATTRs at 91–697 against
+  81. The client revalidates more under delegations; not yet traced.
+
+**Follow-up, same day: NFSv4 replies framed in place.** The compound now encodes its results after the record marker
+and RPC header reserved by the server (`compound::serve_into`, `rpc::success_record_head`), which fills them in last
+(`rpc::finish_success_record`). The results are no longer copied to be framed:
+- `reply_record`'s 5.6% is gone;
+- memcpy fell from 16.8% to 10.1% of the daemon's samples on the O_DIRECT reads;
+- the remaining copies are the decrypted chunk's into the read buffer (6.1%, the one a read needs) and the compound's
+  `record` of the READ result (3.7%).
+
+The throughput A/B (three alternations at load 21–28) was swamped by load spikes that landed on the in-place arm's
+rounds: 578, 612 and 908 MiB/s, against 1,714–1,993 MiB/s in its unloaded rounds and 1,576–2,026 MiB/s for HEAD. It is
+landed on the profile and on the copy removed, measured above at about 3.8 µs per 256 KiB reply. A wire test holds the
+in-place framing byte for byte to `reply_record` over 2,000 cases.
+
+### Measured and rejected: a deeper macOS NFS read-ahead (2026-10-09)
+
+The macOS mount leaves `NFS_MATTR_READAHEAD` at the kernel's default of 16 READs ahead. An experiment binary set it
+from the environment (attribute 6 in `MountArgs::encode`, never committed).
+- Each run: 3 GiB read six times through `slates mount` with `F_NOCACHE`, from a cold client cache. The file was written,
+  then the volume unmounted and mounted again.
+- Arms alternated twice; Apple M5 Max at load 23–30.
+
+| read-ahead | 3 GiB read rate | daemon CPU per run |
+|---|---|---|
+| default (16) | 570–1,247 MiB/s | 4.7–5.7 s |
+| 32 | 775–1,388 MiB/s | 4.5–5.6 s |
+| 64 | 526–834 MiB/s | 5.3–5.9 s |
+| 128 | 303–1,280 MiB/s | 4.8–5.9 s |
+
+Dead even within the load's noise, so it does not land.
+
+A first sweep had read the cached copy at about 10 GB/s with 0.5 s of daemon CPU: `F_NOCACHE` stops caching but
+does not evict what the write cached. Any macOS read benchmark must remount after writing.
+
+On these cold reads (428–473 MiB/s on HEAD at load 20) the daemon's samples are mostly waits in `kevent`. Under that
+load the macOS `sample` tool also counts preempted threads at whatever user function they were in, so small functions'
+counts are not their CPU time.
+
+### Exactly-once across daemon kills: the mixed kill bench, before and after A-127 (condition 11; 2026-10-09)
+
+**Command:** `docs/wip/bench/kill_mixed.sh` (new) in a privileged `python:3.12-slim-trixie` container, with
+`SEED=<seed> OPS=30000 KILLS=30 GAP=0.4`, on Linux release builds.
+- A Linux NFSv4.2 client makes 30,000 random operations over at most 16 files: creates, writes inside and past the end,
+  truncates shorter and longer, appends, unlinks and renames. Each opens, acts and closes its file.
+- Meanwhile the daemon is SIGKILLed 30 times, 0.4 s apart, and the anchor restarts it.
+- The workload keeps a model of every file and records any operation that fails, with whether its file exists afterwards.
+- After the storm the volume is remounted, so the client's cache is cold, and the tree must equal the model name for name
+  and byte for byte.
+- Since A-127 the bench also reads each daemon life's `nfs4.replay.*` counters just before killing it, and sums them.
+- Load average 14–40 from other sessions.
+
+Before (`e494963d`-era build, `linux-inplace`):
+
+| seed | result |
+|---|---|
+| 101 (first attempt, 20 kills) | `unlink` raised `ENOENT` for a file the model held |
+| 101 (5 reruns) | identical |
+| 8 | `unlink("r1668")` raised `ENOENT`; the file was gone after |
+| 9 | `rename("f23670", "r23676")` raised `ENOENT`; the tree held `r23676`, the model did not |
+| 7, 10, 11 | identical |
+
+After (A-127), three builds as the change was refined:
+
+| build | seeds | kills | result |
+|---|---|---|---|
+| first cut | 8, 9, 101, 7, 10, 11 | 180 | identical; the divergence counter fired 2–14 times a life, false positives fixed in the next build |
+| divergence fix | 11, 8, 9 | 90 | identical; no divergence |
+| final | 8, 9, 101, 7, 10, 11 | 180 | identical; no divergence. Per seed, 29–49 records restored over the killed lives; seed 11's lives answered one retry from its record |
+
+- 450 kills across 15 seeds without a failed operation, against 3 of 13 seeds failing before.
+- The window the bug needs, between a barrier and its reply's send, is narrow: the final 180 kills hit it once, and that
+  retry was answered from its record instead of being run again.
+
+### The cost of call records: a single writer's create storm, before and after A-127 (2026-10-09)
+
+**Command:** `docs/wip/bench/hotdir/creates.sh` (new), alternating a build without A-127 (`e494963d`-era) and the final
+A-127 build, six rounds each, in privileged containers on this machine. Every create opens with a compound whose reply
+the client asks to be kept, and closes with another, so both are recorded.
+
+| round | load (1 min) | before: creates/s, p50, p99 | after: creates/s, p50, p99 |
+|---|---|---|---|
+| 1 | 40 / 34 | 4,675, 187.6 µs, 438.5 µs | 4,708, 191.8 µs, 401.1 µs |
+| 2 | 28 / 25 | 4,618, 195.9 µs, 410.0 µs | 4,434, 202.2 µs, 420.3 µs |
+| 3 | 17 / 15 | 4,549, 195.4 µs, 426.6 µs | 4,385, 206.4 µs, 423.3 µs |
+| 4 | 15 / 13 | 4,674, 192.5 µs, 408.0 µs | 3,098, 239.5 µs, 2,814 µs |
+| 5 | 17 / 18 | 1,500, 241.6 µs, 7,523 µs | 3,595, 228.8 µs, 1,707 µs |
+| 6 | 20 / 18 | 1,851, 214.4 µs, 5,303 µs | 4,333, 199.8 µs, 459.5 µs |
+
+- Rounds 1–3 are undisturbed in both arms: +4, +6 and +11 µs on a p50 near 195 µs (2–5%), and −4% to +1% in creates per
+  second. Rounds 4–6 each have one arm hit by a load spike, in both directions.
+- In one daemon, the same OPEN+CLOSE pair alternately kept and not kept, 4,000 pairs each in interleaved blocks of 250
+  (a scratch harness over the restart suite's NFSv4 client, macOS release, three runs): p50 57/57/58 µs not kept against
+  59/62/59 µs kept. That difference includes the slot cache's copy of a kept reply, which predates A-127.
+- Measured and rejected, in the first cut, at 192 → 216 µs median p50 and 4,519 → 4,061 creates/s (five alternated
+  rounds):
+  - a record that rode every publication once durable, re-carried for each read after its change;
+  - a record that rode publications for file-state changes too;
+  - BLAKE3 as the argument digest, 0.47% of the daemon's samples, on its portable path.
+  The replacements: a record rides a publication only for a volume change, a file-state change's record rides its own
+  transaction, the digest is FxHash's word mix, and answering skips the lookup while no restored record is held.
+- Owed: a state transaction carries the slot's whole record, the entries a publication already carried included. A record
+  split between the image's prefix and the transaction's suffix, merged at restore, would trim those entries.
+
+### NFSv3 mutations on a held connection under kills, before and after A-128 (condition 11; 2026-10-09)
+
+**Command:** `SLATES_TEST_CLI=1 cargo test -p slates-cli --test nfs_held a_mutation_applied_before -- --nocapture`
+(macOS 26, debug build, the real `slates anchor`).
+- One held loopback connection pipelines bursts of 24 MKDIRs of fresh names.
+- Each burst's daemon is `kill -9`ed partway in: half the kills follow the burst's first reply, half come at a fixed
+  delay.
+- A burst's requests stay in the socket until the turn that answers them has sent its replies (A-113).
+- Load average 70–85 from other sessions.
+
+| build | runs | kills | MKDIRs first answered `NFS3ERR_EXIST` | answered from held replies |
+|---|---|---|---|---|
+| before (A-127, no held replies) | 1 | 20 | 10 of 480 | (counter absent) |
+| A-128 | 8 | about 160 | 0 | 1–38 per run |
+
+- Before, the run-again requests came in runs of one turn (`d03-00`…`d03-03`, `d06-09`…`d06-12`).
+- After, a successor restored 7–23 held replies per death that printed. Most were replies whose requests had already
+  been consumed, and those are never asked for.
+- A-113's WRITE-burst flow at the same load: longest kill-to-answer about 1.2 s in some runs and 190–270 ms in others,
+  in both the base build and this one, three alternations each. The 1.2 s runs are the anchor's crash-loop backoff
+  (A-119): its log says "restarting it in 1000 ms" when kills come faster than the restart bound derived from the start
+  p99, which load raises. A-113's 123–126 ms was recorded at lower load.
+
+### Landed: one pressure sampler a daemon, holds sent only when they change (battery; 2026-10-09)
+
+**Command:** `idle_csw.sh <binary> <instance> 60 [shards]` (a scratch script, its whole body below). It starts `slates
+anchor` from a release build, waits 15 s after the daemon appears, and reads the daemon's context switches from
+`top -l 1 -pid <daemon> -stats csw` before and after 60 s. Arms alternated: the base `5dd8f3dd` and the change.
+macOS 26 on this 18-core machine, load average 75–109 from other sessions.
+
+```sh
+"$BIN" --instance "$INSTANCE" anchor ${4:+--shards $4} > /dev/null 2>&1 &
+# … wait for `pgrep -f "instance $INSTANCE daemon"`, sleep 15 …
+A=$(top -l 1 -pid "$D" -stats csw | tail -1 | tr -dc '0-9'); sleep 60
+B=$(top -l 1 -pid "$D" -stats csw | tail -1 | tr -dc '0-9')
+echo "csw_per_s=$(( (B - A) / 60 ))"
+```
+
+| shards | base: context switches/s (per 60 s run) | one sampler, sent on change |
+|---|---|---|
+| 5 (this machine's default) | 36, 36, 39 | 27, 27, 27 |
+| 16 | 113, 142 | 43, 39 |
+
+- **Cause:** every shard runs a reap loop, and each loop sampled the host's memory and sent its hold to every shard
+  every second. N shards sent N² messages a second at rest, and a message to a parked shard wakes it.
+- **Change:** only the control shard samples, and a hold goes to a shard only when it differs from the last one sent. A
+  daemon at rest sends none.
+- The saving grows with the square of the shards: 25–30% of an idle 5-shard daemon's switches, 65–72% of a 16-shard
+  one's.
+- `top`'s idle-wakeup column read 0 for every process at this load, since no core was idle. Context switches are the
+  measurable stand-in here; a quiet machine's `powermetrics` run is owed.
+
+### Landed: the daemon process's thread waits on the heartbeat instead of polling (battery; 2026-10-10)
+
+**Command:** the same `idle_csw.sh` as the one-sampler entry above (release builds, a 15 s settle, then `top`'s context
+switches over 30 s), alternating `8d2343a6` and the change, one shard each. macOS 26 on this 18-core machine, load
+average 18–30.
+
+| build | context switches/s at rest, one shard |
+|---|---|
+| `8d2343a6` | 34, 32 |
+| the change | 24, 23 |
+
+- **Found by fitting idle switches against the shard count** at `8d2343a6`: 38, 36, 40 and 51 a second at 1, 2, 4 and 8
+  shards. That is about 35 a second per daemon and about 2 per shard. `sample` of an idle one-shard daemon showed
+  three threads:
+  - the shard, in `kevent`;
+  - the doorbell thread, in a one-second `os_sync_wait_on_address_with_timeout`;
+  - the process's main thread, in `park_timeout` every heartbeat (100 ms), asking whether a signal arrived, whether the
+    anchor asked for a stop, and whether the anchor still lives. Each ask of the anchor's stop word also allocated: it
+    rebuilds the segment's whole region list to find one region.
+- **Change:** the control shard's heartbeat, which beats at that cadence anyway, asks the same three questions
+  (`Daemon::wait_for_stop`), and the process's thread blocks on a channel until one holds. Stop latency is unchanged:
+  one heartbeat.
+- **Proven by use:** the CLI's anchor-death flow ("the anchor is gone; leaving"), the SIGTERM drain flow ("stop
+  requested; drained", leadership handed off before exit) and the restart flows, all with `SLATES_TEST_CLI=1`.
+- **Left as it is:** the anchor's own 11 switches a second at rest (it reads the daemon's heartbeat each beat, so a
+  wedged daemon is caught within one beat of the liveness budget; crashes reach it through its exit watch), and the
+  doorbell thread's one-second bound.
+
+### Landed: an anchor region found by arithmetic, not by building the layout (CPU; 2026-10-10)
+
+**Command:** a scratch test, not kept, over a real `AnchorSegment` (release, this machine, load 20–45). It reads every
+pool owner word (`pool_owner`) of a fresh segment 200 times and reports the mean per read and per whole-pool scan:
+5 and 18 partitions, 64 owner words each. Arms: `ce01b29b`, the cached-table cut, and the final arithmetic lookup.
+
+| build | per owner word, 5 / 18 partitions | one whole-pool scan, 5 / 18 partitions |
+|---|---|---|
+| `ce01b29b` (each lookup builds the region list) | 189 ns / 340 ns | 60 µs / 391 µs |
+| final: `Geometry::region` by arithmetic (three runs) | 11–15 ns / 9–14 ns | 3–4 µs / 10–16 µs |
+
+- **Cause:** every word of the anchor segment is read through its region, and `Geometry::region` built the whole list,
+  about 65 entries at 18 partitions, to find one. It cost 128–233 ns a lookup (a second scratch timing over
+  `Geometry` alone).
+- **Where it fell:**
+  - a log append does about seven lookups;
+  - a pool scan does partitions × 64. One scan runs on every `Store::admittable` (a dynamic volume's `statfs`, every
+    refusal), every admission that grows from the pool, and every pressure refresh.
+- **Measured and rejected:**
+  - a region table built once per attachment and indexed: 6–8 ns a word, but it adds a field to `AnchorSegment`, which
+    every shard's state carries;
+  - keeping the arithmetic lookup out of line (`#[inline(never)]`): 8–15 ns against 9–15 ns inlined, dead even.
+- **Observed, not a cost:** `provision_bench`'s release binary grew from 5.9 to 8.1 MB of machine code with any of the
+  cuts, about 2,250 more symbols, nearly all fleet and TLS code. Under the whole-program LTO, the base build had dropped
+  code this in-process bench never reaches. The shipped `slates` binary is the same size either way:
+  11,752,832 bytes before against 11,751,200 after, machine code within 648 bytes.
+- `every_region_is_found_at_its_place_in_the_layout_and_no_other` holds the arithmetic to the layout's own list for
+  four shapes of geometry, and refuses kinds past it.
+
+### Landed: the anchor looks at a running daemon when its heartbeat could lapse, not every beat (battery; 2026-10-10)
+
+**Command:** `anchor_csw.sh <binary> <instance> 30`, a scratch script. It starts a one-shard `slates anchor`, settles
+15 s, and reads `top`'s context switches for the anchor and the daemon over 30 s. Arms alternated: the build with the
+daemon's stop watch, and the change. Load average 26–30.
+
+| build | anchor, context switches/s | daemon |
+|---|---|---|
+| before | 11, 11 | 26, 25 |
+| the change | 2, 2 | 26, 25 |
+
+- **Cause:** the anchor's observation loop polled every heartbeat (100 ms) for a lapse, though exits and held devices
+  already wake it through descriptors.
+- **Change:** a running daemon is looked at when its heartbeat could first be found lapsed, the last beat plus the
+  liveness budget, and at least every half budget. The half keeps the loop's own gap under the budget, which it would
+  otherwise read as the host having slept (`lapse_wait`).
+  - A starting daemon is still looked at every beat, since its first beat times its start.
+  - A silent daemon is now found lapsed at the budget's end, not up to a beat later.
+- **Found on the way:** once a lapse's kill was sent, the loop judged the same stale heartbeat again each turn and
+  killed and logged again until the daemon was reaped. With the old 100 ms pause that was 21 log lines for one freeze;
+  with the new zero wait it spun (102). A kill is now sent once and the loop waits on the exit.
+- **Proven by use:** `a_frozen_daemon_is_killed_at_its_heartbeat_lapse_and_restarted` (new: `SIGSTOP` the daemon; it is
+  replaced after the budget less one beat, one kill logged), 3 of 3. The anchor-death, restart, signal-drain and
+  `nfs_held` flows pass.
+- At rest, one shard's daemon and anchor together: 48 context switches a second this morning (37 + 11), 27 now
+  (25 + 2).
+
+### Landed: a landing's files reach the disk in batches, one durability barrier each (A-130; 2026-10-10)
+
+**Commands:**
+- The batch-size sweep: a scratch A/B (`crates/land/examples/sync_ab.rs`, not kept), release, 2,000 files of 4 KiB in a
+  fresh directory per arm and three rounds. Per file: create a temporary and write it, then write it out (macOS
+  `fsync`; Linux nothing). Per batch of `n`: one barrier (macOS `F_BARRIERFSYNC` on the batch's last file; Linux
+  `syncfs`), then rename each file. "Per file" is the engine before A-130: Linux `fdatasync`, macOS `F_BARRIERFSYNC`
+  on each file. The busy rounds run the same while a second thread rewrites a 256 MiB region of a file on the same
+  filesystem in 1 MiB writes, never syncing.
+- Concurrent `fdatasync` (`sync_ab concurrent`): `d` threads each write and `fdatasync` their share, then every file
+  is renamed.
+- macOS: this machine (Apple Silicon, APFS), load 13–16. Linux: Docker Desktop's VM (kernel 6.12.76-linuxkit, ext4
+  on the VM's virtio disk), a container capped at 2 GiB and 2 build jobs, run as a non-root user; load on the host
+  23–26.
+
+**macOS APFS, µs a file** (longest single barrier in parentheses, µs):
+
+| round | per file | n=1 | n=2 | n=4 | n=8 | n=16 | n=32 | n=64 | n=256 | n=2000 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| quiet 0 | 953.9 | 882.7 (2,518) | 471.2 | 274.7 | 203.9 | 205.8 (2,485) | 173.0 | 161.9 | 151.6 | 169.5 (11,403) |
+| quiet 1 | 604.2 | 477.7 (7,345) | 338.3 | 309.6 | 228.3 | 191.9 (1,460) | 177.2 | 169.7 | 187.0 | 168.3 (11,175) |
+| quiet 2 | 869.3 | 646.2 (16,308) | 535.2 | 329.3 | 251.6 | 210.9 (3,542) | 174.8 | 170.2 | 133.1 | 139.4 (5,488) |
+| busy 0 | 860.2 | 1,382.8 | 583.5 | 481.3 | 261.5 | 171.3 (1,311) | 148.3 | 167.9 | 209.8 | 178.6 (5,286) |
+| busy 1 | 590.0 | 558.9 | 329.7 | 277.3 | 536.5 | 467.9 (38,989) | 199.5 | 164.4 | 154.5 | 166.7 (4,032) |
+| busy 2 | 676.3 | 586.1 | 452.7 | 339.2 | 256.0 | 219.0 (2,809) | 228.5 | 193.0 | 180.7 | 181.2 (5,046) |
+
+The macOS busy writer rewrote at memory speed (372,226 MiB in 25.9 s): APFS absorbed it in the page cache, so it loaded CPU
+and memory more than the disk.
+
+**Linux ext4, µs a file:**
+
+| round | per file (`fdatasync`) | n=1 | n=4 | n=16 | n=64 | n=256 | n=2000 |
+|---|---|---|---|---|---|---|---|
+| quiet 0 | 948.2 | 1,753.4 | 629.0 | 107.6 | 70.4 | 50.1 | 24.6 |
+| quiet 1 | 685.0 | 1,283.9 | 316.8 | 146.2 | 43.0 | 23.5 | 18.6 |
+| quiet 2 | 403.2 | 1,509.1 | 436.6 | 111.1 | 45.3 | 27.0 | 20.2 |
+| busy 0 | 648.5 | 76,054.6 | 23,901.6 | 4,045.1 | 1,361.4 | 439.1 | 96.9 |
+| busy 1 | 776.7 | 92,060.3 | 27,518.1 | 7,847.4 | 2,443.5 | 412.9 | 255.6 |
+| busy 2 | 794.5 | 71,951.7 | 37,585.6 | 6,432.9 | 2,513.7 | 733.1 | 163.3 |
+
+Longest single `syncfs` beside the busy writer: 604 ms, 3.72 s and 2.80 s (rounds 0–2).
+
+**Linux concurrent `fdatasync`, µs a file:**
+
+| round | d=1 | d=2 | d=4 | d=8 | d=16 |
+|---|---|---|---|---|---|
+| quiet 0 | 1,690.0 | 1,410.2 | 1,073.1 | 598.6 | 565.5 |
+| quiet 1 | 4,765.1 | 3,066.3 | 1,776.8 | 1,454.6 | 630.8 |
+| quiet 2 | 2,518.9 | 2,417.3 | 1,676.1 | 276.2 | 255.1 |
+| busy 0 | 1,665.5 | 553.8 | 374.5 | 204.6 | 176.8 |
+| busy 1 | 755.8 | 660.7 | 368.0 | 219.4 | 148.8 |
+| busy 2 | 844.9 | 488.0 | 333.5 | 173.5 | 142.4 |
+
+**Through the engine, macOS APFS** (`land_bench flat`, release; the per-file barrier is HEAD `85958800` built in a
+scratch worktree, interleaved with the change; µs a new file, median of 5 runs; load 24–37 from other sessions):
+
+| round | arm | 1,000 | 2,000 | 4,000 | 8,000 | 16,000 |
+|---|---|---|---|---|---|---|
+| 1 | barrier a file | 916 | 1,068 | 1,072 | 961 | 1,137 |
+| 1 | batched (my test builds overlapped it) | 449 | 602 | 713 | 641 | 591 |
+| 2 | barrier a file | 1,764 | 1,538 | 1,366 | 1,361 | 1,199 |
+| 2 | batched | 423 | 429 | 446 | 461 | 525 |
+
+Batched is 1.5–4.2× faster, and it held its cost while the load rose between rounds; the per-file barrier did not.
+Over the simulated host the arms are within noise, 4.4–5.3 against 4.2–5.6 µs an entry. A third arm with the
+simulated host's new bookkeeping stubbed ran 4.9–5.4, so the oracle adds no measurable cost at this load. The gated
+`land.land_per_entry_sim_1000_of_100000_engine_only` row ran 13.6–14.1 µs (HEAD) against 14.0–15.8 µs (medians, three
+rounds), with intervals overlapping. Both arms are about twice the row's 7,016 ns ceiling at this load, so the
+ratchet would fail them alike until the machine quiets.
+
+**The landing's percentile lane, before and after** (`landing_fairness a_large_landing -- --nocapture`, debug; HEAD's
+binary from the same scratch worktree, interleaved; 600 files on a one-shard daemon probed by reads, provisions and
+leases; load 27–29):
+
+| arm | landing | slices | slice p99 | slice p999 | slice max | read p50 | provision p50 | lease p50 |
+|---|---|---|---|---|---|---|---|---|
+| barrier a file | 1.24 s | 642 | 5.2 ms | 10.4 ms | 10.4 ms | 1.49 ms | 2.98 ms | 2.78 ms |
+| barrier a file | 1.97 s | 1,206 | 7.3 ms | 21.0 ms | 28.0 ms | 0.96 ms | 2.18 ms | 1.27 ms |
+| barrier a file | 1.26 s | 1,172 | 3.1 ms | 8.4 ms | 8.7 ms | 1.03 ms | 2.67 ms | 2.22 ms |
+| batched | 0.86 s | 1,790 | 1.2 ms | 4.2 ms | 4.7 ms | 0.36 ms | 0.98 ms | 0.73 ms |
+| batched | 0.88 s | 1,844 | 1.0 ms | 3.7 ms | 4.6 ms | 0.38 ms | 0.91 ms | 0.71 ms |
+| batched | 1.93 s | 1,663 | 3.1 ms | 11.5 ms | 21.7 ms | 0.64 ms | 1.42 ms | 1.13 ms |
+
+No slice ran past its budget in either arm. The work a landing's shard serves meanwhile waits 2–3× less at the
+median, because fewer units block it on a sync.
+
+**Seen in both arms, not caused by the change:** one shard step of 126–185 ms per run, and one probe per run waiting
+behind it. The 2026-10-01 runs, at load 4–6, saw longest steps of 13.8–25.5 ms. Open (GAPS, the same day).
+
+- **macOS:** batches of 16 take 89–94% of the gain to 2,000 (the copy window's bound, A-130); 64 take another 15–20%,
+  not taken until the daemon accounts a descriptor share.
+- **Linux, `syncfs` rejected:** fastest when the disk is quiet (19–25 µs a file at 2,000) and worst beside any other
+  writer, because it writes back that writer's dirty data too. At 16 files a batch it costs 5–12 times the per-file
+  `fdatasync`, with single barriers of seconds: one stalls the shard that runs it. Rejected for files and for §4.15's
+  directory sync.
+- **Linux, owed:** concurrent `fdatasync` holds up beside the busy writer (142–177 µs a file at 16, against 756–1,666
+  at one), because journal group commit merges in-flight fsyncs without touching other writers' data. It is Linux's
+  batch barrier, built next with its own A/B through the engine. The quiet rounds were noisy (the d=1 baseline ran
+  1,690–4,765 µs, against 403–948 in the sweep an hour earlier).
+
+### Landed: Linux's batch barrier, every file's `fdatasync` in flight at once (A-130; 2026-10-10)
+
+**Commands:**
+- **The syscall A/B:** a scratch (`sync_ab.rs`, not kept) in the engine's shape. Batches of `n` files of 4 KiB: per
+  file a temporary created and written, optionally its writeback started (`sync_file_range(SYNC_FILE_RANGE_WRITE)`);
+  per batch the barrier; then each file renamed. 2,000 files per arm, three rounds, quiet and beside the busy writer
+  of the entry above.
+- **The engine A/B:** `land_bench flat` for `20b302aa` (one `fdatasync` a file) and the change, each built in its own
+  target directory in one container and interleaved.
+- **Where:** Docker Desktop's VM, kernel 6.12.76-linuxkit, ext4, 2 build jobs, a 3 GiB cap, non-root. The VM was far
+  busier than at noon (load 24–49 inside it, from other sessions' containers): the same per-file `fdatasync` that cost
+  403–948 µs then costs 2,670–7,003 µs now. The arms ran interleaved, so they saw the same VM.
+
+**The syscall A/B, µs a file** (longest barrier in parentheses, ms):
+
+| round | sequential, one a file | sequential, n=16 | writeback first, then sequential, n=16 | concurrent, n=16 | writeback first, then concurrent, n=16 | concurrent, n=8 |
+|---|---|---|---|---|---|---|
+| quiet 0 | 7,003 | 9,554 (527) | 2,198 | 1,846 (213) | 1,034 (142) | 2,327 |
+| quiet 1 | 5,685 | 7,699 (615) | 1,968 | 890 (68) | 636 (31) | 861 |
+| quiet 2 | 3,152 | 2,232 (142) | 429 | 644 (55) | 507 (45) | 598 |
+| busy 0 | 2,670 | 4,591 (474) | 1,726 | 624 (75) | 689 (81) | 1,377 |
+| busy 1 | 3,795 | 3,477 (259) | 822 | 446 (27) | 316 (13) | 1,249 |
+| busy 2 | 4,142 | 5,558 (509) | 816 | 1,122 (129) | 618 (46) | 1,300 |
+
+**Through the engine, µs a new file** (median of 5 runs; load inside the VM at each arm's start):
+
+| round | arm | load | 1,000 | 2,000 | 4,000 | 8,000 | 16,000 |
+|---|---|---|---|---|---|---|---|
+| 1 | one `fdatasync` a file | 39 | 4,800 | 5,331 | 11,091 | 4,846 | 3,426 |
+| 1 | concurrent barrier | 35 | 1,618 | 1,198 | 1,501 | 1,435 | 965 |
+| 2 | one `fdatasync` a file | 49 | 1,793 | 2,395 | 2,193 | 3,185 | 781 |
+| 2 | concurrent barrier | 24 | 208 | 182 | 219 | 218 | 206 |
+
+- **Round 1, at like load:** the concurrent barrier is 3.0–7.4× faster. Round 2's arms met different loads, so its
+  3.8–14.6× is not quoted as the gain. Round 2's 182–219 µs is what the change costs when the VM quiets.
+- **Why it works:** a batch of `fdatasync`s in flight together waits on one journal commit and one device flush in
+  ext4 (jbd2 joins every sync waiting on the running transaction to its commit). One at a time, each forces its own.
+  Each file is durable when its own call returns, so the guarantee is exactly the per-file one.
+- **Writeback first** (`sync_file_range` at write time) helped the concurrent barrier in five of six rounds, by 21–45%,
+  and lost 10% in the sixth (busy 0). It needs an `unsafe` libc call, since rustix wraps no `sync_file_range`. Not taken: its gain is
+  inside this VM's noise, so it waits for a quieter measurement.
+- **Sequential barriers in a batch are no better than one a file** (2,232–9,554 µs): every `fdatasync` still forces
+  its own commit. Sixteen at once beat eight at once in four of six rounds, by up to 2.8× beside the busy writer; eight
+  was 3–7% faster in two quiet rounds.
+- **Threads:** a barrier starts one scoped thread per file but the caller's (up to 15), and joins them. A one-file
+  batch starts none.
+
+### Landed: a published arena's regions keep their live heads from creation, so no publication scans one (A-64; 2026-10-10)
+
+**Commands:**
+- **Release:** a scratch example (not kept). Build `Buddy::new(4096, 23)` (a 32 GiB region of 4 KiB granules) or
+  `Buddy::new_imaged(4096, 23)`, allocate 64 blocks, and time the first `capture`. Three rounds, this machine at load
+  about 25.
+- **Debug:** a scratch print in the first-capture branch during `landing_fairness a_large_landing`.
+
+| round | deferred (before) | started imaged (after) |
+|---|---|---|
+| 0 | 3,442 µs, 8,388,608 granules scanned | 3 µs, none |
+| 1 | 2,865 µs, 8,388,608 | 1 µs, none |
+| 2 | 2,904 µs, 8,388,608 | 1 µs, none |
+
+- **In the daemon (debug):** one first capture per run before, 8,388,608 granules in 64.6 ms inside one verb's shard
+  step. After, none in two runs with the print restored.
+- **The fairness lane's longest step after the fix:** 20–147 ms over twelve runs, nine of them 97–147 ms. That is
+  another long step, open (GAPS, the same day).
+- **Cost elsewhere:** none. Allocations and claims in a published arena keep the bitmap, as they did after a first
+  capture, and an allocator nothing publishes from keeps the deferral's one flag test.
+
+### Landed: a named temporary is placed by one rename that replaces nothing (A-131; 2026-10-10)
+
+**Commands:**
+- **The syscall A/B:** a scratch (not kept), release, this machine at load about 12–16. 2,000 fresh named temporaries
+  per arm, three rounds: `linkat` to the name then `unlinkat` of the hidden name, against one
+  `renameatx_np(RENAME_EXCL)`.
+- **The engine A/B:** `land_bench flat`, HEAD `56d309dc` built in a scratch worktree and interleaved with the change,
+  two rounds, onto APFS.
+
+| round | `linkat` + `unlinkat`, µs a file | `renameatx_np(RENAME_EXCL)` |
+|---|---|---|
+| 0 | 259.1 | 56.5 |
+| 1 | 208.8 | 46.2 |
+| 2 | 197.5 | 45.9 |
+
+**Through the engine, µs a new file** (median of 5 runs):
+
+| round | arm | load | 1,000 | 2,000 | 4,000 | 8,000 | 16,000 |
+|---|---|---|---|---|---|---|---|
+| 1 | link and unlink (`56d309dc`) | 17 | 393 | 480 | 634 | 592 | 750 |
+| 1 | one rename | 26 | 240 | 237 | 271 | 359 | 247 |
+| 2 | link and unlink | 26 | 581 | 611 | 517 | 467 | 477 |
+| 2 | one rename | 15 | 165 | 168 | 177 | 198 | 241 |
+
+- **The change ran under the higher load in round 1 and still won 1.6–3.0×.** Round 2, with the loads reversed, shows
+  2.0–3.6×.
+- **Where the time had gone:** sampled on APFS (debug, the fairness lane), the landing spent 286 samples in `linkat`
+  and 84 in `unlinkat` of 653, against the per-file `fsync`'s 42 and the temporary's `openat` 134.
+- **The day's three changes on macOS, end to end:** about 700–900 µs a file this morning; 165–359 µs now.
+
+### Real use: the slates tree landed through the CLI, before and after A-130/A-131 (macOS; 2026-10-10)
+
+**Command:** `land_e2e.sh BIN SRC WORK`, a scratch script (not kept). Per run:
+- a fresh `slates anchor`, an explicit `bootstrap root`, and a dynamic 2 GiB volume;
+- the volume mounted over the loopback NFS bridge (`slates mount`) and the tree copied in with `cp -R`, then the mount
+  removed (always before the anchor stops);
+- `slates land` presented, `slates grant` issued with the anchor's exported variables, and `slates land --grant` timed
+  into an empty directory;
+- then `diff -r` of the source against the target.
+
+**Inputs and arms:**
+- The tree: `git archive` of the slates repository at `f9f0c081`: 3,685 files and 110 MB, 4,172 landed entries with
+  the directories.
+- The arms: release binaries of `85958800` (before A-130) and of the day's head, interleaved over five rounds.
+- This machine at load 12–16.
+
+| round | before (`85958800`) | after (the day's head) |
+|---|---|---|
+| 1 | 4.221 s | 1.447 s |
+| 2 | 3.824 s | 2.995 s |
+| 3 | 5.477 s | 1.486 s |
+| 4 | 4.626 s | 1.544 s |
+| 5 | 5.632 s | 1.723 s |
+
+- **Medians:** 4.63 s before and 1.54 s after, 3.0× faster; pair by pair 1.3–3.7×.
+- **Every run:** `state: done`, 4,172 entries written, and `diff -r` silent. The day's head took 502 barriers for the
+  3,685 files: files larger than a batch's window take a barrier each, and the small ones share them.
+- **The mount:** checked absent after every run.
+
+### Landed: Linux's write-out starts each file's writeback before the batch's barrier (A-130; 2026-10-10)
+
+**Commands:**
+- **Syscall rerun:** the A/B of the entry above, on a quieter VM (another session's container at about two cores),
+  three arms, five rounds quiet and five beside the busy writer. The two deciding arms' order alternates round by round.
+- **Engine A/B:** `land_bench flat` for `f9f0c081` (the concurrent barrier alone) and the change, each built in its
+  own target directory, three interleaved rounds.
+- **Where:** ext4 in Docker's VM, non-root, a 3 GiB cap.
+
+**Syscall, µs a file:**
+
+| round | one `fdatasync` a file | concurrent, n=16 | writeback first, then concurrent, n=16 |
+|---|---|---|---|
+| quiet 0 | 789.5 | 129.2 | 76.2 |
+| quiet 1 | 385.7 | 157.4 | 64.0 |
+| quiet 2 | 510.0 | 142.4 | 74.5 |
+| quiet 3 | 483.3 | 112.2 | 76.0 |
+| quiet 4 | 376.4 | 197.4 | 128.7 |
+| busy 0 | 12,959.5 | 6,119.8 | 2,323.4 |
+| busy 1 | 19,538.9 | 6,034.0 | 3,688.2 |
+| busy 2 | 8,882.9 | 3,867.6 | 2,206.7 |
+| busy 3 | 602.9 | 225.6 | 123.5 |
+| busy 4 | 620.9 | 211.1 | 114.8 |
+
+Writeback first won every round: 1.5–2.5× quiet and 1.6–2.6× beside the busy writer.
+
+**Through the engine, µs a new file** (median of 5 runs; load inside the VM at each arm's start):
+
+| round | arm | load | 1,000 | 2,000 | 4,000 | 8,000 | 16,000 |
+|---|---|---|---|---|---|---|---|
+| 1 | barrier alone | 13 | 321 | 245 | 266 | 230 | 265 |
+| 1 | writeback first | 17 | 186 | 310 | 179 | 120 | 161 |
+| 2 | barrier alone | 16 | 177 | 178 | 192 | 213 | 184 |
+| 2 | writeback first | 15 | 128 | 99 | 90 | 105 | 127 |
+| 3 | barrier alone | 12 | 216 | 208 | 191 | 212 | 231 |
+| 3 | writeback first | 14 | 77 | 71 | 76 | 74 | 82 |
+
+- **Rounds 2 and 3, at like loads:** 1.4–2.1× and 2.6–2.9× faster. Round 1 was mixed: slower at 2,000 only, with the
+  change at the higher load.
+- **Cost:** one `unsafe` libc call (rustix wraps no `sync_file_range`); slates-land's unsafe budget went from 3 to 4.
+- **Since the morning on Linux:** one `fdatasync` a file cost 573–913 µs on a quiet VM; the head runs 71–127 µs.
+
+### Landed: Linux's batch barrier on ⌈√n⌉ streams, not one thread a file (A-130; 2026-10-10)
+
+**Commands:**
+- **Engine A/B:** `land_bench flat`, 1,000 to 16,000 new files. Arm A was HEAD, with every file's `fdatasync` on a
+  thread of its own (sixteen threads a full batch). Arm B was the change: ⌈√n⌉ streams, four a full batch, each syncing
+  its share in turn. Each arm was built in its own target directory.
+- **Order:** rounds interleaved, the arms' order alternating round by round.
+- **CPU throttling:** the container's `cpu.stat` `throttled_usec` was read before and after each arm. It sums every
+  CPU's throttled time, so it can exceed the wall time.
+- **Where:** ext4 in Docker's VM, three containers:
+  - `--cpus=1 --memory=256m`, no swap;
+  - `--cpus=2 --memory=256m`, no swap;
+  - all of the VM's CPUs and 3 GB.
+
+**µs a new file:**
+
+| container | round | arm | 1,000 | 2,000 | 4,000 | 8,000 | 16,000 | throttled |
+|---|---|---|---|---|---|---|---|---|
+| 1 CPU, 256 MB | 1 | sixteen threads | 485 | 430 | 296 | 397 | 289 | 188.8 s |
+| 1 CPU, 256 MB | 1 | √n streams | 172 | 105 | 109 | 114 | 150 | 0.4 s |
+| 1 CPU, 256 MB | 2 | √n streams | 97 | 99 | 95 | 108 | 1,075 | 0.2 s |
+| 1 CPU, 256 MB | 2 | sixteen threads | 1,987 | 2,414 | 395 | 778 | 357 | 79.8 s |
+| 1 CPU, 256 MB | 3 | sixteen threads | 2,247 | 2,029 | 2,100 | 1,392 | 694 | 43.5 s |
+| 1 CPU, 256 MB | 3 | √n streams | 207 | 168 | 114 | 112 | 105 | 0.3 s |
+| 2 CPUs, 256 MB | 1 | sixteen threads | 772 | 786 | 771 | 1,242 | 178 | 3.7 s |
+| 2 CPUs, 256 MB | 1 | √n streams | 329 | 1,337 | 2,086 | 155 | 136 | 0 |
+| 2 CPUs, 256 MB | 2 | √n streams | 548 | 847 | 175 | 180 | 246 | 0 |
+| all, 3 GB | 1 | sixteen threads | 129 | 163 | 99 | 99 | 107 | 0 |
+| all, 3 GB | 1 | √n streams | 86 | 83 | 83 | 86 | 81 | 0 |
+| all, 3 GB | 2 | √n streams | 118 | 108 | 93 | 117 | 103 | 0 |
+| all, 3 GB | 2 | sixteen threads | 109 | 164 | 340 | 139 | 123 | 0 |
+| all, 3 GB | 3 | sixteen threads | 1,393 | 1,148 | 617 | 914 | 679 | 0 |
+| all, 3 GB | 3 | √n streams | 746 | 498 | 653 | 1,903 | 1,921 | 0 |
+
+**What it shows:**
+- **At one CPU, the decision.**
+  - Sixteen threads started at once spend the container's CPU quota in a burst. The cgroup is then throttled until the
+    next period: 43.5–188.8 s of throttled time over a bench, against 0.2–0.4 s for four streams.
+  - Four streams were 1.9–24× faster at every size but one. The exception is a 16,000-file outlier (1,075 µs) of the
+    kind seen at 256 MB before; the hypothesis there, unshown, is the cgroup's dirty page cache.
+  - The throttling falls on everything in the cgroup, so it would stall every shard of a daemon, not only the landing.
+- **At two CPUs:** throttled 3.7 s against none. The sizes are mixed: four streams were faster at 1,000, 8,000 and
+  16,000 files, and slower at 2,000 and 4,000. Round 2's sixteen-thread arm was lost when Docker Desktop restarted, which
+  also killed the container.
+- **With every CPU:**
+  - Quiet (rounds 1 and 2): four streams were 1.15–3.7× faster at every size but one, 1,000 files in round 2 (118
+    against 109).
+  - Round 3 ran while the VM was contended by other sessions' containers, and both arms slowed 5–20×. Four streams were
+    1.9–2.3× faster at 1,000 and 2,000 files, about even at 4,000 (653 against 617), and **2.1–2.8× slower at 8,000
+    and 16,000**.
+  - With CPU to spare and slow commits, sixteen syncs in flight merge into fewer journal commits than four streams of
+    four.
+- **No count wins everywhere** under the cost model k·a + (n/k)·b:
+  - CPU contention raises a, the cost of starting a thread, and favours fewer streams.
+  - I/O contention raises b, a round of commits, and favours more.
+  - ⌈√n⌉ is the balance where the two are equal. It is chosen because the CPU burst throttles the whole cgroup, while
+    the extra commits slow only the landing.
+- **Open, to measure:** threads kept for the landing rather than started per barrier would cut a toward zero. Every
+  file's sync could then be in flight with no burst, which might win in all three containers.
+
+### Landed: a landing's durability waits run off the shard (A-132; 2026-10-10)
+
+**Commands:**
+- **The lane:** the landing-fairness lane (`landing_fairness`, release): 600 files landed while a second client probes
+  the same shard in turn with reads, provisions (a volume created and destroyed) and lease takes.
+- **The arms:** A is `078bb5e2`, with the barrier on the shard and macOS's `fsync` in the write-out. B is A-132. Each
+  was built in its own target directory.
+- **Linux:** ext4 in Docker's VM. One fresh `--cpus=2 --memory=256m` container a run, no swap. Three conditions, three
+  interleaved rounds each, the arms' order alternating:
+  - `quiet`: the VM as it was;
+  - `syncwriter`: a sibling container rewriting a 512 MiB file with `fsync` after each pass;
+  - `hog2`: two spinning processes in the test's own cgroup.
+- **macOS:** APFS on this Mac, six interleaved rounds at load 22–24 from other sessions.
+- **Each run** reports the landing's time, its slices' maximum (its own longest hold on the shard), the shard's longest
+  step (anyone's), and each probe kind's p99 and maximum inside the landing.
+
+**Linux** (ms; probes give the worst kind's p99 / max):
+
+| condition | round | arm | landing | slice max | longest step | probe p99 | probe max |
+|---|---|---|---|---|---|---|---|
+| quiet | 1 | A | 237 | 18.7 | 18.7 | 18.94 | 18.94 |
+| quiet | 1 | B | 58 | 0.3 | 10.5 | 0.13 | 1.63 |
+| quiet | 2 | B | 59 | 0.4 | 1.3 | 0.12 | 1.28 |
+| quiet | 2 | A | 53 | 3.0 | 3.0 | 1.26 | 3.26 |
+| quiet | 3 | A | 1,328 | 64.4 | 64.4 | 63.56 | 64.47 |
+| quiet | 3 | B | 87 | 0.3 | 1.8 | 0.10 | 2.12 |
+| syncwriter | 1 | A | 1,080 | 90.6 | 90.6 | 108.39 | 108.39 |
+| syncwriter | 1 | B | 351 | 0.7 | 5.5 | 0.08 | 9.27 |
+| syncwriter | 2 | B | 283 | 0.6 | 1.9 | 0.21 | 6.10 |
+| syncwriter | 2 | A | 139 | 6.7 | 6.7 | 6.75 | 6.75 |
+| syncwriter | 3 | A | 1,081 | 79.7 | 79.7 | 126.72 | 126.72 |
+| syncwriter | 3 | B | 2,067 | 8.5 | 112.4 | 0.13 | 112.54 |
+| hog2 | 1 | A | 389 | 35.9 | 35.9 | 72.67 | 72.67 |
+| hog2 | 1 | B | 607 | 2.0 | 19.2 | 0.28 | 51.08 |
+| hog2 | 2 | B | 1,667 | 4.5 | 49.9 | 0.07 | 60.59 |
+| hog2 | 2 | A | 667 | 59.9 | 59.9 | 85.42 | 85.42 |
+| hog2 | 3 | A | 170 | 18.9 | 18.9 | 19.11 | 19.11 |
+| hog2 | 3 | B | 571 | 1.0 | 47.1 | 0.09 | 54.04 |
+
+- **The shard's tail, the change's purpose.**
+  - With B, the probes' worst p99 was 0.07–0.28 ms in every run, against 1.26–126.72 ms with A.
+  - The landing's own longest hold was at most 8.5 ms, against 3.0–90.6 ms.
+  - With A, the longest step was always a landing slice: a barrier.
+- **What B leaves:** probe maxima of 51–113 ms in contended runs, from steps outside the landing's slices.
+  - Under `hog2`, instrumented runs attribute them to the cgroup's CPU quota, not to blocking calls:
+    - a poll held off the CPU 49.8 ms (`Preempted`);
+    - the landing's finish, about 1 ms of CPU at 600 files and unsliced, stretched to 52 ms by throttling;
+    - two unattributed polls up to 34.7 ms.
+  - The 112 ms step beside the syncing writer did not recur in three instrumented runs: the longest step was 1.9–4.2 ms
+    there, and the finish 1.4–1.6 ms.
+- **The landing's own time is mixed:**
+  - quiet: about as fast or faster;
+  - `syncwriter`: faster once (351 against 1,080 ms), slower twice (283 against 139, 2,067 against 1,081);
+  - `hog2`: 1.6–3.4× slower.
+  - The prober now gets the shard during each barrier where A blocked it, so the landing shares the shard. Each barrier
+    also starts its thread and its stream threads inside the throttled cgroup.
+
+**macOS** (ms; rounds at load 22–24):
+
+| round | arm | landing | slice max | longest step | probe p99 (worst) | probe max |
+|---|---|---|---|---|---|---|
+| 1 | A | 1,807 | 15.6 | 148.9 | 20.98 | 151.49 |
+| 1 | B | 2,898 | 17.6 | 144.2 | 18.16 | 165.07 |
+| 2 | B | 208 | 4.1 | 4.1 | 1.26 | 4.26 |
+| 2 | A | 210 | 5.0 | 5.0 | 3.95 | 5.30 |
+| 3 | A | 222 | 4.3 | 4.3 | 3.86 | 4.54 |
+| 3 | B | 240 | 4.2 | 4.2 | 0.52 | 4.51 |
+| 4 | B | 265 | 4.6 | 4.6 | 1.44 | 5.07 |
+| 4 | A | 242 | 4.4 | 4.4 | 0.91 | 4.64 |
+| 5 | A | 249 | 4.8 | 4.8 | 3.66 | 4.98 |
+| 5 | B | 225 | 4.0 | 5.2 | 0.52 | 7.55 |
+| 6 | B | 235 | 4.4 | 4.4 | 0.63 | 4.45 |
+| 6 | A | 251 | 4.2 | 4.2 | 0.96 | 8.40 |
+
+- **Five quieter rounds:** both arms held the shard about 4–5 ms at most. B's worst p99 was lower in four of five rounds,
+  0.52–1.44 against 0.91–3.95 ms.
+- **The first round was contended:** the landing ran 1.8–2.9 s, and both arms took a ~145 ms step outside the landing's
+  slices. It is not a durability wait, since B moved those off the shard and A's slices stayed under 16 ms. The open
+  hypothesis is the shard thread descheduled on an oversubscribed machine (the shard-QoS question in GAPS).
+- **Before this A/B,** an instrumented run on this Mac caught the per-file `fsync` holding a write unit 206 ms. B has no
+  such unit.
+
+**macOS throughput** (`land_bench flat`, the one-call landing, so every barrier runs in place; µs a new file):
+
+| round | arm | load | 1,000 | 2,000 | 4,000 | 8,000 | 16,000 |
+|---|---|---|---|---|---|---|---|
+| 1 | A | 39.7 | 313 | 335 | 258 | 259 | 340 |
+| 1 | B, ⌈√n⌉ streams | 40.6 | 434 | 426 | 467 | 420 | 429 |
+| 1 | B, one stream | 56.5 | 416 | 465 | 402 | 389 | 348 |
+| 2 | B, ⌈√n⌉ streams | 55.0 | 214 | 225 | 245 | 268 | 271 |
+| 2 | B, one stream | 58.5 | 267 | 344 | 318 | 377 | 380 |
+| 2 | A | 80.7 | 336 | 378 | 367 | 399 | 326 |
+| 3 | B, one stream | 74.5 | 202 | 245 | 249 | 261 | 279 |
+| 3 | A | 53.1 | 231 | 250 | 248 | 287 | 285 |
+| 3 | B, ⌈√n⌉ streams | 48.9 | 256 | 227 | 233 | 270 | 261 |
+
+- No arm won consistently at loads of 40–81; each round's winner differed.
+- Moving macOS's `fsync` from the write-out into the barrier costs no measurable throughput here, and neither stream
+  count beat the other. Recorded as inconclusive, not as a win: macOS keeps Linux's derived rule, one rule for every
+  platform.
+
+### Landed: a landing's finish is sliced; its advance is bounded, not O(entries) (A-133; 2026-10-11)
+
+**What changed.** The landing's finish advanced the overlay past what reached the disk (forget each landed entry or
+rebase it, then invalidate the listings) in **one synchronous shard step**, O(entries). A-133 slices it one entry a unit
+under the step budget, driven by the server between yields, the report's figures accumulated over the loop so nothing
+O(entries) runs in one unit; the completion's records still commit as one atom.
+
+**Command.** `land_bench` scratch mode (not kept): for each entry count, an overlay of N flat files over the in-memory
+host is stepped to its finish, then the advance is driven by `finish_step(budget)` with a 125 µs budget, every step
+timed. Reported: steps, and the step-time p50/p99/max. The in-memory host isolates the advance from disk; the per-entry
+cost on a real volume is ~1.7× higher (the 600-entry server measurement).
+
+**Before — the one-call advance (`land_advance`), µs an entry, 2 runs:**
+
+| entries | advance (one step) | per entry |
+|---|---|---|
+| 1,000 | 0.95–0.99 ms | 0.95 µs |
+| 10,000 | 10.0–11.0 ms | 1.05 µs |
+| 25,000 | 25.2–29.1 ms | 1.08 µs |
+| 50,000 | 52.3–53.2 ms | 1.05 µs |
+
+Linear at ~1.0 µs an entry → ~105 ms at 100k, ~1 s at 1M, all in one shard step.
+
+**After — the sliced finish's step time (125 µs budget):**
+
+| entries | steps | p50 | p99 | max |
+|---|---|---|---|---|
+| 1,000 | 7 | 125 µs | 130 µs | 130 µs |
+| 10,000 | 82 | 126 µs | 752 µs | 752 µs |
+| 50,000 | 436 | 126 µs | 235 µs | 3.1 ms |
+| 100,000 | 793 | 126 µs | 135 µs | 6.4 ms |
+
+- **p50 and p99 are flat at the budget (≈126 µs) across 1k→100k** — the advance is bounded per step, independent of the
+  entry count.
+- **The max is a tail outlier,** not an O(n) step: it varied run to run (9.1 → 7.2 → 6.5 → 6.4 ms at 100k) and grows with
+  the number of steps (more samples hit the shared VM's scheduling/allocator tail), while p50/p99 stay flat. Per-unit
+  instrumentation found no O(n) unit — one 556 µs unit across 100k entries, the rest under 500 µs.
+- **The fold mattered:** before folding `advanced()` (a manifest-keyed `BTreeMap` + `Vec`) and the count passes into the
+  slice, the longest step was 25 ms at 100k (the begin/terminal O(n·log n) in one unit); after, p50/p99 are at budget.
+
+**Correctness.** The sliced-vs-one-call oracle holds (`crates/land` 62 tests); reads return the landed content at every
+slice and the base is clean after (`a_sliced_advance_reads_consistently_and_leaves_the_base_clean`); the server landing
+suites and vfs suite are green.
+
+### Condition 12: slates' measured p99s, and an honest comparison to TectonicFS (2026-10-11)
+
+**The competitor, read first.** TectonicFS (Pan et al., "Facebook's Tectonic Filesystem", FAST '21) is an
+**exabyte-scale warehouse/blob filesystem** — 1,590 PB, 10.7 billion files, 15 billion blocks, 4,208 storage nodes
+(Table 2). It reports **throughput and scale, not small-operation p99 latency**: metadata shards serve up to **10 KQPS**,
+and ~1% of Name-layer shards hit that limit and retry after backoff (§6.3, Fig 4c). On latency it is explicit (§6.5,
+"The impact of higher metadata latency"): *"HDFS metadata operations are in-memory and all metadata for a namespace is
+stored on a single disk. In contrast, Tectonic stores its metadata in a sharded key-value store and disaggregates
+metadata layers. This means Tectonic metadata operations may require one or more network calls (e.g., a file open
+operation will interact with the Name and File layers)… compute engines parallelize this step to hide the extra latency
+of individual Tectonic rename operations."* So Tectonic deliberately trades higher per-operation metadata latency for
+exabyte scale, and hides it with parallelism; it publishes no small-op p99.
+
+**Why the classes differ.** slates is an **in-memory copy-on-write VFS** — exactly the in-memory metadata class
+(HDFS-like) that Tectonic contrasts itself against as the lower-latency design. A slates metadata or read operation on
+the local path touches RAM, with no key-value-store hop and no network call; a cross-region one is bounded by the
+measured RTT (§4.8), not by added store hops. So a single-operation p99 comparison favours the in-memory design by
+construction — the honest framing is that slates occupies the low-latency end Tectonic gave up for scale, while Tectonic
+occupies a scale point slates does not claim (EB warehouse blobs).
+
+**slates' measured p99s (this session and prior, in-memory host / loopback NFS / fleet):**
+- **Landing finish, sliced (A-133):** step p50 126 µs, p99 130–752 µs, flat from 1k to 100k entries (125 µs budget).
+- **Other clients during a landing (A-132), 2-CPU/256 MB, quiet + a syncing writer + CPU hogs:** worst p99 **0.07–0.28 ms**
+  (was 1.26–126.72 ms before the barriers moved off the shard).
+- **Local NFS op p99 5.7 µs** (`overlay_diff.sh`, `nfs.local_p99_ns`).
+- **Overlay real-tree reads at the NFS client's floor:** cold 1.58–1.78 s for 5,863 files / 540 MB — **faster than the
+  Linux kernel's own NFS server** on the same client (1.77–2.03 s), the apt live same-machine competitor.
+- **Change tracking:** an exact diff plan in 2–3 ms against `diff -rq`'s 406–461 ms (~150×).
+
+**Verdict.** For single-operation latency under non-ideal (contended) access, slates' p99s are microsecond-scale on the
+local path and bounded by measured RTT on the fleet path — the low-latency end of the design space Tectonic documents
+itself as trading away for exabyte throughput. The directly runnable competitor on this hardware, the Linux kernel's NFS
+server, slates beats on read latency. A live Tectonic A/B is not possible (it is Facebook-internal and not open source);
+this comparison is against its published figures, with the workload-class caveat stated.
+
+### Condition 12, like-for-like: slates (FUSE) vs the kernel's overlayfs vs tmpfs (2026-10-11)
+
+A direct, runnable competitor comparison — the Stop-hook asked for like-for-like, and overlayfs is slates' closest class
+(the kernel's own copy-on-write overlay that container runtimes mount by default). Same workload on all three, over the
+same 500-file base on a tmpfs: 3,000 small files created, stat'd, read, rewritten (a copy-up for an overlay), and 1,000
+created with `fsync`, each op timed; per-op-type p50/p99/p999/max. `docs/wip/bench/fsbench/` (Docker, kernel 6.12,
+privileged, `--device /dev/fuse`), slates mounted `--shared` (FUSE), overlayfs `lowerdir`/`upperdir`/`workdir` on the
+tmpfs.
+
+| op (µs) | overlayfs p50/p99 | tmpfs p50/p99 | slates FUSE p50/p99 | slates vs overlayfs |
+|---|---|---|---|---|
+| stat | 1.0 / 1.8 | 0.8 / 1.5 | 13.9 / 30.2 | ~14× |
+| read | 3.5 / 5.4 | 2.9 / 3.8 | 43.3 / 79.0 | ~12× |
+| create | 5.0 / 16.0 | 3.1 / 6.0 | 276.9 / 553.5 | ~55× |
+| rewrite | 3.2 / 4.3 | 2.7 / 3.7 | 471.1 / 669.7 | ~147× |
+| create+fsync | 3.8 / 14.4 | 2.1 / 5.0 | 1233.9 / 1777.0 | ~325× |
+
+Slates was also measured over **NFSv4.2** (kernel-side caching/readahead) on the same volume, same run: it is *worse*
+than FUSE for writes (create p50 1,872.9 µs, rewrite 1,927.6 µs — synchronous RPC an op) and slightly better for reads
+(read p50 32.1 µs vs FUSE 45.5 µs). Neither mount path is within 10× of overlayfs.
+
+**Should slates write its own (kernel) overlayfs? No** — decided against (2026-10-11, Ada's question). overlayfs is fast
+only because it is **in-kernel** (no userspace round trip an op). An in-kernel slates would break R10 (unprivileged, no
+kernel extension), condition 6 (a Linux module is not cross-OS), and condition 3 (in-kernel, backing-store-coupled
+overlays are what slates exists not to be). The overlay *logic* is already slates' (lower+upper+whiteouts+exact change
+tracking); what is slow is the **kernel↔daemon transport**, not the overlay semantics. Every userspace/distributed peer
+pays this same premium — JuiceFS, Alluxio, CernVM-FS (FUSE, distributed) and gVisor/sandboxfs (FUSE, hermetic) are all
+10–100× slower per op than in-kernel overlayfs; they trade local latency for distribution/hermeticity/portability, as
+slates does, while overlayfs/EROFS buy speed with privilege, locality and OS-specificity slates refuses. The in-design
+levers to narrow the gap, in order: (1) profile one FUSE create end to end to attribute the 277 µs (round trip vs shard
+hop vs copy-up vs merge tracking) before building; (2) io_uring FUSE (`FUSE_OVER_IO_URING`, Linux 6.14+, 2–4× FUSE gains,
+unprivileged); (3) virtio-fs + DAX for the microVM case (shared memory, near-native; `crates/bridge-virtiofs` exists);
+(4) FUSE writeback caching + larger `max_write` to batch write round trips.
+
+**Honest verdict — correcting the earlier "far above industry-leading" framing.** Against the **in-kernel** overlayfs,
+slates is **12–325× slower per operation**, dominated by the **write path** (create/rewrite/fsync). This is the
+out-of-kernel protocol hop: a FUSE (or NFS) round trip plus the daemon's per-op processing and merge tracking, which the
+in-kernel overlayfs does not pay. So slates does **not** have "far above industry-leading" p99s against the kernel's own
+local overlay; the prior comparison (knfsd, Tectonic) was against *networked/distributed* filesystems that also pay
+network/store hops, where slates wins — but that is the wrong peer for a local overlay.
+
+**What slates buys for the premium** (overlayfs offers none of these): hermetic RAM with no disk escape except a granted
+merge, remote/replicated volumes, post-quantum encryption in transit and at rest, cross-OS mount, and exact change
+tracking. The honest position is that slates trades local per-op latency for those properties — the inverse of
+Tectonic's "trade latency for scale."
+
+**The optimization target, now quantified.** The write path dominates: create 277 µs, rewrite 471 µs, create+fsync
+1,234 µs at p50, against overlayfs's 3–5 µs. Reducing the FUSE/daemon round-trip and the copy-up cost on writes is the
+single largest p99 lever for condition 12 — far larger than any landing-side gain. Reads (43 µs) and stats (14 µs) are
+closer but still ~12–14×. Next: profile one FUSE write end to end (client → kernel FUSE → daemon shard → overlay
+copy-up → reply) to attribute the 277 µs, and A/B against the NFSv4.2 mount path (kernel-side caching/readahead may beat
+FUSE).
+
+### Condition 12/2: the overlay write path is O(volume) per op — whole-image publish, not a delta (2026-10-11)
+
+A fresh Linux aarch64 release build (in Docker, kernel 6.12) re-validated the write path and attributed the earlier
+"277 µs create." The daemon's **recovery barrier** (`publish_shard`, which every mount mutation waits on) is a
+**delta** for a plain volume — measured ~3 µs on the shard, create ~42 µs end-to-end over FUSE, **flat** as the volume
+grows — refuting the earlier working hypothesis that the barrier dominates the write path. The `perf` split of a plain
+FUSE create shows the daemon's own logic at single digits of CPU (`fuse::serve` 1.7 %, `fuse::reply` 0.4 %,
+`encode_publication` 0.85 %); the cost is the **FUSE kernel transport** (`fuse_request_end` 18 %, syscall entry/exit
+~25 %, `fuse_copy_one`, `fuse_dev_write`) — the intrinsic userspace-FS premium, consistent with the ~13 µs FUSE floor
+already recorded (2026-10-06).
+
+**But overlay (base-backed) volumes do not take the delta.** `publishes_whole()` forces the whole image for any volume
+with a base, a snapshot or a clone, so every mutation re-encodes the entire volume. Measured (`plain_vs_overlay_scale.sh`,
+4000 creates in one directory, p50 by window):
+
+| volume | [0,500) | [1500,2000) | [3500,4000) |
+|---|---|---|---|
+| plain (`--dynamic`) | 99 µs | 68 µs | 97 µs — **flat, O(1) delta** |
+| overlay (`--dynamic --base`) | 196 µs | 714 µs | 490 µs — **grows, O(dir) whole-image** |
+
+`perf` of overlay creates: `publish_shard` is **70 %** of the shard's CPU (vs 0.85 % plain), in `encode_inode_within`
+(51 %) and `encode_directory` → quicksort by `NameEquivalence::compare` (33 %+21 %). The cost scales with the **upper**
+directory, not the base (base 100→8000 files held create p50 at 128–159 µs for a fixed depth). So the b8fb3d9b "277 µs
+create" was the overlay whole-image re-encode of a ~1500-entry directory — not a copy-up (134 µs, cheaper) and not VM
+load. This is the OCI/container write path (condition 2) and a bounded-work (R4) concern: filling a directory is O(N²).
+Root cause and the oracle-gated fix: `docs/bugs/2026-10-11-overlay-volumes-republish-whole-image-per-operation.md`.
+
+**Real-container re-validation at this build (conditions 2, 3, 4, 11; Docker, privileged):**
+- **Condition 4 (escape fuzz):** `battery.py`, 5 seeds × 300 hostile ops (path traversal `../`×8, device-node `mknod`,
+  cross-user, write-through to `/etc`, setuid, hardlink/symlink escapes) through a FUSE mount — **no invariant violated**;
+  the daemon's `/proc/<pid>/io` write_bytes moved **0 bytes** (condition 3: zero disk escape) and the whole outside-tree
+  hash was unchanged (condition 4).
+- **Condition 2 (containerd 1.7.24 + runc 1.1.15):** `slates attach --oci` → `{dst:/work, options:[bind,rw,private,nosuid,nodev]}`,
+  `ctr run` ran a 2000-file workload inside a real container (exit 0, 2002 entries, 0.97 s), the setuid-root probe ran as
+  **uid 65534 (nobody), not root** (A-94 under the OCI mount), the read-only attach refused writes, and the host side saw
+  all 2002 entries with an identical tar sha.
+- **Condition 11 (chaos):** git clone / cargo build / pip install on a kernel NFSv4.2 mount, daemon **SIGKILLed twice**
+  per workload — anchor restarted it **6 times over held RAM** (generation 7, restarts 6), every workload finished
+  byte-correct (git `fsck` clean, the built binary ran, `import flask 2.34.2` worked).
+
+Commands (committed lanes): `docs/wip/bench/fuse/fuse-perf.sh`, `docs/wip/bench/escape/{inner.sh,battery.py}`,
+`docs/wip/bench/containerd/run.sh`, `docs/wip/bench/realworld_chaos.sh`; the overlay A/B and perf lanes are scratch
+(`plain_vs_overlay_scale.sh`, `overlay_perf.sh`).
+
+### Condition 2/12: overlay volumes publish deltas, not their whole image (A-134; 2026-10-11)
+
+The overlay O(volume)-per-op write path (previous entry) is **fixed**. An overlay (base-backed) volume — every
+OCI/container volume — now publishes a **delta** per barrier while its base plane is unchanged, instead of re-imaging
+the whole volume. Two coupled gates both had to move: `Dirty::recording()` (which had skipped recording changes for any
+base/snapshot/clone volume, so the delta was empty) now records for a base-only volume, and `publishes_whole()` takes
+the delta unless the base plane changed since the last publish (`BasePlane::durable_change_token` = the four versioned
+tables' own write counts — bumped in `Versioned::set`, so an in-place head overwrite counts, which `version_count`
+misses — plus a drift counter). A copy-up/whiteout/rename/drift still publishes the whole image (the only record that
+carries the base plane); recovery applies the delta over the checkpoint, and `VolumeImage::apply` preserves `self.base`.
+
+**Proof (load-independent — allocation-counted, valid under any machine load).**
+`crates/vfs/tests/delta_cost.rs::an_overlay_create_publishes_a_delta_costing_the_same_in_a_large_upper_as_in_a_small_one`:
+one create in an overlay now publishes a `VolumeRecord::Delta` (asserted, was `Full`), and its publication + replay
+allocate **identically** in a 4,096-entry upper directory and a 64-entry one — i.e. O(delta), not O(volume). Before the
+fix the publication was the whole image, allocating with the directory (O(N²) to fill one). Recovery byte-correctness is
+proven by `crates/server/tests/recovery.rs` 39/0 (the overlay restart oracle and the crash-at-every-durable-step
+oracle). `cargo clippy --workspace --all-targets -- -D warnings` and `cargo xtask check` clean.
+
+A wall-clock p99 A/B (overlay create flat vs the earlier 196 → 714 µs growth) is owed on a quiet machine — this session's
+host was at load 48 (other sessions), where timing is unreliable; the allocation-count proof above is load-independent
+and establishes the asymptotic win now. Snapshot/clone volumes still publish whole (owed, a separate delta refinement).
+
+**Wall-clock confirmation (A-134; Linux FUSE in Docker, kernel 6.12, 3 runs at load 6–15, 2026-10-11).** Overlay create
+p50 by 500-op window in a single growing directory, against a plain volume on the same build:
+
+| window | plain (no base) | overlay (empty base), 3 runs |
+|---|---|---|
+| [0, 500) | 67–95 µs | 144 / 184 / 185 µs |
+| [1500, 2000) | 72–96 µs | 71 / 693 / 670 µs |
+| [3500, 4000) | 65–96 µs | 69 / 100 / 98 µs |
+
+At depth (`[3500,4000)`) the overlay create is **flat at ~70–100 µs, ≈ the plain volume** — the pre-fix value at that
+depth was ~490 µs (previous entry), a **5–7× win**, confirming the O(delta) allocation proof wall-clock. The elevated
+first window (~144–185 µs) is the first checkpoint plus base-plane setup. The `[1500,2000)` spike to ~680 µs appeared in
+two of three runs but was 71 µs in the cleanest (lowest-load) run at the **same** window — concurrent-session load
+noise, not algorithmic: a residual O(upper) cost would be monotonic (highest at `[3500,4000)`, not a mid-window spike
+that vanishes under lower load). The asymptotic win is established deterministically and confirmed here wall-clock.
+
+**vs TectonicFS (condition 12).** The OCI write path — overlay create — is now **~70–100 µs p50 on the local path**,
+the µs-scale low-latency class. There is no direct p99-vs-p99 A/B to run: TectonicFS (FAST '21, Pan et al.) is
+closed-source and, as a throughput-oriented exabyte warehouse store (≈10 KQPS/shard, a metadata op is "one or more
+network calls"), **publishes no small-op p99** — it explicitly trades metadata latency for scale. The honest comparison
+is the class one in the "Condition 12 … honest comparison to TectonicFS" entry above: slates holds the low-latency end
+Tectonic gives up, and beats the runnable same-machine competitor (the kernel's NFS server) on read latency. The
+remaining refinement to the slates-side number is a **quiet-machine** p99 histogram (vs this session's load-6–15
+figures); the competitor side is a published-figure comparison by necessity.
+
+### Condition 12: overlay p99 histogram and A-134 confirmed in practice (2026-10-11, host load 3.5→VM 6.7)
+
+A quiet-ish-machine p99 histogram of the OCI write path (overlay volume, Linux FUSE, A-134), 10k creates + 5k
+create+fsync, with the publish path instrumented (`PUBDBG`, reverted):
+
+| op | p50 | p90 | p99 | p999 | max | stalls >1 ms |
+|---|---|---|---|---|---|---|
+| overlay create | 102 µs | 220 µs | 3,129 µs | 7,006 µs | 13,437 µs | 798 / 10,000 |
+| overlay create+fsync | 103 µs | 138 µs | **232 µs** | 610 µs | 2,489 µs | **3 / 5,000** |
+| plain create (same workload) | 76 µs | 137 µs | 221 µs | 437 µs | 1,516 µs | 4 / 10,000 |
+
+**A-134 confirmed in practice, not just asymptotically.** The instrumented publish path showed the overlay publishing
+**small deltas of 471–757 bytes** (not whole images), with checkpoints rare (~1 per 2,000 publishes, same as a plain
+volume). So the O(volume)-per-op publish is genuinely gone on the real daemon under load — the delta bytes are constant
+and tiny, matching the deterministic allocation proof.
+
+**The durability-critical path is clean:** overlay create+**fsync** is p99 232 µs with only 3 stalls in 5,000 — on par
+with a plain volume (p99 221 µs). The tail appears only in overlay create **without** fsync (798 stalls, p99 3.1 ms).
+Since the same volume and base with fsync is clean, the tail is not the publish or a base-plane read (those run on the
+fsync path too) — it is consistent with the kernel's FUSE async write-back bursting under VM load on the unsynced path,
+not a daemon cost A-134 left behind. A dedicated isolation of that unsynced-writeback tail (and a bare-metal, not-VM
+run) is the remaining condition-12 refinement; the durability path and the publish cost are both established.
+
+### Condition 2: clones publish deltas for their own new files (A-134 extended; 2026-10-11)
+
+A clone (an agent's work volume) used to publish its whole image at every barrier. It now records and publishes a
+**delta** for its own new files, falling back to the whole image only on a barrier that **diverges** an origin inode
+(copies up an inode born at or before the origin epoch — the move out of `origin_shared` a delta cannot carry, since
+recovery refuses an inode in both `inodes` and `origin_shared`). Proof (load-independent, allocation-counted):
+`crates/vfs/tests/delta_cost.rs::a_clone_create_publishes_a_delta_costing_the_same_in_a_large_clone_as_in_a_small_one`
+— one create in a published clone publishes a `VolumeRecord::Delta` whose publication+replay allocate the same in a
+4,096-file clone and a 64-file one (O(delta), not O(volume)). Recovery byte-correctness incl. divergence:
+`crates/server/tests/recovery.rs::a_clone_recovers_over_its_recovered_origin...`, now extended to diverge an inherited
+file in the clone, restart, and confirm the clone reads its diverged bytes while the origin's copy is untouched.
+Snapshot (own-snapshot) volumes still publish whole — a separate snapshot-image delta (`trie::changed`) is owed.
+
+### Condition 2: own-snapshot volumes publish deltas too — all three shapes now O(delta) (A-134 generalized; 2026-10-11)
+
+The delta publish now covers the last shape: a volume holding its **own snapshot** (e.g. a green merge target written
+while snapshotted) publishes a delta for its own new files, falling back to the whole image only on a barrier that
+**diverges a snapshot-pinned inode** (its old version moves into the snapshot's private records — a shared→private move
+a delta cannot carry). This unified the gate across overlay/clone/snapshot: `recording()` records for every published
+volume; `publishes_whole()` takes the whole image only on a shape change, `base_plane_changed`, or `shared_diverged`
+(set in `make_current_inode` — the chokepoint for writes, nlink changes and deletes — when it copies up a clone-origin
+or own-snapshot-pinned inode). Proof (load-independent, allocation-counted):
+`crates/vfs/tests/delta_cost.rs::a_snapshotted_create_publishes_a_delta_costing_the_same_in_a_large_volume_as_in_a_small_one`
+— one create in a snapshotted volume publishes a `Delta` whose publication+replay allocate the same in a 4,096-file and
+a 64-file volume. End-to-end recovery: `crates/server/tests/recovery.rs::acknowledged_content_and_its_snapshot_survive_a_restart`
+now also creates a file after the snapshot and confirms it (a delta) survives the restart alongside the diverge-the-head
+whole-image case. With overlay (A-134) and clone deltas, **all three volume shapes are now O(delta) per op**, whole-image
+only on a shared→private divergence. Condition 2's write-path delta optimization is complete.
+
+### Measured-and-rejected: draining many pages per period does not speed takeover recovery (2026-10-11)
+
+Hypothesis: `crates/server/src/takeover.rs::list_page` fixes each recovery page at `page_budget()` (the initial
+receive window, ~55 objects) and `drive_host_takeover` asks one page per member per 100 ms coordinator period, so a
+large retired host recovers in O(N) periods — "minutes for a very large host." Implemented a bounded drain loop
+(`drive_host_takeover` pulls pages until the host is drained or one period elapses, via an extracted
+`next_page_requests` that advances the round without re-promising local copies; each page stays one-flight-sized).
+
+**Rejected — the A/B is dead-even.** Periods-to-recover (in-process 3-node fleet, kill the owner, measure
+`Daemon::fleet_progress` periods to the last-id object placed; `takeover_periods_scale`, this M-series box):
+
+| retired host | before (one page/period) | after (drain loop) |
+|---|---|---|
+| 1,024 volumes | 20 periods | 18 |
+| 4,096 volumes | 34 periods | 33 |
+
+A fixed ~1–2-period saving that **shrinks** with N — so recovery is **not paging-bound**. The ~18-period floor is
+the required safety horizons (AUD-08 owner lease + SWIM detection, each ~900 ms ≈ 9 periods, correctness-required),
+and the part that grows with N is the **O(N) required adopt + materialize** per object, not the paging. The
+"slow paging" premise was wrong; the loop was reverted (the recovery oracle stayed 39/0 and the servable/`NotFound`
+gate read 0 `NotFound` throughout, so the loop was *correct* — just not a win). Recovery of realistic hosts is ~2 s
+(1,024 volumes), dominated by the horizons and per-object work, neither a cheap lever.
+
+### Landed: a checkpoint marks its volumes by set, not a scan — O(V²) → O(V log V) in a shard's volumes (§4.8; 2026-10-12)
+
+**What changed.** A barrier's common path is `publish_delta` (its cost is its changes, A-68); `publish_checkpoint`
+(§4.8, the periodic amortized compaction when the journal `wants_checkpoint`) re-images the whole shard, then sweeps
+every hosted volume to mark it published or not. That sweep asked `published.volumes.contains(&slot.id)` — a linear
+scan of the committed list — once per volume, so the mark was **O(V²)** in the volumes a shard holds. The committed ids
+are now built once into a `BTreeSet` (the volumes' own key type, matching the server's other membership sets), so the
+sweep is **O(V log V)**. The slates case is a shard holding thousands of tiny agent volumes (provisioned in <50 µs, many
+per host); the checkpoint stalls the shard's single thread, so a quadratic term there is a p99 tail under real load.
+
+**Command.** `checkpoint_cost_scales_with_the_hosted_volume_count` (a `#[test] #[ignore]` measurement in
+`crates/server/src/verbs.rs`): on one shard create V empty bounded volumes, then time `publish_checkpoint`, best of 5.
+The volumes are empty, so the image's streaming is metadata only and the mark sweep stands out.
+`cargo test --release -p slates-server --lib checkpoint_cost_scales_with_the_hosted_volume_count -- --ignored --nocapture`.
+macOS, Darwin 25.4, 18 cores, host load ~13.9 (a shared machine — wall-clock, so the *shape* across V is the reading,
+not the absolute points); best of 5.
+
+**Before — the linear-scan mark (`published.volumes.contains`), best of 5:**
+
+| volumes | checkpoint (best) | ns/volume |
+|---|---|---|
+| 512 | 208 µs | 406 |
+| 1,024 | 483 µs | 472 |
+| 2,048 | 1.30 ms | 634 |
+| 4,096 | 3.71 ms | 906 |
+| 8,192 | 11.83 ms | 1,444 |
+
+ns/volume climbs 406 → 1,444 (super-linear). Fitting `a·V + b·V²`: a ≈ 337 ns/vol (streaming/sort, linear),
+b ≈ 0.135 ns/vol² (the scan). At 8,192 the quadratic is ~9 of the 11.8 ms (77%); extrapolated it is ~145 ms at 32,768
+volumes and ~0.4 s at 55,000 (a million volumes over eighteen shards) — a pure-waste single-thread stall per checkpoint.
+
+**After — the set-membership mark (`BTreeSet::contains`), best of 5:**
+
+| volumes | checkpoint (best) | ns/volume |
+|---|---|---|
+| 512 | 275 µs | 537 |
+| 1,024 | 458 µs | 447 |
+| 2,048 | 1.11 ms | 544 |
+| 4,096 | 2.00 ms | 488 |
+| 8,192 | 3.36 ms | 410 |
+
+- **ns/volume is flat (~410–540 across 512 → 8,192)** — the quadratic term is gone; the cost is the linear streaming/sort.
+- **8,192 volumes: 11.83 ms → 3.36 ms (3.5×),** and the gap widens with V (the removed term is quadratic): ~12× at
+  32,768, ~18× at 55,000.
+- At V=512 the after is a shade higher (275 vs 208 µs) — the set build's fixed cost, where the quadratic it removes is
+  still negligible; the win is at the scale that matters.
+
+**Correctness.** Same membership (a duplicate in the Vec, which the set folds, never changed a membership answer), so
+behaviour is identical. The publish-path arbiter is green: `cargo test --release -p slates-server --test recovery` —
+the two checkpoint-recovery oracles pass (`an_overlays_copied_up_and_created_files_survive_a_restart_over_their_base`,
+`a_clone_recovers_over_its_recovered_origin...`), 38/39 with one pre-existing pressure-hold timing flake
+(`a_hold_finer_than_the_pools_free_extents_...`, 3/3 on isolated re-run; it reads the shared machine's real memory
+swings under load, unrelated to this change).
+
+**Sibling (reported, not fixed here).** `stream_checkpoint`'s `left_out` closure scans `skipped` linearly per volume
+(O(V × skipped)). `skipped` is empty in the normal path — every volume captured — so it did not enter this measurement
+and bites only in the degenerate many-skips failure mode; a measurement-first fix awaits a scenario that forces skips
+at scale.
+
+### Measured: a transient false condemnation is harmless and its recovery is size-independent — so no detection-cost margin is owed (condition 11; 2026-10-12)
+
+**Why.** slates can weight its SWIM detector's surety by a condemnation cost (`Detector::set_condemnation_cost`): the more a false condemnation would cost, the surer — and so slower — the detector is before it fires. The natural cost looks like the condemned host's whole takeover (N × ~1.5 µs, up to ~1.5 s at 1 M objects), which would slow detection for large hosts (the LAN-3 least-detection bound grows none→9 s as the cost grows none→1 s; Part 6, `fleet-under-load.md`). This measures the **real** cost of a transient false positive, to set the margin from evidence, not the worst case.
+
+**Command.** `transient_false_condemnation_cost_is_flat_in_the_owners_object_count` (a `#[test] #[ignore]` fleet measurement in `crates/server/tests/fleet.rs`): a three-node mesh, N scratch volumes on A, both survivors made to falsely observe A dead (the fold A's own detector performs when it ages a peer to death), and while A refutes and is re-admitted, A's service of one of its objects is sampled and the re-admission window counted in load-independent periods. `cargo test --release -p slates-server --test fleet transient_false_condemnation -- --ignored --nocapture`. macOS, Darwin 25.4, 18 cores, host load ~14.
+
+| owner's objects | re-admitted (after a real retirement) | periods to re-admit, per survivor | A's reads refused / sampled |
+|---|---|---|---|
+| 256 | yes | [1, 1] | 0 / 9 |
+| 4,096 | yes | [1, 1] | 0 / 10 |
+
+- **Zero unavailability.** The wrongly-retired *live* owner kept serving its own objects throughout (0 refusals), at both sizes — the owner lease (AUD-08) holds while the owner refutes.
+- **Re-admission is O(fleet), size-independent.** One period to re-admit, flat across a 16× object range — membership refutation never enumerates objects (D-12).
+- **So the condemnation cost is ~0** (the measured unavailability), not N × 1.5 µs. `set_condemnation_cost` is now set explicitly to zero in `crates/cluster/src/member_plane.rs` with this derivation, so the detector detects at its least bound (~0.9–1.84 s), fast for every host size, and a change to the vendored default cannot silently slow it. slates' safety against a false positive is the owner lease, not a slower detector. F = 10 s (the failover SLO, `FAILOVER_SLO_NS`) stands unchanged.

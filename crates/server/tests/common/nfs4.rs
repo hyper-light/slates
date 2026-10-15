@@ -40,12 +40,15 @@ const CALLBACK_PROGRAM: u32 = 0x4000_0000;
 /// Format: `ca_maxrequests`, one slot: this client sends one compound at a time.
 const ONE_SLOT: u32 = 1;
 
-/// One NFSv4.2 session over `stream`: its id, slot 0's last sequence id and the next RPC xid.
+/// One NFSv4.2 session over `stream`: its id, slot 0's last sequence id, the next RPC xid, and the last compound
+/// sent on the slot, which a retry sends again unchanged.
 pub(crate) struct Session {
   stream: TcpStream,
   sessionid: [u8; 16],
+  clientid: u64,
   sequence: u32,
   xid: u32,
+  last: Vec<u8>,
 }
 
 impl Session {
@@ -55,8 +58,10 @@ impl Session {
     let mut session = Session {
       stream,
       sessionid: [0; 16],
+      clientid: 0,
       sequence: 0,
       xid: 0,
+      last: Vec::new(),
     };
     let mut args = frame(1);
     args.u32(op::EXCHANGE_ID);
@@ -68,6 +73,7 @@ impl Session {
     let reply = session.compound(args.as_slice());
     let mut body = results(&reply, op::EXCHANGE_ID).expect("EXCHANGE_ID");
     let clientid = body.u64().unwrap();
+    session.clientid = clientid;
     let sequenceid = body.u32().unwrap();
     let mut args = frame(1);
     args.u32(op::CREATE_SESSION);
@@ -102,16 +108,30 @@ impl Session {
     path: &[&str],
     operation: impl FnOnce(&mut XdrWriter),
   ) -> Result<Vec<u8>, u32> {
+    self.at_with(false, capability, path, 1, operation)
+  }
+
+  /// [`Session::at`] for `operations` operations written by `operation`, asking the server to keep the reply for a
+  /// retry when `cache_this` (`sa_cachethis`, which a client sets on a compound that changes state, RFC 8881
+  /// §18.46.3): the last operation's result body, or the first failing status.
+  pub(crate) fn at_with(
+    &mut self,
+    cache_this: bool,
+    capability: &str,
+    path: &[&str],
+    operations: u32,
+    operation: impl FnOnce(&mut XdrWriter),
+  ) -> Result<Vec<u8>, u32> {
     self.sequence += 1;
     let lookups = u32::try_from(path.len()).unwrap() + 1;
-    // SEQUENCE, PUTROOTFH, the LOOKUPs and the operation.
-    let mut args = frame(lookups + 3);
+    // SEQUENCE, PUTROOTFH, the LOOKUPs and the operations.
+    let mut args = frame(lookups + 2 + operations);
     args.u32(op::SEQUENCE);
     args.fixed(&self.sessionid);
     args.u32(self.sequence);
     args.u32(0); // slot
     args.u32(0); // highest slot
-    args.bool(false);
+    args.bool(cache_this);
     args.u32(op::PUTROOTFH);
     for component in std::iter::once(capability.trim_start_matches('/')).chain(path.iter().copied())
     {
@@ -119,26 +139,46 @@ impl Session {
       args.opaque(component.as_bytes());
     }
     operation(&mut args);
+    self.last = args.as_slice().to_vec();
     let reply = self.compound(args.as_slice());
-    let mut body = XdrReader::new(&reply);
-    let status = body.u32().unwrap();
-    body.opaque(1024).unwrap();
-    let count = body.u32().unwrap();
-    for index in 0..count {
-      let _opnum = body.u32().unwrap();
-      let result = body.u32().unwrap();
-      if result != 0 {
-        return Err(result);
-      }
-      if index == 0 {
-        body.fixed(SEQUENCE_RESULT_BYTES).unwrap();
-      }
-      if index + 1 == count {
-        assert_eq!(status, 0, "the compound succeeded with its last operation");
-        return Ok(body.rest().to_vec());
-      }
-    }
-    Err(status)
+    last_result(&reply)
+  }
+
+  /// Sends the last compound again, unchanged — the same slot and sequence id, so a retry of it (RFC 8881
+  /// §2.10.6.2): the last operation's result body, or the first failing status.
+  pub(crate) fn resend(&mut self) -> Result<Vec<u8>, u32> {
+    let args = self.last.clone();
+    let reply = self.compound(&args);
+    last_result(&reply)
+  }
+
+  /// The session's client id.
+  pub(crate) fn clientid(&self) -> u64 {
+    self.clientid
+  }
+
+  /// DESTROY_SESSION of this session (RFC 8881 §18.37), alone in its compound: its status.
+  pub(crate) fn destroy(&mut self) -> u32 {
+    let mut args = frame(1);
+    args.u32(op::DESTROY_SESSION);
+    args.fixed(&self.sessionid);
+    let reply = self.compound(args.as_slice());
+    XdrReader::new(&reply).u32().unwrap()
+  }
+
+  /// DESTROY_CLIENTID of this session's client (RFC 8881 §18.50), alone in its compound: its status. The client's
+  /// sessions must be destroyed first.
+  pub(crate) fn destroy_clientid(&mut self) -> u32 {
+    let mut args = frame(1);
+    args.u32(op::DESTROY_CLIENTID);
+    args.u64(self.clientid);
+    let reply = self.compound(args.as_slice());
+    XdrReader::new(&reply).u32().unwrap()
+  }
+
+  /// Continues this session over a new connection to `port`, as a client reconnects after its server restarted.
+  pub(crate) fn reconnect(&mut self, port: u16) {
+    self.stream = TcpStream::connect(("127.0.0.1", port)).expect("connect to the NFS port");
   }
 
   /// SETXATTR of `name` to `value` on the node at `path` (`SETXATTR4_EITHER`).
@@ -202,6 +242,30 @@ impl Session {
       self.xid,
     )
   }
+}
+
+/// A sequenced compound's outcome from its COMPOUND4res: the last operation's result body, or the first failing
+/// status (the SEQUENCE's own, when the session or slot refused it).
+fn last_result(reply: &[u8]) -> Result<Vec<u8>, u32> {
+  let mut body = XdrReader::new(reply);
+  let status = body.u32().unwrap();
+  body.opaque(1024).unwrap();
+  let count = body.u32().unwrap();
+  for index in 0..count {
+    let _opnum = body.u32().unwrap();
+    let result = body.u32().unwrap();
+    if result != 0 {
+      return Err(result);
+    }
+    if index == 0 {
+      body.fixed(SEQUENCE_RESULT_BYTES).unwrap();
+    }
+    if index + 1 == count {
+      assert_eq!(status, 0, "the compound succeeded with its last operation");
+      return Ok(body.rest().to_vec());
+    }
+  }
+  Err(status)
 }
 
 /// A COMPOUND's frame: an empty tag, minor version 2 and the operation count.

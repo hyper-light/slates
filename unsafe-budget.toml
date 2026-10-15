@@ -82,6 +82,11 @@
 #   `CloseHandle` (5), Win32 without a safe wrapper. An observation counts its budget in the observed shard's own time,
 #   so a starved shard is not read as wedged (docs/bugs/2026-10-03-an-observation-read-a-starved-shard-as-wedged.md).
 #   63 → 73.
+#   The held NFS connection (`tcp.rs`, 2026-10-06, §4.6 A-113): one integer `setsockopt` for the receive and send
+#   low-water marks (`SO_RCVLOWAT`, `SO_SNDLOWAT`), which rustix does not wrap (1) — the send mark is what makes a send
+#   of a whole record all-or-nothing on macOS; and one `getsockopt` of the first byte of the kernel's TCP connection
+#   record (Linux `TCP_INFO`, macOS `TCP_CONNECTION_INFO`) for the peer's close, which a peeking reader cannot see
+#   behind an unfinished record (1). 73 → 75.
 # slates-wire (4): the CRC32C hardware intrinsics behind runtime feature detection.
 # slates-wire-derive (0).
 # slates-base (10): rustix marks kevent unsafe because the kernel fills the output list; one
@@ -132,7 +137,9 @@
 #   read "alive"): on macOS, rustix's `kevent` (unsafe by signature for its user-data pointer) to
 #   register `EVFILT_PROC`/`NOTE_EXIT` and to read it with a zero timeout (2); on Windows, compiled only
 #   there, `OpenProcess(SYNCHRONIZE)`, adopting its handle as an `OwnedHandle`, and
-#   `WaitForSingleObject` with a zero timeout (3).
+#   `WaitForSingleObject` with a zero timeout (3). The anchor-held rendezvous (`rendezvous.rs` `adopt`, 2026-10-06,
+#   A-114): on Linux, borrowing the listening socket the anchor handed over by number to duplicate it close-on-exec,
+#   the shape the segment handoff already has (1). 46 → 47.
 # slates-server (5): the Windows liveness probe of a client's
 #   process (`peer.rs`, added 2026-09-05 with the dead-client reclaim): open, wait with a zero
 #   timeout, close (3), compiled only for Windows; and the daemon adopting the anchor's inherited
@@ -153,9 +160,11 @@
 # slates-bridge-fuse (0): the FUSE ABI codec is byte slices read and written in field order
 #   through a sequential reader/writer (`wire.rs`), never a cast; the /dev/fuse transport and
 #   mount (Unix, added later) will carry their own budgeted sites.
-# slates-land (3): the macOS libc calls rustix does not wrap, each on a descriptor the writer
-#   owns: fcntl(F_BARRIERFSYNC) as the data barrier, fcntl(F_FULLFSYNC) as the media barrier,
-#   renameatx_np(RENAME_SWAP) as the exchange.
+# slates-land (4): the libc calls rustix does not wrap, each on a descriptor the writer owns:
+#   macOS fcntl(F_BARRIERFSYNC) as the data barrier, fcntl(F_FULLFSYNC) as the media barrier,
+#   renameatx_np(RENAME_SWAP, RENAME_EXCL) as the exchange and the rename that replaces nothing;
+#   and (raised 3 -> 4 on 2026-10-10, A-130) Linux sync_file_range(SYNC_FILE_RANGE_WRITE) as a
+#   file's write-out, measured 1.5-2.6x faster a file with the concurrent barrier, quiet and busy.
 #   the Winsock `getsockopt(SO_RCVBUF)` of a live socket (§4.10a, added 2026-09-10 for the
 #   demultiplexer's per-session queue sizing; Win32, unsafe by signature, 1).
 #
@@ -223,13 +232,13 @@ slates-mem = 36
 # `&self`, instead of a `&'static` field — a runtime passed by value had that field protected while its drop
 # freed the clock (Miri, `--test ownership`). (+1) the same for `LocalRuntime::context` (`runtime.rs`), whose
 # context its own `Drop` frees.
-slates-rt = 73
+slates-rt = 75
 slates-base = 10
 slates-vfs = 0
-slates-land = 3
+slates-land = 4
 slates-anchor = 6
 slates-db = 0
-slates-ipc = 46
+slates-ipc = 47
 # 2026-09-19 (-1): Linux rendezvous awaits driver readiness; no raw-fd polling thread.
 # 2026-09-28 (+1): the inherited fleet serve sockets (`fleet.rs` `adopt_inherited`).
 #   Raised 5 → 6 on 2026-10-03 for A-64 (content resident once): `daemon::arena_region` maps the shard's arena range of

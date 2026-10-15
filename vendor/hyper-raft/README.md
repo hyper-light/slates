@@ -1,7 +1,23 @@
 # Vendored hyper-raft crates
 
 The crates slates shares with focal and mantle (`../hyper-raft`, github.com/hyper-light/hyper-raft), taken as a
-snapshot at one revision whose CI is green on all six targets (`SNAPSHOT`: hyper-raft `f9a2c8e`, 2026-10-05; hyper-seal's source and hyper-timing's `ORIGIN.md` changed from `46d1035`, hyper-datagram and hyper-swim unchanged). Never a
+snapshot at one revision whose CI is green on all six targets (`SNAPSHOT`: hyper-raft `aa82ada`, 2026-10-12, green on
+all six targets, Miri, the TLC models and the explorer: the revision mantle and focal re-vendor to as well). The four
+crates' sources and `ORIGIN.md` are those of `67f038d` (2026-10-10, PR #17), unchanged upstream since. At `67f038d`,
+hyper-swim's source and `ORIGIN.md` changed from `5d68252` (its items 14 to 20): the owner's detection budget floors a
+judged period and is re-derived at run time
+(`set_detection_budget`, `least_detection_bound`); a verdict's margin is searched over every margin and a false
+condemnation priced (`set_condemnation_cost`); a pair's fit to the pool follows its latest evidence; a death counts
+once it stands; every probe is judged, by its pair's RFC 6298 timer until an estimator judges it; a relay judges its
+own leg to the target and nacks, and each acknowledgement states when a relay's response is due (`relay_within_ns`,
+beside `promise_ns` for a per-grant lease, which the detector does not read). hyper-timing lost the capped
+configurator only hyper-swim used. slates' local detector patches (`53e182e6`, `e6640dd3`, `bee1bb41`, `976a23d8`)
+are gone, each upstream in its own form (`docs/bugs/2026-10-10-a-relay-reachable-peer-was-condemned-by-a-relay-stage-timed-from-stale-direct-spans.md`,
+"Upstream"). hyper-datagram and hyper-seal are byte for byte `5d68252`'s, unchanged upstream since. All four are as
+taken at `67f038d`: hyper-swim's per-peer `OUTSTANDING` bound is public (slates' member plane imports it), and
+hyper-seal's `sealed_file` sits behind a `files` feature, the only thing that enables `hyper-block`, a file device.
+slates leaves `files` off and does not vendor `hyper-block`: it writes files only in `land` (R1). Its hyper-seal
+manifest declares the feature as a known, unset value. Never a
 path or git dependency on the shared repository: slates builds what it reviewed (A-52 §5,
 `docs/wip/transport-quic.md` §5; the scheme mantle and focal use).
 

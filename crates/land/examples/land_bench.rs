@@ -1,7 +1,7 @@
 //! The landing baselines (Phase 1 task 13; T-1.17): the engine's own cost per entry over the
 //! simulated host (plan, validate, write, advance), and, on Unix, a 10k-entry delta landed into a
 //! 10^6-entry tree on the host's disk by the OS writer against `cp -r` of the same delta, with the
-//! ramp's settled depth recorded. The trees live in the build output beside this binary (under
+//! batch barriers recorded (A-130). The trees live in the build output beside this binary (under
 //! `target/`; A-50: a landing writes the host's disk, never `/tmp` and never a RAM directory);
 //! nothing is written outside it.
 //!
@@ -52,6 +52,10 @@ const OS_DELTA: usize = 10_000;
 const OS_BASE: usize = 1_000_000;
 /// Shape: files per directory of the generated trees.
 const PER_DIR: usize = 100;
+/// Shape: the flat-directory sizes the scaling rows land, doubling. A server landing of 1,000 files took 2.2–2.8 times as
+/// long as one of 500 on macOS, and up to 15 times in Docker (GAPS, 2026-10-01, cause not located); a per-entry cost that
+/// rises down these rows is a cost that grows with a directory's size.
+const FLAT_SIZES: [usize; 5] = [1_000, 2_000, 4_000, 8_000, 16_000];
 
 fn store() -> Store {
   let mut arena = ChunkArena::new(PAGE);
@@ -95,9 +99,6 @@ fn request(id: u64) -> LandingRequest {
     now_ns: 1,
     media_durability: false,
     large_class_bytes: LARGE,
-    cores: 2,
-    max_depth: 8,
-    variance_permille: 100,
   }
 }
 
@@ -170,6 +171,60 @@ fn land_once<H: LandFs>(
   .unwrap();
   leases.release(&lease);
   report
+}
+
+/// Writes `n` new files, `f00000`…, into the root of `vol`, each a few bytes, as a workload's files in one directory.
+fn write_flat<H: HostFs>(vol: &mut Volume, host: &mut H, store: &mut Store, n: usize) {
+  let root = vol.root_inode(store).unwrap();
+  for f in 0..n {
+    let mut o = vol.with_host(host);
+    let inode = o
+      .create_file_no(store, root, &format!("f{f:05}"), 0o644)
+      .unwrap();
+    o.write(store, inode, 0, format!("new {f}").as_bytes())
+      .unwrap();
+  }
+}
+
+/// The flat scaling rows over the simulated host: for each size, `n` new files in one directory of an overlay over an
+/// empty root, landed into it (engine cost only); ns per entry.
+fn flat_sim_rows() {
+  for n in FLAT_SIZES {
+    let mut samples = Vec::new();
+    for run in 0..RUNS {
+      let mut host = SimHost::new();
+      let mut store = store();
+      let root = host.root();
+      let facts = host.facts(root).unwrap();
+      let mut vol = Volume::create_overlay(
+        &mut store,
+        config(),
+        BaseConfig {
+          root,
+          facts,
+          large_class_bytes: LARGE,
+        },
+      )
+      .unwrap();
+      write_flat(&mut vol, &mut host, &mut store, n);
+      let target = LandingTarget {
+        dir: host.root(),
+        key: "/".into(),
+      };
+      let started = Instant::now();
+      let report = land_once(
+        &mut host,
+        &target,
+        &mut vol,
+        &mut store,
+        u64::try_from(run).unwrap(),
+      );
+      samples.push(ns_per_entry(started.elapsed(), n));
+      assert_eq!(report.state, LandingState::Done, "{report:?}");
+      assert_eq!(report.written, n);
+    }
+    row(&format!("land.flat_per_entry_sim_{n}"), samples, false);
+  }
 }
 
 /// The bootstrap-free interval of `samples`: min, median, max (N is small and shown).
@@ -315,7 +370,7 @@ mod os_rows {
     }
     let mut landed = Vec::new();
     let mut copied = Vec::new();
-    let mut depth = 0u32;
+    let mut barriers = 0usize;
     for run in 0..RUNS {
       // Reset the edited files.
       for f in 0..OS_DELTA {
@@ -347,26 +402,87 @@ mod os_rows {
       landed.push(ns_per_entry(started.elapsed(), OS_DELTA));
       assert_eq!(report.state, LandingState::Done, "{report:?}");
       assert_eq!(report.written, OS_DELTA);
-      depth = report.ramp_depth;
+      barriers = report.barriers;
       let copy_dst = ws.join(format!("copy{run}"));
       copied.push(ns_per_entry(cp_r_delta(&delta_src, &copy_dst), OS_DELTA));
     }
     row("land.land_per_entry_os_10000_into_1000000", landed, true);
     row("land.cp_r_per_entry_of_the_same_delta", copied, false);
-    println!("  ramp settled depth (recorded, entries run one at a time in Phase 1): {depth}");
+    println!("  batch barriers in the last run (A-130): {barriers} for {OS_DELTA} files");
+    let _ = std::fs::remove_dir_all(&ws);
+  }
+
+  /// The flat scaling rows on the host's disk: for each size, `n` new files in one directory of an overlay over an
+  /// empty directory in the build output, landed into it by the OS writer; ns per entry.
+  #[allow(clippy::disallowed_methods)]
+  pub(super) fn flat(build_output: &Path) {
+    let ws = build_output.join(format!("slates-land-flat-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&ws);
+    std::fs::create_dir_all(&ws).unwrap();
+    for n in FLAT_SIZES {
+      let mut samples = Vec::new();
+      for run in 0..RUNS {
+        let dir = ws.join(format!("n{n}-r{run}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (mut host, target) = OsLand::open_target(&dir).unwrap();
+        let mut store = store();
+        let facts = host.facts(target.dir).unwrap();
+        let mut vol = Volume::create_overlay(
+          &mut store,
+          config(),
+          BaseConfig {
+            root: target.dir,
+            facts,
+            large_class_bytes: LARGE,
+          },
+        )
+        .unwrap();
+        write_flat(&mut vol, &mut host, &mut store, n);
+        let started = Instant::now();
+        let report = land_once(
+          &mut host,
+          &target,
+          &mut vol,
+          &mut store,
+          u64::try_from(run).unwrap(),
+        );
+        samples.push(ns_per_entry(started.elapsed(), n));
+        assert_eq!(report.state, LandingState::Done, "{report:?}");
+        assert_eq!(report.written, n);
+        drop(host);
+        let _ = std::fs::remove_dir_all(&dir);
+      }
+      row(&format!("land.flat_per_entry_os_{n}"), samples, false);
+    }
     let _ = std::fs::remove_dir_all(&ws);
   }
 }
 
 fn main() {
-  sim_rows();
+  // `land_bench flat` runs only the flat scaling rows, `land_bench sim` only the gated rows over the simulated host
+  // (an engine change's quick A/B); with no argument every row runs, as CI's lane runs it.
+  let only = std::env::args().nth(1);
+  if only.as_deref() == Some("sim") {
+    sim_rows();
+    return;
+  }
+  let flat_only = only.as_deref() == Some("flat");
+  if !flat_only {
+    sim_rows();
+  }
+  flat_sim_rows();
   // The build output: the directory holding this example's binary.
   let beside = std::env::current_exe()
     .ok()
     .and_then(|exe| exe.parent().map(PathBuf::from));
   match beside {
     #[cfg(unix)]
-    Some(build_output) => os_rows::run(&build_output),
+    Some(build_output) => {
+      os_rows::flat(&build_output);
+      if !flat_only {
+        os_rows::run(&build_output);
+      }
+    }
     #[cfg(not(unix))]
     Some(_) => println!("land bench: the OS rows run on Unix only"),
     None => println!("land bench: OS rows skipped — the binary's directory is unknown"),

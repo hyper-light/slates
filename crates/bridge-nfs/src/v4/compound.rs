@@ -19,7 +19,7 @@ use super::Nfsstat4;
 use super::attr::{self, FsFigures};
 use super::files::{LockRequest, share};
 use super::session::{
-  CreateSession, ExchangeId, Limits, ReplyLimits, Sequence, Sequenced, Sessions,
+  CreateSession, ExchangeId, Limits, Purge, ReplyLimits, Sequence, Sequenced, Sessions,
 };
 use super::types::{
   BITMAP_WORDS_MAX, Bitmap, ChannelAttrs, FHSIZE, OPAQUE_LIMIT, SESSIONID_SIZE, SessionId, Stateid,
@@ -87,6 +87,12 @@ pub trait Backend {
   /// succeeded), for the server's counts of which operations its clients are told to retry.
   fn finished(&mut self, opnum: u32, status: Nfsstat4) {
     let _ = (opnum, status);
+  }
+  /// The compound's calls are to be recorded as calls of `compound` (A-127): its SEQUENCE asked for the reply to be
+  /// kept, so a retry of it after a restart must be answered with what its calls did (`super::replay`). `None` for a
+  /// compound whose calls are not recorded. A server that never restarts under a client records nothing.
+  fn record_calls(&mut self, compound: Option<super::replay::CallIdentity>) {
+    let _ = compound;
   }
 }
 
@@ -259,6 +265,19 @@ mod claim {
 }
 /// Format: `channel_dir_from_server4` `CDFS4_FORE`: a bound connection carries the fore channel only.
 const CDFS4_FORE: u32 = 1;
+/// Format: `channel_dir_from_server4` `CDFS4_BACK`: the back channel only.
+const CDFS4_BACK: u32 = 2;
+/// Format: `channel_dir_from_server4` `CDFS4_BOTH`: both channels.
+const CDFS4_BOTH: u32 = 3;
+/// Format: `channel_dir_from_client4` `CDFC4_FORE` (the others ask for the back channel too: `CDFC4_BACK` 2,
+/// `CDFC4_FORE_OR_BOTH` 3, `CDFC4_BACK_OR_BOTH` 7; RFC 8881 §18.34.1).
+const CDFC4_FORE: u32 = 1;
+/// Format: `channel_dir_from_client4` `CDFC4_BACK`: the back channel only.
+const CDFC4_BACK: u32 = 2;
+/// Format: `SEQ4_STATUS_CB_PATH_DOWN` (RFC 8881 §18.46.3): no back channel of the client answers.
+const SEQ4_STATUS_CB_PATH_DOWN: u32 = 0x0000_0001;
+/// Format: `SEQ4_STATUS_CB_PATH_DOWN_SESSION` (RFC 8881 §18.46.3): this session's back channel does not answer.
+const SEQ4_STATUS_CB_PATH_DOWN_SESSION: u32 = 0x0000_0200;
 use super::listing::{COOKIE_SHIFT, ENTRY_FIXED, ENTRY_TYPICAL};
 /// Format: the most a v3 READDIRPLUS `entryplus3` encodes beyond the v4 `entry4` built from it, their names (encoded
 /// alike) aside: the v3 entry's fixed fields (value-follows 4, `fileid` 8, `cookie` 8, the name's length 4), its
@@ -319,9 +338,6 @@ pub const MIN_OPERATION_BYTES: u32 = 8;
 pub struct Server {
   /// Client ids and sessions.
   pub sessions: Sessions,
-  /// Purges an owner could not take, retried on the next drop: `(client, owner partition)`, never more
-  /// than the clients the table held times the owners.
-  pending_purges: Vec<(u64, u16)>,
   limits: Limits,
   /// The major id of the `server_owner4` EXCHANGE_ID answers (RFC 8881 §2.10.5): what names this server, the same
   /// across its restarts and different from every other server's. A client takes two servers with one major id (and
@@ -338,7 +354,6 @@ impl Server {
   pub fn new(boot: u32, limits: Limits) -> Server {
     Server {
       sessions: Sessions::new(boot, limits),
-      pending_purges: Vec::new(),
       limits,
       owner: u64::from(boot),
     }
@@ -351,16 +366,20 @@ impl Server {
     self
   }
 
-  /// A durable listener (§4.6 A-37): its client table rebuilt from the records kept before a restart
-  /// and journaled from now on (`Sessions::restore`).
+  /// A durable listener (§4.6 A-37): its client table, its sessions (A-127) and the purges it still owes (2026-10-10)
+  /// rebuilt from the records kept before a restart and journaled from now on (`Sessions::restore`).
   pub fn restore(
     boot: u32,
     limits: Limits,
-    records: Vec<super::session::ClientRecord>,
+    kept: (
+      Vec<super::session::ClientRecord>,
+      Vec<super::session::SessionRecord>,
+      Vec<super::session::Purge>,
+    ),
     now_ns: u64,
   ) -> Server {
     let mut server = Server::new(boot, limits);
-    server.sessions = Sessions::restore(boot, limits, records, now_ns);
+    server.sessions = Sessions::restore(boot, limits, kept, now_ns);
     server
   }
 
@@ -397,12 +416,6 @@ impl Server {
   pub fn limits(&self) -> Limits {
     self.limits
   }
-
-  /// The clients the session table dropped since the last call (replaced, expired or destroyed), whose
-  /// file state every owner must drop.
-  fn take_dropped(&mut self) -> Vec<u64> {
-    self.sessions.take_dropped()
-  }
 }
 
 /// A compound's running state: the file handles and the client it runs for.
@@ -419,30 +432,64 @@ pub(super) struct Frame {
 }
 
 /// What an operation produced: its result body on success, or the status it failed with.
-pub(super) type Outcome = Result<Vec<u8>, Nfsstat4>;
+pub(super) type Outcome = Result<Body, Nfsstat4>;
+
+/// An operation's result body: `bytes` from `from` on. Almost every body is its own buffer (`from` is zero); a READ's
+/// is the tail of the owner's reply, where `READ4resok` (the eof word, then the data) already sits, so it is encoded
+/// into the compound's reply with one copy and never into a buffer of its own first.
+pub(super) struct Body {
+  bytes: Vec<u8>,
+  from: usize,
+}
+
+impl From<Vec<u8>> for Body {
+  fn from(bytes: Vec<u8>) -> Body {
+    Body { bytes, from: 0 }
+  }
+}
+
+impl Body {
+  /// The body's bytes.
+  pub(super) fn as_slice(&self) -> &[u8] {
+    self.bytes.get(self.from..).unwrap_or_default()
+  }
+}
 
 /// Serves one `COMPOUND` call's arguments against `server` and `backend`, returning its encoded
 /// `COMPOUND4res`.
 pub async fn serve<B: Backend>(backend: &mut B, args: &[u8], request_bytes: usize) -> Vec<u8> {
+  serve_into(backend, args, request_bytes, Vec::new()).await.0
+}
+
+/// [`serve`], encoding the reply after the bytes already in `out` (the record marker and RPC header a caller reserved,
+/// `crate::rpc::success_record_head`), so the caller frames it in place. Returns the buffer and where in it the
+/// `COMPOUND4res` starts: `out`'s length when the reply was encoded there, zero when it is a buffer of its own (a refusal
+/// before the first operation, or a reply replayed from the slot cache).
+pub async fn serve_into<B: Backend>(
+  backend: &mut B,
+  args: &[u8],
+  request_bytes: usize,
+  out: Vec<u8>,
+) -> (Vec<u8>, usize) {
   let mut reader = XdrReader::new(args);
   let Ok(tag) = reader.opaque(OPAQUE_LIMIT).map(<[u8]>::to_vec) else {
-    return reply(Nfsstat4::Badxdr, &[], 0, &[]);
+    return (reply(Nfsstat4::Badxdr, &[], 0, &[]), 0);
   };
   let Ok(minor) = reader.u32() else {
-    return reply(Nfsstat4::Badxdr, &tag, 0, &[]);
+    return (reply(Nfsstat4::Badxdr, &tag, 0, &[]), 0);
   };
   if !(MINOR_LOWEST..=MINOR_HIGHEST).contains(&minor) {
-    return reply(Nfsstat4::MinorVersMismatch, &tag, 0, &[]);
+    return (reply(Nfsstat4::MinorVersMismatch, &tag, 0, &[]), 0);
   }
   let Ok(count) = reader.u32() else {
-    return reply(Nfsstat4::Badxdr, &tag, 0, &[]);
+    return (reply(Nfsstat4::Badxdr, &tag, 0, &[]), 0);
   };
   let max_operations = match backend.with_v4(|server| server.limits.offer.max_operations) {
     Ok(max_operations) => max_operations,
-    Err(status) => return reply(status, &tag, 0, &[]),
+    Err(status) => return (reply(status, &tag, 0, &[]), 0),
   };
   if count > max_operations {
-    return reply(Nfsstat4::TooManyOps, &tag, 0, &[]);
+    return (reply(Nfsstat4::TooManyOps, &tag, 0, &[]), 0);
   }
   let mut frame = Frame {
     minor,
@@ -452,7 +499,16 @@ pub async fn serve<B: Backend>(backend: &mut B, args: &[u8], request_bytes: usiz
     session: None,
     denied: None,
   };
-  let mut results = XdrWriter::new();
+  // The reply's header (status, tag, operation count) is written first and its words filled in at the end, so the
+  // results are encoded once, in place: assembling them into a second buffer copied every reply whole (a READ's full
+  // transfer among them, 2026-10-08).
+  let base = out.len();
+  let mut results = XdrWriter::continuing(out);
+  results.u32(Nfsstat4::Ok.wire());
+  results.opaque(&tag);
+  let count_at = results.len();
+  results.u32(0);
+  let header = results.len();
   let mut done = 0u32;
   let mut last = Nfsstat4::Ok;
   let mut last_op = 0u32;
@@ -468,20 +524,30 @@ pub async fn serve<B: Backend>(backend: &mut B, args: &[u8], request_bytes: usiz
     let outcome = if index == 0 {
       if opnum == op::SEQUENCE {
         match sequence(backend, &mut reader, (request_bytes, count)) {
-          Ok(SequenceOutcome::Replay(kept)) => return kept,
+          Ok(SequenceOutcome::Replay(kept)) => return (kept, 0),
           Ok(SequenceOutcome::New {
             body,
             sessionid,
             slotid,
+            sequenceid,
             clientid,
             limits: reply_limits,
+            cache_this,
           }) => {
             slot = Some((sessionid, slotid));
             limits = Some(reply_limits);
             frame.clientid = Some(clientid);
             frame.session = Some(sessionid);
             backend.act_for(clientid);
-            Ok(body)
+            // A compound whose reply the client asked to be kept has its calls recorded where they are served, so a
+            // retry after a restart is answered with what they did (A-127).
+            backend.record_calls(cache_this.then_some(super::replay::CallIdentity {
+              session: sessionid,
+              slot: slotid,
+              sequence: sequenceid,
+              clientid,
+            }));
+            Ok(body.into())
           }
           Err(status) => Err(status),
         }
@@ -496,9 +562,12 @@ pub async fn serve<B: Backend>(backend: &mut B, args: &[u8], request_bytes: usiz
     let recorded = record(&mut results, opnum, outcome, &mut frame);
     // The result that would carry the reply past the session's sizes is replaced by the refusal that
     // says so, and the compound ends there (RFC 8881 §2.10.6.4).
-    if let Some(too_big) =
-      limits.and_then(|limits| oversize(limits, reply_bytes_so_far(&tag, results.len())))
-    {
+    if let Some(too_big) = limits.and_then(|limits| {
+      oversize(
+        limits,
+        reply_bytes_so_far(&tag, results.len().saturating_sub(header)),
+      )
+    }) {
       results.truncate(before);
       let _ = record(&mut results, opnum, Err(too_big), &mut frame);
       last = too_big;
@@ -510,17 +579,25 @@ pub async fn serve<B: Backend>(backend: &mut B, args: &[u8], request_bytes: usiz
     }
   }
   backend.finished(last_op, last);
-  let encoded = reply(last, &tag, done, results.as_slice());
+  results.set_u32_at(base, last.wire());
+  results.set_u32_at(count_at, done);
+  let encoded = results.into_bytes();
   if let Some((sessionid, slotid)) = slot {
     // A reply that cannot be kept for a retry is not sent as if it had been: the client is told the
     // server failed rather than promised exactly-once (RFC 8881 §2.10.6.1).
-    if let Err(status) =
-      backend.with_v4(|server| server.sessions.store_reply(&sessionid, slotid, &encoded))
-    {
-      return reply(status, &tag, 0, &[]);
+    let cache = limits.is_some_and(|limits| limits.max_cached.is_some());
+    if let Err(status) = backend.with_v4(|server| {
+      server.sessions.store_reply(
+        &sessionid,
+        slotid,
+        encoded.get(base..).unwrap_or_default(),
+        cache,
+      )
+    }) {
+      return (reply(status, &tag, 0, &[]), 0);
     }
   }
-  encoded
+  (encoded, base)
 }
 
 /// What a compound must be served with (A-76), read from its first operation without serving it: the session it
@@ -610,7 +687,7 @@ fn record(
   match outcome {
     Ok(body) => {
       results.u32(Nfsstat4::Ok.wire());
-      results.fixed(&body);
+      results.fixed(body.as_slice());
       Ok(())
     }
     Err(status) => {
@@ -670,21 +747,22 @@ async fn outside_session<B: Backend>(
     op::EXCHANGE_ID => {
       let granted = exchange_id(backend, reader);
       // A client this replaced, or a lapsed one it made room for, leaves its file state at the owners.
-      purge_dropped(backend).await?;
+      purge_owed(backend).await?;
       granted
     }
     op::CREATE_SESSION => create_session(backend, reader),
     op::DESTROY_SESSION => {
       let sessionid = decode_sessionid(reader).map_err(|_| Nfsstat4::Badxdr)?;
-      backend
-        .with_v4(|server| server.sessions.destroy_session(&sessionid))?
-        .map(|()| Vec::new())
+      backend.with_v4(|server| server.sessions.destroy_session(&sessionid))??;
+      // Its call records go at every owner (A-127).
+      purge_owed(backend).await?;
+      Ok(Vec::new().into())
     }
     op::DESTROY_CLIENTID => {
       let clientid = reader.u64().map_err(|_| Nfsstat4::Badxdr)?;
       backend.with_v4(|server| server.sessions.destroy_clientid(clientid))??;
-      purge_dropped(backend).await?;
-      Ok(Vec::new())
+      purge_owed(backend).await?;
+      Ok(Vec::new().into())
     }
     _ => bind_conn(backend, reader),
   }
@@ -733,7 +811,7 @@ fn exchange_id<B: Backend>(backend: &mut B, reader: &mut XdrReader<'_>) -> Outco
   body.opaque(&owner.to_be_bytes());
   body.opaque(b"slates"); // server scope
   body.u32(0); // no implementation id
-  Ok(body.into_bytes())
+  Ok(body.into_bytes().into())
 }
 
 /// Format: `CREATE_SESSION4_FLAG_CONN_BACK_CHAN` (RFC 8881 §18.36.1): the creating connection carries the back
@@ -774,7 +852,7 @@ fn create_session<B: Backend>(backend: &mut B, reader: &mut XdrReader<'_>) -> Ou
   });
   granted.fore.encode(&mut body);
   granted.back.encode(&mut body);
-  Ok(body.into_bytes())
+  Ok(body.into_bytes().into())
 }
 
 /// Reads a `callback_sec_parms4<>` (the flavors the client accepts callbacks under, in its order of preference): the
@@ -837,30 +915,50 @@ fn read_callback_sec(reader: &mut XdrReader<'_>) -> Result<(Option<Vec<u8>>, boo
   Ok((credential, names_gss))
 }
 
-/// `BIND_CONN_TO_SESSION` (§18.34): the connection carries the session's fore channel.
+/// `BIND_CONN_TO_SESSION` (§18.34): the connection carries the session's fore channel, and its back channel too when
+/// the client asks and the session has one. A session's callbacks ride whichever connection last carried one of its
+/// compounds, so a connection bound for the back channel is its carrier from its first compound; the back channel is
+/// probed again before it is used, which is how a client repairs it after `SEQ4_STATUS_CB_PATH_DOWN` (Linux:
+/// `nfs41_handle_cb_path_down`). Until 2026-10-08 every bind was answered fore-only and a back channel once down was
+/// never probed again.
 fn bind_conn<B: Backend>(backend: &mut B, reader: &mut XdrReader<'_>) -> Outcome {
   let sessionid = decode_sessionid(reader).map_err(|_| Nfsstat4::Badxdr)?;
-  let _dir = reader.u32().map_err(|_| Nfsstat4::Badxdr)?;
+  let dir = reader.u32().map_err(|_| Nfsstat4::Badxdr)?;
   let _rdma = reader.bool().map_err(|_| Nfsstat4::Badxdr)?;
   backend
     .with_v4(|server| server.sessions.client_of(&sessionid))?
     .ok_or(Nfsstat4::Badsession)?;
+  let bound = if dir == CDFC4_FORE {
+    CDFS4_FORE
+  } else {
+    let has_back = backend.with_v4(|server| server.sessions.rebind_back_channel(&sessionid))?;
+    match (dir, has_back) {
+      (CDFC4_BACK, true) => CDFS4_BACK,
+      // The back channel alone, asked of a session that has none.
+      (CDFC4_BACK, false) => return Err(Nfsstat4::Inval),
+      (_, true) => CDFS4_BOTH,
+      (_, false) => CDFS4_FORE,
+    }
+  };
   let mut body = XdrWriter::new();
   body.fixed(&sessionid);
-  body.u32(CDFS4_FORE);
+  body.u32(bound);
   body.bool(false);
-  Ok(body.into_bytes())
+  Ok(body.into_bytes().into())
 }
 
 /// How a compound's `SEQUENCE` came out.
 enum SequenceOutcome {
-  /// A new request: its result body, its slot and its client.
+  /// A new request: its result body, its slot, its sequence id, its client, and whether it asked for its reply to be
+  /// kept.
   New {
     body: Vec<u8>,
     sessionid: SessionId,
     slotid: u32,
+    sequenceid: u32,
     clientid: u64,
     limits: ReplyLimits,
+    cache_this: bool,
   },
   /// A retry: the kept reply, to send as it is.
   Replay(Vec<u8>),
@@ -930,18 +1028,34 @@ fn sequence<B: Backend>(
       body.u32(slotid);
       body.u32(table_highest);
       body.u32(table_highest); // target highest slot
-      // A client holding a revoked delegation it has not freed is told on every SEQUENCE until it frees it (§10.4.5).
-      body.u32(if backend.revoked_state(clientid) {
+      // A client holding a revoked delegation it has not freed is told on every SEQUENCE until it frees it (§10.4.5);
+      // one whose back channel stopped answering is told so it can bind it again (§18.46.3).
+      let revoked = if backend.revoked_state(clientid) {
         SEQ4_STATUS_RECALLABLE_STATE_REVOKED
       } else {
         0
-      });
+      };
+      let (session_down, client_down) = backend
+        .with_v4(|server| server.sessions.callback_path_down(&sessionid, clientid))
+        .unwrap_or((false, false));
+      let path = if session_down {
+        SEQ4_STATUS_CB_PATH_DOWN_SESSION
+      } else {
+        0
+      } | if client_down {
+        SEQ4_STATUS_CB_PATH_DOWN
+      } else {
+        0
+      };
+      body.u32(revoked | path);
       Ok(SequenceOutcome::New {
         body: body.into_bytes(),
         sessionid,
         slotid,
+        sequenceid,
         clientid,
         limits,
+        cache_this,
       })
     }
   }
@@ -957,25 +1071,25 @@ async fn operation<B: Backend>(
   match opnum {
     op::PUTROOTFH | op::PUTPUBFH => {
       frame.current = Some(backend.root_handle());
-      Ok(Vec::new())
+      Ok(Vec::new().into())
     }
     op::PUTFH => {
       let fh = reader.opaque(FHSIZE).map_err(|_| Nfsstat4::Badxdr)?;
       frame.current = Some(Nfsfh3(fh.to_vec()));
-      Ok(Vec::new())
+      Ok(Vec::new().into())
     }
     op::GETFH => {
       let mut body = XdrWriter::new();
       body.opaque(&current(frame)?.0);
-      Ok(body.into_bytes())
+      Ok(body.into_bytes().into())
     }
     op::SAVEFH => {
       frame.saved = Some(current(frame)?.clone());
-      Ok(Vec::new())
+      Ok(Vec::new().into())
     }
     op::RESTOREFH => {
       frame.current = Some(frame.saved.clone().ok_or(Nfsstat4::Restorefh)?);
-      Ok(Vec::new())
+      Ok(Vec::new().into())
     }
     op::LOOKUP => lookup_operation(backend, reader, frame).await,
     op::LOOKUPP => {
@@ -987,7 +1101,7 @@ async fn operation<B: Backend>(
         return Err(Nfsstat4::Noent);
       }
       frame.current = Some(parent);
-      Ok(Vec::new())
+      Ok(Vec::new().into())
     }
     _ => object_operation(backend, opnum, reader, frame).await,
   }
@@ -1010,14 +1124,14 @@ async fn lookup_operation<B: Backend>(
       dir = crate::multi::root_handle_with(capability);
       if bare.is_empty() {
         frame.current = Some(dir);
-        return Ok(Vec::new());
+        return Ok(Vec::new().into());
       }
       bare.to_owned()
     }
     _ => name,
   };
   frame.current = Some(lookup(backend, &dir, &name).await?.fh);
-  Ok(Vec::new())
+  Ok(Vec::new().into())
 }
 
 /// The operations on the current object's attributes, data and namespace.
@@ -1085,7 +1199,7 @@ fn secinfo_no_name(reader: &mut XdrReader<'_>, frame: &mut Frame) -> Outcome {
   let mut body = XdrWriter::new();
   body.u32(1);
   body.u32(AUTH_SYS);
-  Ok(body.into_bytes())
+  Ok(body.into_bytes().into())
 }
 
 /// `SECINFO` (§18.29): the flavors that protect `name` in the current directory, which the name must
@@ -1103,7 +1217,7 @@ async fn secinfo<B: Backend>(
   let mut body = XdrWriter::new();
   body.u32(1);
   body.u32(AUTH_SYS);
-  Ok(body.into_bytes())
+  Ok(body.into_bytes().into())
 }
 
 /// `VERIFY` (§18.31) and `NVERIFY` (§18.15): whether the attributes the client names equal the current
@@ -1131,12 +1245,12 @@ async fn verify<B: Backend>(
   }
   let fh = current(frame)?.clone();
   let ours = getattr(backend, &fh, (&requested, frame.minor)).await?;
-  let mut ours = XdrReader::new(&ours);
+  let mut ours = XdrReader::new(ours.as_slice());
   Bitmap::decode(&mut ours).map_err(|_| Nfsstat4::Serverfault)?;
   let encoded = ours.rest().len();
   let same = ours.opaque(encoded).map_err(|_| Nfsstat4::Serverfault)? == theirs;
   match (opnum == op::VERIFY, same) {
-    (true, true) | (false, false) => Ok(Vec::new()),
+    (true, true) | (false, false) => Ok(Vec::new().into()),
     (true, false) => Err(Nfsstat4::NotSame),
     (false, true) => Err(Nfsstat4::Same),
   }
@@ -1150,7 +1264,7 @@ fn backchannel_ctl(reader: &mut XdrReader<'_>) -> Outcome {
   if read_callback_sec(reader)?.1 {
     return Err(Nfsstat4::Noent);
   }
-  Ok(Vec::new())
+  Ok(Vec::new().into())
 }
 
 /// `SET_SSV` (§18.47): refused `NFS4ERR_INVAL`, as it must be for a client that did not choose SP4_SSV
@@ -1171,7 +1285,7 @@ async fn readlink<B: Backend>(backend: &mut B, frame: &Frame) -> Outcome {
   let target = v3(v3call::readlink(&result))?;
   let mut body = XdrWriter::new();
   body.opaque(target.as_bytes());
-  Ok(body.into_bytes())
+  Ok(body.into_bytes().into())
 }
 
 /// Format: the ACCESS bits (RFC 8881 §18.1; RFC 8276 §8.5).
@@ -1225,7 +1339,7 @@ async fn access<B: Backend>(
   let mut body = XdrWriter::new();
   body.u32(supported);
   body.u32(granted);
-  Ok(body.into_bytes())
+  Ok(body.into_bytes().into())
 }
 
 /// The operations on the v4 state alone (opens, stateids, reclaim), and the refusals.
@@ -1242,7 +1356,7 @@ fn state_operation(
       server
         .sessions
         .reclaim_complete(clientid)
-        .map(|()| Vec::new())
+        .map(|()| Vec::new().into())
     }
     op::BACKCHANNEL_CTL => backchannel_ctl(reader),
     op::SET_SSV => set_ssv(reader),
@@ -1317,8 +1431,8 @@ pub(super) async fn state_io<B: Backend>(
   mut v3_args: Vec<u8>,
   clientid: Option<u64>,
   stateid: &Stateid,
-) -> Result<Vec<u8>, Nfsstat4> {
-  let mut suffix = XdrWriter::new();
+) -> Result<StateReply, Nfsstat4> {
+  let mut suffix = XdrWriter::with_capacity(v3call::STATE_SUFFIX_BYTES);
   suffix.u64(clientid.unwrap_or(0));
   stateid.encode(&mut suffix);
   v3_args.extend_from_slice(suffix.as_slice());
@@ -1326,11 +1440,27 @@ pub(super) async fn state_io<B: Backend>(
   let mut reader = XdrReader::new(&result);
   let status = reader.u32().map_err(|_| Nfsstat4::Serverfault)?;
   match Nfsstat4::from_wire(status) {
-    Some(Nfsstat4::Ok) => Ok(reader.rest().to_vec()),
+    Some(Nfsstat4::Ok) => Ok(StateReply { bytes: result }),
     Some(refused) => Err(refused),
     None => Err(Nfsstat4::Serverfault),
   }
 }
+
+/// The owner's reply to a state-carrying call, kept whole: its body (the v3 result) is lent past the state status
+/// word, so a READ's data is never copied out of it before it is encoded into the compound's reply.
+pub(super) struct StateReply {
+  bytes: Vec<u8>,
+}
+
+impl StateReply {
+  /// The v3 result, past the state status word.
+  pub(super) fn body(&self) -> &[u8] {
+    self.bytes.get(STATE_STATUS_BYTES..).unwrap_or_default()
+  }
+}
+
+/// Format: the state status word an owner's state-carrying reply begins with.
+const STATE_STATUS_BYTES: usize = 4;
 
 /// A state id's encoding, as an owner call's extra arguments.
 fn stateid_bytes(stateid: &Stateid) -> Vec<u8> {
@@ -1388,7 +1518,7 @@ async fn delegreturn<B: Backend>(
     &stateid_bytes(&stateid),
   )
   .await
-  .map(|_| Vec::new())
+  .map(|_| Vec::new().into())
   .map_err(|(status, _)| status)
 }
 
@@ -1407,7 +1537,7 @@ async fn close<B: Backend>(backend: &mut B, reader: &mut XdrReader<'_>, frame: &
   )
   .await
   .map_err(|(status, _)| status)?;
-  Ok(stateid_bytes(&stateid_of(&mut XdrReader::new(&body))?))
+  Ok(stateid_bytes(&stateid_of(&mut XdrReader::new(&body))?).into())
 }
 
 /// OPEN_DOWNGRADE (§18.18) at the file's owner.
@@ -1435,7 +1565,7 @@ async fn open_downgrade<B: Backend>(
   )
   .await
   .map_err(|(status, _)| status)?;
-  Ok(stateid_bytes(&stateid_of(&mut XdrReader::new(&body))?))
+  Ok(stateid_bytes(&stateid_of(&mut XdrReader::new(&body))?).into())
 }
 
 /// LOCK, LOCKT and LOCKU (§18.10–18.12): the arguments are checked here (an undefined type, an invalid
@@ -1461,7 +1591,7 @@ async fn lock_operation<B: Backend>(
     _ => extension::STATE_LOCKU,
   };
   match state_call(backend, procedure, &fh, clientid, &raw).await {
-    Ok(body) => Ok(body),
+    Ok(body) => Ok(body.into()),
     Err((Nfsstat4::Denied, denied)) => {
       frame.denied = Some(denied);
       Err(Nfsstat4::Denied)
@@ -1502,7 +1632,7 @@ async fn test_stateid<B: Backend>(
     };
     body.u32(status.wire());
   }
-  Ok(body.into_bytes())
+  Ok(body.into_bytes().into())
 }
 
 /// FREE_STATEID (§18.38) at the owner its `other` names (D-14).
@@ -1522,7 +1652,7 @@ async fn free_stateid<B: Backend>(
     Some(&stateid),
   )
   .await?;
-  Ok(Vec::new())
+  Ok(Vec::new().into())
 }
 
 /// An id-only state procedure at the owner partition `owner`: the body after its status, or the
@@ -1551,28 +1681,41 @@ async fn owner_call<B: Backend>(
   }
 }
 
-/// Tells every owner to drop the file state of each client the session table dropped. An owner that
-/// cannot be reached keeps its purge queued, retried on the next drop, so no dead client's state is
-/// forgotten.
-async fn purge_dropped<B: Backend>(backend: &mut B) -> Result<(), Nfsstat4> {
+/// Sends every purge the session table owes to every owner (A-127): a dropped client's file state and call records, a
+/// destroyed session's call records. A purge every owner acknowledged is settled; one an owner could not take
+/// (unreachable, or unable to make the drop durable) stays owed and goes again with the next round. The table owes them
+/// durably, journaled with the drop (2026-10-10), so no dead client's state and no destroyed session's records are
+/// forgotten across a restart either; the server's own rounds send what a restart left owed.
+pub async fn purge_owed<B: Backend>(backend: &mut B) -> Result<(), Nfsstat4> {
   let owners = backend.owners();
-  let purges = backend.with_v4(|server| {
-    let mut purges = std::mem::take(&mut server.pending_purges);
-    for clientid in server.take_dropped() {
-      purges.extend(owners.iter().map(|owner| (clientid, *owner)));
+  let owed = backend.with_v4(|server| server.sessions.owed())?;
+  for purge in owed {
+    let mut reached = true;
+    for &owner in &owners {
+      let sent = match purge {
+        Purge::Client(clientid) => {
+          owner_call(backend, owner, extension::STATE_PURGE, clientid, None).await
+        }
+        Purge::Session(clientid, sessionid) => {
+          let mut args = XdrWriter::new();
+          args.u64(clientid);
+          args.fixed(&sessionid);
+          let result = backend
+            .call_owner(owner, extension::STATE_PURGE_SESSION, args.into_bytes())
+            .await;
+          match XdrReader::new(&result).u32().map(Nfsstat4::from_wire) {
+            Ok(Some(Nfsstat4::Ok)) => Ok(Vec::new()),
+            _ => Err(Nfsstat4::Delay),
+          }
+        }
+      };
+      reached &= sent.is_ok();
     }
-    purges
-  })?;
-  let mut failed = Vec::new();
-  for (clientid, owner) in purges {
-    if owner_call(backend, owner, extension::STATE_PURGE, clientid, None)
-      .await
-      .is_err()
-    {
-      failed.push((clientid, owner));
+    if reached {
+      backend.with_v4(|server| server.sessions.settle(&purge))?;
     }
   }
-  backend.with_v4(|server| server.pending_purges.extend(failed))
+  Ok(())
 }
 
 /// The current file handle, or `NFS4ERR_NOFILEHANDLE`.
@@ -1684,7 +1827,7 @@ async fn getattr<B: Backend>(
   let figures = figures(backend, fh, requested).await?;
   let mut body = XdrWriter::new();
   attr::encode((requested, minor), &attrs, fh, &figures, &mut body)?;
-  Ok(body.into_bytes())
+  Ok(body.into_bytes().into())
 }
 
 /// `READ` (§18.22).
@@ -1701,11 +1844,13 @@ async fn read<B: Backend>(backend: &mut B, reader: &mut XdrReader<'_>, frame: &F
     &stateid,
   )
   .await?;
-  let (eof, data) = v3(v3call::read(&result))?;
-  let mut body = XdrWriter::new();
-  body.bool(eof);
-  body.opaque(&data);
-  Ok(body.into_bytes())
+  // READ4resok is the tail of the owner's READ3resok (from its eof word on): the reply is lent whole, never encoded
+  // into a body of its own (until 2026-10-08 it was, one more copy of every byte read).
+  let tail = v3(v3call::read_tail(result.body()))?;
+  Ok(Body {
+    from: STATE_STATUS_BYTES.saturating_add(tail),
+    bytes: result.bytes,
+  })
 }
 
 /// `WRITE` (§18.32).
@@ -1725,12 +1870,12 @@ async fn write<B: Backend>(backend: &mut B, reader: &mut XdrReader<'_>, frame: &
     &stateid,
   )
   .await?;
-  let (count, committed, verifier) = v3(v3call::write(&result))?;
+  let (count, committed, verifier) = v3(v3call::write(result.body()))?;
   let mut body = XdrWriter::new();
   body.u32(count);
   body.u32(committed);
   body.fixed(&verifier);
-  Ok(body.into_bytes())
+  Ok(body.into_bytes().into())
 }
 
 /// `COMMIT` (§18.3).
@@ -1744,7 +1889,7 @@ async fn commit<B: Backend>(backend: &mut B, reader: &mut XdrReader<'_>, frame: 
   let verifier = v3(v3call::commit(&result))?;
   let mut body = XdrWriter::new();
   body.fixed(&verifier);
-  Ok(body.into_bytes())
+  Ok(body.into_bytes().into())
 }
 
 /// `READDIR` (§18.23): a directory in a volume is listed by its owner, which encodes the page from the bridge's rows
@@ -1764,7 +1909,11 @@ async fn readdir<B: Backend>(
   let mut verf = [0u8; VERIFIER_SIZE];
   verf.copy_from_slice(reader.fixed(VERIFIER_SIZE).map_err(bad)?);
   let _dircount = reader.u32().map_err(bad)?;
-  let maxcount = reader.u32().map_err(bad)?;
+  // Capped at the transfer ceiling (A-113): the page, and the rows asked of the bridge for it, stay within one message.
+  let maxcount = reader
+    .u32()
+    .map_err(bad)?
+    .min(crate::procedures::MAX_TRANSFER);
   let requested = Bitmap::decode(reader).map_err(bad)?;
   attr::check_readable(&requested)?;
   if cookie == 1 || cookie == 2 {
@@ -1782,7 +1931,7 @@ async fn readdir<B: Backend>(
     figures,
   };
   let result = backend.call_v3(extension::READDIR4, request.encode()).await;
-  super::listing::page_of(result)
+  super::listing::page_of(result).map(Body::from)
 }
 
 /// `READDIR` of the pseudo-root: a v3 READDIRPLUS of the gathered volumes, the dot entries dropped, the cookies
@@ -1797,7 +1946,11 @@ async fn readdir_of_root<B: Backend>(
   let mut verf = [0u8; VERIFIER_SIZE];
   verf.copy_from_slice(reader.fixed(VERIFIER_SIZE).map_err(bad)?);
   let dircount = reader.u32().map_err(bad)?;
-  let maxcount = reader.u32().map_err(bad)?;
+  // Capped as a volume directory's listing is (A-113).
+  let maxcount = reader
+    .u32()
+    .map_err(bad)?
+    .min(crate::procedures::MAX_TRANSFER);
   let requested = Bitmap::decode(reader).map_err(bad)?;
   attr::check_readable(&requested)?;
   if cookie == 1 || cookie == 2 {
@@ -1890,7 +2043,7 @@ async fn readdir_of_root<B: Backend>(
   body.fixed(entries.as_slice());
   body.bool(false); // no more entries in this reply
   body.bool(listing.eof && all);
-  Ok(body.into_bytes())
+  Ok(body.into_bytes().into())
 }
 
 /// A listed entry's attributes and handle: as the listing carried them, or — for an entry it carried
@@ -1975,7 +2128,7 @@ async fn open<B: Backend>(
     None => body.u32(OPEN_DELEGATE_NONE),
   }
   frame.current = Some(opened.fh);
-  Ok(body.into_bytes())
+  Ok(body.into_bytes().into())
 }
 
 /// The file an `OPEN` names by its claim (§18.16.3), with `dir` the current file: a name in it (`CLAIM_NULL`, created
@@ -2415,13 +2568,13 @@ async fn setattr<B: Backend>(
     &stateid,
   )
   .await?;
-  let (status, _) = v3call::wcc_status(&result).map_err(|_| Nfsstat4::Serverfault)?;
+  let (status, _) = v3call::wcc_status(result.body()).map_err(|_| Nfsstat4::Serverfault)?;
   if status != Nfsstat3::Ok {
     return Err(Nfsstat4::of_v3(status));
   }
   let mut body = XdrWriter::new();
   set_bits(&attrs).encode(&mut body);
-  Ok(body.into_bytes())
+  Ok(body.into_bytes().into())
 }
 
 /// The attribute bits a `sattr3` sets, as a SETATTR or OPEN reply's `attrsset`.
@@ -2526,7 +2679,7 @@ async fn create<B: Backend>(
   let mut attrset = XdrWriter::new();
   set_bits(&attrs).encode(&mut attrset);
   body.extend(attrset.into_bytes());
-  Ok(body)
+  Ok(body.into())
 }
 
 /// `REMOVE` (§18.25): a file or an empty directory.
@@ -2547,7 +2700,7 @@ async fn remove<B: Backend>(backend: &mut B, reader: &mut XdrReader<'_>, frame: 
   if status != Nfsstat3::Ok {
     return Err(Nfsstat4::of_v3(status));
   }
-  Ok(change_info(&dir_wcc))
+  Ok(change_info(&dir_wcc).into())
 }
 
 /// `RENAME` (§18.26): the saved file handle's directory to the current one's.
@@ -2568,7 +2721,7 @@ async fn rename<B: Backend>(backend: &mut B, reader: &mut XdrReader<'_>, frame: 
   }
   let mut body = change_info(&from_wcc);
   body.extend(change_info(&to_wcc));
-  Ok(body)
+  Ok(body.into())
 }
 
 /// `LINK` (§18.9): the saved file handle linked into the current directory.
@@ -2583,7 +2736,7 @@ async fn link<B: Backend>(backend: &mut B, reader: &mut XdrReader<'_>, frame: &F
   if status != Nfsstat3::Ok {
     return Err(Nfsstat4::of_v3(status));
   }
-  Ok(change_info(&dir_wcc))
+  Ok(change_info(&dir_wcc).into())
 }
 
 /// A `change_info4` (§3.3.6) from the `wcc_data` of the one v3 call that made the change. Atomic when

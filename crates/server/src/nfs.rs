@@ -48,7 +48,11 @@
 //! the environment, and the daemon adopts it (`crate::daemon`'s `nfs_listener` over
 //! `slates_rt::tcp::TcpListener::from_fd` and `slates_anchor::ENV_NFS_LISTENER`) rather than binding a
 //! fresh ephemeral one, so the loopback
-//! port is stable across restarts; a standalone daemon (tests) still binds its own. Owed here (one
+//! port is stable across restarts; a standalone daemon (tests) still binds its own. **Every connection survives it
+//! too (A-113):** the anchor holds a duplicate of each from its accept, a request is consumed only once its reply is in
+//! the send queue, and replies leave in whole records, so a successor answers what the dead daemon left on the same
+//! socket and the kernel client never reconnects (on macOS its reconnect under repeated kills panicked the kernel,
+//! docs/bugs/2026-10-06-macos-nfs-client-panics-when-its-server-restarts.md; Linux does not hold connections yet). Owed here (one
 //! minor, situational refinement): the attribute-cache timeout from the measured loopback GETATTR RTT.
 //!
 //! **The data-plane barrier (§4.8, D-18).** A mutation served here changes the shard's volumes
@@ -85,7 +89,7 @@ use slates_bridge_nfs::procedures::{
   NFSPROC3_SYMLINK, NFSPROC3_WRITE, io_failure_reply, is_unstable, status_failure_reply,
   write_stable_how,
 };
-use slates_bridge_nfs::rpc::RecordReader;
+use slates_bridge_nfs::rpc::{MAX_MESSAGE, RecordReader};
 use slates_bridge_nfs::v4::compound::{self, Server as V4Server};
 use slates_bridge_nfs::v4::session::Limits;
 use slates_bridge_nfs::v4::session::{CallbackState, DepartedSession};
@@ -95,7 +99,7 @@ use slates_bridge_nfs::v4::{NFS_V4, NFSPROC4_COMPOUND, NFSPROC4_NULL, Nfsstat4};
 use slates_bridge_nfs::xdr::{XdrReader, XdrWriter};
 use slates_bridge_nfs::{
   AcceptStatus, MultiExport, Nfsstat3, UnixGroups, VolumeSet, auth_sys_identity, parse_call,
-  reply_bytes, request_volume, root_volume, serve_call, write_record,
+  reply_record, request_volume, root_volume, serve_call,
 };
 use slates_db::catalog::{AttachForm, Consumer, Principal, VolumeId};
 use slates_db::register::ObjectId;
@@ -209,9 +213,11 @@ impl VolumeSet for ShardVolumeSet {
       let reply = with_export(s, volume, requester, rights, capability, |export| {
         export.serve_nfs(procedure, args)
       });
-      // A file state procedure's changes are durable before its reply leaves (§4.6 A-37); a change
-      // that could not be recorded has rebuilt the state from its records, and the call is refused.
-      if crate::nfs_state::record_files(s) {
+      // A file state procedure's changes are durable before its reply leaves (§4.6 A-37), with the record of the
+      // compound it belongs to (A-127); a change that could not be recorded has rebuilt the state from its records,
+      // and the call is refused.
+      let served = reply.as_ref().and_then(|reply| reply.as_deref());
+      if crate::nfs_state::record_files(s, served) {
         reply
       } else {
         Some(Some(status_word(Nfsstat4::Serverfault)))
@@ -251,7 +257,8 @@ impl VolumeSet for ShardVolumeSet {
   }
 
   fn serve_file_state(&mut self, procedure: u32, args: &mut XdrReader<'_>) -> Vec<u8> {
-    serve_file_state_here(procedure, args.rest())
+    // Reached inside `serve_local`, which answers and records a recorded compound's call around it (A-127).
+    serve_file_state_here(procedure, args.rest(), None)
   }
 }
 
@@ -314,12 +321,15 @@ fn with_export<R>(
   if s.nfs_v4_files.is_none() {
     s.nfs_v4_files = crate::nfs_state::file_state(s);
   }
-  // A scoped mount presents one directory: its bridge answers nothing outside it (AUD-29-76).
-  let scope = s
+  // A scoped mount presents one directory: its bridge answers nothing outside it (AUD-29-76). A bound mount
+  // serves one identity; any other caller is a stranger to it (§4.6 A-115).
+  let form = s
     .db
     .partition()
     .attachment(capability.0)
-    .and_then(|record| record.form.scope());
+    .map(|record| (record.form.scope(), record.form.bound_uid()));
+  let (scope, bound_uid) = form.unwrap_or((None, None));
+  let stranger = bound_uid.is_some_and(|bound| subject != Principal::Uid { uid: bound });
   let ShardState {
     store,
     volumes,
@@ -354,6 +364,9 @@ fn with_export<R>(
   };
   let mut export = Export::over(served, volume, subject, attachments, admitted);
   export.set_groups(groups);
+  if stranger {
+    export.set_stranger();
+  }
   export.set_dialect(dialect);
   // The per-boot write verifier (§4.6, RFC 1813 §3.3.7): a client compares it across a restart to
   // learn its unstable writes were lost and re-send them.
@@ -429,6 +442,70 @@ fn needs_barrier(program: u32, procedure: u32, args: &[u8], results: &[u8]) -> b
     | slates_bridge_nfs::procedures::extension::XATTR_REMOVE => true,
     _ => false,
   }
+}
+
+/// Whether a served call changed what a shard publication makes durable (A-127): every call [`needs_barrier`] names,
+/// and an `UNSTABLE` write, whose change a later publication carries.
+fn changes_volume(program: u32, procedure: u32, args: &[u8], results: &[u8]) -> bool {
+  let write = slates_bridge_nfs::procedures::state_io_inner(procedure).unwrap_or(procedure);
+  needs_barrier(program, procedure, args, results)
+    || (program == NFS_PROGRAM && write == NFSPROC3_WRITE && nfs_ok(results))
+}
+
+/// Counter: NFSv3 requests a dead daemon applied and left unanswered on a held connection, answered by its successor
+/// from the reply published with the effect instead of being applied again (A-128).
+const HELD_REPLY_ANSWERED: &str = "nfs.held_reply.answered";
+
+/// Counter: held NFSv3 replies a restarted shard took back from its image (A-128), each waiting for its request to be
+/// read again.
+pub(crate) const HELD_REPLY_RESTORED: &str = "nfs.held_reply.restored";
+
+/// The reply a dead daemon published for request `xid` on held connection `connection` (A-128), taken (a request is
+/// read again once), counted.
+fn held_reply_answer(
+  s: &mut ShardState,
+  connection: u64,
+  xid: u32,
+) -> Option<(AcceptStatus, Vec<u8>)> {
+  let (accepted, results) = s.recovered_nfs_replies.remove(&(connection, xid))?;
+  s.count(HELD_REPLY_ANSWERED, 1);
+  Some(if accepted {
+    (AcceptStatus::Success, results)
+  } else {
+    (AcceptStatus::SystemErr, Vec::new())
+  })
+}
+
+/// Holds `reply` for request `key` (connection, xid) of a held connection (A-128) until its turn's replies are sent:
+/// the shard's next publication carries it.
+fn hold_reply(s: &mut ShardState, key: (u64, u32), reply: &(AcceptStatus, Vec<u8>)) {
+  let accepted = matches!(reply.0, AcceptStatus::Success);
+  let results = if accepted {
+    reply.1.clone()
+  } else {
+    Vec::new()
+  };
+  s.held_nfs_replies.insert(key, (accepted, results));
+  s.held_nfs_replies_changed = true;
+}
+
+/// A turn's replies are in the kernel and its requests consumed (A-128): a held connection's replies held for them are
+/// owed to no one, since no successor reads those requests again.
+fn turn_sent(connection: &Connection, turn: &Turn) {
+  let Some(held) = connection.held else {
+    return;
+  };
+  let _ = state::with_state_counted(|s| {
+    for xid in turn
+      .handled
+      .iter()
+      .filter_map(|(record, _)| record_xid(record))
+    {
+      if s.held_nfs_replies.remove(&(held, xid)).is_some() {
+        s.held_nfs_replies_changed = true;
+      }
+    }
+  });
 }
 
 /// Whether an NFS reply's leading status is `NFS3_OK` (RFC 1813: every NFS result starts with its
@@ -507,6 +584,14 @@ struct Requester {
   /// The NFSv4 client an operation's v3 call acts for (the client its compound's `SEQUENCE` named, A-80), so the
   /// owner's recall gate passes a delegation holder's own change; `None` for every other call.
   client: Option<u64>,
+  /// The recorded compound this call belongs to and its key in it (A-127): the shard that serves it answers it from
+  /// its records when it served it before a restart, and records it otherwise. `None` for a call of a compound whose
+  /// reply was not asked to be kept, and for every NFSv3 wire call.
+  call: Option<crate::nfs_replay::RecordedCall>,
+  /// The connection the anchor holds that this NFSv3 wire call came on (A-128): a mutation's reply is then held, keyed
+  /// by the connection and the xid, and published with its effect, so a successor that reads the request again
+  /// answers it from there. `None` for every other call.
+  held: Option<u64>,
 }
 
 impl Requester {
@@ -522,6 +607,8 @@ impl Requester {
         capability: None,
         dialect: Dialect::LOOPBACK_NFS3,
         client: None,
+        call: None,
+        held: None,
       },
       None => Requester::root(),
     }
@@ -537,6 +624,8 @@ impl Requester {
       capability: None,
       dialect: Dialect::LOOPBACK_NFS3,
       client: None,
+      call: None,
+      held: None,
     }
   }
 
@@ -672,6 +761,10 @@ fn unmount_capability(_capability: Option<MountCapability>, args: &[u8]) {
           AttachForm::ScopedMount {
             mount_point: Some(path),
             ..
+          }
+          | AttachForm::BoundMount {
+            mount_point: Some(path),
+            ..
           },
         ) => Some((record.id, path.clone())),
         _ => None,
@@ -680,7 +773,7 @@ fn unmount_capability(_capability: Option<MountCapability>, args: &[u8]) {
   })
   .unwrap_or_default();
   if mounts.is_empty() {
-    let _ = state::with_state(|s| s.count("nfs.unmount_refused", 1));
+    let _ = state::with_state_counted(|s| s.count("nfs.unmount_refused", 1));
     return;
   }
   match futures::spawn(confirm_unmount(name, mounts)) {
@@ -712,7 +805,7 @@ async fn confirm_unmount(name: String, mounts: Vec<(u64, String)>) {
       .map(|(attachment, _)| *attachment)
       .collect();
     if !gone.is_empty() {
-      let _ = state::with_state(|s| {
+      let _ = state::with_state_counted(|s| {
         for attachment in gone {
           let ended = s
             .db
@@ -730,12 +823,12 @@ async fn confirm_unmount(name: String, mounts: Vec<(u64, String)>) {
       return;
     }
     if futures::now_ns().saturating_sub(began) >= UNMOUNT_CONFIRM_NS {
-      let _ = state::with_state(|s| s.count("nfs.unmount_unconfirmed", 1));
+      let _ = state::with_state_counted(|s| s.count("nfs.unmount_unconfirmed", 1));
       return;
     }
     if futures::sleep(poll).await.is_err() {
       // Off a shard no poll can be timed: the confirmation is given up, counted, never spun on.
-      let _ = state::with_state(|s| s.count("nfs.unmount_unconfirmed", 1));
+      let _ = state::with_state_counted(|s| s.count("nfs.unmount_unconfirmed", 1));
       return;
     }
   }
@@ -810,20 +903,24 @@ fn encode_mount_path(name: &str) -> Vec<u8> {
 fn presented_capability(
   program: u32,
   procedure: u32,
-  args: &mut Vec<u8>,
-) -> Option<MountCapability> {
+  args: &[u8],
+) -> (Option<MountCapability>, Option<Vec<u8>>) {
   if program == MOUNT_PROGRAM && procedure == MOUNTPROC3_UMNT {
     // The kernel's `UMNT` names the volume by the mount's source (`slates:/<name>` gives `/<name>`), with
     // no capability (§4.6 A-34); it presents none, and the unmount is confirmed against the kernel's
     // mount table before anything ends ([`unmount_capability`]).
-    return None;
+    return (None, None);
   }
   if is_mount_request(program, procedure) {
-    let (name, capability) = split_mount_capability(args)?;
-    *args = encode_mount_path(&name);
-    return Some(capability);
+    return match split_mount_capability(args) {
+      Some((name, capability)) => (Some(capability), Some(encode_mount_path(&name))),
+      None => (None, None),
+    };
   }
-  slates_bridge_nfs::request_capability(&XdrReader::new(args))
+  (
+    slates_bridge_nfs::request_capability(&XdrReader::new(args)),
+    None,
+  )
 }
 
 /// Counter: NFSv4 `GETATTR`s answered `NFS4ERR_DELAY` while another client's write delegation of the file was
@@ -879,6 +976,10 @@ fn serve_local(
   args: &[u8],
   port: u16,
 ) -> (AcceptStatus, Vec<u8>) {
+  if let Some(early) = answered_or_refused(&requester, xid, program, procedure, args) {
+    return early;
+  }
+  let call = requester.call;
   // The `bridge.request` chokepoint span (§4.14): one NFS bridge call from arrival to reply, served on
   // this shard's volumes, opened as a root — the kernel's call is the entry point of its trace. Its
   // request identity for replay is the RPC transaction id under the mount's port (an NFS client
@@ -886,9 +987,6 @@ fn serve_local(
   // procedure — content-free (an operation code, never a path or bytes). The clock and ring are reached
   // through `with_state`, taken at the call's edges — outside `serve_call`'s own per-operation borrows,
   // so there is no re-entrant borrow.
-  if let Some(refused) = refused_for_write_delegation(&requester, program, procedure, args) {
-    return refused;
-  }
   let request = RequestId {
     client: u32::from(port),
     sequence: xid,
@@ -914,7 +1012,12 @@ fn serve_local(
   );
   // The recall gate passes a change by the only holders of a file's delegations: the NFSv4 client this call acts
   // for, if any (A-80). Named for this call alone, and cleared after it.
-  let _ = state::with_state(|s| s.store.recall_gate.act_as(requester.client));
+  // The call in flight is the shard's for the call's span (it is served synchronously, nothing interleaves), so a
+  // file-state change it makes carries its compound's record in the change's own transaction (A-127).
+  let _ = state::with_state_counted(|s| {
+    s.store.recall_gate.act_as(requester.client);
+    s.nfs_call = call;
+  });
   // Only NFSv3 reaches here: an NFSv4 call is served by the v4 front end before routing.
   let served = serve_call(
     &mut service,
@@ -925,25 +1028,108 @@ fn serve_local(
     &mut XdrReader::new(args),
     port,
   );
-  let _ = state::with_state(|s| s.store.recall_gate.act_as(None));
-  // The barrier (§4.8, D-18): a mutation's effect is published into anchor-owned RAM before its
-  // reply leaves this shard, so the reply's stability claim is true for daemon-restart survival.
-  let result = if matches!(served.0, AcceptStatus::Success)
-    && needs_barrier(program, procedure, args, &served.1)
-  {
-    barrier(procedure, target_volume(program, procedure, args), served)
-  } else {
-    served
-  };
+  let _ = state::with_state_counted(|s| {
+    s.store.recall_gate.act_as(None);
+    s.nfs_call = None;
+  });
+  let result = record_and_publish(
+    (call, requester.held),
+    xid,
+    (program, procedure, args),
+    served,
+  );
   if let Some(open) = open {
-    let _ = state::with_state(|s| {
+    let _ = state::with_state_counted(|s| {
       let end_ns = s.clock.monotonic_ns();
       crate::telemetry::emit(s, open.end(procedure, end_ns));
     });
   }
   // A change this call was refused for a delegation asked for a recall; it is sent now (A-79).
-  let _ = state::with_state(crate::delegation::drain);
+  let _ = state::with_state_counted(crate::delegation::drain);
   result
+}
+
+/// What a call is answered with before it is served, if anything:
+/// - an NFSv3 request a dead daemon applied and left unanswered on a held connection, from the reply it published with
+///   the effect (A-128), never applied twice;
+/// - a call of a recorded compound this shard served for the same compound before a restart, from its record (A-127);
+/// - a change another client's write delegation refuses (A-79);
+/// - a call of a recorded compound that recording would carry past the records' bound, refused before it runs (A-127).
+///
+/// Answering changes nothing, so the answers come before any refusal a change would meet.
+fn answered_or_refused(
+  requester: &Requester,
+  xid: u32,
+  program: u32,
+  procedure: u32,
+  args: &[u8],
+) -> Option<(AcceptStatus, Vec<u8>)> {
+  if let Some(answer) = requester
+    .held
+    .and_then(|connection| state::with_state(|s| held_reply_answer(s, connection, xid)).flatten())
+  {
+    return Some(answer);
+  }
+  let call = requester.call;
+  if let Some(answer) = call
+    .as_ref()
+    .and_then(|call| state::with_state(|s| crate::nfs_replay::answered(s, call)).flatten())
+  {
+    return Some((AcceptStatus::Success, answer));
+  }
+  if let Some(refused) = refused_for_write_delegation(requester, program, procedure, args) {
+    return Some(refused);
+  }
+  call
+    .as_ref()
+    .is_some_and(|call| state::with_state(|s| crate::nfs_replay::refused(s, call)) == Some(true))
+    .then(|| {
+      (
+        AcceptStatus::Success,
+        status_failure_reply(Nfsstat3::Jukebox, procedure),
+      )
+    })
+}
+
+/// A served call's record and barrier:
+/// - a recorded compound's call is recorded before the barrier, so the publication that makes its effect durable
+///   carries what it answered (A-127): a change to a volume rides that publication (an UNSTABLE write's, the next one);
+/// - the barrier (§4.8, D-18) publishes a mutation's effect into anchor-owned RAM before its reply leaves this shard,
+///   so the reply's stability claim is true for daemon-restart survival;
+/// - a held connection's mutation holds its reply before the barrier, so the publication carries both (A-128);
+/// - a refused barrier told the client the change is not stable, and that is what its record and held reply answer.
+fn record_and_publish(
+  (call, held): (Option<crate::nfs_replay::RecordedCall>, Option<u64>),
+  xid: u32,
+  (program, procedure, args): (u32, u32, &[u8]),
+  served: (AcceptStatus, Vec<u8>),
+) -> (AcceptStatus, Vec<u8>) {
+  if let Some(call) = call.as_ref()
+    && matches!(served.0, AcceptStatus::Success)
+  {
+    let changed = changes_volume(program, procedure, args, &served.1);
+    let _ = state::with_state_counted(|s| {
+      crate::nfs_replay::record(s, call, procedure, &served.1, changed);
+    });
+  }
+  if !matches!(served.0, AcceptStatus::Success)
+    || !needs_barrier(program, procedure, args, &served.1)
+  {
+    return served;
+  }
+  if let Some(connection) = held {
+    let _ = state::with_state_counted(|s| hold_reply(s, (connection, xid), &served));
+  }
+  let barriered = barrier(procedure, target_volume(program, procedure, args), served);
+  if let Some(connection) = held {
+    let _ = state::with_state_counted(|s| hold_reply(s, (connection, xid), &barriered));
+  }
+  if let Some(call) = call.as_ref() {
+    let _ = state::with_state_counted(|s| {
+      crate::nfs_replay::record(s, call, procedure, &barriered.1, true);
+    });
+  }
+  barriered
 }
 
 /// Serves one call on the volume's `owner` shard over the bridge queue: spawns the serve on the owner
@@ -1025,7 +1211,8 @@ impl VolumeSet for GatheredVolumeSet {
   }
 
   fn serve_file_state(&mut self, procedure: u32, args: &mut XdrReader<'_>) -> Vec<u8> {
-    serve_file_state_here(procedure, args.rest())
+    // Reached inside `serve_local`, which answers and records a recorded compound's call around it (A-127).
+    serve_file_state_here(procedure, args.rest(), None)
   }
 }
 
@@ -1104,22 +1291,31 @@ fn serve_root_listing(
 
 // ------------------------------------------------------------------------------------ the serve loop
 
-/// Serves NFS/MOUNT/portmap over `listener` on the current shard until the daemon stops: each
-/// connection becomes a detached task, so connections are concurrent. `port` answers a portmap
-/// `GETPORT`.
-pub async fn serve(listener: TcpListener, port: u16) {
+/// Serves NFS/MOUNT/portmap over `listener` on the current shard until the daemon stops: each connection is admitted
+/// ([`admit`]: its buffers sized, its sends made whole, and handed to the anchor to hold, A-113) and becomes a
+/// detached task, so connections are concurrent. `port` answers a portmap `GETPORT`; `bound` is the most connections
+/// the anchor holds ([`crate::config::DaemonConfig::held_connection_bound`]).
+pub async fn serve(listener: TcpListener, port: u16, bound: usize) {
   while let Ok(stream) = listener.accept().await {
-    match futures::spawn(serve_one(stream, port)) {
-      Ok(task) => {
-        let _ = futures::detach(task);
-      }
-      // The arena refused the connection's serve task: the connection is dropped (the kernel client
-      // reconnects) and the refusal counted, never silent (banned item 9).
-      Err(_) => {
-        crate::fleet::count_refusal(SERVE_SPAWN_REFUSED);
-      }
+    if let Some(connection) = admit(stream, port, bound) {
+      spawn_connection(connection);
     }
     futures::yield_now().await;
+  }
+}
+
+/// Serves `connection` as a detached task on this shard; a task the arena refuses ends the connection (the kernel
+/// client reconnects) and is counted, never silent (banned item 9).
+fn spawn_connection(connection: Connection) {
+  let ending = connection.ending();
+  match futures::spawn(serve_connection(connection)) {
+    Ok(task) => {
+      let _ = futures::detach(task);
+    }
+    Err(_) => {
+      crate::fleet::count_refusal(SERVE_SPAWN_REFUSED);
+      ending.release();
+    }
   }
 }
 
@@ -1129,7 +1325,7 @@ pub async fn serve(listener: TcpListener, port: u16) {
 pub(crate) const SERVE_SPAWN_REFUSED: &str = "nfs.serve_spawn";
 
 /// One call of the NFS program's `version`, MOUNT or portmap (every program but NFSv4, which
-/// [`reply_v4`] serves): its RPC reply payload. A `program` of 0 is a garbage call whose reply carries
+/// [`reply_v4`] serves): its RPC reply, framed as one record ([`reply_record`]). A `program` of 0 is a garbage call whose reply carries
 /// xid 0; an NFS version other than 3 or 4 is `PROG_MISMATCH` naming the versions served.
 #[allow(clippy::too_many_arguments)] // one RPC call's whole identity: where, its xid, who, program, version, procedure, args, port
 async fn reply_for(
@@ -1143,17 +1339,17 @@ async fn reply_for(
   port: u16,
 ) -> Vec<u8> {
   if program == 0 {
-    return reply_bytes(0, AcceptStatus::GarbageArgs, &[]);
+    return reply_record(0, AcceptStatus::GarbageArgs, &[]);
   }
   if program == NFS_PROGRAM && version != NFS_VERSION {
     let mismatch = AcceptStatus::ProgMismatch {
       low: NFS_VERSION,
       high: NFS_V4,
     };
-    return reply_bytes(xid, mismatch, &[]);
+    return reply_record(xid, mismatch, &[]);
   }
   let (status, results) = serve_v3(this, xid, requester, program, procedure, args, port).await;
-  reply_bytes(xid, status, &results)
+  reply_record(xid, status, &results)
 }
 
 /// Serves one NFSv3, MOUNT or portmap call, routing it locally, to a volume's owner shard over the
@@ -1191,7 +1387,14 @@ async fn serve_v3(
   };
   let elapsed = slates_machine::clock::monotonic_ns().saturating_sub(started);
   let on_cpu = thread_cpu_ns().saturating_sub(started_cpu);
-  let _ = state::with_state(|s| {
+  let _ = state::with_state_counted(|s| {
+    if program == NFS_PROGRAM
+      && let Some(calls) = usize::try_from(procedure)
+        .ok()
+        .and_then(|procedure| s.nfs_service.calls.get_mut(procedure))
+    {
+      *calls = calls.saturating_add(1);
+    }
     if forwarded {
       s.nfs_service.forwarded.record(elapsed);
     } else {
@@ -1250,7 +1453,7 @@ async fn serve_local_held(
     if !refused_by_gate || now >= until {
       return served;
     }
-    let _ = state::with_state(|s| s.count(V3_HELD, 1));
+    let _ = state::with_state_counted(|s| s.count(V3_HELD, 1));
     let parked = futures::within(
       until.saturating_sub(now),
       std::future::poll_fn(|cx| {
@@ -1267,7 +1470,7 @@ async fn serve_local_held(
       Ok(Some(())) => {}
       // The lease passed: revoke the lapsed delegation so the last attempt proceeds.
       Ok(None) => {
-        let _ = state::with_state(crate::delegation::drain);
+        let _ = state::with_state_counted(crate::delegation::drain);
       }
       Err(_) => return served,
     }
@@ -1302,7 +1505,14 @@ pub struct ServiceTimes {
   /// Of each local call, the wall time the shard's thread spent off a core (its wall time less its CPU time): a
   /// synchronous serve never waits, so this is the operating system's preemption, not the serve's work.
   pub local_off_cpu: crate::histogram::DurationHistogram,
+  /// Calls served, by NFSv3 procedure number (an NFSv4 compound counts each operation's v3 call): how many round
+  /// trips each client operation cost, which a client's own counters cannot say on a shared machine (`nfsstat` is
+  /// machine-wide). Reported per shard (`ShardReport::nfs_calls`).
+  pub calls: [u64; V3_PROCEDURES],
 }
+
+/// Format: the NFSv3 procedures, numbered 0 (`NULL`) to 21 (`COMMIT`), RFC 1813 §3.
+pub const V3_PROCEDURES: usize = 22;
 
 /// What [`ServiceTimes`] measured, summed over a daemon's shards (`Daemon::nfs_service_times`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1333,7 +1543,7 @@ fn is_v4_compound(call: &Call) -> bool {
 /// connection's `home`. A session this shard neither holds nor (as home) knows departed is answered here, with
 /// `NFS4ERR_BADSESSION`, so a connection never bounces between shards: the client makes a new session at home.
 fn v4_elsewhere(this: u16, home: u16, call: &Call) -> Option<u16> {
-  match compound::placement(&call.args) {
+  match compound::placement(call.args()) {
     compound::Placement::Session(sessionid) => state::with_state(|s| {
       let server = s.nfs_v4.as_ref()?;
       if server.sessions.holds_session(&sessionid) || this != home {
@@ -1354,12 +1564,14 @@ async fn serve_v4(this: u16, home: u16, call: Call, port: u16) -> (Vec<u8>, Opti
     xid,
     requester,
     procedure,
-    args,
     request_bytes,
+    body,
+    args_at,
     ..
   } = call;
+  let args = body.get(args_at..).unwrap_or_default();
   match procedure {
-    NFSPROC4_NULL => (reply_bytes(xid, AcceptStatus::Success, &[]), None),
+    NFSPROC4_NULL => (reply_record(xid, AcceptStatus::Success, &[]), None),
     NFSPROC4_COMPOUND => {
       // Each operation's v3 call answers for the front end: no AppleDouble views (a v4 client carries
       // attributes itself, §4.6 A-33) and the change counters its attributes need (A-38).
@@ -1374,15 +1586,27 @@ async fn serve_v4(this: u16, home: u16, call: Call, port: u16) -> (Vec<u8>, Opti
         port,
         home,
         forwarded_to: None,
+        recorded: None,
+        occurrences: std::collections::BTreeMap::new(),
       };
       note(NFS4_COMPOUNDS);
-      let results = compound::serve(&mut backend, &args, request_bytes).await;
-      (
-        reply_bytes(xid, AcceptStatus::Success, &results),
-        backend.forwarded_to,
-      )
+      // The reply is encoded after the record's marker and header, reserved here, and framed in place: a READ's data
+      // is never copied to be framed. A reply in a buffer of its own (a refusal before the first operation, a replay)
+      // is framed by copy.
+      let reserved = slates_bridge_nfs::rpc::success_record_head();
+      let (encoded, from) = compound::serve_into(&mut backend, args, request_bytes, reserved).await;
+      let record = if from == slates_bridge_nfs::rpc::SUCCESS_RECORD_HEAD {
+        slates_bridge_nfs::rpc::finish_success_record(xid, encoded)
+      } else {
+        reply_record(
+          xid,
+          AcceptStatus::Success,
+          encoded.get(from..).unwrap_or_default(),
+        )
+      };
+      (record, backend.forwarded_to)
     }
-    _ => (reply_bytes(xid, AcceptStatus::ProcUnavail, &[]), None),
+    _ => (reply_record(xid, AcceptStatus::ProcUnavail, &[]), None),
   }
 }
 
@@ -1485,7 +1709,13 @@ fn adopt_session(sessionid: SessionId, departed: DepartedSession) {
 fn with_v4_sessions<R>(
   f: impl FnOnce(&mut slates_bridge_nfs::v4::session::Sessions) -> R,
 ) -> Option<R> {
-  state::with_state(|s| s.nfs_v4.as_mut().map(|server| f(&mut server.sessions))).flatten()
+  state::with_state(|s| {
+    let result = s.nfs_v4.as_mut().map(|server| f(&mut server.sessions))?;
+    // What the table journaled (a session forgotten, a callback's minor version) is durable before the work goes on
+    // (A-127); a change that could not be recorded has rebuilt the table from its records.
+    crate::nfs_state::record_clients(s).then_some(result)
+  })
+  .flatten()
 }
 
 /// Sends `work` to shard `to` and awaits its outcome in a detached task of this shard, counting `lost` when it could
@@ -1546,12 +1776,111 @@ const NFS4_NOTE_LOST: &str = "nfs4.notes.lost";
 
 /// Counts one `counter` on this shard; off a shard (no state) nothing is counted.
 fn note(counter: &'static str) {
-  let _ = state::with_state(|s| s.count(counter, 1));
+  let _ = state::with_state_counted(|s| s.count(counter, 1));
 }
 
 /// The v4 front end's backend in the daemon: each v3 call it makes presents the capability of the
 /// handle it names and is routed to the volume's owner shard as an NFSv3 call is; the v4 state is this
 /// shard's, reached through [`state::with_state`] and borrowed only inside each closure.
+/// The backend of a shard's own purge rounds (2026-10-10): what its NFSv4 table owes its owners and no compound's round
+/// settled, or a restart left owed ([`purge_owed_here`]). It serves only what a purge round calls: the owners and their
+/// file-state calls, and the table. A purge round makes no v3 call and acts for no client.
+struct PurgeBackend {
+  this: u16,
+}
+
+impl compound::Backend for PurgeBackend {
+  fn call_v3(
+    &mut self,
+    _procedure: u32,
+    _args: Vec<u8>,
+  ) -> impl std::future::Future<Output = Vec<u8>> {
+    // No v3 call is a purge's; an empty result decodes as malformed.
+    std::future::ready(Vec::new())
+  }
+
+  fn call_owner(
+    &mut self,
+    owner: u16,
+    procedure: u32,
+    args: Vec<u8>,
+  ) -> impl std::future::Future<Output = Vec<u8>> {
+    let this = self.this;
+    async move {
+      let Some(shard) = state::with_state(|s| s.shards.get(usize::from(owner)).copied()).flatten()
+      else {
+        return status_word(Nfsstat4::BadStateid);
+      };
+      let Ok(call) = crate::xshard::call_on(this, shard, move || {
+        Some(serve_file_state_here(procedure, &args, None))
+      }) else {
+        return status_word(Nfsstat4::Delay);
+      };
+      crate::xshard::within(call, crate::daemon::LIVENESS_BUDGET_NS)
+        .await
+        .unwrap_or_else(|| status_word(Nfsstat4::Delay))
+    }
+  }
+
+  fn owners(&self) -> Vec<u16> {
+    state::with_state(|s| {
+      (0..s.shards.len())
+        .filter_map(|partition| u16::try_from(partition).ok())
+        .collect()
+    })
+    .unwrap_or_default()
+  }
+
+  fn root_handle(&self) -> Nfsfh3 {
+    slates_bridge_nfs::multi::root_handle_with(NO_CAPABILITY)
+  }
+
+  fn principal(&self) -> u32 {
+    slates_bridge_nfs::access::INVALID_UID
+  }
+
+  fn now_ns(&self) -> u64 {
+    futures::now_ns()
+  }
+
+  fn with_v4<R>(&mut self, f: impl FnOnce(&mut V4Server) -> R) -> Result<R, Nfsstat4> {
+    state::with_state(|s| {
+      let result = s.nfs_v4.as_mut().map(f)?;
+      crate::nfs_state::record_clients(s).then_some(result)
+    })
+    .flatten()
+    .ok_or(Nfsstat4::Delay)
+  }
+}
+
+/// Sends the purges this shard's NFSv4 table owes its owners, if it owes any (2026-10-10): at the reap loop's cadence,
+/// so a purge an owner could not take, and every purge a restart left owed, goes out without waiting for a client. A
+/// table that is not built yet is built when its partition owes purges, as its first compound would build it.
+pub(crate) async fn purge_owed_here() {
+  let owes = state::with_state(|s| {
+    if s.nfs_v4.is_none() && s.db.partition().nfs_purges().next().is_some() {
+      s.nfs_v4 = crate::nfs_state::server(s);
+    }
+    s.nfs_v4
+      .as_ref()
+      .is_some_and(|server| server.sessions.owes())
+  })
+  .unwrap_or(false);
+  let Some(this) = state::with_state(|s| s.shard).filter(|_| owes) else {
+    return;
+  };
+  let mut backend = PurgeBackend { this };
+  if compound::purge_owed(&mut backend).await.is_err() {
+    note(NFS4_PURGE_ROUND_REFUSED);
+  }
+}
+
+/// Counter: a shard's own purge round its table refused to record (2026-10-10); the purges stay owed for the next round.
+const NFS4_PURGE_ROUND_REFUSED: &str = "nfs4.purge.round_refused";
+/// Counter: purges this shard refused because a test asked it to (`Daemon::inject_nfs_purge_refusal`): the hook's
+/// non-vacuity count.
+const NFS4_PURGES_REFUSED_INJECTED: &str = "nfs4.purge.refused_injected";
+
 struct RoutedBackend {
   this: u16,
   xid: u32,
@@ -1561,6 +1890,30 @@ struct RoutedBackend {
   home: u16,
   /// The owner shard a v3 call of this compound was forwarded to, if any.
   forwarded_to: Option<u16>,
+  /// The recorded compound this compound is (A-127), when its SEQUENCE asked for its reply to be kept.
+  recorded: Option<slates_bridge_nfs::v4::replay::CallIdentity>,
+  /// How many of the compound's calls so far had each procedure and digest: the next one's occurrence (A-127).
+  occurrences: std::collections::BTreeMap<(u32, u64), u32>,
+}
+
+impl RoutedBackend {
+  /// The record identity of this compound's next call of `procedure` with `args`, when the compound is recorded
+  /// (A-127): its key counts the earlier calls with the same procedure and digest.
+  fn next_call(&mut self, procedure: u32, args: &[u8]) -> Option<crate::nfs_replay::RecordedCall> {
+    let identity = self.recorded?;
+    let digest = slates_bridge_nfs::v4::replay::digest(procedure, args);
+    let seen = self.occurrences.entry((procedure, digest)).or_insert(0);
+    let occurrence = *seen;
+    *seen = seen.saturating_add(1);
+    Some(crate::nfs_replay::RecordedCall {
+      identity,
+      key: slates_bridge_nfs::v4::replay::CallKey {
+        procedure,
+        digest,
+        occurrence,
+      },
+    })
+  }
 }
 
 impl compound::Backend for RoutedBackend {
@@ -1570,7 +1923,8 @@ impl compound::Backend for RoutedBackend {
     mut args: Vec<u8>,
   ) -> impl std::future::Future<Output = Vec<u8>> {
     let (this, xid, port) = (self.this, self.xid, self.port);
-    let requester = self.requester.clone();
+    let mut requester = self.requester.clone();
+    requester.call = self.next_call(procedure, &args);
     let forwarded = route(NFS_PROGRAM, procedure, &args).filter(|&owner| owner != this);
     if forwarded.is_some() {
       self.forwarded_to = forwarded;
@@ -1581,7 +1935,10 @@ impl compound::Backend for RoutedBackend {
       } else {
         NFS4_V3_LOCAL
       });
-      let capability = presented_capability(NFS_PROGRAM, procedure, &mut args);
+      let (capability, rewritten) = presented_capability(NFS_PROGRAM, procedure, &args);
+      if let Some(rewritten) = rewritten {
+        args = rewritten;
+      }
       let requester = requester.with_capability(capability);
       match serve_v3(this, xid, requester, NFS_PROGRAM, procedure, args, port).await {
         (AcceptStatus::Success, results) => results,
@@ -1599,6 +1956,7 @@ impl compound::Backend for RoutedBackend {
     args: Vec<u8>,
   ) -> impl std::future::Future<Output = Vec<u8>> {
     let this = self.this;
+    let call = self.next_call(procedure, &args);
     async move {
       // The owner partition a state id names is served by that partition's shard (D-14); a name no
       // shard carries is a state id this daemon never minted.
@@ -1612,7 +1970,7 @@ impl compound::Backend for RoutedBackend {
         NFS4_STATE_FORWARDED
       });
       let Ok(call) = crate::xshard::call_on(this, shard, move || {
-        Some(serve_file_state_here(procedure, &args))
+        Some(serve_file_state_here(procedure, &args, call))
       }) else {
         return status_word(Nfsstat4::Delay);
       };
@@ -1680,6 +2038,11 @@ impl compound::Backend for RoutedBackend {
     }
   }
 
+  fn record_calls(&mut self, compound: Option<slates_bridge_nfs::v4::replay::CallIdentity>) {
+    self.recorded = compound;
+    self.occurrences.clear();
+  }
+
   fn renew_home(&mut self, clientid: u64) {
     let now = futures::now_ns();
     send_note(self.this, self.home, NFS4_NOTE_LOST, move || {
@@ -1730,20 +2093,83 @@ pub(crate) fn v4_limits(s: &ShardState) -> Limits {
 }
 
 /// Serves an id-only NFSv4 state procedure on this shard's file state (§4.6 A-36), created on first
-/// use.
-fn serve_file_state_here(procedure: u32, args: &[u8]) -> Vec<u8> {
+/// use; a call of a recorded compound (`call`, A-127) is answered from its record or recorded, as [`serve_local`]
+/// does. A purge drops the client's or the session's call records too.
+fn serve_file_state_here(
+  procedure: u32,
+  args: &[u8],
+  call: Option<crate::nfs_replay::RecordedCall>,
+) -> Vec<u8> {
   state::with_state(|s| {
+    if let Some(call) = call.as_ref() {
+      if let Some(answer) = crate::nfs_replay::answered(s, call) {
+        return Some(answer);
+      }
+      if crate::nfs_replay::refused(s, call) {
+        return Some(status_word(Nfsstat4::Delay));
+      }
+    }
+    let purge = procedure == slates_bridge_nfs::procedures::extension::STATE_PURGE_SESSION
+      || procedure == slates_bridge_nfs::procedures::extension::STATE_PURGE;
+    if purge && s.nfs_purges_refused {
+      // Test support (`Daemon::inject_nfs_purge_refusal`): refused as an owner that cannot make the drop durable is.
+      s.count(NFS4_PURGES_REFUSED_INJECTED, 1);
+      return Some(status_word(Nfsstat4::Delay));
+    }
+    if procedure == slates_bridge_nfs::procedures::extension::STATE_PURGE_SESSION {
+      return Some(purge_session_here(s, args));
+    }
     if s.nfs_v4_files.is_none() {
       s.nfs_v4_files = crate::nfs_state::file_state(s);
     }
     let reply = s.nfs_v4_files.as_mut().map(|files| {
       slates_bridge_nfs::v4::files::serve_by_id(files, procedure, &mut XdrReader::new(args))
     })?;
-    // The changes are durable before the reply leaves (§4.6 A-37).
-    crate::nfs_state::record_files(s).then_some(reply)
+    // The changes are durable before the reply leaves (§4.6 A-37), with the compound's record (A-127): this call's,
+    // or, reached inside `serve_local`, the call in flight there.
+    let prior = s.nfs_call;
+    s.nfs_call = call.or(prior);
+    let recorded = crate::nfs_state::record_files(s, Some(&reply));
+    s.nfs_call = prior;
+    if !recorded {
+      return None;
+    }
+    if let Some(call) = call.as_ref() {
+      crate::nfs_replay::record(s, call, procedure, &reply, false);
+    }
+    // A dropped client's call records go with its state (A-127), dropped from the image before the purge is
+    // acknowledged; a purge that could not be made durable stays queued at its sender.
+    if procedure == slates_bridge_nfs::procedures::extension::STATE_PURGE
+      && let Ok(clientid) = XdrReader::new(args).u64()
+      && !crate::nfs_replay::purge(s, crate::nfs_replay::Purged::Client(clientid))
+    {
+      return Some(status_word(Nfsstat4::Delay));
+    }
+    Some(reply)
   })
   .flatten()
   .unwrap_or_else(|| status_word(Nfsstat4::Serverfault))
+}
+
+/// Drops a destroyed session's call records at this shard (A-127; `STATE_PURGE_SESSION`): `NFS4ERR_DELAY` when the
+/// drop could not be made durable, so its sender keeps it queued.
+fn purge_session_here(s: &mut ShardState, args: &[u8]) -> Vec<u8> {
+  let mut reader = XdrReader::new(args);
+  let parsed = reader.u64().ok().and(
+    reader
+      .fixed(slates_bridge_nfs::v4::types::SESSIONID_SIZE)
+      .ok(),
+  );
+  let Some(session) = parsed else {
+    return status_word(Nfsstat4::Badxdr);
+  };
+  let mut sessionid = [0u8; slates_bridge_nfs::v4::types::SESSIONID_SIZE];
+  sessionid.copy_from_slice(session);
+  if crate::nfs_replay::purge(s, crate::nfs_replay::Purged::Session(sessionid)) {
+    status_word(Nfsstat4::Ok)
+  } else {
+    status_word(Nfsstat4::Delay)
+  }
 }
 
 /// A reply of only a status word.
@@ -1760,24 +2186,43 @@ struct Call {
   program: u32,
   version: u32,
   procedure: u32,
-  args: Vec<u8>,
+  /// The record's body, kept whole: the arguments are its bytes from `args_at` ([`Call::args`]). Copying them out
+  /// of the record cost a 256 KiB WRITE's data once more per call, 3.1% of the daemon's samples on a Linux NFSv4.2
+  /// overwrite (2026-10-09).
+  body: Vec<u8>,
+  /// Where the arguments start in [`Call::body`].
+  args_at: usize,
   /// The whole call's encoded size, its RPC headers included (not its record marker): what an NFSv4
   /// session's request size bounds (RFC 8881 §18.36.3).
   request_bytes: usize,
 }
 
 impl Call {
-  /// The call a record body holds, or a garbage call if its header does not parse.
-  fn parse(body: &[u8]) -> Call {
-    match parse_call(body) {
-      Ok((call, args)) => Call {
-        xid: call.xid,
-        requester: Requester::of(body),
-        program: call.program,
-        version: call.version,
-        procedure: call.procedure,
-        args: args.rest().to_vec(),
-        request_bytes: body.len(),
+  /// The call a record body holds, or a garbage call if its header does not parse. The body is kept, its arguments in
+  /// place.
+  fn parse(body: Vec<u8>) -> Call {
+    let request_bytes = body.len();
+    let parsed = parse_call(&body).map(|(call, args)| {
+      let args_at = request_bytes.saturating_sub(args.rest().len());
+      (
+        call.xid,
+        Requester::of(&body),
+        call.program,
+        call.version,
+        call.procedure,
+        args_at,
+      )
+    });
+    match parsed {
+      Ok((xid, requester, program, version, procedure, args_at)) => Call {
+        xid,
+        requester,
+        program,
+        version,
+        procedure,
+        body,
+        args_at,
+        request_bytes,
       },
       Err(_) => Call {
         xid: 0,
@@ -1785,26 +2230,46 @@ impl Call {
         program: 0,
         version: 0,
         procedure: 0,
-        args: Vec::new(),
-        request_bytes: body.len(),
+        body: Vec::new(),
+        args_at: 0,
+        request_bytes,
       },
     }
   }
+
+  /// The call's arguments, in place in its body.
+  fn args(&self) -> &[u8] {
+    self.body.get(self.args_at..).unwrap_or_default()
+  }
+
+  /// Replaces the call's arguments (a `MOUNT`'s path, rewritten to the bare name).
+  fn set_args(&mut self, args: Vec<u8>) {
+    self.body = args;
+    self.args_at = 0;
+  }
+
+  /// The call's arguments as an owned buffer: the body with its headers shifted out in place, so no new buffer is
+  /// allocated for them.
+  fn into_args(self) -> Vec<u8> {
+    let mut body = self.body;
+    body.drain(..self.args_at.min(body.len()));
+    body
+  }
 }
 
-/// The RPC reply payload for one deframed call message: the entry the network export's TLS session serves
-/// its plaintext calls through ([`crate::nfs_tls`]), exactly as [`serve_one`] serves the loopback's.
-pub(crate) async fn reply_to_message(this: u16, message: &[u8], port: u16) -> Vec<u8> {
-  reply_to(this, Call::parse(message), port).await
+/// The RPC reply for one deframed call message, framed as one record: the entry the network export's TLS session
+/// serves its plaintext calls through ([`crate::nfs_tls`]), exactly as [`serve_one`] serves the loopback's.
+pub(crate) async fn reply_to_message(this: u16, message: Vec<u8>, port: u16) -> Vec<u8> {
+  reply_to(this, Call::parse(message), port, None).await
 }
 
-/// The RPC reply payload for one call. An NFSv4 call goes to the v4 front end, which presents a
+/// The RPC reply for one call, framed as one record ([`reply_record`]). An NFSv4 call goes to the v4 front end, which presents a
 /// capability per operation inside the compound (A-35). Any other call presents its mount capability
 /// (AUD-01): a `MNT`'s from its path (`<name>@<attachment>.<token>`, rewritten to the bare name for the
 /// routing), every other call's from the file handle it names. It rides to the owner shard, which
 /// validates it against the attachment record; no state is kept per connection, so the kernel's later
 /// requests — on this connection or any other — self-authorize through the handles the mount returned.
-async fn reply_to(this: u16, mut call: Call, port: u16) -> Vec<u8> {
+async fn reply_to(this: u16, mut call: Call, port: u16, held: Option<u64>) -> Vec<u8> {
   if call.program == NFS_PROGRAM && call.version == NFS_V4 {
     return reply_v4(this, call, port).await;
   }
@@ -1812,124 +2277,578 @@ async fn reply_to(this: u16, mut call: Call, port: u16) -> Vec<u8> {
   if call.program == NFS_PROGRAM
     && !slates_bridge_nfs::procedures::is_rfc1813_procedure(call.procedure)
   {
-    return reply_bytes(call.xid, AcceptStatus::ProcUnavail, &[]);
+    return reply_record(call.xid, AcceptStatus::ProcUnavail, &[]);
   }
-  let capability = presented_capability(call.program, call.procedure, &mut call.args);
-  let requester = call.requester.with_capability(capability);
+  let (capability, rewritten) = presented_capability(call.program, call.procedure, call.args());
+  if let Some(args) = rewritten {
+    call.set_args(args);
+  }
+  let mut requester =
+    std::mem::replace(&mut call.requester, Requester::root()).with_capability(capability);
+  requester.held = held;
+  let (xid, program, version, procedure) = (call.xid, call.program, call.version, call.procedure);
   reply_for(
     this,
-    call.xid,
+    xid,
     requester,
-    call.program,
-    call.version,
-    call.procedure,
-    call.args,
+    program,
+    version,
+    procedure,
+    call.into_args(),
     port,
   )
   .await
 }
 
-/// Serves one accepted connection: reads RPC records, routes each call, and writes the framed reply,
-/// until the client closes the connection. Owned request data (including the mounting user from the
-/// `AUTH_SYS` credential, §4.13) is taken out before the serve, so the read buffer is free to drain
-/// while a remote call awaits its owner.
-async fn serve_one(stream: TcpStream, port: u16) {
-  serve_connection(Connection {
-    stream,
-    buffer: Vec::new(),
-    records: RecordReader::default(),
-    pending: None,
-    port,
-    home: registry::current_shard().unwrap_or(0),
-    carry: None,
-  })
-  .await;
+// ------------------------------------------------------------------ a connection that outlives its daemon (A-113)
+
+/// Derived: the most wire bytes one record of a connection may span — the largest message ([`MAX_MESSAGE`]) and its
+/// one record marker. The kernel clients send each record as a single fragment (XNU `nfs_send`, Linux
+/// `xs_encode_stream_record_marker`); a peer whose record spans more than a connection's receive buffer is refused,
+/// since a request must sit whole in the kernel to be peeked.
+const RECORD_WIRE_BYTES: usize = MAX_MESSAGE + size_of::<u32>();
+
+/// Derived: each kernel buffer of a connection — two records: the one being served and the next arriving (receive),
+/// the one leaving and the next being built (send). A connection is served one call at a time, so a deeper queue adds
+/// no concurrency, only memory per connection; a shallower one could not hold a whole request beside its successor.
+const CONNECTION_BUFFER_BYTES: usize = 2 * RECORD_WIRE_BYTES;
+
+/// Counter: replies larger than a connection sends whole, answered `SYSTEM_ERR` instead (zero by construction: every
+/// reply is capped at [`MAX_MESSAGE`]; a non-zero count is a bug signal).
+const NFS_REPLY_PAST_BOUND: &str = "nfs.reply_past_bound";
+/// Counter: runs of replies the kernel took in more than one send — moments a connection ended mid-record (zero where
+/// sends are whole; a non-zero count on macOS is a bug signal).
+const NFS_SEND_COMPLETED: &str = "nfs.send_completed";
+/// The status refusal count of connections refused at admission: buffers the kernel would not size, a low-water mark
+/// it would not set, the hold bound reached, or a hold the anchor's channel would not carry. The client reconnects.
+pub(crate) const HOLD_REFUSED: &str = "nfs.connection_hold_refused";
+/// The status refusal count of connections ended because their stream was not a record stream, carried a record
+/// larger than the connection's receive buffer, or needed a receive low-water mark the kernel would not keep.
+const STREAM_REFUSED: &str = "nfs.stream_refused";
+/// The status refusal count of connection releases the anchor's channel would not carry: the anchor keeps a copy of a
+/// connection this daemon ended until the next daemon finds it closed and releases it again.
+const RELEASE_LOST: &str = "nfs.connection_release_lost";
+
+/// Connections the anchor holds for this daemon, against [`crate::config::DaemonConfig::held_connection_bound`]:
+/// raised at a hold, lowered at a release, on whichever shard the connection then lives. A statistic-grade word touched
+/// once per connection's admission and end, never per request.
+static HELD_CONNECTIONS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+std::thread_local! {
+  /// This shard's stream buffer: the bytes a peek copies out of a connection's receive queue, and the sink of a
+  /// discard where the kernel cannot drop bytes itself. One per shard thread, borrowed only inside a synchronous call,
+  /// never across an await, so every connection the shard serves shares it.
+  static STREAM_BUFFER: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+  /// The last connection id this shard handed out ([`next_connection_id`]).
+  static LAST_CONNECTION_ID: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
-/// A connection's serving state, moved whole to the shard that owns the volume its calls name ([`migrate`]):
-/// the socket, the bytes read past the last parsed call, the record reader's partial record, and the call that
-/// named the other shard, served first there.
+/// A connection id unique across the anchor's life: the host's monotonic clock, which every daemon under one anchor
+/// shares and which never runs back (`slates_machine::clock`), made strictly increasing on this shard. Only the
+/// listener's shard hands ids out, and an id a dead daemon handed out is older than any reading after it.
+fn next_connection_id() -> u64 {
+  LAST_CONNECTION_ID.with(|last| {
+    let id = slates_machine::clock::monotonic_ns().max(last.get().saturating_add(1));
+    last.set(id);
+    id
+  })
+}
+
+/// What ends a connection the anchor holds: its id, if held. Ending one shuts it down (so the client sees it close
+/// though the anchor still holds a copy) and releases the anchor's copy.
+#[derive(Clone, Copy, Debug)]
+struct Ending {
+  held: Option<u64>,
+}
+
+impl Ending {
+  /// Releases the anchor's copy and the hold's place under the bound; without a hold, nothing.
+  fn release(self) {
+    let Some(connection) = self.held else {
+      return;
+    };
+    HELD_CONNECTIONS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    if matches!(
+      crate::anchor_hold::release_connection(connection),
+      Some(Err(_))
+    ) {
+      crate::fleet::count_refusal(RELEASE_LOST);
+    }
+  }
+}
+
+/// Admits an accepted connection (A-113): sizes its kernel buffers to [`CONNECTION_BUFFER_BYTES`] (a request must sit
+/// whole in the receive queue to be peeked), makes its sends of up to [`RECORD_WIRE_BYTES`] whole where the kernel
+/// offers that, and — under a supervising anchor that can hold it — hands the anchor a duplicate before its first
+/// request is read. A connection whose buffers or low-water mark the kernel refuses, or that the hold bound or the
+/// channel refuses, is shut down and counted ([`HOLD_REFUSED`]); the client reconnects. Where the kernel cannot make a
+/// send whole (Linux), a connection is served unheld: holding it would let a successor resume mid-record (GAPS, A-113).
+fn admit(stream: TcpStream, port: u16, bound: usize) -> Option<Connection> {
+  let refuse = |stream: &TcpStream| {
+    crate::fleet::count_refusal(HOLD_REFUSED);
+    let _ = stream.shutdown();
+  };
+  if stream.reserve_buffers(CONNECTION_BUFFER_BYTES).is_err() {
+    refuse(&stream);
+    return None;
+  }
+  let whole = match stream.make_sends_whole(RECORD_WIRE_BYTES) {
+    Ok(whole) => whole,
+    Err(_) => {
+      refuse(&stream);
+      return None;
+    }
+  };
+  let held = if whole == slates_rt::tcp::WholeSends::Guaranteed && crate::anchor_hold::anchored() {
+    let admitted = HELD_CONNECTIONS
+      .fetch_update(
+        std::sync::atomic::Ordering::Relaxed,
+        std::sync::atomic::Ordering::Relaxed,
+        |held| (held < bound).then_some(held.saturating_add(1)),
+      )
+      .is_ok();
+    if !admitted {
+      refuse(&stream);
+      return None;
+    }
+    let connection = next_connection_id();
+    if !matches!(
+      crate::anchor_hold::hold_connection(connection, stream.as_fd()),
+      Some(Ok(()))
+    ) {
+      HELD_CONNECTIONS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+      refuse(&stream);
+      return None;
+    }
+    Some(connection)
+  } else {
+    None
+  };
+  Some(Connection::new(stream, port, held))
+}
+
+/// Serves again the connections a dead daemon left (A-113), each handed back by the anchor
+/// ([`crate::anchor_hold::adopt`]): the socket and its buffers and low-water marks are as the dead daemon left them;
+/// every request it had not answered is still queued, since a request is consumed only after its reply's send. A
+/// connection that cannot be adopted is released, so the anchor closes the last copy and the client reconnects.
+pub(crate) fn adopt_held(
+  handed: Vec<crate::anchor_hold::HandedConnection>,
+  port: u16,
+  bound: usize,
+) {
+  for crate::anchor_hold::HandedConnection { connection, socket } in handed {
+    LAST_CONNECTION_ID.with(|last| last.set(last.get().max(connection)));
+    let ending = Ending {
+      held: Some(connection),
+    };
+    let previously = HELD_CONNECTIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let Ok(stream) = TcpStream::from_fd(socket) else {
+      crate::fleet::count_refusal(HOLD_REFUSED);
+      ending.release();
+      continue;
+    };
+    if previously >= bound {
+      // More were handed back than this daemon's bound allows (a smaller configuration than its predecessor's).
+      crate::fleet::count_refusal(HOLD_REFUSED);
+      let _ = stream.shutdown();
+      ending.release();
+      continue;
+    }
+    note(NFS_CONNECTIONS_ADOPTED);
+    spawn_connection(Connection::new(stream, port, Some(connection)));
+  }
+}
+
+/// Releases connections the anchor handed back that this daemon cannot serve (it has no listener): the anchor closes
+/// its copy, and with the daemon's dropped here the client sees the connection close and reconnects.
+pub(crate) fn release_handed(handed: Vec<crate::anchor_hold::HandedConnection>) {
+  for crate::anchor_hold::HandedConnection { connection, socket } in handed {
+    let _ = rustix::net::shutdown(&socket, rustix::net::Shutdown::Both);
+    drop(socket);
+    if matches!(
+      crate::anchor_hold::release_connection(connection),
+      Some(Err(_))
+    ) {
+      crate::fleet::count_refusal(RELEASE_LOST);
+    }
+  }
+}
+
+/// Counter: connections a dead daemon left that this daemon serves again (A-113).
+const NFS_CONNECTIONS_ADOPTED: &str = "nfs.connections_adopted";
+
+/// A connection's serving state, moved whole to the shard that owns the volume its calls name ([`migrate`]). The
+/// requests not yet answered live in the socket's receive queue, not here (A-113): each turn peeks them, and a request
+/// is consumed only once its reply is in the send queue, so the state a move carries — and a death loses — is no more
+/// than the socket.
 struct Connection {
   stream: TcpStream,
-  buffer: Vec<u8>,
-  records: RecordReader,
-  pending: Option<Call>,
   port: u16,
   /// The shard that accepted the connection: where its NFSv4 client table lives (A-76).
   home: u16,
   /// An NFSv4 session moving with the connection to the shard its volume lives on (A-76), taken in there.
   carry: Option<(SessionId, DepartedSession)>,
+  /// The connection's id while the anchor holds it.
+  held: Option<u64>,
+  /// The receive low-water mark last set, so it is set only when it changes (0: not known on this shard).
+  wanted: usize,
 }
 
-/// The serve loop of [`serve_one`], on whichever shard holds the connection now. A mount's calls name one
-/// volume, so the connection moves to that volume's owner shard at its first call there and is served locally
-/// from then on: a call forwarded over the bridge queue costs two cross-shard hops and two thread wakes, each
-/// of which a busy machine can delay by a scheduler quantum, and every call of a mount (six RPCs for one
-/// `rename(2)` from macOS) paid them (2026-10-04: every one of 185,745 calls was forwarded; their service p99
-/// was 115 µs at rest and 1.18 ms with a spinner per core, `crates/cli/examples/vfs_tails.rs`).
+impl Connection {
+  fn new(stream: TcpStream, port: u16, held: Option<u64>) -> Connection {
+    Connection {
+      stream,
+      port,
+      home: registry::current_shard().unwrap_or(0),
+      carry: None,
+      held,
+      wanted: 0,
+    }
+  }
+
+  /// What ends this connection, kept apart from it for the paths that lose the socket.
+  fn ending(&self) -> Ending {
+    Ending { held: self.held }
+  }
+
+  /// Ends the connection while this daemon lives: shuts it down, so the client sees it close although the anchor's copy
+  /// would keep it open, and releases the hold.
+  fn end(self) {
+    let _ = self.stream.shutdown();
+    self.ending().release();
+  }
+
+  /// Sets the receive low-water mark to `bytes` if it is not already that; whether the kernel keeps it. A mark it caps
+  /// below `bytes` (Linux at half of `tcp_rmem[2]`) would wake the connection before the record is whole, every time,
+  /// so the caller ends the connection rather than spin.
+  fn want(&mut self, bytes: usize) -> bool {
+    if self.wanted == bytes {
+      return true;
+    }
+    if self.stream.want_bytes(bytes).is_err() {
+      return false;
+    }
+    self.wanted = bytes;
+    true
+  }
+}
+
+/// One record at the head of a connection's receive queue: its body, and the queue offset just past it (what a discard
+/// consumes to remove it and everything before it).
+struct Inbound {
+  body: Vec<u8>,
+  end: usize,
+}
+
+/// What a peek found at the head of a connection's receive queue.
+enum Head {
+  /// Whole records, in order.
+  Records(Vec<Inbound>),
+  /// No whole record: wait until this many bytes are queued.
+  Waiting(usize),
+  /// The client closed the connection.
+  Ended,
+  /// The bytes are not a record stream, or a record spans more than the buffer; the connection ends.
+  Refused,
+}
+
+/// Peeks the head of `stream`'s receive queue into this shard's stream buffer and reads the whole records there.
+fn peek_head(stream: &TcpStream) -> Head {
+  STREAM_BUFFER.with(|cell| {
+    let Ok(mut buffer) = cell.try_borrow_mut() else {
+      // Never borrowed across an await, so never busy; a busy buffer would be a bug, refused rather than waited on.
+      return Head::Refused;
+    };
+    if buffer.len() < CONNECTION_BUFFER_BYTES {
+      buffer.resize(CONNECTION_BUFFER_BYTES, 0);
+    }
+    match stream.peek_now(&mut buffer) {
+      Err(_) | Ok(Some(0)) => Head::Ended,
+      Ok(None) => Head::Waiting(1),
+      Ok(Some(queued)) => read_head(buffer.get(..queued).unwrap_or_default()),
+    }
+  })
+}
+
+/// The whole records at the head of `queued`, or how many bytes the first needs.
+fn read_head(queued: &[u8]) -> Head {
+  let mut reader = RecordReader::default();
+  let mut at = 0usize;
+  let mut records = Vec::new();
+  while let Some(rest) = queued.get(at..).filter(|rest| !rest.is_empty()) {
+    match reader.read(rest) {
+      Err(_) => return Head::Refused,
+      Ok((Some(body), used)) => {
+        at = at.saturating_add(used);
+        records.push(Inbound { body, end: at });
+      }
+      Ok((None, used)) => {
+        at = at.saturating_add(used);
+        if records.is_empty() {
+          let wanted = at.saturating_add(reader.wanted());
+          return if wanted > CONNECTION_BUFFER_BYTES {
+            Head::Refused
+          } else {
+            Head::Waiting(wanted)
+          };
+        }
+        break;
+      }
+    }
+  }
+  if records.is_empty() {
+    Head::Waiting(at.saturating_add(reader.wanted()).max(1))
+  } else {
+    Head::Records(records)
+  }
+}
+
+/// The serve loop of a connection, on whichever shard holds it now. A mount's calls name one volume, so the connection
+/// moves to that volume's owner shard at its first call there and is served locally from then on: a call forwarded over
+/// the bridge queue costs two cross-shard hops and two thread wakes, each of which a busy machine can delay by a
+/// scheduler quantum, and every call of a mount (six RPCs for one `rename(2)` from macOS) paid them (2026-10-04: every
+/// one of 185,745 calls was forwarded; their service p99 was 115 µs at rest and 1.18 ms with a spinner per core,
+/// `crates/cli/examples/vfs_tails.rs`). Each turn peeks the whole records queued, serves them up to the shard's
+/// quantum, sends their replies in whole records and only then consumes their requests (A-113).
+/// Counter: an NFS connection the peer closed at a record boundary (`Head::Ended`).
+/// Format: a counter name in the daemon's status report.
+const CONNECTION_ENDED_BY_PEER: &str = "nfs.connection.ended_by_peer";
+/// Counter: an NFS connection the peer closed with an unfinished record queued.
+/// Format: a counter name in the daemon's status report.
+const CONNECTION_CLOSED_MID_RECORD: &str = "nfs.connection.closed_mid_record";
+/// Counter: an NFS connection ended because its idle wait failed, or a callback send on it failed.
+/// Format: a counter name in the daemon's status report.
+const CONNECTION_WAIT_FAILED: &str = "nfs.connection.wait_failed";
+/// Counter: an NFS connection ended because a turn's replies could not be sent.
+/// Format: a counter name in the daemon's status report.
+const CONNECTION_SEND_FAILED: &str = "nfs.connection.send_failed";
+
 async fn serve_connection(mut connection: Connection) {
   let this = registry::current_shard().unwrap_or(0);
-  let mut chunk = [0u8; RECORD_CHUNK];
   // The connection's back-channel outbox on this shard (`crate::callback`), released however the loop ends.
   let registration = Registration(crate::callback::register());
+  // Whether the last wait ended because the socket became readable: with an unfinished record queued, that is the
+  // moment to ask whether the peer closed (a peek never shows the close behind bytes it does not consume).
+  let mut woken = false;
   loop {
-    let Some(batch) = serve_batch(this, &mut connection, registration.0).await else {
-      return;
-    };
-    if !send_batch(&mut connection, &batch).await {
-      return;
-    }
-    if let Some(owner) = batch.moving {
-      migrate(owner, connection);
-      return;
-    }
-    if batch.answered > 0 {
-      // A ready read/write does not yield: bound a busy connection to one batch per turn.
-      futures::yield_now().await;
-      continue;
-    }
-    if !wait_idle(&mut connection, &mut chunk, registration.0).await {
-      return;
+    match peek_head(&connection.stream) {
+      Head::Ended => {
+        crate::fleet::count_refusal(CONNECTION_ENDED_BY_PEER);
+        connection.end();
+        return;
+      }
+      Head::Refused => {
+        crate::fleet::count_refusal(STREAM_REFUSED);
+        connection.end();
+        return;
+      }
+      Head::Waiting(bytes) => {
+        if woken && bytes > 1 && connection.stream.peer_closed().unwrap_or(true) {
+          // The peer closed with an unfinished record queued: it never completes.
+          crate::fleet::count_refusal(CONNECTION_CLOSED_MID_RECORD);
+          connection.end();
+          return;
+        }
+        if !connection.want(bytes) {
+          crate::fleet::count_refusal(STREAM_REFUSED);
+          connection.end();
+          return;
+        }
+        woken = false;
+        let standing = match idle(&connection, registration.0).await {
+          Idle::Readable => {
+            woken = true;
+            true
+          }
+          Idle::Send(records) => send_callbacks(&connection, &records).await,
+          Idle::Failed => false,
+        };
+        if !standing {
+          crate::fleet::count_refusal(CONNECTION_WAIT_FAILED);
+          connection.end();
+          return;
+        }
+      }
+      Head::Records(records) => {
+        let turn = serve_turn(this, &mut connection, records, registration.0).await;
+        if !send_turn(&connection, &turn).await {
+          crate::fleet::count_refusal(CONNECTION_SEND_FAILED);
+          connection.end();
+          return;
+        }
+        turn_sent(&connection, &turn);
+        if let Some(owner) = turn.moving {
+          migrate(owner, connection);
+          return;
+        }
+        // A ready read/write does not yield: bound a busy connection to one turn per scheduling round.
+        futures::yield_now().await;
+      }
     }
   }
 }
 
-/// Writes a batch's replies in one write and counts the replies that shared it; whether the connection still stands.
-async fn send_batch(connection: &mut Connection, batch: &Batch) -> bool {
-  if batch.answered == 0 {
-    return true;
+/// One turn's handled records: each record's reply (empty for a callback's answer, which has none) beside the queue
+/// offset just past it, and the owner shard the connection must move to before the next call (left queued).
+struct Turn {
+  handled: Vec<(Vec<u8>, usize)>,
+  moving: Option<u16>,
+}
+
+/// Serves the whole records peeked at the head of `connection`'s queue, in order, in one turn bounded by the shard's
+/// step quantum so a long pipeline still yields to the heartbeat (§4.3, D-18); the replies are gathered for whole-record
+/// sends (A-74). A call naming another shard's volume ends the turn and stays queued: the owner peeks it there.
+async fn serve_turn(
+  this: u16,
+  connection: &mut Connection,
+  records: Vec<Inbound>,
+  registration: Option<u64>,
+) -> Turn {
+  let started = futures::now_ns();
+  let quantum = futures::step_budget_ns().unwrap_or(0);
+  let mut turn = Turn {
+    handled: Vec::new(),
+    moving: None,
+  };
+  for Inbound { body, end } in records {
+    // A reply on the back channel answers one of this shard's callbacks (RFC 8881 §2.10.3.1), never a call.
+    if crate::callback::is_reply(&body) {
+      crate::callback::deliver(&body);
+      turn.handled.push((Vec::new(), end));
+      continue;
+    }
+    let call = Call::parse(body);
+    let elsewhere = if is_v4_compound(&call) {
+      v4_elsewhere(this, connection.home, &call)
+    } else {
+      owner_elsewhere(&call)
+    };
+    if let Some(owner) = elsewhere {
+      turn.moving = Some(owner);
+      break;
+    }
+    let xid = call.xid;
+    let reply = if is_v4_compound(&call) {
+      let (reply, moving) = serve_v4_on(this, connection, call, registration).await;
+      turn.moving = moving;
+      reply
+    } else {
+      reply_to(this, call, connection.port, connection.held).await
+    };
+    turn.handled.push((bounded_record(xid, reply), end));
+    if turn.moving.is_some() || futures::now_ns().saturating_sub(started) >= quantum {
+      break;
+    }
   }
-  if connection.stream.write_all(&batch.replies).await.is_err() {
+  turn
+}
+
+/// Format: where a framed reply record's xid sits: after its four-byte record marker.
+const RECORD_XID_AT: usize = size_of::<u32>();
+
+/// The xid of a framed reply record (its first word after the record marker), or `None` for an empty one (a callback's
+/// answer, which carries no reply).
+fn record_xid(record: &[u8]) -> Option<u32> {
+  let word = record.get(RECORD_XID_AT..RECORD_XID_AT.checked_add(size_of::<u32>())?)?;
+  let mut bytes = [0u8; size_of::<u32>()];
+  bytes.copy_from_slice(word);
+  Some(u32::from_be_bytes(bytes))
+}
+
+/// `record`, a reply framed as one record, or — past [`RECORD_WIRE_BYTES`], which no reply reaches since every result is
+/// capped at the transfer ceiling — a `SYSTEM_ERR` for its `xid`, counted: a connection sends only records it can send
+/// whole.
+fn bounded_record(xid: u32, record: Vec<u8>) -> Vec<u8> {
+  if record.len() <= RECORD_WIRE_BYTES {
+    return record;
+  }
+  note(NFS_REPLY_PAST_BOUND);
+  reply_record(xid, AcceptStatus::SystemErr, &[])
+}
+
+/// Sends a turn's replies in runs of whole records no longer than [`RECORD_WIRE_BYTES`], and after each run consumes
+/// the requests it answered (and any callback answers among them) from the receive queue: a request leaves the kernel
+/// only once its reply is in it, so a daemon that dies anywhere here leaves every unanswered request for its successor,
+/// and at worst a reply sent twice, which the client drops by its xid (RFC 5531 §9) (A-113). Whether the connection
+/// still stands.
+async fn send_turn(connection: &Connection, turn: &Turn) -> bool {
+  // A run is its records' slices, sent by one vectored write: never copied into one buffer first.
+  let mut run: Vec<&[u8]> = Vec::new();
+  let mut run_bytes = 0usize;
+  let mut run_end = 0usize;
+  let mut consumed = 0usize;
+  let mut answered = 0u64;
+  for (reply, end) in &turn.handled {
+    if run_bytes > 0 && run_bytes.saturating_add(reply.len()) > RECORD_WIRE_BYTES {
+      if !send_run(connection, &run, run_end, &mut consumed).await {
+        return false;
+      }
+      run.clear();
+      run_bytes = 0;
+    }
+    if !reply.is_empty() {
+      run.push(reply);
+      run_bytes = run_bytes.saturating_add(reply.len());
+    }
+    run_end = *end;
+    if !reply.is_empty() {
+      answered = answered.saturating_add(1);
+    }
+  }
+  if run_end > consumed && !send_run(connection, &run, run_end, &mut consumed).await {
     return false;
   }
-  if batch.answered > 1 {
-    let _ = state::with_state(|s| {
-      s.count(NFS_REPLIES_BATCHED, batch.answered);
+  if answered > 1 {
+    let _ = state::with_state_counted(|s| {
+      s.count(NFS_REPLIES_BATCHED, answered);
     });
   }
-  // A mount's call is client activity: the shard spins out its idle window after it, so the next call of a burst is
-  // read without a kernel wake (§4.7).
-  registry::with_current(|ctx| ctx.note_activity());
+  if answered > 0 {
+    // A mount's call is client activity: the shard spins out its idle window after it, so the next call of a burst is
+    // read without a kernel wake (§4.7).
+    registry::with_current(|ctx| ctx.note_activity());
+  }
   true
 }
 
-/// Waits for the client's next bytes (buffered for the next batch) or for callbacks queued on this connection (sent);
-/// whether the connection still stands.
-async fn wait_idle(
-  connection: &mut Connection,
-  chunk: &mut [u8],
-  registration: Option<u64>,
+/// Sends one run of whole records (if any), then consumes the receive queue through `through`; whether both succeeded.
+async fn send_run(
+  connection: &Connection,
+  run: &[&[u8]],
+  through: usize,
+  consumed: &mut usize,
 ) -> bool {
-  match idle(connection, chunk, registration).await {
-    Idle::Read(Ok(0) | Err(_)) => false,
-    Idle::Read(Ok(count)) => {
-      connection
-        .buffer
-        .extend_from_slice(chunk.get(..count).unwrap_or_default());
-      true
+  if !run.is_empty() {
+    match connection.stream.send_records_vectored(run).await {
+      Ok(slates_rt::tcp::Sent::Whole) => {}
+      Ok(slates_rt::tcp::Sent::Completed) => note(NFS_SEND_COMPLETED),
+      Err(_) => return false,
     }
-    Idle::Send(records) => connection.stream.write_all(&records.concat()).await.is_ok(),
   }
+  let count = through.saturating_sub(*consumed);
+  let discarded = STREAM_BUFFER.with(|cell| {
+    cell
+      .try_borrow_mut()
+      .ok()
+      .is_some_and(|mut buffer| connection.stream.discard(count, &mut buffer).is_ok())
+  });
+  *consumed = through;
+  discarded
+}
+
+/// Sends callback records queued for this connection, each run whole; whether the connection still stands.
+async fn send_callbacks(connection: &Connection, records: &[Vec<u8>]) -> bool {
+  let mut run: Vec<u8> = Vec::new();
+  for record in records {
+    if !run.is_empty() && run.len().saturating_add(record.len()) > RECORD_WIRE_BYTES {
+      if connection.stream.send_records(&run).await.is_err() {
+        return false;
+      }
+      run.clear();
+    }
+    run.extend_from_slice(record);
+  }
+  run.is_empty() || connection.stream.send_records(&run).await.is_ok()
 }
 
 /// A connection's registration in its shard's back-channel table, ended when the serve loop ends (any path, a
@@ -1944,15 +2863,17 @@ impl Drop for Registration {
   }
 }
 
-/// What woke an idle connection: bytes from the client, or callbacks to send it.
+/// What woke an idle connection: bytes from the client (or its close), callbacks to send it, or a failed wait.
 enum Idle {
-  Read(Result<usize, slates_rt::RtError>),
+  Readable,
   Send(Vec<Vec<u8>>),
+  Failed,
 }
 
-/// Waits for the client's next bytes or for a callback queued on this connection, whichever comes first.
-async fn idle(connection: &mut Connection, chunk: &mut [u8], registration: Option<u64>) -> Idle {
-  let mut read = std::pin::pin!(connection.stream.read(chunk));
+/// Waits for the client's next bytes (as many as the low-water mark asks) or for a callback queued on this connection,
+/// whichever comes first.
+async fn idle(connection: &Connection, registration: Option<u64>) -> Idle {
+  let mut readable = std::pin::pin!(connection.stream.wait_readable());
   std::future::poll_fn(|cx| {
     if let Some(id) = registration {
       let outbound = crate::callback::take_outbound(id, cx.waker());
@@ -1960,61 +2881,12 @@ async fn idle(connection: &mut Connection, chunk: &mut [u8], registration: Optio
         return std::task::Poll::Ready(Idle::Send(outbound));
       }
     }
-    read.as_mut().poll(cx).map(Idle::Read)
+    readable.as_mut().poll(cx).map(|waited| match waited {
+      Ok(()) => Idle::Readable,
+      Err(_) => Idle::Failed,
+    })
   })
   .await
-}
-
-/// One turn's calls on a connection: the replies built, how many, and the owner shard the connection must move to
-/// before its next call (the call is kept as the connection's pending one).
-struct Batch {
-  replies: Vec<u8>,
-  answered: u64,
-  moving: Option<u16>,
-}
-
-/// Serves every complete call already buffered on `connection`, in one turn bounded by the shard's step quantum so a
-/// long pipeline still yields to the heartbeat (§4.3, D-18); the replies are gathered for one write (A-74). One
-/// reply and a yield per call queued each pipelined call behind every earlier one's write and turn. `None` when the
-/// buffered bytes are not a valid record stream (the connection ends).
-async fn serve_batch(
-  this: u16,
-  connection: &mut Connection,
-  registration: Option<u64>,
-) -> Option<Batch> {
-  let started = futures::now_ns();
-  let quantum = futures::step_budget_ns().unwrap_or(0);
-  let mut batch = Batch {
-    replies: Vec::new(),
-    answered: 0,
-    moving: None,
-  };
-  while let Some(call) = next_call(connection)? {
-    let elsewhere = if is_v4_compound(&call) {
-      v4_elsewhere(this, connection.home, &call)
-    } else {
-      owner_elsewhere(&call)
-    };
-    if let Some(owner) = elsewhere {
-      // The replies already built leave first, so the moved connection answers in request order.
-      connection.pending = Some(call);
-      batch.moving = Some(owner);
-      break;
-    }
-    let reply = if is_v4_compound(&call) {
-      let (reply, moving) = serve_v4_on(this, connection, call, registration).await;
-      batch.moving = moving;
-      reply
-    } else {
-      reply_to(this, call, connection.port).await
-    };
-    batch.replies.extend_from_slice(&write_record(&reply));
-    batch.answered = batch.answered.saturating_add(1);
-    if batch.moving.is_some() || futures::now_ns().saturating_sub(started) >= quantum {
-      break;
-    }
-  }
-  Some(batch)
 }
 
 /// Serves one NFSv4 compound on `connection` (A-76, A-77): binds its session's back channel to the connection, serves
@@ -2026,9 +2898,9 @@ async fn serve_v4_on(
   call: Call,
   registration: Option<u64>,
 ) -> (Vec<u8>, Option<u16>) {
-  let placement = compound::placement(&call.args);
+  let placement = compound::placement(call.args());
   if let (compound::Placement::Session(sessionid), Some(id)) = (placement, registration) {
-    bind_back_channel(sessionid, id, compound::minor_version(&call.args));
+    bind_back_channel(sessionid, id, compound::minor_version(call.args()));
   }
   let (reply, forwarded_to) = serve_v4(this, connection.home, call, connection.port).await;
   v4_after(this, connection.home);
@@ -2036,25 +2908,6 @@ async fn serve_v4_on(
     reply,
     depart_with(this, connection, placement, forwarded_to),
   )
-}
-
-/// The connection's next call: the pending one, else the next complete record in its buffer; `Some(None)` when no
-/// complete record is buffered, `None` when the bytes are not a valid record stream.
-fn next_call(connection: &mut Connection) -> Option<Option<Call>> {
-  if let Some(call) = connection.pending.take() {
-    return Some(Some(call));
-  }
-  loop {
-    let (body, consumed) = connection.records.read(&connection.buffer).ok()?;
-    connection
-      .buffer
-      .drain(..consumed.min(connection.buffer.len()));
-    match body {
-      // A reply on the back channel answers one of this shard's callbacks (RFC 8881 §2.10.3.1), never a call.
-      Some(body) if crate::callback::is_reply(&body) => crate::callback::deliver(&body),
-      other => return Some(other.map(|body| Call::parse(&body))),
-    }
-  }
 }
 
 /// Binds connection `id` as the carrier of `sessionid`'s back channel when the session has one (its compounds
@@ -2067,30 +2920,35 @@ fn bind_back_channel(sessionid: SessionId, id: u64, minor: Option<u32>) {
     with_v4_sessions(|sessions| sessions.set_callback_minor(&sessionid, minor));
   }
   crate::callback::carry(sessionid, id);
-  if back.state == CallbackState::Unproven {
-    // Probed once before the first use (RFC 8881 §10.2): marked down while the probe runs, so a second compound does
-    // not start another, and up only when the client answers.
-    with_v4_sessions(|sessions| sessions.set_callback_state(&sessionid, CallbackState::Down));
+  // Probed once before the first use (RFC 8881 §10.2), by whoever claims the probe: the back channel is `Probing` while
+  // it runs (neither up nor down, so no `SEQUENCE` tells the client it is down and no rebind starts another), and up
+  // only when the client answers.
+  if back.state == CallbackState::Unproven
+    && with_v4_sessions(|sessions| sessions.claim_probe(&sessionid)) == Some(true)
+  {
+    note(NFS4_CALLBACK_PROBES);
     match futures::spawn(probe_back_channel(sessionid)) {
       Ok(task) => {
         let _ = futures::detach(task);
       }
-      Err(_) => note(NFS4_CALLBACK_DOWN),
+      Err(_) => {
+        // No probe runs: the back channel is down until a rebind asks for another.
+        note(NFS4_CALLBACK_DOWN);
+        with_v4_sessions(|sessions| sessions.set_callback_state(&sessionid, CallbackState::Down));
+      }
     }
   }
 }
 
+/// Counter: back-channel probes started (§10.2; one at a time per session, `Sessions::claim_probe`).
+const NFS4_CALLBACK_PROBES: &str = "nfs4.callback.probes";
+
 /// Probes `sessionid`'s back channel with `CB_SEQUENCE` alone and records whether the client answered `NFS4_OK`
 /// within a liveness budget.
 async fn probe_back_channel(sessionid: SessionId) {
-  let Some(next) = with_v4_sessions(|sessions| sessions.next_callback(&sessionid)).flatten() else {
-    return;
-  };
-  let args = slates_bridge_nfs::v4::callback::probe(&sessionid, next.minor, next.sequence);
-  let outcome = crate::callback::call(
+  let outcome = crate::callback::call_on_slot(
     sessionid,
-    (next.program, &next.credential),
-    &args,
+    |next| slates_bridge_nfs::v4::callback::probe(&sessionid, next.minor, next.sequence),
     crate::daemon::LIVENESS_BUDGET_NS,
   )
   .await;
@@ -2125,25 +2983,26 @@ fn owner_elsewhere(call: &Call) -> Option<u16> {
   if call.program != NFS_PROGRAM
     || call.version != NFS_VERSION
     || !slates_bridge_nfs::procedures::is_rfc1813_procedure(call.procedure)
-    || is_root_listing(call.program, call.procedure, &call.args)
+    || is_root_listing(call.program, call.procedure, call.args())
   {
     return None;
   }
-  route(call.program, call.procedure, &call.args)
+  route(call.program, call.procedure, call.args())
 }
 
-/// Moves `connection` to `owner`, where its pending call is served first and the loop goes on. The move is a
-/// spawn on the owner's control channel carrying the descriptor and the read state (sharing by move); refused
-/// there, the connection is closed, and counted, and the kernel client reconnects, as at a refused accept.
+/// Moves `connection` to `owner`, where the call that named it — still at the head of the receive queue (A-113) — is
+/// peeked and served first, and the loop goes on. The move is a spawn on the owner's control channel carrying the
+/// descriptor (sharing by move); refused there, the connection is closed and its hold released, and counted, and the
+/// kernel client reconnects, as at a refused accept.
 fn migrate(owner: u16, connection: Connection) {
+  let ending = connection.ending();
   let Connection {
     stream,
-    buffer,
-    records,
-    pending,
     port,
     home,
     carry,
+    held,
+    ..
   } = connection;
   let fd = stream.into_fd();
   // A copy of the session stays behind for the refusal path: a move refused before it left returns the session to its
@@ -2157,32 +3016,27 @@ fn migrate(owner: u16, connection: Connection) {
       }
       let Ok(stream) = TcpStream::from_fd(fd) else {
         crate::fleet::count_refusal(MIGRATE_REFUSED);
+        ending.release();
         return;
       };
       let connection = Connection {
         stream,
-        buffer,
-        records,
-        pending,
         port,
         home,
         carry: None,
+        held,
+        wanted: 0,
       };
-      match futures::spawn(serve_connection(connection)) {
-        Ok(task) => {
-          let _ = futures::detach(task);
-        }
-        Err(_) => {
-          crate::fleet::count_refusal(SERVE_SPAWN_REFUSED);
-        }
-      }
+      spawn_connection(connection);
     }),
     None,
   );
   if registry::send_control(owner, slates_rt::control::Control::Spawn(Box::new(arrive))).is_err() {
     crate::fleet::count_refusal(MIGRATE_REFUSED);
+    // The refused spawn dropped the descriptor; releasing the anchor's copy closes the connection.
+    ending.release();
     if let Some((sessionid, departed)) = kept {
-      let _ = state::with_state(|s| {
+      let _ = state::with_state_counted(|s| {
         if let Some(server) = s.nfs_v4.as_mut() {
           server.sessions.return_home(sessionid, departed);
         }
@@ -2199,6 +3053,7 @@ const MIGRATE_REFUSED: &str = "nfs.connection_move_refused";
 #[cfg(test)]
 mod tests {
   use super::*;
+  use slates_bridge_nfs::{reply_bytes, write_record};
 
   /// AC-2.6 / T-4.3: queue two complete RPC calls on one connection. Serving the first must
   /// give another task a turn before the second, even though neither socket direction blocks.
@@ -2235,7 +3090,11 @@ mod tests {
     let Poll::Ready(Ok(stream)) = std::pin::pin!(listener.accept()).poll(&mut context) else {
       panic!("the established connection must be ready to accept");
     };
-    let mut server = std::pin::pin!(serve_one(stream, address.port()));
+    let mut server = std::pin::pin!(serve_connection(Connection::new(
+      stream,
+      address.port(),
+      None
+    )));
     for xid in [1u32, 2] {
       assert!(
         server.as_mut().poll(&mut context).is_pending(),

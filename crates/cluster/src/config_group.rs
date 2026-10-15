@@ -45,7 +45,7 @@
 
 use std::mem::size_of;
 
-use slates_db::register::{DomainId, HostId, Quorum, RegionalConfiguration};
+use slates_db::register::{DomainId, HostId, ObjectId, Quorum, RegionalConfiguration};
 
 use crate::fold::{Fold, Snapshotted};
 use crate::raft::{
@@ -68,7 +68,7 @@ impl Snapshotted for RegionalConfiguration {
 /// A configuration change as it rides the Raft log — the command a committed [`LogEntry`](crate::raft::LogEntry)
 /// carries, decoded and applied to the [`Configuration`] in commit order so every voter reaches the same
 /// configuration. The Raft core treats it as opaque bytes; this is the config group's interpretation.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ConfigCommand {
   /// Admit a member to the neighbourhood, with the failure domain the operator declared for its node when
   /// there is one (task #22: the domains a region formed with are keyed by the member ids of that formation,
@@ -107,6 +107,27 @@ pub enum ConfigCommand {
     /// The confirming survivor.
     successor: HostId,
   },
+  /// The leader assigns a promoted object's adoption after its phase one (`docs/wip/mirroring.md` decision 4):
+  /// the successor and the newest head and catalog records it adopts
+  /// ([`RegionalConfiguration::assign_adoption`]).
+  MirrorAdopt {
+    /// The promoted object.
+    object: ObjectId,
+    /// The member that adopts it.
+    successor: HostId,
+    /// The adopted head record, encoded.
+    head: Vec<u8>,
+    /// The adopted catalog record, encoded.
+    catalog: Vec<u8>,
+  },
+  /// A successor reports it serves an adopted object, and the assignment is dropped
+  /// ([`RegionalConfiguration::adopted`]).
+  MirrorAdopted {
+    /// The object adopted.
+    object: ObjectId,
+    /// The reporting successor.
+    successor: HostId,
+  },
 }
 
 /// Format: a config command is a one-byte tag followed by its little-endian fields; these are the tags.
@@ -117,6 +138,10 @@ const COMMAND_TAKE_OVER: u8 = 2;
 const COMMAND_SETTLE: u8 = 3;
 /// Format: the tag of a survivor's takeover confirmation ([`ConfigCommand::Confirm`]).
 const COMMAND_CONFIRM: u8 = 4;
+/// Format: the tag of a promoted object's adoption ([`ConfigCommand::MirrorAdopt`]).
+const COMMAND_MIRROR_ADOPT: u8 = 5;
+/// Format: the tag of a successor's report that it serves an adopted object ([`ConfigCommand::MirrorAdopted`]).
+const COMMAND_MIRROR_ADOPTED: u8 = 6;
 /// Format: an admission's domain is a presence byte — absent (unique-per-host) or present, in which case
 /// the domain id follows as a little-endian u64.
 const DOMAIN_ABSENT: u8 = 0;
@@ -160,6 +185,29 @@ impl ConfigCommand {
         out.extend_from_slice(&departed.0.to_le_bytes());
         out.extend_from_slice(&successor.0.to_le_bytes());
       }
+      ConfigCommand::MirrorAdopt {
+        object,
+        successor,
+        head,
+        catalog,
+      } => {
+        out.push(COMMAND_MIRROR_ADOPT);
+        out.extend_from_slice(&object.0);
+        out.extend_from_slice(&successor.0.to_le_bytes());
+        for record in [head, catalog] {
+          out.extend_from_slice(
+            &u64::try_from(record.len())
+              .unwrap_or(u64::MAX)
+              .to_le_bytes(),
+          );
+          out.extend_from_slice(record);
+        }
+      }
+      ConfigCommand::MirrorAdopted { object, successor } => {
+        out.push(COMMAND_MIRROR_ADOPTED);
+        out.extend_from_slice(&object.0);
+        out.extend_from_slice(&successor.0.to_le_bytes());
+      }
     }
     out
   }
@@ -198,6 +246,7 @@ impl ConfigCommand {
           successor,
         })
       }
+      COMMAND_MIRROR_ADOPT | COMMAND_MIRROR_ADOPTED => decode_mirror(tag, rest),
       _ => None,
     }
   }
@@ -211,6 +260,49 @@ fn take_host(bytes: &[u8]) -> Option<(HostId, &[u8])> {
 
 /// Reads a little-endian u64 at the front of `bytes` — a host id, or an admission's domain id — returning
 /// it and the remainder, or `None` if fewer than eight bytes remain.
+/// Decodes a mirror adoption command (`COMMAND_MIRROR_ADOPT`, `COMMAND_MIRROR_ADOPTED`) after its tag, or `None` for
+/// malformed bytes or trailing ones.
+fn decode_mirror(tag: u8, rest: &[u8]) -> Option<ConfigCommand> {
+  let (object, rest) = take_object(rest)?;
+  let (successor, rest) = take_host(rest)?;
+  if tag == COMMAND_MIRROR_ADOPTED {
+    return rest
+      .is_empty()
+      .then_some(ConfigCommand::MirrorAdopted { object, successor });
+  }
+  let (head, rest) = take_record_bytes(rest)?;
+  let (catalog, rest) = take_record_bytes(rest)?;
+  rest.is_empty().then_some(ConfigCommand::MirrorAdopt {
+    object,
+    successor,
+    head,
+    catalog,
+  })
+}
+
+/// Reads an object id at the front of `bytes`, or `None` if fewer bytes remain.
+fn take_object(bytes: &[u8]) -> Option<(ObjectId, &[u8])> {
+  if bytes.len() < slates_db::register::OBJECT_BYTES {
+    return None;
+  }
+  let (head, rest) = bytes.split_at(slates_db::register::OBJECT_BYTES);
+  let mut id = [0u8; slates_db::register::OBJECT_BYTES];
+  id.copy_from_slice(head);
+  Some((ObjectId(id), rest))
+}
+
+/// Reads a length-prefixed record at the front of `bytes` (a little-endian u64 length, then that many bytes), or
+/// `None` when the length overruns what arrived.
+fn take_record_bytes(bytes: &[u8]) -> Option<(Vec<u8>, &[u8])> {
+  let (length, rest) = take_word(bytes)?;
+  let length = usize::try_from(length).ok()?;
+  if rest.len() < length {
+    return None;
+  }
+  let (record, rest) = rest.split_at(length);
+  Some((record.to_vec(), rest))
+}
+
 fn take_word(bytes: &[u8]) -> Option<(u64, &[u8])> {
   if bytes.len() < size_of::<u64>() {
     return None;
@@ -300,6 +392,20 @@ pub enum Reconfiguration {
     /// The retired host.
     departed: HostId,
     /// The confirming survivor.
+    successor: HostId,
+  },
+  /// Assign a promoted object's adoption ([`ConfigCommand::MirrorAdopt`]).
+  MirrorAdopt {
+    /// The promoted object.
+    object: ObjectId,
+    /// The adoption.
+    adoption: slates_db::register::Adoption,
+  },
+  /// Record a successor's report that it serves an adopted object ([`ConfigCommand::MirrorAdopted`]).
+  MirrorAdopted {
+    /// The object.
+    object: ObjectId,
+    /// The reporting successor.
     successor: HostId,
   },
 }
@@ -902,6 +1008,22 @@ impl RegionalCouncil {
         },
         self.fold.state().owes_confirmation(departed, successor),
       ),
+      Reconfiguration::MirrorAdopt { object, adoption } => {
+        let would = self.fold.state().assigns(object, &adoption);
+        (
+          ConfigCommand::MirrorAdopt {
+            object,
+            successor: adoption.successor,
+            head: adoption.head,
+            catalog: adoption.catalog,
+          },
+          would,
+        )
+      }
+      Reconfiguration::MirrorAdopted { object, successor } => (
+        ConfigCommand::MirrorAdopted { object, successor },
+        self.fold.state().owes_adopted(object, successor),
+      ),
     };
     if !would_change {
       return false;
@@ -946,6 +1068,9 @@ impl RegionalCouncil {
         departed,
         successor,
       },
+      ConfigCommand::MirrorAdopted { object, successor } if successor == reporter => {
+        Reconfiguration::MirrorAdopted { object, successor }
+      }
       _ => return ReportOutcome::Refused,
     };
     if !self.is_leader() || !self.caught_up() {
@@ -1169,6 +1294,24 @@ fn apply_command(configuration: &mut RegionalConfiguration, command: &[u8], scat
     }) => {
       configuration.confirm(departed, successor);
     }
+    Some(ConfigCommand::MirrorAdopt {
+      object,
+      successor,
+      head,
+      catalog,
+    }) => {
+      configuration.assign_adoption(
+        object,
+        slates_db::register::Adoption {
+          successor,
+          head,
+          catalog,
+        },
+      );
+    }
+    Some(ConfigCommand::MirrorAdopted { object, successor }) => {
+      configuration.adopted(object, successor);
+    }
     None => {}
   }
 }
@@ -1298,18 +1441,31 @@ mod tests {
         departed: OWNER,
         successor: B,
       },
+      ConfigCommand::MirrorAdopt {
+        object: ObjectId::new(OWNER, 9),
+        successor: A,
+        head: vec![1, 2, 3],
+        catalog: vec![],
+      },
+      ConfigCommand::MirrorAdopted {
+        object: ObjectId::new(OWNER, 9),
+        successor: A,
+      },
     ];
     for command in commands {
       assert_eq!(
         ConfigCommand::decode(&command.encode()),
-        Some(command),
+        Some(command.clone()),
         "round-trip is identity"
       );
       let mut trailing = command.encode();
       trailing.push(0);
       if matches!(
         command,
-        ConfigCommand::Settle { .. } | ConfigCommand::Confirm { .. }
+        ConfigCommand::Settle { .. }
+          | ConfigCommand::Confirm { .. }
+          | ConfigCommand::MirrorAdopt { .. }
+          | ConfigCommand::MirrorAdopted { .. }
       ) {
         assert_eq!(
           ConfigCommand::decode(&trailing),
@@ -1378,7 +1534,7 @@ mod tests {
       .unwrap();
     let leader = groups.get_mut(&OWNER).unwrap();
     assert_eq!(
-      leader.report(other, settle),
+      leader.report(other, settle.clone()),
       ReportOutcome::Refused,
       "no member reports for another"
     );
@@ -1400,14 +1556,20 @@ mod tests {
       generation,
     };
     let leader = groups.get_mut(&OWNER).unwrap();
-    assert_eq!(leader.report(moved, settle), ReportOutcome::Proposed);
     assert_eq!(
-      leader.report(moved, settle),
+      leader.report(moved, settle.clone()),
+      ReportOutcome::Proposed
+    );
+    assert_eq!(
+      leader.report(moved, settle.clone()),
       ReportOutcome::NotLeader,
       "while its proposal is in flight the leader is not caught up, so it is not appended twice"
     );
     let follower = groups.get_mut(&A).unwrap();
-    assert_eq!(follower.report(moved, settle), ReportOutcome::NotLeader);
+    assert_eq!(
+      follower.report(moved, settle.clone()),
+      ReportOutcome::NotLeader
+    );
     replicate_round(&mut groups, OWNER, &[OWNER, A, B]);
     replicate_round(&mut groups, OWNER, &[OWNER, A, B]);
     for voter in [OWNER, A, B] {
@@ -1418,7 +1580,10 @@ mod tests {
       );
     }
     assert_eq!(
-      groups.get_mut(&OWNER).unwrap().report(moved, settle),
+      groups
+        .get_mut(&OWNER)
+        .unwrap()
+        .report(moved, settle.clone()),
       ReportOutcome::Unchanged,
       "a report already recorded changes nothing"
     );
@@ -2331,6 +2496,12 @@ mod tests {
         successor,
       } => {
         oracle.confirm(*departed, *successor);
+      }
+      Reconfiguration::MirrorAdopt { object, adoption } => {
+        oracle.assign_adoption(*object, adoption.clone());
+      }
+      Reconfiguration::MirrorAdopted { object, successor } => {
+        oracle.adopted(*object, *successor);
       }
     }
   }

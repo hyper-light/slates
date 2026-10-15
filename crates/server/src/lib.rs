@@ -42,6 +42,8 @@ pub mod discovery;
 mod retention;
 // Name resolution for a peer named by DNS in the manifest (the Kubernetes deployment): an asynchronous
 // A-record client over the runtime's UDP, resolved at every dial so a rescheduled peer is found.
+#[cfg(unix)]
+mod anchor_hold;
 pub mod dns;
 pub mod doorbell;
 pub mod error;
@@ -58,6 +60,7 @@ pub mod lease;
 mod lease_wait;
 mod member_task;
 pub mod merge_service;
+mod mirror;
 #[cfg(target_os = "linux")]
 mod write_log;
 // The NFS mount transport is the macOS/Linux mount path (Windows mounts through WinFsp); it rides the
@@ -71,6 +74,8 @@ mod listing;
 mod lock_ledger;
 #[cfg(unix)]
 pub mod nfs;
+#[cfg(unix)]
+mod nfs_replay;
 #[cfg(unix)]
 mod nfs_state;
 #[cfg(unix)]
@@ -102,7 +107,9 @@ pub mod virtiofs;
 pub mod xshard;
 
 pub use config::{BootFault, BootFaultKind, DaemonConfig, DurabilityBound, FleetMembership};
-pub use daemon::{Daemon, DrainReport, LeadershipHandoff, SegmentSource, SessionHold};
+pub use daemon::{
+  Daemon, DrainReport, HeldRecordView, LeadershipHandoff, SegmentSource, SessionHold,
+};
 pub use deploy::{DeployError, FleetManifest, FleetNodeEntry, FleetPlan, NodeAddress};
 pub use dns::Resolver;
 pub use fleet::{

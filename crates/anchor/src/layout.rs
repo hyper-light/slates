@@ -16,6 +16,10 @@ pub const POOL_WORD_BYTES: usize = 8;
 /// Format: the pool extents a partition's slice may hold (A-98): its arena range is cut into power-of-two parts, at
 /// most one per bit of its length in units, which a 64-bit count bounds. Extent `partition × this + part`.
 pub const POOL_EXTENTS_PER_PARTITION: usize = 64;
+/// Format: the snapshot slots a partition holds (the committed one and the one being written).
+const SNAPSHOT_SLOTS: usize = 2;
+/// Format: the node-wide consensus publications (regional and root).
+const CONSENSUS_PUBLICATIONS: usize = 2;
 /// Format: the header's size: magic (4), version (4), identity (32), generation (8), total
 /// length (8), then the encoded geometry (64), padded to two cache lines.
 pub const HEADER_BYTES: usize = 128;
@@ -194,6 +198,29 @@ pub enum RegionKind {
   Pool,
 }
 
+/// Where each run of regions starts and one region's length in it, `(start, len)` ([`Geometry::region`]).
+struct Runs {
+  supervision: (u64, u64),
+  profile: (u64, u64),
+  logs: (u64, u64),
+  snapshots: (u64, u64),
+  consensus: (u64, u64),
+  audit: (u64, u64),
+  landings: (u64, u64),
+  pool: (u64, u64),
+}
+
+/// The `index`th region of a run, `(offset, len)`.
+fn nth((start, len): (u64, u64), index: usize) -> Option<(u64, u64)> {
+  let index = u64::try_from(index).ok()?;
+  Some((start.checked_add(index.checked_mul(len)?)?, len))
+}
+
+/// `index` when it is below `count`.
+fn bounded(index: usize, count: usize) -> Option<usize> {
+  (index < count).then_some(index)
+}
+
 /// Where a region sits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RegionSpec {
@@ -234,25 +261,129 @@ impl Geometry {
       push(RegionKind::Snapshot(p, 0), self.snapshot_bytes);
       push(RegionKind::Snapshot(p, 1), self.snapshot_bytes);
     }
-    // Derived: two configuration logs (regional and root) plus one application snapshot's
-    // metadata budget. Two slots preserve the previous publication during a process crash.
-    let consensus_bytes = self
-      .log_bytes
-      .saturating_mul(2)
-      .saturating_add(self.snapshot_bytes);
-    push(RegionKind::Consensus(0), consensus_bytes);
-    push(RegionKind::Consensus(1), consensus_bytes);
+    push(RegionKind::Consensus(0), self.consensus_bytes());
+    push(RegionKind::Consensus(1), self.consensus_bytes());
     push(RegionKind::Audit, self.audit_bytes);
     for slot in 0..self.landing_slots {
       push(RegionKind::Landing(slot), self.landing_slot_bytes);
     }
-    push(
-      RegionKind::Pool,
-      u64::from(self.partitions)
-        .saturating_mul(u64::try_from(POOL_EXTENTS_PER_PARTITION).unwrap_or(u64::MAX))
-        .saturating_mul(u64::try_from(POOL_WORD_BYTES).unwrap_or(u64::MAX)),
-    );
+    push(RegionKind::Pool, self.pool_bytes());
     out
+  }
+
+  /// Derived: one consensus publication's bytes: two configuration logs (regional and root) plus one application
+  /// snapshot's metadata budget. Two publications preserve the previous one during a process crash.
+  fn consensus_bytes(&self) -> u64 {
+    self
+      .log_bytes
+      .saturating_mul(2)
+      .saturating_add(self.snapshot_bytes)
+  }
+
+  /// The pool region's bytes (A-98): [`POOL_EXTENTS_PER_PARTITION`] owner words a partition.
+  fn pool_bytes(&self) -> u64 {
+    u64::from(self.partitions)
+      .saturating_mul(u64::try_from(POOL_EXTENTS_PER_PARTITION).unwrap_or(u64::MAX))
+      .saturating_mul(u64::try_from(POOL_WORD_BYTES).unwrap_or(u64::MAX))
+  }
+
+  /// The region of `kind`, by arithmetic over the layout, or `None` for a kind this geometry has no region of. The
+  /// order is supervision, profile, the partitions' logs, their snapshot slot pairs, the consensus publications, the
+  /// audit ring, the landing slots, then the pool; each region's offset is the aligned lengths before it.
+  ///
+  /// One lookup without building the list: a segment reads its words through it on every log append and every pool
+  /// owner word. Before 2026-10-10 each read built the whole list to find one region: 189–340 ns a pool owner word at
+  /// 5–18 partitions, 391 µs for one scan of an 18-partition pool's owner words (BENCHMARKS).
+  pub fn region(&self, kind: RegionKind) -> Option<RegionSpec> {
+    let runs = self.runs()?;
+    let (offset, len) = match kind {
+      RegionKind::Supervision => runs.supervision,
+      RegionKind::Profile => runs.profile,
+      RegionKind::Log(p) => nth(runs.logs, self.partition_index(p, 0, 1)?)?,
+      RegionKind::Snapshot(p, slot) => nth(
+        runs.snapshots,
+        self.partition_index(p, usize::from(slot), SNAPSHOT_SLOTS)?,
+      )?,
+      RegionKind::Consensus(c) => nth(
+        runs.consensus,
+        bounded(usize::from(c), CONSENSUS_PUBLICATIONS)?,
+      )?,
+      RegionKind::Audit => runs.audit,
+      RegionKind::Landing(slot) => nth(
+        runs.landings,
+        bounded(
+          usize::try_from(slot).ok()?,
+          usize::try_from(self.landing_slots).ok()?,
+        )?,
+      )?,
+      RegionKind::Pool => runs.pool,
+    };
+    Some(RegionSpec { kind, offset, len })
+  }
+
+  /// Where each run of regions starts, and one region's length in it, in layout order ([`Geometry::region`]).
+  fn runs(&self) -> Option<Runs> {
+    let partitions = u64::from(self.partitions);
+    let run = |start: u64, len: u64| (start, len);
+    let supervision = run(
+      self.aligned(u64::try_from(HEADER_BYTES).ok()?),
+      self.aligned(self.page),
+    );
+    let profile = run(
+      supervision.0.checked_add(supervision.1)?,
+      self.aligned(self.profile_bytes),
+    );
+    let logs = run(
+      profile.0.checked_add(profile.1)?,
+      self.aligned(self.log_bytes),
+    );
+    let snapshots = run(
+      logs.0.checked_add(partitions.checked_mul(logs.1)?)?,
+      self.aligned(self.snapshot_bytes),
+    );
+    let snapshot_slots = u64::try_from(SNAPSHOT_SLOTS).ok()?;
+    let consensus = run(
+      snapshots.0.checked_add(
+        partitions
+          .checked_mul(snapshot_slots)?
+          .checked_mul(snapshots.1)?,
+      )?,
+      self.aligned(self.consensus_bytes()),
+    );
+    let publications = u64::try_from(CONSENSUS_PUBLICATIONS).ok()?;
+    let audit = run(
+      consensus
+        .0
+        .checked_add(publications.checked_mul(consensus.1)?)?,
+      self.aligned(self.audit_bytes),
+    );
+    let landings = run(
+      audit.0.checked_add(audit.1)?,
+      self.aligned(self.landing_slot_bytes),
+    );
+    let pool = run(
+      landings
+        .0
+        .checked_add(u64::from(self.landing_slots).checked_mul(landings.1)?)?,
+      self.aligned(self.pool_bytes()),
+    );
+    Some(Runs {
+      supervision,
+      profile,
+      logs,
+      snapshots,
+      consensus,
+      audit,
+      landings,
+      pool,
+    })
+  }
+
+  /// The index of partition `p`'s region `slot` of `per` in a run laid out partition by partition, or `None` past the
+  /// geometry's partitions or `per`.
+  fn partition_index(&self, p: u16, slot: usize, per: usize) -> Option<usize> {
+    let p = bounded(usize::from(p), usize::from(self.partitions))?;
+    p.checked_mul(per)?.checked_add(bounded(slot, per)?)
   }
 
   /// The segment's total length.
@@ -261,11 +392,6 @@ impl Geometry {
       self.aligned(u64::try_from(HEADER_BYTES).unwrap_or(u64::MAX)),
       |r| r.offset.saturating_add(r.len),
     )
-  }
-
-  /// The region of a kind.
-  pub fn region(&self, kind: RegionKind) -> Option<RegionSpec> {
-    self.regions().into_iter().find(|r| r.kind == kind)
   }
 
   /// The fixed little-endian encoding kept in the header.
@@ -330,6 +456,43 @@ fn word(bytes: &[u8], at: usize) -> u64 {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  /// §4.8 (2026-10-10): the arithmetic lookup finds each region exactly where the layout lays it. Do: for geometries
+  /// of several shapes, look up every region the layout lists by its kind, then kinds past the geometry. Expect each
+  /// equal to the layout's entry (offset and length), and `None` for a log, snapshot slot, consensus publication or
+  /// landing slot the geometry does not have.
+  #[test]
+  fn every_region_is_found_at_its_place_in_the_layout_and_no_other() {
+    for (partitions, landing_slots) in [(1u16, 0u32), (2, 2), (5, 8), (18, 3)] {
+      let g = Geometry {
+        partitions,
+        page: 4096,
+        profile_bytes: 8192,
+        log_bytes: 1 << 16,
+        snapshot_bytes: 8192,
+        audit_bytes: 4096,
+        landing_slots,
+        landing_slot_bytes: 4096,
+      };
+      for region in g.regions() {
+        assert_eq!(
+          g.region(region.kind),
+          Some(region),
+          "{:?} in {g:?}",
+          region.kind
+        );
+      }
+      for missing in [
+        RegionKind::Log(partitions),
+        RegionKind::Snapshot(partitions, 0),
+        RegionKind::Snapshot(0, 2),
+        RegionKind::Consensus(2),
+        RegionKind::Landing(landing_slots),
+      ] {
+        assert_eq!(g.region(missing), None, "{missing:?} in {g:?}");
+      }
+    }
+  }
 
   #[test]
   fn regions_are_page_aligned_and_disjoint_and_the_geometry_round_trips() {

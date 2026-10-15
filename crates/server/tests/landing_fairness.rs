@@ -101,6 +101,34 @@ fn write_files(daemon: &Daemon, volume: &str, count: usize) {
   }
 }
 
+/// The barriers the daemon ran on threads of their own (A-132's counter).
+fn barriers_away(daemon: &Daemon) -> u64 {
+  daemon
+    .refusals_on_every_shard()
+    .unwrap()
+    .get("landing.barriers_away")
+    .copied()
+    .unwrap_or(0)
+}
+
+/// The landing is done with every file written, it took barriers, and every one ran on a thread of its own, none on
+/// the shard (A-132): `away` barriers counted by the daemon.
+fn assert_landed_with_every_barrier_away(landed: &Result<Landing, ClientError>, away: u64) {
+  let Ok(Landing::Landed(outcome)) = landed else {
+    panic!("the granted landing: {landed:?}");
+  };
+  assert_eq!(outcome.state, "done");
+  assert_eq!(outcome.written, u64::try_from(FILES).unwrap());
+  assert!(
+    outcome.barriers > 0,
+    "the landing took barriers: {outcome:?}"
+  );
+  assert_eq!(
+    away, outcome.barriers,
+    "every barrier ran on a thread of its own (A-132)"
+  );
+}
+
 /// Prints each probe kind's quantiles inside the landing (`began`, lasting `took`) beside its baseline, asserts
 /// every kind was answered more than once while the landing ran, and returns the longest probe inside it.
 fn report_probes(
@@ -146,8 +174,10 @@ fn report_probes(
 /// destroy) and a write lease taken and given back, in turn. Expect: the landing is done with every file
 /// written and ran in many slices; every kind of probe was answered while it ran; no probe waited for the
 /// whole landing; no slice ran past its budget by more than its own last unit (the daemon counts any that
-/// did); and the run publishes, per probe kind and for the slices, p50/p99/p999/max, with the shard's
-/// longest step — the recorded lane (`docs/wip/BENCHMARKS.md`, "The landing's percentile lane").
+/// did); every barrier the landing took ran on a thread of its own, never in a slice (A-132: the daemon's count of
+/// barriers away equals the landing's barriers, and there were some); and the run publishes, per probe kind and for
+/// the slices, p50/p99/p999/max, with the shard's longest step — the recorded lane (`docs/wip/BENCHMARKS.md`, "The
+/// landing's percentile lane").
 #[test]
 fn a_large_landing_leaves_its_shard_serving_between_its_slices() {
   let profile = common::machine_profile();
@@ -199,6 +229,7 @@ fn a_large_landing_leaves_its_shard_serving_between_its_slices() {
   }
   let (began, took, landed) = landing.join().unwrap();
   let slices = daemon.landing_slices().unwrap();
+  let away = barriers_away(&daemon);
   let longest_step = daemon
     .shard_pulses()
     .iter()
@@ -208,14 +239,10 @@ fn a_large_landing_leaves_its_shard_serving_between_its_slices() {
   drop(prober);
   daemon.stop();
 
-  let Ok(Landing::Landed(outcome)) = landed else {
-    panic!("the granted landing: {landed:?}");
-  };
-  assert_eq!(outcome.state, "done");
-  assert_eq!(outcome.written, u64::try_from(FILES).unwrap());
+  assert_landed_with_every_barrier_away(&landed, away);
   eprintln!(
     "landing of {FILES} files: {took:?} in {} slices of a {} ns budget: p50 {} ns, p99 {} ns, p999 {} ns, \
-     max {} ns; {} past budget; the shard's longest step {longest_step} ns",
+     max {} ns; {} past budget; {away} barriers away; the shard's longest step {longest_step} ns",
     slices.slices,
     slices.budget_ns,
     slices.p50_ns,
@@ -487,11 +514,13 @@ fn drive(client: &mut Client, driver: &mut Driver, tickets: &[Ticket]) -> Ended 
 }
 
 /// The async driver's patient path (the sibling of AUD-29-25 fixed 2026-10-01: a client answered `Stalled`
-/// to a landing still at work). Do: land two volumes, each sized by a calibration landing to last twice the reply deadline, under grants through one async
-/// driver, driven by an event loop as an SDK drives it — one call submitted patient (`submit_patient`, as both
-/// SDKs' `land` is), the other plain — both landings outlasting the reply deadline. Expect: the plain call
-/// ends `Stalled` at its deadline (the control: the landings did outlast it, so the patient flag is what this
-/// tests), and the patient call is waited for past it and ends with its landing done and every file written.
+/// to a landing still at work). Do: land two volumes, each sized by a calibration landing to last twice the reply
+/// deadline, under grants through one async driver, driven by an event loop as an SDK drives it — one call submitted
+/// patient (`submit_patient`, as both SDKs' `land` is), the other plain — both landings outlasting the reply deadline.
+/// Expect: both are waited for past it and end with their landing done and every file written. A granted landing
+/// defers its reply (`defers_reply`), and since 2026-10-07 the driver derives patience from the request
+/// (`Client::defers`), as the synchronous call does, so a plain submission of a deferring verb is waited for too;
+/// until then the plain call ended `Stalled` at its deadline, the control this test used to keep.
 #[test]
 fn an_async_patient_landing_outlasting_the_reply_deadline_is_waited_for() {
   let profile = common::machine_profile();
@@ -530,32 +559,34 @@ fn an_async_patient_landing_outlasting_the_reply_deadline_is_waited_for() {
     eprintln!(
       "{files} files; reply deadline {reply:?}; plain call ended at {impatient_at:?}: {impatient_end:?}; patient call at {patient_at:?}"
     );
-    if matches!(impatient_end, Err(ClientError::Stalled { .. })) {
+    if impatient_at > reply && patient_at > reply {
       break (impatient_at, impatient_end, patient_at, patient_end);
     }
     files = files.saturating_mul(2);
     if files > MOST_FILES {
       daemon.stop();
       eprintln!(
-        "SKIP: no landing of up to {MOST_FILES} files outlasted the {reply:?} reply deadline here"
+        "SKIP: no pair of landings of up to {MOST_FILES} files both outlasted the {reply:?} reply deadline here"
       );
       return;
     }
   };
   daemon.stop();
   assert!(
-    matches!(impatient_end, Err(ClientError::Stalled { .. })),
-    "the control: a plain call to a landing outlasting the deadline stalls ({impatient_at:?}): {impatient_end:?}"
+    patient_at > reply && impatient_at > reply,
+    "both landings outlasted the reply deadline (patient {patient_at:?}, plain {impatient_at:?})"
   );
-  assert!(
-    patient_at > reply,
-    "the patient landing outlasted the reply deadline ({patient_at:?})"
-  );
-  let Ok(Some(Landing::Landed(outcome))) = patient_end else {
-    panic!("the patient landing: {patient_end:?}");
-  };
-  assert_eq!(outcome.state, "done");
-  assert_eq!(outcome.written, u64::try_from(files).unwrap());
+  for (which, end) in [("patient", patient_end), ("plain", impatient_end)] {
+    let Ok(Some(Landing::Landed(outcome))) = end else {
+      panic!("the {which} landing is waited for and done: {end:?}");
+    };
+    assert_eq!(outcome.state, "done", "the {which} landing");
+    assert_eq!(
+      outcome.written,
+      u64::try_from(files).unwrap(),
+      "the {which} landing"
+    );
+  }
 }
 
 /// What one patient-and-plain scenario ended with: the plain call's end and when, then the patient call's.

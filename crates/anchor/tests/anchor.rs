@@ -319,11 +319,11 @@ fn the_supervised_child_inherits_the_held_nfs_listener() {
         #[allow(clippy::disallowed_methods)]
         std::thread::sleep(Duration::from_micros(POLL_US));
       }
-      Step::Restarted { exit_code, .. } | Step::CrashLoop { exit_code } => {
+      Step::Restarted { exit_code, .. } | Step::CrashLoop { exit_code, .. } => {
         outcome = Some(exit_code);
         break;
       }
-      Step::Stopped => break,
+      Step::Stopped | Step::BackingOff { .. } => break,
     }
   }
   supervisor.stop().ok();
@@ -364,7 +364,8 @@ fn drive_until_crash_loop(
         assert_eq!(exit_code, Some(EXIT));
         restarts = in_window;
       }
-      Step::CrashLoop { exit_code } => return (restarts, saw_heartbeat, Some(exit_code)),
+      Step::CrashLoop { exit_code, .. } => return (restarts, saw_heartbeat, Some(exit_code)),
+      Step::BackingOff { .. } => panic!("backing off before a crash loop was reported"),
       Step::Stopped => panic!("stopped without being asked"),
     }
   }
@@ -428,6 +429,83 @@ fn a_crashing_daemon_is_restarted_until_the_derived_bound_and_the_segment_says_s
     "the child's heartbeats were seen through the segment"
   );
   assert_crash_loop_recorded(&supervisor);
+}
+
+/// A-119, supervision never gives up: do supervise a child that beats and exits, under a short window that holds one
+/// restart. Expect the crash loop reported with a restart scheduled a window away, the supervisor backing off until
+/// then (the segment saying `CrashLoop`), the daemon started again once the window passed (the segment `Running`),
+/// and the next crash loop's backoff twice the first. Before A-119 the first crash loop ended supervision for good,
+/// and every hard NFS mount on the daemon hung (2026-10-08, `realworld_chaos.sh` on a loaded host).
+#[test]
+fn a_crash_loop_is_restarted_after_a_doubling_backoff_never_given_up() {
+  /// Shape: the window and the backoff it starts: short, so the test waits two of them.
+  const WINDOW_NS: u64 = 300_000_000;
+  let segment = AnchorSegment::create(
+    &unique_name("slates-anchor-test-backoff"),
+    &identity(),
+    geometry(),
+  )
+  .unwrap();
+  let exe = std::env::current_exe()
+    .unwrap()
+    .to_string_lossy()
+    .into_owned();
+  let args = vec![
+    "--ignored".to_owned(),
+    "--exact".to_owned(),
+    "supervised_child".to_owned(),
+    "--nocapture".to_owned(),
+  ];
+  let policy = RestartPolicy {
+    window_ns: WINDOW_NS,
+    max_restarts: 1,
+  };
+  let mut supervisor = Supervisor::new(segment, &exe, &args, policy);
+  // The child beats and exits, as the bound's own test's does; the same values, since the variables are the
+  // process's and that test's children read them in parallel (and neither test removes them for the same reason).
+  // SAFETY: both tests set the same values before spawning, and the children only read them.
+  unsafe {
+    std::env::set_var(CHILD_BEATS, BEATS.to_string());
+    std::env::set_var(CHILD_EXIT, EXIT.to_string());
+  }
+  let clock = Instant::now();
+  supervisor.start(now_ns(clock)).unwrap();
+  let mut backoffs = Vec::new();
+  let mut backed_off_in_crash_loop = false;
+  let mut restarted_after_backoff = false;
+  let deadline = Duration::from_millis(CHILD_WAIT_MS);
+  while clock.elapsed() < deadline && backoffs.len() < 2 {
+    match supervisor.step(now_ns(clock)).unwrap() {
+      Step::CrashLoop { retry_in_ns, .. } => backoffs.push(retry_in_ns),
+      Step::BackingOff { .. } => {
+        backed_off_in_crash_loop |=
+          supervisor.segment().supervision().unwrap().state() == State::CrashLoop;
+      }
+      Step::Restarted { .. } if !backoffs.is_empty() => {
+        restarted_after_backoff |=
+          supervisor.segment().supervision().unwrap().state() == State::Running;
+      }
+      Step::Running | Step::Restarted { .. } => {}
+      Step::Stopped => panic!("stopped without being asked"),
+    }
+    // The test harness paces the poll; shipped code parks on its driver (D-9).
+    #[allow(clippy::disallowed_methods)]
+    std::thread::sleep(Duration::from_micros(POLL_US));
+  }
+  supervisor.stop().ok();
+  assert!(
+    backed_off_in_crash_loop,
+    "the backoff was recorded as a crash loop"
+  );
+  assert!(
+    restarted_after_backoff,
+    "the daemon was started again after the backoff"
+  );
+  assert_eq!(
+    backoffs,
+    [WINDOW_NS, 2 * WINDOW_NS],
+    "the first backoff is the window, the next twice it"
+  );
 }
 
 /// The segment records the crash loop for the health plane, and a stopped daemon is not
@@ -817,25 +895,25 @@ fn device_child() {
     return;
   }
   let handed =
-    std::env::var(slates_anchor::devices::ENV_DEVICES).expect("the anchor handed the channel over");
-  let inherited = slates_anchor::devices::parse_env(&handed).unwrap();
+    std::env::var(slates_anchor::held::ENV_DEVICES).expect("the anchor handed the channel over");
+  let inherited = slates_anchor::held::parse_env(&handed).unwrap();
   // SAFETY: the anchor made the channel's daemon end inheritable and named its number in the environment;
   // this process adopts it once, here, so the `OwnedFd` is its single owner.
   let channel = unsafe { OwnedFd::from_raw_fd(inherited.channel) };
   let Some(device) = inherited.devices.first() else {
     let (reader, writer) = rustix::pipe::pipe().unwrap();
     rustix::io::write(&writer, DEVICE_MARK).unwrap();
-    slates_anchor::devices::send(
+    slates_anchor::held::send(
       channel.as_fd(),
-      &slates_anchor::devices::Outgoing::Hold {
+      &slates_anchor::held::Outgoing::Hold {
         attachment: DEVICE_ATTACHMENT,
         device: reader.as_fd(),
       },
     )
     .unwrap();
-    slates_anchor::devices::send(
+    slates_anchor::held::send(
       channel.as_fd(),
-      &slates_anchor::devices::Outgoing::Session {
+      &slates_anchor::held::Outgoing::Session {
         attachment: DEVICE_ATTACHMENT,
         session: &DEVICE_SESSION,
       },
@@ -883,7 +961,7 @@ fn a_device_a_daemon_sent_is_held_across_its_restart_and_handed_to_its_successor
   };
   let mut supervisor = Supervisor::new(segment, &exe, &args, policy);
   // Shape: room for this test's one device.
-  supervisor.hold_devices(4).unwrap();
+  supervisor.hold_descriptors(4, 4).unwrap();
   // SAFETY: the test is single-threaded here; the role is chosen by the child's args, so a parallel test's child
   // ignores this variable.
   unsafe {
@@ -907,10 +985,11 @@ fn a_device_a_daemon_sent_is_held_across_its_restart_and_handed_to_its_successor
         }
         exits.push(exit_code);
       }
-      Step::CrashLoop { exit_code } => {
+      Step::CrashLoop { exit_code, .. } => {
         exits.push(exit_code);
         break;
       }
+      Step::BackingOff { .. } => break,
       Step::Stopped => break,
     }
   }

@@ -41,6 +41,11 @@ pub const ENV_NFS_LISTENER: &str = "SLATES_ANCHOR_NFS";
 /// its plan says. Unix, as the NFS listener's descriptor is.
 pub const ENV_FLEET_SERVE: &str = "SLATES_ANCHOR_FLEET_SERVE";
 
+/// Format: the longest a crash loop's backoff grows to: the major timeout of a hard Linux NFS mount over TCP
+/// (`nfs(5)`: `timeo` defaults to 600 deciseconds, 60 s), the cadence a mounted client retries a silent server at, so
+/// a longer wait gains it nothing (A-119).
+pub const RETRY_CAP_NS: u64 = 60_000_000_000;
+
 /// The restart policy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RestartPolicy {
@@ -82,10 +87,19 @@ pub enum Step {
     /// Restarts inside the window after this one.
     in_window: u32,
   },
-  /// The daemon exited and the policy refused another restart.
+  /// The daemon exited faster than it could recover, past the policy's bound: a crash loop, recorded for the health
+  /// plane, with a restart scheduled after a backoff (A-119; supervision never gives up, since every hard mount waits
+  /// on the daemon).
   CrashLoop {
     /// The exit code.
     exit_code: Option<i32>,
+    /// The backoff before the next restart.
+    retry_in_ns: u64,
+  },
+  /// In a crash loop, waiting out the backoff before the restart due at `retry_at_ns`.
+  BackingOff {
+    /// When the restart is due.
+    retry_at_ns: u64,
   },
   /// Nothing to supervise (stopped by the owner).
   Stopped,
@@ -115,7 +129,13 @@ pub struct Supervisor {
   policy: RestartPolicy,
   child: Option<Child>,
   restarts_at_ns: VecDeque<u64>,
-  crash_loop: bool,
+  /// When a crash loop's backed-off restart is due (A-119); `None` outside a crash loop.
+  retry_at_ns: Option<u64>,
+  /// The backoff the next crash loop waits: the window, doubled by each crash loop to [`RETRY_CAP_NS`], and back to
+  /// the window once a daemon outlives it.
+  backoff_ns: u64,
+  /// When the current daemon was started.
+  started_at_ns: u64,
   /// Ties the daemon's life to the anchor's where the OS offers it (Windows: a job object
   /// that kills its processes when its last handle closes; Linux: the daemon asks for the
   /// parent-death signal itself; macOS: the daemon watches its parent's id).
@@ -128,6 +148,9 @@ pub struct Supervisor {
   /// WinFsp), and the descriptor type is Unix's.
   #[cfg(unix)]
   nfs_listener: Option<OwnedFd>,
+  /// Environment variables every daemon this supervisor spawns receives: the handoffs of endpoints the owner holds for
+  /// the daemon's successors (the client rendezvous, A-114), whose objects the owner keeps alive itself.
+  environment: Vec<(String, String)>,
   /// A fleet node's two serve sockets (probe, record) and its network export's listener when the plan has
   /// one, if this daemon is a fleet node (§4.8): bound once by the anchor and handed to each daemon it spawns
   /// (via [`ENV_FLEET_SERVE`]), so the manifest's ports are never free between a daemon's stop and its
@@ -135,27 +158,31 @@ pub struct Supervisor {
   #[cfg(unix)]
   fleet_serve: Option<(OwnedFd, OwnedFd, Option<OwnedFd>)>,
   /// The FUSE devices the anchor holds across daemon restarts, and the channel daemons send them on (A-61;
-  /// [`crate::devices`]). Linux only, as FUSE is.
-  #[cfg(target_os = "linux")]
+  /// [`crate::held`]). Linux only, as FUSE is.
+  #[cfg(unix)]
   devices: Option<DeviceHold>,
 }
 
 /// The device channel's two ends, what has been received over it, and the refusals counted.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 #[derive(Debug)]
 struct DeviceHold {
   anchor_end: OwnedFd,
   daemon_end: OwnedFd,
-  held: crate::devices::HeldDevices,
+  held: crate::held::Held,
   refused: u64,
 }
 
 /// The most messages one drain applies per device the bound allows: a hold, its session and its release are
 /// every message an attachment's life sends, so a drain is bounded whatever a daemon sends, and a daemon at
 /// the bound with every attachment changing state at once is drained in one call.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 /// Derived: one hold + one session + one release per attachment.
 const MESSAGES_PER_DEVICE: usize = 3;
+/// The most messages one drain applies per connection the bound allows, as [`MESSAGES_PER_DEVICE`] is for devices.
+#[cfg(unix)]
+/// Derived: one hold + one release per connection (A-113).
+const MESSAGES_PER_CONNECTION: usize = 2;
 
 impl std::fmt::Debug for Supervisor {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -182,43 +209,70 @@ impl Supervisor {
       policy,
       child: None,
       restarts_at_ns: VecDeque::new(),
-      crash_loop: false,
+      retry_at_ns: None,
+      backoff_ns: policy.window_ns,
+      started_at_ns: 0,
       lifetime: lifetime::Tie::new(),
+      environment: Vec::new(),
       #[cfg(unix)]
       nfs_listener: None,
       #[cfg(unix)]
       fleet_serve: None,
-      #[cfg(target_os = "linux")]
+      #[cfg(unix)]
       devices: None,
     }
   }
 
-  /// Holds the FUSE devices daemons send, at most `bound` at once (A-61): opens the device channel, whose daemon
-  /// end every daemon this supervisor spawns inherits, with every device held so far.
-  #[cfg(target_os = "linux")]
-  pub fn hold_devices(&mut self, bound: usize) -> Result<(), crate::devices::DeviceRefusal> {
-    let (anchor_end, daemon_end) = crate::devices::channel()?;
+  /// Holds the FUSE devices (A-61) and NFS loopback connections (A-113) daemons send, at most `device_bound` and
+  /// `connection_bound` at once: opens the hold channel, whose daemon end every daemon this supervisor spawns
+  /// inherits, with every descriptor held so far.
+  #[cfg(unix)]
+  pub fn hold_descriptors(
+    &mut self,
+    device_bound: usize,
+    connection_bound: usize,
+  ) -> Result<(), crate::held::HoldRefusal> {
+    let (anchor_end, daemon_end) = crate::held::channel()?;
     self.devices = Some(DeviceHold {
       anchor_end,
       daemon_end,
-      held: crate::devices::HeldDevices::new(bound),
+      held: crate::held::Held::new(device_bound, connection_bound),
       refused: 0,
     });
     Ok(())
   }
 
+  /// The anchor's end of the hold channel, to wait on: readable when a daemon sent a message, so the owner's loop
+  /// takes a hold at once rather than at its next pause (a daemon's send waits while the channel is full).
+  #[cfg(unix)]
+  pub fn hold_channel(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
+    self
+      .devices
+      .as_ref()
+      .map(|hold| std::os::fd::AsFd::as_fd(&hold.anchor_end))
+  }
+
   /// Applies every device message queued on the channel, up to [`MESSAGES_PER_DEVICE`] per device the bound
   /// allows; returns the messages applied. A refused message (malformed, or a hold past the bound) is counted
   /// ([`Supervisor::device_refusals`]) and its device closed; it never stops the drain or the supervisor.
-  #[cfg(target_os = "linux")]
+  #[cfg(unix)]
   pub fn drain_devices(&mut self) -> usize {
     let Some(hold) = self.devices.as_mut() else {
       return 0;
     };
-    let most = hold.held_bound().saturating_mul(MESSAGES_PER_DEVICE).max(1);
+    let most = hold
+      .held_bound()
+      .saturating_mul(MESSAGES_PER_DEVICE)
+      .saturating_add(
+        hold
+          .held
+          .connection_bound()
+          .saturating_mul(MESSAGES_PER_CONNECTION),
+      )
+      .max(1);
     let mut applied: usize = 0;
     for _ in 0..most {
-      match crate::devices::receive(std::os::fd::AsFd::as_fd(&hold.anchor_end)) {
+      match crate::held::receive(std::os::fd::AsFd::as_fd(&hold.anchor_end)) {
         Ok(None) => break,
         Ok(Some(message)) => match hold.held.apply(message) {
           Ok(()) => applied = applied.saturating_add(1),
@@ -231,13 +285,22 @@ impl Supervisor {
   }
 
   /// The devices held now.
-  #[cfg(target_os = "linux")]
+  #[cfg(unix)]
   pub fn held_devices(&self) -> usize {
     self.devices.as_ref().map_or(0, |hold| hold.held.len())
   }
 
-  /// The device messages refused so far.
-  #[cfg(target_os = "linux")]
+  /// The NFS connections held now (A-113).
+  #[cfg(unix)]
+  pub fn held_connections(&self) -> usize {
+    self
+      .devices
+      .as_ref()
+      .map_or(0, |hold| hold.held.connections())
+  }
+
+  /// The hold messages refused so far.
+  #[cfg(unix)]
   pub fn device_refusals(&self) -> u64 {
     self.devices.as_ref().map_or(0, |hold| hold.refused)
   }
@@ -245,17 +308,19 @@ impl Supervisor {
   /// The environment handing the device channel and every held device to a daemon about to be spawned, each
   /// descriptor made inheritable. A descriptor that cannot be made inheritable is left out (and counted): handing
   /// a number the daemon does not inherit would have it adopt whatever that number names in its own table.
-  #[cfg(target_os = "linux")]
-  fn device_env(&mut self) -> Option<(String, String)> {
+  #[cfg(unix)]
+  fn device_env(&mut self) -> Vec<(String, String)> {
     self.drain_devices();
-    let hold = self.devices.as_mut()?;
+    let Some(hold) = self.devices.as_mut() else {
+      return Vec::new();
+    };
     let inheritable = |fd: &OwnedFd| rustix::io::fcntl_setfd(fd, rustix::io::FdFlags::empty());
     if let Err(e) = inheritable(&hold.daemon_end) {
-      hold.refuse(&crate::devices::DeviceRefusal::Os {
+      hold.refuse(&crate::held::HoldRefusal::Os {
         call: "fcntl(F_SETFD) on the channel",
         code: e.raw_os_error(),
       });
-      return None;
+      return Vec::new();
     }
     let mut lost = Vec::new();
     for (attachment, held) in hold.held.iter() {
@@ -266,15 +331,40 @@ impl Supervisor {
     for attachment in lost {
       let _ = hold
         .held
-        .apply(crate::devices::Incoming::Release { attachment });
-      hold.refuse(&crate::devices::DeviceRefusal::Malformed {
+        .apply(crate::held::Incoming::Release { attachment });
+      hold.refuse(&crate::held::HoldRefusal::Malformed {
         reason: "a held device could not be made inheritable",
+      });
+    }
+    let mut lost_connections = Vec::new();
+    for (connection, socket) in hold.held.iter_connections() {
+      if inheritable(socket).is_err() {
+        lost_connections.push(connection);
+      }
+    }
+    for connection in lost_connections {
+      hold.held.drop_connection(connection);
+      hold.refuse(&crate::held::HoldRefusal::Malformed {
+        reason: "a held connection could not be made inheritable",
       });
     }
     let value = hold
       .held
       .env_value(std::os::fd::AsFd::as_fd(&hold.daemon_end));
-    Some((crate::devices::ENV_DEVICES.to_owned(), value))
+    vec![
+      (crate::held::ENV_DEVICES.to_owned(), value),
+      (
+        crate::held::ENV_CONNECTIONS.to_owned(),
+        hold.held.connections_env_value(),
+      ),
+    ]
+  }
+
+  /// Hands `name=value` to every daemon this supervisor spawns: the handoff of an endpoint the owner holds across
+  /// restarts (the client rendezvous, A-114). The owner keeps the endpoint itself alive, and any descriptor it names
+  /// inheritable.
+  pub fn hold_environment(&mut self, name: &str, value: String) {
+    self.environment.push((name.to_owned(), value));
   }
 
   /// Holds `fd` — a bound, listening loopback socket — as the NFS listener handed to every daemon this
@@ -297,6 +387,10 @@ impl Supervisor {
 
   /// Replaces the policy (the anchor re-derives it as daemon starts are measured).
   pub fn set_policy(&mut self, policy: RestartPolicy) {
+    // A backoff under way keeps its length; the next one starts from the new window.
+    if self.retry_at_ns.is_none() {
+      self.backoff_ns = policy.window_ns;
+    }
     self.policy = policy;
   }
 
@@ -315,6 +409,7 @@ impl Supervisor {
     if self.child.is_some() {
       return Ok(());
     }
+    self.started_at_ns = now_ns;
     let mut env = self.segment.handoff_env()?;
     env.push((ENV_ANCHOR_PID.to_owned(), std::process::id().to_string()));
     // Hand the held NFS listener's descriptor over: it is inheritable (not close-on-exec), so the
@@ -332,9 +427,11 @@ impl Supervisor {
       }
       env.push((ENV_FLEET_SERVE.to_owned(), numbers));
     }
-    // And the device channel with every FUSE device held (A-61): the daemon takes back the mounts it recovers.
-    #[cfg(target_os = "linux")]
+    // And the hold channel with every FUSE device (A-61) and NFS connection (A-113) held: the daemon takes back the
+    // mounts it recovers and answers the connections the dead daemon left.
+    #[cfg(unix)]
     env.extend(self.device_env());
+    env.extend(self.environment.iter().cloned());
     let child = Command::new(&self.program)
       .args(&self.args)
       .envs(env)
@@ -356,17 +453,31 @@ impl Supervisor {
   pub fn step(&mut self, now_ns: u64) -> Result<Step, AnchorError> {
     // Every step takes what the daemon sent, so a device it established is held within a step of its send,
     // and everything a dead daemon sent is applied before its successor starts.
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     self.drain_devices();
-    if self.crash_loop {
-      return Ok(Step::CrashLoop { exit_code: None });
+    if let Some(retry_at_ns) = self.retry_at_ns {
+      if now_ns < retry_at_ns {
+        return Ok(Step::BackingOff { retry_at_ns });
+      }
+      self.retry_at_ns = None;
+      self.start(now_ns)?;
+      return Ok(Step::Restarted {
+        exit_code: None,
+        in_window: u32::try_from(self.restarts_at_ns.len()).unwrap_or(u32::MAX),
+      });
     }
     let Some(child) = self.child.as_mut() else {
       return Ok(Step::Stopped);
     };
     let status = match child.try_wait() {
       Ok(Some(status)) => status,
-      Ok(None) => return Ok(Step::Running),
+      Ok(None) => {
+        // A daemon that outlived the window recovered: the next crash loop backs off from the window again.
+        if now_ns.saturating_sub(self.started_at_ns) > self.policy.window_ns {
+          self.backoff_ns = self.policy.window_ns;
+        }
+        return Ok(Step::Running);
+      }
       Err(e) => {
         return Err(AnchorError::Spawn {
           code: e.raw_os_error(),
@@ -385,9 +496,18 @@ impl Supervisor {
     }
     let in_window = u32::try_from(self.restarts_at_ns.len()).unwrap_or(u32::MAX);
     if in_window > self.policy.max_restarts {
-      self.crash_loop = true;
+      // Not given up on (A-119): the loop is recorded, and the daemon restarted after a backoff that doubles each time
+      // to the cap, as Kubernetes backs off a crash-looping container. Every hard NFS mount on this daemon waits for
+      // it; a supervisor that stopped restarting left them hung for good (2026-10-08: two kills 0.3 s apart on a
+      // loaded host, whose recovery had stretched to 160-490 ms, ended supervision).
       self.segment.supervision()?.record_exit(true);
-      return Ok(Step::CrashLoop { exit_code });
+      let retry_in_ns = self.backoff_ns;
+      self.backoff_ns = self.backoff_ns.saturating_mul(2).min(RETRY_CAP_NS);
+      self.retry_at_ns = Some(now_ns.saturating_add(retry_in_ns));
+      return Ok(Step::CrashLoop {
+        exit_code,
+        retry_in_ns,
+      });
     }
     self.segment.supervision()?.record_exit(false);
     self.start(now_ns)?;
@@ -431,6 +551,8 @@ impl Supervisor {
     now_ns: u64,
     liveness_budget_ns: u64,
   ) -> Result<Stopping, AnchorError> {
+    // A stop ends a crash loop's backoff too: nothing restarts the daemon after it.
+    self.retry_at_ns = None;
     let Some(child) = self.child.as_mut() else {
       self.segment.supervision()?.record_exit(false);
       return Ok(Stopping::Exited {
@@ -485,6 +607,7 @@ impl Supervisor {
   /// the stop. The graceful path is [`request_stop`](Supervisor::request_stop) then
   /// [`stop_step`](Supervisor::stop_step).
   pub fn stop(&mut self) -> Result<(), AnchorError> {
+    self.retry_at_ns = None;
     if let Some(mut child) = self.child.take() {
       let _ = child.kill();
       let _ = child.wait();
@@ -496,6 +619,12 @@ impl Supervisor {
   /// Whether the daemon is running.
   pub fn running(&self) -> bool {
     self.child.is_some()
+  }
+
+  /// The running daemon's pid, if one runs: what the owner watches for its exit, so a death is restarted as it happens
+  /// rather than at the next observation.
+  pub fn child_pid(&self) -> Option<u32> {
+    self.child.as_ref().map(std::process::Child::id)
   }
 
   /// The policy.
@@ -616,7 +745,7 @@ mod lifetime {
   }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 impl DeviceHold {
   /// The bound the held set was given.
   fn held_bound(&self) -> usize {
@@ -624,8 +753,8 @@ impl DeviceHold {
   }
 
   /// Counts `refusal` and says so on the anchor's log, once per refusal.
-  fn refuse(&mut self, refusal: &crate::devices::DeviceRefusal) {
+  fn refuse(&mut self, refusal: &crate::held::HoldRefusal) {
     self.refused = self.refused.saturating_add(1);
-    eprintln!("slates anchor: a device message was refused: {refusal}");
+    eprintln!("slates anchor: a hold message was refused: {refusal}");
   }
 }

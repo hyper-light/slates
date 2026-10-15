@@ -40,6 +40,9 @@ pub struct RecallGate {
   acting: Option<u64>,
   /// Changes refused at the gate, ever (the non-vacuity counter, and how a caller tells the gate's refusal apart).
   refused: u64,
+  /// Recalls asked for changes made outside any NFSv4 session ([`RecallGate::recall`]), ever: the outsider path's
+  /// non-vacuity counter.
+  outside: u64,
   /// Bumped whenever an inode may have left the gate (a release or a reset).
   generation: u64,
   /// The tasks parked until the next release or reset.
@@ -117,16 +120,52 @@ impl RecallGate {
   /// change that will touch the volume's files wholesale (a landing's advance of its overlay); whether any was held.
   /// A recall asked for this way is not a refused change, so the refusal count does not move.
   pub fn recall_volume(&mut self, prefix: u16) -> bool {
-    let held: Vec<u64> = self
-      .delegated
-      .keys()
-      .copied()
-      .filter(|no| crate::ids::InodeNo(*no).prefix() == prefix)
-      .collect();
+    let held = self.delegated_in(prefix);
     for no in &held {
       self.requested.insert((*no, None));
     }
     !held.is_empty()
+  }
+
+  /// The delegated inodes of the volume whose inode numbers carry `prefix`.
+  pub fn delegated_in(&self, prefix: u16) -> Vec<u64> {
+    self
+      .delegated
+      .keys()
+      .copied()
+      .filter(|no| crate::ids::InodeNo(*no).prefix() == prefix)
+      .collect()
+  }
+
+  /// Asks for the recall of every delegation held on inode `no`, for a change made outside any NFSv4 session that has
+  /// already happened (an outsider's edit of the disk beneath an untouched base file, RFC 8881 §10.2); whether any was
+  /// held. Like [`Self::recall_volume`], it is not a refused change, so the refusal count does not move.
+  pub fn recall(&mut self, no: u64) -> bool {
+    let held = self.delegated.contains_key(&no);
+    if held {
+      self.requested.insert((no, None));
+      self.outside = self.outside.saturating_add(1);
+    }
+    held
+  }
+
+  /// Asks for the recall of every delegation held on inode `no` — the acting client's own included — because a
+  /// `chmod`/`chown` has left the file in a mode where some permission class cannot write. A write delegation lets
+  /// its holder client serve any of its users' I/O locally; once a class cannot write, the client can flush a
+  /// truncate for a user of that class (whose own open would be refused) under a holder identity of a class that
+  /// can — the NFSv4 truncate-laundering escape (a read-only owner's `O_RDONLY|O_TRUNC` flushed through an `other`
+  /// holder of a 0477 file, or a group member's through an `other` holder of a 0747 file). Recalling forces the
+  /// client to re-establish its opens, after which the acting user's own class is checked fresh and the forbidden
+  /// truncate is refused. Unlike a conflicting change ([`RecallGate::recall`] via `act_as`) it does not exclude the
+  /// acting client (the escape's delegation is the actor's own); like [`Self::recall_volume`] it is not a refused
+  /// change, so the refusal count does not move (RFC 8881 §10.4.4: recall on need, always safe). Whether any was
+  /// held.
+  pub fn recall_on_write_restricted(&mut self, no: u64) -> bool {
+    let held = self.delegated.contains_key(&no);
+    if held {
+      self.requested.insert((no, None));
+    }
+    held
   }
 
   /// The inodes, each with the actor of the change refused on it, whose recall was asked for since the last call.
@@ -137,6 +176,11 @@ impl RecallGate {
   /// How many changes the gate has refused, ever.
   pub fn refusals(&self) -> u64 {
     self.refused
+  }
+
+  /// How many recalls changes outside any NFSv4 session have asked for, ever.
+  pub fn outside_recalls(&self) -> u64 {
+    self.outside
   }
 
   /// The gate's generation: it moves whenever an inode may have left the gate.

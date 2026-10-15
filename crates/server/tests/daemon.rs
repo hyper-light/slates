@@ -115,6 +115,94 @@ impl Client {
   }
 }
 
+/// §4.9 "Exactly-once" (RIFL, Lee et al., SOSP 2015: completion records are kept until the client acknowledges them,
+/// and their number is bounded): a client that never acknowledges must not grow a shard's records without bound.
+/// Found 2026-10-07: a fleet test's raw client polled a status for 24 minutes without acknowledging, and the daemon,
+/// whose every snapshot encodes every retained record, stopped answering within the 5 s deadline. Do: as a raw client
+/// that never acknowledges, ask a volume's status again and again, past twice the ring's slots. Expect: a new request
+/// is refused `AcknowledgementOwed` once the bound is reached, never before; a retry of an id already answered is
+/// still answered from its record; and once the client acknowledges, a new request is served again.
+#[test]
+fn a_client_that_never_acknowledges_is_refused_at_its_bound_and_served_once_it_acknowledges() {
+  let (daemon, instance) = daemon("ackbound");
+  let mut client = Client::connect(&instance);
+  let ReplyBody::Created { id: volume } = client.call(&scratch("ackbound")) else {
+    panic!("create");
+  };
+  let slots = u64::try_from(client.end.region().cmd().slots()).unwrap();
+  let bound = 2 * slots;
+  let (served, refusal) = statuses_until_owed(&mut client, volume, (bound + slots) * 2);
+  let Some(Refusal::AcknowledgementOwed {
+    retained,
+    bound: stated,
+  }) = refusal
+  else {
+    daemon.stop();
+    panic!("no AcknowledgementOwed after {served} unacknowledged statuses (bound {bound})");
+  };
+  let after = after_the_refusal(&mut client, volume);
+  daemon.stop();
+  assert_eq!(stated, bound, "the bound is twice the ring's slots");
+  assert!(
+    retained >= bound,
+    "refused only at the bound: {retained} retained"
+  );
+  // Every status records on the volume's owner shard; the create may have recorded there too.
+  assert!(
+    served + 1 >= bound,
+    "served up to the bound, never refused before it: {served}"
+  );
+  assert!(
+    matches!(
+      after,
+      [
+        ReplyBody::Status { .. },
+        ReplyBody::Acknowledged,
+        ReplyBody::Status { .. },
+        ReplyBody::Status { .. }
+      ]
+    ),
+    "a retry answered from its record, the acknowledgement served, then the refused id and a new request \
+     served: {after:?}"
+  );
+}
+
+/// After an `AcknowledgementOwed` refusal of the client's last id: a retry of the id before it (answered), an
+/// acknowledgement up to that id, the refused id again, and a new status.
+fn after_the_refusal(client: &mut Client, volume: VolumeId) -> [ReplyBody; 4] {
+  let refused_id = RequestId {
+    client: client.client,
+    sequence: client.sequence,
+  };
+  let answered_id = RequestId {
+    client: client.client,
+    sequence: client.sequence - 1,
+  };
+  let retried = client.call_as(answered_id, &RequestBody::Status { volume });
+  let acknowledged = client.call(&RequestBody::Acknowledge {
+    up_to: answered_id.sequence,
+  });
+  let again = client.call_as(refused_id, &RequestBody::Status { volume });
+  let fresh = client.call(&RequestBody::Status { volume });
+  [retried, acknowledged, again, fresh]
+}
+
+/// Asks `volume`'s status up to `most` times, never acknowledging: how many were served before the first
+/// `AcknowledgementOwed`, and that refusal.
+fn statuses_until_owed(client: &mut Client, volume: VolumeId, most: u64) -> (u64, Option<Refusal>) {
+  let mut served = 0u64;
+  for _ in 0..most {
+    match client.call(&RequestBody::Status { volume }) {
+      ReplyBody::Status { .. } => served += 1,
+      ReplyBody::Refused {
+        refusal: found @ Refusal::AcknowledgementOwed { .. },
+      } => return (served, Some(found)),
+      other => panic!("status: {other:?}"),
+    }
+  }
+  (served, None)
+}
+
 fn daemon(name: &str) -> (Daemon, String) {
   let profile = common::machine_profile();
   let instance = format!("srv-{name}-{}", std::process::id());
@@ -131,6 +219,35 @@ fn daemon(name: &str) -> (Daemon, String) {
     .bootstrap(true)
     .expect("the fixture explicitly creates its local consensus group");
   (daemon, instance)
+}
+
+/// §4.8 "Lookup" (found 2026-10-10 by the CLI's anchor flow): a daemon with no other host has nobody to forward a
+/// volume to, so a verb on an id it never created is answered `NotFound`. Do: on a fresh single-node daemon, ask the
+/// status of a volume id of zeros. Expect `NotFound`, well inside the takeover bound. Before: the lookup-by-id forward
+/// (2026-10-07, `358aa47d`) sent it to "another host of this region", found none, and answered `OwnerUnreachable`.
+#[test]
+fn a_single_node_answers_an_id_it_never_created_not_found() {
+  let (daemon, instance) = daemon("unknown-id");
+  let mut client = Client::connect(&instance);
+  let began = Instant::now();
+  let reply = client.call(&RequestBody::Status {
+    volume: VolumeId { bytes: [0; 16] },
+  });
+  let took = began.elapsed();
+  daemon.stop();
+  assert!(
+    matches!(
+      reply,
+      ReplyBody::Refused {
+        refusal: Refusal::NotFound
+      }
+    ),
+    "an id this node never created is not found: {reply:?}"
+  );
+  assert!(
+    took < Duration::from_nanos(slates_server::daemon::LIVENESS_BUDGET_NS),
+    "answered at once, not after a location round: {took:?}"
+  );
 }
 
 fn scratch(name: &str) -> RequestBody {
@@ -941,7 +1058,8 @@ fn grant_scenario() {
 
 /// AUD-29-05: the reply carries what the landing achieved, not the counts alone — its durability (synced,
 /// media neither asked for nor reached), its Degraded cells (barriers only: the supported level, since the
-/// verb asks for no media barrier), nothing held, and the ramp's settled depth. Until 2026-09-29 the reply
+/// verb asks for no media barrier), nothing held, and the batch barriers it took (A-130: none when nothing was
+/// written, else at least one and at most one a written file). Until 2026-09-29 the reply
 /// dropped all of it. (This scenario's plan is the grant's: its content is the engine tests' to check,
 /// `crates/land/tests/durability.rs`; here, that the facts cross the wire.)
 fn assert_landed_reply_carries_what_it_achieved(outcome: &slates_ipc::protocol::LandingOutcome) {
@@ -956,7 +1074,12 @@ fn assert_landed_reply_carries_what_it_achieved(outcome: &slates_ipc::protocol::
     vec![slates_ipc::protocol::LandingDegradation::BarriersOnly]
   );
   assert_eq!(outcome.held, 0);
-  assert!(outcome.ramp_depth > 0, "{outcome:?}");
+  assert_eq!(
+    outcome.barriers == 0,
+    outcome.written == 0,
+    "a barrier exactly when files were written: {outcome:?}"
+  );
+  assert!(outcome.barriers <= outcome.written, "{outcome:?}");
 }
 
 /// A grant request for `landing` under `proof`, scoped once for the test's deadline.
@@ -1090,8 +1213,9 @@ fn a_granted_landing_consumes_its_presentation() {
 /// §4.15 (AC-1.12, D-27): a granted landing over a base an outsider changed refuses as a conflict, names only the
 /// entries that conflict, and writes nothing. Do: overlay a directory holding `b.txt`; through the volume, change
 /// `b.txt` and create `new.txt`; then, outside the volume, change `b.txt` on disk; snapshot, present, grant and land.
-/// Expect: `LandingConflict` naming `/b.txt` alone (`new.txt` would only be created, which is no conflict), the
-/// outsider's `b.txt` untouched, and no `new.txt`. Before 2026-10-06 the refusal named every entry of the landing
+/// Expect: the presentation's preliminary pass naming `/b.txt (ModifyModify)` alone, then `LandingConflict` naming
+/// `/b.txt` alone (`new.txt` would only be created, which is no conflict), the outsider's `b.txt` untouched, and no
+/// `new.txt`. Before 2026-10-06 the refusal named every entry of the landing
 /// (`["/new.txt", "/b.txt"]`, measured through the CLI), so a person sent to resolve it looked at files that were fine.
 #[test]
 fn a_landing_over_an_outsiders_change_refuses_naming_only_the_conflict() {
@@ -1147,11 +1271,21 @@ fn a_landing_over_an_outsiders_change_refuses_naming_only_the_conflict() {
     grant: None,
   });
   let ReplyBody::GrantRequired {
-    landing, manifest, ..
+    landing,
+    manifest,
+    conflicts,
+    ..
   } = presented
   else {
     panic!("presented: {presented:?}");
   };
+  // §4.15 step 2: the presentation carries the preliminary verdict pass, so the human deciding on the grant sees the
+  // conflict before approving (until 2026-10-08 it was always empty).
+  assert_eq!(
+    conflicts,
+    vec!["/b.txt (ModifyModify)".to_owned()],
+    "the presentation names the conflict"
+  );
   let grant = verified_approval_issues(&mut client, &secret, landing, manifest);
   let landed = client.call(&RequestBody::Land {
     volume: id,

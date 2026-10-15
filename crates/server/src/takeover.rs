@@ -272,8 +272,21 @@ pub(crate) fn serve_host_prepare(
     *count = count.saturating_add(1);
     return Vec::new();
   }
-  list_page(state, local, &prepare).encode()
+  let page = list_page(state, local, &prepare);
+  // The promise stands behind the shard's publish (§4.8 persistence before reply): the page raised each listed
+  // object's fence and installed the asker's authority, and a warm restart keeps this node's member id, so that
+  // fence must hold after it. A refused publish promises nothing; the asker asks again.
+  if crate::verbs::publish_shard(state).is_err() {
+    let count = state.refusals.entry(PROMISE_UNPUBLISHED).or_insert(0);
+    *count = count.saturating_add(1);
+    return Vec::new();
+  }
+  page.encode()
 }
+
+/// The status count of takeover promises not answered because the shard's publish carrying their raised fences was
+/// refused (§4.8 persistence before reply). Format: a refusal name in the daemon's status report.
+const PROMISE_UNPUBLISHED: &str = "takeover.promise_unpublished";
 
 /// Whether this node may promise `departed`'s objects now (§4.8 "Leases and reads", AUD-08): it has not answered
 /// the retired owner's probes for the membership horizon, or the owner has announced the configuration that
@@ -594,7 +607,7 @@ async fn ask_pages(
   budget: CommitBudget,
 ) -> Option<Dispatch> {
   let wanted: BTreeMap<HostId, HostPrepare> = requests.into_iter().collect();
-  let sessions = take_sessions(|host| wanted.contains_key(&host));
+  let sessions = take_sessions("fleet.lent_to.ask_pages", |host| wanted.contains_key(&host));
   if sessions.is_empty() {
     return None;
   }
@@ -700,12 +713,7 @@ pub(crate) fn ready_objects(
         .count();
       promised_everywhere &= promised >= needed;
     }
-    if promised_everywhere
-      && let Some(newest) = reports
-        .values()
-        .cloned()
-        .reduce(|best, next| if next.newer_than(&best) { next } else { best })
-    {
+    if promised_everywhere && let Some(newest) = reports.values().cloned().reduce(newest_of) {
       ready.push((*object, newest));
     }
   }
@@ -717,6 +725,49 @@ pub(crate) fn ready_objects(
     }
   }
   ready
+}
+
+/// The newer of two reported records by phase one's order (sequence, then epoch), with tied sealed heads merged: two
+/// head copies at one position that name the same manifest under the same lineage key differ only in which holders'
+/// key entries they carry (an owner adds an entry for a member that joined after the head first shipped, A-92 piece
+/// 4c), and each entry is valid on its own. The merge keeps every entry, by anchor, so a successor that holds its own
+/// entry in any copy can open the envelope; keeping one copy by host order could adopt one without it, and the
+/// successor would refuse the volume for good (`docs/bugs/2026-10-08-a-sealed-head-shipped-without-its-successors-key-entry.md`).
+/// Any other tie keeps the first, as before.
+fn newest_of(best: Accepted, next: Accepted) -> Accepted {
+  if next.newer_than(&best) {
+    return next;
+  }
+  if best.newer_than(&next) || best.value == next.value {
+    return best;
+  }
+  let (Some(mut merged), Some(other)) = (
+    HeadValue::from_record_bytes(&best.value),
+    HeadValue::from_record_bytes(&next.value),
+  ) else {
+    return best;
+  };
+  let (Some(sealing), Some(other_sealing)) = (merged.sealing.as_mut(), other.sealing) else {
+    return best;
+  };
+  if merged.manifest != other.manifest
+    || sealing.lineage != other_sealing.lineage
+    || sealing.owner_anchor != other_sealing.owner_anchor
+    || sealing.partition != other_sealing.partition
+  {
+    return best;
+  }
+  for key in other_sealing.keys {
+    if !sealing.keys.iter().any(|held| held.anchor == key.anchor) {
+      sealing.keys.push(key);
+    }
+  }
+  // Anchor order, as the owner writes the entries, so equal sets encode equally.
+  sealing.keys.sort_by_key(|key| key.anchor);
+  Accepted {
+    value: merged.to_record_bytes(),
+    ..best
+  }
 }
 
 /// Adopts `object` (§4.8 "completes safe adoption under the new epoch"): re-commits the newest reported record
@@ -764,7 +815,9 @@ async fn adopt(
     Some((acceptor, shape, quorum, record))
   })
   .flatten()?;
-  let holders = take_sessions(|host| host != local && shape.candidates.contains(&host));
+  let holders = take_sessions("fleet.lent_to.adopt", |host| {
+    host != local && shape.candidates.contains(&host)
+  });
   let taken: Vec<HostId> = holders.iter().map(|(host, _)| *host).collect();
   let committed = commit_record(
     local,
@@ -870,4 +923,73 @@ fn round_done(state: &ShardState, departed: HostId, local: HostId) -> bool {
       .into_iter()
       .filter(|host| *host != local && regional.members.contains(host))
       .all(|host| take.pages.get(&host).is_some_and(|page| page.complete))
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use crate::head::{HeadKey, HeadSealing};
+  use slates_db::register::HostEpoch;
+
+  fn sealed(keys: &[u64], manifest: u8) -> HeadValue {
+    HeadValue {
+      manifest: Some([manifest; 32]),
+      content_holders: vec![1, 2],
+      sealing: Some(HeadSealing {
+        owner_anchor: 9,
+        partition: 0,
+        lineage: [7; 16],
+        keys: keys
+          .iter()
+          .map(|anchor| HeadKey {
+            anchor: *anchor,
+            wrapped: vec![u8::try_from(*anchor).unwrap(); 4],
+          })
+          .collect(),
+        naming: None,
+      }),
+    }
+  }
+
+  fn accepted(sequence: u64, epoch: u64, value: &HeadValue) -> Accepted {
+    Accepted {
+      sequence,
+      epoch: HostEpoch(epoch),
+      value: value.to_record_bytes(),
+    }
+  }
+
+  fn anchors(record: &Accepted) -> Vec<u64> {
+    HeadValue::from_record_bytes(&record.value)
+      .and_then(|value| value.sealing)
+      .map(|sealing| sealing.keys.iter().map(|key| key.anchor).collect())
+      .unwrap_or_default()
+  }
+
+  /// A-92 piece 4c: two tied copies of a sealed head, one written before a member joined (entries 1, 2) and one after
+  /// (entries 1, 2, 3). Do: fold them in both orders. Expect: the adopted value carries all three entries either way,
+  /// so the member that joined can open the envelope as successor.
+  #[test]
+  fn tied_copies_of_a_sealed_head_adopt_every_holders_key_entry() {
+    let older = accepted(4, 2, &sealed(&[1, 2], 5));
+    let newer = accepted(4, 2, &sealed(&[1, 2, 3], 5));
+    assert_eq!(
+      anchors(&newest_of(older.clone(), newer.clone())),
+      vec![1, 2, 3]
+    );
+    assert_eq!(anchors(&newest_of(newer, older)), vec![1, 2, 3]);
+  }
+
+  /// Phase one's order still decides: a newer position wins whole, and a tie of two heads naming different content is
+  /// not merged (the first is kept). Do: fold a newer sequence over an older one with more entries, and two tied heads
+  /// with different manifests. Expect: the newer record as it was, and the first tied record as it was.
+  #[test]
+  fn a_newer_record_wins_and_different_content_is_never_merged() {
+    let old_many = accepted(4, 2, &sealed(&[1, 2, 3], 5));
+    let new_few = accepted(5, 2, &sealed(&[1], 6));
+    assert_eq!(newest_of(old_many.clone(), new_few.clone()), new_few);
+    let first = accepted(4, 2, &sealed(&[1], 5));
+    let other_content = accepted(4, 2, &sealed(&[2], 6));
+    assert_eq!(newest_of(first.clone(), other_content), first);
+  }
 }

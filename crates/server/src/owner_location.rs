@@ -97,7 +97,7 @@ impl Query {
     cached: Option<CachedRoute>,
   ) -> Option<HostId> {
     cached
-      .filter(|route| route.query == self && eligible(state, route.owner, RegionId(self.region)))
+      .filter(|route| self.reuses(state, *route).is_none())
       .map(|route| route.owner)
       .or_else(|| {
         eligible(
@@ -110,13 +110,39 @@ impl Query {
   }
 }
 
+impl Query {
+  /// Why `route` cannot be reused for this query, as the counter the miss is recorded under, or `None` when it
+  /// can: it was found under another query (another object, region or root view), or its owner is no longer an
+  /// eligible member of the region (another region, or held dead).
+  pub(crate) fn reuses(self, state: &ShardState, route: CachedRoute) -> Option<&'static str> {
+    if route.query != self {
+      Some("fleet.owner_location.route_dropped.query_changed")
+    } else {
+      ineligibility(state, route.owner, RegionId(self.region))
+    }
+  }
+}
+
+/// Why `host` is not an eligible owner in `region`, as the counter a dropped route is recorded under, or `None` when
+/// it is: its region is another (or unknown), membership does not know it, or membership holds it dead. A suspected
+/// member stays eligible: SWIM's suspicion is refutable, and only a death removes it (Das, Gupta & Motivala, DSN 2002,
+/// §4.2). The three are counted apart because each has a different source: the root configuration, the member list,
+/// and a death this node's detector judged or a peer gossiped.
+fn ineligibility(state: &ShardState, host: HostId, region: RegionId) -> Option<&'static str> {
+  if state.node_regions.get(&host) != Some(&region) {
+    return Some("fleet.owner_location.route_dropped.owner_ineligible.region");
+  }
+  match state.fleet.membership().state(host) {
+    None => Some("fleet.owner_location.route_dropped.owner_ineligible.unknown"),
+    Some(member) if member.liveness == Liveness::Dead => {
+      Some("fleet.owner_location.route_dropped.owner_ineligible.dead")
+    }
+    Some(_) => None,
+  }
+}
+
 fn eligible(state: &ShardState, host: HostId, region: RegionId) -> bool {
-  state.node_regions.get(&host) == Some(&region)
-    && state
-      .fleet
-      .membership()
-      .state(host)
-      .is_some_and(|member| member.liveness != Liveness::Dead)
+  ineligibility(state, host, region).is_none()
 }
 
 /// Answer from the held-object route, under the council's configuration. A node claims an object only
@@ -125,8 +151,12 @@ fn eligible(state: &ShardState, host: HostId, region: RegionId) -> bool {
 /// false, and the node answers meanwhile. (Refusing then — the placement a version behind its council for most
 /// of a long coordinator period right after a takeover — refused the one owner a lookup could find.) A pending
 /// takeover does not advertise itself until adoption finishes. Peers without this object report no owner;
-/// they never infer one from live membership. The session has already authenticated enrollment.
-pub(crate) fn serve(state: &ShardState, bytes: &[u8]) -> Result<Vec<u8>, LocationError> {
+/// they never infer one from live membership. The session has already authenticated enrollment. Returns the reply
+/// and, when this node does not claim the object, why ([`declined`]), for the caller to count.
+pub(crate) fn serve(
+  state: &ShardState,
+  bytes: &[u8],
+) -> Result<(Vec<u8>, Option<&'static str>), LocationError> {
   let query = Query::from_bytes(bytes).map_err(|_| LocationError::Malformed)?;
   let local = state.fleet.host();
   let root = state.root.configuration();
@@ -147,16 +177,37 @@ pub(crate) fn serve(state: &ShardState, bytes: &[u8]) -> Result<Vec<u8>, Locatio
     return Err(LocationError::OutsideHome);
   }
   let regional = state.council.configuration();
-  Ok(
+  let declined = declined(
+    state,
+    ObjectId(query.object),
+    regional.members.contains(&local),
+  );
+  Ok((
     Reply {
       query,
       generation: regional.version,
-      serves: regional.members.contains(&local)
-        && state.fleet.object_owner(ObjectId(query.object)) == Some(local)
-        && !state.departed_owners.contains_key(&ObjectId(query.object)),
+      serves: declined.is_none(),
     }
     .to_bytes(),
-  )
+    declined,
+  ))
+}
+
+/// Why this node does not claim `object` (`serve`), as the counter it is recorded under on this node, or `None` when
+/// it claims it: not a member of the council's configuration, the object's route naming another owner or none, or the
+/// object retired here as a departed owner's. A lookup that missed the owner then names, on the node that should have
+/// claimed, the rule that refused.
+pub(crate) fn declined(state: &ShardState, object: ObjectId, member: bool) -> Option<&'static str> {
+  let local = state.fleet.host();
+  if !member {
+    Some("fleet.owner_location.declined.not_member")
+  } else if state.fleet.object_owner(object) != Some(local) {
+    Some("fleet.owner_location.declined.not_owner")
+  } else if state.departed_owners.contains_key(&object) {
+    Some("fleet.owner_location.declined.departed")
+  } else {
+    None
+  }
 }
 
 /// Only claims supply a route: the claim at the newest regional generation among them, since an owner
@@ -277,7 +328,7 @@ pub(crate) async fn locate(query: Query) -> Result<HostId, LocationError> {
   let mut answers = Answers::default();
   let mut met_out = false;
   loop {
-    let taken = take_sessions(|peer| unasked.contains(&peer));
+    let taken = take_sessions("fleet.lent_to.locate", |peer| unasked.contains(&peer));
     for (peer, _) in &taken {
       unasked.remove(peer);
     }
@@ -288,6 +339,7 @@ pub(crate) async fn locate(query: Query) -> Result<HostId, LocationError> {
     }
     let out = sessions_out(&unasked);
     if out.is_empty() {
+      count_unsessioned(&unasked);
       break;
     }
     if !met_out {
@@ -307,6 +359,15 @@ pub(crate) async fn locate(query: Query) -> Result<HostId, LocationError> {
     count(error.counter());
   }
   result
+}
+
+/// Counts the peers a round left unasked because they hold no record session at all: not waited for (the bounded
+/// neighbourhood keeps none to most peers), but counted (`fleet.owner_location.no_session`), so a round that missed
+/// a claim because its claimant had no session says so rather than reading as a peer that answered "not mine".
+fn count_unsessioned(unasked: &std::collections::BTreeSet<HostId>) {
+  for _ in unasked {
+    count("fleet.owner_location.no_session");
+  }
 }
 
 /// Asks the peers whose sessions were `taken`, within `budget_ns`, folding every reply that arrives in

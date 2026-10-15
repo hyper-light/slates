@@ -1542,6 +1542,7 @@ dependencies = [
 name = "slates-mcp"
 version = "0.1.0"
 dependencies = [
+ "aws-lc-rs",
  "serde_json",
  "slates-client",
  "slates-db",

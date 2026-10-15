@@ -95,7 +95,7 @@ pub(crate) fn register() -> Option<u64> {
 
 /// Ends a connection: its outbox and the sessions it carried go, and every callback waiting on it fails `Lost`.
 pub(crate) fn unregister(connection: u64) {
-  let _ = state::with_state(|s| {
+  let _ = state::with_state_counted(|s| {
     let table = &mut s.callbacks;
     table.outboxes.remove(&connection);
     table.carriers.retain(|_, carrier| *carrier != connection);
@@ -112,7 +112,7 @@ pub(crate) fn unregister(connection: u64) {
 
 /// Binds `connection` as the carrier of `sessionid`'s back channel (the connection its compounds arrive on).
 pub(crate) fn carry(sessionid: SessionId, connection: u64) {
-  let _ = state::with_state(|s| {
+  let _ = state::with_state_counted(|s| {
     if s.callbacks.outboxes.contains_key(&connection) {
       s.callbacks.carriers.insert(sessionid, connection);
     }
@@ -149,7 +149,7 @@ pub(crate) fn deliver(body: &[u8]) {
     return;
   };
   let outcome = accepted_results(&mut reader).ok_or(CallbackError::Refused);
-  let _ = state::with_state(|s| match s.callbacks.pending.get_mut(&xid) {
+  let _ = state::with_state_counted(|s| match s.callbacks.pending.get_mut(&xid) {
     Some(pending) if pending.reply.is_none() => {
       pending.reply = Some(outcome);
       if let Some(waker) = pending.waker.take() {
@@ -192,6 +192,81 @@ const DELAY_RETRY_NS: u64 = crate::daemon::HEARTBEAT_NS / crate::fleet::POLL_PER
 /// Counter: callbacks the client answered `NFS4ERR_DELAY`, sent again (the retry path's non-vacuity count).
 const CALLBACK_DELAYED: &str = "nfs4.callback.delayed";
 
+/// Format: `NFS4ERR_SEQ_MISORDERED` (RFC 8881 §15.1.11.8): the client's slot was not at the sequence before ours.
+const NFS4ERR_SEQ_MISORDERED: u32 = 10063;
+
+/// Counter: callbacks that waited for the session's one slot while another callback held it (the wait's non-vacuity
+/// count).
+const CALLBACK_WAITED: &str = "nfs4.callback.waited_for_slot";
+
+/// Counter: callbacks the client refused as misordered, sent again once with the slot started over at 1.
+const CALLBACK_RESYNCED: &str = "nfs4.callback.resynced";
+
+/// One callback on `sessionid`'s slot 0, the back channel's only slot (RFC 8881 §2.10.6): waits for the slot while
+/// another callback holds it, within `deadline_ns`; takes the slot's next sequence only now; sends what `build`
+/// encodes for it; and records the slot used once the reply shows the client took it. A reply refused as misordered
+/// starts the slot over at 1 and is sent once more, as Linux knfsd's `nfsd4_cb_sequence_done` does. A callback that
+/// never left, or whose reply never came, leaves the slot where it was. Every callback on a session goes through
+/// here, so the server's sequence follows the client's (until 2026-10-08 each caller advanced it and sent at once:
+/// 152 of a burst of 153 recalls were refused busy, and the slot ran 152 ahead of the client's).
+pub(crate) async fn call_on_slot(
+  sessionid: SessionId,
+  build: impl Fn(&slates_bridge_nfs::v4::session::NextCallback) -> Vec<u8>,
+  deadline_ns: u64,
+) -> Result<Vec<u8>, CallbackError> {
+  let began = slates_rt::futures::now_ns();
+  let mut resynced = false;
+  loop {
+    let elapsed = slates_rt::futures::now_ns().saturating_sub(began);
+    if elapsed >= deadline_ns {
+      return Err(CallbackError::Timeout);
+    }
+    let next = state::with_state(|s| {
+      s.nfs_v4
+        .as_mut()
+        .and_then(|server| server.sessions.next_callback(&sessionid))
+    })
+    .flatten()
+    .ok_or(CallbackError::NoState)?;
+    let args = build(&next);
+    match call(
+      sessionid,
+      (next.program, &next.credential),
+      &args,
+      deadline_ns.saturating_sub(elapsed),
+    )
+    .await
+    {
+      Err(CallbackError::Busy) => {
+        let _ = state::with_state_counted(|s| s.count(CALLBACK_WAITED, 1));
+        if slates_rt::futures::sleep(DELAY_RETRY_NS).await.is_err() {
+          return Err(CallbackError::Busy);
+        }
+      }
+      Err(error) => return Err(error),
+      Ok(results) => {
+        let misordered =
+          slates_bridge_nfs::v4::callback::status(&results) == Some(NFS4ERR_SEQ_MISORDERED);
+        let _ = state::with_state_counted(|s| {
+          if let Some(server) = s.nfs_v4.as_mut() {
+            if misordered {
+              server.sessions.callback_resync(&sessionid);
+            } else {
+              server.sessions.callback_used(&sessionid, next.sequence);
+            }
+          }
+        });
+        if misordered && !resynced {
+          resynced = true;
+          let _ = state::with_state_counted(|s| s.count(CALLBACK_RESYNCED, 1));
+          continue;
+        }
+        return Ok(results);
+      }
+    }
+  }
+}
+
 /// Sends `CB_COMPOUND` arguments `args` on `sessionid`'s back channel to the client's callback `program`, and waits
 /// up to `deadline_ns` for the reply: its results (the `CB_COMPOUND4res`). A reply of `NFS4ERR_DELAY` is not an
 /// answer: the same arguments are sent again after [`DELAY_RETRY_NS`] while the deadline allows — the same slot
@@ -218,7 +293,7 @@ pub(crate) async fn call(
     if !delayed || elapsed.saturating_add(DELAY_RETRY_NS) >= deadline_ns {
       return Ok(results);
     }
-    let _ = state::with_state(|s| s.count(CALLBACK_DELAYED, 1));
+    let _ = state::with_state_counted(|s| s.count(CALLBACK_DELAYED, 1));
     if slates_rt::futures::sleep(DELAY_RETRY_NS).await.is_err() {
       return Ok(results);
     }
@@ -254,7 +329,7 @@ async fn call_once(
     }),
   )
   .await;
-  let _ = state::with_state(|s| s.callbacks.pending.remove(&xid));
+  let _ = state::with_state_counted(|s| s.callbacks.pending.remove(&xid));
   match waited {
     Ok(Some(reply)) => reply,
     Ok(None) => Err(CallbackError::Timeout),

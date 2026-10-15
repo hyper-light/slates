@@ -84,7 +84,7 @@ fn a_checkpoint_and_its_deltas_recover_the_full_image() {
       format!("bytes {at}").as_bytes(),
     );
     journal
-      .append(&mut log, &delta_of(&mut vol, &store))
+      .append(&mut log, &delta_of(&mut vol, &store), &mut Vec::new())
       .unwrap();
     let (recovered, resumed) = Journal::recover(&checkpoints, &log).unwrap();
     assert_eq!(recovered, Some(full(&vol, &store)), "after change {at}");
@@ -129,14 +129,17 @@ fn a_delta_torn_at_any_byte_recovers_the_state_before_or_after_it() {
   vol.mark_published(&store);
   create(&mut vol, &mut store, "first", b"first bytes");
   journal
-    .append(&mut log, &delta_of(&mut vol, &store))
+    .append(&mut log, &delta_of(&mut vol, &store), &mut Vec::new())
     .unwrap();
   let before = full(&vol, &store);
   create(&mut vol, &mut store, "second", b"second bytes");
   let delta = delta_of(&mut vol, &store);
   let after = full(&vol, &store);
   let mut whole = log.clone();
-  let frame = journal.clone().append(&mut whole, &delta).unwrap();
+  let frame = journal
+    .clone()
+    .append(&mut whole, &delta, &mut Vec::new())
+    .unwrap();
   let (mut afters, mut befores) = (0, 0);
   for budget in 0..=frame + 8 {
     let mut memory = log.clone();
@@ -144,7 +147,7 @@ fn a_delta_torn_at_any_byte_recovers_the_state_before_or_after_it() {
       memory: &mut memory,
       budget,
     };
-    let _ = journal.clone().append(&mut torn, &delta);
+    let _ = journal.clone().append(&mut torn, &delta, &mut Vec::new());
     let (recovered, _) = Journal::recover(&checkpoints, &memory).unwrap();
     let recovered = recovered.unwrap();
     if recovered == after {
@@ -178,7 +181,7 @@ fn frames_from_before_a_checkpoint_are_never_replayed_over_it() {
   for at in 0..5 {
     create(&mut vol, &mut store, &format!("old{at}"), &[at; 200]);
     journal
-      .append(&mut log, &delta_of(&mut vol, &store))
+      .append(&mut log, &delta_of(&mut vol, &store), &mut Vec::new())
       .unwrap();
   }
   journal
@@ -186,7 +189,7 @@ fn frames_from_before_a_checkpoint_are_never_replayed_over_it() {
     .unwrap();
   create(&mut vol, &mut store, "new", b"n");
   journal
-    .append(&mut log, &delta_of(&mut vol, &store))
+    .append(&mut log, &delta_of(&mut vol, &store), &mut Vec::new())
     .unwrap();
   let (recovered, _) = Journal::recover(&checkpoints, &log).unwrap();
   assert_eq!(recovered, Some(full(&vol, &store)));
@@ -209,7 +212,7 @@ fn a_full_log_refuses_and_a_checkpoint_follows() {
     create(&mut vol, &mut store, &format!("f{at}"), &[1; 100]);
     let delta = delta_of(&mut vol, &store);
     let generation = journal.generation();
-    if journal.append(&mut log, &delta).is_err() {
+    if journal.append(&mut log, &delta, &mut Vec::new()).is_err() {
       assert_eq!(
         journal.generation(),
         generation,
@@ -225,4 +228,168 @@ fn a_full_log_refuses_and_a_checkpoint_follows() {
   assert!(refused, "the small log filled");
   let (recovered, _) = Journal::recover(&checkpoints, &log).unwrap();
   assert_eq!(recovered, Some(full(&vol, &store)));
+}
+
+/// The streamed shard delta (2026-10-06; call records A-127). Do: checkpoint a shard of three volumes and two call
+/// records, change one volume (its record is then a delta) and make a fourth never published (its record is its full
+/// image), and stream a shard delta in key order with `ShardDelta::encode_start`, each key then
+/// `Volume::encode_publication`, and `encode_finish` naming the other two as removed (unsorted), with held bytes,
+/// replies, a changed call record and a new one (unsorted) and the other checkpointed record purged; log it with
+/// `Journal::append_encoded`, and log the same records as a `ShardDelta` value in a copy of the journal. Expect: the
+/// bytes equal `ShardDelta::new(…).with_calls(…).encode()`, both journals recover the same image, and it holds the
+/// changed volume brought up to date and the fresh one, without the removed, and the call records changed, added and
+/// gone as the delta said.
+#[test]
+fn a_streamed_shard_delta_equals_the_shard_delta_and_recovers() {
+  let mut store = store();
+  let mut published = seeded(&mut store);
+  let mut fresh = seeded(&mut store);
+  let gone = seeded(&mut store);
+  let (low, high) = (KEY, [9; 16]);
+  let removed = vec![[8; 16], [2; 16]];
+  let mut in_checkpoint = vec![KeyedImage {
+    key: low,
+    image: published.to_image(&store, None).unwrap(),
+  }];
+  for key in &removed {
+    in_checkpoint.push(KeyedImage {
+      key: *key,
+      image: gone.to_image(&store, None).unwrap(),
+    });
+  }
+  let (mut checkpoints, mut log) = (vec![0u8; MEMORY], vec![0u8; MEMORY]);
+  let call = |key: u8, record: &[u8]| slates_vfs::recover::HeldCall {
+    key: [key; slates_vfs::recover::HELD_CALL_KEY_BYTES],
+    record: record.to_vec(),
+  };
+  let mut journal = Journal::default();
+  journal
+    .checkpoint(
+      &mut checkpoints,
+      &ShardImage::new(in_checkpoint).with_calls(vec![call(1, b"one"), call(5, b"five")]),
+    )
+    .unwrap();
+  published.mark_published(&store);
+  create(
+    &mut published,
+    &mut store,
+    "changed",
+    b"after the checkpoint",
+  );
+  create(&mut fresh, &mut store, "fresh", b"never published");
+  let replies = vec![slates_vfs::recover::HeldReply {
+    attachment: 3,
+    unique: 5,
+    reply: b"reply".to_vec(),
+  }];
+  let held = b"held image".to_vec();
+
+  let mut streamed = Vec::new();
+  let at = ShardDelta::encode_start(&mut streamed);
+  for (key, vol) in [(low, &mut published), (high, &mut fresh)] {
+    streamed.extend_from_slice(&key);
+    vol.encode_publication(&store, None, &mut streamed).unwrap();
+  }
+  let mut unsorted = removed.clone();
+  let calls = vec![call(7, b"seven"), call(5, b"five, later")];
+  let calls_removed = vec![[1; slates_vfs::recover::HELD_CALL_KEY_BYTES]];
+  let nfs_replies = vec![
+    slates_vfs::recover::HeldNfsReply {
+      connection: 8,
+      xid: 3,
+      accepted: true,
+      results: b"mkdir".to_vec(),
+    },
+    slates_vfs::recover::HeldNfsReply {
+      connection: 2,
+      xid: 9,
+      accepted: true,
+      results: b"remove".to_vec(),
+    },
+  ];
+  ShardDelta::encode_finish(
+    &mut streamed,
+    at,
+    2,
+    &mut unsorted,
+    Some(&held),
+    Some(&replies),
+    (&mut calls.clone(), &mut calls_removed.clone()),
+    Some(&mut nfs_replies.clone()),
+  )
+  .unwrap();
+  let value = ShardDelta::new(
+    vec![
+      KeyedRecord {
+        key: high,
+        record: fresh.publication(&store, None).unwrap(),
+      },
+      KeyedRecord {
+        key: low,
+        record: published.publication(&store, None).unwrap(),
+      },
+    ],
+    removed,
+    Some(held),
+    Some(replies),
+  )
+  .with_calls(calls, calls_removed)
+  .with_nfs_replies(nfs_replies.clone());
+  assert!(
+    matches!(
+      value.volumes[0].record,
+      slates_vfs::delta::VolumeRecord::Delta { .. }
+    ) && matches!(
+      value.volumes[1].record,
+      slates_vfs::delta::VolumeRecord::Full { .. }
+    ),
+    "one delta record and one full record"
+  );
+  let mut expected = Vec::new();
+  slates_wire::Wire::encode(&value, &mut expected);
+  assert_eq!(streamed, expected, "the streamed shard delta's bytes");
+
+  let (mut by_value, mut by_value_log) = (journal, log.clone());
+  journal.append_encoded(&mut log, &streamed).unwrap();
+  by_value
+    .append(&mut by_value_log, &value, &mut Vec::new())
+    .unwrap();
+  let (recovered, _) = Journal::recover(&checkpoints, &log).unwrap();
+  let (expected, _) = Journal::recover(&checkpoints, &by_value_log).unwrap();
+  assert_eq!(recovered, expected, "what logging the value recovers");
+  let recovered = recovered.unwrap();
+  let keys: Vec<[u8; 16]> = recovered.volumes.iter().map(|keyed| keyed.key).collect();
+  assert_eq!(
+    keys,
+    vec![low, high],
+    "the removed volumes gone, the fresh one added"
+  );
+  assert_eq!(
+    recovered.volumes[0].image,
+    published.to_image(&store, None).unwrap(),
+    "the changed volume brought up to date"
+  );
+  assert_recovered_calls(
+    &recovered,
+    vec![call(5, b"five, later"), call(7, b"seven")],
+    nfs_replies,
+  );
+}
+
+/// The streamed delta's call records, as recovered: the changed one replaced, the new one added, the purged one gone,
+/// in key order; and its held NFSv3 replies, whole, in (connection, xid) order.
+fn assert_recovered_calls(
+  recovered: &ShardImage,
+  expected: Vec<slates_vfs::recover::HeldCall>,
+  mut nfs_replies: Vec<slates_vfs::recover::HeldNfsReply>,
+) {
+  assert_eq!(
+    recovered.calls, expected,
+    "the call records changed and added, the purged one gone, in key order"
+  );
+  nfs_replies.sort_by_key(|reply| (reply.connection, reply.xid));
+  assert_eq!(
+    recovered.nfs_replies, nfs_replies,
+    "the held NFSv3 replies, whole, in order"
+  );
 }

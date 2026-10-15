@@ -619,6 +619,23 @@ pub enum RequestBody {
     /// Its permission bits.
     mode: u32,
   },
+  /// A read-ahead window of a file (§4.8 "Lookup" forwards; `ReadRange` across nodes): up to `max` bytes from
+  /// `offset` at a view, answered as one `ReadPage`. Sent node to node only — the origin of a forwarded `ReadRange`
+  /// asks its owner for a window and answers the client's following pages from it — and capped at the owner by a
+  /// bounded window; a client asking it directly over its ring is answered as a `ReadRange`. A read; never recorded.
+  /// Appended.
+  ReadWindow {
+    /// The volume.
+    volume: VolumeId,
+    /// The file.
+    path: String,
+    /// The view.
+    at: ReadAt,
+    /// The first byte wanted.
+    offset: u64,
+    /// The most bytes wanted.
+    max: u64,
+  },
 }
 
 /// A concrete quorum-loss recovery proposal (§4.8). It identifies the retained copy and the
@@ -987,6 +1004,8 @@ pub struct ShardReport {
   pub configuration_version: u64,
   /// The takeover state as this shard's council holds it (live on the control shard).
   pub takeover: TakeoverReport,
+  /// This shard's failure detector's report of each peer (live on the control shard, empty elsewhere).
+  pub detector: Vec<DetectorPeerReport>,
   /// Task admissions this shard's runtime arena refused since boot (§4.3 "a task exceeding the budget
   /// is a counted bug signal"; §4.14): the shard's derived task budget covers every task the daemon
   /// spawns on it — clients' cross-shard work, its own loops, the fleet's share — so a count here is a
@@ -1013,6 +1032,20 @@ pub struct ShardReport {
   /// The node's ML-KEM-1024 recipient id (A-92 piece 4a): live on the control shard, whose partition holds it; empty
   /// on the others and while sealing is unavailable. Appended.
   pub seal_recipient_id: Vec<u8>,
+  /// This shard's record session to each peer, as last seen (live on the control shard, empty elsewhere). Appended.
+  pub sessions: Vec<SessionReport>,
+  /// NFS calls this shard served, by NFSv3 procedure number (0 `NULL` to 21 `COMMIT`, RFC 1813 §3; an NFSv4
+  /// compound counts each operation's v3 call): the round trips each client operation cost. Appended.
+  pub nfs_calls: Vec<u64>,
+  /// This shard's detector granularity (its measured wake lateness), nanoseconds: live on the control shard, zero
+  /// elsewhere. Appended.
+  pub detector_granularity_ns: u64,
+  /// The sessions peers dialed to this shard, as its serve loops last saw them (live on the control shard). Appended.
+  pub served_sessions: Vec<SessionReport>,
+  /// This shard's detector's pooled verdict: live on the control shard, empty elsewhere. Appended.
+  pub detector_pool: DetectorPoolReport,
+  /// This shard's detector's relay-stage timer: live on the control shard, empty elsewhere. Appended.
+  pub detector_relays: DetectorRelayReport,
 }
 
 /// The daemon's place in its fleet (§4.8; §2.6 boot step 6), as the verbs' placement authority sees it.
@@ -1057,6 +1090,250 @@ pub struct FleetReport {
   /// The takeover state as the control shard's council holds it: this node's neighbourhood settlement and
   /// every retirement kept, so a takeover that stalls shows why in any node's status.
   pub takeover: TakeoverReport,
+  /// What the control shard's failure detector found of each peer by its own probes (§4.8 membership), with
+  /// the theory's allowance beside each count: a count far above its allowance is a detector misjudging a
+  /// live peer, one within it is the network the detector was told about. Empty on a laptop.
+  pub detector: Vec<DetectorPeerReport>,
+  /// The control shard's record session to each peer (§4.8, the session forwards and reads ride): its congestion
+  /// state as last seen, so a slow cross-region transfer shows whether the window, the round trip or loss bound it.
+  /// Empty on a laptop. Appended.
+  pub sessions: Vec<SessionReport>,
+  /// The member's own wake lateness as its detector measured it (its granularity `G`, which floors every margin),
+  /// nanoseconds; zero before measured. A loaded host stalling the condemning node shows here. Appended.
+  pub detector_granularity_ns: u64,
+  /// The sessions peers dialed to this node, by the peer's anchor, as its serve loops last saw them after a request:
+  /// the connections a peer's forwards and reads ride, whose sender here is this node (`sessions` are the ones this
+  /// node dialed). Empty on a laptop. Appended.
+  pub served_sessions: Vec<SessionReport>,
+  /// The control shard's failure detector's pooled verdict: whether it configured, on how many round trips, and why it
+  /// last refused. Empty on a laptop. Appended.
+  pub detector_pool: DetectorPoolReport,
+  /// The control shard's failure detector's relay-stage timer: its timeout, and how many relayed answers came late.
+  /// Empty on a laptop. Appended.
+  pub detector_relays: DetectorRelayReport,
+}
+
+impl RequestBody {
+  /// The volume a request is about, when it is about one. A green over a base is born on the base volume's owner
+  /// shard, where the snapshot is walked, so `CreateGreen` names its base's volume. One rule for the daemon's routing
+  /// and the client's waiting ([`Self::may_be_forwarded`]).
+  pub fn volume(&self) -> Option<VolumeId> {
+    match self {
+      RequestBody::Snapshot { volume }
+      | RequestBody::DestroySnapshot { volume, .. }
+      | RequestBody::Versions { green: volume }
+      | RequestBody::ChangedSince { green: volume, .. }
+      | RequestBody::CreateWork { green: volume, .. }
+      | RequestBody::Edit { work: volume, .. }
+      | RequestBody::Declare { work: volume, .. }
+      | RequestBody::Submit { work: volume, .. }
+      | RequestBody::Rebase { work: volume }
+      | RequestBody::Clone { volume, .. }
+      | RequestBody::Attach { volume, .. }
+      | RequestBody::Resize { volume, .. }
+      | RequestBody::Destroy { volume }
+      | RequestBody::Status { volume }
+      | RequestBody::ReadBase { volume, .. }
+      | RequestBody::Digest { volume, .. }
+      | RequestBody::Rewitness { volume, .. }
+      | RequestBody::Pin { volume, .. }
+      | RequestBody::AwaitPlaced { volume, .. }
+      | RequestBody::Read { volume, .. }
+      | RequestBody::ReadRange { volume, .. }
+      | RequestBody::ReadWindow { volume, .. }
+      | RequestBody::ReadDir { volume, .. }
+      | RequestBody::StageBegin { work: volume, .. }
+      | RequestBody::StagePut { work: volume, .. }
+      | RequestBody::EditStaged { work: volume, .. }
+      | RequestBody::FsWrite { volume, .. }
+      | RequestBody::FsWriteStaged { volume, .. }
+      | RequestBody::FsRemove { volume, .. }
+      | RequestBody::FsRename { volume, .. }
+      | RequestBody::FsMkdir { volume, .. }
+      | RequestBody::Land { volume, .. } => Some(*volume),
+      // A green over a base is born on the base volume's owner shard, where the snapshot is walked.
+      RequestBody::CreateGreen { base, .. } => base.map(|b| b.volume),
+      RequestBody::Create { .. }
+      | RequestBody::Advance { .. }
+      | RequestBody::Detach { .. }
+      | RequestBody::BindMount { .. }
+      | RequestBody::List
+      | RequestBody::DaemonStatus
+      | RequestBody::DaemonStatusNext { .. }
+      | RequestBody::Bootstrap { .. }
+      | RequestBody::RecoveryPlan { .. }
+      | RequestBody::Recover { .. }
+      | RequestBody::PromoteRegion { .. }
+      | RequestBody::Grants
+      | RequestBody::Audit { .. }
+      | RequestBody::Acknowledge { .. }
+      | RequestBody::Telemetry { .. }
+      | RequestBody::Grant { .. }
+      | RequestBody::Enroll { .. }
+      | RequestBody::Attest { .. }
+      | RequestBody::Revoke { .. } => None,
+      RequestBody::Share { volume, .. } => Some(*volume),
+    }
+  }
+
+  /// Whether a verb changes the set of volumes or a volume's roots, so the owner shard must republish its recovery
+  /// image (§4.8). Data-plane content writes go through the mount transport, not here.
+  pub fn mutates_shard_image(&self) -> bool {
+    matches!(
+      self,
+      RequestBody::Create { .. }
+        | RequestBody::CreateGreen { .. }
+        | RequestBody::CreateWork { .. }
+        | RequestBody::Edit { .. }
+        | RequestBody::EditStaged { .. }
+        | RequestBody::Declare { .. }
+        | RequestBody::Submit { .. }
+        | RequestBody::Rebase { .. }
+        | RequestBody::Clone { .. }
+        | RequestBody::Resize { .. }
+        | RequestBody::Destroy { .. }
+        | RequestBody::Snapshot { .. }
+        | RequestBody::DestroySnapshot { .. }
+        | RequestBody::Share { .. }
+        | RequestBody::Enroll { .. }
+        | RequestBody::Revoke { .. }
+        | RequestBody::FsWrite { .. }
+        | RequestBody::FsWriteStaged { .. }
+        | RequestBody::FsRemove { .. }
+        | RequestBody::FsRename { .. }
+        | RequestBody::FsMkdir { .. }
+    )
+  }
+
+  /// Whether a verb is a **read** a node forwards to a volume's owner without a completion record: a volume-scoped
+  /// query that mutates nothing, so re-serving a retried forward is idempotent (§4.8 "Lookup"). A staging verb
+  /// forwards the same way: a retried put of bytes already written is answered unchanged, and a retried begin only
+  /// strands a charged buffer that expires within a lease.
+  pub fn forwards_as_read(&self) -> bool {
+    matches!(
+      self,
+      RequestBody::Status { .. }
+        | RequestBody::Versions { .. }
+        | RequestBody::ChangedSince { .. }
+        | RequestBody::Read { .. }
+        | RequestBody::ReadRange { .. }
+        | RequestBody::ReadWindow { .. }
+        | RequestBody::ReadDir { .. }
+        | RequestBody::StageBegin { .. }
+        | RequestBody::StagePut { .. }
+    )
+  }
+
+  /// Whether a verb is a **write** to an existing volume a node forwards to that volume's owner under a completion
+  /// record (§4.8 "Lookup"): a volume-scoped mutation ([`Self::volume`] names the volume, [`Self::mutates_shard_image`]
+  /// changes it).
+  pub fn forwards_as_write(&self) -> bool {
+    self.volume().is_some() && self.mutates_shard_image()
+  }
+
+  /// Whether a node may forward this verb to another node, so its reply can take a location round and a forward
+  /// across the fleet, each bounded by the daemon (§4.8 "Lookup"): longer than a client's reply deadline, while the
+  /// daemon always answers. The client waits for such a verb while its daemon lives (`slates_client::defers_reply`).
+  pub fn may_be_forwarded(&self) -> bool {
+    self.forwards_as_read() || self.forwards_as_write()
+  }
+}
+
+/// One record session to a peer, as this node last saw it (§4.8; condition 7's evidence): the sender's congestion
+/// state on the session forwards and reads ride. A session out on loan cannot be read, so the report is its state when
+/// it was last returned (`lent` says it is out now); zero everywhere when it has not been seen yet.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct SessionReport {
+  /// The peer's member id.
+  pub peer: u64,
+  /// Whether the session is out on loan now, so these numbers are from its last return.
+  pub lent: bool,
+  /// The congestion window, bytes (RFC 9002 §7; the controller slates runs, Copa).
+  pub congestion_window: u64,
+  /// The smoothed round trip, nanoseconds (RFC 9002 §5.3).
+  pub smoothed_rtt_ns: u64,
+  /// The probe timeout, nanoseconds (RFC 9002 §6.2.1).
+  pub pto_ns: u64,
+  /// Losses declared and then found spurious (a reordering mistaken for loss).
+  pub spurious_losses: u64,
+  /// Persistent-congestion collapses of the window (RFC 9002 §7.6).
+  pub persistent_collapses: u64,
+  /// Stream bytes the session has consumed from its peer.
+  pub bytes_consumed: u64,
+  /// The path MTU discovered, bytes; zero before discovery.
+  pub path_mtu: u64,
+}
+
+/// One peer as this node's failure detector judges it (hyper-swim's `PeerReport`): the suspicions and
+/// condemnations its own probes made, each beside the expected number were the peer alive throughout
+/// (Chen, Toueg and Aguilera 2002, Theorem 7, summed over every judged probe), in thousandths.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct DetectorPeerReport {
+  /// The peer's member id.
+  pub peer: u64,
+  /// Whether the pair's own estimator judges its probes (rather than the member's pooled one, or none yet).
+  pub configured: bool,
+  /// Suspicions this node's own probes started.
+  pub suspicions: u64,
+  /// Their allowance in thousandths: the expected suspicions of a peer alive throughout.
+  pub suspicion_allowance_milli: u64,
+  /// Times this node condemned the peer by its own probes.
+  pub condemnations: u64,
+  /// Their allowance in thousandths: over every judged probe, the bound on it and the probe before both
+  /// going unanswered.
+  pub condemnation_allowance_milli: u64,
+  /// The verdict that judges the pair's probes now: `own` (its estimator configured), `pool` (the member's pooled
+  /// verdict), `provisional` (a pair the pool does not fit, or a first contact: hyper-swim claims no Theorem 7 bound
+  /// for it), or `measuring` (no verdict yet). What tells a false condemnation under a bounded verdict, a defect, from
+  /// one under a provisional verdict, a design limit. Appended.
+  pub judged_by: String,
+  /// That verdict's expected arrival of an answer, nanoseconds (zero while measuring). Appended.
+  pub expected_ns: u64,
+  /// That verdict's margin past the expected arrival before a probe counts as unanswered, nanoseconds. Appended.
+  pub margin_ns: u64,
+  /// The round trips the pair's own estimator has taken (hyper-swim's `round_trips_taken`). Appended.
+  pub samples: u64,
+  /// The judging verdict's mistake bound in thousandths: 1000 for a provisional verdict (no Theorem 7 bound), the
+  /// configured β otherwise; zero while measuring. Appended.
+  pub mistake_milli: u64,
+  /// Whether the member's pooled verdict does not fit the pair (hyper-swim's `misfits_pool`): its round trips do not feed
+  /// the pool, and before its own estimator configures it is judged provisionally by its own round trip (while the pool
+  /// has no verdict, only once it has been silent past RFC 6298's timeout). Appended.
+  pub pool_misfit: bool,
+  /// Why the pair's own estimator last refused to configure (hyper-timing's `Refusal`), empty once it configured or
+  /// before it tried. Appended.
+  pub refused: String,
+}
+
+/// The relay stage as the member's failure detector bounds it (hyper-swim's `RelayReport`): each relay judges its own
+/// leg to the target by its own deadline and nacks when that passes unanswered, and the stage ends once every relay
+/// asked has nacked, or when the slowest has its response due, by the member's span for it and the bound it stated.
+/// A relay-reachable peer condemned under load says here how long its relay stages could wait.
+#[derive(Wire, Clone, Debug, Default, PartialEq, Eq)]
+pub struct DetectorRelayReport {
+  /// The latest any relay the member could ask has its response due, from the request, nanoseconds (zero while no
+  /// alive peer has stated a relay bound, when an unanswered probe asks no relay).
+  pub due_ns: u64,
+  /// The peers that have stated a relay bound.
+  pub stated: u64,
+}
+
+/// The member's pooled verdict as its failure detector holds it (hyper-swim's `PoolReport`): what judges every pair that
+/// has no verdict of its own and fits the pool, so a peer shown `measuring` says whether the pool never configured,
+/// and why.
+#[derive(Wire, Clone, Debug, Default, PartialEq, Eq)]
+pub struct DetectorPoolReport {
+  /// Whether the pool has a verdict (it keeps one once configured).
+  pub configured: bool,
+  /// The round trips the pool took.
+  pub samples: u64,
+  /// Why the pool's latest configuration refused (hyper-timing's `Refusal`), empty after one succeeded or before any
+  /// was tried.
+  pub refused: String,
+  /// The pool's verdict's expected arrival of an answer, nanoseconds (zero before configured).
+  pub expected_ns: u64,
+  /// The pool's verdict's margin, nanoseconds (zero before configured).
+  pub margin_ns: u64,
 }
 
 /// The takeover state a council holds (§4.8 "Neighbourhood changes", "Promotion and takeover"): this node's
@@ -1716,6 +1993,16 @@ pub enum AttachRequest {
     /// The directory presented, as a path from the volume's root; the whole volume when absent.
     subtree: Option<String>,
   },
+  /// A host mount bound to one Unix identity (§4.6 A-115): requests whose `AUTH_SYS` caller is `uid` are served;
+  /// every other caller, the superuser's included, is answered attributes and an `ACCESS` granting nothing, so a
+  /// kernel's per-user access cache stops its walk at the export's root and no link target one identity read is
+  /// served to another from the client's cache. Optionally one directory. Appended.
+  BoundHostMount {
+    /// The identity served.
+    uid: u32,
+    /// The directory presented, as a path from the volume's root; the whole volume when absent.
+    subtree: Option<String>,
+  },
 }
 
 impl AttachRequest {
@@ -1733,7 +2020,9 @@ impl AttachRequest {
   pub fn subtree(&self) -> Option<&str> {
     match self {
       Self::ScopedHostMount { subtree } | Self::ScopedFuseMount { subtree, .. } => Some(subtree),
-      Self::SharedFuseMount { subtree, .. } => subtree.as_deref(),
+      Self::SharedFuseMount { subtree, .. } | Self::BoundHostMount { subtree, .. } => {
+        subtree.as_deref()
+      }
       _ => None,
     }
   }
@@ -1849,7 +2138,7 @@ pub struct LandingSummary {
 }
 
 /// A finished landing's outcome (§4.15): the counts, and what the landing achieved and met — its
-/// durability, every Degraded cell, the entries it kept private, and the concurrency it settled on (AUD-29-05:
+/// durability, every Degraded cell, the entries it kept private, and the barriers it took (AUD-29-05:
 /// until 2026-09-29 the reply carried the counts only, and a landing that did not sync read as done).
 #[derive(Wire, Clone, Debug, PartialEq, Eq)]
 pub struct LandingOutcome {
@@ -1874,14 +2163,15 @@ pub struct LandingOutcome {
   pub durability: LandingDurability,
   /// Every Degraded cell the landing met, in the order met.
   pub degraded: Vec<LandingDegradation>,
-  /// The in-flight depth the landing's ramp settled on (§4.15 step 7).
-  pub ramp_depth: u32,
+  /// The batch barriers the landing took (§4.15 step 8, A-130): each made a batch of written-out files durable
+  /// before any of them was placed, so fewer than the files written whenever a batch held more than one.
+  pub barriers: u64,
 }
 
 /// The durability a landing achieved (§4.15 step 8).
 #[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LandingDurability {
-  /// Every written file's data sync ran before its link or exchange.
+  /// Every written file was written out, and behind its batch's barrier, before its link or exchange.
   pub data_synced: bool,
   /// Every directory the landing touched was synced.
   pub dirs_synced: bool,
@@ -2231,6 +2521,25 @@ pub enum Refusal {
   /// A granted landing's target lease ended before the landing could start — its term passed while it
   /// waited — so nothing was written; retry (AUD-29-03). Appended for append-only evolution.
   LandingLeaseLost,
+  /// The client holds as many unacknowledged completion records on this shard as its bound allows (§4.9
+  /// "Exactly-once": a record is kept until the client acknowledges it): the request was not run and nothing was
+  /// recorded. Acknowledge what the client has received, retry any id it still owes a retry, then send it again.
+  /// A retry of an id already completed and an `Acknowledge` are always served. Appended for append-only
+  /// evolution.
+  AcknowledgementOwed {
+    /// The completion records the client holds unacknowledged on the refusing shard.
+    retained: u64,
+    /// The bound they reached.
+    bound: u64,
+  },
+  /// No owner of a volume homed in this region's fleet answered a forwarded verb within the takeover bound (the
+  /// operator's failover SLO): the forward was sent again while the owner was not confirmed dead, and none came back
+  /// (§4.8 "Lookup"). Retryable with the same request id: a successor serves once a takeover installs it. Until
+  /// 2026-10-09 this case was answered `HomedElsewhere`, which names another region and sends the caller there.
+  OwnerUnreachable {
+    /// The region whose fleet the volume's owner was sought in.
+    region: u64,
+  },
 }
 
 /// The writes a snapshot is known to include (§4.6 "Writeback and snapshot barrier"): every write the

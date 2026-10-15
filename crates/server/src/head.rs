@@ -146,6 +146,15 @@ pub struct SealJob {
   /// kept past the "already placed" drop, and a holder that answers the offer with chunks it lacked is a
   /// **repair**, counted. Its rounds are the ordinary content rounds — the same put, hedge and record path.
   pub healing: bool,
+  /// For a mirror shipment (`crate::mirror`): the mirror holders of its content that acknowledged its head and
+  /// catalog records. Placed in the mirror once `f + 1` hold both. Empty for a home seal.
+  pub records_acked: Vec<HostId>,
+  /// For a mirror shipment: its encoded records as first built, resent unchanged to every holder after. The head names
+  /// the content holders known when it was built, and a holder keeps the first value at a position and refuses a
+  /// different one (`slates_db::mirror::MirrorRecords::accept`), so a shipment rebuilt after more holders acknowledged
+  /// was refused for good by a holder whose first acknowledgement was lost (2026-10-09: 328 refusals, the snapshot
+  /// never placed in the mirror). `None` for a home seal and until first built.
+  pub shipment: Option<Vec<u8>>,
 }
 
 #[cfg(test)]

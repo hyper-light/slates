@@ -73,6 +73,11 @@ const SEND_REFUSED: &str = "fleet.plane.send_refused";
 const RECEIVE_REFUSED: &str = "fleet.plane.receive_refused";
 const ADDRESS_UNRESOLVED: &str = "fleet.plane.address_unresolved";
 const FOLD_REFUSED: &str = "fleet.plane.fold_refused";
+/// Event counters (`slates status`): record sessions lent to the announcement pass, and announcements sent on them. A
+/// session is lent only when its connection owes an announcement, so the two move together; lends outrunning sends is
+/// the pass borrowing sessions that owe nothing.
+const EPOCH_LENT: &str = "fleet.plane.announce_lends";
+const EPOCH_SENT: &str = "fleet.plane.announcements_sent";
 
 /// One side's identity in an epoch exchange.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -160,7 +165,7 @@ impl std::fmt::Debug for PlaneState {
 
 /// The anchor a member id belongs to: the anchor whose learned id it is, or whose seed id it is (`FleetPeer::host`,
 /// what its record session is keyed by before it announces itself).
-fn anchor_of(state: &ShardState, member: HostId) -> Option<HostId> {
+pub(crate) fn anchor_of(state: &ShardState, member: HostId) -> Option<HostId> {
   state
     .learned_members
     .iter()
@@ -242,32 +247,45 @@ fn forget_address(state: &mut ShardState, anchor: HostId) {
 /// The dialer side: every record session this node dialed announces its identity once per connection, so the peer
 /// learns who dialed (or refuses and counts a forged identity) whatever the pair's keying. The **canonical** one (this
 /// node the lower anchor) also announces the pair's next epoch, installed once the acceptor answers with a valid
-/// identity; any other announces [`IDENTITY_ONLY`]. The sessions are borrowed from the record links and returned, as
-/// the record coordinator borrows them.
+/// identity; any other announces [`IDENTITY_ONLY`].
+///
+/// Only a session whose connection has not announced yet is owed, decided in the state's borrow from the session
+/// still in its slot, and each owed session is borrowed alone for its own exchange and returned before the next. The
+/// membership loop runs this on every turn: borrowing every session on each turn, all of them held while one
+/// announcement waited, kept the whole record plane lent about a hundred times a second per node and held every
+/// session for up to 3.1 s behind one unanswered announcement (diagnostic run at 10% loss, 2026-10-09).
 async fn announce_epochs() {
   // Decided in one borrow: `take_sessions` runs its filter inside the state's borrow, so the filter must not borrow the
   // state again.
-  let owed: BTreeMap<HostId, bool> = state::with_state(|state| {
-    state
+  let owed: Vec<(HostId, bool)> = state::with_state(|state| {
+    let origin = state.origin_anchor;
+    let anchors: BTreeMap<HostId, HostId> = state
       .record_sessions
       .keys()
-      .copied()
-      .filter_map(|member| {
-        let anchor = anchor_of(state, member)?;
-        Some((member, anchor > state.origin_anchor))
+      .filter_map(|member| Some((*member, anchor_of(state, *member)?)))
+      .collect();
+    let announced_on = &state.plane.announced_on;
+    state
+      .record_sessions
+      .iter_mut()
+      .filter_map(|(member, link)| {
+        let anchor = anchors.get(member)?;
+        let connection = link.endpoint.as_mut()?.connection_id().ok()?;
+        (announced_on.get(member) != Some(&connection)).then_some((*member, *anchor > origin))
       })
       .collect()
   })
   .unwrap_or_default();
-  if owed.is_empty() {
-    return;
+  for (member, canonical) in owed {
+    let mut sessions =
+      crate::fleet::take_sessions("fleet.lent_to.announce_epochs", |host| host == member);
+    let lent = u64::try_from(sessions.len()).unwrap_or(u64::MAX);
+    let _ = state::with_state_counted(|s| s.count(EPOCH_LENT, lent));
+    for (_, endpoint) in &mut sessions {
+      announce_on(member, endpoint, canonical).await;
+    }
+    crate::fleet::return_sessions(sessions);
   }
-  let mut sessions = crate::fleet::take_sessions(|member| owed.contains_key(&member));
-  for (member, endpoint) in &mut sessions {
-    let canonical = owed.get(member).copied().unwrap_or(false);
-    announce_on(*member, endpoint, canonical).await;
-  }
-  crate::fleet::return_sessions(sessions);
 }
 
 /// One announcement on one borrowed session, once per connection: the pair's next epoch on its `canonical` session,
@@ -305,6 +323,7 @@ async fn announce_on(member: HostId, endpoint: &mut Endpoint, canonical: bool) {
   .flatten() else {
     return;
   };
+  crate::fleet::count_refusal(EPOCH_SENT);
   let budget = crate::fleet::record_exchange_budget_ns();
   let answered = futures::within(
     budget,
@@ -321,7 +340,7 @@ async fn announce_on(member: HostId, endpoint: &mut Endpoint, canonical: bool) {
       return;
     }
   };
-  let _ = state::with_state(|state| {
+  let _ = state::with_state_counted(|state| {
     let Some(answer) = Announcement::decode(&reply).filter(|answer| answer.epoch == epoch) else {
       crate::fleet::count_refusal_in(state, EPOCH_REFUSED);
       return;
@@ -377,11 +396,6 @@ impl Fleet for StateFleet<'_> {
     {
       return None;
     }
-    // Test support: a peer this node is deaf to gets no acknowledgement of its direct probe, the asymmetric path loss
-    // the indirect-probe regression imposes.
-    if state.probe_deaf_to.contains(&prober) {
-      return None;
-    }
     // The holder side of the owner lease (§4.8 "Leases and reads"; AUD-08): when this node answered, and the
     // configuration version the prober announced.
     let now = slates_machine::clock::monotonic_ns();
@@ -389,6 +403,11 @@ impl Fleet for StateFleet<'_> {
     state.answers_given.announced(prober, configuration_version);
     let regional = state.council.configuration();
     Some((regional.version, regional.standing_of(prober)))
+  }
+
+  fn hears(&self, from: HostId) -> bool {
+    // Test support: nothing from a peer this node is deaf to reaches the plane, the probe-plane loss a test imposes.
+    !self.0.probe_deaf_to.contains(&from)
   }
 
   fn admit(&mut self, from: HostId, boot_nonce: u64) -> bool {
@@ -401,6 +420,10 @@ impl Fleet for StateFleet<'_> {
 
   fn relays_to(&self, target: HostId) -> bool {
     crate::fleet::keeps_direct_contact_with(self.0, target)
+  }
+
+  fn lease_holders(&self, into: &mut Vec<HostId>) {
+    self.0.fleet.configuration().lease_holders_into(into);
   }
 }
 
@@ -419,6 +442,12 @@ fn fold_events(state: &mut ShardState, events: &[PlaneEvent]) {
       crate::fleet::sample_path(state, from, rtt_ns);
       state.probe_windows.acknowledged = state.probe_windows.acknowledged.saturating_add(1);
       state.formed_probe_peers.insert(from);
+      // Only an answer from this node's own region bears on its lease: its holders are all there, and another
+      // region's answer carries that region's council version and no standing for this node — another counter,
+      // which read as newer superseded the owner for good (found 2026-10-07: region 1 at version 5, region 0 at 4).
+      if !crate::fleet::same_region(state, from) {
+        continue;
+      }
       let installed = state.fleet.configuration();
       let (own, installed_version) = (installed.standing(), installed.version);
       state.lease.answered(
@@ -580,7 +609,7 @@ async fn fold_membership(origin: u16, shards: &[u16]) {
     // leaves it stale.
     if folded.is_err() {
       crate::fleet::count_refusal(FOLD_REFUSED);
-      let _ = state::with_state(|state| {
+      let _ = state::with_state_counted(|state| {
         for (member, _) in &changed {
           state.plane.folded.remove(member);
         }
@@ -607,22 +636,23 @@ async fn resolve_peers(resolver: Option<Kept<Resolver>>) {
   for (anchor, address, certificate) in unresolved {
     let resolved =
       crate::fleet::resolve_peer_address(&address, Plane::Probe, &certificate, resolver).await;
-    let _ = state::with_state(
-      |state| match (resolved, state.plane.peers.get_mut(&anchor)) {
-        (Some(resolved), Some(peer)) => {
-          peer.resolved = Some(resolved);
-          peer.stale = false;
-        }
-        _ => crate::fleet::count_refusal_in(state, ADDRESS_UNRESOLVED),
-      },
-    );
+    let _ =
+      state::with_state_counted(
+        |state| match (resolved, state.plane.peers.get_mut(&anchor)) {
+          (Some(resolved), Some(peer)) => {
+            peer.resolved = Some(resolved);
+            peer.stale = false;
+          }
+          _ => crate::fleet::count_refusal_in(state, ADDRESS_UNRESOLVED),
+        },
+      );
   }
 }
 
 /// Joins to the detector every keyed member whose address is resolved, once (`MemberPlane::join`): a member is judged
 /// only once a probe of it can be sent.
 fn join_addressable() {
-  let _ = state::with_state(|state| {
+  let _ = state::with_state_counted(|state| {
     let ready: Vec<HostId> = state
       .plane
       .keyed
@@ -695,6 +725,16 @@ fn send(socket: &UdpSocket, addressed: &[(SocketAddrV4, Vec<u8>)]) {
   }
 }
 
+/// How this node renews its owner lease (§4.8 "Leases and reads"; `slates_cluster::lease_renewal`): each holder probed
+/// at least once a coordinator period, the cadence the lease bound is stated in (nine periods: `lease::horizon_ns`), so
+/// eight renewals in a row can be lost before a live, reachable owner's lease lapses; an answer counts within the bound.
+fn lease_renewal() -> slates_cluster::lease_renewal::LeaseRenewal {
+  slates_cluster::lease_renewal::LeaseRenewal {
+    interval_ns: crate::daemon::HEARTBEAT_NS,
+    bound_ns: crate::lease::lease_bound_ns(),
+  }
+}
+
 /// The membership task: for the daemon's life, the plane over `socket`. Each turn it announces any canonical epoch owed,
 /// resolves new peers, steps the detector and sends, then waits for a datagram until the detector's wake (or a
 /// heartbeat, so new sessions are keyed promptly), feeds it in, and folds the detector's view into the fleet.
@@ -711,6 +751,8 @@ pub(crate) async fn run(
       boot_nonce,
       members,
       std::time::Duration::from_nanos(slates_machine::clock::resolution_ns()),
+      lease_renewal(),
+      std::time::Duration::from_nanos(crate::lease::horizon_ns()),
     )
     .map(|plane| state.plane.plane = Some(plane))
     .is_ok()
@@ -755,6 +797,53 @@ pub(crate) async fn run(
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  /// §4.8 "Leases and reads" across regions (found 2026-10-07 on two Docker networks: region 1's council at version 5,
+  /// region 0's at 4, and region 0's owner refused its own volume `LeaseUnconfirmed` for good, counting
+  /// `lease.refused.superseded`). Do: fold a probe acknowledgement from a member of another region announcing a newer
+  /// configuration version and no standing for this node, then the same from a member of this node's region. Expect:
+  /// the other region's answer leaves the lease alone — its council's versions are another counter — and only the
+  /// same-region answer supersedes it.
+  #[test]
+  fn another_regions_configuration_version_never_supersedes_the_owner_lease() {
+    let (foreign_superseded, own_superseded) = crate::daemon::audit_on_shard(|state| {
+      let local = state.fleet.host();
+      let foreign = HostId(local.0 ^ 0x11);
+      let neighbour = HostId(local.0 ^ 0x22);
+      state
+        .node_regions
+        .insert(local, slates_db::register::RegionId(0));
+      state
+        .node_regions
+        .insert(foreign, slates_db::register::RegionId(1));
+      state
+        .node_regions
+        .insert(neighbour, slates_db::register::RegionId(0));
+      let installed = state.fleet.configuration().version;
+      let newer = installed.saturating_add(1);
+      let answer = |from| PlaneEvent::Acked {
+        from,
+        boot_nonce: 0,
+        configuration_version: newer,
+        standing: None,
+        sent_ns: 0,
+        rtt_ns: 1,
+      };
+      fold_events(state, &[answer(foreign)]);
+      let foreign_superseded = state.lease.known_version(installed) != installed;
+      fold_events(state, &[answer(neighbour)]);
+      let own_superseded = state.lease.known_version(installed) != installed;
+      (foreign_superseded, own_superseded)
+    });
+    assert!(
+      !foreign_superseded,
+      "another region's version left the lease alone"
+    );
+    assert!(
+      own_superseded,
+      "a same-region holder's newer version supersedes, as before"
+    );
+  }
   use slates_cluster::membership::Liveness;
 
   fn state_of(liveness: Liveness, incarnation: u64) -> MemberState {

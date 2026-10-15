@@ -422,6 +422,52 @@ fn strict_volume_or_typed_refusal(instance: &str) -> Option<String> {
   None
 }
 
+/// §4.14 `daemon.alive` (2026-10-10, when the anchor began waiting for the lapse instead of looking every beat): a daemon
+/// that stops beating is killed at its heartbeat lapse and restarted. Do: start an anchor, freeze its daemon
+/// (`SIGSTOP`: alive and silent), and wait for another daemon to answer. Expect the frozen one gone, killed once, and the
+/// new one answering no sooner than the liveness budget less one heartbeat after the freeze (the lapse runs from the last
+/// beat, which may precede the freeze by a beat) and within the suite's start wait after that.
+#[test]
+fn a_frozen_daemon_is_killed_at_its_heartbeat_lapse_and_restarted() {
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the frozen-daemon flow: set SLATES_TEST_CLI=1 to run it (an anchor and its daemon)"
+    );
+    return;
+  }
+  let instance = format!("cli-frozen-{}", std::process::id());
+  let anchor = start_anchor(&instance);
+  let frozen = daemon_pid(&instance).expect("the daemon answers");
+  assert!(
+    Command::new("kill")
+      .args(["-STOP", &frozen.to_string()])
+      .status()
+      .unwrap()
+      .success()
+  );
+  let stopped = Instant::now();
+  let successor = await_daemon(&instance, Some(frozen), &[]);
+  let replaced_after = stopped.elapsed();
+  let frozen_alive = Command::new("kill")
+    .args(["-0", &frozen.to_string()])
+    .status()
+    .unwrap()
+    .success();
+  drop(anchor);
+  let budget = Duration::from_nanos(slates_server::daemon::LIVENESS_BUDGET_NS);
+  let beat = Duration::from_nanos(slates_server::daemon::HEARTBEAT_NS);
+  assert_ne!(successor, frozen);
+  assert!(!frozen_alive, "the frozen daemon was killed");
+  assert!(
+    replaced_after >= budget.saturating_sub(beat),
+    "not killed before its heartbeat lapsed: replaced after {replaced_after:?}"
+  );
+  assert!(
+    replaced_after <= budget + START_WAIT,
+    "killed at the lapse and replaced: after {replaced_after:?}"
+  );
+}
+
 /// Kills the daemon (`SIGKILL`) and waits for the anchor's restarted one to answer.
 fn kill_the_daemon_and_await_its_successor(instance: &str) {
   let killed = daemon_pid(instance).unwrap();
@@ -2347,6 +2393,15 @@ fn assert_formed(views: &[Option<FleetView>]) -> Vec<String> {
             "fleet.accept.replaced:",
             "fleet.fan.sent:",
             "fleet.fan.unchanged:",
+            // Events of formation's normal work, added to the map since this list was last kept (2026-10-10): the
+            // discovery pages sent, the learner's configuration fetches and those its backoff skipped, the
+            // announcement pass's lent sessions and sends, and the idle purge's freed bytes.
+            "fleet.discovery.pages:",
+            "fleet.learner.fetches:",
+            "fleet.learner.fetch_paced:",
+            "fleet.plane.announce_lends:",
+            "fleet.plane.announcements_sent:",
+            "content.purged_bytes:",
           ]
           .iter()
           .any(|counter| line.split_whitespace().nth(3) == Some(counter))
@@ -2444,13 +2499,20 @@ fn wait_placed(instance: &str, id: &str, snapshot: &str) {
   }
 }
 
-/// Before the owner dies its peers hold the head as candidates but serve no such volume: `volume stat`
-/// refuses on both — the transition the takeover makes is then observable, not vacuous.
+/// Before the owner dies its peers hold the head as candidates but own no such volume: neither lists it among its own
+/// volumes, while a `volume stat` there is answered by the owner itself (a lookup by id reaches the volume's creator
+/// from any node of its region, §4.8 "Lookup", since 2026-10-07). The transition the takeover makes is then observable,
+/// not vacuous. Until 2026-10-10 this asserted the old rule (`NotFound` on a holder) and failed under the new one.
 fn assert_not_served(instances: &[String], id: &str) {
   for instance in instances {
+    let (code, out, err) = run(instance, &["volume", "list"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(
+      !out.contains(id),
+      "a holder does not own the owner's volume: {out}"
+    );
     let (code, _, err) = run(instance, &["volume", "stat", id]);
-    assert_eq!(code, 1, "a holder does not serve the owner's volume: {err}");
-    assert!(err.contains("NotFound"), "{err}");
+    assert_eq!(code, 0, "a holder's stat reaches the owner: {err}");
   }
 }
 
@@ -2480,6 +2542,12 @@ fn wait_successor(instances: &[String], id: &str) -> String {
   let deadline = Instant::now() + FLEET_WAIT;
   loop {
     for instance in instances {
+      // The successor is the survivor that owns the volume: it lists it among its own. A `volume stat` alone answers on
+      // every node of the region once any owns it (a lookup by id reaches the owner, §4.8), so it cannot name which.
+      let (code, listed, _) = run(instance, &["volume", "list"]);
+      if code != 0 || !listed.contains(id) {
+        continue;
+      }
       let (code, out, _) = run(instance, &["volume", "stat", id]);
       if code == 0 {
         assert_eq!(value_of(&out, "name"), FLEET_VOLUME);

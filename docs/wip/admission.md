@@ -327,16 +327,51 @@ acknowledging placement", §4.2).
    (§5.5).** The hold is on each shard's byte budget — `admittable = capacity − committed − headroom
    − hold` (`ShardBudget::set_hold`/`hold`, `crates/mem/src/budget.rs`) — and shrinks admittable
    only, never revoking a committed claim, so no admitted volume's within-entitlement write is
-   touched. The daemon's reap loop samples `Facts::memory_available_now` at the liveness cadence (the
+   touched. The control shard's reap loop samples `Facts::memory_available_now` at the liveness cadence (the
    cheap refresh), captures a boot baseline, and fans the host-wide shortfall below it, divided
    evenly among the shards, as each shard's hold (`daemon::refresh_pressure_hold` over
    `xshard::run_on`); the hold releases to zero as the sample recovers, and a host with no sampler
-   leaves it at zero (admits exactly as before). Proven by use: a raised hold refuses a new bounded
+   leaves it at zero (admits exactly as before). **Amended 2026-10-09: one sampler, holds sent on change.** Every
+   shard runs a reap loop, and until this date each one sampled and sent its hold to every shard: N² messages a second
+   on a daemon at rest. Now only the control shard samples, and a hold is sent to a shard only when it changes
+   (BENCHMARKS: an idle 16-shard daemon's context switches fell from 113–142 to 39–43 a second).
+   **Amended 2026-10-10: the hold is the daemon's, withheld once.** "Divided evenly among the shards" above is
+   superseded. With the content pool (A-98) one volume on one shard can reach every free extent, so an even split held
+   such a volume back by its shard's share alone: half the hold on two shards, a fifth on five. The sampler now
+   withholds the whole hold, in order:
+   1. from the pool's free extents, claimed under the hold's own owner, so no shard can grow into them;
+   2. from the free room the shards already hold, in proportion to it, as their ledger holds;
+   3. as a debt every shard is told, taken on as hold by whichever shard next grows from the pool.
+   The third is exact when one shard grows and conservative when several grow within a refresh; claiming one more
+   extent instead would over-hold by up to a whole part (8 GiB under this machine's derived layout). A takeover's
+   recovery may take the hold's extents as it lifts its shard's hold. Proven by use:
+   - `a_pressured_daemons_hold_is_withheld_whole_from_a_volume_on_any_one_shard`;
+   - `a_hold_the_pool_cannot_cover_is_taken_from_the_free_room_the_shards_hold`;
+   - `a_hold_finer_than_the_pools_free_extents_is_owed_by_the_next_shard_to_grow`.
+   Each of the first two failed before the fix with exactly half the hold
+   (`docs/bugs/2026-10-10-the-pressure-hold-was-split-per-shard-while-the-pool-is-shared.md`). Proven by use: a raised hold refuses a new bounded
    create `BudgetExceeded` while an admitted volume's further write within its limit still lands
    (`crates/server/tests/nfs_mount.rs::a_memory_pressure_hold_refuses_new_admission_but_not_an_admitted_volumes_writes`,
    with `Daemon::inject_pressure_hold`/`pressure_holds` driving the mechanism deterministically), and
    by the pure ledger unit
    (`crates/mem/src/budget.rs::a_pressure_hold_withholds_admission_without_touching_a_committed_claim`).
+   **Amended 2026-10-07: a takeover is recovery, not new admission.** A successor's materialization of a volume its
+   dead owner held (the fetch's staging, the restore, the reservations, the populating writes, a green's chain) runs
+   with the hold lifted for exactly that synchronous work (`fleet::past_the_pressure_hold`). It is a claim the fleet
+   already committed, so the hold, which never revokes a committed claim, does not refuse it, just as boot recovery
+   is admitted at a zero hold. Capacity and the headroom still bound it. Before, a pressured successor adopted the
+   head and never served the volume
+   (`docs/bugs/2026-10-07-a-pressure-hold-kept-a-successor-from-serving-a-taken-over-volume.md`;
+   `a_pressure_hold_does_not_keep_a_successor_from_serving_a_taken_over_volume`).
+   **Amended 2026-10-09: the hold never exceeds the daemon's unbacked room.** The hold is now the smaller of the
+   shortfall (as above) and the daemon's room — its whole content capacity less its own growth since the first sample —
+   less the host's free memory (`daemon::pressure_hold`). That is the invariant itself: what the daemon can still fill
+   must fit in what the host has free. On a host with no slack at the first sample the hold is the shortfall, as
+   before. On a roomy host, memory other processes take from the slack beyond anything the daemon could fill holds
+   nothing. Before, a 64 MiB daemon refused a 1 MiB create while the host had 92% of its memory free, because another
+   process's swing counted as pressure
+   (`docs/bugs/2026-10-09-the-pressure-hold-counted-other-processes-swings-on-a-roomy-host.md`;
+   `memory_others_take_from_a_roomy_host_is_held_only_where_it_eats_into_the_daemons_room`).
    Still owed in this dimension (not the pressure hold): the finer pressure source (Linux PSI
    `memory.some` where the kernel offers it, over the coarser `MemAvailable`), and the Windows
    job-object memory limit sub-part of §5.4.

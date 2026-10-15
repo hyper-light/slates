@@ -139,7 +139,7 @@ fn export_verb(
   client: &mut Client,
   instance: &str,
   volume: VolumeId,
-  (read_only, subtree): (bool, Option<&str>),
+  (read_only, subtree, uid): (bool, Option<&str>, Option<u32>),
   json: bool,
 ) -> Result<(), Failure> {
   let report = client.status(volume).map_err(|e| failure_of(e, instance))?;
@@ -148,9 +148,10 @@ fn export_verb(
   } else {
     Intent::Write
   };
-  let attachment = match subtree {
-    Some(subtree) => client.attach_scoped_mount(volume, intent, subtree),
-    None => client.attach_mount(volume, intent),
+  let attachment = match (uid, subtree) {
+    (Some(uid), subtree) => client.attach_bound_mount(volume, intent, uid, subtree),
+    (None, Some(subtree)) => client.attach_scoped_mount(volume, intent, subtree),
+    (None, None) => client.attach_mount(volume, intent),
   }
   .map_err(|e| failure_of(e, instance))?;
   let Some(token) = attachment.token else {
@@ -349,13 +350,14 @@ pub(crate) fn run(request: &ClientRequest) -> Result<(), Failure> {
     volume,
     read_only,
     subtree,
+    uid,
   } = &request.verb
   {
     return export_verb(
       &mut client,
       &request.instance,
       *volume,
-      (*read_only, subtree.as_deref()),
+      (*read_only, subtree.as_deref(), *uid),
       request.json,
     );
   }
@@ -1526,7 +1528,7 @@ fn print_landing(landing: slates_client::Landing) {
       for degradation in &outcome.degraded {
         println!("degraded: {}", slates_mcp::degradation_json(degradation));
       }
-      println!("ramp_depth: {}", outcome.ramp_depth);
+      println!("barriers: {}", outcome.barriers);
     }
     slates_client::Landing::GrantRequired {
       landing,
@@ -1789,6 +1791,52 @@ fn daemon_status_text(report: &DaemonReport, telemetry: &[TelemetryReport]) -> S
   out.push_str(&takeover_text(&report.fleet.takeover));
   out.push_str(&group_text("council", &report.fleet.council));
   out.push_str(&group_text("root", &report.fleet.root));
+  for peer in &report.fleet.detector {
+    out.push_str(&format!(
+      "fleet_detector {}: configured={} judged_by={} expected_ns={} margin_ns={} samples={} mistake={}/1000 suspicions={} (allowance {}/1000) condemnations={} (allowance {}/1000) pool_misfit={} refused={}\n",
+      peer.peer,
+      peer.configured,
+      peer.judged_by,
+      peer.expected_ns,
+      peer.margin_ns,
+      peer.samples,
+      peer.mistake_milli,
+      peer.suspicions,
+      peer.suspicion_allowance_milli,
+      peer.condemnations,
+      peer.condemnation_allowance_milli,
+      peer.pool_misfit,
+      peer.refused
+    ));
+  }
+  let pool = &report.fleet.detector_pool;
+  out.push_str(&format!(
+    "fleet_detector_pool: configured={} samples={} refused={} expected_ns={} margin_ns={}\n",
+    pool.configured, pool.samples, pool.refused, pool.expected_ns, pool.margin_ns
+  ));
+  let relays = &report.fleet.detector_relays;
+  out.push_str(&format!(
+    "fleet_detector_relays: due_ns={} stated={}\n",
+    relays.due_ns, relays.stated
+  ));
+  out.push_str(&format!(
+    "fleet_detector_granularity_ns: {}\n",
+    report.fleet.detector_granularity_ns
+  ));
+  for session in &report.fleet.sessions {
+    out.push_str(&format!(
+      "fleet_session {}: lent={} cwnd={} srtt_ns={} pto_ns={} spurious_losses={} persistent_collapses={} consumed={} mtu={}\n",
+      session.peer,
+      session.lent,
+      session.congestion_window,
+      session.smoothed_rtt_ns,
+      session.pto_ns,
+      session.spurious_losses,
+      session.persistent_collapses,
+      session.bytes_consumed,
+      session.path_mtu
+    ));
+  }
   for shard in &report.shards {
     out.push_str(&format!(
       "shard {}: clients={} volumes={} served={} replayed={} replay_ns={} torn={} mapped={} locked={} reserve={} committed={} retained={} replicated={} retained_versions={} metadata={} committed_metadata={} tasks_refused={} landings_awaiting={}/{} landings_in_flight={} target_leases={}\n",
@@ -1818,6 +1866,20 @@ fn daemon_status_text(report: &DaemonReport, telemetry: &[TelemetryReport]) -> S
       out.push_str(&format!(
         "shard {} refused {}: {}\n",
         shard.partition, refusal.kind, refusal.count
+      ));
+    }
+    let calls: Vec<String> = shard
+      .nfs_calls
+      .iter()
+      .zip(NFS_V3_PROCEDURE_NAMES)
+      .filter(|(count, _)| **count > 0)
+      .map(|(count, name)| format!("{name}={count}"))
+      .collect();
+    if !calls.is_empty() {
+      out.push_str(&format!(
+        "shard {} nfs_calls: {}\n",
+        shard.partition,
+        calls.join(" ")
       ));
     }
     for signal in &shard.signals {
@@ -2155,3 +2217,30 @@ mod tests {
     assert_eq!(signal_value(&absent), "absent/unknown");
   }
 }
+
+/// Format: the NFSv3 procedure names in procedure-number order, 0 (`NULL`) to 21 (`COMMIT`), RFC 1813 §3 — the
+/// order of `ShardReport::nfs_calls`.
+const NFS_V3_PROCEDURE_NAMES: [&str; 22] = [
+  "null",
+  "getattr",
+  "setattr",
+  "lookup",
+  "access",
+  "readlink",
+  "read",
+  "write",
+  "create",
+  "mkdir",
+  "symlink",
+  "mknod",
+  "remove",
+  "rmdir",
+  "rename",
+  "link",
+  "readdir",
+  "readdirplus",
+  "fsstat",
+  "fsinfo",
+  "pathconf",
+  "commit",
+];

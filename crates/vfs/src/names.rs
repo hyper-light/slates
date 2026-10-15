@@ -108,7 +108,29 @@ impl NameEquivalence {
   pub fn same(self, a: &str, b: &str) -> bool {
     match self {
       Self::Exact => a == b,
+      Self::Fold if a.is_ascii() && b.is_ascii() => a.eq_ignore_ascii_case(b),
       Self::Fold => self.folded(a).eq(self.folded(b)),
+    }
+  }
+
+  /// The order of two names' folded forms — exactly `self.folded(a).cmp(self.folded(b))` — without an iterator step per
+  /// character in the common cases: an exact name compares as bytes (UTF-8's byte order is its code-point order), and
+  /// two ASCII names under folding compare as lowercased bytes, then by length. A replayed delta binary-searches its
+  /// directory's entries with this, and the iterator form was a fifth of a recovery's replay (2026-10-06,
+  /// `recover_bench`).
+  pub fn compare(self, a: &str, b: &str) -> std::cmp::Ordering {
+    match self {
+      Self::Exact => a.as_bytes().cmp(b.as_bytes()),
+      Self::Fold if a.is_ascii() && b.is_ascii() => {
+        for (x, y) in a.bytes().zip(b.bytes()) {
+          let (x, y) = (x.to_ascii_lowercase(), y.to_ascii_lowercase());
+          if x != y {
+            return x.cmp(&y);
+          }
+        }
+        a.len().cmp(&b.len())
+      }
+      Self::Fold => self.folded(a).cmp(self.folded(b)),
     }
   }
 }
@@ -195,5 +217,33 @@ mod tests {
     }
     assert!(check(&"x".repeat(256)).is_err());
     assert!(check(&"x".repeat(255)).is_ok());
+  }
+
+  use proptest::prelude::*;
+
+  /// Names a generator draws for the comparison oracle: mostly ASCII with every case, sometimes non-ASCII (precomposed
+  /// and combining forms), so both fast paths and the general one run.
+  // proptest's `prop_oneof!` builds its union over `Arc` (D-8's harness exception; test code only).
+  #[allow(clippy::disallowed_types)]
+  fn name() -> impl Strategy<Value = String> {
+    prop_oneof![
+      "[a-zA-Z0-9._-]{0,12}",
+      "[a-zA-Z\u{e9}\u{301}\u{c5}\u{3a3}\u{3c3}]{0,8}",
+    ]
+  }
+
+  proptest! {
+    #![proptest_config(slates_test_seeds::unseeded(ProptestConfig { cases: 4000, .. ProptestConfig::default() }))]
+
+    /// The ordering oracle (2026-10-06, the comparison fast paths). Do: compare and equate generated names under both
+    /// policies. Expect: `compare` equals the folded iterators' order and `same` their equality, every time — the fast
+    /// paths change the cost, never the answer the tree's and the image's order rely on.
+    #[test]
+    fn compare_and_same_agree_with_the_folded_forms(a in name(), b in name()) {
+      for policy in [NameEquivalence::Exact, NameEquivalence::Fold] {
+        prop_assert_eq!(policy.compare(&a, &b), policy.folded(&a).cmp(policy.folded(&b)), "{:?} {:?} {:?}", policy, a, b);
+        prop_assert_eq!(policy.same(&a, &b), policy.folded(&a).eq(policy.folded(&b)), "{:?} {:?} {:?}", policy, a, b);
+      }
+    }
   }
 }

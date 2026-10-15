@@ -25,6 +25,22 @@ mod linux {
   /// sixteenth of the region, far below the whole region a populating lock commits.
   const SLACK: usize = LEN / 16;
 
+  /// The tests read the process's locked bytes (`VmLck`, one counter for the whole process) before and after their
+  /// own lock, so a concurrent test's lock, or its unlock when its region drops, inside that window reads as this
+  /// one's. On two test threads 8 of 30 runs failed so ("the OS reports 0 bytes locked"), on one thread none of 10
+  /// (2026-10-10, the Linux lane; CI's threads run them in parallel too). This lock serialises the tests, each holding
+  /// it from before its region exists until after the region drops: the test-harness exception to R2's no-`Mutex`
+  /// rule (D-8 exception 3).
+  #[allow(clippy::disallowed_types)]
+  static LOCKED_BYTES_WINDOW: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+  /// Takes the window, recovering it if a failed test poisoned it, so one failure reports itself alone.
+  fn serialize() -> std::sync::MutexGuard<'static, ()> {
+    LOCKED_BYTES_WINDOW
+      .lock()
+      .unwrap_or_else(std::sync::PoisonError::into_inner)
+  }
+
   /// The process's resident bytes, from `/proc/self/statm` (its second field, in pages).
   fn resident() -> usize {
     let statm = std::fs::read_to_string("/proc/self/statm").unwrap();
@@ -66,6 +82,7 @@ mod linux {
   /// the process's resident set does not grow by it.
   #[test]
   fn locking_a_private_region_charges_it_without_faulting_it_in() {
+    let _window = serialize();
     lock_and_check(
       "locking_a_private_region_charges_it_without_faulting_it_in",
       Region::map(LEN, PAGE, false).unwrap(),
@@ -76,6 +93,7 @@ mod linux {
   /// arena). Expect: the OS charges it locked and the process's resident set does not grow by it.
   #[test]
   fn locking_a_shared_object_region_charges_it_without_faulting_it_in() {
+    let _window = serialize();
     let name = format!("slates-lockfault-{}", std::process::id());
     let object = SharedObject::create(&name, LEN, Words::new()).unwrap();
     // SAFETY: this test is the object's only mapper, and the object declares no words.

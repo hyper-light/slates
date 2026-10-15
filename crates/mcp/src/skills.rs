@@ -6,6 +6,11 @@
 //! Each document follows the open Agent Skills specification (agentskills.io): YAML frontmatter with `name` (the
 //! directory's name) and `description` (what it does and when to use it), then the instructions. The resource's
 //! description is the frontmatter's, so a client's catalog shows what the skill itself says.
+//!
+//! The same documents are also served through the Skills extension (SEP-2640, `io.modelcontextprotocol/skills`,
+//! negotiated as SEP-2133 extensions are): `skills/list` and `skills/get` answer each skill's entry with a manifest of
+//! its files and their `sha256:` digests, which the official MCP Inspector validates (2026-10-08: before the extension
+//! was declared it reported `skills_unsupported`).
 
 /// Format: the URI scheme and authority every skill resource is named under.
 pub(crate) const URI_PREFIX: &str = "skill://slates/";
@@ -54,6 +59,34 @@ impl Skill {
       .map(str::trim)
       .unwrap_or_default()
   }
+}
+
+impl Skill {
+  /// The skill's entry for the Skills extension (SEP-2640, `io.modelcontextprotocol/skills`): its URI, its
+  /// frontmatter's `name` and `description`, and a manifest of every file the skill holds (here its `SKILL.md` alone),
+  /// each with a `sha256:` digest of its bytes and its size, so a client verifies what it reads.
+  pub(crate) fn entry(&self) -> serde_json::Value {
+    let uri = self.uri();
+    serde_json::json!({
+      "uri": uri,
+      "frontmatter": { "name": self.name, "description": self.description() },
+      "resources": [{ "uri": uri, "digest": digest(self.body.as_bytes()), "size": self.body.len() }],
+    })
+  }
+}
+
+/// Format: the prefix of a Skills-extension digest (SEP-2640: `sha256:` and 64 lowercase hex characters).
+const DIGEST_PREFIX: &str = "sha256:";
+
+/// The SEP-2640 digest of `bytes`: `sha256:` and the SHA-256 as lowercase hex.
+fn digest(bytes: &[u8]) -> String {
+  let hash = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, bytes);
+  let hex: String = hash
+    .as_ref()
+    .iter()
+    .map(|byte| format!("{byte:02x}"))
+    .collect();
+  format!("{DIGEST_PREFIX}{hex}")
 }
 
 /// The skill a resource URI names, if any.

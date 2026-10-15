@@ -113,7 +113,8 @@ pub enum Op {
     id: u64,
   },
   /// A host mount's attachment was bound to the path the mount was established at (§4.4
-  /// `Binding → Bound`; GAP-A9-4): its form becomes `ChosenPath { path }`. Appended.
+  /// `Binding → Bound`; GAP-A9-4): its form becomes `ChosenPath { path }`, a scoped mount's keeps its scope and a
+  /// bound mount's its identity and scope (A-115). Appended.
   AttachmentBound {
     /// The attachment.
     id: u64,
@@ -323,6 +324,37 @@ pub enum Op {
     /// Whose key.
     owner: crate::catalog::SealKeyOwner,
   },
+  /// An NFSv4.1 session was recorded or changed at its client's listener (A-127). Appended.
+  NfsSessionSet {
+    /// The record.
+    record: crate::catalog::NfsSessionRecord,
+  },
+  /// An NFSv4.1 session was destroyed at its client's listener (A-127). Appended.
+  NfsSessionCleared {
+    /// Format: the session id (16 bytes).
+    sessionid: [u8; 16],
+  },
+  /// An NFSv4.1 call record was recorded or replaced with the file-state change one of its calls made (A-127).
+  /// Appended.
+  NfsCallSet {
+    /// The record.
+    record: crate::catalog::NfsCallRecord,
+  },
+  /// Every call record of a destroyed NFSv4.1 session was dropped (A-127). Appended.
+  NfsCallsCleared {
+    /// Format: the session id (16 bytes).
+    sessionid: [u8; 16],
+  },
+  /// An NFSv4 purge became owed to every owner, with the drop that made it (2026-10-10). Appended.
+  NfsPurgeOwed {
+    /// The purge.
+    record: crate::catalog::NfsPurgeRecord,
+  },
+  /// An owed NFSv4 purge was acknowledged by every owner (2026-10-10). Appended.
+  NfsPurgeSettled {
+    /// The purge.
+    record: crate::catalog::NfsPurgeRecord,
+  },
 }
 
 impl Op {
@@ -376,6 +408,12 @@ impl Op {
       Op::NfsDelegationCleared { .. } => "nfs_delegation_cleared",
       Op::SealKeySet { .. } => "seal_key_set",
       Op::SealKeyDestroyed { .. } => "seal_key_destroyed",
+      Op::NfsSessionSet { .. } => "nfs_session_set",
+      Op::NfsSessionCleared { .. } => "nfs_session_cleared",
+      Op::NfsCallSet { .. } => "nfs_call_set",
+      Op::NfsCallsCleared { .. } => "nfs_calls_cleared",
+      Op::NfsPurgeOwed { .. } => "nfs_purge_owed",
+      Op::NfsPurgeSettled { .. } => "nfs_purge_settled",
     }
   }
 }

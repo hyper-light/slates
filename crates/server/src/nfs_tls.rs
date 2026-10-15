@@ -297,15 +297,14 @@ async fn serve_session(
     };
     match parsed {
       (Some(message), consumed) => {
-        let reply = if carries_auth_tls(&message) == Some(true) {
+        // Both replies are framed as one record: the served one by `crate::nfs::reply_to_message` itself.
+        let record = if carries_auth_tls(&message) == Some(true) {
           crate::fleet::count_refusal(AUTH_TLS_INSIDE);
-          bad_credential_reply(xid_of(&message))
+          write_record(&bad_credential_reply(xid_of(&message)))
         } else {
-          crate::nfs::reply_to_message(this, &message, port).await
+          crate::nfs::reply_to_message(this, message, port).await
         };
-        session
-          .send(&write_record(&reply))
-          .map_err(|_| SESSION_REFUSED)?;
+        session.send(&record).map_err(|_| SESSION_REFUSED)?;
         plaintext.drain(..consumed);
         // One call per turn, as the loopback connection serves (§4.3, D-18).
         futures::yield_now().await;

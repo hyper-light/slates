@@ -154,6 +154,9 @@ pub enum DriftKind {
 pub struct BaseStatus {
   /// Every witnessed entry whose disk no longer matches its witness, by path.
   pub drift: Vec<(String, DriftKind)>,
+  /// Every witnessed entry whose re-check the host refused now (an I/O error reading the disk), by path, with the
+  /// refusal: not known to match, so never reported as if it did (2026-10-07; the re-check's refusal was dropped).
+  pub unverified: Vec<(String, VfsError)>,
   /// The watcher's state.
   pub watcher: WatchState,
 }
@@ -400,8 +403,15 @@ pub struct BasePlane {
   witness_homes: Versioned<InodeNo, (InodeNo, Box<str>)>,
   /// Drift by inode number.
   drift: BTreeMap<InodeNo, DriftKind>,
+  /// One per change to [`Self::drift`]: the base plane's durable-change token
+  /// ([`Self::durable_change_token`]) counts it beside the versioned tables' writes, so an overlay publication
+  /// takes a delta — which carries no base-plane state — only while the whole durable base plane is unchanged.
+  drift_writes: u64,
   /// Open file descriptors by inode number (large-class copies and read-through).
   descriptors: BTreeMap<InodeNo, HostFile>,
+  /// Descriptors taken out of `descriptors` by a reclaim that had no host to close them with (the volume reclaims an
+  /// inode on its own): closed when the next [`Overlay`] borrow ends. Bounded by `descriptors`, which each left.
+  closing: Vec<HostFile>,
   /// The base entry each whiteout hides, by (directory inode, name): its fingerprint at the
   /// removal, the landing's witnessed base for a delete (§4.15). Versioned by epoch (A-48).
   whiteouts: Versioned<(InodeNo, Box<str>), Fingerprint>,
@@ -431,6 +441,11 @@ pub struct BasePlane {
 }
 
 impl BasePlane {
+  /// Queues `file`, forgotten by a reclaim with no host, to be closed when the next overlay borrow ends.
+  pub(crate) fn queue_close(&mut self, file: HostFile) {
+    self.closing.push(file);
+  }
+
   fn new(config: BaseConfig, root_no: InodeNo) -> Self {
     let mut listings = BTreeMap::new();
     listings.insert(
@@ -452,7 +467,9 @@ impl BasePlane {
       witnesses: Versioned::default(),
       witness_homes: Versioned::default(),
       drift: BTreeMap::new(),
+      drift_writes: 0,
       descriptors: BTreeMap::new(),
+      closing: Vec::new(),
       whiteouts: Versioned::default(),
       redirects: Versioned::default(),
       watch: WatchState::Unavailable,
@@ -498,6 +515,22 @@ impl BasePlane {
     plane.whiteouts = self.whiteouts.view_at(epoch);
     plane.redirects = self.redirects.view_at(epoch);
     plane
+  }
+
+  /// A token that changes whenever any durable base-plane state a delta publication does not carry has been written
+  /// since it was last read: the witnesses, their homes, the whiteouts and the redirects (each counts its own writes,
+  /// including an in-place head overwrite), and the drift set. An overlay's publication takes a delta (which carries
+  /// no base plane) only while this token equals what its last committed publication saw, so a copy-up, whiteout,
+  /// rename or drift forces the next publication to be the whole image — the only record that carries the base plane
+  /// (A-48). Listings are not counted: recovery re-reads them from the host.
+  pub(crate) fn durable_change_token(&self) -> u64 {
+    self
+      .witnesses
+      .writes()
+      .wrapping_add(self.witness_homes.writes())
+      .wrapping_add(self.whiteouts.writes())
+      .wrapping_add(self.redirects.writes())
+      .wrapping_add(self.drift_writes)
   }
 
   /// The witness of an inode, if it was copied up.
@@ -651,6 +684,15 @@ impl BasePlane {
   }
 }
 
+/// Whether a directory node is an untouched merged base directory: it shows the disk, holds nothing of the volume's
+/// own and was never moved, so dropping it loses nothing the volume did.
+fn untouched_merged_dir(store: &Store, dir: Handle<DirNode>) -> bool {
+  store
+    .dirs
+    .get(dir)
+    .is_ok_and(|n| n.base == BaseDirState::Merged && n.is_empty() && n.origin.is_none())
+}
+
 fn host_refusal(e: HostError) -> VfsError {
   match e {
     HostError::NotFound => VfsError::NotFound,
@@ -719,7 +761,12 @@ impl Volume {
       store,
       self.root,
       |no| plane.is_some_and(|b| b.is_witnessed(no)),
-      |no| matches!(self.inode(store, no).map(|i| &i.body), Ok(Body::Base(_))),
+      |no| {
+        matches!(
+          self.inode(store, no).map(|i| &i.body),
+          Ok(Body::Base(_) | Body::BaseLink(_))
+        )
+      },
     )
   }
 
@@ -735,7 +782,7 @@ impl Volume {
       |no| {
         matches!(
           self.inode_in(store, id, no).map(|i| &i.body),
-          Ok(Body::Base(_))
+          Ok(Body::Base(_) | Body::BaseLink(_))
         )
       },
     ))
@@ -927,7 +974,9 @@ impl Volume {
     if plane.forget_digest(store, no) {
       plane.digest_stats.invalidated = plane.digest_stats.invalidated.saturating_add(1);
     }
-    plane.drift.remove(&no);
+    if plane.drift.remove(&no).is_some() {
+      plane.drift_writes = plane.drift_writes.saturating_add(1);
+    }
     let descriptor = plane.descriptors.remove(&no);
     let at = self.witness_clock();
     if let Some(plane) = self.base.as_mut() {
@@ -941,6 +990,20 @@ impl Volume {
 pub struct Overlay<'a> {
   vol: &'a mut Volume,
   host: &'a mut dyn HostFs,
+}
+
+/// An overlay borrow closes the descriptors a reclaim forgot (`BasePlane::closing`) when it ends, so every verb run
+/// through it closes what it reclaimed, and a reclaim with no host closes at the next borrow. Before 2026-10-07 a
+/// reclaim dropped the descriptor unclosed: a file descriptor leaked per unlinked base file on a real disk.
+impl Drop for Overlay<'_> {
+  fn drop(&mut self) {
+    let Some(plane) = self.vol.base.as_mut() else {
+      return;
+    };
+    for file in std::mem::take(&mut plane.closing) {
+      self.host.close_file(file);
+    }
+  }
 }
 
 impl Overlay<'_> {
@@ -1095,6 +1158,23 @@ impl Overlay<'_> {
         (Some(l), Child::File(no)) if l.kind == HostKind::File && self.unloaded_file(store, no) => {
           changed.push((no, l.fingerprint, e.name.to_owned()));
         }
+        // An untouched base symlink the disk replaced (`ln -sf` makes a new link at the name, so its change time
+        // moves) or turned into another kind leaves the node, and the next lookup serves the disk's entry: its target
+        // was read once, with the listing, and the live disk is what an untouched entry shows (§4.5; 2026-10-08).
+        (Some(l), Child::Symlink(no))
+          if self.unloaded_file(store, no) && self.listed_link_changed(store, no, l) =>
+        {
+          gone.push(e.name.to_owned());
+        }
+        // An untouched file or merged directory whose name the disk now gives another kind leaves the node the same
+        // way, and the next lookup serves the disk's entry (until 2026-10-08 the old kind stayed, serving a file the
+        // disk no longer had at a name that was now a directory).
+        (Some(l), Child::File(no)) if l.kind != HostKind::File && self.unloaded_file(store, no) => {
+          gone.push(e.name.to_owned());
+        }
+        (Some(l), Child::Dir(h)) if l.kind != HostKind::Dir && untouched_merged_dir(store, h) => {
+          gone.push(e.name.to_owned());
+        }
         (Some(_), _) => {}
         (None, Child::File(no) | Child::Symlink(no) | Child::Fifo(no) | Child::Socket(no))
           if self.unloaded_file(store, no) =>
@@ -1102,11 +1182,7 @@ impl Overlay<'_> {
           gone.push(e.name.to_owned());
         }
         (None, Child::Dir(h)) => {
-          if store
-            .dirs
-            .get(h)
-            .is_ok_and(|n| n.base == BaseDirState::Merged && n.is_empty() && n.origin.is_none())
-          {
+          if untouched_merged_dir(store, h) {
             gone.push(e.name.to_owned());
           }
         }
@@ -1114,6 +1190,17 @@ impl Overlay<'_> {
       }
     }
     Ok((gone, changed))
+  }
+
+  /// Whether the disk's entry at an untouched base symlink's name is no longer the link it was read from: another
+  /// kind, or a link whose size or times differ from the ones the inode took from the listing.
+  fn listed_link_changed(&self, store: &Store, no: InodeNo, listed: &BaseEntry) -> bool {
+    let fp = listed.fingerprint;
+    listed.kind != HostKind::Symlink
+      || self.vol.inode(store, no).map_or(true, |inode| {
+        (inode.attrs.size, inode.attrs.mtime, inode.attrs.ctime)
+          != (fp.size, fp.mtime_ns, fp.ctime_ns)
+      })
   }
 
   /// Whether the descriptor inode `no` holds names a file other than `fp`'s (the listed name was replaced
@@ -1141,7 +1228,7 @@ impl Overlay<'_> {
       && self
         .vol
         .inode(store, no)
-        .is_ok_and(|i| matches!(i.body, Body::Base(_) | Body::Symlink(_)) && i.attrs.nlink == 1)
+        .is_ok_and(|i| matches!(i.body, Body::Base(_) | Body::BaseLink(_)) && i.attrs.nlink == 1)
   }
 
   /// Removes an untouched entry the disk no longer has from the node (no whiteout, no journal).
@@ -1376,8 +1463,11 @@ impl Overlay<'_> {
           .host
           .read_link(parent_dir, &entry.name)
           .map_err(host_refusal)?;
-        let mut inode = Inode::new(no, epoch, Kind::Symlink, fp.mode, Body::Symlink(target));
+        let mut inode = Inode::new(no, epoch, Kind::Symlink, fp.mode, Body::BaseLink(target));
         inode.attrs.size = fp.size;
+        // The disk's times, as a base file takes them (until 2026-10-08 a base symlink reported time zero).
+        inode.attrs.mtime = fp.mtime_ns;
+        inode.attrs.ctime = fp.ctime_ns;
         (inode.attrs.uid, inode.attrs.gid) = (fp.uid, fp.gid);
         inode.home = Home::new(parent_no, self.vol.policy.hash(&entry.name));
         let handle = store.inodes.insert(inode)?;
@@ -1802,7 +1892,7 @@ impl Overlay<'_> {
         let to_path = self.vol.path_of(store, to_dir, to_name);
         self.vol.record(
           Op::Redirect { from: from.into() },
-          &to_path,
+          to_path,
           Some(moved.inode),
           0,
         );
@@ -2121,6 +2211,18 @@ impl Overlay<'_> {
     if plane.is_witnessed(no) {
       return Ok(());
     }
+    if let Body::BaseLink(target) = &self.vol.inode(store, no)?.body {
+      // A base symlink's copy-up is its target becoming the volume's own: nothing is read from the disk (the target
+      // was read with the listing), and the link is a created one from here on, so a rename lands it at its new name
+      // and the whiteout left at the old name removes the disk's.
+      let target = target.clone();
+      let handle = self.vol.make_current_inode(store, no)?;
+      let prev = store.inodes.get(handle)?.version;
+      store.inodes.get_mut(handle)?.body = Body::Symlink(target);
+      let path = self.vol.path_of_inode(store, no).unwrap_or_default();
+      self.vol.record(Op::Witness, path, Some(no), prev);
+      return Ok(());
+    }
     let is_base = matches!(self.vol.inode(store, no)?.body, Body::Base(_));
     if !is_base {
       return Ok(());
@@ -2200,7 +2302,9 @@ impl Overlay<'_> {
       self.vol.write_room(store, 0, len)?;
       let before = crate::volume::content_by_epoch(store, handle);
       store.inodes.get_mut(handle)?.body = Body::Inline(Vec::new());
-      self.vol.reconcile(before, Vec::new());
+      self
+        .vol
+        .reconcile(before, crate::volume::EpochContent::Empty);
       if !bytes.is_empty() {
         self.vol.apply_write_whole(store, handle, 0, &bytes)?;
       }
@@ -2208,7 +2312,7 @@ impl Overlay<'_> {
       self.plane()?.descriptors.insert(no, file);
     }
     let path = self.vol.path_of_inode(store, no).unwrap_or_default();
-    self.vol.record(Op::Witness, &path, Some(no), prev);
+    self.vol.record(Op::Witness, path, Some(no), prev);
     Ok(())
   }
 
@@ -2723,14 +2827,16 @@ impl Overlay<'_> {
 
   /// Records a drift of `kind` for the inode (once per kind) and journals it.
   fn record_drift(&mut self, store: &mut Store, no: InodeNo, kind: DriftKind) {
-    let fresh = self
-      .vol
-      .base
-      .as_mut()
-      .is_some_and(|b| b.drift.insert(no, kind) != Some(kind));
+    let fresh = self.vol.base.as_mut().is_some_and(|b| {
+      let changed = b.drift.insert(no, kind) != Some(kind);
+      if changed {
+        b.drift_writes = b.drift_writes.saturating_add(1);
+      }
+      changed
+    });
     if fresh {
       let path = self.vol.path_of_inode(store, no).unwrap_or_default();
-      self.vol.record(Op::Drift, &path, Some(no), 0);
+      self.vol.record(Op::Drift, path, Some(no), 0);
     }
   }
 
@@ -2759,6 +2865,27 @@ impl Overlay<'_> {
     Ok(Some(*blake3::hash(&bytes?).as_bytes()))
   }
 
+  /// Re-checks the witnessed entries `targets` against the disk. A re-check the host refused is not a pass: its
+  /// directory waits for the next drain, so the entry is checked again rather than forgotten (bounded: the set of
+  /// directories). Drift found is recorded by the check itself.
+  fn recheck_witnessed(
+    &mut self,
+    store: &mut Store,
+    targets: Vec<InodeNo>,
+  ) -> Result<(), VfsError> {
+    for no in targets {
+      match self.check_drift(store, no) {
+        Ok(()) | Err(VfsError::BaseDrift) => {}
+        Err(_) => {
+          if let Some(home) = self.vol.inode(store, no).ok().and_then(|inode| inode.home) {
+            self.plane()?.recheck.insert(home.parent());
+          }
+        }
+      }
+    }
+    Ok(())
+  }
+
   /// `status`: every witnessed entry re-checked now, the drift list by path, the watcher.
   pub fn status(&mut self, store: &mut Store) -> Result<BaseStatus, VfsError> {
     self.process_hints(store)?;
@@ -2768,9 +2895,21 @@ impl Overlay<'_> {
       .as_ref()
       .map(|b| b.witnesses.iter_head().map(|(no, _)| *no).collect())
       .unwrap_or_default();
+    let mut unverified = Vec::new();
     for no in witnessed {
-      let _ = self.check_drift(store, no);
+      match self.check_drift(store, no) {
+        // Drift found is recorded by the check itself and listed below.
+        Ok(()) | Err(VfsError::BaseDrift) => {}
+        Err(refusal) => unverified.push((
+          self
+            .vol
+            .path_of_inode(store, no)
+            .unwrap_or_else(|| format!("inode {}", no.0)),
+          refusal,
+        )),
+      }
     }
+    unverified.sort_by(|a, b| a.0.cmp(&b.0));
     let plane = self.vol.base.as_ref().ok_or(VfsError::NotOverlay)?;
     let mut drift: Vec<(String, DriftKind)> = plane
       .drift
@@ -2788,8 +2927,61 @@ impl Overlay<'_> {
     drift.sort();
     Ok(BaseStatus {
       drift,
+      unverified,
       watcher: plane.watch,
     })
+  }
+
+  /// Asks for the recall of every delegation held on an untouched base entry the watcher's hints may have changed:
+  /// the entry a hint names, every one homed in a directory a nameless hint names, or every one after an overflow. RFC 8881 §10.2: "operations done outside the
+  /// NFSv4.1 protocol ... also need to result in delegation recall". An untouched entry shows the disk, so an
+  /// outsider's edit beneath it changes what the volume serves, and a holder that is not told keeps serving its own
+  /// cached bytes; a copied-up entry's bytes are the volume's own and are not recalled (its drift is reported instead,
+  /// §4.15). Bounded by the delegation table (one pass over this volume's delegated inodes per drain with a nameless
+  /// hint) and by the named entries (one lookup each). Measured 2026-10-08: one outsider's append beneath a delegated
+  /// directory recalled all 153 of its files when hints named only directories.
+  fn recall_hinted(
+    &self,
+    store: &mut Store,
+    all: bool,
+    whole: &BTreeSet<InodeNo>,
+    named: &BTreeSet<(InodeNo, Box<str>)>,
+  ) {
+    if !all && whole.is_empty() && named.is_empty() {
+      return;
+    }
+    let untouched = |store: &Store, no: InodeNo| {
+      self.vol.base.as_ref().is_some_and(|b| !b.is_witnessed(no))
+        && self
+          .vol
+          .inode(store, no)
+          .is_ok_and(|inode| matches!(inode.body, Body::Base(_) | Body::BaseLink(_)))
+    };
+    if all || !whole.is_empty() {
+      for no in store.recall_gate.delegated_in(self.vol.prefix()) {
+        let no = InodeNo(no);
+        let in_whole = all
+          || self.vol.inode(store, no).is_ok_and(|inode| {
+            inode
+              .home
+              .is_some_and(|home| whole.contains(&home.parent()))
+          });
+        if in_whole && untouched(store, no) {
+          store.recall_gate.recall(no.0);
+        }
+      }
+    }
+    for (dir_no, name) in named {
+      let entry = self
+        .vol
+        .current_dir(store, *dir_no)
+        .and_then(|dir| self.vol.lookup(store, dir, name));
+      if let Ok(located) = entry
+        && untouched(store, located.inode)
+      {
+        store.recall_gate.recall(located.inode.0);
+      }
+    }
   }
 
   /// Drains the watcher's hints: a changed directory invalidates its listing, marks it stale for
@@ -2806,23 +2998,15 @@ impl Overlay<'_> {
       let loaded = &plane.listings;
       plane.stale_since.retain(|no, _| loaded.contains_key(no));
     }
+    // The recalls the hints ask (A-122): every untouched entry of a directory a nameless hint names, or the named
+    // entry alone.
+    let mut whole: BTreeSet<InodeNo> = BTreeSet::new();
+    let mut named: BTreeSet<(InodeNo, Box<str>)> = BTreeSet::new();
     for hint in hints {
       plane.hint_seq = plane.hint_seq.saturating_add(1);
-      match hint {
-        Hint::Changed(dir) => {
-          let hit = plane
-            .listings
-            .iter()
-            .find(|(_, l)| l.dir == dir)
-            .map(|(no, _)| *no);
-          if let Some(no) = hit {
-            if let Some(l) = plane.listings.get_mut(&no) {
-              l.entries = None;
-            }
-            plane.recheck.insert(no);
-            plane.stale_since.insert(no, plane.hint_seq);
-          }
-        }
+      let (dir, entry) = match hint {
+        Hint::Changed(dir) => (dir, None),
+        Hint::Entry(dir, name) => (dir, Some(name)),
         Hint::Overflow => {
           plane.watch = WatchState::Overflowed;
           let seq = plane.hint_seq;
@@ -2831,11 +3015,34 @@ impl Overlay<'_> {
             plane.stale_since.insert(*no, seq);
           }
           plane.recheck_all = true;
+          continue;
+        }
+      };
+      let hit = plane
+        .listings
+        .iter()
+        .find(|(_, l)| l.dir == dir)
+        .map(|(no, _)| *no);
+      if let Some(no) = hit {
+        if let Some(l) = plane.listings.get_mut(&no) {
+          l.entries = None;
+        }
+        plane.recheck.insert(no);
+        plane.stale_since.insert(no, plane.hint_seq);
+        match entry {
+          Some(name) => {
+            named.insert((no, name));
+          }
+          None => {
+            whole.insert(no);
+          }
         }
       }
     }
     let all = std::mem::take(&mut plane.recheck_all);
     let dirs = std::mem::take(&mut plane.recheck);
+    self.recall_hinted(store, all, &whole, &named);
+    let plane = self.vol.base.as_ref().ok_or(VfsError::NotOverlay)?;
     let witnessed: Vec<InodeNo> = plane.witnesses.iter_head().map(|(no, _)| *no).collect();
     let targets: Vec<InodeNo> = witnessed
       .into_iter()
@@ -2849,9 +3056,7 @@ impl Overlay<'_> {
             .is_some_and(|h| dirs.contains(&h.parent()))
       })
       .collect();
-    for no in targets {
-      let _ = self.check_drift(store, no);
-    }
+    self.recheck_witnessed(store, targets)?;
     if all {
       let dropped = self.plane()?.drop_all_digests(store);
       let stats = &mut self.plane()?.digest_stats;
@@ -2884,6 +3089,22 @@ impl Overlay<'_> {
     base: Option<BaseConfig>,
     source: Option<SnapshotId>,
   ) -> Result<(), VfsError> {
+    self.land_advance_begin(store, base)?;
+    for entry in landed {
+      self.land_advance_one(store, entry, source)?;
+    }
+    self.land_advance_end();
+    Ok(())
+  }
+
+  /// The one-time setup of a landing's advance (A-133): the overlay's base plane, if a fresh (non-overlay) volume is
+  /// gaining one. The per-entry advance ([`WithHost::land_advance_one`]) and its end ([`WithHost::land_advance_end`])
+  /// follow, so a large landing's O(entries) advance is sliced across the shard's steps rather than held in one.
+  pub fn land_advance_begin(
+    &mut self,
+    store: &mut Store,
+    base: Option<BaseConfig>,
+  ) -> Result<(), VfsError> {
     if self.vol.base.is_none() {
       let base = base.ok_or(VfsError::NotOverlay)?;
       let root = self.vol.root();
@@ -2891,19 +3112,33 @@ impl Overlay<'_> {
       let root_no = store.dirs.get(root)?.inode;
       self.vol.base = Some(BasePlane::new(base, root_no));
     }
-    for entry in landed {
-      match source {
-        None => self.forget_landed(store, &entry.path)?,
-        Some(id) => self.advance_from_snapshot(store, id, entry)?,
-      }
+    Ok(())
+  }
+
+  /// One entry of a landing's advance (A-133): the overlay surgery for a single landed path — pure in-memory, no
+  /// durable op, so a crash before the completion commits rebuilds the un-advanced overlay and the resume re-lands.
+  /// Each entry is independent, re-evaluated against the current head, so slicing the loop across the shard's steps
+  /// is equivalent to one call ([`WithHost::land_advance`]).
+  pub fn land_advance_one(
+    &mut self,
+    store: &mut Store,
+    entry: &Landed,
+    source: Option<SnapshotId>,
+  ) -> Result<(), VfsError> {
+    match source {
+      None => self.forget_landed(store, &entry.path),
+      Some(id) => self.advance_from_snapshot(store, id, entry),
     }
-    // Every listing is stale: the landing changed the directories beneath.
+  }
+
+  /// The one-time end of a landing's advance (A-133): every base listing is now stale, since the landing changed the
+  /// directories beneath, so each is re-read from the disk on its next access.
+  pub fn land_advance_end(&mut self) {
     if let Some(plane) = self.vol.base.as_mut() {
       for l in plane.listings.values_mut() {
         l.entries = None;
       }
     }
-    Ok(())
   }
 
   /// One path a landing of snapshot `id` advanced, applied to the head by how the head's entry there
@@ -3022,7 +3257,9 @@ impl Overlay<'_> {
       plane.digest_stats.invalidated = plane.digest_stats.invalidated.saturating_add(1);
     }
     plane.record_witness(no, written, Some((dir, name.into())), at);
-    plane.drift.remove(&no);
+    if plane.drift.remove(&no).is_some() {
+      plane.drift_writes = plane.drift_writes.saturating_add(1);
+    }
     if let Some(stale) = plane.descriptors.remove(&no) {
       self.host.close_file(stale);
     }
@@ -3207,7 +3444,9 @@ impl Overlay<'_> {
       let at = self.vol.witness_clock();
       let plane = self.plane()?;
       plane.record_witness(no, witness, None, at);
-      plane.drift.remove(&no);
+      if plane.drift.remove(&no).is_some() {
+        plane.drift_writes = plane.drift_writes.saturating_add(1);
+      }
       let handle = self.vol.make_current_inode(store, no)?;
       let prev = store.inodes.get(handle)?.version;
       let keep_descriptor = if let Body::Base(b) = &mut store.inodes.get_mut(handle)?.body {
@@ -3224,7 +3463,7 @@ impl Overlay<'_> {
         self.host.close_file(file);
       }
       let path = self.vol.path_of_inode(store, no).unwrap_or_default();
-      self.vol.record(Op::Witness, &path, Some(no), prev);
+      self.vol.record(Op::Witness, path.as_str(), Some(no), prev);
       done.push(path);
     }
     Ok(done)

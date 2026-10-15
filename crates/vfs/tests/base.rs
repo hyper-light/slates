@@ -333,6 +333,79 @@ fn the_overlay_worked_example_copies_up_with_a_witness_equal_to_the_disk() {
   assert_eq!(diverged[0].kind, Divergence::Witnessed);
 }
 
+/// A reclaimed base file's descriptor is closed (2026-10-07). Do: read `/src/main.rs` through the overlay (its
+/// descriptor is held, so the host holds the root, `src` and the file open), unlink it through the overlay (no
+/// reference holds it, so it is reclaimed at once), then drain the host's hints. Expect: the host holds the two
+/// directories and nothing else. Before, the reclaim took the descriptor out of the plane's table and dropped it
+/// without closing it: on a real disk, a file descriptor leaked per unlinked base file.
+#[test]
+fn an_unlinked_base_files_descriptor_is_closed() {
+  let mut host = SimHost::new();
+  host.mkdir("/src");
+  host.replace_file("/src/main.rs", b"fn main() {}");
+  host.advance_ns(2);
+  let mut store = store();
+  let mut vol = overlay(&mut host, &mut store);
+  assert_eq!(
+    read_all(&mut vol, &mut host, &mut store, "/src/main.rs").unwrap(),
+    b"fn main() {}"
+  );
+  assert_eq!(
+    host.open_handles(),
+    3,
+    "the root, src, and the file's descriptor"
+  );
+  let src = match vol
+    .with_host(&mut host)
+    .resolve(&mut store, "/src")
+    .unwrap()
+    .child
+  {
+    Child::Dir(handle) => handle,
+    other => panic!("{other:?}"),
+  };
+  vol
+    .with_host(&mut host)
+    .unlink(&mut store, src, "main.rs")
+    .unwrap();
+  vol.with_host(&mut host).process_hints(&mut store).unwrap();
+  assert_eq!(
+    host.open_handles(),
+    2,
+    "the root and src, the file's descriptor closed"
+  );
+}
+
+/// A drift re-check the host refuses is reported, never passed (2026-10-07). Do: in the worked example, arm the host
+/// to refuse opening the witnessed `/src/lib.rs` (an I/O error) and ask for the status; then clear the fault and ask
+/// again. Expect: the first status lists `/src/lib.rs` as unverified with the host's refusal and no drift; the
+/// second lists nothing unverified. Before, the refusal was dropped and the entry looked as if it matched its witness.
+#[test]
+fn a_drift_recheck_the_host_refuses_is_reported_unverified() {
+  let (mut host, mut store, mut vol, _) = worked_example();
+  host.fail(
+    slates_vfs::host::sim::SimVerb::OpenFile,
+    "/src/lib.rs",
+    slates_vfs::host::HostError::Unavailable(5),
+    u32::MAX,
+  );
+  let status = vol.with_host(&mut host).status(&mut store).unwrap();
+  assert!(status.drift.is_empty(), "{:?}", status.drift);
+  assert_eq!(
+    status
+      .unverified
+      .iter()
+      .map(|(path, _)| path.as_str())
+      .collect::<Vec<_>>(),
+    vec!["/src/lib.rs"],
+    "{:?}",
+    status.unverified
+  );
+  host.clear_faults();
+  let status = vol.with_host(&mut host).status(&mut store).unwrap();
+  assert!(status.unverified.is_empty(), "{:?}", status.unverified);
+}
+
 /// The worked example, second half: `git pull` replaces both files on the host; drift is
 /// reported on the witnessed entry and nothing else; `read_base` shows the disk; `rewitness`
 /// clears the drift and leaves the agent's content alone.
@@ -1454,9 +1527,11 @@ fn an_outsiders_edit_moves_the_change_counter_and_a_plain_stat_does_not() {
   let mut store = store();
   let mut vol = overlay(&mut host, &mut store);
   let counter = |vol: &mut Volume, host: &mut SimHost, store: &mut Store| {
-    let mut o = vol.with_host(host);
-    let no = o.resolve(store, "/f").unwrap().inode;
-    let size = o.stat(store, no).unwrap().size;
+    let (no, size) = {
+      let mut o = vol.with_host(host);
+      let no = o.resolve(store, "/f").unwrap().inode;
+      (no, o.stat(store, no).unwrap().size)
+    };
     (size, vol.change_version(store, no).unwrap())
   };
   let (size, first) = counter(&mut vol, &mut host, &mut store);
@@ -1810,4 +1885,341 @@ fn a_base_entry_reports_its_owner_as_the_disk_holds_it() {
     (DISK_UID, DISK_GID),
     "a copy-up keeps the owner"
   );
+}
+
+/// The directory handle a path resolves to in the overlay.
+fn dir_at(
+  vol: &mut Volume,
+  host: &mut SimHost,
+  store: &mut Store,
+  path: &str,
+) -> slates_mem::Handle<slates_vfs::dir::DirNode> {
+  match vol.with_host(host).resolve(store, path).unwrap().child {
+    Child::Dir(handle) => handle,
+    other => panic!("{path} is not a directory: {other:?}"),
+  }
+}
+
+/// §4.5, §4.15 (condition 5; found 2026-10-08 by `docs/wip/bench/overlay/overlay_diff.sh`: a landing of an overlay of
+/// `/usr/lib` with 18 changes planned 657 more, one `symlink` per untouched base symlink). Do: overlay a base holding a
+/// file and two symlinks, list and resolve them through the volume, read one link's target, then remove the other and
+/// create a symlink of the volume's own. Expect the untouched link to be in no diverged set, its target the disk's, the
+/// removed one a whiteout and the created one created.
+#[test]
+fn an_untouched_base_symlink_is_not_a_change() {
+  let mut host = SimHost::new();
+  host.mkdir("/lib");
+  host.replace_file("/lib/libz.so.1.3", b"elf");
+  host.symlink("/lib/libz.so.1", "libz.so.1.3");
+  host.symlink("/lib/libz.so", "libz.so.1");
+  host.advance_ns(2);
+  let mut store = store();
+  let mut vol = overlay(&mut host, &mut store);
+  let lib = dir_at(&mut vol, &mut host, &mut store, "/lib");
+  let mut o = vol.with_host(&mut host);
+  let names: Vec<String> = o
+    .readdir(&mut store, lib)
+    .unwrap()
+    .iter()
+    .map(|row| row.name.to_string())
+    .collect();
+  assert_eq!(
+    names.len(),
+    3,
+    "the listing shows every base entry: {names:?}"
+  );
+  let link = o.resolve(&mut store, "/lib/libz.so.1").unwrap().inode;
+  drop(o);
+  assert_eq!(&*vol.readlink(&store, link).unwrap(), "libz.so.1.3");
+  assert_eq!(vol.diverged(&store), Vec::new(), "nothing was changed");
+  let mut o = vol.with_host(&mut host);
+  o.unlink(&mut store, lib, "libz.so").unwrap();
+  o.symlink(&mut store, lib, "libz.so.mine", "libz.so.1")
+    .unwrap();
+  drop(o);
+  let diverged: Vec<(String, Divergence)> = vol
+    .diverged(&store)
+    .into_iter()
+    .map(|d| (d.path, d.kind))
+    .collect();
+  assert_eq!(
+    diverged,
+    vec![
+      ("/lib/libz.so".to_owned(), Divergence::Whiteout),
+      ("/lib/libz.so.mine".to_owned(), Divergence::Created),
+    ]
+  );
+}
+
+/// §4.5 (found 2026-10-08 reading `stale_entries` beside the symlink divergence bug): an untouched base entry the disk
+/// no longer lists leaves a merged directory when its listing is read again, and a symlink the volume created looked
+/// untouched. Do: overlay a base directory, create a symlink of the volume's own in it, then have an outsider add a
+/// file there so the next listing is read afresh. Expect the volume's symlink to be listed and resolvable after it.
+#[test]
+fn a_symlink_the_volume_created_survives_a_fresh_listing() {
+  let mut host = SimHost::new();
+  host.mkdir("/src");
+  host.replace_file("/src/lib.rs", b"pub fn lib() {}");
+  host.advance_ns(2);
+  let mut store = store();
+  let mut vol = overlay(&mut host, &mut store);
+  let src = dir_at(&mut vol, &mut host, &mut store, "/src");
+  vol
+    .with_host(&mut host)
+    .symlink(&mut store, src, "current", "lib.rs")
+    .unwrap();
+  host.advance_ns(2);
+  host.replace_file("/src/main.rs", b"fn main() {}");
+  host.advance_ns(2);
+  let mut o = vol.with_host(&mut host);
+  let names: BTreeSet<String> = o
+    .readdir(&mut store, src)
+    .unwrap()
+    .iter()
+    .map(|row| row.name.to_string())
+    .collect();
+  assert_eq!(
+    names,
+    ["current", "lib.rs", "main.rs"]
+      .map(str::to_owned)
+      .into_iter()
+      .collect()
+  );
+  let link = o.resolve(&mut store, "/src/current").unwrap().inode;
+  drop(o);
+  assert_eq!(&*vol.readlink(&store, link).unwrap(), "lib.rs");
+}
+
+/// §4.5, AC-2.12 (the symlink divergence fix, 2026-10-08): an untouched base symlink stays untouched across recovery.
+/// Do: overlay a base holding a symlink, resolve it, image the volume and recover it. Expect the recovered volume's
+/// diverged set empty and the link's target the disk's.
+#[test]
+fn an_untouched_base_symlink_recovers_untouched() {
+  let mut host = SimHost::new();
+  host.replace_file("/target", b"bytes");
+  host.symlink("/link", "target");
+  host.advance_ns(2);
+  let mut store = store();
+  let mut vol = overlay(&mut host, &mut store);
+  vol
+    .with_host(&mut host)
+    .resolve(&mut store, "/link")
+    .unwrap();
+  let image = vol.to_image(&store, Some(&mut host)).unwrap();
+  let root = host.root();
+  let mut after = common::surviving(&store);
+  let claims = common::claims(&mut after, &[&image]);
+  let mut recovered = Volume::from_image(
+    &mut after,
+    &image,
+    &claims,
+    Box::new(StepClock::new(0, 1)),
+    1 << 20,
+    Some((&mut host, root)),
+  )
+  .unwrap();
+  assert_eq!(recovered.diverged(&after), Vec::new());
+  let mut o = recovered.with_host(&mut host);
+  let link = o.resolve(&mut after, "/link").unwrap().inode;
+  drop(o);
+  assert_eq!(&*recovered.readlink(&after, link).unwrap(), "target");
+}
+
+/// §4.5 "every mutation copies the witness up" (the symlink divergence fix, 2026-10-08): renaming an untouched base
+/// symlink makes it the volume's own. Do: overlay a base symlink, rename it within its directory, then have an outsider
+/// change the directory so its listing is read afresh. Expect the old name a whiteout, the new name created, and the
+/// renamed link still listed with the disk's target after the fresh listing.
+#[test]
+fn a_renamed_base_symlink_is_a_removal_and_a_creation() {
+  let mut host = SimHost::new();
+  host.mkdir("/lib");
+  host.symlink("/lib/libz.so", "libz.so.1");
+  host.advance_ns(2);
+  let mut store = store();
+  let mut vol = overlay(&mut host, &mut store);
+  let lib = dir_at(&mut vol, &mut host, &mut store, "/lib");
+  vol
+    .with_host(&mut host)
+    .rename(&mut store, lib, "libz.so", lib, "libz.so.old")
+    .unwrap();
+  host.advance_ns(2);
+  host.replace_file("/lib/other", b"outsider");
+  host.advance_ns(2);
+  let mut o = vol.with_host(&mut host);
+  let names: BTreeSet<String> = o
+    .readdir(&mut store, lib)
+    .unwrap()
+    .iter()
+    .map(|row| row.name.to_string())
+    .collect();
+  assert_eq!(
+    names,
+    ["libz.so.old", "other"]
+      .map(str::to_owned)
+      .into_iter()
+      .collect()
+  );
+  let link = o.resolve(&mut store, "/lib/libz.so.old").unwrap().inode;
+  drop(o);
+  assert_eq!(&*vol.readlink(&store, link).unwrap(), "libz.so.1");
+  let diverged: Vec<(String, Divergence)> = vol
+    .diverged(&store)
+    .into_iter()
+    .map(|d| (d.path, d.kind))
+    .collect();
+  assert_eq!(
+    diverged,
+    vec![
+      ("/lib/libz.so".to_owned(), Divergence::Whiteout),
+      ("/lib/libz.so.old".to_owned(), Divergence::Created),
+    ]
+  );
+}
+
+/// §4.5 "an untouched entry shows the live disk" (the symlink divergence fix, 2026-10-08): a base symlink carries the
+/// disk's times, and an outsider retargeting it (`ln -sf`: a new link at the name) shows through once the directory is
+/// listed again. Do: overlay a base symlink and stat it, then replace it on the disk with a link to another target and
+/// list the directory. Expect its times the disk's, the new target after the listing, and still nothing diverged.
+#[test]
+fn an_untouched_base_symlink_follows_the_disk() {
+  let mut host = SimHost::new();
+  // Off the clocks' zero, so a time left unset cannot equal the disk's by accident.
+  host.advance_ns(5_000);
+  host.mkdir("/lib");
+  host.symlink("/lib/libz.so", "libz.so.1");
+  host.advance_ns(2);
+  let mut store = store();
+  let mut vol = overlay(&mut host, &mut store);
+  let lib = dir_at(&mut vol, &mut host, &mut store, "/lib");
+  let mut o = vol.with_host(&mut host);
+  let link = o.resolve(&mut store, "/lib/libz.so").unwrap().inode;
+  let attrs = o.stat(&mut store, link).unwrap();
+  drop(o);
+  let disk = host.fingerprint("/lib/libz.so").unwrap();
+  assert_eq!((attrs.mtime, attrs.ctime), (disk.mtime_ns, disk.ctime_ns));
+  host.advance_ns(2);
+  host.remove("/lib/libz.so");
+  host.symlink("/lib/libz.so", "libz.so.2");
+  host.advance_ns(2);
+  let mut o = vol.with_host(&mut host);
+  o.readdir(&mut store, lib).unwrap();
+  let link = o.resolve(&mut store, "/lib/libz.so").unwrap().inode;
+  drop(o);
+  assert_eq!(&*vol.readlink(&store, link).unwrap(), "libz.so.2");
+  assert_eq!(vol.diverged(&store), Vec::new());
+}
+
+/// §4.5 "an untouched entry shows the live disk" (the sibling of A-121's symlink retarget, 2026-10-08): an untouched
+/// base file whose name the disk now gives a directory shows the directory once its parent is listed again. Do:
+/// overlay a base file and resolve it, then replace it on the disk with a directory holding a file, and list the
+/// parent. Expect the name to resolve to a directory, its child readable, and nothing diverged.
+#[test]
+fn an_untouched_base_file_the_disk_made_a_directory_shows_the_directory() {
+  let mut host = SimHost::new();
+  host.mkdir("/d");
+  host.replace_file("/d/x", b"a file");
+  host.advance_ns(2);
+  let mut store = store();
+  let mut vol = overlay(&mut host, &mut store);
+  let d = dir_at(&mut vol, &mut host, &mut store, "/d");
+  vol
+    .with_host(&mut host)
+    .resolve(&mut store, "/d/x")
+    .unwrap();
+  host.advance_ns(2);
+  host.remove("/d/x");
+  host.mkdir("/d/x");
+  host.replace_file("/d/x/inner", b"inside");
+  host.advance_ns(2);
+  vol.with_host(&mut host).readdir(&mut store, d).unwrap();
+  let located = vol
+    .with_host(&mut host)
+    .resolve(&mut store, "/d/x")
+    .unwrap();
+  assert!(
+    matches!(located.child, Child::Dir(_)),
+    "{:?}",
+    located.child
+  );
+  assert_eq!(
+    read_all(&mut vol, &mut host, &mut store, "/d/x/inner").unwrap(),
+    b"inside"
+  );
+  assert_eq!(vol.diverged(&store), Vec::new());
+}
+
+/// §4.5 (with the file case above, 2026-10-08): an untouched base directory whose name the disk now gives a file shows
+/// the file once its parent is listed again. Do: overlay an empty base directory and resolve it, then replace it on
+/// the disk with a file, and list the parent. Expect the name to read as the file, and nothing diverged.
+#[test]
+fn an_untouched_base_directory_the_disk_made_a_file_shows_the_file() {
+  let mut host = SimHost::new();
+  host.mkdir("/d");
+  host.mkdir("/d/x");
+  host.advance_ns(2);
+  let mut store = store();
+  let mut vol = overlay(&mut host, &mut store);
+  let d = dir_at(&mut vol, &mut host, &mut store, "/d");
+  dir_at(&mut vol, &mut host, &mut store, "/d/x");
+  host.advance_ns(2);
+  host.remove("/d/x");
+  host.replace_file("/d/x", b"now a file");
+  host.advance_ns(2);
+  vol.with_host(&mut host).readdir(&mut store, d).unwrap();
+  assert_eq!(
+    read_all(&mut vol, &mut host, &mut store, "/d/x").unwrap(),
+    b"now a file"
+  );
+  assert_eq!(vol.diverged(&store), Vec::new());
+}
+
+/// RFC 8881 §10.2 (A-79's gate; found 2026-10-08 reading why an outsider's edit under an NFSv4 mount might never reach
+/// a delegation holder): "operations done outside the NFSv4.1 protocol ... also need to result in delegation recall".
+/// An outsider editing the disk beneath an untouched base file changes what the volume serves for it, so the watcher's
+/// hint must ask for the recall of the delegations held on such a file. Do: overlay a directory of two untouched files
+/// and a copied-up one, delegate all three, have an outsider write the first in place, and drain the hints; then have
+/// the outsider add a file there (a hint naming only the directory in the simulation) and drain again. Expect the
+/// in-place write to recall the first file alone (its hint names it), the directory's hint to recall both untouched
+/// files, and the copied-up one, whose bytes are the volume's own, never recalled.
+#[test]
+fn an_outsider_edit_beneath_an_untouched_base_file_asks_for_its_recall() {
+  let mut host = SimHost::new();
+  host.mkdir("/d");
+  host.replace_file("/d/edited", b"one");
+  host.replace_file("/d/neighbour", b"two");
+  host.replace_file("/d/copied", b"three");
+  host.advance_ns(2);
+  let mut store = store();
+  let mut vol = overlay(&mut host, &mut store);
+  let mut o = vol.with_host(&mut host);
+  let edited = o.resolve(&mut store, "/d/edited").unwrap().inode;
+  let neighbour = o.resolve(&mut store, "/d/neighbour").unwrap().inode;
+  let copied = o.resolve(&mut store, "/d/copied").unwrap().inode;
+  o.write(&mut store, copied, 0, b"THREE").unwrap();
+  drop(o);
+  for no in [edited, neighbour, copied] {
+    store.recall_gate.delegate(no.0, 7);
+  }
+  assert_eq!(store.recall_gate.take_requested(), Vec::new());
+  host.write_in_place("/d/edited", b"one, edited", 2);
+  vol.with_host(&mut host).process_hints(&mut store).unwrap();
+  let asked = |store: &mut Store| -> BTreeSet<u64> {
+    store
+      .recall_gate
+      .take_requested()
+      .into_iter()
+      .map(|(no, actor)| {
+        assert_eq!(actor, None, "an outsider acts as no client");
+        no
+      })
+      .collect()
+  };
+  assert_eq!(asked(&mut store), [edited.0].into_iter().collect());
+  host.replace_file("/d/added", b"new");
+  vol.with_host(&mut host).process_hints(&mut store).unwrap();
+  assert_eq!(
+    asked(&mut store),
+    [edited.0, neighbour.0].into_iter().collect()
+  );
+  assert_eq!(store.recall_gate.outside_recalls(), 3);
 }

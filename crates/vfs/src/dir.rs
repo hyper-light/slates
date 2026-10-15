@@ -383,13 +383,11 @@ impl DirNode {
         }
       }
       if let Err(refusal) = built {
-        tree.discard(blocks);
-        return Err(refusal);
+        return Err(refusal.after_undo(tree.discard(blocks)));
       }
       // The new entry is admitted before the tree is published, so the move and the insert are one step.
       if let Err(refusal) = tree.insert(blocks, epoch, retired, policy, name, child) {
-        tree.discard(blocks);
-        return Err(refusal);
+        return Err(refusal.after_undo(tree.discard(blocks)));
       }
       self.entries = DirEntries::Indexed(tree);
       return Ok(());

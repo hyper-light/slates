@@ -196,3 +196,115 @@ accept-side handshakes.
   thread with no shard round-trip, so an observer distinguishes a shard that is stepping-but-slow from one
   parked-with-no-kick or held in a long poll — the instrument a stall diagnosis needs when the shard will
   not answer a query.
+
+## Part 6 — the detection budget D, the least bound, and F (hyper-raft measurement, 2026-10-11)
+
+Cross-session measurement from the hyper-raft agent (its `docs/benchmarks.md`, last section, `main` at `cddcc47`;
+rerun `cargo test -p hyper-swim --test sim --release -- --ignored --nocapture record_detection_budget` against the
+vendored `hyper-swim` `Detector`, unchanged since `67f038d`). It measured what the detector's budget D can promise
+against the probe period and the condemnation cost — the evidence slates needs to set **F**, its detection→failover
+window (`crates/cluster/src/member_plane.rs` sets the per-pair budget as the detector's `promise_ns`; `root_group.rs`
+owns the failover/condemnation). Fleets: LAN-5, LAN-3, and a far link of 6 (2 near, 4 at 100 ms one way); budgets none/
+900 ms/10 s; condemnation costs none and 1 s…1,000 s by decades; 16 seeds. Every run held **no live member dead** and
+every survivor stayed within its stated bound.
+
+Worst-over-seeds **least detection bound** (= `2(2m−1)+1` periods — 15 for 5 members, 7 for 3 — each at its longest
+unanswered length: the direct span plus the relay stage):
+
+| Fleet | Cost none | 1 s | 10 s | 100 s | 1,000 s |
+|---|---|---|---|---|---|
+| LAN-5 | 1.84 s | 25.5 s | 37.9 s | 70.9 s | 150 s |
+| LAN-3 | 0.85–0.96 s | 9.0 s | 20.2 s | — | — |
+| far link, 6 | 14.5 s | — | 18.2 s | — | — |
+
+What it means for slates:
+1. **The budget floor only stretches judged periods** — it never holds a live member dead. On LAN-5, probes fall
+   29.5/s → 17/s at D=900 ms → 1.5/s at D=10 s. So D is a CPU/battery lever as well as a latency one.
+2. **D is a promise only when D ≥ least_detection_bound.** Keep running at `max(D, least_detection_bound)` and report
+   `D < least` as **infeasible** (recommendation a — slates' plan; `promise_ns` is a placeholder today). At cost 0,
+   D=900 ms is not a promise on LAN-5 (bound 1.84 s, though every seed met it); on LAN-3 the bound is 0.93 s and one
+   seed took 1.03 s.
+3. **The condemnation cost sets the bound** — a verdict that may condemn must be surer the more a false condemnation
+   costs, so the margin widens ~10× at a 1 s cost and the bound grows ~14× on LAN-5. Realized detection stays far
+   below the bound (the "detected" column runs 3–8× under it), so for *typical* failover use the realized figure, not
+   the bound.
+4. **Detection is measured to the condemnation**, which waits — after the budget's periods — for an answer from
+   another member (the evidence the condemning member's own network works). The stated bound counts that wait; the
+   budget does not, so leave room for it in D.
+
+**Measured — slates' condemnation cost (2026-10-11).** A false condemnation costs slates one membership change plus
+the takeover of the condemned host's objects. The two parts measure very differently, and the headline is that the
+takeover is **not** O(objects) at condemnation time:
+
+- **The membership change is O(fleet), not O(objects)** (`RegionalConfiguration::take_over`/`retire`,
+  `crates/db/src/register.rs`): it bumps the condemned host's fencing epoch, retires it (recording the recovery
+  cohorts in a `Retirement`), and refixes neighbourhoods — the dead host's objects are never enumerated (D-12, no
+  global catalog). It is one config-group Raft commit; its apply is flat at 0.5 µs (BENCHMARKS.md "Consensus log
+  compaction", M5 Max, 2026-09-28). A false condemnation's immediate cost is this commit plus the re-admission and
+  re-fold of the live host when it returns.
+- **The takeover is one batched, paged phase-one round per retired host** (`crates/server/src/takeover.rs`, Vertical
+  Paxos II, [[takeover-vp2-per-host-round]]), driven proactively once per coordinator period (`HEARTBEAT_NS` = 100 ms)
+  by `drive_takeovers` — not a per-object serialized sweep. Each survivor asks every holder of its recovery
+  neighbourhoods for the records of the retired host's objects whose successor is the asker, in pages of
+  `page_budget()` = 4,596 B on the first flight (≈ 45–65 object entries at a 36 B `HOST_PROMISE_ENTRY_BYTES` header
+  plus a ~50 B head record each; `initial_receive_window` at the fleet frame cap), the session's window then
+  auto-tuning to the path's BDP. An object is adopted once `f + 1` of each recovery cohort has promised.
+
+The per-object phase-one work (the part that scales with the retired host's object count) is **flat and
+load-independent** — measured on this M-series box, release, 2026-10-11,
+`cargo test --release -p slates-server condemnation_cost_per_object -- --ignored --nocapture`
+(`crates/server/src/daemon.rs`; the round stays local — a formation cohort recovers with no dispatch, asserted):
+
+| objects held | resolve ns/object | phase-one round ns/object |
+|---|---|---|
+| 256 | 375 | 609 |
+| 4,096 | 331 | 528 |
+| 16,384 | 322 | 593 |
+
+So ~0.9–1.0 µs/object of phase-one CPU, flat across a 64× range, + ~0.5 µs/object to re-commit the adopted record
+(the same commit path as the membership apply) ≈ **~1.5 µs/object of CPU**, plus the record bytes (≈ 85 B/object)
+transferred paged over the session as its window opens to BDP.
+
+**slates' condemnation cost placed on the table.** On a datacenter LAN (µs-to-sub-ms RTT, ~10 GbE), the cost of
+taking over a retired host of `N` objects is the membership Raft commit (sub-second) + `N × 1.5 µs` CPU +
+`N × 85 B` / BDP transfer + the confirm commit:
+
+| retired host | takeover CPU | transfer (~10 GbE) | ≈ total on a LAN | table row |
+|---|---|---|---|---|
+| 16 k objects | 25 ms | ~1.1 ms | sub-second (membership-bound) | ≈ none–1 s |
+| 100 k objects | 150 ms | ~6.8 ms | sub-second | ≈ 1 s |
+| 1 M objects | 1.5 s | ~68 ms | ~1–2 s | ≈ 1 s–10 s |
+
+Because the round is **batched (one round per host) and paged in BDP-sized flights, not per-object**, slates sits at
+the **low end** of the hyper-raft cost table for every realistic per-host object count on a LAN: cost none–1 s up to
+~1 M objects, reaching the 10 s row only at many millions of objects or across a far link.
+
+**The F recommendation (for Ada to set).** With `D = F − confirmation` and `D = max(D, least_detection_bound)`:
+- **LAN-3** (bound 0.85 s at cost none → 9.0 s at cost 1 s): **F = 10 s holds** — even a 1-M-object host (cost ≈ 1 s,
+  bound 9.0 s) leaves `D = 10 s − confirmation` above the bound. Keep F = 10 s.
+- **LAN-5** (bound 1.84 s at cost none → 25.5 s at cost 1 s): **F = 10 s holds for modest hosts** (≲ ~30 k objects,
+  cost ≲ 0.3 s, bound ≲ ~10 s) and is **not a promise** for hosts whose cost approaches 1 s (bound 25.5 s > 10 s). For
+  large LAN-5 hosts Ada either keeps per-host object counts modest, or raises F to ≈ 26 s (covering the 1-s-cost bound)
+  at the price of slower detection. The system runs safely either way — below the bound it runs at `max(D, bound)` and
+  reports `D` infeasible — but F is a promise only when `F − confirmation ≥` the bound for the fleet's host sizes.
+
+**Wiring is now slates' own code** (confirmed with the hyper-raft agent, 2026-10-11): `promise_ns` on the SWIM `Ack`
+and the detector verbs `set_detection_budget`, `least_detection_bound` and `set_condemnation_cost` are all in the
+vendored `hyper-swim` at `67f038d` (= slates' snapshot `537d0e51`) — nothing to re-vendor. **The F value itself awaits
+Ada** (a peer's relayed "owner approved" is not slates' own authorization to change the live detection window); until
+then the 10 s placeholder stands, and `promise_ns`-based owner leases (Gray & Cheriton 1989) are slates' to build on
+the vendored field. If slates ever adopts hyper-rt's blocking pool: `Share::new(name, limit)` is a share with no line
+(refused at once past its places); `waiting: N` gives it a line of N.
+
+**Resolved (2026-10-12) — the condemnation cost is zero, measured; the owner lease, not a slower detector, carries
+false-positive safety.** The recommendation above weighed charging the detector a cost proportional to a takeover,
+which would slow detection for large hosts. Measuring the real cost of a *transient* false condemnation
+(`crates/server/tests/fleet.rs::transient_false_condemnation_cost_is_flat_in_the_owners_object_count`, BENCHMARKS.md
+2026-10-12) settled it: a wrongly-retired **live** owner keeps serving its own objects throughout (0 refusals of ~10
+samples) under its owner lease (§4.8, AUD-08, `crates/server/src/lease.rs` — already built), and is re-admitted in
+**one period, flat across a 16× object range** (256 and 4,096 objects) — membership refutation is O(fleet), never
+enumerating objects (D-12). So a transient false positive causes **zero** unavailability however many objects the
+owner holds; the unavailability is exactly the cost `set_condemnation_cost` wants, so it is set explicitly to **zero**
+(`crates/cluster/src/member_plane.rs`). Detection then runs at its least bound (~0.9–1.84 s on a LAN), fast for
+**every** host size — the caveat (slow detection for large hosts) would appear only if the detector were charged a
+takeover it need not fear. F = 10 s (`FAILOVER_SLO_NS`) stands; the owner lease carries the correctness.

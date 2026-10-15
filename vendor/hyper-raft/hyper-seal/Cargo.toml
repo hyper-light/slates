@@ -23,4 +23,10 @@ rustix = { version = "1.1", features = ["mm", "param"] }
 # VirtualLock for the key region; GetSecurityInfo and the ACL walk for a key file's owner-only check.
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Memory"] }
 
+[lints.rust]
+# hyper-seal's `files` feature (`sealed_file`: a whole file sealed through `hyper-block`, which opens, writes and renames
+# files) is left out of slates' build: slates writes files only in its `land` crate (R1), so the feature is declared here
+# as a known value and never enabled, and `hyper-block` is not vendored.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("files"))'] }
+
 [workspace]

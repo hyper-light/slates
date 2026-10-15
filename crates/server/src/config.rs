@@ -310,6 +310,11 @@ pub struct DaemonConfig {
   /// of the reserve over every fleet session (the accepted and the dialed, on both planes), never below
   /// the initial window. Zero on a laptop.
   pub fleet_session_receive_bytes: u64,
+  /// Derived: the most bytes of other owners' content a shard may hold as its clients' read-ahead windows at once
+  /// (§4.8 "Lookup"; `crate::verbs::ReadAhead`): one fleet session's receive bytes per peer, counted inside the
+  /// fleet's receive share as one more session per peer, so the windows and the session buffers together stay
+  /// within the share. Zero on a laptop, which forwards nothing.
+  pub read_ahead_bytes: u64,
   /// Derived: the keys hyper-seal's locked region holds at once (A-92; seal.md §8): one base page of 32-byte key
   /// slots per shard, the bounded cache of unwrapped keys each shard keeps (a key past it is evicted and unwrapped
   /// again on its next use), and the root among them. Locked once at boot, a few pages, well inside the default
@@ -370,6 +375,18 @@ impl DaemonConfig {
   /// The unit this daemon allocates content in ([`content_granule`] of its page).
   pub fn content_granule(&self) -> usize {
     content_granule(self.page)
+  }
+
+  /// Derived (A-98): the unit a shard's arena range is cut into pool parts on. It is one chunk window
+  /// (`slates_vfs::content::chunk_bytes`) rounded up to the mapping granule and the page, as a power of two, so every
+  /// part holds whole chunks and maps on its own.
+  pub fn pool_unit(&self) -> usize {
+    slates_mem::mapping_granule()
+      .unwrap_or(self.page)
+      .max(self.page)
+      .max(slates_vfs::content::chunk_bytes(self.page).get())
+      .checked_next_power_of_two()
+      .unwrap_or(usize::MAX)
   }
 
   /// Derived: each shard's FUSE write log in the anchor's content object (A-63): a quarter of the shard's reserve.
@@ -434,6 +451,15 @@ impl DaemonConfig {
   /// attachment the daemon's shards can hold, `shards × slates_bridge_core::authority::MAX_ATTACHMENTS`, since a
   /// FUSE mount is an attachment on its volume's owner shard.
   pub fn held_device_bound(&self) -> usize {
+    usize::from(self.runtime.shards).saturating_mul(slates_bridge_core::authority::MAX_ATTACHMENTS)
+  }
+
+  /// Derived: the NFS loopback connections an anchor may hold for this daemon across a restart (A-113): one per live
+  /// attachment the daemon's shards can hold, as [`DaemonConfig::held_device_bound`] — a kernel mount is an attachment,
+  /// and the macOS and Linux kernel clients open one connection per mount. A connection past it is closed by the daemon
+  /// and counted (`nfs.connection_hold_refused`), never served unheld: a client that opens more than one per mount
+  /// (Linux `nconnect`) meets the bound only that much sooner.
+  pub fn held_connection_bound(&self) -> usize {
     usize::from(self.runtime.shards).saturating_mul(slates_bridge_core::authority::MAX_ATTACHMENTS)
   }
 
@@ -803,6 +829,7 @@ impl DaemonConfig {
       fleet_peer_capacity: 0,
       fleet_sessions_per_plane: 0,
       fleet_session_receive_bytes: 0,
+      read_ahead_bytes: 0,
       seal_key_slots: seal_key_slots.get(),
       boot_fault: None,
       #[cfg(unix)]
@@ -846,7 +873,16 @@ pub struct NfsV4Caps {
   pub opens: usize,
   /// Derived: the byte-range lock ranges (and lock states holding none) the listener records at once.
   pub locks: usize,
+  /// Derived: the bytes of call records a shard holds at once (A-127): what answers a compound retried after a
+  /// restart, bounded beside the slot caches it is the durable twin of.
+  pub record_bytes: usize,
 }
+
+/// Shape: the holders the NFSv4 client share of a shard's reserve is split between (A-127): the slot caches (a kept
+/// reply per slot) and the call records (what a kept reply becomes across a restart, published with its effects).
+/// Each takes an equal part, so neither crowds out the other.
+#[cfg(unix)]
+const NFS_V4_CLIENT_SHARE_HOLDERS: u64 = 2;
 
 /// Shape: the sessions one NFSv4 client holds at once: the live one and its successor, which a client
 /// creates before destroying the old when it replaces a session (RFC 8881 §2.10.13); a client that
@@ -858,8 +894,10 @@ pub const NFS_V4_SESSIONS_PER_CLIENT: usize = 2;
 /// store's inode bound:
 /// - **slots** = the shard count: a session's requests are served by the volumes' owner shards, so more
 ///   in flight than there are shards to serve them only queues;
-/// - **clients** = the client share of the listener shard's reserve over one client's slot caches (every
-///   session's slots, each keeping a reply of up to one compound header, the cached-reply ceiling);
+/// - **clients** = the slot caches' part of the client share of the listener shard's reserve over one client's slot
+///   caches (every session's slots, each keeping a reply of up to one compound header, the cached-reply ceiling);
+/// - **record bytes** = the call records' part of the same share (A-127): the records a shard keeps for the compounds
+///   whose calls it served;
 /// - **opens** = the store's inode bound × the shard count: an open names a file, and every shard's
 ///   store holds at most that many;
 /// - **locks** = the same bound: a lock range names a byte range of an open file, and one lock-owner's
@@ -887,20 +925,25 @@ fn nfs_v4_caps(
       slates_bridge_nfs::v4::compound::COMPOUND_HEADER_BYTES,
     ))
     .max(1);
+  let part = reserve_per_shard
+    .saturating_mul(CLIENT_SHARE_PERMILLE)
+    .checked_div(PERMILLE)
+    .and_then(|share| share.checked_div(NFS_V4_CLIENT_SHARE_HOLDERS))
+    .unwrap_or(0);
   let clients: Derived<usize> = derived!(
-    usize::try_from(
-      reserve_per_shard
-        .saturating_mul(CLIENT_SHARE_PERMILLE)
-        .checked_div(PERMILLE)
-        .and_then(|share| share.checked_div(client_bytes))
-        .unwrap_or(0)
-    )
-    .unwrap_or(usize::MAX)
-    .max(1),
-    "reserve_per_shard × CLIENT_SHARE_PERMILLE / 1000 / (nfs_v4_slots × NFS_V4_SESSIONS_PER_CLIENT × COMPOUND_HEADER_BYTES)",
+    usize::try_from(part.checked_div(client_bytes).unwrap_or(0))
+      .unwrap_or(usize::MAX)
+      .max(1),
+    "reserve_per_shard × CLIENT_SHARE_PERMILLE / 1000 / NFS_V4_CLIENT_SHARE_HOLDERS / (nfs_v4_slots × NFS_V4_SESSIONS_PER_CLIENT × COMPOUND_HEADER_BYTES)",
     ["reserve_per_shard", "shards"]
   );
   derivations.push(note("nfs_v4_clients", &clients));
+  let record_bytes: Derived<usize> = derived!(
+    usize::try_from(part).unwrap_or(usize::MAX),
+    "reserve_per_shard × CLIENT_SHARE_PERMILLE / 1000 / NFS_V4_CLIENT_SHARE_HOLDERS",
+    ["reserve_per_shard"]
+  );
+  derivations.push(note("nfs_v4_record_bytes", &record_bytes));
   let opens: Derived<usize> = derived!(
     max_inodes.saturating_mul(usize::from(shards.max(1))),
     "max_inodes × shards",
@@ -918,6 +961,7 @@ fn nfs_v4_caps(
     clients: clients.get(),
     opens: opens.get(),
     locks: locks.get(),
+    record_bytes: record_bytes.get(),
   }
 }
 
@@ -1057,11 +1101,13 @@ impl DaemonConfig {
       .push(note("fleet_sessions_per_plane", &sessions_per_plane));
     self.fleet_sessions_per_plane = sessions_per_plane.get();
     // Every fleet session on the control shard: the accepted ones (the pool per plane) and the ones this
-    // node dials (one per peer per plane).
+    // node dials (one per peer per plane); and one session's worth per peer for the read-ahead windows a shard
+    // keeps of what those sessions carried (`read_ahead_bytes`).
     let fleet_sessions = sessions_per_plane
       .get()
       .saturating_add(peers)
       .saturating_mul(FLEET_PLANES)
+      .saturating_add(peers)
       .max(1);
     let receive: Derived<u64> = derived!(
       (self
@@ -1073,13 +1119,22 @@ impl DaemonConfig {
       .max(slates_transport::connection::initial_receive_window(
         crate::fleet::FLEET_FRAME_CAP
       )),
-      "reserve_per_shard × FLEET_RECEIVE_SHARE_PERMILLE / 1000 / ((fleet_sessions_per_plane + peers) × FLEET_PLANES), at least the initial window",
+      "reserve_per_shard × FLEET_RECEIVE_SHARE_PERMILLE / 1000 / ((fleet_sessions_per_plane + peers) × FLEET_PLANES + peers), at least the initial window",
       ["reserve_per_shard", "fleet.peers"]
     );
     self
       .derivations
       .push(note("fleet_session_receive_bytes", &receive));
     self.fleet_session_receive_bytes = receive.get();
+    let read_ahead: Derived<u64> = derived!(
+      receive
+        .get()
+        .saturating_mul(u64::try_from(peers).unwrap_or(u64::MAX)),
+      "fleet_session_receive_bytes × peers (one session's receive bytes per peer, inside the fleet's receive share)",
+      ["fleet_session_receive_bytes", "fleet.peers"]
+    );
+    self.derivations.push(note("read_ahead_bytes", &read_ahead));
+    self.read_ahead_bytes = read_ahead.get();
     let fleet_tasks: Derived<usize> = derived!(
       peers
         .saturating_mul(FLEET_LOOPS_PER_PEER)

@@ -93,7 +93,7 @@ async fn seek<B: Backend>(backend: &mut B, reader: &mut XdrReader<'_>, frame: &F
   let mut body = XdrWriter::new();
   body.bool(!found || at >= size);
   body.u64(if found { at } else { size });
-  Ok(body.into_bytes())
+  Ok(body.into_bytes().into())
 }
 
 /// READ_PLUS (§15.10): the requested range as contiguous data and hole contents, holes whole (they may
@@ -141,7 +141,7 @@ async fn read_plus<B: Backend>(
   body.bool(contents.at >= size);
   body.u32(contents.entries);
   body.fixed(contents.writer.as_slice());
-  Ok(body.into_bytes())
+  Ok(body.into_bytes().into())
 }
 
 /// A READ_PLUS reply's contents as they are built: the encoded entries, their count, the next offset,
@@ -205,13 +205,13 @@ async fn next_content<B: Backend>(
     stateid,
   )
   .await?;
-  let (_, data) = v3(v3call::read(&result))?;
+  let (_, data) = v3(v3call::read(result.body()))?;
   if data.is_empty() {
     return Ok(false);
   }
   contents.writer.u32(seek_what::DATA);
   contents.writer.u64(at);
-  contents.writer.opaque(&data);
+  contents.writer.opaque(data);
   contents.entries = contents.entries.saturating_add(1);
   contents.at = at.saturating_add(u64::try_from(data.len()).unwrap_or(u64::MAX));
   Ok(true)
@@ -282,7 +282,7 @@ async fn copy<B: Backend>(backend: &mut B, reader: &mut XdrReader<'_>, frame: &F
   body.fixed(&verifier);
   body.bool(true); // consecutive
   body.bool(true); // synchronous
-  Ok(body.into_bytes())
+  Ok(body.into_bytes().into())
 }
 
 /// One side of a COPY: the file, the offset, and the state id its I/O runs under.
@@ -353,19 +353,19 @@ async fn copy_piece<B: Backend>(
     source_stateid,
   )
   .await?;
-  let (_, data) = v3(v3call::read(&result))?;
+  let (_, data) = v3(v3call::read(result.body()))?;
   if data.is_empty() {
     return Ok((0, [0u8; v3call::VERF_SIZE]));
   }
   let result = state_io(
     backend,
     extension::WRITE_STATE,
-    v3call::write_args(destination, destination_offset, UNSTABLE4, &data),
+    v3call::write_args(destination, destination_offset, UNSTABLE4, data),
     clientid,
     destination_stateid,
   )
   .await?;
-  let (written, _, verifier) = v3(v3call::write(&result))?;
+  let (written, _, verifier) = v3(v3call::write(result.body()))?;
   Ok((written, verifier))
 }
 
@@ -410,7 +410,7 @@ fn io_advise(reader: &mut XdrReader<'_>, frame: &Frame) -> Outcome {
   current(frame)?;
   let mut body = XdrWriter::new();
   Bitmap::default().encode(&mut body);
-  Ok(body.into_bytes())
+  Ok(body.into_bytes().into())
 }
 
 /// Format: the namespace NFSv4 extended attribute keys name (RFC 8276 §5): the user namespace.
@@ -488,12 +488,12 @@ async fn xattr_operation<B: Backend>(
         .map_err(|_| Nfsstat4::Serverfault)?;
       let mut body = XdrWriter::new();
       body.opaque(value);
-      Ok(body.into_bytes())
+      Ok(body.into_bytes().into())
     }
     // SETXATTR and REMOVEXATTR answer the file's change_info4, from the one call that changed it.
     _ => {
       let wcc = Wcc::decode_with_change(&mut result).map_err(|_| Nfsstat4::Serverfault)?;
-      Ok(change_info(&wcc))
+      Ok(change_info(&wcc).into())
     }
   }
 }
@@ -553,5 +553,5 @@ async fn listxattrs<B: Backend>(
   body.u32(returned);
   body.fixed(names.as_slice());
   body.bool(next >= keys.len());
-  Ok(body.into_bytes())
+  Ok(body.into_bytes().into())
 }

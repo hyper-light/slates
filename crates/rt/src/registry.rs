@@ -800,20 +800,58 @@ pub(crate) fn count_stale(target: u16) {
 /// Sends a control message to a shard from any thread and kicks it; refused when the shard's
 /// control channel is full or the shard is gone.
 pub fn send_control(target: u16, message: Control) -> Result<(), RtError> {
-  with_entry(target, |entry| send_control_to(entry, target, message))
-    .ok_or(RtError::ShardGone { shard: target })?
+  send_control_or_return(target, message).map_err(|refused| refused.error)
 }
 
-/// The send itself, on a counted entry (see [`send_control`]).
-fn send_control_to(entry: &Entry, target: u16, message: Control) -> Result<(), RtError> {
+/// A control message a shard refused, handed back so a sender that waits for room can send it again
+/// ([`send_control_or_return`]); `message` is `None` only when the slot was gone before the send began.
+pub struct RefusedControl {
+  /// Why it was refused: `ControlFull` or `ShardGone`.
+  pub error: RtError,
+  /// The message, unsent.
+  pub message: Option<Control>,
+}
+
+/// [`send_control`], handing the message back on a refusal, so a sender with work in it (a reply on its way to the
+/// shard that asked) can wait for room instead of dropping it.
+pub fn send_control_or_return(target: u16, message: Control) -> Result<(), RefusedControl> {
+  let mut held = Some(message);
+  let sent = with_entry(target, |entry| send_control_to(entry, target, held.take()));
+  match sent {
+    Some(outcome) => outcome,
+    None => Err(RefusedControl {
+      error: RtError::ShardGone { shard: target },
+      message: held,
+    }),
+  }
+}
+
+/// The send itself, on a counted entry (see [`send_control_or_return`]).
+fn send_control_to(
+  entry: &Entry,
+  target: u16,
+  message: Option<Control>,
+) -> Result<(), RefusedControl> {
+  let Some(message) = message else {
+    return Err(RefusedControl {
+      error: RtError::ShardGone { shard: target },
+      message: None,
+    });
+  };
   match entry.control.try_send(message) {
     Ok(()) => {
       entry.control_pending.publish();
       entry.parking.kick_if_parked(|| entry.kick.kick());
       Ok(())
     }
-    Err(TrySendError::Full(_)) => Err(RtError::ControlFull { shard: target }),
-    Err(TrySendError::Disconnected(_)) => Err(RtError::ShardGone { shard: target }),
+    Err(TrySendError::Full(message)) => Err(RefusedControl {
+      error: RtError::ControlFull { shard: target },
+      message: Some(message),
+    }),
+    Err(TrySendError::Disconnected(message)) => Err(RefusedControl {
+      error: RtError::ShardGone { shard: target },
+      message: Some(message),
+    }),
   }
 }
 
@@ -855,7 +893,7 @@ pub fn holder_of(shard: u16) -> Option<SlotHolder> {
 /// `ControlFull` when the holder's control channel is full.
 pub fn send_control_to_holder(holder: SlotHolder, message: Control) -> Result<(), RtError> {
   with_holder(holder, |entry| {
-    send_control_to(entry, holder.shard, message)
+    send_control_to(entry, holder.shard, Some(message)).map_err(|refused| refused.error)
   })
   .ok_or(RtError::ShardGone {
     shard: holder.shard,
@@ -948,6 +986,34 @@ mod tests {
       stale_wakes(id) - stale_before,
       1,
       "the fifth wake found an exited holder's full ring and was counted stale"
+    );
+    unregister(id);
+  }
+
+  /// A refused control message comes back (2026-10-07, the reply path's wait for room). Do: register a slot whose
+  /// control channel holds two messages, fill it, send a third, then take one off the channel and send the returned
+  /// third again. Expect: the third refused `ControlFull` with the message handed back, and the resend accepted.
+  #[test]
+  fn a_control_message_refused_full_is_handed_back_and_sends_once_there_is_room() {
+    let (id, receiver) = register_slot(4, 2, RegisterKick::Kick(Kick::none())).unwrap();
+    let spawn = || {
+      Control::Spawn(Box::new(crate::task::SpawnRequest::new(
+        Box::pin(async {}),
+        None,
+      )))
+    };
+    send_control(id, spawn()).unwrap();
+    send_control(id, spawn()).unwrap();
+    let refused = match send_control_or_return(id, spawn()) {
+      Err(refused) => refused,
+      Ok(()) => panic!("a full channel accepted a third message"),
+    };
+    assert!(matches!(refused.error, RtError::ControlFull { .. }));
+    let message = refused.message.expect("the message is handed back");
+    receiver.recv().unwrap();
+    assert!(
+      send_control_or_return(id, message).is_ok(),
+      "the resend lands once there is room"
     );
     unregister(id);
   }

@@ -437,6 +437,17 @@ pub enum AttachForm {
     /// The directory's inode number, when the mount presents one directory.
     scope: Option<u64>,
   },
+  /// A host mount bound to one Unix identity (§4.6 A-115): it serves requests whose caller is `uid`, and to every
+  /// other caller, the superuser's included, only attributes and an `ACCESS` that grants nothing, so no kernel's
+  /// cache of what one identity read through it serves another. Optionally one directory. Appended.
+  BoundMount {
+    /// The identity served.
+    uid: u32,
+    /// The directory's inode number, when the mount presents one directory.
+    scope: Option<u64>,
+    /// The mount point, once bound.
+    mount_point: Option<String>,
+  },
 }
 
 impl AttachForm {
@@ -447,7 +458,9 @@ impl AttachForm {
       | Self::FuseMount { path }
       | Self::ScopedFuseMount { path, .. }
       | Self::SharedFuseMount { path, .. } => Some(path),
-      Self::ScopedMount { mount_point, .. } => mount_point.as_deref(),
+      Self::ScopedMount { mount_point, .. } | Self::BoundMount { mount_point, .. } => {
+        mount_point.as_deref()
+      }
       Self::Root | Self::Oci { .. } | Self::GuestTag { .. } => None,
     }
   }
@@ -456,7 +469,17 @@ impl AttachForm {
   pub fn scope(&self) -> Option<u64> {
     match self {
       Self::ScopedMount { scope, .. } | Self::ScopedFuseMount { scope, .. } => Some(*scope),
-      Self::GuestTag { scope, .. } | Self::SharedFuseMount { scope, .. } => *scope,
+      Self::GuestTag { scope, .. }
+      | Self::SharedFuseMount { scope, .. }
+      | Self::BoundMount { scope, .. } => *scope,
+      _ => None,
+    }
+  }
+
+  /// The one Unix identity a bound mount serves (§4.6 A-115); `None` for a form that serves every caller.
+  pub fn bound_uid(&self) -> Option<u32> {
+    match self {
+      Self::BoundMount { uid, .. } => Some(*uid),
       _ => None,
     }
   }
@@ -768,7 +791,7 @@ pub struct NfsLockRecord {
 
 /// An NFSv4 client held at the listener's partition (§4.6 A-37): its id, owner, verifier, principal
 /// and next CREATE_SESSION sequence, so a restarted listener still knows it and its state ids stay
-/// valid; its sessions are not kept (a client re-creates them after `NFS4ERR_BADSESSION`).
+/// valid; its sessions are records of their own ([`NfsSessionRecord`], A-127).
 #[derive(Wire, Clone, Debug, PartialEq, Eq)]
 pub struct NfsClientRecord {
   /// The client id.
@@ -781,6 +804,81 @@ pub struct NfsClientRecord {
   pub principal: u32,
   /// The next CREATE_SESSION sequence it must send.
   pub create_seq: u32,
+}
+
+/// An NFSv4.1 channel's attributes as negotiated (RFC 8881 §18.36, `channel_attrs4`), as a session record carries them
+/// (A-127).
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NfsChannelRecord {
+  /// `ca_headerpadsize`.
+  pub header_pad: u32,
+  /// `ca_maxrequestsize`.
+  pub max_request: u32,
+  /// `ca_maxresponsesize`.
+  pub max_response: u32,
+  /// `ca_maxresponsesize_cached`.
+  pub max_response_cached: u32,
+  /// `ca_maxoperations`.
+  pub max_operations: u32,
+  /// `ca_maxrequests`: the slot count.
+  pub max_requests: u32,
+}
+
+/// A session's back channel as its record carries it (A-127): the client's callback program, the RPC credential its
+/// callbacks carry (an encoded `opaque_auth` the client listed), and the minor version they name.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct NfsCallbackRecord {
+  /// The callback program number.
+  pub program: u32,
+  /// The encoded credential.
+  pub credential: Vec<u8>,
+  /// The minor version callbacks name.
+  pub minor: u32,
+}
+
+/// An NFSv4.1 session held at its client's listener partition (A-127): enough for a restarted listener to serve it
+/// again, so a client retries on its own slots after a daemon restart and carries on with no CREATE_SESSION. Its
+/// slots' sequence ids are not kept: a restored slot takes its next request as it comes.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct NfsSessionRecord {
+  /// Format: the session id, an NFSv4.1 `sessionid4` (16 bytes, RFC 8881 §2.10.3).
+  pub sessionid: [u8; 16],
+  /// The client it belongs to.
+  pub clientid: u64,
+  /// The CREATE_SESSION sequence id that created it.
+  pub sequence: u32,
+  /// The fore channel.
+  pub fore: NfsChannelRecord,
+  /// The back channel.
+  pub back: NfsChannelRecord,
+  /// The back channel's callback, when the client asked for one.
+  pub callback: Option<NfsCallbackRecord>,
+}
+
+/// An NFSv4.1 call record held at the partition of the shard that served its calls (A-127): the session slot it
+/// answers for, the client it belongs to, and the record's bytes (`slates_bridge_nfs::v4::replay`, opaque here). It
+/// rides the file-state transaction a call of it changed, so a compound retried after a restart is answered with what
+/// it did, never run again.
+#[derive(Wire, Clone, Debug, PartialEq, Eq)]
+pub struct NfsCallRecord {
+  /// Format: the session slot: an NFSv4.1 session id (16 bytes) then the slot as a big-endian word.
+  pub key: [u8; 20],
+  /// The client the session belongs to.
+  pub clientid: u64,
+  /// The record's bytes.
+  pub record: Vec<u8>,
+}
+
+/// An NFSv4 purge a shard owes every owner shard (2026-10-10): a dropped client's file state and call records, or a
+/// destroyed session's call records. Recorded in the same transaction as the drop that makes it owed, and settled once
+/// every owner acknowledged it, so a death between the two cannot leave a dropped client's locks at an owner with no
+/// lease left to expire them.
+#[derive(Wire, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct NfsPurgeRecord {
+  /// The client.
+  pub clientid: u64,
+  /// Format: the destroyed session's id (16 bytes), or `None` for the dropped client's whole state.
+  pub session: Option<[u8; 16]>,
 }
 
 /// Format: the bytes of hyper-seal's wrapped key record (version, parent id, parent generation, AES-256-KW of the key;
@@ -815,6 +913,17 @@ pub enum SealKeyOwner {
   /// owner and `partition` the owner's shard. Appended.
   Pair {
     /// The other node.
+    host: u64,
+    /// The owner's partition.
+    partition: u16,
+  },
+  /// A pair key another node's owner shard delivered to this node (A-92 piece 4b), on its control shard (partition 0),
+  /// wrapped by this node's root: `host` the owner, `partition` the owner's shard. Kept apart from [`Self::Pair`], this
+  /// node's own key with that node: when this node's owner shard is partition 0 as well, the two shared one owner
+  /// until 2026-10-09, and whichever was recorded first made the other "another key for a recorded pair", refused for
+  /// good (an owner's heads then never covered that holder, and its mirror shipments were never owed). Appended.
+  PairReceived {
+    /// The owner node.
     host: u64,
     /// The owner's partition.
     partition: u16,

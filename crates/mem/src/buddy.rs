@@ -81,9 +81,13 @@ pub struct Buddy {
   deferring: WordSet,
   /// Whether a capture is open (taken, neither committed nor abandoned).
   capturing: bool,
-  /// Whether any image may name a block: set by the first capture and kept. Until then neither an allocation nor
-  /// a free touches a bitmap (an allocator nothing publishes from pays one flag test for the deferral).
+  /// Whether any image may name a block: set by the first capture and kept, or from the start for a published arena's
+  /// allocator ([`Buddy::new_imaged`]). Until then neither an allocation nor a free touches a bitmap (an allocator
+  /// nothing publishes from pays one flag test for the deferral).
   imaged: bool,
+  /// Granules a first capture read from the state bytes to find the live heads: the deferral's cost, paid once, in
+  /// one step. Zero for an allocator started imaged (the published arena's non-vacuity count).
+  scanned_granules: u64,
   deferred_bytes: usize,
   /// The heads of blocks locked in RAM (§4.2 D-12: a strict volume's content): set by [`Buddy::lock_block`], cleared
   /// when the block is released, whichever way, so the owner unlocks exactly the blocks that were locked.
@@ -232,6 +236,22 @@ impl Block {
   }
 }
 
+/// The blocks of a trimmed prefix of `granules` granules starting at granule `index` (A-118): the set bits of the
+/// count, highest first, each starting where the last ended, so each sits on its own size's boundary when `index` sits
+/// on the original block's. Only orders below `below` are considered (the original block's order, so the prefix is
+/// strictly smaller than it).
+fn pieces_of(index: u32, granules: usize, below: u32) -> Vec<(u32, u32)> {
+  let mut pieces = Vec::new();
+  let mut at = index;
+  for piece_order in (0..below).rev() {
+    if granules & (1usize << piece_order) != 0 {
+      pieces.push((at, piece_order));
+      at = at.saturating_add(1u32 << piece_order);
+    }
+  }
+  pieces
+}
+
 impl Buddy {
   /// An allocator for a region of `1 << max_order` granules of `granule` bytes each; the whole
   /// region starts free as one block. The granule is a page size, so a power of two; anything else is
@@ -275,10 +295,27 @@ impl Buddy {
       deferring: WordSet::new(granules.div_ceil(Bits::WORD_BITS)),
       capturing: false,
       imaged: false,
+      scanned_granules: 0,
       deferred_bytes: 0,
       locked: Bits::new(granules),
       locked_bytes: 0,
     })
+  }
+
+  /// [`Buddy::new`], keeping its live heads from the start (A-64): the allocator of a published arena. A fresh region
+  /// holds no block, so the set its first capture would read from the state bytes is empty and no capture ever reads
+  /// them; every allocation and claim keeps the heads as it does after a first capture. Before 2026-10-10 a published
+  /// region's first capture scanned every granule inside whichever verb's shard step published first: 8,388,608
+  /// granules, 64.6 ms in a debug build, one probe held behind it.
+  pub fn new_imaged(granule: usize, max_order: u32) -> Result<Self, MemError> {
+    let mut buddy = Self::new(granule, max_order)?;
+    buddy.imaged = true;
+    Ok(buddy)
+  }
+
+  /// Granules first captures read from the state bytes: zero for an allocator started imaged.
+  pub const fn scanned_granules(&self) -> u64 {
+    self.scanned_granules
   }
 
   /// Every allocated block, deferred ones included, as `(offset, len)`, in address order: a walk of the heads that
@@ -480,6 +517,124 @@ impl Buddy {
     }
   }
 
+  /// Trims the allocated `block` to its first `keep` bytes, rounded up to a granule (A-118), as Linux's
+  /// `alloc_pages_exact` does: the kept prefix becomes the blocks of its binary decomposition, largest first and each
+  /// on its own size's boundary (the head keeps its incarnation at its new order; every other piece is a new head with
+  /// a fresh incarnation), and the rest goes back to the free lists, coalescing. The kept blocks are returned in
+  /// address order; they are contiguous, so their bytes are one run.
+  ///
+  /// `None`, nothing changed, when trimming would change nothing (the prefix is the whole block), when the block is
+  /// locked, or when an image may name it (A-64: an image names whole blocks, so a block it names is never split
+  /// before the image that names it is replaced). Refused as [`Buddy::free`] is for a block that names no live block,
+  /// and `GenerationExhausted` when a piece's incarnation is spent, with nothing changed either way.
+  pub fn trim(&mut self, block: Block, keep: usize) -> Result<Option<Vec<Block>>, MemError> {
+    let (index, order) = self
+      .validate(block)
+      .map_err(|reason| MemError::ForeignExtent {
+        offset: block.offset,
+        len: block.len,
+        reason,
+      })?;
+    let granules = keep.max(1).div_ceil(self.granule);
+    let whole = 1usize << order;
+    if granules >= whole || self.named_by_an_image(index) || self.is_locked(block) {
+      return Ok(None);
+    }
+    let pieces = pieces_of(index, granules, order);
+    let mut at = pieces.last().map_or(index, |(piece, piece_order)| {
+      piece.saturating_add(1u32 << piece_order)
+    });
+    // Every new head's incarnation is checked before anything changes.
+    let mut incarnations: Vec<u64> = Vec::with_capacity(pieces.len());
+    for (offset, (piece, _)) in pieces.iter().enumerate() {
+      let incarnation = if offset == 0 {
+        block.incarnation
+      } else {
+        self
+          .incarnation_at(*piece)
+          .checked_add(1)
+          .ok_or(MemError::GenerationExhausted { index: *piece })?
+      };
+      incarnations.push(incarnation);
+    }
+    let mut kept = Vec::with_capacity(pieces.len());
+    for ((piece, piece_order), incarnation) in pieces.iter().zip(incarnations) {
+      self.mark(*piece, *piece_order, false);
+      if let Some(slot) = self.slot_mut(*piece) {
+        *slot = incarnation;
+      }
+      if self.imaged {
+        self.live.set(*piece, true);
+        self.note_changed(*piece);
+      }
+      kept.push(Block {
+        offset: usize::try_from(*piece).unwrap_or(0) << self.granule_shift,
+        len: self.order_bytes(*piece_order),
+        incarnation,
+      });
+    }
+    // The rest, `at .. index + whole`: the largest aligned blocks that fit, lowest first.
+    let end = index.saturating_add(u32::try_from(whole).unwrap_or(u32::MAX));
+    while at < end {
+      let mut free_order = at.trailing_zeros().min(order);
+      while at.saturating_add(1u32 << free_order) > end {
+        free_order = free_order.saturating_sub(1);
+      }
+      self.coalesce_free(at, free_order);
+      at = at.saturating_add(1u32 << free_order);
+    }
+    Ok(Some(kept))
+  }
+
+  /// Frees, or defers the free of, a block [`Buddy::trim`] cut to its first `keep` bytes, named by its head (A-118):
+  /// the head is validated as [`Buddy::free_or_defer`] validates a block, every other piece must be an allocated head
+  /// of the order the prefix's decomposition gives it, and only then is each freed or deferred. Refused, nothing
+  /// changed, when any check fails. Returns whether any piece was deferred (they were imaged together, so all are or
+  /// none is).
+  pub fn free_or_defer_trimmed(&mut self, head: Block, keep: usize) -> Result<bool, MemError> {
+    let blocks = self
+      .trimmed_blocks(head, keep)
+      .map_err(|reason| MemError::ForeignExtent {
+        offset: head.offset,
+        len: head.len,
+        reason,
+      })?;
+    let mut deferred = false;
+    for block in blocks {
+      deferred |= self.free_or_defer(block)?;
+    }
+    Ok(deferred)
+  }
+
+  /// Whether `head` names a live block trimmed to `keep` bytes, every piece allocated (A-118).
+  pub fn holds_trimmed(&self, head: Block, keep: usize) -> bool {
+    self.trimmed_blocks(head, keep).is_ok()
+  }
+
+  /// The pieces of a block trimmed to `keep` bytes whose head is `head`, each as the live block it is, or why not: the
+  /// head validated as a free validates a block, and every other piece an allocated head of its decomposition's order.
+  fn trimmed_blocks(&self, head: Block, keep: usize) -> Result<Vec<Block>, ExtentRefusal> {
+    let (index, order) = self.validate(head)?;
+    let granules = keep.max(1).div_ceil(self.granule);
+    let pieces = pieces_of(index, granules, order.saturating_add(1));
+    if pieces.first() != Some(&(index, order)) {
+      return Err(ExtentRefusal::WrongLength);
+    }
+    let mut blocks = Vec::with_capacity(pieces.len());
+    for (piece, piece_order) in &pieces {
+      let state = self.state_at(*piece);
+      if state == INSIDE || state & FREE_BIT != 0 || u32::from(state & ORDER_MASK) != *piece_order {
+        return Err(ExtentRefusal::NotAllocated);
+      }
+      blocks.push(Block {
+        offset: usize::try_from(*piece).unwrap_or(0) << self.granule_shift,
+        len: self.order_bytes(*piece_order),
+        incarnation: self.incarnation_at(*piece),
+      });
+    }
+    Ok(blocks)
+  }
+
   /// Allocates exactly the block of `len` bytes at `offset` (A-64: rebuilding the allocation a recovered
   /// image names). The block must be one this allocator could hand out (offset on a granule and on its
   /// size's boundary, length a power-of-two number of granules, inside the region) and lie wholly in one
@@ -661,6 +816,9 @@ impl Buddy {
         }
       }
       self.imaged = true;
+      self.scanned_granules = self
+        .scanned_granules
+        .saturating_add(u64::try_from(self.state.len()).unwrap_or(u64::MAX));
       self.changed.insert_all(self.live.words.len());
     }
     self.capturing = true;
@@ -1222,6 +1380,156 @@ mod tests {
     );
   }
 
+  /// A-118, trimming: do allocate, free and trim at random (a live block trimmed to a random prefix), checking after
+  /// every step that no two live blocks overlap and that the free bytes are the region less the live ones; check each
+  /// trim's pieces start at the block, run contiguously, sit on their own sizes' boundaries and hold exactly the prefix
+  /// rounded up to a granule, and that the block's handle from before the trim is refused. Then free everything;
+  /// expect the region one block again. A trim that would keep the whole block changes nothing.
+  #[test]
+  fn random_trims_keep_exact_prefixes_and_everything_coalesces_back() {
+    let granule = 256;
+    let mut b = Buddy::new(granule, 10).unwrap(); // 1024 granules
+    let mut rng = Xorshift::new(Xorshift::SEED);
+    let mut live: Vec<Block> = Vec::new();
+    let mut trimmed = 0usize;
+    let steps = if cfg!(miri) { 400 } else { 20_000 };
+    for _ in 0..steps {
+      match rng.below(4) {
+        0 | 1 => {
+          let len = (rng.below(20) + 1) * granule * (1 << rng.below(4));
+          allocate_step(&mut b, &mut live, len);
+        }
+        2 if !live.is_empty() => trimmed += trim_step(&mut b, &mut live, &mut rng),
+        _ if !live.is_empty() => {
+          let block = live.swap_remove(rng.below(live.len()));
+          b.free(block).unwrap();
+        }
+        _ => {}
+      }
+      check_population(&b, &live);
+    }
+    assert!(
+      trimmed > steps / 20,
+      "the trims ran: {trimmed} of {steps} steps"
+    );
+    for block in live.drain(..) {
+      b.free(block).unwrap();
+    }
+    assert_eq!(
+      b.largest_free(),
+      b.region_bytes(),
+      "the full region is one block again"
+    );
+  }
+
+  /// Trims a random live block to a random prefix and checks the pieces (contiguous from the block, each on its own
+  /// boundary, exactly the prefix in granules) and that the handle from before is refused: 1 when it trimmed.
+  fn trim_step(b: &mut Buddy, live: &mut Vec<Block>, rng: &mut Xorshift) -> usize {
+    let granule = b.granule;
+    let block = live.swap_remove(rng.below(live.len()));
+    let keep = rng.below(block.len()) + 1;
+    let Some(pieces) = b.trim(block, keep).unwrap() else {
+      assert!(
+        keep.div_ceil(granule) * granule >= block.len(),
+        "only a whole-block keep is left alone"
+      );
+      live.push(block);
+      return 0;
+    };
+    let mut at = block.offset();
+    for piece in &pieces {
+      assert_eq!(
+        piece.offset(),
+        at,
+        "the pieces run contiguously from the block"
+      );
+      assert_eq!(
+        piece.offset() % piece.len(),
+        0,
+        "each piece on its own boundary"
+      );
+      at += piece.len();
+    }
+    assert_eq!(
+      at - block.offset(),
+      keep.div_ceil(granule) * granule,
+      "exactly the prefix"
+    );
+    assert!(
+      b.free(block).is_err(),
+      "the handle from before the trim is refused"
+    );
+    live.extend(pieces);
+    1
+  }
+
+  /// No two live blocks overlap, and the free bytes are the region less the live ones.
+  fn check_population(b: &Buddy, live: &[Block]) {
+    for (index, block) in live.iter().enumerate() {
+      for other in &live[index + 1..] {
+        assert!(
+          !overlaps((block.offset, block.len), (other.offset, other.len)),
+          "{block:?} overlaps {other:?}"
+        );
+      }
+    }
+    let used: usize = live.iter().map(|x| x.len).sum();
+    assert_eq!(b.free_bytes() + used, b.region_bytes());
+  }
+
+  /// A-118: do trim blocks and free each through its head alone ([`Buddy::free_or_defer_trimmed`]); expect every
+  /// piece freed (the region one block again), and a head named with the wrong kept length, or after a piece was freed
+  /// on its own, refused with nothing changed.
+  #[test]
+  fn a_trimmed_block_is_freed_whole_through_its_head() {
+    let granule = 4096;
+    let mut b = Buddy::new(granule, 7).unwrap(); // eight 16-granule blocks
+    let mut groups = Vec::new();
+    for keep_granules in [3usize, 5, 7, 9, 11, 13, 15] {
+      let block = b.alloc(16 * granule).unwrap();
+      let pieces = b.trim(block, keep_granules * granule).unwrap().unwrap();
+      groups.push((pieces, keep_granules * granule));
+    }
+    let (pieces, keep) = groups.remove(0);
+    let free_before = b.free_bytes();
+    assert!(
+      b.free_or_defer_trimmed(pieces[0], keep + granule).is_err(),
+      "a wrong length is refused"
+    );
+    assert_eq!(b.free_bytes(), free_before, "nothing changed");
+    assert_eq!(b.free_or_defer_trimmed(pieces[0], keep), Ok(false));
+    let (pieces, keep) = groups.remove(0);
+    b.free(pieces[1]).unwrap();
+    let free_before = b.free_bytes();
+    assert!(
+      b.free_or_defer_trimmed(pieces[0], keep).is_err(),
+      "a missing piece is refused"
+    );
+    assert_eq!(b.free_bytes(), free_before, "nothing changed");
+    b.free(pieces[0]).unwrap();
+    for (pieces, keep) in groups {
+      assert_eq!(b.free_or_defer_trimmed(pieces[0], keep), Ok(false));
+    }
+    assert_eq!(
+      b.largest_free(),
+      b.region_bytes(),
+      "the full region is one block again"
+    );
+  }
+
+  /// A-118: do take a block into a committed image and trim it; expect nothing changed (an image names whole blocks).
+  #[test]
+  fn a_block_an_image_may_name_is_never_trimmed() {
+    let mut b = Buddy::new(4096, 4).unwrap();
+    b.commit_live();
+    let block = b.alloc(4 * 4096).unwrap();
+    b.capture();
+    b.commit_capture();
+    let free_before = b.free_bytes();
+    assert_eq!(b.trim(block, 4096).unwrap(), None);
+    assert_eq!(b.free_bytes(), free_before, "nothing changed");
+  }
+
   fn overlaps(a: (usize, usize), b: (usize, usize)) -> bool {
     a.0 < b.0 + b.1 && b.0 < a.0 + a.1
   }
@@ -1464,7 +1772,23 @@ mod tests {
   #[test]
   fn no_block_an_image_names_is_ever_handed_out_again() {
     let granule = 256;
-    let mut b = Buddy::new(granule, 8).unwrap();
+    let b = Buddy::new(granule, 8).unwrap();
+    let scanned = deferral_history(b, granule);
+    assert!(scanned > 0, "the first capture read the state bytes");
+  }
+
+  /// A-64 with a published arena's allocator. Do: the same history over an allocator started imaged. Expect: the same
+  /// rules hold at every step, and no capture ever read the state bytes — the scan the deferral pays is gone, not moved.
+  #[test]
+  fn an_allocator_started_imaged_keeps_every_rule_without_scanning() {
+    let granule = 256;
+    let b = Buddy::new_imaged(granule, 8).unwrap();
+    assert_eq!(deferral_history(b, granule), 0, "no capture scanned");
+  }
+
+  /// The random history of [`no_block_an_image_names_is_ever_handed_out_again`] over `b`, checked against the model at
+  /// every step; the granules its captures scanned.
+  fn deferral_history(mut b: Buddy, granule: usize) -> u64 {
     let mut rng = Xorshift::new(Xorshift::SEED);
     let mut model = DeferralModel::default();
     let steps = if cfg!(miri) { 2_000 } else { 20_000 };
@@ -1480,6 +1804,7 @@ mod tests {
       }
       model.check_totals(&b);
     }
+    b.scanned_granules()
   }
 
   /// T-1.1's preflight. Do: in a region of eight granules, ask for blocks of each size, then take one granule.

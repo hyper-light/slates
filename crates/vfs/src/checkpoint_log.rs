@@ -24,12 +24,18 @@ use slates_wire::crc32c::{crc32c, crc32c_append};
 
 use crate::delta::VolumeRecord;
 use crate::error::VfsError;
-use crate::recover::{CommittedSlot, HeldReply, ImageRead, ImageWrite, ShardImage};
+use crate::recover::{
+  CommittedSlot, HELD_CALL_KEY_BYTES, HeldCall, HeldNfsReply, HeldReply, ImageRead, ImageWrite,
+  ShardImage, StreamedImage,
+};
 
 /// Format: a delta's magic, checked before anything else on decode.
 const DELTA_MAGIC: u32 = u32::from_le_bytes(*b"SLD1");
-/// Format: the delta format's version.
-const DELTA_VERSION: u16 = 1;
+/// Format: the delta format's version, bumped with any change to the delta's types: 1 (A-68, 2026-10-04); 2 (A-126,
+/// 2026-10-09) a file changed only by writes to its chunked body is carried as its written windows
+/// (`delta::InodePatch`), not its whole image; 3 (A-127, 2026-10-09) the call records changed and purged since the
+/// last publication; 4 (A-128, 2026-10-09) the held NFSv3 replies, whole, when they changed.
+const DELTA_VERSION: u16 = 4;
 /// Format: a log frame's header — a little-endian payload length then a CRC-32C of the payload.
 const LOG_HEADER: usize = 2 * size_of::<u32>();
 /// Format: a log frame's payload prefix — its generation and its base checkpoint's generation.
@@ -60,9 +66,84 @@ pub struct ShardDelta {
   pub held: Option<Vec<u8>>,
   /// The undelivered barrier replies now, when they changed.
   pub replies: Option<Vec<HeldReply>>,
+  /// The call records changed since the last publication (A-127), in key order, each whole.
+  pub calls: Vec<HeldCall>,
+  /// The call records purged since the last publication, in key order.
+  pub calls_removed: Vec<[u8; HELD_CALL_KEY_BYTES]>,
+  /// The held NFSv3 replies now, when they changed (A-128).
+  pub nfs_replies: Option<Vec<HeldNfsReply>>,
 }
 
 impl ShardDelta {
+  /// Starts a streamed shard delta's encoding in `out` (for [`ShardDelta::encode_finish`]): what `ShardDelta::new`
+  /// then `encode` writes before the volumes, with their count to be patched in; returns where it goes. The caller
+  /// then appends each changed volume as its key's 16 bytes followed by `Volume::encode_publication`, in key order.
+  pub fn encode_start(out: &mut Vec<u8>) -> usize {
+    DELTA_MAGIC.encode(out);
+    DELTA_VERSION.encode(out);
+    let at = out.len();
+    slates_wire::codec::encode_len(0, out);
+    at
+  }
+
+  /// Ends a streamed shard delta: the volume count patched in at `at`, then the volumes gone (sorted here), the held
+  /// replicas' image, the replies, the call records changed and purged (each sorted here), and the held NFSv3 replies
+  /// when they changed, as `ShardDelta::new(volumes, removed, held, replies).with_calls(calls, calls_removed)
+  /// .with_nfs_replies(nfs_replies).encode` writes them.
+  #[allow(clippy::too_many_arguments)] // one delta's whole tail, each part written in the format's order
+  pub fn encode_finish(
+    out: &mut Vec<u8>,
+    at: usize,
+    volumes: usize,
+    removed: &mut [[u8; 16]],
+    held: Option<&[u8]>,
+    replies: Option<&[HeldReply]>,
+    (calls, calls_removed): (&mut [HeldCall], &mut [[u8; HELD_CALL_KEY_BYTES]]),
+    nfs_replies: Option<&mut [HeldNfsReply]>,
+  ) -> Result<(), VfsError> {
+    if !slates_wire::codec::patch_len(out, at, volumes) {
+      return Err(VfsError::RecoveryIncomplete);
+    }
+    removed.sort_unstable();
+    slates_wire::codec::encode_len(removed.len(), out);
+    for key in removed.iter() {
+      key.encode(out);
+    }
+    slates_wire::codec::encode_option_bytes(held, out);
+    match replies {
+      None => out.push(slates_wire::codec::OPTION_NONE),
+      Some(replies) => {
+        out.push(slates_wire::codec::OPTION_SOME);
+        slates_wire::codec::encode_len(replies.len(), out);
+        for reply in replies {
+          reply.encode(out);
+        }
+      }
+    }
+    calls.sort_unstable_by_key(|call| call.key);
+    slates_wire::codec::encode_len(calls.len(), out);
+    for call in calls.iter() {
+      call.encode(out);
+    }
+    calls_removed.sort_unstable();
+    slates_wire::codec::encode_len(calls_removed.len(), out);
+    for key in calls_removed.iter() {
+      key.encode(out);
+    }
+    match nfs_replies {
+      None => out.push(slates_wire::codec::OPTION_NONE),
+      Some(nfs_replies) => {
+        nfs_replies.sort_unstable_by_key(|reply| (reply.connection, reply.xid));
+        out.push(slates_wire::codec::OPTION_SOME);
+        slates_wire::codec::encode_len(nfs_replies.len(), out);
+        for reply in nfs_replies.iter() {
+          reply.encode(out);
+        }
+      }
+    }
+    Ok(())
+  }
+
   /// A delta of these changes.
   pub fn new(
     mut volumes: Vec<KeyedRecord>,
@@ -79,6 +160,34 @@ impl ShardDelta {
       removed,
       held,
       replies,
+      calls: Vec::new(),
+      calls_removed: Vec::new(),
+      nfs_replies: None,
+    }
+  }
+
+  /// This delta carrying the call records changed (`calls`) and purged (`calls_removed`) since the last publication
+  /// (A-127), each sorted by key.
+  pub fn with_calls(
+    self,
+    mut calls: Vec<HeldCall>,
+    mut calls_removed: Vec<[u8; HELD_CALL_KEY_BYTES]>,
+  ) -> ShardDelta {
+    calls.sort_unstable_by_key(|call| call.key);
+    calls_removed.sort_unstable();
+    ShardDelta {
+      calls,
+      calls_removed,
+      ..self
+    }
+  }
+
+  /// This delta carrying the held NFSv3 replies now (A-128), sorted by (connection, xid).
+  pub fn with_nfs_replies(self, mut nfs_replies: Vec<HeldNfsReply>) -> ShardDelta {
+    nfs_replies.sort_unstable_by_key(|reply| (reply.connection, reply.xid));
+    ShardDelta {
+      nfs_replies: Some(nfs_replies),
+      ..self
     }
   }
 }
@@ -127,6 +236,22 @@ impl ShardImage {
     if let Some(replies) = &delta.replies {
       self.replies.clone_from(replies);
     }
+    for call in &delta.calls {
+      match self.calls.binary_search_by_key(&call.key, |held| held.key) {
+        Ok(at) => {
+          if let Some(held) = self.calls.get_mut(at) {
+            held.record.clone_from(&call.record);
+          }
+        }
+        Err(at) => self.calls.insert(at, call.clone()),
+      }
+    }
+    self
+      .calls
+      .retain(|held| delta.calls_removed.binary_search(&held.key).is_err());
+    if let Some(nfs_replies) = &delta.nfs_replies {
+      self.nfs_replies.clone_from(nfs_replies);
+    }
     Ok(())
   }
 }
@@ -147,7 +272,31 @@ pub struct Journal {
   logged_bytes: usize,
 }
 
+/// What of a shard's recovery memory no restart reads (A-117), each as `(offset, len)` within its own region: the
+/// checkpoint slot older than the committed one, and the delta log past its tail.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DeadRanges {
+  /// The stale checkpoint slot, within the checkpoint memory.
+  pub stale_slot: (usize, usize),
+  /// The log past the next frame's start, within the log memory.
+  pub log_past_tail: (usize, usize),
+}
+
 impl Journal {
+  /// What no restart reads (A-117), for checkpoint memory `checkpoint_total` and log memory `log_total` bytes long;
+  /// `None` before the first checkpoint commits. A restart takes the newer CRC-valid slot, then the log's frames from
+  /// its start while each is CRC-valid and names that checkpoint, so the other slot and every byte past the tail are
+  /// dead: frames there are torn or name an older base. Returning their pages leaves them reading zeros, which fail
+  /// the same checks.
+  pub fn dead_ranges(&self, checkpoint_total: usize, log_total: usize) -> Option<DeadRanges> {
+    let committed = self.committed?;
+    let tail = self.tail.min(log_total);
+    Some(DeadRanges {
+      stale_slot: committed.stale_slot(checkpoint_total),
+      log_past_tail: (tail, log_total.saturating_sub(tail)),
+    })
+  }
+
   /// The generation of the last committed publication: what a transport's write log since it is stamped with.
   pub fn generation(&self) -> u64 {
     self.generation
@@ -180,18 +329,67 @@ impl Journal {
     Ok(bytes)
   }
 
-  /// Appends `delta` to `log` over the committed checkpoint. Refuses [`VfsError::NoSpace`] when the frame does not
-  /// fit the log's room (the caller checkpoints instead), and refuses before writing anything when no checkpoint is
-  /// committed; the journal is unchanged on any refusal.
+  /// Starts a checkpoint streamed into the free slot of `checkpoints` (staging in `stage`): the caller encodes the shard
+  /// image into it (`ShardImage::encode_start`, each volume, `encode_finish`) and hands it to
+  /// [`Journal::finish_checkpoint`], so the publisher never holds the image, nor its encoding, whole. Dropping the
+  /// stream instead abandons the checkpoint: the committed slot is untouched and the journal unchanged.
+  pub fn begin_checkpoint<'s, S: ImageWrite + ?Sized>(
+    &self,
+    checkpoints: &'s mut S,
+    stage: &'s mut Vec<u8>,
+  ) -> Result<StreamedImage<'s, S>, VfsError> {
+    let known = self
+      .committed
+      .map(|committed| committed.advanced_to(self.generation));
+    StreamedImage::begin(checkpoints, known, stage)
+  }
+
+  /// Commits a checkpoint begun by [`Journal::begin_checkpoint`] and restarts the log; the journal is unchanged on any
+  /// refusal (the slot could not take the image: [`VfsError::NoSpace`]).
+  pub fn finish_checkpoint<S: ImageWrite + ?Sized>(
+    &mut self,
+    image: StreamedImage<'_, S>,
+  ) -> Result<usize, VfsError> {
+    let (bytes, committed) = image.finish()?;
+    *self = Journal {
+      committed: Some(committed),
+      generation: committed.generation,
+      tail: 0,
+      checkpoint_bytes: bytes,
+      logged_bytes: 0,
+    };
+    Ok(bytes)
+  }
+
+  /// Appends `delta` to `log` over the committed checkpoint, encoding it in `scratch` (cleared first; the caller keeps
+  /// it, so a barrier's delta reuses one buffer where its own grew by doubling: one allocation and seven reallocations
+  /// per create, 2026-10-06 `create_heap`). Refuses [`VfsError::NoSpace`] when the frame does not fit the log's room
+  /// (the caller checkpoints instead), and refuses before writing anything when no checkpoint is committed; the journal
+  /// is unchanged on any refusal.
   pub fn append<S: ImageWrite + ?Sized>(
     &mut self,
     log: &mut S,
     delta: &ShardDelta,
+    scratch: &mut Vec<u8>,
+  ) -> Result<usize, VfsError> {
+    if self.committed.is_none() {
+      return Err(VfsError::RecoveryIncomplete);
+    }
+    scratch.clear();
+    delta.encode(scratch);
+    self.append_encoded(log, scratch)
+  }
+
+  /// [`Journal::append`] for a shard delta already encoded (`ShardDelta::encode_start` … `encode_finish`): the daemon
+  /// streams each volume's publication into its scratch, never building the delta as a value.
+  pub fn append_encoded<S: ImageWrite + ?Sized>(
+    &mut self,
+    log: &mut S,
+    body: &[u8],
   ) -> Result<usize, VfsError> {
     let Some(committed) = self.committed else {
       return Err(VfsError::RecoveryIncomplete);
     };
-    let body = delta.to_bytes();
     let generation = self
       .generation
       .checked_add(1)
@@ -210,7 +408,7 @@ impl Journal {
     let (gen_field, base_field) = prefix.split_at_mut(size_of::<u64>());
     gen_field.copy_from_slice(&generation.to_le_bytes());
     base_field.copy_from_slice(&committed.generation.to_le_bytes());
-    let crc = crc32c_append(crc32c(&prefix), &body);
+    let crc = crc32c_append(crc32c(&prefix), body);
     let mut header = [0u8; LOG_HEADER];
     let (len_field, crc_field) = header.split_at_mut(size_of::<u32>());
     len_field.copy_from_slice(
@@ -222,7 +420,7 @@ impl Journal {
     // The payload first and the header last, so the frame becomes CRC-valid only once all of it is written.
     let payload_at = self.tail.saturating_add(LOG_HEADER);
     log.image_write(payload_at, &prefix)?;
-    log.image_write(payload_at.saturating_add(LOG_PREFIX), &body)?;
+    log.image_write(payload_at.saturating_add(LOG_PREFIX), body)?;
     // The next frame's length word reads zero until a frame is written there, so a replay stops at this tail.
     if end.saturating_add(LOG_HEADER) <= log.image_len() {
       log.image_write(end, &[0u8; LOG_HEADER])?;
@@ -240,10 +438,9 @@ impl Journal {
     checkpoints: &C,
     log: &L,
   ) -> Result<(Option<ShardImage>, Journal), VfsError> {
-    let Some(committed) = crate::recover::committed_slot(checkpoints) else {
-      return Ok((None, Journal::default()));
-    };
-    let Some(mut image) = ShardImage::read_from(checkpoints)? else {
+    // The committed checkpoint found, read and checked once (it was found by checking both slots, then found and
+    // read again).
+    let Some((committed, mut image)) = ShardImage::read_committed(checkpoints)? else {
       return Ok((None, Journal::default()));
     };
     let mut journal = Journal {

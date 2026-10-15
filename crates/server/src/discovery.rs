@@ -377,6 +377,12 @@ pub(crate) struct Cursor {
 }
 
 impl Cursor {
+  /// The peer's roster generation once a sweep has completed against it (this node announced, and the last page named
+  /// no further candidate); `None` mid-sweep. A record link backs its checks off while this stays the same.
+  pub(crate) fn settled(&self) -> Option<u64> {
+    (self.announced && self.after.is_none() && self.generation != 0).then_some(self.generation)
+  }
+
   pub(crate) fn request(&self, state: &ShardState) -> Option<Vec<u8>> {
     let discovery = state.discovery.as_ref()?;
     Some(

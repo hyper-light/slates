@@ -748,6 +748,25 @@ pub(crate) fn read_range(
   offset: u64,
   max: u64,
 ) -> ReplyBody {
+  read_window(state, principal, (volume, path, at), offset, max, 0)
+}
+
+/// The room one page of a read leaves in a client's reply chunk: the most a client-facing `ReadPage` carries.
+pub(crate) fn page_room() -> u64 {
+  let chunk = usize::try_from(crate::config::bulk_chunk_bytes()).unwrap_or(usize::MAX);
+  u64::try_from(chunk.saturating_sub(READ_PAGE_HEADER_BYTES)).unwrap_or(0)
+}
+
+/// [`read_range`] with a larger bound: up to `max` bytes, capped at `cap` where it exceeds one page's room — a
+/// read-ahead window another node asked for (`RequestBody::ReadWindow`). A `cap` of zero is one page.
+pub(crate) fn read_window(
+  state: &mut ShardState,
+  principal: &Principal,
+  (volume, path, at): (VolumeId, &str, ReadAt),
+  offset: u64,
+  max: u64,
+  cap: u64,
+) -> ReplyBody {
   let record = match find_record(state, volume) {
     Ok(record) => record,
     Err(refusal) => return refused(refusal),
@@ -755,9 +774,7 @@ pub(crate) fn read_range(
   if !rights_of(&record, principal).read {
     return forbidden("read");
   }
-  let chunk = usize::try_from(crate::config::bulk_chunk_bytes()).unwrap_or(usize::MAX);
-  let room = u64::try_from(chunk.saturating_sub(READ_PAGE_HEADER_BYTES)).unwrap_or(0);
-  let want = max.min(room);
+  let want = max.min(page_room().max(cap));
   let key = canonical_path(path);
   match record.policy.role {
     Role::Green { .. } => read_green_range(state, record.id, key, at, (offset, want)),
@@ -1151,7 +1168,7 @@ use slates_merge::engine::{Green, Increment, Outcome};
 use slates_wire::Wire;
 
 use crate::fleet::{Dispatch, LateReplies, return_sessions, take_sessions};
-use crate::xshard::{call_within, run_on};
+use crate::xshard::call_within;
 
 /// The stream a merge record rides between an owner and a candidate holder (§4.16 "Commit"):
 /// its own id, so the holder recomputes before it accepts — never a guess from the bytes.
@@ -1766,8 +1783,9 @@ async fn put_inputs(
   quorum: Quorum,
   budget: CommitBudget,
 ) -> Option<Dispatch> {
-  let holders =
-    take_sessions(|host| host != local && candidates.contains(&host) && !acked.contains(&host));
+  let holders = take_sessions("fleet.lent_to.put_inputs", |host| {
+    host != local && candidates.contains(&host) && !acked.contains(&host)
+  });
   if holders.is_empty() {
     return None;
   }
@@ -1795,7 +1813,7 @@ async fn put_inputs(
     Err(ClusterError::Uncertain { placement } | ClusterError::NotPlaced { placement }) => placement,
     Err(_) => return Some(dispatch),
   };
-  let _ = run_on(origin, shard, move |s| {
+  crate::xshard::run_on_counted(origin, shard, move |s| {
     if let Some(pending) = s
       .merge
       .pending
@@ -1830,7 +1848,7 @@ async fn ship_record(
   quorum: Quorum,
   budget: CommitBudget,
 ) -> Option<Dispatch> {
-  let holders = take_sessions(|host| targets.contains(&host));
+  let holders = take_sessions("fleet.lent_to.ship_record", |host| targets.contains(&host));
   if holders.is_empty() {
     return None;
   }
@@ -1858,7 +1876,7 @@ async fn ship_record(
     Err(ClusterError::Uncertain { placement } | ClusterError::NotPlaced { placement }) => placement,
     Err(_) => return Some(dispatch),
   };
-  let _ = run_on(origin, shard, move |s| {
+  crate::xshard::run_on_counted(origin, shard, move |s| {
     record_merge_acks(s, local, object, version, placement, quorum);
   });
   Some(dispatch)

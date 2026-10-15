@@ -51,6 +51,10 @@ const BEFORE: &[u8] = b"the bytes the snapshot froze: alpha bravo charlie delta 
 /// [`BEFORE`] and written at offset zero, so the head's file is exactly these bytes.
 const AFTER: &[u8] =
   b"the bytes the head holds after the snapshot: golf hotel india juliet kilo lima mike november\n";
+/// Shape: the bytes a clone writes over an inherited file — diverging it out of the origin snapshot's shared records
+/// (A-134 `origin_diverged`): the clone's publication that follows is its whole image, and the origin keeps [`BEFORE`].
+const DIVERGED: &[u8] =
+  b"the bytes the clone diverged an inherited file to: oscar papa quebec romeo sierra tango\n";
 
 /// The product's own deadlines (`Deadlines::derive` over the anchor's liveness budget and the recovery
 /// budget), never a shorter hand-picked reply clock that calls a live daemon stalled
@@ -348,6 +352,10 @@ fn acknowledged_content_and_its_snapshot_survive_a_daemon_restart_byte_for_byte(
       AFTER,
       "the head diverged before the restart"
     );
+    // A new file born after the snapshot is the head's own: writing it is a delta (A-134), not the whole image a
+    // snapshot-pinned write takes, and the delta must survive the restart.
+    let post = create(&mut stream, &root, "post-snap", 6);
+    write(&mut stream, &post, BEFORE, 7);
   }
   let snapshot = client.status(kept).unwrap().head;
   let member = first.member_identity().unwrap();
@@ -377,6 +385,11 @@ fn acknowledged_content_and_its_snapshot_survive_a_daemon_restart_byte_for_byte(
     read_file(&second, "kept", "f"),
     AFTER,
     "the head's acknowledged bytes, written after the snapshot, survived the restart"
+  );
+  assert_eq!(
+    read_file(&second, "kept", "post-snap"),
+    BEFORE,
+    "a file created after the snapshot (published as a delta) survived the restart"
   );
   // The snapshot's frozen bytes, read through a clone of it — the only path that serves a snapshot's
   // content over the mount transport.
@@ -694,13 +707,19 @@ fn an_abandoned_transfer_returns_every_charge_when_replaced() {
   assert_eq!(abandoned_held, Ok(false));
 }
 
-/// Shape: the host memory the pressure test's first daemon reads at its first sample.
-const SAMPLED_AVAILABLE: u64 = 8 << 30;
-/// Shape: how much less the second daemon reads at its own first sample — a process that grew between
-/// two daemons' starts (the fleet test binary grows by its leaked sockets and buffers).
-const GROWN_BETWEEN_STARTS: u64 = 1 << 30;
-/// Shape: a further drop the second daemon reads later, which is real pressure on it.
-const LATER_DROP: u64 = 256 << 20;
+/// Shape: the pressure tests' host has exactly the daemon's whole capacity free at the first sample (no slack beyond
+/// what it could fill, so every drop it did not cause is pressure on it, admission.md §5.5). The parts of that capacity
+/// the tests move the host by, each a fraction of it so they hold on any machine's derived capacity:
+/// how much less the second daemon reads at its own first sample — a process that grew between two daemons' starts
+/// (the fleet test binary grows by its leaked sockets and buffers) — as a divisor of the capacity.
+const GROWN_BETWEEN_STARTS_PARTS: u64 = 4;
+/// Shape: a further drop a daemon reads later, which is real pressure on it, as a divisor of the capacity.
+const LATER_DROP_PARTS: u64 = 8;
+
+/// A pressure test daemon's whole content capacity: what its sampler is first shown as the host's free memory.
+fn pressure_capacity(config: &DaemonConfig) -> u64 {
+  config.reserve_per_shard * u64::from(TEST_SHARDS)
+}
 /// Shape: how long the test waits for a sampler to act — many liveness cadences (one second each).
 const SAMPLER_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
@@ -723,10 +742,11 @@ fn within_sampler_wait(mut done: impl FnMut() -> bool) -> bool {
 }
 
 /// §4.2, admission.md §5.5 (found by the AUD-29-43 churn test's CI failures). Do: start one daemon whose
-/// sampler reads a host's available memory; start a second in the same process that reads 1 GiB less at
-/// its first sample; then let the second read a further 256 MiB less. Expect: neither daemon holds
+/// sampler reads a host's available memory (exactly its capacity, no slack); start a second in the same process that
+/// reads a quarter of the capacity less at its first sample; then let the second read a further eighth less. Expect:
+/// neither daemon holds
 /// anything back for the difference between their starts — each measures pressure from its own first
-/// sample — and the second's later drop is held back across its shards. Before the fix the baseline was
+/// sample — and the second's later drop is held back whole. Before the fix the baseline was
 /// process-wide, fixed by whichever daemon sampled first, so the second daemon withheld the first's
 /// growth as if it were pressure.
 #[test]
@@ -735,33 +755,40 @@ fn two_daemons_in_one_process_measure_memory_pressure_from_their_own_start() {
   let start = |name: &str| {
     let instance = format!("srv-pressure-{name}-{}", std::process::id());
     let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
+    let capacity = pressure_capacity(&config);
     let segment = anchor_segment(&format!("pressure-{name}"), &profile, &config);
     let daemon = Daemon::start(&profile, config, source_of(&segment)).unwrap();
-    (daemon, segment)
+    (daemon, segment, capacity)
   };
-  let (first, first_segment) = start("first");
+  let (first, first_segment, capacity) = start("first");
+  // The shapes the test moves the host by: the host free at the first sample, the growth between the starts, the
+  // later drop.
+  let (sampled_available, grown_between_starts, later_drop) = (
+    capacity,
+    capacity / GROWN_BETWEEN_STARTS_PARTS,
+    capacity / LATER_DROP_PARTS,
+  );
   // The process's resident memory is pinned too: the hold subtracts the daemon's own resident growth, and a real
   // reading of a test process (both daemons and the harness) moves with whatever else runs, which made this test fail
   // under x86_64 emulation at load 60 (2026-10-05).
   first.inject_resident_memory(SAMPLED_RESIDENT).unwrap();
-  first.inject_available_memory(SAMPLED_AVAILABLE).unwrap();
+  first.inject_available_memory(sampled_available).unwrap();
   let first_sampled =
-    within_sampler_wait(|| first.pressure_baseline() == Ok(Some(SAMPLED_AVAILABLE)));
-  let (second, second_segment) = start("second");
+    within_sampler_wait(|| first.pressure_baseline() == Ok(Some(sampled_available)));
+  let (second, second_segment, _) = start("second");
   second.inject_resident_memory(SAMPLED_RESIDENT).unwrap();
   second
-    .inject_available_memory(SAMPLED_AVAILABLE - GROWN_BETWEEN_STARTS)
+    .inject_available_memory(sampled_available - grown_between_starts)
     .unwrap();
   let second_sampled = within_sampler_wait(|| {
-    second.pressure_baseline() == Ok(Some(SAMPLED_AVAILABLE - GROWN_BETWEEN_STARTS))
+    second.pressure_baseline() == Ok(Some(sampled_available - grown_between_starts))
   });
-  let second_hold_at_start = second.pressure_hold();
+  let second_hold_at_start = withheld(&second);
   second
-    .inject_available_memory(SAMPLED_AVAILABLE - GROWN_BETWEEN_STARTS - LATER_DROP)
+    .inject_available_memory(sampled_available - grown_between_starts - later_drop)
     .unwrap();
-  let per_shard = LATER_DROP / u64::from(TEST_SHARDS);
-  let pressure_held = within_sampler_wait(|| second.pressure_hold() == Ok(per_shard));
-  let first_hold = first.pressure_hold();
+  let pressure_held = within_sampler_wait(|| withheld(&second) == Some(later_drop));
+  let first_hold = withheld(&first);
   first.stop();
   second.stop();
   drop((first_segment, second_segment));
@@ -772,31 +799,37 @@ fn two_daemons_in_one_process_measure_memory_pressure_from_their_own_start() {
   );
   assert_eq!(
     second_hold_at_start,
-    Ok(0),
+    Some(0),
     "the second daemon withholds nothing for the process's growth before it started"
   );
   assert!(
     pressure_held,
-    "a later drop on the second daemon is held back, divided among its shards"
+    "a later drop on the second daemon is held back whole"
   );
   assert_eq!(
     first_hold,
-    Ok(0),
+    Some(0),
     "the first daemon saw no pressure of its own"
   );
 }
 
+/// The whole pressure hold `daemon` withholds now ([`Daemon::pressure_withheld`]), `None` when it could not be read.
+fn withheld(daemon: &Daemon) -> Option<u64> {
+  daemon.pressure_withheld().ok().and_then(Result::ok)
+}
+
 /// Shape: the pressure test's daemon's own resident memory at its first sample.
 const SAMPLED_RESIDENT: u64 = 64 << 20;
-/// Shape: the bytes the daemon itself takes after its first sample (content it stored): the host's available memory
-/// falls by them and its own resident memory rises by them.
-const OWN_GROWTH: u64 = 512 << 20;
+/// Shape: the bytes the daemon itself takes after its first sample (content it stored), as a divisor of its capacity:
+/// the host's available memory falls by them and its own resident memory rises by them.
+const OWN_GROWTH_PARTS: u64 = 4;
 
 /// §4.2, admission.md §5.5 (found 2026-10-05 in a 1 GiB container: one volume refused at 244 MB with a hold of 111 MB
 /// per shard for memory the daemon had itself filled). Do: let a daemon's sampler read a host's available memory and
-/// its own resident memory; then let available fall by [`OWN_GROWTH`] while its resident memory rises by the same;
-/// then let available fall a further [`LATER_DROP`] with its resident memory unchanged. Expect: no hold for its own
-/// growth (that is committed content, charged already), and the further drop held back across its shards. Before the
+/// its own resident memory (the host's free memory exactly the daemon's capacity, no slack); then let available fall by
+/// a quarter of the capacity ([`OWN_GROWTH_PARTS`]) while its resident memory rises by the same; then let available fall
+/// a further eighth ([`LATER_DROP_PARTS`]) with its resident memory unchanged. Expect: no hold for its own
+/// growth (that is committed content, charged already), and the further drop held back whole. Before the
 /// fix the hold counted the daemon's own growth as pressure, so every stored byte was charged twice and one volume
 /// reached about half the content capacity.
 #[test]
@@ -804,31 +837,37 @@ fn a_daemons_own_growth_is_not_memory_pressure() {
   let profile = common::machine_profile();
   let instance = format!("srv-pressure-own-{}", std::process::id());
   let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
+  let capacity = pressure_capacity(&config);
+  // The shapes the test moves the host by: the host free at the first sample, the daemon's own growth, the later drop.
+  let (sampled_available, own_growth, later_drop) = (
+    capacity,
+    capacity / OWN_GROWTH_PARTS,
+    capacity / LATER_DROP_PARTS,
+  );
   let segment = anchor_segment("pressure-own", &profile, &config);
   let daemon = Daemon::start(&profile, config, source_of(&segment)).unwrap();
-  daemon.inject_available_memory(SAMPLED_AVAILABLE).unwrap();
+  daemon.inject_available_memory(sampled_available).unwrap();
   daemon.inject_resident_memory(SAMPLED_RESIDENT).unwrap();
-  let sampled = within_sampler_wait(|| daemon.pressure_baseline() == Ok(Some(SAMPLED_AVAILABLE)));
+  let sampled = within_sampler_wait(|| daemon.pressure_baseline() == Ok(Some(sampled_available)));
   daemon
-    .inject_resident_memory(SAMPLED_RESIDENT + OWN_GROWTH)
+    .inject_resident_memory(SAMPLED_RESIDENT + own_growth)
     .unwrap();
   daemon
-    .inject_available_memory(SAMPLED_AVAILABLE - OWN_GROWTH)
+    .inject_available_memory(sampled_available - own_growth)
     .unwrap();
   // Two sampler periods: the hold a wrong reading would set has had its chance to appear.
-  let wrongly_held = within_sampler_wait(|| daemon.pressure_hold().is_ok_and(|hold| hold > 0));
+  let wrongly_held = within_sampler_wait(|| withheld(&daemon).is_some_and(|hold| hold > 0));
   daemon
-    .inject_available_memory(SAMPLED_AVAILABLE - OWN_GROWTH - LATER_DROP)
+    .inject_available_memory(sampled_available - own_growth - later_drop)
     .unwrap();
-  let per_shard = LATER_DROP / u64::from(TEST_SHARDS);
-  let pressure_held = within_sampler_wait(|| daemon.pressure_hold() == Ok(per_shard));
-  let hold = daemon.pressure_hold();
+  let pressure_held = within_sampler_wait(|| withheld(&daemon) == Some(later_drop));
+  let hold = withheld(&daemon);
   daemon.stop();
   assert!(sampled, "the daemon took its first sample");
   assert!(!wrongly_held, "its own growth is not held back as pressure");
   assert!(
     pressure_held,
-    "a drop it did not cause is held back, divided among its shards: {hold:?}"
+    "a drop it did not cause is held back whole: {hold:?} against {later_drop}"
   );
 }
 
@@ -920,6 +959,64 @@ fn an_acknowledged_replica_survives_a_warm_daemon_restart() {
     held_after,
     Ok(true),
     "the acknowledged replica is held after a warm restart"
+  );
+}
+
+/// §4.8 "persistence before reply" for register records (Vertical Paxos II's acceptor; Raft Figure 2: persistent
+/// state is updated before responding): a holder acknowledges a record only once anchor-owned RAM retains it, so a
+/// warm restart, which keeps the node's member id, keeps every record it acknowledged and the epoch its fence saw.
+/// Found 2026-10-07: no code restored a held record (`Acceptor::recovered` was never called), so a restarted holder
+/// came back under the same id holding nothing, and its takeover promise would count toward `f + 1` without the
+/// record it had acknowledged. Do: hold a head record on a daemon through the holder's production path, stop it, and
+/// start a second daemon over the same anchor segment. Expect: the record acknowledged, then held after the
+/// restart with its value and the fence's epoch.
+#[test]
+fn an_acknowledged_held_record_survives_a_warm_daemon_restart() {
+  use slates_db::register::{HostEpoch, HostId, ObjectId, Record};
+
+  let profile = common::machine_profile();
+  let instance = format!("srv-record-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
+  let segment = anchor_segment("record", &profile, &config);
+  let first = Daemon::start(&profile, config.clone(), source_of(&segment)).unwrap();
+  first
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  // The owner must be a member of the holder's council; a solo daemon's only member is itself.
+  let owner = first.member_identity().unwrap();
+  let object = ObjectId::new(HostId(owner.0), 3);
+  let record = Record {
+    owner,
+    object,
+    sequence: 4,
+    epoch: HostEpoch(2),
+    generation: 0,
+    value: b"a head".to_vec(),
+  };
+  let reply = first
+    .hold_record_as_authorized(owner, record.clone())
+    .unwrap();
+  let held_before = first.fleet_held_record(object);
+  first.stop();
+
+  let second = Daemon::start(&profile, config, source_of(&segment)).unwrap();
+  let held_after = second.fleet_held_record(object);
+  let owner_after = second.member_identity();
+  second.stop();
+  drop(segment);
+  assert!(!reply.is_empty(), "the holder acknowledged the record");
+  assert_eq!(
+    owner_after,
+    Ok(owner),
+    "a warm restart keeps the member id, so the holder's promises still count for its records"
+  );
+  assert!(
+    matches!(&held_before, Ok(Some(held)) if held.sequence == 4 && held.epoch == 2 && held.value == record.value),
+    "the record was held before the restart: {held_before:?}"
+  );
+  assert_eq!(
+    held_after, held_before,
+    "the acknowledged record and its fence are held after a warm restart"
   );
 }
 
@@ -1875,6 +1972,10 @@ fn a_clone_recovers_over_its_recovered_origin_serving_inherited_and_its_own_file
   let (mut stream, root) = mounted_on(&first, "clone-origin");
   let inherited = create(&mut stream, &root, "inherited", 2);
   write(&mut stream, &inherited, BEFORE, 3);
+  // A second inherited file the clone will diverge (A-134): it exercises the shared→private move that forces the
+  // clone's whole-image publication, while `inherited` stays shared to prove the untouched path still recovers.
+  let inherited2 = create(&mut stream, &root, "inherited2", 12);
+  write(&mut stream, &inherited2, BEFORE, 13);
   drop(stream);
   let snapshot = client.snapshot(origin).unwrap();
   // A clone lives on its origin's partition; its name must route there too to be mounted by name.
@@ -1885,6 +1986,11 @@ fn a_clone_recovers_over_its_recovered_origin_serving_inherited_and_its_own_file
   let (mut stream, root) = mounted_on(&first, &clone_name);
   let own = create(&mut stream, &root, "own", 4);
   write(&mut stream, &own, AFTER, 5);
+  // Diverge an inherited file in the clone: it copies up (born > origin), leaving `origin_shared` for the clone's own
+  // inodes — the shared→private move that makes the clone's publication its whole image (A-134), and must survive the
+  // restart without touching the origin's own copy.
+  let diverge = lookup(&mut stream, &root, "inherited2", 14);
+  write(&mut stream, &diverge, DIVERGED, 15);
   drop(stream);
   first.stop();
 
@@ -1898,10 +2004,25 @@ fn a_clone_recovers_over_its_recovered_origin_serving_inherited_and_its_own_file
   );
   let own = lookup(&mut stream, &root, "own", 8);
   assert_eq!(read(&mut stream, &own, 9), AFTER, "the clone's own file");
+  // The diverged inherited file reads the clone's own bytes after the restart (its whole-image publication carried
+  // the shared→private move).
+  let diverged = lookup(&mut stream, &root, "inherited2", 16);
+  assert_eq!(
+    read(&mut stream, &diverged, 17),
+    DIVERGED,
+    "the clone's diverged inherited file"
+  );
   drop(stream);
   let (mut stream, root) = mounted_on(&second, "clone-origin");
   let file = lookup(&mut stream, &root, "inherited", 10);
   assert_eq!(read(&mut stream, &file, 11), BEFORE, "the origin's file");
+  // The clone's divergence never touched the origin's own copy of that file.
+  let origin2 = lookup(&mut stream, &root, "inherited2", 18);
+  assert_eq!(
+    read(&mut stream, &origin2, 19),
+    BEFORE,
+    "the origin's copy is untouched by the clone's divergence"
+  );
   drop(stream);
   drop(client);
   second.stop();
@@ -2105,6 +2226,49 @@ fn a_shard_is_refused_while_another_holds_the_pool_and_admitted_once_it_returns(
   };
   assert_ne!(admitted, large);
   daemon.stop();
+}
+
+/// A-98, §4.2 ("refused whole, with nothing changed"): a refused admission takes nothing from the pool. Do: on two
+/// shards of [`SLICE`] each, ask shard 1 for a volume larger than the whole pool, then ask shard 0 for a quarter of its
+/// own slice. Expect: the first refused `BudgetExceeded` naming at least a slice available (the pool's free room, not
+/// only what shard 1 holds), and the second admitted at once. Found 2026-10-09 reading the
+/// pool beside the pressure hold: the refused create had claimed every free extent into shard 1's arena on its way to
+/// the refusal, and an idle shard returns extents only after its next publication.
+#[test]
+fn a_refused_admission_leaves_the_pool_to_the_other_shards() {
+  let profile = common::machine_profile();
+  let instance = format!("srv-pool-refused-{}", std::process::id());
+  let mut config = DaemonConfig::derive(&profile, &instance, Some(POOL_SHARDS));
+  config.reserve_per_shard = SLICE;
+  let segment = anchor_segment("pool-refused", &profile, &config);
+  let daemon = Daemon::start(&profile, config, source_of(&segment)).unwrap();
+  daemon
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let mut client = connect(&instance);
+  let bounded = |name: String, limit: u64| CreateSpec {
+    size: SizeClass::Bounded { limit },
+    ..scratch(&name)
+  };
+  let oversized = client.create(&bounded(
+    name_on(1, "oversized"),
+    SLICE * u64::from(POOL_SHARDS) + SLICE,
+  ));
+  let modest = client.create(&bounded(name_on(0, "modest"), SLICE / 4));
+  daemon.stop();
+  assert!(
+    matches!(
+      oversized,
+      Err(ClientError::Refused(
+        slates_ipc::protocol::Refusal::BudgetExceeded { available }
+      )) if available >= SLICE
+    ),
+    "a volume larger than the whole pool is refused, naming the pool's free room as available: {oversized:?}"
+  );
+  assert!(
+    modest.is_ok(),
+    "the refused create left the pool to shard 0: {modest:?}"
+  );
 }
 
 /// Shape: the pool extent the crash test leaves claimed: partition 1's slice, its first (and, at a power-of-two
@@ -2424,6 +2588,179 @@ fn allocated_in_content(name: &str) -> u64 {
   0
 }
 
+/// A-117, the recovery memory no restart reads goes back when idle, and a restart still recovers everything: do write
+/// files in rounds with a publication after each (a checkpoint, then deltas, then a checkpoint into the other slot),
+/// leave the shard idle until it counts recovery memory given back (`recovery.returned_bytes`), restart over the same
+/// anchor and read every file; then write another round, publish, return again and restart again, so the next
+/// checkpoint is written into a slot whose pages went back. Expect every file byte for byte after each restart and, on
+/// Linux and macOS (where the content object punches holes or marks pages reusable), the counter moved both times. Before A-117 the stale slot and the log's dead pages stayed resident: 30 MB of a
+/// `/usr` copy (`docs/wip/BENCHMARKS.md`, memory per file).
+#[test]
+fn recovery_memory_no_restart_reads_goes_back_and_a_restart_recovers_every_file() {
+  /// Shape: rounds of files, each published.
+  const ROUNDS: u64 = 6;
+  /// Shape: files per round, enough that a round's delta is a real fraction of the checkpoint.
+  const PER_ROUND: u64 = 200;
+  let profile = common::machine_profile();
+  let instance = format!("srv-recovery-return-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile, &instance, Some(1));
+  let segment = anchor_segment("recovery-return", &profile, &config);
+  let first = Daemon::start(&profile, config.clone(), source_of(&segment)).unwrap();
+  first
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let mut client = connect(&instance);
+  let volume = client
+    .create(&CreateSpec {
+      size: SizeClass::Bounded { limit: 64 << 20 },
+      ..scratch("return")
+    })
+    .unwrap();
+  let attach = |client: &mut Client| {
+    client
+      .attach(volume, None, slates_ipc::protocol::Intent::Write)
+      .unwrap()
+      .attachment
+  };
+  let attachment = attach(&mut client);
+  let write_round = |client: &mut Client, attachment: u64, round: u64| {
+    for index in round * PER_ROUND..(round + 1) * PER_ROUND {
+      let body = format!("file {index} of round {round}").into_bytes();
+      client
+        .fs_write((volume, attachment), &format!("r{index}"), &body, 0o644)
+        .unwrap();
+    }
+  };
+  for round in 0..ROUNDS {
+    write_round(&mut client, attachment, round);
+    first.publish_every_shard().unwrap();
+  }
+  let returned_first = returned_after_idle(&first, 0);
+  first.stop();
+  let second = Daemon::start(&profile, config.clone(), source_of(&segment)).unwrap();
+  assert_every_file(&mut client, volume, ROUNDS * PER_ROUND, PER_ROUND);
+  // An SDK attachment ends with its daemon; the restarted one is attached afresh.
+  let attachment = attach(&mut client);
+  write_round(&mut client, attachment, ROUNDS);
+  second.publish_every_shard().unwrap();
+  let returned_second = returned_after_idle(&second, 0);
+  second.stop();
+  let third = Daemon::start(&profile, config, source_of(&segment)).unwrap();
+  assert_every_file(&mut client, volume, (ROUNDS + 1) * PER_ROUND, PER_ROUND);
+  third.stop();
+  drop(segment);
+  // Pages go back where the content object can punch a hole (Linux) or mark them reusable (macOS,
+  // `SparseObject::discard`); on Windows the return is a no-op and the restarts above are the whole test.
+  if cfg!(any(target_os = "linux", target_os = "macos")) {
+    assert!(
+      returned_first > 0,
+      "the first daemon gave dead recovery memory back"
+    );
+    assert!(
+      returned_second > 0,
+      "the restarted daemon gave it back again"
+    );
+  }
+}
+
+/// The recovery bytes `daemon` counts given back once its shard goes idle, above `before`, waiting up to the bound.
+fn returned_after_idle(daemon: &Daemon, before: u64) -> u64 {
+  let returned = || {
+    daemon
+      .refusals_on_every_shard()
+      .unwrap()
+      .get(slates_server::daemon::RECOVERY_RETURNED)
+      .copied()
+      .unwrap_or(0)
+  };
+  let started = Instant::now();
+  while cfg!(any(target_os = "linux", target_os = "macos"))
+    && returned() <= before
+    && started.elapsed() < START_WAIT
+  {
+    std::thread::yield_now();
+  }
+  returned()
+}
+
+/// Reads files `r0` to `r{count - 1}` of `volume` and checks each against what its round wrote.
+fn assert_every_file(client: &mut Client, volume: VolumeId, count: u64, per_round: u64) {
+  for index in 0..count {
+    let expected = format!("file {index} of round {}", index / per_round).into_bytes();
+    let read = read_answered(client, volume, &format!("r{index}"));
+    assert!(read.unwrap() == expected, "file r{index} after the restart");
+  }
+}
+
+/// A-118, a sealed file's block holds its pages and no more: do write files whose sizes leave a chunk window partly
+/// filled (5, 9 and 13 pages and a little), leave the shard idle until its sweep seals them, restart over the same
+/// anchor and read every file. Expect the daemon to count trimmed bytes (`content.trimmed_bytes`, the non-vacuity
+/// count), every file byte for byte after the restart (the recovery claims each trimmed chunk's pieces), and report the
+/// bytes a trim declined (an imaged block) beside it.
+#[test]
+fn a_sealed_files_block_is_trimmed_to_its_pages_and_survives_a_restart() {
+  /// Shape: the files' lengths in bytes, each leaving its window partly filled.
+  const SIZES: [usize; 4] = [5 * 4096 + 1, 9 * 4096 + 77, 13 * 4096 + 4000, 3 * 4096];
+  let profile = common::machine_profile();
+  let instance = format!("srv-trim-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile, &instance, Some(1));
+  let segment = anchor_segment("trim", &profile, &config);
+  let first = Daemon::start(&profile, config.clone(), source_of(&segment)).unwrap();
+  first
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let mut client = connect(&instance);
+  let volume = client
+    .create(&CreateSpec {
+      size: SizeClass::Bounded { limit: 16 << 20 },
+      ..scratch("trim")
+    })
+    .unwrap();
+  let attachment = client
+    .attach(volume, None, slates_ipc::protocol::Intent::Write)
+    .unwrap()
+    .attachment;
+  let body = |index: usize, len: usize| -> Vec<u8> {
+    (0..len)
+      .map(|at| u8::try_from((at ^ index.wrapping_mul(31)) & 0xFF).unwrap())
+      .collect()
+  };
+  for (index, len) in SIZES.iter().enumerate() {
+    client
+      .fs_write(
+        (volume, attachment),
+        &format!("t{index}"),
+        &body(index, *len),
+        0o644,
+      )
+      .unwrap();
+  }
+  // The content counters ride the daemon's status, beside the shard's own map.
+  let started = Instant::now();
+  while counter(&mut client, "content.trimmed_bytes") == 0 && started.elapsed() < START_WAIT {
+    std::thread::yield_now();
+  }
+  let trimmed = counter(&mut client, "content.trimmed_bytes");
+  let declined = counter(&mut client, "content.trim_declined_bytes");
+  eprintln!("trimmed {trimmed} bytes, declined {declined} bytes");
+  first.publish_every_shard().unwrap();
+  first.stop();
+  let second = Daemon::start(&profile, config, source_of(&segment)).unwrap();
+  for (index, len) in SIZES.iter().enumerate() {
+    let read = read_answered(&mut client, volume, &format!("t{index}"));
+    assert!(
+      read.unwrap() == body(index, *len),
+      "file t{index} after the restart"
+    );
+  }
+  second.stop();
+  drop(segment);
+  assert!(
+    trimmed > 0,
+    "sealed blocks were trimmed: {trimmed} trimmed, {declined} declined"
+  );
+}
+
 /// Memory, a deleted file's RAM: do write a file of many chunks, publish, delete it and leave the shard idle. Expect
 /// the daemon to count most of the file given back to the OS within the bound (`content.purged_bytes`: an idle
 /// shard's free blocks go back, A-105, on macOS as reusable pages, A-110), and on Linux the content object's allocated
@@ -2689,4 +3026,722 @@ fn an_idle_small_file_is_sealed_by_the_daemons_sweep() {
   assert!(read.unwrap() == bytes, "the sealed file reads back");
   daemon.stop();
   drop(segment);
+}
+
+/// Format: `NFS4ERR_NOENT` (RFC 8881 §15.1.4.6).
+const NFS4ERR_NOENT: u32 = 2;
+/// Format: `NFS4ERR_EXIST` (RFC 8881 §15.1.4.5).
+const NFS4ERR_EXIST: u32 = 17;
+/// Format: the bytes of an NFSv4 `stateid4`: its seqid and its 12-byte `other`.
+const STATEID_BYTES: usize = 16;
+
+/// A REMOVE of `name` in the directory the session's `at` reaches, asking for its reply to be kept (a client sets
+/// `sa_cachethis` on a compound that changes state).
+fn remove_kept(
+  session: &mut common::nfs4::Session,
+  capability: &str,
+  name: &str,
+) -> Result<Vec<u8>, u32> {
+  session.at_with(true, capability, &[], 1, |args| {
+    args.u32(slates_bridge_nfs::v4::compound::op::REMOVE);
+    args.opaque(name.as_bytes());
+  })
+}
+
+/// A RENAME of `from` to `to` within the directory the session's `at` reaches (SAVEFH, then RENAME from the saved
+/// directory to the current one), asking for its reply to be kept.
+fn rename_kept(
+  session: &mut common::nfs4::Session,
+  capability: &str,
+  (from, to): (&str, &str),
+) -> Result<Vec<u8>, u32> {
+  session.at_with(true, capability, &[], 2, |args| {
+    args.u32(slates_bridge_nfs::v4::compound::op::SAVEFH);
+    args.u32(slates_bridge_nfs::v4::compound::op::RENAME);
+    args.opaque(from.as_bytes());
+    args.opaque(to.as_bytes());
+  })
+}
+
+/// Whether `name` is found in the directory the session's `at` reaches (a LOOKUP then GETFH, not kept): `Ok` with
+/// its handle, or the status that refused it.
+fn found(
+  session: &mut common::nfs4::Session,
+  capability: &str,
+  name: &str,
+) -> Result<Vec<u8>, u32> {
+  session.at(capability, &[name], |args| {
+    args.u32(slates_bridge_nfs::v4::compound::op::GETFH);
+  })
+}
+
+/// RFC 8881 §2.10.6.5 (A-127): a compound the daemon applied before it died is answered, when its client retries it
+/// on the same slot and sequence id after the restart, with what it did — never run a second time. A REMOVE and a
+/// RENAME (each the last compound on its own client's slot, as when the daemon was killed after applying it and
+/// before its reply left): the retry over a new connection to the restarted daemon is answered `NFS4_OK` — run
+/// again it would be `NFS4ERR_NOENT`, its file already gone, which is what a Linux client's `unlink` and `rename`
+/// returned under the mixed kill bench — the session carries on with no CREATE_SESSION, and the tree shows each
+/// change once. Non-vacuous: the restarted daemon counts the retried calls it answered from what it recorded.
+#[test]
+fn a_compound_retried_across_a_daemon_restart_is_answered_never_run_again() {
+  let profile = common::machine_profile();
+  let instance = format!("srv-v4-retry-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
+  let segment = anchor_segment("v4retry", &profile, &config);
+
+  let first = Daemon::start(&profile, config.clone(), source_of(&segment)).unwrap();
+  first
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let mut client = connect(&instance);
+  client.create(&scratch("retried")).unwrap();
+  let capability = capability_path(&first, "retried");
+  {
+    let mut stream = nfs_stream(&first);
+    let root = mount(&mut stream, &capability, 1);
+    create(&mut stream, &root, "gone", 2);
+    create(&mut stream, &root, "moved", 3);
+  }
+  let port = first.nfs_port().expect("the daemon is serving NFS");
+  let mut remover = common::nfs4::Session::open(port, b"retry-remove");
+  let mut renamer = common::nfs4::Session::open(port, b"retry-rename");
+  assert!(
+    remove_kept(&mut remover, &capability, "gone").is_ok(),
+    "the REMOVE"
+  );
+  assert!(
+    rename_kept(&mut renamer, &capability, ("moved", "renamed")).is_ok(),
+    "the RENAME"
+  );
+  first.stop();
+
+  let second = Daemon::start(&profile, config, source_of(&segment)).unwrap();
+  let port = second
+    .nfs_port()
+    .expect("the restarted daemon is serving NFS");
+  remover.reconnect(port);
+  renamer.reconnect(port);
+  assert_eq!(
+    remover.resend().map(|_| ()),
+    Ok(()),
+    "the retried REMOVE is answered with what it did, not run again into NFS4ERR_NOENT"
+  );
+  assert_eq!(
+    renamer.resend().map(|_| ()),
+    Ok(()),
+    "the retried RENAME is answered with what it did, not run again into NFS4ERR_NOENT"
+  );
+  assert_eq!(
+    found(&mut remover, &capability, "gone").map(|_| ()),
+    Err(NFS4ERR_NOENT),
+    "the session carries on after the restart, and the removed file is gone"
+  );
+  assert!(
+    found(&mut renamer, &capability, "renamed").is_ok(),
+    "the renamed file is there under its new name"
+  );
+  assert_eq!(
+    found(&mut renamer, &capability, "moved").map(|_| ()),
+    Err(NFS4ERR_NOENT),
+    "and not under its old one"
+  );
+  let answered = second
+    .refusals_on_every_shard()
+    .unwrap()
+    .get("nfs4.replay.answered")
+    .copied()
+    .unwrap_or(0);
+  assert!(
+    answered >= 2,
+    "the restarted daemon answered both retried calls from its records ({answered})"
+  );
+  second.stop();
+  drop(segment);
+}
+
+/// An OPEN of `name` in the directory the session's `at` reaches, creating it `GUARDED` with mode 0644 for the
+/// session's client and `owner`, asking for its reply to be kept: the OPEN's result body (its state id first).
+fn open_guarded(
+  session: &mut common::nfs4::Session,
+  capability: &str,
+  (owner, name): (&[u8], &str),
+) -> Result<Vec<u8>, u32> {
+  /// Format: `OPEN4_SHARE_ACCESS_BOTH`, `OPEN4_SHARE_DENY_NONE`, `OPEN4_CREATE`, `GUARDED4`, `CLAIM_NULL` (RFC 7863).
+  const ACCESS_BOTH: u32 = 3;
+  const DENY_NONE: u32 = 0;
+  const OPEN4_CREATE: u32 = 1;
+  const GUARDED4: u32 = 1;
+  const CLAIM_NULL: u32 = 0;
+  /// Format: `FATTR4_MODE` (attribute 33): bit 1 of the bitmap's second word.
+  const MODE_WORD: u32 = 1 << (33 - 32);
+  let clientid = session.clientid();
+  session.at_with(true, capability, &[], 1, |args| {
+    args.u32(slates_bridge_nfs::v4::compound::op::OPEN);
+    args.u32(0); // seqid, unused in NFSv4.1
+    args.u32(ACCESS_BOTH);
+    args.u32(DENY_NONE);
+    args.u64(clientid);
+    args.opaque(owner);
+    args.u32(OPEN4_CREATE);
+    args.u32(GUARDED4);
+    args.u32(2); // the bitmap's words
+    args.u32(0);
+    args.u32(MODE_WORD);
+    args.opaque(&0o644u32.to_be_bytes());
+    args.u32(CLAIM_NULL);
+    args.opaque(name.as_bytes());
+  })
+}
+
+/// A CLOSE of the open `stateid` of the file `name` the session's `at` reaches, asking for its reply to be kept.
+fn close_kept(
+  session: &mut common::nfs4::Session,
+  capability: &str,
+  name: &str,
+  stateid: &[u8],
+) -> Result<Vec<u8>, u32> {
+  session.at_with(true, capability, &[name], 1, |args| {
+    args.u32(slates_bridge_nfs::v4::compound::op::CLOSE);
+    args.u32(0); // seqid, unused in NFSv4.1
+    args.fixed(stateid);
+  })
+}
+
+/// RFC 8881 §2.10.6.5 (A-127), the file-state leg: a compound whose call changed file state (A-37) carries its record
+/// in the change's own transaction, so a retry after the restart is answered with what it did. An OPEN that created
+/// its file `GUARDED`, retried, is answered with the same state id — run again it would be `NFS4ERR_EXIST`, its file
+/// already made; a CLOSE, retried, is answered `NFS4_OK` with the state id it closed — run again it would be
+/// `NFS4ERR_BAD_STATEID`, its open already gone. Non-vacuous: the restarted daemon counts what it answered from its
+/// records.
+#[test]
+fn an_open_and_a_close_retried_across_a_daemon_restart_are_answered_never_run_again() {
+  let profile = common::machine_profile();
+  let instance = format!("srv-v4-state-retry-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
+  let segment = anchor_segment("v4stateretry", &profile, &config);
+
+  let first = Daemon::start(&profile, config.clone(), source_of(&segment)).unwrap();
+  first
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let mut client = connect(&instance);
+  client.create(&scratch("opened")).unwrap();
+  let capability = capability_path(&first, "opened");
+  let port = first.nfs_port().expect("the daemon is serving NFS");
+  let mut opener = common::nfs4::Session::open(port, b"retry-open");
+  let mut closer = common::nfs4::Session::open(port, b"retry-close");
+  let opened = open_guarded(&mut opener, &capability, (b"opener", "made")).expect("the OPEN");
+  let to_close =
+    open_guarded(&mut closer, &capability, (b"closer", "closed")).expect("the OPEN to close");
+  let stateid = &to_close[..STATEID_BYTES];
+  let closed = close_kept(&mut closer, &capability, "closed", stateid).expect("the CLOSE");
+  first.stop();
+
+  let second = Daemon::start(&profile, config, source_of(&segment)).unwrap();
+  let port = second
+    .nfs_port()
+    .expect("the restarted daemon is serving NFS");
+  opener.reconnect(port);
+  closer.reconnect(port);
+  let again = opener.resend();
+  assert_ne!(
+    again.as_ref().err(),
+    Some(&NFS4ERR_EXIST),
+    "the retried OPEN is not run again into NFS4ERR_EXIST"
+  );
+  assert_eq!(
+    again.map(|body| body[..STATEID_BYTES].to_vec()),
+    Ok(opened[..STATEID_BYTES].to_vec()),
+    "the retried OPEN is answered with the state id it granted"
+  );
+  assert_eq!(
+    closer.resend().map(|body| body[..STATEID_BYTES].to_vec()),
+    Ok(closed[..STATEID_BYTES].to_vec()),
+    "the retried CLOSE is answered with the state id it closed, not run again into NFS4ERR_BAD_STATEID"
+  );
+  let counters = second.refusals_on_every_shard().unwrap();
+  let answered = counters.get("nfs4.replay.answered").copied().unwrap_or(0);
+  assert!(
+    answered >= 2,
+    "the restarted daemon answered the retried calls from its records ({answered})"
+  );
+  assert_eq!(
+    counters.get("nfs4.replay.diverged"),
+    None,
+    "no retried call met its record under another digest"
+  );
+  second.stop();
+  drop(segment);
+}
+
+/// Format: `NFS4ERR_SHARE_DENIED` (RFC 8881 §15.1.3.6): an OPEN whose access another open denies.
+const NFS4ERR_SHARE_DENIED: u32 = 10015;
+/// Format: `OPEN4_SHARE_DENY_NONE` and `OPEN4_SHARE_DENY_WRITE` (RFC 8881 §18.16).
+const DENY_NONE: u32 = 0;
+/// See [`DENY_NONE`].
+const DENY_WRITE: u32 = 2;
+
+/// OPEN of `name` in the volume at `capability` for open owner `owner`, for reading and writing and denying `deny` to
+/// every other open, creating it (guarded) when `create`: the compound's last result, or its status.
+fn open_denying(
+  session: &mut common::nfs4::Session,
+  capability: &str,
+  (owner, name): (&[u8], &str),
+  create: bool,
+  deny: u32,
+) -> Result<Vec<u8>, u32> {
+  /// Format: `OPEN4_SHARE_ACCESS_BOTH`, `OPEN4_NOCREATE`, `OPEN4_CREATE`, `GUARDED4`, `CLAIM_NULL` (RFC 7863).
+  const ACCESS_BOTH: u32 = 3;
+  const OPEN4_NOCREATE: u32 = 0;
+  const OPEN4_CREATE: u32 = 1;
+  const GUARDED4: u32 = 1;
+  const CLAIM_NULL: u32 = 0;
+  /// Format: `FATTR4_MODE` (attribute 33): bit 1 of the bitmap's second word.
+  const MODE_WORD: u32 = 1 << (33 - 32);
+  let clientid = session.clientid();
+  session.at_with(true, capability, &[], 1, |args| {
+    args.u32(slates_bridge_nfs::v4::compound::op::OPEN);
+    args.u32(0); // seqid, unused in NFSv4.1
+    args.u32(ACCESS_BOTH);
+    args.u32(deny);
+    args.u64(clientid);
+    args.opaque(owner);
+    if create {
+      args.u32(OPEN4_CREATE);
+      args.u32(GUARDED4);
+      args.u32(2); // the bitmap's words
+      args.u32(0);
+      args.u32(MODE_WORD);
+      args.opaque(&0o644u32.to_be_bytes());
+    } else {
+      args.u32(OPEN4_NOCREATE);
+    }
+    args.u32(CLAIM_NULL);
+    args.opaque(name.as_bytes());
+  })
+}
+
+/// 2026-10-10 (A-127's purges, made durable): a dropped client's purge outlives a restart. Do: client A opens a file
+/// denying writers, and client B's open of it for writing is refused `NFS4ERR_SHARE_DENIED`; every owner is made to
+/// refuse purges, and A destroys its session and its client id, so their purges are left owed; the daemon is stopped
+/// and started again over the same anchor. Expect B's open admitted once the restarted daemon's purge round has run.
+/// Before: the purge was owed only in memory, so after the restart no shard knew A, and A's open denied B for good.
+#[test]
+fn a_dropped_clients_purge_owed_at_a_restart_is_sent_after_it() {
+  let profile = common::machine_profile();
+  let instance = format!("srv-v4-purge-owed-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
+  let segment = anchor_segment("v4purgeowed", &profile, &config);
+  let first = Daemon::start(&profile, config.clone(), source_of(&segment)).unwrap();
+  first
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let mut client = connect(&instance);
+  client.create(&scratch("shared")).unwrap();
+  let capability = capability_path(&first, "shared");
+  let port = first.nfs_port().expect("the daemon is serving NFS");
+  let mut holder = common::nfs4::Session::open(port, b"purge-holder");
+  let mut writer = common::nfs4::Session::open(port, b"purge-writer");
+  let held = open_denying(
+    &mut holder,
+    &capability,
+    (b"holder", "denied"),
+    true,
+    DENY_WRITE,
+  );
+  let denied = open_denying(
+    &mut writer,
+    &capability,
+    (b"writer", "denied"),
+    false,
+    DENY_NONE,
+  );
+  first.inject_nfs_purge_refusal(true).unwrap();
+  let destroyed = holder.destroy();
+  let dropped = holder.destroy_clientid();
+  let refused = first
+    .refusals_on_every_shard()
+    .unwrap()
+    .get("nfs4.purge.refused_injected")
+    .copied()
+    .unwrap_or(0);
+  first.stop();
+
+  let second = Daemon::start(&profile, config, source_of(&segment)).unwrap();
+  let port = second
+    .nfs_port()
+    .expect("the restarted daemon is serving NFS");
+  writer.reconnect(port);
+  let mut admitted = open_denying(
+    &mut writer,
+    &capability,
+    (b"writer", "denied"),
+    false,
+    DENY_NONE,
+  );
+  let began = Instant::now();
+  while admitted.is_err() && began.elapsed() < SAMPLER_WAIT {
+    // The harness paces its poll of a purge round that runs at the reap cadence; shipped code parks on its driver.
+    #[allow(clippy::disallowed_methods)]
+    std::thread::sleep(SAMPLER_POLL);
+    admitted = open_denying(
+      &mut writer,
+      &capability,
+      (b"writer", "denied"),
+      false,
+      DENY_NONE,
+    );
+  }
+  second.stop();
+  drop(segment);
+  assert!(held.is_ok(), "A's open is granted: {held:?}");
+  assert_eq!(
+    denied.err(),
+    Some(NFS4ERR_SHARE_DENIED),
+    "while A's open lives, B's open for writing is denied"
+  );
+  assert_eq!(
+    (destroyed, dropped),
+    (0, 0),
+    "A destroyed its session, then its client id"
+  );
+  assert!(
+    refused >= 1,
+    "the owners refused the purges ({refused}), so they were left owed"
+  );
+  assert!(
+    admitted.is_ok(),
+    "after the restart the owed purge dropped A's open, and B's open is admitted: {admitted:?}"
+  );
+}
+
+/// A-127 (bounds): a destroyed session's call records are dropped at every owner, and the drop is made durable before
+/// it is acknowledged, so records never outlive their session. Do: a kept REMOVE on one session (its record kept at
+/// the volume's owner), then DESTROY_SESSION. Expect: the destroy succeeds and the daemon counts the record purged;
+/// after a restart over the same segment, the destroyed session's retry is refused `NFS4ERR_BADSESSION` and nothing is
+/// answered from a record.
+#[test]
+fn a_destroyed_sessions_records_are_purged_and_stay_purged_across_a_restart() {
+  /// Format: `NFS4ERR_BADSESSION` (RFC 8881 §15.1.11.3).
+  const NFS4ERR_BADSESSION: u32 = 10052;
+  let profile = common::machine_profile();
+  let instance = format!("srv-v4-purge-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
+  let segment = anchor_segment("v4purge", &profile, &config);
+
+  let first = Daemon::start(&profile, config.clone(), source_of(&segment)).unwrap();
+  first
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let mut client = connect(&instance);
+  client.create(&scratch("purged")).unwrap();
+  let capability = capability_path(&first, "purged");
+  {
+    let mut stream = nfs_stream(&first);
+    let root = mount(&mut stream, &capability, 1);
+    create(&mut stream, &root, "gone", 2);
+  }
+  let port = first.nfs_port().expect("the daemon is serving NFS");
+  let mut session = common::nfs4::Session::open(port, b"purge-on-destroy");
+  assert!(
+    remove_kept(&mut session, &capability, "gone").is_ok(),
+    "the REMOVE"
+  );
+  assert_eq!(session.destroy(), 0, "DESTROY_SESSION");
+  let purged = first
+    .refusals_on_every_shard()
+    .unwrap()
+    .get("nfs4.replay.purged")
+    .copied()
+    .unwrap_or(0);
+  assert!(
+    purged >= 1,
+    "the destroyed session's record was purged ({purged})"
+  );
+  first.stop();
+
+  let second = Daemon::start(&profile, config, source_of(&segment)).unwrap();
+  session.reconnect(
+    second
+      .nfs_port()
+      .expect("the restarted daemon is serving NFS"),
+  );
+  assert_eq!(
+    session.resend().map(|_| ()),
+    Err(NFS4ERR_BADSESSION),
+    "the destroyed session stays destroyed"
+  );
+  let counters = second.refusals_on_every_shard().unwrap();
+  assert_eq!(
+    counters.get("nfs4.replay.answered"),
+    None,
+    "nothing answered"
+  );
+  assert_eq!(
+    counters.get("nfs4.replay.restored").copied().unwrap_or(0),
+    0,
+    "no record of the destroyed session came back"
+  );
+  second.stop();
+  drop(segment);
+}
+
+/// §4.2, admission.md §5.5 (found as the flake of `an_extent_claimed_just_before_a_crash_is_returned_at_the_first_publication`
+/// on a shared host, 2026-10-09: a 64 MiB daemon refused a 1 MiB create `BudgetExceeded { available: 0 }` while the host
+/// reported 92% of its memory free, because another process's swing of a few hundred megabytes below the daemon's
+/// first sample was held back as pressure). Do: start a daemon whose sampler first reads four times its whole capacity
+/// free; let another process take as much as the daemon's capacity (the host still has three times it free); then let
+/// others take more, until the host has half the daemon's capacity free. Expect: the first drop holds nothing — the
+/// host can still back every byte the daemon could fill — and the second holds exactly what the daemon's unfilled room
+/// exceeds the host's free memory by.
+#[test]
+fn memory_others_take_from_a_roomy_host_is_held_only_where_it_eats_into_the_daemons_room() {
+  let profile = common::machine_profile();
+  let instance = format!("srv-pressure-room-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
+  let capacity = config.reserve_per_shard * u64::from(TEST_SHARDS);
+  let segment = anchor_segment("pressure-room", &profile, &config);
+  let daemon = Daemon::start(&profile, config, source_of(&segment)).unwrap();
+  daemon.inject_resident_memory(SAMPLED_RESIDENT).unwrap();
+  daemon.inject_available_memory(4 * capacity).unwrap();
+  let sampled = within_sampler_wait(|| daemon.pressure_baseline() == Ok(Some(4 * capacity)));
+  daemon.inject_available_memory(3 * capacity).unwrap();
+  // Two sampler periods: a hold the swing would wrongly set has had its chance to appear.
+  let wrongly_held = within_sampler_wait(|| withheld(&daemon).is_some_and(|hold| hold > 0));
+  daemon.inject_available_memory(capacity / 2).unwrap();
+  let expected = capacity / 2;
+  let held = within_sampler_wait(|| withheld(&daemon) == Some(expected));
+  let hold = withheld(&daemon);
+  daemon.stop();
+  drop(segment);
+  assert!(sampled, "the daemon took its first sample");
+  assert!(
+    !wrongly_held,
+    "memory others took from the host's slack, beyond anything the daemon could fill, is not held back"
+  );
+  assert!(
+    held,
+    "memory others took from the daemon's own room is held back whole: {hold:?} against {expected}"
+  );
+}
+
+/// Shape: the hold-placement tests' slice, in pool units ([`DaemonConfig::pool_unit`]): 255, so each slice cuts into
+/// parts of 128, 64, 32, 16, 8, 4, 2 and 1 units (A-98), and the operation headroom (about 40 units on macOS) is a
+/// small part of it.
+const PLACEMENT_SLICE_UNITS: u64 = 255;
+/// Shape: the placement test's hold, in pool units: 64, 8 and 1, a sum of the slices' parts, so the pool can withhold it
+/// exactly in whole extents.
+const PLACEMENT_HOLD_UNITS: u64 = 73;
+
+/// What a create on `shard` could take now: the `available` its refusal names when the volume asked for is larger than
+/// the daemon's whole `capacity` (a refused create takes nothing, so asking changes nothing); `None` for any other
+/// answer.
+fn room_on(client: &mut Client, shard: u16, capacity: u64) -> Option<u64> {
+  let oversized = CreateSpec {
+    size: SizeClass::Bounded {
+      limit: capacity.saturating_mul(2),
+    },
+    ..scratch(&name_on(shard, "room"))
+  };
+  match client.create(&oversized) {
+    Err(ClientError::Refused(slates_ipc::protocol::Refusal::BudgetExceeded { available })) => {
+      Some(available)
+    }
+    _ => None,
+  }
+}
+
+/// A placement-test daemon: two shards whose slices are `slice_units` pool units, its sampler shown a host with exactly
+/// its capacity free (no slack) and its own resident memory pinned. Returns the daemon, its anchor, a client, its
+/// capacity and its pool unit, once the sampler has taken its first sample.
+fn placement_daemon(name: &str, slice_units: u64) -> (Daemon, AnchorSegment, Client, u64, u64) {
+  let profile = common::machine_profile();
+  let instance = format!("srv-placement-{name}-{}", std::process::id());
+  let mut config = DaemonConfig::derive(&profile, &instance, Some(POOL_SHARDS));
+  let unit = u64::try_from(config.pool_unit()).unwrap();
+  config.reserve_per_shard = slice_units * unit;
+  let capacity = config.reserve_per_shard * u64::from(POOL_SHARDS);
+  let segment = anchor_segment(&format!("placement-{name}"), &profile, &config);
+  let daemon = Daemon::start(&profile, config, source_of(&segment)).unwrap();
+  daemon
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  daemon.inject_resident_memory(SAMPLED_RESIDENT).unwrap();
+  daemon.inject_available_memory(capacity).unwrap();
+  assert!(
+    within_sampler_wait(|| daemon.pressure_baseline() == Ok(Some(capacity))),
+    "the daemon took its first sample"
+  );
+  let client = connect(&instance);
+  (daemon, segment, client, capacity, unit)
+}
+
+/// §4.2, admission.md §5.5 (found 2026-10-09 reading the content pool beside the hold): the hold is the daemon's, so it
+/// is withheld from a volume on any one shard whole. Do: on [`placement_daemon`], read each shard's room, let the host's
+/// free memory fall by [`PLACEMENT_HOLD_UNITS`] (a drop the daemon did not cause), and read each shard's room again.
+/// Expect: each shard's room smaller by the whole hold. Before: the hold was divided evenly among the shards and each
+/// share claimed only by its own shard's admissions, so a volume on one shard was held back by its shard's share alone
+/// (half the hold here; a fifth on a 5-shard laptop), while the pool (A-98) let it reach the whole capacity.
+#[test]
+fn a_pressured_daemons_hold_is_withheld_whole_from_a_volume_on_any_one_shard() {
+  let (daemon, segment, mut client, capacity, unit) =
+    placement_daemon("whole", PLACEMENT_SLICE_UNITS);
+  let hold = PLACEMENT_HOLD_UNITS * unit;
+  let before = [
+    room_on(&mut client, 0, capacity),
+    room_on(&mut client, 1, capacity),
+  ];
+  daemon.inject_available_memory(capacity - hold).unwrap();
+  let mut after = before;
+  let moved = within_sampler_wait(|| {
+    after = [
+      room_on(&mut client, 0, capacity),
+      room_on(&mut client, 1, capacity),
+    ];
+    after[0] != before[0] && after[1] != before[1]
+  });
+  let pooled = daemon.pressure_pooled();
+  let holds = daemon.pressure_holds();
+  daemon.stop();
+  drop(segment);
+  assert!(
+    moved,
+    "the hold reached both shards: before {before:?} after {after:?}"
+  );
+  assert!(
+    matches!(pooled, Ok(Ok(bytes)) if bytes == hold),
+    "the pool withholds the whole hold in whole extents: {pooled:?}"
+  );
+  assert_eq!(holds, Ok(vec![0, 0]), "no shard's own room is taken");
+  for shard in 0..usize::from(POOL_SHARDS) {
+    let shrank = before[shard].zip(after[shard]).map(|(was, now)| was - now);
+    assert_eq!(
+      shrank,
+      Some(hold),
+      "shard {shard}'s room shrank by the whole hold ({hold} bytes): before {before:?} after {after:?}"
+    );
+  }
+}
+
+/// §4.2, admission.md §5.5: a hold the pool cannot cover is taken from the free room the shards hold. Do: on
+/// [`placement_daemon`], create a one-unit volume on shard 0 (it claims its slice's 128-unit part and holds most of it
+/// free), then a volume on shard 1 of exactly its room (it claims every other free extent, so the pool is empty and
+/// shard 1 holds no free room); then let the host's free memory fall by half of shard 0's room. Expect: shard 0's room
+/// smaller by the whole hold, and shard 1's still none. Before: each shard was held back by half the hold, so shard 0
+/// could still fill half of it.
+#[test]
+fn a_hold_the_pool_cannot_cover_is_taken_from_the_free_room_the_shards_hold() {
+  let (daemon, segment, mut client, capacity, unit) =
+    placement_daemon("residual", PLACEMENT_SLICE_UNITS);
+  let bounded = |name: String, limit: u64| CreateSpec {
+    size: SizeClass::Bounded { limit },
+    ..scratch(&name)
+  };
+  let small = client.create(&bounded(name_on(0, "small"), unit));
+  let filler = room_on(&mut client, 1, capacity)
+    .map(|room| client.create(&bounded(name_on(1, "filler"), room)));
+  let shard_1_left = room_on(&mut client, 1, capacity);
+  let before = room_on(&mut client, 0, capacity);
+  let hold = before.map_or(0, |room| room / 2);
+  daemon.inject_available_memory(capacity - hold).unwrap();
+  let mut after = before;
+  let moved = within_sampler_wait(|| {
+    after = room_on(&mut client, 0, capacity);
+    after != before
+  });
+  let shard_1_after = room_on(&mut client, 1, capacity);
+  let holds = daemon.pressure_holds();
+  daemon.stop();
+  drop(segment);
+  assert!(small.is_ok(), "the small volume is admitted: {small:?}");
+  assert_eq!(
+    holds,
+    Ok(vec![hold, 0]),
+    "the hold is taken from shard 0's free room, the only room left"
+  );
+  assert!(
+    matches!(filler, Some(Ok(_))),
+    "the filler takes shard 1's whole room: {filler:?}"
+  );
+  assert_eq!(
+    shard_1_left,
+    Some(0),
+    "the pool is empty and shard 1 holds no free room"
+  );
+  assert!(hold > 0, "shard 0 holds free room: {before:?}");
+  assert!(
+    moved,
+    "the hold reached shard 0: before {before:?} after {after:?}"
+  );
+  assert_eq!(
+    before.zip(after).map(|(was, now)| was - now),
+    Some(hold),
+    "shard 0's room shrank by the whole hold ({hold} bytes): before {before:?} after {after:?}"
+  );
+  assert_eq!(shard_1_after, Some(0), "shard 1 still has no room");
+}
+
+/// Shape: the debt test's slice, in pool units: 129, so each slice cuts into a part of 128 units and a part of 1 (A-98),
+/// too coarse for the pool to withhold [`DEBT_HOLD_UNITS`] in whole extents.
+const DEBT_SLICE_UNITS: u64 = 129;
+/// Shape: the debt test's hold, in pool units: 64, half a coarse part.
+const DEBT_HOLD_UNITS: u64 = 64;
+
+/// §4.2, admission.md §5.5: a hold finer than the pool's free extents is owed by the next shard to grow. Do: on
+/// [`placement_daemon`] with slices of a 128-unit part and a 1-unit part, and no shard holding anything, let the host's
+/// free memory fall by [`DEBT_HOLD_UNITS`]; read each shard's room; create a volume on shard 1 of exactly its room.
+/// Expect: each shard's room smaller by exactly the hold (the two 1-unit parts withheld whole, the other 62 units
+/// owed); the create admitted; then shard 1 holding the debt as hold and shard 0 left no room. Withholding the
+/// remainder with one more extent would hold back 128 units for a hold of 64, and leaving it out would hold back 2.
+#[test]
+fn a_hold_finer_than_the_pools_free_extents_is_owed_by_the_next_shard_to_grow() {
+  let (daemon, segment, mut client, capacity, unit) = placement_daemon("debt", DEBT_SLICE_UNITS);
+  let hold = DEBT_HOLD_UNITS * unit;
+  let before = [
+    room_on(&mut client, 0, capacity),
+    room_on(&mut client, 1, capacity),
+  ];
+  daemon.inject_available_memory(capacity - hold).unwrap();
+  let mut after = before;
+  let moved = within_sampler_wait(|| {
+    after = [
+      room_on(&mut client, 0, capacity),
+      room_on(&mut client, 1, capacity),
+    ];
+    after[0] != before[0] && after[1] != before[1]
+  });
+  let filled = after[1].map(|room| {
+    client.create(&CreateSpec {
+      size: SizeClass::Bounded { limit: room },
+      ..scratch(&name_on(1, "debtor"))
+    })
+  });
+  let shard_0_left = room_on(&mut client, 0, capacity);
+  let pooled = daemon.pressure_pooled();
+  let holds = daemon.pressure_holds();
+  daemon.stop();
+  drop(segment);
+  assert!(
+    moved,
+    "the hold reached both shards: before {before:?} after {after:?}"
+  );
+  for shard in 0..usize::from(POOL_SHARDS) {
+    assert_eq!(
+      before[shard].zip(after[shard]).map(|(was, now)| was - now),
+      Some(hold),
+      "shard {shard}'s room shrank by exactly the hold ({hold} bytes): before {before:?} after {after:?}"
+    );
+  }
+  assert!(
+    matches!(filled, Some(Ok(_))),
+    "shard 1's whole room is admitted: {filled:?}"
+  );
+  assert_eq!(shard_0_left, Some(0), "shard 0 has no room left");
+  let pooled = pooled.ok().and_then(Result::ok);
+  let shard_1_hold = holds.as_ref().ok().and_then(|holds| holds.get(1).copied());
+  assert_eq!(
+    pooled.zip(shard_1_hold).map(|(pool, shard)| pool + shard),
+    Some(hold),
+    "the pool's two small parts and the debt shard 1 took on make the hold: {pooled:?} and {holds:?}"
+  );
 }

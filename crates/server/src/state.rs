@@ -48,6 +48,13 @@ pub struct ClientSlot {
   pub revoked: bool,
   /// The last successful remote route, released with this client. One slot, no global catalog.
   pub(crate) owner_route: Option<crate::owner_location::CachedRoute>,
+  /// The read-ahead window of this client's latest forwarded read (`crate::verbs::ReadAhead`): the pages after the
+  /// first, answered here without another round trip to the owner. One window, released with this client.
+  pub(crate) read_ahead: Option<crate::verbs::ReadAhead>,
+  /// The budget charge of this client's read-ahead batches still being fetched (`crate::verbs::ReadAhead`): moved
+  /// to its window when a batch is delivered, and credited with the client when it goes — so a batch whose reply
+  /// was never carried home (`crate::xshard::send_back`) holds its charge no longer than its client.
+  pub(crate) read_ahead_pending: u64,
 }
 
 impl std::fmt::Debug for ClientSlot {
@@ -114,6 +121,12 @@ pub struct RecordLink {
   pub endpoint: Option<slates_transport::endpoint::Endpoint>,
   /// The connection id of the session a dispatch borrowed, while it is out; `None` otherwise.
   pub borrowed: Option<slates_transport::endpoint::ConnectionId>,
+  /// Who borrowed it, while it is out (`fleet::take_sessions`'s label, a status counter name): what a forward that
+  /// finds the session out counts, so a session that never comes back names its holder.
+  pub lent_to: Option<&'static str>,
+  /// The session's congestion state when it was last returned or established, so status reports it while a borrower
+  /// has it out (a cross-region read keeps it borrowed for the whole transfer).
+  pub last_seen: Option<slates_ipc::protocol::SessionReport>,
 }
 
 impl RecordLink {
@@ -122,6 +135,55 @@ impl RecordLink {
     RecordLink {
       endpoint: Some(endpoint),
       borrowed: None,
+      lent_to: None,
+      last_seen: None,
+    }
+  }
+
+  /// The session's congestion state as `endpoint` holds it now.
+  pub fn seen(
+    peer: slates_db::HostId,
+    endpoint: &slates_transport::endpoint::Endpoint,
+  ) -> slates_ipc::protocol::SessionReport {
+    slates_ipc::protocol::SessionReport {
+      peer: peer.0,
+      lent: false,
+      congestion_window: endpoint.congestion_window(),
+      smoothed_rtt_ns: endpoint.smoothed_rtt(),
+      pto_ns: endpoint.pto(),
+      spurious_losses: endpoint.spurious_losses(),
+      persistent_collapses: endpoint.persistent_collapses(),
+      bytes_consumed: endpoint.bytes_consumed(),
+      path_mtu: endpoint
+        .path_mtu()
+        .and_then(|mtu| u64::try_from(mtu).ok())
+        .unwrap_or(0),
+    }
+  }
+
+  /// The link to `peer` for a status report: read now when the session is here, else as it was last returned, marked
+  /// lent (zero everywhere when it has not been seen yet).
+  pub fn report(&self, peer: slates_db::HostId) -> slates_ipc::protocol::SessionReport {
+    match &self.endpoint {
+      Some(endpoint) => Self::seen(peer, endpoint),
+      None => {
+        let mut last = self
+          .last_seen
+          .clone()
+          .unwrap_or(slates_ipc::protocol::SessionReport {
+            peer: peer.0,
+            lent: true,
+            congestion_window: 0,
+            smoothed_rtt_ns: 0,
+            pto_ns: 0,
+            spurious_losses: 0,
+            persistent_collapses: 0,
+            bytes_consumed: 0,
+            path_mtu: 0,
+          });
+        last.lent = true;
+        last
+      }
     }
   }
 }
@@ -155,6 +217,9 @@ pub struct ShardState {
   /// The content arena's allocation count at the last reap tick: unchanged at the next means the shard allocated
   /// nothing in between, so its free blocks can go back to the OS (A-105, `daemon::purge_if_idle`).
   pub(crate) purge_seen_allocations: u64,
+  /// The journal generation whose dead recovery memory an idle shard last gave back (A-117,
+  /// `daemon::return_dead_recovery`): a later publication moves the generation and re-arms the return.
+  pub(crate) recovery_returned_at: Option<u64>,
   /// The half-open byte range `[start, end)` of `content` this shard publishes into and recovers
   /// from; `0..0` when there is no content object.
   pub content_range: (usize, usize),
@@ -164,6 +229,10 @@ pub struct ShardState {
   /// This shard's recovery journal (A-68; `slates_vfs::checkpoint_log`): the committed checkpoint, the log's tail
   /// and what has been logged since. Only this shard publishes into its ranges.
   pub journal: slates_vfs::checkpoint_log::Journal,
+  /// The stage a checkpoint is streamed through into its slot (`verbs::publish_checkpoint`; `STREAM_STAGE_BYTES` and
+  /// one inode's encoding), which a delta also encodes in; kept so its capacity is reused. Bounded by the stage and the
+  /// largest delta frame, which the delta log bounds.
+  pub checkpoint_buffer: Vec<u8>,
   /// The volume keys the committed journal holds, so a delta names the volumes gone since (A-68).
   pub published_keys: std::collections::BTreeSet<[u8; 16]>,
   /// The held replicas' image the committed journal holds, so a delta carries it only when it changed (A-68).
@@ -209,10 +278,38 @@ pub struct ShardState {
   /// derived bounds.
   #[cfg(unix)]
   pub nfs_v4_files: Option<slates_bridge_nfs::v4::files::FileState>,
+  /// The delegation recalls waiting for each session's back channel (`crate::delegation`; bounded by the delegations
+  /// each client holds).
+  #[cfg(unix)]
+  pub(crate) recall_queues: std::collections::BTreeMap<
+    slates_bridge_nfs::v4::types::SessionId,
+    crate::delegation::RecallQueue,
+  >,
   /// This daemon life's NFSv4 instance on the shard's partition (§4.6 A-37), advanced durably on first
   /// use; every NFSv4 id the shard mints names it.
   #[cfg(unix)]
   pub nfs_v4_instance: Option<u32>,
+  /// The call records of the recorded compounds whose calls this shard served (A-127), bounded by the configuration's
+  /// derived record bytes; what answers a compound retried after a restart.
+  #[cfg(unix)]
+  pub(crate) nfs_calls: slates_bridge_nfs::v4::replay::CallRecords,
+  /// The call of a recorded compound this shard is serving right now (A-127), set for the synchronous span of one
+  /// call so a file-state change it makes carries the compound's record in its own transaction.
+  #[cfg(unix)]
+  pub(crate) nfs_call: Option<crate::nfs_replay::RecordedCall>,
+  /// The NFSv3 replies held for connections the anchor holds (A-128), by (connection, xid): each mutation's reply,
+  /// recorded before its barrier publishes so the publication carries it with the effect, and dropped once its turn's
+  /// replies are sent. At most a turn's mutations per held connection on this shard.
+  #[cfg(unix)]
+  pub(crate) held_nfs_replies: std::collections::BTreeMap<(u64, u32), (bool, Vec<u8>)>,
+  /// Whether [`ShardState::held_nfs_replies`] changed since the last publication, which a delta then carries whole.
+  #[cfg(unix)]
+  pub(crate) held_nfs_replies_changed: bool,
+  /// The held NFSv3 replies the previous daemon published and never sent (A-128), by (connection, xid): a request it
+  /// applied and left unanswered on a held connection is answered from here, never applied twice. Each is taken when
+  /// its request is read again; at most the previous image's.
+  #[cfg(unix)]
+  pub(crate) recovered_nfs_replies: std::collections::BTreeMap<(u64, u32), (bool, Vec<u8>)>,
   /// The partition.
   pub db: Db,
   /// The owner runtime this node takes part in a region as (§4.8, boot step 6): the SWIM membership
@@ -356,6 +453,11 @@ pub struct ShardState {
   /// The candidate nodes, by stable anchor, this shard's pair key was delivered to in this daemon's life (A-92 piece 4b),
   /// bounded by the fleet's peer capacity.
   pub pairs_delivered: std::collections::BTreeSet<u64>,
+  /// The stable anchor of each neighbour, by member id, as this owner shard's pair delivery last resolved them (A-92
+  /// piece 4c): a head naming sealed content ships only once it carries a key entry for every remote candidate's
+  /// anchor. Refreshed each record period, so a member that restarts under a new id with the same anchor resolves;
+  /// bounded by the neighbourhood.
+  pub member_anchors: std::collections::BTreeMap<slates_db::HostId, u64>,
   /// The recipient public keys of peers by stable anchor, asked over their authenticated sessions and kept (A-92 piece
   /// 4b), bounded by the fleet's peer capacity.
   pub peer_recipients: BTreeMap<u64, hyper_seal::recipient::RecipientPublic>,
@@ -407,6 +509,10 @@ pub struct ShardState {
   /// work retirement moves this to exactly what the engine holds. Balanced by construction; bounded
   /// by the greens.
   pub green_retention: BTreeMap<VolumeId, u64>,
+  /// The read-ahead windows this shard's clients hold or are fetching (`crate::verbs::ReadAhead`): the bytes charged,
+  /// never past `DaemonConfig::read_ahead_bytes`. Charged before a batch is fetched, credited as each window is
+  /// replaced, dropped or its client goes.
+  pub(crate) read_ahead: crate::verbs::ReadAheadLedger,
   /// The merge plane's service state (§4.16, `crate::merge_service`): version-pinned green
   /// attachments, and the fleet's pending merge records and holder replicas.
   pub merge: crate::merge_service::MergeShardState,
@@ -538,6 +644,10 @@ pub struct ShardState {
   /// nothing, replacing the per-period conditional poll. Only meaningful on the control shard (which drives
   /// and serves the council); inert elsewhere and on a laptop.
   pub config_refresh_wanted: bool,
+  /// When an uninitialized council learner fetches next, and the wait after it (`fleet::next_learner_wait`).
+  pub(crate) council_learner_pace: crate::fleet::LearnerPace,
+  /// When an uninitialized root learner fetches next, and the wait after it.
+  pub(crate) root_learner_pace: crate::fleet::LearnerPace,
   /// This node's client record sessions to its candidate holder peers (§4.8), keyed by peer host: each
   /// per-peer link task ([`crate::fleet::establish_record_link`]) brings its session up on one socket and
   /// installs it here as `Some`; the record-plane coordinator borrows a session for each dispatch — leaving
@@ -546,6 +656,10 @@ pub struct ShardState {
   /// which the link task re-establishes; a retired peer's entry is removed with it. Empty on a laptop (no
   /// fleet loop runs).
   pub record_sessions: BTreeMap<slates_db::HostId, RecordLink>,
+  /// The congestion state of each session a peer dialed to this node, as its serve loop last saw it after a request,
+  /// keyed by the peer's stable anchor: the connections a peer's forwards and reads ride, whose sender here is this
+  /// node. One a peer, replaced on a re-dial, so bounded by the roster. Empty on a laptop.
+  pub served_sessions: BTreeMap<u64, slates_ipc::protocol::SessionReport>,
   /// The waker of the discovery exchange pending on each anchor's record link, if one is — at most one per
   /// anchor (the link task drives one exchange at a time), bounded by the roster — so a peer change learned
   /// on contact or folded by the detector wakes the exchange to re-check its link at once rather than at
@@ -568,11 +682,18 @@ pub struct ShardState {
   /// Completed probes and live uses of the measured scheduler floor (§4.8), observed through
   /// `Daemon::fleet_probe_windows`. Fixed-size counters on their owning control shard.
   pub probe_windows: crate::fleet::ProbeWindows,
-  /// Test support (never reachable from the wire): peers whose **direct** probes this node's serve side
-  /// leaves unanswered — the asymmetric path loss the indirect-probe regression imposes (A cannot reach B,
-  /// but a relay can), without touching the transport. Empty in production
-  /// (`Daemon::inject_probe_deafness`).
+  /// Test support (never reachable from the wire): peers this node hears nothing from on the probe plane — the one-way
+  /// loss from each of them, which the indirect-probe and isolation regressions impose without touching the transport.
+  /// Empty in production (`Daemon::inject_probe_deafness`).
   pub probe_deaf_to: std::collections::BTreeSet<slates_db::HostId>,
+  /// Test support (never reachable from the wire): how long this node waits before answering each location query
+  /// and each forwarded verb, as a slow or distant owner would, so a test drives a forward's total time past the
+  /// client's reply deadline while each step stays inside its own bound. `None` in production
+  /// (`Daemon::inject_serve_delay`).
+  pub injected_serve_delay_ns: Option<u64>,
+  /// Test support: while set, this control shard delivers no pair keys (`Daemon::inject_pair_withhold`), as a
+  /// neighbour's recipient answer that has not yet arrived holds a delivery back.
+  pub injected_pair_withhold: bool,
   /// Test support (never reachable from the wire): voters whose record sessions each of this node's
   /// campaigns counts as out of their links, as a discovery page holds one, for the span after the
   /// campaign's round begins (`fleet::take_campaign_sessions`); so a test drives a campaign into sessions
@@ -612,6 +733,16 @@ pub struct ShardState {
   /// The process's resident memory at the pressure sampler's first sample (§4.2): its growth since then is the
   /// daemon's own use, subtracted from the host's shortfall so only pressure from elsewhere is held back.
   pub(crate) pressure_resident_baseline: Option<u64>,
+  /// The pressure hold and debt the sampler last sent each shard, in shard order (§4.2; kept on the control shard, the
+  /// one sampler): they are sent only when they change, so a daemon at rest sends none. Every shard's hold and debt
+  /// start at zero at boot, and so does this. Bounded by the shards.
+  pub(crate) pressure_sent: Vec<(u64, u64)>,
+  /// The process thread's wait for a reason to stop (`Daemon::wait_for_stop`), asked at each heartbeat on the control
+  /// shard; `None` until a process installs it (and on every other shard).
+  pub(crate) stop_watch: Option<crate::daemon::StopWatch>,
+  /// Test support: this shard refuses every NFSv4 purge sent to it (`Daemon::inject_nfs_purge_refusal`), as an owner
+  /// that cannot make the drop durable does, so a test can leave a purge owed across a restart.
+  pub(crate) nfs_purges_refused: bool,
   /// The holder side of the owner lease (§4.8; AUD-08): when this node last answered each peer's direct
   /// probe reporting it alive, and the newest configuration version each announced — the evidence that
   /// gates a successor's promotion of a departed owner's objects at this holder
@@ -645,6 +776,26 @@ pub struct ShardState {
   /// `f + 1` hold it, and is dropped once the head naming it places and the snapshot is recorded placed.
   /// Empty on a laptop and whenever every owned snapshot is placed.
   pub seals: BTreeMap<ObjectId, crate::head::SealJob>,
+  /// The mirror shipments in progress for volumes this node owns (§4.10 "Mirroring across regions";
+  /// `docs/wip/mirroring.md`), by object: a placed head snapshot's archive put to the owner's neighbourhood in the
+  /// mirror region until `f + 1` there hold it, then recorded (`SnapshotPlaced { mirror }`) and dropped. One per
+  /// object, the newest placed snapshot superseding an older one still shipping. Empty with no mirror declared.
+  pub mirror_seals: BTreeMap<ObjectId, crate::head::SealJob>,
+  /// This node's neighbourhood in its region's declared mirror region (`slates_db::mirror::mirror_neighbourhood`),
+  /// recomputed once a record period from the mirror region's members held alive: the hosts mirror shipments go to.
+  /// Direct contact keeps them already: a member of another region is never in this region's council configuration.
+  /// Empty with no mirror declared or none of its members alive.
+  pub mirror_neighbourhood: Vec<slates_db::HostId>,
+  /// The records this node holds as a mirror holder for owners in the region it mirrors (`crate::mirror`): each
+  /// object's newest head and catalog record, kept on the control shard and published in its held image before
+  /// a shipment is acknowledged. What a promotion's phase one reads. Empty outside a mirror region.
+  pub mirror_records: slates_db::mirror::MirrorRecords,
+  /// The promotion rounds this node leads as its council's leader, by lost region (`crate::mirror`). Bounded by the
+  /// regions promoted to this one.
+  pub(crate) mirror_rounds: BTreeMap<slates_db::register::RegionId, crate::mirror::PromotionRound>,
+  /// The promoted objects assigned to this node that it has seeded into its materialization queue, until their
+  /// assignment is dropped (`crate::mirror`). Bounded by the council's adoptions.
+  pub(crate) mirror_seeded: std::collections::BTreeSet<ObjectId>,
   /// The measured put latency of this node's **content class** (§4.8 "Derived constants": "hedge delay =
   /// measured p95 put latency per class"): one reading per binding content acknowledgement this owner
   /// shard has collected — the time from the round's dispatch to that holder's verified acknowledgement.
@@ -653,6 +804,10 @@ pub struct ShardState {
   /// first content acknowledgement, and on a laptop, where no content round runs — the trigger is then
   /// one period (R8, the same code with an empty window).
   pub put_latency: crate::fleet::LatencyWindow,
+  /// The measured put latency of content rounds to the mirror region (`fleet::content_work`'s mirror track): kept
+  /// apart from [`Self::put_latency`], because a home round's p95 on a local network is far inside one round trip to
+  /// another region, and a mirror round hedged and judged stalled at it never got past its offer.
+  pub mirror_put_latency: crate::fleet::LatencyWindow,
   /// The measured fetch latency of the content class on this shard (A-91): each chunk's time from its first
   /// request to its verified arrival, whose p95 is the hedge trigger for a fetch's chunks. Empty until the first
   /// fetch, and on a laptop, where none runs — the trigger is then one period (R8).
@@ -759,8 +914,14 @@ impl std::fmt::Debug for PendingForward {
 }
 
 impl ShardState {
-  /// Adds `by` to the count of refusal or event `kind`, saturating (a count never wraps to a small number).
+  /// Adds `by` to the count of refusal or event `kind`, saturating (a count never wraps to a small number). Adding zero
+  /// changes nothing: an entry stands in the status report's counter map only once something happened (2026-10-10: a
+  /// boot's zero restores and an idle tick's zero purges stood there as events, and a formation check that reads the
+  /// map failed on them).
   pub(crate) fn count(&mut self, kind: &'static str, by: u64) {
+    if by == 0 {
+      return;
+    }
     let count = self.refusals.entry(kind).or_insert(0);
     *count = count.saturating_add(by);
   }
@@ -863,6 +1024,48 @@ pub(crate) fn with_state_at_shutdown<R>(f: impl FnOnce(&mut ShardState) -> R) ->
 /// acts the same whichever it was.
 pub fn with_state<R>(f: impl FnOnce(&mut ShardState) -> R) -> Option<R> {
   try_with_state(f).ok()
+}
+
+std::thread_local! {
+  /// Borrows on this shard thread refused in a way that lost a step ([`with_state_counted`]): a nested borrow (the
+  /// closure never ran) and a retention check refused after the closure ran (its effect stands, its result was
+  /// discarded). Per thread because each shard reports its own (a process-wide count would be summed once per shard).
+  static LOST_STEPS: std::cell::Cell<LostSteps> = const { std::cell::Cell::new(LostSteps { borrowed: 0, retention: 0 }) };
+}
+
+/// The borrows this shard thread refused in a way that lost a step, by kind ([`with_state_counted`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LostSteps {
+  /// Nested borrows: the closure never ran.
+  pub borrowed: u64,
+  /// Retention checks refused after the closure ran.
+  pub retention: u64,
+}
+
+/// [`with_state`] for a caller with nothing to do on a refusal (a counter, a cleanup, a drain), which before
+/// 2026-10-07 discarded it at 57 sites: the refusals that lose a step are counted on this thread ([`lost_steps`],
+/// reported in status as `state.borrow_refused` and `state.retention_refused`). A thread with no state, or a fenced
+/// shard, is not a lost step: there is nothing to do there.
+pub fn with_state_counted<R>(f: impl FnOnce(&mut ShardState) -> R) -> Option<R> {
+  let refusal = match try_with_state(f) {
+    Ok(result) => return Some(result),
+    Err(refusal) => refusal,
+  };
+  LOST_STEPS.with(|cell| {
+    let mut lost = cell.get();
+    match refusal {
+      StateAccess::Borrowed => lost.borrowed = lost.borrowed.saturating_add(1),
+      StateAccess::Retention(_) => lost.retention = lost.retention.saturating_add(1),
+      StateAccess::Absent | StateAccess::Fenced => {}
+    }
+    cell.set(lost);
+  });
+  None
+}
+
+/// The borrows this shard thread refused in a way that lost a step, so far.
+pub fn lost_steps() -> LostSteps {
+  LOST_STEPS.with(std::cell::Cell::get)
 }
 
 /// Whether any client ring on this thread holds a request (the poller's question).

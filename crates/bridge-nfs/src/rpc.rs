@@ -25,11 +25,50 @@ const REPLY_ACCEPTED: u32 = 0;
 const AUTH_NONE: u32 = 0;
 /// Format: the largest credential or verifier body ONC RPC allows (RFC 5531, 400 bytes).
 const MAX_AUTH_BODY: usize = 400;
-/// Format: the largest ONC RPC message the loopback server accepts, bounding a record-marking
-/// fragment so a hostile length is refused before any accumulation. Sized to a NFSv3 header plus the
-/// largest write payload the server offers; the negotiated write size derives the exact bound once
-/// the server wires it (owed). Two mebibytes is comfortably above a 1 MiB write plus overhead.
-pub const MAX_MESSAGE: usize = 2 * 1024 * 1024;
+/// Derived: the largest ONC RPC message the server accepts or sends, bounding a record-marking
+/// fragment so a hostile length is refused before any accumulation: the transfer ceiling every
+/// FSINFO and v4 session advertises ([`crate::procedures::MAX_TRANSFER`]) plus the most a request of
+/// that ceiling adds to it, RPC headers included ([`crate::v4::compound::COMPOUND_HEADER_BYTES`], which
+/// a v3 WRITE call's header never exceeds — [`V3_WRITE_CALL_OVERHEAD`], checked when this is built).
+/// Every reply is no larger: a READ's or READDIR's results are capped at the transfer ceiling, and a
+/// v4 reply at the session's response size, the same sum (A-113). It is also the largest record a
+/// held connection must queue whole, so it sizes that connection's socket buffers
+/// (`slates_server::nfs`). Until 2026-10-06 it was a placeholder 2 MiB.
+pub const MAX_MESSAGE: usize = derived_max_message();
+
+/// Derived: what a v3 WRITE call adds to its data ([`derived_v3_write_call_overhead`]).
+const V3_WRITE_CALL_OVERHEAD: usize = derived_v3_write_call_overhead();
+
+/// The sum stated on [`V3_WRITE_CALL_OVERHEAD`]: the RPC call header at its largest (six words, then a credential and
+/// a verifier, each a flavor, a length and at most [`MAX_AUTH_BODY`] bytes) and WRITE3args' fixed fields (a handle's
+/// length and its largest bytes, the offset, the count, the stability and the data's length; RFC 1813 §3.3.7).
+// Evaluated only in a `const` item: an overflow fails the build, it cannot wrap at run time.
+#[allow(clippy::arithmetic_side_effects)]
+const fn derived_v3_write_call_overhead() -> usize {
+  /// Format: an XDR word.
+  const WORD: usize = 4;
+  /// Format: the RPC call header's fixed words: xid, message type, RPC version, program, version, procedure.
+  const CALL_WORDS: usize = 6;
+  /// Format: the largest NFSv3 file handle (`NFS3_FHSIZE`, RFC 1813 §2.4).
+  const FHSIZE3: usize = 64;
+  /// Format: an `offset3` (a `uint64`).
+  const OFFSET: usize = 8;
+  let rpc = CALL_WORDS * WORD + 2 * (2 * WORD + MAX_AUTH_BODY);
+  let args = (WORD + FHSIZE3) + OFFSET + WORD + WORD + WORD;
+  rpc + args
+}
+
+/// The sum stated on [`MAX_MESSAGE`].
+// Evaluated only in a `const` item: an overflow or a failed check fails the build, it cannot happen at run time.
+#[allow(clippy::arithmetic_side_effects)]
+const fn derived_max_message() -> usize {
+  let header = crate::v4::compound::COMPOUND_HEADER_BYTES as usize;
+  assert!(
+    V3_WRITE_CALL_OVERHEAD <= header,
+    "a v3 WRITE call's header fits the compound header bound"
+  );
+  crate::procedures::MAX_TRANSFER as usize + header
+}
 /// Format: the record-marking last-fragment flag — the top bit of the four-byte marker (RFC 5531).
 const LAST_FRAGMENT: u32 = 0x8000_0000;
 /// Format: the record-marking fragment-length mask — the low 31 bits of the marker.
@@ -198,6 +237,18 @@ impl RecordReader {
     }
     Ok((None, consumed))
   }
+
+  /// The bytes the reader needs before its current fragment is complete: the rest of a fragment's marker, else the
+  /// rest of its body. A record of several fragments may need more after this, once its next marker is read; a reader
+  /// that waits for this many is woken no earlier than it can make progress (A-113's receive low-water mark).
+  pub fn wanted(&self) -> usize {
+    let marker_rest = self.marker.len().saturating_sub(self.marker_bytes);
+    if marker_rest > 0 {
+      marker_rest
+    } else {
+      self.remaining.max(1)
+    }
+  }
 }
 
 /// Frames `body` as one last-fragment record (prepends the four-byte record marker).
@@ -208,6 +259,86 @@ pub fn write_record(body: &[u8]) -> Vec<u8> {
   out.extend_from_slice(&marker.to_be_bytes());
   out.extend_from_slice(body);
   out
+}
+
+/// Format: an accepted reply's header with an empty `AUTH_NONE` verifier — xid, message type, reply status, verifier
+/// flavor, verifier length and accept status, one XDR word each (RFC 5531 §9).
+const REPLY_HEADER_BYTES: usize = 6 * size_of::<u32>();
+
+/// Format: a `PROG_MISMATCH` reply's extra words, the lowest and highest versions supported (RFC 5531 §9).
+const MISMATCH_BYTES: usize = 2 * size_of::<u32>();
+
+/// [`reply_bytes`] framed as one last-fragment record ([`write_record`]), built in one buffer: the marker reserved, the
+/// header and the results written once, the marker filled in last. Built through `reply_bytes` and then `write_record`,
+/// a READ's 256 KiB of results was copied twice more (8.8% of the daemon's samples on a Linux NFSv4.2 read,
+/// 2026-10-09). Byte for byte `write_record(&reply_bytes(..))`, which a wire test holds it to.
+pub fn reply_record(xid: u32, status: AcceptStatus, results: &[u8]) -> Vec<u8> {
+  let carried = if matches!(status, AcceptStatus::Success) {
+    results
+  } else {
+    &[]
+  };
+  let extra = if matches!(status, AcceptStatus::ProgMismatch { .. }) {
+    MISMATCH_BYTES
+  } else {
+    0
+  };
+  let capacity = size_of::<u32>()
+    .saturating_add(REPLY_HEADER_BYTES)
+    .saturating_add(extra)
+    .saturating_add(carried.len());
+  let mut writer = XdrWriter::with_capacity(capacity);
+  writer.u32(0); // the record marker, filled in below
+  writer.u32(xid);
+  writer.u32(MSG_REPLY);
+  writer.u32(REPLY_ACCEPTED);
+  writer.u32(AUTH_NONE); // verifier flavor
+  writer.opaque(&[]); // empty verifier body
+  writer.u32(status.wire());
+  if let AcceptStatus::ProgMismatch { low, high } = status {
+    writer.u32(low);
+    writer.u32(high);
+  }
+  let mut out = writer.into_bytes();
+  out.extend_from_slice(carried);
+  let message = out.len().saturating_sub(size_of::<u32>());
+  let marker = u32::try_from(message).unwrap_or(u32::MAX) | LAST_FRAGMENT;
+  if let Some(slot) = out.get_mut(..size_of::<u32>()) {
+    slot.copy_from_slice(&marker.to_be_bytes());
+  }
+  out
+}
+
+/// Format: the bytes in front of a successful reply's results once framed: the record marker and the accepted reply's
+/// header ([`REPLY_HEADER_BYTES`]).
+pub const SUCCESS_RECORD_HEAD: usize = size_of::<u32>() + REPLY_HEADER_BYTES;
+
+/// A buffer holding [`SUCCESS_RECORD_HEAD`] reserved bytes, for a successful reply's results to be encoded after
+/// ([`crate::xdr::XdrWriter::continuing`]) and framed in place by [`finish_success_record`].
+pub fn success_record_head() -> Vec<u8> {
+  vec![0u8; SUCCESS_RECORD_HEAD]
+}
+
+/// Frames `record` in place: its first [`SUCCESS_RECORD_HEAD`] bytes, reserved by [`success_record_head`], become the
+/// record marker and a successful reply's header for `xid`, and the results already after them are not moved. Byte
+/// for byte `reply_record(xid, AcceptStatus::Success, results)`, which a wire test holds it to. Encoding an NFSv4
+/// reply into a separate buffer and framing it copied a READ's whole transfer once more (5.6% of the daemon's samples
+/// on a Linux NFSv4.2 read, 2026-10-09).
+pub fn finish_success_record(xid: u32, mut record: Vec<u8>) -> Vec<u8> {
+  let message = record.len().saturating_sub(size_of::<u32>());
+  let marker = u32::try_from(message).unwrap_or(u32::MAX) | LAST_FRAGMENT;
+  let mut head = XdrWriter::with_capacity(SUCCESS_RECORD_HEAD);
+  head.u32(marker);
+  head.u32(xid);
+  head.u32(MSG_REPLY);
+  head.u32(REPLY_ACCEPTED);
+  head.u32(AUTH_NONE); // verifier flavor
+  head.opaque(&[]); // empty verifier body
+  head.u32(AcceptStatus::Success.wire());
+  if let Some(slot) = record.get_mut(..SUCCESS_RECORD_HEAD) {
+    slot.copy_from_slice(head.as_slice());
+  }
+  record
 }
 
 /// Parses an RPC call from a message body, returning the header and a reader positioned at the

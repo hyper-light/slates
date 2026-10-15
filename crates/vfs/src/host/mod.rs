@@ -52,11 +52,17 @@ pub struct HostFacts {
   pub timestamp_granularity_ns: u64,
 }
 
-/// A watcher's word, never the truth (§4.5): a directory changed, or events were lost.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// A watcher's word, never the truth (§4.5): a directory or one of its entries changed, or events were lost.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Hint {
-  /// Something under this directory changed.
+  /// Something under this directory changed, the watcher not saying what (the directory itself moved, or the event
+  /// named no entry).
   Changed(HostDir),
+  /// The named entry of this directory changed (inotify names the child of every event it reports; a watched file's
+  /// own registration knows its name). Everything a [`Hint::Changed`] of the directory does, and the recall it asks
+  /// (A-122) is of that entry's delegations alone: a directory delegation is never granted, so a change to one entry
+  /// changes no other file a client holds a delegation of.
+  Entry(HostDir, Box<str>),
   /// The watcher overflowed: every listing is suspect and every witness is re-checked.
   Overflow,
 }
@@ -148,6 +154,17 @@ pub struct LandCapabilities {
   pub unnamed_temporaries: bool,
 }
 
+/// A batch's durability barrier taken from its host to run where waiting costs nothing (A-132): a thread of its own,
+/// never the shard that owns the landing. The wait is the device's and every other writer's on the filesystem, not the
+/// landing's own: on a busy machine a barrier measured 1–160 ms a batch on Linux and an `fsync` up to 206 ms a file on
+/// macOS (2026-10-10, `BENCHMARKS.md`), and while one ran on the shard every other client of that shard waited for it.
+/// It holds what it syncs by its own descriptors, so its host may close the files meanwhile.
+pub trait Barrier: Send {
+  /// Blocks until every file the barrier names is durable ahead of any write that follows: the first refusal (every file
+  /// is still synced).
+  fn run(self: Box<Self>) -> Result<(), HostError>;
+}
+
 /// The write side of the seam, for the landing engine only (D-26): every verb is relative to
 /// a directory handle inside the granted target, and the only crate that implements it over
 /// the operating system is `slates-land`. The simulated host implements it too, with crash and
@@ -160,14 +177,32 @@ pub trait LandFs: HostFs {
   fn create_temp(&mut self, dir: HostDir, name: &str) -> Result<HostFile, HostError>;
   /// Writes at an offset (the whole buffer, or a refusal).
   fn write_at(&mut self, file: HostFile, off: u64, bytes: &[u8]) -> Result<(), HostError>;
-  /// Makes the file's data durable (`fdatasync`, or the platform's barrier).
-  fn sync_file(&mut self, file: HostFile) -> Result<(), HostError>;
+  /// The file is final — its bytes, mode and mtime written (§4.15 step 8, A-130) — and joins its batch: its writeback
+  /// started where that never waits on the device (Linux `sync_file_range`), nothing more elsewhere. Never durability:
+  /// the batch's barrier makes the file durable, off the shard (A-132). A change to the file after it needs another.
+  fn write_out(&mut self, file: HostFile) -> Result<(), HostError>;
+  /// The durability barrier of a batch of temporaries, each written out ([`LandFs::write_out`]) since its last change,
+  /// taken to run elsewhere ([`Barrier::run`]): once it has run, every one is durable ahead of any write that follows,
+  /// so a placement after it never shows a name whose bytes a power loss could take (Linux the files' `fdatasync`s on
+  /// ⌈√n⌉ streams, merged by journal group commit; macOS each file's `fsync` and then one `F_BARRIERFSYNC` per device
+  /// among them; elsewhere every file's `fdatasync`). The outcome comes back through
+  /// [`LandFs::end_barrier`]; nothing of the batch may be placed before.
+  fn begin_barrier(&mut self, files: &[HostFile]) -> Result<Box<dyn Barrier>, HostError>;
+  /// The outcome of the barrier [`LandFs::begin_barrier`] took for `files`, after it ran: the files are durable when it
+  /// is `Ok`.
+  fn end_barrier(
+    &mut self,
+    files: &[HostFile],
+    ran: Result<(), HostError>,
+  ) -> Result<(), HostError>;
   /// Sets the file's mode.
   fn set_mode(&mut self, file: HostFile, mode: u32) -> Result<(), HostError>;
   /// Sets the file's modification time in nanoseconds.
   fn set_mtime(&mut self, file: HostFile, mtime_ns: i64) -> Result<(), HostError>;
-  /// Gives the temporary the hidden sibling name `name` under `dir` (a link for an unnamed
-  /// temporary; nothing for one created by name).
+  /// Gives the temporary the name `name` under `dir`, refused `EEXIST` when the name exists, so that it holds that
+  /// one name after: an unnamed temporary is linked there; a named one is moved there from the name it holds (Linux
+  /// `renameat2(RENAME_NOREPLACE)`, macOS `renameatx_np(RENAME_EXCL)`; elsewhere a link and the old name's removal);
+  /// nothing for one already at `name`.
   fn place(&mut self, file: HostFile, dir: HostDir, name: &str) -> Result<(), HostError>;
   /// Atomically exchanges the entries `a` and `b` under `dir` (both must exist).
   fn exchange(&mut self, dir: HostDir, a: &str, b: &str) -> Result<(), HostError>;

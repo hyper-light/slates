@@ -69,19 +69,26 @@ impl Deadlines {
 }
 
 /// Whether the daemon defers `body`'s reply until long work ends — a granted landing, which runs in slices for
-/// as long as its tree takes, and a FUSE mount, which waits on the OS's mount helper — so a caller waits for
-/// it while the daemon lives rather than for one reply deadline.
+/// as long as its tree takes; a FUSE mount, which waits on the OS's mount helper; and any verb the daemon may forward
+/// to its volume's owner across the fleet (`RequestBody::may_be_forwarded`), under a location round and a forward
+/// the daemon bounds by the measured path — so a caller waits for it while the daemon lives rather than for one reply
+/// deadline.
 pub fn defers_reply(body: &RequestBody) -> bool {
-  matches!(
-    body,
-    RequestBody::Land { grant: Some(_), .. }
-      | RequestBody::Attach {
-        form: AttachRequest::FuseMount { .. }
-          | AttachRequest::ScopedFuseMount { .. }
-          | AttachRequest::SharedFuseMount { .. },
-        ..
-      }
-  )
+  // A verb the daemon may forward to its volume's owner on another node, across a WAN: the daemon bounds the location
+  // round and the forward by the measured path and always answers, so the client waits for it while its daemon lives.
+  // Before 2026-10-07 only a page read did; a forwarded write whose round and forward each stayed within their bound
+  // was reported `Stalled` at one liveness budget (`a_forward_answered_within_its_bounds_is_never_reported_stalled`).
+  body.may_be_forwarded()
+    || matches!(
+      body,
+      RequestBody::Land { grant: Some(_), .. }
+        | RequestBody::Attach {
+          form: AttachRequest::FuseMount { .. }
+            | AttachRequest::ScopedFuseMount { .. }
+            | AttachRequest::SharedFuseMount { .. },
+          ..
+        }
+    )
 }
 
 /// Derived: the last sequence a client issues. Sequences run from 1 up to here and never wrap: a wrapped
@@ -185,6 +192,8 @@ pub struct Client {
   deadlines: Deadlines,
   /// Reconnects made (a non-vacuity counter for the tests of the restart path).
   reconnects: u64,
+  /// Read pages sent again after a transient refusal (a non-vacuity counter, `Client::call_through_transient`).
+  transient_retries: u64,
   /// The highest sequence acknowledged (its completion records released, §4.9).
   acknowledged: u32,
   /// Derived: how many replies the client receives before it acknowledges them: half the
@@ -578,7 +587,7 @@ impl Client {
   /// delivery is the account's client.
   pub fn connect(instance: &str, deadlines: Deadlines) -> Result<Client, ClientError> {
     let delivered = delivered_capability()?;
-    let connected = connect_as(instance, 0)?;
+    let connected = connect_as(instance, 0, deadlines.reconnect_ns)?;
     let mut client = Client::over(instance, connected, 0, deadlines);
     client.bind_delivered(delivered)?;
     Ok(client)
@@ -589,7 +598,7 @@ impl Client {
   /// without waiting, as a reconnected channel binds again.
   pub fn begin_connect(instance: &str, deadlines: Deadlines) -> Result<Connecting, ClientError> {
     let delivered = delivered_capability()?;
-    let claim = begin_connect_as(instance, 0)?;
+    let claim = begin_connect_as(instance, 0, deadlines.reconnect_ns)?;
     Ok(Connecting {
       instance: instance.to_owned(),
       deadlines,
@@ -609,7 +618,7 @@ impl Client {
     deadlines: Deadlines,
   ) -> Result<Client, ClientError> {
     let delivered = delivered_capability()?;
-    let connected = connect_as(instance, session.client_id)?;
+    let connected = connect_as(instance, session.client_id, deadlines.reconnect_ns)?;
     let assigned = connected.region.client_id();
     if assigned != session.client_id {
       return Err(ClientError::SessionTaken { assigned });
@@ -637,6 +646,7 @@ impl Client {
       sequence,
       deadlines,
       reconnects: 0,
+      transient_retries: 0,
       acknowledged: 0,
       ack_every,
       unpublished: std::collections::BTreeSet::new(),
@@ -723,6 +733,11 @@ impl Client {
   /// never pays a wake when the daemon meets it.
   pub fn spin_for(&mut self, spin_ns: Option<u64>) {
     self.end.set_spin_ns(spin_ns);
+  }
+
+  /// Read and listing pages sent again after a transient refusal, so far.
+  pub fn transient_retries(&self) -> u64 {
+    self.transient_retries
   }
 
   /// Reconnects made so far.
@@ -976,6 +991,13 @@ impl Client {
     self.try_send(RequestId::from_word(word), body)
   }
 
+  /// Whether the in-flight request `word` is one whose reply the daemon may defer past one reply deadline
+  /// ([`defers_reply`]): what the async driver waits for while the daemon lives, as the synchronous call does, so a
+  /// forwarded verb is never reported `Stalled` on one path and waited for on the other.
+  pub fn defers(&self, word: u64) -> bool {
+    self.awaited.get(&word).is_some_and(defers_reply)
+  }
+
   /// [`Self::resend`] for an outstanding call, with the body it was begun with; `Ok(true)` too for a word no
   /// longer outstanding (nothing is owed for it).
   pub fn resend_awaited(&mut self, word: u64) -> Result<bool, ClientError> {
@@ -1024,7 +1046,7 @@ impl Client {
   pub fn try_reconnect(&mut self) -> Result<bool, ClientError> {
     let polled = match self.reconnecting.as_mut() {
       Some(claim) => claim.poll(),
-      None => match begin_connect_as(&self.instance, self.client_id) {
+      None => match begin_connect_as(&self.instance, self.client_id, self.deadlines.reconnect_ns) {
         Ok(claim) => self.reconnecting.insert(claim).poll(),
         Err(error) => Err(error),
       },
@@ -1876,6 +1898,33 @@ impl Client {
     }
   }
 
+  /// One read-only page request (`ReadRange`, `ReadDir`), sent again while the daemon refuses it with a transient
+  /// refusal: no owner answered within the takeover bound (`OwnerUnreachable`, a successor serves once a takeover
+  /// installs it) or the owner's lease is not confirmed yet (`LeaseUnconfirmed`). A page changes nothing, so a resend
+  /// under a fresh id is safe. The resends back off as a reconnect does and stop at the reconnect budget (the restart's
+  /// recovery budget plus one reply deadline, `Deadlines::derive`), after which the last refusal is the caller's. Until
+  /// 2026-10-09 the first such refusal failed the whole read (contested cross-region reads at 10% loss, 2 in 9).
+  fn call_through_transient(&mut self, body: &RequestBody) -> Result<ReplyBody, ClientError> {
+    // The budget runs from the first transient refusal: the daemon bounds each attempt itself (its resends to an owner
+    // stop at the takeover bound), so the client's budget bounds only how long it keeps asking after being refused.
+    let mut refused_since: Option<Instant> = None;
+    let budget = self.deadlines.reconnect_ns;
+    let mut pause_ns = self.end.wake_estimate_ns().max(1);
+    loop {
+      match self.call(body) {
+        Err(ClientError::Refused(
+          slates_ipc::protocol::Refusal::OwnerUnreachable { .. }
+          | slates_ipc::protocol::Refusal::LeaseUnconfirmed { .. },
+        )) if elapsed_ns(*refused_since.get_or_insert_with(Instant::now)) < budget => {
+          self.transient_retries = self.transient_retries.saturating_add(1);
+          std::thread::park_timeout(std::time::Duration::from_nanos(pause_ns));
+          pause_ns = next_pause_ns(pause_ns, budget);
+        }
+        other => return other,
+      }
+    }
+  }
+
   /// Reconnects under the client's id inside the reconnect budget; refused when the budget
   /// passes or a live client holds the id. The fresh channel is the account's until the client
   /// binds it again (`rebind_if_needed`), which every send path does before sending.
@@ -1884,7 +1933,7 @@ impl Client {
     let budget = self.deadlines.reconnect_ns;
     let mut pause_ns = self.end.wake_estimate_ns().max(1);
     loop {
-      match connect_as(&self.instance, self.client_id) {
+      match connect_as(&self.instance, self.client_id, self.deadlines.reconnect_ns) {
         Ok(connected) => {
           let assigned = connected.region.client_id();
           if assigned != self.client_id {
@@ -2031,7 +2080,7 @@ impl Client {
     let mut first_stamp = None;
     loop {
       let offset = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-      let reply = self.call(&RequestBody::ReadRange {
+      let reply = self.call_through_transient(&RequestBody::ReadRange {
         volume,
         path: path.to_owned(),
         at,
@@ -2074,7 +2123,7 @@ impl Client {
     let mut entries = Vec::new();
     let mut cursor = 0u64;
     loop {
-      let reply = self.call(&RequestBody::ReadDir {
+      let reply = self.call_through_transient(&RequestBody::ReadDir {
         volume,
         path: path.to_owned(),
         at,
@@ -2402,6 +2451,29 @@ impl Client {
       intent,
       AttachRequest::ScopedHostMount {
         subtree: subtree.to_owned(),
+      },
+    )
+  }
+
+  /// Attaches for a host kernel mount of `volume` bound to Unix identity `uid` (§4.6 A-115), optionally presenting
+  /// only directory `subtree`: requests whose caller is `uid` are served; every other caller, the superuser's
+  /// included, is answered attributes and an `ACCESS` granting nothing, so a client's cache of what `uid` read
+  /// (a link's target above all) is never served to another user. The attachment is the mount's, as
+  /// [`Client::attach_mount`]'s.
+  pub fn attach_bound_mount(
+    &mut self,
+    volume: VolumeId,
+    intent: Intent,
+    uid: u32,
+    subtree: Option<&str>,
+  ) -> Result<Attachment, ClientError> {
+    self.attach_with(
+      volume,
+      None,
+      intent,
+      AttachRequest::BoundHostMount {
+        uid,
+        subtree: subtree.map(str::to_owned),
       },
     )
   }

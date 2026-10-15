@@ -16,8 +16,8 @@ slates-wire = { workspace = true }
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true }
 
-# The device channel (A-61): a socketpair and `SCM_RIGHTS`, through rustix's safe wrappers.
-[target.'cfg(target_os = "linux")'.dependencies]
+# The hold channel (A-61, A-113): a socketpair and `SCM_RIGHTS`, through rustix's safe wrappers.
+[target.'cfg(unix)'.dependencies]
 rustix = { workspace = true }
 
 # The NFS-listener-inheritance test binds a listener and checks the supervised child inherited it

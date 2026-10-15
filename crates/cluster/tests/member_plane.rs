@@ -12,6 +12,7 @@ use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
 
 use slates_cluster::fleet::{FleetNode, apply_peer_state};
+use slates_cluster::lease_renewal::LeaseRenewal;
 use slates_cluster::member_plane::{Fleet, MemberPlane, PlaneEvent};
 use slates_db::register::{
   Configuration, HostId, Lineage, ObjectId, Quorum, RegionalConfiguration,
@@ -34,22 +35,35 @@ const TIMER_LATENESS_NS: u64 = 50_000;
 const BACKED_OBJECTS: u64 = 64;
 /// Shape: the jitter's bound as a divisor of the latency: up to a fifth of it.
 const JITTER_DIVISOR: u64 = 5;
+/// Shape: the extra one-way latency of a far link, nanoseconds: a cross-region path (Japan East to East US is
+/// about 80 ms one way; the escape and KIND lanes shape 80-100 ms).
+const FAR_LATENCY_NS: u64 = 100_000_000;
+/// Shape: the owner lease's bound in the daemon, nanoseconds: three coordinator periods of 100 ms, each dilated
+/// three times (`slates-server` `lease::horizon_ns`, less its 0.1 % clock tolerance).
+const LEASE_BOUND_NS: u64 = 900_000_000;
+/// Shape: the simulated time the lease test observes, nanoseconds: many probe rounds.
+const LEASE_OBSERVED_NS: u64 = 30_000_000_000;
 /// Shape: the simulated time a run may take before it is a failure: long past the detector's evidence and its
 /// detection bound at this latency (hundreds of periods).
 const HORIZON_NS: u64 = 600_000_000_000;
 
-/// A fleet that believes and answers every member (but one it refuses to answer, as for a forged identity), announcing
-/// version 7 and standing 3.
+/// A fleet that believes and answers every member (but those it refuses to answer, as for a forged identity or a lost
+/// path), announcing version 7 and standing 3.
 #[derive(Default)]
 struct Believing {
-  refuses: Option<u64>,
+  refuses: Vec<u64>,
+  /// The holders this member's owner lease is renewed with.
+  holders: Vec<u64>,
 }
 impl Fleet for Believing {
   fn announced_version(&self) -> u64 {
     7
   }
+  fn hears(&self, _: HostId) -> bool {
+    true
+  }
   fn answer(&mut self, prober: HostId, _: u64, _: u64) -> Option<(u64, Option<u64>)> {
-    (self.refuses != Some(prober.0)).then_some((7, Some(3)))
+    (!self.refuses.contains(&prober.0)).then_some((7, Some(3)))
   }
   fn admit(&mut self, _: HostId, _: u64) -> bool {
     true
@@ -57,7 +71,16 @@ impl Fleet for Believing {
   fn relays_to(&self, _: HostId) -> bool {
     true
   }
+  fn lease_holders(&self, into: &mut Vec<HostId>) {
+    into.extend(self.holders.iter().map(|holder| HostId(*holder)));
+  }
 }
+
+/// Shape: the lease renewal the daemon runs: every 100 ms coordinator period, within the lease bound.
+const RENEWAL: LeaseRenewal = LeaseRenewal {
+  interval_ns: 100_000_000,
+  bound_ns: LEASE_BOUND_NS,
+};
 
 /// The secret two members' canonical connection exports: any 32 bytes both derive alike.
 fn secret_between(a: u64, b: u64) -> ExporterSecret {
@@ -77,6 +100,8 @@ struct InFlight {
 }
 
 struct Network {
+  /// Members whose datagrams, either way, cross [`FAR_LATENCY_NS`] more: another region.
+  far: Vec<u64>,
   members: BTreeMap<u64, MemberPlane>,
   fleets: BTreeMap<u64, Believing>,
   in_flight: Vec<InFlight>,
@@ -86,20 +111,29 @@ struct Network {
   now_ns: u64,
   /// The jitter generator's state (xorshift64), deterministic.
   jitter: u64,
+  /// Every condemnation a member's own probes made, as `(member, condemned)`, gathered after each step.
+  condemned: Vec<(u64, u64)>,
 }
 
 impl Network {
   fn new() -> Network {
+    Network::sized(MEMBERS, &[])
+  }
+
+  /// `count` members, those in `far` across the far link.
+  fn sized(count: u64, far: &[u64]) -> Network {
     let mut members = BTreeMap::new();
-    for me in 1..=MEMBERS {
+    for me in 1..=count {
       let mut plane = MemberPlane::new(
         HostId(me),
         me * 1_000,
-        NonZeroUsize::new(usize::try_from(MEMBERS).unwrap()).unwrap(),
+        NonZeroUsize::new(usize::try_from(count).unwrap()).unwrap(),
         SIM_RESOLUTION,
+        RENEWAL,
+        std::time::Duration::ZERO,
       )
       .unwrap();
-      for peer in (1..=MEMBERS).filter(|peer| *peer != me) {
+      for peer in (1..=count).filter(|peer| *peer != me) {
         // The lower member id dials the canonical connection (transport-quic.md §6).
         let role = if me < peer {
           Role::Initiator
@@ -109,12 +143,22 @@ impl Network {
         plane
           .install_epoch(HostId(peer), 1, &secret_between(me, peer), role)
           .unwrap();
-        plane.join(HostId(peer), None);
+        // As the daemon does: each peer joins with the round trip its keying handshake measured.
+        let crossing = if far.contains(&me) != far.contains(&peer) {
+          FAR_LATENCY_NS
+        } else {
+          0
+        };
+        plane.join(
+          HostId(peer),
+          Some(std::time::Duration::from_nanos(2 * (LATENCY_NS + crossing))),
+        );
       }
       members.insert(me, plane);
     }
-    let fleets = (1..=MEMBERS).map(|me| (me, Believing::default())).collect();
+    let fleets = (1..=count).map(|me| (me, Believing::default())).collect();
     Network {
+      far: far.to_vec(),
       members,
       fleets,
       in_flight: Vec::new(),
@@ -122,6 +166,7 @@ impl Network {
       killed: Vec::new(),
       now_ns: 1,
       jitter: 0x9E37_79B9_7F4A_7C15,
+      condemned: Vec::new(),
     }
   }
 
@@ -145,7 +190,12 @@ impl Network {
       }
     });
     for (to, bytes) in sealed {
-      let lands_ns = now + self.next_latency();
+      let crossing = if self.far.contains(&me) != self.far.contains(&to) {
+        FAR_LATENCY_NS
+      } else {
+        0
+      };
+      let lands_ns = now + self.next_latency() + crossing;
       self.in_flight.push(InFlight {
         to,
         lands_ns,
@@ -166,6 +216,7 @@ impl Network {
         if wake.is_none_or(|at| at <= self.now_ns) {
           let fleet = self.fleets.get_mut(me).unwrap();
           self.members.get_mut(me).unwrap().step(self.now_ns, fleet);
+          self.gather_condemnations(*me);
           self.flush(*me);
         }
       }
@@ -189,6 +240,7 @@ impl Network {
         member.receive(&mut bytes, self.now_ns, fleet, events);
         // The detector is polled after every message it is fed, as well as at its wake (hyper-swim `Detector::poll`).
         member.step(self.now_ns, fleet);
+        self.gather_condemnations(to);
         self.flush(to);
       }
       if done(self) {
@@ -218,6 +270,15 @@ impl Network {
       self.now_ns = next;
     }
     false
+  }
+
+  /// Records the condemnations member `me`'s last poll found.
+  fn gather_condemnations(&mut self, me: u64) {
+    for finding in self.members[&me].detector().findings() {
+      if let hyper_swim::detector::Finding::Condemned { target, .. } = finding {
+        self.condemned.push((me, target.0));
+      }
+    }
   }
 
   fn liveness(&self, of: u64, peer: u64) -> Option<Liveness> {
@@ -323,12 +384,61 @@ fn condemnations_by_own_probes(fleet: &Network, victim: u64) -> usize {
     }
     own += 1;
     let (after, within) = (report.condemned_after, report.condemned_within);
+    // A peer that never answered has no last answer to measure from: its bound is checked by the test, on the
+    // network's clock from the kill.
+    let never_answered = report.last_answer_ns.is_none() && after.is_none() && within.is_some();
     assert!(
-      matches!((after, within), (Some(after), Some(within)) if after <= within),
+      never_answered || matches!((after, within), (Some(after), Some(within)) if after <= within),
       "member {survivor} condemned within its stated bound: after {after:?}, within {within:?}"
     );
   }
   own
+}
+
+/// §4.8 membership, the liveness half of the far-link fix (the hyper-raft owner's review of `swim-pair-deadline`,
+/// 2026-10-07): a pair the pool does not fit must still be judged, within a bound, before its own estimator has a
+/// verdict. Do: run two near members and one far one, the far one killed from the start, so neither survivor ever
+/// measures it and every survivor is far from it. Expect: both survivors come to hold it dead, at least one by its
+/// own probes within the bound its detector stated, and neither survivor is condemned. Before the fix, a misfit
+/// pair's probes were measurement only and an unanswered one condemned nothing: the dead far member was never held
+/// dead.
+#[test]
+fn a_far_member_killed_before_any_far_pair_configures_is_condemned_by_every_survivor() {
+  let far = [3u64];
+  let members = 3u64;
+  let victim = 3u64;
+  let mut fleet = Network::sized(members, &far);
+  fleet.killed.push(victim);
+  let started = fleet.now_ns;
+  let condemned = fleet.run_until(HORIZON_NS, |fleet| {
+    (1..members).all(|me| matches!(fleet.liveness(me, victim), Some(Liveness::Dead) | None))
+  });
+  let took = std::time::Duration::from_nanos(fleet.now_ns.saturating_sub(started));
+  // The victim never answered, so each condemning survivor's stated bound runs from the kill.
+  let stated = (1..members)
+    .filter_map(|me| {
+      fleet.members[&me]
+        .detector()
+        .report(hyper_swim::HostId(victim))
+        .and_then(|report| report.condemned_within)
+    })
+    .max();
+  let wrongly: Vec<(u64, u64)> = fleet
+    .condemned
+    .iter()
+    .copied()
+    .filter(|(_, target)| *target != victim)
+    .collect();
+  assert!(condemned, "every survivor holds the far member dead");
+  assert!(wrongly.is_empty(), "live members condemned: {wrongly:?}");
+  assert!(
+    condemnations_by_own_probes(&fleet, victim) > 0,
+    "a survivor's own probes condemned the far member"
+  );
+  assert!(
+    stated.is_some_and(|stated| took <= stated),
+    "every survivor held it dead within the bound its detector stated: took {took:?}, stated {stated:?}"
+  );
 }
 
 /// A-67 H-2, T-8.5 (a death report crosses live neighbours; its transmission budget is hyper-swim's gossip_transmits,
@@ -387,6 +497,8 @@ fn a_message_claiming_another_sender_is_refused_and_counted() {
     2_000,
     NonZeroUsize::new(3).unwrap(),
     SIM_RESOLUTION,
+    RENEWAL,
+    std::time::Duration::ZERO,
   )
   .unwrap();
   sender
@@ -397,6 +509,8 @@ fn a_message_claiming_another_sender_is_refused_and_counted() {
     1_000,
     NonZeroUsize::new(3).unwrap(),
     SIM_RESOLUTION,
+    RENEWAL,
+    std::time::Duration::ZERO,
   )
   .unwrap();
   receiver
@@ -448,7 +562,7 @@ fn a_message_claiming_another_sender_is_refused_and_counted() {
 #[test]
 fn a_probe_the_fleet_refuses_is_neither_answered_nor_folded() {
   let mut fleet = Network::new();
-  fleet.fleets.get_mut(&1).unwrap().refuses = Some(2);
+  fleet.fleets.get_mut(&1).unwrap().refuses = vec![2];
   let heard_from_3 = fleet.run_until(HORIZON_NS, |fleet| {
     fleet.events.get(&2).is_some_and(|events| {
       events
@@ -467,6 +581,41 @@ fn a_probe_the_fleet_refuses_is_neither_answered_nor_folded() {
   assert!(
     fleet.members[&1].counts().refused_by_fleet > 0,
     "member 1 counted its refusals"
+  );
+}
+
+/// §4.8 "direct probe → k indirect proxies" (SWIM, Das, Gupta & Motivala, DSN 2002 §3: the relay forwards the answer
+/// to the member that asked). Two members asking one relay about the same target are each answered. Do: run four
+/// members where member 2 answers neither member 1 nor member 4 directly, while member 3 reaches everyone, so 1 and 4
+/// both keep 2 only through member 3's relays, often at once. Expect: neither condemns member 2, and each was
+/// answered through a relay (`indirect_acked`, the non-vacuity count). Before 2026-10-07 the relay kept one relayed
+/// probe per target: a second request overwrote the first, the first asker was never answered, and it condemned a
+/// live member (memberlist registers one handler per relayed probe's sequence number, so concurrent asks stay apart).
+#[test]
+fn two_members_asking_one_relay_about_the_same_target_are_each_answered() {
+  let mut fleet = Network::sized(4, &[]);
+  fleet.fleets.get_mut(&2).unwrap().refuses = vec![1, 4];
+  let observed_ns = LEASE_OBSERVED_NS;
+  fleet.run_until(observed_ns, |_| false);
+  let condemned_by_askers: Vec<_> = fleet
+    .condemned
+    .iter()
+    .filter(|(member, condemned)| *condemned == 2 && (*member == 1 || *member == 4))
+    .collect();
+  print_evidence(&fleet);
+  assert!(
+    condemned_by_askers.is_empty(),
+    "no asker condemned the member a relay still reaches: {condemned_by_askers:?}; relay counts 1 {:?}, 3 {:?}, 4 {:?}",
+    fleet.members[&1].counts(),
+    fleet.members[&3].counts(),
+    fleet.members[&4].counts()
+  );
+  assert!(fleet.members[&3].counts().relayed > 0, "member 3 relayed");
+  assert!(
+    fleet.members[&1].counts().indirect_acked > 0 && fleet.members[&4].counts().indirect_acked > 0,
+    "both askers were answered through a relay: 1 {:?}, 4 {:?}",
+    fleet.members[&1].counts(),
+    fleet.members[&4].counts()
   );
 }
 
@@ -555,4 +704,137 @@ fn a_silent_member_is_condemned_and_its_objects_are_taken_over() {
     "member 3 left the neighbourhood"
   );
   assert!(taken > 0, "member 1 took over the objects that rank to it");
+}
+
+/// §4.8 "Leases and reads" (AUD-08), found on two Docker networks joined by a shaped router (2026-10-07,
+/// `docs/wip/bench/multiregion/run.sh`). Do: run an owner, one near holder of its objects and four members across
+/// a far link, for many probe rounds, and record when the owner's probes the holder answered were sent. Expect:
+/// the owner is never without a fresh answer from its holder for longer than the lease bound. The owner's lease
+/// counts only answers to probes sent within the bound; if those answers come only from the detector's probe
+/// rotation, a round that spends periods on far members leaves the near holder unprobed past the bound, and the
+/// owner refuses its own objects' latest state while every member is alive.
+#[test]
+fn an_owner_is_answered_by_its_holder_within_the_lease_bound_while_far_members_stretch_the_round() {
+  let (owner, holder) = (1u64, 2u64);
+  let far = [3u64, 4, 5, 6];
+  let mut fleet = Network::sized(6, &far);
+  fleet.fleets.get_mut(&owner).unwrap().holders = vec![holder];
+  fleet.run_until(LEASE_OBSERVED_NS, |_| false);
+  let mut sent: Vec<u64> = fleet.events[&owner]
+    .iter()
+    .filter_map(|event| match event {
+      PlaneEvent::Acked { from, sent_ns, .. } if from.0 == holder => Some(*sent_ns),
+      _ => None,
+    })
+    .collect();
+  sent.sort_unstable();
+  // From the first answer on: before it the pair is still being measured.
+  let longest_gap = sent
+    .windows(2)
+    .map(|pair| pair[1] - pair[0])
+    .chain(sent.last().map(|last| fleet.now_ns - last))
+    .max()
+    .unwrap_or(u64::MAX);
+  eprintln!(
+    "answered probes {}, longest gap {} ms, now {} ms",
+    sent.len(),
+    longest_gap / 1_000_000,
+    fleet.now_ns / 1_000_000
+  );
+  // Non-vacuity: the renewals ran and were answered.
+  let counts = fleet.members[&owner].counts();
+  assert!(
+    counts.renewals_answered > 0,
+    "the holder answered renewals: {counts:?}"
+  );
+  assert!(
+    longest_gap <= LEASE_BOUND_NS,
+    "the owner went {} ms without a fresh answer from its holder, past the {} ms lease bound",
+    longest_gap / 1_000_000,
+    LEASE_BOUND_NS / 1_000_000
+  );
+}
+
+/// §4.8 membership (`docs/bugs/2026-10-07-a-far-member-condemns-the-near-side-by-its-pooled-deadline.md`; fixed in the
+/// vendored hyper-swim, the diff owed upstream to `../hyper-raft`). Do: run two near members and four far ones, the far link 100 ms one way and
+/// lossless, every member alive throughout. Expect: no member condemns a live one. Measured 2026-10-07: every far member
+/// condemned both near members 20 to 49 times per 10 s for the whole run, each crossing probe judged by a deadline of
+/// 1.9 to 2.7 ms on a 200 ms path: the far member's pooled estimator, fed mostly by its 1 ms same-side round trips,
+/// judged the pair, and the pair's own estimator never took over. Each peer joins with its handshake's round trip,
+/// as the daemon's members do.
+#[test]
+fn no_live_member_is_condemned_across_a_lossless_far_link() {
+  let far = [3u64, 4, 5, 6];
+  let mut fleet = Network::sized(6, &far);
+  fleet.run_until(LEASE_OBSERVED_NS, |_| false);
+  let mut by_pair: BTreeMap<(u64, u64), usize> = BTreeMap::new();
+  for pair in &fleet.condemned {
+    *by_pair.entry(*pair).or_default() += 1;
+  }
+  assert!(
+    by_pair.is_empty(),
+    "live members condemned, (member, condemned) -> count: {by_pair:?}"
+  );
+}
+
+/// §4.8 membership, the counter-case to [`no_live_member_is_condemned_across_a_lossless_far_link`]: a pair the pool
+/// does not fit is measured before it is judged, and must still be judged once it has its own verdict. Do: run two
+/// near members and four far ones until every pair is judged by its own estimator, then kill a far member. Expect:
+/// every survivor comes to hold it dead (by its own probes, within the bound its detector stated, or by gossip),
+/// near and far alike, at least one by its own probes, and no live member is ever condemned.
+#[test]
+fn a_far_member_that_dies_is_condemned_by_every_survivor_and_no_live_one_is() {
+  let far = [3u64, 4, 5, 6];
+  let members = 6u64;
+  let mut fleet = Network::sized(members, &far);
+  let judged = fleet.run_until(HORIZON_NS, |fleet| {
+    (1..=members).all(|me| {
+      (1..=members).filter(|peer| *peer != me).all(|peer| {
+        fleet.members[&me]
+          .detector()
+          .report(hyper_swim::HostId(peer))
+          .is_some_and(|report| report.configured)
+      })
+    })
+  });
+  let unconfigured: Vec<(u64, u64)> = (1..=members)
+    .flat_map(|me| {
+      (1..=members)
+        .filter(move |peer| *peer != me)
+        .map(move |peer| (me, peer))
+    })
+    .filter(|(me, peer)| {
+      !fleet.members[me]
+        .detector()
+        .report(hyper_swim::HostId(*peer))
+        .is_some_and(|report| report.configured)
+    })
+    .collect();
+  assert!(
+    judged,
+    "every pair's own estimator configured from its evidence; not configured: {unconfigured:?}"
+  );
+  assert!(
+    fleet.condemned.is_empty(),
+    "no live member condemned while measuring: {:?}",
+    fleet.condemned
+  );
+  let victim = 6u64;
+  fleet.killed.push(victim);
+  let started = fleet.now_ns;
+  let condemned = fleet.run_until(started + HORIZON_NS, |fleet| {
+    (1..members).all(|me| matches!(fleet.liveness(me, victim), Some(Liveness::Dead) | None))
+  });
+  let wrongly: Vec<(u64, u64)> = fleet
+    .condemned
+    .iter()
+    .copied()
+    .filter(|(_, target)| *target != victim)
+    .collect();
+  assert!(condemned, "every survivor holds the far member dead");
+  assert!(wrongly.is_empty(), "live members condemned: {wrongly:?}");
+  assert!(
+    condemnations_by_own_probes(&fleet, victim) > 0,
+    "a survivor's own probes condemned the far member, within its stated bound"
+  );
 }

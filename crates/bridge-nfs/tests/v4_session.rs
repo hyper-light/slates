@@ -4,7 +4,8 @@
 
 use slates_bridge_nfs::v4::Nfsstat4;
 use slates_bridge_nfs::v4::session::{
-  CreateSession, EXCHGID4_FLAG_CONFIRMED_R, ExchangeId, Limits, Sequence, Sequenced, Sessions,
+  ClientChange, CreateSession, EXCHGID4_FLAG_CONFIRMED_R, ExchangeId, Limits, Purge, Sequence,
+  Sequenced, Sessions,
 };
 use slates_bridge_nfs::v4::types::ChannelAttrs;
 
@@ -119,7 +120,7 @@ fn a_slot_runs_each_request_once_and_answers_its_retry_from_the_cache() {
     ),
     "a new request"
   );
-  sessions.store_reply(&sessionid, 0, b"reply one");
+  sessions.store_reply(&sessionid, 0, b"reply one", true);
   assert_eq!(
     sessions.sequence(&seq(sessionid, 0, 1), 2).unwrap(),
     Sequenced::Replay(b"reply one".to_vec()),
@@ -150,11 +151,30 @@ fn a_reply_past_the_cache_size_is_not_kept() {
   let mut sessions = Sessions::new(7, limits());
   let (_, sessionid) = session(&mut sessions, "host-a");
   sessions.sequence(&seq(sessionid, 1, 1), 1).unwrap();
-  sessions.store_reply(&sessionid, 1, &vec![0u8; 8192]);
+  sessions.store_reply(&sessionid, 1, &vec![0u8; 8192], true);
   assert_eq!(
     sessions.sequence(&seq(sessionid, 1, 1), 2),
     Err(Nfsstat4::RetryUncachedRep)
   );
+}
+
+/// §2.10.6.1.3: do end a request whose SEQUENCE did not ask for its reply to be kept (`sa_cachethis` false, as Linux
+/// sends a READ or a WRITE) and retry it; expect `RETRY_UNCACHED_REP`, the client then resending it as new, and the next
+/// request on the slot served as new. The full transfer a READ's reply carries is no longer copied into the cache.
+#[test]
+fn a_reply_the_client_did_not_ask_to_keep_is_not_kept() {
+  let mut sessions = Sessions::new(7, limits());
+  let (_, sessionid) = session(&mut sessions, "host-a");
+  sessions.sequence(&seq(sessionid, 3, 1), 1).unwrap();
+  sessions.store_reply(&sessionid, 3, b"a read's reply", false);
+  assert_eq!(
+    sessions.sequence(&seq(sessionid, 3, 1), 2),
+    Err(Nfsstat4::RetryUncachedRep)
+  );
+  assert!(matches!(
+    sessions.sequence(&seq(sessionid, 3, 2), 3).unwrap(),
+    Sequenced::New { .. }
+  ));
 }
 
 /// §2.10.6.1: do retry a request while it is still being served (its reply not yet stored); expect
@@ -169,7 +189,7 @@ fn a_retry_of_a_request_still_being_served_is_delayed() {
     Err(Nfsstat4::Delay),
     "the original is still in flight"
   );
-  sessions.store_reply(&sessionid, 2, b"done");
+  sessions.store_reply(&sessionid, 2, b"done", true);
   assert_eq!(
     sessions.sequence(&seq(sessionid, 2, 1), 3).unwrap(),
     Sequenced::Replay(b"done".to_vec())
@@ -292,7 +312,7 @@ fn a_departed_session_keeps_its_reply_cache_and_its_home_remembers_it() {
     home.sequence(&seq(sessionid, 0, 1), 1).unwrap(),
     Sequenced::New { .. }
   ));
-  home.store_reply(&sessionid, 0, b"reply one");
+  home.store_reply(&sessionid, 0, b"reply one", true);
   let departed = home
     .depart(&sessionid, GUEST_SHARD)
     .expect("an idle session departs");
@@ -326,7 +346,7 @@ fn a_session_with_a_request_in_flight_does_not_depart() {
   ));
   assert!(home.depart(&sessionid, GUEST_SHARD).is_none());
   assert!(home.holds_session(&sessionid) && home.away(&sessionid).is_none());
-  home.store_reply(&sessionid, 1, b"done");
+  home.store_reply(&sessionid, 1, b"done", true);
   assert!(home.depart(&sessionid, GUEST_SHARD).is_some());
 }
 
@@ -352,7 +372,7 @@ fn a_guest_asks_for_a_renewal_note_at_most_twice_a_lease_and_keeps_its_client_al
       notes += 1;
       home.renew(clientid, now);
     }
-    guest.store_reply(&sessionid, 0, b"r");
+    guest.store_reply(&sessionid, 0, b"r", true);
   }
   assert!(
     notes <= 3 * RENEWALS_PER_LEASE,
@@ -385,4 +405,62 @@ fn a_client_dropped_at_home_leaves_a_drop_for_each_guest() {
   guest.arrive(second, home.depart(&second, GUEST_SHARD).unwrap(), 0);
   assert_eq!(home.destroy_session(&second), Ok(()));
   assert_eq!(home.take_guest_drops(), vec![(second, GUEST_SHARD)]);
+}
+
+/// 2026-10-10 (purges owed durably): a destroyed session and a dropped client each owe their purge in the same journal
+/// as the drop, and a settled purge journals its settlement. Do: on a durable table, give a client a session, destroy
+/// the session, then the client id, and take the table's changes; settle both purges and take the changes again.
+/// Expect each purge owed right after its drop's own change, in the one batch, and owed until settled; then both
+/// settlements journaled and nothing owed.
+#[test]
+fn a_drop_owes_its_purge_in_the_same_journal_and_its_settlement_is_journaled() {
+  let mut sessions = Sessions::restore(1, limits(), (Vec::new(), Vec::new(), Vec::new()), 0);
+  let (clientid, sessionid) = session(&mut sessions, "host-a");
+  let _ = sessions.take_changes();
+  sessions.destroy_session(&sessionid).unwrap();
+  sessions.destroy_clientid(clientid).unwrap();
+  let changes = sessions.take_changes();
+  let session_purge = Purge::Session(clientid, sessionid);
+  let client_purge = Purge::Client(clientid);
+  let at = |wanted: &ClientChange| changes.iter().position(|change| change == wanted);
+  let session_cleared = at(&ClientChange::SessionCleared(sessionid));
+  let session_owed = at(&ClientChange::PurgeOwed(session_purge));
+  let client_cleared = at(&ClientChange::Cleared(clientid));
+  let client_owed = at(&ClientChange::PurgeOwed(client_purge));
+  assert!(
+    session_cleared
+      .zip(session_owed)
+      .is_some_and(|(cleared, owed)| owed == cleared + 1),
+    "the session's purge is owed right after its clear: {changes:?}"
+  );
+  assert!(
+    client_cleared
+      .zip(client_owed)
+      .is_some_and(|(cleared, owed)| owed == cleared + 1),
+    "the client's purge is owed right after its clear: {changes:?}"
+  );
+  assert_eq!(sessions.owed(), vec![session_purge, client_purge]);
+  sessions.settle(&session_purge);
+  sessions.settle(&client_purge);
+  assert_eq!(
+    sessions.take_changes(),
+    vec![
+      ClientChange::PurgeSettled(session_purge),
+      ClientChange::PurgeSettled(client_purge)
+    ]
+  );
+  assert!(!sessions.owes(), "nothing is owed once both settled");
+}
+
+/// 2026-10-10: a restarted table owes what its records owed. Do: restore a table from records owing a client's purge
+/// and a session's. Expect both owed, and settling one leaves the other.
+#[test]
+fn a_restored_table_owes_the_purges_its_records_owed() {
+  let owed = vec![Purge::Session(7, [3; 16]), Purge::Client(7)];
+  let mut sessions = Sessions::restore(2, limits(), (Vec::new(), Vec::new(), owed.clone()), 0);
+  let mut expected = owed;
+  expected.sort_unstable();
+  assert_eq!(sessions.owed(), expected);
+  sessions.settle(&Purge::Client(7));
+  assert_eq!(sessions.owed(), vec![Purge::Session(7, [3; 16])]);
 }

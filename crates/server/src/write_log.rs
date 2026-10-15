@@ -255,14 +255,23 @@ impl WriteLog {
     self.used = 0;
     self.stamp = stamp;
     self.overflowed = false;
-    self.store(object, AT_USED, &0u64.to_le_bytes())?;
-    self.store(object, AT_OVERFLOW, &0u64.to_le_bytes())?;
-    self.store(object, AT_STAMP, &stamp.to_le_bytes())?;
-    if logged > 0 {
-      let at = self.start.checked_add(HEADER_BYTES).ok_or(Unwritten)?;
-      object.zero(at, logged).map_err(|_| Unwritten)?;
-    }
-    Ok(())
+    // The header first (a crash mid-scrub then replays nothing), but the scrub runs whatever the header's writes
+    // answered: the records are plaintext, and a refused header write that returned early left them in place while
+    // this log already counted itself empty, so nothing would scrub them (2026-10-07). The first refusal is returned.
+    let header = self
+      .store(object, AT_USED, &0u64.to_le_bytes())
+      .and(self.store(object, AT_OVERFLOW, &0u64.to_le_bytes()))
+      .and(self.store(object, AT_STAMP, &stamp.to_le_bytes()));
+    let scrubbed = if logged > 0 {
+      self
+        .start
+        .checked_add(HEADER_BYTES)
+        .ok_or(Unwritten)
+        .and_then(|at| object.zero(at, logged).map_err(|_| Unwritten))
+    } else {
+      Ok(())
+    };
+    header.and(scrubbed)
   }
 
   /// Gives the record area's pages back to the OS while the log is empty (A-105): run by an idle shard, so a log that

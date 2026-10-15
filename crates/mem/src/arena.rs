@@ -109,6 +109,10 @@ pub trait ExtentSource: Send {
   /// The bytes of free extents this source could still hand out now, as an arena would hold them: what an admission
   /// may count on beyond the arena's own capacity. A snapshot: another arena may claim them first.
   fn available(&self) -> usize;
+  /// Lets this source hand out the extents a pressure hold has withheld, as well as free ones, while `open` (§4.2,
+  /// admission.md §5.5: a takeover's recovery runs past the hold, which never revokes a committed claim). A source
+  /// with no hold has nothing to open.
+  fn open_hold(&mut self, _open: bool) {}
 }
 
 /// The arena.
@@ -140,6 +144,9 @@ pub struct ChunkArena {
   /// Bytes whose reusable mark an allocation cleared before handing them out (A-110, macOS), monotone: the counter a
   /// test of the give-back asserts moved, so a dead clearing path cannot pass as one that had nothing to clear.
   reused: u64,
+  /// Whether recovery publications name this arena's blocks ([`ChunkArena::published`]): each region it adds then keeps
+  /// its live heads from the start ([`Buddy::new_imaged`]), so no publication scans a region's state.
+  published: bool,
 }
 
 /// What one [`ChunkArena::purge`] call did.
@@ -186,7 +193,27 @@ impl ChunkArena {
       purge_cursor: None,
       allocations: 0,
       reused: 0,
+      published: false,
     }
+  }
+
+  /// Marks this arena's blocks as named by recovery publications (A-64): every region added from here on keeps its live
+  /// heads from the start ([`Buddy::new_imaged`]), so a publication never reads a region's state bytes to find them.
+  /// Without it a region's first capture scanned every granule inside whichever verb's shard step published first
+  /// (8,388,608 granules, 64.6 ms in a debug build; 2026-10-10). An arena nothing publishes from leaves it unset and
+  /// keeps no bitmap.
+  pub fn published(mut self) -> Self {
+    self.published = true;
+    self
+  }
+
+  /// Granules the regions' first captures read from their state bytes: zero for a published arena's regions.
+  pub fn scanned_granules(&self) -> u64 {
+    self
+      .slots
+      .iter()
+      .map(|slot| slot.buddy.scanned_granules())
+      .fold(0u64, u64::saturating_add)
   }
 
   /// Lets an idle purge give free blocks of at least `bytes` back to the OS
@@ -296,6 +323,12 @@ impl ChunkArena {
   /// Grows from the source by what a commitment of `bytes` lacks in `budget`, and extends `budget` by what was added
   /// (A-98): the bytes added. Nothing grows when the commitment is admittable already; the deficit counts the
   /// budget's pressure hold ([`crate::budget::ShardBudget::deficit`]).
+  ///
+  /// All of the deficit or nothing (§4.2: an admission is refused whole, with nothing changed). A commitment the pool
+  /// cannot cover is refused by the admission that follows whatever this arena claims, so it claims nothing for it;
+  /// and when another arena claims first, between the look and the claims, what this one took goes back. Before
+  /// 2026-10-09 a refused create claimed every free extent on its way to the refusal, and its shard kept them until its
+  /// next publication: one oversized request on an idle shard refused every other shard's admissions.
   pub fn make_room(&mut self, budget: &mut crate::budget::ShardBudget, bytes: u64) -> u64 {
     if bytes == 0 {
       return 0;
@@ -304,9 +337,23 @@ impl ChunkArena {
     if deficit == 0 {
       return 0;
     }
+    // Growing from the pool takes on the pressure debt the daemon's sampler left for the next shard to grow (§4.2,
+    // `budget::Pressure`): the arena grows by it too, and the budget holds it once grown.
+    let needed = deficit.saturating_add(budget.debt());
+    if u64::try_from(self.claimable()).unwrap_or(u64::MAX) < needed {
+      return 0;
+    }
+    let before = self.capacity();
     let added =
-      u64::try_from(self.grow(usize::try_from(deficit).unwrap_or(usize::MAX))).unwrap_or(u64::MAX);
+      u64::try_from(self.grow(usize::try_from(needed).unwrap_or(usize::MAX))).unwrap_or(u64::MAX);
+    if added < needed {
+      // The claims just taken hold no block, so they are wholly free and go back first (the newest regions are
+      // returned first), down to the capacity the arena had before.
+      self.shrink(before);
+      return 0;
+    }
     budget.extend(added);
+    budget.absorb_debt();
     added
   }
 
@@ -349,6 +396,14 @@ impl ChunkArena {
   /// The bytes this arena could still claim from its source ([`ExtentSource::available`]); zero without a source.
   pub fn claimable(&self) -> usize {
     self.source.as_ref().map_or(0, |source| source.available())
+  }
+
+  /// Opens or closes the source's pressure hold to this arena's growth ([`ExtentSource::open_hold`]); nothing without a
+  /// source.
+  pub fn open_hold(&mut self, open: bool) {
+    if let Some(source) = self.source.as_mut() {
+      source.open_hold(open);
+    }
   }
 
   /// Claims the source could not hand out so far ([`ExtentSource::refused`]); zero without a source.
@@ -415,7 +470,11 @@ impl ChunkArena {
       id,
       dirty: crate::ranges::UnitSet::new(region.len(), self.granule),
       region,
-      buddy: Buddy::new(self.granule, max_order)?,
+      buddy: if self.published {
+        Buddy::new_imaged(self.granule, max_order)?
+      } else {
+        Buddy::new(self.granule, max_order)?
+      },
     };
     let at = usize::from(id);
     if self.position.len() <= at {
@@ -682,7 +741,157 @@ impl ChunkArena {
     Ok(())
   }
 
-  /// Allocates exactly the block of `len` bytes at `offset` in region `region` (A-64: a recovery rebuilding
+  /// Trims `extent` to its first `keep` bytes, rounded up to a granule (A-118; [`crate::buddy::Buddy::trim`]): the rest
+  /// goes back to the free lists, and the head of the kept prefix is returned. Every byte of the block past `dirty` is
+  /// zero (the caller's record of what was ever written), so only the freed tail's bytes before `dirty` are scrubbed: a
+  /// tail page nothing wrote is never touched, and no written byte is left in free memory (A-99). The tail is recorded
+  /// for the idle purge like any freed range. `None`, nothing changed, where the buddy declines (the prefix is the whole
+  /// block, the block is locked, or an image may name it).
+  pub fn trim(
+    &mut self,
+    extent: Extent,
+    keep: usize,
+    dirty: usize,
+  ) -> Result<Option<Extent>, MemError> {
+    if self.identity != Some(extent.arena) {
+      return Err(MemError::ForeignExtent {
+        offset: extent.offset(),
+        len: extent.len(),
+        reason: ExtentRefusal::OtherArena,
+      });
+    }
+    let Some(slot) = self.slot_mut(extent.region) else {
+      return Err(MemError::ForeignExtent {
+        offset: extent.offset(),
+        len: extent.len(),
+        reason: ExtentRefusal::NoSuchRegion,
+      });
+    };
+    let before = slot.buddy.free_bytes();
+    let Some(pieces) = slot.buddy.trim(extent.block, keep)? else {
+      return Ok(None);
+    };
+    let kept: usize = pieces.iter().map(|piece| piece.len()).sum();
+    let tail_from = extent.offset().saturating_add(kept);
+    let end = extent.offset().saturating_add(extent.len());
+    let written_to = extent.offset().saturating_add(dirty).min(end);
+    if written_to > tail_from {
+      scrub(
+        &mut slot.region,
+        tail_from,
+        written_to.saturating_sub(tail_from),
+      );
+    }
+    slot.dirty.mark(tail_from, end);
+    let released = slot.buddy.free_bytes().saturating_sub(before);
+    self.allocated_bytes = self.allocated_bytes.saturating_sub(released);
+    self.resident_free = self.resident_free.saturating_add(released);
+    Ok(pieces.first().map(|head| Extent {
+      arena: extent.arena,
+      region: extent.region,
+      block: *head,
+    }))
+  }
+
+  /// Frees a block [`ChunkArena::trim`] cut to `keep` bytes, named by its head (A-118), scrubbing the kept bytes as
+  /// [`ChunkArena::free`] does; refused, nothing changed, as [`crate::buddy::Buddy::free_or_defer_trimmed`] refuses.
+  pub fn free_trimmed(&mut self, head: Extent, keep: usize) -> Result<(), MemError> {
+    self.release_trimmed(head, keep, true)
+  }
+
+  /// [`ChunkArena::free_trimmed`] with the bytes untouched, as [`ChunkArena::give_back`] is to [`ChunkArena::free`].
+  pub fn give_back_trimmed(&mut self, head: Extent, keep: usize) -> Result<(), MemError> {
+    self.release_trimmed(head, keep, false)
+  }
+
+  fn release_trimmed(&mut self, head: Extent, keep: usize, scrubbed: bool) -> Result<(), MemError> {
+    let foreign = |reason| MemError::ForeignExtent {
+      offset: head.offset(),
+      len: head.len(),
+      reason,
+    };
+    if self.identity != Some(head.arena) {
+      return Err(foreign(ExtentRefusal::OtherArena));
+    }
+    let granule = self.granule;
+    let slot = self
+      .slot_mut(head.region)
+      .ok_or_else(|| foreign(ExtentRefusal::NoSuchRegion))?;
+    let before = slot.buddy.free_bytes();
+    let deferred = slot.buddy.free_or_defer_trimmed(head.block, keep)?;
+    let span = keep.max(1).div_ceil(granule).saturating_mul(granule);
+    let mut self_resident = 0usize;
+    if !deferred && scrubbed {
+      // A trimmed block is never locked (the buddy declines to trim one), so only the scrub is owed.
+      scrub(&mut slot.region, head.offset(), span);
+      slot
+        .dirty
+        .mark(head.offset(), head.offset().saturating_add(span));
+      self_resident = span;
+    }
+    let released = slot.buddy.free_bytes().saturating_sub(before);
+    self.allocated_bytes = self.allocated_bytes.saturating_sub(released);
+    self.resident_free = self.resident_free.saturating_add(self_resident);
+    Ok(())
+  }
+
+  /// Whether `head` names a live block of this arena trimmed to `keep` bytes, every piece allocated (A-118).
+  pub fn holds_trimmed(&self, head: Extent, keep: usize) -> bool {
+    self.identity == Some(head.arena)
+      && self
+        .slot(head.region)
+        .is_some_and(|slot| slot.buddy.holds_trimmed(head.block, keep))
+  }
+
+  /// The `len` bytes from the start of `head`, which may run past the head into the rest of a trimmed block's pieces
+  /// (A-118: they are contiguous); `None` past the region.
+  pub fn span(&self, head: Extent, len: usize) -> Option<&[u8]> {
+    let slot = self.slot(head.region)?;
+    slot
+      .region
+      .bytes()
+      .get(head.offset()..head.offset().checked_add(len)?)
+  }
+
+  /// Claims every piece of a block trimmed to `keep` bytes whose head sits at `offset` in region `region` (A-64, A-118:
+  /// a recovery rebuilding a trimmed chunk's blocks), returning the head. All or nothing: a refused piece gives back
+  /// the pieces already claimed, and the refusal is returned.
+  pub fn claim_trimmed(
+    &mut self,
+    region: u16,
+    offset: usize,
+    keep: usize,
+  ) -> Result<Extent, MemError> {
+    let granule = self.granule;
+    let granules = keep.max(1).div_ceil(granule);
+    let mut claimed: Vec<Extent> = Vec::new();
+    let mut at = offset;
+    for order in (0..usize::BITS).rev() {
+      let piece = 1usize.checked_shl(order).unwrap_or(0);
+      if piece == 0 || granules & piece == 0 {
+        continue;
+      }
+      let len = piece.saturating_mul(granule);
+      match self.claim(region, at, len) {
+        Ok(extent) => claimed.push(extent),
+        Err(refusal) => {
+          // A piece just claimed always goes back; should one not, that refusal is the one reported.
+          for extent in claimed {
+            self.give_back(extent)?;
+          }
+          return Err(refusal);
+        }
+      }
+      at = at.saturating_add(len);
+    }
+    claimed.first().copied().ok_or(MemError::ForeignExtent {
+      offset,
+      len: keep,
+      reason: ExtentRefusal::WrongLength,
+    })
+  }
+
+  /// Allocates exactly the block of `len` bytes at `offset` in region `region` (A-64: a recovery rebuilding  /// Allocates exactly the block of `len` bytes at `offset` in region `region` (A-64: a recovery rebuilding
   /// the blocks its image names). Refused as [`crate::buddy::Buddy::claim`] refuses, or `NoSuchRegion`.
   pub fn claim(&mut self, region: u16, offset: usize, len: usize) -> Result<Extent, MemError> {
     let arena = self
@@ -964,6 +1173,48 @@ mod tests {
     );
   }
 
+  /// A-118, the arena's trim: do allocate a 16-page block, fill its first 5 pages and a byte of the sixth, trim it to
+  /// that length, and read the span; expect the bytes back, 6 pages still allocated and 10 free, the tail free for any
+  /// allocation; then free the trimmed block through its head and expect every byte of the region free and zero.
+  #[test]
+  fn a_trimmed_block_keeps_its_prefix_and_frees_whole() {
+    let p = page();
+    let mut arena = ChunkArena::new(p);
+    arena
+      .add_region(Region::map(p * 16, p, false).unwrap())
+      .unwrap();
+    let block = arena.alloc(p * 16).unwrap();
+    let used = p * 5 + 1;
+    arena.bytes_mut(block).unwrap()[..used].fill(7);
+    // Two bytes past the kept prefix were written too: the trim must scrub them out of the freed tail.
+    arena.bytes_mut(block).unwrap()[p * 6..p * 6 + 2].fill(9);
+    let head = arena.trim(block, used, p * 6 + 2).unwrap().unwrap();
+    assert_eq!(head.offset(), block.offset());
+    assert!(
+      arena
+        .span(head, used)
+        .unwrap()
+        .iter()
+        .all(|byte| *byte == 7),
+      "the prefix reads back"
+    );
+    assert_eq!(arena.allocated_bytes(), p * 6);
+    assert_eq!(arena.free_bytes(), p * 10);
+    let tail = arena.alloc(p * 8).unwrap();
+    assert_eq!(tail.offset(), p * 8, "the freed tail is allocatable");
+    let bytes = arena.slot(head.region).unwrap().region.bytes();
+    assert!(
+      all_are(bytes, p * 6, p * 2, 0),
+      "the written bytes past the prefix were scrubbed"
+    );
+    arena.free(tail).unwrap();
+    arena.free_trimmed(head, used).unwrap();
+    assert_eq!(arena.allocated_bytes(), 0);
+    let bytes = arena.slot(head.region).unwrap().region.bytes();
+    assert!(all_are(bytes, 0, p * 16, 0), "the kept bytes were scrubbed");
+    assert!(arena.alloc(p * 16).is_ok(), "the region is one block again");
+  }
+
   /// §4.2 allocator rounding: do: allocate every length from one byte to four granules; expect each block to
   /// be exactly the length `block_len` charged for it before the allocation.
   #[test]
@@ -1149,6 +1400,94 @@ mod tests {
     ));
   }
 
+  /// A pool whose look at its free bytes counts `phantom` more than it can hand out: another arena claiming between an
+  /// arena's look and its claims.
+  struct RacedPool {
+    pool: TestPool,
+    phantom: usize,
+  }
+
+  impl ExtentSource for RacedPool {
+    fn claim(&mut self) -> Option<(u16, Region)> {
+      self.pool.claim()
+    }
+    fn release(&mut self, id: u16, region: Region) {
+      self.pool.release(id, region);
+    }
+    fn refused(&self) -> u64 {
+      0
+    }
+    fn available(&self) -> usize {
+      self.pool.available().saturating_add(self.phantom)
+    }
+  }
+
+  /// A-98, §4.2 ("refused whole, with nothing changed"). Do: over a pool of two four-granule regions, make room for
+  /// twelve granules, then for six. Expect: the first claims nothing (the pool cannot cover it, and the admission it is
+  /// for is refused whatever is claimed), leaving both regions in the pool; the second claims both. Before 2026-10-09
+  /// the first claimed both regions on its way to a refusal.
+  #[test]
+  fn making_room_the_pool_cannot_cover_claims_nothing() {
+    let p = page();
+    let mut arena = pooled(p, &[3, 9]);
+    let mut budget = crate::budget::ShardBudget::new(0, 0);
+    let refused = arena.make_room(&mut budget, u64::try_from(p * 12).unwrap());
+    assert_eq!((refused, arena.capacity(), budget.capacity()), (0, 0, 0));
+    assert_eq!(arena.claimable(), p * 8, "both regions stay in the pool");
+    let admitted = arena.make_room(&mut budget, u64::try_from(p * 6).unwrap());
+    assert_eq!(admitted, u64::try_from(p * 8).unwrap(), "two whole regions");
+    assert_eq!(budget.capacity(), admitted);
+  }
+
+  /// §4.2 (2026-10-09): a growth from the pool takes on the pressure debt. Do: over a pool of two four-granule regions,
+  /// owe a debt of four granules and make room for two. Expect both regions claimed (two granules and the debt need
+  /// more than one), the hold four granules and no debt left; with the debt larger than the pool can add beside the
+  /// admission, nothing claimed.
+  #[test]
+  fn making_room_takes_on_the_pressure_debt() {
+    let p = page();
+    let granules = |n: usize| u64::try_from(p * n).unwrap();
+    let mut arena = pooled(p, &[1, 2]);
+    let mut budget = crate::budget::ShardBudget::new(0, 0);
+    budget.set_pressure(0, granules(7));
+    assert_eq!(
+      arena.make_room(&mut budget, granules(2)),
+      0,
+      "nine granules exceed the pool"
+    );
+    assert_eq!(arena.claimable(), p * 8);
+    budget.set_pressure(0, granules(4));
+    assert_eq!(arena.make_room(&mut budget, granules(2)), granules(8));
+    assert_eq!((budget.hold(), budget.debt()), (granules(4), 0));
+  }
+
+  /// A-98, §4.2. Do: over a pool that looks one granule larger than it is (another arena claimed between the look and
+  /// the claims), make room for all it looks to hold. Expect: nothing kept — the regions claimed go back to the pool,
+  /// the arena's capacity and the budget unchanged.
+  #[test]
+  fn room_another_arena_took_first_returns_what_was_claimed() {
+    let p = page();
+    let mut arena = ChunkArena::new(p);
+    arena.set_source(Box::new(RacedPool {
+      pool: TestPool {
+        free: [5u16, 6]
+          .iter()
+          .map(|id| (*id, Region::map(p * 4, p, false).unwrap()))
+          .collect(),
+      },
+      phantom: p,
+    }));
+    let mut budget = crate::budget::ShardBudget::new(0, 0);
+    let added = arena.make_room(&mut budget, u64::try_from(p * 9).unwrap());
+    assert_eq!((added, arena.capacity(), budget.capacity()), (0, 0, 0));
+    assert_eq!(arena.regions(), 0);
+    assert_eq!(
+      arena.claimable(),
+      p * 9,
+      "both regions are back, as the look counts them"
+    );
+  }
+
   /// A-98 recovery: do add a region under a high id to a fresh arena and claim a block in it; expect the claim to land
   /// at the named id and offset, and a free of it to return the arena to empty.
   #[test]
@@ -1165,5 +1504,83 @@ mod tests {
     assert_eq!(arena.allocated_bytes(), 0);
     assert!(arena.remove_region(300).is_ok());
     assert_eq!(arena.regions(), 0);
+  }
+
+  /// A-64 with a published arena (2026-10-10). Do: in an unpublished arena and in a published one, each of two regions
+  /// of sixteen pages, allocate blocks, free one, capture, commit, allocate again, and capture; and claim a block in a
+  /// fresh region of each, as recovery does, then capture. Expect: both arenas name exactly the same blocks at every
+  /// capture; the unpublished arena's captures scanned every granule of its three regions once, the published arena's
+  /// none — the scan gone, not moved.
+  #[test]
+  fn a_published_arena_names_what_a_scanning_one_names_and_scans_nothing() {
+    let p = page();
+    let mut scanning = arena_of_regions(p, false);
+    let mut published = arena_of_regions(p, true);
+    compare_captures(&mut scanning, &mut published, p);
+    let claimed_a = claim_in_a_fresh_region(&mut scanning, p);
+    let claimed_b = claim_in_a_fresh_region(&mut published, p);
+    assert!(scanning.imaged(claimed_a) && published.imaged(claimed_b));
+    let granules = u64::try_from((REGIONS + 1) * PAGES).unwrap();
+    assert_eq!(
+      scanning.scanned_granules(),
+      granules,
+      "each region scanned once"
+    );
+    assert_eq!(published.scanned_granules(), 0, "no region scanned");
+  }
+
+  /// Shape: the regions [`arena_of_regions`] adds, and the pages each holds.
+  const REGIONS: usize = 2;
+  /// Shape: see [`REGIONS`].
+  const PAGES: usize = 16;
+
+  /// An arena of [`REGIONS`] regions of [`PAGES`] pages each, published or not.
+  fn arena_of_regions(p: usize, published: bool) -> ChunkArena {
+    let arena = ChunkArena::new(p);
+    let mut arena = if published { arena.published() } else { arena };
+    for _ in 0..REGIONS {
+      arena
+        .add_region(Region::map(p * PAGES, p, false).unwrap())
+        .unwrap();
+    }
+    arena
+  }
+
+  /// The same allocations, free, captures and commit in both arenas; both must name the same blocks.
+  fn compare_captures(scanning: &mut ChunkArena, published: &mut ChunkArena, p: usize) {
+    let mut held: Vec<(Extent, Extent)> = [p, 2 * p, p, 4 * p]
+      .into_iter()
+      .map(|len| (scanning.alloc(len).unwrap(), published.alloc(len).unwrap()))
+      .collect();
+    let (gone_a, gone_b) = held.remove(1);
+    scanning.free(gone_a).unwrap();
+    published.free(gone_b).unwrap();
+    for arena in [&mut *scanning, &mut *published] {
+      arena.capture();
+      arena.commit_capture();
+    }
+    held.push((scanning.alloc(p).unwrap(), published.alloc(p).unwrap()));
+    scanning.capture();
+    published.capture();
+    for (a, b) in &held {
+      assert_eq!(scanning.imaged(*a), published.imaged(*b), "{a:?} / {b:?}");
+      assert!(
+        published.imaged(*b),
+        "a live block is named by the open capture"
+      );
+    }
+    assert!(!published.imaged(gone_b) && !scanning.imaged(gone_a));
+    scanning.commit_capture();
+    published.commit_capture();
+  }
+
+  /// Recovery's shape: a fresh region added, a block in it claimed, a capture; the claimed block.
+  fn claim_in_a_fresh_region(arena: &mut ChunkArena, p: usize) -> Extent {
+    let id = arena
+      .add_region(Region::map(p * PAGES, p, false).unwrap())
+      .unwrap();
+    let claimed = arena.claim(id, 2 * p, 2 * p).unwrap();
+    arena.capture();
+    claimed
   }
 }

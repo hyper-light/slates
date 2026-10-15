@@ -526,12 +526,18 @@ fn rendezvous_weight(host: u64, object: &ObjectId) -> u64 {
 /// its neighbourhood (§4.8 "Promotion and takeover"; the worked example's "rendezvous ranks first
 /// among {B, C, D}").
 pub fn rendezvous_first(hosts: &[HostId], object: ObjectId) -> Option<HostId> {
+  rendezvous_ranked(hosts, object).first().copied()
+}
+
+/// `hosts` in rendezvous order for `object`: the highest weight first, the lowest id breaking a tie (the order
+/// [`rendezvous_first`] takes the head of). A mirror region's cohort is its prefix (`crate::mirror::mirror_cohort`).
+pub fn rendezvous_ranked(hosts: &[HostId], object: ObjectId) -> Vec<HostId> {
   let mut ranked: Vec<(u64, HostId)> = hosts
     .iter()
     .map(|host| (rendezvous_weight(host.0, &object), *host))
     .collect();
   ranked.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
-  ranked.first().map(|(_, host)| *host)
+  ranked.into_iter().map(|(_, host)| host).collect()
 }
 
 /// The number of **distinct copysets** Copyset Replication lays down over `hosts` nodes at scatter width
@@ -1439,6 +1445,12 @@ impl Acceptor {
     self.authority.owner
   }
 
+  /// The configuration generation this acceptor serves under: what a recovery image keeps with its records, so a
+  /// restarted holder refuses and accepts as it did before.
+  pub fn generation(&self) -> u64 {
+    self.authority.generation
+  }
+
   /// Raises this holder's fence for the object to at least `epoch` (§4.8 "Promotion and takeover": "every
   /// holder raises its fence for that host to the new epoch"). When the configuration group bumps a failed
   /// host's fencing epoch, a holder installing that configuration raises the fence for the objects that host
@@ -1917,6 +1929,21 @@ impl Configuration {
         .is_some_and(|settled| settled.hosts.contains(&host))
   }
 
+  /// The hosts of this owner's neighbourhood, current and — while a change is in flight — settled, the owner
+  /// excluded, each once, appended to `into`: every host a lease cohort can draw from
+  /// ([`lease_cohorts`](Configuration::lease_cohorts)), so every host whose answers confirm this owner's lease.
+  pub fn lease_holders_into(&self, into: &mut Vec<HostId>) {
+    let settled = self
+      .settled
+      .as_ref()
+      .map(|settled| settled.hosts.as_slice());
+    for host in self.neighbourhood.iter().chain(settled.unwrap_or_default()) {
+      if *host != self.owner && !into.contains(host) {
+        into.push(*host);
+      }
+    }
+  }
+
   /// This owner's authority standing ([`Standing`]): the versions its settled and its current neighbourhoods
   /// were fixed at.
   pub fn standing(&self) -> Standing {
@@ -2115,6 +2142,23 @@ pub struct RegionalConfiguration {
   /// confirmed that share ([`confirm`](RegionalConfiguration::confirm)), and never more than
   /// [`retirement_bound`](RegionalConfiguration::retirement_bound) of them.
   pub retired: std::collections::BTreeMap<HostId, Retirement>,
+  /// The promoted objects this region adopts from the region it mirrors (§4.10 "region loss promotes the mirror";
+  /// `docs/wip/mirroring.md` decision 4): each object's agreed successor, with the head and catalog records it adopts.
+  /// An entry is assigned by the council leader after its phase one and dropped once its successor reports it serves
+  /// the object ([`adopted`](RegionalConfiguration::adopted)), so it holds only adoptions in flight.
+  pub adoptions: std::collections::BTreeMap<ObjectId, Adoption>,
+}
+
+/// One promoted object's adoption in the mirror region (`docs/wip/mirroring.md` decision 4): the member that adopts it,
+/// and the newest head and catalog records phase one found for it, each an encoded [`Record`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Adoption {
+  /// The member that adopts and serves the object.
+  pub successor: HostId,
+  /// The adopted head record.
+  pub head: Vec<u8>,
+  /// The adopted catalog record.
+  pub catalog: Vec<u8>,
 }
 
 impl RegionalConfiguration {
@@ -2141,6 +2185,7 @@ impl RegionalConfiguration {
       has_mirror,
       settled: std::collections::BTreeMap::new(),
       retired: std::collections::BTreeMap::new(),
+      adoptions: std::collections::BTreeMap::new(),
     };
     config.fix_neighbourhoods(scatter);
     // A formed region owns nothing yet: every member's first neighbourhood is already settled.
@@ -2192,6 +2237,22 @@ impl RegionalConfiguration {
         .cloned(),
       generation: neighbourhood.generation,
     })
+  }
+
+  /// Whether `host` holds `owner`'s content: it is in `owner`'s neighbourhood, current or — while `owner`'s change is
+  /// in flight — settled. The holder's side of [`Configuration::neighbours`], asked without building `owner`'s
+  /// configuration, for a contact rule asked per probe event (2026-10-10: a holder that kept no contact with an owner
+  /// left the pair's probe plane unkeyed when it was the pair's canonical dialer).
+  pub fn holds_for(&self, owner: HostId, host: HostId) -> bool {
+    let Some(neighbourhood) = self.neighbourhoods.get(&owner) else {
+      return false;
+    };
+    neighbourhood.hosts.contains(&host)
+      || self
+        .settled
+        .get(&owner)
+        .filter(|settled| settled.generation != neighbourhood.generation)
+        .is_some_and(|settled| settled.hosts.contains(&host))
   }
 
   /// The version this configuration fixed `host`'s settled neighbourhood at — its authority generation as a
@@ -2364,6 +2425,48 @@ impl RegionalConfiguration {
     self.version = version;
     self.prune_retirements();
     true
+  }
+
+  /// Assigns `object`'s adoption to `adoption.successor` (`docs/wip/mirroring.md` decision 4): only to a member, and
+  /// only where it changes what is assigned. Returns whether the configuration changed.
+  pub fn assign_adoption(&mut self, object: ObjectId, adoption: Adoption) -> bool {
+    if !self.assigns(object, &adoption) {
+      return false;
+    }
+    let Some(version) = self.version.checked_add(1) else {
+      return false;
+    };
+    self.adoptions.insert(object, adoption);
+    self.version = version;
+    true
+  }
+
+  /// Whether assigning `adoption` to `object` would change the configuration: its successor is a member, and the
+  /// object is not already assigned exactly so.
+  pub fn assigns(&self, object: ObjectId, adoption: &Adoption) -> bool {
+    self.members.contains(&adoption.successor) && self.adoptions.get(&object) != Some(adoption)
+  }
+
+  /// Drops `object`'s adoption once its successor reports it serves the object. Only the assigned successor's report
+  /// changes anything. Returns whether the configuration changed.
+  pub fn adopted(&mut self, object: ObjectId, successor: HostId) -> bool {
+    if !self.owes_adopted(object, successor) {
+      return false;
+    }
+    let Some(version) = self.version.checked_add(1) else {
+      return false;
+    };
+    self.adoptions.remove(&object);
+    self.version = version;
+    true
+  }
+
+  /// Whether `object` is assigned to `successor` and not yet reported adopted.
+  pub fn owes_adopted(&self, object: ObjectId, successor: HostId) -> bool {
+    self
+      .adoptions
+      .get(&object)
+      .is_some_and(|adoption| adoption.successor == successor)
   }
 
   /// Whether `host` still owes a confirmation of its share of `departed`'s takeover: `departed`'s retirement is
@@ -2705,6 +2808,40 @@ impl RootConfiguration {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  /// docs/wip/mirroring.md decision 4. Do: assign a promoted object's adoption to a member and to a non-member, report
+  /// it adopted by another member, then by its successor. Expect: only the member's assignment and only its own
+  /// report change the configuration, each advancing the version, and the adopted entry is gone.
+  #[test]
+  fn an_adoption_is_assigned_to_a_member_and_dropped_only_by_its_successor() {
+    let (a, b, c) = (HostId(1), HostId(2), HostId(3));
+    let mut config =
+      RegionalConfiguration::formed(vec![a, b, c], Quorum { f: 1 }, Default::default(), 3, true);
+    let object = ObjectId::new(HostId(90), 1);
+    let adoption = |successor| Adoption {
+      successor,
+      head: vec![7],
+      catalog: vec![8],
+    };
+    assert!(
+      !config.assign_adoption(object, adoption(HostId(99))),
+      "a non-member is assigned nothing"
+    );
+    let version = config.version;
+    assert!(config.assign_adoption(object, adoption(b)));
+    assert_eq!(config.version, version + 1);
+    assert!(
+      !config.assign_adoption(object, adoption(b)),
+      "the same assignment changes nothing"
+    );
+    assert!(
+      !config.adopted(object, c),
+      "another member's report changes nothing"
+    );
+    assert!(config.adopted(object, b));
+    assert!(config.adoptions.is_empty());
+    assert_eq!(config.version, version + 2);
+  }
 
   /// A record authorized under `config`, at `object`/`sequence` and host `epoch`, carrying `value`.
   fn record_under(
@@ -3523,6 +3660,38 @@ mod tests {
     assert!(
       regional.configuration_for(HostId(99)).is_none(),
       "a non-member has no configuration"
+    );
+  }
+
+  /// §4.8 (2026-10-10): a holder's view of whom it holds for agrees with each owner's own view of its neighbourhood.
+  /// Do: for a formed configuration and for one with a change in flight, ask every member pair both ways. Expect
+  /// `holds_for(owner, host)` exactly when `owner`'s configuration `neighbours(host)`, settled cohort included.
+  #[test]
+  fn a_holders_view_agrees_with_each_owners_neighbourhood() {
+    let members: Vec<HostId> = (1..=7).map(HostId).collect();
+    let formed = RegionalConfiguration::formed(
+      members.clone(),
+      Quorum { f: 1 },
+      std::collections::BTreeMap::new(),
+      3,
+      false,
+    );
+    let (in_flight, ..) = change_in_flight();
+    for regional in [&formed, &in_flight] {
+      for &owner in &regional.members {
+        let configuration = regional.configuration_for(owner).unwrap();
+        for &host in &regional.members {
+          assert_eq!(
+            regional.holds_for(owner, host),
+            configuration.neighbours(host),
+            "owner {owner:?}, host {host:?}"
+          );
+        }
+      }
+    }
+    assert!(
+      !formed.holds_for(HostId(99), HostId(1)),
+      "a non-member is held by nobody"
     );
   }
 

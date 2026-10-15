@@ -211,6 +211,26 @@ council can seat fewer voters than its `f` asks, and it tolerates only the losse
 and the same twenty-one `fleet_root_*` lines for the root group across regions. A single daemon shows the same
 lines, degenerate: `f` 0, itself the one member, leading both groups after explicit bootstrap,
 at the floor with no sample.
+Then one `fleet_detector PEER: configured=… suspicions=… (allowance …/1000) condemnations=… (allowance
+…/1000)` line per peer the failure detector holds (JSON: `fleet.detector`): the suspicions and condemnations
+this node's own probes made of that peer, each beside the number the detector's theory expects of a peer
+alive throughout, in thousandths (Chen, Toueg and Aguilera's Theorem 7, summed over every judged probe), and
+whether the pair's own estimator judges it yet. A count far above its allowance is a detector misjudging a live
+peer; a laptop shows none. Each line also says how the pair is judged now:
+- `judged_by`: `own`, `pool`, `provisional` or `measuring`;
+- `expected_ns`, `margin_ns`, `samples` and `mistake`;
+- `pool_misfit`: whether the member's pooled verdict does not fit the pair;
+- `refused`: why the pair's own estimator last refused to configure.
+
+Then `fleet_detector_pool: configured=… samples=… refused=…` (JSON: `fleet.detector_pool`): the member's pooled verdict,
+which judges every pair without its own. A peer shown `measuring` with the pool unconfigured is judged by nothing until it
+has been silent past RFC 6298's timeout (at least 1 s).
+
+Then `fleet_detector_relays: due_ns=… stated=…` (JSON: `fleet.detector_relays`): the relay stage as the detector bounds
+it. Each relay judges its own leg to the target by its own deadline and nacks when that passes unanswered; a stage
+ends once every relay asked has nacked, or when the slowest has its response due: the member's span for it plus the
+bound the relay stated on its acknowledgements. `due_ns` is that due for the slowest relay the member could ask (zero
+while no alive peer has stated a bound), and `stated` counts the peers that have stated one.
 
 Then one block per shard: its counters (`shard N: clients=… volumes=… served=…`), its refusals by
 kind, its health signals (`shard N catalog.volumes: 3 (age 0 ns)` — a signal that is absent prints
@@ -250,7 +270,7 @@ slates advance ATTACHMENT [VERSION] [--json]
 slates read VOLUME PATH [--version N | --attachment A]
 slates mount ID PATH [--read-only] [--subtree DIR]
 slates unmount PATH
-slates export ID [--read-only] [--subtree DIR]
+slates export ID [--read-only] [--subtree DIR] [--uid UID]
 slates land ID TARGET [--snapshot N] [--include P] [--exclude P] [--grant N] [--json]
 slates grants [--json]
 slates grant LANDING MANIFEST [--session] [--term SECONDS] [--json]
@@ -309,7 +329,9 @@ never holds up another.
 `slates export ID` prints `export: /<name>@<attachment>.<token>`, the path a Kubernetes PersistentVolume
 names as its `nfs` path on a fleet node's network export (RPC-with-TLS on the node's base port, served when
 the fleet manifest names an operator authority). The export has its own attachment, ending with `slates detach`
-or the volume's destroy. `--read-only` takes no write lease, and `--subtree DIR` presents only that directory.
+or the volume's destroy. `--read-only` takes no write lease, and `--subtree DIR` presents only that directory. `--uid UID` serves only that
+Unix identity: every other caller, root included, is shown the export's attributes and refused everything else, so a
+Linux client never serves one user what another read through the mount (a symbolic link's target above all; A-115).
 
 The merge flow (§4.16): `green NAME` starts a green from scratch, or from a **complete immutable
 base** with `--base VOLUME --snapshot N` — a snapshot of a volume whose whole tree is in memory

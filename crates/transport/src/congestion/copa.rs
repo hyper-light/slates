@@ -22,6 +22,17 @@
 //! the first decrease, loss ignored in the default mode, persistent congestion collapsing to the minimum
 //! window (mvfst `Copa.cpp` [C]). Windows are Nichols filters as in mvfst, so every structure is bounded.
 //! `δ` is held as the integer `1/δ`, so the law is integer arithmetic throughout.
+//!
+//! One departure from the paper, measured (`docs/wip/BENCHMARKS.md`, "Copa reads independent jitter out of its queue
+//! estimate", 2026-10-07): `d_q` is reduced by the jitter excess `RTTstanding` carries, estimated from each `srtt/2`
+//! epoch's samples ([`Epoch`]), so independent non-congestive jitter of tens of milliseconds is not read as queue
+//! (Arun, Alizadeh & Balakrishnan, "Starvation in End-to-End Congestion Control", SIGCOMM 2022 [A], §6). On a thin
+//! 200 ms link with ±40 ms of independent jitter an 8 MiB pull went from 79–102 s to 24–33 s (median of 8 seeds),
+//! with the 58-scenario grid's share +1.6% and ping p99 −1.9%. The first estimate modelled each sample's jitter as
+//! uniform; a round trip's jitter is the sum of two directions', whose least sample sits about four times further
+//! above the floor, so a second estimate reads that from the gap between an epoch's two least samples, guarded
+//! against a slow link's queue (2026-10-08, "Copa reads summed jitter from its two least samples": the thin link's
+//! reordering pulls 24.3 → 12.6 s and 32.8 → 13.3 s, the 200 ms crossing 20.7 → 9.6 s, the grid flat).
 
 use super::filter::{WindowedMax, WindowedMin};
 use super::{AckEvent, INITIAL_WINDOW_DATAGRAMS, LossEvent, MINIMUM_WINDOW_DATAGRAMS};
@@ -59,6 +70,9 @@ pub struct Copa {
   last_double: Option<u64>,
   min_rtt: Option<WindowedMin>,
   standing_rtt: Option<WindowedMin>,
+  /// The RTT samples of the current `srtt/2` epoch and of the last whole one ([`Epoch`]): the jitter estimate.
+  epoch: Epoch,
+  last_epoch: Option<Epoch>,
   mode_min: Option<WindowedMin>,
   mode_max: Option<WindowedMax>,
   /// The velocity: the window's step multiplier.
@@ -87,6 +101,8 @@ impl Copa {
       last_double: None,
       min_rtt: None,
       standing_rtt: None,
+      epoch: Epoch::default(),
+      last_epoch: None,
       mode_min: None,
       mode_max: None,
       velocity: 1,
@@ -158,7 +174,20 @@ impl Copa {
       None => self.mode_max.insert(WindowedMax::new(now, rtt)).get(),
     };
     self.update_mode(now, srtt, (rtt_min, recent_min, recent_max));
-    let queueing = standing.saturating_sub(rtt_min);
+    if self.epoch.count > 0 && now.saturating_sub(self.epoch.began) > srtt / 2 {
+      self.last_epoch = Some(self.epoch);
+      self.epoch = Epoch::default();
+    }
+    // The sender's own interval per packet, `smss·RTTstanding/cwnd`: a queue's samples are at least this far apart.
+    let packet_interval = u128::from(self.smss)
+      .saturating_mul(u128::from(standing))
+      .checked_div(u128::from(self.cwnd.max(1)))
+      .and_then(|value| u64::try_from(value).ok())
+      .unwrap_or(0);
+    self.epoch.take(now, rtt, packet_interval);
+    let queueing = standing
+      .saturating_sub(rtt_min)
+      .saturating_sub(self.last_epoch.map_or(0, |epoch| epoch.jitter_excess()));
     // Increase when the current rate `cwnd/RTTstanding` is at or below the target `1/(δ·d_q)` (in bytes,
     // `inv_delta·smss/d_q`): `cwnd·d_q ≤ inv_delta·smss·RTTstanding`; an empty queue always increases.
     let increase = queueing == 0
@@ -296,6 +325,132 @@ impl Copa {
   }
 }
 
+/// One `srtt/2` epoch's RTT samples: when it began, how many, the least and the greatest, the first and the last.
+#[derive(Clone, Copy, Debug, Default)]
+struct Epoch {
+  began: u64,
+  count: u64,
+  min: u64,
+  max: u64,
+  first: u64,
+  last: u64,
+  /// The path length: the sum of the absolute differences between successive samples.
+  path: u64,
+  /// The second-least sample (`u64::MAX` until there are two).
+  second: u64,
+  /// The turning points: samples where the direction of change reversed.
+  turns: u64,
+  /// The direction of the last non-zero change (`Some(true)` when rising).
+  rising: Option<bool>,
+  /// The sender's own interval per packet at the epoch's last sample, nanoseconds.
+  packet_interval: u64,
+}
+
+impl Epoch {
+  fn take(&mut self, now: u64, rtt: u64, packet_interval: u64) {
+    if self.count == 0 {
+      *self = Epoch {
+        began: now,
+        count: 1,
+        min: rtt,
+        max: rtt,
+        first: rtt,
+        last: rtt,
+        path: 0,
+        second: u64::MAX,
+        turns: 0,
+        rising: None,
+        packet_interval,
+      };
+      return;
+    }
+    self.packet_interval = packet_interval;
+    if rtt != self.last {
+      let up = rtt > self.last;
+      if self.rising.is_some_and(|was| was != up) {
+        self.turns = self.turns.saturating_add(1);
+      }
+      self.rising = Some(up);
+    }
+    self.count = self.count.saturating_add(1);
+    if rtt < self.min {
+      self.second = self.min;
+      self.min = rtt;
+    } else if rtt < self.second {
+      self.second = rtt;
+    }
+    self.max = self.max.max(rtt);
+    self.path = self.path.saturating_add(self.last.abs_diff(rtt));
+    self.last = rtt;
+  }
+
+  /// The part of `RTTstanding − RTTmin` independent jitter explains (Arun, Alizadeh & Balakrishnan, SIGCOMM 2022,
+  /// §6: a delay-bounding law must not read non-congestive jitter as queue). The larger of two estimates:
+  ///
+  /// - **Uniform jitter.** With jitter of width `W` independent per sample, the least of an epoch's `n` samples
+  ///   sits `W/(n+1)` above the path's floor (order statistics of `n` uniform draws), and successive samples differ
+  ///   by `W/3` on average, so the epoch's path length is about `(n−1)·W/3`. A queue moves the RTT monotonically
+  ///   within half a round trip, so its path length is its net change `|last − first|`: the path length beyond the
+  ///   net change is spread no trend explains, `W ≈ 3·(path − |last − first|)/(n−1)`, and the excess `W/(n+1)`.
+  /// - **Any lower tail, from the two least samples.** A round trip's jitter is the sum of the two directions', so
+  ///   near its floor its density rises from zero instead of starting flat, and the least of `n` samples sits much
+  ///   further above the floor than `W/(n+1)`. For a lower tail `F(x) ∝ x^α` the least sample's expected excess
+  ///   over the floor is `α` times the expected gap to the second least (`E[X₍₁₎] ∝ Γ(1+1/α)`,
+  ///   `E[X₍₂₎] ∝ Γ(2+1/α)`; extreme-value order statistics, as in Hill's tail estimator, Annals of Statistics
+  ///   1975). The sum of two independent jitters has `α = 2`. Two guards keep a queue out of it. The gap first
+  ///   loses the sender's own interval per packet, because a queue's successive samples are spaced by at least a
+  ///   service time and a slow link's queue would otherwise pass for jitter. It then counts in proportion to the
+  ///   epoch's turning points against the `2(n−2)/3` independent samples show (the turning-point test, Brockwell
+  ///   & Davis, *Introduction to Time Series and Forecasting*, §1.6): a filling or draining queue turns rarely.
+  ///
+  /// Two samples cannot tell jitter from a queue and estimate none, so a slow link's few samples (a packet's 150 ms
+  /// at 64 kbit/s) are never read as jitter. Measured (`docs/wip/BENCHMARKS.md`, "Copa reads summed jitter from its
+  /// two least samples", 2026-10-08).
+  fn jitter_excess(&self) -> u64 {
+    let zigzag = self.path.saturating_sub(self.last.abs_diff(self.first));
+    let width = zigzag
+      .saturating_mul(UNIFORM_MEAN_STEP_DIVISOR)
+      .checked_div(self.count.saturating_sub(1).max(1))
+      .unwrap_or(0);
+    let uniform = width.checked_div(self.count.saturating_add(1)).unwrap_or(0);
+    if self.count < TAIL_ESTIMATE_MIN_SAMPLES || self.path == 0 || self.second == u64::MAX {
+      return uniform;
+    }
+    let spacing = self
+      .second
+      .saturating_sub(self.min)
+      .saturating_sub(self.packet_interval);
+    let independent_turns = self
+      .count
+      .saturating_sub(2)
+      .saturating_mul(TURNING_POINTS_NUMERATOR)
+      / TURNING_POINTS_DENOMINATOR;
+    let tail = u128::from(spacing)
+      .saturating_mul(u128::from(SUMMED_JITTER_TAIL_SHAPE))
+      .saturating_mul(u128::from(self.turns.min(independent_turns)))
+      .checked_div(u128::from(independent_turns.max(1)))
+      .unwrap_or(0);
+    uniform.max(u64::try_from(tail).unwrap_or(u64::MAX))
+  }
+}
+
+/// Format: the mean absolute difference of two independent draws uniform over a width `W` is `W/3`; the jitter
+/// estimate multiplies the mean step by this to recover `W`.
+const UNIFORM_MEAN_STEP_DIVISOR: u64 = 3;
+
+/// Format: the lower-tail shape `α` of a round trip's jitter, the sum of two independent one-way jitters. Each
+/// has a density near its floor; their sum's density rises linearly from its floor (`F(x) ∝ x²`), so `α = 2` and
+/// the least sample's excess is twice the gap to the second least ([`Epoch::jitter_excess`]).
+const SUMMED_JITTER_TAIL_SHAPE: u64 = 2;
+/// Format: the turning-point test — `n` independent samples have `2(n−2)/3` turning points in expectation
+/// (Brockwell & Davis, *Introduction to Time Series and Forecasting*, §1.6); this is the 2.
+const TURNING_POINTS_NUMERATOR: u64 = 2;
+/// Format: the fewest samples the tail estimate reads — two least samples and an interior point, the least a
+/// turning point needs (one sample on each side).
+const TAIL_ESTIMATE_MIN_SAMPLES: u64 = 3;
+/// Format: the turning-point test's 3 (see [`TURNING_POINTS_NUMERATOR`]).
+const TURNING_POINTS_DENOMINATOR: u64 = 3;
+
 /// Updates a lazily started windowed minimum and returns it.
 fn update_min(filter: &mut Option<WindowedMin>, now: u64, window: u64, value: u64) -> u64 {
   match filter.as_mut() {
@@ -351,6 +506,105 @@ mod tests {
       law.window(),
       2 * start,
       "one doubling after a round trip past the first"
+    );
+  }
+
+  /// The samples of one epoch, taken in order, by a sender whose own interval per packet is `packet_interval`.
+  fn epoch_paced(samples: &[u64], packet_interval: u64) -> Epoch {
+    let mut epoch = Epoch::default();
+    for (at, rtt) in samples.iter().enumerate() {
+      epoch.take(u64::try_from(at).unwrap(), *rtt, packet_interval);
+    }
+    epoch
+  }
+
+  /// The samples of one epoch, taken in order by a fast sender (no interval per packet to discount).
+  fn epoch_of(samples: &[u64]) -> Epoch {
+    epoch_paced(samples, 0)
+  }
+
+  /// The order statistics of summed jitter: a round trip's jitter is the sum of the two directions', and the least
+  /// of `n` such samples sits about `a·√(π/2n)` above the floor, far more than `W/(n+1)`. Do: draw 400 epochs of 20
+  /// round trips, each a 100 ms floor plus two independent one-way jitters uniform over 0–80 ms (a fixed xorshift,
+  /// so the test is deterministic), and estimate each epoch's excess. Expect: the mean estimate within half to one
+  /// and a half times the mean true excess (the epoch's least sample less the floor), where the uniform model alone
+  /// reads about a quarter of it.
+  #[test]
+  fn summed_jitter_is_estimated_from_the_two_least_samples() {
+    let ms = 1_000_000u64;
+    let mut state = 0x9e37_79b9_7f4a_7c15u64;
+    let mut draw = |width: u64| {
+      state ^= state << 13;
+      state ^= state >> 7;
+      state ^= state << 17;
+      state % width
+    };
+    let (epochs, samples_per_epoch, floor, one_way) = (400u64, 20, 100 * ms, 80 * ms);
+    let (mut estimated, mut actual) = (0u64, 0u64);
+    for _ in 0..epochs {
+      let samples: Vec<u64> = (0..samples_per_epoch)
+        .map(|_| floor + draw(one_way) + draw(one_way))
+        .collect();
+      let least = samples.iter().copied().min().unwrap();
+      actual += least - floor;
+      estimated += epoch_of(&samples).jitter_excess();
+    }
+    let (estimated, actual) = (estimated / epochs, actual / epochs);
+    assert!(
+      estimated * 2 >= actual && estimated * 2 <= actual * 3,
+      "estimated {estimated} ns against a true excess of {actual} ns"
+    );
+  }
+
+  /// A slow link's own queue is not summed jitter: a paced sender at 1 Mbit/s spaces its packets 8 ms apart, and
+  /// its samples climb a staircase that dips between bursts (it turns often). Do: estimate the excess of such an
+  /// epoch with the sender's 8 ms interval. Expect: no more than the uniform model's millisecond, because the gap
+  /// between the two least samples is within one packet interval.
+  #[test]
+  fn a_paced_slow_link_queue_is_not_read_as_summed_jitter() {
+    let ms = 1_000_000u64;
+    let staircase = [100, 108, 104, 112, 108, 116, 112, 120, 116].map(|value| value * ms);
+    let excess = epoch_paced(&staircase, 8 * ms).jitter_excess();
+    assert!(
+      excess <= 2 * ms,
+      "a paced queue read as {excess} ns of jitter"
+    );
+    assert!(
+      epoch_of(&staircase).jitter_excess() > excess,
+      "non-vacuity: without the sender's interval the same samples do read as jitter"
+    );
+  }
+
+  /// Arun, Alizadeh & Balakrishnan (SIGCOMM 2022) §6: jitter is not read as queue, and a queue is not read as
+  /// jitter. Do: estimate the jitter excess of a filling queue (RTT rising monotonically), of two samples, and of
+  /// zigzagging samples spread over 80 ms. Expect: none for the queue and for two samples (a straight line either
+  /// way), and for the zigzag about `W/(n+1)`: within a factor of two of 80 ms over nine samples.
+  #[test]
+  fn the_jitter_estimate_reads_zigzag_and_never_a_monotone_queue() {
+    let ms = 1_000_000;
+    let filling: Vec<u64> = (0..9).map(|step| 200 * ms + step * 5 * ms).collect();
+    assert_eq!(
+      epoch_of(&filling).jitter_excess(),
+      0,
+      "a filling queue is not jitter"
+    );
+    let draining: Vec<u64> = (0..9).rev().map(|step| 200 * ms + step * 5 * ms).collect();
+    assert_eq!(
+      epoch_of(&draining).jitter_excess(),
+      0,
+      "a draining queue is not jitter"
+    );
+    assert_eq!(
+      epoch_of(&[200 * ms, 280 * ms]).jitter_excess(),
+      0,
+      "two samples cannot tell jitter from a queue"
+    );
+    let zigzag = [200, 270, 210, 260, 230, 280, 205, 250, 220].map(|value| value * ms);
+    let excess = epoch_of(&zigzag).jitter_excess();
+    let expected = 80 * ms / 10;
+    assert!(
+      excess >= expected / 2 && excess <= expected * 2,
+      "about W/(n+1) = {expected} ns: {excess} ns"
     );
   }
 

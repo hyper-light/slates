@@ -29,9 +29,12 @@ use super::workloads::manifest_of;
 use super::{Run, SuiteResult, write_file};
 use crate::Failure;
 
-/// Format: the system calls strace traces: every call taking a path (`%file`) plus the
-/// descriptor-based writes the structural test's syscall list names.
-const STRACE_TRACE: &str = "trace=%file,write,pwrite64,writev,pwritev,pwritev2,ftruncate,fchmod,fchown,fsync,fdatasync,fallocate,copy_file_range,sendfile,splice,vmsplice";
+/// Format: the system calls strace traces: every call taking a path (`%file`), the descriptor-based
+/// writes the structural test's syscall list names, and `clone`/`clone3` — not writes, but their returns
+/// name the threads the daemon spawns, so a thread A-130's barrier starts for a landing and joins within
+/// it (`crates/land/src/os.rs`) is attributed to the daemon and not read as a stranger (see
+/// [`slates_conformance::trace::strace_thread_group`]).
+const STRACE_TRACE: &str = "trace=%file,write,pwrite64,writev,pwritev,pwritev2,ftruncate,fchmod,fchown,fsync,fdatasync,fallocate,copy_file_range,sendfile,splice,vmsplice,clone,clone3";
 // `futimens` is glibc's wrapper over `utimensat` (a %file syscall), not a syscall name: strace refused the
 // whole run with `invalid system call 'futimens'` and the daemon never came up under it (the Linux lane,
 // 2026-09-16).
@@ -519,9 +522,11 @@ struct Landed {
   landing: u64,
   from_ns: u64,
   until_ns: u64,
-  /// The ids the daemon's writes are traced under: its threads on Linux (strace `-f` names each event by
-  /// its thread, and the landing runs on a shard thread), its process elsewhere (eslogger names the
-  /// process).
+  /// The seed of the ids the daemon's writes are traced under: its threads on Linux (strace `-f` names
+  /// each event by its thread), read from `/proc/<pid>/task` — its long-lived shard threads. A-130's
+  /// barrier spawns and joins further threads within the landing, gone before this is read;
+  /// [`slates_conformance::trace::strace_thread_group`] grows this seed with them from the trace. The
+  /// process alone elsewhere (eslogger names processes, not threads).
   writers: Vec<u32>,
 }
 
@@ -629,9 +634,11 @@ fn land_under_grant(run: &Run<'_>, session: &Session, target: &Path) -> Result<L
   })
 }
 
-/// The ids `pid`'s events are traced under: on Linux every thread of the process, read from its
-/// `/proc/<pid>/task` while it lives (the daemon's shard threads are made at its start and live to its
-/// end, so the landing's thread is among them); elsewhere the process alone.
+/// The seed of the ids `pid`'s events are traced under: on Linux the threads `/proc/<pid>/task` lists
+/// while the daemon lives — its long-lived shard threads. A-130's barrier spawns and joins further
+/// threads within the landing (`crates/land/src/os.rs`), gone before this reads `/proc`; the caller grows
+/// this seed with them from the trace's clone/clone3 (`strace_thread_group`). Elsewhere (eslogger names
+/// processes, not threads) the process alone.
 fn threads_of(os: HostOs, pid: u32) -> Result<Vec<u32>, Failure> {
   if os != HostOs::Linux {
     return Ok(vec![pid]);
@@ -796,7 +803,15 @@ pub(crate) fn run_hermeticity(run: &Run<'_>) -> Result<SuiteResult, Failure> {
     ),
     _ => (parse_eslogger(&text), Vec::new()),
   };
-  let writers = landed.writers.clone();
+  // strace names every event by its thread, and A-130's barrier runs each file's `fdatasync` on a scoped
+  // thread the daemon spawns and joins within the landing (`crates/land/src/os.rs`), gone before
+  // `threads_of` read `/proc/<pid>/task`. Grow the daemon's seed with the threads the trace's own
+  // `clone`/`clone3` returns name, so a transient barrier thread's write of a staged file is the
+  // landing's and not a stranger's; elsewhere (eslogger names processes, not threads) the seed stands.
+  let writers = match run.os {
+    HostOs::Linux => slates_conformance::trace::strace_thread_group(&text, &landed.writers),
+    _ => landed.writers.clone(),
+  };
   // The tracer's namespace's mounts (Linux): a write's backing filesystem is known by what is mounted at
   // its path, never by its spelling (the dump exclusion writes `/proc/self/coredump_filter`; AUD-29-41).
   let mount_table = match run.os {
@@ -873,8 +888,8 @@ pub(crate) fn run_hermeticity(run: &Run<'_>) -> Result<SuiteResult, Failure> {
     broker_note(&set_aside),
     format!("the granted target: {}", target.display()),
     format!(
-      "the granted landing {:016x}: the daemon's traced ids {:?}, {} ns to {} ns (wall clock); hidden names: {hidden_verdict:?}",
-      landed.landing, landed.writers, landed.from_ns, landed.until_ns
+      "the granted landing {:016x}: the daemon's traced thread ids {:?} (its live threads at the landing, grown by the trace's clone/clone3 with any it spawned for the landing), {} ns to {} ns (wall clock); hidden names: {hidden_verdict:?}",
+      landed.landing, writers, landed.from_ns, landed.until_ns
     ),
     format!(
       "volume quota: {size} bytes, derived from {inode_count} peak workload entries × {page}-byte host page"

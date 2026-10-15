@@ -36,6 +36,12 @@ const ROOT_MODE: u32 = 0o755;
 /// Format: POSIX symlink mode bits are always `rwxrwxrwx`; the bits of a symlink are unused.
 const SYMLINK_MODE: u32 = 0o777;
 
+/// Format: the three POSIX write bits (owner `S_IWUSR`, group `S_IWGRP`, other `S_IWOTH`). A mode that does
+/// not set all three leaves some class unable to write — so a user of that class cannot truncate the file,
+/// and a write delegation held on it could launder that user's forbidden truncate through a holder of a
+/// class that can (the NFSv4 truncate escape; see `chmod`/`chown`).
+const ALL_WRITE_BITS: u32 = 0o222;
+
 /// Format: the most snapshot slots a volume can hold, the slot field of a handle (`u32`).
 const SNAPSHOT_SLOT_CAP: usize = u32::MAX as usize;
 
@@ -118,6 +124,9 @@ pub struct Store {
   /// inode table's size ([`crate::base::digest_capacity`]), so the caches together never exceed
   /// their share of the reserve; at the bound a fresh digest is exported but not kept.
   pub digests: crate::base::DigestBudget,
+  /// Releases of retired objects the store refused (an object already gone, or a free the arena refused): each is an
+  /// object listed twice or one left held, so it is counted and surfaced (`store.release_refused`), never silent.
+  pub release_refusals: u64,
 }
 
 impl std::fmt::Debug for Store {
@@ -195,6 +204,7 @@ impl Store {
       digests: crate::base::DigestBudget::new(
         crate::base::digest_capacity(config.max_inodes).get(),
       ),
+      release_refusals: 0,
     }
   }
 
@@ -206,47 +216,69 @@ impl Store {
   }
 
   /// The bytes an admission could take now (A-98): the arena's held capacity and what it could still claim from its
-  /// pool, less what is committed, the operation headroom and the pressure hold. What a refusal names as available
+  /// pool, less what is committed, the operation headroom and the pressure hold. A growth from the pool takes on the
+  /// pressure debt as well (§4.2), so what the pool could add counts less the debt. What a refusal names as available
   /// and a dynamic volume's `statfs` counts on; a snapshot, since another shard may claim the pool's extents first.
   pub fn admittable(&self) -> u64 {
     let claimable = u64::try_from(self.content.arena().claimable()).unwrap_or(u64::MAX);
     self
       .budget
       .capacity()
-      .saturating_add(claimable)
+      .saturating_add(claimable.saturating_sub(self.budget.debt()))
       .saturating_sub(self.budget.committed())
       .saturating_sub(self.budget.headroom())
       .saturating_sub(self.budget.hold())
   }
 
   /// Reserves `bytes` for a bounded volume against the shard budget, growing the arena from its pool first when the
-  /// budget lacks the capacity (A-98).
+  /// budget lacks the capacity (A-98). A refusal names what an admission could take now, the pool's free extents
+  /// included ([`Store::admittable`]): the arena claims nothing for a commitment the pool cannot cover, so the budget
+  /// alone would name only what the shard already holds.
   pub fn reserve(
     &mut self,
     bytes: u64,
   ) -> Result<slates_mem::budget::Reservation, slates_mem::MemError> {
     self.make_room(bytes);
-    self.budget.reserve(bytes)
+    self
+      .budget
+      .reserve(bytes)
+      .map_err(|e| self.with_admittable(e))
   }
 
   /// Grows a dynamic charge by `bytes` against the shard budget, growing the arena from its pool first when the
-  /// budget lacks the capacity (A-98).
+  /// budget lacks the capacity (A-98); a refusal names [`Store::admittable`], as [`Store::reserve`]'s does.
   pub fn grow(
     &mut self,
     bytes: u64,
   ) -> Result<slates_mem::budget::Reservation, slates_mem::MemError> {
     self.make_room(bytes);
-    self.budget.grow(bytes)
+    self.budget.grow(bytes).map_err(|e| self.with_admittable(e))
   }
 
-  /// Returns the arena's wholly free extents to its pool, keeping the capacity every commitment and the operation
-  /// headroom need (A-98): the bytes returned. Run after a committed publication, when no deferred free holds an
-  /// extent the committed image might still name.
+  /// A budget refusal with its `available` taken from [`Store::admittable`]; any other refusal as it is.
+  fn with_admittable(&self, refusal: slates_mem::MemError) -> slates_mem::MemError {
+    match refusal {
+      slates_mem::MemError::BudgetExceeded { requested, .. } => {
+        slates_mem::MemError::BudgetExceeded {
+          requested,
+          available: self.admittable(),
+        }
+      }
+      other => other,
+    }
+  }
+
+  /// Returns the arena's wholly free extents to its pool, keeping the capacity every commitment, the operation
+  /// headroom and the pressure hold need (A-98): the bytes returned. Run after a committed publication, when no
+  /// deferred free holds an extent the committed image might still name. The hold is kept because it is free room the
+  /// daemon's sampler took from this shard (§4.2): returned to the pool, it would be claimable by any shard until the
+  /// next refresh withheld it again.
   pub fn release_idle(&mut self) -> u64 {
     let keep = self
       .budget
       .committed()
-      .saturating_add(self.budget.headroom());
+      .saturating_add(self.budget.headroom())
+      .saturating_add(self.budget.hold());
     let returned = self
       .content
       .arena_mut()
@@ -1311,7 +1343,7 @@ impl Volume {
   /// The target of a symlink.
   pub fn readlink(&self, store: &Store, no: InodeNo) -> Result<Box<str>, VfsError> {
     match &self.inode(store, no)?.body {
-      Body::Symlink(target) => Ok(target.clone()),
+      Body::Symlink(target) | Body::BaseLink(target) => Ok(target.clone()),
       _ => Err(VfsError::Invalid),
     }
   }
@@ -1355,15 +1387,16 @@ impl Volume {
     .unwrap_or(0);
     let out = buf.get_mut(..want).unwrap_or_default();
     out.fill(0);
+    let read_end = off.saturating_add(u64::try_from(want).unwrap_or(u64::MAX));
     match &inode.body {
       Body::Inline(bytes) => copy_range(bytes, 0, off, out),
       Body::Sealed(extents) => {
-        for e in extents {
+        for e in overlapping(extents, off, read_end) {
           store.content.read_extent_into(e, off, out)?;
         }
       }
       Body::Open { open, sealed } => {
-        for e in sealed {
+        for e in overlapping(sealed, off, read_end) {
           store.content.read_extent_into(e, off, out)?;
         }
         copy_range(store.content.open_bytes(open), open.off, off, out);
@@ -1381,11 +1414,11 @@ impl Volume {
         if unpinned {
           return Err(VfsError::BaseUnavailable(0));
         }
-        for e in &b.pinned {
+        for e in overlapping(&b.pinned, off, read_end) {
           store.content.read_extent_into(e, off, out)?;
         }
       }
-      Body::None | Body::Directory(_) | Body::Symlink(_) => {}
+      Body::None | Body::Directory(_) | Body::Symlink(_) | Body::BaseLink(_) => {}
     }
     Ok(want)
   }
@@ -1518,8 +1551,7 @@ impl Volume {
     };
     // Publication: the name is the one step a client sees.
     if let Err(refusal) = self.dir_insert(store, dir, name, child) {
-      self.uninstall(store, no, handle);
-      return Err(refusal);
+      return Err(refusal.after_undo(self.uninstall(store, no, handle)));
     }
     self.touch_dir(store, dir, now)?;
     let path = self.path_of(store, dir, name);
@@ -1529,7 +1561,7 @@ impl Volume {
       } else {
         Op::Create
       },
-      &path,
+      path,
       Some(no),
       0,
     );
@@ -1575,19 +1607,18 @@ impl Volume {
     let handle = match self.install(store, no, inode) {
       Ok(handle) => handle,
       Err(refusal) => {
-        let _ = store.dirs.remove(child);
-        return Err(refusal);
+        return Err(refusal.after_undo(store.dirs.remove(child)));
       }
     };
     if let Err(refusal) = self.dir_insert(store, dir, name, Child::Dir(child)) {
-      self.uninstall(store, no, handle);
-      let _ = store.dirs.remove(child);
-      return Err(refusal);
+      let inode = self.uninstall(store, no, handle);
+      let node = store.dirs.remove(child).map(|_| ()).map_err(VfsError::from);
+      return Err(refusal.after_undo(inode.and(node)));
     }
     self.touch_dir(store, dir, now)?;
     self.adjust_nlink(store, store.dirs.get(dir)?.inode, 1)?;
     let path = self.path_of(store, dir, name);
-    self.record(Op::Mkdir, &path, Some(no), 0);
+    self.record(Op::Mkdir, path, Some(no), 0);
     Ok(child)
   }
 
@@ -1625,12 +1656,11 @@ impl Volume {
     stamp_all(&mut inode.attrs, now);
     let handle = self.install(store, no, inode)?;
     if let Err(refusal) = self.dir_insert(store, dir, name, Child::Symlink(no)) {
-      self.uninstall(store, no, handle);
-      return Err(refusal);
+      return Err(refusal.after_undo(self.uninstall(store, no, handle)));
     }
     self.touch_dir(store, dir, now)?;
     let path = self.path_of(store, dir, name);
-    self.record(Op::Symlink, &path, Some(no), 0);
+    self.record(Op::Symlink, path, Some(no), 0);
     Ok(no)
   }
 
@@ -1698,7 +1728,7 @@ impl Volume {
     self.touch_dir(store, dir, now)?;
     let path = self.path_of(store, dir, name);
     let prev = self.inode(store, target)?.version;
-    self.record(Op::Link, &path, Some(target), prev);
+    self.record(Op::Link, path, Some(target), prev);
     // An orphan named again (an `O_TMPFILE` given a name by `linkat`) is in the namespace once more: it leaves the
     // orphan record, and the retention its unlink secured for a reclaim that will not happen now goes back (§4.2).
     if let Some(secured) = self.orphans.remove(&target) {
@@ -1746,7 +1776,7 @@ impl Volume {
     self.dir_remove(store, dir, name)?;
     self.drop_link(store, located.inode)?;
     self.touch_dir(store, dir, now)?;
-    self.record(Op::Unlink, &path, Some(located.inode), 0);
+    self.record(Op::Unlink, path.as_str(), Some(located.inode), 0);
     self.record_whiteout(store, dir, name, &path)?;
     Ok(())
   }
@@ -1778,7 +1808,7 @@ impl Volume {
     self.drop_link(store, located.inode)?;
     self.adjust_nlink(store, store.dirs.get(dir)?.inode, -1)?;
     self.touch_dir(store, dir, now)?;
-    self.record(Op::Rmdir, &path, Some(located.inode), 0);
+    self.record(Op::Rmdir, path.as_str(), Some(located.inode), 0);
     self.record_whiteout(store, dir, name, &path)?;
     Ok(())
   }
@@ -2027,7 +2057,7 @@ impl Volume {
       Op::Rename {
         from: from_path.into(),
       },
-      &to_path,
+      to_path,
       Some(source.inode),
       0,
     );
@@ -2124,6 +2154,23 @@ impl Volume {
   /// The write proper, under a secured retention: the quota admits the charge, the inode is made
   /// current, the bytes apply, the record lands.
   fn write_secured(
+    &mut self,
+    store: &mut Store,
+    no: InodeNo,
+    off: u64,
+    charge: u64,
+    bytes: &[u8],
+    recorded: Recorded,
+  ) -> Result<usize, VfsError> {
+    // The write's own marks of its inode leave it patchable (A-126); the mark ends on every outcome.
+    self.dirty.set_writing(Some(no.0));
+    let written = self.write_marked(store, no, off, charge, bytes, recorded);
+    self.dirty.set_writing(None);
+    written
+  }
+
+  /// [`Volume::write_secured`] while its write is marked.
+  fn write_marked(
     &mut self,
     store: &mut Store,
     no: InodeNo,
@@ -2353,6 +2400,12 @@ impl Volume {
     inode.attrs.mode = mode;
     inode.stamp_change(now);
     self.record(Op::Setattr, "", Some(no), prev);
+    // A mode where some class cannot write lets a write delegation launder that class's forbidden truncate:
+    // recall the file's write delegations so the next truncate is re-checked as the acting user, not the
+    // holder (the NFSv4 escape; RFC 8881 §10.4.4 recall-on-need).
+    if mode & ALL_WRITE_BITS != ALL_WRITE_BITS {
+      store.recall_gate.recall_on_write_restricted(no.0);
+    }
     Ok(())
   }
 
@@ -2375,7 +2428,13 @@ impl Volume {
     inode.attrs.uid = uid;
     inode.attrs.gid = gid;
     inode.stamp_change(now);
+    let write_restricted = inode.attrs.mode & ALL_WRITE_BITS != ALL_WRITE_BITS;
     self.record(Op::Setattr, "", Some(no), prev);
+    // A chown re-sorts the file's users across the mode's classes; if some class cannot write, a still-held write
+    // delegation could launder a truncate for a user that class forbids, so recall them (as `chmod` does).
+    if write_restricted {
+      store.recall_gate.recall_on_write_restricted(no.0);
+    }
     Ok(())
   }
 
@@ -2537,15 +2596,16 @@ impl Volume {
     .unwrap_or(0);
     let out = buf.get_mut(..want).unwrap_or_default();
     out.fill(0);
+    let read_end = off.saturating_add(u64::try_from(want).unwrap_or(u64::MAX));
     match &inode.body {
       Body::Inline(bytes) => copy_range(bytes, 0, off, out),
       Body::Sealed(extents) => {
-        for e in extents {
+        for e in overlapping(extents, off, read_end) {
           store.content.read_extent_into(e, off, out)?;
         }
       }
       Body::Open { open, sealed } => {
-        for e in sealed {
+        for e in overlapping(sealed, off, read_end) {
           store.content.read_extent_into(e, off, out)?;
         }
         copy_range(store.content.open_bytes(open), open.off, off, out);
@@ -2565,11 +2625,11 @@ impl Volume {
         if unpinned {
           return Err(VfsError::BaseUnavailable(0));
         }
-        for e in &b.pinned {
+        for e in overlapping(&b.pinned, off, read_end) {
           store.content.read_extent_into(e, off, out)?;
         }
       }
-      Body::None | Body::Directory(_) | Body::Symlink(_) => {}
+      Body::None | Body::Directory(_) | Body::Symlink(_) | Body::BaseLink(_) => {}
     }
     Ok(want)
   }
@@ -2582,7 +2642,7 @@ impl Volume {
     no: InodeNo,
   ) -> Result<Box<str>, VfsError> {
     match &self.inode_in(store, id, no)?.body {
-      Body::Symlink(target) => Ok(target.clone()),
+      Body::Symlink(target) | Body::BaseLink(target) => Ok(target.clone()),
       _ => Err(VfsError::Invalid),
     }
   }
@@ -3335,12 +3395,36 @@ impl Volume {
 
   /// The path of `name` under `dir`, for the journal.
   pub fn path_of(&self, store: &Store, dir: Handle<DirNode>, name: &str) -> String {
-    let mut parts: Vec<Box<str>> = vec![name.into()];
+    // Two walks up the parent chain and one allocation of exactly the path's length, filled from its end: the path a
+    // create journals cost seven allocations and two reallocations built as boxed parts joined (2026-10-06,
+    // `create_heap`). The walk is the one the parts were collected by, so the path is the same.
+    let mut len = name.len().saturating_add(1);
+    self.walk_up(store, dir, |segment| {
+      len = len.saturating_add(segment.len()).saturating_add(1);
+    });
+    let mut bytes = vec![b'/'; len];
+    let mut end = len;
+    let mut place = |segment: &str| {
+      let start = end.saturating_sub(segment.len());
+      if let Some(slot) = bytes.get_mut(start..end) {
+        slot.copy_from_slice(segment.as_bytes());
+      }
+      // The separator before it stays the `/` the buffer was filled with.
+      end = start.saturating_sub(1);
+    };
+    place(name);
+    self.walk_up(store, dir, place);
+    String::from_utf8(bytes).unwrap_or_default()
+  }
+
+  /// Calls `visit` with each directory's own name from `dir` up to (not including) the root, through the head's
+  /// current directories, bounded at `u16::MAX` steps as a cycle guard.
+  fn walk_up(&self, store: &Store, dir: Handle<DirNode>, mut visit: impl FnMut(&str)) {
     let mut current = dir;
     let mut guard = 0usize;
     while let Ok(node) = store.dirs.get(current) {
       let Some(parent_no) = node.parent else { break };
-      parts.push(node.name.clone());
+      visit(&node.name);
       let Ok(parent) = self.current_dir(store, parent_no) else {
         break;
       };
@@ -3350,8 +3434,6 @@ impl Volume {
         break;
       }
     }
-    parts.reverse();
-    format!("/{}", parts.join("/"))
   }
 
   // ------------------------------------------------------------------ internals
@@ -3419,6 +3501,9 @@ impl Volume {
   /// Counts what making directory `no` and its ancestors current would take. A current directory's
   /// ancestors are current (a copy-up makes the ancestors current first), so the walk stops at the
   /// first current one, or at one already counted (`counted`, shared by a verb's several directories).
+  /// Only a directory counted is recorded: a current one stops every walk that reaches it, so the
+  /// common create in a current directory records nothing and allocates nothing (2026-10-06,
+  /// `create_heap`).
   fn need_current_dir(
     &self,
     store: &Store,
@@ -3431,11 +3516,11 @@ impl Volume {
       if counted.contains(&no) {
         break;
       }
-      counted.push(no);
       let node = store.dirs.get(self.current_dir(store, no)?)?;
       if node.born == self.epoch {
         break;
       }
+      counted.push(no);
       needs.dirs = needs.dirs.saturating_add(1);
       self.need_current_inode(store, no, needs)?;
       if let Some(parent_no) = node.parent {
@@ -3574,10 +3659,22 @@ impl Volume {
   /// Undoes an inode a verb installed and never published (AUD-29-40): its table entry, its version
   /// and its charge, so the refused verb leaves the table, the slab and the allowance as they were.
   /// The number is not reissued.
-  fn uninstall(&mut self, store: &mut Store, no: InodeNo, handle: Handle<Inode>) {
-    let _ = self.table_remove(store, no);
-    let _ = store.inodes.remove(handle);
+  /// Both steps are taken whatever the first answers; the first refusal is returned (the caller's
+  /// [`VfsError::after_undo`]).
+  fn uninstall(
+    &mut self,
+    store: &mut Store,
+    no: InodeNo,
+    handle: Handle<Inode>,
+  ) -> Result<(), VfsError> {
+    let table = self.table_remove(store, no).map(|_| ());
+    let slab = store
+      .inodes
+      .remove(handle)
+      .map(|_| ())
+      .map_err(VfsError::from);
     self.unissue_no();
+    table.and(slab)
   }
 
   /// Installs a fresh inode under a number [`Volume::next_no`] issued: its version in the slab and its
@@ -3596,9 +3693,9 @@ impl Volume {
       }
     };
     if let Err(refusal) = self.table_set(store, no, handle) {
-      let _ = store.inodes.remove(handle);
+      let undo = store.inodes.remove(handle);
       self.unissue_no();
-      return Err(refusal);
+      return Err(refusal.after_undo(undo));
     }
     Ok(handle)
   }
@@ -3664,7 +3761,7 @@ impl Volume {
         Dead::Chunk(handle, born) if self.owns(*born) => store.content.chunk(*handle),
         _ => None,
       })
-      .map(|chunk| u64::try_from(chunk.block.len()).unwrap_or(u64::MAX))
+      .map(|chunk| u64::try_from(store.content.stored_bytes(chunk)).unwrap_or(u64::MAX))
       .fold(0u64, u64::saturating_add)
   }
 
@@ -3704,23 +3801,29 @@ impl Volume {
     &self,
     store: &Store,
     no: InodeNo,
-    touched: impl Fn(u64, u64) -> bool,
+    (start, end): (u64, u64),
+    touched: impl Fn(u64, u64, u64) -> bool,
   ) -> Result<u64, VfsError> {
     let inode = self.inode(store, no)?;
     let block_len = |len: usize| u64::try_from(len).unwrap_or(u64::MAX);
-    let mut retained = body_extents(&inode.body)
+    // Only the pieces overlapping `[start, end)` can be touched, found by binary search: walking every extent of the
+    // file cost each write O(file windows) (4.5% of a daemon's large-write profile, 2026-10-08).
+    // `touched` is told each piece's offset, length and the arena bytes it holds (a chunk's stored bytes; for the
+    // open extent its whole block, the most its seal can leave, A-118), so a rebuild decision is the one
+    // `rebuilt_if_smaller` will make.
+    let mut retained = overlapping(body_extents(&inode.body), start, end)
       .iter()
-      .filter(|e| touched(e.off, e.len))
       .filter_map(|e| match e.src {
-        ExtentSrc::Chunk { chunk, .. } => store.content.chunk(chunk),
+        ExtentSrc::Chunk { chunk, .. } => store.content.chunk(chunk).map(|c| (e, c)),
         ExtentSrc::Zero => None,
       })
-      .filter(|chunk| self.retains(chunk.born))
-      .map(|chunk| block_len(chunk.block.len()))
+      .filter(|(e, chunk)| touched(e.off, e.len, block_len(store.content.stored_bytes(chunk))))
+      .filter(|(_, chunk)| self.retains(chunk.born))
+      .map(|(_, chunk)| block_len(store.content.stored_bytes(chunk)))
       .fold(0u64, u64::saturating_add);
     if let Body::Open { open, .. } = &inode.body
       && open.len > 0
-      && touched(open.off, open.len)
+      && touched(open.off, open.len, block_len(open.block.len()))
       && self.retains(open.born)
     {
       retained = retained.saturating_add(block_len(open.block.len()));
@@ -3746,7 +3849,11 @@ impl Volume {
       window_of(off, chunk),
       window_of(end.saturating_sub(1), chunk),
     );
-    self.retention_of_pieces(store, no, |piece, _| {
+    let range = (
+      first.saturating_mul(chunk),
+      last.saturating_add(1).saturating_mul(chunk),
+    );
+    self.retention_of_pieces(store, no, range, |piece, _, _| {
       let window = window_of(piece, chunk);
       window >= first && window <= last
     })
@@ -3759,13 +3866,11 @@ impl Volume {
     if len >= self.inode(store, no)?.attrs.size {
       return Ok(0);
     }
-    let page = u64::try_from(store.content.granule()).unwrap_or(1);
-    let chunk = u64::try_from(store.content.chunk_bytes()).unwrap_or(u64::MAX);
-    self.retention_of_pieces(store, no, |piece, piece_len| {
+    let locked = self.locked;
+    self.retention_of_pieces(store, no, (len, u64::MAX), |piece, piece_len, stored| {
       piece >= len
         || (piece.saturating_add(piece_len) > len
-          && charged_window(len.saturating_sub(piece), page, chunk)
-            < charged_window(piece_len, page, chunk))
+          && rebuilt_size(store, len.saturating_sub(piece), locked) < stored)
     })
   }
 
@@ -3782,21 +3887,25 @@ impl Volume {
     let chunk = u64::try_from(store.content.chunk_bytes())
       .unwrap_or(u64::MAX)
       .max(1);
-    let page = u64::try_from(store.content.granule()).unwrap_or(1);
     let window_start = window_start_of(at, chunk);
-    self.retention_of_pieces(store, no, |piece, piece_len| {
-      piece >= at
-        || (piece == window_start
-          && (writes
-            || (piece.saturating_add(piece_len) > at
-              && charged_window(at.saturating_sub(piece), page, chunk)
-                < charged_window(piece_len, page, chunk))))
-    })
+    let locked = self.locked;
+    self.retention_of_pieces(
+      store,
+      no,
+      (window_start, u64::MAX),
+      |piece, piece_len, stored| {
+        piece >= at
+          || (piece == window_start
+            && (writes
+              || (piece.saturating_add(piece_len) > at
+                && rebuilt_size(store, at.saturating_sub(piece), locked) < stored)))
+      },
+    )
   }
 
   /// The retention the whole content of `no` causes when the head lets go of it.
   fn retention_of_content(&self, store: &Store, no: InodeNo) -> Result<u64, VfsError> {
-    self.retention_of_pieces(store, no, |_, _| true)
+    self.retention_of_pieces(store, no, (0, u64::MAX), |_, _, _| true)
   }
 
   /// The retention dropping one link of `no` causes: its whole content, when this is the last name
@@ -3844,10 +3953,9 @@ impl Volume {
       if let Dead::Chunk(handle, born) = item
         && self.retains(born)
       {
-        let len = store
-          .content
-          .chunk(handle)
-          .map_or(0, |c| u64::try_from(c.block.len()).unwrap_or(u64::MAX));
+        let len = store.content.chunk(handle).map_or(0, |c| {
+          u64::try_from(store.content.stored_bytes(c)).unwrap_or(u64::MAX)
+        });
         let covered = len.min(self.retention_prepaid);
         self.retention_prepaid = self.retention_prepaid.saturating_sub(covered);
         let mut charged = covered;
@@ -4030,6 +4138,33 @@ impl Volume {
     Ok(previous)
   }
 
+  /// [`Self::table_set`] through a [`trie::LeafCursor`], for a run that sets numbers in increasing order (a rebuild's
+  /// placing loop).
+  pub(crate) fn table_set_in_order(
+    &mut self,
+    store: &mut Store,
+    no: InodeNo,
+    handle: Handle<Inode>,
+    cursor: &mut trie::LeafCursor,
+  ) -> Result<Option<Handle<Inode>>, VfsError> {
+    let mut scratch = Deadlist::default();
+    let (root, previous) = trie::set_in_order(
+      &mut store.tries,
+      self.inode_root,
+      no,
+      handle,
+      self.epoch,
+      &mut scratch,
+      cursor,
+    )?;
+    self.inode_root = root;
+    self.dirty.inode(no.0);
+    for d in scratch.take() {
+      self.retire(store, d)?;
+    }
+    Ok(previous)
+  }
+
   pub(crate) fn table_remove(
     &mut self,
     store: &mut Store,
@@ -4049,6 +4184,19 @@ impl Volume {
       self.retire(store, d)?;
     }
     Ok(removed)
+  }
+
+  /// Records a shared→private divergence when the copy-up about to run retires a version a clone's origin snapshot or
+  /// this volume's own snapshot holds (A-134): a clone's origin inode (`!self.owns(born)` — born at or before the
+  /// origin epoch) leaves `origin_shared` for the clone's own inodes, and an own-snapshot-pinned inode
+  /// (`self.retains(born)`) moves its old version into the snapshot's private image. Neither move is something a delta
+  /// carries (recovery refuses an inode in both `inodes` and `origin_shared`, and a snapshot's private inode lives in
+  /// `self.snapshots`, which `apply` leaves untouched), so the publication that follows must be the whole image. This
+  /// is called from `make_current_inode`, the chokepoint every inode mutation — write, nlink change, delete — passes.
+  fn note_shared_divergence(&mut self, born: Epoch) {
+    if !self.owns(born) || self.retains(born) {
+      self.dirty.mark_shared_diverged();
+    }
   }
 
   /// The current-epoch version of an inode, copying an older version and re-pointing the table.
@@ -4073,6 +4221,7 @@ impl Volume {
     if born == self.epoch {
       return Ok(handle);
     }
+    self.note_shared_divergence(born);
     // This copy-up retires the old version; if a snapshot pins it (its birth is at or before the last
     // snapshot's epoch — the same rule `retire` uses to keep it), it is retained on that snapshot's
     // deadlist. Charge it against the retention allowance (§4.2): refuse before the copy-up if the
@@ -4112,6 +4261,8 @@ impl Volume {
     // An open extent born earlier is sealed first: the snapshot keeps the sealed bytes and the
     // head continues in a fresh extent on its next write.
     if let Body::Open { open, sealed } = copy.body {
+      // A seal trims the block to its length (A-118), so the charge follows what the arena now holds.
+      let before = content_by_epoch(store, handle);
       let mut extents = sealed;
       if let Some(e) = store.content.seal(*open, self.seal_key)? {
         insert_extent(&mut extents, e);
@@ -4120,6 +4271,7 @@ impl Volume {
       if let Ok(old) = store.inodes.get_mut(handle) {
         old.body = copy.body.clone();
       }
+      self.reconcile(before, content_by_epoch(store, handle));
     }
     // The head's copy of inline content is born now; the old record keeps the snapshot's. Moved only
     // once the copy is installed.
@@ -4130,10 +4282,7 @@ impl Volume {
     let installed = match store.inodes.insert(copy) {
       Ok(fresh) => match self.table_set(store, no, fresh) {
         Ok(_) => Ok(fresh),
-        Err(refusal) => {
-          let _ = store.inodes.remove(fresh);
-          Err(refusal)
-        }
+        Err(refusal) => Err(refusal.after_undo(store.inodes.remove(fresh))),
       },
       Err(refusal) => Err(refusal.into()),
     };
@@ -4211,8 +4360,7 @@ impl Volume {
           Child::Dir(fresh),
         );
         if let Err(refusal) = set {
-          let _ = store.dirs.remove(fresh);
-          return Err(refusal);
+          return Err(refusal.after_undo(store.dirs.remove(fresh)));
         }
         self.retire_blocks(store, retired)?;
       }
@@ -4484,12 +4632,12 @@ impl Volume {
       None => Some(self.dir_place(store, to_dir, to_name, moved)?),
     };
     if let Err(refusal) = self.dir_remove(store, from_dir, from_name) {
-      let _ = match (replaced, over_whiteout) {
+      let undo = match (replaced, over_whiteout) {
         (Some(t), _) => self.dir_set(store, to_dir, to_name, t.child),
         (None, Some(over_whiteout)) => self.dir_unplace(store, to_dir, to_name, over_whiteout),
         (None, None) => Ok(()),
       };
-      return Err(refusal);
+      return Err(refusal.after_undo(undo));
     }
     Ok(())
   }
@@ -4648,7 +4796,7 @@ impl Volume {
         table
           .iter()
           .map(|(_, attribute)| attribute)
-          .chain(table.sidecar)
+          .chain(table.sidecar())
           .collect()
       })
       .unwrap_or_default();
@@ -4665,9 +4813,13 @@ impl Volume {
     // The number leaves the head: return its credit to the inode allowance (§4.2). The single
     // permanent-free site, matching `next_no`'s single charge.
     self.live_inodes = self.live_inodes.saturating_sub(1);
-    // The base plane's descriptor, if one was held, is closed by the owner of the host at its
-    // next `process_hints`; the tables forget the inode now.
-    let _ = self.base_forget(store, no);
+    // The base plane's descriptor, if one was held, is closed when the next overlay borrow ends (the volume holds no
+    // host here); the tables forget the inode now.
+    if let Some(file) = self.base_forget(store, no)
+      && let Some(plane) = self.base.as_mut()
+    {
+      plane.queue_close(file);
+    }
     Ok(())
   }
 
@@ -5120,7 +5272,17 @@ impl Volume {
     off: u64,
     bytes: &[u8],
   ) -> Result<usize, VfsError> {
-    let before = content_by_epoch(store, handle);
+    let touched = touched_windows(
+      &store.inodes.get(handle)?.body,
+      off,
+      bytes.len(),
+      u64::try_from(store.content.chunk_bytes()).unwrap_or(u64::MAX),
+    );
+    let before = content_by_epoch_within(store, handle, touched);
+    // What a publication may patch (A-126): the windows this write can change, or, for a body that is not chunked,
+    // nothing (the inode is imaged whole).
+    let written_no = store.inodes.get(handle)?.no.0;
+    self.dirty.written(written_no, touched);
     let body = std::mem::replace(&mut store.inodes.get_mut(handle)?.body, Body::None);
     let landed = self.write_body(store, body, off, bytes);
     let inode = store.inodes.get_mut(handle)?;
@@ -5130,7 +5292,7 @@ impl Volume {
       self.written.insert(inode.no, self.sweep_tick);
       self.idle_pending.remove(&inode.no);
     }
-    self.reconcile(before, content_by_epoch(store, handle));
+    self.reconcile(before, content_by_epoch_within(store, handle, touched));
     match landed.refused {
       Some(refusal) if landed.written == 0 => Err(refusal),
       _ => Ok(landed.written),
@@ -5205,8 +5367,8 @@ impl Volume {
           Err(refusal) => return refused(Body::Inline(v), refusal),
         };
         if let Err(refusal) = store.content.write_open(&mut open, 0, &v) {
-          let _ = store.content.release_open(open);
-          return refused(Body::Inline(v), refusal);
+          let undo = store.content.release_open(open);
+          return refused(Body::Inline(v), refusal.after_undo(undo));
         }
         let mut sealed = Vec::new();
         self.write_into(store, Box::new(open), &mut sealed, off, bytes)
@@ -5280,7 +5442,7 @@ impl Volume {
   }
 
   /// Moves the histogram from one by-epoch view of an inode's content to the next.
-  pub(crate) fn reconcile(&mut self, before: Vec<(Epoch, u64)>, after: Vec<(Epoch, u64)>) {
+  pub(crate) fn reconcile(&mut self, before: EpochContent, after: EpochContent) {
     for (epoch, len) in before {
       self.bytes.sub(epoch, len);
     }
@@ -5292,8 +5454,9 @@ impl Volume {
   /// Writes into an open extent, sealing and reopening as the write crosses chunk boundaries
   /// or leaves the open extent's range.
   /// Opens the chunk window holding `cursor` for writing: the window's sealed extent, if it
-  /// has one, is reopened (copied, its chunk retired by the epoch rule), else a fresh extent
-  /// starts at the window's start. Every extent thus begins at a window boundary and a window
+  /// has one, is reopened (copied, its chunk retired by the epoch rule) unless the write of `want`
+  /// bytes from `cursor` covers it whole, when the window opens fresh and the chunk is retired
+  /// unread; else a fresh extent starts at the window's start. Every extent thus begins at a window boundary and a window
   /// has at most one extent, which is what the chunk rule of §4.5 charges.
   pub(crate) fn open_window(
     &mut self,
@@ -5305,11 +5468,20 @@ impl Volume {
     let chunk = u64::try_from(store.content.chunk_bytes()).unwrap_or(u64::MAX);
     let epoch = self.epoch;
     let window_start = window_start_of(cursor, chunk);
-    let Some(pos) = sealed.iter().position(|e| e.off == window_start) else {
+    // The sealed extents are ascending by offset: the window's is found by binary search, not a walk of the file.
+    let Some(pos) = sealed.binary_search_by_key(&window_start, |e| e.off).ok() else {
       return store.content.open(window_start, want, epoch, self.locked);
     };
     let e = sealed.remove(pos);
-    let open = match store.content.reopen(&e, epoch, self.locked) {
+    // A write from the window's start at least as long as the sealed extent overwrites every byte of it: the
+    // window opens fresh, and the old bytes are never read (`ChunkStore::replace`).
+    let covers = cursor == window_start && u64::try_from(want).is_ok_and(|want| want >= e.len);
+    let opened = if covers {
+      store.content.replace(&e, want, epoch, self.locked)
+    } else {
+      store.content.reopen(&e, epoch, self.locked)
+    };
+    let open = match opened {
       Ok(open) => open,
       Err(refusal) => {
         // Refused before anything changed: the window keeps its sealed extent.
@@ -5391,67 +5563,74 @@ impl Volume {
     if len >= old_size {
       return Ok(());
     }
+    // Guard, then apply (the shape of `slates-db`'s partition): every chunk the cut releases or clips must resolve
+    // before the body is touched, so the one refusal a release meets in a consistent store (a stale chunk) refuses the
+    // truncate with the file unchanged, as a failed `ftruncate(2)` leaves it.
+    truncated_chunks(&store.inodes.get(handle)?.body, len)
+      .try_for_each(|chunk| store.content.check_chunk(chunk))?;
     let last = self.last_snapshot_epoch();
     let epoch = self.epoch;
     let before = content_by_epoch(store, handle);
     let body = std::mem::replace(&mut store.inodes.get_mut(handle)?.body, Body::None);
     let mut dead = Deadlist::default();
-    let new_body = match body {
+    // A refusal past the guard (the arena or the tag store refusing a free: the store is inconsistent) still leaves a
+    // whole body: whatever was not yet released stays, and the body always goes back before the refusal is returned.
+    let (new_body, refused) = self.cut_body(store, body, len, (last, epoch), &mut dead);
+    self.retain_dead_list(store, dead);
+    store.inodes.get_mut(handle)?.body = new_body;
+    self.reconcile(before, content_by_epoch(store, handle));
+    refused.map_or(Ok(()), Err)
+  }
+
+  /// [`Volume::apply_truncate`]'s cut of `body` to `len`: the body it leaves, whole whatever happened, and the refusal
+  /// that stopped it short, if one did.
+  fn cut_body(
+    &mut self,
+    store: &mut Store,
+    body: Body,
+    len: u64,
+    (last, epoch): (Option<Epoch>, Epoch),
+    dead: &mut Deadlist,
+  ) -> (Body, Option<VfsError>) {
+    let key = self.seal_key;
+    match body {
       Body::Inline(mut v) => {
         v.truncate(usize::try_from(len).unwrap_or(0));
-        Body::Inline(v)
+        (Body::Inline(v), None)
       }
       Body::Sealed(mut extents) => {
-        clip_extents(
-          (store, self.seal_key),
-          &mut extents,
-          len,
-          last,
-          epoch,
-          &mut dead,
-        )?;
-        Body::Sealed(extents)
+        let refused = clip_extents((store, key), &mut extents, len, last, epoch, dead).err();
+        (Body::Sealed(extents), refused)
       }
       Body::Open {
         mut open,
         mut sealed,
       } => {
-        clip_extents(
-          (store, self.seal_key),
-          &mut sealed,
-          len,
-          last,
-          epoch,
-          &mut dead,
-        )?;
+        if let Err(refused) = clip_extents((store, key), &mut sealed, len, last, epoch, dead) {
+          return (Body::Open { open, sealed }, Some(refused));
+        }
         if open.off >= len {
-          store.content.release_open(*open)?;
-          Body::Sealed(sealed)
+          let block = open.block;
+          match store.content.release_block(block) {
+            Ok(()) => (Body::Sealed(sealed), None),
+            Err(refused) => (Body::Open { open, sealed }, Some(refused)),
+          }
         } else {
           let keep = len.saturating_sub(open.off);
-          store.content.shrink_open(&mut open, keep)?;
-          Body::Open { open, sealed }
+          let refused = store.content.shrink_open(&mut open, keep).err();
+          (Body::Open { open, sealed }, refused)
         }
       }
       Body::Base(mut b) => {
-        clip_extents(
-          (store, self.seal_key),
-          &mut b.pinned,
-          len,
-          last,
-          epoch,
-          &mut dead,
-        )?;
-        // Disk bytes past the cut are no longer the file's; a later extension is a hole.
-        b.base_len = b.base_len.min(len);
-        Body::Base(b)
+        let refused = clip_extents((store, key), &mut b.pinned, len, last, epoch, dead).err();
+        if refused.is_none() {
+          // Disk bytes past the cut are no longer the file's; a later extension is a hole.
+          b.base_len = b.base_len.min(len);
+        }
+        (Body::Base(b), refused)
       }
-      other => other,
-    };
-    self.retain_dead_list(store, dead);
-    store.inodes.get_mut(handle)?.body = new_body;
-    self.reconcile(before, content_by_epoch(store, handle));
-    Ok(())
+      other => (other, None),
+    }
   }
 
   fn is_ancestor(
@@ -5484,7 +5663,13 @@ impl Volume {
     Ok(false)
   }
 
-  pub(crate) fn record(&mut self, op: Op, path: &str, inode: Option<InodeNo>, prev_version: u64) {
+  pub(crate) fn record(
+    &mut self,
+    op: Op,
+    path: impl Into<Box<str>>,
+    inode: Option<InodeNo>,
+    prev_version: u64,
+  ) {
     let at = self.clock.monotonic_ns();
     self
       .journal
@@ -5591,30 +5776,170 @@ pub struct IdleSweep {
   pub left: u64,
 }
 
-pub(crate) fn content_by_epoch(store: &Store, handle: Handle<Inode>) -> Vec<(Epoch, u64)> {
+pub(crate) fn content_by_epoch(store: &Store, handle: Handle<Inode>) -> EpochContent {
+  let mut out = EpochContent::Empty;
   let Ok(inode) = store.inodes.get(handle) else {
-    return Vec::new();
+    return out;
   };
   let sealed_block = |e: &Extent| match e.src {
-    ExtentSrc::Chunk { chunk, .. } => store
-      .content
-      .chunk(chunk)
-      .map(|c| (c.born, u64::try_from(c.block.len()).unwrap_or(u64::MAX))),
+    ExtentSrc::Chunk { chunk, .. } => store.content.chunk(chunk).map(|c| {
+      (
+        c.born,
+        u64::try_from(store.content.stored_bytes(c)).unwrap_or(u64::MAX),
+      )
+    }),
     ExtentSrc::Zero => None,
   };
   match &inode.body {
-    Body::Inline(b) => vec![(inode.born, u64::try_from(b.len()).unwrap_or(0))],
-    Body::Sealed(extents) => extents.iter().filter_map(sealed_block).collect(),
+    Body::Inline(b) => out.push((inode.born, u64::try_from(b.len()).unwrap_or(0))),
+    Body::Sealed(extents) => extents
+      .iter()
+      .filter_map(sealed_block)
+      .for_each(|part| out.push(part)),
     Body::Open { open, sealed } => {
-      let mut out: Vec<(Epoch, u64)> = sealed.iter().filter_map(sealed_block).collect();
+      sealed
+        .iter()
+        .filter_map(sealed_block)
+        .for_each(|part| out.push(part));
       out.push((
         open.born,
         u64::try_from(open.block.len()).unwrap_or(u64::MAX),
       ));
-      out
     }
-    Body::Base(b) => b.pinned.iter().filter_map(sealed_block).collect(),
-    _ => Vec::new(),
+    Body::Base(b) => b
+      .pinned
+      .iter()
+      .filter_map(sealed_block)
+      .for_each(|part| out.push(part)),
+    _ => {}
+  }
+  out
+}
+
+/// The file ranges whose extents a write of `len` bytes at `off` can change in a chunked body, for the epoch histogram's
+/// reconcile to read only those (`None`: every extent, for any other body). Every extent begins at a window boundary
+/// and a window holds at most one (§4.5, the chunk rule), and a write on a sealed or open body changes extents only by
+/// reopening the windows it covers ([`Volume::open_window`]) and by sealing the extent open before it, so outside the
+/// windows `[off, off + len)` covers and the window of the open extent nothing changes, and the parts there are the
+/// same before and after. Reading every extent made a random 4 KiB overwrite cost O(the file's extents) twice:
+/// 74 µs in a 512 MiB file against 17 µs in a 16 MiB one (2026-10-06). An inline body (it may spill into window 0)
+/// and a base-backed one keep the whole view.
+fn touched_windows(body: &Body, off: u64, len: usize, chunk: u64) -> Option<[(u64, u64); 2]> {
+  let end = off.saturating_add(u64::try_from(len).unwrap_or(u64::MAX));
+  let window_end = |at: u64| window_start_of(at, chunk).saturating_add(chunk);
+  let written = (
+    window_start_of(off, chunk),
+    window_end(end.saturating_sub(1).max(off)),
+  );
+  match body {
+    Body::Sealed(_) => Some([written, written]),
+    Body::Open { open, .. } => Some([
+      written,
+      (window_start_of(open.off, chunk), window_end(open.off)),
+    ]),
+    _ => None,
+  }
+}
+
+/// [`content_by_epoch`] limited to the extents (and the open extent) overlapping `within`'s ranges, counting an
+/// extent once when the ranges overlap; the whole view for `None`.
+fn content_by_epoch_within(
+  store: &Store,
+  handle: Handle<Inode>,
+  within: Option<[(u64, u64); 2]>,
+) -> EpochContent {
+  let Some([first, second]) = within else {
+    return content_by_epoch(store, handle);
+  };
+  let mut out = EpochContent::Empty;
+  let Ok(inode) = store.inodes.get(handle) else {
+    return out;
+  };
+  let in_ranges = |e_off: u64, e_len: u64| {
+    let e_end = e_off.saturating_add(e_len);
+    [first, second]
+      .iter()
+      .any(|(start, end)| e_off < *end && *start < e_end)
+  };
+  let mut add = |e: &Extent| {
+    if let ExtentSrc::Chunk { chunk, .. } = e.src
+      && let Some(c) = store.content.chunk(chunk)
+    {
+      out.push((
+        c.born,
+        u64::try_from(store.content.stored_bytes(c)).unwrap_or(u64::MAX),
+      ));
+    }
+  };
+  let (sealed, open) = match &inode.body {
+    Body::Sealed(extents) => (extents.as_slice(), None),
+    Body::Open { open, sealed } => (sealed.as_slice(), Some(open)),
+    _ => return content_by_epoch(store, handle),
+  };
+  let second_disjoint = second.1 <= first.0 || first.1 <= second.0;
+  for e in overlapping(sealed, first.0, first.1) {
+    add(e);
+  }
+  if second_disjoint {
+    for e in overlapping(sealed, second.0, second.1) {
+      add(e);
+    }
+  } else {
+    // Overlapping ranges: the extents of `second` outside `first`, so none is counted twice.
+    for e in overlapping(sealed, second.0, second.1) {
+      if !(e.off < first.1 && first.0 < e.off.saturating_add(e.len)) {
+        add(e);
+      }
+    }
+  }
+  if let Some(open) = open
+    && in_ranges(open.off, open.len.max(1))
+  {
+    out.push((
+      open.born,
+      u64::try_from(open.block.len()).unwrap_or(u64::MAX),
+    ));
+  }
+  out
+}
+
+/// An inode's content by birth epoch ([`content_by_epoch`]): what the epoch histogram moves on every write. Held inline
+/// for the common bodies (an inline file, a file of one extent) and in a `Vec` only past one part, where a `Vec` for
+/// every body was two allocations per write (2026-10-06, `create_heap`).
+pub(crate) enum EpochContent {
+  /// No content.
+  Empty,
+  /// One part.
+  One((Epoch, u64)),
+  /// Several parts.
+  Many(Vec<(Epoch, u64)>),
+}
+
+impl EpochContent {
+  /// Adds a part.
+  fn push(&mut self, part: (Epoch, u64)) {
+    *self = match std::mem::replace(self, EpochContent::Empty) {
+      EpochContent::Empty => EpochContent::One(part),
+      EpochContent::One(first) => EpochContent::Many(vec![first, part]),
+      EpochContent::Many(mut parts) => {
+        parts.push(part);
+        EpochContent::Many(parts)
+      }
+    };
+  }
+}
+
+impl IntoIterator for EpochContent {
+  type Item = (Epoch, u64);
+  type IntoIter =
+    std::iter::Chain<std::option::IntoIter<(Epoch, u64)>, std::vec::IntoIter<(Epoch, u64)>>;
+
+  fn into_iter(self) -> Self::IntoIter {
+    match self {
+      EpochContent::Empty => None.into_iter().chain(Vec::new()),
+      EpochContent::One(part) => Some(part).into_iter().chain(Vec::new()),
+      EpochContent::Many(parts) => None.into_iter().chain(parts),
+    }
   }
 }
 
@@ -5772,6 +6097,39 @@ pub(crate) fn insert_extent(list: &mut Vec<Extent>, e: Extent) {
 /// would shrink is rebuilt at its new length (the window's block is always the buddy block its
 /// materialized length takes, §4.2 "allocator rounding"), its old chunk released by the epoch rule
 /// like any window the head rewrites. Returns bytes freed.
+/// The extents of `extents` (ascending by offset and non-overlapping, as every body holds them) that overlap the file
+/// range `[start, end)`: found by binary search, so a read costs the extents it touches, not the file's. A read walked
+/// every extent of the file and resolved each one's chunk before testing the overlap, so it cost O(extents) and a
+/// chunk anywhere in the file that could not be resolved refused every read of it (2026-10-06).
+pub(crate) fn overlapping(extents: &[Extent], start: u64, end: u64) -> &[Extent] {
+  let first = extents.partition_point(|e| e.off.saturating_add(e.len) <= start);
+  let rest = extents.get(first..).unwrap_or_default();
+  let count = rest.partition_point(|e| e.off < end);
+  rest.get(..count).unwrap_or_default()
+}
+
+/// The chunks a cut of `body` to `len` releases or clips: those of the extents reaching past `len`.
+fn truncated_chunks(
+  body: &Body,
+  len: u64,
+) -> impl Iterator<Item = Handle<crate::content::Chunk>> + '_ {
+  let extents: &[Extent] = match body {
+    Body::Sealed(extents)
+    | Body::Open {
+      sealed: extents, ..
+    } => extents,
+    Body::Base(b) => &b.pinned,
+    _ => &[],
+  };
+  extents
+    .iter()
+    .filter(move |e| e.off.saturating_add(e.len) > len)
+    .filter_map(|e| match e.src {
+      ExtentSrc::Chunk { chunk, .. } => Some(chunk),
+      ExtentSrc::Zero => None,
+    })
+}
+
 pub(crate) fn clip_extents(
   (store, key): (&mut Store, Option<u32>),
   extents: &mut Vec<Extent>,
@@ -5782,10 +6140,15 @@ pub(crate) fn clip_extents(
 ) -> Result<u64, VfsError> {
   let mut freed = 0u64;
   let mut keep = Vec::with_capacity(extents.len());
-  for e in extents.drain(..) {
-    if e.off >= len {
-      if let ExtentSrc::Chunk { chunk, .. } = e.src {
-        freed = freed.saturating_add(store.content.release_chunk(chunk, last, dead)?);
+  let mut pending = std::mem::take(extents).into_iter();
+  while let Some(e) = pending.next() {
+    let step = if e.off >= len {
+      match e.src {
+        ExtentSrc::Chunk { chunk, .. } => store
+          .content
+          .release_chunk(chunk, last, dead)
+          .map(|released| freed = freed.saturating_add(released)),
+        ExtentSrc::Zero => Ok(()),
       }
     } else if e.off.saturating_add(e.len) > len {
       let clipped = Extent {
@@ -5793,20 +6156,37 @@ pub(crate) fn clip_extents(
         len: len.saturating_sub(e.off),
         src: e.src,
       };
-      freed = freed.saturating_add(e.len.saturating_sub(clipped.len));
-      keep.push(rebuilt_if_smaller(
-        (store, key),
-        clipped,
-        last,
-        epoch,
-        dead,
-      )?);
+      rebuilt_if_smaller((store, key), clipped, last, epoch, dead).map(|rebuilt| {
+        freed = freed.saturating_add(e.len.saturating_sub(clipped.len));
+        keep.push(rebuilt);
+      })
     } else {
       keep.push(e);
+      Ok(())
+    };
+    if let Err(refusal) = step {
+      // Nothing is dropped on a refusal: the extent refused and every one not yet reached stay, after those kept.
+      keep.push(e);
+      keep.extend(pending);
+      *extents = keep;
+      return Err(refusal);
     }
   }
   *extents = keep;
   Ok(freed)
+}
+
+/// The arena bytes a chunk rebuilt at `len` bytes holds (A-118): its length's granules when it can be trimmed, its
+/// whole power-of-two block when locked (a locked block is never trimmed). One rule for the rebuild and for the
+/// retention estimate before it, so the estimate secures exactly what the rebuild releases.
+fn rebuilt_size(store: &Store, len: u64, locked: bool) -> u64 {
+  let len = usize::try_from(len).unwrap_or(usize::MAX);
+  let bytes = if locked {
+    store.content.block_bytes(len)
+  } else {
+    store.content.trimmed_size(len)
+  };
+  u64::try_from(bytes).unwrap_or(u64::MAX)
 }
 
 /// A clipped extent, rebuilt into a fresh chunk of its new length's page multiple when its old
@@ -5822,18 +6202,23 @@ fn rebuilt_if_smaller(
   let ExtentSrc::Chunk { chunk, .. } = clipped.src else {
     return Ok(clipped);
   };
-  let block = store.content.chunk(chunk).map_or(0, |c| c.block.len());
-  let need = usize::try_from(clipped.len).unwrap_or(usize::MAX);
-  if store.content.block_bytes(need) >= block {
-    return Ok(clipped);
-  }
-  // The smaller block is an economy, never a requirement: when the arena or the chunk slab cannot give it now, the
-  // clipped extent keeps its block, and its charge follows that block (`content_by_epoch`).
+  let block = store
+    .content
+    .chunk(chunk)
+    .map_or(0, |c| store.content.stored_bytes(c));
   // The rebuilt chunk replaces the clipped one in its volume: locked if that chunk's block was.
   let locked = store
     .content
     .chunk(chunk)
     .is_some_and(|c| store.content.arena().is_locked(c.block));
+  // Rebuild only when the rebuilt chunk holds fewer bytes: one trimmed to its length's granules (A-118), or a locked
+  // one's whole power-of-two block, since a locked block is never trimmed.
+  let need = clipped.len;
+  if rebuilt_size(store, need, locked) >= u64::try_from(block).unwrap_or(u64::MAX) {
+    return Ok(clipped);
+  }
+  // The smaller block is an economy, never a requirement: when the arena or the chunk slab cannot give it now, the
+  // clipped extent keeps its block, and its charge follows that block (`content_by_epoch`).
   let Ok(open) = store.content.reopen(&clipped, epoch, locked) else {
     return Ok(clipped);
   };
@@ -5969,34 +6354,25 @@ const BLOCK_SEGMENT_PAGES: usize = 64;
 /// `Dead::Chunk` by [`Volume::destroy`]'s walk of the head and by the recovery rebuild
 /// ([`tree_deadlist_excluding`]). Only an open extent's block belongs to the version alone.
 fn release_dead(store: &mut Store, dead: Dead) -> Result<usize, VfsError> {
-  match dead {
-    Dead::Dir(h, _) => {
-      let _ = store.dirs.discard(h);
-      Ok(1)
-    }
-    Dead::DirBlock(h, _) => {
-      let _ = store.blocks.discard(h);
-      Ok(1)
-    }
-    Dead::Inode(h, _) => {
-      let Ok(inode) = store.inodes.remove(h) else {
-        return Ok(1);
-      };
-      if let Body::Open { open, .. } = &inode.body {
-        let _ = store.content.release_open(**open);
-        return Ok(2);
-      }
-      Ok(1)
-    }
-    Dead::Trie(h, _) => {
-      let _ = store.tries.discard(h);
-      Ok(1)
-    }
-    Dead::Chunk(h, _) => {
-      let _ = store.content.free_chunk(h);
-      Ok(1)
-    }
+  // Releasing is idempotent (an object already gone counts as released, so a walk can be resumed), but a refusal is
+  // never silent: it is counted on the store.
+  let (released, freed) = match dead {
+    Dead::Dir(h, _) => (store.dirs.discard(h).map_err(VfsError::from), 1),
+    Dead::DirBlock(h, _) => (store.blocks.discard(h).map_err(VfsError::from), 1),
+    Dead::Inode(h, _) => match store.inodes.remove(h) {
+      Ok(inode) => match &inode.body {
+        Body::Open { open, .. } => (store.content.release_open(**open), 2),
+        _ => (Ok(()), 1),
+      },
+      Err(refusal) => (Err(refusal.into()), 1),
+    },
+    Dead::Trie(h, _) => (store.tries.discard(h).map_err(VfsError::from), 1),
+    Dead::Chunk(h, _) => (store.content.free_chunk(h), 1),
+  };
+  if released.is_err() {
+    store.release_refusals = store.release_refusals.saturating_add(1);
   }
+  Ok(freed)
 }
 
 /// The sealed extents a body holds: its sealed list, the sealed list beneath an open extent, or a
@@ -6052,7 +6428,7 @@ fn data_ranges(body: &Body, size: u64) -> Vec<(u64, u64)> {
       ranges.push((open.off, open.off.saturating_add(open.len)));
     }
     Body::Base(_) => ranges.push((0, size)),
-    Body::None | Body::Directory(_) | Body::Symlink(_) => {}
+    Body::None | Body::Directory(_) | Body::Symlink(_) | Body::BaseLink(_) => {}
   }
   ranges.sort_unstable();
   let mut merged: Vec<(u64, u64)> = Vec::with_capacity(ranges.len());

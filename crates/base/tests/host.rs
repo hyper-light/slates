@@ -220,13 +220,15 @@ fn an_overlay_over_the_workspace_tree_costs_one_open_and_reads_the_disk() {
   assert_eq!(host.open_handles(), 1);
   assert_eq!(store.dirs.iter().count(), 1);
   let expected = std::fs::read(crates_dir().join("vfs/src/lib.rs")).unwrap();
-  let mut o = vol.with_host(&mut host);
-  let no = o.resolve(&mut store, "/vfs/src/lib.rs").unwrap().inode;
-  let size = o.stat(&mut store, no).unwrap().size;
-  assert_eq!(size, u64::try_from(expected.len()).unwrap());
-  let mut buf = vec![0u8; expected.len()];
-  let n = o.read(&mut store, no, 0, &mut buf).unwrap();
-  assert_eq!(&buf[..n], &expected[..]);
+  {
+    let mut o = vol.with_host(&mut host);
+    let no = o.resolve(&mut store, "/vfs/src/lib.rs").unwrap().inode;
+    let size = o.stat(&mut store, no).unwrap().size;
+    assert_eq!(size, u64::try_from(expected.len()).unwrap());
+    let mut buf = vec![0u8; expected.len()];
+    let n = o.read(&mut store, no, 0, &mut buf).unwrap();
+    assert_eq!(&buf[..n], &expected[..]);
+  }
   assert_eq!(
     host.open_handles(),
     4,
@@ -416,7 +418,7 @@ fn a_real_directory_shows_descriptor_semantics_nofollow_and_hints() {
   assert!(
     hints
       .iter()
-      .any(|h| matches!(h, slates_vfs::host::Hint::Changed(d) if *d == root)),
+      .any(|h| matches!(h, slates_vfs::host::Hint::Changed(d) | slates_vfs::host::Hint::Entry(d, _) if *d == root)),
     "a hint for the root after the rename: {hints:?}"
   );
   host.close_file(file);
@@ -598,4 +600,55 @@ fn a_final_component_swapped_for_a_link_is_refused_and_an_open_file_keeps_its_by
   assert!(host.read_link(root, "f.txt").unwrap().ends_with("f.txt"));
   host.close_file(before);
   host.close_dir(root);
+}
+
+/// A-122 on a real filesystem (2026-10-08): an outsider's in-place write to an existing base file hints its directory,
+/// so the drain can recall the delegations held on it. kqueue's `EVFILT_VNODE` on a directory reports namespace changes
+/// only, so on macOS the write was never hinted; inotify's `IN_MODIFY` on the directory already reported it on Linux.
+/// Do: watch a real directory in the build output, open a file in it as a read-through does, drain the hints, then
+/// append to the file in place (same inode, no namespace change); close it and append again. Expect a hint naming the
+/// file in its directory for the first append. For the append after the close, the two watch backends differ, and
+/// each is right: kqueue (every unix but Linux) heard the write only through the open file's own registration, which
+/// the close releases, so it hints nothing; inotify's directory watch hears a write to any file in it (`IN_MODIFY`),
+/// open or not, so it hints the file again, which drift detection wants. Before 2026-10-10 the test asked kqueue's
+/// answer of Linux too, and failed there on every run (found by the Linux lane; CI had not yet run it).
+#[cfg(unix)]
+#[test]
+fn an_in_place_write_to_an_opened_base_file_hints_its_directory() {
+  // A-50: a real base directory in the build output, never `/tmp` or a RAM directory.
+  let owned = BuildOutputDir::new("inplace");
+  let dir = owned.0.clone();
+  std::fs::write(dir.join("f"), b"one").unwrap();
+  let (mut host, root) = OsHost::open_root(&dir).unwrap();
+  assert_eq!(host.watch(root), WatchState::Live);
+  let file = host.open_file(root, "f").unwrap();
+  let _ = host.hints();
+  let append = |bytes: &[u8]| {
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new()
+      .append(true)
+      .open(dir.join("f"))
+      .unwrap();
+    f.write_all(bytes).unwrap();
+  };
+  append(b", two");
+  let hints = host.hints();
+  assert!(
+    hints.contains(&slates_vfs::host::Hint::Entry(root, "f".into())),
+    "an in-place write hints the file in its directory: {hints:?}"
+  );
+  host.close_file(file);
+  append(b", three");
+  let after_close = host.hints();
+  #[cfg(not(target_os = "linux"))]
+  assert_eq!(
+    after_close,
+    Vec::new(),
+    "kqueue: a closed file's own registration is released, so its write hints nothing"
+  );
+  #[cfg(target_os = "linux")]
+  assert!(
+    after_close.contains(&slates_vfs::host::Hint::Entry(root, "f".into())),
+    "inotify: the directory's watch hears a write to any file in it, open or not: {after_close:?}"
+  );
 }

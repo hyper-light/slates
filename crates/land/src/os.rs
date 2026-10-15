@@ -5,14 +5,22 @@
 //!
 //! Shape: every verb is relative to a descriptor the base host holds (`OsHost`, which resolves
 //! the one root path with `O_NOFOLLOW` and hands out handles); no verb takes a path string.
-//! Linux: `O_TMPFILE` temporaries linked by `linkat` through `/proc/self/fd`, `fdatasync`,
-//! `renameat2(RENAME_EXCHANGE)`, `fsync` on directories. macOS: hidden-name temporaries
-//! (`O_CREAT|O_EXCL`), `fcntl(F_BARRIERFSYNC)` as the data barrier, `renameatx_np(RENAME_SWAP)`,
-//! `fcntl(F_FULLFSYNC)` on the target as the media barrier when the grant asked for it. Both:
+//! A batch's barrier is a job over its own descriptors of the batch's files (`dup`), run on a thread of the landing's
+//! and never on the shard that owns it (A-132): it waits on the device and on every other writer of the filesystem.
+//! Linux: `O_TMPFILE` temporaries linked by `linkat` through `/proc/self/fd`, each file's writeback
+//! started as it is written out (`sync_file_range`) and a batch's barrier as its files' `fdatasync`s
+//! on ⌈√n⌉ streams (A-130: journal group commit merges those in flight into few commits and flushes),
+//! `renameat2(RENAME_EXCHANGE)`, `fsync` on directories. macOS: hidden-name
+//! temporaries (`O_CREAT|O_EXCL`), a batch's barrier as each file's `fsync` and then one `fcntl(F_BARRIERFSYNC)` per
+//! device, `renameatx_np(RENAME_SWAP)`, `fcntl(F_FULLFSYNC)` on the target as the
+//! media barrier when the grant asked for it. Other unixes: a batch's barrier as each file's `fdatasync`. Linux's one
+//! call that covers a batch, `syncfs`, flushes every other writer's
+//! dirty data too: beside one busy writer a barrier took up to 3.7 s and a 16-file batch cost 4.0–7.8 ms
+//! a file against `fdatasync`'s 0.65–0.79 ms (2026-10-10, `BENCHMARKS.md`), so it is not used. Both:
 //! `fchmod` (on files and on each made directory, so the umask never edits a recorded mode),
-//! `futimens`, `unlinkat`, `mkdirat`, `symlinkat`, `renameat`. The three `unsafe`
-//! sites are the libc calls rustix does not wrap (`F_BARRIERFSYNC`, `F_FULLFSYNC`,
-//! `renameatx_np`), each on a descriptor this host owns.
+//! `futimens`, `unlinkat`, `mkdirat`, `symlinkat`, `renameat`. The four `unsafe`
+//! sites are the libc calls rustix does not wrap (macOS `F_BARRIERFSYNC`, `F_FULLFSYNC`,
+//! `renameatx_np`; Linux `sync_file_range`), each on a descriptor this host owns.
 //!
 //! Containment (§4.15 step 4, §4.13): [`OsLand::open_target`] opens the target path one
 //! component at a time with `O_DIRECTORY|O_NOFOLLOW`; an unfollowed symlink is classified
@@ -26,8 +34,8 @@ use std::path::{Component, Path};
 use rustix::fs::{AtFlags, Mode, OFlags};
 use slates_base::OsHost;
 use slates_vfs::host::{
-  BaseEntry, Hint, HostDir, HostError, HostFacts, HostFile, HostFs, LandCapabilities, LandFs,
-  WatchState,
+  Barrier, BaseEntry, Hint, HostDir, HostError, HostFacts, HostFile, HostFs, LandCapabilities,
+  LandFs, WatchState,
 };
 use slates_vfs::inode::Fingerprint;
 
@@ -351,6 +359,33 @@ fn rename_without_replacing(
   renameatx(dir, from, to_dir, to, libc::RENAME_EXCL)
 }
 
+/// A named temporary moved from `from` to `to`, refused `EEXIST` when `to` exists, holding the one name after: the
+/// rename that never replaces, one metadata operation where a link and an unlink were two. APFS measured 46–57 µs a
+/// file against 198–259 µs for the pair (2026-10-10, `BENCHMARKS.md`).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn move_without_replacing(
+  dir: BorrowedFd<'_>,
+  from: &str,
+  to_dir: BorrowedFd<'_>,
+  to: &str,
+) -> Result<(), HostError> {
+  rename_without_replacing(dir, from, to_dir, to)
+}
+
+/// A named temporary moved where no rename refuses an existing name: a link (which refuses one) and the old name's
+/// removal, the temporary at both names between the two; the sweep removes a hidden one a crash leaves.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[allow(clippy::disallowed_methods)] // the write seam's own placement (R1, D-26; AUD-29-31).
+fn move_without_replacing(
+  dir: BorrowedFd<'_>,
+  from: &str,
+  to_dir: BorrowedFd<'_>,
+  to: &str,
+) -> Result<(), HostError> {
+  rustix::fs::linkat(dir, from, to_dir, to, AtFlags::empty()).map_err(refusal)?;
+  rustix::fs::unlinkat(dir, from, AtFlags::empty()).map_err(refusal)
+}
+
 /// Where neither exists, the rename that never replaces is unavailable: a removal refuses rather than race.
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn rename_without_replacing(
@@ -406,14 +441,148 @@ fn exchange_names(_dir: BorrowedFd<'_>, _a: &str, _b: &str) -> Result<(), HostEr
   ))
 }
 
-/// The data barrier: Linux `fdatasync`.
+/// A file's write-out on Linux: its writeback started (`sync_file_range(SYNC_FILE_RANGE_WRITE)`, which neither waits
+/// nor writes metadata), so its data is in flight and its blocks allocated before the batch's barrier syncs every file
+/// at once. The barrier, not this, makes the file durable. Measured (2026-10-10, `BENCHMARKS.md`, ten rounds, the arms'
+/// order alternated): with the concurrent barrier, 64–129 µs a file against 112–197 for the barrier alone when the disk
+/// is quiet, and 115–3,688 against 211–6,120 beside a busy writer. Its errors are the file's: `ENOSPC` where starting
+/// writeback allocates, `EIO` where the device refuses.
+#[cfg(target_os = "linux")]
+fn write_out_file(fd: BorrowedFd<'_>) -> Result<(), HostError> {
+  // SAFETY: `sync_file_range` takes no pointer argument; `fd` is a descriptor this host owns for the call's duration.
+  let rc = unsafe { libc::sync_file_range(fd.as_raw_fd(), 0, 0, libc::SYNC_FILE_RANGE_WRITE) };
+  if rc == 0 {
+    Ok(())
+  } else {
+    Err(refusal(rustix::io::Errno::from_raw_os_error(
+      std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
+    )))
+  }
+}
+
+/// A file's write-out on macOS and the other unixes: nothing reaches the device here. Their only call that starts a
+/// file's writeback also waits for it (`fsync`, `fdatasync`), so it belongs to the batch's barrier, off the shard
+/// (A-132): on the shard a macOS `fsync` held every other client up to 206 ms a file on a busy machine (2026-10-10).
+#[cfg(not(target_os = "linux"))]
+fn write_out_file(_fd: BorrowedFd<'_>) -> Result<(), HostError> {
+  Ok(())
+}
+
+/// A batch's barrier away from its host (A-132): its own descriptor of each file, so the host may close a file while it
+/// runs, and the platform's syncs over them when it runs — each file synced ([`sync_file`]) on ⌈√n⌉ streams for n
+/// files, then the syncs ordered ahead of every later write ([`order_synced`]).
+struct OsBarrier {
+  files: Vec<OwnedFd>,
+}
+
+impl Barrier for OsBarrier {
+  fn run(self: Box<Self>) -> Result<(), HostError> {
+    let fds: Vec<BorrowedFd<'_>> = self.files.iter().map(AsFd::as_fd).collect();
+    let streams = fds
+      .len()
+      .isqrt()
+      .saturating_add(usize::from(!is_square(fds.len())));
+    sync_on_streams(&fds, streams).and_then(|()| order_synced(&fds))
+  }
+}
+
+/// Whether `n` is a perfect square (so ⌈√n⌉ is `n.isqrt()` itself).
+fn is_square(n: usize) -> bool {
+  let root = n.isqrt();
+  root.checked_mul(root) == Some(n)
+}
+
+/// A batch's syncs on `streams` streams: the caller takes stream zero and a scoped thread each further stream, every
+/// thread joined before the return; the first refusal. A thread the system refuses to start leaves its share to the
+/// caller.
+///
+/// Derived: k streams cost about a·k for their threads' start and join and b·n/k for each stream's serial chain of
+/// syncs, least at k = √(b·n/a). The measurement (2026-10-10, `BENCHMARKS.md`) puts a and b about equal on Linux: for
+/// 16-file batches, four streams beat two and sixteen at 1, 2, 4 and 18 CPUs, quiet and beside a busy writer, while
+/// sixteen threads at once stalled a 1-CPU container 31–43 ms a barrier and spent 27–37 s of a bench throttled by its
+/// CPU quota. An online ramp over the count was tried the same day and rejected: a barrier's time varies about 6× at
+/// one count on a shared disk, so two samples mismeasured the noise and the ramp settled on one stream in 9,620 of
+/// 9,690 barriers.
+fn sync_on_streams(fds: &[BorrowedFd<'_>], streams: usize) -> Result<(), HostError> {
+  let streams = streams.clamp(1, fds.len().max(1));
+  std::thread::scope(|scope| {
+    let mut started = Vec::with_capacity(streams.saturating_sub(1));
+    let mut refused = Vec::new();
+    for stream in 1..streams {
+      match std::thread::Builder::new()
+        .spawn_scoped(scope, move || sync_stream(fds, stream, streams))
+      {
+        Ok(thread) => started.push(thread),
+        Err(_) => refused.push(stream),
+      }
+    }
+    let mut synced = sync_stream(fds, 0, streams);
+    for stream in refused {
+      synced = synced.and(sync_stream(fds, stream, streams));
+    }
+    for thread in started {
+      let joined = thread.join().unwrap_or(Err(HostError::Unavailable(
+        rustix::io::Errno::IO.raw_os_error(),
+      )));
+      synced = synced.and(joined);
+    }
+    synced
+  })
+}
+
+/// One stream's share of a batch: files `stream`, `stream + streams`, and so on, each synced in turn; the first refusal
+/// (the rest are still synced).
+fn sync_stream(fds: &[BorrowedFd<'_>], stream: usize, streams: usize) -> Result<(), HostError> {
+  let mut synced = Ok(());
+  for fd in fds.iter().skip(stream).step_by(streams.max(1)) {
+    synced = synced.and(sync_file(*fd));
+  }
+  synced
+}
+
+/// One file of a batch made durable on Linux and the other unixes: `fdatasync` (on Linux its writeback was started at
+/// the write-out, and the journal's group commit merges the syncs in flight together: ext4's jbd2 joins every sync
+/// waiting on the running transaction to its commit).
 #[cfg(not(target_os = "macos"))]
-fn data_barrier(fd: BorrowedFd<'_>) -> Result<(), HostError> {
+fn sync_file(fd: BorrowedFd<'_>) -> Result<(), HostError> {
   rustix::fs::fdatasync(fd).map_err(refusal)
 }
 
-/// The data barrier: macOS `fcntl(F_BARRIERFSYNC)` (ordered against later writes, not a
-/// media flush; the media barrier is `sync_media`).
+/// One file of a batch handed to the device on macOS: `fsync`, its data and attributes (not a media flush); the
+/// batch's barrier after every one orders them ahead of every later write ([`order_synced`]).
+#[cfg(target_os = "macos")]
+#[allow(clippy::disallowed_methods)] // the write seam's own barrier (R1, D-26; AUD-29-31).
+fn sync_file(fd: BorrowedFd<'_>) -> Result<(), HostError> {
+  rustix::fs::fsync(fd).map_err(refusal)
+}
+
+/// The batch's syncs ordered on macOS: one `F_BARRIERFSYNC` per device among the files, on that device's last file.
+/// The barrier applies to everything `fsync`ed on its device before it, so it orders every file synced there; files on
+/// another device (a mount inside the target) need that device's own.
+#[cfg(target_os = "macos")]
+fn order_synced(fds: &[BorrowedFd<'_>]) -> Result<(), HostError> {
+  let mut last_on_device = BTreeMap::new();
+  for fd in fds {
+    let device = rustix::fs::fstat(*fd).map_err(refusal)?.st_dev;
+    last_on_device.insert(device, *fd);
+  }
+  for fd in last_on_device.into_values() {
+    data_barrier(fd)?;
+  }
+  Ok(())
+}
+
+/// The batch's syncs ordered on Linux and the other unixes: each `fdatasync` returned with its file durable, so nothing
+/// remains.
+#[cfg(not(target_os = "macos"))]
+fn order_synced(_fds: &[BorrowedFd<'_>]) -> Result<(), HostError> {
+  Ok(())
+}
+
+/// The data barrier: macOS `fcntl(F_BARRIERFSYNC)`: `fsync` of the file, then a barrier that "applies to I/O that have
+/// been flushed with fsync(2) on the same device before" — ordered against later writes, not a media flush (the media
+/// barrier is `sync_media`). fcntl(2) names the batch's use: "execute operations of phase one, then fsync(2) each FD and
+/// issue a single barrier. Finally execute operations of phase two" (implemented on HFS and APFS) [B: macOS fcntl(2)].
 #[cfg(target_os = "macos")]
 fn data_barrier(fd: BorrowedFd<'_>) -> Result<(), HostError> {
   // SAFETY: `fcntl` with `F_BARRIERFSYNC` takes no pointer argument; `fd` is a descriptor
@@ -540,8 +709,29 @@ impl LandFs for OsLand {
     Ok(())
   }
 
-  fn sync_file(&mut self, file: HostFile) -> Result<(), HostError> {
-    data_barrier(self.file(file)?)
+  fn write_out(&mut self, file: HostFile) -> Result<(), HostError> {
+    write_out_file(self.file(file)?)
+  }
+
+  fn begin_barrier(&mut self, files: &[HostFile]) -> Result<Box<dyn Barrier>, HostError> {
+    let files = files
+      .iter()
+      .map(|file| {
+        self
+          .file(*file)?
+          .try_clone_to_owned()
+          .map_err(|error| HostError::Unavailable(error.raw_os_error().unwrap_or(0)))
+      })
+      .collect::<Result<Vec<_>, _>>()?;
+    Ok(Box::new(OsBarrier { files }))
+  }
+
+  fn end_barrier(
+    &mut self,
+    _files: &[HostFile],
+    ran: Result<(), HostError>,
+  ) -> Result<(), HostError> {
+    ran
   }
 
   fn set_mode(&mut self, file: HostFile, mode: u32) -> Result<(), HostError> {
@@ -576,14 +766,17 @@ impl LandFs for OsLand {
     match temp.created_as {
       None => self.link_unnamed(file, dir, name),
       Some(created) if temp.dir == dir && created.as_ref() == name => Ok(()),
-      Some(created) => rustix::fs::linkat(
-        self.dir(temp.dir)?,
-        created.as_ref(),
-        self.dir(dir)?,
-        name,
-        AtFlags::empty(),
-      )
-      .map_err(refusal),
+      Some(created) => {
+        move_without_replacing(self.dir(temp.dir)?, created.as_ref(), self.dir(dir)?, name)?;
+        self.temps.insert(
+          file.0,
+          Temp {
+            dir,
+            created_as: Some(name.into()),
+          },
+        );
+        Ok(())
+      }
     }
   }
 

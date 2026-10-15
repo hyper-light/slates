@@ -53,7 +53,7 @@ use slates_land::os::{Away, OsLand, TargetRefusal};
 use slates_land::source::Source;
 use slates_vfs::clock::Clock;
 #[cfg(unix)]
-use slates_vfs::host::{HostError, HostFs, LandFs};
+use slates_vfs::host::{Barrier, HostError, HostFs, LandFs};
 #[cfg(unix)]
 use slates_wire::observe::Chokepoint;
 
@@ -576,9 +576,6 @@ fn run_landing(
     now_ns: state.clock.monotonic_ns(),
     media_durability: false,
     large_class_bytes: state.config.large_class_bytes,
-    cores: 1,
-    max_depth: 1,
-    variance_permille: 0,
   };
   let slot = match state.volumes.get_mut(prepared.handle) {
     Ok(s) => s,
@@ -670,9 +667,7 @@ fn not_landed(
   refusal: LandingRefusal,
 ) -> ReplyBody {
   match refusal {
-    LandingRefusal::GrantRequired(plan) => {
-      present(state, presenter, ids, &plan.manifest, &plan.binding)
-    }
+    LandingRefusal::GrantRequired(plan) => present(state, presenter, ids, &plan),
     // The engine hands back every entry's report; the refusal names the conflicting ones alone (§4.15: a conflict
     // refuses the whole landing, and the person resolving it needs only the entries in conflict). Before 2026-10-06
     // every entry was named, so an entry that would only have been created read as a conflict.
@@ -872,6 +867,8 @@ enum Begun {
 enum Stepped {
   /// More host work remains.
   More,
+  /// The run took a batch's barrier and waits on it (A-132): it runs on a thread of its own, never the shard.
+  Barrier(Box<dyn Barrier>),
   /// Only the finish remains.
   Ready,
   /// The run ended early with this outcome (a refusal).
@@ -916,17 +913,34 @@ async fn drive_granted_landing(
         keep_lease_alive(&mut granted, renew, &key).await;
         slates_rt::futures::yield_now().await;
       }
+      Stepped::Barrier(barrier) => {
+        let ran = run_barrier_away(barrier, &mut granted, renew, &key).await;
+        granted.run.barrier_ran(ran);
+      }
       Stepped::Ready => {
         recall_before_finish(&mut granted, renew, &key).await;
+        // The finish's O(entries) advance is sliced (A-133): stepped a quantum at a time, the shard serving its other
+        // clients between, the lease kept alive — then its completion commits as one atom.
+        let outcome = loop {
+          match crate::state::with_state(|s| {
+            let stepped = step_finish(s, &mut granted);
+            crate::delegation::drain(s);
+            stepped
+          })? {
+            FinishStepped::More => {
+              keep_lease_alive(&mut granted, renew, &key).await;
+              slates_rt::futures::yield_now().await;
+            }
+            FinishStepped::Done(outcome) => break *outcome,
+          }
+        };
         return crate::state::with_state(move |s| {
-          complete_landing_with(s, request, cause, |s| finish_granted(s, *granted, None))
+          complete_landing_with(s, request, cause, |s| complete_finish(s, *granted, outcome))
         });
       }
       Stepped::Ended(ended) => {
         return crate::state::with_state(move |s| {
-          complete_landing_with(s, request, cause, |s| {
-            finish_granted(s, *granted, Some(*ended))
-          })
+          complete_landing_with(s, request, cause, |s| complete_finish(s, *granted, *ended))
         });
       }
     }
@@ -962,7 +976,7 @@ async fn recall_before_finish(granted: &mut GrantedRun, renew: LeaseAsk, key: &s
     let until = *deadline.get_or_insert(now.saturating_add(lease).saturating_add(1));
     if now >= until {
       // The lease passed: the drain revokes what lapsed, and the finish runs over what is left.
-      let _ = crate::state::with_state(crate::delegation::drain);
+      let _ = crate::state::with_state_counted(crate::delegation::drain);
       return;
     }
     let parked = slates_rt::futures::within(
@@ -1042,6 +1056,133 @@ const LEASE_RENEWED: &str = "landing.lease_renewed";
 #[cfg(unix)]
 const LEASE_NOT_RENEWED: &str = "landing.lease_not_renewed";
 
+/// Counter: a landing batch's barrier run on a thread of its own while the shard served on (A-132).
+/// Format: a counter name in the daemon's status report.
+#[cfg(unix)]
+const BARRIERS_AWAY: &str = "landing.barriers_away";
+
+/// Counter: a barrier thread the system refused to start (a process or cgroup thread limit): the batch's entries
+/// fail with the refusal and the landing stops writing, for its resume, as at any refused host step.
+/// Format: a counter name in the daemon's status report.
+#[cfg(unix)]
+const BARRIER_THREAD_REFUSED: &str = "landing.barrier_thread_refused";
+
+/// A landing batch's barrier on a thread of its own (A-132), owned by the landing's task: the thread sends the
+/// barrier's outcome over a channel of one and then wakes the task, so the wake always finds the outcome. Dropped
+/// before the outcome came (a shutdown while the barrier waits), it joins the thread first, so no thread outlives
+/// its owner; the join waits out the one barrier.
+#[cfg(unix)]
+struct BarrierThread {
+  outcome: std::sync::mpsc::Receiver<Result<(), HostError>>,
+  thread: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(unix)]
+impl BarrierThread {
+  /// Starts `barrier` on its own thread, `waker` woken once its outcome is sent; refused with the system's errno when
+  /// no thread can start (the barrier is dropped unrun, its descriptors closed).
+  fn start(barrier: Box<dyn Barrier>, waker: std::task::Waker) -> Result<Self, HostError> {
+    let (send, outcome) = std::sync::mpsc::sync_channel(1);
+    let thread = std::thread::Builder::new()
+      .name("slates-land-barrier".to_owned())
+      .spawn(move || {
+        // The receiver outlives the thread (its owner joins before it drops), so the send cannot fail; were it to,
+        // nobody is left to tell.
+        if send.send(barrier.run()).is_ok() {
+          waker.wake();
+        }
+      })
+      .map_err(|error| HostError::Unavailable(error.raw_os_error().unwrap_or(0)))?;
+    Ok(Self {
+      outcome,
+      thread: Some(thread),
+    })
+  }
+
+  /// The barrier's outcome once it is back (its thread joined: it has only to exit), `None` while it runs. A thread
+  /// gone without an outcome (it cannot be: shipped code does not panic, and a panic aborts) reads as `EIO`.
+  fn returned(&mut self) -> Option<Result<(), HostError>> {
+    let ran = match self.outcome.try_recv() {
+      Ok(ran) => ran,
+      Err(std::sync::mpsc::TryRecvError::Empty) => return None,
+      Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+        Err(HostError::Unavailable(rustix::io::Errno::IO.raw_os_error()))
+      }
+    };
+    self.join();
+    Some(ran)
+  }
+
+  fn join(&mut self) {
+    if let Some(thread) = self.thread.take()
+      && thread.join().is_err()
+    {
+      eprintln!("slates-server: a landing barrier thread panicked");
+    }
+  }
+}
+
+#[cfg(unix)]
+impl Drop for BarrierThread {
+  fn drop(&mut self) {
+    self.join();
+  }
+}
+
+/// Runs a landing batch's barrier away from the shard and waits for it without holding the shard (A-132): the shard
+/// serves its other clients meanwhile, and parks when it has none, where the barrier on the shard held every one of
+/// them for its whole wait (1–160 ms a batch on a busy Linux machine, an `fsync` up to 206 ms a file on a busy Mac,
+/// 2026-10-10). The landing's lease is kept alive while the barrier lasts, as between slices. The outcome: the
+/// barrier's, or the refusal that no thread could start for it.
+#[cfg(unix)]
+async fn run_barrier_away(
+  barrier: Box<dyn Barrier>,
+  granted: &mut GrantedRun,
+  renew: LeaseAsk,
+  key: &str,
+) -> Result<(), HostError> {
+  let waker = std::future::poll_fn(|cx| std::task::Poll::Ready(cx.waker().clone())).await;
+  let started = BarrierThread::start(barrier, waker);
+  crate::state::with_state(|s| {
+    let counter = if started.is_ok() {
+      BARRIERS_AWAY
+    } else {
+      BARRIER_THREAD_REFUSED
+    };
+    s.count(counter, 1);
+  });
+  let mut away = started?;
+  loop {
+    if let Some(ran) = away.returned() {
+      return ran;
+    }
+    keep_lease_alive(granted, renew, key).await;
+    // Woken by the thread, or at the lease's next renewal: whichever is first. With no renewal due ahead (refused, or
+    // overdue), the thread's wake alone, never a spin.
+    match renewal_wait_ns(granted, renew) {
+      Some(wait) => {
+        if slates_rt::futures::within(wait, slates_rt::futures::idle())
+          .await
+          .is_err()
+        {
+          slates_rt::futures::idle().await;
+        }
+      }
+      None => slates_rt::futures::idle().await,
+    }
+  }
+}
+
+/// How long until the landing's lease is due its renewal ([`keep_lease_alive`]), `None` when it is due already (a
+/// renewal just refused leaves it so) or the shard's clock cannot be read.
+#[cfg(unix)]
+fn renewal_wait_ns(granted: &GrantedRun, ask: LeaseAsk) -> Option<u64> {
+  let margin = ask.term.saturating_mul(RENEW_AT_REMAINING_PERMILLE) / PERMILLE;
+  let due = granted.run.lease().expires_ns.saturating_sub(margin);
+  let now = crate::state::with_state(|s| s.clock.monotonic_ns())?;
+  due.checked_sub(now).filter(|wait| *wait > 0)
+}
+
 /// Begins a granted landing on its owner shard: its id and request, the head's implicit snapshot for an
 /// unnamed landing, the writer (inside an overlay's own base host), and the engine's plan, grant and lease
 /// checks.
@@ -1084,9 +1225,6 @@ fn begin_granted(
     now_ns: state.clock.monotonic_ns(),
     media_durability: false,
     large_class_bytes: state.config.large_class_bytes,
-    cores: 1,
-    max_depth: 1,
-    variance_permille: 0,
   };
   let was_overlay = slot.volume.is_overlay();
   let not_run = |refusal: LandingRefusal, principal: Principal| {
@@ -1288,8 +1426,11 @@ fn step_granted(state: &mut ShardState, granted: &mut GrantedRun) -> Stepped {
   }
   match stepped {
     Some(ended) => Stepped::Ended(Box::new(ended)),
-    None if granted.run.ready_to_finish() => Stepped::Ready,
-    None => Stepped::More,
+    None => match granted.run.take_barrier() {
+      Some(barrier) => Stepped::Barrier(barrier),
+      None if granted.run.ready_to_finish() => Stepped::Ready,
+      None => Stepped::More,
+    },
   }
 }
 
@@ -1297,35 +1438,69 @@ fn step_granted(state: &mut ShardState, granted: &mut GrantedRun) -> Stepped {
 /// once-grant consumed, its spans drained, the writer's host settled, the implicit snapshot destroyed, and
 /// the reply with the landing's records.
 #[cfg(unix)]
-fn finish_granted(
+/// Where one step of the sliced finish left the advance (A-133).
+#[cfg(unix)]
+enum FinishStepped {
+  /// The advance has more entries; the caller yields and steps again.
+  More,
+  /// The finish is done (or failed), with this outcome to complete.
+  Done(Box<Result<LandingReport, LandingRefusal>>),
+}
+
+/// One step of a granted landing's finish (A-133): the overlay advanced past what reached the disk, for a slice of the
+/// shard's quantum, the base host lent back after — the same shape as [`step_granted`], so the shard serves its other
+/// clients between the advance's steps rather than holding them for its whole O(entries) run. A volume gone or a host
+/// away ends the finish with that refusal.
+#[cfg(unix)]
+fn step_finish(state: &mut ShardState, granted: &mut GrantedRun) -> FinishStepped {
+  let budget_ns = state
+    .config
+    .step_quantum_ns()
+    .saturating_mul(LANDING_SLICE_PERMILLE)
+    / PERMILLE;
+  let Ok(slot) = state.volumes.get_mut(granted.handle) else {
+    granted.run.abandon();
+    return FinishStepped::Done(Box::new(Err(LandingRefusal::Volume(
+      slates_vfs::error::VfsError::StaleHandle,
+    ))));
+  };
+  if granted.was_overlay && !take_for_slice(slot, granted) {
+    granted.run.abandon();
+    return FinishStepped::Done(Box::new(Err(LandingRefusal::HostAway)));
+  }
+  let began = state.clock.monotonic_ns();
+  let finished = granted.run.finish_step(
+    &mut slot.volume,
+    &mut state.store,
+    &mut state.landing.audit,
+    &mut granted.spans,
+    budget_ns,
+  );
+  if granted.was_overlay {
+    lend_back(slot, granted);
+  }
+  let took = state.clock.monotonic_ns().saturating_sub(began);
+  state.landing.slice_times.record(took);
+  state.landing.slice_budget_ns = budget_ns;
+  if granted.run.last_step_ns() > budget_ns.saturating_add(granted.run.last_unit_ns()) {
+    state.landing.slices_past_budget = state.landing.slices_past_budget.saturating_add(1);
+  }
+  match finished {
+    Some(outcome) => FinishStepped::Done(Box::new(outcome)),
+    None => FinishStepped::More,
+  }
+}
+
+/// Completes a granted landing once its advance is done (A-133): its grant settled, its spans drained, its writer's host
+/// settled back into the volume's slot, the implicit snapshot destroyed, and the reply with the landing's records (the
+/// completion commits as one atom around this, A-127). `outcome` is the finish's, or the refusal a run that ended early
+/// carried.
+#[cfg(unix)]
+fn complete_finish(
   state: &mut ShardState,
   mut granted: GrantedRun,
-  ended: Option<Result<LandingReport, LandingRefusal>>,
+  outcome: Result<LandingReport, LandingRefusal>,
 ) -> ReplyBody {
-  let outcome = match ended {
-    Some(ended) => ended,
-    None => match state.volumes.get_mut(granted.handle) {
-      Ok(slot) => {
-        if !granted.was_overlay || take_for_slice(slot, &mut granted) {
-          granted.run.finish(
-            &mut slot.volume,
-            &mut state.store,
-            &mut state.landing.audit,
-            &mut granted.spans,
-          )
-        } else {
-          granted.run.abandon();
-          Err(LandingRefusal::HostAway)
-        }
-      }
-      Err(_) => {
-        granted.run.abandon();
-        Err(LandingRefusal::Volume(
-          slates_vfs::error::VfsError::StaleHandle,
-        ))
-      }
-    },
-  };
   settle_grant(&mut state.landing.grants, granted.run.grant(), &outcome);
   let spans = std::mem::replace(&mut granted.spans, SpanObserver::with_capacity(1));
   drain_land_spans(state, spans);
@@ -1468,7 +1643,7 @@ pub(crate) fn deferred_reply() -> ReplyBody {
         dirs: 0,
       },
       degraded: Vec::new(),
-      ramp_depth: 0,
+      barriers: 0,
     },
   }
 }
@@ -1625,9 +1800,23 @@ fn present(
   state: &mut ShardState,
   presenter: Presenter<'_>,
   ids: &LandingIds<'_>,
-  manifest: &Manifest,
-  binding: &slates_land::grant::GrantBinding,
+  plan: &slates_land::engine::Presented,
 ) -> ReplyBody {
+  let manifest = &plan.manifest;
+  let binding = &plan.binding;
+  // §4.15 step 2: the conflicts the engine's preliminary verdict pass found (step 4 run without writing), each with
+  // its class, so the human deciding on the grant decides on evidence. Until 2026-10-08 the reply carried none, and a
+  // plan over a disk an outsider had changed looked clean until the granted landing refused.
+  let conflicts: Vec<String> = plan
+    .preliminary
+    .iter()
+    .filter_map(|entry| match entry.verdict {
+      Some(slates_land::verdict::Verdict::Conflict(class)) => {
+        Some(format!("{} ({class:?})", entry.path))
+      }
+      _ => None,
+    })
+    .collect();
   let Presenter { client, principal } = presenter;
   state.landing.next_landing = state.landing.next_landing.saturating_add(1);
   let hash = manifest.hash;
@@ -1659,7 +1848,7 @@ fn present(
     grant: None,
     state: DbLandingState::AwaitingGrant,
     written: 0,
-    conflicts: 0,
+    conflicts: u32::try_from(conflicts.len()).unwrap_or(u32::MAX),
   };
   let ops = [
     Op::LandingRecorded { record },
@@ -1685,7 +1874,7 @@ fn present(
     landing: landing_id,
     manifest: hash,
     summary: summary_of(manifest),
-    conflicts: Vec::new(),
+    conflicts,
   }
 }
 
@@ -1764,7 +1953,7 @@ fn finish(
       held: u64::try_from(report.held).unwrap_or(u64::MAX),
       durability: durability_of(&report.durability),
       degraded: report.degraded.iter().map(degradation_of).collect(),
-      ramp_depth: report.ramp_depth,
+      barriers: u64::try_from(report.barriers).unwrap_or(u64::MAX),
     },
   }
 }

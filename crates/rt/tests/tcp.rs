@@ -319,3 +319,90 @@ fn a_reply_in_two_writes_does_not_wait_for_the_peers_delayed_acknowledgement() {
   );
   rt.shutdown().unwrap();
 }
+
+/// Shape: three records whose whole run (8 MiB) is past any default socket send buffer (Linux `tcp_wmem` tops out at
+/// 4 MiB, macOS's autotuned buffer below that), so one `writev` cannot take it and the run is completed in parts.
+const LARGE_RECORD_BYTES: usize = 8 * 1024 * 1024 / 3;
+
+/// A run of records sent by one vectored write arrives as their concatenation (2026-10-09: the NFS server sends a
+/// turn's replies this way, never copying them into one buffer). Do: on one connection, send a run of three small
+/// records, then a run of three records too large for the send buffer, each with `send_records_vectored`; read
+/// everything on the other end. Expect: the small run was sent whole, the large one completed after a short send,
+/// and the bytes read are both runs' records in order, byte for byte.
+#[test]
+fn a_vectored_run_of_records_arrives_whole_and_in_order() {
+  let rt = Runtime::start(&config()).unwrap();
+  let id = rt.shard_ids()[0];
+  let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0), BACKLOG).unwrap();
+  let addr = listener.local_addr().unwrap();
+  let small: Vec<Vec<u8>> = (0..3u8).map(|n| vec![n; 100 + usize::from(n)]).collect();
+  let large: Vec<Vec<u8>> = (0..3u8)
+    .map(|n| {
+      (0..LARGE_RECORD_BYTES)
+        .map(|at| u8::try_from(at % 251).unwrap() ^ n)
+        .collect()
+    })
+    .collect();
+  let mut expected: Vec<u8> = small.concat();
+  expected.extend(large.concat());
+  let want = expected.len();
+
+  let (sent_tx, sent_rx) = channel();
+  let (small_run, large_run) = (small.clone(), large.clone());
+  rt.spawn_on(id, async move {
+    let outcome: Result<_, slates_rt::RtError> = async {
+      let stream = listener.accept().await?;
+      let small_slices: Vec<&[u8]> = small_run.iter().map(Vec::as_slice).collect();
+      let large_slices: Vec<&[u8]> = large_run.iter().map(Vec::as_slice).collect();
+      let first = stream.send_records_vectored(&small_slices).await?;
+      let second = stream.send_records_vectored(&large_slices).await?;
+      Ok((first, second))
+    }
+    .await;
+    let _ = sent_tx.send(outcome);
+  })
+  .unwrap();
+
+  let (read_tx, read_rx) = channel();
+  rt.spawn_on(id, async move {
+    let outcome: Result<Vec<u8>, slates_rt::RtError> = async {
+      let stream = TcpStream::connect(addr).await?;
+      let mut got = Vec::with_capacity(want);
+      let mut buf = vec![0u8; 64 * 1024];
+      while got.len() < want {
+        let n = stream.read(&mut buf).await?;
+        if n == 0 {
+          break;
+        }
+        got.extend_from_slice(&buf[..n]);
+      }
+      Ok(got)
+    }
+    .await;
+    let _ = read_tx.send(outcome);
+  })
+  .unwrap();
+
+  let got = read_rx
+    .recv_timeout(Duration::from_secs(30))
+    .unwrap()
+    .unwrap();
+  let (first, second) = sent_rx
+    .recv_timeout(Duration::from_secs(30))
+    .unwrap()
+    .unwrap();
+  rt.shutdown().unwrap();
+  assert!(
+    matches!(first, slates_rt::tcp::Sent::Whole),
+    "the small run went in one send: {first:?}"
+  );
+  assert!(
+    matches!(second, slates_rt::tcp::Sent::Completed),
+    "the large run was completed after a short send: {second:?}"
+  );
+  assert_eq!(got.len(), want, "every byte arrived");
+  assert!(
+    got == expected,
+    "both runs' records arrived in order, byte for byte"
+  );
+}

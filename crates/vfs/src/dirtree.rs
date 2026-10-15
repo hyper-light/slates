@@ -187,7 +187,7 @@ impl Slot {
 /// by any spelling of a folded name descends the same way the entry was inserted. Distinct
 /// entries never compare equal here (equal folded names are one entry).
 fn cmp_names(policy: NameEquivalence, a: &str, b: &str) -> std::cmp::Ordering {
-  policy.folded(a).cmp(policy.folded(b))
+  policy.compare(a, b)
 }
 
 /// A handle as one word: index in the high half, generation in the low.
@@ -470,6 +470,18 @@ type Path = [(Handle<DirBlock>, usize); MAX_HEIGHT];
 
 /// The block and slot a descent recorded at `level`; a level past the tree's height (never: `height <=
 /// MAX_HEIGHT`, and every caller asks below it) refuses typed.
+/// Whether every block above `depth` on `path` descended through its last slot: the block at `depth` is then the
+/// rightmost of its level, so an entry past its end is past the end of the whole tree.
+fn rightmost_above(blocks: &Slab<DirBlock>, path: &Path, depth: usize) -> Result<bool, VfsError> {
+  for level in 0..depth {
+    let (block, at) = step(path, Some(level))?;
+    if at.saturating_add(1) != blocks.get(block)?.count() {
+      return Ok(false);
+    }
+  }
+  Ok(true)
+}
+
 fn step(path: &Path, level: Option<usize>) -> Result<(Handle<DirBlock>, usize), VfsError> {
   level
     .and_then(|level| path.get(level))
@@ -707,12 +719,18 @@ impl Tree {
   /// Gives every block of a tree this mutation built and never published back to the slab: the undo
   /// of a small directory's move to a tree that was refused partway (the tree's blocks are all born
   /// now and reachable only from it).
-  pub fn discard(self, blocks: &mut Slab<DirBlock>) {
+  /// Every block is tried; the first refusal is returned, for the caller's [`crate::error::VfsError::after_undo`].
+  pub fn discard(self, blocks: &mut Slab<DirBlock>) -> Result<(), slates_mem::MemError> {
     let mut owned = Vec::new();
     self.blocks(blocks, &mut owned);
+    let mut first = Ok(());
     for (block, _) in owned {
-      let _ = blocks.remove(block);
+      let removed = blocks.remove(block).map(drop);
+      if first.is_ok() {
+        first = removed;
+      }
     }
+    first
   }
 
   /// Inserts `name → child` (the caller checked it is absent). All or nothing: the copies and any
@@ -765,12 +783,24 @@ impl Tree {
       return Ok(());
     }
     // Split: the upper half moves to a fresh sibling; the new entry goes to whichever side
-    // its position falls in; the sibling's first key becomes a separator in the parent.
+    // its position falls in; the sibling's first key becomes a separator in the parent. An entry
+    // appended past the end of the tree's rightmost block is the exception: the full block stays
+    // full and the entry starts the sibling alone (PostgreSQL nbtree's rightmost-page split,
+    // SQLite's `balance_quick`), so ascending inserts — a directory rebuilt in key order — fill
+    // their blocks where a half/half split left every block half empty.
     let index = blocks.get(block)?.index;
     let mut sibling = DirBlock::new(epoch, index);
-    blocks.get_mut(block)?.split_into(&mut sibling);
+    let appending = at == blocks.get(block)?.count() && rightmost_above(blocks, path, depth)?;
+    if !appending {
+      blocks.get_mut(block)?.split_into(&mut sibling);
+    }
     let left_count = blocks.get(block)?.count();
-    if at <= left_count {
+    if appending {
+      if !sibling.fits(name.len()) {
+        return Err(VfsError::NameTooLong);
+      }
+      sibling.insert_at(0, slot, name);
+    } else if at <= left_count {
       if !blocks.get(block)?.fits(name.len()) {
         return Err(VfsError::NameTooLong);
       }
@@ -1368,5 +1398,59 @@ mod tests {
     );
     assert!(retired.is_empty(), "same epoch: nothing copied");
     assert_eq!(tree.count, 30);
+  }
+
+  /// §4.8 rebuild (the rightmost split). Do: insert 4,000 names in the tree's own key order (as a rebuild does), and
+  /// the same names in a scattered order into a second tree. Expect: both list exactly the model; the ascending tree's
+  /// leaves are full but for its last, so it holds far fewer blocks than the scattered one (whose splits leave halves).
+  #[test]
+  fn ascending_inserts_fill_their_blocks() {
+    let mut names: Vec<(u64, String)> = (0..4000u64)
+      .map(|n| {
+        keyed(
+          POLICY,
+          &format!(
+            "name-{:05}-{}",
+            (n * 7919) % 4001,
+            "y".repeat(usize::try_from(n % 30).unwrap_or(0))
+          ),
+        )
+      })
+      .collect();
+    let scattered = names.clone();
+    names.sort();
+    let fill = |order: &[(u64, String)]| {
+      let mut blocks = slab();
+      let mut tree = Tree::new(&mut blocks, Epoch(0)).unwrap();
+      let mut retired = Retired::new();
+      for (index, (_, name)) in order.iter().enumerate() {
+        let child = Child::File(InodeNo(u64::try_from(index).unwrap_or(0)));
+        tree
+          .insert(&mut blocks, Epoch(0), &mut retired, POLICY, name, child)
+          .unwrap();
+      }
+      let listed = listed(&tree, &blocks);
+      (blocks.len(), listed)
+    };
+    let (ascending_blocks, ascending_listed) = fill(&names);
+    let (scattered_blocks, scattered_listed) = fill(&scattered);
+    assert_eq!(
+      ascending_listed, names,
+      "the ascending tree lists the model"
+    );
+    assert_eq!(
+      scattered_listed, names,
+      "the scattered tree lists the model"
+    );
+    let bytes: usize = names.iter().map(|(_, n)| ENTRY_BYTES + n.len()).sum();
+    let full_leaves = bytes.div_ceil(BLOCK_BYTES);
+    assert!(
+      ascending_blocks <= full_leaves + full_leaves / 8 + 2,
+      "ascending: {ascending_blocks} blocks for {full_leaves} blocks' worth of entries"
+    );
+    assert!(
+      ascending_blocks * 5 < scattered_blocks * 4,
+      "ascending {ascending_blocks} blocks against scattered {scattered_blocks}"
+    );
   }
 }

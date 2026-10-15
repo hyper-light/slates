@@ -5,7 +5,7 @@
 //! anchor's last handle. Paired `#[cfg]` functions, one signature.
 
 /// The watch.
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub(crate) struct ParentWatch {
   /// The anchor's pid, when the daemon is its child.
   anchor: Option<u32>,

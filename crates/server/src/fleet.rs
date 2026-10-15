@@ -413,7 +413,7 @@ fn adopt_inherited(
 }
 
 /// Takes ownership of a descriptor the supervisor handed over at `raw`: a fleet serve socket
-/// (`ENV_FLEET_SERVE`), or the device channel and a held FUSE device (`slates_anchor::devices::ENV_DEVICES`,
+/// (`ENV_FLEET_SERVE`), or the device channel and a held FUSE device (`slates_anchor::held::ENV_DEVICES`,
 /// `crate::fuse_hold`).
 #[cfg(unix)]
 pub(crate) fn inherited_descriptor(raw: std::os::fd::RawFd) -> std::os::fd::OwnedFd {
@@ -1059,7 +1059,7 @@ impl PeerDriver {
       stale: false,
       seed_retired: false,
     };
-    let _ = state::with_state(|s| s.plane.peers.insert(peer.anchor, plane_peer));
+    let _ = state::with_state_counted(|s| s.plane.peers.insert(peer.anchor, plane_peer));
     let record = PeerDial {
       anchor: peer.anchor,
       host: peer.host,
@@ -1385,6 +1385,22 @@ async fn serve_peer_records(
                 })
               })
               .unwrap_or_default(),
+            crate::mirror::MIRROR_PROMISE_STREAM => state::with_state(|s| {
+              let peer_host = s
+                .learned_members
+                .get(&peer_anchor)
+                .map_or(seed, |learned| learned.host);
+              crate::mirror::serve_promise(s, local, peer_host, &request)
+            })
+            .unwrap_or_default(),
+            crate::mirror::MIRROR_RECORD_STREAM => state::with_state(|s| {
+              let peer_host = s
+                .learned_members
+                .get(&peer_anchor)
+                .map_or(seed, |learned| learned.host);
+              crate::mirror::serve(s, local, peer_host, &request)
+            })
+            .unwrap_or_default(),
             crate::takeover::TAKEOVER_STREAM => state::with_state(|s| {
               let peer_host = s
                 .learned_members
@@ -1413,8 +1429,9 @@ async fn serve_peer_records(
                 s,
                 local,
                 &request,
-                |regional, records, access, object| {
+                |regional, records, mirror, access, object| {
                   content_authorized(regional, records, local, peer_host, access, object)
+                    || mirror.admits_put(peer_host, access, object)
                 },
               )
             })
@@ -1473,11 +1490,20 @@ async fn serve_peer_records(
             ROOT_FETCH_STREAM => {
               state::with_state(|s| serve_root_fetch(s, &request)).unwrap_or_default()
             }
-            FORWARD_STREAM => verbs::serve_forward(control, peer_anchor, &request).await,
+            FORWARD_STREAM => {
+              injected_serve_delay().await;
+              verbs::serve_forward(control, peer_anchor, &request).await
+            }
             crate::owner_location::STREAM => {
+              injected_serve_delay().await;
               state::with_state(
                 |state| match crate::owner_location::serve(state, &request) {
-                  Ok(reply) => reply,
+                  Ok((reply, declined)) => {
+                    if let Some(declined) = declined {
+                      state.count(declined, 1);
+                    }
+                    reply
+                  }
                   Err(error) => {
                     state.count(error.counter(), 1);
                     Vec::new()
@@ -1491,6 +1517,9 @@ async fn serve_peer_records(
         }
       })
       .await;
+    // The sender's state on the connection the peer dialed: where its forwards and reads come back from this node.
+    let seen = crate::state::RecordLink::seen(peer_anchor, &endpoint);
+    state::with_state(|s| s.served_sessions.insert(peer_anchor.0, seen));
     if served.is_err() {
       return;
     }
@@ -1548,6 +1577,21 @@ pub(crate) fn accept_held_record(
   if let Err(error) = check_held_record(state, local, peer_host, record) {
     return encode_refusal(&error);
   }
+  hold_checked_record(state, local, peer_host, record)
+}
+
+/// The status count of held records accepted but not acknowledged because the shard's publish carrying them was
+/// refused (§4.8 persistence before reply). Format: a refusal name in the daemon's status report.
+const RECORD_UNPUBLISHED: &str = "fleet.record.unpublished";
+
+/// Holds `record` from `peer_host` once its authority was checked ([`check_held_record`]): the acceptance into this
+/// holder's register for the object, the routing it learns, and the acknowledgement or the refusal's reply.
+pub(crate) fn hold_checked_record(
+  state: &mut ShardState,
+  local: HostId,
+  peer_host: HostId,
+  record: &Record,
+) -> Vec<u8> {
   let generation = state.fleet.configuration().version;
   let accepted = match state.holder_records.get_mut(&record.object) {
     Some(acceptor) => acceptor.accept(record),
@@ -1587,6 +1631,13 @@ pub(crate) fn accept_held_record(
       {
         Ok(()) => {
           after_held_record(state, record);
+          // The acknowledgement stands behind the shard's publish (§4.8 persistence before reply): a warm restart
+          // keeps this node's member id, so a record it acknowledged must be held again after it. A refused
+          // publish answers no acknowledgement, and the record rides the next publish that commits.
+          if crate::verbs::publish_shard(state).is_err() {
+            state.count(RECORD_UNPUBLISHED, 1);
+            return Vec::new();
+          }
           ack.encode()
         }
         Err(error) => encode_refusal(&error),
@@ -1776,6 +1827,9 @@ fn unplaced_heads(state: &ShardState, local: HostId) -> Vec<Head> {
     let Some((sequence, value)) = head_value_of(state, record, object, config.quorum) else {
       continue; // The newest seal's content is not yet placed: the head waits for it.
     };
+    if !sealing_covers_candidates(state, config, object, &value, local) {
+      continue; // A candidate could not open the sealed content as a successor: the head waits for its pair.
+    }
     heads.extend(owed_record(
       state,
       config,
@@ -1914,6 +1968,92 @@ fn owed_record(
   })
 }
 
+/// Whether a head may ship given what its sealing covers (A-92 pieces 3b and 4c), over the object's remote candidates
+/// that are still members of the neighbourhood. A candidate the council has retired stays in the placement while the
+/// owner's neighbourhood change is in flight (the settled and the current cohorts are joined), but it can never take
+/// the volume over, so it needs no entry; requiring one held the head back from the new cohort, and the change could
+/// never settle (`an_owner_settles_its_neighbourhood_only_once_its_head_is_placed_on_the_new_cohort`). See
+/// [`sealing_covers`].
+fn sealing_covers_candidates(
+  state: &ShardState,
+  config: &slates_db::register::Configuration,
+  object: ObjectId,
+  value: &HeadValue,
+  local: HostId,
+) -> bool {
+  let placement = config.place(object);
+  let remote = placement
+    .candidates
+    .iter()
+    .copied()
+    .filter(|candidate| *candidate != local && config.neighbourhood.contains(candidate));
+  sealing_covers(state, object, value, remote)
+}
+
+/// Whether a head naming sealed content carries the lineage key for each of `holders` (A-92 pieces 3b and 4c). The
+/// volume has a lineage key, so its archive is an envelope; any holder may become the successor (or a promoted mirror),
+/// and one without its entry could never open the envelope, so the volume would stay unserved after a takeover. Such a
+/// head waits until the owner shard has delivered a pair to every holder. Every holder at once, not each as it is
+/// covered: a head's bytes at one sequence are one register value, and shipping it to some holders now and to the
+/// rest later with more entries would put two values at one position. The wait is bounded: a pair is delivered once
+/// per neighbour and kept, each record period, so only a member new to the neighbourhood, or one unreachable until
+/// it is retired, holds a new sealed head back. A head naming no content, or plain content, needs no keys.
+pub(crate) fn sealing_covers(
+  state: &ShardState,
+  object: ObjectId,
+  value: &HeadValue,
+  mut holders: impl Iterator<Item = HostId>,
+) -> bool {
+  if value.manifest.is_none()
+    || !crate::seal_keys::lineage_recorded(state, DbVolumeId { bytes: object.0 })
+  {
+    return true;
+  }
+  let Some(sealing) = value.sealing.as_ref() else {
+    return false;
+  };
+  holders.all(|holder| {
+    state
+      .member_anchors
+      .get(&holder)
+      .is_some_and(|anchor| sealing.keys.iter().any(|key| key.anchor == *anchor))
+  })
+}
+
+/// Whether the owner's head for `object` names sealed content it may not ship yet, because its sealing does not cover
+/// every live candidate ([`sealing_covers_candidates`]): the head waits for a pair delivery. Read by
+/// `Daemon::fleet_head_awaits_keys`, so a placement that never completes names this cause.
+pub(crate) fn head_awaits_keys(state: &ShardState, object: ObjectId) -> bool {
+  let Some(record) = state.db.partition().volume(DbVolumeId { bytes: object.0 }) else {
+    return false;
+  };
+  let config = state.fleet.configuration();
+  head_value_of(state, record, object, config.quorum).is_some_and(|(_, value)| {
+    !sealing_covers_candidates(state, config, object, &value, state.fleet.host())
+  })
+}
+
+/// The owner's sealed manifest for `object` once its content has placed: from the snapshot's durable record once the
+/// seal completed, else from the seal in progress once its content placed; `None` before then, or for a volume this
+/// shard does not own (read by `Daemon::fleet_sealed_manifest`).
+pub(crate) fn sealed_manifest(state: &ShardState, object: ObjectId) -> Option<[u8; 32]> {
+  let record = state
+    .db
+    .partition()
+    .volume(DbVolumeId { bytes: object.0 })?;
+  if let Some(snapshot) = state.db.partition().snapshot(record.id, record.head)
+    && let PlacementState::Placed { .. } = &snapshot.placed
+    && let Some(identity) = snapshot.identity
+  {
+    return Some(identity);
+  }
+  let seal = state.seals.get(&object)?;
+  if seal.snapshot != record.head || !seal.content.placed(state.fleet.configuration().quorum) {
+    return None;
+  }
+  seal.manifest
+}
+
 /// The head this node should be shipping for `record`'s volume — its sequence and value — or `None` while
 /// the volume's newest snapshot has content not yet placed. At epoch 0 it is the creation head (no content).
 /// For a sealed snapshot it names the manifest and the content holders: from the snapshot's durable record
@@ -1952,8 +2092,32 @@ fn head_value_of(
   Some((seal.sequence, value(seal.manifest, holders)))
 }
 
+/// Which content placement a seal job serves: the home region's candidates, or the owner's neighbourhood in its
+/// mirror region (§4.10 "Mirroring across regions"; `docs/wip/mirroring.md`). The two run the same rounds over
+/// different candidates and are kept apart, each in its own map on the owner shard.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Track {
+  /// The seal of a new snapshot to the home region's candidates ([`ShardState::seals`]).
+  Home,
+  /// The shipment of a home-placed snapshot to the mirror region ([`ShardState::mirror_seals`]).
+  Mirror,
+}
+
+/// The seal jobs of `track` on this owner shard.
+fn seal_jobs(
+  state: &mut ShardState,
+  track: Track,
+) -> &mut std::collections::BTreeMap<ObjectId, SealJob> {
+  match track {
+    Track::Home => &mut state.seals,
+    Track::Mirror => &mut state.mirror_seals,
+  }
+}
+
 /// A seal whose archive is complete and whose content is not yet placed: the put to run this period.
 struct ContentWork {
+  /// Which placement the seal serves: its map on the owner shard, and the first round's size.
+  track: Track,
   /// The shard that owns the volume — where the seal lives and its acknowledgements are recorded.
   shard: u16,
   object: ObjectId,
@@ -1980,6 +2144,246 @@ struct ContentWork {
 /// base-backed entry whose bytes are on disk, not in RAM; a torn read): the seal stays `Local`, reported.
 /// Format: a refusal name in the daemon's status report, alongside the verbs' refusal kinds.
 const SEAL_REFUSED: &str = "fleet.seal";
+
+/// This node's neighbourhood in its region's mirror region (§4.10 "the owner's neighbourhood in the mirror region";
+/// `docs/wip/mirroring.md` decision 1): the mirror region's members this node holds alive and has authenticated,
+/// ranked by rendezvous keyed on this node. Empty when its region declares no mirror.
+fn mirror_neighbourhood_of(state: &ShardState, local: HostId) -> Vec<HostId> {
+  let own = state
+    .node_regions
+    .get(&local)
+    .copied()
+    .unwrap_or(RegionId(0));
+  let Some(mirror) = state.region_mirrors.get(&own).copied() else {
+    return Vec::new();
+  };
+  if mirror == own {
+    return Vec::new();
+  }
+  let members: Vec<HostId> = state
+    .node_regions
+    .iter()
+    .filter(|(host, region)| {
+      **region == mirror
+        && state.authenticated_members.contains(host)
+        && state
+          .fleet
+          .membership()
+          .state(**host)
+          .is_some_and(|belief| belief.liveness != Liveness::Dead)
+    })
+    .map(|(host, _)| *host)
+    .collect();
+  slates_db::mirror::mirror_neighbourhood(local, &members, state.fleet.configuration().quorum)
+}
+
+/// One period of this node's mirror shipments (§4.10 "Mirroring across regions"; `docs/wip/mirroring.md` piece M2):
+/// for each owned volume whose head snapshot is recorded placed at home and not yet in the mirror, a mirror job is
+/// started (or replaced, when a newer snapshot superseded it), its archive walk advanced one slice, and its content
+/// round to the mirror neighbourhood returned once the archive is complete. A volume whose head the mirror already
+/// holds, or that is being destroyed, keeps no job. Nothing runs with no mirror declared.
+fn advance_mirror_seals(
+  state: &mut ShardState,
+  local: HostId,
+  slice_bytes: u64,
+  created_unix: u64,
+  round: CommitBudget,
+) -> Vec<ContentWork> {
+  state.mirror_neighbourhood = mirror_neighbourhood_of(state, local);
+  if state.mirror_neighbourhood.is_empty() {
+    // A mirror declared for this node's region with no live, authenticated member of it to ship to is counted: it is
+    // the one way a declared mirror ships nothing without a refusal anywhere.
+    let own = state
+      .node_regions
+      .get(&local)
+      .copied()
+      .unwrap_or(RegionId(0));
+    if state
+      .region_mirrors
+      .get(&own)
+      .is_some_and(|mirror| *mirror != own)
+    {
+      state.count(MIRROR_NO_NEIGHBOURHOOD, 1);
+    }
+    state.mirror_seals.clear();
+    return Vec::new();
+  }
+  let quorum = state.fleet.configuration().quorum;
+  let mut work = Vec::new();
+  let volumes: Vec<(DbVolumeId, slates_mem::Handle<crate::state::VolumeSlot>)> =
+    state.by_id.iter().map(|(id, h)| (*id, *h)).collect();
+  for (id, handle) in volumes {
+    let object = ObjectId(id.bytes);
+    let Some(head) = mirror_due(state, id) else {
+      state.mirror_seals.remove(&object);
+      continue;
+    };
+    if state
+      .mirror_seals
+      .get(&object)
+      .is_some_and(|job| job.snapshot != head.0)
+    {
+      state.mirror_seals.remove(&object);
+    }
+    if !state.mirror_seals.contains_key(&object) {
+      if !start_mirror_seal(state, object, handle, head, created_unix) {
+        continue;
+      }
+      state.count(MIRROR_JOB_STARTED, 1);
+    }
+    if !advance_seal(state, Track::Mirror, object, handle, slice_bytes) {
+      continue;
+    }
+    if let Some(item) = content_work(state, Track::Mirror, object, quorum, round) {
+      state.count(MIRROR_CONTENT_ROUNDS, 1);
+      work.push(item);
+    }
+  }
+  work
+}
+
+/// The head snapshot of `id` and its sequence when it is placed at home and its mirror placement is not yet recorded:
+/// what a mirror job ships. `None` before the home placement (content places at home first), once the mirror holds
+/// it, and for a volume being destroyed.
+fn mirror_due(state: &ShardState, id: DbVolumeId) -> Option<(DbSnapshotId, u64)> {
+  let record = state.db.partition().volume(id)?;
+  if record.epoch == 0 || record.state == VolumeState::Destroying {
+    return None;
+  }
+  let snapshot = state.db.partition().snapshot(id, record.head)?;
+  matches!(snapshot.placed, PlacementState::Placed { mirror: None, .. })
+    .then_some((record.head, record.epoch))
+}
+
+/// Starts the mirror shipment of `head` for `object`: the archive walk over the volume's snapshot, put to the
+/// object's cohort in the mirror neighbourhood (its rendezvous order over it), with nothing acknowledged yet: the
+/// owner holds no mirror copy. `false`, counted, if the snapshot cannot be walked.
+fn start_mirror_seal(
+  state: &mut ShardState,
+  object: ObjectId,
+  handle: slates_mem::Handle<crate::state::VolumeSlot>,
+  (head, sequence): (DbSnapshotId, u64),
+  created_unix: u64,
+) -> bool {
+  let Ok(slot) = state.volumes.get(handle) else {
+    return false;
+  };
+  let archiver = SnapshotArchiver::new(
+    &slot.volume,
+    &state.store,
+    verbs::core_snapshot(slates_ipc::protocol::SnapshotId { value: head.value }),
+    object.local(),
+    created_unix,
+    state.config.codec.clone(),
+  );
+  let Ok(archiver) = archiver else {
+    state.count(SEAL_REFUSED, 1);
+    return false;
+  };
+  let candidates = slates_db::register::rendezvous_ranked(&state.mirror_neighbourhood, object);
+  state.mirror_seals.insert(
+    object,
+    SealJob {
+      snapshot: head,
+      sequence,
+      archiver: Some(archiver),
+      archive: None,
+      manifest: None,
+      content: Placement {
+        candidates,
+        acked: Vec::new(),
+        mirror_acked: None,
+        joint: Vec::new(),
+      },
+      rounds: 0,
+      first_round_at_ns: None,
+      healing: false,
+      records_acked: Vec::new(),
+      shipment: None,
+    },
+  );
+  true
+}
+
+/// Records durably each mirror shipment whose content `f + 1` of its mirror cohort hold
+/// (`SnapshotPlaced { mirror: Some(holders) }`, keeping the home placement), and drops it: the fact
+/// `await placed(mirror)` and a mirror's lag answer from. Runs on the owner shard.
+fn record_mirrored_seals(state: &mut ShardState) {
+  let quorum = state.fleet.configuration().quorum;
+  let now = state.clock.monotonic_ns();
+  let done: Vec<(ObjectId, DbSnapshotId, Vec<u64>)> = state
+    .mirror_seals
+    .iter()
+    .filter(|(_, job)| {
+      job.manifest.is_some() && quorum.committed(crate::mirror::holders_of(job).len())
+    })
+    .map(|(object, job)| {
+      (
+        *object,
+        job.snapshot,
+        crate::mirror::holders_of(job)
+          .iter()
+          .map(|host| host.0)
+          .collect(),
+      )
+    })
+    .collect();
+  for (object, snapshot, mirror) in done {
+    let volume = DbVolumeId { bytes: object.0 };
+    let region = match state.db.partition().snapshot(volume, snapshot) {
+      Some(record) => match &record.placed {
+        PlacementState::Placed { region, .. } => region.clone(),
+        PlacementState::Local => Vec::new(),
+      },
+      None => Vec::new(),
+    };
+    let placed = Op::SnapshotPlaced {
+      volume,
+      id: snapshot,
+      placed: PlacementState::Placed {
+        region,
+        mirror: Some(mirror),
+      },
+    };
+    // A snapshot gone meanwhile (destroyed) has nothing to record; the job is dropped either way.
+    let recorded = state.db.mutate(&mut state.segment, &placed, now);
+    if recorded.is_err() {
+      state.count(MIRROR_RECORD_REFUSED, 1);
+    }
+    state.mirror_seals.remove(&object);
+  }
+}
+
+/// Counter: periods in which this node's region declares a mirror but no live, authenticated member of the mirror
+/// region was found to ship to (`advance_mirror_seals`).
+const MIRROR_NO_NEIGHBOURHOOD: &str = "fleet.mirror.no_neighbourhood";
+
+/// Counter: home content rounds that found no free session to any of their targets (`put_seal_content`).
+const SEAL_NO_HOLDER_SESSION: &str = "fleet.seal.no_holder_session";
+
+/// Counter: mirror content rounds that found no free session to any of their targets (`put_seal_content`).
+const MIRROR_NO_HOLDER_SESSION: &str = "fleet.mirror.no_holder_session";
+
+/// Counter: content acknowledgements mirror holders returned within their rounds (`put_seal_content`).
+const MIRROR_ACKS: &str = "fleet.mirror.acks";
+
+/// Counter: mirror content rounds that failed outright (neither placed, uncertain nor short of the quorum).
+const MIRROR_ROUND_FAILED: &str = "fleet.mirror.round_failed";
+
+/// Counter: home placements recorded again for a snapshot already placed in the mirror, which kept its mirror
+/// placement (`record_placed_seals`).
+const MIRROR_KEPT_ON_HOME_RECORD: &str = "fleet.mirror.kept_on_home_record";
+
+/// Counter: mirror shipments started (a snapshot placed at home, its archive walk begun for the mirror region).
+const MIRROR_JOB_STARTED: &str = "fleet.mirror.job_started";
+
+/// Counter: content rounds sent to the mirror neighbourhood (a mirror shipment's archive complete and put).
+const MIRROR_CONTENT_ROUNDS: &str = "fleet.mirror.content_rounds";
+
+/// The status count of mirror placements the database refused to record (the snapshot destroyed meanwhile, or the
+/// partition refusing): the shipment is dropped and the next period starts it again if the snapshot still stands.
+/// Format: a refusal name in the daemon's status report.
+const MIRROR_RECORD_REFUSED: &str = "fleet.mirror.record_refused";
 
 /// One period of this node's seals (§4.10 "auto-seal" → content replication; §4.3 bounded slices): for each
 /// owned volume whose newest snapshot is not yet placed, a seal job is started (or replaced, when a newer
@@ -2030,10 +2434,10 @@ fn advance_seals(
     {
       continue;
     }
-    if !advance_seal(state, object, handle, slice_bytes) {
+    if !advance_seal(state, Track::Home, object, handle, slice_bytes) {
       continue;
     }
-    if let Some(item) = content_work(state, object, quorum, round) {
+    if let Some(item) = content_work(state, Track::Home, object, quorum, round) {
       work.push(item);
     }
   }
@@ -2203,6 +2607,8 @@ fn start_seal(
       rounds: 0,
       first_round_at_ns: None,
       healing,
+      records_acked: Vec::new(),
+      shipment: None,
     },
   );
   true
@@ -2213,11 +2619,17 @@ fn start_seal(
 /// `Local`, counted so an operator sees why it never places (§4.4 coverage is never upgraded).
 fn advance_seal(
   state: &mut ShardState,
+  track: Track,
   object: ObjectId,
   handle: slates_mem::Handle<crate::state::VolumeSlot>,
   slice_bytes: u64,
 ) -> bool {
-  let Some(job) = state.seals.get_mut(&object) else {
+  // The track's map is picked field by field, so the job is borrowed beside the volumes and the store.
+  let jobs = match track {
+    Track::Home => &mut state.seals,
+    Track::Mirror => &mut state.mirror_seals,
+  };
+  let Some(job) = jobs.get_mut(&object) else {
     return false;
   };
   let Some(archiver) = job.archiver.as_mut() else {
@@ -2241,7 +2653,7 @@ fn advance_seal(
   let Some(archive) = envelope_of(state, object, archive) else {
     return false;
   };
-  let Some(job) = state.seals.get_mut(&object) else {
+  let Some(job) = seal_jobs(state, track).get_mut(&object) else {
     return false;
   };
   job.manifest = Some(archive.manifest_identity());
@@ -2409,7 +2821,11 @@ fn hedge_delay_ns(latency: &LatencyWindow) -> u64 {
 /// expires there and is hedged); the stall window = the hedge delay itself (an acknowledgement within one
 /// delay is progress); poll = the collection cadence ([`POLL_PER_PERIOD`]).
 fn content_budget(latency: &LatencyWindow, round: CommitBudget) -> CommitBudget {
-  let hedge_delay = hedge_delay_ns(latency);
+  content_budget_at(hedge_delay_ns(latency), round)
+}
+
+/// [`content_budget`] at a given hedge delay (a mirror round's, floored at its path).
+fn content_budget_at(hedge_delay: u64, round: CommitBudget) -> CommitBudget {
   let span = round.max_deadline_ns().max(hedge_delay);
   CommitBudget::with_extension(
     hedge_delay,
@@ -2439,14 +2855,41 @@ fn fold_content_ack(job: &mut SealJob, holder: HostId) {
 /// happen to be driven at (§4.8 "hedged to the remaining candidates after the measured p95 put latency").
 fn content_work(
   state: &mut ShardState,
+  track: Track,
   object: ObjectId,
   quorum: Quorum,
   round: CommitBudget,
 ) -> Option<ContentWork> {
-  let hedge_delay = hedge_delay_ns(&state.put_latency);
-  let budget = content_budget(&state.put_latency, round);
+  // Each track is hedged and judged stalled from its own measured puts, and a mirror round never sooner than the
+  // slowest measured round-trip tail to its candidates: until 2026-10-09 both tracks used the home window, whose p95
+  // on a local network is far inside a round trip to another region, so every mirror round was judged stalled at its
+  // offer and the mirror never placed (350 rounds, 0 acknowledgements, on a 200 ms path).
+  let (hedge_delay, budget) = match track {
+    Track::Home => (
+      hedge_delay_ns(&state.put_latency),
+      content_budget(&state.put_latency, round),
+    ),
+    Track::Mirror => {
+      let floor = state
+        .mirror_seals
+        .get(&object)
+        .map(|job| {
+          job
+            .content
+            .candidates
+            .iter()
+            .filter_map(|host| state.peer_paths.get(host).and_then(PathRtt::tail_ns))
+            .max()
+            .unwrap_or(0)
+        })
+        .unwrap_or(0);
+      let hedge = hedge_delay_ns(&state.mirror_put_latency).max(floor);
+      (hedge, content_budget_at(hedge, round))
+    }
+  };
   let now = state.clock.monotonic_ns();
-  let job = state.seals.get_mut(&object)?;
+  let shard = state.shard;
+  let job = seal_jobs(state, track).get_mut(&object)?;
   if job.content.placed(quorum) {
     return None;
   }
@@ -2457,7 +2900,8 @@ fn content_work(
   };
   let archive = job.archive.take()?;
   Some(ContentWork {
-    shard: state.shard,
+    track,
+    shard,
     object,
     snapshot: job.snapshot,
     sequence: job.sequence,
@@ -2496,7 +2940,15 @@ fn hedge_targets(hedged: bool, remote: Vec<HostId>, first_round: usize) -> Vec<H
 /// dispatch to settle.
 async fn put_seal_content(origin: u16, local: HostId, work: ContentWork) -> Option<Dispatch> {
   let budget = work.budget;
-  let hedge = usize::try_from(work.quorum.f).unwrap_or(0);
+  // The first round reaches `f + 1` copies: at home the owner is one of them, so `f` remote candidates; in the
+  // mirror region the owner holds none, so `f + 1`.
+  let owner_copies = match work.track {
+    Track::Home => 0,
+    Track::Mirror => 1,
+  };
+  let hedge = usize::try_from(work.quorum.f)
+    .unwrap_or(0)
+    .saturating_add(owner_copies);
   let remote: Vec<HostId> = work
     .candidates
     .iter()
@@ -2504,10 +2956,19 @@ async fn put_seal_content(origin: u16, local: HostId, work: ContentWork) -> Opti
     .filter(|host| *host != local && !work.acked.contains(host))
     .collect();
   let targets = hedge_targets(work.hedged, remote, hedge);
-  let holders = take_sessions(|host| targets.contains(&host));
+  let holders = take_sessions("fleet.lent_to.put_seal_content", |host| {
+    targets.contains(&host)
+  });
   let dispatched_ns = futures::now_ns();
   let manifest = work.archive.manifest_identity();
   let (placement, latencies_ns, refilled, dispatch) = if holders.is_empty() {
+    // No session to any target was free (none held, or every one lent): the round sends nothing, counted per track, so
+    // a placement that never progresses names why.
+    let counter = match work.track {
+      Track::Home => SEAL_NO_HOLDER_SESSION,
+      Track::Mirror => MIRROR_NO_HOLDER_SESSION,
+    };
+    let _ = state::with_state_counted(|s| s.count(counter, 1));
     (None, Vec::new(), Vec::new(), None)
   } else {
     let taken: Vec<HostId> = holders.iter().map(|(host, _)| *host).collect();
@@ -2529,6 +2990,7 @@ async fn put_seal_content(origin: u16, local: HostId, work: ContentWork) -> Opti
       &placed.reusable,
       placed.stragglers,
       LateReplies::Content {
+        track: work.track,
         shard: work.shard,
         object: work.object,
         snapshot: work.snapshot,
@@ -2538,6 +3000,19 @@ async fn put_seal_content(origin: u16, local: HostId, work: ContentWork) -> Opti
       },
     );
     return_sessions(placed.reusable);
+    if work.track == Track::Mirror {
+      let acks = u64::try_from(placed.latencies_ns.len()).unwrap_or(u64::MAX);
+      let failed = matches!(
+        placed.outcome,
+        Err(ref error) if !matches!(error, ClusterError::Uncertain { .. } | ClusterError::NotPlaced { .. })
+      );
+      let _ = state::with_state_counted(|s| {
+        s.count(MIRROR_ACKS, acks);
+        if failed {
+          s.count(MIRROR_ROUND_FAILED, 1);
+        }
+      });
+    }
     let placement = match placed.outcome {
       Ok(placement) => Some(placement),
       Err(ClusterError::Uncertain { placement } | ClusterError::NotPlaced { placement }) => {
@@ -2556,6 +3031,7 @@ async fn put_seal_content(origin: u16, local: HostId, work: ContentWork) -> Opti
   // their latencies (the content class's readings the next hedge is sized from), and note when the first
   // round went out (the hedge is held until it has been outstanding for the measured p95).
   let ContentWork {
+    track,
     shard,
     object,
     snapshot,
@@ -2564,11 +3040,15 @@ async fn put_seal_content(origin: u16, local: HostId, work: ContentWork) -> Opti
     quorum,
     ..
   } = work;
-  let _ = run_on(origin, shard, move |s| {
+  crate::xshard::run_on_counted(origin, shard, move |s| {
     for (_, latency_ns) in &latencies_ns {
-      s.put_latency.record(*latency_ns);
+      match track {
+        Track::Home => s.put_latency.record(*latency_ns),
+        Track::Mirror => s.mirror_put_latency.record(*latency_ns),
+      }
     }
-    let Some(job) = s.seals.get_mut(&object) else {
+    // The job is borrowed alone; what the round counts is written after the borrow ends.
+    let Some(job) = seal_jobs(s, track).get_mut(&object) else {
       return; // The seal was superseded meanwhile; its archive is dropped with it.
     };
     if job.snapshot != snapshot {
@@ -2578,24 +3058,28 @@ async fn put_seal_content(origin: u16, local: HostId, work: ContentWork) -> Opti
     if round == 0 && job.first_round_at_ns.is_none() {
       job.first_round_at_ns = Some(dispatched_ns);
     }
-    if let Some(placement) = placement {
-      job.rounds = job.rounds.saturating_add(1);
-      // A healing round that shipped bytes to a holder repaired it: that holder had lost content the
-      // placement recorded it as holding (§4.10 "repairs only differing subtrees").
-      if job.healing {
-        let repaired = refilled
-          .iter()
-          .filter(|host| placement.acked.contains(host))
-          .count();
-        s.repairs = s
-          .repairs
-          .saturating_add(u64::try_from(repaired).unwrap_or(u64::MAX));
-      }
-      for host in placement.acked {
-        fold_content_ack(job, host);
-      }
-      s.put_outcomes.record(job.content.placed(quorum));
+    let Some(placement) = placement else {
+      return;
+    };
+    job.rounds = job.rounds.saturating_add(1);
+    // A healing round that shipped bytes to a holder repaired it: that holder had lost content the
+    // placement recorded it as holding (§4.10 "repairs only differing subtrees").
+    let repaired = if job.healing {
+      refilled
+        .iter()
+        .filter(|host| placement.acked.contains(host))
+        .count()
+    } else {
+      0
+    };
+    for host in placement.acked {
+      fold_content_ack(job, host);
     }
+    let placed = job.content.placed(quorum);
+    s.repairs = s
+      .repairs
+      .saturating_add(u64::try_from(repaired).unwrap_or(u64::MAX));
+    s.put_outcomes.record(placed);
   });
   dispatch
 }
@@ -2627,6 +3111,22 @@ fn record_placed_seals(state: &mut ShardState) {
     .collect();
   for (object, snapshot, identity, region) in done {
     let volume = DbVolumeId { bytes: object.0 };
+    // A mirror placement already recorded is kept: a home seal that completes again for a mirrored snapshot (the
+    // healer's re-offer) wrote `mirror: None` over it until 2026-10-09, which started a second mirror job for the
+    // snapshot, whose shipment named other content holders at the same position and was refused for good.
+    let mirror = match state.db.partition().snapshot(volume, snapshot) {
+      Some(record) => match &record.placed {
+        PlacementState::Placed {
+          mirror: Some(mirror),
+          ..
+        } => Some(mirror.clone()),
+        _ => None,
+      },
+      None => None,
+    };
+    if mirror.is_some() {
+      state.count(MIRROR_KEPT_ON_HOME_RECORD, 1);
+    }
     let ops = [
       Op::SnapshotIdentified {
         volume,
@@ -2636,10 +3136,7 @@ fn record_placed_seals(state: &mut ShardState) {
       Op::SnapshotPlaced {
         volume,
         id: snapshot,
-        placed: PlacementState::Placed {
-          region,
-          mirror: None,
-        },
+        placed: PlacementState::Placed { region, mirror },
       },
     ];
     for op in &ops {
@@ -2673,15 +3170,17 @@ async fn materialize_pending(origin: u16, budget: CommitBudget) {
   })
   .unwrap_or_default();
   for (object, head) in pending {
-    let Some(manifest) = head.manifest else {
-      // A head naming no content (the volume was never sealed): nothing to serve beyond the head.
-      state::with_state(|s| s.pending_materializations.remove(&object));
-      continue;
-    };
-    let held =
-      state::with_state(|s| s.held_content.holds_manifest(object, &manifest)).unwrap_or(false);
-    if !held && !fetch_into_hold(object, &head, manifest, budget).await {
-      continue; // Not whole yet: what was fetched stays staged for the next period (AUD-29-55).
+    // A head that names content waits until this node holds that content; a contentless volume (a scratch
+    // volume never sealed) has nothing to fetch and materializes from its adopted head and catalog registers
+    // alone. Both then go to `materialize`, which builds the servable db entry. A head-only volume was dropped
+    // here unmaterialized before 2026-10-11, so a taken-over scratch volume stayed `owned_unmaterialized`
+    // forever (docs/bugs/2026-10-11-taken-over-scratch-volumes-never-become-servable.md).
+    if let Some(manifest) = head.manifest {
+      let held =
+        state::with_state(|s| s.held_content.holds_manifest(object, &manifest)).unwrap_or(false);
+      if !held && !fetch_into_hold(object, &head, manifest, budget).await {
+        continue; // Not whole yet: what was fetched stays staged for the next period (AUD-29-55).
+      }
     }
     materialize(origin, object, head).await;
   }
@@ -2712,9 +3211,13 @@ async fn fetch_into_hold(
   let holders = head.holders();
   // Every reachable recorded holder: the manifest and the chunks are ranked, hedged and tied across all of them
   // (A-91; §4.10 "hedged fetches by identity from the recorded holders"), so one slow or lost holder is masked.
-  let sessions = take_sessions(|host| holders.contains(&host));
+  let sessions = take_sessions("fleet.lent_to.fetch_into_hold", |host| {
+    holders.contains(&host)
+  });
   if sessions.is_empty() {
-    return false; // No recorded holder reachable this period.
+    // No recorded holder reachable this period (none with a session here, or every such session out on loan).
+    count_refusal(FETCH_NO_HOLDER_SESSION);
+    return false;
   }
   let hedge_after_ns =
     state::with_state(|s| hedge_delay_ns(&s.fetch_latency)).unwrap_or(HEARTBEAT_NS);
@@ -2733,12 +3236,14 @@ async fn fetch_into_hold(
         let placed = slates_cluster::content::Placed {
           sequence: s.placed_heads.get(&object).map_or(0, |head| head.sequence),
         };
-        s.held_content.stage_fetched(
-          &mut crate::content_holder::hold_space(&mut s.store),
-          object,
-          placed,
-          found,
-        )
+        past_the_pressure_hold(s, |s| {
+          s.held_content.stage_fetched(
+            &mut crate::content_holder::hold_space(&mut s.store),
+            object,
+            placed,
+            found,
+          )
+        })
       });
       match staged {
         Some(Ok(None)) => {
@@ -2754,14 +3259,15 @@ async fn fetch_into_hold(
     },
     |chunk| {
       state::with_state(|s| {
-        s.held_content
-          .stage_piece(
+        past_the_pressure_hold(s, |s| {
+          s.held_content.stage_piece(
             &mut crate::content_holder::hold_space(&mut s.store),
             object,
             &manifest,
             chunk,
           )
-          .is_ok()
+        })
+        .is_ok()
       })
       .unwrap_or(false)
     },
@@ -2784,20 +3290,60 @@ async fn fetch_into_hold(
   });
   if stage_refused {
     count_refusal(MATERIALIZE_REFUSED);
+    count_refusal(FETCH_STAGE_REFUSED);
     return false;
   }
   if already_whole {
     return true;
   }
   if !fetched.complete {
-    return false; // Not whole yet: what was fetched stays staged for the next period (AUD-29-55).
+    // Not whole yet: what was fetched stays staged for the next period (AUD-29-55).
+    count_refusal(FETCH_INCOMPLETE);
+    return false;
   }
-  state::with_state(|s| {
-    s.held_content
-      .complete_stage(&mut crate::content_holder::hold_space(&mut s.store), object)
-      .is_ok()
+  let completed = state::with_state(|s| {
+    past_the_pressure_hold(s, |s| {
+      s.held_content
+        .complete_stage(&mut crate::content_holder::hold_space(&mut s.store), object)
+    })
+    .is_ok()
   })
-  .unwrap_or(false)
+  .unwrap_or(false);
+  if !completed {
+    count_refusal(FETCH_COMPLETE_REFUSED);
+  }
+  completed
+}
+
+/// Counter: a takeover fetch found no session to any recorded holder of the head this period (none kept here, or
+/// every one out on loan); it is asked again next period.
+/// Format: a counter name in the daemon's status report.
+const FETCH_NO_HOLDER_SESSION: &str = "fleet.fetch.no_holder_session";
+/// Counter: a takeover fetch's manifest could not be staged in the hold (no capacity, or a refused stage).
+/// Format: a counter name in the daemon's status report.
+const FETCH_STAGE_REFUSED: &str = "fleet.fetch.stage_refused";
+/// Counter: a takeover fetch ended its period without the whole content; what it fetched stays staged.
+/// Format: a counter name in the daemon's status report.
+const FETCH_INCOMPLETE: &str = "fleet.fetch.incomplete";
+/// Counter: a takeover fetch held every chunk, but the hold refused to complete its stage.
+/// Format: a counter name in the daemon's status report.
+const FETCH_COMPLETE_REFUSED: &str = "fleet.fetch.complete_refused";
+
+/// One period of everything this node adopts: each takeover it owes a confirmation of (one batched phase-one round per
+/// retired host across its recovery neighbourhoods, §4.8 "Promotion and takeover"; the holds and rounds arrive over
+/// this shard's sessions), a region promoted to this one (`crate::mirror`: the council leader's phase one and
+/// assignments, then this node's own assigned adoptions), and the content of each adopted head, served from what this
+/// node holds or a recorded holder on the shard the id routes to.
+async fn adopt_and_serve(
+  origin: u16,
+  local: HostId,
+  budget: CommitBudget,
+  in_flight: &mut Vec<Dispatch>,
+) {
+  in_flight.extend(crate::takeover::drive_takeovers(local, budget).await);
+  in_flight.extend(crate::mirror::drive_promotion(local, budget).await);
+  crate::mirror::adopt_assigned(local, budget, in_flight).await;
+  materialize_adopted_objects(origin, budget).await;
 }
 
 /// One period's materialization of everything this node took over: the plain volumes whose heads it
@@ -2917,7 +3463,9 @@ async fn materialize_pending_greens(origin: u16) {
       origin,
       target,
       move |s| {
-        let served = verbs::materialize_taken_over_green(s, id, recovery).is_ok();
+        let served =
+          past_the_pressure_hold(s, |s| verbs::materialize_taken_over_green(s, id, recovery))
+            .is_ok();
         if served {
           s.placed_heads.insert(object, placed);
         }
@@ -2936,6 +3484,65 @@ async fn materialize_pending_greens(origin: u16) {
   }
 }
 
+/// Waits out a test's injected serve delay (`Daemon::inject_serve_delay`) before a location answer or a forwarded
+/// verb; nothing in production. A sleep the runtime could not time is counted and the answer goes at once.
+async fn injected_serve_delay() {
+  let Some(delay_ns) = state::with_state(|s| s.injected_serve_delay_ns).flatten() else {
+    return;
+  };
+  if slates_rt::futures::sleep(delay_ns).await.is_err() {
+    count_refusal(SERVE_DELAY_UNTIMED);
+  }
+}
+
+/// Counter: a test's injected serve delay the runtime could not time; the answer went at once.
+/// Format: a counter name in the daemon's status report.
+const SERVE_DELAY_UNTIMED: &str = "fleet.serve_delay_untimed";
+
+/// Runs `recovery` on this shard with the memory-pressure hold lifted for exactly its duration, then sets the hold
+/// back. A takeover's materialization (its fetch's staging, the restore, the volume's reservations and the writes
+/// that populate it) moves a claim the fleet already admitted and committed to its successor: admission.md §5.5 keeps
+/// the hold off every committed claim ("it shrinks admittable only, never revoking a committed claim"), and §4e
+/// admits a recovered claim ahead of any new one, which boot recovery gets because its hold starts at zero. Before
+/// 2026-10-07 the takeover was refused like a new volume, so under host pressure a successor adopted the head and
+/// never served it (a fleet test: 3,913 refusals, the volume unavailable until the pressure lifted). Capacity and the
+/// operation headroom still bound it. Exact because a shard runs one task at a time and `recovery` is synchronous:
+/// no other admission can run while the hold is lifted, and the pressure refresh is itself a message to this shard.
+/// The hold is the daemon's (2026-10-09): its part withheld from the content pool is a set of extents under the hold's
+/// own owner, so the recovery may take those too while it runs (`ExtentSource::open_hold`), as it lifts this shard's
+/// part and its debt (restored after, with the debt's mark, so the recovery's own growth takes none of it on); the
+/// sampler withholds what was taken from the pool again at its next refresh.
+fn past_the_pressure_hold<T>(
+  state: &mut ShardState,
+  recovery: impl FnOnce(&mut ShardState) -> T,
+) -> T {
+  let (hold, pressure) = (state.store.budget.hold(), state.store.budget.pressure());
+  state.store.budget.set_pressure(0, 0);
+  state.store.content.arena_mut().open_hold(true);
+  let recovered = recovery(state);
+  state.store.content.arena_mut().open_hold(false);
+  state.store.budget.set_hold(hold);
+  state.store.budget.restore_pressure(pressure);
+  recovered
+}
+
+/// Counter: a taken-over volume's materialization waited a period for its content, which this node does not hold
+/// whole yet (the archive of the head's manifest).
+/// Format: a counter name in the daemon's status report.
+const MATERIALIZE_WAITS_CONTENT: &str = "fleet.materialize.waits.content";
+/// Counter: a taken-over volume's materialization waited a period for the takeover's placement of its head.
+/// Format: a counter name in the daemon's status report.
+const MATERIALIZE_WAITS_PLACEMENT: &str = "fleet.materialize.waits.placement";
+/// Counter: a taken-over volume's materialization waited a period for its catalog register's adoption (AUD-29-17).
+/// Format: a counter name in the daemon's status report.
+const MATERIALIZE_WAITS_CATALOG: &str = "fleet.materialize.waits.catalog";
+/// Counter: a taken-over volume's materialization waited a period for the placement of its adopted catalog.
+/// Format: a counter name in the daemon's status report.
+const MATERIALIZE_WAITS_CATALOG_PLACEMENT: &str = "fleet.materialize.waits.catalog_placement";
+/// Counter: a taken-over volume's materialization found no runtime shard for the partition its id names.
+/// Format: a counter name in the daemon's status report.
+const MATERIALIZE_WAITS_SHARD: &str = "fleet.materialize.waits.shard";
+
 /// A taken-over green whose chain could not be gathered this period (an input not held, or the adopted
 /// version beyond this node's accepted prefix); it stays pending and is retried.
 const GREEN_TAKEOVER_INCOMPLETE: &str = "merge.takeover_incomplete";
@@ -2949,26 +3556,46 @@ const GREEN_TAKEOVER_REFUSED: &str = "merge.takeover_refused";
 /// the head move there by value; on success the object is no longer pending, on a refusal (or a shard
 /// that does not answer this period) it is counted and stays pending.
 async fn materialize(origin: u16, object: ObjectId, head: HeadValue) {
-  let Some(manifest) = head.manifest else {
-    return;
-  };
   let id = DbVolumeId { bytes: object.0 };
   let partition = verbs::owner_of(slates_ipc::protocol::VolumeId { bytes: object.0 });
   let taken = state::with_state(|s| {
-    let archive = s
-      .held_content
-      .archive_of(s.store.content.arena(), object, &manifest)?;
+    // A contentless volume (never sealed) has no manifest and no archive: it materializes from its adopted
+    // head and catalog registers alone. A volume with content waits until this node holds that content.
+    let archive = match &head.manifest {
+      Some(manifest) => Some(
+        s.held_content
+          .archive_of(s.store.content.arena(), object, manifest)
+          .ok_or(MATERIALIZE_WAITS_CONTENT)?,
+      ),
+      None => None,
+    };
     // The takeover's placement of the head (its sequence, promotion epoch and acknowledging holders),
     // recorded here where the promotion ran; it moves to the owner shard with the volume.
-    let placed = s.placed_heads.get(&object).cloned()?;
+    let placed = s
+      .placed_heads
+      .get(&object)
+      .cloned()
+      .ok_or(MATERIALIZE_WAITS_PLACEMENT)?;
     // The volume's catalog, adopted in the same round (it is placed before any head that could be adopted
     // is shipped): the volume is served as that catalog describes it (AUD-29-17). Until it is adopted the
-    // materialization waits, uncounted.
-    let (catalog_sequence, catalog) = s.pending_catalogs.get(&object).cloned()?;
-    let catalog_placed = s.placed_heads.get(&object.catalog()).cloned()?;
+    // materialization waits.
+    let (catalog_sequence, catalog) = s
+      .pending_catalogs
+      .get(&object)
+      .cloned()
+      .ok_or(MATERIALIZE_WAITS_CATALOG)?;
+    let catalog_placed = s
+      .placed_heads
+      .get(&object.catalog())
+      .cloned()
+      .ok_or(MATERIALIZE_WAITS_CATALOG_PLACEMENT)?;
     // The partition the id names, as this daemon's runtime shard (the shard list is in partition order).
-    let target = s.shards.get(usize::from(partition)).copied()?;
-    Some((
+    let target = s
+      .shards
+      .get(usize::from(partition))
+      .copied()
+      .ok_or(MATERIALIZE_WAITS_SHARD)?;
+    Ok((
       archive,
       placed,
       catalog_sequence,
@@ -2976,10 +3603,17 @@ async fn materialize(origin: u16, object: ObjectId, head: HeadValue) {
       catalog_placed,
       target,
     ))
-  })
-  .flatten();
-  let Some((archive, placed, catalog_sequence, catalog, catalog_placed, target)) = taken else {
-    return;
+  });
+  let (archive, placed, catalog_sequence, catalog, catalog_placed, target) = match taken {
+    Some(Ok(taken)) => taken,
+    Some(Err(waits)) => {
+      // Each period's wait is counted by what it waits for, so a successor that adopted a head and never serves
+      // its volume names the missing piece (a successor's own client was refused for a whole wait in a full
+      // fleet suite, 2026-10-07, with nothing counted).
+      count_refusal(waits);
+      return;
+    }
+    None => return,
   };
   let region = head.content_holders.clone();
   // The successor's own copy of the volume's lineage key (A-92 piece 4c), unwrapped here on the control shard, which
@@ -3013,31 +3647,71 @@ async fn materialize(origin: u16, object: ObjectId, head: HeadValue) {
         }
         adopted
       });
-      let Some(archive) = opened_archive(s, id, &catalog.owner, adopted, archive) else {
-        s.count(ENVELOPE_UNOPENED, 1);
-        return false;
+      // Open a content archive (a sealed one needs the lineage key); a contentless volume has none to open.
+      let opened = match archive {
+        Some(archive) => match opened_archive(s, id, &catalog.owner, adopted, archive) {
+          Some(opened) => Some(opened),
+          None => {
+            s.count(ENVELOPE_UNOPENED, 1);
+            return Err(ENVELOPE_UNOPENED);
+          }
+        },
+        None => None,
       };
-      let served = verbs::materialize_taken_over(s, id, &taken, region, &archive).is_ok();
-      if served {
-        // The owner shard now owns the head's and the catalog's placements — its record plane writes the
-        // object's next records at the promotion epoch and ships only to holders still missing these.
-        s.placed_heads.insert(object, placed);
-        s.placed_heads.insert(object.catalog(), catalog_placed);
-      }
-      served
+      past_the_pressure_hold(s, |s| {
+        verbs::materialize_taken_over(s, id, &taken, region, opened.as_ref())
+      })
+      .map_err(|refusal| materialize_refusal_counter(&refusal))?;
+      // The owner shard now owns the head's and the catalog's placements — its record plane writes the
+      // object's next records at the promotion epoch and ships only to holders still missing these.
+      s.placed_heads.insert(object, placed);
+      s.placed_heads.insert(object.catalog(), catalog_placed);
+      Ok(())
     },
     HEARTBEAT_NS,
   )
   .await;
-  state::with_state(|s| {
-    if served == Some(true) {
+  state::with_state(|s| match served {
+    Some(Ok(())) => {
       s.pending_materializations.remove(&object);
       s.pending_catalogs.remove(&object);
-    } else {
+    }
+    // Counted on this (control) shard with the refusal's kind, where status and the fleet tests read: the owner
+    // shard's typed refusal was discarded before 2026-10-07, and a successor refused every period for a whole
+    // test wait (298 times) said only `fleet.materialize`.
+    Some(Err(refusal)) => {
       s.count(MATERIALIZE_REFUSED, 1);
+      s.count(refusal, 1);
+    }
+    None => {
+      s.count(MATERIALIZE_REFUSED, 1);
+      s.count(MATERIALIZE_UNANSWERED, 1);
     }
   });
 }
+
+/// The counter a taken-over volume's refused materialization is recorded under, by the owner shard's refusal: a name
+/// already taken on this node, an archive or volume past the shard's budget, a restore that refused the archive, or
+/// another refusal.
+fn materialize_refusal_counter(refusal: &slates_ipc::protocol::ReplyBody) -> &'static str {
+  match refusal {
+    slates_ipc::protocol::ReplyBody::Refused { refusal } => match refusal {
+      slates_ipc::protocol::Refusal::AlreadyExists { .. } => {
+        "fleet.materialize.refused.already_exists"
+      }
+      slates_ipc::protocol::Refusal::BudgetExceeded { .. } => {
+        "fleet.materialize.refused.budget_exceeded"
+      }
+      slates_ipc::protocol::Refusal::BadRequest { .. } => "fleet.materialize.refused.bad_request",
+      _ => "fleet.materialize.refused.other",
+    },
+    _ => "fleet.materialize.refused.other",
+  }
+}
+
+/// Counter: the owner shard did not answer a taken-over volume's materialization within the period.
+/// Format: a counter name in the daemon's status report.
+const MATERIALIZE_UNANSWERED: &str = "fleet.materialize.unanswered";
 
 /// The archive a taken-over volume is served from: a plain archive as it is; an envelope opened under the volume's
 /// lineage and naming keys once this node has adopted them (`adopted`), else `None` — ciphertext is never served as a
@@ -3161,6 +3835,10 @@ const RESOLVE_NO_ADDRESS: &str = "fleet.resolve.no-address";
 const RESOLVE_MALFORMED: &str = "fleet.resolve.malformed";
 const RESOLVE_IO: &str = "fleet.resolve.io";
 
+/// The status count of a forward that found its session held by the record link task itself (a discovery page or
+/// a dial), not lent through [`take_sessions`]: the holder named beside `fleet.forward.session_out`.
+const LENT_TO_LINK: &str = "fleet.lent_to.link";
+
 /// The status refusal counts under which a dial task records a handshake that ran out its budgets with
 /// the peer silent (`fleet.dial.redial`: the socket is dropped and the next period dials afresh) and one
 /// the transport faulted (`fleet.dial.fault`: a peer whose half-open state for this source is gone, a
@@ -3241,6 +3919,14 @@ pub(crate) fn keeps_direct_contact_with(state: &ShardState, peer: HostId) -> boo
   direct_contact(state, peer).kept()
 }
 
+/// Why this node keeps or drops direct contact with `peer` ([`keeps_direct_contact_with`]'s rule), named: what a
+/// formation failure's report shows for each peer, so a pair that never meshes says which side dropped the other and
+/// why (2026-10-09: a pair formed no probe session in either direction for 4,000 periods under load, one side counting
+/// itself meshed without the other).
+pub(crate) fn direct_contact_reason(state: &ShardState, peer: HostId) -> String {
+  format!("{:?}", direct_contact(state, peer))
+}
+
 /// Why this node keeps, or drops, direct contact with a peer — the one rule behind
 /// [`keeps_direct_contact_with`], with its reason, so a probe task's idle and resume transitions can be
 /// logged by cause.
@@ -3260,11 +3946,23 @@ enum DirectContact {
   /// In this node's neighbourhood: its current one, or its settled one while a change is in flight, since its
   /// joint writes and its joint lease reach both.
   Neighbour,
+  /// This node holds the peer's content: it is in the peer's neighbourhood, whose writes, lease probes and takeover
+  /// rounds reach it. Kept from this side too, so the pair's probe plane is keyed whichever of the two is its canonical
+  /// dialer: the reverse of [`DirectContact::Neighbour`], as [`DirectContact::AsVoter`] is of [`DirectContact::Voter`]
+  /// (2026-10-10). A pair's plane epoch is announced only by its lower anchor, so contact kept from one side alone left
+  /// the pair unkeyed whenever the side that dropped it was the lower anchor.
+  Holder,
   /// A voter of the council or the root group.
   Voter,
   /// A member this node, leading the council or the root group, is catching up to join its voters (thesis
   /// §4.2.1): its rounds need a session to it wherever it sits.
   Staged,
+  /// This node is a voter of the council or the root group, and every member keeps contact with the voters
+  /// ([`DirectContact::Voter`]): kept from this side too, so the pair's probe plane is keyed whichever of the two is its
+  /// canonical dialer. Found 2026-10-10 by the formation report's keying facts: a voter, the pair's lower anchor, had
+  /// dropped a member outside its neighbourhood, never announced the pair's epoch once formation's
+  /// everyone-contacts-everyone window closed, and the member's probes to it went unanswered for 4,000 periods.
+  AsVoter,
   /// Dropped: this node believes the peer dead.
   BelievedDead,
   /// Dropped: a council member outside this node's neighbourhood and no voter.
@@ -3295,10 +3993,18 @@ fn direct_contact(state: &ShardState, peer: HostId) -> DirectContact {
     DirectContact::NotInCouncilConfiguration
   } else if state.fleet.configuration().neighbours(peer) {
     DirectContact::Neighbour
+  } else if state
+    .council
+    .configuration()
+    .holds_for(peer, state.fleet.host())
+  {
+    DirectContact::Holder
   } else if state.council.is_voter(peer) || state.root.is_voter(peer) {
     DirectContact::Voter
   } else if state.council.is_staged(peer) || state.root.is_staged(peer) {
     DirectContact::Staged
+  } else if state.council.is_voter(state.fleet.host()) || state.root.is_voter(state.fleet.host()) {
+    DirectContact::AsVoter
   } else {
     DirectContact::OutsideNeighbourhood
   }
@@ -3342,6 +4048,9 @@ async fn establish_record_link(driver: PeerDriver, dial: PeerDial) {
     resolver,
   } = dial;
   let mut peer_host = seed;
+  // When the next discovery page is due, and the wait after it (see `next_discovery_wait`).
+  let mut discovery_due: u64 = 0;
+  let mut discovery_wait: u64 = HEARTBEAT_NS;
   let mut client: Option<Endpoint> = client_for(
     identity,
     &name,
@@ -3383,13 +4092,94 @@ async fn establish_record_link(driver: PeerDriver, dial: PeerDial) {
       .await;
       client = kept;
       enroll_record_session(session, peer_host, anchor, &mut discovery_cursor, driver).await;
+      discovery_wait = HEARTBEAT_NS;
+      discovery_due = 0;
     }
-    if !absent {
+    if !absent && futures::now_ns() >= discovery_due {
+      let before = discovery_cursor.settled();
       refresh_discovery(peer_host, anchor, &mut discovery_cursor, driver).await;
+      discovery_wait = next_discovery_wait(before, discovery_cursor.settled(), discovery_wait);
+      discovery_due = futures::now_ns().saturating_add(discovery_wait);
     }
     crate::daemon::pace(HEARTBEAT_NS).await;
   }
 }
+
+/// Counter: a discovery page sent over a record link (a settled roster's pages back off to one per horizon a peer).
+/// Format: a counter name in the daemon's status report.
+const DISCOVERY_PAGES: &str = "fleet.discovery.pages";
+
+/// The wait before a record link's next discovery page. While the sweep stays complete at the same roster generation
+/// the wait doubles, from one heartbeat up to the membership horizon ([`crate::lease::horizon_ns`]); anything else (a
+/// sweep under way, a new generation, a new session) brings it back to one heartbeat. So a settled fleet checks each
+/// peer about once a horizon rather than every heartbeat (it was one exchange a peer a heartbeat, ~2% of a core per idle
+/// node on the two-network topology, 2026-10-08), and a roster change is still learned no later than a death would be.
+fn next_discovery_wait(before: Option<u64>, after: Option<u64>, wait: u64) -> u64 {
+  match (before, after) {
+    (Some(was), Some(now)) if was == now => wait
+      .saturating_mul(2)
+      .clamp(HEARTBEAT_NS, crate::lease::horizon_ns()),
+    _ => HEARTBEAT_NS,
+  }
+}
+
+/// An uninitialized learner's fetch pace: when its next fetch is due and the wait after that one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct LearnerPace {
+  /// The runtime clock's time the next fetch is due.
+  due_ns: u64,
+  /// The wait after the next fetch.
+  wait_ns: u64,
+}
+
+impl Default for LearnerPace {
+  fn default() -> Self {
+    LearnerPace {
+      due_ns: 0,
+      wait_ns: HEARTBEAT_NS,
+    }
+  }
+}
+
+impl LearnerPace {
+  /// Whether a fetch is due at `now_ns`.
+  fn due(&self, now_ns: u64) -> bool {
+    now_ns >= self.due_ns
+  }
+
+  /// Paces the next fetch after one made at `now_ns`.
+  fn fetched(&mut self, now_ns: u64, still_uninitialized: bool) {
+    self.wait_ns = next_learner_wait(still_uninitialized, self.wait_ns);
+    self.due_ns = now_ns.saturating_add(self.wait_ns);
+  }
+
+  /// Back to fetching at once (the group is initialized, or another reason to fetch arrived).
+  fn reset(&mut self) {
+    *self = LearnerPace::default();
+  }
+}
+
+/// The wait before an uninitialized learner's next fetch (no group has been bootstrapped yet, so its configuration is
+/// empty and every live peer looks like a divergence): it doubles while the group stays uninitialized, from one
+/// heartbeat up to the membership horizon ([`crate::lease::horizon_ns`]), and is one heartbeat once it is initialized.
+/// A fleet left unbootstrapped then polls each voter about once a horizon rather than every heartbeat (measured
+/// 2026-10-08: about 43 root and 17 council fetches a second per node before `bootstrap root`), and a bootstrap is
+/// still learned within a horizon; a stale-configuration refusal or recovery fetches at once, as before.
+fn next_learner_wait(still_uninitialized: bool, wait_ns: u64) -> u64 {
+  if still_uninitialized {
+    wait_ns
+      .saturating_mul(2)
+      .clamp(HEARTBEAT_NS, crate::lease::horizon_ns())
+  } else {
+    HEARTBEAT_NS
+  }
+}
+
+/// Counter: learner fetches skipped while an uninitialized group's backoff ran (the backoff's non-vacuity counter).
+const LEARNER_FETCH_PACED: &str = "fleet.learner.fetch_paced";
+
+/// Counter: configuration fetch requests a learner sent, root and council (one per voter asked).
+const LEARNER_FETCHES: &str = "fleet.learner.fetches";
 
 /// The member id the link should address now (task #22). A change — the peer restarted — removes the
 /// previous member's record entry (the session to its previous incarnation is dead by definition), drops a
@@ -3539,14 +4329,38 @@ impl DiscoveryFault {
 /// Whether the link to `anchor` still addresses `expected`: the anchor's learned member is still `expected`
 /// (or none was learned yet, the seed standing) and this node still keeps direct contact with it.
 fn link_valid(anchor: HostId, expected: HostId) -> bool {
-  state::with_state(|s| {
-    s.learned_members
-      .get(&anchor)
-      .is_none_or(|learned| learned.host == expected)
-      && keeps_direct_contact_with(s, expected)
-  })
-  .unwrap_or(false)
+  state::with_state(|s| link_invalid_reason(s, anchor, expected).is_none()).unwrap_or(false)
 }
+
+/// Why `anchor`'s link, made to `expected`, no longer holds, as a status counter name; `None` while it holds:
+/// the anchor's learned member is another incarnation, or this node no longer keeps direct contact with the
+/// member, by the reason [`direct_contact`] gives. Counted beside `fleet.discovery.invalidated`, so link churn
+/// says which rule dropped the link.
+fn link_invalid_reason(
+  state: &ShardState,
+  anchor: HostId,
+  expected: HostId,
+) -> Option<&'static str> {
+  if state
+    .learned_members
+    .get(&anchor)
+    .is_some_and(|learned| learned.host != expected)
+  {
+    return Some(LINK_INVALID_MEMBER_CHANGED);
+  }
+  match direct_contact(state, expected) {
+    DirectContact::BelievedDead => Some(LINK_INVALID_BELIEVED_DEAD),
+    DirectContact::OutsideNeighbourhood => Some(LINK_INVALID_OUTSIDE_NEIGHBOURHOOD),
+    _ => None,
+  }
+}
+
+/// A record link dropped because its anchor's learned member became another incarnation.
+const LINK_INVALID_MEMBER_CHANGED: &str = "fleet.link.invalid.member_changed";
+/// A record link dropped because this node came to believe its member dead.
+const LINK_INVALID_BELIEVED_DEAD: &str = "fleet.link.invalid.believed_dead";
+/// A record link dropped because its member left this node's neighbourhood and holds no voter's seat.
+const LINK_INVALID_OUTSIDE_NEIGHBOURHOOD: &str = "fleet.link.invalid.outside_neighbourhood";
 
 /// Wakes the discovery exchange pending on `anchor`'s record link, if one is, so it re-checks the link's
 /// validity at once — a replacement learned on contact, a retirement folded — rather than at its deadline.
@@ -3592,6 +4406,8 @@ async fn exchange_discovery(
     return DiscoveryOutcome::Refused;
   };
   let span_ns = consensus_budget(slowest_path_tail_ns()).max_deadline_ns();
+  // Every page counted: the non-vacuity counter for the record link's discovery backoff (`next_discovery_wait`).
+  count_refusal(DISCOVERY_PAGES);
   let exchanged = {
     let mut exchange =
       std::pin::pin!(session.request(crate::discovery::STREAM, Priority::Metadata, &request));
@@ -3631,6 +4447,12 @@ async fn exchange_discovery(
         session.abandon(abandoned);
       }
       count_refusal(fault.counter());
+      if matches!(fault, DiscoveryFault::Invalidated)
+        && let Some(reason) =
+          state::with_state(|s| link_invalid_reason(s, anchor, expected)).flatten()
+      {
+        count_refusal(reason);
+      }
       return fault.outcome();
     }
   };
@@ -3689,6 +4511,8 @@ pub(crate) enum LateReplies {
   /// manifest it was put for, and timed into the put-latency window — never discarded: the stop bounds how
   /// long the round waits before hedging, not whether a slow holder's verified hold counts.
   Content {
+    /// Which placement the round served: the seal's map on its owner shard.
+    track: Track,
     /// The owner shard the seal lives on.
     shard: u16,
     /// The object whose seal the round put.
@@ -3701,6 +4525,17 @@ pub(crate) enum LateReplies {
     manifest: [u8; 32],
     /// When the round was dispatched, for the straggler's latency reading.
     dispatched_ns: u64,
+  },
+  /// A mirror shipment (`crate::mirror::ship`): a holder's acknowledgement that came back after the round's budget is
+  /// folded into the job's acknowledged holders on its owner shard, never discarded. A holder keeps the first value at
+  /// a position, so a resend after a discarded acknowledgement could be refused for good (2026-10-09).
+  MirrorShip {
+    /// The owner shard the mirror job lives on.
+    shard: u16,
+    /// The object shipped.
+    object: ObjectId,
+    /// The head sequence shipped.
+    sequence: u64,
   },
 }
 
@@ -3739,10 +4574,14 @@ impl Dispatch {
           replies.push((host, reply));
           recovered.push((host, endpoint));
         }
-        if let LateReplies::Content { .. } = late {
-          fold_late_content(late, &replies);
-        } else {
-          fold_late_replies(late, &replies);
+        match late {
+          LateReplies::Content { .. } => fold_late_content(late, &replies),
+          LateReplies::MirrorShip {
+            shard,
+            object,
+            sequence,
+          } => crate::mirror::fold_late_acks(shard, object, sequence, &replies),
+          _ => fold_late_replies(late, &replies),
         }
         (recovered, done)
       }
@@ -3771,6 +4610,7 @@ impl Dispatch {
 /// seal ignores the fold. Only a `LateReplies::Content` reaches here.
 fn fold_late_content(late: LateReplies, replies: &[(HostId, TimedReply)]) {
   let LateReplies::Content {
+    track,
     shard,
     object,
     snapshot,
@@ -3793,10 +4633,13 @@ fn fold_late_content(late: LateReplies, replies: &[(HostId, TimedReply)]) {
   }
   let latency_ns = futures::now_ns().saturating_sub(dispatched_ns);
   let origin = state::with_state(|s| s.shard).unwrap_or_default();
-  let _ = run_on(origin, shard, move |s| {
+  crate::xshard::run_on_counted(origin, shard, move |s| {
     for holder in &acked {
-      s.put_latency.record(latency_ns);
-      if let Some(job) = s.seals.get_mut(&object)
+      match track {
+        Track::Home => s.put_latency.record(latency_ns),
+        Track::Mirror => s.mirror_put_latency.record(latency_ns),
+      }
+      if let Some(job) = seal_jobs(s, track).get_mut(&object)
         && job.snapshot == snapshot
         && job.content.candidates.contains(holder)
       {
@@ -3834,8 +4677,8 @@ fn fold_late_replies(late: LateReplies, replies: &[(HostId, TimedReply)]) {
         LateReplies::RootFetch => {
           crate::consensus::adopt_fetch(s, true, *peer, bytes);
         }
-        // Folded on the seal's owner shard by [`fold_late_content`], outside this borrow.
-        LateReplies::Content { .. } => {}
+        // Folded on the owner shard by [`fold_late_content`] and `mirror::fold_late_acks`, outside this borrow.
+        LateReplies::Content { .. } | LateReplies::MirrorShip { .. } => {}
       }
     }
   });
@@ -4102,6 +4945,7 @@ pub(crate) async fn send_council_report(
   budget: CommitBudget,
   in_flight: &mut Vec<Dispatch>,
 ) {
+  let request = command.encode();
   let voters = state::with_state(|s| {
     s.count(REPORT_SENT, 1);
     if s.council.is_leader() {
@@ -4111,11 +4955,12 @@ pub(crate) async fn send_council_report(
     s.council.voters()
   })
   .unwrap_or_default();
-  let sessions = take_sessions(|host| host != local && voters.contains(&host));
+  let sessions = take_sessions("fleet.lent_to.send_council_report", |host| {
+    host != local && voters.contains(&host)
+  });
   if sessions.is_empty() {
     return;
   }
-  let request = command.encode();
   let requests: Vec<(HostId, Vec<u8>, Endpoint)> = sessions
     .into_iter()
     .map(|(host, endpoint)| (host, request.clone(), endpoint))
@@ -4153,7 +4998,9 @@ async fn drive_council_replication(
   budget: CommitBudget,
   in_flight: &mut Vec<Dispatch>,
 ) {
-  let sessions = take_sessions(|host| others.contains(&host));
+  let sessions = take_sessions("fleet.lent_to.drive_council_replication", |host| {
+    others.contains(&host)
+  });
   if sessions.is_empty() {
     return;
   }
@@ -4330,7 +5177,9 @@ async fn take_campaign_sessions(
   let began = futures::now_ns();
   let (withheld, withheld_until) = campaign_hold(began);
   let available = |host: HostId| !(withheld.contains(&host) && futures::now_ns() < withheld_until);
-  let mut taken = take_sessions(|host| others.contains(&host) && available(host));
+  let mut taken = take_sessions("fleet.lent_to.take_campaign_sessions", |host| {
+    others.contains(&host) && available(host)
+  });
   let first_look = taken.len();
   loop {
     let out = voters_out(others, &taken);
@@ -4343,7 +5192,10 @@ async fn take_campaign_sessions(
       count_campaign_sessions(others, &taken, taken.len().saturating_sub(first_look));
       return taken;
     }
-    taken.extend(take_sessions(|host| out.contains(&host) && available(host)));
+    taken.extend(take_sessions(
+      "fleet.lent_to.take_campaign_sessions",
+      |host| out.contains(&host) && available(host),
+    ));
   }
 }
 
@@ -4375,7 +5227,7 @@ fn voters_out(others: &[HostId], taken: &[(HostId, Endpoint)]) -> Vec<HostId> {
 /// Counts a campaign's session take: the voters awaited ([`ELECTION_SESSION_AWAITED`]), and each voter left
 /// unasked by why.
 fn count_campaign_sessions(others: &[HostId], taken: &[(HostId, Endpoint)], awaited: usize) {
-  let _ = state::with_state(|s| {
+  let _ = state::with_state_counted(|s| {
     if awaited > 0 {
       let count = s.refusals.entry(ELECTION_SESSION_AWAITED).or_insert(0);
       *count = count.saturating_add(u64::try_from(awaited).unwrap_or(u64::MAX));
@@ -4453,7 +5305,9 @@ async fn drive_transfer_invitation(
   let Some(target) = state::with_state(|s| group.transferring_to(s)).flatten() else {
     return;
   };
-  let sessions = take_sessions(|host| host == target);
+  let sessions = take_sessions("fleet.lent_to.drive_transfer_invitation", |host| {
+    host == target
+  });
   if sessions.is_empty() {
     return;
   }
@@ -4679,10 +5533,10 @@ fn lapse_learner_lease(
   match timer.follower_period(contact, timing, local, rank) {
     FollowerStep::Follow => {}
     FollowerStep::LeaderLapsed => {
-      let _ = state::with_state(|s| group.forget_leader(s));
+      let _ = state::with_state_counted(|s| group.forget_leader(s));
     }
     FollowerStep::Campaign => {
-      let _ = state::with_state(|s| group.forget_leader(s));
+      let _ = state::with_state_counted(|s| group.forget_leader(s));
       timer.rebaseline(contact);
     }
   }
@@ -4752,16 +5606,32 @@ async fn drive_config_council(
   // configuration). The adopted configuration is installed into placement by `sync_config_from_council`,
   // exactly as a voter's committed one is.
   if !is_voter && !is_leader {
+    // An uninitialized council paces its fetches (`next_learner_wait`): its empty configuration makes every live peer
+    // a divergence, which is no evidence. Recovery and a stale-configuration refusal fetch at once.
+    let now = futures::now_ns();
     let wanted = state::with_state(|s| {
-      s.recovery.council.is_some()
-        || !s.council.initialized()
-        || s.config_refresh_wanted
-        || membership_diverges_from_config(s)
+      if s.recovery.council.is_some() || s.config_refresh_wanted {
+        s.council_learner_pace.reset();
+        true
+      } else if !s.council.initialized() {
+        let due = s.council_learner_pace.due(now);
+        if !due {
+          s.count(LEARNER_FETCH_PACED, 1);
+        }
+        due
+      } else {
+        s.council_learner_pace.reset();
+        membership_diverges_from_config(s)
+      }
     })
     .unwrap_or(false);
     if wanted {
       drive_learner_fetch(&voters, budget, in_flight).await;
-      let _ = state::with_state(|s| s.config_refresh_wanted = false);
+      let _ = state::with_state_counted(|s| {
+        s.config_refresh_wanted = false;
+        let still = !s.council.initialized();
+        s.council_learner_pace.fetched(futures::now_ns(), still);
+      });
     }
     let timing = derive_group_timing(&voters, |s, timing| s.council_timing = timing);
     lapse_learner_lease(Group::Council, timer, contact, &timing, local, rank);
@@ -4791,7 +5661,7 @@ async fn drive_config_council(
   }
   if others.is_empty() {
     // The sole voter (a one-node council, the fleet degenerate): self-elect, then it leads next period.
-    let _ = state::with_state(|s| s.council.election_timeout());
+    let _ = state::with_state_counted(|s| s.council.election_timeout());
     timer.reset();
     return;
   }
@@ -4808,7 +5678,7 @@ async fn drive_config_council(
       }
     }
     FollowerStep::LeaderLapsed => {
-      let _ = state::with_state(|s| s.council.forget_leader());
+      let _ = state::with_state_counted(|s| s.council.forget_leader());
     }
     FollowerStep::Follow => {}
   }
@@ -4909,11 +5779,32 @@ async fn drive_root_group(
     // reactively, only when its own alive view of the regions diverges from the root configuration it holds
     // ([`root_diverges`]), so a converged learner sends nothing. The cross-region parallel of the config
     // learner's reactive fetch.
-    let wanted =
-      state::with_state(|s| s.recovery.root.is_some() || !s.root.initialized() || root_diverges(s))
-        .unwrap_or(false);
+    // As the council learner: an uninitialized root paces its fetches; recovery fetches at once.
+    let now = futures::now_ns();
+    let wanted = state::with_state(|s| {
+      if s.recovery.root.is_some() {
+        s.root_learner_pace.reset();
+        true
+      } else if !s.root.initialized() {
+        let due = s.root_learner_pace.due(now);
+        if !due {
+          s.count(LEARNER_FETCH_PACED, 1);
+        }
+        due
+      } else {
+        s.root_learner_pace.reset();
+        root_diverges(s)
+      }
+    })
+    .unwrap_or(false);
+
     if wanted {
-      drive_root_learner_fetch(&voters, budget, in_flight).await;
+      let targets = root_learner_targets(&voters, local);
+      drive_root_learner_fetch(&targets, budget, in_flight).await;
+      let _ = state::with_state_counted(|s| {
+        let still = !s.root.initialized();
+        s.root_learner_pace.fetched(futures::now_ns(), still);
+      });
     }
     let timing = derive_group_timing(&voters, |s, timing| s.root_timing = timing);
     lapse_learner_lease(Group::Root, timer, contact, &timing, local, rank);
@@ -4939,7 +5830,7 @@ async fn drive_root_group(
   }
   if others.is_empty() {
     // The sole root voter (a single-region fleet's degenerate): self-elect, then it leads next period.
-    let _ = state::with_state(|s| s.root.election_timeout());
+    let _ = state::with_state_counted(|s| s.root.election_timeout());
     timer.reset();
     return;
   }
@@ -4954,7 +5845,7 @@ async fn drive_root_group(
       }
     }
     FollowerStep::LeaderLapsed => {
-      let _ = state::with_state(|s| s.root.forget_leader());
+      let _ = state::with_state_counted(|s| s.root.forget_leader());
     }
     FollowerStep::Follow => {}
   }
@@ -4968,7 +5859,9 @@ async fn drive_root_replication(
   budget: CommitBudget,
   in_flight: &mut Vec<Dispatch>,
 ) {
-  let sessions = take_sessions(|host| others.contains(&host));
+  let sessions = take_sessions("fleet.lent_to.drive_root_replication", |host| {
+    others.contains(&host)
+  });
   if sessions.is_empty() {
     return;
   }
@@ -5080,6 +5973,31 @@ async fn drive_root_election(
   drive_vote_round(Group::Root, vote, sessions, budget, in_flight).await;
 }
 
+/// Whom a root learner asks for the committed root configuration: the voters it knows. The voters it last learned
+/// can all be gone (a lost region's representative was the only one it knew) while the leader has moved the voter set
+/// to each live region's representative; with no session to any voter it knows, it asks those representatives
+/// instead, or it never hears the root's later commits (found 2026-10-07: a region-1 learner stayed on the
+/// pre-promotion root for good, its only known voter the dead region-0 representative, 4,269 fetches finding no
+/// session). A learner that knows no voter yet names none, and so asks every session it holds, as it always has.
+fn root_learner_targets(voters: &[HostId], local: HostId) -> Vec<HostId> {
+  let reachable = state::with_state(|s| {
+    voters
+      .iter()
+      .any(|voter| s.record_sessions.contains_key(voter))
+  })
+  .unwrap_or(false);
+  if reachable || voters.is_empty() {
+    return voters.to_vec();
+  }
+  state::with_state(|s| {
+    alive_representatives(s)
+      .into_values()
+      .filter(|host| *host != local)
+      .collect::<Vec<HostId>>()
+  })
+  .unwrap_or_default()
+}
+
 /// Drives a **root learner** one period: fetches the committed root configuration from the root voters it has
 /// a session to and adopts the newest (§4.8, D-14) — the cross-region parallel of [`drive_learner_fetch`].
 /// The fetch carries this learner's root version, so a caught-up learner's fetch is an empty reply, not a
@@ -5090,7 +6008,9 @@ async fn drive_root_learner_fetch(
   budget: CommitBudget,
   in_flight: &mut Vec<Dispatch>,
 ) {
-  let sessions = take_sessions(|host| voters.is_empty() || voters.contains(&host));
+  let sessions = take_sessions("fleet.lent_to.drive_root_learner_fetch", |host| {
+    voters.is_empty() || voters.contains(&host)
+  });
   if sessions.is_empty() {
     return;
   }
@@ -5112,6 +6032,12 @@ async fn drive_root_learner_fetch(
   let sent: Vec<HostId> = requests.iter().map(|(host, _, _)| *host).collect();
   let (replied, stragglers) =
     broadcast(requests, ROOT_FETCH_STREAM, Priority::Metadata, budget).await;
+  let _ = state::with_state_counted(|s| {
+    s.count(
+      LEARNER_FETCHES,
+      u64::try_from(sent.len()).unwrap_or(u64::MAX),
+    );
+  });
   let mut recovered = Vec::with_capacity(replied.len());
   let mut fetched = Vec::with_capacity(replied.len());
   for (host, reply, endpoint) in replied {
@@ -5154,7 +6080,7 @@ async fn drive_learner_fetch(
       .collect()
   })
   .unwrap_or_default();
-  let sessions = take_sessions(|host| {
+  let sessions = take_sessions("fleet.lent_to.drive_learner_fetch", |host| {
     regional_peers.contains(&host) && (voters.is_empty() || voters.contains(&host))
   });
   if sessions.is_empty() {
@@ -5180,6 +6106,12 @@ async fn drive_learner_fetch(
   let sent: Vec<HostId> = requests.iter().map(|(host, _, _)| *host).collect();
   let (replied, stragglers) =
     broadcast(requests, CONFIG_FETCH_STREAM, Priority::Metadata, budget).await;
+  let _ = state::with_state_counted(|s| {
+    s.count(
+      LEARNER_FETCHES,
+      u64::try_from(sent.len()).unwrap_or(u64::MAX),
+    );
+  });
   let mut recovered = Vec::with_capacity(replied.len());
   let mut fetched = Vec::with_capacity(replied.len());
   for (host, reply, endpoint) in replied {
@@ -5331,13 +6263,13 @@ fn fan_configs_to_shards(origin: u16, shards: &[u16]) {
       crate::lease_wait::resolve(s);
     }) {
       Ok(()) => {
-        let _ = state::with_state(|s| {
+        let _ = state::with_state_counted(|s| {
           s.fanned.record(shard, delivered);
           count_refusal_in(s, FAN_SENT);
         });
       }
       Err(_) => {
-        let _ = state::with_state(|s| count_refusal_in(s, FAN_REFUSED));
+        let _ = state::with_state_counted(|s| count_refusal_in(s, FAN_REFUSED));
       }
     }
   }
@@ -5537,10 +6469,7 @@ async fn run_record_plane(local: HostId) {
     // across its recovery neighbourhoods, adopting each object once its cohorts have promised and confirming
     // the share once done (§4.8 "Promotion and takeover"; the takeover module). The holds and the rounds are
     // this node's (they arrive over this shard's sessions), so this runs here.
-    in_flight.extend(crate::takeover::drive_takeovers(local, budget).await);
-    // Serve the content of each adopted head, from what this node holds or a recorded holder, on the
-    // shard the taken-over id routes to.
-    materialize_adopted_objects(origin, budget).await;
+    adopt_and_serve(origin, local, budget, &mut in_flight).await;
     crate::daemon::pace(HEARTBEAT_NS).await;
   }
 }
@@ -5580,6 +6509,42 @@ async fn follow_configuration(
   }
 }
 
+/// Advances `shard`'s seal jobs of `track` one bounded slice each on the owner shard and runs the content rounds
+/// of those whose archive is complete, keeping each round's dispatch for its stragglers. Whether the shard holds any
+/// job of the track.
+async fn put_track_content(
+  origin: u16,
+  shard: u16,
+  local: HostId,
+  budget: CommitBudget,
+  track: Track,
+  in_flight: &mut Vec<Dispatch>,
+) -> bool {
+  let (work, jobs) = call_within(
+    origin,
+    shard,
+    move |s| {
+      let slice_bytes = s.config.archive_slice_bytes();
+      let created_unix = u64::try_from(s.clock.wall_ns()).unwrap_or(0) / NANOS_PER_SECOND;
+      let work = match track {
+        Track::Home => advance_seals(s, local, slice_bytes, created_unix, budget),
+        Track::Mirror => advance_mirror_seals(s, local, slice_bytes, created_unix, budget),
+      };
+      let jobs = !seal_jobs(s, track).is_empty();
+      (work, jobs)
+    },
+    HEARTBEAT_NS,
+  )
+  .await
+  .unwrap_or_default();
+  for item in work {
+    if let Some(dispatch) = put_seal_content(origin, local, item).await {
+      in_flight.push(dispatch);
+    }
+  }
+  jobs
+}
+
 /// One period of the record plane for the volumes `shard` owns, in the order the design's placement rule
 /// requires: seals advance and their content is put (content places first), then the heads naming placed
 /// content ship, then the seals whose content and head both placed are recorded durably. The seal walk,
@@ -5595,28 +6560,20 @@ async fn run_record_period(
   in_flight: &mut Vec<Dispatch>,
 ) {
   // Advance the shard's seals one bounded slice each and put the completed archives' content to their
-  // candidates (§4.10) — content places before the head that names it ships.
-  let seals = call_within(
-    origin,
-    shard,
-    move |s| {
-      let slice_bytes = s.config.archive_slice_bytes();
-      let created_unix = u64::try_from(s.clock.wall_ns()).unwrap_or(0) / NANOS_PER_SECOND;
-      advance_seals(s, local, slice_bytes, created_unix, budget)
-    },
-    HEARTBEAT_NS,
-  )
-  .await
-  .unwrap_or_default();
-  for work in seals {
-    if let Some(dispatch) = put_seal_content(origin, local, work).await {
-      in_flight.push(dispatch);
-    }
+  // candidates (§4.10) — content places before the head that names it ships — then the shipments of placed heads
+  // to the mirror region (§4.10 "Mirroring across regions").
+  put_track_content(origin, shard, local, budget, Track::Home, in_flight).await;
+  let mirroring = put_track_content(origin, shard, local, budget, Track::Mirror, in_flight).await;
+  // A mirror shipment's head and catalog records, once its content is held there (`crate::mirror`); no call at all
+  // while the shard ships nothing to a mirror.
+  if mirroring {
+    crate::mirror::ship(origin, shard, local, budget, in_flight).await;
   }
   deliver_pairs(origin, shard, local, budget).await;
   ship_shard_heads(origin, shard, local, budget, owner_acceptor, in_flight).await;
   // Record durably each seal whose content and head have both placed.
-  let _ = run_on(origin, shard, record_placed_seals);
+  crate::xshard::run_on_counted(origin, shard, record_placed_seals);
+  crate::xshard::run_on_counted(origin, shard, record_mirrored_seals);
   retire_shard_tombstones(origin, shard, local, owner_acceptor).await;
   // The greens' merge records (§4.16 "Commit"): each green's lowest pending version — its inputs put
   // while unplaced, its record shipped in order once they are.
@@ -5631,19 +6588,27 @@ async fn run_record_period(
 /// its pair, and the records stay one per (owner shard, candidate). Once per pair per daemon life; a candidate accepts
 /// a repeat of the key it holds, so a restart's redelivery changes nothing there.
 async fn deliver_pairs(origin: u16, shard: u16, local: HostId, budget: CommitBudget) {
+  if state::with_state(|s| s.injected_pair_withhold).unwrap_or(false) {
+    return;
+  }
   let Some((members, delivered)) = call_within(
     origin,
     shard,
     move |s| {
       s.seal_root.as_ref()?;
-      let members: Vec<HostId> = s
+      // The home neighbourhood and the mirror neighbourhood alike: a mirror holder must be able to open a promoted
+      // volume's content, so a head's sealing wraps the lineage key for it too (`docs/wip/mirroring.md` decision 4).
+      let mut members: Vec<HostId> = s
         .fleet
         .configuration()
         .neighbourhood
         .iter()
+        .chain(s.mirror_neighbourhood.iter())
         .copied()
         .filter(|host| *host != local)
         .collect();
+      members.sort_unstable();
+      members.dedup();
       Some((members, s.pairs_delivered.clone()))
     },
     HEARTBEAT_NS,
@@ -5653,7 +6618,7 @@ async fn deliver_pairs(origin: u16, shard: u16, local: HostId, budget: CommitBud
     return;
   };
   // Each neighbour by its stable anchor, from the identities this control shard has learned.
-  let owed: Vec<(HostId, u64)> = state::with_state(|s| {
+  let anchors: Vec<(HostId, u64)> = state::with_state(|s| {
     members
       .iter()
       .filter_map(|member| {
@@ -5662,12 +6627,31 @@ async fn deliver_pairs(origin: u16, shard: u16, local: HostId, budget: CommitBud
           .find(|(_, learned)| learned.host == *member)
           .map(|(anchor, _)| (*member, anchor.0))
       })
-      .filter(|(_, anchor)| !delivered.contains(anchor))
       .collect()
   })
   .unwrap_or_default();
+  let owed: Vec<(HostId, u64)> = anchors
+    .iter()
+    .copied()
+    .filter(|(_, anchor)| !delivered.contains(anchor))
+    .collect();
+  // The owner shard learns every neighbour's anchor, so it can tell which candidates a head's sealing covers.
+  let resolved: std::collections::BTreeMap<HostId, u64> = anchors.into_iter().collect();
+  if call_within(
+    origin,
+    shard,
+    move |s| s.member_anchors = resolved,
+    HEARTBEAT_NS,
+  )
+  .await
+  .is_none()
+  {
+    count_refusal(MEMBER_ANCHORS_UNSENT);
+  }
   for (member, anchor) in owed {
     let Some(public) = peer_recipient(member, anchor, budget).await else {
+      // The neighbour's recipient key did not come back this period: its pair is owed again next period, counted.
+      count_refusal(PAIR_RECIPIENT_UNKNOWN);
       continue;
     };
     let delivery = call_within(
@@ -5684,6 +6668,7 @@ async fn deliver_pairs(origin: u16, shard: u16, local: HostId, budget: CommitBud
     .flatten();
     let Some((partition, id, record)) = delivery else {
       count_refusal(PAIR_UNDELIVERED);
+      count_refusal(PAIR_UNBUILT);
       continue;
     };
     let mut request = Vec::with_capacity(
@@ -5694,7 +6679,7 @@ async fn deliver_pairs(origin: u16, shard: u16, local: HostId, budget: CommitBud
     request.extend_from_slice(&partition.to_le_bytes());
     request.extend_from_slice(&id);
     request.extend_from_slice(&record);
-    let accepted = request_peer(member, PAIR_KEY_STREAM, &request, budget).await;
+    let accepted = send_pair(member, &request, budget).await;
     if accepted.as_deref() == Some(&[PAIR_ACCEPTED][..]) {
       let _ = call_within(
         origin,
@@ -5713,9 +6698,54 @@ async fn deliver_pairs(origin: u16, shard: u16, local: HostId, budget: CommitBud
   }
 }
 
+/// One pair key delivery to `member` over its record session, within the round's budget: the member's reply, or `None`
+/// with the way it failed counted (no free session to the member, or no answer within the budget).
+async fn send_pair(member: HostId, request: &[u8], budget: CommitBudget) -> Option<Vec<u8>> {
+  let mut sessions = take_sessions("fleet.lent_to.deliver_pairs", |candidate| {
+    candidate == member
+  });
+  let taken = sessions.pop();
+  return_sessions(sessions);
+  let Some((holder, endpoint)) = taken else {
+    count_refusal(PAIR_NO_SESSION);
+    return None;
+  };
+  let (reply, endpoint) = request_within(
+    endpoint,
+    PAIR_KEY_STREAM,
+    Priority::Metadata,
+    request,
+    budget.max_deadline_ns(),
+  )
+  .await;
+  return_sessions(vec![(holder, endpoint)]);
+  if reply.bytes.is_empty() {
+    count_refusal(PAIR_UNANSWERED);
+    return None;
+  }
+  Some(reply.bytes)
+}
+
+/// Counter: the owner shard did not answer this period's neighbour anchors (A-92 piece 4c); sent again next period,
+/// and until then a sealed head waits for the candidates it cannot resolve.
+/// Format: a counter name in the daemon's status report.
+const MEMBER_ANCHORS_UNSENT: &str = "fleet.seal.member_anchors_unsent";
+
 /// Counter: a pair key that could not be made, wrapped or delivered this period (A-92 piece 4b); tried again next.
 /// Format: a counter name in the daemon's status report.
 const PAIR_UNDELIVERED: &str = "fleet.seal.pair_undelivered";
+
+/// Counters: which way a pair delivery failed (each also in [`PAIR_UNDELIVERED`]): the owner shard did not build it, no
+/// session to the member was free, or the member did not answer within the budget (a refusal is the member's own
+/// `fleet.seal.pair_refused`).
+const PAIR_UNBUILT: &str = "fleet.seal.pair_unbuilt";
+/// See [`PAIR_UNBUILT`].
+const PAIR_NO_SESSION: &str = "fleet.seal.pair_no_session";
+/// See [`PAIR_UNBUILT`].
+const PAIR_UNANSWERED: &str = "fleet.seal.pair_unanswered";
+
+/// Counter: a neighbour's recipient key that did not come back in a period, so its pair was not built (`deliver_pairs`).
+const PAIR_RECIPIENT_UNKNOWN: &str = "fleet.seal.pair_recipient_unknown";
 
 /// The recipient public key of the node with stable `anchor`, reached as `member` (A-92 piece 4b): kept from an earlier
 /// answer, or asked over its authenticated record session now and kept by anchor (bounded by the fleet's peer
@@ -5747,7 +6777,7 @@ async fn request_peer(
   request: &[u8],
   budget: CommitBudget,
 ) -> Option<Vec<u8>> {
-  let mut sessions = take_sessions(|candidate| candidate == host);
+  let mut sessions = take_sessions("fleet.lent_to.request_peer", |candidate| candidate == host);
   let taken = sessions.pop();
   return_sessions(sessions);
   let (holder, endpoint) = taken?;
@@ -5767,20 +6797,25 @@ async fn request_peer(
 /// recipient, accepted from the node with stable anchor `peer` (the session's authenticated certificate, never a field of
 /// the request) and recorded under that anchor.
 fn accept_pair_delivery(s: &mut ShardState, peer: HostId, request: &[u8]) -> Vec<u8> {
-  let Some((partition, rest)) = request.split_at_checked(size_of::<u16>()) else {
-    return Vec::new();
-  };
-  let Some((id, delivery)) = rest.split_at_checked(PAIR_ID_BYTES) else {
-    return Vec::new();
-  };
-  let (Ok(partition), Ok(id)) = (partition.try_into().map(u16::from_le_bytes), id.try_into())
-  else {
+  count_refusal_in(s, PAIR_SERVED);
+  // A request too short for its fields is answered empty, counted: the sender sees no answer, and without the count
+  // the receiver's side of a delivery that fails would not show.
+  let parsed = request
+    .split_at_checked(size_of::<u16>())
+    .and_then(|(partition, rest)| {
+      let (id, delivery) = rest.split_at_checked(PAIR_ID_BYTES)?;
+      let partition = u16::from_le_bytes(partition.try_into().ok()?);
+      let id: [u8; PAIR_ID_BYTES] = id.try_into().ok()?;
+      Some((partition, id, delivery))
+    });
+  let Some((partition, id, delivery)) = parsed else {
+    count_refusal_in(s, PAIR_MALFORMED);
     return Vec::new();
   };
   match crate::seal_keys::accept_pair(s, (peer.0, partition), id, delivery) {
     Ok(()) => vec![PAIR_ACCEPTED],
     Err(_) => {
-      count_refusal(PAIR_REFUSED);
+      count_refusal_in(s, PAIR_REFUSED);
       Vec::new()
     }
   }
@@ -5791,6 +6826,10 @@ const PAIR_ID_BYTES: usize = 16;
 /// Counter: a pair key delivery this node refused (malformed, not for its recipient, or another key for a recorded pair).
 /// Format: a counter name in the daemon's status report.
 const PAIR_REFUSED: &str = "fleet.seal.pair_refused";
+/// Counter: pair key deliveries that reached this receiver's serve path (the receiving side of `pair_unanswered`).
+const PAIR_SERVED: &str = "fleet.seal.pair_served";
+/// Counter: a pair key delivery too short for its partition and key id, answered empty.
+const PAIR_MALFORMED: &str = "fleet.seal.pair_malformed";
 
 /// Ships each of `shard`'s unplaced heads — catalogs, heads and tombstones — to all its candidate holders at
 /// once, committed at `f + 1`.
@@ -5856,8 +6895,9 @@ async fn ship_head(
   head: &Head,
   budget: CommitBudget,
 ) -> Option<Dispatch> {
-  let holders =
-    take_sessions(|host| head.shape.candidates.contains(&host) && !head.acked.contains(&host));
+  let holders = take_sessions("fleet.lent_to.ship_head", |host| {
+    head.shape.candidates.contains(&host) && !head.acked.contains(&host)
+  });
   if holders.is_empty() {
     return None; // No live session to a candidate that still needs the head; retry next period.
   }
@@ -5878,7 +6918,7 @@ async fn ship_head(
   // so the coordinator fetches the committed configuration next period; the head stays unplaced and re-ships
   // under the refreshed generation. Gated on the version being strictly newer than what this node now holds.
   if let Some(version) = committed.stale_version {
-    let _ = state::with_state(|s| {
+    let _ = state::with_state_counted(|s| {
       if version > s.council.configuration().version {
         s.config_refresh_wanted = true;
       }
@@ -5902,7 +6942,7 @@ async fn ship_head(
   }
   // The placement is the owner shard's fact: record it there.
   let (object, sequence, epoch) = (head.object, head.record.sequence, head.record.epoch);
-  let _ = run_on(origin, head.shard, move |s| {
+  crate::xshard::run_on_counted(origin, head.shard, move |s| {
     record_acks_in(s, object, sequence, epoch, placement);
   });
   Some(dispatch)
@@ -5956,7 +6996,10 @@ fn record_acks_in(
 /// entry `None` (out on a dispatch — the link task leaves it alone) until [`return_sessions`] puts it back. A
 /// holder with no live session is skipped — the dispatch proceeds with the holders it can reach and the rest
 /// are retried next period.
-pub(crate) fn take_sessions(wanted: impl Fn(HostId) -> bool) -> Vec<(HostId, Endpoint)> {
+pub(crate) fn take_sessions(
+  lent_to: &'static str,
+  wanted: impl Fn(HostId) -> bool,
+) -> Vec<(HostId, Endpoint)> {
   state::with_state(|s| {
     let mut taken = Vec::new();
     for (host, link) in s.record_sessions.iter_mut() {
@@ -5965,6 +7008,7 @@ pub(crate) fn take_sessions(wanted: impl Fn(HostId) -> bool) -> Vec<(HostId, End
       {
         // The borrow is tagged with the session's own identity, so only this session returns to the slot.
         link.borrowed = endpoint.connection_id().ok();
+        link.lent_to = Some(lent_to);
         taken.push((*host, endpoint));
       }
     }
@@ -5985,8 +7029,10 @@ pub(crate) fn return_sessions(sessions: Vec<(HostId, Endpoint)>) {
       let returned = endpoint.connection_id().ok();
       match s.record_sessions.get_mut(&host) {
         Some(link) if link.endpoint.is_none() && link.borrowed == returned => {
+          link.last_seen = Some(crate::state::RecordLink::seen(host, &endpoint));
           link.endpoint = Some(endpoint);
           link.borrowed = None;
+          link.lent_to = None;
         }
         _ => s.count(LINK_STALE_RETURN, 1),
       }
@@ -6014,34 +7060,69 @@ pub(crate) async fn forward_over_leader_session(
   request: Vec<u8>,
   deadline_ns: u64,
 ) -> Option<Vec<u8>> {
+  forward_batch_over_leader_session(peer, &[request], deadline_ns)
+    .await
+    .map(|batch| {
+      batch
+        .replies
+        .into_iter()
+        .next()
+        .flatten()
+        .unwrap_or_default()
+    })
+}
+
+/// [`forward_over_leader_session`] for several requests at once — a read-ahead batch of windows
+/// (`RequestBody::ReadWindow`) — all sent together on the borrowed session ([`slates_cluster::requests_within`]).
+/// `stall_ns` bounds the wait for the session and, once it is borrowed, any stretch with no progress: a batch that
+/// keeps delivering is never cut off for its size. Returns the replies in order (`None` for one not answered) with
+/// how they streamed ([`slates_cluster::BatchReplies`]), or `None` when the session never came back within the
+/// budget.
+pub(crate) async fn forward_batch_over_leader_session(
+  peer: HostId,
+  requests: &[Vec<u8>],
+  stall_ns: u64,
+) -> Option<slates_cluster::BatchReplies> {
   let began = futures::now_ns();
   let mut missed = false;
   loop {
     let waited = futures::now_ns().saturating_sub(began);
-    if let Some((_, endpoint)) = take_sessions(|host| host == peer).pop() {
-      let remaining = deadline_ns.saturating_sub(waited);
-      let (reply, endpoint) = request_within(
+    if let Some((_, endpoint)) =
+      take_sessions("fleet.lent_to.forward_batch_over_leader_session", |host| {
+        host == peer
+      })
+      .pop()
+    {
+      // The wait for the session spends the budget for the first byte; every byte after renews it.
+      let (replies, endpoint) = slates_cluster::requests_within(
         endpoint,
         FORWARD_STREAM,
         Priority::Metadata,
-        &request,
-        remaining,
+        requests,
+        stall_ns.saturating_sub(waited),
       )
       .await;
       return_sessions(vec![(peer, endpoint)]);
-      return Some(reply.bytes);
+      return Some(replies);
     }
     let first_miss = !missed;
     missed = true;
-    let expired = waited >= deadline_ns;
+    let expired = waited >= stall_ns;
     state::with_state(|s| {
       if first_miss {
-        let missing = if s.record_sessions.contains_key(&peer) {
+        let link = s.record_sessions.get(&peer);
+        let missing = if link.is_some() {
           "fleet.forward.session_out"
         } else {
           "fleet.forward.no_session"
         };
+        // Who holds it: the borrower's own label (`take_sessions`), or the link task when nothing lent
+        // it (a discovery page or a dial), so a session that never comes back names its holder.
+        let holder = link.map(|link| link.lent_to.unwrap_or(LENT_TO_LINK));
         s.count(missing, 1);
+        if let Some(holder) = holder {
+          s.count(holder, 1);
+        }
       }
       if expired {
         s.count("fleet.forward.session_never_returned", 1);
@@ -6056,6 +7137,75 @@ pub(crate) async fn forward_over_leader_session(
     {
       return None;
     }
+  }
+}
+
+#[cfg(test)]
+mod learner_wait_tests {
+  use super::{HEARTBEAT_NS, next_learner_wait};
+
+  /// The uninitialized-learner backoff (battery, 2026-10-09). Do: step the wait while the group stays uninitialized,
+  /// then once it is initialized. Expect it to double from a heartbeat and stop at the membership horizon, and to be
+  /// one heartbeat again once the group is initialized.
+  #[test]
+  fn an_uninitialized_learner_backs_its_fetches_off_to_the_horizon_and_an_initialized_one_returns()
+  {
+    let horizon = crate::lease::horizon_ns();
+    let mut wait = HEARTBEAT_NS;
+    let mut waits = Vec::new();
+    for _ in 0..8 {
+      wait = next_learner_wait(true, wait);
+      waits.push(wait);
+    }
+    assert_eq!(waits.first(), Some(&HEARTBEAT_NS.saturating_mul(2)));
+    assert!(waits.windows(2).all(|pair| pair[0] <= pair[1]), "{waits:?}");
+    assert_eq!(
+      waits.last(),
+      Some(&horizon),
+      "the wait stops at the horizon: {waits:?}"
+    );
+    assert_eq!(next_learner_wait(false, horizon), HEARTBEAT_NS);
+  }
+}
+
+#[cfg(test)]
+mod discovery_wait_tests {
+  use super::{HEARTBEAT_NS, next_discovery_wait};
+
+  /// A settled roster's checks back off and a change brings them back: do a run of pages at one generation, then one
+  /// at a new generation, then one mid-sweep. Expect the wait to double from a heartbeat up to the membership horizon
+  /// and stay there, and to return to one heartbeat at the change and mid-sweep.
+  #[test]
+  fn a_settled_roster_backs_its_discovery_checks_off_to_the_horizon_and_a_change_resets_them() {
+    let horizon = crate::lease::horizon_ns();
+    let mut wait = HEARTBEAT_NS;
+    let mut waits = Vec::new();
+    for _ in 0..8 {
+      wait = next_discovery_wait(Some(7), Some(7), wait);
+      waits.push(wait);
+    }
+    assert_eq!(waits.first(), Some(&(2 * HEARTBEAT_NS)));
+    assert!(waits.windows(2).all(|pair| pair[1] >= pair[0]), "{waits:?}");
+    assert_eq!(
+      waits.last(),
+      Some(&horizon),
+      "the wait stops at the horizon: {waits:?}"
+    );
+    assert_eq!(
+      next_discovery_wait(Some(7), Some(8), horizon),
+      HEARTBEAT_NS,
+      "a new generation resets"
+    );
+    assert_eq!(
+      next_discovery_wait(Some(7), None, horizon),
+      HEARTBEAT_NS,
+      "a sweep under way resets"
+    );
+    assert_eq!(
+      next_discovery_wait(None, Some(7), horizon),
+      HEARTBEAT_NS,
+      "a first completed sweep starts at a heartbeat"
+    );
   }
 }
 

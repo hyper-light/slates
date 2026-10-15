@@ -152,3 +152,61 @@ fn an_edit_without_room_is_refused_with_the_file_unchanged() {
   );
   assert!(read_all(&vol, &store, f, original.len()) == original);
 }
+
+/// T-1.1 (a truncate refused changes nothing; 2026-10-06). Do: write a file across three chunk windows (the write
+/// seals the windows it crosses), free the chunk record of its middle window out from under it (a stale handle, the one refusal a release can
+/// meet), then truncate the file into its first window. Expect: the truncate refused with the chunk's stale handle, and the file
+/// exactly as it was: its size, and its first window's bytes through the read path. Before, the truncate took the body
+/// out, released the windows past the cut until the stale one refused, and returned without putting it back: the file
+/// kept its size and read as zeros.
+#[test]
+fn a_truncate_refused_by_a_stale_chunk_keeps_the_file() {
+  let mut store = common::store();
+  let mut vol = common::volume(&mut store, 1 << 30);
+  let root = vol.root_inode(&store).unwrap();
+  let chunk = store.content.chunk_bytes();
+  let f = vol.create_file_no(&mut store, root, "f", 0o644).unwrap();
+  let bytes: Vec<u8> = (0..3 * chunk)
+    .map(|at| u8::try_from(at % 251).unwrap())
+    .collect();
+  vol.write(&mut store, f, 0, &bytes).unwrap();
+  // The write sealed the windows it crossed; the last stays open over them.
+  let sealed = store
+    .inodes
+    .iter()
+    .find(|(_, inode)| inode.no == f)
+    .map(|(_, inode)| match &inode.body {
+      slates_vfs::inode::Body::Sealed(extents) => extents.clone(),
+      slates_vfs::inode::Body::Open { sealed, .. } => sealed.clone(),
+      other => panic!("a chunked body: {other:?}"),
+    })
+    .unwrap();
+  let stale = sealed
+    .iter()
+    .find(|extent| extent.off == u64::try_from(chunk).unwrap())
+    .and_then(|extent| match extent.src {
+      slates_vfs::content::ExtentSrc::Chunk { chunk, .. } => Some(chunk),
+      slates_vfs::content::ExtentSrc::Zero => None,
+    })
+    .unwrap();
+  store.content.free_chunk(stale).unwrap();
+  let refused = vol.truncate(&mut store, f, 1);
+  assert!(
+    matches!(
+      refused,
+      Err(slates_vfs::VfsError::Memory(
+        slates_mem::MemError::StaleHandle { .. }
+      ))
+    ),
+    "{refused:?}"
+  );
+  assert_eq!(
+    vol.stat(&store, f).unwrap().size,
+    u64::try_from(3 * chunk).unwrap()
+  );
+  assert_eq!(
+    read_all(&vol, &store, f, chunk),
+    bytes[..chunk],
+    "the first window's bytes"
+  );
+}

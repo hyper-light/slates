@@ -63,7 +63,12 @@ pub(crate) fn bootstrap(state: &mut ShardState, root: bool, member: u64) -> Repl
     quorum,
     domains,
     state.config.derived_scatter(quorum),
-    false,
+    // The region's mirror scope exists exactly when the manifest declares it a mirror (§4.10; joiners receive it in
+    // the group's base configuration, so every member agrees).
+    state
+      .region_mirrors
+      .get(&region)
+      .is_some_and(|mirror| *mirror != region),
   );
   if root {
     state.root = RootGroup::new(local, vec![region], vec![local]);

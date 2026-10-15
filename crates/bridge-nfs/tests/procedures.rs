@@ -1993,6 +1993,82 @@ fn parse_readdirplus(reply: &[u8]) -> (Vec<String>, Vec<Nfsfh3>) {
   (names, handles)
 }
 
+/// A-113, hostile input. Do: fill a directory past what one transfer-ceiling page holds, then READDIRPLUS and READDIR
+/// it with a budget of `u32::MAX`. Expect: each reply no larger than the transfer ceiling FSINFO advertises, and not the
+/// end of the listing — the server returns fewer entries than asked (RFC 1813 §3.3.16) rather than a page as large as
+/// the directory, so every reply fits the largest record a held connection sends whole.
+#[test]
+fn a_listing_asked_for_four_gibibytes_is_capped_at_the_transfer_ceiling() {
+  // A store with room for a directory of thousands of entries (the shared one holds 256 inodes).
+  let mut arena = ChunkArena::new(PAGE);
+  arena
+    .add_region(Region::map(PAGE * REGION_PAGES, PAGE, false).unwrap())
+    .unwrap();
+  let mut store = Store::new(
+    &StoreConfig {
+      page: PAGE,
+      cache_line: 128,
+      max_dirs: 64,
+      max_inodes: 4096,
+      max_chunks: REGION_PAGES,
+      max_dir_blocks: 4096,
+      dir_cutover: 16,
+    },
+    arena,
+    0,
+  );
+  let mut vol = volume(&mut store);
+  let mut bridge = VolumeBridge::new(VolumeId { bytes: [0x11; 16] }, &mut vol, &mut store);
+  let cx = write_cx();
+  let root_ino = bridge.root(&cx).unwrap();
+  // Long names, so even the plain listing of a few thousand entries (about 130 bytes each) outgrows one page of the
+  // ceiling.
+  let padding = "n".repeat(100);
+  for index in 0..3000 {
+    let name = format!("{padding}-{index:05}");
+    bridge.create(oid(root_ino), &cx, &name, 0o644, 0).unwrap();
+  }
+  let mut export = Export::new(
+    &mut bridge,
+    VolumeId { bytes: [0x11; 16] },
+    Principal::Uid { uid: 0 },
+    Rights {
+      read: true,
+      write: true,
+    },
+  )
+  .unwrap();
+  let root_fh = root_handle(&mut export);
+  let ceiling = usize::try_from(slates_bridge_nfs::procedures::MAX_TRANSFER).unwrap();
+  for procedure in [NFSPROC3_READDIRPLUS, NFSPROC3_READDIR] {
+    let mut args = XdrWriter::new();
+    root_fh.encode(&mut args);
+    args.u64(0);
+    args.fixed(&[0u8; 8]);
+    if procedure == NFSPROC3_READDIRPLUS {
+      args.u32(u32::MAX); // dircount (advisory)
+    }
+    args.u32(u32::MAX); // count / maxcount
+    let reply = export
+      .serve_nfs(procedure, &mut XdrReader::new(args.as_slice()))
+      .unwrap();
+    assert!(
+      reply.len() <= ceiling,
+      "procedure {procedure}: a {} byte page, past the {ceiling} byte ceiling",
+      reply.len()
+    );
+    assert_eq!(
+      XdrReader::new(&reply).u32().unwrap(),
+      Nfsstat3::Ok.wire(),
+      "procedure {procedure} answered"
+    );
+    assert!(
+      reply.ends_with(&0u32.to_be_bytes()),
+      "procedure {procedure}: the page is not the end of the listing (eof false)"
+    );
+  }
+}
+
 /// READDIRPLUS lists a directory with each entry's attributes and file handle, so a client needs
 /// no follow-up GETATTR/LOOKUP per entry: every entry carries its attributes and a handle, and a
 /// listed handle resolves to the same object.

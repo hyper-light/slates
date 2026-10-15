@@ -8,7 +8,8 @@
 //!
 //! An acknowledgement also carries the sender's Vivaldi network coordinate ([`crate::coordinates`]), so
 //! a prober learns the coordinate of every peer it probes and can predict the round-trip time to it —
-//! the live half of coordinate-aware indirect probing.
+//! the live half of coordinate-aware indirect probing — and the bound on the sender's responses as a
+//! relay, so a prober that asks it to relay knows when its response is due.
 //!
 //! A message borrows what it carries: a sender's gossip entries and coordinate when it is encoded,
 //! the received bytes when it is decoded. [`SwimMessage::encode_into`] writes into the caller's
@@ -58,7 +59,7 @@ pub enum SwimMessage<'a> {
     Ack {
         /// The acknowledging node.
         from: HostId,
-        /// Echoes the probing [`Ping`]'s `nonce`, so the prober counts this acknowledgement only for the probe
+        /// Echoes the probing [`Ping`](SwimMessage::Ping)'s `nonce`, so the prober counts this acknowledgement only for the probe
         /// it is answering — never for an earlier one whose reply was redelivered.
         nonce: u64,
         /// The acknowledging node's daemon boot_nonce — the same announcement a ping makes, so the prober
@@ -74,6 +75,17 @@ pub enum SwimMessage<'a> {
         /// observation must belong to the relevant authority generation" (`slates_db::register::Standing`) — so
         /// another host's configuration change leaves the lease as it was.
         standing: Option<u64>,
+        /// The acknowledging node's promise to the prober for an owner's per-grant lease (Gray and
+        /// Cheriton 1989), nanoseconds from its receipt of the probe; the prober counts it from the
+        /// probe's send, which came first. The owner's to make and to keep: the detector carries it
+        /// and reads none of it. Zero promises nothing, so an owner that does not lease ignores it. A
+        /// relayed answer carries none ([`SwimMessage::IndirectAck`]): a lease counts direct answers.
+        promise_ns: u64,
+        /// How long after a ping-request reaches the acknowledging node it responds, with the target's
+        /// answer or a nack, nanoseconds
+        /// ([`Ack::relay_within_ns`](crate::detector::Ack::relay_within_ns)): a prober that asks it to
+        /// relay has its response due by its own span for it plus this.
+        relay_within_ns: u64,
         /// The membership updates piggybacked on this acknowledgement.
         gossip: GossipBatch<'a>,
         /// The acknowledging node's Vivaldi coordinate.
@@ -109,6 +121,27 @@ pub enum SwimMessage<'a> {
         /// The requester's probe nonce the relay was asked about.
         nonce: u64,
         /// The relay's daemon boot_nonce — its own identity announcement.
+        boot_nonce: u64,
+        /// The membership updates piggybacked on this answer.
+        gossip: GossipBatch<'a>,
+    },
+    /// A relay's answer to a [`SwimMessage::PingReq`] whose target did not answer the relay's own
+    /// probe by the relay's deadline for it, the relayed ping's
+    /// ([`Ping::due_ns`](crate::detector::Ping::due_ns)): `from` (the relay) judged its own leg to
+    /// `target` by its own measure and reports that, echoing the requester's probe `nonce`
+    /// (Lifeguard's nack, Dadgar, Phillips and Currey 2018, §IV-A). The requester's relay stage ends
+    /// when every relay it asked has answered so, rather than at a guess of the relay's leg it never
+    /// measured. An answer that reaches the relay later still goes back as an
+    /// [`IndirectAck`](SwimMessage::IndirectAck). Laid out as the indirect acknowledgement is,
+    /// under its own tag.
+    Nack {
+        /// The relay whose probe of the target went unanswered by its deadline.
+        from: HostId,
+        /// The member the relay probed.
+        target: HostId,
+        /// The requester's probe nonce the relay was asked about.
+        nonce: u64,
+        /// The relay's daemon boot_nonce, its own identity announcement.
         boot_nonce: u64,
         /// The membership updates piggybacked on this answer.
         gossip: GossipBatch<'a>,
@@ -178,6 +211,8 @@ const TAG_PING_REQ: u8 = 3;
 const TAG_INDIRECT_ACK: u8 = 4;
 /// Format: a view chunk's tag.
 const TAG_SYNC: u8 = 5;
+/// Format: a relay's nack's tag.
+const TAG_NACK: u8 = 6;
 
 /// Format: a view chunk's pull is one byte; a chunk that asks no view in return.
 const PULL_NONE: u8 = 0;
@@ -342,6 +377,7 @@ impl<'a> SwimMessage<'a> {
             | SwimMessage::Ack { from, .. }
             | SwimMessage::PingReq { from, .. }
             | SwimMessage::IndirectAck { from, .. }
+            | SwimMessage::Nack { from, .. }
             | SwimMessage::Sync { from, .. } => *from,
         }
     }
@@ -353,6 +389,7 @@ impl<'a> SwimMessage<'a> {
             | SwimMessage::Ack { gossip, .. }
             | SwimMessage::PingReq { gossip, .. }
             | SwimMessage::IndirectAck { gossip, .. }
+            | SwimMessage::Nack { gossip, .. }
             | SwimMessage::Sync { gossip, .. } => gossip,
         }
     }
@@ -364,20 +401,22 @@ impl<'a> SwimMessage<'a> {
             SwimMessage::Ping { .. }
             | SwimMessage::PingReq { .. }
             | SwimMessage::IndirectAck { .. }
+            | SwimMessage::Nack { .. }
             | SwimMessage::Sync { .. } => None,
         }
     }
 
     /// The probe token: a [`Ping`](SwimMessage::Ping)'s nonce, the value an [`Ack`](SwimMessage::Ack)
     /// echoes back, the requester's probe nonce a [`PingReq`](SwimMessage::PingReq) asks about, or the one
-    /// an [`IndirectAck`](SwimMessage::IndirectAck) echoes. The prober compares its ping's nonce to the
-    /// acknowledgement's — direct or relayed — to reject a stale reply.
+    /// an [`IndirectAck`](SwimMessage::IndirectAck) or a [`Nack`](SwimMessage::Nack) echoes. The prober
+    /// compares its ping's nonce to the acknowledgement's — direct or relayed — to reject a stale reply.
     pub fn nonce(&self) -> Option<u64> {
         match self {
             SwimMessage::Ping { nonce, .. }
             | SwimMessage::Ack { nonce, .. }
             | SwimMessage::PingReq { nonce, .. }
-            | SwimMessage::IndirectAck { nonce, .. } => Some(*nonce),
+            | SwimMessage::IndirectAck { nonce, .. }
+            | SwimMessage::Nack { nonce, .. } => Some(*nonce),
             SwimMessage::Sync { .. } => None,
         }
     }
@@ -391,6 +430,7 @@ impl<'a> SwimMessage<'a> {
             SwimMessage::Ping { boot_nonce, .. }
             | SwimMessage::Ack { boot_nonce, .. }
             | SwimMessage::IndirectAck { boot_nonce, .. }
+            | SwimMessage::Nack { boot_nonce, .. }
             | SwimMessage::Sync { boot_nonce, .. } => Some(*boot_nonce),
             SwimMessage::PingReq { .. } => None,
         }
@@ -411,6 +451,7 @@ impl<'a> SwimMessage<'a> {
             } => Some(*configuration_version),
             SwimMessage::PingReq { .. }
             | SwimMessage::IndirectAck { .. }
+            | SwimMessage::Nack { .. }
             | SwimMessage::Sync { .. } => None,
         }
     }
@@ -420,9 +461,9 @@ impl<'a> SwimMessage<'a> {
     /// acknowledgement.
     pub fn target(&self) -> Option<HostId> {
         match self {
-            SwimMessage::PingReq { target, .. } | SwimMessage::IndirectAck { target, .. } => {
-                Some(*target)
-            }
+            SwimMessage::PingReq { target, .. }
+            | SwimMessage::IndirectAck { target, .. }
+            | SwimMessage::Nack { target, .. } => Some(*target),
             SwimMessage::Ping { .. } | SwimMessage::Ack { .. } | SwimMessage::Sync { .. } => None,
         }
     }
@@ -455,6 +496,8 @@ impl<'a> SwimMessage<'a> {
                 boot_nonce,
                 configuration_version,
                 standing,
+                promise_ns,
+                relay_within_ns,
                 gossip,
                 coordinate,
             } => {
@@ -470,6 +513,8 @@ impl<'a> SwimMessage<'a> {
                     }
                     None => out.push(STANDING_ABSENT),
                 }
+                out.extend_from_slice(&promise_ns.to_le_bytes());
+                out.extend_from_slice(&relay_within_ns.to_le_bytes());
                 encode_gossip(out, *gossip);
                 encode_coordinate(out, *coordinate);
             }
@@ -491,8 +536,19 @@ impl<'a> SwimMessage<'a> {
                 nonce,
                 boot_nonce,
                 gossip,
+            }
+            | SwimMessage::Nack {
+                from,
+                target,
+                nonce,
+                boot_nonce,
+                gossip,
             } => {
-                out.push(TAG_INDIRECT_ACK);
+                out.push(if matches!(self, SwimMessage::Nack { .. }) {
+                    TAG_NACK
+                } else {
+                    TAG_INDIRECT_ACK
+                });
                 out.extend_from_slice(&from.0.to_le_bytes());
                 out.extend_from_slice(&target.0.to_le_bytes());
                 out.extend_from_slice(&nonce.to_le_bytes());
@@ -544,6 +600,8 @@ impl<'a> SwimMessage<'a> {
                 let (boot_nonce, rest) = take_word(rest)?;
                 let (configuration_version, rest) = take_word(rest)?;
                 let (standing, rest) = take_standing(rest)?;
+                let (promise_ns, rest) = take_word(rest)?;
+                let (relay_within_ns, rest) = take_word(rest)?;
                 let (gossip, leftover) = decode_gossip(rest)?;
                 let coordinate = decode_coordinate(leftover)?;
                 Ok(SwimMessage::Ack {
@@ -552,6 +610,8 @@ impl<'a> SwimMessage<'a> {
                     boot_nonce,
                     configuration_version,
                     standing,
+                    promise_ns,
+                    relay_within_ns,
                     gossip,
                     coordinate,
                 })
@@ -571,7 +631,7 @@ impl<'a> SwimMessage<'a> {
                     gossip,
                 })
             }
-            TAG_INDIRECT_ACK => {
+            TAG_INDIRECT_ACK | TAG_NACK => {
                 let (from, rest) = take_host(rest)?;
                 let (target, rest) = take_host(rest)?;
                 let (nonce, rest) = take_word(rest)?;
@@ -580,12 +640,22 @@ impl<'a> SwimMessage<'a> {
                 if !leftover.is_empty() {
                     return Err(SwimWireError::GossipLengthMismatch);
                 }
-                Ok(SwimMessage::IndirectAck {
-                    from,
-                    target,
-                    nonce,
-                    boot_nonce,
-                    gossip,
+                Ok(if tag == TAG_NACK {
+                    SwimMessage::Nack {
+                        from,
+                        target,
+                        nonce,
+                        boot_nonce,
+                        gossip,
+                    }
+                } else {
+                    SwimMessage::IndirectAck {
+                        from,
+                        target,
+                        nonce,
+                        boot_nonce,
+                        gossip,
+                    }
                 })
             }
             TAG_SYNC => {
@@ -844,6 +914,8 @@ mod tests {
             boot_nonce: 1,
             configuration_version: 6,
             standing: Some(4),
+            promise_ns: 900_000_000,
+            relay_within_ns: 2_500_000,
             gossip: GossipBatch::Entries(&SAMPLE_GOSSIP),
             coordinate: Coordinate::Held(&coordinate),
         };
@@ -860,6 +932,8 @@ mod tests {
         hostile.extend_from_slice(&0u64.to_le_bytes()); // boot_nonce
         hostile.extend_from_slice(&0u64.to_le_bytes()); // configuration_version
         hostile.push(STANDING_ABSENT); // no standing
+        hostile.extend_from_slice(&0u64.to_le_bytes()); // no promise
+        hostile.extend_from_slice(&0u64.to_le_bytes()); // relay_within_ns
         hostile.extend_from_slice(&0u32.to_le_bytes()); // empty gossip
         let bare = hostile.clone();
         hostile.extend_from_slice(&u32::MAX.to_le_bytes()); // coordinate dims = huge
@@ -894,6 +968,8 @@ mod tests {
             boot_nonce: 1,
             configuration_version: 6,
             standing: Some(0x0102_0304_0506_0708),
+            promise_ns: 0,
+            relay_within_ns: 0,
             gossip: GossipBatch::Entries(&[]),
             coordinate: Coordinate::Held(&coordinate),
         }
@@ -935,6 +1011,8 @@ mod tests {
                 boot_nonce: u64::MAX,
                 configuration_version: u64::MAX,
                 standing: None,
+                promise_ns: u64::MAX,
+                relay_within_ns: u64::MAX,
                 gossip: GossipBatch::Entries(&[]),
                 coordinate: Coordinate::Held(&coordinate),
             },
@@ -944,6 +1022,8 @@ mod tests {
                 boot_nonce: 6,
                 configuration_version: 7,
                 standing: Some(u64::MAX),
+                promise_ns: 0,
+                relay_within_ns: 0,
                 gossip: GossipBatch::Entries(&SAMPLE_GOSSIP),
                 coordinate: Coordinate::Held(&coordinate),
             },
@@ -960,6 +1040,13 @@ mod tests {
                 boot_nonce: 11,
                 gossip: GossipBatch::Entries(&SAMPLE_GOSSIP),
             },
+            SwimMessage::Nack {
+                from: B,
+                target: A,
+                nonce: 9,
+                boot_nonce: 11,
+                gossip: GossipBatch::Entries(&SAMPLE_GOSSIP),
+            },
         ];
         for message in messages {
             let bytes = message.encoded();
@@ -967,6 +1054,52 @@ mod tests {
                 SwimMessage::decode(&bytes),
                 Ok(message),
                 "round-trip is identity"
+            );
+        }
+    }
+
+    /// The acknowledgement's encoding is fixed and little-endian, a golden vector pinning it (host 2 at
+    /// daemon boot_nonce 7 answering probe nonce 5 under configuration version 9, holding the prober's
+    /// standing at 3, promising 900 ms, stating its relay responses within 2.5 ms, with no gossip and
+    /// the sample coordinate); a message cut anywhere before its coordinate ends is refused.
+    #[test]
+    fn ack_has_a_golden_encoding() {
+        let coordinate = sample_coordinate();
+        let message = SwimMessage::Ack {
+            from: HostId(2),
+            nonce: 5,
+            boot_nonce: 7,
+            configuration_version: 9,
+            standing: Some(3),
+            promise_ns: 900_000_000,
+            relay_within_ns: 2_500_000,
+            gossip: GossipBatch::Entries(&[]),
+            coordinate: Coordinate::Held(&coordinate),
+        };
+        let mut expected = vec![TAG_ACK];
+        expected.extend_from_slice(&2u64.to_le_bytes()); // from = 2
+        expected.extend_from_slice(&5u64.to_le_bytes()); // nonce = 5
+        expected.extend_from_slice(&7u64.to_le_bytes()); // boot_nonce = 7
+        expected.extend_from_slice(&9u64.to_le_bytes()); // configuration_version = 9
+        expected.push(STANDING_PRESENT);
+        expected.extend_from_slice(&3u64.to_le_bytes()); // standing = 3
+        expected.extend_from_slice(&900_000_000u64.to_le_bytes()); // promise_ns
+        expected.extend_from_slice(&2_500_000u64.to_le_bytes()); // relay_within_ns
+        expected.extend_from_slice(&0u32.to_le_bytes()); // gossip count = 0
+        expected.extend_from_slice(&2u32.to_le_bytes()); // coordinate dimensions = 2
+        for scalar in [1.5f64, -2.0, 3.25, 0.75] {
+            expected.extend_from_slice(&scalar.to_bits().to_le_bytes());
+        }
+        assert_eq!(message.encoded(), expected, "the byte layout is fixed");
+        assert_eq!(
+            SwimMessage::decode(&expected),
+            Ok(message),
+            "and decodes back"
+        );
+        for cut in 1..expected.len() {
+            assert!(
+                SwimMessage::decode(&expected[..cut]).is_err(),
+                "an acknowledgement cut at {cut} bytes is refused"
             );
         }
     }
@@ -995,6 +1128,48 @@ mod tests {
             Ok(message),
             "and decodes back"
         );
+    }
+
+    /// A relay's nack is laid out as the indirect acknowledgement is, under its own tag, a golden
+    /// vector pinning it (a relay, host 4 at daemon boot_nonce 7, reporting host 3 unanswered by its
+    /// deadline for the requester's probe nonce 5, with no gossip); the same fields under the other
+    /// tag decode as the other message, and a nack cut short is refused.
+    #[test]
+    fn nack_has_a_golden_encoding() {
+        let message = SwimMessage::Nack {
+            from: HostId(4),
+            target: HostId(3),
+            nonce: 5,
+            boot_nonce: 7,
+            gossip: GossipBatch::Entries(&[]),
+        };
+        let mut expected = vec![TAG_NACK];
+        expected.extend_from_slice(&4u64.to_le_bytes()); // from = 4
+        expected.extend_from_slice(&3u64.to_le_bytes()); // target = 3
+        expected.extend_from_slice(&5u64.to_le_bytes()); // nonce = 5
+        expected.extend_from_slice(&7u64.to_le_bytes()); // boot_nonce = 7
+        expected.extend_from_slice(&0u32.to_le_bytes()); // gossip count = 0
+        assert_eq!(message.encoded(), expected, "the byte layout is fixed");
+        assert_eq!(
+            SwimMessage::decode(&expected),
+            Ok(message),
+            "and decodes back"
+        );
+        let mut acknowledgement = expected.clone();
+        acknowledgement[0] = TAG_INDIRECT_ACK;
+        assert!(
+            matches!(
+                SwimMessage::decode(&acknowledgement),
+                Ok(SwimMessage::IndirectAck { nonce: 5, .. })
+            ),
+            "the tag alone tells a nack from an answer"
+        );
+        for cut in 1..expected.len() {
+            assert!(
+                SwimMessage::decode(&expected[..cut]).is_err(),
+                "a nack cut at {cut} bytes is refused"
+            );
+        }
     }
 
     /// A view chunk's encoding is fixed and little-endian, a golden vector pins it (host 2 at daemon
@@ -1234,6 +1409,8 @@ mod tests {
         bytes.extend_from_slice(&0u64.to_le_bytes()); // boot_nonce
         bytes.extend_from_slice(&0u64.to_le_bytes()); // configuration_version
         bytes.push(STANDING_ABSENT); // no standing
+        bytes.extend_from_slice(&0u64.to_le_bytes()); // no promise
+        bytes.extend_from_slice(&0u64.to_le_bytes()); // relay_within_ns
         bytes.extend_from_slice(&u32::MAX.to_le_bytes()); // count = huge
         assert_eq!(
             SwimMessage::decode(&bytes),
@@ -1247,6 +1424,8 @@ mod tests {
         short.extend_from_slice(&0u64.to_le_bytes()); // boot_nonce
         short.extend_from_slice(&0u64.to_le_bytes()); // configuration_version
         short.push(STANDING_ABSENT); // no standing
+        short.extend_from_slice(&0u64.to_le_bytes()); // no promise
+        short.extend_from_slice(&0u64.to_le_bytes()); // relay_within_ns
         short.extend_from_slice(&1u32.to_le_bytes());
         short.extend_from_slice(&[9, 9, 9]); // a partial entry
         assert_eq!(

@@ -234,9 +234,11 @@ fn copy_up_rows(
       &format!("copy up {label} on first write"),
       &measure(
         || {
-          let mut o = vol.with_host(host);
-          if let Ok(l) = o.resolve(&mut store, &path) {
-            std::hint::black_box(o.write(&mut store, l.inode, 0, b"x").ok());
+          {
+            let mut o = vol.with_host(host);
+            if let Ok(l) = o.resolve(&mut store, &path) {
+              std::hint::black_box(o.write(&mut store, l.inode, 0, b"x").ok());
+            }
           }
           // Rebuild for the next sample so the next write copies up again.
           if let Ok(v) = fresh(&mut store) {

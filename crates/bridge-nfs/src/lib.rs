@@ -48,7 +48,8 @@ pub use portmap::Mapping;
 pub use procedures::Export;
 pub use rpc::{
   AUTH_SYS_MAX_GIDS, AcceptStatus, RpcCall, RpcError, auth_sys_creds, auth_sys_gid,
-  auth_sys_identity, auth_sys_uid, parse_call, read_record, reply_bytes, write_record,
+  auth_sys_identity, auth_sys_uid, parse_call, read_record, reply_bytes, reply_record,
+  write_record,
 };
 pub use server::{serve_call, serve_connection, serve_connection_async};
 pub use xdr::{XdrError, XdrReader, XdrWriter};

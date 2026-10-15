@@ -29,6 +29,7 @@ use std::mem::Discriminant;
 
 use slates_mem::Handle;
 use slates_wire::Wire;
+use slates_wire::codec::{encode_bytes, encode_option_bytes};
 use slates_wire::crc32c::{crc32c, crc32c_append};
 
 use crate::clock::Clock;
@@ -69,9 +70,13 @@ const SHARD_MAGIC: u32 = u32::from_le_bytes(*b"SLS1");
 /// base entry's fingerprint carries its owner, so an overlay reports a base file's owner as the disk holds it.
 /// 17 (A-99, 2026-10-05) a sealed chunk's image carries its key identity, its version and its segments' tags, so
 /// a restarted daemon re-opens the ciphertext the arena still holds instead of reading it as clear bytes.
+/// 18 (A-127, 2026-10-09) the call records a barrier publishes with the effects their calls made, so a compound the
+/// dead daemon applied is answered on its client's retry, never run again. 19 (A-128, 2026-10-09) the replies an NFSv3
+/// barrier publishes for a connection the anchor holds, so a request the dead daemon applied and never answered is
+/// answered on the same socket by its successor, never applied twice.
 /// Format: the image layout version, bumped with any change to the types below or to the held replicas'
 /// image they carry.
-const IMAGE_VERSION: u16 = 17;
+const IMAGE_VERSION: u16 = 19;
 
 /// A recorded attachment's references in an image (A-61): its durable id and its share by inode.
 #[derive(Clone, Debug, PartialEq, Eq, Wire)]
@@ -222,6 +227,12 @@ pub enum BodyImage {
   },
   /// A symlink's target.
   Symlink {
+    /// The target path.
+    target: String,
+  },
+  /// An untouched base symlink's target as the disk held it ([`Body::BaseLink`]); appended, so every earlier image
+  /// decodes as it did.
+  BaseLink {
     /// The target path.
     target: String,
   },
@@ -497,6 +508,27 @@ pub struct ShardImage {
   /// The replies a barrier published with its effect and had not yet delivered (A-61): at most one per FUSE
   /// mount, opaque here (the transport encodes them).
   pub replies: Vec<HeldReply>,
+  /// The call records published with the effects their calls made (A-127), in key order: at most one per session
+  /// slot of the transport's clients, opaque here.
+  pub calls: Vec<HeldCall>,
+  /// The NFSv3 replies a barrier published for connections the anchor holds and had not yet sent (A-128), in
+  /// (connection, xid) order: the mutations of each held connection's turn in progress.
+  pub nfs_replies: Vec<HeldNfsReply>,
+}
+
+/// An NFSv3 reply published with the effect it answers (A-128): the anchor-held connection the request came on, the
+/// request's xid, whether the call was accepted (a refused barrier answers `SYSTEM_ERR`), and the procedure's results,
+/// opaque here.
+#[derive(Clone, Debug, PartialEq, Eq, Wire)]
+pub struct HeldNfsReply {
+  /// The held connection's id.
+  pub connection: u64,
+  /// The request's xid.
+  pub xid: u32,
+  /// Whether the call was accepted with these results; `false` for a system error with none.
+  pub accepted: bool,
+  /// The procedure's results.
+  pub results: Vec<u8>,
 }
 
 /// A transport's reply published with the effect it answers (A-61): the mount's attachment, the request's unique
@@ -511,7 +543,53 @@ pub struct HeldReply {
   pub reply: Vec<u8>,
 }
 
+/// Format: the bytes of a held call record's key: an NFSv4.1 session id (16 bytes) and its slot (a big-endian word).
+pub const HELD_CALL_KEY_BYTES: usize = 16 + size_of::<u32>();
+
+/// A transport's call record published with the effects its calls made (A-127): the session slot it answers for, and
+/// the record's bytes, opaque here (the transport encodes them).
+#[derive(Clone, Debug, PartialEq, Eq, Wire)]
+pub struct HeldCall {
+  /// The session slot.
+  pub key: [u8; HELD_CALL_KEY_BYTES],
+  /// The record's bytes.
+  pub record: Vec<u8>,
+}
+
 impl ShardImage {
+  /// Starts a streamed shard image's encoding in `out` (for [`ShardImage::encode_finish`]): what `ShardImage::new` then
+  /// `encode` writes before its `volumes` volumes. The caller then appends exactly that many, each as its key's 16
+  /// bytes followed by [`Volume::encode_image`], in key order (the order `new` sorts into). The count is written first
+  /// because a streamed image's bytes may already be in its slot when the last volume is encoded; a volume that cannot
+  /// be captured restarts the stream without it.
+  pub fn encode_start(out: &mut Vec<u8>, volumes: usize) {
+    SHARD_MAGIC.encode(out);
+    IMAGE_VERSION.encode(out);
+    slates_wire::codec::encode_len(volumes, out);
+  }
+
+  /// Ends a streamed shard image: the held replicas, the replies, the call records and the held NFSv3 replies, as
+  /// `ShardImage::new(volumes).with_held(held).with_replies(replies).with_calls(calls).with_nfs_replies(nfs)`'s
+  /// `encode` writes them after the volumes.
+  pub fn encode_finish(
+    out: &mut Vec<u8>,
+    held: &[u8],
+    (replies, calls, nfs_replies): (
+      &mut Vec<HeldReply>,
+      &mut Vec<HeldCall>,
+      &mut Vec<HeldNfsReply>,
+    ),
+  ) {
+    slates_wire::codec::encode_len(held.len(), out);
+    out.extend_from_slice(held);
+    replies.sort_by_key(|reply| reply.attachment);
+    replies.encode(out);
+    calls.sort_by_key(|call| call.key);
+    calls.encode(out);
+    nfs_replies.sort_by_key(|reply| (reply.connection, reply.xid));
+    nfs_replies.encode(out);
+  }
+
   /// A shard image of the given volumes, in key order, holding nothing for others.
   pub fn new(mut volumes: Vec<KeyedImage>) -> ShardImage {
     volumes.sort_by_key(|v| v.key);
@@ -521,6 +599,8 @@ impl ShardImage {
       volumes,
       held: Vec::new(),
       replies: Vec::new(),
+      calls: Vec::new(),
+      nfs_replies: Vec::new(),
     }
   }
 
@@ -533,6 +613,21 @@ impl ShardImage {
   pub fn with_replies(self, mut replies: Vec<HeldReply>) -> ShardImage {
     replies.sort_by_key(|reply| reply.attachment);
     ShardImage { replies, ..self }
+  }
+
+  /// This image carrying `calls`, the call records (A-127), in key order.
+  pub fn with_calls(self, mut calls: Vec<HeldCall>) -> ShardImage {
+    calls.sort_by_key(|call| call.key);
+    ShardImage { calls, ..self }
+  }
+
+  /// This image carrying `nfs_replies`, the held NFSv3 replies not yet sent (A-128), in (connection, xid) order.
+  pub fn with_nfs_replies(self, mut nfs_replies: Vec<HeldNfsReply>) -> ShardImage {
+    nfs_replies.sort_by_key(|reply| (reply.connection, reply.xid));
+    ShardImage {
+      nfs_replies,
+      ..self
+    }
   }
 
   /// Decodes a shard image from content-object bytes, refusing a foreign magic, an unknown version
@@ -574,9 +669,21 @@ impl ShardImage {
   /// for a committed slot that is CRC-valid but decodes wrong (never a false success). A publish torn
   /// mid-write is skipped in favour of the previous committed image.
   pub fn read_from<S: ImageRead + ?Sized>(slots: &S) -> Result<Option<ShardImage>, VfsError> {
+    Ok(Self::read_committed(slots)?.map(|(_, image)| image))
+  }
+
+  /// [`ShardImage::read_from`] with the committed slot it read: the committed frame found, read and checked once.
+  pub fn read_committed<S: ImageRead + ?Sized>(
+    slots: &S,
+  ) -> Result<Option<(CommittedSlot, ShardImage)>, VfsError> {
     match recover_committed(slots)? {
       None => Ok(None),
-      Some(bytes) => ShardImage::from_content(&bytes).map(Some),
+      Some((committed, payload)) => {
+        let image = payload
+          .get(SLOT_GEN_WIDTH..)
+          .ok_or(VfsError::RecoveryIncomplete)?;
+        ShardImage::from_content(image).map(|image| Some((committed, image)))
+      }
     }
   }
 
@@ -620,7 +727,12 @@ impl VolumeImage {
   pub fn read_from<S: ImageRead + ?Sized>(slots: &S) -> Result<Option<VolumeImage>, VfsError> {
     match recover_committed(slots)? {
       None => Ok(None),
-      Some(bytes) => VolumeImage::from_content(&bytes).map(Some),
+      Some((_, payload)) => {
+        let image = payload
+          .get(SLOT_GEN_WIDTH..)
+          .ok_or(VfsError::RecoveryIncomplete)?;
+        VolumeImage::from_content(image).map(Some)
+      }
     }
   }
 }
@@ -706,6 +818,157 @@ struct Slot {
 /// them into one buffer. The header is what a restarted daemon reads to find and validate what was published; the
 /// CRC turns a write torn by a crash into a typed refusal rather than a garbage decode. Refuses
 /// [`VfsError::NoSpace`] if the slot cannot hold the frame.
+/// Where an image is encoded: a buffer the encoders append to, and a point between items where a streaming output may
+/// hand what is buffered on ([`StreamedImage`]); a plain `Vec` keeps everything.
+pub trait ImageOut {
+  /// The buffer the next items are encoded into.
+  fn buf(&mut self) -> &mut Vec<u8>;
+  /// Called between items; a streaming output hands the buffered bytes on here.
+  fn settle(&mut self) -> Result<(), VfsError>;
+}
+
+impl ImageOut for Vec<u8> {
+  fn buf(&mut self) -> &mut Vec<u8> {
+    self
+  }
+
+  fn settle(&mut self) -> Result<(), VfsError> {
+    Ok(())
+  }
+}
+
+/// A shard image framed into the free slot of double-buffered `slots` as it is encoded, so it is never held whole in
+/// memory: the encoders stage items in a buffer the caller keeps, which is copied into the slot, and folded into the
+/// frame's CRC, once it reaches [`STREAM_STAGE_BYTES`]. The slot's old header is zeroed before any payload byte lands
+/// and the new header is written last, so a publish interrupted anywhere (a refusal, a crash, a dropped stream) leaves
+/// that slot invalid and recovery reads the committed one, which is never touched (the commit is still the CRC
+/// becoming valid, §4.8). A checkpoint encoded whole kept one image's worth of buffer per shard: 399 bytes a file,
+/// 2026-10-06 `create_heap`.
+pub struct StreamedImage<'s, S: ImageWrite + ?Sized> {
+  slots: &'s mut S,
+  slot: Slot,
+  generation: u64,
+  second: bool,
+  written: usize,
+  crc: u32,
+  stage: &'s mut Vec<u8>,
+  refused: Option<VfsError>,
+}
+
+/// Shape: the bytes a streamed image stages before copying them into the slot: large enough that the per-copy cost is
+/// small against the copy, small against any image (one inode's encoding is a few hundred bytes).
+pub const STREAM_STAGE_BYTES: usize = 1 << 16;
+
+impl<'s, S: ImageWrite + ?Sized> StreamedImage<'s, S> {
+  /// Starts a frame in the slot the committed image is not in (`known`, else read from `slots`), with the next
+  /// generation, staging in `stage` (cleared); the slot's old header is zeroed first.
+  pub fn begin(
+    slots: &'s mut S,
+    known: Option<CommittedSlot>,
+    stage: &'s mut Vec<u8>,
+  ) -> Result<Self, VfsError> {
+    let committed = known.or_else(|| committed_slot(slots));
+    let generation = committed
+      .map_or(0, |slot| slot.generation)
+      .checked_add(1)
+      .ok_or(VfsError::FileTooLarge)?;
+    let second = committed.is_some_and(|slot| !slot.second);
+    let (zero, one) = slots_of(slots.image_len());
+    let slot = if second { one } else { zero };
+    if slot.len < FRAME_HEADER.saturating_add(SLOT_GEN_WIDTH) {
+      return Err(VfsError::NoSpace);
+    }
+    slots.image_write(slot.offset, &[0u8; FRAME_HEADER])?;
+    let generation_bytes = generation.to_le_bytes();
+    slots.image_write(slot.offset.saturating_add(FRAME_HEADER), &generation_bytes)?;
+    stage.clear();
+    stage.reserve(STREAM_STAGE_BYTES);
+    Ok(StreamedImage {
+      slots,
+      slot,
+      generation,
+      second,
+      written: SLOT_GEN_WIDTH,
+      crc: crc32c(&generation_bytes),
+      stage,
+      refused: None,
+    })
+  }
+
+  /// The refusal that stopped this stream (the slot could not take its bytes), if one did: an encoder's error after it
+  /// is this refusal, not the encoder's own.
+  pub fn refused(&self) -> Option<&VfsError> {
+    self.refused.as_ref()
+  }
+
+  /// Copies the staged bytes into the slot; a refusal is kept, and every later call returns it.
+  fn flush(&mut self) -> Result<(), VfsError> {
+    if let Some(refused) = &self.refused {
+      return Err(refused.clone());
+    }
+    let flushed = self.copy_out();
+    if let Err(refusal) = &flushed {
+      self.refused = Some(refusal.clone());
+    }
+    flushed
+  }
+
+  /// [`Self::flush`]'s copy.
+  fn copy_out(&mut self) -> Result<(), VfsError> {
+    if self.stage.is_empty() {
+      return Ok(());
+    }
+    let end = FRAME_HEADER
+      .checked_add(self.written)
+      .and_then(|at| at.checked_add(self.stage.len()))
+      .ok_or(VfsError::FileTooLarge)?;
+    if end > self.slot.len {
+      return Err(VfsError::NoSpace);
+    }
+    let at = self
+      .slot
+      .offset
+      .saturating_add(FRAME_HEADER)
+      .saturating_add(self.written);
+    self.slots.image_write(at, self.stage)?;
+    self.crc = crc32c_append(self.crc, self.stage);
+    self.written = self.written.saturating_add(self.stage.len());
+    self.stage.clear();
+    Ok(())
+  }
+
+  /// Flushes what is staged and writes the header, committing the frame: its length and the committed slot it makes.
+  pub fn finish(mut self) -> Result<(usize, CommittedSlot), VfsError> {
+    self.flush()?;
+    let len = u32::try_from(self.written).map_err(|_| VfsError::FileTooLarge)?;
+    let mut header = [0u8; FRAME_HEADER];
+    let (len_field, crc_field) = header.split_at_mut(LEN_WIDTH);
+    len_field.copy_from_slice(&len.to_le_bytes());
+    crc_field.copy_from_slice(&self.crc.to_le_bytes());
+    self.slots.image_write(self.slot.offset, &header)?;
+    Ok((
+      FRAME_HEADER.saturating_add(self.written),
+      CommittedSlot {
+        generation: self.generation,
+        second: self.second,
+      },
+    ))
+  }
+}
+
+impl<S: ImageWrite + ?Sized> ImageOut for StreamedImage<'_, S> {
+  fn buf(&mut self) -> &mut Vec<u8> {
+    self.stage
+  }
+
+  fn settle(&mut self) -> Result<(), VfsError> {
+    if self.stage.len() >= STREAM_STAGE_BYTES {
+      self.flush()?;
+    }
+    Ok(())
+  }
+}
+
 fn frame<S: ImageWrite + ?Sized>(
   generation: u64,
   image: &[u8],
@@ -822,6 +1085,15 @@ pub struct CommittedSlot {
 }
 
 impl CommittedSlot {
+  /// The other slot of image memory `total` bytes long, as `(offset, len)`: dead once this one is committed, since a
+  /// restart reads only the newer CRC-valid slot (A-117). Its pages may go back to the OS until the next checkpoint
+  /// writes there.
+  pub fn stale_slot(self, total: usize) -> (usize, usize) {
+    let (first, second) = slots_of(total);
+    let stale = if self.second { first } else { second };
+    (stale.offset, stale.len)
+  }
+
   /// The same committed slot, with the generation the publisher's last publication reached (a delta logged after
   /// the checkpoint, A-68), so the next checkpoint's generation is newer than every frame before it.
   pub(crate) fn advanced_to(self, generation: u64) -> CommittedSlot {
@@ -835,21 +1107,43 @@ impl CommittedSlot {
 /// The committed slot of image memory `slots`, found by checking both slots' CRCs: `None` when neither holds a
 /// committed image (a fresh object, or both torn).
 pub fn committed_slot<S: ImageRead + ?Sized>(slots: &S) -> Option<CommittedSlot> {
+  newest_first(slots)
+    .into_iter()
+    .flatten()
+    .find_map(|(second, slot)| {
+      slot_generation(slots, slot).map(|generation| CommittedSlot { generation, second })
+    })
+}
+
+/// The two slots in the order recovery tries them: by the generation each frame claims, newest first, the first slot
+/// first on a tie, a slot whose frame claims none (empty, short, or a length past the slot) left out. The claim is read
+/// from the frame without checking its CRC, which costs a pass over the whole image; the caller verifies the slot it
+/// takes, and falls back to the other when that fails, so the slot chosen is the one checking both would choose (the
+/// newest CRC-valid), at one verified pass where checking both cost two (2026-10-06: four passes per recovery, with the
+/// read below).
+fn newest_first<S: ImageRead + ?Sized>(slots: &S) -> [Option<(bool, Slot)>; 2] {
   let (zero, one) = slots_of(slots.image_len());
-  match (slot_generation(slots, zero), slot_generation(slots, one)) {
-    (Some(g0), Some(g1)) if g1 > g0 => Some(CommittedSlot {
-      generation: g1,
-      second: true,
-    }),
-    (Some(g0), _) => Some(CommittedSlot {
-      generation: g0,
-      second: false,
-    }),
-    (None, Some(g1)) => Some(CommittedSlot {
-      generation: g1,
-      second: true,
-    }),
-    (None, None) => None,
+  let claim = |slot: Slot| -> Option<u64> {
+    let mut header = [0u8; FRAME_HEADER];
+    slots.image_read(slot.offset, &mut header).ok()?;
+    let mut len = [0u8; LEN_WIDTH];
+    len.copy_from_slice(header.get(..LEN_WIDTH)?);
+    let len = usize::try_from(u32::from_le_bytes(len)).ok()?;
+    if len < SLOT_GEN_WIDTH || FRAME_HEADER.checked_add(len)? > slot.len {
+      return None;
+    }
+    let mut generation = [0u8; SLOT_GEN_WIDTH];
+    slots
+      .image_read(slot.offset.saturating_add(FRAME_HEADER), &mut generation)
+      .ok()?;
+    Some(u64::from_le_bytes(generation))
+  };
+  match (claim(zero), claim(one)) {
+    (Some(g0), Some(g1)) if g1 > g0 => [Some((true, one)), Some((false, zero))],
+    (Some(_), Some(_)) => [Some((false, zero)), Some((true, one))],
+    (Some(_), None) => [Some((false, zero)), None],
+    (None, Some(_)) => [Some((true, one)), None],
+    (None, None) => [None, None],
   }
 }
 
@@ -889,20 +1183,56 @@ fn publish_committed<S: ImageWrite + ?Sized>(
 /// slot fails its CRC and is skipped, so an interrupted publish falls back to the previous committed
 /// image; a slot that is CRC-valid but decodes wrong is left for the caller to refuse, never a false
 /// success.
-fn recover_committed<S: ImageRead + ?Sized>(slots: &S) -> Result<Option<Vec<u8>>, VfsError> {
-  let (zero, one) = slots_of(slots.image_len());
-  let chosen = match (slot_image(slots, zero), slot_image(slots, one)) {
-    (Some((g0, p0)), Some((g1, p1))) => Some(if g0 >= g1 { p0 } else { p1 }),
-    (Some((_, p0)), None) => Some(p0),
-    (None, Some((_, p1))) => Some(p1),
-    (None, None) => None,
+fn recover_committed<S: ImageRead + ?Sized>(
+  slots: &S,
+) -> Result<Option<(CommittedSlot, Vec<u8>)>, VfsError> {
+  for (second, slot) in newest_first(slots).into_iter().flatten() {
+    if let Some(committed) = verified_frame(slots, slot, second)? {
+      return Ok(Some(committed));
+    }
+  }
+  Ok(None)
+}
+
+/// The committed slot a CRC-valid frame in `slot` makes and its payload (the generation's bytes, then the image's),
+/// read in one copy and checked over that copy, where it was checked by a streamed pass and then read again; `None`
+/// when the frame is empty, short or torn.
+fn verified_frame<S: ImageRead + ?Sized>(
+  slots: &S,
+  slot: Slot,
+  second: bool,
+) -> Result<Option<(CommittedSlot, Vec<u8>)>, VfsError> {
+  let mut header = [0u8; FRAME_HEADER];
+  slots.image_read(slot.offset, &mut header)?;
+  let (len_field, crc_field) = header.split_at(LEN_WIDTH);
+  let word = |field: &[u8]| {
+    let mut bytes = [0u8; LEN_WIDTH];
+    bytes.copy_from_slice(field);
+    u32::from_le_bytes(bytes)
   };
-  chosen
-    .map(|framed| {
-      let mut image = vec![0u8; framed.len];
-      slots.image_read(framed.at, &mut image).map(|()| image)
-    })
-    .transpose()
+  let len = usize::try_from(word(len_field)).unwrap_or(usize::MAX);
+  match FRAME_HEADER.checked_add(len) {
+    Some(end) if len >= SLOT_GEN_WIDTH && end <= slot.len => {}
+    _ => return Ok(None),
+  }
+  let mut payload = vec![0u8; len];
+  slots.image_read(slot.offset.saturating_add(FRAME_HEADER), &mut payload)?;
+  if crc32c(&payload) != word(crc_field) {
+    return Ok(None);
+  }
+  let mut generation = [0u8; SLOT_GEN_WIDTH];
+  generation.copy_from_slice(
+    payload
+      .get(..SLOT_GEN_WIDTH)
+      .ok_or(VfsError::RecoveryIncomplete)?,
+  );
+  Ok(Some((
+    CommittedSlot {
+      generation: u64::from_le_bytes(generation),
+      second,
+    },
+    payload,
+  )))
 }
 
 /// A slot's generation, if its frame is CRC-valid and carries one.
@@ -1015,6 +1345,115 @@ impl Volume {
         })
         .collect(),
     })
+  }
+
+  /// Appends this volume's image encoding to `out`: exactly `self.to_image(store, host)?.encode(out)`, but the head's
+  /// inodes are encoded one at a time as they are captured, so no `Vec` of every inode image is ever held. A checkpoint
+  /// built that way held the whole image and then its encoding, and the allocator kept the high-water mark: each
+  /// checkpoint left a step of its own size in the daemon's footprint, 270 MB after 50,000 macOS files where the
+  /// volume needs 47 (2026-10-06, `sizes_probe`). On a refusal `out` is left as it was.
+  pub fn encode_image(
+    &self,
+    store: &Store,
+    host: Option<&mut dyn crate::host::HostFs>,
+    out: &mut Vec<u8>,
+  ) -> Result<(), VfsError> {
+    let start = out.len();
+    let encoded = self.encode_image_into(store, host, out);
+    if encoded.is_err() {
+      out.truncate(start);
+    }
+    encoded
+  }
+
+  /// [`Self::encode_image`] into any [`ImageOut`], settled between inodes, so a [`StreamedImage`] holds at most a
+  /// stage's bytes and one inode's. On a refusal the output holds a partial image: a streamed checkpoint restarts
+  /// without this volume (its slot is not committed until its header is written last).
+  pub fn encode_image_into<O: ImageOut + ?Sized>(
+    &self,
+    store: &Store,
+    host: Option<&mut dyn crate::host::HostFs>,
+    out: &mut O,
+  ) -> Result<(), VfsError> {
+    let base = match (&self.base, host) {
+      (Some(plane), Some(host)) => Some(plane.image(host)?),
+      (Some(_), None) => return Err(VfsError::RecoveryIncomplete),
+      (None, _) => None,
+    };
+    let snapshots = self.capture_snapshots(store)?;
+    let root_no = store
+      .dirs
+      .get(self.root)
+      .map_err(|_| VfsError::StaleHandle)?
+      .inode;
+    let fields = out.buf();
+    IMAGE_MAGIC.encode(fields);
+    IMAGE_VERSION.encode(fields);
+    self.prefix.encode(fields);
+    policy_image(self.policy).encode(fields);
+    self.epoch.0.encode(fields);
+    self.next_counter.encode(fields);
+    self.origin_epoch.map(|e| e.0).encode(fields);
+    quota_image(&self.quota).encode(fields);
+    root_no.0.encode(fields);
+    self.last_snapshot.map(snap_ref).encode(fields);
+    let origin_shared = self.encode_head(store, out)?;
+    let out = out.buf();
+    origin_shared.encode(out);
+    snapshots.encode(out);
+    self
+      .orphans
+      .keys()
+      .map(|no| no.0)
+      .collect::<Vec<u64>>()
+      .encode(out);
+    base.encode(out);
+    self
+      .attachment_references()
+      .into_iter()
+      .map(|(attachment, inodes)| AttachmentReferences {
+        attachment,
+        inodes: inodes
+          .into_iter()
+          .map(|(no, count)| InodeReferences { inode: no.0, count })
+          .collect(),
+      })
+      .collect::<Vec<AttachmentReferences>>()
+      .encode(out);
+    Ok(())
+  }
+
+  /// [`Self::capture_head`] encoded as it goes: the head's inode images as a `Vec<InodeImage>`, each dropped once
+  /// encoded and the output settled after it; the shared numbers. The trie is visited twice, once to count the inodes
+  /// the image carries (a clone's shared ones are left out) so the length is written before them, and once to encode
+  /// them; no `Vec` of handles is built (eight bytes an inode for the checkpoint's length).
+  fn encode_head<O: ImageOut + ?Sized>(
+    &self,
+    store: &Store,
+    out: &mut O,
+  ) -> Result<Vec<u64>, VfsError> {
+    let mut count = 0usize;
+    let mut shared = Vec::new();
+    trie::for_each(&store.tries, self.inode_root, |handle| {
+      let inode = store.inodes.get(handle)?;
+      match self.origin_epoch {
+        Some(origin) if inode.born <= origin => shared.push(inode.no.0),
+        _ => count = count.saturating_add(1),
+      }
+      Ok::<(), VfsError>(())
+    })?;
+    slates_wire::codec::encode_len(count, out.buf());
+    trie::for_each(&store.tries, self.inode_root, |handle| {
+      let inode = store.inodes.get(handle)?;
+      if let Some(origin) = self.origin_epoch
+        && inode.born <= origin
+      {
+        return Ok(());
+      }
+      self.encode_inode(store, inode, Entries::Captured, out.buf())?;
+      out.settle()
+    })?;
+    Ok(shared)
   }
 
   /// The head's inodes, and for a clone the numbers it shares with its origin snapshot (A-64): an inode born at or
@@ -1179,44 +1618,7 @@ impl Volume {
     inode: &Inode,
     entries: Entries,
   ) -> Result<InodeImage, VfsError> {
-    let body = if let Body::Base(base) = &inode.body {
-      let pinned = base
-        .pinned
-        .iter()
-        .map(|extent| extent_image(store, extent))
-        .collect::<Result<_, VfsError>>()?;
-      BodyImage::Base {
-        witness: base.witness.as_deref().copied(),
-        pinned,
-        base_len: base.base_len,
-        lost: base.lost,
-      }
-    } else {
-      match inode.kind {
-        Kind::Dir => {
-          let Body::Directory(handle) = inode.body else {
-            return Err(VfsError::RecoveryIncomplete);
-          };
-          let directory = store.dirs.get(handle)?;
-          BodyImage::Directory {
-            entries: match entries {
-              Entries::Captured => self.dir_entries(store, inode)?,
-              Entries::Omitted => Vec::new(),
-            },
-            base: directory.base,
-            origin: directory.origin.as_ref().map(|path| path.to_string()),
-          }
-        }
-        Kind::Symlink => match &inode.body {
-          Body::Symlink(target) => BodyImage::Symlink {
-            target: target.to_string(),
-          },
-          _ => return Err(VfsError::RecoveryIncomplete),
-        },
-        Kind::File => file_body_image(store, &inode.body)?,
-        Kind::Fifo | Kind::Socket => BodyImage::Empty,
-      }
-    };
+    let body = self.inode_body(store, inode, entries)?;
     Ok(InodeImage {
       no: inode.no.0,
       generation: inode.generation,
@@ -1257,9 +1659,170 @@ impl Volume {
       sidecar: inode
         .xattrs
         .as_deref()
-        .and_then(|table| table.sidecar)
+        .and_then(crate::inode::XattrTable::sidecar)
         .map(|copy| copy.0),
     })
+  }
+
+  /// An inode's body image: a directory's entries (or none, `Entries::Omitted`), a file's content, a symlink's target,
+  /// a base-backed file's overlay state.
+  fn inode_body(
+    &self,
+    store: &Store,
+    inode: &Inode,
+    entries: Entries,
+  ) -> Result<BodyImage, VfsError> {
+    Ok(if let Body::Base(base) = &inode.body {
+      let pinned = base
+        .pinned
+        .iter()
+        .map(|extent| extent_image(store, extent))
+        .collect::<Result<_, VfsError>>()?;
+      BodyImage::Base {
+        witness: base.witness.as_deref().copied(),
+        pinned,
+        base_len: base.base_len,
+        lost: base.lost,
+      }
+    } else {
+      match inode.kind {
+        Kind::Dir => {
+          let Body::Directory(handle) = inode.body else {
+            return Err(VfsError::RecoveryIncomplete);
+          };
+          let directory = store.dirs.get(handle)?;
+          BodyImage::Directory {
+            entries: match entries {
+              Entries::Captured => self.dir_entries(store, inode)?,
+              Entries::Omitted => Vec::new(),
+            },
+            base: directory.base,
+            origin: directory.origin.as_ref().map(|path| path.to_string()),
+          }
+        }
+        Kind::Symlink => match &inode.body {
+          Body::Symlink(target) => BodyImage::Symlink {
+            target: target.to_string(),
+          },
+          Body::BaseLink(target) => BodyImage::BaseLink {
+            target: target.to_string(),
+          },
+          _ => return Err(VfsError::RecoveryIncomplete),
+        },
+        Kind::File => file_body_image(store, &inode.body)?,
+        Kind::Fifo | Kind::Socket => BodyImage::Empty,
+      }
+    })
+  }
+
+  /// Appends `inode`'s image encoding with its `entries`: exactly `self.inode_image(store, inode, entries)?.encode(out)`
+  /// (`image_of_inode` for a checkpoint, `image_of_inode_without_entries` for a delta), without
+  /// building the image. An `InodeImage` copies every owned field (an inline body, each attribute name, each directory
+  /// entry's name) only to be encoded and dropped: about nine allocations a file in every checkpoint (2026-10-06,
+  /// `create_heap`). The common bodies (inline, directory) and the attribute table are written from the inode; the
+  /// others (chunked, symlink, base-backed, empty) still go through their `BodyImage`, whose allocations are per extent
+  /// of a large file, not per file. The bytes are held equal to the image's by the streamed-checkpoint oracle tests.
+  pub(crate) fn encode_inode(
+    &self,
+    store: &Store,
+    inode: &Inode,
+    entries: Entries,
+    out: &mut Vec<u8>,
+  ) -> Result<(), VfsError> {
+    self.encode_inode_within(store, inode, entries, None, out)
+  }
+
+  /// [`Volume::encode_inode`] with, for a chunked file and `within` given, only the extents whose offsets are in those
+  /// spans: the image an [`crate::delta::InodePatch`] carries.
+  pub(crate) fn encode_inode_within(
+    &self,
+    store: &Store,
+    inode: &Inode,
+    entries: Entries,
+    within: Option<&[crate::delta::WindowSpan]>,
+    out: &mut Vec<u8>,
+  ) -> Result<(), VfsError> {
+    inode.no.0.encode(out);
+    inode.generation.encode(out);
+    inode.born.0.encode(out);
+    kind_image(inode.kind).encode(out);
+    AttrsImage {
+      mode: inode.attrs.mode,
+      uid: inode.attrs.uid,
+      gid: inode.attrs.gid,
+      nlink: inode.attrs.nlink,
+      size: inode.attrs.size,
+      atime: inode.attrs.atime,
+      mtime: inode.attrs.mtime,
+      ctime: inode.attrs.ctime,
+      btime: inode.attrs.btime,
+    }
+    .encode(out);
+    inode.version.encode(out);
+    inode
+      .home
+      .map(|h| HomeImage {
+        parent: h.parent().0,
+        hash: h.hash,
+      })
+      .encode(out);
+    inode.multi.encode(out);
+    match (&inode.body, inode.kind) {
+      (Body::Inline(bytes), Kind::File) => {
+        BodyImage::WIRE_TAG_INLINE.encode(out);
+        encode_bytes(bytes, out);
+      }
+      (Body::Directory(handle), Kind::Dir) => {
+        self.encode_directory(store, *handle, entries, out)?
+      }
+      (Body::Sealed(_) | Body::Open { .. }, Kind::File) if within.is_some() => {
+        file_body_image_within(store, &inode.body, within.unwrap_or_default())?.encode(out)
+      }
+      _ => self.inode_body(store, inode, entries)?.encode(out),
+    }
+    let table = inode.xattrs.as_deref();
+    slates_wire::codec::encode_len(table.map_or(0, crate::inode::XattrTable::len), out);
+    for (name, attribute) in table.into_iter().flat_map(crate::inode::XattrTable::iter) {
+      encode_bytes(name, out);
+      attribute.0.encode(out);
+    }
+    inode.attribute_of().map(|owner| owner.0).encode(out);
+    table
+      .and_then(crate::inode::XattrTable::sidecar)
+      .map(|copy| copy.0)
+      .encode(out);
+    Ok(())
+  }
+
+  /// A directory's `BodyImage::Directory` encoding, written from the store: the entries in canonical order
+  /// ([`entry_order`]), gathered by reference and sorted (a directory iterates in hash order), so one allocation for the
+  /// directory and none per entry, where the image copied every name.
+  fn encode_directory(
+    &self,
+    store: &Store,
+    handle: Handle<crate::dir::DirNode>,
+    entries: Entries,
+    out: &mut Vec<u8>,
+  ) -> Result<(), VfsError> {
+    let dir = store.dirs.get(handle)?;
+    let policy = self.policy;
+    BodyImage::WIRE_TAG_DIRECTORY.encode(out);
+    match entries {
+      Entries::Omitted => slates_wire::codec::encode_len(0, out),
+      Entries::Captured => {
+        let mut captured = Vec::with_capacity(dir.len());
+        captured.extend(dir.iter(&store.blocks));
+        captured.sort_by(|a, b| entry_order(policy, a.name, b.name));
+        slates_wire::codec::encode_len(captured.len(), out);
+        for entry in captured {
+          encode_bytes(entry.name.as_bytes(), out);
+          child_number(store, &entry.child)?.encode(out);
+        }
+      }
+    }
+    dir.base.encode(out);
+    encode_option_bytes(dir.origin.as_deref().map(str::as_bytes), out);
+    Ok(())
   }
 
   /// The entries of a directory inode, by name and child inode number. A subdirectory child's
@@ -1299,7 +1862,7 @@ impl Volume {
 
 /// Whether an inode's image captures a directory's entries.
 #[derive(Clone, Copy)]
-enum Entries {
+pub(crate) enum Entries {
   /// Every entry, in canonical order: a full image.
   Captured,
   /// None: a delta, which carries changed entries by name.
@@ -1309,7 +1872,7 @@ enum Entries {
 /// The canonical order of a directory image's entries (A-89): by folded name under `policy`, which is the name's own
 /// order under `Exact`. Allocation-free for an ASCII name under `Fold` (the common case).
 pub(crate) fn entry_order(policy: NameEquivalence, a: &str, b: &str) -> std::cmp::Ordering {
-  policy.folded(a).cmp(policy.folded(b))
+  policy.compare(a, b)
 }
 
 /// A block's image (A-64).
@@ -1361,6 +1924,43 @@ fn extent_image(store: &Store, extent: &Extent) -> Result<ExtentImage, VfsError>
 }
 
 /// A file's body image, as the store holds it (A-64): no byte is copied but inline content.
+/// A chunked file body's image with only the sealed extents whose offsets are in `spans`, and its open extent (an
+/// [`crate::delta::InodePatch`]'s body). Extents and spans are ascending by offset, so each span's extents are found by
+/// binary search and only they are imaged.
+pub(crate) fn file_body_image_within(
+  store: &Store,
+  body: &Body,
+  spans: &[crate::delta::WindowSpan],
+) -> Result<BodyImage, VfsError> {
+  let within = |sealed: &[Extent]| {
+    let mut images = Vec::new();
+    for span in spans {
+      let first = sealed.partition_point(|extent| extent.off < span.from);
+      let last = sealed.partition_point(|extent| extent.off < span.to);
+      for extent in sealed.get(first..last.max(first)).unwrap_or_default() {
+        images.push(extent_image(store, extent)?);
+      }
+    }
+    Ok::<_, VfsError>(images)
+  };
+  match body {
+    Body::Sealed(sealed) => Ok(BodyImage::Chunked {
+      extents: within(sealed)?,
+      open: None,
+    }),
+    Body::Open { open, sealed } => Ok(BodyImage::Chunked {
+      extents: within(sealed)?,
+      open: Some(OpenImage {
+        offset: open.off,
+        len: open.len,
+        block: block_image(&open.block),
+        born: open.born.0,
+      }),
+    }),
+    _ => Err(VfsError::RecoveryIncomplete),
+  }
+}
+
 fn file_body_image(store: &Store, body: &Body) -> Result<BodyImage, VfsError> {
   let extents = |sealed: &[Extent]| {
     sealed
@@ -1386,8 +1986,27 @@ fn file_body_image(store: &Store, body: &Body) -> Result<BodyImage, VfsError> {
         born: open.born.0,
       }),
     }),
-    Body::Directory(_) | Body::Symlink(_) | Body::Base(_) => Err(VfsError::RecoveryIncomplete),
+    Body::Directory(_) | Body::Symlink(_) | Body::BaseLink(_) | Body::Base(_) => {
+      Err(VfsError::RecoveryIncomplete)
+    }
   }
+}
+
+/// The inode number an entry's child names, as [`EntryImage::child`] holds it: a subdirectory's is its node's own inode;
+/// a whiteout names none.
+pub(crate) fn child_number(store: &Store, child: &Child) -> Result<Option<u64>, VfsError> {
+  Ok(match child {
+    Child::File(no) | Child::Symlink(no) | Child::Fifo(no) | Child::Socket(no) => Some(no.0),
+    Child::Dir(handle) => Some(
+      store
+        .dirs
+        .get(*handle)
+        .map_err(|_| VfsError::StaleHandle)?
+        .inode
+        .0,
+    ),
+    Child::Whiteout => None,
+  })
 }
 
 /// The image reference for a snapshot id.
@@ -1715,7 +2334,7 @@ impl Volume {
         .get(&image.root_no)
         .ok_or(VfsError::RecoveryIncomplete)?;
     }
-    self.rebuild_entries(store, &image.inodes, &kinds, &dirs)?;
+    self.rebuild_entries(store, &image.inodes, &Kinds::Map(&kinds), &dirs)?;
     self.restore_identities(store, &image.inodes)?;
     self.live_entries = self
       .live_entries
@@ -1734,12 +2353,12 @@ impl Volume {
     root_no: InodeNo,
     epoch: Epoch,
   ) -> Result<(), VfsError> {
-    let kinds: BTreeMap<u64, KindImage> = inodes.iter().map(|i| (i.no, i.kind)).collect();
+    let kinds = Kinds::of(inodes);
     let mut dirs: BTreeMap<u64, Handle<DirNode>> = BTreeMap::new();
     dirs.insert(root_no.0, self.root);
-    self.place_inodes(store, claims, inodes, root_no, epoch, &mut dirs)?;
+    let placed = self.place_inodes(store, claims, inodes, root_no, epoch, &mut dirs)?;
     self.rebuild_entries(store, inodes, &kinds, &dirs)?;
-    self.restore_identities(store, inodes)?;
+    self.restore_placed_identities(store, inodes, root_no, &placed)?;
     Ok(())
   }
 
@@ -1921,7 +2540,7 @@ impl Volume {
       let handle = store.inodes.insert(inode)?;
       self.table_set(store, no, handle)?;
     }
-    self.rebuild_entries(store, &snap.inodes, &kinds, &dirs)?;
+    self.rebuild_entries(store, &snap.inodes, &Kinds::Map(&kinds), &dirs)?;
     self.restore_identities(store, &snap.inodes)?;
     // A clone's snapshot rebuilds its directories privately; a record the live snapshot shared with the origin
     // (born at or before the origin epoch) is this snapshot's own copy now, born with it, so the snapshot's drop
@@ -1947,18 +2566,22 @@ impl Volume {
     root_no: InodeNo,
     epoch: Epoch,
     dirs: &mut BTreeMap<u64, Handle<DirNode>>,
-  ) -> Result<(), VfsError> {
+  ) -> Result<Vec<Option<Handle<Inode>>>, VfsError> {
+    let mut placed = Vec::with_capacity(inodes.len());
+    let mut cursor = trie::LeafCursor::default();
     for image_inode in inodes {
       let no = InodeNo(image_inode.no);
       if no == root_no {
+        placed.push(None);
         continue;
       }
       let body = body_for(store, claims, image_inode, no, epoch, dirs)?;
       let inode = Inode::new(no, epoch, kind_from_image(image_inode.kind), 0, body);
       let handle = store.inodes.insert(inode)?;
-      self.table_set(store, no, handle)?;
+      self.table_set_in_order(store, no, handle, &mut cursor)?;
+      placed.push(Some(handle));
     }
-    Ok(())
+    Ok(placed)
   }
 
   /// Pass two: rebuild every directory's entries, naming each child with the right kind, and fix
@@ -1967,7 +2590,7 @@ impl Volume {
     &mut self,
     store: &mut Store,
     inodes: &[InodeImage],
-    kinds: &BTreeMap<u64, KindImage>,
+    kinds: &Kinds,
     dirs: &BTreeMap<u64, Handle<DirNode>>,
   ) -> Result<(), VfsError> {
     for image_inode in inodes {
@@ -1985,7 +2608,18 @@ impl Volume {
         .ok_or(VfsError::RecoveryIncomplete)?;
       store.dirs.get_mut(parent)?.base = *base;
       store.dirs.get_mut(parent)?.origin = origin.as_ref().map(|path| path.as_str().into());
-      for e in entries {
+      // In the tree's key order (the name's hash, then the name), not the image's (the folded name): each insert then
+      // lands past the end, which needs no shifting and whose split leaves the full block full (`dirtree`'s rightmost
+      // split). The order changes only the cost; the tree takes its entries in any order.
+      let policy = self.policy;
+      let mut ordered: Vec<(u64, &EntryImage)> =
+        entries.iter().map(|e| (policy.hash(&e.name), e)).collect();
+      ordered.sort_unstable_by(|(a_hash, a), (b_hash, b)| {
+        a_hash
+          .cmp(b_hash)
+          .then_with(|| a.name.as_bytes().cmp(b.name.as_bytes()))
+      });
+      for (_, e) in ordered {
         let child = child_for(store, e, parent_no, kinds, dirs)?;
         self.dir_insert(store, parent, &e.name, child)?;
       }
@@ -2007,17 +2641,38 @@ impl Volume {
       let no = InodeNo(image_inode.no);
       let handle =
         trie::get(&store.tries, self.inode_root, no).ok_or(VfsError::RecoveryIncomplete)?;
-      let inode = store.inodes.get_mut(handle)?;
-      inode.generation = image_inode.generation;
-      inode.born = Epoch(image_inode.born);
-      inode.version = image_inode.version;
-      inode.multi = image_inode.multi;
-      inode.home = image_inode
-        .home
-        .and_then(|h| Home::new(InodeNo(h.parent), h.hash));
-      inode.attrs = attrs_from_image(&image_inode.attrs);
-      inode.set_attribute_of(image_inode.attribute_of.map(InodeNo));
+      restore_identity(store.inodes.get_mut(handle)?, image_inode);
     }
+    self.restore_tables(store, inodes)
+  }
+
+  /// [`Self::restore_identities`] for inodes [`Self::place_inodes`] just placed: each one's handle is the one placing
+  /// returned, so no number is looked up in the trie again (the root, which placing skips, once). A restart's rebuild
+  /// spent 12% of its time on that second walk (2026-10-06, `recover_bench`).
+  fn restore_placed_identities(
+    &mut self,
+    store: &mut Store,
+    inodes: &[InodeImage],
+    root_no: InodeNo,
+    placed: &[Option<Handle<Inode>>],
+  ) -> Result<(), VfsError> {
+    if placed.len() != inodes.len() {
+      return Err(VfsError::RecoveryIncomplete);
+    }
+    for (image_inode, handle) in inodes.iter().zip(placed) {
+      let handle = match handle {
+        Some(handle) => *handle,
+        None => {
+          trie::get(&store.tries, self.inode_root, root_no).ok_or(VfsError::RecoveryIncomplete)?
+        }
+      };
+      restore_identity(store.inodes.get_mut(handle)?, image_inode);
+    }
+    self.restore_tables(store, inodes)
+  }
+
+  /// The attribute tables of `inodes` that carry any, after every identity is restored.
+  fn restore_tables(&mut self, store: &mut Store, inodes: &[InodeImage]) -> Result<(), VfsError> {
     // Tables after every identity: an attribute inode is checked in the rebuilt table, where a
     // snapshot's shared attribute inode (in its `shared` list, not `inodes`) is also found.
     for image_inode in inodes
@@ -2031,7 +2686,7 @@ impl Volume {
         if !self.attribute_of_owner(store, copy, owner) {
           return Err(VfsError::RecoveryIncomplete);
         }
-        table.sidecar = Some(copy);
+        table.set_sidecar(copy);
       }
       let handle =
         trie::get(&store.tries, self.inode_root, owner).ok_or(VfsError::RecoveryIncomplete)?;
@@ -2126,7 +2781,7 @@ fn body_crc(body: &BodyImage) -> u32 {
     // A chunked body's references and offsets are its identity (the same blocks at another offset are a
     // different file), so the crc covers the body's canonical wire form, as for a base body.
     BodyImage::Inline { .. } | BodyImage::Chunked { .. } => crc32c(&body.to_bytes()),
-    BodyImage::Symlink { target } => crc32c(target.as_bytes()),
+    BodyImage::Symlink { target } | BodyImage::BaseLink { target } => crc32c(target.as_bytes()),
     BodyImage::Empty => crc32c(&[]),
     BodyImage::Directory { .. } => 0,
     BodyImage::Base { .. } => crc32c(&body.to_bytes()),
@@ -2155,6 +2810,7 @@ fn body_for(
     }
     KindImage::Symlink => match &image_inode.body {
       BodyImage::Symlink { target } => Ok(Body::Symlink(target.as_str().into())),
+      BodyImage::BaseLink { target } => Ok(Body::BaseLink(target.as_str().into())),
       _ => Err(VfsError::RecoveryIncomplete),
     },
     KindImage::File => file_body_from_image(claims, &image_inode.body, image_inode.attrs.size),
@@ -2201,10 +2857,11 @@ fn file_body_from_image(claims: &Claims, body: &BodyImage, size: u64) -> Result<
       witness: witness.map(Box::new),
       pinned: extents_from_image(claims, pinned, size)?,
       base_len: *base_len,
-      descriptor: None,
       lost: *lost,
     })),
-    BodyImage::Directory { .. } | BodyImage::Symlink { .. } => Err(VfsError::RecoveryIncomplete),
+    BodyImage::Directory { .. } | BodyImage::Symlink { .. } | BodyImage::BaseLink { .. } => {
+      Err(VfsError::RecoveryIncomplete)
+    }
   }
 }
 
@@ -2307,8 +2964,8 @@ impl Claims {
     }
     claims.locking = false;
     if let Err(refusal) = claimed {
-      claims.give_back(store);
-      return Err(refusal);
+      let undo = claims.give_back(store);
+      return Err(refusal.after_undo(undo));
     }
     store.content.arena_mut().commit_live();
     Ok(claims)
@@ -2370,10 +3027,12 @@ impl Claims {
       }
       Some(_) => Err(VfsError::RecoveryIncomplete),
       None => {
-        let block =
-          store
-            .content
-            .claim_block(chunk.block.region, chunk.block.offset, chunk.block.len)?;
+        // A trimmed chunk's image names its head; its other pieces follow from its length (A-118).
+        let block = store.content.claim_chunk_blocks(
+          chunk.block.region,
+          (chunk.block.offset, chunk.block.len),
+          chunk.used,
+        )?;
         let sealed = match &chunk.seal {
           Some(seal) => {
             let key = store
@@ -2384,8 +3043,9 @@ impl Claims {
             match key {
               Ok(key) => Some((key, seal.version, seal.tags.as_slice())),
               Err(refusal) => {
-                let _ = store.content.give_back_block(block);
-                return Err(refusal);
+                return Err(
+                  refusal.after_undo(store.content.give_back_chunk_blocks(block, chunk.used)),
+                );
               }
             }
           }
@@ -2404,8 +3064,9 @@ impl Claims {
         let handle = match adopted {
           Ok(handle) => handle,
           Err(refusal) => {
-            let _ = store.content.give_back_block(block);
-            return Err(refusal);
+            return Err(
+              refusal.after_undo(store.content.give_back_chunk_blocks(block, chunk.used)),
+            );
           }
         };
         self.held.insert(key, Held::Chunk(handle, chunk.clone()));
@@ -2441,14 +3102,20 @@ impl Claims {
     }
   }
 
-  /// Gives back every claim of a refused preparation, before anything is committed.
-  fn give_back(&mut self, store: &mut Store) {
+  /// Gives back every claim of a refused preparation, before anything is committed: every one is tried, and the first
+  /// refusal is returned (the caller's [`VfsError::after_undo`]).
+  fn give_back(&mut self, store: &mut Store) -> Result<(), VfsError> {
+    let mut first = Ok(());
     for (_, held) in std::mem::take(&mut self.held) {
-      let _ = match held {
+      let given = match held {
         Held::Chunk(handle, _) => store.content.give_back_chunk(handle),
         Held::Open(block, _) => store.content.give_back_block(block),
       };
+      if first.is_ok() {
+        first = given;
+      }
     }
+    first
   }
 
   fn chunk(&self, chunk: &ChunkImage) -> Result<Handle<Chunk>, VfsError> {
@@ -2465,6 +3132,8 @@ impl Claims {
         len: open.len,
         block: *block,
         born: Epoch(open.born),
+        // Writes made after the image may have reached anywhere in the block (A-118).
+        dirty_to: u64::try_from(block.len()).unwrap_or(u64::MAX),
       }),
       _ => Err(VfsError::RecoveryIncomplete),
     }
@@ -2547,18 +3216,65 @@ impl Volume {
 
 /// The child an entry names, resolving a subdirectory to its node handle and fixing that node's
 /// parent and name from the reaching entry.
+/// The kind of each inode an image holds, by number: a flat table searched by bisection where a map was built per
+/// inode. An image lists its inodes in number order (`capture_tree`); one that does not (a delta merged in) is sorted
+/// once. A snapshot's rebuild adds kinds of its own as it goes, so it keeps a map ([`Kinds::Map`]).
+enum Kinds<'a> {
+  /// Sorted by number.
+  Sorted(Vec<(u64, KindImage)>),
+  /// A map built by its owner.
+  Map(&'a BTreeMap<u64, KindImage>),
+}
+
+impl Kinds<'_> {
+  /// The kinds of `inodes`.
+  fn of(inodes: &[InodeImage]) -> Kinds<'static> {
+    let mut table: Vec<(u64, KindImage)> = inodes.iter().map(|i| (i.no, i.kind)).collect();
+    if !table.is_sorted_by_key(|(no, _)| *no) {
+      table.sort_by_key(|(no, _)| *no);
+    }
+    Kinds::Sorted(table)
+  }
+
+  /// The kind of inode `no`, if the image holds it.
+  fn get(&self, no: u64) -> Option<KindImage> {
+    match self {
+      Kinds::Sorted(table) => table
+        .binary_search_by_key(&no, |(number, _)| *number)
+        .ok()
+        .and_then(|at| table.get(at))
+        .map(|(_, kind)| *kind),
+      Kinds::Map(map) => map.get(&no).copied(),
+    }
+  }
+}
+
+/// Restores `inode`'s true identity from its image: generation, birth epoch, version, multi-link flag, home, the
+/// exact attributes and the attribute-inode link.
+fn restore_identity(inode: &mut Inode, image_inode: &InodeImage) {
+  inode.generation = image_inode.generation;
+  inode.born = Epoch(image_inode.born);
+  inode.version = image_inode.version;
+  inode.multi = image_inode.multi;
+  inode.home = image_inode
+    .home
+    .and_then(|h| Home::new(InodeNo(h.parent), h.hash));
+  inode.attrs = attrs_from_image(&image_inode.attrs);
+  inode.set_attribute_of(image_inode.attribute_of.map(InodeNo));
+}
+
 fn child_for(
   store: &mut Store,
   entry: &EntryImage,
   parent_no: InodeNo,
-  kinds: &BTreeMap<u64, KindImage>,
+  kinds: &Kinds,
   dirs: &BTreeMap<u64, Handle<DirNode>>,
 ) -> Result<Child, VfsError> {
   let Some(child) = entry.child else {
     return Ok(Child::Whiteout);
   };
   let child_no = InodeNo(child);
-  match kinds.get(&child).ok_or(VfsError::RecoveryIncomplete)? {
+  match kinds.get(child).ok_or(VfsError::RecoveryIncomplete)? {
     KindImage::File => Ok(Child::File(child_no)),
     KindImage::Symlink => Ok(Child::Symlink(child_no)),
     KindImage::Fifo => Ok(Child::Fifo(child_no)),

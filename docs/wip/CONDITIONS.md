@@ -1,0 +1,290 @@
+# The thirteen conditions: where each stands, and the evidence
+
+This maps the project's terminating conditions (Ada's standing goal, 2026-10-04) to the evidence in the tree:
+- the README's capability table, rendered from `xtask/src/capabilities.rs`; `cargo xtask check` refuses it if a cited
+  test disappears or is ignored;
+- the dated records in `GAPS.md` and `BENCHMARKS.md`, cited by their headings;
+- the tests themselves.
+
+A status is a reviewed judgement:
+- **works**: proven as the condition states;
+- **limited**: proven within named limits;
+- **failing**: measured not to meet the condition.
+
+Every limit names what is owed. Updated whenever a condition's evidence changes (CLAUDE.md §6: the record changes
+in the same commit as the work). Last reviewed 2026-10-09 at `e494963d`.
+
+| # | Condition | Status |
+|---|---|---|
+| 1 | One binary and CLI, laptop to global, with records proving it | limited |
+| 2 | Volumes provisioned and managed; OCI, CRI, Kubernetes, microVMs | limited |
+| 3 | No write reaches disk except a granted landing | works |
+| 4 | Escapes battle-tested adversarially | limited |
+| 5 | Fast reads of the local filesystem, accurate diff and change tracking | works |
+| 6 | Cross-OS and cross-architecture | limited |
+| 7 | Fast remote pulls under heavy contention and bad networks | failing on independent delay jitter; works otherwise |
+| 8 | Post-quantum protected transfer | works for the fleet transport; the export's TLS group unverified |
+| 9 | Post-quantum encryption at rest and in transit | works |
+| 10 | Multi-cluster replication under horrible networks | limited |
+| 11 | No panics; failures recovered, proven adversarially | works |
+| 12 | Far-above-industry p99s under non-ideal patterns, against Tectonic | limited |
+| 13 | A full MCP server with codemode and skills, for every agent | limited |
+
+## 1. One binary, laptop to global
+
+- **Evidence.** `slates` is one binary: the CLI, the anchor, the daemon and the MCP server (`crates/cli`).
+  - Laptop and fleet run one code path: no mode switches (R8). The commit rule is proven identical at f = 0 and a
+    simulated f = 1 (`crates/db/src/register.rs`, AC-2.5).
+  - A fleet deploys from one manifest across real processes, including the owner's SIGKILL
+    (`three_daemon_processes_deploy_a_fleet_from_one_manifest_and_survive_the_owners_death`).
+  - On real Linux pods: `BENCHMARKS.md` "The KIND lane on the streamed-checkpoint build (2026-10-07)" — formation,
+    placement at f + 1, a SIGKILL takeover served in 3.5 s, a fresh-identity rejoin in 3.7 s, and 0 leader changes
+    under WAN, WAN-with-loss and 350 ms profiles.
+- **Owed.**
+  - A multi-region deployment on real separate networks: the KIND lane emulates WAN on one host.
+  - The transport's replacement by a conformed QUIC (AUD-29-50–54, capability row "Fleet").
+
+## 2. Volumes; OCI, CRI, Kubernetes, microVMs
+
+- **Evidence.** The capability rows:
+  - lifecycle (works);
+  - mount on macOS and Linux (works) and Windows (limited);
+  - "Containers: an OCI runtime binds a volume" (limited: Docker Desktop and Docker Engine);
+  - "Kubernetes: kubelet mounts a volume as an NFS PersistentVolume" (limited: kernel-TLS nodes, a CI-only kubelet
+    leg);
+  - "VM guests over virtio-fs" (limited: QEMU's vhost-user-fs, nine roster workloads identical in a live guest).
+
+  `BENCHMARKS.md` "Linux FUSE mount: small creates, and a containerd/runc binding (2026-10-05)".
+- **Owed.**
+  - Firecracker and Cloud Hypervisor guests (untested).
+  - Rootless engines and other runtimes (refused typed until a workload runs, AUD-29-67).
+  - A CRI-level integration beyond the kubelet NFS PersistentVolume (no CSI driver: a node plugin needs privileged
+    mount propagation, which R10 forbids).
+  - The kubelet leg cannot run on Docker Desktop: its kernel has no `CONFIG_TLS`, so it skips loudly here.
+- **2026-10-09.**
+  - containerd 1.7.24 with runc re-run on `faad1562`: the 2,000-file workload, the setuid probe and the read-only
+    entry all as before (`GAPS.md` "the day's builds re-checked through real workloads").
+  - Every Linux NFSv4 client, kubelet's and Docker's among them, had its back channel caught in a storm of probes,
+    and was granted no delegation. Fixed in `9c0d5057`; one writer's open+read p50 fell from about 300 to about 30 µs
+    once delegations returned (`BENCHMARKS.md` "The hot-directory storm after the probe-storm fix").
+
+## 3. No disk escape except a granted landing
+
+- **Evidence.**
+  - The lint wall denies `std::fs` and file-creating syscalls outside the landing crate, and a structural test
+    walks the dependency graph (CLAUDE.md §1, R1).
+  - `GAPS.md` "no write escapes to disk while the daemon is killed mid-install (conditions 3, 4, 11)": real pip and
+    npm installs with 15–19 daemon SIGKILLs, and `find -newer` showing only the test's and npm's own files.
+    Re-run 2026-10-07 on this day's build: 11 and 8 kills, 3,606 RECORD hashes intact, `npm ls` clean, the same
+    escape set.
+  - `GAPS.md` "an ended FUSE mount no longer exposes the disk beneath it" and "a strict volume locks only its own
+    content".
+  - The landing engine's crash-at-every-instruction oracle (`crates/land/tests/oracle.rs`).
+- **Owed.** Nothing named.
+
+## 4. Escapes battle-tested
+
+- **Evidence.**
+  - `GAPS.md` "an adversarial container run — containment held".
+  - "Kubernetes pods do not get the PersistentVolume's nosuid".
+  - "an ended FUSE mount no longer exposes the disk beneath it".
+  - The landing's escape tests (`crates/land/tests/os_escape.rs`), symlinks out of the volume resolving only for
+    their owner (A-107), and hostile NFS (`crates/server/tests/nfs_hostile.rs`).
+  - A generated battery: `GAPS.md` "a generated escape battery through a shared FUSE mount" (recorded command
+    `docs/wip/bench/escape/run.sh`). 1,500 seeded hostile steps as the owner and another user produced no
+    violation: 192 of 192 out-of-volume links refused to the other user, with positive controls, 0 daemon disk
+    writes, and the outside tree's hash unchanged.
+  - Over Linux's NFS client (`run-nfs.sh`, mounted `nosuid,nodev` as kubelet does): no disk write, the outside
+    tree unchanged, no device, no setuid elevation, but **out-of-volume links followed by another user on 46 of 116**
+    (the client caches symlink targets per inode, so A-107's per-caller rule holds only until a link's first
+    resolution; `GAPS.md` 2026-10-07).
+- **Owed.**
+  - A-107 on NFS: a per-identity export, or links the client must re-ask about.
+  - The battery over virtio-fs, and against a hostile user holding `CAP_SYS_ADMIN`.
+
+## 5. Fast local reads, accurate diff and change tracking
+
+- **Evidence.**
+  - `BENCHMARKS.md` "An overlay of a real tree: read, change, plan (2026-10-05)".
+  - "Real workloads through Linux's own NFS client, beside tmpfs".
+  - `GAPS.md` "Linux FUSE: the pip leftovers check".
+  - The base overlay's tests (`crates/vfs/tests/base.rs`), with drift, witnesses and digests against a simulated
+    host with outsider edits.
+  - 2026-10-07: a drift re-check the host refuses is reported unverified, never as a match.
+  - 2026-10-08, an overlay of `/usr/lib`: the landing plan is exact (base symlinks were planned as changes, A-121).
+    An outsider's edit is visible through the mount in 121–157 ms on Linux and 377–875 ms on macOS (A-122, A-123),
+    and a landing's presentation names its conflicts.
+- **Owed.** Windows has no base watcher (`ReadDirectoryChangesW`): an outsider's edit is seen only at a lookup's
+  live-disk check (`GAPS.md` 2026-10-09).
+
+## 6. Cross-OS and cross-architecture
+
+- **Evidence.**
+  - macOS on arm64 natively (this machine).
+  - Linux on aarch64 (Docker lanes; the Linux clippy gate on every commit).
+  - `BENCHMARKS.md` "x86_64 Linux under emulation (2026-10-05)".
+  - Windows: the daemon builds and runs its lifecycle in CI, and the WinFsp mount is proven live on the
+    `windows-latest` runner (capability row, limited).
+- **Owed.**
+  - Native x86_64 performance numbers (emulation proves behaviour, not speed).
+  - Windows beyond create, write, read, list and delete.
+  - The Windows base watcher, which cannot be built or linted from this machine without the Windows C headers (a tool
+    install awaiting Ada) or a CI push.
+
+## 7. Remote pulls under contention and bad networks
+
+- **Evidence.** `BENCHMARKS.md` "Remote pulls of 64 MiB …" and "Remote pulls under horrific networks"
+  (`fetch_bench`, real endpoints over the simulated network). These complete:
+  - delay, 1% and 5% loss;
+  - a 1/20-rate holder, and a silent holder;
+  - 8 readers, and 8 readers at 10% loss (199.6 of 300 Mbit/s).
+- **Failing.** Independent delay jitter of ±40–60 ms on 200–250 ms paths. The two reordering rows do not finish
+  64 MiB in 600 s, and 8 MiB takes 68–104 s on a 10 Mbit/s link. Copa reads non-congestive jitter as queue (the
+  starvation result, Arun, Alizadeh, Balakrishnan, SIGCOMM 2022). Three fixes were measured and rejected; the
+  records are in `BENCHMARKS.md`.
+- **Owed.** A delay signal that separates jitter from queueing without a long memory of the path's rate, clearing
+  `congestion_bench`'s 56 scenarios with no regression and the jitter rows at 8 MiB.
+- **2026-10-09.** Contested cross-region reads on the two networks at 10% loss went from 4 of 9 to 9 of 9 complete:
+  - an unanswered forward is resent to the same owner while it is not confirmed dead;
+  - the client retries a read refused as transiently unreachable;
+  - an unbootstrapped fleet's learners back off (`GAPS.md` 2026-10-09).
+
+## 8. Post-quantum protected transfer
+
+- **Evidence.**
+  - The fleet transport's TLS 1.3 key exchange prefers `SecP384r1MLKEM1024` (ML-KEM-1024 hybrid,
+    `crates/transport/src/kx.rs`).
+  - `GAPS.md` "post-quantum key exchange by default".
+- **Owed.** The Kubernetes export's RPC-with-TLS handshake runs in the node's `tlshd` (GnuTLS); its key-exchange
+  group is the node's, not slates', and is not yet verified post-quantum.
+
+## 9. Post-quantum encryption at rest and in transit
+
+- **Evidence.**
+  - `GAPS.md` "volumes sealed at rest (A-92)" and "sealed content no longer leaves plaintext in RAM".
+  - `BENCHMARKS.md` "A-99 sealed read" and "The idle sweep on real installs through Docker".
+  - Idle content is sealed with AES-256-GCM. A 256-bit symmetric key keeps 128-bit strength against Grover's
+    algorithm, the margin NIST and CNSA 2.0 give for post-quantum symmetric protection.
+  - 2026-10-07: a seal refused partway can no longer leave ciphertext marked plaintext, and a write log's clear
+    scrubs its plaintext whatever its header writes answer.
+  - In transit: condition 8.
+- **Owed.** Nothing named.
+
+## 10. Multi-cluster replication under horrible networks
+
+- **Evidence.**
+  - The capability row "Fleet: replication, takeover, multi-process deployment" (limited).
+  - The fleet suite (`crates/server/tests/fleet.rs`, 71 tests), including cross-region lookups to a copyset
+    successor.
+  - The KIND lane's WAN, WAN-with-loss and 350 ms profiles.
+  - `fetch_bench`'s content pulls (condition 7).
+  - 2026-10-07: two regions on two Docker networks, joined only by a router shaping 100 ms ± 40 ms one way and
+    3 % loss (`docs/wip/bench/multiregion/run.sh`). Both regions formed and bootstrapped. The run found and fixed an
+    owner lease that lapsed whenever far members stretched the probe round (`GAPS.md` 2026-10-07).
+- **Owed.**
+  - **Cross-region mirroring and promotion are built and proven in-process** (§4.10; `docs/wip/mirroring.md`): a
+    volume awaited in the mirror is read byte-identical in the mirror region after its home region is lost and
+    promoted. Still owed: the loss-window report, `NotPlaced { mirror }` at a deadline, and the two-network run
+    under a shaped router.
+  - Cross-region reads are correct on the two networks (2026-10-07: 9 of 9 byte-identical on each link). On 100 ms
+    with 3 % loss, batched read-ahead reads 8 MiB in 28.8–33.9 s (82.3–87.1 s one window per forward). With
+    ±40 ms jitter, 26.5–52.2 s once the read-ahead batch's rate cap was removed (2026-10-08; 97–131 s with it).
+    Then Copa's delay signal: it read the summed jitter of both directions as queue. With the two-least-samples
+    estimate, the same reads take 18.9–33.0 s (median 24.9 s, against 49.0 s on the same day; 18 of 18
+    byte-identical in each arm).
+  - The detector's far-link false deaths are fixed, including the stale-pool follow-up (0 of 100 seeds). A misfit
+    pair condemns a dead member within its stated bound even when every survivor is far (40 of 40). The fix landed
+    on hyper-raft `main` with the hyper-sim port, the `docs/timing.md` derivation and the records, plus two
+    follow-ups: an answer after its record was reused still times the path, and a peer with no evidence of its path
+    is judged at RFC 6298's initial RTO. slates vendors it from `41761ff` (2026-10-07), so the vendored copy carries
+    no local patch.
+  - Open: cross-region membership did not form in 2 of 12 bring-ups, and one node's record session stayed borrowed
+    for good (`GAPS.md` 2026-10-07).
+  - **2026-10-08/09: mirroring across the shaped crossing** (`docs/wip/bench/multiregion/mirror.sh`). Snapshots
+    placed in the mirror region:
+    - before the day's fixes: 0 of 6;
+    - after them: 43 of 44 at 3% loss;
+    - 5 of 5 at 10% loss with 150 ± 60 ms;
+    - 5 of 5 with every node held to half a CPU.
+
+    The fixes: the mirror's hedge, late acknowledgements folded, pair keys accepted both ways, and an announcement
+    pass that lent every record session about a hundred times a second (`48496cf8`).
+  - **2026-10-09:** a detector bug left a member that died soon after a warm restart unsuspected for good. Answers to
+    lease renewals marked every pair a pool misfit. Fixed in the vendored detector (`e6640dd3`, pending upstream);
+    the warm-restart test went from failing 3 of 11 runs to passing 16 of 16.
+  - Condition 7's jitter design, which replication's content pulls share.
+  - The copyset-successor fleet test fails intermittently in the full suite (4 of 9 untraced runs earlier; 1 of 3
+    full suites on 2026-10-07, "retry not served: HomedElsewhere", one forward unanswered, location rounds answering
+    `not_owner` 6 times and `unavailable` once). Run alone it passes, and run as 6 and as 12 concurrent copies it
+    passed 18 of 18 and 36 of 36 (load average 6.7), so contention alone does not reproduce it: it needs state the
+    serialized suite leaves behind from earlier tests in the same process. Open; the next failure's counters now
+    name any held session's holder (`fleet.lent_to.*`) and a dropped link's reason (`fleet.link.invalid.*`).
+
+## 11. No panics; recovery proven adversarially
+
+- **Evidence.**
+  - Panics are denied in every crate by the lint wall: `unwrap`, `expect`, indexing, slicing and overflowing
+    arithmetic (`GAPS.md` "the no-panic sweep's indexing half is closed and the lints are denied
+    workspace-wide").
+  - SIGKILLs under real workloads (`BENCHMARKS.md` "The daemon SIGKILLed in the middle of real workloads", "SIGKILL
+    under write load on a Linux FUSE mount").
+  - Crash at every landing instruction (`crates/land/tests/oracle.rs`).
+  - Recovery oracles: `crates/vfs/tests/recover.rs`, including a write-accounting recount after every step; and
+    `crates/db/tests/model.rs`, with drops and recoveries at random points.
+  - The 2026-10-07 sweep of discarded results fixed a seal, a descriptor leak, dropped replies, a truncate and a
+    scrub, and made every remaining refusal counted in status.
+- **2026-10-09.**
+  - `docs/wip/bench/kill_writes.sh`: 80 SIGKILLs across 100,000 fsyncs of random 4 KiB writes. The file read back
+    identical every time, each recovery replaying A-126's windowed deltas, and the longest fsync was 70 ms.
+  - `realworld_chaos.sh` on the day's build: git, cargo and pip each finished exactly, under two SIGKILLs each.
+  - `docs/wip/bench/kill_mixed.sh`: random creates, writes, truncates, appends, unlinks and renames through Linux's
+    NFSv4.2 client under 30 SIGKILLs a run. It found an operation the daemon applied before a kill answered `ENOENT` on
+    the client's retry. A-127 made sessions durable and a retry answered from call records that ride their effects'
+    commits. Since then, 450 kills over 15 seeds have passed without a failed operation, and one retry was answered
+    from its record.
+- **Owed.**
+  - ~~macOS NFSv3 over a held connection re-ran a request applied and unanswered at a death~~ fixed (A-128): about 160
+    kills with no MKDIR answered `NFS3ERR_EXIST`, against 10 of 480 before.
+  - A generated fault-injection campaign across a live fleet (the deterministic simulation's nemesis library over the
+    seed budget, CLAUDE.md §4) is the strengthening.
+  - Open: the daemon disappeared twice in about 70 container runs under heavy host load. No OOM kill of slates,
+    restart or lapsed heartbeat was seen in the logged runs that followed. Cause unknown; the benchmarks now print
+    what would name it (`GAPS.md` 2026-10-09).
+
+## 12. Tail latency against Tectonic
+
+- **Evidence.** `BENCHMARKS.md` "Tail latency under a hot-directory storm, against Tectonic's published tails",
+  re-run 2026-10-07:
+  - create p99 0.35 ms at one writer and 3.37 ms at sixteen in one directory;
+  - reads 80 µs p99;
+  - the daemon's own operation p99 about 10 µs.
+
+  Against Tectonic's published 150–200 ms write and about 100 ms read tails (FAST'21), with the media difference
+  stated.
+- **2026-10-09**, through Linux's own NFSv4.2 client:
+  - random 4 KiB writes with an fsync every 8 have fsync p99 0.75–1.37 ms at load 15, against 3.5–6.2 ms before
+    A-126;
+  - sequential overwrite runs at 1,143 MiB/s median, inside Linux nfsd's 967–1,524 MB/s;
+  - sixteen writers in one directory see create p99 3.2–3.4 ms after the probe-storm fix (6.1–6.6 ms before);
+  - O_DIRECT reads run at 1.6–2.0 GB/s.
+
+  (`BENCHMARKS.md`, the day's entries.)
+- **Owed.**
+  - A broader p99 matrix: a loaded fleet, remote pulls.
+  - Condition 7's jitter tail.
+  - Reads spend 29% of their CPU decrypting sealed chunks (A-99 opens per read). A bounded plaintext cache of
+    actively read chunks is Ada's decision (condition 9's posture).
+
+## 13. MCP with codemode and skills
+
+- **Evidence.**
+  - The capability row "MCP server for agents" (works).
+  - `GAPS.md` "MCP speaks 2026-07-28, dual era (A-81)".
+  - `BENCHMARKS.md` "Codemode against list-and-read on a real agent task".
+  - The skills served over MCP (`crates/mcp/src/skills.rs`, `skills/`).
+  - `crates/mcp/tests/mcp.rs`: version negotiation, tools, refusals, batches, subscriptions, and the HTTP transport
+    with its authorization.
+- **Owed.**
+  - Validation by an independent checker (the official MCP inspector needs an npm install, awaiting Ada's
+    authorization).
+  - Recorded runs from each named agent (Codex, Claude, Cursor, Pi) against a live daemon.

@@ -36,12 +36,19 @@ pub(crate) struct Version<V> {
 #[derive(Clone, Debug)]
 pub(crate) struct Versioned<K, V> {
   keys: BTreeMap<K, Vec<Version<V>>>,
+  /// One per mutating call ([`Self::set`], which [`Self::remove`] calls), whether it pushed a version or overwrote
+  /// the head in place. The base plane sums this across its tables for its durable-change token
+  /// (`BasePlane::durable_change_token`): an overlay's publication takes a delta only while the token is unchanged,
+  /// so every witness, home, whiteout or redirect write — including an in-place head overwrite that leaves
+  /// `version_count` unmoved — is counted here, or a delta that carries no base plane would drop it on a restart.
+  writes: u64,
 }
 
 impl<K, V> Default for Versioned<K, V> {
   fn default() -> Self {
     Self {
       keys: BTreeMap::new(),
+      writes: 0,
     }
   }
 }
@@ -74,6 +81,7 @@ impl<K: Ord + Clone, V: Clone + PartialEq> Versioned<K, V> {
   /// overwritten when no live snapshot reads it, so the table grows only by what a snapshot still needs. A
   /// key with nothing but removals hides nothing, so it is dropped.
   pub(crate) fn set(&mut self, key: K, value: Option<V>, head: Epoch, newest: Option<Epoch>) {
+    self.writes = self.writes.saturating_add(1);
     let versions = self.keys.entry(key.clone()).or_default();
     match versions.last_mut() {
       Some(last) if newest.is_none_or(|snapshot| last.from > snapshot) => last.value = value,
@@ -143,7 +151,7 @@ impl<K: Ord + Clone, V: Clone + PartialEq> Versioned<K, V> {
         ))
       })
       .collect();
-    Self { keys }
+    Self { keys, writes: 0 }
   }
 
   /// Every version of every key, in key order and then epoch order (the recovery image).
@@ -171,6 +179,12 @@ impl<K: Ord + Clone, V: Clone + PartialEq> Versioned<K, V> {
   /// The versions held, over every key: the measure of the bound.
   pub(crate) fn version_count(&self) -> usize {
     self.keys.values().map(Vec::len).sum()
+  }
+
+  /// How many mutating calls this table has taken (see [`Self::writes`]): the base plane's durable-change token
+  /// sums it across tables, so an overlay delta is taken only when no table has been written since its last publish.
+  pub(crate) fn writes(&self) -> u64 {
+    self.writes
   }
 }
 
