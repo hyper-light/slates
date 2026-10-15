@@ -424,11 +424,38 @@ impl std::fmt::Debug for Liveness {
   }
 }
 
+/// A read-only content map the daemon delivered to a same-kernel client (§4.6, A-135): the arena
+/// block's backing descriptor and where the file's bytes sit within it. The client `mmap`s `block`
+/// read-only at `region_off` for the file's page span; the sub-file tail of the last page reads zero.
+#[cfg(unix)]
+pub struct MappingDelivery {
+  /// The arena block's backing object, to map read-only.
+  pub block: std::os::fd::OwnedFd,
+  /// The request this delivery answers (the command-ring map request's id).
+  pub request_id: u64,
+  /// The daemon-minted mapping id, named by the later release message.
+  pub mapping_id: u64,
+  /// The block's byte offset within `block`.
+  pub region_off: u64,
+  /// The file's authorized length; the bytes from here to the page-span end read zero.
+  pub file_len: u64,
+  /// The block's length (its buddy size); the map covers only the file's page span within it.
+  pub block_len: u64,
+}
+
 impl Liveness {
   /// Whether the daemon the client connected to is gone (dead, or restarted since). A cold
   /// path: asked only after a reply has stalled past the client's deadline.
   pub fn daemon_gone(&self) -> bool {
     self.inner.daemon_gone()
+  }
+
+  /// Receives a content-map delivery the daemon sent over the control socket (§4.6, A-135), or
+  /// `None` when none is waiting. Non-blocking. A platform without a control socket (macOS,
+  /// Windows) never delivers one, so a same-kernel client there reads through the copy path.
+  #[cfg(unix)]
+  pub fn recv_mapping(&self) -> Result<Option<MappingDelivery>, IpcError> {
+    self.inner.recv_mapping()
   }
 }
 
@@ -511,6 +538,22 @@ pub mod platform {
   /// reason.
   const REFUSED_CLIENT: u32 = 0;
 
+  /// Format: a mapping delivery's body (§4.6, A-135): request id (8), mapping id (8), the block's
+  /// offset in its backing object (8), the file's authorized length (8), the block length (8).
+  const MAPPING_MSG_BYTES: usize = 40;
+  /// Format: the request id's offset in a mapping delivery.
+  const MAPPING_AT_REQUEST: usize = 0;
+  /// Format: the mapping id's offset.
+  const MAPPING_AT_ID: usize = 8;
+  /// Format: the block offset's offset.
+  const MAPPING_AT_OFF: usize = 16;
+  /// Format: the file length's offset.
+  const MAPPING_AT_FILE_LEN: usize = 24;
+  /// Format: the block length's offset.
+  const MAPPING_AT_BLOCK_LEN: usize = 32;
+  /// Format: the one descriptor a mapping delivery carries — the arena block's backing object.
+  const MAPPING_FDS: usize = 1;
+
   /// Sends the typed refusal handoff to `peer`: client [`REFUSED_CLIENT`], `limit` in the length word,
   /// no descriptors.
   fn send_refusal(peer: &OwnedFd, limit: usize) -> Result<(), IpcError> {
@@ -553,6 +596,51 @@ pub mod platform {
     pub fn completion_dup(&self) -> Option<OwnedFd> {
       rustix::io::dup(&self.completion).ok()
     }
+
+    /// Sends a read-only content-map delivery to the client over the control socket (§4.6, A-135):
+    /// the arena block's backing descriptor by `SCM_RIGHTS` with the mapping metadata. The client
+    /// `mmap`s `block` read-only at `region_off` for the file's page span. One `sendmsg`, so the
+    /// descriptor arrives with the body; the command ring cannot carry a descriptor, this socket can.
+    pub fn send_mapping(
+      &self,
+      block: std::os::fd::BorrowedFd<'_>,
+      request_id: u64,
+      mapping_id: u64,
+      region_off: u64,
+      file_len: u64,
+      block_len: u64,
+    ) -> Result<(), IpcError> {
+      let mut body = [0u8; MAPPING_MSG_BYTES];
+      let fields = [
+        (MAPPING_AT_REQUEST, request_id.to_le_bytes()),
+        (MAPPING_AT_ID, mapping_id.to_le_bytes()),
+        (MAPPING_AT_OFF, region_off.to_le_bytes()),
+        (MAPPING_AT_FILE_LEN, file_len.to_le_bytes()),
+        (MAPPING_AT_BLOCK_LEN, block_len.to_le_bytes()),
+      ];
+      for (at, bytes) in fields {
+        if let Some(field) = body.get_mut(at..at.saturating_add(bytes.len())) {
+          field.copy_from_slice(&bytes);
+        }
+      }
+      let fds = [block];
+      let mut space =
+        [std::mem::MaybeUninit::<u8>::uninit(); rustix::cmsg_space!(ScmRights(MAPPING_FDS))];
+      let mut control = SendAncillaryBuffer::new(&mut space);
+      if !control.push(SendAncillaryMessage::ScmRights(&fds)) {
+        return Err(IpcError::Layout {
+          reason: "the mapping descriptor did not fit the ancillary buffer",
+        });
+      }
+      rustix::net::sendmsg(
+        &self.socket,
+        &[IoSlice::new(&body)],
+        &mut control,
+        SendFlags::empty(),
+      )
+      .map_err(|e| refused("sendmsg mapping", e))?;
+      Ok(())
+    }
   }
 
   impl ClientControl {
@@ -582,6 +670,65 @@ pub mod platform {
         // Reset, or an unusable descriptor: the channel is gone either way.
         Err(_) => true,
       }
+    }
+
+    /// Receives a content-map delivery from the daemon over the control socket (§4.6, A-135), or
+    /// `None` when none is waiting. Non-blocking; the descriptor arrives by `SCM_RIGHTS`
+    /// (close-on-exec), the metadata in the body.
+    pub(super) fn recv_mapping(&self) -> Result<Option<super::MappingDelivery>, IpcError> {
+      let mut body = [0u8; MAPPING_MSG_BYTES];
+      let mut space =
+        [std::mem::MaybeUninit::<u8>::uninit(); rustix::cmsg_space!(ScmRights(MAPPING_FDS))];
+      let mut control = RecvAncillaryBuffer::new(&mut space);
+      let received = match rustix::net::recvmsg(
+        &self.socket,
+        &mut [IoSliceMut::new(&mut body)],
+        &mut control,
+        RecvFlags::CMSG_CLOEXEC | RecvFlags::DONTWAIT,
+      ) {
+        Ok(received) => received.bytes,
+        // Nothing waiting yet.
+        Err(rustix::io::Errno::AGAIN) => return Ok(None),
+        Err(e) => return Err(refused("recvmsg mapping", e)),
+      };
+      // The peer closed: no delivery (the daemon is gone; `daemon_gone` reports it).
+      if received == 0 {
+        return Ok(None);
+      }
+      if received != MAPPING_MSG_BYTES {
+        return Err(IpcError::Layout {
+          reason: "a mapping delivery was the wrong length",
+        });
+      }
+      let mut descriptors: Vec<OwnedFd> = Vec::new();
+      for message in control.drain() {
+        if let RecvAncillaryMessage::ScmRights(iter) = message {
+          descriptors.extend(iter);
+        }
+      }
+      if descriptors.len() != MAPPING_FDS {
+        return Err(IpcError::Layout {
+          reason: "a mapping delivery carried the wrong number of descriptors",
+        });
+      }
+      let block = descriptors.pop().ok_or(IpcError::Layout {
+        reason: "a mapping delivery carried no block descriptor",
+      })?;
+      let word = |at: usize| -> u64 {
+        let mut raw = [0u8; size_of::<u64>()];
+        if let Some(field) = body.get(at..at.saturating_add(size_of::<u64>())) {
+          raw.copy_from_slice(field);
+        }
+        u64::from_le_bytes(raw)
+      };
+      Ok(Some(super::MappingDelivery {
+        block,
+        request_id: word(MAPPING_AT_REQUEST),
+        mapping_id: word(MAPPING_AT_ID),
+        region_off: word(MAPPING_AT_OFF),
+        file_len: word(MAPPING_AT_FILE_LEN),
+        block_len: word(MAPPING_AT_BLOCK_LEN),
+      }))
     }
   }
 
@@ -992,6 +1139,101 @@ pub mod platform {
       control: Some(ClientControl { completion }),
     })
   }
+
+  #[cfg(test)]
+  mod tests {
+    use std::os::fd::AsFd;
+
+    use rustix::fs::{MemfdFlags, memfd_create};
+    use rustix::net::{AddressFamily, SocketFlags, SocketType};
+
+    use super::{Control, Liveness};
+    use crate::error::IpcError;
+
+    /// A-135: the daemon sends a read-only content-map descriptor with its metadata over the
+    /// control socket, and the client receives that exact descriptor — the file's bytes read back
+    /// through it. Drives the real `send_mapping`/`recv_mapping` over a real `AF_UNIX`/`SOCK_STREAM`
+    /// pair (the kind the rendezvous retains), with a real `memfd` standing in for an arena block
+    /// whose file is shorter than the block (so the metadata's file length is exercised). A failing
+    /// check returns a typed error rather than panicking (the lint wall forbids a panic in a
+    /// `Result` function).
+    #[test]
+    fn a_mapping_delivery_hands_the_client_the_block_descriptor_and_its_bytes()
+    -> Result<(), IpcError> {
+      let (daemon_socket, client_socket) = rustix::net::socketpair(
+        AddressFamily::UNIX,
+        SocketType::STREAM,
+        SocketFlags::CLOEXEC,
+        None,
+      )
+      .map_err(|e| super::refused("socketpair", e))?;
+      let completion = rustix::event::eventfd(0, rustix::event::EventfdFlags::CLOEXEC)
+        .map_err(|e| super::refused("eventfd", e))?;
+      let control = Control {
+        socket: daemon_socket,
+        completion,
+      };
+      let liveness = Liveness {
+        socket: client_socket,
+      };
+
+      // An arena-block stand-in: a memfd holding a full block of known bytes, with the file's
+      // authorized length shorter than the block (so the metadata's file length is exercised).
+      // Writing the whole block sizes the memfd to it, so no `ftruncate` is needed.
+      let block: Vec<u8> = (0..512)
+        .map(|byte| u8::try_from(byte % 256).unwrap_or(0))
+        .collect();
+      let block_len = u64::try_from(block.len()).unwrap_or(0);
+      let file_len: u64 = 300;
+      let file_bytes = usize::try_from(file_len).unwrap_or(0);
+      let mem = memfd_create("slates-a135-test", MemfdFlags::CLOEXEC)
+        .map_err(|e| super::refused("memfd_create", e))?;
+      let wrote = rustix::io::pwrite(&mem, &block, 0).map_err(|e| super::refused("pwrite", e))?;
+      if wrote != block.len() {
+        return Err(IpcError::Layout {
+          reason: "the block stand-in was not fully written",
+        });
+      }
+
+      // Nothing waiting yet: a non-blocking recv returns None.
+      if liveness.recv_mapping()?.is_some() {
+        return Err(IpcError::Layout {
+          reason: "a delivery arrived before one was sent",
+        });
+      }
+
+      control.send_mapping(mem.as_fd(), 7, 42, 0, file_len, block_len)?;
+
+      let delivery = liveness.recv_mapping()?.ok_or(IpcError::Layout {
+        reason: "a delivery was waiting but recv returned None",
+      })?;
+      let metadata_ok = delivery.request_id == 7
+        && delivery.mapping_id == 42
+        && delivery.region_off == 0
+        && delivery.file_len == file_len
+        && delivery.block_len == block_len;
+      if !metadata_ok {
+        return Err(IpcError::Layout {
+          reason: "the mapping metadata did not survive the wire",
+        });
+      }
+
+      // The delivered descriptor names the same object: the file's bytes read back through it,
+      // equal to the daemon's bytes over exactly the authorized length.
+      let mut got = vec![0u8; file_bytes];
+      let read = rustix::io::pread(&delivery.block, &mut got, delivery.region_off)
+        .map_err(|e| super::refused("pread", e))?;
+      let want = block.get(..file_bytes).ok_or(IpcError::Layout {
+        reason: "the block stand-in was shorter than the file length",
+      })?;
+      if read != file_bytes || got.as_slice() != want {
+        return Err(IpcError::Layout {
+          reason: "the bytes the client read through the delivered descriptor did not match",
+        });
+      }
+      Ok(())
+    }
+  }
 }
 
 #[cfg(any(target_os = "macos", windows))]
@@ -1088,6 +1330,22 @@ pub mod platform {
     pub fn completion_dup(&self) -> Option<std::os::fd::OwnedFd> {
       None
     }
+
+    /// No control socket here yet (§4.6, A-135): the same-kernel direct map is not offered, so the
+    /// server falls back to a copy. The owed macOS control socket would carry the block's descriptor.
+    pub fn send_mapping(
+      &self,
+      _block: std::os::fd::BorrowedFd<'_>,
+      _request_id: u64,
+      _mapping_id: u64,
+      _region_off: u64,
+      _file_len: u64,
+      _block_len: u64,
+    ) -> Result<(), IpcError> {
+      Err(IpcError::Unsupported {
+        feature: "same-kernel direct map (macOS control socket owed)",
+      })
+    }
   }
 
   #[cfg(unix)]
@@ -1111,6 +1369,13 @@ pub mod platform {
   impl Liveness {
     pub(super) fn daemon_gone(&self) -> bool {
       self.watch.exited() || generation_of(&self.instance).is_none_or(|now| now != self.generation)
+    }
+
+    /// No control socket here yet (§4.6, A-135), so no descriptor is ever delivered; a same-kernel
+    /// client on this platform reads by copy.
+    #[cfg(unix)]
+    pub(super) fn recv_mapping(&self) -> Result<Option<super::MappingDelivery>, IpcError> {
+      Ok(None)
     }
   }
 

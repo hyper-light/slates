@@ -150,7 +150,10 @@
 #   number in `SLATES_ANCHOR_FLEET_SERVE`, one site called per plane (1, Unix only).
 # slates-db (0): records, indexes and the log are safe Rust over the segment's byte slices.
 # slates-merge (0): the verdict is a pure sweep over ranges and a memcmp; safe Rust throughout.
-# slates-client (0): the rings and the rendezvous are slates-ipc's; the client is safe Rust.
+# slates-client (3): the rings and the rendezvous are slates-ipc's. Raised 0 → 3 on 2026-10-15 for the
+#   same-kernel zero-copy read (§4.6, A-135): `MappedRead` maps the daemon's arena block into this process,
+#   so rustix `mmap` (1) and `munmap` (1) of the block's descriptor and `slice::from_raw_parts` (1) over the
+#   mapped read-only bytes, each with a SAFETY note; Unix only (the whole A-135 client path is `cfg(unix)`).
 # slates-cli (4): the stop flag's handlers (`signal.rs`): `signal(2)` for SIGINT and SIGTERM on
 #   Unix (1), and on Windows the console control handler, an `unsafe extern` function by
 #   signature and its registration (2); the launcher's `unshare_unsafe` (`exec.rs`, Linux),
@@ -245,7 +248,7 @@ slates-ipc = 47
 #   the anchor's content object through `ExclusiveObject::open_range`, whose promise (no other mapping reaches the
 #   range) the layout keeps: the daemon's copies reach only the write log and image slots.
 slates-server = 6
-slates-client = 0
+slates-client = 3
 slates-cli = 5
 slates-wire = 4
 # slates-bridge-core (0): the operation layer is the trait, neutral data structs and the

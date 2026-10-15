@@ -199,7 +199,7 @@ impl SharedObject {
 /// A shared memory object exactly one process reaches, through this value only: the storage a region
 /// backs with anchor-owned RAM (`Region::shared`), whose arena hands out references to its bytes. Its one
 /// constructor carries the promise; its views are then safe.
-pub struct ExclusiveObject(SharedObject);
+pub struct ExclusiveObject(SharedObject, usize);
 
 impl std::fmt::Debug for ExclusiveObject {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -218,7 +218,7 @@ impl ExclusiveObject {
   /// no words. A shared object two processes use at once is reached through its copies and words instead
   /// (AUD-29-09).
   pub unsafe fn new(object: SharedObject) -> ExclusiveObject {
-    ExclusiveObject(object)
+    ExclusiveObject(object, 0)
   }
 
   /// The bytes `[offset, offset + len)` of the object `handoff` names, mapped on their own, as storage no
@@ -245,7 +245,7 @@ impl ExclusiveObject {
     }
     let words = Words::new().layout(len)?;
     let inner = platform::open_range(handoff, offset, len)?;
-    Ok(ExclusiveObject(SharedObject { inner, len, words }))
+    Ok(ExclusiveObject(SharedObject { inner, len, words }, offset))
   }
 
   /// The whole map.
@@ -268,6 +268,15 @@ impl ExclusiveObject {
   #[cfg(unix)]
   pub fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
     self.0.as_fd()
+  }
+
+  /// This view's byte offset within its descriptor: 0 for a whole object ([`ExclusiveObject::new`]), the
+  /// [`ExclusiveObject::open_range`] offset for a shard's sub-range of the anchor content object (A-64).
+  /// A descriptor consumer — the virtio-fs DAX window or a same-kernel client (§4.6) — maps a block's
+  /// pages at `base() + the block's in-view offset`, since `as_fd()` is the whole object, not this view.
+  #[must_use]
+  pub fn base(&self) -> usize {
+    self.1
   }
 
   /// Locks the whole object into RAM (D-12).

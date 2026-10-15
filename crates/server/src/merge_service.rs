@@ -950,6 +950,155 @@ fn read_green(state: &ShardState, green: DbVolumeId, path: &str, at: ReadAt) -> 
 
 /// A plain volume's file at its head, through the volume core: an overlay through its host (an
 /// untouched entry reads the disk), a scratch volume from the store.
+/// Format: the counter the local zero-copy map path moves (§4.6 A-135 non-vacuity) — a test asserts
+/// it moved, so a silently-dead map path cannot masquerade as the copy fallback passing.
+#[cfg(unix)]
+const DAX_LOCAL_MAP: &str = "dax.local_map";
+
+/// A-135: mint a read-only content map for a same-kernel client and hand it the arena block's
+/// descriptor over its control socket, so the client reads the file's bytes with no copy. Offered only
+/// to the daemon's own trust domain (a same-uid peer); every other shape — a different-uid or non-uid
+/// peer, a non-plain volume or a non-head view, a path with no shared-object backing, or a client not
+/// on this shard — falls back to the copy path, so the client always gets its bytes (the zero-copy
+/// upgrade is invisible to it but for the counter). The minted mapping pins the version until the
+/// client releases it (§4.6); on any fall-back after minting, the pin is released here.
+///
+/// The same-kernel direct map is a Unix `SCM_RIGHTS`/`mmap` feature; on a non-Unix host a `MapRead`
+/// reads by copy (the client always gets its bytes), so this has a `cfg(not(unix))` sibling below.
+#[cfg(not(unix))]
+pub(crate) fn map_read(
+  state: &mut ShardState,
+  _client_id: u32,
+  principal: &Principal,
+  volume: VolumeId,
+  path: &str,
+  at: ReadAt,
+) -> ReplyBody {
+  read(state, principal, volume, path, at)
+}
+
+#[cfg(unix)]
+pub(crate) fn map_read(
+  state: &mut ShardState,
+  client_id: u32,
+  principal: &Principal,
+  volume: VolumeId,
+  path: &str,
+  at: ReadAt,
+) -> ReplyBody {
+  let same_uid =
+    matches!(principal, Principal::Uid { uid } if *uid == rustix::process::geteuid().as_raw());
+  if !same_uid || !matches!(at, ReadAt::Head) {
+    return read(state, principal, volume, path, at);
+  }
+  let record = match find_record(state, volume) {
+    Ok(record) => record,
+    Err(refusal) => return refused(refusal),
+  };
+  if !rights_of(&record, principal).read {
+    return forbidden("read");
+  }
+  if !matches!(record.policy.role, Role::Plain) {
+    return read(state, principal, volume, path, at);
+  }
+  let (handle, _) = match find(state, volume) {
+    Ok(found) => found,
+    Err(reply) => return *reply,
+  };
+  let key = canonical_path(path).to_owned();
+  match try_local_map(state, handle, client_id, &key) {
+    LocalMap::Mapped(reply) => {
+      state.count(DAX_LOCAL_MAP, 1);
+      reply
+    }
+    LocalMap::Directory => refused(Refusal::BadRequest {
+      reason: "the path is a directory".to_owned(),
+    }),
+    LocalMap::NotHere => refused(Refusal::NotFound),
+    LocalMap::Vfs(error) => refused(refusal_of_vfs(&error)),
+    LocalMap::Fallback => read_plain(state, volume, path),
+  }
+}
+
+/// The outcome of attempting a same-kernel zero-copy map (§4.6, A-135), kept separate from [`map_read`]'s
+/// gate logic so each stays under the cognitive-complexity bound.
+#[cfg(unix)]
+enum LocalMap {
+  /// Mapped and the descriptor delivered; the metadata reply to return.
+  Mapped(ReplyBody),
+  /// The path is a directory.
+  Directory,
+  /// The volume is not on this shard.
+  NotHere,
+  /// A VFS error resolving or mapping the path.
+  Vfs(slates_vfs::error::VfsError),
+  /// Not mappable here (no shared-object backing, or the client is not on this shard): read by copy.
+  Fallback,
+}
+
+/// Resolve `key` in the volume `handle` names, mint a read mapping, and hand its arena block's descriptor
+/// to the client over the control socket (§4.6, A-135). The pin is released on any non-delivering outcome,
+/// so a fall-back never leaks it.
+#[cfg(unix)]
+fn try_local_map(
+  state: &mut ShardState,
+  handle: slates_mem::Handle<crate::state::VolumeSlot>,
+  client_id: u32,
+  key: &str,
+) -> LocalMap {
+  let ShardState {
+    store,
+    volumes,
+    clients,
+    ..
+  } = state;
+  let Ok(slot) = volumes.get_mut(handle) else {
+    return LocalMap::NotHere;
+  };
+  let located = match slot.volume.resolve(store, key) {
+    Ok(located) => located,
+    Err(error) => return LocalMap::Vfs(error),
+  };
+  if matches!(located.child, Child::Dir(_)) {
+    return LocalMap::Directory;
+  }
+  let mapping = match slot.volume.dax_map_read(store, located.inode) {
+    Ok(mapping) => mapping,
+    Err(error) => return LocalMap::Vfs(error),
+  };
+  // No shared-object backing (inline or private content): release the pin and read by copy.
+  let Some((block, region_off, block_len)) = store.dax_backing(&mapping) else {
+    store.dax_revoke(&mapping);
+    return LocalMap::Fallback;
+  };
+  let mapping_id = mapping.id.as_u64();
+  let file_len = u64::try_from(mapping.file_len).unwrap_or(0);
+  let region_off = u64::try_from(region_off).unwrap_or(0);
+  let block_len = u64::try_from(block_len).unwrap_or(0);
+  let sent = clients
+    .iter()
+    .find(|(_, candidate)| candidate.client_id == client_id)
+    .and_then(|(_, candidate)| candidate.control.as_ref())
+    .map(|control| {
+      control.send_mapping(
+        block, mapping_id, mapping_id, region_off, file_len, block_len,
+      )
+    });
+  match sent {
+    Some(Ok(())) => LocalMap::Mapped(ReplyBody::Mapped {
+      mapping_id,
+      region_off,
+      file_len,
+      block_len,
+    }),
+    // Not on this shard (cross-shard owner delivery is owed), or the send failed: release, read by copy.
+    _ => {
+      store.dax_revoke(&mapping);
+      LocalMap::Fallback
+    }
+  }
+}
+
 fn read_plain(state: &mut ShardState, volume: VolumeId, path: &str) -> ReplyBody {
   let (handle, _) = match find(state, volume) {
     Ok(found) => found,

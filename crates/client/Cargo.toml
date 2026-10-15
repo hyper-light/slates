@@ -19,6 +19,11 @@ slates-machine = { workspace = true }
 slates-ipc = { workspace = true }
 slates-wire = { workspace = true }
 
+# The same-kernel zero-copy read (§4.6, A-135) maps the daemon's arena block into this process with
+# `mmap`; rustix is the sanctioned syscall wrapper (its `mm`/`param` features are the workspace pin).
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true }
+
 [dev-dependencies]
 slates-server = { workspace = true }
 slates-anchor = { workspace = true }

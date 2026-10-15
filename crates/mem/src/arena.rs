@@ -1188,8 +1188,13 @@ impl ChunkArena {
     // Bounds-check the extent against the region exactly as `bytes` does, so an out-of-range or foreign extent is
     // `None`, never an fd + offset that would map past the object.
     self.bytes(extent)?;
-    let fd = self.region(extent.region())?.backing_fd()?;
-    Some((fd, extent.offset(), extent.len()))
+    let region = self.region(extent.region())?;
+    let fd = region.backing_fd()?;
+    // `backing_fd` is the whole object; this region is a sub-range of it (A-64), so the block's offset
+    // in the descriptor is the region's base plus the block's offset within the region. A consumer that
+    // mapped `extent.offset()` alone would land `base` bytes early — on the object's start, not the block.
+    let offset = region.backing_base().saturating_add(extent.offset());
+    Some((fd, offset, extent.len()))
   }
 }
 
@@ -1329,7 +1334,11 @@ mod tests {
 
     // The file frees its block, but a mapping still holds it: the free is deferred, the bytes kept.
     arena.free(a).unwrap();
-    assert_eq!(arena.pinned_free_waiting(), 1, "the deferred free is counted");
+    assert_eq!(
+      arena.pinned_free_waiting(),
+      1,
+      "the deferred free is counted"
+    );
     assert!(
       arena.bytes(a).unwrap().iter().all(|&b| b == 0xAA),
       "the pinned block keeps its bytes while mapped"
@@ -1363,7 +1372,10 @@ mod tests {
     let a = arena.alloc(p).unwrap();
     arena.pin(a).unwrap();
     assert!(!arena.unpin(a).unwrap(), "no free was waiting");
-    assert!(arena.holds(a), "the block is still allocated after the unpin");
+    assert!(
+      arena.holds(a),
+      "the block is still allocated after the unpin"
+    );
     arena.free(a).unwrap();
     let b = arena.alloc(p).unwrap();
     assert_eq!(
@@ -1480,7 +1492,10 @@ mod tests {
       "a pinned block is not trimmed"
     );
     assert!(!arena.unpin(big).unwrap(), "no free was waiting");
-    assert!(arena.holds(big), "the block is still allocated after the unpin");
+    assert!(
+      arena.holds(big),
+      "the block is still allocated after the unpin"
+    );
   }
 
   /// A-118, the arena's trim: do allocate a 16-page block, fill its first 5 pages and a byte of the sixth, trim it to

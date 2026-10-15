@@ -79,6 +79,16 @@ pub fn stripe_target(slots: NonZeroUsize, current: usize, rng: &mut Xorshift) ->
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MappingId(u64);
 
+impl MappingId {
+  /// The id's opaque value, so a same-host client can name this mapping when it asks to release it
+  /// (§4.6, A-135). Reading the value never *forms* a `MappingId` — the inner stays private, so a
+  /// client-supplied `u64` can only be looked up in the registry, never fabricated into a mapping.
+  #[must_use]
+  pub fn as_u64(self) -> u64 {
+    self.0
+  }
+}
+
 /// One active mapping of a file's content block into a guest's DAX window. Minted by the daemon
 /// ([`Volume::dax_map_read`]/[`Volume::dax_map_write`]); never constructed from caller input — its [`MappingId`] has
 /// a module-private inner, so a `Mapping` can be formed only by the mint paths in this module.

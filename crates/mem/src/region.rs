@@ -74,6 +74,19 @@ impl Region {
     }
   }
 
+  /// The byte offset of this region's bytes within its [`backing_fd`](Self::backing_fd): the shared
+  /// object is mapped as a sub-range (A-64, a shard's slice of the anchor content object), so a block's
+  /// offset in the descriptor is `backing_base() + the block's offset in this region`. Zero for a
+  /// private (anonymous) region, which has no descriptor.
+  #[cfg(unix)]
+  #[must_use]
+  pub fn backing_base(&self) -> usize {
+    match &self.backing {
+      Backing::Shared(object) => object.base(),
+      Backing::Anon(_) => 0,
+    }
+  }
+
   /// Maps `len` bytes (rounded up to whole pages of `page` bytes). `huge` asks the OS to back
   /// the region with transparent huge pages where that exists (Linux `MADV_HUGEPAGE`).
   pub fn map(len: usize, page: usize, huge: bool) -> Result<Region, MemError> {

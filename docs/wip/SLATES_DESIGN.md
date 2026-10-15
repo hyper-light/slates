@@ -2652,6 +2652,48 @@ content goes through the VFS write boundary so witness, journal, quota and lease
 The baseline contract does not require DAX; a requested DAX capability cannot be advertised
 until mapping isolation, pinning and teardown have been established for that VMM.
 
+The same capability serves a **same-kernel** consumer — a host process, or a container or pod that shares the
+daemon's kernel — with no virtual machine and no copy (A-135). The content arena's pages are the same pages a guest
+reaches through DAX; a local reader `mmap`s them directly. The agent's volume is always co-located with the agent
+(its arena DRAM is on the agent's own machine, §4.1), so this path is always physically available; it is negotiated
+at connect, never configured (R8, no mode switch): the daemon offers the direct map only to a peer the rendezvous
+authenticated as the **same uid** (`SO_PEERCRED`, §4.7) — its own trust domain, a peer that may read the bytes
+through the mount regardless, so the map discloses nothing the peer is not already entitled to. A different-uid or
+sandboxed peer, and any peer the platform cannot pass a descriptor to, reads through the copy path (the bulk region,
+§4.7) or through virtio-fs DAX; the consumer always has a correct read, and the zero-copy upgrade is taken only where
+it is both safe and physically possible. Mechanism: the client requests a read-only map over the command ring; the
+daemon mints the read mapping (`Volume::dax_map_read` — the block pinned in the arena, the version pinned for the
+map's life, the sub-file tail scrubbed) and sends the arena block's descriptor (`Store::dax_backing`) with the mapping
+id, the block offset and the file length over the retained control socket by `SCM_RIGHTS` (the command ring cannot
+carry a descriptor; §4.7). The client maps the descriptor for the file's page span; the sub-file tail reads zero; no
+arena byte is copied (the bulk-region copy counter, a non-vacuity counter, stays zero on this path). Coherence differs
+from a guest in one way and is correct without trusting the peer: the daemon cannot force-unmap a local process as a
+VMM force-unmaps a guest window, so the version a live local map pins is held until the client drops the map — the
+immutable block it reads is never reused or scrubbed under it, so a stale read cannot occur; on
+`advance`/`write`/`truncate` the new bytes are a new version the client sees on its next lookup and re-maps (the
+ordinary semantics of a map that outlives a replaced file), the old version released when the last map drops (§4.6
+pin, D-26 retention). A writable local map, if ever offered, goes through the VFS write boundary exactly as the
+guest's opt-in writable DAX (§4.6 L0). Reaching a consumer in a *separate* namespace (an OCI container, a k8s pod)
+needs the descriptor-passing channel to cross that namespace — the pathname-rendezvous question recorded in GAPS; the
+same-namespace host process is the first delivered case.
+
+> **Status (local zero-copy read / A-135, 2026-10-15).** **Built and proven end to end on x86_64 Linux.** A same-uid
+> client requests `MapRead` over the command ring; the daemon mints a read mapping (`Volume::dax_map_read`) and sends
+> the arena block's descriptor (`Store::dax_backing`) with its metadata over the retained control socket by
+> `SCM_RIGHTS` (`crates/ipc/src/rendezvous.rs` `Control::send_mapping`/`Liveness::recv_mapping`,
+> `ClientEnd::recv_mapping`); the client `mmap`s it (`Client::map_read` → `MappedRead`, `crates/client/src/client.rs`).
+> The server path is `crates/server/src/merge_service.rs` (`map_read`/`try_local_map`): the `SO_PEERCRED` same-uid
+> gate, then `dax_map_read` + `dax_backing`, else the copy path (`read`), so the client always gets its bytes; the
+> zero-copy upgrade is counted (`dax.local_map`, a non-vacuity counter). Proven by use in
+> `crates/client/tests/client.rs` `a_same_kernel_client_maps_a_file_with_no_copy`: a one-shard daemon, a 20 KiB
+> arena-backed file, mapped zero-copy with the bytes equal byte for byte. The whole A-135 client path is `cfg(unix)`;
+> a non-Unix `MapRead` reads by copy. This path's first real descriptor map surfaced and fixed a latent arena bug —
+> `block_backing` returned a region-relative offset against the whole-object descriptor, which would have mis-mapped
+> the guest DAX window too (`docs/bugs/2026-10-15-block-backing-returned-a-region-relative-offset.md`). **Owed:** the
+> cross-shard owner→home descriptor hand-off (a `MapRead` whose volume is owned by another shard copies rather than
+> maps for now); an explicit release on the client's drop (the daemon unpins the version on client disconnect today);
+> and the macOS control socket (macOS carries refusing `send_mapping`/`recv_mapping` stubs, so it reads by copy).
+
 > **Status (DAX gate, 2026-10-12).** Mapping isolation, pinning and teardown are **built in the VFS** and proven by
 > use (`crates/vfs/src/dax.rs`, `crates/vfs/tests/dax.rs`, 21 tests; `crates/mem/src/arena.rs` pin set, 6 tests,
 > Miri-clean; recovery oracle 39/0). **Pinning:** a mapped block is pinned in the arena
@@ -11477,3 +11519,11 @@ Status: built 2026-10-11.
     the loaded VM (6.4 ms at 100k over 793 steps), not an algorithmic step — per-unit instrumentation found no O(n) unit.
 - **Owed:** the start's `close_dirs` and the end's listing invalidation are O(open dirs)/O(dirs), not O(entries), and
   stay one unit each (bounded by the delta's directories, as the sweep and sync phases are).
+
+### A-135 — A same-kernel client reads a file with no copy, the direct-map sibling of guest DAX (accepted 2026-10-15)
+Applied in the same change to: §4.6 (the same-kernel direct map paragraph + its status), GAPS, `crates/ipc` (rendezvous, endpoint), `crates/mem` (shared, region, arena), `crates/server` (protocol, verbs, merge_service), `crates/client` (client, Cargo.toml, tests), `unsafe-budget.toml`, `docs/bugs/2026-10-15-block-backing-returned-a-region-relative-offset.md`.
+- Adds §4.6: the content arena's pages serve a same-kernel consumer (a host process, an OCI container, a k8s pod) with no VM and no copy — the non-VM sibling of virtio-fs DAX, for the same arena blocks. Offered only to a same-uid (`SO_PEERCRED`) peer, the daemon's own trust domain, the block's descriptor passed over the retained control socket by `SCM_RIGHTS`; a different-uid/sandboxed peer, a non-plain/non-head view, a path with no shared-object backing, or a cross-shard volume reads by copy, so the consumer always gets its bytes.
+- Coherence is cooperative (the daemon cannot force-unmap a local process as a VMM force-unmaps a guest window): the pinned immutable version is held until the client drops the map, so a stale read cannot occur; on `advance`/`write` the new bytes are a new version the client re-maps (ordinary mmap-after-replace semantics).
+- Realized: `RequestBody::MapRead`/`ReplyBody::Mapped`; `Control::send_mapping`/`Liveness::recv_mapping`/`ClientEnd::recv_mapping`; `Volume::dax_map_read` + `Store::dax_backing` reused; `merge_service::map_read`/`try_local_map`; `Client::map_read` → `MappedRead`. Proven end to end on x86_64 Linux (`a_same_kernel_client_maps_a_file_with_no_copy`).
+- Fixes a latent arena bug the first real descriptor map surfaced: `ChunkArena::block_backing` returned a region-relative offset against the whole-object descriptor, which would have mis-mapped the guest DAX window too; `ExclusiveObject`/`Region`/`block_backing` now return the descriptor-absolute offset (`base + extent.offset()`).
+- Does not change: the guest DAX gate's own contract (still unadvertised, Ada-gated); the copy transport (the universal base); the single-binary model (no VMM embedded). Owed: the cross-shard owner→home descriptor hand-off; an explicit release on the client's drop; the macOS control socket (stubs refuse → copy).

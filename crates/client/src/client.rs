@@ -325,6 +325,110 @@ struct EditChain {
   offset: usize,
 }
 
+/// A file's bytes delivered to a same-kernel client (§4.6, A-135): mapped directly from the daemon's
+/// arena with no copy where the daemon could (the common case), or the daemon's copy where it could not
+/// (a different trust domain, no shared-object backing, a cross-shard volume). Either way
+/// [`MappedRead::bytes`] is the file's authorized bytes. A direct mapping is unmapped when this value
+/// drops; the daemon keeps the version pinned until the client disconnects (an explicit release is owed).
+#[cfg(unix)]
+pub struct MappedRead {
+  inner: Mapped,
+}
+
+#[cfg(unix)]
+enum Mapped {
+  /// Zero-copy: `ptr` maps `map_len` whole read-only pages of the arena block; the file is its first
+  /// `file_len` bytes. `_fd` keeps the backing object alive while the mapping lives.
+  Zero {
+    ptr: *mut core::ffi::c_void,
+    map_len: usize,
+    file_len: usize,
+    _fd: std::os::fd::OwnedFd,
+  },
+  /// The daemon's copy (the fallback).
+  Copied(Vec<u8>),
+}
+
+#[cfg(unix)]
+impl MappedRead {
+  /// The file's bytes — a borrow into the mapped arena block, or into the copied buffer.
+  #[must_use]
+  pub fn bytes(&self) -> &[u8] {
+    match &self.inner {
+      Mapped::Zero { ptr, file_len, .. } => {
+        // SAFETY: `ptr` begins `map_len` ≥ `file_len` bytes the daemon mapped read-only from the arena
+        // block it authorized (§4.6, A-135). The bytes are immutable, pinned content and the backing
+        // descriptor is held in `_fd`, so the range stays valid and unchanging for this borrow.
+        unsafe { std::slice::from_raw_parts(ptr.cast::<u8>(), *file_len) }
+      }
+      Mapped::Copied(bytes) => bytes,
+    }
+  }
+
+  /// Whether the bytes were mapped directly (zero-copy) rather than copied — a test's non-vacuity check.
+  #[must_use]
+  pub fn is_zero_copy(&self) -> bool {
+    matches!(self.inner, Mapped::Zero { .. })
+  }
+
+  /// The copy fallback: the daemon served the bytes.
+  fn copied(bytes: Vec<u8>) -> MappedRead {
+    MappedRead {
+      inner: Mapped::Copied(bytes),
+    }
+  }
+
+  /// Maps the delivered arena block read-only at its page-aligned offset, covering the file's pages.
+  fn map(
+    delivery: slates_ipc::rendezvous::MappingDelivery,
+    region_off: u64,
+    file_len: u64,
+  ) -> Result<MappedRead, ClientError> {
+    let block = delivery.block;
+    let page = rustix::param::page_size().max(1);
+    let file_len = usize::try_from(file_len).unwrap_or(0);
+    let map_len = file_len.div_ceil(page).saturating_mul(page).max(page);
+    // SAFETY: a read-only, shared mapping of the daemon-provided backing object at the page-aligned
+    // block offset for `map_len` whole pages; the kernel validates the range against the object, and
+    // `block` is moved into the returned value so the mapping stays backed for its life.
+    let ptr = unsafe {
+      rustix::mm::mmap(
+        core::ptr::null_mut(),
+        map_len,
+        rustix::mm::ProtFlags::READ,
+        rustix::mm::MapFlags::SHARED,
+        &block,
+        region_off,
+      )
+    }
+    .map_err(|error| {
+      ClientError::Ipc(IpcError::OsRefused {
+        call: "mmap",
+        code: Some(error.raw_os_error()),
+      })
+    })?;
+    Ok(MappedRead {
+      inner: Mapped::Zero {
+        ptr,
+        map_len,
+        file_len,
+        _fd: block,
+      },
+    })
+  }
+}
+
+#[cfg(unix)]
+impl Drop for MappedRead {
+  fn drop(&mut self) {
+    if let Mapped::Zero { ptr, map_len, .. } = &self.inner {
+      // SAFETY: `ptr`/`map_len` are exactly the region `map` mapped; unmapping releases this process's
+      // view. A failure is unrecoverable in a drop and leaves only this view behind.
+      let _unmapped = unsafe { rustix::mm::munmap(*ptr, *map_len) };
+    }
+  }
+}
+
 /// Maps a decoded reply body to a result: a refusal becomes the typed error, any other body passes
 /// through — the same rule [`Client::exchange`] applies to a synchronous reply.
 fn resolved(body: ReplyBody) -> Result<ReplyBody, ClientError> {
@@ -769,6 +873,51 @@ impl Client {
       return slates_ipc::status::collect(capacity, |request| self.call_plain(request));
     }
     self.call_plain(body)
+  }
+
+  /// A-135: read a file's bytes with no copy where the daemon can map them for this same-kernel client,
+  /// else the daemon's copy — either way [`MappedRead::bytes`] is the file's bytes. The daemon mints a
+  /// read mapping and sends the arena block's descriptor over the control socket; this maps it. The
+  /// mapping is released when the returned [`MappedRead`] is dropped (the daemon pins the version until
+  /// the client disconnects; an explicit release is owed).
+  #[cfg(unix)]
+  pub fn map_read(&mut self, volume: VolumeId, path: &str) -> Result<MappedRead, ClientError> {
+    let reply = self.call(&RequestBody::MapRead {
+      volume,
+      path: path.to_owned(),
+      at: ReadAt::Head,
+    })?;
+    match reply {
+      ReplyBody::Mapped {
+        region_off,
+        file_len,
+        ..
+      } => {
+        let delivery = self.recv_delivery()?;
+        MappedRead::map(delivery, region_off, file_len)
+      }
+      ReplyBody::ReadBytes { bytes } => Ok(MappedRead::copied(bytes)),
+      ReplyBody::Refused { refusal } => Err(ClientError::Refused(refusal)),
+      _ => Err(ClientError::UnexpectedReply { verb: "map_read" }),
+    }
+  }
+
+  /// Receives the arena block's descriptor the daemon sent over the control socket for a `MapRead`
+  /// (§4.6, A-135). The daemon sends it before the ring reply just read, so it is already waiting; the
+  /// loop only covers a kernel that makes the socket readable a scheduling tick after the ring slot,
+  /// bounded by the client's existing reply deadline (no new timeout).
+  #[cfg(unix)]
+  fn recv_delivery(&self) -> Result<slates_ipc::rendezvous::MappingDelivery, ClientError> {
+    let start = Instant::now();
+    loop {
+      if let Some(delivery) = self.end.recv_mapping().map_err(ClientError::Ipc)? {
+        return Ok(delivery);
+      }
+      if elapsed_ns(start) > self.deadlines.reply_ns {
+        return Err(ClientError::Ipc(IpcError::DeadlineExceeded));
+      }
+      std::thread::yield_now();
+    }
   }
 
   /// The highest sequence the client may acknowledge now: everything it has received, unless a verb

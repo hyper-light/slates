@@ -367,6 +367,19 @@ impl ClientEnd {
     self.liveness.as_ref().is_none_or(|l| l.daemon_gone())
   }
 
+  /// Receives a content-map delivery the daemon sent over the control socket (§4.6, A-135), or `None`
+  /// if none is waiting (or this end has no control socket). Non-blocking; the arena block's descriptor
+  /// arrives by `SCM_RIGHTS` with its metadata.
+  #[cfg(unix)]
+  pub fn recv_mapping(
+    &self,
+  ) -> Result<Option<crate::rendezvous::MappingDelivery>, crate::error::IpcError> {
+    match self.liveness.as_ref() {
+      Some(liveness) => liveness.recv_mapping(),
+      None => Ok(None),
+    }
+  }
+
   /// The region.
   pub fn region(&self) -> &ClientRegion {
     &self.region

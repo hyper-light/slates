@@ -158,6 +158,103 @@ fn attach_status_detach(client: &mut Client, id: slates_client::VolumeId) {
   assert_eq!(client.status(id).unwrap().lease_epoch, None);
 }
 
+/// AC-A-135 (§4.6 the same-kernel direct map): a same-kernel client reads a file with no copy. Do: a
+/// one-shard daemon (so the volume's owner shard is the client's home shard), write an arena-backed file
+/// into a plain volume, then `map_read` it. Expect: the bytes equal what was written, and the read was
+/// zero-copy — `is_zero_copy` proves the mapping path fired rather than the copy fallback (the
+/// non-vacuity check: a dead map path would silently fall back to a copy and this would be false).
+#[cfg(unix)]
+#[test]
+fn a_same_kernel_client_maps_a_file_with_no_copy() {
+  let profile = profile();
+  let instance = format!("cl-dax-{}", std::process::id());
+  // One shard, so owner == home: the cross-shard owner→home descriptor hand-off is a later step.
+  let config = DaemonConfig::derive(&profile, &instance, Some(1));
+  let daemon = Daemon::start(
+    &profile,
+    config,
+    SegmentSource::Create {
+      name: format!("slates-seg-cl-dax-{}", std::process::id()),
+    },
+  )
+  .unwrap();
+  daemon
+    .bootstrap(true)
+    .expect("the fixture creates its local consensus group");
+  let mut client = connect(&instance);
+
+  let id = client.create(&scratch("dax")).unwrap();
+  // Large enough to live in the content arena as a shared-object-backed block (not held inline), so a
+  // same-kernel client can map it; one chunk, so one block.
+  let bytes: Vec<u8> = (0..(20usize << 10))
+    .map(|i| u8::try_from(i % 251).unwrap_or(0))
+    .collect();
+  let attached = client.attach(id, None, Intent::Write).unwrap();
+  client
+    .fs_write((id, attached.attachment), "/big.bin", &bytes, 0o644)
+    .unwrap();
+  client.detach(attached.attachment).unwrap();
+
+  let mapped = client.map_read(id, "/big.bin").unwrap();
+  assert!(
+    mapped.is_zero_copy(),
+    "a same-uid, single-shard, arena-backed read takes the zero-copy map, not the copy fallback"
+  );
+  assert_eq!(
+    mapped.bytes(),
+    bytes.as_slice(),
+    "the mapped bytes equal the written file, byte for byte"
+  );
+
+  client.destroy(id).unwrap();
+}
+
+/// AC-A-135 (cross-shard): on a multi-shard daemon a client maps files whose owner shard may not be its
+/// home shard; it must always get the correct bytes — zero-copy where the volume is local, a copy where
+/// it is owned by another shard (the descriptor cannot cross shards yet). Several volumes spread across
+/// the two shards by id hash, so at least one is owned by the shard the client did not connect to, which
+/// exercises the forwarded path (without the fix a `MapRead` there returns `NotFound` and the client errors).
+#[cfg(unix)]
+#[test]
+fn a_client_maps_files_across_shards_and_always_gets_the_bytes() {
+  let profile = profile();
+  let instance = format!("cl-daxx-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile, &instance, Some(2));
+  let daemon = Daemon::start(
+    &profile,
+    config,
+    SegmentSource::Create {
+      name: format!("slates-seg-cl-daxx-{}", std::process::id()),
+    },
+  )
+  .unwrap();
+  daemon
+    .bootstrap(true)
+    .expect("the fixture creates its local consensus group");
+  let mut client = connect(&instance);
+
+  for n in 0..6u8 {
+    let id = client.create(&scratch(&format!("daxx-{n}"))).unwrap();
+    // A small file (its copy-fallback reply fits the bulk area on a multi-shard daemon); the cross-shard
+    // case is about the client always getting its bytes, not about zero-copy.
+    let bytes: Vec<u8> = (0..200usize)
+      .map(|i| u8::try_from((i + usize::from(n)) % 251).unwrap_or(0))
+      .collect();
+    let attached = client.attach(id, None, Intent::Write).unwrap();
+    client
+      .fs_write((id, attached.attachment), "/f.bin", &bytes, 0o644)
+      .unwrap();
+    client.detach(attached.attachment).unwrap();
+    let mapped = client.map_read(id, "/f.bin").unwrap();
+    assert_eq!(
+      mapped.bytes(),
+      bytes.as_slice(),
+      "volume {n}: the bytes are correct whether the map was zero-copy (local) or a copy (cross-shard)"
+    );
+    client.destroy(id).unwrap();
+  }
+}
+
 /// The typed verbs over the rings: create, the duplicate refused, snapshot, clone, attach
 /// with the lease, status, list, detach, resize, destroy, acknowledge.
 #[test]

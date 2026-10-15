@@ -6155,6 +6155,21 @@ its own page table and never calls the daemon), so the defense had to be at the 
   aligned map where the host page (16 KiB here) exceeds DAX_PAGE. Proven red-first by
   `a_setupmapping_of_the_block_padding_past_the_file_is_refused` (`crates/bridge-virtiofs/tests/device.rs`); device 28
   / vfs dax 43 / admission 11 / serve 5 green, clippy `-D warnings` + `cargo xtask check` clean.
+- **Local zero-copy read (A-135) — BUILT + proven end to end on x86_64 Linux (2026-10-15).** A same-kernel, same-uid
+  (`SO_PEERCRED`) client reads a file with no copy: `MapRead` over the ring → the daemon mints a read mapping and
+  sends the arena block's descriptor over the retained control socket by `SCM_RIGHTS` → the client `mmap`s it
+  (`crates/ipc` `Control::send_mapping`/`Liveness::recv_mapping`; `crates/server/src/merge_service.rs`
+  `map_read`/`try_local_map`; `crates/client/src/client.rs` `map_read`/`MappedRead`). A non-same-uid peer, a
+  non-plain/non-head view, a path with no shared-object backing, or a volume whose owner shard is not the client's
+  home shard falls back to the copy path (`read`), so the client always gets its bytes; the zero-copy upgrade is a
+  non-vacuity counter (`dax.local_map`). Proven by use: `crates/client/tests/client.rs`
+  `a_same_kernel_client_maps_a_file_with_no_copy` (one-shard daemon, 20 KiB arena-backed file, mapped zero-copy,
+  bytes equal). `cfg(unix)`; a non-Unix `MapRead` reads by copy. The first real descriptor map surfaced and fixed a
+  latent arena bug — `block_backing` returned a region-relative offset against the whole-object descriptor, which
+  would have mis-mapped the guest DAX window too (`docs/bugs/2026-10-15-block-backing-returned-a-region-relative-offset.md`).
+  **Owed:** the cross-shard owner→home descriptor hand-off (a cross-shard `MapRead` copies, not maps, for now); an
+  explicit release on the client's drop (the daemon unpins the version on client disconnect today); the macOS
+  control socket (macOS carries refusing `send_mapping`/`recv_mapping` stubs, so it reads by copy).
 - **Directory-window coherence — decided point-in-time (not an open design call).** A directory DAX window
   (`dax_map_dir`, the READDIR/READDIRPLUS snapshot) is a point-in-time view the guest re-maps to refresh, and that
   is correct, not an owed revoke: POSIX/NFS `readdir` guarantees no consistent snapshot across concurrent mutations

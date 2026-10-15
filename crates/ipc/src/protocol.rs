@@ -636,6 +636,18 @@ pub enum RequestBody {
     /// The most bytes wanted.
     max: u64,
   },
+  /// Map a file's bytes read-only into a same-kernel client's address space, zero-copy (§4.6, A-135):
+  /// the daemon mints a read mapping and hands the arena block's descriptor over the control socket; the
+  /// client `mmap`s it. Offered only to a same-uid peer the platform can pass a descriptor to; any other
+  /// peer reads through `ReadRange` instead. A read; never recorded. Appended.
+  MapRead {
+    /// The volume.
+    volume: VolumeId,
+    /// The file.
+    path: String,
+    /// The view.
+    at: ReadAt,
+  },
 }
 
 /// A concrete quorum-loss recovery proposal (§4.8). It identifies the retained copy and the
@@ -1139,6 +1151,7 @@ impl RequestBody {
       | RequestBody::Pin { volume, .. }
       | RequestBody::AwaitPlaced { volume, .. }
       | RequestBody::Read { volume, .. }
+      | RequestBody::MapRead { volume, .. }
       | RequestBody::ReadRange { volume, .. }
       | RequestBody::ReadWindow { volume, .. }
       | RequestBody::ReadDir { volume, .. }
@@ -2830,6 +2843,20 @@ pub enum ReplyBody {
   FsDone {
     /// The changed object's size after the verb (a written file's length; 0 for a removal or a directory).
     size: u64,
+  },
+  /// A read-only content map was established for a same-kernel client (§4.6, A-135): its metadata. The
+  /// arena block's descriptor arrives separately over the control socket; the client `mmap`s it at
+  /// `region_off` for the file's page span and reads `file_len` bytes (the sub-file tail reads zero).
+  /// Appended.
+  Mapped {
+    /// The daemon-minted mapping id, named by the later release.
+    mapping_id: u64,
+    /// The block's byte offset within its backing object.
+    region_off: u64,
+    /// The file's authorized length.
+    file_len: u64,
+    /// The block's length (its buddy size).
+    block_len: u64,
   },
 }
 

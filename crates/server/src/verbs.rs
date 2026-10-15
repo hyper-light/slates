@@ -3404,6 +3404,9 @@ fn dispatch_inner(
     RequestBody::Read { volume, path, at } => {
       crate::merge_service::read(state, principal, volume, &path, at)
     }
+    RequestBody::MapRead { volume, path, at } => {
+      crate::merge_service::map_read(state, client_id, principal, volume, &path, at)
+    }
     RequestBody::ReadRange {
       volume,
       path,

@@ -147,21 +147,30 @@ fn block_backing_exposes_a_shared_regions_fd_and_none_for_a_private_one() {
   let mut arena = ChunkArena::new(PAGE);
   // SAFETY: this test is the object's only mapper, and the object declares no words.
   arena
-    .add_region(Region::shared(unsafe { ExclusiveObject::new(object) }, PAGE))
+    .add_region(Region::shared(
+      unsafe { ExclusiveObject::new(object) },
+      PAGE,
+    ))
     .unwrap();
   let extent = arena.alloc(PAGE).unwrap();
 
   let (fd, off, len) = arena
     .block_backing(extent)
     .expect("a shared-object region exposes its backing fd for the DAX window");
-  assert_eq!(off, extent.offset(), "the offset is the block's offset within the object");
+  assert_eq!(
+    off,
+    extent.offset(),
+    "the offset is the block's offset within the object"
+  );
   assert_eq!(len, extent.len(), "the length is the block's length");
   assert!(fd.as_raw_fd() >= 0, "a live descriptor is handed back");
   arena.free(extent).unwrap();
 
   // A private (anonymous) region has no descriptor, so no DAX fd.
   let mut private = ChunkArena::new(PAGE);
-  private.add_region(Region::map(LEN, PAGE, false).unwrap()).unwrap();
+  private
+    .add_region(Region::map(LEN, PAGE, false).unwrap())
+    .unwrap();
   let anon = private.alloc(PAGE).unwrap();
   assert!(
     private.block_backing(anon).is_none(),
