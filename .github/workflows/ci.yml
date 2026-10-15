@@ -427,6 +427,17 @@ jobs:
           WINFSP_LIB: C:\Program Files (x86)\WinFsp\lib
           WINFSP_TEST_MOUNT: "1"
         run: cargo test -p slates-bridge-winfsp --test mount -- --nocapture
+      # Windows hermeticity tracer leg (AUD-29-42, the Windows leg owed): prove the ETW capture mechanism
+      # on the real runner and surface `tracerpt`'s real output, so the parser (`parse_etw`) is built
+      # against a real vector, not a guessed format — the way the Linux leg records with `strace` and
+      # macOS with `eslogger`. Probe only (gated `SLATES_ETW_CAPTURE=1`); the live hermeticity lane
+      # follows once the parser and a traced Windows lifecycle are wired.
+      - name: Windows ETW capture probe (hermeticity leg)
+        if: ${{ !cancelled() }}
+        timeout-minutes: 10
+        env:
+          SLATES_ETW_CAPTURE: "1"
+        run: cargo test -p slates-conformance --test etw_windows -- --nocapture
 
   # D-20: instruction-count gates. callgrind counts are deterministic for a given binary, so
   # they see the one-percent change the wall clock cannot. valgrind is non-Rust tooling, admitted
