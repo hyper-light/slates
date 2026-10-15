@@ -6186,22 +6186,37 @@ its own page table and never calls the daemon), so the defense had to be at the 
     completes the snapshot, so a bounded recall (revoke the window if the device does not drain within a lease, as a
     delegation is revoked on lapse) is the companion hardening. A through-the-client e2e needs a live writable
     window, advertisement-gated like all DAX e2e.
-  - **advance/takeover/landing** (`dax_revoke_block`) is **unwired — and, investigated, unneeded for the realistic
-    design** (not owed wiring): a **read** DAX mapping **pins its version** (§4.6/§4.2 retention, SLATES_DESIGN.md:199;
-    "Destroy/revoke releases credits only after … mappings"), so an advance retains the pinned version and the guest
-    reads it validly, never a stale-dangling block — no revoke needed; a **write**-advance changes content through the
-    write path, which already revokes (`dax_revoke_inode`, step-5); **migration** (L2 `dax_migrate`) does its own
-    two-phase revoke+remap; **takeover** starts the successor with **no** mappings (the dead owner's guests die with
-    it — host-local registry), so there is nothing to recall; and **landing** reads content out to disk without moving
-    the arena block. So `dax_revoke_block` is a defensive entry for a block genuinely *moved/reclaimed* under a live
-    window — a case the realistic paths do not create. If a future path does move a mapped block, it uses the
-    now-built writable recall pattern (enqueue + `request_revoke_writable_inode`/`request_revoke_inode` + kick).
+  - **advance — revoke on the moving reader is BUILT (2026-10-15, a7f317af); takeover/landing need no revoke.** An
+    earlier note here called advance-revoke "unneeded," reasoning that a read mapping pins its version so the guest
+    "reads it validly and re-maps." **That reasoning was wrong and is corrected.** The DAX client is an unmodified
+    guest kernel that speaks only FUSE and never sees slates' control-plane `advance`, so it would keep its old
+    page-table windows and read the *old* snapshot's bytes for the changed files with no signal to re-map — exactly
+    the "old names with new bytes" the body forbids (SLATES_DESIGN.md:1534) and the revoke the body requires "before …
+    `advance` completes" (SLATES_DESIGN.md:2650). Lazy is not a cheaper equivalent; it is a stale-read bug for the only
+    client DAX has. So `advance` now kicks the advancing attachment's own device (`virtiofs::kick_volume_devices` from
+    `snapshot_view::advanced`), which re-validates its windows against the new view (`Device::revalidate_windows` →
+    `Bridge::dax_window_current` → `Volume::dax_still_current`) and tears only the windows whose content block the new
+    view no longer holds — the changed inodes — keeping every window onto unchanged, block-shared content; a device
+    whose view did not move tears nothing (the volume-wide kick is self-scoping), and the cost is proportional to the
+    real delta (`paths_changed_between`), on a rare control-plane re-pin, never a per-op path. Proven:
+    `an_advance_revalidate_tears_the_stale_window_and_keeps_the_current_one` (`bridge-virtiofs/tests/device.rs`). The
+    **sibling** paths genuinely need no revoke, and that part of the earlier analysis stands: a **write**-advance
+    changes content through the write path, which already revokes (`dax_revoke_inode`, step-5); **migration** (L2
+    `dax_migrate`) does its own two-phase revoke+remap; **takeover** starts the successor with **no** mappings (the
+    dead owner's guests die with it — host-local registry); and **landing** reads content out to disk without moving
+    the arena block. `dax_revoke_block` remains the defensive primitive for a block genuinely *moved/reclaimed* under a
+    live window; a future path that moves a mapped block uses the writable recall pattern (enqueue +
+    `request_revoke_writable_inode`/`request_revoke_inode` + kick).
 
 **Owed before DAX is advertised (the next steps):**
 
-1. **Wire the gate to the virtio-fs device seam** (`crates/server/src/virtiofs.rs`): the device maps through
-   `dax_map_*` on an authenticated admission and revokes through `dax_revoke_*` on detach and on `advance` (a version
-   move). Until then DAX stays unadvertised and a request is refused `AttachmentUnsupported`.
+1. **Wire the gate to the virtio-fs device seam** (`crates/server/src/virtiofs.rs`). **The teardown half is built
+   (2026-10-14/15):** the device serves SETUPMAPPING/REMOVEMAPPING over a real cache window and revokes through
+   `dax_revoke_*` on write/truncate (step-5), on `snapshot`/clone (the writable recall), on detach
+   (`Device::release_dax`) and on `advance` (`Device::revalidate_windows`, a7f317af — see the advance bullet above).
+   **Owed:** the *map* half — accepting DAX at FUSE_INIT admission and mapping through `dax_map_*` — is deliberately
+   withheld with step 4 (advertise) until step 2 (the tamper-proof/fleet registry) lands; until then DAX stays
+   unadvertised and a request is refused `AttachmentUnsupported`.
 
 2. **Make the registry un-fabricable and tamper-proof, including across the fleet.** No agent may interfere with,
    fabricate or tamper with the registry. The design, given slates' distributed nature:

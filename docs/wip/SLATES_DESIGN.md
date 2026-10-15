@@ -2729,6 +2729,28 @@ until mapping isolation, pinning and teardown have been established for that VMM
 >    broker trigger into the device loop is the owed step; the L0/L2/B2 primitives are built and proven by use in
 >    `crates/vfs/tests/dax.rs`.
 
+> **Status (DAX device-seam wiring, 2026-10-15).** The device side of the gate is built against the in-process
+> virtio-fs seam and proven by a simulated guest (no KVM): `crates/bridge-virtiofs` serves a real
+> SETUPMAPPING/REMOVEMAPPING over a `DaxCacheRegion` (the VMM cache fd overlaid with `MAP_FIXED`), and the three
+> teardown obligations the body states ("mappings must be revoked before reuse or `advance` completes") are wired to
+> the VFS and ride the production serve loop. (1) A write or truncate of a mapped inode enqueues a two-phase revoke
+> the device drains before the block is unpinned (munmap before unpin). (2) `snapshot`/clone recalls the volume's
+> *writable* windows before it freezes a shared block, refusing retryable until the device has drained. (3) **`advance`
+> revokes on the moving reader**, as the attachment lifecycle requires ("`advance` … invalidates old caches/mappings …
+> cannot combine old names with new bytes"): the advancing attachment's own device re-validates its windows against the
+> now-current view (`Device::revalidate_windows` → `Bridge::dax_window_current` → `Volume::dax_still_current`) and
+> tears only those whose content block the new view no longer holds — the changed inodes — keeping every window onto
+> unchanged, block-shared content; a device whose view did not move tears nothing, so the volume-wide kick from
+> `snapshot_view::advanced` (`virtiofs::kick_volume_devices`) is self-scoping. This is eager by necessity, not taste:
+> the DAX client is an unmodified guest kernel that speaks only FUSE and never sees the control-plane `advance`, so a
+> lingering window would surface the old snapshot's bytes through the guest's own page table with no signal to re-map —
+> a stale cross-version read only the host can prevent. The teardown is proportional to the real delta
+> (`paths_changed_between`), on a rare control-plane re-pin, never a per-op cost. All of this is a no-op in production
+> while DAX stays unadvertised (the FUSE_INIT flag is withheld until the tamper-proof/fleet registry and a DAX-capable
+> VMM are in place) and correct the moment it is advertised. Proven by use:
+> `an_advance_revalidate_tears_the_stale_window_and_keeps_the_current_one`, the step-5 and snapshot-recall cases
+> (`crates/bridge-virtiofs/tests/device.rs`), and `crates/vfs/tests/dax.rs`.
+
 > **Status (virtio-fs, 2026-09-13).** The owned FUSE-over-virtio device exists
 > (`crates/bridge-virtiofs`) and the daemon serves it on the volume's owning shard
 > (`crates/server/src/virtiofs.rs`): the split virtqueue is walked sans-io over a bounded
