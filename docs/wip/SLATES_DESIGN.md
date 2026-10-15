@@ -2749,7 +2749,11 @@ until mapping isolation, pinning and teardown have been established for that VMM
 > while DAX stays unadvertised (the FUSE_INIT flag is withheld until the tamper-proof/fleet registry and a DAX-capable
 > VMM are in place) and correct the moment it is advertised. Proven by use:
 > `an_advance_revalidate_tears_the_stale_window_and_keeps_the_current_one`, the step-5 and snapshot-recall cases
-> (`crates/bridge-virtiofs/tests/device.rs`), and `crates/vfs/tests/dax.rs`.
+> (`crates/bridge-virtiofs/tests/device.rs`), and `crates/vfs/tests/dax.rs`. The authorized window is the file's own
+> pages — `file_len` rounded up to the window granule (`DaxCacheRegion::page`), capped at the block — not the buddy
+> block's power-of-two padding, so a guest can never map a page lying entirely past its file
+> (`a_setupmapping_of_the_block_padding_past_the_file_is_refused`); the sub-file tail of the last page reads zero by
+> the map-time scrub, so the surface the host shares with a guest is the file's pages and no more.
 
 > **Status (virtio-fs, 2026-09-13).** The owned FUSE-over-virtio device exists
 > (`crates/bridge-virtiofs`) and the daemon serves it on the volume's owning shard

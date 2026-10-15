@@ -1262,11 +1262,22 @@ fn serve_dax(
         let _ = bridge.dax_unmap(&mapping, cx); // undo the pin (no window established yet)
         return err(dax_errno::EOPNOTSUPP, out);
       };
-      // Bound the requested file range to the block, and compute the object offset to map from.
+      // Bound the requested range to the file's authorized window — its own pages, not the arena block's power-of-two
+      // padding. The buddy allocator may round a block larger than the file needs (a 64 KiB block for a 33 KiB file),
+      // and §4.6 authorizes only the pages that cover the file (`Mapping::file_len`; the sub-file tail reads zero).
+      // Round the file length up to this window's granule (the host page, or the negotiated FUSE_MAP_ALIGNMENT) and
+      // cap at the block, so a guest can never map a whole page lying entirely past its file — the shared surface is
+      // minimal by bound, not only by the map-time tail scrub. `min(block_len)` keeps the physical block the floor.
+      let granule = cache.page().max(1);
+      let authorized = mapping
+        .file_len
+        .div_ceil(granule)
+        .saturating_mul(granule)
+        .min(block_len);
       let bound = usize::try_from(m.foffset)
         .ok()
         .and_then(|foffset| usize::try_from(m.len).ok().map(|len| (foffset, len)))
-        .filter(|&(foffset, len)| foffset.checked_add(len).is_some_and(|end| end <= block_len))
+        .filter(|&(foffset, len)| foffset.checked_add(len).is_some_and(|end| end <= authorized))
         .and_then(|(foffset, _)| region_off.checked_add(foffset))
         .and_then(|off| u64::try_from(off).ok());
       let Some(object_off) = bound else {

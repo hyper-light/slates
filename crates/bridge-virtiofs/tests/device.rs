@@ -1727,6 +1727,91 @@ fn a_setupmapping_past_the_window_is_refused() {
   drop(cache);
 }
 
+/// §4.6 multi-tenancy (adversarial: a guest maps the arena block's padding past its own file). The buddy allocator
+/// rounds a content block up to a power of two, so a file of two pages + 1 byte lives in a four-page block; the file
+/// authorizes only three pages (`Mapping::file_len` rounded up to the window granule), and the fourth page is padding
+/// the file never reaches. Do: opt in to writable DAX, write such a file, then SETUPMAPPING the whole four-page block.
+/// Expect: refused EINVAL and no window established — the authorized window is the file's pages, not the block's
+/// padding — while a map of exactly the authorized pages succeeds. So the guest's shared-memory window never covers a
+/// page lying entirely past its file, closed by bound (not only by the map-time tail scrub), keeping the surface the
+/// host shares with the guest minimal.
+#[cfg(unix)]
+#[test]
+fn a_setupmapping_of_the_block_padding_past_the_file_is_refused() {
+  use slates_mem::{SharedObject, Words};
+  let page = rustix::param::page_size().max(1);
+  let mut store = dax_shared_store(page, "pad");
+  let mut vol = volume(&mut store);
+  vol.enable_writable_dax();
+  let root = vol.root_inode(&store).unwrap();
+  let no = vol.create_file_no(&mut store, root, "f", 0o644).unwrap();
+  // Two pages + 1 byte: the buddy block rounds to four pages, the file authorizes three (rounded up to the granule).
+  let file_len = page * 2 + 1;
+  vol.write(&mut store, no, 0, &vec![0x44; file_len]).unwrap();
+  let nodeid = no.0;
+  let authorized = page * 3; // file_len rounded up to the page granule
+  let block = page * 4; // the next power of two of (two pages + 1 byte)
+
+  let (mut device, mut driver) = device_and_driver();
+  let region = (page * 4) as u64;
+  let cache = SharedObject::create(
+    &format!("sl-daxpad-{}", std::process::id()),
+    page * 4,
+    Words::new(),
+  )
+  .unwrap();
+  device.install_dax_window(Some(
+    slates_bridge_virtiofs::dax::DaxCacheRegion::new(cache.as_fd(), region).unwrap(),
+  ));
+  let cx = context();
+  let mut bridge = VolumeBridge::new(vid(), &mut vol, &mut store);
+  dax_exchange(
+    &mut device,
+    &mut driver,
+    &mut bridge,
+    &cx,
+    (Opcode::Init, 1, ROOT),
+    &dax_init_body(),
+  );
+
+  // The whole four-page block — its fourth page lies entirely past the file. Refused, nothing mapped.
+  let past = dax_exchange(
+    &mut device,
+    &mut driver,
+    &mut bridge,
+    &cx,
+    (Opcode::SetupMapping, 2, nodeid),
+    &dax_setup_body(0, block as u64, true, 0),
+  );
+  assert_eq!(
+    reply_error(&past),
+    -22,
+    "a map of the block padding past the file is refused EINVAL"
+  );
+  assert_eq!(
+    device.dax_window_count(),
+    0,
+    "nothing is mapped when the request reaches past the file's pages"
+  );
+
+  // Exactly the file's authorized pages. Succeeds.
+  let ok = dax_exchange(
+    &mut device,
+    &mut driver,
+    &mut bridge,
+    &cx,
+    (Opcode::SetupMapping, 3, nodeid),
+    &dax_setup_body(0, authorized as u64, true, 0),
+  );
+  assert_eq!(
+    reply_error(&ok),
+    0,
+    "a map of exactly the file's authorized pages succeeds"
+  );
+  assert_eq!(device.dax_window_count(), 1, "the authorized window is live");
+  drop(cache);
+}
+
 /// §4.6 (adversarial: a guest remaps a window slot). Do: opt in to writable DAX, map file A's block into window
 /// offset 0, then SETUPMAPPING file B's block into the SAME window offset 0 (a remap). Expect: the remap replaces A
 /// — one live window entry (not two), the window shows B's bytes, and after a later REMOVEMAPPING of offset 0 the

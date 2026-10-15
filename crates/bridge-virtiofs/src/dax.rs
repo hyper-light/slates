@@ -78,6 +78,14 @@ impl DaxCacheRegion {
     })
   }
 
+  /// The window's page granule — the multiple a map offset and length must align to (the host page here, or the VMM's
+  /// negotiated `FUSE_MAP_ALIGNMENT` for a message-based VMM). The device rounds a file's length up to it to bound the
+  /// authorized window, so a guest never maps a whole page that lies entirely past its file.
+  #[must_use]
+  pub fn page(&self) -> usize {
+    self.page
+  }
+
   /// The host address of a validated `[moffset, moffset+len)` sub-range of the window (for a `MAP_FIXED` overlay), with
   /// both bounds page-aligned and the range inside the window — else [`DaxCacheError::BadRange`]. The address is formed
   /// by `wrapping_add` (not dereferenced here; it is a syscall address argument) and stays within the reservation.

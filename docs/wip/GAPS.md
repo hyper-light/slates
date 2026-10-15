@@ -6144,6 +6144,17 @@ its own page table and never calls the daemon), so the defense had to be at the 
   inode→window index (revoke → O(windows-of-inode)) is **deferred, not premature-built**: the path is empty in
   production until DAX is advertised, and a positional index through `swap_remove` is error-prone; the optimization
   hierarchy says measure a real advertised guest's drain pattern first.
+- **Window authorized-bound hardening (2026-10-15, adversarial escape pass).** `serve_dax` bounded a SETUPMAPPING to
+  the arena block's power-of-two length, not the file's pages, so a guest could map a whole page of buddy padding past
+  its own file (a four-page block behind a two-page-plus-one file). No cross-tenant leak — the block is the guest's
+  own and all three map paths zero the tail `[file_len, block_end)` at map time — but the shared surface was larger
+  than the file warranted and rested on the scrub never regressing. Now the window is bounded to `file_len` rounded up
+  to the window's own granule (`DaxCacheRegion::page` — the host page, or a VMM's negotiated FUSE_MAP_ALIGNMENT),
+  capped at the block, so a page lying entirely past the file is refused EINVAL by bound, not only by the scrub. The
+  bound is granule-aware: a naive `page_span` (DAX_PAGE = 4 KiB) bound would wrongly reject a legitimate host-page-
+  aligned map where the host page (16 KiB here) exceeds DAX_PAGE. Proven red-first by
+  `a_setupmapping_of_the_block_padding_past_the_file_is_refused` (`crates/bridge-virtiofs/tests/device.rs`); device 28
+  / vfs dax 43 / admission 11 / serve 5 green, clippy `-D warnings` + `cargo xtask check` clean.
 - **Directory-window coherence — decided point-in-time (not an open design call).** A directory DAX window
   (`dax_map_dir`, the READDIR/READDIRPLUS snapshot) is a point-in-time view the guest re-maps to refresh, and that
   is correct, not an owed revoke: POSIX/NFS `readdir` guarantees no consistent snapshot across concurrent mutations
