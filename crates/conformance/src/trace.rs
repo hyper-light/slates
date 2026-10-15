@@ -1433,6 +1433,114 @@ pub fn parse_eslogger(log: &str) -> Vec<WriteEvent> {
   out
 }
 
+// --- Windows ETW (Microsoft-Windows-Kernel-File) ---------------------------------------------
+//
+// The Linux leg records with `strace` and the macOS leg with `eslogger`; the Windows leg records the
+// `Microsoft-Windows-Kernel-File` provider (`{EDD08927-9CC4-4E65-B970-C2560FB5C289}`) with the built-in
+// `logman` and dumps it with `tracerpt` (`crates/conformance/tests/etw_windows.rs` is the capture probe
+// that establishes the dump's real shape). This half — a decoded event stream to write events — is
+// independent of the dump's XML: a provider event names a file only when it opens or creates it, and
+// gives a later write just the file's handle, so the name is resolved across events through a handle
+// table (as `parse_fs_usage` resolves a descriptor). The XML-to-`EtwEvent` front end and the exact event
+// ids are finalized against the probe's dump before the live Windows lane is enabled.
+
+/// One `Microsoft-Windows-Kernel-File` event, decoded from a `tracerpt` dump into the fields the
+/// judgement needs: its 1-based position, its manifest event id, the process and time its `System` header
+/// carries, the file handle it references, and the name it carries when it is a name-bearing event.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EtwEvent {
+  /// The 1-based event position in the dump.
+  pub line: usize,
+  /// The provider's manifest event id.
+  pub id: u16,
+  /// The process that made the call (`System/Execution/@ProcessID`).
+  pub pid: Option<u32>,
+  /// When the call was made, nanoseconds since the Unix epoch (`System/TimeCreated/@SystemTime`).
+  pub at_ns: Option<u64>,
+  /// The file handle the event references: the `FileObject` on an open's operations (a write carries
+  /// only this), bound to a name by the create that opened it. The front end puts the field a write
+  /// shares with its create here, so binders and writers resolve in one handle space.
+  pub handle: Option<u64>,
+  /// The file's name, on the events that carry one (create, open, a rename's new path, a delete by path).
+  pub name: Option<String>,
+}
+
+/// Format: the Kernel-File event ids that bind a handle to a name — `NameCreate` (10), `Create`/open (12)
+/// and `CreateNewFile` (30) carry both a handle and a `FileName` (the provider manifest, evidence B;
+/// deployed ETW tooling that reads it, evidence C). Verified against the probe's dump before the live lane.
+const ETW_NAME_BINDERS: &[u16] = &[10, 12, 30];
+
+/// Format: the event ids that write to disk — `Write` (16) of file data, `SetInformation` (17, carrying
+/// `SetEndOfFile`, the truncate, and `SetAllocation`), `SetDelete` (18), `Rename` (19), `DeletePath` (26),
+/// `RenamePath` (27), `SetLinkPath` (28) and `CreateNewFile` (30, a file's creation). A read (15) and the
+/// query, directory and cleanup events are not writes. Verified against the probe's dump before the live lane.
+const ETW_WRITERS: &[u16] = &[16, 17, 18, 19, 26, 27, 28, 30];
+
+/// Format: the event id that frees a file handle (`Close`, 14), so a handle number the kernel reuses never
+/// borrows a closed file's name.
+const ETW_HANDLE_CLOSE: u16 = 14;
+
+/// A human name for a Kernel-File event id, for a `WriteEvent`'s call. An unknown id prints its number, so
+/// a classification gap is visible, never silent.
+fn etw_call_name(id: u16) -> String {
+  match id {
+    16 => "Write".to_owned(),
+    17 => "SetInformation".to_owned(),
+    18 => "SetDelete".to_owned(),
+    19 => "Rename".to_owned(),
+    26 => "DeletePath".to_owned(),
+    27 => "RenamePath".to_owned(),
+    28 => "SetLinkPath".to_owned(),
+    30 => "CreateNewFile".to_owned(),
+    other => format!("KernelFile{other}"),
+  }
+}
+
+/// The write-capable events a decoded Kernel-File stream contributes, each named through the handle table
+/// a name-bearing event filled. A write that names no handle the stream bound is kept with an unresolved
+/// path, never dropped, so a gap is a counted violation rather than silence.
+pub fn etw_write_events(events: &[EtwEvent]) -> Vec<WriteEvent> {
+  let mut names: HashMap<u64, String> = HashMap::new();
+  let mut out = Vec::new();
+  for decoded in events {
+    if ETW_NAME_BINDERS.contains(&decoded.id)
+      && let (Some(handle), Some(name)) = (decoded.handle, decoded.name.as_deref())
+    {
+      names.insert(handle, name.to_owned());
+    }
+    if ETW_WRITERS.contains(&decoded.id) {
+      let path = decoded
+        .name
+        .clone()
+        .or_else(|| {
+          decoded
+            .handle
+            .and_then(|handle| names.get(&handle).cloned())
+        })
+        .unwrap_or_else(|| {
+          format!(
+            "{UNRESOLVED_PREFIX}etw handle {:?} unnamed>",
+            decoded.handle
+          )
+        });
+      out.push(WriteEvent {
+        line: decoded.line,
+        call: etw_call_name(decoded.id),
+        path,
+        descriptor: None,
+        pid: decoded.pid,
+        at_ns: decoded.at_ns,
+      });
+    }
+    if decoded.id == ETW_HANDLE_CLOSE
+      && let Some(handle) = decoded.handle
+    {
+      names.remove(&handle);
+    }
+  }
+  out
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -1451,6 +1559,56 @@ mod tests {
     }
     assert!(fs_usage_has_activity(&format!("{read}\n")));
     assert!(parse_fs_usage(&format!("{read}\n")).is_empty());
+  }
+
+  /// R1 / AUD-29-42 (Windows leg): the Kernel-File correlation resolves a write's file through the handle
+  /// a create bound, names a rename by its own path, keeps an unbound write's path unresolved (never
+  /// dropped), and forgets a handle on close so a reused number cannot borrow a closed file's name. The
+  /// open binds but does not write, and a read is not a write.
+  #[test]
+  fn etw_writes_are_named_through_the_handle_a_create_bound() {
+    let ev = |line, id, handle: Option<u64>, name: Option<&str>| EtwEvent {
+      line,
+      id,
+      pid: Some(7),
+      at_ns: Some(1_000_001_000),
+      handle,
+      name: name.map(str::to_owned),
+    };
+    let target = r"C:\scratch\land-target\f.txt";
+    let renamed = r"C:\scratch\land-target\g.txt";
+    let events = vec![
+      ev(1, 12, Some(0xA), Some(target)), // Create: binds handle 0xA -> f.txt (an open, not a write)
+      ev(2, 16, Some(0xA), None),         // Write: no name -> resolves to f.txt through the table
+      ev(3, 17, Some(0xA), None),         // SetInformation (truncate): resolves to f.txt
+      ev(4, 19, Some(0xA), Some(renamed)), // Rename: carries its own new name -> g.txt
+      ev(5, 16, Some(0xB), None),         // Write on an unbound handle -> unresolved, not dropped
+      ev(6, 14, Some(0xA), None),         // Close 0xA: forgets the binding
+      ev(7, 16, Some(0xA), None),         // Write after close -> unresolved (no stale f.txt)
+      ev(8, 15, Some(0xA), None),         // Read: not a write, contributes nothing
+    ];
+    let writes = etw_write_events(&events);
+    let seen: Vec<(&str, &str)> = writes
+      .iter()
+      .map(|w| (w.call.as_str(), w.path.as_str()))
+      .collect();
+    assert_eq!(
+      seen,
+      vec![
+        ("Write", target),
+        ("SetInformation", target),
+        ("Rename", renamed),
+        ("Write", "<fd etw handle Some(11) unnamed>"),
+        ("Write", "<fd etw handle Some(10) unnamed>"),
+      ],
+      "the open binds but does not write, a read is not a write, and a closed handle's name is gone",
+    );
+    assert!(
+      writes
+        .iter()
+        .all(|w| w.pid == Some(7) && w.at_ns == Some(1_000_001_000) && w.descriptor.is_none()),
+      "every write carries its process and time for the authority and window checks",
+    );
   }
 
   const TARGET: &str = "/scratch/land-target";
