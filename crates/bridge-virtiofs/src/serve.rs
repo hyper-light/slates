@@ -332,6 +332,13 @@ async fn serve_round<S: VmmSeam, B: BridgeAccess>(
   // doorbell kick, then resume. Additive to the doorbell path below (unchanged): a loop with no kick falls straight
   // through to its doorbell wait.
   if take_drain_requested(id) {
+    // An `advance` kick (§4.6 "revoke on advance") rides the same flag: before the drain, re-validate this device's
+    // windows against its now-current view and tear any it no longer backs (the moved reader's stale windows), so
+    // the guest re-maps against the new view. A device whose view did not change finds all windows current, so a
+    // volume-wide kick is self-scoping. Best-effort hardening: if the attachment's authority has just lapsed, the
+    // pending drain and the terminal reclaim still cover teardown, and the pass below surfaces the lapse — so the
+    // result is folded into that pass, not lost.
+    let _revalidated = bridge.with_bridge(|b, registry| admitted.revalidate_windows(b, registry));
     return serve_until_idle(id, admitted, bridge, counters).await;
   }
   let raw = match admitted.doorbell() {
@@ -397,16 +404,28 @@ mod tests {
   fn a_kick_marks_the_loop_to_drain_once_and_is_distinct_from_revoke() {
     // A generous bound: this thread-local control map may hold loops from other tests sharing the thread.
     let id = register(1024).unwrap();
-    assert!(!take_drain_requested(id), "no drain is pending before a kick");
+    assert!(
+      !take_drain_requested(id),
+      "no drain is pending before a kick"
+    );
     assert!(kick(id), "the kick finds the registered loop");
-    assert!(take_drain_requested(id), "the kick marked the loop to drain");
+    assert!(
+      take_drain_requested(id),
+      "the kick marked the loop to drain"
+    );
     assert!(
       !take_drain_requested(id),
       "the drain request is one-shot — the take cleared it, so the loop drains once per kick"
     );
     assert!(!revoke_requested(id), "a kick drains; it does not revoke");
     assert!(request_revoke(id), "the same loop can be revoked");
-    assert!(revoke_requested(id), "revoke is its own flag, independent of the drain flag");
-    assert!(!kick(DeviceId(u64::MAX)), "a kick of a loop that does not run here is false");
+    assert!(
+      revoke_requested(id),
+      "revoke is its own flag, independent of the drain flag"
+    );
+    assert!(
+      !kick(DeviceId(u64::MAX)),
+      "a kick of a loop that does not run here is false"
+    );
   }
 }

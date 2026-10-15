@@ -81,7 +81,11 @@ impl DaxCacheRegion {
   /// The host address of a validated `[moffset, moffset+len)` sub-range of the window (for a `MAP_FIXED` overlay), with
   /// both bounds page-aligned and the range inside the window — else [`DaxCacheError::BadRange`]. The address is formed
   /// by `wrapping_add` (not dereferenced here; it is a syscall address argument) and stays within the reservation.
-  fn fixed_addr(&self, moffset: u64, len: u64) -> Result<(*mut core::ffi::c_void, usize), DaxCacheError> {
+  fn fixed_addr(
+    &self,
+    moffset: u64,
+    len: u64,
+  ) -> Result<(*mut core::ffi::c_void, usize), DaxCacheError> {
     let moffset = usize::try_from(moffset).map_err(|_| DaxCacheError::BadRange)?;
     let len = usize::try_from(len).map_err(|_| DaxCacheError::BadRange)?;
     if len == 0 || !moffset.is_multiple_of(self.page) || !len.is_multiple_of(self.page) {
@@ -120,7 +124,14 @@ impl DaxCacheRegion {
     // replaces only that sub-range (never memory outside the reservation); `fd` is the pinned content block's object,
     // valid and stable for this call and while the mapping lives. The reservation's `MmapMut` still owns the range.
     unsafe {
-      rustix::mm::mmap(addr, len, prot, MapFlags::SHARED | MapFlags::FIXED, fd, foffset)
+      rustix::mm::mmap(
+        addr,
+        len,
+        prot,
+        MapFlags::SHARED | MapFlags::FIXED,
+        fd,
+        foffset,
+      )
     }
     .map_err(|e| DaxCacheError::Host(e.raw_os_error()))?;
     self.mapped = self.mapped.saturating_add(1);
@@ -135,7 +146,12 @@ impl DaxCacheRegion {
     // SAFETY: as `map` — a page-aligned sub-range within the reservation; `MAP_FIXED | ANON` replaces it with a
     // private, inaccessible mapping, detaching the block's descriptor from the window. The reservation still owns it.
     unsafe {
-      rustix::mm::mmap_anonymous(addr, len, ProtFlags::empty(), MapFlags::PRIVATE | MapFlags::FIXED)
+      rustix::mm::mmap_anonymous(
+        addr,
+        len,
+        ProtFlags::empty(),
+        MapFlags::PRIVATE | MapFlags::FIXED,
+      )
     }
     .map_err(|e| DaxCacheError::Host(e.raw_os_error()))?;
     self.unmapped = self.unmapped.saturating_add(1);
@@ -235,7 +251,10 @@ mod tests {
       .copy_from_slice(b"HERE");
     let mut back = [0u8; 4];
     block.read(0, &mut back).unwrap();
-    assert_eq!(&back, b"HERE", "a write through the window reached the block");
+    assert_eq!(
+      &back, b"HERE",
+      "a write through the window reached the block"
+    );
 
     region.unmap(page as u64, page as u64).unwrap();
     assert_eq!(region.mapped(), 1, "one mapping established");
@@ -258,7 +277,13 @@ mod tests {
     );
     // Straddling the end.
     assert_eq!(
-      region.map((window - page) as u64, (2 * page) as u64, block.as_fd(), 0, false),
+      region.map(
+        (window - page) as u64,
+        (2 * page) as u64,
+        block.as_fd(),
+        0,
+        false
+      ),
       Err(DaxCacheError::BadRange)
     );
     // Unaligned offset.
@@ -273,6 +298,9 @@ mod tests {
     );
     assert_eq!(region.mapped(), 0, "nothing was mapped");
     // Unmap of an out-of-window range is refused too.
-    assert_eq!(region.unmap(window as u64, page as u64), Err(DaxCacheError::BadRange));
+    assert_eq!(
+      region.unmap(window as u64, page as u64),
+      Err(DaxCacheError::BadRange)
+    );
   }
 }

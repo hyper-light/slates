@@ -494,4 +494,13 @@ impl Bridge for ScopedBridge<'_> {
     // the windows it actually holds.
     self.inner.take_pending_dax_revokes()
   }
+
+  fn dax_window_current(&mut self, mapping: &slates_vfs::dax::Mapping, cx: &OpContext) -> bool {
+    // A window outside this scope is not this scoped guest's to validate (unreachable through its per-guest window
+    // table); treat it as not current so the device tears it.
+    if self.admit(ObjectId::new(mapping.inode.0, 0), cx).is_err() {
+      return false;
+    }
+    self.inner.dax_window_current(mapping, cx)
+  }
 }

@@ -212,7 +212,11 @@ impl DaxRegistry {
   /// prior true (a snapshot — writable windows only) for the same inode, since tearing all windows subsumes tearing
   /// the writable ones. Bounded by `cap` distinct inodes.
   fn enqueue_pending_revoke(&mut self, no: InodeNo, writable_only: bool) {
-    if let Some(entry) = self.pending_revokes.iter_mut().find(|(held, _)| *held == no) {
+    if let Some(entry) = self
+      .pending_revokes
+      .iter_mut()
+      .find(|(held, _)| *held == no)
+    {
       // `false` (all) wins: once any revoke needs every window, the drain must tear every window.
       entry.1 = entry.1 && writable_only;
     } else {
@@ -242,7 +246,10 @@ impl DaxRegistry {
   /// a live guest window. `false` when the queue holds nothing for the volume.
   #[must_use]
   pub fn has_pending_of_prefix(&self, prefix: u16) -> bool {
-    self.pending_revokes.iter().any(|(no, _)| no.prefix() == prefix)
+    self
+      .pending_revokes
+      .iter()
+      .any(|(no, _)| no.prefix() == prefix)
   }
 
   /// Whether any **writable** mapping of the volume `prefix` is still live (not yet revoke-pending). A snapshot/clone
@@ -427,12 +434,17 @@ impl Volume {
       for row in &rows {
         let name = row.name.as_bytes();
         let name_len = u8::try_from(name.len()).map_err(|_| VfsError::NameTooLong)?;
+        /// Format: the dax_map_dir listing's entry-kind byte (§4.6 READDIRPLUS layout): 3 symlink, 4 fifo,
+        /// 5 socket (1 file and 2 dir are the trivial values the literal check exempts).
+        const SYMLINK_KIND: u8 = 3;
+        const FIFO_KIND: u8 = 4;
+        const SOCKET_KIND: u8 = 5;
         let kind = match row.kind {
           crate::inode::Kind::File => 1u8,
           crate::inode::Kind::Dir => 2,
-          crate::inode::Kind::Symlink => 3,
-          crate::inode::Kind::Fifo => 4,
-          crate::inode::Kind::Socket => 5,
+          crate::inode::Kind::Symlink => SYMLINK_KIND,
+          crate::inode::Kind::Fifo => FIFO_KIND,
+          crate::inode::Kind::Socket => SOCKET_KIND,
         };
         // READDIRPLUS: each entry carries its attributes, so a guest gets the `stat` of every entry from the one
         // mapped block — no per-entry GETATTR round-trip (the metadata the kernel's readdirplus batches, served
@@ -611,8 +623,12 @@ impl Volume {
   }
 
   /// Whether `mapping` still names its file's current content block and length. The content paths revoke a mapping
-  /// before the block moves, so a live mapping always passes; this is a consistency backstop, not the primary guard.
-  fn dax_still_current(&self, store: &Store, mapping: &Mapping) -> bool {
+  /// before the block moves, so a live mapping always passes there; this is a consistency backstop, not the primary
+  /// guard. It is the backstop a snapshot reader's `advance` leans on (§4.6 "revoke on advance"): advance does not
+  /// enqueue an inode-global revoke (that would tear every reader's windows, not just the one moving), so the
+  /// advancing device re-validates its own windows against its new view through this and tears each one whose block
+  /// the new view no longer backs — the changed inodes — keeping the windows onto unchanged (block-shared) content.
+  pub fn dax_still_current(&self, store: &Store, mapping: &Mapping) -> bool {
     matches!(
       file_block(store, self, mapping.inode),
       Ok((block, file_len)) if block == mapping.block && file_len == mapping.file_len
@@ -660,9 +676,7 @@ impl Volume {
     off: usize,
     bytes: &[u8],
   ) -> Result<(), VfsError> {
-    if !mapping.writable
-      || !store.dax.is_live(mapping)
-      || !self.dax_still_current(&*store, mapping)
+    if !mapping.writable || !store.dax.is_live(mapping) || !self.dax_still_current(&*store, mapping)
     {
       return Err(VfsError::Invalid);
     }
@@ -695,7 +709,11 @@ impl Store {
     if !self.dax.is_live(mapping) {
       return vec![0u8; want];
     }
-    let block = self.content.arena().bytes(mapping.block).unwrap_or_default();
+    let block = self
+      .content
+      .arena()
+      .bytes(mapping.block)
+      .unwrap_or_default();
     let mut out = vec![0u8; want];
     for (index, slot) in out.iter_mut().enumerate() {
       if let Some(&byte) = block.get(off.saturating_add(index)) {
@@ -816,7 +834,13 @@ impl Store {
   /// cannot see directly (a hardware write/flip on a mapped page). Returns [`DaxScrub`]. A background scanner calls
   /// this over its guards a bounded number per step; an explicit validation pass calls it on demand.
   pub fn dax_scrub(&mut self, mapping: &Mapping) -> DaxScrub {
-    let Some(guard) = self.dax.guards.iter().find(|g| &g.mapping == mapping).copied() else {
+    let Some(guard) = self
+      .dax
+      .guards
+      .iter()
+      .find(|g| &g.mapping == mapping)
+      .copied()
+    else {
       return DaxScrub::Unguarded;
     };
     self.dax.scrubbed = self.dax.scrubbed.saturating_add(1);

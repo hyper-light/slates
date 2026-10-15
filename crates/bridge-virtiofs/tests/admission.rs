@@ -678,12 +678,14 @@ fn a_service_pass_drains_a_pending_dax_revoke_and_tears_the_window_down() {
   vol.enable_writable_dax();
   let root = vol.root_inode(&store).unwrap();
   let no = vol.create_file_no(&mut store, root, "f", 0o644).unwrap();
-  vol.write(&mut store, no, 0, &vec![0x5A; page_bytes]).unwrap();
+  vol
+    .write(&mut store, no, 0, &vec![0x5A; page_bytes])
+    .unwrap();
   let nodeid = no.0;
 
   let mut registry = Attachments::new();
-  let seam =
-    SimVmm::new(&QUEUE_SIZES, Ok(Principal::Uid { uid: 0 })).with_dax_window("admit-drain", page * 4);
+  let seam = SimVmm::new(&QUEUE_SIZES, Ok(Principal::Uid { uid: 0 }))
+    .with_dax_window("admit-drain", page * 4);
   let mut admitted = admit(
     request(GuestTransport::InProcess),
     seam,
@@ -701,10 +703,12 @@ fn a_service_pass_drains_a_pending_dax_revoke_and_tears_the_window_down() {
   // Pass one: FUSE_INIT brings the connection up, then a writable SETUPMAPPING maps the file — one live window.
   {
     let mut bridge = VolumeBridge::new(vid(), &mut vol, &mut store);
-    admitted
-      .seam_mut()
-      .guest_mut()
-      .submit(rq, &message(Opcode::Init.to_wire(), 1, ROOT, &dax_init_body()), 4096, 1);
+    admitted.seam_mut().guest_mut().submit(
+      rq,
+      &message(Opcode::Init.to_wire(), 1, ROOT, &dax_init_body()),
+      4096,
+      1,
+    );
     admitted.service(&mut bridge, &registry).unwrap();
     let (id, len) = admitted.seam_mut().guest_mut().reap(rq).unwrap();
     let reply = admitted.seam_mut().guest_mut().reply_of(rq, id, len);
@@ -712,20 +716,39 @@ fn a_service_pass_drains_a_pending_dax_revoke_and_tears_the_window_down() {
 
     admitted.seam_mut().guest_mut().submit(
       rq,
-      &message(Opcode::SetupMapping.to_wire(), 2, nodeid, &dax_setup_body(0, page, true, 0)),
+      &message(
+        Opcode::SetupMapping.to_wire(),
+        2,
+        nodeid,
+        &dax_setup_body(0, page, true, 0),
+      ),
       4096,
       1,
     );
     admitted.service(&mut bridge, &registry).unwrap();
     let (id, len) = admitted.seam_mut().guest_mut().reap(rq).unwrap();
     let reply = admitted.seam_mut().guest_mut().reply_of(rq, id, len);
-    assert_eq!(reply_error(&reply), 0, "SETUPMAPPING served over the DAX window");
+    assert_eq!(
+      reply_error(&reply),
+      0,
+      "SETUPMAPPING served over the DAX window"
+    );
   }
-  assert_eq!(admitted.device().dax_window_count(), 1, "one live guest window after the map pass");
-  assert_eq!(admitted.counters().dax_window_revokes, 0, "no daemon revoke drained yet");
+  assert_eq!(
+    admitted.device().dax_window_count(),
+    1,
+    "one live guest window after the map pass"
+  );
+  assert_eq!(
+    admitted.counters().dax_window_revokes,
+    0,
+    "no daemon revoke drained yet"
+  );
 
   // A client on the shard writes the mapped file between passes: the VFS write boundary enqueues a step-5 revoke.
-  vol.write(&mut store, no, 0, &vec![0xA5; page_bytes]).unwrap();
+  vol
+    .write(&mut store, no, 0, &vec![0xA5; page_bytes])
+    .unwrap();
 
   // Pass two: the production serve path drains the pending revoke and tears the stale window down.
   {
@@ -766,22 +789,33 @@ fn a_snapshot_recall_tears_the_writable_window_and_keeps_the_read_only_through_a
   let prefix = vol.prefix();
   let root = vol.root_inode(&store).unwrap();
   let no = vol.create_file_no(&mut store, root, "f", 0o644).unwrap();
-  vol.write(&mut store, no, 0, &vec![0x5A; page_bytes]).unwrap();
+  vol
+    .write(&mut store, no, 0, &vec![0x5A; page_bytes])
+    .unwrap();
   let nodeid = no.0;
 
   let mut registry = Attachments::new();
-  let seam =
-    SimVmm::new(&QUEUE_SIZES, Ok(Principal::Uid { uid: 0 })).with_dax_window("admit-snaprecall", page * 4);
-  let mut admitted =
-    admit(request(GuestTransport::InProcess), seam, config(), roomy(), rw, &mut registry).unwrap();
+  let seam = SimVmm::new(&QUEUE_SIZES, Ok(Principal::Uid { uid: 0 }))
+    .with_dax_window("admit-snaprecall", page * 4);
+  let mut admitted = admit(
+    request(GuestTransport::InProcess),
+    seam,
+    config(),
+    roomy(),
+    rw,
+    &mut registry,
+  )
+  .unwrap();
 
   // INIT, then a writable window (slot 0) and a read-only window (slot `page`) of the same inode.
   {
     let mut bridge = VolumeBridge::new(vid(), &mut vol, &mut store);
-    admitted
-      .seam_mut()
-      .guest_mut()
-      .submit(rq, &message(Opcode::Init.to_wire(), 1, ROOT, &dax_init_body()), 4096, 1);
+    admitted.seam_mut().guest_mut().submit(
+      rq,
+      &message(Opcode::Init.to_wire(), 1, ROOT, &dax_init_body()),
+      4096,
+      1,
+    );
     admitted.service(&mut bridge, &registry).unwrap();
     let (id, len) = admitted.seam_mut().guest_mut().reap(rq).unwrap();
     let reply = admitted.seam_mut().guest_mut().reply_of(rq, id, len);
@@ -789,7 +823,12 @@ fn a_snapshot_recall_tears_the_writable_window_and_keeps_the_read_only_through_a
 
     admitted.seam_mut().guest_mut().submit(
       rq,
-      &message(Opcode::SetupMapping.to_wire(), 2, nodeid, &dax_setup_body(0, page, true, 0)),
+      &message(
+        Opcode::SetupMapping.to_wire(),
+        2,
+        nodeid,
+        &dax_setup_body(0, page, true, 0),
+      ),
       4096,
       1,
     );
@@ -800,7 +839,12 @@ fn a_snapshot_recall_tears_the_writable_window_and_keeps_the_read_only_through_a
 
     admitted.seam_mut().guest_mut().submit(
       rq,
-      &message(Opcode::SetupMapping.to_wire(), 3, nodeid, &dax_setup_body(0, page, false, page)),
+      &message(
+        Opcode::SetupMapping.to_wire(),
+        3,
+        nodeid,
+        &dax_setup_body(0, page, false, page),
+      ),
       4096,
       1,
     );
@@ -809,16 +853,32 @@ fn a_snapshot_recall_tears_the_writable_window_and_keeps_the_read_only_through_a
     let reply = admitted.seam_mut().guest_mut().reply_of(rq, id, len);
     assert_eq!(reply_error(&reply), 0, "read-only SETUPMAPPING served");
   }
-  assert_eq!(admitted.device().dax_window_count(), 2, "both the writable and read-only windows are live");
+  assert_eq!(
+    admitted.device().dax_window_count(),
+    2,
+    "both the writable and read-only windows are live"
+  );
 
   // What `snapshot` runs before freezing: recall the volume's writable windows (hand them to the device, two-phase).
-  assert_eq!(store.dax_revoke_writable_of_prefix(prefix), 1, "exactly the writable mapping is revoked-pending");
+  assert_eq!(
+    store.dax_revoke_writable_of_prefix(prefix),
+    1,
+    "exactly the writable mapping is revoked-pending"
+  );
 
   // The next service pass drains the writable-only revoke; the device tears the writable window, keeps the read-only.
   {
     let mut bridge = VolumeBridge::new(vid(), &mut vol, &mut store);
     admitted.service(&mut bridge, &registry).unwrap();
   }
-  assert_eq!(admitted.device().dax_window_count(), 1, "the writable window is torn; the read-only window survives");
-  assert_eq!(admitted.counters().dax_window_revokes, 1, "exactly one window was torn — the writable one");
+  assert_eq!(
+    admitted.device().dax_window_count(),
+    1,
+    "the writable window is torn; the read-only window survives"
+  );
+  assert_eq!(
+    admitted.counters().dax_window_revokes,
+    1,
+    "exactly one window was torn — the writable one"
+  );
 }

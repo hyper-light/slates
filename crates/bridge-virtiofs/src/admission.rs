@@ -619,6 +619,30 @@ impl<S: VmmSeam> AdmittedDevice<S> {
     Ok(self.tear_down_inode_windows(no, false, bridge, &cx))
   }
 
+  /// Re-validates the device's live DAX windows against its current view and tears any the view no longer backs
+  /// (§4.6 "revoke on advance"), under the attachment's authority. A snapshot reader's `advance` kicks its device
+  /// here, so its windows onto changed inodes are torn and the guest re-maps against the new view; a device whose
+  /// view did not change finds all windows current and tears none, so a volume-wide kick is self-scoping. Returns
+  /// how many were torn, or the registry's refusal if the attachment's authority is gone; `Ok(0)` once not live.
+  pub fn revalidate_windows(
+    &mut self,
+    bridge: &mut dyn Bridge,
+    registry: &Attachments,
+  ) -> Result<usize, ServeError> {
+    if self.state != AttachmentState::Live {
+      return Ok(0);
+    }
+    let cx = registry
+      .context(self.attachment)
+      .map_err(ServeError::Authority)?;
+    let torn = self.device.revalidate_windows(bridge, &cx);
+    self.counters.dax_window_revokes = self
+      .counters
+      .dax_window_revokes
+      .saturating_add(u64::try_from(torn).unwrap_or(u64::MAX));
+    Ok(torn)
+  }
+
   /// Tears down inode `no`'s live windows on the device under the already-derived `cx` and records them in the
   /// non-vacuity counter. `writable_only` false tears every window (a write/truncate makes all stale), true tears
   /// only the writable ones and keeps the read-only (a snapshot shares the block read-only). The shared core of the

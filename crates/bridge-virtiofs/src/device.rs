@@ -573,6 +573,36 @@ impl Device {
     torn
   }
 
+  /// Re-validates every live DAX window against the device's **current** view and tears any the view no longer backs
+  /// (§4.6 "revoke on advance"): after a snapshot reader advances, its windows onto inodes whose content changed
+  /// name blocks the new view does not hold, so [`slates_bridge_core::Bridge::dax_window_current`] fails and the
+  /// two-phase revoke (munmap then unpin) tears them — the guest re-maps against the new view — while windows onto
+  /// unchanged, block-shared content stay current and survive. Unlike [`Self::request_revoke_inode`] (a write's
+  /// inode-global teardown across every reader), this is the moving reader's own device re-checking its own windows,
+  /// so no other reader's are touched. Returns how many were torn.
+  #[cfg(unix)]
+  pub fn revalidate_windows(
+    &mut self,
+    bridge: &mut dyn slates_bridge_core::Bridge,
+    cx: &slates_bridge_core::OpContext,
+  ) -> usize {
+    let mut torn = 0usize;
+    if let Some(cache) = self.dax_cache.as_mut() {
+      let mut index = 0;
+      while index < self.dax_windows.len() {
+        match self.dax_windows.get(index).copied() {
+          Some(entry) if !bridge.dax_window_current(&entry.mapping, cx) => {
+            teardown_dax_window(cache, bridge, cx, &entry);
+            self.dax_windows.swap_remove(index);
+            torn = torn.saturating_add(1);
+          }
+          _ => index = index.saturating_add(1),
+        }
+      }
+    }
+    torn
+  }
+
   /// No DAX window exists off Unix, so a daemon-initiated revoke tears nothing down.
   #[cfg(not(unix))]
   pub fn request_revoke_inode(
@@ -589,6 +619,16 @@ impl Device {
   pub fn request_revoke_writable_inode(
     &mut self,
     _no: u64,
+    _bridge: &mut dyn slates_bridge_core::Bridge,
+    _cx: &slates_bridge_core::OpContext,
+  ) -> usize {
+    0
+  }
+
+  /// No DAX window exists off Unix, so an advance re-validate tears nothing down.
+  #[cfg(not(unix))]
+  pub fn revalidate_windows(
+    &mut self,
     _bridge: &mut dyn slates_bridge_core::Bridge,
     _cx: &slates_bridge_core::OpContext,
   ) -> usize {
@@ -1128,6 +1168,8 @@ pub(crate) struct DaxWindowEntry {
 mod dax_errno {
   pub(super) const ENOENT: i32 = 2;
   pub(super) const EPERM: i32 = 1;
+  /// Format: the Linux errno ABI values a DAX reply carries — invalid argument, no space, unsupported
+  /// operation (a guest reads them as Linux, whatever the host).
   pub(super) const EINVAL: i32 = 22;
   pub(super) const ENOSPC: i32 = 28;
   pub(super) const EOPNOTSUPP: i32 = 95;
@@ -1187,7 +1229,8 @@ fn serve_dax(
   let cache = dax_cache.as_mut()?; // no window offered: let dispatch answer EOPNOTSUPP / no-op
   let req = Request::parse(request).ok()?;
   let unique = req.header.unique;
-  let err = |errno: i32, out: &mut [u8]| Some(ReplyHeader::write_error(unique, errno, out).unwrap_or(0));
+  let err =
+    |errno: i32, out: &mut [u8]| Some(ReplyHeader::write_error(unique, errno, out).unwrap_or(0));
   match Opcode::from_wire(req.header.opcode)? {
     Opcode::SetupMapping => {
       let Ok(m) = SetupMappingIn::parse(Opcode::SetupMapping.to_wire(), req.body) else {
@@ -1230,7 +1273,10 @@ fn serve_dax(
         let _ = bridge.dax_unmap(&mapping, cx);
         return err(dax_errno::EINVAL, out);
       };
-      if cache.map(m.moffset, m.len, fd, object_off, writable).is_err() {
+      if cache
+        .map(m.moffset, m.len, fd, object_off, writable)
+        .is_err()
+      {
         let _ = bridge.dax_unmap(&mapping, cx);
         return err(dax_errno::EINVAL, out);
       }

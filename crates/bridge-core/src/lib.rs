@@ -523,6 +523,18 @@ pub trait Bridge {
     Vec::new()
   }
 
+  /// Whether a live DAX window's `mapping` still names its file's current content block in this bridge's view (§4.6
+  /// "revoke on advance"). After a snapshot reader `advance`s its view, the device re-validates each window it holds
+  /// through this and tears any that no longer passes — the inodes whose content changed between the old view and
+  /// the new — so a hardware guest re-maps against the new view rather than reading stale bytes through a lingering
+  /// window. Unlike a write or truncate (which revokes every reader's windows of the inode), an advance moves one
+  /// reader, so its device validates only its own windows against its own view here. The default serves no DAX and
+  /// holds no window, so nothing is current: `false`.
+  fn dax_window_current(&mut self, mapping: &slates_vfs::dax::Mapping, cx: &OpContext) -> bool {
+    let _ = (mapping, cx);
+    false
+  }
+
   /// The AppleDouble view of `owner_name`'s extended attributes in directory `parent` (§4.6
   /// "Extended attributes over NFSv3"): the `._owner_name` file a macOS NFSv3 client keeps
   /// attributes in, served from the volume's attribute store. Its number is the owner's derived

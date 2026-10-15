@@ -67,7 +67,10 @@ fn a_mapping_does_not_expose_the_bytes_past_the_files_length() {
   volume.truncate(&mut store, secret, 100).unwrap();
 
   let mapping = volume.dax_map_read(&mut store, secret).unwrap();
-  assert_eq!(mapping.file_len, 100, "the authorized length is the truncated size");
+  assert_eq!(
+    mapping.file_len, 100,
+    "the authorized length is the truncated size"
+  );
   let page = volume.dax_read(&store, &mapping, 0, DAX_PAGE).unwrap();
   assert!(
     page[100..].iter().all(|&b| b == 0),
@@ -163,15 +166,27 @@ fn a_dax_map_of_an_attribute_inode_is_refused() {
   let mut volume = volume(&mut store, 1 << 20);
   let file = file_of(&mut store, &mut volume, "f", SECRET, DAX_PAGE);
   volume
-    .xattr_set(&mut store, file, b"user.secret", b"attribute value bytes", XattrSet::Either)
+    .xattr_set(
+      &mut store,
+      file,
+      b"user.secret",
+      b"attribute value bytes",
+      XattrSet::Either,
+    )
     .unwrap();
   let attr = volume.xattr_inode(&store, file, b"user.secret").unwrap();
   assert!(
-    matches!(volume.dax_map_read(&mut store, attr), Err(VfsError::NotFound)),
+    matches!(
+      volume.dax_map_read(&mut store, attr),
+      Err(VfsError::NotFound)
+    ),
     "an attribute inode cannot be DAX-mapped for read"
   );
   assert!(
-    matches!(volume.dax_map_write(&mut store, attr), Err(VfsError::NotFound)),
+    matches!(
+      volume.dax_map_write(&mut store, attr),
+      Err(VfsError::NotFound)
+    ),
     "an attribute inode cannot be DAX-mapped for write"
   );
   assert!(
@@ -191,8 +206,16 @@ fn colossal_and_overflowing_offsets_are_refused_without_a_panic() {
   let m = volume.dax_map_write(&mut store, f).unwrap();
   assert!(volume.dax_read(&store, &m, usize::MAX - 10, 100).is_err());
   assert!(volume.dax_read(&store, &m, 0, usize::MAX).is_err());
-  assert!(volume.dax_read(&store, &m, 0, m.page_span() + DAX_PAGE).is_err());
-  assert!(volume.dax_write(&mut store, &m, usize::MAX, &[0u8; 10]).is_err());
+  assert!(
+    volume
+      .dax_read(&store, &m, 0, m.page_span() + DAX_PAGE)
+      .is_err()
+  );
+  assert!(
+    volume
+      .dax_write(&mut store, &m, usize::MAX, &[0u8; 10])
+      .is_err()
+  );
 }
 
 // ───────────────────────────────────────────────────────────── pinning (the memory-level gate)
@@ -340,7 +363,10 @@ fn a_fabricated_or_tampered_mapping_is_inert() {
     writable: true,
     ..am
   };
-  assert!(!store.dax_is_live(&fabricated), "a fabricated mapping is not live");
+  assert!(
+    !store.dax_is_live(&fabricated),
+    "a fabricated mapping is not live"
+  );
   store.dax_write_raw(&fabricated, 0, &[POISON; 64]);
   let mut got = vec![0u8; 64];
   victim.read(&store, fb, 0, &mut got).unwrap();
@@ -350,7 +376,10 @@ fn a_fabricated_or_tampered_mapping_is_inert() {
     &got[..8]
   );
   assert!(
-    store.dax_read_raw(&fabricated, 0, DAX_PAGE).iter().all(|&b| b == 0),
+    store
+      .dax_read_raw(&fabricated, 0, DAX_PAGE)
+      .iter()
+      .all(|&b| b == 0),
     "the fabricated read is zeros, never the victim's bytes"
   );
 
@@ -398,8 +427,9 @@ fn a_pile_of_stale_writers_cannot_corrupt_a_live_file() {
   let v = file_of(&mut store, &mut volume, "victim", VICTIM, DAX_PAGE);
   let vm = volume.dax_map_read(&mut store, v).unwrap();
   assert!(
-    stale.iter().all(|(_, m)| m.block.region() != vm.block.region()
-      || m.block.offset() != vm.block.offset()),
+    stale
+      .iter()
+      .all(|(_, m)| m.block.region() != vm.block.region() || m.block.offset() != vm.block.offset()),
     "the victim did not reuse any pinned block"
   );
   for (_, m) in &stale {
@@ -491,7 +521,9 @@ fn a_block_move_revokes_the_mapping_and_the_stale_hardware_write_is_inert() {
   let m = volume.dax_map_write(&mut store, f).unwrap();
 
   let before = store.dax.revoked();
-  volume.write(&mut store, f, 0, &vec![0x22; DAX_PAGE * 4]).unwrap();
+  volume
+    .write(&mut store, f, 0, &vec![0x22; DAX_PAGE * 4])
+    .unwrap();
   assert!(
     !store.dax_is_live(&m) && store.dax.revoked() > before,
     "the VFS write revoked the mapping"
@@ -516,7 +548,9 @@ fn the_daemon_path_refuses_a_mapping_whose_block_moved() {
   let f = file_of(&mut store, &mut volume, "f", 0x11, DAX_PAGE);
   volume.truncate(&mut store, f, 100).unwrap();
   let m = volume.dax_map_write(&mut store, f).unwrap();
-  volume.write(&mut store, f, 0, &vec![0x22; DAX_PAGE * 4]).unwrap();
+  volume
+    .write(&mut store, f, 0, &vec![0x22; DAX_PAGE * 4])
+    .unwrap();
   assert!(volume.dax_write(&mut store, &m, 0, &[0x33; 50]).is_err());
   assert!(volume.dax_read(&store, &m, 0, 50).is_err());
 }
@@ -534,7 +568,10 @@ fn a_snapshot_after_a_writable_map_revokes_it_and_is_not_corrupted() {
   let m = volume.dax_map_write(&mut store, f).unwrap();
 
   let snap = volume.snapshot(&mut store).unwrap();
-  assert!(!store.dax_is_live(&m), "the snapshot revoked the writable mapping");
+  assert!(
+    !store.dax_is_live(&m),
+    "the snapshot revoked the writable mapping"
+  );
 
   store.dax_write_raw(&m, 0, &[POISON; 100]);
   let mut frozen = vec![0u8; 100];
@@ -546,7 +583,10 @@ fn a_snapshot_after_a_writable_map_revokes_it_and_is_not_corrupted() {
   );
   let mut live = vec![0u8; 100];
   volume.read(&store, f, 0, &mut live).unwrap();
-  assert!(live.iter().all(|&b| b == ORIG), "the live file is uncorrupted too");
+  assert!(
+    live.iter().all(|&b| b == ORIG),
+    "the live file is uncorrupted too"
+  );
 }
 
 /// §4.6 (a writable map taken after a snapshot copies up — the frozen version is safe without a revoke). Do: snapshot
@@ -584,9 +624,15 @@ fn a_read_only_mapping_survives_a_snapshot() {
   let f = file_of(&mut store, &mut volume, "f", ORIG, DAX_PAGE);
   let m = volume.dax_map_read(&mut store, f).unwrap();
   let _snap = volume.snapshot(&mut store).unwrap();
-  assert!(store.dax_is_live(&m), "a read-only mapping is not revoked by a snapshot");
+  assert!(
+    store.dax_is_live(&m),
+    "a read-only mapping is not revoked by a snapshot"
+  );
   let raw = store.dax_read_raw(&m, 0, 100);
-  assert!(raw.iter().all(|&b| b == ORIG), "it still reads its own bytes");
+  assert!(
+    raw.iter().all(|&b| b == ORIG),
+    "it still reads its own bytes"
+  );
 }
 
 // ───────────────────────────────────────────────────────────── lifecycle (reclamation)
@@ -627,7 +673,10 @@ fn a_past_length_tail_write_is_scrubbed_before_the_block_is_reused() {
 
   store.dax_write_raw(&m, 100, &[POISON; 200]); // into the page tail, past the file
   volume.unlink_no(&mut store, root, "f").unwrap();
-  assert!(store.dax_revoke(&m), "revoke runs the deferred free, scrubbing the block");
+  assert!(
+    store.dax_revoke(&m),
+    "revoke runs the deferred free, scrubbing the block"
+  );
 
   let g = file_of(&mut store, &mut volume, "g", 0x00, DAX_PAGE);
   let gm = volume.dax_map_read(&mut store, g).unwrap();
@@ -676,9 +725,15 @@ fn a_pending_revoke_keeps_the_block_pinned_until_the_unmap_is_confirmed() {
   let no = file_of(&mut store, &mut volume, "f", SECRET, DAX_PAGE);
   let mapping = volume.dax_map_read(&mut store, no).unwrap();
   let block = mapping.block;
-  assert!(store.content.arena().is_pinned(block), "a live mapping pins its block");
+  assert!(
+    store.content.arena().is_pinned(block),
+    "a live mapping pins its block"
+  );
 
-  assert!(store.dax_revoke_pending(&mapping), "phase one: the mapping was held");
+  assert!(
+    store.dax_revoke_pending(&mapping),
+    "phase one: the mapping was held"
+  );
   assert!(
     !store.dax_is_live(&mapping),
     "phase one: the hardware path is inert — no new access authorized"
@@ -726,13 +781,19 @@ fn a_map_storm_is_refused_at_the_registry_bound() {
       }
     }
   }
-  assert!(refused, "a re-map storm is refused at the bound, never grown without limit");
+  assert!(
+    refused,
+    "a re-map storm is refused at the bound, never grown without limit"
+  );
   assert!(
     store.dax_mappings() <= CAP,
     "the registry never exceeds its cap ({} > {CAP})",
     store.dax_mappings()
   );
-  assert!(store.dax.refused() > before, "the refusal at the bound is counted");
+  assert!(
+    store.dax.refused() > before,
+    "the refusal at the bound is counted"
+  );
   // Non-vacuity + recovery: free one mapping, and the file maps again — the bound is live, not a dead wall.
   let freed = held.pop().expect("at least one map succeeded");
   assert!(store.dax_revoke(&freed));
@@ -776,7 +837,10 @@ fn a_truncate_while_mapped_revokes_the_window_so_the_freed_tail_is_inert() {
 
   // Truncate small through the daemon: this revokes the held mapping and frees the tail.
   volume.truncate(&mut store, f, 100).unwrap();
-  assert!(!store.dax_is_live(&m), "the truncate revoked the held mapping");
+  assert!(
+    !store.dax_is_live(&m),
+    "the truncate revoked the held mapping"
+  );
 
   // The stale window cannot reach the freed tail: its hardware read is zeros, its write a no-op.
   let tail = store.dax_read_raw(&m, 200, 100);
@@ -807,7 +871,10 @@ fn a_daemon_write_while_mapped_revokes_the_read_window() {
   assert!(store.dax_is_live(&m), "the read mapping starts live");
 
   volume.write(&mut store, f, 0, &[0x22; 64]).unwrap();
-  assert!(!store.dax_is_live(&m), "the daemon write revoked the held read mapping");
+  assert!(
+    !store.dax_is_live(&m),
+    "the daemon write revoked the held read mapping"
+  );
 
   assert!(
     store.dax_read_raw(&m, 0, 64).iter().all(|&b| b == 0),
@@ -846,7 +913,10 @@ fn a_writable_map_in_a_clone_copies_up_and_spares_the_shared_origin() {
   );
   let mut clone_bytes = vec![0u8; 3];
   clone.read(&store, cf, 0, &mut clone_bytes).unwrap();
-  assert_eq!(&clone_bytes, b"BBB", "the clone sees its own copied-up write");
+  assert_eq!(
+    &clone_bytes, b"BBB",
+    "the clone sees its own copied-up write"
+  );
 }
 
 /// §4.6 (the raw hardware path bounds a colossal offset or length too, not only the daemon-mediated path): a guest's
@@ -895,18 +965,42 @@ fn a_migration_moves_the_content_to_a_new_block_and_repoints_the_inode() {
 
   let m2 = volume.dax_migrate(&mut store, &m).unwrap();
 
-  assert_ne!(m2.block, m.block, "the content moved to a physically different block (the moving target)");
+  assert_ne!(
+    m2.block, m.block,
+    "the content moved to a physically different block (the moving target)"
+  );
   assert!(store.dax_is_live(&m2), "the new mapping is live");
-  assert!(!store.dax_is_live(&m), "the old mapping is inert (revoked-pending)");
-  assert_eq!(store.dax.migrated(), 1, "the migration counter moved (non-vacuity)");
+  assert!(
+    !store.dax_is_live(&m),
+    "the old mapping is inert (revoked-pending)"
+  );
+  assert_eq!(
+    store.dax.migrated(),
+    1,
+    "the migration counter moved (non-vacuity)"
+  );
   // Every byte survived the shift: the marker and the file's body.
-  assert_eq!(store.dax_read_raw(&m2, 0, 8), vec![0x55; 8], "the written marker moved with the content");
-  assert!(all_bytes(&store.dax_read_raw(&m2, 8, 16), 0x41), "the rest of the file moved intact");
+  assert_eq!(
+    store.dax_read_raw(&m2, 0, 8),
+    vec![0x55; 8],
+    "the written marker moved with the content"
+  );
+  assert!(
+    all_bytes(&store.dax_read_raw(&m2, 8, 16), 0x41),
+    "the rest of the file moved intact"
+  );
   // The inode follows the move, so the daemon path and a plain non-DAX read reach the moved bytes, not a stale block.
-  assert_eq!(volume.dax_read(&store, &m2, 0, 8).unwrap(), vec![0x55; 8], "the daemon path sees the moved block");
+  assert_eq!(
+    volume.dax_read(&store, &m2, 0, 8).unwrap(),
+    vec![0x55; 8],
+    "the daemon path sees the moved block"
+  );
   let mut buf = [0u8; 8];
   volume.read(&store, f, 0, &mut buf).unwrap();
-  assert_eq!(&buf, &[0x55; 8], "a non-DAX reader reaches the moved content");
+  assert_eq!(
+    &buf, &[0x55; 8],
+    "a non-DAX reader reaches the moved content"
+  );
 }
 
 /// §4.6 L2 (the stale-TLB hold). Do: migrate a writable mapping, then release the old mapping as the device would
@@ -924,9 +1018,18 @@ fn a_migration_holds_the_old_block_pinned_until_the_release() {
 
   let _m2 = volume.dax_migrate(&mut store, &m).unwrap();
 
-  assert!(all_bytes(&store.dax_read_raw(&m, 0, 8), 0), "the old window is inert after the migrate");
-  assert!(store.content.arena().is_pinned(old_block), "the old block is still pinned — the stale-TLB hold");
-  assert!(store.dax_release_after_unmap(&m), "the release after the confirmed unmap drops the hold");
+  assert!(
+    all_bytes(&store.dax_read_raw(&m, 0, 8), 0),
+    "the old window is inert after the migrate"
+  );
+  assert!(
+    store.content.arena().is_pinned(old_block),
+    "the old block is still pinned — the stale-TLB hold"
+  );
+  assert!(
+    store.dax_release_after_unmap(&m),
+    "the release after the confirmed unmap drops the hold"
+  );
   assert!(
     !store.content.arena().is_pinned(old_block),
     "the old block is unpinned and reusable only after the release"
@@ -953,7 +1056,10 @@ fn a_read_only_mapping_is_not_migrated() {
   // Non-vacuity: the same file, mapped writable, does migrate.
   store.dax_revoke(&ro);
   let rw = volume.dax_map_write(&mut store, f).unwrap();
-  assert!(volume.dax_migrate(&mut store, &rw).is_ok(), "a writable mapping of the same file migrates");
+  assert!(
+    volume.dax_migrate(&mut store, &rw).is_ok(),
+    "a writable mapping of the same file migrates"
+  );
   assert_eq!(store.dax.migrated(), 1);
 }
 
@@ -977,7 +1083,10 @@ fn the_stripe_target_stays_in_the_sandbox_and_always_moves() {
       seen[t] = true;
     }
   }
-  assert!(seen.iter().all(|&s| s), "every slot in the sandbox is reachable (the placement is not stuck)");
+  assert!(
+    seen.iter().all(|&s| s),
+    "every slot in the sandbox is reachable (the placement is not stuck)"
+  );
   assert_eq!(
     stripe_target(NonZeroUsize::new(1).unwrap(), 0, &mut rng),
     0,
@@ -1008,12 +1117,27 @@ fn a_flip_in_a_guarded_read_only_block_is_caught_and_healed() {
   let f = file_of(&mut store, &mut volume, "f", 0x41, DAX_PAGE);
   let m = volume.dax_map_read(&mut store, f).unwrap();
   store.dax_guard(&m).unwrap();
-  assert_eq!(store.dax_scrub(&m), DaxScrub::Clean, "a freshly guarded block scrubs clean");
+  assert_eq!(
+    store.dax_scrub(&m),
+    DaxScrub::Clean,
+    "a freshly guarded block scrubs clean"
+  );
 
   flip_a_byte(&mut store, m.block);
-  assert_eq!(store.dax_scrub(&m), DaxScrub::Healed, "the flip is caught and the block restored");
-  assert!(all_bytes(&store.dax_read_raw(&m, 0, 64), 0x41), "the victim byte is erased — the clean content is back");
-  assert_eq!(store.dax_scrub(&m), DaxScrub::Clean, "a re-scrub confirms the heal");
+  assert_eq!(
+    store.dax_scrub(&m),
+    DaxScrub::Healed,
+    "the flip is caught and the block restored"
+  );
+  assert!(
+    all_bytes(&store.dax_read_raw(&m, 0, 64), 0x41),
+    "the victim byte is erased — the clean content is back"
+  );
+  assert_eq!(
+    store.dax_scrub(&m),
+    DaxScrub::Clean,
+    "a re-scrub confirms the heal"
+  );
   assert_eq!(store.dax.flips(), 1, "one flip caught (non-vacuity)");
   assert_eq!(store.dax.healed(), 1, "one block healed (non-vacuity)");
 }
@@ -1030,8 +1154,15 @@ fn a_guarded_block_without_a_flip_scrubs_clean() {
 
   assert_eq!(store.dax_scrub(&m), DaxScrub::Clean);
   assert_eq!(store.dax_scrub(&m), DaxScrub::Clean);
-  assert_eq!(store.dax.flips(), 0, "no false-positive flip on untouched content");
-  assert!(store.dax.scrubbed() >= 2, "the scrub counter moved (non-vacuity)");
+  assert_eq!(
+    store.dax.flips(),
+    0,
+    "no false-positive flip on untouched content"
+  );
+  assert!(
+    store.dax.scrubbed() >= 2,
+    "the scrub counter moved (non-vacuity)"
+  );
 }
 
 /// §4.6 B2 (the honest scope). Do: try to guard a *writable* mapping. Expect: refused `Invalid` — a writable block
@@ -1050,11 +1181,18 @@ fn a_writable_mapping_cannot_be_guarded() {
     matches!(store.dax_guard(&w), Err(VfsError::Invalid)),
     "a writable mapping cannot be content-guarded"
   );
-  assert_eq!(store.dax.guards(), 0, "no guard was registered for the writable mapping");
+  assert_eq!(
+    store.dax.guards(),
+    0,
+    "no guard was registered for the writable mapping"
+  );
 
   store.dax_revoke(&w);
   let r = volume.dax_map_read(&mut store, f).unwrap();
-  assert!(store.dax_guard(&r).is_ok(), "a read-only mapping of the same file guards");
+  assert!(
+    store.dax_guard(&r).is_ok(),
+    "a read-only mapping of the same file guards"
+  );
   assert_eq!(store.dax.guards(), 1);
 }
 
@@ -1070,7 +1208,11 @@ fn revoking_a_guarded_mapping_drops_the_guard() {
   assert_eq!(store.dax.guards(), 1);
 
   assert!(store.dax_revoke(&m), "the mapping is revoked");
-  assert_eq!(store.dax.guards(), 0, "the revoke dropped the guard and freed its clean copy");
+  assert_eq!(
+    store.dax.guards(),
+    0,
+    "the revoke dropped the guard and freed its clean copy"
+  );
 }
 
 /// §4.6 B2 + the step-5 two-phase revoke. A write or truncate of a DAX-mapped inode revokes *every* mapping of it —
@@ -1090,7 +1232,10 @@ fn the_two_phase_revoke_drops_a_guarded_mappings_clean_copy() {
   store.dax_guard(&m).unwrap();
   assert_eq!(store.dax.guards(), 1, "the read-only mapping is guarded");
 
-  assert!(store.dax_revoke_pending(&m), "phase one: the mapping was held");
+  assert!(
+    store.dax_revoke_pending(&m),
+    "phase one: the mapping was held"
+  );
   assert_eq!(
     store.dax.guards(),
     0,
@@ -1100,7 +1245,10 @@ fn the_two_phase_revoke_drops_a_guarded_mappings_clean_copy() {
     store.content.arena().is_pinned(block),
     "phase one still keeps the MAPPED block pinned (the stale-TLB hold); only the guard's clean copy was freed"
   );
-  assert!(store.dax_release_after_unmap(&m), "phase two releases the mapped block's pin");
+  assert!(
+    store.dax_release_after_unmap(&m),
+    "phase two releases the mapped block's pin"
+  );
 
   // No leak across cycles: the 16-chunk arena would be exhausted by a leaked clean copy (guard + mapped block + the
   // clean copy are three blocks per cycle), but a freed clean copy lets every cycle reuse the space.
@@ -1108,12 +1256,15 @@ fn the_two_phase_revoke_drops_a_guarded_mappings_clean_copy() {
     let m = volume
       .dax_map_read(&mut store, f)
       .unwrap_or_else(|e| panic!("map after {cycle} guarded two-phase revokes: {e:?} — a leaked clean copy exhausted the arena"));
-    store
-      .dax_guard(&m)
-      .unwrap_or_else(|e| panic!("guard on cycle {cycle}: {e:?} — a leaked clean copy exhausted the arena"));
+    store.dax_guard(&m).unwrap_or_else(|e| {
+      panic!("guard on cycle {cycle}: {e:?} — a leaked clean copy exhausted the arena")
+    });
     assert!(store.dax_revoke_pending(&m), "phase one, cycle {cycle}");
     assert_eq!(store.dax.guards(), 0, "guard dropped on cycle {cycle}");
-    assert!(store.dax_release_after_unmap(&m), "phase two, cycle {cycle}");
+    assert!(
+      store.dax_release_after_unmap(&m),
+      "phase two, cycle {cycle}"
+    );
   }
 }
 
@@ -1139,14 +1290,20 @@ fn the_pending_revoke_queue_is_bounded_and_deduped() {
     let m = volume.dax_map_read(&mut store, f).unwrap();
     assert!(store.dax_is_live(&m), "the re-map is live, round {round}");
     volume.write(&mut store, f, 0, &[round; 8]).unwrap();
-    assert!(store.dax.pending_len() <= 1, "the storm never grows the queue past the one deduped inode");
+    assert!(
+      store.dax.pending_len() <= 1,
+      "the storm never grows the queue past the one deduped inode"
+    );
   }
   assert_eq!(
     store.dax.take_pending_revokes(),
     vec![(f, false)],
     "a write storm on one mapped inode enqueues it once, writable_only=false (every window stale)"
   );
-  assert!(store.dax.take_pending_revokes().is_empty(), "the drain cleared the queue");
+  assert!(
+    store.dax.take_pending_revokes().is_empty(),
+    "the drain cleared the queue"
+  );
 
   // Several distinct mapped inodes, each written once: each enqueued exactly once, and the queue stays within the cap.
   let mut want: BTreeSet<u64> = BTreeSet::new();
@@ -1157,9 +1314,20 @@ fn the_pending_revoke_queue_is_bounded_and_deduped() {
     volume.write(&mut store, no, 0, &[0xCD; 8]).unwrap();
     want.insert(no.0);
   }
-  assert!(store.dax.pending_len() <= CAP, "the queue never exceeds the registry cap");
-  let drained: BTreeSet<u64> = store.dax.take_pending_revokes().into_iter().map(|(no, _)| no.0).collect();
-  assert_eq!(drained, want, "each distinct mapped inode was enqueued exactly once");
+  assert!(
+    store.dax.pending_len() <= CAP,
+    "the queue never exceeds the registry cap"
+  );
+  let drained: BTreeSet<u64> = store
+    .dax
+    .take_pending_revokes()
+    .into_iter()
+    .map(|(no, _)| no.0)
+    .collect();
+  assert_eq!(
+    drained, want,
+    "each distinct mapped inode was enqueued exactly once"
+  );
 }
 
 /// §4.6 step 5 — snapshot/clone now revokes its volume's writable DAX windows **two-phase** (the device munmaps),
@@ -1181,7 +1349,11 @@ fn a_snapshot_revokes_the_volumes_writable_windows_two_phase_and_keeps_read_only
   let rm = volume.dax_map_read(&mut store, r).unwrap();
 
   // The snapshot's teardown: writable windows go revoke-pending + enqueued; the read-only one survives.
-  assert_eq!(store.dax_revoke_writable_of_prefix(prefix), 1, "exactly the writable mapping was revoked-pending");
+  assert_eq!(
+    store.dax_revoke_writable_of_prefix(prefix),
+    1,
+    "exactly the writable mapping was revoked-pending"
+  );
   let state_after = (
     store.dax.has_writable_of_prefix(prefix),
     store.dax.has_pending_of_prefix(prefix),
@@ -1201,8 +1373,15 @@ fn a_snapshot_revokes_the_volumes_writable_windows_two_phase_and_keeps_read_only
     vec![(wm.inode, true)],
     "the writable revoke is enqueued writable_only=true (device keeps the read-only window)"
   );
-  let drained_state = (store.dax.has_pending_of_prefix(prefix), store.dax_release_after_unmap(&wm));
-  assert_eq!(drained_state, (false, true), "the take cleared the queue (snapshot may freeze) and phase two unpins");
+  let drained_state = (
+    store.dax.has_pending_of_prefix(prefix),
+    store.dax_release_after_unmap(&wm),
+  );
+  assert_eq!(
+    drained_state,
+    (false, true),
+    "the take cleared the queue (snapshot may freeze) and phase two unpins"
+  );
 }
 
 /// §4.6 (the DAX device-window backing seam, Unix). Do: on the scratch (anonymous-backed) test store, map a file
@@ -1222,7 +1401,10 @@ fn a_scratch_volume_has_no_dax_backing_and_a_revoked_mapping_has_none() {
     "a scratch (anonymous-backed) volume has no DAX backing fd to hand a VMM"
   );
   store.dax_revoke(&m);
-  assert!(store.dax_backing(&m).is_none(), "a revoked mapping has no DAX backing");
+  assert!(
+    store.dax_backing(&m).is_none(),
+    "a revoked mapping has no DAX backing"
+  );
 }
 
 /// Parses the flat READDIRPLUS directory snapshot `dax_map_dir` writes (§4.6 metadata DAX): a u32 count, then per
@@ -1256,15 +1438,21 @@ fn a_directory_maps_its_entries_flat_and_revoke_frees_the_snapshot_block() {
   let mut store = store_capped_chunks(16);
   let mut volume = volume(&mut store, 1 << 20);
   let root = volume.root_inode(&store).unwrap();
-  let mut want: std::collections::BTreeMap<String, (u64, u64, u32)> = std::collections::BTreeMap::new();
+  let mut want: std::collections::BTreeMap<String, (u64, u64, u32)> =
+    std::collections::BTreeMap::new();
   for name in ["alpha", "beta", "gamma"] {
-    let no = volume.create_file_no(&mut store, root, name, 0o644).unwrap();
+    let no = volume
+      .create_file_no(&mut store, root, name, 0o644)
+      .unwrap();
     let a = volume.stat(&store, no).unwrap();
     want.insert(name.to_owned(), (no.0, a.size, a.mode));
   }
 
   let mapping = volume.dax_map_dir(&mut store, root).unwrap();
-  assert!(mapping.snapshot, "a directory mapping owns its throwaway block");
+  assert!(
+    mapping.snapshot,
+    "a directory mapping owns its throwaway block"
+  );
   assert!(store.dax_is_live(&mapping), "the directory mapping is live");
   let raw = store.dax_read_raw(&mapping, 0, mapping.file_len);
   assert_eq!(
@@ -1273,13 +1461,16 @@ fn a_directory_maps_its_entries_flat_and_revoke_frees_the_snapshot_block() {
     "the window is the directory's entries, flat and guest-readable, no READDIR round-trip"
   );
   assert!(store.dax_revoke(&mapping), "the directory mapping revokes");
-  assert!(!store.dax_is_live(&mapping), "the mapping is dead after revoke");
+  assert!(
+    !store.dax_is_live(&mapping),
+    "the mapping is dead after revoke"
+  );
 
   // No leak: far more map/revoke cycles than the 16-chunk arena holds. A leaked snapshot block would exhaust it.
   for cycle in 0..64 {
-    let m = volume
-      .dax_map_dir(&mut store, root)
-      .unwrap_or_else(|e| panic!("map after {cycle} revokes: {e:?} — a leaked snapshot block exhausted the arena"));
+    let m = volume.dax_map_dir(&mut store, root).unwrap_or_else(|e| {
+      panic!("map after {cycle} revokes: {e:?} — a leaked snapshot block exhausted the arena")
+    });
     assert!(store.dax_revoke(&m), "revoke cycle {cycle}");
   }
 }

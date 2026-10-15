@@ -148,7 +148,11 @@ fn main() {
   // DAX write: the bytes a guest's page table moves into the arena block — a memcpy, no daemon call.
   let data = vec![0xCDu8; OP_BYTES];
   let (write_ns, write_runs) = best_of(ITERS, || {
-    let dstb = store.content.arena_mut().bytes_mut(block).expect("block bytes");
+    let dstb = store
+      .content
+      .arena_mut()
+      .bytes_mut(block)
+      .expect("block bytes");
     dstb[..OP_BYTES].copy_from_slice(&data);
     black_box(dstb[0]);
   });
@@ -159,7 +163,9 @@ fn main() {
   // *adaptive migration interval* is derived from: a migration must cost far less than the interval between them, or
   // the moving target starves the guest it protects. Minting the writable mapping copies the file up and revokes the
   // read mapping used above.
-  let mut cur = vol.dax_map_write(&mut store, no).expect("map write for migrate");
+  let mut cur = vol
+    .dax_map_write(&mut store, no)
+    .expect("map write for migrate");
   let (migrate_ns, migrate_runs) = best_of(ITERS / 100, || {
     let next = vol.dax_migrate(&mut store, &cur).expect("migrate");
     store.dax_release_after_unmap(&cur); // the device confirmed the unmap; drop the old block's hold
@@ -172,7 +178,9 @@ fn main() {
   println!("dax_map_read_setup\t{map_read_ns}\truns={map_read_runs:?}");
   println!("dax_map_write_setup\t{map_write_ns}\truns={map_write_runs:?}");
   println!();
-  println!("# DAX migration (L2 moving target), a {OP_BYTES}-byte block relocated + handed off, ns/migration");
+  println!(
+    "# DAX migration (L2 moving target), a {OP_BYTES}-byte block relocated + handed off, ns/migration"
+  );
   println!("dax_migrate\t{migrate_ns}\truns={migrate_runs:?}");
   println!(
     "# derived: migration interval floor = cost / stall budget; a 1% stall budget => >= 100 x {migrate_ns} = {} ns",
@@ -198,6 +206,8 @@ fn amortise(label: &str, round_trip_ns: u64, setup_mint_ns: u64, access_ns: u64)
     let mediated = round_trip_ns.saturating_mul(n);
     let dax = dax_setup.saturating_add(access_ns.saturating_mul(n));
     let speedup = mediated as f64 / dax.max(1) as f64;
-    println!("{label} N={n:>5}: mediated {mediated:>12} ns, dax {dax:>12} ns, speedup {speedup:>7.1}x");
+    println!(
+      "{label} N={n:>5}: mediated {mediated:>12} ns, dax {dax:>12} ns, speedup {speedup:>7.1}x"
+    );
   }
 }

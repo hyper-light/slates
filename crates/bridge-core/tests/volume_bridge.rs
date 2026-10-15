@@ -1453,8 +1453,12 @@ fn a_scoped_dax_map_is_confined_to_its_subtree() {
   // One content block each (a page), so each is a mappable file, not inline.
   let (f, _) = inner.create(oid(shared.ino), &cx, "f", 0o644, 0).unwrap();
   inner.write(oid(f.ino), &cx, 0, &[0xABu8; 4096]).unwrap();
-  let (secret, _) = inner.create(oid(private.ino), &cx, "secret", 0o644, 0).unwrap();
-  inner.write(oid(secret.ino), &cx, 0, &[0xCDu8; 4096]).unwrap();
+  let (secret, _) = inner
+    .create(oid(private.ino), &cx, "secret", 0o644, 0)
+    .unwrap();
+  inner
+    .write(oid(secret.ino), &cx, 0, &[0xCDu8; 4096])
+    .unwrap();
 
   {
     let mut scoped = ScopedBridge::new(&mut inner, shared.ino);
@@ -1463,7 +1467,10 @@ fn a_scoped_dax_map_is_confined_to_its_subtree() {
       "the scoped mount maps its own file"
     );
     assert!(
-      matches!(scoped.dax_map(oid(secret.ino), &cx, false), Err(VfsError::NotFound)),
+      matches!(
+        scoped.dax_map(oid(secret.ino), &cx, false),
+        Err(VfsError::NotFound)
+      ),
       "the scoped mount cannot map a file outside its subtree"
     );
   }

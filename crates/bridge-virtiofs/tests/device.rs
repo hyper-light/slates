@@ -1257,12 +1257,19 @@ fn dax_profiling_store(page: usize, pages: usize, tag: &str) -> slates_vfs::volu
   use slates_mem::arena::ChunkArena;
   use slates_mem::region::Region;
   use slates_mem::{ExclusiveObject, SharedObject, Words};
-  let object =
-    SharedObject::create(&format!("sl-dp-{tag}-{}", std::process::id()), page * pages, Words::new()).unwrap();
+  let object = SharedObject::create(
+    &format!("sl-dp-{tag}-{}", std::process::id()),
+    page * pages,
+    Words::new(),
+  )
+  .unwrap();
   let mut arena = ChunkArena::new(page);
   // SAFETY: this test is the object's only mapper; it declares no words.
   arena
-    .add_region(Region::shared(unsafe { ExclusiveObject::new(object) }, page))
+    .add_region(Region::shared(
+      unsafe { ExclusiveObject::new(object) },
+      page,
+    ))
     .unwrap();
   slates_vfs::volume::Store::new(
     &slates_vfs::volume::StoreConfig {
@@ -1320,19 +1327,32 @@ fn t_dax_device_map_path_latency_profile() {
   let root = vol.root_inode(&store).unwrap();
   let mut files = Vec::with_capacity(n);
   for i in 0..n {
-    let no = vol.create_file_no(&mut store, root, &format!("f{i}"), 0o644).unwrap();
+    let no = vol
+      .create_file_no(&mut store, root, &format!("f{i}"), 0o644)
+      .unwrap();
     vol.write(&mut store, no, 0, &vec![0x5A; page]).unwrap();
     files.push(no.0);
   }
   let (mut device, mut driver) = device_and_driver();
-  let cache =
-    SharedObject::create(&format!("sl-dpwin-{}", std::process::id()), page * n, Words::new()).unwrap();
+  let cache = SharedObject::create(
+    &format!("sl-dpwin-{}", std::process::id()),
+    page * n,
+    Words::new(),
+  )
+  .unwrap();
   device.install_dax_window(Some(
     slates_bridge_virtiofs::dax::DaxCacheRegion::new(cache.as_fd(), (page * n) as u64).unwrap(),
   ));
   let cx = context();
   let mut bridge = VolumeBridge::new(vid(), &mut vol, &mut store);
-  dax_exchange(&mut device, &mut driver, &mut bridge, &cx, (Opcode::Init, 1, ROOT), &dax_init_body());
+  dax_exchange(
+    &mut device,
+    &mut driver,
+    &mut bridge,
+    &cx,
+    (Opcode::Init, 1, ROOT),
+    &dax_init_body(),
+  );
 
   let batch = 128usize;
   let (mut first, mut last) = (Duration::ZERO, Duration::ZERO);
@@ -1341,8 +1361,12 @@ fn t_dax_device_map_path_latency_profile() {
     let unique = u64::try_from(i).unwrap_or(0).saturating_add(2);
     let at = Instant::now();
     let r = dax_exchange(
-      &mut device, &mut driver, &mut bridge, &cx,
-      (Opcode::SetupMapping, unique, nodeid), &dax_setup_body(0, page as u64, true, moffset),
+      &mut device,
+      &mut driver,
+      &mut bridge,
+      &cx,
+      (Opcode::SetupMapping, unique, nodeid),
+      &dax_setup_body(0, page as u64, true, moffset),
     );
     let dt = at.elapsed();
     assert_eq!(reply_error(&r), 0, "map {i}");
@@ -1395,13 +1419,19 @@ fn dax_shared_store(page: usize, tag: &str) -> slates_vfs::volume::Store {
   use slates_mem::{ExclusiveObject, SharedObject, Words};
   const REGION_PAGES: usize = 64;
   // The name is unique per test (tag), so parallel tests never collide on one `shm` object.
-  let object =
-    SharedObject::create(&format!("sl-ds-{tag}-{}", std::process::id()), page * REGION_PAGES, Words::new())
-      .unwrap();
+  let object = SharedObject::create(
+    &format!("sl-ds-{tag}-{}", std::process::id()),
+    page * REGION_PAGES,
+    Words::new(),
+  )
+  .unwrap();
   let mut arena = ChunkArena::new(page);
   // SAFETY: this test is the object's only mapper; it declares no words.
   arena
-    .add_region(Region::shared(unsafe { ExclusiveObject::new(object) }, page))
+    .add_region(Region::shared(
+      unsafe { ExclusiveObject::new(object) },
+      page,
+    ))
     .unwrap();
   slates_vfs::volume::Store::new(
     &slates_vfs::volume::StoreConfig {
@@ -1457,11 +1487,19 @@ fn a_guest_setupmapping_maps_the_file_into_the_dax_window_and_removemapping_tear
 
   let (mut device, mut driver) = device_and_driver();
   // The VMM's cache window: a shared object the device maps block pages into.
-  let cache = SharedObject::create(&format!("sl-daxwin-{}", std::process::id()), page * 4, Words::new()).unwrap();
+  let cache = SharedObject::create(
+    &format!("sl-daxwin-{}", std::process::id()),
+    page * 4,
+    Words::new(),
+  )
+  .unwrap();
   device.install_dax_window(Some(
     slates_bridge_virtiofs::dax::DaxCacheRegion::new(cache.as_fd(), (page * 4) as u64).unwrap(),
   ));
-  assert!(device.dax_offered(), "the device serves DAX now a window is installed");
+  assert!(
+    device.dax_offered(),
+    "the device serves DAX now a window is installed"
+  );
 
   let cx = context();
   let mut bridge = VolumeBridge::new(vid(), &mut vol, &mut store);
@@ -1473,7 +1511,14 @@ fn a_guest_setupmapping_maps_the_file_into_the_dax_window_and_removemapping_tear
   init.extend_from_slice(&0u32.to_le_bytes()); // max_readahead
   init.extend_from_slice(&0u32.to_le_bytes()); // flags
   init.resize(64, 0); // the kernel sends a 64-byte init_in; the codec reads what it needs
-  let init_reply = dax_exchange(&mut device, &mut driver, &mut bridge, &cx, (Opcode::Init, 1, ROOT), &init);
+  let init_reply = dax_exchange(
+    &mut device,
+    &mut driver,
+    &mut bridge,
+    &cx,
+    (Opcode::Init, 1, ROOT),
+    &init,
+  );
   assert_eq!(reply_error(&init_reply), 0, "INIT served");
 
   // FUSE_SETUPMAPPING: fh, foffset=0, len=page, flags=WRITE, moffset=0.
@@ -1483,9 +1528,19 @@ fn a_guest_setupmapping_maps_the_file_into_the_dax_window_and_removemapping_tear
   setup.extend_from_slice(&(page as u64).to_le_bytes()); // len
   setup.extend_from_slice(&slates_bridge_fuse::request::SETUPMAPPING_FLAG_WRITE.to_le_bytes()); // flags = write
   setup.extend_from_slice(&0u64.to_le_bytes()); // moffset
-  let setup_reply =
-    dax_exchange(&mut device, &mut driver, &mut bridge, &cx, (Opcode::SetupMapping, 2, nodeid), &setup);
-  assert_eq!(reply_error(&setup_reply), 0, "SETUPMAPPING succeeded over the DAX window");
+  let setup_reply = dax_exchange(
+    &mut device,
+    &mut driver,
+    &mut bridge,
+    &cx,
+    (Opcode::SetupMapping, 2, nodeid),
+    &setup,
+  );
+  assert_eq!(
+    reply_error(&setup_reply),
+    0,
+    "SETUPMAPPING succeeded over the DAX window"
+  );
   assert_eq!(device.dax_window_count(), 1, "one live window mapping");
 
   // The window shows the file's bytes — the guest would reach these through its own page table, no daemon call.
@@ -1500,10 +1555,20 @@ fn a_guest_setupmapping_maps_the_file_into_the_dax_window_and_removemapping_tear
   remove.extend_from_slice(&1u32.to_le_bytes()); // count
   remove.extend_from_slice(&0u64.to_le_bytes()); // moffset
   remove.extend_from_slice(&(page as u64).to_le_bytes()); // len
-  let remove_reply =
-    dax_exchange(&mut device, &mut driver, &mut bridge, &cx, (Opcode::RemoveMapping, 3, nodeid), &remove);
+  let remove_reply = dax_exchange(
+    &mut device,
+    &mut driver,
+    &mut bridge,
+    &cx,
+    (Opcode::RemoveMapping, 3, nodeid),
+    &remove,
+  );
   assert_eq!(reply_error(&remove_reply), 0, "REMOVEMAPPING succeeded");
-  assert_eq!(device.dax_window_count(), 0, "the window mapping was torn down");
+  assert_eq!(
+    device.dax_window_count(),
+    0,
+    "the window mapping was torn down"
+  );
 
   drop(cache);
 }
@@ -1552,24 +1617,52 @@ fn a_writable_dax_setupmapping_without_opt_in_is_refused() {
   let nodeid = no.0;
 
   let (mut device, mut driver) = device_and_driver();
-  let cache = SharedObject::create(&format!("sl-daxA-{}", std::process::id()), page * 4, Words::new()).unwrap();
+  let cache = SharedObject::create(
+    &format!("sl-daxA-{}", std::process::id()),
+    page * 4,
+    Words::new(),
+  )
+  .unwrap();
   device.install_dax_window(Some(
     slates_bridge_virtiofs::dax::DaxCacheRegion::new(cache.as_fd(), (page * 4) as u64).unwrap(),
   ));
   let cx = context();
   let mut bridge = VolumeBridge::new(vid(), &mut vol, &mut store);
-  dax_exchange(&mut device, &mut driver, &mut bridge, &cx, (Opcode::Init, 1, ROOT), &dax_init_body());
+  dax_exchange(
+    &mut device,
+    &mut driver,
+    &mut bridge,
+    &cx,
+    (Opcode::Init, 1, ROOT),
+    &dax_init_body(),
+  );
 
   let w = dax_exchange(
-    &mut device, &mut driver, &mut bridge, &cx,
-    (Opcode::SetupMapping, 2, nodeid), &dax_setup_body(0, page as u64, true, 0),
+    &mut device,
+    &mut driver,
+    &mut bridge,
+    &cx,
+    (Opcode::SetupMapping, 2, nodeid),
+    &dax_setup_body(0, page as u64, true, 0),
   );
-  assert_eq!(reply_error(&w), -1, "writable DAX refused EPERM without opt-in");
-  assert_eq!(device.dax_window_count(), 0, "no window for the refused writable map");
+  assert_eq!(
+    reply_error(&w),
+    -1,
+    "writable DAX refused EPERM without opt-in"
+  );
+  assert_eq!(
+    device.dax_window_count(),
+    0,
+    "no window for the refused writable map"
+  );
 
   let r = dax_exchange(
-    &mut device, &mut driver, &mut bridge, &cx,
-    (Opcode::SetupMapping, 3, nodeid), &dax_setup_body(0, page as u64, false, 0),
+    &mut device,
+    &mut driver,
+    &mut bridge,
+    &cx,
+    (Opcode::SetupMapping, 3, nodeid),
+    &dax_setup_body(0, page as u64, false, 0),
   );
   assert_eq!(reply_error(&r), 0, "read-only DAX served without opt-in");
   assert_eq!(device.dax_window_count(), 1, "the read-only window is live");
@@ -1592,21 +1685,45 @@ fn a_setupmapping_past_the_window_is_refused() {
   let nodeid = no.0;
 
   let (mut device, mut driver) = device_and_driver();
-  let cache = SharedObject::create(&format!("sl-daxB-{}", std::process::id()), page * 4, Words::new()).unwrap();
+  let cache = SharedObject::create(
+    &format!("sl-daxB-{}", std::process::id()),
+    page * 4,
+    Words::new(),
+  )
+  .unwrap();
   device.install_dax_window(Some(
     slates_bridge_virtiofs::dax::DaxCacheRegion::new(cache.as_fd(), (page * 4) as u64).unwrap(),
   ));
   let cx = context();
   let mut bridge = VolumeBridge::new(vid(), &mut vol, &mut store);
-  dax_exchange(&mut device, &mut driver, &mut bridge, &cx, (Opcode::Init, 1, ROOT), &dax_init_body());
+  dax_exchange(
+    &mut device,
+    &mut driver,
+    &mut bridge,
+    &cx,
+    (Opcode::Init, 1, ROOT),
+    &dax_init_body(),
+  );
 
   // moffset = the window's end: the whole requested range is outside it.
   let reply = dax_exchange(
-    &mut device, &mut driver, &mut bridge, &cx,
-    (Opcode::SetupMapping, 2, nodeid), &dax_setup_body(0, page as u64, true, (page * 4) as u64),
+    &mut device,
+    &mut driver,
+    &mut bridge,
+    &cx,
+    (Opcode::SetupMapping, 2, nodeid),
+    &dax_setup_body(0, page as u64, true, (page * 4) as u64),
   );
-  assert_eq!(reply_error(&reply), -22, "a map past the window is refused EINVAL");
-  assert_eq!(device.dax_window_count(), 0, "nothing mapped past the window");
+  assert_eq!(
+    reply_error(&reply),
+    -22,
+    "a map past the window is refused EINVAL"
+  );
+  assert_eq!(
+    device.dax_window_count(),
+    0,
+    "nothing mapped past the window"
+  );
   drop(cache);
 }
 
@@ -1632,43 +1749,83 @@ fn a_remap_over_an_occupied_window_slot_revokes_the_old_mapping() {
   let (a_no, b_no) = (a.0, b.0);
 
   let (mut device, mut driver) = device_and_driver();
-  let cache =
-    SharedObject::create(&format!("sl-daxremap-{}", std::process::id()), page * 4, Words::new()).unwrap();
+  let cache = SharedObject::create(
+    &format!("sl-daxremap-{}", std::process::id()),
+    page * 4,
+    Words::new(),
+  )
+  .unwrap();
   device.install_dax_window(Some(
     slates_bridge_virtiofs::dax::DaxCacheRegion::new(cache.as_fd(), (page * 4) as u64).unwrap(),
   ));
   let cx = context();
   let mut bridge = VolumeBridge::new(vid(), &mut vol, &mut store);
-  dax_exchange(&mut device, &mut driver, &mut bridge, &cx, (Opcode::Init, 1, ROOT), &dax_init_body());
+  dax_exchange(
+    &mut device,
+    &mut driver,
+    &mut bridge,
+    &cx,
+    (Opcode::Init, 1, ROOT),
+    &dax_init_body(),
+  );
 
   let ra = dax_exchange(
-    &mut device, &mut driver, &mut bridge, &cx,
-    (Opcode::SetupMapping, 2, a_no), &dax_setup_body(0, page as u64, true, 0),
+    &mut device,
+    &mut driver,
+    &mut bridge,
+    &cx,
+    (Opcode::SetupMapping, 2, a_no),
+    &dax_setup_body(0, page as u64, true, 0),
   );
   assert_eq!(reply_error(&ra), 0, "A mapped at window offset 0");
   assert_eq!(device.dax_window_count(), 1, "one window after A");
 
   let rb = dax_exchange(
-    &mut device, &mut driver, &mut bridge, &cx,
-    (Opcode::SetupMapping, 3, b_no), &dax_setup_body(0, page as u64, true, 0),
+    &mut device,
+    &mut driver,
+    &mut bridge,
+    &cx,
+    (Opcode::SetupMapping, 3, b_no),
+    &dax_setup_body(0, page as u64, true, 0),
   );
   assert_eq!(reply_error(&rb), 0, "B remapped over A's slot");
-  assert_eq!(device.dax_window_count(), 1, "still one window after the remap — A's entry did not leak");
-  assert_eq!(device.dax_window_bytes(0, 64).unwrap(), vec![0xBB; 64], "the window now shows B, not A");
+  assert_eq!(
+    device.dax_window_count(),
+    1,
+    "still one window after the remap — A's entry did not leak"
+  );
+  assert_eq!(
+    device.dax_window_bytes(0, 64).unwrap(),
+    vec![0xBB; 64],
+    "the window now shows B, not A"
+  );
 
   let mut remove = Vec::new();
   remove.extend_from_slice(&1u32.to_le_bytes());
   remove.extend_from_slice(&0u64.to_le_bytes());
   remove.extend_from_slice(&(page as u64).to_le_bytes());
   let rr = dax_exchange(
-    &mut device, &mut driver, &mut bridge, &cx, (Opcode::RemoveMapping, 4, b_no), &remove,
+    &mut device,
+    &mut driver,
+    &mut bridge,
+    &cx,
+    (Opcode::RemoveMapping, 4, b_no),
+    &remove,
   );
   assert_eq!(reply_error(&rr), 0, "REMOVEMAPPING of offset 0 served");
   assert_eq!(device.dax_window_count(), 0, "no window entry left");
 
   drop(bridge);
-  assert_eq!(store.dax.len(), 0, "no live mapping in the registry — neither A nor B leaked");
-  assert_eq!(store.dax.revoked(), 2, "both A (at the remap) and B (at REMOVEMAPPING) were revoked");
+  assert_eq!(
+    store.dax.len(),
+    0,
+    "no live mapping in the registry — neither A nor B leaked"
+  );
+  assert_eq!(
+    store.dax.revoked(),
+    2,
+    "both A (at the remap) and B (at REMOVEMAPPING) were revoked"
+  );
   drop(cache);
 }
 
@@ -1690,28 +1847,62 @@ fn fuse_destroy_tears_down_live_dax_windows() {
   let nodeid = no.0;
 
   let (mut device, mut driver) = device_and_driver();
-  let cache =
-    SharedObject::create(&format!("sl-daxdestroy-{}", std::process::id()), page * 4, Words::new()).unwrap();
+  let cache = SharedObject::create(
+    &format!("sl-daxdestroy-{}", std::process::id()),
+    page * 4,
+    Words::new(),
+  )
+  .unwrap();
   device.install_dax_window(Some(
     slates_bridge_virtiofs::dax::DaxCacheRegion::new(cache.as_fd(), (page * 4) as u64).unwrap(),
   ));
   let cx = context();
   let mut bridge = VolumeBridge::new(vid(), &mut vol, &mut store);
-  dax_exchange(&mut device, &mut driver, &mut bridge, &cx, (Opcode::Init, 1, ROOT), &dax_init_body());
+  dax_exchange(
+    &mut device,
+    &mut driver,
+    &mut bridge,
+    &cx,
+    (Opcode::Init, 1, ROOT),
+    &dax_init_body(),
+  );
   let r = dax_exchange(
-    &mut device, &mut driver, &mut bridge, &cx,
-    (Opcode::SetupMapping, 2, nodeid), &dax_setup_body(0, page as u64, true, 0),
+    &mut device,
+    &mut driver,
+    &mut bridge,
+    &cx,
+    (Opcode::SetupMapping, 2, nodeid),
+    &dax_setup_body(0, page as u64, true, 0),
   );
   assert_eq!(reply_error(&r), 0, "mapped");
   assert_eq!(device.dax_window_count(), 1, "one live window");
 
-  let d = dax_exchange(&mut device, &mut driver, &mut bridge, &cx, (Opcode::Destroy, 3, ROOT), &[]);
+  let d = dax_exchange(
+    &mut device,
+    &mut driver,
+    &mut bridge,
+    &cx,
+    (Opcode::Destroy, 3, ROOT),
+    &[],
+  );
   assert_eq!(reply_error(&d), 0, "DESTROY served");
-  assert_eq!(device.dax_window_count(), 0, "the live window was torn down at unmount");
+  assert_eq!(
+    device.dax_window_count(),
+    0,
+    "the live window was torn down at unmount"
+  );
 
   drop(bridge);
-  assert_eq!(store.dax.len(), 0, "the registry holds no live mapping after unmount — the pin was not leaked");
-  assert_eq!(store.dax.revoked(), 1, "the mapped block was revoked at teardown");
+  assert_eq!(
+    store.dax.len(),
+    0,
+    "the registry holds no live mapping after unmount — the pin was not leaked"
+  );
+  assert_eq!(
+    store.dax.revoked(),
+    1,
+    "the mapped block was revoked at teardown"
+  );
   drop(cache);
 }
 
@@ -1734,28 +1925,55 @@ fn release_dax_tears_down_live_windows_on_a_disconnect() {
   let nodeid = no.0;
 
   let (mut device, mut driver) = device_and_driver();
-  let cache =
-    SharedObject::create(&format!("sl-daxdisc-{}", std::process::id()), page * 4, Words::new()).unwrap();
+  let cache = SharedObject::create(
+    &format!("sl-daxdisc-{}", std::process::id()),
+    page * 4,
+    Words::new(),
+  )
+  .unwrap();
   device.install_dax_window(Some(
     slates_bridge_virtiofs::dax::DaxCacheRegion::new(cache.as_fd(), (page * 4) as u64).unwrap(),
   ));
   let cx = context();
   let mut bridge = VolumeBridge::new(vid(), &mut vol, &mut store);
-  dax_exchange(&mut device, &mut driver, &mut bridge, &cx, (Opcode::Init, 1, ROOT), &dax_init_body());
+  dax_exchange(
+    &mut device,
+    &mut driver,
+    &mut bridge,
+    &cx,
+    (Opcode::Init, 1, ROOT),
+    &dax_init_body(),
+  );
   let r = dax_exchange(
-    &mut device, &mut driver, &mut bridge, &cx,
-    (Opcode::SetupMapping, 2, nodeid), &dax_setup_body(0, page as u64, true, 0),
+    &mut device,
+    &mut driver,
+    &mut bridge,
+    &cx,
+    (Opcode::SetupMapping, 2, nodeid),
+    &dax_setup_body(0, page as u64, true, 0),
   );
   assert_eq!(reply_error(&r), 0, "mapped");
   assert_eq!(device.dax_window_count(), 1, "one live window");
 
   // The disconnect terminal step (no DESTROY): reclaim calls this with the attachment's bridge.
   device.release_dax(&mut bridge, &cx);
-  assert_eq!(device.dax_window_count(), 0, "the live window was torn down on the disconnect");
+  assert_eq!(
+    device.dax_window_count(),
+    0,
+    "the live window was torn down on the disconnect"
+  );
 
   drop(bridge);
-  assert_eq!(store.dax.len(), 0, "the registry holds no live mapping after the disconnect — no leaked pin");
-  assert_eq!(store.dax.revoked(), 1, "the mapped block was revoked at the disconnect teardown");
+  assert_eq!(
+    store.dax.len(),
+    0,
+    "the registry holds no live mapping after the disconnect — no leaked pin"
+  );
+  assert_eq!(
+    store.dax.revoked(),
+    1,
+    "the mapped block was revoked at the disconnect teardown"
+  );
   drop(cache);
 }
 
@@ -1782,14 +2000,25 @@ fn hostile_dax_requests_are_refused_and_establish_no_window() {
   let (big_no, tiny_no) = (big.0, tiny.0);
 
   let (mut device, mut driver) = device_and_driver();
-  let cache =
-    SharedObject::create(&format!("sl-daxhostile-{}", std::process::id()), page * 4, Words::new()).unwrap();
+  let cache = SharedObject::create(
+    &format!("sl-daxhostile-{}", std::process::id()),
+    page * 4,
+    Words::new(),
+  )
+  .unwrap();
   device.install_dax_window(Some(
     slates_bridge_virtiofs::dax::DaxCacheRegion::new(cache.as_fd(), (page * 4) as u64).unwrap(),
   ));
   let cx = context();
   let mut bridge = VolumeBridge::new(vid(), &mut vol, &mut store);
-  dax_exchange(&mut device, &mut driver, &mut bridge, &cx, (Opcode::Init, 1, ROOT), &dax_init_body());
+  dax_exchange(
+    &mut device,
+    &mut driver,
+    &mut bridge,
+    &cx,
+    (Opcode::Init, 1, ROOT),
+    &dax_init_body(),
+  );
 
   // Hostile SETUPMAPPING bodies: a truncated body (the parser needs 5x u64), a colossal len (overflows the block/
   // window bound), an unaligned window offset (the map is refused and the block it briefly pinned is unpinned), and
@@ -1797,12 +2026,39 @@ fn hostile_dax_requests_are_refused_and_establish_no_window() {
   // released — a hostile guest establishes no mapping.
   let page_len = page as u64;
   for (unique, nodeid, body, why) in [
-    (2u64, big_no, [0u8; 20].to_vec(), "a truncated SETUPMAPPING body"),
-    (3, big_no, dax_setup_body(0, u64::MAX, true, 0), "len = u64::MAX"),
-    (4, big_no, dax_setup_body(0, page_len, true, 1), "an unaligned moffset"),
-    (5, tiny_no, dax_setup_body(0, page_len, true, 0), "an inline file"),
+    (
+      2u64,
+      big_no,
+      [0u8; 20].to_vec(),
+      "a truncated SETUPMAPPING body",
+    ),
+    (
+      3,
+      big_no,
+      dax_setup_body(0, u64::MAX, true, 0),
+      "len = u64::MAX",
+    ),
+    (
+      4,
+      big_no,
+      dax_setup_body(0, page_len, true, 1),
+      "an unaligned moffset",
+    ),
+    (
+      5,
+      tiny_no,
+      dax_setup_body(0, page_len, true, 0),
+      "an inline file",
+    ),
   ] {
-    let r = dax_exchange(&mut device, &mut driver, &mut bridge, &cx, (Opcode::SetupMapping, unique, nodeid), &body);
+    let r = dax_exchange(
+      &mut device,
+      &mut driver,
+      &mut bridge,
+      &cx,
+      (Opcode::SetupMapping, unique, nodeid),
+      &body,
+    );
     assert_ne!(reply_error(&r), 0, "{why} is refused");
     assert_eq!(device.dax_window_count(), 0, "{why} established no window");
   }
@@ -1811,16 +2067,50 @@ fn hostile_dax_requests_are_refused_and_establish_no_window() {
   // short body). Each handled without faulting the device and establishing no window.
   for (unique, body) in [
     (6u64, [0u8; 3].to_vec()),
-    (7, [u32::MAX.to_le_bytes().as_slice(), &0u64.to_le_bytes(), &page_len.to_le_bytes()].concat()),
+    (
+      7,
+      [
+        u32::MAX.to_le_bytes().as_slice(),
+        &0u64.to_le_bytes(),
+        &page_len.to_le_bytes(),
+      ]
+      .concat(),
+    ),
   ] {
-    let _ = dax_exchange(&mut device, &mut driver, &mut bridge, &cx, (Opcode::RemoveMapping, unique, big_no), &body);
-    assert_eq!(device.dax_window_count(), 0, "a hostile REMOVEMAPPING established no window");
+    let _ = dax_exchange(
+      &mut device,
+      &mut driver,
+      &mut bridge,
+      &cx,
+      (Opcode::RemoveMapping, unique, big_no),
+      &body,
+    );
+    assert_eq!(
+      device.dax_window_count(),
+      0,
+      "a hostile REMOVEMAPPING established no window"
+    );
   }
 
   // The device was never faulted: a well-formed map still succeeds.
-  let r = dax_exchange(&mut device, &mut driver, &mut bridge, &cx, (Opcode::SetupMapping, 8, big_no), &dax_setup_body(0, page as u64, true, 0));
-  assert_eq!(reply_error(&r), 0, "a valid map still succeeds after the hostile requests");
-  assert_eq!(device.dax_window_count(), 1, "exactly the one valid window is live");
+  let r = dax_exchange(
+    &mut device,
+    &mut driver,
+    &mut bridge,
+    &cx,
+    (Opcode::SetupMapping, 8, big_no),
+    &dax_setup_body(0, page as u64, true, 0),
+  );
+  assert_eq!(
+    reply_error(&r),
+    0,
+    "a valid map still succeeds after the hostile requests"
+  );
+  assert_eq!(
+    device.dax_window_count(),
+    1,
+    "exactly the one valid window is live"
+  );
   drop(cache);
 }
 
@@ -1860,37 +2150,73 @@ fn a_guest_setupmapping_of_a_directory_maps_its_entries() {
   let root_no = root.0;
 
   let (mut device, mut driver) = device_and_driver();
-  let cache =
-    SharedObject::create(&format!("sl-daxdir-{}", std::process::id()), page * 4, Words::new()).unwrap();
+  let cache = SharedObject::create(
+    &format!("sl-daxdir-{}", std::process::id()),
+    page * 4,
+    Words::new(),
+  )
+  .unwrap();
   device.install_dax_window(Some(
     slates_bridge_virtiofs::dax::DaxCacheRegion::new(cache.as_fd(), (page * 4) as u64).unwrap(),
   ));
   let cx = context();
   let mut bridge = VolumeBridge::new(vid(), &mut vol, &mut store);
-  dax_exchange(&mut device, &mut driver, &mut bridge, &cx, (Opcode::Init, 1, ROOT), &dax_init_body());
+  dax_exchange(
+    &mut device,
+    &mut driver,
+    &mut bridge,
+    &cx,
+    (Opcode::Init, 1, ROOT),
+    &dax_init_body(),
+  );
 
   // SETUPMAPPING the root directory, read-only: the device maps its entries snapshot into the window.
   let reply = dax_exchange(
-    &mut device, &mut driver, &mut bridge, &cx,
-    (Opcode::SetupMapping, 2, root_no), &dax_setup_body(0, page as u64, false, 0),
+    &mut device,
+    &mut driver,
+    &mut bridge,
+    &cx,
+    (Opcode::SetupMapping, 2, root_no),
+    &dax_setup_body(0, page as u64, false, 0),
   );
-  assert_eq!(reply_error(&reply), 0, "a directory SETUPMAPPING maps its entries");
+  assert_eq!(
+    reply_error(&reply),
+    0,
+    "a directory SETUPMAPPING maps its entries"
+  );
   assert_eq!(device.dax_window_count(), 1, "one live directory window");
 
   let raw = device.dax_window_bytes(0, page as u64).unwrap();
   let got = dir_snapshot_names(&raw);
   for name in names {
-    assert!(got.iter().any(|g| g == name), "entry {name} readable from the directory window: {got:?}");
+    assert!(
+      got.iter().any(|g| g == name),
+      "entry {name} readable from the directory window: {got:?}"
+    );
   }
 
   let mut remove = Vec::new();
   remove.extend_from_slice(&1u32.to_le_bytes());
   remove.extend_from_slice(&0u64.to_le_bytes());
   remove.extend_from_slice(&(page as u64).to_le_bytes());
-  let removed =
-    dax_exchange(&mut device, &mut driver, &mut bridge, &cx, (Opcode::RemoveMapping, 3, root_no), &remove);
-  assert_eq!(reply_error(&removed), 0, "REMOVEMAPPING tears the directory window down");
-  assert_eq!(device.dax_window_count(), 0, "the directory window was torn down");
+  let removed = dax_exchange(
+    &mut device,
+    &mut driver,
+    &mut bridge,
+    &cx,
+    (Opcode::RemoveMapping, 3, root_no),
+    &remove,
+  );
+  assert_eq!(
+    reply_error(&removed),
+    0,
+    "REMOVEMAPPING tears the directory window down"
+  );
+  assert_eq!(
+    device.dax_window_count(),
+    0,
+    "the directory window was torn down"
+  );
   drop(cache);
 }
 
@@ -1914,24 +2240,42 @@ fn request_revoke_inode_tears_down_the_daemons_mapping() {
   let nodeid = no.0;
 
   let (mut device, mut driver) = device_and_driver();
-  let cache =
-    SharedObject::create(&format!("sl-daxreq-{}", std::process::id()), page * 4, Words::new()).unwrap();
+  let cache = SharedObject::create(
+    &format!("sl-daxreq-{}", std::process::id()),
+    page * 4,
+    Words::new(),
+  )
+  .unwrap();
   device.install_dax_window(Some(
     slates_bridge_virtiofs::dax::DaxCacheRegion::new(cache.as_fd(), (page * 4) as u64).unwrap(),
   ));
   let cx = context();
   let mut bridge = VolumeBridge::new(vid(), &mut vol, &mut store);
-  dax_exchange(&mut device, &mut driver, &mut bridge, &cx, (Opcode::Init, 1, ROOT), &dax_init_body());
+  dax_exchange(
+    &mut device,
+    &mut driver,
+    &mut bridge,
+    &cx,
+    (Opcode::Init, 1, ROOT),
+    &dax_init_body(),
+  );
   let r = dax_exchange(
-    &mut device, &mut driver, &mut bridge, &cx,
-    (Opcode::SetupMapping, 2, nodeid), &dax_setup_body(0, page as u64, true, 0),
+    &mut device,
+    &mut driver,
+    &mut bridge,
+    &cx,
+    (Opcode::SetupMapping, 2, nodeid),
+    &dax_setup_body(0, page as u64, true, 0),
   );
   assert_eq!(reply_error(&r), 0, "mapped");
   assert_eq!(device.dax_window_count(), 1, "one live window");
 
   // The daemon signals the device to revoke the inode's windows before it touches the block (step 5).
   let torn = device.request_revoke_inode(nodeid, &mut bridge, &cx);
-  assert_eq!(torn, 1, "the daemon-initiated revoke tore down the inode's one window");
+  assert_eq!(
+    torn, 1,
+    "the daemon-initiated revoke tore down the inode's one window"
+  );
   assert_eq!(device.dax_window_count(), 0, "the window was munmapped");
   assert_eq!(
     device.request_revoke_inode(nodeid, &mut bridge, &cx),
@@ -1941,7 +2285,11 @@ fn request_revoke_inode_tears_down_the_daemons_mapping() {
 
   drop(bridge);
   assert_eq!(store.dax.len(), 0, "the registry mapping was revoked");
-  assert_eq!(store.dax.revoked(), 1, "the block was unpinned through the two-phase (release after unmap)");
+  assert_eq!(
+    store.dax.revoked(),
+    1,
+    "the block was unpinned through the two-phase (release after unmap)"
+  );
   drop(cache);
 }
 
@@ -1967,23 +2315,42 @@ fn request_revoke_writable_inode_keeps_the_read_only_window() {
   let nodeid = no.0;
 
   let (mut device, mut driver) = device_and_driver();
-  let cache =
-    SharedObject::create(&format!("sl-daxrw-{}", std::process::id()), page * 4, Words::new()).unwrap();
+  let cache = SharedObject::create(
+    &format!("sl-daxrw-{}", std::process::id()),
+    page * 4,
+    Words::new(),
+  )
+  .unwrap();
   device.install_dax_window(Some(
     slates_bridge_virtiofs::dax::DaxCacheRegion::new(cache.as_fd(), (page * 4) as u64).unwrap(),
   ));
   let cx = context();
   let mut bridge = VolumeBridge::new(vid(), &mut vol, &mut store);
-  dax_exchange(&mut device, &mut driver, &mut bridge, &cx, (Opcode::Init, 1, ROOT), &dax_init_body());
+  dax_exchange(
+    &mut device,
+    &mut driver,
+    &mut bridge,
+    &cx,
+    (Opcode::Init, 1, ROOT),
+    &dax_init_body(),
+  );
   // A writable window at window offset 0 and a read-only window at offset `page`, both of the same inode.
   let w = dax_exchange(
-    &mut device, &mut driver, &mut bridge, &cx,
-    (Opcode::SetupMapping, 2, nodeid), &dax_setup_body(0, page as u64, true, 0),
+    &mut device,
+    &mut driver,
+    &mut bridge,
+    &cx,
+    (Opcode::SetupMapping, 2, nodeid),
+    &dax_setup_body(0, page as u64, true, 0),
   );
   assert_eq!(reply_error(&w), 0, "writable mapped");
   let r = dax_exchange(
-    &mut device, &mut driver, &mut bridge, &cx,
-    (Opcode::SetupMapping, 3, nodeid), &dax_setup_body(0, page as u64, false, page as u64),
+    &mut device,
+    &mut driver,
+    &mut bridge,
+    &cx,
+    (Opcode::SetupMapping, 3, nodeid),
+    &dax_setup_body(0, page as u64, false, page as u64),
   );
   assert_eq!(reply_error(&r), 0, "read-only mapped");
   assert_eq!(device.dax_window_count(), 2, "both windows live");
@@ -1991,7 +2358,11 @@ fn request_revoke_writable_inode_keeps_the_read_only_window() {
   // Snapshot's teardown: revoke only the inode's writable windows.
   let torn = device.request_revoke_writable_inode(nodeid, &mut bridge, &cx);
   assert_eq!(torn, 1, "exactly the writable window was torn");
-  assert_eq!(device.dax_window_count(), 1, "the read-only window survives a writable revoke");
+  assert_eq!(
+    device.dax_window_count(),
+    1,
+    "the read-only window survives a writable revoke"
+  );
   assert_eq!(
     device.request_revoke_writable_inode(nodeid, &mut bridge, &cx),
     0,
@@ -2032,8 +2403,12 @@ fn a_write_of_a_mapped_file_enqueues_a_revoke_the_next_service_pass_drains() {
   let nodeid = no.0;
 
   let (mut device, mut driver) = device_and_driver();
-  let cache =
-    SharedObject::create(&format!("sl-daxchan-{}", std::process::id()), page * 4, Words::new()).unwrap();
+  let cache = SharedObject::create(
+    &format!("sl-daxchan-{}", std::process::id()),
+    page * 4,
+    Words::new(),
+  )
+  .unwrap();
   device.install_dax_window(Some(
     slates_bridge_virtiofs::dax::DaxCacheRegion::new(cache.as_fd(), (page * 4) as u64).unwrap(),
   ));
@@ -2042,21 +2417,44 @@ fn a_write_of_a_mapped_file_enqueues_a_revoke_the_next_service_pass_drains() {
   // Pass one: a transient bridge brings the connection up and maps the file writable — one live guest window.
   {
     let mut bridge = VolumeBridge::new(vid(), &mut vol, &mut store);
-    dax_exchange(&mut device, &mut driver, &mut bridge, &cx, (Opcode::Init, 1, ROOT), &dax_init_body());
+    dax_exchange(
+      &mut device,
+      &mut driver,
+      &mut bridge,
+      &cx,
+      (Opcode::Init, 1, ROOT),
+      &dax_init_body(),
+    );
     let r = dax_exchange(
-      &mut device, &mut driver, &mut bridge, &cx,
-      (Opcode::SetupMapping, 2, nodeid), &dax_setup_body(0, page as u64, true, 0),
+      &mut device,
+      &mut driver,
+      &mut bridge,
+      &cx,
+      (Opcode::SetupMapping, 2, nodeid),
+      &dax_setup_body(0, page as u64, true, 0),
     );
     assert_eq!(reply_error(&r), 0, "mapped");
   }
-  assert_eq!(device.dax_window_count(), 1, "one live window after the map pass");
+  assert_eq!(
+    device.dax_window_count(),
+    1,
+    "one live window after the map pass"
+  );
   assert_eq!(store.dax.len(), 1, "the registry holds the live mapping");
 
   // Between passes a client on the shard writes the mapped file. The VFS write boundary revokes the inode's mappings
   // (phase one): the registry entry goes, the block stays pinned, and the inode is enqueued for the device.
   vol.write(&mut store, no, 0, &vec![0xA5; page]).unwrap();
-  assert_eq!(store.dax.len(), 0, "the write revoked the mapping (phase one)");
-  assert_eq!(store.dax.revoked(), 1, "phase one counted the revoke; the block is still pinned");
+  assert_eq!(
+    store.dax.len(),
+    0,
+    "the write revoked the mapping (phase one)"
+  );
+  assert_eq!(
+    store.dax.revoked(),
+    1,
+    "phase one counted the revoke; the block is still pinned"
+  );
 
   // Pass two: a fresh transient bridge. The daemon drains its pending revokes and tears the guest window down.
   {
@@ -2077,6 +2475,95 @@ fn a_write_of_a_mapped_file_enqueues_a_revoke_the_next_service_pass_drains() {
       "the queue is drained — a later pass does no redundant work"
     );
   }
-  assert_eq!(device.dax_window_count(), 0, "the guest window was unmapped");
+  assert_eq!(
+    device.dax_window_count(),
+    0,
+    "the guest window was unmapped"
+  );
+  drop(cache);
+}
+
+/// §4.6 "revoke on advance": the device re-validates its live DAX windows against its current view and tears any the
+/// view no longer backs, keeping those still current. A snapshot reader's `advance` to a newer snapshot moves some
+/// inodes' content to new blocks without enqueuing a per-inode revoke (which would tear *every* reader's windows,
+/// not just the one moving), so the advancing device re-validates its own windows here and tears exactly the stale
+/// ones — the guest re-maps against the new view. Do: map two files' windows; move one file's content so its block
+/// and length no longer match its window (the change an advance presents), leaving the other untouched; re-validate.
+/// Expect: the stale window is torn (1), the current window survives, and a second re-validate tears nothing. The
+/// transient per-pass bridge models the shard between the device loop's passes (as the channel test above).
+#[cfg(unix)]
+#[test]
+fn an_advance_revalidate_tears_the_stale_window_and_keeps_the_current_one() {
+  use slates_mem::{SharedObject, Words};
+  let page = rustix::param::page_size().max(1);
+  let mut store = dax_shared_store(page, "revalidate");
+  let mut vol = volume(&mut store);
+  vol.enable_writable_dax();
+  let root = vol.root_inode(&store).unwrap();
+  let a = vol.create_file_no(&mut store, root, "a", 0o644).unwrap();
+  let b = vol.create_file_no(&mut store, root, "b", 0o644).unwrap();
+  vol.write(&mut store, a, 0, &vec![0xA1; page]).unwrap();
+  vol.write(&mut store, b, 0, &vec![0xB2; page]).unwrap();
+
+  let (mut device, mut driver) = device_and_driver();
+  let cache = SharedObject::create(
+    &format!("sl-daxrev-{}", std::process::id()),
+    page * 4,
+    Words::new(),
+  )
+  .unwrap();
+  device.install_dax_window(Some(
+    slates_bridge_virtiofs::dax::DaxCacheRegion::new(cache.as_fd(), (page * 4) as u64).unwrap(),
+  ));
+  let cx = context();
+
+  // Map one read-only window of each file (a snapshot reader's windows).
+  {
+    let mut bridge = VolumeBridge::new(vid(), &mut vol, &mut store);
+    dax_exchange(
+      &mut device,
+      &mut driver,
+      &mut bridge,
+      &cx,
+      (Opcode::Init, 1, ROOT),
+      &dax_init_body(),
+    );
+    let wa = dax_exchange(
+      &mut device,
+      &mut driver,
+      &mut bridge,
+      &cx,
+      (Opcode::SetupMapping, 2, a.0),
+      &dax_setup_body(0, page as u64, false, 0),
+    );
+    assert_eq!(reply_error(&wa), 0, "a mapped");
+    let wb = dax_exchange(
+      &mut device,
+      &mut driver,
+      &mut bridge,
+      &cx,
+      (Opcode::SetupMapping, 3, b.0),
+      &dax_setup_body(0, page as u64, false, page as u64),
+    );
+    assert_eq!(reply_error(&wb), 0, "b mapped");
+  }
+  assert_eq!(device.dax_window_count(), 2, "both windows live");
+
+  // `a`'s content moves to a new block and length (the change an advance to a newer snapshot presents); `b` is
+  // untouched, so its window still names the current block.
+  vol.write(&mut store, a, 0, &vec![0xA2; page * 2]).unwrap();
+
+  // The advance kick: the device re-validates its windows against the current view.
+  {
+    let mut bridge = VolumeBridge::new(vid(), &mut vol, &mut store);
+    let torn = device.revalidate_windows(&mut bridge, &cx);
+    assert_eq!(torn, 1, "exactly the stale window (a) was torn");
+    assert_eq!(device.dax_window_count(), 1, "b's current window survives");
+    assert_eq!(
+      device.revalidate_windows(&mut bridge, &cx),
+      0,
+      "a second re-validate finds every remaining window current and tears nothing"
+    );
+  }
   drop(cache);
 }

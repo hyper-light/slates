@@ -423,13 +423,19 @@ pub fn dax_shared_store(tag: &str) -> Store {
   // the real page on macOS arm64 (16 KiB). The region holds a small, fixed number of those pages.
   let page = rustix::param::page_size().max(1);
   const PAGES: usize = 64;
-  let object =
-    SharedObject::create(&format!("sl-cmn-ds-{tag}-{}", std::process::id()), page * PAGES, Words::new())
-      .unwrap();
+  let object = SharedObject::create(
+    &format!("sl-cmn-ds-{tag}-{}", std::process::id()),
+    page * PAGES,
+    Words::new(),
+  )
+  .unwrap();
   let mut arena = ChunkArena::new(page);
   // SAFETY: this test is the object's only mapper; it declares no words.
   arena
-    .add_region(Region::shared(unsafe { ExclusiveObject::new(object) }, page))
+    .add_region(Region::shared(
+      unsafe { ExclusiveObject::new(object) },
+      page,
+    ))
     .unwrap();
   Store::new(
     &StoreConfig {

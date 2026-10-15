@@ -1539,4 +1539,16 @@ impl Bridge for VolumeBridge<'_> {
       .map(|(no, writable_only)| (no.0, writable_only))
       .collect()
   }
+
+  fn dax_window_current(&mut self, mapping: &slates_vfs::dax::Mapping, cx: &OpContext) -> bool {
+    // A window is this reader's to validate only if its context binds this volume and the mapping names it; an
+    // unauthorized or cross-volume window is not current here, so the device tears it (the per-guest window table
+    // makes the cross-volume case unreachable in practice, checked for the same confinement discipline).
+    if self.authorize_read(cx).is_err() || mapping.inode.prefix() != self.volume.prefix() {
+      return false;
+    }
+    // The mapping's block must still be the inode's current content block in this bridge's view; after an advance
+    // the changed inodes' blocks differ and fail this, so the device tears those windows and the guest re-maps.
+    self.volume.dax_still_current(self.store, mapping)
+  }
 }
