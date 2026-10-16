@@ -1209,10 +1209,18 @@ impl Volume {
   /// The changed inodes are marked for the next recovery image.
   pub fn seal_pending(&mut self, store: &mut Store, budget_bytes: u64) -> IdleSweep {
     let mut outcome = IdleSweep::default();
+    let mut deferred: Vec<InodeNo> = Vec::new();
     while outcome.sealed_bytes < budget_bytes {
       let Some(no) = self.idle_pending.pop_first() else {
         break;
       };
+      // Pin-defers-seal (§4.6 "DAX maps the open frontier"): a DAX-mapped (pinned) open block must not be sealed —
+      // sealing encrypts it in place (A-92/A-99) and a live window would then read ciphertext. Defer it and re-queue
+      // so a later sweep seals it once the last mapping of it is revoked and the block unpins.
+      if self.open_block_pinned(store, no) {
+        deferred.push(no);
+        continue;
+      }
       match self.seal_open_body(store, no) {
         Ok(0) => {}
         Ok(bytes) => {
@@ -1222,8 +1230,30 @@ impl Volume {
         Err(_) => outcome.refused = outcome.refused.saturating_add(1),
       }
     }
+    for no in deferred {
+      self.idle_pending.insert(no);
+    }
     outcome.left = u64::try_from(self.idle_pending.len()).unwrap_or(u64::MAX);
     outcome
+  }
+
+  /// Whether inode `no`'s open block is pinned by a live DAX mapping (§4.6 "DAX maps the open frontier"): the idle
+  /// sweep must not seal such a block, since sealing encrypts it in place (A-92/A-99) and a live window would then
+  /// read ciphertext under the guest's MMU. The block unpins when the last mapping of it is revoked, after which a
+  /// later sweep seals it. A no-op in production while DAX is unadvertised (no block is DAX-pinned), it also guards
+  /// the A-135 same-kernel local map, whose pinned block would otherwise be sealed under a live `mmap`.
+  fn open_block_pinned(&self, store: &Store, no: InodeNo) -> bool {
+    let Some(handle) = trie::get(&store.tries, self.inode_root, no) else {
+      return false;
+    };
+    let block = match store.inodes.get(handle) {
+      Ok(inode) => match &inode.body {
+        Body::Open { open, .. } => open.block,
+        _ => return false,
+      },
+      Err(_) => return false,
+    };
+    store.content.arena().is_pinned(block)
   }
 
   /// Seals inode `no`'s open extent into a chunk, if its body has one: the open bytes sealed, or zero.

@@ -23,6 +23,7 @@
 )]
 
 use slates_vfs::dax::{DAX_PAGE, DaxScrub, Mapping, stripe_target};
+use slates_vfs::error::VfsError;
 use slates_vfs::ids::InodeNo;
 use slates_vfs::volume::{Store, Volume};
 
@@ -1506,4 +1507,98 @@ fn a_directory_maps_its_entries_flat_and_revoke_frees_the_snapshot_block() {
     });
     assert!(store.dax_revoke(&m), "revoke cycle {cycle}");
   }
+}
+
+/// A trivial in-test chunk cipher (A-99 shape): seals by XOR-ing every byte (so a sealed block's arena bytes differ
+/// from the plaintext — a guest MMU reading it raw would see ciphertext) and opens by XOR-ing back under a fixed tag.
+/// Enough to make the idle sweep actually *encrypt*, which is what the pin-defers-seal guard must prevent under a live
+/// window.
+struct XorSealCipher;
+impl slates_vfs::content::ChunkCipher for XorSealCipher {
+  fn seal(
+    &self,
+    _key: u32,
+    _version: u64,
+    _index: u32,
+    _last: bool,
+    segment: &mut [u8],
+  ) -> Result<slates_vfs::content::Tag, VfsError> {
+    for b in segment.iter_mut() {
+      *b ^= 0xFF;
+    }
+    Ok([0xAB; 16])
+  }
+  fn open(
+    &self,
+    _key: u32,
+    _version: u64,
+    _index: u32,
+    _last: bool,
+    segment: &mut [u8],
+    tag: &slates_vfs::content::Tag,
+  ) -> Result<(), VfsError> {
+    if *tag != [0xAB; 16] {
+      return Err(VfsError::Integrity);
+    }
+    for b in segment.iter_mut() {
+      *b ^= 0xFF;
+    }
+    Ok(())
+  }
+  fn identity(&self, _key: u32) -> Option<slates_vfs::content::KeyIdentity> {
+    Some([0u8; 32])
+  }
+  fn reference(&mut self, _identity: &slates_vfs::content::KeyIdentity) -> Result<u32, VfsError> {
+    Ok(1)
+  }
+  fn key_for_volume(&mut self, _volume: [u8; 16]) -> Result<u32, VfsError> {
+    Ok(1)
+  }
+}
+
+/// §4.6 (A-135 / the open-frontier rule, **pin-defers-seal**). Do: with at-rest sealing enabled (a key + a cipher),
+/// map a single-block file read-only, then run the idle sweep that would seal — AES-GCM-encrypt in place (A-92/A-99)
+/// — its open block. Expect: the sweep **defers** the seal while a live window pins the block (sealing it would swap
+/// plaintext→ciphertext under the guest's MMU), so the mapping stays current and reads its plaintext; once the mapping
+/// is revoked and the block unpins, a later sweep seals it. Before the guard the sweep sealed the mapped block, so the
+/// mapping went stale (`dax_still_current` false) and a hardware read saw ciphertext.
+#[test]
+fn the_idle_sweep_defers_sealing_a_mapped_block_until_it_is_unmapped() {
+  let mut store = store();
+  // Turn on at-rest sealing: a cipher on the store and a key on the volume, so the sweep actually encrypts.
+  store.content.set_cipher(Box::new(XorSealCipher));
+  let mut volume = volume(&mut store, 1 << 20);
+  volume.set_seal_key(Some(1));
+  let f = file_of(&mut store, &mut volume, "f", 0x5A, DAX_PAGE);
+
+  let mapping = volume.dax_map_read(&mut store, f).unwrap();
+  assert!(
+    volume.dax_still_current(&store, &mapping),
+    "mapped and current before the sweep"
+  );
+
+  // Two ticks age f into the pending set; the sweep then tries to seal it, but the live window pins its block.
+  volume.age_writes();
+  volume.age_writes();
+  let _ = volume.seal_pending(&mut store, u64::MAX);
+  assert!(
+    volume.dax_still_current(&store, &mapping),
+    "the mapped block was NOT sealed under the live window (the sweep deferred it)"
+  );
+  let page = volume.dax_read(&store, &mapping, 0, DAX_PAGE).unwrap();
+  assert!(
+    page.iter().all(|&b| b == 0x5A),
+    "the window still reads the file's plaintext, not XOR ciphertext: {:?}",
+    &page[..8]
+  );
+
+  // Revoke the mapping (the no-live-guest synchronous path unpins immediately); now the sweep may seal it.
+  assert!(store.dax_revoke(&mapping), "the mapping is revoked and the block unpinned");
+  volume.age_writes();
+  volume.age_writes();
+  let _ = volume.seal_pending(&mut store, u64::MAX);
+  assert!(
+    !volume.dax_still_current(&store, &mapping),
+    "once unmapped, the sweep sealed the block (the deferral lifted)"
+  );
 }
