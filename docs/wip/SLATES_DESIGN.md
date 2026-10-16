@@ -2796,9 +2796,73 @@ same-namespace host process is the first delivered case.
 > `an_advance_revalidate_tears_the_stale_window_and_keeps_the_current_one`, the step-5 and snapshot-recall cases
 > (`crates/bridge-virtiofs/tests/device.rs`), and `crates/vfs/tests/dax.rs`. The authorized window is the file's own
 > pages — `file_len` rounded up to the window granule (`DaxCacheRegion::page`), capped at the block — not the buddy
-> block's power-of-two padding, so a guest can never map a page lying entirely past its file
-> (`a_setupmapping_of_the_block_padding_past_the_file_is_refused`); the sub-file tail of the last page reads zero by
-> the map-time scrub, so the surface the host shares with a guest is the file's pages and no more.
+> block's power-of-two padding; a request reaching past the file is capped to those pages and a map starting entirely
+> past them is refused (`a_setupmapping_reaching_past_the_file_is_capped_to_its_authorized_pages`); the sub-file tail
+> of the last page reads zero by the map-time scrub, so the surface the host shares with a guest is the file's pages
+> and no more.
+
+> **Status (DAX: live vhost-user binding, inline files, and the at-rest-sealing limit, 2026-10-16).** The device-seam
+> wiring above is now proven against a *real* VMM, inline files map, and the file-shape scope with its one hard limit
+> is settled. **The message-based vhost-user DAX binding is built and proven end to end on x86_64 Linux (KVM):** a
+> real crosvm guest mounts the volume `-o dax=always` and reads a 32 KiB file through an `mmap`, getting the exact
+> bytes back — the read went `FUSE_SETUPMAPPING` → `VHOST_USER_BACKEND_SHMEM_MAP` over the back-end channel and slates
+> mapped the content block into the guest's DAX window, not FUSE_READ (`crates/client/examples/crosvm_dax_ab`, the
+> recorded A/B; the non-DAX arm reads the same file over FUSE_READ). The async map-ack park — `serve_dax` sends
+> SHMEM_MAP and parks the chain, the serve loop awaits the back-end-request fd and `complete_dax_awaiting` answers the
+> guest on the ack — mirrors the landing barrier, and has an in-tree hermetic proof with a stand-in front end
+> (`a_message_based_setupmapping_parks_until_the_front_end_acks_then_answers_the_guest`,
+> `crates/bridge-virtiofs/tests/device.rs`). **Inline files map too:** a file whose bytes live in the inode (no
+> content block) is materialized into a throwaway page block the mapping owns, exactly as a directory's entries are
+> (`Volume::dax_map_read`'s inline branch over `map_owned_block`,
+> `an_inline_file_is_mapped_read_only_through_a_materialized_block`); this fixed a latent bug where a materialized
+> (snapshot) mapping read as permanently stale on the local-client path — `dax_still_current` compared a throwaway
+> block against `file_block` and now returns `is_live` for a snapshot mapping, as the guest path (`dax_read_raw`)
+> already did.
+>
+> **The one hard limit — multi-block files — and why.** A file larger than one chunk (`chunk_bytes`, 64 KiB on a
+> 4 KiB page) reads correctly over **FUSE_READ** but is not zero-copy-DAX-mapped, because of **at-rest sealing
+> (A-92/A-99)**: a sealed chunk's arena block holds AES-GCM **ciphertext** (`ChunkSeal`; a read decrypts through
+> `open_into`), and `Body::Open` holds exactly one *open* (plaintext) chunk over its sealed ones — so every chunk but
+> the open tail is ciphertext a guest's MMU would read raw. FUSE_READ is the copy path the body sanctions where
+> zero-copy is not physically possible.
+>
+> **Decision (DAX maps the open frontier; one representation, no cache; supersedes both a volume-wide plaintext-at-rest
+> opt-out and a decrypted-chunk cache).** A cache of decrypted chunks was considered and **rejected**: it is a second
+> copy of the content and would owe coherence against every mutation (write, truncate, snapshot, advance, migrate,
+> takeover) — the divergent state (staleness, invalidation races, a parallel store) slates is built to *not* have
+> (single writer per volume, no global catalog, invalidate-by-revoke). DAX instead uses the chunk's *own* single live
+> representation: a chunk is **open** (plaintext, the canonical bytes the inode points at) **or sealed** (ciphertext),
+> and `reopen` is a transition between them, never a coexisting copy. **The rule: a DAX window exists only over a
+> chunk in its open (plaintext) state; a sealed chunk falls back to FUSE_READ.** Three lifecycle transitions govern a
+> window, each on machinery already built:
+> - **Map.** A `SETUPMAPPING` whose offset is in the open chunk maps it (the existing DAX pin on the block, the
+>   existing cap to the file's pages); an offset in a sealed chunk is refused and the guest FUSE_READs that range.
+>   Because a file has at most one open chunk, the device maps **at most one chunk per file** — no
+>   N-`SHMEM_MAP`-per-request and no N-ack park; it is the single-chunk map path plus a sealed-refuse gate.
+> - **Write to a mapped chunk.** The existing step-5 two-phase revoke fires and the guest re-faults onto the new
+>   bytes; unchanged.
+> - **The chunk cools (the idle sweep would seal it).** The one new interaction, on existing tools. By default the
+>   **pin defers the seal**: the DAX pin already stops reuse/free of a mapped block, and it extends to stop the
+>   *encrypt*, since sealing a block the guest is reading would swap plaintext→ciphertext under its live MMU — so a
+>   mapped chunk stays open for the map's life and seals when the last window drops. The exception is **growth**: if
+>   the writer appends past the mapped chunk a new tail must open and the body holds exactly one open chunk, so the
+>   mapped chunk is **force-sealed** — its windows two-phase-revoked first (the snapshot-recall pattern:
+>   revoke-pending, wait for the device to confirm the unmap and cross-core TLB flush, then encrypt) and the guest
+>   re-faults onto FUSE_READ.
+>
+> The only genuinely new wiring is "a pin defers a seal, and a forced seal revokes first," strictly symmetric with "a
+> pin defers a free" and "a write revokes." The guest sees zero-copy over the hot/open frontier it is using and
+> transparent FUSE_READ for cooled or never-touched content — DAX tracks the working set *by construction*, not by a
+> store that can go stale. The cost, stated plainly: a chunk is plaintext-at-rest while a window pins it open (bounded
+> by the map), the same "plaintext only while in use" A-99 already allows for an open block — no new exposure class,
+> no second copy. **Owed (advertisement-gated):** the gate that maps the open chunk at a `SETUPMAPPING`'s offset and
+> refuses a sealed one; the pin-defers-seal and force-seal-revoke wiring in the seal/open paths (the recovery oracle
+> the arbiter); the device's sealed-refuse; and a multi-block harness A/B (the open tail zero-copy, the sealed body
+> FUSE_READ). **Gated follow-on (b):** `reopen`-on-map — a read-only map of a *cold* sealed chunk could flip it
+> sealed→open (the same pin/revoke, still one representation, no cache), giving a never-edited large file zero-copy
+> too, at the cost of a read/map triggering a canonical state change (it allocates, decrypts, can fail `NoSpace`,
+> dirties the recovery image, adds re-seal churn) — built only if a read-only-large-file zero-copy workload asks for
+> it. (`GAPS.md`.)
 
 > **Status (virtio-fs, 2026-09-13).** The owned FUSE-over-virtio device exists
 > (`crates/bridge-virtiofs`) and the daemon serves it on the volume's owning shard

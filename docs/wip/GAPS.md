@@ -6242,9 +6242,13 @@ its own page table and never calls the daemon), so the defense had to be at the 
    (2026-10-14/15):** the device serves SETUPMAPPING/REMOVEMAPPING over a real cache window and revokes through
    `dax_revoke_*` on write/truncate (step-5), on `snapshot`/clone (the writable recall), on detach
    (`Device::release_dax`) and on `advance` (`Device::revalidate_windows`, a7f317af — see the advance bullet above).
-   **Owed:** the *map* half — accepting DAX at FUSE_INIT admission and mapping through `dax_map_*` — is deliberately
-   withheld with step 4 (advertise) until step 2 (the tamper-proof/fleet registry) lands; until then DAX stays
-   unadvertised and a request is refused `AttachmentUnsupported`.
+   **The map half is now built and proven live (2026-10-16):** DAX admission (FUSE_INIT `FUSE_CAP_DAX`), `dax_map_*`
+   through the device, and the message-based `VHOST_USER_BACKEND_SHMEM_MAP` binding run end to end — a real crosvm
+   guest reads a file through the DAX window (`crates/client/examples/crosvm_dax_ab`, the recorded A/B), with an
+   in-tree hermetic proof of the map-ack park (`a_message_based_setupmapping_parks_until_the_front_end_acks_then_answers_the_guest`).
+   It stays **withheld in production** with step 4 (advertise) until step 2 (the tamper-proof/fleet registry) lands:
+   the `FUSE_CAP_DAX` advertise is flipped only by the A/B harness, and a production DAX request is refused
+   `AttachmentUnsupported`.
 
 2. **Make the registry un-fabricable and tamper-proof, including across the fleet.** No agent may interfere with,
    fabricate or tamper with the registry. The design, given slates' distributed nature:
@@ -6267,6 +6271,27 @@ its own page table and never calls the daemon), so the defense had to be at the 
      "Destroy/revoke releases credits only after … mappings"), so no other node's merge/`advance`/landing reclaims a
      version a remote mapping pins. On takeover the dead owner's guests die with it, so the successor starts with no
      mappings — nothing to inherit or forge.
+
+3. **File-shape scope and the open-frontier rule (2026-10-16).** DAX maps a chunk only in its **open (plaintext)**
+   representation; a **sealed** chunk (AES-GCM at-rest, A-92/A-99) reads over **FUSE_READ** — a guest's MMU would read
+   ciphertext. **Built:** single-block *unsealed* files map their block directly, and **inline** files are
+   materialized into a throwaway page block the mapping owns (`Volume::dax_map_read`,
+   `an_inline_file_is_mapped_read_only_through_a_materialized_block`; the snapshot `dax_still_current` fix rides it).
+   A multi-block file reads correctly over FUSE_READ; its open tail is not yet mapped. **Owed — the open-frontier rule
+   (SLATES_DESIGN.md §4.6 "DAX maps the open frontier", advertisement-gated):** the gate that maps the open chunk at a
+   `SETUPMAPPING`'s offset and refuses a sealed one (the open tail of a growing/edited file is then zero-copy, the
+   sealed body FUSE_READ); **pin-defers-seal** (the DAX pin extends to block the *encrypt* of a mapped chunk, not just
+   its free/reuse, so a seal never swaps plaintext→ciphertext under a live window) and **force-seal-revoke-on-growth**
+   (a mapped chunk yields the file's single open slot to a new tail through the two-phase revoke) — both in the
+   seal/open paths, with the recovery oracle (`cargo test -p slates-server --test recovery`) the arbiter; and the
+   device's sealed-refuse. Because a file has exactly one open chunk, the device needs **no** N-`SHMEM_MAP`-per-request
+   and no N-ack park. **Rejected:** a decrypted-chunk cache (a divergent second copy owing coherence against every
+   mutation — the staleness/timing/correctness slates avoids) and a volume-wide plaintext-at-rest opt-out (surrenders
+   A-92/condition-9 for the whole volume); the open-frontier rule keeps one representation and leans entirely on the
+   existing pin/revoke/single-writer. **Gated follow-on (b):** `reopen`-on-map flips a *cold* sealed chunk sealed→open
+   on a read map (same pin/revoke, still one representation, no cache), giving a never-edited large file zero-copy too,
+   at the cost of a read/map triggering a canonical state change (it allocates, decrypts, can fail `NoSpace`, dirties
+   the recovery image, adds re-seal churn) — built only if a read-only-large-file zero-copy workload asks for it.
 
 ### 2026-10-13: write delegations were offered unilaterally, costing ~26% of the create-storm's RPCs (A-80 amended)
 
