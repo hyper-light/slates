@@ -222,6 +222,26 @@ pub enum DaxPlacer {
   /// `VHOST_USER_BACKEND_SHMEM_MAP` over the back-end-request channel and the front end maps the block into the guest's
   /// BAR, completing on the front end's acknowledgement) is added next (Piece C).
   Local(DaxCacheRegion),
+  /// An **out-of-process / message-based** VMM (crosvm, QEMU, cloud-hypervisor): the back end does not own the
+  /// window; it asks the front end to place each content block over the back-end-request channel and awaits the
+  /// reply-ack ([`crate::vhost_user::MessagePlacer`]). A SETUPMAPPING's guest reply waits for the front end's
+  /// map-ack (so the guest never faults an unmapped page); a teardown's unpin waits for the unmap-ack (§4.6 #1).
+  /// Linux only (the back-end-request channel is a Linux/vhost-user feature).
+  #[cfg(target_os = "linux")]
+  Message(crate::vhost_user::MessagePlacer<crate::device::DaxWindowEntry>),
+}
+
+impl DaxPlacer {
+  /// The map granule — the multiple a window offset and length must be aligned to (the host page here, or a
+  /// negotiated FUSE_MAP_ALIGNMENT). Both forms expose it so `serve_dax` bounds a mapping the same way.
+  #[must_use]
+  pub fn page(&self) -> usize {
+    match self {
+      DaxPlacer::Local(cache) => cache.page(),
+      #[cfg(target_os = "linux")]
+      DaxPlacer::Message(placer) => placer.page(),
+    }
+  }
 }
 
 #[cfg(test)]

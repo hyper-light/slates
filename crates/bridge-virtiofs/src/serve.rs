@@ -272,8 +272,19 @@ async fn serve_until_idle<S: VmmSeam, B: BridgeAccess>(
       continue;
     }
     match one_pass(admitted, bridge, counters) {
-      Ok(true) => futures::yield_now().await,
-      Ok(false) => return None,
+      Ok(more) => {
+        // A message-based SETUPMAPPING may have parked for the front end's map-ack (§4.6); await it and answer
+        // the guest, and settle any deferred unmap-acks. No-op without a message placer or outstanding request.
+        #[cfg(target_os = "linux")]
+        if let Some(reason) = drive_dax_acks(admitted, bridge).await {
+          return Some(reason);
+        }
+        if more {
+          futures::yield_now().await;
+        } else {
+          return None;
+        }
+      }
       Err(ServeError::Revoked) => return Some(EndReason::Revoked),
       Err(ServeError::Authority(VfsError::NotFound)) => {
         return Some(EndReason::VolumeGone(VfsError::NotFound));
@@ -306,6 +317,39 @@ fn one_pass<S: VmmSeam, B: BridgeAccess>(
   // guest's next kick lands in the spin rather than waking a parked shard (§4.7).
   slates_rt::registry::with_current(|ctx| ctx.note_activity());
   Ok(pass.more_pending)
+}
+
+/// Completes a parked message-based DAX map (§4.6): await the front end's reply-ack on the back-end-request
+/// channel, then answer the guest's SETUPMAPPING; and settle any deferred unmap-acks (unpinning their blocks).
+/// `Some(reason)` when the loop must end — the channel's readiness was lost, the front end closed, or the
+/// attachment's volume is gone. The fd-sharing path has no acks, so this is Linux only; a device with no
+/// outstanding DAX request does nothing.
+#[cfg(target_os = "linux")]
+async fn drive_dax_acks<S: VmmSeam, B: BridgeAccess>(
+  admitted: &mut AdmittedDevice<S>,
+  bridge: &mut B,
+) -> Option<EndReason> {
+  while admitted.dax_map_ack_owed() {
+    let Some(raw) = admitted.dax_ack_raw_fd() else {
+      break;
+    };
+    if let Err(error) = readable(raw).await {
+      return Some(EndReason::DoorbellLost(error));
+    }
+    match bridge.with_bridge(|b, registry| admitted.complete_dax_map(b, registry)) {
+      Ok(Ok(_)) => {}
+      Ok(Err(e)) => return Some(EndReason::Faulted(e)),
+      Err(gone) => return Some(EndReason::VolumeGone(gone)),
+    }
+  }
+  // Opportunistically settle any arrived unmap-acks (deferred unpins) without blocking.
+  if admitted.dax_outstanding() {
+    match bridge.with_bridge(|b, registry| admitted.complete_dax_map(b, registry)) {
+      Ok(Ok(_)) | Err(_) => {}
+      Ok(Err(e)) => return Some(EndReason::Faulted(e)),
+    }
+  }
+  None
 }
 
 /// What the loop counted, reported in [`ServeEnd`].

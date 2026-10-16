@@ -149,6 +149,14 @@ pub trait VmmSeam {
   fn dax_window(&mut self) -> Option<(std::os::fd::BorrowedFd<'_>, u64)> {
     None
   }
+
+  /// The back-end-request channel a message-based VMM (crosvm/QEMU/cloud-hypervisor) hands over for DAX (§4.6),
+  /// with the cache region's size in bytes: admission builds the device's [`crate::dax::DaxPlacer::Message`] from
+  /// it. `None` for the fd-sharing form and the default — then message-based DAX is not served. Linux only.
+  #[cfg(target_os = "linux")]
+  fn dax_message_channel(&mut self) -> Option<(crate::vhost_user::BackendReqChannel, u64)> {
+    None
+  }
 }
 
 /// Why a requested form is unsupported (the `reason` of `AttachmentUnsupported`).
@@ -449,6 +457,17 @@ pub fn admit<S: VmmSeam>(
       .dax_window()
       .and_then(|(fd, len)| crate::dax::DaxCacheRegion::new(fd, len).ok());
     device.install_dax_window(cache);
+    // A message-based VMM (crosvm/QEMU) offers no fd-sharing window; it hands over the back-end-request channel,
+    // which becomes the device's message placer (§4.6). Only when no fd-sharing window was installed.
+    #[cfg(target_os = "linux")]
+    if !device.dax_offered()
+      && let Some((channel, region)) = seam.dax_message_channel()
+    {
+      let granule = rustix::param::page_size().max(1);
+      device.install_dax_message_placer(crate::vhost_user::MessagePlacer::new(
+        channel, granule, region,
+      ));
+    }
   }
   Ok(AdmittedDevice {
     seam,
@@ -702,6 +721,62 @@ impl<S: VmmSeam> AdmittedDevice<S> {
     Ok(completed)
   }
 
+  /// Drains the message-based DAX placer's reply-acks (§4.6) under the attachment's authority: a parked
+  /// SETUPMAPPING's ack answers the guest and records the window; a teardown unmap's ack unpins the block (phase
+  /// two). The serve loop calls this after awaiting [`AdmittedDevice::dax_ack_raw_fd`]. Notifies the completed
+  /// chain's queue when its driver asks; `Ok(None)` when nothing completed or the device is not live. Linux only.
+  #[cfg(target_os = "linux")]
+  pub fn complete_dax_map(
+    &mut self,
+    bridge: &mut dyn Bridge,
+    registry: &Attachments,
+  ) -> Result<Option<Completed>, ServeError> {
+    if self.state != AttachmentState::Live {
+      return Ok(None);
+    }
+    let cx = registry
+      .context(self.attachment)
+      .map_err(ServeError::Authority)?;
+    let completed = {
+      let memory = self.seam.memory().map_err(ServeError::Seam)?;
+      self
+        .device
+        .complete_dax_awaiting(memory, bridge, &cx)
+        .map_err(ServeError::Device)?
+    };
+    if let Some(done) = completed
+      && done.interrupt_wanted
+    {
+      self.seam.notify_used(done.queue).map_err(ServeError::Seam)?;
+      self.counters.notifications = self.counters.notifications.saturating_add(1);
+    }
+    Ok(completed)
+  }
+
+  /// Whether a message-based SETUPMAPPING is parked for the front end's map-ack; the loop awaits the ack and
+  /// completes it before serving more. Linux only.
+  #[cfg(target_os = "linux")]
+  #[must_use]
+  pub fn dax_map_ack_owed(&self) -> bool {
+    self.device.dax_map_ack_owed()
+  }
+
+  /// The raw descriptor the message-based placer's reply-acks arrive on, for the loop to await; `None` without a
+  /// message placer. Linux only.
+  #[cfg(target_os = "linux")]
+  #[must_use]
+  pub fn dax_ack_raw_fd(&self) -> Option<std::os::fd::RawFd> {
+    self.device.dax_ack_raw_fd()
+  }
+
+  /// Whether the message-based placer has any request still awaiting a reply-ack (a map or a deferred unmap).
+  /// Linux only.
+  #[cfg(target_os = "linux")]
+  #[must_use]
+  pub fn dax_outstanding(&self) -> bool {
+    self.device.dax_outstanding()
+  }
+
   /// Stops admission now: no later pass touches the ring. Returns the requests in flight at this
   /// moment: none, or the one chain held for the owner's barrier (whose grants the terminal step's sweep
   /// releases and whose charge it restores). The terminal step is [`AdmittedDevice::reclaim`].
@@ -733,6 +808,8 @@ impl<S: VmmSeam> AdmittedDevice<S> {
         // still has the bridge to release them (§4.6 teardown). A clean unmount already drained them, so a device
         // with no live window drains nothing here.
         self.device.release_dax(bridge, &cx);
+        #[cfg(target_os = "linux")]
+        self.device.drain_dax_terminal(bridge, &cx);
         bridge.sweep_attachment(&cx).map_err(ReclaimError::Sweep)
       }
       Err(e) => Err(ReclaimError::Authority(e)),

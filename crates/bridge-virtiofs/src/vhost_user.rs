@@ -1498,6 +1498,17 @@ impl VmmSeam for VhostUserSeam {
     Ok(())
   }
 
+  /// Hands the admitted device the back-end-request channel for message-based DAX (§4.6): a DAX device that
+  /// negotiated the channel gives it up here, with the cache region's size, so admission builds the device's
+  /// [`crate::dax::DaxPlacer::Message`]. A non-DAX device (and the default) has none, so DAX stays unserved.
+  fn dax_message_channel(&mut self) -> Option<(BackendReqChannel, u64)> {
+    if self.dax_enabled {
+      self.backend_req.take().map(|channel| (channel, self.dax_region_bytes))
+    } else {
+      None
+    }
+  }
+
   fn notify_used(&mut self, queue: u16) -> Result<(), SeamError> {
     let call = self
       .vrings
@@ -1680,6 +1691,24 @@ impl<T: Copy> MessagePlacer<T> {
   #[must_use]
   pub fn has_outstanding(&self) -> bool {
     !self.outstanding.is_empty()
+  }
+
+  /// The raw descriptor reply-acks arrive on, for awaiting readiness on the shard's driver. A `RawFd` (not a
+  /// borrow), so nothing of the placer is held across the loop's `.await`.
+  #[must_use]
+  pub fn ack_raw_fd(&self) -> std::os::fd::RawFd {
+    std::os::fd::AsRawFd::as_raw_fd(&self.channel.fd())
+  }
+
+  /// Drains every still-outstanding request, clearing the ring, as `(is_map, token)` pairs. The terminal step
+  /// takes these to release the blocks whose reply-ack never arrived (the front end is gone): a map's pin is
+  /// undone, an unmap's block is unpinned (§4.6 phase two), so no block is left pinned after the device ends.
+  pub fn take_pending(&mut self) -> Vec<(bool, T)> {
+    self
+      .outstanding
+      .drain(..)
+      .map(|op| (matches!(op.op, DaxOp::Map), op.token))
+      .collect()
   }
 
   /// The granule as a `u64` (lossless; `usize` is at most 64-bit on every target slates builds for).
