@@ -115,6 +115,10 @@ pub mod request {
   /// Format: `VHOST_USER_SET_BACKEND_REQ_FD` (formerly `SET_SLAVE_REQ_FD`) — the front end hands over the
   /// back-end-request socket in ancillary data, the channel the back end sends `SHMEM_MAP` on (§4.6 DAX).
   pub const SET_BACKEND_REQ_FD: u32 = 21;
+  /// Format: `VHOST_USER_GET_SHMEM_CONFIG` — the front end asks the back end how many VIRTIO shared-memory
+  /// regions it needs and each size, to allocate the DAX cache BAR (crosvm's frontend calls this when `SHMEM`
+  /// is negotiated, `devices/src/virtio/vhost_user_frontend/mod.rs::get_shared_memory_region`).
+  pub const GET_SHMEM_CONFIG: u32 = 44;
 }
 
 /// Format: the back-end-request codes (`BackendReq`), a namespace distinct from the front-end `request` codes
@@ -166,6 +170,17 @@ pub const PROTOCOL_F_SHMEM: u64 = 1 << 22;
 /// shared-memory regions it needs to place content with `SHMEM_MAP`. Offered only when the device serves DAX, so a
 /// non-DAX device and production (where DAX stays unadvertised, §4.6) offer exactly `OFFERED_PROTOCOL_FEATURES`.
 pub const DAX_PROTOCOL_FEATURES: u64 = PROTOCOL_F_BACKEND_REQ | PROTOCOL_F_SHMEM;
+
+/// Format: the shmid of the single VIRTIO shared-memory region slates uses — the DAX cache window. crosvm maps
+/// exactly one region (it refuses more than one), so every `SHMEM_MAP` the back end sends names shmid 0.
+pub const SHMEM_DAX_SHMID: u8 = 0;
+/// Format: the byte offset of the `sizes` array in a `VhostUserShMemConfig` (after `nregions` u32 and padding u32).
+const SHMEM_CONFIG_SIZES: usize = 8;
+/// Format: the number of per-region sizes a `VhostUserShMemConfig` carries (`sizes[256]`, indexed by shmid), as
+/// crosvm's `vmm_vhost::message::VhostUserShMemConfig` lays it out.
+const SHMEM_CONFIG_REGIONS: usize = 256;
+/// Format: a `VhostUserShMemConfig` reply's size — `nregions`/padding (8 bytes) then 256 `u64` sizes (2056 bytes).
+const SHMEM_CONFIG_LEN: usize = SHMEM_CONFIG_SIZES + SHMEM_CONFIG_REGIONS * U64_LEN;
 /// The device features offered: version 1 and the protocol-features extension (no event index, no indirect
 /// descriptors: the virtqueue implements neither, `docs/wip/virtiofs.md` §6).
 pub const OFFERED_FEATURES: u64 = VIRTIO_F_VERSION_1 | F_PROTOCOL_FEATURES;
@@ -859,8 +874,30 @@ impl VhostUserSeam {
         Ok(Answer::Acknowledge)
       }
       request::SET_BACKEND_REQ_FD => self.set_backend_req_fd(),
+      request::GET_SHMEM_CONFIG => self.get_shmem_config(header),
       _ => Err(protocol("a request this back end does not serve")),
     }
+  }
+
+  /// Answers `GET_SHMEM_CONFIG` (§4.6 DAX): the back end reports the VIRTIO shared-memory regions it needs and
+  /// each size, so the front end can allocate the DAX cache BAR. slates needs exactly one region — the cache
+  /// window — of `dax_region_bytes` (crosvm refuses more than one; shmid 0 names it); a non-DAX device reports
+  /// none. The reply is a `VhostUserShMemConfig`: region count (`u32`), padding (`u32`), then 256 `u64` sizes
+  /// indexed by shmid.
+  fn get_shmem_config(&self, header: Header) -> Result<Answer, VhostError> {
+    let mut body = vec![0u8; SHMEM_CONFIG_LEN];
+    if self.dax_enabled {
+      if let Some(field) = body.get_mut(0..U32_LEN) {
+        field.copy_from_slice(&1u32.to_le_bytes()); // one region: the DAX cache window
+      }
+      if let Some(field) =
+        body.get_mut(SHMEM_CONFIG_SIZES..SHMEM_CONFIG_SIZES.saturating_add(U64_LEN))
+      {
+        field.copy_from_slice(&self.dax_region_bytes.to_le_bytes()); // sizes[0]
+      }
+    }
+    self.reply(header, &body)?;
+    Ok(Answer::Replied)
   }
 
   /// Adopts the back-end-request socket the front end handed in ancillary data (`SET_BACKEND_REQ_FD`): the channel
@@ -1655,6 +1692,37 @@ mod shmem_tests {
     .unwrap();
     assert_eq!(got.bytes, buf.len());
     assert_eq!(u32_at(&buf, 0).unwrap(), backend_request::SHMEM_MAP);
+  }
+
+  /// A-9 / AC-4.12: a DAX device reports exactly one shared-memory region — the cache window — of the configured
+  /// size over GET_SHMEM_CONFIG, the region crosvm allocates as the DAX BAR and the back end maps into (shmid 0).
+  #[test]
+  fn a_dax_device_reports_one_cache_region_of_the_configured_size() {
+    let (frontend, backend) = stream_pair();
+    let config = crate::device::DeviceConfig::new(crate::device::FsTag::new("slates").unwrap());
+    let mut seam = VhostUserSeam::adopt(backend, &config).unwrap();
+    let region = 0x0400_0000u64; // a 64 MiB cache window (test value)
+    seam.enable_dax(region);
+
+    send_front_message(&frontend, request::GET_SHMEM_CONFIG, 0, None);
+    seam.serve_control().unwrap();
+
+    let mut buf = vec![0u8; HEADER_LEN + SHMEM_CONFIG_LEN];
+    let mut none: [std::mem::MaybeUninit<u8>; 0] = [];
+    let got = rustix::net::recvmsg(
+      &frontend,
+      &mut [std::io::IoSliceMut::new(&mut buf)],
+      &mut RecvAncillaryBuffer::new(&mut none),
+      RecvFlags::empty(),
+    )
+    .unwrap();
+    assert_eq!(got.bytes, buf.len());
+    assert_eq!(u32_at(&buf, HEADER_LEN).unwrap(), 1, "exactly one DAX cache region");
+    assert_eq!(
+      u64_at(&buf, HEADER_LEN + SHMEM_CONFIG_SIZES).unwrap(),
+      region,
+      "the region is the configured cache size"
+    );
   }
 
   /// A non-DAX device offers neither DAX feature and refuses a back-end-request fd — production and any non-DAX
