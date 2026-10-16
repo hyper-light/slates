@@ -115,6 +115,11 @@ pub mod request {
   /// Format: `VHOST_USER_SET_BACKEND_REQ_FD` (formerly `SET_SLAVE_REQ_FD`) — the front end hands over the
   /// back-end-request socket in ancillary data, the channel the back end sends `SHMEM_MAP` on (§4.6 DAX).
   pub const SET_BACKEND_REQ_FD: u32 = 21;
+  /// Format: `VHOST_USER_GET_CONFIG` — the front end reads the device's config space (the virtio-fs tag and
+  /// queue count); offered via `PROTOCOL_F_CONFIG`.
+  pub const GET_CONFIG: u32 = 24;
+  /// Format: `VHOST_USER_SET_CONFIG` — a config-space write; the virtio-fs config is read-only, so it is refused.
+  pub const SET_CONFIG: u32 = 25;
   /// Format: `VHOST_USER_GET_SHMEM_CONFIG` — the front end asks the back end how many VIRTIO shared-memory
   /// regions it needs and each size, to allocate the DAX cache BAR (crosvm's frontend calls this when `SHMEM`
   /// is negotiated, `devices/src/virtio/vhost_user_frontend/mod.rs::get_shared_memory_region`).
@@ -162,6 +167,9 @@ pub const F_PROTOCOL_FEATURES: u64 = 1 << 30;
 pub const PROTOCOL_F_MQ: u64 = 1 << 0;
 /// Format: the protocol feature `VHOST_USER_PROTOCOL_F_REPLY_ACK`.
 pub const PROTOCOL_F_REPLY_ACK: u64 = 1 << 3;
+/// Format: the protocol feature `VHOST_USER_PROTOCOL_F_CONFIG` — the device configuration space, read with
+/// `GET_CONFIG` (bit 9). A real VMM (crosvm/QEMU) reads the virtio-fs tag and queue count this way.
+pub const PROTOCOL_F_CONFIG: u64 = 1 << 9;
 /// Format: the protocol feature `VHOST_USER_PROTOCOL_F_BACKEND_REQ` — the back-end-request channel (bit 5).
 pub const PROTOCOL_F_BACKEND_REQ: u64 = 1 << 5;
 /// Format: the protocol feature `VHOST_USER_PROTOCOL_F_SHMEM` — VIRTIO shared-memory regions, the DAX cache (bit 22).
@@ -184,8 +192,38 @@ const SHMEM_CONFIG_LEN: usize = SHMEM_CONFIG_SIZES + SHMEM_CONFIG_REGIONS * U64_
 /// The device features offered: version 1 and the protocol-features extension (no event index, no indirect
 /// descriptors: the virtqueue implements neither, `docs/wip/virtiofs.md` §6).
 pub const OFFERED_FEATURES: u64 = VIRTIO_F_VERSION_1 | F_PROTOCOL_FEATURES;
-/// The protocol features offered.
-pub const OFFERED_PROTOCOL_FEATURES: u64 = PROTOCOL_F_MQ | PROTOCOL_F_REPLY_ACK;
+/// The protocol features offered. Includes `CONFIG` so a real VMM can read the virtio-fs config space
+/// (`GET_CONFIG`); the in-process form did not need it, which is why real-VMM interop was owed.
+pub const OFFERED_PROTOCOL_FEATURES: u64 = PROTOCOL_F_MQ | PROTOCOL_F_REPLY_ACK | PROTOCOL_F_CONFIG;
+
+/// Format: `struct virtio_fs_config` (§5.11.4) — the tag (36 bytes, NUL-padded) then `num_request_queues`
+/// (`u32`, little-endian): 40 bytes. The guest reads it via `GET_CONFIG` to learn the mount tag and how many
+/// request queues to set up (it adds the one high-priority queue itself).
+const FS_CONFIG_LEN: usize = crate::device::TAG_LEN + U32_LEN;
+/// Format: the offset of `num_request_queues` in `virtio_fs_config` — just past the 36-byte tag.
+const FS_CONFIG_AT_QUEUES: usize = crate::device::TAG_LEN;
+/// Format: a `vhost_user_config` message's fixed head — `offset`, `size`, `flags` (three `u32`) before the
+/// `size` config bytes.
+const CONFIG_MSG_HEAD_LEN: usize = 3 * U32_LEN;
+/// Format: the byte offset of `offset` in a `vhost_user_config` head.
+const CONFIG_AT_OFFSET: usize = 0;
+/// Format: the byte offset of `size` in a `vhost_user_config` head.
+const CONFIG_AT_SIZE: usize = U32_LEN;
+
+/// Builds `struct virtio_fs_config` (§5.11.4): the mount `tag` (36 bytes, already NUL-padded) then
+/// `num_request_queues` (`u32`, little-endian). 40 bytes, what the guest reads via `GET_CONFIG`.
+fn fs_config_bytes(tag: &[u8; crate::device::TAG_LEN], num_request_queues: u32) -> [u8; FS_CONFIG_LEN] {
+  let mut config = [0u8; FS_CONFIG_LEN];
+  if let Some(field) = config.get_mut(0..crate::device::TAG_LEN) {
+    field.copy_from_slice(tag);
+  }
+  if let Some(field) =
+    config.get_mut(FS_CONFIG_AT_QUEUES..FS_CONFIG_AT_QUEUES.saturating_add(U32_LEN))
+  {
+    field.copy_from_slice(&num_request_queues.to_le_bytes());
+  }
+  config
+}
 /// Format: a vring descriptor message's queue index (its low byte).
 const VRING_INDEX_MASK: u64 = 0xff;
 /// Format: a vring descriptor message's "no descriptor" bit.
@@ -549,6 +587,11 @@ pub struct VhostUserSeam {
   dax_enabled: bool,
   /// The DAX cache region's size to report to the front end, in bytes (derived by the caller; 0 when no DAX).
   dax_region_bytes: u64,
+  /// The device's `virtio_fs_config` tag (36 bytes, NUL-padded), captured at adopt so `GET_CONFIG` can answer a
+  /// real front end during negotiation (before the device is admitted and `publish` runs).
+  config_tag: [u8; crate::device::TAG_LEN],
+  /// The device's `num_request_queues`, captured at adopt for `GET_CONFIG` (the guest adds the high-priority queue).
+  num_request_queues: u32,
   stopped: bool,
 }
 
@@ -596,6 +639,8 @@ impl VhostUserSeam {
       backend_req: None,
       dax_enabled: false,
       dax_region_bytes: 0,
+      config_tag: config.tag.config_bytes(),
+      num_request_queues: config.num_request_queues.get(),
       stopped: false,
     })
   }
@@ -875,6 +920,8 @@ impl VhostUserSeam {
       }
       request::SET_BACKEND_REQ_FD => self.set_backend_req_fd(),
       request::GET_SHMEM_CONFIG => self.get_shmem_config(header),
+      request::GET_CONFIG => self.get_config(header, payload),
+      request::SET_CONFIG => Err(protocol("the virtio-fs configuration space is read-only")),
       _ => Err(protocol("a request this back end does not serve")),
     }
   }
@@ -895,6 +942,40 @@ impl VhostUserSeam {
       {
         field.copy_from_slice(&self.dax_region_bytes.to_le_bytes()); // sizes[0]
       }
+    }
+    self.reply(header, &body)?;
+    Ok(Answer::Replied)
+  }
+
+  /// Answers `GET_CONFIG` (§5.11.4): the front end reads the device's `virtio_fs_config` — the mount tag and the
+  /// request-queue count — during negotiation, before the device is admitted. The message is a `vhost_user_config`
+  /// head (`offset`, `size`, `flags`); the reply echoes the head and carries the `size` config bytes at `offset`.
+  /// A real VMM (crosvm/QEMU) needs this to learn the mount tag; the in-process sim did not. The config is
+  /// [`FS_CONFIG_LEN`] bytes; a range past it is refused, so a confused front end cannot read beyond the space.
+  fn get_config(&self, header: Header, payload: &[u8]) -> Result<Answer, VhostError> {
+    if payload.len() < CONFIG_MSG_HEAD_LEN {
+      return Err(protocol("a GET_CONFIG message shorter than its head"));
+    }
+    let offset = usize::try_from(u32_at(payload, CONFIG_AT_OFFSET)?)
+      .map_err(|_| protocol("a GET_CONFIG offset"))?;
+    let size =
+      usize::try_from(u32_at(payload, CONFIG_AT_SIZE)?).map_err(|_| protocol("a GET_CONFIG size"))?;
+    let end = offset
+      .checked_add(size)
+      .ok_or(protocol("a GET_CONFIG range that overflows"))?;
+    if end > FS_CONFIG_LEN {
+      return Err(protocol("a GET_CONFIG range past the virtio-fs config space"));
+    }
+    let config = fs_config_bytes(&self.config_tag, self.num_request_queues);
+    let mut body = vec![0u8; CONFIG_MSG_HEAD_LEN.saturating_add(size)];
+    if let (Some(dst), Some(src)) = (
+      body.get_mut(0..CONFIG_MSG_HEAD_LEN),
+      payload.get(0..CONFIG_MSG_HEAD_LEN),
+    ) {
+      dst.copy_from_slice(src); // echo the head (offset, size, flags) back
+    }
+    if let (Some(dst), Some(src)) = (body.get_mut(CONFIG_MSG_HEAD_LEN..), config.get(offset..end)) {
+      dst.copy_from_slice(src);
     }
     self.reply(header, &body)?;
     Ok(Answer::Replied)
@@ -1949,6 +2030,24 @@ mod shmem_tests {
       "a request past the bound is refused, never grown"
     );
     // `_frontend` is kept alive so the socket stays open for the sends above.
+  }
+
+  /// §5.11.4 golden vector: the `virtio_fs_config` a real front end reads via GET_CONFIG — the mount tag padded
+  /// with NULs to 36 bytes, then `num_request_queues` as a little-endian `u32`. The seam's GET_CONFIG handler
+  /// replies exactly these bytes; a real crosvm front end reads the tag from them to mount the volume.
+  #[test]
+  fn t_5_11_4_virtio_fs_config_is_the_tag_then_num_request_queues_golden_vector() {
+    let tag = crate::device::FsTag::new("slates").unwrap();
+    let config = fs_config_bytes(&tag.config_bytes(), 1);
+    let mut want = [0u8; FS_CONFIG_LEN];
+    want[0..6].copy_from_slice(b"slates");
+    want[crate::device::TAG_LEN..].copy_from_slice(&1u32.to_le_bytes());
+    assert_eq!(config, want);
+    assert_eq!(
+      &config[6..crate::device::TAG_LEN],
+      &[0u8; crate::device::TAG_LEN - 6],
+      "the tag is NUL-padded to 36 bytes"
+    );
   }
 
   /// AC-4.12 / A-9: a `SHMEM_MAP` body encodes exactly as crosvm's `VhostUserMMap` — a golden vector over every
