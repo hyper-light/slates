@@ -1459,6 +1459,275 @@ impl VmmSeam for VhostUserSeam {
   }
 }
 
+/// Which placement an outstanding back-end request is, so its reply-ack completes the right action.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DaxOp {
+  /// A `SHMEM_MAP` (FUSE_SETUPMAPPING): its ack lets the guest be told the window is live.
+  Map,
+  /// A `SHMEM_UNMAP` (FUSE_REMOVEMAPPING, or a content-path teardown): its ack is the signal the front end has
+  /// removed the window from the guest's BAR, so the block may be unpinned (§4.6 phase two).
+  Unmap,
+}
+
+/// A back-end request sent and awaiting the front end's reply-ack. Replies arrive in send order on the channel, so
+/// these are matched FIFO. `token` is what the caller acts on when the ack lands (the device threads its DAX window
+/// entry through here).
+#[derive(Clone, Copy, Debug)]
+struct OutstandingDax<T: Copy> {
+  op: DaxOp,
+  token: T,
+}
+
+/// What a drained reply-ack completed — the action the device loop now takes. `token` is the request's caller value
+/// (the device's DAX window entry). A map records the window and answers the guest; a refused map unpins and
+/// answers an errno; an unmap unpins the block (§4.6 phase two); a refused unmap is a front-end protocol fault.
+#[derive(Clone, Copy, Debug)]
+pub enum DaxCompletion<T: Copy> {
+  /// The front end mapped the window: the caller records it and answers the guest's SETUPMAPPING with success.
+  Mapped(T),
+  /// The front end refused the map: the caller unpins the block (no window was established) and answers an errno.
+  MapRefused {
+    /// The request's token.
+    token: T,
+    /// The front end's non-zero reply-ack status.
+    status: u64,
+  },
+  /// The front end removed the window: the caller unpins the block (phase two — safe now the guest cannot reach it).
+  Unmapped(T),
+  /// The front end refused an unmap: a protocol fault; the block stays pinned and the caller faults the device.
+  UnmapRefused {
+    /// The request's token.
+    token: T,
+    /// The front end's non-zero reply-ack status.
+    status: u64,
+  },
+}
+
+/// Why a message-based placement was refused (a typed refusal, never a panic).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MessagePlaceError {
+  /// The `[moffset, moffset+len)` range was zero, not a whole number of granules, or outside the cache region.
+  BadRange,
+  /// The outstanding-request ring is at its derived ceiling, so a confused or hostile guest cannot grow it without
+  /// bound (banned: unbounded growth). `bound` is the region's whole-page capacity plus one in-flight map.
+  TooManyOutstanding {
+    /// The ceiling the ring reached.
+    bound: usize,
+  },
+  /// The back-end-request channel refused the send, or reported a closed or garbled reply.
+  Channel(VhostError),
+}
+
+impl std::fmt::Display for MessagePlaceError {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    match self {
+      Self::BadRange => {
+        f.write_str("a DAX map range was zero, unaligned, or outside the cache region")
+      }
+      Self::TooManyOutstanding { bound } => {
+        write!(f, "the back-end-request ring is full at its bound of {bound}")
+      }
+      Self::Channel(e) => write!(f, "the back-end-request channel refused: {e}"),
+    }
+  }
+}
+
+impl std::error::Error for MessagePlaceError {}
+
+/// The **message-based** DAX placer (§4.6, A-9): the out-of-process form of placing content blocks into a guest's
+/// DAX window. Unlike the fd-sharing [`crate::dax::DaxCacheRegion`] (where the back end owns the window and overlays
+/// blocks itself, for an in-process VMM like libkrun), here the back end does not own the window — it asks the front
+/// end (crosvm `--vhost-user-fs`, QEMU, cloud-hypervisor) to place each block over the [`BackendReqChannel`]: a
+/// SETUPMAPPING is a [`BackendReqChannel::send_map`] whose reply-ack the device waits for before answering the guest
+/// (so the guest never faults a page the front end has not mapped), and a REMOVEMAPPING or a content-path teardown
+/// is a [`BackendReqChannel::send_unmap`] whose ack is the signal the window is gone, so the block may be unpinned —
+/// never before, or a stale guest page table could reach a reused block (§4.6 #1, phase two).
+///
+/// Requests are pipelined (sent as they arise) and their reply-acks matched FIFO, since the channel replies in send
+/// order. [`MessagePlacer::poll_acks`] drains the acks when the channel is readable and returns the completions the
+/// device acts on. `T` is the per-request token the device threads through (its DAX window entry); it is generic so
+/// the placer's wire and FIFO are proven by use with a plain marker, independent of the un-fabricable gate mapping.
+pub struct MessagePlacer<T: Copy> {
+  /// The back-end-request socket to the front end.
+  channel: BackendReqChannel,
+  /// The granule a map offset and length must be a multiple of (the host page, or a negotiated FUSE_MAP_ALIGNMENT),
+  /// matching the fd-sharing placer's [`crate::dax::DaxCacheRegion::page`].
+  page: usize,
+  /// The cache region's size in bytes (the window the front end advertised): a map must lie inside it.
+  region_bytes: u64,
+  /// Requests sent and awaiting the front end's reply-ack, in send order (acks arrive in that order, matched FIFO).
+  /// Bounded by [`MessagePlacer::outstanding_bound`] so growth is never unbounded.
+  outstanding: std::collections::VecDeque<OutstandingDax<T>>,
+}
+
+impl<T: Copy> std::fmt::Debug for MessagePlacer<T> {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.debug_struct("MessagePlacer")
+      .field("region_bytes", &self.region_bytes)
+      .field("outstanding", &self.outstanding.len())
+      .finish()
+  }
+}
+
+impl<T: Copy> MessagePlacer<T> {
+  /// Adopts `channel` as the device's message-based DAX placer for a cache region of `region_bytes` whose map
+  /// granule is `page` (clamped to at least one, so the modulo and bound are always well-defined).
+  pub fn new(channel: BackendReqChannel, page: usize, region_bytes: u64) -> MessagePlacer<T> {
+    MessagePlacer {
+      channel,
+      page: page.max(1),
+      region_bytes,
+      outstanding: std::collections::VecDeque::new(),
+    }
+  }
+
+  /// The map granule (as [`crate::dax::DaxCacheRegion::page`]).
+  #[must_use]
+  pub fn page(&self) -> usize {
+    self.page
+  }
+
+  /// The descriptor reply-acks arrive on, for registering readiness with the shard's driver (the same edge the
+  /// doorbell is awaited on).
+  #[must_use]
+  pub fn ack_fd(&self) -> BorrowedFd<'_> {
+    self.channel.fd()
+  }
+
+  /// Whether any request still awaits a reply-ack — the loop keeps draining while true, and the terminal step
+  /// drains to empty before it unpins the last block.
+  #[must_use]
+  pub fn has_outstanding(&self) -> bool {
+    !self.outstanding.is_empty()
+  }
+
+  /// The granule as a `u64` (lossless; `usize` is at most 64-bit on every target slates builds for).
+  fn page_bytes(&self) -> u64 {
+    u64::try_from(self.page).unwrap_or(u64::MAX)
+  }
+
+  /// Derived: the most requests outstanding at once — one per whole page of the cache region (the most windows that
+  /// can be live, each awaiting at most one unmap) plus one in-flight map while a teardown's unmaps drain. A request
+  /// past this is refused, never grown (banned: unbounded growth).
+  fn outstanding_bound(&self) -> usize {
+    let per_page = self.region_bytes.checked_div(self.page_bytes()).unwrap_or(0);
+    let pages = usize::try_from(per_page).unwrap_or(usize::MAX);
+    pages.saturating_add(1)
+  }
+
+  /// Validates `[moffset, moffset+len)` against the region and granule (defence in depth; the front end bounds it
+  /// against the BAR too).
+  fn check_range(&self, moffset: u64, len: u64) -> Result<(), MessagePlaceError> {
+    let page = self.page_bytes();
+    if len == 0 || !moffset.is_multiple_of(page) || !len.is_multiple_of(page) {
+      return Err(MessagePlaceError::BadRange);
+    }
+    let end = moffset.checked_add(len).ok_or(MessagePlaceError::BadRange)?;
+    if end > self.region_bytes {
+      return Err(MessagePlaceError::BadRange);
+    }
+    Ok(())
+  }
+
+  /// Refuses when the outstanding ring is already at its bound.
+  fn room(&self) -> Result<(), MessagePlaceError> {
+    let bound = self.outstanding_bound();
+    if self.outstanding.len() >= bound {
+      return Err(MessagePlaceError::TooManyOutstanding { bound });
+    }
+    Ok(())
+  }
+
+  /// Sends a `SHMEM_MAP` placing `len` bytes of `fd` (from `fd_offset`) into the window at `moffset`, read-write per
+  /// `writable`, and records the request awaiting the front end's ack under `token`. The guest's SETUPMAPPING is
+  /// answered only when [`MessagePlacer::poll_acks`] yields this request's [`DaxCompletion::Mapped`] (or
+  /// `MapRefused`). The send happens before the request is recorded, so a failed send records nothing and the FIFO
+  /// stays consistent with the wire.
+  pub fn begin_map(
+    &mut self,
+    moffset: u64,
+    len: u64,
+    fd: BorrowedFd<'_>,
+    fd_offset: u64,
+    writable: bool,
+    token: T,
+  ) -> Result<(), MessagePlaceError> {
+    self.check_range(moffset, len)?;
+    self.room()?;
+    self
+      .channel
+      .send_map(SHMEM_DAX_SHMID, moffset, fd, fd_offset, len, writable)
+      .map_err(MessagePlaceError::Channel)?;
+    self.outstanding.push_back(OutstandingDax {
+      op: DaxOp::Map,
+      token,
+    });
+    Ok(())
+  }
+
+  /// Sends a `SHMEM_UNMAP` removing the window at `[moffset, moffset+len)` and records the request awaiting the ack
+  /// under `token`. The block stays pinned until [`MessagePlacer::poll_acks`] yields this request's
+  /// [`DaxCompletion::Unmapped`], at which point the caller unpins it (§4.6 phase two). Send-before-record, as
+  /// [`MessagePlacer::begin_map`].
+  pub fn begin_unmap(
+    &mut self,
+    moffset: u64,
+    len: u64,
+    token: T,
+  ) -> Result<(), MessagePlaceError> {
+    self.check_range(moffset, len)?;
+    self.room()?;
+    self
+      .channel
+      .send_unmap(SHMEM_DAX_SHMID, moffset, len)
+      .map_err(MessagePlaceError::Channel)?;
+    self.outstanding.push_back(OutstandingDax {
+      op: DaxOp::Unmap,
+      token,
+    });
+    Ok(())
+  }
+
+  /// Drains every reply-ack the front end has sent (non-blocking), completing the matching requests FIFO, and
+  /// returns the completions in the order the front end acknowledged — for the device loop to act on. Stops at the
+  /// first ack not yet arrived; the loop awaits [`MessagePlacer::ack_fd`] readiness and drains again. A closed or
+  /// garbled channel, or a reply with no request outstanding, is a typed refusal.
+  pub fn poll_acks(&mut self) -> Result<Vec<DaxCompletion<T>>, MessagePlaceError> {
+    let mut completed = Vec::new();
+    loop {
+      match self.channel.recv_ack() {
+        Ok(false) => break,
+        Ok(true) => {
+          let op = self.outstanding.pop_front().ok_or(MessagePlaceError::Channel(
+            protocol("a back-end-request reply-ack with no request outstanding"),
+          ))?;
+          completed.push(match op.op {
+            DaxOp::Map => DaxCompletion::Mapped(op.token),
+            DaxOp::Unmap => DaxCompletion::Unmapped(op.token),
+          });
+        }
+        Err(VhostError::MapRefused { status }) => {
+          let op = self.outstanding.pop_front().ok_or(MessagePlaceError::Channel(
+            protocol("a back-end-request reply-ack with no request outstanding"),
+          ))?;
+          completed.push(match op.op {
+            DaxOp::Map => DaxCompletion::MapRefused {
+              token: op.token,
+              status,
+            },
+            DaxOp::Unmap => DaxCompletion::UnmapRefused {
+              token: op.token,
+              status,
+            },
+          });
+        }
+        Err(e) => return Err(MessagePlaceError::Channel(e)),
+      }
+    }
+    Ok(completed)
+  }
+}
+
 #[cfg(test)]
 mod shmem_tests {
   //! The back-end-request channel's wire, by use (§4.6, A-9, AC-4.12): a `SHMEM_MAP` body matches crosvm's
@@ -1527,6 +1796,159 @@ mod shmem_tests {
     .unwrap();
     assert_eq!(got.bytes, buf.len());
     u64_at(&buf, HEADER_LEN).unwrap()
+  }
+
+  /// Reads one back-end request (header + the 40-byte body, plus any descriptor it carries) the way a front end
+  /// would, drops any received descriptor, and returns the request code.
+  fn front_read_request(socket: &OwnedFd) -> u32 {
+    let mut buf = [0u8; HEADER_LEN + MMAP_LEN];
+    let mut space =
+      [std::mem::MaybeUninit::<u8>::uninit(); rustix::cmsg_space!(ScmRights(MAP_FDS))];
+    let mut control = RecvAncillaryBuffer::new(&mut space);
+    let got = rustix::net::recvmsg(
+      socket,
+      &mut [std::io::IoSliceMut::new(&mut buf)],
+      &mut control,
+      RecvFlags::empty(),
+    )
+    .unwrap();
+    assert_eq!(got.bytes, buf.len());
+    let mut fds: Vec<OwnedFd> = Vec::new();
+    for message in control.drain() {
+      if let RecvAncillaryMessage::ScmRights(iter) = message {
+        fds.extend(iter);
+      }
+    }
+    drop(fds);
+    u32_at(&buf, 0).unwrap()
+  }
+
+  /// Answers a `NEED_REPLY` back-end request with a reply-ack carrying `status` (zero for success), the way a front
+  /// end acknowledges a map or unmap.
+  fn front_send_ack(socket: &OwnedFd, request: u32, status: u64) {
+    let mut ack = [0u8; HEADER_LEN + ACK_LEN];
+    ack[0..4].copy_from_slice(&request.to_le_bytes());
+    ack[HEADER_AT_FLAGS..HEADER_AT_FLAGS + 4]
+      .copy_from_slice(&(VERSION | FLAG_REPLY).to_le_bytes());
+    ack[HEADER_AT_SIZE..HEADER_AT_SIZE + 4]
+      .copy_from_slice(&u32::try_from(ACK_LEN).unwrap().to_le_bytes());
+    ack[HEADER_LEN..].copy_from_slice(&status.to_le_bytes());
+    rustix::net::sendmsg(
+      socket,
+      &[std::io::IoSlice::new(&ack)],
+      &mut SendAncillaryBuffer::default(),
+      SendFlags::NOSIGNAL,
+    )
+    .unwrap();
+  }
+
+  /// A-9 / AC-4.12 (message-based DAX placement, by use): the placer pipelines a SETUPMAPPING and a REMOVEMAPPING
+  /// over the channel and matches the front end's reply-acks FIFO. Do: begin a map (token 100) and an unmap (token
+  /// 200), acknowledge each at a stand-in front end, and drain. Expect: nothing completes before the acks; then the
+  /// completions come back in send order carrying each token — the map as `Mapped`, the unmap as `Unmapped` — and
+  /// the outstanding ring empties. Proven over a real socket with no VMM. The token is a plain marker here; the
+  /// device threads its window entry, and the placer's FIFO is agnostic to it.
+  #[test]
+  fn the_message_placer_matches_pipelined_acks_fifo_and_reports_each_completion() {
+    let (frontend, backend) = stream_pair();
+    let mem = memfd_create("slates-placer-fifo", MemfdFlags::CLOEXEC).unwrap();
+    rustix::io::pwrite(&mem, &[0x5Au8; 64], 0).unwrap();
+    let page = rustix::param::page_size().max(1);
+    let pg = u64::try_from(page).unwrap();
+    let region = u64::try_from(page.saturating_mul(8)).unwrap();
+    let mut placer: MessagePlacer<u64> =
+      MessagePlacer::new(BackendReqChannel::adopt(backend), page, region);
+
+    placer.begin_map(0, pg, mem.as_fd(), 0, false, 100).unwrap();
+    placer.begin_unmap(pg, pg, 200).unwrap();
+    assert!(placer.has_outstanding());
+    assert!(
+      placer.poll_acks().unwrap().is_empty(),
+      "nothing completes before the front end acknowledges"
+    );
+
+    // the front end reads both requests in send order and acknowledges them.
+    assert_eq!(front_read_request(&frontend), backend_request::SHMEM_MAP);
+    assert_eq!(front_read_request(&frontend), backend_request::SHMEM_UNMAP);
+    front_send_ack(&frontend, backend_request::SHMEM_MAP, 0);
+    front_send_ack(&frontend, backend_request::SHMEM_UNMAP, 0);
+
+    let done = placer.poll_acks().unwrap();
+    assert_eq!(done.len(), 2, "both acks drained");
+    match done[0] {
+      DaxCompletion::Mapped(token) => assert_eq!(token, 100, "the first completion is the map's token"),
+      _ => panic!("the first completion must be the map"),
+    }
+    match done[1] {
+      DaxCompletion::Unmapped(token) => {
+        assert_eq!(token, 200, "the second completion is the unmap's token");
+      }
+      _ => panic!("the second completion must be the unmap"),
+    }
+    assert!(!placer.has_outstanding(), "the ring emptied");
+  }
+
+  /// A non-zero reply-ack is a typed refusal the placer surfaces per request kind, never a silent success. Do: begin
+  /// a map, have the front end refuse it with status 22. Expect: the completion is `MapRefused` carrying the token
+  /// and the status, and the ring empties (the device will unpin the block and answer the guest an errno).
+  #[test]
+  fn a_refused_map_ack_is_a_typed_map_refusal_completion() {
+    let (frontend, backend) = stream_pair();
+    let mem = memfd_create("slates-placer-refuse", MemfdFlags::CLOEXEC).unwrap();
+    rustix::io::pwrite(&mem, &[0u8; 64], 0).unwrap();
+    let page = rustix::param::page_size().max(1);
+    let pg = u64::try_from(page).unwrap();
+    let mut placer: MessagePlacer<u64> =
+      MessagePlacer::new(BackendReqChannel::adopt(backend), page, u64::try_from(page.saturating_mul(4)).unwrap());
+
+    placer.begin_map(0, pg, mem.as_fd(), 0, true, 7).unwrap();
+    assert_eq!(front_read_request(&frontend), backend_request::SHMEM_MAP);
+    front_send_ack(&frontend, backend_request::SHMEM_MAP, 22);
+
+    let done = placer.poll_acks().unwrap();
+    assert_eq!(done.len(), 1);
+    match done[0] {
+      DaxCompletion::MapRefused { token, status } => {
+        assert_eq!(token, 7);
+        assert_eq!(status, 22);
+      }
+      _ => panic!("a non-zero ack must be a typed map refusal"),
+    }
+    assert!(!placer.has_outstanding());
+  }
+
+  /// §4.6 bounds. Do: ask the placer for an unaligned map, a map past the cache region, and one request past its
+  /// derived outstanding bound. Expect: each refused typed — `BadRange` for the ranges, `TooManyOutstanding` at the
+  /// bound — so a confused or hostile guest reaches neither outside the region nor unbounded growth.
+  #[test]
+  fn the_message_placer_refuses_a_bad_range_and_growth_past_its_bound() {
+    let (_frontend, backend) = stream_pair();
+    let mem = memfd_create("slates-placer-bound", MemfdFlags::CLOEXEC).unwrap();
+    rustix::io::pwrite(&mem, &[0u8; 64], 0).unwrap();
+    let page = rustix::param::page_size().max(1);
+    let pg = u64::try_from(page).unwrap();
+    // A one-page region: its bound is one whole page plus one in-flight map = 2.
+    let mut placer: MessagePlacer<u64> =
+      MessagePlacer::new(BackendReqChannel::adopt(backend), page, pg);
+
+    assert_eq!(
+      placer.begin_map(1, pg, mem.as_fd(), 0, false, 0),
+      Err(MessagePlaceError::BadRange),
+      "an unaligned offset is refused"
+    );
+    assert_eq!(
+      placer.begin_map(pg, pg, mem.as_fd(), 0, false, 0),
+      Err(MessagePlaceError::BadRange),
+      "a range past the region is refused"
+    );
+    placer.begin_map(0, pg, mem.as_fd(), 0, false, 1).unwrap();
+    placer.begin_unmap(0, pg, 2).unwrap();
+    assert_eq!(
+      placer.begin_unmap(0, pg, 3),
+      Err(MessagePlaceError::TooManyOutstanding { bound: 2 }),
+      "a request past the bound is refused, never grown"
+    );
+    // `_frontend` is kept alive so the socket stays open for the sends above.
   }
 
   /// AC-4.12 / A-9: a `SHMEM_MAP` body encodes exactly as crosvm's `VhostUserMMap` — a golden vector over every
