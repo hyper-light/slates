@@ -40,12 +40,13 @@
 //! §2.7 (ring layouts) and §5.11 (the file-system device, two queues by default: high priority and one request
 //! queue). QEMU's memfd backend seals by default (`memory-backend-memfd`, property `seal`, default on).
 
-use std::os::fd::{AsFd, AsRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 
 use rustix::event::epoll::{self, CreateFlags, EventData, EventFlags};
 use rustix::io::Errno;
 use rustix::net::{
-  RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, SendAncillaryBuffer, SendFlags,
+  RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, SendAncillaryBuffer, SendAncillaryMessage,
+  SendFlags,
 };
 use slates_db::catalog::Principal;
 use slates_mem::shared::{Handoff, SharedObject};
@@ -113,6 +114,39 @@ pub mod request {
   pub const SET_VRING_ENABLE: u32 = 18;
 }
 
+/// Format: the back-end-request codes (`BackendReq`), a namespace distinct from the front-end `request` codes
+/// above (a number means a different message on each channel — `9` is `SET_VRING_ADDR` from the front end and
+/// `SHMEM_MAP` from the back end). As crosvm's `vmm_vhost::message::BackendReq` numbers them (re-checked against
+/// the pinned VMM when the live guest runs); crosvm's older `FS_MAP` is `DEPRECATED__` and its `EXTERNAL_MAP`
+/// (1007) is the in-process `ptr` form slates does not use — the out-of-process back end sends `SHMEM_MAP` (9)
+/// with the arena descriptor, the standardized code QEMU and cloud-hypervisor also speak.
+pub mod backend_request {
+  /// Format: `VHOST_USER_BACKEND_SHMEM_MAP` — ask the front end to map a descriptor's pages into a VIRTIO
+  /// shared-memory region (the DAX cache window) at a given offset.
+  pub const SHMEM_MAP: u32 = 9;
+  /// Format: `VHOST_USER_BACKEND_SHMEM_UNMAP` — ask the front end to remove a mapped range from the region.
+  pub const SHMEM_UNMAP: u32 = 10;
+}
+
+/// Format: the `struct VhostUserMMap` body of a shmem map/unmap: `shmid` (`u8`), seven padding bytes, then
+/// `fd_offset`, `shm_offset`, `len` and `flags` (four `u64`) — 40 bytes, as crosvm's
+/// `vmm_vhost::message::VhostUserMMap` lays it out (`#[repr(C)]`, the u64s 8-aligned after the padded `shmid`).
+pub const MMAP_LEN: usize = 40;
+/// Format: the `shmid` field's byte offset in a `VhostUserMMap` body.
+const MMAP_AT_SHMID: usize = 0;
+/// Format: the `fd_offset` field's byte offset (after `shmid` and its seven padding bytes).
+const MMAP_AT_FD_OFFSET: usize = 8;
+/// Format: the `shm_offset` field's byte offset.
+const MMAP_AT_SHM_OFFSET: usize = 16;
+/// Format: the `len` field's byte offset.
+const MMAP_AT_LEN: usize = 24;
+/// Format: the `flags` field's byte offset.
+const MMAP_AT_FLAGS: usize = 32;
+/// Format: the `VhostUserMMap` flag bit asking for a read-write mapping (`MAP_RW`); clear means read-only.
+pub const MMAP_FLAG_MAP_RW: u64 = 1;
+/// Format: a back-end-request reply-ack's body — a single `u64` status, zero for success (`VHOST_USER_NEED_REPLY`).
+const ACK_LEN: usize = 8;
+
 /// Format: virtio's `VIRTIO_F_VERSION_1` feature bit.
 pub const VIRTIO_F_VERSION_1: u64 = 1 << 32;
 /// Format: vhost-user's `VHOST_USER_F_PROTOCOL_FEATURES` feature bit.
@@ -155,6 +189,11 @@ pub enum VhostError {
     /// The rule broken.
     reason: &'static str,
   },
+  /// The front end refused a back-end-request shmem map or unmap with a non-zero reply-ack status.
+  MapRefused {
+    /// The status the front end returned (non-zero).
+    status: u64,
+  },
   /// The memory table is inconsistent.
   Table(GuestMemoryError),
 }
@@ -167,6 +206,7 @@ impl std::fmt::Display for VhostError {
       Self::Closed => f.write_str("the front end closed its end"),
       Self::Protocol { reason } => write!(f, "protocol: {reason}"),
       Self::Memory { reason } => write!(f, "memory: {reason}"),
+      Self::MapRefused { status } => write!(f, "the front end refused a shmem map: status {status}"),
       Self::Table(e) => write!(f, "memory table: {e}"),
     }
   }
@@ -1007,6 +1047,221 @@ fn u64_of(payload: &[u8]) -> Result<u64, VhostError> {
   u64_at(payload, 0)
 }
 
+// --------------------------------------------------------------- the back-end-request channel (DAX, §4.6 A-9)
+
+/// Encodes a `VhostUserMMap` body — the payload of `SHMEM_MAP` and `SHMEM_UNMAP`. `fd_offset` is the byte offset
+/// of the mapped range within the supplied descriptor; `shm_offset` its byte offset within region `shmid`; `len`
+/// its length; `writable` sets `MAP_RW`. An unmap carries `fd_offset = 0` and `writable = false` (the front end
+/// reads only `shmid`, `shm_offset` and `len` for it). The seven bytes after `shmid` are padding, left zero.
+fn encode_mmap(shmid: u8, fd_offset: u64, shm_offset: u64, len: u64, writable: bool) -> [u8; MMAP_LEN] {
+  let mut body = [0u8; MMAP_LEN];
+  if let Some(byte) = body.get_mut(MMAP_AT_SHMID) {
+    *byte = shmid;
+  }
+  let flags = if writable { MMAP_FLAG_MAP_RW } else { 0 };
+  let fields = [
+    (MMAP_AT_FD_OFFSET, fd_offset.to_le_bytes()),
+    (MMAP_AT_SHM_OFFSET, shm_offset.to_le_bytes()),
+    (MMAP_AT_LEN, len.to_le_bytes()),
+    (MMAP_AT_FLAGS, flags.to_le_bytes()),
+  ];
+  for (at, bytes) in fields {
+    if let Some(field) = body.get_mut(at..at.saturating_add(bytes.len())) {
+      field.copy_from_slice(&bytes);
+    }
+  }
+  body
+}
+
+/// Encodes a back-end-request header: `request`, the flags (the version plus `NEED_REPLY`, since the back end
+/// waits for the front end's reply-ack before it answers the guest), and the payload `size`. Laid out exactly as
+/// [`Header::parse`] reads a header. `None` if `size` does not fit a `u32`.
+fn encode_request_header(request: u32, size: usize) -> Option<[u8; HEADER_LEN]> {
+  let size = u32::try_from(size).ok()?;
+  let mut header = [0u8; HEADER_LEN];
+  let fields = [
+    (0usize, request.to_le_bytes()),
+    (HEADER_AT_FLAGS, (VERSION | FLAG_NEED_REPLY).to_le_bytes()),
+    (HEADER_AT_SIZE, size.to_le_bytes()),
+  ];
+  for (at, bytes) in fields {
+    let field = header.get_mut(at..at.saturating_add(bytes.len()))?;
+    field.copy_from_slice(&bytes);
+  }
+  Some(header)
+}
+
+/// Decodes a back-end-request reply-ack: a reply header (the version correct, `FLAG_REPLY` set) then a `u64`
+/// status. `Ok(())` on a zero status; [`VhostError::MapRefused`] on a non-zero one. A malformed or wrong-sized
+/// reply is a protocol refusal, never a panic.
+fn parse_ack(bytes: &[u8]) -> Result<(), VhostError> {
+  if bytes.len() != HEADER_LEN.saturating_add(ACK_LEN) {
+    return Err(protocol("a back-end-request reply-ack of the wrong size"));
+  }
+  let flags = u32_at(bytes, HEADER_AT_FLAGS)?;
+  if flags & VERSION_MASK != VERSION {
+    return Err(protocol(
+      "a reply-ack in a protocol version this back end does not speak",
+    ));
+  }
+  if flags & FLAG_REPLY == 0 {
+    return Err(protocol("a back-end-request reply without the reply flag"));
+  }
+  let status = u64_at(bytes, HEADER_LEN)?;
+  if status != 0 {
+    return Err(VhostError::MapRefused { status });
+  }
+  Ok(())
+}
+
+/// Format: the one descriptor a `SHMEM_MAP` carries in ancillary data — the content arena's backing object.
+const MAP_FDS: usize = 1;
+
+/// The back-end-request channel (§4.6, A-9): the stream socket the front end hands the back end over
+/// `VHOST_USER_SET_BACKEND_REQ_FD`, on which the back end asks the front end to place a content block's pages into
+/// a VIRTIO shared-memory region with [`BackendReqChannel::send_map`] (`SHMEM_MAP`) and to remove them with
+/// [`BackendReqChannel::send_unmap`] (`SHMEM_UNMAP`). This is the **message-based** DAX delivery an out-of-process
+/// VMM (crosvm `--vhost-user-fs`, QEMU `vhost-user-fs-pci`, cloud-hypervisor) uses: the back end cannot reach the
+/// guest's BAR itself, so it hands the front end the arena descriptor
+/// ([`slates_bridge_core::Bridge::dax_backing`]) and the front end `mmap`s it into the region. (The fd-sharing
+/// form, where the back end maps a window it was handed, is [`crate::dax::DaxCacheRegion`], used by an in-process
+/// VMM like libkrun.)
+///
+/// A map carries `NEED_REPLY`, so the front end acknowledges once the mapping is live; the caller reads the ack
+/// with [`parse_ack`] before answering the guest's `FUSE_SETUPMAPPING`, so the guest never faults a page the front
+/// end has not yet mapped. Awaiting that ack over the shard's driver is the async-wiring step; the send below is
+/// the wire.
+pub struct BackendReqChannel {
+  /// The socket to the front end's back-end-request handler.
+  socket: OwnedFd,
+}
+
+impl std::fmt::Debug for BackendReqChannel {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.debug_struct("BackendReqChannel").finish()
+  }
+}
+
+impl BackendReqChannel {
+  /// Adopts `socket`, the back-end-request socket the front end handed over `SET_BACKEND_REQ_FD`.
+  pub fn adopt(socket: OwnedFd) -> BackendReqChannel {
+    BackendReqChannel { socket }
+  }
+
+  /// This end's descriptor, for registering the ack's readiness with the shard's driver.
+  pub fn fd(&self) -> BorrowedFd<'_> {
+    self.socket.as_fd()
+  }
+
+  /// Asks the front end to map `len` bytes of `fd` (from `fd_offset`) into region `shmid` at `shm_offset`,
+  /// read-write when `writable`. Sends `SHMEM_MAP` with the descriptor in ancillary data and `NEED_REPLY` set; the
+  /// ack is read separately. The front end expects the whole message, with its descriptor, in one `sendmsg`.
+  pub fn send_map(
+    &self,
+    shmid: u8,
+    shm_offset: u64,
+    fd: BorrowedFd<'_>,
+    fd_offset: u64,
+    len: u64,
+    writable: bool,
+  ) -> Result<(), VhostError> {
+    let header = encode_request_header(backend_request::SHMEM_MAP, MMAP_LEN)
+      .ok_or(protocol("a shmem-map payload larger than a u32"))?;
+    let body = encode_mmap(shmid, fd_offset, shm_offset, len, writable);
+    self.send(&header, &body, Some(fd))
+  }
+
+  /// Asks the front end to unmap `len` bytes at `shm_offset` in region `shmid` (`SHMEM_UNMAP`, no descriptor).
+  pub fn send_unmap(&self, shmid: u8, shm_offset: u64, len: u64) -> Result<(), VhostError> {
+    let header = encode_request_header(backend_request::SHMEM_UNMAP, MMAP_LEN)
+      .ok_or(protocol("a shmem-unmap payload larger than a u32"))?;
+    let body = encode_mmap(shmid, 0, shm_offset, len, false);
+    self.send(&header, &body, None)
+  }
+
+  /// Reads the front end's reply-ack for the most recent map or unmap, without blocking. `Ok(true)` once the ack
+  /// has arrived reporting success; `Ok(false)` while it has not yet arrived (the caller awaits this channel's
+  /// readiness on the shard's driver and asks again); [`VhostError::MapRefused`] if the front end refused the
+  /// mapping. The back end reads this before it answers the guest's `FUSE_SETUPMAPPING`, so the guest never faults
+  /// a page the front end has not mapped. A reply-ack carries no descriptor.
+  pub fn recv_ack(&self) -> Result<bool, VhostError> {
+    let mut buf = [0u8; HEADER_LEN + ACK_LEN];
+    let mut none: [std::mem::MaybeUninit<u8>; 0] = [];
+    let mut control = RecvAncillaryBuffer::new(&mut none);
+    let received = match rustix::net::recvmsg(
+      &self.socket,
+      &mut [std::io::IoSliceMut::new(&mut buf)],
+      &mut control,
+      RecvFlags::DONTWAIT,
+    ) {
+      Ok(received) => received,
+      Err(Errno::AGAIN | Errno::INTR) => return Ok(false),
+      Err(Errno::CONNRESET | Errno::PIPE | Errno::NOTCONN) => return Err(VhostError::Closed),
+      Err(e) => return Err(os("recvmsg")(e)),
+    };
+    if received.bytes == 0 {
+      return Err(VhostError::Closed);
+    }
+    if received.bytes != buf.len() {
+      return Err(protocol("a short back-end-request reply-ack"));
+    }
+    parse_ack(&buf)?;
+    Ok(true)
+  }
+
+  /// Sends one back-end request — header then body, with `fd` in ancillary data on the `sendmsg` that carries the
+  /// message's first byte (the protocol attaches descriptors there). The message is 52 bytes into the front end's
+  /// socket, so a short write means the front end has stopped reading (a typed refusal, never a split that would
+  /// strand the descriptor). The ancillary buffer is rebuilt each attempt, so an `INTR` retry re-sends the
+  /// descriptor.
+  fn send(
+    &self,
+    header: &[u8; HEADER_LEN],
+    body: &[u8; MMAP_LEN],
+    fd: Option<BorrowedFd<'_>>,
+  ) -> Result<(), VhostError> {
+    let mut message = [0u8; HEADER_LEN + MMAP_LEN];
+    if let Some(slot) = message.get_mut(..HEADER_LEN) {
+      slot.copy_from_slice(header);
+    }
+    if let Some(slot) = message.get_mut(HEADER_LEN..) {
+      slot.copy_from_slice(body);
+    }
+    let held = fd.map(|fd| [fd]);
+    let mut space =
+      [std::mem::MaybeUninit::<u8>::uninit(); rustix::cmsg_space!(ScmRights(MAP_FDS))];
+    loop {
+      let mut control = SendAncillaryBuffer::new(&mut space);
+      let pushed = match held.as_ref() {
+        Some(held) => control.push(SendAncillaryMessage::ScmRights(held)),
+        None => true,
+      };
+      if !pushed {
+        return Err(protocol("the map descriptor did not fit the ancillary buffer"));
+      }
+      match rustix::net::sendmsg(
+        &self.socket,
+        &[std::io::IoSlice::new(&message)],
+        &mut control,
+        SendFlags::NOSIGNAL,
+      ) {
+        Ok(sent) if sent == message.len() => return Ok(()),
+        Ok(_) => {
+          return Err(protocol(
+            "the front end did not take a whole back-end request",
+          ));
+        }
+        Err(Errno::INTR) => {}
+        Err(Errno::AGAIN) => {
+          return Err(protocol("the front end stopped reading back-end requests"));
+        }
+        Err(Errno::PIPE | Errno::CONNRESET | Errno::NOTCONN) => return Err(VhostError::Closed),
+        Err(e) => return Err(os("sendmsg")(e)),
+      }
+    }
+  }
+}
+
 impl VmmSeam for VhostUserSeam {
   fn consumer(&mut self) -> Result<Principal, SeamError> {
     Ok(self.consumer.clone())
@@ -1095,5 +1350,144 @@ impl VmmSeam for VhostUserSeam {
     self.memory = GuestRegions::default();
     self.stopped = true;
     let _ = rustix::net::shutdown(self.socket.as_fd(), rustix::net::Shutdown::Both);
+  }
+}
+
+#[cfg(test)]
+mod shmem_tests {
+  //! The back-end-request channel's wire, by use (§4.6, A-9, AC-4.12): a `SHMEM_MAP` body matches crosvm's
+  //! `VhostUserMMap` byte for byte, and a real descriptor plus the map fields cross a socket to a stand-in front
+  //! end, which reads the block's bytes back through the descriptor it received and acknowledges — the
+  //! message-based DAX wire, end to end, with no VMM.
+  #![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::cognitive_complexity
+  )]
+
+  use std::os::fd::AsFd;
+
+  use rustix::fs::{MemfdFlags, memfd_create};
+  use rustix::net::{AddressFamily, SocketFlags, SocketType};
+
+  use super::*;
+
+  /// AC-4.12 / A-9: a `SHMEM_MAP` body encodes exactly as crosvm's `VhostUserMMap` — a golden vector over every
+  /// field (`shmid`, the seven zero padding bytes, `fd_offset`, `shm_offset`, `len`, `flags`).
+  #[test]
+  fn t_4_13_shmem_map_body_is_the_vhost_user_mmap_golden_vector() {
+    let body = encode_mmap(7, 0x1122_3344_5566_7788, 0x2000, 0x0001_0000, true);
+    let mut want = [0u8; MMAP_LEN];
+    want[MMAP_AT_SHMID] = 7;
+    want[MMAP_AT_FD_OFFSET..MMAP_AT_FD_OFFSET + 8]
+      .copy_from_slice(&0x1122_3344_5566_7788u64.to_le_bytes());
+    want[MMAP_AT_SHM_OFFSET..MMAP_AT_SHM_OFFSET + 8].copy_from_slice(&0x2000u64.to_le_bytes());
+    want[MMAP_AT_LEN..MMAP_AT_LEN + 8].copy_from_slice(&0x0001_0000u64.to_le_bytes());
+    want[MMAP_AT_FLAGS..MMAP_AT_FLAGS + 8].copy_from_slice(&MMAP_FLAG_MAP_RW.to_le_bytes());
+    assert_eq!(body, want);
+    assert_eq!(&body[1..8], &[0u8; 7], "the seven bytes after shmid are padding");
+  }
+
+  /// A non-zero reply-ack status is the typed map refusal, never a silent success.
+  #[test]
+  fn a_non_zero_ack_is_a_typed_map_refusal() {
+    let mut ack = [0u8; HEADER_LEN + ACK_LEN];
+    ack[HEADER_AT_FLAGS..HEADER_AT_FLAGS + 4].copy_from_slice(&(VERSION | FLAG_REPLY).to_le_bytes());
+    ack[HEADER_AT_SIZE..HEADER_AT_SIZE + 4]
+      .copy_from_slice(&u32::try_from(ACK_LEN).unwrap().to_le_bytes());
+    ack[HEADER_LEN..].copy_from_slice(&22u64.to_le_bytes());
+    assert_eq!(parse_ack(&ack), Err(VhostError::MapRefused { status: 22 }));
+  }
+
+  /// AC-4.12 / A-9: the back end sends a real descriptor and the map fields over the channel; a stand-in front
+  /// end receives exactly those bytes and that descriptor, reads the block's bytes back through the fd it got,
+  /// then acknowledges success, and the back end accepts the ack. The message-based DAX wire, end to end.
+  #[test]
+  fn a_shmem_map_carries_the_block_descriptor_and_fields_and_the_ack_returns() {
+    let (backend, frontend) = rustix::net::socketpair(
+      AddressFamily::UNIX,
+      SocketType::STREAM,
+      SocketFlags::CLOEXEC,
+      None,
+    )
+    .unwrap();
+    let channel = BackendReqChannel::adopt(backend);
+
+    // a content-block stand-in: a memfd of known bytes.
+    let block = [0xABu8; 64];
+    let mem = memfd_create("slates-shmem-test", MemfdFlags::CLOEXEC).unwrap();
+    let wrote = rustix::io::pwrite(&mem, &block, 0).unwrap();
+    assert_eq!(wrote, block.len());
+    let block_len = u64::try_from(block.len()).unwrap();
+
+    // the back end asks the front end to map the block read-only into region 5 at shm_offset 0x2000.
+    channel
+      .send_map(5, 0x2000, mem.as_fd(), 0, block_len, false)
+      .unwrap();
+
+    // the stand-in front end receives the whole 52-byte message and the one descriptor.
+    let mut buf = [0u8; HEADER_LEN + MMAP_LEN];
+    let mut space =
+      [std::mem::MaybeUninit::<u8>::uninit(); rustix::cmsg_space!(ScmRights(MAP_FDS))];
+    let mut control = RecvAncillaryBuffer::new(&mut space);
+    let received = rustix::net::recvmsg(
+      &frontend,
+      &mut [std::io::IoSliceMut::new(&mut buf)],
+      &mut control,
+      RecvFlags::empty(),
+    )
+    .unwrap();
+    assert_eq!(received.bytes, buf.len());
+
+    // the header names SHMEM_MAP, asks for a reply, and sizes the body.
+    assert_eq!(u32_at(&buf, 0).unwrap(), backend_request::SHMEM_MAP);
+    assert_ne!(u32_at(&buf, HEADER_AT_FLAGS).unwrap() & FLAG_NEED_REPLY, 0);
+    assert_eq!(
+      u32_at(&buf, HEADER_AT_SIZE).unwrap(),
+      u32::try_from(MMAP_LEN).unwrap()
+    );
+    // the body carries the map fields.
+    let body = &buf[HEADER_LEN..];
+    assert_eq!(body[MMAP_AT_SHMID], 5);
+    assert_eq!(u64_at(body, MMAP_AT_SHM_OFFSET).unwrap(), 0x2000);
+    assert_eq!(u64_at(body, MMAP_AT_LEN).unwrap(), block_len);
+    assert_eq!(u64_at(body, MMAP_AT_FLAGS).unwrap(), 0, "read-only clears MAP_RW");
+
+    // the descriptor really crossed: the block's bytes read back through the fd the front end received.
+    let mut fds = Vec::new();
+    for message in control.drain() {
+      if let RecvAncillaryMessage::ScmRights(iter) = message {
+        fds.extend(iter);
+      }
+    }
+    assert_eq!(fds.len(), 1);
+    let got_fd = fds.into_iter().next().unwrap();
+    let mut echo = [0u8; 64];
+    let read = rustix::io::pread(&got_fd, &mut echo, 0).unwrap();
+    assert_eq!(read, echo.len());
+    assert_eq!(
+      echo, block,
+      "the mapped descriptor must be the block the back end handed over"
+    );
+
+    // the front end acknowledges success (status 0); the back end reads and accepts the ack.
+    let mut ack = [0u8; HEADER_LEN + ACK_LEN];
+    ack[0..4].copy_from_slice(&backend_request::SHMEM_MAP.to_le_bytes());
+    ack[HEADER_AT_FLAGS..HEADER_AT_FLAGS + 4].copy_from_slice(&(VERSION | FLAG_REPLY).to_le_bytes());
+    ack[HEADER_AT_SIZE..HEADER_AT_SIZE + 4]
+      .copy_from_slice(&u32::try_from(ACK_LEN).unwrap().to_le_bytes());
+    rustix::net::sendmsg(
+      &frontend,
+      &[std::io::IoSlice::new(&ack)],
+      &mut SendAncillaryBuffer::default(),
+      SendFlags::NOSIGNAL,
+    )
+    .unwrap();
+    assert!(
+      channel.recv_ack().unwrap(),
+      "the back end must accept the success ack"
+    );
   }
 }
