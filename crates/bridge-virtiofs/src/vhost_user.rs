@@ -112,6 +112,9 @@ pub mod request {
   pub const GET_QUEUE_NUM: u32 = 17;
   /// Format: `VHOST_USER_SET_VRING_ENABLE`.
   pub const SET_VRING_ENABLE: u32 = 18;
+  /// Format: `VHOST_USER_SET_BACKEND_REQ_FD` (formerly `SET_SLAVE_REQ_FD`) — the front end hands over the
+  /// back-end-request socket in ancillary data, the channel the back end sends `SHMEM_MAP` on (§4.6 DAX).
+  pub const SET_BACKEND_REQ_FD: u32 = 21;
 }
 
 /// Format: the back-end-request codes (`BackendReq`), a namespace distinct from the front-end `request` codes
@@ -155,6 +158,14 @@ pub const F_PROTOCOL_FEATURES: u64 = 1 << 30;
 pub const PROTOCOL_F_MQ: u64 = 1 << 0;
 /// Format: the protocol feature `VHOST_USER_PROTOCOL_F_REPLY_ACK`.
 pub const PROTOCOL_F_REPLY_ACK: u64 = 1 << 3;
+/// Format: the protocol feature `VHOST_USER_PROTOCOL_F_BACKEND_REQ` — the back-end-request channel (bit 5).
+pub const PROTOCOL_F_BACKEND_REQ: u64 = 1 << 5;
+/// Format: the protocol feature `VHOST_USER_PROTOCOL_F_SHMEM` — VIRTIO shared-memory regions, the DAX cache (bit 22).
+pub const PROTOCOL_F_SHMEM: u64 = 1 << 22;
+/// The protocol features a DAX device offers in addition to the baseline: the back-end-request channel and the
+/// shared-memory regions it needs to place content with `SHMEM_MAP`. Offered only when the device serves DAX, so a
+/// non-DAX device and production (where DAX stays unadvertised, §4.6) offer exactly `OFFERED_PROTOCOL_FEATURES`.
+pub const DAX_PROTOCOL_FEATURES: u64 = PROTOCOL_F_BACKEND_REQ | PROTOCOL_F_SHMEM;
 /// The device features offered: version 1 and the protocol-features extension (no event index, no indirect
 /// descriptors: the virtqueue implements neither, `docs/wip/virtiofs.md` §6).
 pub const OFFERED_FEATURES: u64 = VIRTIO_F_VERSION_1 | F_PROTOCOL_FEATURES;
@@ -516,6 +527,13 @@ pub struct VhostUserSeam {
   protocol_features: u64,
   inbound: Vec<u8>,
   inbound_fds: Vec<OwnedFd>,
+  /// The back-end-request channel the front end handed over `SET_BACKEND_REQ_FD`; present once DAX is negotiated.
+  backend_req: Option<BackendReqChannel>,
+  /// Whether this device serves DAX: it then offers `BACKEND_REQ | SHMEM` and accepts the back-end-request fd.
+  /// Default false — production and non-DAX devices behave exactly as before (DAX stays unadvertised, §4.6).
+  dax_enabled: bool,
+  /// The DAX cache region's size to report to the front end, in bytes (derived by the caller; 0 when no DAX).
+  dax_region_bytes: u64,
   stopped: bool,
 }
 
@@ -560,8 +578,35 @@ impl VhostUserSeam {
       protocol_features: 0,
       inbound: Vec::with_capacity(HEADER_LEN.saturating_add(MAX_PAYLOAD)),
       inbound_fds: Vec::new(),
+      backend_req: None,
+      dax_enabled: false,
+      dax_region_bytes: 0,
       stopped: false,
     })
+  }
+
+  /// Enables DAX for this device: it will offer `BACKEND_REQ | SHMEM`, accept the back-end-request channel over
+  /// `SET_BACKEND_REQ_FD`, and (§4.6) ask the front end to place content blocks into a VIRTIO shared-memory region
+  /// of `region_bytes`. Gated by the caller to the DAX-authorized path; a device that never calls this behaves
+  /// exactly as a non-DAX one (production stays unadvertised). `region_bytes` is the caller's derived cache size.
+  pub fn enable_dax(&mut self, region_bytes: u64) {
+    self.dax_enabled = true;
+    self.dax_region_bytes = region_bytes;
+  }
+
+  /// The protocol features offered: the baseline, plus the DAX features when this device serves DAX.
+  fn offered_protocol_features(&self) -> u64 {
+    if self.dax_enabled {
+      OFFERED_PROTOCOL_FEATURES | DAX_PROTOCOL_FEATURES
+    } else {
+      OFFERED_PROTOCOL_FEATURES
+    }
+  }
+
+  /// The back-end-request channel, once the front end has handed it over (DAX only); `None` otherwise. The device
+  /// sends `SHMEM_MAP`/`SHMEM_UNMAP` on it and awaits each ack before answering the guest's `FUSE_SETUPMAPPING`.
+  pub fn backend_req(&self) -> Option<&BackendReqChannel> {
+    self.backend_req.as_ref()
   }
 
   /// Whether the front end has configured every queue: memory mapped; each queue's size, addresses, kick and
@@ -774,10 +819,13 @@ impl VhostUserSeam {
         self.features = features;
         Ok(Answer::Acknowledge)
       }
-      request::GET_PROTOCOL_FEATURES => self.answer_u64(header, OFFERED_PROTOCOL_FEATURES),
+      request::GET_PROTOCOL_FEATURES => {
+        let offered = self.offered_protocol_features();
+        self.answer_u64(header, offered)
+      }
       request::SET_PROTOCOL_FEATURES => {
         let features = u64_of(payload)?;
-        if features & !OFFERED_PROTOCOL_FEATURES != 0 {
+        if features & !self.offered_protocol_features() != 0 {
           return Err(protocol("a protocol feature that was not offered"));
         }
         self.protocol_features = features;
@@ -810,8 +858,29 @@ impl VhostUserSeam {
         vring.enabled = num != 0;
         Ok(Answer::Acknowledge)
       }
+      request::SET_BACKEND_REQ_FD => self.set_backend_req_fd(),
       _ => Err(protocol("a request this back end does not serve")),
     }
+  }
+
+  /// Adopts the back-end-request socket the front end handed in ancillary data (`SET_BACKEND_REQ_FD`): the channel
+  /// on which the device later sends `SHMEM_MAP`/`SHMEM_UNMAP` (§4.6 DAX). Refused unless DAX was negotiated — the
+  /// feature, and so this request, is offered only then — and unless exactly one descriptor came with it.
+  fn set_backend_req_fd(&mut self) -> Result<Answer, VhostError> {
+    if !self.dax_enabled {
+      return Err(protocol("a back-end-request fd without the shmem feature"));
+    }
+    let mut fds = self.take_fds();
+    if fds.len() != 1 {
+      return Err(protocol(
+        "a back-end-request fd message without exactly one descriptor",
+      ));
+    }
+    let socket = fds
+      .pop()
+      .ok_or(protocol("a back-end-request fd message without a descriptor"))?;
+    self.backend_req = Some(BackendReqChannel::adopt(socket));
+    Ok(Answer::Acknowledge)
   }
 
   fn answer_u64(&self, header: Header, value: u64) -> Result<Answer, VhostError> {
@@ -1367,12 +1436,61 @@ mod shmem_tests {
     clippy::cognitive_complexity
   )]
 
-  use std::os::fd::AsFd;
+  use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 
   use rustix::fs::{MemfdFlags, memfd_create};
   use rustix::net::{AddressFamily, SocketFlags, SocketType};
 
   use super::*;
+
+  /// A socketpair of stream sockets (the front-end end, then the back-end end).
+  fn stream_pair() -> (OwnedFd, OwnedFd) {
+    rustix::net::socketpair(
+      AddressFamily::UNIX,
+      SocketType::STREAM,
+      SocketFlags::CLOEXEC,
+      None,
+    )
+    .unwrap()
+  }
+
+  /// Sends a bare front-end request (`request`, version flags, `size`) with an optional descriptor in ancillary
+  /// data, the way a VMM front end drives the control socket.
+  fn send_front_message(socket: &OwnedFd, request: u32, size: u32, fd: Option<BorrowedFd<'_>>) {
+    let mut header = [0u8; HEADER_LEN];
+    header[0..4].copy_from_slice(&request.to_le_bytes());
+    header[HEADER_AT_FLAGS..HEADER_AT_FLAGS + 4].copy_from_slice(&VERSION.to_le_bytes());
+    header[HEADER_AT_SIZE..HEADER_AT_SIZE + 4].copy_from_slice(&size.to_le_bytes());
+    let held = fd.map(|f| [f]);
+    let mut space =
+      [std::mem::MaybeUninit::<u8>::uninit(); rustix::cmsg_space!(ScmRights(MAP_FDS))];
+    let mut control = SendAncillaryBuffer::new(&mut space);
+    if let Some(held) = held.as_ref() {
+      assert!(control.push(SendAncillaryMessage::ScmRights(held)));
+    }
+    rustix::net::sendmsg(
+      socket,
+      &[std::io::IoSlice::new(&header)],
+      &mut control,
+      SendFlags::NOSIGNAL,
+    )
+    .unwrap();
+  }
+
+  /// Reads a `u64`-payload reply (header then eight bytes), as `answer_u64` sends.
+  fn read_front_u64(socket: &OwnedFd) -> u64 {
+    let mut buf = [0u8; HEADER_LEN + 8];
+    let mut none: [std::mem::MaybeUninit<u8>; 0] = [];
+    let got = rustix::net::recvmsg(
+      socket,
+      &mut [std::io::IoSliceMut::new(&mut buf)],
+      &mut RecvAncillaryBuffer::new(&mut none),
+      RecvFlags::empty(),
+    )
+    .unwrap();
+    assert_eq!(got.bytes, buf.len());
+    u64_at(&buf, HEADER_LEN).unwrap()
+  }
 
   /// AC-4.12 / A-9: a `SHMEM_MAP` body encodes exactly as crosvm's `VhostUserMMap` — a golden vector over every
   /// field (`shmid`, the seven zero padding bytes, `fd_offset`, `shm_offset`, `len`, `flags`).
@@ -1489,5 +1607,81 @@ mod shmem_tests {
       channel.recv_ack().unwrap(),
       "the back end must accept the success ack"
     );
+  }
+
+  /// A-9 / AC-4.12: a DAX device offers `BACKEND_REQ | SHMEM` and adopts the back-end-request channel the front
+  /// end hands over `SET_BACKEND_REQ_FD`, driven through the production control loop over a real socket; the
+  /// adopted channel then carries a `SHMEM_MAP` to the handed-in peer — the negotiation end to end, no VMM.
+  #[test]
+  fn a_dax_device_negotiates_the_backend_req_channel_and_it_carries_a_map() {
+    let (frontend, backend) = stream_pair();
+    let config = crate::device::DeviceConfig::new(crate::device::FsTag::new("slates").unwrap());
+    let mut seam = VhostUserSeam::adopt(backend, &config).unwrap();
+    seam.enable_dax(0x1000_0000); // a 256 MiB cache window (test value; Piece B only stores it)
+
+    // GET_PROTOCOL_FEATURES: the reply carries the DAX features.
+    send_front_message(&frontend, request::GET_PROTOCOL_FEATURES, 0, None);
+    seam.serve_control().unwrap();
+    let offered = read_front_u64(&frontend);
+    assert_ne!(offered & PROTOCOL_F_BACKEND_REQ, 0, "a DAX device offers BACKEND_REQ");
+    assert_ne!(offered & PROTOCOL_F_SHMEM, 0, "a DAX device offers SHMEM");
+
+    // SET_BACKEND_REQ_FD: a fresh pair, its 'a' end handed to the seam, 'b' kept as the front end's handler.
+    let (req_a, req_b) = stream_pair();
+    send_front_message(&frontend, request::SET_BACKEND_REQ_FD, 0, Some(req_a.as_fd()));
+    seam.serve_control().unwrap();
+    drop(req_a); // the seam holds a dup; this end is no longer needed
+    assert!(
+      seam.backend_req().is_some(),
+      "the seam adopted the back-end-request channel"
+    );
+
+    // the adopted channel is req_a's peer: a SHMEM_MAP the device sends arrives on req_b.
+    let mem = memfd_create("slates-reqfd-test", MemfdFlags::CLOEXEC).unwrap();
+    rustix::io::pwrite(&mem, &[0u8; 16], 0).unwrap();
+    seam
+      .backend_req()
+      .unwrap()
+      .send_map(0, 0, mem.as_fd(), 0, 16, false)
+      .unwrap();
+    let mut buf = [0u8; HEADER_LEN + MMAP_LEN];
+    let mut none: [std::mem::MaybeUninit<u8>; 0] = [];
+    let got = rustix::net::recvmsg(
+      &req_b,
+      &mut [std::io::IoSliceMut::new(&mut buf)],
+      &mut RecvAncillaryBuffer::new(&mut none),
+      RecvFlags::empty(),
+    )
+    .unwrap();
+    assert_eq!(got.bytes, buf.len());
+    assert_eq!(u32_at(&buf, 0).unwrap(), backend_request::SHMEM_MAP);
+  }
+
+  /// A non-DAX device offers neither DAX feature and refuses a back-end-request fd — production and any non-DAX
+  /// device behave exactly as before (DAX stays unadvertised, §4.6).
+  #[test]
+  fn a_non_dax_device_offers_no_dax_features_and_refuses_the_backend_req_fd() {
+    let (frontend, backend) = stream_pair();
+    let config = crate::device::DeviceConfig::new(crate::device::FsTag::new("slates").unwrap());
+    let mut seam = VhostUserSeam::adopt(backend, &config).unwrap();
+    // no enable_dax
+
+    send_front_message(&frontend, request::GET_PROTOCOL_FEATURES, 0, None);
+    seam.serve_control().unwrap();
+    let offered = read_front_u64(&frontend);
+    assert_eq!(
+      offered & DAX_PROTOCOL_FEATURES,
+      0,
+      "a non-DAX device offers no DAX features"
+    );
+
+    // an unsolicited SET_BACKEND_REQ_FD is refused (the feature was never offered): the control loop ends.
+    let (req_a, _req_b) = stream_pair();
+    send_front_message(&frontend, request::SET_BACKEND_REQ_FD, 0, Some(req_a.as_fd()));
+    assert!(
+      seam.serve_control().is_err(),
+      "a back-end-request fd without the shmem feature is refused"
+    );
+    assert!(seam.backend_req().is_none());
   }
 }
