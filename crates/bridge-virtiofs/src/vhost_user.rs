@@ -157,7 +157,7 @@ const MMAP_AT_FLAGS: usize = 32;
 /// Format: the `VhostUserMMap` flag bit asking for a read-write mapping (`MAP_RW`); clear means read-only.
 pub const MMAP_FLAG_MAP_RW: u64 = 1;
 /// Format: a back-end-request reply-ack's body — a single `u64` status, zero for success (`VHOST_USER_NEED_REPLY`).
-const ACK_LEN: usize = 8;
+pub const ACK_LEN: usize = 8;
 
 /// Format: virtio's `VIRTIO_F_VERSION_1` feature bit.
 pub const VIRTIO_F_VERSION_1: u64 = 1 << 32;
@@ -549,9 +549,9 @@ const U64_LEN: usize = 8;
 /// Format: a `u32` field.
 const U32_LEN: usize = 4;
 /// Format: the header's flags follow its request word.
-const HEADER_AT_FLAGS: usize = 4;
+pub const HEADER_AT_FLAGS: usize = 4;
 /// Format: the header's payload size follows its flags.
-const HEADER_AT_SIZE: usize = 8;
+pub const HEADER_AT_SIZE: usize = 8;
 /// Format: a memory-table entry's size follows its guest address.
 const REGION_AT_SIZE: usize = 8;
 /// Format: a memory-table entry's front-end address follows its size.
@@ -1302,7 +1302,7 @@ fn parse_ack(bytes: &[u8]) -> Result<(), VhostError> {
 }
 
 /// Format: the one descriptor a `SHMEM_MAP` carries in ancillary data — the content arena's backing object.
-const MAP_FDS: usize = 1;
+pub const MAP_FDS: usize = 1;
 
 /// The back-end-request channel (§4.6, A-9): the stream socket the front end hands the back end over
 /// `VHOST_USER_SET_BACKEND_REQ_FD`, on which the back end asks the front end to place a content block's pages into

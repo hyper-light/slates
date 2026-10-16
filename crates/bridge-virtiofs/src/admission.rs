@@ -741,7 +741,7 @@ impl<S: VmmSeam> AdmittedDevice<S> {
       let memory = self.seam.memory().map_err(ServeError::Seam)?;
       self
         .device
-        .complete_dax_awaiting(memory, bridge, &cx)
+        .complete_dax_awaiting(memory, bridge, &cx, &mut self.ledger)
         .map_err(ServeError::Device)?
     };
     if let Some(done) = completed

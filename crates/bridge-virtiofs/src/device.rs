@@ -1024,6 +1024,7 @@ impl Device {
     memory: &mut dyn GuestMemory,
     bridge: &mut dyn slates_bridge_core::Bridge,
     cx: &slates_bridge_core::OpContext,
+    admission: &mut dyn ChainAdmission,
   ) -> Result<Option<Completed>, DeviceError> {
     // Drain the acks into a list first, releasing the placer borrow before touching windows/queues/reply.
     let completions = match self.dax_placer.as_mut() {
@@ -1036,11 +1037,11 @@ impl Device {
     for completion in completions {
       match completion {
         crate::vhost_user::DaxCompletion::Mapped(entry) => {
-          completed = self.complete_parked_map(memory, entry, None)?;
+          completed = self.complete_parked_map(memory, entry, None, admission)?;
         }
         crate::vhost_user::DaxCompletion::MapRefused { token, .. } => {
           let _ = bridge.dax_unmap(&token.mapping, cx);
-          completed = self.complete_parked_map(memory, token, Some(EIO))?;
+          completed = self.complete_parked_map(memory, token, Some(EIO), admission)?;
         }
         crate::vhost_user::DaxCompletion::Unmapped(entry) => {
           let _ = bridge.dax_release_after_unmap(&entry.mapping, cx);
@@ -1063,6 +1064,7 @@ impl Device {
     memory: &mut dyn GuestMemory,
     entry: DaxWindowEntry,
     errno: Option<i32>,
+    admission: &mut dyn ChainAdmission,
   ) -> Result<Option<Completed>, DeviceError> {
     let Some(held) = self.awaiting_dax_map.take() else {
       return Ok(None);
@@ -1081,6 +1083,9 @@ impl Device {
     }
     let written = u32::try_from(n).unwrap_or(u32::MAX);
     self.queue_at(index)?.push_used(memory, &held.chain, written)?;
+    // Release the charge the parked chain held since its service pass (as `complete_awaiting` does for the
+    // owner's barrier) — otherwise each message-based DAX map leaks one request credit.
+    admission.complete();
     Ok(Some(Completed {
       queue: held.queue,
       interrupt_wanted: self.queue_at(index)?.interrupts_wanted(memory)?,

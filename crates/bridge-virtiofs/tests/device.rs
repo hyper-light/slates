@@ -1731,13 +1731,14 @@ fn a_setupmapping_past_the_window_is_refused() {
 /// rounds a content block up to a power of two, so a file of two pages + 1 byte lives in a four-page block; the file
 /// authorizes only three pages (`Mapping::file_len` rounded up to the window granule), and the fourth page is padding
 /// the file never reaches. Do: opt in to writable DAX, write such a file, then SETUPMAPPING the whole four-page block.
-/// Expect: refused EINVAL and no window established — the authorized window is the file's pages, not the block's
-/// padding — while a map of exactly the authorized pages succeeds. So the guest's shared-memory window never covers a
-/// page lying entirely past its file, closed by bound (not only by the map-time tail scrub), keeping the surface the
-/// host shares with the guest minimal.
+/// Expect: the map is CAPPED to the file's three authorized pages (it succeeds, mapping only those — the real guest
+/// maps DAX in window chunks that reach past a small file, and refusing the whole chunk outright SIGBUS'd a live
+/// crosvm guest), while a map STARTING entirely past the authorized pages is refused. So the guest's shared-memory
+/// window never covers a page lying entirely past its file — the invariant holds by the cap, not by refusing the
+/// over-reaching request — keeping the surface the host shares with the guest minimal.
 #[cfg(unix)]
 #[test]
-fn a_setupmapping_of_the_block_padding_past_the_file_is_refused() {
+fn a_setupmapping_reaching_past_the_file_is_capped_to_its_authorized_pages() {
   use slates_mem::{SharedObject, Words};
   let page = rustix::param::page_size().max(1);
   let mut store = dax_shared_store(page, "pad");
@@ -1774,8 +1775,9 @@ fn a_setupmapping_of_the_block_padding_past_the_file_is_refused() {
     &dax_init_body(),
   );
 
-  // The whole four-page block — its fourth page lies entirely past the file. Refused, nothing mapped.
-  let past = dax_exchange(
+  // The whole four-page block — its fourth page lies entirely past the file. The map is CAPPED to the file's three
+  // authorized pages: it succeeds, mapping only those; the fourth page is never mapped.
+  let capped = dax_exchange(
     &mut device,
     &mut driver,
     &mut bridge,
@@ -1784,23 +1786,45 @@ fn a_setupmapping_of_the_block_padding_past_the_file_is_refused() {
     &dax_setup_body(0, block as u64, true, 0),
   );
   assert_eq!(
-    reply_error(&past),
-    -22,
-    "a map of the block padding past the file is refused EINVAL"
+    reply_error(&capped),
+    0,
+    "a request reaching past the file is capped to the authorized pages, not refused"
   );
   assert_eq!(
     device.dax_window_count(),
-    0,
-    "nothing is mapped when the request reaches past the file's pages"
+    1,
+    "the cap mapped the file's authorized pages"
   );
 
-  // Exactly the file's authorized pages. Succeeds.
-  let ok = dax_exchange(
+  // A map STARTING entirely past the file's authorized pages backs nothing: refused, at a distinct window slot so
+  // it does not remap the capped window above. The invariant: the guest never maps a page lying entirely past its
+  // file.
+  let entirely_past = dax_exchange(
     &mut device,
     &mut driver,
     &mut bridge,
     &cx,
     (Opcode::SetupMapping, 3, nodeid),
+    &dax_setup_body(authorized as u64, page as u64, true, (page * 3) as u64),
+  );
+  assert_eq!(
+    reply_error(&entirely_past),
+    -22,
+    "a map starting entirely past the file's pages is refused EINVAL"
+  );
+  assert_eq!(
+    device.dax_window_count(),
+    1,
+    "nothing new is mapped past the file; the capped window still stands"
+  );
+
+  // Exactly the file's authorized pages, remapping the capped slot. Succeeds.
+  let ok = dax_exchange(
+    &mut device,
+    &mut driver,
+    &mut bridge,
+    &cx,
+    (Opcode::SetupMapping, 4, nodeid),
     &dax_setup_body(0, authorized as u64, true, 0),
   );
   assert_eq!(
@@ -2105,10 +2129,11 @@ fn hostile_dax_requests_are_refused_and_establish_no_window() {
     &dax_init_body(),
   );
 
-  // Hostile SETUPMAPPING bodies: a truncated body (the parser needs 5x u64), a colossal len (overflows the block/
-  // window bound), an unaligned window offset (the map is refused and the block it briefly pinned is unpinned), and
-  // an inline file (no mappable content block). Each a typed refusal, no window, the block a refused map pinned
-  // released — a hostile guest establishes no mapping.
+  // Hostile SETUPMAPPING bodies: a truncated body (the parser needs 5x u64), a map starting entirely past the file's
+  // pages (backs nothing), an unaligned window offset (the map is refused and the block it briefly pinned is
+  // unpinned), and an inline file (no mappable content block). Each a typed refusal, no window, the block a refused
+  // map pinned released — a hostile guest establishes no mapping. (A colossal len that reaches past the file is
+  // capped to the file's pages, not a refusal — covered by the cap test above.)
   let page_len = page as u64;
   for (unique, nodeid, body, why) in [
     (
@@ -2120,8 +2145,8 @@ fn hostile_dax_requests_are_refused_and_establish_no_window() {
     (
       3,
       big_no,
-      dax_setup_body(0, u64::MAX, true, 0),
-      "len = u64::MAX",
+      dax_setup_body(page_len, page_len, true, 0),
+      "a map starting entirely past the file's pages",
     ),
     (
       4,
@@ -2651,4 +2676,150 @@ fn an_advance_revalidate_tears_the_stale_window_and_keeps_the_current_one() {
     );
   }
   drop(cache);
+}
+
+/// Receives one `SHMEM_MAP` back-end request and its single descriptor the way a vhost-user front end would,
+/// asserting the request code; returns the descriptor so the caller can read the mapped block's bytes.
+#[cfg(target_os = "linux")]
+fn front_recv_shmem_map(socket: &std::os::fd::OwnedFd) -> std::os::fd::OwnedFd {
+  use slates_bridge_virtiofs::vhost_user::{HEADER_LEN, MAP_FDS, MMAP_LEN, backend_request};
+  let mut buf = [0u8; HEADER_LEN + MMAP_LEN];
+  let mut space = [std::mem::MaybeUninit::<u8>::uninit(); rustix::cmsg_space!(ScmRights(MAP_FDS))];
+  let mut control = rustix::net::RecvAncillaryBuffer::new(&mut space);
+  let got = rustix::net::recvmsg(
+    socket,
+    &mut [std::io::IoSliceMut::new(&mut buf)],
+    &mut control,
+    rustix::net::RecvFlags::empty(),
+  )
+  .unwrap();
+  assert_eq!(got.bytes, buf.len(), "a whole SHMEM_MAP message");
+  assert_eq!(
+    u32::from_le_bytes(buf[0..4].try_into().unwrap()),
+    backend_request::SHMEM_MAP,
+    "the back-end request is SHMEM_MAP"
+  );
+  let mut fds: Vec<std::os::fd::OwnedFd> = Vec::new();
+  for message in control.drain() {
+    if let rustix::net::RecvAncillaryMessage::ScmRights(iter) = message {
+      fds.extend(iter);
+    }
+  }
+  assert_eq!(fds.len(), 1, "SHMEM_MAP carries exactly one descriptor");
+  fds.into_iter().next().unwrap()
+}
+
+/// Answers a back-end request with a reply-ack carrying `status` (zero for success), as a front end would.
+#[cfg(target_os = "linux")]
+fn front_send_ack(socket: &std::os::fd::OwnedFd, request: u32, status: u64) {
+  use slates_bridge_virtiofs::vhost_user::{
+    ACK_LEN, FLAG_REPLY, HEADER_AT_FLAGS, HEADER_AT_SIZE, HEADER_LEN, VERSION,
+  };
+  let mut ack = [0u8; HEADER_LEN + ACK_LEN];
+  ack[0..4].copy_from_slice(&request.to_le_bytes());
+  ack[HEADER_AT_FLAGS..HEADER_AT_FLAGS + 4].copy_from_slice(&(VERSION | FLAG_REPLY).to_le_bytes());
+  ack[HEADER_AT_SIZE..HEADER_AT_SIZE + 4]
+    .copy_from_slice(&u32::try_from(ACK_LEN).unwrap().to_le_bytes());
+  ack[HEADER_LEN..].copy_from_slice(&status.to_le_bytes());
+  rustix::net::sendmsg(
+    socket,
+    &[std::io::IoSlice::new(&ack)],
+    &mut rustix::net::SendAncillaryBuffer::default(),
+    rustix::net::SendFlags::NOSIGNAL,
+  )
+  .unwrap();
+}
+
+/// §4.6 / A-9 / A-135 (message-based DAX, Piece C.2b, by use with no VMM): a guest FUSE_SETUPMAPPING over a
+/// message-based placer parks — its reply is withheld until the front end acknowledges the map — then completes.
+/// Do: on a real volume with a single-block file of known bytes, install a message placer over a socketpair,
+/// serve FUSE_INIT, then a guest SETUPMAPPING for a 2 MiB window chunk of the 1-page file. Expect: the service
+/// pass parks (no used element published, no window recorded yet); the placer sent a SHMEM_MAP carrying the file's
+/// content descriptor (its bytes read back through it); after the front end acknowledges, complete_dax_awaiting
+/// answers the guest SETUPMAPPING OK, records the one window, and releases the chain's charge — the async map-ack
+/// park, mirroring the owner's barrier, proven in-tree.
+#[cfg(target_os = "linux")]
+#[allow(clippy::cognitive_complexity)]
+#[test]
+fn a_message_based_setupmapping_parks_until_the_front_end_acks_then_answers_the_guest() {
+  use slates_bridge_virtiofs::device::DaxWindowEntry;
+  use slates_bridge_virtiofs::vhost_user::{BackendReqChannel, MessagePlacer, backend_request};
+
+  let page = rustix::param::page_size().max(1);
+  let mut store = dax_shared_store(page, "msgmap");
+  let mut vol = volume(&mut store);
+  let root = vol.root_inode(&store).unwrap();
+  let no = vol.create_file_no(&mut store, root, "f", 0o644).unwrap();
+  // One page of known bytes: above inline, within one chunk -> a single unsealed block the DAX gate maps.
+  vol.write(&mut store, no, 0, &vec![0x5Au8; page]).unwrap();
+  let nodeid = no.0;
+
+  let (mut device, mut driver) = device_and_driver();
+  let (front, back) = rustix::net::socketpair(
+    rustix::net::AddressFamily::UNIX,
+    rustix::net::SocketType::STREAM,
+    rustix::net::SocketFlags::CLOEXEC,
+    None,
+  )
+  .unwrap();
+  let placer: MessagePlacer<DaxWindowEntry> =
+    MessagePlacer::new(BackendReqChannel::adopt(back), page, (page * 16) as u64);
+  device.install_dax_message_placer(placer);
+  assert!(device.dax_offered(), "the device serves message-based DAX");
+
+  let cx = context();
+  let mut bridge = VolumeBridge::new(vid(), &mut vol, &mut store);
+
+  let init_reply = dax_exchange(
+    &mut device,
+    &mut driver,
+    &mut bridge,
+    &cx,
+    (Opcode::Init, 1, ROOT),
+    &dax_init_body(),
+  );
+  assert_eq!(reply_error(&init_reply), 0, "INIT served");
+
+  // SETUPMAPPING for a 2 MiB window chunk of the 1-page file (read): the placer caps the map to the file's page.
+  let setup = dax_setup_body(0, (2 * 1024 * 1024) as u64, false, 0);
+  let request = message(Opcode::SetupMapping.to_wire(), 2, nodeid, &setup);
+  let queue = FIRST_REQUEST_QUEUE;
+  let head = driver.submit(usize::from(queue), &request, 4096, 1);
+  let pass = serve(&mut device, queue, &mut driver, &mut bridge, &cx, BATCH).unwrap();
+  assert!(pass.more_pending, "the pass parked the map and asks to come back");
+  assert!(
+    driver.reap(usize::from(queue)).is_none(),
+    "no used element is published while the map is parked"
+  );
+  assert_eq!(
+    device.dax_window_count(),
+    0,
+    "the window is not recorded until the front end acknowledges"
+  );
+
+  // The front end receives the SHMEM_MAP and its descriptor; the block's bytes read back through it.
+  let got_fd = front_recv_shmem_map(&front);
+  let mut echo = [0u8; 64];
+  let read = rustix::io::pread(&got_fd, &mut echo, 0).unwrap();
+  assert_eq!(read, 64);
+  assert_eq!(echo, [0x5Au8; 64], "the SHMEM_MAP carried the file's content block");
+  front_send_ack(&front, backend_request::SHMEM_MAP, 0);
+
+  // The device drains the ack, answers the guest, records the window, and releases the chain's charge.
+  let completed = device
+    .complete_dax_awaiting(&mut driver.memory, &mut bridge, &cx, &mut Unlimited)
+    .unwrap();
+  assert!(completed.is_some(), "the parked SETUPMAPPING completed on the ack");
+  let (id, len) = driver
+    .reap(usize::from(queue))
+    .expect("the used element is published after the ack");
+  assert_eq!(id, head);
+  assert_eq!(
+    reply_error(&driver.reply_of(usize::from(queue), head, len)),
+    0,
+    "SETUPMAPPING is answered OK once the front end has mapped the window"
+  );
+  assert_eq!(device.dax_window_count(), 1, "the one window is recorded");
+
+  drop(front);
 }
