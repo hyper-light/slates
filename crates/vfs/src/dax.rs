@@ -382,15 +382,28 @@ fn file_block(store: &Store, volume: &Volume, no: InodeNo) -> Result<(Block, usi
 }
 
 impl Volume {
-  /// Maps inode `no`'s content block into a guest window, **read-only** (§4.6). The block is **pinned** (never reused
-  /// or freed while mapped) and every byte of the block past the file's length is scrubbed to zero, so the guest's
-  /// whole-page view never reaches a truncate's leftover tail or a prior allocation's bytes. Refused for a directory,
-  /// a sealed or multi-block file, or when the registry is at its bound.
+  /// Maps inode `no`'s content into a guest window, **read-only** (§4.6). For a single-block file the arena block is
+  /// mapped directly and **pinned** (never reused or freed while mapped); every byte past the file's length is
+  /// scrubbed to zero, so the guest's whole-page view never reaches a truncate's leftover tail or a prior
+  /// allocation's bytes. An **inline** file (bytes kept in the inode, no content block) is materialized into a
+  /// throwaway block the mapping owns, as [`Volume::dax_map_dir`] does for a directory. Refused for a directory, a
+  /// sealed or multi-block file, or when the registry is at its bound.
   pub fn dax_map_read(&mut self, store: &mut Store, no: InodeNo) -> Result<Mapping, VfsError> {
     // Defence in depth for the device seam: a mapping is of a namespace object only, never an attribute
     // (xattr-value) inode — so a crafted or confused map of an attribute number is `NotFound`, never a window onto
     // an attribute's bytes, mirroring the transports' `namespace_inode` gate.
     self.namespace_inode(&*store, no)?;
+    // An inline file keeps its bytes in the inode with no content block to map; materialize them into a throwaway
+    // block the mapping owns, exactly as `dax_map_dir` does for a directory. `inline_bytes` is ~128 B, so the copy
+    // is negligible and there is no arena content to zero-copy — the single-block path below maps the arena block
+    // directly. The clone releases the store borrow before the mutable materialize.
+    let inline = match &self.inode(&*store, no)?.body {
+      Body::Inline(bytes) => Some(bytes.clone()),
+      _ => None,
+    };
+    if let Some(bytes) = inline {
+      return self.map_owned_block(store, no, &bytes);
+    }
     let (block, file_len) = file_block(&*store, self, no)?;
     store.content.arena_mut().pin(block)?;
     if let Some(tail) = store
@@ -473,11 +486,25 @@ impl Volume {
       }
       buf
     };
+    self.map_owned_block(store, no, &serialized)
+  }
+
+  /// Maps a freshly allocated throwaway block holding `serialized` into a guest window, **read-only**, as a snapshot
+  /// the mapping **owns** — pinned while mapped, freed when revoked. Shared by [`Volume::dax_map_dir`] (a directory's
+  /// serialized entries) and the inline-file path of [`Volume::dax_map_read`] (a small file whose bytes live in the
+  /// inode with no content block to map). A later daemon change to the inode revokes the mapping, so the guest
+  /// re-maps to see it. A refused map (an unpinnable block, or a full registry) leaves nothing allocated or held.
+  fn map_owned_block(
+    &mut self,
+    store: &mut Store,
+    no: InodeNo,
+    serialized: &[u8],
+  ) -> Result<Mapping, VfsError> {
     let file_len = serialized.len();
     let block = store.content.alloc_block(file_len.max(1), false)?;
     if let Some(bytes) = store.content.arena_mut().bytes_mut(block) {
       if let Some(head) = bytes.get_mut(..file_len) {
-        head.copy_from_slice(&serialized);
+        head.copy_from_slice(serialized);
       }
       if let Some(tail) = bytes.get_mut(file_len..) {
         tail.fill(0);
@@ -639,6 +666,14 @@ impl Volume {
   /// advancing device re-validates its own windows against its new view through this and tears each one whose block
   /// the new view no longer backs — the changed inodes — keeping the windows onto unchanged (block-shared) content.
   pub fn dax_still_current(&self, store: &Store, mapping: &Mapping) -> bool {
+    if mapping.snapshot {
+      // A materialized snapshot (a directory's entries, or an inline file's bytes) owns a throwaway block that is
+      // never the inode's content block, so there is nothing to compare against `file_block`. It stays current as
+      // long as the registry still holds it — a mutation of the inode revokes it — which is exactly the liveness the
+      // guest's `Store::dax_read_raw` relies on alone. (Before this, `file_block` returned `Invalid` for the inode's
+      // non-single-block body and a snapshot mapping read as stale through `Volume::dax_read`, the local-client path.)
+      return store.dax.is_live(mapping);
+    }
     matches!(
       file_block(store, self, mapping.inode),
       Ok((block, file_len)) if block == mapping.block && file_len == mapping.file_len

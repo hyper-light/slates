@@ -79,6 +79,39 @@ fn a_mapping_does_not_expose_the_bytes_past_the_files_length() {
   );
 }
 
+/// §4.6 (A-135, inline DAX). Do: write a small file whose bytes stay inline in the inode (no content block), map it
+/// read-only, read the mapped window. Expect: the map succeeds (before this it was refused `Invalid` and the guest
+/// fell back to FUSE_READ), the window shows the inline bytes with the page tail scrubbed to zero — an inline file
+/// is DAX-mappable through a throwaway block the mapping owns, exactly as a directory's entries are.
+#[test]
+fn an_inline_file_is_mapped_read_only_through_a_materialized_block() {
+  let mut store = store();
+  let mut volume = volume(&mut store, 1 << 20);
+  let root = volume.root_inode(&store).unwrap();
+  let no = volume.create_file_no(&mut store, root, "tiny", 0o644).unwrap();
+  // 48 bytes: well under `inline_bytes` (~128 B), so the content stays in the inode with no arena content block.
+  let bytes = [0x5Au8; 48];
+  volume.write(&mut store, no, 0, &bytes).unwrap();
+
+  let mapping = volume.dax_map_read(&mut store, no).unwrap();
+  assert_eq!(
+    mapping.file_len,
+    bytes.len(),
+    "the authorized length is the inline file's size"
+  );
+  let page = volume.dax_read(&store, &mapping, 0, DAX_PAGE).unwrap();
+  assert_eq!(
+    &page[..bytes.len()],
+    &bytes,
+    "the window shows the inline file's bytes"
+  );
+  assert!(
+    page[bytes.len()..].iter().all(|&b| b == 0),
+    "the page tail past the inline file is scrubbed to zero: {:?}",
+    &page[bytes.len()..bytes.len() + 16]
+  );
+}
+
 /// §4.6. Do: map a 100-byte file writable, write at and past the length through the daemon path. Expect: a write
 /// within the length is allowed, one past it or straddling its end is refused — growing a file needs a quota and lease
 /// check the guest cannot make itself.
