@@ -34,7 +34,7 @@ use slates_bridge_virtiofs::admission::{
   AdmissionError, GuestAttachRequest, GuestTransport, ReclaimError, VmmSeam, admit,
 };
 use slates_bridge_virtiofs::capability::{TransportCapability, host_capability};
-use slates_bridge_virtiofs::device::{DeviceConfig, FsTag};
+use slates_bridge_virtiofs::device::DeviceConfig;
 use slates_bridge_virtiofs::serve::{BridgeAccess, LoopError, ServeEnd, register, serve_loop};
 use slates_db::catalog::{Principal, VolumeId as DbVolumeId};
 use slates_ipc::protocol::{Refusal, VolumeId};
@@ -49,6 +49,10 @@ use crate::daemon::Daemon;
 use crate::error::ServerError;
 use crate::state::{self, ShardState};
 use crate::verbs::{owner_of, rights_of};
+
+/// The virtio-fs mount tag a guest sees (e.g. `slates`), re-exported so a caller of the vhost-user attach API
+/// below can name the `tag` argument those fns take without depending on the bridge crate directly.
+pub use slates_bridge_virtiofs::device::FsTag;
 
 /// What became of a guest device the harness attached, delivered to its `on_end` callback.
 #[derive(Debug)]
