@@ -411,17 +411,24 @@ async fn serve_vhost_user_device(
   tag: FsTag,
   view: GuestView,
   (socket, handshake_ns): (std::os::fd::OwnedFd, u64),
+  dax_region: Option<u64>,
   harness: GuestHarness,
 ) {
   use slates_bridge_virtiofs::vhost_user::VhostUserSeam;
   let config = DeviceConfig::new(tag);
-  let seam = match VhostUserSeam::adopt(socket, &config) {
+  let mut seam = match VhostUserSeam::adopt(socket, &config) {
     Ok(seam) => seam,
     Err(refused) => {
       (harness.on_end)(GuestDeviceOutcome::HandshakeRefused(Some(refused)));
       return;
     }
   };
+  // DAX (A/B harness only, Ada-gated 2026-10-16): offer the shared-memory region so the front end sets up the DAX
+  // BAR and hands over the back-end-request channel; the production attach path passes None, so DAX stays
+  // unadvertised (§4.6).
+  if let Some(region) = dax_region {
+    seam.enable_dax(region);
+  }
   // The front end configures the device as its guest boots its driver, within the harness's bound.
   let seam = match slates_rt::futures::within(handshake_ns, seam.negotiate()).await {
     Ok(Some(Ok(seam))) => seam,
@@ -609,6 +616,39 @@ impl Daemon {
         tag,
         view,
         (socket, handshake_ns),
+        None,
+        harness,
+      )),
+      None,
+    );
+    registry::send_control(shard, Control::Spawn(Box::new(task))).map_err(ServerError::Runtime)
+  }
+
+  /// Like `attach_vhost_user_device`, but enables DAX (§4.6): the front end sets up the DAX BAR and
+  /// hands over the back-end-request channel, so the guest's SETUPMAPPING is served through the message placer.
+  /// `dax_region` is the cache window size in bytes. For the A/B harness only — the hermetic daemon's attach path
+  /// never enables DAX (it stays unadvertised). Linux only.
+  #[cfg(target_os = "linux")]
+  pub fn attach_vhost_user_device_dax(
+    &self,
+    volume: VolumeId,
+    tag: FsTag,
+    view: GuestView,
+    (socket, handshake_ns): (std::os::fd::OwnedFd, u64),
+    dax_region: u64,
+    harness: GuestHarness,
+  ) -> Result<(), ServerError> {
+    let shard = self.owner_shard(volume)?;
+    let device = DbVolumeId {
+      bytes: volume.bytes,
+    };
+    let task = SpawnRequest::new(
+      Box::pin(serve_vhost_user_device(
+        device,
+        tag,
+        view,
+        (socket, handshake_ns),
+        Some(dax_region),
         harness,
       )),
       None,

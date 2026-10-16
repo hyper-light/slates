@@ -1527,24 +1527,34 @@ fn serve_dax(
         .div_ceil(granule)
         .saturating_mul(granule)
         .min(block_len);
-      let bound = usize::try_from(m.foffset)
-        .ok()
-        .and_then(|foffset| usize::try_from(m.len).ok().map(|len| (foffset, len)))
-        .filter(|&(foffset, len)| foffset.checked_add(len).is_some_and(|end| end <= authorized))
-        .and_then(|(foffset, _)| region_off.checked_add(foffset))
-        .and_then(|off| u64::try_from(off).ok());
-      let Some(object_off) = bound else {
+      // The guest maps DAX window chunks (e.g. 2 MiB) that can extend past a small file; map only the file's
+      // authorized pages (§4.6: a guest never maps a page lying entirely past its file), capping the requested
+      // length to what the file backs. The window beyond stays unmapped, so a read past EOF faults (which a guest
+      // does not do within the file). A chunk starting at or past the authorized window backs nothing: refused.
+      let (Ok(foffset), Ok(requested)) = (usize::try_from(m.foffset), usize::try_from(m.len)) else {
+        let _ = bridge.dax_unmap(&mapping, cx);
+        return err(dax_errno::EINVAL, out);
+      };
+      let Some(room) = authorized.checked_sub(foffset).filter(|room| *room > 0) else {
+        let _ = bridge.dax_unmap(&mapping, cx);
+        return err(dax_errno::EINVAL, out);
+      };
+      let mapped_len = u64::try_from(requested.min(room)).unwrap_or(u64::MAX);
+      let Some(object_off) = region_off
+        .checked_add(foffset)
+        .and_then(|off| u64::try_from(off).ok())
+      else {
         let _ = bridge.dax_unmap(&mapping, cx);
         return err(dax_errno::EINVAL, out);
       };
       let entry = DaxWindowEntry {
         moffset: m.moffset,
-        len: m.len,
+        len: mapped_len,
         mapping,
       };
       match placer {
         crate::dax::DaxPlacer::Local(cache) => {
-          if cache.map(m.moffset, m.len, fd, object_off, writable).is_err() {
+          if cache.map(m.moffset, mapped_len, fd, object_off, writable).is_err() {
             let _ = bridge.dax_unmap(&mapping, cx);
             return err(dax_errno::EINVAL, out);
           }
@@ -1556,7 +1566,7 @@ fn serve_dax(
         #[cfg(target_os = "linux")]
         crate::dax::DaxPlacer::Message(message) => {
           if message
-            .begin_map(m.moffset, m.len, fd, object_off, writable, entry)
+            .begin_map(m.moffset, mapped_len, fd, object_off, writable, entry)
             .is_err()
           {
             let _ = bridge.dax_unmap(&mapping, cx);
