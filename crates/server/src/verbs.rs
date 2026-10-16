@@ -3185,6 +3185,7 @@ pub(crate) fn refusal_name(r: &Refusal) -> &'static str {
     Refusal::GrantInvalid => "grant_invalid",
     Refusal::HomedElsewhere { .. } => "homed_elsewhere",
     Refusal::OwnerUnreachable { .. } => "owner_unreachable",
+    Refusal::MapUnavailable => "map_unavailable",
     Refusal::NotRootLeader => "not_root_leader",
     Refusal::ConsensusNotInitialized => "consensus_not_initialized",
     Refusal::ConsensusAlreadyInitialized => "consensus_already_initialized",

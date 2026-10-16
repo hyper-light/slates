@@ -989,7 +989,9 @@ pub(crate) fn map_read(
   let same_uid =
     matches!(principal, Principal::Uid { uid } if *uid == rustix::process::geteuid().as_raw());
   if !same_uid || !matches!(at, ReadAt::Head) {
-    return read(state, principal, volume, path, at);
+    // Only a same-uid peer reading a plain volume's live head is served a zero-copy map; every other
+    // shape tells the client to read by its normal paged path (never a single oversized whole-file reply).
+    return refused(Refusal::MapUnavailable);
   }
   let record = match find_record(state, volume) {
     Ok(record) => record,
@@ -999,7 +1001,7 @@ pub(crate) fn map_read(
     return forbidden("read");
   }
   if !matches!(record.policy.role, Role::Plain) {
-    return read(state, principal, volume, path, at);
+    return refused(Refusal::MapUnavailable);
   }
   let (handle, _) = match find(state, volume) {
     Ok(found) => found,
@@ -1014,9 +1016,10 @@ pub(crate) fn map_read(
     LocalMap::Directory => refused(Refusal::BadRequest {
       reason: "the path is a directory".to_owned(),
     }),
-    LocalMap::NotHere => refused(Refusal::NotFound),
+    // Not mappable here (cross-shard, no shared-object backing, or the send failed): the client reads by
+    // its normal paged path, which returns the bytes without a single oversized reply.
+    LocalMap::NotHere | LocalMap::Fallback => refused(Refusal::MapUnavailable),
     LocalMap::Vfs(error) => refused(refusal_of_vfs(&error)),
-    LocalMap::Fallback => read_plain(state, volume, path),
   }
 }
 

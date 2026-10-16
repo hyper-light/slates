@@ -10,7 +10,7 @@ use slates_ipc::delivery::{Capability, Delivered, DeliveryFault, attest_proof};
 use slates_ipc::protocol::{
   AttachRequest, AttachmentCapability, AuditEntry, DaemonReport, Direction, Established, Filter,
   GrantScope, GrantSummary, GreenBase, Intent, LandingOutcome, LandingSummary, MergeWindow,
-  NamePolicy, Principal, ReadAt, ReplyBody, RequestBody, Rights, Scope, SizeClass,
+  NamePolicy, Principal, ReadAt, Refusal, ReplyBody, RequestBody, Rights, Scope, SizeClass,
   SnapshotCoverage, SnapshotId, StatusReport, TelemetryReport, VolumeId, VolumeSummary, WorkOp,
   pack, unpack,
 };
@@ -882,11 +882,21 @@ impl Client {
   /// the client disconnects; an explicit release is owed).
   #[cfg(unix)]
   pub fn map_read(&mut self, volume: VolumeId, path: &str) -> Result<MappedRead, ClientError> {
-    let reply = self.call(&RequestBody::MapRead {
+    let reply = match self.call(&RequestBody::MapRead {
       volume,
       path: path.to_owned(),
       at: ReadAt::Head,
-    })?;
+    }) {
+      Ok(reply) => reply,
+      // The daemon could not map it (a different uid, no shared-object backing, a cross-shard volume, …):
+      // read by the normal paged path, which returns the bytes a page at a time with no oversized single
+      // reply. The client still gets its data; only the copy is paid. (`call` turns a refusal into an
+      // error, so this is caught here, not in the reply match below.)
+      Err(ClientError::Refused(Refusal::MapUnavailable)) => {
+        return Ok(MappedRead::copied(self.read(volume, path, ReadAt::Head)?));
+      }
+      Err(error) => return Err(error),
+    };
     match reply {
       ReplyBody::Mapped {
         region_off,
@@ -896,8 +906,6 @@ impl Client {
         let delivery = self.recv_delivery()?;
         MappedRead::map(delivery, region_off, file_len)
       }
-      ReplyBody::ReadBytes { bytes } => Ok(MappedRead::copied(bytes)),
-      ReplyBody::Refused { refusal } => Err(ClientError::Refused(refusal)),
       _ => Err(ClientError::UnexpectedReply { verb: "map_read" }),
     }
   }

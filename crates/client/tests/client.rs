@@ -235,9 +235,10 @@ fn a_client_maps_files_across_shards_and_always_gets_the_bytes() {
 
   for n in 0..6u8 {
     let id = client.create(&scratch(&format!("daxx-{n}"))).unwrap();
-    // A small file (its copy-fallback reply fits the bulk area on a multi-shard daemon); the cross-shard
-    // case is about the client always getting its bytes, not about zero-copy.
-    let bytes: Vec<u8> = (0..200usize)
+    // 20 KiB — larger than one bulk chunk, so where map_read cannot map it the copy fallback must page
+    // rather than return one oversized whole-file `ReadBytes` (the bug this test caught); it proves the
+    // client always gets the bytes, zero-copy or paged-copy, without an over-capacity single reply.
+    let bytes: Vec<u8> = (0..(20usize << 10))
       .map(|i| u8::try_from((i + usize::from(n)) % 251).unwrap_or(0))
       .collect();
     let attached = client.attach(id, None, Intent::Write).unwrap();

@@ -2553,6 +2553,11 @@ pub enum Refusal {
     /// The region whose fleet the volume's owner was sought in.
     region: u64,
   },
+  /// A `MapRead` (§4.6, A-135) could not be served as a zero-copy same-kernel map — a different-uid or non-plain /
+  /// non-head request, content with no shared-object backing, or a volume not mappable on the serving shard — so the
+  /// client reads the file by its normal paged read instead. The bytes are identical; only the copy is paid, and the
+  /// reply is never a single oversized `ReadBytes`. Appended.
+  MapUnavailable,
 }
 
 /// The writes a snapshot is known to include (§4.6 "Writeback and snapshot barrier"): every write the
