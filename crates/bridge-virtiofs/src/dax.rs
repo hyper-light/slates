@@ -211,6 +211,19 @@ impl DaxCacheRegion {
   }
 }
 
+/// How a device places a content block's pages into a guest's DAX window (§4.6), chosen at admission by the kind of
+/// VMM the device serves. The device holds one of these when DAX was offered; `serve_dax` and the teardown paths drive
+/// it. A DAX window is delivered two ways (§4.6, [`crate::vhost_user`]); this names which.
+pub enum DaxPlacer {
+  /// An **in-process / fd-sharing** VMM (libkrun, and the sim): the VMM shared the cache window as a memory object, so
+  /// the device reserved it whole and overlays each content block itself with `MAP_FIXED` ([`DaxCacheRegion`]). A map
+  /// and an unmap complete synchronously on the placing call — there is no separate front-end process to await. The
+  /// **message-based** sibling (an out-of-process crosvm/QEMU/cloud-hypervisor, where the device sends
+  /// `VHOST_USER_BACKEND_SHMEM_MAP` over the back-end-request channel and the front end maps the block into the guest's
+  /// BAR, completing on the front end's acknowledgement) is added next (Piece C).
+  Local(DaxCacheRegion),
+}
+
 #[cfg(test)]
 mod tests {
   // Test harness code: an unwrap here is a failed test.

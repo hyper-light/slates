@@ -399,11 +399,12 @@ pub struct Device {
   fault: Option<DeviceError>,
   awaiting: Option<AwaitingBarrier>,
   counters: DeviceCounters,
-  /// The DAX cache region the VMM offered, installed once at admission ([`Device::install_dax_window`]); `None` when
-  /// no window is offered (then FUSE_SETUPMAPPING is declined and DAX is not advertised). Content blocks' pages are
-  /// mapped into it per SETUPMAPPING (§4.6). Unix only (the DAX window is a Linux/vhost-user feature).
+  /// How the device places content blocks into the guest's DAX window ([`crate::dax::DaxPlacer`]), installed once at
+  /// admission ([`Device::install_dax_window`]); `None` when the VMM offered no window (then FUSE_SETUPMAPPING is
+  /// declined and DAX is not advertised). The fd-sharing form (`Local`) overlays blocks into a cache region the device
+  /// owns (§4.6); the message-based form is its sibling (Piece C). Unix only (the DAX window is a Linux/vhost-user feature).
   #[cfg(unix)]
-  dax_cache: Option<crate::dax::DaxCacheRegion>,
+  dax_placer: Option<crate::dax::DaxPlacer>,
   /// The live DAX window mappings, so REMOVEMAPPING (and the terminal teardown) finds each mapping to revoke and its
   /// window range to unmap. Bounded by the cache region's pages; empty when no window is offered.
   #[cfg(unix)]
@@ -434,7 +435,7 @@ impl Device {
       awaiting: None,
       counters: DeviceCounters::default(),
       #[cfg(unix)]
-      dax_cache: None,
+      dax_placer: None,
       #[cfg(unix)]
       dax_windows: Vec::new(),
     }
@@ -445,18 +446,19 @@ impl Device {
     &self.config
   }
 
-  /// Installs the DAX cache region the VMM offered (§4.6), once at admission; `None` leaves DAX unserved (SETUPMAPPING
-  /// stays declined). From here the device maps content blocks' pages into it per FUSE_SETUPMAPPING. Unix only.
+  /// Installs the fd-sharing DAX cache region the VMM offered (§4.6) as the device's placer
+  /// ([`crate::dax::DaxPlacer::Local`]), once at admission; `None` leaves DAX unserved (SETUPMAPPING stays declined).
+  /// From here the device maps content blocks' pages into it per FUSE_SETUPMAPPING. Unix only.
   #[cfg(unix)]
   pub fn install_dax_window(&mut self, cache: Option<crate::dax::DaxCacheRegion>) {
-    self.dax_cache = cache;
+    self.dax_placer = cache.map(crate::dax::DaxPlacer::Local);
   }
 
   /// Whether the device serves DAX (the VMM offered a cache region). Unix only.
   #[cfg(unix)]
   #[must_use]
   pub fn dax_offered(&self) -> bool {
-    self.dax_cache.is_some()
+    self.dax_placer.is_some()
   }
 
   /// A copy of the DAX window bytes at `[moffset, moffset+len)` — a diagnostic/test read of what a guest's CPU would
@@ -465,10 +467,10 @@ impl Device {
   #[cfg(unix)]
   #[must_use]
   pub fn dax_window_bytes(&self, moffset: u64, len: u64) -> Option<Vec<u8>> {
-    self
-      .dax_cache
-      .as_ref()
-      .and_then(|cache| cache.window_bytes(moffset, len).map(<[u8]>::to_vec))
+    let Some(crate::dax::DaxPlacer::Local(cache)) = self.dax_placer.as_ref() else {
+      return None; // no window, or a message-based placer, which keeps no local window bytes
+    };
+    cache.window_bytes(moffset, len).map(<[u8]>::to_vec)
   }
 
   /// The live DAX window count (non-vacuity for tests). Unix only.
@@ -489,7 +491,7 @@ impl Device {
     cx: &slates_bridge_core::OpContext,
   ) {
     let windows = std::mem::take(&mut self.dax_windows);
-    if let Some(cache) = self.dax_cache.as_mut() {
+    if let Some(crate::dax::DaxPlacer::Local(cache)) = self.dax_placer.as_mut() {
       for entry in &windows {
         teardown_dax_window(cache, bridge, cx, entry);
       }
@@ -555,7 +557,7 @@ impl Device {
     writable_only: bool,
   ) -> usize {
     let mut torn = 0usize;
-    if let Some(cache) = self.dax_cache.as_mut() {
+    if let Some(crate::dax::DaxPlacer::Local(cache)) = self.dax_placer.as_mut() {
       let mut index = 0;
       while index < self.dax_windows.len() {
         match self.dax_windows.get(index).copied() {
@@ -587,7 +589,7 @@ impl Device {
     cx: &slates_bridge_core::OpContext,
   ) -> usize {
     let mut torn = 0usize;
-    if let Some(cache) = self.dax_cache.as_mut() {
+    if let Some(crate::dax::DaxPlacer::Local(cache)) = self.dax_placer.as_mut() {
       let mut index = 0;
       while index < self.dax_windows.len() {
         match self.dax_windows.get(index).copied() {
@@ -977,7 +979,7 @@ impl Device {
       Some(Opcode::Destroy)
     ) {
       let windows = std::mem::take(&mut self.dax_windows);
-      if let Some(cache) = self.dax_cache.as_mut() {
+      if let Some(crate::dax::DaxPlacer::Local(cache)) = self.dax_placer.as_mut() {
         for entry in &windows {
           teardown_dax_window(cache, bridge, cx, entry);
         }
@@ -1002,7 +1004,7 @@ impl Device {
           &self.request,
           bridge,
           cx,
-          &mut self.dax_cache,
+          &mut self.dax_placer,
           &mut self.dax_windows,
           &mut self.reply,
         )
@@ -1219,14 +1221,17 @@ fn serve_dax(
   request: &[u8],
   bridge: &mut dyn slates_bridge_core::Bridge,
   cx: &slates_bridge_core::OpContext,
-  dax_cache: &mut Option<crate::dax::DaxCacheRegion>,
+  dax_placer: &mut Option<crate::dax::DaxPlacer>,
   dax_windows: &mut Vec<DaxWindowEntry>,
   out: &mut [u8],
 ) -> Option<usize> {
   use slates_bridge_core::ObjectId;
   use slates_bridge_fuse::request::{RemoveMappingIn, Request, SetupMappingIn};
 
-  let cache = dax_cache.as_mut()?; // no window offered: let dispatch answer EOPNOTSUPP / no-op
+  // No window offered, or a message-based placer (Piece C handles it): let dispatch answer EOPNOTSUPP / no-op.
+  let Some(crate::dax::DaxPlacer::Local(cache)) = dax_placer.as_mut() else {
+    return None;
+  };
   let req = Request::parse(request).ok()?;
   let unique = req.header.unique;
   let err =
