@@ -2691,8 +2691,11 @@ same-namespace host process is the first delivered case.
 > `block_backing` returned a region-relative offset against the whole-object descriptor, which would have mis-mapped
 > the guest DAX window too (`docs/bugs/2026-10-15-block-backing-returned-a-region-relative-offset.md`). **Owed:** the
 > cross-shard owner→home descriptor hand-off (a `MapRead` whose volume is owned by another shard copies rather than
-> maps for now); an explicit release on the client's drop (the daemon unpins the version on client disconnect today);
-> and the macOS control socket (macOS carries refusing `send_mapping`/`recv_mapping` stubs, so it reads by copy).
+> maps for now); a prompt per-drop release (the daemon now revokes a client's maps when it is **reaped** — 3b,
+> `crate::reap` over a `ClientSlot::dax_maps` list — so a dropped or dead client's read maps no longer pin versions
+> toward the registry cap; a release on the client's own `MappedRead` drop would be prompter, and slates exposes no
+> dax-map count yet for a reap count-assertion test — both owed); and the macOS control socket (macOS carries
+> refusing `send_mapping`/`recv_mapping` stubs, so it reads by copy).
 
 > **Status (DAX gate, 2026-10-12).** Mapping isolation, pinning and teardown are **built in the VFS** and proven by
 > use (`crates/vfs/src/dax.rs`, `crates/vfs/tests/dax.rs`, 21 tests; `crates/mem/src/arena.rs` pin set, 6 tests,

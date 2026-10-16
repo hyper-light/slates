@@ -6167,9 +6167,11 @@ its own page table and never calls the daemon), so the defense had to be at the 
   bytes equal). `cfg(unix)`; a non-Unix `MapRead` reads by copy. The first real descriptor map surfaced and fixed a
   latent arena bug — `block_backing` returned a region-relative offset against the whole-object descriptor, which
   would have mis-mapped the guest DAX window too (`docs/bugs/2026-10-15-block-backing-returned-a-region-relative-offset.md`).
-  **Owed:** the cross-shard owner→home descriptor hand-off (a cross-shard `MapRead` copies, not maps, for now); an
-  explicit release on the client's drop (the daemon unpins the version on client disconnect today); the macOS
-  control socket (macOS carries refusing `send_mapping`/`recv_mapping` stubs, so it reads by copy).
+  **Owed:** the cross-shard owner→home descriptor hand-off (a cross-shard `MapRead` copies, not maps, for now); a
+  prompt per-drop release (3b built the reap revoke — `crate::reap` revokes a client's maps when it is reaped, over a
+  `ClientSlot::dax_maps` list, so a dropped/dead client's read maps no longer pin versions toward the registry cap; a
+  release on the `MappedRead` drop would be prompter, and no dax-map count observable exists yet for a reap
+  count-assertion test — both owed); the macOS control socket (refusing stubs, so it reads by copy).
 - **Directory-window coherence — decided point-in-time (not an open design call).** A directory DAX window
   (`dax_map_dir`, the READDIR/READDIRPLUS snapshot) is a point-in-time view the guest re-maps to refresh, and that
   is correct, not an owed revoke: POSIX/NFS `readdir` guarantees no consistent snapshot across concurrent mutations

@@ -160,6 +160,12 @@ fn finish(state: &mut ShardState, handle: Handle<ClientSlot>, client_id: u32) ->
     return false;
   };
   client.status_pages.clear(&mut state.store.metadata);
+  // Release the client's same-kernel DAX maps (§4.6, A-135): its window is already gone with it, so a
+  // synchronous revoke unregisters and unpins each mapped block, rather than letting a dropped or dead
+  // client's read maps pin immutable versions in the arena toward the registry cap.
+  for mapping in &client.dax_maps {
+    state.store.dax_revoke(mapping);
+  }
   state.read_ahead.credit(client.read_ahead_pending);
   crate::verbs::release_read_ahead(&mut state.read_ahead, &mut client);
   if let Some(control) = state.shards.first().copied() {

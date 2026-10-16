@@ -16,6 +16,7 @@ use slates_mem::Slab;
 use slates_mem::SparseObject;
 use slates_merge::engine::Green;
 use slates_merge::increment::VolumeOp;
+use slates_vfs::dax::Mapping;
 use slates_vfs::volume::{Store, Volume};
 
 use crate::config::DaemonConfig;
@@ -55,6 +56,11 @@ pub struct ClientSlot {
   /// to its window when a batch is delivered, and credited with the client when it goes — so a batch whose reply
   /// was never carried home (`crate::xshard::send_back`) holds its charge no longer than its client.
   pub(crate) read_ahead_pending: u64,
+  /// The same-kernel DAX maps (§4.6, A-135) this client holds, each pinning an immutable version until
+  /// the client goes: revoked when the client is reaped (`crate::reap`), so a dropped or dead client's
+  /// read maps do not accumulate in the arena's `DaxRegistry` toward its cap. Empty for a client that
+  /// never mapped; one `Mapping` is a few words, and the count is bounded by the registry cap.
+  pub(crate) dax_maps: Vec<Mapping>,
 }
 
 impl std::fmt::Debug for ClientSlot {

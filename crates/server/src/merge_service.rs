@@ -1075,28 +1075,36 @@ fn try_local_map(
   let file_len = u64::try_from(mapping.file_len).unwrap_or(0);
   let region_off = u64::try_from(region_off).unwrap_or(0);
   let block_len = u64::try_from(block_len).unwrap_or(0);
-  let sent = clients
-    .iter()
+  let Some((_, slot)) = clients
+    .iter_mut_all()
     .find(|(_, candidate)| candidate.client_id == client_id)
-    .and_then(|(_, candidate)| candidate.control.as_ref())
-    .map(|control| {
-      control.send_mapping(
-        block, mapping_id, mapping_id, region_off, file_len, block_len,
-      )
-    });
-  match sent {
-    Some(Ok(())) => LocalMap::Mapped(ReplyBody::Mapped {
-      mapping_id,
-      region_off,
-      file_len,
-      block_len,
-    }),
-    // Not on this shard (cross-shard owner delivery is owed), or the send failed: release, read by copy.
-    _ => {
-      store.dax_revoke(&mapping);
-      LocalMap::Fallback
-    }
+  else {
+    // Not on this shard (a cross-shard owner served this; the descriptor hand-off is owed): read by copy.
+    store.dax_revoke(&mapping);
+    return LocalMap::Fallback;
+  };
+  let Some(control) = slot.control.as_ref() else {
+    store.dax_revoke(&mapping);
+    return LocalMap::Fallback;
+  };
+  if control
+    .send_mapping(
+      block, mapping_id, mapping_id, region_off, file_len, block_len,
+    )
+    .is_err()
+  {
+    store.dax_revoke(&mapping);
+    return LocalMap::Fallback;
   }
+  // Delivered: hold the mapping on the client so a reap releases it (§4.6 A-135 lifetime), rather than
+  // letting a dropped or dead client's read maps pin versions in the arena to its cap.
+  slot.dax_maps.push(mapping);
+  LocalMap::Mapped(ReplyBody::Mapped {
+    mapping_id,
+    region_off,
+    file_len,
+    block_len,
+  })
 }
 
 fn read_plain(state: &mut ShardState, volume: VolumeId, path: &str) -> ReplyBody {
