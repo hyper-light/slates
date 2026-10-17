@@ -4510,7 +4510,10 @@ const IN_FLIGHT_WRITERS: usize = 4;
 fn write_pages(
   path: &str,
   first: usize,
-  progress: &std::sync::atomic::AtomicUsize,
+  (progress, in_write): (
+    &std::sync::atomic::AtomicUsize,
+    &std::sync::atomic::AtomicUsize,
+  ),
   restarted: &std::sync::atomic::AtomicBool,
 ) -> Cycle {
   use std::io::Write;
@@ -4520,9 +4523,13 @@ fn write_pages(
   let mut after = 0usize;
   while after < WRITES_AFTER {
     let page = [u8::try_from((first + written) % PAGE_VALUES).unwrap_or(0); IN_FLIGHT_WRITE];
-    file
-      .write_all(&page)
-      .expect("every write is acknowledged across the kill (none fails or hangs)");
+    // `in_write` is held across the syscall only: while it is non-zero a writer is inside `write(2)`, so the
+    // kernel has a FUSE request outstanding to the daemon. The kill waits for that, since a kill that lands
+    // between requests catches nothing to resend.
+    in_write.fetch_add(1, Ordering::AcqRel);
+    let acknowledged = file.write_all(&page);
+    in_write.fetch_sub(1, Ordering::AcqRel);
+    acknowledged.expect("every write is acknowledged across the kill (none fails or hangs)");
     written += 1;
     progress.fetch_add(1, Ordering::AcqRel);
     if restarted.load(Ordering::Acquire) {
@@ -4548,15 +4555,27 @@ fn write_through_a_kill(instance: &str, paths: &[String], firsts: &[usize]) -> V
   use std::sync::atomic::Ordering;
   let restarted = std::sync::atomic::AtomicBool::new(false);
   let progress = std::sync::atomic::AtomicUsize::new(0);
+  let in_write = std::sync::atomic::AtomicUsize::new(0);
   std::thread::scope(|scope| {
     let writers: Vec<_> = paths
       .iter()
       .zip(firsts)
-      .map(|(path, first)| scope.spawn(|| write_pages(path, *first, &progress, &restarted)))
+      .map(|(path, first)| {
+        scope.spawn(|| write_pages(path, *first, (&progress, &in_write), &restarted))
+      })
       .collect();
     assert!(
       wait_for(|| progress.load(Ordering::Acquire) >= WRITES_BEFORE * paths.len()),
       "the writers started"
+    );
+    // Kill while a write is actually outstanding. Waiting only for "the writers started" let the kill land
+    // between requests — on a loaded shared runner that happened on every attempt, and the test failed with
+    // nothing resent (CI run 39053632284, ubuntu lane, 2026-10-17) though the daemon was behaving correctly.
+    // The resend under test (A-61) exists only for a request the dead daemon read and never answered, so the
+    // kill must catch one in flight; this waits for exactly that condition instead of racing it.
+    assert!(
+      wait_for(|| in_write.load(Ordering::Acquire) >= 1),
+      "a writer is inside write(2), so a request is outstanding to the daemon"
     );
     let killed = kill_the_daemon(instance);
     await_daemon(instance, Some(killed), &[]);
