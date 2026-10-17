@@ -559,6 +559,176 @@ impl ChunkStore {
     Some(())
   }
 
+  /// Reopens a sealed chunk to its plaintext block in place (§4.6 DAX open frontier), the inverse of
+  /// [`Self::seal_where_safe`]: the chunk's representation transitions sealed→open without a second copy, so a DAX
+  /// window maps the chunk's own block. The common case — a full block no recovery image names — is decrypted in
+  /// place, its ciphertext copied aside and restored on a refused tag ([`Self::open_in_place`]) so a partial decrypt
+  /// never leaves the block half-plaintext. A trimmed block (A-118) or one an image names (A-64) is opened into a
+  /// fresh full-sized block instead, the old block retired (deferred when imaged, so the image keeps its ciphertext
+  /// until the next publication). The chunk's seal is cleared and its tags freed; the read path then serves it raw.
+  /// Returns the plaintext block; a chunk already open on a full block is returned unchanged.
+  pub fn reopen_in_place(&mut self, extent: &Extent) -> Result<Block, VfsError> {
+    let ExtentSrc::Chunk { chunk: handle, .. } = extent.src else {
+      return Err(VfsError::Invalid);
+    };
+    let record = *self.chunks.get(handle)?;
+    let len = usize::try_from(record.len).map_err(|_| VfsError::Invalid)?;
+    if record.seal.is_none() && !self.is_trimmed(&record) {
+      return Ok(record.block);
+    }
+    if let Some(seal) = record.seal
+      && !self.is_trimmed(&record)
+      && !self.arena.imaged(record.block)
+    {
+      if self.open_in_place(record.block, len, &seal).is_none() {
+        return Err(VfsError::Integrity);
+      }
+      let freed = self.tags.free(seal.tags);
+      self.count_free(freed);
+      let cm = self.chunks.get_mut(handle)?;
+      cm.seal = None;
+      return Ok(record.block);
+    }
+    self.reopen_into_fresh(handle, extent, &record, len)
+  }
+
+  /// Decrypts the first `len` bytes of `block` in place, one granule a segment, under `seal` (the inverse of
+  /// [`Self::seal_in_place`]). The ciphertext is copied aside into the store's scratch and restored on a refused tag,
+  /// so a partial decrypt never leaves the block half-plaintext; the scratch is zeroed after, so no copy outlives it.
+  /// `None` on a refusal (a bad tag, or no scratch), with the block holding its ciphertext back.
+  fn open_in_place(&mut self, block: Block, len: usize, seal: &ChunkSeal) -> Option<()> {
+    let segments = usize::try_from(seal.segments).ok()?;
+    let mut saved = std::mem::take(&mut self.seal_scratch);
+    let opened = self.open_in_place_inner(&mut saved, block, len, seal, segments);
+    saved.fill(0);
+    self.seal_scratch = saved;
+    opened
+  }
+
+  /// [`Self::open_in_place`]'s pass: copies the block's ciphertext into `saved`, opens each segment in place, and on a
+  /// refused tag puts the ciphertext back and returns `None` (`None` before any byte changed when the copy cannot be
+  /// made).
+  fn open_in_place_inner(
+    &mut self,
+    saved: &mut Vec<u8>,
+    block: Block,
+    len: usize,
+    seal: &ChunkSeal,
+    segments: usize,
+  ) -> Option<()> {
+    saved.clear();
+    saved.try_reserve_exact(len).ok()?;
+    saved.extend_from_slice(self.arena.bytes(block)?.get(..len)?);
+    let granule = self.granule;
+    let cipher = self.cipher.as_ref()?;
+    let bytes = self.arena.bytes_mut(block)?.get_mut(..len)?;
+    let mut refused = false;
+    for (index, segment) in bytes.chunks_mut(granule).enumerate() {
+      let last = index.saturating_add(1) == segments;
+      let opened = u32::try_from(index).ok().and_then(|at| {
+        let tag = *self.tags.tag(seal.tags, index)?;
+        cipher.open(seal.key, seal.version, at, last, segment, &tag).ok()
+      });
+      if opened.is_none() {
+        refused = true;
+        break;
+      }
+    }
+    if refused {
+      bytes.copy_from_slice(saved);
+      return None;
+    }
+    Some(())
+  }
+
+  /// Opens a trimmed or imaged chunk into a fresh full-sized block (the uniform case of [`Self::reopen_in_place`]): the
+  /// chunk's plaintext (zero-derived past a trimmed head, A-118) is read into a new block the DAX window can map whole;
+  /// the old block is retired (the arena defers the free while an image names it, A-64) and the seal's tags freed.
+  fn reopen_into_fresh(
+    &mut self,
+    handle: Handle<Chunk>,
+    extent: &Extent,
+    record: &Chunk,
+    len: usize,
+  ) -> Result<Block, VfsError> {
+    let full = self.granule_round(record.len);
+    let mut plain = Vec::new();
+    plain.try_reserve_exact(len).map_err(|_| VfsError::NoSpace)?;
+    plain.resize(len, 0);
+    let read = self.read_extent_into(extent, extent.off, &mut plain);
+    if let Err(e) = read {
+      plain.fill(0);
+      return Err(e);
+    }
+    let fresh = if self.arena.is_locked(record.block) {
+      self.arena.alloc_locked(full)
+    } else {
+      self.arena.alloc(full)
+    };
+    let fresh = match fresh {
+      Ok(block) => block,
+      Err(e) => {
+        plain.fill(0);
+        return Err(e.into());
+      }
+    };
+    let placed = match self.arena.bytes_mut(fresh).and_then(|b| b.get_mut(..full)) {
+      Some(dst) => {
+        dst.fill(0);
+        match dst.get_mut(..len) {
+          Some(head) => {
+            head.copy_from_slice(&plain);
+            Ok(())
+          }
+          None => Err(VfsError::Invalid),
+        }
+      }
+      None => Err(VfsError::StaleHandle),
+    };
+    plain.fill(0);
+    if let Err(e) = placed {
+      let freed = self.arena.free(fresh);
+      self.count_free(freed);
+      return Err(e);
+    }
+    let imaged = self.arena.imaged(record.block);
+    let freed = self.arena.free(record.block);
+    self.count_free(freed);
+    if let Some(seal) = record.seal {
+      if imaged {
+        self.moved_out_of_image = self.moved_out_of_image.saturating_add(1);
+      }
+      let tfreed = self.tags.free(seal.tags);
+      self.count_free(tfreed);
+    }
+    let cm = self.chunks.get_mut(handle)?;
+    cm.seal = None;
+    cm.block = fresh;
+    Ok(fresh)
+  }
+
+  /// Re-seals a chunk reopened for a DAX map once its window is gone (§4.6 DAX open frontier), the cold transition
+  /// back: the chunk's block is encrypted under `key` where no recovery image is hurt ([`Self::seal_where_safe`]). A
+  /// no-op for a chunk that already carries a seal. Refused `NoSpace` (counted a seal refusal) when the seal cannot be
+  /// placed, the chunk left in the clear for a later pass.
+  pub fn reseal(&mut self, handle: Handle<Chunk>, key: u32) -> Result<(), VfsError> {
+    let record = *self.chunks.get(handle)?;
+    if record.seal.is_some() {
+      return Ok(());
+    }
+    let len = usize::try_from(record.len).map_err(|_| VfsError::Invalid)?;
+    let (block, seal) = self.seal_where_safe(record.block, len, key);
+    match seal {
+      Some(seal) => {
+        let cm = self.chunks.get_mut(handle)?;
+        cm.block = block;
+        cm.seal = Some(seal);
+        Ok(())
+      }
+      None => Err(VfsError::NoSpace),
+    }
+  }
+
   /// Opens the segments of a sealed chunk that a read of `[from, to)` (bytes within the chunk) touches, copying the
   /// requested bytes into `out` as [`copy_overlap`] would place them. Each segment is opened in a scratch buffer, so
   /// the arena keeps its ciphertext.
@@ -1544,6 +1714,46 @@ mod tests {
     ));
     s.free_chunk(chunk).unwrap();
     assert_eq!(s.seal_refusals(), 0);
+  }
+
+  /// §4.6 (DAX open frontier, A/B arm B): do reopen a sealed chunk in place, read it back, then re-seal it and read it
+  /// back; expect the chunk's own block (no new block, the common case) to hold plaintext after the reopen and
+  /// ciphertext again after the re-seal, and every read to return the plaintext both times — the sealed↔open
+  /// transition is lossless and keeps one representation (no throwaway copy).
+  #[test]
+  fn a_sealed_chunk_reopens_in_place_to_plaintext_and_reseals_losslessly() {
+    let (mut s, extent, plain) = sealed_store();
+    let ExtentSrc::Chunk { chunk, .. } = extent.src else {
+      panic!()
+    };
+    let sealed_block = s.chunk(chunk).unwrap().block;
+    assert!(s.chunk(chunk).unwrap().seal.is_some(), "sealed to start");
+    let sealed_count = s.sealed();
+    // Reopen in place: the chunk's own block (a full, un-imaged block) now holds plaintext, the seal cleared.
+    let block = s.reopen_in_place(&extent).unwrap();
+    assert_eq!(block, sealed_block, "reopened in place — the same block, no copy");
+    assert!(s.chunk(chunk).unwrap().seal.is_none(), "the seal is cleared");
+    assert_eq!(
+      &s.arena().bytes(block).unwrap()[..SEALED_LEN],
+      &plain[..],
+      "the arena now holds plaintext"
+    );
+    let mut read = vec![0u8; SEALED_LEN];
+    s.read_extent_into(&extent, extent.off, &mut read).unwrap();
+    assert_eq!(read, plain, "reads back plain after the reopen");
+    // Re-seal on cold: the arena holds ciphertext again, the sealed count restored, and it still reads back plain.
+    s.reseal(chunk, KEY).unwrap();
+    assert!(s.chunk(chunk).unwrap().seal.is_some(), "sealed again");
+    assert_eq!(s.sealed(), sealed_count.saturating_add(1), "the re-seal is counted");
+    let held = s.chunk(chunk).unwrap().block;
+    assert_ne!(
+      &s.arena().bytes(held).unwrap()[..SEALED_LEN],
+      &plain[..],
+      "the arena holds ciphertext again"
+    );
+    let mut reread = vec![0u8; SEALED_LEN];
+    s.read_extent_into(&extent, extent.off, &mut reread).unwrap();
+    assert_eq!(reread, plain, "reads back plain after the re-seal");
   }
 
   /// A-99: on a store whose granule is its page and on one whose granule is a quarter of its page (macOS arm64: 4 KiB

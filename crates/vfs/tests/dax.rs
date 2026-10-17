@@ -1603,47 +1603,73 @@ fn the_idle_sweep_defers_sealing_a_mapped_block_until_it_is_unmapped() {
   );
 }
 
-/// §4.6 VIEW arm (A/B vs reopen). Do: write a file larger than one chunk (a sealed head chunk + an open tail), then
-/// map-read at an offset in the OPEN TAIL and at offset 0 (the SEALED head). Expect: the open tail maps directly
-/// (zero-copy, `block_file_start` = the tail's offset), and the sealed head is BACKED by a decrypted read-only view
-/// (a snapshot mapping at `block_file_start` 0 that reads the chunk's plaintext) — so a guest mmap of the whole
-/// multi-block file is fully backed (the SIGBUS of rule (a) is gone); the canonical sealed chunk is untouched.
-#[test]
-fn the_open_tail_maps_directly_and_the_sealed_head_is_backed_by_a_decrypted_view() {
-  let mut store = store();
-  let mut volume = volume(&mut store, 1 << 24);
+/// A multi-block file sealed at rest (a cipher + a key): one full head chunk [0, chunk) and an open tail
+/// [chunk, chunk + page), written `0x33`. The two reopen-arm tests below both start here.
+fn sealed_head_open_tail(store: &mut Store, volume: &mut Volume) -> (InodeNo, usize, usize) {
   let chunk = store.content.chunk_bytes();
-  let root = volume.root_inode(&store).unwrap();
-  let no = volume.create_file_no(&mut store, root, "big", 0o644).unwrap();
-  // One full chunk + one page: a sealed head chunk [0, chunk) and an open tail [chunk, chunk + page).
+  let root = volume.root_inode(store).unwrap();
+  let no = volume.create_file_no(store, root, "big", 0o644).unwrap();
+  volume.set_seal_key(Some(1));
   let tail = DAX_PAGE;
-  volume
-    .write(&mut store, no, 0, &vec![0x33u8; chunk + tail])
-    .unwrap();
+  volume.write(store, no, 0, &vec![0x33u8; chunk + tail]).unwrap();
+  (no, chunk, tail)
+}
 
-  // The open tail maps directly at its file offset (zero-copy).
+/// §4.6 REOPEN arm (A/B vs view). Do: on a multi-block file (a sealed head + an open tail), map-read at an offset in
+/// the OPEN TAIL and at offset 0 (the SEALED head). Expect: the open tail maps directly (zero-copy, a non-snapshot
+/// mapping), and the sealed head is REOPENED IN PLACE — decrypted in its OWN canonical block (`snapshot: false`, one
+/// representation, no throwaway) and mapped directly; both read their plaintext (the rule-(a) SIGBUS is gone).
+#[test]
+fn the_open_tail_maps_directly_and_the_sealed_head_is_reopened_in_place() {
+  let mut store = store();
+  store.content.set_cipher(Box::new(XorSealCipher));
+  let mut volume = volume(&mut store, 1 << 24);
+  let (no, chunk, tail) = sealed_head_open_tail(&mut store, &mut volume);
+
+  // The open tail maps directly at its file offset (zero-copy, a non-snapshot mapping).
   let tail_map = volume.dax_map_read_at(&mut store, no, chunk).unwrap();
-  assert_eq!(
-    tail_map.block_file_start, chunk,
-    "the tail mapping begins at the open tail's file offset"
-  );
+  assert_eq!(tail_map.block_file_start, chunk, "the tail mapping begins at the open tail's offset");
   assert_eq!(tail_map.file_len, tail, "the tail mapping's length is the open tail's bytes");
+  assert!(!tail_map.snapshot, "the open tail is a direct (non-snapshot) mapping");
   let got = volume.dax_read(&store, &tail_map, 0, tail).unwrap();
-  assert!(
-    got.iter().all(|&b| b == 0x33),
-    "the open tail reads its plaintext: {:?}",
-    &got[..8]
-  );
+  assert!(all_bytes(&got, 0x33), "the open tail reads its plaintext");
 
-  // Offset 0 is in the sealed head -> the VIEW arm backs it with a decrypted read-only view (no SIGBUS), reading
-  // the chunk's plaintext.
-  let head_view = volume.dax_map_read_at(&mut store, no, 0).unwrap();
-  assert_eq!(head_view.block_file_start, 0, "the head view begins at offset 0");
-  assert_eq!(head_view.file_len, chunk, "the head view spans the sealed chunk's bytes");
-  let head_bytes = volume.dax_read(&store, &head_view, 0, DAX_PAGE).unwrap();
+  // Offset 0 is in the sealed head -> the REOPEN arm decrypts the chunk IN PLACE and maps its own block directly (no
+  // throwaway snapshot — one representation), reading the chunk's plaintext.
+  let head_map = volume.dax_map_read_at(&mut store, no, 0).unwrap();
+  assert_eq!(head_map.block_file_start, 0, "the head mapping begins at offset 0");
+  assert_eq!(head_map.file_len, chunk, "the head mapping spans the sealed chunk's bytes");
   assert!(
-    head_bytes.iter().all(|&b| b == 0x33),
-    "the sealed head's decrypted view reads its plaintext: {:?}",
-    &head_bytes[..8]
+    !head_map.snapshot,
+    "the reopened head is a direct (non-snapshot) mapping — one representation, no copy"
+  );
+  let head_bytes = volume.dax_read(&store, &head_map, 0, DAX_PAGE).unwrap();
+  assert!(all_bytes(&head_bytes, 0x33), "the reopened head reads its plaintext");
+}
+
+/// §4.6 REOPEN arm (A/B vs view), the cold transition. Do: reopen a sealed head chunk for a DAX map, then revoke the
+/// map and run the idle sweep. Expect: while mapped the reopened chunk is current; once the map is revoked (the block
+/// unpins) the sweep RE-SEALS it (ciphertext at rest again), so the stale mapping no longer validates — the guest
+/// would re-map and re-reopen it. (Content is plaintext at rest only while a guest maps it.)
+#[test]
+fn a_reopened_dax_chunk_is_resealed_once_its_window_is_revoked() {
+  let mut store = store();
+  store.content.set_cipher(Box::new(XorSealCipher));
+  let mut volume = volume(&mut store, 1 << 24);
+  let (no, _chunk, _tail) = sealed_head_open_tail(&mut store, &mut volume);
+
+  let head_map = volume.dax_map_read_at(&mut store, no, 0).unwrap();
+  assert!(
+    volume.dax_still_current(&store, &head_map),
+    "the reopened head is current while mapped"
+  );
+  assert!(
+    store.dax_revoke(&head_map),
+    "the head mapping is revoked and its block unpinned"
+  );
+  volume.seal_idle(&mut store, u64::MAX);
+  assert!(
+    !volume.dax_still_current(&store, &head_map),
+    "once unmapped, the sweep re-sealed the reopened head chunk"
   );
 }

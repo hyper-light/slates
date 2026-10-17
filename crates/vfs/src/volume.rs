@@ -394,6 +394,10 @@ pub struct Volume {
   /// Files aged past a sweep tick and not yet sealed, sealed a budget at a time ([`Volume::seal_pending`]); a write
   /// takes a file back out.
   pub(crate) idle_pending: std::collections::BTreeSet<InodeNo>,
+  /// Files with a chunk reopened in place for a DAX map (§4.6 DAX open frontier, the REOPEN arm), re-sealed a budget at
+  /// a time once the mapping is gone ([`Volume::reseal_cold`]); so content is plaintext at rest only while a guest maps
+  /// it. Empty in production while DAX is unadvertised.
+  pub(crate) reseal_pending: std::collections::BTreeSet<InodeNo>,
   pub(crate) state: VolumeState,
   pub(crate) destroy_queue: Vec<Dead>,
   /// Open and lookup references per inode number (§4.6 lifetime; the inode-addressed-io design):
@@ -644,6 +648,7 @@ impl Volume {
       written: BTreeMap::new(),
       sweep_tick: 0,
       idle_pending: std::collections::BTreeSet::new(),
+      reseal_pending: std::collections::BTreeSet::new(),
       state: VolumeState::Live,
       destroy_queue: Vec::new(),
       references: BTreeMap::new(),
@@ -718,6 +723,7 @@ impl Volume {
       written: BTreeMap::new(),
       sweep_tick: 0,
       idle_pending: std::collections::BTreeSet::new(),
+      reseal_pending: std::collections::BTreeSet::new(),
       state: VolumeState::Live,
       destroy_queue: Vec::new(),
       references: BTreeMap::new(),
@@ -812,6 +818,7 @@ impl Volume {
       written: BTreeMap::new(),
       sweep_tick: 0,
       idle_pending: std::collections::BTreeSet::new(),
+      reseal_pending: std::collections::BTreeSet::new(),
       state: VolumeState::Live,
       destroy_queue: Vec::new(),
       references: BTreeMap::new(),
@@ -1174,10 +1181,14 @@ impl Volume {
     self.writable_dax
   }
 
-  /// The idle sweep (A-99) in one call: [`Volume::age_writes`], then [`Volume::seal_pending`] within `budget_bytes`.
+  /// The idle sweep (A-99) in one call: [`Volume::age_writes`], then [`Volume::seal_pending`] within `budget_bytes`,
+  /// then [`Volume::reseal_cold`] within the same budget (re-sealing any chunk a DAX map reopened and has since
+  /// released, §4.6 DAX open frontier).
   pub fn seal_idle(&mut self, store: &mut Store, budget_bytes: u64) -> IdleSweep {
     self.age_writes();
-    self.seal_pending(store, budget_bytes)
+    let sweep = self.seal_pending(store, budget_bytes);
+    self.reseal_cold(store, budget_bytes);
+    sweep
   }
 
   /// Advances the idle sweep's tick (A-99): every file last written before the previous tick, and not since, is due a
@@ -1287,6 +1298,87 @@ impl Volume {
     self.reconcile(before, content_by_epoch(store, handle));
     self.dirty.inode(no.0);
     Ok(bytes)
+  }
+
+  /// Marks inode `no` for re-seal (§4.6 DAX open frontier, the REOPEN arm): a chunk of it was reopened in place for a
+  /// DAX map and must be re-encrypted once its window is gone. [`Volume::reseal_cold`] does it on the idle sweep.
+  pub(crate) fn mark_reseal(&mut self, no: InodeNo) {
+    self.reseal_pending.insert(no);
+  }
+
+  /// Re-seals the chunks reopened for a DAX map on files whose window is now gone (§4.6 DAX open frontier), until
+  /// `budget_bytes` of reopened bytes are re-sealed (one cooperative slice); the rest wait for the next slice. A
+  /// reopened chunk whose block is still pinned by a live mapping is deferred and re-queued, like the open block in
+  /// [`Volume::seal_pending`]: content is plaintext at rest only while a guest maps it. Returns the bytes re-sealed. A
+  /// no-op without a seal key (the set is cleared — nothing was ever sealed to reopen).
+  pub fn reseal_cold(&mut self, store: &mut Store, budget_bytes: u64) -> u64 {
+    let Some(key) = self.seal_key else {
+      self.reseal_pending.clear();
+      return 0;
+    };
+    let mut resealed_bytes = 0u64;
+    let mut deferred: Vec<InodeNo> = Vec::new();
+    while resealed_bytes < budget_bytes {
+      let Some(no) = self.reseal_pending.pop_first() else {
+        break;
+      };
+      let (bytes, incomplete) = self.reseal_inode(store, no, key);
+      resealed_bytes = resealed_bytes.saturating_add(bytes);
+      if incomplete {
+        deferred.push(no);
+      }
+    }
+    for no in deferred {
+      self.reseal_pending.insert(no);
+    }
+    resealed_bytes
+  }
+
+  /// Re-seals inode `no`'s reopened (plaintext, seal-cleared) sealed-list chunks under `key` ([`Volume::reseal_cold`]).
+  /// Returns the bytes re-sealed and whether any chunk was left reopened — still pinned by a live window, or a refused
+  /// seal — so the file is re-queued for a later sweep. Re-sealing is charge-neutral (the chunk's stored bytes are
+  /// unchanged), so no reconcile is needed.
+  fn reseal_inode(&mut self, store: &mut Store, no: InodeNo, key: u32) -> (u64, bool) {
+    let Some(handle) = trie::get(&store.tries, self.inode_root, no) else {
+      return (0, false);
+    };
+    let mut targets: Vec<(slates_mem::Handle<crate::content::Chunk>, bool, u64)> = Vec::new();
+    match store.inodes.get(handle) {
+      Ok(inode) => {
+        let sealed = match &inode.body {
+          Body::Open { sealed, .. } => sealed.as_slice(),
+          Body::Sealed(sealed) => sealed.as_slice(),
+          _ => return (0, false),
+        };
+        for extent in sealed {
+          let crate::content::ExtentSrc::Chunk { chunk, .. } = extent.src else {
+            continue;
+          };
+          let Some(c) = store.content.chunk(chunk) else {
+            continue;
+          };
+          if c.seal.is_some() {
+            continue;
+          }
+          let pinned = store.content.arena().is_pinned(c.block);
+          targets.push((chunk, pinned, u64::from(c.len)));
+        }
+      }
+      Err(_) => return (0, false),
+    }
+    let mut resealed = 0u64;
+    let mut incomplete = false;
+    for (chunk, pinned, len) in targets {
+      if pinned {
+        incomplete = true;
+        continue;
+      }
+      match store.content.reseal(chunk, key) {
+        Ok(()) => resealed = resealed.saturating_add(len),
+        Err(_) => incomplete = true,
+      }
+    }
+    (resealed, incomplete)
   }
 
   /// The key this volume's chunks are sealed under, if any.

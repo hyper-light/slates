@@ -403,15 +403,18 @@ fn open_chunk_at(
   }
 }
 
-/// The **sealed chunk** covering file offset `file_offset`, as `(chunk_start, valid_len)` (§4.6, the VIEW arm). Walks
-/// the sealed extents of a `Body::Open`/`Body::Sealed` file for the one that spans the offset. A non-chunked body, or
-/// an offset in no sealed extent (it is in the open chunk, or past the file), is refused `Invalid`.
-fn sealed_chunk_at(
+/// The **sealed (or already-reopened) chunk extent** covering file offset `file_offset` (§4.6, the REOPEN arm): the
+/// extent — carrying its chunk handle — from a `Body::Open`/`Body::Sealed` file's sealed list that spans the offset, so
+/// the caller can reopen it in place. A non-chunked body is refused `Invalid`. An offset in no sealed extent (it is in
+/// the open chunk, or past the file) is refused `NotFound` (distinct from the wrong-body `Invalid`), which tells the
+/// device's N-map loop to STOP — the guest's window range ran off the end of the file's content, so the remaining pages
+/// are simply not backed (as the authorized-window cap always left them).
+fn sealed_extent_at(
   store: &Store,
   volume: &Volume,
   no: InodeNo,
   file_offset: usize,
-) -> Result<(usize, usize), VfsError> {
+) -> Result<crate::content::Extent, VfsError> {
   let inode = volume.inode(store, no)?;
   let sealed: &[crate::content::Extent] = match &inode.body {
     Body::Open { sealed, .. } => sealed,
@@ -422,13 +425,34 @@ fn sealed_chunk_at(
     let start = usize::try_from(extent.off).map_err(|_| VfsError::NoSpace)?;
     let len = usize::try_from(extent.len).map_err(|_| VfsError::NoSpace)?;
     if file_offset >= start && file_offset < start.saturating_add(len) {
-      return Ok((start, len));
+      return Ok(*extent);
     }
   }
-  // No open and no sealed chunk covers this offset: it is past the file's content. `NotFound` (distinct from the
-  // wrong-body `Invalid`) tells the device's N-map loop to STOP here — the guest's window range ran off the end of
-  // the file, so the remaining pages are simply not backed (as the authorized-window cap always left them).
   Err(VfsError::NotFound)
+}
+
+/// The **reopened chunk** covering file offset `file_offset`, as `(block, chunk_start, valid_len)` (§4.6, the REOPEN
+/// arm): a sealed-list chunk whose seal has been cleared — decrypted in place for a DAX map. `None` when the offset is
+/// in no sealed-list chunk, or the chunk there is still sealed (not reopened). [`Volume::dax_still_current`] leans on
+/// this: a mapping whose chunk was re-sealed under it (its seal back) no longer matches and is torn, so the guest
+/// re-maps and re-reopens it.
+fn reopened_chunk_at(
+  store: &Store,
+  volume: &Volume,
+  no: InodeNo,
+  file_offset: usize,
+) -> Option<(Block, usize, usize)> {
+  let extent = sealed_extent_at(store, volume, no, file_offset).ok()?;
+  let crate::content::ExtentSrc::Chunk { chunk, .. } = extent.src else {
+    return None;
+  };
+  let c = store.content.chunk(chunk)?;
+  if c.seal.is_some() {
+    return None;
+  }
+  let start = usize::try_from(extent.off).ok()?;
+  let len = usize::try_from(extent.len).ok()?;
+  Some((c.block, start, len))
 }
 
 impl Volume {
@@ -489,17 +513,44 @@ impl Volume {
       }
       return Ok(mapping);
     }
-    // VIEW arm (A/B against reopen): a SEALED chunk (ciphertext at rest, A-92/A-99) cannot be mapped zero-copy — a
-    // guest MMU would read ciphertext, and a refused SETUPMAPPING SIGBUSes a `dax=always` mmap. Back it with a
-    // decrypted read-only throwaway the mapping owns (`snapshot: true`): read the chunk's plaintext (the read path
-    // decrypts through `open_into`) and materialize it at the chunk's file offset. The canonical sealed chunk stays
-    // ciphertext; the view is freed and scrubbed on revoke, and a write to the chunk revokes the mapping (so a view
-    // of immutable sealed content never goes stale).
-    let (chunk_start, chunk_len) = sealed_chunk_at(&*store, self, no, file_offset)?;
-    let at = u64::try_from(chunk_start).map_err(|_| VfsError::NoSpace)?;
-    let mut plain = vec![0u8; chunk_len];
-    self.read(&*store, no, at, &mut plain)?;
-    self.map_owned_block(store, no, chunk_start, &plain)
+    // REOPEN arm (A/B against view): a SEALED chunk (ciphertext at rest, A-92/A-99) cannot be mapped zero-copy — a
+    // guest MMU would read ciphertext, and a refused SETUPMAPPING SIGBUSes a `dax=always` mmap. Reopen it in place: the
+    // chunk's representation transitions sealed→open, decrypted in its OWN block (no throwaway copy, one
+    // representation), and that block is mapped directly and pinned exactly as the open chunk is. The inode is marked
+    // for re-seal, so the idle sweep re-encrypts the chunk once its window is gone ([`Volume::reseal_pending`]):
+    // content is plaintext at rest only while a guest maps it. A write to the chunk revokes the mapping first.
+    let extent = sealed_extent_at(&*store, self, no, file_offset)?;
+    let chunk_start = usize::try_from(extent.off).map_err(|_| VfsError::NoSpace)?;
+    let file_len = usize::try_from(extent.len).map_err(|_| VfsError::NoSpace)?;
+    let block = store.content.reopen_in_place(&extent)?;
+    store.content.arena_mut().pin(block)?;
+    if let Some(tail) = store
+      .content
+      .arena_mut()
+      .bytes_mut(block)
+      .and_then(|bytes| bytes.get_mut(file_len..))
+    {
+      tail.fill(0);
+    }
+    self.mark_reseal(no);
+    let mapping = Mapping {
+      id: store.dax.mint_id(),
+      inode: no,
+      block_file_start: chunk_start,
+      block,
+      file_len,
+      writable: false,
+      snapshot: false,
+    };
+    if let Err(refusal) = store.dax.register(mapping) {
+      // The registry is full: undo the pin so a refused map leaves nothing held (the chunk stays reopened; the sweep
+      // re-seals it, as it would after a normal unmap).
+      if store.content.arena_mut().unpin(block).is_err() {
+        store.release_refusals = store.release_refusals.saturating_add(1);
+      }
+      return Err(refusal);
+    }
+    Ok(mapping)
   }
 
   /// Maps inode `no`'s content from offset 0 — the whole single block of a single-block file, or an inline file —
@@ -760,9 +811,19 @@ impl Volume {
       // non-single-block body and a snapshot mapping read as stale through `Volume::dax_read`, the local-client path.)
       return store.dax.is_live(mapping);
     }
-    matches!(
+    // The open tail maps directly off the open extent.
+    if matches!(
       open_chunk_at(store, self, mapping.inode, mapping.block_file_start),
       Ok((block, start, file_len))
+        if block == mapping.block && start == mapping.block_file_start && file_len == mapping.file_len
+    ) {
+      return true;
+    }
+    // The REOPEN arm: a reopened sealed-list chunk (decrypted in place, seal cleared) maps directly off its own block.
+    // It stays current while the chunk is still reopened on the same block and length; a re-seal under it tears it.
+    matches!(
+      reopened_chunk_at(store, self, mapping.inode, mapping.block_file_start),
+      Some((block, start, file_len))
         if block == mapping.block && start == mapping.block_file_start && file_len == mapping.file_len
     )
   }
