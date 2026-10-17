@@ -6350,3 +6350,37 @@ reclaim/re-map cycles) byte-for-byte.
 **Owed:** the live guest's revoke→remap figures (67 ms/537 ms) were taken under load 34 and before the hold existed,
 so the churn the hold removes *in a real guest* is inferred from the in-process workload rather than re-measured
 there; and DAX stays advertisement-gated.
+
+## A FUSE invalidation written from the serving thread deadlocked the mount (§4.6, 2026-10-17)
+
+Found by widening the regression sweep for the DAX work, then proved pre-existing. A Linux FUSE mount wedged
+permanently — `crates/server/tests/fuse_mount.rs::a_scoped_fuse_mount_presents_one_directory_and_follows_it` hung
+forever (13 minutes at 1 s of CPU; exit 124 under a 240 s timeout), taking its **shard** with it.
+
+Root cause, confirmed by kernel stacks and a trace rather than inferred
+(`docs/bugs/2026-10-17-fuse-notify-deadlocks-the-serving-thread.md`): `FuseChannel::write_invalidation` did a
+blocking `write(2)` of `FUSE_NOTIFY_INVAL_ENTRY` from `deliver_owed`, which runs inside the same `serve_step` /
+`dispatch_ready` that reads a request and produces its reply. The kernel's `fuse_reverse_inval_entry()` takes the
+parent directory's inode lock, which a concurrent lookup holds for the whole request — so the one thread that would
+answer the lookup and release the lock was the thread blocked waiting for it. `FUSE_EXPIRE_ONLY` does not avoid it
+(the kernel locks the parent before reading the flags), and neither does any ordering inside our own loop (the
+kernel holds the lock from the moment it issues the request).
+
+Fixed: a round of invalidations is written on a thread of its own, owned and joined by the `ServeState` that
+started it, mirroring the landing barrier's thread (A-132) which exists for the same reason. The API that wrote a
+notification on the caller's thread is **gone** (replaced by `encode_invalidation`), so a new caller cannot
+reintroduce the hazard. One round is out at a time — `Bridge::invalidations` consumes what it reports, so a second
+is never gathered while one is in flight, which is also its bound — and the cursor is rewound if the kernel refuses
+the write, so nothing is dropped. §4.6 Cache posture is amended in the same change: the claim that delivery precedes
+each request is withdrawn (it was never achievable); the property that posture rests on, proven delivery, is kept.
+
+Verified: 5 runs out of 5 green in ~0.22 s where it previously hung every time; a deterministic unit test
+(`a_round_whose_write_blocks_does_not_hold_its_owner`) holds the invariant with no kernel; a watchdog now aborts the
+suite with a named reason instead of hanging CI, since `cargo test --workspace` includes it. Regression on the box:
+bridge-fuse all suites, `nfs_mount` 36/0, `daemon` 22/0, `virtiofs` 18/0, `attach_forms` 8/0, recovery oracle 41/0,
+clippy `--all-targets -D warnings` clean.
+
+**Owed:** on a refused delivery the cursor is rewound, but the base-plane entries `take_stale_base_entries` already
+consumed are gone — the journal half replays, the base half does not (pre-existing, found while fixing this, not
+widened into it). And the daemon's serve loop waits on device readability, so a finished round's outcome is seen at
+its next turn; `ServeState::wakes_with` exists for a loop that carries a change signal.

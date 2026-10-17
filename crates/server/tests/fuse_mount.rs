@@ -29,6 +29,53 @@ const VOLUME: &str = "fuse-mounted";
 /// one serve turn: far past their milliseconds, short enough that a lost end fails the test.
 const ENDS_WITHIN: Duration = Duration::from_secs(10);
 
+/// Shape: how long the whole scoped-mount test may take before it is treated as wedged. Its work is milliseconds;
+/// this is two orders of magnitude of headroom for a loaded box.
+const WEDGED_AFTER: Duration = Duration::from_secs(90);
+
+/// Fails the run loudly if the test wedges, instead of hanging until CI's own timeout.
+///
+/// This guards a real deadlock that shipped: a notification written on the thread that answers requests blocked in
+/// the kernel on a lock only an answered request releases, and the mount stopped forever
+/// (`docs/bugs/2026-10-17-fuse-notify-deadlocks-the-serving-thread.md`). A wedged mount cannot be unwound from
+/// inside the test — its thread is stuck in the kernel on a file call — so the guard aborts the process with a
+/// named reason, which `cargo test --workspace` reports rather than sitting on.
+///
+/// The flag is a process-lifetime `&'static`, not a shared pointer: one test arms the guard, and slates shares a
+/// word that way rather than by reference counting.
+static FINISHED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+struct Watchdog;
+
+impl Watchdog {
+  fn set(what: &'static str) -> Watchdog {
+    FINISHED.store(false, std::sync::atomic::Ordering::Relaxed);
+    std::thread::spawn(move || {
+      let until = Instant::now() + WEDGED_AFTER;
+      while Instant::now() < until {
+        if FINISHED.load(std::sync::atomic::Ordering::Relaxed) {
+          return;
+        }
+        // A test harness thread watching for a wedge, not a shipped path (clippy.toml's stated exception).
+        #[allow(clippy::disallowed_methods)]
+        std::thread::sleep(Duration::from_millis(100));
+      }
+      eprintln!(
+        "WEDGED: {what} made no progress in {WEDGED_AFTER:?} — see \
+         docs/bugs/2026-10-17-fuse-notify-deadlocks-the-serving-thread.md"
+      );
+      std::process::abort();
+    });
+    Watchdog
+  }
+}
+
+impl Drop for Watchdog {
+  fn drop(&mut self) {
+    FINISHED.store(true, std::sync::atomic::Ordering::Relaxed);
+  }
+}
+
 fn command_available(name: &str) -> bool {
   Command::new("sh")
     .args(["-c", &format!("command -v {name}")])
@@ -372,6 +419,7 @@ fn shared_and_private(point: &str) {
 #[test]
 #[allow(clippy::disallowed_methods)] // the test's own calls through the slates mount: RAM, not disk
 fn a_scoped_fuse_mount_presents_one_directory_and_follows_it() {
+  let _watchdog = Watchdog::set("a_scoped_fuse_mount_presents_one_directory_and_follows_it");
   if !command_available("fusermount3") || !std::path::Path::new("/dev/fuse").exists() {
     eprintln!("SKIP: no fusermount3 or /dev/fuse on this host; the FUSE transport needs both");
     return;

@@ -1981,9 +1981,24 @@ Linux runner; then teardown proofs (detach, destroy, a daemon restart).
 > Its guest devices are asked to revoke on the same step (AUD-29-73): a device loop checks at every pass boundary,
 > so none serves a request after the acknowledgement.
 
+> **Amendment (2026-10-17): invalidations are delivered off the answering thread, not before each request.**
+> "Before each request" was not merely an ordering preference — it deadlocked the mount, and could not be kept.
+> `FUSE_NOTIFY_INVAL_ENTRY` blocks in the kernel on the parent directory's inode lock, which a concurrent lookup
+> holds for the whole request; the only thread that would answer that lookup is the one writing the notification.
+> A scoped mount wedged permanently, taking its shard with it
+> (`docs/bugs/2026-10-17-fuse-notify-deadlocks-the-serving-thread.md`). Neither `FUSE_EXPIRE_ONLY` (the kernel locks
+> the parent before it reads the flags) nor any ordering inside our own loop (the kernel holds the lock from the
+> moment it issues the request) avoids it. A round of invalidations is therefore written on a thread of its own,
+> owned and joined by the serve state that started it, while the serving thread stays free to answer — which is
+> precisely what releases the lock the write waits on. One round is out at a time (the gather consumes what it
+> reports, so that is also its bound); the cursor advances only for a round that was handed off whole and is put
+> back if the kernel refuses the write, so nothing is dropped. The property `Invalidated` posture rests on —
+> **proven delivery**, which is what buys unbounded entry lifetimes — is preserved; only the claim that delivery
+> precedes each request is withdrawn, as it was never achievable.
+
 > **Status (2026-10-01, AUD-29-79: a transport's cache promise matches its delivery).** An attachment
 > carries how its transport keeps the kernel's cache coherent: the native `/dev/fuse` channel, which writes
-> the seam's invalidations before each request, declares `Invalidated`, and may hand the volume's own objects
+> the seam's invalidations (off the answering thread, per the 2026-10-17 amendment above), declares `Invalidated`, and may hand the volume's own objects
 > unbounded lifetimes and negotiate explicit invalidation; every other attachment is `Revalidated` — zero
 > entry and attribute lifetimes, no explicit invalidation, `AUTO_INVAL_DATA` and no page cache kept across an
 > open — so a virtio-fs guest with no notification queue converges by revalidating rather than holding a
