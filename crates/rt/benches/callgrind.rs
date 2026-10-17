@@ -106,6 +106,19 @@ fn check_wake(result: Result<Counters, RtError>) {
   );
 }
 
+/// The first shard of a freshly built simulated runtime. The sim always configures at least one
+/// shard, so this resolves; a runtime with none cannot be benchmarked, so it reports and exits
+/// rather than index a slice (the lint wall forbids `[0]`, and a bench honours R6 — no panic — too).
+fn first_shard(sim: &SimRuntime) -> ShardId {
+  match sim.shard_ids().first() {
+    Some(&shard) => shard,
+    None => {
+      eprintln!("the simulated runtime has no shard to benchmark");
+      std::process::exit(1);
+    }
+  }
+}
+
 #[library_benchmark(teardown = check_idle)]
 #[bench::idle(sim())]
 fn step_idle(mut sim: SimRuntime) -> u64 {
@@ -116,7 +129,7 @@ fn step_idle(mut sim: SimRuntime) -> u64 {
 #[bench::trivial(sim())]
 fn spawn_and_run(mut sim: SimRuntime) -> Result<Counters, RtError> {
   count_instructions(move || {
-    let shard = sim.shard_ids()[0];
+    let shard = first_shard(&sim);
     sim.spawn_on(shard, async {})?;
     black_box(sim.run_until_idle());
     Ok(black_box(sim.context(shard)?.counters()))
@@ -127,7 +140,7 @@ fn spawn_and_run(mut sim: SimRuntime) -> Result<Counters, RtError> {
 #[bench::one_yield(sim())]
 fn local_wake(mut sim: SimRuntime) -> Result<Counters, RtError> {
   count_instructions(move || {
-    let shard = sim.shard_ids()[0];
+    let shard = first_shard(&sim);
     sim.spawn_on(shard, async {
       yield_now().await;
     })?;
@@ -142,7 +155,7 @@ const KEPT_WORD: u64 = 42;
 /// A runtime holding one kept word (kept by a task, outside the measured span), with its shard and handle.
 fn kept_value() -> (SimRuntime, ShardId, Kept<u64>) {
   let mut sim = sim();
-  let shard = sim.shard_ids()[0];
+  let shard = first_shard(&sim);
   let (tx, rx) = std::sync::mpsc::channel();
   require_success(
     sim.spawn_on(shard, async move {

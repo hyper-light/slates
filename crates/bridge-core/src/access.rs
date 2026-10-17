@@ -260,12 +260,21 @@ pub fn may_chown(caller: &Caller, node: &NodeAttr, uid: Option<u32>, gid: Option
 /// is allowed: the mode needs ownership; the owner and group follow [`may_chown`]; the size needs
 /// write permission (with the I/O owner override); explicit times need ownership and "now" needs
 /// ownership or write permission (`explicit_times` says which the request asked for).
+///
+/// `owner_size_override` is for a *stateless* front end (NFSv3): with no open state id, the server cannot
+/// tell an `ftruncate(fd)` (a write-capable descriptor's own truncate, which POSIX allows whatever the mode
+/// — a newly created mode-0 file's creator included, pjdfstest `ftruncate/00.t`) from a `truncate(path)` by
+/// a caller its bits deny, since both arrive as a bare size `SETATTR`. It trusts the file's owner for its
+/// own file's size there, as the Linux NFS server (knfsd) does. A stateful front end (NFSv4) passes `false`:
+/// it tells them apart by the state id (`IoAuthority::Open` is the write-capable descriptor), so the bits
+/// decide strictly — the owner included — which is what closes the NFSv4 truncate-laundering escape.
 pub fn setattr_denial(
   caller: &Caller,
   node: &NodeAttr,
   changes: &SetAttr,
   explicit_times: bool,
   authority: IoAuthority,
+  owner_size_override: bool,
 ) -> Option<Denial> {
   if changes.mode.is_some() && !owner_or_root(caller, node) {
     return Some(Denial::NotOwner);
@@ -275,14 +284,19 @@ pub fn setattr_denial(
   {
     return Some(Denial::NotOwner);
   }
-  // A size change is a write. An NFSv4 open for writing authorized it when it was made; a delegation's state id stands
-  // for the whole client, whose local open checked only the open mode's access, never `O_TRUNC`'s write, so the bits
-  // decide strictly (pjdfstest `open/07.t`, 2026-10-05: any user of the client truncated through it); otherwise the
-  // mode decides with the I/O owner override.
+  // A size change is a write, and `O_TRUNC` needs write permission by the bits for the acting caller, the file's own
+  // owner included (pjdfstest `open/07.t`). Only a write-capable open authorizes it without that check — the open was
+  // checked when it was made, and a descriptor keeps its access whatever the mode becomes (`IoAuthority::Open`). A
+  // delegation's state id stands for the whole client, and a special state id (`IoAuthority::Mode`) holds no open at
+  // all, so neither inherits a write right: both decide strictly, with no owner override (2026-10-05 fixed the
+  // delegation path for the Linux client's local-open-then-SETATTR truncate; 2026-10-14 the same for a special state
+  // id, which a 6.17 client reached — the owner of a 0477 file truncated through `permits_io`'s owner override). The
+  // exception is a stateless (NFSv3) front end under `owner_size_override`: with no state id to tell `ftruncate(fd)`
+  // from `truncate(path)`, the owner is trusted for its own file's size, as knfsd is.
   let size_denied = match authority {
     IoAuthority::Open => false,
-    IoAuthority::Delegation => !permits(caller, node, Want::Write),
-    IoAuthority::Mode => !permits_io(caller, node, Want::Write),
+    IoAuthority::Mode if owner_size_override => !permits_io(caller, node, Want::Write),
+    IoAuthority::Delegation | IoAuthority::Mode => !permits(caller, node, Want::Write),
   };
   if changes.size.is_some() && size_denied {
     return Some(Denial::NoAccess);
@@ -513,7 +527,14 @@ mod tests {
       ),
     ] {
       assert_eq!(
-        setattr_denial(&caller, file, &truncate, false, IoAuthority::Delegation),
+        setattr_denial(
+          &caller,
+          file,
+          &truncate,
+          false,
+          IoAuthority::Delegation,
+          false
+        ),
         Some(Denial::NoAccess),
         "{caller:?}"
       );
@@ -524,7 +545,8 @@ mod tests {
         &node(Kind::File, 0o666, 65534, 65534),
         &truncate,
         false,
-        IoAuthority::Delegation
+        IoAuthority::Delegation,
+        false
       ),
       None
     );
@@ -534,10 +556,126 @@ mod tests {
         &owner_denied,
         &truncate,
         false,
-        IoAuthority::Open
+        IoAuthority::Open,
+        false
       ),
       None,
       "an open for writing keeps its access whatever the mode became"
+    );
+  }
+
+  /// The same, under a *special* state id (`IoAuthority::Mode`: one that holds no open — a bare
+  /// `truncate()`, or a client that opened read-only and set the size outside that open). A truncate
+  /// still needs write permission by the bits, the file's own owner included (pjdfstest `open/07.t`).
+  /// A 6.17 Linux NFS client reached this path and truncated a 0477 file as its owner, which
+  /// `permits_io`'s owner override wrongly allowed (CI, 2026-10-14); the bits now decide strictly, as
+  /// the delegation path does. Only a write-capable open keeps its access across a chmod
+  /// (`IoAuthority::Open`, covered above).
+  #[test]
+  fn a_truncate_under_a_special_state_id_needs_write_permission_by_the_bits() {
+    let truncate = SetAttr {
+      size: Some(0),
+      ..SetAttr::default()
+    };
+    let owner_denied = node(Kind::File, 0o477, 65534, 65534);
+    for (caller, file, why) in [
+      (
+        user(65534, 65534, &[]),
+        &owner_denied,
+        "the owner of a 0477 file has no write bit",
+      ),
+      (
+        user(65533, 65534, &[]),
+        &node(Kind::File, 0o747, 65534, 65534),
+        "a group member the group bits deny",
+      ),
+      (
+        user(65533, 65533, &[]),
+        &node(Kind::File, 0o774, 65534, 65534),
+        "another user the other bits deny",
+      ),
+    ] {
+      assert_eq!(
+        setattr_denial(&caller, file, &truncate, false, IoAuthority::Mode, false),
+        Some(Denial::NoAccess),
+        "{why}: {caller:?}"
+      );
+    }
+    assert_eq!(
+      setattr_denial(
+        &user(65533, 65533, &[]),
+        &node(Kind::File, 0o666, 65534, 65534),
+        &truncate,
+        false,
+        IoAuthority::Mode,
+        false
+      ),
+      None,
+      "the other bits grant write"
+    );
+    assert_eq!(
+      setattr_denial(
+        &user(65534, 65534, &[]),
+        &node(Kind::File, 0o644, 65534, 65534),
+        &truncate,
+        false,
+        IoAuthority::Mode,
+        false
+      ),
+      None,
+      "0644: the owner bits grant write"
+    );
+  }
+
+  /// A stateless (NFSv3) front end has no open state id, so it cannot tell `ftruncate(fd)` from
+  /// `truncate(path)` and trusts the file's owner for its own file's size, as knfsd does — pjdfstest
+  /// `ftruncate/00.t:24`: uid 65534 creates a mode-0 file `O_RDWR` and `ftruncate`s it, which must succeed
+  /// (the write descriptor authorizes it; the file's mode must not block its creator). `owner_size_override`
+  /// is set only for NFSv3, so NFSv4 keeps the strict bits check that closes the truncate-laundering escape.
+  #[test]
+  fn a_stateless_front_end_lets_an_owner_size_its_own_file() {
+    let truncate = SetAttr {
+      size: Some(0),
+      ..SetAttr::default()
+    };
+    let owned = node(Kind::File, 0o000, 65534, 65534);
+    assert_eq!(
+      setattr_denial(
+        &user(65534, 65534, &[]),
+        &owned,
+        &truncate,
+        false,
+        IoAuthority::Mode,
+        true
+      ),
+      None,
+      "NFSv3: the owner sizes its own mode-0 file (ftruncate/00.t:24)"
+    );
+    assert_eq!(
+      setattr_denial(
+        &user(65534, 65534, &[]),
+        &owned,
+        &truncate,
+        false,
+        IoAuthority::Mode,
+        false
+      ),
+      Some(Denial::NoAccess),
+      "NFSv4 stays strict: the owner of a mode-0 file has no write bit"
+    );
+    // The override helps only the owner: a non-owner the bits deny is still refused, even on NFSv3.
+    let others_file = node(Kind::File, 0o600, 65534, 65534);
+    assert_eq!(
+      setattr_denial(
+        &user(1001, 1001, &[]),
+        &others_file,
+        &truncate,
+        false,
+        IoAuthority::Mode,
+        true
+      ),
+      Some(Denial::NoAccess),
+      "NFSv3 still refuses a non-owner the bits deny"
     );
   }
 
@@ -550,7 +688,7 @@ mod tests {
       ..SetAttr::default()
     };
     assert_eq!(
-      setattr_denial(&other, &file, &chmod, false, IoAuthority::Mode),
+      setattr_denial(&other, &file, &chmod, false, IoAuthority::Mode, false),
       Some(Denial::NotOwner)
     );
     assert_eq!(
@@ -559,12 +697,20 @@ mod tests {
         &file,
         &chmod,
         false,
-        IoAuthority::Mode
+        IoAuthority::Mode,
+        false
       ),
       None
     );
     assert_eq!(
-      setattr_denial(&Caller::root(), &file, &chmod, false, IoAuthority::Mode),
+      setattr_denial(
+        &Caller::root(),
+        &file,
+        &chmod,
+        false,
+        IoAuthority::Mode,
+        false
+      ),
       None
     );
     let truncate = SetAttr {
@@ -572,12 +718,19 @@ mod tests {
       ..SetAttr::default()
     };
     assert_eq!(
-      setattr_denial(&other, &file, &truncate, false, IoAuthority::Mode),
+      setattr_denial(&other, &file, &truncate, false, IoAuthority::Mode, false),
       Some(Denial::NoAccess)
     );
     let writable = node(Kind::File, 0o666, 1000, 1000);
     assert_eq!(
-      setattr_denial(&other, &writable, &truncate, false, IoAuthority::Mode),
+      setattr_denial(
+        &other,
+        &writable,
+        &truncate,
+        false,
+        IoAuthority::Mode,
+        false
+      ),
       None
     );
     let times = SetAttr {
@@ -585,16 +738,16 @@ mod tests {
       ..SetAttr::default()
     };
     assert_eq!(
-      setattr_denial(&other, &writable, &times, true, IoAuthority::Mode),
+      setattr_denial(&other, &writable, &times, true, IoAuthority::Mode, false),
       Some(Denial::NotOwner)
     );
     assert_eq!(
-      setattr_denial(&other, &writable, &times, false, IoAuthority::Mode),
+      setattr_denial(&other, &writable, &times, false, IoAuthority::Mode, false),
       None,
       "now needs only write"
     );
     assert_eq!(
-      setattr_denial(&other, &file, &times, false, IoAuthority::Mode),
+      setattr_denial(&other, &file, &times, false, IoAuthority::Mode, false),
       Some(Denial::NoAccess)
     );
   }
