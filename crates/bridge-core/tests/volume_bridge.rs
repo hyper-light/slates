@@ -1463,12 +1463,12 @@ fn a_scoped_dax_map_is_confined_to_its_subtree() {
   {
     let mut scoped = ScopedBridge::new(&mut inner, shared.ino);
     assert!(
-      scoped.dax_map(oid(f.ino), &cx, false).is_ok(),
+      scoped.dax_map(oid(f.ino), &cx, false, 0).is_ok(),
       "the scoped mount maps its own file"
     );
     assert!(
       matches!(
-        scoped.dax_map(oid(secret.ino), &cx, false),
+        scoped.dax_map(oid(secret.ino), &cx, false, 0),
         Err(VfsError::NotFound)
       ),
       "the scoped mount cannot map a file outside its subtree"
@@ -1476,7 +1476,7 @@ fn a_scoped_dax_map_is_confined_to_its_subtree() {
   }
   // Non-vacuity: the private file IS mappable — the scope was the only thing refusing it.
   assert!(
-    inner.dax_map(oid(secret.ino), &cx, false).is_ok(),
+    inner.dax_map(oid(secret.ino), &cx, false, 0).is_ok(),
     "the unscoped bridge maps the private file"
   );
 }

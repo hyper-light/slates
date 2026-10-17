@@ -1511,7 +1511,13 @@ fn serve_dax(
         }
       }
       let object = ObjectId::new(req.header.nodeid, 0);
-      let mapping = match bridge.dax_map(object, cx, writable) {
+      // The guest's SETUPMAPPING file offset selects which chunk to map; the gate returns the OPEN (plaintext) chunk
+      // covering it and refuses a sealed one (→ the guest FUSE_READs that range). Parse it before the map so the gate
+      // can pick the chunk (§4.6 "DAX maps the open frontier").
+      let (Ok(foffset), Ok(requested)) = (usize::try_from(m.foffset), usize::try_from(m.len)) else {
+        return err(dax_errno::EINVAL, out);
+      };
+      let mapping = match bridge.dax_map(object, cx, writable, foffset) {
         Ok(mapping) => mapping,
         Err(e) => return err(vfs_dax_errno(&e), out),
       };
@@ -1520,33 +1526,32 @@ fn serve_dax(
         let _ = bridge.dax_unmap(&mapping, cx); // undo the pin (no window established yet)
         return err(dax_errno::EOPNOTSUPP, out);
       };
-      // Bound the requested range to the file's authorized window — its own pages, not the arena block's power-of-two
-      // padding. The buddy allocator may round a block larger than the file needs (a 64 KiB block for a 33 KiB file),
-      // and §4.6 authorizes only the pages that cover the file (`Mapping::file_len`; the sub-file tail reads zero).
-      // Round the file length up to this window's granule (the host page, or the negotiated FUSE_MAP_ALIGNMENT) and
-      // cap at the block, so a guest can never map a whole page lying entirely past its file — the shared surface is
-      // minimal by bound, not only by the map-time tail scrub. `min(block_len)` keeps the physical block the floor.
+      // The mapping's block holds file bytes [block_file_start, block_file_start + file_len); the guest's foffset maps
+      // to block byte `intra = foffset - block_file_start`. For a single-block/whole-file map block_file_start is 0, so
+      // intra == foffset; for a multi-block file's open tail it rebases into the tail's own block.
+      let Some(intra) = foffset.checked_sub(mapping.block_file_start) else {
+        let _ = bridge.dax_unmap(&mapping, cx);
+        return err(dax_errno::EINVAL, out);
+      };
+      // Bound the requested range to the chunk's authorized window — its own pages, not the arena block's power-of-two
+      // padding (§4.6; the sub-file tail reads zero). Round the chunk's valid length up to this window's granule (the
+      // host page, or the negotiated FUSE_MAP_ALIGNMENT) and cap at the block, so a guest can never map a page lying
+      // entirely past the chunk's bytes. The guest maps window chunks (e.g. 2 MiB) that can extend past the chunk; the
+      // window beyond stays unmapped (a read there faults, which a guest does not do within the file). A request at or
+      // past the authorized window backs nothing: refused (the guest FUSE_READs it).
       let granule = placer.page().max(1);
       let authorized = mapping
         .file_len
         .div_ceil(granule)
         .saturating_mul(granule)
         .min(block_len);
-      // The guest maps DAX window chunks (e.g. 2 MiB) that can extend past a small file; map only the file's
-      // authorized pages (§4.6: a guest never maps a page lying entirely past its file), capping the requested
-      // length to what the file backs. The window beyond stays unmapped, so a read past EOF faults (which a guest
-      // does not do within the file). A chunk starting at or past the authorized window backs nothing: refused.
-      let (Ok(foffset), Ok(requested)) = (usize::try_from(m.foffset), usize::try_from(m.len)) else {
-        let _ = bridge.dax_unmap(&mapping, cx);
-        return err(dax_errno::EINVAL, out);
-      };
-      let Some(room) = authorized.checked_sub(foffset).filter(|room| *room > 0) else {
+      let Some(room) = authorized.checked_sub(intra).filter(|room| *room > 0) else {
         let _ = bridge.dax_unmap(&mapping, cx);
         return err(dax_errno::EINVAL, out);
       };
       let mapped_len = u64::try_from(requested.min(room)).unwrap_or(u64::MAX);
       let Some(object_off) = region_off
-        .checked_add(foffset)
+        .checked_add(intra)
         .and_then(|off| u64::try_from(off).ok())
       else {
         let _ = bridge.dax_unmap(&mapping, cx);

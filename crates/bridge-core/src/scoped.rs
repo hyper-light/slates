@@ -442,11 +442,12 @@ impl Bridge for ScopedBridge<'_> {
     object: ObjectId,
     cx: &OpContext,
     writable: bool,
+    file_offset: usize,
   ) -> Result<slates_vfs::dax::Mapping, VfsError> {
     // A scoped guest may map only an inode in its subtree: admit before the gate mints the window mapping, so a
     // DAX window never opens onto content outside the scope (the "one missing predicate per method" discipline).
     self.admit(object, cx)?;
-    self.inner.dax_map(object, cx, writable)
+    self.inner.dax_map(object, cx, writable, file_offset)
   }
 
   fn dax_unmap(

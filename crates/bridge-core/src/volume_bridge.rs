@@ -1448,6 +1448,7 @@ impl Bridge for VolumeBridge<'_> {
     object: ObjectId,
     cx: &OpContext,
     writable: bool,
+    file_offset: usize,
   ) -> Result<slates_vfs::dax::Mapping, VfsError> {
     // A writable mapping copies the block up, which is a write; a read mapping needs only read rights.
     if writable {
@@ -1460,7 +1461,7 @@ impl Bridge for VolumeBridge<'_> {
     let no = InodeNo(object.inode);
     // A directory is mapped as a flat read-only snapshot of its entries (metadata DAX, READDIR) — a guest reads the
     // directory through its own page table with no READDIR round-trip. A writable directory map is nonsensical
-    // (dirents are not written through DAX) and refused.
+    // (dirents are not written through DAX) and refused. `file_offset` does not apply to the materialized dir block.
     if self.volume.kind(self.store, no)? == Kind::Dir {
       if writable {
         return Err(VfsError::NotPermitted);
@@ -1468,9 +1469,12 @@ impl Bridge for VolumeBridge<'_> {
       return self.volume.dax_map_dir(self.store, no);
     }
     if writable {
+      // Writable DAX is the single-block (offset 0) path today; writable per-chunk is the gated follow-on.
       self.volume.dax_map_write(self.store, no)
     } else {
-      self.volume.dax_map_read(self.store, no)
+      // Read maps the OPEN chunk covering the guest's offset (the open tail of a multi-block file), refusing a
+      // sealed chunk so the guest FUSE_READs it — §4.6 "DAX maps the open frontier".
+      self.volume.dax_map_read_at(self.store, no, file_offset)
     }
   }
 

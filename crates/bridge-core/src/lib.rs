@@ -444,20 +444,24 @@ pub trait Bridge {
     Ok(object.inode == scope)
   }
 
-  /// Mint a DAX mapping of `object`'s single content block (§4.6 A-9, AC-4.12; `slates_vfs::dax`): the daemon
-  /// pins the arena block and registers the mapping, and the returned [`slates_vfs::dax::Mapping`] names the block
-  /// the virtio-fs device places in its DAX window (a `MAP_FIXED` of the content arena's memfd), so the guest
-  /// reaches the block through its own page table with no per-access daemon call. `writable` copies the block up
-  /// first (`Volume::dax_map_write`) so it is this version's alone. The default is *no DAX window on this
-  /// transport* — plain `/dev/fuse` and the scratch bridges never serve it — refused `SpecialFileOperation`
-  /// (EOPNOTSUPP); a transport advertises DAX in FUSE_INIT only when its bridge overrides this behind the gate.
+  /// Mint a DAX mapping of the **open chunk** of `object` covering `file_offset` (§4.6 A-9, AC-4.12,
+  /// "DAX maps the open frontier"; `slates_vfs::dax`): the daemon pins the arena block and registers the mapping, and
+  /// the returned [`slates_vfs::dax::Mapping`] names the block the virtio-fs device places in its DAX window (a
+  /// `MAP_FIXED` of the content arena's memfd, or a `SHMEM_MAP` to the front end), so the guest reaches the block
+  /// through its own page table with no per-access daemon call. A single-block file maps at `file_offset` 0; a
+  /// multi-block file maps the open tail covering `file_offset`, while a sealed chunk (ciphertext at rest) is refused
+  /// so the guest FUSE_READs that range. `writable` copies the block up first (`Volume::dax_map_write`) so it is this
+  /// version's alone. The default is *no DAX window on this transport* — plain `/dev/fuse` and the scratch bridges
+  /// never serve it — refused `SpecialFileOperation` (EOPNOTSUPP); a transport advertises DAX in FUSE_INIT only when
+  /// its bridge overrides this behind the gate.
   fn dax_map(
     &mut self,
     object: ObjectId,
     cx: &OpContext,
     writable: bool,
+    file_offset: usize,
   ) -> Result<slates_vfs::dax::Mapping, VfsError> {
-    let _ = (object, cx, writable);
+    let _ = (object, cx, writable, file_offset);
     Err(VfsError::SpecialFileOperation)
   }
 
