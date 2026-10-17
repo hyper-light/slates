@@ -99,9 +99,16 @@ pub struct Mapping {
   pub id: MappingId,
   /// The inode mapped (prefix-encoded, so its volume is `inode.prefix()`).
   pub inode: InodeNo,
+  /// The file offset where this mapping's block begins (§4.6 "DAX maps the open frontier"): `0` for a single-block
+  /// file, an inline/materialized block, or a whole-file map; the open chunk's file offset for a per-chunk map of a
+  /// multi-block file's open tail. A reader of the block at byte `b` is at file offset `block_file_start + b`, so the
+  /// device maps a guest `SETUPMAPPING` at file offset `foffset` from block byte `foffset - block_file_start`.
+  pub block_file_start: usize,
   /// The arena block holding the content — what the guest's page table points at. Pinned while this mapping lives.
   pub block: Block,
-  /// The file's authorized length: the bytes from here to the end of the block's pages read as zero.
+  /// The authorized length of this mapping's block: `file_len` bytes from `block_file_start`, with the bytes from
+  /// there to the end of the block's pages reading as zero. For a single-block file this is the file's length; for a
+  /// per-chunk map it is the open chunk's valid bytes.
   pub file_len: usize,
   /// Whether the guest may write these pages.
   pub writable: bool,
@@ -370,41 +377,62 @@ impl DaxRegistry {
   }
 }
 
-/// A file's content block and its authorized length (`attrs.size`). The gate maps single-block unsealed files
-/// (`Body::Open`), the shape a freshly written file takes.
-fn file_block(store: &Store, volume: &Volume, no: InodeNo) -> Result<(Block, usize), VfsError> {
-  let size = usize::try_from(volume.stat(store, no)?.size).map_err(|_| VfsError::NoSpace)?;
+/// The **open (plaintext) chunk** covering file offset `file_offset`, as `(block, block_file_start, valid_len)`
+/// (§4.6 "DAX maps the open frontier"). A `Body::Open` file holds exactly one open chunk over its sealed ones; this
+/// returns it when `file_offset` lands in it — `block_file_start` is the chunk's file offset (`0` for a single-block
+/// file, the open tail's offset for a multi-block file), `valid_len` its used bytes. A **sealed** chunk (ciphertext
+/// at rest, A-92/A-99), a hole past the open chunk, or a non-`Open` body is refused `Invalid`, so the caller falls
+/// back to FUSE_READ for that range. A guest's whole-page view of the returned block is scrubbed past `valid_len` by
+/// the caller.
+fn open_chunk_at(
+  store: &Store,
+  volume: &Volume,
+  no: InodeNo,
+  file_offset: usize,
+) -> Result<(Block, usize, usize), VfsError> {
   let inode = volume.inode(store, no)?;
-  match &inode.body {
-    Body::Open { open, sealed } if sealed.is_empty() => Ok((open.block, size)),
-    _ => Err(VfsError::Invalid),
+  let Body::Open { open, .. } = &inode.body else {
+    return Err(VfsError::Invalid);
+  };
+  let start = usize::try_from(open.off).map_err(|_| VfsError::NoSpace)?;
+  let len = usize::try_from(open.len).map_err(|_| VfsError::NoSpace)?;
+  if file_offset >= start && file_offset < start.saturating_add(len) {
+    Ok((open.block, start, len))
+  } else {
+    Err(VfsError::Invalid)
   }
 }
 
 impl Volume {
-  /// Maps inode `no`'s content into a guest window, **read-only** (§4.6). For a single-block file the arena block is
-  /// mapped directly and **pinned** (never reused or freed while mapped); every byte past the file's length is
-  /// scrubbed to zero, so the guest's whole-page view never reaches a truncate's leftover tail or a prior
-  /// allocation's bytes. An **inline** file (bytes kept in the inode, no content block) is materialized into a
-  /// throwaway block the mapping owns, as [`Volume::dax_map_dir`] does for a directory. Refused for a directory, a
-  /// sealed or multi-block file, or when the registry is at its bound.
-  pub fn dax_map_read(&mut self, store: &mut Store, no: InodeNo) -> Result<Mapping, VfsError> {
+  /// Maps the **open (plaintext) chunk** covering file offset `file_offset` into a guest window, **read-only** (§4.6
+  /// "DAX maps the open frontier"). The chunk's arena block is mapped directly and **pinned** (never reused, freed or
+  /// sealed while mapped — [`Volume::seal_pending`] defers the seal); every byte of the block past the chunk's valid
+  /// length is scrubbed to zero, so the guest's whole-page view never reaches a prior allocation's bytes or a sealed
+  /// neighbour. An **inline** file (bytes in the inode, no content block) is materialized at offset 0 into a throwaway
+  /// block the mapping owns, as [`Volume::dax_map_dir`] does. A **sealed** chunk (ciphertext at rest, A-92/A-99), a
+  /// hole, a directory, an attribute inode, or a full registry is refused — the caller falls back to FUSE_READ for
+  /// that range. A single-block file maps at offset 0 (the whole block); a multi-block file maps only its open tail.
+  pub fn dax_map_read_at(
+    &mut self,
+    store: &mut Store,
+    no: InodeNo,
+    file_offset: usize,
+  ) -> Result<Mapping, VfsError> {
     // Defence in depth for the device seam: a mapping is of a namespace object only, never an attribute
     // (xattr-value) inode — so a crafted or confused map of an attribute number is `NotFound`, never a window onto
     // an attribute's bytes, mirroring the transports' `namespace_inode` gate.
     self.namespace_inode(&*store, no)?;
-    // An inline file keeps its bytes in the inode with no content block to map; materialize them into a throwaway
-    // block the mapping owns, exactly as `dax_map_dir` does for a directory. `inline_bytes` is ~128 B, so the copy
-    // is negligible and there is no arena content to zero-copy — the single-block path below maps the arena block
-    // directly. The clone releases the store borrow before the mutable materialize.
+    // An inline file keeps its bytes in the inode with no content block; materialize them at offset 0 into a
+    // throwaway block the mapping owns, exactly as `dax_map_dir` does. The clone releases the store borrow before
+    // the mutable materialize.
     let inline = match &self.inode(&*store, no)?.body {
-      Body::Inline(bytes) => Some(bytes.clone()),
+      Body::Inline(bytes) if file_offset == 0 => Some(bytes.clone()),
       _ => None,
     };
     if let Some(bytes) = inline {
       return self.map_owned_block(store, no, &bytes);
     }
-    let (block, file_len) = file_block(&*store, self, no)?;
+    let (block, block_file_start, file_len) = open_chunk_at(&*store, self, no, file_offset)?;
     store.content.arena_mut().pin(block)?;
     if let Some(tail) = store
       .content
@@ -417,6 +445,7 @@ impl Volume {
     let mapping = Mapping {
       id: store.dax.mint_id(),
       inode: no,
+      block_file_start,
       block,
       file_len,
       writable: false,
@@ -430,6 +459,14 @@ impl Volume {
       return Err(refusal);
     }
     Ok(mapping)
+  }
+
+  /// Maps inode `no`'s content from offset 0 — the whole single block of a single-block file, or an inline file —
+  /// read-only ([`Volume::dax_map_read_at`]). The same-kernel local map (A-135) and the single-block callers use
+  /// this; the device maps per `SETUPMAPPING` offset through [`Volume::dax_map_read_at`], so a multi-block file's
+  /// open tail is reachable there while offset 0 (its sealed head) is refused to FUSE_READ.
+  pub fn dax_map_read(&mut self, store: &mut Store, no: InodeNo) -> Result<Mapping, VfsError> {
+    self.dax_map_read_at(store, no, 0)
   }
 
   /// Maps directory inode `no`'s entries into a guest window, **read-only**, as a flat guest-readable snapshot
@@ -518,6 +555,7 @@ impl Volume {
     let mapping = Mapping {
       id: store.dax.mint_id(),
       inode: no,
+      block_file_start: 0,
       block,
       file_len,
       writable: false,
@@ -553,7 +591,10 @@ impl Volume {
     self.read(&*store, no, 0, &mut current)?;
     // Force the copy-up through the write boundary. No mapping is registered yet, so this write revokes nothing.
     self.write(store, no, 0, &current)?;
-    let (block, file_len) = file_block(&*store, self, no)?;
+    // The copy-up made the file a single open block at offset 0 (a writable map of a multi-block file is refused
+    // here, as before — offset 0 is a sealed chunk once the file spans more than one). Writable per-chunk DAX is the
+    // gated follow-on; this stays the single-block writable path.
+    let (block, block_file_start, file_len) = open_chunk_at(&*store, self, no, 0)?;
     store.content.arena_mut().pin(block)?;
     if let Some(tail) = store
       .content
@@ -566,6 +607,7 @@ impl Volume {
     let mapping = Mapping {
       id: store.dax.mint_id(),
       inode: no,
+      block_file_start,
       block,
       file_len,
       writable: true,
@@ -642,6 +684,7 @@ impl Volume {
     let mapping = Mapping {
       id: store.dax.mint_id(),
       inode: old.inode,
+      block_file_start: old.block_file_start,
       block: new_block,
       file_len: old.file_len,
       writable: true,
@@ -675,8 +718,9 @@ impl Volume {
       return store.dax.is_live(mapping);
     }
     matches!(
-      file_block(store, self, mapping.inode),
-      Ok((block, file_len)) if block == mapping.block && file_len == mapping.file_len
+      open_chunk_at(store, self, mapping.inode, mapping.block_file_start),
+      Ok((block, start, file_len))
+        if block == mapping.block && start == mapping.block_file_start && file_len == mapping.file_len
     )
   }
 

@@ -1602,3 +1602,40 @@ fn the_idle_sweep_defers_sealing_a_mapped_block_until_it_is_unmapped() {
     "once unmapped, the sweep sealed the block (the deferral lifted)"
   );
 }
+
+/// §4.6 (the open-frontier gate). Do: write a file larger than one chunk (a sealed head chunk + an open tail), then
+/// map-read at an offset in the OPEN TAIL and at offset 0 (the SEALED head). Expect: the open tail maps (its block,
+/// `block_file_start` = the tail's file offset, reading its plaintext), while offset 0 is refused `Invalid` — a guest
+/// maps the open frontier zero-copy and FUSE_READs the sealed body.
+#[test]
+fn the_open_tail_of_a_multi_block_file_maps_and_the_sealed_head_is_refused() {
+  let mut store = store();
+  let mut volume = volume(&mut store, 1 << 24);
+  let chunk = store.content.chunk_bytes();
+  let root = volume.root_inode(&store).unwrap();
+  let no = volume.create_file_no(&mut store, root, "big", 0o644).unwrap();
+  // One full chunk + one page: a sealed head chunk [0, chunk) and an open tail [chunk, chunk + page).
+  let tail = DAX_PAGE;
+  volume
+    .write(&mut store, no, 0, &vec![0x33u8; chunk + tail])
+    .unwrap();
+
+  // Offset 0 is in the sealed head -> refused (the guest FUSE_READs that range).
+  assert!(
+    volume.dax_map_read_at(&mut store, no, 0).is_err(),
+    "the sealed head chunk is refused"
+  );
+  // An offset in the open tail -> mapped, at the tail's file offset.
+  let mapping = volume.dax_map_read_at(&mut store, no, chunk).unwrap();
+  assert_eq!(
+    mapping.block_file_start, chunk,
+    "the mapping begins at the open tail's file offset"
+  );
+  assert_eq!(mapping.file_len, tail, "the mapping's length is the open tail's bytes");
+  let got = volume.dax_read(&store, &mapping, 0, tail).unwrap();
+  assert!(
+    got.iter().all(|&b| b == 0x33),
+    "the open tail reads its plaintext: {:?}",
+    &got[..8]
+  );
+}
