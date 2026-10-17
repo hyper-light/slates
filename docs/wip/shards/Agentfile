@@ -1,0 +1,28 @@
+# syntax=ghcr.io/hyper-light/shards
+#
+# A shards microVM that applies a slates VFS over slates' NFS transport (§4.6). Build with
+# `shards build -f Agentfile -t slates-guest .`, run with `shards run slates-guest` (see demo.sh for
+# the full end-to-end, which runs the mount inline without a build). DAX is NOT available over NFS —
+# see README.md for the vhost-user-fs frontend shards would need for DAX.
+FROM alpine:3.22
+
+# The guest mounts over NFSv3; alpine's busybox mount needs the nfs helper.
+RUN apk add --no-cache nfs-utils
+
+# SLATES_PORT is the host-forwarded port that reaches slates' loopback NFS listener (demo.sh forwards
+# it). The host itself is the guest's default gateway, discovered at boot — no address is baked in.
+ENV SLATES_PORT=""
+
+# Mount slates at /slates, then hand off to the command. The gateway is the host; the mount options
+# are slates' loopback contract (vers=3, tcp, explicit port+mountport, no lock manager, soft).
+ENTRYPOINT ["/bin/sh", "-c", "set -e; \
+  gw=$(ip route 2>/dev/null | awk '/default/{print $3; exit}'); \
+  : \"${gw:?no default gateway — run with a network}\"; \
+  : \"${SLATES_PORT:?set -e SLATES_PORT=<forwarded port>}\"; \
+  mkdir -p /slates; \
+  mount -t nfs -o vers=3,tcp,port=${SLATES_PORT},mountport=${SLATES_PORT},nolock,soft,ro \
+        ${gw}:/ /slates; \
+  echo \"--- slates VFS mounted in a shards microVM (gateway ${gw}, port ${SLATES_PORT}) ---\"; \
+  ls -la /slates; \
+  exec \"$@\""]
+CMD ["cat", "/slates/hello.txt"]

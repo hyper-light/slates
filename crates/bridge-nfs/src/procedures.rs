@@ -1828,9 +1828,18 @@ impl<'b> Export<'b> {
     // times need ownership, the owner and group follow `_POSIX_CHOWN_RESTRICTED`, the size needs write
     // permission — refused typed (`PERM`/`ACCES`) before any effect. An allowed change carries the
     // set-id side effects a non-superuser's chown or chmod has (`crate::access`).
-    if let Some(denial) =
-      access::setattr_denial(&self.caller, &node, &changes, explicit_times, authority)
-    {
+    // A stateless (NFSv3) front end cannot tell ftruncate(fd) from truncate(path), so it trusts the owner
+    // for its own file's size (knfsd's rule); a stateful (NFSv4) front end tells them apart by the state id
+    // and decides strictly, which closes the truncate-laundering escape.
+    let owner_size_override = !self.dialect.carries_v4_attributes();
+    if let Some(denial) = access::setattr_denial(
+      &self.caller,
+      &node,
+      &changes,
+      explicit_times,
+      authority,
+      owner_size_override,
+    ) {
       return (status_of_denial(denial), self.unchanged(&node));
     }
     let changes = access::with_setid_side_effects(&self.caller, &node, changes);
@@ -2620,6 +2629,7 @@ impl<'b> Export<'b> {
         &post_changes,
         explicit_times,
         IoAuthority::Mode,
+        !self.dialect.carries_v4_attributes(),
       ) {
         return (
           status_of_denial(denial),
