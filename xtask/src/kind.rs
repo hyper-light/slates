@@ -1840,12 +1840,13 @@ impl Lane {
   fn owns_locally(&self, pod: &str, id: &str) -> Result<bool, Failure> {
     let listed = self.verb(pod, &["volume", "list"])?;
     if listed.code != 0 {
-      return Err(Failure(format!(
-        "kind: {pod} could not list its volumes: {}",
-        listed.stderr
-      )));
+      // A pod that cannot answer its own listing right now (mid-churn, restarting) has not been shown to own the
+      // volume: answer "no", never a hard failure. This is read inside a poll loop, where a transient refusal must
+      // be retried rather than end the wait.
+      return Ok(false);
     }
-    // Volume ids are long hex, so a listing that names this one names this volume.
+    // Volume ids are long hex, so a listing that names this one names this volume. `volume list --json` is an
+    // array of summaries carrying `"id":"<id>"` (`crates/cli/tests/cli.rs` json_list_has).
     Ok(listed.stdout.contains(id))
   }
 
