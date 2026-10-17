@@ -2864,6 +2864,39 @@ same-namespace host process is the first delivered case.
 > dirties the recovery image, adds re-seal churn) — built only if a read-only-large-file zero-copy workload asks for
 > it. (`GAPS.md`.)
 
+> **Amendment (2026-10-17): a live guest disproved the rule above; the backing is `reopen`-on-map with a learned
+> re-seal hold.** Rule (a) was taken to a real crosvm guest and failed on its central premise. A guest's single
+> `SETUPMAPPING` spans a whole DAX range (2 MiB at `FUSE_DAX_SHIFT`), **not one chunk**, so the device must back
+> *every* chunk in the requested range — an N-map loop with an N-ack park for the message-based placer, exactly what
+> (a) claimed to avoid. And a refused sealed chunk does not fall back politely: the guest's `dax=always` mmap
+> **SIGBUSes**, because the range it was promised is not backed. A sealed chunk inside a mapped range must therefore
+> be *backed*, not refused.
+>
+> Both candidate backings were built in full, on separate branches, and measured head to head (`BENCHMARKS.md`
+> 2026-10-17): the **view** (a decrypted read-only throwaway the mapping owns, the canonical chunk left ciphertext)
+> and **reopen** (the chunk's own representation transitioned sealed→open, decrypted in place, re-encrypted when the
+> window is gone — formerly the gated follow-on (b)). Both carry a live guest's multi-block mmap byte-for-byte.
+> Measured: the view costs **one byte of RAM per byte simultaneously mapped** (slope 1.0 over 256×), and a real guest
+> **fills its DAX cache exactly** (an 8 MiB cache gave an 8.000 MiB high-water, a 4 MiB cache 4.000 MiB), so the view's
+> cost is the whole advertised cache — 256 MiB at the harness's own setting, in a RAM-only system. Reopen costs no
+> mapped-set RAM; it pays one extra AES-GCM pass per chunk per cold cycle (+0.08–0.18 s per GiB streamed) and is ~8×
+> faster when the guest returns to a chunk it still holds plaintext. **Decision: reopen.** The view is recorded
+> measured-and-rejected.
+>
+> **The re-seal hold is learned, not chosen.** A reopened chunk must be re-encrypted once its window is gone, but
+> re-sealing a chunk the guest is about to ask for again pays an encrypt and a decrypt for nothing. Against a real
+> guest the revoke→remap interval moved **8× (67 ms to 537 ms) for one workload merely by changing the guest's DAX
+> cache**, so no fixed delay is right for every deployment. The volume therefore learns its own: the hold starts at
+> zero (re-seal as soon as the window drops) and grows by one sweep each time the gate catches a re-seal the guest
+> immediately undid, resetting when the volume goes quiescent so a new workload re-learns. The sweep is the hold's
+> clock, so it needs no timestamp. Its ceiling is derived, not picked: the idle sweep already leaves a write's bytes
+> in the clear for one to two ticks before sealing them, and a mapped read must not get a weaker at-rest guarantee
+> than an ordinary write, so the hold is capped at that same window (policy may lower it).
+>
+> **Cost, stated plainly.** A reopened chunk is plaintext at rest while a window pins it and for at most the learned
+> hold after — bounded, and never longer than a written chunk already waits to be sealed. One representation
+> throughout: no cache, no second copy, no coherence to owe.
+
 > **Status (virtio-fs, 2026-09-13).** The owned FUSE-over-virtio device exists
 > (`crates/bridge-virtiofs`) and the daemon serves it on the volume's owning shard
 > (`crates/server/src/virtiofs.rs`): the split virtqueue is walked sans-io over a bounded

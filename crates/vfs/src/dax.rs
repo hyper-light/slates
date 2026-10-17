@@ -224,6 +224,7 @@ impl DaxRegistry {
     }
   }
 
+
   /// Marks inode `no` revoke-pending for the device to munmap (§4.6 step 5), deduped so a burst of writes to one
   /// mapped inode enqueues it once. `writable_only` false (a write/truncate — every window stale) **supersedes** a
   /// prior true (a snapshot — writable windows only) for the same inode, since tearing all windows subsumes tearing
@@ -531,6 +532,11 @@ impl Volume {
       .and_then(|bytes| bytes.get_mut(file_len..))
     {
       tail.fill(0);
+    }
+    // Tell the learner: a chunk the sweep re-sealed inside the hold means the guest came back faster than the hold
+    // assumed, and the hold grows (§4.6, the learned re-seal hold).
+    if let crate::content::ExtentSrc::Chunk { chunk, .. } = extent.src {
+      self.note_dax_reopen(chunk.index());
     }
     self.mark_reseal(no);
     let mapping = Mapping {

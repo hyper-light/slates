@@ -47,8 +47,11 @@ mod linux {
   /// box. (A harness constant: `examples/` is exempt from the literal check; stated here so the wait is legible.)
   const BOOT_NS: u64 = 120_000_000_000;
 
-  /// The DAX cache window offered to the front end for the A/B (256 MiB); crosvm sizes the DAX BAR to this.
-  const DAX_REGION: u64 = 1 << 28;
+  /// The DAX cache window offered to the front end (8 MiB); crosvm sizes the DAX BAR to this. Deliberately small
+  /// for the learned-value measurement: the guest's working set must EXCEED its cache for the guest kernel to
+  /// reclaim mapping ranges, which is the only way a revoke→remap interval is ever produced. A 256 MiB cache with a
+  /// file that fits in a 512 MB VM never reclaims, so it would record no remap at all.
+  const DAX_REGION: u64 = 8 << 20;
 
   fn deadlines() -> Deadlines {
     Deadlines::derive(
@@ -88,7 +91,7 @@ mod linux {
     let id = client
       .create(&CreateSpec {
         name: "fs".to_owned(),
-        size: SizeClass::Bounded { limit: 1 << 20 },
+        size: SizeClass::Bounded { limit: 96 << 20 },
         names: NamePolicy::Exact,
         require_locked: false,
         base: None,

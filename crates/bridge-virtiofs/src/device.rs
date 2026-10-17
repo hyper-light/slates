@@ -1612,10 +1612,6 @@ fn map_chunk_at(
     let _ = bridge.dax_unmap(&mapping, cx);
     return MapStep::Refused(dax_errno::EINVAL);
   };
-  eprintln!(
-    "DAX-TRACE map cur={cur} start={} mapped_len={mapped_len} win_off={win_off}",
-    mapping.block_file_start
-  );
   let entry = DaxWindowEntry {
     moffset: win_off,
     len: mapped_len,

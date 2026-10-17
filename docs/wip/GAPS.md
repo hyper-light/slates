@@ -6315,3 +6315,33 @@ tests green (v4 suites 63/0, nfs_mount delegation subset 10/0); clippy `--all-ta
 **Owed:** the next metadata levers toward 2×-vs-tmpfs — GETATTR (still ~1/file in the baseline op mix) and SETATTR
 (~1/file, git's per-file mode/mtime) — profiled but not yet addressed; and the controlled best-of-N wall-clock for
 the delegation change.
+
+## DAX sealed-chunk backing decided by A/B; the re-seal hold is learned (§4.6, 2026-10-17)
+
+Rule (a) of the open-frontier decision — map only a file's one open chunk, refuse a sealed one to FUSE_READ — was
+taken to a live crosvm guest and failed. A guest's single `SETUPMAPPING` spans a whole DAX range, not one chunk, so
+the device must back every chunk in the range (an N-map loop, and for the message-based placer an N-ack park); and a
+refused sealed chunk SIGBUSes a `dax=always` mmap rather than falling back. Both candidate backings were then built
+in full on separate branches and measured head to head (`BENCHMARKS.md` 2026-10-17): the decrypt-**view** throwaway
+and **reopen**-in-place. Both carry a live guest's multi-block mmap byte-for-byte (`GUEST-MMAP-OK`).
+
+Measured: the view needs one byte of RAM per byte simultaneously mapped (slope 1.0 across 256×), and a real guest
+fills its DAX cache exactly (8 MiB cache → 8.000 MiB high-water; 4 MiB → 4.000 MiB), so its cost is the whole
+advertised cache — 256 MiB as the harness shipped. Reopen needs none, pays one extra AES-GCM pass per chunk per cold
+cycle (+0.08–0.18 s per GiB streamed), and is ~8× faster when the guest returns to a chunk still held plaintext.
+**Reopen lands; the view is recorded measured-and-rejected.**
+
+The re-seal hold is **learned**, because the measurement showed no fixed delay is right: the guest's revoke→remap
+interval moved 8× (67 ms to 537 ms) for one workload merely by changing its DAX cache. The volume starts at zero and
+grows the hold a sweep each time the gate catches a re-seal the guest immediately undid (`reseal_regret`, the
+non-vacuity counter), resetting on quiescence; the sweep is the hold's clock. Its ceiling is derived from the idle
+sweep's own aging — a mapped read must not be a weaker at-rest guarantee than an ordinary write — and policy may
+lower it.
+
+Green: vfs dax 48/0 (including the learned-hold and re-seal tests), vfs lib 43/0, bridge-virtiofs device 28/0, the
+recovery oracle 39/0 serial, clippy `--all-targets -D warnings` clean.
+
+**Owed:** the learned hold is proven by unit test but not yet re-measured end to end against the live guest (the run
+that produced the 67 ms/537 ms figures predates it), so the churn it removes in a real guest is modelled, not
+measured; the A/B timings were taken under load 16–17 (Mac) and 34 (box), so absolute figures are inflated and only
+the ratios and the contention-proof RAM relationship are firm; and DAX stays advertisement-gated.

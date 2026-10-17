@@ -398,6 +398,28 @@ pub struct Volume {
   /// a time once the mapping is gone ([`Volume::reseal_cold`]); so content is plaintext at rest only while a guest maps
   /// it. Empty in production while DAX is unadvertised.
   pub(crate) reseal_pending: std::collections::BTreeSet<InodeNo>,
+  /// How many consecutive idle sweeps a reopened chunk must sit unmapped before the sweep re-seals it (§4.6).
+  /// **Learned, not chosen**: it starts at zero (re-seal as soon as the window is gone) and grows by one each time the
+  /// gate catches a re-seal it should not have made — a chunk re-opened because the guest came back inside the hold,
+  /// which pays an encrypt and a decrypt for nothing. Measured against a real guest kernel, the revoke→remap interval
+  /// moved 8× (67 ms to 537 ms) for one workload merely by changing the guest's DAX cache, so no fixed figure is
+  /// right for every deployment and the volume learns its own. Reset to zero when the volume goes quiescent, so a new
+  /// workload re-learns rather than inheriting.
+  pub(crate) reseal_hold_sweeps: u32,
+  /// The ceiling on [`Volume::reseal_hold_sweeps`], whatever the learner asks for.
+  /// Derived: the idle sweep already leaves a file's written bytes in the clear for one to two ticks before sealing
+  /// them ([`Volume::age_writes`]), so holding DAX-reopened plaintext longer than that would make a mapped read a
+  /// weaker at-rest guarantee than an ordinary write. Two sweeps, the same window, unless policy lowers it.
+  pub(crate) reseal_hold_cap_sweeps: u32,
+  /// Consecutive sweeps each reopened chunk has been seen unmapped, by chunk slab index: the sweep is its own clock,
+  /// so the hold needs no timestamp. Bounded by the chunks a volume has reopened.
+  pub(crate) cold_sweeps: std::collections::BTreeMap<u32, u32>,
+  /// Chunks the sweep re-sealed and the tick it did, so the gate can recognise a re-seal the guest immediately undid.
+  /// Pruned every sweep to the hold's own window, so it holds only what the learner can still act on.
+  pub(crate) resealed_at: std::collections::BTreeMap<u32, u64>,
+  /// Re-seals the gate caught as premature — the non-vacuity counter of the learned hold: a test asserts it moved, so
+  /// a learner that never learns cannot pass for one that does.
+  pub(crate) reseal_regret: u64,
   pub(crate) state: VolumeState,
   pub(crate) destroy_queue: Vec<Dead>,
   /// Open and lookup references per inode number (§4.6 lifetime; the inode-addressed-io design):
@@ -649,6 +671,11 @@ impl Volume {
       sweep_tick: 0,
       idle_pending: std::collections::BTreeSet::new(),
       reseal_pending: std::collections::BTreeSet::new(),
+      reseal_hold_sweeps: 0,
+      reseal_hold_cap_sweeps: Volume::WRITE_PLAINTEXT_SWEEPS,
+      cold_sweeps: std::collections::BTreeMap::new(),
+      resealed_at: std::collections::BTreeMap::new(),
+      reseal_regret: 0,
       state: VolumeState::Live,
       destroy_queue: Vec::new(),
       references: BTreeMap::new(),
@@ -724,6 +751,11 @@ impl Volume {
       sweep_tick: 0,
       idle_pending: std::collections::BTreeSet::new(),
       reseal_pending: std::collections::BTreeSet::new(),
+      reseal_hold_sweeps: 0,
+      reseal_hold_cap_sweeps: Volume::WRITE_PLAINTEXT_SWEEPS,
+      cold_sweeps: std::collections::BTreeMap::new(),
+      resealed_at: std::collections::BTreeMap::new(),
+      reseal_regret: 0,
       state: VolumeState::Live,
       destroy_queue: Vec::new(),
       references: BTreeMap::new(),
@@ -819,6 +851,11 @@ impl Volume {
       sweep_tick: 0,
       idle_pending: std::collections::BTreeSet::new(),
       reseal_pending: std::collections::BTreeSet::new(),
+      reseal_hold_sweeps: 0,
+      reseal_hold_cap_sweeps: Volume::WRITE_PLAINTEXT_SWEEPS,
+      cold_sweeps: std::collections::BTreeMap::new(),
+      resealed_at: std::collections::BTreeMap::new(),
+      reseal_regret: 0,
       state: VolumeState::Live,
       destroy_queue: Vec::new(),
       references: BTreeMap::new(),
@@ -1191,6 +1228,12 @@ impl Volume {
     sweep
   }
 
+  /// The sweeps a write's bytes may sit in the clear before the idle sweep seals them: a file is swept once its last
+  /// write is older than the previous tick, so one to two ticks pass between the write and its seal
+  /// ([`Volume::age_writes`]). It is the ceiling on how long a DAX-reopened chunk may be held plaintext, so a mapped
+  /// read never gets a weaker at-rest guarantee than an ordinary write.
+  const WRITE_PLAINTEXT_SWEEPS: u32 = 2;
+
   /// Advances the idle sweep's tick (A-99): every file last written before the previous tick, and not since, is due a
   /// seal. A file whose last write is one to two ticks old is sealed, as ZFS commits dirty data each transaction group
   /// and Linux writes back a dirty page once it has aged (`dirty_expire_centisecs`); a later append reopens the chunk,
@@ -1300,6 +1343,38 @@ impl Volume {
     Ok(bytes)
   }
 
+  /// Records that the gate reopened the chunk in slab slot `chunk` for a DAX map (§4.6), and **learns** from it: if
+  /// the sweep re-sealed that very chunk within the current hold, the guest came back faster than the hold assumed,
+  /// so that encrypt and this decrypt were both avoidable and the hold grows by one sweep (never past the derived
+  /// cap). A chunk being mapped is no longer cold, so its unmapped-sweep count is dropped.
+  pub(crate) fn note_dax_reopen(&mut self, chunk: u32) {
+    self.cold_sweeps.remove(&chunk);
+    let Some(sealed_at) = self.resealed_at.remove(&chunk) else {
+      return;
+    };
+    let since = self.sweep_tick.saturating_sub(sealed_at);
+    if since <= u64::from(self.reseal_hold_sweeps.saturating_add(1)) {
+      self.reseal_regret = self.reseal_regret.saturating_add(1);
+      self.reseal_hold_sweeps = self
+        .reseal_hold_sweeps
+        .saturating_add(1)
+        .min(self.reseal_hold_cap_sweeps);
+    }
+  }
+
+  /// The learned hold, in sweeps, and the premature re-seals that taught it (§4.6) — what a test asserts moved.
+  pub const fn reseal_hold(&self) -> (u32, u64) {
+    (self.reseal_hold_sweeps, self.reseal_regret)
+  }
+
+  /// Lowers the ceiling on the learned hold (§4.6): how many sweeps a DAX-reopened chunk may stay plaintext after its
+  /// window is gone. Policy, not performance — an operator trading at-rest exposure for the re-seal churn the hold
+  /// avoids. Never raised past the derived default ([`Volume::WRITE_PLAINTEXT_SWEEPS`]).
+  pub fn set_plaintext_hold_cap(&mut self, sweeps: u32) {
+    self.reseal_hold_cap_sweeps = sweeps.min(Self::WRITE_PLAINTEXT_SWEEPS);
+    self.reseal_hold_sweeps = self.reseal_hold_sweeps.min(self.reseal_hold_cap_sweeps);
+  }
+
   /// Marks inode `no` for re-seal (§4.6 DAX open frontier, the REOPEN arm): a chunk of it was reopened in place for a
   /// DAX map and must be re-encrypted once its window is gone. [`Volume::reseal_cold`] does it on the idle sweep.
   pub(crate) fn mark_reseal(&mut self, no: InodeNo) {
@@ -1330,6 +1405,17 @@ impl Volume {
     }
     for no in deferred {
       self.reseal_pending.insert(no);
+    }
+    // Keep only the re-seals the learner can still act on: a regret is a re-open within the hold's own window.
+    let window = u64::from(self.reseal_hold_sweeps.saturating_add(2));
+    let tick = self.sweep_tick;
+    self
+      .resealed_at
+      .retain(|_, at| tick.saturating_sub(*at) <= window);
+    // Quiescent: nothing reopened and nothing waiting, so the next workload learns its own hold rather than
+    // inheriting one measured against a different access pattern.
+    if self.reseal_pending.is_empty() && self.cold_sweeps.is_empty() {
+      self.reseal_hold_sweeps = 0;
     }
     resealed_bytes
   }
@@ -1368,13 +1454,31 @@ impl Volume {
     }
     let mut resealed = 0u64;
     let mut incomplete = false;
+    let hold = self.reseal_hold_sweeps;
+    let tick = self.sweep_tick;
     for (chunk, pinned, len) in targets {
+      let slot = chunk.index();
+      // A mapped chunk is not cold at all: the window still reads it, and sealing under a live window would hand the
+      // guest ciphertext (the pin-defers-seal rule).
       if pinned {
+        self.cold_sweeps.remove(&slot);
+        incomplete = true;
+        continue;
+      }
+      // The sweep is the hold's clock: a chunk must be seen unmapped for more sweeps than the learned hold before it
+      // is re-encrypted, so a guest that comes back quickly finds its plaintext still there.
+      let seen = self.cold_sweeps.entry(slot).or_insert(0);
+      *seen = seen.saturating_add(1);
+      if *seen <= hold {
         incomplete = true;
         continue;
       }
       match store.content.reseal(chunk, key) {
-        Ok(()) => resealed = resealed.saturating_add(len),
+        Ok(()) => {
+          resealed = resealed.saturating_add(len);
+          self.cold_sweeps.remove(&slot);
+          self.resealed_at.insert(slot, tick);
+        }
         Err(_) => incomplete = true,
       }
     }

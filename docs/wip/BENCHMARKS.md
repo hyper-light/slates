@@ -5489,3 +5489,75 @@ slates serves from RAM. This is the honest real-use picture: slates holds up (by
 beats the directly-comparable competitor, while the micro-op gap vs *in-kernel* overlayfs is real but mostly
 invisible to real workloads — and is what the DAX data path (measured separately above) removes entirely once
 its device window is wired behind a KVM-capable host.
+
+## DAX sealed-chunk backing: view versus reopen, and the learned hold (2026-10-17)
+
+A sealed chunk (ciphertext at rest, A-92/A-99) cannot be mapped into a guest's DAX window as it stands — the guest's
+MMU would read ciphertext, and refusing the SETUPMAPPING SIGBUSes a `dax=always` mmap. Two arms were built in full,
+each on its own branch, and measured head to head (§4.6):
+
+- **view** (`writable-dax-view`): back the chunk with a decrypted read-only throwaway the mapping owns; the canonical
+  chunk stays ciphertext and the copy is freed on revoke.
+- **reopen** (`writable-dax-reopen`): transition the chunk's own representation sealed→open — decrypt it in place, map
+  its own block, and re-encrypt it once the window is gone.
+
+Both are correct: each carries a live crosvm guest's mmap of a 192 KiB multi-block file byte-for-byte
+(`GUEST-MMAP-OK`), with the N-map loop backing all three chunks of the one SETUPMAPPING.
+
+Environment (in-process arms): Apple M5 Max, 128 GiB, macOS 26.4.1, Rust 1.98.0, release. **Load average 16.4–16.9
+throughout, another session's VM at 451% CPU** — not a quiet machine, so the two arms were built to separate binaries
+up front and run **alternately**, and each data point gets a fresh store, volume and sealed file.
+Command: `cargo run --release -p slates-vfs --example dax_backing_ab` on each branch, best of 3, all runs shown.
+
+### The memory relationship (contention-proof: a count, not a timing)
+
+Streaming a 64 MiB sealed file while varying the simultaneously-mapped bytes:
+
+| simultaneously mapped | view extra RAM | reopen extra RAM |
+|---|---|---|
+| 0.25 MiB | 0.25 MiB | 0.00 |
+| 1 MiB | 1.00 MiB | 0.00 |
+| 2 MiB | 2.00 MiB | 0.00 |
+| 8 MiB | 8.00 MiB | 0.00 |
+| 32 MiB | 32.00 MiB | 0.00 |
+| 64 MiB | 64.00 MiB | 0.00 |
+
+Slope exactly 1.0 over 256×: **view costs one byte of RAM per byte simultaneously mapped**; reopen costs none.
+
+### What a real guest actually maps, and how soon it comes back
+
+Environment: bare-metal x86_64, kernel 7.2.9-cachyos, crosvm, 512 MB guest, 4 KiB pages. **Load average 34** (shared
+box). Command: `crosvm_dax_ab` harness with the guest writing a 32 MiB file — four times its DAX cache, so the guest
+kernel must reclaim mapping ranges — then reading every byte twice through one mmap.
+
+| advertised DAX cache | live-mapped high-water | remaps observed | revoke→remap p99 |
+|---|---|---|---|
+| 8 MiB | **8.000 MiB** | 522 | **67 ms** |
+| 4 MiB | **4.000 MiB** | 541 | **537 ms** |
+
+Two readings, two conclusions. First, the guest fills its cache and holds it full, so **view's extra RAM is the DAX
+cache slates advertises** — at the 256 MiB cache the harness shipped with, +256 MiB of RAM in a RAM-only system.
+Second, the interval after which a guest asks for a reclaimed chunk again moved **8×** for one workload merely by
+changing the cache, so no fixed re-seal delay is right: it is learned per volume (§4.6).
+
+### Timings (interleaved, isolated, load recorded)
+
+| workload (64 MiB streamed, or 2 MiB re-read ×20) | view | reopen |
+|---|---|---|
+| stream once | 0.020–0.022 s | 0.025–0.033 s |
+| re-read, guest returns inside the hold | 0.012–0.017 s | **0.001–0.002 s** |
+| re-read, re-sealed between | 0.013–0.014 s | 0.015–0.023 s |
+
+Reopen is ~8× on a returning guest (the re-map is a bare pin, no crypto) and costs +0.08–0.18 s per GiB on a
+one-shot stream (one extra AES-GCM pass per chunk). With the hold learned, the middle row is the common case for a
+guest whose reclaim brings it back, which the live measurement shows it does.
+
+**Measured and rejected: the decrypt-view throwaway.** It is faster on a one-shot stream and has a cheap teardown,
+but it needs one byte of RAM per mapped byte with no amortisation, and the live guest shows that means the whole
+advertised DAX cache. Reopen holds one representation, costs no mapped-set RAM, and its only penalty — the re-encrypt
+— is removed exactly when the guest returns quickly, by a hold learned from that guest's own behaviour.
+
+**Correction on record.** The first numbers taken for this comparison were wrong and were withdrawn: all workloads
+shared one store (later measurements inherited earlier arena churn), load was not recorded, and the arms were not
+interleaved. That overstated view's streaming win by about 2× and understated reopen's returning-guest win by about
+2×. The tables above are the re-measurement under the stated discipline.

@@ -1647,6 +1647,49 @@ fn the_open_tail_maps_directly_and_the_sealed_head_is_reopened_in_place() {
   assert!(all_bytes(&head_bytes, 0x33), "the reopened head reads its plaintext");
 }
 
+/// §4.6 the LEARNED re-seal hold. Do: map a sealed chunk (reopening it), revoke it and sweep — which re-seals it at
+/// the starting hold of zero — then map it again straight away, so the guest came back inside the hold. Expect: the
+/// gate counts that re-seal as premature and the hold grows by one sweep; and with the hold learned, a later revoke
+/// plus one sweep leaves the chunk reopened (plaintext, ready for the guest's return) instead of re-encrypting it,
+/// while a further sweep past the hold does re-seal it. Measured against a real guest kernel the revoke→remap
+/// interval moved 8x with the guest's cache size, which is why this is learned rather than fixed.
+#[test]
+fn the_reseal_hold_is_learned_from_a_guest_that_comes_back() {
+  let mut store = store();
+  store.content.set_cipher(Box::new(XorSealCipher));
+  let mut volume = volume(&mut store, 1 << 24);
+  let (no, _chunk, _tail) = sealed_head_open_tail(&mut store, &mut volume);
+  assert_eq!(volume.reseal_hold(), (0, 0), "nothing learned yet");
+
+  // At hold zero the sweep re-seals as soon as the window is gone.
+  let first = volume.dax_map_read_at(&mut store, no, 0).unwrap();
+  assert!(store.dax_revoke(&first), "the first window is revoked");
+  volume.seal_idle(&mut store, u64::MAX);
+  assert!(!volume.dax_still_current(&store, &first), "re-sealed at hold zero");
+
+  // The guest comes straight back: that encrypt and this decrypt were both avoidable, and the volume learns.
+  let second = volume.dax_map_read_at(&mut store, no, 0).unwrap();
+  assert_eq!(
+    volume.reseal_hold(),
+    (1, 1),
+    "the premature re-seal is counted and the hold grew a sweep"
+  );
+
+  // With the hold learned, one sweep after the revoke no longer re-encrypts.
+  assert!(store.dax_revoke(&second), "the second window is revoked");
+  volume.seal_idle(&mut store, u64::MAX);
+  assert!(
+    volume.dax_still_current(&store, &second),
+    "held plaintext through one sweep for the guest's return"
+  );
+  // Held, not abandoned: the sweep past the hold re-seals it.
+  volume.seal_idle(&mut store, u64::MAX);
+  assert!(
+    !volume.dax_still_current(&store, &second),
+    "re-sealed once the hold passed"
+  );
+}
+
 /// §4.6 REOPEN arm (A/B vs view), the cold transition. Do: reopen a sealed head chunk for a DAX map, then revoke the
 /// map and run the idle sweep. Expect: while mapped the reopened chunk is current; once the map is revoked (the block
 /// unpins) the sweep RE-SEALS it (ciphertext at rest again), so the stale mapping no longer validates — the guest
