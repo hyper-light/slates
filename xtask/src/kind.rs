@@ -1709,12 +1709,12 @@ impl Lane {
       .map(|index| self.pod(index))
       .filter(|pod| pod != &owner)
       .collect();
+    // Before the takeover no survivor may OWN the volume. It may well answer `volume stat <id>` — that is routed to
+    // the live owner (§4.8 "Lookup") and answering it is correct — so ownership is read from the pod's own listing.
     for survivor in &survivors {
-      let stat = self.verb(survivor, &["volume", "stat", &id])?;
-      if stat.code == 0 {
+      if self.owns_locally(survivor, &id)? {
         return Err(Failure(format!(
-          "kind: a holder must not serve the owner's volume before the takeover: {survivor} answered {}",
-          stat.stdout
+          "kind: a holder must not own the owner's volume before the takeover: {survivor} lists it"
         )));
       }
     }
@@ -1826,6 +1826,29 @@ impl Lane {
   /// Polls the survivors' `volume stat` until one serves the volume placed; returns it and the time since
   /// `since`. On the bound, `diagnosed` (every pod, the replacement included) is reported with
   /// [`Lane::fleet_diagnostics`].
+  /// Whether `pod`'s **own** listing holds `id` — the ownership gate of this lane.
+  ///
+  /// `volume stat <id>` is NOT that gate. A by-id lookup is routed to the volume's owner (§4.8 "Lookup":
+  /// `serve_here` forwards a volume another host owns), so every pod answers it exit 0 whoever owns the volume.
+  /// `volume list` is answered from the pod's own partitions (`verbs::list` reads `state.db.partition()`, scattered
+  /// across this node's shards only), so the id appears there exactly on the node that holds it as owner.
+  ///
+  /// The lane used to read `stat`'s exit code instead, which worked only while a holder wrongly answered `NotFound`
+  /// for an object it held — the false-absence bug fixed in `b72c354a` ("a held copy is not an absent object"). Once
+  /// that was fixed, the old gate called every pod a successor and the pre-takeover check failed on correct
+  /// forwarding, so the lane now asks the question it actually means.
+  fn owns_locally(&self, pod: &str, id: &str) -> Result<bool, Failure> {
+    let listed = self.verb(pod, &["volume", "list"])?;
+    if listed.code != 0 {
+      return Err(Failure(format!(
+        "kind: {pod} could not list its volumes: {}",
+        listed.stderr
+      )));
+    }
+    // Volume ids are long hex, so a listing that names this one names this volume.
+    Ok(listed.stdout.contains(id))
+  }
+
   fn wait_successor(
     &self,
     survivors: &[String],
@@ -1835,13 +1858,12 @@ impl Lane {
   ) -> Result<(String, Duration), Failure> {
     loop {
       for survivor in survivors {
-        let stat = self.verb(survivor, &["volume", "stat", id])?;
-        // The successor **serves** the volume when `volume stat` answers exit 0 (a holder that has not
-        // taken it over refuses `NotFound`, exit 1). `volume stat`'s `placed` is an object
-        // (`{"region": true, ...}`) or null — the region-placement of the re-served head — not a bare
-        // bool, so it is read for the record, not as the serve gate (the gate is that the volume exists
-        // on this node at all).
-        if stat.code == 0 {
+        // The successor **serves** the volume when it holds it as owner — read from its own listing
+        // ([`Self::owns_locally`]). `volume stat`'s exit code cannot be the gate: a by-id lookup is forwarded to
+        // the owner, so every pod answers it exit 0 even before any takeover, which would call the first pod
+        // asked a successor and make this wait prove nothing.
+        if self.owns_locally(survivor, id)? {
+          let stat = self.verb(survivor, &["volume", "stat", id])?;
           let answer: serde_json::Value = serde_json::from_str(&stat.stdout).unwrap_or_default();
           let region_placed = answer
             .get("placed")
@@ -1862,9 +1884,14 @@ impl Lane {
         // asked `status <id>` of the daemon, which answers `NotFound` for the volume, not its counters.
         let mut why = String::new();
         for survivor in survivors {
+          // Both are named: the listing is the ownership gate this wait is on, and the by-id answer shows whether
+          // the volume is reachable at all (it is forwarded to the owner while one lives).
+          let owns = self
+            .owns_locally(survivor, id)
+            .map_or_else(|e| e.0, |owns| owns.to_string());
           let stat = self.verb(survivor, &["volume", "stat", id]);
           why.push_str(&format!(
-            "\n  {survivor}: volume stat -> {}",
+            "\n  {survivor}: owns it (own listing) -> {owns}; volume stat -> {}",
             stat.map_or_else(|e| e.0, |o| format!("exit {}: {}", o.code, o.stderr.trim())),
           ));
         }
