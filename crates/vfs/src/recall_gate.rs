@@ -149,6 +149,25 @@ impl RecallGate {
     held
   }
 
+  /// Asks for the recall of every delegation held on inode `no` — the acting client's own included — because a
+  /// `chmod`/`chown` has left the file in a mode where some permission class cannot write. A write delegation lets
+  /// its holder client serve any of its users' I/O locally; once a class cannot write, the client can flush a
+  /// truncate for a user of that class (whose own open would be refused) under a holder identity of a class that
+  /// can — the NFSv4 truncate-laundering escape (a read-only owner's `O_RDONLY|O_TRUNC` flushed through an `other`
+  /// holder of a 0477 file, or a group member's through an `other` holder of a 0747 file). Recalling forces the
+  /// client to re-establish its opens, after which the acting user's own class is checked fresh and the forbidden
+  /// truncate is refused. Unlike a conflicting change ([`RecallGate::recall`] via `act_as`) it does not exclude the
+  /// acting client (the escape's delegation is the actor's own); like [`Self::recall_volume`] it is not a refused
+  /// change, so the refusal count does not move (RFC 8881 §10.4.4: recall on need, always safe). Whether any was
+  /// held.
+  pub fn recall_on_write_restricted(&mut self, no: u64) -> bool {
+    let held = self.delegated.contains_key(&no);
+    if held {
+      self.requested.insert((no, None));
+    }
+    held
+  }
+
   /// The inodes, each with the actor of the change refused on it, whose recall was asked for since the last call.
   pub fn take_requested(&mut self) -> Vec<(u64, Option<u64>)> {
     std::mem::take(&mut self.requested).into_iter().collect()

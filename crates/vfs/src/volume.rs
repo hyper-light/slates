@@ -36,6 +36,12 @@ const ROOT_MODE: u32 = 0o755;
 /// Format: POSIX symlink mode bits are always `rwxrwxrwx`; the bits of a symlink are unused.
 const SYMLINK_MODE: u32 = 0o777;
 
+/// Format: the three POSIX write bits (owner `S_IWUSR`, group `S_IWGRP`, other `S_IWOTH`). A mode that does
+/// not set all three leaves some class unable to write — so a user of that class cannot truncate the file,
+/// and a write delegation held on it could launder that user's forbidden truncate through a holder of a
+/// class that can (the NFSv4 truncate escape; see `chmod`/`chown`).
+const ALL_WRITE_BITS: u32 = 0o222;
+
 /// Format: the most snapshot slots a volume can hold, the slot field of a handle (`u32`).
 const SNAPSHOT_SLOT_CAP: usize = u32::MAX as usize;
 
@@ -2660,6 +2666,12 @@ impl Volume {
     inode.attrs.mode = mode;
     inode.stamp_change(now);
     self.record(Op::Setattr, "", Some(no), prev);
+    // A mode where some class cannot write lets a write delegation launder that class's forbidden truncate:
+    // recall the file's write delegations so the next truncate is re-checked as the acting user, not the
+    // holder (the NFSv4 escape; RFC 8881 §10.4.4 recall-on-need).
+    if mode & ALL_WRITE_BITS != ALL_WRITE_BITS {
+      store.recall_gate.recall_on_write_restricted(no.0);
+    }
     Ok(())
   }
 
@@ -2682,7 +2694,13 @@ impl Volume {
     inode.attrs.uid = uid;
     inode.attrs.gid = gid;
     inode.stamp_change(now);
+    let write_restricted = inode.attrs.mode & ALL_WRITE_BITS != ALL_WRITE_BITS;
     self.record(Op::Setattr, "", Some(no), prev);
+    // A chown re-sorts the file's users across the mode's classes; if some class cannot write, a still-held write
+    // delegation could launder a truncate for a user that class forbids, so recall them (as `chmod` does).
+    if write_restricted {
+      store.recall_gate.recall_on_write_restricted(no.0);
+    }
     Ok(())
   }
 

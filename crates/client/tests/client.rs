@@ -11,7 +11,7 @@
   clippy::panic_in_result_fn
 )]
 
-use std::sync::OnceLock;
+use std::sync::{LazyLock, OnceLock};
 use std::time::{Duration, Instant};
 
 use slates_anchor::AnchorSegment;
@@ -1057,16 +1057,46 @@ fn a_restarted_daemon_adopts_its_anchors_sealing_root_and_a_fresh_anchor_mints_a
   );
 }
 
-/// Shape: how long the successor's held shard spends starting: far past [`SHORT_REPLY_NS`], well inside the
-/// reconnect budget.
-const LONG_RECOVERY_NS: u64 = 300_000_000;
-/// Shape: a reply deadline below a restarted daemon's boot, standing for a recovery longer than the anchor's liveness
-/// budget.
-const SHORT_REPLY_NS: u64 = 1_000_000;
+/// A slow CI lane (a loaded shared runner, or ThreadSanitizer's 10–20× slowdown) publishes a restarted daemon's
+/// bootstrap stamp far later than this developer machine does. The restart here runs an *in-process* test daemon, so
+/// its `stop` cannot fire the client's process-exit watch (the daemon is this very process); the client learns the
+/// daemon is gone only once the successor republishes the stamp (`daemon_gone` = the exit watch OR a changed start
+/// stamp). With a 1 ms reply deadline this raced the publish and the client reported `Stalled { after_ns: 1_000_000 }`
+/// instead of awaiting the restart (CI macOS `Test` + TSan lanes, run 38537130473). `SLATES_TEST_RESTART_SLOWDOWN`
+/// (an integer ≥ 1, default 1) scales every restart timing together so a slow lane gives the publish room; the
+/// invariant the test rests on holds at any scale — publish ≪ reply ≪ recovery ≪ reconnect budget.
+static RESTART_SLOWDOWN: LazyLock<u64> = LazyLock::new(|| {
+  std::env::var("SLATES_TEST_RESTART_SLOWDOWN")
+    .ok()
+    .and_then(|value| value.parse::<u64>().ok())
+    .filter(|&n| n >= 1)
+    .unwrap_or(1)
+});
+
+/// The reply deadline in the slow-restart test: short enough that it fires well before the restart finishes (so the
+/// test proves the client awaits the *restart*, not the reply deadline), yet — scaled for a slow lane — long enough
+/// that the successor has republished its stamp before the deadline fires. Base 20 ms.
+fn short_reply_ns() -> u64 {
+  20_000_000u64.saturating_mul(*RESTART_SLOWDOWN)
+}
+
+/// How long the successor's held shard spends starting: far past the reply deadline (15×), well inside the reconnect
+/// budget (a long recovery). Base 300 ms.
+fn long_recovery_ns() -> u64 {
+  300_000_000u64.saturating_mul(*RESTART_SLOWDOWN)
+}
+
+/// The client's reconnect budget in this test: well past the recovery time (10×) so a slow restart is awaited, not
+/// judged stalled. Base 3 s. Scaled with the rest so a slow lane's longer recovery still fits inside it (the product
+/// derives `reconnect_ns` from the recovery and liveness budgets, `Deadlines::derive`; this test fixes the ratio and
+/// scales it, since its in-process daemon makes the wall-clock, not the formula, the thing under test here).
+fn reconnect_budget_ns() -> u64 {
+  3_000_000_000u64.saturating_mul(*RESTART_SLOWDOWN)
+}
 
 /// One crossing of a restart: a volume made, the daemon stopped, a successor whose shard `partition` takes
-/// [`LONG_RECOVERY_NS`] to start (as a long recovery does), and a status asked meanwhile by a client whose reply
-/// deadline is [`SHORT_REPLY_NS`]; the status, the client's reconnect count, and how long the call took.
+/// [`long_recovery_ns`] to start (as a long recovery does), and a status asked meanwhile by a client whose reply
+/// deadline ([`short_reply_ns`]) is shorter; the status, the client's reconnect count, and how long the call took.
 fn status_across_a_slow_restart(
   partition: u16,
 ) -> (
@@ -1086,8 +1116,8 @@ fn status_across_a_slow_restart(
   // only the call that crosses it.
   let volume = connect(&instance).create(&scratch("first-answer")).unwrap();
   let short = Deadlines {
-    reply_ns: SHORT_REPLY_NS,
-    ..deadlines()
+    reply_ns: short_reply_ns(),
+    reconnect_ns: reconnect_budget_ns(),
   };
   let mut client = Client::connect(&instance, short).unwrap();
   first.stop();
@@ -1103,7 +1133,7 @@ fn status_across_a_slow_restart(
     .with_boot_fault(slates_server::config::BootFault {
       partition,
       kind: slates_server::config::BootFaultKind::Busy,
-      for_ns: LONG_RECOVERY_NS,
+      for_ns: long_recovery_ns(),
     });
   let second = start_over(&profile, &slow, &segment);
   let crossed = asking.join().unwrap();
@@ -1113,7 +1143,7 @@ fn status_across_a_slow_restart(
 
 /// §4.7 (`Deadlines::derive`: the reconnect budget is "the recovery budget the restart is bounded by, plus one reply
 /// deadline for the restarted daemon's first answer"). Do: for each shard in turn, restart the daemon with that
-/// shard's start held busy [`LONG_RECOVERY_NS`] while a client whose reply deadline is shorter asks for a volume's
+/// shard's start held busy [`long_recovery_ns`] while a client whose reply deadline is shorter asks for a volume's
 /// status. Expect: the status answers each time, and the call crossed the restart. The successor opens its rendezvous
 /// while its shards still start (`Daemon::start` spawns their starts and opens the listener behind them), so this pins
 /// that a client's reconnect is not complete until a slow shard has started: a recovering daemon is waited for under
@@ -1134,7 +1164,7 @@ fn a_restarted_daemons_first_answer_is_awaited_for_the_reconnect_budget() {
     );
     // Non-vacuity: the call waited out the held start, so the slow path is the one exercised.
     assert!(
-      took >= Duration::from_nanos(LONG_RECOVERY_NS),
+      took >= Duration::from_nanos(long_recovery_ns()),
       "shard {partition} held: the call spanned the slow start ({took:?})"
     );
   }

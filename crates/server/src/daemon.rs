@@ -1856,20 +1856,32 @@ impl Daemon {
   /// starvation it relied on actually held. Returns once admitted: the caller watches the rest of the
   /// fleet while the shard is held. The hold's budget is the observe budget past the span it holds for.
   pub fn starve_control_shard(&self, span_ns: u64) -> Result<Admitted<u64>, ObserveError> {
-    self
+    // The hold announces the moment it takes the shard, so this call returns only once the shard is
+    // genuinely spinning on it. A question submitted after it is then ordered behind a busy shard that
+    // cannot step its scheduler to admit it, so the queued-behind-a-hold path deadlines in the
+    // admission stage deterministically — it never slips into execution because the shard admitted the
+    // question in the same step it took the hold, which a loaded runner would otherwise do (§4.3). The
+    // admission-vs-execution staging the observe oracle asserts rides on this ordering being certain.
+    let (spinning, confirm) = std::sync::mpsc::channel::<()>();
+    let held = self
       .pending(
         self.shards.first().copied(),
         OBSERVE_BUDGET_NS.saturating_add(span_ns),
         move || {
-          let started = slates_rt::futures::now_ns();
-          let end = started.saturating_add(span_ns);
+          let _ = spinning.send(());
+          let begin = slates_rt::futures::now_ns();
+          let end = begin.saturating_add(span_ns);
           while slates_rt::futures::now_ns() < end {
             std::hint::spin_loop();
           }
-          Ok(slates_rt::futures::now_ns().saturating_sub(started))
+          Ok(slates_rt::futures::now_ns().saturating_sub(begin))
         },
       )?
-      .admit()
+      .admit()?;
+    // Block until the hold reports it is on the shard; the admitted handle is valid regardless, so a
+    // barrier that does not confirm within the budget still yields it.
+    let _ = confirm.recv_timeout(std::time::Duration::from_nanos(OBSERVE_BUDGET_NS));
+    Ok(held)
   }
 
   /// Whether this daemon's fleet has **region-placed** the head of `object` (§4.8): its control-shard
@@ -3318,10 +3330,14 @@ async fn reap_loop() {
       CLIENTS_REAPED.fetch_add(u64::try_from(reaped).unwrap_or(u64::MAX), Ordering::AcqRel);
     }
     refresh_pressure_hold().await;
+    // NFS owed-work purge and delegation recalls are the Unix transports' state (`crate::nfs`/`crate::delegation`
+    // are `#[cfg(unix)]`); Windows has no NFS mount, so the maintenance loop skips them and keeps the rest.
+    #[cfg(unix)]
     crate::nfs::purge_owed_here().await;
     state::with_state(|s| {
       process_base_hints(s);
       // The recalls the hints asked for are sent now: nothing else runs the drain while no call is served.
+      #[cfg(unix)]
       crate::delegation::drain(s);
     });
     seal_idle_content().await;

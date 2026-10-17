@@ -98,7 +98,19 @@ const REJOIN_DEADLINE: Duration = Duration::from_secs(30);
 /// test fails. Polled, not a fixed settle, so it returns the instant the mesh is up; the deadline is wide
 /// because a larger mesh has more sessions to establish (each node dials and accepts every peer) and the
 /// daemons start one after another.
-const FORMATION_DEADLINE: Duration = Duration::from_secs(30);
+/// Overridable for an exceptionally slow environment via `SLATES_TEST_FLEET_DEADLINE_SECS` (the same knob that
+/// scales [`DEADLINE_NS`]'s reply wait): a heavily loaded or shared CI runner takes far longer to converge a
+/// multi-node takeover than an unloaded machine (`a_cross_region_client_finds_the_copyset_successor...` passed
+/// locally in 5.7 s but exceeded a fixed 30 s on a loaded ubuntu lane — the sibling deadline the DEADLINE_NS fix
+/// missed). A real non-convergence is still caught at the bound. Default 30 s.
+fn formation_deadline() -> Duration {
+  Duration::from_secs(
+    std::env::var("SLATES_TEST_FLEET_DEADLINE_SECS")
+      .ok()
+      .and_then(|secs| secs.parse::<u64>().ok())
+      .unwrap_or(30),
+  )
+}
 /// Shape: how long to wait, after the mesh forms, for the configuration council to elect a single leader over
 /// the transport — several election timeouts (ELECTION_HEARTBEATS heartbeat periods plus per-node jitter, and
 /// a retry or two if a jittered collision splits the first vote), measured against the serialised quiet
@@ -907,7 +919,7 @@ fn form_and_settle(daemons: &[&Daemon]) -> bool {
       Err(_) => return false,
     }
   }
-  let formed = poll_until(daemons, FORMATION_DEADLINE, || {
+  let formed = poll_until(daemons, formation_deadline(), || {
     all_hold(daemons.iter().map(|daemon| daemon.fleet_meshed()))
   });
   settle();
@@ -1139,7 +1151,7 @@ fn a_starved_but_live_peer_is_not_retired() {
   let host_b = daemon_b.member_identity().unwrap();
 
   // The direct probe mesh forms, then settles: a few answered probes seed A's measured round trip to B.
-  let formed = poll_until(&[&daemon_a, &daemon_b], FORMATION_DEADLINE, || {
+  let formed = poll_until(&[&daemon_a, &daemon_b], formation_deadline(), || {
     all_hold([daemon_a.fleet_meshed(), daemon_b.fleet_meshed()])
   });
   settle();
@@ -1157,7 +1169,7 @@ fn a_starved_but_live_peer_is_not_retired() {
   );
   let held_ns = hold.and_then(|done| done.answer());
   // B is back: both sides see the mesh whole.
-  let meshed_after = poll_until(&[&daemon_a, &daemon_b], FORMATION_DEADLINE, || {
+  let meshed_after = poll_until(&[&daemon_a, &daemon_b], formation_deadline(), || {
     all_hold([daemon_a.fleet_meshed(), daemon_b.fleet_meshed()])
   });
 
@@ -1437,7 +1449,7 @@ fn a_stopped_daemons_serve_ports_are_freed_so_its_restart_binds_the_same_address
   let daemon_b_again = start(b_again, peer_of_b);
   // The mesh re-forms only if the restart bound B's addresses; polled for that (the positive event), then
   // the refusal counts are read once — a bind refusal never clears, so it is either there or not.
-  let reformed = poll_until(&[&daemon_a, &daemon_b_again], FORMATION_DEADLINE, || {
+  let reformed = poll_until(&[&daemon_a, &daemon_b_again], formation_deadline(), || {
     all_hold([daemon_a.fleet_meshed(), daemon_b_again.fleet_meshed()])
   });
   let refusals = daemon_b_again.fleet_refusals();
@@ -1506,7 +1518,7 @@ fn a_peer_that_returns_at_new_addresses_is_reached_there() {
   let formed = form_and_settle(&[&daemon_a, &daemon_b]);
   daemon_b.stop();
   let daemon_moved = start(b_moved, peer_of_b);
-  let reformed = poll_until(&[&daemon_a, &daemon_moved], FORMATION_DEADLINE, || {
+  let reformed = poll_until(&[&daemon_a, &daemon_moved], formation_deadline(), || {
     all_hold([daemon_a.fleet_meshed(), daemon_moved.fleet_meshed()])
   });
   let counts = (
@@ -1662,7 +1674,7 @@ fn run_burst(
   let mut reports = Vec::new();
   let mut verbs_during_burst = 0u64;
   let mut refused_during_burst = Vec::new();
-  let burst_done = poll_until(&daemons, FORMATION_DEADLINE, || {
+  let burst_done = poll_until(&daemons, formation_deadline(), || {
     reports.extend(report_rx.try_iter());
     if reports.len() < dials {
       status_verb(
@@ -1690,7 +1702,7 @@ fn run_burst(
   }
   // The replaced sessions' serve tasks end as each replacement closes them: A's live tasks return to the
   // pre-burst level (the burst's last session stands in for B's record session, one serve task either way).
-  let tasks_settled = poll_until(&daemons, FORMATION_DEADLINE, || {
+  let tasks_settled = poll_until(&daemons, formation_deadline(), || {
     let now = fleet.daemon_a.live_tasks()?;
     Ok(live_before.as_ref().is_ok_and(|&earlier| now <= earlier))
   });
@@ -2276,7 +2288,7 @@ fn restart_fleet_forms_and_seals(pid: u32) -> RestartFleet {
   daemon_b.bootstrap(true).expect("explicit initial group");
   // Old B dials A and C, so its mesh forms; then it seals the volume the restart's takeover will move.
   let mut daemons = vec![daemon_b, daemon_a, daemon_c];
-  let formed = poll_until(&[&daemons[0]], FORMATION_DEADLINE, || {
+  let formed = poll_until(&[&daemons[0]], formation_deadline(), || {
     daemons[0].fleet_meshed()
   });
   let voters = vec![host_b, host_a, host_c];
@@ -3051,7 +3063,7 @@ fn three_daemons_form_a_full_mesh() {
   // load: `poll_until` charges the fleet's own forward progress, not wall-clock (see its docs).
   poll_until(
     &daemons.iter().collect::<Vec<_>>(),
-    FORMATION_DEADLINE,
+    formation_deadline(),
     || all_hold(daemons.iter().map(|daemon| daemon.fleet_meshed())),
   );
   // A refusal names a node that could not be observed at all, and the stage it reached — shown as such in
@@ -6197,7 +6209,7 @@ fn an_indirect_probe_through_a_relay_keeps_a_peer_the_direct_path_lost_and_losin
 /// returns as soon as the mesh is up and tolerates a slower-forming larger mesh.
 fn assert_fleet_forms(daemons: &[Daemon], _hosts: &[HostId], names: &[&str]) {
   let observed: Vec<&Daemon> = daemons.iter().collect();
-  if poll_until(&observed, FORMATION_DEADLINE, || {
+  if poll_until(&observed, formation_deadline(), || {
     all_hold(daemons.iter().map(|daemon| daemon.fleet_meshed()))
   }) {
     return;
@@ -6361,7 +6373,9 @@ fn a_fleet_node_under_a_containers_memory_bound_still_admits_a_client() {
     .member_identity()
     .expect("A has its fresh identity");
   // B's probe session to A is up — A accepted it and serves it — before the client arrives.
-  let served_b = poll_until(&[&daemon_b], FORMATION_DEADLINE, || daemon_b.fleet_meshed());
+  let served_b = poll_until(&[&daemon_b], formation_deadline(), || {
+    daemon_b.fleet_meshed()
+  });
   let mut client = Client::connect(&instance_a);
   let report = match client.call(&RequestBody::DaemonStatus) {
     ReplyBody::DaemonStatus { report } => report,
@@ -6431,7 +6445,7 @@ fn a_nodes_status_reports_each_record_session_with_its_congestion_state() {
         .iter()
         .all(|session| session.congestion_window > 0 && session.smoothed_rtt_ns > 0)
   };
-  let reported = poll_until(&observed, FORMATION_DEADLINE, || {
+  let reported = poll_until(&observed, formation_deadline(), || {
     Ok(
       daemons
         .iter()
@@ -6447,7 +6461,7 @@ fn a_nodes_status_reports_each_record_session_with_its_congestion_state() {
       ReplyBody::DaemonStatus { report } => report.fleet.served_sessions,
       _ => Vec::new(),
     };
-  let served = poll_until(&observed, FORMATION_DEADLINE, || {
+  let served = poll_until(&observed, formation_deadline(), || {
     Ok(daemons.iter().all(|daemon| {
       served_of(daemon)
         .iter()
@@ -6519,7 +6533,7 @@ fn measured_detectors(daemons: &[Daemon], observed: &[&Daemon]) -> (bool, Vec<De
       }
       _ => None,
     };
-  let measured = poll_until(observed, FORMATION_DEADLINE, || {
+  let measured = poll_until(observed, formation_deadline(), || {
     Ok(
       daemons
         .iter()
@@ -6782,7 +6796,7 @@ fn a_provisioned_head_replicates_across_the_fleet() {
 
   // A's control-shard loop ships the head to B over the record connection; B serves it; the quorum is
   // reached and A records the placement. Poll until A reports the head region-placed.
-  let placed = poll_until(&[&daemon_a, &daemon_b], FORMATION_DEADLINE, || {
+  let placed = poll_until(&[&daemon_a, &daemon_b], formation_deadline(), || {
     daemon_a.fleet_head_placed(object)
   });
   // The verbs read the same recorded placement (§4.8 D-18, `await placed(region)`): a client asking the
@@ -6862,7 +6876,7 @@ fn a_holder_durably_holds_the_owners_replicated_head() {
 
   // A ships the head to B (the holder) over the record connection; B accepts it into the object's durable
   // acceptor and tracks it in its routing view. Poll until B reports it durably holds A's head.
-  let held = if poll_until(&[&daemon_a, &daemon_b], FORMATION_DEADLINE, || {
+  let held = if poll_until(&[&daemon_a, &daemon_b], formation_deadline(), || {
     daemon_b
       .fleet_holder_head(object)
       .map(|held| held.is_some())
@@ -8228,7 +8242,21 @@ fn a_sealed_snapshots_content_replicates_to_the_holder_and_places() {
 /// the SWIM starvation test uses: far past any measured put p95 on loopback (sub-millisecond to tens of
 /// milliseconds), so a hedge that fires on the measured p95 places the seal through the third candidate long
 /// before the hold ends, while a first round that waits out the hold itself does not.
-const HEDGE_STARVATION_NS: u64 = 3 * LIVENESS_BUDGET_NS;
+/// Shape: how long the hedge test holds the first-round candidate's control shard down (nanoseconds) — the
+/// window the hedge must place the second seal within, which proves the hedge (not the candidate recovering)
+/// carried it. Default three liveness budgets: far past the measured put p95 (sub-ms to tens of ms) and the
+/// unloaded placement-and-observation path (measured ~360 ms here, ~18x the p95), so a normal run stays prompt.
+/// A heavily loaded or shared CI runner inflates that whole path — a 180x-overloaded runner once took 3.003 s,
+/// racing the fixed 3 s window and false-failing — so an exceptionally slow environment widens the window
+/// through `SLATES_TEST_HEDGE_STARVATION_SECS`. The hedge's behaviour (it fires on the measured p95) is
+/// unchanged; only the observation window the test allows it grows.
+static HEDGE_STARVATION_NS: std::sync::LazyLock<u64> = std::sync::LazyLock::new(|| {
+  std::env::var("SLATES_TEST_HEDGE_STARVATION_SECS")
+    .ok()
+    .and_then(|secs| secs.parse::<u64>().ok())
+    .map(|secs| secs.saturating_mul(1_000_000_000))
+    .unwrap_or(3 * LIVENESS_BUDGET_NS)
+});
 
 /// The owner's two remote content candidates, read in the exact order used by its
 /// owner shard, including committed failure domains. Return indexes into `hosts`:
@@ -8296,7 +8324,7 @@ fn a_slow_first_round_candidate_is_hedged_after_the_measured_p95() {
   // Hold the first-round candidate's control shard, then seal again: the second put cannot be answered
   // by it, so the hedge must carry the seal to the other candidate on the measured p95.
   write_hello_over_nfs(&daemons[0], "hedged");
-  let hold = daemons[first_index].starve_control_shard(HEDGE_STARVATION_NS);
+  let hold = daemons[first_index].starve_control_shard(*HEDGE_STARVATION_NS);
   let started = Instant::now();
   let ReplyBody::Snapshotted { id: second, .. } =
     client.call(&RequestBody::Snapshot { volume: id })
@@ -8349,7 +8377,8 @@ fn assert_hedged_through_the_measured_p95(outcome: &HedgeOutcome) {
     held_ns,
     after,
   } = outcome;
-  let held_still_starved = *placed_after < Duration::from_nanos(HEDGE_STARVATION_NS);
+  let hold_ns = *HEDGE_STARVATION_NS;
+  let held_still_starved = *placed_after < Duration::from_nanos(hold_ns);
   assert!(
     measured
       .as_ref()
@@ -8357,19 +8386,17 @@ fn assert_hedged_through_the_measured_p95(outcome: &HedgeOutcome) {
     "the first seal left measured put-latency readings on the owner: {measured:?}"
   );
   assert!(
-    held_ns
-      .as_ref()
-      .is_ok_and(|&held| held >= HEDGE_STARVATION_NS),
+    held_ns.as_ref().is_ok_and(|&held| held >= hold_ns),
     "the first-round candidate's control shard was held for the whole span ({held_ns:?} ns)"
   );
   eprintln!(
     "hedge: measured before the hold {measured:?} (readings, p95 ns); second seal placed after \
-     {placed_after:?} against a {HEDGE_STARVATION_NS} ns hold; readings after {after:?}"
+     {placed_after:?} against a {hold_ns} ns hold; readings after {after:?}"
   );
   assert!(
     *placed && held_still_starved,
     "the second seal placed through the hedge while the first-round candidate was still held \
-     (placed={placed} after {placed_after:?}, hold {HEDGE_STARVATION_NS} ns)"
+     (placed={placed} after {placed_after:?}, hold {hold_ns} ns)"
   );
   assert!(
     hedge_holds,
@@ -9966,7 +9993,7 @@ fn a_fresh_restart_keeps_its_serve_session_while_the_predecessor_retires() {
   // session. That session must survive so A echoes its death belief and B self-refutes; A then re-admits B
   // and the two settle. Mirror the false-death rejoin structure (retire → rejoin → stable), the difference
   // being a natural retirement of a real restart rather than an injected false death.
-  let reformed = poll_until(&[&daemon_a, &daemon_b_again], FORMATION_DEADLINE, || {
+  let reformed = poll_until(&[&daemon_a, &daemon_b_again], formation_deadline(), || {
     daemon_a.fleet_members().map(|m| m.contains(&fresh_b))
   });
   // Non-vacuous: A actually retires B (the stale session ages out), so this exercises the retirement whose
@@ -10543,7 +10570,7 @@ fn audit_wait(mut condition: impl FnMut() -> Result<bool, ObserveError>) -> bool
   let site = std::panic::Location::caller();
   let began = Instant::now();
   let (_pace_sender, pace) = std::sync::mpsc::channel::<()>();
-  while began.elapsed() < FORMATION_DEADLINE {
+  while began.elapsed() < formation_deadline() {
     match verdict(condition()) {
       Verdict::Holds => return true,
       Verdict::Observed => {}
@@ -12834,7 +12861,7 @@ fn an_owner_shards_pair_key_reaches_its_candidate_under_its_recipient() {
     host: anchor_b.0,
     partition: 0,
   };
-  let delivered = poll_until(&[&daemon_a, &daemon_b], FORMATION_DEADLINE, || {
+  let delivered = poll_until(&[&daemon_a, &daemon_b], formation_deadline(), || {
     daemon_b.observe_control(budget, move |s| {
       s.db.partition().seal_key(&at_candidate).is_some()
     })

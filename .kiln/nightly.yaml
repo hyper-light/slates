@@ -1,0 +1,283 @@
+# Nightly, translated from the `schedule` trigger of .github/workflows/ci.yml ("17 3 * * *", UTC): every CI
+# job runs on main once a day, so a day with no push still meets a moving nightly toolchain (Miri, TSan),
+# a changed image or a re-pulled container tag. Its own file and concurrency group, so the nightly run and
+# a push to main never cancel each other. Everything from `env:` down is ci.yaml's, verbatim: keep in sync.
+name: nightly
+on:
+  schedule: ["17 3 * * *"]
+  manual: true
+concurrency: { group: "nightly-${{ branch }}", cancel-in-progress: true }
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  CARGO_PROFILE_TEST_DEBUG: line-tables-only
+jobs:
+  # gates (Linux leg), split into parallel jobs: lint / test / models / disk / vendored.
+  gates-lint:
+    name: "gates: fmt + clippy + structural + literals + version + ratchet"
+    runs-on: [k8s]
+    toolchain: rust
+    resources: { cpu: "4", memory: 8Gi }
+    timeout-minutes: 60
+    env: { CARGO_BUILD_JOBS: "4" }
+    steps:
+      - name: toolchain (rust-toolchain.toml)
+        run: (rustup toolchain install || rustup show) && rustc --version
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Clippy (the lint wall)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Structural test
+        run: cargo xtask structural
+      - name: Literal check
+        run: cargo xtask literals
+      - name: Version check
+        run: cargo xtask version
+      # Skips loudly on a machine with no baseline in ratchets.toml (only the Apple M5 Max has one).
+      - name: Ratchet
+        run: cargo xtask ratchet
+
+  gates-test:
+    name: "gates: test (workspace + CLI flow, bare metal)"
+    runs-on: [baremetal]
+    timeout-minutes: 90
+    steps:
+      - name: toolchain (rust-toolchain.toml)
+        run: (rustup toolchain install || rustup show) && rustc --version
+      # The workspace runs the chart's byte-for-byte golden: use helm v4.3.0's renderer, as GHA pins it.
+      - name: helm v4.3.0
+        run: |
+          mkdir -p "$TMPDIR/helm"
+          curl -fsSL https://get.helm.sh/helm-v4.3.0-linux-amd64.tar.gz \
+            | tar -xz -C "$TMPDIR/helm" --strip-components=1 linux-amd64/helm
+          "$TMPDIR/helm/helm" version --short
+      - name: Test
+        env:
+          SLATES_TEST_DRIVER: io_uring
+          SLATES_FLEET_TRACE: "1"
+        run: PATH="$TMPDIR/helm:$PATH" cargo test --workspace
+      # The anchor + daemon flow needs the machine to itself, so it is its own step (as on GHA). Its FUSE
+      # mounts run as the agent's user through fusermount3.
+      - name: The slates CLI flow (anchor + daemon)
+        env: { SLATES_TEST_CLI: "1" }
+        run: cargo test -p slates-cli --test cli -- --test-threads=1 --nocapture
+
+  gates-models:
+    name: "gates: model suite + explorers + exhaustive searches (release)"
+    runs-on: [k8s]
+    toolchain: rust
+    resources: { cpu: "6", memory: 12Gi }
+    timeout-minutes: 120
+    env: { CARGO_BUILD_JOBS: "6", RUST_TEST_THREADS: "6" }
+    steps:
+      - name: toolchain (rust-toolchain.toml)
+        run: (rustup toolchain install || rustup show) && rustc --version
+      - name: AC-1.1 model suite over 10^6 generated operations
+        run: cargo test -p slates-vfs --release --test model -- --ignored ac_1_1
+      - name: T-8.13 Raft safety explorer at full scale
+        run: cargo test -p slates-cluster --release --test explore -- --ignored --exact the_dialect_keeps_raft_safety_at_full_scale
+      - name: The multi-log explorer at full scale (MLRaft's merge, research record §3.6)
+        run: cargo test -p slates-cluster --release --test multilog -- --ignored --exact the_multi_log_merges_alike_at_full_scale
+      - name: The slot model's exhaustive searches (the fast track's recovery, research record §3.7 and §4)
+        run: >-
+          cargo test -p slates-cluster --release --test slot_model -- --ignored --test-threads=1 --exact
+          the_ballot_recovery_keeps_agreement_at_full_scope
+          the_published_recovery_loses_agreement_when_its_leader_decides_by_votes
+      - name: The prefix model's exhaustive searches (the dialect's design and its rejected alternatives, §4)
+        run: >-
+          cargo test -p slates-cluster --release --test prefix_model -- --ignored --test-threads=1 --exact
+          the_design_keeps_agreement_at_full_scope
+          each_rejected_alternative_loses_a_committed_entry_or_resurrects_a_stale_one
+
+  gates-disk:
+    name: "gates: differential + host + landing over the disk, landing bench"
+    runs-on: [k8s]
+    toolchain: rust
+    resources: { cpu: "4", memory: 8Gi }
+    timeout-minutes: 60
+    env: { CARGO_BUILD_JOBS: "4", RUST_TEST_THREADS: "4" }
+    steps:
+      - name: toolchain (rust-toolchain.toml)
+        run: (rustup toolchain install || rustup show) && rustc --version
+      - name: AC-1.2 differential suite against the host filesystem (Linux)
+        run: PROPTEST_CASES=2000 cargo test -p slates-vfs --release --test differential -- --nocapture
+      - name: Host semantics over the disk (Linux)
+        run: cargo test -p slates-base --test host -- --nocapture
+      - name: Landing over the disk, with kill -9 (Linux)
+        run: cargo test -p slates-land --release --test os -- --nocapture
+      # T-1.17: informational on a shared machine (no ratchet baseline); the numbers land in the job log.
+      - name: Landing bench over the disk (Linux)
+        run: cargo run --release -p slates-land --example land_bench
+
+  gates-vendored:
+    name: "gates: the vendored AWS-LC crates' suites"
+    runs-on: [k8s]
+    toolchain: rust
+    resources: { cpu: "4", memory: 8Gi }
+    timeout-minutes: 45
+    env: { CARGO_BUILD_JOBS: "4", RUST_TEST_THREADS: "4" }
+    steps:
+      # cmake and clang ship on GitHub's runner image; the rust image lacks them.
+      - name: toolchain + C build tools
+        run: |
+          apt-get update -qq && apt-get install -y -qq cmake clang libclang-dev >/dev/null
+          (rustup toolchain install || rustup show) && rustc --version
+      - name: The vendored crates' suites
+        run: cargo test --manifest-path vendor/Cargo.toml --workspace --locked
+
+  # The live guest (AUD-29-68, AC-9.7): QEMU's vhost-user-fs-pci drives a Linux guest from ci/guest. Root in
+  # the container as on GHA, but the workspace is mounted read-only and copied in, so no root-owned build
+  # output is left in the agent's workspace (no sudo here). `timeout` ends the container itself if kiln
+  # kills the docker client at the job limit.
+  live-guest:
+    name: live guest over vhost-user (QEMU, KVM)
+    runs-on: [baremetal]
+    timeout-minutes: 60
+    artifacts: [live-guest.log]
+    steps:
+      - name: KVM for the guest
+        run: |
+          ls -l /dev/kvm || echo "no /dev/kvm: the guest runs under software emulation"
+      - name: Build the guest image
+        run: docker build --iidfile "$TMPDIR/guest.iid" -t slates-guest ci/guest
+      - name: The virtio-fs suite with the live guest
+        run: |
+          set -o pipefail
+          docker run --rm --security-opt seccomp=unconfined \
+            $( [ -e /dev/kvm ] && echo --device /dev/kvm ) \
+            -v "$PWD":/src:ro "$(cat "$TMPDIR/guest.iid")" sh -c \
+            'cp -a /src /build && cd /build && \
+             SLATES_GUEST_QEMU=$(ls /usr/bin/qemu-system-x86_64 /usr/bin/qemu-system-aarch64 2>/dev/null | head -1) \
+             SLATES_GUEST_KERNEL=/guest/vmlinuz SLATES_GUEST_INITRD=/guest/initrd.gz \
+             timeout 50m cargo test -p slates-server --test virtiofs -- --nocapture' 2>&1 | tee live-guest.log
+          # A skipped live guest is a vacuous pass here: the image provides its environment, so a skip fails.
+          if grep -q "SKIP: the live guest" live-guest.log; then echo "the live guest was skipped"; exit 1; fi
+          grep -q "guest workload git: Identical" live-guest.log
+          grep -q "guest suite fsx: ok" live-guest.log
+          grep -q "guest suite fsstress: ok" live-guest.log
+          grep -q "guest suite pjdfstest: ok" live-guest.log
+
+  # The two SDKs as a user installs them (the Linux leg of GHA's sdk matrix). Python 3.11 is bookworm's
+  # python3; Node 24 and the pinned napi CLI are installed into the pod.
+  sdk:
+    name: SDK packaging by use (wheel, sdist, addon, tarballs)
+    runs-on: [k8s]
+    toolchain: rust
+    resources: { cpu: "4", memory: 8Gi }
+    timeout-minutes: 75
+    env:
+      CARGO_BUILD_JOBS: "4"
+      NAPI_CLI_VERSION: 3.7.2 # keep in sync with publish-node.yml
+    steps:
+      - name: toolchains (rust-toolchain.toml, python3-venv, Node 24)
+        run: |
+          apt-get update -qq && apt-get install -y -qq python3-venv >/dev/null
+          (rustup toolchain install || rustup show) && rustc --version
+          v=$(curl -fsSL https://nodejs.org/dist/index.json \
+            | python3 -c 'import json,sys; print(next(r["version"] for r in json.load(sys.stdin) if r["version"].startswith("v24.")))')
+          curl -fsSL "https://nodejs.org/dist/$v/node-$v-linux-x64.tar.xz" | tar -xJ -C /usr/local --strip-components=1
+          python3 --version && node --version && npm --version
+      - name: The daemon both SDK suites spawn
+        run: cargo build -p slates-cli
+      - name: Build the wheel and the sdist, check their metadata, install the wheel into a fresh venv
+        run: |
+          set -euo pipefail
+          python3 -m venv "$TMPDIR/venv"
+          "$TMPDIR/venv/bin/pip" install --quiet 'maturin>=1.5,<2' twine
+          "$TMPDIR/venv/bin/maturin" build --release --out "$TMPDIR/dist" -m crates/sdk-python/Cargo.toml --compatibility linux
+          "$TMPDIR/venv/bin/maturin" sdist --out "$TMPDIR/dist" -m crates/sdk-python/Cargo.toml
+          "$TMPDIR/venv/bin/twine" check --strict "$TMPDIR"/dist/*
+          "$TMPDIR/venv/bin/pip" install --quiet --no-index "$TMPDIR"/dist/slates-*.whl
+      - name: The Python suites (sync and async) against the installed wheel over a live daemon
+        run: SLATES_DAEMON="$PWD/target/debug/slates" "$TMPDIR/venv/bin/python" -m unittest discover -s crates/sdk-python/tests -v
+      - name: Build the napi addon and run the Node suites (sync and async) over a live daemon
+        run: |
+          set -euo pipefail
+          npm install -g "@napi-rs/cli@$NAPI_CLI_VERSION"
+          (cd crates/sdk-node && npm run build)
+          addon=$(ls crates/sdk-node/slates.*.node)
+          SLATES_NODE_ADDON="$PWD/$addon" SLATES_DAEMON="$PWD/target/debug/slates" \
+            node --test crates/sdk-node/tests/sdk.test.mjs crates/sdk-node/tests/sdk_async.test.mjs
+      - name: Pack the main and platform packages, install them into a fresh project, run the packaged smoke test
+        run: |
+          set -euo pipefail
+          binary=$(basename "$(ls crates/sdk-node/slates.*.node)")
+          platform=${binary#slates.}
+          platform=${platform%.node}
+          cp "crates/sdk-node/$binary" "crates/sdk-node/npm/$platform/"
+          (cd "crates/sdk-node/npm/$platform" && npm pack --pack-destination "$TMPDIR")
+          (cd crates/sdk-node && npm pack --pack-destination "$TMPDIR")
+          mkdir "$TMPDIR/project"
+          cd "$TMPDIR/project"
+          npm init -y >/dev/null
+          npm install "$TMPDIR"/hyper-light-slates-*.tgz
+          cp "$KILN_WORKSPACE/crates/sdk-node/tests/packaged.test.mjs" .
+          SLATES_DAEMON="$KILN_WORKSPACE/target/debug/slates" node --test packaged.test.mjs
+
+  # i686 is a tested target: the official linux/386 Rust image runs natively on the x86_64 host. The
+  # container runs as the agent's uid (HOME=/tmp), so its target/ stays removable without sudo.
+  i686:
+    name: i686 (32-bit narrowing, by test)
+    runs-on: [baremetal]
+    timeout-minutes: 60
+    steps:
+      - name: Unit tests as 32-bit code
+        run: >-
+          docker run --rm --platform linux/386 --user "$(id -u):$(id -g)" -e HOME=/tmp
+          -v "$PWD":/src -w /src rust:1.98.0
+          cargo test -p slates-wire -p slates-archive -p slates-ipc -p slates-db -p slates-vfs --lib
+      - name: The runtime and memory crates as 32-bit code
+        run: >-
+          docker run --rm --platform linux/386 --user "$(id -u):$(id -g)" -e HOME=/tmp
+          -v "$PWD":/src -w /src rust:1.98.0
+          cargo test --no-fail-fast -p slates-rt -p slates-mem
+
+  miri-and-loom:
+    name: miri + loom (mem, rt, wire)
+    runs-on: [k8s]
+    toolchain: rust
+    resources: { cpu: "4", memory: 8Gi }
+    timeout-minutes: 120
+    env: { CARGO_BUILD_JOBS: "4", RUST_TEST_THREADS: "4" }
+    steps:
+      - name: toolchain (rust-toolchain.toml)
+        run: (rustup toolchain install || rustup show) && rustc --version
+      - name: loom (every bounded interleaving of the rings, the handle core, the parking and doorbell protocols)
+        run: RUSTFLAGS="--cfg loom" cargo test -p slates-mem -p slates-rt -p slates-ipc --lib --release loom -- --nocapture
+      - name: nightly with Miri
+        run: rustup toolchain install nightly --profile minimal -c miri -c rust-src --allow-downgrade
+      - name: "Miri (memory and wire: leak check on)"
+        run: cargo +nightly miri test -p slates-mem -p slates-wire --lib
+      - name: "Miri (runtime: simulation tests, intentional leaks ignored)"
+        run: MIRIFLAGS="-Zmiri-ignore-leaks" cargo +nightly miri test -p slates-rt --lib --test differential --test ownership --test timers
+
+  shuttle-nightly:
+    name: shuttle (vfs clones, merge green; every push to main and nightly)
+    if: "event != 'pull_request'"
+    runs-on: [k8s]
+    toolchain: rust
+    resources: { cpu: "4", memory: 8Gi }
+    timeout-minutes: 60
+    env: { CARGO_BUILD_JOBS: "4", RUST_TEST_THREADS: "4" }
+    steps:
+      - name: toolchain (rust-toolchain.toml)
+        run: (rustup toolchain install || rustup show) && rustc --version
+      - name: shuttle (T-1.6 two agents on one base; T-6.7 sixteen agents on one green)
+        run: RUSTFLAGS="--cfg shuttle" cargo test -p slates-vfs -p slates-merge --test shuttle_clones --test shuttle_green -- --nocapture
+
+  tsan-nightly:
+    name: TSan (mem, rt, ipc, client; every push to main and nightly)
+    if: "event != 'pull_request'"
+    runs-on: [k8s]
+    toolchain: rust
+    resources: { cpu: "6", memory: 12Gi }
+    timeout-minutes: 120
+    env: { CARGO_BUILD_JOBS: "6", RUST_TEST_THREADS: "6" }
+    steps:
+      - name: toolchains (rust-toolchain.toml for xtask; nightly with rust-src for -Zbuild-std)
+        run: |
+          (rustup toolchain install || rustup show) && rustc --version
+          rustup toolchain install nightly --profile minimal -c rust-src
+      - name: TSan (the race canary must be reported; then the suites, any report fails)
+        run: cargo xtask tsan

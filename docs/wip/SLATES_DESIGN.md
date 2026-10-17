@@ -120,8 +120,10 @@ Four separate claims follow from it, each needing its own evidence:
    resolved-path lints (`clippy.toml` `disallowed-methods`, which see through aliases and macro expansion),
    with reasoned exemptions in place only for shared-memory objects and the landing seam (AUD-29-31); the
    hermeticity tracer (macOS and Linux lanes) sees no write outside a granted target, and every write inside
-   it is the granted landing's — the daemon's, during the landing's interval — with no exemption by name or
-   descriptor number (AUD-29-42, 2026-10-01). Owed: the tracer to record reads, pageout and dumps as well as
+   it is the granted landing's — the daemon's, any thread of it the landing spawns included, during the
+   landing's interval — with no exemption by name or descriptor number (AUD-29-42, 2026-10-01; the thread
+   attribution reopened by A-130's barrier threads and re-closed 2026-10-14, the trace's own clone events now
+   naming them). Owed: the tracer to record reads, pageout and dumps as well as
    writes (audit §9.3); Windows base handles (AUD-29-62).
 2. *No private byte is paged out or dumped.* Dumps: the anchor and the daemon exclude themselves before they
    hold a byte, or refuse to start — core size limit 0 soft and hard (every Unix) and an empty
