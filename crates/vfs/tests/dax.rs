@@ -1603,12 +1603,13 @@ fn the_idle_sweep_defers_sealing_a_mapped_block_until_it_is_unmapped() {
   );
 }
 
-/// §4.6 (the open-frontier gate). Do: write a file larger than one chunk (a sealed head chunk + an open tail), then
-/// map-read at an offset in the OPEN TAIL and at offset 0 (the SEALED head). Expect: the open tail maps (its block,
-/// `block_file_start` = the tail's file offset, reading its plaintext), while offset 0 is refused `Invalid` — a guest
-/// maps the open frontier zero-copy and FUSE_READs the sealed body.
+/// §4.6 VIEW arm (A/B vs reopen). Do: write a file larger than one chunk (a sealed head chunk + an open tail), then
+/// map-read at an offset in the OPEN TAIL and at offset 0 (the SEALED head). Expect: the open tail maps directly
+/// (zero-copy, `block_file_start` = the tail's offset), and the sealed head is BACKED by a decrypted read-only view
+/// (a snapshot mapping at `block_file_start` 0 that reads the chunk's plaintext) — so a guest mmap of the whole
+/// multi-block file is fully backed (the SIGBUS of rule (a) is gone); the canonical sealed chunk is untouched.
 #[test]
-fn the_open_tail_of_a_multi_block_file_maps_and_the_sealed_head_is_refused() {
+fn the_open_tail_maps_directly_and_the_sealed_head_is_backed_by_a_decrypted_view() {
   let mut store = store();
   let mut volume = volume(&mut store, 1 << 24);
   let chunk = store.content.chunk_bytes();
@@ -1620,22 +1621,29 @@ fn the_open_tail_of_a_multi_block_file_maps_and_the_sealed_head_is_refused() {
     .write(&mut store, no, 0, &vec![0x33u8; chunk + tail])
     .unwrap();
 
-  // Offset 0 is in the sealed head -> refused (the guest FUSE_READs that range).
-  assert!(
-    volume.dax_map_read_at(&mut store, no, 0).is_err(),
-    "the sealed head chunk is refused"
-  );
-  // An offset in the open tail -> mapped, at the tail's file offset.
-  let mapping = volume.dax_map_read_at(&mut store, no, chunk).unwrap();
+  // The open tail maps directly at its file offset (zero-copy).
+  let tail_map = volume.dax_map_read_at(&mut store, no, chunk).unwrap();
   assert_eq!(
-    mapping.block_file_start, chunk,
-    "the mapping begins at the open tail's file offset"
+    tail_map.block_file_start, chunk,
+    "the tail mapping begins at the open tail's file offset"
   );
-  assert_eq!(mapping.file_len, tail, "the mapping's length is the open tail's bytes");
-  let got = volume.dax_read(&store, &mapping, 0, tail).unwrap();
+  assert_eq!(tail_map.file_len, tail, "the tail mapping's length is the open tail's bytes");
+  let got = volume.dax_read(&store, &tail_map, 0, tail).unwrap();
   assert!(
     got.iter().all(|&b| b == 0x33),
     "the open tail reads its plaintext: {:?}",
     &got[..8]
+  );
+
+  // Offset 0 is in the sealed head -> the VIEW arm backs it with a decrypted read-only view (no SIGBUS), reading
+  // the chunk's plaintext.
+  let head_view = volume.dax_map_read_at(&mut store, no, 0).unwrap();
+  assert_eq!(head_view.block_file_start, 0, "the head view begins at offset 0");
+  assert_eq!(head_view.file_len, chunk, "the head view spans the sealed chunk's bytes");
+  let head_bytes = volume.dax_read(&store, &head_view, 0, DAX_PAGE).unwrap();
+  assert!(
+    head_bytes.iter().all(|&b| b == 0x33),
+    "the sealed head's decrypted view reads its plaintext: {:?}",
+    &head_bytes[..8]
   );
 }

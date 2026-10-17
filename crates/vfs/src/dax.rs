@@ -403,6 +403,34 @@ fn open_chunk_at(
   }
 }
 
+/// The **sealed chunk** covering file offset `file_offset`, as `(chunk_start, valid_len)` (§4.6, the VIEW arm). Walks
+/// the sealed extents of a `Body::Open`/`Body::Sealed` file for the one that spans the offset. A non-chunked body, or
+/// an offset in no sealed extent (it is in the open chunk, or past the file), is refused `Invalid`.
+fn sealed_chunk_at(
+  store: &Store,
+  volume: &Volume,
+  no: InodeNo,
+  file_offset: usize,
+) -> Result<(usize, usize), VfsError> {
+  let inode = volume.inode(store, no)?;
+  let sealed: &[crate::content::Extent] = match &inode.body {
+    Body::Open { sealed, .. } => sealed,
+    Body::Sealed(sealed) => sealed,
+    _ => return Err(VfsError::Invalid),
+  };
+  for extent in sealed {
+    let start = usize::try_from(extent.off).map_err(|_| VfsError::NoSpace)?;
+    let len = usize::try_from(extent.len).map_err(|_| VfsError::NoSpace)?;
+    if file_offset >= start && file_offset < start.saturating_add(len) {
+      return Ok((start, len));
+    }
+  }
+  // No open and no sealed chunk covers this offset: it is past the file's content. `NotFound` (distinct from the
+  // wrong-body `Invalid`) tells the device's N-map loop to STOP here — the guest's window range ran off the end of
+  // the file, so the remaining pages are simply not backed (as the authorized-window cap always left them).
+  Err(VfsError::NotFound)
+}
+
 impl Volume {
   /// Maps the **open (plaintext) chunk** covering file offset `file_offset` into a guest window, **read-only** (§4.6
   /// "DAX maps the open frontier"). The chunk's arena block is mapped directly and **pinned** (never reused, freed or
@@ -430,35 +458,48 @@ impl Volume {
       _ => None,
     };
     if let Some(bytes) = inline {
-      return self.map_owned_block(store, no, &bytes);
+      return self.map_owned_block(store, no, 0, &bytes);
     }
-    let (block, block_file_start, file_len) = open_chunk_at(&*store, self, no, file_offset)?;
-    store.content.arena_mut().pin(block)?;
-    if let Some(tail) = store
-      .content
-      .arena_mut()
-      .bytes_mut(block)
-      .and_then(|bytes| bytes.get_mut(file_len..))
-    {
-      tail.fill(0);
-    }
-    let mapping = Mapping {
-      id: store.dax.mint_id(),
-      inode: no,
-      block_file_start,
-      block,
-      file_len,
-      writable: false,
-      snapshot: false,
-    };
-    if let Err(refusal) = store.dax.register(mapping) {
-      // The registry is full: undo the pin so a refused map leaves nothing held.
-      if store.content.arena_mut().unpin(block).is_err() {
-        store.release_refusals = store.release_refusals.saturating_add(1);
+    // The open (plaintext) chunk at this offset maps zero-copy, directly off its arena block.
+    if let Ok((block, block_file_start, file_len)) = open_chunk_at(&*store, self, no, file_offset) {
+      store.content.arena_mut().pin(block)?;
+      if let Some(tail) = store
+        .content
+        .arena_mut()
+        .bytes_mut(block)
+        .and_then(|bytes| bytes.get_mut(file_len..))
+      {
+        tail.fill(0);
       }
-      return Err(refusal);
+      let mapping = Mapping {
+        id: store.dax.mint_id(),
+        inode: no,
+        block_file_start,
+        block,
+        file_len,
+        writable: false,
+        snapshot: false,
+      };
+      if let Err(refusal) = store.dax.register(mapping) {
+        // The registry is full: undo the pin so a refused map leaves nothing held.
+        if store.content.arena_mut().unpin(block).is_err() {
+          store.release_refusals = store.release_refusals.saturating_add(1);
+        }
+        return Err(refusal);
+      }
+      return Ok(mapping);
     }
-    Ok(mapping)
+    // VIEW arm (A/B against reopen): a SEALED chunk (ciphertext at rest, A-92/A-99) cannot be mapped zero-copy — a
+    // guest MMU would read ciphertext, and a refused SETUPMAPPING SIGBUSes a `dax=always` mmap. Back it with a
+    // decrypted read-only throwaway the mapping owns (`snapshot: true`): read the chunk's plaintext (the read path
+    // decrypts through `open_into`) and materialize it at the chunk's file offset. The canonical sealed chunk stays
+    // ciphertext; the view is freed and scrubbed on revoke, and a write to the chunk revokes the mapping (so a view
+    // of immutable sealed content never goes stale).
+    let (chunk_start, chunk_len) = sealed_chunk_at(&*store, self, no, file_offset)?;
+    let at = u64::try_from(chunk_start).map_err(|_| VfsError::NoSpace)?;
+    let mut plain = vec![0u8; chunk_len];
+    self.read(&*store, no, at, &mut plain)?;
+    self.map_owned_block(store, no, chunk_start, &plain)
   }
 
   /// Maps inode `no`'s content from offset 0 — the whole single block of a single-block file, or an inline file —
@@ -523,18 +564,20 @@ impl Volume {
       }
       buf
     };
-    self.map_owned_block(store, no, &serialized)
+    self.map_owned_block(store, no, 0, &serialized)
   }
 
   /// Maps a freshly allocated throwaway block holding `serialized` into a guest window, **read-only**, as a snapshot
-  /// the mapping **owns** — pinned while mapped, freed when revoked. Shared by [`Volume::dax_map_dir`] (a directory's
-  /// serialized entries) and the inline-file path of [`Volume::dax_map_read`] (a small file whose bytes live in the
-  /// inode with no content block to map). A later daemon change to the inode revokes the mapping, so the guest
+  /// the mapping **owns** — pinned while mapped, freed when revoked. `block_file_start` is the file offset the block
+  /// represents (`0` for a directory's serialized entries or an inline file; the chunk's offset for a decrypted
+  /// sealed-chunk view). Shared by [`Volume::dax_map_dir`], the inline path of [`Volume::dax_map_read_at`], and the
+  /// VIEW arm's decrypted sealed-chunk view. A later daemon change to the inode revokes the mapping, so the guest
   /// re-maps to see it. A refused map (an unpinnable block, or a full registry) leaves nothing allocated or held.
   fn map_owned_block(
     &mut self,
     store: &mut Store,
     no: InodeNo,
+    block_file_start: usize,
     serialized: &[u8],
   ) -> Result<Mapping, VfsError> {
     let file_len = serialized.len();
@@ -555,7 +598,7 @@ impl Volume {
     let mapping = Mapping {
       id: store.dax.mint_id(),
       inode: no,
-      block_file_start: 0,
+      block_file_start,
       block,
       file_len,
       writable: false,

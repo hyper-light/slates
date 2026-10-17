@@ -10,10 +10,12 @@
 #include <sys/mount.h>
 #include <sys/reboot.h>
 
-/* 32 KiB: above inline (~128 B) so it is block-backed, within one chunk (64 KiB on a 4 KiB page) so it is a
-   single unsealed block (Body::Open) the DAX gate maps; freshly written and the fd kept open, so it never seals
-   before the map. */
-#define SIZE (32 * 1024)
+/* 192 KiB: a MULTI-BLOCK file (three 64 KiB chunks on the box's 4 KiB page). As the file grows the daemon seals the
+   head chunks (the sealed body); only the open tail chunk stays plaintext. Under DAX the open-frontier gate maps the
+   open tail through the window and the sealed body reads over FUSE_READ, yet the whole file still reads back
+   byte-for-byte (GUEST-MMAP-OK) — the DAX-tail + FUSE_READ-head mix. (A 32 KiB single-block file was the earlier
+   single-chunk A/B; the unit tests still cover that shape.) */
+#define SIZE (192 * 1024)
 static unsigned char buf[SIZE];
 static unsigned char rb[SIZE];
 

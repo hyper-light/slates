@@ -280,6 +280,11 @@ struct AwaitingDaxMap {
   queue: u16,
   chain: DescriptorChain,
   unique: u64,
+  /// How many SHMEM_MAP acks this one SETUPMAPPING still owes before its reply is published. A guest's window range
+  /// can span several chunks, each a distinct arena block sent as its own SHMEM_MAP; the chain is answered only once
+  /// every chunk is mapped (all acks in), so a multi-block guest mmap is fully backed before it reads (§4.6, the
+  /// N-map-per-request rule the live A/B surfaced).
+  remaining: usize,
 }
 
 /// A held chain the owner has completed: the queue it was on and whether that queue's driver asks to be
@@ -455,9 +460,10 @@ pub struct Device {
   #[cfg(target_os = "linux")]
   awaiting_dax_map: Option<AwaitingDaxMap>,
   /// What `serve_dax` recorded for a map it just sent, which `serve_chain` moves into `awaiting_dax_map` with the
-  /// chain: the reply's `unique` and the window entry to record once the ack lands.
+  /// chain: the reply's `unique` and **how many** SHMEM_MAP acks the SETUPMAPPING owes (one per chunk in the guest's
+  /// window range), so the chain is answered only once every chunk is mapped.
   #[cfg(target_os = "linux")]
-  pending_dax_map: Option<u64>,
+  pending_dax_map: Option<(u64, usize)>,
 }
 
 impl fmt::Debug for Device {
@@ -1066,15 +1072,36 @@ impl Device {
     errno: Option<i32>,
     admission: &mut dyn ChainAdmission,
   ) -> Result<Option<Completed>, DeviceError> {
+    // One SETUPMAPPING owes one ack per chunk it sent (`remaining`). A successful ack records its window and counts
+    // down; the chain is answered only when the last lands (`remaining` -> 0), so a multi-block guest reads a fully
+    // backed window. A refused map answers the whole SETUPMAPPING with the error at once.
+    let complete_now = {
+      let Some(held) = self.awaiting_dax_map.as_mut() else {
+        return Ok(None);
+      };
+      match errno {
+        None => {
+          held.remaining = held.remaining.saturating_sub(1);
+          held.remaining == 0
+        }
+        Some(_) => {
+          held.remaining = 0;
+          true
+        }
+      }
+    };
+    if errno.is_none() {
+      self.dax_windows.push(entry);
+    }
+    if !complete_now {
+      return Ok(None);
+    }
     let Some(held) = self.awaiting_dax_map.take() else {
       return Ok(None);
     };
     let index = self.queue_index(held.queue)?;
     let n = match errno {
-      None => {
-        self.dax_windows.push(entry);
-        ReplyHeader::write_ok(held.unique, &[], &mut self.reply).unwrap_or(0)
-      }
+      None => ReplyHeader::write_ok(held.unique, &[], &mut self.reply).unwrap_or(0),
       Some(e) => ReplyHeader::write_error(held.unique, e, &mut self.reply).unwrap_or(0),
     };
     let reply = self.reply.get(..n).unwrap_or(&[]);
@@ -1229,11 +1256,12 @@ impl Device {
           // scattered now — `complete_dax_awaiting` scatters it and publishes the used element once the ack lands.
           #[cfg(target_os = "linux")]
           DaxServed::MapAckOwed => match self.pending_dax_map.take() {
-            Some(unique) => {
+            Some((unique, remaining)) => {
               self.awaiting_dax_map = Some(AwaitingDaxMap {
                 queue,
                 chain: chain.clone(),
                 unique,
+                remaining,
               });
               return Ok(ChainOutcome::DaxMapParked);
             }
@@ -1463,13 +1491,167 @@ fn dax_ranges_overlap(a_off: u64, a_len: u64, b_off: u64, b_len: u64) -> bool {
   a_off < b_off.saturating_add(b_len) && b_off < a_off.saturating_add(a_len)
 }
 
+/// Tears down everything a SETUPMAPPING mapped before it failed partway through its range (§4.6 N-map rollback), so a
+/// refused SETUPMAPPING backs nothing and leaks no pin. The window range `[win_off, win_off+win_len)` holds any Local
+/// windows this request already pushed — each is torn down — and the message-based placer's outstanding SHMEM_MAPs
+/// (only this one in-flight SETUPMAPPING's, by the one-at-a-time park invariant) are undone (`dax_unmap` the pin).
+#[cfg(unix)]
+fn rollback_dax_setup(
+  placer: &mut crate::dax::DaxPlacer,
+  bridge: &mut dyn slates_bridge_core::Bridge,
+  cx: &slates_bridge_core::OpContext,
+  dax_windows: &mut Vec<DaxWindowEntry>,
+  win_off: u64,
+  win_len: u64,
+) {
+  let mut index = 0;
+  while index < dax_windows.len() {
+    match dax_windows.get(index).copied() {
+      Some(held) if dax_ranges_overlap(held.moffset, held.len, win_off, win_len) => {
+        teardown_dax_window(placer, bridge, cx, &held);
+        dax_windows.swap_remove(index);
+      }
+      _ => index = index.saturating_add(1),
+    }
+  }
+  #[cfg(target_os = "linux")]
+  if let crate::dax::DaxPlacer::Message(message) = placer {
+    for (is_map, entry) in message.take_pending() {
+      if is_map {
+        let _ = bridge.dax_unmap(&entry.mapping, cx);
+      } else {
+        let _ = bridge.dax_release_after_unmap(&entry.mapping, cx);
+      }
+    }
+  }
+}
+
+/// What one chunk's map attempt did in the N-map loop (§4.6): advanced the cursor by `this` bytes, ran past the
+/// file's content (stop the loop), or refused with an errno (tear down and refuse the whole SETUPMAPPING).
+#[cfg(unix)]
+enum MapStep {
+  Advanced { this: usize },
+  PastFile,
+  Refused(i32),
+}
+
+/// The window offset, arena-object offset and mapped length for chunk `mapping` at file offset `cur` (§4.6): bounded
+/// to the chunk's authorized window (`file_len` rounded up to `granule`, capped at the block), and never past the
+/// request's `end`. `None` on any overflow (a hostile offset or length), which the caller turns into a refusal.
+#[cfg(unix)]
+#[allow(
+  clippy::too_many_arguments,
+  reason = "the per-chunk window geometry is a flat set of offsets and lengths; a struct would only move the same fields"
+)]
+fn chunk_map_params(
+  mapping: &slates_vfs::dax::Mapping,
+  region_off: usize,
+  block_len: usize,
+  cur: usize,
+  foffset: usize,
+  base_moffset: u64,
+  end: usize,
+  granule: usize,
+) -> Option<(u64, u64, u64)> {
+  let intra = cur.checked_sub(mapping.block_file_start)?;
+  let authorized = mapping
+    .file_len
+    .div_ceil(granule)
+    .saturating_mul(granule)
+    .min(block_len);
+  let room = authorized.checked_sub(intra).filter(|room| *room > 0)?;
+  let this = end.saturating_sub(cur).min(room);
+  let win_off = base_moffset.checked_add(u64::try_from(cur.saturating_sub(foffset)).ok()?)?;
+  let object_off = u64::try_from(region_off.checked_add(intra)?).ok()?;
+  let mapped_len = u64::try_from(this).ok()?;
+  Some((win_off, object_off, mapped_len))
+}
+
+/// Maps the one chunk covering file offset `cur` into the window (§4.6 N-map loop): the gate returns the open chunk
+/// (zero-copy) or the arm's sealed-chunk backing, which the placer maps (Local synchronously, Message as a parked
+/// SHMEM_MAP). A `NotFound` or a chunk that does not cover `cur` (a writable single-block map re-returns block 0)
+/// means the range ran past the file's content — [`MapStep::PastFile`]. Any pin a refused step took is undone before
+/// it returns, so a refusal leaves nothing held for the caller to roll back beyond the earlier chunks.
+#[cfg(unix)]
+#[allow(
+  clippy::too_many_arguments,
+  reason = "the per-chunk map needs the window geometry, the placer, the bridge and the cursor; a struct would only move the same fields"
+)]
+fn map_chunk_at(
+  placer: &mut crate::dax::DaxPlacer,
+  bridge: &mut dyn slates_bridge_core::Bridge,
+  cx: &slates_bridge_core::OpContext,
+  dax_windows: &mut Vec<DaxWindowEntry>,
+  object: slates_bridge_core::ObjectId,
+  writable: bool,
+  cur: usize,
+  foffset: usize,
+  base_moffset: u64,
+  end: usize,
+  granule: usize,
+) -> MapStep {
+  let mapping = match bridge.dax_map(object, cx, writable, cur) {
+    Ok(mapping) => mapping,
+    // No chunk at this offset: the range ran past the file's content.
+    Err(slates_vfs::error::VfsError::NotFound) => return MapStep::PastFile,
+    Err(e) => return MapStep::Refused(vfs_dax_errno(&e)),
+  };
+  let Some((fd, region_off, block_len)) = bridge.dax_backing(&mapping) else {
+    let _ = bridge.dax_unmap(&mapping, cx);
+    return MapStep::Refused(dax_errno::EOPNOTSUPP);
+  };
+  // A chunk that does not cover `cur` (a writable single-block map re-returns block 0) means the range ran past the
+  // file's content.
+  if cur >= mapping.block_file_start.saturating_add(mapping.file_len) {
+    let _ = bridge.dax_unmap(&mapping, cx);
+    return MapStep::PastFile;
+  }
+  let Some((win_off, object_off, mapped_len)) =
+    chunk_map_params(&mapping, region_off, block_len, cur, foffset, base_moffset, end, granule)
+  else {
+    let _ = bridge.dax_unmap(&mapping, cx);
+    return MapStep::Refused(dax_errno::EINVAL);
+  };
+  eprintln!(
+    "DAX-TRACE map cur={cur} start={} mapped_len={mapped_len} win_off={win_off}",
+    mapping.block_file_start
+  );
+  let entry = DaxWindowEntry {
+    moffset: win_off,
+    len: mapped_len,
+    mapping,
+  };
+  match placer {
+    crate::dax::DaxPlacer::Local(cache) => {
+      if cache.map(win_off, mapped_len, fd, object_off, writable).is_err() {
+        let _ = bridge.dax_unmap(&mapping, cx);
+        return MapStep::Refused(dax_errno::EINVAL);
+      }
+      dax_windows.push(entry);
+    }
+    #[cfg(target_os = "linux")]
+    crate::dax::DaxPlacer::Message(message) => {
+      if message
+        .begin_map(win_off, mapped_len, fd, object_off, writable, entry)
+        .is_err()
+      {
+        let _ = bridge.dax_unmap(&mapping, cx);
+        return MapStep::Refused(dax_errno::EINVAL);
+      }
+    }
+  }
+  MapStep::Advanced {
+    this: usize::try_from(mapped_len).unwrap_or(0),
+  }
+}
+
 fn serve_dax(
   request: &[u8],
   bridge: &mut dyn slates_bridge_core::Bridge,
   cx: &slates_bridge_core::OpContext,
   dax_placer: &mut Option<crate::dax::DaxPlacer>,
   dax_windows: &mut Vec<DaxWindowEntry>,
-  #[cfg(target_os = "linux")] pending_dax_map: &mut Option<u64>,
+  #[cfg(target_os = "linux")] pending_dax_map: &mut Option<(u64, usize)>,
   out: &mut [u8],
 ) -> DaxServed {
   use slates_bridge_core::ObjectId;
@@ -1511,79 +1693,67 @@ fn serve_dax(
         }
       }
       let object = ObjectId::new(req.header.nodeid, 0);
-      // The guest's SETUPMAPPING file offset selects which chunk to map; the gate returns the OPEN (plaintext) chunk
-      // covering it and refuses a sealed one (→ the guest FUSE_READs that range). Parse it before the map so the gate
-      // can pick the chunk (§4.6 "DAX maps the open frontier").
       let (Ok(foffset), Ok(requested)) = (usize::try_from(m.foffset), usize::try_from(m.len)) else {
         return err(dax_errno::EINVAL, out);
       };
-      let mapping = match bridge.dax_map(object, cx, writable, foffset) {
-        Ok(mapping) => mapping,
-        Err(e) => return err(vfs_dax_errno(&e), out),
-      };
-      // The block's backing descriptor, its byte offset in the arena object, and its length.
-      let Some((fd, region_off, block_len)) = bridge.dax_backing(&mapping) else {
-        let _ = bridge.dax_unmap(&mapping, cx); // undo the pin (no window established yet)
-        return err(dax_errno::EOPNOTSUPP, out);
-      };
-      // The mapping's block holds file bytes [block_file_start, block_file_start + file_len); the guest's foffset maps
-      // to block byte `intra = foffset - block_file_start`. For a single-block/whole-file map block_file_start is 0, so
-      // intra == foffset; for a multi-block file's open tail it rebases into the tail's own block.
-      let Some(intra) = foffset.checked_sub(mapping.block_file_start) else {
-        let _ = bridge.dax_unmap(&mapping, cx);
-        return err(dax_errno::EINVAL, out);
-      };
-      // Bound the requested range to the chunk's authorized window — its own pages, not the arena block's power-of-two
-      // padding (§4.6; the sub-file tail reads zero). Round the chunk's valid length up to this window's granule (the
-      // host page, or the negotiated FUSE_MAP_ALIGNMENT) and cap at the block, so a guest can never map a page lying
-      // entirely past the chunk's bytes. The guest maps window chunks (e.g. 2 MiB) that can extend past the chunk; the
-      // window beyond stays unmapped (a read there faults, which a guest does not do within the file). A request at or
-      // past the authorized window backs nothing: refused (the guest FUSE_READs it).
       let granule = placer.page().max(1);
-      let authorized = mapping
-        .file_len
-        .div_ceil(granule)
-        .saturating_mul(granule)
-        .min(block_len);
-      let Some(room) = authorized.checked_sub(intra).filter(|room| *room > 0) else {
-        let _ = bridge.dax_unmap(&mapping, cx);
-        return err(dax_errno::EINVAL, out);
-      };
-      let mapped_len = u64::try_from(requested.min(room)).unwrap_or(u64::MAX);
-      let Some(object_off) = region_off
-        .checked_add(intra)
-        .and_then(|off| u64::try_from(off).ok())
-      else {
-        let _ = bridge.dax_unmap(&mapping, cx);
-        return err(dax_errno::EINVAL, out);
-      };
-      let entry = DaxWindowEntry {
-        moffset: m.moffset,
-        len: mapped_len,
-        mapping,
-      };
-      match placer {
-        crate::dax::DaxPlacer::Local(cache) => {
-          if cache.map(m.moffset, mapped_len, fd, object_off, writable).is_err() {
-            let _ = bridge.dax_unmap(&mapping, cx);
+      // Map EVERY chunk covering [foffset, foffset+requested). A guest's window range can span several chunks, each a
+      // distinct arena block mapped at its own window sub-offset; a one-chunk map leaves the rest of the window stale
+      // (a multi-block guest mmap then mismatches, or SIGBUSes on a refused sealed head). So one SETUPMAPPING becomes
+      // N maps, answered as a whole: the Local placer maps each synchronously and replies now; the Message placer
+      // sends N SHMEM_MAPs and parks the chain until all N acks land (§4.6 "DAX maps the open frontier"; the N-map
+      // rule the live A/B surfaced). The gate backs each chunk — the open tail zero-copy, a sealed chunk per the arm.
+      let mut cur = foffset;
+      let end = foffset.saturating_add(requested);
+      // Whether at least one chunk has been mapped — so a later `NotFound` (the range ran past the file's content)
+      // ends the loop cleanly with what is backed, rather than refusing the whole request.
+      let mut mapped_any = false;
+      // How many SHMEM_MAPs the message-based placer sent (one per chunk) — the acks the chain then owes.
+      #[cfg(target_os = "linux")]
+      let mut sent = 0usize;
+      while cur < end {
+        match map_chunk_at(
+          placer, bridge, cx, dax_windows, object, writable, cur, foffset, m.moffset, end, granule,
+        ) {
+          MapStep::Advanced { this } => {
+            mapped_any = true;
+            #[cfg(target_os = "linux")]
+            {
+              sent = sent.saturating_add(1);
+            }
+            cur = cur.saturating_add(this.max(1));
+          }
+          // The range ran past the file's content: answer with what is backed (the authorized-window cap leaves the
+          // rest unmapped). Nothing mapped yet means the request began past the file — refuse.
+          MapStep::PastFile => {
+            if mapped_any {
+              break;
+            }
+            rollback_dax_setup(placer, bridge, cx, dax_windows, m.moffset, m.len);
             return err(dax_errno::EINVAL, out);
           }
-          dax_windows.push(entry);
+          // A chunk within the file could not be backed: tear down what this request mapped and refuse the whole
+          // SETUPMAPPING — never a partially-backed window.
+          MapStep::Refused(errno) => {
+            rollback_dax_setup(placer, bridge, cx, dax_windows, m.moffset, m.len);
+            return err(errno, out);
+          }
+        }
+      }
+      // The whole range is mapped. Local answered each map synchronously -> reply OK now; Message parked `sent`
+      // SHMEM_MAPs -> hold the chain until all of them ack (`complete_dax_awaiting`). An empty range replies OK.
+      match placer {
+        crate::dax::DaxPlacer::Local(_) => {
           DaxServed::Replied(ReplyHeader::write_ok(unique, &[], out).unwrap_or(0))
         }
-        // The message-based placer sends SHMEM_MAP and the guest's reply waits for the front end's ack; the
-        // chain is parked (`pending_dax_map`) and `complete_dax_awaiting` answers it once the ack lands.
         #[cfg(target_os = "linux")]
-        crate::dax::DaxPlacer::Message(message) => {
-          if message
-            .begin_map(m.moffset, mapped_len, fd, object_off, writable, entry)
-            .is_err()
-          {
-            let _ = bridge.dax_unmap(&mapping, cx);
-            return err(dax_errno::EINVAL, out);
+        crate::dax::DaxPlacer::Message(_) => {
+          if sent == 0 {
+            DaxServed::Replied(ReplyHeader::write_ok(unique, &[], out).unwrap_or(0))
+          } else {
+            *pending_dax_map = Some((unique, sent));
+            DaxServed::MapAckOwed
           }
-          *pending_dax_map = Some(unique);
-          DaxServed::MapAckOwed
         }
       }
     }
