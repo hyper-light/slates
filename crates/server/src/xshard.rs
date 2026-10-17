@@ -312,11 +312,14 @@ mod tests {
       slates_rt::futures::detach(task).unwrap();
       (registration, receiver)
     });
-    std::thread::sleep(std::time::Duration::from_nanos(2 * REPLY_PACE_NS));
-    assert!(receiver.try_recv().is_ok(), "the filler");
-    let carried = receiver.recv_timeout(std::time::Duration::from_nanos(
-      REPLY_PACE_NS * REPLY_ROOM_ATTEMPTS,
-    ));
+    // The filler occupies the one slot, so the reply behind it can only land once this takes it. Wait for the
+    // filler within the same bound the reply's own wait uses, rather than assuming two pacing intervals are
+    // enough: on a loaded shared runner they are not, and this failed with the daemon behaving correctly
+    // (CI run 39073360651, macOS lane). The assertion that matters is the next one — the reply arrived once
+    // there was room — and it keeps its bound.
+    let room = std::time::Duration::from_nanos(REPLY_PACE_NS * REPLY_ROOM_ATTEMPTS);
+    assert!(receiver.recv_timeout(room).is_ok(), "the filler");
+    let carried = receiver.recv_timeout(room);
     assert!(
       carried.is_ok(),
       "the result's message arrived once there was room"

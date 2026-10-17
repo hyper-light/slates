@@ -2402,6 +2402,11 @@ fn assert_formed(views: &[Option<FleetView>]) -> Vec<String> {
             "fleet.plane.announce_lends:",
             "fleet.plane.announcements_sent:",
             "content.purged_bytes:",
+            // A record link dropped because its anchor's learned member became another incarnation
+            // (`fleet::LINK_INVALID_MEMBER_CHANGED`). Incarnations change as the fleet comes up, so this is
+            // superseded link work — exactly what this assertion permits — and it is counted during formation
+            // since the list was last kept (seen on the CI ubuntu lane, run 39073360651, 2026-10-17).
+            "fleet.link.invalid.member_changed:",
           ]
           .iter()
           .any(|counter| line.split_whitespace().nth(3) == Some(counter))
