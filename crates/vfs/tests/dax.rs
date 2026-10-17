@@ -89,7 +89,9 @@ fn an_inline_file_is_mapped_read_only_through_a_materialized_block() {
   let mut store = store();
   let mut volume = volume(&mut store, 1 << 20);
   let root = volume.root_inode(&store).unwrap();
-  let no = volume.create_file_no(&mut store, root, "tiny", 0o644).unwrap();
+  let no = volume
+    .create_file_no(&mut store, root, "tiny", 0o644)
+    .unwrap();
   // 48 bytes: well under `inline_bytes` (~128 B), so the content stays in the inode with no arena content block.
   let bytes = [0x5Au8; 48];
   volume.write(&mut store, no, 0, &bytes).unwrap();
@@ -1593,7 +1595,10 @@ fn the_idle_sweep_defers_sealing_a_mapped_block_until_it_is_unmapped() {
   );
 
   // Revoke the mapping (the no-live-guest synchronous path unpins immediately); now the sweep may seal it.
-  assert!(store.dax_revoke(&mapping), "the mapping is revoked and the block unpinned");
+  assert!(
+    store.dax_revoke(&mapping),
+    "the mapping is revoked and the block unpinned"
+  );
   volume.age_writes();
   volume.age_writes();
   let _ = volume.seal_pending(&mut store, u64::MAX);
@@ -1611,7 +1616,9 @@ fn sealed_head_open_tail(store: &mut Store, volume: &mut Volume) -> (InodeNo, us
   let no = volume.create_file_no(store, root, "big", 0o644).unwrap();
   volume.set_seal_key(Some(1));
   let tail = DAX_PAGE;
-  volume.write(store, no, 0, &vec![0x33u8; chunk + tail]).unwrap();
+  volume
+    .write(store, no, 0, &vec![0x33u8; chunk + tail])
+    .unwrap();
   (no, chunk, tail)
 }
 
@@ -1628,23 +1635,41 @@ fn the_open_tail_maps_directly_and_the_sealed_head_is_reopened_in_place() {
 
   // The open tail maps directly at its file offset (zero-copy, a non-snapshot mapping).
   let tail_map = volume.dax_map_read_at(&mut store, no, chunk).unwrap();
-  assert_eq!(tail_map.block_file_start, chunk, "the tail mapping begins at the open tail's offset");
-  assert_eq!(tail_map.file_len, tail, "the tail mapping's length is the open tail's bytes");
-  assert!(!tail_map.snapshot, "the open tail is a direct (non-snapshot) mapping");
+  assert_eq!(
+    tail_map.block_file_start, chunk,
+    "the tail mapping begins at the open tail's offset"
+  );
+  assert_eq!(
+    tail_map.file_len, tail,
+    "the tail mapping's length is the open tail's bytes"
+  );
+  assert!(
+    !tail_map.snapshot,
+    "the open tail is a direct (non-snapshot) mapping"
+  );
   let got = volume.dax_read(&store, &tail_map, 0, tail).unwrap();
   assert!(all_bytes(&got, 0x33), "the open tail reads its plaintext");
 
   // Offset 0 is in the sealed head -> the REOPEN arm decrypts the chunk IN PLACE and maps its own block directly (no
   // throwaway snapshot — one representation), reading the chunk's plaintext.
   let head_map = volume.dax_map_read_at(&mut store, no, 0).unwrap();
-  assert_eq!(head_map.block_file_start, 0, "the head mapping begins at offset 0");
-  assert_eq!(head_map.file_len, chunk, "the head mapping spans the sealed chunk's bytes");
+  assert_eq!(
+    head_map.block_file_start, 0,
+    "the head mapping begins at offset 0"
+  );
+  assert_eq!(
+    head_map.file_len, chunk,
+    "the head mapping spans the sealed chunk's bytes"
+  );
   assert!(
     !head_map.snapshot,
     "the reopened head is a direct (non-snapshot) mapping — one representation, no copy"
   );
   let head_bytes = volume.dax_read(&store, &head_map, 0, DAX_PAGE).unwrap();
-  assert!(all_bytes(&head_bytes, 0x33), "the reopened head reads its plaintext");
+  assert!(
+    all_bytes(&head_bytes, 0x33),
+    "the reopened head reads its plaintext"
+  );
 }
 
 /// §4.6 the LEARNED re-seal hold. Do: map a sealed chunk (reopening it), revoke it and sweep — which re-seals it at
@@ -1665,7 +1690,10 @@ fn the_reseal_hold_is_learned_from_a_guest_that_comes_back() {
   let first = volume.dax_map_read_at(&mut store, no, 0).unwrap();
   assert!(store.dax_revoke(&first), "the first window is revoked");
   volume.seal_idle(&mut store, u64::MAX);
-  assert!(!volume.dax_still_current(&store, &first), "re-sealed at hold zero");
+  assert!(
+    !volume.dax_still_current(&store, &first),
+    "re-sealed at hold zero"
+  );
 
   // The guest comes straight back: that encrypt and this decrypt were both avoidable, and the volume learns.
   let second = volume.dax_map_read_at(&mut store, no, 0).unwrap();

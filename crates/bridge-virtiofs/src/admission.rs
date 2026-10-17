@@ -747,7 +747,10 @@ impl<S: VmmSeam> AdmittedDevice<S> {
     if let Some(done) = completed
       && done.interrupt_wanted
     {
-      self.seam.notify_used(done.queue).map_err(ServeError::Seam)?;
+      self
+        .seam
+        .notify_used(done.queue)
+        .map_err(ServeError::Seam)?;
       self.counters.notifications = self.counters.notifications.saturating_add(1);
     }
     Ok(completed)

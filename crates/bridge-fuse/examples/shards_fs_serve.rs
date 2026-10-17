@@ -90,9 +90,16 @@ mod unix {
     )
     .unwrap();
     let root = vol.root_inode(&store).unwrap();
-    let hello = vol.create_file_no(&mut store, root, "hello", 0o644).unwrap();
+    let hello = vol
+      .create_file_no(&mut store, root, "hello", 0o644)
+      .unwrap();
     vol
-      .write(&mut store, hello, 0, b"hello from slates over shards virtio-fs\n")
+      .write(
+        &mut store,
+        hello,
+        0,
+        b"hello from slates over shards virtio-fs\n",
+      )
       .unwrap();
 
     // The bridge is the one FUSE seam the kernel mount uses too; it borrows the volume for serving.

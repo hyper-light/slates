@@ -212,7 +212,10 @@ const CONFIG_AT_SIZE: usize = U32_LEN;
 
 /// Builds `struct virtio_fs_config` (§5.11.4): the mount `tag` (36 bytes, already NUL-padded) then
 /// `num_request_queues` (`u32`, little-endian). 40 bytes, what the guest reads via `GET_CONFIG`.
-fn fs_config_bytes(tag: &[u8; crate::device::TAG_LEN], num_request_queues: u32) -> [u8; FS_CONFIG_LEN] {
+fn fs_config_bytes(
+  tag: &[u8; crate::device::TAG_LEN],
+  num_request_queues: u32,
+) -> [u8; FS_CONFIG_LEN] {
   let mut config = [0u8; FS_CONFIG_LEN];
   if let Some(field) = config.get_mut(0..crate::device::TAG_LEN) {
     field.copy_from_slice(tag);
@@ -270,7 +273,9 @@ impl std::fmt::Display for VhostError {
       Self::Closed => f.write_str("the front end closed its end"),
       Self::Protocol { reason } => write!(f, "protocol: {reason}"),
       Self::Memory { reason } => write!(f, "memory: {reason}"),
-      Self::MapRefused { status } => write!(f, "the front end refused a shmem map: status {status}"),
+      Self::MapRefused { status } => {
+        write!(f, "the front end refused a shmem map: status {status}")
+      }
       Self::Table(e) => write!(f, "memory table: {e}"),
     }
   }
@@ -958,13 +963,15 @@ impl VhostUserSeam {
     }
     let offset = usize::try_from(u32_at(payload, CONFIG_AT_OFFSET)?)
       .map_err(|_| protocol("a GET_CONFIG offset"))?;
-    let size =
-      usize::try_from(u32_at(payload, CONFIG_AT_SIZE)?).map_err(|_| protocol("a GET_CONFIG size"))?;
+    let size = usize::try_from(u32_at(payload, CONFIG_AT_SIZE)?)
+      .map_err(|_| protocol("a GET_CONFIG size"))?;
     let end = offset
       .checked_add(size)
       .ok_or(protocol("a GET_CONFIG range that overflows"))?;
     if end > FS_CONFIG_LEN {
-      return Err(protocol("a GET_CONFIG range past the virtio-fs config space"));
+      return Err(protocol(
+        "a GET_CONFIG range past the virtio-fs config space",
+      ));
     }
     let config = fs_config_bytes(&self.config_tag, self.num_request_queues);
     let mut body = vec![0u8; CONFIG_MSG_HEAD_LEN.saturating_add(size)];
@@ -994,9 +1001,9 @@ impl VhostUserSeam {
         "a back-end-request fd message without exactly one descriptor",
       ));
     }
-    let socket = fds
-      .pop()
-      .ok_or(protocol("a back-end-request fd message without a descriptor"))?;
+    let socket = fds.pop().ok_or(protocol(
+      "a back-end-request fd message without a descriptor",
+    ))?;
     self.backend_req = Some(BackendReqChannel::adopt(socket));
     Ok(Answer::Acknowledge)
   }
@@ -1240,7 +1247,13 @@ fn u64_of(payload: &[u8]) -> Result<u64, VhostError> {
 /// of the mapped range within the supplied descriptor; `shm_offset` its byte offset within region `shmid`; `len`
 /// its length; `writable` sets `MAP_RW`. An unmap carries `fd_offset = 0` and `writable = false` (the front end
 /// reads only `shmid`, `shm_offset` and `len` for it). The seven bytes after `shmid` are padding, left zero.
-fn encode_mmap(shmid: u8, fd_offset: u64, shm_offset: u64, len: u64, writable: bool) -> [u8; MMAP_LEN] {
+fn encode_mmap(
+  shmid: u8,
+  fd_offset: u64,
+  shm_offset: u64,
+  len: u64,
+  writable: bool,
+) -> [u8; MMAP_LEN] {
   let mut body = [0u8; MMAP_LEN];
   if let Some(byte) = body.get_mut(MMAP_AT_SHMID) {
     *byte = shmid;
@@ -1424,7 +1437,9 @@ impl BackendReqChannel {
         None => true,
       };
       if !pushed {
-        return Err(protocol("the map descriptor did not fit the ancillary buffer"));
+        return Err(protocol(
+          "the map descriptor did not fit the ancillary buffer",
+        ));
       }
       match rustix::net::sendmsg(
         &self.socket,
@@ -1503,7 +1518,10 @@ impl VmmSeam for VhostUserSeam {
   /// [`crate::dax::DaxPlacer::Message`]. A non-DAX device (and the default) has none, so DAX stays unserved.
   fn dax_message_channel(&mut self) -> Option<(BackendReqChannel, u64)> {
     if self.dax_enabled {
-      self.backend_req.take().map(|channel| (channel, self.dax_region_bytes))
+      self
+        .backend_req
+        .take()
+        .map(|channel| (channel, self.dax_region_bytes))
     } else {
       None
     }
@@ -1617,7 +1635,10 @@ impl std::fmt::Display for MessagePlaceError {
         f.write_str("a DAX map range was zero, unaligned, or outside the cache region")
       }
       Self::TooManyOutstanding { bound } => {
-        write!(f, "the back-end-request ring is full at its bound of {bound}")
+        write!(
+          f,
+          "the back-end-request ring is full at its bound of {bound}"
+        )
       }
       Self::Channel(e) => write!(f, "the back-end-request channel refused: {e}"),
     }
@@ -1720,7 +1741,10 @@ impl<T: Copy> MessagePlacer<T> {
   /// can be live, each awaiting at most one unmap) plus one in-flight map while a teardown's unmaps drain. A request
   /// past this is refused, never grown (banned: unbounded growth).
   fn outstanding_bound(&self) -> usize {
-    let per_page = self.region_bytes.checked_div(self.page_bytes()).unwrap_or(0);
+    let per_page = self
+      .region_bytes
+      .checked_div(self.page_bytes())
+      .unwrap_or(0);
     let pages = usize::try_from(per_page).unwrap_or(usize::MAX);
     pages.saturating_add(1)
   }
@@ -1732,7 +1756,9 @@ impl<T: Copy> MessagePlacer<T> {
     if len == 0 || !moffset.is_multiple_of(page) || !len.is_multiple_of(page) {
       return Err(MessagePlaceError::BadRange);
     }
-    let end = moffset.checked_add(len).ok_or(MessagePlaceError::BadRange)?;
+    let end = moffset
+      .checked_add(len)
+      .ok_or(MessagePlaceError::BadRange)?;
     if end > self.region_bytes {
       return Err(MessagePlaceError::BadRange);
     }
@@ -1779,12 +1805,7 @@ impl<T: Copy> MessagePlacer<T> {
   /// under `token`. The block stays pinned until [`MessagePlacer::poll_acks`] yields this request's
   /// [`DaxCompletion::Unmapped`], at which point the caller unpins it (§4.6 phase two). Send-before-record, as
   /// [`MessagePlacer::begin_map`].
-  pub fn begin_unmap(
-    &mut self,
-    moffset: u64,
-    len: u64,
-    token: T,
-  ) -> Result<(), MessagePlaceError> {
+  pub fn begin_unmap(&mut self, moffset: u64, len: u64, token: T) -> Result<(), MessagePlaceError> {
     self.check_range(moffset, len)?;
     self.room()?;
     self
@@ -1808,18 +1829,24 @@ impl<T: Copy> MessagePlacer<T> {
       match self.channel.recv_ack() {
         Ok(false) => break,
         Ok(true) => {
-          let op = self.outstanding.pop_front().ok_or(MessagePlaceError::Channel(
-            protocol("a back-end-request reply-ack with no request outstanding"),
-          ))?;
+          let op = self
+            .outstanding
+            .pop_front()
+            .ok_or(MessagePlaceError::Channel(protocol(
+              "a back-end-request reply-ack with no request outstanding",
+            )))?;
           completed.push(match op.op {
             DaxOp::Map => DaxCompletion::Mapped(op.token),
             DaxOp::Unmap => DaxCompletion::Unmapped(op.token),
           });
         }
         Err(VhostError::MapRefused { status }) => {
-          let op = self.outstanding.pop_front().ok_or(MessagePlaceError::Channel(
-            protocol("a back-end-request reply-ack with no request outstanding"),
-          ))?;
+          let op = self
+            .outstanding
+            .pop_front()
+            .ok_or(MessagePlaceError::Channel(protocol(
+              "a back-end-request reply-ack with no request outstanding",
+            )))?;
           completed.push(match op.op {
             DaxOp::Map => DaxCompletion::MapRefused {
               token: op.token,
@@ -1986,7 +2013,9 @@ mod shmem_tests {
     let done = placer.poll_acks().unwrap();
     assert_eq!(done.len(), 2, "both acks drained");
     match done[0] {
-      DaxCompletion::Mapped(token) => assert_eq!(token, 100, "the first completion is the map's token"),
+      DaxCompletion::Mapped(token) => {
+        assert_eq!(token, 100, "the first completion is the map's token")
+      }
       _ => panic!("the first completion must be the map"),
     }
     match done[1] {
@@ -2008,8 +2037,11 @@ mod shmem_tests {
     rustix::io::pwrite(&mem, &[0u8; 64], 0).unwrap();
     let page = rustix::param::page_size().max(1);
     let pg = u64::try_from(page).unwrap();
-    let mut placer: MessagePlacer<u64> =
-      MessagePlacer::new(BackendReqChannel::adopt(backend), page, u64::try_from(page.saturating_mul(4)).unwrap());
+    let mut placer: MessagePlacer<u64> = MessagePlacer::new(
+      BackendReqChannel::adopt(backend),
+      page,
+      u64::try_from(page.saturating_mul(4)).unwrap(),
+    );
 
     placer.begin_map(0, pg, mem.as_fd(), 0, true, 7).unwrap();
     assert_eq!(front_read_request(&frontend), backend_request::SHMEM_MAP);
@@ -2092,14 +2124,19 @@ mod shmem_tests {
     want[MMAP_AT_LEN..MMAP_AT_LEN + 8].copy_from_slice(&0x0001_0000u64.to_le_bytes());
     want[MMAP_AT_FLAGS..MMAP_AT_FLAGS + 8].copy_from_slice(&MMAP_FLAG_MAP_RW.to_le_bytes());
     assert_eq!(body, want);
-    assert_eq!(&body[1..8], &[0u8; 7], "the seven bytes after shmid are padding");
+    assert_eq!(
+      &body[1..8],
+      &[0u8; 7],
+      "the seven bytes after shmid are padding"
+    );
   }
 
   /// A non-zero reply-ack status is the typed map refusal, never a silent success.
   #[test]
   fn a_non_zero_ack_is_a_typed_map_refusal() {
     let mut ack = [0u8; HEADER_LEN + ACK_LEN];
-    ack[HEADER_AT_FLAGS..HEADER_AT_FLAGS + 4].copy_from_slice(&(VERSION | FLAG_REPLY).to_le_bytes());
+    ack[HEADER_AT_FLAGS..HEADER_AT_FLAGS + 4]
+      .copy_from_slice(&(VERSION | FLAG_REPLY).to_le_bytes());
     ack[HEADER_AT_SIZE..HEADER_AT_SIZE + 4]
       .copy_from_slice(&u32::try_from(ACK_LEN).unwrap().to_le_bytes());
     ack[HEADER_LEN..].copy_from_slice(&22u64.to_le_bytes());
@@ -2158,7 +2195,11 @@ mod shmem_tests {
     assert_eq!(body[MMAP_AT_SHMID], 5);
     assert_eq!(u64_at(body, MMAP_AT_SHM_OFFSET).unwrap(), 0x2000);
     assert_eq!(u64_at(body, MMAP_AT_LEN).unwrap(), block_len);
-    assert_eq!(u64_at(body, MMAP_AT_FLAGS).unwrap(), 0, "read-only clears MAP_RW");
+    assert_eq!(
+      u64_at(body, MMAP_AT_FLAGS).unwrap(),
+      0,
+      "read-only clears MAP_RW"
+    );
 
     // the descriptor really crossed: the block's bytes read back through the fd the front end received.
     let mut fds = Vec::new();
@@ -2180,7 +2221,8 @@ mod shmem_tests {
     // the front end acknowledges success (status 0); the back end reads and accepts the ack.
     let mut ack = [0u8; HEADER_LEN + ACK_LEN];
     ack[0..4].copy_from_slice(&backend_request::SHMEM_MAP.to_le_bytes());
-    ack[HEADER_AT_FLAGS..HEADER_AT_FLAGS + 4].copy_from_slice(&(VERSION | FLAG_REPLY).to_le_bytes());
+    ack[HEADER_AT_FLAGS..HEADER_AT_FLAGS + 4]
+      .copy_from_slice(&(VERSION | FLAG_REPLY).to_le_bytes());
     ack[HEADER_AT_SIZE..HEADER_AT_SIZE + 4]
       .copy_from_slice(&u32::try_from(ACK_LEN).unwrap().to_le_bytes());
     rustix::net::sendmsg(
@@ -2210,12 +2252,21 @@ mod shmem_tests {
     send_front_message(&frontend, request::GET_PROTOCOL_FEATURES, 0, None);
     seam.serve_control().unwrap();
     let offered = read_front_u64(&frontend);
-    assert_ne!(offered & PROTOCOL_F_BACKEND_REQ, 0, "a DAX device offers BACKEND_REQ");
+    assert_ne!(
+      offered & PROTOCOL_F_BACKEND_REQ,
+      0,
+      "a DAX device offers BACKEND_REQ"
+    );
     assert_ne!(offered & PROTOCOL_F_SHMEM, 0, "a DAX device offers SHMEM");
 
     // SET_BACKEND_REQ_FD: a fresh pair, its 'a' end handed to the seam, 'b' kept as the front end's handler.
     let (req_a, req_b) = stream_pair();
-    send_front_message(&frontend, request::SET_BACKEND_REQ_FD, 0, Some(req_a.as_fd()));
+    send_front_message(
+      &frontend,
+      request::SET_BACKEND_REQ_FD,
+      0,
+      Some(req_a.as_fd()),
+    );
     seam.serve_control().unwrap();
     drop(req_a); // the seam holds a dup; this end is no longer needed
     assert!(
@@ -2267,7 +2318,11 @@ mod shmem_tests {
     )
     .unwrap();
     assert_eq!(got.bytes, buf.len());
-    assert_eq!(u32_at(&buf, HEADER_LEN).unwrap(), 1, "exactly one DAX cache region");
+    assert_eq!(
+      u32_at(&buf, HEADER_LEN).unwrap(),
+      1,
+      "exactly one DAX cache region"
+    );
     assert_eq!(
       u64_at(&buf, HEADER_LEN + SHMEM_CONFIG_SIZES).unwrap(),
       region,
@@ -2295,7 +2350,12 @@ mod shmem_tests {
 
     // an unsolicited SET_BACKEND_REQ_FD is refused (the feature was never offered): the control loop ends.
     let (req_a, _req_b) = stream_pair();
-    send_front_message(&frontend, request::SET_BACKEND_REQ_FD, 0, Some(req_a.as_fd()));
+    send_front_message(
+      &frontend,
+      request::SET_BACKEND_REQ_FD,
+      0,
+      Some(req_a.as_fd()),
+    );
     assert!(
       seam.serve_control().is_err(),
       "a back-end-request fd without the shmem feature is refused"

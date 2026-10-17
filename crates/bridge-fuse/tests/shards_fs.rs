@@ -117,9 +117,18 @@ fn a_shards_microvm_fs_frame_is_served_by_the_slates_bridge() {
     serve_one(&mut server, &mut bridge, &cx, &mut reply).unwrap(),
     "a framed request is read, dispatched and answered"
   );
-  let answered = read_shards_frame(&mut client, 1 << 16).unwrap().expect("a framed reply");
-  assert_eq!(errno(&answered), 0, "slates answered the guest's GETATTR over shards' le32 framing");
-  assert!(answered.len() > OUT_HEADER_LEN, "the reply carries the root's attributes, not a bare error header");
+  let answered = read_shards_frame(&mut client, 1 << 16)
+    .unwrap()
+    .expect("a framed reply");
+  assert_eq!(
+    errno(&answered),
+    0,
+    "slates answered the guest's GETATTR over shards' le32 framing"
+  );
+  assert!(
+    answered.len() > OUT_HEADER_LEN,
+    "the reply carries the root's attributes, not a bare error header"
+  );
 
   // The guest's fs device closes the socket: serving ends at EOF, cleanly.
   drop(client);
@@ -134,7 +143,11 @@ const HELLO: &[u8] = b"hello from slates over shards virtio-fs\n";
 
 /// A `u64` at the start of a reply's body (the field `EntryOut.nodeid` and `OpenOut.fh` both begin with).
 fn body_u64(reply: &[u8]) -> u64 {
-  u64::from_le_bytes(reply[OUT_HEADER_LEN..OUT_HEADER_LEN + 8].try_into().unwrap())
+  u64::from_le_bytes(
+    reply[OUT_HEADER_LEN..OUT_HEADER_LEN + 8]
+      .try_into()
+      .unwrap(),
+  )
 }
 
 /// A single-threaded in-memory duplex: one `Read + Write` the backend serves on, with no OS socket — so the full
@@ -152,7 +165,10 @@ impl Read for MemDuplex {
   fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
     let avail = self.inbox.get(self.pos..).unwrap_or_default();
     let n = avail.len().min(buf.len());
-    buf.get_mut(..n).unwrap_or_default().copy_from_slice(avail.get(..n).unwrap_or_default());
+    buf
+      .get_mut(..n)
+      .unwrap_or_default()
+      .copy_from_slice(avail.get(..n).unwrap_or_default());
     self.pos += n;
     Ok(n)
   }
@@ -176,13 +192,27 @@ fn framed(request: &[u8]) -> Vec<u8> {
 }
 
 /// Pushes a framed request, serves one, and returns the reply's bytes (unframed), over the in-memory duplex.
-fn exchange(duplex: &mut MemDuplex, bridge: &mut VolumeBridge<'_>, cx: &OpContext, request: &[u8]) -> Vec<u8> {
+fn exchange(
+  duplex: &mut MemDuplex,
+  bridge: &mut VolumeBridge<'_>,
+  cx: &OpContext,
+  request: &[u8],
+) -> Vec<u8> {
   duplex.inbox.extend_from_slice(&framed(request));
   let mut reply = vec![0u8; 1 << 16];
-  assert!(serve_one(duplex, bridge, cx, &mut reply).unwrap(), "the framed request was served");
+  assert!(
+    serve_one(duplex, bridge, cx, &mut reply).unwrap(),
+    "the framed request was served"
+  );
   // serve_one appended one reply frame (le32 len + bytes); take it from where the previous reply ended.
   let frame = duplex.outbox.get(duplex.taken..).unwrap_or_default();
-  let len = u32::from_le_bytes(frame.get(0..4).unwrap_or(&[0; 4]).try_into().unwrap_or([0; 4])) as usize;
+  let len = u32::from_le_bytes(
+    frame
+      .get(0..4)
+      .unwrap_or(&[0; 4])
+      .try_into()
+      .unwrap_or([0; 4]),
+  ) as usize;
   let reply = frame.get(4..4 + len).unwrap_or_default().to_vec();
   duplex.taken += 4 + len;
   reply
@@ -211,7 +241,9 @@ fn the_slates_backend_answers_a_guests_full_mount_and_read_of_a_file() {
   .unwrap();
   // One file `hello` under the root, with distinctive content, before the bridge borrows the volume.
   let root = vol.root_inode(&store).unwrap();
-  let hello = vol.create_file_no(&mut store, root, "hello", 0o644).unwrap();
+  let hello = vol
+    .create_file_no(&mut store, root, "hello", 0o644)
+    .unwrap();
   vol.write(&mut store, hello, 0, HELLO).unwrap();
   let mut bridge = VolumeBridge::new(VolumeId { bytes: [0; 16] }, &mut vol, &mut store);
   let cx = test_cx();
@@ -224,11 +256,21 @@ fn the_slates_backend_answers_a_guests_full_mount_and_read_of_a_file() {
   init.extend_from_slice(&0u32.to_le_bytes());
   init.extend_from_slice(&0u32.to_le_bytes());
   init.resize(64, 0);
-  let r = exchange(&mut duplex, &mut bridge, &cx, &message(Opcode::Init as u32, 1, 0, &init));
+  let r = exchange(
+    &mut duplex,
+    &mut bridge,
+    &cx,
+    &message(Opcode::Init as u32, 1, 0, &init),
+  );
   assert_eq!(errno(&r), 0, "INIT served");
 
   // LOOKUP "hello" under the root (nodeid 1): the reply's body begins with the file's inode number.
-  let r = exchange(&mut duplex, &mut bridge, &cx, &message(Opcode::Lookup as u32, 2, 1, b"hello\0"));
+  let r = exchange(
+    &mut duplex,
+    &mut bridge,
+    &cx,
+    &message(Opcode::Lookup as u32, 2, 1, b"hello\0"),
+  );
   assert_eq!(errno(&r), 0, "LOOKUP of hello served");
   let nodeid = body_u64(&r);
   assert_ne!(nodeid, 0, "the lookup resolved the file to a nodeid");
@@ -236,7 +278,12 @@ fn the_slates_backend_answers_a_guests_full_mount_and_read_of_a_file() {
   // OPEN that inode (fuse_open_in: flags u32, then 4 padding): the reply's body begins with the file handle.
   let mut open_in = 0u32.to_le_bytes().to_vec();
   open_in.extend_from_slice(&[0u8; 4]);
-  let r = exchange(&mut duplex, &mut bridge, &cx, &message(Opcode::Open as u32, 3, nodeid, &open_in));
+  let r = exchange(
+    &mut duplex,
+    &mut bridge,
+    &cx,
+    &message(Opcode::Open as u32, 3, nodeid, &open_in),
+  );
   assert_eq!(errno(&r), 0, "OPEN served");
   let fh = body_u64(&r);
 
@@ -245,7 +292,12 @@ fn the_slates_backend_answers_a_guests_full_mount_and_read_of_a_file() {
   read_in[0..8].copy_from_slice(&fh.to_le_bytes());
   read_in[8..16].copy_from_slice(&0u64.to_le_bytes());
   read_in[16..20].copy_from_slice(&u32::try_from(HELLO.len()).unwrap().to_le_bytes());
-  let r = exchange(&mut duplex, &mut bridge, &cx, &message(Opcode::Read as u32, 4, nodeid, &read_in));
+  let r = exchange(
+    &mut duplex,
+    &mut bridge,
+    &cx,
+    &message(Opcode::Read as u32, 4, nodeid, &read_in),
+  );
   assert_eq!(errno(&r), 0, "READ served");
   assert_eq!(
     &r[OUT_HEADER_LEN..],
@@ -267,13 +319,21 @@ fn a_hostile_or_truncated_shards_fs_frame_is_refused_before_allocating() {
   let colossal = u32::MAX.to_le_bytes();
   let mut src = colossal.as_slice();
   let err = read_shards_frame(&mut src, 1 << 16).unwrap_err();
-  assert_eq!(err.kind(), ErrorKind::InvalidData, "a colossal frame length is refused, not allocated");
+  assert_eq!(
+    err.kind(),
+    ErrorKind::InvalidData,
+    "a colossal frame length is refused, not allocated"
+  );
 
   // One byte past the caller's bound (the reply buffer): the same refusal.
   let over = 65_537u32.to_le_bytes();
   let mut src = over.as_slice();
   let err = read_shards_frame(&mut src, 1 << 16).unwrap_err();
-  assert_eq!(err.kind(), ErrorKind::InvalidData, "a frame one byte past the bound is refused");
+  assert_eq!(
+    err.kind(),
+    ErrorKind::InvalidData,
+    "a frame one byte past the bound is refused"
+  );
 
   // A truncated frame: claims 100 bytes, supplies 4 — an error, never a hang or an over-read.
   let mut truncated = 100u32.to_le_bytes().to_vec();

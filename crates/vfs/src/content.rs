@@ -629,7 +629,9 @@ impl ChunkStore {
       let last = index.saturating_add(1) == segments;
       let opened = u32::try_from(index).ok().and_then(|at| {
         let tag = *self.tags.tag(seal.tags, index)?;
-        cipher.open(seal.key, seal.version, at, last, segment, &tag).ok()
+        cipher
+          .open(seal.key, seal.version, at, last, segment, &tag)
+          .ok()
       });
       if opened.is_none() {
         refused = true;
@@ -655,7 +657,9 @@ impl ChunkStore {
   ) -> Result<Block, VfsError> {
     let full = self.granule_round(record.len);
     let mut plain = Vec::new();
-    plain.try_reserve_exact(len).map_err(|_| VfsError::NoSpace)?;
+    plain
+      .try_reserve_exact(len)
+      .map_err(|_| VfsError::NoSpace)?;
     plain.resize(len, 0);
     let read = self.read_extent_into(extent, extent.off, &mut plain);
     if let Err(e) = read {
@@ -1737,8 +1741,14 @@ mod tests {
     let sealed_count = s.sealed();
     // Reopen in place: the chunk's own block (a full, un-imaged block) now holds plaintext, the seal cleared.
     let block = s.reopen_in_place(&extent).unwrap();
-    assert_eq!(block, sealed_block, "reopened in place — the same block, no copy");
-    assert!(s.chunk(chunk).unwrap().seal.is_none(), "the seal is cleared");
+    assert_eq!(
+      block, sealed_block,
+      "reopened in place — the same block, no copy"
+    );
+    assert!(
+      s.chunk(chunk).unwrap().seal.is_none(),
+      "the seal is cleared"
+    );
     assert_eq!(
       &s.arena().bytes(block).unwrap()[..SEALED_LEN],
       &plain[..],
@@ -1750,7 +1760,11 @@ mod tests {
     // Re-seal on cold: the arena holds ciphertext again, the sealed count restored, and it still reads back plain.
     s.reseal(chunk, KEY).unwrap();
     assert!(s.chunk(chunk).unwrap().seal.is_some(), "sealed again");
-    assert_eq!(s.sealed(), sealed_count.saturating_add(1), "the re-seal is counted");
+    assert_eq!(
+      s.sealed(),
+      sealed_count.saturating_add(1),
+      "the re-seal is counted"
+    );
     let held = s.chunk(chunk).unwrap().block;
     assert_ne!(
       &s.arena().bytes(held).unwrap()[..SEALED_LEN],
@@ -1758,7 +1772,8 @@ mod tests {
       "the arena holds ciphertext again"
     );
     let mut reread = vec![0u8; SEALED_LEN];
-    s.read_extent_into(&extent, extent.off, &mut reread).unwrap();
+    s.read_extent_into(&extent, extent.off, &mut reread)
+      .unwrap();
     assert_eq!(reread, plain, "reads back plain after the re-seal");
   }
 

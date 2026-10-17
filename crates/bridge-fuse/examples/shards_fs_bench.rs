@@ -52,7 +52,10 @@ impl Read for MemDuplex {
   fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
     let avail = self.inbox.get(self.pos..).unwrap_or_default();
     let n = avail.len().min(buf.len());
-    buf.get_mut(..n).unwrap_or_default().copy_from_slice(avail.get(..n).unwrap_or_default());
+    buf
+      .get_mut(..n)
+      .unwrap_or_default()
+      .copy_from_slice(avail.get(..n).unwrap_or_default());
     self.pos += n;
     Ok(n)
   }
@@ -86,16 +89,34 @@ fn framed(request: &[u8]) -> Vec<u8> {
 }
 
 /// Serves `request` once and returns the reply's bytes (unframed).
-fn once(duplex: &mut MemDuplex, bridge: &mut VolumeBridge<'_>, cx: &OpContext, framed_request: &[u8], reply: &mut [u8]) -> Vec<u8> {
+fn once(
+  duplex: &mut MemDuplex,
+  bridge: &mut VolumeBridge<'_>,
+  cx: &OpContext,
+  framed_request: &[u8],
+  reply: &mut [u8],
+) -> Vec<u8> {
   duplex.load(framed_request);
   serve_one(duplex, bridge, cx, reply).unwrap();
   let frame = &duplex.outbox;
-  let len = u32::from_le_bytes(frame.get(0..4).unwrap_or(&[0; 4]).try_into().unwrap_or([0; 4])) as usize;
+  let len = u32::from_le_bytes(
+    frame
+      .get(0..4)
+      .unwrap_or(&[0; 4])
+      .try_into()
+      .unwrap_or([0; 4]),
+  ) as usize;
   frame.get(4..4 + len).unwrap_or_default().to_vec()
 }
 
 /// Best-of-N wall-clock of serving one framed request.
-fn best(duplex: &mut MemDuplex, bridge: &mut VolumeBridge<'_>, cx: &OpContext, framed_request: &[u8], reply: &mut [u8]) -> Duration {
+fn best(
+  duplex: &mut MemDuplex,
+  bridge: &mut VolumeBridge<'_>,
+  cx: &OpContext,
+  framed_request: &[u8],
+  reply: &mut [u8],
+) -> Duration {
   let mut best = Duration::MAX;
   for _ in 0..N {
     duplex.load(framed_request);
@@ -108,26 +129,54 @@ fn best(duplex: &mut MemDuplex, bridge: &mut VolumeBridge<'_>, cx: &OpContext, f
 
 fn main() {
   let mut arena = ChunkArena::new(PAGE);
-  arena.add_region(Region::map(PAGE * REGION_PAGES, PAGE, false).unwrap()).unwrap();
+  arena
+    .add_region(Region::map(PAGE * REGION_PAGES, PAGE, false).unwrap())
+    .unwrap();
   let mut store = Store::new(
-    &StoreConfig { page: PAGE, cache_line: 128, max_dirs: 64, max_inodes: 256, max_chunks: REGION_PAGES, max_dir_blocks: 64, dir_cutover: 16 },
+    &StoreConfig {
+      page: PAGE,
+      cache_line: 128,
+      max_dirs: 64,
+      max_inodes: 256,
+      max_chunks: REGION_PAGES,
+      max_dir_blocks: 64,
+      dir_cutover: 16,
+    },
     arena,
     0,
   );
   let vid = VolumeId { bytes: [0; 16] };
   let mut vol = Volume::create(
     &mut store,
-    VolumeConfig { prefix: 1, names: NameEquivalence::Exact, quota: Quota::Bounded { limit: 1 << 30 }, journal_bytes: 1 << 16, clock: Box::new(HostClock::default()) },
+    VolumeConfig {
+      prefix: 1,
+      names: NameEquivalence::Exact,
+      quota: Quota::Bounded { limit: 1 << 30 },
+      journal_bytes: 1 << 16,
+      clock: Box::new(HostClock::default()),
+    },
   )
   .unwrap();
   let root = vol.root_inode(&store).unwrap();
-  let hello = vol.create_file_no(&mut store, root, "hello", 0o644).unwrap();
-  vol.write(&mut store, hello, 0, &vec![0xC7u8; FILE_BYTES]).unwrap();
+  let hello = vol
+    .create_file_no(&mut store, root, "hello", 0o644)
+    .unwrap();
+  vol
+    .write(&mut store, hello, 0, &vec![0xC7u8; FILE_BYTES])
+    .unwrap();
   let mut bridge = VolumeBridge::new(vid, &mut vol, &mut store);
 
   let mut attachments = Attachments::new();
   let id = attachments
-    .attach(vid, View::Current, Principal::Uid { uid: 0 }, Rights { read: true, write: true })
+    .attach(
+      vid,
+      View::Current,
+      Principal::Uid { uid: 0 },
+      Rights {
+        read: true,
+        write: true,
+      },
+    )
     .unwrap();
   let cx: OpContext = attachments.context(id).unwrap();
 
@@ -141,13 +190,35 @@ fn main() {
   init.resize(64, 0);
 
   let mut duplex = MemDuplex::default();
-  let _ = once(&mut duplex, &mut bridge, &cx, &framed(&message(Opcode::Init as u32, 1, 0, &init)), &mut reply);
-  let look = once(&mut duplex, &mut bridge, &cx, &framed(&message(Opcode::Lookup as u32, 2, 1, b"hello\0")), &mut reply);
+  let _ = once(
+    &mut duplex,
+    &mut bridge,
+    &cx,
+    &framed(&message(Opcode::Init as u32, 1, 0, &init)),
+    &mut reply,
+  );
+  let look = once(
+    &mut duplex,
+    &mut bridge,
+    &cx,
+    &framed(&message(Opcode::Lookup as u32, 2, 1, b"hello\0")),
+    &mut reply,
+  );
   let nodeid = u64::from_le_bytes(look[OUT_HEADER_LEN..OUT_HEADER_LEN + 8].try_into().unwrap());
   let mut open_in = 0u32.to_le_bytes().to_vec();
   open_in.extend_from_slice(&[0u8; 4]);
-  let opened = once(&mut duplex, &mut bridge, &cx, &framed(&message(Opcode::Open as u32, 3, nodeid, &open_in)), &mut reply);
-  let fh = u64::from_le_bytes(opened[OUT_HEADER_LEN..OUT_HEADER_LEN + 8].try_into().unwrap());
+  let opened = once(
+    &mut duplex,
+    &mut bridge,
+    &cx,
+    &framed(&message(Opcode::Open as u32, 3, nodeid, &open_in)),
+    &mut reply,
+  );
+  let fh = u64::from_le_bytes(
+    opened[OUT_HEADER_LEN..OUT_HEADER_LEN + 8]
+      .try_into()
+      .unwrap(),
+  );
 
   let getattr = framed(&message(Opcode::GetAttr as u32, 10, 1, &[0u8; 16]));
   let lookup = framed(&message(Opcode::Lookup as u32, 11, 1, b"hello\0"));
@@ -156,8 +227,19 @@ fn main() {
   read_in[16..20].copy_from_slice(&u32::try_from(FILE_BYTES).unwrap().to_le_bytes());
   let read = framed(&message(Opcode::Read as u32, 12, nodeid, &read_in));
 
-  println!("shards_fs mediated serve latency (best of {N}, in-memory duplex; framing + dispatch, no OS I/O):");
-  println!("  GETATTR (root)      {:?}", best(&mut duplex, &mut bridge, &cx, &getattr, &mut reply));
-  println!("  LOOKUP  (hello)     {:?}", best(&mut duplex, &mut bridge, &cx, &lookup, &mut reply));
-  println!("  READ    ({FILE_BYTES} B)      {:?}", best(&mut duplex, &mut bridge, &cx, &read, &mut reply));
+  println!(
+    "shards_fs mediated serve latency (best of {N}, in-memory duplex; framing + dispatch, no OS I/O):"
+  );
+  println!(
+    "  GETATTR (root)      {:?}",
+    best(&mut duplex, &mut bridge, &cx, &getattr, &mut reply)
+  );
+  println!(
+    "  LOOKUP  (hello)     {:?}",
+    best(&mut duplex, &mut bridge, &cx, &lookup, &mut reply)
+  );
+  println!(
+    "  READ    ({FILE_BYTES} B)      {:?}",
+    best(&mut duplex, &mut bridge, &cx, &read, &mut reply)
+  );
 }

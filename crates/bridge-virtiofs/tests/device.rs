@@ -1832,7 +1832,11 @@ fn a_setupmapping_reaching_past_the_file_is_capped_to_its_authorized_pages() {
     0,
     "a map of exactly the file's authorized pages succeeds"
   );
-  assert_eq!(device.dax_window_count(), 1, "the authorized window is live");
+  assert_eq!(
+    device.dax_window_count(),
+    1,
+    "the authorized window is live"
+  );
   drop(cache);
 }
 
@@ -2786,7 +2790,10 @@ fn a_message_based_setupmapping_parks_until_the_front_end_acks_then_answers_the_
   let queue = FIRST_REQUEST_QUEUE;
   let head = driver.submit(usize::from(queue), &request, 4096, 1);
   let pass = serve(&mut device, queue, &mut driver, &mut bridge, &cx, BATCH).unwrap();
-  assert!(pass.more_pending, "the pass parked the map and asks to come back");
+  assert!(
+    pass.more_pending,
+    "the pass parked the map and asks to come back"
+  );
   assert!(
     driver.reap(usize::from(queue)).is_none(),
     "no used element is published while the map is parked"
@@ -2802,14 +2809,20 @@ fn a_message_based_setupmapping_parks_until_the_front_end_acks_then_answers_the_
   let mut echo = [0u8; 64];
   let read = rustix::io::pread(&got_fd, &mut echo, 0).unwrap();
   assert_eq!(read, 64);
-  assert_eq!(echo, [0x5Au8; 64], "the SHMEM_MAP carried the file's content block");
+  assert_eq!(
+    echo, [0x5Au8; 64],
+    "the SHMEM_MAP carried the file's content block"
+  );
   front_send_ack(&front, backend_request::SHMEM_MAP, 0);
 
   // The device drains the ack, answers the guest, records the window, and releases the chain's charge.
   let completed = device
     .complete_dax_awaiting(&mut driver.memory, &mut bridge, &cx, &mut Unlimited)
     .unwrap();
-  assert!(completed.is_some(), "the parked SETUPMAPPING completed on the ack");
+  assert!(
+    completed.is_some(),
+    "the parked SETUPMAPPING completed on the ack"
+  );
   let (id, len) = driver
     .reap(usize::from(queue))
     .expect("the used element is published after the ack");

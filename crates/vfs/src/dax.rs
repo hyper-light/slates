@@ -224,7 +224,6 @@ impl DaxRegistry {
     }
   }
 
-
   /// Marks inode `no` revoke-pending for the device to munmap (§4.6 step 5), deduped so a burst of writes to one
   /// mapped inode enqueues it once. `writable_only` false (a write/truncate — every window stale) **supersedes** a
   /// prior true (a snapshot — writable windows only) for the same inode, since tearing all windows subsumes tearing

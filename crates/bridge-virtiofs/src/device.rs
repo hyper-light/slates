@@ -376,9 +376,7 @@ impl fmt::Display for DeviceError {
     match self {
       Self::TagEmpty => f.write_str("the tag is empty"),
       #[cfg(target_os = "linux")]
-      Self::DaxPlacement => {
-        f.write_str("the DAX back-end-request channel refused or closed")
-      }
+      Self::DaxPlacement => f.write_str("the DAX back-end-request channel refused or closed"),
       Self::TagTooLong { bytes, max } => {
         write!(f, "the tag is {bytes} bytes; the field holds {max}")
       }
@@ -1109,7 +1107,9 @@ impl Device {
       return Err(self.record_fault(e));
     }
     let written = u32::try_from(n).unwrap_or(u32::MAX);
-    self.queue_at(index)?.push_used(memory, &held.chain, written)?;
+    self
+      .queue_at(index)?
+      .push_used(memory, &held.chain, written)?;
     // Release the charge the parked chain held since its service pass (as `complete_awaiting` does for the
     // owner's barrier) — otherwise each message-based DAX map leaks one request credit.
     admission.complete();
@@ -1300,7 +1300,9 @@ impl Device {
       return Err(e);
     }
     self.count(hiprio, chain.readable_bytes, written);
-    Ok(ChainOutcome::Replied(u32::try_from(written).unwrap_or(u32::MAX)))
+    Ok(ChainOutcome::Replied(
+      u32::try_from(written).unwrap_or(u32::MAX),
+    ))
   }
 
   /// Records what the request was, when it is one the device tracks (INIT, DESTROY).
@@ -1478,7 +1480,10 @@ fn teardown_dax_window(
     // means the channel is gone (the guest cannot reach the block any more), so unpin now rather than leak the pin.
     #[cfg(target_os = "linux")]
     crate::dax::DaxPlacer::Message(message) => {
-      if message.begin_unmap(entry.moffset, entry.len, *entry).is_err() {
+      if message
+        .begin_unmap(entry.moffset, entry.len, *entry)
+        .is_err()
+      {
         let _ = bridge.dax_release_after_unmap(&entry.mapping, cx);
       }
     }
@@ -1606,9 +1611,16 @@ fn map_chunk_at(
     let _ = bridge.dax_unmap(&mapping, cx);
     return MapStep::PastFile;
   }
-  let Some((win_off, object_off, mapped_len)) =
-    chunk_map_params(&mapping, region_off, block_len, cur, foffset, base_moffset, end, granule)
-  else {
+  let Some((win_off, object_off, mapped_len)) = chunk_map_params(
+    &mapping,
+    region_off,
+    block_len,
+    cur,
+    foffset,
+    base_moffset,
+    end,
+    granule,
+  ) else {
     let _ = bridge.dax_unmap(&mapping, cx);
     return MapStep::Refused(dax_errno::EINVAL);
   };
@@ -1619,7 +1631,10 @@ fn map_chunk_at(
   };
   match placer {
     crate::dax::DaxPlacer::Local(cache) => {
-      if cache.map(win_off, mapped_len, fd, object_off, writable).is_err() {
+      if cache
+        .map(win_off, mapped_len, fd, object_off, writable)
+        .is_err()
+      {
         let _ = bridge.dax_unmap(&mapping, cx);
         return MapStep::Refused(dax_errno::EINVAL);
       }
@@ -1689,7 +1704,8 @@ fn serve_dax(
         }
       }
       let object = ObjectId::new(req.header.nodeid, 0);
-      let (Ok(foffset), Ok(requested)) = (usize::try_from(m.foffset), usize::try_from(m.len)) else {
+      let (Ok(foffset), Ok(requested)) = (usize::try_from(m.foffset), usize::try_from(m.len))
+      else {
         return err(dax_errno::EINVAL, out);
       };
       let granule = placer.page().max(1);
@@ -1709,7 +1725,17 @@ fn serve_dax(
       let mut sent = 0usize;
       while cur < end {
         match map_chunk_at(
-          placer, bridge, cx, dax_windows, object, writable, cur, foffset, m.moffset, end, granule,
+          placer,
+          bridge,
+          cx,
+          dax_windows,
+          object,
+          writable,
+          cur,
+          foffset,
+          m.moffset,
+          end,
+          granule,
         ) {
           MapStep::Advanced { this } => {
             mapped_any = true;

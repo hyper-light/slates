@@ -61,11 +61,32 @@ const KEYS_HELD: usize = 4;
 struct Cipher(VersionKey);
 
 impl ChunkCipher for Cipher {
-  fn seal(&self, _: u32, version: u64, index: u32, last: bool, segment: &mut [u8]) -> Result<Tag, VfsError> {
-    self.0.seal(version, index, last, segment).map_err(|_| VfsError::Integrity)
+  fn seal(
+    &self,
+    _: u32,
+    version: u64,
+    index: u32,
+    last: bool,
+    segment: &mut [u8],
+  ) -> Result<Tag, VfsError> {
+    self
+      .0
+      .seal(version, index, last, segment)
+      .map_err(|_| VfsError::Integrity)
   }
-  fn open(&self, _: u32, version: u64, index: u32, last: bool, segment: &mut [u8], tag: &Tag) -> Result<(), VfsError> {
-    self.0.open(version, index, last, segment, tag).map_err(|_| VfsError::Integrity)
+  fn open(
+    &self,
+    _: u32,
+    version: u64,
+    index: u32,
+    last: bool,
+    segment: &mut [u8],
+    tag: &Tag,
+  ) -> Result<(), VfsError> {
+    self
+      .0
+      .open(version, index, last, segment, tag)
+      .map_err(|_| VfsError::Integrity)
   }
   fn identity(&self, _: u32) -> Option<KeyIdentity> {
     Some(KeyIdentity::default())
@@ -97,9 +118,9 @@ fn store(pages: usize) -> Store {
     0,
   );
   let secret = Secret32::from_bytes(&[7u8; 32]).expect("secret");
-  store
-    .content
-    .set_cipher(Box::new(Cipher(VersionKey::new(&secret, [1u8; 16]).expect("key"))));
+  store.content.set_cipher(Box::new(Cipher(
+    VersionKey::new(&secret, [1u8; 16]).expect("key"),
+  )));
   store
 }
 
@@ -109,7 +130,9 @@ fn volume(store: &mut Store, pages: usize) -> Volume {
     VolumeConfig {
       prefix: 7,
       names: NameEquivalence::Fold,
-      quota: Quota::Bounded { limit: (PAGE * pages) as u64 },
+      quota: Quota::Bounded {
+        limit: (PAGE * pages) as u64,
+      },
       journal_bytes: 1 << 20,
       clock: Box::new(StepClock::new(0, 1_000)),
     },
@@ -182,7 +205,13 @@ struct Workload {
 
 /// W1: read the whole file through a bounded live mapped set of `window` bytes, the idle sweep running after each
 /// window (the steady state).
-fn stream(store: &mut Store, vol: &mut Volume, no: InodeNo, chunk: usize, window: usize) -> Workload {
+fn stream(
+  store: &mut Store,
+  vol: &mut Volume,
+  no: InodeNo,
+  chunk: usize,
+  window: usize,
+) -> Workload {
   let baseline = store.content.allocated_bytes();
   let mut sink = Vec::with_capacity(chunk);
   let mut peak_extra = 0usize;
@@ -195,12 +224,21 @@ fn stream(store: &mut Store, vol: &mut Volume, no: InodeNo, chunk: usize, window
     vol.seal_idle(store, u64::MAX);
     at += span;
   }
-  Workload { seconds: started.elapsed().as_secs_f64(), peak_extra }
+  Workload {
+    seconds: started.elapsed().as_secs_f64(),
+    peak_extra,
+  }
 }
 
 /// W2/W3: re-read the same working set `REREADS` times; `sweep_between` runs the idle sweep between reads (cold) or
 /// not (hot — the window lapsed but the chunk has not been re-sealed yet).
-fn reread(store: &mut Store, vol: &mut Volume, no: InodeNo, chunk: usize, sweep_between: bool) -> Workload {
+fn reread(
+  store: &mut Store,
+  vol: &mut Volume,
+  no: InodeNo,
+  chunk: usize,
+  sweep_between: bool,
+) -> Workload {
   let baseline = store.content.allocated_bytes();
   let mut sink = Vec::with_capacity(chunk);
   let mut peak_extra = 0usize;
@@ -214,7 +252,10 @@ fn reread(store: &mut Store, vol: &mut Volume, no: InodeNo, chunk: usize, sweep_
   }
   // Whatever is still reopened is re-sealed at the end either way: the work is owed, not avoided.
   vol.seal_idle(store, u64::MAX);
-  Workload { seconds: started.elapsed().as_secs_f64(), peak_extra }
+  Workload {
+    seconds: started.elapsed().as_secs_f64(),
+    peak_extra,
+  }
 }
 
 fn mib(bytes: usize) -> f64 {
@@ -270,8 +311,13 @@ fn main() {
   let (s2, p2) = best(&hot_runs);
   let (s3, p3) = best(&cold_runs);
 
-  println!("# DAX sealed-chunk backing, WORKLOADS (chunk {chunk} B, AES-256-GCM, best of {RUNS}; runs shown)");
-  println!("# W1 sweep: streaming {} MiB, varying the SIMULTANEOUSLY-MAPPED bytes — the view arm's extra RAM is this curve", mib(FILE_BYTES));
+  println!(
+    "# DAX sealed-chunk backing, WORKLOADS (chunk {chunk} B, AES-256-GCM, best of {RUNS}; runs shown)"
+  );
+  println!(
+    "# W1 sweep: streaming {} MiB, varying the SIMULTANEOUSLY-MAPPED bytes — the view arm's extra RAM is this curve",
+    mib(FILE_BYTES)
+  );
   for (window, runs) in &sweep {
     let (s, p) = best(runs);
     println!(

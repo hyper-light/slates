@@ -49,8 +49,12 @@ pub fn read_shards_frame<S: Read>(conn: &mut S, max: usize) -> io::Result<Option
 /// Writes one shards fs frame: a little-endian `u32` length, then `bytes`. Refused `InvalidInput` if a reply somehow
 /// exceeds `u32` (it cannot — a reply is bounded by the buffer, itself a `usize` the caller keeps under `u32`).
 pub fn write_shards_frame<S: Write>(conn: &mut S, bytes: &[u8]) -> io::Result<()> {
-  let len = u32::try_from(bytes.len())
-    .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "a shards fs reply larger than a u32 frame"))?;
+  let len = u32::try_from(bytes.len()).map_err(|_| {
+    io::Error::new(
+      io::ErrorKind::InvalidInput,
+      "a shards fs reply larger than a u32 frame",
+    )
+  })?;
   conn.write_all(&len.to_le_bytes())?;
   conn.write_all(bytes)
 }

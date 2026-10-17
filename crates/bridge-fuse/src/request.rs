@@ -513,8 +513,14 @@ mod dax_mapping_parse_tests {
   #[test]
   fn a_short_setupmapping_is_refused() {
     let op = Opcode::SetupMapping.to_wire();
-    assert!(SetupMappingIn::parse(op, &[0u8; 39]).is_err(), "39 bytes is one short of the five u64s");
-    assert!(SetupMappingIn::parse(op, &[]).is_err(), "an empty body is refused");
+    assert!(
+      SetupMappingIn::parse(op, &[0u8; 39]).is_err(),
+      "39 bytes is one short of the five u64s"
+    );
+    assert!(
+      SetupMappingIn::parse(op, &[]).is_err(),
+      "an empty body is refused"
+    );
   }
 
   /// REMOVEMAPPING parses its count's worth of entries; a count larger than the body is refused, never
@@ -531,14 +537,23 @@ mod dax_mapping_parse_tests {
     assert_eq!(
       parsed.entries,
       vec![
-        RemoveMappingOne { moffset: 0, len: 4096 },
-        RemoveMappingOne { moffset: 8192, len: 4096 },
+        RemoveMappingOne {
+          moffset: 0,
+          len: 4096
+        },
+        RemoveMappingOne {
+          moffset: 8192,
+          len: 4096
+        },
       ]
     );
     // A count of 1000 with only two entries' worth of bytes is refused, not over-read.
     let mut lying = 1000u32.to_le_bytes().to_vec();
     lying.extend_from_slice(&body[4..]);
-    assert!(RemoveMappingIn::parse(op, &lying).is_err(), "a count past the body is refused");
+    assert!(
+      RemoveMappingIn::parse(op, &lying).is_err(),
+      "a count past the body is refused"
+    );
     // A huge count does not over-allocate before it refuses.
     assert!(RemoveMappingIn::parse(op, &u32::MAX.to_le_bytes()).is_err());
   }
