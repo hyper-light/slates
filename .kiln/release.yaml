@@ -1,0 +1,60 @@
+# Tag-time lanes, translated from .github/workflows/release.yml and the shared version-guard.yml (which
+# release.yml, publish-python.yml and publish-node.yml each run first). release.yml is still a dry run: every
+# target builds the workspace in release mode, with no assets and no secrets; its two x86_64 Linux legs run
+# here. Not translated: its macOS, Windows and aarch64 legs, and publish-python.yml / publish-node.yml (PyPI
+# and npm trusted publishing through OIDC; ci.yaml's sdk job exercises the packaging on every push).
+name: release
+on:
+  tag: { branches: ["v*"] }
+  manual: true
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+jobs:
+  guard:
+    name: tag names the workspace version; npm copies derived
+    runs-on: [k8s]
+    toolchain: rust
+    resources: { cpu: "2", memory: 4Gi }
+    timeout-minutes: 30
+    env: { CARGO_BUILD_JOBS: "2" }
+    steps:
+      - name: toolchain (rust-toolchain.toml)
+        run: (rustup toolchain install || rustup show) && rustc --version
+      # On a tag run KILN_BRANCH is the tag's name; a manual run on a branch only checks the npm copies.
+      - name: Check
+        run: |
+          if [ "$KILN_EVENT" = "tag" ]; then
+            cargo xtask version --expect-tag "$KILN_BRANCH"
+          else
+            cargo xtask version
+          fi
+
+  build-gnu:
+    name: x86_64-unknown-linux-gnu
+    needs: [guard]
+    runs-on: [k8s]
+    toolchain: rust
+    resources: { cpu: "6", memory: 12Gi }
+    timeout-minutes: 90
+    env: { CARGO_BUILD_JOBS: "6", AWS_LC_SYS_PREBUILT_NASM: "0" }
+    steps:
+      - name: toolchain (rust-toolchain.toml)
+        run: (rustup toolchain install || rustup show) && rustc --version
+      - name: Build (native via --target)
+        run: cargo build --release --workspace --target x86_64-unknown-linux-gnu
+
+  # GHA runs `docker run rust:1.98-alpine`; here that image is the pod itself (native musl, no docker).
+  build-musl:
+    name: x86_64-unknown-linux-musl
+    needs: [guard]
+    runs-on: [k8s]
+    image: docker.io/library/rust:1.98-alpine
+    resources: { cpu: "6", memory: 12Gi }
+    timeout-minutes: 90
+    env: { CARGO_BUILD_JOBS: "6", AWS_LC_SYS_PREBUILT_NASM: "0" }
+    steps:
+      - name: Build (musl, in the rust:1.98-alpine image)
+        run: |
+          apk add --no-cache build-base
+          RUSTFLAGS="-C target-feature=+crt-static" cargo build --release --workspace --target x86_64-unknown-linux-musl
