@@ -583,10 +583,12 @@ impl ChunkStore {
       if self.open_in_place(record.block, len, &seal).is_none() {
         return Err(VfsError::Integrity);
       }
+      // Clear the seal on the record *before* returning its tags: were the record unreachable afterwards, the chunk
+      // would be left claiming a seal whose tag run had already gone back, and a later read would open plaintext
+      // against freed tags.
+      self.chunks.get_mut(handle)?.seal = None;
       let freed = self.tags.free(seal.tags);
       self.count_free(freed);
-      let cm = self.chunks.get_mut(handle)?;
-      cm.seal = None;
       return Ok(record.block);
     }
     self.reopen_into_fresh(handle, extent, &record, len)
@@ -692,6 +694,13 @@ impl ChunkStore {
       return Err(e);
     }
     let imaged = self.arena.imaged(record.block);
+    // Repoint the chunk at the fresh plaintext block *before* retiring the old one and its tags: were the record
+    // unreachable afterwards, the chunk would be left naming a block that had already been freed.
+    {
+      let cm = self.chunks.get_mut(handle)?;
+      cm.seal = None;
+      cm.block = fresh;
+    }
     let freed = self.arena.free(record.block);
     self.count_free(freed);
     if let Some(seal) = record.seal {
@@ -701,9 +710,6 @@ impl ChunkStore {
       let tfreed = self.tags.free(seal.tags);
       self.count_free(tfreed);
     }
-    let cm = self.chunks.get_mut(handle)?;
-    cm.seal = None;
-    cm.block = fresh;
     Ok(fresh)
   }
 
