@@ -5540,22 +5540,43 @@ cache slates advertises** — at the 256 MiB cache the harness shipped with, +25
 Second, the interval after which a guest asks for a reclaimed chunk again moved **8×** for one workload merely by
 changing the cache, so no fixed re-seal delay is right: it is learned per volume (§4.6).
 
-### Timings (interleaved, isolated, load recorded)
+### Timings (interleaved, isolated, load recorded) — quiet machine, with the learned hold in place
 
-| workload (64 MiB streamed, or 2 MiB re-read ×20) | view | reopen |
+Environment: bare-metal x86_64, kernel 7.2.9-cachyos, 4 KiB pages, release. **Load average 2.98** (quiet), both arms
+built to separate binaries and run alternately, two rounds, each point best of 3 on a fresh store; the two rounds
+agree to within a millisecond throughout. This supersedes an earlier set taken on a loaded Mac (load 16–17) *before
+the learned hold existed*; those are withdrawn.
+
+Streaming a 64 MiB sealed file, varying the simultaneously-mapped bytes:
+
+| live-mapped | reopen | view | view extra RAM |
+|---|---|---|---|
+| 0.25 MiB | 0.011 s (5,960 MiB/s) | 0.007 s (8,860 MiB/s) | 0.25 MiB |
+| 1 MiB | 0.011 s (5,648) | 0.008 s (7,896) | 1.00 MiB |
+| 2 MiB | 0.012 s (5,488) | 0.008 s (8,117) | 2.00 MiB |
+| 8 MiB | 0.012 s (5,470) | 0.008 s (7,544) | 8.00 MiB |
+| 32 MiB | 0.012 s (5,245) | 0.009 s (6,909) | 32.00 MiB |
+| 64 MiB | 0.012 s (5,322) | 0.011 s (5,814) | 64.00 MiB |
+
+Re-reading a 2 MiB working set twenty times:
+
+| re-read | reopen | view |
 |---|---|---|
-| stream once | 0.020–0.022 s | 0.025–0.033 s |
-| re-read, guest returns inside the hold | 0.012–0.017 s | **0.001–0.002 s** |
-| re-read, re-sealed between | 0.013–0.014 s | 0.015–0.023 s |
+| guest returns before the sweep | **0.001 s** (41,356 MiB/s) | 0.005 s (8,724 MiB/s) |
+| sweeps run between the re-reads | **0.001 s** (34,270 MiB/s) | 0.005 s (8,762 MiB/s) |
 
-Reopen is ~8× on a returning guest (the re-map is a bare pin, no crypto) and costs +0.08–0.18 s per GiB on a
-one-shot stream (one extra AES-GCM pass per chunk). With the hold learned, the middle row is the common case for a
-guest whose reclaim brings it back, which the live measurement shows it does.
+Two readings. View leads on a one-shot stream, but **its lead shrinks as the live set grows** — 1.57× at 0.25 MiB,
+1.09× at 64 MiB — because the throwaway's allocate-and-copy scales with the mapped set while reopen's in-place
+decrypt does not; at a realistically full cache the two are within 9%. And the bottom row is **the learned hold
+measured in a workload**: before it existed, sweeps between re-reads re-encrypted the chunk and reopen *lost* that
+row by 1.1–1.7×; with the hold learned the sweeps leave the plaintext alone and reopen wins it by 3.9×. The hold is
+what removes reopen's only real penalty, and it is removed by learning, not by a chosen delay.
 
-**Measured and rejected: the decrypt-view throwaway.** It is faster on a one-shot stream and has a cheap teardown,
-but it needs one byte of RAM per mapped byte with no amortisation, and the live guest shows that means the whole
-advertised DAX cache. Reopen holds one representation, costs no mapped-set RAM, and its only penalty — the re-encrypt
-— is removed exactly when the guest returns quickly, by a hold learned from that guest's own behaviour.
+**Measured and rejected: the decrypt-view throwaway.** It leads only on a one-shot stream, by 1.57× at a small live
+set falling to 1.09× at a full one, and it loses every re-read row by ~4×. Against that it needs one byte of RAM per
+byte simultaneously mapped with no amortisation, and the live guest shows that means the whole advertised DAX cache
+(256 MiB as shipped). Reopen holds one representation, costs no mapped-set RAM, and its only penalty — the re-encrypt
+— is removed by a hold learned from the guest's own behaviour, measured above.
 
 **Correction on record.** The first numbers taken for this comparison were wrong and were withdrawn: all workloads
 shared one store (later measurements inherited earlier arena churn), load was not recorded, and the arms were not

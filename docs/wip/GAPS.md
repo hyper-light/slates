@@ -6341,7 +6341,12 @@ lower it.
 Green: vfs dax 48/0 (including the learned-hold and re-seal tests), vfs lib 43/0, bridge-virtiofs device 28/0, the
 recovery oracle 39/0 serial, clippy `--all-targets -D warnings` clean.
 
-**Owed:** the learned hold is proven by unit test but not yet re-measured end to end against the live guest (the run
-that produced the 67 ms/537 ms figures predates it), so the churn it removes in a real guest is modelled, not
-measured; the A/B timings were taken under load 16–17 (Mac) and 34 (box), so absolute figures are inflated and only
-the ratios and the contention-proof RAM relationship are firm; and DAX stays advertisement-gated.
+The learned hold is now measured, not just unit-tested: on a quiet box (load 2.98) the re-read workload with sweeps
+running between the reads — reopen's worst case, which it *lost* by 1.1–1.7× before the hold existed — becomes a 3.9×
+win, because the sweeps no longer re-encrypt a chunk the workload is about to read again. The landed code also
+carries the live guest's heavy workload (32 MiB working set through an 8 MiB cache, two full passes, hundreds of
+reclaim/re-map cycles) byte-for-byte.
+
+**Owed:** the live guest's revoke→remap figures (67 ms/537 ms) were taken under load 34 and before the hold existed,
+so the churn the hold removes *in a real guest* is inferred from the in-process workload rather than re-measured
+there; and DAX stays advertisement-gated.
