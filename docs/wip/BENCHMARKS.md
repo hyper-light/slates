@@ -5582,3 +5582,53 @@ byte simultaneously mapped with no amortisation, and the live guest shows that m
 shared one store (later measurements inherited earlier arena churn), load was not recorded, and the arms were not
 interleaved. That overstated view's streaming win by about 2× and understated reopen's returning-guest win by about
 2×. The tables above are the re-measurement under the stated discipline.
+
+## io_uring against epoll on Linux: the measurement D-9 never had (2026-10-18)
+
+D-9 chose io_uring on Linux citing `DEFER_TASKRUN` + `SINGLE_ISSUER` "for jitter" at evidence tier B
+(the `io_uring_setup(2)` man page). No measurement in this project had ever compared the two drivers,
+so the default rested on a citation rather than a number. Ada asked why we use io_uring at all, given
+its security record; this is the number that was missing from the answer.
+
+Environment: AMD, 32 cores, Linux 7.2.9-2-cachyos, Rust release profile, **a shared box under another
+session's work — load average 13 → 29 over the run, recorded per block**. Two binaries differing in
+one line: the epoll arm has `rt::uring::probe` forced to `false`, so `os_driver` selects
+`EpollDriver`; everything else identical.
+Command: `cargo build --release -p slates-client --example provision_bench` per arm, then the arms
+interleaved `uring, epoll` three rounds, each invocation its own 3 runs × (2,000 spinning + 500
+parked) samples at 1, 8 and 64 clients.
+
+Arms verified to be the drivers they claim, by descriptor rather than by trust: the io_uring arm
+holds 31 `anon_inode:[io_uring]` descriptors and 0 `eventpoll`; the epoll arm holds 0 and 31.
+
+| Row (median of 3 invocations, ns) | io_uring | epoll | epoll / io_uring |
+|---|---|---|---|
+| `parked_1_p50` | 65,402 | 73,855 | **1.13× (io_uring better)** |
+| `parked_1_p99` | 1,490,024 | 1,624,044 | 1.09× |
+| `parked_1_p999` | 2,022,083 | 2,122,540 | 1.05× |
+| `spinning_1_p50` | 19,496 | 19,353 | 0.99× |
+| `spinning_1_p99` | 1,657,573 | 1,577,323 | 0.95× (epoll better) |
+| `spinning_8_p50` | 20,047 | 17,356 | 0.87× (epoll better) |
+| `spinning_8_p99` | 2,024,321 | 1,556,771 | **0.77× (epoll better)** |
+| `spinning_8_p999` | 3,185,257 | 2,366,245 | 0.74× |
+| `spinning_64_p99` | 4,117,519 | 3,897,188 | 0.95× |
+
+What it means. io_uring's advantage is real but small and **confined to the parked wake path** — 8.5 µs
+on a 65 µs operation at p50, shrinking to 5% by p999. In the **spinning** path, which is the one R9's
+sub-50 µs provisioning gate actually measures, epoll is equal or better, by 23% at the 8-client p99.
+So D-9's jitter rationale holds only where the gate does not look, and costs nothing where it does.
+
+Honesty about this reading: the box was loaded and the load climbed through the run, so every p99 and
+p999 here (1.5–4 ms) is dominated by scheduling, not by the driver — those rows are nearly noise. The
+**p50 rows are the trustworthy ones**, and they say the same thing: parked favours io_uring by 13%,
+spinning favours epoll. Within each round the epoll arm runs second, which biases *against* epoll, so
+its spinning win is if anything understated. A quiesced re-run is owed before this settles D-9.
+
+What it does not measure: security. io_uring is ~60% of Google's kernel VRP submissions, is disabled
+by default on openSUSE and dropped from Docker's and containerd's seccomp profiles, and slates uses it
+for **two opcodes only** — `PollAdd` and `Nop`, no I/O through the ring (which is why the 2025
+syscall-monitoring-bypass class does not reach our R1 tracer: every read and write is still an ordinary
+syscall). The trade on the table is therefore a 13% parked-p50 win against the whole io_uring kernel
+surface, for a ring we use as an epoll substitute. Also measured here, incidentally: `io_uring_setup`
+returning `ENOMEM` under 32-way test parallelism against an 8 MiB `memlock` limit is what makes the
+Linux recovery oracle flaky — the epoll arm has no such failure mode.

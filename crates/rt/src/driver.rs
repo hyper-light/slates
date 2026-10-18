@@ -181,18 +181,19 @@ pub trait Driver {
   /// Registers one-shot interest in `raw`'s readability (a UDP socket for the fleet transport,
   /// §4.10a; a TCP listener or stream for the loopback bridge, §4.6): when it next becomes readable, a
   /// completion carrying `user_data` arrives on a following `wait` (re-registered after each read).
-  /// `raw` is the OS handle (a `RawFd` on Unix). The readiness-native drivers (kqueue, epoll) register
-  /// it; the completion-native drivers (io_uring, IOCP) do not carry it yet and refuse with a typed
-  /// [`RtError`] (owed).
+  /// `raw` is the OS handle (a `RawFd` on Unix). **Every** driver carries this: kqueue and epoll
+  /// natively, io_uring by arming a `PollAdd` on the ring, IOCP by an AFD poll. An earlier version of
+  /// this line said the completion-native drivers refused it as owed; they were built since and the
+  /// line was not updated.
   fn register_readable(&mut self, raw: i32, user_data: u64) -> Result<(), RtError>;
 
   /// Registers one-shot interest in `raw`'s writability (a TCP stream whose send buffer filled while
   /// the loopback bridge wrote a reply, §4.6): when it next has send-buffer space, a completion
   /// carrying `user_data` arrives on a following `wait` (re-registered after each blocked write), so a
-  /// write to a stalled peer yields the shard instead of blocking it. `raw` is the OS handle. The
-  /// readiness-native drivers (kqueue, epoll) register it; the completion-native drivers (io_uring,
-  /// IOCP) do not carry it yet, and the simulation's fabric sends never block, so those refuse with a
-  /// typed [`RtError`] (owed).
+  /// write to a stalled peer yields the shard instead of blocking it. `raw` is the OS handle. kqueue
+  /// and epoll register it natively, io_uring arms a `PollAdd` and IOCP an AFD poll; only the
+  /// simulation refuses, whose fabric sends never block. An earlier version of this line said the
+  /// completion-native drivers refused it as owed, which they no longer do.
   fn register_writable(&mut self, raw: i32, user_data: u64) -> Result<(), RtError>;
 
   /// Whether a `wait` would return a completion or a kick without blocking, as far as the driver
