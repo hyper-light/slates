@@ -22,6 +22,7 @@
   clippy::indexing_slicing
 )]
 
+use proptest::prelude::*;
 use slates_vfs::dax::{DAX_PAGE, DaxScrub, Mapping, stripe_target};
 use slates_vfs::error::VfsError;
 use slates_vfs::ids::InodeNo;
@@ -1743,4 +1744,127 @@ fn a_reopened_dax_chunk_is_resealed_once_its_window_is_revoked() {
     !volume.dax_still_current(&store, &head_map),
     "once unmapped, the sweep re-sealed the reopened head chunk"
   );
+}
+
+// ───────────────────────────────────────────────────────────── chaos: the gate under random interleavings
+
+/// How many files the chaos schedule plays over: enough that a mapping of one can be caught by another's write,
+/// truncate or seal, few enough that every step touches a file some mapping already holds.
+const CHAOS_FILES: usize = 3;
+
+/// One step of the chaos schedule, applied to the volume. Every operation is allowed to fail — a map can be
+/// refused (no space, a sealed chunk, a multi-block file), a write can hit quota — and a refusal is itself a
+/// valid outcome; what the invariants check is what the gate shows *afterwards*, never that a step succeeded.
+fn chaos_step(
+  store: &mut Store,
+  volume: &mut Volume,
+  files: &[InodeNo],
+  held: &mut Vec<Mapping>,
+  (op, which, size): (u8, u8, u16),
+) {
+  let no = files[usize::from(which) % files.len()];
+  let len = usize::from(size) % (DAX_PAGE * 2);
+  match op % 6 {
+    0 => {
+      let _ = volume.write(store, no, 0, &vec![op ^ which; len.max(1)]);
+    }
+    1 => {
+      let _ = volume.truncate(store, no, len as u64);
+    }
+    2 => {
+      if let Ok(mapping) = volume.dax_map_read(store, no) {
+        held.push(mapping);
+      }
+    }
+    3 => {
+      if let Ok(mapping) = volume.dax_map_write(store, no) {
+        held.push(mapping);
+      }
+    }
+    4 => {
+      if let Some(mapping) = held.pop() {
+        store.dax_revoke(&mapping);
+        store.dax_release_after_unmap(&mapping);
+      }
+    }
+    _ => {
+      volume.age_writes();
+      let _ = volume.seal_pending(store, 1 << 20);
+    }
+  }
+}
+
+/// The invariants that must hold after every step, for every mapping the schedule still holds.
+fn chaos_invariants(store: &Store, volume: &Volume, held: &[Mapping]) -> Result<(), TestCaseError> {
+  for mapping in held {
+    if store.dax_is_live(mapping) && volume.dax_still_current(store, mapping) {
+      let window = volume.dax_read(store, mapping, 0, mapping.page_span());
+      prop_assert!(
+        window.is_ok(),
+        "a live, current mapping must read: {window:?}"
+      );
+      let bytes = window.unwrap_or_default();
+      prop_assert!(
+        bytes.len() >= mapping.file_len,
+        "the window covers at least the file"
+      );
+      prop_assert!(
+        bytes[mapping.file_len..].iter().all(|byte| *byte == 0),
+        "a live mapping shows zeroes past its file, never another file's bytes or a stale tail"
+      );
+    } else {
+      prop_assert!(
+        volume.dax_read(store, mapping, 0, DAX_PAGE).is_err(),
+        "a revoked or stale mapping is inert — the daemon path refuses it"
+      );
+    }
+  }
+  Ok(())
+}
+
+proptest! {
+  #![proptest_config(slates_test_seeds::unseeded(ProptestConfig { cases: 150, .. ProptestConfig::default() }))]
+
+  /// §4.6 / AC-4.12 under chaos. Every other DAX test here is one hand-built attack; this is the same gate under
+  /// random interleavings of the operations that fight each other — writes and truncates that must revoke a
+  /// mapping, maps read and writable, explicit unmaps, and the idle sweep that seals a block out from under a
+  /// map. Do: play a random schedule over three files, holding every mapping the schedule makes. Expect, after
+  /// **every** step: a mapping that is live and current reads, and shows zeroes past its file's length — never a
+  /// stale tail and never another file's bytes; a mapping that is revoked or stale is inert, refused by the
+  /// daemon path exactly as the MMU would make it inert on the hardware path. Any step may be refused — a
+  /// refusal is a valid outcome — so what is asserted is what the gate SHOWS, not that an operation succeeded.
+  ///
+  /// This is the DAX gate's first property coverage: the 48 tests above are hand-written cases, and the
+  /// interleavings that matter here are exactly the ones nobody writes by hand.
+  #[test]
+  fn a_random_interleaving_never_shows_a_live_mapping_stale_or_foreign_bytes(
+    schedule in prop::collection::vec((any::<u8>(), any::<u8>(), any::<u16>()), 1..60)
+  ) {
+    let mut store = store();
+    let mut volume = volume(&mut store, 1 << 22);
+    let files: Vec<InodeNo> = (0..CHAOS_FILES)
+      .map(|i| {
+        let fill = 0x10u8.saturating_add(u8::try_from(i).unwrap_or(0));
+        file_of(&mut store, &mut volume, &format!("f{i}"), fill, DAX_PAGE)
+      })
+      .collect();
+    let mut held: Vec<Mapping> = Vec::new();
+
+    for step in schedule {
+      chaos_step(&mut store, &mut volume, &files, &mut held, step);
+      chaos_invariants(&store, &volume, &held)?;
+      // Drain what the step revoked, as the device's serve loop drains pending revokes: a dead mapping's block
+      // stays pinned until the unmap is confirmed, and leaving them held would fill the arena instead of
+      // exercising the gate.
+      let dead: Vec<Mapping> = held
+        .iter()
+        .filter(|mapping| !store.dax_is_live(mapping))
+        .copied()
+        .collect();
+      for mapping in &dead {
+        store.dax_release_after_unmap(mapping);
+      }
+      held.retain(|mapping| store.dax_is_live(mapping));
+    }
+  }
 }
