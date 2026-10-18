@@ -94,6 +94,18 @@ I cannot prove the tighter bound for every overlayfs stack:
    the type table says. That tightens only on evidence and never below what was actually observed, so it
    cannot be unsafe the way options 1 and 2 are.
 
+   **Measured, so this is not just an argument.** Taking the smallest non-zero mtime difference over a
+   directory's files, on the same container where the table says two seconds:
+
+   | sample | smallest non-zero mtime delta | what option 5 would infer |
+   |---|---|---|
+   | overlayfs, 40 files written now | **0.001000166 s** | ~1 ms — the measured truth, 2000× tighter than the table |
+   | an ordinary checked-out source tree (sampled `.rs` files) | **0.000016928 s** | ~17 µs |
+
+   So the evidence is there in both the written-now case and the ordinary-files case, and in both it
+   lands far below the 2 s default. The second row matters most: it says a base directory does not have
+   to be freshly written for this to fire — a normal tree of source files already carries it.
+
    Two things it is not. It is **not** a proof from a single mtime's precision — a filesystem may store
    nanoseconds and still only update per millisecond, so representation says nothing about advance; only
    a *difference* does. And it is opportunistic: a directory whose files were all unpacked in the same
