@@ -7092,3 +7092,18 @@ on both sides with real counts.
 **The method lesson, paid for twice:** filtering a long run's output through `grep` threw away the figures of
 the fourth flake and cost a whole extra run to get them back. The fifth was diagnosed on the first failure
 because the run was kept whole and grepped afterwards.
+
+**The sweep for siblings, and the line drawn.** Two kinds of wall-clock assertion live in these suites and only
+one of them is exposed:
+
+- **"this was fast"** — a tight bound asserting an operation did *not* wait: `driver.rs`'s step bound
+  (`reply_ns / 10`) and `rendezvous.rs`'s poll bound (`CLAIM_WAIT_NS / 10`). A scheduler hiccup of tens of
+  milliseconds is the same order as the bound, so contention reads as a failure. **Both are now attributed.**
+- **"this finished in time"** — a generous liveness deadline: `held_rendezvous.rs`'s `took < CLAIM_WAIT`,
+  `reap.rs`'s `< LEASE_TERM_NS`, `rings.rs`'s `< REPLY_DEADLINE_NS`, `cli.rs`'s `< RECOVERY_BUDGET_NS`, the
+  `< START_WAIT` and `< WAIT` guards. A preemption is small against these, and attributing them would only
+  weaken what they assert.
+
+So the attribution is added where the bound is of the same order as the noise, and nowhere else. The cluster
+suites' timing assertions run against simulated clocks and are a separate question; fleet tests run alone by
+policy.
