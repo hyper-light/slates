@@ -2774,11 +2774,23 @@ same-namespace host process is the first delivered case.
 >    first (`crates/vfs/tests/dax.rs` `a_pending_revoke_keeps_the_block_pinned_until_the_unmap_is_confirmed`); the
 >    synchronous `dax_revoke` is kept only for the no-live-guest path.
 > 2. **Map/unmap-storm or page-fault DoS.** A guest cannot steal data but could try to starve the host orchestration
->    by flooding SETUPMAPPING/REMOVEMAPPING or faulting the DAX BAR. **Addressed, bounded at three levels:** the
+>    by flooding SETUPMAPPING/REMOVEMAPPING or faulting the DAX BAR. **Bounded at three levels:** the
 >    mapping registry's cap is the shard's chunk budget (`DaxRegistry::new(max_chunks)`), a map past it refused
 >    `NoSpace` and counted (`a_map_storm_is_refused_at_the_registry_bound`); the §4.9 credit window bounds in-flight
 >    requests and bytes (`crates/bridge-virtiofs/src/credit.rs`); and the device serve loop is cooperative per pass,
->    so one guest's storm cannot starve another guest or the host.
+>    so one guest's storm cannot starve another guest's **service**.
+>
+>    **It can, however, deny another guest a window, and an earlier version of this paragraph said otherwise.**
+>    Corrected 2026-10-18 by measurement: the cap is the *shard's* and the accounting is per request, so one volume
+>    re-mapping one file took all 32 slots of a 32-chunk store and the next volume's first window was refused
+>    `NoSpace` (`one_volumes_map_storm_does_not_deny_another_volume`, committed `#[ignore]`d as the reproduction of
+>    an open finding). Refusing a storm is a bound on *growth*; it is not fairness, and the tenant who fills a
+>    shared bound is not the tenant who pays for it. A fix that returned the live window for a repeat request was
+>    built and withdrawn the same day — it shares one refcounted pin between two guest windows, so the first unmap
+>    would unpin a block the second still maps. **A correct fix moves the pin from the mapping to the window**, so
+>    the holder count tracks guest windows rather than registry entries, and that changes the invariant above;
+>    until then the denial stands recorded rather than claimed away
+>    (`docs/bugs/2026-10-18-one-volumes-dax-map-storm-denies-every-other-volume.md`).
 > 3. **Rowhammer / hardware co-location.** Two untrusted tenants whose writable DAX blocks land on physically
 >    adjacent DRAM rows face bit-flip risk at the silicon layer, independent of software isolation — slates cannot
 >    prevent the physics and does not claim to. The hardware floor stays the host/VMM's: ECC/Chipkill, DDR4/5 Target
