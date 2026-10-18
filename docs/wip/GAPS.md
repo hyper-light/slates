@@ -6098,8 +6098,8 @@ its own page table and never calls the daemon), so the defense had to be at the 
   A `free` of a pinned block is deferred (bytes kept, unscrubbed) and the block is never handed to another allocation
   or trimmed, until the last unpin releases and scrubs it (A-99). 6 by-use tests, Miri-clean.
 - **Registry + teardown** (`crates/vfs/src/dax.rs`, a `DaxRegistry` in `Store`): `dax_map_read`/`dax_map_write` pin and
-  register a mapping; `dax_revoke`/`dax_revoke_inode`/`dax_revoke_writable_of_prefix`/`dax_revoke_volume`/
-  `dax_revoke_block` tear down. `write`/`truncate` revoke the inode's mappings (one write boundary); `snapshot` revokes
+  register a mapping; `dax_revoke`/`dax_revoke_inode`/`dax_revoke_writable_of_prefix`/`dax_revoke_volume`
+  tear down (`dax_revoke_block` was here too and was **removed 2026-10-18** — see that day's entry). `write`/`truncate` revoke the inode's mappings (one write boundary); `snapshot` revokes
   writable mappings before sharing (read-only survive — the allowed immutable-shared case); `destroy` revokes the whole
   volume's. The hardware path (`dax_read_raw`/`dax_write_raw`) models the MMU — inert for a revoked mapping.
 - **Evidence:** `crates/vfs/tests/dax.rs` 42/0 (every former escape now closed: exfiltration, cross-file and
@@ -6286,7 +6286,12 @@ its own page table and never calls the daemon), so the defense had to be at the 
     dead owner's guests die with it — host-local registry); and **landing** reads content out to disk without moving
     the arena block. `dax_revoke_block` remains the defensive primitive for a block genuinely *moved/reclaimed* under a
     live window; a future path that moves a mapped block uses the writable recall pattern (enqueue +
-    `request_revoke_writable_inode`/`request_revoke_inode` + kick).
+    `request_revoke_writable_inode`/`request_revoke_inode` + kick). **Amended 2026-10-18: it was removed.** This
+    entry's analysis of landing and takeover stands and was re-derived independently that day; what changed is
+    the keep decision. A defensive primitive with no caller anywhere — not even a test — is the "just in case"
+    second path CLAUDE.md #7 forbids, and the reclaim case it defended is already held by the pin (the arena
+    defers a `free` of a pinned block and declines a `trim` of one). The recall pattern named here is still the
+    right shape for a future mover, and it is fifteen lines when one exists.
 
 **Owed before DAX is advertised (the next steps):**
 
