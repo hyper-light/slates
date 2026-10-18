@@ -122,3 +122,12 @@ macOS is not fixed and not proven unaffected. Its identity is `statfs`'s `f_fsid
 is reused across an unmount and a remount of the NFS loopback has not been measured. The same probe
 that found this — mount, record, swap, compare — decides it, and until it is run the macOS leg of
 AUD-29-66 rests on an assumption rather than a measurement.
+
+It was attempted and did not yield a number. An ad-hoc shell probe (2026-10-17) mounted the first
+volume successfully — the kernel listed `slates:/victim on .../fsidprobe-pKcS (nfs, nodev, nosuid)` —
+and then hung on the first access through the mount, printing nothing, until it was stopped about
+two and a half minutes later; a plain `umount` then succeeded and the host was left clean (0 mounts,
+0 stray processes). Whether the hang was the mount not yet being ready to serve, the probe's own
+shape, or something in the loopback path was not established, so nothing is claimed from it either
+way. The probe belongs in the test harness that already knows how to wait for a macOS mount to serve
+(`crates/cli/tests/cli.rs`, the `mount_and_check` path), not in a shell script.
