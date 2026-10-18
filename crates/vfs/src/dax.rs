@@ -316,6 +316,19 @@ impl DaxRegistry {
   // window handed out, and a `dax_revoke` that stops consuming one. That changes the gate's core invariant, so it
   // is a considered change, not a passing one.
 
+  /// The block holding a guarded mapping's clean copy (§4.6 B2), the heal source a scrub restores from.
+  /// Exposed so a test can corrupt it: Rowhammer flips physical rows and this copy lives in the same RAM as the
+  /// block it protects, so "both corrupt" is a real state and the arm that refuses it
+  /// ([`DaxScrub::Unhealable`]) has to be exercised rather than assumed.
+  #[must_use]
+  pub fn guard_clean_block(&self, mapping: &Mapping) -> Option<Block> {
+    self
+      .guards
+      .iter()
+      .find(|guard| &guard.mapping == mapping)
+      .map(|guard| guard.clean)
+  }
+
   /// Marks the volume `prefix` as recalling its writable windows, so [`Volume::dax_map_write`] refuses a new one
   /// until the recall ends (see the [`recalling`](Self::recalling) field for why). Idempotent. `false` when the
   /// registry is already holding `cap` recalls, which is the bound: the caller treats that as a refusal rather than

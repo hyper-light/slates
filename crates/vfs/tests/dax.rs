@@ -1178,6 +1178,16 @@ fn the_stripe_target_stays_in_the_sandbox_and_always_moves() {
 
 /// A synthetic Rowhammer bit flip: invert a byte of a block directly in the arena, behind the daemon's back — exactly
 /// what a hardware hammer does to a mapped page that the daemon never sees written.
+/// Writes `byte` at `at` in `block` — a corruption distinguishable from [`flip_a_byte`]'s, so a test can tell
+/// which of two corrupted copies a heal actually used.
+fn poison_a_byte(store: &mut Store, block: slates_mem::arena::Extent, at: usize, byte: u8) {
+  if let Some(bytes) = store.content.arena_mut().bytes_mut(block)
+    && let Some(b) = bytes.get_mut(at)
+  {
+    *b = byte;
+  }
+}
+
 fn flip_a_byte(store: &mut Store, block: slates_mem::arena::Extent) {
   if let Some(bytes) = store.content.arena_mut().bytes_mut(block)
     && let Some(b) = bytes.get_mut(0)
@@ -1220,6 +1230,65 @@ fn a_flip_in_a_guarded_read_only_block_is_caught_and_healed() {
   );
   assert_eq!(store.dax.flips(), 1, "one flip caught (non-vacuity)");
   assert_eq!(store.dax.healed(), 1, "one block healed (non-vacuity)");
+}
+
+/// §4.6 B2 — adversarial: when the clean copy is corrupt too, the net must refuse, not "heal" with bad bytes.
+/// Rowhammer flips **physical rows**, and the guard's clean copy lives in the same RAM as the block it protects,
+/// so "both corrupt" is an ordinary state for this threat and not a contrived one. A defence that trusts its own
+/// copy has an unguarded single point, and the failure would be the worst kind: a scrub reporting success while
+/// writing an attacker's bytes over good content.
+///
+/// Do: guard a read-only mapping, flip a byte in the block **and** a byte in the clean copy, then scrub. Expect:
+/// `Unhealable`; the block is left as it was rather than overwritten from the bad copy; the flip is counted and
+/// no heal is.
+///
+/// This arm had no test at all — `DaxScrub::Unhealable` appeared only in the source — which is why it is written
+/// here: a refusal nothing exercises is a refusal nobody knows still works.
+#[test]
+fn a_flip_in_the_clean_copy_too_is_refused_rather_than_healed_from_bad_bytes() {
+  let mut store = store();
+  let mut volume = volume(&mut store, 1 << 20);
+  let f = file_of(&mut store, &mut volume, "f", 0x41, DAX_PAGE);
+  let m = volume.dax_map_read(&mut store, f).unwrap();
+  store.dax_guard(&m).unwrap();
+  let clean = store
+    .dax
+    .guard_clean_block(&m)
+    .expect("the guard holds a clean copy");
+
+  // The two corruptions must differ, or the test cannot see the failure it is for. Flipping the same byte the
+  // same way in both would make the bad copy byte-identical to the bad block, so healing from it would change
+  // nothing and "the block was not overwritten" would hold however the code behaved — a vacuous pass, and the
+  // first version of this test had exactly that bug. So: the block loses byte 0, and the copy is poisoned at a
+  // *different* offset, which a heal from it would stamp onto the block.
+  flip_a_byte(&mut store, m.block);
+  poison_a_byte(&mut store, clean, 1, POISON);
+  let flipped_block = store.dax_read_raw(&m, 0, 64);
+  let flips_before = store.dax.flips();
+  let healed_before = store.dax.healed();
+
+  assert_eq!(
+    store.dax_scrub(&m),
+    DaxScrub::Unhealable,
+    "with both the block and its clean copy corrupt the scrub must refuse, not heal"
+  );
+  let after = store.dax_read_raw(&m, 0, 64);
+  assert_eq!(
+    after, flipped_block,
+    "the block is left as it was, never overwritten from the corrupt copy"
+  );
+  assert!(
+    after.get(1).is_some_and(|byte| *byte != POISON),
+    "and the copy's poison never reached the block (it would have, had the heal run from it)"
+  );
+  assert_eq!(
+    (
+      store.dax.flips().saturating_sub(flips_before),
+      store.dax.healed().saturating_sub(healed_before)
+    ),
+    (1, 0),
+    "the flip is counted (non-vacuity: the scrub really looked) and no heal is claimed"
+  );
 }
 
 /// §4.6 B2. Do: guard a read-only mapping and scrub it twice without any flip. Expect: both scrubs are clean, nothing

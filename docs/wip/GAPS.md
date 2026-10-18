@@ -6728,3 +6728,26 @@ single-chunk read) and tripped over this on the way. The bench now reports laten
 returned — it had been quietly reporting 676,704 MiB/s for a 4 MiB file it had read 64 KiB of, which is how a
 throughput number computed from the *requested* size flatters exactly the path that answers with less. Record:
 `docs/bugs/2026-10-18-a-zero-copy-read-of-a-multi-chunk-file-returned-one-chunk.md`.
+
+### 2026-10-18: B2's "both copies corrupt" arm had no test, and the first test I wrote for it was vacuous
+
+`DaxScrub::Unhealable` — the arm that refuses to heal when the guard's own clean copy fails its checksum — appeared
+only in the source. Nothing exercised it. It matters because the threat it belongs to is **Rowhammer, which flips
+physical rows**, and the guard's clean copy lives in the same RAM as the block it protects: "both corrupt" is an
+ordinary state for this attacker, not a contrived one. A defence that trusted its copy would do the worst thing
+available — report success while stamping an attacker's bytes over good content.
+
+The production code is right (`dax_scrub` verifies the copy against the guard's identity before restoring from it,
+and re-verifies after). It is now tested:
+`a_flip_in_the_clean_copy_too_is_refused_rather_than_healed_from_bad_bytes`.
+
+**The first version of that test passed with the protection disabled, and the bug was mine.** It corrupted the
+block and the copy the same way at the same offset, so the bad copy was byte-identical to the bad block and
+healing from it changed nothing — "the block was not overwritten" held however the code behaved. The two
+corruptions are now deliberately different (the block loses byte 0 to a flip; the copy is poisoned at byte 1), and
+the red-check is decisive: with the copy verification disabled the block comes back `[65, 238, 65, …]` — its own
+flip erased and the copy's poison stamped on — where it must be `[190, 65, 65, …]`.
+
+The lesson generalises past this test: **a corruption test whose two corruptions are indistinguishable cannot
+observe which source a repair used.** Red-check every "nothing happened" assertion; a vacuous one is worse than
+none, because it reports coverage.
