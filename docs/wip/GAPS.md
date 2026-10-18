@@ -6893,3 +6893,20 @@ ledger** now has a red-checked guard holding the arena's accounting to the devic
 (`confined_for_a_peer`) and is separately owed a **multi-chunk map** — a file larger than one content chunk falls
 back to copy today, since the zero-copy path would otherwise return one chunk silently — and the **cross-shard
 owner→home descriptor hand-off**.
+
+### 2026-10-18 (later): the snapshot recall is now under the chaos schedule, red-checked
+
+The recall exclusion added earlier today (`RecallInFlight`, which stops a guest re-arming a writable window
+between a snapshot's retries) shipped with deterministic tests only. It is new state on the map path, so it
+belongs under the property schedule that already drives the gate's other interleavings.
+
+`chaos_step` grows two operations — what the `snapshot` verb does before it freezes (revoke the volume's
+writable windows, put the recall on) and what its wrapper does on any answer but the retryable one (end it) —
+and the schedule now asserts the rule **where it is exercised**: on every writable map, if the volume was
+recalling, the call must be refused and refused `RecallInFlight`; if it succeeded, the volume must not have been
+recalling. The registry's recall list is also held to the cap after every step.
+
+Green at `PROPTEST_CASES=512` (15.8 s). **Red-checked:** with the refusal disabled the schedule catches it —
+*"a writable window was armed while the volume was recalling: the snapshot's retry can never converge"* — so
+this is a guard and not decoration. The exclusion is checked before any effect in `dax_map_write`, so the
+schedule can attempt the map safely and a refusal perturbs nothing.

@@ -1989,10 +1989,10 @@ fn chaos_step(
   files: &[InodeNo],
   held: &mut Vec<Mapping>,
   (op, which, size): (u8, u8, u16),
-) {
+) -> Result<(), TestCaseError> {
   let no = files[usize::from(which) % files.len()];
   let len = usize::from(size) % (DAX_PAGE * 2);
-  match op % 8 {
+  match op % 10 {
     0 => {
       let _ = volume.write(store, no, 0, &vec![op ^ which; len.max(1)]);
     }
@@ -2005,8 +2005,23 @@ fn chaos_step(
       }
     }
     3 => {
-      if let Ok(mapping) = volume.dax_map_write(store, no) {
-        held.push(mapping);
+      // The exclusion asserted where it is exercised: while the volume is recalling its writable windows, a
+      // writable map must be refused `RecallInFlight` — that refusal is what makes a snapshot's retry converge
+      // instead of a guest re-arming the window between two of them. Checked before the call so the schedule
+      // itself proves the rule under interleavings no hand-written case covers.
+      let recalling = store.dax.recalling(volume.prefix());
+      match volume.dax_map_write(store, no) {
+        Ok(mapping) => {
+          prop_assert!(
+            !recalling,
+            "a writable window was armed while the volume was recalling: the snapshot's retry can never converge"
+          );
+          held.push(mapping);
+        }
+        Err(e) => prop_assert!(
+          !recalling || e == VfsError::RecallInFlight,
+          "a recalling volume refused a writable map for the wrong reason: {e:?}"
+        ),
       }
     }
     4 => {
@@ -2028,15 +2043,32 @@ fn chaos_step(
         held.push(mapping);
       }
     }
+    7 => {
+      // What the `snapshot` verb does before it freezes: hand the volume's writable windows to the device and
+      // put the recall on, so no new writable window can be armed while it waits (§4.6 step 5).
+      let prefix = volume.prefix();
+      store.dax_revoke_writable_of_prefix(prefix);
+      let _ = store.dax.begin_recall(prefix);
+    }
+    8 => {
+      // And what its wrapper does on any answer but the retryable one: the recall is this snapshot's to end.
+      store.dax.end_recall(volume.prefix());
+    }
     _ => {
       volume.age_writes();
       let _ = volume.seal_pending(store, 1 << 20);
     }
   }
+  Ok(())
 }
 
 /// The invariants that must hold after every step, for every mapping the schedule still holds.
 fn chaos_invariants(store: &Store, volume: &Volume, held: &[Mapping]) -> Result<(), TestCaseError> {
+  // The recall's own bound, whatever the schedule did: one entry per volume, never past the registry's cap.
+  prop_assert!(
+    store.dax.recalling_len() <= store.dax.cap(),
+    "the recall list grew past the registry's cap"
+  );
   for mapping in held {
     if store.dax_is_live(mapping) && volume.dax_still_current(store, mapping) {
       let window = volume.dax_read(store, mapping, 0, mapping.page_span());
@@ -2118,7 +2150,7 @@ proptest! {
     let mut held: Vec<Mapping> = Vec::new();
 
     for step in schedule {
-      chaos_step(&mut store, &mut volume, &files, &mut held, step);
+      chaos_step(&mut store, &mut volume, &files, &mut held, step)?;
       chaos_invariants(&store, &volume, &held)?;
       // Drain what the step revoked, as the device's serve loop drains pending revokes: a dead mapping's block
       // stays pinned until the unmap is confirmed, and leaving them held would fill the arena instead of
