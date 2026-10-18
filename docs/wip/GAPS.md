@@ -7013,3 +7013,29 @@ a fleet whose members differ in shard count will silently run the larger ones un
 binaries (`mcp/tests/mcp.rs`, several `server/tests/*`) share the order dependence; it is observable only where
 a test asserts on sealing, which today is this test and `server/tests/seal.rs` — and that one uses a single
 shard count throughout, so it is not exposed.
+
+### 2026-10-18: a fourth workspace-run flake, OPEN and not diagnosed — the driver loop's step bound
+
+The third full `cargo test --workspace` (after the three fixes above) came back with one failure, a new one:
+`every_call_ends_and_the_loop_is_never_held_across_restart_and_death` (`crates/client/tests/driver.rs:378`).
+
+**It is a timing assertion, not a correctness one:** `ticker.longest_step < step_bound() + noise`, where the
+test measures the machine's own scheduling noise in-process and adds it to the bound — the right shape, and it
+was still exceeded.
+
+**Today's profile work is not implicated, and that is checked rather than assumed.** `step_bound()` is
+`deadlines().reply_ns / 10`, and `deadlines()` is `Deadlines::derive(LIVENESS_BUDGET_NS,
+RECOVERY_BUDGET_NS)` — two constants, no machine profile anywhere in it. The budget-escalation change cannot
+move this bound.
+
+**Not diagnosed, and the numbers are missing for a reason worth recording:** the run's output was piped through
+a `grep` whose patterns did not match an `assert!` with a custom message, so the line carrying *"the longest
+loop step was X, bound Y plus the machine's own scheduling noise Z"* was dropped. The test passes standalone at
+load 25.6, so reproducing needs the full workspace's contention. **The next workspace run should keep the whole
+output and grep the file afterwards** — filtering a run you cannot cheaply repeat throws away the evidence you
+ran it for.
+
+Two readings remain open, and the numbers would separate them: the noise probe samples at a different moment
+than the loop's worst step and so under-measures the contention the loop actually met; or there is a real hold
+that only extreme contention exposes. Until it is reproduced with its figures, it is an observed flake and
+nothing more.
