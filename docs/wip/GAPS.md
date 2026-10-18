@@ -6650,19 +6650,27 @@ Measured, two volumes on a 32-chunk store (`one_volumes_map_storm_does_not_deny_
 volume was denied its first window by another volume's storm: Err(NoSpace) (attacker holds 32 of 32)"*, with the
 victim's map shown to succeed on a quiet registry immediately before.
 
-**Fixed by making a repeat request return the window it already has** (`DaxRegistry::live_window`, consulted by
-both map paths before the pin and before the writable path's copy-up). The registry now grows with the windows
-that exist rather than with the requests made, so a storm on one window is one entry and cannot reach the cap at
-all; to consume entries a volume must hold windows onto distinct blocks, and with one entry per distinct block the
-registry's cap and the arena's chunk budget are the same number — which is what the cap's derivation always
-claimed. A volume's consumption is then bounded by content its own quota already bounds. Correctness-neutral: a
-guest that asks twice for one window has one window; a write or truncate revokes the inode's mappings so a live
-one is never stale; directory windows are untouched and keep their decided point-in-time re-map semantics.
+**The finding is OPEN. A fix was built, proven green on three platforms, and withdrawn the same day because it
+was unsafe** — recorded in full because the trap is the interesting part.
 
-**The hostile-input test was rewritten and that is flagged, not buried:**
-`a_map_storm_is_absorbed_and_the_registry_grows_only_with_real_windows` replaces the "refused at the cap" version.
-Rewriting a threat test to suit a fix deserves suspicion; here the new assertion is strictly stronger (refusing is
-a bound; absorbing is a bound *and* fairness) and the test measuring the weakness the old one missed is committed
-beside it. Verified: vfs dax 52/52 on macOS aarch64, x86_64 Linux and aarch64 Linux; bridge-virtiofs green on both;
-recovery arbiter 39/39; clippy `-D warnings` and `xtask check` clean. Record:
+The fix was to return the live window for a repeat request (`DaxRegistry::live_window`), so the registry grows
+with the windows that exist rather than with the requests made. The suite went green on macOS aarch64, x86_64
+Linux and aarch64 Linux (52/52 each). It is still wrong: the arena's pin is refcounted **per mapping**
+(`PinnedBlock::holders`, one pin per mapping handed out, one unpin per `dax_release_after_unmap`), while the
+device keeps **one `DaxWindowEntry` per SETUPMAPPING** and releases each. Two guest windows over one file range
+would share a mapping and therefore one pin while producing two releases, so the first unmap would unpin a block
+the second window still maps — reusable under a live guest page table, the exact escape the two-phase revoke
+exists to prevent, and worse than the denial being fixed. **No test caught it**; it was found by reading the
+device's bookkeeping after the change was committed (`e4535b01`, reverted). The lesson is the general one: the
+two halves of the pin live in different crates, so a change to the registry's accounting must be checked against
+the device's.
+
+**A correct fix moves the pin from the mapping to the window** — one pin per window handed out, and a
+`dax_revoke` that no longer consumes one, so the holder count tracks guest windows rather than registry entries.
+That changes the gate's core invariant and is a considered change, not a passing one.
+
+The reproduction is kept and `#[ignore]`d so the suite stays green and the evidence is not lost
+(`one_volumes_map_storm_does_not_deny_another_volume`; `cargo test -p slates-vfs --test dax -- --ignored`), and
+`a_map_storm_is_refused_at_the_registry_bound` is restored to what it was, with a note naming what it does not
+cover. After the revert: vfs dax 51/51 + 1 ignored, clippy `-D warnings` and `xtask check` clean. Record:
 `docs/bugs/2026-10-18-one-volumes-dax-map-storm-denies-every-other-volume.md`.

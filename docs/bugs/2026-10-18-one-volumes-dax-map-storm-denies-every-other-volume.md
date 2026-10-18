@@ -3,7 +3,9 @@
 - **Date:** 2026-10-18
 - **Area:** `crates/vfs/src/dax.rs` (`DaxRegistry::register`, `Volume::dax_map_read_at`,
   `Volume::dax_map_write`)
-- **Status:** found by attacking; **fixed in this change**
+- **Status:** found by attacking; **OPEN.** A fix was built and **withdrawn the same day** — it was unsafe, for the
+  reason below. The reproduction is committed `#[ignore]`d
+  (`one_volumes_map_storm_does_not_deny_another_volume`; run with `--ignored`).
 - **Class:** cross-tenant resource exhaustion through a shared bound (CWE-410)
 
 ## Description
@@ -36,45 +38,47 @@ the victim volume was denied its first window by another volume's storm:
 The victim's map is shown to succeed on a quiet registry immediately before, so the refusal is the
 storm's and not a volume that could never map.
 
-## The fix
+## The fix that was built, and why it was withdrawn
 
-**A request for a window that already exists returns that window.** `DaxRegistry::live_window(inode,
-file_offset, writable)` finds a live, non-snapshot mapping already covering the asked-for byte, and
-both map paths consult it before doing anything else — before the pin, and before the writable path's
-copy-up, which is the expensive half there.
+The obvious fix is to make a request for a window that already exists return that window:
+`DaxRegistry::live_window(inode, file_offset, writable)`, consulted by both map paths before the pin and
+before the writable path's copy-up. The registry would then grow with the **windows that exist** rather
+than with the requests made — a storm on one window would be one entry and could never reach the cap,
+and a volume's consumption would be bounded by content its own quota already bounds.
 
-The registry then grows with the **windows that exist** rather than with the requests made. Two things
-follow:
+It was built, the suite was green on three platforms, and then it was withdrawn, because it is unsafe:
 
-- A storm on one window is one entry, so it cannot reach the cap at all. To consume entries a volume
-  must hold windows onto distinct blocks, and with one entry per distinct block the registry's cap and
-  the arena's chunk budget are the same number — which is what the cap's own derivation always claimed
-  it was bounding.
-- A volume's consumption is bounded by the content it actually has, which its own quota already bounds,
-  so one tenant can no longer price another out.
+- The arena's pin is refcounted **per mapping** (`PinnedBlock::holders`): `dax_map_*` pins once per
+  mapping handed out, and `dax_release_after_unmap` unpins once.
+- The device keeps **one `DaxWindowEntry` per SETUPMAPPING** (`dax_windows.push(entry)`, both the
+  fd-sharing and the message arms) and calls `dax_release_after_unmap(&entry.mapping)` for each.
 
-It is also a correctness-neutral reduction in state rather than a new policy: a guest that asks twice
-for one window has one window, and that is what it is handed. A write or truncate of the inode revokes
-its mappings, so a live window is never stale. Directory windows are untouched — `dax_map_dir` has its
-own path, and §4.6 decided they are a point-in-time view a guest re-maps to refresh.
+So two guest windows over the same file range — two SETUPMAPPINGs at different guest offsets — would
+share one mapping and therefore **one pin**, while still producing two window entries and two releases.
+The first unmap would take the holder count to zero and unpin a block the second window still maps:
+reusable by another volume under a live guest page table. That is precisely the escape the two-phase
+revoke exists to prevent, and it is worse than the denial it was fixing.
 
-## The existing threat-model test was rewritten, and that is worth saying plainly
+Nothing in the test suite caught it. It was found by reading the device's window bookkeeping after the
+change was already committed (`e4535b01`), which is itself the lesson: a change to the registry's
+accounting has to be checked against the *device's* accounting, because the two halves of the pin live
+in different crates.
 
-`a_map_storm_is_refused_at_the_registry_bound` asserted the storm was **refused** at the cap. That is
-no longer what happens, so it is now
-`a_map_storm_is_absorbed_and_the_registry_grows_only_with_real_windows`: the storm is absorbed, a
-distinct window still adds an entry (non-vacuity, so the dedup is not swallowing everything), the
-registry never exceeds its cap, and a released window lets the file map again. Rewriting a hostile-input
-test to suit a fix deserves suspicion; here the new assertion is strictly stronger than the old one —
-refusing was a bound, absorbing is a bound *and* fairness — and the test that measures the weakness the
-old one missed is committed beside it.
+**What a correct fix has to do: move the pin from the mapping to the window.** One pin per window
+handed out, and a `dax_revoke` that no longer consumes one — so the holder count tracks guest windows
+rather than registry entries. That changes the gate's core invariant, so it is a considered change
+rather than a passing one, and it is not made here.
 
-## Verification
+## Verification of the revert
+
+
 
 ```
-slates-vfs --test dax                                   52 passed, 0 failed   (macOS aarch64)
-slates-bridge-virtiofs (6 suites)                       all green
-slates-server --test recovery (the arbiter)             39 passed, 0 failed
+slates-vfs --test dax                                   51 passed, 0 failed, 1 ignored  (macOS aarch64)
+slates-vfs --test dax -- --ignored                      the reproduction still fails, as it should
 cargo clippy --workspace --all-targets -- -D warnings   clean
 cargo xtask check                                       clean
 ```
+
+(The withdrawn fix had also been green on x86_64 Linux and aarch64 Linux — 52/52 on both — which is
+exactly why the suite passing is not the same as the change being safe.)
