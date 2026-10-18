@@ -2828,7 +2828,13 @@ same-namespace host process is the first delivered case.
 > snapshot is back where it started, which a hostile guest can keep up forever. It lasts across retries, so it
 > belongs to the thing that retries — the `snapshot` verb begins it and ends it on every answer but the retryable
 > one, and `destroy` ends it too; the VFS revoke deliberately does not begin it, since `Volume::snapshot` has no
-> moment at which the snapshot is over. Read-only windows are admitted throughout. (3) **`advance`
+> moment at which the snapshot is over. Read-only windows are admitted throughout. **The wait is unbounded on
+> purpose.** A lease that took the window back on lapse — the shape a write delegation uses — would be wrong here:
+> a delegation is held by a cooperating client slates can refuse, while a DAX window is a page table entry in an
+> unmodified guest kernel that only the VMM's `munmap` removes, and unpinning on a lapse would hand the block to
+> another allocation while the guest still points at it. Closing the backend connection does not unmap it either.
+> So a snapshot facing a hung VMM refuses until it can freeze safely, bounded in practice by the client's own reply
+> deadline. (3) **`advance`
 > revokes on the moving reader**, as the attachment lifecycle requires ("`advance` … invalidates old caches/mappings …
 > cannot combine old names with new bytes"): the advancing attachment's own device re-validates its windows against the
 > now-current view (`Device::revalidate_windows` → `Bridge::dax_window_current` → `Volume::dax_still_current`) and

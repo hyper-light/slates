@@ -6248,12 +6248,23 @@ its own page table and never calls the daemon), so the defense had to be at the 
     neighbour of the same volume are refused; the same map succeeds before the recall and after it ends, and a read
     map is admitted throughout, so the refusal is the recall's) and
     `recalls_are_deduped_bounded_and_released_by_destroy`. vfs dax 51/51, virtiofs suites green, recovery oracle
-    39/39, clippy `-D warnings` and `xtask check` clean. **(b) still owed:** the refuse-retry has no server-side
-    deadline, so a stuck device leaves the snapshot refusing retryable until the client gives up. The recall itself
-    no longer leaks when that happens (the wrapper ends it), so what is missing is the *bound*, not the cleanup.
-    It is not built here because the `Store` has no clock and a retry-count bound would be a magic number wearing a
-    deadline's clothes; the server has the clock and would need per-volume recall-start state to use it. The
-    exposure meanwhile is a refused snapshot, not corruption, on a path that is empty until DAX is advertised. A through-the-client e2e needs a live writable
+    39/39, clippy `-D warnings` and `xtask check` clean. **(b) is now DECIDED, not owed — waiting is
+    correct.** The companion hardening was written down as "a bounded recall: revoke the window if the device does
+    not drain within a lease, as a delegation is revoked on lapse". Checked against what the two-phase revoke is
+    for, that analogy does not hold and the hardening would be a bug. A lease on a *delegation* can be taken back
+    because the holder is a cooperating client slates can refuse; a DAX window is a **page table entry in an
+    unmodified guest kernel**, and only the VMM's `munmap` removes it. Phase one has already unregistered the
+    mapping and kept the block pinned exactly so that "a block the daemon is about to move/reuse is never reachable
+    through a stale TLB" (§4.6 step 5). Unpinning on a lapse would hand that block to another allocation while the
+    guest's page table still points at it — the escape the two phases exist to prevent. And tearing the attachment
+    down does not help either: closing the backend connection does not unmap the guest's window, so a hung VMM
+    simply cannot be made to let go. **So the snapshot must wait, and refusing until it can freeze safely is the
+    right terminal state, not a missing bound.** It is already bounded in practice by the client's own reply
+    deadline, and since 2026-10-18 the recall is ended on that path by the verb's wrapper, so nothing leaks when a
+    client gives up. What remains is a *diagnostic* nicety and is recorded as such: after a budget the refusal
+    could become non-retryable and typed ("the device has not released its window") so a client learns the
+    snapshot will not succeed instead of retrying blindly. That needs the clock plus per-volume recall-start state
+    and buys no safety, so it is not built. A through-the-client e2e needs a live writable
     window, advertisement-gated like all DAX e2e.
   - **advance — revoke on the moving reader is BUILT (2026-10-15, a7f317af); takeover/landing need no revoke.** An
     earlier note here called advance-revoke "unneeded," reasoning that a read mapping pins its version so the guest
