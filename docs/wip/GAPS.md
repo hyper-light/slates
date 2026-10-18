@@ -6871,8 +6871,8 @@ Today's work closed several things and found several more, scattered across six 
 that answers "what is left before `admission::unsupported`'s `DaxNotEstablished` can be lifted", so the next
 person does not have to reassemble it. Every row was checked today, not recalled.
 
-**Blocking — a guest window could be served unsafely or not at all.** Row 6 closed the same day it was written;
-the rest need decisions or deployment work.
+**Blocking — a guest window could be served unsafely or not at all.** Rows 5 and 6 closed the same day they were
+written; the remaining four need decisions or deployment work.
 
 | # | What | State |
 |---|---|---|
@@ -6880,7 +6880,7 @@ the rest need decisions or deployment work.
 | 2 | **B2's wiring.** `dax_guard`/`dax_scrub` have no production caller and no `Bridge` surface; nothing guards a mapping and nothing schedules a scrub. | **Ada's call**: what to guard (a guard pins a full clean copy, so guarding every read-only mapping doubles mapped-content RAM) and the scrub cadence (no anchor to derive from). |
 | 3 | **L2's device half.** `dax_migrate`'s own doc promised a daemon-initiated `MAP_FIXED`/`mremap` of the guest window; no such remap exists in `bridge-virtiofs` or `bridge-core`. | Owed, with L2's adaptive trigger. |
 | 4 | **L1.** Physically-contiguous hugetlb zones + guard rows — the deployment layer that makes L2's shift move real physical rows. | Owed (needs a privileged broker). |
-| 5 | **`dax_revoke_block` for landing/takeover.** Documented as their teardown; neither calls it. The pin is today's backstop, which holds a landing *off* a mapped block rather than letting it revoke-then-move. | Owed. |
+| 5 | **`dax_revoke_block`** — *resolved by removal.* It had **no reference anywhere**, not even a test, and its documented role is already covered: every path that could harm a mapped block checks the pin — the arena defers a `free` and **declines a `trim`** ("trimming it would return the cut tail to the free lists, where a reuse could fall under the mapping's page"), and the re-seal sweep defers a pinned chunk. A primitive with no caller and no need is the "just in case" second path CLAUDE.md #7 forbids, so it is gone. | **Closed.** If a future mover must *not* defer — revoke-then-move rather than wait — it is fifteen lines, and this row says why it was removed. |
 | 6 | **The destroy ordering** — *checked, and smaller than it looked.* The invariant is implemented, not merely hoped: `destroy` revokes the volume's guest devices first (AUD-29-68) and `start_teardown` — which leads to `dax_revoke_volume` — runs only once `devices_serving == 0`, so each device's terminal `reclaim` has run `release_dax` through a still-live bridge and munmapped every window before any block is unpinned. It is tested at the attachment level by `a_volume_destroyed_under_its_guest_devices_ends_them_cleanly`. | Residual: the `abandon` fallback (`AdmittedDevice::abandon`, for a device whose volume is already gone) has **no bridge and so cannot munmap**; reached with live DAX windows it would leave a guest's page tables over unpinned blocks. The destroy path cannot reach it that way today. **Both now done**: `the_destroy_sequence_leaves_no_block_pinned` asserts the two teardowns compose in the server's order, and `abandon`'s doc carries the warning. |
 
 **Closed today, and listed so they are not re-litigated:** the snapshot-recall **re-arm livelock** (a guest can no

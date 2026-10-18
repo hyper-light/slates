@@ -386,10 +386,10 @@ fn unsupported(request: &GuestAttachRequest) -> Option<UnsupportedReason> {
   // confinement would rest on the frontend honouring them rather than on what slates handed it. The
   // fd-sharing placer does not have this property (the backend maps; the VMM gets no descriptor).
   //
-  // That is one of six blocking items. The full list — descriptor confinement, B2's wiring, L2's missing
-  // device-side remap, L1's zones, `dax_revoke_block` for landing/takeover, and the destroy ordering — is the
-  // gate checklist in `docs/wip/GAPS.md` (2026-10-18, "what must be true before DAX is advertised"). Read it
-  // before flipping this, not just the record above.
+  // That is one of four remaining blocking items. The full list — descriptor confinement, B2's wiring, L2's
+  // missing device-side remap and L1's zones — is the gate checklist in `docs/wip/GAPS.md` (2026-10-18, "what
+  // must be true before DAX is advertised"), which also records the two closed that day and why. Read it before
+  // flipping this, not just the record above.
   if request.dax {
     return Some(UnsupportedReason::DaxNotEstablished);
   }

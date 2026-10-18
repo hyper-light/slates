@@ -1425,26 +1425,4 @@ impl Store {
       .filter(|mapping| self.dax_revoke(mapping))
       .count()
   }
-
-  /// Revokes every mapping of a specific block (§4.6). Returns how many were revoked.
-  ///
-  /// **No landing or takeover calls this**, though this doc used to say they did ("the teardown a landing or
-  /// takeover runs before it reclaims or moves content that block holds"). What actually protects a mapped block
-  /// from a reclaim today is the pin: `ChunkArena` never hands a pinned block to another allocation and defers
-  /// its free, so a landing that reclaims content a guest has mapped is held off rather than racing it. That is a
-  /// backstop, not the documented mechanism — a landing cannot *move* such a block at all while it is pinned,
-  /// where the intent was to revoke first and move after. Owed with the rest of the DAX wiring.
-  pub fn dax_revoke_block(&mut self, block: Block) -> usize {
-    let victims: Vec<Mapping> = self
-      .dax
-      .mappings
-      .iter()
-      .filter(|mapping| mapping.block == block)
-      .copied()
-      .collect();
-    victims
-      .iter()
-      .filter(|mapping| self.dax_revoke(mapping))
-      .count()
-  }
 }
