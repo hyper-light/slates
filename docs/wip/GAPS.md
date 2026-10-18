@@ -6933,12 +6933,40 @@ binary** so the probe really does run repeatedly:
   helper, no `OnceLock`.
 
 All three now measure **once per process** behind a `OnceLock`, as `crates/client/tests/client.rs` has since
-September. Checked rather than assumed for the rest: `rt/tests/placement.rs`, `mcp/tests/mcp.rs`,
-`client/tests/reap.rs` and `client/tests/presentation.rs` each hold a single test, so their one probe is already
-one per process; examples and benches are deliberate single-process runs. `crate::daemon::measure`'s two
+September. Checked for the rest: `rt/tests/placement.rs`, `mcp/tests/mcp.rs`, `client/tests/reap.rs` and
+`client/tests/presentation.rs` each hold a single test, so their one probe is already one per process.
+
+**That reading was right and the conclusion drawn from it was wrong, which the next run proved.** The same
+workspace run then failed `mcp/tests/mcp.rs` at the same `expect` — one test, one probe, refused anyway. A
+`OnceLock` reduces how many times the dice are rolled; it does not make a roll safe. The real defect is
+underneath and is **not a test problem at all** — see the next entry. `crate::daemon::measure`'s two
 **production** call sites are per-invocation and right to be — the wrapper is the tests' alone.
 
 **The lesson is about the sweep, not the fix.** A September sweep that searched the test *directories* would
 miss `crates/cli/src/verbs.rs`, because its tests live in the source file; and a sweep that counted call sites
 would rate a one-call-site file safe when that site sits in a helper every test calls. The question that finds
 them is "how many times does this run in one process", which is `#[test]` count × call sites, not either alone.
+
+
+### 2026-10-18: the quick profile's 5 ms probe cannot survive a busy machine, and production uses it
+
+Chasing the test flake above to its cause found a product defect. The bound that is refused is
+`QUICK_PROBE_MS = 5` in `crates/cli/src/daemon.rs`, and the CLI measures with it on paths users reach:
+`serve_mcp_http` takes `measure(true)` before it serves, and so does `slates profile --quick`. A machine busy
+enough that the **wake probe** cannot answer in five milliseconds therefore makes the MCP server refuse to
+start — `MeasurementTimeout { probe: "wake" }` — on a product whose own standing rule is that the busy machine
+is the norm, and whose p99-under-load is the target.
+
+This is measured, not argued: a full `cargo test --workspace` refused that exact call twice today
+(`crates/cli/src/verbs.rs` harness test, then `crates/mcp/tests/mcp.rs`), while both passed alone every time.
+The full profile's own per-probe bound is `PROBE_WALL_BUDGET = 250 ms`, fifty times larger, and already exists.
+
+**Fixed by escalating the bound before giving up**: a quick measurement tries the quick bound, then the full
+profile's, and only then is refused. One path with a growing bound — not a second path (CLAUDE.md #7) — and
+neither number is invented here; both are bounds the profile already defines. A quick profile stays quick in
+*scope* (no codecs, no core matrix); it is only its patience that grows, and only on a machine that needed it.
+
+Tested by use, with the vacuity trap closed: a zero budget is a deterministic refusal (asserted on its own, so
+the next test cannot pass for the wrong reason), `[ZERO, 250 ms]` must still produce a profile — which only
+happens if the second budget is tried — and the shipped list is asserted to be strictly growing, since a
+single-budget list would make the escalation unreachable in production however well the logic tests.

@@ -26,19 +26,48 @@ pub(crate) fn segment_name(instance: &str) -> String {
   format!("slates-seg-{clean}")
 }
 
-/// Measures the profile: full, or quick. A probe that could not measure at all within its bound is the
-/// failure, named (`MeasurementTimeout`), never a profile carrying a fabricated value.
-pub(crate) fn measure(quick: bool) -> Result<MachineProfile, Failure> {
-  let options = if quick {
-    ProfileOptions {
-      budget_per_probe: Duration::from_millis(QUICK_PROBE_MS),
+/// Shape: the per-probe budgets a **quick** measurement tries in turn — the quick bound, then the full
+/// profile's own. Both already exist and neither is invented here; what is new is trying the second.
+const QUICK_BUDGETS: [Duration; 2] = [
+  Duration::from_millis(QUICK_PROBE_MS),
+  slates_machine::bench::PROBE_WALL_BUDGET,
+];
+
+/// Measures the profile within each budget in turn, stopping at the first that answers. A probe that could
+/// not measure at all within the **last** budget is the failure, named (`MeasurementTimeout`), never a
+/// profile carrying a fabricated value.
+fn measure_within(budgets: &[Duration]) -> Result<MachineProfile, slates_machine::MachineError> {
+  let mut last = Err(slates_machine::MachineError::MeasurementTimeout { probe: "wake" });
+  for budget in budgets {
+    last = MachineProfile::measure(ProfileOptions {
+      budget_per_probe: *budget,
       codecs: false,
       core_matrix: false,
+    });
+    if last.is_ok() {
+      return last;
     }
+  }
+  last
+}
+
+/// Measures the profile: full, or quick. A probe that could not measure at all within its bound is the
+/// failure, named (`MeasurementTimeout`), never a profile carrying a fabricated value.
+///
+/// **A quick measurement escalates its bound before it gives up.** The quick bound is five milliseconds, and
+/// a machine busy enough cannot answer the wake probe inside it — measured on 2026-10-18, where a full
+/// `cargo test --workspace` refused this very call twice while the same code passed alone. That matters past
+/// the tests: `serve_mcp_http` measures this way, so an MCP server could refuse to start because the machine
+/// was busy, on a product whose own standing rule is that the busy machine is the norm. So a refused quick
+/// probe is retried at the full profile's per-probe bound before the refusal stands: one path with an
+/// escalating bound, not a second path, and both bounds are ones the profile already defines.
+pub(crate) fn measure(quick: bool) -> Result<MachineProfile, Failure> {
+  let measured = if quick {
+    measure_within(&QUICK_BUDGETS)
   } else {
-    ProfileOptions::default()
+    MachineProfile::measure(ProfileOptions::default())
   };
-  MachineProfile::measure(options).map_err(|refusal| failed("measure the machine profile", refusal))
+  measured.map_err(|refusal| failed("measure the machine profile", refusal))
 }
 
 fn failed(what: &str, e: impl std::fmt::Display) -> Failure {
@@ -165,4 +194,48 @@ pub(crate) fn run(options: &ProcessOptions) -> Result<(), Failure> {
   }
   daemon.stop();
   Ok(())
+}
+
+#[cfg(test)]
+mod budget_tests {
+  //! The quick measurement's budget escalation (§4.1): a busy machine must not stop the CLI starting.
+  #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+  use std::time::Duration;
+
+  use super::{QUICK_BUDGETS, measure_within};
+
+  /// A zero budget cannot measure the wake probe, so it is the deterministic refusal this file's other
+  /// assertions stand on — `MachineProfile::measure` is refused `MeasurementTimeout`, never a fabricated
+  /// profile (`crates/machine/src/profile.rs` asserts the same of `refresh_cheap(Duration::ZERO)`).
+  #[test]
+  fn a_zero_budget_is_refused_so_the_escalation_test_below_is_not_vacuous() {
+    assert!(
+      measure_within(&[Duration::ZERO]).is_err(),
+      "a zero-budget probe must be refused, or the escalation test proves nothing"
+    );
+  }
+
+  /// §4.1 — a quick measurement escalates its bound rather than giving up. Do: ask for a budget that
+  /// cannot work followed by one that can. Expect: a profile, because the second was tried. This is the
+  /// case a loaded machine produces, where the first bound is refused and the CLI must still start —
+  /// measured 2026-10-18, when a full `cargo test --workspace` refused the quick probe twice.
+  #[test]
+  fn a_refused_budget_escalates_to_the_next_one() {
+    let measured = measure_within(&[Duration::ZERO, Duration::from_millis(250)]);
+    assert!(
+      measured.is_ok(),
+      "the escalation must reach the second budget: {measured:?}"
+    );
+  }
+
+  /// The shipped order escalates: the quick bound first, then a strictly larger one. A single-budget list
+  /// would make the escalation above unreachable in production however well it tests.
+  #[test]
+  fn the_shipped_budgets_escalate() {
+    assert!(
+      QUICK_BUDGETS.len() >= 2 && QUICK_BUDGETS[1] > QUICK_BUDGETS[0],
+      "the shipped budgets must grow: {QUICK_BUDGETS:?}"
+    );
+  }
 }
