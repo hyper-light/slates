@@ -5044,6 +5044,91 @@ fn shell(script: &str) -> String {
   String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
+/// Format: the variable naming the daemon's root mount, where a volume appears as `<root>/<volume>`
+/// (`crates/cli/src/exec.rs`); the launcher has no default and refuses without it.
+#[cfg(target_os = "linux")]
+const ROOT_ENV: &str = "SLATES_ROOT";
+
+/// AC-3.5 / §4.6 "The launcher", R1. The chosen-path launcher had no test of any kind — not of its refusal,
+/// not of its containment — though it is the one place slates enters a user and a mount namespace and binds
+/// a volume onto a path the caller names. Do: mount a volume so it appears as `<root>/<volume>`, run
+/// `slates exec` at a path that does not exist, run it again at one that does, then look at the host.
+/// Expect: the missing path is refused naming it exactly and nothing is created for it — a launcher that
+/// helpfully made the path would be writing to disk outside a grant (R1); inside the namespace the volume's
+/// bytes are readable and the process keeps its own uid and gid, so the new user namespace presents nothing
+/// to the volume as root; and afterwards the host's chosen path is empty and carries no mount, the private
+/// propagation holding so nothing the launcher bound survives it.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_launcher_refuses_a_path_it_would_have_to_create_and_leaves_the_host_untouched() {
+  if !linux_fuse_mount_runs() {
+    return;
+  }
+  let instance = format!("cli-exec-{}", std::process::id());
+  let anchor = start_anchor(&instance);
+  let id = created_volume(&instance, "execvol");
+  let root = MountPoint {
+    path: fresh_mount_point(),
+  };
+  let at = MountPoint {
+    path: fresh_mount_point(),
+  };
+  let inside = format!("{}/{id}", root.path);
+  shell(&format!("mkdir -p {inside}"));
+  fuse_mount_and_check(&instance, &id, &inside);
+  shell(&format!("printf secret-in-volume > {inside}/marker"));
+  let environment = [(ROOT_ENV.to_owned(), root.path.clone())];
+
+  let missing = format!("{}/no/such/deep/path", at.path);
+  let (code, _, refusal) = run_as_issuer(
+    &instance,
+    &environment,
+    &["exec", "--volume", &id, "--at", &missing, "--", "/bin/true"],
+  );
+  assert_eq!(
+    code, 4,
+    "a path the launcher would have to create: {refusal}"
+  );
+  assert!(refusal.contains(&missing), "it names the path: {refusal}");
+  assert!(
+    !std::path::Path::new(&format!("{}/no", at.path)).exists(),
+    "the launcher created the path it refused"
+  );
+
+  let who = shell("id -u; id -g");
+  let mine: Vec<&str> = who.split_whitespace().collect();
+  let script = format!("id -u; id -g; cat {}/marker", at.path);
+  let (code, saw, err) = run_as_issuer(
+    &instance,
+    &environment,
+    &[
+      "exec", "--volume", &id, "--at", &at.path, "--", "sh", "-c", &script,
+    ],
+  );
+  assert_eq!(code, 0, "the launcher runs the command: {err}");
+  assert_eq!(
+    saw.split_whitespace().collect::<Vec<_>>(),
+    [
+      mine.first().copied().unwrap_or(""),
+      mine.get(1).copied().unwrap_or(""),
+      "secret-in-volume"
+    ],
+    "inside: the caller's own uid and gid, and the volume's bytes"
+  );
+
+  let left = shell(&format!("ls -A {}", at.path));
+  let still_mounted = is_mounted(&at.path);
+  run(&instance, &["unmount", &inside]);
+  drop(at);
+  drop(root);
+  drop(anchor);
+  assert_eq!(left.trim(), "", "the host sees nothing at the chosen path");
+  assert!(
+    !still_mounted,
+    "the launcher's bind propagated back to the host"
+  );
+}
+
 /// AUD-29-76 (`slates mount --subtree`). Do: through the real binary against a real anchor-supervised daemon,
 /// mount a volume whole and make `shared/g` and `private/secret` through it; `slates mount ID DIR --subtree
 /// /shared`; list and read the scoped mount, write `h` through it, then unmount both. Expect: the scoped mount
