@@ -266,6 +266,46 @@ fn uring_driver(_efd: KickFd, _ring_entries: u32) -> Result<Box<dyn Driver>, RtE
   })
 }
 
+/// The epoll driver over the kick eventfd: the Linux driver that always builds.
+#[cfg(target_os = "linux")]
+fn epoll_driver(efd: KickFd) -> Result<Box<dyn Driver>, RtError> {
+  Ok(Box::new(crate::epoll::EpollDriver::with_eventfd(efd)?) as Box<dyn Driver>)
+}
+
+/// One shard's Linux driver: io_uring when `build_uring` yields one, epoll when it refuses.
+///
+/// The probe in [`os_driver`] runs **once per runtime**, but every shard builds its **own** ring, and a
+/// ring the probe could make may still fail here: io_uring rings are locked memory, so a host near its
+/// `RLIMIT_MEMLOCK` runs out partway through a many-shard start. Measured on a 32-core box with the
+/// default 8 MiB limit — `io_uring_setup` returning `ENOMEM` (errno 12) for the later shards, which is
+/// what made the Linux recovery oracle fail a random subset of its tests on every other run.
+///
+/// D-9 says a refusal selects epoll. Before this it did so only for a refusal at *probe* time; a refusal
+/// *here* propagated out of `ShardContext::build` and failed the shard, and with it the daemon. Falling
+/// back per shard is the design's own rule applied where the refusal actually happens — not a second
+/// path kept "just in case" (banned item 7): the seam has exactly these two implementations, each shard
+/// owns its driver, and they never interoperate, so a runtime whose later shards took epoll is as
+/// correct as one where the probe had refused for everybody.
+#[cfg(target_os = "linux")]
+fn shard_driver(
+  kick: Kick,
+  ring_entries: u32,
+  build_uring: impl FnOnce(KickFd, u32) -> Result<Box<dyn Driver>, RtError>,
+) -> Result<Box<dyn Driver>, RtError> {
+  let Kick::Eventfd(efd) = kick else {
+    return Err(RtError::DriverRefused {
+      call: "a Linux driver without its eventfd",
+      code: None,
+    });
+  };
+  // `KickFd` is a copyable generational name for a registry-owned descriptor, so the kick the refused
+  // ring was handed is still this shard's to give epoll.
+  match build_uring(efd, ring_entries) {
+    Ok(driver) => Ok(driver),
+    Err(_) => epoll_driver(efd),
+  }
+}
+
 /// Prepares the OS driver for this platform, probing and falling back as D-9 says.
 #[cfg(target_os = "linux")]
 pub fn os_driver(ring_entries: u32) -> Result<Prepared, RtError> {
@@ -273,18 +313,10 @@ pub fn os_driver(ring_entries: u32) -> Result<Prepared, RtError> {
   let mut notes = Vec::new();
   let uring = uring_available(ring_entries, &mut notes);
   let seed: DriverSeed = if uring {
-    Box::new(move |kick| match kick {
-      Kick::Eventfd(efd) => uring_driver(efd, ring_entries),
-      _ => Err(RtError::DriverRefused {
-        call: "io_uring driver without its eventfd",
-        code: None,
-      }),
-    })
+    Box::new(move |kick| shard_driver(kick, ring_entries, uring_driver))
   } else {
     Box::new(|kick| match kick {
-      Kick::Eventfd(efd) => {
-        Ok(Box::new(crate::epoll::EpollDriver::with_eventfd(efd)?) as Box<dyn Driver>)
-      }
+      Kick::Eventfd(efd) => epoll_driver(efd),
       _ => Err(RtError::DriverRefused {
         call: "epoll driver without its eventfd",
         code: None,
@@ -351,6 +383,36 @@ pub(crate) fn refused(call: &'static str, e: rustix::io::Errno) -> RtError {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  /// D-9, the refusal that selects epoll, asked where the refusal actually happens. The probe runs once
+  /// per runtime but each shard builds its own ring, so a ring the probe could make may still be refused
+  /// here — on a 32-core box at the default 8 MiB `RLIMIT_MEMLOCK`, `io_uring_setup` returns `ENOMEM` for
+  /// the later shards, which is what made the Linux recovery oracle fail a random subset of its tests on
+  /// every other run. Do: hand the shard builder a ring constructor that refuses, exactly as the kernel
+  /// does when the locked-memory budget is gone. Expect: a working epoll driver, not an error — before
+  /// this, the refusal came out of `ShardContext::build` and took the shard, and the daemon, with it.
+  #[cfg(target_os = "linux")]
+  #[test]
+  fn a_ring_refused_after_the_probe_leaves_the_shard_on_epoll() {
+    let prepared = os_driver(64).unwrap();
+    let (registration, _control) =
+      crate::registry::register(2, 1, crate::runtime::register_kick(prepared.kick_fd)).unwrap();
+    let shard = registration.shard();
+    let kick = crate::registry::with_entry(shard, |entry| entry.kick).unwrap();
+    let refused = |_efd: KickFd, _entries: u32| {
+      Err(RtError::DriverRefused {
+        call: "io_uring_setup",
+        code: Some(12),
+      })
+    };
+    let driver = shard_driver(kick, 64, refused)
+      .expect("a refused ring falls back to epoll instead of failing the shard");
+    assert_eq!(
+      driver.kind(),
+      DriverKind::Epoll,
+      "the shard that could not have a ring runs on epoll"
+    );
+  }
 
   /// AC-0.6: the real driver wakes for a kick, delivers a no-op, and supports a timed wait
   /// despite another kick arriving before its deadline. All registered resources are retired.
