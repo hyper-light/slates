@@ -1127,6 +1127,15 @@ impl Store {
     true
   }
 
+  /// **Nothing in production calls this.** B2 is a complete primitive with no wiring: no caller outside tests and
+  /// `dax_bench`, and no surface on the `Bridge` trait, so the device cannot reach it either. Nothing decides
+  /// which read-only mappings to guard, and [`Store::dax_scrub`] below has nothing scheduling it — so the
+  /// "self-healing safety net" heals nothing in a running daemon today. Two decisions are owed before it can be
+  /// wired, and both are Ada's: **what to guard** (a guard pins a full clean copy of the block, so guarding every
+  /// read-only mapping doubles the RAM of mapped content — the "do we need it at all, and that much" question),
+  /// and **how often to scrub** (a cadence with no anchor to derive from today). Not a live hole: DAX is
+  /// unadvertised, so no guest window exists to protect. Recorded in `docs/wip/GAPS.md`.
+  ///
   /// Registers an integrity guard for a **read-only** mapping (§4.6 B2, the self-healing safety net): captures the
   /// BLAKE3 of the block's clean bytes and a pinned clean copy to heal from, so a later [`Store::dax_scrub`] catches a
   /// Rowhammer bit flip and restores it. Refused `Invalid` for a *writable* mapping — a writable block changes
@@ -1184,8 +1193,13 @@ impl Store {
 
   /// Scrubs a guarded read-only mapping (§4.6 B2): re-checksums the live block and, on a mismatch (a bit flip),
   /// restores it from the clean copy and re-verifies — the asynchronous safety net for the one hazard the daemon
-  /// cannot see directly (a hardware write/flip on a mapped page). Returns [`DaxScrub`]. A background scanner calls
-  /// this over its guards a bounded number per step; an explicit validation pass calls it on demand.
+  /// cannot see directly (a hardware write/flip on a mapped page). Returns [`DaxScrub`].
+  ///
+  /// **There is no background scanner.** This sentence used to read "a background scanner calls this over its
+  /// guards a bounded number per step; an explicit validation pass calls it on demand", and neither exists:
+  /// nothing outside tests and `dax_bench` calls this, and the `Bridge` trait has no scrub surface, so the device
+  /// serve loop cannot reach it. The scanner, and the cadence it would run at, are owed with the guard policy
+  /// above.
   pub fn dax_scrub(&mut self, mapping: &Mapping) -> DaxScrub {
     let Some(guard) = self
       .dax
@@ -1412,8 +1426,14 @@ impl Store {
       .count()
   }
 
-  /// Revokes every mapping of a specific block (§4.6): the teardown a landing or takeover runs before it reclaims or
-  /// moves content that block holds. Returns how many were revoked.
+  /// Revokes every mapping of a specific block (§4.6). Returns how many were revoked.
+  ///
+  /// **No landing or takeover calls this**, though this doc used to say they did ("the teardown a landing or
+  /// takeover runs before it reclaims or moves content that block holds"). What actually protects a mapped block
+  /// from a reclaim today is the pin: `ChunkArena` never hands a pinned block to another allocation and defers
+  /// its free, so a landing that reclaims content a guest has mapped is held off rather than racing it. That is a
+  /// backstop, not the documented mechanism — a landing cannot *move* such a block at all while it is pinned,
+  /// where the intent was to revoke first and move after. Owed with the rest of the DAX wiring.
   pub fn dax_revoke_block(&mut self, block: Block) -> usize {
     let victims: Vec<Mapping> = self
       .dax

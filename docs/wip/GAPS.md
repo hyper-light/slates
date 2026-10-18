@@ -6825,3 +6825,42 @@ green, recovery arbiter 39/39, client 13/13, clippy `-D warnings` and `xtask che
 that "passes on both other targets". It was not arch-specific: the Docker lane bind-mounts the working tree, so
 it was testing this uncommitted dedup rather than HEAD. A bind-mounted lane tests the tree, not the commit —
 state the commit when quoting one.
+
+### 2026-10-18 (later): two of the three Rowhammer layers are primitives with no wiring, and the ledger reads otherwise
+
+Asked of every documented DAX mechanism in turn — *who calls this in production?* — after the `dax_migrate`
+finding above showed a doc promising a device half that does not exist. The answer is worse than one function:
+
+| mechanism | production caller |
+|---|---|
+| **L0** writable-DAX opt-in (`Volume::enable_writable_dax` checked in `dax_map_write`) | yes — it is a check on the map path itself |
+| **L2** the moving target (`Volume::dax_migrate`) | **none** (and its device-side remap does not exist) |
+| **B2** the self-healing net (`Store::dax_guard` / `dax_scrub`) | **none** |
+| `Store::dax_revoke_block` | **none** |
+| `dax_map_dir`, `dax_map_read/write`, `dax_revoke_inode`, `dax_revoke_writable_of_prefix`, `dax_revoke_volume`, `dax_still_current` | yes |
+
+Checked, not assumed: outside `crates/vfs/src/dax.rs` the only references to `dax_guard`, `dax_scrub` and
+`dax_revoke_block` are in `tests/` and `examples/`, **and the `Bridge` trait carries no surface for any of them**,
+so the device serve loop could not reach them even if it wanted to. The server's only "scrub" is
+`write_log.rs`'s unrelated zeroing of logged plaintext.
+
+**Two docs claimed callers that do not exist, and both are corrected at the definition site:** `dax_scrub` said
+"a background scanner calls this over its guards a bounded number per step; an explicit validation pass calls it
+on demand" — there is no scanner and no validation pass; `dax_revoke_block` said it was "the teardown a landing
+or takeover runs" — no landing or takeover calls it. What actually keeps a landing off a mapped block today is
+the **pin** (a pinned block is never handed to another allocation and its free is deferred), which is a backstop
+rather than the documented mechanism: a landing cannot *move* such a block at all while it is pinned, where the
+intent was to revoke first and move after.
+
+**And this ledger's own wording oversold it.** The 2026-10-13 entry says the Rowhammer defence is "built in the
+VFS" and lists L1 and the migration trigger as owed, "both wired into the device loop with L0/L2/B2" — which
+reads as though L0/L2/B2 were already in that loop. Only L0 is, and only because it is a check inside the map
+path.
+
+**Not a live hole:** DAX is unadvertised, so no guest window exists to protect. It is a **checklist item for
+advertising it**, which is exactly when it would be assumed done.
+
+**Why it is not wired here — two decisions, both Ada's.** *What to guard:* a guard pins a full clean copy of the
+block, so guarding every read-only mapping doubles the RAM of mapped content; that is the optimization
+hierarchy's first question (need it at all, and that much?) and not a detail to settle in passing. *How often to
+scrub:* a cadence with no anchor to derive from today, and inventing one would be a magic number (R3).
