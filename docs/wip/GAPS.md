@@ -6521,3 +6521,55 @@ advertisement-gated and **not** harness-only — every Linux `MapRead` served by
   `a_same_kernel_client_maps_a_file_with_no_copy` reports its path instead of asserting it, since asserting it would
   pin today's state in place. Record:
   `docs/bugs/2026-10-18-a-read-handed-the-peer-the-whole-content-arena.md`.
+
+### 2026-10-18: GAP-A9-9 measured — on macOS a same-uid stranger opens any client's ring, by name
+
+The ledger has carried "same-uid isolation (GAP-A9-9) owed" since §4.7 was written. This is the first
+**measurement** of what that costs, and it is worse on macOS than the wording suggests.
+
+Linux hands a client its ring as a **descriptor** over an abstract-namespace socket, so the memfd has no
+name anywhere and only a process the daemon passed it to can reach it. macOS has no abstract namespace,
+so the rendezvous is a **named** object and everything it leads to is opened by name —
+`/slates-rv-<instance>-<uid>`, `/slates-cr-<instance>-<client_id>-<uid>`,
+`/slates-seg-<instance>-<uid>` — every part of which is public (the instance is how clients find the
+daemon, the uid is the caller's own, a client id counts up from 1). `shm_open` mode `0600` leaves the
+uid as the only barrier, and the uid is exactly the boundary that must hold: a §4.13 consumer is an
+untrusted process of the daemon's own uid, as `crates/ipc/src/delivery.rs` says when it picks an
+inherited descriptor as "the one channel other same-uid processes provably cannot read".
+
+Measured (macOS arm64; a stranger that never connected and holds no capability):
+
+```
+victim is client 1; it wrote its secret through its ring
+stranger opened /slates-cr-mr78796-1-501 read-write: 278528 bytes, no capability at all
+the victim's secret appears 2719 times in the ring a stranger just mapped
+the stranger also wrote into it (header byte flipped and restored)
+stranger opened /slates-seg-mr-79327-501 read-write: 148892368896 bytes
+stranger opened /slates-rv-mb72074-501 read-write with no capability at all
+```
+
+Ring disclosure, ring **injection**, and read-write access to the daemon's 138.7 GiB segment, without
+being a client. Windows shares the bootstrap-object shape and is presumed alike; not measured (no
+Windows host here).
+
+**A measured negative, so the Linux doorbell theft does not carry over:** a stranger can write the
+macOS doorbell word, but restoring it after every ring does not slow the victim — `Bell::ring` follows
+its `fetch_add` with an explicit `wake_one` on the address, and the waiter is woken by that, not by the
+value. Three arms interleaved with a CPU-matched control: idle 402 µs p50, control 400 µs, suppressing
+396 µs over 211,635,442 stores. No effect.
+
+**Two scan traps worth keeping:** macOS shm objects answer neither `SEEK_DATA` nor `pread` (`false` and
+`0` bytes), so the first version of the probe reported a clean object that was wide open — any scan of a
+macOS shared object must `mmap` it. And the segment's 256 MiB prefix held none of the victim's content,
+which is a bounded negative and not an absence; the object is 138.7 GiB and scanning it all would commit
+it.
+
+**Why no patch here:** a random name per object and an `shm_unlink` after hand-over both fail, because
+the region's name is published in the bootstrap object's claim slot and a stranger polling that object
+managed 211 million reads in one run. A Unix domain socket would end the class as it does on Linux but
+needs a path, which R1 forbids "if any alternative exists". **An alternative does exist and it is the
+macOS-native one:** a Mach port *is* a capability, the bootstrap namespace is per-user rather than a
+filesystem, and `fileport_makeport`/`fileport_makefd` pass a descriptor over a Mach message — the
+`SCM_RIGHTS` hand-off with no path and no name to guess, so it answers R1 rather than trading against
+it. **Ada's call.** Record:
+`docs/bugs/2026-10-18-macos-shares-by-name-so-a-stranger-opens-any-clients-ring.md`.
