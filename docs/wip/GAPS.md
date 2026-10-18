@@ -6970,3 +6970,12 @@ Tested by use, with the vacuity trap closed: a zero budget is a deterministic re
 the next test cannot pass for the wrong reason), `[ZERO, 250 ms]` must still produce a profile — which only
 happens if the second budget is tried — and the shipped list is asserted to be strictly growing, since a
 single-budget list would make the escalation unreachable in production however well the logic tests.
+
+**The escalation lives in the product, and every test fixture now measures through it.** It is
+`MachineProfile::measure_within(&options, &budgets)` in `crates/machine`, not a CLI-local or test-local helper:
+the CLI needs it, so it is product behaviour, and the tests then exercise the product's own escalation rather
+than inventing a parallel one. All **ten** test sites that measure a profile were converted in the same change —
+`server/tests/{seal,common/mod}.rs`, `mcp/tests/mcp.rs`, `rt/tests/placement.rs` and the six
+`client/tests/*.rs` — each with a `PROFILE_BUDGETS` constant that keeps the quick bound the suite always used
+and adds the full profile's behind it. Converting *some* of them is what produced two failures in one afternoon;
+the list was taken from `grep` over the whole workspace rather than from the directories I expected them in.

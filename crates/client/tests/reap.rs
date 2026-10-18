@@ -23,6 +23,16 @@ use slates_machine::{MachineProfile, ProfileOptions};
 use slates_server::daemon::{CLIENTS_REAPED, LIVENESS_BUDGET_NS};
 use slates_server::{Daemon, DaemonConfig, SegmentSource};
 
+/// Shape: the per-probe budgets this binary's profile is measured within — the quick bound this suite has
+/// always used, then the full profile's own (`slates_machine::bench::PROBE_WALL_BUDGET`). One bound is a
+/// guess about the machine, and the cheap one is wrong on a busy machine: the wake probe cannot answer in
+/// five milliseconds beside the rest of a `cargo test --workspace`, which refused it twice on 2026-10-18.
+/// The scope stays quick — no codecs, no core matrix — and only the patience grows.
+const PROFILE_BUDGETS: [std::time::Duration; 2] = [
+  Duration::from_millis(PROBE_MS),
+  slates_machine::bench::PROBE_WALL_BUDGET,
+];
+
 /// Format: the environment variable selecting the victim role, and the ones carrying its
 /// instance and the volume to attach.
 const ROLE: &str = "SLATES_REAP_TEST_ROLE";
@@ -195,11 +205,14 @@ fn a_killed_client_is_reclaimed_and_its_lease_expires_by_its_term() {
     victim();
     return;
   }
-  let profile = MachineProfile::measure(ProfileOptions {
+  let profile = MachineProfile::measure_within(
+    &ProfileOptions {
     budget_per_probe: Duration::from_millis(PROBE_MS),
     codecs: false,
     core_matrix: false,
-  })
+  },
+    &PROFILE_BUDGETS,
+  )
   .expect("the machine profile measures");
   let instance = format!("cl-reap-{}", std::process::id());
   let config = DaemonConfig::derive(&profile, &instance, Some(2)).with_failover_slo(LEASE_TERM_NS);

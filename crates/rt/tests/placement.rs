@@ -28,6 +28,16 @@ mod linux {
   use slates_machine::profile::{MachineProfile, ProfileOptions};
   use slates_rt::runtime::{Runtime, RuntimeConfig};
 
+  /// Shape: the per-probe budgets this binary's profile is measured within — the quick bound this test has
+  /// always used, then the full profile's own (`slates_machine::bench::PROBE_WALL_BUDGET`). One bound is a
+  /// guess about the machine, and the cheap one is wrong on a busy machine: the wake probe cannot answer in
+  /// five milliseconds beside the rest of a `cargo test --workspace`, which refused it twice on 2026-10-18.
+  /// The scope stays quick — no codecs, no core matrix — and only the patience grows.
+  const PROFILE_BUDGETS: [Duration; 2] = [
+    Duration::from_millis(5),
+    slates_machine::bench::PROBE_WALL_BUDGET,
+  ];
+
   /// Shape: the per-probe wall budget of the profile the runtime derives from (the test fixtures' quick
   /// profile; the placement depends on the facts, not on the probes' precision).
   const PROBE_MS: u64 = 50;
@@ -83,11 +93,14 @@ mod linux {
   /// Starts a runtime from a measured profile, as the daemon does, and returns what every shard thread
   /// may run on, in shard order.
   fn shard_masks() -> Vec<Vec<u32>> {
-    let profile = MachineProfile::measure(ProfileOptions {
+    let profile = MachineProfile::measure_within(
+      &ProfileOptions {
       budget_per_probe: Duration::from_millis(PROBE_MS),
       codecs: false,
       core_matrix: false,
-    })
+    },
+      &PROFILE_BUDGETS,
+    )
     .expect("the machine profile measures");
     let config = RuntimeConfig::from_profile(&profile, TASKS, TASKS, LATENCY_BUDGET_NS);
     let rt = Runtime::start(&config).unwrap();

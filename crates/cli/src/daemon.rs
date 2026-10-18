@@ -33,24 +33,6 @@ const QUICK_BUDGETS: [Duration; 2] = [
   slates_machine::bench::PROBE_WALL_BUDGET,
 ];
 
-/// Measures the profile within each budget in turn, stopping at the first that answers. A probe that could
-/// not measure at all within the **last** budget is the failure, named (`MeasurementTimeout`), never a
-/// profile carrying a fabricated value.
-fn measure_within(budgets: &[Duration]) -> Result<MachineProfile, slates_machine::MachineError> {
-  let mut last = Err(slates_machine::MachineError::MeasurementTimeout { probe: "wake" });
-  for budget in budgets {
-    last = MachineProfile::measure(ProfileOptions {
-      budget_per_probe: *budget,
-      codecs: false,
-      core_matrix: false,
-    });
-    if last.is_ok() {
-      return last;
-    }
-  }
-  last
-}
-
 /// Measures the profile: full, or quick. A probe that could not measure at all within its bound is the
 /// failure, named (`MeasurementTimeout`), never a profile carrying a fabricated value.
 ///
@@ -63,7 +45,14 @@ fn measure_within(budgets: &[Duration]) -> Result<MachineProfile, slates_machine
 /// escalating bound, not a second path, and both bounds are ones the profile already defines.
 pub(crate) fn measure(quick: bool) -> Result<MachineProfile, Failure> {
   let measured = if quick {
-    measure_within(&QUICK_BUDGETS)
+    MachineProfile::measure_within(
+      &ProfileOptions {
+        budget_per_probe: Duration::from_millis(QUICK_PROBE_MS),
+        codecs: false,
+        core_matrix: false,
+      },
+      &QUICK_BUDGETS,
+    )
   } else {
     MachineProfile::measure(ProfileOptions::default())
   };
@@ -203,7 +192,22 @@ mod budget_tests {
 
   use std::time::Duration;
 
-  use super::{QUICK_BUDGETS, measure_within};
+  use slates_machine::{MachineProfile, ProfileOptions};
+
+  use super::QUICK_BUDGETS;
+
+  /// The quick profile's scope, as `measure` uses it: the budgets are the argument.
+  fn scope() -> ProfileOptions {
+    ProfileOptions {
+      budget_per_probe: Duration::ZERO,
+      codecs: false,
+      core_matrix: false,
+    }
+  }
+
+  fn measure_within(budgets: &[Duration]) -> Result<MachineProfile, slates_machine::MachineError> {
+    MachineProfile::measure_within(&scope(), budgets)
+  }
 
   /// A zero budget cannot measure the wake probe, so it is the deterministic refusal this file's other
   /// assertions stand on — `MachineProfile::measure` is refused `MeasurementTimeout`, never a fabricated

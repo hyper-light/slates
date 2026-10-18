@@ -20,6 +20,16 @@ use slates_machine::{MachineError, MachineProfile, ProfileOptions};
 use slates_server::seal_keys::{lineage, namer};
 use slates_server::{Daemon, DaemonConfig, SegmentSource};
 
+/// Shape: the per-probe budgets this binary's profile is measured within — the quick bound this suite has
+/// always used, then the full profile's own (`slates_machine::bench::PROBE_WALL_BUDGET`). One bound is a
+/// guess about the machine, and the cheap one is wrong on a busy machine: the wake probe cannot answer in
+/// five milliseconds beside the rest of a `cargo test --workspace`, which refused it twice on 2026-10-18.
+/// The scope stays quick — no codecs, no core matrix — and only the patience grows.
+const PROFILE_BUDGETS: [std::time::Duration; 2] = [
+  Duration::from_millis(PROBE_MS),
+  slates_machine::bench::PROBE_WALL_BUDGET,
+];
+
 /// Shape: the per-probe budget of the test's machine profile (a quick measurement, no codecs or core matrix).
 const PROBE_MS: u64 = 25;
 /// Shape: one shard: the control shard holds the volume's records.
@@ -37,11 +47,14 @@ fn profile() -> MachineProfile {
   static PROFILE: OnceLock<Result<MachineProfile, MachineError>> = OnceLock::new();
   PROFILE
     .get_or_init(|| {
-      MachineProfile::measure(ProfileOptions {
+      MachineProfile::measure_within(
+        &ProfileOptions {
         budget_per_probe: Duration::from_millis(PROBE_MS),
         codecs: false,
         core_matrix: false,
-      })
+      },
+        &PROFILE_BUDGETS,
+      )
     })
     .clone()
     .expect("the machine profile measures")

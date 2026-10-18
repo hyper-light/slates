@@ -88,6 +88,35 @@ pub struct MachineProfile {
 }
 
 impl MachineProfile {
+  /// Measures the machine within each budget in turn, stopping at the first that answers; the last
+  /// budget's refusal is the refusal. `options`' own `budget_per_probe` is unused — the budgets are the
+  /// argument — while its `codecs` and `core_matrix` are honoured, so a quick profile stays quick in
+  /// **scope** and only its patience grows.
+  ///
+  /// This exists because a single bound is a guess about the machine, and the cheap bound is wrong on a busy
+  /// one: five milliseconds is not enough for the wake probe when a machine is loaded, measured on
+  /// 2026-10-18 when a full `cargo test --workspace` refused that bound twice while the same calls passed
+  /// alone. Refusing to measure means refusing to start — `slates`' MCP server takes this path — so a caller
+  /// that can afford to wait longer says so here rather than failing. An empty `budgets` is refused without
+  /// probing, since no bound was offered.
+  pub fn measure_within(
+    options: &ProfileOptions,
+    budgets: &[std::time::Duration],
+  ) -> Result<MachineProfile, MachineError> {
+    let mut last = Err(MachineError::MeasurementTimeout { probe: "wake" });
+    for budget in budgets {
+      last = MachineProfile::measure(ProfileOptions {
+        budget_per_probe: *budget,
+        codecs: options.codecs,
+        core_matrix: options.core_matrix,
+      });
+      if last.is_ok() {
+        return last;
+      }
+    }
+    last
+  }
+
   /// Measures the machine; refused `MeasurementTimeout` when a probe could not measure at all within its
   /// bound (the wake probe, [`wake::wake`]) rather than a profile carrying a fabricated value.
   pub fn measure(options: ProfileOptions) -> Result<MachineProfile, MachineError> {
