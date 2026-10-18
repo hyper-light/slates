@@ -713,13 +713,27 @@ impl Volume {
   ) -> Result<Mapping, VfsError> {
     let file_len = serialized.len();
     let block = store.content.alloc_block(file_len.max(1), false)?;
-    if let Some(bytes) = store.content.arena_mut().bytes_mut(block) {
-      if let Some(head) = bytes.get_mut(..file_len) {
-        head.copy_from_slice(serialized);
+    // The copy must happen, and the guest must never be handed a window whose bytes were not written. The buddy
+    // allocator returns a block at least as large as asked, so the short case is unreachable — but written as
+    // `if let Some(..) {}` with no else it would, if that contract ever changed, register a mapping over an
+    // unwritten block and the guest would read zeroes where the entries should be, with nothing refused and
+    // nothing counted. Refused instead, and the throwaway freed, so a window that exists is a window that was
+    // filled (CLAUDE.md #9: no swallowed failure).
+    let filled = match store.content.arena_mut().bytes_mut(block) {
+      Some(bytes) if bytes.len() >= file_len => {
+        if let Some(head) = bytes.get_mut(..file_len) {
+          head.copy_from_slice(serialized);
+        }
+        if let Some(tail) = bytes.get_mut(file_len..) {
+          tail.fill(0);
+        }
+        true
       }
-      if let Some(tail) = bytes.get_mut(file_len..) {
-        tail.fill(0);
-      }
+      _ => false,
+    };
+    if !filled {
+      let _ = store.content.arena_mut().free(block);
+      return Err(VfsError::NoSpace);
     }
     if let Err(pin) = store.content.arena_mut().pin(block) {
       // Allocated but unpinnable: free the throwaway so a refused map leaves nothing held.
