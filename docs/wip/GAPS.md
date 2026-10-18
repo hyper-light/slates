@@ -6864,3 +6864,31 @@ advertising it**, which is exactly when it would be assumed done.
 block, so guarding every read-only mapping doubles the RAM of mapped content; that is the optimization
 hierarchy's first question (need it at all, and that much?) and not a detail to settle in passing. *How often to
 scrub:* a cadence with no anchor to derive from today, and inventing one would be a magic number (R3).
+
+### 2026-10-18: what must be true before DAX is advertised — the gate checklist
+
+Today's work closed several things and found several more, scattered across six records. This is the one place
+that answers "what is left before `admission::unsupported`'s `DaxNotEstablished` can be lifted", so the next
+person does not have to reassemble it. Every row was checked today, not recalled.
+
+**Blocking — a guest window could be served unsafely or not at all:**
+
+| # | What | State |
+|---|---|---|
+| 1 | **Descriptor confinement for the message-based placer.** `Store::dax_backing` hands the frontend the arena's *whole* shared object — measured 64× the authorized window, with another tenant's blocks inside it. `fd_offset`/`len` scope the request, never the descriptor. | **Ada's call** between a per-tenant sealed backing, a per-mapping copy, or advertising over fd-sharing only. `docs/bugs/2026-10-18-the-message-based-dax-map-hands-the-vmm-the-whole-arena.md` |
+| 2 | **B2's wiring.** `dax_guard`/`dax_scrub` have no production caller and no `Bridge` surface; nothing guards a mapping and nothing schedules a scrub. | **Ada's call**: what to guard (a guard pins a full clean copy, so guarding every read-only mapping doubles mapped-content RAM) and the scrub cadence (no anchor to derive from). |
+| 3 | **L2's device half.** `dax_migrate`'s own doc promised a daemon-initiated `MAP_FIXED`/`mremap` of the guest window; no such remap exists in `bridge-virtiofs` or `bridge-core`. | Owed, with L2's adaptive trigger. |
+| 4 | **L1.** Physically-contiguous hugetlb zones + guard rows — the deployment layer that makes L2's shift move real physical rows. | Owed (needs a privileged broker). |
+| 5 | **`dax_revoke_block` for landing/takeover.** Documented as their teardown; neither calls it. The pin is today's backstop, which holds a landing *off* a mapped block rather than letting it revoke-then-move. | Owed. |
+| 6 | **The destroy ordering.** `dax_revoke_volume` is synchronous by design and relies on the attachment being torn down first (`release_dax`); nothing asserts that ordering at the server. | Owed — a test, not a design change. |
+
+**Closed today, and listed so they are not re-litigated:** the snapshot-recall **re-arm livelock** (a guest can no
+longer hold a snapshot off forever — `RecallInFlight`, owned by the verb that retries); the recall's "missing
+deadline", **decided** rather than built, because a lease would reintroduce the stale-TLB escape; the
+**cross-volume map-storm denial** (a repeat request returns its window and pins again for it); and the **pin
+ledger** now has a red-checked guard holding the arena's accounting to the device's.
+
+**Adjacent, and not part of this gate:** A-135's local zero-copy read is governed by its own confinement rule
+(`confined_for_a_peer`) and is separately owed a **multi-chunk map** — a file larger than one content chunk falls
+back to copy today, since the zero-copy path would otherwise return one chunk silently — and the **cross-shard
+owner→home descriptor hand-off**.
