@@ -31,9 +31,14 @@ const HELPER_ROLE: &str = "SLATES_FUSE_TEST_HELPER_ROLE";
 const DEADLINE_IN_TRIVIAL_HANDSHAKES: u32 = 100;
 /// Format: `SIGKILL`, the signal the handshake's cancellation sends.
 const SIGKILL: i32 = 9;
-/// Shape: a helper that sleeps far past any derived deadline (seconds), so a handshake that did
-/// not enforce its deadline would visibly hang the test rather than pass by luck.
-const HANG_SECONDS: &str = "30";
+/// Derived: the hanging helper lives this many derived deadlines, so "far past the deadline" holds
+/// on a loaded box as on an idle one. A fixed thirty seconds did not: at load 56 on 2026-10-18 a
+/// trivial handshake took over three hundred milliseconds, so the derived deadline — a hundred of
+/// those — passed thirty seconds, the sleep finished first, and the helper exited 0 where the test
+/// expects the deadline's `SIGKILL`. Four leaves three whole deadlines of slack for the fork, the
+/// exec and the kill's delivery, and still fails a real regression loudly and bounded rather than
+/// hanging the suite.
+const HANG_IN_DEADLINES: u32 = 4;
 
 /// Shape: how many trivial handshakes are timed for the deadline's unit; the slowest is taken, so
 /// one unloaded sample never sets a deadline the loaded runs cannot meet (the tests here spawn
@@ -54,6 +59,27 @@ fn trivial_handshake() -> Duration {
     start.elapsed()
   );
   start.elapsed()
+}
+
+/// How long the hanging helper lives, in whole seconds rounded up (`sleep` takes seconds, and a
+/// deadline under a quarter second must still outlive its own enforcement), floored at one so no
+/// helper is handed `sleep 0`. Both the helper's life and the bound a deadline-enforcing handshake
+/// must come in under are read from here, so the two can never drift apart.
+fn hang_life(deadline: Duration) -> Duration {
+  let whole = deadline.saturating_mul(HANG_IN_DEADLINES);
+  let seconds = whole
+    .as_secs()
+    .saturating_add(u64::from(whole.subsec_nanos() > 0))
+    .max(1);
+  Duration::from_secs(seconds)
+}
+
+/// A helper that never answers, living far past the deadline it will be killed at. `exec`, so the
+/// process the handshake kills is the sleeper itself, not a shell whose child would outlive the test.
+fn hanging_helper(deadline: Duration) -> Command {
+  let mut helper = Command::new("sh");
+  helper.args(["-c", &format!("exec sleep {}", hang_life(deadline).as_secs())]);
+  helper
 }
 
 /// The derived deadline: a hundred times the slowest of several trivial handshakes (floored at
@@ -94,10 +120,7 @@ fn a_helper_that_exits_without_a_descriptor_is_reaped_and_its_exit_reported() {
 #[test]
 fn a_helper_that_never_answers_is_killed_at_the_derived_deadline_and_reaped() {
   let deadline = derived_deadline();
-  // `exec`, so the process the handshake kills is the sleeper itself, not a shell whose child
-  // would outlive the test.
-  let mut helper = Command::new("sh");
-  helper.args(["-c", &format!("exec sleep {HANG_SECONDS}")]);
+  let helper = hanging_helper(deadline);
   let start = Instant::now();
   let outcome = handshake(helper, deadline);
   let took = start.elapsed();
@@ -119,7 +142,7 @@ fn a_helper_that_never_answers_is_killed_at_the_derived_deadline_and_reaped() {
     other => panic!("expected Timeout, got {other:?}"),
   }
   assert!(
-    took < Duration::from_secs(HANG_SECONDS.parse::<u64>().unwrap()),
+    took < hang_life(deadline),
     "the handshake ended at the deadline, not the helper's sleep ({took:?})"
   );
 }
@@ -232,8 +255,7 @@ fn a_non_blocking_handshake_reports_what_the_blocking_one_does() {
     rustix::fs::FileType::from_raw_mode(stat.st_mode),
     rustix::fs::FileType::CharacterDevice
   );
-  let mut hangs = Command::new("sh");
-  hangs.args(["-c", &format!("exec sleep {HANG_SECONDS}")]);
+  let hangs = hanging_helper(deadline);
   let started = Instant::now();
   let (outcome, _) = drive(begin_handshake(hangs).unwrap(), deadline);
   assert!(
@@ -249,7 +271,7 @@ fn a_non_blocking_handshake_reports_what_the_blocking_one_does() {
     ),
     "{outcome:?}"
   );
-  assert!(started.elapsed() < Duration::from_secs(HANG_SECONDS.parse::<u64>().unwrap()));
+  assert!(started.elapsed() < hang_life(deadline));
 }
 
 /// Cancellation (Part 2 item 9). Do: begin a handshake with a helper that never answers and drop it while
@@ -257,8 +279,7 @@ fn a_non_blocking_handshake_reports_what_the_blocking_one_does() {
 /// longer names a process; an unreaped zombie would still answer a signal probe).
 #[test]
 fn a_dropped_non_blocking_handshake_kills_and_reaps_its_helper() {
-  let mut hangs = Command::new("sh");
-  hangs.args(["-c", &format!("exec sleep {HANG_SECONDS}")]);
+  let hangs = hanging_helper(derived_deadline());
   let pending = begin_handshake(hangs).unwrap();
   let pid = pending.helper_id().unwrap();
   let pid = rustix::process::Pid::from_raw(i32::try_from(pid).unwrap()).unwrap();

@@ -195,16 +195,28 @@ impl MachineProfile {
   /// Re-measures the cheap, power-sensitive subset (timer, syscall, wake) and the power state,
   /// for the daemon to call when the power state changes.
   ///
-  /// A wake re-measure that is refused leaves the previous wake in place — it was measured, and a
-  /// refusal is no measurement to replace it with — and is returned.
+  /// A wake re-measure that is refused leaves the whole profile in place — the wake was measured
+  /// and a refusal is no measurement to replace it with, and the power state it was measured under
+  /// is what makes the next poll try again — and the refusal is returned.
+  ///
+  /// Guard then apply, the `crates/db/src/partition.rs` pattern: every fallible measurement is taken
+  /// before a single field moves. Recording the new power state ahead of the measurement (as this did
+  /// until 2026-10-18) retires the trigger on a refusal — [`MachineProfile::power_changed`] then reads
+  /// false while the profile still carries the old state's wake, so a daemon polling it re-measures
+  /// never, and one busy moment pins every tunable to the wrong power source for the process's life.
+  /// Found by `a_power_state_change_is_detected_and_triggers_a_refresh` under load 56 on 2026-10-18.
   pub fn refresh_cheap(&mut self, budget: Duration) -> Result<(), MachineError> {
-    self.facts.power = Facts::query().power;
-    self.timer_overhead_ns = timer_overhead_ns();
-    self.syscall = probes::syscall(budget);
-    self.wake = wake::wake(
+    let power = Facts::query().power;
+    let timer_overhead_ns = timer_overhead_ns();
+    let syscall = probes::syscall(budget);
+    let wake = wake::wake(
       budget,
       &Placement::of(&self.facts.cores, self.facts.cpu_budget),
     )?;
+    self.facts.power = power;
+    self.timer_overhead_ns = timer_overhead_ns;
+    self.syscall = syscall;
+    self.wake = wake;
     Ok(())
   }
 
@@ -554,18 +566,36 @@ mod tests {
     assert!(profile.wake.mean_ns > 0);
   }
 
-  /// §4.1 refusals: a re-measure whose wake probe could not measure refuses by name and keeps the wake
-  /// the profile already measured, rather than replacing it with nothing.
+  /// §4.1 refusals: a re-measure whose wake probe could not measure refuses by name and leaves the
+  /// profile whole — the wake it already measured, and the power state it measured that wake under.
+  /// Keeping the wake while recording the new power state (the shape until 2026-10-18) is the worse
+  /// half of one bug: [`MachineProfile::power_changed`] then reads false, so the re-measure the
+  /// refusal still owes is never retried and the profile carries one power source's wake under the
+  /// other's label for the rest of the process's life.
   #[test]
   fn a_refused_wake_re_measure_keeps_the_measured_wake() {
     let mut profile =
       MachineProfile::measure(quick_options()).expect("the machine profile measures");
     let measured = profile.wake;
+    // Pretend the profile was taken on the other source, so the refusal has a trigger it could drop.
+    profile.facts.power = match profile.facts.power {
+      PowerState::Mains => PowerState::Battery,
+      _ => PowerState::Mains,
+    };
+    let stale = profile.facts.power;
     assert_eq!(
       profile.refresh_cheap(Duration::ZERO),
       Err(MachineError::MeasurementTimeout { probe: "wake" })
     );
     assert_eq!(profile.wake, measured);
+    assert_eq!(
+      profile.facts.power, stale,
+      "a refused re-measure leaves the power state it could not measure under"
+    );
+    assert!(
+      profile.power_changed(),
+      "the trigger survives the refusal, so the next poll re-measures this machine"
+    );
   }
 
   /// §4.1 refusals: a profile whose wake probe could not measure at all is refused by name, never a
@@ -583,6 +613,12 @@ mod tests {
     );
   }
 
+  /// D-11 "re-measured on power-state change": a profile taken under the other power source is
+  /// detected and re-measured. A busy machine can refuse the wake probe, and the two outcomes are
+  /// asserted apart — a completed refresh records the current state, a refused one leaves the
+  /// profile whole so the trigger survives for the next poll. Asserting only the completed branch
+  /// made this a measurement of the machine's load (it failed at load 56 on 2026-10-18), and the
+  /// refused branch is the one that found the defect: the state was recorded before the probe ran.
   #[test]
   fn a_power_state_change_is_detected_and_triggers_a_refresh() {
     let mut profile =
@@ -597,14 +633,30 @@ mod tests {
       PowerState::Mains => PowerState::Battery,
       _ => PowerState::Mains,
     };
-    let before = profile.syscall;
+    let stale = profile.facts.power;
+    let before = profile.wake;
     assert!(profile.power_changed());
-    assert_eq!(profile.refresh_if_power_changed(REFRESH_BUDGET), Ok(true));
-    assert!(
-      !profile.power_changed(),
-      "the refresh recorded the current state"
-    );
-    let _ = before;
+    match profile.refresh_if_power_changed(REFRESH_BUDGET) {
+      Ok(true) => assert!(
+        !profile.power_changed(),
+        "a refresh that measured records the state it measured under"
+      ),
+      Err(MachineError::MeasurementTimeout { probe: "wake" }) => {
+        assert!(
+          profile.power_changed(),
+          "a refused refresh keeps the trigger, or nothing ever re-measures this machine"
+        );
+        assert_eq!(
+          profile.facts.power, stale,
+          "a refused refresh leaves the power state it could not measure under"
+        );
+        assert_eq!(
+          profile.wake, before,
+          "a refused refresh leaves the measurement it had no replacement for"
+        );
+      }
+      other => panic!("the refresh neither measured nor timed out on the wake probe: {other:?}"),
+    }
   }
 
   #[test]

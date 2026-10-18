@@ -7217,3 +7217,27 @@ lesson about the first.
 load test whichever way it is written. Assert the behaviour instead — that the extension ran, that the window
 was handed back — and accept a refusal that arrives the right way. `wake.rs`'s own extension test is the
 worked example.
+
+**A fifth shape, found by failures eight and nine:** a relation with one side derived from the machine and the
+other side fixed holds only on the machines where the two happen not to cross. `crates/bridge-fuse/tests/handshake.rs`
+derived its deadline properly — a hundred trivial spawn-and-reap handshakes, scaling with the scheduler on a
+loaded box as on an idle one — and then stood a hanging helper next to it that slept a hardcoded thirty seconds.
+At load 56 a trivial handshake passed three hundred milliseconds, the derived deadline passed thirty seconds,
+and the sleep finished first: the helper exited 0 where the test expects the deadline's `SIGKILL`. The derived
+half was right and the fixed half could not follow it. R3 is usually read as a rule about production tunables;
+it binds a test's constants to the same standard, because a test with a magic number in it measures the machine.
+Fixed by deriving the helper's life from the deadline it will be killed at (`hang_life`, `HANG_IN_DEADLINES`),
+so both sides of the relation move together; red-checked by collapsing the multiple, which reproduces the
+original failure exactly.
+
+**And what the ninth failure was actually worth.** `profile::tests::a_power_state_change_is_detected_and_triggers_a_refresh`
+failed at load 56 as another instance of the fourth shape — but rewriting it to assert the refused outcome
+exposed a real defect in `MachineProfile::refresh_cheap`: it recorded the new power state *before* the wake
+probe that could refuse, so a refusal retired the very trigger that would have retried it, leaving one power
+source's wake under the other's label for the process's life. Fixed by guard-then-apply
+(`crates/db/src/partition.rs`'s pattern) and recorded in
+`docs/bugs/2026-10-18-a-refused-re-measure-retired-its-own-trigger.md`. The lesson is not about load: **a
+load-sensitive test is a report that some path only runs when the machine is busy, and that path is usually the
+one nothing else tests.** The refusal arm of this function had never executed in a passing run. The fourth
+shape says not to require the probe to succeed; it does not say the failing arm is uninteresting — it is
+where the untested code is.
