@@ -6230,15 +6230,30 @@ its own page table and never calls the daemon), so the defense had to be at the 
     `snapshot` proceeds unchanged — recovery arbiter 39/0, server lib clippy clean, the check's components tested in
     `vfs/tests/dax.rs`. **The liveness kick is also built** (`serve::kick` + `serve_round`'s additive drain-on-kick
     branch + `virtiofs::kick_volume_devices`; the snapshot verb kicks the volume's device loops so an idle-guest
-    device munmaps on the recall, not on its next doorbell kick; unit-tested, recovery 39/0). **Owed — an adversarial
-    hardening pass (advertisement-gated, not correctness):** (a) a malicious guest could **re-map** a writable window
-    between the snapshot's retries (`dax_map_write` re-adds it after the recall removed it), **livelocking** the
-    retry; the mitigation mirrors the delegation quiet-period — refuse a new writable DAX map of a volume whose
-    snapshot is recalling (a per-prefix "recalling" state `dax_map_write` checks, set by the verb, cleared on
-    completion/timeout) — deferred because its flag lifecycle (across retries + an abandoned snapshot) is tricky and
-    the path is empty until advertisement; (b) the refuse-retry has no server-side deadline — a stuck device never
-    completes the snapshot, so a bounded recall (revoke the window if the device does not drain within a lease, as a
-    delegation is revoked on lapse) is the companion hardening. A through-the-client e2e needs a live writable
+    device munmaps on the recall, not on its next doorbell kick; unit-tested, recovery 39/0). **(a) the re-arm livelock is CLOSED
+    (2026-10-18).** A guest could re-map a writable window between the snapshot's retries, putting the snapshot back
+    where it started, and a guest doing it deliberately could hold the snapshot off forever. The registry now
+    carries a per-volume `recalling` set (`DaxRegistry::begin_recall`/`recalling`/`end_recall`), and
+    `Volume::dax_map_write` refuses a volume in it `VfsError::RecallInFlight` (EBUSY) before any effect, so the
+    retry converges. Read-only DAX is unaffected — the exclusion is of writable windows only.
+    **Whoever retries owns the recall:** it is begun by the `snapshot` *verb*, not by
+    `dax_revoke_writable_of_prefix`, and ended in one place by a wrapper around the verb on every answer but the
+    retryable `Overloaded` — so a client that simply stops retrying cannot leave a volume unable to take a writable
+    window. That ownership was not the first design: beginning it inside the revoke also caught `Volume::snapshot`,
+    which has no "the snapshot is over" moment, and two existing tests
+    (`a_writable_map_after_a_snapshot_copies_up_and_spares_the_snapshot`, the clone sibling) went red for exactly
+    that reason — the tests found it, not review. A `destroy` ends the recall too, so a prefix's next holder
+    inherits no ghost. Bounded and deduped by `cap` like every other structure here. Proven by use:
+    `a_guest_cannot_re_arm_a_writable_window_while_the_snapshot_is_recalling_it` (both the recalled file and a
+    neighbour of the same volume are refused; the same map succeeds before the recall and after it ends, and a read
+    map is admitted throughout, so the refusal is the recall's) and
+    `recalls_are_deduped_bounded_and_released_by_destroy`. vfs dax 51/51, virtiofs suites green, recovery oracle
+    39/39, clippy `-D warnings` and `xtask check` clean. **(b) still owed:** the refuse-retry has no server-side
+    deadline, so a stuck device leaves the snapshot refusing retryable until the client gives up. The recall itself
+    no longer leaks when that happens (the wrapper ends it), so what is missing is the *bound*, not the cleanup.
+    It is not built here because the `Store` has no clock and a retry-count bound would be a magic number wearing a
+    deadline's clothes; the server has the clock and would need per-volume recall-start state to use it. The
+    exposure meanwhile is a refused snapshot, not corruption, on a path that is empty until DAX is advertised. A through-the-client e2e needs a live writable
     window, advertisement-gated like all DAX e2e.
   - **advance — revoke on the moving reader is BUILT (2026-10-15, a7f317af); takeover/landing need no revoke.** An
     earlier note here called advance-revoke "unneeded," reasoning that a read mapping pins its version so the guest

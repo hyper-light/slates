@@ -2822,7 +2822,13 @@ same-namespace host process is the first delivered case.
 > teardown obligations the body states ("mappings must be revoked before reuse or `advance` completes") are wired to
 > the VFS and ride the production serve loop. (1) A write or truncate of a mapped inode enqueues a two-phase revoke
 > the device drains before the block is unpinned (munmap before unpin). (2) `snapshot`/clone recalls the volume's
-> *writable* windows before it freezes a shared block, refusing retryable until the device has drained. (3) **`advance`
+> *writable* windows before it freezes a shared block, refusing retryable until the device has drained — and, while
+> it waits, **excluding new writable windows of that volume** (`DaxRegistry::begin_recall`; `Volume::dax_map_write`
+> refuses `RecallInFlight`). The exclusion is not tidiness: without it a guest re-maps between two retries and the
+> snapshot is back where it started, which a hostile guest can keep up forever. It lasts across retries, so it
+> belongs to the thing that retries — the `snapshot` verb begins it and ends it on every answer but the retryable
+> one, and `destroy` ends it too; the VFS revoke deliberately does not begin it, since `Volume::snapshot` has no
+> moment at which the snapshot is over. Read-only windows are admitted throughout. (3) **`advance`
 > revokes on the moving reader**, as the attachment lifecycle requires ("`advance` … invalidates old caches/mappings …
 > cannot combine old names with new bytes"): the advancing attachment's own device re-validates its windows against the
 > now-current view (`Device::revalidate_windows` → `Bridge::dax_window_current` → `Volume::dax_still_current`) and

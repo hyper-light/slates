@@ -208,6 +208,20 @@ pub struct DaxRegistry {
   /// a snapshot shares the block read-only). Empty on any shard with no device drain pending; bounded by `cap`
   /// distinct live inodes (deduped on enqueue, `writable_only=false` superseding `true` for the same inode).
   pending_revokes: Vec<(InodeNo, bool)>,
+  /// Volumes whose writable windows a snapshot has recalled (§4.6 step 5, `Store::dax_revoke_writable_of_prefix`).
+  /// While a volume is here, [`Volume::dax_map_write`] refuses it `RecallInFlight`.
+  ///
+  /// Why it exists: without it the recall never converges. The snapshot revokes the volume's writable windows and
+  /// refuses itself retryable until the device has munmapped them; a guest that maps a writable window again
+  /// between two of those retries puts the snapshot straight back where it started, and a guest doing it
+  /// deliberately holds the snapshot off forever. The exclusion is the same shape a write delegation's quiet period
+  /// has: once the recall is on, the thing being recalled cannot be taken out again.
+  ///
+  /// It carries no deadline, deliberately: the `Store` has no clock, and a bound invented here would be a magic
+  /// number. The caller that *does* have a clock owns the bound and clears this with
+  /// [`DaxRegistry::end_recall`] — see `crates/server/src/verbs.rs`'s `snapshot`. `dax_revoke_volume` clears it too,
+  /// so a destroyed volume leaves nothing behind. Bounded by `cap`, one entry per volume, deduped.
+  recalling: Vec<u16>,
   /// The next mapping identity to mint (§4.6 step 2). Monotone and per-`Store`, incremented on every mint; starts at
   /// 1 so a zero id is never minted. It never crosses a host (a taken-over successor starts from its own fresh
   /// registry), so it needs no coordination.
@@ -229,6 +243,7 @@ impl DaxRegistry {
       flips: 0,
       healed: 0,
       pending_revokes: Vec::new(),
+      recalling: Vec::new(),
       next_id: 1,
     }
   }
@@ -287,6 +302,45 @@ impl DaxRegistry {
       .mappings
       .iter()
       .any(|mapping| mapping.writable && mapping.inode.prefix() == prefix)
+  }
+
+  /// Marks the volume `prefix` as recalling its writable windows, so [`Volume::dax_map_write`] refuses a new one
+  /// until the recall ends (see the [`recalling`](Self::recalling) field for why). Idempotent. `false` when the
+  /// registry is already holding `cap` recalls, which is the bound: the caller treats that as a refusal rather than
+  /// letting the list grow.
+  pub fn begin_recall(&mut self, prefix: u16) -> bool {
+    if self.recalling.contains(&prefix) {
+      return true;
+    }
+    if self.recalling.len() >= self.cap {
+      return false;
+    }
+    self.recalling.push(prefix);
+    true
+  }
+
+  /// Whether the volume `prefix` is recalling its writable windows.
+  #[must_use]
+  pub fn recalling(&self, prefix: u16) -> bool {
+    self.recalling.contains(&prefix)
+  }
+
+  /// Ends the volume `prefix`'s recall, so writable maps of it are admitted again. Called by whoever began it once
+  /// its snapshot has frozen or given up, and by `dax_revoke_volume` so a destroyed volume leaves nothing behind.
+  pub fn end_recall(&mut self, prefix: u16) {
+    self.recalling.retain(|held| *held != prefix);
+  }
+
+  /// The most live mappings — and the most recalls — the registry admits at once.
+  #[must_use]
+  pub fn cap(&self) -> usize {
+    self.cap
+  }
+
+  /// How many volumes are recalling (the bound/dedup test's counter).
+  #[must_use]
+  pub fn recalling_len(&self) -> usize {
+    self.recalling.len()
   }
 
   /// Counts a completed migration (§4.6 L2): the moving target's non-vacuity counter.
@@ -690,6 +744,13 @@ impl Volume {
     // refused writable map mutates nothing.
     if !self.writable_dax {
       return Err(VfsError::NotPermitted);
+    }
+    // A snapshot of this volume has recalled its writable windows and is waiting for the device to munmap them
+    // (§4.6 step 5). Granting another one now would put that snapshot back where it started on its next retry, and
+    // a guest doing it deliberately would hold the snapshot off forever — the livelock this exclusion closes.
+    // Checked before any effect, so a refused map copies nothing up.
+    if store.dax.recalling(no.prefix()) {
+      return Err(VfsError::RecallInFlight);
     }
     // Defence in depth: a writable mapping, like a read mapping, is of a namespace object only — never an
     // attribute inode (`Volume::dax_map_read`).
@@ -1223,6 +1284,10 @@ impl Store {
   /// which a retrying `snapshot` awaits ([`DaxRegistry::has_pending_of_prefix`]) before it freezes. The inode-keyed
   /// enqueue carries `writable_only=true` so the drain tears only the writable windows and keeps the read-only ones.
   /// Returns how many were revoked-pending. Empty on any volume no guest maps writable (the common case).
+  /// This revoke does **not** begin the recall ([`DaxRegistry::begin_recall`]), deliberately. The recall is an
+  /// exclusion that lasts across retries, so it belongs to whoever runs that retry loop and can end it — the
+  /// `snapshot` verb. Begun here it would also be begun by `Volume::snapshot`, which has no "the snapshot is over"
+  /// moment to end it at, and the volume would never take a writable window again (two tests caught exactly that).
   pub fn dax_revoke_writable_of_prefix(&mut self, prefix: u16) -> usize {
     let victims: Vec<Mapping> = self
       .dax
@@ -1246,6 +1311,9 @@ impl Store {
   /// [`Store::dax_revoke_writable_of_prefix`] this takes read-only mappings too — the whole volume is going away.
   /// Returns how many were revoked.
   pub fn dax_revoke_volume(&mut self, prefix: u16) -> usize {
+    // The volume is going away, so any recall of it goes with it: nothing is left to block a later volume that
+    // happens to reuse the prefix.
+    self.dax.end_recall(prefix);
     let victims: Vec<Mapping> = self
       .dax
       .mappings

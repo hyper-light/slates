@@ -48,6 +48,10 @@ pub enum VfsError {
   Destroying,
   /// The snapshot is pinned by a live clone; destroy the clone (and unpin) first.
   Pinned,
+  /// A snapshot of this volume has recalled its writable DAX windows and is waiting for the device to munmap them
+  /// (§4.6 step 5), so a new writable map is refused until the recall ends. Without this a guest that re-maps
+  /// between the snapshot's retries holds the snapshot off forever.
+  RecallInFlight,
   /// The base beneath an overlay entry cannot be served: the host's errno.
   BaseUnavailable(i32),
   /// A witnessed base entry changed on disk beneath an unpinned range: the read refuses rather
@@ -141,7 +145,7 @@ impl VfsError {
       Self::FileTooLarge => "EFBIG",
       Self::CrossVolumeMove => "EXDEV",
       Self::StaleHandle => "ESTALE",
-      Self::Destroying | Self::Archived | Self::Pinned => "EBUSY",
+      Self::Destroying | Self::Archived | Self::Pinned | Self::RecallInFlight => "EBUSY",
       Self::BaseUnavailable(_) | Self::BaseDrift | Self::RecoveryIncomplete | Self::Integrity => {
         "EIO"
       }

@@ -1421,6 +1421,106 @@ fn a_snapshot_revokes_the_volumes_writable_windows_two_phase_and_keeps_read_only
   );
 }
 
+/// §4.6 step 5 — adversarial: a guest must not be able to hold a snapshot off forever by re-arming the window the
+/// snapshot just called back. Do: map a file writable, run the snapshot's recall
+/// (`dax_revoke_writable_of_prefix`), and then do what a hostile guest does — ask for a writable map again, of that
+/// file and of a *second* file of the same volume. Expect: both refused `RecallInFlight`, so the snapshot's next
+/// retry finds no new writable window and converges; once the recall ends, a writable map is admitted again.
+///
+/// Non-vacuity, both ways: the same map succeeds before the recall and again after it ends, so the refusal is the
+/// recall's and not a map that never worked; and a *read* map is admitted throughout, so the exclusion is of
+/// writable windows only and not of DAX as such.
+#[test]
+fn a_guest_cannot_re_arm_a_writable_window_while_the_snapshot_is_recalling_it() {
+  let mut store = store();
+  let mut volume = volume(&mut store, 1 << 20);
+  let prefix = volume.prefix();
+  let first = file_of(&mut store, &mut volume, "first", 0x11, DAX_PAGE);
+  let second = file_of(&mut store, &mut volume, "second", 0x22, DAX_PAGE);
+
+  // Before: a writable map is admitted. (Non-vacuity for the refusals below.)
+  let mapped = volume.dax_map_write(&mut store, first).unwrap();
+  assert!(store.dax_is_live(&mapped), "the window is live before the recall");
+
+  // The snapshot's recall.
+  assert_eq!(
+    store.dax_revoke_writable_of_prefix(prefix),
+    1,
+    "the live writable window was handed to the device"
+  );
+  // What the `snapshot` verb does with the revoke: the exclusion is the retry loop's, so the caller that retries
+  // begins it and ends it (`crates/server/src/verbs.rs`). The revoke itself deliberately does not.
+  assert!(store.dax.begin_recall(prefix), "the recall is admitted");
+  assert!(store.dax.recalling(prefix), "the volume is recalling");
+
+  // The attack: re-arm a writable window while the snapshot waits for the device.
+  let retaken = volume.dax_map_write(&mut store, first);
+  let neighbour = volume.dax_map_write(&mut store, second);
+  assert_eq!(
+    (retaken.err(), neighbour.err()),
+    (
+      Some(slates_vfs::error::VfsError::RecallInFlight),
+      Some(slates_vfs::error::VfsError::RecallInFlight)
+    ),
+    "neither the recalled file nor a neighbour of the same volume can be re-armed during the recall"
+  );
+  assert!(
+    !store.dax.has_writable_of_prefix(prefix),
+    "so the snapshot's retry still sees no live writable window — the retry converges"
+  );
+
+  // A read map is untouched: the exclusion is of writable windows, not of DAX.
+  let read_through = volume.dax_map_read(&mut store, second).unwrap();
+  assert!(store.dax_is_live(&read_through), "read-only DAX is admitted during a recall");
+
+  // The snapshot finishes and ends its recall; writable maps are admitted again.
+  store.dax.end_recall(prefix);
+  let after = volume.dax_map_write(&mut store, first);
+  assert!(
+    after.is_ok(),
+    "once the recall ends a writable window is admitted again: {after:?}"
+  );
+}
+
+/// §4.6 step 5 — the recall's lifetime has no loose ends. Do: begin recalls for several volumes, re-begin one of
+/// them, destroy one, and push past the registry's cap. Expect: the list is deduped (re-beginning changes nothing),
+/// a destroyed volume's recall goes with it (so a later volume reusing the prefix is not blocked by a ghost), and
+/// the list never grows past the cap — it is bounded like every other structure here (CLAUDE.md #8).
+#[test]
+fn recalls_are_deduped_bounded_and_released_by_destroy() {
+  let mut store = store();
+  let volume = volume(&mut store, 1 << 20);
+  let prefix = volume.prefix();
+
+  assert!(store.dax.begin_recall(prefix), "the first recall is admitted");
+  assert!(store.dax.begin_recall(prefix), "re-beginning is idempotent");
+  assert_eq!(store.dax.recalling_len(), 1, "one volume, one entry");
+
+  // A destroy takes the recall with it.
+  store.dax_revoke_volume(prefix);
+  assert!(
+    !store.dax.recalling(prefix),
+    "a destroyed volume leaves no recall behind for its prefix's next holder"
+  );
+  assert_eq!(store.dax.recalling_len(), 0, "and nothing in the list");
+
+  // The bound, on a registry of its own with a small cap: a live store's cap is larger than the whole prefix
+  // space, so filling it there would measure nothing.
+  let cap = 3usize;
+  let mut small = slates_vfs::dax::DaxRegistry::new(cap);
+  let mut admitted = 0usize;
+  for candidate in 1..=u16::try_from(cap.saturating_add(5)).unwrap_or(u16::MAX) {
+    if small.begin_recall(candidate) {
+      admitted = admitted.saturating_add(1);
+    }
+  }
+  assert_eq!(
+    (admitted, small.recalling_len()),
+    (cap, cap),
+    "the list stops at the cap and refuses the rest, instead of growing with the caller"
+  );
+}
+
 /// §4.6 (the DAX device-window backing seam, Unix). Do: on the scratch (anonymous-backed) test store, map a file
 /// writable and ask for its DAX backing; then revoke and ask again. Expect: `None` both times — a scratch volume's
 /// content is private process RAM with no descriptor to hand a VMM (so DAX is served only on anchor-backed volumes),
