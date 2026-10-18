@@ -46,6 +46,23 @@ const START_WAIT: Duration = Duration::from_secs(5);
 /// the other tests' probes and daemons and measured their load, or measured nothing and was refused
 /// (`docs/bugs/2026-09-25-test-fixtures-measured-the-machine-beside-each-other.md`).
 fn profile() -> MachineProfile {
+  let measured = measured_profile();
+  // This binary starts daemons of one and two shards, and `hyper_seal`'s key region is made **once per
+  // process** by whichever starts first and never grows. A one-shard daemon winning that race locked 512
+  // slots and left the two-shard sealing test refused the 1024 it needed — which is why that test failed
+  // under a full `cargo test --workspace` and passed alone. Reserving for the largest daemon here, before
+  // any of them starts, takes the order out of it for every test in the binary, not only the one that
+  // asserts on sealing (`slates_server::seal_keys::reserve`).
+  static RESERVED: OnceLock<bool> = OnceLock::new();
+  let _ = RESERVED.get_or_init(|| {
+    let largest = DaemonConfig::derive(&measured, "cl-reserve", Some(TEST_SHARDS));
+    slates_server::seal_keys::reserve(largest.seal_key_slots)
+  });
+  measured
+}
+
+/// The measurement itself, once per process.
+fn measured_profile() -> MachineProfile {
   static PROFILE: OnceLock<Result<MachineProfile, MachineError>> = OnceLock::new();
   PROFILE
     .get_or_init(|| {

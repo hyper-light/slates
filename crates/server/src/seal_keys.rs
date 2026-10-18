@@ -43,6 +43,37 @@ impl RootState {
   }
 }
 
+/// Reserves this **process's** key region for at least `slots` keys, before any daemon starts. `true` when the
+/// region now holds that many — either because this call made it, or because one already made holds enough.
+///
+/// The region is made **once per process** and never grows ([`hyper_seal::lock_keys`]: a later caller is served
+/// if the region holds enough, and refused `AlreadyLocked` otherwise). One daemon per process — production —
+/// never meets that. A process that starts **several** daemons does: the first to start fixes the size, and a
+/// later daemon needing more is refused, and degrades to [`RootState::Unavailable`] with its content unsealed
+/// rather than failing. Since `seal_key_slots` is derived per daemon from its shard count, "several daemons"
+/// means in-process fleets and test binaries, where start order is not controlled.
+///
+/// So such a process reserves for its **largest** daemon up front and stops depending on order.
+///
+/// **Its only caller today is a test binary**, and that is said rather than dressed up: `crates/client/tests/
+/// client.rs` reserves here before any of its daemons start. The in-process fleet has the same exposure and
+/// does **not** call this yet — it is owed, and a fleet whose members differ in shard count will silently run
+/// the larger ones unsealed until it does.
+///
+/// Measured
+/// 2026-10-18: in `crates/client/tests/client.rs` a one-shard daemon winning the race locked 512 slots, and the
+/// two-shard daemon of the sealing test was then refused the 1024 it needed — *"sealing unavailable: this
+/// process's key region holds 512 keys, fewer than the 1024 this daemon needs"* — so that test failed under a
+/// full `cargo test --workspace` and passed alone, and every other two-shard test in the binary had been running
+/// with sealing unavailable whenever the order fell that way.
+pub fn reserve(slots: usize) -> bool {
+  match hyper_seal::lock_keys(slots) {
+    Ok(()) => true,
+    Err(hyper_seal::SealError::AlreadyLocked { slots: held }) => held >= slots,
+    Err(_) => false,
+  }
+}
+
 /// Locks the key region for `slots` keys and the anchor's page, then finds or makes the node's root in `segment` (the
 /// module doc). The calling thread holds no key afterwards; the shards read the root themselves.
 pub fn init(segment: &mut AnchorSegment, slots: usize) -> RootState {

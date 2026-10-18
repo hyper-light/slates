@@ -6979,3 +6979,37 @@ than inventing a parallel one. All **ten** test sites that measure a profile wer
 `client/tests/*.rs` — each with a `PROFILE_BUDGETS` constant that keeps the quick bound the suite always used
 and adds the full profile's behind it. Converting *some* of them is what produced two failures in one afternoon;
 the list was taken from `grep` over the whole workspace rather than from the directories I expected them in.
+
+### 2026-10-18: a one-shard daemon starting first left the sealing test's two-shard daemon unsealed
+
+The third failure the full workspace run found, and the only one that is not about the machine profile. The
+client binary's sealing test failed `left: "unavailable", right: "minted"`, and the daemon said exactly why:
+
+```
+slates-server: sealing unavailable: this process's key region holds 512 keys, fewer than the 1024 this daemon needs
+SealReport { state: "unavailable", root_id: [], key_slots: 512, keys_held: 0, recipient_id: [] }
+```
+
+`hyper_seal`'s key region is made **once per process** by whichever daemon starts first and never grows — by
+design, and right for production, where one process is one daemon. `seal_key_slots` is derived per daemon as
+`page.base / 32 × shards`, so a one-shard daemon locks 512 slots and a two-shard daemon then needs 1024 and is
+refused `AlreadyLocked`, degrading to `RootState::Unavailable` with its content unsealed rather than failing.
+
+**Reproduced deterministically** rather than inferred: `cargo test -p slates-client --test client --
+--test-threads=1 a_map_read_returns_the_whole_file a_restarted_daemon_adopts` puts a one-shard daemon first by
+alphabetical order and fails every time; the same two tests pass in either order after the fix. Under libtest's
+parallel threads the order is a race, which is why it passed alone and failed in the workspace.
+
+**It was latent and I made it likelier.** The binary had two one-shard tests before today; the DAX work added
+two more, so the chance that a one-shard daemon wins the race roughly doubled.
+
+**Fixed by reserving for the largest daemon before any of them starts** — `slates_server::seal_keys::reserve`,
+called once from the client binary's `profile()` helper, which every test already calls. That fixes more than
+the flake: **every** two-shard test in that binary had been running with sealing unavailable whenever the order
+fell that way, which is a silent coverage hole and not a visible failure.
+
+**Owed, and named at the function:** the in-process fleet has the same exposure and does not call `reserve`, so
+a fleet whose members differ in shard count will silently run the larger ones unsealed. Other multi-daemon test
+binaries (`mcp/tests/mcp.rs`, several `server/tests/*`) share the order dependence; it is observable only where
+a test asserts on sealing, which today is this test and `server/tests/seal.rs` — and that one uses a single
+shard count throughout, so it is not exposed.
