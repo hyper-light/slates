@@ -1,0 +1,85 @@
+# overlayfs is `Unknown` to `fs_kind`, so the base plane assumes 2-second timestamps in containers
+
+- **Date:** 2026-10-18
+- **Area:** `crates/base/src/unix.rs` (`fs_kind`), `crates/base/src/lib.rs` (`granularity_for`),
+  `crates/vfs/src/base.rs` (the digest/attribute freshness window, §4.5)
+- **Status:** found by measurement; **NOT changed** — the value is a safety bound and I cannot prove a
+  tighter one for every overlayfs stack. Flagged for Ada with the numbers.
+- **Class:** over-conservative default on the deployment the product targets (performance, not correctness)
+
+## Description
+
+The base plane decides how long a digest or attribute may be trusted from the base filesystem's
+timestamp granularity: `HostFacts::timestamp_granularity_ns`, which `unix.rs` takes as
+`granularity_for(fs_kind(&fs)).max(clock_ns)`. `fs_kind` matches `statfs`'s `f_type`:
+
+| magic | class | granularity |
+|---|---|---|
+| ext4, XFS, btrfs, tmpfs | `Nanosecond` | 1 ns |
+| NTFS | `HundredNanoseconds` | 100 ns |
+| HFS+ | `Second` | 1 s |
+| FAT, exFAT | `TwoSeconds` | 2 s |
+| **anything else** | **`Unknown`** | **2 s** |
+
+**overlayfs — magic `0x794c7630` — is not in the match**, so it takes the `Unknown` arm and the base
+plane assumes **two seconds**. overlayfs is the filesystem of every OCI container, which is condition 2
+of the goal and the deployment the OCI work targets.
+
+## The measurement
+
+Inside a Docker container (aarch64, kernel 6.12-linuxkit, `stat -f -c %T` = `overlayfs`, magic
+`0x794c7630`), five consecutive writes to the same file:
+
+```
+1792337493.999477007
+1792337494.004477007
+1792337494.005477007
+1792337494.006477007
+1792337494.007477007
+```
+
+The nanosecond field is the constant `…477007` on every write and the values advance in whole
+**milliseconds**; two writes inside one millisecond share a timestamp exactly. So the real granularity
+there is **1 ms**, against the **2 s** slates assumes — a factor of **2000**.
+
+For contrast, the same probe on the Linux box's btrfs gives true nanosecond spacing
+(`…959704950`, `…960212437`, `…960667456`), which `fs_kind` already classifies correctly.
+
+## Impact
+
+Performance, in containers, and only there. A base file's digest cannot be kept until the assumed
+window has closed, so on overlayfs a digest computed within two seconds of the file's last write is
+discarded as racy and recomputed. The conservatism is **safe** — it is the §4.5 rule that a timestamp
+comparison means nothing inside the granularity — and nothing is read stale. It simply does far more
+work than the filesystem requires, in exactly the deployment where base-plane reads matter most.
+
+This was invisible until something ran the suite on a container filesystem: every platform CI tests
+(ext4 on the Linux runner, APFS on macOS) is classified `Nanosecond`, so the `Unknown` arm never ran.
+
+## Why it is not changed here
+
+The value is an upper bound on how wrong a timestamp may be, so tightening it is a safety change, and
+I cannot prove the tighter bound for every overlayfs stack:
+
+1. **Map overlayfs to a new `Millisecond` class.** Matches the measurement, but overlayfs delegates to
+   whatever its upper layer is, and `statfs` on the mount does not reveal that layer. The measured 1 ms
+   may be this VM's clock rather than overlayfs itself, in which case the class is wrong elsewhere.
+2. **Map overlayfs to `Nanosecond`** on the argument that a container upper layer is always a modern
+   filesystem. Fastest, and unsafe if that argument is ever false — and it is unverifiable from inside.
+3. **Measure the granularity instead of classifying it.** What R3 would want, and what would be right
+   for every filesystem at once. Blocked by R1 as the base plane stands: a probe means writing, and the
+   base directory is a host path slates only ever reads.
+4. **Leave it.** Correct and slow in containers, which is where it is today.
+
+Option 3 is the only one that generalises, and it needs a place to write that R1 permits — the question
+is whether a granted landing's target, or the daemon's own build area, is a legitimate stand-in for the
+base's filesystem (same mount in some deployments, not in others). That is a design call.
+
+## Owed
+
+Ada's choice among the four. Until then the behaviour is correct and the cost is recorded here.
+
+A related test defect found with it **is** fixed in the same change: `crates/base/tests/host.rs` held a
+hardcoded 2 ms `TICK` whose own doc assumed "tmpfs and APFS". It failed 3/3 on overlayfs because the
+real window there is the 2 s above. The pause now derives from the same `timestamp_granularity_ns` the
+product decides by, so the test is portable and the magic number is gone.

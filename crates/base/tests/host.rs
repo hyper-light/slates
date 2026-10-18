@@ -324,11 +324,27 @@ fn an_overlay_over_the_workspace_tree_digests_a_file_as_the_disk_holds_it() {
   assert_eq!(digest_stats(&vol).computed, 1);
 }
 
-/// Shape: the pause that lets a filesystem's timestamp tick close so a digest may be kept
-/// (nanosecond granularity on tmpfs and APFS, a microsecond clock resolution on macOS): two
-/// milliseconds, far past both.
+/// Shape: the floor for the pause that lets a filesystem's timestamp tick close so a digest may be
+/// kept — two milliseconds, far past the nanosecond granularity of tmpfs and APFS and macOS's
+/// microsecond clock resolution, which is what this constant alone used to assume.
 #[cfg(unix)]
-const TICK: std::time::Duration = std::time::Duration::from_millis(2);
+const TICK_FLOOR: std::time::Duration = std::time::Duration::from_millis(2);
+
+/// Derived: the pause this host actually needs, from the same measured number the base plane
+/// decides freshness by (`HostFacts::timestamp_granularity_ns`, which `crates/base/src/unix.rs`
+/// already takes as the filesystem's granularity raised to the clock's resolution). Twice that, with
+/// [`TICK_FLOOR`] underneath.
+///
+/// A fixed two milliseconds was not portable. Docker's overlayfs stamps at **one millisecond** — its
+/// mtime nanoseconds are a constant (`…477007` on every write, measured 2026-10-18) and two writes in
+/// the same millisecond share a timestamp — so the racy window the base plane computes from
+/// granularity *plus* clock resolution can reach past two milliseconds, the digest is correctly not
+/// kept, and the test failed 3/3 on aarch64 Linux in a container while passing on macOS/APFS and on
+/// btrfs. The product was right; the constant was the part that assumed a filesystem.
+#[cfg(unix)]
+fn tick_for(facts: &slates_vfs::host::HostFacts) -> std::time::Duration {
+  std::time::Duration::from_nanos(facts.timestamp_granularity_ns.saturating_mul(2)).max(TICK_FLOOR)
+}
 
 /// A test's own directory in the build output (`CARGO_TARGET_TMPDIR`; A-50: a real base directory,
 /// never `/tmp` or a RAM directory), named with the process id and removed on drop, a failed assertion
@@ -362,18 +378,21 @@ fn a_real_directory_digest_follows_the_disk_through_the_watcher() {
   // A-50: a real base directory in the build output, never `/tmp` or a RAM directory.
   let owned = BuildOutputDir::new("digest");
   let dir = owned.0.clone();
-  std::fs::write(dir.join("f"), b"one").unwrap();
-  std::thread::sleep(TICK);
-
+  // The host is opened first so the pause comes from this filesystem's measured granularity.
   let (mut host, root) = OsHost::open_root(&dir).unwrap();
   let facts = host.facts(root).unwrap();
+  let tick = tick_for(&facts);
+  std::fs::write(dir.join("f"), b"one").unwrap();
+  std::thread::sleep(tick);
   let mut store = store();
   let mut vol = overlay_over(&mut store, root, facts);
   let first = vol.with_host(&mut host).digest(&mut store, "/f").unwrap();
   assert_eq!(first.identity, *blake3::hash(b"one").as_bytes());
   assert_eq!(digest_stats(&vol).cached, 1, "the tick had closed: kept");
   let rechecks = assert_replacement_hint_drops_the_digest(&mut vol, &mut host, &mut store, &dir);
-  assert_unrelated_change_hint_keeps_the_digest(&mut vol, &mut host, &mut store, &dir, rechecks);
+  assert_unrelated_change_hint_keeps_the_digest(
+    &mut vol, &mut host, &mut store, &dir, rechecks, tick,
+  );
 }
 
 /// Replace `f` by rename (a new inode at the name): the real watcher hints the directory, the
@@ -413,8 +432,9 @@ fn assert_unrelated_change_hint_keeps_the_digest(
   store: &mut Store,
   dir: &std::path::Path,
   rechecks_before: u64,
+  tick: std::time::Duration,
 ) {
-  std::thread::sleep(TICK);
+  std::thread::sleep(tick);
   vol.with_host(host).digest(store, "/f").unwrap();
   assert_eq!(digest_stats(vol).cached, 1);
   std::fs::write(dir.join("g"), b"other").unwrap();
