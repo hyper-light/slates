@@ -26,7 +26,7 @@ enum Interest {
   Readable,
   /// The socket has send-buffer space for a write (or connect) that returned `EAGAIN`/`EINPROGRESS`: a TCP
   /// write, or a UDP send the kernel had no room for (every platform's driver arms it: kqueue
-  /// `EVFILT_WRITE`, epoll `EPOLLOUT`, io_uring `POLLOUT`, IOCP's AFD send poll).
+  /// `EVFILT_WRITE`, epoll `EPOLLOUT`, IOCP's AFD send poll).
   Writable,
 }
 

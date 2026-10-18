@@ -729,8 +729,8 @@ plan schedules.
 - Evidence: contended refcounts cost 50-400 ns per touch and serialize cores [A: David SOSP'13; A: Schweizer PACT'15]; vorpal's written policy and two exemplar load-bearing `Arc`s [C: survey-vorpal.md §2.0-2.1]; hecate's generational-handle doctrine [C: survey-hecate.md §3.8]; `RawWakerVTable` needs no reference count [B: std docs]. (`research/arc-free-rust-architecture.md` §2.1-2.2)
 - Exceptions: bindings objects whose GC may drop them mid-call; foreign APIs that take `Arc` by signature; test harnesses.
 
-### D-9 Runtime: a custom thread-per-core executor with arena task slots and `RawWaker` encodings; io_uring/epoll, kqueue, IOCP drivers; a deterministic simulation driver
-- Evidence: monoio lacks Windows, compio has no maturity statement, tokio is work-stealing and `Arc`-based [C: READMEs; C: survey-vorpal.md §2.4]; embassy proves `Arc`-free wakers [C: embassy-executor]; io_uring `DEFER_TASKRUN`+`SINGLE_ISSUER` for jitter and the epoll fallback for containers [B: io_uring_setup(2); C: Docker seccomp]. (`research/low-latency-ipc-and-runtime.md` §2.3; `research/arc-free-rust-architecture.md` §2.3-2.4)
+### D-9 Runtime: a custom thread-per-core executor with arena task slots and `RawWaker` encodings; epoll, kqueue, IOCP drivers; a deterministic simulation driver
+- Evidence: monoio lacks Windows, compio has no maturity statement, tokio is work-stealing and `Arc`-based [C: READMEs; C: survey-vorpal.md §2.4]; embassy proves `Arc`-free wakers [C: embassy-executor]; epoll is Linux's driver (**amended 2026-10-18, A-136** — io_uring was the default until its benefit was measured for the first time and proved confined to the parked path, 13% at p50, while it lost the spinning path the R9 gate measures by up to 23% at p99, cost the kernel attack surface Google's VRP data describes, and failed daemon boot with `io_uring_setup` = ENOMEM under `RLIMIT_MEMLOCK`) [M: BENCHMARKS.md io_uring/epoll A/B; C: Google VRP; C: Docker seccomp]. (`research/low-latency-ipc-and-runtime.md` §2.3; `research/arc-free-rust-architecture.md` §2.3-2.4)
 - Lost: tokio; compio (audited runner-up); monoio (until Windows lands).
 - Size: 6-7 kLOC plus tests.
 
@@ -1235,12 +1235,13 @@ ring and kicks the driver; a stale generation is ignored.
 > geometry takes four allocator calls rather than 25,271, and use/renewal/expiry allocate
 > nothing. These corrections supersede the older delayed-entry-retirement description.
 
-> **Follow-up (2026-09-19, driver retirement and test attribution):** io_uring close
-> schedules kernel cleanup; pending polls can retain a listener after the shard joins.
-> Driver retirement cancels submitted requests and waits for a drain completion before
-> closing the ring. The probe requires synchronous cancellation support. Threaded and
-> calling-thread rebind regressions exercise actual socket ownership, and Linux CI requires
-> io_uring so an epoll result cannot silently replace its coverage. Allocation oracles in
+> **Follow-up (2026-09-19, driver retirement and test attribution; the io_uring half is history since
+> A-136 removed that driver):** io_uring close scheduled kernel cleanup, and pending polls could retain
+> a listener after the shard joined. Driver retirement cancelled submitted requests and waited for a
+> drain completion before closing the ring; the probe required synchronous cancellation support. Threaded and
+> calling-thread rebind regressions exercise actual socket ownership; Linux CI required io_uring then,
+> so an epoll result could not silently replace its coverage, which A-136 made moot by leaving one
+> Linux driver. Allocation oracles in
 > `mem` and `rt` count on the allocating thread; a controlled foreign allocation proves that
 > libtest reporting cannot contaminate either the capacity comparison or the zero-call gate.
 > Evidence and local validation: the two 2026-09-19 driver-retirement/allocation-counter reports.
@@ -1261,7 +1262,7 @@ ring and kicks the driver; a stale generation is ignored.
 > publish whole (the head-into-snapshot and shared-root cases a delta cannot carry). Evidence:
 > `docs/bugs/2026-10-11-overlay-volumes-republish-whole-image-per-operation.md`.
 
-**Loop.** Each iteration: drain the driver's completions (io_uring CQ / kqueue events / IOCP
+**Loop.** Each iteration: drain the driver's completions (epoll events / kqueue events / IOCP
 packets) into the run queue; drain inbound rings (client command rings, cross-shard rings, the
 bridge queue) up to a batch bound derived from the measured service time and the latency budget;
 run ready tasks to their next await; expire timers; store the loop generation (QSBR); if nothing
@@ -1269,17 +1270,19 @@ is ready, spin out the idle-spin window that the last client activity opened (A-
 served ring request, forwarded verb, mount call or guest pass; a timer's work opens none) — a multiple of
 the shard's wake estimate — asking the rings, the pollers, the timers and the driver on each turn (a socket's
 readiness is known only to the driver, so the spin polls it without blocking; A-39), then park in
-the driver. Every non-blocking harvest is one that never sleeps: on io_uring that is `io_uring_enter`
-with `GETEVENTS` and `min_complete = 0`, which runs the deferred task work and returns (A-39). Cancellation: dropping a future releases nothing it did not own (resources live in arenas
+the driver. Every non-blocking harvest is one that never sleeps: on epoll that is `epoll_wait` with a
+zero timeout (A-39; the same rule held for io_uring's `io_uring_enter` before A-136 removed it).
+Cancellation: dropping a future releases nothing it did not own (resources live in arenas
 keyed by handle and are released by the owning operation's terminal step), so every operation is
 cancel-safe by construction; a cancellation request is a message that guarantees a terminal
 completion.
 
-**Drivers.** Linux: io_uring with `SINGLE_ISSUER|DEFER_TASKRUN` when the kernel is ≥ 6.1 and
-io_uring is permitted (probed at boot: setup or synchronous-cancellation refusal selects epoll);
-plain rings require cancellation support from 6.0. Registered
-buffers for ring and chunk pages; FUSE-over-io_uring per-shard queues on ≥ 6.14; eventfd for
-cross-shard kicks. macOS: kqueue with `EVFILT_USER` kicks and non-blocking socket I/O for the NFS
+**Drivers.** Linux: epoll with an eventfd for cross-shard kicks, one-shot `EPOLLIN`/`EPOLLOUT`
+interest re-armed per edge. io_uring was Linux's driver until A-136 (2026-10-18) removed it: slates
+only ever issued `PollAdd` and `Nop` through a ring — epoll's job — and the first measurement of what
+that bought showed a 13% p50 win confined to the parked wake path against a loss of up to 23% at the
+8-client p99 in the spinning path, which is the one R9's sub-50 µs gate measures. It is removed, not
+kept behind a flag: the rule is replace, do not layer. macOS: kqueue with `EVFILT_USER` kicks and non-blocking socket I/O for the NFS
 server. Windows: IOCP with `PostQueuedCompletionStatus` kicks; WinFsp requests arrive on WinFsp's
 threads and are routed to the owning shard by handle. Simulation: a driver that replaces time,
 randomness, sockets, rings, and the bridge with seeded in-process simulations for the whole
@@ -1288,8 +1291,8 @@ cluster.
 > Status (2026-09-09): the driver readiness seam carries both directions. `Driver::register_readable`
 > and `register_writable` register one-shot interest in a descriptor's readability or writability with
 > the shard's driver (kqueue `EVFILT_READ`/`EVFILT_WRITE` and epoll `EPOLLIN`/`EPOLLOUT`, each re-armed
-> after the edge is consumed; io_uring a one-shot `PollAdd` on `POLLIN`/`POLLOUT` since 2026-09-16, the
-> shape its kick eventfd already used; Windows IOCP through its AFD reactor). The simulation carries
+> after the edge is consumed; Windows IOCP through its AFD reactor; io_uring carried the same one-shot
+> `PollAdd` shape until A-136 removed that driver). The simulation carries
 > readability over its in-memory fabric and refuses only writability (its fabric sends never block).
 > Over that seam the runtime exposes two async sockets that share one readiness future
 > (`crates/rt/src/readiness.rs`, so neither duplicates the register-and-yield dance): `udp::UdpSocket`
@@ -11644,3 +11647,12 @@ Applied in the same change to: §4.6 (the same-kernel direct map paragraph + its
 - Realized: `RequestBody::MapRead`/`ReplyBody::Mapped`; `Control::send_mapping`/`Liveness::recv_mapping`/`ClientEnd::recv_mapping`; `Volume::dax_map_read` + `Store::dax_backing` reused; `merge_service::map_read`/`try_local_map`; `Client::map_read` → `MappedRead`. Proven end to end on x86_64 Linux (`a_same_kernel_client_maps_a_file_with_no_copy`).
 - Fixes a latent arena bug the first real descriptor map surfaced: `ChunkArena::block_backing` returned a region-relative offset against the whole-object descriptor, which would have mis-mapped the guest DAX window too; `ExclusiveObject`/`Region`/`block_backing` now return the descriptor-absolute offset (`base + extent.offset()`).
 - Does not change: the guest DAX gate's own contract (still unadvertised, Ada-gated); the copy transport (the universal base); the single-binary model (no VMM embedded). Owed: the cross-shard owner→home descriptor hand-off; an explicit release on the client's drop; the macOS control socket (stubs refuse → copy).
+
+### A-136 — Linux runs on epoll; the io_uring driver is removed (accepted 2026-10-18)
+Applied in the same change to: D-9 (decision text and evidence tier), §4.3 (Drivers, Loop, the readiness follow-up, the 2026-09-19 driver-retirement follow-up), `crates/rt` (`driver.rs`, `lib.rs`, `epoll.rs`, `readiness.rs`, `tests/reclaim.rs`, `Cargo.toml`), the workspace `Cargo.toml`, `unsafe-budget.toml` (slates-rt 75 → 73), `docs/wip/BENCHMARKS.md` (the A/B that decided it).
+- **What changed.** `os_driver` on Linux now builds the epoll driver unconditionally; `DriverKind::IoUring`, the probe, the per-shard ring build and `crates/rt/src/uring.rs` are gone, as is the `io-uring` dependency. Removed rather than demoted behind a flag: banned item 7 is replace, do not layer, and a dormant second driver is exactly the "just in case" path that rule forbids.
+- **Why — what it bought, measured for the first time.** D-9 had chosen io_uring citing `DEFER_TASKRUN`+`SINGLE_ISSUER` "for jitter" at evidence tier B, with no number anywhere in the project. The A/B (two binaries differing in one line, interleaved, each arm verified by descriptor) found the win real but confined: **io_uring +13% at the parked p50** (65.4 vs 73.9 µs) and +9% at the parked p99, against **epoll +23% at the 8-client spinning p99** (1.56 vs 2.02 ms) — and the spinning path is the one R9's sub-50 µs gate measures. slates only ever issued two opcodes through a ring, `PollAdd` and `Nop`, which is epoll's job.
+- **Why — what it cost.** (1) Attack surface: io_uring is ~60% of Google's kernel VRP submissions, disabled in ChromeOS, restricted on Android, removed from their production servers; openSUSE ships `kernel.io_uring_disabled=2`; Docker and containerd dropped it from their default seccomp profiles — so a growing share of deployments ran the *less*-exercised driver anyway. (2) A real liveness bug: rings are locked memory, so a host near `RLIMIT_MEMLOCK` (default 8 MiB) ran out partway through a many-shard start and `io_uring_setup` returned `ENOMEM`, failing the shard and with it the daemon. That is what made the Linux recovery oracle fail a random, differing subset of its tests on roughly every other run — clean source and modified source alike, which is why it read as load for so long.
+- **What it does not change.** kqueue, IOCP and the simulation driver are untouched; the `Driver` seam, its paired-`#[cfg]` shape and every readiness contract are the same. The one Linux driver still carries `register_readable`/`register_writable` (the trait's doc had gone stale claiming the completion-native drivers refused them; corrected in the same pass).
+- **Evidence:** `BENCHMARKS.md` "io_uring against epoll on Linux" (2026-10-18, 32-core cachyos, interleaved, arms verified by descriptor; the box was loaded 13→29 so only the p50 rows carry signal, and a quiesced re-run is owed to tighten the parked figure — it does not change the direction). Verified after removal: the daemon holds `eventpoll=4, io_uring=0` for 4 shards; `slates-rt` suites green; the recovery oracle 41/41 on four consecutive runs where it had been failing a differing subset every other run.
+

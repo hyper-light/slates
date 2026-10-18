@@ -48,26 +48,14 @@ fn open_descriptors() -> usize {
   std::fs::read_dir("/dev/fd").map_or(0, |dir| dir.count())
 }
 
-/// A local or CI run can require the backend it intends to cover. Docker's default policy
-/// selects epoll, which cannot establish that io_uring releases its pending file references.
+/// Linux has one driver since D-9's 2026-10-18 amendment; this records which the runtime reports, so a
+/// run that silently got something else is visible rather than assumed.
 #[cfg(target_os = "linux")]
 fn verify_linux_driver(notes: &[String]) {
-  let selection = notes
-    .iter()
-    .find(|note| note.starts_with("io_uring = "))
-    .expect("the runtime reports its Linux driver probe");
-  let driver = if selection.ends_with("using epoll") {
-    "epoll"
-  } else {
-    "io_uring"
-  };
-  eprintln!("listener retirement driver: {driver}; {notes:?}");
-  if let Some(expected) = std::env::var_os("SLATES_TEST_DRIVER") {
-    assert_eq!(
-      expected, driver,
-      "the requested Linux backend must be exercised"
-    );
-  }
+  assert!(
+    notes.iter().any(|note| note == "driver = epoll"),
+    "the Linux runtime reports epoll: {notes:?}"
+  );
 }
 
 #[cfg(target_os = "linux")]

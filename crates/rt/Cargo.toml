@@ -16,11 +16,6 @@ slates-mem = { workspace = true }
 libc = { workspace = true }
 rustix = { workspace = true }
 
-# The io_uring binding ships its kernel layout prebuilt for 64-bit targets only; a 32-bit Linux build (i686, a
-# tested target) runs the epoll driver instead, rather than generating bindings with libclang (non-Rust
-# tooling; AUD-29-32).
-[target.'cfg(all(target_os = "linux", target_pointer_width = "64"))'.dependencies]
-io-uring = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true }

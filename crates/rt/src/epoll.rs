@@ -1,5 +1,6 @@
-//! The epoll driver (Linux fallback when io_uring is refused, as in containers whose seccomp
-//! profile blocks it): an eventfd for kicks registered on an epoll instance, `epoll_wait` with a
+//! The epoll driver: Linux's driver (D-9, amended 2026-10-18 — io_uring was removed after its
+//! measured win proved confined to the parked path while it cost the kernel attack surface and a
+//! boot-time `ENOMEM` under `RLIMIT_MEMLOCK`; see `BENCHMARKS.md`).
 //! timeout for the wait [B: epoll(7); B: eventfd(2)], through rustix's safe wrappers. The one unsafe
 //! idiom is borrowing a caller-owned socket fd by number for a single `epoll_ctl` readiness
 //! registration (a `UdpSocket` recv, a `TcpStream` read or write), each with a `// SAFETY:` note.

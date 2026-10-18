@@ -100,9 +100,6 @@ rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", 
 rcgen = { version = "0.13", default-features = false, features = ["aws_lc_rs"] }
 lz4_flex = { version = "0.11", default-features = false, features = ["safe-encode", "safe-decode", "frame"] }
 zstd = "0.13"
-# The io_uring syscall wrapper (tokio-rs/io-uring): thin, no reference counting in its core types;
-# the driver probes setup flags at boot and falls back to epoll (D-9).
-io-uring = "0.7"
 # The derive macro's parser and emitter (the standard trio); build-time only.
 syn = { version = "2", features = ["full", "extra-traits"] }
 quote = "1"

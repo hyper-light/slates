@@ -235,7 +235,7 @@ slates-mem = 36
 # `&self`, instead of a `&'static` field — a runtime passed by value had that field protected while its drop
 # freed the clock (Miri, `--test ownership`). (+1) the same for `LocalRuntime::context` (`runtime.rs`), whose
 # context its own `Drop` frees.
-slates-rt = 75
+slates-rt = 73
 slates-base = 10
 slates-vfs = 0
 slates-land = 4

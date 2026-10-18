@@ -5632,3 +5632,9 @@ syscall). The trade on the table is therefore a 13% parked-p50 win against the w
 surface, for a ring we use as an epoll substitute. Also measured here, incidentally: `io_uring_setup`
 returning `ENOMEM` under 32-way test parallelism against an 8 MiB `memlock` limit is what makes the
 Linux recovery oracle flaky — the epoll arm has no such failure mode.
+
+**Outcome (2026-10-18): Ada chose epoll and io_uring was removed (A-136).** The measurement above is
+what it was weighed on: a 13% parked-p50 win, confined to the path the R9 gate does not measure,
+against the kernel attack surface and a `RLIMIT_MEMLOCK` boot failure. The driver is deleted rather
+than demoted — replace, do not layer. A quiesced re-run of this A/B is still owed as a record of the
+parked figure; it cannot change the decision, which rests on surface and on the spinning column.

@@ -489,17 +489,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "io-uring"
-version = "0.7.14"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d64d8ca234d152948ceaede1f419b6a83983a5ecccaac05fb337a809c96d3aa6"
-dependencies = [
- "bitflags",
- "cfg-if",
- "libc",
-]
-
-[[package]]
 name = "itertools"
 version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1586,7 +1575,6 @@ name = "slates-rt"
 version = "0.1.0"
 dependencies = [
  "iai-callgrind",
- "io-uring",
  "libc",
  "loom",
  "rustix",
