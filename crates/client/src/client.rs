@@ -10,7 +10,7 @@ use slates_ipc::delivery::{Capability, Delivered, DeliveryFault, attest_proof};
 use slates_ipc::protocol::{
   AttachRequest, AttachmentCapability, AuditEntry, DaemonReport, Direction, Established, Filter,
   GrantScope, GrantSummary, GreenBase, Intent, LandingOutcome, LandingSummary, MergeWindow,
-  NamePolicy, Principal, ReadAt, Refusal, ReplyBody, RequestBody, Rights, Scope, SizeClass,
+  NamePolicy, Principal, ReadAt, ReplyBody, RequestBody, Rights, Scope, SizeClass,
   SnapshotCoverage, SnapshotId, StatusReport, TelemetryReport, VolumeId, VolumeSummary, WorkOp,
   pack, unpack,
 };
@@ -892,7 +892,7 @@ impl Client {
       // read by the normal paged path, which returns the bytes a page at a time with no oversized single
       // reply. The client still gets its data; only the copy is paid. (`call` turns a refusal into an
       // error, so this is caught here, not in the reply match below.)
-      Err(ClientError::Refused(Refusal::MapUnavailable)) => {
+      Err(ClientError::Refused(slates_ipc::protocol::Refusal::MapUnavailable)) => {
         return Ok(MappedRead::copied(self.read(volume, path, ReadAt::Head)?));
       }
       Err(error) => return Err(error),

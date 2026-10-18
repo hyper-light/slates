@@ -4497,6 +4497,8 @@ fn snapshot(state: &mut ShardState, principal: &Principal, volume: VolumeId) -> 
     // Kick the volume's device loops to munmap the recalled windows now (not on the guest's next doorbell kick),
     // then refuse retryable: the client's retry meets the frozen-safe volume once the device has drained — the
     // retryable-refusal shape `await_deferred_completion` uses.
+    // Unix-only, as the module is: a platform with no guest device has no window to munmap.
+    #[cfg(unix)]
     crate::virtiofs::kick_volume_devices(state, record.id);
     return refused(Refusal::Overloaded { shard: state.shard });
   }

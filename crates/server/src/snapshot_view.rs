@@ -277,6 +277,9 @@ fn advanced(
   // reader re-maps against the new view rather than reading stale bytes through a lingering window. A device whose
   // view did not change finds every window current and tears none, so the volume-wide kick is self-scoping. A no-op
   // in production while DAX is unadvertised (no live window to re-validate), and correct the moment it is.
+  // The guest-device transports are Unix-only (`virtiofs` is `#[cfg(unix)]`), so there is nothing to kick
+  // elsewhere.
+  #[cfg(unix)]
   let _kicked = crate::virtiofs::kick_volume_devices(state, record.volume);
   Ok((target.value, invalidated))
 }
