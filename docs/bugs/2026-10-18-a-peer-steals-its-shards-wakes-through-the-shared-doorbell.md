@@ -19,10 +19,11 @@ It is the *shard's*, so every client on that shard holds a duplicate of the same
 eventfd duplicate can be **read** as well as written. A read drains the counter. So one client can
 consume the wake another client just posted.
 
-The shard then sleeps to its next timer deadline. That is not a correctness failure — the doorbell
-protocol in `serve_loop` (`announce_idle`, fence, re-check) means a request published *before* the
-fence is served, and `park(outcome.next_deadline_ns)` always ends — but a request published *after*
-the fence depends on the kick, and the kick is what was stolen.
+The victim's request is still served — this is latency, not loss. The doorbell protocol in `serve_loop`
+(`announce_idle`, fence, re-check) covers a request published *before* the fence, and every park ends at
+`outcome.next_deadline_ns` — but a request published *after* the fence depends on the kick, and the kick
+is what was stolen. How long the shard then takes to notice is measured below and not otherwise
+characterised here.
 
 ## The measurement
 
@@ -42,8 +43,34 @@ Three arms **interleaved round-robin**, so the machine's own load is shared by a
 **Arm B is the control and it matters.** The attack spins a core, and a core spinning beside the daemon
 on a loaded box is its own slowdown; B burns exactly that core on a descriptor of its own. B is
 indistinguishable from idle (362 µs against 415 µs), so the 23× is the **theft**, not the CPU. An
-earlier two-arm run without this control measured 390 µs → 40,153 µs (103×); the stall is however long
-the shard's next timer happens to be, so its size varies and its cause does not.
+earlier two-arm run without this control measured 390 µs → 40,153 µs (103×).
+
+### A fourth arm settles it: the thief that uses almost no CPU is the worst of all
+
+Spinning still leaves room to argue that hammering a shared kernel object contends it. So a fourth arm
+was added that steals every wake at nearly no CPU — `poll` on the doorbell with a 2 ms timeout, then one
+read — and the four were interleaved round-robin:
+
+| arm | what the hostile peer does | p50 | shard steps |
+|---|---|---|---|
+| A | nothing | 1,802 µs | 993 |
+| B | spin-read **a private eventfd** | 1,812 µs | 682 |
+| C | spin-read **the shard doorbell** | 7,805 µs | 74 |
+| D | **poll, then one read** of the shard doorbell | **69,970 µs** | 369 |
+
+**D is the cheapest attack and the most damaging — 38× the idle p50.** Contention cannot explain that:
+D touches the object a few times a second where C touches it millions of times, and D is nine times
+worse. What D maximises is not pressure on the object but the *fraction of wakes taken*, so the
+mechanism is the theft.
+
+**One instrument correction, since it was reported wrongly on the way.** An earlier reading of this
+probe said "0 driver waits per call", and read that as the shard never parking. Both halves were wrong:
+the figure was an integer mean of per-call deltas (so 0 meant "under one", not "none"), and summed
+across a run the `waits` counter is **0 in every arm including idle**, so in this test it is simply not
+the counter that moves and it says nothing either way. What is measured is what is claimed here: the
+wake is consumed (counted, one per attacked round) and the victim's latency inflates up to 38×. By what
+path the shard eventually notices is *not* established, and the earlier sentence asserting it slept to
+its next timer deadline is withdrawn.
 
 ## Impact
 

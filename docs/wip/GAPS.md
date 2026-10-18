@@ -6573,3 +6573,39 @@ filesystem, and `fileport_makeport`/`fileport_makefd` pass a descriptor over a M
 `SCM_RIGHTS` hand-off with no path and no name to guess, so it answers R1 rather than trading against
 it. **Ada's call.** Record:
 `docs/bugs/2026-10-18-macos-shares-by-name-so-a-stranger-opens-any-clients-ring.md`.
+
+### 2026-10-18: the shard doorbell is shared, and a peer steals its wakes (GAP-A9-9, Linux half)
+
+The connect hand-off gives every client a duplicate of the **shard's** kick eventfd, and an eventfd
+duplicate can be read as well as written. A read drains the counter, so one client consumes the wake
+another just posted. Requests are still served — this is latency, not loss.
+
+Four arms interleaved round-robin against a real one-shard daemon (x86_64 Linux):
+
+| arm | the hostile peer | p50 |
+|---|---|---|
+| A | nothing | 1,802 µs |
+| B | spin-read **a private eventfd** (the CPU-matched control) | 1,812 µs |
+| C | spin-read **the shard doorbell** | 7,805 µs |
+| D | **`poll`, then one read** of the shard doorbell | **69,970 µs** |
+
+B is indistinguishable from idle, so the cost is not the core the attack burns. **D settles the
+mechanism:** it is the cheapest attack — a few touches a second against C's millions — and the most
+damaging, 38× idle. Contention would rank them the other way round; what D maximises is the fraction of
+wakes taken, so it is theft. One wake stolen per attacked round, every round.
+
+**An instrument correction from this hunt, worth keeping:** an earlier pass reported "0 driver waits per
+call" and read it as the shard never parking. The figure was an *integer mean of per-call deltas* (0
+meant "under one"), and summed over a run the `waits` counter is 0 in every arm including idle — it is
+simply not the counter that moves here. Average a delta and you can prove anything; sum it and check a
+counter moves in the control arm before reading meaning into it.
+
+**Fix: a doorbell per client**, so draining, closing or shutting one down is self-harm. Ruled out by
+measurement rather than argument: a write-only eventfd handle cannot be made (anon inodes cannot be
+re-opened through `/proc`); a pipe write end *can* be re-opened `O_RDONLY` and read; a socketpair end
+shared by all clients is sabotageable by `shutdown(SHUT_WR)` from any one of them. Any descriptor shared
+between clients is abusable by one of them. Two ways to give each client its own, both one registration
+per client on the shard's driver: a fresh eventfd in the hand-off (as the completion eventfd already
+is), or the client's **existing** control socket, which adds no descriptor at all. R9's provisioning
+histogram is the gate on the change, since the shard's poll set grows with clients. Record:
+`docs/bugs/2026-10-18-a-peer-steals-its-shards-wakes-through-the-shared-doorbell.md`.
