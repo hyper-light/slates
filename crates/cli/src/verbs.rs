@@ -1994,10 +1994,12 @@ mod harness_tests {
   /// that fix in September; this module was missed, and a full `cargo test --workspace` on 2026-10-18 failed
   /// here while the same test passed alone.
   fn profile() -> slates_machine::MachineProfile {
-    static PROFILE: std::sync::OnceLock<Option<slates_machine::MachineProfile>> =
+    // The failure is kept as text, not dropped: `Failure` is not `Clone`, and a probe refused under load is
+    // exactly the case someone will be reading this panic to understand.
+    static PROFILE: std::sync::OnceLock<Result<slates_machine::MachineProfile, String>> =
       std::sync::OnceLock::new();
     PROFILE
-      .get_or_init(|| crate::daemon::measure(true).ok())
+      .get_or_init(|| crate::daemon::measure(true).map_err(|e| format!("{e:?}")))
       .clone()
       .expect("the machine profile measures")
   }
