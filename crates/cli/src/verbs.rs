@@ -908,9 +908,18 @@ pub(crate) fn oci_check(check: &crate::args::OciCheck) -> Result<(), Failure> {
     mount: check.mount_id,
     device: check.device,
   };
-  // What decides is the identity the kernel does not reuse, read of this path now; the table says only whether
-  // anything is still mounted there. A kernel that cannot name a mount uniquely refuses, since this check would
-  // otherwise pass a replacement (`docs/bugs/2026-10-17-oci-check-accepts-a-replaced-mount.md`).
+  // Whether anything is mounted there at all is the table's to answer, and it is answered first: on a path
+  // whose mount is gone there is nothing to identify, and a harness must hear `SourceMissing` rather than a
+  // failed identity read — the two mean different things to it (it would bind a bare directory).
+  if !slates_bridge_oci::verify::mounted_at(&table, &check.source) {
+    return Err(Failure::Refused(format!(
+      "SourceMissing: no mount is at {} any more",
+      check.source
+    )));
+  }
+  // What decides is then the identity the kernel does not reuse, read of this path now. A kernel that cannot
+  // name a mount uniquely refuses, since this check would otherwise pass a replacement
+  // (`docs/bugs/2026-10-17-oci-check-accepts-a-replaced-mount.md`).
   let live = match slates_bridge_oci::mount_table::mount_identity_at(&check.source) {
     Ok(live) => live,
     Err(slates_bridge_oci::mount_table::MountTableError::NoUniqueMountId) => {

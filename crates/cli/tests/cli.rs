@@ -3408,6 +3408,52 @@ fn a_verified_container_source_is_checked_again_before_it_is_bound() {
   assert!(missing.contains("SourceMissing"), "{missing}");
 }
 
+/// AUD-29-66 on the macOS loopback: the same swap the Linux leg refuses. Do: mount one volume, attach the
+/// container form over it and keep the evidence, unmount, mount a *second* volume at the same path, and run
+/// the check a harness runs just before its runtime binds. Expect: refused `SourceReplaced` — the harness
+/// binds nothing. Linux needed a fix for this because `mountinfo`'s mount id is an IDA's lowest free number
+/// and a replacement reproduces it; the macOS identity is `statfs`'s `f_fsid`, which was measured not to
+/// behave that way — three successive mounts took 436207736, 436207737 and, after the first was unmounted
+/// and its value freed, 436207738 (2026-10-17), a counter rather than a reuse. That measurement is why macOS
+/// keeps `f_fsid`, and this test is what holds it to being true rather than assumed.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_container_source_swapped_for_another_mount_is_refused_on_the_loopback() {
+  if std::env::var("SLATES_TEST_CLI").is_err() || !std::path::Path::new("/sbin/mount_nfs").exists()
+  {
+    eprintln!(
+      "SKIP: set SLATES_TEST_CLI=1 on a host with mount_nfs to run the swapped-source check"
+    );
+    return;
+  }
+  let instance = format!("cli-oci-swap-nfs-{}", std::process::id());
+  let anchor = start_anchor(&instance);
+  let victim = created_volume(&instance, "victim");
+  let attacker = created_volume(&instance, "attacker");
+  let mount_point = MountPoint {
+    path: fresh_mount_point(),
+  };
+  let path = mount_point.path.clone();
+  mount_and_check(&instance, &victim, &path);
+  let binding = attach_oci(&instance, &victim, &path, "--write");
+  let (code, before, err) = oci_check(&instance, &binding);
+  assert_eq!(code, 0, "the source is the mount verified: {before}{err}");
+  detach_all(&instance, &[binding["attachment"].as_u64().unwrap()]);
+  assert!(
+    unmount_after_container(&instance, &path),
+    "the verified mount is taken away"
+  );
+  // The swap: another volume, the same path, the identity the harness recorded unchanged in its hand.
+  mount_and_check(&instance, &attacker, &path);
+  let (code, out, replaced) = oci_check(&instance, &binding);
+  let cleaned = unmount_after_container(&instance, &path);
+  drop(mount_point);
+  drop(anchor);
+  assert!(cleaned, "the swapped-in mount is cleaned up");
+  assert_eq!(code, 1, "a replaced source is refused: {out}{replaced}");
+  assert!(replaced.contains("SourceReplaced"), "{replaced}");
+}
+
 /// Whether a shared mount — the only kind the container form binds — may be made here: the operator's
 /// `user_allow_other` grant. Read, never written (R1). Skips loudly like the container leg.
 #[cfg(target_os = "linux")]
@@ -3427,7 +3473,7 @@ fn shared_mounts_are_granted() -> bool {
 }
 
 /// A volume created for a test, by id.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn created_volume(instance: &str, name: &str) -> String {
   let (code, out, err) = run(instance, &["volume", "create", name, "--bounded", "8MiB"]);
   assert_eq!(code, 0, "{err}");

@@ -116,18 +116,47 @@ Gates: `cargo clippy --workspace --all-targets -- -D warnings` and `fmt --check`
 on Linux; `slates-bridge-oci` 11/11; `slates-server --test attach_forms` 9/9 on both; the Linux cli
 suite 32/32.
 
-## Owed
+## The ordering the fix had to get right, twice
 
-macOS is not fixed and not proven unaffected. Its identity is `statfs`'s `f_fsid`, and whether that
-is reused across an unmount and a remount of the NFS loopback has not been measured. The same probe
-that found this — mount, record, swap, compare — decides it, and until it is run the macOS leg of
-AUD-29-66 rests on an assumption rather than a measurement.
+Reading the identity is a question about one path, and it only makes sense for a path that has a
+mount. Asking it too early breaks the refusal taxonomy, and this was got wrong in both places before
+the tests caught it:
 
-It was attempted and did not yield a number. An ad-hoc shell probe (2026-10-17) mounted the first
-volume successfully — the kernel listed `slates:/victim on .../fsidprobe-pKcS (nfs, nodev, nosuid)` —
-and then hung on the first access through the mount, printing nothing, until it was stopped about
-two and a half minutes later; a plain `umount` then succeeded and the host was left clean (0 mounts,
-0 stray processes). Whether the hang was the mount not yet being ready to serve, the probe's own
-shape, or something in the loopback path was not established, so nothing is claimed from it either
-way. The probe belongs in the test harness that already knows how to wait for a macOS mount to serve
-(`crates/cli/tests/cli.rs`, the `mount_and_check` path), not in a shell script.
+- In the attach (`server/src/oci.rs`), asking before `verify_host_mount` turned "that directory is
+  not a mount point" into `MountTableUnavailable{errno:0}`. `attach_forms` caught it: 8 passed, 1
+  failed, expecting `NotAMountPoint`.
+- In `oci-check` itself, asking before the table lookup turned the unmounted case into a generic
+  failure instead of `SourceMissing` — which matters, because a harness hearing `SourceMissing`
+  knows a runtime would bind a bare directory. Only the **whole** CLI suite caught this one: the
+  swap test passed on its own, and `a_verified_container_source_is_checked_again_before_it_is_bound`
+  was the test that went red.
+
+Both now ask the pure question first — is anything mounted there — and read the identity only for a
+path the table has already vouched for. `verify::mounted_at` exists for the second one.
+
+## macOS: measured, not assumed
+
+macOS keeps `f_fsid`, and that is now a measurement rather than a hope. The question was whether it
+is handed back the way Linux hands back a mount id. It is not:
+
+```
+A at M1: fsid=436207736  B at M2: fsid=436207737
+(unmount A, freeing its value)
+C at M1: fsid=436207738        <- the freed value was not reused
+```
+
+Three successive mounts took successive values, and the one freed in the middle was not given to the
+next mount — a counter, not Linux's lowest-free IDA. So the swap that defeats the Linux check does
+not defeat the macOS one, and `a_container_source_swapped_for_another_mount_is_refused_on_the_loopback`
+holds it to that: mount a volume, attach, unmount, mount a second volume at the same path, check —
+refused `SourceReplaced`. It passes.
+
+What that does not establish: a counter still wraps. These samples sit in the low bits of a value
+whose top byte looks like a filesystem-type tag, so reuse plausibly needs on the order of millions of
+mounts within one boot. That bound was not measured and is not relied on by anything here.
+
+An earlier ad-hoc probe of this same question hung and yielded nothing. The reason is worth keeping:
+it read the identity with `statfs` on the mount path and wrote a marker file, both of which go
+*through* the mount. `getfsstat(MNT_NOWAIT)` reads the kernel's cached table and touches nothing,
+which is what slates itself does — the probe then ran clean in under a second. When a question is
+about the kernel's view of a mount, do not ask the mount.

@@ -171,6 +171,16 @@ pub fn source_unchanged(
   Ok(())
 }
 
+/// Whether the kernel's table shows a mount at exactly `source`. The caller asks this before reading the
+/// path's identity, so a source whose mount is simply gone is `Missing` and not a failed identity read: on a
+/// path with no mount there is nothing to identify, and the two answers mean different things to a harness.
+pub fn mounted_at(entries: &[MountEntry], source: &str) -> bool {
+  let path = normalized(source);
+  entries
+    .iter()
+    .any(|entry| normalized(&entry.mount_point) == path)
+}
+
 /// The path with trailing separators removed, the root kept as `/`.
 fn normalized(path: &str) -> &str {
   let trimmed = path.trim_end_matches('/');
