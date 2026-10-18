@@ -788,9 +788,18 @@ fn a_pending_revoke_keeps_the_block_pinned_until_the_unmap_is_confirmed() {
     !store.content.arena().is_pinned(block),
     "only now, after the confirmed unmap, is the block reusable"
   );
+  let refusals_before = store.release_refusals;
   assert!(
     !store.dax_release_after_unmap(&mapping),
     "a double release is refused, never a double-free"
+  );
+  // And it is *counted*. `release_refusals` is the signal the adversarial suites now assert is zero (the device
+  // chaos schedule, the hostile request sequence, both pin-ledger tests); a counter that could never move would
+  // make every one of those pass for nothing. This is the one place that proves it moves.
+  assert_eq!(
+    store.release_refusals.saturating_sub(refusals_before),
+    1,
+    "the refused double release is counted, so a zero asserted elsewhere means something"
   );
 }
 
