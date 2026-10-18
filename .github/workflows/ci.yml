@@ -58,9 +58,6 @@ jobs:
       # tests run under the runner's default mlock limit — no `ulimit` bump, which the runners ignore.
       - name: Test
         env:
-          # An epoll pass cannot validate io_uring teardown. The Linux rebind regressions
-          # require the intended backend; local container runs also cover epoll explicitly.
-          SLATES_TEST_DRIVER: ${{ runner.os == 'Linux' && 'io_uring' || '' }}
           # The fleet harness's wait trace (crates/server/tests/common/trace.rs): held in memory per test and printed
           # only with a failing test, so a takeover that never completes says which daemon stopped advancing (fleet
           # tests failed on 4 of 8 runs on 2026-10-06 with no evidence beyond a timeout).
@@ -213,6 +210,10 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
+          # `seccomp=unconfined` was needed partly to let io_uring through Docker's default profile; that
+          # reason left with A-136 (2026-10-18, Linux runs on epoll). It is kept because QEMU in this lane
+          # may still need it — whoever owns this lane should test dropping it, which would be a strict
+          # hardening of the CI container.
           docker run --rm --security-opt seccomp=unconfined \
             $( [ -e /dev/kvm ] && echo --device /dev/kvm ) \
             -v "$PWD":/src -w /src slates-guest sh -c \
@@ -458,7 +459,7 @@ jobs:
   # i686 is a tested target, not a build-only one (CLAUDE.md §3; AUD-29-32): every u64 → usize of a mapped or
   # user-supplied size goes through `usize::try_from`, and these crates' unit tests run as 32-bit code. The
   # official linux/386 Rust image runs natively on the x86_64 runner, so the lane installs nothing. On a
-  # 32-bit target the runtime serves through epoll (the io_uring binding has no 32-bit layout). slates-rt
+  # target the runtime serves through epoll, as every target does since A-136 removed io_uring. slates-rt
   # and slates-mem run whole, integration tests included: a 32-bit waker carries its shard and slot and
   # wakes the slot (docs/bugs/2026-10-01-a-32-bit-waker-lost-its-task.md). cargo is invoked directly, not
   # through a login shell: `bash -l` sources the image's /etc/profile, which resets PATH without cargo.
