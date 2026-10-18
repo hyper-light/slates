@@ -1214,6 +1214,28 @@ impl Header {
   }
 }
 
+/// A vhost-user refusal as the device seam reports it, keeping the words the wire produced (§4.6, CLAUDE.md #9:
+/// no refusal is swallowed). [`VhostError::Closed`] never reaches here — a clean close is a hang-up, not a refusal,
+/// and its caller answers it before asking for this.
+fn seam_refusal(error: VhostError) -> SeamError {
+  match error {
+    VhostError::PeerUnverified => SeamError::ConsumerUnverified,
+    VhostError::Os { call, errno } => SeamError::SeamCallFailed { call, errno },
+    VhostError::Protocol { reason } | VhostError::Memory { reason } => {
+      SeamError::FrontEndBroke { reason }
+    }
+    VhostError::MapRefused { .. } => SeamError::DaxMapRefused,
+    VhostError::Table(_) => SeamError::FrontEndBroke {
+      reason: "the memory table is inconsistent",
+    },
+    // A close reaching here would be a caller that did not answer it; report it as what it is rather than
+    // inventing a protocol reason for it.
+    VhostError::Closed => SeamError::FrontEndBroke {
+      reason: "the front end closed its end",
+    },
+  }
+}
+
 fn u32_at(bytes: &[u8], at: usize) -> Result<u32, VhostError> {
   let end = at.checked_add(U32_LEN).ok_or(protocol("field"))?;
   let field = bytes
@@ -1545,14 +1567,21 @@ impl VmmSeam for VhostUserSeam {
   }
 
   fn drain_doorbell(&mut self) -> Result<Drained, SeamError> {
+    // A clean close is a hang-up; anything else is the refusal the wire already named, reported as one. Collapsing
+    // both into `HungUp` (the shape until 2026-10-18) told whoever reads the end record that a guest shut down when
+    // in fact a VMM had sent a message past the back end's cap or a vring address of the wrong size — a reason this
+    // layer had produced and then dropped. The serve loop already carries a seam refusal
+    // (`EndReason::Faulted(ServeError::Seam(..))`); it was never given one.
     match self.serve_control() {
       Ok(true) => {}
-      Ok(false) | Err(_) => return Ok(Drained::HungUp),
+      Ok(false) | Err(VhostError::Closed) => return Ok(Drained::HungUp),
+      Err(refused) => return Err(seam_refusal(refused)),
     }
     match self.drain_kicks() {
       Ok(true) => Ok(Drained::Kicked),
       Ok(false) => Ok(Drained::Nothing),
-      Err(_) => Ok(Drained::HungUp),
+      Err(VhostError::Closed) => Ok(Drained::HungUp),
+      Err(refused) => Err(seam_refusal(refused)),
     }
   }
 
@@ -1887,6 +1916,10 @@ mod shmem_tests {
   use super::*;
 
   /// A socketpair of stream sockets (the front-end end, then the back-end end).
+  /// Shape: the DAX cache window these tests give a device (64 MiB), large enough that no case here is refused for
+  /// want of a window rather than for the rule under test.
+  const DAX_REGION_FOR_TESTS: u64 = 0x0400_0000;
+
   fn stream_pair() -> (OwnedFd, OwnedFd) {
     rustix::net::socketpair(
       AddressFamily::UNIX,
@@ -1918,6 +1951,152 @@ mod shmem_tests {
       SendFlags::NOSIGNAL,
     )
     .unwrap();
+  }
+
+  /// Sends raw bytes at the front end's socket, for inputs no well-formed sender would produce.
+  fn send_front_raw(socket: &OwnedFd, bytes: &[u8]) {
+    rustix::net::sendmsg(
+      socket,
+      &[std::io::IoSlice::new(bytes)],
+      &mut SendAncillaryBuffer::default(),
+      SendFlags::NOSIGNAL,
+    )
+    .unwrap();
+  }
+
+  /// A header with arbitrary request, flags and size — including combinations the protocol forbids.
+  fn raw_header(request: u32, flags: u32, size: u32) -> [u8; HEADER_LEN] {
+    let mut header = [0u8; HEADER_LEN];
+    header[0..4].copy_from_slice(&request.to_le_bytes());
+    header[HEADER_AT_FLAGS..HEADER_AT_FLAGS + 4].copy_from_slice(&flags.to_le_bytes());
+    header[HEADER_AT_SIZE..HEADER_AT_SIZE + 4].copy_from_slice(&size.to_le_bytes());
+    header
+  }
+
+  /// Hostile input on the front-end wire (AC-4.12; CLAUDE.md's "hostile-input tests on every parser of external
+  /// bytes"). The VMM is the only writer of these bytes and slates does not control it, so every malformed shape a
+  /// front end can produce is driven here against a real socket. Do: send each malformed message at a fresh device
+  /// and drain its doorbell the way the serve loop does. Expect: a typed refusal naming the rule broken — not a
+  /// hang-up, not a panic, not an answer — and no back-end channel established by any of them.
+  ///
+  /// The reasons are asserted verbatim because they are what reaches the operator through
+  /// `EndReason::Faulted(ServeError::Seam(..))`; a refusal that loses its reason is the defect this test was
+  /// written with (`SeamError::FrontEndBroke`, 2026-10-18).
+  #[test]
+  fn a_hostile_front_end_is_refused_by_name_and_establishes_nothing() {
+    let cap = u32::try_from(MAX_PAYLOAD).unwrap();
+    let cases: Vec<(&str, Vec<u8>, &str)> = vec![
+      (
+        "a payload size of u32::MAX",
+        raw_header(request::SET_MEM_TABLE, VERSION, u32::MAX).to_vec(),
+        "a message exceeds the largest this back end accepts",
+      ),
+      (
+        "a payload one byte past the cap",
+        raw_header(request::SET_MEM_TABLE, VERSION, cap.saturating_add(1)).to_vec(),
+        "a message exceeds the largest this back end accepts",
+      ),
+      (
+        "a request this back end does not know",
+        raw_header(0xDEAD_BEEF, VERSION, 0).to_vec(),
+        "a request this back end does not serve",
+      ),
+      (
+        "a reply where a request belongs",
+        raw_header(request::GET_FEATURES, VERSION | FLAG_REPLY, 0).to_vec(),
+        "a reply where a request belongs",
+      ),
+      (
+        "a protocol version this back end does not speak",
+        raw_header(request::GET_FEATURES, 2, 0).to_vec(),
+        "a protocol version this back end does not speak",
+      ),
+      (
+        "a vring address of the wrong size",
+        {
+          let mut m = raw_header(request::SET_VRING_ADDR, VERSION, 4).to_vec();
+          m.extend_from_slice(&[0xFF; 4]);
+          m
+        },
+        "a vring address of the wrong size",
+      ),
+      (
+        "a memory table claiming regions it did not send",
+        {
+          let mut m = raw_header(request::SET_MEM_TABLE, VERSION, 8).to_vec();
+          m.extend_from_slice(&u32::MAX.to_le_bytes());
+          m.extend_from_slice(&0u32.to_le_bytes());
+          m
+        },
+        "a memory table of no regions or past the baseline",
+      ),
+      (
+        "a config read with no fields",
+        raw_header(request::GET_CONFIG, VERSION, 0).to_vec(),
+        "a GET_CONFIG message shorter than its head",
+      ),
+      (
+        "a vring state with no payload",
+        raw_header(request::SET_VRING_NUM, VERSION, 0).to_vec(),
+        "a vring state of the wrong size",
+      ),
+      (
+        "a queue index past every queue",
+        {
+          let mut m = raw_header(request::SET_VRING_NUM, VERSION, 8).to_vec();
+          m.extend_from_slice(&u32::MAX.to_le_bytes());
+          m.extend_from_slice(&u32::MAX.to_le_bytes());
+          m
+        },
+        "a queue index past the device's queues",
+      ),
+    ];
+    for (name, bytes, reason) in cases {
+      let (frontend, backend) = stream_pair();
+      let config = crate::device::DeviceConfig::new(crate::device::FsTag::new("slates").unwrap());
+      let mut seam = VhostUserSeam::adopt(backend, &config).unwrap();
+      seam.enable_dax(DAX_REGION_FOR_TESTS);
+      send_front_raw(&frontend, &bytes);
+      drop(frontend);
+      assert_eq!(
+        seam.drain_doorbell(),
+        Err(SeamError::FrontEndBroke { reason }),
+        "{name}: the refusal must name the rule the front end broke"
+      );
+      assert!(
+        seam.backend_req().is_none(),
+        "{name}: a refused front end establishes no back-end channel"
+      );
+    }
+  }
+
+  /// The other side of the discriminator above: a front end that closes without breaking anything — including one
+  /// that dies part-way through a header — is a hang-up, which is the guest going away, not a protocol fault. Do:
+  /// close the front end's socket (cleanly, and after half a header) and drain. Expect `Drained::HungUp` both
+  /// times. Without this, "every outcome is a refusal" would pass the hostile test above just as well.
+  #[test]
+  fn a_front_end_that_closes_is_a_hang_up_and_not_a_fault() {
+    for (name, prefix) in [
+      ("a clean close", Vec::new()),
+      (
+        "a close part-way through a header",
+        raw_header(request::GET_FEATURES, VERSION, 0)[..7].to_vec(),
+      ),
+    ] {
+      let (frontend, backend) = stream_pair();
+      let config = crate::device::DeviceConfig::new(crate::device::FsTag::new("slates").unwrap());
+      let mut seam = VhostUserSeam::adopt(backend, &config).unwrap();
+      seam.enable_dax(DAX_REGION_FOR_TESTS);
+      if !prefix.is_empty() {
+        send_front_raw(&frontend, &prefix);
+      }
+      drop(frontend);
+      assert_eq!(
+        seam.drain_doorbell(),
+        Ok(Drained::HungUp),
+        "{name}: a front end that stops talking is gone, not faulty"
+      );
+    }
   }
 
   /// Reads a `u64`-payload reply (header then eight bytes), as `answer_u64` sends.

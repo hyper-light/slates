@@ -533,8 +533,8 @@ pub mod platform {
       Err(e) => return Err(refused("fstat mapping", e)),
     };
     let seals = rustix::fs::fcntl_get_seals(descriptor).unwrap_or(rustix::fs::SealFlags::empty());
-    let write_sealed =
-      seals.contains(rustix::fs::SealFlags::WRITE) || seals.contains(rustix::fs::SealFlags::FUTURE_WRITE);
+    let write_sealed = seals.contains(rustix::fs::SealFlags::WRITE)
+      || seals.contains(rustix::fs::SealFlags::FUTURE_WRITE);
     let size_sealed =
       seals.contains(rustix::fs::SealFlags::SHRINK) && seals.contains(rustix::fs::SealFlags::GROW);
     let writable = !(write_sealed && size_sealed);
@@ -1357,8 +1357,18 @@ pub mod platform {
       rustix::fs::ftruncate(&unsealed, window).map_err(|e| super::refused("ftruncate", e))?;
 
       let offers: [(std::os::fd::BorrowedFd<'_>, u64, u64, &str); 3] = [
-        (sealed.as_fd(), 0, window, "an object larger than the window"),
-        (sealed.as_fd(), window, window, "a window partway into the object"),
+        (
+          sealed.as_fd(),
+          0,
+          window,
+          "an object larger than the window",
+        ),
+        (
+          sealed.as_fd(),
+          window,
+          window,
+          "a window partway into the object",
+        ),
         (unsealed.as_fd(), 0, window, "a window the peer could write"),
       ];
       // Nothing crossed: the peer has no delivery waiting. Proved non-vacuously — a `recv_mapping` that could

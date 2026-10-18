@@ -21,7 +21,8 @@ use common::{SimDriver, SimVmm, message, reply_error, store, vid, volume};
 use slates_bridge_core::{Attachments, Bridge, Rights, VolumeBridge};
 use slates_bridge_fuse::abi::Opcode;
 use slates_bridge_virtiofs::admission::{
-  AdmittedDevice, Doorbell, Drained, GuestAttachRequest, GuestTransport, SeamError, VmmSeam, admit,
+  AdmittedDevice, Doorbell, Drained, GuestAttachRequest, GuestTransport, SeamError, ServeError,
+  VmmSeam, admit,
 };
 use slates_bridge_virtiofs::credit::AttachmentCredits;
 use slates_bridge_virtiofs::device::{DeviceConfig, FIRST_REQUEST_QUEUE, FsTag};
@@ -114,6 +115,10 @@ struct PipeVmm {
   call_write: OwnedFd,
   memory: SharedGuestMemory,
   notified: u64,
+  /// The refusal this seam's doorbell drain answers with instead of draining — a front end that broke the wire,
+  /// as the vhost-user seam reports one. Persistent rather than one-shot, so a loop that fails to end on it keeps
+  /// meeting it rather than quietly draining past.
+  fault: Option<SeamError>,
 }
 
 impl std::fmt::Debug for PipeVmm {
@@ -147,7 +152,10 @@ impl VmmSeam for PipeVmm {
     Doorbell::Descriptor(self.kick_read.as_raw_fd())
   }
   fn drain_doorbell(&mut self) -> Result<Drained, SeamError> {
-    drain(&self.kick_read)
+    match self.fault.clone() {
+      Some(refused) => Err(refused),
+      None => drain(&self.kick_read),
+    }
   }
   fn release(&mut self) {}
 }
@@ -256,6 +264,14 @@ fn rw(_consumer: &Principal) -> Rights {
 /// Builds the guest and admits a device over a pipe seam; returns the admitted device and the
 /// guest's ends (the kick's write end, the call's read end).
 fn admitted_over_pipes(registry: &mut Attachments) -> (AdmittedDevice<PipeVmm>, OwnedFd, OwnedFd) {
+  admitted_over_pipes_with_fault(registry, None)
+}
+
+/// As [`admitted_over_pipes`], with a refusal the seam's doorbell drain answers instead of draining.
+fn admitted_over_pipes_with_fault(
+  registry: &mut Attachments,
+  fault: Option<SeamError>,
+) -> (AdmittedDevice<PipeVmm>, OwnedFd, OwnedFd) {
   let (kick_read, kick_write) = pipe();
   let (call_read, call_write) = pipe();
   GUEST.with(|guest| *guest.borrow_mut() = Some(SimDriver::new(&QUEUE_SIZES)));
@@ -264,6 +280,7 @@ fn admitted_over_pipes(registry: &mut Attachments) -> (AdmittedDevice<PipeVmm>, 
     call_write,
     memory: SharedGuestMemory,
     notified: 0,
+    fault,
   };
   let admitted = admit(
     request(),
@@ -299,6 +316,49 @@ async fn guest_round_trip(unique: u64, kick_write: &OwnedFd, call_read: &OwnedFd
   let (id, len) = with_guest(|g| g.reap(rq)).expect("a used element after the notification");
   assert_eq!(id, head);
   with_guest(|g| reply_error(&g.reply_of(rq, head, len)))
+}
+
+/// A seam refusal reaches the end record with its reason (§4.6; CLAUDE.md #9). Do: serve a device whose seam
+/// answers the doorbell drain with a broken-wire refusal — what the vhost-user seam now reports for a VMM that
+/// sends an oversized message or a vring address of the wrong size. Expect: the loop ends `Faulted` carrying that
+/// exact refusal, not `DoorbellHungUp`.
+///
+/// The distinction is the point. A guest that shut down and a VMM that violated the protocol are different events
+/// for whoever reads the end record, and the loop's `Faulted` arm — which has always existed — had no test and no
+/// caller that could reach it: every seam collapsed its refusals into a hang-up first.
+#[test]
+fn a_seam_refusal_ends_the_loop_faulted_with_its_reason() {
+  let refusal = SeamError::FrontEndBroke {
+    reason: "a message exceeds the largest this back end accepts",
+  };
+  let rt = Runtime::start(&config()).unwrap();
+  let shard = rt.shard_ids()[0];
+  let (end_tx, end_rx) = channel::<ServeEnd>();
+  let injected = refusal.clone();
+  rt.spawn_on(shard, async move {
+    let mut owned = OwnedVolume::fresh();
+    let (admitted, kick_write, _call_read) =
+      admitted_over_pipes_with_fault(&mut owned.registry, Some(injected));
+    let id = register(DEVICE_BOUND).unwrap();
+    let device_task = futures::spawn(async move {
+      let end = serve_loop(id, admitted, owned).await;
+      let _ = end_tx.send(end);
+    })
+    .unwrap();
+    let _ = futures::detach(device_task);
+    // Closing the kick's write end makes the doorbell readable, which wakes the loop into a drain. Which of the
+    // two — a kick or an end-of-file — does not matter here: the seam answers the drain with its refusal before
+    // it ever reads the pipe, so the wake is only how the loop gets there.
+    drop(kick_write);
+  })
+  .unwrap();
+
+  let end = end_rx.recv_timeout(WAIT).expect("the loop ended");
+  assert_eq!(
+    end.why,
+    EndReason::Faulted(ServeError::Seam(refusal)),
+    "a seam refusal ends the loop by name, carrying the rule the front end broke"
+  );
 }
 
 /// The loop serves three kicks through the driver — each answered and notified — and, when the

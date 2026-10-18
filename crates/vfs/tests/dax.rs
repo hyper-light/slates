@@ -865,7 +865,9 @@ fn a_map_storm_is_absorbed_and_the_registry_grows_only_with_real_windows() {
   let mut volume = volume(&mut store, 1 << 20);
   let no = file_of(&mut store, &mut volume, "f", SECRET, DAX_PAGE);
 
-  let first = volume.dax_map_read(&mut store, no).expect("the first window");
+  let first = volume
+    .dax_map_read(&mut store, no)
+    .expect("the first window");
   let after_first = store.dax_mappings();
   let mut same = true;
   for _ in 0..(CAP * 4) {
@@ -874,7 +876,10 @@ fn a_map_storm_is_absorbed_and_the_registry_grows_only_with_real_windows() {
       Err(e) => panic!("a repeat request for a live window must be served, not refused: {e:?}"),
     }
   }
-  assert!(same, "every repeat returned the window that already existed");
+  assert!(
+    same,
+    "every repeat returned the window that already existed"
+  );
   assert_eq!(
     store.dax_mappings(),
     after_first,
@@ -1568,7 +1573,10 @@ fn a_guest_cannot_re_arm_a_writable_window_while_the_snapshot_is_recalling_it() 
 
   // Before: a writable map is admitted. (Non-vacuity for the refusals below.)
   let mapped = volume.dax_map_write(&mut store, first).unwrap();
-  assert!(store.dax_is_live(&mapped), "the window is live before the recall");
+  assert!(
+    store.dax_is_live(&mapped),
+    "the window is live before the recall"
+  );
 
   // The snapshot's recall.
   assert_eq!(
@@ -1599,7 +1607,10 @@ fn a_guest_cannot_re_arm_a_writable_window_while_the_snapshot_is_recalling_it() 
 
   // A read map is untouched: the exclusion is of writable windows, not of DAX.
   let read_through = volume.dax_map_read(&mut store, second).unwrap();
-  assert!(store.dax_is_live(&read_through), "read-only DAX is admitted during a recall");
+  assert!(
+    store.dax_is_live(&read_through),
+    "read-only DAX is admitted during a recall"
+  );
 
   // The snapshot finishes and ends its recall; writable maps are admitted again.
   store.dax.end_recall(prefix);
@@ -1620,7 +1631,10 @@ fn recalls_are_deduped_bounded_and_released_by_destroy() {
   let volume = volume(&mut store, 1 << 20);
   let prefix = volume.prefix();
 
-  assert!(store.dax.begin_recall(prefix), "the first recall is admitted");
+  assert!(
+    store.dax.begin_recall(prefix),
+    "the first recall is admitted"
+  );
   assert!(store.dax.begin_recall(prefix), "re-beginning is idempotent");
   assert_eq!(store.dax.recalling_len(), 1, "one volume, one entry");
 

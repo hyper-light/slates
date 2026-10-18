@@ -95,10 +95,10 @@ mod linux {
   fn shard_masks() -> Vec<Vec<u32>> {
     let profile = MachineProfile::measure_within(
       &ProfileOptions {
-      budget_per_probe: Duration::from_millis(PROBE_MS),
-      codecs: false,
-      core_matrix: false,
-    },
+        budget_per_probe: Duration::from_millis(PROBE_MS),
+        codecs: false,
+        core_matrix: false,
+      },
       &PROFILE_BUDGETS,
     )
     .expect("the machine profile measures");

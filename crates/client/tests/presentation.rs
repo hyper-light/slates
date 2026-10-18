@@ -147,10 +147,10 @@ fn a_killed_clients_presented_landing_is_abandoned_with_it() {
   }
   let profile = MachineProfile::measure_within(
     &ProfileOptions {
-    budget_per_probe: Duration::from_millis(PROBE_MS),
-    codecs: false,
-    core_matrix: false,
-  },
+      budget_per_probe: Duration::from_millis(PROBE_MS),
+      codecs: false,
+      core_matrix: false,
+    },
     &PROFILE_BUDGETS,
   )
   .expect("the machine profile measures");

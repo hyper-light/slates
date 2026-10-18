@@ -300,10 +300,7 @@ fn poll_until_refused(mut claim: slates_ipc::Claim) -> (IpcError, u64, Longest) 
 
 /// Begins a claim and polls it while the daemon end serves, until it connects within the claim wait: the
 /// connection and the longest poll.
-fn poll_while_serving(
-  listener: &mut Listener,
-  instance: &str,
-) -> (slates_ipc::Connected, Longest) {
+fn poll_while_serving(listener: &mut Listener, instance: &str) -> (slates_ipc::Connected, Longest) {
   let pid = std::process::id();
   let mut claim = begin_connect_as(instance, 0, slates_ipc::CLAIM_WAIT_NS).unwrap();
   let started = Instant::now();

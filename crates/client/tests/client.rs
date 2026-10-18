@@ -68,10 +68,10 @@ fn measured_profile() -> MachineProfile {
     .get_or_init(|| {
       MachineProfile::measure_within(
         &ProfileOptions {
-        budget_per_probe: Duration::from_millis(PROBE_MS),
-        codecs: false,
-        core_matrix: false,
-      },
+          budget_per_probe: Duration::from_millis(PROBE_MS),
+          codecs: false,
+          core_matrix: false,
+        },
         &PROFILE_BUDGETS,
       )
     })
@@ -380,7 +380,11 @@ fn judge_the_handed_descriptor(number: i32, authorized: u64) {
   println!(
     "handed descriptor: object_bytes={object_bytes} authorized_bytes={authorized} \
      neighbour_marker_occurrences={reachable} writable_map={}",
-    if writable.is_ok() { "granted" } else { "refused" }
+    if writable.is_ok() {
+      "granted"
+    } else {
+      "refused"
+    }
   );
 
   assert_eq!(
@@ -408,7 +412,6 @@ fn judge_the_handed_descriptor(number: i32, authorized: u64) {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_zero_copy_reads_descriptor_authorizes_its_window_and_nothing_more() {
-
   let profile = profile();
   let instance = format!("cl-mapauth-{}", std::process::id());
   // One shard: the owner is the peer's home shard, which is where the hand-off happens, and both
@@ -484,7 +487,9 @@ fn a_zero_copy_reads_descriptor_authorizes_its_window_and_nothing_more() {
       "a copy-path read still installed {} memory-object descriptor(s) in the peer: {arrived:?}",
       arrived.len()
     );
-    println!("map_read took the copy path; no descriptor crossed (arena holds {in_the_arena} markers)");
+    println!(
+      "map_read took the copy path; no descriptor crossed (arena holds {in_the_arena} markers)"
+    );
     client.destroy(mine).unwrap();
     client.destroy(neighbour).unwrap();
     return;
@@ -539,7 +544,9 @@ fn a_map_read_returns_the_whole_file_at_every_size() {
       .create(&CreateSpec {
         name: format!("whole-{kib}"),
         size: SizeClass::Bounded {
-          limit: u64::try_from(kib << 10).unwrap_or(1 << 20).saturating_mul(8),
+          limit: u64::try_from(kib << 10)
+            .unwrap_or(1 << 20)
+            .saturating_mul(8),
         },
         names: NamePolicy::Exact,
         require_locked: false,

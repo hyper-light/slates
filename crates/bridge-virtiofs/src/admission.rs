@@ -100,6 +100,25 @@ pub enum SeamError {
   /// or the host `mmap`/`munmap` refused. The guest's SETUPMAPPING is answered `EOPNOTSUPP` (it falls back to ordinary
   /// READ/WRITE), and a revoke's teardown that cannot unmap is surfaced, never silently left mapped.
   DaxMapRefused,
+  /// The front end broke the seam's wire and the device cannot continue — an oversized message, a protocol version
+  /// this back end does not speak, a vring address of the wrong size, a memory region that cannot be mapped safely.
+  /// The reason is the rule broken, in the words of the platform seam that caught it.
+  ///
+  /// Distinct from [`Drained::HungUp`] on purpose: a guest that shuts down cleanly and a VMM that violates the
+  /// protocol are different events for whoever reads the end record, and until 2026-10-18 the vhost-user seam
+  /// reported both as a hang-up, dropping a reason it had already produced.
+  FrontEndBroke {
+    /// The rule the front end broke.
+    reason: &'static str,
+  },
+  /// A host call the seam itself makes failed (socket, epoll, eventfd) — the device's own machinery, not the front
+  /// end's doing, which is why it is reported apart from [`SeamError::FrontEndBroke`].
+  SeamCallFailed {
+    /// The call that failed.
+    call: &'static str,
+    /// Its errno.
+    errno: i32,
+  },
 }
 
 impl fmt::Display for SeamError {
@@ -112,6 +131,10 @@ impl fmt::Display for SeamError {
       Self::PublishRefused => f.write_str("the configuration space could not be published"),
       Self::NotifyRefused { queue } => write!(f, "queue {queue} could not be notified"),
       Self::DaxMapRefused => f.write_str("the DAX cache-region map/unmap was refused"),
+      Self::FrontEndBroke { reason } => write!(f, "the front end broke the wire: {reason}"),
+      Self::SeamCallFailed { call, errno } => {
+        write!(f, "the seam's {call} failed with errno {errno}")
+      }
     }
   }
 }

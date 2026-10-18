@@ -78,7 +78,10 @@ fn hang_life(deadline: Duration) -> Duration {
 /// process the handshake kills is the sleeper itself, not a shell whose child would outlive the test.
 fn hanging_helper(deadline: Duration) -> Command {
   let mut helper = Command::new("sh");
-  helper.args(["-c", &format!("exec sleep {}", hang_life(deadline).as_secs())]);
+  helper.args([
+    "-c",
+    &format!("exec sleep {}", hang_life(deadline).as_secs()),
+  ]);
   helper
 }
 

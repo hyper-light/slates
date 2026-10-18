@@ -1815,7 +1815,11 @@ fn two_windows_over_one_block_each_hold_its_pin() {
   let mut f = pin_ledger_fixture("pinledger-two");
   let second_at = f.page_len;
   assert_eq!(f.map(2, 0), 0, "the first window maps");
-  assert_eq!(f.map(3, second_at), 0, "the second window maps the same range");
+  assert_eq!(
+    f.map(3, second_at),
+    0,
+    "the second window maps the same range"
+  );
   let with_two = f.pinned();
   assert!(
     with_two > f.quiet,
@@ -2965,7 +2969,10 @@ fn hostile_dax_requests_are_refused_and_establish_no_window() {
   device.release_dax(&mut bridge, &cx);
   drop(bridge);
   assert_eq!(
-    (store.content.arena().pinned_blocks(), store.release_refusals),
+    (
+      store.content.arena().pinned_blocks(),
+      store.release_refusals
+    ),
     (0, 0),
     "a hostile SETUPMAPPING/REMOVEMAPPING sequence left a block pinned, or made the arena refuse a release"
   );

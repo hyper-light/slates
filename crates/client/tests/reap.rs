@@ -207,10 +207,10 @@ fn a_killed_client_is_reclaimed_and_its_lease_expires_by_its_term() {
   }
   let profile = MachineProfile::measure_within(
     &ProfileOptions {
-    budget_per_probe: Duration::from_millis(PROBE_MS),
-    codecs: false,
-    core_matrix: false,
-  },
+      budget_per_probe: Duration::from_millis(PROBE_MS),
+      codecs: false,
+      core_matrix: false,
+    },
     &PROFILE_BUDGETS,
   )
   .expect("the machine profile measures");

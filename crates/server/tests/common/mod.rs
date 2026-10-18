@@ -61,10 +61,10 @@ pub(crate) fn machine_profile() -> MachineProfile {
     .get_or_init(|| {
       let profile = MachineProfile::measure_within(
         &ProfileOptions {
-        budget_per_probe: Duration::from_millis(PROBE_MS),
-        codecs: false,
-        core_matrix: false,
-      },
+          budget_per_probe: Duration::from_millis(PROBE_MS),
+          codecs: false,
+          core_matrix: false,
+        },
         &PROFILE_BUDGETS,
       )?;
       let default = slates_server::config::DaemonConfig::derive(&profile, "key-region", None);

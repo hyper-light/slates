@@ -33,10 +33,10 @@ const PROFILE_BUDGETS: [std::time::Duration; 2] = [
 fn profile() -> MachineProfile {
   MachineProfile::measure_within(
     &ProfileOptions {
-    budget_per_probe: Duration::from_millis(5),
-    codecs: false,
-    core_matrix: false,
-  },
+      budget_per_probe: Duration::from_millis(5),
+      codecs: false,
+      core_matrix: false,
+    },
     &PROFILE_BUDGETS,
   )
   .expect("the machine profile measures")
