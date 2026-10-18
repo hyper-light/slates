@@ -7180,3 +7180,40 @@ zero is exactly the shape the regression had — and the test fails on it, *"ref
 
 This is the same distinction as the driver and rendezvous bounds earlier today: say whether the code did its
 job, not whether the machine was fast enough while it did.
+
+### 2026-10-18: the busy-machine discipline — three discriminators, and which to reach for
+
+Seven failures in one afternoon, all surfaced only by `cargo test --workspace` and all variations of "the
+machine was busy". The project already had the right primitives; they were applied inconsistently, so this
+names each one, its canonical implementation, and the shape of problem it answers. Reach for the one that
+matches the question being asked, not the one nearest to hand.
+
+**1. "This probe must produce a measurement."** Let the probe extend its own wall time rather than taking a
+caller's budget at face value. Canonical: `crates/machine/src/wake.rs` — a round budget that doubles while
+short of the sample floor, bounded by `PROBE_WALL_BUDGET`. The caller's budget then sets the *per-round* size,
+which is why handing it 250 ms instead of 5 ms still matters (rounds fifty times larger from the first), and
+why it does **not** buy more wall time. A machine too busy for the floor in 250 ms still refuses; that ceiling
+is the standing limitation.
+
+**2. "This operation was fast."** A tight bound — one the same order as scheduling noise — must say whether
+the code did its job, not whether the machine was fast while it did. Attribute with `getrusage`'s involuntary
+context-switch count: a step the scheduler took away is the machine's; one it did not is the code's. Canonical:
+`involuntary_switches` in `crates/vfs/examples/vfs_bench.rs`, now also in `crates/client/tests/driver.rs` and
+`crates/ipc/tests/rendezvous.rs`. A *sleeping* sampler's wake lateness is **not** a substitute — it measures a
+different quantity and under-covers by a margin that varies with nothing in particular (measured: 20 ms against
+65 ms for near-identical steps).
+
+**3. "This test needs a machine profile."** Measure **once per process**, behind a `OnceLock`, with the
+escalating budgets of (1). Canonical: `crates/client/tests/client.rs`. One probe per process is fewer dice
+rolled; it does not make a roll safe, which is why (1) matters too.
+
+**And the counting rule that finds the sites:** how many times does this run in one process — `#[test]` count ×
+call sites — not either alone. Searching `crates/*/tests/` misses tests that live in source files
+(`crates/cli/src/verbs.rs`, `crates/machine/src/profile.rs`); counting call sites rates a one-site file safe
+when that site is a helper every test calls. Both mistakes were made today, the second after writing the
+lesson about the first.
+
+**A fourth shape, which is not a discriminator but a trap:** a test that requires a probe to *succeed* is a
+load test whichever way it is written. Assert the behaviour instead — that the extension ran, that the window
+was handed back — and accept a refusal that arrives the right way. `wake.rs`'s own extension test is the
+worked example.
