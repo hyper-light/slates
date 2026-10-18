@@ -835,6 +835,15 @@ impl<S: VmmSeam> AdmittedDevice<S> {
   /// The terminal step for a device whose volume is gone (AUD-29-70): there is no bridge to sweep through, and
   /// nothing to sweep — the references went with the volume — so the registry attachment is revoked and
   /// drained, the credits restored and the seam released, as [`AdmittedDevice::reclaim`] does after its sweep.
+  ///
+  /// **Unlike [`AdmittedDevice::reclaim`], this cannot tear DAX windows down** — `release_dax` needs the bridge
+  /// this path does not have. Reached with live DAX windows it would leave the guest's page tables over blocks
+  /// that `Store::dax_revoke_volume` has already unpinned, which is the stale-TLB reuse the two-phase revoke
+  /// exists to prevent. **The destroy path cannot reach it that way today:** `destroy` revokes the volume's
+  /// devices first (AUD-29-68) and starts the volume teardown only once none serves the volume, so every device
+  /// has already run `reclaim` — with its bridge — before any block is unpinned. This is a note, not a defect:
+  /// whoever changes that ordering, or gives this path a bridge, has to keep it true. Gate checklist item 6 in
+  /// `docs/wip/GAPS.md`.
   pub fn abandon(&mut self, registry: &mut Attachments) -> Result<Reclaimed, ReclaimError> {
     if self.state == AttachmentState::Reclaimed {
       return Err(ReclaimError::AlreadyReclaimed);
