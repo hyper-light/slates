@@ -6180,6 +6180,32 @@ its own page table and never calls the daemon), so the defense had to be at the 
   leak (a re-map at the same slot frees the old throwaway block; a held stale window pins one cap-bounded block). So
   unlike a file *content* window — where a stale read after a write must re-fault, hence `dax_revoke_inode` on
   write/truncate — a directory window needs **no** coherence wiring. File bytes may not be stale; a dir listing may.
+- **ADVERTISEMENT-GATING, found by measurement 2026-10-18: the message-based map hands the frontend a descriptor
+  for the WHOLE arena object, not the authorized block.** `Store::dax_backing` → `ChunkArena::block_backing` returns
+  `(region.backing_fd(), base + offset, len)` and its own comment says "`backing_fd` is the whole object";
+  `BackendReqChannel::send_map` passes that fd over `SCM_RIGHTS`. `fd_offset`/`len` scope the *request*, never the
+  *descriptor*. Measured on a two-tenant store: `object_size=1048576`, `authorized_len=16384` — the frontend is
+  handed **64×** what it may map, with the other tenant's blocks inside it, and a real shard's arena is far larger.
+  Unreachable today (`admission::unsupported` refuses `dax` unconditionally; the message form is reached only by the
+  harness-only `attach_vhost_user_device_dax`), and the fd-sharing form does NOT have this property — there the
+  backend maps and the VMM never gets a descriptor. But if advertised, tenant isolation across VMM processes would
+  rest on each frontend honouring `fd_offset`/`len` rather than on what slates handed it, which is the wrong side
+  of the trust boundary for a gate that exists because the guest is untrusted. **Ada's call between three options,
+  before the gate flips:** a backing object per tenant (keeps zero-copy and confines by construction, but cuts
+  against A-64's one-image layout), a per-mapping `memfd` copy (confined but it is the "view" arm already
+  measured-and-rejected, and loses writable zero-copy), or advertising DAX over fd-sharing only (no code change,
+  but it drops the crosvm/QEMU route chosen 2026-10-16 for multi-tenant hosts). No test pins the current
+  behaviour — a test that enshrines a weakness is worse than the record of it; when the option is chosen the test
+  to write asserts the descriptor's extent EQUALS the authorized window's. Record:
+  `docs/bugs/2026-10-18-the-message-based-dax-map-hands-the-vmm-the-whole-arena.md`.
+- **Cross-tenant isolation at the DEVICE seam is now proven (2026-10-18)**, where before only the VFS half was: two
+  tenants in one store, each with its own device, cache region and context, both windows live at once showing only
+  their own bytes; a context binding another tenant's volume is refused (`authorize_write`'s volume check — red-
+  checked: disabling `authorize_read`'s alone does not turn it red, since a writable SETUPMAPPING authorizes as a
+  write); a foreign inode number never yields the other tenant's bytes, scanned over the whole cache region. Also
+  proven at the device seam: a truncate's leftover bytes are not reachable through the window a device grants,
+  which is wider than the mediated path's `page_span` wherever the host page exceeds `DAX_PAGE` (16 KiB against
+  4 KiB on Apple Silicon) — `page_span`'s doc claimed otherwise and is corrected.
 - **The sibling teardown paths — investigated, each is a *different* case (an earlier note wrongly said all three
   should route through the pending-enqueue; that would break destroy). All are safe today — DAX is unadvertised, so
   no live window exists — and each is gated on the advertisement decision:**
