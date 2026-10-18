@@ -280,9 +280,21 @@ fn a_landing_component_never_steps_out_of_the_target() {
     Some(HostError::NotFound),
     "open_file .."
   );
-  // The leaf write seam never creates in the parent either: `..` already exists, so an exclusive
-  // create of it is refused rather than reaching outside.
-  assert!(host.create_temp(root, "..").is_err(), "create_temp ..");
+  // The leaf write seam never creates in the parent either. How it refuses to differs by host and both are
+  // containment: where an unnamed create exists (Linux `O_TMPFILE` on the directory's own `"."`) the name is never
+  // consulted at all and the file is inside the target by construction, so the call succeeds and reaches nothing
+  // outside; where it does not (macOS), the named fallback is an exclusive create of `..`, which already exists,
+  // and is refused. What must hold on every host is that nothing appeared outside the target — asserted below.
+  #[cfg(target_os = "linux")]
+  assert!(
+    host.create_temp(root, "..").is_ok(),
+    "create_temp .. (the unnamed create ignores the name and lands inside the target)"
+  );
+  #[cfg(not(target_os = "linux"))]
+  assert!(
+    host.create_temp(root, "..").is_err(),
+    "create_temp .. (the named fallback must refuse)"
+  );
   // Beside the target: the secret keeps its bytes and the parent gained no entry (only SECRET and target).
   assert_eq!(
     read(&ws.path.join("SECRET")).unwrap(),

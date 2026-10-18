@@ -2989,7 +2989,7 @@ fn a_write_delegation_does_not_truncate_a_file_its_holder_no_longer_owns() {
   // A client opens the file for writing (a write delegation) and prepares it as the 6.17 escape's file:
   // mode 0477, owned by uid 65534. The `chmod 0477` clears the owner's write bit.
   a.caller = Some((0, 0));
-  let (open_a, fh, delegation) = a.open_creating(&component, "x.txt");
+  let (open_a, fh, delegation) = a.open_creating_wanting(&component, "x.txt", WANT_WRITE_DELEG);
   let (kind, delegation) = delegation.expect("the open for writing is delegated");
   assert_eq!(kind, 2, "a write delegation");
   assert_eq!(
@@ -3048,7 +3048,7 @@ fn a_write_delegation_does_not_truncate_a_file_its_holder_no_longer_owns() {
 fn a_write_delegation_on_a_fully_writable_file_survives_a_chmod_and_serves_a_truncate() {
   let (daemon, client, mut a, b, component) = holder_and_other("deleg-0666");
   a.caller = Some((0, 0));
-  let (open_a, fh, delegation) = a.open_creating(&component, "w.txt");
+  let (open_a, fh, delegation) = a.open_creating_wanting(&component, "w.txt", WANT_WRITE_DELEG);
   let (kind, delegation) = delegation.expect("the open for writing is delegated");
   assert_eq!(kind, 2, "a write delegation");
   assert_eq!(
