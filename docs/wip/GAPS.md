@@ -7135,3 +7135,27 @@ materially. Noted at the function, where whoever wires it will read it.
 **Owed:** the daemon decides when to ask (a periodic check, or an OS power notification) and with what budget —
 a refusal there means the machine was too busy to measure, not that nothing changed, so the caller must decide
 whether to retry or keep the stale profile. Both are design calls, not detail.
+
+### 2026-10-18: correcting what the probe-budget escalation actually does — the wall ceiling is inside `wake()`
+
+A seventh failure, chased to its cause, corrects an earlier entry of my own. `wake::tests::
+a_budget_too_short_for_its_rounds_extends_to_the_full_probe_budget_and_measures` failed three times running
+at load 22 and passed at load 18.5 — load-sensitive, not a regression — and reading it taught me something I
+should have known before claiming a fix:
+
+**`wake()` has extended its own wall time since 2026-10-07.** For any non-zero budget it keeps doubling its
+round budget while short of the sample floor, `while … began.elapsed() < PROBE_WALL_BUDGET`, and that test
+exists because "three test binaries' quick profiles were refused at load 37 to 80". So the 250 ms ceiling was
+already there.
+
+**So the escalation added today does less than its commit message implies, and here is what it really does.**
+The outer budget sets the *per-round* budget (`budget / WAKE_ROUNDS`); the wall ceiling is internal and
+unchanged. Going from 5 ms to 250 ms therefore buys **rounds fifty times larger from the first one**, instead
+of climbing there by doubling and spending the wall budget on rounds too small to confirm a sleeper. That is a
+real improvement and it is not "more time to measure", which is how the earlier entry reads.
+
+**And it leaves the ceiling where it was.** A machine busy enough that `wake()` cannot reach its sample floor
+in 250 ms still refuses, and `serve_mcp_http` still declines to start on one. The honest state: today's change
+makes the refusal rarer, not impossible, and the remaining question — whether a caller that can afford to wait
+should retry, or `wake()` should take a wall ceiling from its caller — is a design call, not a detail. Flakes
+1, 2 and 6 all have this one root.
