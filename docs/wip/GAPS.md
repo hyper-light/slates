@@ -6751,3 +6751,23 @@ flip erased and the copy's poison stamped on — where it must be `[190, 65, 65,
 The lesson generalises past this test: **a corruption test whose two corruptions are indistinguishable cannot
 observe which source a repair used.** Red-check every "nothing happened" assertion; a vacuous one is worse than
 none, because it reports coverage.
+
+### 2026-10-18: Miri over the DAX suite — 51/51 clean, and the proptest case is the whole cost
+
+The DAX gate's pin and free paths now have a Miri result, which they did not before: **51 passed, 0 failed, in
+391.80 s** on macOS aarch64 (`MIRIFLAGS=-Zmiri-ignore-leaks cargo +nightly miri test -p slates-vfs --test dax --
+--skip a_random_interleaving`), with no undefined behaviour and no unsupported operation reported. That covers
+every deterministic test in the suite — pin/unpin, the two-phase revoke, the B2 guard and heal including today's
+`Unhealable` arm, the migration, the reopen, the registry teardowns.
+
+**The chaos proptest is excluded deliberately, and that is the finding about the method.** Run under Miri it did
+not finish a *single* generated case in 45 minutes of CPU, twice, where the other 51 tests together take 6.5
+minutes — a byte-comparison chaos schedule is about the worst possible shape for an interpreter. Skipping it is
+not a gap in coverage of the *code*: the same pin, map, revoke and scrub paths the schedule drives are each
+exercised deterministically by tests in the run above. What Miri cannot practically add is coverage of the
+*interleavings*, and that is proptest's job, which it does natively at 512 cases in under a second.
+
+Two operational notes paid for in wasted cores: `cargo +nightly miri test … | tail` writes nothing until it
+ends, so a run that is killed leaves no evidence — redirect instead; and stopping such a task kills the wrapper
+and leaves `miri` running (it does not match `pgrep miri`; the process name is the rustup toolchain path), which
+cost a full core for 84 minutes before it was noticed.
