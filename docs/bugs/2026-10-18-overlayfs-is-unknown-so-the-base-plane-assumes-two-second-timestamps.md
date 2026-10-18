@@ -83,7 +83,12 @@ the last two seconds has its digest recomputed on each export instead of kept. T
 for this product, and it is the one to weigh; it is not the whole container story.
 
 The conservatism itself is **safe** either way — it is the §4.5 rule that a timestamp comparison means
-nothing inside the granularity — and nothing is ever read stale.
+nothing inside the granularity — and nothing is ever read stale. That was checked rather than assumed:
+the value has exactly three consumers (`base.rs` 1040, 2252, 2586) and all three ask the same question,
+"is this timestamp within granularity of the read, and therefore racy?" — the directory listing's relist
+rule, a witness's racy flag, and the digest cache's window. In every one, a **coarser** value classifies
+*more* as racy, which costs a relist or a recomputation and can never permit a stale read. Too coarse is
+always the safe direction here, which is precisely why tightening it is the one that needs proof.
 
 This was invisible until something ran the suite on a container filesystem: every platform CI tests
 (ext4 on the Linux runner, APFS on macOS) is classified `Nanosecond`, so the `Unknown` arm never ran.
