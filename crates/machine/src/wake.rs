@@ -881,15 +881,29 @@ mod tests {
   /// floor keeps doubling until the full profile's per-probe budget is spent, so a profile measured on a machine whose
   /// cores are busy still measures (three test binaries' quick profiles were refused at load 37 to 80, 2026-10-07).
   /// Do: measure the wake with [`TOO_SHORT_BUDGET`]. Expect: a measured mean, and no more wall time than the full
-  /// budget plus one round. Before the extension it refused `MeasurementTimeout`.
+  /// budget plus one round. Before the extension it refused `MeasurementTimeout` at once.
+  ///
+  /// **What is asserted is the extension, not the success**, and that distinction is the test's whole
+  /// robustness. A machine busy enough cannot reach the sample floor even in the full budget — this test
+  /// failed three times running at load 22 and passed at load 18.5 on 2026-10-18 — and a refusal then says
+  /// the machine was too busy, not that the extension is gone. So a refusal is accepted only if it arrived
+  /// **after the wall budget was spent**: that is what the extension does and what its absence would not.
+  /// A refusal in microseconds is still a failure, which is exactly the regression this guards.
   #[test]
-  fn a_budget_too_short_for_its_rounds_extends_to_the_full_probe_budget_and_measures() {
+  fn a_budget_too_short_for_its_rounds_extends_to_the_full_probe_budget() {
     let facts = Facts::query();
     let began = Instant::now();
     let measured = wake(TOO_SHORT_BUDGET, &placement_of(&facts));
     let took = began.elapsed();
-    let w = measured.expect("the extended probe measures a wake");
-    assert_a_measured_mean(&w);
+    match measured {
+      Ok(w) => assert_a_measured_mean(&w),
+      Err(MachineError::MeasurementTimeout { .. }) => assert!(
+        took >= PROBE_WALL_BUDGET,
+        "a refusal must come from the extension having spent the full budget, not from the short budget \
+         being taken at face value: refused after {took:?}, full budget {PROBE_WALL_BUDGET:?}"
+      ),
+      Err(e) => panic!("the probe refused for another reason: {e:?}"),
+    }
     assert!(
       took <= PROBE_WALL_BUDGET.saturating_mul(2),
       "the extension stays within the full probe budget and its last round: {took:?}"

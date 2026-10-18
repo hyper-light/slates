@@ -4674,7 +4674,8 @@ fails under extreme load, on either detector snapshot.**
   doubling rounds now continue, while short of the sample floor and given a non-zero budget, until the full profile's
   per-probe budget (`PROBE_WALL_BUDGET`, 250 ms) is spent, each round capped at what is left. An idle machine pays
   nothing, and a boot profile is unchanged (its 62 shares already exceed the wall). Regression
-  `a_budget_too_short_for_its_rounds_extends_to_the_full_probe_budget_and_measures` (10 µs budget): 5 of 5 refused
+  `a_budget_too_short_for_its_rounds_extends_to_the_full_probe_budget` (10 µs budget; renamed 2026-10-18 when
+  it stopped requiring the measurement to succeed): 5 of 5 refused
   `MeasurementTimeout` without the extension, 5 of 5 measured with it.
 
 ### 2026-10-07: a write delegation's space limit, weighed (condition 12, A-80)
@@ -7139,7 +7140,7 @@ whether to retry or keep the stale profile. Both are design calls, not detail.
 ### 2026-10-18: correcting what the probe-budget escalation actually does — the wall ceiling is inside `wake()`
 
 A seventh failure, chased to its cause, corrects an earlier entry of my own. `wake::tests::
-a_budget_too_short_for_its_rounds_extends_to_the_full_probe_budget_and_measures` failed three times running
+a_budget_too_short_for_its_rounds_extends_to_the_full_probe_budget` (then still named `…_and_measures`) failed three times running
 at load 22 and passed at load 18.5 — load-sensitive, not a regression — and reading it taught me something I
 should have known before claiming a fix:
 
@@ -7159,3 +7160,23 @@ in 250 ms still refuses, and `serve_mcp_http` still declines to start on one. Th
 makes the refusal rarer, not impossible, and the remaining question — whether a caller that can afford to wait
 should retry, or `wake()` should take a wall ceiling from its caller — is a design call, not a detail. Flakes
 1, 2 and 6 all have this one root.
+
+
+### 2026-10-18: the busy-machine wake test now asserts the extension, not the measurement
+
+The seventh failure's own test was the next thing to fix: it required the extended probe to **succeed**, and
+on a machine too busy to reach the sample floor in 250 ms it cannot — three failures at load 22, a pass at
+18.5. Requiring success made it a load test by accident.
+
+What it is actually for is the 2026-10-07 regression: before the extension, a 10 µs budget was taken at face
+value and refused **at once**. That property survives a busy machine: a refusal is now accepted only if it
+arrives **after the full wall budget was spent**, and a refusal in microseconds still fails. Renamed to
+`a_budget_too_short_for_its_rounds_extends_to_the_full_probe_budget`, since it no longer claims to measure.
+
+**Red-checked against the code's own documented behaviour rather than a patch:** `wake()` deliberately gives no
+wall extension to a *zero* budget ("A zero budget doubles to zero: no round could measure"), so calling it with
+zero is exactly the shape the regression had — and the test fails on it, *"refused after 375.208µs, full budget
+250ms"*. The guard catches the thing it exists for and tolerates the machine.
+
+This is the same distinction as the driver and rendezvous bounds earlier today: say whether the code did its
+job, not whether the machine was fast enough while it did.
