@@ -1764,7 +1764,7 @@ fn chaos_step(
 ) {
   let no = files[usize::from(which) % files.len()];
   let len = usize::from(size) % (DAX_PAGE * 2);
-  match op % 6 {
+  match op % 7 {
     0 => {
       let _ = volume.write(store, no, 0, &vec![op ^ which; len.max(1)]);
     }
@@ -1786,6 +1786,10 @@ fn chaos_step(
         store.dax_revoke(&mapping);
         store.dax_release_after_unmap(&mapping);
       }
+    }
+    5 => {
+      // A snapshot splits shared content copy-on-write, which must revoke a writable mapping of it.
+      let _ = volume.snapshot(store);
     }
     _ => {
       volume.age_writes();
@@ -1812,6 +1816,18 @@ fn chaos_invariants(store: &Store, volume: &Volume, held: &[Mapping]) -> Result<
         bytes[mapping.file_len..].iter().all(|byte| *byte == 0),
         "a live mapping shows zeroes past its file, never another file's bytes or a stale tail"
       );
+      // The stronger half: the window is this file's CURRENT bytes. Zeroes past the end would still pass
+      // above if the head were stale — a copy-on-write split the mapping outlived, say.
+      let mut truth = vec![0u8; mapping.file_len];
+      prop_assert!(
+        volume.read(store, mapping.inode, 0, &mut truth).is_ok(),
+        "the mapped file reads"
+      );
+      prop_assert_eq!(
+        bytes.get(..mapping.file_len),
+        Some(truth.as_slice()),
+        "a live mapping shows the file's current bytes"
+      );
     } else {
       prop_assert!(
         volume.dax_read(store, mapping, 0, DAX_PAGE).is_err(),
@@ -1836,6 +1852,15 @@ proptest! {
   ///
   /// This is the DAX gate's first property coverage: the 48 tests above are hand-written cases, and the
   /// interleavings that matter here are exactly the ones nobody writes by hand.
+  ///
+  /// Red-checking it established something worth keeping: **the eager revoke and the staleness check are
+  /// independently sufficient**. Disabling `store.dax_revoke_inode` on write and truncate leaves the schedule
+  /// green, because `dax_still_current` then catches the moved block and the mapping takes the inert branch;
+  /// disabling `dax_still_current` alone leaves it green too, because the revoke already removed the mapping
+  /// from the registry. Only with **both** disabled does a live mapping show a stale head and the
+  /// current-bytes assertion fire. So a single red-check here proves nothing about this assertion — that is
+  /// the defence being doubly redundant, not the test being vacuous (4,110 non-trivial comparisons over 150
+  /// cases).
   #[test]
   fn a_random_interleaving_never_shows_a_live_mapping_stale_or_foreign_bytes(
     schedule in prop::collection::vec((any::<u8>(), any::<u8>(), any::<u16>()), 1..60)
