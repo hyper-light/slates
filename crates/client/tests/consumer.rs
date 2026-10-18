@@ -31,7 +31,7 @@ use slates_client::{
 };
 use slates_ipc::delivery::{Delivery, Output, delivered};
 use slates_machine::{MachineError, MachineProfile, ProfileOptions};
-use slates_server::landing::enroll_proof;
+use slates_server::landing::{enroll_proof, revoke_proof};
 use slates_server::{Daemon, DaemonConfig, SegmentSource};
 
 /// Format: the environment variable selecting the child role, and the ones carrying the instance,
@@ -288,6 +288,60 @@ fn a_spawned_consumer_binds_through_the_inherited_capability_and_a_sibling_witho
     "the account is refused on the consumer's volume before any lookup"
   );
   assert_sibling_is_the_account(&instance, consumer, volume);
+  daemon.stop();
+}
+
+/// AC-2.13 / §4.13's revocation half, which the code held two ways and no run had ever shown. Do: enroll a
+/// consumer, bind a channel to it, let it create a volume as itself, then revoke it; ask that same bound
+/// channel for another effect, and separately bind a fresh channel with the very same capability. Expect:
+/// both refuse `ConsumerRevoked`. The two legs are two different mechanisms and a test of one proves
+/// nothing about the other — the bound channel is fenced by a per-slot mark the revocation fans to every
+/// shard before it acknowledges, and the fresh bind is fenced by the durable `revoked` on the consumer's
+/// record, read at attest before the proof is even compared, so a leaked capability outlives nothing.
+/// `TEST_SHARDS` is two, so the consumer's record need not live on the shard either channel landed on.
+#[test]
+fn a_revoked_consumer_is_fenced_on_the_channel_it_bound_and_on_any_binding_after() {
+  let profile = profile();
+  let instance = format!("cl-revoke-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
+  let daemon = Daemon::start(
+    &profile,
+    config,
+    SegmentSource::Create {
+      name: format!("slates-seg-cl-revoke-{}", std::process::id()),
+    },
+  )
+  .unwrap();
+  daemon
+    .bootstrap(true)
+    .expect("the fixture explicitly creates its local consensus group");
+  let secret = daemon.segment().issuer_secret().unwrap();
+  let account = current_uid();
+  let mut owner = connect(&instance);
+  let (consumer, capability) = owner
+    .enroll(account, enroll_proof(&secret, account))
+    .unwrap();
+  let mut bound = connect(&instance);
+  bound.attest(consumer, &capability).unwrap();
+  bound
+    .create(&scratch("before-the-revocation"))
+    .expect("an enrolled consumer acts");
+
+  owner
+    .revoke(consumer, revoke_proof(&secret, consumer))
+    .expect("the human revokes the enrollment");
+
+  let after = bound.create(&scratch("after-the-revocation"));
+  assert!(
+    matches!(after, Err(ClientError::Refused(Refusal::ConsumerRevoked))),
+    "the channel bound before the revocation is fenced: {after:?}"
+  );
+  let mut late = connect(&instance);
+  let rebind = late.attest(consumer, &capability);
+  assert!(
+    matches!(rebind, Err(ClientError::Refused(Refusal::ConsumerRevoked))),
+    "the same capability binds nothing afterwards: {rebind:?}"
+  );
   daemon.stop();
 }
 
