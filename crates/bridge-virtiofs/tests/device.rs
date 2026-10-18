@@ -1981,6 +1981,16 @@ proptest! {
   /// from somewhere the guest has no business reaching — another volume's block, arena metadata, or memory never
   /// initialised — which is exactly the class of leak a shared window makes possible and a per-access check
   /// cannot catch, since the guest reads these pages through its own page table.
+  ///
+  /// **What this schedule does NOT catch, measured rather than assumed:** a revoke that forgets to unmap.
+  /// Deleting the `teardown_dax_window` call leaves this test green while
+  /// `request_revoke_inode_tears_down_the_daemons_mapping` goes red — so that class is covered, but by that
+  /// test and not this one. The cause is the conservative slot tracking below, which this schedule needs to
+  /// stay fault-safe: a torn-down slot is `PROT_NONE` and reading it faults, so the schedule stops trusting
+  /// every slot after any revoking op, and a slot it never reads is one whose staleness it cannot see.
+  /// Fault-safety and missed-unmap detection pull against each other here. Anyone extending this should reach
+  /// for `DaxCacheRegion::unmapped()` — a counter, observable without touching the address space — rather than
+  /// trying to read a slot that may legitimately fault.
   #[cfg(unix)]
   #[test]
   fn a_random_window_schedule_never_shows_the_guest_a_foreign_byte(
