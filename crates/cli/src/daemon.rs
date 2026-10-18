@@ -26,13 +26,6 @@ pub(crate) fn segment_name(instance: &str) -> String {
   format!("slates-seg-{clean}")
 }
 
-/// Shape: the per-probe budgets a **quick** measurement tries in turn — the quick bound, then the full
-/// profile's own. Both already exist and neither is invented here; what is new is trying the second.
-const QUICK_BUDGETS: [Duration; 2] = [
-  Duration::from_millis(QUICK_PROBE_MS),
-  slates_machine::bench::PROBE_WALL_BUDGET,
-];
-
 /// Measures the profile: full, or quick. A probe that could not measure at all within its bound is the
 /// failure, named (`MeasurementTimeout`), never a profile carrying a fabricated value.
 ///
@@ -45,14 +38,11 @@ const QUICK_BUDGETS: [Duration; 2] = [
 /// escalating bound, not a second path, and both bounds are ones the profile already defines.
 pub(crate) fn measure(quick: bool) -> Result<MachineProfile, Failure> {
   let measured = if quick {
-    MachineProfile::measure_within(
-      &ProfileOptions {
-        budget_per_probe: Duration::from_millis(QUICK_PROBE_MS),
-        codecs: false,
-        core_matrix: false,
-      },
-      &QUICK_BUDGETS,
-    )
+    MachineProfile::measure_patiently(&ProfileOptions {
+      budget_per_probe: Duration::from_millis(QUICK_PROBE_MS),
+      codecs: false,
+      core_matrix: false,
+    })
   } else {
     MachineProfile::measure(ProfileOptions::default())
   };
@@ -194,8 +184,6 @@ mod budget_tests {
 
   use slates_machine::{MachineProfile, ProfileOptions};
 
-  use super::QUICK_BUDGETS;
-
   /// The quick profile's scope, as `measure` uses it: the budgets are the argument.
   fn scope() -> ProfileOptions {
     ProfileOptions {
@@ -220,26 +208,21 @@ mod budget_tests {
     );
   }
 
-  /// §4.1 — a quick measurement escalates its bound rather than giving up. Do: ask for a budget that
-  /// cannot work followed by one that can. Expect: a profile, because the second was tried. This is the
-  /// case a loaded machine produces, where the first bound is refused and the CLI must still start —
-  /// measured 2026-10-18, when a full `cargo test --workspace` refused the quick probe twice.
+  /// §4.1 — a quick measurement escalates its bound rather than giving up. Do: measure **the shipped way**
+  /// ([`MachineProfile::measure_patiently`]) with a per-probe bound that cannot measure anything. Expect: a
+  /// profile, because the policy tried the probe's own wall ceiling after it. This is the case a loaded machine
+  /// produces, where the first bound is refused and the CLI must still start — measured 2026-10-18, when a full
+  /// `cargo test --workspace` refused the quick probe twice.
+  ///
+  /// Asked of the production call rather than of a ladder built here, so there is no way for the shipped policy
+  /// to stop escalating while the test still passes. The previous shape asserted that a constant held two
+  /// ascending values, which is a statement about a literal and not about what the CLI does.
   #[test]
   fn a_refused_budget_escalates_to_the_next_one() {
-    let measured = measure_within(&[Duration::ZERO, Duration::from_millis(250)]);
+    let measured = MachineProfile::measure_patiently(&scope());
     assert!(
       measured.is_ok(),
-      "the escalation must reach the second budget: {measured:?}"
-    );
-  }
-
-  /// The shipped order escalates: the quick bound first, then a strictly larger one. A single-budget list
-  /// would make the escalation above unreachable in production however well it tests.
-  #[test]
-  fn the_shipped_budgets_escalate() {
-    assert!(
-      QUICK_BUDGETS.len() >= 2 && QUICK_BUDGETS[1] > QUICK_BUDGETS[0],
-      "the shipped budgets must grow: {QUICK_BUDGETS:?}"
+      "the shipped escalation must rescue a bound that cannot measure: {measured:?}"
     );
   }
 }

@@ -117,6 +117,29 @@ impl MachineProfile {
     last
   }
 
+  /// Measures the machine within the caller's own per-probe bound, and — if that bound was too short for this
+  /// machine right now — again within the probe's own wall ceiling ([`crate::bench::PROBE_WALL_BUDGET`]) before
+  /// the refusal stands. The scope is the caller's throughout: only the patience grows.
+  ///
+  /// This is the one escalation policy, in one place. It was written out by hand at eleven call sites — the CLI's
+  /// quick measurement and ten test fixtures, each with its own copy of the same two-element ladder and the same
+  /// paragraph explaining it. The copies are why the sweep of 2026-10-18 reached ten of the eleven and missed
+  /// `slates-server`'s own unit-test fixture, where a single refused probe behind a `OnceLock` failed sixty tests
+  /// in one binary in 1.19 seconds. A policy spelled out in eleven places is one that has to be remembered eleven
+  /// times.
+  ///
+  /// The caller's bound is the first rung and not a decoration: binaries differ in how much measurement they
+  /// want before they settle (`slates-rt`'s placement test asks for fifty milliseconds, the seal suite
+  /// twenty-five, most fixtures five), and a profile measured within a longer bound is a finer one. A caller
+  /// whose bound already reaches the ceiling gets one attempt, not a second shorter one.
+  pub fn measure_patiently(options: &ProfileOptions) -> Result<MachineProfile, MachineError> {
+    let ceiling = crate::bench::PROBE_WALL_BUDGET;
+    if options.budget_per_probe >= ceiling {
+      return MachineProfile::measure_within(options, &[options.budget_per_probe]);
+    }
+    MachineProfile::measure_within(options, &[options.budget_per_probe, ceiling])
+  }
+
   /// Measures the machine; refused `MeasurementTimeout` when a probe could not measure at all within its
   /// bound (the wake probe, [`wake::wake`]) rather than a profile carrying a fabricated value.
   pub fn measure(options: ProfileOptions) -> Result<MachineProfile, MachineError> {
@@ -495,9 +518,23 @@ mod tests {
     }
   }
 
+  /// The profile these tests work from: measured **once per process** and **patiently**, then cloned for each
+  /// test to read or mutate. Seven tests here each measured their own within a thirty-millisecond bound and
+  /// required it to succeed — seven rolls of the same die, each able to fail for the machine's load rather than
+  /// for anything the test asserts. The measurement is not what any of them is about; it is the material they
+  /// need in order to assert something else.
+  fn measured_once() -> MachineProfile {
+    static PROFILE: std::sync::OnceLock<Result<MachineProfile, MachineError>> =
+      std::sync::OnceLock::new();
+    PROFILE
+      .get_or_init(|| MachineProfile::measure_patiently(&quick_options()))
+      .clone()
+      .expect("the machine profile measures")
+  }
+
   #[test]
   fn a_profile_measures_within_its_budget_and_round_trips_through_json() {
-    let profile = MachineProfile::measure(quick_options()).expect("the machine profile measures");
+    let profile = measured_once();
     assert_eq!(profile.version, PROFILE_VERSION);
     assert!(profile.syscall.median_ns() > 0);
     assert!(profile.faults.base_ns > 0);
@@ -514,7 +551,7 @@ mod tests {
   /// reader can measure afresh instead (the daemon handed an older anchor's profile across an upgrade).
   #[test]
   fn a_profile_of_another_format_version_is_refused_by_name() {
-    let profile = MachineProfile::measure(quick_options()).expect("the machine profile measures");
+    let profile = measured_once();
     let json = profile.to_json().unwrap();
     assert_eq!(MachineProfile::format_version(&json), Some(PROFILE_VERSION));
     let older = json.replacen(
@@ -529,7 +566,7 @@ mod tests {
 
   #[test]
   fn every_derived_constant_has_a_formula_and_anchors_and_is_logged() {
-    let profile = MachineProfile::measure(quick_options()).expect("the machine profile measures");
+    let profile = measured_once();
     let d = profile.derived();
     assert_eq!(d.spin_before_park_ns.get(), profile.wake.mean_ns.max(1));
     assert_eq!(d.task_step_budget_ns.get(), profile.wake.mean_ns.max(1));
@@ -554,16 +591,26 @@ mod tests {
     assert!(lines.iter().all(|l| l.contains("anchors:")), "{lines:?}");
   }
 
+  /// §4.1: a re-measure of the cheap, power-sensitive subset leaves the rest of the profile alone — the fault
+  /// costs above all, which it never measures. That claim holds whichever way the wake probe went, and both ways
+  /// are asserted: requiring the probe to succeed made this a test of the machine's load, and it failed as one in
+  /// a full `cargo test --workspace` on 2026-10-18.
   #[test]
   fn refreshing_the_cheap_subset_keeps_the_rest() {
-    let mut profile =
-      MachineProfile::measure(quick_options()).expect("the machine profile measures");
+    let mut profile = measured_once();
     let faults = profile.faults.clone();
-    profile
-      .refresh_cheap(Duration::from_millis(20))
-      .expect("the cheap subset re-measures");
-    assert_eq!(profile.faults, faults);
-    assert!(profile.wake.mean_ns > 0);
+    match profile.refresh_cheap(REFRESH_BUDGET) {
+      Ok(()) => assert!(
+        profile.wake.mean_ns > 0,
+        "a re-measure that answered carries a wake"
+      ),
+      Err(MachineError::MeasurementTimeout { probe: "wake" }) => {}
+      Err(other) => panic!("the re-measure refused for another reason: {other:?}"),
+    }
+    assert_eq!(
+      profile.faults, faults,
+      "the fault costs are not the cheap subset and are never touched by a refresh, measured or refused"
+    );
   }
 
   /// §4.1 refusals: a re-measure whose wake probe could not measure refuses by name and leaves the
@@ -574,8 +621,7 @@ mod tests {
   /// other's label for the rest of the process's life.
   #[test]
   fn a_refused_wake_re_measure_keeps_the_measured_wake() {
-    let mut profile =
-      MachineProfile::measure(quick_options()).expect("the machine profile measures");
+    let mut profile = measured_once();
     let measured = profile.wake;
     // Pretend the profile was taken on the other source, so the refusal has a trigger it could drop.
     profile.facts.power = match profile.facts.power {
@@ -621,8 +667,7 @@ mod tests {
   /// refused branch is the one that found the defect: the state was recorded before the probe ran.
   #[test]
   fn a_power_state_change_is_detected_and_triggers_a_refresh() {
-    let mut profile =
-      MachineProfile::measure(quick_options()).expect("the machine profile measures");
+    let mut profile = measured_once();
     assert!(
       !profile.power_changed(),
       "the state has not moved since the profile"
@@ -661,8 +706,7 @@ mod tests {
 
   #[test]
   fn the_copy_versus_remap_threshold_follows_the_curve() {
-    let mut profile =
-      MachineProfile::measure(quick_options()).expect("the machine profile measures");
+    let mut profile = measured_once();
     profile.faults.base_ns = 1;
     let first = profile.memcpy.first().map(|p| p.bytes).unwrap();
     let d = profile.derived();

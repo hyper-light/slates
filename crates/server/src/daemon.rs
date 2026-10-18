@@ -4551,13 +4551,18 @@ mod tests {
   /// CPU), 33 measurements across 18 runs were refused `MeasurementTimeout`, and so was CI run
   /// 36202635768 on its macOS runner
   /// (`docs/bugs/2026-09-25-test-fixtures-measured-the-machine-beside-each-other.md`).
+  /// Measured **patiently** (`MachineProfile::measure_patiently`): the quick bound first, then the probe's own
+  /// wall ceiling. Measuring once per process is fewer dice rolled, not a safe roll — and behind a `OnceLock`
+  /// the one roll decides the whole binary. On 2026-10-18 a full `cargo test --workspace` refused this probe
+  /// and **sixty tests in this binary failed in 1.19 seconds**, every one of them at this line. This fixture was
+  /// the site the day's earlier sweep missed, because it lives in a source file rather than under `tests/`.
   pub(crate) fn test_profile() -> slates_machine::MachineProfile {
     static PROFILE: std::sync::OnceLock<
       Result<slates_machine::MachineProfile, slates_machine::MachineError>,
     > = std::sync::OnceLock::new();
     PROFILE
       .get_or_init(|| {
-        slates_machine::MachineProfile::measure(slates_machine::ProfileOptions {
+        slates_machine::MachineProfile::measure_patiently(&slates_machine::ProfileOptions {
           budget_per_probe: std::time::Duration::from_millis(PROBE_MS),
           codecs: false,
           core_matrix: false,

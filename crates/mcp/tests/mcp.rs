@@ -20,25 +20,12 @@ use slates_machine::{MachineProfile, ProfileOptions};
 use slates_mcp::McpServer;
 use slates_server::{Daemon, DaemonConfig, SegmentSource};
 
-/// Shape: the per-probe budgets this binary's profile is measured within — the quick bound this suite has
-/// always used, then the full profile's own (`slates_machine::bench::PROBE_WALL_BUDGET`). One bound is a
-/// guess about the machine, and the cheap one is wrong on a busy machine: the wake probe cannot answer in
-/// five milliseconds beside the rest of a `cargo test --workspace`, which refused it twice on 2026-10-18.
-/// The scope stays quick — no codecs, no core matrix — and only the patience grows.
-const PROFILE_BUDGETS: [std::time::Duration; 2] = [
-  Duration::from_millis(5),
-  slates_machine::bench::PROBE_WALL_BUDGET,
-];
-
 fn profile() -> MachineProfile {
-  MachineProfile::measure_within(
-    &ProfileOptions {
-      budget_per_probe: Duration::from_millis(5),
-      codecs: false,
-      core_matrix: false,
-    },
-    &PROFILE_BUDGETS,
-  )
+  MachineProfile::measure_patiently(&ProfileOptions {
+    budget_per_probe: Duration::from_millis(5),
+    codecs: false,
+    core_matrix: false,
+  })
   .expect("the machine profile measures")
 }
 
