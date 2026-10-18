@@ -4378,10 +4378,14 @@ struct HeldMount {
   anchor: Option<AnchorProcess>,
 }
 
-/// Shape: what a held mount's volume is bounded to — room for the writers of the in-flight test to span three kill
-/// cycles (which [`WRITES_PER_PHASE`] divides out of it) without the volume filling.
+/// Derived: what a held mount's volume is bounded to, sized by the most demanding test that takes one (the
+/// in-flight resend) — twice [`WRITER_BUDGET_BYTES`], because a test that fills a volume to its last byte is
+/// testing the quota and not the resend. A bound is a quota and not an allocation, so
+/// the margin costs nothing: the volume charges a write exactly its own length — filling one file by `dd` until
+/// `ENOSPC` reached 67108864 B of a 64 MiB bound to the byte at both 4 KiB and 256 KiB pages (fedora, 2026-10-17),
+/// a charge-to-length ratio of 1.000 — and a run that catches on its first cycle writes an eleventh of the budget.
 #[cfg(target_os = "linux")]
-const HELD_VOLUME_BYTES: usize = 64 * 1024 * 1024;
+const HELD_VOLUME_BYTES: usize = 2 * WRITER_BUDGET_BYTES;
 
 #[cfg(target_os = "linux")]
 impl HeldMount {
@@ -4497,10 +4501,21 @@ fn counter_of(instance: &str, name: &str) -> u64 {
     .sum()
 }
 
-/// Shape: the kill cycles the in-flight test may take to catch a request the daemon read and had not answered;
-/// inside the anchor's restart policy, which allows a restart per daemon start the recovery budget holds.
+/// Derived: the kill cycles the in-flight test may take to catch a request the daemon read and had not answered.
+/// A cycle catches or it does not, and the next one is a fresh draw, so n cycles all miss with (1 - p)^n and
+/// n = ⌈ln(1e-5) / ln(1 - p)⌉ holds a run's chance of missing below one in 100000 — orders below the rate at which
+/// CI runs this lane, so the catch is no longer what decides whether the test is green. That the draws really are
+/// independent is the part worth checking, and it was: over 200 runs on the cachyos box pinned to 4 cores
+/// (2026-10-17, load 14-16) the share of runs still going after k cycles fell 1 → 0.305 → 0.100 → 0.035, a ratio
+/// of 0.33 to 0.35 at every step rather than a fat tail, and no run took more than 4 cycles. Taking the worst
+/// miss rate measured anywhere in the sweep, 1 - p = 0.35, gives ⌈ln(1e-5) / ln(0.35)⌉ = 11. Cycles are spent only
+/// when one misses: the loop stops at the first catch, 139 of those 200 runs took one cycle and the mean run cost
+/// 0.49 s, so the ceiling is a bound on the bad case and not a cost of the usual one. It is what the test budgets
+/// for, which is why [`WRITER_BUDGET_BYTES`] counts every cycle rather than the expected one. Eleven kills in one
+/// run stays inside the anchor's restart policy: forcing every cycle, a run finished in 2.1 s with no crash-loop
+/// backoff and no `ENOSPC` (5 runs, same host).
 #[cfg(target_os = "linux")]
-const IN_FLIGHT_ATTEMPTS: usize = 3;
+const IN_FLIGHT_ATTEMPTS: usize = 11;
 /// Derived: one write is the mount's advertised `init::MAX_WRITE`, so the daemon's service of it is the longest a
 /// single write can hold a request it has read and not answered — the state the kill has to land inside for the
 /// kernel to resend anything. The daemon is in that state only for the fraction of its serve loop spent serving
@@ -4520,27 +4535,26 @@ const IN_FLIGHT_ATTEMPTS: usize = 3;
 const IN_FLIGHT_WRITE: usize = slates_bridge_fuse::init::MAX_WRITE as usize;
 /// Shape: the phases of one kill cycle a writer's pages are spread over — the pages before the kill, the pages it
 /// gets in while the kill is delivered and the daemon restarts, and the pages after the restarted daemon answers.
+/// [`write_pages`] holds a writer to this many phases' worth: the middle one ends at the restart, which the test
+/// observes a poll late, so without the cap it is bounded by nothing the test controls.
 #[cfg(target_os = "linux")]
 const CYCLE_PHASES: usize = 3;
-/// Derived: the bytes every writer together may append over the whole test — half the volume's bound, not all of
-/// it, because the volume charges a write more than the write's own length: budgeting the writers the whole bound
-/// plans 42 MiB of pages into a 64 MiB volume and still overflows it, so the charge exceeds the bytes by more than
-/// half again. What makes up the excess is not attributed here — the chunk windows a page touches, the inode
-/// allowance (A-109) and the pages a writer gets in between the kill and the restart are all candidates, and none
-/// was isolated. Measured 2026-10-17, 256 KiB pages and the one-syscall kill in both arms, so neither is the
-/// cause: the writers took `ENOSPC` instead of the resend under test in 2 runs of 30 on the cachyos box and 2 of 8
-/// on the fedora box with the bound itself, and in 0 of 30 and 0 of 10 with half of it.
+/// Derived: the bytes every writer together may append over the whole test, in the worst case where every cycle
+/// misses — [`WRITES_PER_PHASE`] pages per writer per phase per cycle: [`IN_FLIGHT_WRITE`] × [`IN_FLIGHT_WRITERS`]
+/// × [`IN_FLIGHT_ATTEMPTS`] × [`CYCLE_PHASES`] × [`WRITES_PER_PHASE`], which is 99 MiB. [`write_pages`] holds every
+/// writer to exactly that, so this is a figure the test controls rather than a function of how fast the host
+/// writes; before the cap the middle phase was bounded by nothing, and the writers took `ENOSPC` instead of the
+/// resend under test in 2 runs of 12 and 1 of 7 (2026-10-17). The inode allowance (A-109) over the eight files a
+/// cycle touches is four orders below this budget.
 #[cfg(target_os = "linux")]
-const WRITER_BUDGET_BYTES: usize = HELD_VOLUME_BYTES / 2;
-/// Derived: the pages one writer appends in each phase of a cycle — [`WRITER_BUDGET_BYTES`] shared out among every
-/// writer, cycle and phase, so [`IN_FLIGHT_ATTEMPTS`] cycles cannot fill the volume: [`WRITER_BUDGET_BYTES`] /
-/// ([`IN_FLIGHT_WRITE`] × [`IN_FLIGHT_WRITERS`] × [`IN_FLIGHT_ATTEMPTS`] × [`CYCLE_PHASES`]). It is both the stride
-/// a writer reaches before the kill and the pages it writes after the restart, so the file spans the takeover on
-/// both sides. In bytes it is several times what this test wrote per phase before the page grew to
-/// [`IN_FLIGHT_WRITE`], since one page now carries what sixty-four did.
+const WRITER_BUDGET_BYTES: usize =
+  IN_FLIGHT_WRITE * IN_FLIGHT_WRITERS * IN_FLIGHT_ATTEMPTS * CYCLE_PHASES * WRITES_PER_PHASE;
+/// Shape: the pages one writer appends in each phase of a cycle. It is both the stride a writer reaches before the
+/// kill and the pages it writes after the restart, so every file spans the takeover on both sides. In bytes it is
+/// several times what this test wrote per phase before the page grew to [`IN_FLIGHT_WRITE`], since one page now
+/// carries what sixty-four did.
 #[cfg(target_os = "linux")]
-const WRITES_PER_PHASE: usize =
-  WRITER_BUDGET_BYTES / (IN_FLIGHT_WRITE * IN_FLIGHT_WRITERS * IN_FLIGHT_ATTEMPTS * CYCLE_PHASES);
+const WRITES_PER_PHASE: usize = 3;
 /// Format: the page values cycle through this many, a prime, so a page out of place shows.
 #[cfg(target_os = "linux")]
 const PAGE_VALUES: usize = 251;
@@ -4576,21 +4590,63 @@ fn write_pages(
   use std::io::Write;
   use std::sync::atomic::Ordering;
   let mut file = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+  // Where a writer keeps working once it has spent its allowance. The daemon must stay as busy as the counted
+  // pages keep it, so this is the same request — an append of one [`IN_FLIGHT_WRITE`] page — to a file truncated
+  // back to empty every phase's worth, which bounds what it costs the volume. Rewriting one page in place was
+  // tried instead and is the same to within noise (0.725 against 0.750 per cycle, 40 runs each, cachyos
+  // 2026-10-17); an append is kept because it is the request the counted pages make. Its bytes are never read.
+  let busy_path = format!("{path}-busy");
+  // Truncating is how it is bounded, and every spelling of truncate is walled off outside the landing crate (R1),
+  // so the file is reopened instead: the same `write(2)` at a sequential offset, back to empty each time.
+  let empty_busy_file = || {
+    std::fs::OpenOptions::new()
+      .write(true)
+      .create(true)
+      .truncate(true)
+      .open(&busy_path)
+      .unwrap()
+  };
+  let mut busy = empty_busy_file();
+  let mut busy_pages = 0usize;
   let mut written = 0usize;
   let mut after = 0usize;
   while after < WRITES_PER_PHASE {
+    let restarted_now = restarted.load(Ordering::Acquire);
+    // A writer counts only its allowance, and appends to the busy file after that. Nothing else bounds what it
+    // appends between the kill and `restarted`: the successor answers as soon as it is serving, but this thread
+    // learns of it only at the next [`POLL_MS`] poll in `await_daemon`, and four writers fill that interval at
+    // full speed with pages no phase counts. At [`IN_FLIGHT_WRITE`] bytes each they filled the volume — the
+    // writers took `ENOSPC` instead of the resend under test in 2 runs of 12 and 1 of 7 (2026-10-17). The volume
+    // is not at fault: filling a file by `dd` until `ENOSPC` reached the bound to the byte at both 4 KiB and
+    // 256 KiB pages, so its charge is exactly the bytes written. Pausing at the allowance bounds it too, but
+    // breaks the test: the kill needs a request in flight and a paused writer has none, so no run completed at
+    // all. Appending where the bytes are thrown away keeps both.
+    let counted =
+      restarted_now || written < WRITES_PER_PHASE.saturating_mul(CYCLE_PHASES.saturating_sub(1));
+    if !counted && busy_pages >= WRITES_PER_PHASE {
+      busy = empty_busy_file();
+      busy_pages = 0;
+    }
     let page = [u8::try_from((first + written) % PAGE_VALUES).unwrap_or(0); IN_FLIGHT_WRITE];
-    // `in_write` is held across the syscall only: while it is non-zero a writer is inside `write(2)`, so the
-    // kernel has a FUSE request outstanding to the daemon. The kill waits for that, since a kill that lands
+    // `in_write` is held across the syscall only: while it is non-zero a writer is inside a write syscall, so
+    // the kernel has a FUSE request outstanding to the daemon. The kill waits for that, since a kill that lands
     // between requests catches nothing to resend.
     in_write.fetch_add(1, Ordering::AcqRel);
-    let acknowledged = file.write_all(&page);
+    let acknowledged = if counted {
+      file.write_all(&page)
+    } else {
+      busy.write_all(&page)
+    };
     in_write.fetch_sub(1, Ordering::AcqRel);
     acknowledged.expect("every write is acknowledged across the kill (none fails or hangs)");
-    written += 1;
-    progress.fetch_add(1, Ordering::AcqRel);
-    if restarted.load(Ordering::Acquire) {
-      after += 1;
+    if counted {
+      written += 1;
+      progress.fetch_add(1, Ordering::AcqRel);
+      if restarted_now {
+        after += 1;
+      }
+    } else {
+      busy_pages += 1;
     }
   }
   let loss_reported = match file.sync_all() {

@@ -71,29 +71,73 @@ have been read as the known flake.
   a single write can hold it. The write-through mount keeps the bytes in the daemon before `write(2)`
   returns (D-18; writeback cache is never asked for, `init.rs`), so a writer inside `write(2)` really
   does have a request on the device.
-- `WRITES_BEFORE`/`WRITES_AFTER` become one derived `WRITES_PER_PHASE`, taken from a writer budget of
-  half the volume's bound rather than from a chosen number.
+- `WRITES_BEFORE`/`WRITES_AFTER` become one `WRITES_PER_PHASE`.
+- A writer counts only its before-plus-middle allowance and appends to a throwaway file after that,
+  truncated back every phase's worth. Without that cap the loop is unbounded: the successor daemon
+  answers as soon as it is serving, but the test only learns of it at the next 20 ms `await_daemon`
+  poll, and four writers fill that interval at full speed with pages no phase counts. The cap is for
+  boundedness alone and costs no catch rate (measured below).
+- `IN_FLIGHT_ATTEMPTS` rises from 3 to a derived 11, and the volume's bound follows from it rather
+  than the other way round: `WRITER_BUDGET_BYTES` is now what the writers can append in the worst
+  case where every cycle misses, and `HELD_VOLUME_BYTES` is twice that (99 MiB and 198 MiB). This is
+  the part that makes the test green, and it is why the fix is not just the page size. A bound is a
+  quota, not an allocation, and attempts are spent only when a cycle misses, so the usual run is
+  unchanged: 139 of 200 runs took one cycle, at a mean of 0.49 s.
 
-No attempt count or timeout was raised.
+An attempt count was raised, deliberately. An earlier draft of this record said none was, which was
+wrong: at `IN_FLIGHT_ATTEMPTS = 3` and the measured per-cycle catch of about 0.7, a run misses every
+attempt roughly once in 37, which is a flake whatever the page size. Three was never derived from
+anything; eleven is derived from the measured catch rate and a stated target.
 
 ## Verification
 
-Interleaved on the cachyos box, 30 runs per arm, 2026-10-17: 256 KiB caught 30 of 32 cycles (0.94)
-with 0 test failures; 4 KiB in the same series caught 30 of 48 (0.63). On fedora (kernel 6.19.10,
-pinned to 2 cores — harsher) the current tree is 10 runs of 10 green, 10 of 11 cycles caught (0.91);
-4 KiB with the fast kill caught 2 of 15 (0.13), so the fast kill alone is necessary and nowhere near
-sufficient. At 0.91 per cycle and three attempts a miss is about 1 in 1300 runs.
+All on the cachyos box (32 cores, kernel 7.2.9-2-cachyos), the test pinned to 4 of them, 2026-10-17,
+with the box under another session's load (recorded per series).
+
+The page size, interleaved, 30 runs per arm: 256 KiB caught 30 of 32 cycles (0.94) with 0 test
+failures; 4 KiB in the same series caught 30 of 48 (0.63). On fedora (kernel 6.19.10, pinned to 2
+cores) 4 KiB with the fast kill caught 2 of 15 (0.13), so the fast kill alone is necessary and
+nowhere near sufficient.
+
+The cap, four arms interleaved, 20 runs each at load 11 — allowance 1x, 4x, 16x and uncapped, all on
+a volume large enough that none could fill: 0.833, 0.909, 0.833 and 0.870 caught per cycle, 0
+failures anywhere. The cap does not change the catch rate; it only bounds what a cycle writes.
+
+The final shape, 360 runs at load 13-16: **0 failures, 0 `ENOSPC`** — 100 runs of the binary as it
+ships (p = 0.709, 141 cycles, no run over 3 cycles) and 260 of the same design before the busy file
+went from `set_len` to a reopen (p = 0.705, 369 cycles). The tail is geometric, which is what licenses the attempt count: the share of runs
+still going after k cycles fell 1 → 0.305 → 0.100 → 0.035 over the 200-run series, a ratio of 0.33
+to 0.35 at each step, and no run in it exceeded 4 cycles of the 11 allowed. Forcing every cycle to
+run, a worst-case run finishes in 2.1 s with no crash-loop backoff and no `ENOSPC` (5 runs).
+
+## Measured and rejected
+
+- **Pausing at the allowance instead of writing somewhere cheap.** The first cap simply stopped a
+  writer once it had spent its allowance. It bounds the volume, and it breaks the test outright: the
+  kill waits for a request to be in flight, a paused writer has none, and no run completed at all
+  (40 attempted, none reached a kill; before the change a run took about 0.5 s). The writers have to
+  keep the daemon busy without growing the file, which is what the throwaway file is for.
+- **Rewriting one page in place rather than appending to a throwaway file.** Also bounded, and the
+  same to within noise: 0.725 against 0.750 caught per cycle, 40 runs each. The append is kept
+  because it is the same request the counted pages make, not because it measured better.
+- **Blaming the cap for a lower catch rate.** One interleaved A/B at load 20-23 put the capped arm at
+  0.651 against 0.903 uncapped, which read as the cap costing catch probability. It did not survive
+  a larger sweep at load 11 (four arms above, all 0.83-0.91). Two mechanisms were proposed for it and
+  both were measured false: append throughput is flat in file size (950 MiB/s from 8 MiB to 192 MiB)
+  and flat as a volume fills to its bound (870 MiB/s to the last byte of 64 MiB), so neither a
+  growing file nor a near-full volume was making the uncapped daemon slower and easier to catch.
 
 ## Found on the way, not fixed here
 
-- **The writers' budget had to be halved, and the reason is not established.** With the whole bound,
-  42 MiB of planned pages overflowed a 64 MiB volume *with the fast kill in place* (2 runs of 30 on
-  cachyos, 2 of 8 on fedora), so the volume charges a write more than half again its length. The
-  chunk-window charge, the inode allowance (A-109) and the pages a writer adds between the kill and
-  the restart are all candidates; none was isolated. Half the bound is 0 of 30 and 0 of 10. The two
-  symptoms are coupled, which is why an idle host can miss the overflow entirely: a run that catches
-  on its first cycle writes the least and never approaches the bound, so `ENOSPC` only appears on the
-  runs that need a second or third cycle — the same runs a slower or more contended host produces.
+- **The volume does not overcharge — an earlier draft of this record said it did, and that was
+  wrong.** Filling one file by `dd` until `ENOSPC` reached 67108864 B of a 64 MiB bound to the byte at
+  both 4 KiB and 256 KiB pages (fedora, 2026-10-17): charge to length 1.000, no chunk-window excess,
+  and A-109's inode allowance over four files is four orders below the budget. The overflow was
+  therefore pages the test wrote and did not count, which is the uncapped middle phase above; it is
+  fixed, not owed. Worth keeping for whoever meets it next: the two symptoms are coupled, so an idle
+  host can miss the overflow entirely — a run that catches on its first cycle writes the least and
+  never approaches the bound, so `ENOSPC` only shows on runs that need a second or third cycle. That
+  is why the halved budget looked sufficient over 30 runs and then failed 2 of 12 on the same tree.
 - **`max_write` is advertised at 256 KiB but the kernel caps a request below it.** `wanted()` in
   `crates/bridge-fuse/src/init.rs` does not ask for `FUSE_MAX_PAGES` and the INIT reply writes
   `max_pages = 0`, so the kernel keeps its own default pages-per-request ceiling

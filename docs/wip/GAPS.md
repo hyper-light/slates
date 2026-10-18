@@ -6410,12 +6410,33 @@ with the fast kill 2/15 (0.13), so the fast kill alone is necessary and far from
 --all-targets -D warnings` and `fmt --check` exit 0; the cli suite 31/31. Record:
 `docs/bugs/2026-10-17-the-in-flight-resend-test-raced-its-own-precondition.md`.
 
-**Owed:** the writers' budget had to be halved and the reason is not attributed — with the whole bound, 42 MiB of
-planned pages overflow a 64 MiB volume *with the fast kill in place* (2 runs of 30 on cachyos, 2 of 8 on fedora),
-so the charge exceeds the bytes written by more than half again; the chunk-window charge, the inode allowance
-(A-109) and the pages added between the kill and the restart are all candidates and none was isolated. The two
-symptoms are coupled: a run that catches on its first cycle never approaches the bound, so the overflow only shows
-on runs that need a second or third cycle. And `wanted()` in `crates/bridge-fuse/src/init.rs` never asks for
+A second defect in the same test, found by running the committed tree: the writers' loop was unbounded. The
+successor daemon answers as soon as it is serving, but the test learns of it only at the next 20 ms `await_daemon`
+poll, and four writers fill that interval at full speed with pages no phase counts — enough to take `ENOSPC`
+instead of the resend under test in 2 runs of 12 and 1 of 7. The volume is not at fault and an earlier draft that
+said it overcharges was wrong: filling one file by `dd` until `ENOSPC` reached 67108864 B of a 64 MiB bound to the
+byte at both 4 KiB and 256 KiB pages, a charge-to-length ratio of 1.000, with A-109's inode allowance over four
+files four orders below the budget. A writer now counts only its before-plus-middle allowance and appends to a
+throwaway file after that, reopened empty every phase's worth, so what a cycle adds to the volume is bounded by
+construction (CLAUDE.md #8) and does not depend on how fast the host writes. Pausing at the allowance instead was
+tried and rejected: it bounds the volume and breaks the test, since the kill waits for a request in flight and a
+paused writer has none — no run completed at all. The two symptoms are coupled, which is why the budget alone
+looked sufficient over 30 runs and then failed 2 of 12 on the same tree: a run that catches on its first cycle
+never approaches the bound, so the overflow only shows on runs needing a second or third cycle.
+
+Bounding the writers exposed what the page size had been masking: the catch is a draw, not a certainty, and three
+attempts were never derived from it. A cycle catches with p = 0.709 measured over 100 runs of the shipped binary,
+and the tail is geometric (the share of runs still going after k cycles fell 1 → 0.305 → 0.100 → 0.035 over a
+200-run series, a ratio of 0.33-0.35 at each step), so `IN_FLIGHT_ATTEMPTS` is now ⌈ln(1e-5)/ln(0.35)⌉ = 11 and a
+run misses every attempt below once in 100000. The derivation is inverted to match: `WRITES_PER_PHASE` is the
+shape, `WRITER_BUDGET_BYTES` is what the writers can append if every cycle misses (99 MiB) and the held mount's
+bound is twice that (198 MiB) — a quota, not an allocation, and attempts cost nothing unless a cycle misses (67 of
+100 runs took one cycle). Four interleaved arms at allowance 1x/4x/16x/uncapped measured 0.833/0.909/0.833/0.870,
+so the cap itself costs no catch rate. Verified: 360 runs, 0 failures, 0 `ENOSPC`; a run forced through all 11
+cycles finishes in 2.1 s inside the anchor's restart policy; `clippy --workspace --all-targets -D warnings` and
+`fmt --check` exit 0; the cli suite 31/31.
+
+**Owed:** `wanted()` in `crates/bridge-fuse/src/init.rs` never asks for
 `FUSE_MAX_PAGES` and the INIT reply writes `max_pages = 0`, so the kernel keeps its own pages-per-request ceiling
 and the advertised `max_write` of 256 KiB is not what one request carries — verified in our source by two
 independent readings, but the kernel half is read from `fuse_perform_write`, not measured here, and no `strace` of
