@@ -1361,6 +1361,19 @@ pub mod platform {
         (sealed.as_fd(), window, window, "a window partway into the object"),
         (unsealed.as_fd(), 0, window, "a window the peer could write"),
       ];
+      // Nothing crossed: the peer has no delivery waiting. Proved non-vacuously — a `recv_mapping` that could
+      // receive nothing at all would satisfy that however `send_mapping` behaved — by sending one hand-off
+      // that *does* meet the rule and taking it off the socket first. So the peer's side is known to work, and
+      // the emptiness after the three refusals is a fact about the refusals.
+      control.send_mapping(sealed.as_fd(), 9, 11, 0, object_bytes, object_bytes)?;
+      let good = liveness.recv_mapping()?.ok_or(IpcError::Layout {
+        reason: "a confined, sealed hand-off did not reach the peer, so this test proves nothing",
+      })?;
+      if good.mapping_id != 11 {
+        return Err(IpcError::Layout {
+          reason: "the confined hand-off arrived with the wrong metadata",
+        });
+      }
       for (descriptor, region_off, authorized, what) in offers {
         match control.send_mapping(descriptor, 7, 42, region_off, authorized, authorized) {
           Err(IpcError::UnconfinedDescriptor { .. }) => {}
@@ -1373,8 +1386,6 @@ pub mod platform {
           Err(other) => return Err(other),
         }
       }
-
-      // Nothing crossed: the peer has no delivery waiting.
       if liveness.recv_mapping()?.is_some() {
         return Err(IpcError::Layout {
           reason: "a refused hand-off still reached the peer",
