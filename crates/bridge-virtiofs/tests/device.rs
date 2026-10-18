@@ -2213,6 +2213,15 @@ proptest! {
     }
     prop_assume!(scanned > 0);
 
+    // Non-vacuity, where the schedule left a window live: pins must be held before the release can mean
+    // anything. A schedule that ended with no window says nothing either way, and asserts nothing.
+    if device.dax_window_count() > 0 {
+      prop_assert!(
+        store.content.arena().pinned_blocks() > 0,
+        "windows are live, so blocks must be pinned before the release below"
+      );
+    }
+
     // Whatever the schedule did, the pin ledger must balance once the device lets go. `release_dax` is the
     // terminal teardown a crashed or disconnected VMM gets, and after it no block of this store may still be
     // pinned: a pin left behind holds a chunk out of the arena for good, and the only thing that would hide
@@ -2893,10 +2902,20 @@ fn hostile_dax_requests_are_refused_and_establish_no_window() {
     "exactly the one valid window is live"
   );
 
-  // And the hostile sequence leaked nothing: with the one valid window released, no block of the store is still
-  // pinned. A refused map that kept its pin would hold a chunk out of the arena for good, and a hostile guest
-  // could repeat it — the leak is the attack. Asserted over the whole arena rather than one block, because the
-  // interesting leak is the one from a path nobody thought to name.
+  // The hostile sequence must have leaked nothing: with the one valid window released, no block of the store is
+  // still pinned. A refused map that kept its pin would hold a chunk out of the arena for good, and a hostile
+  // guest could repeat it — the leak is the attack. Asserted over the whole arena rather than one block,
+  // because the interesting leak is the one from a path nobody thought to name.
+  //
+  // The bridge is dropped first so the store can be read, and the pins are checked **before** the release as
+  // well as after: the one live window really did pin something, so the zero below is the ledger balancing and
+  // not a counter that never moves.
+  drop(bridge);
+  assert!(
+    store.content.arena().pinned_blocks() > 0,
+    "the live window pins a block, so the zero asserted below means something"
+  );
+  let mut bridge = VolumeBridge::new(vid(), &mut vol, &mut store);
   device.release_dax(&mut bridge, &cx);
   drop(bridge);
   assert_eq!(
