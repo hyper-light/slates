@@ -6674,3 +6674,23 @@ The reproduction is kept and `#[ignore]`d so the suite stays green and the evide
 `a_map_storm_is_refused_at_the_registry_bound` is restored to what it was, with a note naming what it does not
 cover. After the revert: vfs dax 51/51 + 1 ignored, clippy `-D warnings` and `xtask check` clean. Record:
 `docs/bugs/2026-10-18-one-volumes-dax-map-storm-denies-every-other-volume.md`.
+
+### 2026-10-18: the DAX pin ledger is now held to the device's books (the guard the class was missing)
+
+**No device-level test looked at pins at all.** That is the gap the withdrawn window dedup went through: the
+arena counts pin holders **per mapping**, the device keeps one `DaxWindowEntry` **per SETUPMAPPING** and releases
+each, and neither crate's own tests could hold the two halves to each other — so an unsafe change was green on
+macOS aarch64, x86_64 Linux and aarch64 Linux.
+
+`ChunkArena::pinned_blocks()` now reports how many blocks are pinned, and two device-level tests balance the
+ledger over a **real** device, cache region and context:
+
+- `a_device_window_gives_its_pin_back_when_it_unmaps` — one window; mapping pins a block (non-vacuity), the unmap
+  returns the arena to exactly where it started, so a pin cannot be left behind holding a chunk out for good.
+- `two_windows_over_one_block_each_hold_its_pin` — the same file range mapped at two guest offsets; dropping the
+  first leaves the block **still pinned** for the second, and only the second's teardown releases it.
+
+**Red-checked, so it is a guard and not a hope:** with the withdrawn dedup re-applied the second test fails
+exactly where it must — `left: 0, right: 1`, the block released while the second window is live. Verified again
+after the test was split in two for the cognitive-complexity bound. bridge-virtiofs 33/33 + 1 ignored, slates-mem
+94/94, clippy `-D warnings` and `xtask check` clean.

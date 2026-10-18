@@ -844,6 +844,14 @@ impl ChunkArena {
       .is_some_and(|entry| entry.holders > 0)
   }
 
+  /// How many blocks are pinned at all (any holder count). The ledger a teardown test balances: every window a
+  /// device maps pins a block and every teardown must give that pin back, so after everything is torn down this
+  /// is zero. Counting blocks, not holders, so a block two windows hold is one.
+  #[must_use]
+  pub fn pinned_blocks(&self) -> usize {
+    self.pins.len()
+  }
+
   /// Blocks held by a live DAX mapping whose file has already been freed — a `free` arrived while they were pinned and
   /// waits for the last unpin (§4.6). A test asserts this moved, so a dead deferral path cannot pass for a live one.
   pub fn pinned_free_waiting(&self) -> usize {

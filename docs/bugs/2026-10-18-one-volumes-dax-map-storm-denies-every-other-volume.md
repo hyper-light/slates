@@ -64,6 +64,21 @@ change was already committed (`e4535b01`), which is itself the lesson: a change 
 accounting has to be checked against the *device's* accounting, because the two halves of the pin live
 in different crates.
 
+**And it is a measured hazard, not a reading of the code.** A new device-level test
+(`every_window_a_device_maps_gives_its_pin_back`) maps the same file range at two guest offsets, drops
+one window and asserts the block is still pinned for the other. It passes on the reverted tree, and
+with the dedup re-applied it fails exactly there:
+
+```
+assertion `left == right` failed: the block is STILL pinned: the second window over it is live,
+and a block released here would be reusable under a live guest page table
+  left: 0
+ right: 1
+```
+
+That test is committed, and it is the guard this class was missing: **no device-level test looked at
+pins at all** before, which is why three platforms' suites went green over an unsafe change.
+
 **What a correct fix has to do: move the pin from the mapping to the window.** One pin per window
 handed out, and a `dax_revoke` that no longer consumes one — so the holder count tracks guest windows
 rather than registry entries. That changes the gate's core invariant, so it is a considered change

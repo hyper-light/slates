@@ -1652,6 +1652,143 @@ fn tenant_dax_map(
   reply_error(&reply)
 }
 
+/// A tenant with one file, its device, cache region and context, brought up and ready to map — the fixture the
+/// two pin-ledger tests share, so each of them does one thing.
+#[cfg(unix)]
+struct PinLedgerFixture {
+  store: slates_vfs::volume::Store,
+  tenant: slates_vfs::volume::Volume,
+  device: Device,
+  driver: SimDriver,
+  cx: OpContext,
+  no: u64,
+  page_len: u64,
+  quiet: usize,
+  _cache: slates_mem::SharedObject,
+}
+
+#[cfg(unix)]
+fn pin_ledger_fixture(tag: &str) -> PinLedgerFixture {
+  const BYTE: u8 = 0xC7;
+  let page = rustix::param::page_size().max(1);
+  let window = (page * 4) as u64;
+  let mut store = dax_shared_store(page, tag);
+  let (mut tenant, no) = tenant_with_file(&mut store, (1, "p", BYTE), page);
+  let (mut device, mut driver) = device_and_driver();
+  let cache = tenant_cache(tag, page);
+  device.install_dax_window(Some(
+    slates_bridge_virtiofs::dax::DaxCacheRegion::new(cache.as_fd(), window).unwrap(),
+  ));
+  let cx = context_for(vid());
+  tenant_connect(
+    (&mut device, &mut driver),
+    (vid(), &mut tenant, &mut store),
+    &cx,
+  );
+  let quiet = store.content.arena().pinned_blocks();
+  PinLedgerFixture {
+    store,
+    tenant,
+    device,
+    driver,
+    cx,
+    no,
+    page_len: page as u64,
+    quiet,
+    _cache: cache,
+  }
+}
+
+#[cfg(unix)]
+impl PinLedgerFixture {
+  fn map(&mut self, unique: u64, moffset: u64) -> i32 {
+    tenant_dax_map(
+      (&mut self.device, &mut self.driver),
+      (vid(), &mut self.tenant, &mut self.store),
+      &self.cx,
+      (unique, self.no),
+      (moffset, self.page_len),
+    )
+  }
+
+  fn unmap(&mut self, unique: u64, moffset: u64) -> i32 {
+    tenant_dax_unmap(
+      (&mut self.device, &mut self.driver),
+      (vid(), &mut self.tenant, &mut self.store),
+      &self.cx,
+      (unique, self.no),
+      (moffset, self.page_len),
+    )
+  }
+
+  fn pinned(&self) -> usize {
+    self.store.content.arena().pinned_blocks()
+  }
+}
+
+/// §4.6 — a window a device maps gives its pin back when it unmaps. A pin left behind holds a chunk out of the
+/// arena for good. Do: map one window over a real cache region, then unmap it. Expect: mapping pins a block
+/// (non-vacuity) and the unmap returns the arena to exactly where it started.
+#[cfg(unix)]
+#[test]
+fn a_device_window_gives_its_pin_back_when_it_unmaps() {
+  let mut f = pin_ledger_fixture("pinledger-one");
+  assert_eq!(f.map(2, 0), 0, "the window maps");
+  let with_one = f.pinned();
+  assert!(
+    with_one > f.quiet,
+    "non-vacuity: mapping a window pins a block ({} -> {with_one})",
+    f.quiet
+  );
+  assert_eq!(f.unmap(3, 0), 0, "the window unmaps");
+  assert_eq!(f.pinned(), f.quiet, "and its pin came back");
+}
+
+/// §4.6 — two guest windows over **one** block each hold its pin, and only the last one out releases it. A block
+/// released while a window still maps it is reusable by another allocation under a live guest page table, which
+/// is the escape the two-phase revoke exists to prevent.
+///
+/// Do: map the same file range at two different guest offsets, drop one window, then the other. Expect: after
+/// the first, the block is **still pinned**; after the second, nothing is.
+///
+/// Why this test exists, and it is a red-checked guard rather than a hopeful one. No device-level test looked at
+/// pins at all, and that gap let an unsafe change through on 2026-10-18: deduplicating windows in the registry
+/// made two guest windows share one refcounted pin, and it was green on macOS aarch64, x86_64 Linux and aarch64
+/// Linux. With that change re-applied this test fails exactly here — `left: 0, right: 1`, the block released
+/// while the second window is live. The two halves of the pin live in different crates (the arena counts holders
+/// per mapping; the device keeps one window entry per SETUPMAPPING and releases each), so neither crate's own
+/// tests could hold them to each other. Record:
+/// `docs/bugs/2026-10-18-one-volumes-dax-map-storm-denies-every-other-volume.md`.
+#[cfg(unix)]
+#[test]
+fn two_windows_over_one_block_each_hold_its_pin() {
+  let mut f = pin_ledger_fixture("pinledger-two");
+  let second_at = f.page_len;
+  assert_eq!(f.map(2, 0), 0, "the first window maps");
+  assert_eq!(f.map(3, second_at), 0, "the second window maps the same range");
+  let with_two = f.pinned();
+  assert!(
+    with_two > f.quiet,
+    "non-vacuity: two windows over one range hold the block ({} -> {with_two})",
+    f.quiet
+  );
+
+  assert_eq!(f.unmap(4, 0), 0, "the first window unmaps");
+  assert_eq!(
+    f.pinned(),
+    with_two,
+    "the block is STILL pinned: the second window over it is live, and a block released here would be reusable \
+     under a live guest page table"
+  );
+
+  assert_eq!(f.unmap(5, second_at), 0, "the second window unmaps");
+  assert_eq!(
+    f.pinned(),
+    f.quiet,
+    "with both windows gone the ledger balances: no block is left pinned"
+  );
+}
+
 /// §4.6 / AC-4.12, the cross-tenant question asked where a VMM actually reaches. The VFS proves a guest cannot
 /// read across a volume boundary (`vfs/tests/dax.rs a_guest_cannot_read_across_a_volume_boundary`); this proves it
 /// at the device seam, the half a guest's own page table is wired to. Do: put two tenants in ONE store, so they
