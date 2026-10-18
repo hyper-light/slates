@@ -99,6 +99,34 @@ pub enum FsKind {
 mod tests {
   use super::*;
 
+  /// §4.5's racy rule rests on this table, so the table is pinned here — in particular the arm every
+  /// filesystem **not** in `fs_kind`'s match takes. Do: ask for each class's granularity. Expect: the
+  /// documented unit, and `Unknown` at two seconds, the same as FAT.
+  ///
+  /// `Unknown` is not a rare arm. `fs_kind` matches eight magics on Linux (ext4, XFS, btrfs, tmpfs,
+  /// MSDOS, exFAT, NTFS, HFS+), so **overlayfs, virtiofs and NFS all land here** — every OCI container,
+  /// the microVM path, and slates' own macOS loopback. Measured 2026-10-18: overlayfs's real granularity
+  /// is 1 ms, against the 2 s it is given, which is why that record exists
+  /// (`docs/bugs/2026-10-18-overlayfs-is-unknown-so-the-base-plane-assumes-two-second-timestamps.md`).
+  ///
+  /// **Coarse is the safe direction and this test exists to keep it that way.** All three consumers of
+  /// the value ask "is this timestamp within granularity of the read, and therefore racy?", so a larger
+  /// number classifies more as racy — a relist or a recomputation, never a stale read. Anyone tempted to
+  /// shrink `Unknown` to recover that performance is changing a safety bound and should read the record
+  /// first; this assertion is where they will meet it.
+  #[test]
+  fn the_granularity_table_is_what_the_racy_rule_assumes_and_unknown_is_the_coarse_arm() {
+    assert_eq!(granularity_for(FsKind::Nanosecond), 1);
+    assert_eq!(granularity_for(FsKind::HundredNanoseconds), 100);
+    assert_eq!(granularity_for(FsKind::Second), 1_000_000_000);
+    assert_eq!(granularity_for(FsKind::TwoSeconds), 2_000_000_000);
+    assert_eq!(
+      granularity_for(FsKind::Unknown),
+      granularity_for(FsKind::TwoSeconds),
+      "an unclassified filesystem takes the coarsest arm, never a guess at a finer one"
+    );
+  }
+
   /// AUD-29-62. Do: ask for every shape of name that is not one entry, on each platform's rule. Expect:
   /// each is refused as absent, and a plain name — including one holding the other platform's breaks — is
   /// one entry.
