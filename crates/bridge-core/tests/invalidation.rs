@@ -312,6 +312,79 @@ fn a_watcher_hint_expires_the_directorys_live_entries_and_the_next_lookup_relist
   assert!(owed.is_empty(), "delivered once: {owed:?}");
 }
 
+/// §4.6: the scope invariant holds on BASE-PLANE hints too, not only journal records. A `ScopedBridge`'s
+/// invalidation stream must drop a watcher hint for a base directory outside the scope, exactly as it drops an
+/// out-of-scope journal record — the same `within` filter, but exercised here from the base-plane source
+/// (completing the scope-invalidation fix's coverage, which the journal test alone did not reach). Do: a base
+/// overlay with `/scope/keep` (in scope) and `/other/secret` (out of scope), both read so the base plane watches
+/// them; an outsider changes both; read the scoped view's owed invalidations. Expect: nothing names `/other` or
+/// its file; the in-scope `/scope` change is still delivered.
+#[test]
+fn a_scoped_view_filters_an_out_of_scope_base_plane_hint() {
+  use slates_bridge_core::scoped::ScopedBridge;
+  // The scenario, built fresh (identical, so the inode numbers match): `/scope/keep` in scope, `/other/secret`
+  // out of it, both read so the base plane watches them, then both changed by an outsider. Returns the overlay
+  // positioned to read its owed invalidations, with the inode numbers that matter.
+  fn tampered() -> (Overlay, (u64, u64, u64, u64)) {
+    let mut host = SimHost::new();
+    host.mkdir("/scope");
+    host.replace_file("/scope/keep", b"in scope");
+    host.mkdir("/other");
+    host.replace_file("/other/secret", b"out of scope");
+    let mut f = Overlay::over(host);
+    let root = f.bridge(|b, cx| b.root(cx).unwrap());
+    let (_, scope_ino) = f.lookup(root, "scope");
+    let (_, keep) = f.lookup(scope_ino, "keep");
+    let (_, other_ino) = f.lookup(root, "other");
+    let (_, secret) = f.lookup(other_ino, "secret");
+    f.host.advance_ns(i64::try_from(GRANULARITY_NS).unwrap());
+    f.host.replace_file("/other/secret", b"tampered out of scope");
+    f.host.replace_file("/scope/keep", b"tampered in scope");
+    (f, (scope_ino, keep, other_ino, secret))
+  }
+  let names_other = |owed: &[Invalidation], other_ino: u64, secret: u64| {
+    owed.iter().any(|inv| match inv {
+      Invalidation::Inode { ino, .. } => *ino == other_ino || *ino == secret,
+      Invalidation::Entry { parent, .. } => *parent == other_ino,
+    })
+  };
+
+  // Non-vacuity baseline: unscoped, the out-of-scope directory's hint IS produced — so the scoped run below has a
+  // real hint to drop, not an absent one.
+  let (mut base, (_, _, other_ino, secret)) = tampered();
+  let cursor = base.cursor;
+  let unscoped = base.bridge(|b, cx| {
+    let mut owed = Vec::new();
+    b.invalidations(cx, cursor, &mut owed).unwrap();
+    owed
+  });
+  assert!(
+    names_other(&unscoped, other_ino, secret),
+    "the unscoped baseline did not even produce the out-of-scope hint, so the scoped test would be vacuous: {unscoped:?}"
+  );
+
+  // Scoped: the same hint is dropped; the in-scope one is kept.
+  let (mut f, (scope_ino, keep, other_ino, secret)) = tampered();
+  let cursor = f.cursor;
+  let owed = f.bridge(|b, cx| {
+    let mut scoped = ScopedBridge::new(b, scope_ino);
+    let mut owed = Vec::new();
+    scoped.invalidations(cx, cursor, &mut owed).unwrap();
+    owed
+  });
+  assert!(
+    !names_other(&owed, other_ino, secret),
+    "an out-of-scope base-plane hint leaked through the scoped stream: {owed:?}"
+  );
+  assert!(
+    owed.iter().any(|inv| {
+      matches!(inv, Invalidation::Entry { parent, .. } if *parent == scope_ino)
+        || matches!(inv, Invalidation::Inode { ino, .. } if *ino == scope_ino || *ino == keep)
+    }),
+    "the in-scope base-plane hint was dropped — the scope filter is not vacuous: {owed:?}"
+  );
+}
+
 /// A watcher overflow (lost events) marks every loaded directory stale: the transport owes an
 /// expire for every live entry it may hold anywhere, not only under one directory.
 #[test]

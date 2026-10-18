@@ -288,6 +288,34 @@ fn a_forget_drops_only_the_owners_share() {
   );
 }
 
+/// §4.6 the reference model, at the extreme (the FUSE FORGET-underflow class, a kernel that lies about its
+/// `nlookup`): a forget of `u64::MAX` for a node an attachment holds once drops exactly one — `forget_for`
+/// caps the drop at what the owner holds (`min(n, owned)` over a `u64→u32` saturation), so the count never
+/// underflows or wraps. The node reclaims once (no other holder), and a *second* `u64::MAX` forget of the now
+/// reclaimed node is a safe no-op (owned is zero): it never underflows the count negative, never resurrects or
+/// corrupts a freed inode, never panics.
+#[test]
+fn a_u64_max_forget_drops_only_what_is_held_and_a_repeat_is_inert() {
+  let mut store = store();
+  let mut vol = volume(&mut store, 1 << 30);
+  let root = vol.root_inode(&store).unwrap();
+  let f = vol.create_file_no(&mut store, root, "f", 0o644).unwrap();
+  vol.reference_for(&store, f, RefOwner::Process(1)).unwrap();
+  vol.unlink_no(&mut store, root, "f").unwrap();
+
+  // A colossal forget caps at the one reference held: the inode reclaims exactly once.
+  vol
+    .forget_for(&mut store, f, RefOwner::Process(1), u64::MAX)
+    .unwrap();
+  assert!(vol.stat(&store, f).is_err(), "the single reference was dropped exactly once");
+
+  // A repeat colossal forget of the reclaimed node is inert — no underflow, no resurrection, no panic.
+  vol
+    .forget_for(&mut store, f, RefOwner::Process(1), u64::MAX)
+    .unwrap();
+  assert!(vol.stat(&store, f).is_err(), "the reclaimed inode stays gone, never resurrected");
+}
+
 /// A directory removed while a transport still holds it — a kernel's lookup of a directory it made, kept until
 /// its forget (2026-10-01: `rm -r` through the daemon's FUSE mount, after which every barrier on the volume was
 /// refused and the kernel answered `EIO`). Do: hold a reference on a directory, empty it, remove it; image
@@ -393,4 +421,35 @@ fn an_orphan_named_again_survives_its_last_close_and_leaks_nothing() {
     budget_before,
     "the budget ends where it began"
   );
+}
+
+/// CVE-2026-77179 class (CVSS 9.4: a macOS virtio-fs host server reopened an unlinked file *by name* and followed a
+/// symlink swapped in at that name, escaping the share). slates never reopens by name — I/O is inode-addressed and
+/// an unlinked-but-referenced inode is held, so a handle opened before an unlink reaches the ORIGINAL inode, never a
+/// new object (or a symlink) created at the same name afterwards. Create f="AAA", hold a reference (the open
+/// handle), unlink it, create a NEW f="BBB": a read through the original inode still returns "AAA", and the new name
+/// is a distinct inode holding "BBB" — the open handle is never re-resolved through the name.
+#[test]
+fn an_open_handle_survives_unlink_and_recreate_reaching_the_original_inode() {
+  let mut store = store();
+  let mut vol = volume(&mut store, 1 << 30);
+  let root = vol.root_inode(&store).unwrap();
+  let f = vol.create_file_no(&mut store, root, "f", 0o644).unwrap();
+  vol.write(&mut store, f, 0, b"AAA").unwrap();
+  vol.reference_for(&store, f, RefOwner::Process(1)).unwrap();
+  vol.unlink_no(&mut store, root, "f").unwrap();
+
+  let f2 = vol.create_file_no(&mut store, root, "f", 0o644).unwrap();
+  vol.write(&mut store, f2, 0, b"BBB").unwrap();
+  assert_ne!(f, f2, "the recreated name is a distinct inode, never the held one");
+
+  let mut original = vec![0u8; 3];
+  vol.read(&store, f, 0, &mut original).unwrap();
+  assert_eq!(
+    &original, b"AAA",
+    "the handle opened before the unlink reaches the original inode, never a reopen-by-name"
+  );
+  let mut recreated = vec![0u8; 3];
+  vol.read(&store, f2, 0, &mut recreated).unwrap();
+  assert_eq!(&recreated, b"BBB", "the new name is the new file");
 }

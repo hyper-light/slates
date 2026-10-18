@@ -81,6 +81,36 @@ pub(crate) fn call_version(
   reply[accept_off + 4..].to_vec()
 }
 
+/// One ONC RPC call of `program`/`procedure` at version 3 (AUTH_NONE), returning the RPC *accept status*
+/// (RFC 5531 §9) rather than asserting it was `SUCCESS` — for probing a procedure the server may not serve (e.g. a
+/// MOUNT `DUMP`/`EXPORT` that must be `PROC_UNAVAIL` so no tenant enumerates the others), where [`call_version`]
+/// would panic on the non-success reply.
+pub(crate) fn call_accept_status(
+  stream: &mut (impl Read + Write),
+  program: u32,
+  procedure: u32,
+  args: &[u8],
+  xid: u32,
+) -> u32 {
+  let mut body = Vec::new();
+  for field in [xid, 0, 2, program, VERSION_3, procedure, 0, 0, 0, 0] {
+    body.extend_from_slice(&field.to_be_bytes());
+  }
+  body.extend_from_slice(args);
+  let marker = 0x8000_0000u32 | u32::try_from(body.len()).unwrap();
+  stream.write_all(&marker.to_be_bytes()).unwrap();
+  stream.write_all(&body).unwrap();
+
+  let mut marker_buf = [0u8; 4];
+  stream.read_exact(&mut marker_buf).unwrap();
+  let len = (u32::from_be_bytes(marker_buf) & 0x7fff_ffff) as usize;
+  let mut reply = vec![0u8; len];
+  stream.read_exact(&mut reply).unwrap();
+  let verf_len = u32::from_be_bytes(reply[16..20].try_into().unwrap()) as usize;
+  let accept_off = 20 + verf_len + (4 - verf_len % 4) % 4;
+  u32::from_be_bytes(reply[accept_off..accept_off + 4].try_into().unwrap())
+}
+
 pub(crate) fn status(results: &[u8]) -> u32 {
   u32::from_be_bytes(results[0..4].try_into().unwrap())
 }
@@ -230,6 +260,121 @@ pub(crate) fn create(
   read_opaque(&reply, 8).0
 }
 
+/// NFS CREATE (UNCHECKED) raw `name` bytes in `dir_fh` with mode 0644 → the status the server answered,
+/// without asserting it succeeded (so a test can present a name the server refuses, such as one with a
+/// separator or a NUL byte).
+pub(crate) fn create_status(
+  stream: &mut (impl Read + Write),
+  dir_fh: &[u8],
+  name: &[u8],
+  xid: u32,
+) -> u32 {
+  let mut args = Vec::new();
+  opaque(dir_fh, &mut args);
+  opaque(name, &mut args);
+  args.extend_from_slice(&0u32.to_be_bytes()); // createmode3 UNCHECKED
+  args.extend_from_slice(&1u32.to_be_bytes()); // set_mode: yes
+  args.extend_from_slice(&0o644u32.to_be_bytes());
+  for _unset in 0..5 {
+    args.extend_from_slice(&0u32.to_be_bytes()); // uid, gid, size: no; atime, mtime: DONT_CHANGE
+  }
+  status(&call(stream, NFS_PROGRAM, 8, &args, xid))
+}
+
+/// NFS LOOKUP of raw `name` bytes in `dir_fh` → the status (so a test can present a name with a NUL byte or
+/// a separator, which `&str` would reject before the wire).
+pub(crate) fn lookup_raw_status(
+  stream: &mut (impl Read + Write),
+  dir_fh: &[u8],
+  name: &[u8],
+  xid: u32,
+) -> u32 {
+  let mut args = Vec::new();
+  opaque(dir_fh, &mut args);
+  opaque(name, &mut args);
+  status(&call(stream, NFS_PROGRAM, 3, &args, xid))
+}
+
+/// NFS MKDIR of raw `name` bytes in `dir_fh` with mode 0755 → the status (so a test can present `.`/`..`).
+pub(crate) fn mkdir_status(
+  stream: &mut (impl Read + Write),
+  dir_fh: &[u8],
+  name: &[u8],
+  xid: u32,
+) -> u32 {
+  let mut args = Vec::new();
+  opaque(dir_fh, &mut args);
+  opaque(name, &mut args);
+  args.extend_from_slice(&1u32.to_be_bytes()); // set_mode: yes
+  args.extend_from_slice(&0o755u32.to_be_bytes());
+  for _unset in 0..5 {
+    args.extend_from_slice(&0u32.to_be_bytes()); // uid, gid, size: no; atime, mtime: DONT_CHANGE
+  }
+  status(&call(stream, NFS_PROGRAM, 9, &args, xid))
+}
+
+/// NFS SYMLINK of raw `name` bytes in `dir_fh` to `target` → the status (so a test can present `.`/`..`).
+pub(crate) fn symlink_status(
+  stream: &mut (impl Read + Write),
+  dir_fh: &[u8],
+  name: &[u8],
+  target: &str,
+  xid: u32,
+) -> u32 {
+  let mut args = Vec::new();
+  opaque(dir_fh, &mut args);
+  opaque(name, &mut args);
+  for _unset in 0..6 {
+    args.extend_from_slice(&0u32.to_be_bytes()); // symlink_attributes (sattr3): all unset
+  }
+  opaque(target.as_bytes(), &mut args); // symlink_data (nfspath3)
+  status(&call(stream, NFS_PROGRAM, 10, &args, xid))
+}
+
+/// NFS REMOVE of raw `name` bytes in `dir_fh` → the status (so a test can present `.`/`..` or a separator).
+pub(crate) fn remove_status(
+  stream: &mut (impl Read + Write),
+  dir_fh: &[u8],
+  name: &[u8],
+  xid: u32,
+) -> u32 {
+  let mut args = Vec::new();
+  opaque(dir_fh, &mut args);
+  opaque(name, &mut args);
+  status(&call(stream, NFS_PROGRAM, 12, &args, xid))
+}
+
+/// NFS RMDIR of raw `name` bytes in `dir_fh` → the status.
+pub(crate) fn rmdir_status(
+  stream: &mut (impl Read + Write),
+  dir_fh: &[u8],
+  name: &[u8],
+  xid: u32,
+) -> u32 {
+  let mut args = Vec::new();
+  opaque(dir_fh, &mut args);
+  opaque(name, &mut args);
+  status(&call(stream, NFS_PROGRAM, 13, &args, xid))
+}
+
+/// NFS READDIRPLUS of `dir_fh` from `cookie` with `cookieverf` → the status (so a test can present a forged or
+/// out-of-range resume cookie and a mismatched verifier without asserting success).
+pub(crate) fn readdirplus_status(
+  stream: &mut (impl Read + Write),
+  dir_fh: &[u8],
+  cookie: u64,
+  cookieverf: [u8; 8],
+  xid: u32,
+) -> u32 {
+  let mut args = Vec::new();
+  opaque(dir_fh, &mut args);
+  args.extend_from_slice(&cookie.to_be_bytes());
+  args.extend_from_slice(&cookieverf);
+  args.extend_from_slice(&512u32.to_be_bytes()); // dircount (advisory)
+  args.extend_from_slice(&8192u32.to_be_bytes()); // maxcount
+  status(&call(stream, NFS_PROGRAM, 17, &args, xid))
+}
+
 /// NFS MKDIR `name` in `dir_fh` with mode 0755 → the new directory's handle.
 pub(crate) fn mkdir(
   stream: &mut (impl Read + Write),
@@ -280,6 +425,24 @@ pub(crate) fn write_status(
   opaque(file_fh, &mut args);
   args.extend_from_slice(&0u64.to_be_bytes()); // offset
   args.extend_from_slice(&u32::try_from(data.len()).unwrap().to_be_bytes()); // count
+  args.extend_from_slice(&2u32.to_be_bytes()); // stable: FILE_SYNC
+  opaque(data, &mut args);
+  status(&call(stream, NFS_PROGRAM, 7, &args, xid))
+}
+
+/// NFS WRITE `data` at `offset` to `file_fh` (FILE_SYNC) → the status, so a test can present a colossal offset
+/// whose `offset + count` would overflow or exceed the maximum file size.
+pub(crate) fn write_at_status(
+  stream: &mut (impl Read + Write),
+  file_fh: &[u8],
+  offset: u64,
+  data: &[u8],
+  xid: u32,
+) -> u32 {
+  let mut args = Vec::new();
+  opaque(file_fh, &mut args);
+  args.extend_from_slice(&offset.to_be_bytes());
+  args.extend_from_slice(&u32::try_from(data.len()).unwrap().to_be_bytes());
   args.extend_from_slice(&2u32.to_be_bytes()); // stable: FILE_SYNC
   opaque(data, &mut args);
   status(&call(stream, NFS_PROGRAM, 7, &args, xid))
@@ -382,6 +545,83 @@ pub(crate) fn readdirplus(
     names.push(String::from_utf8_lossy(&name).into_owned());
   }
   names
+}
+
+/// NFS READDIRPLUS of `dir_fh` → the `(name, file handle)` of each entry, keeping the `name_handle` the
+/// READDIRPLUS reply hands out directly (absent when the reply carried none). This is the surface of
+/// CVE-2021-3178, where a scoped NFS export's `..` entry leaked the parent directory's handle through the
+/// listing itself — a client that follows a READDIRPLUS entry handle never does a LOOKUP, so confining LOOKUP
+/// `..` alone is not enough; the entry handle must be confined too.
+pub(crate) fn readdirplus_entries(
+  stream: &mut (impl Read + Write),
+  dir_fh: &[u8],
+  xid: u32,
+) -> Vec<(String, Option<Vec<u8>>)> {
+  let mut args = Vec::new();
+  opaque(dir_fh, &mut args);
+  args.extend_from_slice(&0u64.to_be_bytes()); // cookie
+  args.extend_from_slice(&[0u8; 8]); // cookieverf
+  args.extend_from_slice(&512u32.to_be_bytes()); // dircount (advisory)
+  args.extend_from_slice(&8192u32.to_be_bytes()); // maxcount
+  let reply = call(stream, NFS_PROGRAM, 17, &args, xid);
+  assert_eq!(status(&reply), 0, "READDIRPLUS");
+  let mut off = 4;
+  let dir_follows = u32::from_be_bytes(reply[off..off + 4].try_into().unwrap());
+  off += 4;
+  if dir_follows == 1 {
+    off += 84; // dir post_op_attr
+  }
+  off += 8; // cookieverf
+  let mut entries = Vec::new();
+  loop {
+    let follows = u32::from_be_bytes(reply[off..off + 4].try_into().unwrap());
+    off += 4;
+    if follows == 0 {
+      break;
+    }
+    off += 8; // fileid
+    let (name, next) = read_opaque(&reply, off);
+    off = next;
+    off += 8; // cookie
+    let name_attr = u32::from_be_bytes(reply[off..off + 4].try_into().unwrap());
+    off += 4;
+    if name_attr == 1 {
+      off += 84; // name_attributes
+    }
+    let name_handle = u32::from_be_bytes(reply[off..off + 4].try_into().unwrap());
+    off += 4;
+    let handle = if name_handle == 1 {
+      let (handle, next) = read_opaque(&reply, off);
+      off = next;
+      Some(handle)
+    } else {
+      None
+    };
+    entries.push((String::from_utf8_lossy(&name).into_owned(), handle));
+  }
+  entries
+}
+
+/// NFS READLINK of `link_fh` → the raw target bytes the server stored, or the status it answered. slates stores
+/// a symlink target as an opaque string and never resolves it (the kernel does, as the mounting user), so a
+/// target naming a host path comes back byte-for-byte, proving the server itself never opened it.
+pub(crate) fn readlink(
+  stream: &mut (impl Read + Write),
+  link_fh: &[u8],
+  xid: u32,
+) -> Result<Vec<u8>, u32> {
+  let mut args = Vec::new();
+  opaque(link_fh, &mut args);
+  let reply = call(stream, NFS_PROGRAM, 5, &args, xid);
+  match status(&reply) {
+    0 => {
+      // READLINK3resok: symlink_attributes (post_op_attr), then the nfspath3 target (opaque).
+      let follows = u32::from_be_bytes(reply[4..8].try_into().unwrap());
+      let off = 8 + if follows == 1 { 84 } else { 0 };
+      Ok(read_opaque(&reply, off).0)
+    }
+    answered => Err(answered),
+  }
 }
 
 /// An `nfstime3` as (seconds, nanoseconds).

@@ -405,3 +405,311 @@ fn dropping_one_name_of_a_linked_file_advances_the_survivors_ctime() {
     "the renamed file took the name"
   );
 }
+
+/// CWE-190 (integer overflow) at the write/read offset. A client's write offset plus its length must be checked,
+/// not wrapped: `off.checked_add(len)` refuses `FileTooLarge` rather than wrapping to a low offset and writing
+/// out of place, and a read at a colossal offset returns no bytes rather than underflowing `size - off`. Do:
+/// write four bytes at `u64::MAX - 2` and at `u64::MAX` (both overflow the end), read at `u64::MAX`. Expect:
+/// each write refused `FileTooLarge`, the file still empty (no wrapped write), the read returns zero bytes, and
+/// a normal write at offset 0 still works.
+#[test]
+fn a_write_or_read_at_a_colossal_offset_is_refused_or_empty_never_wrapped() {
+  let mut store = store();
+  let mut vol = volume(&mut store, 1 << 20);
+  let root = vol.root_inode(&store).unwrap();
+  let f = vol.create_file_no(&mut store, root, "f", 0o644).unwrap();
+
+  for off in [u64::MAX - 2, u64::MAX] {
+    assert_eq!(
+      vol.write(&mut store, f, off, b"data"),
+      Err(VfsError::FileTooLarge),
+      "a write whose offset {off} plus length overflows must be refused, not wrapped"
+    );
+  }
+  assert_eq!(
+    vol.stat(&store, f).unwrap().size,
+    0,
+    "the overflowing writes wrote nothing — no wraparound to a low offset"
+  );
+
+  let mut buf = vec![0u8; 16];
+  assert_eq!(
+    vol.read(&store, f, u64::MAX, &mut buf).unwrap(),
+    0,
+    "a read at a colossal offset returns nothing, never an out-of-bounds or underflowing read"
+  );
+
+  vol.write(&mut store, f, 0, b"ok").unwrap();
+  let mut got = vec![0u8; 2];
+  assert_eq!(vol.read(&store, f, 0, &mut got).unwrap(), 2);
+  assert_eq!(&got, b"ok", "a normal write reads back");
+}
+
+/// MEMORY-EXHAUSTION ATTACK → FIX (CLAUDE.md #8 no unbounded growth; CWE-789). A symlink's target is stored
+/// inline in its inode and, before the fix, was neither length-capped nor byte-charged: an agent created
+/// symlinks with wire-cap targets and committed target memory far past its quota (a real run put 81.9 MB of
+/// targets behind a 64 KiB quota). A target is a path, so it is now capped at the host/archive path ceiling
+/// (`PATH_MAX`), refused `NameTooLong` (`ENAMETOOLONG`) before any effect — a bound on each target, config-
+/// independent, that a host `symlink(2)` also imposes. Do: create a symlink one byte past the ceiling, and one
+/// exactly at it. Expect: the first refused `NameTooLong` with nothing created; the second lands and reads back.
+#[test]
+fn a_symlink_target_past_the_path_ceiling_is_refused() {
+  let mut store = store();
+  let mut vol = volume(&mut store, 1 << 20);
+  let root = vol.root_inode(&store).unwrap();
+  let ceiling = slates_archive::manifest::PATH_MAX_BYTES;
+
+  let over = "x".repeat(ceiling + 1);
+  assert_eq!(
+    vol.symlink_no(&mut store, root, "toolong", &over),
+    Err(VfsError::NameTooLong),
+    "a symlink target past the path ceiling must be refused ENAMETOOLONG, not stored"
+  );
+  assert!(
+    vol.lookup_no(&store, root, "toolong").is_err(),
+    "nothing was created for the refused over-long target"
+  );
+
+  let at = "y".repeat(ceiling);
+  let no = vol.symlink_no(&mut store, root, "ok", &at).unwrap();
+  assert_eq!(
+    vol.readlink(&store, no).unwrap().len(),
+    ceiling,
+    "a target exactly at the ceiling lands and reads back whole"
+  );
+}
+
+/// A symlink target with an interior NUL byte is refused `InvalidName`, never stored (CWE-158; POSIX.1-2017
+/// §3.271 — a pathname is a NUL-terminated string, and `symlink(2)` returns `EINVAL`). Without this, the stored
+/// target diverges from what resolves: a FUSE readlink is NUL-terminated and truncates `"a\0b"` to `"a"` at the
+/// kernel, while an NFS (length-prefixed XDR) readlink returns the whole `"a\0b"`, and a host `symlink(2)` or the
+/// placed archive would refuse or truncate it — a volume must not hold a target it cannot carry consistently. Do:
+/// create a symlink whose target has an interior NUL, then (non-vacuity) a legitimate multi-component path target.
+/// Expect: the first refused `InvalidName` with nothing created; the second (containing `/`, no NUL) lands and
+/// reads back byte-for-byte, proving the check refuses only the NUL, not a path's separators.
+#[test]
+fn a_symlink_target_with_an_interior_nul_is_refused_but_a_path_is_kept() {
+  let mut store = store();
+  let mut vol = volume(&mut store, 1 << 20);
+  let root = vol.root_inode(&store).unwrap();
+
+  assert_eq!(
+    vol.symlink_no(&mut store, root, "nul", "a\0b"),
+    Err(VfsError::InvalidName),
+    "a symlink target with an interior NUL must be refused, not stored with a byte that truncates on readlink"
+  );
+  assert!(
+    vol.lookup_no(&store, root, "nul").is_err(),
+    "nothing was created for the refused NUL target"
+  );
+
+  let path = "../some/deep/relative/target";
+  let no = vol.symlink_no(&mut store, root, "rel", path).unwrap();
+  assert_eq!(
+    &*vol.readlink(&store, no).unwrap(),
+    path,
+    "a legitimate multi-component path target (slashes, no NUL) is unaffected and reads back whole"
+  );
+}
+
+/// CVE-2026-47243 (Kata runtime-rs virtiofs guest→host, 2026): a guest-root submits a raw `FUSE_SYMLINK` whose
+/// NAME is an absolute host path (`/etc/cron.d/evil`) to drop a root-owned symlink in a sensitive host directory.
+/// Replicated here at the layer that defends it — a symlink NAME is a single path component, so `names::check`
+/// refuses one holding a separator (`/`) with `InvalidName` and nothing is created; the CVE's primitive cannot
+/// name a host path. The companion leg: a symlink whose valid name carries an absolute-path TARGET is stored (a
+/// target is just inline bytes in the RAM volume, capped and NUL-free), and reaching the host from it is R1's
+/// grant-gated landing — which writes only inside the human's named target via per-component `O_NOFOLLOW`
+/// (`land/tests/os.rs`), never `/etc/cron.d`. Do: create a symlink whose name is an absolute host path, then one
+/// whose target is. Expect: the first refused `InvalidName` with nothing created; the second stored in the volume
+/// and read back verbatim (inert until a landing a human grants, which cannot step out of its target).
+#[test]
+fn a_symlink_cannot_name_an_absolute_host_path_cve_2026_47243() {
+  let mut store = store();
+  let mut vol = volume(&mut store, 1 << 20);
+  let root = vol.root_inode(&store).unwrap();
+
+  assert_eq!(
+    vol.symlink_no(&mut store, root, "/etc/cron.d/evil", "payload"),
+    Err(VfsError::InvalidName),
+    "a symlink NAME that is an absolute host path must be refused — the CVE-2026-47243 primitive names a host path"
+  );
+  assert!(
+    vol.lookup_no(&store, root, "/etc/cron.d/evil").is_err(),
+    "nothing was created for the refused absolute-path name"
+  );
+
+  // A valid name with an absolute-path target: stored as inline RAM bytes (R1), inert until a granted landing.
+  let target = "/etc/cron.d/x";
+  let no = vol.symlink_no(&mut store, root, "evil", target).unwrap();
+  assert_eq!(
+    &*vol.readlink(&store, no).unwrap(),
+    target,
+    "an absolute-path target is a stored RAM string (no host write without a grant), read back verbatim"
+  );
+}
+
+/// A symlink inode answers only `readlink` — reading, writing, or seeking it as file content is refused `Invalid`
+/// (POSIX `EINVAL`), like a directory and an IPC name beside it in the content paths. Found by attacking: before
+/// this, `read` of a symlink's number returned its target bytes as if they were a file's content, and `write`
+/// returned `Ok(n)` while silently dropping the bytes — the body is a target string, not a content body, so the
+/// write was a no-op that still charged quota and lied about success. The kernel follows a symlink, but an SDK or
+/// a crafted FUSE/NFS op can name its inode directly. Do: make a symlink; read, write, and seek it; then a regular
+/// file. Expect: every symlink content op refused `Invalid`, the target unchanged and still readable through
+/// `readlink`; the regular file's read and write still work (non-vacuity — the refusal is symlink-specific).
+#[test]
+fn a_symlink_answers_only_readlink_not_file_content() {
+  let mut store = store();
+  let mut vol = volume(&mut store, 1 << 20);
+  let root = vol.root_inode(&store).unwrap();
+  let link = vol.symlink_no(&mut store, root, "l", "the-target").unwrap();
+  let mut buf = [0u8; 16];
+
+  assert_eq!(
+    vol.read(&store, link, 0, &mut buf),
+    Err(VfsError::Invalid),
+    "a read of a symlink's number must be EINVAL, never its target returned as file content"
+  );
+  assert_eq!(
+    vol.write(&mut store, link, 0, b"overwrite"),
+    Err(VfsError::Invalid),
+    "a write of a symlink's number must be EINVAL, never a no-op that charges quota and lies Ok"
+  );
+  assert_eq!(
+    vol.seek(&store, link, 0, slates_vfs::volume::Seek::Data),
+    Err(VfsError::Invalid),
+    "a seek of a symlink's number must be EINVAL"
+  );
+  assert_eq!(
+    vol.truncate(&mut store, link, 100),
+    Err(VfsError::Invalid),
+    "a truncate of a symlink's number must be EINVAL, never a no-op that lies Ok"
+  );
+  assert_eq!(
+    vol.admit_allocation(&mut store, link, 0, 100),
+    Err(VfsError::Invalid),
+    "an allocation of a symlink's number must be EINVAL (the match's _ => Ok formerly admitted it)"
+  );
+  assert_eq!(
+    vol.edit(&mut store, link, 0, 0, b"x"),
+    Err(VfsError::Invalid),
+    "an SDK edit of a symlink's number must be EINVAL, refused at the kind check not a later offset check"
+  );
+  assert_eq!(
+    &*vol.readlink(&store, link).unwrap(),
+    "the-target",
+    "the target is unchanged and still reachable through readlink, the symlink's one read"
+  );
+
+  // Non-vacuity: a regular file still reads and writes — the refusal is symlink-specific, not a blanket break.
+  let file = vol.create_file_no(&mut store, root, "f", 0o644).unwrap();
+  assert_eq!(vol.write(&mut store, file, 0, b"hello").unwrap(), 5);
+  assert_eq!(vol.read(&store, file, 0, &mut buf).unwrap(), 5);
+}
+
+/// The errno a content operation owes an inode of `kind`, or `None` for a regular file (it is allowed). The one
+/// place the "a content op is allowed only on a regular file" rule is stated for the matrix test below.
+fn content_refusal(kind: slates_vfs::inode::Kind) -> Option<VfsError> {
+  use slates_vfs::inode::Kind;
+  match kind {
+    Kind::File => None,
+    Kind::Dir => Some(VfsError::IsDirectory),
+    Kind::Symlink => Some(VfsError::Invalid),
+    Kind::Fifo | Kind::Socket => Some(VfsError::SpecialFileOperation),
+  }
+}
+
+/// Asserts one content operation's `result` on an inode of `kind` matches [`content_refusal`] (recomputed per
+/// call so the error need not be `Copy`).
+fn assert_content(op: &str, result: Result<(), VfsError>, kind: slates_vfs::inode::Kind) {
+  match content_refusal(kind) {
+    None => assert!(result.is_ok(), "{op} on a regular file must succeed, got {result:?}"),
+    Some(err) => assert_eq!(result, Err(err), "{op} on a {kind:?} must be refused with its errno"),
+  }
+}
+
+/// Runs every content operation on `inode` and checks each against the kind's expected refusal.
+fn check_content_ops(
+  vol: &mut Volume,
+  store: &mut Store,
+  inode: slates_vfs::ids::InodeNo,
+  kind: slates_vfs::inode::Kind,
+) {
+  let mut buf = [0u8; 8];
+  assert_content("read", vol.read(store, inode, 0, &mut buf).map(|_| ()), kind);
+  assert_content("write", vol.write(store, inode, 0, b"x").map(|_| ()), kind);
+  assert_content(
+    "seek",
+    vol.seek(store, inode, 0, slates_vfs::volume::Seek::Data).map(|_| ()),
+    kind,
+  );
+  assert_content("truncate", vol.truncate(store, inode, 4), kind);
+  assert_content("allocate", vol.admit_allocation(store, inode, 0, 4), kind);
+  assert_content("edit", vol.edit(store, inode, 0, 0, b"x").map(|_| ()), kind);
+}
+
+/// The full (kind x content operation) refusal matrix: every content op (read, write, seek, truncate, allocate,
+/// edit) succeeds on a regular file and is refused on every other kind with its exact errno — a directory
+/// `IsDirectory` (`EISDIR`), a symlink `Invalid` (`EINVAL`), an IPC name `SpecialFileOperation`. This is the
+/// generative guard the oracles lacked: `model.rs ino_of` picks only file inodes, and the differential follows a
+/// symlink by path, so neither ran a direct content op on a non-file inode — which is how the symlink content-op
+/// type confusion slipped past them. One table catches the whole class, including a future op or kind that forgets
+/// a check. Do: make an inode of each kind, run every content op on each. Expect: a file's ops succeed; every
+/// non-file's are refused with its errno.
+#[test]
+fn every_content_operation_is_refused_on_a_non_file_kind() {
+  use slates_vfs::inode::Kind;
+  let mut store = store();
+  let mut vol = volume(&mut store, 1 << 20);
+  let root = vol.root_inode(&store).unwrap();
+  let inodes = [
+    (Kind::File, vol.create_file_no(&mut store, root, "f", 0o644).unwrap()),
+    (Kind::Dir, vol.mkdir_no(&mut store, root, "d", 0o755).unwrap()),
+    (Kind::Symlink, vol.symlink_no(&mut store, root, "l", "target").unwrap()),
+    (Kind::Fifo, vol.mknod_no(&mut store, root, "p", 0o644, Kind::Fifo).unwrap()),
+    (Kind::Socket, vol.mknod_no(&mut store, root, "s", 0o644, Kind::Socket).unwrap()),
+  ];
+  for (kind, inode) in inodes {
+    check_content_ops(&mut vol, &mut store, inode, kind);
+  }
+}
+
+/// A snapshot read (`read_in`) of a non-file inode is refused with the head read's errno, not `Ok(0)` or the
+/// directory's body: a directory `IsDirectory`, a symlink `Invalid`, an IPC name `SpecialFileOperation`. Before,
+/// `read_in` relied on a directory's size being zero (answering `Ok(0)`) and did not refuse a symlink (returning
+/// its target) — a divergence from the head read, and fragile if a directory ever reported a size. The export's
+/// own symlink-as-content serialization uses `read_in_body` directly and is untouched. Do: snapshot a volume with
+/// one of each kind; `read_in` each. Expect: the file reads its bytes; every non-file is refused with its errno.
+#[test]
+fn a_snapshot_read_of_a_non_file_is_refused_like_the_head() {
+  use slates_vfs::inode::Kind;
+  let mut store = store();
+  let mut vol = volume(&mut store, 1 << 20);
+  let root = vol.root_inode(&store).unwrap();
+  let file = vol.create_file_no(&mut store, root, "f", 0o644).unwrap();
+  vol.write(&mut store, file, 0, b"hello").unwrap();
+  let dir = vol.mkdir_no(&mut store, root, "d", 0o755).unwrap();
+  let link = vol.symlink_no(&mut store, root, "l", "target").unwrap();
+  let fifo = vol.mknod_no(&mut store, root, "p", 0o644, Kind::Fifo).unwrap();
+  let snap = vol.snapshot(&mut store).unwrap();
+  let mut buf = [0u8; 16];
+  assert_eq!(
+    vol.read_in(&store, snap, file, 0, &mut buf).unwrap(),
+    5,
+    "a regular file reads its bytes at a snapshot"
+  );
+  assert_eq!(
+    vol.read_in(&store, snap, dir, 0, &mut buf),
+    Err(VfsError::IsDirectory),
+    "a snapshot read of a directory must be EISDIR, not Ok(0)"
+  );
+  assert_eq!(
+    vol.read_in(&store, snap, link, 0, &mut buf),
+    Err(VfsError::Invalid),
+    "a snapshot read of a symlink must be EINVAL, not its target"
+  );
+  assert_eq!(
+    vol.read_in(&store, snap, fifo, 0, &mut buf),
+    Err(VfsError::SpecialFileOperation),
+    "a snapshot read of an IPC name must be refused"
+  );
+}

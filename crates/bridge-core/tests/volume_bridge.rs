@@ -632,6 +632,66 @@ fn a_write_is_refused_on_a_pinned_view() {
   );
 }
 
+/// §4.16, §4.6 — a pinned immutable view owes no content-journal cache invalidations. The journal records
+/// current-head mutations; a snapshot/green-volume attachment does not see the head, so a head mutation is never
+/// staleness in its frozen view, and the one thing that changes its content — an `advance` re-pin — carries its
+/// own invalidated paths in the `Advanced` reply (server `snapshot_view::advance`), not this stream. Delivering
+/// head invalidations to a pinned view would drop caches still valid for its version and disclose current-head
+/// file names and inodes created after its snapshot. Do: with a file in place, take a current-view and a
+/// pinned-view cursor at the same journal point, then (another writer) create `posthead` on the head; ask both
+/// views for their owed invalidations. Expect: the current view is owed the `posthead` entry (non-vacuity: the
+/// mechanism works); the pinned view is owed nothing.
+#[test]
+fn a_pinned_view_owes_no_content_journal_invalidation() {
+  use slates_bridge_core::Invalidation;
+  use slates_vfs::ids::InodeNo;
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let current = rw_cx();
+  let pinned = context(
+    View::Version(1),
+    Rights {
+      read: true,
+      write: false,
+    },
+  );
+
+  // A file exists; take both views' cursors at the same journal point (after the setup churn).
+  let (root, cursor_current, cursor_pinned) = {
+    let mut b = VolumeBridge::new(VolumeId { bytes: [0; 16] }, &mut vol, &mut store);
+    let root = b.root(&current).unwrap();
+    let (f, fh) = b.create(oid(root), &current, "f", 0o644, 0).unwrap();
+    b.release(oid(f.ino), &current, fh).unwrap();
+    (root, b.seen(&current), b.seen(&pinned))
+  };
+
+  // Another writer changes the CURRENT head after the pinned view's snapshot point.
+  vol
+    .create_file_no(&mut store, InodeNo(root), "posthead", 0o644)
+    .unwrap();
+
+  let mut current_owed = Vec::new();
+  let mut pinned_owed = Vec::new();
+  {
+    let mut b = VolumeBridge::new(VolumeId { bytes: [0; 16] }, &mut vol, &mut store);
+    b.invalidations(&current, cursor_current, &mut current_owed)
+      .unwrap();
+    b.invalidations(&pinned, cursor_pinned, &mut pinned_owed)
+      .unwrap();
+  }
+  assert!(
+    current_owed.iter().any(|inv| matches!(
+      inv,
+      Invalidation::Entry { parent, name, .. } if *parent == root && name == "posthead"
+    )),
+    "the current view is owed the head change (non-vacuity): {current_owed:?}"
+  );
+  assert!(
+    pinned_owed.is_empty(),
+    "a pinned immutable view was owed a current-head invalidation it must never see: {pinned_owed:?}"
+  );
+}
+
 /// Unlink-while-open works end to end through the bridge via the OPEN reference (the handle a
 /// create holds): a created file survives an unlink and still serves reads, and is reclaimed once
 /// its open handle is released. The open reference is transport-neutral — both FUSE and NFS hold an
@@ -1312,6 +1372,178 @@ fn an_alias_homed_in_another_directory_inside_the_scope_is_listed_and_found() {
   assert_eq!(scoped.lookup(oid(b), &cx, "alias").unwrap().ino, f.ino);
 }
 
+/// AUD-29-76, the scoped listing PAGINATED (not just one page). A directory inside the scope can hold entries the
+/// scope drops — hard-link aliases of a file homed outside it — interleaved with in-scope files. If the scoped
+/// readdir filtered each inner page in isolation, a page that is entirely out-of-scope aliases would come back
+/// empty, and a client paging by cookie reads an empty page as end-of-directory — silently missing the in-scope
+/// files in later pages. Do: in `/shared/d` link an out-of-scope file in as twenty aliases `a00..a19` (sorted
+/// before) and create two in-scope files `z0`, `z1`; page the scoped view by cookie with a small limit, as a
+/// client does. Expect: `z0` and `z1` are both listed (no in-scope entry is lost behind a fully-dropped page),
+/// and no alias ever appears.
+#[test]
+fn a_scoped_directory_paged_by_cookie_never_loses_an_in_scope_entry_behind_dropped_pages() {
+  use slates_bridge_core::scoped::ScopedBridge;
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let mut inner = VolumeBridge::new(VolumeId { bytes: [0; 16] }, &mut vol, &mut store);
+  let cx = rw_cx();
+  let (shared, _, _) = shared_and_private(&mut inner, &cx);
+  let d = inner.mkdir(oid(shared), &cx, "d", 0o755).unwrap().ino;
+  // A file homed OUTSIDE the scope, hard-linked into the in-scope directory many times: each alias is dropped by
+  // the scope (homed elsewhere). Many of them, so that in the directory's (hash) order some run of a page's worth
+  // falls between in-scope files — the case that makes a scoped page come back empty with more still to come.
+  let root = inner.root(&cx).unwrap();
+  let outside = inner.mkdir(oid(root), &cx, "outside", 0o755).unwrap().ino;
+  // One name space ("e{nn}"), so entries interleave by the directory's own order rather than clustering by
+  // prefix; scope-membership is set by HOME, not name. A spread subset is in-scope (homed in `d`); the rest are
+  // distinct out-of-scope inodes linked in (dropped by the scope). A late-ordered in-scope entry sitting behind a
+  // page's worth of droppable ones is the case that loses it.
+  let in_scope_ix: [u32; 4] = [1, 2, 3, 67];
+  let mut in_scope: Vec<String> = Vec::new();
+  for n in 0..68u32 {
+    let name = format!("e{n:02}");
+    if in_scope_ix.contains(&n) {
+      let (z, zfh) = inner.create(oid(d), &cx, &name, 0o644, 0).unwrap();
+      inner.release(oid(z.ino), &cx, zfh).unwrap();
+      in_scope.push(name);
+    } else {
+      let (g, gfh) = inner.create(oid(outside), &cx, &format!("g{n:02}"), 0o644, 0).unwrap();
+      inner.release(oid(g.ino), &cx, gfh).unwrap();
+      inner.link(oid(g.ino), oid(d), &cx, &name).unwrap();
+    }
+  }
+
+  let mut scoped = ScopedBridge::new(&mut inner, shared);
+  // Page as a client does: resume at the last entry's cookie, stop at the first empty page (its EOF signal, the
+  // same rule NFS encodes at procedures.rs `eof = sent == rows.len() && rows.len() < limit`).
+  let mut seen: Vec<String> = Vec::new();
+  let mut cookie = 0u64;
+  for _ in 0..200 {
+    let page = scoped.readdir(oid(d), &cx, 0, cookie, 4).unwrap();
+    let Some(last) = page.last() else { break };
+    cookie = last.cookie;
+    for entry in &page {
+      if entry.name != "." && entry.name != ".." {
+        seen.push(entry.name.clone());
+      }
+    }
+  }
+  assert!(
+    seen.iter().all(|n| !n.starts_with('a')),
+    "an out-of-scope alias leaked into the scoped listing: {seen:?}"
+  );
+  let missed: Vec<&String> = in_scope.iter().filter(|z| !seen.contains(z)).collect();
+  assert!(
+    missed.is_empty(),
+    "a paged scoped listing lost in-scope files behind fully-dropped pages: missed {missed:?}, saw {seen:?}"
+  );
+}
+
+/// AUD-29-76, §4.6 (the scope invariant "nothing outside is ever shown", `scoped.rs`). The cache-invalidation
+/// stream a scoped view hands its transport must name only objects within the scope. An `Inode`/`Entry`
+/// invalidation carries a real inode number and, for an entry, a real file name, drawn from the *whole volume's*
+/// journal; forwarded unfiltered, a tenant confined to one directory would learn the inode numbers, change
+/// activity, and even the file names of other tenants' directories in the same volume — a cross-scope
+/// side-channel. Do: build `/shared` (the scope) and `/private/secret` (outside it), take the scoped cursor,
+/// then — as another attachment (the SDK path) would — write `private/secret`, create `private/leaked`, and
+/// create one in-scope `shared/visible`; read the scoped view's owed invalidations. Expect: not one names
+/// `private`, `secret`, or `leaked`; the in-scope `visible` is present (non-vacuity: the filter is not blanket).
+#[test]
+fn a_scoped_view_never_leaks_an_out_of_scope_cache_invalidation() {
+  use slates_bridge_core::Invalidation;
+  use slates_bridge_core::scoped::ScopedBridge;
+  use slates_vfs::ids::InodeNo;
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let cx = rw_cx();
+
+  // Build the scope and an out-of-scope neighbour, then take the scoped cursor so only later changes appear.
+  let (shared, private, secret, cursor) = {
+    let mut inner = VolumeBridge::new(VolumeId { bytes: [0; 16] }, &mut vol, &mut store);
+    let (shared, private, secret) = shared_and_private(&mut inner, &cx);
+    let mut scoped = ScopedBridge::new(&mut inner, shared);
+    let cursor = scoped.seen(&cx);
+    (shared, private, secret, cursor)
+  };
+
+  // Another attachment changes out-of-scope objects, and one in-scope object for non-vacuity.
+  vol
+    .write(&mut store, InodeNo(secret), 0, b"top secret bytes")
+    .unwrap();
+  let leaked = vol
+    .create_file_no(&mut store, InodeNo(private), "leaked", 0o600)
+    .unwrap();
+  vol
+    .create_file_no(&mut store, InodeNo(shared), "visible", 0o644)
+    .unwrap();
+
+  // The scoped view reads its owed invalidations.
+  let mut owed = Vec::new();
+  {
+    let mut inner = VolumeBridge::new(VolumeId { bytes: [0; 16] }, &mut vol, &mut store);
+    let mut scoped = ScopedBridge::new(&mut inner, shared);
+    scoped.invalidations(&cx, cursor, &mut owed).unwrap();
+  }
+
+  // Not one invalidation may name an out-of-scope object.
+  for inv in &owed {
+    match inv {
+      Invalidation::Inode { ino, .. } => assert!(
+        *ino != private && *ino != secret && *ino != leaked.0,
+        "an out-of-scope inode leaked through the scoped invalidation stream: {inv:?}"
+      ),
+      Invalidation::Entry { parent, name, .. } => assert!(
+        *parent != private && *parent != secret,
+        "an out-of-scope entry leaked ({name}) through the scoped invalidation stream: {inv:?}"
+      ),
+    }
+  }
+  // Non-vacuity: the in-scope change is still delivered — the filter is confinement, not a blanket drop.
+  assert!(
+    owed.iter().any(|inv| matches!(
+      inv,
+      Invalidation::Entry { parent, name, .. } if *parent == shared && name == "visible"
+    )),
+    "the in-scope invalidation was dropped — the stream is not vacuously empty: {owed:?}"
+  );
+}
+
+/// §4.6 (AppleDouble sidecars under a scoped export). A sidecar's derived inode (owner | `DERIVED_BIT`) names no
+/// real inode of its own; it lives at its owner, so it is within the scope exactly when its owner is. A scoped
+/// client must be able to read the sidecar of a file in its own scope, and must not reach the sidecar of one
+/// outside it. Do: in `/shared` (the scope) create `f` and its sidecar, in `/private` (outside) create `s` and
+/// its sidecar; serve `shared` scoped and `getattr` both sidecars by their derived inode. Expect: the in-scope
+/// sidecar is read (its owner is in scope); the out-of-scope one is `NotFound`.
+#[test]
+fn a_scoped_view_reaches_an_in_scope_sidecar_and_refuses_an_out_of_scope_one() {
+  use slates_bridge_core::scoped::ScopedBridge;
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let cx = rw_cx();
+  let (shared, f_sidecar, s_sidecar) = {
+    let mut inner = VolumeBridge::new(VolumeId { bytes: [0; 16] }, &mut vol, &mut store);
+    let root = inner.root(&cx).unwrap();
+    let shared = inner.mkdir(oid(root), &cx, "shared", 0o755).unwrap().ino;
+    let private = inner.mkdir(oid(root), &cx, "private", 0o700).unwrap().ino;
+    inner.create(oid(shared), &cx, "f", 0o644, 0).unwrap();
+    let f_view = inner.appledouble_create(oid(shared), &cx, "f", true).unwrap();
+    inner.create(oid(private), &cx, "s", 0o644, 0).unwrap();
+    let s_view = inner.appledouble_create(oid(private), &cx, "s", true).unwrap();
+    (shared, f_view.ino, s_view.ino)
+  };
+  let mut inner = VolumeBridge::new(VolumeId { bytes: [0; 16] }, &mut vol, &mut store);
+  let mut scoped = ScopedBridge::new(&mut inner, shared);
+  assert!(
+    scoped.getattr(oid(f_sidecar), &cx).is_ok(),
+    "the sidecar of an in-scope file must be reachable through the scoped view"
+  );
+  assert_eq!(
+    scoped.getattr(oid(s_sidecar), &cx),
+    Err(VfsError::NotFound),
+    "the sidecar of an out-of-scope file must not be reachable"
+  );
+}
+
 /// A-61 (a mount taken over after its daemon died). Do: serve a volume holding `lost` and `kept` through a bridge
 /// told `lost` lost writes; flush `lost` twice through a handle the dead daemon issued (one this bridge never
 /// did), then fsync it twice and flush it; flush `kept` through another; flush `lost` through a handle opened
@@ -1433,6 +1665,49 @@ fn dot_and_dotdot_resolve_and_never_climb_out_of_a_root_or_a_scope() {
     Ok(shared),
     "the scope's `..` is the scope"
   );
+}
+
+/// Attack the scoped-readdir loop (8adc3738) with a crafted resume cookie: it must terminate and never emit an
+/// out-of-scope entry, whatever cookie a client resumes from (a forged one, or one landing in a dropped run).
+/// Do: in `/shared/d`, out-of-scope aliases plus one in-scope `z`; read with `cookie = u64::MAX`, and with a
+/// cookie taken mid-listing. Expect: the `u64::MAX` resume returns empty (past the end, no hang); no page ever
+/// contains an alias.
+#[test]
+fn a_scoped_readdir_with_a_crafted_cookie_terminates_and_leaks_no_alias() {
+  use slates_bridge_core::scoped::ScopedBridge;
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let mut inner = VolumeBridge::new(VolumeId { bytes: [0; 16] }, &mut vol, &mut store);
+  let cx = rw_cx();
+  let (shared, _, _) = shared_and_private(&mut inner, &cx);
+  let d = inner.mkdir(oid(shared), &cx, "d", 0o755).unwrap().ino;
+  let root = inner.root(&cx).unwrap();
+  let outside = inner.mkdir(oid(root), &cx, "out", 0o755).unwrap().ino;
+  for n in 0..12u32 {
+    let (g, gfh) = inner.create(oid(outside), &cx, &format!("g{n:02}"), 0o644, 0).unwrap();
+    inner.release(oid(g.ino), &cx, gfh).unwrap();
+    inner.link(oid(g.ino), oid(d), &cx, &format!("a{n:02}")).unwrap();
+  }
+  let (z, zfh) = inner.create(oid(d), &cx, "z", 0o644, 0).unwrap();
+  inner.release(oid(z.ino), &cx, zfh).unwrap();
+
+  let mut scoped = ScopedBridge::new(&mut inner, shared);
+  // A forged cookie past every entry: the loop must stop (empty), not spin.
+  let past = scoped.readdir(oid(d), &cx, 0, u64::MAX, 4).unwrap();
+  assert!(past.is_empty(), "a resume past the end returns nothing: {past:?}");
+  // Paging from 0 with a crafted small limit: terminates, never shows an alias.
+  let mut cookie = 0u64;
+  let mut pages = 0u32;
+  loop {
+    let page = scoped.readdir(oid(d), &cx, 0, cookie, 2).unwrap();
+    for e in &page {
+      assert!(!e.name.starts_with('a'), "an out-of-scope alias leaked: {:?}", e.name);
+    }
+    let Some(last) = page.last() else { break };
+    cookie = last.cookie;
+    pages += 1;
+    assert!(pages < 1000, "the scoped readdir loop did not terminate");
+  }
 }
 
 /// §4.6 A-9 / AC-4.12 (DAX confinement, the "one predicate per method" discipline): a DAX map is minted for an

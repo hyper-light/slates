@@ -4,6 +4,7 @@
 // Test harness code: an unwrap here is a failed test.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+use proptest::prelude::*;
 use slates_merge::ops_doc::{Op, OpKind, OpsDoc};
 
 /// Builds a document from (path, kind, at, len) tuples in the given order.
@@ -204,4 +205,81 @@ fn hostile_documents_refuse_by_type() {
   let op_start = 16 + (4 + 1) + (4 + 1);
   bad_kind[op_start] = 0xff;
   assert_eq!(OpsDoc::decode(&bad_kind), Err(DocDecodeError::BadKind));
+}
+
+/// Injection: a path a merge keyed carries control bytes the tree path's `names::check` would reject,
+/// because the merge service canonicalizes a path by only trimming a leading slash
+/// (`merge_service::canonical_path`) — an embedded NUL, the document's own `SLOP` magic as text, and bytes
+/// shaped like a four-byte length prefix. Each round-trips through the length-prefixed encoding
+/// byte-exact and injects nothing: the decoded document has the same paths (none split by a control byte,
+/// none merged), the same number of ops, and re-encodes to the same bytes (the identity is unchanged).
+/// This is why the codec needs no name check of its own — every field is length-delimited, never a
+/// separator a payload could forge (§4.16).
+#[test]
+fn a_path_with_control_and_framing_bytes_round_trips_without_injection() {
+  let original = doc(&[
+    ("a\u{0}b", OpKind::Insert, 0, 1),
+    ("SLOP", OpKind::Overwrite, 2, 3),
+    ("\u{4}\u{0}\u{0}\u{0}x", OpKind::Insert, 4, 5),
+  ]);
+  let bytes = original.encode();
+  let decoded = OpsDoc::decode(&bytes).expect("a control-laden document round-trips");
+  assert_eq!(
+    decoded.paths.paths(),
+    original.paths.paths(),
+    "every path is byte-identical; no control byte split or merged one"
+  );
+  assert_eq!(
+    decoded.ops.len(),
+    3,
+    "three ops in, three ops out: no entry injected or dropped"
+  );
+  assert_eq!(
+    decoded.encode(),
+    bytes,
+    "the identity is unchanged by the round trip"
+  );
+}
+
+/// A path whose bytes are not valid UTF-8 is refused `BadPath` at decode, never decoded into a lossy or
+/// replaced string: the single path of a good document (its one byte at offset 20, after the 16-byte
+/// header and the 4-byte length prefix) set to a lone `0xFF` is a hostile wire document, refused by type,
+/// never a panic.
+#[test]
+fn a_path_that_is_not_utf8_is_refused_by_type() {
+  use slates_merge::ops_doc::DocDecodeError;
+  let mut bytes = doc(&[("a", OpKind::Insert, 0, 1)]).encode();
+  bytes[20] = 0xFF;
+  assert_eq!(OpsDoc::decode(&bytes), Err(DocDecodeError::BadPath));
+}
+
+/// A decode is a typed result and, when it succeeds, re-encoding is a fixed point: decoding those bytes and
+/// re-encoding yields the same bytes, so one document identity has no second wire spelling.
+fn assert_canonical_or_typed(bytes: &[u8]) {
+  if let Ok(doc) = OpsDoc::decode(bytes) {
+    let once = doc.encode();
+    assert_eq!(
+      OpsDoc::decode(&once).map(|d| d.encode()).ok(),
+      Some(once),
+      "re-encoding a decoded document is a fixed point"
+    );
+  }
+}
+
+proptest! {
+  #![proptest_config(slates_test_seeds::unseeded(proptest::test_runner::Config::default()))]
+
+  /// Hostile-input fuzz of the ops-document decoder (the merge wire format, §4.16): any byte string decodes to a
+  /// typed result, never a panic (proptest fails on one), and a document that decodes is canonical. The second
+  /// arm prepends a well-formed magic+version header (the first 8 bytes of a real document) so the fuzz reaches
+  /// the count, path and op parsing with a hostile body, not just the magic gate — the bounds checks that keep a
+  /// wild path or op count from allocating (CWE-789) are exercised with arbitrary counts.
+  #[test]
+  fn any_bytes_decode_to_a_typed_result_never_a_panic(body in proptest::collection::vec(any::<u8>(), 0..512)) {
+    assert_canonical_or_typed(&body);
+    let mut framed = doc(&[("a", OpKind::Insert, 0, 1)]).encode();
+    framed.truncate(8); // keep only MAGIC + VERSION, then a hostile body
+    framed.extend_from_slice(&body);
+    assert_canonical_or_typed(&framed);
+  }
 }

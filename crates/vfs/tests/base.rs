@@ -2223,3 +2223,146 @@ fn an_outsider_edit_beneath_an_untouched_base_file_asks_for_its_recall() {
   );
   assert_eq!(store.recall_gate.outside_recalls(), 3);
 }
+
+/// CVE-2026-77179 (a host VMM's virtio-fs server followed a symlink swapped in at a path it reopened by name,
+/// reading an arbitrary host file) for the OVERLAY's read side. slates never reopens a base path by name after it
+/// has witnessed it (the content is in RAM), and the base seam opens every path component `O_DIRECTORY|O_NOFOLLOW`,
+/// so a host swap of a base path never redirects the agent to host content. The RAM-volume leg is
+/// `lifetime::an_open_handle_survives_unlink_and_recreate_reaching_the_original_inode`; this is the base/overlay
+/// leg, and it exercises this session's symlink content-op refusal on a base symlink. Do: edit a base file
+/// (witnessing it), then from the host (1) swap its content, (2) remove it, (3) swap a base file to a symlink to a
+/// sensitive host path, (4) swap an intermediate directory to a symlink to a host directory. Expect: the agent
+/// keeps reading its witnessed copy through (1) and (2); a read of a base path the host turned into a symlink is
+/// `Invalid` (never the symlink's host target as content); a resolve through a directory the host turned into a
+/// symlink is `NotDirectory` (never descended into the host target).
+#[test]
+fn an_overlay_never_follows_a_base_path_the_host_swaps_under_it_cve_2026_77179() {
+  let mut host = SimHost::new();
+  host.replace_file("/witnessed", b"ORIGINAL");
+  host.mkdir("/realdir");
+  host.replace_file("/realdir/f", b"inside-realdir");
+  host.replace_file("/victim", b"VICTIM");
+  let mut store = store();
+  let mut vol = overlay(&mut host, &mut store);
+
+  // Witness `/witnessed` by editing it: its content now lives in the volume's RAM, not the host.
+  let w = vol.with_host(&mut host).resolve(&mut store, "/witnessed").unwrap().inode;
+  vol.with_host(&mut host).write(&mut store, w, 0, b"EDITED!!").unwrap();
+
+  // (1) Host swaps the content underneath, (2) host removes it: the agent still reads its witnessed copy.
+  host.replace_file("/witnessed", b"SWAPPED!!");
+  assert_eq!(
+    read_all(&mut vol, &mut host, &mut store, "/witnessed").unwrap(),
+    b"EDITED!!",
+    "a host content swap must not reach the agent's witnessed copy"
+  );
+  host.remove("/witnessed");
+  assert_eq!(
+    read_all(&mut vol, &mut host, &mut store, "/witnessed").unwrap(),
+    b"EDITED!!",
+    "a host removal must not strip the agent's witnessed copy"
+  );
+
+  // (3) Host turns a base file into a symlink to a sensitive host path: the agent's read is refused, never the
+  // symlink's host target returned as content (this session's symlink content-op refusal, on a base symlink).
+  host.remove("/victim");
+  host.symlink("/victim", "/etc/passwd");
+  assert_eq!(
+    read_all(&mut vol, &mut host, &mut store, "/victim"),
+    Err(VfsError::Invalid),
+    "a base path the host swapped into a symlink must refuse the read, never return its host target as content"
+  );
+
+  // (4) Host turns an intermediate directory into a symlink to a host directory: the resolve does not descend
+  // through it into the host target.
+  host.remove("/realdir/f");
+  host.remove("/realdir");
+  host.symlink("/realdir", "/etc");
+  assert_eq!(
+    vol
+      .with_host(&mut host)
+      .resolve(&mut store, "/realdir/f")
+      .map(|located| located.inode),
+    Err(VfsError::NotDirectory),
+    "a directory the host swapped into a symlink must not be descended into the host target"
+  );
+}
+
+/// The canonical overlay / container escape (CWE-59, symlink following out of the lower directory): a base
+/// directory that LEGITIMATELY holds a symlink whose target escapes the overlaid subtree — an absolute host path
+/// (`/etc/passwd`) or a `../../..` climb — must never be followed by the overlay's own resolver into the host
+/// filesystem. slates resolves one path component at a time and stops at a symlink: a symlink as a non-terminal
+/// component is `NotDirectory` (never walked through), and a symlink as the terminal component is returned for the
+/// caller to `readlink`, so the kernel does any following — against the mount, as the agent's own uid, the control
+/// plane being same-uid (`crates/ipc/src/rendezvous.rs` refuses a peer whose `SO_PEERCRED` uid differs). This is
+/// the STATIC companion to the dynamic host-swap case (`...cve_2026_77179`): there the host swaps a symlink in
+/// under a witnessed path; here the base holds the escaping symlinks from the start and they are reached through
+/// ordinary resolution. Do: overlay a base with `evil -> /etc/passwd`, `up -> ../../../../etc`, and a real
+/// `d/inner`. Expect: resolving `evil`/`up` returns the symlink terminal and `readlink` returns the RAW target
+/// (slates never opens it); resolving THROUGH either (`evil/x`, `up/x`, `evil/../etc`) is `NotDirectory`; a content
+/// read of an escaping symlink is `Invalid` (this session's symlink content-op refusal, reaching a `BaseLink`); a
+/// literal `..` component is `NotFound` (slates does not climb — the kernel resolves `..` before a request
+/// arrives); and a real base path still resolves and reads (non-vacuity).
+#[test]
+fn an_overlay_never_follows_a_base_symlink_out_of_the_overlaid_subtree_cwe_59() {
+  let mut host = SimHost::new();
+  host.symlink("/evil", "/etc/passwd");
+  host.symlink("/up", "../../../../etc");
+  host.mkdir("/d");
+  host.replace_file("/d/inner", b"legitimate");
+  let mut store = store();
+  let mut vol = overlay(&mut host, &mut store);
+
+  // Each escaping symlink resolves as a TERMINAL component; readlink returns the RAW target, which slates reports
+  // and never opens. The kernel, not slates, resolves the target (against the mount, as the agent's own uid).
+  let evil = vol
+    .with_host(&mut host)
+    .resolve(&mut store, "/evil")
+    .unwrap()
+    .inode;
+  assert_eq!(&*vol.readlink(&store, evil).unwrap(), "/etc/passwd");
+  let up = vol
+    .with_host(&mut host)
+    .resolve(&mut store, "/up")
+    .unwrap()
+    .inode;
+  assert_eq!(&*vol.readlink(&store, up).unwrap(), "../../../../etc");
+
+  // Resolving THROUGH either symlink is refused NotDirectory — the resolver stops at a symlink component and never
+  // walks it into the host filesystem (no /etc/passwd, no climb above the overlaid root).
+  for path in ["/evil/anything", "/up/anything", "/evil/../etc", "/up/passwd"] {
+    assert_eq!(
+      vol
+        .with_host(&mut host)
+        .resolve(&mut store, path)
+        .map(|l| l.inode),
+      Err(VfsError::NotDirectory),
+      "resolving through a base symlink must not follow it into the host: {path}"
+    );
+  }
+
+  // A content read of an escaping base symlink is Invalid (the symlink content-op refusal reaches a BaseLink): the
+  // symlink's target bytes are never returned as file content, only through readlink.
+  assert_eq!(
+    read_all(&mut vol, &mut host, &mut store, "/evil"),
+    Err(VfsError::Invalid),
+    "a content read of a base symlink must refuse, never return its target as content"
+  );
+
+  // A literal `..` path component is a name lookup, not a climb: slates does not implement `..` (the kernel
+  // resolves it before a request arrives), so it is NotFound — it can never walk above the overlaid root.
+  assert_eq!(
+    vol
+      .with_host(&mut host)
+      .resolve(&mut store, "/../etc")
+      .map(|l| l.inode),
+    Err(VfsError::NotFound),
+    "a literal `..` component must not climb above the overlaid root"
+  );
+
+  // Non-vacuity: a real base path still resolves and reads, so the refusals above are symlink/escape-specific.
+  assert_eq!(
+    read_all(&mut vol, &mut host, &mut store, "/d/inner").unwrap(),
+    b"legitimate"
+  );
+}

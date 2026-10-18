@@ -556,6 +556,88 @@ fn a_write_then_read_round_trips_over_the_export() {
   assert_eq!(data, payload, "the bytes round-trip");
 }
 
+/// CVE-2022-49280 (Linux nfsd `nfssvc_decode_writeargs` underflow, CVSS 9.8): the kernel trusted WRITE's
+/// advisory byte count, so a negative/huge count became `ULONG_MAX` and `svc_fill_write_vector` walked off the
+/// request's pages, reading out-of-bounds memory. slates ignores the advisory count — `write_result` decodes it
+/// into `_count` and takes the opaque **data length** as authoritative, bounds-checked against the offered
+/// transfer size and the bytes actually present. Proven here: a count of `u32::MAX` with six bytes of data
+/// writes six bytes (the count is ignored, not walked), and a data-length prefix claiming more bytes than the
+/// request carries is refused `NFS3ERR_INVAL` before anything is read — never an overrun. The file ends holding
+/// exactly the six bytes, never the lie's.
+#[test]
+fn a_write_count_that_lies_or_overruns_the_request_never_reads_out_of_bounds() {
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let mut bridge = VolumeBridge::new(VolumeId { bytes: [0x11; 16] }, &mut vol, &mut store);
+  let cx = write_cx();
+  let root_ino = bridge.root(&cx).unwrap();
+  let (created, _fh) = bridge.create(oid(root_ino), &cx, "data", 0o644, 0).unwrap();
+  let file_fh = slates_bridge_nfs::FileHandle {
+    volume: VolumeId { bytes: [0x11; 16] },
+    inode: created.ino,
+    generation: 0,
+    attachment: 0,
+    token: [0u8; 16],
+  }
+  .to_fh();
+  let mut export = Export::new(
+    &mut bridge,
+    VolumeId { bytes: [0x11; 16] },
+    Principal::Uid { uid: 0 },
+    Rights {
+      read: true,
+      write: true,
+    },
+  )
+  .unwrap();
+
+  // A count of u32::MAX with six bytes of data: the data length is authoritative, so six bytes are written.
+  let mut lying = XdrWriter::new();
+  file_fh.encode(&mut lying);
+  lying.u64(0);
+  lying.u32(u32::MAX);
+  lying.u32(2);
+  lying.opaque(b"slates");
+  let reply = export
+    .serve_nfs(NFSPROC3_WRITE, &mut XdrReader::new(lying.as_slice()))
+    .unwrap();
+  assert_eq!(
+    XdrReader::new(&reply).u32().unwrap(),
+    Nfsstat3::Ok.wire(),
+    "the lying count is ignored; the six data bytes are written"
+  );
+
+  // A data-length prefix claiming a thousand bytes with only four present overruns nothing: INVAL.
+  let mut overrun = XdrWriter::new();
+  file_fh.encode(&mut overrun);
+  overrun.u64(0);
+  overrun.u32(4);
+  overrun.u32(2);
+  overrun.u32(1000); // the opaque length prefix claims a thousand bytes...
+  overrun.fixed(&[0xAB; 4]); // ...but only four follow
+  let reply = export
+    .serve_nfs(NFSPROC3_WRITE, &mut XdrReader::new(overrun.as_slice()))
+    .unwrap();
+  assert_eq!(
+    XdrReader::new(&reply).u32().unwrap(),
+    Nfsstat3::Inval.wire(),
+    "a data length that overruns the request is refused before any read"
+  );
+
+  // The file holds exactly the six bytes the first write stored, never the lie's count of bytes.
+  let mut rargs = XdrWriter::new();
+  file_fh.encode(&mut rargs);
+  rargs.u64(0);
+  rargs.u32(64);
+  let rreply = export
+    .serve_nfs(NFSPROC3_READ, &mut XdrReader::new(rargs.as_slice()))
+    .unwrap();
+  let mut rr = XdrReader::new(&rreply);
+  assert_eq!(rr.u32().unwrap(), Nfsstat3::Ok.wire());
+  PostOpAttr::decode(&mut rr).unwrap();
+  assert_eq!(rr.u32().unwrap(), 6, "the file is the six bytes written, not u32::MAX");
+}
+
 /// COMMIT over the export reports the file's writes stable and returns the same `writeverf3` a WRITE
 /// returns — a client's `fsync` (which the kernel issues as COMMIT) succeeds, since every slates
 /// write already lands FILE_SYNC. Without COMMIT the fsync would fail PROC_UNAVAIL. The matching
@@ -965,6 +1047,78 @@ fn a_rename_over_the_export_moves_the_entry() {
   assert_eq!(
     attr.fileid, file_ino,
     "the same object moved to the new name"
+  );
+}
+
+/// "Test at extremes": a SETATTR that sets the size to `u64::MAX` (truncate-to-colossal via the metadata path —
+/// a different route than a WRITE at a huge offset) is a sparse hole that charges the quota **nothing**, never
+/// overflows the page arithmetic, and never wedges the daemon. Proven on a `Bounded { 1 GiB }` volume: the
+/// colossal SETATTR is accepted (it would be `BudgetExceeded` had the hole been charged), the size reads back as
+/// the colossal value, and — the point — a real write to a *second* file still succeeds, so the hole exhausted no
+/// quota (a truncate that extends charges nothing, model.rs §4.5; §4.2, §4.6). NB `used` mirrors the logical size
+/// here, not the physical bytes — a reporting-fidelity nit for Ada, not a DoS, since the quota charge is the
+/// separate, physical one proven below.
+#[test]
+fn a_setattr_to_a_colossal_size_is_a_sparse_hole_that_charges_no_quota() {
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let mut bridge = VolumeBridge::new(VolumeId { bytes: [0x11; 16] }, &mut vol, &mut store);
+  let cx = write_cx();
+  let root_ino = bridge.root(&cx).unwrap();
+  let (f, _) = bridge.create(oid(root_ino), &cx, "f", 0o644, 0).unwrap();
+  let (g, _) = bridge.create(oid(root_ino), &cx, "g", 0o644, 0).unwrap();
+  let fh_f = fh_of(f.ino);
+  let fh_g = fh_of(g.ino);
+  let mut export = Export::new(
+    &mut bridge,
+    VolumeId { bytes: [0x11; 16] },
+    Principal::Uid { uid: 0 },
+    Rights {
+      read: true,
+      write: true,
+    },
+  )
+  .unwrap();
+
+  // SETATTR f with only the size set, to the largest possible value.
+  let mut args = XdrWriter::new();
+  fh_f.encode(&mut args);
+  args.bool(false); // mode unset
+  args.bool(false); // uid unset
+  args.bool(false); // gid unset
+  args.bool(true); // size set...
+  args.u64(u64::MAX); // ...to the largest possible
+  args.u32(0); // atime DONT_CHANGE
+  args.u32(0); // mtime DONT_CHANGE
+  args.bool(false); // guard unset
+  let reply = export
+    .serve_nfs(NFSPROC3_SETATTR, &mut XdrReader::new(args.as_slice()))
+    .unwrap();
+  assert_eq!(
+    status_of(&reply),
+    Nfsstat3::Ok.wire(),
+    "the colossal size is accepted as a sparse hole, not refused BudgetExceeded for a charged u64::MAX"
+  );
+  assert_eq!(
+    getattr_of(&mut export, &fh_f).size,
+    u64::MAX,
+    "the size reads back as the colossal value"
+  );
+
+  // The point: the sparse hole charged no quota, so a real write to a second file still succeeds.
+  let mut wargs = XdrWriter::new();
+  fh_g.encode(&mut wargs);
+  wargs.u64(0);
+  wargs.u32(6);
+  wargs.u32(2);
+  wargs.opaque(b"slates");
+  let wreply = export
+    .serve_nfs(NFSPROC3_WRITE, &mut XdrReader::new(wargs.as_slice()))
+    .unwrap();
+  assert_eq!(
+    XdrReader::new(&wreply).u32().unwrap(),
+    Nfsstat3::Ok.wire(),
+    "a real write still succeeds — the colossal sparse size exhausted no quota"
   );
 }
 
@@ -2872,6 +3026,37 @@ fn the_callers_directory_replaces_one_it_does_not_own_in_its_own_sticky_director
       "the caller's directory replaces one owned by {owner} in the caller's sticky directory"
     );
   }
+}
+
+/// Reserved and malformed names in RENAME, the sibling of the UNCHECKED CREATE "." echo (§4.6,
+/// docs/bugs/2026-10-13-nfs-create-echoes-dot-names.md): a rename whose target component is `.`, `..`
+/// or carries a separator is refused by `names::check` (volume.rs `admit_rename`), and one whose *source*
+/// component is `.` or `..` must not resolve to the directory or its parent and move it — the lookup of
+/// `from_name` is not name-checked, so this proves `.`/`..` never name a renamable entry. Every case is
+/// refused (never `NFS3_OK`), and the tree is intact afterwards: `f` still there, no `x` or `y` created.
+#[test]
+fn rename_refuses_reserved_and_malformed_names() {
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let mut bridge = VolumeBridge::new(VolumeId { bytes: [0x11; 16] }, &mut vol, &mut store);
+  let cx = write_cx();
+  let root_ino = bridge.root(&cx).unwrap();
+  let dir = bridge.mkdir(oid(root_ino), &cx, "d", 0o755).unwrap();
+  bridge.create(oid(dir.ino), &cx, "f", 0o644, 0).unwrap();
+  let d = fh_of(dir.ino);
+  let mut caller = export_as(&mut bridge, 0, 0);
+  let ok = Nfsstat3::Ok.wire();
+  // A target component that is reserved or carries a separator is refused.
+  assert_ne!(rename_status(&mut caller, &d, "f", &d, "."), ok, "rename to \".\"");
+  assert_ne!(rename_status(&mut caller, &d, "f", &d, ".."), ok, "rename to \"..\"");
+  assert_ne!(rename_status(&mut caller, &d, "f", &d, "a/b"), ok, "rename to \"a/b\"");
+  // A source component that is `.` or `..` must not rename the directory itself or its parent.
+  assert_ne!(rename_status(&mut caller, &d, ".", &d, "x"), ok, "rename from \".\"");
+  assert_ne!(rename_status(&mut caller, &d, "..", &d, "y"), ok, "rename from \"..\"");
+  drop(caller);
+  assert!(bridge.lookup(oid(dir.ino), &cx, "f").is_ok(), "f survives every refused rename");
+  assert!(bridge.lookup(oid(dir.ino), &cx, "x").is_err(), "no x was created");
+  assert!(bridge.lookup(oid(dir.ino), &cx, "y").is_err(), "no y was created");
 }
 
 /// A rename needs write and search permission on both directories (`NFS3ERR_ACCES`), and the sticky

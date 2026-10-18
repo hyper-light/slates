@@ -445,3 +445,93 @@ fn a_canonical_sidecar_keeps_no_working_copy_and_any_other_keeps_its_own() {
     "a sidecar the encoding cannot reproduce keeps its working copy ({held} bytes)"
   );
 }
+
+/// A small deterministic xorshift, so the fuzz below is reproducible and allocates no RNG state on disk.
+struct Rng(u64);
+
+impl Rng {
+  fn next(&mut self) -> u64 {
+    self.0 ^= self.0 << 13;
+    self.0 ^= self.0 >> 7;
+    self.0 ^= self.0 << 17;
+    self.0
+  }
+}
+
+/// Decodes `body` as a sidecar claiming to be `file_len` bytes, serving any bytes past the header prefix from
+/// `body` itself. One place for the decode's shared borrow of `body` (the prefix) and its reader to coexist.
+fn probe(body: &[u8], file_len: u64) -> Decoded {
+  let prefix = body.get(..body.len().min(MAX_HEADER_BYTES)).unwrap_or(&[]);
+  let mut read_at = |off: u64, buf: &mut [u8]| -> usize {
+    let start = usize::try_from(off).unwrap_or(usize::MAX);
+    let avail = body.get(start..).unwrap_or(&[]);
+    let n = avail.len().min(buf.len());
+    if let (Some(dst), Some(src)) = (buf.get_mut(..n), avail.get(..n)) {
+      dst.copy_from_slice(src);
+    }
+    n
+  };
+  decode(prefix, file_len, &mut read_at)
+}
+
+/// Arm 1: uniformly random bytes, random length, a sometimes-lying file length. Half plant the valid magic and
+/// version, so the entry-count, entry and extended-attribute parsers are reached rather than rejected at byte 0.
+fn fuzz_random_bytes(rng: &mut Rng) {
+  for _ in 0..20_000 {
+    let len = usize::try_from(rng.next() % (MAX_HEADER_BYTES as u64 + 256)).unwrap_or(0);
+    let mut body = vec![0u8; len];
+    for byte in body.iter_mut() {
+      *byte = (rng.next() & 0xff) as u8;
+    }
+    if len >= 8 && rng.next() & 1 == 0 {
+      body[..4].copy_from_slice(&0x0005_1607u32.to_be_bytes());
+      body[4..8].copy_from_slice(&0x0002_0000u32.to_be_bytes());
+    }
+    let file_len = if rng.next() & 3 == 0 {
+      rng.next() % (1 << 40) // a lying length, far past the bytes we hold
+    } else {
+      body.len() as u64
+    };
+    let _ = probe(&body, file_len); // the property is: this returns, never panics
+  }
+}
+
+/// Arm 2: bit-flipped and truncated real macOS vectors — the corrupted-but-plausible inputs most likely to slip
+/// past a header check and trip a later bound.
+fn fuzz_flipped_vectors(rng: &mut Rng) {
+  for name in ["one-attr.bin", "two-attrs.bin", "finderinfo.bin", "after-remove.bin"] {
+    let base = vector(name);
+    for _ in 0..5_000 {
+      let mut body = base.clone();
+      let flips = 1 + rng.next() % 4;
+      for _ in 0..flips {
+        let at = usize::try_from(rng.next() % body.len() as u64).unwrap_or(0);
+        if let Some(byte) = body.get_mut(at) {
+          *byte ^= 1u8 << (rng.next() % 8);
+        }
+      }
+      let keep = usize::try_from(rng.next() % (body.len() as u64 + 1)).unwrap_or(0);
+      body.truncate(keep);
+      let _ = probe(&body, body.len() as u64); // never panics
+    }
+  }
+}
+
+/// A deterministic hostile-input fuzz of the AppleDouble decoder — the fifth agent-reachable wire decoder (a
+/// client writes arbitrary bytes to a `._X` file; slates `decode`s them to set `X`'s attributes, `view.rs`). The
+/// four other reachable decoders (filehandle, ops-document, increment, mount-capability) each carry such a fuzz;
+/// this one did not. Property: ANY bytes, at ANY claimed file length, decode to `Complete` or `Incomplete` and
+/// never panic, read out of bounds, or allocate on an attacker's count (the decoder clamps `MAX_ENTRIES`/
+/// `MAX_ATTRS` and `.get()`s every field). Non-vacuity: a real vector still decodes `Complete`, so the decoder's
+/// success path is live rather than short-circuited at the magic.
+#[test]
+fn any_sidecar_bytes_decode_without_panicking_and_a_real_one_still_completes() {
+  let real = vector("two-attrs.bin");
+  assert!(
+    matches!(probe(&real, real.len() as u64), Decoded::Complete(_)),
+    "a real macOS sidecar must decode Complete, or the fuzz is vacuous"
+  );
+  let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+  fuzz_random_bytes(&mut rng);
+  fuzz_flipped_vectors(&mut rng);
+}

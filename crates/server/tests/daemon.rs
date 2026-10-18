@@ -1512,6 +1512,8 @@ fn distinct_consumers_under_one_uid_hold_only_the_rights_shared_with_them_until_
   let (consumer, capability) = enroll(&mut owner, &secret, account);
   only_the_genuine_capability_binds_the_channel(&mut workload, consumer, &capability);
   let id = the_consumer_holds_only_the_right_shared(&mut owner, &mut workload, account, consumer);
+  a_consumer_lists_the_shared_volume_and_not_an_unshared_one(&mut owner, &mut workload, id);
+  a_read_only_consumer_cannot_grant_itself_more_rights(&mut workload, account, consumer, id);
   once_revoked_every_verb_refuses_before_any_effect(
     &mut owner,
     &mut workload,
@@ -1520,6 +1522,93 @@ fn distinct_consumers_under_one_uid_hold_only_the_rights_shared_with_them_until_
     id,
   );
   daemon.stop();
+}
+
+/// §4.13 (the classic privilege-escalation: a reader bootstrapping itself to admin). The consumer holds a shared
+/// *read* on `id`; it tries to `Share` the volume to its own principal with write+admin. `Share` itself needs the
+/// `admin` right (verbs::share gates on `rights_of(record, principal).admin`), which the reader lacks — refused
+/// `Forbidden`, and the refused self-share grants nothing, so an admin verb (Destroy) is still refused after it.
+fn a_read_only_consumer_cannot_grant_itself_more_rights(
+  workload: &mut Client,
+  account: u32,
+  consumer: u64,
+  id: VolumeId,
+) {
+  let escalate = RequestBody::Share {
+    volume: id,
+    principal: slates_ipc::protocol::Principal::Consumer { account, consumer },
+    rights: slates_ipc::protocol::Rights {
+      read: true,
+      write: true,
+      admin: true,
+    },
+  };
+  assert!(
+    matches!(
+      workload.call(&escalate),
+      ReplyBody::Refused {
+        refusal: Refusal::Forbidden { .. }
+      }
+    ),
+    "a read-only consumer must not grant itself more rights by sharing to its own principal"
+  );
+  assert!(
+    matches!(
+      workload.call(&RequestBody::Destroy { volume: id }),
+      ReplyBody::Refused {
+        refusal: Refusal::Forbidden { .. }
+      }
+    ),
+    "the refused self-share granted no admin — Destroy is still Forbidden"
+  );
+}
+
+/// §4.13 access lists at the volume listing: a consumer's `List` shows exactly the volumes shared with it for
+/// reading — the one already shared (`shared`), never a second volume the owner keeps private. The list verb
+/// filters by `rights_of(v, principal).read` (verbs::list), so an unshared volume's very name and size stay
+/// invisible to the consumer, not merely unreadable. Guards against a listing that leaks other tenants' volume
+/// names across the shared uid (the same filter the MCP `volumes()` query relies on).
+fn a_consumer_lists_the_shared_volume_and_not_an_unshared_one(
+  owner: &mut Client,
+  workload: &mut Client,
+  shared: VolumeId,
+) {
+  let ReplyBody::Created { id: private } = owner.call(&scratch("owner-kept-private")) else {
+    panic!("create the owner-only volume");
+  };
+  let ReplyBody::Listed { volumes } = workload.call(&RequestBody::List) else {
+    panic!("the consumer lists its accessible volumes");
+  };
+  let ids: Vec<VolumeId> = volumes.iter().map(|v| v.id).collect();
+  assert!(
+    ids.contains(&shared),
+    "the consumer must list the volume shared with it for reading: {ids:?}"
+  );
+  assert!(
+    !ids.contains(&private),
+    "the consumer must not list a volume the owner kept private — its name must stay invisible: {ids:?}"
+  );
+  // Nor READ it: the same principal gate the MCP read-only `volumes()`/`read()` query relies on (client.read ->
+  // ReadRange -> the read path authorizes the principal). An unshared volume's bytes are unreachable, and the
+  // refusal must not be a bare NotFound that would leak whether a path exists.
+  let read = RequestBody::ReadRange {
+    volume: private,
+    path: "/anything".to_owned(),
+    at: slates_ipc::protocol::ReadAt::Head,
+    offset: 0,
+    max: 64,
+  };
+  let reply = workload.call(&read);
+  assert!(
+    matches!(
+      reply,
+      ReplyBody::Refused {
+        refusal: Refusal::Forbidden { .. }
+      }
+    ),
+    "a consumer reading an unshared volume must be refused Forbidden by rights (not a bare NotFound that \
+     leaks path existence), got {reply:?}"
+  );
 }
 
 /// A forged proof of issuer authority refuses: an agent cannot enroll itself.
@@ -1611,7 +1700,32 @@ fn the_consumer_holds_only_the_right_shared(
       refusal: Refusal::Forbidden { .. }
     }
   ));
+  a_shared_read_consumer_cannot_destroy_the_owner_volume(owner, workload, id);
   id
+}
+
+/// The most catastrophic cross-principal verb: destroying another principal's volume needs the `admin` right,
+/// which a shared read grant never confers (verbs::destroy gates on `rights_of(record, principal).admin`). The
+/// consumer's Destroy is refused Forbidden, and the owner still sees its volume live — the refused destroy
+/// touched nothing.
+fn a_shared_read_consumer_cannot_destroy_the_owner_volume(
+  owner: &mut Client,
+  workload: &mut Client,
+  id: VolumeId,
+) {
+  assert!(matches!(
+    workload.call(&RequestBody::Destroy { volume: id }),
+    ReplyBody::Refused {
+      refusal: Refusal::Forbidden { .. }
+    }
+  ));
+  assert!(
+    matches!(
+      owner.call(&RequestBody::Status { volume: id }),
+      ReplyBody::Status { .. }
+    ),
+    "the owner's volume survived the consumer's refused destroy"
+  );
 }
 
 /// The human revokes the consumer: its next verb refuses before any effect, and stays refused.
@@ -2480,6 +2594,112 @@ fn green_chain_scenario() {
     panic!("versions");
   };
   assert_eq!(head, 0, "a fresh green is at version 0");
+  daemon.stop();
+}
+
+/// The owner's green, a work over it, and one edit — the state a cross-principal test then attacks.
+fn owner_green_and_work(owner: &mut Client) -> (VolumeId, VolumeId) {
+  let ReplyBody::GreenCreated { id: green } = owner.call(&RequestBody::CreateGreen {
+    name: "green".to_owned(),
+    require_evidence: false,
+    base: None,
+  }) else {
+    panic!("the owner creates the green");
+  };
+  let ReplyBody::WorkCreated { id: work, .. } = owner.call(&RequestBody::CreateWork {
+    green,
+    name: "w".to_owned(),
+  }) else {
+    panic!("the owner creates the work");
+  };
+  assert!(matches!(
+    owner.call(&RequestBody::Edit {
+      work,
+      path: "f".to_owned(),
+      at: 0,
+      delete_len: 0,
+      bytes: b"owned".to_vec(),
+    }),
+    ReplyBody::Edited
+  ));
+  (green, work)
+}
+
+/// A merge verb a foreign principal aimed at another account's green or work must be refused `Forbidden`
+/// before any effect (never silently succeed, never leak existence as something other than a refusal).
+fn assert_foreign_merge_refused(reply: ReplyBody) {
+  assert!(
+    matches!(
+      reply,
+      ReplyBody::Refused {
+        refusal: Refusal::Forbidden { .. }
+      }
+    ),
+    "a foreign principal's merge verb must be Forbidden, got {reply:?}"
+  );
+}
+
+/// A foreign principal cannot drive another account's merge through the real daemon (§4.13 "Principals",
+/// §4.16). The merge verbs authorize through the same `rights_of` the volume verbs do
+/// (`distinct_consumers_under_one_uid_...` proves it for Share and VFS reads), but on their own code path
+/// (`merge_service::require_green`/`require_work`). The owner creates a green and a work and edits it; a
+/// second channel, bound to a *different* consumer under the same uid, then names the owner's green and
+/// work at every merge verb — create-work and version reads (green rights), edit, declare, submit and
+/// rebase (work rights) — and each is refused `Forbidden` before any effect. Non-vacuous: the owner itself
+/// drives its own submit to success afterwards, and the green's head only moves then — never under a
+/// foreign call.
+#[test]
+fn a_foreign_principal_cannot_drive_another_accounts_merge() {
+  let (daemon, instance) = daemon("merge-authz");
+  let secret = daemon.segment().issuer_secret().unwrap();
+  let account = current_uid();
+  let mut owner = Client::connect(&instance);
+  let mut intruder = Client::connect(&instance);
+  // Bind the intruder's channel to a distinct consumer principal under the same uid.
+  let (consumer, capability) = enroll(&mut owner, &secret, account);
+  let proof = slates_server::landing::attest_proof(&capability, intruder.client);
+  assert!(matches!(
+    intruder.call(&RequestBody::Attest { consumer, proof }),
+    ReplyBody::Attested
+  ));
+  let (green, work) = owner_green_and_work(&mut owner);
+  // The intruder names the owner's green and work at every merge verb.
+  assert_foreign_merge_refused(intruder.call(&RequestBody::CreateWork {
+    green,
+    name: "x".to_owned(),
+  }));
+  assert_foreign_merge_refused(intruder.call(&RequestBody::Versions { green }));
+  assert_foreign_merge_refused(intruder.call(&RequestBody::Edit {
+    work,
+    path: "f".to_owned(),
+    at: 0,
+    delete_len: 0,
+    bytes: b"stolen".to_vec(),
+  }));
+  assert_foreign_merge_refused(intruder.call(&RequestBody::Declare {
+    work,
+    op: slates_ipc::protocol::WorkOp::Mkdir {
+      path: "d".to_owned(),
+    },
+  }));
+  assert_foreign_merge_refused(intruder.call(&RequestBody::Submit {
+    work,
+    evidence: Vec::new(),
+  }));
+  assert_foreign_merge_refused(intruder.call(&RequestBody::Rebase { work }));
+  // The green never advanced under the foreign calls; the owner still drives its own submit to success.
+  let ReplyBody::Submitted { version, conflicts } = owner.call(&RequestBody::Submit {
+    work,
+    evidence: Vec::new(),
+  }) else {
+    panic!("the owner submits its own work");
+  };
+  assert!(conflicts.is_empty(), "the owner's submit is clean: {conflicts:?}");
+  assert_eq!(
+    version,
+    Some(1),
+    "the green's first version is the owner's, not the intruder's"
+  );
   daemon.stop();
 }
 

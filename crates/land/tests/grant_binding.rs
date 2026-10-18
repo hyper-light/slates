@@ -185,6 +185,100 @@ fn a_single_use_grant_lands_only_its_target_volume_consumer_and_snapshot() {
   assert_eq!(host.bytes("/a/note").unwrap(), b"approved bytes");
 }
 
+/// AUD-29-01 / R10, the grant→land TOCTOU (the trust-handoff): a single-use grant binds the EXACT manifest the
+/// human reviewed, so content changed *after* the grant cannot land under it. Do: approve a single-use landing of
+/// `/note = "approved bytes"` into `/a`; then — as an agent sneaking a payload past a reviewed grant — overwrite
+/// `/note` with "evil bytes" (same path, same binding: target, volume, consumer and snapshot all unchanged, only
+/// the content differs) and try to land under the grant. Expect: refused `GrantMismatch` (the manifest hash the
+/// landing now plans differs from the one granted), and the disk is untouched — proving the manifest hash covers
+/// the content, not merely the structure, so a create-only plan to the same path with different bytes is a
+/// different manifest. Then the ORIGINAL content lands under the grant (so the refusal is the manifest's, not a
+/// dead grant's).
+#[test]
+fn a_single_use_grant_refuses_content_changed_after_it_was_approved() {
+  let mut host = SimHost::new();
+  host.mkdir("/a");
+  let mut store = store();
+  let mut vol = volume_with_note(&mut host, &mut store);
+  let mut session = Session::new();
+  let a = target(&mut host, "a");
+  let presented = Setup {
+    host: &mut host,
+    target: &a,
+    vol: &mut vol,
+    store: &mut store,
+    session: &mut session,
+  }
+  .present(&request(1));
+  let approved_hash = presented.manifest.hash;
+  let grant = session.grants.issue(
+    Surface::Cli,
+    approved_hash,
+    presented.binding.clone(),
+    GrantScope::Once,
+    1,
+    TERM_NS,
+  );
+  let granted = LandingRequest {
+    grant,
+    ..request(1)
+  };
+
+  // The agent overwrites the reviewed file with a payload — same path, same binding, different bytes.
+  write_file(&mut vol, &mut host, &mut store, "/note", b"evil bytes");
+  let before = disk(&host);
+  let outcome = Setup {
+    host: &mut host,
+    target: &a,
+    vol: &mut vol,
+    store: &mut store,
+    session: &mut session,
+  }
+  .try_land(&granted, &mut Unobserved);
+  let changed_hash = match outcome {
+    Err(LandingRefusal::Grant(GrantRefusal::GrantMismatch { expected, got })) => {
+      assert_eq!(expected, approved_hash, "the grant still binds the approved manifest");
+      assert_ne!(got, approved_hash, "the changed content plans a different manifest hash");
+      got
+    }
+    other => panic!("content changed after the grant must refuse GrantMismatch, got {other:?}"),
+  };
+  assert_eq!(disk(&host), before, "a refused TOCTOU landing wrote to the host");
+  assert!(host.bytes("/a/note").is_none(), "nothing of the evil content landed");
+
+  // Non-vacuity: a grant issued for the changed content's own manifest lands it, so the refusal above was
+  // specifically the stale grant's manifest, not a dead grant or a broken land path. The binding is unchanged
+  // (same target, volume, consumer, snapshot); only the manifest the human would review differs.
+  let for_changed = Setup {
+    host: &mut host,
+    target: &a,
+    vol: &mut vol,
+    store: &mut store,
+    session: &mut session,
+  }
+  .present(&request(1));
+  assert_eq!(for_changed.manifest.hash, changed_hash, "present re-plans the changed content's manifest");
+  let grant2 = session.grants.issue(
+    Surface::Cli,
+    for_changed.manifest.hash,
+    for_changed.binding.clone(),
+    GrantScope::Once,
+    1,
+    TERM_NS,
+  );
+  let report = Setup {
+    host: &mut host,
+    target: &a,
+    vol: &mut vol,
+    store: &mut store,
+    session: &mut session,
+  }
+  .try_land(&LandingRequest { grant: grant2, ..request(1) }, &mut Unobserved)
+  .unwrap();
+  assert_eq!(report.state, LandingState::Done, "{report:?}");
+  assert_eq!(host.bytes("/a/note").unwrap(), b"evil bytes");
+}
+
 /// AUD-29-01, the replaced target. Do: approve a landing into `/a`, move that directory away and make a new
 /// empty `/a` in its place, then land with the grant into the new `/a`. Expect: refused on the target
 /// (another directory at the approved path), nothing written; the moved directory is untouched.

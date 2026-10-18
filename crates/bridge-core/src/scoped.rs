@@ -213,20 +213,36 @@ impl Bridge for ScopedBridge<'_> {
     limit: usize,
   ) -> Result<Vec<DirEntry>, VfsError> {
     self.admit(object, cx)?;
-    let page = self.inner.readdir(object, cx, fh, cookie, limit)?;
-    let mut shown = Vec::with_capacity(page.len());
-    for mut entry in page {
-      if entry.name == ".." {
-        // The scope is this view's root: its parent is itself, so no walk climbs out.
-        if object.inode == self.scope {
-          entry.ino = self.scope;
+    // A page of the underlying directory may be entirely entries the scope drops (hard-link aliases of files
+    // homed outside it). Filtering one inner page in isolation would then return an empty page *before* the
+    // directory's end, which a transport reads as end-of-directory (NFS `eof = sent == rows.len() && rows.len() <
+    // limit`): the in-scope entries past the dropped page would be lost. So keep fetching inner pages, advancing
+    // the cursor, until a full page of in-scope entries has been gathered or the inner directory is exhausted —
+    // a short or empty result then means a true end, never a page the scope happened to empty. §4.6.
+    let mut shown = Vec::new();
+    let mut cursor = cookie;
+    while shown.len() < limit {
+      let page = self.inner.readdir(object, cx, fh, cursor, limit)?;
+      let Some(next) = page.last().map(|entry| entry.cookie) else {
+        break; // the inner directory is exhausted.
+      };
+      for mut entry in page {
+        if entry.name == ".." {
+          // The scope is this view's root: its parent is itself, so no walk climbs out.
+          if object.inode == self.scope {
+            entry.ino = self.scope;
+          }
+          shown.push(entry);
+          continue;
         }
-        shown.push(entry);
-        continue;
+        if entry.name == "." || self.within_admitted(ObjectId::new(entry.ino, 0), object, cx)? {
+          shown.push(entry);
+        }
       }
-      if entry.name == "." || self.within_admitted(ObjectId::new(entry.ino, 0), object, cx)? {
-        shown.push(entry);
+      if next == cursor {
+        break; // no progress (a single cookie group fills the page); the inner bound governs it.
       }
+      cursor = next;
     }
     Ok(shown)
   }
@@ -430,7 +446,24 @@ impl Bridge for ScopedBridge<'_> {
     cursor: InvalidationCursor,
     out: &mut Vec<Invalidation>,
   ) -> Result<InvalidationCursor, VfsError> {
-    self.inner.invalidations(cx, cursor, out)
+    // The inner bridge draws its invalidations from the whole volume's journal, so the stream names objects
+    // across every scope. The scope invariant holds here too — an `Inode` invalidation names an inode and an
+    // `Entry` names a directory and a file name, and a scoped view must reveal neither an out-of-scope inode nor
+    // a name in an out-of-scope directory (§4.6; "nothing outside is ever shown"). Keep only those the scope
+    // admits, by the same `within` climb every other verb uses; the parent's membership is the test for an
+    // entry, exactly as a listing checks its entries.
+    let start = out.len();
+    let next = self.inner.invalidations(cx, cursor, out)?;
+    for invalidation in out.split_off(start) {
+      let object = match &invalidation {
+        Invalidation::Inode { ino, .. } => *ino,
+        Invalidation::Entry { parent, .. } => *parent,
+      };
+      if self.inner.within(ObjectId::new(object, 0), self.scope, cx)? {
+        out.push(invalidation);
+      }
+    }
+    Ok(next)
   }
 
   fn seen(&mut self, cx: &OpContext) -> InvalidationCursor {

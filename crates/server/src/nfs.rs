@@ -278,7 +278,11 @@ fn authorized_rights(
     return None;
   }
   let record = s.db.partition().attachment(attachment)?;
-  if record.token != token || record.volume != volume {
+  // The token is a bearer secret, so it is matched in constant time (the same discipline the grant proof
+  // takes, `crate::landing::constant_time_eq`): a short-circuiting `!=` would leak, through its timing, how
+  // many leading bytes of a forged token matched, turning a 128-bit guess into a byte-at-a-time search. The
+  // volume id is not secret (the caller names it), so its check stays an ordinary comparison.
+  if !crate::landing::constant_time_eq(&record.token, &token) || record.volume != volume {
     return None;
   }
   // The attachment's granted rights (catalog read/write/admin) map to the mount edge's read/write.

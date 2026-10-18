@@ -480,3 +480,26 @@ pub fn kind_of_mode(mode: u32) -> Kind {
     Kind::File
   }
 }
+
+#[cfg(test)]
+mod tests {
+  use super::under;
+
+  /// CVE-2025-53110 ("EscapeRoute", Anthropic's Filesystem MCP) replicated against the landing filter's prefix
+  /// check. There a naive `path.starts_with(root)` let a sibling like `/root-evil` match the boundary `/root`.
+  /// slates' `under` compares against the exact prefix or `prefix + "/"`, so a sibling whose name merely extends
+  /// the prefix is NOT under it — `/root-evil`, `/rootx` and `/roo` are not under `/root` — while the prefix
+  /// itself and its genuine descendants are, with or without a trailing slash on the prefix.
+  #[test]
+  fn a_sibling_sharing_the_prefix_is_not_under_it() {
+    // The exact bypass the CVE exploited: a sibling extending the prefix.
+    assert!(!under("/root-evil", "/root"));
+    assert!(!under("/rootx", "/root"));
+    assert!(!under("/roo", "/root"));
+    assert!(!under("/other", "/root"));
+    // The prefix itself and its genuine descendants are under it.
+    assert!(under("/root", "/root"));
+    assert!(under("/root/file", "/root"));
+    assert!(under("/root/a/b", "/root/"));
+  }
+}

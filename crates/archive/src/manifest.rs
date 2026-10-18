@@ -169,8 +169,9 @@ impl core::fmt::Display for ManifestError {
 impl std::error::Error for ManifestError {}
 
 /// Format: the longest path a supported host resolves (Linux's `PATH_MAX`, the largest of the supported
-/// hosts' limits).
-const PATH_MAX_BYTES: usize = 4096;
+/// hosts' limits). A symlink's target is a path, so the volume caps a target at this too
+/// (`slates_vfs` `SYMLINK_TARGET_MAX_BYTES`): a volume never holds a target its placed archive would refuse.
+pub const PATH_MAX_BYTES: usize = 4096;
 /// Derived: the deepest a manifest tree may nest — a path `d` levels deep needs at least `2d` bytes (a
 /// one-byte name and a separator per level), so no host path reaches past `PATH_MAX_BYTES / 2` levels.
 pub const MAX_DEPTH: usize = PATH_MAX_BYTES / 2;

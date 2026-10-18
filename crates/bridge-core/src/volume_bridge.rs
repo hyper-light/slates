@@ -1308,15 +1308,23 @@ impl Bridge for VolumeBridge<'_> {
     // 1. The journal: every record since the cursor is a change this transport did not make (it
     //    advanced past its own after serving them), so each names a kernel entry to drop. A
     //    content record carries its inode; a namespace record carries the new path, whose parent
-    //    is resolved over the volume's own nodes (a mutation's path is always loaded).
-    let records: Vec<(Op, Box<str>, Option<InodeNo>)> = self
-      .volume
-      .op_log()
-      .since(cursor.journal_seq)
-      .map(|r| (r.op.clone(), r.path.clone(), r.inode))
-      .collect();
-    for (op, path, inode) in records {
-      self.journal_invalidations(&op, &path, inode, out);
+    //    is resolved over the volume's own nodes (a mutation's path is always loaded). Only a
+    //    current-head view sees these. A pinned immutable view (a snapshot or green-volume
+    //    attachment) never sees a head mutation, so none is staleness in its frozen view, and its
+    //    content changes only through an `advance` re-pin, which carries its own invalidated paths
+    //    in the `Advanced` reply (server `snapshot_view::advance`), not here. Emitting a head
+    //    change to a pinned view would drop caches still valid for its version and disclose
+    //    current-head file names and inodes it must never see (§4.16, §4.6).
+    if matches!(cx.view, View::Current) {
+      let records: Vec<(Op, Box<str>, Option<InodeNo>)> = self
+        .volume
+        .op_log()
+        .since(cursor.journal_seq)
+        .map(|r| (r.op.clone(), r.path.clone(), r.inode))
+        .collect();
+      for (op, path, inode) in records {
+        self.journal_invalidations(&op, &path, inode, out);
+      }
     }
     // 2. The base plane: every directory a watcher hint invalidated since the cursor, with the
     //    live entries beneath it, expired (not dropped: a busy directory must keep working) so the

@@ -458,3 +458,82 @@ pub fn reply_bytes(xid: u32, status: AcceptStatus, results: &[u8]) -> Vec<u8> {
   }
   out
 }
+
+#[cfg(test)]
+mod tests {
+  #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+  use proptest::prelude::*;
+
+  use super::*;
+  use crate::xdr::XdrWriter;
+
+  /// Builds an `authsys_parms` body (RFC 5531): stamp, machinename, uid, gid, the *claimed* gid count, then the
+  /// gids actually present (which may be fewer than the claim — a hostile credential).
+  fn authsys_parms(uid: u32, gid: u32, claimed: u32, gids: &[u32]) -> Vec<u8> {
+    let mut w = XdrWriter::new();
+    w.u32(0); // stamp
+    w.opaque(b"host"); // machinename
+    w.u32(uid);
+    w.u32(gid);
+    w.u32(claimed); // the count the credential claims — a hostile one lies
+    for gid in gids {
+      w.u32(*gid);
+    }
+    w.into_bytes()
+  }
+
+  /// §4.13 hostile input (RFC 5531: `AUTH_SYS` supplementary groups are bounded at sixteen). A credential
+  /// claiming a colossal group count is refused before any allocation — never a four-billion-entry `Vec`, an OOM
+  /// or a panic — and the bound is exact (17 is refused, 16 accepted); a well-formed credential decodes.
+  #[test]
+  fn a_colossal_auth_sys_gid_count_is_refused_before_allocating() {
+    // Claims u32::MAX groups but carries none: the count check refuses it before `Vec::with_capacity`.
+    assert!(
+      parse_authsys_parms(&authsys_parms(1000, 100, u32::MAX, &[])).is_none(),
+      "a colossal claimed gid count is refused, not allocated"
+    );
+    // The bound is exact.
+    assert!(
+      parse_authsys_parms(&authsys_parms(1000, 100, 17, &[7; 17])).is_none(),
+      "17 groups (past the 16 bound) is refused"
+    );
+    let at_bound = parse_authsys_parms(&authsys_parms(1000, 100, 16, &[7; 16]))
+      .expect("16 groups (at the bound) decodes");
+    assert_eq!(at_bound.groups.supplementary.len(), 16);
+    // A well-formed small credential decodes to its identity.
+    let id = parse_authsys_parms(&authsys_parms(1000, 100, 3, &[10, 20, 30]))
+      .expect("a valid credential decodes");
+    assert_eq!(
+      (id.uid, id.groups.gid, id.groups.supplementary.len()),
+      (1000, 100, 3)
+    );
+  }
+
+  proptest! {
+    #![proptest_config(slates_test_seeds::unseeded(proptest::test_runner::Config::default()))]
+
+    /// Hostile-input fuzz of the AUTH_SYS credential parser (every NFS request carries one, §4.13): any byte
+    /// string parses to `None` or a bounded identity, never a panic (proptest fails on one) and never more than
+    /// the sixteen supplementary groups RFC 5531 allows — so a hostile credential can neither OOM (the count is
+    /// checked before the `Vec`) nor crash. The second arm frames a well-formed header with a random claimed
+    /// count and random gids, reaching the count bound and the per-gid decode with arbitrary values.
+    #[test]
+    fn any_auth_sys_credential_parses_to_a_bounded_identity_or_none(
+      body in proptest::collection::vec(any::<u8>(), 0..256),
+      uid in any::<u32>(),
+      gid in any::<u32>(),
+      claimed in 0u32..64,
+      gids in proptest::collection::vec(any::<u32>(), 0..40),
+    ) {
+      if let Some(id) = parse_authsys_parms(&body) {
+        prop_assert!(id.groups.supplementary.len() <= AUTH_SYS_MAX_GIDS);
+      }
+      if let Some(id) = parse_authsys_parms(&authsys_parms(uid, gid, claimed, &gids)) {
+        prop_assert!(
+          id.groups.supplementary.len() <= AUTH_SYS_MAX_GIDS,
+          "the sixteen-group bound holds for any framed credential"
+        );
+      }
+    }
+  }
+}
