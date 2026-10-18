@@ -2209,6 +2209,21 @@ proptest! {
     }
     prop_assume!(scanned > 0);
 
+    // Whatever the schedule did, the pin ledger must balance once the device lets go. `release_dax` is the
+    // terminal teardown a crashed or disconnected VMM gets, and after it no block of this store may still be
+    // pinned: a pin left behind holds a chunk out of the arena for good, and the only thing that would hide
+    // one is nobody looking. Nothing looked, before 2026-10-18 — see
+    // `two_windows_over_one_block_each_hold_its_pin`.
+    {
+      let mut bridge = VolumeBridge::new(vid(), &mut volume, &mut store);
+      device.release_dax(&mut bridge, &cx);
+    }
+    prop_assert_eq!(
+      store.content.arena().pinned_blocks(),
+      0,
+      "the schedule left blocks pinned after the device released everything"
+    );
+
     drop(cache);
   }
 }
