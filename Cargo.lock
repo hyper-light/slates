@@ -1390,6 +1390,7 @@ name = "slates-bridge-virtiofs"
 version = "0.1.0"
 dependencies = [
  "memmap2",
+ "proptest",
  "rustix",
  "slates-bridge-core",
  "slates-bridge-fuse",
@@ -1397,6 +1398,7 @@ dependencies = [
  "slates-machine",
  "slates-mem",
  "slates-rt",
+ "slates-test-seeds",
  "slates-vfs",
  "slates-wire",
 ]

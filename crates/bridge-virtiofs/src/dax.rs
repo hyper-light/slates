@@ -167,8 +167,14 @@ impl DaxCacheRegion {
   }
 
   /// The window bytes at `[moffset, moffset+len)` — how a simulated guest reads its DAX window (a real guest's CPU
-  /// reaches the same pages directly). Sub-page ranges are allowed. `None` for an out-of-window range. A safe slice of
-  /// the owned mapping (the `MAP_FIXED` overlays stay within it), so no `unsafe` and no fault for an in-window range.
+  /// reaches the same pages directly). Sub-page ranges are allowed. `None` for an out-of-window range.
+  ///
+  /// **Reading a torn-down range faults.** The slice is in-bounds of the reservation, so this is `unsafe`-free and
+  /// bounds-checked, but [`DaxCacheRegion::unmap`] replaces a slot with a `PROT_NONE` anonymous mapping — by
+  /// design, so a stale window reaches nothing — and touching those bytes raises a fault the bounds check cannot
+  /// see. An earlier version of this line promised "no fault for an in-window range", which is true only while
+  /// every page of the range is mapped; a chaos schedule that unmapped a slot and then read it took `SIGBUS`. A
+  /// caller that scans the region must know which slots are live, or read only what it has just mapped.
   #[must_use]
   pub fn window_bytes(&self, moffset: u64, len: u64) -> Option<&[u8]> {
     let moffset = usize::try_from(moffset).ok()?;

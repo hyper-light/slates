@@ -19,6 +19,7 @@ use common::{
   SimDriver, context, context_for, layout_at, message, other_vid, reply_error, store, vid, volume,
   volume_with_prefix,
 };
+use proptest::prelude::*;
 use slates_bridge_core::{Bridge, ObjectId, OpContext, VolumeBridge};
 use slates_bridge_fuse::abi::{IN_HEADER_LEN, OUT_HEADER_LEN, Opcode, flags};
 use slates_bridge_fuse::bridge::dispatch;
@@ -1852,6 +1853,217 @@ fn a_device_window_past_the_files_length_shows_zeroes_not_the_truncated_secret()
   );
 
   drop(cache);
+}
+
+/// The fills the chaos schedule writes. A byte in the guest's window that is none of these and not zero came from
+/// somewhere the guest has no business reaching — another volume, arena metadata, or memory never initialised.
+#[cfg(unix)]
+const CHAOS_FILLS: [u8; 3] = [0x11, 0x22, 0x33];
+
+/// One FUSE_REMOVEMAPPING of `len` at `moffset`; the reply's error.
+#[cfg(unix)]
+fn tenant_dax_unmap(
+  (device, driver): (&mut Device, &mut SimDriver),
+  (volume_id, volume, store): (
+    slates_db::catalog::VolumeId,
+    &mut slates_vfs::volume::Volume,
+    &mut slates_vfs::volume::Store,
+  ),
+  cx: &OpContext,
+  (unique, nodeid): (u64, u64),
+  (moffset, len): (u64, u64),
+) -> i32 {
+  let mut body = Vec::new();
+  body.extend_from_slice(&1u32.to_le_bytes());
+  body.extend_from_slice(&moffset.to_le_bytes());
+  body.extend_from_slice(&len.to_le_bytes());
+  let mut bridge = VolumeBridge::new(volume_id, volume, store);
+  let reply = dax_exchange(
+    device,
+    driver,
+    &mut bridge,
+    cx,
+    (Opcode::RemoveMapping, unique, nodeid),
+    &body,
+  );
+  reply_error(&reply)
+}
+
+/// One step of the device chaos schedule. Every operation may be refused — a slot may be taken, a file may have
+/// been truncated away, a map may collide — and a refusal is a valid outcome; the invariant is about what the
+/// guest-visible region SHOWS afterwards.
+#[cfg(unix)]
+#[expect(
+  clippy::too_many_arguments,
+  reason = "one step of a schedule, taken as tuples"
+)]
+fn device_chaos_step(
+  (device, driver): (&mut Device, &mut SimDriver),
+  (volume, store): (
+    &mut slates_vfs::volume::Volume,
+    &mut slates_vfs::volume::Store,
+  ),
+  cx: &OpContext,
+  files: &[u64],
+  page: usize,
+  slots: u64,
+  unique: u64,
+  (op, which, size): (u8, u8, u16),
+) -> ChaosEffect {
+  let nodeid = files[usize::from(which) % files.len()];
+  let slot = (u64::from(which) % slots) * page as u64;
+  let no = slates_vfs::ids::InodeNo(nodeid);
+  match op % 5 {
+    0 => {
+      let answered = tenant_dax_map(
+        (device, driver),
+        (vid(), volume, store),
+        cx,
+        (unique, nodeid),
+        (slot, page as u64),
+      );
+      if answered == 0 {
+        return ChaosEffect::Mapped(slot, nodeid);
+      }
+      ChaosEffect::None
+    }
+    1 => {
+      tenant_dax_unmap(
+        (device, driver),
+        (vid(), volume, store),
+        cx,
+        (unique, nodeid),
+        (slot, page as u64),
+      );
+      ChaosEffect::TornDown
+    }
+    2 => {
+      let fill = CHAOS_FILLS[usize::from(op) % CHAOS_FILLS.len()];
+      let len = (usize::from(size) % page).max(1);
+      let _ = volume.write(store, no, 0, &vec![fill; len]);
+      ChaosEffect::TornDown
+    }
+    3 => {
+      let _ = volume.truncate(store, no, u64::from(size) % (page as u64));
+      ChaosEffect::TornDown
+    }
+    _ => {
+      volume.age_writes();
+      let _ = volume.seal_pending(store, 1 << 20);
+      ChaosEffect::TornDown
+    }
+  }
+}
+
+/// What a chaos step did to the window's slots, as far as the schedule can know: it mapped one, or it may have
+/// torn some down. Conservative by design — `unmap`, a write, a truncate and the sweep can each leave a slot
+/// `PROT_NONE`, and reading one of those faults, so after any of them the schedule trusts no slot until a map
+/// re-establishes it.
+#[cfg(unix)]
+#[derive(Clone, Copy)]
+enum ChaosEffect {
+  /// A SETUPMAPPING succeeded at this window offset, for this inode.
+  Mapped(u64, u64),
+  /// Nothing was established.
+  None,
+  /// Something that can revoke ran; no slot is known-live afterwards.
+  TornDown,
+}
+
+proptest! {
+  #![proptest_config(slates_test_seeds::unseeded(ProptestConfig { cases: 80, .. ProptestConfig::default() }))]
+
+  /// §4.6 / AC-4.12 under chaos, at the device seam. `vfs/tests/dax.rs` plays this schedule against the gate;
+  /// this plays it against the half that owns the guest-visible window — SETUPMAPPING and REMOVEMAPPING over a
+  /// shared cache region, interleaved with the writes, truncates and idle sweeps that revoke underneath them.
+  /// Do: a random schedule over three files and several window slots. Expect, after **every** step: every byte
+  /// of the whole cache region is either zero or one of the fills this volume wrote. A byte that is neither came
+  /// from somewhere the guest has no business reaching — another volume's block, arena metadata, or memory never
+  /// initialised — which is exactly the class of leak a shared window makes possible and a per-access check
+  /// cannot catch, since the guest reads these pages through its own page table.
+  #[cfg(unix)]
+  #[test]
+  fn a_random_window_schedule_never_shows_the_guest_a_foreign_byte(
+    schedule in prop::collection::vec((any::<u8>(), any::<u8>(), any::<u16>()), 1..40)
+  ) {
+    const SLOTS: usize = 4;
+    let page = rustix::param::page_size().max(1);
+    let region = page * SLOTS;
+    let slots = SLOTS as u64;
+    let mut store = dax_shared_store(page, "devchaos");
+    let mut volume = volume(&mut store);
+    volume.enable_writable_dax();
+    let root = volume.root_inode(&store).unwrap();
+    let mut files = Vec::new();
+    for (i, fill) in CHAOS_FILLS.iter().enumerate() {
+      let no = volume.create_file_no(&mut store, root, &format!("c{i}"), 0o644).unwrap();
+      volume.write(&mut store, no, 0, &vec![*fill; page]).unwrap();
+      files.push(no.0);
+    }
+
+    let (mut device, mut driver) = device_and_driver();
+    let cache = tenant_cache("chaos", page);
+    device.install_dax_window(Some(
+      slates_bridge_virtiofs::dax::DaxCacheRegion::new(cache.as_fd(), region as u64).unwrap(),
+    ));
+    let cx = context_for(vid());
+    tenant_connect((&mut device, &mut driver), (vid(), &mut volume, &mut store), &cx);
+
+    let mut live: Vec<(u64, u64)> = Vec::new();
+    let mut scanned = 0usize;
+    for (step, triple) in schedule.into_iter().enumerate() {
+      let unique = (step as u64).saturating_add(2);
+      let effect = device_chaos_step(
+        (&mut device, &mut driver),
+        (&mut volume, &mut store),
+        &cx,
+        &files,
+        page,
+        slots,
+        unique,
+        triple,
+      );
+      match effect {
+        ChaosEffect::Mapped(slot, nodeid) => {
+          live.retain(|(at, _)| *at != slot);
+          live.push((slot, nodeid));
+        }
+        ChaosEffect::None => {}
+        // Any revoking op can leave a slot PROT_NONE, and reading one of those faults by design.
+        ChaosEffect::TornDown => live.clear(),
+      }
+      for (slot, nodeid) in &live {
+        let seen = device.dax_window_bytes(*slot, page as u64).unwrap_or_default();
+        prop_assert!(!seen.is_empty(), "a live window reads, so the scan means something");
+        scanned = scanned.saturating_add(1);
+        let foreign = seen
+          .iter()
+          .find(|byte| **byte != 0 && !CHAOS_FILLS.contains(byte));
+        prop_assert!(
+          foreign.is_none(),
+          "a byte the guest can see belongs to neither this volume nor zero: {foreign:?}"
+        );
+        // The stronger half: the window is not merely plausible, it is this file's current bytes. A stale
+        // window would still pass the provenance check above, since every file here writes the same fills.
+        let no = slates_vfs::ids::InodeNo(*nodeid);
+        let len = usize::try_from(volume.stat(&store, no).map(|s| s.size).unwrap_or(0)).unwrap_or(0);
+        let mut truth = vec![0u8; len];
+        prop_assert!(volume.read(&store, no, 0, &mut truth).is_ok(), "the file reads");
+        prop_assert_eq!(
+          seen.get(..len),
+          Some(truth.as_slice()),
+          "the guest's window is this file's current bytes"
+        );
+        prop_assert!(
+          seen.get(len..).is_some_and(|tail| tail.iter().all(|byte| *byte == 0)),
+          "and zeroes past its length"
+        );
+      }
+    }
+    prop_assume!(scanned > 0);
+
+    drop(cache);
+  }
 }
 
 /// A 64-byte FUSE_INIT body (major 7, minor 38): the codec reads what it needs.

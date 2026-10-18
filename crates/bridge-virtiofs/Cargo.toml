@@ -35,6 +35,11 @@ memmap2 = { workspace = true }
 # `rustix` (descriptor I/O on a memory object, never a host path). The crate's own source holds no
 # descriptor — the seam owns and drains the doorbell; the loop only awaits its number.
 rustix = { workspace = true }
+# The DAX window's chaos schedule (`tests/device.rs`): random interleavings of map, unmap, write and
+# truncate against one guest-visible cache region. Seeds go through `slates-test-seeds`, so a failing
+# case is recorded without writing a file (R1).
+proptest = { workspace = true }
+slates-test-seeds = { workspace = true }
 
 [lints]
 workspace = true
