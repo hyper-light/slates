@@ -41,6 +41,13 @@ absence):
 The three in bold are deployment paths slates itself ships. A base directory on any of them gets the
 2-second window today.
 
+**The macOS branch has the same shape.** It matches by `f_fstypename` rather than magic, and matches
+exactly five names — `apfs`, `hfs`, `msdos`, `exfat`, `ntfs`. Everything else takes `Unknown`, including
+**`nfs`** — which is the type of slates' own macOS loopback mount (§4.6 A-34) — and `smbfs`, `webdav`
+and `virtiofs`. So the gap is not a Linux accident; both branches enumerate a short list and give
+everything else two seconds, and on both platforms the list omits filesystems slates itself produces or
+runs on.
+
 ## The measurement
 
 Inside a Docker container (aarch64, kernel 6.12-linuxkit, `stat -f -c %T` = `overlayfs`, magic
