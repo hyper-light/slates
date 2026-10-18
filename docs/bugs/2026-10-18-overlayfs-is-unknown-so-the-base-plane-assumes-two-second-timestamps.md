@@ -25,6 +25,22 @@ timestamp granularity: `HostFacts::timestamp_granularity_ns`, which `unix.rs` ta
 plane assumes **two seconds**. overlayfs is the filesystem of every OCI container, which is condition 2
 of the goal and the deployment the OCI work targets.
 
+**It is not only overlayfs.** The Linux arm matches exactly eight magics — ext4, XFS, btrfs, tmpfs,
+MSDOS, exFAT, NTFS, HFS+ — and everything else falls through. Absent, and so assumed two seconds
+(verified by reading the match arms; their *actual* granularities are not measured here, only their
+absence):
+
+| absent filesystem | why it matters to slates |
+|---|---|
+| **overlayfs** | every OCI container — condition 2, and measured at 1 ms below |
+| **virtiofs** | slates' own microVM path (`crates/bridge-virtiofs` exists for it) |
+| **NFS** | slates' own macOS loopback transport (§4.6 A-34) |
+| ZFS, F2FS, bcachefs | ordinary modern server filesystems |
+| erofs, squashfs, 9p, CIFS | container images, VM shares, network mounts |
+
+The three in bold are deployment paths slates itself ships. A base directory on any of them gets the
+2-second window today.
+
 ## The measurement
 
 Inside a Docker container (aarch64, kernel 6.12-linuxkit, `stat -f -c %T` = `overlayfs`, magic
