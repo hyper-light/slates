@@ -61,13 +61,29 @@ there is **1 ms**, against the **2 s** slates assumes — a factor of **2000**.
 For contrast, the same probe on the Linux box's btrfs gives true nanosecond spacing
 (`…959704950`, `…960212437`, `…960667456`), which `fs_kind` already classifies correctly.
 
-## Impact
+## Impact — narrower than it first looks
 
-Performance, in containers, and only there. A base file's digest cannot be kept until the assumed
-window has closed, so on overlayfs a digest computed within two seconds of the file's last write is
-discarded as racy and recomputed. The conservatism is **safe** — it is the §4.5 rule that a timestamp
-comparison means nothing inside the granularity — and nothing is read stale. It simply does far more
-work than the filesystem requires, in exactly the deployment where base-plane reads matter most.
+**An earlier draft of this record overstated this and is corrected here.** The rule is relative to the
+file's own last change, not to the volume:
+
+```rust
+let last_change = fingerprint.mtime_ns.max(fingerprint.ctime_ns);
+if self.host.now_ns().saturating_sub(last_change) <= granularity { /* not kept, racy_uncached */ }
+```
+
+So the 2-second assumption only withholds the digest of a file changed **within the last two seconds**.
+A *static* base — an OCI image layer, a checked-out source tree, anything whose files are minutes or
+hours old — is **completely unaffected**: `now - last_change` is far past any granularity, and digests
+cache exactly as they do on ext4. The sweeping claim that this costs the OCI deployment generally was
+wrong.
+
+Where it does bite is a base directory being **actively written while slates reads it** — an agent
+editing the working tree its volume overlays, or a build writing into one. There, every file touched in
+the last two seconds has its digest recomputed on each export instead of kept. That is a real scenario
+for this product, and it is the one to weigh; it is not the whole container story.
+
+The conservatism itself is **safe** either way — it is the §4.5 rule that a timestamp comparison means
+nothing inside the granularity — and nothing is ever read stale.
 
 This was invisible until something ran the suite on a container filesystem: every platform CI tests
 (ext4 on the Linux runner, APFS on macOS) is classified `Nanosecond`, so the `Unknown` arm never ran.
