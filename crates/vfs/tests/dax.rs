@@ -1764,7 +1764,7 @@ fn chaos_step(
 ) {
   let no = files[usize::from(which) % files.len()];
   let len = usize::from(size) % (DAX_PAGE * 2);
-  match op % 7 {
+  match op % 8 {
     0 => {
       let _ = volume.write(store, no, 0, &vec![op ^ which; len.max(1)]);
     }
@@ -1790,6 +1790,15 @@ fn chaos_step(
     5 => {
       // A snapshot splits shared content copy-on-write, which must revoke a writable mapping of it.
       let _ = volume.snapshot(store);
+    }
+    6 => {
+      // Metadata DAX: a directory's entries materialized into a throwaway block the mapping owns, whose
+      // release (`free_snapshot_block`) is a lifecycle a file's content block does not have.
+      if let Ok(root) = volume.root_inode(&*store)
+        && let Ok(mapping) = volume.dax_map_dir(store, root)
+      {
+        held.push(mapping);
+      }
     }
     _ => {
       volume.age_writes();
@@ -1817,17 +1826,22 @@ fn chaos_invariants(store: &Store, volume: &Volume, held: &[Mapping]) -> Result<
         "a live mapping shows zeroes past its file, never another file's bytes or a stale tail"
       );
       // The stronger half: the window is this file's CURRENT bytes. Zeroes past the end would still pass
-      // above if the head were stale — a copy-on-write split the mapping outlived, say.
-      let mut truth = vec![0u8; mapping.file_len];
-      prop_assert!(
-        volume.read(store, mapping.inode, 0, &mut truth).is_ok(),
-        "the mapped file reads"
-      );
-      prop_assert_eq!(
-        bytes.get(..mapping.file_len),
-        Some(truth.as_slice()),
-        "a live mapping shows the file's current bytes"
-      );
+      // above if the head were stale — a copy-on-write split the mapping outlived, say. Skipped for a
+      // materialized snapshot (a directory's entries): its block is a throwaway the mapping owns, there is no
+      // file to read back, and a directory window is point-in-time by design — a mutation revokes it, it does
+      // not track. Those mappings are still held to the live/inert invariants above and below.
+      if !mapping.snapshot {
+        let mut truth = vec![0u8; mapping.file_len];
+        prop_assert!(
+          volume.read(store, mapping.inode, 0, &mut truth).is_ok(),
+          "the mapped file reads"
+        );
+        prop_assert_eq!(
+          bytes.get(..mapping.file_len),
+          Some(truth.as_slice()),
+          "a live mapping shows the file's current bytes"
+        );
+      }
     } else {
       prop_assert!(
         volume.dax_read(store, mapping, 0, DAX_PAGE).is_err(),
