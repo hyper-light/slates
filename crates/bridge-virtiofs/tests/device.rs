@@ -1741,7 +1741,11 @@ fn a_device_window_gives_its_pin_back_when_it_unmaps() {
     f.quiet
   );
   assert_eq!(f.unmap(3, 0), 0, "the window unmaps");
-  assert_eq!(f.pinned(), f.quiet, "and its pin came back");
+  assert_eq!(
+    (f.pinned(), f.store.release_refusals),
+    (f.quiet, 0),
+    "its pin came back, and the arena refused no release on the way"
+  );
 }
 
 /// §4.6 — two guest windows over **one** block each hold its pin, and only the last one out releases it. A block
@@ -1783,9 +1787,9 @@ fn two_windows_over_one_block_each_hold_its_pin() {
 
   assert_eq!(f.unmap(5, second_at), 0, "the second window unmaps");
   assert_eq!(
-    f.pinned(),
-    f.quiet,
-    "with both windows gone the ledger balances: no block is left pinned"
+    (f.pinned(), f.store.release_refusals),
+    (f.quiet, 0),
+    "with both windows gone the ledger balances: no block left pinned, and no release the arena refused"
   );
 }
 
@@ -2222,6 +2226,14 @@ proptest! {
       store.content.arena().pinned_blocks(),
       0,
       "the schedule left blocks pinned after the device released everything"
+    );
+    // `release_refusals` counts an unpin or a deferred free the arena refused — a double release, or a pin the
+    // ledger had already lost. It exists to signal exactly the imbalance a block count can hide (an extra
+    // release that errors leaves the count right and the ledger wrong), and until now nothing read it.
+    prop_assert_eq!(
+      store.release_refusals,
+      0,
+      "the schedule made the arena refuse a release"
     );
 
     drop(cache);
@@ -2879,6 +2891,18 @@ fn hostile_dax_requests_are_refused_and_establish_no_window() {
     device.dax_window_count(),
     1,
     "exactly the one valid window is live"
+  );
+
+  // And the hostile sequence leaked nothing: with the one valid window released, no block of the store is still
+  // pinned. A refused map that kept its pin would hold a chunk out of the arena for good, and a hostile guest
+  // could repeat it — the leak is the attack. Asserted over the whole arena rather than one block, because the
+  // interesting leak is the one from a path nobody thought to name.
+  device.release_dax(&mut bridge, &cx);
+  drop(bridge);
+  assert_eq!(
+    (store.content.arena().pinned_blocks(), store.release_refusals),
+    (0, 0),
+    "a hostile SETUPMAPPING/REMOVEMAPPING sequence left a block pinned, or made the arena refuse a release"
   );
   drop(cache);
 }
