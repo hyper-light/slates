@@ -48,6 +48,18 @@ and `virtiofs`. So the gap is not a Linux accident; both branches enumerate a sh
 everything else two seconds, and on both platforms the list omits filesystems slates itself produces or
 runs on.
 
+**Windows enumerates nothing, and says so.** `windows.rs`'s `facts` returns
+`granularity_for(FsKind::Unknown)` unconditionally, with the comment "the coarsest class of the table
+until the volume's filesystem is queried through the handle: the racy rule then re-hashes more often,
+never less". A deliberate, correctly-reasoned placeholder rather than an oversight — but it means
+**every** Windows filesystem gets two seconds, NTFS included, whose own class in this very table is
+100 ns. So across the three platforms: Linux classifies 8 filesystems, macOS 5, Windows 0.
+
+That also makes Windows the cheapest place to improve, and the only one where the right answer is not
+in doubt: the filesystem name is a `GetVolumeInformation` call the code already anticipates, and
+mapping `NTFS` to the class this table already documents for it needs no new judgement. It is not done
+here only because this host cannot build or test Windows at all.
+
 ## The measurement
 
 Inside a Docker container (aarch64, kernel 6.12-linuxkit, `stat -f -c %T` = `overlayfs`, magic
