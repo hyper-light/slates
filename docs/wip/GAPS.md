@@ -7107,3 +7107,31 @@ one of them is exposed:
 So the attribution is added where the bound is of the same order as the noise, and nowhere else. The cluster
 suites' timing assertions run against simulated clocks and are a separate question; fleet tests run alone by
 policy.
+
+### 2026-10-18: D-11's "re-measured on power-state change" is unwired, found by a sixth workspace flake
+
+The sixth full `cargo test --workspace` failed one test, in `slates-machine`'s own unit tests:
+
+```
+---- profile::tests::a_power_state_change_is_detected_and_triggers_a_refresh ----
+assertion `left == right` failed
+  left: Err(MeasurementTimeout { probe: "wake" })   right: Ok(true)
+```
+
+**The flake is the same wake-probe refusal as the first two**, in a place the earlier sweep did not reach:
+that sweep looked through `crates/*/tests/`, and these tests live inside `crates/machine/src/profile.rs`.
+That is precisely the lesson written down after the CLI harness test — *"searching the test directories misses
+`crates/cli/src/verbs.rs`, whose tests live in the source file"* — and it was not applied to the crate the
+lesson was about. Fixed by giving the test the full profile's per-probe bound: it is about the detection and
+the refresh, never about their speed.
+
+**Chasing it found the real thing.** D-11's title reads "every tunable derived at boot from measurements,
+logged with inputs, **re-measured on power-state change**", and the re-measurement half has no caller at all:
+`refresh_if_power_changed`, `power_changed` and `refresh_cheap` are referenced nowhere outside `profile.rs`
+and its tests. A laptop that moves between battery and mains keeps every derived tunable at its boot value —
+on the machine slates targets first, where that transition changes CPU frequency and wake behaviour
+materially. Noted at the function, where whoever wires it will read it.
+
+**Owed:** the daemon decides when to ask (a periodic check, or an OS power notification) and with what budget —
+a refusal there means the machine was too busy to measure, not that nothing changed, so the caller must decide
+whether to retry or keep the stale profile. Both are design calls, not detail.

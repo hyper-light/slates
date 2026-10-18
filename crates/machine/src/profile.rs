@@ -177,6 +177,13 @@ impl MachineProfile {
 
   /// Re-measures the cheap subset if the power state changed; returns whether it did (a refused wake
   /// re-measure keeps the previous measurement and is the refusal).
+  /// **Nothing in the daemon calls this, and D-11 says something should.** That decision's own title is
+  /// "every tunable derived at boot from measurements, logged with inputs, **re-measured on power-state
+  /// change**", and the re-measurement half is unwired: this function, [`MachineProfile::power_changed`] and
+  /// [`MachineProfile::refresh_cheap`] have no caller outside this file's tests. A laptop moving between
+  /// battery and mains therefore keeps every tunable at its boot value, which is exactly the machine slates
+  /// targets. Recorded in `docs/wip/GAPS.md` (2026-10-18); the budget a caller should pass is its own
+  /// question, since a refusal here means the machine was too busy to measure, not that nothing changed.
   pub fn refresh_if_power_changed(&mut self, budget: Duration) -> Result<bool, MachineError> {
     if !self.power_changed() {
       return Ok(false);
@@ -460,6 +467,12 @@ fn copy_versus_remap(p: &MachineProfile, page: u64, fault: u64) -> u64 {
 
 #[cfg(test)]
 mod tests {
+  /// Shape: the budget this test gives the refresh — the full profile's own per-probe bound, not a tenth of
+  /// it. The test is about the *detection and the refresh*, never about their speed, and a ten-millisecond
+  /// budget is not enough for the wake probe on a loaded machine: a full `cargo test --workspace` refused it
+  /// `MeasurementTimeout { probe: "wake" }` on 2026-10-18 where the test passes alone every time.
+  const REFRESH_BUDGET: Duration = crate::bench::PROBE_WALL_BUDGET;
+
   use super::*;
 
   fn quick_options() -> ProfileOptions {
@@ -578,10 +591,7 @@ mod tests {
       !profile.power_changed(),
       "the state has not moved since the profile"
     );
-    assert_eq!(
-      profile.refresh_if_power_changed(Duration::from_millis(10)),
-      Ok(false)
-    );
+    assert_eq!(profile.refresh_if_power_changed(REFRESH_BUDGET), Ok(false));
     // Pretend the profile was taken on the other source: the next check must refresh.
     profile.facts.power = match profile.facts.power {
       PowerState::Mains => PowerState::Battery,
@@ -589,10 +599,7 @@ mod tests {
     };
     let before = profile.syscall;
     assert!(profile.power_changed());
-    assert_eq!(
-      profile.refresh_if_power_changed(Duration::from_millis(10)),
-      Ok(true)
-    );
+    assert_eq!(profile.refresh_if_power_changed(REFRESH_BUDGET), Ok(true));
     assert!(
       !profile.power_changed(),
       "the refresh recorded the current state"
