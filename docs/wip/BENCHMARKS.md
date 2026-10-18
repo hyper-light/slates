@@ -5622,7 +5622,9 @@ Honesty about this reading: the box was loaded and the load climbed through the 
 p999 here (1.5–4 ms) is dominated by scheduling, not by the driver — those rows are nearly noise. The
 **p50 rows are the trustworthy ones**, and they say the same thing: parked favours io_uring by 13%,
 spinning favours epoll. Within each round the epoll arm runs second, which biases *against* epoll, so
-its spinning win is if anything understated. A quiesced re-run is owed before this settles D-9.
+its spinning win is if anything understated. A quiesced re-run would sharpen the parked figure; it is
+no longer owed for the decision, which D-9's amendment settled (see the outcome note below), and the
+arms it would need are gone from the tree with io_uring.
 
 What it does not measure: security. io_uring is ~60% of Google's kernel VRP submissions, is disabled
 by default on openSUSE and dropped from Docker's and containerd's seccomp profiles, and slates uses it
