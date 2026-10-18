@@ -1784,6 +1784,76 @@ fn two_tenants_dax_windows_each_show_only_their_own_bytes() {
   drop(cache_b);
 }
 
+/// §4.6, the leak question asked at the device seam rather than the mediated path. The VFS proves a truncate's
+/// leftover bytes are not reachable through `dax_read` (`vfs/tests/dax.rs
+/// a_mapping_does_not_expose_the_bytes_past_the_files_length`), but that path bounds to `Mapping::page_span`,
+/// which counts `DAX_PAGE` units. A **device** grants whole HOST pages — `file_len` rounded up to the placer's
+/// granule, capped at the block — so where the host page is larger than `DAX_PAGE` (16 KiB against 4 KiB on an
+/// Apple-Silicon host) the guest's window is strictly larger than the mediated path's, and the mediated test says
+/// nothing about the extra bytes. Do: fill a whole page with a secret, truncate the file to 100 bytes, map it
+/// through the device, and scan the ENTIRE granted window. Expect: the file's own 100 bytes, then zeroes — the
+/// map scrubs the whole block past `file_len`, and the cap at the block keeps a coarse granule from reaching the
+/// next one. Runs on both granules: 16 KiB on this host, 4 KiB on x86_64 Linux, where the two bounds coincide.
+#[cfg(unix)]
+#[test]
+fn a_device_window_past_the_files_length_shows_zeroes_not_the_truncated_secret() {
+  const SECRET: u8 = 0xEE;
+  const KEPT: usize = 100;
+  let page = rustix::param::page_size().max(1);
+  let window = (page * 4) as u64;
+  let mut store = dax_shared_store(page, "tailleak");
+  let mut vol = volume(&mut store);
+  vol.enable_writable_dax();
+  let root = vol.root_inode(&store).unwrap();
+  let no = vol.create_file_no(&mut store, root, "f", 0o644).unwrap();
+  vol.write(&mut store, no, 0, &vec![SECRET; page]).unwrap();
+  vol.truncate(&mut store, no, KEPT as u64).unwrap();
+
+  let (mut device, mut driver) = device_and_driver();
+  let cache = tenant_cache("tail", page);
+  device.install_dax_window(Some(
+    slates_bridge_virtiofs::dax::DaxCacheRegion::new(cache.as_fd(), window).unwrap(),
+  ));
+  let cx = context_for(vid());
+  tenant_connect(
+    (&mut device, &mut driver),
+    (vid(), &mut vol, &mut store),
+    &cx,
+  );
+  assert_eq!(
+    tenant_dax_map(
+      (&mut device, &mut driver),
+      (vid(), &mut vol, &mut store),
+      &cx,
+      (2, no.0),
+      (0, page as u64)
+    ),
+    0,
+    "the truncated file maps"
+  );
+
+  // The whole window the device granted, not one DAX_PAGE of it.
+  let granted = device.dax_window_bytes(0, page as u64).unwrap_or_default();
+  assert_eq!(
+    granted.len(),
+    page,
+    "the granted window is readable in full"
+  );
+  assert_eq!(
+    granted.get(..KEPT),
+    Some(vec![SECRET; KEPT].as_slice()),
+    "the file's own surviving bytes are there"
+  );
+  assert!(
+    granted
+      .get(KEPT..)
+      .is_some_and(|tail| tail.iter().all(|byte| *byte == 0)),
+    "every byte past the file's length is zero, not the truncated-away secret"
+  );
+
+  drop(cache);
+}
+
 /// A 64-byte FUSE_INIT body (major 7, minor 38): the codec reads what it needs.
 #[cfg(unix)]
 fn dax_init_body() -> Vec<u8> {

@@ -119,8 +119,17 @@ pub struct Mapping {
 }
 
 impl Mapping {
-  /// The window bytes this mapping occupies — whole pages (`file_len` rounded up to [`DAX_PAGE`]). A guest's page
-  /// table covers exactly these pages and no more.
+  /// The window bytes this mapping occupies in [`DAX_PAGE`] units: `file_len` rounded up, at least one page.
+  ///
+  /// This is the **mediated** path's bound ([`Volume::dax_read`]), and it is *not* what a guest's page table
+  /// covers — an earlier version of this line claimed it was, which is false wherever the host's page is larger
+  /// than [`DAX_PAGE`]. A device grants whole HOST pages: `file_len` rounded up to the placer's granule, capped at
+  /// the block (`bridge-virtiofs`'s authorized window). On an Apple-Silicon host that granule is 16 KiB against a
+  /// 4 KiB [`DAX_PAGE`], so the guest's window is four times this; on x86_64 Linux the two coincide. Neither
+  /// exposes anything it should not: a map scrubs the whole block past `file_len`, and the device's cap at the
+  /// block stops a coarse granule reaching the next one. Both are proven by use — the mediated path by
+  /// `a_mapping_does_not_expose_the_bytes_past_the_files_length`, the device's wider window by
+  /// `a_device_window_past_the_files_length_shows_zeroes_not_the_truncated_secret`.
   #[must_use]
   pub fn page_span(&self) -> usize {
     self
