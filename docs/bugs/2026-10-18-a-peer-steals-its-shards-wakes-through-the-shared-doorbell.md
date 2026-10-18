@@ -140,6 +140,29 @@ already the design. Either way the wake path changes, so **R9's provisioning his
 from one kick to one registration per client, and that must be shown not to move the single-client
 spinning p99 that AC-2.1 holds at 50 µs.
 
+### The implementation shape, worked out, so the plan is not re-derived
+
+Checked rather than assumed: **there is no long-lived per-client task to hang this on.** A client's
+arrival task (`daemon.rs`, the `SpawnRequest` that inserts its `ClientSlot`) inserts and ends. So a
+per-client doorbell cannot simply await inside an existing task.
+
+What fits the runtime as it stands:
+
+- **A fresh eventfd per client in the hand-off**, registered on the shard's driver **edge-triggered and
+  persistent**, with the **server task's word**. The serve loop already drains every ready client ring
+  (`serve_round`), so it never needs to know *which* client rang — which is what removes the need for a
+  task per client and for draining the eventfd at all. Edge-triggered means an undrained counter does
+  not spin the poller, and a client that saturates its own counter only breaks its own doorbell.
+- The cost is one `epoll_ctl` at admission and one at reap, and one descriptor per client beside the
+  completion eventfd each client already gets.
+- **What it needs that does not exist:** `Driver::register_readable` is *one-shot* by contract, so this
+  needs a persistent variant across all five paired `#[cfg]` implementations (`epoll`, `kqueue`,
+  `uring` is gone, `iocp`, `sim`). That is a change to the runtime's core trait, which is why it is
+  written down here rather than made in passing.
+- macOS and Windows ring the bootstrap object's doorbell word rather than a descriptor, so their arms
+  take no doorbell registration; their own exposure is the separate name-reachability finding
+  (`docs/bugs/2026-10-18-macos-shares-by-name-so-a-stranger-opens-any-clients-ring.md`).
+
 ## Owed
 
 - The fix above, with the provisioning A/B.
