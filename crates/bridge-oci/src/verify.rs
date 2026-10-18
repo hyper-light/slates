@@ -144,24 +144,28 @@ pub enum SourceChange {
   },
 }
 
-/// Whether `source` is still the mount instance verified as `identity` in `entries` (the kernel's table
-/// now): the check a harness runs immediately before it hands the bind to its runtime, so it never binds a
-/// replacement or a bare directory left where the mount was. Pure, so it is tested on every host.
+/// Whether `source` is still the mount instance verified as `identity`: the check a harness runs immediately
+/// before it hands the bind to its runtime, so it never binds a replacement or a bare directory left where the
+/// mount was. `entries` (the kernel's table now) says whether anything is mounted there at all; `live` is that
+/// path's identity read now through [`crate::mount_table::mount_identity_at`], and it is what decides, because
+/// the table's own mount id is reused by the kernel and a replacement reproduces it. Pure, so it is tested on
+/// every host.
 pub fn source_unchanged(
   entries: &[MountEntry],
   source: &str,
   identity: MountIdentity,
+  live: MountIdentity,
 ) -> Result<(), SourceChange> {
   let path = normalized(source);
-  let entry = entries
+  entries
     .iter()
     .rev()
     .find(|entry| normalized(&entry.mount_point) == path)
     .ok_or(SourceChange::Missing)?;
-  if entry.identity != identity {
+  if live != identity {
     return Err(SourceChange::Replaced {
       verified: identity,
-      found: entry.identity,
+      found: live,
     });
   }
   Ok(())
@@ -176,10 +180,13 @@ fn normalized(path: &str) -> &str {
 /// Verifies `host_path` against `entries`: absolute, exactly a mount point (the last mount at that
 /// path is the visible one), of the expected type, and — where the source names volumes — of this
 /// volume.
+/// `identity` is the mount's identity read now through [`crate::mount_table::mount_identity_at`], which is what
+/// the harness will compare against later; the table's own id is reused by the kernel and cannot serve.
 pub fn verify_host_mount(
   entries: &[MountEntry],
   host_path: &str,
   expected: &ExpectedMount,
+  identity: MountIdentity,
 ) -> Result<VerifiedHostMount, HostPathRefusal> {
   if !host_path.starts_with('/') {
     return Err(HostPathRefusal::NotAbsolute);
@@ -222,6 +229,6 @@ pub fn verify_host_mount(
     source: entry.source.clone(),
     names_volume: true,
     attachment,
-    identity: entry.identity,
+    identity,
   })
 }

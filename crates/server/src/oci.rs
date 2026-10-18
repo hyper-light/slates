@@ -86,9 +86,10 @@ pub(crate) fn bind(
   read_only: bool,
 ) -> Result<Binding, Refusal> {
   use slates_bridge_oci::binding::{DestinationRefusal, OciMountEntry};
-  use slates_bridge_oci::mount_table::mount_table;
+  use slates_bridge_oci::mount_table::MountIdentity;
+  use slates_bridge_oci::mount_table::{mount_identity_at, mount_table};
   use slates_bridge_oci::verify::{
-    HostPathRefusal, expected_mount, host_mount_kind, verify_host_mount,
+    HostPathRefusal, VerifiedHostMount, expected_mount, host_mount_kind, verify_host_mount,
   };
 
   let Some(kind) = host_mount_kind() else {
@@ -107,20 +108,35 @@ pub(crate) fn bind(
   }
   let entries = mount_table()
     .map_err(|e| chosen(HostPathReason::MountTableUnavailable { errno: e.errno() }))?;
-  let verified =
-    verify_host_mount(&entries, source, &expected_mount(kind, volume_name)).map_err(|refusal| {
-      chosen(match refusal {
-        HostPathRefusal::NotAbsolute => HostPathReason::NotAbsolute,
-        HostPathRefusal::NotAMountPoint => HostPathReason::NotAMountPoint,
-        HostPathRefusal::ForeignFilesystem { fstype } => {
-          HostPathReason::ForeignFilesystem { fstype }
-        }
-        HostPathRefusal::NotThisVolume { source } => HostPathReason::NotThisVolume { source },
-        HostPathRefusal::DescendantMount { mount_point } => {
-          HostPathReason::DescendantMount { mount_point }
-        }
-      })
-    })?;
+  let verified = verify_host_mount(
+    &entries,
+    source,
+    &expected_mount(kind, volume_name),
+    MountIdentity::default(),
+  )
+  .map_err(|refusal| {
+    chosen(match refusal {
+      HostPathRefusal::NotAbsolute => HostPathReason::NotAbsolute,
+      HostPathRefusal::NotAMountPoint => HostPathReason::NotAMountPoint,
+      HostPathRefusal::ForeignFilesystem { fstype } => HostPathReason::ForeignFilesystem { fstype },
+      HostPathRefusal::NotThisVolume { source } => HostPathReason::NotThisVolume { source },
+      HostPathRefusal::DescendantMount { mount_point } => {
+        HostPathReason::DescendantMount { mount_point }
+      }
+    })
+  })?;
+  // Only now, for a path the table has already vouched for: the identity recorded as evidence is the one the
+  // kernel never reuses, read of this path alone. The table's own mount id is reused, so a mount swapped in at
+  // the same path reproduces it and the later check passes a replacement
+  // (`docs/bugs/2026-10-17-oci-check-accepts-a-replaced-mount.md`). Asking after the pure checks keeps each
+  // refusal the precise one — a path that is no mount point is `NotAMountPoint`, not a failed identity read —
+  // and a kernel that cannot name a mount uniquely refuses rather than record evidence no check can use.
+  let identity = mount_identity_at(source)
+    .map_err(|e| chosen(HostPathReason::MountTableUnavailable { errno: e.errno() }))?;
+  let verified = VerifiedHostMount {
+    identity,
+    ..verified
+  };
   let entry = OciMountEntry::new(&verified, destination, read_only).map_err(|e| match e {
     DestinationRefusal::NotAbsolute => chosen(HostPathReason::DestinationNotAbsolute),
   })?;

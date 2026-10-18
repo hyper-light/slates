@@ -908,7 +908,20 @@ pub(crate) fn oci_check(check: &crate::args::OciCheck) -> Result<(), Failure> {
     mount: check.mount_id,
     device: check.device,
   };
-  match slates_bridge_oci::verify::source_unchanged(&table, &check.source, verified) {
+  // What decides is the identity the kernel does not reuse, read of this path now; the table says only whether
+  // anything is still mounted there. A kernel that cannot name a mount uniquely refuses, since this check would
+  // otherwise pass a replacement (`docs/bugs/2026-10-17-oci-check-accepts-a-replaced-mount.md`).
+  let live = match slates_bridge_oci::mount_table::mount_identity_at(&check.source) {
+    Ok(live) => live,
+    Err(slates_bridge_oci::mount_table::MountTableError::NoUniqueMountId) => {
+      return Err(Failure::Refused(
+        "SourceUncheckable: this kernel does not report a mount id it never reuses, so a replacement at this          path cannot be told from the mount verified (Linux 6.8 added it)"
+          .to_owned(),
+      ));
+    }
+    Err(e) => return Err(Failure::Failed(format!("reading the mount identity: {e}"))),
+  };
+  match slates_bridge_oci::verify::source_unchanged(&table, &check.source, verified, live) {
     Ok(()) => {
       println!("unchanged: {}", check.source);
       Ok(())

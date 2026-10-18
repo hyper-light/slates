@@ -3408,6 +3408,79 @@ fn a_verified_container_source_is_checked_again_before_it_is_bound() {
   assert!(missing.contains("SourceMissing"), "{missing}");
 }
 
+/// Whether a shared mount — the only kind the container form binds — may be made here: the operator's
+/// `user_allow_other` grant. Read, never written (R1). Skips loudly like the container leg.
+#[cfg(target_os = "linux")]
+fn shared_mounts_are_granted() -> bool {
+  if !linux_fuse_mount_runs() {
+    return false;
+  }
+  #[allow(clippy::disallowed_methods)] // a host configuration file, read only (R1)
+  let granted = std::fs::read_to_string("/etc/fuse.conf")
+    .is_ok_and(|conf| conf.lines().any(|line| line.trim() == "user_allow_other"));
+  if !granted {
+    eprintln!(
+      "SKIP: the swapped-source check needs user_allow_other in /etc/fuse.conf (an operator's grant)"
+    );
+  }
+  granted
+}
+
+/// A volume created for a test, by id.
+#[cfg(target_os = "linux")]
+fn created_volume(instance: &str, name: &str) -> String {
+  let (code, out, err) = run(instance, &["volume", "create", name, "--bounded", "8MiB"]);
+  assert_eq!(code, 0, "{err}");
+  value_of(&out, "id")
+}
+
+/// AUD-29-66, against the replacement the kernel's own table cannot show. Do: mount one volume, attach the
+/// container form over it and keep the evidence, unmount it, mount a *second* volume at the same path, and run
+/// the check a harness runs immediately before its runtime binds. Expect: refused `SourceReplaced`, exit 1 —
+/// the harness binds nothing. This is the attack the check exists for and it is not hypothetical: the kernel
+/// hands the mount id back out (an IDA's lowest free number) and reuses the FUSE superblock's anonymous device
+/// with it, so the second mount arrived wearing the first's whole table identity — measured id 927 and device
+/// 0:114 for both, first try, on kernel 7.2.9-2-cachyos — and the check answered `unchanged`, exit 0, so a
+/// runtime bound the second volume's bytes for the first's
+/// (`docs/bugs/2026-10-17-oci-check-accepts-a-replaced-mount.md`). What decides now is the id the kernel never
+/// reuses. Gated like the other Linux mount flows.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_container_source_swapped_for_another_mount_is_refused() {
+  if !shared_mounts_are_granted() {
+    return;
+  }
+  let instance = format!("cli-oci-swap-{}", std::process::id());
+  let anchor = start_anchor(&instance);
+  let victim = created_volume(&instance, "victim");
+  let attacker = created_volume(&instance, "attacker");
+  let mount_point = MountPoint {
+    path: fresh_mount_point(),
+  };
+  let path = mount_point.path.clone();
+  // The container form binds only a shared mount, so both mounts here are the real thing a runtime would take.
+  let mount_shared = |id: &str| {
+    let (code, _, err) = run(&instance, &["mount", id, &path, "--shared"]);
+    assert_eq!(code, 0, "slates mount --shared: {err}");
+  };
+  mount_shared(&victim);
+  let binding = attach_oci(&instance, &victim, &path, "--write");
+  let (code, before, err) = oci_check(&instance, &binding);
+  assert_eq!(code, 0, "the source is the mount verified: {before}{err}");
+  detach_all(&instance, &[binding["attachment"].as_u64().unwrap()]);
+  let (code, _, err) = run(&instance, &["unmount", &path]);
+  assert_eq!(code, 0, "the verified mount is taken away: {err}");
+  // The swap: another volume, the same path, and nothing in the kernel's table to tell them apart.
+  mount_shared(&attacker);
+  let (code, out, replaced) = oci_check(&instance, &binding);
+  let (cleaned, _, _) = run(&instance, &["unmount", &path]);
+  drop(mount_point);
+  drop(anchor);
+  assert_eq!(cleaned, 0, "the swapped-in mount is cleaned up");
+  assert_eq!(code, 1, "a replaced source is refused: {out}{replaced}");
+  assert!(replaced.contains("SourceReplaced"), "{replaced}");
+}
+
 /// T-2.14 / AUD-07: review a recovery plan through the real CLI, refuse missing authority,
 /// then approve that exact plan through the anchor issuer and continue serving the retained catalog.
 #[test]

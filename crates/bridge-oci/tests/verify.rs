@@ -6,14 +6,14 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use slates_bridge_oci::binding::{DestinationRefusal, OciMountEntry};
-use slates_bridge_oci::mount_table::{MountEntry, MountTableError, parse_mountinfo};
+use slates_bridge_oci::mount_table::{MountEntry, MountIdentity, MountTableError, parse_mountinfo};
 use slates_bridge_oci::verify::{
   HostMountKind, HostPathRefusal, expected_mount, verify_host_mount,
 };
 
 fn entry(mount_point: &str, fstype: &str, source: &str) -> MountEntry {
   MountEntry {
-    identity: slates_bridge_oci::mount_table::MountIdentity::default(),
+    identity: MountIdentity::default(),
     mount_point: mount_point.to_owned(),
     fstype: fstype.to_owned(),
     source: source.to_owned(),
@@ -41,6 +41,7 @@ fn a_loopback_mount_of_the_volume_is_verified_and_names_it() {
     &macos_table(),
     "/private/var/folders/1s/T/tmp.abc/",
     &expected,
+    MountIdentity::default(),
   )
   .unwrap();
   assert_eq!(verified.mount_point, "/private/var/folders/1s/T/tmp.abc");
@@ -64,7 +65,7 @@ fn only_the_exact_source_names_the_volume() {
   ] {
     let table = [entry("/mount", "nfs", source)];
     assert_eq!(
-      verify_host_mount(&table, "/mount", &expected),
+      verify_host_mount(&table, "/mount", &expected, MountIdentity::default()),
       Err(HostPathRefusal::NotThisVolume {
         source: source.to_owned()
       }),
@@ -81,26 +82,36 @@ fn every_host_path_refusal_is_typed_and_reached() {
   let table = macos_table();
   let expected = expected_mount(HostMountKind::NfsLoopback, "work");
   assert_eq!(
-    verify_host_mount(&table, "relative/path", &expected),
+    verify_host_mount(&table, "relative/path", &expected, MountIdentity::default()),
     Err(HostPathRefusal::NotAbsolute)
   );
   assert_eq!(
-    verify_host_mount(&[], "relative/path", &expected),
+    verify_host_mount(&[], "relative/path", &expected, MountIdentity::default()),
     Err(HostPathRefusal::NotAbsolute),
     "nothing consulted"
   );
   assert_eq!(
-    verify_host_mount(&table, "/private/var/folders/1s/T/tmp.abc/sub", &expected),
+    verify_host_mount(
+      &table,
+      "/private/var/folders/1s/T/tmp.abc/sub",
+      &expected,
+      MountIdentity::default()
+    ),
     Err(HostPathRefusal::NotAMountPoint)
   );
   assert_eq!(
-    verify_host_mount(&table, "/", &expected),
+    verify_host_mount(&table, "/", &expected, MountIdentity::default()),
     Err(HostPathRefusal::ForeignFilesystem {
       fstype: "apfs".to_owned()
     })
   );
   assert_eq!(
-    verify_host_mount(&table, "/Users/me/other", &expected),
+    verify_host_mount(
+      &table,
+      "/Users/me/other",
+      &expected,
+      MountIdentity::default()
+    ),
     Err(HostPathRefusal::NotThisVolume {
       source: "slates:/other".to_owned()
     })
@@ -113,7 +124,13 @@ fn the_last_mount_at_a_path_is_the_visible_one() {
   let mut table = macos_table();
   table.push(entry("/Users/me/other", "nfs", "slates:/work"));
   let expected = expected_mount(HostMountKind::NfsLoopback, "work");
-  let verified = verify_host_mount(&table, "/Users/me/other", &expected).unwrap();
+  let verified = verify_host_mount(
+    &table,
+    "/Users/me/other",
+    &expected,
+    MountIdentity::default(),
+  )
+  .unwrap();
   assert_eq!(verified.source, "slates:/work");
 }
 
@@ -156,18 +173,29 @@ fn a_fuse_mount_is_verified_by_the_attachment_its_source_names() {
   assert_eq!(table[2].fstype, "fuse.slates");
   assert_eq!(table[2].source, "slates:00000000000000ab");
   let expected = expected_mount(HostMountKind::Fuse, "work");
-  let verified = verify_host_mount(&table, "/home/runner/mnt point", &expected).unwrap();
+  let verified = verify_host_mount(
+    &table,
+    "/home/runner/mnt point",
+    &expected,
+    MountIdentity::default(),
+  )
+  .unwrap();
   assert!(verified.names_volume);
   assert_eq!(verified.attachment, Some(0xab));
   assert_eq!(
-    verify_host_mount(&table, "/home/runner/old", &expected),
+    verify_host_mount(
+      &table,
+      "/home/runner/old",
+      &expected,
+      MountIdentity::default()
+    ),
     Err(HostPathRefusal::NotThisVolume {
       source: "slates".to_owned()
     })
   );
   a_malformed_attachment_source_names_none();
   assert_eq!(
-    verify_host_mount(&table, "/", &expected),
+    verify_host_mount(&table, "/", &expected, MountIdentity::default()),
     Err(HostPathRefusal::ForeignFilesystem {
       fstype: "ext4".to_owned()
     })
@@ -199,6 +227,7 @@ fn the_runtime_entry_carries_the_attachment_policy() {
     &macos_table(),
     "/private/var/folders/1s/T/tmp.abc",
     &expected,
+    MountIdentity::default(),
   )
   .unwrap();
   let read_only = OciMountEntry::new(&verified, "/work", true).unwrap();
@@ -257,7 +286,7 @@ fn a_source_with_a_mount_beneath_it_is_refused() {
     entry("/home/u/mnt-other", "apfs", "/dev/disk2s1"),
   ];
   assert_eq!(
-    verify_host_mount(&table, "/home/u/mnt", &expected),
+    verify_host_mount(&table, "/home/u/mnt", &expected, MountIdentity::default()),
     Err(HostPathRefusal::DescendantMount {
       mount_point: "/home/u/mnt/inner".to_owned()
     })
@@ -266,7 +295,7 @@ fn a_source_with_a_mount_beneath_it_is_refused() {
     .into_iter()
     .filter(|e| e.mount_point != "/home/u/mnt/inner")
     .collect();
-  assert!(verify_host_mount(&clean, "/home/u/mnt", &expected).is_ok());
+  assert!(verify_host_mount(&clean, "/home/u/mnt", &expected, MountIdentity::default()).is_ok());
 }
 
 /// AUD-29-66. Do: parse the proc(5) example `mountinfo` line. Expect: its identity is mount 36, device 98:0
@@ -291,12 +320,12 @@ fn a_mountinfo_line_names_its_mount_instance() {
 }
 
 /// AUD-29-66. Do: verify a source, then check it again against tables where it is unchanged, gone, remounted
-/// with another identity, and shadowed by a later mount at the same path. Expect: unchanged passes; gone is
-/// `Missing` (a runtime would bind a bare directory, or create one); remounted and shadowed are `Replaced`,
-/// naming both identities — so a harness that checks just before its runtime binds never binds a replacement.
+/// with another identity, shadowed by a later mount at the same path, and — the real attack — replaced by a
+/// mount the kernel gave the same table id. Expect: unchanged passes; gone is `Missing` (a runtime would bind a
+/// bare directory, or create one); every replacement is `Replaced`, naming both identities, including the one
+/// the table cannot see — so a harness that checks just before its runtime binds never binds a replacement.
 #[test]
 fn a_source_checked_again_must_be_the_mount_instance_verified() {
-  use slates_bridge_oci::mount_table::MountIdentity;
   use slates_bridge_oci::verify::{SourceChange, source_unchanged};
   let verified = MountIdentity {
     mount: 7,
@@ -307,11 +336,16 @@ fn a_source_checked_again_must_be_the_mount_instance_verified() {
     ..entry("/work/mnt", "nfs", "localhost:/work")
   };
   assert_eq!(
-    source_unchanged(&[with(verified)], "/work/mnt", verified),
+    source_unchanged(&[with(verified)], "/work/mnt", verified, verified),
     Ok(())
   );
   assert_eq!(
-    source_unchanged(&[entry("/", "apfs", "/dev/disk3s1")], "/work/mnt", verified),
+    source_unchanged(
+      &[entry("/", "apfs", "/dev/disk3s1")],
+      "/work/mnt",
+      verified,
+      verified
+    ),
     Err(SourceChange::Missing)
   );
   let remounted = MountIdentity {
@@ -319,7 +353,16 @@ fn a_source_checked_again_must_be_the_mount_instance_verified() {
     device: 9,
   };
   assert_eq!(
-    source_unchanged(&[with(remounted)], "/work/mnt", verified),
+    source_unchanged(&[with(remounted)], "/work/mnt", verified, remounted),
+    Err(SourceChange::Replaced {
+      verified,
+      found: remounted
+    })
+  );
+  // The attack this is written for: the kernel reused the table's mount id, so the table still shows the
+  // verified identity, and only the id it never reuses says the mount is another one.
+  assert_eq!(
+    source_unchanged(&[with(verified)], "/work/mnt", verified, remounted),
     Err(SourceChange::Replaced {
       verified,
       found: remounted
@@ -330,7 +373,7 @@ fn a_source_checked_again_must_be_the_mount_instance_verified() {
     device: 12,
   };
   assert_eq!(
-    source_unchanged(&[with(verified), with(over)], "/work/mnt/", verified),
+    source_unchanged(&[with(verified), with(over)], "/work/mnt/", verified, over),
     Err(SourceChange::Replaced {
       verified,
       found: over

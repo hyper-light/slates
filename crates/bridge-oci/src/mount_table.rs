@@ -55,6 +55,9 @@ pub enum MountTableError {
     /// The bound in bytes.
     cap: usize,
   },
+  /// The kernel does not report a mount id it never reuses, so no identity here can tell one mount instance
+  /// from the next at the same path (Linux before 6.8, which added `STATX_MNT_ID_UNIQUE`).
+  NoUniqueMountId,
 }
 
 impl fmt::Display for MountTableError {
@@ -64,6 +67,10 @@ impl fmt::Display for MountTableError {
       Self::Query { errno } => write!(f, "the kernel refused the mount-table query: errno {errno}"),
       Self::Malformed { line } => write!(f, "the mount table is malformed at line {line}"),
       Self::TooLarge { cap } => write!(f, "the mount table exceeds its bound of {cap} bytes"),
+      Self::NoUniqueMountId => write!(
+        f,
+        "this kernel does not report a mount id it never reuses, so a replaced mount cannot be told apart"
+      ),
     }
   }
 }
@@ -75,7 +82,10 @@ impl MountTableError {
   pub const fn errno(&self) -> i32 {
     match self {
       Self::Query { errno } => *errno,
-      Self::Unsupported { .. } | Self::Malformed { .. } | Self::TooLarge { .. } => 0,
+      Self::Unsupported { .. }
+      | Self::Malformed { .. }
+      | Self::TooLarge { .. }
+      | Self::NoUniqueMountId => 0,
     }
   }
 }
@@ -95,6 +105,48 @@ pub fn mount_table() -> Result<Vec<MountEntry>, MountTableError> {
 /// Every mounted filesystem: no query is built here.
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 pub fn mount_table() -> Result<Vec<MountEntry>, MountTableError> {
+  Err(MountTableError::Unsupported {
+    platform: std::env::consts::OS,
+  })
+}
+
+/// The kernel's identity of the mount at `path`, read now (AUD-29-66) — the one a harness compares with the
+/// identity its attach recorded, so it never binds a replacement.
+///
+/// This is a seam of its own rather than a field of [`mount_table`] because the identity that survives the
+/// comparison is not in the table. `mountinfo`'s mount id is reused: the kernel allocates it from an IDA that
+/// hands back the lowest free number, so unmounting a mount and mounting another at the same path reproduces it
+/// — measured 927 for both a victim and an attacker mount on kernel 7.2.9-2-cachyos (2026-10-17), first try,
+/// with the FUSE superblock's anonymous device (0:114) reused with it. Linux 6.8 added `STATX_MNT_ID_UNIQUE` for
+/// exactly this reason and it told the same two mounts apart (2156321564 against 2156321579), so that is what is
+/// asked for here. Reading one path costs one `statx` against the table's whole-file read, and it is asked only
+/// of the path being verified, never of every mount on the host.
+#[cfg(target_os = "linux")]
+pub fn mount_identity_at(path: &str) -> Result<MountIdentity, MountTableError> {
+  linux::identity_at(path)
+}
+
+/// The kernel's identity of the mount at `path`, read now: on macOS the `statfs` filesystem id the table
+/// already carries, found by mount point. Whether `f_fsid` is reused across an unmount and a remount is not
+/// established here, so this is the table's own answer and claims nothing more.
+#[cfg(target_os = "macos")]
+pub fn mount_identity_at(path: &str) -> Result<MountIdentity, MountTableError> {
+  let wanted = path.trim_end_matches('/');
+  let wanted = if wanted.is_empty() { "/" } else { wanted };
+  mount_table()?
+    .iter()
+    .rev()
+    .find(|entry| {
+      let point = entry.mount_point.trim_end_matches('/');
+      (if point.is_empty() { "/" } else { point }) == wanted
+    })
+    .map(|entry| entry.identity)
+    .ok_or(MountTableError::Query { errno: 0 })
+}
+
+/// The kernel's identity of the mount at `path`: no query is built here.
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub fn mount_identity_at(_path: &str) -> Result<MountIdentity, MountTableError> {
   Err(MountTableError::Unsupported {
     platform: std::env::consts::OS,
   })
@@ -192,10 +244,35 @@ mod linux {
   /// fixed-width ids, options and type fields; four `PATH_MAX` bounds all of them.
   const LINE_CAP: usize = 4 * PATH_MAX;
 
+  /// Format: `STATX_MNT_ID_UNIQUE` (Linux 6.8, `include/uapi/linux/stat.h`) — the mask bit that asks for the
+  /// mount id the kernel never reuses. rustix 1.1.5 names `STATX_MNT_ID` (5.8) but not this one.
+  const STATX_MNT_ID_UNIQUE: u32 = 0x0000_4000;
+
   fn errno_of(e: rustix::io::Errno) -> MountTableError {
     MountTableError::Query {
       errno: e.raw_os_error(),
     }
+  }
+
+  /// One `statx` for the unique mount id of `path`. `AT_STATX_DONT_SYNC` asks the kernel not to go to the
+  /// filesystem for freshness, so a mount whose attributes are cached answers without a round trip to its
+  /// daemon. A kernel that does not set the mask bit is refused rather than answered from the reusable id.
+  pub(super) fn identity_at(path: &str) -> Result<super::MountIdentity, MountTableError> {
+    let answer = rustix::fs::statx(
+      rustix::fs::CWD,
+      path,
+      rustix::fs::AtFlags::STATX_DONT_SYNC,
+      rustix::fs::StatxFlags::from_bits_retain(STATX_MNT_ID_UNIQUE),
+    )
+    .map_err(errno_of)?;
+    if answer.stx_mask & STATX_MNT_ID_UNIQUE == 0 {
+      return Err(MountTableError::NoUniqueMountId);
+    }
+    Ok(super::MountIdentity {
+      mount: answer.stx_mnt_id,
+      device: (u64::from(answer.stx_dev_major) << super::MAJOR_SHIFT)
+        | u64::from(answer.stx_dev_minor),
+    })
   }
 
   /// Reads a pseudo-file whole through a read-only descriptor, refusing past `cap` bytes.
