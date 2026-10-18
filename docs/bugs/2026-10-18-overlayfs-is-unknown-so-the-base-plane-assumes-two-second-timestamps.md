@@ -87,9 +87,24 @@ I cannot prove the tighter bound for every overlayfs stack:
    base directory is a host path slates only ever reads.
 4. **Leave it.** Correct and slow in containers, which is where it is today.
 
-Option 3 is the only one that generalises, and it needs a place to write that R1 permits — the question
-is whether a granted landing's target, or the daemon's own build area, is a legitimate stand-in for the
-base's filesystem (same mount in some deployments, not in others). That is a design call.
+5. **Infer the bound from timestamps slates already reads — no write, so no R1 problem.** The base plane
+   already stats every base file it witnesses. Granularity is how finely an mtime can *advance*, so the
+   smallest non-zero difference between any two observed mtimes on that filesystem is a sound **upper
+   bound** on it: if two files differ by 300 µs, the clock demonstrably advanced within 300 µs, whatever
+   the type table says. That tightens only on evidence and never below what was actually observed, so it
+   cannot be unsafe the way options 1 and 2 are.
+
+   Two things it is not. It is **not** a proof from a single mtime's precision — a filesystem may store
+   nanoseconds and still only update per millisecond, so representation says nothing about advance; only
+   a *difference* does. And it is opportunistic: a directory whose files were all unpacked in the same
+   second offers no evidence, so the table stays the floor and nothing regresses. The shape is the right
+   one either way — a safe default that evidence may tighten, never a guess that evidence must refute.
+
+Options 1 and 2 are guesses. Option 3 generalises but needs a place to write that R1 permits — whether a
+granted landing's target, or the daemon's own build area, is a legitimate stand-in for the base's
+filesystem (the same mount in some deployments, not in others), which is a design call. **Option 5 looks
+like the one that is both sound and already permitted**, and it is the one I would build; it is written
+here rather than built because changing how freshness is bounded is Ada's call, not a test fix.
 
 ## Owed
 
