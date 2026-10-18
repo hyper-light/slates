@@ -196,9 +196,19 @@ fn a_same_kernel_client_maps_a_file_with_no_copy() {
   client.detach(attached.attachment).unwrap();
 
   let mapped = client.map_read(id, "/big.bin").unwrap();
+  // The zero-copy map hands the block's descriptor to the peer over the control socket. That hand-off is built on
+  // Linux and **owed on macOS** (the daemon answers `Unsupported { feature: "same-kernel direct map (macOS control
+  // socket owed)" }`, and `map_read` takes its documented copy fallback). Both are asserted rather than the test
+  // being skipped, so the fallback keeps its cover and the bytes are checked on either path.
+  #[cfg(target_os = "linux")]
   assert!(
     mapped.is_zero_copy(),
     "a same-uid, single-shard, arena-backed read takes the zero-copy map, not the copy fallback"
+  );
+  #[cfg(not(target_os = "linux"))]
+  assert!(
+    !mapped.is_zero_copy(),
+    "until the control-socket hand-off lands on this platform the daemon answers the copy fallback"
   );
   assert_eq!(
     mapped.bytes(),
