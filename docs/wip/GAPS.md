@@ -6635,3 +6635,34 @@ per client on the shard's driver: a fresh eventfd in the hand-off (as the comple
 is), or the client's **existing** control socket, which adds no descriptor at all. R9's provisioning
 histogram is the gate on the change, since the shard's poll set grows with clients. Record:
 `docs/bugs/2026-10-18-a-peer-steals-its-shards-wakes-through-the-shared-doorbell.md`.
+
+### 2026-10-18: one volume's DAX map storm denied every other volume (§4.6 multi-tenancy; fixed)
+
+The mapping registry's cap is the shard's chunk budget, on the stated reasoning that "a mapping pins a chunk, and
+the shard holds no more chunks than `max_chunks`" — and `a_map_storm_is_refused_at_the_registry_bound` proved a
+guest could not grow it without limit. The bound was the **shard's** and the accounting was per **request**:
+`dax_map_read_at` and `dax_map_write` registered a fresh entry on every call, so a guest asking for the *same*
+window a thousand times cost a thousand entries for one window onto one block. The old test therefore proved the
+weaker half of the threat and missed the half that matters on the multi-tenant host the gate exists for — the
+tenant who fills a shared bound is not the tenant who pays for it.
+
+Measured, two volumes on a 32-chunk store (`one_volumes_map_storm_does_not_deny_another_volume`): *"the victim
+volume was denied its first window by another volume's storm: Err(NoSpace) (attacker holds 32 of 32)"*, with the
+victim's map shown to succeed on a quiet registry immediately before.
+
+**Fixed by making a repeat request return the window it already has** (`DaxRegistry::live_window`, consulted by
+both map paths before the pin and before the writable path's copy-up). The registry now grows with the windows
+that exist rather than with the requests made, so a storm on one window is one entry and cannot reach the cap at
+all; to consume entries a volume must hold windows onto distinct blocks, and with one entry per distinct block the
+registry's cap and the arena's chunk budget are the same number — which is what the cap's derivation always
+claimed. A volume's consumption is then bounded by content its own quota already bounds. Correctness-neutral: a
+guest that asks twice for one window has one window; a write or truncate revokes the inode's mappings so a live
+one is never stale; directory windows are untouched and keep their decided point-in-time re-map semantics.
+
+**The hostile-input test was rewritten and that is flagged, not buried:**
+`a_map_storm_is_absorbed_and_the_registry_grows_only_with_real_windows` replaces the "refused at the cap" version.
+Rewriting a threat test to suit a fix deserves suspicion; here the new assertion is strictly stronger (refusing is
+a bound; absorbing is a bound *and* fairness) and the test measuring the weakness the old one missed is committed
+beside it. Verified: vfs dax 52/52 on macOS aarch64, x86_64 Linux and aarch64 Linux; bridge-virtiofs green on both;
+recovery arbiter 39/39; clippy `-D warnings` and `xtask check` clean. Record:
+`docs/bugs/2026-10-18-one-volumes-dax-map-storm-denies-every-other-volume.md`.

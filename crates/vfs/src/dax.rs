@@ -304,6 +304,27 @@ impl DaxRegistry {
       .any(|mapping| mapping.writable && mapping.inode.prefix() == prefix)
   }
 
+  /// The live window that already covers `file_offset` of inode `no`, with the writability asked for, if one
+  /// exists (§4.6). A guest that asks twice for the same window needs one window, not two: returning the live one
+  /// keeps the registry proportional to the windows that exist rather than to the requests made.
+  ///
+  /// This is what stops a re-map storm from being a **cross-tenant** denial. The cap bounds the shard, so before
+  /// this a volume re-mapping one file filled the registry and the next volume's first window was refused
+  /// `NoSpace` — measured, 32 of 32 taken by one volume
+  /// (`one_volumes_map_storm_does_not_deny_another_volume`). Now a storm on one window is one entry, and to
+  /// consume entries a volume must map windows it actually has, which its own content does bound.
+  /// Directory windows do not come through here ([`Volume::dax_map_dir`] has its own path) and keep their
+  /// point-in-time re-map semantics.
+  pub(crate) fn live_window(&self, no: InodeNo, file_offset: usize, writable: bool) -> Option<Mapping> {
+    self.mappings.iter().copied().find(|held| {
+      held.inode == no
+        && held.writable == writable
+        && !held.snapshot
+        && file_offset >= held.block_file_start
+        && file_offset < held.block_file_start.saturating_add(held.file_len.max(1))
+    })
+  }
+
   /// Marks the volume `prefix` as recalling its writable windows, so [`Volume::dax_map_write`] refuses a new one
   /// until the recall ends (see the [`recalling`](Self::recalling) field for why). Idempotent. `false` when the
   /// registry is already holding `cap` recalls, which is the bound: the caller treats that as a refusal rather than
@@ -537,6 +558,13 @@ impl Volume {
     // (xattr-value) inode — so a crafted or confused map of an attribute number is `NotFound`, never a window onto
     // an attribute's bytes, mirroring the transports' `namespace_inode` gate.
     self.namespace_inode(&*store, no)?;
+    // The window this asks for may already exist: a guest that re-requests one needs the window it has, not a
+    // second entry for the same bytes ([`DaxRegistry::live_window`]). Checked first, so a storm of identical
+    // requests costs one entry and one pin rather than one of each per request. A write or truncate of the inode
+    // revokes its mappings, so a live one is never stale.
+    if let Some(live) = store.dax.live_window(no, file_offset, false) {
+      return Ok(live);
+    }
     // An inline file keeps its bytes in the inode with no content block; materialize them at offset 0 into a
     // throwaway block the mapping owns, exactly as `dax_map_dir` does. The clone releases the store borrow before
     // the mutable materialize.
@@ -751,6 +779,11 @@ impl Volume {
     // Checked before any effect, so a refused map copies nothing up.
     if store.dax.recalling(no.prefix()) {
       return Err(VfsError::RecallInFlight);
+    }
+    // As for a read window: a guest re-requesting the writable window it already holds gets that window, not a
+    // second entry — and not a second copy-up, which is the expensive half here.
+    if let Some(live) = store.dax.live_window(no, 0, true) {
+      return Ok(live);
     }
     // Defence in depth: a writable mapping, like a read mapping, is of a namespace object only — never an
     // attribute inode (`Volume::dax_map_read`).
