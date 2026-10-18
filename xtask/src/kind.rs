@@ -1679,7 +1679,7 @@ impl Lane {
       .unwrap_or(0);
 
     // A volume sealed on the owner places at f + 1 across pods.
-    let created = self.verb(&owner, &["volume", "create", "lane", "--bounded", "8MiB"])?;
+    let created = self.create_when_consensus_is_ready(&owner)?;
     let created: serde_json::Value = serde_json::from_str(&created.stdout).map_err(|e| {
       Failure(format!(
         "kind: create answered no JSON ({e}): {}",
@@ -1826,6 +1826,32 @@ impl Lane {
   /// Polls the survivors' `volume stat` until one serves the volume placed; returns it and the time since
   /// `since`. On the bound, `diagnosed` (every pod, the replacement included) is reported with
   /// [`Lane::fleet_diagnostics`].
+  /// Creates the lane's volume on `owner`, waiting out `ConsensusNotInitialized`.
+  ///
+  /// A pod answers verbs as soon as it is Ready and the fleet has formed by membership, but a fleet node imports
+  /// its consensus groups a moment later; a create issued in that window is refused with exactly that message,
+  /// which itself says to wait ("on a fleet node, wait for it to import the groups"). The lane used to issue the
+  /// create the instant the fleet formed and failed the whole run when it landed in the window (CI run
+  /// 39073360651, 2026-10-17). Any other refusal fails at once — only this one is a window to wait out.
+  fn create_when_consensus_is_ready(&self, owner: &str) -> Result<Outcome, Failure> {
+    let deadline = Instant::now() + FORMATION_WAIT;
+    loop {
+      let created = self.verb(owner, &["volume", "create", "lane", "--bounded", "8MiB"])?;
+      if created.code == 0 {
+        return Ok(created);
+      }
+      let waiting = created.stderr.contains("ConsensusNotInitialized");
+      if !waiting || Instant::now() >= deadline {
+        return Err(Failure(format!(
+          "kind: {owner} could not create the lane volume (exit {}): {}",
+          created.code,
+          created.stderr.trim()
+        )));
+      }
+      pause(POLL_CLUSTER);
+    }
+  }
+
   /// Whether `pod`'s **own** listing holds `id` — the ownership gate of this lane.
   ///
   /// `volume stat <id>` is NOT that gate. A by-id lookup is routed to the volume's owner (§4.8 "Lookup":
@@ -1840,12 +1866,13 @@ impl Lane {
   fn owns_locally(&self, pod: &str, id: &str) -> Result<bool, Failure> {
     let listed = self.verb(pod, &["volume", "list"])?;
     if listed.code != 0 {
-      return Err(Failure(format!(
-        "kind: {pod} could not list its volumes: {}",
-        listed.stderr
-      )));
+      // A pod that cannot answer its own listing right now (mid-churn, restarting) has not been shown to own the
+      // volume: answer "no", never a hard failure. This is read inside a poll loop, where a transient refusal must
+      // be retried rather than end the wait.
+      return Ok(false);
     }
-    // Volume ids are long hex, so a listing that names this one names this volume.
+    // Volume ids are long hex, so a listing that names this one names this volume. `volume list --json` is an
+    // array of summaries carrying `"id":"<id>"` (`crates/cli/tests/cli.rs` json_list_has).
     Ok(listed.stdout.contains(id))
   }
 
