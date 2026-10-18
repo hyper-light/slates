@@ -5640,3 +5640,40 @@ what it was weighed on: a 13% parked-p50 win, confined to the path the R9 gate d
 against the kernel attack surface and a `RLIMIT_MEMLOCK` boot failure. The driver is deleted rather
 than demoted — replace, do not layer. A quiesced re-run of this A/B is still owed as a record of the
 parked figure; it cannot change the decision, which rests on surface and on the spinning column.
+
+## 2026-10-18: what the confined-descriptor rule costs a local zero-copy read (A-135)
+
+Since 2026-10-18 the daemon refuses to hand a peer a descriptor that authorizes more than the read it answers
+(`Control::send_mapping` → `confined_for_a_peer`; the escape it closes is
+`docs/bugs/2026-10-18-a-read-handed-the-peer-the-whole-content-arena.md`). No backing satisfies the rule yet, so
+a `MapRead` takes its copy path. This prices that, so the per-tenant-backing decision has a number.
+
+**Hardware and discipline.** x86_64 Linux (cachyos 7.2.9-2), release binaries, a real one-shard daemon per run,
+a fresh volume and file per run. Two binaries differing in one line — the rule in force, and the rule lifted —
+**interleaved** A,B,A,B over three rounds, so the box's load is shared by both arms rather than attributed to
+one. The box is shared and was busy: `/proc/loadavg` 43–68 across the runs, recorded per line by the bench
+itself. 200 samples a point, one warm read outside the sample. Command:
+`cargo run --release -p slates-client --example map_read_ab -- <file_kib> <samples>`.
+
+**64 KiB (one content chunk), the only size where both arms return the same bytes:**
+
+| round | arm | p50 | p99 | max |
+|---|---|---|---|---|
+| 2 | copy (as shipped) | 62 µs | 294 µs | 353 µs |
+| 2 | zero-copy (rule lifted) | **4 µs** | **12 µs** | 46 µs |
+| 3 | copy (as shipped) | 61 µs | 296 µs | 388 µs |
+| 3 | zero-copy (rule lifted) | **6 µs** | **13 µs** | 17 µs |
+
+So the rule costs roughly **10–15× at p50 and ~23× at p99** on a single-chunk read. That is what a confined,
+sealed per-tenant backing would buy back.
+
+**No figure is given above 64 KiB, and the reason is the better finding.** The zero-copy arm returned exactly
+65,536 bytes for 256 KiB, 1 MiB and 4 MiB files — one chunk, silently — so its "throughput" at those sizes was
+meaningless (the bench was reporting 676,704 MiB/s for a 4 MiB file it had read 64 KiB of). That is
+`docs/bugs/2026-10-18-a-zero-copy-read-of-a-multi-chunk-file-returned-one-chunk.md`, fixed and red-checked in
+the same change; the bench now reports latency only and prints what each arm actually returned, so an arm that
+answers with less can never look fast.
+
+**What this does not measure:** the copy arm's figures are a full paged read of the file and the zero-copy arm's
+are an `mmap`, so the ratio is a property of the file size as much as of the paths; only the single-chunk row is
+an apples-to-apples comparison, and it is the only one quoted. A quiesced re-run would sharpen all of it.

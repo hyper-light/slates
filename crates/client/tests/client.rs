@@ -459,6 +459,78 @@ fn a_zero_copy_reads_descriptor_authorizes_its_window_and_nothing_more() {
   client.destroy(neighbour).unwrap();
 }
 
+/// AC-A-135 — a `MapRead` returns the **whole** file, whichever path it takes. Do: on a one-shard daemon, write
+/// files from well under one content chunk to several chunks across, and `map_read` each. Expect: every one
+/// returns every byte.
+///
+/// This is the test the A-135 suite did not have. Every other test here uses a 20 KiB file — "one chunk, so one
+/// block", as the first of them says — and the zero-copy path maps the content block at offset 0 and answers as
+/// though that block were the file. Measured on x86_64 Linux with the confinement rule lifted, a 256 KiB, a
+/// 1 MiB and a 4 MiB file each returned exactly 65,536 bytes and `equal=false`, with nothing to tell the caller
+/// (`docs/bugs/2026-10-18-a-zero-copy-read-of-a-multi-chunk-file-returned-one-chunk.md`). A silent short read is
+/// worse than a refusal, so the server now falls back to the copy path for a file bigger than the block it
+/// would map.
+///
+/// Sizes are chosen to straddle a chunk without depending on what the chunk size is: the smallest here is
+/// certainly inside one and the largest certainly spans several.
+#[cfg(unix)]
+#[test]
+fn a_map_read_returns_the_whole_file_at_every_size() {
+  let profile = profile();
+  let instance = format!("cl-whole-{}", std::process::id());
+  let config = DaemonConfig::derive(&profile, &instance, Some(1));
+  let daemon = Daemon::start(
+    &profile,
+    config,
+    SegmentSource::Create {
+      name: format!("slates-seg-cl-whole-{}", std::process::id()),
+    },
+  )
+  .unwrap();
+  daemon
+    .bootstrap(true)
+    .expect("the fixture creates its local consensus group");
+  let mut client = connect(&instance);
+
+  for kib in [4usize, 64, 256, 1024] {
+    let id = client
+      .create(&CreateSpec {
+        name: format!("whole-{kib}"),
+        size: SizeClass::Bounded {
+          limit: u64::try_from(kib << 10).unwrap_or(1 << 20).saturating_mul(8),
+        },
+        names: NamePolicy::Exact,
+        require_locked: false,
+        base: None,
+      })
+      .unwrap();
+    let bytes: Vec<u8> = (0..(kib << 10))
+      .map(|i| u8::try_from(i % 251).unwrap_or(0))
+      .collect();
+    let attached = client.attach(id, None, Intent::Write).unwrap();
+    client
+      .fs_write((id, attached.attachment), "/f.bin", &bytes, 0o644)
+      .unwrap();
+    client.detach(attached.attachment).unwrap();
+
+    let mapped = client.map_read(id, "/f.bin").unwrap();
+    assert_eq!(
+      mapped.bytes().len(),
+      bytes.len(),
+      "{kib} KiB: a MapRead returned {} of {} bytes (path {})",
+      mapped.bytes().len(),
+      bytes.len(),
+      if mapped.is_zero_copy() {
+        "zero-copy"
+      } else {
+        "copy"
+      }
+    );
+    assert_eq!(mapped.bytes(), bytes.as_slice(), "{kib} KiB: every byte");
+    client.destroy(id).unwrap();
+  }
+}
+
 /// AC-A-135 (cross-shard): on a multi-shard daemon a client maps files whose owner shard may not be its
 /// home shard; it must always get the correct bytes — zero-copy where the volume is local, a copy where
 /// it is owned by another shard (the descriptor cannot cross shards yet). Several volumes spread across

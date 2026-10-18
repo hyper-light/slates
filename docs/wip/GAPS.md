@@ -6694,3 +6694,29 @@ ledger over a **real** device, cache region and context:
 exactly where it must — `left: 0, right: 1`, the block released while the second window is live. Verified again
 after the test was split in two for the cognitive-complexity bound. bridge-virtiofs 33/33 + 1 ignored, slates-mem
 94/94, clippy `-D warnings` and `xtask check` clean.
+
+### 2026-10-18: a zero-copy read of a multi-chunk file returned one chunk, silently (A-135; fixed, red-checked)
+
+`Client::map_read` has two paths and one contract — `MappedRead::bytes()` is "the file's bytes". The copy path
+returns all of it; the zero-copy path mapped the content block at offset 0 and answered as though that block
+were the file. Every A-135 test used a 20 KiB file ("one chunk, so one block", as the first of them says), so
+the suite never asked. Measured with the confinement rule lifted so the path is reachable (x86_64 Linux): a
+64 KiB file returned 65,536 bytes and `equal=true`; **256 KiB, 1 MiB and 4 MiB each returned exactly 65,536
+bytes** and `equal=false`, with nothing to tell the caller.
+
+Fixed: `try_local_map` reads the file's size before mapping and takes the existing copy fallback when the block
+it would map is smaller than the file, so the caller always gets every byte and the zero-copy upgrade is taken
+only where it is the whole answer. Mapping all of a file's chunks is the owed extension (the device already
+N-maps a multi-chunk guest window); it is not this.
+
+**Verified on the path where the bug lives**, since the confinement rule means production takes the copy path
+anyway — three arms on x86_64 Linux with the rule lifted: the fallback in place **passes**, the fallback removed
+**fails** (`"256 KiB: a MapRead returned 65536 of 262144 bytes (path zero-copy)"`), as shipped passes. The new
+test `a_map_read_returns_the_whole_file_at_every_size` (4 KiB to 1 MiB) is therefore a red-checked guard.
+
+**Found by a benchmark, not a test**, and that is the point: `crates/client/examples/map_read_ab.rs` was written
+to price the confinement rule (`docs/wip/BENCHMARKS.md`: zero-copy is ~10–15× faster at p50 and ~23× at p99 on a
+single-chunk read) and tripped over this on the way. The bench now reports latency only and prints what each arm
+returned — it had been quietly reporting 676,704 MiB/s for a 4 MiB file it had read 64 KiB of, which is how a
+throughput number computed from the *requested* size flatters exactly the path that answers with less. Record:
+`docs/bugs/2026-10-18-a-zero-copy-read-of-a-multi-chunk-file-returned-one-chunk.md`.

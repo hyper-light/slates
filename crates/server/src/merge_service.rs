@@ -1065,10 +1065,25 @@ fn try_local_map(
   if matches!(located.child, Child::Dir(_)) {
     return LocalMap::Directory;
   }
+  // The whole file, or nothing. `dax_map_read` maps the content block at offset 0, and a file larger than one
+  // chunk has more blocks behind it — so mapping one and answering as though it were the file is a silent
+  // truncated read: measured, a 4 MiB file returned exactly 65,536 bytes through this path while the copy path
+  // returned all 4 MiB, with nothing to tell the caller
+  // (`docs/bugs/2026-10-18-a-zero-copy-read-of-a-multi-chunk-file-returned-one-chunk.md`). Checked before the
+  // map, so a multi-chunk file costs no pin to refuse; the caller reads by copy and gets every byte. Mapping all
+  // of a file's chunks is the owed extension, not this.
+  let whole_file = match slot.volume.stat(store, located.inode) {
+    Ok(stat) => stat.size,
+    Err(error) => return LocalMap::Vfs(error),
+  };
   let mapping = match slot.volume.dax_map_read(store, located.inode) {
     Ok(mapping) => mapping,
     Err(error) => return LocalMap::Vfs(error),
   };
+  if u64::try_from(mapping.file_len).unwrap_or(0) < whole_file {
+    store.dax_revoke(&mapping);
+    return LocalMap::Fallback;
+  }
   // No shared-object backing (inline or private content): release the pin and read by copy.
   let Some((block, region_off, block_len)) = store.dax_backing(&mapping) else {
     store.dax_revoke(&mapping);
