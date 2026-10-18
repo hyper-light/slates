@@ -313,6 +313,57 @@ fn occurrences_in_this_process(needle: &[u8]) -> usize {
   total
 }
 
+/// What a hostile peer does with the descriptor a zero-copy read handed it, and what must come of it: the
+/// neighbour's marker must not be reachable through it, and it must refuse a shared writable map. Split out of
+/// the test so each does one thing (the cognitive-complexity bound) and so the hostile part reads as the attack
+/// it is. `number` is the descriptor that arrived; `authorized` is what the read was for, reported for scale.
+#[cfg(target_os = "linux")]
+fn judge_the_handed_descriptor(number: i32, authorized: u64) {
+  use std::os::fd::BorrowedFd;
+
+  // SAFETY: `number` is a descriptor this process owns — installed in its table by the `recvmsg` inside
+  // `map_read`, and held open by the caller's live `MappedRead` for the whole of this borrow.
+  let handed = unsafe { BorrowedFd::borrow_raw(number) };
+  let reachable = occurrences_through(handed, NEIGHBOUR_MARKER);
+  let object_bytes = rustix::fs::fstat(handed).map(|s| s.st_size).unwrap_or(0);
+  let span = usize::try_from(object_bytes).unwrap_or(1).max(1);
+
+  // The hostile use of a read authorization: a shared writable map of the daemon's memory.
+  // SAFETY: a fresh mapping at an address the kernel chooses, of `span` bytes of the handed descriptor, which
+  // the caller keeps open; the result is only tested and unmapped below.
+  let writable = unsafe {
+    rustix::mm::mmap(
+      std::ptr::null_mut(),
+      span,
+      rustix::mm::ProtFlags::READ | rustix::mm::ProtFlags::WRITE,
+      rustix::mm::MapFlags::SHARED,
+      handed,
+      0,
+    )
+  };
+  if let Ok(address) = writable {
+    // SAFETY: `address` is this call's own mapping of `span` bytes; unmapped once and never used again.
+    unsafe {
+      let _ = rustix::mm::munmap(address, span);
+    }
+  }
+  println!(
+    "handed descriptor: object_bytes={object_bytes} authorized_bytes={authorized} \
+     neighbour_marker_occurrences={reachable} writable_map={}",
+    if writable.is_ok() { "granted" } else { "refused" }
+  );
+
+  assert_eq!(
+    reachable, 0,
+    "the neighbour's content is reachable through the descriptor handed for another volume's file \
+     ({reachable} occurrences in {object_bytes} bytes, where {authorized} were authorized)"
+  );
+  assert!(
+    writable.is_err(),
+    "a descriptor handed to authorize a read mapped writable: the peer can write the daemon's memory"
+  );
+}
+
 /// §4.6 A-135 with §4.13: the descriptor a zero-copy read hands a peer must authorize that read and
 /// nothing more. Do: a one-shard daemon with two volumes of one account — a neighbour holding a marked
 /// arena-backed file, and the peer's own — map the peer's file with no copy, then use the descriptor
@@ -327,7 +378,6 @@ fn occurrences_in_this_process(needle: &[u8]) -> usize {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_zero_copy_reads_descriptor_authorizes_its_window_and_nothing_more() {
-  use std::os::fd::BorrowedFd;
 
   let profile = profile();
   let instance = format!("cl-mapauth-{}", std::process::id());
@@ -382,6 +432,13 @@ fn a_zero_copy_reads_descriptor_authorizes_its_window_and_nothing_more() {
   );
 
   let before = memory_object_descriptors();
+  // Non-vacuity for the detector itself, not just for the marker scan. The copy branch below asserts that *no*
+  // descriptor arrived, which a detector that can see none would satisfy however the daemon behaved — so prove
+  // it sees memory objects at all. The daemon runs in this process, so its own are here.
+  assert!(
+    !before.is_empty(),
+    "the descriptor probe can see this process's memory objects, so 'none arrived' means something"
+  );
   let mapped = client.map_read(mine, "/mine.bin").unwrap();
   assert_eq!(mapped.bytes(), bytes.as_slice(), "the peer's own bytes");
   let after = memory_object_descriptors();
@@ -408,52 +465,7 @@ fn a_zero_copy_reads_descriptor_authorizes_its_window_and_nothing_more() {
     1,
     "exactly one descriptor arrived with the mapping: {arrived:?}"
   );
-  let number = arrived.first().copied().unwrap();
-  // SAFETY: `number` is a descriptor this process owns — it was installed in this process's table by
-  // the `recvmsg` inside `map_read` and is held open by the live `mapped` for the whole borrow.
-  let handed = unsafe { BorrowedFd::borrow_raw(number) };
-
-  let reachable = occurrences_through(handed, NEIGHBOUR_MARKER);
-  let object_bytes = rustix::fs::fstat(handed).map(|s| s.st_size).unwrap_or(0);
-  println!(
-    "handed descriptor: object_bytes={object_bytes} authorized_bytes={authorized} \
-     neighbour_marker_occurrences={reachable}"
-  );
-
-  // The hostile use of a read authorization: a shared writable map of the daemon's memory.
-  // SAFETY: a fresh mapping at an address the kernel chooses, of `object_bytes` bytes of the handed
-  // descriptor, which the live `mapped` keeps open; the result is only tested and unmapped below.
-  let writable = unsafe {
-    rustix::mm::mmap(
-      std::ptr::null_mut(),
-      usize::try_from(object_bytes).unwrap_or(1).max(1),
-      rustix::mm::ProtFlags::READ | rustix::mm::ProtFlags::WRITE,
-      rustix::mm::MapFlags::SHARED,
-      handed,
-      0,
-    )
-  };
-  if let Ok(address) = writable {
-    // SAFETY: `address` is this call's own mapping of `object_bytes` bytes; it is unmapped once and
-    // never used again.
-    unsafe {
-      let _ = rustix::mm::munmap(address, usize::try_from(object_bytes).unwrap_or(1).max(1));
-    }
-  }
-  println!(
-    "handed descriptor: writable_map={}",
-    if writable.is_ok() { "granted" } else { "refused" }
-  );
-
-  assert_eq!(
-    reachable, 0,
-    "the neighbour's content is reachable through the descriptor handed for another volume's file \
-     ({reachable} occurrences in {object_bytes} bytes, where {authorized} were authorized)"
-  );
-  assert!(
-    writable.is_err(),
-    "a descriptor handed to authorize a read mapped writable: the peer can write the daemon's memory"
-  );
+  judge_the_handed_descriptor(arrived.first().copied().unwrap_or(-1), authorized);
 
   client.destroy(mine).unwrap();
   client.destroy(neighbour).unwrap();
