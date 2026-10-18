@@ -57,6 +57,22 @@ pub enum IpcError {
     /// The feature.
     feature: &'static str,
   },
+  /// A descriptor offered to a peer would authorize more than the hand-off does (§4.6, A-135).
+  /// A descriptor carries its **whole object**, read and write, to whoever holds it: the offsets and
+  /// lengths in the message scope the request, never the descriptor. So one whose object is larger
+  /// than the authorized window, whose window does not start at the object's start, or that the peer
+  /// could still write or resize, is refused here rather than sent, and the caller serves the bytes by
+  /// copy. Record: `docs/bugs/2026-10-18-a-read-handed-the-peer-the-whole-content-arena.md`.
+  UnconfinedDescriptor {
+    /// The object's whole length — what the descriptor actually authorizes.
+    object_bytes: u64,
+    /// The bytes the hand-off was for.
+    authorized_bytes: u64,
+    /// Whether the peer could still write or resize the object (no `F_SEAL_FUTURE_WRITE`/`F_SEAL_WRITE`
+    /// with `F_SEAL_SHRINK` and `F_SEAL_GROW`); measured, since a read-only duplicate alone is no
+    /// defence — a same-uid peer re-opens it `O_RDWR` through `/proc/self/fd`.
+    writable: bool,
+  },
   /// A wait ended at its deadline.
   DeadlineExceeded,
   /// The daemon's derived client bound is reached (§4.7 admission, AC-2.6).
@@ -102,6 +118,19 @@ impl fmt::Display for IpcError {
       Self::OsRefused { call, code } => write!(f, "{call} refused (code {code:?})"),
       Self::Memory(e) => write!(f, "shared memory: {e}"),
       Self::Unsupported { feature } => write!(f, "unsupported here: {feature}"),
+      Self::UnconfinedDescriptor {
+        object_bytes,
+        authorized_bytes,
+        writable,
+      } => write!(
+        f,
+        "the descriptor authorizes {object_bytes} bytes where {authorized_bytes} were offered{}",
+        if *writable {
+          " and the peer could still write or resize it"
+        } else {
+          ""
+        }
+      ),
       Self::DeadlineExceeded => f.write_str("deadline exceeded"),
       Self::TooManyClients { limit } => write!(f, "too many clients (the bound is {limit})"),
       Self::HandoffLost { client_id, cause } => {

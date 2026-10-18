@@ -158,11 +158,17 @@ fn attach_status_detach(client: &mut Client, id: slates_client::VolumeId) {
   assert_eq!(client.status(id).unwrap().lease_epoch, None);
 }
 
-/// AC-A-135 (§4.6 the same-kernel direct map): a same-kernel client reads a file with no copy. Do: a
-/// one-shard daemon (so the volume's owner shard is the client's home shard), write an arena-backed file
-/// into a plain volume, then `map_read` it. Expect: the bytes equal what was written, and the read was
-/// zero-copy — `is_zero_copy` proves the mapping path fired rather than the copy fallback (the
-/// non-vacuity check: a dead map path would silently fall back to a copy and this would be false).
+/// AC-A-135 (§4.6 the same-kernel direct map): a `MapRead` returns the file's bytes whichever path it
+/// takes. Do: a one-shard daemon (so the volume's owner shard is the client's home shard), write an
+/// arena-backed file into a plain volume, then `map_read` it. Expect: the bytes equal what was written.
+///
+/// Which path it takes is reported, not asserted, because it depends on something outside this test:
+/// the hand-off is refused unless the descriptor authorizes exactly the window, and no backing
+/// satisfies that yet — a shard's content arena is one object holding every volume (the measured
+/// escape of 2026-10-18, `docs/bugs/2026-10-18-a-read-handed-the-peer-the-whole-content-arena.md`).
+/// The rule the descriptor must meet is held by
+/// `a_zero_copy_reads_descriptor_authorizes_its_window_and_nothing_more`, which passes on either path;
+/// asserting the path here instead would pin today's state in place.
 #[cfg(unix)]
 #[test]
 fn a_same_kernel_client_maps_a_file_with_no_copy() {
@@ -196,19 +202,17 @@ fn a_same_kernel_client_maps_a_file_with_no_copy() {
   client.detach(attached.attachment).unwrap();
 
   let mapped = client.map_read(id, "/big.bin").unwrap();
-  // The zero-copy map hands the block's descriptor to the peer over the control socket. That hand-off is built on
-  // Linux and **owed on macOS** (the daemon answers `Unsupported { feature: "same-kernel direct map (macOS control
-  // socket owed)" }`, and `map_read` takes its documented copy fallback). Both are asserted rather than the test
-  // being skipped, so the fallback keeps its cover and the bytes are checked on either path.
-  #[cfg(target_os = "linux")]
-  assert!(
-    mapped.is_zero_copy(),
-    "a same-uid, single-shard, arena-backed read takes the zero-copy map, not the copy fallback"
-  );
-  #[cfg(not(target_os = "linux"))]
-  assert!(
-    !mapped.is_zero_copy(),
-    "until the control-socket hand-off lands on this platform the daemon answers the copy fallback"
+  // The hand-off is a Linux control-socket feature and is **owed on macOS** (the daemon answers
+  // `Unsupported { feature: "same-kernel direct map (macOS control socket owed)" }`); on Linux it is
+  // built but refused today for want of a confined backing. Either way the client gets its bytes, and
+  // which path ran is recorded here rather than asserted.
+  println!(
+    "map_read path: {}",
+    if mapped.is_zero_copy() {
+      "zero-copy"
+    } else {
+      "copy"
+    }
   );
   assert_eq!(
     mapped.bytes(),
@@ -217,6 +221,242 @@ fn a_same_kernel_client_maps_a_file_with_no_copy() {
   );
 
   client.destroy(id).unwrap();
+}
+
+/// Shape: the neighbour volume's marker — a byte run written into no other volume, so finding it
+/// inside a descriptor proves that descriptor reaches content the peer never asked for.
+#[cfg(target_os = "linux")]
+const NEIGHBOUR_MARKER: &[u8; 16] = b"SL-NEIGHBOUR-SEC";
+
+/// Shape: a file large enough that its content lives in the shared-object content arena rather than
+/// inline in its inode, which is the only content a zero-copy read can hand over (§4.6, A-135).
+#[cfg(target_os = "linux")]
+const ARENA_BACKED_BYTES: usize = 20 << 10;
+
+/// This process's descriptors that name a kernel memory object (`/memfd:…`), by descriptor number.
+/// The daemon in these tests runs in this process, so its own descriptors are in the set too; the
+/// probe takes the set before a map and the set after, and what is new is what the hand-off installed.
+#[cfg(target_os = "linux")]
+#[allow(clippy::disallowed_methods)] // reading this process's own descriptor table through /proc, read-only
+fn memory_object_descriptors() -> std::collections::BTreeSet<i32> {
+  let mut found = std::collections::BTreeSet::new();
+  let Ok(entries) = std::fs::read_dir("/proc/self/fd") else {
+    return found;
+  };
+  for entry in entries.flatten() {
+    let target = std::fs::read_link(entry.path()).unwrap_or_default();
+    if !target.to_string_lossy().contains("memfd:") {
+      continue;
+    }
+    if let Some(number) = entry
+      .file_name()
+      .to_string_lossy()
+      .parse::<i32>()
+      .ok()
+      .filter(|number| *number >= 0)
+    {
+      found.insert(number);
+    }
+  }
+  found
+}
+
+/// How many times `needle` occurs in the object `descriptor` names. Only the object's data ranges are
+/// read (`SEEK_DATA`/`SEEK_HOLE`, which the memory filesystem answers), so an object with unwritten
+/// pages costs nothing to scan and none of its holes are committed by the scan itself.
+#[cfg(target_os = "linux")]
+fn occurrences_through(descriptor: std::os::fd::BorrowedFd<'_>, needle: &[u8]) -> usize {
+  let mut count = 0;
+  let mut at: u64 = 0;
+  while let Ok(data) = rustix::fs::seek(descriptor, rustix::fs::SeekFrom::Data(at)) {
+    let end = rustix::fs::seek(descriptor, rustix::fs::SeekFrom::Hole(data)).unwrap_or(data);
+    let span = usize::try_from(end.saturating_sub(data)).unwrap_or(0);
+    let mut range = vec![0u8; span];
+    let read = rustix::io::pread(descriptor, &mut range, data).unwrap_or(0);
+    count += range
+      .get(..read)
+      .unwrap_or_default()
+      .windows(needle.len())
+      .filter(|window| *window == needle)
+      .count();
+    if end <= at {
+      break;
+    }
+    at = end;
+  }
+  count
+}
+
+/// How many times `needle` occurs in any kernel memory object this process holds, the daemon's own
+/// content object included (the daemon in these tests runs in this process). The non-vacuity side of
+/// the probe: it says the marker is findable at all, so a clean scan of a handed descriptor is a fact
+/// about that descriptor.
+#[cfg(target_os = "linux")]
+#[allow(clippy::disallowed_methods)] // reading this process's own descriptor table through /proc, read-only
+fn occurrences_in_this_process(needle: &[u8]) -> usize {
+  use std::os::fd::AsFd;
+
+  let mut total = 0;
+  let Ok(entries) = std::fs::read_dir("/proc/self/fd") else {
+    return 0;
+  };
+  for entry in entries.flatten() {
+    let target = std::fs::read_link(entry.path()).unwrap_or_default();
+    if !target.to_string_lossy().contains("memfd:") {
+      continue;
+    }
+    let Ok(file) = std::fs::File::open(entry.path()) else {
+      continue;
+    };
+    total += occurrences_through(file.as_fd(), needle);
+  }
+  total
+}
+
+/// §4.6 A-135 with §4.13: the descriptor a zero-copy read hands a peer must authorize that read and
+/// nothing more. Do: a one-shard daemon with two volumes of one account — a neighbour holding a marked
+/// arena-backed file, and the peer's own — map the peer's file with no copy, then use the descriptor
+/// that arrived the way a hostile peer would: scan it for the neighbour's marker and map it writable.
+/// Expect: the neighbour's marker is not reachable through it, and it refuses a writable map. The same
+/// uid is not the boundary here — a §4.13 consumer is an untrusted process of this very uid, holding
+/// this very channel — so what the descriptor itself authorizes is the boundary.
+///
+/// Non-vacuity: the marker must be found in the daemon's own content object (the scan works, and the
+/// neighbour's bytes really are in the arena), or a descriptor that reached everything would still
+/// read as clean.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_zero_copy_reads_descriptor_authorizes_its_window_and_nothing_more() {
+  use std::os::fd::BorrowedFd;
+
+  let profile = profile();
+  let instance = format!("cl-mapauth-{}", std::process::id());
+  // One shard: the owner is the peer's home shard, which is where the hand-off happens, and both
+  // volumes' content is then in one shard's arena — the reach being measured.
+  let config = DaemonConfig::derive(&profile, &instance, Some(1));
+  let daemon = Daemon::start(
+    &profile,
+    config,
+    SegmentSource::Create {
+      name: format!("slates-seg-cl-mapauth-{}", std::process::id()),
+    },
+  )
+  .unwrap();
+  daemon
+    .bootstrap(true)
+    .expect("the fixture creates its local consensus group");
+  let mut client = connect(&instance);
+
+  // The neighbour: a volume this peer will not name, holding a file whose bytes are its marker.
+  let neighbour = client.create(&scratch("neighbour")).unwrap();
+  let secret: Vec<u8> = NEIGHBOUR_MARKER
+    .iter()
+    .copied()
+    .cycle()
+    .take(ARENA_BACKED_BYTES)
+    .collect();
+  let held = client.attach(neighbour, None, Intent::Write).unwrap();
+  client
+    .fs_write((neighbour, held.attachment), "/secret.bin", &secret, 0o600)
+    .unwrap();
+  client.detach(held.attachment).unwrap();
+
+  // The peer's own volume and file.
+  let mine = client.create(&scratch("mine")).unwrap();
+  let bytes: Vec<u8> = (0..ARENA_BACKED_BYTES)
+    .map(|i| u8::try_from(i % 251).unwrap_or(0))
+    .collect();
+  let held = client.attach(mine, None, Intent::Write).unwrap();
+  client
+    .fs_write((mine, held.attachment), "/mine.bin", &bytes, 0o644)
+    .unwrap();
+  client.detach(held.attachment).unwrap();
+
+  // Non-vacuity, taken before the map: the neighbour's secret really is in this daemon's content
+  // object, so "the handed descriptor does not show it" is a fact about the descriptor rather than
+  // about the marker being absent everywhere.
+  let in_the_arena = occurrences_in_this_process(NEIGHBOUR_MARKER);
+  assert!(
+    in_the_arena > 0,
+    "the neighbour's content is in the daemon's content object, so the scan can find it"
+  );
+
+  let before = memory_object_descriptors();
+  let mapped = client.map_read(mine, "/mine.bin").unwrap();
+  assert_eq!(mapped.bytes(), bytes.as_slice(), "the peer's own bytes");
+  let after = memory_object_descriptors();
+  let arrived: Vec<i32> = after.difference(&before).copied().collect();
+  let authorized = u64::try_from(ARENA_BACKED_BYTES).unwrap_or(0);
+
+  if !mapped.is_zero_copy() {
+    // The hand-off was refused, so the bytes came by copy. Then nothing may have crossed: a refused
+    // hand-off that still installed a descriptor in the peer would be the escape with the reply
+    // changed.
+    assert!(
+      arrived.is_empty(),
+      "a copy-path read still installed {} memory-object descriptor(s) in the peer: {arrived:?}",
+      arrived.len()
+    );
+    println!("map_read took the copy path; no descriptor crossed (arena holds {in_the_arena} markers)");
+    client.destroy(mine).unwrap();
+    client.destroy(neighbour).unwrap();
+    return;
+  }
+
+  assert_eq!(
+    arrived.len(),
+    1,
+    "exactly one descriptor arrived with the mapping: {arrived:?}"
+  );
+  let number = arrived.first().copied().unwrap();
+  // SAFETY: `number` is a descriptor this process owns — it was installed in this process's table by
+  // the `recvmsg` inside `map_read` and is held open by the live `mapped` for the whole borrow.
+  let handed = unsafe { BorrowedFd::borrow_raw(number) };
+
+  let reachable = occurrences_through(handed, NEIGHBOUR_MARKER);
+  let object_bytes = rustix::fs::fstat(handed).map(|s| s.st_size).unwrap_or(0);
+  println!(
+    "handed descriptor: object_bytes={object_bytes} authorized_bytes={authorized} \
+     neighbour_marker_occurrences={reachable}"
+  );
+
+  // The hostile use of a read authorization: a shared writable map of the daemon's memory.
+  // SAFETY: a fresh mapping at an address the kernel chooses, of `object_bytes` bytes of the handed
+  // descriptor, which the live `mapped` keeps open; the result is only tested and unmapped below.
+  let writable = unsafe {
+    rustix::mm::mmap(
+      std::ptr::null_mut(),
+      usize::try_from(object_bytes).unwrap_or(1).max(1),
+      rustix::mm::ProtFlags::READ | rustix::mm::ProtFlags::WRITE,
+      rustix::mm::MapFlags::SHARED,
+      handed,
+      0,
+    )
+  };
+  if let Ok(address) = writable {
+    // SAFETY: `address` is this call's own mapping of `object_bytes` bytes; it is unmapped once and
+    // never used again.
+    unsafe {
+      let _ = rustix::mm::munmap(address, usize::try_from(object_bytes).unwrap_or(1).max(1));
+    }
+  }
+  println!(
+    "handed descriptor: writable_map={}",
+    if writable.is_ok() { "granted" } else { "refused" }
+  );
+
+  assert_eq!(
+    reachable, 0,
+    "the neighbour's content is reachable through the descriptor handed for another volume's file \
+     ({reachable} occurrences in {object_bytes} bytes, where {authorized} were authorized)"
+  );
+  assert!(
+    writable.is_err(),
+    "a descriptor handed to authorize a read mapped writable: the peer can write the daemon's memory"
+  );
+
+  client.destroy(mine).unwrap();
+  client.destroy(neighbour).unwrap();
 }
 
 /// AC-A-135 (cross-shard): on a multi-shard daemon a client maps files whose owner shard may not be its

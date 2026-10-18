@@ -6467,3 +6467,57 @@ cycles finishes in 2.1 s inside the anchor's restart policy; `clippy --workspace
 and the advertised `max_write` of 256 KiB is not what one request carries — verified in our source by two
 independent readings, but the kernel half is read from `fuse_perform_write`, not measured here, and no `strace` of
 the daemon's reads was taken.
+
+### 2026-10-18: a zero-copy read handed the peer the whole content arena, writable (A-135; escape closed)
+
+**Found by attacking the local zero-copy read (A-135), closed in the same change.** It is the live sibling of the
+message-based DAX finding above: the same accessor, the same mistake, but on a path that is **not**
+advertisement-gated and **not** harness-only — every Linux `MapRead` served by the zero-copy arm did this.
+
+- **What was handed over.** `try_local_map` sends the content block's backing descriptor over the control socket by
+  `SCM_RIGHTS`. The reply's `region_off`/`file_len`/`block_len` scope the *request*; a descriptor carries its whole
+  object, read **and** write. `ChunkArena::block_backing` says so in its own comment — "`backing_fd` is the whole
+  object" — and the object is the anchor's content RAM for the host.
+- **Measured e2e** (x86_64 Linux, kernel 7.2.9-2-cachyos, a one-shard daemon, two volumes of one account; the peer
+  maps *its own* 20 KiB file): `object_bytes=189833572352 authorized_bytes=20480` — **176.8 GiB for a 20 KiB read,
+  9,269,217×** — `neighbour_marker_occurrences=1280` (the other volume's *whole* 20 KiB file readable), and
+  `writable_map=granted`. A second run finished the escape: find the neighbour's bytes in the handed object,
+  overwrite them, read that volume through the ordinary verb — `"OWNED-BY-A-PEER!SL-NEIGHBOUR-SEC"`. **A read verb
+  gave cross-volume read and cross-volume write with no lease, no attachment and no verb.**
+- **The false premise.** The gate was `same_uid`, documented as "its own trust domain". A §4.13 consumer is an
+  untrusted process of exactly this uid holding exactly this channel, and `MapRead` is dispatched with a `Principal`
+  like any other read — so a consumer confined to one volume reached all of them. §4.6's body carried the same
+  wrong sentence and is corrected in this change.
+- **A read-only duplicate is not a fix, and that is measured** (`/tmp/fdprobe.c`, same host): a same-uid peer
+  re-opens a read-only memfd duplicate `O_RDWR` through `/proc/self/fd` and maps it writable. What does hold is
+  `MFD_ALLOW_SEALING` + `F_SEAL_FUTURE_WRITE|SHRINK|GROW` applied **after** the owner takes its own writable map:
+  the owner keeps writing through that map while the peer is refused every writable map, every `pwrite`, every
+  `ftruncate` — including when it holds the writable descriptor itself.
+- **The fix is at the boundary, not at the caller.** `Control::send_mapping` → `confined_for_a_peer` is the one
+  place a descriptor leaves this process for a peer, so no caller can skip it and the rule cannot drift: `fstat`
+  must show the object *is* the window (`region_off == 0`, `object_len == block_len`) and `F_GET_SEALS` must show a
+  write seal with `SHRINK` and `GROW`, else the typed `IpcError::UnconfinedDescriptor { object_bytes,
+  authorized_bytes, writable }`. `try_local_map` already treats a failed send as `LocalMap::Fallback`, so the client
+  is served by copy and always gets its bytes; the minted mapping's pin is released on that arm as before.
+- **What it costs.** No backing satisfies the rule today — a shard's content arena is one object holding every
+  volume (A-64) — so on Linux a `MapRead` now reads by copy and A-135's zero-copy arm is not taken. That is the
+  honest price of closing a live escape, and the alternative was preserving the behaviour that caused it.
+- **Owed — one decision, now shared by both findings.** Restoring zero-copy needs a backing whose **object is the
+  unit of authorization**: (1) a sealed backing object per tenant (keeps zero-copy, confines by construction, cuts
+  against A-64's one-image layout), (2) a per-mapping sealed object holding only the block (confined, one copy at
+  map time — for DAX this is the measured-and-rejected "view" arm, but A-135's baseline is a copy *per read*, so
+  copy-once-map-many is a *different* measurement and has not been taken), or (3) keep the copy path. Option 1 is
+  the only one that serves both callers. **A sibling the fix does not cover:** `Store::dax_backing` still hands the
+  same unconfined descriptor to the vhost-user message placer, which does not route through `send_mapping`; it stays
+  advertisement-gated and recorded. **The real hazard is `block_backing`'s contract** — a descriptor for an object
+  its own comment calls "the whole object", with nothing in its signature saying that handing it over authorizes
+  everything in it. Both escapes came from that; if option 1 is taken it should have no unconfined sibling.
+- **Tests.** `crates/ipc` `a_descriptor_that_would_authorize_more_than_the_hand_off_is_never_sent` (three shapes a
+  real arena produces, each refused, and nothing waiting on the peer's side afterwards);
+  `crates/client/tests/client.rs` `a_zero_copy_reads_descriptor_authorizes_its_window_and_nothing_more`, written as
+  the invariant so it keeps its meaning when a confined backing lands — zero-copy ⇒ the descriptor shows none of the
+  neighbour's marker and refuses a writable map; copy ⇒ **no** memory-object descriptor was installed in the peer at
+  all. Non-vacuity: the marker must first be found in this process's memory objects (10,240 occurrences).
+  `a_same_kernel_client_maps_a_file_with_no_copy` reports its path instead of asserting it, since asserting it would
+  pin today's state in place. Record:
+  `docs/bugs/2026-10-18-a-read-handed-the-peer-the-whole-content-arena.md`.

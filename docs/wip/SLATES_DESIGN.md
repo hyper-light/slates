@@ -2677,11 +2677,21 @@ daemon's kernel — with no virtual machine and no copy (A-135). The content are
 reaches through DAX; a local reader `mmap`s them directly. The agent's volume is always co-located with the agent
 (its arena DRAM is on the agent's own machine, §4.1), so this path is always physically available; it is negotiated
 at connect, never configured (R8, no mode switch): the daemon offers the direct map only to a peer the rendezvous
-authenticated as the **same uid** (`SO_PEERCRED`, §4.7) — its own trust domain, a peer that may read the bytes
-through the mount regardless, so the map discloses nothing the peer is not already entitled to. A different-uid or
-sandboxed peer, and any peer the platform cannot pass a descriptor to, reads through the copy path (the bulk region,
-§4.7) or through virtio-fs DAX; the consumer always has a correct read, and the zero-copy upgrade is taken only where
-it is both safe and physically possible. Mechanism: the client requests a read-only map over the command ring; the
+authenticated as the **same uid** (`SO_PEERCRED`, §4.7), and then only if the descriptor it would send authorizes
+nothing beyond that read. **The uid is a necessary condition, never a sufficient one.** An earlier reading of this
+section called a same-uid peer "its own trust domain, a peer that may read the bytes through the mount regardless";
+that was wrong twice over and is corrected here. A §4.13 consumer is an untrusted process of exactly this uid holding
+exactly this channel — the consumer capability exists because it is untrusted — and a descriptor is not a read: it
+carries its whole object, writable, to whoever holds it. Measured, a 20 KiB read handed a peer a writable descriptor
+for a 176.8 GiB content object holding every volume on the host, and a peer used it to rewrite another volume's file
+(`docs/bugs/2026-10-18-a-read-handed-the-peer-the-whole-content-arena.md`). So the rule is the descriptor's own
+extent and seals: the object must *be* the authorized window (offset zero, equal lengths) and must be sealed against
+writing and resizing (`F_SEAL_WRITE` or `F_SEAL_FUTURE_WRITE`, with `F_SEAL_SHRINK` and `F_SEAL_GROW`). A read-only
+duplicate does not qualify and must not — measured, a same-uid peer re-opens one `O_RDWR` through `/proc/self/fd`.
+A different-uid or
+sandboxed peer, a peer the platform cannot pass a descriptor to, and any backing that cannot meet that rule, read
+through the copy path (the bulk region, §4.7) or through virtio-fs DAX; the consumer always has a correct read, and
+the zero-copy upgrade is taken only where it is both safe and physically possible. Mechanism: the client requests a read-only map over the command ring; the
 daemon mints the read mapping (`Volume::dax_map_read` — the block pinned in the arena, the version pinned for the
 map's life, the sub-file tail scrubbed) and sends the arena block's descriptor (`Store::dax_backing`) with the mapping
 id, the block offset and the file length over the retained control socket by `SCM_RIGHTS` (the command ring cannot
@@ -2709,7 +2719,19 @@ same-namespace host process is the first delivered case.
 > arena-backed file, mapped zero-copy with the bytes equal byte for byte. The whole A-135 client path is `cfg(unix)`;
 > a non-Unix `MapRead` reads by copy. This path's first real descriptor map surfaced and fixed a latent arena bug —
 > `block_backing` returned a region-relative offset against the whole-object descriptor, which would have mis-mapped
-> the guest DAX window too (`docs/bugs/2026-10-15-block-backing-returned-a-region-relative-offset.md`). **Owed:** the
+> the guest DAX window too (`docs/bugs/2026-10-15-block-backing-returned-a-region-relative-offset.md`).
+>
+> **Amended 2026-10-18 — the hand-off is refused today, and a `MapRead` reads by copy on Linux too.** The descriptor
+> being sent was the arena's whole object: measured at 189,833,572,352 bytes against 20,480 authorized (9.27 million
+> ×), writable, with another volume's whole file readable inside it — and a peer used it to rewrite that volume's
+> file, which the ordinary read verb then served. The check now lives at the one place a descriptor leaves the
+> process for a peer (`Control::send_mapping` → `confined_for_a_peer`), so no caller can skip it: the object must be
+> the window (`region_off == 0`, `object_len == block_len`) and must be sealed against writing and resizing, else
+> `IpcError::UnconfinedDescriptor` and the existing `LocalMap::Fallback` serves the bytes by copy. No backing
+> satisfies that yet — a shard's content arena is one object holding every volume (A-64) — so the zero-copy arm is
+> not taken. Restoring it needs a backing whose object is the unit of authorization, the same decision the
+> message-based DAX placer waits on; the measured seal mechanism that makes such a backing safe
+> (`F_SEAL_FUTURE_WRITE` after the owner's own map) is in the record. **Owed:** that decision; and the
 > cross-shard owner→home descriptor hand-off (a `MapRead` whose volume is owned by another shard copies rather than
 > maps for now); a prompt per-drop release (the daemon now revokes a client's maps when it is **reaped** — 3b,
 > `crate::reap` over a `ClientSlot::dax_maps` list — so a dropped or dead client's read maps no longer pin versions

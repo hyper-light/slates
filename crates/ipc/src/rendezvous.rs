@@ -505,6 +505,49 @@ pub mod platform {
   use crate::error::IpcError;
   use crate::region::ClientRegion;
 
+  /// Refuses a descriptor that would authorize a peer more than the hand-off does (§4.6, A-135).
+  ///
+  /// Two questions, both measured on the descriptor itself rather than taken from the caller:
+  ///
+  /// 1. **Does it reach past the window?** `fstat` gives the object's whole length, which is what the
+  ///    holder of the descriptor may map. The window starts at `region_off` and runs `authorized`
+  ///    bytes, so the descriptor is confined only when the window is the object: offset zero and equal
+  ///    lengths. A shared arena holding many volumes' blocks fails this by construction — which is the
+  ///    point, since that is what was being handed over before.
+  /// 2. **Could the peer still write or resize it?** `F_GET_SEALS`. Writing must be sealed
+  ///    (`F_SEAL_WRITE`, or `F_SEAL_FUTURE_WRITE` where the owner keeps its own earlier map) and both
+  ///    `F_SEAL_SHRINK` and `F_SEAL_GROW` must be set, or a peer shrinks the object under the daemon's
+  ///    feet. A descriptor duplicated read-only does **not** pass and must not: measured, a same-uid
+  ///    peer re-opens such a duplicate `O_RDWR` through `/proc/self/fd` and maps it writable.
+  ///
+  /// An object with no seal support at all answers `F_GET_SEALS` with `F_SEAL_SEAL` absent and no write
+  /// seal, so it is refused by the same arm; a file that is not a memfd refuses the call, and is
+  /// refused here too.
+  fn confined_for_a_peer(
+    descriptor: std::os::fd::BorrowedFd<'_>,
+    region_off: u64,
+    authorized: u64,
+  ) -> Result<(), IpcError> {
+    let object_bytes = match rustix::fs::fstat(descriptor) {
+      Ok(stat) => u64::try_from(stat.st_size).unwrap_or(u64::MAX),
+      Err(e) => return Err(refused("fstat mapping", e)),
+    };
+    let seals = rustix::fs::fcntl_get_seals(descriptor).unwrap_or(rustix::fs::SealFlags::empty());
+    let write_sealed =
+      seals.contains(rustix::fs::SealFlags::WRITE) || seals.contains(rustix::fs::SealFlags::FUTURE_WRITE);
+    let size_sealed =
+      seals.contains(rustix::fs::SealFlags::SHRINK) && seals.contains(rustix::fs::SealFlags::GROW);
+    let writable = !(write_sealed && size_sealed);
+    if region_off != 0 || object_bytes != authorized || writable {
+      return Err(IpcError::UnconfinedDescriptor {
+        object_bytes,
+        authorized_bytes: authorized,
+        writable,
+      });
+    }
+    Ok(())
+  }
+
   /// No doorbell waiter on this platform: an uninhabited type, so no value of it exists.
   pub enum DoorbellWaiter {}
 
@@ -597,10 +640,25 @@ pub mod platform {
       rustix::io::dup(&self.completion).ok()
     }
 
-    /// Sends a read-only content-map delivery to the client over the control socket (§4.6, A-135):
-    /// the arena block's backing descriptor by `SCM_RIGHTS` with the mapping metadata. The client
-    /// `mmap`s `block` read-only at `region_off` for the file's page span. One `sendmsg`, so the
-    /// descriptor arrives with the body; the command ring cannot carry a descriptor, this socket can.
+    /// Sends a content-map delivery to the client over the control socket (§4.6, A-135): the block's
+    /// backing descriptor by `SCM_RIGHTS` with the mapping metadata. The client `mmap`s `block` at
+    /// `region_off` for the file's page span. One `sendmsg`, so the descriptor arrives with the body;
+    /// the command ring cannot carry a descriptor, this socket can.
+    ///
+    /// **The descriptor is checked against what it authorizes before it is sent**, and that check is
+    /// here — at the one place a descriptor leaves this process for a peer — so no caller can skip it.
+    /// A descriptor carries its whole object, read and write; `region_off`, `file_len` and `block_len`
+    /// scope the *request* and bind the peer to nothing. The peer is not trusted merely for sharing
+    /// this uid: a §4.13 consumer is an untrusted process of exactly this uid holding exactly this
+    /// channel. So the object must be the window ([`IpcError::UnconfinedDescriptor`] otherwise), and it
+    /// must be sealed against writing and resizing.
+    ///
+    /// The seals are the measured mechanism rather than a chosen one (2026-10-18, kernel 7.2.9): a
+    /// read-only duplicate of a memfd is **no** defence — the peer re-opens it `O_RDWR` through
+    /// `/proc/self/fd` and maps it writable — whereas `F_SEAL_FUTURE_WRITE` with `F_SEAL_SHRINK` and
+    /// `F_SEAL_GROW`, added after the owner has taken its own writable map, refuses the peer every
+    /// writable map, every `pwrite` and every `ftruncate` while the owner keeps writing through the map
+    /// it already holds.
     pub fn send_mapping(
       &self,
       block: std::os::fd::BorrowedFd<'_>,
@@ -610,6 +668,7 @@ pub mod platform {
       file_len: u64,
       block_len: u64,
     ) -> Result<(), IpcError> {
+      confined_for_a_peer(block, region_off, block_len)?;
       let mut body = [0u8; MAPPING_MSG_BYTES];
       let fields = [
         (MAPPING_AT_REQUEST, request_id.to_le_bytes()),
@@ -1186,14 +1245,25 @@ pub mod platform {
       let block_len = u64::try_from(block.len()).unwrap_or(0);
       let file_len: u64 = 300;
       let file_bytes = usize::try_from(file_len).unwrap_or(0);
-      let mem = memfd_create("slates-a135-test", MemfdFlags::CLOEXEC)
-        .map_err(|e| super::refused("memfd_create", e))?;
+      // Sealable, and sealed once written: `send_mapping` refuses a descriptor a peer could still
+      // write or resize, so a hand-off that is meant to go through must be sealed — which is also how
+      // a confined backing would be built.
+      let mem = memfd_create(
+        "slates-a135-test",
+        MemfdFlags::CLOEXEC | MemfdFlags::ALLOW_SEALING,
+      )
+      .map_err(|e| super::refused("memfd_create", e))?;
       let wrote = rustix::io::pwrite(&mem, &block, 0).map_err(|e| super::refused("pwrite", e))?;
       if wrote != block.len() {
         return Err(IpcError::Layout {
           reason: "the block stand-in was not fully written",
         });
       }
+      rustix::fs::fcntl_add_seals(
+        &mem,
+        rustix::fs::SealFlags::WRITE | rustix::fs::SealFlags::SHRINK | rustix::fs::SealFlags::GROW,
+      )
+      .map_err(|e| super::refused("add seals", e))?;
 
       // Nothing waiting yet: a non-blocking recv returns None.
       if liveness.recv_mapping()?.is_some() {
@@ -1229,6 +1299,85 @@ pub mod platform {
       if read != file_bytes || got.as_slice() != want {
         return Err(IpcError::Layout {
           reason: "the bytes the client read through the delivered descriptor did not match",
+        });
+      }
+      Ok(())
+    }
+
+    /// §4.6, A-135: a descriptor that would authorize more than the hand-off never reaches the peer.
+    /// Do: offer `send_mapping` the three shapes a real arena produces — an object larger than the
+    /// window, a window that starts partway into the object, and an object the peer could still write
+    /// — and look on the client's side of the socket afterwards. Expect: each is refused
+    /// `UnconfinedDescriptor` naming what it would have authorized, and nothing was sent, so a peer
+    /// never holds a descriptor the check refused.
+    ///
+    /// This is the guard for the measured escape of 2026-10-18, where a 20 KiB read handed a peer a
+    /// writable descriptor for a 176.8 GiB content object holding every volume on the host.
+    #[test]
+    fn a_descriptor_that_would_authorize_more_than_the_hand_off_is_never_sent()
+    -> Result<(), IpcError> {
+      let (daemon_socket, client_socket) = rustix::net::socketpair(
+        AddressFamily::UNIX,
+        SocketType::STREAM,
+        SocketFlags::CLOEXEC,
+        None,
+      )
+      .map_err(|e| super::refused("socketpair", e))?;
+      let completion = rustix::event::eventfd(0, rustix::event::EventfdFlags::CLOEXEC)
+        .map_err(|e| super::refused("eventfd", e))?;
+      let control = Control {
+        socket: daemon_socket,
+        completion,
+      };
+      let liveness = Liveness {
+        socket: client_socket,
+      };
+
+      // A sealed object of 8 KiB, standing in for an arena holding more than one volume's blocks.
+      let object_bytes: u64 = 8192;
+      let window: u64 = 4096;
+      let sealed = memfd_create(
+        "slates-a135-arena",
+        MemfdFlags::CLOEXEC | MemfdFlags::ALLOW_SEALING,
+      )
+      .map_err(|e| super::refused("memfd_create", e))?;
+      #[allow(clippy::disallowed_methods)] // sizing a memory object: RAM, not a host path (R1).
+      rustix::fs::ftruncate(&sealed, object_bytes).map_err(|e| super::refused("ftruncate", e))?;
+      rustix::fs::fcntl_add_seals(
+        &sealed,
+        rustix::fs::SealFlags::WRITE | rustix::fs::SealFlags::SHRINK | rustix::fs::SealFlags::GROW,
+      )
+      .map_err(|e| super::refused("add seals", e))?;
+
+      // The same bytes in an unsealed object exactly the size of the window: confined in extent, and
+      // still refused, because the peer could write and resize it.
+      let unsealed = memfd_create("slates-a135-open", MemfdFlags::CLOEXEC)
+        .map_err(|e| super::refused("memfd_create", e))?;
+      #[allow(clippy::disallowed_methods)] // sizing a memory object: RAM, not a host path (R1).
+      rustix::fs::ftruncate(&unsealed, window).map_err(|e| super::refused("ftruncate", e))?;
+
+      let offers: [(std::os::fd::BorrowedFd<'_>, u64, u64, &str); 3] = [
+        (sealed.as_fd(), 0, window, "an object larger than the window"),
+        (sealed.as_fd(), window, window, "a window partway into the object"),
+        (unsealed.as_fd(), 0, window, "a window the peer could write"),
+      ];
+      for (descriptor, region_off, authorized, what) in offers {
+        match control.send_mapping(descriptor, 7, 42, region_off, authorized, authorized) {
+          Err(IpcError::UnconfinedDescriptor { .. }) => {}
+          Ok(()) => {
+            let _ = what;
+            return Err(IpcError::Layout {
+              reason: "a descriptor that authorizes more than the hand-off was sent",
+            });
+          }
+          Err(other) => return Err(other),
+        }
+      }
+
+      // Nothing crossed: the peer has no delivery waiting.
+      if liveness.recv_mapping()?.is_some() {
+        return Err(IpcError::Layout {
+          reason: "a refused hand-off still reached the peer",
         });
       }
       Ok(())
