@@ -6384,3 +6384,39 @@ clippy `--all-targets -D warnings` clean.
 consumed are gone — the journal half replays, the base half does not (pre-existing, found while fixing this, not
 widened into it). And the daemon's serve loop waits on device readability, so a finished round's outcome is seen at
 its next turn; `ServeState::wakes_with` exists for a loop that carries a change signal.
+
+### 2026-10-17: the A-61 resend test raced its own precondition (CI red, fixed)
+
+`a_write_in_flight_at_the_daemons_kill_is_resent_and_every_acknowledged_write_survives` failed the ubuntu lane of
+run 39090330413 with `3 cycles, 0 resent` while the product was correct throughout — nothing lost, no `fsync`
+reporting a loss. The test needs the `SIGKILL` to land while the daemon holds a request it has read and not
+answered, since only those are resent, and it had no way to make that true: the catch probability is the serve
+loop's duty cycle, because `turn()` reads, serves and replies to one request and the kernel's processing list holds
+at most one at a time, so extra writers lengthen the pending queue and cannot raise it. Measured, binaries
+differing only in the page constant and run alternately (cachyos box, 32 cores, kernel 7.2.9, pinned to 4): cycles
+caught 4 KiB 33/58 = 0.57, 16 KiB 12/14 = 0.86, 64 KiB 12/13 = 0.92, 256 KiB 37/37 = 1.00. Two beliefs in the test
+were false — that several writers keep one request always in flight, and that waiting for a writer to be inside
+`write(2)` is sufficient (on fedora `in_write` was 4 throughout and the kill still missed). Behind them sat the
+kill itself: a `slates status` round trip plus `kill(1)`, 27.3-46.0 ms from the observed window to the signal,
+against a window of microseconds.
+
+Fixed by resolving the pid before the writers start and sending the signal with one syscall (7.2-15.9 µs, about
+3400× tighter), and by writing one `init::MAX_WRITE` page instead of 4 KiB; `WRITES_BEFORE`/`WRITES_AFTER` become
+one `WRITES_PER_PHASE` derived from a writer budget. No attempt count or timeout was raised.
+
+Verified: cachyos, 30 interleaved runs per arm — 256 KiB caught 30/32 cycles (0.94), 0 failures; 4 KiB 30/48
+(0.63). Fedora (kernel 6.19.10, pinned to 2 cores): current tree 10 runs of 10 green, 10/11 cycles (0.91); 4 KiB
+with the fast kill 2/15 (0.13), so the fast kill alone is necessary and far from sufficient. `clippy --workspace
+--all-targets -D warnings` and `fmt --check` exit 0; the cli suite 31/31. Record:
+`docs/bugs/2026-10-17-the-in-flight-resend-test-raced-its-own-precondition.md`.
+
+**Owed:** the writers' budget had to be halved and the reason is not attributed — with the whole bound, 42 MiB of
+planned pages overflow a 64 MiB volume *with the fast kill in place* (2 runs of 30 on cachyos, 2 of 8 on fedora),
+so the charge exceeds the bytes written by more than half again; the chunk-window charge, the inode allowance
+(A-109) and the pages added between the kill and the restart are all candidates and none was isolated. The two
+symptoms are coupled: a run that catches on its first cycle never approaches the bound, so the overflow only shows
+on runs that need a second or third cycle. And `wanted()` in `crates/bridge-fuse/src/init.rs` never asks for
+`FUSE_MAX_PAGES` and the INIT reply writes `max_pages = 0`, so the kernel keeps its own pages-per-request ceiling
+and the advertised `max_write` of 256 KiB is not what one request carries — verified in our source by two
+independent readings, but the kernel half is read from `fuse_perform_write`, not measured here, and no `strace` of
+the daemon's reads was taken.

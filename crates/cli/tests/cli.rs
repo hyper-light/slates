@@ -4378,6 +4378,11 @@ struct HeldMount {
   anchor: Option<AnchorProcess>,
 }
 
+/// Shape: what a held mount's volume is bounded to — room for the writers of the in-flight test to span three kill
+/// cycles (which [`WRITES_PER_PHASE`] divides out of it) without the volume filling.
+#[cfg(target_os = "linux")]
+const HELD_VOLUME_BYTES: usize = 64 * 1024 * 1024;
+
 #[cfg(target_os = "linux")]
 impl HeldMount {
   fn start(tag: &str) -> Option<HeldMount> {
@@ -4392,7 +4397,8 @@ impl HeldMount {
     }
     let instance = format!("cli-fuse-{tag}-{}", std::process::id());
     let anchor = start_anchor(&instance);
-    let (code, out, err) = run(&instance, &["volume", "create", tag, "--bounded", "64MiB"]);
+    let bounded = format!("{}MiB", HELD_VOLUME_BYTES / (1024 * 1024));
+    let (code, out, err) = run(&instance, &["volume", "create", tag, "--bounded", &bounded]);
     assert_eq!(code, 0, "{err}");
     let id = value_of(&out, "id");
     let mount_point = MountPoint {
@@ -4456,6 +4462,19 @@ fn kill_the_daemon(instance: &str) -> u32 {
   killed
 }
 
+/// `SIGKILL` to `pid` as one syscall. The in-flight test's kill has to land inside the window it waited for, and
+/// [`kill_the_daemon`] cannot: finding the pid is a `slates status` round trip and `kill(1)` is a fork and an exec,
+/// together 27-46 ms on the Fedora box under two cores (2026-10-17), against a request the daemon holds for
+/// microseconds.
+#[cfg(target_os = "linux")]
+fn signal_kill(pid: u32) {
+  let pid = i32::try_from(pid)
+    .ok()
+    .and_then(rustix::process::Pid::from_raw)
+    .expect("the daemon's pid");
+  rustix::process::kill_process(pid, rustix::process::Signal::KILL).expect("SIGKILL to the daemon");
+}
+
 /// Every byte of `file`, read from its start through the same descriptor.
 #[cfg(target_os = "linux")]
 fn read_whole(file: &mut std::fs::File) -> Vec<u8> {
@@ -4482,15 +4501,46 @@ fn counter_of(instance: &str, name: &str) -> u64 {
 /// inside the anchor's restart policy, which allows a restart per daemon start the recovery budget holds.
 #[cfg(target_os = "linux")]
 const IN_FLIGHT_ATTEMPTS: usize = 3;
-/// Shape: the bytes of each write the in-flight test's writer makes (one page).
+/// Derived: one write is the mount's advertised `init::MAX_WRITE`, so the daemon's service of it is the longest a
+/// single write can hold a request it has read and not answered — the state the kill has to land inside for the
+/// kernel to resend anything. The daemon is in that state only for the fraction of its serve loop spent serving
+/// rather than reading the next request, so with a page-sized write the kill is close to a coin toss however many
+/// writers queue behind it. Measured on the Linux box (32 cores, kernel 7.2.9-2-cachyos, the test pinned to 4 of
+/// them, other sessions' load 10-14, 2026-10-17), binaries differing only in this constant and run alternately,
+/// the fraction of kill cycles that caught a request in flight rose with the write: 4 KiB 33/58 = 0.57, 16 KiB
+/// 12/14 = 0.86, 64 KiB 12/13 = 0.92, 256 KiB 37/37 = 1.00. With the kill since reduced to one syscall
+/// ([`signal_kill`]) the same comparison over 30 interleaved runs each reads 4 KiB 30/48 = 0.63 against 256 KiB
+/// 30/32 = 0.94, and the whole test failed 0 runs in 30. A second host agrees and is harsher: fedora, kernel
+/// 6.19.10, pinned to 2 cores, 4 KiB caught 2 of 15 cycles = 0.13 and 256 KiB 10 of 11 = 0.91, 10 runs of 10
+/// green. At 4 KiB the whole test failed 9 of 107 runs across the two hosts, which is the CI red this replaces
+/// (run 39090330413, ubuntu lane). Whether the kernel carries one `MAX_WRITE` write as one request or splits it
+/// into two is its own affair — it caps a request at its own page count, which slates does not negotiate — and
+/// what was measured here is the catch rate, not the request count.
 #[cfg(target_os = "linux")]
-const IN_FLIGHT_WRITE: usize = 4096;
-/// Shape: the writes the writer makes before the kill, so it is in its stride when the daemon dies.
+const IN_FLIGHT_WRITE: usize = slates_bridge_fuse::init::MAX_WRITE as usize;
+/// Shape: the phases of one kill cycle a writer's pages are spread over — the pages before the kill, the pages it
+/// gets in while the kill is delivered and the daemon restarts, and the pages after the restarted daemon answers.
 #[cfg(target_os = "linux")]
-const WRITES_BEFORE: usize = 64;
-/// Shape: the writes the writer makes after the restarted daemon answers, so the file spans the takeover.
+const CYCLE_PHASES: usize = 3;
+/// Derived: the bytes every writer together may append over the whole test — half the volume's bound, not all of
+/// it, because the volume charges a write more than the write's own length: budgeting the writers the whole bound
+/// plans 42 MiB of pages into a 64 MiB volume and still overflows it, so the charge exceeds the bytes by more than
+/// half again. What makes up the excess is not attributed here — the chunk windows a page touches, the inode
+/// allowance (A-109) and the pages a writer gets in between the kill and the restart are all candidates, and none
+/// was isolated. Measured 2026-10-17, 256 KiB pages and the one-syscall kill in both arms, so neither is the
+/// cause: the writers took `ENOSPC` instead of the resend under test in 2 runs of 30 on the cachyos box and 2 of 8
+/// on the fedora box with the bound itself, and in 0 of 30 and 0 of 10 with half of it.
 #[cfg(target_os = "linux")]
-const WRITES_AFTER: usize = 64;
+const WRITER_BUDGET_BYTES: usize = HELD_VOLUME_BYTES / 2;
+/// Derived: the pages one writer appends in each phase of a cycle — [`WRITER_BUDGET_BYTES`] shared out among every
+/// writer, cycle and phase, so [`IN_FLIGHT_ATTEMPTS`] cycles cannot fill the volume: [`WRITER_BUDGET_BYTES`] /
+/// ([`IN_FLIGHT_WRITE`] × [`IN_FLIGHT_WRITERS`] × [`IN_FLIGHT_ATTEMPTS`] × [`CYCLE_PHASES`]). It is both the stride
+/// a writer reaches before the kill and the pages it writes after the restart, so the file spans the takeover on
+/// both sides. In bytes it is several times what this test wrote per phase before the page grew to
+/// [`IN_FLIGHT_WRITE`], since one page now carries what sixty-four did.
+#[cfg(target_os = "linux")]
+const WRITES_PER_PHASE: usize =
+  WRITER_BUDGET_BYTES / (IN_FLIGHT_WRITE * IN_FLIGHT_WRITERS * IN_FLIGHT_ATTEMPTS * CYCLE_PHASES);
 /// Format: the page values cycle through this many, a prime, so a page out of place shows.
 #[cfg(target_os = "linux")]
 const PAGE_VALUES: usize = 251;
@@ -4505,11 +4555,13 @@ struct Cycle {
 
 /// Shape: concurrent writers in each kill cycle, each on its own file. One synchronous writer leaves the daemon idle
 /// between a reply and the next read, so a kill missed every in-flight request in three cycles on the CI runner
-/// (2026-10-03); with several writers queued, the daemon always holds one it read and has not answered.
+/// (2026-10-03). Several writers keep the device's queue non-empty, but that alone does not keep a request *in
+/// flight*: the serve loop still holds one only while it serves, which is why the write is [`IN_FLIGHT_WRITE`]
+/// bytes and not a page.
 #[cfg(target_os = "linux")]
 const IN_FLIGHT_WRITERS: usize = 4;
 
-/// One writer of a kill cycle: appends numbered pages to `path` from page `first` until [`WRITES_AFTER`] writes
+/// One writer of a kill cycle: appends numbered pages to `path` from page `first` until [`WRITES_PER_PHASE`] writes
 /// past the restart, then `fsync`s the descriptor it wrote through.
 #[cfg(target_os = "linux")]
 fn write_pages(
@@ -4526,7 +4578,7 @@ fn write_pages(
   let mut file = std::fs::OpenOptions::new().append(true).open(path).unwrap();
   let mut written = 0usize;
   let mut after = 0usize;
-  while after < WRITES_AFTER {
+  while after < WRITES_PER_PHASE {
     let page = [u8::try_from((first + written) % PAGE_VALUES).unwrap_or(0); IN_FLIGHT_WRITE];
     // `in_write` is held across the syscall only: while it is non-zero a writer is inside `write(2)`, so the
     // kernel has a FUSE request outstanding to the daemon. The kill waits for that, since a kill that lands
@@ -4561,6 +4613,9 @@ fn write_through_a_kill(instance: &str, paths: &[String], firsts: &[usize]) -> V
   let restarted = std::sync::atomic::AtomicBool::new(false);
   let progress = std::sync::atomic::AtomicUsize::new(0);
   let in_write = std::sync::atomic::AtomicUsize::new(0);
+  // The pid is read before the window opens: finding it costs a `slates status` round trip, and the kill has to
+  // land inside the window, not tens of milliseconds after it was observed.
+  let target = daemon_pid(instance).expect("the daemon answers");
   std::thread::scope(|scope| {
     let writers: Vec<_> = paths
       .iter()
@@ -4570,19 +4625,24 @@ fn write_through_a_kill(instance: &str, paths: &[String], firsts: &[usize]) -> V
       })
       .collect();
     assert!(
-      wait_for(|| progress.load(Ordering::Acquire) >= WRITES_BEFORE * paths.len()),
+      wait_for(|| progress.load(Ordering::Acquire) >= WRITES_PER_PHASE * paths.len()),
       "the writers started"
     );
     // Kill while a write is actually outstanding. Waiting only for "the writers started" let the kill land
     // between requests — on a loaded shared runner that happened on every attempt, and the test failed with
     // nothing resent (CI run 39053632284, ubuntu lane, 2026-10-17) though the daemon was behaving correctly.
     // The resend under test (A-61) exists only for a request the dead daemon read and never answered, so the
-    // kill must catch one in flight; this waits for exactly that condition instead of racing it.
+    // kill must catch one in flight. This wait is necessary but is not on its own sufficient: a writer inside
+    // `write(2)` has a request on the device, and the daemon holds it only while it serves it rather than while
+    // it reads the next one, so what decides the catch is how long one write occupies the daemon — which is why
+    // a page is [`IN_FLIGHT_WRITE`] bytes (measured there: 0.63 of cycles caught at 4 KiB against 0.94 at 256 KiB,
+    // interleaved, with this kill).
     assert!(
       wait_for(|| in_write.load(Ordering::Acquire) >= 1),
       "a writer is inside write(2), so a request is outstanding to the daemon"
     );
-    let killed = kill_the_daemon(instance);
+    signal_kill(target);
+    let killed = target;
     await_daemon(instance, Some(killed), &[]);
     restarted.store(true, Ordering::Release);
     writers

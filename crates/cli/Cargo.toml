@@ -36,6 +36,12 @@ slates-rt = { workspace = true }
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true }
 
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+# `init::MAX_WRITE`: the in-flight resend test writes one page of it, the largest write the mount advertises, so the
+# daemon is serving one for as long as a single write can hold it when the kill lands (A-61 / T-3.5). Linux-only,
+# as the test is.
+slates-bridge-fuse = { workspace = true }
+
 [dev-dependencies]
 # Self-signed fleet identities for the multi-process deployment test (as the server's fleet tests mint them).
 rcgen = { workspace = true }
