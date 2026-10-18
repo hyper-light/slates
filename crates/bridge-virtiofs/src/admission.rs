@@ -378,6 +378,13 @@ fn unsupported(request: &GuestAttachRequest) -> Option<UnsupportedReason> {
   if request.transport == GuestTransport::InheritedDescriptor && !cfg!(target_os = "linux") {
     return Some(UnsupportedReason::BindingNotBuilt);
   }
+  // The DAX advertisement gate. **Before flipping this, read
+  // `docs/bugs/2026-10-18-the-message-based-dax-map-hands-the-vmm-the-whole-arena.md`:** the
+  // message-based placer sends the frontend the arena's WHOLE shared-object descriptor, not the
+  // authorized block — measured at 64× the window it may map, with another tenant's blocks inside it.
+  // `fd_offset`/`len` scope the request, never the descriptor, so with this gate open a VMM's
+  // confinement would rest on the frontend honouring them rather than on what slates handed it. The
+  // fd-sharing placer does not have this property (the backend maps; the VMM gets no descriptor).
   if request.dax {
     return Some(UnsupportedReason::DaxNotEstablished);
   }
