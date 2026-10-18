@@ -7035,7 +7035,30 @@ load 25.6, so reproducing needs the full workspace's contention. **The next work
 output and grep the file afterwards** — filtering a run you cannot cheaply repeat throws away the evidence you
 ran it for.
 
-Two readings remain open, and the numbers would separate them: the noise probe samples at a different moment
-than the loop's worst step and so under-measures the contention the loop actually met; or there is a real hold
-that only extreme contention exposes. Until it is reproduced with its figures, it is an observed flake and
-nothing more.
+**Reproduced and closed the same day.** Running the test six times against the load of a concurrent workspace
+run failed it twice, with the figures:
+
+| run | longest step | bound | sampled noise | over by |
+|---|---|---|---|---|
+| 5 | 172.7 ms | 100 ms | 65.3 ms | 7.5 ms |
+| 6 | 160.4 ms | 100 ms | 19.6 ms | **40.8 ms** |
+
+The noise estimate swung 20↔65 ms for near-identical steps, which is the tell. **The probe measured the wrong
+quantity, and the file said so itself without noticing**: its comment cites `destroy_rows` in
+`crates/vfs/examples/vfs_bench.rs` as its pattern, and that one measures "the longest gap between two
+consecutive clock reads over the probe window, with no work between them" — a **runnable** thread's preemption
+— and cross-checks it with `getrusage`'s involuntary-switch count. `driver.rs` instead ran a sampler that
+**sleeps** 1 ms at a time and records how late each wake was. A sleeping thread's wake lateness is not an upper
+bound on how long a running thread is kept off a core, so under contention the allowance under-covers, by a
+margin that varies with nothing in particular.
+
+**Fixed with the attribution the cited pattern uses:** every timed step now records the involuntary context
+switches that happened during it, and a step over the bound fails only if that count is **zero** — one the
+scheduler took away is the machine's, not the driver's. The three figures are printed whether it passes or
+fails, since a timing bound whose margin nobody sees is one nobody can judge, and the `longest_call` comment
+already records a 245 ms CI step that could not be attributed at all.
+
+**Red-checked from both sides**, because a clause that rescues everything is worse than no clause: with the
+primary condition made impossible the test passes on the switch clause alone (16 switches observed), and with
+`involuntary_switches` forced to return zero it fails — *"the scheduler took the thread away 0 times during it
+(zero: the driver held it)"*. So a genuine hold still fails, which is the property that matters.

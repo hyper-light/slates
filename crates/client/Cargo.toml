@@ -30,6 +30,9 @@ slates-anchor = { workspace = true }
 # Test-only: the async-core test polls the completion fd for readiness (the fd an event loop would
 # poll), which needs `poll(2)`; rustix is the crate's syscall wrapper, a normal dep of `slates-ipc`.
 rustix = { workspace = true }
+# The canonical scheduling attribution (`crates/vfs/examples/vfs_bench.rs`): `getrusage`'s involuntary
+# context-switch count tells a step the scheduler preempted from one our own code held.
+libc = { workspace = true }
 slates-mem = { workspace = true }
 slates-db = { workspace = true }
 
