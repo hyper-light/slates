@@ -237,14 +237,27 @@ fn a_single_use_grant_refuses_content_changed_after_it_was_approved() {
   .try_land(&granted, &mut Unobserved);
   let changed_hash = match outcome {
     Err(LandingRefusal::Grant(GrantRefusal::GrantMismatch { expected, got })) => {
-      assert_eq!(expected, approved_hash, "the grant still binds the approved manifest");
-      assert_ne!(got, approved_hash, "the changed content plans a different manifest hash");
+      assert_eq!(
+        expected, approved_hash,
+        "the grant still binds the approved manifest"
+      );
+      assert_ne!(
+        got, approved_hash,
+        "the changed content plans a different manifest hash"
+      );
       got
     }
     other => panic!("content changed after the grant must refuse GrantMismatch, got {other:?}"),
   };
-  assert_eq!(disk(&host), before, "a refused TOCTOU landing wrote to the host");
-  assert!(host.bytes("/a/note").is_none(), "nothing of the evil content landed");
+  assert_eq!(
+    disk(&host),
+    before,
+    "a refused TOCTOU landing wrote to the host"
+  );
+  assert!(
+    host.bytes("/a/note").is_none(),
+    "nothing of the evil content landed"
+  );
 
   // Non-vacuity: a grant issued for the changed content's own manifest lands it, so the refusal above was
   // specifically the stale grant's manifest, not a dead grant or a broken land path. The binding is unchanged
@@ -257,7 +270,10 @@ fn a_single_use_grant_refuses_content_changed_after_it_was_approved() {
     session: &mut session,
   }
   .present(&request(1));
-  assert_eq!(for_changed.manifest.hash, changed_hash, "present re-plans the changed content's manifest");
+  assert_eq!(
+    for_changed.manifest.hash, changed_hash,
+    "present re-plans the changed content's manifest"
+  );
   let grant2 = session.grants.issue(
     Surface::Cli,
     for_changed.manifest.hash,
@@ -273,7 +289,13 @@ fn a_single_use_grant_refuses_content_changed_after_it_was_approved() {
     store: &mut store,
     session: &mut session,
   }
-  .try_land(&LandingRequest { grant: grant2, ..request(1) }, &mut Unobserved)
+  .try_land(
+    &LandingRequest {
+      grant: grant2,
+      ..request(1)
+    },
+    &mut Unobserved,
+  )
   .unwrap();
   assert_eq!(report.state, LandingState::Done, "{report:?}");
   assert_eq!(host.bytes("/a/note").unwrap(), b"evil bytes");

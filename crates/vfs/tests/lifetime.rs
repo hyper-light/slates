@@ -307,13 +307,19 @@ fn a_u64_max_forget_drops_only_what_is_held_and_a_repeat_is_inert() {
   vol
     .forget_for(&mut store, f, RefOwner::Process(1), u64::MAX)
     .unwrap();
-  assert!(vol.stat(&store, f).is_err(), "the single reference was dropped exactly once");
+  assert!(
+    vol.stat(&store, f).is_err(),
+    "the single reference was dropped exactly once"
+  );
 
   // A repeat colossal forget of the reclaimed node is inert — no underflow, no resurrection, no panic.
   vol
     .forget_for(&mut store, f, RefOwner::Process(1), u64::MAX)
     .unwrap();
-  assert!(vol.stat(&store, f).is_err(), "the reclaimed inode stays gone, never resurrected");
+  assert!(
+    vol.stat(&store, f).is_err(),
+    "the reclaimed inode stays gone, never resurrected"
+  );
 }
 
 /// A directory removed while a transport still holds it — a kernel's lookup of a directory it made, kept until
@@ -441,7 +447,10 @@ fn an_open_handle_survives_unlink_and_recreate_reaching_the_original_inode() {
 
   let f2 = vol.create_file_no(&mut store, root, "f", 0o644).unwrap();
   vol.write(&mut store, f2, 0, b"BBB").unwrap();
-  assert_ne!(f, f2, "the recreated name is a distinct inode, never the held one");
+  assert_ne!(
+    f, f2,
+    "the recreated name is a distinct inode, never the held one"
+  );
 
   let mut original = vec![0u8; 3];
   vol.read(&store, f, 0, &mut original).unwrap();

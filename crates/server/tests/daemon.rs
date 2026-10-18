@@ -2694,7 +2694,10 @@ fn a_foreign_principal_cannot_drive_another_accounts_merge() {
   }) else {
     panic!("the owner submits its own work");
   };
-  assert!(conflicts.is_empty(), "the owner's submit is clean: {conflicts:?}");
+  assert!(
+    conflicts.is_empty(),
+    "the owner's submit is clean: {conflicts:?}"
+  );
   assert_eq!(
     version,
     Some(1),

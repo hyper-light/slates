@@ -260,19 +260,34 @@ fn a_landing_component_never_steps_out_of_the_target() {
   let (mut host, target) = OsLand::open_target(&ws.path.join("target")).unwrap();
   let root = target.dir;
   // The one seam the landing walk steps through refuses every component that would leave the target.
-  assert_eq!(host.open_dir(root, "..").err(), Some(HostError::NotFound), "open_dir ..");
-  assert_eq!(host.open_dir(root, ".").err(), Some(HostError::NotFound), "open_dir .");
+  assert_eq!(
+    host.open_dir(root, "..").err(),
+    Some(HostError::NotFound),
+    "open_dir .."
+  );
+  assert_eq!(
+    host.open_dir(root, ".").err(),
+    Some(HostError::NotFound),
+    "open_dir ."
+  );
   assert_eq!(
     host.open_dir(root, "mid/escape").err(),
     Some(HostError::NotFound),
     "open_dir embedded separator"
   );
-  assert_eq!(host.open_file(root, "..").err(), Some(HostError::NotFound), "open_file ..");
+  assert_eq!(
+    host.open_file(root, "..").err(),
+    Some(HostError::NotFound),
+    "open_file .."
+  );
   // The leaf write seam never creates in the parent either: `..` already exists, so an exclusive
   // create of it is refused rather than reaching outside.
   assert!(host.create_temp(root, "..").is_err(), "create_temp ..");
   // Beside the target: the secret keeps its bytes and the parent gained no entry (only SECRET and target).
-  assert_eq!(read(&ws.path.join("SECRET")).unwrap(), b"outside the target");
+  assert_eq!(
+    read(&ws.path.join("SECRET")).unwrap(),
+    b"outside the target"
+  );
   assert_eq!(names_in(&ws.path).len(), 2, "{:?}", names_in(&ws.path));
 }
 
@@ -309,7 +324,10 @@ fn a_landing_never_walks_a_manifest_path_through_a_symlink() {
     "a symlink is never opened as a file"
   );
   // The secret beside the target keeps its bytes and the parent gained no entry.
-  assert_eq!(read(&ws.path.join("SECRET")).unwrap(), b"outside the target");
+  assert_eq!(
+    read(&ws.path.join("SECRET")).unwrap(),
+    b"outside the target"
+  );
   assert_eq!(names_in(&ws.path).len(), 2, "{:?}", names_in(&ws.path));
 }
 
@@ -423,11 +441,18 @@ fn a_landed_setuid_file_is_owned_by_the_daemon_never_the_recorded_root() {
   let mut vol = scratch(&mut store);
 
   // A real binary an agent would plant: a shell script, owner-executable and world-readable, setuid.
-  write_file(&mut vol, &mut host, &mut store, "/exploit", b"#!/bin/sh\nid\n");
+  write_file(
+    &mut vol,
+    &mut host,
+    &mut store,
+    "/exploit",
+    b"#!/bin/sh\nid\n",
+  );
   let no = {
     let (dir, name) = common::split("/exploit");
     let d = common::dir_of(&mut vol, &mut host, &mut store, dir);
-    vol.with_host(&mut host)
+    vol
+      .with_host(&mut host)
       .lookup(&mut store, d, name)
       .unwrap()
       .inode
@@ -437,7 +462,9 @@ fn a_landed_setuid_file_is_owned_by_the_daemon_never_the_recorded_root() {
   // runs as root (a container lane), a nonzero uid keeps the claim non-vacuous either way.
   let euid = rustix::process::geteuid().as_raw();
   let recorded_uid = if euid == 0 { 65_534 } else { 0 };
-  vol.chown(&mut store, no, recorded_uid, recorded_uid).unwrap();
+  vol
+    .chown(&mut store, no, recorded_uid, recorded_uid)
+    .unwrap();
   vol.chmod(&mut store, no, 0o104_755).unwrap();
 
   let mut session = Session::new();
@@ -495,11 +522,18 @@ fn a_landing_never_materializes_a_security_capability_xattr() {
   let mut vol = scratch(&mut store);
 
   // A real binary an agent would plant, then mark with a Linux file capability.
-  write_file(&mut vol, &mut host, &mut store, "/exploit", b"#!/bin/sh\nid\n");
+  write_file(
+    &mut vol,
+    &mut host,
+    &mut store,
+    "/exploit",
+    b"#!/bin/sh\nid\n",
+  );
   let no = {
     let (dir, name) = common::split("/exploit");
     let d = common::dir_of(&mut vol, &mut host, &mut store, dir);
-    vol.with_host(&mut host)
+    vol
+      .with_host(&mut host)
       .lookup(&mut store, d, name)
       .unwrap()
       .inode
@@ -508,7 +542,8 @@ fn a_landing_never_materializes_a_security_capability_xattr() {
   // permitted set. The exact bits are immaterial to the guard — the point is this attribute never reaches disk.
   let cap_name: &[u8] = b"security.capability";
   let cap_value: [u8; 20] = [
-    0x00, 0x80, 0x00, 0x02, // magic_etc: VFS_CAP_REVISION_2 | VFS_CAP_FLAGS_EFFECTIVE (little-endian)
+    0x00, 0x80, 0x00,
+    0x02, // magic_etc: VFS_CAP_REVISION_2 | VFS_CAP_FLAGS_EFFECTIVE (little-endian)
     0x80, 0x00, 0x00, 0x00, // permitted[0]: CAP_SETUID (bit 7)
     0x80, 0x00, 0x00, 0x00, // inheritable[0]: CAP_SETUID (bit 7)
     0x00, 0x00, 0x00, 0x00, // permitted[1]

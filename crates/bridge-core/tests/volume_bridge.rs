@@ -1407,7 +1407,9 @@ fn a_scoped_directory_paged_by_cookie_never_loses_an_in_scope_entry_behind_dropp
       inner.release(oid(z.ino), &cx, zfh).unwrap();
       in_scope.push(name);
     } else {
-      let (g, gfh) = inner.create(oid(outside), &cx, &format!("g{n:02}"), 0o644, 0).unwrap();
+      let (g, gfh) = inner
+        .create(oid(outside), &cx, &format!("g{n:02}"), 0o644, 0)
+        .unwrap();
       inner.release(oid(g.ino), &cx, gfh).unwrap();
       inner.link(oid(g.ino), oid(d), &cx, &name).unwrap();
     }
@@ -1526,9 +1528,13 @@ fn a_scoped_view_reaches_an_in_scope_sidecar_and_refuses_an_out_of_scope_one() {
     let shared = inner.mkdir(oid(root), &cx, "shared", 0o755).unwrap().ino;
     let private = inner.mkdir(oid(root), &cx, "private", 0o700).unwrap().ino;
     inner.create(oid(shared), &cx, "f", 0o644, 0).unwrap();
-    let f_view = inner.appledouble_create(oid(shared), &cx, "f", true).unwrap();
+    let f_view = inner
+      .appledouble_create(oid(shared), &cx, "f", true)
+      .unwrap();
     inner.create(oid(private), &cx, "s", 0o644, 0).unwrap();
-    let s_view = inner.appledouble_create(oid(private), &cx, "s", true).unwrap();
+    let s_view = inner
+      .appledouble_create(oid(private), &cx, "s", true)
+      .unwrap();
     (shared, f_view.ino, s_view.ino)
   };
   let mut inner = VolumeBridge::new(VolumeId { bytes: [0; 16] }, &mut vol, &mut store);
@@ -1684,9 +1690,13 @@ fn a_scoped_readdir_with_a_crafted_cookie_terminates_and_leaks_no_alias() {
   let root = inner.root(&cx).unwrap();
   let outside = inner.mkdir(oid(root), &cx, "out", 0o755).unwrap().ino;
   for n in 0..12u32 {
-    let (g, gfh) = inner.create(oid(outside), &cx, &format!("g{n:02}"), 0o644, 0).unwrap();
+    let (g, gfh) = inner
+      .create(oid(outside), &cx, &format!("g{n:02}"), 0o644, 0)
+      .unwrap();
     inner.release(oid(g.ino), &cx, gfh).unwrap();
-    inner.link(oid(g.ino), oid(d), &cx, &format!("a{n:02}")).unwrap();
+    inner
+      .link(oid(g.ino), oid(d), &cx, &format!("a{n:02}"))
+      .unwrap();
   }
   let (z, zfh) = inner.create(oid(d), &cx, "z", 0o644, 0).unwrap();
   inner.release(oid(z.ino), &cx, zfh).unwrap();
@@ -1694,14 +1704,21 @@ fn a_scoped_readdir_with_a_crafted_cookie_terminates_and_leaks_no_alias() {
   let mut scoped = ScopedBridge::new(&mut inner, shared);
   // A forged cookie past every entry: the loop must stop (empty), not spin.
   let past = scoped.readdir(oid(d), &cx, 0, u64::MAX, 4).unwrap();
-  assert!(past.is_empty(), "a resume past the end returns nothing: {past:?}");
+  assert!(
+    past.is_empty(),
+    "a resume past the end returns nothing: {past:?}"
+  );
   // Paging from 0 with a crafted small limit: terminates, never shows an alias.
   let mut cookie = 0u64;
   let mut pages = 0u32;
   loop {
     let page = scoped.readdir(oid(d), &cx, 0, cookie, 2).unwrap();
     for e in &page {
-      assert!(!e.name.starts_with('a'), "an out-of-scope alias leaked: {:?}", e.name);
+      assert!(
+        !e.name.starts_with('a'),
+        "an out-of-scope alias leaked: {:?}",
+        e.name
+      );
     }
     let Some(last) = page.last() else { break };
     cookie = last.cookie;

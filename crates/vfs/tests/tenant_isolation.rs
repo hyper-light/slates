@@ -7,7 +7,12 @@
 //! regression against any future change that let one tenant's write, truncate or reclaim reach another's bytes.
 
 // Test harness code: an unwrap here is a failed test, which is what it should be.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+  clippy::unwrap_used,
+  clippy::expect_used,
+  clippy::panic,
+  clippy::indexing_slicing
+)]
 
 use proptest::prelude::*;
 use slates_vfs::error::VfsError;

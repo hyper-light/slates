@@ -622,8 +622,15 @@ fn content_refusal(kind: slates_vfs::inode::Kind) -> Option<VfsError> {
 /// call so the error need not be `Copy`).
 fn assert_content(op: &str, result: Result<(), VfsError>, kind: slates_vfs::inode::Kind) {
   match content_refusal(kind) {
-    None => assert!(result.is_ok(), "{op} on a regular file must succeed, got {result:?}"),
-    Some(err) => assert_eq!(result, Err(err), "{op} on a {kind:?} must be refused with its errno"),
+    None => assert!(
+      result.is_ok(),
+      "{op} on a regular file must succeed, got {result:?}"
+    ),
+    Some(err) => assert_eq!(
+      result,
+      Err(err),
+      "{op} on a {kind:?} must be refused with its errno"
+    ),
   }
 }
 
@@ -635,11 +642,17 @@ fn check_content_ops(
   kind: slates_vfs::inode::Kind,
 ) {
   let mut buf = [0u8; 8];
-  assert_content("read", vol.read(store, inode, 0, &mut buf).map(|_| ()), kind);
+  assert_content(
+    "read",
+    vol.read(store, inode, 0, &mut buf).map(|_| ()),
+    kind,
+  );
   assert_content("write", vol.write(store, inode, 0, b"x").map(|_| ()), kind);
   assert_content(
     "seek",
-    vol.seek(store, inode, 0, slates_vfs::volume::Seek::Data).map(|_| ()),
+    vol
+      .seek(store, inode, 0, slates_vfs::volume::Seek::Data)
+      .map(|_| ()),
     kind,
   );
   assert_content("truncate", vol.truncate(store, inode, 4), kind);
@@ -662,11 +675,30 @@ fn every_content_operation_is_refused_on_a_non_file_kind() {
   let mut vol = volume(&mut store, 1 << 20);
   let root = vol.root_inode(&store).unwrap();
   let inodes = [
-    (Kind::File, vol.create_file_no(&mut store, root, "f", 0o644).unwrap()),
-    (Kind::Dir, vol.mkdir_no(&mut store, root, "d", 0o755).unwrap()),
-    (Kind::Symlink, vol.symlink_no(&mut store, root, "l", "target").unwrap()),
-    (Kind::Fifo, vol.mknod_no(&mut store, root, "p", 0o644, Kind::Fifo).unwrap()),
-    (Kind::Socket, vol.mknod_no(&mut store, root, "s", 0o644, Kind::Socket).unwrap()),
+    (
+      Kind::File,
+      vol.create_file_no(&mut store, root, "f", 0o644).unwrap(),
+    ),
+    (
+      Kind::Dir,
+      vol.mkdir_no(&mut store, root, "d", 0o755).unwrap(),
+    ),
+    (
+      Kind::Symlink,
+      vol.symlink_no(&mut store, root, "l", "target").unwrap(),
+    ),
+    (
+      Kind::Fifo,
+      vol
+        .mknod_no(&mut store, root, "p", 0o644, Kind::Fifo)
+        .unwrap(),
+    ),
+    (
+      Kind::Socket,
+      vol
+        .mknod_no(&mut store, root, "s", 0o644, Kind::Socket)
+        .unwrap(),
+    ),
   ];
   for (kind, inode) in inodes {
     check_content_ops(&mut vol, &mut store, inode, kind);
@@ -689,7 +721,9 @@ fn a_snapshot_read_of_a_non_file_is_refused_like_the_head() {
   vol.write(&mut store, file, 0, b"hello").unwrap();
   let dir = vol.mkdir_no(&mut store, root, "d", 0o755).unwrap();
   let link = vol.symlink_no(&mut store, root, "l", "target").unwrap();
-  let fifo = vol.mknod_no(&mut store, root, "p", 0o644, Kind::Fifo).unwrap();
+  let fifo = vol
+    .mknod_no(&mut store, root, "p", 0o644, Kind::Fifo)
+    .unwrap();
   let snap = vol.snapshot(&mut store).unwrap();
   let mut buf = [0u8; 16];
   assert_eq!(

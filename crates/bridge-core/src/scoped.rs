@@ -459,7 +459,10 @@ impl Bridge for ScopedBridge<'_> {
         Invalidation::Inode { ino, .. } => *ino,
         Invalidation::Entry { parent, .. } => *parent,
       };
-      if self.inner.within(ObjectId::new(object, 0), self.scope, cx)? {
+      if self
+        .inner
+        .within(ObjectId::new(object, 0), self.scope, cx)?
+      {
         out.push(invalidation);
       }
     }

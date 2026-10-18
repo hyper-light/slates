@@ -207,12 +207,24 @@ fn fuse_create_and_mkdir_refuse_dot_names() {
   let mut bridge = VolumeBridge::new(VOLUME, &mut volume, &mut store);
 
   assert_ne!(
-    fuse_errno(&mut bridge, &cx, Opcode::Create, 1, create(S_IFREG | 0o644, 0, ".")),
+    fuse_errno(
+      &mut bridge,
+      &cx,
+      Opcode::Create,
+      1,
+      create(S_IFREG | 0o644, 0, ".")
+    ),
     0,
     "FUSE_CREATE '.' is refused, not echoed"
   );
   assert_ne!(
-    fuse_errno(&mut bridge, &cx, Opcode::Create, 2, create(S_IFREG | 0o644, 0, "..")),
+    fuse_errno(
+      &mut bridge,
+      &cx,
+      Opcode::Create,
+      2,
+      create(S_IFREG | 0o644, 0, "..")
+    ),
     0,
     "FUSE_CREATE '..' is refused"
   );
@@ -222,7 +234,13 @@ fn fuse_create_and_mkdir_refuse_dot_names() {
     "FUSE_MKDIR '.' is refused"
   );
   assert_eq!(
-    fuse_errno(&mut bridge, &cx, Opcode::Create, 4, create(S_IFREG | 0o644, 0, "real")),
+    fuse_errno(
+      &mut bridge,
+      &cx,
+      Opcode::Create,
+      4,
+      create(S_IFREG | 0o644, 0, "real")
+    ),
     0,
     "a normal name still creates"
   );
@@ -260,22 +278,46 @@ fn fuse_create_family_refuses_a_path_or_absolute_name() {
   let mut bridge = VolumeBridge::new(VOLUME, &mut volume, &mut store);
 
   assert_ne!(
-    fuse_errno(&mut bridge, &cx, Opcode::Create, 1, create(S_IFREG | 0o644, 0, "/etc/cron.d/evil")),
+    fuse_errno(
+      &mut bridge,
+      &cx,
+      Opcode::Create,
+      1,
+      create(S_IFREG | 0o644, 0, "/etc/cron.d/evil")
+    ),
     0,
     "an absolute-path CREATE name is refused"
   );
   assert_ne!(
-    fuse_errno(&mut bridge, &cx, Opcode::MkDir, 2, mkdir(0o755, 0, "../../escape")),
+    fuse_errno(
+      &mut bridge,
+      &cx,
+      Opcode::MkDir,
+      2,
+      mkdir(0o755, 0, "../../escape")
+    ),
     0,
     "a '..' traversal MKDIR name is refused"
   );
   assert_ne!(
-    fuse_errno(&mut bridge, &cx, Opcode::SymLink, 3, symlink_body("/etc/cron.d/evil", "payload")),
+    fuse_errno(
+      &mut bridge,
+      &cx,
+      Opcode::SymLink,
+      3,
+      symlink_body("/etc/cron.d/evil", "payload")
+    ),
     0,
     "an absolute-path SYMLINK name is refused (CVE-2026-47243's exact vector)"
   );
   assert_ne!(
-    fuse_errno(&mut bridge, &cx, Opcode::SymLink, 4, symlink_body("../escape", "payload")),
+    fuse_errno(
+      &mut bridge,
+      &cx,
+      Opcode::SymLink,
+      4,
+      symlink_body("../escape", "payload")
+    ),
     0,
     "a '..' traversal SYMLINK name is refused"
   );
@@ -304,12 +346,24 @@ fn a_huge_symlink_target_is_handled_without_a_panic() {
   let mut bridge = VolumeBridge::new(VOLUME, &mut volume, &mut store);
 
   let long_target = "a".repeat(70_000);
-  let symlink = fuse_errno(&mut bridge, &cx, Opcode::SymLink, 1, symlink_body("link", &long_target));
+  let symlink = fuse_errno(
+    &mut bridge,
+    &cx,
+    Opcode::SymLink,
+    1,
+    symlink_body("link", &long_target),
+  );
   eprintln!("PROBE huge symlink target (70 KiB): symlink_errno={symlink}");
 
   // Whatever the policy on an outsized target, the bridge did not panic and still serves a normal create.
   assert_eq!(
-    fuse_errno(&mut bridge, &cx, Opcode::Create, 2, create(S_IFREG | 0o644, 0, "after")),
+    fuse_errno(
+      &mut bridge,
+      &cx,
+      Opcode::Create,
+      2,
+      create(S_IFREG | 0o644, 0, "after")
+    ),
     0,
     "the bridge still serves after a huge symlink target"
   );
@@ -342,18 +396,36 @@ fn fuse_mknod_refuses_a_character_or_block_device() {
   let mut bridge = VolumeBridge::new(VOLUME, &mut volume, &mut store);
 
   assert_ne!(
-    fuse_errno(&mut bridge, &cx, Opcode::MkNod, 1, mknod(S_IFCHR | 0o644, 0, "chr")),
+    fuse_errno(
+      &mut bridge,
+      &cx,
+      Opcode::MkNod,
+      1,
+      mknod(S_IFCHR | 0o644, 0, "chr")
+    ),
     0,
     "a character device node is refused (no host-device window)"
   );
   assert_ne!(
-    fuse_errno(&mut bridge, &cx, Opcode::MkNod, 2, mknod(S_IFBLK | 0o644, 0, "blk")),
+    fuse_errno(
+      &mut bridge,
+      &cx,
+      Opcode::MkNod,
+      2,
+      mknod(S_IFBLK | 0o644, 0, "blk")
+    ),
     0,
     "a block device node is refused"
   );
   // Non-vacuity: a FIFO (no stream) is allowed (A-26).
   assert_eq!(
-    fuse_errno(&mut bridge, &cx, Opcode::MkNod, 3, mknod(S_IFIFO | 0o644, 0, "fifo")),
+    fuse_errno(
+      &mut bridge,
+      &cx,
+      Opcode::MkNod,
+      3,
+      mknod(S_IFIFO | 0o644, 0, "fifo")
+    ),
     0,
     "a FIFO is allowed"
   );
@@ -406,11 +478,20 @@ fn a_fuse_getattr_with_a_forged_node_id_is_refused_without_a_panic() {
     &mut out,
   );
   let errno = i32::from_le_bytes(out[4..8].try_into().unwrap());
-  assert_ne!(errno, 0, "a forged node id is refused, never served or paniced");
+  assert_ne!(
+    errno, 0,
+    "a forged node id is refused, never served or paniced"
+  );
 
   // The bridge still serves a real operation afterwards.
   assert_eq!(
-    fuse_errno(&mut bridge, &cx, Opcode::Create, 2, create(S_IFREG | 0o644, 0, "real")),
+    fuse_errno(
+      &mut bridge,
+      &cx,
+      Opcode::Create,
+      2,
+      create(S_IFREG | 0o644, 0, "real")
+    ),
     0,
     "the bridge survives a forged node id"
   );
@@ -453,7 +534,13 @@ fn a_truncated_fuse_body_is_a_typed_error_not_a_panic() {
   );
   // The bridge still serves a well-formed request.
   assert_eq!(
-    fuse_errno(&mut bridge, &cx, Opcode::Create, 3, create(S_IFREG | 0o644, 0, "real")),
+    fuse_errno(
+      &mut bridge,
+      &cx,
+      Opcode::Create,
+      3,
+      create(S_IFREG | 0o644, 0, "real")
+    ),
     0,
     "the bridge survives a truncated body"
   );

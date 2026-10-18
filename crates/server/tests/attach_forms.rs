@@ -885,7 +885,9 @@ fn a_scoped_readdirplus_dotdot_entry_handle_cannot_climb_out_cve_2021_3178() {
   // does emit one, remapped; `expect` makes a silent "no handle" a visible failure rather than a vacuous pass.)
   let entries = common::nfs::readdirplus_entries(&mut scoped, &root, 2);
   assert!(
-    entries.iter().any(|(name, handle)| name == "g" && handle.is_some()),
+    entries
+      .iter()
+      .any(|(name, handle)| name == "g" && handle.is_some()),
     "non-vacuity: READDIRPLUS carries entry handles at all ({entries:?})"
   );
   let dotdot = entries
@@ -898,7 +900,9 @@ fn a_scoped_readdirplus_dotdot_entry_handle_cannot_climb_out_cve_2021_3178() {
   // volume root's `private`/`shared` (which is what the real parent would show).
   let via_dotdot = common::nfs::readdirplus(&mut scoped, &dotdot, 3);
   assert!(
-    via_dotdot.iter().all(|name| name != "private" && name != "shared"),
+    via_dotdot
+      .iter()
+      .all(|name| name != "private" && name != "shared"),
     "the `..` entry handle from a scoped READDIRPLUS must not expose the volume root's siblings: {via_dotdot:?}"
   );
   assert!(

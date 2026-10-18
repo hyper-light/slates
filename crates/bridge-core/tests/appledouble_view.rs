@@ -499,7 +499,12 @@ fn fuzz_random_bytes(rng: &mut Rng) {
 /// Arm 2: bit-flipped and truncated real macOS vectors — the corrupted-but-plausible inputs most likely to slip
 /// past a header check and trip a later bound.
 fn fuzz_flipped_vectors(rng: &mut Rng) {
-  for name in ["one-attr.bin", "two-attrs.bin", "finderinfo.bin", "after-remove.bin"] {
+  for name in [
+    "one-attr.bin",
+    "two-attrs.bin",
+    "finderinfo.bin",
+    "after-remove.bin",
+  ] {
     let base = vector(name);
     for _ in 0..5_000 {
       let mut body = base.clone();

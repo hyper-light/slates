@@ -338,7 +338,8 @@ fn a_scoped_view_filters_an_out_of_scope_base_plane_hint() {
     let (_, other_ino) = f.lookup(root, "other");
     let (_, secret) = f.lookup(other_ino, "secret");
     f.host.advance_ns(i64::try_from(GRANULARITY_NS).unwrap());
-    f.host.replace_file("/other/secret", b"tampered out of scope");
+    f.host
+      .replace_file("/other/secret", b"tampered out of scope");
     f.host.replace_file("/scope/keep", b"tampered in scope");
     (f, (scope_ino, keep, other_ino, secret))
   }

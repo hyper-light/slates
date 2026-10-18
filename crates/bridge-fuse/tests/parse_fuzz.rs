@@ -9,7 +9,9 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use slates_bridge_fuse::request::{InHeader, ReadIn, Request, RenameIn, SetAttrIn, WriteIn, parse_name};
+use slates_bridge_fuse::request::{
+  InHeader, ReadIn, RenameIn, Request, SetAttrIn, WriteIn, parse_name,
+};
 
 /// A small deterministic xorshift, so the fuzz is reproducible and allocates no RNG state on disk.
 struct Rng(u64);
@@ -36,14 +38,26 @@ impl Rng {
 fn any_bytes_to_a_fuse_parser_never_panic_and_a_well_formed_one_parses() {
   // Non-vacuity: each parser accepts a well-formed body of its exact shape (so "never panics over random bytes"
   // is not vacuously true because the parser always bails at byte 0).
-  assert!(ReadIn::parse(0, &[0u8; 40]).is_ok(), "a full ReadIn body parses");
-  assert!(WriteIn::parse(0, &[0u8; 48]).is_ok(), "a full WriteIn body (header + no data) parses");
-  assert!(SetAttrIn::parse(&[0u8; 88]).is_ok(), "a full SetAttrIn body parses");
+  assert!(
+    ReadIn::parse(0, &[0u8; 40]).is_ok(),
+    "a full ReadIn body parses"
+  );
+  assert!(
+    WriteIn::parse(0, &[0u8; 48]).is_ok(),
+    "a full WriteIn body (header + no data) parses"
+  );
+  assert!(
+    SetAttrIn::parse(&[0u8; 88]).is_ok(),
+    "a full SetAttrIn body parses"
+  );
   {
     // RenameIn: newdir (8) then the two NUL-terminated names.
     let mut body = vec![0u8; 8];
     body.extend_from_slice(b"old\0new\0");
-    assert!(RenameIn::parse(0, &body, false).is_ok(), "a well-formed RenameIn parses");
+    assert!(
+      RenameIn::parse(0, &body, false).is_ok(),
+      "a well-formed RenameIn parses"
+    );
   }
 
   let mut rng = Rng(0x1234_5678_9ABC_DEF0);

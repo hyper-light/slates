@@ -635,7 +635,11 @@ fn a_write_count_that_lies_or_overruns_the_request_never_reads_out_of_bounds() {
   let mut rr = XdrReader::new(&rreply);
   assert_eq!(rr.u32().unwrap(), Nfsstat3::Ok.wire());
   PostOpAttr::decode(&mut rr).unwrap();
-  assert_eq!(rr.u32().unwrap(), 6, "the file is the six bytes written, not u32::MAX");
+  assert_eq!(
+    rr.u32().unwrap(),
+    6,
+    "the file is the six bytes written, not u32::MAX"
+  );
 }
 
 /// COMMIT over the export reports the file's writes stable and returns the same `writeverf3` a WRITE
@@ -3047,16 +3051,45 @@ fn rename_refuses_reserved_and_malformed_names() {
   let mut caller = export_as(&mut bridge, 0, 0);
   let ok = Nfsstat3::Ok.wire();
   // A target component that is reserved or carries a separator is refused.
-  assert_ne!(rename_status(&mut caller, &d, "f", &d, "."), ok, "rename to \".\"");
-  assert_ne!(rename_status(&mut caller, &d, "f", &d, ".."), ok, "rename to \"..\"");
-  assert_ne!(rename_status(&mut caller, &d, "f", &d, "a/b"), ok, "rename to \"a/b\"");
+  assert_ne!(
+    rename_status(&mut caller, &d, "f", &d, "."),
+    ok,
+    "rename to \".\""
+  );
+  assert_ne!(
+    rename_status(&mut caller, &d, "f", &d, ".."),
+    ok,
+    "rename to \"..\""
+  );
+  assert_ne!(
+    rename_status(&mut caller, &d, "f", &d, "a/b"),
+    ok,
+    "rename to \"a/b\""
+  );
   // A source component that is `.` or `..` must not rename the directory itself or its parent.
-  assert_ne!(rename_status(&mut caller, &d, ".", &d, "x"), ok, "rename from \".\"");
-  assert_ne!(rename_status(&mut caller, &d, "..", &d, "y"), ok, "rename from \"..\"");
+  assert_ne!(
+    rename_status(&mut caller, &d, ".", &d, "x"),
+    ok,
+    "rename from \".\""
+  );
+  assert_ne!(
+    rename_status(&mut caller, &d, "..", &d, "y"),
+    ok,
+    "rename from \"..\""
+  );
   drop(caller);
-  assert!(bridge.lookup(oid(dir.ino), &cx, "f").is_ok(), "f survives every refused rename");
-  assert!(bridge.lookup(oid(dir.ino), &cx, "x").is_err(), "no x was created");
-  assert!(bridge.lookup(oid(dir.ino), &cx, "y").is_err(), "no y was created");
+  assert!(
+    bridge.lookup(oid(dir.ino), &cx, "f").is_ok(),
+    "f survives every refused rename"
+  );
+  assert!(
+    bridge.lookup(oid(dir.ino), &cx, "x").is_err(),
+    "no x was created"
+  );
+  assert!(
+    bridge.lookup(oid(dir.ino), &cx, "y").is_err(),
+    "no y was created"
+  );
 }
 
 /// A rename needs write and search permission on both directories (`NFS3ERR_ACCES`), and the sticky

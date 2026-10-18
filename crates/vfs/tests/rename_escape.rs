@@ -69,8 +69,16 @@ fn rename_into_a_sibling_carries_the_subtree() {
   let sib = v.mkdir_no(&mut store, root, "sib", 0o755).unwrap();
 
   assert!(v.rename_no(&mut store, root, "a", sib, "a").is_ok());
-  assert_eq!(v.lookup_no(&store, sib, "a").unwrap().inode, a, "'a' moved under 'sib'");
-  assert_eq!(v.lookup_no(&store, a, "b").unwrap().inode, b, "its subtree came along");
+  assert_eq!(
+    v.lookup_no(&store, sib, "a").unwrap().inode,
+    a,
+    "'a' moved under 'sib'"
+  );
+  assert_eq!(
+    v.lookup_no(&store, a, "b").unwrap().inode,
+    b,
+    "its subtree came along"
+  );
 }
 
 /// §4.6 (POSIX `EPERM` "the target is a directory"). A hard link to a *directory* would make the tree a graph
@@ -126,7 +134,10 @@ fn a_foreign_inode_number_never_reaches_another_volumes_data() {
   a.write(&mut store, a_file, 0, b"AAA").unwrap();
   let b_file = b.create_file_no(&mut store, root_b, "f", 0o644).unwrap();
   b.write(&mut store, b_file, 0, b"BBB").unwrap();
-  assert_ne!(a_file, b_file, "the two files differ by their volume prefix");
+  assert_ne!(
+    a_file, b_file,
+    "the two files differ by their volume prefix"
+  );
 
   // A, handed B's inode number, reads its OWN same-counter bytes — never B's. A miss would be containment too.
   let mut buf = vec![0u8; 3];
@@ -141,7 +152,11 @@ fn a_foreign_inode_number_never_reaches_another_volumes_data() {
   // B's file is intact and still its own — A's foreign-number access reached nothing of B's.
   let mut bbuf = vec![0u8; 3];
   let bn = b.read(&store, b_file, 0, &mut bbuf).unwrap();
-  assert_eq!(&bbuf[..bn], b"BBB", "B's file is untouched and unreachable from A");
+  assert_eq!(
+    &bbuf[..bn],
+    b"BBB",
+    "B's file is untouched and unreachable from A"
+  );
 }
 
 /// §4.2 cross-tenant resource isolation (CLAUDE.md #8, no unbounded growth). Two bounded volumes share the shard;

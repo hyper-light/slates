@@ -2246,8 +2246,15 @@ fn an_overlay_never_follows_a_base_path_the_host_swaps_under_it_cve_2026_77179()
   let mut vol = overlay(&mut host, &mut store);
 
   // Witness `/witnessed` by editing it: its content now lives in the volume's RAM, not the host.
-  let w = vol.with_host(&mut host).resolve(&mut store, "/witnessed").unwrap().inode;
-  vol.with_host(&mut host).write(&mut store, w, 0, b"EDITED!!").unwrap();
+  let w = vol
+    .with_host(&mut host)
+    .resolve(&mut store, "/witnessed")
+    .unwrap()
+    .inode;
+  vol
+    .with_host(&mut host)
+    .write(&mut store, w, 0, b"EDITED!!")
+    .unwrap();
 
   // (1) Host swaps the content underneath, (2) host removes it: the agent still reads its witnessed copy.
   host.replace_file("/witnessed", b"SWAPPED!!");
@@ -2330,7 +2337,12 @@ fn an_overlay_never_follows_a_base_symlink_out_of_the_overlaid_subtree_cwe_59() 
 
   // Resolving THROUGH either symlink is refused NotDirectory — the resolver stops at a symlink component and never
   // walks it into the host filesystem (no /etc/passwd, no climb above the overlaid root).
-  for path in ["/evil/anything", "/up/anything", "/evil/../etc", "/up/passwd"] {
+  for path in [
+    "/evil/anything",
+    "/up/anything",
+    "/evil/../etc",
+    "/up/passwd",
+  ] {
     assert_eq!(
       vol
         .with_host(&mut host)

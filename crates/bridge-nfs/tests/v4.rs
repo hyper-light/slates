@@ -1581,7 +1581,11 @@ fn allocate_and_deallocate_are_refused_notsupp_over_nfs() {
   // Non-vacuity: the file's map is untouched — SEEK still finds its data at 0 and the hole after it.
   let (status, data) = seek(&mut client, &mut service, &mut server, 0, CONTENT_DATA);
   assert_eq!(status, Nfsstat4::Ok.wire());
-  assert_eq!(data, Some((false, 0)), "the sparse file's data at 0 survived the refused allocate/deallocate");
+  assert_eq!(
+    data,
+    Some((false, 0)),
+    "the sparse file's data at 0 survived the refused allocate/deallocate"
+  );
 }
 
 /// A-35 (RFC 7862 §15.10): READ_PLUS of the whole sparse file returns its contents in order — the first

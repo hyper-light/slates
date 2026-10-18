@@ -696,8 +696,16 @@ fn a_valid_capability_cannot_be_restamped_onto_another_tenants_handle() {
   assert_eq!(file_b.len(), 57, "a version-2 handle is 57 bytes");
 
   // Non-vacuity: B's own handle, under B's own capability, answers B's bytes.
-  assert_eq!(read_status(&mut owner_b, &file_b, 4), 0, "B serves its own file");
-  assert_eq!(read(&mut owner_b, &file_b, 5), SECRET, "...with its private bytes");
+  assert_eq!(
+    read_status(&mut owner_b, &file_b, 4),
+    0,
+    "B serves its own file"
+  );
+  assert_eq!(
+    read(&mut owner_b, &file_b, 5),
+    SECRET,
+    "...with its private bytes"
+  );
 
   // Sanity: the handle really names volume B, not A, so the re-stamp is a true cross-volume forgery.
   let root_a = mount(
@@ -758,7 +766,11 @@ fn a_crafted_name_cannot_split_truncate_or_create_a_control_entry() {
   provision(&instance, "names");
   let port = daemon.nfs_port().expect("the daemon is serving NFS");
   let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
-  let root = mount(&mut s, &daemon.mount_capability("names").unwrap().unwrap(), 1);
+  let root = mount(
+    &mut s,
+    &daemon.mount_capability("names").unwrap().unwrap(),
+    1,
+  );
 
   // The honest file resolves — the test is not vacuous.
   let _secret = create(&mut s, &root, "secret", 2);
@@ -838,14 +850,38 @@ fn mkdir_and_symlink_refuse_dot_names() {
   let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
   let root = mount(&mut s, &daemon.mount_capability("df").unwrap().unwrap(), 1);
 
-  assert_ne!(mkdir_status(&mut s, &root, b".", 2), 0, "MKDIR '.' is refused");
-  assert_ne!(mkdir_status(&mut s, &root, b"..", 3), 0, "MKDIR '..' is refused");
-  assert_ne!(symlink_status(&mut s, &root, b".", "t", 4), 0, "SYMLINK '.' is refused");
-  assert_ne!(symlink_status(&mut s, &root, b"..", "t", 5), 0, "SYMLINK '..' is refused");
+  assert_ne!(
+    mkdir_status(&mut s, &root, b".", 2),
+    0,
+    "MKDIR '.' is refused"
+  );
+  assert_ne!(
+    mkdir_status(&mut s, &root, b"..", 3),
+    0,
+    "MKDIR '..' is refused"
+  );
+  assert_ne!(
+    symlink_status(&mut s, &root, b".", "t", 4),
+    0,
+    "SYMLINK '.' is refused"
+  );
+  assert_ne!(
+    symlink_status(&mut s, &root, b"..", "t", 5),
+    0,
+    "SYMLINK '..' is refused"
+  );
 
   // Non-vacuity: a normal name still creates through both.
-  assert_eq!(mkdir_status(&mut s, &root, b"realdir", 6), 0, "a normal MKDIR works");
-  assert_eq!(symlink_status(&mut s, &root, b"reallink", "target", 7), 0, "a normal SYMLINK works");
+  assert_eq!(
+    mkdir_status(&mut s, &root, b"realdir", 6),
+    0,
+    "a normal MKDIR works"
+  );
+  assert_eq!(
+    symlink_status(&mut s, &root, b"reallink", "target", 7),
+    0,
+    "a normal SYMLINK works"
+  );
 
   drop(s);
   drop(daemon);
@@ -922,7 +958,11 @@ fn a_handle_with_a_valid_attachment_but_a_wrong_mount_token_is_refused() {
   // A real file, read with the correct handle (which carries the real mount token) — the test is not vacuous.
   let file = create(&mut s, &root, "secret.txt", 2);
   write(&mut s, &file, b"tenant bytes", 3);
-  assert_eq!(read_status(&mut s, &file, 4), 0, "the honest handle (correct token) reads");
+  assert_eq!(
+    read_status(&mut s, &file, 4),
+    0,
+    "the honest handle (correct token) reads"
+  );
 
   // The same handle with its last 16 bytes — the capability token — replaced by a wrong, non-zero value; the
   // valid attachment id ahead of them is left intact. The token no longer matches the attachment record's, so
@@ -980,7 +1020,11 @@ fn a_valid_capability_for_one_volume_cannot_read_another_cwe_863() {
   write(&mut s, &file_b, b"volume B's private bytes", 5);
 
   // Non-vacuity: B's own handle (carrying B's real capability) reads B's file.
-  assert_eq!(read_status(&mut s, &file_b, 6), 0, "B's own handle reads B's file");
+  assert_eq!(
+    read_status(&mut s, &file_b, 6),
+    0,
+    "B's own handle reads B's file"
+  );
 
   // The craft: B's volume+inode handle with A's capability spliced over its last 24 bytes (attachment id +
   // token). The volume field ahead of them stays B, so it routes to B; the capability presented is A's valid one.
@@ -1022,8 +1066,15 @@ fn a_symlink_target_naming_a_host_path_is_stored_opaque_and_a_nul_or_overlong_ta
 
   // An absolute host path and a `..`-climb as targets are accepted and stored opaquely — slates never resolves
   // them, so READLINK returns the exact bytes and no host file is ever opened by the server.
-  for (xid, name, target) in [(2u32, b"abs".as_slice(), "/etc/passwd"), (3, b"up", "../../../../etc/shadow")] {
-    assert_eq!(symlink_status(&mut s, &root, name, target, xid), 0, "an opaque symlink target is accepted");
+  for (xid, name, target) in [
+    (2u32, b"abs".as_slice(), "/etc/passwd"),
+    (3, b"up", "../../../../etc/shadow"),
+  ] {
+    assert_eq!(
+      symlink_status(&mut s, &root, name, target, xid),
+      0,
+      "an opaque symlink target is accepted"
+    );
     let fh = lookup(&mut s, &root, std::str::from_utf8(name).unwrap(), xid + 100);
     assert_eq!(
       readlink(&mut s, &fh, xid + 200),
@@ -1048,7 +1099,11 @@ fn a_symlink_target_naming_a_host_path_is_stored_opaque_and_a_nul_or_overlong_ta
   );
 
   // Non-vacuity: a normal relative symlink still creates and reads back.
-  assert_eq!(symlink_status(&mut s, &root, b"rel", "sibling.txt", 8), 0, "a normal symlink is created");
+  assert_eq!(
+    symlink_status(&mut s, &root, b"rel", "sibling.txt", 8),
+    0,
+    "a normal symlink is created"
+  );
   let rel = lookup(&mut s, &root, "rel", 9);
   assert_eq!(readlink(&mut s, &rel, 10), Ok(b"sibling.txt".to_vec()));
 
@@ -1088,7 +1143,11 @@ fn a_cross_tenant_craft_never_reads_through_under_contention_and_churn() {
   drop(sb);
 
   // Two crafts of B's secret handle: A's valid capability spliced over the last 24 bytes, and a zero capability.
-  let a_cap: Vec<u8> = file_a.iter().skip(file_a.len().saturating_sub(24)).copied().collect();
+  let a_cap: Vec<u8> = file_a
+    .iter()
+    .skip(file_a.len().saturating_sub(24))
+    .copied()
+    .collect();
   let cut = secret_b.len().saturating_sub(24);
   let mut with_a_cap = secret_b.clone();
   for (dst, src) in with_a_cap.iter_mut().skip(cut).zip(a_cap.iter()) {
@@ -1154,7 +1213,10 @@ fn a_cross_tenant_craft_never_reads_through_under_contention_and_churn() {
         while !stop.load(Ordering::Relaxed) {
           for craft in crafts {
             xid = xid.wrapping_add(1);
-            if s.write_all(&record(NFSPROC3_READ, &read_args(craft), xid)).is_err() {
+            if s
+              .write_all(&record(NFSPROC3_READ, &read_args(craft), xid))
+              .is_err()
+            {
               let Ok(fresh) = TcpStream::connect(("127.0.0.1", port)) else {
                 return;
               };
@@ -1208,7 +1270,8 @@ fn a_cross_tenant_craft_never_reads_through_under_contention_and_churn() {
 /// inode number is reused — and never the victim's secret; the attempt count is the non-vacuity evidence.
 #[test]
 fn a_stale_handle_never_reads_a_reused_inode_under_churn() {
-  const SECRET: &[u8] = b"the victim inode's secret, never served through a stale handle after inode reuse";
+  const SECRET: &[u8] =
+    b"the victim inode's secret, never served through a stale handle after inode reuse";
   /// How long the pressure runs — bounded so the test stays CI-safe.
   const PRESSURE: Duration = Duration::from_secs(2);
   let (daemon, instance) = single_shard_daemon("stale-handle-race");
@@ -1222,7 +1285,11 @@ fn a_stale_handle_never_reads_a_reused_inode_under_churn() {
   write(&mut setup, &victim, SECRET, 3);
   // A stale handle: create a file, take its handle, then delete it — its inode is freed and may be reused.
   let stale = create(&mut setup, &root, "doomed", 4);
-  assert_eq!(remove_status(&mut setup, &root, b"doomed", 5), 0, "the doomed file is deleted");
+  assert_eq!(
+    remove_status(&mut setup, &root, b"doomed", 5),
+    0,
+    "the doomed file is deleted"
+  );
   drop(setup);
 
   let cores = std::thread::available_parallelism().map_or(1, usize::from);
@@ -1264,7 +1331,10 @@ fn a_stale_handle_never_reads_a_reused_inode_under_churn() {
         let mut xid = 1u32;
         while !stop.load(Ordering::Relaxed) {
           xid = xid.wrapping_add(1);
-          if s.write_all(&record(NFSPROC3_READ, &read_args(stale), xid)).is_err() {
+          if s
+            .write_all(&record(NFSPROC3_READ, &read_args(stale), xid))
+            .is_err()
+          {
             let Ok(fresh) = TcpStream::connect(("127.0.0.1", port)) else {
               return;
             };
@@ -1339,13 +1409,20 @@ fn remove_refuses_dot_names_and_separators() {
     "PROBE remove: RMDIR '.'={rmdir_dot} RMDIR '..'={rmdir_dotdot} REMOVE '.'={rm_dot} REMOVE '..'={rm_dotdot} REMOVE 'a/b'={rm_sep}"
   );
 
-  assert_ne!(rm_dot, 0, "REMOVE '.' must be refused, never unlink the directory itself");
+  assert_ne!(
+    rm_dot, 0,
+    "REMOVE '.' must be refused, never unlink the directory itself"
+  );
   assert_ne!(rm_dotdot, 0, "REMOVE '..' must be refused");
   assert_ne!(rm_sep, 0, "REMOVE of a separator name is refused");
 
   // Non-vacuity: a real file removes.
   let _f = create(&mut s, &root, "f", 7);
-  assert_eq!(remove_status(&mut s, &root, b"f", 8), 0, "a real file removes");
+  assert_eq!(
+    remove_status(&mut s, &root, b"f", 8),
+    0,
+    "a real file removes"
+  );
 
   drop(s);
   drop(daemon);

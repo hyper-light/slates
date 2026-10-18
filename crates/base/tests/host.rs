@@ -230,7 +230,10 @@ fn a_base_symlink_pointing_outside_is_never_followed_to_the_host() {
     );
   }
   // The links are exposed as their raw targets (the guest, not the server, resolves them), never read here.
-  assert_eq!(host.read_link(root, "evil_abs").unwrap().as_ref(), "/etc/hosts");
+  assert_eq!(
+    host.read_link(root, "evil_abs").unwrap().as_ref(),
+    "/etc/hosts"
+  );
   assert_eq!(
     host.read_link(root, "evil_rel").unwrap().as_ref(),
     outside.to_str().unwrap()

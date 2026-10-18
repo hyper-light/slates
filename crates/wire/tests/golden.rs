@@ -115,7 +115,11 @@ fn the_sample_encoding_is_frozen_and_round_trips() {
 #[test]
 fn a_mutated_or_truncated_wire_message_never_panics() {
   let good = sample().to_bytes();
-  assert_eq!(Sample::from_bytes(&good).unwrap(), sample(), "the valid message round-trips");
+  assert_eq!(
+    Sample::from_bytes(&good).unwrap(),
+    sample(),
+    "the valid message round-trips"
+  );
 
   // Every truncation decodes to a typed result, never a panic.
   for n in 0..=good.len() {

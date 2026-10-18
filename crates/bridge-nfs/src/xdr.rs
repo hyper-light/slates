@@ -310,7 +310,9 @@ mod tests {
   #[test]
   fn a_well_formed_opaque_reads_and_bad_utf8_is_refused() {
     assert_eq!(
-      XdrReader::new(&framed(3, &[1, 2, 3, 0])).opaque(16).unwrap(),
+      XdrReader::new(&framed(3, &[1, 2, 3, 0]))
+        .opaque(16)
+        .unwrap(),
       &[1u8, 2, 3]
     );
     assert!(matches!(

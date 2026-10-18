@@ -72,9 +72,15 @@ fn owner() -> FileState {
 #[test]
 fn opens_past_the_bound_are_refused_without_starving_the_owner() {
   let mut files = FileState::new(owner_tag(0, 1), 3, 3);
-  files.open(A, b"a".to_vec(), &handle(10, 1), read_only()).unwrap();
-  files.open(A, b"a".to_vec(), &handle(11, 1), read_only()).unwrap();
-  files.open(A, b"a".to_vec(), &handle(12, 1), read_only()).unwrap();
+  files
+    .open(A, b"a".to_vec(), &handle(10, 1), read_only())
+    .unwrap();
+  files
+    .open(A, b"a".to_vec(), &handle(11, 1), read_only())
+    .unwrap();
+  files
+    .open(A, b"a".to_vec(), &handle(12, 1), read_only())
+    .unwrap();
   assert_eq!(files.open_count(), 3, "the table is full at its bound");
   // A fourth distinct file is refused NOSPC, not admitted past the bound.
   assert_eq!(
@@ -124,7 +130,11 @@ fn locks_past_the_bound_are_delayed_not_admitted() {
   files.lock(range(0), &fh, A).unwrap();
   files.lock(range(20), &fh, A).unwrap();
   files.lock(range(40), &fh, A).unwrap();
-  assert_eq!(files.lock_state_count(), 1, "one lock-owner holds the three ranges");
+  assert_eq!(
+    files.lock_state_count(),
+    1,
+    "one lock-owner holds the three ranges"
+  );
   // A fourth disjoint range would pass the bound: DELAY, not admitted.
   assert_eq!(
     files.lock(range(60), &fh, A).err(),
