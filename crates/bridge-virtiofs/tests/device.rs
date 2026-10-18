@@ -15,7 +15,10 @@
 
 mod common;
 
-use common::{SimDriver, context, layout_at, message, reply_error, store, vid, volume};
+use common::{
+  SimDriver, context, context_for, layout_at, message, other_vid, reply_error, store, vid, volume,
+  volume_with_prefix,
+};
 use slates_bridge_core::{Bridge, ObjectId, OpContext, VolumeBridge};
 use slates_bridge_fuse::abi::{IN_HEADER_LEN, OUT_HEADER_LEN, Opcode, flags};
 use slates_bridge_fuse::bridge::dispatch;
@@ -1571,6 +1574,214 @@ fn a_guest_setupmapping_maps_the_file_into_the_dax_window_and_removemapping_tear
   );
 
   drop(cache);
+}
+
+/// One tenant of the cross-tenant test: its own volume in the shared store, writable DAX opted in, and one file
+/// filled with `byte`. Returns the volume and its file's nodeid.
+#[cfg(unix)]
+fn tenant_with_file(
+  store: &mut slates_vfs::volume::Store,
+  (prefix, name, byte): (u16, &str, u8),
+  page: usize,
+) -> (slates_vfs::volume::Volume, u64) {
+  let mut volume = volume_with_prefix(store, prefix);
+  volume.enable_writable_dax();
+  let root = volume.root_inode(&*store).unwrap();
+  let no = volume.create_file_no(store, root, name, 0o644).unwrap();
+  volume.write(store, no, 0, &vec![byte; page]).unwrap();
+  (volume, no.0)
+}
+
+/// A tenant's cache region: the window a VMM would hand its device.
+#[cfg(unix)]
+fn tenant_cache(tag: &str, page: usize) -> slates_mem::SharedObject {
+  slates_mem::SharedObject::create(
+    &format!("sl-tenant-{tag}-{}", std::process::id()),
+    page * 4,
+    slates_mem::Words::new(),
+  )
+  .unwrap()
+}
+
+/// FUSE_INIT over one tenant's device and bridge; the reply's error.
+#[cfg(unix)]
+fn tenant_connect(
+  (device, driver): (&mut Device, &mut SimDriver),
+  (volume_id, volume, store): (
+    slates_db::catalog::VolumeId,
+    &mut slates_vfs::volume::Volume,
+    &mut slates_vfs::volume::Store,
+  ),
+  cx: &OpContext,
+) -> i32 {
+  let mut bridge = VolumeBridge::new(volume_id, volume, store);
+  let reply = dax_exchange(
+    device,
+    driver,
+    &mut bridge,
+    cx,
+    (Opcode::Init, 1, ROOT),
+    &dax_init_body(),
+  );
+  reply_error(&reply)
+}
+
+/// One writable FUSE_SETUPMAPPING over a tenant's device and bridge; the reply's error.
+#[cfg(unix)]
+fn tenant_dax_map(
+  (device, driver): (&mut Device, &mut SimDriver),
+  (volume_id, volume, store): (
+    slates_db::catalog::VolumeId,
+    &mut slates_vfs::volume::Volume,
+    &mut slates_vfs::volume::Store,
+  ),
+  cx: &OpContext,
+  (unique, nodeid): (u64, u64),
+  (moffset, len): (u64, u64),
+) -> i32 {
+  let mut bridge = VolumeBridge::new(volume_id, volume, store);
+  let reply = dax_exchange(
+    device,
+    driver,
+    &mut bridge,
+    cx,
+    (Opcode::SetupMapping, unique, nodeid),
+    &dax_setup_body(0, len, true, moffset),
+  );
+  reply_error(&reply)
+}
+
+/// §4.6 / AC-4.12, the cross-tenant question asked where a VMM actually reaches. The VFS proves a guest cannot
+/// read across a volume boundary (`vfs/tests/dax.rs a_guest_cannot_read_across_a_volume_boundary`); this proves it
+/// at the device seam, the half a guest's own page table is wired to. Do: put two tenants in ONE store, so they
+/// share an arena and a leak would be a real one; give each a file of its own byte; map each through its own
+/// device, its own cache region and its own context. Then try the two crossings a hostile guest has: present
+/// tenant B's context to tenant A's bridge, and present tenant B's inode number on tenant A's own device.
+///
+/// Expect: both windows live at once, each showing only its own tenant's bytes; the foreign *context* is refused
+/// outright (`VolumeBridge::authorize_read` — the context's volume must be the one the bridge serves); and the
+/// foreign *inode number* never yields B's bytes. Deliberately NOT asserting the foreign number is refused:
+/// slates confines by counter, not by refusing a foreign prefix, so such a number resolves to A's own
+/// same-counter inode or misses. Asserting "refused" there would encode the wrong rule — an earlier cross-volume
+/// test did exactly that and a run disproved it. What must hold, and all that must hold, is that B's content is
+/// unreachable from A.
+#[cfg(unix)]
+#[test]
+fn two_tenants_dax_windows_each_show_only_their_own_bytes() {
+  const A_BYTE: u8 = 0xAA;
+  const B_BYTE: u8 = 0xBB;
+  let page = rustix::param::page_size().max(1);
+  let window = (page * 4) as u64;
+  let mut store = dax_shared_store(page, "tenants");
+  let (mut tenant_a, a_no) = tenant_with_file(&mut store, (1, "a", A_BYTE), page);
+  let (mut tenant_b, b_no) = tenant_with_file(&mut store, (2, "b", B_BYTE), page);
+
+  let (mut device_a, mut driver_a) = device_and_driver();
+  let (mut device_b, mut driver_b) = device_and_driver();
+  let cache_a = tenant_cache("a", page);
+  let cache_b = tenant_cache("b", page);
+  device_a.install_dax_window(Some(
+    slates_bridge_virtiofs::dax::DaxCacheRegion::new(cache_a.as_fd(), window).unwrap(),
+  ));
+  device_b.install_dax_window(Some(
+    slates_bridge_virtiofs::dax::DaxCacheRegion::new(cache_b.as_fd(), window).unwrap(),
+  ));
+  let cx_a = context_for(vid());
+  let cx_b = context_for(other_vid());
+  let page_len = page as u64;
+
+  // Each tenant brings its connection up and maps its own file, through its own device and context.
+  tenant_connect(
+    (&mut device_a, &mut driver_a),
+    (vid(), &mut tenant_a, &mut store),
+    &cx_a,
+  );
+  tenant_connect(
+    (&mut device_b, &mut driver_b),
+    (other_vid(), &mut tenant_b, &mut store),
+    &cx_b,
+  );
+  assert_eq!(
+    tenant_dax_map(
+      (&mut device_a, &mut driver_a),
+      (vid(), &mut tenant_a, &mut store),
+      &cx_a,
+      (2, a_no),
+      (0, page_len)
+    ),
+    0,
+    "tenant A maps its own file"
+  );
+  assert_eq!(
+    tenant_dax_map(
+      (&mut device_b, &mut driver_b),
+      (other_vid(), &mut tenant_b, &mut store),
+      &cx_b,
+      (2, b_no),
+      (0, page_len)
+    ),
+    0,
+    "tenant B maps its own file"
+  );
+
+  // Both live at once: each window reaches its own tenant's block and nothing else.
+  assert_eq!(
+    device_a.dax_window_bytes(0, 64).unwrap(),
+    vec![A_BYTE; 64],
+    "tenant A's window reaches tenant A's bytes"
+  );
+  assert_eq!(
+    device_b.dax_window_bytes(0, 64).unwrap(),
+    vec![B_BYTE; 64],
+    "tenant B's window reaches tenant B's bytes"
+  );
+
+  // Crossing 1: tenant B's context on tenant A's bridge — refused before any mapping, by the object-side check
+  // that the context binds the volume this bridge serves.
+  assert_ne!(
+    tenant_dax_map(
+      (&mut device_a, &mut driver_a),
+      (vid(), &mut tenant_a, &mut store),
+      &cx_b,
+      (3, a_no),
+      (page_len, page_len)
+    ),
+    0,
+    "a context binding another tenant's volume is refused"
+  );
+
+  // Crossing 2: tenant B's inode number, on tenant A's own device with A's own context.
+  let answered = tenant_dax_map(
+    (&mut device_a, &mut driver_a),
+    (vid(), &mut tenant_a, &mut store),
+    &cx_a,
+    (4, b_no),
+    (page_len * 2, page_len),
+  );
+  // Scanned over the WHOLE of A's cache region, not just the slot: a leak anywhere in it is a leak. The
+  // emptiness check is what keeps this honest — an empty vector would satisfy "contains no B byte" and prove
+  // nothing.
+  let reached = device_a.dax_window_bytes(0, window).unwrap_or_default();
+  assert!(
+    !reached.is_empty(),
+    "A's region is readable, so the scan means something"
+  );
+  assert!(
+    !reached.contains(&B_BYTE),
+    "tenant B's bytes reached tenant A's window (setupmapping answered {answered})"
+  );
+  assert!(
+    reached.iter().all(|byte| *byte == 0 || *byte == A_BYTE),
+    "A's region holds only its own bytes and untouched zeroes"
+  );
+  assert_eq!(
+    device_b.dax_window_bytes(0, 64).unwrap(),
+    vec![B_BYTE; 64],
+    "tenant B's own window is untouched by A's attempts"
+  );
+
+  drop(cache_a);
+  drop(cache_b);
 }
 
 /// A 64-byte FUSE_INIT body (major 7, minor 38): the codec reads what it needs.

@@ -393,10 +393,16 @@ pub fn store() -> Store {
 
 /// A scratch volume on a deterministic clock, so two volumes driven identically agree byte for byte.
 pub fn volume(store: &mut Store) -> Volume {
+  volume_with_prefix(store, 1)
+}
+
+/// The same, with the inode prefix chosen: two tenants in one store need distinct prefixes, which is what
+/// makes their inode numbers differ and what a cross-tenant test has to vary.
+pub fn volume_with_prefix(store: &mut Store, prefix: u16) -> Volume {
   Volume::create(
     store,
     VolumeConfig {
-      prefix: 1,
+      prefix,
       names: NameEquivalence::Exact,
       quota: Quota::Bounded { limit: 1 << 30 },
       journal_bytes: 1 << 16,
@@ -409,6 +415,11 @@ pub fn volume(store: &mut Store) -> Volume {
 /// The volume id every test attaches.
 pub fn vid() -> VolumeId {
   VolumeId { bytes: [7; 16] }
+}
+
+/// A second tenant's volume id, distinct from [`vid`].
+pub fn other_vid() -> VolumeId {
+  VolumeId { bytes: [9; 16] }
 }
 
 /// A DAX-capable store: its content arena is backed by a shared object (an anchor-backed volume), so `dax_backing`
@@ -479,10 +490,16 @@ pub fn dax_setup_body(foffset: u64, len: u64, writable: bool, moffset: u64) -> V
 
 /// A read-write current-view context, minted through the attachment registry (the only way).
 pub fn context() -> OpContext {
+  context_for(vid())
+}
+
+/// The same, binding a chosen volume: a second tenant's context must name its OWN volume, since a bridge
+/// refuses any operation whose context binds another one (`VolumeBridge::authorize_read`).
+pub fn context_for(volume: VolumeId) -> OpContext {
   let mut attachments = Attachments::new();
   let id = attachments
     .attach(
-      vid(),
+      volume,
       View::Current,
       Principal::Uid { uid: 0 },
       Rights {
