@@ -1984,6 +1984,24 @@ mod harness_tests {
   /// Shape: shards per test daemon: two, so the consumer's record and the attesting channel differ.
   const TEST_SHARDS: u16 = 2;
 
+  /// The machine profile this binary's test daemons derive from, measured **once per process** (§4.1), as
+  /// production measures once at the anchor's boot — `crate::daemon::measure` itself is per-invocation and
+  /// right to be, which is why this wrapper exists only for the tests.
+  ///
+  /// Measured afresh per test, the wake probe runs beside the other tests' probes and daemons, measures their
+  /// load, and is refused — `expect`ing it then fails the test for the machine's state rather than the code's
+  /// (`docs/bugs/2026-09-25-test-fixtures-measured-the-machine-beside-each-other.md`). The other suites took
+  /// that fix in September; this module was missed, and a full `cargo test --workspace` on 2026-10-18 failed
+  /// here while the same test passed alone.
+  fn profile() -> slates_machine::MachineProfile {
+    static PROFILE: std::sync::OnceLock<Option<slates_machine::MachineProfile>> =
+      std::sync::OnceLock::new();
+    PROFILE
+      .get_or_init(|| crate::daemon::measure(true).ok())
+      .clone()
+      .expect("the machine profile measures")
+  }
+
   /// The product's own deadlines, as the command itself derives them — never a shorter hand-picked reply
   /// clock that calls a live daemon stalled
   /// (`docs/bugs/2026-09-28-the-client-tests-judged-a-live-daemon-by-a-shorter-clock.md`).
@@ -2113,7 +2131,7 @@ mod harness_tests {
   /// enrollment kept, the same attest binds.
   #[test]
   fn run_spawns_the_workload_as_an_ephemeral_consumer_and_revokes_it_after() {
-    let profile = crate::daemon::measure(true).expect("the machine profile measures");
+    let profile = profile();
     let instance = format!("cli-run-{}", std::process::id());
     let config = DaemonConfig::derive(&profile, &instance, Some(TEST_SHARDS));
     let daemon = Daemon::start(

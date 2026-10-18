@@ -32,13 +32,24 @@ const REPLY_WAIT: Duration = Duration::from_secs(30);
 /// far past a live daemon's reply.
 const FD_WAIT_NS: u64 = 2_000_000_000;
 
+/// The machine profile this binary's daemons derive from, measured **once per process** (§4.1), as production
+/// measures once at the anchor's boot. Measured afresh per test, the wake probe runs beside the other tests'
+/// probes and daemons and measures their load, or measures nothing and is refused — which fails the test for
+/// the machine's state rather than the code's
+/// (`docs/bugs/2026-09-25-test-fixtures-measured-the-machine-beside-each-other.md`).
 fn profile() -> MachineProfile {
-  MachineProfile::measure(ProfileOptions {
-    budget_per_probe: Duration::from_millis(PROBE_MS),
-    codecs: false,
-    core_matrix: false,
-  })
-  .expect("the machine profile measures")
+  static PROFILE: std::sync::OnceLock<Result<MachineProfile, slates_machine::MachineError>> =
+    std::sync::OnceLock::new();
+  PROFILE
+    .get_or_init(|| {
+      MachineProfile::measure(ProfileOptions {
+        budget_per_probe: Duration::from_millis(PROBE_MS),
+        codecs: false,
+        core_matrix: false,
+      })
+    })
+    .clone()
+    .expect("the machine profile measures")
 }
 
 /// The product's own deadlines (`Deadlines::derive` over the anchor's liveness budget and the recovery

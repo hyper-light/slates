@@ -6915,3 +6915,30 @@ Green at `PROPTEST_CASES=512` (15.8 s). **Red-checked:** with the refusal disabl
 *"a writable window was armed while the volume was recalling: the snapshot's retry can never converge"* — so
 this is a guard and not decoration. The exclusion is checked before any effect in `dax_map_write`, so the
 schedule can attempt the map safely and a refusal perturbs nothing.
+
+### 2026-10-18: the 2026-09-25 "measured the machine beside each other" fix had three sites it never reached
+
+Found by a full `cargo test --workspace`, which is the only thing that reproduces it: the CLI's in-binary
+harness test `run_spawns_the_workload_as_an_ephemeral_consumer_and_revokes_it_after` **failed at
+`crate::daemon::measure(true).expect(...)`** — the machine-profile probe refused because it was measuring
+beside the rest of the workspace's test binaries. The same test passes alone, every time, which is exactly why
+targeted suites never showed it.
+
+This is the defect `docs/bugs/2026-09-25-test-fixtures-measured-the-machine-beside-each-other.md` fixed in the
+client and server suites in September. The sweep then missed three places, all with **more than one test in the
+binary** so the probe really does run repeatedly:
+
+- `crates/cli/src/verbs.rs` (`harness_tests`) — the one that failed;
+- `crates/client/tests/driver.rs` and `crates/client/tests/async_core.rs` — two tests each, a `profile()`
+  helper, no `OnceLock`.
+
+All three now measure **once per process** behind a `OnceLock`, as `crates/client/tests/client.rs` has since
+September. Checked rather than assumed for the rest: `rt/tests/placement.rs`, `mcp/tests/mcp.rs`,
+`client/tests/reap.rs` and `client/tests/presentation.rs` each hold a single test, so their one probe is already
+one per process; examples and benches are deliberate single-process runs. `crate::daemon::measure`'s two
+**production** call sites are per-invocation and right to be — the wrapper is the tests' alone.
+
+**The lesson is about the sweep, not the fix.** A September sweep that searched the test *directories* would
+miss `crates/cli/src/verbs.rs`, because its tests live in the source file; and a sweep that counted call sites
+would rate a one-call-site file safe when that site sits in a helper every test calls. The question that finds
+them is "how many times does this run in one process", which is `#[test]` count × call sites, not either alone.
