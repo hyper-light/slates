@@ -129,14 +129,13 @@ fn injected() -> slates_rt::error::RtError {
 #[test]
 fn a_start_refused_while_preparing_a_driver_gives_every_slot_back() {
   let _serial = serial();
-  let entries = u32::try_from(config().ring_entries).unwrap();
   let mut prepared = 0;
   let mut prepare = || {
     prepared += 1;
     if prepared == 3 {
       return Err(injected());
     }
-    slates_rt::driver::os_driver(entries)
+    slates_rt::driver::os_driver()
   };
   refused_without_residue(&mut prepare, &injected());
 }
@@ -148,11 +147,10 @@ fn a_start_refused_while_preparing_a_driver_gives_every_slot_back() {
 #[test]
 fn a_shard_whose_context_fails_to_build_is_never_advertised_and_its_siblings_stop() {
   let _serial = serial();
-  let entries = u32::try_from(config().ring_entries).unwrap();
   let mut prepared = 0;
   let mut prepare = || {
     prepared += 1;
-    let mut driver = slates_rt::driver::os_driver(entries)?;
+    let mut driver = slates_rt::driver::os_driver()?;
     if prepared == usize::from(SHARDS) {
       driver.seed = Box::new(|_kick| Err(injected()));
     }

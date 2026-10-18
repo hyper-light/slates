@@ -459,8 +459,7 @@ fn register_seeds(
 impl Runtime {
   /// Starts `config.shards` shard threads on the OS drivers.
   pub fn start(config: &RuntimeConfig) -> Result<Runtime, RtError> {
-    let entries = u32::try_from(config.ring_entries).unwrap_or(u32::MAX);
-    Self::start_with(config, &mut || os_driver(entries))
+    Self::start_with(config, &mut || os_driver())
   }
 
   /// Starts `config.shards` shard threads over the drivers `prepare` makes, one call per shard: the OS
@@ -640,7 +639,7 @@ impl Drop for LocalRuntime {
 impl LocalRuntime {
   /// Builds the shard.
   pub fn new(config: &RuntimeConfig) -> Result<LocalRuntime, RtError> {
-    let prepared = os_driver(u32::try_from(config.ring_entries).unwrap_or(u32::MAX))?;
+    let prepared = os_driver()?;
     Ok(LocalRuntime {
       ctx: std::ptr::NonNull::from(ShardContext::build(ShardSeed::register(
         config,

@@ -253,7 +253,7 @@ fn epoll_driver(efd: KickFd) -> Result<Box<dyn Driver>, RtError> {
 /// (`io_uring_setup` = ENOMEM). slates only ever issued two opcodes through it, `PollAdd` and `Nop`,
 /// which is epoll's job.
 #[cfg(target_os = "linux")]
-pub fn os_driver(_ring_entries: u32) -> Result<Prepared, RtError> {
+pub fn os_driver() -> Result<Prepared, RtError> {
   let efd = crate::epoll::prepare_eventfd()?;
   let seed: DriverSeed = Box::new(|kick| match kick {
     Kick::Eventfd(efd) => epoll_driver(efd),
@@ -271,7 +271,7 @@ pub fn os_driver(_ring_entries: u32) -> Result<Prepared, RtError> {
 
 /// Prepares the OS driver for this platform.
 #[cfg(any(target_os = "macos", target_os = "freebsd"))]
-pub fn os_driver(_ring_entries: u32) -> Result<Prepared, RtError> {
+pub fn os_driver() -> Result<Prepared, RtError> {
   Ok(Prepared {
     kick_fd: Some(crate::kqueue::prepare()?),
     seed: Box::new(|kick| match kick {
@@ -289,7 +289,7 @@ pub fn os_driver(_ring_entries: u32) -> Result<Prepared, RtError> {
 
 /// Prepares the OS driver for this platform.
 #[cfg(target_os = "windows")]
-pub fn os_driver(_ring_entries: u32) -> Result<Prepared, RtError> {
+pub fn os_driver() -> Result<Prepared, RtError> {
   Ok(Prepared {
     kick_fd: Some(crate::iocp::prepare()?),
     seed: Box::new(|kick| match kick {
@@ -328,7 +328,7 @@ mod tests {
   #[test]
   #[cfg_attr(miri, ignore)]
   fn the_os_driver_wakes_on_a_kick_and_delivers_a_nop() {
-    let prepared = os_driver(64).unwrap();
+    let prepared = os_driver().unwrap();
     let notes = prepared.notes.clone();
     // Exercise the real registration and retirement protocol, including the foreign kick.
     // The registration outlives its driver and retires even when an assertion unwinds (its drop):
@@ -394,7 +394,7 @@ mod tests {
   #[cfg(unix)]
   #[cfg_attr(miri, ignore)]
   fn a_zero_timeout_wait_delivers_what_is_ready_and_never_sleeps() {
-    let prepared = os_driver(64).unwrap();
+    let prepared = os_driver().unwrap();
     // The registration outlives its driver and retires even when an assertion unwinds (its drop):
     // otherwise the parallel registry stress test can fill its abandoned ring and wait forever.
     let (registration, _control) =
