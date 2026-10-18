@@ -7062,3 +7062,33 @@ already records a 245 ms CI step that could not be attributed at all.
 primary condition made impossible the test passes on the switch clause alone (16 switches observed), and with
 `involuntary_switches` forced to return zero it fails — *"the scheduler took the thread away 0 times during it
 (zero: the driver held it)"*. So a genuine hold still fails, which is the property that matters.
+
+### 2026-10-18: a fifth workspace-run flake, same family — and the sweep the first four did not get
+
+The fourth full `cargo test --workspace`, kept **unfiltered** this time on the lesson from the driver flake,
+came back 170 results and one failure — a new one, and the full output was there because nothing had been
+grepped away:
+
+```
+---- a_claim_is_polled_without_waiting_and_refused_at_the_claim_wait stdout ----
+panicked at crates/ipc/tests/rendezvous.rs:219:5:
+the longest poll was 129.106917ms, bound 100ms
+```
+
+Same family as the driver's step bound, and worse: that bound has **no allowance at all**. Its own doc says
+"the tenth separates the two with room for scheduling noise", and nothing in the code measures any. Under a
+loaded machine a poll that only read the answer's state took 129 ms because the thread was taken off a core.
+
+Fixed the same way: each poll records the involuntary context switches during it, the longest poll keeps its
+own count, and a poll over the bound fails only if that count is **zero** — a poll that was preempted is the
+machine's, a poll that *waited* is still a failure. The figures print either way.
+
+Evidence, since a rescue clause has to be shown not to rescue everything: with the bound made impossible, a
+poll of 55.6 µs with **0 switches failed** — so an unpreempted poll over its bound still fails, which is the
+property under test. And across eight runs at load 41 every long poll (15–81 ms) had been preempted at least
+once, so the clause targets the cause the measurements actually show. The driver's identical clause was proven
+on both sides with real counts.
+
+**The method lesson, paid for twice:** filtering a long run's output through `grep` threw away the figures of
+the fourth flake and cost a whole extra run to get them back. The fifth was diagnosed on the first failure
+because the run was kept whole and grepped afterwards.
