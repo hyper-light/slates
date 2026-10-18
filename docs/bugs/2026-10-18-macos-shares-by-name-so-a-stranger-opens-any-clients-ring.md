@@ -82,8 +82,30 @@ Three arms interleaved round-robin, B the CPU-matched control. No effect.
 On macOS, slates has no isolation between same-uid processes at all: ring disclosure, ring injection
 and full access to the daemon's segment, all without being a client. On Linux the equivalents require
 the daemon to have handed you something (and two such hand-offs were found and dealt with the same
-day). Windows uses the same bootstrap-object rendezvous and is presumed to share the shape; it was not
-measured here, because this host cannot build or test Windows.
+day).
+
+**Windows: the same exposure, established from source and labelled as such — it is not measured, since
+this host cannot build or test Windows.** Three facts from `crates/mem/src/shared.rs`:
+
+- the section is created `CreateFileMappingW(INVALID_HANDLE_VALUE, std::ptr::null(), …)` — a **NULL**
+  `lpFileMappingAttributes`, so it takes the default security descriptor from the creating token,
+  whose DACL grants the creating **user** access; nothing narrows it to the intended process;
+- its name is `Local\<name>` over the same derived names, so it is in the caller's **session**
+  namespace;
+- slates opens by name with `OpenFileMappingW(FILE_MAP_ALL_ACCESS, …)`, which is precisely the call a
+  stranger would make.
+
+So a same-user process in the same session should be able to open any client's ring read-write exactly
+as on macOS. It is narrower than macOS in one respect worth stating: `Local\` is per-session, so a
+different logon session of the same user cannot reach it, where the POSIX name is per-uid. That does
+not help against the actor this matters for — a §4.13 consumer the harness spawns runs in the same
+session.
+
+**And Windows already has the fix in the tree, used elsewhere.** `crates/ipc/src/delivery.rs` passes
+the consumer capability by handing exactly one handle to exactly one child with
+`PROC_THREAD_ATTRIBUTE_HANDLE_LIST`. Handle duplication is Windows' capability-passing primitive, the
+counterpart of `SCM_RIGHTS` and of the Mach fileport recommended below; the rendezvous could use what
+the delivery channel already does.
 
 The bound worth stating: this is a **same-uid** break. A different user cannot open these objects, and
 the daemon's control plane is per-uid. It matters exactly where slates says it matters — a §4.13

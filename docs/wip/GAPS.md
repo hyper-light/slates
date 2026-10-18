@@ -6575,8 +6575,16 @@ stranger opened /slates-rv-mb72074-501 read-write with no capability at all
 ```
 
 Ring disclosure, ring **injection**, and read-write access to the daemon's 138.7 GiB segment, without
-being a client. Windows shares the bootstrap-object shape and is presumed alike; not measured (no
-Windows host here).
+being a client.
+
+**Windows: the same, from source and labelled as such** (not measured — no Windows host here). The section is
+created with a **NULL** `lpFileMappingAttributes`, so it takes the creating token's default DACL, which grants
+the creating *user*; its name is `Local\<name>` over the same derived names; and slates opens by name with
+`OpenFileMappingW(FILE_MAP_ALL_ACCESS, …)`, the very call a stranger would make. Narrower than macOS only in
+that `Local\` is per-session rather than per-uid, which does not help against a §4.13 consumer the harness
+spawns into the same session. **The fix is already in the tree, used elsewhere:** `crates/ipc/src/delivery.rs`
+hands the consumer capability to exactly one child with `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`; handle duplication
+is Windows' capability-passing primitive, the counterpart of `SCM_RIGHTS` and of the Mach fileport below.
 
 **A measured negative, so the Linux doorbell theft does not carry over:** a stranger can write the
 macOS doorbell word, but restoring it after every ring does not slow the victim — `Bell::ring` follows
