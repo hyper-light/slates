@@ -112,11 +112,32 @@ I cannot prove the tighter bound for every overlayfs stack:
    second offers no evidence, so the table stays the floor and nothing regresses. The shape is the right
    one either way — a safe default that evidence may tighten, never a guess that evidence must refute.
 
-Options 1 and 2 are guesses. Option 3 generalises but needs a place to write that R1 permits — whether a
-granted landing's target, or the daemon's own build area, is a legitimate stand-in for the base's
-filesystem (the same mount in some deployments, not in others), which is a design call. **Option 5 looks
-like the one that is both sound and already permitted**, and it is the one I would build; it is written
-here rather than built because changing how freshness is bounded is Ada's call, not a test fix.
+### Option 5 is RETRACTED — it derives a safety bound from untrusted input
+
+I recommended option 5 above and then checked it against this project's own threat model, where it
+fails. **An mtime is settable.** `utimensat` is what `tar -p`, `rsync -t`, `cp -p` and `touch -d` all
+use, and §4.5's whole base-plane model treats the base directory as a place **outsiders write** —
+`SimHost` exists to model exactly that. So the "evidence" option 5 reads is attacker-influenceable: an
+outsider can plant two files whose mtimes differ by nanoseconds on a filesystem whose real update
+quantum is two seconds, slates infers nanosecond granularity, and then trusts a digest *inside* the
+real racy window. Tightening is precisely the unsafe direction, so a wrong inference is not a
+performance loss — it is a stale read.
+
+Nor is the obvious patch enough. Restricting it to differences slates itself *witnessed* (file seen at
+t1, seen changed at t2) does not help: the new value is still whatever the outsider set it to.
+
+What survives is narrower and worth keeping: the same scan is a sound **diagnostic**. Observing
+sub-millisecond spacing where the table claims two seconds is good evidence the table is wrong for this
+filesystem, and could be reported — to an operator, or in the boot profile — without being allowed to
+move the bound. The measurements above keep their value as exactly that.
+
+### So, standing options
+
+Options 1 and 2 are guesses about a safety bound. Option 4 is correct and slow. **Option 3 — measure by
+writing — remains the only sound way to actually tighten it**, and it needs an R1 answer: whether a
+granted landing's target, or some location slates may write, can be shown to be the *same filesystem* as
+the base (`statfs`'s `f_fsid`/`st_dev` would prove the identity) and may therefore be probed. That is
+the design call, and it is Ada's. I am not building any of this while fixing a test.
 
 ## Owed
 
