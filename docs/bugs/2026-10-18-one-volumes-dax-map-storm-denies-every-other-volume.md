@@ -3,9 +3,9 @@
 - **Date:** 2026-10-18
 - **Area:** `crates/vfs/src/dax.rs` (`DaxRegistry::register`, `Volume::dax_map_read_at`,
   `Volume::dax_map_write`)
-- **Status:** found by attacking; **OPEN.** A fix was built and **withdrawn the same day** — it was unsafe, for the
-  reason below. The reproduction is committed `#[ignore]`d
-  (`one_volumes_map_storm_does_not_deny_another_volume`; run with `--ignored`).
+- **Status:** found by attacking; **FIXED** — on the second attempt. The first was withdrawn the same day as
+  unsafe (below), and the guard built in response is what told the two apart. The reproduction is now a plain
+  passing test (`one_volumes_map_storm_does_not_deny_another_volume`, no longer `#[ignore]`d).
 - **Class:** cross-tenant resource exhaustion through a shared bound (CWE-410)
 
 ## Description
@@ -38,53 +38,61 @@ the victim volume was denied its first window by another volume's storm:
 The victim's map is shown to succeed on a quiet registry immediately before, so the refusal is the
 storm's and not a volume that could never map.
 
-## The fix that was built, and why it was withdrawn
+## The fix, and the attempt that had to be withdrawn first
 
-The obvious fix is to make a request for a window that already exists return that window:
-`DaxRegistry::live_window(inode, file_offset, writable)`, consulted by both map paths before the pin and
-before the writable path's copy-up. The registry would then grow with the **windows that exist** rather
-than with the requests made — a storm on one window would be one entry and could never reach the cap,
-and a volume's consumption would be bounded by content its own quota already bounds.
+The fix is to make a request for a window that already exists return that window:
+`DaxRegistry::live_window(inode, file_offset, writable)`, consulted by both map paths before the pin
+and before the writable path's copy-up. The registry then grows with the **windows that exist** rather
+than with the requests made — a storm on one window is one entry and can never reach the cap, and a
+volume's consumption is bounded by content its own quota already bounds.
 
-It was built, the suite was green on three platforms, and then it was withdrawn, because it is unsafe:
+**The first attempt did exactly that and was unsafe.** It was green on macOS aarch64, x86_64 Linux and
+aarch64 Linux, and it was still wrong:
 
-- The arena's pin is refcounted **per mapping** (`PinnedBlock::holders`): `dax_map_*` pins once per
-  mapping handed out, and `dax_release_after_unmap` unpins once.
-- The device keeps **one `DaxWindowEntry` per SETUPMAPPING** (`dax_windows.push(entry)`, both the
-  fd-sharing and the message arms) and calls `dax_release_after_unmap(&entry.mapping)` for each.
+- the arena's pin is refcounted **per mapping** (`PinnedBlock::holders`): `dax_map_*` pinned once per
+  mapping handed out, and `dax_release_after_unmap` unpins once;
+- the device keeps **one `DaxWindowEntry` per SETUPMAPPING** (both the fd-sharing and the message arms)
+  and calls `dax_release_after_unmap` for each.
 
-So two guest windows over the same file range — two SETUPMAPPINGs at different guest offsets — would
-share one mapping and therefore **one pin**, while still producing two window entries and two releases.
-The first unmap would take the holder count to zero and unpin a block the second window still maps:
-reusable by another volume under a live guest page table. That is precisely the escape the two-phase
-revoke exists to prevent, and it is worse than the denial it was fixing.
+So two guest windows over one file range shared a mapping and therefore **one pin** while still
+producing two releases: the first unmap took the holder count to zero and released a block the second
+window still mapped — reusable by another volume under a live guest page table, the exact escape the
+two-phase revoke exists to prevent, and worse than the denial being fixed.
 
-Nothing in the test suite caught it. It was found by reading the device's window bookkeeping after the
-change was already committed (`e4535b01`), which is itself the lesson: a change to the registry's
-accounting has to be checked against the *device's* accounting, because the two halves of the pin live
-in different crates.
+**What makes the version that stands correct is one line: it pins again on every hit.** One pin per
+window handed out, one unpin per window released, so the holder count tracks guest windows rather than
+registry entries. That is the "move the pin from the mapping to the window" the withdrawal called for,
+in the smallest form that achieves it.
 
-**And it is a measured hazard, not a reading of the code.** A new device-level test
-(`every_window_a_device_maps_gives_its_pin_back`) maps the same file range at two guest offsets, drops
-one window and asserts the block is still pinned for the other. It passes on the reverted tree, and
-with the dedup re-applied it fails exactly there:
+## Verification
+
+The decisive check is the guard built after the withdrawal,
+`two_windows_over_one_block_each_hold_its_pin` (`crates/bridge-virtiofs/tests/device.rs`), which maps
+one file range at two guest offsets, drops one window and asserts the block is still pinned for the
+other. Red-checked against this very fix — with the `pin()` on the dedup hit removed:
 
 ```
-assertion `left == right` failed: the block is STILL pinned: the second window over it is live,
-and a block released here would be reusable under a live guest page table
-  left: 0
- right: 1
+two_windows_over_one_block_each_hold_its_pin ... FAILED
+  left: 0   right: 1          (the block released while the second window is live)
 ```
 
-That test is committed, and it is the guard this class was missing: **no device-level test looked at
-pins at all** before, which is why three platforms' suites went green over an unsafe change.
+and with it in place, green. No device-level test looked at pins at all before this episode, which is
+precisely how the first attempt passed three platforms.
 
-**What a correct fix has to do: move the pin from the mapping to the window.** One pin per window
-handed out, and a `dax_revoke` that no longer consumes one — so the holder count tracks guest windows
-rather than registry entries. That changes the gate's core invariant, so it is a considered change
-rather than a passing one, and it is not made here.
+```
+slates-vfs --test dax                                   53 passed, 0 failed, 0 ignored
+  (the reproduction is now a passing test, and a_map_storm_is_absorbed_… replaces the
+   "refused at the cap" version, whose property was weaker)
+slates-bridge-virtiofs (6 suites)                       all green, 33 + 1 ignored on the device suite
+slates-server --test recovery (the arbiter)             39 passed, 0 failed
+slates-client --test client                             13 passed, 0 failed
+cargo clippy --workspace --all-targets -- -D warnings   clean
+cargo xtask check                                       clean
+```
 
-## Verification of the revert
+## Verification of the revert (superseded, kept for the record)
+
+
 
 
 

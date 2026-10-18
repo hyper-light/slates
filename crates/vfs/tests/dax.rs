@@ -811,14 +811,15 @@ fn a_pending_revoke_keeps_the_block_pinned_until_the_unmap_is_confirmed() {
 /// Non-vacuity: B's map is shown to succeed on a quiet registry first, so the refusal is A's storm and not a
 /// volume that could never map.
 ///
-/// **This reproduces an OPEN finding and fails** — it is `#[ignore]`d so the suite is green and the reproduction
-/// is kept. Run it with `--ignored`. The fix that suggests itself, returning the live window for a repeat
-/// request, was built and withdrawn: the arena's pin is refcounted **per mapping**, while the device keeps one
-/// window entry per SETUPMAPPING and releases each, so two guest windows sharing one mapping would share one pin
-/// and the first unmap would unpin a block the second still maps. A correct fix moves the pin from the mapping to
-/// the window. Record: `docs/bugs/2026-10-18-one-volumes-dax-map-storm-denies-every-other-volume.md`.
+/// **Fixed 2026-10-18, and the fix took two attempts.** Returning the live window for a repeat request
+/// ([`DaxRegistry::live_window`]) makes the registry grow with the windows that exist rather than the requests
+/// made. The first attempt did only that and was withdrawn the same day: the arena's pin is refcounted **per
+/// mapping**, while the device keeps one window entry per SETUPMAPPING and releases each, so two guest windows
+/// sharing one mapping shared one pin and the first unmap released a block the second still mapped. The version
+/// that stands pins again on every hit — one pin per window handed out — and
+/// `two_windows_over_one_block_each_hold_its_pin` in `crates/bridge-virtiofs/tests/device.rs` is the guard that
+/// told the two apart. Record: `docs/bugs/2026-10-18-one-volumes-dax-map-storm-denies-every-other-volume.md`.
 #[test]
-#[ignore = "reproduces an open finding: the registry's cap is the shard's, so one volume can take it all"]
 fn one_volumes_map_storm_does_not_deny_another_volume() {
   const CAP: usize = 32;
   let mut store = store_capped_chunks(CAP);
@@ -847,48 +848,54 @@ fn one_volumes_map_storm_does_not_deny_another_volume() {
 }
 
 /// §4.6 (CLAUDE.md #8, no unbounded growth) — map-storm DoS (multi-tenancy threat #2). A malicious guest cannot
-/// exhaust the daemon by flooding SETUPMAPPING: the mapping registry is bounded (its cap is the shard's chunk
-/// budget, `max_chunks`), so a storm is refused typed, counted, and the daemon keeps serving. Do: with a small
-/// chunk budget, re-map one file past the registry cap. Expect: maps succeed up to the cap, the next is `NoSpace`,
-/// the registry never exceeds the cap, the refusal is counted, and after one is freed the file maps again
-/// (non-vacuity + recovery).
+/// exhaust the daemon by flooding SETUPMAPPING. Do: with a small chunk budget, re-map one file far past the
+/// registry cap, then map a distinct file. Expect: the storm is **absorbed** — a request for a window that
+/// already exists returns that window, so the registry grows with the windows that exist and not with the
+/// requests made — while a distinct window does add an entry, and the registry never exceeds its cap.
+///
+/// This replaced a version asserting the storm was *refused* at the cap. Refusing met the letter of the threat
+/// (nothing grew without bound) and missed its substance: the cap bounds the **shard**, so the volume that
+/// filled it denied every other volume on it — measured at 32 of 32 by
+/// `one_volumes_map_storm_does_not_deny_another_volume` above, which is the test that now holds that property.
+/// Absorbing is the stronger guarantee: a volume consumes entries only for windows it actually has.
 #[test]
-fn a_map_storm_is_refused_at_the_registry_bound() {
+fn a_map_storm_is_absorbed_and_the_registry_grows_only_with_real_windows() {
   const CAP: usize = 32;
   let mut store = store_capped_chunks(CAP);
   let mut volume = volume(&mut store, 1 << 20);
   let no = file_of(&mut store, &mut volume, "f", SECRET, DAX_PAGE);
-  let before = store.dax.refused();
-  let mut held = Vec::new();
-  let mut refused = false;
+
+  let first = volume.dax_map_read(&mut store, no).expect("the first window");
+  let after_first = store.dax_mappings();
+  let mut same = true;
   for _ in 0..(CAP * 4) {
     match volume.dax_map_read(&mut store, no) {
-      Ok(m) => held.push(m),
-      Err(_) => {
-        refused = true;
-        break;
-      }
+      Ok(m) => same &= m == first,
+      Err(e) => panic!("a repeat request for a live window must be served, not refused: {e:?}"),
     }
   }
-  assert!(
-    refused,
-    "a re-map storm is refused at the bound, never grown without limit"
+  assert!(same, "every repeat returned the window that already existed");
+  assert_eq!(
+    store.dax_mappings(),
+    after_first,
+    "{} requests past the cap added no entries at all",
+    CAP * 4
+  );
+
+  // Non-vacuity: a distinct window DOES add an entry, so the dedup is not swallowing everything.
+  let other = file_of(&mut store, &mut volume, "g", POISON, DAX_PAGE);
+  volume
+    .dax_map_read(&mut store, other)
+    .expect("a distinct file's window");
+  assert_eq!(
+    store.dax_mappings(),
+    after_first.saturating_add(1),
+    "a window of a different file is a new entry"
   );
   assert!(
     store.dax_mappings() <= CAP,
     "the registry never exceeds its cap ({} > {CAP})",
     store.dax_mappings()
-  );
-  assert!(
-    store.dax.refused() > before,
-    "the refusal at the bound is counted"
-  );
-  // Non-vacuity + recovery: free one mapping, and the file maps again — the bound is live, not a dead wall.
-  let freed = held.pop().expect("at least one map succeeded");
-  assert!(store.dax_revoke(&freed));
-  assert!(
-    volume.dax_map_read(&mut store, no).is_ok(),
-    "once a slot is freed the file maps again"
   );
 }
 

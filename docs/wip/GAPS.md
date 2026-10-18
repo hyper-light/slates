@@ -6771,3 +6771,57 @@ Two operational notes paid for in wasted cores: `cargo +nightly miri test … | 
 ends, so a run that is killed leaves no evidence — redirect instead; and stopping such a task kills the wrapper
 and leaves `miri` running (it does not match `pgrep miri`; the process name is the rustup toolchain path), which
 cost a full core for 84 minutes before it was noticed.
+
+### 2026-10-18: L2's moving target is half-built — the device-side remap its own doc promises does not exist
+
+`Volume::dax_migrate` is complete, measured (242 ns/migration) and correct on the VFS side: the content moves to
+a fresh block, the inode repoints so every non-DAX reader follows, the new mapping is minted before the old goes
+revoke-pending, and the old block stays pinned until `dax_release_after_unmap` — so no block is ever both
+reachable through a possibly-stale guest page table and reusable by a neighbour.
+
+Its doc then says "**the device remaps the guest window old→new** (an atomic `MAP_FIXED`/`mremap` over the same
+guest address), so the guest re-faults transparently onto the moved bytes". **That remap does not exist.** There
+is no daemon-initiated remap anywhere in `crates/bridge-virtiofs` or `crates/bridge-core`; a guest can replace
+its own window by sending SETUPMAPPING at the same offset, but the daemon cannot push one. The only daemon→device
+channel is the pending-revoke queue, and `dax_migrate` deliberately does not use it — an inode-global revoke
+would tear *every* window of the inode rather than move the one being shifted, and `dax_revoke_pending` (which it
+does call) only unregisters; the enqueue is a separate call at every other site.
+
+Not a live bug: `dax_migrate` has no production caller — tests and `dax_bench` only — and DAX is unadvertised.
+But both docs read as though the mechanism were whole, so whoever wires L2's trigger would find the device half
+missing after building the hard part. The ledger already listed "the adaptive migration trigger from a
+privileged PEBS/IBS broker" as owed; **the backend-initiated window remap is owed with it**, or a decision to use
+the revoke-and-refault path instead and accept that it tears every window of the inode. The function's own doc
+now says so at the definition site, where whoever wires it will read it.
+
+Found by asking what a migration does to a live guest window, then checking the design before concluding: the
+missing enqueue looked like the bug and is not one — the design says remap, not revoke — and the real gap was one
+level further down.
+
+### 2026-10-18 (later): the cross-volume map-storm denial is FIXED — the second attempt, with the pin per window
+
+Earlier today this was recorded as open, after the obvious fix was built and withdrawn for sharing one refcounted
+pin between two guest windows. It is now fixed, and the thing that made the difference is the guard built in
+response to the withdrawal.
+
+`DaxRegistry::live_window` returns the window a repeat request already has, so the registry grows with the
+windows that exist rather than the requests made — and **the map paths pin again on every hit**. That one line is
+the whole correctness: one pin per window handed out, one unpin per window released, so the arena's holder count
+tracks guest windows rather than registry entries. It is "move the pin from the mapping to the window" in the
+smallest form that achieves it, and it needs no change to the gate's invariant after all.
+
+**Red-checked against the fix itself.** With the `pin()` on the dedup hit removed,
+`two_windows_over_one_block_each_hold_its_pin` fails `left: 0, right: 1` — the block released while the second
+window is live; with it, green. That guard did not exist this morning, and no device-level test looked at pins at
+all, which is exactly how the first attempt passed macOS aarch64, x86_64 Linux and aarch64 Linux.
+
+Test fallout, both resolved: `one_volumes_map_storm_does_not_deny_another_volume` is **no longer `#[ignore]`d** —
+the reproduction is a passing test; and `a_map_storm_is_refused_at_the_registry_bound` becomes
+`a_map_storm_is_absorbed_and_the_registry_grows_only_with_real_windows`, since refusing is a bound while
+absorbing is a bound *and* fairness. Verified on macOS aarch64: vfs dax **53 passed, 0 ignored**, bridge-virtiofs
+green, recovery arbiter 39/39, client 13/13, clippy `-D warnings` and `xtask check` clean.
+
+**A correction to this morning's own note.** An aarch64-Linux run of the DAX suite was reported here as a failure
+that "passes on both other targets". It was not arch-specific: the Docker lane bind-mounts the working tree, so
+it was testing this uncommitted dedup rather than HEAD. A bind-mounted lane tests the tree, not the commit —
+state the commit when quoting one.

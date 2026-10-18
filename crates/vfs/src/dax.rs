@@ -304,17 +304,41 @@ impl DaxRegistry {
       .any(|mapping| mapping.writable && mapping.inode.prefix() == prefix)
   }
 
-  // NOT HERE, and the reason is worth keeping: **deduplicating windows is unsafe as the pin accounting stands.**
-  // A `live_window(inode, offset, writable)` lookup that returned the existing mapping for a repeat request would
-  // fix the cross-volume storm (`docs/bugs/2026-10-18-one-volumes-dax-map-storm-denies-every-other-volume.md`) —
-  // the registry would grow with windows rather than requests. It was built, and then withdrawn: the arena's pin
-  // is **refcounted per mapping** (`PinnedBlock::holders`), while the device keeps one `DaxWindowEntry` per
-  // SETUPMAPPING and calls `dax_release_after_unmap` for each. Two guest windows sharing one mapping would
-  // therefore share one pin, and the first unmap would unpin a block the second window still maps — reusable
-  // under a live guest page table, which is the exact escape the two-phase revoke exists to prevent, and worse
-  // than the denial it was fixing. A correct fix has to move the pin from the mapping to the window: a pin per
-  // window handed out, and a `dax_revoke` that stops consuming one. That changes the gate's core invariant, so it
-  // is a considered change, not a passing one.
+  /// The live window that already covers `file_offset` of inode `no` with the writability asked for, if one
+  /// exists (§4.6). A guest that asks twice for the same window needs one window, not two: the map paths return
+  /// this instead of minting a second entry, so **the registry grows with the windows that exist rather than
+  /// with the requests made**.
+  ///
+  /// That is what stops a re-map storm being a *cross-tenant* denial. The cap bounds the shard, so before this a
+  /// volume re-mapping one file filled the registry and the next volume's first window was refused `NoSpace` —
+  /// measured, 32 of 32 taken by one volume. Now a storm on one window is one entry, and to consume entries a
+  /// volume must hold windows onto distinct blocks, which its own content bounds.
+  ///
+  /// **The caller must pin the block again on a hit**, and that is not an optimisation detail — it is the whole
+  /// correctness of this. The arena's pin is refcounted (`PinnedBlock::holders`) and the device keeps one
+  /// `DaxWindowEntry` **per SETUPMAPPING**, releasing each: two guest windows sharing one mapping and one pin
+  /// would have the first unmap release a block the second still maps, reusable under a live guest page table.
+  /// One pin per window handed out, one unpin per window released. A first attempt at this dedup missed that and
+  /// was withdrawn the same day
+  /// (`docs/bugs/2026-10-18-one-volumes-dax-map-storm-denies-every-other-volume.md`); the guard that catches it
+  /// is `two_windows_over_one_block_each_hold_its_pin` in `crates/bridge-virtiofs/tests/device.rs`.
+  ///
+  /// Directory windows do not come through here ([`Volume::dax_map_dir`] has its own path) and keep their
+  /// decided point-in-time re-map semantics.
+  pub(crate) fn live_window(
+    &self,
+    no: InodeNo,
+    file_offset: usize,
+    writable: bool,
+  ) -> Option<Mapping> {
+    self.mappings.iter().copied().find(|held| {
+      held.inode == no
+        && held.writable == writable
+        && !held.snapshot
+        && file_offset >= held.block_file_start
+        && file_offset < held.block_file_start.saturating_add(held.file_len.max(1))
+    })
+  }
 
   /// The block holding a guarded mapping's clean copy (§4.6 B2), the heal source a scrub restores from.
   /// Exposed so a test can corrupt it: Rowhammer flips physical rows and this copy lives in the same RAM as the
@@ -562,6 +586,13 @@ impl Volume {
     // (xattr-value) inode — so a crafted or confused map of an attribute number is `NotFound`, never a window onto
     // an attribute's bytes, mirroring the transports' `namespace_inode` gate.
     self.namespace_inode(&*store, no)?;
+    // The window asked for may already exist: hand back the one that does, with a pin of its own for the window
+    // this call hands out ([`DaxRegistry::live_window`]). A write or truncate of the inode revokes its mappings,
+    // so a live one is never stale.
+    if let Some(live) = store.dax.live_window(no, file_offset, false) {
+      store.content.arena_mut().pin(live.block)?;
+      return Ok(live);
+    }
     // An inline file keeps its bytes in the inode with no content block; materialize them at offset 0 into a
     // throwaway block the mapping owns, exactly as `dax_map_dir` does. The clone releases the store borrow before
     // the mutable materialize.
@@ -791,6 +822,11 @@ impl Volume {
     if store.dax.recalling(no.prefix()) {
       return Err(VfsError::RecallInFlight);
     }
+    // As for a read window, and here it also saves the copy-up, which is the expensive half of this path.
+    if let Some(live) = store.dax.live_window(no, 0, true) {
+      store.content.arena_mut().pin(live.block)?;
+      return Ok(live);
+    }
     // Defence in depth: a writable mapping, like a read mapping, is of a namespace object only — never an
     // attribute inode (`Volume::dax_map_read`).
     self.namespace_inode(&*store, no)?;
@@ -839,13 +875,23 @@ impl Volume {
   /// until the device confirms the window unmap and calls [`Store::dax_release_after_unmap`] (the stale-TLB hold). So
   /// at no point is a block both reachable through the guest's possibly-stale page table and reusable by a neighbour.
   ///
-  /// The device remaps the guest window old→new (an atomic `MAP_FIXED`/`mremap` over the same guest address), so the
-  /// guest re-faults transparently onto the moved bytes. Refused `Invalid` for a read-only mapping (immutable shared
+  /// **The device half this depends on is not built, and that is why nothing calls this yet.** The intended
+  /// hand-off is that the device remaps the guest window old→new — an atomic `MAP_FIXED`/`mremap` over the same
+  /// guest address, so the guest re-faults transparently onto the moved bytes — and **no such daemon-initiated
+  /// remap exists** in `crates/bridge-virtiofs`. A guest can replace its own window by sending SETUPMAPPING at the
+  /// same offset, but the daemon cannot push one, and the only daemon→device channel today is the pending-revoke
+  /// queue, which this deliberately does **not** use: an inode-global revoke would tear every window of the inode
+  /// rather than move the one that is being shifted. So whoever wires L2's trigger owes the backend-initiated
+  /// remap (or a decision to use the revoke-and-refault path instead and accept the tear). Until then this is a
+  /// complete and measured primitive with no production caller — tests and `dax_bench` only. Recorded in
+  /// `docs/wip/GAPS.md` under the L2 owed list.
+  ///
+  /// Refused `Invalid` for a read-only mapping (immutable shared
   /// content a guest cannot hammer into a neighbour, and moving it would break the share), a revoked mapping, or one
   /// whose block already moved; `NoSpace`/`PublishNeeded` if no fresh block can back the shift — the caller keeps the
   /// old mapping and retries, never a lost window. The pseudo-random *placement* of the fresh block within a bounded
   /// physically-contiguous sandbox ([`stripe_target`]) is the L1 step bound to the hugetlb sandbox; here the arena
-  /// provides the fresh block and the handoff mechanics are complete and exact.
+  /// provides the fresh block and the VFS half of the handoff is complete and exact — the device half above is not.
   pub fn dax_migrate(&mut self, store: &mut Store, old: &Mapping) -> Result<Mapping, VfsError> {
     if !old.writable || !store.dax.is_live(old) {
       return Err(VfsError::Invalid);
