@@ -1748,6 +1748,52 @@ fn a_device_window_gives_its_pin_back_when_it_unmaps() {
   );
 }
 
+/// §4.6, gate checklist item 6 — the **destroy sequence** leaves no block pinned. A destroy tears the volume's
+/// guest devices down first (AUD-29-68) and only then runs the volume teardown, so by the time
+/// `Store::dax_revoke_volume` unpins anything, every window is already munmapped. Do: bring a window up over a
+/// real device and cache region, then run those two steps in that order. Expect: nothing pinned afterwards, and
+/// no release the arena refused.
+///
+/// Why this exists beside the single-window test: that one proves a window gives its pin back when it *unmaps*.
+/// This proves the two teardowns **compose** in the order the server uses them — the ordering is what keeps
+/// `dax_revoke_volume` safe being synchronous, and the thing that would break it is a path that unpins before
+/// the windows are gone. `AdmittedDevice::abandon` is exactly such a path (it has no bridge, so it cannot
+/// `release_dax`); the destroy verb cannot reach it with live windows today, and its doc now says so.
+///
+/// **Red-checked, and the result is why `release_refusals` is asserted here at all.** Running the two steps in
+/// the wrong order gives `(pinned, release_refusals) = (0, 1)` against `(0, 0)`: the block count comes back to
+/// zero *either way*, because `dax_revoke_volume` unpins it itself — so the pinned count alone cannot tell the
+/// orders apart, and the only signal is the release the arena then refuses when `release_dax` tries to unpin a
+/// block that is already free. A counter nobody reads is a signal that cannot fire; this is the case it fires
+/// on.
+#[cfg(unix)]
+#[test]
+fn the_destroy_sequence_leaves_no_block_pinned() {
+  let mut f = pin_ledger_fixture("pinledger-destroy");
+  assert_eq!(f.map(2, 0), 0, "the window maps");
+  assert!(
+    f.pinned() > f.quiet,
+    "non-vacuity: the window pinned a block before the destroy ({} -> {})",
+    f.quiet,
+    f.pinned()
+  );
+  let prefix = f.tenant.prefix();
+
+  // Step one, as the destroy does it: the device's terminal teardown, through a still-live bridge.
+  {
+    let mut bridge = VolumeBridge::new(vid(), &mut f.tenant, &mut f.store);
+    f.device.release_dax(&mut bridge, &f.cx);
+  }
+  // Step two: the volume teardown, which unpins synchronously.
+  f.store.dax_revoke_volume(prefix);
+
+  assert_eq!(
+    (f.pinned(), f.store.release_refusals),
+    (f.quiet, 0),
+    "after the destroy sequence no block is left pinned, and the arena refused no release"
+  );
+}
+
 /// §4.6 — two guest windows over **one** block each hold its pin, and only the last one out releases it. A block
 /// released while a window still maps it is reusable by another allocation under a live guest page table, which
 /// is the escape the two-phase revoke exists to prevent.
