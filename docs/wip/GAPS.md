@@ -7284,6 +7284,20 @@ proptest and reading its config. All four now call `cases()` too, verified by th
 written** — this ledger has that lesson under "sibling sweep: every spelling" from 2026-09-28, and it still
 caught me twice today: once on `measure(options)` versus `measure(ProfileOptions { .. })`, and once here.
 
+**The sweep is now exhaustive, and here is the enumeration that says so.** Every way a suite in this tree sets
+its case count, found by grepping the *config* rather than the count
+(`grep -rn "proptest_config\|ProptestConfig\|TestRunner::new"`):
+
+| how the count is set | sites | state |
+|---|---|---|
+| `ProptestConfig { cases: N, .. }` | 18 | call `cases()` |
+| `ProptestConfig::with_cases(N)` | 4 | call `cases()` |
+| `Config::default()` (incl. two `TestRunner::new_with_rng` in `slates-cluster`) | the rest | proptest reads `PROPTEST_CASES` itself |
+| a local `cases()` helper (`crates/vfs/tests/differential.rs`) | 1 | reads the variable |
+
+So every property suite in the tree now deepens on demand. The one literal left is `test-seeds`' own `cases: 4`
+fixture, which tests the seed machinery and must not grow with a sweep.
+
 **And the deep sweeps the fix made possible, all green** (release, macOS aarch64, host load 20–31):
 
 | schedule | default | deepened | result |
