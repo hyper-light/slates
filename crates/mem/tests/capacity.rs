@@ -125,6 +125,7 @@ fn assert_kernel_moved(before: Option<usize>, expected: usize, what: &str) {
 /// moves by exactly as much. mlock capacity is environment-dependent, so a refusal is a loud skip that leaves
 /// nothing locked.
 #[test]
+#[cfg_attr(miri, ignore)] // mlock and the OS's locked-byte report are not modelled by Miri, as at `region.rs`
 fn the_arena_locks_the_blocks_asked_never_the_region_or_their_neighbours() {
   let region = 16 * PAGE;
   let mut arena = ChunkArena::new(PAGE);

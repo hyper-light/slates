@@ -25,6 +25,7 @@ fn object_name(tag: &str) -> String {
 /// over a private mapping — the arena is agnostic to the backing, which is what lets the store's
 /// content live in anchor-owned RAM without changing the volume core.
 #[test]
+#[cfg_attr(miri, ignore)] // a shared memory object is not modelled by Miri, as at `region.rs`
 fn an_arena_over_a_shared_region_allocates_and_serves_bytes() {
   let object = SharedObject::create(&object_name("arena"), LEN, Words::new()).unwrap();
   let mut arena = ChunkArena::new(PAGE);
@@ -49,6 +50,7 @@ fn an_arena_over_a_shared_region_allocates_and_serves_bytes() {
 /// — the memory-level shape of "an agent's writes survive a daemon restart" (§4.8). A private
 /// mapping (`Region::map`) would lose them; this is why the store's content must be anchor-owned.
 #[test]
+#[cfg_attr(miri, ignore)] // a shared memory object is not modelled by Miri, as at `region.rs`
 fn content_in_a_shared_region_survives_the_writing_mapping_being_dropped() {
   let object = SharedObject::create(&object_name("survive"), LEN, Words::new()).unwrap();
   // The handoff a restarted daemon would use to re-map the same object.
@@ -84,6 +86,7 @@ fn content_in_a_shared_region_survives_the_writing_mapping_being_dropped() {
 /// bytes are there through the new mapping, at the offset the block names, and the header beside the range
 /// is still what the copy wrote.
 #[test]
+#[cfg_attr(miri, ignore)] // a shared memory object is not modelled by Miri, as at `region.rs`
 fn a_range_of_a_sparse_object_mapped_alone_keeps_its_bytes_across_a_remap() {
   let granule = slates_mem::mapping_granule().unwrap();
   let range = 4 * granule;
@@ -121,6 +124,7 @@ fn a_range_of_a_sparse_object_mapped_alone_keeps_its_bytes_across_a_remap() {
 /// A-64. Do: map a range whose offset is not on the mapping granule. Expect: refused `OutOfRange` on every
 /// platform, never a mapping of other bytes (Unix's map would round the offset down).
 #[test]
+#[cfg_attr(miri, ignore)] // a shared memory object is not modelled by Miri, as at `region.rs`
 fn a_range_off_the_mapping_granule_is_refused() {
   let granule = slates_mem::mapping_granule().unwrap();
   let object =
@@ -141,6 +145,7 @@ fn a_range_off_the_mapping_granule_is_refused() {
 /// (the very descriptor whose bytes the arena already serves, proven by the first test above).
 #[cfg(unix)]
 #[test]
+#[cfg_attr(miri, ignore)] // a shared memory object is not modelled by Miri, as at `region.rs`
 fn block_backing_exposes_a_shared_regions_fd_and_none_for_a_private_one() {
   use std::os::fd::AsRawFd;
   let object = SharedObject::create(&object_name("daxfd"), LEN, Words::new()).unwrap();

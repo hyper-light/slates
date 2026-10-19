@@ -7572,3 +7572,66 @@ either, and arming ten tuned mount tests blind is how a green lint ships a red l
 (`socket-options-need-the-linux-lane`). The guard also wants one home rather than a copy per test binary once a
 third test needs it — `slates-test-seeds` is the wrong one, its charter is seed persistence, so a shared
 test-support crate is the open question.
+
+### 2026-10-19: two FUSE mount tests are red on Linux 6.19 and green on 6.12 — four causes eliminated, not yet root-caused
+
+**What is red.** On an idle x86_64 Fedora host (kernel 6.19.10-300.fc44, page 4,096), at HEAD, with
+`SLATES_TEST_CLI=1`:
+
+| suite | result on 6.19 / x86_64 |
+|---|---|
+| `slates-cli --test cli` | **33 passed**, 0 failed (16.7 s) |
+| `slates-server --test nfs_mount` | **38 passed**, 0 failed |
+| `slates-server --test fuse_mount` | **3 passed**, 0 failed |
+| `slates-server --test attach_forms` | **9 passed**, 0 failed |
+| `slates-bridge-fuse --test coherence_mount` | **FAILED** — `coherence_mount.rs:345`, "the name another attachment made in the root is seen through the kernel": left `"absent"`, right `"present"` |
+| `slates-bridge-fuse --test owner_turn` | **FAILED** — `owner_turn.rs:292`, "the directory is in the volume, unpublished" |
+| `slates-bridge-fuse --test ipc_mount` | FAILED, but **environmental** — see below |
+
+So this is not "FUSE is broken on this host": the kernel-mount suites that do not turn on cache coherence
+pass, 83 tests of them.
+
+**`ipc_mount` is the host, not the product.** It binds a unix socket *inside the mount*
+(`SocketAddrUnix::new(format!("{}/socket", paths.original))`) and `sockaddr_un` caps a path at ~108 bytes. From
+the 71-character working directory the runner used it fails `ENAMETOOLONG`; copied to `/tmp/s` (7 characters)
+and run again from the same tree it **passes**. The test is sound; it simply cannot run from a deep directory.
+Worth a loud skip rather than a failure when the path will not fit, which is what this repo asks of every
+environment-gated test — recorded, not done here.
+
+**Four causes eliminated, each by measurement rather than reading.**
+
+1. *Not today's `FUSE_MAX_PAGES` change.* A/B from one tree with the single line `| flags::MAX_PAGES` deleted
+   from `wanted()`: **both arms fail identically**.
+2. *Not the notify-off-the-serving-thread fix (`b9935dfe`).* `channel.rs` restored to its content at
+   `b9935dfe~1` with `git show` (no checkout) and rebuilt: **both arms fail identically**.
+3. *Not path length.* Unlike `ipc_mount`, these two fail from `/tmp/s` as well as from the long path.
+4. *Not delivery latency — this matters most.* The hypothesis was that moving invalidation delivery off the
+   serving thread made it late, so the final assertion was patched into a bounded poll: 200 probes at 50 ms.
+   The name was still **`"absent"` after 10.27 s**. The invalidation does not arrive late; **it does not
+   arrive**.
+
+**The split that is left.** The same code on the Docker VM's kernel **6.12.76-linuxkit** passes both:
+`coherence_mount` ok (0.30 s), `owner_turn` ok (1.60 s), no mount left behind. And `coherence_mount` was
+*originally proven* on "a real Linux 6.12 mount" (`c3c0024b`, which fixed invalidations that named the volume
+root). So 6.12 green, 6.19 red. **The one confound is that the 6.12 run was aarch64 and the 6.19 run x86_64** —
+though both report page size 4,096, so the usual page-size mechanism is not available as an explanation, and
+nothing about entry invalidation is instruction-set shaped. The clean closer is one run of these two tests in a
+`--platform linux/amd64` container on that same 6.12 VM kernel, which separates kernel from architecture
+exactly; it is a full emulated build and was not taken here.
+
+**Why it matters.** §4.6's `Invalidated` posture is the promise that a change made through one attachment is
+pushed to the kernel's caches; `coherence_mount` is the proof of it, and on 6.19 a name another attachment
+creates is never seen through the mount at all. If the cause is a kernel change at or after 6.13, slates'
+invalidation is making an assumption newer kernels no longer honour, and the posture — not the test — is what
+has to move. **Not root-caused, so no `docs/bugs/` entry yet**, per this repo's rule that one is written after
+the cause is confirmed.
+
+```
+# red (kernel 6.19, x86_64):
+SLATES_TEST_CLI=1 cargo test -p slates-bridge-fuse --test coherence_mount -- --test-threads=1 --nocapture
+SLATES_TEST_CLI=1 cargo test -p slates-bridge-fuse --test owner_turn      -- --test-threads=1
+# green (kernel 6.12, aarch64), in a container with FUSE and an unmount trap:
+docker run --rm --platform linux/arm64 --device /dev/fuse --cap-add SYS_ADMIN \
+  --security-opt apparmor=unconfined -e SLATES_TEST_CLI=1 ... rust:1.98.1 \
+  bash -c 'apt-get -qq install -y fuse3 && cargo test -p slates-bridge-fuse --test coherence_mount'
+```
