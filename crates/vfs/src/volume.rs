@@ -140,6 +140,9 @@ pub struct Store {
   /// revoked one. Daemon-only RAM — no agent, SDK, MCP or guest reaches it; a mapping is minted here, never supplied.
   /// Empty on any shard no guest maps, so it costs a length check on the hot paths.
   pub dax: crate::dax::DaxRegistry,
+  /// The shard's §4.6 L1 sandboxes, one per volume whose writable DAX content has been shifted, and the
+  /// generator the shift's placement is drawn from.
+  pub dax_zones: crate::daxzone::DaxZones,
 }
 
 impl std::fmt::Debug for Store {
@@ -221,6 +224,7 @@ impl Store {
       // Derived: a mapping pins a chunk, and the shard holds no more chunks than `max_chunks`, so that is the most
       // mappings it can hold at once — the registry's bound, not a tunable.
       dax: crate::dax::DaxRegistry::new(config.max_chunks),
+      dax_zones: crate::daxzone::DaxZones::new(),
     }
   }
 

@@ -983,18 +983,7 @@ impl ChunkStore {
       .ok_or(VfsError::StaleHandle)?;
     let locked = self.arena.is_locked(old_block);
     let new_block = self.alloc(size, locked)?;
-    let carry = self.arena.bytes(old_block).map(<[u8]>::to_vec);
-    let copied = match (carry, self.arena.bytes_mut(new_block)) {
-      (Some(carry), Some(dst)) => match dst.get_mut(..carry.len()) {
-        Some(slot) => {
-          slot.copy_from_slice(&carry);
-          true
-        }
-        None => false,
-      },
-      _ => false,
-    };
-    if !copied {
+    if !self.carry_into(old_block, new_block) {
       // The new block is unpinned, so this free is immediate; the old block and `open` are untouched.
       self.arena.free(new_block)?;
       return Err(VfsError::StaleHandle);
@@ -1003,6 +992,47 @@ impl ChunkStore {
     self.arena.free(old_block)?;
     open.block = new_block;
     Ok(old_block)
+  }
+
+  /// [`ChunkStore::relocate`] onto a block the **caller** chose and already holds, and without freeing the old one
+  /// — the arena half of a DAX migration into §4.6's L1 sandbox, where *where* the content lands is the whole point
+  /// (a shift to a block the general allocator picked may land in the same physical row, or in another tenant's).
+  ///
+  /// `dest` must be a live block of this arena at least as large as `open`'s, allocated by the caller and still
+  /// owned by it; the whole old block is copied in, as [`ChunkStore::relocate`] copies it, so nothing written past
+  /// the extent's length is lost. The old block is **returned, not freed**: a sandbox slot is owned by the sandbox
+  /// and goes back to it rather than to the free lists, where a neighbour could take a row inside this tenant's
+  /// page. A caller whose old block is *not* a sandbox slot frees it itself, keeping the deferred-free semantics
+  /// [`ChunkStore::relocate`] documents.
+  ///
+  /// `StaleHandle`, with `open` untouched and `dest` still the caller's, where either block is not the arena's or
+  /// `dest` is too small to hold the old one.
+  pub fn relocate_into(&mut self, open: &mut OpenExtent, dest: Block) -> Result<Block, VfsError> {
+    let old_block = open.block;
+    if !self.carry_into(old_block, dest) {
+      return Err(VfsError::StaleHandle);
+    }
+    open.block = dest;
+    Ok(old_block)
+  }
+
+  /// Copies the whole of `from`'s block into `into`'s, reporting whether it happened: `false` where either block is
+  /// not this arena's live allocation or `into` is the smaller, in which case nothing was written.
+  fn carry_into(&mut self, from: Block, into: Block) -> bool {
+    let Some(carry) = self.arena.bytes(from).map(<[u8]>::to_vec) else {
+      return false;
+    };
+    match self
+      .arena
+      .bytes_mut(into)
+      .and_then(|dst| dst.get_mut(..carry.len()))
+    {
+      Some(slot) => {
+        slot.copy_from_slice(&carry);
+        true
+      }
+      None => false,
+    }
   }
 
   /// Writes into an open extent at `at` (relative to the extent), zero-filling any gap, growing

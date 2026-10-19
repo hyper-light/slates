@@ -2812,11 +2812,33 @@ same-namespace host process is the first delivered case.
 >      by default and `Volume::dax_map_write` refuses `NotPermitted` until the owner opts in
 >      (`Volume::enable_writable_dax`). Read-only DAX (immutable shared content, the common case) cannot hammer a
 >      neighbour. Keeping the dangerous mode rare bounds how many blocks every layer below must cover.
->    - **L1 — zones + guard rows (owed, the device/deployment layer).** Per-tenant writable-DAX blocks placed in a
->      pre-reserved, physically-contiguous hugetlb sandbox with guard rows between tenants (CATT-style). This is the
->      stated deployment requirement that makes the moving target *real* — without physical contiguity a virtual shift
->      moves no physical rows (security theatre). A low-trust *sacrificial pool* may deliberately co-locate mutually-
->      untrusted tenants so they absorb each other's leakage rather than the host — sound only paired with B2.
+>    - **L1 — zones + guard rows (built, `crates/vfs/src/daxzone.rs`).** A tenant's writable-DAX content is shifted
+>      only inside a sandbox reserved for that tenant: one transparent huge page of the content arena, **verified**
+>      to have actually been given as one, cut into slots that are therefore distinct physical rows of the same
+>      page, with the first and last slot held by the zone as guard rows (CATT-style, Brasser et al., USENIX
+>      Security 2017) so the tenant's rows are never at the edge of its page beside a neighbour's. Without this a
+>      shift moves a *virtual* address the kernel may back with the row it came from — security theatre — so
+>      [`Volume::dax_migrate`] now **refuses `NoPhysicalIsolation`** on a host that cannot back a sandbox rather
+>      than performing a shift that does not shift.
+>      **Unprivileged, by measurement rather than by requirement.** A hugetlb reservation would need
+>      `/proc/sys/vm/nr_hugepages` from an administrator, which R10 refuses to require; a transparent huge page
+>      needs nothing, and whether the kernel actually gave one is a question `/proc/self/smaps` answers
+>      (`slates_machine::facts::huge_backed_bytes`). The zone asks, faults the span, and reads the PMD-mapped bytes
+>      before and after, so the growth is attributable to that span — `madvise` returning `OK` is not an answer
+>      (measured on Linux 7.2: a 64 KiB and a 1 MiB mapping both take it and receive none).
+>      **The zone holds every slot it is not lending.** A row the zone does not hold is a row the general allocator
+>      may give another volume — the co-location the zone exists to prevent — so the span is allocated whole and
+>      any row that left (an ordinary delete or truncate frees a block by a path the zone does not sit on) is
+>      re-claimed before the next grant. The cost is one huge page per tenant that shifts, flat and capped, which
+>      is §4.6's "footprint stays capped": there is no quarantine pool to exhaust.
+>      **Deployment note.** The arena is a shared memory object, so the setting that governs it is
+>      `transparent_hugepage/shmem_enabled`, *not* `transparent_hugepage/enabled` — a host can have the second on
+>      and the first off and get no sandbox at all. Measured 2026-10-19: adacachy (6.x, `shmem_enabled=[advise]`)
+>      reserves sandboxes in the daemon's own object and every L1 test runs; fedora 6.19.10
+>      (`enabled=[madvise]`, `shmem_enabled=[never]`) backs private mappings but not the object, so the shift is
+>      refused there and `a_sandbox_is_reserved_in_the_shared_object_a_daemon_serves_dax_from` skips loudly. A
+>      low-trust *sacrificial pool* may deliberately co-locate mutually-untrusted tenants so they absorb each
+>      other's leakage rather than the host — sound only paired with B2, and not built.
 >    - **L2 — moving target (built, 68b4a9c5).** `Volume::dax_migrate` relocates a writable block to a physically
 >      different block under the two-phase revoke (the new block pinned and its mapping minted before the old is
 >      revoked-pending, the old held until the VMM confirms the unmap), so an attacker tracking physical rows loses
@@ -2835,9 +2857,12 @@ same-namespace host process is the first delivered case.
 >      (a writable block changes legitimately, so a checksum cannot tell a flip from a write); read-only is the L0
 >      default, so B2 covers the common case. The clean copy is bounded by the registry cap and freed on revoke.
 >    The modern window is 16–32 ms and RowPress leaks across refresh windows, so the migration interval is derived
->    from the lowest hammer threshold, not the classic 64 ms. Wiring L1 (hugetlb zones + guard rows) and the adaptive
->    broker trigger into the device loop is the owed step; the L0/L2/B2 primitives are built and proven by use in
->    `crates/vfs/tests/dax.rs`.
+>    from the lowest hammer threshold, not the classic 64 ms. L0, L1, L2 and B2 are built and proven by use in
+>    `crates/vfs/tests/dax.rs`. What is owed is the **caller**: `Volume::dax_migrate` still has none in production.
+>    The periodic sweep at the 16–32 ms cadence is the one the measurement already affords (242 ns per 4 KiB block,
+>    so unconditional migration costs <0.01% throughput) and needs no new signal; the adaptive trigger from a
+>    privileged broker's PEBS/IBS is the optimization on top of it, not a precondition. The device half — a
+>    backend-initiated remap of the guest's window old→new — is owed with it.
 
 > **Status (DAX device-seam wiring, 2026-10-15).** The device side of the gate is built against the in-process
 > virtio-fs seam and proven by a simulated guest (no KVM): `crates/bridge-virtiofs` serves a real

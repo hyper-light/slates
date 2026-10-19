@@ -29,7 +29,7 @@ use slates_vfs::ids::InodeNo;
 use slates_vfs::volume::{Store, Volume};
 
 mod common;
-use common::{clone_config, store, store_capped_chunks};
+use common::{clone_config, store, store_capped_chunks, store_sandboxed};
 
 /// The gate's standard test volume, **with writable DAX opted in** (L0). The mapping-gate tests below exercise what a
 /// writable mapping does *after* a volume opts in — pinning, teardown, migration — so the shared fixture opts in. The
@@ -1052,19 +1052,51 @@ fn all_bytes(bytes: &[u8], v: u8) -> bool {
   bytes.iter().all(|&b| b == v)
 }
 
+/// The first shift of a test that needs a §4.6 L1 sandbox, which is also the question "can this host back one".
+///
+/// `None`, with the skip printed, where the host declined the huge page the sandbox needs — every non-Linux host
+/// and a Linux without transparent huge pages always will, and a Linux *with* them may decline any individual
+/// span, because a transparent huge page is granted best-effort out of whatever contiguous memory the kernel has
+/// at that moment. So the question is asked by the test's own first shift rather than by a separate probe: a probe
+/// would both race the answer and consume a huge page of the very memory it was asking about.
+fn first_shift(
+  store: &mut Store,
+  volume: &mut Volume,
+  mapping: &Mapping,
+  test: &str,
+) -> Option<Mapping> {
+  match volume.dax_migrate(store, mapping) {
+    Ok(moved) => Some(moved),
+    Err(VfsError::NoPhysicalIsolation) => {
+      println!(
+        "SKIP {test}: this host backed no transparent huge page for the span, so §4.6's L1 sandbox cannot be reserved"
+      );
+      None
+    }
+    Err(other) => panic!("a shift is either performed or refused for want of a sandbox: {other:?}"),
+  }
+}
+
 /// §4.6 multi-tenancy **L2** (the moving target; the `dax_migrate` stripe-shift primitive the periodic Rowhammer
 /// defence composes from). Do: map a file writable, write a known marker the hardware way, migrate it. Expect: the
 /// content moves to a *physically different* block with every byte preserved; the inode follows, so the daemon path
 /// and a plain non-DAX read both reach the moved bytes; the new mapping is live, the old is inert; the counter moved.
 #[test]
 fn a_migration_moves_the_content_to_a_new_block_and_repoints_the_inode() {
-  let mut store = store();
+  let mut store = store_sandboxed();
   let mut volume = volume(&mut store, 1 << 20);
   let f = file_of(&mut store, &mut volume, "f", 0x41, DAX_PAGE);
   let m = volume.dax_map_write(&mut store, f).unwrap();
   store.dax_write_raw(&m, 0, &[0x55; 8]); // a known marker written through the guest's own page table
 
-  let m2 = volume.dax_migrate(&mut store, &m).unwrap();
+  let Some(m2) = first_shift(
+    &mut store,
+    &mut volume,
+    &m,
+    "a_migration_moves_the_content_to_a_new_block_and_repoints_the_inode",
+  ) else {
+    return;
+  };
 
   assert_ne!(
     m2.block, m.block,
@@ -1111,13 +1143,22 @@ fn a_migration_moves_the_content_to_a_new_block_and_repoints_the_inode() {
 /// guest's possibly-stale page table still maps it.
 #[test]
 fn a_migration_holds_the_old_block_pinned_until_the_release() {
-  let mut store = store();
+  let mut store = store_sandboxed();
   let mut volume = volume(&mut store, 1 << 20);
   let f = file_of(&mut store, &mut volume, "f", 0x41, DAX_PAGE);
   let m = volume.dax_map_write(&mut store, f).unwrap();
   let old_block = m.block;
 
-  let _m2 = volume.dax_migrate(&mut store, &m).unwrap();
+  if first_shift(
+    &mut store,
+    &mut volume,
+    &m,
+    "a_migration_holds_the_old_block_pinned_until_the_release",
+  )
+  .is_none()
+  {
+    return;
+  }
 
   assert!(
     all_bytes(&store.dax_read_raw(&m, 0, 8), 0),
@@ -1142,8 +1183,7 @@ fn a_migration_holds_the_old_block_pinned_until_the_release() {
 /// would break the share. Non-vacuity: a writable mapping of the same file migrates.
 #[test]
 fn a_read_only_mapping_is_not_migrated() {
-  use slates_vfs::error::VfsError;
-  let mut store = store();
+  let mut store = store_sandboxed();
   let mut volume = volume(&mut store, 1 << 20);
   let f = file_of(&mut store, &mut volume, "f", 0x41, DAX_PAGE);
 
@@ -1154,13 +1194,19 @@ fn a_read_only_mapping_is_not_migrated() {
   );
   assert_eq!(store.dax.migrated(), 0, "nothing migrated");
 
-  // Non-vacuity: the same file, mapped writable, does migrate.
+  // Non-vacuity: the same file, mapped writable, does migrate — where the host can back the sandbox it needs.
   store.dax_revoke(&ro);
   let rw = volume.dax_map_write(&mut store, f).unwrap();
-  assert!(
-    volume.dax_migrate(&mut store, &rw).is_ok(),
-    "a writable mapping of the same file migrates"
-  );
+  if first_shift(
+    &mut store,
+    &mut volume,
+    &rw,
+    "a_read_only_mapping_is_not_migrated (the non-vacuity leg)",
+  )
+  .is_none()
+  {
+    return;
+  }
   assert_eq!(store.dax.migrated(), 1);
 }
 
@@ -1193,6 +1239,304 @@ fn the_stripe_target_stays_in_the_sandbox_and_always_moves() {
     0,
     "a one-slot sandbox cannot move: it returns its only slot (no shift available)"
   );
+}
+
+/// §4.6 **L1** (zones and guard rows), the leg every host runs. Do: ask for a shift on a store whose arena the
+/// host may or may not have backed with a huge page. Expect: on a host that cannot back one, the shift is
+/// **refused** `NoPhysicalIsolation` and nothing moved — a shift inside a 4 KiB-paged region is a virtual move the
+/// kernel may back with the very row it came from, which §4.6 calls security theatre, and slates refuses rather
+/// than performs it; on a host that can, the shift succeeds and the volume holds a sandbox. One test, both legs,
+/// so neither host silently loses the rule.
+#[test]
+fn a_shift_is_refused_where_the_host_cannot_make_it_move_physical_rows() {
+  let mut store = store_sandboxed();
+  let mut volume = volume(&mut store, 1 << 20);
+  let f = file_of(&mut store, &mut volume, "f", 0x41, DAX_PAGE);
+  let m = volume.dax_map_write(&mut store, f).unwrap();
+  let before = m.block;
+
+  match volume.dax_migrate(&mut store, &m) {
+    Err(VfsError::NoPhysicalIsolation) => {
+      assert_eq!(store.dax.migrated(), 0, "nothing migrated");
+      assert!(
+        store.dax_is_live(&m),
+        "the refused shift left the window exactly as it was"
+      );
+      assert!(
+        store.dax_zones.is_empty(),
+        "no sandbox was left half-reserved by the refusal"
+      );
+      assert!(
+        all_bytes(&store.dax_read_raw(&m, 0, 8), 0x41),
+        "the content is untouched where it was"
+      );
+      println!(
+        "this host backs no transparent huge page: the shift is refused, which is the rule under test"
+      );
+    }
+    Ok(moved) => {
+      assert_ne!(moved.block, before, "the shift moved the content");
+      assert_eq!(
+        store.dax_zones.len(),
+        1,
+        "the volume holds one sandbox (non-vacuity: the shift really drew from a zone)"
+      );
+    }
+    other => panic!("a shift is either refused for want of a sandbox or performed: {other:?}"),
+  }
+}
+
+/// §4.6 L1 (the sandbox's shape). Do: on a host that backs one, shift a tenant's writable content many times over.
+/// Expect: every landing is inside that tenant's own sandbox, never on a guard row at either end, the content is
+/// byte-identical after each one, and over the sweep more than one row is used (non-vacuity — the placement is not
+/// stuck on a single slot, which would be a sandbox that does not move).
+#[test]
+fn every_shift_lands_inside_the_tenants_sandbox_and_never_on_a_guard_row() {
+  let mut store = store_sandboxed();
+  let mut volume = volume(&mut store, 1 << 20);
+  let f = file_of(&mut store, &mut volume, "f", 0x41, DAX_PAGE);
+  let mut m = volume.dax_map_write(&mut store, f).unwrap();
+  store.dax_write_raw(&m, 0, &[0x55; 8]);
+
+  // Derived: enough shifts that a stuck placement cannot pass by luck, and few enough that the test stays a
+  // fraction of a second — the zone has tens of rows, so twenty draws visit several of them with overwhelming
+  // probability while costing twenty 64 KiB copies.
+  const SHIFTS: usize = 20;
+  let mut landed = Vec::new();
+  for shift in 0..SHIFTS {
+    // The first draw is the one that reserves the sandbox, so it is the one that answers "can this host".
+    let moved = match first_shift(
+      &mut store,
+      &mut volume,
+      &m,
+      "every_shift_lands_inside_the_tenants_sandbox_and_never_on_a_guard_row",
+    ) {
+      Some(moved) => moved,
+      None if shift == 0 => return,
+      None => panic!("the sandbox was reserved on the first shift and must still be there"),
+    };
+    let (_, slots) = store.dax_zones.of_volume(f.prefix()).unwrap().held();
+    let slot = store
+      .dax_zones
+      .of_volume(f.prefix())
+      .unwrap()
+      .slot_of(moved.block)
+      .expect("the content landed in the tenant's own sandbox");
+    assert_ne!(slot, 0, "a landing never takes the leading guard row");
+    assert_ne!(
+      slot,
+      slots.saturating_sub(1),
+      "a landing never takes the trailing guard row"
+    );
+    assert_eq!(
+      store.dax_read_raw(&moved, 0, 8),
+      vec![0x55; 8],
+      "the marker survived the shift"
+    );
+    assert!(
+      all_bytes(&store.dax_read_raw(&moved, 8, 16), 0x41),
+      "the rest of the file survived the shift"
+    );
+    store.dax_release_after_unmap(&m);
+    landed.push(slot);
+    m = moved;
+  }
+  landed.sort_unstable();
+  landed.dedup();
+  assert!(
+    landed.len() > 1,
+    "the placement visits more than one row over {SHIFTS} shifts (it is not stuck): {landed:?}"
+  );
+}
+
+/// §4.6 L1 (the isolation the zone exists for). Do: on a host that backs sandboxes, give two volumes on the same
+/// shard a writable DAX block each and shift both many times. Expect: no row either tenant ever lands on is a row
+/// the other's sandbox covers — the co-location that makes a neighbour's hammer reach this tenant's bits cannot
+/// happen, because each tenant's rows are inside its own huge page with guard rows at the ends.
+#[test]
+fn two_tenants_never_land_on_a_row_inside_the_others_sandbox() {
+  let mut store = store_sandboxed();
+  let mut one = volume(&mut store, 1 << 20);
+  // A second volume on the same shard arena, with its own prefix — the fixture's `volume` always makes prefix 7,
+  // so two of them would be one volume created twice, not two tenants.
+  let mut two = Volume::create(&mut store, clone_config(9)).unwrap();
+  two.enable_writable_dax();
+  let a = file_of(&mut store, &mut one, "a", 0xA1, DAX_PAGE);
+  let b = file_of(&mut store, &mut two, "b", 0xB2, DAX_PAGE);
+  let mut ma = one.dax_map_write(&mut store, a).unwrap();
+  let mut mb = two.dax_map_write(&mut store, b).unwrap();
+
+  // Derived: as above — enough draws that a placement that strayed would be caught, cheap enough to stay fast.
+  const SHIFTS: usize = 12;
+  for shift in 0..SHIFTS {
+    let test = "two_tenants_never_land_on_a_row_inside_the_others_sandbox";
+    let (Some(moved_a), Some(moved_b)) = (
+      first_shift(&mut store, &mut one, &ma, test),
+      first_shift(&mut store, &mut two, &mb, test),
+    ) else {
+      assert_eq!(shift, 0, "both sandboxes were reserved on the first shift");
+      return;
+    };
+    let zone_a = store.dax_zones.of_volume(a.prefix()).unwrap();
+    let zone_b = store.dax_zones.of_volume(b.prefix()).unwrap();
+    assert!(
+      zone_a.slot_of(moved_a.block).is_some() && zone_a.slot_of(moved_b.block).is_none(),
+      "the first tenant landed in its own sandbox and the second never did"
+    );
+    assert!(
+      zone_b.slot_of(moved_b.block).is_some() && zone_b.slot_of(moved_a.block).is_none(),
+      "the second tenant landed in its own sandbox and the first never did"
+    );
+    // Each tenant's bytes are its own after the shift, which is the leak this isolation is about.
+    assert!(
+      all_bytes(&store.dax_read_raw(&moved_a, 8, 16), 0xA1),
+      "the first tenant's content is its own"
+    );
+    assert!(
+      all_bytes(&store.dax_read_raw(&moved_b, 8, 16), 0xB2),
+      "the second tenant's content is its own"
+    );
+    store.dax_release_after_unmap(&ma);
+    store.dax_release_after_unmap(&mb);
+    ma = moved_a;
+    mb = moved_b;
+  }
+  assert_eq!(store.dax_zones.len(), 2, "each tenant has its own sandbox");
+}
+
+/// §4.6 L1 (the sandbox's own lifecycle). Do: on a host that backs sandboxes, shift a volume's content so it
+/// reserves one, then destroy the volume. Expect: the sandbox's huge page goes back to the arena — the shard's
+/// free bytes return to what they were before the tenant existed, so a sandbox is a cost that ends with its
+/// tenant and not a page the shard loses for the rest of its life.
+#[test]
+fn destroying_a_volume_gives_its_sandbox_back_to_the_arena() {
+  let mut store = store_sandboxed();
+  let mut volume = volume(&mut store, 1 << 20);
+  let prefix = volume.prefix();
+  let f = file_of(&mut store, &mut volume, "f", 0x41, DAX_PAGE);
+  let m = volume.dax_map_write(&mut store, f).unwrap();
+  let allocated_before = store.content.arena().allocated_bytes();
+
+  let Some(moved) = first_shift(
+    &mut store,
+    &mut volume,
+    &m,
+    "destroying_a_volume_gives_its_sandbox_back_to_the_arena",
+  ) else {
+    return;
+  };
+  store.dax_release_after_unmap(&m);
+  let with_sandbox = store.content.arena().allocated_bytes();
+  assert!(
+    with_sandbox > allocated_before,
+    "the sandbox took a huge page from the arena ({allocated_before} -> {with_sandbox})"
+  );
+  assert_eq!(store.dax_zones.len(), 1);
+
+  store.dax_release_after_unmap(&moved);
+  store.dax_revoke_volume(prefix);
+  assert_eq!(
+    store.dax_zones.len(),
+    0,
+    "the destroyed volume's sandbox is gone"
+  );
+  assert!(
+    store.content.arena().allocated_bytes() < with_sandbox,
+    "the sandbox's rows went back to the arena"
+  );
+}
+
+/// §4.6 L1 over the backing a **daemon actually uses**. Do: build a store whose content arena is a shared memory
+/// object — what the production arena is (A-64: content lives in the anchor's object, so it survives a restart),
+/// not the private mapping the other sandbox tests map — and shift a tenant's writable content in it. Expect: the
+/// sandbox is reserved inside the object's own pages and the shift lands in it, so the guest's DAX window, which
+/// is a range of that object's descriptor, is the thing being protected.
+///
+/// This is a separate test because it is a separate kernel question: a private mapping's huge pages are governed
+/// by `transparent_hugepage/enabled` and a shared object's by `transparent_hugepage/shmem_enabled`, and a host can
+/// have the first on and the second off — measured on Fedora 6.19, which is `[madvise]` for one and `[never]` for
+/// the other. A fixture that only mapped privately would pass on such a host while the daemon got no sandbox at
+/// all, which is the trap of testing a backing the product does not use.
+#[test]
+fn a_sandbox_is_reserved_in_the_shared_object_a_daemon_serves_dax_from() {
+  use slates_mem::arena::ChunkArena;
+  use slates_mem::region::Region;
+  use slates_mem::shared::{ExclusiveObject, SharedObject};
+  use slates_mem::words::Words;
+  use slates_vfs::volume::StoreConfig;
+
+  let page = 4096usize;
+  // Derived: as the private fixture — eight of the host's huge pages, so the sandbox, the content and the arena's
+  // rounding all fit without the fixture's size shaping the result.
+  const SANDBOX_HUGE_PAGES: usize = 8;
+  let Some(huge) =
+    slates_machine::facts::huge_page_bytes().and_then(|bytes| usize::try_from(bytes).ok())
+  else {
+    println!(
+      "SKIP a_sandbox_is_reserved_in_the_shared_object_a_daemon_serves_dax_from: this host has no transparent huge page"
+    );
+    return;
+  };
+  let object = SharedObject::create(
+    &format!("sl-dax-zone-{}", std::process::id()),
+    huge * SANDBOX_HUGE_PAGES,
+    Words::new(),
+  )
+  .unwrap();
+  let mut arena = ChunkArena::new(page);
+  // SAFETY: this test is the object's only mapper, and it declares no words.
+  arena
+    .add_region(Region::shared(
+      unsafe { ExclusiveObject::new(object) },
+      page,
+    ))
+    .unwrap();
+  let mut store = Store::new(
+    &StoreConfig {
+      page,
+      cache_line: 128,
+      max_dirs: 1 << 10,
+      max_inodes: 1 << 12,
+      max_chunks: 1 << 12,
+      max_dir_blocks: 1 << 10,
+      dir_cutover: 16,
+    },
+    arena,
+    0,
+  );
+  let mut volume = volume(&mut store, 1 << 20);
+  let f = file_of(&mut store, &mut volume, "f", 0x41, DAX_PAGE);
+  let m = volume.dax_map_write(&mut store, f).unwrap();
+  store.dax_write_raw(&m, 0, &[0x55; 8]);
+
+  let Some(moved) = first_shift(
+    &mut store,
+    &mut volume,
+    &m,
+    "a_sandbox_is_reserved_in_the_shared_object_a_daemon_serves_dax_from",
+  ) else {
+    return;
+  };
+
+  let zone = store.dax_zones.of_volume(f.prefix()).unwrap();
+  assert!(
+    zone.slot_of(moved.block).is_some(),
+    "the content landed in the sandbox reserved inside the shared object"
+  );
+  assert_eq!(
+    store.dax_read_raw(&moved, 0, 8),
+    vec![0x55; 8],
+    "the marker moved with it"
+  );
+  // The window a device would hand a VMM is a range of this object's descriptor, and it names the moved block.
+  #[cfg(unix)]
+  {
+    let (_, offset, len) = store
+      .dax_backing(&moved)
+      .expect("the moved block is mappable");
+    assert_eq!(offset, moved.block.offset(), "the window names the new row");
+    assert!(len >= DAX_PAGE, "the window covers the file's page");
+  }
 }
 
 // ───────────────────────────────────────────────────────────── B2 the self-healing safety net (checksum + heal)

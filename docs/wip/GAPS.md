@@ -8210,3 +8210,49 @@ So the order that works, as one piece rather than three blocked ones:
 Rows 3 and 4 are therefore **one piece of work with a known shape and no outstanding decision** — not two rows
 waiting on an anchor and an authorization, which is how this checklist has read all along. What it needs is the
 build: the sandbox allocator, the sweep on the shard's timer, and tests on a host with shmem THP.
+
+### 2026-10-19 (later still): §4.6 L1 built — the sandbox a shift lands in, and the refusal where it cannot
+
+The zone is `crates/vfs/src/daxzone.rs`. One huge page of the content arena per tenant, verified by measurement,
+cut into slots, with the first and last held as guard rows; `Volume::dax_migrate` draws its destination from it
+through `stripe_target` and **refuses `NoPhysicalIsolation`** where no sandbox can be backed — which replaces the
+previous behaviour of shifting to whatever block the general allocator returned, a virtual move §4.6 itself calls
+security theatre. Nothing was layered beside the old path; the old path is gone.
+
+Three things this cost that the plan above did not foresee:
+
+1. **The sandbox cannot be a new arena region.** Region ids are the pool's (`id = partition ×
+   POOL_EXTENTS_PER_PARTITION + part`, A-98) and a block's `(region, offset)` is its name in an image (A-64), so a
+   zone in a region of its own would hold blocks no restart could find. A zone is therefore a *sub-span* of a pool
+   extent, reserved by allocating it whole and re-claiming each slot — which keeps every block image-nameable and
+   needed no change to the pool, the image or recovery.
+2. **The guard against reuse has to be re-asserted, not installed once.** A zone slot handed to an inode is freed
+   by the ordinary content path on a delete or truncate, which the zone does not sit on. Rather than put the zone
+   on every free site, `shift_target` re-claims every missing slot before it draws, so the invariant that matters
+   — at the moment a tenant receives a writable row, every other row of its page is the zone's — is restored
+   exactly when it is needed and costs an O(slots) check only on a shift.
+3. **The fixture nearly tested the wrong backing.** The private mapping (`Region::map`) the first tests used is
+   governed by `transparent_hugepage/enabled`; the daemon's arena is a shared object, governed by
+   `shmem_enabled`. On fedora 6.19.10 the first is `[madvise]` and the second `[never]`, so every anon-backed
+   sandbox test passed on a host where a daemon would get no sandbox at all.
+   `a_sandbox_is_reserved_in_the_shared_object_a_daemon_serves_dax_from` closes that: it builds the store over a
+   `SharedObject` as `crates/server/src/content_pool.rs` does and asserts the shift lands in a sandbox inside the
+   object, checking `dax_backing` names the moved row — the window a VMM would actually be handed.
+
+**Measured 2026-10-19.** macOS 15 aarch64: 58 tests, the four sandbox tests skip loudly (no superpages for user
+programs). fedora 6.19.10 x86_64 (`enabled=[madvise]`, `shmem_enabled=[never]`): 58 pass, three runs, only the
+shared-object one skips. adacachy x86_64 (`shmem_enabled=[advise]`): **58 pass with no skip at all** — the
+sandbox is reserved in the daemon's own object, twenty consecutive shifts all land inside it on more than one
+row, neither guard row is ever taken, two tenants never land in each other's page, and a destroyed volume gives
+its huge page back.
+
+**A sharper flake than expected, and what it taught.** A transparent huge page is granted best-effort from
+whatever contiguous memory the kernel has at that instant, so a separate "can this host?" probe both raced its own
+answer and consumed a huge page of the memory it was asking about — one test went red on fedora only when the
+probe ran beside 56 other tests. Each test now asks the question with its own first shift (`first_shift`), which
+is the product's own predicate and cannot race it. This is the same rule as `inject-the-products-own-condition`,
+met in a new place.
+
+**Still owed, and now the only thing owed for the Rowhammer layers:** `dax_migrate`'s production caller. §4.6's
+own measurement affords the unconditional sweep at the 16–32 ms cadence without any new signal; the device's
+backend-initiated remap of the guest window goes with it.

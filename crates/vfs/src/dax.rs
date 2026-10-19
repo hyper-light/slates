@@ -908,12 +908,39 @@ impl Volume {
       store.inodes.get_mut(handle)?.body = Body::Open { open, sealed };
       return Err(VfsError::Invalid);
     }
-    // Relocate the content to a fresh block; the old block, pinned by `old`, is freed *deferred* (its bytes kept) —
-    // the stale-TLB hold. On a refusal nothing moved: restore the body and surface it.
-    if let Err(refusal) = store.content.relocate(open.as_mut()) {
-      store.inodes.get_mut(handle)?.body = Body::Open { open, sealed };
-      return Err(refusal);
-    }
+    // Draw the destination from this volume's L1 sandbox (§4.6): a different physical row of a huge page the
+    // kernel confirmed it gave us, with guard rows at both ends and every other row held by the zone itself. A
+    // block the general allocator picked would be a *virtual* move the kernel is free to back with the same
+    // physical row, which is the security theatre §4.6 names — so a host that cannot offer a sandbox is refused
+    // here rather than served a shift that does not shift.
+    let slot_bytes = NonZeroUsize::new(store.content.chunk_bytes());
+    let target = match slot_bytes
+      .ok_or(VfsError::NoPhysicalIsolation)
+      .and_then(|slot| {
+        store.dax_zones.shift_target(
+          old.inode.prefix(),
+          store.content.arena_mut(),
+          slot,
+          old.block,
+        )
+      }) {
+      Ok(target) => target,
+      Err(refusal) => {
+        store.inodes.get_mut(handle)?.body = Body::Open { open, sealed };
+        return Err(refusal);
+      }
+    };
+    // Relocate the content onto that row. The old block is *not* freed: a sandbox slot goes back to the sandbox
+    // (below), and a block from outside it is freed here, which — because `old` pins it — is the *deferred* free
+    // whose bytes are kept, the stale-TLB hold. On a refusal nothing moved: restore the body and surface it.
+    let vacated = match store.content.relocate_into(open.as_mut(), target) {
+      Ok(vacated) => vacated,
+      Err(refusal) => {
+        store.dax_zones.return_slot(old.inode.prefix(), target);
+        store.inodes.get_mut(handle)?.body = Body::Open { open, sealed };
+        return Err(refusal);
+      }
+    };
     let new_block = open.block;
     // The inode now reaches the moved block; non-DAX readers see the file unchanged.
     store.inodes.get_mut(handle)?.body = Body::Open { open, sealed };
@@ -951,6 +978,14 @@ impl Volume {
         store.release_refusals = store.release_refusals.saturating_add(1);
       }
       return Err(refusal);
+    }
+    // The row the content left: a sandbox slot returns to the sandbox, so no neighbour can take a row inside this
+    // tenant's page while the tenant still writes the page. A block from outside the sandbox is freed, deferred
+    // while `old` pins it, exactly as a relocation through the general allocator frees it.
+    if !store.dax_zones.return_slot(old.inode.prefix(), vacated)
+      && store.content.arena_mut().free(vacated).is_err()
+    {
+      store.release_refusals = store.release_refusals.saturating_add(1);
     }
     store.dax.count_migration();
     Ok(mapping)
@@ -1413,6 +1448,12 @@ impl Store {
     // The volume is going away, so any recall of it goes with it: nothing is left to block a later volume that
     // happens to reuse the prefix.
     self.dax.end_recall(prefix);
+    // And so does its L1 sandbox (§4.6): a huge page held for a tenant that no longer exists is a page the rest
+    // of the shard cannot use, and a later volume that reuses the prefix must get a sandbox of its own rather
+    // than inherit rows this one wrote.
+    self
+      .dax_zones
+      .release_volume(prefix, self.content.arena_mut());
     let victims: Vec<Mapping> = self
       .dax
       .mappings

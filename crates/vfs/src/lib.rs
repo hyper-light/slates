@@ -35,6 +35,7 @@ pub mod clock;
 pub mod content;
 pub mod coverage;
 pub mod dax;
+pub mod daxzone;
 pub mod delta;
 pub mod derive;
 pub mod dir;

@@ -759,6 +759,35 @@ pub fn huge_backed_bytes(_base: usize) -> Option<u64> {
   None
 }
 
+/// The size of one transparent huge page on this host, the span a PMD entry maps.
+///
+/// §4.6's L1 sandbox is sized in these: a tenant's writable-DAX rows must sit inside one physically
+/// contiguous page, or a shift between two of its offsets moves no physical rows. Read from the kernel
+/// rather than assumed, because it is not the same number on every architecture slates targets — 2 MiB on
+/// x86_64 and on arm64 with 4 KiB base pages, 32 MiB on arm64 with 16 KiB base pages, 512 MiB with 64 KiB —
+/// and a sandbox built to the wrong one is either unbuildable or silently split across pages.
+///
+/// `None` where the host has no transparent huge pages to size (off Linux, or a kernel built without
+/// `CONFIG_TRANSPARENT_HUGEPAGE`), which the caller reads as "no sandbox here", never as a default.
+#[cfg(target_os = "linux")]
+#[must_use]
+pub fn huge_page_bytes() -> Option<u64> {
+  std::fs::read_to_string("/sys/kernel/mm/transparent_hugepage/hpage_pmd_size")
+    .ok()?
+    .trim()
+    .parse::<u64>()
+    .ok()
+    .filter(|size| *size > 0)
+}
+
+/// The paired arm: a host with no transparent huge pages has no size to report, so §4.6's sandbox is
+/// unbuildable there and says so (the same reason [`huge_backed_bytes`] answers `None`).
+#[cfg(not(target_os = "linux"))]
+#[must_use]
+pub fn huge_page_bytes() -> Option<u64> {
+  None
+}
+
 #[cfg(target_os = "linux")]
 mod platform {
   use super::{

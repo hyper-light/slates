@@ -52,6 +52,11 @@ pub enum VfsError {
   /// (§4.6 step 5), so a new writable map is refused until the recall ends. Without this a guest that re-maps
   /// between the snapshot's retries holds the snapshot off forever.
   RecallInFlight,
+  /// This host cannot give the volume a physically-contiguous sandbox for its writable DAX rows (§4.6 L1), so a
+  /// shift of them would move no physical rows and the defence it is part of would be theatre. Refused rather
+  /// than performed: the kernel declined a huge page for the span, the host has none to offer (every non-Linux
+  /// host, and a Linux built without transparent huge pages), or the arena has no page to spare for one.
+  NoPhysicalIsolation,
   /// The base beneath an overlay entry cannot be served: the host's errno.
   BaseUnavailable(i32),
   /// A witnessed base entry changed on disk beneath an unpinned range: the read refuses rather
@@ -146,6 +151,9 @@ impl VfsError {
       Self::CrossVolumeMove => "EXDEV",
       Self::StaleHandle => "ESTALE",
       Self::Destroying | Self::Archived | Self::Pinned | Self::RecallInFlight => "EBUSY",
+      // The operation is sound and the caller is permitted; this host simply cannot back it with the
+      // physical isolation it would need to mean anything (§4.6 L1), which is "not supported here".
+      Self::NoPhysicalIsolation => "EOPNOTSUPP",
       Self::BaseUnavailable(_) | Self::BaseDrift | Self::RecoveryIncomplete | Self::Integrity => {
         "EIO"
       }

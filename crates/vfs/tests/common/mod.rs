@@ -60,6 +60,40 @@ pub(crate) fn store_shaped(
   )
 }
 
+/// A store whose arena can back §4.6's L1 sandboxes: its region is huge-page advised and several of this host's
+/// huge pages long, so a zone reservation has somewhere aligned and contiguous to land.
+///
+/// The advice is only an ask — whether the kernel gave huge pages is what `DaxZone::reserve` measures, and on a
+/// host that gave none (every non-Linux host, and a Linux without transparent huge pages) a reservation refuses
+/// `NoPhysicalIsolation`, which is the behaviour the sandbox tests drive on both legs.
+pub(crate) fn store_sandboxed() -> Store {
+  // Derived: one huge page for the tenant's zone, one for a second tenant's in the two-volume tests, and the rest
+  // for the content the tests write plus the arena's own rounding — eight of them, so no test is shaped by the
+  // fixture running out. Where the host offers no huge page the region falls back to the ordinary fixture size,
+  // since nothing can reserve a zone there anyway.
+  const SANDBOX_HUGE_PAGES: usize = 8;
+  let region_bytes = slates_machine::facts::huge_page_bytes()
+    .and_then(|bytes| usize::try_from(bytes).ok())
+    .map_or(PAGE * REGION_PAGES, |huge| huge * SANDBOX_HUGE_PAGES);
+  let mut arena = ChunkArena::new(PAGE);
+  arena
+    .add_region(Region::map(region_bytes, PAGE, true).unwrap())
+    .unwrap();
+  Store::new(
+    &StoreConfig {
+      page: PAGE,
+      cache_line: 64,
+      max_dirs: 1 << 16,
+      max_inodes: 1 << 16,
+      max_chunks: 1 << 16,
+      max_dir_blocks: 1 << 16,
+      dir_cutover: 4,
+    },
+    arena,
+    0,
+  )
+}
+
 /// A store whose chunk budget — and so its DAX mapping-registry cap (`DaxRegistry::new(max_chunks)`) — is
 /// `max_chunks`, small enough that a map-storm bound is reachable in a test.
 pub(crate) fn store_capped_chunks(max_chunks: usize) -> Store {
