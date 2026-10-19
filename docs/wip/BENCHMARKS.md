@@ -5291,6 +5291,10 @@ merge, remote/replicated volumes, post-quantum encryption in transit and at rest
 tracking. The honest position is that slates trades local per-op latency for those properties — the inverse of
 Tectonic's "trade latency for scale."
 
+> **Superseded 2026-10-19** (see "Condition 12 re-measured" above): the in-process figures in this section
+> stand, but the 276.9 µs they are set against does not reproduce — a create is 27–31 µs. The *conclusion* drawn
+> below, that most of a create is unaccounted for, is wrong; there was never a missing 259 µs.
+
 **Measured (2026-10-18), second cut: the bridge is not the missing time either — dispatch is 0.5 µs.** The
 decomposition below put ~94% of a create "between" the transport and the VFS. Driving the same FUSE opcodes
 in-process through the bridge narrows that further, and the answer is that the between-layer is not the bridge.
@@ -5335,6 +5339,9 @@ path — and in the overlay's base-plane work for the `--shared` half. That a GE
 Owed; it needs a Linux host quiet enough to profile, and both of mine are loaded (the box at 120–283 from another
 session all evening).
 
+> **Superseded 2026-10-19.** The share arithmetic here divides by a stale 276.9 µs. Re-measured, the transport
+> is most of a create, not 5% of it. The VFS and bridge measurements are sound; the percentages are not.
+
 **Measured (2026-10-18): the VFS primitive is 1% of a FUSE create, and the transport 5%. The other ~94% is the
 path between them.** The amendment below reasoned from the stat row that the round trip could not be most of a
 create; the in-process half is now measured rather than inferred.
@@ -5367,6 +5374,9 @@ are already microsecond-scale. It is the per-operation path the daemon runs betw
 calling the VFS. That is cross-platform work, it is the same path every transport shares (FUSE, NFS, virtio-fs),
 and it is where a profile should go next: `docs/wip/bench/fuse/fuse-perf.sh` runs 2,000 creates with `perf record`
 on the daemon and will name the symbols inside that 259 µs. Owed; it needs a Linux host quiet enough to profile.
+
+> **Superseded 2026-10-19 — and backwards.** It *is* most of it. This amendment reasoned from the stale row to
+> demote the round trip; the re-measurement promotes it back, which is where the lever list had it all along.
 
 **Amendment (2026-10-18): the table already bounds how much of this is the round trip, and it is not most of it.**
 The order of levers below leads with the FUSE/daemon round trip, and the same table prices that round trip: a **stat
