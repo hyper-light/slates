@@ -7945,6 +7945,26 @@ confined window. Checked on `adacachy` (the harness's recorded host, kernel 7.2.
   crosvm opens the kernel **before** it connects to the vhost-user backend, so there is no handshake to
   observe without one — the 2026-10-16 run must have had an image that has since gone.
 
-So the leg needs a kernel built to that config (hours of build, or a download of a sizeable third-party binary
-onto Ada's machine), and that is the whole of what is missing: the protocol gap is closed, the confinement is
-in and unit-proven, and the initramfs from the last run is still at `~/crosvm-ab/initramfs.cpio.gz`.
+**And the gap is smaller than "build a kernel".** The other Linux host here (`fedora`, x86_64, same
+architecture) has a stock kernel at `/boot/vmlinuz-6.19.10-300.fc44.x86_64` (18 MB) whose config already
+carries most of what the recipe asks for:
+
+| config | fedora's stock kernel |
+|---|---|
+| `CONFIG_FUSE_DAX` | **`=y`** |
+| `CONFIG_DAX` | **`=y`** |
+| `CONFIG_VIRTIO_PCI` | **`=y`** |
+| `CONFIG_SERIAL_8250_CONSOLE` | **`=y`** |
+| `CONFIG_FUSE_FS` | `=m` |
+| `CONFIG_VIRTIO_FS` | `=m` |
+
+Only the last two are wrong for this harness, and only because the initramfs is bare — a static `/init` with
+no module support, which is why the README asks for them built in. So the next step is one of two small
+things, not a kernel build: **carry `fuse.ko` and `virtiofs.ko` into the initramfs and `insmod` them in
+`/init`** before the mount (they are `.ko.xz` on Fedora, so they need decompressing first, and the kernel and
+modules must be copied to the crosvm host together), or build a kernel with those two `=y`.
+
+That is the whole of what is missing. The protocol gap is closed, the confinement is in and unit-proven, the
+host can create udmabufs unprivileged, and the initramfs from the last run is still at
+`~/crosvm-ab/initramfs.cpio.gz` waiting to be extended. It is a bounded piece of guest-side work on a shared
+box that is running someone else's CI, which is why it is written down here rather than started.
