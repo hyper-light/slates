@@ -8031,3 +8031,40 @@ detection-latency choice against a RAM cost, which is a posture decision rather 
 So the accurate statement is: **row 3 waits on row 4 (L1/hugetlb, the privileged layer); row 2 waits on a
 posture choice about RAM against detection latency.** Neither waits on a DRAM measurement, which is what I
 said twice and should have checked against §4.6 the first time.
+
+### 2026-10-19: row 4 does not need a privileged broker — the checklist conflated L1 with L2's trigger
+
+Row 4 reads "L1 — Physically-contiguous hugetlb zones + guard rows … Owed (needs a privileged broker)", and I
+have cited that all session as banned item #4, a capability I may not require without Ada's authorization.
+**It is wrong, and the error is traceable: §4.6 names a "privileged OS-shipped broker's PEBS/IBS" for L2's
+*adaptive trigger* — detecting a hammer signature — not for L1's zones.** The checklist carried the broker
+across to the wrong row.
+
+Measured on both Linux hosts, as uid 1000 with no `CAP_SYS_ADMIN`:
+
+```
+memfd_create(MFD_HUGETLB) as uid 1000: OK (no EPERM)
+  mmap: Cannot allocate memory        <- pool availability, not permission
+```
+
+`HugePages_Total: 0` on both, so the mapping fails for want of a reserved pool — **never for want of a
+privilege**. Physically-contiguous backing has two unprivileged routes:
+
+- **`MFD_HUGETLB`**, where the host has reserved a pool (`vm.nr_hugepages`). Reserving it is an administrator's
+  action on the host, exactly like `/dev/udmabuf`'s permissions are — a *deployment requirement*, not a
+  capability slates demands. R10 is satisfied the same way A-138 satisfies it: slates uses the facility where
+  it exists and **refuses** where it does not.
+- **THP**, which needs no pool and no privilege at all — `madvise(MADV_HUGEPAGE)`. It is `[always]` on
+  `adacachy` with 4,089,856 kB of anon huge pages already in use. Its contiguity is best-effort rather than
+  reserved, which is weaker for a security property, so it is a fallback to characterise rather than assume.
+
+So the corrected picture, and it is narrower than "authorize a privilege":
+
+| row | what it actually needs |
+|---|---|
+| 4 (L1 zones + guard rows) | a host hugepage pool, or THP; **buildable unprivileged**, no broker |
+| 3 (L2 wiring) | L1 first (without contiguity a shift is theatre); interval already derived at 16–32 ms; the *adaptive* trigger needs the broker, but the design calls that an optimization over unconditional migration measured at <0.01% |
+| 2 (B2 wiring) | a posture choice: what to guard, detection latency against 2× mapped-content RAM |
+
+Neither host has a pool, so an `MFD_HUGETLB`-backed arena cannot be exercised here until one is reserved —
+a one-line `sysctl` an administrator runs, which is what to ask for rather than a broker.
