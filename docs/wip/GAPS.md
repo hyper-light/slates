@@ -7214,9 +7214,19 @@ the next one cannot miss it. Verified non-vacuously by scaling: the DAX schedule
 |---|---|---|---|
 | `a_random_interleaving_never_shows_a_live_mapping_stale_or_foreign_bytes` (`vfs/tests/dax.rs`) | 150 | **20,000** (133×) | 12.60 s, green |
 | `a_random_window_schedule_never_shows_the_guest_a_foreign_byte` (`bridge-virtiofs/tests/device.rs`) | 80 | **2,000** (25×) | 0.24 s, green |
+| `slates-db --test model` (generated histories, dropped and recovered at random points) | 60 | **1,500** (25×) | 9.73 s, 14/14 green |
+| `slates-vfs --test charge_oracle` (the quota charge oracle) | 150 | **2,000** (13×) | 26.75 s, green |
+| `slates-vfs --test allocate` | 128 | **2,000** (16×) | 1.19 s, 5/5 green |
+| `slates-vfs --test clones` | 200 | **1,500** (8×) | 0.17 s, green |
 
-Both cover this session's DAX work — the pin dedup and the snapshot-recall exclusion — so the gate's
-interleavings are now swept two orders deeper than the committed defaults, on demand and by anyone.
+The two DAX schedules cover this session's work — the pin dedup and the snapshot-recall exclusion — so the
+gate's interleavings are now swept two orders deeper than the committed defaults, on demand and by anyone. The
+database's recovery model at 1,500 generated histories is the deepest that oracle has been run; its committed
+default of 60 was the shallowest in the tree.
+
+Non-vacuity for the four below the DAX rows rests on the scaling check above rather than on four more of them:
+every suite calls the *same* `cases()` function, so the one demonstration that the environment reaches it
+covers them all. That is the argument for one definition over eighteen.
 
 ### 2026-10-18 (close of day): what a clean `cargo test --workspace` says now
 
