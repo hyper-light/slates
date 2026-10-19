@@ -8256,3 +8256,29 @@ met in a new place.
 **Still owed, and now the only thing owed for the Rowhammer layers:** `dax_migrate`'s production caller. §4.6's
 own measurement affords the unconditional sweep at the 16–32 ms cadence without any new signal; the device's
 backend-initiated remap of the guest window goes with it.
+
+### 2026-10-19: what L2's caller must also carry — three facts read out of the device, not guessed
+
+Before writing the sweep, the device half it depends on was read rather than assumed. Three things it says:
+
+1. **The device can already remap a window in place.** `teardown_dax_window` in `crates/bridge-virtiofs/src/device.rs`
+   documents itself as "shared by REMOVEMAPPING, **a remap over the same window region**, and the terminal
+   teardown", and `rollback_dax_setup` already finds entries by overlapping window range. So a backend-initiated
+   remap does not need a new teardown path — it needs a daemon→device *signal* and a map at a known `moffset`.
+2. **`Volume::dax_migrate` does not tell the device.** It calls `Store::dax_revoke_pending` for the old mapping but
+   never `enqueue_pending_revoke`; the only two callers of that are `dax_revoke_inode` and
+   `dax_revoke_writable_of_prefix` (grep, 2026-10-19). That is deliberate — §4.6 says an inode-global revoke "would
+   tear every window of the inode rather than move the one that is being shifted" — but it means a caller that
+   migrates today leaves the device's window entry naming a mapping the registry no longer holds, with no
+   notification. Whoever writes the sweep must pick: the backend-initiated remap, or the revoke-and-refault the
+   design already sanctions ("or a decision to use the revoke-and-refault path instead and accept the tear").
+3. **The message-based placer's map is chain-shaped, and a daemon-initiated one has no chain.** A `SHMEM_MAP` under
+   `DaxPlacer::Message` parks the guest's chain and is finished by `complete_parked_map`, which "scatters the reply
+   and publishes the used element" — it exists to answer a guest request. A remap the *daemon* started has no
+   request to answer, so the message placer needs a second, chain-less completion arm before the backend-initiated
+   remap can work there. The `Local` placer has no such problem: its map is synchronous. This is the piece of the
+   device half that is actual new design, and it is why the choice in (2) matters.
+
+Also swept: `vfs_dax_errno` had a `_ => EINVAL` catch-all, so the new `NoPhysicalIsolation` would have reached a
+guest as "invalid argument" rather than "unsupported". Named explicitly beside `SpecialFileOperation` as
+`EOPNOTSUPP`, which is what it is: the host will not do that, not the caller asked wrongly.

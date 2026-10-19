@@ -1450,7 +1450,9 @@ fn vfs_dax_errno(e: &slates_vfs::error::VfsError) -> i32 {
     E::NotPermitted | E::LinkProtected => dax_errno::EPERM,
     E::NotFound | E::StaleHandle => dax_errno::ENOENT,
     E::NoSpace | E::FileTooLarge => dax_errno::ENOSPC,
-    E::SpecialFileOperation => dax_errno::EOPNOTSUPP,
+    // Both are "this host will not do that", not "you asked wrongly": the second is §4.6 L1 refusing a shift on
+    // a host that cannot back a physically-contiguous sandbox for it.
+    E::SpecialFileOperation | E::NoPhysicalIsolation => dax_errno::EOPNOTSUPP,
     _ => dax_errno::EINVAL,
   }
 }
