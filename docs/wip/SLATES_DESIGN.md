@@ -2841,13 +2841,20 @@ same-namespace host process is the first delivered case.
 >      any row that left (an ordinary delete or truncate frees a block by a path the zone does not sit on) is
 >      re-claimed before the next grant. The cost is one huge page per tenant that shifts, flat and capped, which
 >      is §4.6's "footprint stays capped": there is no quarantine pool to exhaust.
->      **Deployment note.** The arena is a shared memory object, so the setting that governs it is
->      `transparent_hugepage/shmem_enabled`, *not* `transparent_hugepage/enabled` — a host can have the second on
->      and the first off and get no sandbox at all. Measured 2026-10-19: adacachy (6.x, `shmem_enabled=[advise]`)
->      reserves sandboxes in the daemon's own object and every L1 test runs; fedora 6.19.10
->      (`enabled=[madvise]`, `shmem_enabled=[never]`) backs private mappings but not the object, so the shift is
->      refused there and `a_sandbox_is_reserved_in_the_shared_object_a_daemon_serves_dax_from` skips loudly. A
->      low-trust *sacrificial pool* may deliberately co-locate mutually-untrusted tenants so they absorb each
+>      **Deployment note.** The arena is a shared memory object, so the preference that governs it is
+>      `transparent_hugepage/shmem_enabled`, not `transparent_hugepage/enabled`; the `MADV_COLLAPSE` ask above
+>      goes through either way, so a deployment does not have to tune that knob, but a host that cannot find the
+>      contiguous memory still gets no sandbox and the shift is refused.
+>      **Measured across the platforms and architectures slates targets, 2026-10-19** — the whole DAX suite
+>      (59 tests), the device seam (36) and the daemon (23):
+>      | Host | THP | L1 sandbox | Result |
+>      |---|---|---|---|
+>      | macOS 15 aarch64 | none for user programs (Appendix C) | refused | 59 pass, sandbox tests skip loudly |
+>      | Linux x86_64 (adacachy, `shmem_enabled=[advise]`) | 2 MiB | reserved | 59 pass, no skip |
+>      | Linux x86_64 (fedora 6.19.10, `shmem_enabled=[never]`) | 2 MiB | reserved via `MADV_COLLAPSE` | 59 pass, 0–4 skips by host state |
+>      | Linux aarch64 (4 KiB base page) | 2 MiB | reserved | 59 pass, device seam 36 pass, daemon 23 pass |
+>      | Windows x86_64 (cross-lint, `x86_64-pc-windows-gnu`) | large pages need a privilege R10 refuses | refused | clippy clean over the Windows-buildable crates |
+>      A low-trust *sacrificial pool* may deliberately co-locate mutually-untrusted tenants so they absorb each
 >      other's leakage rather than the host — sound only paired with B2, and not built.
 >    - **L2 — moving target (built, 68b4a9c5).** `Volume::dax_migrate` relocates a writable block to a physically
 >      different block under the two-phase revoke (the new block pinned and its mapping minted before the old is
