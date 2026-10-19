@@ -7717,3 +7717,29 @@ data race `race_canary` keeps for the TSan lane). And the gap that let this happ
 `cargo xtask check` governs the iteration count of a hand-rolled randomized or exhaustive loop the way it
 governs a `proptest!` suite's cases, so the next one written will cost the next Miri run its budget with
 nothing to catch it.
+
+### 2026-10-19: how far the Windows cross-lint actually reaches from a Mac, and the comment that said otherwise
+
+Today's 14 changed crates were linted for `x86_64-pc-windows-msvc` from this machine. **Seven passed**
+`-D warnings`: `slates-machine`, `slates-test-seeds`, `slates-mem`, `slates-rt`, `slates-db` and `slates-ipc`
+with `--all-targets`, and `slates-client --lib`. `slates-ipc` is the one that matters most, because
+`rendezvous.rs` is the canonical paired-`#[cfg]` module whose Windows branch this machine is otherwise never
+the compiler for.
+
+**The other seven cannot be linted here, and the manifest said they could.** `crates/archive/Cargo.toml` read
+"the cross-compile lint gate runs `--no-default-features` and so does not need a C cross-toolchain for the
+Windows/Linux targets". That is false and is corrected in this change. `zstd` is optional in `slates-archive`,
+but `slates-vfs`, `slates-server` and `slates-cluster` each declare `slates-archive = { workspace = true }`
+with no `default-features = false` and forward no feature of their own, so **the dependency edge requests the
+default and the CLI flag cannot reach it** — `cargo tree --target x86_64-pc-windows-msvc --workspace
+--no-default-features -e normal` still resolves `zstd-sys`, and `aws-lc-sys` with it. Both then need an MSVC
+C toolchain that macOS does not have (`cc --target=x86_64-pc-windows-msvc` cannot find `stdlib.h`).
+
+**What it would take, and why it was not done here.** Either (a) `default-features = false` on those three
+edges plus a default-on forwarding feature through every dependent — the shape `slates-client`'s `pure-hash`
+already uses for blake3, but ten-plus manifests and a change to *production* feature defaults, where a slip
+silently drops the ratio codec from release builds; or (b) a Windows C toolchain on a runner. Neither host
+here has one: `fedora` has no zig, no mingw, no clang and no Windows rustup target, and `adacachy` has
+`cargo-zigbuild` but not the pinned 1.98 toolchain. Installing either is a tool install on Ada's machines.
+Until one of those happens the remaining crates are **CI's Windows lane only**, which is where NASM for
+`aws-lc-sys` already lives.

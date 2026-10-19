@@ -11,9 +11,15 @@ description = "The archive format (D-17, §4.16 archive, research/compression-ar
 [dependencies]
 blake3 = { workspace = true }
 lz4_flex = { workspace = true }
-# zstd is the C-backed ratio codec (D-17). It is a default feature so native builds use it, but the
-# cross-compile lint gate runs `--no-default-features` and so does not need a C cross-toolchain for
-# the Windows/Linux targets; a `ruzstd` decode-only fallback for those builds is owed (GAPS §8g).
+# zstd is the C-backed ratio codec (D-17), optional and on by default so native builds use it.
+# `--no-default-features` turns it off **for this crate only**: `slates-vfs`, `slates-server` and
+# `slates-cluster` each declare `slates-archive = { workspace = true }` without `default-features = false`
+# and forward no feature, so their edge requests the default and zstd is on however the gate is invoked —
+# measured 2026-10-19, `cargo tree --target x86_64-pc-windows-msvc --workspace --no-default-features`
+# still resolves zstd-sys. A cross-lint of those crates therefore does need a C toolchain for the target
+# today; making the gate reach them is `default-features = false` plus a default-on forwarding feature
+# through each dependent (the shape `slates-client`'s `pure-hash` already uses for blake3). A `ruzstd`
+# decode-only fallback for those builds is owed (GAPS §8g).
 zstd = { workspace = true, optional = true }
 
 [features]
