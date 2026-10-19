@@ -308,6 +308,39 @@ fn the_init_reply_has_the_headers_layout() {
   );
 }
 
+/// The page count slates offers sits in the low half of `fuse_init_out`'s word at offset 28, with
+/// `map_alignment` zero in the high half. The layout test above does not cover that word — it did not need to
+/// while slates wrote a zero there — and a count written at the wrong offset would land in `max_write` or
+/// `flags2` with no other assertion noticing.
+#[test]
+fn the_init_reply_offers_its_page_count_in_the_word_at_twenty_eight() {
+  let mut body = vec![0u8; 64];
+  put_u32(&mut body, 0, 7);
+  put_u32(&mut body, 4, 46);
+  put_u32(&mut body, 8, 1 << 20);
+  put_u32(&mut body, 12, u32::MAX);
+  put_u32(&mut body, 16, u32::MAX);
+  let reply = negotiate(&body, slates_bridge_core::CacheCoherence::Invalidated)
+    .unwrap()
+    .to_bytes();
+  let word = u32_at(&reply, 28);
+  assert_eq!(
+    u16::try_from(word & 0xFFFF).unwrap_or(0),
+    slates_bridge_fuse::init::max_pages(),
+    "max_pages is the low half of the word at 28"
+  );
+  assert_ne!(
+    word & 0xFFFF,
+    0,
+    "a page count is offered, not left at the kernel's default"
+  );
+  assert_eq!(
+    word >> 16,
+    0,
+    "map_alignment is the high half, and slates asks for no alignment"
+  );
+}
+
 /// The `FATTR_*` bits and the `renameat2` flags carry the headers' values.
 #[test]
 fn setattr_and_rename_flags_carry_the_headers_bits() {
