@@ -2245,7 +2245,11 @@ notifier encoder alone cannot justify them. Unsupported semantics are explicitly
 Live source names/attributes/content cannot have an indefinite kernel cache lifetime:
 watchers may miss outsider writes. Current-state operations revalidate through the base seam;
 only pinned/immutable views can justify retention without a source check. A transport that
-cannot implement the requested coherence refuses that guarantee. §4.15 supplies the source
+cannot implement the requested coherence refuses that guarantee. **A lookup miss is `ENOENT`, never a cached
+negative entry** (A-137): a negative entry can only be ended by `FUSE_NOTIFY_INVAL_ENTRY`, Linux 6.19 refuses
+that for a negative dentry, and nothing else clears it — so its delivery is not proven and an infinite lifetime
+for it is not available under the rule above. Positive entries, attributes, pages and listings keep their
+lifetimes, because the kernel honours *their* invalidation. §4.15 supplies the source
 validation rules; finite stale-data TTLs do not silently become exact live-source semantics. The
 launcher (`slates exec`) implements the chosen-path form with `CLONE_NEWUSER|CLONE_NEWNS`,
 recursive-private root, and a bind mount; on AppArmor-restricted hosts it reports the exact
@@ -11700,6 +11704,15 @@ Applied in the same change to: §4.6 (the same-kernel direct map paragraph + its
 - Realized: `RequestBody::MapRead`/`ReplyBody::Mapped`; `Control::send_mapping`/`Liveness::recv_mapping`/`ClientEnd::recv_mapping`; `Volume::dax_map_read` + `Store::dax_backing` reused; `merge_service::map_read`/`try_local_map`; `Client::map_read` → `MappedRead`. Proven end to end on x86_64 Linux (`a_same_kernel_client_maps_a_file_with_no_copy`).
 - Fixes a latent arena bug the first real descriptor map surfaced: `ChunkArena::block_backing` returned a region-relative offset against the whole-object descriptor, which would have mis-mapped the guest DAX window too; `ExclusiveObject`/`Region`/`block_backing` now return the descriptor-absolute offset (`base + extent.offset()`).
 - Does not change: the guest DAX gate's own contract (still unadvertised, Ada-gated); the copy transport (the universal base); the single-binary model (no VMM embedded). Owed: the cross-shard owner→home descriptor hand-off; an explicit release on the client's drop; the macOS control socket (stubs refuse → copy).
+
+### A-137 — A lookup miss is `ENOENT` again: a negative entry's invalidation is not proven (accepted 2026-10-19)
+Applied in the same change to: §4.6 (cache posture), `crates/bridge-fuse/src/bridge.rs`, `crates/bridge-fuse/tests/dispatch.rs`, BENCHMARKS.md (c3c0024b's table), GAPS, `docs/bugs/2026-10-19-linux-6-19-refuses-the-entry-invalidation-slates-swallows.md`.
+- Changes §4.6: a lookup miss is answered `ENOENT` and is no longer a cached negative entry (node id 0 with the directory's lifetime), which it had been since `c3c0024b`. Positive entries, attributes, pages and listings are unchanged.
+- Evidence: Linux 6.19.10 refuses `FUSE_NOTIFY_INVAL_ENTRY` for a negative dentry with `ENOENT` and goes on answering from it, so a name another attachment creates is never seen through the mount; the same code passes on 6.12 (x86_64 userspace on both, so not an architecture difference). Six causes were eliminated by measurement first, including a true drop rather than an expire, and an invalidation of the parent inode — no notification clears it. A runtime degrade cannot rescue it either: by the time a refusal is observed the kernel already holds the entry with an unbounded lifetime.
+- Why the rule decides it rather than a preference: §4.6 already required "proven invalidation delivery" for an infinite lifetime, and delivery for this case is now disproven on a shipping kernel. R4 does not allow the cost to be weighed against it.
+- Cost, measured: five interpreter starts over a mount (a workload built of repeated misses) cost 273 daemon reads with the negative entries and 310 without — **+14%**, two interleaved rounds, non-overlapping, Fedora 6.19, 2026-10-19. The earlier −28% figure covered negative entries, kept pages and listings together; the other two are untouched.
+- Proven: `coherence_mount` and `owner_turn` go from red to green on 6.19, with `fuse_mount` 3, `nfs_mount` 38, `cli` 33 and the bridge-fuse lib 13 unchanged.
+- What it does not change: the `Invalidated` posture itself, the invalidation machinery, or any other transport (a virtio-fs guest already got lifetime 0).
 
 ### A-136 — Linux runs on epoll; the io_uring driver is removed (accepted 2026-10-18)
 Applied in the same change to: D-9 (decision text and evidence tier), §4.3 (Drivers, Loop, the readiness follow-up, the 2026-09-19 driver-retirement follow-up), `crates/rt` (`driver.rs`, `lib.rs`, `epoll.rs`, `readiness.rs`, `tests/reclaim.rs`, `Cargo.toml`), the workspace `Cargo.toml`, `unsafe-budget.toml` (slates-rt 75 → 73), `docs/wip/BENCHMARKS.md` (the A/B that decided it).

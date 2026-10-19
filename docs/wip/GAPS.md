@@ -7676,6 +7676,16 @@ narrow: only the *negative*-entry lifetime must stop being unbounded. Positive e
 apart from the other two and must be before this is priced. Still a §4.6 amendment with a derived bound, and
 still not improvised here, but a much smaller one than this entry first claimed.
 
+**Fixed the same day, as A-137.** Once the hole was known to be narrow, the measurement existed and the rule
+was checked, there was nothing left to defer: §4.6 already required *proven* invalidation delivery for an
+infinite lifetime, delivery for a negative entry is disproven on a shipping kernel, and R4 forbids weighing the
+cost against it. A lookup miss is `ENOENT` again. Cost, measured on its own for the first time: five
+interpreter starts over a mount cost **273** daemon reads with the negative entries and **310** without,
+**+14%** (268/278 against 298/323, interleaved, non-overlapping). **`coherence_mount` and `owner_turn` are
+green on 6.19**, and `fuse_mount` 3, `nfs_mount` 38, `cli` 33 and the bridge-fuse lib 13 are unchanged. §4.6,
+the amendment log, `BENCHMARKS.md`'s `c3c0024b` table and the `dispatch.rs` test that asserted the old promise
+moved with it.
+
 **Why it matters.** §4.6's `Invalidated` posture is the promise that a change made through one attachment is
 pushed to the kernel's caches; `coherence_mount` is the proof of it, and on 6.19 a name another attachment
 creates is never seen through the mount at all. If the cause is a kernel change at or after 6.13, slates'

@@ -2527,6 +2527,13 @@ the NFS loopback mount with no privilege, against APFS, alternating, three round
 - **A lookup miss is a negative entry** (node id 0), cached for its directory's lifetime: forever for the volume's
   own directories, whose every name change through another attachment is invalidated, and bounded for a live base.
   A virtio-fs guest, with no invalidation channel, gets lifetime 0.
+  **Reversed on 2026-10-19 (A-137), and this row's share of the −28% with it.** The premise — "whose every name
+  change through another attachment is invalidated" — is false on Linux 6.19, which refuses
+  `FUSE_NOTIFY_INVAL_ENTRY` for a negative dentry and keeps answering from it, so a name a neighbour creates is
+  never seen. A miss is `ENOENT` again. Re-measured on its own, which this table never did: five interpreter
+  starts over a mount cost **273** daemon reads with the negative entries and **310** without (+14%; two
+  interleaved rounds, 268/278 against 298/323, non-overlapping, Fedora 6.19). The other two mechanisms in this
+  table — kept pages and kept listings — are untouched, and so are their rows.
 - **Open flags.** `FOPEN_KEEP_CACHE` for the volume's own files, and `FOPEN_CACHE_DIR` for its directories:
   the kernel keeps pages and listings across opens. `FOPEN_NOFLUSH` for a read-only handle: no `FLUSH`, and no
   barrier, at its close.

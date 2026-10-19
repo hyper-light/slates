@@ -17,7 +17,6 @@ use slates_bridge_core::{
   View,
 };
 use slates_bridge_fuse::abi::{IN_HEADER_LEN, OUT_HEADER_LEN, Opcode};
-use slates_bridge_fuse::bridge::CACHE_FOREVER;
 use slates_bridge_fuse::bridge::{
   Bridge, DirEntry, EILSEQ, EIO, ENOSYS, Reclaimed, reclaim_unreported,
 };
@@ -456,11 +455,6 @@ fn message(opcode: u32, unique: u64, nodeid: u64, body: &[u8]) -> Vec<u8> {
   m
 }
 
-/// Whether a reply is a negative entry: success, node id 0.
-fn is_negative_entry(out: &[u8]) -> bool {
-  out[4..8] == [0u8; 4] && u64::from_le_bytes(out[16..24].try_into().unwrap()) == 0
-}
-
 fn reply_error(out: &[u8], n: usize) -> i32 {
   assert_eq!(n, OUT_HEADER_LEN);
   i32::from_le_bytes(out[4..8].try_into().unwrap())
@@ -582,12 +576,15 @@ fn reply_times(out: &[u8]) -> (u64, u64) {
   (mtime, ctime)
 }
 
-/// LOOKUP reaches the bridge and its entry reply decodes; a missing name is a negative entry (node id 0) cached
-/// for its directory's lifetime, so the kernel answers the next probe of that name itself (§4.6 "Cache posture":
-/// a create through any attachment invalidates the name, as it does a positive entry). Python's imports and pip
-/// probe thousands of absent names; answered `ENOENT`, each probe was a round trip to the daemon.
+/// LOOKUP reaches the bridge and its entry reply decodes; a missing name is **`ENOENT`**, never a cached
+/// negative entry (§4.6 "Cache posture": an infinite lifetime needs *proven* invalidation delivery). It was a
+/// cached negative entry between `c3c0024b` and 2026-10-19 — Python's imports and pip probe thousands of absent
+/// names, and each probe was a round trip — but Linux 6.19 refuses the invalidation that would end it and keeps
+/// answering from the stale entry, so the name a neighbour creates is never seen
+/// (`docs/bugs/2026-10-19-linux-6-19-refuses-the-entry-invalidation-slates-swallows.md`). This test is the one
+/// that would go green again if that caching came back, so it is where the rule is stated.
 #[test]
-fn lookup_dispatches_and_a_miss_is_a_negative_entry_cached_for_its_directorys_lifetime() {
+fn lookup_dispatches_and_a_miss_is_enoent_never_a_cached_negative_entry() {
   let mut m = mock();
   let mut out = [0u8; 512];
   let n = dispatch(
@@ -618,21 +615,12 @@ fn lookup_dispatches_and_a_miss_is_a_negative_entry_cached_for_its_directorys_li
     &mut m,
     &mut out,
   );
-  assert_eq!(n, OUT_HEADER_LEN + EntryOut::LEN, "a full entry reply");
+  assert_eq!(n, OUT_HEADER_LEN, "an error reply carries no body");
   assert_eq!(
-    u32::from_le_bytes(out[4..8].try_into().unwrap()),
-    0,
-    "success, not ENOENT"
-  );
-  assert_eq!(
-    u64::from_le_bytes(out[16..24].try_into().unwrap()),
-    0,
-    "node id 0: a negative entry"
-  );
-  assert_eq!(
-    u64::from_le_bytes(out[32..40].try_into().unwrap()),
-    CACHE_FOREVER,
-    "entry_valid: the root directory's lifetime (the volume's own, forever)"
+    i32::from_le_bytes(out[4..8].try_into().unwrap()),
+    -2,
+    "ENOENT, not a cached negative entry: the kernel must ask again, because on a kernel that refuses \
+     FUSE_NOTIFY_INVAL_ENTRY nothing could ever tell it the name had appeared"
   );
   assert_eq!(m.referenced, 1, "a LOOKUP miss takes no reference");
 }
@@ -1527,10 +1515,12 @@ fn reclaiming_an_unreported_reply_gives_back_exactly_what_it_granted() {
     &mut m,
     &mut out,
   );
-  // The miss is a negative entry (node id 0): a lost reply of it granted nothing, so nothing is reclaimed.
-  assert!(
-    is_negative_entry(&out),
-    "the lookup missed as a negative entry"
+  // The miss is `ENOENT` (§4.6: a negative entry would need an invalidation the kernel may refuse): an error
+  // reply granted nothing, so nothing is reclaimed.
+  assert_eq!(
+    i32::from_le_bytes(out[4..8].try_into().unwrap()),
+    -2,
+    "the lookup missed with ENOENT"
   );
   assert_eq!(
     reclaim_unreported(Some(Opcode::Lookup), 1, &out[..n], &mut m, &cx),

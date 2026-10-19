@@ -1,7 +1,9 @@
 # Linux 6.19 refuses `FUSE_NOTIFY_INVAL_ENTRY` with `ENOENT`, and slates reads that as "nothing stale"
 
-Status: **root cause confirmed by instrumentation. The silent half is fixed — the refusal is counted, not
-discarded. The posture half is a §4.6 decision and is Ada's call.**
+Status: **FIXED (A-137).** A lookup miss is `ENOENT` again, never a cached negative entry, so the hole is
+closed on every kernel; `coherence_mount` and `owner_turn` are green on 6.19. The refusal is also counted
+rather than discarded (`fuse.entry_invalidation_refused`). The kernel's own behaviour is unchanged and is
+worth tracking upstream; the counter is what will say if it changes.
 
 ## Description
 
@@ -181,8 +183,19 @@ So the only fix that closes the hole is to not grant it in the first place:
 - **Also required in the same change (CLAUDE.md):** §4.6's cache-posture paragraph and its status blockquote,
   the amendment log, and `c3c0024b`'s claim in `BENCHMARKS.md`, since this partly reverses it.
 
-That is a change to a shipped caching promise on **every** platform, reversing a measured optimization, so it
-is written up here rather than taken unilaterally. The analysis above is complete enough to act on in one pass.
+**Taken, as A-137.** It is a change to a shipped caching promise on every platform and it reverses a measured
+optimization, so it was not taken until the measurement existed and the rule was checked: §4.6 already required
+*proven* invalidation delivery for an infinite lifetime, delivery for this case is disproven on a shipping
+kernel, and R4 forbids weighing the cost against it. Measured cost: five interpreter starts over a mount —
+a workload of repeated misses — cost **273** daemon reads with the negative entries and **310** without,
+**+14%** (268/278 against 298/323, two interleaved rounds, non-overlapping, Fedora 6.19, 2026-10-19).
+Result: `coherence_mount` and `owner_turn` **green** on 6.19, with `fuse_mount` 3, `nfs_mount` 38, `cli` 33 and
+the bridge-fuse lib 13 unchanged. §4.6, the amendment log, `BENCHMARKS.md`'s `c3c0024b` table and the
+`dispatch.rs` test that asserted the old promise all moved in the same change.
+
+If the kernel is fixed upstream and the caching is wanted back, this is the row to restore and the number to
+beat: it is one branch in `serve_lookup`, and the test that now states the rule is
+`lookup_dispatches_and_a_miss_is_enoent_never_a_cached_negative_entry`.
 
 ## Reproduction
 

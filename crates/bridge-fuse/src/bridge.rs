@@ -689,21 +689,23 @@ fn serve_lookup(
     Err(e) => return reply_err(req.header.unique, e, out),
   };
   let looked = bridge.lookup(parent, cx, name);
-  let valid = valid_for(bridge, cx, parent.inode);
-  if matches!(looked, Err(VfsError::NotFound)) && valid != (0, 0) {
-    // A miss is a negative entry (node id 0, no reference taken), cached for the directory's lifetime: the
-    // kernel answers the next probe of the name itself. Every way a name appears through another attachment
-    // invalidates it (`Invalidation::Entry` for create, mknod, mkdir, link, symlink, a rename's target), and a
-    // live base directory's lifetime is bounded, as its positive entries' are (§4.6 "Cache posture"). With no
-    // lifetime (a virtio-fs guest, which has no invalidation channel) there is nothing to cache, so the miss is
-    // `ENOENT`, as it was: the same to the kernel, and what a guest has always been told.
-    let negative = EntryOut {
-      entry_valid: valid.0,
-      entry_valid_nsec: valid.1,
-      ..EntryOut::default()
-    };
-    return reply(req.header.unique, Ok(negative), |e| e.to_bytes(), out);
-  }
+  // A miss is `ENOENT`, never a cached negative entry.
+  //
+  // It was one, briefly (`c3c0024b`): node id 0 with the directory's lifetime, so the kernel could answer the
+  // next probe of the name itself. §4.6 allows that only on "**proven** invalidation delivery", and the proof
+  // has since failed. Linux 6.19 refuses `FUSE_NOTIFY_INVAL_ENTRY` for a *negative* dentry with `ENOENT` and
+  // goes on answering from it, so a name another attachment creates is invisible to this mount for as long as
+  // it lives — and nothing recovers it, because by the time the refusal is seen the kernel already holds the
+  // entry with an unbounded lifetime. No notification clears it: a true drop rather than an expire, and an
+  // invalidation of the parent inode, were both measured and both refused
+  // (`docs/bugs/2026-10-19-linux-6-19-refuses-the-entry-invalidation-slates-swallows.md`). The kernel still
+  // honours a *positive* entry's invalidation, which is why only this one case is given up; deletes, renames,
+  // attributes, pages and listings all keep their lifetimes.
+  //
+  // The cost is measured, not assumed: five interpreter starts over a mount cost 273 daemon reads with the
+  // negative entries and 310 without, +14% on a workload built of repeated misses (two interleaved rounds,
+  // non-overlapping, Fedora 6.19, 2026-10-19). R4 does not allow that to be weighed against a name a user
+  // cannot see.
   let result = looked.and_then(|n| referenced(bridge, cx, n));
   let result = entry_reply(bridge, cx, result);
   reply(req.header.unique, result, |e| e.to_bytes(), out)

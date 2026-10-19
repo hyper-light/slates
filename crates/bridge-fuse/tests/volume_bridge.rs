@@ -117,9 +117,9 @@ fn ok(out: &[u8]) -> bool {
   u32::from_le_bytes(out[4..8].try_into().unwrap()) == 0
 }
 
-/// Whether a LOOKUP reply says the name is absent. This context revalidates (it has no invalidation channel), so a
-/// miss has no lifetime to cache and is `ENOENT`; a negative entry is for a context the kernel can be told about
-/// (`dispatch.rs`, and a real kernel in `coherence_mount.rs`), §4.6 "Cache posture".
+/// Whether a LOOKUP reply says the name is absent. A miss is `ENOENT` for every context since A-137: a cached
+/// negative entry can only be ended by an invalidation Linux 6.19 refuses, so §4.6's "proven delivery" rule no
+/// longer allows one.
 fn absent(out: &[u8]) -> bool {
   i32::from_le_bytes(out[4..8].try_into().unwrap()) == -ENOENT
 }
