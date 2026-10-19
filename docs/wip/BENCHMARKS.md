@@ -5163,6 +5163,28 @@ bridge path (FUSE codec + dispatch + the VFS create) is **0.5 µs** (`shards_fs_
 About half the daemon's CPU is the kernel's FUSE and syscall paths and a fifth is the runtime's epoll wait; its
 own filesystem work barely registers. 164 samples, so the shape is sound and the digits are not.
 
+**The three-way table, re-run like-for-like (2026-10-19).** Same container, same run, same 500-file base, 2,000
+creates each with `creates.py`; overlayfs `lowerdir`/`upperdir`/`workdir` on a tmpfs, slates `--shared` over the
+same tree:
+
+| op, p50 (p99) | tmpfs | overlayfs | slates (FUSE) | slates vs overlayfs |
+|---|---|---|---|---|
+| create | 1 µs (3) | 2 µs (4) | 31 µs (95) | **16×** |
+| write | 1 µs (2) | 1 µs (2) | 14 µs (36) | **14×** |
+| close | 0 µs (0) | 0 µs (0) | 13 µs (25) | — |
+| stat | 0 µs (1) | 1 µs (1) | 27 µs (51) | **27×** |
+
+**The multiples are now uniform, and that is the finding.** The superseded row reported 12–325× with the write
+path as a wild outlier (create 55×, rewrite 147×, create+fsync 325×). Re-measured, every operation sits in a
+14–27× band — because every operation pays the same ~25 µs round trip and almost nothing else. There is no
+"write path problem"; there is one transport cost, charged once per message, and the kernel's in-kernel
+filesystems pay 1–2 µs for the same work because they are in the kernel.
+
+Conditions: Docker Desktop (kernel 6.12.76-linuxkit) on an 18-core aarch64 Mac, host load 25–27, release build,
+one run per arm rather than best-of-N, p50/p99 over 2,000 files (the superseded row used 3,000 and reported
+p999/max as well). Owed: the same on x86_64, and the `create+fsync` arm, which the old row put at 325× and this
+harness does not drive.
+
 **So the lever is the round trip, and it is ~22 µs.** Against tmpfs's 1 µs create slates is ~27×, not the ~55×
 the stale row implies against overlayfs. The in-design levers that attack the round trip — FUSE writeback
 caching and a larger `max_write` to batch, and virtio-fs + DAX to replace the round trip with a page-table
