@@ -4849,6 +4849,66 @@ fn write_through_a_kill(instance: &str, paths: &[String], firsts: &[usize]) -> V
 #[cfg(target_os = "linux")]
 const EIO: i32 = 5;
 
+/// Shape: how long the in-flight resend test may run before it is treated as wedged rather than merely slow.
+/// Every wait inside a cycle is already bounded -- at most one [`START_WAIT`] for the restarted daemon to answer
+/// and one [`WAIT_FOR`] for the writers to reach their stride -- so [`IN_FLIGHT_ATTEMPTS`] cycles cannot honestly
+/// outlast their sum: past it no deadline inside the test can still be pending, and the one thing left that waits
+/// with no deadline of its own is a writer parked in `write(2)` for a resend that never came. For scale, the run
+/// that forced every cycle took 2.1 s and the mean run 0.49 s, so this is two orders of magnitude of headroom.
+#[cfg(target_os = "linux")]
+const RESEND_WEDGED_AFTER: Duration = Duration::from_secs(
+  START_WAIT
+    .as_secs()
+    .saturating_add(WAIT_FOR.as_secs())
+    .saturating_mul(IN_FLIGHT_ATTEMPTS as u64),
+);
+
+/// Set while the in-flight resend test runs, cleared when its guard drops. A process-lifetime word rather than a
+/// shared pointer: slates shares a word that way and never by reference counting (D-8).
+#[cfg(target_os = "linux")]
+static RESEND_FINISHED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Fails the run loudly if the in-flight resend test wedges, instead of hanging until CI's own timeout.
+///
+/// The test's own words are that without the kernel's resend (A-61) a writer "would wait forever", and the join
+/// that collects the writers carries no deadline, so that is precisely what the suite does. One binary of this
+/// test was found still parked 29 hours after the harness that launched it died: six threads idle, four of them
+/// writers, and the daemon it had killed still unreaped (2026-10-19). A writer stuck inside `write(2)` cannot be
+/// unwound from within the test -- its thread is in the kernel on a file call -- so the guard aborts the process
+/// with a named reason, which `cargo test --workspace` reports rather than sitting on. Same answer and same
+/// mechanism as the scoped mount's guard in `crates/server/tests/fuse_mount.rs`.
+#[cfg(target_os = "linux")]
+struct ResendWatchdog;
+
+#[cfg(target_os = "linux")]
+impl ResendWatchdog {
+  fn set() -> ResendWatchdog {
+    RESEND_FINISHED.store(false, std::sync::atomic::Ordering::Relaxed);
+    std::thread::spawn(|| {
+      let until = Instant::now() + RESEND_WEDGED_AFTER;
+      while Instant::now() < until {
+        if RESEND_FINISHED.load(std::sync::atomic::Ordering::Relaxed) {
+          return;
+        }
+        pause();
+      }
+      eprintln!(
+        "WEDGED: the in-flight resend test made no progress in {RESEND_WEDGED_AFTER:?} -- a writer is parked in \
+         write(2) for a resend that never came (A-61)"
+      );
+      std::process::abort();
+    });
+    ResendWatchdog
+  }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for ResendWatchdog {
+  fn drop(&mut self) {
+    RESEND_FINISHED.store(true, std::sync::atomic::Ordering::Relaxed);
+  }
+}
+
 /// AC-3.4 / T-3.5 with a request in flight (A-61: `FUSE_NOTIFY_RESEND`; A-63: the write log). Do: mount a volume over
 /// FUSE; [`IN_FLIGHT_WRITERS`] writer threads append numbered pages, each through one descriptor to its own file,
 /// while the daemon is `SIGKILL`ed and on past the restart, then `fsync`; repeat until the restarted daemon reports
@@ -4860,6 +4920,7 @@ const EIO: i32 = 5;
 #[cfg(target_os = "linux")]
 #[test]
 fn a_write_in_flight_at_the_daemons_kill_is_resent_and_every_acknowledged_write_survives() {
+  let _wedge_guard = ResendWatchdog::set();
   let Some(held) = HeldMount::start("resend") else {
     return;
   };

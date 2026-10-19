@@ -7498,3 +7498,52 @@ load-sensitive test is a report that some path only runs when the machine is bus
 one nothing else tests.** The refusal arm of this function had never executed in a passing run. The fourth
 shape says not to require the probe to succeed; it does not say the failing arm is uninteresting — it is
 where the untested code is.
+
+### 2026-10-19: a test that hangs instead of failing — found parked for 29 hours, and the ten siblings still unguarded
+
+**What was found.** On the Linux box, `crates/cli/tests/cli.rs`'s
+`a_write_in_flight_at_the_daemons_kill_is_resent_and_every_acknowledged_write_survives` was still running
+29 hours after it started (pid 2889175, begun 2026-10-17 21:11, observed 2026-10-19 02:11). Its census:
+six threads, two in `futex_wait` and four in `hrtimer_nanosleep`, `0` scheduler ticks accumulated across a
+3-second sample, `VmRSS` 864 kB against a 351 MB peak, four `/pages-*` segments open, and the daemon it had
+`SIGKILL`ed left as an unreaped zombie. It was not spinning and not progressing; it was parked.
+
+**Why the test can do that.** The test's own doc says the quiet part out loud — without the kernel's resend
+(A-61) a writer "would wait forever" — and `write_through_a_kill` ends in
+`writers.into_iter().map(|writer| writer.join().unwrap())`, a join with no deadline. The attempt loop is
+bounded (`IN_FLIGHT_ATTEMPTS`); the join is not. A writer stuck inside `write(2)` on a FUSE mount cannot be
+unwound from inside the test, so the binary waits for as long as the machine stays up, and
+`cargo test --workspace` waits with it.
+
+**Honest about the cause.** This particular instance is **not** evidence of a product defect. The binary came
+from a two-day-old scratch worktree (`sl-resend`, commit `405adcfb`, 96 dirty files), its launching harness had
+died — it was reparented to `init` — and the daemon zombie it holds is as likely to have been killed by my own
+orphan cleanup on 2026-10-18 as by the test. What it *is* evidence of is the failure mode: when the resend does
+not arrive, for any reason, this test hangs rather than fails.
+
+**Fixed, for this test.** It now arms `ResendWatchdog` before it mounts anything. The bound is not a number
+picked for comfort: every wait inside a cycle is already bounded by the test's own deadlines — at most one
+`START_WAIT` for the restarted daemon and one `WAIT_FOR` for the writers' stride — so
+`IN_FLIGHT_ATTEMPTS * (START_WAIT + WAIT_FOR)` is the longest an honest run can take, and past it no internal
+deadline can still be pending. For scale, the run that forced every cycle took 2.1 s and the mean run 0.49 s,
+so the guard sits two orders of magnitude above the work. On expiry it prints a named reason and aborts, which
+libtest reports — the same answer and the same mechanism as `crates/server/tests/fuse_mount.rs`, which took it
+for the notify deadlock.
+
+**Verified only as far as it can be here.** `cargo clippy -p slates-cli --all-targets -- -D warnings` on Linux
+aarch64, exit 0 (Docker, `rust:1.98.1`, 2026-10-19). The behaviour is **not** run: the test is Linux-and-FUSE
+only, the box was at load 232–250 under another project's CI, and the one other Linux host here is a Docker VM
+two other sessions are using for KIND and mantle — where a SIGKILL-under-FUSE test is precisely the wedge-prone
+workload two earlier incidents in this ledger were caused by. **Owed: one run of this test on a quiet Linux
+host**, both to confirm the guard stays silent on a healthy run and to see whether the hang reproduces at HEAD.
+
+**The sweep, which is the larger finding.** Eleven test files mount through a kernel and can therefore wedge a
+thread where no assertion can reach it. Exactly **one** arms a guard. Unguarded:
+`crates/bridge-fuse/tests/{coherence_mount,ipc_mount,oci_container,owner_turn}.rs`,
+`crates/bridge-oci/tests/verify.rs`, `crates/bridge-winfsp/tests/mount.rs`,
+`crates/server/tests/{attach_forms,nfs_mount}.rs`, `crates/db/tests/model.rs`, and
+`crates/server/tests/common/target.rs`. They are **not** edited here: none of them can be run from this host
+either, and arming ten tuned mount tests blind is how a green lint ships a red lane
+(`socket-options-need-the-linux-lane`). The guard also wants one home rather than a copy per test binary once a
+third test needs it — `slates-test-seeds` is the wrong one, its charter is seed persistence, so a shared
+test-support crate is the open question.
