@@ -256,11 +256,6 @@ pub enum VhostError {
     /// The rule broken.
     reason: &'static str,
   },
-  /// The front end refused a back-end-request shmem map or unmap with a non-zero reply-ack status.
-  MapRefused {
-    /// The status the front end returned (non-zero).
-    status: u64,
-  },
   /// The memory table is inconsistent.
   Table(GuestMemoryError),
 }
@@ -273,9 +268,6 @@ impl std::fmt::Display for VhostError {
       Self::Closed => f.write_str("the front end closed its end"),
       Self::Protocol { reason } => write!(f, "protocol: {reason}"),
       Self::Memory { reason } => write!(f, "memory: {reason}"),
-      Self::MapRefused { status } => {
-        write!(f, "the front end refused a shmem map: status {status}")
-      }
       Self::Table(e) => write!(f, "memory table: {e}"),
     }
   }
@@ -1224,7 +1216,6 @@ fn seam_refusal(error: VhostError) -> SeamError {
     VhostError::Protocol { reason } | VhostError::Memory { reason } => {
       SeamError::FrontEndBroke { reason }
     }
-    VhostError::MapRefused { .. } => SeamError::DaxMapRefused,
     VhostError::Table(_) => SeamError::FrontEndBroke {
       reason: "the memory table is inconsistent",
     },
@@ -1314,9 +1305,14 @@ fn encode_request_header(request: u32, size: usize) -> Option<[u8; HEADER_LEN]> 
 }
 
 /// Decodes a back-end-request reply-ack: a reply header (the version correct, `FLAG_REPLY` set) then a `u64`
-/// status. `Ok(())` on a zero status; [`VhostError::MapRefused`] on a non-zero one. A malformed or wrong-sized
-/// reply is a protocol refusal, never a panic.
-fn parse_ack(bytes: &[u8]) -> Result<(), VhostError> {
+/// status. Returns **which request the front end is answering** and its status; a malformed or wrong-sized reply
+/// is a protocol refusal, never a panic.
+///
+/// The request code is returned rather than ignored because the caller must check it against the request it
+/// actually sent. The channel is strictly in order, so for a conforming front end the code is redundant — and
+/// for one that is not, it is the difference between completing the right outstanding request and the wrong one.
+/// See [`MessagePlacer::poll_acks`] for what a mismatch would otherwise cost.
+fn parse_ack(bytes: &[u8]) -> Result<(u32, u64), VhostError> {
   if bytes.len() != HEADER_LEN.saturating_add(ACK_LEN) {
     return Err(protocol("a back-end-request reply-ack of the wrong size"));
   }
@@ -1329,11 +1325,7 @@ fn parse_ack(bytes: &[u8]) -> Result<(), VhostError> {
   if flags & FLAG_REPLY == 0 {
     return Err(protocol("a back-end-request reply without the reply flag"));
   }
-  let status = u64_at(bytes, HEADER_LEN)?;
-  if status != 0 {
-    return Err(VhostError::MapRefused { status });
-  }
-  Ok(())
+  Ok((u32_at(bytes, 0)?, u64_at(bytes, HEADER_LEN)?))
 }
 
 /// Format: the one descriptor a `SHMEM_MAP` carries in ancillary data — the content arena's backing object.
@@ -1401,12 +1393,12 @@ impl BackendReqChannel {
     self.send(&header, &body, None)
   }
 
-  /// Reads the front end's reply-ack for the most recent map or unmap, without blocking. `Ok(true)` once the ack
-  /// has arrived reporting success; `Ok(false)` while it has not yet arrived (the caller awaits this channel's
-  /// readiness on the shard's driver and asks again); [`VhostError::MapRefused`] if the front end refused the
-  /// mapping. The back end reads this before it answers the guest's `FUSE_SETUPMAPPING`, so the guest never faults
+  /// Reads the front end's reply-ack for the oldest unanswered map or unmap, without blocking. `Ok(Some((request,
+  /// status)))` once an ack has arrived — the request it answers and the front end's status, zero for success —
+  /// and `Ok(None)` while none has (the caller awaits this channel's readiness on the shard's driver and asks
+  /// again). The back end reads this before it answers the guest's `FUSE_SETUPMAPPING`, so the guest never faults
   /// a page the front end has not mapped. A reply-ack carries no descriptor.
-  pub fn recv_ack(&self) -> Result<bool, VhostError> {
+  pub fn recv_ack(&self) -> Result<Option<(u32, u64)>, VhostError> {
     let mut buf = [0u8; HEADER_LEN + ACK_LEN];
     let mut none: [std::mem::MaybeUninit<u8>; 0] = [];
     let mut control = RecvAncillaryBuffer::new(&mut none);
@@ -1417,7 +1409,7 @@ impl BackendReqChannel {
       RecvFlags::DONTWAIT,
     ) {
       Ok(received) => received,
-      Err(Errno::AGAIN | Errno::INTR) => return Ok(false),
+      Err(Errno::AGAIN | Errno::INTR) => return Ok(None),
       Err(Errno::CONNRESET | Errno::PIPE | Errno::NOTCONN) => return Err(VhostError::Closed),
       Err(e) => return Err(os("recvmsg")(e)),
     };
@@ -1427,8 +1419,7 @@ impl BackendReqChannel {
     if received.bytes != buf.len() {
       return Err(protocol("a short back-end-request reply-ack"));
     }
-    parse_ack(&buf)?;
-    Ok(true)
+    parse_ack(&buf).map(Some)
   }
 
   /// Sends one back-end request — header then body, with `fd` in ancillary data on the `sendmsg` that carries the
@@ -1855,40 +1846,49 @@ impl<T: Copy> MessagePlacer<T> {
   pub fn poll_acks(&mut self) -> Result<Vec<DaxCompletion<T>>, MessagePlaceError> {
     let mut completed = Vec::new();
     loop {
-      match self.channel.recv_ack() {
-        Ok(false) => break,
-        Ok(true) => {
-          let op = self
-            .outstanding
-            .pop_front()
-            .ok_or(MessagePlaceError::Channel(protocol(
-              "a back-end-request reply-ack with no request outstanding",
-            )))?;
-          completed.push(match op.op {
-            DaxOp::Map => DaxCompletion::Mapped(op.token),
-            DaxOp::Unmap => DaxCompletion::Unmapped(op.token),
-          });
-        }
-        Err(VhostError::MapRefused { status }) => {
-          let op = self
-            .outstanding
-            .pop_front()
-            .ok_or(MessagePlaceError::Channel(protocol(
-              "a back-end-request reply-ack with no request outstanding",
-            )))?;
-          completed.push(match op.op {
-            DaxOp::Map => DaxCompletion::MapRefused {
-              token: op.token,
-              status,
-            },
-            DaxOp::Unmap => DaxCompletion::UnmapRefused {
-              token: op.token,
-              status,
-            },
-          });
-        }
+      let (request, status) = match self.channel.recv_ack() {
+        Ok(None) => break,
+        Ok(Some(answered)) => answered,
         Err(e) => return Err(MessagePlaceError::Channel(e)),
+      };
+      let waiting = self
+        .outstanding
+        .front()
+        .ok_or(MessagePlaceError::Channel(protocol(
+          "a back-end-request reply-ack with no request outstanding",
+        )))?;
+      let expected = match waiting.op {
+        DaxOp::Map => backend_request::SHMEM_MAP,
+        DaxOp::Unmap => backend_request::SHMEM_UNMAP,
+      };
+      // The channel answers in order, so for a conforming front end this always holds. For one that does not,
+      // it is the whole of the safety: completing a map's ack against an outstanding *unmap* would report that
+      // window gone and the caller would unpin a block the guest still has in its page tables — the
+      // use-after-free the pin discipline exists to prevent (§4.6, A-99). A mismatch is the front end breaking
+      // the wire, which ends the device; it is never completed as though it answered the request we sent.
+      if request != expected {
+        return Err(MessagePlaceError::Channel(protocol(
+          "a reply-ack answering a back-end request other than the one awaiting it",
+        )));
       }
+      let op = self
+        .outstanding
+        .pop_front()
+        .ok_or(MessagePlaceError::Channel(protocol(
+          "a back-end-request reply-ack with no request outstanding",
+        )))?;
+      completed.push(match (op.op, status) {
+        (DaxOp::Map, 0) => DaxCompletion::Mapped(op.token),
+        (DaxOp::Unmap, 0) => DaxCompletion::Unmapped(op.token),
+        (DaxOp::Map, status) => DaxCompletion::MapRefused {
+          token: op.token,
+          status,
+        },
+        (DaxOp::Unmap, status) => DaxCompletion::UnmapRefused {
+          token: op.token,
+          status,
+        },
+      });
     }
     Ok(completed)
   }
@@ -2158,6 +2158,44 @@ mod shmem_tests {
     .unwrap();
   }
 
+  /// A-9 / AC-4.12, hostile front end. Do: leave one `SHMEM_UNMAP` outstanding and have the front end reply-ack
+  /// a `SHMEM_MAP` instead. Expect: a typed protocol refusal — which ends the device — and the unmap still
+  /// outstanding, completed by nothing.
+  ///
+  /// The channel answers in order, so a conforming VMM never does this and the check costs a comparison. What it
+  /// buys is the case where the VMM is wrong: completing a map's ack against an outstanding unmap would report
+  /// that window removed, and the caller unpins on an `Unmapped` — handing a block back to the arena while the
+  /// guest still has it in its page tables (§4.6 phase two, A-99). Until 2026-10-18 the ack's request code was
+  /// parsed and discarded, so the two were indistinguishable.
+  #[test]
+  fn a_reply_ack_for_a_request_that_is_not_the_one_awaiting_it_is_refused() {
+    let (frontend, backend) = stream_pair();
+    let page = rustix::param::page_size().max(1);
+    let pg = u64::try_from(page).unwrap();
+    let region = u64::try_from(page.saturating_mul(8)).unwrap();
+    let mut placer: MessagePlacer<u64> =
+      MessagePlacer::new(BackendReqChannel::adopt(backend), page, region);
+
+    // One unmap is outstanding; the front end answers as though it had been asked for a map.
+    placer.begin_unmap(0, pg, 300).unwrap();
+    assert_eq!(front_read_request(&frontend), backend_request::SHMEM_UNMAP);
+    front_send_ack(&frontend, backend_request::SHMEM_MAP, 0);
+
+    let refused = placer.poll_acks();
+    assert!(
+      matches!(
+        &refused,
+        Err(MessagePlaceError::Channel(VhostError::Protocol { reason }))
+          if reason.contains("other than the one awaiting")
+      ),
+      "a mismatched reply-ack is the front end breaking the wire: {refused:?}"
+    );
+    assert!(
+      placer.has_outstanding(),
+      "the unmap is still outstanding: a wrong ack completes nothing"
+    );
+  }
+
   /// A-9 / AC-4.12 (message-based DAX placement, by use): the placer pipelines a SETUPMAPPING and a REMOVEMAPPING
   /// over the channel and matches the front end's reply-acks FIFO. Do: begin a map (token 100) and an unmap (token
   /// 200), acknowledge each at a stand-in front end, and drain. Expect: nothing completes before the acks; then the
@@ -2310,16 +2348,19 @@ mod shmem_tests {
     );
   }
 
-  /// A non-zero reply-ack status is the typed map refusal, never a silent success.
+  /// A reply-ack is decoded as the request it answers and the front end's status, so the caller can both check
+  /// that the front end answered the request awaiting it and tell a refusal from a success. A non-zero status is
+  /// never a silent success.
   #[test]
-  fn a_non_zero_ack_is_a_typed_map_refusal() {
+  fn a_reply_ack_decodes_as_the_request_it_answers_and_its_status() {
     let mut ack = [0u8; HEADER_LEN + ACK_LEN];
+    ack[0..4].copy_from_slice(&backend_request::SHMEM_MAP.to_le_bytes());
     ack[HEADER_AT_FLAGS..HEADER_AT_FLAGS + 4]
       .copy_from_slice(&(VERSION | FLAG_REPLY).to_le_bytes());
     ack[HEADER_AT_SIZE..HEADER_AT_SIZE + 4]
       .copy_from_slice(&u32::try_from(ACK_LEN).unwrap().to_le_bytes());
     ack[HEADER_LEN..].copy_from_slice(&22u64.to_le_bytes());
-    assert_eq!(parse_ack(&ack), Err(VhostError::MapRefused { status: 22 }));
+    assert_eq!(parse_ack(&ack), Ok((backend_request::SHMEM_MAP, 22)));
   }
 
   /// AC-4.12 / A-9: the back end sends a real descriptor and the map fields over the channel; a stand-in front
@@ -2411,9 +2452,10 @@ mod shmem_tests {
       SendFlags::NOSIGNAL,
     )
     .unwrap();
-    assert!(
+    assert_eq!(
       channel.recv_ack().unwrap(),
-      "the back end must accept the success ack"
+      Some((backend_request::SHMEM_MAP, 0)),
+      "the back end reads the ack as answering the map it sent, with a success status"
     );
   }
 

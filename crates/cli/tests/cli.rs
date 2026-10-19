@@ -33,6 +33,16 @@ const RESTART_RETRIES: u32 = 50;
 /// Shape: consecutive daemon responses `start_anchor` waits for, so the anchor's one startup restart
 /// (a heartbeat-lapse recovery) has settled before a test runs its verbs.
 const STABLE_STREAK: u32 = 10;
+/// Derived: the most `volume list` attempts a startup wait makes before it calls the daemon absent — the streak
+/// it needs, plus the refusals a single verb already tolerates while the daemon's one startup restart settles
+/// ([`RESTART_RETRIES`]). Both numbers are ones this file already states.
+///
+/// **Counted in attempts, not wall time, on purpose.** Each attempt is a whole CLI process: spawn, connect, list,
+/// exit. A contended host makes each attempt slower, not more numerous, so a wall bound over eleven of them
+/// measures the host. Twenty seconds was enough alone and not enough inside a full `cargo test --workspace`,
+/// where this failed on 2026-10-18 with exit 3 while passing by itself in well under a second. An absent daemon
+/// still ends the wait — it refuses every attempt — and so does one that flaps, which never reaches the streak.
+const START_ATTEMPTS: u32 = STABLE_STREAK.saturating_add(RESTART_RETRIES);
 
 fn slates() -> Command {
   Command::new(env!("CARGO_BIN_EXE_slates"))
@@ -133,14 +143,15 @@ fn start_anchor_with_environment(
     .spawn()
     .unwrap();
   let anchor = AnchorProcess { child, drain: None };
-  let started = Instant::now();
   // The anchor restarts the daemon once at startup if its first heartbeat lapses (a known liveness
   // recovery, logged as "heartbeat lapsed; killing it"). Wait for several *consecutive* successes so
   // that restart has settled before returning — otherwise a test verb lands in the restart window and
   // gets exit 3 (no daemon). A restart resets the streak.
   let mut streak = 0u32;
+  let mut attempts = 0u32;
   loop {
     let (code, _, _) = run(instance, &["volume", "list"]);
+    attempts = attempts.saturating_add(1);
     if code == 0 {
       streak += 1;
       if streak >= STABLE_STREAK {
@@ -154,7 +165,10 @@ fn start_anchor_with_environment(
     } else {
       streak = 0;
     }
-    assert!(started.elapsed() < START_WAIT, "the daemon came up: {code}");
+    assert!(
+      attempts < START_ATTEMPTS,
+      "the daemon came up within {START_ATTEMPTS} attempts (last exit {code})"
+    );
     pause();
   }
 }
@@ -1399,17 +1413,21 @@ fn start_anchor_with_issuer_surface(instance: &str) -> (AnchorProcess, Vec<(Stri
   anchor.drain = Some(std::thread::spawn(move || {
     let _ = std::io::copy(&mut stderr, &mut std::io::sink());
   }));
-  let started = Instant::now();
   let mut streak = 0u32;
+  let mut attempts = 0u32;
   loop {
     let (code, _, _) = run(instance, &["volume", "list"]);
+    attempts = attempts.saturating_add(1);
     streak = if code == 0 { streak + 1 } else { 0 };
     if streak >= STABLE_STREAK {
       let (code, _, error) = run(instance, &["bootstrap", "root"]);
       assert_eq!(code, 0, "explicit first-time bootstrap: {error}");
       return (anchor, exports);
     }
-    assert!(started.elapsed() < START_WAIT, "the daemon came up: {code}");
+    assert!(
+      attempts < START_ATTEMPTS,
+      "the daemon came up within {START_ATTEMPTS} attempts (last exit {code})"
+    );
     pause();
   }
 }
