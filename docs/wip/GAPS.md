@@ -7242,6 +7242,14 @@ canary intact
 tree hashing the same before and after. The non-vacuity line matters as much as the verdict — "other reaches
 the mount" proves the second user could actually see the mount it was attacking.
 
+**Four live sites are left alone deliberately, and this is the note for them.** Sweeping the pattern rather than
+the one file found `rust:1.98.0` still pinned in `ci/guest/Dockerfile`, `ci/linux-oci/Dockerfile`, and two steps
+each in `.kiln/ci.yaml` and `.kiln/nightly.yaml`. They are **not** changed here: every runner that executes them
+is linux/x86_64, where that tag resolves correctly, and CI configuration is Ada's. The hazard is latent — it
+appears the moment one of those steps runs on an arm64 host, where Docker will silently substitute a linux/386
+image — and the fix is the same one-token change (`rust:1.98`, with the compiler still pinned by
+`rust-toolchain.toml`). The `docs/bugs/*` mentions are records of what past runs used and must not be rewritten.
+
 **It had stopped running on this host, silently.** `run.sh` pinned `rust:1.98.0`, a tag with no arm64 manifest,
 so Docker fell back to a **linux/386** image and the battery built and ran under emulation on the wrong
 architecture — failing early and dumping CLI usage. Two things hid it: the fallback is a `WARNING` on stderr
