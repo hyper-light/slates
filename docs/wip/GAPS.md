@@ -7288,6 +7288,18 @@ Non-vacuity for the four below the DAX rows rests on the scaling check above rat
 every suite calls the *same* `cases()` function, so the one demonstration that the environment reaches it
 covers them all. That is the argument for one definition over eighteen.
 
+### 2026-10-19 (close): the workspace run is clean — 257 binaries, zero failures
+
+`cargo test --workspace --no-fail-fast` at `f16c73f9` on a quiet host: **257 test binaries, 0 distinct
+failures.** This run covers everything the day added — the `max_pages` negotiation and the device cap that
+follows it, the `PROPTEST_CASES` fix across eighteen suites, the three product defects and the twelve profile
+fixtures.
+
+The trajectory across the day's five full runs: **63 distinct failures → 2 → 1 → 0**. Of the 63, sixty were one
+`OnceLock`'d fixture; of the 2, both were artifacts of 168 orphaned spinners I had leaked onto the host; the 1
+was the twelfth profile fixture. **Not one of the sixty-odd was a product defect** — the three product defects
+found this day came out of *writing* tests, not running them.
+
 ### 2026-10-18 (close of day): what a clean `cargo test --workspace` says now
 
 The day opened with a workspace run failing **63 distinct tests** and closed with one failing **1**, on a quiet
