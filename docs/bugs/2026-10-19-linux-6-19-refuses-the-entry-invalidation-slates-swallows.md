@@ -86,13 +86,19 @@ a 7-character working directory too.
    the negative-entry reply says why that is sound: "Every way a name appears through another attachment
    invalidates it". On 6.19 that justification is simply false.
 
-   **And the hole is wider than negative entries.** A delete, a rename's source and a rename's target all travel
-   as `Invalidation::Entry` too, and the refusal is of the message, not of the case — so on such a kernel a name
-   *removed* through another attachment also stays visible, not just a name created. `Forever` is therefore
-   unsound for **every** entry on these kernels, which is why this is a §4.6 posture change and not a tweak:
-   it reprices the core caching promise, it needs a derived bound rather than a chosen one, and it must re-take
-   the measurement `c3c0024b` recorded (negative entries bought −28% lookups on a pip install) to show what the
-   bound costs. That is a planned change with a design-doc and amendment-log entry, not an improvisation.
+   **Correcting an earlier claim in this document: the hole is negative entries only.** It said that because a
+   delete and both halves of a rename also travel as `Invalidation::Entry`, a name *removed* elsewhere must be
+   equally invisible. That was reasoned from how the code routes the message and **not measured, and it is
+   wrong.** Measured on the 6.19 host: create a name through the other attachment, stat it through the mount
+   twice so the kernel holds it positively, then remove it through that attachment — the mount sees it go.
+   `POSITIVEPROBE: created=present cached=present after_remove=absent`. Two of `coherence_mount`'s three
+   scenarios pass on 6.19 for the same reason, and they run *before* the failing one.
+
+   So the kernel refuses the invalidation of a **negative** dentry and honours it for a positive one, which
+   fits the suspected cause — `fuse_reverse_inval_entry()`'s recent conversion to `start_removing_noperm()`,
+   a path built for removing something that is *there*. The hole is exactly: **a name the kernel has cached as
+   absent, then created elsewhere, is never seen.** Deletes, renames, attribute and data changes are all
+   delivered.
 
 ## The decision is binary, and already priced
 
@@ -104,11 +110,27 @@ not shortening the lifetime, removing it. So the choice is binary, and both side
 - **Keep `Forever`.** Costs nothing. Leaves a real hole on kernels that refuse entry invalidation: a name
   created, removed or renamed through another attachment is invisible to that mount, indefinitely. The hole is
   no longer silent — `fuse.entry_invalidation_refused` moves the moment it happens.
-- **Stop caching entries.** Closes the hole on every kernel. Gives back exactly what `c3c0024b` measured when
-  it added the caching: a pip install's requests 21,709 → 19,222 and **lookups −28%**, paid on *every* kernel,
-  including the large majority where invalidation works correctly.
+- **Stop caching *negative* entries** (only those — positive entries keep `Forever`, since the kernel honours
+  their invalidation). Closes the hole. Gives back the negative-entry share of what `c3c0024b` measured when it
+  added "negative entries, kept pages and listings" together: a pip install's requests 21,709 → 19,222 and
+  **lookups −28%** for all three. The negative share alone has never been measured apart from the other two and
+  would have to be, before this is priced honestly.
 
-**Recommendation: keep `Forever`, and treat 6.19 as a kernel regression to track.** Three reasons. The upstream
+**Recommendation, revised now the hole is known to be narrow: bound the negative-entry lifetime, keep
+everything else.** R4 says correctness is never weighed against performance, and a name that is permanently
+invisible is a correctness hole, so "keep `Forever` and accept it" does not survive the rule — the earlier
+recommendation in this document was wrong on that point too. But the fix no longer costs the 28%: positive
+entries, pages and listings all keep `Forever`, because the kernel honours their invalidation. Only the
+negative-entry lifetime needs to stop being unbounded, and a *bounded* one keeps most of the repeat-miss
+elision inside its window while making staleness finite on every kernel. The bound must be derived, not
+chosen, and the negative share of the −28% must be measured before and after, which is the work this leaves.
+
+Note what that does **not** do: it does not make these two tests green. They assert the `Invalidated` posture's
+*immediate* visibility, and the probe runs at once, so any bound above about zero still answers from the cache.
+If the posture for negative entries becomes "bounded", §4.6 says so and the tests assert the bound instead —
+which is the honest shape, since the strong promise is one this kernel will not let slates keep.
+
+The older reasoning, kept because it is the counter-argument: the upstream
 history is churning this exact function — `fuse_reverse_inval_entry()` was recently converted to
 `start_removing_noperm()` (`c9ba789dad15`) and has already needed one follow-up fix, which is what a regression
 looks like rather than a deliberate ABI change. The cost of the alternative is permanent and paid everywhere,

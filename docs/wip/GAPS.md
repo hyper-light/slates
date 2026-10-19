@@ -7658,11 +7658,23 @@ invalidation.
 Appending a parent-inode invalidation — the notification the kernel *does* accept on 6.19 — leaves both tests
 failing; forcing `FUSE_EXPIRE_ONLY` off leaves both failing. No notification clears the entry, so the only
 lever left is the lifetime `valid_for` grants, which is `Forever` for a volume's own objects on the strength of
-"every way a name appears through another attachment invalidates it". And because a delete and both halves of
-a rename travel as `Invalidation::Entry` as well, a name *removed* elsewhere is equally invisible on these
-kernels — `Forever` is unsound for every entry, not only negative ones. That reprices §4.6's core caching
-promise and must re-take `c3c0024b`'s −28%-lookup measurement, so it is a planned design change with an
-amendment-log entry, which is exactly why it is not improvised here.
+"every way a name appears through another attachment invalidates it".
+
+**Correcting this entry, same day: the hole is negative entries only.** It said that because a delete and both
+halves of a rename also travel as `Invalidation::Entry`, a name removed elsewhere must be equally invisible.
+That was reasoned from the code's routing and **not measured, and it is wrong** — measured on the 6.19 host, a
+name created, cached positively through the mount, then removed through the other attachment *does* go:
+`POSITIVEPROBE: created=present cached=present after_remove=absent`. Two of `coherence_mount`'s three
+scenarios pass there for the same reason, and they run before the failing one. The kernel refuses the
+invalidation of a **negative** dentry and honours it for a positive one — which fits the suspected cause,
+`fuse_reverse_inval_entry()`'s conversion to `start_removing_noperm()`, a path built for removing something
+that is there.
+
+So the hole is exactly **a name cached absent and then created elsewhere**, and the fix is correspondingly
+narrow: only the *negative*-entry lifetime must stop being unbounded. Positive entries, pages and listings keep
+`Forever`, so the 28% is not what is at stake — only the negative share of it, which has never been measured
+apart from the other two and must be before this is priced. Still a §4.6 amendment with a derived bound, and
+still not improvised here, but a much smaller one than this entry first claimed.
 
 **Why it matters.** §4.6's `Invalidated` posture is the promise that a change made through one attachment is
 pushed to the kernel's caches; `coherence_mount` is the proof of it, and on 6.19 a name another attachment
