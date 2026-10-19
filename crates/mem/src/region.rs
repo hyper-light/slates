@@ -54,7 +54,6 @@ pub struct Region {
   backing: Backing,
   page: usize,
   locked: bool,
-  huge: bool,
   numa_node: u16,
   /// The ranges whose pages may carry the OS's reusable mark (A-110, macOS), cleared by [`Region::prepare`] before
   /// any of them is handed out. Empty on every platform whose discard leaves no mark.
@@ -96,12 +95,17 @@ impl Region {
       len,
       code: e.raw_os_error(),
     })?;
-    let huge = huge && advise_huge(&map);
+    if huge {
+      // Advice only: whether the OS *accepted* it says nothing about whether the region got huge pages — on
+      // Linux 7.2 a 64 KiB and a 1 MiB mapping both take it with `OK` and receive none. The question that has
+      // an answer is `AnonHugePages`/`ShmemPmdMapped` in `/proc/self/smaps`, which the caller that needs it
+      // reads (§4.6 L1); nothing is kept here, because a kept `bool` would read as a guarantee.
+      advise_huge(&map);
+    }
     Ok(Region {
       backing: Backing::Anon(map),
       page,
       locked: false,
-      huge,
       numa_node: 0,
       reusable: crate::ranges::UnitSet::new(if os::DISCARD_LEAVES_A_MARK { len } else { 0 }, page),
     })
@@ -127,7 +131,6 @@ impl Region {
       backing: Backing::Shared(object),
       page,
       locked: false,
-      huge: false,
       numa_node: 0,
       reusable: if os::DISCARD_LEAVES_A_MARK {
         crate::ranges::UnitSet::whole(len, page)
@@ -169,11 +172,6 @@ impl Region {
   /// Whether the region is locked in RAM.
   pub const fn locked(&self) -> bool {
     self.locked
-  }
-
-  /// Whether the OS accepted the huge-page advice.
-  pub const fn huge(&self) -> bool {
-    self.huge
   }
 
   /// The NUMA node the region was recorded on.
