@@ -2224,9 +2224,16 @@ invalidates exactly the paths the manifest diff names.
 using the OS-installed broker for privileged mount establishment; the daemon itself never
 requires `CAP_SYS_ADMIN`, root or a Slates-owned setuid helper. Namespace attachment capability
 is checked by the launcher and refused when unavailable; it is not a daemon prerequisite. Options: `default_permissions`, `allow_other` only
-if `user_allow_other` is set and the operator asked; `FUSE_INIT` negotiates splice, readdirplus,
-`EXPLICIT_INVAL_DATA`, `EXPIRE_ONLY`, parallel dirops, and `OVER_IO_URING` when the kernel offers
-it, and **refuses writeback cache** (corrected 2026-09-19: under `FUSE_WRITEBACK_CACHE` the kernel
+if `user_allow_other` is set and the operator asked; `FUSE_INIT` asks for exactly what `wanted()` in
+`crates/bridge-fuse/src/init.rs` names and keeps whatever the kernel also offers: parallel dirops, readdirplus
+(and `READDIRPLUS_AUTO`), big writes, `MAX_PAGES`, `DONT_MASK`, `INIT_EXT`, and then — by the attachment's cache
+coherence — either `EXPLICIT_INVAL_DATA` with `HAS_EXPIRE_ONLY` (a transport that delivers invalidations) or
+`AUTO_INVAL_DATA` (one that does not). **`MAX_PAGES` is sent with a page count** (`MAX_WRITE / page_size`), added
+2026-10-19: without it the kernel splits every request at its own 32-page default and the advertised `max_write`
+of 256 KiB is never reached — measured, a 256 KiB write cost two round trips instead of one
+(`BENCHMARKS.md`). This list said "splice … and `OVER_IO_URING`" until 2026-10-19 and neither was ever asked
+for; `tests/abi.rs` asserts io_uring is among the foreign bits that must **not** leak into the reply, and
+io_uring left the runtime entirely at A-136. It **refuses writeback cache** (corrected 2026-09-19: under `FUSE_WRITEBACK_CACHE` the kernel
 owns a regular file's size and times and ignores the daemon's, so a change made through another
 attachment stays invisible to `stat` even after an accepted invalidation — measured on Linux 6.12,
 `docs/bugs/2026-09-19-writeback-cache-made-the-kernel-the-size-authority.md`; write-through also
