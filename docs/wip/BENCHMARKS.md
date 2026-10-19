@@ -5180,10 +5180,24 @@ path as a wild outlier (create 55×, rewrite 147×, create+fsync 325×). Re-meas
 "write path problem"; there is one transport cost, charged once per message, and the kernel's in-kernel
 filesystems pay 1–2 µs for the same work because they are in the kernel.
 
+And the `create+fsync` arm, the old row's biggest outlier at 325×, driven the same way (1,000 files,
+`open`+`write`+`fsync`+`close` timed as one span):
+
+| op, p50 (p99) | tmpfs | overlayfs | slates (FUSE) | slates vs overlayfs | the old row |
+|---|---|---|---|---|---|
+| create + fsync | 2 µs (4) | 3 µs (8) | 87 µs (185) | **29×** | 325× |
+
+87 µs is four operations — create 31, write 14, close 13 and the fsync itself about thirty, which is one more
+round trip and nothing else. slates' `fsync` is a success no-op by design (the anchor segment is already the
+source of truth, R1), so what it costs is the message, exactly as the rest of the table says.
+
+**Every multiple in the re-run is 14–29×**: stat 27×, write 14×, create 16×, create+fsync 29×. The superseded
+row's 12–325× spread, and the "write path dominates" reading built on it, were artifacts of the pre-A-134
+whole-image republish.
+
 Conditions: Docker Desktop (kernel 6.12.76-linuxkit) on an 18-core aarch64 Mac, host load 25–27, release build,
-one run per arm rather than best-of-N, p50/p99 over 2,000 files (the superseded row used 3,000 and reported
-p999/max as well). Owed: the same on x86_64, and the `create+fsync` arm, which the old row put at 325× and this
-harness does not drive.
+one run per arm rather than best-of-N, p50/p99 over 2,000 files (1,000 for the fsync arm); the superseded row
+used 3,000 and reported p999/max as well. Owed: the same on x86_64.
 
 **So the lever is the round trip, and it is ~22 µs.** Against tmpfs's 1 µs create slates is ~27×, not the ~55×
 the stale row implies against overlayfs. The in-design levers that attack the round trip — FUSE writeback
