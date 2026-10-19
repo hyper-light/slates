@@ -233,7 +233,7 @@ mod tests {
   }
 
   proptest! {
-    #![proptest_config(slates_test_seeds::unseeded(ProptestConfig { cases: 4000, .. ProptestConfig::default() }))]
+    #![proptest_config(slates_test_seeds::unseeded(ProptestConfig { cases: slates_test_seeds::cases(4000), .. ProptestConfig::default() }))]
 
     /// The ordering oracle (2026-10-06, the comparison fast paths). Do: compare and equate generated names under both
     /// policies. Expect: `compare` equals the folded iterators' order and `same` their equality, every time — the fast

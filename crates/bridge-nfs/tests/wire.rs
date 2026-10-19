@@ -253,7 +253,7 @@ fn accept_status() -> impl Strategy<Value = AcceptStatus> {
 }
 
 proptest! {
-  #![proptest_config(slates_test_seeds::unseeded(ProptestConfig { cases: 2000, .. ProptestConfig::default() }))]
+  #![proptest_config(slates_test_seeds::unseeded(ProptestConfig { cases: slates_test_seeds::cases(2000), .. ProptestConfig::default() }))]
 
   /// A reply built as its own record is the reply framed (2026-10-09: the server builds READ replies this way to skip
   /// two copies of their data). Do: build replies of every accept status with random xids and results, both ways.

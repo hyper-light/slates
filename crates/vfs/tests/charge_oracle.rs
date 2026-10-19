@@ -332,7 +332,7 @@ fn check_identities(
 }
 
 proptest! {
-  #![proptest_config(slates_test_seeds::unseeded(ProptestConfig { cases: 150, max_shrink_iters: 3000, .. ProptestConfig::default() }))]
+  #![proptest_config(slates_test_seeds::unseeded(ProptestConfig { cases: slates_test_seeds::cases(150), max_shrink_iters: 3000, .. ProptestConfig::default() }))]
 
   /// AC-2.11 / AC-0.10: the charge identities hold on every generated history.
   #[test]

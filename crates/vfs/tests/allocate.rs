@@ -166,7 +166,7 @@ fn shape(chunk: u64) -> impl Strategy<Value = Shape> {
 }
 
 proptest! {
-  #![proptest_config(slates_test_seeds::unseeded(ProptestConfig { cases: 128, .. ProptestConfig::default() }))]
+  #![proptest_config(slates_test_seeds::unseeded(ProptestConfig { cases: slates_test_seeds::cases(128), .. ProptestConfig::default() }))]
 
   /// A-108's oracle. Do: on generated files, allocate a range once whole and once in generated slices, and model the
   /// result as the written bytes over zeros. Expect: both volumes read back the model byte for byte, with the model's

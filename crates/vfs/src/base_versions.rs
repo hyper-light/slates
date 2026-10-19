@@ -266,7 +266,7 @@ mod tests {
   }
 
   proptest! {
-    #![proptest_config(slates_test_seeds::unseeded(ProptestConfig { cases: 2000, .. ProptestConfig::default() }))]
+    #![proptest_config(slates_test_seeds::unseeded(ProptestConfig { cases: slates_test_seeds::cases(2000), .. ProptestConfig::default() }))]
 
     /// A-48: over any history of writes, removals, snapshots and snapshot destroys, the head reads the
     /// model's head, every live snapshot reads exactly what the model froze for it, and after every step no

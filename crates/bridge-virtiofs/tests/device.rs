@@ -2162,7 +2162,7 @@ enum ChaosEffect {
 }
 
 proptest! {
-  #![proptest_config(slates_test_seeds::unseeded(ProptestConfig { cases: 80, .. ProptestConfig::default() }))]
+  #![proptest_config(slates_test_seeds::unseeded(ProptestConfig { cases: slates_test_seeds::cases(80), .. ProptestConfig::default() }))]
 
   /// §4.6 / AC-4.12 under chaos, at the device seam. `vfs/tests/dax.rs` plays this schedule against the gate;
   /// this plays it against the half that owns the guest-visible window — SETUPMAPPING and REMOVEMAPPING over a

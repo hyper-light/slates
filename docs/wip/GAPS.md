@@ -7191,6 +7191,31 @@ zero is exactly the shape the regression had — and the test fails on it, *"ref
 This is the same distinction as the driver and rendezvous bounds earlier today: say whether the code did its
 job, not whether the machine was fast enough while it did.
 
+### 2026-10-19: every property suite silently ignored `PROPTEST_CASES`, so no sweep could be deepened
+
+Trying to deepen the DAX chaos schedule — `PROPTEST_CASES=6000 cargo test --release -p slates-vfs --test dax
+a_random_interleaving` — ran **150 cases**, the hardcoded default. proptest reads that variable in
+`Config::default()`, and a `ProptestConfig { cases: 150, ..default() }` sets the field *after*, so the literal
+wins. Nineteen suites carried a bare literal; `crates/vfs/tests/differential.rs` had solved it locally with its
+own `cases()` helper, alone, which is why CI's `PROPTEST_CASES=2000` took effect there and nowhere else.
+
+The hazard is the one this ledger keeps naming: **the run reports coverage it never had.** I nearly recorded "a
+6,000-case chaos sweep passed" on the strength of a 150-case run.
+
+Fixed with one definition — `slates_test_seeds::cases(default)` — and all eighteen remaining suites call it, so
+the next one cannot miss it. Verified non-vacuously by scaling: the DAX schedule's in-test time goes 0.04 s at
+150, 0.58 s at 1,500, 3.62 s at 6,000, 12.60 s at 20,000, linear in the count.
+
+**And the deep sweeps the fix made possible, all green** (release, macOS aarch64, host load 20–31):
+
+| schedule | default | deepened | result |
+|---|---|---|---|
+| `a_random_interleaving_never_shows_a_live_mapping_stale_or_foreign_bytes` (`vfs/tests/dax.rs`) | 150 | **20,000** (133×) | 12.60 s, green |
+| `a_random_window_schedule_never_shows_the_guest_a_foreign_byte` (`bridge-virtiofs/tests/device.rs`) | 80 | **2,000** (25×) | 0.24 s, green |
+
+Both cover this session's DAX work — the pin dedup and the snapshot-recall exclusion — so the gate's
+interleavings are now swept two orders deeper than the committed defaults, on demand and by anyone.
+
 ### 2026-10-18 (close of day): what a clean `cargo test --workspace` says now
 
 The day opened with a workspace run failing **63 distinct tests** and closed with one failing **1**, on a quiet

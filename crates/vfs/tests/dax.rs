@@ -2127,7 +2127,7 @@ fn chaos_invariants(store: &Store, volume: &Volume, held: &[Mapping]) -> Result<
 }
 
 proptest! {
-  #![proptest_config(slates_test_seeds::unseeded(ProptestConfig { cases: 150, .. ProptestConfig::default() }))]
+  #![proptest_config(slates_test_seeds::unseeded(ProptestConfig { cases: slates_test_seeds::cases(150), .. ProptestConfig::default() }))]
 
   /// §4.6 / AC-4.12 under chaos. Every other DAX test here is one hand-built attack; this is the same gate under
   /// random interleavings of the operations that fight each other — writes and truncates that must revoke a

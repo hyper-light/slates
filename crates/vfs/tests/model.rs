@@ -1127,7 +1127,7 @@ fn a_volume_publishes_deltas_that_rebuild_its_full_image() {
 }
 
 proptest! {
-  #![proptest_config(slates_test_seeds::seeded(ProptestConfig { cases: 400, max_shrink_iters: 4000, .. ProptestConfig::default() }, include_str!("model.proptest-regressions")).unwrap())]
+  #![proptest_config(slates_test_seeds::seeded(ProptestConfig { cases: slates_test_seeds::cases(400), max_shrink_iters: 4000, .. ProptestConfig::default() }, include_str!("model.proptest-regressions")).unwrap())]
 
   #[test]
   fn the_volume_equals_the_model_on_every_history(steps in prop::collection::vec(step(), 1..40)) {

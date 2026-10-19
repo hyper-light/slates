@@ -956,7 +956,7 @@ mod tests {
   const WINDOWS: u64 = 48;
 
   proptest! {
-    #![proptest_config(slates_test_seeds::unseeded(ProptestConfig { cases: 2000, .. ProptestConfig::default() }))]
+    #![proptest_config(slates_test_seeds::unseeded(ProptestConfig { cases: slates_test_seeds::cases(2000), .. ProptestConfig::default() }))]
 
     /// A-126: a written file's spans cover exactly the windows its writes named. Do: add random spans of whole windows
     /// in any order. Expect: the spans stay ascending, disjoint and never touching (coalesced), and cover exactly the

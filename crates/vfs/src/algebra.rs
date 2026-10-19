@@ -406,7 +406,7 @@ mod tests {
   }
 
   proptest! {
-    #![proptest_config(slates_test_seeds::unseeded(ProptestConfig { cases: 2000, .. ProptestConfig::default() }))]
+    #![proptest_config(slates_test_seeds::unseeded(ProptestConfig { cases: slates_test_seeds::cases(2000), .. ProptestConfig::default() }))]
 
     /// T-1.18: net-apply equals raw replay, every hunk lies within its sources.
     #[test]

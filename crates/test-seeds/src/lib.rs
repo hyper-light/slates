@@ -150,6 +150,23 @@ pub fn seeded(config: Config, reviewed: &str) -> Result<Config, SeedRefused> {
   })
 }
 
+/// The case count a proptest suite should run: `PROPTEST_CASES` when the environment sets it, else `default`.
+///
+/// **A suite that writes `cases: 150` into its `ProptestConfig` silently ignores `PROPTEST_CASES`.** proptest
+/// reads that variable in `Config::default()`, and an explicit field set afterwards overrides it — so a deep
+/// sweep asked for with `PROPTEST_CASES=6000` quietly runs the default and reports coverage it never had. Found
+/// on 2026-10-19 trying to deepen the DAX chaos schedule: the run "at 6,000 cases" had run 150.
+///
+/// Nineteen suites carried the bare literal and `crates/vfs/tests/differential.rs` had solved it locally and
+/// alone, which is why CI's `PROPTEST_CASES=2000` took effect there and nowhere else. One definition, so the
+/// next suite cannot miss it.
+pub fn cases(default: u32) -> u32 {
+  std::env::var("PROPTEST_CASES")
+    .ok()
+    .and_then(|set| set.parse().ok())
+    .unwrap_or(default)
+}
+
 /// `config` for a suite with no reviewed seeds: a new failing seed is reported, never written.
 pub fn unseeded(config: Config) -> Config {
   Config {

@@ -1278,7 +1278,7 @@ impl Oracle {
 }
 
 proptest! {
-  #![proptest_config(slates_test_seeds::unseeded(ProptestConfig { cases: 150, .. ProptestConfig::default() }))]
+  #![proptest_config(slates_test_seeds::unseeded(ProptestConfig { cases: slates_test_seeds::cases(150), .. ProptestConfig::default() }))]
 
   /// T-1.10 and AC-1.10: after every step the overlay's diverged set, its witnesses and its
   /// drift list equal the oracle's, and every readable file reads what the oracle says.
