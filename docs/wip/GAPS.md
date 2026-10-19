@@ -6494,11 +6494,26 @@ so the cap itself costs no catch rate. Verified: 360 runs, 0 failures, 0 `ENOSPC
 cycles finishes in 2.1 s inside the anchor's restart policy; `clippy --workspace --all-targets -D warnings` and
 `fmt --check` exit 0; the cli suite 31/31.
 
-**Owed:** `wanted()` in `crates/bridge-fuse/src/init.rs` never asks for
+**Owed — CLOSED 2026-10-19.** The entry read: "`wanted()` in `crates/bridge-fuse/src/init.rs` never asks for
 `FUSE_MAX_PAGES` and the INIT reply writes `max_pages = 0`, so the kernel keeps its own pages-per-request ceiling
 and the advertised `max_write` of 256 KiB is not what one request carries — verified in our source by two
 independent readings, but the kernel half is read from `fuse_perform_write`, not measured here, and no `strace` of
-the daemon's reads was taken.
+the daemon's reads was taken."
+
+Both halves are now settled. **Measured** (the evidence the entry said was missing, taken as a count rather than
+an strace): each FUSE request is one `read()` from `/dev/fuse`, so the daemon's `syscr` over a known write is
+load-independent — writing 256 MiB, a 128 KiB buffer cost 4,101 reads (2,048 one-request calls, pinning the scale
+at 2.0 reads per request), and before the fix a 256 KiB buffer cost the same ~4,100, i.e. two requests per call.
+**Fixed**: `wanted()` asks for the flag and the reply carries `max_pages = MAX_WRITE / page_size` (run-time,
+clamped to the kernel's `FUSE_MAX_MAX_PAGES`); after it, 256 KiB is 2,058 reads — one request — and 1 MiB is
+2,051, four. Half the round trips for every write ≥ 256 KiB.
+
+Two things the entry did not anticipate. The device's `writable_cap` was derived from the kernel *default* page
+count, so negotiating a larger one would have let a 64 KiB-page guest ask past the cap the device enforces; it
+now follows the negotiated count. And the **read** side does not move — 128 KiB per READ request at any buffer —
+because the mount's readahead window is 128 kB (`/sys/class/bdi/<maj:min>/read_ahead_kb`, read directly), which
+is root-owned and therefore a host knob, not something an unprivileged daemon can lift. Full record in
+`BENCHMARKS.md`. The x86_64 leg of the count is still owed.
 
 ### 2026-10-18: a zero-copy read handed the peer the whole content arena, writable (A-135; escape closed)
 
