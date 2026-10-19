@@ -145,6 +145,45 @@ done.
 Narrowing the kernel range below 6.13…6.19 needs a kernel between the two; the three hosts available are
 6.12, 6.19 and 7.2, so it was not narrowed here.
 
+## The fix is one branch, and §4.6 already mandates it
+
+§4.6 does not leave this open. It says, in its own words:
+
+> Infinite cache lifetimes require **proven** invalidation delivery and recovery for every mutation source; a
+> notifier encoder alone cannot justify them. … A transport that cannot implement the requested coherence
+> **refuses that guarantee**.
+
+Delivery for a *negative* entry is no longer proven — it is disproven, on a shipping kernel. So granting one an
+infinite lifetime is not a posture preference; it is already outside the rule the design states. R4 settles the
+rest: correctness is never weighed against performance, so "keep it because the alternative costs lookups" is
+not available.
+
+**And a runtime degrade cannot rescue it, which is worth recording because it is the obvious idea.** The
+machinery exists and looks perfect for this: `Attachments::set_coherence` is public, and
+`VolumeBridge::cache_lifetime` already answers `CacheLifetime::Bounded { ns: 0 }` for
+`CacheCoherence::Revalidated`, which `serve_lookup` turns into a plain uncached `ENOENT`. So the channel could
+notice the first refusal — it now counts them — and drop this attachment to `Revalidated`. It does not work:
+by the time a refusal is observed, the kernel is **already** holding that name as absent with an infinite
+lifetime, and it will never ask again. Degrading changes what is granted next, and nothing recovers what was
+granted before. The first stale name per mount would survive any adaptive scheme.
+
+So the only fix that closes the hole is to not grant it in the first place:
+
+- **Site:** `serve_lookup` in `crates/bridge-fuse/src/bridge.rs`, the branch
+  `if matches!(looked, Err(VfsError::NotFound)) && valid != (0, 0)`. A miss stops being answered as a cached
+  negative entry and goes back to a plain `ENOENT`, which is what the code did before `c3c0024b`.
+- **No constant is needed.** Zero is not a tuning value; the existing `valid != (0, 0)` guard already routes it.
+- **Scope:** negative entries only. Positive entries, pages and listings keep `Forever`, because the kernel
+  honours *their* invalidation — measured above.
+- **Cost:** the negative-entry share of `c3c0024b`'s "negative entries, kept pages and listings" (together:
+  requests 21,709 → 19,222, lookups −28% on a pip install). That share has never been measured on its own and
+  must be, before and after, on a Linux host.
+- **Also required in the same change (CLAUDE.md):** §4.6's cache-posture paragraph and its status blockquote,
+  the amendment log, and `c3c0024b`'s claim in `BENCHMARKS.md`, since this partly reverses it.
+
+That is a change to a shipped caching promise on **every** platform, reversing a measured optimization, so it
+is written up here rather than taken unilaterally. The analysis above is complete enough to act on in one pass.
+
 ## Reproduction
 
 ```
