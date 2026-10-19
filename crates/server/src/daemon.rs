@@ -1884,6 +1884,44 @@ impl Daemon {
     Ok(held)
   }
 
+  /// Test support: **wedges** this daemon's control shard for `span_ns` — a task that sleeps on the shard's
+  /// thread, so the shard runs nothing else and, unlike [`Self::starve_control_shard`], **consumes no CPU**
+  /// while it does. Returns the admitted hold once it is genuinely on the shard, like its sibling; its answer
+  /// is the measured span.
+  ///
+  /// The two are different injections, for the two halves of the §4.14 rule, and what a test asserts decides
+  /// which it wants. An observation's budget is the **target shard's own CPU time** (A-65,
+  /// `docs/bugs/2026-10-03-an-observation-read-a-starved-shard-as-wedged.md`): a shard that is working but slow
+  /// is given more wall time and answers, and only a shard that is not running ends the observation at its
+  /// deadline. So a test that wants a **deadline** must wedge; a spinning hold produces one only on a machine
+  /// idle enough to run the spin at the wall clock's pace.
+  ///
+  /// Measured 2026-10-18 on an 18-core Mac under twenty-four CPU burners: a two-second *spinning* hold advanced
+  /// the shard's CPU clock by 153 ms (72 ms to 225 ms), never reached the 300 ms budget, and the observations
+  /// that three tests expected to deadline were answered after the hold ended instead. A wedge of the same span
+  /// advances it by nothing, which is the condition those tests are about.
+  pub fn wedge_control_shard(&self, span_ns: u64) -> Result<Admitted<u64>, ObserveError> {
+    // The same barrier as the spinning hold: this call returns once the shard is on it, so a question
+    // submitted afterwards is certainly ordered behind it.
+    let (sleeping, confirm) = std::sync::mpsc::channel::<()>();
+    let held = self
+      .pending(
+        self.shards.first().copied(),
+        OBSERVE_BUDGET_NS.saturating_add(span_ns),
+        move || {
+          let _ = sleeping.send(());
+          let begin = slates_rt::futures::now_ns();
+          // The point of the fixture: the shard's thread is off the CPU for the span, not burning it.
+          #[allow(clippy::disallowed_methods)]
+          std::thread::sleep(std::time::Duration::from_nanos(span_ns));
+          Ok(slates_rt::futures::now_ns().saturating_sub(begin))
+        },
+      )?
+      .admit()?;
+    let _ = confirm.recv_timeout(std::time::Duration::from_nanos(OBSERVE_BUDGET_NS));
+    Ok(held)
+  }
+
   /// Whether this daemon's fleet has **region-placed** the head of `object` (§4.8): its control-shard
   /// membership loop replicated the head's record to the candidate holders and recorded a quorum of
   /// acknowledgements. A test or an operator reads this to observe cross-node replication: `Ok(false)` if

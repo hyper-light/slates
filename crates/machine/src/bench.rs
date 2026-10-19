@@ -22,6 +22,39 @@ pub const PROBE_WALL_BUDGET: Duration = Duration::from_millis(250);
 /// contributes at most one percent of it (lmbench's rule, GAPS §5).
 pub const TIMER_OVERHEAD_FACTOR: u64 = 100;
 
+/// The process's involuntary context switches so far (`getrusage`'s `ru_nivcsw`): a stretch of work during
+/// which this count moved was taken off the CPU by the scheduler, and its wall time is the machine's doing
+/// rather than the code's.
+///
+/// This is the second of the three busy-machine discriminators (`GAPS.md`, 2026-10-18), and it lives here
+/// because it is a measurement primitive every crate's timing assertions need. It was copied by hand into
+/// three places first (`crates/vfs/examples/vfs_bench.rs`, `crates/client/tests/driver.rs`,
+/// `crates/ipc/tests/rendezvous.rs`), and a fourth site is what made the copies worth collapsing — the same
+/// way eleven copies of the profile-escalation ladder hid the fixture that failed sixty tests.
+///
+/// Use it to attribute a tight "was this fast" bound: assert the bound **or** that the count moved. A
+/// *sleeping* sampler's wake lateness is not a substitute — it measures a different quantity and under-covers
+/// by a margin that varies with nothing in particular (measured: 20 ms against 65 ms for near-identical steps).
+#[cfg(unix)]
+pub fn involuntary_switches() -> u64 {
+  let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
+  // SAFETY: `getrusage` fills the `rusage` the pointer names and returns zero on success; `RUSAGE_SELF` is a
+  // valid selector; the buffer is ours, fully sized and zeroed before the call.
+  let usage = unsafe {
+    if libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) != 0 {
+      return 0;
+    }
+    usage.assume_init()
+  };
+  u64::try_from(usage.ru_nivcsw).unwrap_or(0)
+}
+
+/// Without the counter, every stretch of work counts as the code's own.
+#[cfg(not(unix))]
+pub fn involuntary_switches() -> u64 {
+  0
+}
+
 /// Shape: the smallest sample the stopping rule may accept; below this the bootstrap has too few
 /// distinct resamples to mean anything (Kalibera and Jones's minimum repetition count).
 pub const MIN_SAMPLES: usize = 16;

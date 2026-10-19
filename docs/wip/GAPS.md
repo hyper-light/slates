@@ -7230,6 +7230,30 @@ Fixed by deriving the helper's life from the deadline it will be killed at (`han
 so both sides of the relation move together; red-checked by collapsing the multiple, which reproduces the
 original failure exactly.
 
+**A sixth shape, and the sharpest one: injecting *busy* where the product means *stopped*.** Three tests in
+`crates/server/tests/observe.rs` made a shard unavailable by **spinning** a task on it and asserted that an
+observation of it hits its deadline. But an observation's budget is the target shard's **own CPU time**, not wall
+time — that is the whole of A-65 and `docs/bugs/2026-10-03-an-observation-read-a-starved-shard-as-wedged.md`: a
+shard the host is starving keeps its budget and is answered late, and only a shard that is not running ends the
+observation. A spinning hold reaches a CPU budget only on a machine idle enough to spin at the wall clock's pace.
+Instrumented under 24 burners: a two-second spin advanced the shard's CPU clock by **153 ms** against a 300 ms
+budget, so the extension kept granting windows and all three observations were answered. Written out, those tests
+asserted *a busy shard is unavailable*, which the product deliberately denies. Fixed with a second injection —
+`Daemon::wedge_control_shard`, a task that **sleeps**, so the shard consumes no CPU and the deadline fires on any
+machine — while `starve_control_shard` keeps its spin for the fleet suite, which wants wall-time silence on the
+probe plane. Full record: `docs/bugs/2026-10-18-three-observe-tests-injected-busy-where-the-product-means-stopped.md`.
+
+**Two wrong hypotheses on the way there, recorded because both were plausible and both cost a measurement to kill:**
+that the hold's start barrier was timing out (it was not — confirmations arrived in 10.4 µs to 515 ms against a 10 s
+bound, and the discarded `let _ =` on it was a red herring), and that a budget of 300 ms that waited 2.33 s was an
+unbounded retry (it is the documented CPU-budget extension, bounded by the shard's own progress). Neither would have
+been caught by reading the code more carefully; both died to one `eprintln!` of the actual numbers.
+
+**And the duplication rule again.** `involuntary_switches` — discriminator 2 — had been copied by hand into three
+files. Rather than make the wedge test a fourth copy it now lives once, in `slates_machine::bench`, and the three
+call it. The eleven-copy escalation ladder below is the same lesson at larger scale: **a policy written out N times
+is one that has to be remembered N times, and the copy that gets missed is the one in a file nobody greps.**
+
 **And what the ninth failure was actually worth.** `profile::tests::a_power_state_change_is_detected_and_triggers_a_refresh`
 failed at load 56 as another instance of the fourth shape — but rewriting it to assert the refused outcome
 exposed a real defect in `MachineProfile::refresh_cheap`: it recorded the new power state *before* the wake

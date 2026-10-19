@@ -64,30 +64,6 @@ struct Ticker {
   longest_switches: u64,
 }
 
-/// The process's involuntary context switches so far (`getrusage`): a step during which the count moved was
-/// preempted by the scheduler, and its length is not the driver's doing. This is the canonical attribution of
-/// `crates/vfs/examples/vfs_bench.rs` (`involuntary_switches`), which this file's noise comment already cites
-/// and did not use.
-#[cfg(unix)]
-fn involuntary_switches() -> u64 {
-  let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
-  // SAFETY: `getrusage` fills the `rusage` the pointer names and returns zero on success; `RUSAGE_SELF` is a
-  // valid selector; the buffer is ours and fully sized.
-  let usage = unsafe {
-    if libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) != 0 {
-      return 0;
-    }
-    usage.assume_init()
-  };
-  u64::try_from(usage.ru_nivcsw).unwrap_or(0)
-}
-
-/// Without the counter every step counts as the driver's own.
-#[cfg(not(unix))]
-fn involuntary_switches() -> u64 {
-  0
-}
-
 impl Ticker {
   /// Times one loop step that made `call`, keeping the longest and **how many times the scheduler took the
   /// thread away during it**. A step is judged by the clock and attributed by that count: one the OS preempted
@@ -118,21 +94,21 @@ impl Ticker {
       && started.elapsed() < within
     {
       let step = Instant::now();
-      let step_switches = involuntary_switches();
+      let step_switches = slates_machine::bench::involuntary_switches();
       let mut events = driver.pump(client);
       self.note(
         "pump",
         step.elapsed(),
-        involuntary_switches().saturating_sub(step_switches),
+        slates_machine::bench::involuntary_switches().saturating_sub(step_switches),
       );
       if Instant::now() >= next_tick {
         let ticked = Instant::now();
-        let tick_switches = involuntary_switches();
+        let tick_switches = slates_machine::bench::involuntary_switches();
         events.extend(driver.tick(client));
         self.note(
           "tick",
           ticked.elapsed(),
-          involuntary_switches().saturating_sub(tick_switches),
+          slates_machine::bench::involuntary_switches().saturating_sub(tick_switches),
         );
       }
       for event in events {
@@ -160,7 +136,7 @@ impl Ticker {
       self.note(
         "a whole step: pump, tick and the events",
         step.elapsed(),
-        involuntary_switches().saturating_sub(step_switches),
+        slates_machine::bench::involuntary_switches().saturating_sub(step_switches),
       );
       std::hint::spin_loop();
     }
@@ -280,16 +256,16 @@ fn connect_from_the_loop(instance: &str, ticker: &mut Ticker) -> Client {
   let started = Instant::now();
   loop {
     let step = Instant::now();
-    let connect_switches = involuntary_switches();
+    let connect_switches = slates_machine::bench::involuntary_switches();
     match Client::begin_connect(instance, deadlines()) {
       Ok(mut connecting) => loop {
         let step = Instant::now();
-        let switches = involuntary_switches();
+        let switches = slates_machine::bench::involuntary_switches();
         let polled = connecting.poll();
         ticker.note(
           "Connecting::poll",
           step.elapsed(),
-          involuntary_switches().saturating_sub(switches),
+          slates_machine::bench::involuntary_switches().saturating_sub(switches),
         );
         match polled {
           Ok(Some(client)) => return client,
@@ -308,7 +284,7 @@ fn connect_from_the_loop(instance: &str, ticker: &mut Ticker) -> Client {
         ticker.note(
           "Client::begin_connect",
           step.elapsed(),
-          involuntary_switches().saturating_sub(connect_switches),
+          slates_machine::bench::involuntary_switches().saturating_sub(connect_switches),
         );
         std::hint::spin_loop();
       }

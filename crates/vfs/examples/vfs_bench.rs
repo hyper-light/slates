@@ -604,28 +604,6 @@ fn scheduling_jitter_ns() -> u64 {
   longest
 }
 
-/// The process's involuntary context switches so far (`getrusage`): a slice during which the
-/// count moved was preempted by the scheduler, and its length is not the volume's doing.
-#[cfg(unix)]
-fn involuntary_switches() -> u64 {
-  let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
-  // SAFETY: `getrusage` fills the `rusage` the pointer names and returns zero on success;
-  // `RUSAGE_SELF` is a valid selector; the buffer is ours and fully sized.
-  let usage = unsafe {
-    if libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) != 0 {
-      return 0;
-    }
-    usage.assume_init()
-  };
-  u64::try_from(usage.ru_nivcsw).unwrap_or(0)
-}
-
-/// Without the counter every slice counts.
-#[cfg(not(unix))]
-fn involuntary_switches() -> u64 {
-  0
-}
-
 /// AC-1.8: destroy in slices under the shard's step budget, sliced by the volume's own clock;
 /// no slice may run past the budget by more than the clock-check allowance plus the machine's
 /// measured scheduling jitter, unless the scheduler preempted it (the process's involuntary
@@ -643,12 +621,12 @@ fn destroy_rows(mut tree: Tree, step_budget_ns: u64) -> Result<bool, Box<dyn Err
   let total = Instant::now();
   loop {
     let dealloc_before = DEALLOC_NS.load(Ordering::Relaxed);
-    let switches_before = involuntary_switches();
+    let switches_before = slates_machine::bench::involuntary_switches();
     let started = Instant::now();
     let progress = vol.destroy_step(store, step_budget_ns)?;
     let took = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
     let in_dealloc = DEALLOC_NS.load(Ordering::Relaxed) - dealloc_before;
-    let was_preempted = involuntary_switches() > switches_before;
+    let was_preempted = slates_machine::bench::involuntary_switches() > switches_before;
     match progress {
       DestroyProgress::Released(n) => {
         released += n;

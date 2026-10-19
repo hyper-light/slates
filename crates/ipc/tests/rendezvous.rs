@@ -181,29 +181,6 @@ fn no_daemon_means_daemon_unavailable() {
   assert!(started.elapsed() < Duration::from_secs(2));
 }
 
-/// The process's involuntary context switches so far (`getrusage`): a poll during which the count moved was
-/// preempted by the scheduler, and its length is not the claim's doing. The canonical attribution of
-/// `crates/vfs/examples/vfs_bench.rs` (`involuntary_switches`).
-#[cfg(unix)]
-fn involuntary_switches() -> u64 {
-  let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
-  // SAFETY: `getrusage` fills the `rusage` the pointer names and returns zero on success; `RUSAGE_SELF` is a
-  // valid selector; the buffer is ours and fully sized.
-  let usage = unsafe {
-    if libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) != 0 {
-      return 0;
-    }
-    usage.assume_init()
-  };
-  u64::try_from(usage.ru_nivcsw).unwrap_or(0)
-}
-
-/// Without the counter every poll counts as the claim's own.
-#[cfg(not(unix))]
-fn involuntary_switches() -> u64 {
-  0
-}
-
 /// The longest poll seen, and whether the scheduler took the thread away during **that** poll. The bound
 /// below judges a poll by the clock; this attributes it, so a machine that preempted the thread is not read
 /// as a claim that waited (measured 2026-10-18: a 129 ms poll against the 100 ms bound under a full
@@ -283,11 +260,11 @@ fn poll_until_refused(mut claim: slates_ipc::Claim) -> (IpcError, u64, Longest) 
   let mut longest = Longest::default();
   loop {
     let at = Instant::now();
-    let switches = involuntary_switches();
+    let switches = slates_machine::bench::involuntary_switches();
     let polled = claim.poll();
     longest.note(
       at.elapsed(),
-      involuntary_switches().saturating_sub(switches),
+      slates_machine::bench::involuntary_switches().saturating_sub(switches),
     );
     polls += 1;
     match polled {
@@ -321,11 +298,11 @@ fn poll_while_serving(listener: &mut Listener, instance: &str) -> (slates_ipc::C
     });
     accepted.extend(served.unwrap_or_default());
     let at = Instant::now();
-    let switches = involuntary_switches();
+    let switches = slates_machine::bench::involuntary_switches();
     let polled = claim.poll().unwrap();
     longest.note(
       at.elapsed(),
-      involuntary_switches().saturating_sub(switches),
+      slates_machine::bench::involuntary_switches().saturating_sub(switches),
     );
     if let Some(connected) = polled {
       // The daemon's ends go with the test; the client's mapping keeps the region it opened.
