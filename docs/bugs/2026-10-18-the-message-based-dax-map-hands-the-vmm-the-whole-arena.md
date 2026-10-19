@@ -135,9 +135,31 @@ which the lint wall keeps away from file-creating syscalls (R1). The natural sea
 keeps handing out the arena's range, and **`bridge-virtiofs` narrows it to a udmabuf before it sends the
 descriptor**, since that crate already owns fd-passing to the front end and is already allowed the syscalls.
 That confines the change to the bridge, which is also where the refusal belongs when `/dev/udmabuf` cannot be
-opened. What it still needs beyond that: the `UDMABUF_CREATE` ioctl has no `rustix` wrapper, so one `unsafe`
-site and an `unsafe-budget.toml` raise naming it; the owned fd closed when the mapping is released; a paired
-`#[cfg]` arm off Linux; and the tests.
+opened. The lifetime is easier than it looks: `MessagePlacer::begin_map` sends synchronously
+(`channel.send_map(...)` before it records the outstanding request), so the udmabuf only has to outlive that
+call — create it, borrow it for the send, drop it. The receiver keeps its own descriptor.
+
+**But it is not bridge-local, and that is the finding that matters.** `UDMABUF_CREATE` refuses a memfd without
+`F_SEAL_SHRINK`, and slates' shared objects are created with `MemfdFlags::CLOEXEC` alone
+(`crates/mem/src/shared.rs`) and never sealed. So option 4 needs `slates-mem` to create the arena's object
+with `ALLOW_SEALING` and add `F_SEAL_SHRINK` after its sizing `ftruncate` — a change to how A-64's content
+object is made, and `SharedObject::create` also backs the IPC ring region (`crates/ipc/src/region.rs`), so it
+is either every object or a new constructor scoped to the arena.
+
+Sealing is at least *viable*: `ftruncate` appears exactly once in `shared.rs`, at creation, so nothing in the
+tree shrinks a shared object and `F_SEAL_SHRINK` costs nothing today. It does bind the future — no shared
+object may ever shrink — which is why it is a change to a decided structure rather than a local narrowing.
+
+**The complete shape, for whoever builds it:**
+1. `slates-mem` — `ALLOW_SEALING` at `memfd_create` and `F_SEAL_SHRINK` after the sizing `ftruncate`, either
+   for every `SharedObject` or through a constructor scoped to the content arena. Linux-only; the macOS and
+   Windows arms have no equivalent and DAX is Linux-only regardless.
+2. `bridge-virtiofs` — a Linux-only udmabuf module (one `unsafe` `ioctl`, `rustix` has no wrapper, with the
+   `unsafe-budget.toml` raise naming it), the narrowing in `device.rs`'s `DaxPlacer::Message` arm (the only
+   path that sends a descriptor off-process; `DaxPlacer::Local` maps in-process and is not this bug), and a
+   typed refusal when `/dev/udmabuf` cannot be opened — never a fall back to the wide descriptor.
+3. Tests on a Linux host: the descriptor's extent must equal the authorized window's, which is the inverse of
+   the measurement in this document.
 
 Of the four, **1 and 4 keep both zero-copy and confinement**; 4 is much the smaller change and the only one
 that leaves A-64 alone, which was the whole reason 1 was hard. It is worth being exact that **option 4
