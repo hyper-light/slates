@@ -5165,6 +5165,28 @@ merge, remote/replicated volumes, post-quantum encryption in transit and at rest
 tracking. The honest position is that slates trades local per-op latency for those properties — the inverse of
 Tectonic's "trade latency for scale."
 
+**Amendment (2026-10-18): the table already bounds how much of this is the round trip, and it is not most of it.**
+The order of levers below leads with the FUSE/daemon round trip, and the same table prices that round trip: a **stat
+is 13.9 µs p50** — one FUSE message to the daemon, a trivial lookup, and the reply. A create is 276.9 µs. Even
+allowing a create two or three messages where a stat takes one, the transport accounts for roughly 14–42 µs of it,
+**5–15%**; the other 85–95% is work the daemon does on the create path. Rewrite (471 µs) and create+fsync (1,234 µs)
+are further still from the floor.
+
+So the largest lever is **not** the transport: it is what a create costs inside the daemon, which is cross-platform
+VFS/server work rather than FUSE work, and is measurable in-process without a mount (`crates/vfs/examples/vfs_bench.rs`
+times a create+unlink in a populated tree). Lever (2) in the list below is in any case closed — io_uring was removed
+from the runtime on 2026-10-17 (A-136, Ada's A/B), so `FUSE_OVER_IO_URING` would be a second driver for one job.
+
+This is an inference from the recorded table, not a new measurement: it says where to point the profiler, not what
+the profiler will find. The owed step is unchanged and now has a sharper question — run
+`docs/wip/bench/fuse/fuse-perf.sh` (2,000 creates through the mount with `perf record` on the daemon) and attribute
+the ~263 µs *inside* the daemon: dispatch, shard hop, inode allocation, directory insert, merge/change tracking,
+publish bookkeeping.
+
+**Harness note.** The three-way table above cites `docs/wip/bench/fsbench/`, which **is not in the tree and never has
+been** (`git log --diff-filter=A -- '*fsbench*'` is empty). The commands are supposed to be the contract; this one
+cannot be re-run as cited. `docs/wip/bench/fuse/fuse-perf.sh` is the committed harness for the slates-FUSE leg.
+
 **The optimization target, now quantified.** The write path dominates: create 277 µs, rewrite 471 µs, create+fsync
 1,234 µs at p50, against overlayfs's 3–5 µs. Reducing the FUSE/daemon round-trip and the copy-up cost on writes is the
 single largest p99 lever for condition 12 — far larger than any landing-side gain. Reads (43 µs) and stats (14 µs) are
