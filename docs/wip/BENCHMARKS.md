@@ -5153,6 +5153,16 @@ A timing A/B was attempted first and is **not** reported as evidence: the host's
 (tmpfs itself fell 14,776 → 7,691 MiB/s), so the two runs were not comparable. The count is immune to that,
 which is why it is the measurement here.
 
+**x86_64 kernel-side confirmation is owed, and the attempt is recorded as not evidence.** The counts above are
+Linux **aarch64** (Docker, 6.12). Confirming the same on the x86_64 box needs a release build *there*, and its
+scratch tree sits at an old commit: dropping today's `init.rs`/`abi.rs` into it failed to compile (29 errors,
+the files reference newer APIs), so the probe that ran used the **pre-change** binary and its numbers
+(7,953 / 6,064 / 4,563 reads) say nothing about this fix. The three files were restored from that tree's own
+HEAD and it builds again. A full sync of that tree is not a change to make unilaterally, so the x86_64 leg
+stays owed. What does carry across architectures meanwhile: `max_pages` is derived from the run-time page size
+and the ABI test asserts `max_pages × page_size == MAX_WRITE` on every platform CI builds, and the kernel code
+path that honours the field is architecture-independent.
+
 **The read side does not move, and the reason is measured.** The same count over a 256 MiB read-back is 4,100
 daemon reads whatever the caller's buffer — 128 KiB per READ request, unchanged by `max_pages`:
 
