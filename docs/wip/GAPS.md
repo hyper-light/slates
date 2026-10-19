@@ -7276,6 +7276,14 @@ Fixed with one definition — `slates_test_seeds::cases(default)` — and all ei
 the next one cannot miss it. Verified non-vacuously by scaling: the DAX schedule's in-test time goes 0.04 s at
 150, 0.58 s at 1,500, 3.62 s at 6,000, 12.60 s at 20,000, linear in the count.
 
+**And then the same mistake inside the fix: there are two spellings.** The sweep grepped `cases: \d+` and so
+missed four suites written `ProptestConfig::with_cases(N)` — `crates/vfs/tests/{seek,change,snapshot_diff}.rs`
+and `crates/mem/src/ranges.rs`. They were found by accident, watching Miri crawl through the `ranges.rs`
+proptest and reading its config. All four now call `cases()` too, verified by the same scaling check (seek:
+0.32 s at 64 cases, 11.07 s at 2,000). **A sweep is over the thing, not over the way it happens to be
+written** — this ledger has that lesson under "sibling sweep: every spelling" from 2026-09-28, and it still
+caught me twice today: once on `measure(options)` versus `measure(ProfileOptions { .. })`, and once here.
+
 **And the deep sweeps the fix made possible, all green** (release, macOS aarch64, host load 20–31):
 
 | schedule | default | deepened | result |

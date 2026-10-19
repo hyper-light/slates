@@ -176,7 +176,7 @@ mod tests {
   }
 
   proptest! {
-    #![proptest_config(slates_test_seeds::unseeded(ProptestConfig::with_cases(512)))]
+    #![proptest_config(slates_test_seeds::unseeded(ProptestConfig::with_cases(slates_test_seeds::cases(512))))]
 
     /// A-105 and A-110's oracle for the bit set. Do: apply generated marks and takes, in units of 3 bytes over 400 bytes
     /// (more than six words), to the set and to a unit map, and walk the runs after each step. Expect: each take returns

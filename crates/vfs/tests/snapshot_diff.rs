@@ -81,7 +81,7 @@ fn held(state: &PathState) -> BTreeSet<String> {
 }
 
 proptest! {
-  #![proptest_config(slates_test_seeds::seeded(ProptestConfig::with_cases(256), include_str!("snapshot_diff.proptest-regressions")).unwrap())]
+  #![proptest_config(slates_test_seeds::seeded(ProptestConfig::with_cases(slates_test_seeds::cases(256)), include_str!("snapshot_diff.proptest-regressions")).unwrap())]
 
   /// AUD-29-76 (`advance` of a snapshot mount). Do: apply a generated history, snapshot, apply a second,
   /// snapshot; ask which paths changed between the two. Expect: every path whose file bytes, link count,

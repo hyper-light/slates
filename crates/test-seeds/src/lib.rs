@@ -157,6 +157,11 @@ pub fn seeded(config: Config, reviewed: &str) -> Result<Config, SeedRefused> {
 /// sweep asked for with `PROPTEST_CASES=6000` quietly runs the default and reports coverage it never had. Found
 /// on 2026-10-19 trying to deepen the DAX chaos schedule: the run "at 6,000 cases" had run 150.
 ///
+/// **Two spellings, and the first sweep found only one.** `ProptestConfig { cases: N, .. }` and
+/// `ProptestConfig::with_cases(N)` both set the field; grepping `cases: \d+` on 2026-10-19 caught eighteen
+/// suites and missed four written the other way, including `crates/mem/src/ranges.rs`. Grep **both**, or grep
+/// `with_cases\|cases:` — a sweep is over the thing, not over the way it happens to be written.
+///
 /// Eighteen suites carried the bare literal and `crates/vfs/tests/differential.rs` had solved it locally and
 /// alone, which is why CI's `PROPTEST_CASES=2000` took effect there and nowhere else. One definition, so the
 /// next suite cannot miss it. (A nineteenth literal stays on purpose: this crate's own `cases: 4` below, a
