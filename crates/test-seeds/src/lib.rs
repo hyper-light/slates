@@ -157,9 +157,10 @@ pub fn seeded(config: Config, reviewed: &str) -> Result<Config, SeedRefused> {
 /// sweep asked for with `PROPTEST_CASES=6000` quietly runs the default and reports coverage it never had. Found
 /// on 2026-10-19 trying to deepen the DAX chaos schedule: the run "at 6,000 cases" had run 150.
 ///
-/// Nineteen suites carried the bare literal and `crates/vfs/tests/differential.rs` had solved it locally and
+/// Eighteen suites carried the bare literal and `crates/vfs/tests/differential.rs` had solved it locally and
 /// alone, which is why CI's `PROPTEST_CASES=2000` took effect there and nowhere else. One definition, so the
-/// next suite cannot miss it.
+/// next suite cannot miss it. (A nineteenth literal stays on purpose: this crate's own `cases: 4` below, a
+/// fixture for testing the seed machinery, which must not grow when someone asks a *suite* for a deep sweep.)
 pub fn cases(default: u32) -> u32 {
   std::env::var("PROPTEST_CASES")
     .ok()

@@ -7196,8 +7196,10 @@ job, not whether the machine was fast enough while it did.
 Trying to deepen the DAX chaos schedule — `PROPTEST_CASES=6000 cargo test --release -p slates-vfs --test dax
 a_random_interleaving` — ran **150 cases**, the hardcoded default. proptest reads that variable in
 `Config::default()`, and a `ProptestConfig { cases: 150, ..default() }` sets the field *after*, so the literal
-wins. Nineteen suites carried a bare literal; `crates/vfs/tests/differential.rs` had solved it locally with its
-own `cases()` helper, alone, which is why CI's `PROPTEST_CASES=2000` took effect there and nowhere else.
+wins. **Eighteen** suites carried a bare literal (nineteen sites: the nineteenth is `test-seeds`' own `cases: 4`
+fixture, which tests the seed machinery and must *not* grow with a deep sweep, so it stays);
+`crates/vfs/tests/differential.rs` had solved it locally with its own `cases()` helper, alone, which is why
+CI's `PROPTEST_CASES=2000` took effect there and nowhere else.
 
 The hazard is the one this ledger keeps naming: **the run reports coverage it never had.** I nearly recorded "a
 6,000-case chaos sweep passed" on the strength of a 150-case run.
