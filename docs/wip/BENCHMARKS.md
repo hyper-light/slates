@@ -5165,6 +5165,39 @@ merge, remote/replicated volumes, post-quantum encryption in transit and at rest
 tracking. The honest position is that slates trades local per-op latency for those properties — the inverse of
 Tectonic's "trade latency for scale."
 
+**Measured (2026-10-18): the VFS primitive is 1% of a FUSE create, and the transport 5%. The other ~94% is the
+path between them.** The amendment below reasoned from the stat row that the round trip could not be most of a
+create; the in-process half is now measured rather than inferred.
+
+`cargo run --release --example vfs_bench -p slates-vfs`, macOS aarch64 (M-series, 18 cores), host load 25,
+2026-10-18 — the namespace row, which creates and unlinks one file in a populated tree:
+
+| in-process VFS | median | p99 |
+|---|---|---|
+| create **and** unlink, 1,000-file tree | **3,875 ns** | 9,375 ns |
+| create **and** unlink, 100,000-file tree | **3,958 ns** | 4,750 ns |
+| look one name up in a 36-entry dir | 343 ns | 348 ns |
+
+So the VFS's own create is **~2 µs** (the row is two namespace operations) and flat as the tree grows 100×.
+Set against the FUSE create's 276.9 µs p50:
+
+| where the 277 µs is | µs | share |
+|---|---|---|
+| FUSE transport (the stat row: one message, a trivial lookup, a reply) | ~14 | ~5% |
+| the VFS create itself | ~2–4 | ~1% |
+| **everything between them** — bridge dispatch, the client/daemon IPC, the shard hop, per-op bookkeeping | **~259** | **~94%** |
+
+**Caveats, stated.** The two legs are on different hosts and architectures (in-process macOS aarch64; the FUSE
+figures Linux x86_64 under Docker, kernel 6.12) and the harnesses differ, so the shares are order-of-magnitude,
+not a ledger. What they cannot be is reversed: a 100× platform difference would be needed to make the VFS or the
+transport the dominant term, and the two hosts are within a small factor of each other on every other row.
+
+**What this means for the lever.** The cost is neither the mount protocol nor the copy-on-write filesystem — both
+are already microsecond-scale. It is the per-operation path the daemon runs between receiving a FUSE message and
+calling the VFS. That is cross-platform work, it is the same path every transport shares (FUSE, NFS, virtio-fs),
+and it is where a profile should go next: `docs/wip/bench/fuse/fuse-perf.sh` runs 2,000 creates with `perf record`
+on the daemon and will name the symbols inside that 259 µs. Owed; it needs a Linux host quiet enough to profile.
+
 **Amendment (2026-10-18): the table already bounds how much of this is the round trip, and it is not most of it.**
 The order of levers below leads with the FUSE/daemon round trip, and the same table prices that round trip: a **stat
 is 13.9 µs p50** — one FUSE message to the daemon, a trivial lookup, and the reply. A create is 276.9 µs. Even
