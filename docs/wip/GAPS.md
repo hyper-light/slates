@@ -6758,6 +6758,21 @@ The lesson generalises past this test: **a corruption test whose two corruptions
 observe which source a repair used.** Red-check every "nothing happened" assertion; a vacuous one is worse than
 none, because it reports coverage.
 
+### 2026-10-19: Miri over `slates-mem` did **not** finish, and is owed on a quiet machine
+
+The standing rule is to run Miri on changed `rt`/`mem` tests before pushing, and `crates/mem/src/region.rs`
+changed today (the twelfth profile fixture). `MIRIFLAGS=-Zmiri-ignore-leaks cargo +nightly miri test -p
+slates-mem` was given 45 minutes beside a full `cargo test --workspace` and **was killed at the bound without
+printing a result**. It is recorded as unfinished, not as a pass: the shell reported `exit=0`, which is the
+grep's exit and not Miri's — the same trap the CI-watch note names, and the reason the absence of a
+`test result:` line is what was read instead.
+
+What stands meanwhile: the DAX suite's Miri from the day before (52 passed, 0 failed, 396 s) exercises the same
+`ChunkArena` pin, unpin, deferred-free and scrub paths through the VFS, and the only `mem` change since is a
+test fixture's measurement call. Owed: the direct run on a machine that is not also running the workspace.
+No orphan was left — `timeout` killed the cargo process and the `miri` child went with it, which is worth
+noting because a stopped Miri burned a core for 84 minutes on 2026-10-18 when it did not.
+
 ### 2026-10-18: Miri over the DAX suite — 51/51 clean, and the proptest case is the whole cost
 
 The DAX gate's pin and free paths now have a Miri result, which they did not before: **51 passed, 0 failed, in
