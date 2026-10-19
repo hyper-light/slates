@@ -740,13 +740,38 @@ mod platform {
     // handoff its creator gave; by this module's rule no process truncates it while a view
     // lives, and every concurrent word is reached through the atomic views. The map borrows
     // nothing that outlives it.
-    unsafe { MmapOptions::new().offset(offset).len(len).map_mut(fd) }.map_err(|e| {
+    let map = unsafe { MmapOptions::new().offset(offset).len(len).map_mut(fd) }.map_err(|e| {
       MemError::OsRefused {
         call: "mmap",
         code: e.raw_os_error(),
       }
-    })
+    })?;
+    advise_huge_object(&map);
+    Ok(map)
   }
+
+  /// Asks for transparent huge pages behind a shared object's mapping (Linux).
+  ///
+  /// §4.6 L1 needs the content arena to be **physically** contiguous: `Volume::dax_migrate` moves a block to a
+  /// different *virtual* block, and if the backing is 4 KiB pages that moves no physical rows — the design calls
+  /// that security theatre in as many words. A private `Region` has asked for huge pages since it was written;
+  /// a shared object never has, and the DAX arena is a shared object.
+  ///
+  /// Unconditional, and harmless where it cannot apply: measured on Linux 7.2, a 64 KiB and a 1 MiB mapping
+  /// both take the advice with `OK` and receive **zero** huge pages, while an 8 MiB one comes back fully
+  /// backed — the kernel simply ignores what it cannot honour. That is also why the advice is not a *claim*:
+  /// whether a mapping actually got huge pages is `AnonHugePages`/`ShmemPmdMapped` in `/proc/self/smaps`, which
+  /// L1's zones must read and refuse on rather than trusting this call.
+  #[cfg(target_os = "linux")]
+  fn advise_huge_object(map: &MmapMut) {
+    // A refusal here costs nothing: the mapping is correct either way, and the only consequence is base pages.
+    let _ = map.advise(memmap2::Advice::HugePage);
+  }
+
+  /// The paired arm: no transparent huge pages to ask for off Linux (macOS offers user programs no superpages,
+  /// Appendix C; Windows large pages need a privilege slates never requires, R10).
+  #[cfg(not(target_os = "linux"))]
+  fn advise_huge_object(_map: &MmapMut) {}
 
   pub(super) fn create(name: &str, len: usize) -> Result<Inner, MemError> {
     let created = create_object(name)?;

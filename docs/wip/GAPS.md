@@ -8132,3 +8132,19 @@ object rather than global, since the IPC ring and the anchor segment share that 
 2 MB granularity for nothing.
 
 That is the whole of what L1's build needs to know, and none of it waits on a decision.
+
+**First piece built (2026-10-19): the arena's object is huge-page backed, and a test pins it.** `shared.rs`'s
+object mapping now asks for transparent huge pages on Linux — it never had, so until today
+`Volume::dax_migrate` was striding inside a 4 KiB-paged region and moving no physical rows at all, which is
+the theatre §4.6 names. The advice is unconditional and harmless where it cannot apply (the table above: 64 KiB
+and 1 MiB take it and get nothing), and it is deliberately **not** treated as a claim — the new test reads the
+kernel's own `ShmemPmdMapped` for the mapping instead.
+
+Red-checked on `adacachy` (`shmem_enabled: [advise]`), where it runs rather than skips: with the advice,
+green; with the advice removed, **`ShmemPmdMapped is 0 kB of 16384 kB`** and the test fails. On a host whose
+`shmem_enabled` is `[never]` — `fedora`, as it happens — it skips loudly, because the property is the
+kernel's to grant and not slates' to assert.
+
+What remains of L1 on top of this foundation: per-tenant zones with guard rows between them, placement wired
+to `stripe_target`, and the verify-and-refuse path in `bridge-virtiofs` so a zone that did *not* get its huge
+pages refuses writable DAX rather than pretending.

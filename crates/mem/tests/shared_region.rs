@@ -182,3 +182,62 @@ fn block_backing_exposes_a_shared_regions_fd_and_none_for_a_private_one() {
     "a private (anonymous) region exposes no DAX fd"
   );
 }
+
+/// §4.6 L1: the arena's shared object is backed by **huge pages**, so moving a block moves physical rows.
+///
+/// `Volume::dax_migrate` relocates a writable block to a different *virtual* block; if the backing is 4 KiB
+/// pages that moves no physical rows and the moving target is, in the design's own words, security theatre. A
+/// private `Region` has asked for huge pages since it was written; a shared object did not until 2026-10-19,
+/// and the DAX arena is a shared object.
+///
+/// Do: make a shared object several huge pages long, touch every byte, and read the kernel's own account of
+/// the mapping. Expect: `ShmemPmdMapped` covers it. The advice alone proves nothing — measured on Linux 7.2, a
+/// 64 KiB and a 1 MiB mapping both take `MADV_HUGEPAGE` with `OK` and get **zero** huge pages — which is why
+/// this asserts the kernel's number and not the call's return.
+///
+/// Linux-only, and skips loudly where the host will not give shmem huge pages (a container kernel with
+/// `shmem_enabled: never`, for instance): the property is the kernel's to grant.
+#[cfg(target_os = "linux")]
+#[test]
+#[cfg_attr(miri, ignore)] // a shared memory object is not modelled by Miri, as at `region.rs`
+fn a_shared_objects_mapping_is_backed_by_huge_pages_so_a_shift_moves_physical_rows() {
+  let shmem = std::fs::read_to_string("/sys/kernel/mm/transparent_hugepage/shmem_enabled")
+    .unwrap_or_default();
+  if !(shmem.contains("[always]") || shmem.contains("[advise]") || shmem.contains("[within_size]"))
+  {
+    eprintln!("skipping the huge-page backing proof: this host's shmem_enabled is {shmem:?}");
+    return;
+  }
+  // Several huge pages, so the kernel has something it can honour: below one huge page the advice is a no-op.
+  let span = 16 * 1024 * 1024;
+  let object = SharedObject::create(&object_name("huge"), span, Words::new()).unwrap();
+  // SAFETY: this test is the object's only accessor, which is what `ExclusiveObject` promises.
+  let mut region = Region::shared(unsafe { ExclusiveObject::new(object) }, PAGE);
+  region.bytes_mut().fill(0x7A);
+  let base = region.base() as usize;
+
+  let smaps = std::fs::read_to_string("/proc/self/smaps").unwrap();
+  let mut in_mapping = false;
+  let mut pmd_kb = 0u64;
+  for line in smaps.lines() {
+    if let Some((start, _)) = line.split_once('-')
+      && let Ok(addr) = usize::from_str_radix(start, 16)
+    {
+      in_mapping = addr == base;
+    }
+    if in_mapping && let Some(rest) = line.strip_prefix("ShmemPmdMapped:") {
+      pmd_kb = rest
+        .trim()
+        .trim_end_matches(" kB")
+        .trim()
+        .parse()
+        .unwrap_or(0);
+      break;
+    }
+  }
+  assert!(
+    pmd_kb > 0,
+    "the shared object's mapping is huge-page backed: ShmemPmdMapped is {pmd_kb} kB of {} kB",
+    span / 1024
+  );
+}
