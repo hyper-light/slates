@@ -128,8 +128,24 @@ The fix is architectural and is Ada's call. The options, with what each costs:
      every primitive it uses is now shown to work on a udmabuf — and the harness for that already exists
      (`crates/client/examples/crosvm_dax_ab/`).
 
+**Where option 4 would live, which is not where the bug is.** `Store::dax_backing` is nine lines returning the
+arena's `(BorrowedFd, offset, len)` from `ChunkArena::block_backing`, and a udmabuf is an **owned** fd with a
+per-mapping lifetime — so narrowing there would push fd ownership and a device open down into `slates-mem`,
+which the lint wall keeps away from file-creating syscalls (R1). The natural seam is the other end: the VFS
+keeps handing out the arena's range, and **`bridge-virtiofs` narrows it to a udmabuf before it sends the
+descriptor**, since that crate already owns fd-passing to the front end and is already allowed the syscalls.
+That confines the change to the bridge, which is also where the refusal belongs when `/dev/udmabuf` cannot be
+opened. What it still needs beyond that: the `UDMABUF_CREATE` ioctl has no `rustix` wrapper, so one `unsafe`
+site and an `unsafe-budget.toml` raise naming it; the owned fd closed when the mapping is released; a paired
+`#[cfg]` arm off Linux; and the tests.
+
 Of the four, **1 and 4 keep both zero-copy and confinement**; 4 is much the smaller change and the only one
-that leaves A-64 alone, which was the whole reason 1 was hard. Neither is a change to make unilaterally — 4
+that leaves A-64 alone, which was the whole reason 1 was hard. It is worth being exact that **option 4
+overturns nothing decided**: A-64's one-image-per-shard layout is untouched, it is not the copy arm the
+2026-10-17 A/B rejected, it keeps the crosvm route chosen on 2026-10-16 rather than forfeiting it, and
+`/dev/udmabuf` is not a privilege under R10 — it is the device a VMM host already has, and a daemon without it
+refuses DAX. What remains is a selection among four live options and the pinning interaction with L2 (row 3,
+unbuilt and with no production caller today). Neither is a change to make unilaterally — 4
 still has an untested VMM leg and a pinning cost — but the choice is no longer "reverse A-64, or give
 something up".
 
