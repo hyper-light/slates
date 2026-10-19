@@ -1,7 +1,7 @@
 #!/bin/bash
 # Run in a privileged container with the Linux release build of slates at /target and an output directory at /out:
 #   docker run --rm --privileged -v <linux-target>:/target:ro -v "$PWD/docs/wip/bench":/rw:ro -v <out>:/out \
-#     rust:1.98.0 bash /rw/realworld_native.sh
+#     rust:1.98 bash /rw/realworld_native.sh
 # The mount is unmounted on every exit path while the daemon still runs (a hard mount of an exiting daemon in its own
 # container wedges the container's teardown).
 # Real workloads on a slates NFSv4.2 volume through Linux's own client, beside tmpfs: a git clone + fsck, a cargo build

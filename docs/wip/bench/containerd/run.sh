@@ -3,7 +3,7 @@
 # containerd 1.7 and runc 1.1 from Debian trixie, in a privileged container (nested cgroup v2 delegated as dind does;
 # the native snapshotter, since overlayfs does not stack on Docker's overlay). Run with the Linux release build:
 #   docker run --rm --privileged -v <linux-target>:/target:ro -v "$PWD/docs/wip/bench/containerd":/c:ro \
-#     -v "$PWD/docs/wip/bench/fuse":/f:ro -v <out>:/out rust:1.98.0 bash /c/run.sh
+#     -v "$PWD/docs/wip/bench/fuse":/f:ro -v <out>:/out rust:1.98 bash /c/run.sh
 set -u
 # Nested cgroup v2 (as docker:dind's entrypoint does): move this container's processes into a child group so runc may
 # enable the domain controllers beneath the root.

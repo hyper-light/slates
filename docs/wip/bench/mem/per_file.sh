@@ -2,7 +2,7 @@
 # Condition 12, memory: what one file costs the daemon on a real tree, beside what the kernel's tmpfs pays for the same
 # tree. A privileged container with the Linux release build at /target/release/slates copies TREE (default /usr) into
 # a slates volume over the kernel's NFSv4.2 client and into tmpfs, and reports each side's growth:
-#   docker run --rm --privileged -v <target-volume>:/target:ro -v "$PWD/docs/wip/bench/mem":/m:ro rust:1.98.0 \
+#   docker run --rm --privileged -v <target-volume>:/target:ro -v "$PWD/docs/wip/bench/mem":/m:ro rust:1.98 \
 #     -v <out>:/m-out bash /m/per_file.sh [TREE]
 # slates' side is the proportional set size (smaps_rollup Pss: private pages plus each shared page divided by its
 # sharers) of the anchor and the daemon together, so content kept in anchor-owned RAM (A-64) is counted once.

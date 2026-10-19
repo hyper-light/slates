@@ -2,7 +2,7 @@
 # Condition 12: a real tree copied with `cp -a` (many files, real sizes) into slates and into the kernel's own NFS server
 # (nfsd exporting tmpfs, `sync` and `async`), both through the same Linux NFSv4.2 client, with tmpfs itself as the floor. Each target is
 # copied RUNS times, interleaved, into a fresh directory that is removed (untimed) before the next copy. Run in a privileged container with the Linux release build:
-#   docker run --rm --privileged -v <target-volume>:/target:ro -v "$PWD/docs/wip/bench/mixed":/m:ro rust:1.98.0 \
+#   docker run --rm --privileged -v <target-volume>:/target:ro -v "$PWD/docs/wip/bench/mixed":/m:ro rust:1.98 \
 #     bash /m/copy_tree.sh [TREE] [RUNS]
 set -u
 TREE=${1:-/usr}; RUNS=${2:-3}

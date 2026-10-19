@@ -5,7 +5,7 @@
 # given the same changes. The tree is copied into tmpfs first so every reader starts from RAM. Each round uses a fresh
 # volume and fresh mounts, so the first read is cold in the NFS client. Run in a privileged container with the Linux
 # release build:
-#   docker run --rm --privileged -v <target-volume>:/target:ro -v "$PWD/docs/wip/bench/overlay":/o:ro rust:1.98.0 \
+#   docker run --rm --privileged -v <target-volume>:/target:ro -v "$PWD/docs/wip/bench/overlay":/o:ro rust:1.98 \
 #     bash /o/overlay_diff.sh [TREE] [ROUNDS]     (SLATES names the binary when it is not /target/release/slates)
 set -u
 TREE=${1:-/usr/lib}; ROUNDS=${2:-3}

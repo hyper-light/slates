@@ -3,7 +3,7 @@
 # against slates and against the kernel's own NFS server (nfsd) exporting tmpfs, both in RAM, with plain tmpfs as the
 # floor. Run in a privileged container with the Linux release build of slates at /target:
 #   docker run --rm --privileged -v <linux-target>:/target:ro -v "$PWD/docs/wip/bench/mixed":/m:ro -v <out>:/out \
-#     rust:1.98.0 bash /m/linux_vs_nfsd.sh [OPS_PER_WORKER] [LARGE_MIB]
+#     rust:1.98 bash /m/linux_vs_nfsd.sh [OPS_PER_WORKER] [LARGE_MIB]
 # Every mount is removed and nfsd's threads stopped on every exit path, the slates mount while its daemon still runs.
 set -u
 OPS=${1:-400}; LARGE=${2:-64}

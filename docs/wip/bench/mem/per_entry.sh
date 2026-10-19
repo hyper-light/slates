@@ -2,7 +2,7 @@
 # Condition 12, memory: what one empty file costs, with no content to round, split between the anchor and the daemon.
 # A privileged container with the Linux release build at /target/release/slates creates COUNT empty files (default
 # 100,000) in 100 directories over the kernel's NFSv4.2 client, and the same on tmpfs:
-#   docker run --rm --privileged -v <target-volume>:/target:ro -v "$PWD/docs/wip/bench/mem":/m:ro rust:1.98.0 \
+#   docker run --rm --privileged -v <target-volume>:/target:ro -v "$PWD/docs/wip/bench/mem":/m:ro rust:1.98 \
 #     bash /m/per_entry.sh [COUNT]
 set -u
 COUNT=${1:-100000}

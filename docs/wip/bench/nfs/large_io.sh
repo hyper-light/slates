@@ -2,7 +2,7 @@
 # Condition 12: large sequential I/O through one Linux NFSv4.2 client: a 512 MiB file written with `conv=fsync` from a
 # random source, the client's caches dropped, then read back, ROUNDS times, with the daemon's CPU for each transfer. Run in a privileged container with the
 # Linux release build at /target/release/slates:
-#   docker run --rm --privileged -v <target-volume>:/target:ro -v "$PWD/docs/wip/bench/nfs":/n:ro rust:1.98.0 \
+#   docker run --rm --privileged -v <target-volume>:/target:ro -v "$PWD/docs/wip/bench/nfs":/n:ro rust:1.98 \
 #     bash /n/large_io.sh [ROUNDS]     (SLATES names the binary when it is not /target/release/slates)
 set -u
 ROUNDS=${1:-5}

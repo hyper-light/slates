@@ -182,6 +182,15 @@ pub mod flags {
   pub const BIG_WRITES: u64 = 1 << 5;
   /// Format: FUSE_INIT_EXT — the second 32 bits of the flags word (`flags2`) are present.
   pub const INIT_EXT: u64 = 1 << 30;
+  /// Format: FUSE_MAX_PAGES — the reply's `max_pages` field is read, so one request may carry more than the
+  /// kernel's default of 32 pages (`FUSE_DEFAULT_MAX_PAGES_PER_REQ`, `fs/fuse/fuse_i.h`).
+  ///
+  /// Without it `max_write` is advertised and not reached: the kernel still splits at 32 pages, which is
+  /// 128 KiB on a 4 KiB page against the 256 KiB slates offers. Measured through a real mount before this was
+  /// negotiated (2026-10-19, Docker kernel 6.12): sequential write throughput plateaued at a 128 KiB buffer
+  /// (1,204 → 2,082 → 2,188 → 1,985 MiB/s at 64/128/256/1,024 KiB) and per-call latency rose in whole
+  /// round-trip steps — 47.9 µs, 57.7 µs, 110.9 µs, 482.4 µs — which is one request, one, two and eight.
+  pub const MAX_PAGES: u64 = 1 << 22;
   /// Format: FUSE_DONT_MASK — the kernel does **not** apply the creating process's umask: the mode arrives
   /// unmasked and the umask travels beside it in the request (`fuse_create_in`, `fuse_mkdir_in`,
   /// `fuse_mknod_in`), for the filesystem to apply (Linux `fs/fuse/dir.c`). Corrected 2026-10-01

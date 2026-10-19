@@ -8,7 +8,7 @@
 #
 # Run (privileged for the NFS mount and /dev/fuse; repo read-only at /work, an output dir at /out, a cache volume
 # at /ccache so a rebuild and the dep downloads are not repeated):
-#   docker run --rm --privileged -v "$PWD":/work:ro -v <out>:/out -v slates-cc:/ccache rust:1.98.0 \
+#   docker run --rm --privileged -v "$PWD":/work:ro -v <out>:/out -v slates-cc:/ccache rust:1.98 \
 #     bash /work/docs/wip/bench/realworld_compete.sh
 set -u
 mkdir -p /ccache/cargo /out

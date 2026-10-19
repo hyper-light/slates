@@ -10,7 +10,7 @@
 #   4. A big npm toolchain — webpack, babel, react, typescript, eslint, jest, express; `npm install` must exit 0.
 #
 # Run (privileged for the NFS mount and /dev/fuse; repo read-only at /work, out at /out, cache volume at /ccache):
-#   docker run --rm --privileged --memory=24g -v "$PWD":/work:ro -v <out>:/out -v slates-cc:/ccache rust:1.98.0 \
+#   docker run --rm --privileged --memory=24g -v "$PWD":/work:ro -v <out>:/out -v slates-cc:/ccache rust:1.98 \
 #     bash /work/docs/wip/bench/realworld_sweat.sh
 set -u
 mkdir -p /ccache/cargo /out

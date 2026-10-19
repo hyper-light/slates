@@ -3,7 +3,7 @@
 # starts, so its supervisor sees a crash loop), while a file sits on its mounted NFSv4.2 volume. The anchor must keep
 # restarting it (backing off, never giving up), and the mount must serve the file intact afterwards. Run privileged
 # with the Linux release build at /target/release/slates and an output directory at /out:
-#   docker run --rm --privileged -v <target-volume>:/target:ro -v "$PWD/docs/wip/bench":/b:ro -v <out>:/out rust:1.98.0 \
+#   docker run --rm --privileged -v <target-volume>:/target:ro -v "$PWD/docs/wip/bench":/b:ro -v <out>:/out rust:1.98 \
 #     [-e KILLS=40 -e GAP=0.02] bash /b/kill_storm.sh
 set -u
 apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq nfs-common >/dev/null 2>&1

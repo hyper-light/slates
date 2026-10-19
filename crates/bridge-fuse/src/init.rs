@@ -16,6 +16,26 @@ use slates_bridge_core::CacheCoherence;
 pub const MAX_WRITE: u32 = 256 * 1024;
 /// Shape: the read-ahead the daemon suggests, matched to `MAX_WRITE`.
 const MAX_READAHEAD: u32 = 256 * 1024;
+/// Format: the kernel's own ceiling on `max_pages` (`FUSE_MAX_MAX_PAGES`, `fs/fuse/fuse_i.h`); it clamps
+/// anything larger, so asking past it would be asking for a number the kernel will not use.
+const KERNEL_MAX_PAGES: u32 = 256;
+
+/// Derived: how many pages the largest write slates accepts occupies on *this* kernel's page size —
+/// `MAX_WRITE / page_size`, bounded by the kernel's own [`KERNEL_MAX_PAGES`]. Sent as `max_pages` when the
+/// kernel offers `FUSE_MAX_PAGES`.
+///
+/// Without it the kernel splits every request at its default of 32 pages whatever `max_write` says, so the
+/// 256 KiB slates advertises is unreachable and a 1 MiB write costs eight round trips rather than four. The
+/// page size is read at run time rather than assumed: a 4 KiB-page host wants 64 here and a 16 KiB-page
+/// arm64 host wants 16, and hard-coding either would silently halve or quadruple the request size on the
+/// other.
+fn max_pages() -> u16 {
+  let page = u32::try_from(rustix::param::page_size())
+    .unwrap_or(4096)
+    .max(1);
+  let pages = MAX_WRITE.div_ceil(page).clamp(1, KERNEL_MAX_PAGES);
+  u16::try_from(pages).unwrap_or(u16::MAX)
+}
 /// Shape: the time granularity the daemon reports: one nanosecond (times are monotonic ns).
 const TIME_GRAN_NS: u32 = 1;
 
@@ -30,6 +50,9 @@ pub struct InitNegotiation {
   pub flags: u64,
   /// The maximum write per request.
   pub max_write: u32,
+  /// The pages one request may carry ([`max_pages`]); zero when the kernel did not offer `FUSE_MAX_PAGES`,
+  /// in which case it splits at its own default and the field is ignored.
+  pub max_pages: u16,
   /// The read-ahead suggested.
   pub max_readahead: u32,
   /// Whether the kernel's major is one slates cannot speak (the caller replies with its own
@@ -62,6 +85,7 @@ fn wanted(coherence: CacheCoherence) -> u64 {
     | flags::DO_READDIRPLUS
     | flags::READDIRPLUS_AUTO
     | flags::BIG_WRITES
+    | flags::MAX_PAGES
     | flags::DONT_MASK
     | flags::INIT_EXT;
   match coherence {
@@ -96,6 +120,7 @@ pub fn negotiate(body: &[u8], coherence: CacheCoherence) -> Result<InitNegotiati
       minor: FUSE_KERNEL_MINOR_VERSION,
       flags: 0,
       max_write: MAX_WRITE,
+      max_pages: 0,
       max_readahead: MAX_READAHEAD,
       version_mismatch: true,
       kernel_resends: false,
@@ -106,6 +131,12 @@ pub fn negotiate(body: &[u8], coherence: CacheCoherence) -> Result<InitNegotiati
     minor: minor.min(FUSE_KERNEL_MINOR_VERSION),
     flags: wanted(coherence) & kernel_flags,
     max_write: MAX_WRITE,
+    // Only meaningful when the intersection kept the flag: a kernel that did not offer it ignores the field.
+    max_pages: if wanted(coherence) & kernel_flags & flags::MAX_PAGES != 0 {
+      max_pages()
+    } else {
+      0
+    },
     max_readahead: kernel_readahead.min(MAX_READAHEAD),
     version_mismatch: false,
     kernel_resends: kernel_flags & flags::HAS_RESEND != 0,
@@ -131,7 +162,8 @@ impl InitNegotiation {
     w.u32(0); // max_background + congestion_threshold (two u16, both zero: kernel defaults)
     w.u32(self.max_write);
     w.u32(TIME_GRAN_NS);
-    w.u32(0); // max_pages + map_alignment (two u16, kernel defaults)
+    // max_pages (low u16) + map_alignment (high u16, zero: slates asks for no alignment).
+    w.u32(u32::from(self.max_pages));
     w.u32(high); // flags2
     w.pad(RESERVED_WORDS);
     w.into_bytes()

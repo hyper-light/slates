@@ -5119,6 +5119,40 @@ itself as trading away for exabyte throughput. The directly runnable competitor 
 server, slates beats on read latency. A live Tectonic A/B is not possible (it is Facebook-internal and not open source);
 this comparison is against its published figures, with the workload-class caveat stated.
 
+### FUSE max_pages: the advertised 256 KiB write was unreachable, and a large write cost twice the round trips (2026-10-19)
+
+Following the re-measurement below — which puts a create at one round trip and almost nothing else — the obvious
+question is how many round trips a *large write* pays. Measured through a real mount (Docker kernel 6.12,
+release): sequential write throughput **plateaued at a 128 KiB buffer**, 1,204 → 2,082 → 2,188 → 1,985 MiB/s at
+64/128/256/1,024 KiB, with per-call p50 47.9 / 57.7 / 110.9 / 482.4 µs — whole round-trip steps, one request,
+one, two, eight.
+
+**Cause.** `FUSE_MAX_PAGES` was never negotiated. Without it the kernel splits every request at
+`FUSE_DEFAULT_MAX_PAGES_PER_REQ` = 32 pages, which is 128 KiB on a 4 KiB page, whatever `max_write` says — so
+the 256 KiB slates advertises at INIT could not be reached and every write ≥ 256 KiB paid double.
+
+**Fix.** Ask for the flag and send `max_pages` = `MAX_WRITE / page_size`, bounded by the kernel's own
+`FUSE_MAX_MAX_PAGES` (256). The page size is read at run time: a 4 KiB host wants 64 and a 16 KiB arm64 host
+wants 16, and hard-coding either would silently halve or quadruple the request size on the other. This raises
+nothing — it makes the number already advertised reachable.
+
+**Proof, by count rather than by clock.** Each FUSE request is one `read()` from `/dev/fuse`, so the daemon's
+`syscr` across a known write is load-independent. Writing 256 MiB:
+
+| buffer | daemon `read()` calls | requests per `write()` | request size |
+|---|---|---|---|
+| 128 KiB | 4,101 | 1 | 128 KiB |
+| 256 KiB | **2,058** | **1** | **256 KiB** |
+| 1,024 KiB | **2,051** | **4** | **256 KiB** |
+
+The 128 KiB row pins the scale at 2.0 reads per request (2,048 one-request calls → 4,101 reads). On that scale
+1,024 calls of 256 KiB cost 2,058 reads — one request each, not two — and 256 calls of 1 MiB cost 2,051, four
+each. Before the change all three rows would read ~4,100. **Half the round trips for every write ≥ 256 KiB.**
+
+A timing A/B was attempted first and is **not** reported as evidence: the host's load changed between arms
+(tmpfs itself fell 14,776 → 7,691 MiB/s), so the two runs were not comparable. The count is immune to that,
+which is why it is the measurement here.
+
 ### Condition 12 re-measured (2026-10-19): the table below is stale by ~10×, and the round trip is the cost
 
 **Withdrawing three of my own amendments from 2026-10-18.** They reasoned from the 276.9 µs create in the

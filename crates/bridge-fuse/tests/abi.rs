@@ -205,8 +205,19 @@ fn a_kernel_offering_every_bit_negotiates_only_the_named_flags() {
     | flags::PARALLEL_DIROPS
     | flags::EXPLICIT_INVAL_DATA
     | flags::INIT_EXT
-    | flags::HAS_EXPIRE_ONLY;
+    | flags::HAS_EXPIRE_ONLY
+    | flags::MAX_PAGES;
   assert_eq!(n.flags & !named, 0, "no foreign bit leaks: {:#x}", n.flags);
+  // A kernel that offers MAX_PAGES is told how many pages the largest accepted write occupies, or the
+  // advertised `max_write` is never reached: the kernel keeps splitting at its own 32-page default.
+  assert_ne!(n.flags & flags::MAX_PAGES, 0, "max pages is negotiated");
+  assert_eq!(
+    u32::from(n.max_pages) * u32::try_from(rustix::param::page_size()).unwrap_or(4096),
+    slates_bridge_fuse::init::MAX_WRITE,
+    "the pages offered carry exactly the largest write slates accepts ({} B on a {} B page)",
+    slates_bridge_fuse::init::MAX_WRITE,
+    rustix::param::page_size()
+  );
   assert_eq!(
     n.flags & flags::WRITEBACK_CACHE,
     0,
