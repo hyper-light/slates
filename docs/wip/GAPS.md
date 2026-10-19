@@ -8176,3 +8176,37 @@ arena-level accessor with them — it had no caller once the gate was gone, and 
 caller is the thing CLAUDE.md #7 forbids and that `Region::huge()` was just deleted for. What stays is the
 advice (so the backing *is* contiguous) and the measurement (so a zone can check). **The gate lands with the
 zones, where the question it asks has a defined answer.**
+
+### 2026-10-19 (later): the build order for L1 + L2, derived — unconditional migration is the caller that unblocks both
+
+Reading `stripe_target`'s own doc settles how L1 and L2 fit, and it is not the order the checklist implies.
+
+> "When the L1 hugetlb sandbox lands, `Volume::dax_migrate` draws its shift target's slot from here instead of
+> the general arena allocator, binding the offset to a physically-contiguous sandbox so the shift actually
+> moves physical rows."
+
+So L1's sandbox exists **to feed `dax_migrate`** — and `dax_migrate` has, in §4.6's own words, "no production
+caller — tests and `dax_bench` only". Building the sandbox first would be building a placement layer for a
+primitive nothing invokes, which is the shape CLAUDE.md #7 forbids and that row 5's `dax_revoke_block` was
+deleted for. That is why L1 on its own has never felt landable.
+
+**The caller already has a blessing in the design, and it is not the broker.** §4.6: "Measured 242 ns/migration
+for a 4 KiB block (`dax_bench`), so even *unconditional* migration at the 16–32 ms RowPress cadence costs
+<0.01% throughput; migration is meant to be *adaptive* … so honest agents run at native DAX speed with zero
+migration overhead." The adaptive form needs PEBS/IBS from a privileged broker; the **unconditional** form
+needs nothing but a periodic sweep, is already priced, and gives `dax_migrate` the production caller it lacks.
+
+So the order that works, as one piece rather than three blocked ones:
+
+1. **A per-tenant sandbox** — a huge-page-aligned span, faulted and *verified* through
+   `Region::huge_backed_bytes` (built today), with guard rows between tenants; refuse writable DAX for a
+   tenant whose sandbox did not come back huge-backed. This is where the gate belongs — a zone's coverage is a
+   deterministic question where the whole arena's is not, which is the mistake recorded above.
+2. **A periodic sweep** at the derived 16–32 ms cadence calling `dax_migrate` for the tenant's writable blocks,
+   drawing each target slot from `stripe_target` within that sandbox. This is L2's wiring and the sandbox's
+   caller, landing together so neither is a primitive without one.
+3. **The adaptive trigger** afterwards, as the optimization §4.6 says it is, when a broker can supply PEBS/IBS.
+
+Rows 3 and 4 are therefore **one piece of work with a known shape and no outstanding decision** — not two rows
+waiting on an anchor and an authorization, which is how this checklist has read all along. What it needs is the
+build: the sandbox allocator, the sweep on the shard's timer, and tests on a host with shmem THP.
