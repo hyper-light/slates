@@ -7650,9 +7650,19 @@ dentry**. The 10.27 s poll above already showed it is not lateness. Full write-u
 the posture turns out to be, so it did not wait: entry refusals are now counted apart from the benign ones and
 reported as **`fuse.entry_invalidation_refused`**, so a mount whose coherence promise is not being honoured
 says so instead of looking healthy. It is counted and not raised because the refusal is not retryable — the
-next round is refused identically, and a round kept for retry is the unbounded loop #8 forbids. What *replaces*
-the posture changes a measured cache cost, so that stays Ada's. The two tests remain red, as they should: the
-counter makes the loss visible, it does not make the kernel accept the invalidation.
+next round is refused identically, and a round kept for retry is the unbounded loop #8 forbids. The two tests
+remain red, as they should: the counter makes the loss visible, it does not make the kernel accept the
+invalidation.
+
+**Two of the three posture options are now closed by experiment, and the hole is wider than it looked.**
+Appending a parent-inode invalidation — the notification the kernel *does* accept on 6.19 — leaves both tests
+failing; forcing `FUSE_EXPIRE_ONLY` off leaves both failing. No notification clears the entry, so the only
+lever left is the lifetime `valid_for` grants, which is `Forever` for a volume's own objects on the strength of
+"every way a name appears through another attachment invalidates it". And because a delete and both halves of
+a rename travel as `Invalidation::Entry` as well, a name *removed* elsewhere is equally invisible on these
+kernels — `Forever` is unsound for every entry, not only negative ones. That reprices §4.6's core caching
+promise and must re-take `c3c0024b`'s −28%-lookup measurement, so it is a planned design change with an
+amendment-log entry, which is exactly why it is not improvised here.
 
 **Why it matters.** §4.6's `Invalidated` posture is the promise that a change made through one attachment is
 pushed to the kernel's caches; `coherence_mount` is the proof of it, and on 6.19 a name another attachment

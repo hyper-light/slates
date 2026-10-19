@@ -71,11 +71,28 @@ a 7-character working directory too.
    kernel it is talking to. It is counted rather than raised because the refusal is **not retryable** — the
    next round is refused identically, and a round kept for retry is the unbounded loop CLAUDE.md #8 forbids.
    This was the part that is a defect under CLAUDE.md #9 whatever else is decided, so it did not wait.
-2. **Then the posture — open.** If the kernel will not drop a negative entry on request, `Invalidated` cannot keep
-   promising unbounded negative lifetimes on those kernels. The options are a bounded negative-entry lifetime
-   (the kernel re-asks, at a measured cost), invalidating the **parent inode** instead when the entry refusal
-   comes back, or dropping to `Revalidated` for negative entries. Each changes a measured cost that §4.6
-   records, so none should be picked without the measurement.
+2. **Then the posture — open, and narrowed to one lever by measurement.** Three options were on the table: a
+   bounded negative-entry lifetime, invalidating the **parent inode** when the entry refusal comes back, or
+   dropping to `Revalidated` for negative entries. Two of them are now closed by experiment on the 6.19 host:
+
+   - *Parent-inode invalidation does not work.* Appending a `FUSE_NOTIFY_INVAL_INODE` for the parent directory
+     after every entry invalidation — the notification the kernel **does** accept there, as the trace shows —
+     leaves both tests failing exactly as before. The kernel takes the message and the stale entry survives it.
+   - *`FUSE_EXPIRE_ONLY` is not the trigger.* Forcing the flag off, so every entry invalidation is a true drop,
+     also leaves both tests failing.
+
+   **So no notification slates can send clears the entry on 6.19, and the only remaining lever is the lifetime
+   slates grants.** `valid_for` answers `CacheLifetime::Forever` for a volume's own objects, and the comment at
+   the negative-entry reply says why that is sound: "Every way a name appears through another attachment
+   invalidates it". On 6.19 that justification is simply false.
+
+   **And the hole is wider than negative entries.** A delete, a rename's source and a rename's target all travel
+   as `Invalidation::Entry` too, and the refusal is of the message, not of the case — so on such a kernel a name
+   *removed* through another attachment also stays visible, not just a name created. `Forever` is therefore
+   unsound for **every** entry on these kernels, which is why this is a §4.6 posture change and not a tweak:
+   it reprices the core caching promise, it needs a derived bound rather than a chosen one, and it must re-take
+   the measurement `c3c0024b` recorded (negative entries bought −28% lookups on a pip install) to show what the
+   bound costs. That is a planned change with a design-doc and amendment-log entry, not an improvisation.
 
 Narrowing the kernel range below 6.13…6.19 needs a kernel between the two; the three hosts available are
 6.12, 6.19 and 7.2, so it was not narrowed here.
