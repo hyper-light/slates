@@ -5119,7 +5119,58 @@ itself as trading away for exabyte throughput. The directly runnable competitor 
 server, slates beats on read latency. A live Tectonic A/B is not possible (it is Facebook-internal and not open source);
 this comparison is against its published figures, with the workload-class caveat stated.
 
-### Condition 12, like-for-like: slates (FUSE) vs the kernel's overlayfs vs tmpfs (2026-10-11)
+### Condition 12 re-measured (2026-10-19): the table below is stale by ~10×, and the round trip is the cost
+
+**Withdrawing three of my own amendments from 2026-10-18.** They reasoned from the 276.9 µs create in the
+2026-10-11 table to conclude that the transport was ~5% of a create and ~94% was work inside the daemon. The
+premise does not reproduce, so the conclusion is wrong, and the lever list this file carried *before* those
+amendments — "reduce the FUSE/daemon round-trip" — was right.
+
+Re-run of `docs/wip/bench/fuse/fuse-perf.sh` plus an overlay variant, **release** build at `818623fa`, Docker
+Desktop kernel **6.12.76-linuxkit** (the same 6.12 Docker environment the 2026-10-11 row records), aarch64,
+host load 25–28, 2,000 creates per leg with `creates.py`:
+
+| op, p50 | tmpfs | slates, plain volume | slates, `--shared` over a 500-file base | the 2026-10-11 row |
+|---|---|---|---|---|
+| create (`open` O_CREAT) | 1 µs | **27 µs** | **30 µs** | 276.9 µs |
+| write | 1 µs | 11 µs | 14 µs | 471.1 µs (rewrite) |
+| close | 0 µs | 10 µs | 10 µs | — |
+| stat | 0 µs | 22 µs | 26 µs | 13.9 µs |
+
+2,000 creates take 0.15 s plain and 0.17 s on the overlay (the old A-96 row: 0.26 s). The overlay's 500 base
+entries are visible through the mount, so it is the real shape, and it costs **3 µs** per create — not the
+~250 µs the gap between the two tables would have needed.
+
+**Why the old row is stale.** It is dated the same day as **A-134**, which fixed exactly this: overlay volumes
+republished their *whole image* per barrier, "O(volume) per op, O(N²) to fill a directory — overlay create p50
+grew 196 → 714 µs over 4,000 creates" (`GAPS.md`). A pre-A-134 create of a few hundred microseconds is precisely
+what the row records, and nobody re-ran the table after the fix landed (`6625b6f2`).
+
+**Where a create's 27 µs goes, measured three ways and now consistent.** A stat — one round trip and a trivial
+lookup — is 22 µs, so a create is about **five microseconds above the round-trip floor**. In-process the whole
+bridge path (FUSE codec + dispatch + the VFS create) is **0.5 µs** (`shards_fs_bench`), and the VFS create alone
+~2 µs (`vfs_bench`). `perf record` on the daemon through 2,000 creates attributes its CPU accordingly:
+
+| symbol | share |
+|---|---|
+| `fuse_request_end` (kernel) | 20.1% |
+| `el0_svc` (kernel syscall entry) | 19.5% |
+| `slates_rt::epoll::EpollDriver::wait` | 18.9% |
+| `__kernel_clock_gettime` | 4.9% |
+| `fdget` + `invoke_syscall` + `do_el0_svc` (kernel) | 8.5% |
+| slates' own (`reference_for`, `publish_shard`, `any_ring_ready`, `Ring::depth`, …) | ~1.2% each |
+
+About half the daemon's CPU is the kernel's FUSE and syscall paths and a fifth is the runtime's epoll wait; its
+own filesystem work barely registers. 164 samples, so the shape is sound and the digits are not.
+
+**So the lever is the round trip, and it is ~22 µs.** Against tmpfs's 1 µs create slates is ~27×, not the ~55×
+the stale row implies against overlayfs. The in-design levers that attack the round trip — FUSE writeback
+caching and a larger `max_write` to batch, and virtio-fs + DAX to replace the round trip with a page-table
+access — are the ones that matter; the daemon-side work they would not touch is already half a microsecond.
+Owed: re-run the overlayfs leg so the three-way table is like-for-like again (this run had no overlayfs arm),
+and the same on x86_64.
+
+### Condition 12, like-for-like: slates (FUSE) vs the kernel's overlayfs vs tmpfs (2026-10-11) — superseded above
 
 A direct, runnable competitor comparison — the Stop-hook asked for like-for-like, and overlayfs is slates' closest class
 (the kernel's own copy-on-write overlay that container runtimes mount by default). Same workload on all three, over the
