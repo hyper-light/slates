@@ -7301,14 +7301,20 @@ which the Windows and Linux lanes both run. Its commit claimed "the macOS and Li
 when Linux had not yet seen it (the run was 23:17, the commit 23:43); it has now — rendezvous 7/7 and
 slates-machine 56/56 on Linux at HEAD. The claim is true as written now and was premature when written.
 
-The trajectory across the day's five full runs: **63 distinct failures → 2 → 1 → 0**. Of the 63, sixty were one
-`OnceLock`'d fixture; of the 2, both were artifacts of 168 orphaned spinners I had leaked onto the host; the 1
-was the twelfth profile fixture. **Not one of the sixty-odd was a product defect** — the three product defects
-found this day came out of *writing* tests, not running them.
+The trajectory across the day's **four** full runs, counted exactly (`grep -E '^test [A-Za-z0-9_:]+ \.\.\. FAILED' | sort -u`):
+**65 distinct failing tests → 2 → 1 → 0**. Of the 65, sixty were one `OnceLock`'d fixture; of the 2, both were
+artifacts of 168 orphaned spinners I had leaked onto the host; the 1 was the twelfth profile fixture. **Not one
+of the sixty-five was a product defect** — the three product defects found this day came out of *writing* tests,
+not running them.
+
+(The figure was carried as "63" through several entries and this report. It came from a `grep -c` run while that
+first workspace run was still going, and a partial count that is never revisited becomes the number everyone
+quotes. 65 is the count of the finished run.)
 
 ### 2026-10-18 (close of day): what a clean `cargo test --workspace` says now
 
-The day opened with a workspace run failing **63 distinct tests** and closed with one failing **1**, on a quiet
+The day opened with a workspace run failing **65 distinct tests** (see the correction in the 2026-10-19 close
+entry: this was carried as 63 from a partial count) and closed with one failing **1**, on a quiet
 host (load 3–20, no self-inflicted contention — see the correction below about the 168 orphaned spinners that
 polluted the middle of the day). 258 test binaries. The single failure was the twelfth machine-profile fixture,
 `crates/mem/src/region.rs`'s huge-page test, fixed in the same session.
