@@ -98,8 +98,21 @@ The fix is architectural and is Ada's call. The options, with what each costs:
      host configuration.
    - **It pins pages** for the mapping's life, unswappable and unmovable, which interacts with L2's moving
      target (§4.6) and has to be weighed against it.
-   - **Unproven with a real front end.** crosvm's `SHMEM_MAP` mmaps the fd it is handed and a udmabuf fd is
-     mmap-able, so it should work — but it has not been run, and it is the first thing to run.
+   - **The hand-off is proven; only crosvm's own handler is not.** The mechanism `SHMEM_MAP` performs —
+     receive a descriptor over `SCM_RIGHTS`, `mmap` it — was run across a real process boundary on the same
+     host. A 4 MiB arena memfd filled with `'N'` (a neighbour's bytes) and a 256 KiB window at offset 1 MiB
+     filled with `'W'`; the udmabuf for that window passed to a forked process holding **nothing else**:
+
+     ```
+     FRONTEND mapped 262144 bytes: first='W' last='W'   (the authorized window, not the neighbour's bytes)
+     FRONTEND whole 4194304-byte arena through it: REFUSED
+     FRONTEND at an offset past the window:        REFUSED
+     ```
+
+     So the confinement survives the descriptor crossing to another process, which is the property row 1
+     exists for. What remains untested is crosvm's `SHMEM_MAP` handler specifically — it mmaps what it is
+     given, so it should accept this, and the harness for it already exists
+     (`crates/client/examples/crosvm_dax_ab/`).
 
 Of the four, **1 and 4 keep both zero-copy and confinement**; 4 is much the smaller change and the only one
 that leaves A-64 alone, which was the whole reason 1 was hard. Neither is a change to make unilaterally — 4
