@@ -7191,6 +7191,36 @@ zero is exactly the shape the regression had — and the test fails on it, *"ref
 This is the same distinction as the driver and rendezvous bounds earlier today: say whether the code did its
 job, not whether the machine was fast enough while it did.
 
+### 2026-10-19: conditions 3 and 4 re-validated at HEAD — and why the battery had stopped running here
+
+The escape battery (`docs/wip/bench/escape/run.sh`) is green at HEAD on aarch64: **3 seeds × 300 steps = 900
+hostile operations** through a real FUSE mount, driven as the volume's owner (an agent) and as another user (a
+privileged tool), with the containment invariants checked after every step.
+
+```
+other reaches the mount
+ops: churn=33 dotdot=47 hardlink_in=32 link_out=38 mknod=29 other_refused=38 owner_resolved_canary=1 remove=38 rename_link=39 setuid=42
+seed 1: 300 steps, no invariant violated
+seed 2: 300 steps, no invariant violated
+seed 3: 300 steps, no invariant violated
+daemon disk writes during the battery: 0 bytes
+outside tree unchanged (e2f7d9322c4f26d6)
+canary intact
+```
+
+**Condition 3** by the daemon's own `write_bytes`: zero. **Condition 4** by the invariants and by the outside
+tree hashing the same before and after. The non-vacuity line matters as much as the verdict — "other reaches
+the mount" proves the second user could actually see the mount it was attacking.
+
+**It had stopped running on this host, silently.** `run.sh` pinned `rust:1.98.0`, a tag with no arm64 manifest,
+so Docker fell back to a **linux/386** image and the battery built and ran under emulation on the wrong
+architecture — failing early and dumping CLI usage. Two things hid it: the fallback is a `WARNING` on stderr
+that is easy to scroll past, and I had piped the run through `tail -25`, which cut the warning and the
+`MOUNT-FAILED` marker off the top and left only the usage text. **Reading the whole log found in one minute
+what guessing at the tail had not found in twenty.** Twelve harnesses carried that pin; all are now on
+`rust:1.98`, whose manifest covers both architectures, and the compiler stays pinned by `rust-toolchain.toml`
+inside the container.
+
 ### 2026-10-19: every property suite silently ignored `PROPTEST_CASES`, so no sweep could be deepened
 
 Trying to deepen the DAX chaos schedule — `PROPTEST_CASES=6000 cargo test --release -p slates-vfs --test dax
