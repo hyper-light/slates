@@ -7996,3 +7996,38 @@ requests_in_flight_at_revoke: 0` — the device ended clean, nothing leaked.
 confinement in force**, so the descriptor the front end mapped was a `udmabuf` covering only the authorized
 window. Confinement and the binding hold together against a real VMM, which the in-tree stand-in could not
 show. Recorded run: `adacachy`, bare-metal x86_64 KVM, kernel 7.2.9-cachyos, crosvm from source, 2026-10-19.
+
+### 2026-10-19: correcting what rows 2 and 3 are actually blocked on — the design states the cadence
+
+I wrote that rows 2 and 3 collapse into "one anchor question" with no derivable value, needing a DRAM
+measurement on Ada's hardware. **Reading §4.6's Rowhammer block rather than recalling it shows that is wrong
+for row 3**, and wrong about why for both.
+
+**The migration interval is already derived, and stated.** §4.6: *"The modern window is 16–32 ms and RowPress
+leaks across refresh windows, so the migration interval is derived from the lowest hammer threshold, not the
+classic 64 ms."* That is a published figure (evidence tier A/B — a paper or a standard), not something to
+measure here; CLAUDE.md's tiers never required the anchor be local. And its cost is already on record:
+*"Measured 242 ns/migration for a 4 KiB block (`dax_bench`), so even **unconditional** migration at the
+16–32 ms RowPress cadence costs **<0.01% throughput**."*
+
+So the adaptive trigger is an **optimization, not a prerequisite** — the design says as much ("migration is
+meant to be *adaptive* … so honest agents run at native DAX speed with zero migration overhead"). Unconditional
+migration at the stated cadence is affordable and needs no trigger at all. What the *adaptive* form needs is
+PEBS/IBS from a privileged OS-shipped broker, because "a pure direct-write hammer is invisible to the daemon".
+
+**What actually blocks row 3 is L1, not a number.** §4.6 is blunt: *"without physical contiguity a virtual
+shift moves no physical rows (security theatre)."* Wiring L2's shift before L1's hugetlb zones exist would
+build exactly that. So row 3's dependency is **row 4** — the pre-reserved physically-contiguous sandbox — and
+row 4 is the privileged-broker item. The two are one item, in that order, and the design already says which
+comes first: *"Wiring L1 (hugetlb zones + guard rows) and the adaptive broker trigger into the device loop is
+the owed step."*
+
+**Row 2 is the one with a genuinely unstated number.** B2's primitives are built (`dax_guard`, `dax_scrub`);
+what is owed is the wiring, and that carries two open values the design does not give: *what* to guard (a
+guard pins a full clean copy, so guarding every read-only mapping doubles mapped-content RAM) and the scrub
+cadence. A scrub cannot prevent a flip — a flip can land inside one refresh window — so its cadence is a
+detection-latency choice against a RAM cost, which is a posture decision rather than a derivation.
+
+So the accurate statement is: **row 3 waits on row 4 (L1/hugetlb, the privileged layer); row 2 waits on a
+posture choice about RAM against detection latency.** Neither waits on a DRAM measurement, which is what I
+said twice and should have checked against §4.6 the first time.
