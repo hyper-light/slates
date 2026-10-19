@@ -7784,10 +7784,34 @@ machine: an **ephemeral container** can carry one, exactly as the Linux lane's c
 `fuse3` and `clippy`. `apt-get install gcc-mingw-w64-x86-64` plus `rustup target add x86_64-pc-windows-gnu`
 gives a working cross-toolchain in a throwaway image, and both `zstd-sys` and `aws-lc-sys` build through it.
 
-**So seven of CI's nine now lint from this machine**, `--all-targets -- -D warnings`, exit 0:
-`mem`, `ipc`, `rt`, `base`, `client`, `server` and `sdk-python`. The two that remain need a real Windows
-environment, not a toolchain: `bridge-winfsp` links the WinFsp SDK (`WINFSP_LIB`, a Windows MSI) and
-`sdk-node`'s napi build script needs a Node toolchain.
+**All nine of CI's Windows crates now lint from this machine**, in one command, `--all-targets -- -D warnings`,
+**exit 0**: `mem`, `ipc`, `rt`, `base`, `client`, `server`, `bridge-winfsp`, `sdk-node`, `sdk-python`.
+
+Two of them looked like they needed a real Windows box and did not, which is worth writing down because the
+claim was made here first and was wrong both times:
+
+- **`bridge-winfsp` needs no WinFsp SDK to be linted.** Its own `build.rs` says so at the top — "this only
+  affects the link step of a real Windows build — a cross-target `cargo check` from another host type-checks
+  the FFI declarations without linking". The build script only emits `rustc-link-search`/`rustc-link-lib`, and
+  clippy does not link. Exit 0 with no `WINFSP_LIB` at all.
+- **`sdk-node` needs no Node.** Its `build.rs` is one line, `napi_build::setup()`. The failure came from
+  `napi-build` 2.4.1's `setup_gnu()`, which panics unless it finds a `libnode.dll` — and it only tests that
+  the file *exists* before emitting link flags. CI uses the **msvc** target and never takes that path at all,
+  so this is an artefact of choosing `-gnu` here. A zero-byte stand-in at `LIBNODE_PATH` satisfies the
+  existence check; nothing reads its contents, because clippy does not link.
+
+The one command, reproducible:
+
+```
+docker run --rm --platform linux/amd64 -v "$PWD":/w:ro -w /w   -e CC_x86_64_pc_windows_gnu=x86_64-w64-mingw32-gcc -e AR_x86_64_pc_windows_gnu=x86_64-w64-mingw32-ar   -e AWS_LC_SYS_PREBUILT_NASM=0 -e LIBNODE_PATH=/tmp/nodelib rust:1.98.1 bash -c '
+    apt-get -qq update && apt-get -qq install -y gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64 nasm
+    rustup target add x86_64-pc-windows-gnu && rustup component add clippy
+    mkdir -p /tmp/nodelib && : > /tmp/nodelib/libnode.dll
+    cargo clippy --target x86_64-pc-windows-gnu -p slates-mem -p slates-ipc -p slates-rt -p slates-base       -p slates-client -p slates-server -p slates-bridge-winfsp -p slates-sdk-node -p slates-sdk-python       --all-targets --locked -- -D warnings'
+```
+
+It cross-lints the **gnu** ABI, not CI's **msvc** one; the Rust is the same and the `#[cfg(windows)]` branches
+are the point, but an msvc-only difference would still reach CI first.
 
 **The lane paid for itself twice on its first run.** It found `init.rs` using `rustix::param::page_size()` in
 code built on every platform (my `max_pages()` from earlier today; `rustix`'s `param` is Unix-only), now a
