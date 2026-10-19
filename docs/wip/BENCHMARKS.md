@@ -5197,7 +5197,32 @@ whole-image republish.
 
 Conditions: Docker Desktop (kernel 6.12.76-linuxkit) on an 18-core aarch64 Mac, host load 25–27, release build,
 one run per arm rather than best-of-N, p50/p99 over 2,000 files (1,000 for the fsync arm); the superseded row
-used 3,000 and reported p999/max as well. Owed: the same on x86_64.
+used 3,000 and reported p999/max as well.
+
+**x86_64, bare metal (2026-10-19), and it is better again.** Same workload on the Linux box — 32-core x86_64,
+kernel 7.2.9-cachyos, no VM — release build of 2026-10-18 (which postdates A-134; checked by ancestry). The box
+was carrying **load 61 from another session's builds** throughout, which is what the p99 column is showing:
+
+| op, p50 (p99) | tmpfs | overlayfs | slates (FUSE) | slates vs overlayfs |
+|---|---|---|---|---|
+| create | 2 µs (11) | 6 µs (26) | **16 µs (595)** | **2.7×** |
+| write | 1 µs (3) | 2 µs (4) | 8 µs (492) | 4× |
+| close | 0 µs (0) | 1 µs (1) | 3 µs (246) | 3× |
+| stat | 1 µs (2) | 1 µs (3) | 5 µs (424) | 5× |
+| create + fsync | 4 µs (18) | 7 µs (23) | **37 µs (888)** | **5.3×** |
+
+On bare metal the round trip is ~5 µs rather than the ~25 µs the Docker-on-macOS VM imposes, and slates lands
+**within 3–5× of the kernel's own overlayfs at p50** — against the superseded row's 12–325×. The p99s (246–888 µs)
+are the host's load, not slates: all three arms ran in the same contended minute, and tmpfs's own p99 rose to
+11–18 µs in it.
+
+This mount was **not** `--shared` (the box has no `user_allow_other`, and changing a machine's `/etc/fuse.conf`
+is not mine to do); the Mac run's `--shared` arm cost 3 µs over the plain one, so the comparison is unaffected.
+Both runs used a base-backed volume over the same 500-file tree.
+
+**The honest statement of condition 12 is now:** on bare-metal Linux, slates over FUSE answers a create in 16 µs
+against the in-kernel overlayfs's 6 µs, and the gap is one userspace round trip. Not "12–325× slower, dominated
+by the write path".
 
 **So the lever is the round trip, and it is ~22 µs.** Against tmpfs's 1 µs create slates is ~27×, not the ~55×
 the stale row implies against overlayfs. The in-design levers that attack the round trip — FUSE writeback
