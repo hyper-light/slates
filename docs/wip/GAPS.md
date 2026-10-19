@@ -8400,3 +8400,29 @@ the guest reading its own bytes again) and by
 `without_the_opt_in_nothing_is_guarded_and_the_scrub_pass_has_nothing_to_find`, which states the cost of not
 opting in as a test rather than leaving it implied, and arms the same volume afterwards so the pair is not
 vacuous. Both run on every host — B2 needs no huge page.
+
+### 2026-10-19: the DAX layers attacked, and a chaos property that can actually fail
+
+Two tests the layered defence was missing, both aimed at the places a hand-written case does not reach.
+
+**The row that leaves the sandbox.** A zone holds every slot it is not lending, so a neighbour can never hold a
+row inside the tenant's huge page — except the row the *tenant* holds, which is the inode's and which the
+ordinary content path frees on a delete, by a route the zone does not sit on. From that moment the row is in the
+general free lists. `a_row_a_neighbour_took_is_never_drawn_for_the_tenant_again` drives exactly that: shift into
+the sandbox, delete the file, let a second volume allocate until it holds a row inside the first tenant's page,
+then map and shift the tenant thirty more times. It must never be drawn onto that row, and the neighbour's bytes
+must be untouched. **Ran (not skipped) three times on fedora 6.19.10** — the allocator does hand the freed row
+to the neighbour, so the attack is real and the re-claim-then-leave-out path is what holds.
+
+**Four layers under chaos, with one assertion that bites.** `the_four_layers_under_chaos_never_heal_what_nothing_corrupted`
+interleaves L0's opt-ins, L1's sandbox, L2's periodic shift and B2's scrub against writes, truncates, deletes
+and the sealing sweep. Besides the standing gate invariants it asserts two new ones: the sandbox never holds a
+row a live window sits on (it lends a row or holds it, never both, or two tenants could be handed the same
+row), and — the sharp one — **B2 never heals anything**, because nothing in the schedule corrupts a block. A
+heal there would mean a legitimate operation reached a guarded block without dropping its guard first, so the
+net would *revert* that operation, which is the worst failure a self-healing net has.
+
+**Red-checked, because an assertion that cannot fire is decoration.** Replacing the delete step with a
+deliberate flip of a guarded block makes the run fail on exactly that line ("B2 healed a block nothing
+corrupted"). The step was then restored. 63 dax tests on macOS aarch64 and on Linux x86_64, the chaos property
+three runs each.

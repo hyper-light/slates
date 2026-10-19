@@ -1628,6 +1628,107 @@ fn one_round_of_the_periodic_shift_visits_every_window_once_and_slices() {
   }
 }
 
+/// §4.6 **L1 under attack: the row that leaves the sandbox.** A zone holds every slot it is not lending, so a
+/// neighbour can never hold a row inside this tenant's huge page — but the row the *tenant* holds is the
+/// inode's, and the ordinary content path frees it on a delete or truncate, by a route the zone does not sit
+/// on. From that moment the row is in the general free lists and a neighbour can take it, which is exactly the
+/// co-location the sandbox exists to prevent.
+///
+/// Do: shift a tenant's content into its sandbox, delete the file so the row it sat on goes back to the
+/// allocator, then let a second volume allocate until it holds a row inside the first tenant's page. Map and
+/// shift the first tenant again. Expect: the shift never lands on the row the neighbour holds — the zone
+/// re-claims what it can before it draws, and leaves out what it cannot — and the neighbour's bytes are
+/// untouched by the tenant's writes.
+#[test]
+fn a_row_a_neighbour_took_is_never_drawn_for_the_tenant_again() {
+  let mut store = store_sandboxed();
+  let mut tenant = volume(&mut store, 1 << 22);
+  let mut neighbour = Volume::create(&mut store, clone_config(9)).unwrap();
+  let f = file_of(&mut store, &mut tenant, "f", 0x41, DAX_PAGE);
+  let m = tenant.dax_map_write(&mut store, f).unwrap();
+  let Some(moved) = first_shift(
+    &mut store,
+    &mut tenant,
+    &m,
+    "a_row_a_neighbour_took_is_never_drawn_for_the_tenant_again",
+  ) else {
+    return;
+  };
+  store.dax_release_after_unmap(&m);
+  let prefix = tenant.prefix();
+  let (held_before, slots) = store.dax_zones.of_volume(prefix).unwrap().held();
+  assert_eq!(
+    held_before,
+    slots - 1,
+    "the zone holds every row but the one the tenant is on"
+  );
+
+  // The tenant's own ordinary path frees its row: the window is revoked and the file deleted.
+  store.dax_release_after_unmap(&moved);
+  let root = tenant.root_inode(&store).unwrap();
+  tenant.unlink_no(&mut store, root, "f").unwrap();
+
+  // The neighbour allocates until it holds a row inside the tenant's page. Bounded: a handful of blocks of the
+  // tenant's slot size is enough for the allocator to hand back the row just freed, and the test says so rather
+  // than looping unbounded if it does not.
+  const TRIES: usize = 16;
+  let mut taken = None;
+  for which in 0..TRIES {
+    let name = format!("n{which}");
+    let slot_bytes = store.dax_zones.of_volume(prefix).unwrap().slot_bytes();
+    let n = file_of(&mut store, &mut neighbour, &name, 0xB2, slot_bytes);
+    // A read map is how a test learns which block an inode's content sits on; it is revoked at once, so the
+    // block stays the neighbour's *allocation* without a pin doing the work this test means to attribute to
+    // the zone.
+    let probe = neighbour.dax_map_read(&mut store, n).unwrap();
+    let block = probe.block;
+    store.dax_revoke(&probe);
+    if let Some(index) = store.dax_zones.of_volume(prefix).unwrap().slot_of(block) {
+      taken = Some((index, block));
+      break;
+    }
+  }
+  let Some((stolen, stolen_block)) = taken else {
+    println!(
+      "SKIP a_row_a_neighbour_took_is_never_drawn_for_the_tenant_again: the allocator did not hand a row of \
+       the tenant's page to the neighbour in {TRIES} tries, so there is nothing to attack here"
+    );
+    return;
+  };
+
+  // The tenant comes back and shifts again, many times. It must never be given the row the neighbour holds.
+  let f2 = file_of(&mut store, &mut tenant, "f2", 0x41, DAX_PAGE);
+  let mut live = tenant.dax_map_write(&mut store, f2).unwrap();
+  // Derived: enough draws that a placement that could pick the stolen row would, over a sandbox of tens of
+  // rows, almost surely have done so.
+  const DRAWS: usize = 30;
+  for _ in 0..DRAWS {
+    let Ok(next) = tenant.dax_migrate(&mut store, &live) else {
+      break;
+    };
+    let zone = store.dax_zones.of_volume(prefix).unwrap();
+    assert_ne!(
+      zone.slot_of(next.block),
+      Some(stolen),
+      "the tenant was never drawn onto the row its neighbour holds"
+    );
+    assert_ne!(
+      next.block, stolen_block,
+      "and never onto that block by any other name"
+    );
+    store.dax_release_after_unmap(&live);
+    live = next;
+  }
+  // The neighbour's bytes are its own throughout: the tenant wrote its own rows, never that one.
+  assert!(
+    all_bytes(
+      &store.content.arena().bytes(stolen_block).unwrap()[..16],
+      0xB2
+    ),
+    "the neighbour's content was never written by the tenant"
+  );
+}
+
 // ───────────────────────────────────────────────────────────── B2 the self-healing safety net (checksum + heal)
 
 /// A synthetic Rowhammer bit flip: invert a byte of a block directly in the arena, behind the daemon's back — exactly
@@ -2718,6 +2819,152 @@ proptest! {
       // Drain what the step revoked, as the device's serve loop drains pending revokes: a dead mapping's block
       // stays pinned until the unmap is confirmed, and leaving them held would fill the arena instead of
       // exercising the gate.
+      let dead: Vec<Mapping> = held
+        .iter()
+        .filter(|mapping| !store.dax_is_live(mapping))
+        .copied()
+        .collect();
+      for mapping in &dead {
+        store.dax_release_after_unmap(mapping);
+      }
+      held.retain(|mapping| store.dax_is_live(mapping));
+    }
+  }
+}
+
+/// One step of the §4.6 layered-defence schedule: the operations L1, L2 and B2 fight each other with.
+fn layers_step(
+  store: &mut Store,
+  volume: &mut Volume,
+  files: &[InodeNo],
+  held: &mut Vec<Mapping>,
+  (op, which, size): (u8, u8, u16),
+) -> Result<(), TestCaseError> {
+  let no = files[usize::from(which) % files.len()];
+  let len = usize::from(size) % (DAX_PAGE * 2);
+  match op % 9 {
+    0 => {
+      let _ = volume.write(store, no, 0, &vec![op ^ which; len.max(1)]);
+    }
+    1 => {
+      let _ = volume.truncate(store, no, len as u64);
+    }
+    2 => {
+      // A read map, which the volume's opt-in guards (B2).
+      if let Ok(mapping) = volume.dax_map_read(store, no) {
+        held.push(mapping);
+      }
+    }
+    3 => {
+      if let Ok(mapping) = volume.dax_map_write(store, no) {
+        held.push(mapping);
+      }
+    }
+    4 => {
+      if let Some(mapping) = held.pop() {
+        store.dax_revoke(&mapping);
+        store.dax_release_after_unmap(&mapping);
+      }
+    }
+    5 => {
+      // L2's trigger, one slice, as the shard's loop runs it.
+      let due = store.dax.writable_of_prefix(volume.prefix());
+      let _ = volume.dax_shift_slice(store, &due, 0, u64::from(size).max(1));
+    }
+    6 => {
+      // B2's net, one slice, as the reap tick runs it.
+      let slice = store.dax_scrub_slice(0, u64::from(size).max(1));
+      // Nothing in this schedule corrupts a block, so the net must never claim it found a flip. A heal here
+      // would mean a legitimate operation reached a guarded block without dropping its guard first — which
+      // would make B2 *revert* that operation, the worst thing a self-healing net can do.
+      prop_assert_eq!(
+        slice.healed,
+        0,
+        "B2 healed a block nothing corrupted: a legitimate write reached a guarded block with its guard still on"
+      );
+      prop_assert_eq!(
+        slice.unhealable,
+        0,
+        "B2 reported an unhealable block in a schedule that corrupts nothing"
+      );
+    }
+    7 => {
+      // The churn that takes a row out of the sandbox: the tenant's own delete, then a fresh file in its place.
+      if let Ok(root) = volume.root_inode(&*store) {
+        let name = format!("f{}", usize::from(which) % files.len());
+        let _ = volume.unlink_no(store, root, &name);
+      }
+    }
+    _ => {
+      volume.age_writes();
+      let _ = volume.seal_pending(store, 1 << 20);
+    }
+  }
+  Ok(())
+}
+
+/// The sandbox's invariants after every step of the layered schedule.
+fn layers_invariants(store: &Store, volume: &Volume) -> Result<(), TestCaseError> {
+  let Some(zone) = store.dax_zones.of_volume(volume.prefix()) else {
+    return Ok(());
+  };
+  let (zone_held, slots) = zone.held();
+  prop_assert!(
+    zone_held <= slots,
+    "the sandbox cannot hold more rows than it was cut into: {zone_held} of {slots}"
+  );
+  // Every live writable window of this volume that sits in the sandbox sits on a row the sandbox is *not*
+  // holding — the zone lends a row or holds it, never both, or two tenants could be handed the same row.
+  for mapping in store.dax.writable_of_prefix(volume.prefix()) {
+    if let Some(index) = zone.slot_of(mapping.block) {
+      prop_assert!(
+        !zone.holds_slot(index),
+        "the sandbox is holding row {index} while a live window sits on it"
+      );
+    }
+  }
+  Ok(())
+}
+
+proptest! {
+  #![proptest_config(slates_test_seeds::unseeded(ProptestConfig { cases: slates_test_seeds::cases(if cfg!(miri) { 4 } else { 80 }), .. ProptestConfig::default() }))]
+
+  /// §4.6's **four layers under chaos together** — the interleavings nobody writes by hand. Every other test
+  /// here drives one layer; this one runs L0's opt-ins, L1's sandbox, L2's periodic shift and B2's scrub
+  /// against each other while the ordinary content paths churn underneath: writes and truncates that must
+  /// revoke, deletes that take a row out of the sandbox, the sealing sweep, maps read and writable.
+  ///
+  /// Expect, after **every** step: a live, current mapping reads its own bytes and zeroes past its file's
+  /// length (the gate's standing invariant); the sandbox never holds a row a live window sits on, which is the
+  /// property that keeps two tenants off one row; and — the sharp one — **B2 never heals anything**, because
+  /// nothing in this schedule corrupts a block. A heal here would mean a legitimate operation reached a
+  /// guarded block without dropping its guard, so the net would *revert* that operation: the worst failure a
+  /// self-healing net has.
+  ///
+  /// Any step may be refused; a refusal is a valid outcome, and on a host that backs no sandbox the shift
+  /// refuses every time and the rest of the schedule still has to hold.
+  #[test]
+  fn the_four_layers_under_chaos_never_heal_what_nothing_corrupted(
+    schedule in prop::collection::vec(
+      (any::<u8>(), any::<u8>(), any::<u16>()),
+      1..if cfg!(miri) { 7 } else { 40 },
+    )
+  ) {
+    let mut store = store_sandboxed();
+    let mut volume = volume(&mut store, 1 << 22);
+    volume.enable_dax_integrity_guard();
+    let files: Vec<InodeNo> = (0..CHAOS_FILES)
+      .map(|i| {
+        let fill = 0x10u8.saturating_add(u8::try_from(i).unwrap_or(0));
+        file_of(&mut store, &mut volume, &format!("f{i}"), fill, DAX_PAGE)
+      })
+      .collect();
+    let mut held: Vec<Mapping> = Vec::new();
+
+    for step in schedule {
+      layers_step(&mut store, &mut volume, &files, &mut held, step)?;
+      chaos_invariants(&store, &volume, &held)?;
+      layers_invariants(&store, &volume)?;
       let dead: Vec<Mapping> = held
         .iter()
         .filter(|mapping| !store.dax_is_live(mapping))

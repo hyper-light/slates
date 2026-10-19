@@ -293,6 +293,14 @@ impl DaxZone {
     )
   }
 
+  /// Whether the zone is holding the row at `index` itself, rather than having lent it to the tenant or lost
+  /// it to an ordinary free. The zone must never hold a row a live window sits on — it lends a row or holds
+  /// it, never both — and that is what a chaos schedule checks after every step.
+  #[must_use]
+  pub fn holds_slot(&self, index: usize) -> bool {
+    self.slots.get(index).is_some_and(Option::is_some)
+  }
+
   /// One slot in bytes, so a caller can tell whether a content block fits a row of this zone.
   #[must_use]
   pub fn slot_bytes(&self) -> usize {
