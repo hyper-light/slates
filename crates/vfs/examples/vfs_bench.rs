@@ -733,11 +733,12 @@ fn burst_rows(cutover: usize) -> Result<(), Box<dyn Error>> {
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
-  let profile = slates_machine::MachineProfile::measure(slates_machine::ProfileOptions {
-    budget_per_probe: Duration::from_millis(50),
-    codecs: false,
-    core_matrix: false,
-  })?;
+  let profile =
+    slates_machine::MachineProfile::measure_patiently(&slates_machine::ProfileOptions {
+      budget_per_probe: Duration::from_millis(50),
+      codecs: false,
+      core_matrix: false,
+    })?;
   let step_budget_ns = profile.derived().task_step_budget_ns.get();
   println!("task step budget: {step_budget_ns} ns (from the machine profile)");
   println!(

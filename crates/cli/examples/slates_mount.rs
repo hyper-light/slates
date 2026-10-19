@@ -56,7 +56,7 @@ fn mount_nfs_present() -> bool {
 
 /// The quick machine profile the demo daemon derives its constants from.
 fn quick_profile() -> MachineProfile {
-  MachineProfile::measure(ProfileOptions {
+  MachineProfile::measure_patiently(&ProfileOptions {
     budget_per_probe: Duration::from_millis(PROBE_MS),
     codecs: false,
     core_matrix: false,

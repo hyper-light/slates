@@ -96,7 +96,7 @@ fn report(load: usize, workers: usize, op: &str, mut samples: Vec<u64>) {
 }
 
 fn quick_profile() -> MachineProfile {
-  MachineProfile::measure(ProfileOptions {
+  MachineProfile::measure_patiently(&ProfileOptions {
     budget_per_probe: Duration::from_millis(5),
     codecs: false,
     core_matrix: false,

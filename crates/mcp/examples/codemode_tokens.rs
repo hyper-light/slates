@@ -148,7 +148,7 @@ fn report(label: &str, cost: &Cost, elapsed: Duration, found: usize) {
 
 fn main() -> Result<(), Box<dyn Error>> {
   let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
-  let profile = MachineProfile::measure(ProfileOptions {
+  let profile = MachineProfile::measure_patiently(&ProfileOptions {
     budget_per_probe: PROBE_BUDGET,
     codecs: false,
     core_matrix: false,

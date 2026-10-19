@@ -73,7 +73,7 @@ fn main() {
     .and_then(|a| a.parse::<usize>().ok())
     .unwrap_or(DEFAULT_SAMPLES);
 
-  let profile = MachineProfile::measure(ProfileOptions {
+  let profile = MachineProfile::measure_patiently(&ProfileOptions {
     budget_per_probe: Duration::from_millis(PROBE_MS),
     codecs: false,
     core_matrix: false,

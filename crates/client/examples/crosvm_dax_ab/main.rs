@@ -67,7 +67,7 @@ mod linux {
       .expect("usage: crosvm_dax_ab <socket_path> [dax]");
     let dax = std::env::args().nth(2).as_deref() == Some("dax");
 
-    let profile = MachineProfile::measure(ProfileOptions {
+    let profile = MachineProfile::measure_patiently(&ProfileOptions {
       budget_per_probe: ProfileOptions::default().budget_per_probe,
       codecs: false,
       core_matrix: false,

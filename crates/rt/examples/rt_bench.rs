@@ -196,11 +196,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
   // The same round trip with each spawned task noted as client activity: the shard spins out the
   // profile's window after it before parking, so a spawn that lands within the window skips the kernel
   // wake.
-  let profile = slates_machine::MachineProfile::measure(slates_machine::ProfileOptions {
-    budget_per_probe: Duration::from_millis(50),
-    codecs: false,
-    core_matrix: false,
-  })?;
+  let profile =
+    slates_machine::MachineProfile::measure_patiently(&slates_machine::ProfileOptions {
+      budget_per_probe: Duration::from_millis(50),
+      codecs: false,
+      core_matrix: false,
+    })?;
   let mut spinning = config(2);
   spinning.spin_ns = profile.derived().spin_before_park_ns.get();
   let two = Runtime::start(&spinning)?;

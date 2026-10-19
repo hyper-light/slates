@@ -218,7 +218,7 @@ fn p99_median(rows: &[(&'static str, Vec<u64>)]) -> u64 {
 }
 
 fn main() {
-  let profile = MachineProfile::measure(ProfileOptions {
+  let profile = MachineProfile::measure_patiently(&ProfileOptions {
     budget_per_probe: ProfileOptions::default().budget_per_probe,
     codecs: false,
     core_matrix: false,
