@@ -5165,6 +5165,36 @@ merge, remote/replicated volumes, post-quantum encryption in transit and at rest
 tracking. The honest position is that slates trades local per-op latency for those properties — the inverse of
 Tectonic's "trade latency for scale."
 
+**Measured (2026-10-18), second cut: the bridge is not the missing time either — dispatch is 0.5 µs.** The
+decomposition below put ~94% of a create "between" the transport and the VFS. Driving the same FUSE opcodes
+in-process through the bridge narrows that further, and the answer is that the between-layer is not the bridge.
+
+`cargo run --release -p slates-bridge-fuse --example shards_fs_bench`, macOS aarch64, host load 19, 2026-10-18 —
+a framed FUSE request in, dispatched through `VolumeBridge`, the framed reply out, over an in-memory duplex:
+
+| op | in-process | the same op through a Linux FUSE mount | ratio |
+|---|---|---|---|
+| GETATTR / stat | **291 ns** | 13,900 ns | 48× |
+| READ 4 KiB | **541 ns** | 43,300 ns | 80× |
+| LOOKUP | **541 ns** | — | — |
+| CREATE | **500 ns** p50 (3.7 µs p99, 36 µs max) | 276,900 ns | **554×** |
+
+So the FUSE codec, the bridge dispatch and the VFS together answer a create in half a microsecond, and a real
+mount takes 277. Three layers are now measured and none of them is the cost.
+
+**Caveats, and they matter here.** The in-process volume is a plain bounded volume built directly
+(`VolumeBridge::new`); the mounted one was `--shared`, an overlay over a 500-file tmpfs base, and published. So
+this measurement deliberately excludes overlay copy-up, base-plane lookups and publish/change-tracking — any of
+which a real create pays and this one does not. It also serves over an in-memory duplex rather than the
+production `/dev/fuse` channel and its serve loop. Different host and architecture again, as above.
+
+**What is left to attribute, stated as the next question rather than an answer.** The ~262 µs is in one or more
+of: the kernel↔daemon transport and the serve loop around dispatch (the stat row prices a *whole* round trip at
+13.9 µs, so this would have to be create-specific — a CREATE is more than one kernel message); the overlay and
+base-plane work a `--shared` mount does per create; and the publish/change-tracking bookkeeping a published
+volume does. `docs/wip/bench/fuse/fuse-perf.sh` discriminates between them by name — it `perf record`s the daemon
+through 2,000 creates. Owed; it needs a Linux host quiet enough to profile, and both of mine are loaded.
+
 **Measured (2026-10-18): the VFS primitive is 1% of a FUSE create, and the transport 5%. The other ~94% is the
 path between them.** The amendment below reasoned from the stat row that the round trip could not be most of a
 create; the in-process half is now measured rather than inferred.

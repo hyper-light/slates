@@ -29,6 +29,13 @@ const REGION_PAGES: usize = 4096;
 const N: usize = 20_000;
 /// The file the READ bench reads: one page, so READ moves a page per call.
 const FILE_BYTES: usize = 4096;
+/// How many files the CREATE row makes, one per timed call — the same count `docs/wip/bench/fuse/creates.py`
+/// drives through a real mount, so the two are comparable: each create lands in a directory that already holds
+/// every earlier one, as a real workload's do.
+const CREATES: usize = 2_000;
+/// Format: `fuse_create_in`'s open flags — `O_WRONLY | O_CREAT | O_TRUNC` as Linux numbers them, what
+/// `open(p, os.O_WRONLY | os.O_CREAT | os.O_TRUNC)` sends.
+const CREATE_FLAGS: u32 = 0o1 | 0o100 | 0o1000;
 
 /// A reusable in-memory duplex (see `tests/shards_fs.rs`): `serve_one` reads the request from `inbox` and appends the
 /// reply to `outbox`; `load` resets it with the next framed request so each timed call starts clean.
@@ -241,5 +248,42 @@ fn main() {
   println!(
     "  READ    ({FILE_BYTES} B)      {:?}",
     best(&mut duplex, &mut bridge, &cx, &read, &mut reply)
+  );
+
+  // CREATE is the write path's head and the slowest op a real mount shows (276.9 µs p50 through Linux FUSE,
+  // `BENCHMARKS.md` 2026-10-11, against a 3.9 µs in-process VFS create+unlink). Every call needs its own name,
+  // so the messages are built first and only the serve is timed; the distribution is reported as p50/p99 rather
+  // than best-of-N because that is what `creates.py` reports and the point is to compare them.
+  let creates: Vec<Vec<u8>> = (0..CREATES)
+    .map(|i| {
+      let mut body = Vec::with_capacity(16 + 16);
+      body.extend_from_slice(&CREATE_FLAGS.to_le_bytes());
+      body.extend_from_slice(&0o644u32.to_le_bytes());
+      body.extend_from_slice(&0u32.to_le_bytes());
+      body.extend_from_slice(&0u32.to_le_bytes());
+      body.extend_from_slice(format!("f{i}\0").as_bytes());
+      framed(&message(
+        Opcode::Create as u32,
+        100 + u64::try_from(i).unwrap_or(0),
+        1,
+        &body,
+      ))
+    })
+    .collect();
+  let mut took: Vec<Duration> = Vec::with_capacity(CREATES);
+  for request in &creates {
+    duplex.load(request);
+    let at = Instant::now();
+    serve_one(&mut duplex, &mut bridge, &cx, &mut reply).unwrap();
+    took.push(at.elapsed());
+  }
+  took.sort_unstable();
+  // Integer quantile index: the last element scaled by num/den, so no float cast rounds the position.
+  let at = |num: usize, den: usize| took[took.len().saturating_sub(1).saturating_mul(num) / den];
+  println!(
+    "  CREATE  ({CREATES} files)  p50 {:?}  p99 {:?}  max {:?}",
+    at(1, 2),
+    at(99, 100),
+    took[took.len().saturating_sub(1)]
   );
 }
