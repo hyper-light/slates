@@ -7837,6 +7837,12 @@ run before:
 | `PROPTEST_CASES=20000 … --test dax a_random_interleaving` | **green, 3.90 s** |
 | `PROPTEST_CASES=2000 … --test device a_random_window_schedule` | **green, 0.30 s** |
 
-The two deepened runs are the gate checklist's own commands, at 133× and 25× their committed case counts, on
-the architecture they had never been taken on. Nothing in the DAX path is page-size or endianness shaped as far
-as these say, which is the useful negative result: the macOS evidence was not accidentally architecture-bound.
+And again on **aarch64 Linux** (the Docker VM's 6.12.76 kernel, page 4,096), which completes the matrix:
+`dax` 53, `device` 35 (+1 ignored), `serve` 6, the virtio-fs lib 19, the interleaving at 20,000 cases green in
+3.34 s and the window schedule at 2,000 green in 0.14 s.
+
+So the gate's evidence now stands on **three** platform/architecture pairs — macOS aarch64, Linux x86_64 and
+Linux aarch64 — with identical counts on each. The two deepened runs are the checklist's own commands at 133×
+and 25× their committed case counts. The useful negative result is that nothing in the DAX path turns out to be
+page-size, kernel or endianness shaped: the macOS evidence was not accidentally architecture-bound, which is
+what taking it on one host had left open.
