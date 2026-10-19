@@ -448,7 +448,7 @@ fn a_wedged_shard_ends_the_observation_long_before_its_wedge_does() {
     "a shard consuming no CPU ends at its deadline: {ended:?}"
   );
   let took = started.elapsed();
-  let switches = slates_machine::bench::involuntary_switches().saturating_sub(switches_before);
+  let switches = slates_machine::bench::involuntary_switches_since(switches_before);
   let wedge = std::time::Duration::from_nanos(WEDGE_BUDGETS * SHORT_BUDGET_NS);
   // What must hold on any machine: measured from the moment the shard took the wedge, the observation ended
   // before the wedge's own sleep did — so the deadline is what ended it, not the sleep running out. A wedge
@@ -462,7 +462,7 @@ fn a_wedged_shard_ends_the_observation_long_before_its_wedge_does() {
     "the deadline ended it, not the {WEDGE_BUDGETS}-budget wedge running out: {from_wedge:?} from the wedge"
   );
   println!(
-    "wedge: ended after {took:?} ({from_wedge:?} from the wedge), involuntary switches {switches}"
+    "wedge: ended after {took:?} ({from_wedge:?} from the wedge), involuntary switches {switches:?}"
   );
   // The tighter claim, on the same from-the-wedge basis: the deadline fired within its own windows. Measured
   // against the whole call it was a claim about how long the host took to admit the question — at load 158 on
@@ -470,7 +470,7 @@ fn a_wedged_shard_ends_the_observation_long_before_its_wedge_does() {
   assert!(
     from_wedge
       .is_none_or(|waited| waited < Duration::from_nanos(ENDED_WITHIN_BUDGETS * SHORT_BUDGET_NS))
-      || switches > 0,
+      || switches.is_none_or(|switches| switches > 0),
     "within two windows and the deadline's lateness: {from_wedge:?} from the wedge, with no involuntary \
      switch to blame"
   );

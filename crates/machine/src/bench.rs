@@ -35,24 +35,37 @@ pub const TIMER_OVERHEAD_FACTOR: u64 = 100;
 /// Use it to attribute a tight "was this fast" bound: assert the bound **or** that the count moved. A
 /// *sleeping* sampler's wake lateness is not a substitute — it measures a different quantity and under-covers
 /// by a margin that varies with nothing in particular (measured: 20 ms against 65 ms for near-identical steps).
+///
+/// **`None` where the platform has no such counter** (Windows today), which a caller must tell apart from
+/// `Some(0)`, "the scheduler did not take this thread away". A test that cannot attribute must not enforce a
+/// tight bound it has no way to defend — it should say so and skip that assertion, the way this project skips
+/// an env-gated test loudly. Returning a bare `0` there, as the three hand-copied versions of this did, quietly
+/// turns "cannot tell" into "the code's own fault" on exactly the platform that is hardest to reproduce on.
 #[cfg(unix)]
-pub fn involuntary_switches() -> u64 {
+pub fn involuntary_switches() -> Option<u64> {
   let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
   // SAFETY: `getrusage` fills the `rusage` the pointer names and returns zero on success; `RUSAGE_SELF` is a
   // valid selector; the buffer is ours, fully sized and zeroed before the call.
   let usage = unsafe {
     if libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) != 0 {
-      return 0;
+      return None;
     }
     usage.assume_init()
   };
-  u64::try_from(usage.ru_nivcsw).unwrap_or(0)
+  Some(u64::try_from(usage.ru_nivcsw).unwrap_or(0))
 }
 
-/// Without the counter, every stretch of work counts as the code's own.
+/// No counter on this platform: the caller cannot attribute, and is told so rather than handed a zero.
 #[cfg(not(unix))]
-pub fn involuntary_switches() -> u64 {
-  0
+pub fn involuntary_switches() -> Option<u64> {
+  None
+}
+
+/// The involuntary switches since `before`, or `None` when the question cannot be answered on this platform.
+/// Take `before` with [`involuntary_switches`], run the work, then ask this; `Some(0)` means the scheduler left
+/// the thread alone, which is the reading that lets a tight timing bound stand.
+pub fn involuntary_switches_since(before: Option<u64>) -> Option<u64> {
+  Some(involuntary_switches()?.saturating_sub(before?))
 }
 
 /// Shape: the smallest sample the stopping rule may accept; below this the bootstrap has too few

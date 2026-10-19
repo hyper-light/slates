@@ -60,8 +60,9 @@ struct Ticker {
   /// the macOS runner, unattributed).
   longest_call: &'static str,
   /// Involuntary context switches during the longest step: non-zero means the scheduler took the thread away,
-  /// so the step's length is the machine's and not the driver's.
-  longest_switches: u64,
+  /// so the step's length is the machine's and not the driver's. `None` where the platform keeps no such
+  /// counter — a different thing from zero, and the bound is then not enforced rather than guessed at.
+  longest_switches: Option<u64>,
 }
 
 impl Ticker {
@@ -69,7 +70,7 @@ impl Ticker {
   /// thread away during it**. A step is judged by the clock and attributed by that count: one the OS preempted
   /// is not one the driver held, and before this the two were indistinguishable — the comment on
   /// `longest_call` records a 245 ms step on a CI runner that could not be attributed at all.
-  fn note(&mut self, call: &'static str, took: Duration, switches: u64) {
+  fn note(&mut self, call: &'static str, took: Duration, switches: Option<u64>) {
     if took > self.longest_step {
       self.longest_step = took;
       self.longest_call = call;
@@ -99,7 +100,7 @@ impl Ticker {
       self.note(
         "pump",
         step.elapsed(),
-        slates_machine::bench::involuntary_switches().saturating_sub(step_switches),
+        slates_machine::bench::involuntary_switches_since(step_switches),
       );
       if Instant::now() >= next_tick {
         let ticked = Instant::now();
@@ -108,7 +109,7 @@ impl Ticker {
         self.note(
           "tick",
           ticked.elapsed(),
-          slates_machine::bench::involuntary_switches().saturating_sub(tick_switches),
+          slates_machine::bench::involuntary_switches_since(tick_switches),
         );
       }
       for event in events {
@@ -136,7 +137,7 @@ impl Ticker {
       self.note(
         "a whole step: pump, tick and the events",
         step.elapsed(),
-        slates_machine::bench::involuntary_switches().saturating_sub(step_switches),
+        slates_machine::bench::involuntary_switches_since(step_switches),
       );
       std::hint::spin_loop();
     }
@@ -265,7 +266,7 @@ fn connect_from_the_loop(instance: &str, ticker: &mut Ticker) -> Client {
         ticker.note(
           "Connecting::poll",
           step.elapsed(),
-          slates_machine::bench::involuntary_switches().saturating_sub(switches),
+          slates_machine::bench::involuntary_switches_since(switches),
         );
         match polled {
           Ok(Some(client)) => return client,
@@ -284,7 +285,7 @@ fn connect_from_the_loop(instance: &str, ticker: &mut Ticker) -> Client {
         ticker.note(
           "Client::begin_connect",
           step.elapsed(),
-          slates_machine::bench::involuntary_switches().saturating_sub(connect_switches),
+          slates_machine::bench::involuntary_switches_since(connect_switches),
         );
         std::hint::spin_loop();
       }
@@ -398,7 +399,7 @@ fn every_call_ends_and_the_loop_is_never_held_across_restart_and_death() {
   // these three numbers are what a CI failure needs (the `longest_call` comment records a 245 ms step that
   // could not be attributed at all).
   println!(
-    "driver loop: longest step {:?} in {}, bound {:?}, sampled noise {:?}, involuntary switches during it {}",
+    "driver loop: longest step {:?} in {}, bound {:?}, sampled noise {:?}, involuntary switches during it {:?}",
     ticker.longest_step,
     ticker.longest_call,
     step_bound(),
@@ -412,9 +413,11 @@ fn every_call_ends_and_the_loop_is_never_held_across_restart_and_death() {
   // estimate swinging 20–65 ms for near-identical steps — a sleeping sampler measures its own wake lateness,
   // which is not what a runnable thread suffers.
   assert!(
-    ticker.longest_step < step_bound() + noise || ticker.longest_switches > 0,
+    ticker.longest_step < step_bound() + noise
+      || ticker.longest_switches.is_none_or(|switches| switches > 0),
     "the longest loop step was {:?} in {}, bound {:?} plus the machine's own scheduling noise {:?}, and the \
-     scheduler took the thread away {} times during it (zero: the driver held it)",
+     scheduler took the thread away {:?} times during it (Some(0): the driver held it; None: this \
+     platform keeps no such counter)",
     ticker.longest_step,
     ticker.longest_call,
     step_bound(),

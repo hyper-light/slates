@@ -188,11 +188,13 @@ fn no_daemon_means_daemon_unavailable() {
 #[derive(Clone, Copy, Default)]
 struct Longest {
   took: Duration,
-  switches: u64,
+  /// `None` where the platform keeps no such counter (Windows), which is not the same as zero: the bound
+  /// cannot be attributed there and so is not enforced, loudly.
+  switches: Option<u64>,
 }
 
 impl Longest {
-  fn note(&mut self, took: Duration, switches: u64) {
+  fn note(&mut self, took: Duration, switches: Option<u64>) {
     if took > self.took {
       self.took = took;
       self.switches = switches;
@@ -236,21 +238,29 @@ fn a_claim_is_polled_without_waiting_and_refused_at_the_claim_wait() {
   assert!(connected.region.client_id() > 0);
   for longest in [longest, served_longest] {
     println!(
-      "claim poll: longest {:?}, bound {:?}, involuntary switches during it {}",
+      "claim poll: longest {:?}, bound {:?}, involuntary switches during it {:?}",
       longest.took,
       poll_bound(),
       longest.switches
     );
     // Over the bound is the claim's doing only if the scheduler did not take the thread away during that
     // poll. A poll that merely read the answer's state and was then preempted is not a poll that waited.
-    assert!(
-      longest.took < poll_bound() || longest.switches > 0,
-      "the longest poll was {:?}, bound {:?}, and the scheduler took the thread away {} times during it \
-       (zero: the claim waited)",
-      longest.took,
-      poll_bound(),
-      longest.switches
-    );
+    match longest.switches {
+      Some(switches) => assert!(
+        longest.took < poll_bound() || switches > 0,
+        "the longest poll was {:?}, bound {:?}, and the scheduler took the thread away {switches} times \
+         during it (zero: the claim waited)",
+        longest.took,
+        poll_bound()
+      ),
+      // No counter here, so a long poll cannot be told from a preempted one. Say so and do not assert a
+      // bound this platform gives no way to defend.
+      None => println!(
+        "claim poll: the bound was not enforced — this platform has no involuntary-switch counter, so a \
+         {:?} poll cannot be attributed to the claim rather than to the scheduler",
+        longest.took
+      ),
+    }
   }
 }
 
@@ -264,7 +274,7 @@ fn poll_until_refused(mut claim: slates_ipc::Claim) -> (IpcError, u64, Longest) 
     let polled = claim.poll();
     longest.note(
       at.elapsed(),
-      slates_machine::bench::involuntary_switches().saturating_sub(switches),
+      slates_machine::bench::involuntary_switches_since(switches),
     );
     polls += 1;
     match polled {
@@ -302,7 +312,7 @@ fn poll_while_serving(listener: &mut Listener, instance: &str) -> (slates_ipc::C
     let polled = claim.poll().unwrap();
     longest.note(
       at.elapsed(),
-      slates_machine::bench::involuntary_switches().saturating_sub(switches),
+      slates_machine::bench::involuntary_switches_since(switches),
     );
     if let Some(connected) = polled {
       // The daemon's ends go with the test; the client's mapping keeps the region it opened.

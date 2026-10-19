@@ -626,7 +626,8 @@ fn destroy_rows(mut tree: Tree, step_budget_ns: u64) -> Result<bool, Box<dyn Err
     let progress = vol.destroy_step(store, step_budget_ns)?;
     let took = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
     let in_dealloc = DEALLOC_NS.load(Ordering::Relaxed) - dealloc_before;
-    let was_preempted = slates_machine::bench::involuntary_switches() > switches_before;
+    let was_preempted =
+      slates_machine::bench::involuntary_switches_since(switches_before).is_some_and(|n| n > 0);
     match progress {
       DestroyProgress::Released(n) => {
         released += n;
