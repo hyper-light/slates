@@ -6513,7 +6513,13 @@ count, so negotiating a larger one would have let a 64 KiB-page guest ask past t
 now follows the negotiated count. And the **read** side does not move — 128 KiB per READ request at any buffer —
 because the mount's readahead window is 128 kB (`/sys/class/bdi/<maj:min>/read_ahead_kb`, read directly), which
 is root-owned and therefore a host knob, not something an unprivileged daemon can lift. Full record in
-`BENCHMARKS.md`. The x86_64 leg of the count is still owed.
+`BENCHMARKS.md`. **The x86_64 leg is no longer owed — taken 2026-10-19** on an idle 32-core Fedora host
+(kernel 6.19, page 4,096, load1 1.6-2.2) as an interleaved A/B against the same tree with the one line
+`| flags::MAX_PAGES` deleted, two rounds each. With the flag a 256 KiB and a 1 MiB write both resolve to 256 KiB
+requests; without it, 128 KiB. The 128 KiB buffer is the built-in control -- under both caps, so both arms must
+issue one request per write, and they agree within 2% there -- and at a 1 MiB buffer, where both arms make the
+same 64 `write()` calls, the measured gap is 1,166 - 654 = 512 reads = exactly twice the 256 extra requests, with
+an overhead term of 142 in *both* arms. Same conclusion as aarch64, on the other architecture and page size.
 
 ### 2026-10-18: a zero-copy read handed the peer the whole content arena, writable (A-135; escape closed)
 

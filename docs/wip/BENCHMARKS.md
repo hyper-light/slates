@@ -5153,15 +5153,50 @@ A timing A/B was attempted first and is **not** reported as evidence: the host's
 (tmpfs itself fell 14,776 → 7,691 MiB/s), so the two runs were not comparable. The count is immune to that,
 which is why it is the measurement here.
 
-**x86_64 kernel-side confirmation is owed, and the attempt is recorded as not evidence.** The counts above are
-Linux **aarch64** (Docker, 6.12). Confirming the same on the x86_64 box needs a release build *there*, and its
-scratch tree sits at an old commit: dropping today's `init.rs`/`abi.rs` into it failed to compile (29 errors,
-the files reference newer APIs), so the probe that ran used the **pre-change** binary and its numbers
-(7,953 / 6,064 / 4,563 reads) say nothing about this fix. The three files were restored from that tree's own
-HEAD and it builds again. A full sync of that tree is not a change to make unilaterally, so the x86_64 leg
-stays owed. What does carry across architectures meanwhile: `max_pages` is derived from the run-time page size
-and the ABI test asserts `max_pages × page_size == MAX_WRITE` on every platform CI builds, and the kernel code
-path that honours the field is architecture-independent.
+**x86_64 confirmed, on a quiet host, by an A/B with its own control (2026-10-19).** The counts above are Linux
+**aarch64** (Docker, 6.12). The first x86_64 attempt is recorded as **not** evidence: the scratch tree on the bench
+box sat at an old commit, dropping today's `init.rs`/`abi.rs` into it failed to compile (29 errors), so the probe
+that ran used the **pre-change** binary and its numbers (7,953 / 6,064 / 4,563 reads) say nothing about this fix.
+The files were restored from that tree's own HEAD and it builds again.
+
+The leg is now taken properly on a second x86_64 host that was idle — `fedora.attlocal.net`, 32 cores, kernel
+6.19.10-300.fc44, page size 4,096, load1 1.60–2.15 throughout, release build with the repo's pinned rustc 1.98.0.
+Two arms from one tree: **A** is HEAD, **B** is HEAD with the single line `| flags::MAX_PAGES` deleted from
+`wanted()`; the binaries were checked to differ by hash before either ran (`cf63ef8db1c9` vs `4a12b6161c5a`). Each
+point is a fresh daemon, volume and mount; 64 MiB is written at one buffer size and `fsync`ed before the daemon's
+`syscr` is sampled; the arms are interleaved A, B, A, B.
+
+| buffer (64 MiB) | A `read()`s (2 rounds) | B `read()`s (2 rounds) | A requests | B requests |
+|---|---|---|---|---|
+| 128 KiB | 2,025 / 1,982 | 2,061 / 2,062 | 512 | 512 |
+| 256 KiB | **1,038 / 1,037** | 1,550 / 1,546 | **256** | 512 |
+| 1,024 KiB | **654 / 654** | 1,166 / 1,166 | **256** | 512 |
+
+**The 128 KiB row is the control**: 128 KiB is under both arms' caps, so both must issue one request per `write()`,
+and both do — the arms agree within 2% there and separate only where the cap bites. Reading the table needs one
+constant, `reads = 2 x requests + 2 x write() calls`, which fits all six points within 3%; the two reads per
+request are the same scale the aarch64 run pinned. The fit is not load-bearing, because the two rows that matter
+need no model at all: at a 1 MiB buffer both arms make exactly 64 `write()` calls, so their per-write overhead is
+identical, and the measured difference is 1,166 - 654 = 512 reads = exactly 2 x 256 extra requests. Subtracting
+the 512 and 1,024 request-reads leaves an overhead of **142 in both arms**. At 256 KiB the same subtraction leaves
+525 and 524. The arms differ in one thing and the arithmetic closes on it.
+
+**So on x86_64 with 4 KiB pages the request is 256 KiB with the flag and 128 KiB without** — the requests for any
+write of 256 KiB or more are halved, which is what the aarch64 counts said, now on the other architecture and the
+other page size. In syscalls the daemon does 33% fewer reads at a 256 KiB buffer and 44% fewer at 1 MiB, and
+nothing changes at 128 KiB. What already carried across architectures stands: `max_pages` is derived from the
+run-time page size, the ABI test asserts `max_pages x page_size == MAX_WRITE` on every platform CI builds, and the
+kernel path that honours the field is architecture-independent.
+
+Re-take it with (the sweep is one command; the `sed` makes the B arm and the tree is disposable):
+
+```
+cargo build --release -p slates-cli --bin slates && cp target/release/slates /tmp/slates-A
+sed -i '/^    | flags::MAX_PAGES$/d' crates/bridge-fuse/src/init.rs
+cargo build --release -p slates-cli --bin slates && cp target/release/slates /tmp/slates-B
+# per point: anchor --quick --shards 2; volume create --dynamic 8GiB; mount; write 64 MiB; fsync;
+# delta of /proc/<daemon>/io syscr.  Interleave the arms.
+```
 
 **The read side does not move, and the reason is measured.** The same count over a 256 MiB read-back is 4,100
 daemon reads whatever the caller's buffer — 128 KiB per READ request, unchanged by `max_pages`:
