@@ -6895,6 +6895,16 @@ deadline", **decided** rather than built, because a lease would reintroduce the 
 **cross-volume map-storm denial** (a repeat request returns its window and pins again for it); and the **pin
 ledger** now has a red-checked guard holding the arena's accounting to the device's.
 
+**Hardening added later the same day, none of it blocking but all of it on the gate's path.** The vhost-user front
+end is the one external-bytes surface a VMM controls, and it had no hostile-input test — CLAUDE.md requires one of
+every parser of external bytes. Eleven malformed messages now drive a real socket and each is refused by its own
+rule with nothing established; the parser itself proved sound, and what the exercise found was on the way out
+(`SeamError::FrontEndBroke`: every refusal had been reported to the end record as a clean guest hang-up). The
+back-end-request channel's reply-acks are now checked against the request awaiting them, which is the one that
+mattered for DAX: the ack carried a request code that was parsed and discarded, so a front end answering out of
+order would have completed a map's ack against an outstanding *unmap*, and the caller unpins on an `Unmapped` —
+a block back in the arena while the guest still holds it. Both red-checked on Linux.
+
 **Adjacent, and not part of this gate:** A-135's local zero-copy read is governed by its own confinement rule
 (`confined_for_a_peer`) and is separately owed a **multi-chunk map** — a file larger than one content chunk falls
 back to copy today, since the zero-copy path would otherwise return one chunk silently — and the **cross-shard
