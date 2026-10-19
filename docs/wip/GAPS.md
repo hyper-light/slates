@@ -7919,3 +7919,32 @@ Deriving it means measuring bit-flip susceptibility on real DRAM, which is not a
 hosts uninvited, and the cost it trades against is real: row 2's note records that guarding every read-only
 mapping doubles mapped-content RAM. So rows 2 and 3 are **one** question now rather than three, and the
 question is an anchor, not an architecture.
+
+### 2026-10-19: row 1's live crosvm leg — what it is actually blocked on, measured
+
+With row 1 closed (A-138) the gate's one remaining row-1 item is the live proof: a real crosvm guest mapping a
+confined window. Checked on `adacachy` (the harness's recorded host, kernel 7.2.9, `/dev/kvm` world-rw,
+`/dev/udmabuf` reachable by ACL — `UDMABUF_CREATE as uid 1000: OK`, so the confinement would work there):
+
+- **The gap the 2026-10-16 attempt found is closed.** That run reached the vhost-user connection and stopped
+  because the seam had no `VHOST_USER_GET_CONFIG` (24), which a real VMM needs to read the virtio-fs tag and
+  queue count. It is implemented now — `request::GET_CONFIG => self.get_config(..)`, the `virtio_fs_config`
+  captured at adopt.
+- **The harness builds and runs at HEAD.** `cargo build --release -p slates-client --example crosvm_dax_ab`
+  (2m31s), and it prints `HARNESS-LISTENING /tmp/.../sl.sock` with its shard up.
+- **The blocker is a guest kernel image, and nothing else.** There is no `vmlinux` or `bzImage` anywhere on the
+  box (`/boot` is empty), and the README's recipe needs one built with `VIRTIO_FS`, `FUSE_FS`, `FUSE_DAX`,
+  `DAX` and `VIRTIO_PCI` all `=y` — a stock distro image would very likely not carry `FUSE_DAX=y`. Running the
+  real crosvm against the listening backend with a missing kernel path shows why no shortcut exists:
+
+  ```
+  crosvm: exiting with error 1: failed to open kernel image /nonexistent/vmlinux
+  the backend saw: HARNESS-LISTENING ...        (and nothing further)
+  ```
+
+  crosvm opens the kernel **before** it connects to the vhost-user backend, so there is no handshake to
+  observe without one — the 2026-10-16 run must have had an image that has since gone.
+
+So the leg needs a kernel built to that config (hours of build, or a download of a sizeable third-party binary
+onto Ada's machine), and that is the whole of what is missing: the protocol gap is closed, the confinement is
+in and unit-proven, and the initramfs from the last run is still at `~/crosvm-ab/initramfs.cpio.gz`.
