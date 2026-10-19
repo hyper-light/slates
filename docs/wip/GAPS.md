@@ -6935,6 +6935,20 @@ mattered for DAX: the ack carried a request code that was parsed and discarded, 
 order would have completed a map's ack against an outstanding *unmap*, and the caller unpins on an `Unmapped` —
 a block back in the arena while the guest still holds it. Both red-checked on Linux.
 
+**The gate's adversarial evidence, and the two commands that re-take it (2026-10-19).** Both schedules deepen on
+demand now that the case count reads from the environment:
+
+```
+PROPTEST_CASES=20000 cargo test --release -p slates-vfs --test dax a_random_interleaving      # 12.60 s, green
+PROPTEST_CASES=2000  cargo test --release -p slates-bridge-virtiofs --test device a_random_window_schedule   # 0.24 s, green
+MIRIFLAGS=-Zmiri-ignore-leaks cargo +nightly miri test -p slates-vfs --test dax -- --skip a_random_interleaving
+```
+
+The first two are 133× and 25× their committed defaults and cover this session's pin dedup and snapshot-recall
+exclusion. The third is the Miri leg (52 passed, 396 s, 2026-10-18); it skips the chaos schedule because an
+interpreter cannot finish one generated case of it, and with the count now a variable the better form is
+`PROPTEST_CASES=16` rather than `--skip`, which covers the property instead of omitting it.
+
 **Adjacent, and not part of this gate:** A-135's local zero-copy read is governed by its own confinement rule
 (`confined_for_a_peer`) and is separately owed a **multi-chunk map** — a file larger than one content chunk falls
 back to copy today, since the zero-copy path would otherwise return one chunk silently — and the **cross-shard
