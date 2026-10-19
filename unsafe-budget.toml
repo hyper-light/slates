@@ -210,7 +210,10 @@ slates-machine = 51
 # has no Darwin advice, so they are `libc::madvise`); and the test-only footprint reader `test_serial::footprint`
 # (`proc_pid_rusage` into a buffer of its struct's size and the `assume_init` after it succeeded, 2), with which the
 # give-back's tests observe what macOS counts.
-slates-mem = 36
+slates-mem = 37
+# 2026-10-19 (+1, §4.6 L1): `region::collapse_huge` — one `libc::madvise(MADV_COLLAPSE)` block. The sandbox
+#   needs physical contiguity, not a preference for it, and neither memmap2 0.9.11 nor rustix 1.1.4 exposes the
+#   advice, so the call is made directly; it only changes how the kernel backs pages the map already owns.
 # 2026-09-14 (+11, registry slot reclamation — `docs/bugs/2026-09-14-shard-registry-leaks-every-slot-for-the-process-lifetime.md`):
 # `driver::KickFd` — the slot-owned kick descriptor: `Sync`/`Send` impls (2), `with`, `fd`, `close` (3
 # blocks reading or taking the `UnsafeCell` under the `closed` flag); `registry::register` (the previous

@@ -186,6 +186,19 @@ impl Region {
     slates_machine::facts::huge_backed_bytes(self.base() as usize)
   }
 
+  /// Asks the kernel to make `[offset, offset + len)` one huge page **now** (`MADV_COLLAPSE`, Linux 6.1), for a
+  /// caller that needs physical contiguity rather than prefers it (§4.6's L1 sandbox).
+  ///
+  /// `true` only means the kernel accepted the work, not that the span is huge: that stays
+  /// [`Region::huge_backed_bytes`]'s question, and the caller asks it after. `false` off Linux, on a kernel
+  /// before 6.1, on a shared object the kernel will not collapse, or when it could not compact enough memory.
+  pub fn collapse_huge(&mut self, offset: usize, len: usize) -> bool {
+    match self.backing.bytes().get(offset..offset.saturating_add(len)) {
+      Some(span) => collapse_huge(span),
+      None => false,
+    }
+  }
+
   /// The NUMA node the region was recorded on.
   pub const fn numa_node(&self) -> u16 {
     self.numa_node
@@ -375,6 +388,47 @@ impl Region {
 #[cfg(target_os = "linux")]
 fn advise_huge(map: &MmapMut) -> bool {
   map.advise(memmap2::Advice::HugePage).is_ok()
+}
+
+/// Asks the kernel to **make** `[offset, offset + len)` of `map` one huge page now, rather than to prefer one
+/// when it next happens to be able to (`MADV_COLLAPSE`, Linux 6.1).
+///
+/// `MADV_HUGEPAGE` is a preference: the kernel grants it out of whatever contiguous memory it has at fault time,
+/// so the same span can come back huge on a quiet machine and base-paged on a busy one. Measured here
+/// 2026-10-19: with 59 tests mapping in parallel on a 32-core host with 81 GB free, two of four sandbox
+/// reservations that had succeeded moments before were declined. §4.6's L1 sandbox cannot be best-effort — a
+/// shift onto base pages moves no physical rows — so when the preference is not honoured the kernel is asked to
+/// do the compaction work synchronously instead, and the caller measures again either way.
+///
+/// `false` where the kernel declined (it could not compact enough free memory, the range is unsuitable, or the
+/// kernel predates 6.1 and answers `EINVAL`) — never a reason to assume the span is huge; the caller's
+/// measurement decides, as it does for the advice.
+#[cfg(target_os = "linux")]
+fn collapse_huge(span: &[u8]) -> bool {
+  /// Format: `MADV_COLLAPSE` (`include/uapi/asm-generic/mman-common.h`, Linux 6.1). Written here rather than
+  /// taken from `libc`, which defines it only for the GNU target, so a musl build sees the same number.
+  const MADV_COLLAPSE: libc::c_int = 25;
+  if span.is_empty() {
+    return false;
+  }
+  // SAFETY: `span` is a live sub-slice of this mapping, so the pointer and length name mapped memory the map
+  // owns for the call. `MADV_COLLAPSE` changes only how the kernel backs those pages — it never unmaps them,
+  // moves them or changes their contents — so no Rust reference into the map is invalidated, and a kernel that
+  // does not know the advice returns `EINVAL`, which is read as "no".
+  let answer = unsafe {
+    libc::madvise(
+      span.as_ptr().cast_mut().cast::<libc::c_void>(),
+      span.len(),
+      MADV_COLLAPSE,
+    )
+  };
+  answer == 0
+}
+
+/// The paired arm: no `MADV_COLLAPSE` to ask off Linux, so the span is whatever the OS made it.
+#[cfg(not(target_os = "linux"))]
+fn collapse_huge(_span: &[u8]) -> bool {
+  false
 }
 
 #[cfg(not(target_os = "linux"))]

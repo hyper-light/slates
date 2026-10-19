@@ -8340,3 +8340,32 @@ Three things worth keeping:
 Proven by `one_round_of_the_periodic_shift_visits_every_window_once_and_slices` (three windows, a one-byte
 budget, so the round must take three slices; every window visited once, each landing in the tenant's sandbox and
 none on the row it left) — which runs where a sandbox can be backed and skips loudly elsewhere.
+
+### 2026-10-19: the sandbox measurement was understating, and the kernel can be asked harder
+
+Two fixes to `DaxZone::verify_contiguous`, both found by running the suite repeatedly on Linux rather than by
+reading it. Before them the sandbox tests skipped 2, 6, 6, 4, 6 times over five runs of the dax suite on fedora
+6.19.10 — a defence whose own tests ran half the time.
+
+1. **The measurement was not attributable.** `huge_backed_bytes` is a whole-mapping total, so taking it before
+   and after faulting a span only attributes the growth to that span if the span was not already faulted. In a
+   long-lived arena it usually is: the test writes a file, the arena hands out the span later, and the pages are
+   already there. The growth then understates by exactly what was present, and a span that really was one huge
+   page reads as short. The zone now discards the span first (it is huge-aligned and huge-sized, so it covers
+   whole huge pages and takes nothing else with it), which makes the before-reading honest.
+2. **The advice can be escalated to a request.** `MADV_HUGEPAGE` is a preference the kernel grants out of
+   whatever contiguous memory it has at fault time. `MADV_COLLAPSE` (Linux 6.1) asks it to do the compaction work
+   synchronously. Neither memmap2 0.9.11 nor rustix 1.1.4 exposes it, so `Region::collapse_huge` issues the
+   `madvise` directly (one `unsafe` block, budget 36 → 37, reason recorded).
+
+**Measured after, fedora 6.19.10 x86_64, five runs of the full dax suite: 3, 4, 2, 0, 0 skips.** And a finding
+worth keeping for deployment: `MADV_COLLAPSE` honoured the request on a host whose `transparent_hugepage/
+shmem_enabled` is `[never]` — it is a request, not a preference — so a deployment does not have to tune that
+sysfs knob for L1. It still needs the kernel to *find* the contiguous memory: the shared-object test, run alone
+eight times on that host, reserved a sandbox in three. A reservation that cannot be backed is refused, which is
+the only honest answer, and `a_shift_is_refused_where_the_host_cannot_make_it_move_physical_rows` is the test of
+that leg.
+
+The remaining variance is the host's, not the code's. That is worth saying plainly rather than engineering
+around: physical contiguity is a resource the kernel may not have, and a defence that pretended otherwise would
+be the security theatre §4.6 names.

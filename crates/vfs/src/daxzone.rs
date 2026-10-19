@@ -153,6 +153,15 @@ impl DaxZone {
     if address.checked_rem(huge).unwrap_or(1) != 0 {
       return Err(VfsError::NoPhysicalIsolation);
     }
+    // Drop whatever already backs the span before measuring, so the measurement is *attributable*. The
+    // mapping's PMD-mapped bytes are a whole-mapping total, so a reading taken over a span the arena had
+    // already faulted counts pages this reservation did not get and the growth understates by exactly what was
+    // there — which is how a span that really is one huge page comes back looking short. The span is
+    // huge-aligned and huge-sized (checked above), so it covers whole huge pages and nothing else's bytes go
+    // with it, and the slots cut from it are handed out empty anyway.
+    if let Some(mapping) = arena.region_mut(region) {
+      mapping.discard(base, huge);
+    }
     let before = arena
       .region(region)
       .and_then(slates_mem::region::Region::huge_backed_bytes)
@@ -162,12 +171,28 @@ impl DaxZone {
     if let Some(mapping) = arena.region_mut(region) {
       mapping.touch_pages(from_page, to_page);
     }
+    let wanted = u64::try_from(huge).unwrap_or(u64::MAX);
     let after = arena
       .region(region)
       .and_then(slates_mem::region::Region::huge_backed_bytes)
       .ok_or(VfsError::NoPhysicalIsolation)?;
-    let gained = after.saturating_sub(before);
-    if gained < u64::try_from(huge).unwrap_or(u64::MAX) {
+    if after.saturating_sub(before) >= wanted {
+      return Ok(());
+    }
+    // The advice is a *preference*: the kernel grants it out of whatever contiguous memory it has at fault
+    // time, so the same span comes back huge on a quiet machine and base-paged on a busy one — measured here
+    // 2026-10-19, two of four reservations declined under 59 parallel tests on a host with 81 GB free. A
+    // sandbox cannot be best-effort, so ask the kernel to do the compaction work now instead
+    // (`MADV_COLLAPSE`), and measure again. A kernel that does not know the advice, or cannot compact, simply
+    // leaves the second measurement short and the zone is refused.
+    if let Some(mapping) = arena.region_mut(region) {
+      mapping.collapse_huge(base, huge);
+    }
+    let collapsed = arena
+      .region(region)
+      .and_then(slates_mem::region::Region::huge_backed_bytes)
+      .ok_or(VfsError::NoPhysicalIsolation)?;
+    if collapsed.saturating_sub(before) < wanted {
       return Err(VfsError::NoPhysicalIsolation);
     }
     Ok(())

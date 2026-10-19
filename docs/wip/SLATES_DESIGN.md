@@ -2823,9 +2823,19 @@ same-namespace host process is the first delivered case.
 >      **Unprivileged, by measurement rather than by requirement.** A hugetlb reservation would need
 >      `/proc/sys/vm/nr_hugepages` from an administrator, which R10 refuses to require; a transparent huge page
 >      needs nothing, and whether the kernel actually gave one is a question `/proc/self/smaps` answers
->      (`slates_machine::facts::huge_backed_bytes`). The zone asks, faults the span, and reads the PMD-mapped bytes
->      before and after, so the growth is attributable to that span — `madvise` returning `OK` is not an answer
->      (measured on Linux 7.2: a 64 KiB and a 1 MiB mapping both take it and receive none).
+>      (`slates_machine::facts::huge_backed_bytes`); `madvise` returning `OK` is not an answer (measured on
+>      Linux 7.2: a 64 KiB and a 1 MiB mapping both take it and receive none).
+>      The zone **discards the span, measures, faults it, and measures again**, so the growth is attributable to
+>      that span. The discard is not tidiness: the PMD-mapped figure is a whole-mapping total, so a reading taken
+>      over a span the arena had already faulted counts pages this reservation did not get, and the growth
+>      understates by exactly what was there — which is how a span that really was one huge page read as short
+>      (measured 2026-10-19; it was costing two to six of the sandbox tests per run).
+>      And where the preference is not honoured the zone **asks the kernel to do the compaction work now**
+>      (`MADV_COLLAPSE`, Linux 6.1) and measures a third time, because a sandbox cannot be best-effort. Measured
+>      on fedora 6.19.10: the collapse honours the request even where `shmem_enabled` is `[never]` — it is a
+>      request, not a preference — but it still needs the kernel to find the contiguous memory, so an isolated
+>      reservation succeeded in three runs of eight on that host. A reservation that cannot be backed is refused,
+>      which is the only honest answer: physical contiguity is the host's to give.
 >      **The zone holds every slot it is not lending.** A row the zone does not hold is a row the general allocator
 >      may give another volume — the co-location the zone exists to prevent — so the span is allocated whole and
 >      any row that left (an ordinary delete or truncate frees a block by a path the zone does not sit on) is
