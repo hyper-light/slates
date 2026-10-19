@@ -1,9 +1,14 @@
 #!/bin/bash
 set -u
 # A-96: 2,000 creates (open O_CREAT, write, close, stat; `creates.py`) through Linux's FUSE mount of a slates volume,
-# beside tmpfs, then again under `perf record` of the daemon. Run with the Linux release build at /target:
-#   docker run --rm --privileged -v <linux-target>:/target:ro -v "$PWD/docs/wip/bench/fuse":/c:ro -v <out>:/out \
-#     rust:1.98.0 bash /c/fuse-perf.sh
+# beside tmpfs, then again under `perf record` of the daemon. Run with the Linux **release** build at /target:
+#   docker run --rm --privileged --device /dev/fuse -v slates-linux-target:/target:ro \
+#     -v "$PWD/docs/wip/bench/fuse":/c:ro -v <out>:/out rust:1.98 bash /c/fuse-perf.sh
+#
+# Release matters: a debug binary measures the compiler, not slates — `slates profile --quick` reads 0.07 s
+# release against 0.51 s debug, and blake3 is 60× slower unoptimised (2026-10-19). The build line for the
+# `slates-linux-target` volume is in `../fsbench/run.sh`'s header, which also runs the three-way comparison
+# (overlayfs and tmpfs beside slates) that puts these numbers in context.
 apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq fuse3 linux-perf python3 >/dev/null 2>&1
 cp /target/release/slates /usr/local/bin/slates
 slates --instance fp anchor --quick --shards 2 >/out/anchor.out 2>/out/anchor.err &
