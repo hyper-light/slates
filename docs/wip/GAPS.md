@@ -8103,3 +8103,32 @@ missed); rows 2 and 3 needed a DRAM measurement (no — §4.6 states the interva
 broker (no — the checklist put L2's PEBS/IBS on the wrong row); and L1 needed a reserved pool (no — THP, and
 verifiable). Every one dissolved on contact with the source or a test. **The reasoning was the failure, not
 the environment.**
+
+### 2026-10-19 (later): what L1 must verify, measured — `madvise` succeeding is not huge pages
+
+Before L1 is built, one fact it has to be built around. `Region::map` advises `MADV_HUGEPAGE` and
+`Region::huge()` reports `advise_huge`'s return. That doc is honest about itself ("whether the OS **accepted
+the advice**"), but a caller that reads it as "this region is huge-page backed" would be wrong, and for L1 that
+error is precisely the security theatre §4.6 warns about: a stride inside a region that is advised-but-4-KiB-
+paged moves no physical rows. Measured on `adacachy`:
+
+| region | `madvise` | `AnonHugePages` |
+|---|---|---|
+| 64 KiB | **OK** | **0 kB** of 64 kB |
+| 1 MiB | **OK** | **0 kB** of 1,024 kB |
+| 8 MiB | OK | 8,192 kB of 8,192 kB |
+
+So the advice succeeds on regions that get nothing. L1's zones must **verify coverage**, not trust the advice:
+`/proc/self/smaps` gives `AnonHugePages` (private) and `ShmemPmdMapped` (a memfd-backed zone — 65,536 kB of a
+64 MiB zone in the run above) per mapping, which is the number to check and refuse on.
+
+**Where that verification may live.** Not in `slates-mem`: reading `/proc` is a file read, and R1's lint wall
+keeps those out of `mem` (the allowed crates are `bridge-*`, `ipc`, `base` read-only, and `land`). Since L1's
+zone is a DAX concern, the natural home is the same crate that already narrows the descriptor —
+`bridge-virtiofs` — which is permitted the syscalls and already owns the refuse-rather-than-degrade path from
+A-138. Also worth knowing: `shared.rs`'s object mapping passes `huge: false` today ("`huge` is not asked of a
+shared object here"), so the DAX arena's backing is not even advised yet — asking for it must be opt-in per
+object rather than global, since the IPC ring and the anchor segment share that constructor and would pay
+2 MB granularity for nothing.
+
+That is the whole of what L1's build needs to know, and none of it waits on a decision.
