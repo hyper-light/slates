@@ -6814,6 +6814,12 @@ ends, so a run that is killed leaves no evidence — redirect instead; and stopp
 and leaves `miri` running (it does not match `pgrep miri`; the process name is the rustup toolchain path), which
 cost a full core for 84 minutes before it was noticed.
 
+**Superseded on 2026-10-19 on the point that matters.** "What Miri cannot practically add is coverage of the
+*interleavings*" was true of the schedule as written, not of the property. Shrinking its length and case count
+under `cfg!(miri)` — the pattern `slates-mem`'s loops now use — makes the chaos property pass interpreted in
+**9.56 s**, so the leg no longer skips it and the suite's Miri coverage is 52 tests rather than 51. The full
+59-step, 150-case schedule still runs on every native pass.
+
 ### 2026-10-18: L2's moving target is half-built — the device-side remap its own doc promises does not exist
 
 `Volume::dax_migrate` is complete, measured (242 ns/migration) and correct on the VFS side: the content moves to
@@ -6947,7 +6953,7 @@ demand now that the case count reads from the environment:
 ```
 PROPTEST_CASES=20000 cargo test --release -p slates-vfs --test dax a_random_interleaving      # 12.60 s, green
 PROPTEST_CASES=2000  cargo test --release -p slates-bridge-virtiofs --test device a_random_window_schedule   # 0.24 s, green
-MIRIFLAGS=-Zmiri-ignore-leaks cargo +nightly miri test -p slates-vfs --test dax -- --skip a_random_interleaving
+MIRIFLAGS=-Zmiri-ignore-leaks cargo +nightly miri test -p slates-vfs --test dax    # nothing skipped since 2026-10-19
 ```
 
 The first two are 133× and 25× their committed defaults and cover this session's pin dedup and snapshot-recall
@@ -6961,9 +6967,14 @@ an option. Measured rather than argued — `PROPTEST_CASES=1 MIRIFLAGS=-Zmiri-ig
 -p slates-vfs --test dax a_random_interleaving` was given 1,800 s and **exited 124 with no `test result:` line**,
 having burned 12.5 minutes of CPU while sharing the machine with one other Miri job (2026-10-19). The schedule is
 up to 59 steps over three files against a 4 MiB store, and the suite is `unseeded`, so there is no seed file
-replaying extra work — one case really is one schedule. `--skip` is therefore what this leg does, and the honest
-statement is that **the chaos property has no Miri coverage at all**; a single case on a quiet machine, timed
-rather than assumed, is what would establish whether even that is reachable.
+replaying extra work — one case really is one schedule.
+
+**And then fixed, rather than left skipped.** Shrinking beats omitting, which is this ledger's own rule, so the
+schedule's length and its case count now shrink under `cfg!(miri)` exactly as `slates-mem`'s loops do: up to six
+steps and four cases interpreted, the full 59 and 150 natively. The chaos property went from **no Miri coverage
+at all to passing in 9.56 s**, so the leg no longer skips it by name. A handful of steps still interleaves the
+operations that fight each other — a write or truncate that must revoke, a map held across it, an explicit
+unmap, the sealing sweep — which is the shape an interpreter is there to read.
 
 **Adjacent, and not part of this gate:** A-135's local zero-copy read is governed by its own confinement rule
 (`confined_for_a_peer`) and is separately owed a **multi-chunk map** — a file larger than one content chunk falls
@@ -7616,14 +7627,26 @@ Linux x86_64.
    The name was still **`"absent"` after 10.27 s**. The invalidation does not arrive late; **it does not
    arrive**.
 
-**The split that is left.** The same code on the Docker VM's kernel **6.12.76-linuxkit** passes both:
-`coherence_mount` ok (0.30 s), `owner_turn` ok (1.60 s), no mount left behind. And `coherence_mount` was
-*originally proven* on "a real Linux 6.12 mount" (`c3c0024b`, which fixed invalidations that named the volume
-root). So 6.12 green, 6.19 red. **The one confound is that the 6.12 run was aarch64 and the 6.19 run x86_64** —
-though both report page size 4,096, so the usual page-size mechanism is not available as an explanation, and
-nothing about entry invalidation is instruction-set shaped. The clean closer is one run of these two tests in a
-`--platform linux/amd64` container on that same 6.12 VM kernel, which separates kernel from architecture
-exactly; it is a full emulated build and was not taken here.
+**Closed, both the confound and the cause — same day.** The same code on kernel **6.12.76-linuxkit** passes
+both. That first comparison was aarch64, leaving architecture confounded with the kernel, so the closer named
+here was taken: Docker's VM kernel is shared, so a `--platform linux/amd64` container runs **x86_64 userspace
+on 6.12**, and Rosetta makes it near-native. Both tests pass there — `coherence_mount` 0.43 s, `owner_turn`
+1.96 s. **Architecture is eliminated: it is the kernel version.**
+
+Then the cause, by instrumenting the notification write rather than reading code. The notification code rides
+the `error` word of `fuse_out_header`, and the identical build answers differently on the two kernels:
+
+| kernel | arch | `INVAL_ENTRY` (code 3, 34 bytes) | test |
+|---|---|---|---|
+| 6.12.76 | x86_64 | `wrote 34 bytes` | pass |
+| 6.19.10 | x86_64 | **`ENOENT`, swallowed** | fail |
+
+`NotifyThread` treats `ENOENT` as benign — "it has nothing stale, or revalidates on next use" — which was true
+on 6.12 and is false on 6.19: the kernel refuses the invalidation **and keeps answering from the negative
+dentry**. The 10.27 s poll above already showed it is not lateness. Full write-up and the posture options in
+`docs/bugs/2026-10-19-linux-6-19-refuses-the-entry-invalidation-slates-swallows.md`. The silent swallow is a
+defect under CLAUDE.md #9 whatever else is decided; what replaces the posture is a §4.6 decision with a
+measured cost, so it is **Ada's**, not taken here.
 
 **Why it matters.** §4.6's `Invalidated` posture is the promise that a change made through one attachment is
 pushed to the kernel's caches; `coherence_mount` is the proof of it, and on 6.19 a name another attachment

@@ -2127,7 +2127,7 @@ fn chaos_invariants(store: &Store, volume: &Volume, held: &[Mapping]) -> Result<
 }
 
 proptest! {
-  #![proptest_config(slates_test_seeds::unseeded(ProptestConfig { cases: slates_test_seeds::cases(150), .. ProptestConfig::default() }))]
+  #![proptest_config(slates_test_seeds::unseeded(ProptestConfig { cases: slates_test_seeds::cases(if cfg!(miri) { 4 } else { 150 }), .. ProptestConfig::default() }))]
 
   /// §4.6 / AC-4.12 under chaos. Every other DAX test here is one hand-built attack; this is the same gate under
   /// random interleavings of the operations that fight each other — writes and truncates that must revoke a
@@ -2151,7 +2151,16 @@ proptest! {
   /// cases).
   #[test]
   fn a_random_interleaving_never_shows_a_live_mapping_stale_or_foreign_bytes(
-    schedule in prop::collection::vec((any::<u8>(), any::<u8>(), any::<u16>()), 1..60)
+    // Interpreted, this schedule had no coverage at all: one generated case of up to 59 steps did not finish
+    // inside 1,800 s under Miri, so the Miri leg skipped it by name and the property went unchecked for
+    // undefined behaviour. Shorter schedules, fewer of them, are the honest alternative to skipping -- a
+    // handful of steps still interleaves the operations that fight each other (a write or truncate that must
+    // revoke, a map held across it, an explicit unmap, the sealing sweep), which is the shape Miri reads.
+    // Native runs keep the full 150 cases of up to 59 steps.
+    schedule in prop::collection::vec(
+      (any::<u8>(), any::<u8>(), any::<u16>()),
+      1..if cfg!(miri) { 7 } else { 60 },
+    )
   ) {
     let mut store = store();
     let mut volume = volume(&mut store, 1 << 22);
