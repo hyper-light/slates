@@ -7886,3 +7886,36 @@ Verified: workspace clippy clean on x86_64 Linux 6.19 and on macOS; `xtask check
 unsafe, version, capabilities); the virtio-fs suites, `vfs dax`, `mem`, `fuse_mount` and `cli` all green on
 Linux. **Owed: the live crosvm leg** — every primitive its `SHMEM_MAP` uses is proven on a udmabuf, but the
 real front end has not been run against it.
+
+### 2026-10-19: DAX gate row 3's decision dissolves — there is no tear to accept, and rows 2 and 3 share one open anchor
+
+Row 3 has carried a decision since it was written: `dax_migrate`'s doc says "whoever wires L2's trigger owes
+the backend-initiated remap (**or a decision** to use the revoke-and-refault path instead and accept the
+tear)". The remap it wanted was "an atomic `MAP_FIXED`/`mremap` over the same guest address".
+
+**That decision is not needed: `MAP_FIXED` over a live mapping is already atomic, so a second `SHMEM_MAP` at
+the same guest offset *is* the remap.** Measured on Fedora 6.19 with two udmabuf windows over one arena — the
+old block filled `'O'`, the block it moves to filled `'M'`:
+
+```
+guest window before the shift: 'O'
+guest window after  the shift: 'M'   (no unmap in between)
+```
+
+No hole, no tear, and **no new protocol message** — the existing `SHMEM_MAP` does it. Nothing in slates blocks
+it either: `MessagePlacer::check_range` validates alignment and bounds only, not whether the offset is already
+mapped, so a remap needs no relaxation of the placer's rules. The daemon→device request shape already exists
+too (`request_revoke_inode` and its writable sibling, drained by the serve loop), so a `request_remap` would
+follow a path the crate already has.
+
+**What actually remains in row 3 is the trigger, and it is the same open question as row 2.** Building the
+remap now would leave `dax_migrate` with a device half and still no production caller — which is precisely the
+"primitive with no caller" that CLAUDE.md #7 forbids and that row 5's `dax_revoke_block` was *removed* for.
+What decides when to shift is L2's adaptive trigger; what decides when to scrub is row 2's cadence; **both are
+the same anchor** — at what rate the Rowhammer defence runs — and D-11 says it must be derived from the
+machine or the data rather than chosen.
+
+Deriving it means measuring bit-flip susceptibility on real DRAM, which is not a measurement to take on Ada's
+hosts uninvited, and the cost it trades against is real: row 2's note records that guarding every read-only
+mapping doubles mapped-content RAM. So rows 2 and 3 are **one** question now rather than three, and the
+question is an anchor, not an architecture.
