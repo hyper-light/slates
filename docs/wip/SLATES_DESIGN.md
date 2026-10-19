@@ -2873,10 +2873,22 @@ same-namespace host process is the first delivered case.
 >    `DaxPlacer::Message` a `SHMEM_MAP` parks the *guest's* chain and is finished by `complete_parked_map`, which
 >    exists to answer a guest request, so a daemon-initiated map needs a second, chain-less completion arm — new
 >    asynchronous state in the device's most delicate path, bought for one guest fault per shift.
->    What is owed is now only the **trigger**: `Volume::dax_migrate` still has no production caller. The periodic
->    sweep at the 16–32 ms cadence is the one the measurement already affords (242 ns per 4 KiB block, so
->    unconditional migration costs <0.01% throughput) and needs no new signal; the adaptive trigger from a
->    privileged broker's PEBS/IBS is the optimization on top of it, not a precondition.
+>    **The trigger is built** (`daemon::dax_shift_loop`, 2026-10-19): once every hammer window — 16 ms, the lowest
+>    of §4.6's stated 16–32 ms range — the shard shifts every live writable DAX window onto a different physical
+>    row of its tenant's sandbox, unconditionally, in cooperative slices of `dax_shift_slice_bytes` (half the
+>    shard's live step quantum at the machine's measured memcpy rate) with a yield between them. Unconditional is
+>    what the measurement affords: 242 ns per 4 KiB block, so a window moved every 16 ms costs under 0.01% of its
+>    own throughput and nothing has to *detect* a hammer first. The round takes one snapshot of each volume's
+>    writable windows and works through that — a shift mints a new mapping, so a list re-read mid-round would
+>    offer the same content again and the sweep would chase its own tail.
+>    **It costs an idle laptop nothing.** The hammer cadence is kept only while the shard holds a volume opted
+>    into writable DAX (L0); otherwise the loop waits the liveness budget it already waits for its other periodic
+>    work, so a daemon with no writable DAX adds no wakeup. The bound that buys: a volume opting in between two
+>    long waits is first shifted up to one liveness budget later. Shifting is defence in depth over L1's
+>    containment and the host's ECC/TRR floor, so that is bounded exposure rather than a hole; the fix is for the
+>    opt-in to wake the loop rather than for the loop to poll, and it is recorded in the gap ledger.
+>    The adaptive trigger from a privileged broker's PEBS/IBS — shifting only blocks showing a hammer signature,
+>    so honest agents pay nothing — is the optimization on top of this, not its precondition.
 
 > **Status (DAX device-seam wiring, 2026-10-15).** The device side of the gate is built against the in-process
 > virtio-fs seam and proven by a simulated guest (no KVM): `crates/bridge-virtiofs` serves a real

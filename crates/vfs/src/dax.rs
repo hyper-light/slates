@@ -69,6 +69,26 @@ pub fn stripe_target(slots: NonZeroUsize, current: usize, rng: &mut Xorshift) ->
   }
 }
 
+/// What one slice of §4.6 L2's periodic shift did ([`Volume::dax_shift_slice`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ShiftSlice {
+  /// Windows moved onto a different physical row of the volume's sandbox — the non-vacuity counter: a sweep
+  /// that ran but shifted nothing reads as zero here, so a silently dead trigger cannot look like a working one.
+  pub shifted: u64,
+  /// Windows that could not be moved because they were no longer live when their turn came (the guest unmapped,
+  /// a write revoked, a snapshot recalled). Expected and counted, never retried in this round.
+  pub refused: u64,
+  /// Content bytes copied, which is what the slice's budget is spent in.
+  pub bytes: u64,
+  /// Where the next slice of this round resumes in the caller's snapshot; equal to its length when the round is
+  /// done.
+  pub next: usize,
+  /// The host backs no §4.6 L1 sandbox, so no window of this volume can be shifted at all and the round stopped
+  /// at the first refusal rather than learning it once per window. The caller reads this as "not here", not as a
+  /// failure.
+  pub unsupported: bool,
+}
+
 /// A daemon-minted opaque mapping identity (§4.6 step 2, the tamper-proof registry). The inner value is private to
 /// this module, so a [`Mapping`] — and thus its id — can be formed only by the mint path here
 /// ([`DaxRegistry::mint_id`]), never from caller input or by tampering: a mapping the daemon never minted cannot be
@@ -1015,6 +1035,60 @@ impl Volume {
     store.dax.enqueue_pending_revoke(old.inode, true);
     store.dax.count_migration();
     Ok(mapping)
+  }
+
+  /// One cooperative slice of §4.6 L2's **periodic shift** (the moving target's trigger): the windows in `due`,
+  /// from index `from`, shifted onto different physical rows of this volume's L1 sandbox until `budget_bytes`
+  /// have been copied.
+  ///
+  /// `due` is a snapshot the caller takes once per round ([`DaxRegistry::writable_of_prefix`]) and holds across
+  /// slices. Snapshotting is what makes the round terminate and stay fair: a shift mints a *new* mapping, so a
+  /// list re-read mid-round would offer the same content again and the sweep would chase its own tail, while a
+  /// fixed list visits every window exactly once. An entry that is no longer live when its turn comes — the guest
+  /// unmapped it, a write revoked it, a snapshot recalled it — is counted refused and skipped, never retried in
+  /// this round.
+  ///
+  /// Nothing here decides *whether* to shift: that is the caller's cadence, derived from the hammer window
+  /// (§4.6: 16–32 ms, from the lowest threshold, not the classic 64 ms). This decides only how much of a round
+  /// fits in one slice, so a shard with many mapped windows keeps serving between them (§4.3).
+  pub fn dax_shift_slice(
+    &mut self,
+    store: &mut Store,
+    due: &[Mapping],
+    from: usize,
+    budget_bytes: u64,
+  ) -> ShiftSlice {
+    let mut slice = ShiftSlice {
+      next: from,
+      ..ShiftSlice::default()
+    };
+    let Some(window) = due.get(from..) else {
+      slice.next = due.len();
+      return slice;
+    };
+    for mapping in window {
+      match self.dax_migrate(store, mapping) {
+        Ok(moved) => {
+          slice.shifted = slice.shifted.saturating_add(1);
+          slice.bytes = slice
+            .bytes
+            .saturating_add(u64::try_from(moved.file_len).unwrap_or(u64::MAX));
+        }
+        Err(VfsError::NoPhysicalIsolation) => {
+          // This host backs no sandbox, so no window of it can be shifted: the rest of the round would refuse
+          // the same way. Stop the round rather than walk every window to learn it again.
+          slice.unsupported = true;
+          slice.next = due.len();
+          return slice;
+        }
+        Err(_) => slice.refused = slice.refused.saturating_add(1),
+      }
+      slice.next = slice.next.saturating_add(1);
+      if slice.bytes >= budget_bytes {
+        break;
+      }
+    }
+    slice
   }
 
   /// Whether `mapping` still names its file's current content block and length. The content paths revoke a mapping

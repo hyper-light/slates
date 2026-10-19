@@ -1539,6 +1539,95 @@ fn a_sandbox_is_reserved_in_the_shared_object_a_daemon_serves_dax_from() {
   }
 }
 
+/// One whole round of the periodic shift, driven in slices as the daemon's loop drives it: the windows shifted
+/// and the slices it took, or `None` with the skip printed where this host backs no sandbox. The budget is one
+/// byte, so a slice stops after the first window it copies and the round's slicing is what is under test.
+fn run_one_shift_round(
+  store: &mut Store,
+  volume: &mut Volume,
+  due: &[Mapping],
+) -> Option<(u64, usize)> {
+  let mut at = 0usize;
+  let mut slices = 0usize;
+  let mut shifted = 0u64;
+  while at < due.len() {
+    let slice = volume.dax_shift_slice(store, due, at, 1);
+    if slice.unsupported {
+      println!(
+        "SKIP one_round_of_the_periodic_shift_visits_every_window_once_and_slices: this host backed no \
+         transparent huge page, so §4.6's L1 sandbox cannot be reserved"
+      );
+      return None;
+    }
+    assert!(
+      slice.next > at,
+      "a slice always advances, so a round terminates"
+    );
+    at = slice.next;
+    shifted = shifted.saturating_add(slice.shifted);
+    slices = slices.saturating_add(1);
+  }
+  Some((shifted, slices))
+}
+
+/// §4.6 **L2's periodic shift, one round** ([`Volume::dax_shift_slice`]) — the unit the daemon's cadence drives.
+/// Do: give a volume three writable DAX windows and run one round in slices with a budget far smaller than the
+/// round, as a shard does to stay responsive. Expect: every window is visited exactly once (the snapshot is what
+/// makes that true — a re-read list would offer each shifted window again and the sweep would chase its own
+/// tail), every slice advances, each landing is inside the tenant's sandbox, and the round shifted all three
+/// (non-vacuity: a sweep that ran but moved nothing reads as zero). Where the host backs no sandbox the round
+/// says so at once instead of refusing window by window, which is what the daemon's loop reads as "not here".
+#[test]
+fn one_round_of_the_periodic_shift_visits_every_window_once_and_slices() {
+  let mut store = store_sandboxed();
+  let mut volume = volume(&mut store, 1 << 22);
+  // Derived: three windows is the fewest that distinguishes "sliced" from "one slice did everything" while
+  // keeping the round's cost to three block copies.
+  const WINDOWS: usize = 3;
+  let mut mapped = Vec::new();
+  for which in 0..WINDOWS {
+    let name = format!("f{which}");
+    let f = file_of(&mut store, &mut volume, &name, 0x41, DAX_PAGE);
+    mapped.push(volume.dax_map_write(&mut store, f).unwrap());
+  }
+  let prefix = volume.prefix();
+  let due = store.dax.writable_of_prefix(prefix);
+  assert_eq!(due.len(), WINDOWS, "three live writable windows to shift");
+
+  // A budget of one byte, so each slice stops after the first window it copies: the round must take three.
+  let Some((shifted, slices)) = run_one_shift_round(&mut store, &mut volume, &due) else {
+    return;
+  };
+  assert_eq!(
+    shifted, WINDOWS as u64,
+    "every window was shifted exactly once"
+  );
+  assert_eq!(
+    slices, WINDOWS,
+    "the budget sliced the round, one window each"
+  );
+  assert_eq!(
+    store.dax.migrated(),
+    WINDOWS as u64,
+    "the registry counted the same shifts (non-vacuity)"
+  );
+
+  // Every window now sits on a row of this tenant's own sandbox, and none on the row it left.
+  let after = store.dax.writable_of_prefix(prefix);
+  assert_eq!(after.len(), WINDOWS, "each window was replaced, not lost");
+  let zone = store.dax_zones.of_volume(prefix).unwrap();
+  for moved in &after {
+    assert!(
+      zone.slot_of(moved.block).is_some(),
+      "a shifted window sits in the tenant's sandbox"
+    );
+    assert!(
+      !mapped.iter().any(|before| before.block == moved.block),
+      "a shifted window is not on the row it left"
+    );
+  }
+}
+
 // ───────────────────────────────────────────────────────────── B2 the self-healing safety net (checksum + heal)
 
 /// A synthetic Rowhammer bit flip: invert a byte of a block directly in the arena, behind the daemon's back — exactly

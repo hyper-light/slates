@@ -3341,6 +3341,8 @@ fn init_shard(
   let _ = futures::detach(serve);
   let reap = futures::spawn(reap_loop()).map_err(ServerError::Runtime)?;
   let _ = futures::detach(reap);
+  let shift = futures::spawn(dax_shift_loop()).map_err(ServerError::Runtime)?;
+  let _ = futures::detach(shift);
   Ok(())
 }
 
@@ -3489,6 +3491,126 @@ async fn seal_idle_content() {
     return;
   }
   purge_if_idle().await;
+}
+
+/// Counter: writable DAX windows this shard shifted onto a different physical row (§4.6 L2's moving target).
+/// The trigger's non-vacuity counter: a sweep that runs but never moves a window reads zero here, so a silently
+/// dead defence cannot look like a working one.
+const DAX_WINDOWS_SHIFTED: &str = "dax.windows_shifted";
+/// Counter: windows a shift round found no longer live when their turn came (the guest unmapped, a write revoked,
+/// a snapshot recalled). Expected under churn, never an error — but a count that dwarfs the shifts says the
+/// cadence is racing the workload.
+const DAX_SHIFTS_REFUSED: &str = "dax.shifts_refused";
+/// Counter: shift rounds that stopped at once because this host backs no §4.6 L1 sandbox, so no window of the
+/// volume could be moved onto a physically different row. Not a failure; the defence is simply unavailable here,
+/// and the count is how an operator sees that rather than assuming the shift is running.
+const DAX_SHIFTS_UNSUPPORTED: &str = "dax.shifts_unsupported";
+
+/// §4.6 **L2's trigger**: this shard's writable DAX windows shifted onto different physical rows of their
+/// tenants' L1 sandboxes, once every hammer window.
+///
+/// Unconditional, which §4.6's own measurement affords: 242 ns per 4 KiB block (`dax_bench`), so a window moved
+/// every 16 ms costs under 0.01% of its own throughput, and nothing has to *detect* a hammer first. The adaptive
+/// form — shifting only blocks showing a hammer signature — needs PEBS/IBS from a privileged broker, which R10
+/// refuses to require; it is the optimization on top of this, not its precondition. Honest agents pay the 242 ns
+/// and keep native DAX speed.
+///
+/// A shard with no writable DAX window — the common case, since L0 keeps the mode off by default — wakes, finds
+/// an empty snapshot and sleeps again.
+async fn dax_shift_loop() {
+  let cadence = derived!(
+    crate::config::DAX_SHIFT_CADENCE_NS,
+    "the lowest hammer threshold of §4.6's stated 16–32 ms window, which a moving target must keep up with",
+    ["DAX_SHIFT_CADENCE_NS"]
+  )
+  .get();
+  // A shard with no volume opted into writable DAX has nothing a guest can hammer (L0) and so nothing to shift,
+  // and waking it sixty times a second to learn that again is a cost paid by every laptop for a mode almost none
+  // of them use. So the hammer cadence is kept while the shard holds an opted-in volume, and the reaper's
+  // liveness budget otherwise — the same wait the shard already makes for its other periodic work, so an idle
+  // daemon adds no wakeup at all.
+  //
+  // The bound this accepts: a volume that opts in between two long waits is first shifted up to one liveness
+  // budget later, and only then does it get its L1 sandbox. Shifting is a *defence in depth* over L1's
+  // containment and the host's own ECC/TRR floor, so the gap is bounded exposure rather than a hole — but it is
+  // a gap, and the fix is for the opt-in to wake this loop rather than for the loop to poll. Recorded in GAPS.
+  let idle_cadence = derived!(
+    LIVENESS_BUDGET_NS,
+    "the liveness budget: what the shard already waits for its other periodic work, so a shard with nothing to \
+     shift adds no wakeup of its own",
+    ["LIVENESS_BUDGET_NS"]
+  )
+  .get();
+  loop {
+    let armed = state::with_state(|s| {
+      s.volumes
+        .iter_mut_all()
+        .any(|(_, slot)| slot.volume.writable_dax_enabled())
+    })
+    .unwrap_or(false);
+    pace(if armed { cadence } else { idle_cadence }).await;
+    if armed {
+      shift_mapped_windows().await;
+    }
+  }
+}
+
+/// One round of the periodic shift, in cooperative slices of `dax_shift_slice_bytes` with a yield between them,
+/// so a shard with many mapped windows keeps serving while they move (§4.3).
+///
+/// The round takes one snapshot of each volume's live writable windows and works through *that*: a shift mints a
+/// new mapping, so a list re-read mid-round would offer the same content again and the sweep would chase its own
+/// tail ([`slates_vfs::volume::Volume::dax_shift_slice`]).
+async fn shift_mapped_windows() {
+  let Some(volumes) = state::with_state(|s| {
+    s.volumes
+      .iter_mut_all()
+      .map(|(handle, _)| handle)
+      .collect::<Vec<_>>()
+  }) else {
+    return;
+  };
+  for handle in volumes {
+    let Some(due) = state::with_state(|s| {
+      s.volumes
+        .get(handle)
+        .ok()
+        .map(|slot| s.store.dax.writable_of_prefix(slot.volume.prefix()))
+    }) else {
+      return;
+    };
+    let Some(due) = due else { continue };
+    if due.is_empty() {
+      continue;
+    }
+    let mut at = 0usize;
+    while at < due.len() {
+      let turn = state::with_state(|s| {
+        let budget = s.config.dax_shift_slice_bytes().max(1);
+        let Ok(slot) = s.volumes.get_mut(handle) else {
+          return None;
+        };
+        let slice = slot.volume.dax_shift_slice(&mut s.store, &due, at, budget);
+        s.count(DAX_WINDOWS_SHIFTED, slice.shifted);
+        s.count(DAX_SHIFTS_REFUSED, slice.refused);
+        s.count(DAX_SHIFTS_UNSUPPORTED, u64::from(slice.unsupported));
+        Some(slice)
+      });
+      let Some(Some(slice)) = turn else {
+        break;
+      };
+      if slice.unsupported {
+        break;
+      }
+      if slice.next <= at {
+        // A slice that did not advance would spin the round; the slice contract says it always does, so this is
+        // a tripwire rather than an expected branch.
+        break;
+      }
+      at = slice.next;
+      futures::yield_now().await;
+    }
+  }
 }
 
 /// The idle shard's emptied FUSE write log, its pages given back (`crate::write_log::WriteLog::purge`).

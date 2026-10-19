@@ -8310,3 +8310,33 @@ own function (`one_writable_window_is_mapped`, `the_drain_tears_the_stale_window
 `the_refault_reaches_the_moved_row`) rather than to drop assertions.
 
 **Owed:** the trigger. Nothing else in the Rowhammer layers is.
+
+### 2026-10-19: §4.6 L2's trigger built — the Rowhammer layers now have no owed piece
+
+`daemon::dax_shift_loop` shifts every live writable DAX window on the shard once every hammer window, drawing
+each destination from the tenant's L1 sandbox. With it, L0, L1, L2 and B2 are all built *and driven*; the
+checklist's four DAX rows are closed.
+
+Three things worth keeping:
+
+1. **The round must snapshot.** A shift mints a new mapping, so a sweep that re-read the registry mid-round would
+   be offered the same content again under a new id and would chase its own tail. `Volume::dax_shift_slice` takes
+   the caller's fixed snapshot and an index, which makes the round both terminating and fair, and it is why the
+   slice returns `next` rather than a "left" count.
+2. **The cadence had to be paced by the opt-in, not by the clock.** 16 ms is 62 wakeups a second per shard; on an
+   eight-shard laptop with no DAX at all that is 500 wakeups a second bought for nothing, against a 100 ms
+   heartbeat that is there by design. The loop now keeps the hammer cadence only while a volume on the shard has
+   opted into writable DAX (L0), and otherwise waits the liveness budget it already waits for its other periodic
+   work. `an_idle_daemon_parks_once_its_clients_windows_have_passed` still passes.
+   **The exposure that buys, stated plainly:** a volume opting in between two long waits is first shifted up to
+   one liveness budget later, and only then gets its sandbox. The shift is defence in depth over L1's containment
+   and the host's ECC/TRR floor, so this is a bounded gap, not a hole — but the right fix is for the opt-in to
+   wake the loop rather than for the loop to poll. **Owed.**
+3. **The slice is sized by the copy rate, not the hash rate.** A shift copies a content block, so
+   `dax_shift_slice_bytes` derives from the profile's measured memcpy throughput at its largest copy size, beside
+   `archive_slice_bytes`'s BLAKE3 derivation. Using the hash rate would have been the wrong question asked of the
+   right-looking number; `DaemonConfig` now stores `memcpy_bytes_per_second` for it.
+
+Proven by `one_round_of_the_periodic_shift_visits_every_window_once_and_slices` (three windows, a one-byte
+budget, so the round must take three slices; every window visited once, each landing in the tenant's sandbox and
+none on the row it left) — which runs where a sandbox can be backed and skips loudly elsewhere.
