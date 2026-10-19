@@ -6952,8 +6952,18 @@ MIRIFLAGS=-Zmiri-ignore-leaks cargo +nightly miri test -p slates-vfs --test dax 
 
 The first two are 133× and 25× their committed defaults and cover this session's pin dedup and snapshot-recall
 exclusion. The third is the Miri leg (52 passed, 396 s, 2026-10-18); it skips the chaos schedule because an
-interpreter cannot finish one generated case of it, and with the count now a variable the better form is
-`PROPTEST_CASES=16` rather than `--skip`, which covers the property instead of omitting it.
+interpreter cannot finish one generated case of it.
+
+**Correcting this entry's own advice, same day.** It first said that now the case count is a variable, the better
+form is `PROPTEST_CASES=16` rather than `--skip`, "which covers the property instead of omitting it". That is
+**wrong, and it contradicted the sentence before it**: if an interpreter cannot finish *one* case, sixteen is not
+an option. Measured rather than argued — `PROPTEST_CASES=1 MIRIFLAGS=-Zmiri-ignore-leaks cargo +nightly miri test
+-p slates-vfs --test dax a_random_interleaving` was given 1,800 s and **exited 124 with no `test result:` line**,
+having burned 12.5 minutes of CPU while sharing the machine with one other Miri job (2026-10-19). The schedule is
+up to 59 steps over three files against a 4 MiB store, and the suite is `unseeded`, so there is no seed file
+replaying extra work — one case really is one schedule. `--skip` is therefore what this leg does, and the honest
+statement is that **the chaos property has no Miri coverage at all**; a single case on a quiet machine, timed
+rather than assumed, is what would establish whether even that is reachable.
 
 **Adjacent, and not part of this gate:** A-135's local zero-copy read is governed by its own confinement rule
 (`confined_for_a_peer`) and is separately owed a **multi-chunk map** — a file larger than one content chunk falls
@@ -7536,12 +7546,21 @@ so the guard sits two orders of magnitude above the work. On expiry it prints a 
 libtest reports — the same answer and the same mechanism as `crates/server/tests/fuse_mount.rs`, which took it
 for the notify deadlock.
 
-**Verified only as far as it can be here.** `cargo clippy -p slates-cli --all-targets -- -D warnings` on Linux
-aarch64, exit 0 (Docker, `rust:1.98.1`, 2026-10-19). The behaviour is **not** run: the test is Linux-and-FUSE
-only, the box was at load 232–250 under another project's CI, and the one other Linux host here is a Docker VM
-two other sessions are using for KIND and mantle — where a SIGKILL-under-FUSE test is precisely the wedge-prone
-workload two earlier incidents in this ledger were caused by. **Owed: one run of this test on a quiet Linux
-host**, both to confirm the guard stays silent on a healthy run and to see whether the hang reproduces at HEAD.
+**Verified, including the behaviour — the owed run was taken the same day.** `cargo clippy -p slates-cli
+--all-targets -- -D warnings` on Linux aarch64, exit 0 (Docker, `rust:1.98.1`). The behavioural run was first
+recorded as owed, because the bench box was at load 232–250 under another project's CI and the only other Linux
+here is a Docker VM two sessions are using. It is no longer owed: a **third** x86_64 Linux host was idle
+(`fedora.attlocal.net`, kernel 6.19.10, load1 ~3), and it satisfies both of the test's gates — `/dev/fuse` is
+world-accessible, so the mount needs no privilege, and the kernel is far past the 6.9 that `FUSE_NOTIFY_RESEND`
+needs. With `SLATES_TEST_CLI=1`, three consecutive runs: **3/3 pass, 1.05 s, 1.00 s and 0.98 s**, each catching
+the resend on its first cycle (`1 cycles, 1 resent, 0 reported lost writes`), and no mount or process left behind.
+
+Two things follow. **The guard cannot fire spuriously**: a healthy run is ~1 s against its 330 s bound, 330× of
+headroom, so the derivation that the bound exceeds every deadline the test itself enforces is borne out by the
+clock as well as by the arithmetic. And **the hang does not reproduce at HEAD** — which supports the reading
+above that the parked binary was its orphaned harness and not a live defect, and turns that caution from a hedge
+into a result. The failure mode the guard exists for is still real; what is now known is that it is not firing
+today.
 
 **The sweep, which is the larger finding.** Eleven test files mount through a kernel and can therefore wedge a
 thread where no assertion can reach it. Exactly **one** arms a guard. Unguarded:
