@@ -8068,3 +8068,38 @@ So the corrected picture, and it is narrower than "authorize a privilege":
 
 Neither host has a pool, so an `MFD_HUGETLB`-backed arena cannot be exercised here until one is reserved —
 a one-line `sysctl` an administrator runs, which is what to ask for rather than a broker.
+
+### 2026-10-19 (later): L1 needs no reserved pool either — a THP-backed zone is verifiable, unprivileged
+
+Having found that row 4 needs no privileged broker, I then said it still needed an administrator to reserve a
+hugepage pool before anything could be exercised. **That was wrong too.** Measured on `adacachy` as uid 1000,
+no `CAP_SYS_ADMIN`, with `HugePages_Total: 0`:
+
+```
+uid=1000 zone=64 MiB, no pool, no CAP_SYS_ADMIN
+  ShmemPmdMapped:    65536 kB
+```
+
+A 64 MiB `memfd` with `madvise(MADV_HUGEPAGE)`, faulted in, came back **entirely PMD-mapped** — every byte on
+2 MB huge pages, from transparent huge pages alone. The host has THP `[always]` and shmem `[advise]`, which is
+what `MADV_HUGEPAGE` needs.
+
+**And it is checkable, which is what makes it usable for a security property.** `/proc/self/smaps` reports
+`ShmemPmdMapped` per mapping, so slates can *verify* a zone actually got its huge pages rather than assume it
+— best-effort THP becomes measured contiguity, and a zone that did not get them can be refused instead of
+silently becoming the "security theatre" §4.6 warns about. That is the same shape as A-138's refusal when
+`/dev/udmabuf` is missing.
+
+So L1's remaining content is **implementation, not permission**: a per-tenant zone over a THP-verified memfd,
+guard rows between tenants, the verification-and-refuse path, and placement wired to `stripe_target`. It
+touches the arena's backing, so it is A-64-adjacent work and wants its own pass — but nothing about it waits
+on Ada now.
+
+**Tally of the day's wrong blockers, because the pattern is the lesson.** Seven times I reported something
+blocked and was wrong: A-64 had to be overturned for row 1 (no — udmabuf); Windows needed a toolchain install
+(no — a container); `bridge-winfsp`/`sdk-node` needed real Windows (no — their own build scripts say
+otherwise); the crosvm leg needed a kernel build (no — the host's running kernel, which a too-shallow `find`
+missed); rows 2 and 3 needed a DRAM measurement (no — §4.6 states the interval); row 4 needed a privileged
+broker (no — the checklist put L2's PEBS/IBS on the wrong row); and L1 needed a reserved pool (no — THP, and
+verifiable). Every one dissolved on contact with the source or a test. **The reasoning was the failure, not
+the environment.**
