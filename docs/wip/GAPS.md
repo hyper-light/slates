@@ -7295,6 +7295,12 @@ failures.** This run covers everything the day added — the `max_pages` negotia
 follows it, the `PROPTEST_CASES` fix across eighteen suites, the three product defects and the twelve profile
 fixtures.
 
+Linux x86_64 and aarch64 were verified at HEAD too, including the one change that had landed *after* the
+earlier Linux pass: `involuntary_switches` returning `Option<u64>` touches `crates/ipc/tests/rendezvous.rs`,
+which the Windows and Linux lanes both run. Its commit claimed "the macOS and Linux compiles validate them"
+when Linux had not yet seen it (the run was 23:17, the commit 23:43); it has now — rendezvous 7/7 and
+slates-machine 56/56 on Linux at HEAD. The claim is true as written now and was premature when written.
+
 The trajectory across the day's five full runs: **63 distinct failures → 2 → 1 → 0**. Of the 63, sixty were one
 `OnceLock`'d fixture; of the 2, both were artifacts of 168 orphaned spinners I had leaked onto the host; the 1
 was the twelfth profile fixture. **Not one of the sixty-odd was a product defect** — the three product defects
