@@ -3489,8 +3489,9 @@ fn front_send_ack(socket: &std::os::fd::OwnedFd, request: u32, status: u64) {
 /// message-based placer parks — its reply is withheld until the front end acknowledges the map — then completes.
 /// Do: on a real volume with a single-block file of known bytes, install a message placer over a socketpair,
 /// serve FUSE_INIT, then a guest SETUPMAPPING for a 2 MiB window chunk of the 1-page file. Expect: the service
-/// pass parks (no used element published, no window recorded yet); the placer sent a SHMEM_MAP carrying the file's
-/// content descriptor (its bytes read back through it); after the front end acknowledges, complete_dax_awaiting
+/// pass parks (no used element published, no window recorded yet); the placer sent a SHMEM_MAP carrying a
+/// descriptor **confined to the window** — its bytes read back by mapping it, and one byte past the window not
+/// mappable at all, which is the escape of 2026-10-18 closed; after the front end acknowledges, complete_dax_awaiting
 /// answers the guest SETUPMAPPING OK, records the one window, and releases the chain's charge — the async map-ack
 /// park, mirroring the owner's barrier, proven in-tree.
 #[cfg(target_os = "linux")]
@@ -3500,6 +3501,23 @@ fn a_message_based_setupmapping_parks_until_the_front_end_acks_then_answers_the_
   use slates_bridge_virtiofs::device::DaxWindowEntry;
   use slates_bridge_virtiofs::vhost_user::{BackendReqChannel, MessagePlacer, backend_request};
 
+  // The message-based placer confines the descriptor it sends with a `udmabuf` (§4.6), so this proof needs
+  // `/dev/udmabuf`. Where the kernel or the container has none, the placer refuses the map by design — a
+  // different property, and not this test's — so it skips loudly rather than failing, as the suite's other
+  // environment gates do. Docker's linuxkit VM has no such device; a Fedora host does.
+  if rustix::fs::open(
+    "/dev/udmabuf",
+    rustix::fs::OFlags::RDWR | rustix::fs::OFlags::CLOEXEC,
+    rustix::fs::Mode::empty(),
+  )
+  .is_err()
+  {
+    eprintln!(
+      "skipping the message-based SETUPMAPPING proof: /dev/udmabuf is unavailable, so the placer refuses \
+       the map rather than confining it"
+    );
+    return;
+  }
   let page = rustix::param::page_size().max(1);
   let mut store = dax_shared_store(page, "msgmap");
   let mut vol = volume(&mut store);
@@ -3555,15 +3573,51 @@ fn a_message_based_setupmapping_parks_until_the_front_end_acks_then_answers_the_
     "the window is not recorded until the front end acknowledges"
   );
 
-  // The front end receives the SHMEM_MAP and its descriptor; the block's bytes read back through it.
+  // The front end receives the SHMEM_MAP and its descriptor. Since 2026-10-19 that descriptor is a `udmabuf`
+  // confined to the window (§4.6), so it is read by mapping it rather than with `pread` — a dmabuf has no read
+  // method — and the length it maps to is the point: the arena's object is far larger, and an unconfined
+  // descriptor let the front end map all of it, a neighbour's blocks included
+  // (`docs/bugs/2026-10-18-the-message-based-dax-map-hands-the-vmm-the-whole-arena.md`).
   let got_fd = front_recv_shmem_map(&front);
-  let mut echo = [0u8; 64];
-  let read = rustix::io::pread(&got_fd, &mut echo, 0).unwrap();
-  assert_eq!(read, 64);
+  // SAFETY: a fresh mapping at an address the kernel chooses, read-only and shared, of `page` bytes of a
+  // descriptor this test owns; it is unmapped below, with the same length, before the descriptor is dropped.
+  let window = unsafe {
+    rustix::mm::mmap(
+      std::ptr::null_mut(),
+      page,
+      rustix::mm::ProtFlags::READ,
+      rustix::mm::MapFlags::SHARED,
+      &got_fd,
+      0,
+    )
+  }
+  .expect("the front end maps the window it was sent");
+  // SAFETY: `window` is the mapping just made, of `page` bytes, and nothing else aliases it for this borrow.
+  let bytes = unsafe { std::slice::from_raw_parts(window.cast::<u8>(), page) };
   assert_eq!(
-    echo, [0x5Au8; 64],
+    &bytes[..64],
+    &[0x5Au8; 64],
     "the SHMEM_MAP carried the file's content block"
   );
+  // The confinement itself: one byte past the authorized window is not reachable through what was sent.
+  // SAFETY: the same call, expected to be refused; the result is never dereferenced, and is unmapped if the
+  // kernel surprises us by allowing it.
+  let past = unsafe {
+    rustix::mm::mmap(
+      std::ptr::null_mut(),
+      page.saturating_mul(2),
+      rustix::mm::ProtFlags::READ,
+      rustix::mm::MapFlags::SHARED,
+      &got_fd,
+      0,
+    )
+  };
+  assert!(
+    past.is_err(),
+    "the descriptor the front end holds covers the window and nothing past it"
+  );
+  // SAFETY: unmapping exactly the mapping made above, with its own address and length.
+  unsafe { rustix::mm::munmap(window, page) }.expect("the window unmaps");
   front_send_ack(&front, backend_request::SHMEM_MAP, 0);
 
   // The device drains the ack, answers the guest, records the window, and releases the chain's charge.

@@ -28,6 +28,12 @@ rustix = { workspace = true }
 # with `MAP_FIXED`; holding the mapping as `MmapMut` keeps `AdmittedDevice` `Send` without an `unsafe impl` (§4.6).
 memmap2 = { workspace = true }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# One ioctl: `UDMABUF_CREATE`, which confines a guest's DAX window to its own descriptor (`src/udmabuf.rs`).
+# rustix has no wrapper for it, and its typed `ioctl` cannot express one that *returns* a descriptor without an
+# `unsafe impl Ioctl` of our own — which would be two unsafe sites where libc is one.
+libc = { workspace = true }
+
 [dev-dependencies]
 
 [target.'cfg(unix)'.dev-dependencies]

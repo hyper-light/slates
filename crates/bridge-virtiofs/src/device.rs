@@ -1646,8 +1646,26 @@ fn map_chunk_at(
     }
     #[cfg(target_os = "linux")]
     crate::dax::DaxPlacer::Message(message) => {
+      // This is the one path where a descriptor leaves the process, so it is narrowed to the window before it
+      // goes (§4.6; `docs/bugs/2026-10-18-the-message-based-dax-map-hands-the-vmm-the-whole-arena.md`). The
+      // arena's object carries every volume's blocks and `fd_offset`/`len` scope the *request*, not the
+      // *descriptor*; a `udmabuf` over the same range is a descriptor that covers only it, without copying, so
+      // the window still writes through to the arena's own pages. `DaxPlacer::Local` maps in this process and
+      // hands out nothing, which is why it is not narrowed here.
+      //
+      // A host that cannot carve one refuses the mapping. The wide descriptor is never sent as a fallback —
+      // that is the escape itself, and CLAUDE.md #7 has no room for a second path.
+      use std::os::fd::AsFd as _;
+      let confined = match crate::udmabuf::confine(fd, object_off, mapped_len) {
+        Ok(confined) => confined,
+        Err(_) => {
+          let _ = bridge.dax_unmap(&mapping, cx);
+          return MapStep::Refused(dax_errno::EOPNOTSUPP);
+        }
+      };
+      // The window is the whole of the confined descriptor, so its offset within it is zero.
       if message
-        .begin_map(win_off, mapped_len, fd, object_off, writable, entry)
+        .begin_map(win_off, mapped_len, confined.as_fd(), 0, writable, entry)
         .is_err()
       {
         let _ = bridge.dax_unmap(&mapping, cx);

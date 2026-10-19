@@ -801,8 +801,19 @@ mod platform {
 
   #[cfg(target_os = "linux")]
   fn create_object(name: &str) -> Result<Created, MemError> {
-    let fd = rustix::fs::memfd_create(name, rustix::fs::MemfdFlags::CLOEXEC)
-      .map_err(|e| refused("memfd_create", e))?;
+    let fd = rustix::fs::memfd_create(
+      name,
+      rustix::fs::MemfdFlags::CLOEXEC | rustix::fs::MemfdFlags::ALLOW_SEALING,
+    )
+    .map_err(|e| refused("memfd_create", e))?;
+    // Sealed against shrinking, which costs nothing and buys the DAX window its confinement. Nothing in slates
+    // shrinks a memory object — the single `ftruncate` is the sizing one below, and a grow is unaffected by this
+    // seal — but `UDMABUF_CREATE` refuses a memfd without `F_SEAL_SHRINK`, and a udmabuf is how a guest's DAX
+    // window is handed out as a descriptor covering **only** that window instead of the whole arena
+    // (`docs/bugs/2026-10-18-the-message-based-dax-map-hands-the-vmm-the-whole-arena.md`). Sealing here rather
+    // than at the one call site keeps the property true of every object, so no caller has to remember it.
+    rustix::fs::fcntl_add_seals(&fd, rustix::fs::SealFlags::SHRINK)
+      .map_err(|e| refused("fcntl_add_seals", e))?;
     Ok(Created { fd })
   }
 

@@ -1,3 +1,5 @@
+Status: **FIXED 2026-10-19 (A-138).**
+
 # The message-based DAX map hands the VMM a descriptor for the whole arena
 
 - **Date:** 2026-10-18
@@ -173,8 +175,12 @@ something up".
 
 ## Owed
 
-- Ada's call between the **four** options, **before** the advertisement gate at
-  `admission.rs`'s `DaxNotEstablished` is flipped.
-- No test is committed asserting the current behaviour: a test that pins a weakness in place is worse
-  than the record of it. When the option is chosen, the test to write is the inverse of the
-  measurement above — the descriptor's extent must equal the authorized window's.
+- ~~Ada's call between the four options~~ — **taken: option 4**, which forecloses none of the others. If a
+  per-tenant backing (option 1) ever lands, this narrowing becomes a no-op rather than an obstacle.
+- ~~No test is committed asserting the current behaviour~~ — the inverse test is committed instead, as this
+  entry asked: `a_message_based_setupmapping_...` in `crates/bridge-virtiofs/tests/device.rs` maps the
+  descriptor the front end was sent, reads the file's bytes through it, and asserts that **one byte past the
+  window is not mappable**. It needs `/dev/udmabuf`, so it skips loudly where there is none (Docker's linuxkit
+  VM has no such device; a Fedora host does).
+- **Still owed:** the live crosvm leg. Every primitive its `SHMEM_MAP` uses is proven on a udmabuf, but the
+  real front end has not been run against it (`crates/client/examples/crosvm_dax_ab/`).

@@ -68,6 +68,10 @@ pub mod serve;
 pub mod sim;
 // The inherited-descriptor binding (vhost-user): eventfds, epoll and `SO_PEERCRED` are Linux's, and so is the
 // VMM side that speaks it to a KVM guest.
+/// Confining a guest's DAX window to a descriptor covering only that window (§4.6): the Linux `udmabuf`
+/// carve-out the message-based placer narrows the arena's object with before sending it.
+#[cfg(target_os = "linux")]
+mod udmabuf;
 #[cfg(target_os = "linux")]
 pub mod vhost_user;
 pub mod virtqueue;

@@ -6919,12 +6919,12 @@ Today's work closed several things and found several more, scattered across six 
 that answers "what is left before `admission::unsupported`'s `DaxNotEstablished` can be lifted", so the next
 person does not have to reassemble it. Every row was checked today, not recalled.
 
-**Blocking — a guest window could be served unsafely or not at all.** Rows 5 and 6 closed the same day they were
-written; the remaining four need decisions or deployment work.
+**Blocking — a guest window could be served unsafely or not at all.** Rows 5 and 6 closed the day they were
+written; **row 1 closed 2026-10-19 (A-138)**; rows 2, 3 and 4 need decisions or deployment work.
 
 | # | What | State |
 |---|---|---|
-| 1 | **Descriptor confinement for the message-based placer.** *(2026-10-19: a **fourth** option exists and may remove the conflict — a per-mapping `udmabuf` over the arena memfd's range is confined by construction, zero-copy, and leaves A-64 alone; measured unprivileged on Fedora 6.19, caveats and the unproven crosvm leg in the bug doc.)* `Store::dax_backing` hands the frontend the arena's *whole* shared object — measured 64× the authorized window, with another tenant's blocks inside it. `fd_offset`/`len` scope the request, never the descriptor. | **Ada's call** between a per-tenant sealed backing, a per-mapping copy, or advertising over fd-sharing only. `docs/bugs/2026-10-18-the-message-based-dax-map-hands-the-vmm-the-whole-arena.md` |
+| 1 | ~~**Descriptor confinement for the message-based placer.**~~ — **CLOSED 2026-10-19 (A-138)** by a fourth option the three on record had missed: the placer narrows the arena's descriptor to the authorized window with a Linux `udmabuf` before sending it. Confined by construction, zero-copy and writable, A-64 untouched, unprivileged. Red-checked in `tests/device.rs` (one byte past the window is unmappable; hand back the arena descriptor and it fails there). A host without `/dev/udmabuf` is refused, never widened. Owed: the live crosvm leg. `Store::dax_backing` hands the frontend the arena's *whole* shared object — measured 64× the authorized window, with another tenant's blocks inside it. `fd_offset`/`len` scope the request, never the descriptor. | **Ada's call** between a per-tenant sealed backing, a per-mapping copy, or advertising over fd-sharing only. `docs/bugs/2026-10-18-the-message-based-dax-map-hands-the-vmm-the-whole-arena.md` |
 | 2 | **B2's wiring.** `dax_guard`/`dax_scrub` have no production caller and no `Bridge` surface; nothing guards a mapping and nothing schedules a scrub. | **Ada's call**: what to guard (a guard pins a full clean copy, so guarding every read-only mapping doubles mapped-content RAM) and the scrub cadence (no anchor to derive from). |
 | 3 | **L2's device half.** `dax_migrate`'s own doc promised a daemon-initiated `MAP_FIXED`/`mremap` of the guest window; no such remap exists in `bridge-virtiofs` or `bridge-core`. | Owed, with L2's adaptive trigger. |
 | 4 | **L1.** Physically-contiguous hugetlb zones + guard rows — the deployment layer that makes L2's shift move real physical rows. | Owed (needs a privileged broker). |
@@ -7846,3 +7846,43 @@ Linux aarch64 — with identical counts on each. The two deepened runs are the c
 and 25× their committed case counts. The useful negative result is that nothing in the DAX path turns out to be
 page-size, kernel or endianness shaped: the macOS evidence was not accidentally architecture-bound, which is
 what taking it on one host had left open.
+
+### 2026-10-19: DAX gate row 1 is closed — the descriptor a front end gets covers only its window (A-138)
+
+Row 1 had been open on a choice between three options that each gave something up: a per-tenant backing cuts
+against A-64's one-image-per-shard layout, a per-mapping copy is the view arm the 2026-10-17 A/B measured and
+rejected at slope 1.0, and advertising over fd-sharing only forfeits the crosvm route chosen on 2026-10-16. I
+had recorded that as needing Ada, twice.
+
+**There was a fourth option, and it gives up none of them.** `UDMABUF_CREATE` takes `{memfd, offset, size}` and
+returns a descriptor covering **only** that range, pinning the memfd's existing pages rather than copying them.
+So the window is confined by construction, zero-copy survives — writable zero-copy too, which the copy arm lost
+— and the arena's layout is untouched: what changed is the descriptor that leaves the process, nothing else.
+
+**Proven before it was built**, unprivileged on Fedora 6.19 (`uid 1000`, no `CAP_SYS_ADMIN`, not in `kvm`): the
+window maps its own bytes and refuses both the whole object and any offset past itself; it survives
+`SCM_RIGHTS` to another process; it takes `MAP_FIXED` into a region a VMM reserved, with the hole restorable
+after; and a write through it lands in the arena's own pages.
+
+**Then in-tree, and red-checked.** `a_message_based_setupmapping_...` now maps the descriptor the front end was
+sent, reads the file's bytes through it, and asserts **one byte past the window is not mappable**. Put the
+arena's own descriptor back and it fails on exactly that assertion — so the test pins the fix rather than
+decorating it. It needs `/dev/udmabuf`, so it skips loudly where there is none (Docker's linuxkit VM has no
+such device; a Fedora host does).
+
+**What it cost.** `slates-mem` now creates every shared object with `ALLOW_SEALING` and `F_SEAL_SHRINK`, which
+`UDMABUF_CREATE` requires: nothing in slates shrinks an object — `ftruncate` appears once, at creation — so the
+seal costs nothing today and binds the future not to. The unsafe budget rises 3 → 5 for the ioctl and the
+descriptor it returns; `rustix` has no wrapper and its typed `ioctl` cannot express one that returns a
+descriptor without an `unsafe impl` of our own, which would be more unsafe rather than less. The device is
+opened **read-only**, which `UDMABUF_CREATE` accepts (measured both ways) and which keeps it inside the lint
+wall with no exception.
+
+**And a host without `/dev/udmabuf` is refused, never widened** — the wide descriptor is the escape itself, so
+there is no fallback (CLAUDE.md #7). That does mean message-based DAX now follows host configuration; the
+device is not a privilege under R10, being the one the VMM already uses, but it has to be there.
+
+Verified: workspace clippy clean on x86_64 Linux 6.19 and on macOS; `xtask check` clean (structural, literals,
+unsafe, version, capabilities); the virtio-fs suites, `vfs dax`, `mem`, `fuse_mount` and `cli` all green on
+Linux. **Owed: the live crosvm leg** — every primitive its `SHMEM_MAP` uses is proven on a udmabuf, but the
+real front end has not been run against it.
