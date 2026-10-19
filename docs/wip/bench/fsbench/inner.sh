@@ -8,6 +8,13 @@
 set -u
 : "${CREATES:=2000}" "${FSYNCS:=1000}" "${BASE_FILES:=500}"
 apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq fuse3 python3 >/dev/null 2>&1 || { echo APT-FAILED; exit 1; }
+# Say which precondition is missing rather than failing on a bare `cp`: the usual one is an empty target volume
+# (no build yet) or a debug-only build, and a debug binary measures the compiler — a quick machine profile reads
+# 0.07 s release against 0.51 s debug, so the comparison would be meaningless rather than merely slow.
+[ -x /target/release/slates ] || {
+  echo "NO-RELEASE-BUILD: /target/release/slates is missing. Build it first — the command is in run.sh's header."
+  exit 1
+}
 cp /target/release/slates /usr/local/bin/slates
 mkdir -p /base /mnt/v /ram /ovl
 mount -t tmpfs tmpfs /ram
