@@ -5188,12 +5188,26 @@ this measurement deliberately excludes overlay copy-up, base-plane lookups and p
 which a real create pays and this one does not. It also serves over an in-memory duplex rather than the
 production `/dev/fuse` channel and its serve loop. Different host and architecture again, as above.
 
-**What is left to attribute, stated as the next question rather than an answer.** The ~262 µs is in one or more
-of: the kernel↔daemon transport and the serve loop around dispatch (the stat row prices a *whole* round trip at
-13.9 µs, so this would have to be create-specific — a CREATE is more than one kernel message); the overlay and
-base-plane work a `--shared` mount does per create; and the publish/change-tracking bookkeeping a published
-volume does. `docs/wip/bench/fuse/fuse-perf.sh` discriminates between them by name — it `perf record`s the daemon
-through 2,000 creates. Owed; it needs a Linux host quiet enough to profile, and both of mine are loaded.
+**What is left to attribute, with four candidates already eliminated.** Measured away: the bridge dispatch
+(0.5 µs), the VFS create (~2 µs), and the transport floor (13.9 µs by the stat row). Read away, and worth
+recording so they are not re-chased:
+
+- **Cache revalidation is not it.** A classic FUSE cause of multiplied round trips is a zero entry/attr lifetime,
+  forcing the kernel to revalidate on every path operation. slates already answers `CacheLifetime::Forever` for a
+  volume's own objects (`bridge.rs::valid_for`), bounded only for a *live base* entry an outsider may change.
+  `fuse-perf.sh`'s volume has no base, so every lifetime there is Forever.
+- **Self-invalidation is not it.** A mutation does not make the mount notify its own kernel: a transport takes the
+  invalidation cursor *after* serving its own request, "so its own changes are never invalidated in its own
+  kernel" (`bridge-core/src/lib.rs::seen`). With one mount and no other writer, the notify path owes nothing, so
+  the per-batch notify thread is not being spawned per create.
+
+The ~130 µs that a *plain*-volume create costs (A-96: 2,000 creates in 0.26 s) and the further ~147 µs the
+`--shared` overlay adds therefore sit in the daemon's serve loop around dispatch and in the kernel's own CREATE
+path — and in the overlay's base-plane work for the `--shared` half. That a GETATTR costs 13.9 µs and a CREATE
+130 µs through the same loop, when both are a 0.5 µs dispatch in-process, is the shape to explain.
+`docs/wip/bench/fuse/fuse-perf.sh` names it by symbol — it `perf record`s the daemon through 2,000 creates.
+Owed; it needs a Linux host quiet enough to profile, and both of mine are loaded (the box at 120–283 from another
+session all evening).
 
 **Measured (2026-10-18): the VFS primitive is 1% of a FUSE create, and the transport 5%. The other ~94% is the
 path between them.** The amendment below reasoned from the stat row that the round trip could not be most of a
