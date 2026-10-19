@@ -80,6 +80,26 @@ Exact edits:
   copies (`crates/vfs/examples/vfs_bench.rs`, `crates/client/tests/driver.rs`,
   `crates/ipc/tests/rendezvous.rs` now call it), so the fourth site did not become a fourth copy.
 
+## Correction to the conditions stated above (same day)
+
+The runs quoted here say "24 CPU burners". That understates them. The load generator used for the repro was
+`for i in $(seq 1 24); do (while :; do :; done) & done` inside a single `zsh -c` invocation, and `kill $(jobs -p)`
+at the end of that invocation killed **nothing**: the subshells were not in the shell's job table, so each run
+left its 24 spinners behind, reparented to init. By the time the later measurements were taken there were **168**
+of them on an 18-core machine, and the host's load average read 150–245 rather than the ~40 that 24 spinners
+produce. They were found and killed at 19:21.
+
+What this changes, and what it does not. The **mechanism** is unaffected: the decisive reading is a ratio taken
+inside one run — a hold that spun 2.059 s of wall time advanced the shard's CPU clock by 153 ms — and a ratio of
+CPU to wall says the same thing whatever produced the contention. The **magnitudes** quoted as "at load 158" are
+magnitudes of a machine carrying far more than the stated load, and are not a characterisation of a normally busy
+host. Where a number here is used to argue that a bound is too tight, read it as "under heavy contention", not as
+a measurement of twenty-four burners.
+
+The recipe itself was the bug: a backgrounded subshell inside a non-interactive `zsh -c` is not a job, so
+`jobs -p` is empty. Load generation must kill by process group or by a recorded pid list, and must confirm the
+count afterwards.
+
 ## Sibling sweep
 
 Every caller of `starve_control_shard`: `crates/server/tests/fleet.rs` lines 1160, 8327 and 11186 want wall-time

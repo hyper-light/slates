@@ -7230,14 +7230,39 @@ Fixed by deriving the helper's life from the deadline it will be killed at (`han
 so both sides of the relation move together; red-checked by collapsing the multiple, which reproduces the
 original failure exactly.
 
+**A suspected defect that measurement killed, recorded so nobody re-opens it.** Chasing the CLI suite's
+`recovery_approval_uses_the_provisioned_node_key_across_processes` (exit 3, "the daemon came up") led to the
+anchor's boot profile: sampled, it sat in `probes::memcpy_curve → fill`, and timing each probe showed
+`memcpy_curve` at **35 s** and `hash` at **17.7 s** against a 250 ms per-probe budget, with 86% of the memcpy
+probe spent filling its 128 MiB source *outside* any budget. That looked like a defect against
+`PROBE_WALL_BUDGET`'s own stated purpose ("so a slow machine still boots"), and it is not one.
+
+Measured on a quiet host (load 3.3, 18-core M-series Mac, 2026-10-18), whole `slates profile --quick`:
+
+| build | elapsed | blake3 |
+|---|---|---|
+| **release** | **0.068–0.098 s** | 2.40–2.56 GB/s |
+| debug | 0.508–0.541 s | 0.115–0.118 GB/s |
+
+The product meets the intent by two orders of magnitude. The 35 s and 17.7 s were a **debug** binary — blake3 is
+60× slower unoptimized and `fill` writes 128 MiB a word at a time — under a host carrying 168 orphaned spinners
+of my own making. Two lessons, both already paid for: **time the release binary before calling anything a
+performance defect** (CLAUDE.md already says a benchmark is a release-binary command; I measured debug and nearly
+filed it), and the contention a measurement runs under has to be known, not assumed. The CLI tests do run the
+debug binary, which is why that suite is the one that feels this at all; its startup waits now count attempts
+rather than wall time, which is the right shape regardless of how fast the binary is.
+
 **A sixth shape, and the sharpest one: injecting *busy* where the product means *stopped*.** Three tests in
 `crates/server/tests/observe.rs` made a shard unavailable by **spinning** a task on it and asserted that an
 observation of it hits its deadline. But an observation's budget is the target shard's **own CPU time**, not wall
 time — that is the whole of A-65 and `docs/bugs/2026-10-03-an-observation-read-a-starved-shard-as-wedged.md`: a
 shard the host is starving keeps its budget and is answered late, and only a shard that is not running ends the
 observation. A spinning hold reaches a CPU budget only on a machine idle enough to spin at the wall clock's pace.
-Instrumented under 24 burners: a two-second spin advanced the shard's CPU clock by **153 ms** against a 300 ms
-budget, so the extension kept granting windows and all three observations were answered. Written out, those tests
+Instrumented under heavy contention: a two-second spin advanced the shard's CPU clock by **153 ms** against a
+300 ms budget, so the extension kept granting windows and all three observations were answered. (The contention
+was stated as "24 CPU burners" when these runs were made and was in fact far more — a leaking load generator had
+left 168 spinners on the host. The ratio is a within-run reading and stands; the magnitudes do not characterise a
+normally busy machine. Corrected in the bug doc, same day.) Written out, those tests
 asserted *a busy shard is unavailable*, which the product deliberately denies. Fixed with a second injection —
 `Daemon::wedge_control_shard`, a task that **sleeps**, so the shard consumes no CPU and the deadline fires on any
 machine — while `starve_control_shard` keeps its spin for the fleet suite, which wants wall-time silence on the
