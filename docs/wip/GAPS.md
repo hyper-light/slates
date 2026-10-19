@@ -7191,6 +7191,22 @@ zero is exactly the shape the regression had — and the test fails on it, *"ref
 This is the same distinction as the driver and rendezvous bounds earlier today: say whether the code did its
 job, not whether the machine was fast enough while it did.
 
+### 2026-10-18 (close of day): what a clean `cargo test --workspace` says now
+
+The day opened with a workspace run failing **63 distinct tests** and closed with one failing **1**, on a quiet
+host (load 3–20, no self-inflicted contention — see the correction below about the 168 orphaned spinners that
+polluted the middle of the day). 258 test binaries. The single failure was the twelfth machine-profile fixture,
+`crates/mem/src/region.rs`'s huge-page test, fixed in the same session.
+
+Sixty of the original sixty-three were one line — `slates-server`'s unit-test fixture measuring the machine
+within five milliseconds behind a `OnceLock`. The rest were the shapes catalogued below. None of them were
+product defects; the three product defects found this day came from *writing the tests*, not from running them:
+a refused power-state re-measure that retired its own trigger, a seam that reported every typed refusal as a
+clean guest hang-up, and a reply-ack whose request code was parsed and discarded.
+
+Linux x86_64 at the same HEAD: `clippy --workspace --all-targets` clean, and machine 56/56, bridge-virtiofs
+19+11+35+6+14, server lib 181/181, observe 8/8, ipc rendezvous 7/7, rt placement 2/2, bridge-fuse handshake 5/5.
+
 ### 2026-10-18: the busy-machine discipline — three discriminators, and which to reach for
 
 Seven failures in one afternoon, all surfaced only by `cargo test --workspace` and all variations of "the
