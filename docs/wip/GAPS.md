@@ -7595,8 +7595,14 @@ pass, 83 tests of them.
 (`SocketAddrUnix::new(format!("{}/socket", paths.original))`) and `sockaddr_un` caps a path at ~108 bytes. From
 the 71-character working directory the runner used it fails `ENAMETOOLONG`; copied to `/tmp/s` (7 characters)
 and run again from the same tree it **passes**. The test is sound; it simply cannot run from a deep directory.
-Worth a loud skip rather than a failure when the path will not fit, which is what this repo asks of every
-environment-gated test — recorded, not done here.
+
+**Fixed, in this change.** It now skips loudly instead of failing, which is what this repo asks of every
+environment-gated test. The limit is not written down anywhere: the guard asks `SocketAddrUnix::new` for the
+same path the test will bind and skips if the ABI refuses it, so it cannot drift from `sockaddr_un`. Verified
+both ways on the same host — from the 71-character build directory it prints `the socket path in the build
+output (116 bytes) is longer than sockaddr_un holds` and passes; from `/tmp/s` it prints nothing and **runs**,
+which is the non-vacuity check that the guard has not quietly retired the test. `clippy -D warnings` green on
+Linux x86_64.
 
 **Four causes eliminated, each by measurement rather than reading.**
 

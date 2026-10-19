@@ -323,6 +323,19 @@ fn verify_isolation(paths: &MountPaths, original: &LiveIpc) {
 fn fifo_and_socket_communication_is_local_to_each_clone() {
   std::thread::scope(|scope| {
     let paths = MountPaths::new();
+    // This proof binds a unix socket *inside* the mount, and A-50 puts the mount in the build output rather
+    // than `/tmp`, so on a host whose build directory is deep the socket's path is longer than `sockaddr_un`
+    // can hold and `bind` answers `ENAMETOOLONG`. That is the shape of the host, not a fault in the bridge, so
+    // it skips loudly like the other environment gates here. The limit is not written down: `SocketAddrUnix`
+    // refuses the path itself, which is the ABI's own answer and cannot drift from it.
+    if SocketAddrUnix::new(format!("{}/socket", paths.original)).is_err() {
+      eprintln!(
+        "skipping mounted IPC proof: the socket path in the build output ({} bytes) is longer than \
+         sockaddr_un holds; run from a shorter directory to cover this",
+        paths.original.len().saturating_add("/socket".len())
+      );
+      return;
+    }
     let try_mount = |path: &str| match mount(path, &[], MOUNT_WAIT) {
       Ok(mounted) => Some(mounted),
       Err(MountError::NoDevice { .. } | MountError::Helper { .. } | MountError::Spawn { .. }) => {
