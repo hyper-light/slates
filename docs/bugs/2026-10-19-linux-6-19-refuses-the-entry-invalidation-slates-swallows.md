@@ -94,6 +94,32 @@ a 7-character working directory too.
    the measurement `c3c0024b` recorded (negative entries bought −28% lookups on a pip install) to show what the
    bound costs. That is a planned change with a design-doc and amendment-log entry, not an improvisation.
 
+## The decision is binary, and already priced
+
+A *bounded* lifetime does not actually rescue the failing tests, and it is worth being exact about why: the
+probe runs immediately after the creating mutation, so any bound longer than about zero still answers from the
+cache. Making these tests green therefore means **not caching entries at all** for a volume's own objects —
+not shortening the lifetime, removing it. So the choice is binary, and both sides already carry numbers:
+
+- **Keep `Forever`.** Costs nothing. Leaves a real hole on kernels that refuse entry invalidation: a name
+  created, removed or renamed through another attachment is invisible to that mount, indefinitely. The hole is
+  no longer silent — `fuse.entry_invalidation_refused` moves the moment it happens.
+- **Stop caching entries.** Closes the hole on every kernel. Gives back exactly what `c3c0024b` measured when
+  it added the caching: a pip install's requests 21,709 → 19,222 and **lookups −28%**, paid on *every* kernel,
+  including the large majority where invalidation works correctly.
+
+**Recommendation: keep `Forever`, and treat 6.19 as a kernel regression to track.** Three reasons. The upstream
+history is churning this exact function — `fuse_reverse_inval_entry()` was recently converted to
+`start_removing_noperm()` (`c9ba789dad15`) and has already needed one follow-up fix, which is what a regression
+looks like rather than a deliberate ABI change. The cost of the alternative is permanent and paid everywhere,
+against a hole on a subset of kernels. And the hole is now observable rather than silent, so a deployment on an
+affected kernel can be told. If correctness-first is preferred regardless, the switch is one function —
+`valid_for` in `crates/bridge-fuse/src/bridge.rs` — and the price above is what it costs.
+
+Either way the two tests stay red on 6.19 and **should**: they assert a promise the kernel is refusing to
+honour. Making them green by skipping on affected kernels would hide a real hole, so that is deliberately not
+done.
+
 Narrowing the kernel range below 6.13…6.19 needs a kernel between the two; the three hosts available are
 6.12, 6.19 and 7.2, so it was not narrowed here.
 
