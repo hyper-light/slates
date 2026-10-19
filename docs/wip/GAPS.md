@@ -8282,3 +8282,31 @@ Before writing the sweep, the device half it depends on was read rather than ass
 Also swept: `vfs_dax_errno` had a `_ => EINVAL` catch-all, so the new `NoPhysicalIsolation` would have reached a
 guest as "invalid argument" rather than "unsupported". Named explicitly beside `SpecialFileOperation` as
 `EOPNOTSUPP`, which is what it is: the host will not do that, not the caller asked wrongly.
+
+### 2026-10-19: the daemon→device half of L2, decided by reading the device rather than by preference
+
+§4.6 offered a choice — a backend-initiated remap of the guest window, or "the revoke-and-refault path instead,
+and accept the tear". The second is taken, and the reason the first was deferred is structural, not a preference:
+under `DaxPlacer::Message` a `SHMEM_MAP` parks the *guest's* chain and is completed by `complete_parked_map`,
+whose job is to scatter that request's reply and publish its used element. A map the daemon starts has no request
+to answer, so the remap needs a second, chain-less completion arm in the device's most delicate asynchronous path
+— bought for the saving of one guest fault per shift, at a cadence of 16–32 ms, on a mode L0 keeps rare.
+
+And the objection recorded against revoke-and-refault turned out to be stale. §4.6 said an inode-global revoke
+"would tear every window of the inode rather than move the one that is being shifted". The queue carries
+`writable_only`, and `tear_down_inode_windows` honours it: a shift enqueues `(inode, true)`, which tears this
+inode's writable windows — exactly the one being shifted, since a writable map is the single-block open path —
+and leaves a read-only window of the same inode alone. The flag was added after the objection was written.
+
+`a_shift_tells_the_device_so_the_guests_window_follows_the_content` proves it through the real device: a guest
+maps a page writable, the daemon shifts it into the L1 sandbox, the service pass drain tears the window that
+named the row the content left, and the guest's re-fault maps the row it moved to with its bytes intact. **Ran,
+not skipped, on adacachy 2026-10-19** (x86_64, `shmem_enabled=[advise]`); skips loudly on macOS and on a Linux
+whose shared objects get no huge page.
+
+One thing the split cost, worth knowing: clippy's cognitive-complexity budget counts every `assert!`, so a test
+with nine of them trips it however flat it reads. The fix that keeps the test honest is to name each phase as its
+own function (`one_writable_window_is_mapped`, `the_drain_tears_the_stale_window`,
+`the_refault_reaches_the_moved_row`) rather than to drop assertions.
+
+**Owed:** the trigger. Nothing else in the Rowhammer layers is.

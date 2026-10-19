@@ -458,6 +458,20 @@ impl DaxRegistry {
     self.refused
   }
 
+  /// The live **writable** mappings of the volume with `prefix`: the set §4.6's periodic shift walks, and what a
+  /// caller names when it asks for one to be moved. Collected rather than borrowed, because shifting one borrows
+  /// the store; bounded by the registry's own cap, as every list here is, and small in practice because L0 keeps
+  /// writable DAX rare.
+  #[must_use]
+  pub fn writable_of_prefix(&self, prefix: u16) -> Vec<Mapping> {
+    self
+      .mappings
+      .iter()
+      .filter(|mapping| mapping.writable && mapping.inode.prefix() == prefix)
+      .copied()
+      .collect()
+  }
+
   /// Migrations performed so far (§4.6 L2 moving target; the non-vacuity counter).
   #[must_use]
   pub fn migrated(&self) -> u64 {
@@ -987,6 +1001,18 @@ impl Volume {
     {
       store.release_refusals = store.release_refusals.saturating_add(1);
     }
+    // Tell the device, or its window still names the mapping this shift revoked and the guest reads a page the
+    // registry no longer authorizes until something else happens to tear it. The queue is the one the device
+    // already drains every service pass (`AdmittedDevice::service` -> `tear_down_inode_windows`), and
+    // `writable_only` is what makes it right here: it tears this inode's *writable* windows — which, since a
+    // writable map is the single-block open path, is exactly the one being shifted — and leaves any read-only
+    // window of the same inode alone. That answers §4.6's objection to using this queue ("an inode-global revoke
+    // would tear every window of the inode rather than move the one that is being shifted"), which was written
+    // before the flag existed. The guest re-faults, SETUPMAPPING runs [`Volume::dax_map_write`], and its
+    // live-window path finds this freshly-minted mapping and maps the row the content moved to.
+    //
+    // Enqueued only here, after the new mapping is registered, so a shift that refused part-way tears nothing.
+    store.dax.enqueue_pending_revoke(old.inode, true);
     store.dax.count_migration();
     Ok(mapping)
   }

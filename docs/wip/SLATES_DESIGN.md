@@ -2858,11 +2858,25 @@ same-namespace host process is the first delivered case.
 >      default, so B2 covers the common case. The clean copy is bounded by the registry cap and freed on revoke.
 >    The modern window is 16–32 ms and RowPress leaks across refresh windows, so the migration interval is derived
 >    from the lowest hammer threshold, not the classic 64 ms. L0, L1, L2 and B2 are built and proven by use in
->    `crates/vfs/tests/dax.rs`. What is owed is the **caller**: `Volume::dax_migrate` still has none in production.
->    The periodic sweep at the 16–32 ms cadence is the one the measurement already affords (242 ns per 4 KiB block,
->    so unconditional migration costs <0.01% throughput) and needs no new signal; the adaptive trigger from a
->    privileged broker's PEBS/IBS is the optimization on top of it, not a precondition. The device half — a
->    backend-initiated remap of the guest's window old→new — is owed with it.
+>    `crates/vfs/tests/dax.rs`. **The daemon→device half is settled and built** (2026-10-19). The earlier text left
+>    a choice between a backend-initiated remap and "the revoke-and-refault path instead, and accept the tear"; the
+>    second is taken, because the objection recorded against it no longer holds. `Volume::dax_migrate` now enqueues
+>    `(inode, writable_only = true)` on the queue the device already drains every service pass
+>    (`AdmittedDevice::service` → `tear_down_inode_windows`), and `writable_only` tears this inode's *writable*
+>    windows only — which, since a writable map is the single-block open path, is exactly the window being shifted,
+>    leaving any read-only window of the same inode alone. That was the whole of the objection ("an inode-global
+>    revoke would tear every window of the inode"), written before the flag existed. The guest re-faults, its
+>    SETUPMAPPING runs `Volume::dax_map_write`, and the live-window path finds the freshly-minted mapping and maps
+>    the row the content moved to. Proven through the real device by
+>    `a_shift_tells_the_device_so_the_guests_window_follows_the_content`, which ran (not skipped) on adacachy
+>    2026-10-19. The remap was rejected for now on a measured structural ground, not a preference: under
+>    `DaxPlacer::Message` a `SHMEM_MAP` parks the *guest's* chain and is finished by `complete_parked_map`, which
+>    exists to answer a guest request, so a daemon-initiated map needs a second, chain-less completion arm — new
+>    asynchronous state in the device's most delicate path, bought for one guest fault per shift.
+>    What is owed is now only the **trigger**: `Volume::dax_migrate` still has no production caller. The periodic
+>    sweep at the 16–32 ms cadence is the one the measurement already affords (242 ns per 4 KiB block, so
+>    unconditional migration costs <0.01% throughput) and needs no new signal; the adaptive trigger from a
+>    privileged broker's PEBS/IBS is the optimization on top of it, not a precondition.
 
 > **Status (DAX device-seam wiring, 2026-10-15).** The device side of the gate is built against the in-process
 > virtio-fs seam and proven by a simulated guest (no KVM): `crates/bridge-virtiofs` serves a real

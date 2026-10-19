@@ -1452,6 +1452,294 @@ fn dax_shared_store(page: usize, tag: &str) -> slates_vfs::volume::Store {
   )
 }
 
+/// [`dax_shared_store`] with an object big enough to hold a §4.6 L1 sandbox, so a test can drive a *shift*
+/// through the device. A sandbox is one of the host's transparent huge pages and the arena needs room for it
+/// beside the content, so the object is several of them rather than the 64 pages the plain fixture takes.
+///
+/// Where the host offers no huge page the object falls back to the plain fixture's size — nothing can reserve a
+/// sandbox there anyway, and the test skips on the product's refusal rather than on the fixture.
+/// Brings the connection up over one transient bridge, as the shard builds one per pass.
+#[cfg(unix)]
+fn dax_init_pass(
+  device: &mut Device,
+  driver: &mut SimDriver,
+  vol: &mut slates_vfs::volume::Volume,
+  store: &mut slates_vfs::volume::Store,
+  cx: &OpContext,
+) {
+  let mut bridge = VolumeBridge::new(vid(), vol, store);
+  dax_exchange(
+    device,
+    driver,
+    &mut bridge,
+    cx,
+    (Opcode::Init, 1, ROOT),
+    &dax_init_body(),
+  );
+}
+
+/// One SETUPMAPPING pass over its own transient bridge: `nodeid`'s first page, writable, at window offset zero,
+/// answering with the guest's reply errno.
+#[cfg(unix)]
+fn dax_map_pass(
+  device: &mut Device,
+  driver: &mut SimDriver,
+  vol: &mut slates_vfs::volume::Volume,
+  store: &mut slates_vfs::volume::Store,
+  cx: &OpContext,
+  (unique, nodeid): (u64, u64),
+  page: usize,
+) -> i32 {
+  let mut bridge = VolumeBridge::new(vid(), vol, store);
+  let reply = dax_exchange(
+    device,
+    driver,
+    &mut bridge,
+    cx,
+    (Opcode::SetupMapping, unique, nodeid),
+    &dax_setup_body(0, page as u64, true, 0),
+  );
+  reply_error(&reply)
+}
+
+/// The volume's one live writable mapping — the window a shift is about to move. Panics with what it found
+/// instead, so a fixture that drifted says so rather than the test reading a mapping it did not mean.
+#[cfg(unix)]
+fn only_writable_mapping(
+  store: &slates_vfs::volume::Store,
+  prefix: u16,
+) -> slates_vfs::dax::Mapping {
+  let mapped = store.dax.writable_of_prefix(prefix);
+  match mapped.as_slice() {
+    [one] => *one,
+    other => panic!("one writable mapping after the map pass, found {other:?}"),
+  }
+}
+
+/// The §4.6 L2 shift under test, or `None` with the skip printed where this host backs no transparent huge page
+/// for §4.6's L1 sandbox, so there is no physically different row for the content to land on.
+#[cfg(unix)]
+fn dax_shift_or_skip(
+  vol: &mut slates_vfs::volume::Volume,
+  store: &mut slates_vfs::volume::Store,
+) -> Option<(slates_mem::arena::Extent, slates_vfs::dax::Mapping)> {
+  let live = only_writable_mapping(store, vol.prefix());
+  match vol.dax_migrate(store, &live) {
+    Ok(moved) => {
+      assert_ne!(
+        moved.block, live.block,
+        "the content moved to a different row"
+      );
+      Some((live.block, moved))
+    }
+    Err(slates_vfs::error::VfsError::NoPhysicalIsolation) => {
+      println!(
+        "SKIP a_shift_tells_the_device_so_the_guests_window_follows_the_content: this host backed no \
+         transparent huge page, so §4.6's L1 sandbox cannot be reserved"
+      );
+      None
+    }
+    Err(other) => panic!("a shift is performed or refused for want of a sandbox: {other:?}"),
+  }
+}
+
+/// Phase one: the guest maps the file writable, leaving one live window over the row the content sits on now.
+#[cfg(unix)]
+fn one_writable_window_is_mapped(
+  device: &mut Device,
+  driver: &mut SimDriver,
+  vol: &mut slates_vfs::volume::Volume,
+  store: &mut slates_vfs::volume::Store,
+  cx: &OpContext,
+  nodeid: u64,
+  page: usize,
+) {
+  dax_init_pass(device, driver, vol, store, cx);
+  let mapped = dax_map_pass(device, driver, vol, store, cx, (2, nodeid), page);
+  assert_eq!(mapped, 0, "mapped");
+  assert_eq!(device.dax_window_count(), 1, "one live guest window");
+}
+
+/// Phase three: a service pass drains what the shift enqueued and the device tears the window that named the row
+/// the content left, so the guest faults instead of reading a page the registry no longer authorizes.
+#[cfg(unix)]
+fn the_drain_tears_the_stale_window(
+  device: &mut Device,
+  vol: &mut slates_vfs::volume::Volume,
+  store: &mut slates_vfs::volume::Store,
+  cx: &OpContext,
+  nodeid: u64,
+) {
+  let (pending, torn) = {
+    let mut bridge = VolumeBridge::new(vid(), vol, store);
+    let pending = bridge.take_pending_dax_revokes();
+    let torn = device.request_revoke_inode(nodeid, &mut bridge, cx);
+    (pending, torn)
+  };
+  assert_eq!(
+    pending,
+    vec![(nodeid, true)],
+    "the shift enqueued this inode writable-only, so a read-only window of it would survive"
+  );
+  assert_eq!(
+    torn, 1,
+    "the device tore down the window that named the row the content left"
+  );
+  assert_eq!(
+    device.dax_window_count(),
+    0,
+    "the stale window is gone, so the guest faults rather than read an unauthorized page"
+  );
+}
+
+/// Phase four: the guest re-faults and its fresh SETUPMAPPING reaches the row the content moved to, with its
+/// bytes — which is the whole point of telling the device, and what makes a periodic shift safe to run.
+#[cfg(unix)]
+fn the_refault_reaches_the_moved_row(
+  device: &mut Device,
+  driver: &mut SimDriver,
+  vol: &mut slates_vfs::volume::Volume,
+  store: &mut slates_vfs::volume::Store,
+  cx: &OpContext,
+  (nodeid, page, fill): (u64, usize, u8),
+  moved: &slates_vfs::dax::Mapping,
+) {
+  let refaulted = dax_map_pass(device, driver, vol, store, cx, (3, nodeid), page);
+  assert_eq!(refaulted, 0, "the re-fault maps again");
+  assert_eq!(
+    device.dax_window_count(),
+    1,
+    "the guest has its window back"
+  );
+  let names_moved_row = store
+    .dax
+    .writable_of_prefix(vol.prefix())
+    .iter()
+    .any(|mapping| mapping.block == moved.block);
+  assert!(
+    names_moved_row,
+    "the window the guest re-mapped names the row the content moved to, not the one it left"
+  );
+  assert_eq!(
+    store.dax_read_raw(moved, 0, 8),
+    vec![fill; 8],
+    "the content survived the shift"
+  );
+}
+
+/// A sandbox-capable DAX store holding one writable-DAX volume with a one-page file of `fill`: the store, the
+/// volume and the file's nodeid, which is all the shift test needs before it touches the device.
+#[cfg(unix)]
+fn dax_sandbox_fixture(
+  page: usize,
+  tag: &str,
+  fill: u8,
+) -> (slates_vfs::volume::Store, slates_vfs::volume::Volume, u64) {
+  let mut store = dax_sandbox_store(page, tag);
+  let mut vol = volume(&mut store);
+  vol.enable_writable_dax();
+  let root = vol.root_inode(&store).unwrap();
+  let no = vol.create_file_no(&mut store, root, "f", 0o644).unwrap();
+  vol.write(&mut store, no, 0, &vec![fill; page]).unwrap();
+  (store, vol, no.0)
+}
+
+/// §4.6 **L2's caller contract, through the real device** (A-9, AC-4.12). The periodic shift is only safe if the
+/// guest's window follows it: a shift that moved the content but left the device's window naming the revoked
+/// mapping would leave a guest reading a page the registry no longer authorizes, with nothing to tell it.
+///
+/// Do: map a file writable through the device (one live guest window), have the daemon shift it (L2), then drain
+/// the pending revokes the way a service pass does and let the guest re-fault. Expect: the shift enqueued exactly
+/// this inode with `writable_only` — so a read-only window of the same inode would survive, which is what makes
+/// this queue the right one; the device tears the one window down; and the re-fault reaches the row the content
+/// moved to with its bytes intact. Skips loudly where the host backs no sandbox for the shift to land in.
+#[cfg(unix)]
+#[test]
+fn a_shift_tells_the_device_so_the_guests_window_follows_the_content() {
+  use slates_mem::{SharedObject, Words};
+  const FILL: u8 = 0x5A;
+  let page = rustix::param::page_size().max(1);
+  let (mut store, mut vol, nodeid) = dax_sandbox_fixture(page, "shift", FILL);
+  let (mut device, mut driver) = device_and_driver();
+  let cache = SharedObject::create(
+    &format!("sl-daxshift-{}", std::process::id()),
+    page * 4,
+    Words::new(),
+  )
+  .unwrap();
+  device.install_dax_window(Some(
+    slates_bridge_virtiofs::dax::DaxCacheRegion::new(cache.as_fd(), (page * 4) as u64).unwrap(),
+  ));
+  let cx = context();
+
+  one_writable_window_is_mapped(
+    &mut device,
+    &mut driver,
+    &mut vol,
+    &mut store,
+    &cx,
+    nodeid,
+    page,
+  );
+  // The daemon shifts it (L2's moving target), as the periodic defence would.
+  let Some((_left, moved)) = dax_shift_or_skip(&mut vol, &mut store) else {
+    return;
+  };
+  the_drain_tears_the_stale_window(&mut device, &mut vol, &mut store, &cx, nodeid);
+  the_refault_reaches_the_moved_row(
+    &mut device,
+    &mut driver,
+    &mut vol,
+    &mut store,
+    &cx,
+    (nodeid, page, FILL),
+    &moved,
+  );
+  drop(cache);
+}
+
+#[cfg(unix)]
+fn dax_sandbox_store(page: usize, tag: &str) -> slates_vfs::volume::Store {
+  use slates_mem::arena::ChunkArena;
+  use slates_mem::region::Region;
+  use slates_mem::{ExclusiveObject, SharedObject, Words};
+  // Derived: one huge page for the sandbox and the rest for the content and the arena's rounding, as
+  // `crates/vfs/tests/common/mod.rs::store_sandboxed` sizes its region and for the same reason — the fixture must
+  // not be what decides the result.
+  const SANDBOX_HUGE_PAGES: usize = 8;
+  const PLAIN_PAGES: usize = 64;
+  let bytes = slates_machine::facts::huge_page_bytes()
+    .and_then(|huge| usize::try_from(huge).ok())
+    .map_or(page * PLAIN_PAGES, |huge| huge * SANDBOX_HUGE_PAGES);
+  let object = SharedObject::create(
+    &format!("sl-dsb-{tag}-{}", std::process::id()),
+    bytes,
+    Words::new(),
+  )
+  .unwrap();
+  let mut arena = ChunkArena::new(page);
+  // SAFETY: this test is the object's only mapper; it declares no words.
+  arena
+    .add_region(Region::shared(
+      unsafe { ExclusiveObject::new(object) },
+      page,
+    ))
+    .unwrap();
+  slates_vfs::volume::Store::new(
+    &slates_vfs::volume::StoreConfig {
+      page,
+      cache_line: 128,
+      max_dirs: 64,
+      max_inodes: 256,
+      max_chunks: 1 << 12,
+      max_dir_blocks: 64,
+      dir_cutover: 16,
+    },
+    arena,
+    0,
+  )
+}
+
 /// One request straight through the device (no differential leg — the DAX reply is the device's, not dispatch's).
 #[cfg(unix)]
 fn dax_exchange(

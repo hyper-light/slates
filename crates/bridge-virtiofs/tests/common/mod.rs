@@ -462,7 +462,6 @@ pub fn dax_shared_store(tag: &str) -> Store {
     0,
   )
 }
-
 /// A 64-byte FUSE_INIT body (major 7, minor 38): the codec reads what it needs.
 pub fn dax_init_body() -> Vec<u8> {
   let mut b = Vec::new();
