@@ -64,9 +64,6 @@ pub const FIRST_REQUEST_QUEUE: u16 = 1;
 /// Format: `include/uapi/linux/fuse.h` `struct fuse_write_in`: fh (8), offset (8), size (4),
 /// write_flags (4), lock_owner (8), flags (4), padding (4) — 40 bytes before the data.
 const WRITE_IN_LEN: u64 = 40;
-/// Format: `fs/fuse/fuse_i.h` `FUSE_DEFAULT_MAX_PAGES_PER_REQ` — the pages one request may span
-/// when the daemon does not set `max_pages` at INIT (slates leaves the kernel default).
-const FUSE_DEFAULT_MAX_PAGES_PER_REQ: u64 = 32;
 /// Format: the largest base page a Linux guest that mounts virtio-fs runs with — 64 KiB (arm64
 /// `CONFIG_ARM64_64K_PAGES`, ppc64 `CONFIG_PPC_64K_PAGES`); x86-64 guests use 4 KiB. The cap must
 /// hold for any guest, so it takes the largest.
@@ -163,18 +160,25 @@ pub fn readable_cap() -> Derived<u64> {
   )
 }
 
-/// The writable-bytes cap of one request: the FUSE out-header and the largest READ reply a guest
-/// kernel asks for when the daemon leaves `max_pages` at its default — the default page count times
-/// the largest guest base page.
+/// The writable-bytes cap of one request: the FUSE out-header and the largest READ reply a guest kernel asks
+/// for — the `max_pages` **this daemon negotiates** times the largest guest base page.
+///
+/// It must follow the negotiation, not the kernel's default. Until 2026-10-19 slates left `max_pages` alone and
+/// this cap was the default 32 pages; now it offers `MAX_WRITE / page_size` (64 on a 4 KiB host), and a guest
+/// with 64 KiB base pages could ask for 64 × 64 KiB where the old cap allowed 32 × 64 KiB — the device would
+/// have faulted the queue on a request its own INIT had invited. The guest's page size is not the daemon's,
+/// which is why the largest guest page multiplies here while the daemon's own page size sets the count.
 pub fn writable_cap() -> Derived<u64> {
   derived!(
     u64::try_from(OUT_HEADER_LEN)
       .unwrap_or(u64::MAX)
-      .saturating_add(FUSE_DEFAULT_MAX_PAGES_PER_REQ.saturating_mul(LARGEST_GUEST_PAGE)),
-    "fuse_out_header + FUSE_DEFAULT_MAX_PAGES_PER_REQ × the largest guest base page (the largest READ reply a guest kernel asks for at the default max_pages)",
+      .saturating_add(
+        u64::from(slates_bridge_fuse::init::max_pages()).saturating_mul(LARGEST_GUEST_PAGE)
+      ),
+    "fuse_out_header + the negotiated max_pages × the largest guest base page (the largest READ reply a guest kernel asks for)",
     [
       "fuse.out_header_len",
-      "fuse.default_max_pages_per_req",
+      "fuse.negotiated_max_pages",
       "guest.largest_base_page"
     ]
   )

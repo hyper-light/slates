@@ -29,7 +29,7 @@ const KERNEL_MAX_PAGES: u32 = 256;
 /// page size is read at run time rather than assumed: a 4 KiB-page host wants 64 here and a 16 KiB-page
 /// arm64 host wants 16, and hard-coding either would silently halve or quadruple the request size on the
 /// other.
-fn max_pages() -> u16 {
+pub fn max_pages() -> u16 {
   let page = u32::try_from(rustix::param::page_size())
     .unwrap_or(4096)
     .max(1);
