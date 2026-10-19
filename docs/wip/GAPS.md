@@ -7298,6 +7298,13 @@ its case count, found by grepping the *config* rather than the count
 So every property suite in the tree now deepens on demand. The one literal left is `test-seeds`' own `cases: 4`
 fixture, which tests the seed machinery and must not grow with a sweep.
 
+**It cuts the other way too, which is the more useful half for Miri.** A proptest is the worst possible shape
+for an interpreter — the DAX suite's chaos schedule could not finish a *single* generated case in 45 minutes of
+Miri, twice, which is why that run skips it by name. Now that the count is a variable, a Miri run can *shrink*
+it instead of skipping: `PROPTEST_CASES=16 cargo +nightly miri test -p slates-mem` keeps the property covered
+under the interpreter at a hundredth of the cases, where before the only options were the committed default or
+`--skip`. Skipping a test reports no coverage of it; shrinking reports a little, honestly.
+
 **And the deep sweeps the fix made possible, all green** (release, macOS aarch64, host load 20–31):
 
 | schedule | default | deepened | result |
