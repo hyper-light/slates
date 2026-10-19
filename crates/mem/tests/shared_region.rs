@@ -214,30 +214,13 @@ fn a_shared_objects_mapping_is_backed_by_huge_pages_so_a_shift_moves_physical_ro
   // SAFETY: this test is the object's only accessor, which is what `ExclusiveObject` promises.
   let mut region = Region::shared(unsafe { ExclusiveObject::new(object) }, PAGE);
   region.bytes_mut().fill(0x7A);
-  let base = region.base() as usize;
 
-  let smaps = std::fs::read_to_string("/proc/self/smaps").unwrap();
-  let mut in_mapping = false;
-  let mut pmd_kb = 0u64;
-  for line in smaps.lines() {
-    if let Some((start, _)) = line.split_once('-')
-      && let Ok(addr) = usize::from_str_radix(start, 16)
-    {
-      in_mapping = addr == base;
-    }
-    if in_mapping && let Some(rest) = line.strip_prefix("ShmemPmdMapped:") {
-      pmd_kb = rest
-        .trim()
-        .trim_end_matches(" kB")
-        .trim()
-        .parse()
-        .unwrap_or(0);
-      break;
-    }
-  }
+  // Asked of the kernel, not of `madvise`'s return: the advice succeeds on mappings that get nothing.
+  let backed = region
+    .huge_backed_bytes()
+    .expect("Linux answers how much of a mapping is huge-page backed");
   assert!(
-    pmd_kb > 0,
-    "the shared object's mapping is huge-page backed: ShmemPmdMapped is {pmd_kb} kB of {} kB",
-    span / 1024
+    backed > 0,
+    "the shared object's mapping is huge-page backed: {backed} bytes of {span}"
   );
 }

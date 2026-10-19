@@ -174,6 +174,18 @@ impl Region {
     self.locked
   }
 
+  /// How many of this region's bytes the kernel has **actually** backed with huge pages, or `None` where the
+  /// question cannot be asked (off Linux).
+  ///
+  /// Not the same question as "was the advice accepted", which is why no `bool` is kept from `madvise`: on
+  /// Linux 7.2 a 64 KiB and a 1 MiB mapping both take `MADV_HUGEPAGE` with `OK` and receive none. §4.6's
+  /// moving target only moves physical rows where the backing is huge, so the gate that grants a writable DAX
+  /// window asks this. A cold path — it walks the process's mappings — so ask once and keep the answer.
+  #[must_use]
+  pub fn huge_backed_bytes(&self) -> Option<u64> {
+    slates_machine::facts::huge_backed_bytes(self.base() as usize)
+  }
+
   /// The NUMA node the region was recorded on.
   pub const fn numa_node(&self) -> u16 {
     self.numa_node

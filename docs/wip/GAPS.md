@@ -8148,3 +8148,31 @@ kernel's to grant and not slates' to assert.
 What remains of L1 on top of this foundation: per-tenant zones with guard rows between them, placement wired
 to `stripe_target`, and the verify-and-refuse path in `bridge-virtiofs` so a zone that did *not* get its huge
 pages refuses writable DAX rather than pretending.
+
+### 2026-10-19 (later): the huge-backing measurement, and an L1 gate tried at the wrong level and backed out
+
+With the arena's object now advised for huge pages, the next question is how anything *knows* it worked.
+`madvise` returning `Ok` does not say, so `slates-machine::facts::huge_backed_bytes(base)` reads
+`/proc/self/smaps` and sums the mapping's `AnonHugePages`, `ShmemPmdMapped` and `FilePmdMapped` — the three
+ways the kernel reports PMD-level backing — and `Region::huge_backed_bytes()` asks it for a region. It lives
+in `machine` because that crate already reads `/sys` and `/proc` as "a query of the kernel, never a disk read;
+R1's allowed site"; `mem` calls it without naming `std::fs` itself. Red-checked: remove the advice and the
+proof fails with **`0 bytes of 16777216`**.
+
+**And an attempt that was wrong, recorded because the next person will reach for it too.** I wired L1's gate
+into `Volume::dax_map_write` beside L0's opt-in: refuse a writable window when the arena reports no huge-page
+backing. It is the right idea at the wrong level, and the suite said so within a minute — on a host without
+shmem THP every writable-DAX test refused with the new error. The flaw is not the host:
+
+- **A small arena legitimately has no huge pages.** Test arenas are a few MB; below one huge page the advice
+  is a no-op *on a perfectly capable host*. The gate could not tell "this host cannot give huge pages" from
+  "this arena is too small to have been given any", and would have refused honest small volumes.
+- **The property belongs to a zone, not to the arena.** L1 defines a *per-tenant, pre-reserved* zone, which is
+  ≥ one huge page by construction and faulted when it is made — so its coverage is a deterministic question.
+  The arena as a whole is neither.
+
+So the gate, its `VfsError::NoPhysicalIsolation` variant and its errno mapping were all backed out, and the
+arena-level accessor with them — it had no caller once the gate was gone, and an accessor kept for a future
+caller is the thing CLAUDE.md #7 forbids and that `Region::huge()` was just deleted for. What stays is the
+advice (so the backing *is* contiguous) and the measurement (so a zone can check). **The gate lands with the
+zones, where the question it asks has a defined answer.**

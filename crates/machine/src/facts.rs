@@ -702,6 +702,63 @@ mod platform {
   }
 }
 
+/// How many bytes of the mapping that begins at `base` the kernel has actually backed with huge pages.
+///
+/// `madvise(MADV_HUGEPAGE)` returning `Ok` is **not** an answer to this, which is the trap it exists to avoid:
+/// measured on Linux 7.2, a 64 KiB and a 1 MiB mapping both take the advice with `OK` and receive **zero**
+/// huge pages, while an 8 MiB one comes back fully backed. §4.6's moving target is only real where the backing
+/// is physically contiguous — a stride inside a 4 KiB-paged region moves no physical rows — so the question is
+/// put to the kernel rather than to the advice.
+///
+/// Sums the mapping's `AnonHugePages` (a private mapping), `ShmemPmdMapped` (a memory object's) and
+/// `FilePmdMapped` (a file's), which are the three ways `smaps` reports PMD-level backing.
+///
+/// `None` where the question cannot be asked: off Linux, or when no mapping starts exactly at `base`. A cold
+/// path — `smaps` costs a walk of the whole address space — so ask once and keep the answer.
+#[cfg(target_os = "linux")]
+#[must_use]
+pub fn huge_backed_bytes(base: usize) -> Option<u64> {
+  /// Format: the fields `smaps` reports PMD-level backing under, each in kB.
+  const PMD_FIELDS: [&str; 3] = ["AnonHugePages:", "ShmemPmdMapped:", "FilePmdMapped:"];
+  /// Format: `smaps` reports every size in kibibytes, so its numbers are scaled by this to bytes.
+  const BYTES_PER_KIB: u64 = 1024;
+  /// Format: `smaps` writes a mapping's start and end addresses in hexadecimal.
+  const ADDRESS_RADIX: u32 = 16;
+  let smaps = std::fs::read_to_string("/proc/self/smaps").ok()?;
+  let mut in_mapping = false;
+  let mut found = false;
+  let mut kilobytes = 0u64;
+  for line in smaps.lines() {
+    // A mapping's header is `start-end perms ...`; its fields follow until the next header.
+    if let Some((start, rest)) = line.split_once('-')
+      && rest.starts_with(|c: char| c.is_ascii_hexdigit())
+      && let Ok(addr) = usize::from_str_radix(start, ADDRESS_RADIX)
+    {
+      if in_mapping {
+        break;
+      }
+      in_mapping = addr == base;
+      found |= in_mapping;
+      continue;
+    }
+    if in_mapping
+      && let Some(field) = PMD_FIELDS.iter().find_map(|f| line.strip_prefix(f))
+      && let Ok(value) = field.trim().trim_end_matches(" kB").trim().parse::<u64>()
+    {
+      kilobytes = kilobytes.saturating_add(value);
+    }
+  }
+  found.then(|| kilobytes.saturating_mul(BYTES_PER_KIB))
+}
+
+/// The paired arm: no `smaps` to ask, so the question has no answer rather than a false one (macOS offers user
+/// programs no superpages, Appendix C; Windows large pages need a privilege slates never requires, R10).
+#[cfg(not(target_os = "linux"))]
+#[must_use]
+pub fn huge_backed_bytes(_base: usize) -> Option<u64> {
+  None
+}
+
 #[cfg(target_os = "linux")]
 mod platform {
   use super::{
