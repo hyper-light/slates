@@ -5153,6 +5153,25 @@ A timing A/B was attempted first and is **not** reported as evidence: the host's
 (tmpfs itself fell 14,776 → 7,691 MiB/s), so the two runs were not comparable. The count is immune to that,
 which is why it is the measurement here.
 
+**The read side does not move, and the reason is measured.** The same count over a 256 MiB read-back is 4,100
+daemon reads whatever the caller's buffer — 128 KiB per READ request, unchanged by `max_pages`:
+
+| read buffer | daemon `read()` calls | request size |
+|---|---|---|
+| 128 KiB | 4,101 | 128 KiB |
+| 256 KiB | 4,100 | 128 KiB |
+| 1,024 KiB | 4,100 | 128 KiB |
+
+Reads are driven by the kernel's **readahead window**, not by the caller's buffer or by `max_pages`, and the
+mount's window was read directly rather than inferred: `/sys/class/bdi/0:424/read_ahead_kb` is **128** for the
+slates mount (and for every other FUSE bdi in that kernel). slates advertises `max_readahead` = 256 KiB at INIT
+and the window is still 128 kB, so a read never exceeds it.
+
+Raising it is a **deployment** knob, not a negotiation: `read_ahead_kb` is a root-owned sysfs file, and R10
+says slates requires no privilege, so the daemon cannot set it for its own mount. It belongs with L1's hugetlb
+zones on the list of things a host can do for slates rather than things slates does. Worth stating because the
+write fix above might otherwise be assumed to help reads; it does not, and the ceiling is someone else's.
+
 ### Condition 12 re-measured (2026-10-19): the table below is stale by ~10×, and the round trip is the cost
 
 **Withdrawing three of my own amendments from 2026-10-18.** They reasoned from the 276.9 µs create in the
