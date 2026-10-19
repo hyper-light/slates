@@ -77,12 +77,38 @@ The fix is architectural and is Ada's call. The options, with what each costs:
    but it makes the crosvm/QEMU route — the one chosen on 2026-10-16 — unavailable for multi-tenant
    hosts, which is most of the point of it.
 
-Option 1 is the only one that keeps both zero-copy and confinement; it is also the largest change, and
-it touches a decided layout (A-64), so it is not a change to make unilaterally.
+4. **A per-mapping `udmabuf` over the arena memfd's authorized range** — *found 2026-10-19, and missing from
+   the three above.* `UDMABUF_CREATE` takes `{memfd, offset, size}` and returns a **new descriptor covering
+   only that range**, without copying: it pins the memfd's existing pages rather than duplicating them. The
+   descriptor is confined by construction, zero-copy survives, and **A-64 is untouched** — the arena stays one
+   image per shard and only the fd handed to the front end changes.
+
+   Measured on Fedora 6.19 (`CONFIG_UDMABUF=y`) as **uid 1000, no `CAP_SYS_ADMIN`, not in `kvm`**: a udmabuf
+   made at offset 64 KiB for 128 KiB of a 1 MiB memfd maps exactly that window (byte 0 is the marker written
+   inside it), and mapping the whole arena's length through the same fd is **refused**. That is the property
+   options 1-3 were competing for.
+
+   Its costs, and what is unproven:
+   - **64 MB per buffer** by default (`/sys/module/udmabuf/parameters/size_limit_mb`), an admin tunable; a
+     larger window needs the host raised or the mapping split.
+   - **Access is deployment-dependent.** `/dev/udmabuf` is `root:kvm 0660` here, reached through an explicit
+     ACL (`user:adalundhe:rw-`), not group membership. A daemon that cannot open it must **refuse DAX** rather
+     than fall back to the wide descriptor. It is not a privilege slates *requires* (R10) — it is the same
+     device a VMM already uses, and DAX only matters where one is running — but DAX availability would follow
+     host configuration.
+   - **It pins pages** for the mapping's life, unswappable and unmovable, which interacts with L2's moving
+     target (§4.6) and has to be weighed against it.
+   - **Unproven with a real front end.** crosvm's `SHMEM_MAP` mmaps the fd it is handed and a udmabuf fd is
+     mmap-able, so it should work — but it has not been run, and it is the first thing to run.
+
+Of the four, **1 and 4 keep both zero-copy and confinement**; 4 is much the smaller change and the only one
+that leaves A-64 alone, which was the whole reason 1 was hard. Neither is a change to make unilaterally — 4
+still has an untested VMM leg and a pinning cost — but the choice is no longer "reverse A-64, or give
+something up".
 
 ## Owed
 
-- Ada's call between the three options, **before** the advertisement gate at
+- Ada's call between the **four** options, **before** the advertisement gate at
   `admission.rs`'s `DaxNotEstablished` is flipped.
 - No test is committed asserting the current behaviour: a test that pins a weakness in place is worse
   than the record of it. When the option is chosen, the test to write is the inverse of the
