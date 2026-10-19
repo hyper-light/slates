@@ -7884,7 +7884,7 @@ device is not a privilege under R10, being the one the VMM already uses, but it 
 
 Verified: workspace clippy clean on x86_64 Linux 6.19 and on macOS; `xtask check` clean (structural, literals,
 unsafe, version, capabilities); the virtio-fs suites, `vfs dax`, `mem`, `fuse_mount` and `cli` all green on
-Linux. **Owed: the live crosvm leg** — every primitive its `SHMEM_MAP` uses is proven on a udmabuf, but the
+Linux. **The live crosvm leg is taken (2026-10-19): a real guest mapped a confined window and got its bytes** — every primitive its `SHMEM_MAP` uses is proven on a udmabuf, but the
 real front end has not been run against it.
 
 ### 2026-10-19: DAX gate row 3's decision dissolves — there is no tear to accept, and rows 2 and 3 share one open anchor
@@ -7968,3 +7968,31 @@ That is the whole of what is missing. The protocol gap is closed, the confinemen
 host can create udmabufs unprivileged, and the initramfs from the last run is still at
 `~/crosvm-ab/initramfs.cpio.gz` waiting to be extended. It is a bounded piece of guest-side work on a shared
 box that is running someone else's CI, which is why it is written down here rather than started.
+
+### 2026-10-19: the live crosvm leg passes, with the confinement in force — row 1 is fully closed
+
+The last thing owed on gate row 1 was the end-to-end proof against a real VMM. It is taken, and the blocker I
+twice described was my own search being too shallow: `find / -maxdepth 3 -name "vmlinu*"` missed
+`/usr/lib/modules/$(uname -r)/vmlinuz`, which is exactly where `adacachy` keeps the image for the kernel it is
+running — and that kernel has `FUSE_FS`, `VIRTIO_FS`, `FUSE_DAX`, `DAX` and `VIRTIO_PCI` **all `=y`**. No
+kernel build, no modules to carry into the initramfs, no cross-host copy: everything the harness asks for was
+already on the host.
+
+A real crosvm guest, booted against the backend at HEAD:
+
+```
+GUEST-BOOTED / GUEST-DAX-MODE / GUEST-MOUNTED / GUEST-WROTE
+GUEST-PASS1 sum=4278190080 / GUEST-PASS2 sum=4278190080
+GUEST-MMAP-OK / SLATES-GUEST-OK          crosvm exit=0
+```
+
+and the backend's own side: `HARNESS-ACCEPTED`, `HARNESS-DAX on (cache region 8388608 bytes)`,
+`HARNESS-ATTACHED`, `HARNESS-ADMITTED`, then
+`HARNESS-ENDED … DoorbellHungUp … references_swept: true, sweep_refused: None, credits_restored: (20, 4456544),
+requests_in_flight_at_revoke: 0` — the device ended clean, nothing leaked.
+
+**`GUEST-MMAP-OK` is the whole point**: the guest's read came from the DAX window slates mapped
+(`FUSE_SETUPMAPPING` → `VHOST_USER_BACKEND_SHMEM_MAP`), not from `FUSE_READ`. And it ran **with A-138's
+confinement in force**, so the descriptor the front end mapped was a `udmabuf` covering only the authorized
+window. Confinement and the binding hold together against a real VMM, which the in-tree stand-in could not
+show. Recorded run: `adacachy`, bare-metal x86_64 KVM, kernel 7.2.9-cachyos, crosvm from source, 2026-10-19.

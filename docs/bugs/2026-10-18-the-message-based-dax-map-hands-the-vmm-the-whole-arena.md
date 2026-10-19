@@ -182,5 +182,13 @@ something up".
   descriptor the front end was sent, reads the file's bytes through it, and asserts that **one byte past the
   window is not mappable**. It needs `/dev/udmabuf`, so it skips loudly where there is none (Docker's linuxkit
   VM has no such device; a Fedora host does).
-- **Still owed:** the live crosvm leg. Every primitive its `SHMEM_MAP` uses is proven on a udmabuf, but the
-  real front end has not been run against it (`crates/client/examples/crosvm_dax_ab/`).
+- ~~Still owed: the live crosvm leg~~ — **taken 2026-10-19, and it passes.** A real crosvm guest on
+  `adacachy` (kernel 7.2.9-cachyos, which has `FUSE_FS`, `VIRTIO_FS`, `FUSE_DAX`, `DAX` and `VIRTIO_PCI` all
+  `=y`, and ships its own image at `/usr/lib/modules/$(uname -r)/vmlinuz`) mounted a slates volume over
+  vhost-user virtio-fs with `dax=always`, wrote a 32 KiB file and read it back **through an `mmap`** —
+  `GUEST-BOOTED`, `GUEST-DAX-MODE`, `GUEST-MOUNTED`, `GUEST-WROTE`, **`GUEST-MMAP-OK`**, `SLATES-GUEST-OK`,
+  crosvm exit 0. The backend's own trace: accepted, `HARNESS-DAX on (cache region 8388608 bytes)`, attached,
+  admitted, then `HARNESS-ENDED … DoorbellHungUp … references_swept: true, credits_restored` — a clean
+  teardown. **This ran with the confinement in force**, so what the front end mapped was a udmabuf covering
+  only the window, and the guest still got its bytes: confinement and the binding hold together against a
+  real VMM, not just the stand-in.
