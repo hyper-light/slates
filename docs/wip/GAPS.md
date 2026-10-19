@@ -7641,3 +7641,56 @@ docker run --rm --platform linux/arm64 --device /dev/fuse --cap-add SYS_ADMIN \
   --security-opt apparmor=unconfined -e SLATES_TEST_CLI=1 ... rust:1.98.1 \
   bash -c 'apt-get -qq install -y fuse3 && cargo test -p slates-bridge-fuse --test coherence_mount'
 ```
+
+### 2026-10-19: `cargo miri test -p slates-mem` can finish now — it never could, and the reason was five fixed counts
+
+**The standing rule could not be obeyed.** "Run Miri on changed `rt`/`mem` tests before pushing" was recorded
+as owed on 2026-10-19 after a 45-minute run was killed at its bound with no result. Re-run with an hour it
+still did not finish, and the reason turned out to be specific rather than general: **the crate's Miri run
+spends its whole budget on five tests**, and the modules that changed today sort after them. The first run
+produced no coverage at all of what it was run for — it was still inside `mpsc` when it was killed, and
+`ranges` and `region` sort after it. Only a second run, with that one test skipped by name, reached them
+(both green), and that run did not finish the crate either.
+
+| test | what it does natively | interpreted |
+|---|---|---|
+| `ring::one_producer_and_one_consumer_thread_see_every_word_in_order` | 100,000 words, two threads spinning on a full ring | never finished |
+| `mpsc::four_producer_threads_lose_nothing_and_keep_each_producers_order` | 80,000 pushes, four threads spinning | still running at 27 min |
+| `arena::block_len_is_the_block_alloc_takes` | every length to four granules — 65,536 allocate/free round trips on a 16 KiB page | ~8 min |
+| `words::touches_equals_the_byte_model_on_every_range` | 656 offsets x 72 lengths against a byte-by-byte model | ~21 min |
+| `buddy::random_sequences_never_overlap_and_always_coalesce_back` | 20,000 random allocate/free steps | minutes |
+
+None of them is a `proptest!`, so the `PROPTEST_CASES` knob added earlier today does not reach them — they are
+hand-written loops with counts written into the source. That is the gap: `cargo xtask check` refuses a
+property suite that bypasses `slates-test-seeds`, and nothing at all governs a hand-rolled randomized or
+exhaustive loop.
+
+**Shrunk under `cfg!(miri)`, not skipped.** Each now picks a smaller count only when interpreted, with the
+reason at the site: 500 words through a 64-slot ring (about eight wraps, both threads live), 200 per producer,
+a stride of 61 over the lengths (the page is a power of two and 61 is odd, so every residue class the rounding
+can distinguish is still visited), a stride of 7 over the offsets (coprime with both the 8-byte word and the
+64-byte run stride), and 400 random steps across all ten orders. **Natively every one of them still runs its
+full count** — `cargo test -p slates-mem --lib` is 94 passed, 0 failed, **0 ignored**, 1.35 s, unchanged. This
+follows the crate's own practice rather than inventing one: `region.rs`, `prefault.rs` and `lock.rs` already
+branch on `cfg!(miri)`, and the alternative — `#[cfg_attr(miri, ignore)]` — reports no coverage at all, which
+this ledger has already argued against.
+
+**Seven tests gated instead, because Miri cannot run them at all on macOS**, each with the reason its sibling
+in `region.rs` already states: `mlock` (the arena's locking test), `shm_open`/`shm_unlink` (all five
+shared-object tests) and `sysctlbyname` (the zero-allocation test, which reads the machine's page size). These
+are interpreter limits, not choices — there is nothing to shrink.
+
+**Result: `cargo +nightly miri test -p slates-mem` exits 0.** Not a binary at a time — the whole crate, end to
+end, in one command: lib **84 passed, 0 failed, 10 ignored (914 s)**, then `capacity` 1/1, `extent_ownership`
+2, `lock_on_fault` 1, `no_alloc` 1/1, `race_canary` 0/1, `shared_region` 0/5 and the doc tests 4, with no
+unsupported operation and no undefined behaviour anywhere. Before this, two runs of an hour each reached 92 of
+94 and were killed at their bound. The standing rule is obeyable again, and the two modules that changed today
+are covered by it: `ranges::a_whole_bit_set_splits_across_words` and
+`region::a_region_maps_rounds_to_pages_touches_and_unmaps` both pass interpreted.
+
+**What is still owed here.** Ten of the crate's tests are `ignored` under Miri. Seven are the interpreter's
+own limits above; the other three were already gated before today (two measurement tests and the deliberate
+data race `race_canary` keeps for the TSan lane). And the gap that let this happen is open: nothing in
+`cargo xtask check` governs the iteration count of a hand-rolled randomized or exhaustive loop the way it
+governs a `proptest!` suite's cases, so the next one written will cost the next Miri run its budget with
+nothing to catch it.

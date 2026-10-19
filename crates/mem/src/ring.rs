@@ -222,7 +222,11 @@ mod tests {
   #[test]
   fn one_producer_and_one_consumer_thread_see_every_word_in_order() {
     let ring = SpscRing::new(64).unwrap();
-    let total = 100_000u64;
+    // A hundred thousand words across two threads that spin when the ring is full is the costliest test in the
+    // crate under Miri, where every spin is interpreted and the scheduler explores the interleaving. Five
+    // hundred still wraps the 64-slot ring about eight times with both threads live, which is the memory
+    // ordering Miri is here to check; the full hundred thousand runs natively.
+    let total: u64 = if cfg!(miri) { 500 } else { 100_000 };
     std::thread::scope(|s| {
       let (p, c) = ring.split().unwrap();
       s.spawn(move || {

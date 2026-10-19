@@ -1554,7 +1554,12 @@ mod tests {
   fn block_len_is_the_block_alloc_takes() {
     let p = page();
     let mut arena = two_regions(p);
-    for len in 1..=p * 4 {
+    // Every length to four granules is 65,536 allocate-and-free round trips on a 16 KiB page, which is minutes
+    // interpreted. Miri is here for undefined behaviour, not for the rounding -- native runs still walk every
+    // length -- so it strides. The page is a power of two and 61 is odd, so an interpreted sweep still lands on
+    // every residue class the rounding can distinguish.
+    let step = if cfg!(miri) { 61 } else { 1 };
+    for len in (1..=p * 4).step_by(step) {
       let extent = arena.alloc(len).unwrap();
       assert_eq!(Some(extent.len()), arena.block_len(len), "len {len}");
       arena.free(extent).unwrap();

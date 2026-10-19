@@ -474,7 +474,14 @@ mod tests {
       WordRun::strided(128, 64, 8, Width::U64),
     ];
     let words = ring().layout(RING_LEN).unwrap();
-    for offset in 0..(128 + 8 * 64 + 16) {
+    // Under Miri this one sweep costs more than the rest of the crate put together: 656 offsets x 72 lengths,
+    // each against a byte-by-byte model, ran for nineteen minutes interpreted and the crate's whole budget was
+    // gone before the later modules were reached. Miri is here for undefined behaviour, not for the
+    // arithmetic -- which this same test checks exhaustively on every native run -- so interpreted runs stride
+    // the offsets by seven. Seven is coprime with both the 8-byte word and the 64-byte run stride, so every
+    // alignment class is still visited; what is lost is repetition, not a case.
+    let stride = if cfg!(miri) { 7 } else { 1 };
+    for offset in (0..(128 + 8 * 64 + 16)).step_by(stride) {
       for len in 0..72 {
         assert_eq!(
           words.touches(offset, len),

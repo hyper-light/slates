@@ -40,6 +40,7 @@ unsafe impl GlobalAlloc for Counting {
 static GLOBAL: Counting = Counting;
 
 #[test]
+#[cfg_attr(miri, ignore)] // reads the machine's page size through `sysctlbyname`, which Miri does not model
 fn the_hot_path_makes_zero_system_allocations() {
   let page = usize::try_from(slates_machine::facts::Facts::query().page.base).unwrap();
   let mut slab: Slab<[u8; 64]> = Slab::new(256, 1024);

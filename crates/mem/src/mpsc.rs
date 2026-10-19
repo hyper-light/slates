@@ -266,7 +266,12 @@ mod tests {
   #[test]
   fn four_producer_threads_lose_nothing_and_keep_each_producers_order() {
     let ring = MpscRing::new(64).unwrap();
-    let per_producer = 20_000u64;
+    // Under Miri 80,000 pushes across four threads, every one of them spinning when the ring is full, does not
+    // finish in any budget this crate has been given -- it is the single test that stops
+    // `cargo +nightly miri test -p slates-mem` from completing, and it was still running after 27 minutes.
+    // Miri is here for the memory model, and a ring that wraps many times under real contention exercises that
+    // just as well as one that wraps a thousand: 200 each still wraps the 64-slot ring about twelve times.
+    let per_producer: u64 = if cfg!(miri) { 200 } else { 20_000 };
     let producers = 4u64;
     std::thread::scope(|s| {
       for p in 0..producers {

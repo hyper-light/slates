@@ -1359,7 +1359,11 @@ mod tests {
     let mut b = Buddy::new(granule, 10).unwrap(); // 1024 granules
     let mut rng = Xorshift::new(Xorshift::SEED);
     let mut live: Vec<Block> = Vec::new();
-    for _ in 0..20_000 {
+    // Interpreted, twenty thousand random steps is several minutes of the crate's Miri budget. Four hundred
+    // still allocates, frees and coalesces across all ten orders of a 1,024-granule allocator, which is the
+    // shape Miri is reading; the full sequence runs on every native pass.
+    let steps = if cfg!(miri) { 400 } else { 20_000 };
+    for _ in 0..steps {
       if live.is_empty() || rng.below(3) != 0 {
         let len = (rng.below(20) + 1) * granule * (1 << rng.below(4));
         allocate_step(&mut b, &mut live, len);

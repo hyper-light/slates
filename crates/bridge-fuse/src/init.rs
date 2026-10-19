@@ -14,7 +14,7 @@ use slates_bridge_core::CacheCoherence;
 /// Shape: one arena chunk (256 KiB at a 4 KiB page, the FUSE big-write convention and the ramp's
 /// ceiling); the kernel is told this at INIT and never sends a larger write.
 pub const MAX_WRITE: u32 = 256 * 1024;
-/// Shape: the read-ahead ceiling the daemon offers, matched to `MAX_WRITE`.
+/// The read-ahead ceiling the daemon offers.
 ///
 /// It is a **ceiling, not a request**: the reply carries `min(kernel's max_readahead, this)`, and the kernel
 /// then sets the mount's window to `min(its own default, what we sent)`. Raising this number therefore buys
@@ -22,10 +22,17 @@ pub const MAX_WRITE: u32 = 256 * 1024;
 /// every READ request was 128 KiB whatever the caller's buffer. The 128 kB default lives in
 /// `/sys/class/bdi/<maj:min>/read_ahead_kb`, which is root-owned, so lifting it is a host's doing and not the
 /// daemon's (R10). Do not reach for this constant to make reads larger; it cannot.
+///
+/// Shape: one arena chunk, the same ceiling as [`MAX_WRITE`].
 const MAX_READAHEAD: u32 = 256 * 1024;
 /// Format: the kernel's own ceiling on `max_pages` (`FUSE_MAX_MAX_PAGES`, `fs/fuse/fuse_i.h`); it clamps
 /// anything larger, so asking past it would be asking for a number the kernel will not use.
 const KERNEL_MAX_PAGES: u32 = 256;
+/// Shape: the page size assumed only when the host cannot be asked for its own — the smallest page any
+/// platform slates builds for uses, so a failed query yields more and smaller requests rather than a request
+/// larger than a page count the kernel would accept. `page_size()` returning something past `u32` is the only
+/// way to reach it, which no supported host does.
+const ASSUMED_PAGE_BYTES: u32 = 4096;
 
 /// Derived: how many pages the largest write slates accepts occupies on *this* kernel's page size —
 /// `MAX_WRITE / page_size`, bounded by the kernel's own [`KERNEL_MAX_PAGES`]. Sent as `max_pages` when the
@@ -38,7 +45,7 @@ const KERNEL_MAX_PAGES: u32 = 256;
 /// other.
 pub fn max_pages() -> u16 {
   let page = u32::try_from(rustix::param::page_size())
-    .unwrap_or(4096)
+    .unwrap_or(ASSUMED_PAGE_BYTES)
     .max(1);
   let pages = MAX_WRITE.div_ceil(page).clamp(1, KERNEL_MAX_PAGES);
   u16::try_from(pages).unwrap_or(u16::MAX)

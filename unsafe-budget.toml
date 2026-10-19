@@ -20,6 +20,12 @@
 #   Corrected 49 → 50 on 2026-10-01 (AUD-29-31), no new site: the shared-memory map of the profile segment's
 #   macOS/Linux object (`segment.rs` platform module, `MmapOptions::map_mut`) had gone uncounted, because the
 #   scanner took that production module for a test module after a `#[cfg(test)] fn` above it.
+#   Raised 50 → 51 on 2026-10-19 for `bench::involuntary_switches` (`bench.rs`): one `libc::getrusage`
+#   with `RUSAGE_SELF` into a zeroed, fully sized `rusage` this crate owns. It reads `ru_nivcsw`, so a probe
+#   that overran its bound can say whether the scheduler took the thread away instead of reporting the
+#   overrun as the machine's cost — the busy-machine discriminator a timing gate needs. rustix 1.1.4 has no
+#   `getrusage` and no `Rusage` of any kind, so there is no safe wrapper to reach for; the non-Unix arm is a
+#   paired `#[cfg(not(unix))]` returning `None` rather than a zero, and holds no `unsafe`.
 # slates-mem (22): the Windows working-set raise and VirtualLock/VirtualUnlock (memmap2 covers
 #   Unix) (4); the shared memory object of §4.7 (`shared.rs`, added 2026-09-05 for Phase 2):
 #   the file-backed map of a memory object (1), the descriptor a child inherits (1), the one
@@ -176,7 +182,7 @@
 #   by BLAKE3.
 
 [budget]
-slates-machine = 50
+slates-machine = 51
 #   Raised 19 → 22 on 2026-09-30 for AUD-29-09 (a shared object hands out no reference to its bytes):
 #   the two plain copies across the mapping's raw pointer (`copy_out`, `copy_in`), the two racy copies
 #   through `AtomicU8` for seqlock payloads (`racy_out`, `racy_in`), and `ExclusiveObject::new`, the one
