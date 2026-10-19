@@ -7284,6 +7284,16 @@ bound, and the discarded `let _ =` on it was a red herring), and that a budget o
 unbounded retry (it is the documented CPU-budget extension, bounded by the shard's own progress). Neither would have
 been caught by reading the code more carefully; both died to one `eprintln!` of the actual numbers.
 
+**And a twelfth site, found by the next workspace run, missed for a reason worth naming.** The enumeration that
+collapsed the eleven copies grepped for `MachineProfile::measure` *next to* a `ProfileOptions { .. }` literal.
+`crates/mem/src/region.rs`'s huge-page test builds its options into a variable first and calls `measure(options)`,
+so the grep did not see it, and `the_huge_page_decision_follows_the_measured_fault_costs` failed on the next full
+run for a refused wake probe. The sweep rule is not "grep the pattern" but **"grep the call, then read every hit"**:
+`MachineProfile::measure(` with no second term finds five sites in the tree, of which two are deliberate (the
+`profile` example demonstrating the raw call, and the `Duration::ZERO` test that asserts the refusal), one is
+`measure_within`'s own body, one is the full profile already at the wall ceiling, and one was this bug. A pattern
+written with its argument in the grep matches the style a site happens to be written in, not the call it makes.
+
 **And the duplication rule again.** `involuntary_switches` — discriminator 2 — had been copied by hand into three
 files. Rather than make the wedge test a fourth copy it now lives once, in `slates_machine::bench`, and the three
 call it. The eleven-copy escalation ladder below is the same lesson at larger scale: **a policy written out N times

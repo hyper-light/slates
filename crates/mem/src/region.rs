@@ -701,8 +701,10 @@ mod tests {
       codecs: false,
       core_matrix: false,
     };
-    let mut profile =
-      slates_machine::MachineProfile::measure(options).expect("the machine profile measures");
+    // Patiently: the test is about the huge-page decision, not about whether this machine could run a wake probe
+    // inside twenty milliseconds. It failed as the latter in a full `cargo test --workspace` on 2026-10-18.
+    let mut profile = slates_machine::MachineProfile::measure_patiently(&options)
+      .expect("the machine profile measures");
     profile.faults.base_ns = 1000;
     profile.faults.huge_ns = Some(100);
     assert!(huge_pages_beneficial(&profile).get());
