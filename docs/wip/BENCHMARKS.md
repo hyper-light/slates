@@ -5224,6 +5224,20 @@ Both runs used a base-backed volume over the same 500-file tree.
 against the in-kernel overlayfs's 6 µs, and the gap is one userspace round trip. Not "12–325× slower, dominated
 by the write path".
 
+**The harness is committed:** `docs/wip/bench/fsbench/` — `run.sh` (the container invocation), `inner.sh` (the
+three arms in one run over one base) and `fsync.py`. The superseded row cited this path and it did not exist;
+every number in the two tables above now comes from a command in the tree. It needs a **release** build in the
+`slates-linux-target` volume; the build line is in `run.sh`'s header.
+
+**One caveat the harness itself exposed, and it is a property worth knowing.** A verification run of the same
+script while a `cargo build` ran beside it in the same Docker VM read slates create p50 **130 µs** and stat
+98 µs, against 31 µs and 27 µs in the uncontended run — while tmpfs and overlayfs barely moved (1–3 µs either
+way). An in-kernel filesystem serves the caller in the caller's own timeslice; slates needs its daemon
+scheduled, so its per-operation latency is far more sensitive to CPU contention than theirs. That is inherent to
+being out of kernel and is the honest companion to the ratios above: they are ratios on a *quiet-ish* host, and
+the gap widens on a loaded one. (That run also used 500 creates rather than 2,000, so warm-up weighs more
+heavily in its p50.)
+
 **So the lever is the round trip, and it is ~22 µs.** Against tmpfs's 1 µs create slates is ~27×, not the ~55×
 the stale row implies against overlayfs. The in-design levers that attack the round trip — FUSE writeback
 caching and a larger `max_write` to batch, and virtio-fs + DAX to replace the round trip with a page-table
