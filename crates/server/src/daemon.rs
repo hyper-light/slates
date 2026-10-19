@@ -3381,6 +3381,52 @@ async fn reap_loop() {
       crate::delegation::drain(s);
     });
     seal_idle_content().await;
+    scrub_guarded_windows().await;
+  }
+}
+
+/// Counter: guarded read-only DAX blocks that still matched the checksum they were guarded with (§4.6 B2).
+const DAX_SCRUB_CLEAN: &str = "dax.scrub_clean";
+/// Counter: blocks whose content had changed with no write to explain it — a bit flip — restored from their
+/// clean copy. The net's non-vacuity counter in production: zero forever is the expected and wanted reading,
+/// and anything else is the thing B2 exists to find.
+const DAX_SCRUB_HEALED: &str = "dax.scrub_healed";
+/// Counter: flips the net could not undo, because the clean copy no longer verified either. Both sides corrupt;
+/// the window is left for the owner to revoke rather than served from either.
+const DAX_SCRUB_UNHEALABLE: &str = "dax.scrub_unhealable";
+/// Counter: guards dropped because their mapping is no longer live — ordinary churn, and how the list stays
+/// bounded without a second sweep.
+const DAX_SCRUB_DROPPED: &str = "dax.scrub_dropped";
+
+/// §4.6 **B2's net, run**: the shard's guarded read-only DAX blocks re-checked against the checksums they were
+/// guarded with, once a reap tick, in cooperative slices of `archive_slice_bytes`.
+///
+/// A flip in read-only content is invisible to slates by construction — nothing in the daemon wrote it, so no
+/// code path can notice — so it has to be looked for on a timer. The slice budget is the archive walk's,
+/// because this spends it the same way: BLAKE3 over content, under the shard's own step quantum.
+///
+/// A shard with no guard — the common case, since the guard is the owner's opt-in
+/// (`Volume::enable_dax_integrity_guard`) — finds an empty list and returns.
+async fn scrub_guarded_windows() {
+  let mut at = 0usize;
+  loop {
+    let turn = state::with_state(|s| {
+      let budget = s.config.archive_slice_bytes().max(1);
+      let slice = s.store.dax_scrub_slice(at, budget);
+      s.count(DAX_SCRUB_CLEAN, slice.clean);
+      s.count(DAX_SCRUB_HEALED, slice.healed);
+      s.count(DAX_SCRUB_UNHEALABLE, slice.unhealable);
+      s.count(DAX_SCRUB_DROPPED, slice.dropped);
+      (slice.next, s.store.dax.guards())
+    });
+    let Some((next, guards)) = turn else {
+      return;
+    };
+    if next >= guards || next <= at {
+      return;
+    }
+    at = next;
+    futures::yield_now().await;
   }
 }
 

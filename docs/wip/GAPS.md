@@ -8369,3 +8369,34 @@ that leg.
 The remaining variance is the host's, not the code's. That is worth saying plainly rather than engineering
 around: physical contiguity is a resource the kernel may not have, and a defence that pretended otherwise would
 be the security theatre §4.6 names.
+
+### 2026-10-19: B2 wired — the last DAX layer that was a primitive without a caller
+
+`Store::dax_guard` and `Store::dax_scrub` have existed since 6922fcf2 with no production caller, exactly as
+`dax_migrate` did. Both ends are now wired, and with them none of §4.6's four Rowhammer layers is an unwired
+primitive.
+
+**The guard is the owner's opt-in, and that was the open question.** The row was recorded as "a posture choice:
+what to guard; detection latency vs 2× mapped-content RAM". It is decidable, but not by slates: the guard costs
+a BLAKE3 of the block and a second pinned copy of it per read-only mapping, which is worth paying where
+untrusted tenants share the host's DRAM and is pure overhead where they do not — and slates cannot see the
+host's other tenants. So `Volume::enable_dax_integrity_guard` is symmetric with L0's `enable_writable_dax`:
+off by default, the owner's to turn on, one code path either way. Not a mode switch (#7) — an owner policy, of
+exactly the kind L0 already is.
+
+**A guard the shard cannot take does not fail the map.** The net is *under* the mapping, not a condition of it,
+so a refused guard is counted (`DaxRegistry::guards_refused`) and the window is served unguarded. A count
+climbing beside a flat guard count is a capacity signal, which is what an operator needs to see; a failed
+SETUPMAPPING would not be.
+
+**The pass runs on the reap tick, not the hammer window.** B2 is a net under L1's containment and L2's shift,
+not a shield, so it does not need the 16 ms cadence, and hashing every guarded block that often would cost far
+more than the shift's 242 ns copies. The slice budget is `archive_slice_bytes` — the archive walk's — because
+this spends it the same way: BLAKE3 over content under the shard's own step quantum.
+
+Proven by `the_scrub_pass_heals_a_flip_no_write_explains_and_leaves_the_rest_clean` (three guarded maps, a byte
+flipped behind the daemon's back, the pass sliced one block at a time: the flip healed, the neighbours clean,
+the guest reading its own bytes again) and by
+`without_the_opt_in_nothing_is_guarded_and_the_scrub_pass_has_nothing_to_find`, which states the cost of not
+opting in as a test rather than leaving it implied, and arms the same volume afterwards so the pair is not
+vacuous. Both run on every host — B2 needs no huge page.

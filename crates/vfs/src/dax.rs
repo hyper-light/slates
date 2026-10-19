@@ -89,6 +89,25 @@ pub struct ShiftSlice {
   pub unsupported: bool,
 }
 
+/// What one slice of §4.6 B2's periodic scrub did ([`Store::dax_scrub_slice`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ScrubSlice {
+  /// Guarded blocks that still matched the checksum they were guarded with.
+  pub clean: u64,
+  /// Blocks that did **not** match and were restored from their clean copy — a bit flip caught and undone, and
+  /// the counter that says the net is doing anything at all.
+  pub healed: u64,
+  /// Blocks that did not match and could not be restored, because the clean copy no longer verified either.
+  /// Both sides corrupt: the caller revokes the mapping rather than serve either.
+  pub unhealable: u64,
+  /// Guards dropped as the slice passed them, because their mapping is no longer live.
+  pub dropped: u64,
+  /// Content bytes hashed, which is what the slice's budget is spent in.
+  pub bytes: u64,
+  /// Where the next slice resumes; equal to the guard count when the pass is done.
+  pub next: usize,
+}
+
 /// A daemon-minted opaque mapping identity (§4.6 step 2, the tamper-proof registry). The inner value is private to
 /// this module, so a [`Mapping`] — and thus its id — can be formed only by the mint path here
 /// ([`DaxRegistry::mint_id`]), never from caller input or by tampering: a mapping the daemon never minted cannot be
@@ -214,6 +233,9 @@ pub struct DaxRegistry {
   /// Integrity guards for read-only mappings (§4.6 B2, the self-healing safety net). Bounded by `cap` as the
   /// mappings are; empty on any shard that guards nothing.
   guards: Vec<DaxGuard>,
+  /// Guards the net could not take because the shard already holds `cap` clean copies: the mapping was served
+  /// unguarded. A capacity signal, never a failed map.
+  guards_refused: u64,
   /// Scrubs run, flips caught, and blocks healed (§4.6 B2 non-vacuity counters): a test asserts the one it drove
   /// moved, so a dead scrub or a dead heal path cannot pass for a live one.
   scrubbed: u64,
@@ -259,6 +281,7 @@ impl DaxRegistry {
       refused: 0,
       migrated: 0,
       guards: Vec::new(),
+      guards_refused: 0,
       scrubbed: 0,
       flips: 0,
       healed: 0,
@@ -498,6 +521,14 @@ impl DaxRegistry {
     self.migrated
   }
 
+  /// Guards §4.6's B2 net could not take, because the shard was already holding as many clean copies as its
+  /// bound allows. The mapping was served unguarded; a count climbing beside a flat [`DaxRegistry::guards`] is
+  /// a capacity signal, never a failed map.
+  #[must_use]
+  pub fn guards_refused(&self) -> u64 {
+    self.guards_refused
+  }
+
   /// Live integrity guards (§4.6 B2).
   #[must_use]
   pub fn guards(&self) -> usize {
@@ -664,6 +695,7 @@ impl Volume {
         }
         return Err(refusal);
       }
+      self.guard_if_asked(store, &mapping);
       return Ok(mapping);
     }
     // REOPEN arm (A/B against view): a SEALED chunk (ciphertext at rest, A-92/A-99) cannot be mapped zero-copy — a
@@ -708,7 +740,24 @@ impl Volume {
       }
       return Err(refusal);
     }
+    self.guard_if_asked(store, &mapping);
     Ok(mapping)
+  }
+
+  /// Takes §4.6's B2 net over a freshly-minted read-only mapping when the volume's owner asked for one
+  /// ([`Volume::enable_dax_integrity_guard`]).
+  ///
+  /// A refusal is **counted, not returned**: the guard is a net under the mapping, not a condition of it, so a
+  /// shard that has no room for another clean copy serves the window unguarded rather than failing a map the
+  /// guest is entitled to. `DaxRegistry::guards_refused` is how that shows — a count climbing beside a flat
+  /// guard count says the shard is at its net's bound, which is a capacity signal, not a bug.
+  fn guard_if_asked(&self, store: &mut Store, mapping: &Mapping) {
+    if !self.dax_integrity_guard {
+      return;
+    }
+    if store.dax_guard(mapping).is_err() {
+      store.dax.guards_refused = store.dax.guards_refused.saturating_add(1);
+    }
   }
 
   /// Maps inode `no`'s content from offset 0 — the whole single block of a single-block file, or an inline file —
@@ -1385,6 +1434,56 @@ impl Store {
     } else {
       DaxScrub::Unhealable
     }
+  }
+
+  /// One cooperative slice of §4.6 B2's **periodic scrub**: the guards from index `from`, each checked against
+  /// the clean checksum it was taken with and healed from its clean copy where they differ, until
+  /// `budget_bytes` have been hashed.
+  ///
+  /// This is the net's only use. A flip in read-only content is invisible to slates by construction — nothing in
+  /// the daemon wrote it, so no code path can notice — which is why it has to be *looked for* on a timer rather
+  /// than caught at a write. A guard whose mapping is no longer live is dropped as it is passed, so a round over
+  /// a churning volume shrinks the list instead of re-checking dead entries.
+  ///
+  /// The caller owns the cadence and the budget; `next` says where the next slice resumes, and equals the guard
+  /// count when the pass is done. Like the shift's slice, nothing here decides *whether* to scrub.
+  pub fn dax_scrub_slice(&mut self, from: usize, budget_bytes: u64) -> ScrubSlice {
+    let mut slice = ScrubSlice {
+      next: from,
+      ..ScrubSlice::default()
+    };
+    let mut at = from;
+    while let Some(guard) = self.dax.guards.get(at).copied() {
+      if !self.dax.is_live(&guard.mapping) {
+        // The mapping is gone; its clean copy goes with it, and the list shrinks under `at`, so the cursor
+        // stays put and the next entry slides into this place.
+        self.drop_guard(&guard.mapping);
+        slice.dropped = slice.dropped.saturating_add(1);
+        continue;
+      }
+      let hashed = self
+        .content
+        .arena()
+        .bytes(guard.mapping.block)
+        .map(<[u8]>::len)
+        .unwrap_or(0);
+      match self.dax_scrub(&guard.mapping) {
+        DaxScrub::Clean => slice.clean = slice.clean.saturating_add(1),
+        DaxScrub::Healed => slice.healed = slice.healed.saturating_add(1),
+        DaxScrub::Unhealable => slice.unhealable = slice.unhealable.saturating_add(1),
+        DaxScrub::Unguarded => slice.dropped = slice.dropped.saturating_add(1),
+      }
+      slice.bytes = slice
+        .bytes
+        .saturating_add(u64::try_from(hashed).unwrap_or(u64::MAX));
+      at = at.saturating_add(1);
+      slice.next = at;
+      if slice.bytes >= budget_bytes {
+        break;
+      }
+    }
+    slice.next = slice.next.min(self.dax.guards.len());
+    slice
   }
 
   /// Drops a mapping's integrity guard (§4.6 B2) if it has one, freeing the clean copy; returns whether one was held.

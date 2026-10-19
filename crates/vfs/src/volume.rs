@@ -403,6 +403,11 @@ pub struct Volume {
   /// scale (the quarantine-exhaustion worry is answered by there being little to quarantine). Default `false`; a clone
   /// does not inherit it (the capability is each owner's own deliberate choice).
   pub(crate) writable_dax: bool,
+  /// Whether this volume's **read-only** DAX mappings are guarded by §4.6's B2 self-healing net: a clean
+  /// BLAKE3 and a pinned clean copy taken at map time, so a periodic scrub can catch a bit flip the daemon
+  /// never saw and restore the block. Off by default, for the same reason L0 is: the guard costs a hash and a
+  /// second copy of every mapped block, which an owner with no co-located untrusted neighbour should not pay.
+  pub(crate) dax_integrity_guard: bool,
   /// The inodes written since an idle sweep, each by the sweep tick it was last written in (A-99): a sweep seals the
   /// open extent of each one not written since the sweep before, so a file smaller than a chunk is not left in
   /// plaintext while idle. Bounded by the volume's inodes; empty for a volume that does not seal.
@@ -685,6 +690,7 @@ impl Volume {
       seal_key: None,
       locked: false,
       writable_dax: false,
+      dax_integrity_guard: false,
       written: BTreeMap::new(),
       sweep_tick: 0,
       idle_pending: std::collections::BTreeSet::new(),
@@ -765,6 +771,7 @@ impl Volume {
       seal_key: None,
       locked: false,
       writable_dax: false,
+      dax_integrity_guard: false,
       written: BTreeMap::new(),
       sweep_tick: 0,
       idle_pending: std::collections::BTreeSet::new(),
@@ -865,6 +872,7 @@ impl Volume {
       seal_key: None,
       locked: false,
       writable_dax: false,
+      dax_integrity_guard: false,
       written: BTreeMap::new(),
       sweep_tick: 0,
       idle_pending: std::collections::BTreeSet::new(),
@@ -1228,6 +1236,25 @@ impl Volume {
   /// it is off until explicitly asked for. Idempotent.
   pub fn enable_writable_dax(&mut self) {
     self.writable_dax = true;
+  }
+
+  /// Opts this volume's **read-only** DAX mappings into §4.6's B2 self-healing net: from here each one is
+  /// guarded at map time with a clean checksum and a pinned clean copy, and the shard's periodic scrub catches
+  /// and heals a bit flip in it that no slates write explains (`Store::dax_scrub`).
+  ///
+  /// Off by default and the owner's to turn on, as L0 is, because it is the same kind of decision: the guard
+  /// costs a BLAKE3 of the block and a second copy of it per mapping, which is worth paying where untrusted
+  /// tenants share the host's DRAM and is pure overhead where they do not. slates cannot see the host's other
+  /// tenants, so it cannot make that call. A guard the shard has no room for is counted and the mapping is left
+  /// unguarded — the map itself never fails for want of a net.
+  pub fn enable_dax_integrity_guard(&mut self) {
+    self.dax_integrity_guard = true;
+  }
+
+  /// Whether §4.6's B2 net is opted in on this volume ([`Volume::enable_dax_integrity_guard`]).
+  #[must_use]
+  pub fn dax_integrity_guard_enabled(&self) -> bool {
+    self.dax_integrity_guard
   }
 
   /// Whether writable DAX is opted in on this volume ([`Volume::enable_writable_dax`]); read-only DAX needs no opt-in.

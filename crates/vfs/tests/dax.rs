@@ -1650,6 +1650,113 @@ fn flip_a_byte(store: &mut Store, block: slates_mem::arena::Extent) {
   }
 }
 
+/// One whole scrub pass, driven in slices as the reap tick drives it: the blocks healed, the blocks found
+/// clean, and the slices it took. The budget is one byte, so a slice stops after the first block it hashes and
+/// the pass's slicing is what is under test.
+fn run_one_scrub_pass(store: &mut Store) -> (u64, u64, usize) {
+  let mut at = 0usize;
+  let mut healed = 0u64;
+  let mut clean = 0u64;
+  let mut passes = 0usize;
+  while at < store.dax.guards() {
+    let slice = store.dax_scrub_slice(at, 1);
+    assert!(
+      slice.next > at,
+      "a slice always advances, so a pass terminates"
+    );
+    at = slice.next;
+    healed = healed.saturating_add(slice.healed);
+    clean = clean.saturating_add(slice.clean);
+    passes = passes.saturating_add(1);
+  }
+  (healed, clean, passes)
+}
+
+/// §4.6 **B2's net, driven as the shard drives it** ([`Store::dax_scrub_slice`]) — the pass the reap tick runs.
+/// Do: opt a volume into the guard, map three files read-only so each is guarded at map time, flip a byte in
+/// one behind the daemon's back as a hardware hammer would, then run a scrub pass in slices with a budget
+/// smaller than the pass. Expect: every guard is visited, the flipped block is healed back to its clean bytes,
+/// the others read clean, and the pass advances to the end. A flip in read-only content is invisible to slates
+/// by construction — no write explains it — so this timer pass is the only thing that can find it.
+#[test]
+fn the_scrub_pass_heals_a_flip_no_write_explains_and_leaves_the_rest_clean() {
+  let mut store = store();
+  let mut volume = volume(&mut store, 1 << 20);
+  volume.enable_dax_integrity_guard();
+  // Derived: three guards is the fewest that shows the pass slicing and still leaves clean neighbours either
+  // side of the flipped one.
+  const GUARDED: usize = 3;
+  let mut mapped = Vec::new();
+  for which in 0..GUARDED {
+    let name = format!("f{which}");
+    let f = file_of(&mut store, &mut volume, &name, 0x41, DAX_PAGE);
+    mapped.push(volume.dax_map_read(&mut store, f).unwrap());
+  }
+  assert_eq!(
+    store.dax.guards(),
+    GUARDED,
+    "the opt-in guarded every read-only map (non-vacuity: the net is armed)"
+  );
+
+  // A hardware hammer flips a byte in the middle one. Nothing in the daemon wrote it.
+  let victim = mapped[1];
+  flip_a_byte(&mut store, victim.block);
+  assert!(
+    !all_bytes(&store.dax_read_raw(&victim, 0, DAX_PAGE), 0x41),
+    "the flip really changed the block the guest reads"
+  );
+
+  // The pass, in slices of one block each, as the reap tick runs it.
+  let (healed, clean, passes) = run_one_scrub_pass(&mut store);
+  assert_eq!(healed, 1, "the flipped block was healed");
+  assert_eq!(
+    clean,
+    (GUARDED - 1) as u64,
+    "the others were checked and found clean"
+  );
+  assert_eq!(
+    passes, GUARDED,
+    "the budget sliced the pass, one block each"
+  );
+  assert_eq!(store.dax.healed(), 1, "the registry counted the heal");
+  assert!(
+    all_bytes(&store.dax_read_raw(&victim, 0, DAX_PAGE), 0x41),
+    "the guest reads its own bytes again — the flip was undone"
+  );
+}
+
+/// §4.6 B2 (the opt-in is what arms the net). Do: map a file read-only on a volume that has *not* opted in, flip
+/// a byte in it, and run the scrub pass. Expect: nothing was guarded, so the pass finds nothing to check and the
+/// flip stands — which is the cost of not opting in, stated as a test rather than left implied. Non-vacuity: the
+/// same volume, opted in and re-mapped, is guarded and heals.
+#[test]
+fn without_the_opt_in_nothing_is_guarded_and_the_scrub_pass_has_nothing_to_find() {
+  let mut store = store();
+  let mut volume = volume(&mut store, 1 << 20);
+  let f = file_of(&mut store, &mut volume, "f", 0x41, DAX_PAGE);
+  let m = volume.dax_map_read(&mut store, f).unwrap();
+  assert_eq!(store.dax.guards(), 0, "no opt-in, no guard");
+
+  flip_a_byte(&mut store, m.block);
+  let slice = store.dax_scrub_slice(0, u64::MAX);
+  assert_eq!(slice.clean, 0, "nothing was checked");
+  assert_eq!(slice.healed, 0, "nothing was healed");
+  assert_eq!(slice.next, 0, "the pass was over before it began");
+  assert!(
+    !all_bytes(&store.dax_read_raw(&m, 0, DAX_PAGE), 0x41),
+    "the flip stands, which is what not opting in costs"
+  );
+
+  // Non-vacuity: the opt-in arms it, and the same flip heals.
+  store.dax_revoke(&m);
+  volume.enable_dax_integrity_guard();
+  let armed = volume.dax_map_read(&mut store, f).unwrap();
+  assert_eq!(store.dax.guards(), 1, "the opt-in guarded the re-map");
+  flip_a_byte(&mut store, armed.block);
+  let slice = store.dax_scrub_slice(0, u64::MAX);
+  assert_eq!(slice.healed, 1, "the armed net healed the same flip");
+}
+
 /// §4.6 multi-tenancy **B2** (the self-healing safety net). Do: guard a read-only mapping (immutable content), then
 /// inject a synthetic bit flip into its block and scrub. Expect: the fresh guard scrubs clean; after the flip the
 /// scrub catches it and heals the block from the clean copy, the victim byte erased; a re-scrub confirms it; the

@@ -2868,14 +2868,29 @@ same-namespace host process is the first delivered case.
 >      OS-shipped broker's PEBS/IBS, since a pure direct-write hammer is invisible to the daemon; this is why the
 >      strategy leans on *contain* (L1 zones) and *heal* (B2) over *detect*. slates is RAM-only, so the migration copy
 >      is DRAM↔DRAM with no write-endurance cost — the PMEM-endurance concern does not apply to slates' arena.
->    - **B2 — self-healing net (built, 6922fcf2).** `Store::dax_guard` records a read-only mapping's clean BLAKE3 and
->      a pinned clean copy; a periodic `Store::dax_scrub` catches a flip the daemon never saw and restores the block
->      from the clean copy (`Healed`), or reports `Unhealable` if both are corrupt. Sound only for read-only content
->      (a writable block changes legitimately, so a checksum cannot tell a flip from a write); read-only is the L0
->      default, so B2 covers the common case. The clean copy is bounded by the registry cap and freed on revoke.
+>    - **B2 — self-healing net (built, 6922fcf2; **wired 2026-10-19**).** `Store::dax_guard` records a read-only
+>      mapping's clean BLAKE3 and a pinned clean copy; `Store::dax_scrub` catches a flip the daemon never saw and
+>      restores the block from the clean copy (`Healed`), or reports `Unhealable` if both are corrupt. Sound only
+>      for read-only content (a writable block changes legitimately, so a checksum cannot tell a flip from a
+>      write); read-only is the L0 default, so B2 covers the common case. The clean copy is bounded by the
+>      registry cap and freed on revoke.
+>      **The guard is the owner's opt-in** (`Volume::enable_dax_integrity_guard`), off by default and symmetric
+>      with L0's: it costs a BLAKE3 of the block and a second copy of it per mapping, worth paying where
+>      untrusted tenants share the host's DRAM and pure overhead where they do not — and slates cannot see the
+>      host's other tenants, so it cannot make that call. A guard the shard has no room for is counted
+>      (`DaxRegistry::guards_refused`) and the mapping served unguarded: the net is under the map, never a
+>      condition of it.
+>      **The pass runs on the reap tick** (`daemon::scrub_guarded_windows`), in cooperative slices of
+>      `archive_slice_bytes` — the archive walk's budget, because this spends it the same way, BLAKE3 over
+>      content under the shard's own step quantum. A flip in read-only content is invisible to slates by
+>      construction, since no write explains it and no code path can notice, so looking for it on a timer is the
+>      only thing that can find it. A guard whose mapping has gone is dropped as the pass reaches it, so the list
+>      stays bounded without a second sweep.
 >    The modern window is 16–32 ms and RowPress leaks across refresh windows, so the migration interval is derived
->    from the lowest hammer threshold, not the classic 64 ms. L0, L1, L2 and B2 are built and proven by use in
->    `crates/vfs/tests/dax.rs`. **The daemon→device half is settled and built** (2026-10-19). The earlier text left
+>    from the lowest hammer threshold, not the classic 64 ms. **All four layers are now built, driven and proven
+>    by use** in `crates/vfs/tests/dax.rs`: L0 refuses the hammerable mode by default, L1 contains what is left
+>    in a verified huge page with guard rows, L2 moves it every hammer window, and B2 finds and heals what got
+>    through. Nothing in the set is a primitive without a caller. **The daemon→device half is settled and built** (2026-10-19). The earlier text left
 >    a choice between a backend-initiated remap and "the revoke-and-refault path instead, and accept the tear"; the
 >    second is taken, because the objection recorded against it no longer holds. `Volume::dax_migrate` now enqueues
 >    `(inode, writable_only = true)` on the queue the device already drains every service pass
