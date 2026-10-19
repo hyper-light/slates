@@ -1729,6 +1729,146 @@ fn a_row_a_neighbour_took_is_never_drawn_for_the_tenant_again() {
   );
 }
 
+/// §4.6 L1 (the cost of hearing "no"). A refused sandbox reservation allocates a huge page's span, discards it,
+/// walks `/proc/self/smaps` three times — a walk of the whole address space each — faults the span and frees
+/// it: **measured 53 µs on fedora 6.19.10**. The shift loop asks every 16 ms per window, so asking again each
+/// time would burn 0.33% of a core per window to re-learn the same answer, and more as the daemon's address
+/// space grows.
+///
+/// Do: ask for a shift on this host and see which answer it gives. Expect: where the host refuses, the volume
+/// is remembered as refused so the question is not asked again, and a re-arm forgets it so a host that frees
+/// memory later is asked once more; where the host backs a sandbox, nothing is remembered. One test, both
+/// legs, so neither host silently loses the rule.
+#[test]
+fn a_refused_sandbox_is_remembered_until_the_caller_re_arms() {
+  let mut store = store_sandboxed();
+  let mut volume = volume(&mut store, 1 << 20);
+  let f = file_of(&mut store, &mut volume, "f", 0x41, DAX_PAGE);
+  let m = volume.dax_map_write(&mut store, f).unwrap();
+  assert_eq!(
+    store.dax_zones.refused_len(),
+    0,
+    "nothing is remembered before the question is asked"
+  );
+
+  match volume.dax_migrate(&mut store, &m) {
+    Err(VfsError::NoPhysicalIsolation) => {
+      // Two ways to be refused, and only one of them costs anything to re-learn. A host with no transparent
+      // huge page at all answers from one `Option` and needs no memo; a host that *has* one and declined this
+      // span is the 53 µs case, and that is the one that must be remembered.
+      let host_has_huge_pages = slates_machine::facts::huge_page_bytes().is_some();
+      let remembered = usize::from(host_has_huge_pages);
+      assert_eq!(
+        store.dax_zones.refused_len(),
+        remembered,
+        "a host that declined a span it could have backed is remembered; one with no huge page needs no memo"
+      );
+      // The answer does not change, and asking again does not re-ask the host.
+      assert!(
+        matches!(
+          volume.dax_migrate(&mut store, &m),
+          Err(VfsError::NoPhysicalIsolation)
+        ),
+        "the memo gives the same answer it memorised"
+      );
+      assert_eq!(
+        store.dax_zones.refused_len(),
+        remembered,
+        "and asking again added nothing"
+      );
+      store.dax_zones.rearm_refusals();
+      assert_eq!(
+        store.dax_zones.refused_len(),
+        0,
+        "the re-arm forgets it, so a host that frees memory is asked once more"
+      );
+    }
+    Ok(_) => {
+      assert_eq!(
+        store.dax_zones.refused_len(),
+        0,
+        "a host that backs a sandbox remembers no refusal"
+      );
+      assert_eq!(store.dax_zones.len(), 1, "it has a sandbox instead");
+    }
+    other => panic!("a shift is performed or refused for want of a sandbox: {other:?}"),
+  }
+}
+
+/// §4.6 B2, the bug the chaos property found
+/// (`docs/bugs/2026-10-19-the-self-healing-net-resurrects-a-deleted-files-plaintext.md`). The net must never
+/// write through a mapping whose block is no longer pinned: the block may already have been released *and
+/// scrubbed*, and "healing" it puts a deleted file's plaintext back into memory the allocator has freed — the
+/// cross-tenant disclosure the gate exists to prevent, performed by the gate's own net.
+///
+/// Do: map one file both writable and read-only (the read map is guarded), unlink it, then release the windows
+/// so the deferred free completes and the block is scrubbed — the state the shared per-block pin lets happen
+/// while the read mapping is still in the registry — and run the scrub. Expect: the pass **drops** the stale
+/// guard and heals nothing, so the freed block keeps the zeroes the free wrote into it.
+///
+/// Kept as a named case rather than a proptest seed because it is one exact interleaving with one exact
+/// outcome, and a reader should be able to see it without replaying a hash.
+#[test]
+fn the_net_never_heals_through_a_block_the_arena_has_freed() {
+  let mut store = store();
+  let mut volume = volume(&mut store, 1 << 20);
+  volume.enable_dax_integrity_guard();
+  let f = file_of(&mut store, &mut volume, "f", 0x41, DAX_PAGE);
+
+  let writable = volume.dax_map_write(&mut store, f).unwrap();
+  let guarded = volume.dax_map_read(&mut store, f).unwrap();
+  assert_eq!(store.dax.guards(), 1, "the read map is guarded");
+  assert_eq!(
+    guarded.block, writable.block,
+    "both windows name the one content block, which is what makes the pin shared"
+  );
+
+  // The file goes; its block's free is deferred while anything still pins it.
+  let root = volume.root_inode(&store).unwrap();
+  volume.unlink_no(&mut store, root, "f").unwrap();
+
+  // The windows are released. The shared per-block pin reaches zero here even though the read mapping is still
+  // in the registry (§4.6's recorded map-storm defect), so the deferred free completes and scrubs the block.
+  store.dax_revoke(&writable);
+  store.dax_release_after_unmap(&writable);
+  store.dax_release_after_unmap(&guarded);
+  let freed = !store.content.arena().is_pinned(guarded.block);
+  if !freed {
+    println!(
+      "SKIP the_net_never_heals_through_a_block_the_arena_has_freed: the block is still pinned here, so the \
+       state this test is about did not arise"
+    );
+    return;
+  }
+  let after_free = store
+    .content
+    .arena()
+    .bytes(guarded.block)
+    .map(<[u8]>::to_vec)
+    .unwrap_or_default();
+
+  let slice = store.dax_scrub_slice(0, u64::MAX);
+
+  assert_eq!(
+    slice.healed, 0,
+    "the net wrote the deleted file's plaintext back into a freed block"
+  );
+  assert_eq!(
+    slice.dropped, 1,
+    "the stale guard was dropped instead (non-vacuity: the pass really reached it)"
+  );
+  assert_eq!(store.dax.guards(), 0, "and its clean copy went with it");
+  assert_eq!(
+    store
+      .content
+      .arena()
+      .bytes(guarded.block)
+      .map(<[u8]>::to_vec),
+    Some(after_free),
+    "the freed block's bytes are exactly as the free left them"
+  );
+}
+
 // ───────────────────────────────────────────────────────────── B2 the self-healing safety net (checksum + heal)
 
 /// A synthetic Rowhammer bit flip: invert a byte of a block directly in the arena, behind the daemon's back — exactly

@@ -8426,3 +8426,46 @@ net would *revert* that operation, which is the worst failure a self-healing net
 deliberate flip of a guarded block makes the run fail on exactly that line ("B2 healed a block nothing
 corrupted"). The step was then restored. 63 dax tests on macOS aarch64 and on Linux x86_64, the chaos property
 three runs each.
+
+### 2026-10-19: the chaos property earned its keep on its second run — B2 was resurrecting deleted plaintext
+
+`the_four_layers_under_chaos_never_heal_what_nothing_corrupted` was written the same day with one sharp
+assertion: B2 must never heal, because nothing in the schedule corrupts a block. It fired within minutes.
+
+**What it found.** One inode mapped both writable and read-only at once shares a single per-block pin (§4.6
+item 2's recorded map-storm defect). Releasing the writable window drops that pin to zero while the read
+mapping is still in the registry; the deferred free from a prior `unlink` then completes and **scrubs the block
+to zero**. The next scrub reads the zeroes as a bit flip and writes the old content back — a deleted file's
+plaintext, into a block the allocator now considers free and will hand to the next caller, in any volume on the
+shard. That is the cross-tenant disclosure the gate exists to prevent, performed by the gate's own net.
+
+Confirmed by replaying proptest's shrunk schedule with the arena's bytes printed at every step, not by reading
+code: `step 5 → arena=[00,00,00,00] pinned=false`, `step 6 → healed=1, arena=[10,10,10,10]`.
+
+**Fixed narrowly, and deliberately so.** `Store::dax_scrub` now refuses to act on a mapping whose block is not
+pinned, and the sliced pass drops that guard. A live mapping's block is always pinned — the gate's own
+invariant — so an unpinned block under a live entry means the entry is stale, and writing through a stale entry
+is unsound whatever created it. The **shared per-block pin stays owed**: moving the pin from the mapping to the
+window is the correct repair and it changes the gate's invariant, which is its own change.
+`docs/bugs/2026-10-19-the-self-healing-net-resurrects-a-deleted-files-plaintext.md` has the full record.
+
+Red-checked both ways: `the_net_never_heals_through_a_block_the_arena_has_freed` fails with `healed: 1` when the
+pin check is removed, and the chaos property ran 15 times clean after the fix.
+
+**The lesson, which is the reusable part.** The assertion that found this was not "the feature works" but "this
+layer must never do the one thing that would make it worse than absent". A net that can write is a net that can
+corrupt, and the property worth asserting about it is the harm, not the function.
+
+### 2026-10-19: a refused sandbox cost 53 µs to re-learn, at 62 times a second
+
+Measured before the fix, on fedora 6.19.10: **53,320 ns per refused reservation attempt**, because a refusal
+allocates the span, discards it, walks `/proc/self/smaps` three times (a walk of the whole address space each,
+which is why `huge_backed_bytes`'s own doc says to ask once and keep the answer), faults a huge page's worth and
+frees it. The shift loop asks every 16 ms per writable window, so a host that cannot back a sandbox burned
+0.33% of a core per window hearing the same no — scaling with the daemon's address space, not with its work.
+
+`DaxZones` now memoises the refusal; the daemon clears the memo on its reap tick. At most one attempt per volume
+per tick, and a host that frees memory still gets its sandbox within one tick. Proven by
+`a_refused_sandbox_is_remembered_until_the_caller_re_arms`, which drives all three host cases — no huge page at
+all (the `Option` is already the memo, nothing to remember), a huge page the kernel declined for this span (the
+53 µs case, remembered), and a sandbox reserved (nothing remembered).

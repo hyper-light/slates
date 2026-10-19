@@ -2820,6 +2820,12 @@ same-namespace host process is the first delivered case.
 >      shift moves a *virtual* address the kernel may back with the row it came from — security theatre — so
 >      [`Volume::dax_migrate`] now **refuses `NoPhysicalIsolation`** on a host that cannot back a sandbox rather
 >      than performing a shift that does not shift.
+>      **A refused reservation is remembered.** A refusal costs 53 µs — it allocates the span, discards it,
+>      walks `/proc/self/smaps` three times (a walk of the whole address space each) and faults a huge page's
+>      worth — measured on fedora 6.19.10. At the 16 ms shift cadence, re-asking would burn 0.33% of a core per
+>      window to re-learn the same answer, and more as the daemon's address space grows. `DaxZones` memoises the
+>      refusal and the daemon clears it on its reap tick, so the host is asked at most once per volume per tick
+>      and a host that frees memory still gets its sandbox within one.
 >      **Unprivileged, by measurement rather than by requirement.** A hugetlb reservation would need
 >      `/proc/sys/vm/nr_hugepages` from an administrator, which R10 refuses to require; a transparent huge page
 >      needs nothing, and whether the kernel actually gave one is a question `/proc/self/smaps` answers
@@ -2880,6 +2886,14 @@ same-namespace host process is the first delivered case.
 >      host's other tenants, so it cannot make that call. A guard the shard has no room for is counted
 >      (`DaxRegistry::guards_refused`) and the mapping served unguarded: the net is under the map, never a
 >      condition of it.
+>      **The net never writes through a block the arena has freed.** A scrub acts only on a mapping whose block
+>      is still **pinned** — a live mapping's block always is, since every `dax_map_*` pins and only a revoke
+>      unpins, so an unpinned block under a live entry means the entry is stale and its bytes may already be
+>      released and scrubbed. Healing there put a deleted file's plaintext back into free memory: the
+>      cross-tenant disclosure this whole gate exists to prevent, performed by its own net
+>      (`docs/bugs/2026-10-19-the-self-healing-net-resurrects-a-deleted-files-plaintext.md`, found by the
+>      four-layer chaos property on its second run). The state arises from the shared per-block pin recorded in
+>      item 2 above, which stays owed; refusing to write through a stale entry is sound whatever created it.
 >      **The pass runs on the reap tick** (`daemon::scrub_guarded_windows`), in cooperative slices of
 >      `archive_slice_bytes` — the archive walk's budget, because this spends it the same way, BLAKE3 over
 >      content under the shard's own step quantum. A flip in read-only content is invisible to slates by

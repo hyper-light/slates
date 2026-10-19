@@ -339,6 +339,15 @@ pub struct DaxZones {
   rng: Xorshift,
   /// Each volume's zone, by volume prefix.
   zones: Vec<(u16, DaxZone)>,
+  /// Volumes whose reservation the host refused since the last re-arm, so the question is not asked again at
+  /// the shift cadence. **Measured 2026-10-19 on fedora 6.19.10: a refused reservation costs 53 µs** — it
+  /// allocates the span, discards it, walks `/proc/self/smaps` three times (a walk of the whole address space
+  /// each, which is why [`slates_machine::facts::huge_backed_bytes`] says to ask once and keep the answer),
+  /// faults a huge page's worth and frees it. At the 16 ms hammer cadence that is 0.33% of a core per window
+  /// spent learning the same "no", and it grows with the process's address space. Re-armed by the caller at
+  /// its own slower cadence ([`DaxZones::rearm_refusals`]), so a host that frees memory later still gets a
+  /// sandbox — just not at 62 attempts a second.
+  refused: Vec<u16>,
 }
 
 impl DaxZones {
@@ -370,6 +379,7 @@ impl DaxZones {
         .and_then(NonZeroUsize::new),
       rng: Xorshift::new(u64::from_le_bytes(word)),
       zones: Vec::new(),
+      refused: Vec::new(),
     }
   }
 
@@ -428,6 +438,11 @@ impl DaxZones {
     if self.zones.iter().any(|(held, _)| *held == prefix) {
       return Ok(());
     }
+    // Asked and answered: the host refused this volume a sandbox since the last re-arm, and asking again costs
+    // 53 µs of address-space walking to hear it again (the note on `refused`).
+    if self.refused.contains(&prefix) {
+      return Err(VfsError::NoPhysicalIsolation);
+    }
     let huge = self.huge.ok_or(VfsError::NoPhysicalIsolation)?;
     let ceiling = arena.capacity().checked_div(huge.get()).unwrap_or(0);
     if self.zones.len() >= ceiling {
@@ -436,9 +451,38 @@ impl DaxZones {
     // Room for the record before the page is taken, so a reservation is never left holding a huge page it has
     // nowhere to record (nothing to unwind, because nothing was taken yet).
     self.zones.try_reserve(1).map_err(|_| VfsError::NoSpace)?;
-    let zone = DaxZone::reserve(arena, huge, slot_bytes)?;
-    self.zones.push((prefix, zone));
-    Ok(())
+    match DaxZone::reserve(arena, huge, slot_bytes) {
+      Ok(zone) => {
+        self.zones.push((prefix, zone));
+        Ok(())
+      }
+      Err(refusal) => {
+        // Remember the no. A volume the list has no room for is simply asked again next time — the cost of
+        // that is the 53 µs, not a correctness problem, so the bound refuses the *memo*, never the mapping.
+        if self.refused.try_reserve(1).is_ok() {
+          self.refused.push(prefix);
+        }
+        Err(refusal)
+      }
+    }
+  }
+
+  /// Forgets the volumes the host refused a sandbox, so each is asked once more.
+  ///
+  /// The caller's cadence is the bound: a refusal costs 53 µs of address-space walking to re-learn, so asking
+  /// at the 16 ms hammer cadence burns 0.33% of a core per window for nothing, while never asking again would
+  /// leave a tenant unsandboxed for the life of the volume because the host was momentarily fragmented. The
+  /// daemon re-arms on its reap tick — the cadence it already does cold work at — so a host that frees memory
+  /// gets the sandbox within one tick, and the question is asked at most once per volume per tick.
+  pub fn rearm_refusals(&mut self) {
+    self.refused.clear();
+  }
+
+  /// Volumes currently remembered as refused — the counter that says the memo is doing its job, and the signal
+  /// that this host is not backing sandboxes.
+  #[must_use]
+  pub fn refused_len(&self) -> usize {
+    self.refused.len()
   }
 
   /// The placement generator, for a caller drawing a shift target.
@@ -449,6 +493,7 @@ impl DaxZones {
   /// Releases a volume's zone back to the arena, so a destroyed volume's sandbox does not hold a huge page for a
   /// tenant that is gone. The slots released; zero where the volume had no zone.
   pub fn release_volume(&mut self, prefix: u16, arena: &mut ChunkArena) -> usize {
+    self.refused.retain(|held| *held != prefix);
     let Some(at) = self.zones.iter().position(|(held, _)| *held == prefix) else {
       return 0;
     };

@@ -1394,6 +1394,16 @@ impl Store {
     else {
       return DaxScrub::Unguarded;
     };
+    // The block must still be the daemon's to write. A live mapping's block is always pinned — that is the
+    // gate's own invariant, since every `dax_map_*` pins and only `dax_revoke` unpins — so an unpinned block
+    // under a live mapping means the registry entry is stale, and the bytes under it may already have been
+    // released and scrubbed. Healing there writes a deleted file's plaintext back into memory the allocator
+    // has freed, which is the disclosure the whole gate exists to prevent, performed by its own net
+    // (`docs/bugs/2026-10-19-the-self-healing-net-resurrects-a-deleted-files-plaintext.md`, found by the
+    // four-layer chaos property). The only safe reading of a stale entry is to drop it.
+    if !self.content.arena().is_pinned(mapping.block) {
+      return DaxScrub::Unguarded;
+    }
     self.dax.scrubbed = self.dax.scrubbed.saturating_add(1);
     let clean = match self.content.arena().bytes(mapping.block) {
       Some(live) => *blake3::hash(live).as_bytes() == guard.identity,
@@ -1454,9 +1464,11 @@ impl Store {
     };
     let mut at = from;
     while let Some(guard) = self.dax.guards.get(at).copied() {
-      if !self.dax.is_live(&guard.mapping) {
-        // The mapping is gone; its clean copy goes with it, and the list shrinks under `at`, so the cursor
-        // stays put and the next entry slides into this place.
+      // Two ways a guard is stale: its mapping left the registry, or its block is no longer pinned — the
+      // second means the entry outlived the block, and the bytes under it may be freed memory already
+      // (the bug above). Either way the guard goes, and the list shrinks under `at`, so the cursor stays put
+      // and the next entry slides into this place.
+      if !self.dax.is_live(&guard.mapping) || !self.content.arena().is_pinned(guard.mapping.block) {
         self.drop_guard(&guard.mapping);
         slice.dropped = slice.dropped.saturating_add(1);
         continue;

@@ -3382,6 +3382,11 @@ async fn reap_loop() {
     });
     seal_idle_content().await;
     scrub_guarded_windows().await;
+    // §4.6 L1: ask the host once more for the sandboxes it refused. A refusal costs 53 µs of address-space
+    // walking to re-learn (measured on fedora 6.19.10), so the shift loop must not ask at its own 16 ms
+    // cadence — that is 0.33% of a core per window spent hearing the same no. The reap tick is the cadence
+    // the shard already does cold work at, so a host that frees memory gets its sandbox within one tick.
+    state::with_state(|s| s.store.dax_zones.rearm_refusals());
   }
 }
 
