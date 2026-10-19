@@ -7644,9 +7644,15 @@ the `error` word of `fuse_out_header`, and the identical build answers different
 `NotifyThread` treats `ENOENT` as benign — "it has nothing stale, or revalidates on next use" — which was true
 on 6.12 and is false on 6.19: the kernel refuses the invalidation **and keeps answering from the negative
 dentry**. The 10.27 s poll above already showed it is not lateness. Full write-up and the posture options in
-`docs/bugs/2026-10-19-linux-6-19-refuses-the-entry-invalidation-slates-swallows.md`. The silent swallow is a
-defect under CLAUDE.md #9 whatever else is decided; what replaces the posture is a §4.6 decision with a
-measured cost, so it is **Ada's**, not taken here.
+`docs/bugs/2026-10-19-linux-6-19-refuses-the-entry-invalidation-slates-swallows.md`.
+
+**The silent half is fixed; the posture half is Ada's.** The swallow is a defect under CLAUDE.md #9 whatever
+the posture turns out to be, so it did not wait: entry refusals are now counted apart from the benign ones and
+reported as **`fuse.entry_invalidation_refused`**, so a mount whose coherence promise is not being honoured
+says so instead of looking healthy. It is counted and not raised because the refusal is not retryable — the
+next round is refused identically, and a round kept for retry is the unbounded loop #8 forbids. What *replaces*
+the posture changes a measured cache cost, so that stays Ada's. The two tests remain red, as they should: the
+counter makes the loss visible, it does not make the kernel accept the invalidation.
 
 **Why it matters.** §4.6's `Invalidated` posture is the promise that a change made through one attachment is
 pushed to the kernel's caches; `coherence_mount` is the proof of it, and on 6.19 a name another attachment

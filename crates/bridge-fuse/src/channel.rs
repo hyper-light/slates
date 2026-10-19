@@ -223,9 +223,11 @@ const EVENTFD_WORD: usize = size_of::<u64>();
 
 /// Encodes one kernel invalidation as an unsolicited notification (§4.6 `notify`). `expire_only` says the kernel
 /// negotiated `FUSE_HAS_EXPIRE_ONLY`, so a live-source entry is expired rather than dropped. `None` for a name past
-/// the wire cap: the kernel cannot be holding it either, so there is nothing to drop.
-fn encode_invalidation(invalidation: &Invalidation, expire_only: bool) -> Option<Vec<u8>> {
+/// the wire cap: the kernel cannot be holding it either, so there is nothing to drop. The flag says whether this is
+/// an **entry** invalidation, because the kernel's `ENOENT` means something different for one (see [`NotifyThread`]).
+fn encode_invalidation(invalidation: &Invalidation, expire_only: bool) -> Option<(Vec<u8>, bool)> {
   let mut out = [0u8; NOTIFY_BYTES];
+  let entry = matches!(invalidation, Invalidation::Entry { .. });
   let encoded = match invalidation {
     Invalidation::Entry {
       parent,
@@ -248,7 +250,7 @@ fn encode_invalidation(invalidation: &Invalidation, expire_only: bool) -> Option
     }
   };
   let n = encoded.ok()?;
-  Some(out.get(..n)?.to_vec())
+  Some((out.get(..n)?.to_vec(), entry))
 }
 
 /// A round of kernel invalidations written **away from the serving thread** (§4.6 "Cache posture"), owned by the
@@ -265,7 +267,8 @@ fn encode_invalidation(invalidation: &Invalidation, expire_only: bool) -> Option
 /// holds the lock from the moment it issues the request, whenever we read it). This mirrors the landing barrier's
 /// thread (A-132, `slates-server` `landing.rs`), which exists for the same reason.
 struct NotifyThread {
-  outcome: std::sync::mpsc::Receiver<Result<(), ChannelError>>,
+  /// The round's outcome: how many entry invalidations the kernel refused, or the device's own refusal.
+  outcome: std::sync::mpsc::Receiver<Result<u32, ChannelError>>,
   thread: Option<std::thread::JoinHandle<()>>,
   /// Where the cursor stood before the round, to put it back if the kernel refuses the write.
   before: Option<slates_bridge_core::InvalidationCursor>,
@@ -276,7 +279,7 @@ impl NotifyThread {
   /// waiting for the kernel's next request. Refused with the system's errno when no thread can start.
   fn start(
     device: OwnedFd,
-    messages: Vec<Vec<u8>>,
+    messages: Vec<(Vec<u8>, bool)>,
     before: Option<slates_bridge_core::InvalidationCursor>,
     wake: Option<ChangeNotifier>,
   ) -> Result<NotifyThread, ChannelError> {
@@ -284,12 +287,23 @@ impl NotifyThread {
     let thread = std::thread::Builder::new()
       .name("slates-fuse-notify".to_owned())
       .spawn(move || {
-        let mut round = Ok(());
-        for message in &messages {
-          // The kernel answers `ENOENT` when it holds no such entry and `ENOTEMPTY` when a directory it would drop
-          // is in use — neither is a fault of the mount (it has nothing stale, or revalidates on next use).
+        let mut round = Ok(0u32);
+        for (message, entry) in &messages {
+          // `ENOTEMPTY` is the kernel declining to drop a directory that is in use, and `ENOENT` on an *inode*
+          // invalidation is the kernel not holding that inode — neither is a fault of the mount. `ENOENT` on an
+          // **entry** invalidation is not benign and is counted, not discarded: on Linux 6.19 the kernel refuses it
+          // and goes on answering from the cached negative entry, so the name a neighbour created is never seen
+          // (`docs/bugs/2026-10-19-linux-6-19-refuses-the-entry-invalidation-slates-swallows.md`). It is counted
+          // rather than raised because the refusal is not retryable — the next round would be refused the same way,
+          // and a round kept for retry is an unbounded loop.
           match rustix::io::write(&device, message) {
-            Ok(_) | Err(rustix::io::Errno::NOENT | rustix::io::Errno::NOTEMPTY) => {}
+            Ok(_) => {}
+            Err(rustix::io::Errno::NOENT) if *entry => {
+              if let Ok(refused) = round.as_mut() {
+                *refused = refused.saturating_add(1);
+              }
+            }
+            Err(rustix::io::Errno::NOENT | rustix::io::Errno::NOTEMPTY) => {}
             Err(e) => {
               round = Err(ChannelError::Device {
                 call: "notify",
@@ -321,7 +335,7 @@ impl NotifyThread {
   /// The round's outcome once it is back (its thread joined: it has only to exit), `None` while it is still being
   /// written. A thread gone without an outcome (it cannot be: shipped code does not panic, and a panic aborts) reads
   /// as the device refusing.
-  fn returned(&mut self) -> Option<Result<(), ChannelError>> {
+  fn returned(&mut self) -> Option<Result<u32, ChannelError>> {
     let round = match self.outcome.try_recv() {
       Ok(round) => round,
       Err(std::sync::mpsc::TryRecvError::Empty) => return None,
@@ -507,6 +521,11 @@ pub struct ServeState {
   /// Wakes this loop when a round finishes, so its outcome is seen and the next round started without waiting for
   /// the kernel's next request. Absent in a harness that drives the loop itself.
   notify_wake: Option<ChangeNotifier>,
+  /// Entry invalidations the kernel refused with `ENOENT` since this was last read. Every one of them is a name
+  /// this mount believes it has told the kernel about and has not: the kernel kept the cached entry. Counted so a
+  /// mount losing coherence is visible instead of silent (CLAUDE.md #9); read and cleared by the owner that
+  /// reports it.
+  entry_invalidations_refused: u64,
 }
 
 impl std::fmt::Debug for ServeState {
@@ -530,7 +549,14 @@ impl ServeState {
       allocating: None,
       notifying: None,
       notify_wake: None,
+      entry_invalidations_refused: 0,
     }
+  }
+
+  /// The entry invalidations the kernel has refused since this was last asked, and zero afterwards. A non-zero
+  /// answer means the kernel is still serving names this mount has tried to invalidate.
+  pub fn take_entry_invalidations_refused(&mut self) -> u64 {
+    std::mem::take(&mut self.entry_invalidations_refused)
   }
 
   /// Wakes this state's serve loop whenever a round of invalidations finishes being written (§4.6): the round runs
@@ -698,9 +724,16 @@ fn deliver_owed(
     };
     let before = round.before;
     state.notifying = None;
-    if let Err(refusal) = outcome {
-      state.coherence.rewind(before);
-      return Err(refusal);
+    match outcome {
+      Err(refusal) => {
+        state.coherence.rewind(before);
+        return Err(refusal);
+      }
+      Ok(refused) => {
+        state.entry_invalidations_refused = state
+          .entry_invalidations_refused
+          .saturating_add(u64::from(refused));
+      }
     }
   }
   let expire_only = state.expire_only;
@@ -710,7 +743,7 @@ fn deliver_owed(
   // that outlived the name's creation).
   let root = bridge.root(cx).ok();
   let before = state.coherence.cursor();
-  let mut messages: Vec<Vec<u8>> = Vec::new();
+  let mut messages: Vec<(Vec<u8>, bool)> = Vec::new();
   let delivered = state
     .coherence
     .deliver(bridge, cx, &mut |invalidation: &Invalidation| {
@@ -1225,8 +1258,8 @@ mod tests {
     }
     rustix::fs::fcntl_setfl(&writer, rustix::fs::OFlags::empty()).expect("blocking again");
 
-    let mut round =
-      NotifyThread::start(writer, vec![vec![7u8; 64]], None, None).expect("the round starts");
+    let mut round = NotifyThread::start(writer, vec![(vec![7u8; 64], false)], None, None)
+      .expect("the round starts");
     // The owner carries on: the round is out, and asking does not block.
     assert!(
       round.returned().is_none(),
@@ -1244,8 +1277,8 @@ mod tests {
       }
     }
     assert!(
-      matches!(outcome, Some(Ok(()))),
-      "the round completed once its write could land: {outcome:?}"
+      matches!(outcome, Some(Ok(0))),
+      "the round completed once its write could land, refusing nothing: {outcome:?}"
     );
     assert!(round.thread.is_none(), "its thread was joined");
   }

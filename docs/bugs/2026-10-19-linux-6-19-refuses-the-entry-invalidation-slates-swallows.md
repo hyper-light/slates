@@ -1,6 +1,7 @@
 # Linux 6.19 refuses `FUSE_NOTIFY_INVAL_ENTRY` with `ENOENT`, and slates reads that as "nothing stale"
 
-Status: **root cause confirmed by instrumentation; the fix is a §4.6 posture decision and is Ada's call.**
+Status: **root cause confirmed by instrumentation. The silent half is fixed — the refusal is counted, not
+discarded. The posture half is a §4.6 decision and is Ada's call.**
 
 ## Description
 
@@ -61,10 +62,16 @@ a 7-character working directory too.
 
 ## What a fix has to decide (Ada's call, §4.6)
 
-1. **Stop swallowing it.** `ENOENT` from an `INVAL_ENTRY` is no longer evidence that nothing is stale, so at
-   minimum it should be counted and surfaced rather than discarded. This is the part that is clearly a defect
-   under CLAUDE.md #9 whatever else is decided.
-2. **Then the posture.** If the kernel will not drop a negative entry on request, `Invalidated` cannot keep
+1. **Stop swallowing it — DONE.** `ENOENT` from an `INVAL_ENTRY` is no longer evidence that nothing is stale,
+   and it is no longer discarded: `encode_invalidation` now says whether a message is an entry invalidation,
+   the notify thread counts the entry refusals separately from the benign ones (an `ENOENT` on an *inode*
+   invalidation, and `ENOTEMPTY`, still mean what the old comment said), the count rides the round's outcome
+   into `ServeState`, and the server reports it as **`fuse.entry_invalidation_refused`** in `status`. Zero is
+   the healthy reading; any movement means this mount's `Invalidated` posture is not being honoured by the
+   kernel it is talking to. It is counted rather than raised because the refusal is **not retryable** — the
+   next round is refused identically, and a round kept for retry is the unbounded loop CLAUDE.md #8 forbids.
+   This was the part that is a defect under CLAUDE.md #9 whatever else is decided, so it did not wait.
+2. **Then the posture — open.** If the kernel will not drop a negative entry on request, `Invalidated` cannot keep
    promising unbounded negative lifetimes on those kernels. The options are a bounded negative-entry lifetime
    (the kernel re-asks, at a measured cost), invalidating the **parent inode** instead when the entry refusal
    comes back, or dropping to `Revalidated` for negative entries. Each changes a measured cost that §4.6

@@ -98,6 +98,11 @@ const ADOPTED: &str = "fuse.adopted";
 /// Format: see [`MOUNT_REFUSED`] — requests the kernel resent after a takeover's `FUSE_NOTIFY_RESEND` (A-61): ones
 /// a dead daemon read and never answered, served here; the resend's non-vacuity counter.
 const RESENT: &str = "fuse.resent";
+/// Format: entry invalidations the kernel **refused**, each one a name this mount believes it has told the kernel
+/// about and has not — the kernel kept the cached entry and goes on answering from it. Zero is the healthy
+/// reading; any movement means this mount's `Invalidated` posture is not being honoured by the kernel it is
+/// talking to (`docs/bugs/2026-10-19-linux-6-19-refuses-the-entry-invalidation-slates-swallows.md`).
+const ENTRY_INVALIDATION_REFUSED: &str = "fuse.entry_invalidation_refused";
 /// Format: see [`MOUNT_REFUSED`] — resent requests answered from the reply their dead daemon published and never
 /// delivered (A-61); the exact replay's non-vacuity counter.
 const REPLAYED: &str = "fuse.replayed";
@@ -585,6 +590,11 @@ fn turn(s: &mut ShardState, attachment: u64) -> Turned {
       return Turned::Ended;
     }
   };
+  // What the round that just finished could not deliver. Counted rather than raised: the refusal is not
+  // retryable (the next round is refused identically, and a round kept for retry is an unbounded loop), but it is
+  // never silent — CLAUDE.md #9.
+  let refused = mount.serve.take_entry_invalidations_refused();
+  s.count(ENTRY_INVALIDATION_REFUSED, refused);
   s.fuse_mounts.insert(attachment, mount);
   turned
 }
