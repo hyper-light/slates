@@ -18,21 +18,30 @@
   clippy::indexing_slicing
 )]
 
+#[cfg(unix)]
 use std::time::{Duration, Instant};
 
+#[cfg(unix)]
 use slates_client::{Client, ClientError, CreateSpec, Deadlines, Intent, NamePolicy, SizeClass};
+#[cfg(unix)]
 use slates_machine::{MachineProfile, ProfileOptions};
+#[cfg(unix)]
 use slates_server::{Daemon, DaemonConfig, SegmentSource};
 
 /// Shape: the file read per sample, in kibibytes, unless the first argument says otherwise.
+#[cfg(unix)]
 const DEFAULT_FILE_KIB: usize = 1024;
 /// Shape: reads sampled, unless the second argument says otherwise.
+#[cfg(unix)]
 const DEFAULT_SAMPLES: usize = 200;
 /// Shape: the machine profile's budget per probe.
+#[cfg(unix)]
 const PROBE_MS: u64 = 5;
 /// Shape: how long a client retries the rendezvous while the daemon starts.
+#[cfg(unix)]
 const START_WAIT: Duration = Duration::from_secs(5);
 
+#[cfg(unix)]
 fn deadlines() -> Deadlines {
   Deadlines::derive(
     slates_server::daemon::LIVENESS_BUDGET_NS,
@@ -41,6 +50,7 @@ fn deadlines() -> Deadlines {
   .get()
 }
 
+#[cfg(unix)]
 fn connect(instance: &str) -> Client {
   let started = Instant::now();
   loop {
@@ -53,6 +63,7 @@ fn connect(instance: &str) -> Client {
   }
 }
 
+#[cfg(unix)]
 fn percentile(sorted: &[u128], per_thousand: u64) -> u128 {
   if sorted.is_empty() {
     return 0;
@@ -62,6 +73,15 @@ fn percentile(sorted: &[u128], per_thousand: u64) -> u128 {
   sorted[usize::try_from(at).unwrap_or(last).min(last)]
 }
 
+/// The paired arm: `Client::map_read` is `#[cfg(unix)]` (it maps a descriptor the daemon sends over the control
+/// socket), so there is nothing to price off Unix. It skips loudly, and `clippy --all-targets` compiles this
+/// example on every platform — which is how the Windows lane found it red (2026-10-19).
+#[cfg(not(unix))]
+fn main() {
+  eprintln!("skip: the local zero-copy read A/B needs the Unix client API (`Client::map_read`)");
+}
+
+#[cfg(unix)]
 fn main() {
   let mut args = std::env::args().skip(1);
   let file_kib = args

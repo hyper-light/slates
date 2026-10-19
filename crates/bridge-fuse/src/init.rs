@@ -44,11 +44,23 @@ const ASSUMED_PAGE_BYTES: u32 = 4096;
 /// arm64 host wants 16, and hard-coding either would silently halve or quadruple the request size on the
 /// other.
 pub fn max_pages() -> u16 {
-  let page = u32::try_from(rustix::param::page_size())
-    .unwrap_or(ASSUMED_PAGE_BYTES)
-    .max(1);
+  let page = host_page_bytes().max(1);
   let pages = MAX_WRITE.div_ceil(page).clamp(1, KERNEL_MAX_PAGES);
   u16::try_from(pages).unwrap_or(u16::MAX)
+}
+
+/// The page size this host serves requests on.
+#[cfg(unix)]
+fn host_page_bytes() -> u32 {
+  u32::try_from(rustix::param::page_size()).unwrap_or(ASSUMED_PAGE_BYTES)
+}
+
+/// The paired arm for a platform with no `/dev/fuse`, so no kernel is ever told this number — it exists
+/// because this codec is built and its golden vectors checked on every platform, and `rustix`'s `param`
+/// module is Unix-only (the Windows cross-lint was the first compiler to see that: 2026-10-19).
+#[cfg(not(unix))]
+fn host_page_bytes() -> u32 {
+  ASSUMED_PAGE_BYTES
 }
 /// Shape: the time granularity the daemon reports: one nanosecond (times are monotonic ns).
 const TIME_GRAN_NS: u32 = 1;

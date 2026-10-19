@@ -7773,11 +7773,46 @@ default and the CLI flag cannot reach it** — `cargo tree --target x86_64-pc-wi
 --no-default-features -e normal` still resolves `zstd-sys`, and `aws-lc-sys` with it. Both then need an MSVC
 C toolchain that macOS does not have (`cc --target=x86_64-pc-windows-msvc` cannot find `stdlib.h`).
 
-**What it would take, and why it was not done here.** Either (a) `default-features = false` on those three
-edges plus a default-on forwarding feature through every dependent — the shape `slates-client`'s `pure-hash`
-already uses for blake3, but ten-plus manifests and a change to *production* feature defaults, where a slip
-silently drops the ratio codec from release builds; or (b) a Windows C toolchain on a runner. Neither host
-here has one: `fedora` has no zig, no mingw, no clang and no Windows rustup target, and `adacachy` has
-`cargo-zigbuild` but not the pinned 1.98 toolchain. Installing either is a tool install on Ada's machines.
-Until one of those happens the remaining crates are **CI's Windows lane only**, which is where NASM for
-`aws-lc-sys` already lives.
+**Correcting the framing, and then doing better (same day).** "Seven of fourteen" was the wrong denominator:
+**fourteen was never the target.** CI's own Windows job says so — "`--workspace` cannot build here: the
+NFS-mount and FUSE/FSKit crates (bridge-nfs, cli, bridge-fuse, bridge-fskit) are macOS/Linux-only" — and it
+lints a set of **nine**: `mem`, `ipc`, `rt`, `base`, `client`, `server`, `bridge-winfsp`, `sdk-node`,
+`sdk-python`.
+
+And the toolchain objection was wrong too. A Windows C toolchain does not have to be installed on anyone's
+machine: an **ephemeral container** can carry one, exactly as the Linux lane's containers already carry
+`fuse3` and `clippy`. `apt-get install gcc-mingw-w64-x86-64` plus `rustup target add x86_64-pc-windows-gnu`
+gives a working cross-toolchain in a throwaway image, and both `zstd-sys` and `aws-lc-sys` build through it.
+
+**So seven of CI's nine now lint from this machine**, `--all-targets -- -D warnings`, exit 0:
+`mem`, `ipc`, `rt`, `base`, `client`, `server` and `sdk-python`. The two that remain need a real Windows
+environment, not a toolchain: `bridge-winfsp` links the WinFsp SDK (`WINFSP_LIB`, a Windows MSI) and
+`sdk-node`'s napi build script needs a Node toolchain.
+
+**The lane paid for itself twice on its first run.** It found `init.rs` using `rustix::param::page_size()` in
+code built on every platform (my `max_pages()` from earlier today; `rustix`'s `param` is Unix-only), now a
+paired `#[cfg]` helper; and a genuine **pre-existing CI-Windows red** — `crates/client/examples/map_read_ab.rs`
+calls `Client::map_read`, which is `#[cfg(unix)]`, from an example with no platform gate, so
+`-p slates-client --all-targets -- -D warnings` could not have passed on Windows. It now skips loudly off Unix,
+like the `crosvm_dax_ab` harness beside it. The feature-rewiring option in the paragraph above is still the
+only way to reach `vfs`/`server`/`cluster` with `--no-default-features`, but it is no longer needed to lint
+them: the container's mingw builds their C dependencies outright.
+
+### 2026-10-19: the DAX suites had only ever run on macOS; they now run on x86_64 Linux too
+
+The gate's evidence was all taken on one host and one architecture. Taken again on x86_64 Linux
+(`fedora.attlocal.net`, kernel 6.19.10, page 4,096, release build on the pinned 1.98.0), where none of it had
+run before:
+
+| suite | x86_64 Linux |
+|---|---|
+| `slates-vfs --test dax` | **53 passed**, 0 failed |
+| `slates-bridge-virtiofs --test device` | **35 passed**, 0 failed, 1 ignored |
+| `slates-bridge-virtiofs --test serve` | **6 passed**, 0 failed |
+| `slates-bridge-virtiofs --lib` | **19 passed**, 0 failed |
+| `PROPTEST_CASES=20000 … --test dax a_random_interleaving` | **green, 3.90 s** |
+| `PROPTEST_CASES=2000 … --test device a_random_window_schedule` | **green, 0.30 s** |
+
+The two deepened runs are the gate checklist's own commands, at 133× and 25× their committed case counts, on
+the architecture they had never been taken on. Nothing in the DAX path is page-size or endianness shaped as far
+as these say, which is the useful negative result: the macOS evidence was not accidentally architecture-bound.
