@@ -110,8 +110,22 @@ The fix is architectural and is Ada's call. The options, with what each costs:
      ```
 
      So the confinement survives the descriptor crossing to another process, which is the property row 1
-     exists for. What remains untested is crosvm's `SHMEM_MAP` handler specifically — it mmaps what it is
-     given, so it should accept this, and the harness for it already exists
+     exists for.
+
+     And the rest of the shape a VMM needs was run too, on the same host — a VMM reserves the guest's DAX
+     region up front and `MAP_FIXED`es each window into a slot of it, which is a path a plain `mmap` test
+     would not have exercised:
+
+     ```
+     SHMEM_MAP-style MAP_FIXED into the reserved region: OK, slot byte0='W' last='W'
+     SHMEM_UNMAP-style restore of the hole:              OK
+     writable udmabuf mapping: OK, and the arena now reads 'Z' at the window (the write reached the memfd)
+     ```
+
+     The last line is the one that separates this from option 2: **writable zero-copy survives**. A write
+     through the guest's window lands in the arena's own pages, which is what the per-mapping copy gave up.
+     What is left untested is crosvm's `SHMEM_MAP` handler specifically — it mmaps what it is handed, and
+     every primitive it uses is now shown to work on a udmabuf — and the harness for that already exists
      (`crates/client/examples/crosvm_dax_ab/`).
 
 Of the four, **1 and 4 keep both zero-copy and confinement**; 4 is much the smaller change and the only one
