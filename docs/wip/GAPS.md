@@ -817,6 +817,39 @@ unverified *lane* would not is that this is two crates added to a **proven** lan
 Windows runner that already builds everything they depend on — and if it does go red, that is the
 finding, found in CI rather than at the first tag.
 
+### 8a-dax-measure. The sandbox's huge-page check is a whole-mapping delta, so it refuses spans that are already backed (2026-10-20, OPEN — design call)
+
+Fixing `8a-dax-place` below exposed the next layer. `DaxZone::verify_contiguous` decides whether a span
+really is one physical huge page by discarding it, reading the mapping's PMD-mapped bytes, faulting the
+span back in, reading again, and requiring the **growth** to be at least a huge page (then a
+`MADV_COLLAPSE` and a third reading). But `/proc/self/smaps` reports per **VMA**, not per span, so that
+growth is attributable only while nothing else about the mapping moves — and two things routinely do.
+Measured 2026-10-20 on Linux 6.12.76 (aarch64), instrumented at the refusal while the DAX suite ran its
+73 tests in parallel:
+
+- `before=4194304 after=4194304 collapsed=4194304 wanted=2097152` — no growth at all, because with
+  `enabled=[always]` the span came straight back as a huge page on fault. A span that **is** backed reads
+  as zero growth and is refused.
+- `before=8388608 after=4194304` — the total *fell* between two readings, the rest of the mapping having
+  been broken up under the suite's own memory pressure.
+
+Consequence: L1 is refused non-deterministically, and with it L2 and B2. Three identical runs of the DAX
+suite skipped 1, 1 and 3 tests, naming different ones each time, so the L1 coverage that runs on Linux is
+a coin flip rather than a gate. Worse for the product than for the suite: in a long-lived daemon with a
+warm arena, a span that is *already* huge-backed is the ordinary case, and that is exactly the case this
+refuses. Nothing claims an isolation it lacks — the refusal is conservative — but the defence is absent
+whenever it fires.
+
+Measured and rejected: advising the span alone, so the advice splits its VMA and `smaps` can report it by
+itself. The mapping is advised whole when it is made, so a sub-range advice changes no VMA flag and the
+kernel does not split — `huge_backed_bytes(span_address)` answered `None` (measured). Per-page attribution
+through `/proc/self/pagemap` is not open to us either: the PFN field reads zero without `CAP_SYS_ADMIN`,
+which R10 and banned item 4 refuse.
+
+What would settle it is the sandbox owning its **own mapping**, so its VMA is its own and the question is
+answered absolutely rather than as a difference. That is a §4.6 change — the arena hands out regions, and a
+sandbox is cut from one — so it is Ada's call, not mine.
+
 ### 8a-dax-place. The DAX sandbox was reserved by `mmap` address luck (2026-10-20, closed)
 
 Asking what §4.6's L1 sandbox does on a host whose `shmem_enabled` is `never` — the kernel's default,
