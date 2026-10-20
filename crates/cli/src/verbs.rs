@@ -904,6 +904,7 @@ fn established_text(established: &Established) -> String {
 /// kernel's table read now, the source's identity compared with the evidence's. A harness runs it immediately
 /// before its runtime binds the path; a replaced or missing source refuses (exit 1), so the runtime is never
 /// handed a replacement or a bare directory where the mount was.
+#[cfg(unix)]
 pub(crate) fn oci_check(check: &crate::args::OciCheck) -> Result<(), Failure> {
   let table = slates_bridge_oci::mount_table::mount_table()
     .map_err(|e| Failure::Failed(format!("reading the mount table: {e}")))?;
@@ -949,6 +950,18 @@ pub(crate) fn oci_check(check: &crate::args::OciCheck) -> Result<(), Failure> {
       )))
     }
   }
+}
+
+/// The paired arm: the source check reads the host's mount table through `slates-bridge-oci`, a `cfg(unix)`
+/// dependency, and there is no Windows mount table of that shape to read. A container harness runs this
+/// immediately before its runtime binds a verified source, so answering "fine" where nothing was checked is
+/// the one answer it must never give — it refuses instead, typed, exactly as `oci-runtime` does.
+#[cfg(not(unix))]
+pub(crate) fn oci_check(_check: &crate::args::OciCheck) -> Result<(), Failure> {
+  Err(Failure::Failed(
+    "slates oci-check reads a host mount table this platform does not have; it is not available here"
+      .to_owned(),
+  ))
 }
 
 /// One transport's six facts on one `transport:` line (§4.6 A-9), in the vocabulary the JSON uses.

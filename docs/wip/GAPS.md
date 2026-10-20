@@ -866,6 +866,28 @@ failure mode to protect against. `std::` paths resolve on every platform, so lea
 typo in them an error. Red-checked rather than assumed — a planted `rustix::fs::fsync` in `slates-mem`
 still fails `-D clippy::disallowed-methods` with the flag in place, and the plant was removed byte-exact.
 
+### 8a-win-dumps. Windows has no unprivileged core-dump exclusion, and the CLI now says so (2026-10-20, OPEN — needs Ada)
+
+Compiling `slates-cli` for Windows for the first time turned up three Unix-only sites in the shipped
+binary, and one of them is a security property rather than a portability detail. `dumps::exclude_from_dumps`
+sets `RLIMIT_CORE = 0` before the anchor or daemon starts, so a crash cannot write the process's RAM —
+tenant content and keys included — to a core file. Windows has no unprivileged equivalent: a crash dump is
+written by Windows Error Reporting, turning it off for a process is a registry setting an administrator
+makes (R10 refuses to require one), and `WerRegisterExcludedMemoryBlock` excludes named regions rather than
+the process, which does not fit a content arena that is not a fixed set of regions known up front.
+
+So on Windows the hardening is **absent**, and the paired arm returns `Ok` rather than refusing, because
+refusing would stop the daemon starting on Windows at all — a bigger hole than the one it would guard. That
+is a judgement call with security weight, which is why it is here and not only in a `cfg`.
+
+**Ada's call:** accept it and say so in the Windows packaging, exclude the arena explicitly through
+`WerRegisterExcludedMemoryBlock` where the regions are known, or decide that a Windows daemon refuses to
+start unless dumps are already disabled. The other two sites were portability and are fixed: `mount::backend`
+and `command_on_path` were gated `not(macos), not(linux)`, which is true of Windows as well as of the BSDs
+they were written for, so Windows took the BSD path into `rustix::fs::access`; and `verbs::oci_check` reads a
+host mount table Windows does not have, and now refuses typed rather than answering "fine" where nothing was
+checked — the one answer a pre-bind source check must never give.
+
 ### 8a-shards-boot. A real microVM mounted a slates volume and read it (2026-10-20, closed)
 
 `crates/bridge-fuse/examples/shards_fs_serve.rs` serves a volume to a shards microVM over virtio-fs:

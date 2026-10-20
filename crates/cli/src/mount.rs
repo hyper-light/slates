@@ -63,7 +63,7 @@ pub(crate) enum MountBackend {
 /// Classifies the loopback mount mechanism from an injectable "is this command on the `PATH`" probe.
 /// Pure — no filesystem or process references — so every branch tests on any host without a live mount,
 /// exactly as sylk factors its detection into a predicate-injected `classifyDarwinFUSEBackend`.
-#[cfg(any(all(not(target_os = "macos"), not(target_os = "linux")), test))]
+#[cfg(any(all(unix, not(target_os = "macos"), not(target_os = "linux")), test))]
 fn classify(command_exists: impl Fn(&str) -> bool) -> MountBackend {
   if command_exists("mount_nfs") {
     MountBackend::NfsLoopback
@@ -74,7 +74,7 @@ fn classify(command_exists: impl Fn(&str) -> bool) -> MountBackend {
 
 /// Whether `name` resolves to an executable on the `PATH` (the analogue of sylk's `commandAvailable`
 /// over `exec.LookPath`): a directory of the `PATH` holds an entry `name` the caller may execute.
-#[cfg(all(not(target_os = "macos"), not(target_os = "linux")))]
+#[cfg(all(unix, not(target_os = "macos"), not(target_os = "linux")))]
 fn command_on_path(name: &str) -> bool {
   let Some(paths) = std::env::var_os("PATH") else {
     return false;
@@ -91,9 +91,19 @@ pub(crate) fn backend() -> MountBackend {
 }
 
 /// The loopback mount mechanism this host offers, probing the real `PATH` for `mount_nfs`.
-#[cfg(all(not(target_os = "macos"), not(target_os = "linux")))]
+#[cfg(all(unix, not(target_os = "macos"), not(target_os = "linux")))]
 pub(crate) fn backend() -> MountBackend {
   classify(command_on_path)
+}
+
+/// The paired arm for a host that is not Unix at all. These two said `not(macos), not(linux)`, which is true
+/// of Windows as well as of the BSDs they were written for, so Windows took the BSD path and reached
+/// `rustix::fs::access` — a POSIX call it does not have. Nothing caught it because nothing had ever compiled
+/// this crate for Windows (2026-10-20). A Windows host has no `mount_nfs` loopback; its mount is WinFsp,
+/// reached elsewhere, so the loopback backend is `Unsupported` and the caller refuses with that.
+#[cfg(not(unix))]
+pub(crate) fn backend() -> MountBackend {
+  MountBackend::Unsupported
 }
 
 /// The `mount_nfs` arguments to mount the volume named `name`, served on the daemon's loopback `port`,

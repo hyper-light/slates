@@ -28,9 +28,28 @@
 use crate::Failure;
 
 /// Format: the core size limit that writes no core, soft and hard.
+#[cfg(unix)]
 const NO_CORE_BYTES: u64 = 0;
 
+/// The paired arm, and it is weaker than the Unix one — which is the point of saying so here.
+///
+/// `RLIMIT_CORE = 0` has no unprivileged equivalent on Windows. A crash dump is written by Windows Error
+/// Reporting, and turning that off for a process is a registry setting an administrator makes, which R10
+/// refuses to require; `WerRegisterExcludedMemoryBlock` excludes named regions rather than the process, and
+/// the daemon's content arena is not a fixed set of regions it could name up front. So on Windows this
+/// hardening is **absent**: a crash can write the daemon's RAM, tenant content included, to a dump file.
+///
+/// It returns `Ok` rather than refusing because refusing would stop the daemon starting on Windows at all,
+/// which is a bigger hole than the one it would be guarding. Recorded for Ada in `docs/wip/GAPS.md`
+/// (`8a-win-dumps`) rather than left as an implication of a `cfg`. Found 2026-10-20, when `slates-cli` was
+/// compiled for Windows for the first time.
+#[cfg(not(unix))]
+pub(crate) fn exclude_from_dumps() -> Result<(), Failure> {
+  Ok(())
+}
+
 /// Excludes this process from core dumps, or refuses with the setting the host would not take.
+#[cfg(unix)]
 pub(crate) fn exclude_from_dumps() -> Result<(), Failure> {
   let no_core = rustix::process::Rlimit {
     current: Some(NO_CORE_BYTES),
@@ -65,11 +84,12 @@ fn exclude_linux_paths() -> Result<(), Failure> {
 }
 
 /// No Linux-only path to close elsewhere: the core limit is the mechanism.
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(unix, not(target_os = "linux")))]
 fn exclude_linux_paths() -> Result<(), Failure> {
   Ok(())
 }
 
+#[cfg(unix)]
 fn refused(setting: &str, e: rustix::io::Errno) -> Failure {
   Failure::Failed(format!(
     "cannot exclude this process from core dumps: {setting} was refused (code {})",
