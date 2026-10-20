@@ -481,9 +481,10 @@ jobs:
           docker run --rm --platform linux/386 -v "$PWD":/src -w /src rust:1.98.0
           cargo test --no-fail-fast -p slates-rt -p slates-mem
 
-  # arm64 Windows is the one square of the platform matrix with no runner anywhere: GitHub has no
-  # aarch64 Windows image and this kiln has no arm64 Windows box, so the code is cross-compiled and
-  # linted rather than run, and that limit is stated rather than papered over. It earns a lane
+  # The cheap half of arm64 Windows: a cross lint from Linux on every push and pull request, paired
+  # with the `windows-arm64` lane below that runs the code natively on main and the nightly. Same
+  # split as `windows-lint` and `windows-nightly`, for the same reason — a compile break should fail
+  # a pull request in a minute, not wait for a scarcer runner. It earns a lane
   # because exactly one file in the workspace is architecture-conditional —
   # `crates/wire/src/crc32c.rs`, whose aarch64 arm uses `is_aarch64_feature_detected!("crc")` and
   # the NEON CRC intrinsics — and because mem, rt and ipc carry the Win32 shared-memory, IOCP and
@@ -509,6 +510,59 @@ jobs:
           cargo clippy -p slates-wire -p slates-mem -p slates-rt -p slates-ipc
           --all-targets --target aarch64-pc-windows-msvc
           --features slates-machine/pure-hash -- -D warnings
+
+  # The same square of the matrix, run rather than compiled. GitHub's `windows-11-arm` image went
+  # generally available (actions/runner-images#14592) and is free for a public repository, which this
+  # is, so arm64 Windows stopped being a platform we could only cross-compile for. That matters more
+  # here than on most projects: arm64 has a weaker memory model than x86_64, and the rings, the
+  # doorbell protocol and the parking protocol have never executed on a weak-ordering machine under
+  # Windows — loom explores their interleavings and x86_64 Windows runs them, but no lane has ever
+  # done both at once. The image carries what the build needs, checked against its manifest before
+  # this landed: `Microsoft.VisualStudio.Component.VC.Tools.ARM64`, LLVM 22.1.8 with the clang-cl
+  # components, rustup and clippy.
+  #
+  # Scoped to the five crates the cross-lint above already proves compile for the target, so the one
+  # new variable is native execution. base, vfs, server and the SDKs are the next increment and are
+  # left out deliberately: they pull `zstd-sys` and `aws-lc-sys`, and aws-lc-sys's builder refuses
+  # aarch64-pc-windows-msvc without clang-cl, which is present on this image but has never been
+  # exercised for that target. On main and the nightly only, as `windows-nightly` is, so a first run
+  # that finds something real does not block every pull request.
+  #
+  # Unlike every other lane added this week, this one could not be rehearsed before landing: there is
+  # no arm64 Windows machine on this laptop or in this kiln, and jupiter — the one Windows box —
+  # fails every command in its WSL bash relay. It is modelled step for step on `windows-nightly`,
+  # which is proven.
+  windows-arm64:
+    name: aarch64 windows (native, by test)
+    if: github.event_name != 'pull_request'
+    runs-on: windows-11-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.0 # keep in sync with rust-toolchain.toml
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy natively on arm64 Windows
+        run: >-
+          cargo clippy -p slates-wire -p slates-mem -p slates-rt -p slates-ipc -p slates-machine
+          --all-targets -- -D warnings
+      - name: Test the Win32 shared memory (native arm64 Windows)
+        run: cargo test -p slates-mem
+      - name: Test the rings and the Event wake (native arm64 Windows)
+        run: cargo test -p slates-ipc --test rings
+      - name: Test the Win32 rendezvous (native arm64 Windows)
+        run: cargo test -p slates-ipc --test rendezvous
+      - name: Test the typed delivery (native arm64 Windows)
+        run: cargo test -p slates-ipc --test delivery
+      - name: Test the IOCP driver's kick and no-op (native arm64 Windows)
+        run: 'cargo test -p slates-rt --lib driver::'
+      - name: Test the AFD readiness over loopback UDP (native arm64 Windows)
+        run: cargo test -p slates-rt --test udp
+      - name: Test the shard CPU clock (native arm64 Windows)
+        run: 'cargo test -p slates-rt --lib thread_clock::'
+      - name: Test the wire codec and its CRC32C on arm64 hardware
+        run: cargo test -p slates-wire
 
   # Miri (the memory-model interpreter) and loom (the concurrency-permutation checker) run
   # on the unit tests of the crates that hold unsafe code. Miri ships only with the

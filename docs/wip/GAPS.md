@@ -520,10 +520,28 @@ are retained with their scope; no documentation edit is an implementation accept
 
   It is now a permanent lane, `windows-arm64-lint` (`aarch64 windows (cross lint, by compile)`),
   verified on Linux in `rust:1.98.0` before it landed (2026-10-20, 5m36s, exit 0) rather than
-  pushed and watched, because this project has shipped a red lane that way twice. What the lane
-  cannot do is **run** anything: GitHub has no aarch64 Windows image and this kiln has no arm64
-  Windows box, so arm64 Windows is compiled and linted, never executed. That limit stands until
-  such a machine exists.
+  pushed and watched, because this project has shipped a red lane that way twice.
+
+  **Correction, same day:** I first wrote here that the lane "cannot run anything: GitHub has no
+  aarch64 Windows image". That is wrong. GitHub's `windows-11-arm` image is generally available
+  (actions/runner-images#14592) and is free for a public repository, which `hyper-light/slates`
+  is. Its manifest carries `Microsoft.VisualStudio.Component.VC.Tools.ARM64`, LLVM 22.1.8 with the
+  clang-cl components, rustup and clippy — checked before relying on it. So a second lane,
+  `windows-arm64` (`aarch64 windows (native, by test)`), now **runs** the code there on main and
+  the nightly, gated as `windows-nightly` is. That matters beyond ticking the platform box: arm64
+  has a weaker memory model than x86_64, and the rings, the doorbell protocol and the parking
+  protocol have never executed on a weak-ordering machine under Windows. `cargo test -p
+  slates-wire` on that lane also puts the one architecture-conditional file in the workspace on
+  real arm64 hardware, against the RFC 3720 B.4 check value `0xE3069283` and a hardware-versus-
+  software differential over 10,007 bytes.
+
+  Scoped to the five crates the cross lint already proves compile for the target, so native
+  execution is the only new variable. base, vfs, server and the SDKs are the next increment: they
+  pull `zstd-sys` and `aws-lc-sys`, and aws-lc-sys refuses `aarch64-pc-windows-msvc` without
+  clang-cl, which that image has but which has never been exercised for the target. This lane is
+  the one thing landed this week that could not be rehearsed first — there is no arm64 Windows
+  machine on this laptop or in this kiln — so it is modelled step for step on `windows-nightly`
+  and kept off pull requests.
 
   **The arm64 Windows *release* target is declared and has never been built, and it has a named
   unmet prerequisite.** `release.yml:34` lists `aarch64-pc-windows-msvc` in the matrix and builds
@@ -535,11 +553,17 @@ are retained with their scope; no documentation edit is an implementation accept
   "Windows ARM64 (aarch64-pc-windows-msvc) requires clang-cl ... or set CC to a working
   clang-cl" (`aws-lc-sys-0.45.0/builder/cc_builder.rs:1113`, the version `Cargo.lock` pins).
   `release.yml` installs NASM only, and its own comment scopes that to "Windows **x86**
-  assembly". GitHub's `windows-latest` image does ship LLVM, so the build may find `clang-cl` on
-  PATH and succeed — but that is a guess, and the first release cut will be the first test of
-  it. Not changed here: adding an unverified step to a workflow that cannot be run from this
-  machine is how this project has shipped red lanes before. The cheap mitigation before the
-  first tag is a `workflow_dispatch` run of `release.yml`, which it already supports.
+  assembly". **The prerequisite is met by the image, checked rather than assumed** (2026-10-20,
+  `actions/runner-images` `images/windows/Windows2025-Readme.md`, image version 20261013.288.2):
+  LLVM 20.1.8 is installed, `Microsoft.VisualStudio.Component.VC.Llvm.Clang` and
+  `.ClangToolset` are present, and so is `Microsoft.VisualStudio.Component.VC.Tools.ARM64`, which
+  the cross-link needs. What is still unproven is the last hop — whether `cc` and aws-lc-sys's
+  own probe (it searches `clang-cl`, `clang-cl.exe`, `cl`, `cl.exe` on PATH,
+  `cc_builder.rs:1457`) find it in that environment. No workflow change here: adding an
+  unverified step to a workflow I cannot run is how this project has shipped red lanes before,
+  and the components being installed is a better reason to leave it alone than to patch it. The
+  cheap check before the first tag is a `workflow_dispatch` run of `release.yml`, which it
+  already supports.
 
   **Deliberately not extended to `slates-vfs`, `slates-cluster` and `slates-server`.** They reach
   `slates-archive`, whose `zstd` is on for every dependent because the root declares it without
