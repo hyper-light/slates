@@ -737,6 +737,40 @@ keeping: a gate that only ever runs on one platform is not a gate.** The `gates`
 ubuntu and macos both, so CI would have caught this on the next push — it had simply never been
 pushed.
 
+### 8a-win. The shipped binary's Windows code was compiled by nothing (2026-10-21)
+
+Same question as the lint-gate entry above, asked of the other platform: **what does only one
+platform see, and does any lane look there?** macOS and Linux lint the whole workspace through
+`gates`. Windows does not — `windows-lint` and `windows-nightly` name eleven crates, not
+`--workspace`. So a crate with `#[cfg(windows)]` code that is not in that list, and not reached
+as a dependency of something in it, is never compiled for Windows at all.
+
+Two crates qualified, and they are not the same case:
+
+- **`slates-anchor`** has one Windows site (`supervise.rs:636`). It *is* a dependency of
+  `slates-client` and `slates-server`, both of which the lane lints, so it has to **compile** for
+  the lane to pass — a compile error there would already have surfaced. What it has never had is
+  a **lint**, since clippy only lints the packages it is given.
+- **`slates-cli`** has two (`signal.rs:32`, `verbs.rs:418`), and **nothing depends on it** — it is
+  the top-level binary. No lane names it and no lane reaches it, so the `slates` binary's Windows
+  signal handling has never been compiled by anything. The one thing that would is
+  `release.yml`'s `cargo build --release --workspace --target x86_64-pc-windows-msvc`, and that
+  workflow has never run.
+
+Checked before assuming a break: the Windows branch uses
+`windows_sys::Win32::System::Console::SetConsoleCtrlHandler`, and `Win32_System_Console` **is** in
+the workspace's `windows-sys` feature list — so this is not the 2026-09-05 defect ("three Windows
+imports behind an unrequested `Win32_Security` feature") repeating. The code looks sound; it has
+simply never been compiled.
+
+Both crates are now in both Windows lanes. **Not verifiable from this machine**, and the reason is
+worth stating rather than glossed: `slates-cli` pulls `zstd-sys` and `aws-lc-sys`, which need an
+MSVC C toolchain for the target that a Mac does not have, so the five-crate `pure-hash` recipe
+that covers the cross lanes cannot reach it. What makes adding it acceptable where adding an
+unverified *lane* would not is that this is two crates added to a **proven** lane on a real
+Windows runner that already builds everything they depend on — and if it does go red, that is the
+finding, found in CI rather than at the first tag.
+
 ### 8a-dax. DAX surface audited for never-executed paths (2026-10-20)
 
 The codec defect above was found by asking which production paths nothing ever runs. The same
