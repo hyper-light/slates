@@ -488,6 +488,13 @@ are retained with their scope; no documentation edit is an implementation accept
   graph once the root's `default-features = false` keeps `slates-machine`'s zstd out; no crate in
   the set has its own `build.rs`, and every third-party build script in it is pure Rust.
 
+  It is now a permanent lane, `windows-arm64-lint` (`aarch64 windows (cross lint, by compile)`),
+  verified on Linux in `rust:1.98.0` before it landed (2026-10-20, 5m36s, exit 0) rather than
+  pushed and watched, because this project has shipped a red lane that way twice. What the lane
+  cannot do is **run** anything: GitHub has no aarch64 Windows image and this kiln has no arm64
+  Windows box, so arm64 Windows is compiled and linted, never executed. That limit stands until
+  such a machine exists.
+
   **Deliberately not extended to `slates-vfs`, `slates-cluster` and `slates-server`.** They reach
   `slates-archive`, whose `zstd` is on for every dependent because the root declares it without
   `default-features = false`, so a cross-check of them needs a C toolchain for the target.

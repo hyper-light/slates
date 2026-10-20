@@ -481,6 +481,35 @@ jobs:
           docker run --rm --platform linux/386 -v "$PWD":/src -w /src rust:1.98.0
           cargo test --no-fail-fast -p slates-rt -p slates-mem
 
+  # arm64 Windows is the one square of the platform matrix with no runner anywhere: GitHub has no
+  # aarch64 Windows image and this kiln has no arm64 Windows box, so the code is cross-compiled and
+  # linted rather than run, and that limit is stated rather than papered over. It earns a lane
+  # because exactly one file in the workspace is architecture-conditional —
+  # `crates/wire/src/crc32c.rs`, whose aarch64 arm uses `is_aarch64_feature_detected!("crc")` and
+  # the NEON CRC intrinsics — and because mem, rt and ipc carry the Win32 shared-memory, IOCP and
+  # AFD code that no other arm64 target ever compiles. `pure-hash` keeps BLAKE3's C and NEON
+  # sources out; that is the only C left in this graph, since the root's `default-features = false`
+  # already keeps zstd out of `slates-machine`. vfs, cluster and server are deliberately absent:
+  # they reach `slates-archive`, whose zstd needs a C toolchain for the target, and they hold no
+  # architecture-conditional code, so the lane would cost a feature-graph change for no coverage.
+  # Verified in `rust:1.98.0` on Linux before it landed (2026-10-20, 5m36s, clean).
+  windows-arm64-lint:
+    name: aarch64 windows (cross lint, by compile)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.0 # keep in sync with rust-toolchain.toml
+          components: clippy
+          targets: aarch64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy the arm64-Windows-buildable crates
+        run: >-
+          cargo clippy -p slates-wire -p slates-mem -p slates-rt -p slates-ipc
+          --all-targets --target aarch64-pc-windows-msvc
+          --features slates-machine/pure-hash -- -D warnings
+
   # Miri (the memory-model interpreter) and loom (the concurrency-permutation checker) run
   # on the unit tests of the crates that hold unsafe code. Miri ships only with the
   # nightly toolchain, which CI installs for this job alone; the pinned stable toolchain builds
