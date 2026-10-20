@@ -8531,3 +8531,29 @@ it". A block whose pin was dropped while its mapping stayed live (the shared per
 its deferred free complete and reads as *free*, so the zone's re-claim took a row a guest was still mapping
 through. `reclaim_missing` now refuses any row a live mapping names, which is sound whatever made it look
 free. Clean at 3 × 4,000 cases on aarch64 Linux after, and 10 / 10 full-suite runs.
+
+### 2026-10-19: the two §4.6 items that are not mine to build, and why
+
+With L0, L1, L2 and B2 built and driven, two things §4.6 names remain. Neither is an oversight; each is a
+decision that belongs to Ada, and the ledger should say so rather than let them read as forgotten work.
+
+**The adaptive migration trigger is blocked on banned item #4.** §4.6 wants the shift to fire only for blocks
+showing a hammer signature, so honest agents pay nothing. The signature has to come from PEBS/IBS, and an
+unprivileged daemon cannot read another process's performance counters — that needs `CAP_PERFMON` or an
+OS-shipped privileged broker, which is exactly the capability requirement CLAUDE.md #4 forbids without explicit
+authorization. **This would require a privileged OS-shipped broker (or `CAP_PERFMON`). Does Ada explicitly
+authorize it?** Until then the unconditional shift stands, and §4.6's own measurement is why that is tolerable:
+242 ns per 4 KiB block at the 16 ms cadence.
+
+The unprivileged alternative §4.6 floats — "SETUPMAPPING / fault cadence" — was considered and is **not worth
+building as a gate**. §4.6 states the reason itself: "a pure direct-write hammer is invisible to the daemon". A
+detector that cannot see the main threat would still invite an operator to switch the unconditional shift off,
+which trades a defence that works for one that looks like it does. Measured-and-rejected, on the design's own
+words rather than a number.
+
+**The low-trust sacrificial pool is unblocked but unbuilt, and deliberately so.** §4.6 offers it as a *may*: a
+pool that intentionally co-locates mutually-untrusted tenants in one zone so they absorb each other's leakage
+rather than the host, "sound only paired with B2" — and B2 is now wired, so the precondition is met. What it
+needs is a way to put chosen volumes in a shared zone instead of one each, which `DaxZones` keys by prefix and
+would key by pool. It is not built because it is a feature whose purpose is to *reduce* isolation for a
+deployment that wants that trade, and choosing to offer it is a product decision, not an implementation gap.
