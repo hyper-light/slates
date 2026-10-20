@@ -289,3 +289,104 @@ fn an_export_deeper_than_the_manifest_bound_is_refused_typed() {
     Some(VfsError::TreeTooDeep { limit: bound })
   );
 }
+
+/// How much more a byte is worth than neutral in the test below. The archive crate's own cost-model
+/// test uses the same shape and the same constant (`PRECIOUS_BYTES` in
+/// `crates/archive/tests/archive.rs`): at neutral worth a chunk read once stays raw, which that test
+/// asserts outright, so forcing the encode path means saying a byte is scarce. Derived: the measured
+/// break-even on this machine is 159x neutral for the cheapest codec (2026-10-20, GAPS §8), so the
+/// multiplier has to clear that with room for a slower box; 10_000 is the archive suite's choice and
+/// is kept identical so the two tests cannot drift apart.
+const BYTES_ARE_SCARCE: u64 = 10_000;
+
+/// §4.11, D-17: the archiver must honour a policy that says compress, and the archive must still
+/// restore byte for byte. Do: write highly compressible text into a volume, snapshot it, and export
+/// the snapshot with a profile-shaped policy under which a codec pays. Expect: at least one chunk
+/// comes back encoded and smaller than its raw length, and the restored file equals what was written.
+///
+/// Until 2026-10-20 `SnapshotArchiver` had never run with a policy that compresses. Both tests that
+/// drove it passed `CodecPolicy::raw_only()`, and the daemon's own derived policy decides raw on
+/// every machine measured so far — its value of a byte is anchored to memcpy bandwidth, which puts
+/// the cheapest codec about 159x from paying. `crates/archive/tests/archive.rs` covers the encode
+/// decision at `Archive::chunk_with`; nothing covered it through the volume walk, so the first build
+/// whose policy chose a codec would have run this path in production first.
+#[test]
+fn the_archiver_encodes_when_the_policy_says_to_and_the_archive_still_restores() {
+  use slates_archive::codec::{CodecPolicy, CodecRate, NEUTRAL_PERMILLE};
+  use slates_archive::format::Encoding;
+  use slates_vfs::export::{Progress, SnapshotArchiver};
+
+  let mut store = common::store();
+  let mut volume = common::volume(&mut store, 1 << 24);
+  let root = volume.root_inode(&store).unwrap();
+  let inode = volume
+    .create_file_no(&mut store, root, "text", 0o644)
+    .unwrap();
+  // Repeated structured text, so the decision is about worth and not about whether the bytes
+  // compress; big enough to span more than one content chunk on a 4 KiB page as well as a 16 KiB one.
+  let text: Vec<u8> = b"the quick brown fox jumps over the lazy dog. ".repeat(2000);
+  volume.write(&mut store, inode, 0, &text).unwrap();
+  let snapshot = volume.snapshot(&mut store).unwrap();
+
+  // The shape the boot probe measures, as one measured box's numbers, with a byte priced scarce.
+  let policy = CodecPolicy {
+    byte_ns_scaled: CodecPolicy::byte_worth_from_memcpy(10_000_000_000),
+    lz4: Some(CodecRate::from_throughput(
+      0,
+      700_000_000,
+      3_000_000_000,
+      476,
+    )),
+    zstd: vec![
+      CodecRate::from_throughput(1, 400_000_000, 1_200_000_000, 346),
+      CodecRate::from_throughput(3, 250_000_000, 1_100_000_000, 320),
+    ],
+    value_of_byte_permille: NEUTRAL_PERMILLE.saturating_mul(BYTES_ARE_SCARCE),
+    value_of_cpu_permille: NEUTRAL_PERMILLE,
+    expected_reads: 1,
+  };
+
+  let mut archiver = SnapshotArchiver::new(&volume, &store, snapshot, 0, 0, policy).unwrap();
+  let archive = loop {
+    if let Progress::Done(done) = archiver.advance(&volume, &store, u64::MAX).unwrap() {
+      break done;
+    }
+  };
+
+  let shapes: Vec<_> = archive
+    .chunks
+    .iter()
+    .map(|chunk| (chunk.encoding, chunk.raw_len, chunk.stored_len))
+    .collect();
+  let encoded = archive
+    .chunks
+    .iter()
+    .filter(|chunk| chunk.encoding != Encoding::Raw);
+  let mut encoded_count = 0u32;
+  for chunk in encoded {
+    encoded_count = encoded_count.saturating_add(1);
+    assert!(
+      chunk.stored_len < chunk.raw_len,
+      "an encoded chunk is smaller than its raw bytes: {chunk:?}"
+    );
+  }
+  assert!(
+    encoded_count > 0,
+    "the walk encoded at least one chunk under a policy where a codec pays; chunks: {shapes:?}"
+  );
+
+  // The whole point of compressing is that it is invisible to a reader.
+  let restored = slates_archive::restore(&archive, u64::MAX).unwrap();
+  let file = &restored.files["text"];
+  assert_eq!(file.len, text.len() as u64, "the restored length");
+  let mut rebuilt = vec![0u8; text.len()];
+  for (at, bytes) in &file.pieces {
+    let start = usize::try_from(*at).unwrap();
+    rebuilt[start..start + bytes.len()].copy_from_slice(bytes);
+  }
+  assert_eq!(rebuilt, text, "the archive restores the bytes exactly");
+  assert!(
+    restored.chunks_decoded > 0,
+    "and decoding actually ran (the decode-once counter moved)"
+  );
+}

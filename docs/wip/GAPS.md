@@ -465,10 +465,22 @@ are retained with their scope; no documentation edit is an implementation accept
   (`measured_policy()`, `CodecPolicy::raw_only()`), so all of them passed while the wiring was
   dead. Write-up: `docs/bugs/2026-10-20-the-ratio-codec-was-compiled-out-of-every-build.md`.
 
-  Owed from the same finding: no test drives a *compressed* archive end to end. Every test
-  anchor starts `--quick`, which sets `codecs: false` so the suites skip the 250 ms probe, so
-  the policy under test is still `raw_only()`. One full-profile end-to-end test that archives a
-  compressible volume and asserts encoded chunks would close it.
+  Owed from the same finding: no test drove a *compressed* archive. Partly closed 2026-10-20 by
+  `crates/vfs/tests/special.rs::the_archiver_encodes_when_the_policy_says_to_and_the_archive_still_restores`,
+  which was the sharper half of the gap. `SnapshotArchiver` had never run with a policy that
+  compresses — both tests that drove it passed `CodecPolicy::raw_only()` — so the volume walk's
+  encode path had no test at all and the first build whose policy chose a codec would have run it
+  in production first. The new test writes compressible text, exports the snapshot under a
+  profile-shaped policy where a codec pays, and asserts an encoded chunk smaller than its raw
+  bytes, an exact byte-for-byte restore, and a moved decode-once counter. Red-checked by setting
+  the scarcity multiplier to 1: the walk then yields `[(Raw, 65536, 65536), (Raw, 24464, 24464)]`
+  and the test fails — which is also an independent confirmation that neutral worth means raw.
+
+  Still open, and blocked on the anchor question below rather than on test plumbing: a *daemon*
+  end to end writing a compressed archive. The archive is produced on the fleet replication path
+  (`crates/server/src/fleet.rs:2277`, `:2584`), every test anchor starts `--quick` so the suites
+  skip the 250 ms codec probe, and the derived policy chooses raw anyway. All three have to move
+  before such a test could assert anything, and the third is a design decision.
 
   **Open, and larger than the bug above: the cost model's live signals are never fed.** Fixing
   the probe made a codec *reachable*; it did not make one *chosen*. Measured 2026-10-20 with the
