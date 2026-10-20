@@ -773,6 +773,17 @@ partition the hosts and every host runs one of them. It asserts the pass does no
 acknowledgement of a descriptor it sent, that the guest is answered `EOPNOTSUPP`, and that no window
 is recorded.
 
+**Closed 2026-10-20: the positive half now has a machine too.** "Runs on no machine this project can
+reach" was true of the laptop, Docker's linuxkit VM and a GitHub runner, but not of the x86_64 box,
+whose kernel carries `CONFIG_UDMABUF=y` built in — `/dev/udmabuf` is present (`crw-rw----+ root:kvm`)
+and readable by the ordinary login, so nothing has to be loaded and no privilege is needed. Run there
+on Linux 7.2.9 (x86_64):
+`a_message_based_setupmapping_parks_until_the_front_end_acks_then_answers_the_guest` **executed and
+passed** — no skip line — and on the same host the refusal half correctly stood down, printing "this
+host has /dev/udmabuf, so the placer confines the window instead". The two halves partition the hosts
+as designed, and both halves are now observed running on a host that has them. The checkout was a
+throwaway from `git archive HEAD`, removed afterwards; the box's own working tree was not touched.
+
 Red-checked against the historical escape itself rather than a stand-in: making `udmabuf::confine`
 hand back `object.try_clone_to_owned()` — the whole arena object, which is exactly what the
 2026-10-18 bug did — fails the new test on the right assertion ("the map was refused outright, not
