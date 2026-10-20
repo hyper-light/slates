@@ -8766,3 +8766,22 @@ Methodology worth keeping: constrain the **run**, never the build. The first att
 container that also compiled, cargo was OOM-killed, and both commands printed nothing at all — which reads as
 a pass if you only grep for failures. Build into a named volume with generous memory, then run the built
 binary under the limit.
+
+### 2026-10-20: the newest tests across the architectures, with the skips counted
+
+The CLI work of the last two days (the landing/grant arc, the OCI container consumption, the adversarial grant
+pass) had only been run where it was written. Across the four platform/arch pairs, **counting what actually
+ran rather than what passed**:
+
+| host | result | what ran |
+|---|---|---|
+| macOS 15 aarch64 | 23/23 | the grant arc in full — one-shot, session auto-approve, and the three attacks (the issuer surface exists here) |
+| Linux x86_64 (fedora) | 37/37 | the rootless OCI container read/write; the landing's ungranted half |
+| Linux aarch64 (Docker, `--device /dev/fuse` + `fuse3`) | 37/37, **3 skips** | the FUSE mount, and the landing test's ungranted half — the R1/R10 claim on arm64 |
+| Windows x86_64 (cross-lint) | clean | `slates-vfs --all-targets` compiles, DAX tests included |
+
+The three aarch64 skips are the issuer-surface flows, which Linux structurally cannot run. **Without
+`fusermount3` on PATH the count is 16 skips, not 3** — `linux_fuse_mount_runs` needs the binary as well as the
+device, and a container with `/dev/fuse` alone silently skips every mount flow while still printing
+"37 passed". That is the third time in two days that a green count meant less than it looked; the habit that
+catches it is to count the skips every time, not to read the pass line.
