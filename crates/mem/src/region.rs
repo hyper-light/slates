@@ -757,6 +757,49 @@ mod tests {
     assert!(!r.base().is_null());
   }
 
+  /// §4.6 L1's escalation, exercised in the crate that owns the `unsafe`. `Region::collapse_huge` is the one
+  /// raw `madvise` in this module, and until 2026-10-20 nothing here called it — only `crates/vfs`'s zone
+  /// reservation did, so the block had no test in its own crate and none that pinned its **refusals**.
+  ///
+  /// Do: ask a mapping to collapse a range that is valid, one that runs past its end, and an empty one.
+  /// Expect: the out-of-range and empty asks answer `false` **without reaching the syscall** (the slice
+  /// lookup refuses first, which is what keeps the pointer handed to `madvise` inside the mapping the
+  /// `SAFETY` note claims); and the valid ask answers whatever the kernel says, which is `false` wherever
+  /// there is no `MADV_COLLAPSE` — never a panic, and never a claim that the span is huge, since only
+  /// [`Region::huge_backed_bytes`] answers that.
+  #[test]
+  fn a_collapse_refuses_a_range_outside_the_mapping_before_it_asks_the_kernel() {
+    let page = 4096;
+    let mut region = Region::map(page * 8, page, false).expect("a region maps");
+    let len = region.len();
+    assert!(
+      !region.collapse_huge(0, len.saturating_add(page)),
+      "a range past the end of the mapping is refused before the syscall"
+    );
+    assert!(
+      !region.collapse_huge(len, page),
+      "a range starting at the end is refused before the syscall"
+    );
+    assert!(!region.collapse_huge(0, 0), "an empty range asks nothing");
+    // A valid range reaches the syscall, which Miri cannot execute: it stops at "Miri does not support
+    // calls to madvise with advice other than MADV_NORMAL, MADV_RANDOM, MADV_SEQUENTIAL, or MADV_WILLNEED".
+    // **Shrink rather than skip** — under Miri the three refusals above still run, and they are the part
+    // that keeps the pointer inside the mapping, so Miri checks the slice lookup, the pointer derivation and
+    // the length and reaches the boundary without flagging anything. Verified on Linux nightly 2026-10-20:
+    // Miri accepted everything up to the call and stopped only there. What the syscall itself does is
+    // covered by the real-hardware runs (§4.6 L1's sandbox reservation on fedora, adacachy and aarch64).
+    if cfg!(miri) {
+      return;
+    }
+    // The answer is the kernel's, and either way it must not panic and must not be read as "this span is
+    // huge" — that question is `huge_backed_bytes`'s alone.
+    let answered = region.collapse_huge(0, page);
+    assert!(
+      answered || !answered,
+      "a valid range answers without panicking"
+    );
+  }
+
   #[test]
   #[cfg_attr(miri, ignore)] // measures the machine
   fn the_huge_page_decision_follows_the_measured_fault_costs() {

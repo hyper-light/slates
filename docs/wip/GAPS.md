@@ -8924,3 +8924,31 @@ compiled** (x86_64 cross-lint, `-p slates-vfs -p slates-mem -p slates-machine -p
 clean, with the DAX tests and the new OCI chaos property included); **no Windows code has been executed** by
 this session, because kiln's relay wraps every command in `/bin/bash` through a WSL distro that has none.
 Execution remains CI's `windows-lint` lane and the release lane's native runners.
+
+### 2026-10-20: Miri over the `unsafe` this session added, and what Miri can and cannot say about it
+
+CLAUDE.md runs Miri on `mem`, and this session added an `unsafe` block there —
+`region::collapse_huge`'s raw `libc::madvise(MADV_COLLAPSE)` — **without running it**. Corrected, and the
+result is worth stating precisely because it is partial by nature.
+
+**Miri over `slates-mem --lib`, macOS aarch64: 84 passed, 0 failed, no undefined behaviour.** That says
+nothing about the new block, though: it is `#[cfg(target_os = "linux")]`, so macOS compiled it out — and
+worse, **no test in `mem` reached it on any platform**, because only `crates/vfs`'s zone reservation called
+it. An `unsafe` block with no test in its own crate is exactly the shape that goes unnoticed.
+
+`a_collapse_refuses_a_range_outside_the_mapping_before_it_asks_the_kernel` gives it one, and pins the
+**refusals** rather than the success: a range past the end, a range starting at the end, and an empty range
+all answer `false` *before* the syscall, which is what keeps the pointer handed to `madvise` inside the
+mapping the `SAFETY` note claims.
+
+**What Miri could then check, run on Linux nightly in a container:** it reached the `madvise` call and
+stopped with "Miri does not support calls to madvise with advice other than MADV_NORMAL, MADV_RANDOM,
+MADV_SEQUENTIAL, or MADV_WILLNEED" — **having flagged nothing before it**. So the slice lookup, the pointer
+derivation (`span.as_ptr().cast_mut().cast()`) and the length are sound by Miri's model right up to the FFI
+boundary, which is as far as any tool can go for a foreign call.
+
+The test **shrinks under Miri rather than skipping**: the three refusal assertions still run there (they are
+the ones that matter for soundness), and only the call that reaches the syscall is skipped. Skipping the
+whole test would have reported no coverage where there is real coverage to report. What the syscall itself
+does is covered by the real-hardware runs — the L1 sandbox reservations on fedora, adacachy and aarch64
+Linux.
