@@ -3268,3 +3268,85 @@ proptest! {
     }
   }
 }
+
+/// §4.6 B2 (the design's words: a refused guard leaves "the mapping served unguarded: the net is under the map,
+/// never a condition of it"). Do: fill the shard's whole chunk budget with file content so the net has no room for
+/// another clean copy, then map a read-only window on a volume that asked for the guard. Expect: the window is
+/// **served** — a guest entitled to a mapping is never failed because the safety net is full — the guard count stays
+/// where it was, `guards_refused` climbs by exactly one, and the window reads the file's real bytes.
+///
+/// This is the first test to read `DaxRegistry::guards_refused`. Before it, the counter had **no caller anywhere in
+/// the workspace** — written at `guard_if_asked` and read by nothing — so the refusal branch had never executed in a
+/// test, and a net that silently refused every guard was indistinguishable from one that never filled. That is the
+/// exact shape CLAUDE.md's non-vacuity rule exists to catch, on the counter the design nominates as the capacity
+/// signal: "a count climbing beside a flat guard count says the shard is at its net's bound, which is a capacity
+/// signal, not a bug".
+#[test]
+fn a_full_guard_net_still_serves_the_window_and_counts_the_refusal() {
+  const CAP: usize = 8;
+  const FILL: u8 = 0x5a;
+  /// A whole content chunk, so the fill loop spends the shard's chunk budget rather than packing
+  /// several small files into one chunk (a 4 KiB file did not exhaust it, measured 2026-10-20).
+  const WHOLE_CHUNK: usize = 64 * 1024;
+  /// Enough attempts to reach the arena's end at `WHOLE_CHUNK` a time (the test region is 16 MiB), with room
+  /// to spare so the loop ends on a refusal and never on its own bound — which the assertion below checks.
+  const FILL_ATTEMPTS: usize = 1024;
+  let mut store = store_capped_chunks(CAP);
+  let mut volume = volume(&mut store, 1 << 25);
+  volume.enable_dax_integrity_guard();
+
+  // Spend the shard's whole content arena, so the net cannot allocate another clean copy. `max_chunks` bounds
+  // the DAX registry, not content allocation — measured 2026-10-20, 32 files of 64 KiB went in under
+  // `store_capped_chunks(8)` without a refusal — so the fill has to reach the arena's own region, and it stops
+  // at the first write the arena cannot take rather than assuming how far that is.
+  let mut inodes = Vec::new();
+  for index in 0..FILL_ATTEMPTS {
+    let root = volume.root_inode(&store).unwrap();
+    let name = format!("f{index}");
+    let Ok(no) = volume.create_file_no(&mut store, root, &name, 0o644) else {
+      break;
+    };
+    if volume
+      .write(&mut store, no, 0, &vec![FILL; WHOLE_CHUNK])
+      .is_err()
+    {
+      break;
+    }
+    inodes.push(no);
+  }
+  assert!(
+    inodes.len() >= 2 && inodes.len() < FILL_ATTEMPTS,
+    "the fill ended because the arena was full, not because the loop ran out: {} files",
+    inodes.len()
+  );
+
+  let guarded_before = store.dax.guards();
+  let refused_before = store.dax.guards_refused();
+  let first = inodes[0];
+  let mapping = volume
+    .dax_map_read(&mut store, first)
+    .expect("a window is served even when the net cannot take a clean copy for it");
+
+  assert!(
+    store.dax.is_live(&mapping),
+    "the mapping is live, not a half-made one"
+  );
+  assert_eq!(
+    store.dax.guards(),
+    guarded_before,
+    "the net took no clean copy: it had no room for one"
+  );
+  assert_eq!(
+    store.dax.guards_refused(),
+    refused_before.saturating_add(1),
+    "and the refusal is counted exactly once, which is the capacity signal the design names"
+  );
+
+  // Served unguarded still means served correctly.
+  let seen = store.dax_read_raw(&mapping, 0, DAX_PAGE);
+  assert_eq!(
+    seen,
+    vec![FILL; DAX_PAGE],
+    "the unguarded window serves the file's real bytes"
+  );
+}

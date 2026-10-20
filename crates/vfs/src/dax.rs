@@ -1588,12 +1588,6 @@ impl Store {
     }
   }
 
-  /// Drops a mapping's integrity guard (§4.6 B2) if it has one, freeing the clean copy; returns whether one was held.
-  /// The explicit teardown a caller runs before it revokes a guarded mapping; [`Store::dax_revoke`] also calls it.
-  pub fn dax_unguard(&mut self, mapping: &Mapping) -> bool {
-    self.drop_guard(mapping)
-  }
-
   /// Removes `mapping`'s guard and releases its clean copy (unpin then free). Internal to the B2 paths.
   pub(crate) fn drop_guard(&mut self, mapping: &Mapping) -> bool {
     let Some(index) = self.dax.guards.iter().position(|g| &g.mapping == mapping) else {

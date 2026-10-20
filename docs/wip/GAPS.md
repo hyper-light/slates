@@ -636,6 +636,49 @@ are retained with their scope; no documentation edit is an implementation accept
   Nothing on Windows or Linux has *run* yet: that needs those machines (Phase 1's reference
   boxes).
 
+### 8a-dax. DAX surface audited for never-executed paths (2026-10-20)
+
+The codec defect above was found by asking which production paths nothing ever runs. The same
+question put to §4.6's DAX surface — every `pub`/`pub(crate)` function in `crates/vfs/src/dax.rs`
+and `daxzone.rs`, checked for a mention in any test or example — returned four names with none:
+`dax_unguard`, `shift_target`, `guards_refused`, `mapped_blocks`. Two were false alarms:
+`shift_target` and `mapped_blocks` are driven through `dax_shift_slice`, which tests do cover.
+The other two were real.
+
+- **`guards_refused` was written and read by nothing.** The B2 net's refusal counter is
+  incremented in `guard_if_asked` (`dax.rs:769`) and exposed by `DaxRegistry::guards_refused`,
+  and before 2026-10-20 **no caller existed anywhere in the workspace** — not a test, not the
+  server, not an example. So the refusal branch had never executed under test, and a net that
+  silently refused every guard looked exactly like one that never filled. The design nominates
+  this counter as the capacity signal ("a count climbing beside a flat guard count says the shard
+  is at its net's bound, which is a capacity signal, not a bug", §4.6 near line 2900), which made
+  the absence worse: the signal existed and nothing listened. Now gated by
+  `crates/vfs/tests/dax.rs::a_full_guard_net_still_serves_the_window_and_counts_the_refusal`,
+  which fills the shard's content arena (256 files of 64 KiB — `max_chunks` bounds the DAX
+  registry, *not* content allocation, measured when 32 such files went in under
+  `store_capped_chunks(8)` without a refusal), then maps a read-only window and asserts the
+  design's actual promise: the window is **served**, the guard count does not move, the refusal is
+  counted exactly once, and the unguarded window reads the file's real bytes. Red-checked by
+  disabling the increment in `dax.rs` and re-running: the test fails `left: 0, right: 1`, and the
+  source was restored byte-exact.
+- **`dax_unguard` was dead and is removed.** `dax.rs:1593` was its single occurrence in the whole
+  tree — no caller, no test, no mention in any document or manifest. Its doc claimed it was "the
+  explicit teardown a caller runs before it revokes a guarded mapping", but both revoke paths
+  (`dax_revoke:1449` and `dax_revoke_pending:1632`) call `drop_guard` directly, so it was a second
+  public path to the one real one — CLAUDE.md #7. Removed rather than tested, because a function
+  with no use cannot be tested by use (R5). The DAX suite is 68 tests, green, unchanged by its
+  removal.
+
+Swept the rest of the class and found nothing: every other counter on `DaxRegistry` (`healed`,
+`migrated`, `revoked`, `scrubbed`, `flips`, `release_refusals`) has readers outside `dax.rs`.
+
+Open, flagged by reasoning rather than measurement: the `guards.len() >= self.dax.cap` arm of
+`dax_guard` (`dax.rs:1476`) looks unreachable. A guard exists only for a live mapping, so
+`guards.len() <= mappings`, and mappings are bounded by the same `cap`; reaching `guards == cap`
+therefore implies `mappings == cap`, where the next map is refused by the registry bound before
+`guard_if_asked` runs. The reachable refusal is the clean-copy allocation below it, which is what
+the new test drives. Worth confirming before anyone relies on that arm.
+
 ## 8b. Unsafe, Miri and instruction counts (2026-09-05)
 
 - Unsafe surface, measured by `cargo xtask unsafe` (blocks, functions and impls in shipped
