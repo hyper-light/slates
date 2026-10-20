@@ -1370,22 +1370,62 @@ fn the_verbs_emit_json_with_the_json_flag() {
   drop(anchor);
 }
 
+/// The issuer surface the anchor publishes through the environment, read from its stderr.
+///
+/// **Paired by platform, because the fact is structural rather than something to sniff for.** On macOS and
+/// Windows the anchor names its segment and prints an `export` line a shell can pass to `grant`/`enroll`; on
+/// Linux the segment is a **descriptor only the anchor's children hold**, so no such line exists and no
+/// separate process can issue those verbs at all.
+///
+/// Getting this wrong twice on 2026-10-20 is why it is a `cfg` and not a heuristic. First the Linux arm hung:
+/// it read stderr for a line that platform never sends, and only each caller's own skip kept the suite
+/// green. Then a bound that stopped at the anchor's "up; daemon pid" greeting broke macOS instead, because
+/// there the greeting is printed *first* and the issuer line second — so the bound returned "no surface" on
+/// the one platform that has one. A platform difference stated as a `cfg` cannot be wrong about the order of
+/// two log lines.
+#[cfg(not(target_os = "linux"))]
+fn read_issuer_surface(stderr: &mut impl std::io::BufRead) -> Option<Vec<(String, String)>> {
+  let mut line = String::new();
+  loop {
+    line.clear();
+    assert!(
+      stderr.read_line(&mut line).unwrap() > 0,
+      "the anchor printed its issuer surface before ending"
+    );
+    if let Some(rest) = line
+      .trim()
+      .strip_prefix("slates anchor: issuer surface: export ")
+    {
+      return Some(
+        rest
+          .split(' ')
+          .filter_map(|pair| pair.split_once('='))
+          .map(|(name, value)| (name.to_owned(), value.to_owned()))
+          .collect(),
+      );
+    }
+  }
+}
+
+/// The paired arm: Linux publishes no issuer surface through the environment, so there is nothing to read
+/// and nothing to wait for.
+#[cfg(target_os = "linux")]
+fn read_issuer_surface(_stderr: &mut impl std::io::BufRead) -> Option<Vec<(String, String)>> {
+  None
+}
+
 /// Starts the anchor with its stderr piped and reads the issuer-surface line it prints (the segment
 /// handoff a shell exports to run `grant`/`enroll`/`revoke`/`run`); the rest of its stderr is drained
 /// by a thread so the anchor never blocks on a full pipe. Waits for the daemon as `start_anchor` does.
 ///
-/// **The exports are `None` where this platform publishes no issuer surface through the environment.**
-/// On Linux the anchor's segment is a descriptor only its children hold, so it prints no `export` line and
-/// a caller cannot issue `grant`/`enroll` from a separate process at all. Until 2026-10-20 this function
-/// simply **hung** there — it read stderr for a line that platform never prints, and the only thing keeping
-/// the suite green was every caller remembering its own `cfg` skip. A new test that forgot cost 40 minutes
-/// of wall time before the thread states said why. The scan is now bounded by a line that always comes (the
-/// anchor's "up; daemon pid" greeting), so an absent issuer surface is an answer rather than a hang, and a
-/// renamed message degrades to `None` instead of blocking.
+/// **The exports are `None` where this platform publishes no issuer surface through the environment** — see
+/// [`read_issuer_surface`], which is where that platform split and the two ways of getting it wrong live.
+/// Until 2026-10-20 this function simply **hung** on Linux, and the only thing keeping the suite green was
+/// every caller remembering its own skip; a new test that forgot cost 40 minutes.
 fn start_anchor_with_issuer_surface(
   instance: &str,
 ) -> (AnchorProcess, Option<Vec<(String, String)>>) {
-  use std::io::{BufRead, BufReader};
+  use std::io::BufReader;
   let mut child = slates()
     .args([
       "--instance",
@@ -1401,31 +1441,7 @@ fn start_anchor_with_issuer_surface(
     .unwrap();
   let mut stderr = BufReader::new(child.stderr.take().unwrap());
   let mut anchor = AnchorProcess { child, drain: None };
-  let mut exports = None;
-  let mut line = String::new();
-  loop {
-    line.clear();
-    assert!(
-      stderr.read_line(&mut line).unwrap() > 0,
-      "the anchor printed its issuer surface, or came up, before ending"
-    );
-    let said = line.trim();
-    if let Some(rest) = said.strip_prefix("slates anchor: issuer surface: export ") {
-      exports = Some(
-        rest
-          .split(' ')
-          .filter_map(|pair| pair.split_once('='))
-          .map(|(name, value)| (name.to_owned(), value.to_owned()))
-          .collect(),
-      );
-      break;
-    }
-    // The anchor is up and has said so without publishing an issuer surface: this platform has none to
-    // publish (Linux hands its segment to children by descriptor). Stop reading rather than wait forever.
-    if said.contains("up; daemon pid") {
-      break;
-    }
-  }
+  let exports = read_issuer_surface(&mut stderr);
   // Drain what the anchor says from here on (restarts, stops) so it never blocks writing.
   anchor.drain = Some(std::thread::spawn(move || {
     let _ = std::io::copy(&mut stderr, &mut std::io::sink());
@@ -5825,7 +5841,6 @@ fn a_write_over_a_base_lands_only_under_a_grant_and_leaves_the_base_alone() {
 }
 
 /// A number field of a one-line JSON object, as the CLI's `--json` emits it.
-#[cfg(target_os = "linux")]
 fn json_number(text: &str, key: &str) -> String {
   let needle = format!("\"{key}\":");
   let after = text.split(&needle).nth(1).unwrap_or_default();
@@ -5837,7 +5852,6 @@ fn json_number(text: &str, key: &str) -> String {
 }
 
 /// A string field of a one-line JSON object, as the CLI's `--json` emits it.
-#[cfg(target_os = "linux")]
 fn json_string(text: &str, key: &str) -> String {
   let needle = format!("\"{key}\":\"");
   text
@@ -5848,4 +5862,178 @@ fn json_string(text: &str, key: &str) -> String {
     .next()
     .unwrap_or_default()
     .to_owned()
+}
+
+/// **The standing authorization an agent is auto-approved by.** A grant need not be a keystroke per landing:
+/// `GrantScope::Session` is documented as "every landing of the volume into the target for the session", which
+/// is how an agent lands repeatedly without a human in the loop each time. Nothing tested that sentence.
+///
+/// Do: write into a volume, land it (refused, target untouched), grant **once** and land; then write again and
+/// grant with `--session`; then write a **third** time and land with no new grant at all. Expect: the session's
+/// standing authorization carries the third landing, and a landing into a **different** target still presents,
+/// because the scope names the target it was granted for (AUD-29-01).
+///
+/// No mount here on purpose — the volume is written through the CLI, so this runs wherever the anchor
+/// publishes its issuer surface through the environment, which Linux does not (its segment is a descriptor
+/// only the anchor's children hold).
+#[test]
+fn a_session_grant_auto_approves_the_next_landing_and_stops_at_its_target() {
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the session-grant flow: set SLATES_TEST_CLI=1 to run it (an anchor and its daemon)"
+    );
+    return;
+  }
+  let instance = format!("cli-session-{}", std::process::id());
+  let (anchor, issuer) = start_anchor_with_issuer_surface(&instance);
+  let Some(issuer) = issuer else {
+    println!(
+      "SKIP a_session_grant_auto_approves_the_next_landing_and_stops_at_its_target: this platform \
+       publishes no issuer surface through the environment, so no separate process can issue a grant"
+    );
+    return;
+  };
+  let target = build_output_dir("slates-session-target");
+  let elsewhere = build_output_dir("slates-session-elsewhere");
+  let id = created_volume(&instance, "sessionvol");
+  let (code, out, err) = run(&instance, &["attach", &id, "--write"]);
+  assert_eq!(code, 0, "{err}");
+  let attachment = value_of(&out, "attachment");
+
+  let first = a_one_shot_grant_places_the_first_plan(&instance, &issuer, &id, &attachment, &target);
+  let standing =
+    a_session_grant_places_the_second(&instance, &issuer, &id, &attachment, &target, &first);
+  the_session_carries_the_third_with_no_new_grant(&instance, &id, &attachment, &target, &standing);
+  the_session_does_not_reach_another_target(&instance, &id, &attachment, &elsewhere);
+  drop(anchor);
+}
+
+/// Phase one: a plan presents, nothing is on disk, and a one-shot grant places it.
+fn a_one_shot_grant_places_the_first_plan(
+  instance: &str,
+  issuer: &[(String, String)],
+  id: &str,
+  attachment: &str,
+  target: &str,
+) -> LandPlan {
+  let first = land_plan(instance, id, attachment, target, b"first");
+  assert!(first.required, "a landing onto disk requires a grant (R10)");
+  assert_eq!(
+    shell(&format!("ls -A {target} | wc -l")).trim(),
+    "0",
+    "the target is untouched before any grant"
+  );
+  let (code, _out, err) = run_as_issuer(
+    instance,
+    issuer,
+    &["grant", &first.landing, &first.manifest],
+  );
+  assert_eq!(code, 0, "the one-shot grant is accepted: {err}");
+  let (code, _out, err) = run(instance, &["land", id, target, "--grant", &first.landing]);
+  assert_eq!(code, 0, "the granted landing runs: {err}");
+  assert_eq!(shell(&format!("cat {target}/note")).trim(), "first");
+  first
+}
+
+/// Phase two: a second, different plan presents (the one-shot grant cannot cover it) and is granted for the
+/// session — the standing authorization an auto-approved agent lands under.
+fn a_session_grant_places_the_second(
+  instance: &str,
+  issuer: &[(String, String)],
+  id: &str,
+  attachment: &str,
+  target: &str,
+  first: &LandPlan,
+) -> String {
+  let second = land_plan(instance, id, attachment, target, b"second");
+  assert!(
+    second.required,
+    "a new plan presents before any session grant"
+  );
+  assert_ne!(
+    second.manifest, first.manifest,
+    "the second plan is its own manifest, so the one-shot grant cannot cover it"
+  );
+  let (code, _out, err) = run_as_issuer(
+    instance,
+    issuer,
+    &["grant", &second.landing, &second.manifest, "--session"],
+  );
+  assert_eq!(code, 0, "the standing grant is accepted: {err}");
+  let (code, _out, err) = run(instance, &["land", id, target, "--grant", &second.landing]);
+  assert_eq!(code, 0, "the session-granted landing runs: {err}");
+  assert_eq!(shell(&format!("cat {target}/note")).trim(), "second");
+  second.landing
+}
+
+/// Phase three, the one this test exists for: a third plan under the **standing** grant, with no new
+/// approval — "every landing of the same volume into the same target for the session".
+///
+/// How auto-approval actually works, which this pins down: `Grants::check` takes the grant the caller
+/// **names** (`id.ok_or(GrantRequired)?`) and never searches for a covering one, so a bare `land` always
+/// presents its plan. A session grant is not consumed (`consume` only consumes `Once`) and skips the
+/// manifest equality a one-shot grant enforces, so an agent keeps the id from its single approval and
+/// presents it on every later landing: no human after the first grant, and still a plan presented and a
+/// conflict refused each time.
+fn the_session_carries_the_third_with_no_new_grant(
+  instance: &str,
+  id: &str,
+  attachment: &str,
+  target: &str,
+  standing: &str,
+) {
+  let third = land_plan(instance, id, attachment, target, b"third");
+  assert!(
+    third.required,
+    "a bare landing always presents its plan: authorization is named, never searched for"
+  );
+  let (code, _out, err) = run(instance, &["land", id, target, "--grant", standing]);
+  assert_eq!(
+    code, 0,
+    "the standing grant authorizes a later, different plan with no new approval: {err}"
+  );
+  assert_eq!(
+    shell(&format!("cat {target}/note")).trim(),
+    "third",
+    "and it placed that plan"
+  );
+}
+
+/// Phase four, the scope's bound: the same session does not authorize a different target.
+fn the_session_does_not_reach_another_target(
+  instance: &str,
+  id: &str,
+  attachment: &str,
+  elsewhere: &str,
+) {
+  let away = land_plan(instance, id, attachment, elsewhere, b"elsewhere");
+  assert!(
+    away.required,
+    "a session grant for one target does not authorize another (AUD-29-01)"
+  );
+  assert_eq!(
+    shell(&format!("ls -A {elsewhere} | wc -l")).trim(),
+    "0",
+    "and that target is untouched"
+  );
+}
+
+/// What a landing presented: whether a grant is required, and the ids to grant it with.
+struct LandPlan {
+  required: bool,
+  landing: String,
+  manifest: String,
+}
+
+/// Writes `bytes` to the volume's `note` and asks to land it onto `target`; what the landing presented.
+fn land_plan(instance: &str, id: &str, attachment: &str, target: &str, bytes: &[u8]) -> LandPlan {
+  let (code, _out, err) = run_with_stdin(instance, &["write", id, attachment, "note"], bytes);
+  assert_eq!(code, 0, "the write lands in the volume: {err}");
+  let (code, out, err) = run(instance, &["land", id, target, "--json"]);
+  assert_eq!(code, 0, "the landing is presented: {err}");
+  LandPlan {
+    required: out.contains("\"grant_required\":true"),
+    landing: json_number(&out, "landing"),
+    manifest: json_string(&out, "manifest"),
+  }
 }

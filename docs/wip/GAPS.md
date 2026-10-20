@@ -8654,3 +8654,31 @@ uses) skip loudly on Linux with the reason, because no separate process can pres
 `--test-threads=1`: seven anchors racing starve each other and fail at "the daemon came up within N attempts".
 And a hung run's anchor and daemon survive a `pkill` that itself gets cut off — verify the kill, because the
 next run's failures will look like a regression and are not.
+
+### 2026-10-20: how an agent is auto-approved, pinned down — and a "fix" of mine that broke macOS
+
+Ada clarified that R10's grant "also means things like auto approve for an agent". slates implements that and
+nothing tested it, so the sentence and the behaviour had never been checked against each other.
+
+**They agree, once the interface is stated correctly.** `GrantScope::Session` is "every landing of the same
+volume into the same target for the session", and `Grants::check` honours it: a session grant is **not
+consumed** (`consume` only consumes `Once`) and **skips the manifest equality** a one-shot grant enforces. But
+`check` takes the grant the caller **names** — `id.ok_or(GrantRefusal::GrantRequired)?` — and never searches
+for a covering one. So a bare `land` always presents its plan, and the auto-approve path is: the agent keeps
+the id from its single approval and presents it on every later landing. No human after the first grant; still
+a plan presented and a conflict refused each time.
+`a_session_grant_auto_approves_the_next_landing_and_stops_at_its_target` proves the whole arc — one-shot grant
+places the first plan with the target untouched before it, a session grant places a second and different
+plan, a **third** different plan lands under that same standing grant with no new approval, and a different
+target still presents (AUD-29-01's bound). macOS 23/23, Linux 36/36, both single-threaded and clean.
+
+My first expectation — that a bare third `land` would auto-approve — was wrong, and the test says so in its
+own words now rather than quietly matching the code.
+
+**And a correction to yesterday's fix.** Bounding `start_anchor_with_issuer_surface`'s stderr scan at the
+anchor's "up; daemon pid" greeting **broke macOS**: there the greeting is printed *first* and the issuer line
+second, so the bound returned "no issuer surface" on the one platform that has one, and every issuer test
+began skipping. The difference is structural — Linux hands its segment to children by descriptor, macOS and
+Windows publish a name — so it is now a paired `#[cfg]` in `read_issuer_surface`, which cannot be wrong about
+the order of two log lines. Twice in two days a plausible bound beat a stated fact; the `cfg` is the stated
+fact.
