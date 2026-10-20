@@ -828,6 +828,21 @@ unverified *lane* would not is that this is two crates added to a **proven** lan
 Windows runner that already builds everything they depend on — and if it does go red, that is the
 finding, found in CI rather than at the first tag.
 
+### 8a-shards-boot. A real microVM mounted a slates volume and read it (2026-10-20, closed)
+
+`crates/bridge-fuse/examples/shards_fs_serve.rs` serves a volume to a shards microVM over virtio-fs:
+the socket is connected on the host and the descriptor handed in (`run --slates-fs-fd`), because a VM
+process is App-Sandboxed and cannot open it itself. The connection had been proven live, but **no guest
+had ever booted against it** — the one run owed was held back as workload interference on a shared
+machine until Ada cleared it.
+
+Run 2026-10-20 on this Mac (HVF, aarch64), `shards` branch `slates-fs-native` at 08066b27:
+`a_microvm_mounts_and_reads_a_slates_volume_over_virtiofs` **passed in 48.7 s with no skip line** — the
+test asserts the guest exited 0 *and* printed `SHARDS-TEST PASS`, which it prints only after mounting
+tag `shards0` and reading `/hello` back byte for byte. So a guest kernel's own virtio-fs client mounts a
+slates volume and reads it, with no host mount and no DAX window: the achievable integration where the
+VMM offers no DAX cache window. The DAX-window route stays as recorded in `8a-dax-confine`.
+
 ### 8a-dax-measure. The sandbox asked the wrong oracle: a whole-mapping total, not the span (2026-10-20, closed)
 
 Fixing `8a-dax-place` below exposed the next layer. `DaxZone::verify_contiguous` decided whether a span
