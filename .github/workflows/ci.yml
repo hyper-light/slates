@@ -498,18 +498,29 @@ jobs:
   # verification is worth knowing about: `docker run rust:1.98.0` resolved to a cached **linux/386**
   # image and ran under emulation, so it checked i686 Linux, not the x86_64 this lane runs on. Pass
   # `--platform` when the host is arm64, and read the platform warning rather than the exit code.
-  windows-cross-lint:
+  cross-lint:
     name: ${{ matrix.target }} (cross lint, by compile)
     strategy:
       fail-fast: false
       matrix:
-        # The two Windows triples `release.yml` ships that no lane ever compiled. x86_64 Windows is
-        # covered natively by `windows-lint`; these two were declared release targets with no build
-        # behind them at all. i686 earns its place twice over: `usize` is 32 bits there, and while the
-        # `i686` lane below runs the 32-bit narrowing tests on **Linux**, the Win32 shared-memory, IOCP
-        # and AFD code had never been compiled at 32 bits on any platform.
-        target: [aarch64-pc-windows-msvc, i686-pc-windows-msvc]
-    runs-on: ubuntu-latest
+        # Every triple `release.yml` ships and `publish-node.yml` publishes that no lane ever compiled.
+        # Three of the nine are covered by the hosts CI already runs on — x86_64 linux-gnu by ubuntu,
+        # aarch64-apple-darwin by macos, x86_64 windows-msvc by `windows-lint`. These six had no build
+        # behind them at all, which for a declared release target means the first person to cut a tag
+        # is the first to compile it. Two of them are worth more than box-ticking: `usize` is 32 bits on
+        # i686, and while the `i686` lane below runs the narrowing tests on **Linux**, the Win32
+        # shared-memory, IOCP and AFD code had never been compiled at 32 bits anywhere; and musl is a
+        # different libc under code that reaches for `rustix` and `libc` on every syscall.
+        #
+        # Each target is paired with a host that can actually build it rather than assumed portable.
+        include:
+          - { target: aarch64-pc-windows-msvc, runner: ubuntu-latest }
+          - { target: i686-pc-windows-msvc, runner: ubuntu-latest }
+          - { target: x86_64-unknown-linux-musl, runner: ubuntu-latest }
+          - { target: aarch64-unknown-linux-musl, runner: ubuntu-latest }
+          - { target: aarch64-unknown-linux-gnu, runner: ubuntu-latest }
+          - { target: x86_64-apple-darwin, runner: macos-latest }
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -518,7 +529,7 @@ jobs:
           components: clippy
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
-      - name: Clippy the Windows-cross-buildable crates
+      - name: Clippy the cross-buildable crates
         run: >-
           cargo clippy -p slates-wire -p slates-mem -p slates-rt -p slates-ipc
           --all-targets --target ${{ matrix.target }}

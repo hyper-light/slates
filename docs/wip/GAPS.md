@@ -586,8 +586,25 @@ are retained with their scope; no documentation edit is an implementation accept
   this machine and again on native `aarch64-unknown-linux-gnu` in a container. No defect found;
   what changed is that it is now known rather than assumed.
 
-  The lane is therefore a matrix over both triples, `windows-cross-lint`
-  (`${{ matrix.target }} (cross lint, by compile)`), rather than an arm64-only one.
+  **Asked of the whole matrix, 2026-10-21, rather than stopping at Windows.** `release.yml` ships
+  nine triples and `publish-node.yml` publishes the same nine. Three are covered by the hosts CI
+  already runs on: `x86_64-unknown-linux-gnu` by ubuntu, `aarch64-apple-darwin` by macos,
+  `x86_64-pc-windows-msvc` by `windows-lint`. **The other six had no build behind them at all** —
+  for a declared release target that means the first person to cut a tag is the first to compile
+  it. Two are worth more than box-ticking: `usize` is 32 bits on i686, and the `i686` lane runs
+  the narrowing tests on *Linux* while the Win32 shared-memory, IOCP and AFD code had never been
+  compiled at 32 bits anywhere; and musl is a different libc under code that reaches for `rustix`
+  and `libc` on every syscall.
+
+  All six lint clean over the five cross-buildable crates — `aarch64-pc-windows-msvc`,
+  `i686-pc-windows-msvc`, `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`,
+  `aarch64-unknown-linux-gnu` and `x86_64-apple-darwin` — checked on this machine and the
+  Linux-hosted five again in a native `aarch64-unknown-linux-gnu` container. No defect found;
+  what changed is that nine declared targets are now known to compile rather than assumed to.
+
+  The lane is therefore `cross-lint`, a matrix pairing each uncovered target with a host that can
+  actually build it (the five on ubuntu, `x86_64-apple-darwin` on macos), rather than the
+  arm64-only one it started as.
 
   It is now a permanent lane, `windows-arm64-lint` (`aarch64 windows (cross lint, by compile)`),
   verified on Linux before it landed rather than pushed and watched, because this project has
