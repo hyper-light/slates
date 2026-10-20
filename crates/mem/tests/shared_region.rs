@@ -430,3 +430,43 @@ fn a_placed_mapping_costs_a_page_of_slack_and_returns_every_byte_of_it() {
      mappings took, which is more than the {noise} the allocator's own movement allows"
   );
 }
+
+/// §4.6 L1 — an absurd length is refused with a typed error rather than a panic, and the mapper still works.
+///
+/// `ExclusiveObject::open_range` maps a range of an object a handoff names, so a caller's length reaches the
+/// mapping path without an `ftruncate` to refuse it on the way. Expect a typed error, no panic, and the next
+/// ordinary open to map and read normally, so a refusal leaves nothing broken behind it.
+///
+/// What refuses it, exactly, because the difference matters and the first version of this test claimed the
+/// wrong one: `Words::new().layout(len)` caps the length before the mapper is reached. Red-checked 2026-10-20
+/// by replacing the reservation's own `len.checked_add(grain)` with a wrapping add — this test still passed,
+/// so it does **not** exercise that arithmetic. That `checked_add` is defence in depth for a future caller
+/// that reaches the mapper without the layout cap, kept because no production path may panic, and it is
+/// honestly unreachable from any public API today.
+///
+/// Also measured while writing this, so the bound is not mistaken for something tighter: a span of 64 TiB
+/// (`1 << 46`) is *not* hostile here — a memory object is sparse and the address space is 256 TiB, so it
+/// reserves and maps perfectly well.
+#[test]
+#[cfg_attr(miri, ignore)] // a shared memory object is not modelled by Miri, as at `region.rs`
+fn an_absurd_length_is_refused_with_a_typed_error_and_the_mapper_still_works() {
+  let span = PAGE.saturating_mul(4);
+  let object = SharedObject::create(&object_name("overflow"), span, Words::new()).unwrap();
+  let handoff = object.handoff().unwrap();
+  // SAFETY: the handoff names this test's own object, which nothing truncates while the view lives; the call
+  // is expected to refuse, and on refusal it maps nothing at all.
+  let refused = unsafe { ExclusiveObject::open_range(&handoff, 0, usize::MAX) };
+  assert!(
+    refused.is_err(),
+    "a length of usize::MAX is refused with a typed error rather than panicked on"
+  );
+
+  // The refusal left nothing behind: the same object still opens and reads.
+  // SAFETY: as above, and this range is the object's own.
+  let mut mapped = unsafe { ExclusiveObject::open_range(&handoff, 0, span) }.unwrap();
+  mapped.bytes_mut().fill(0x6B);
+  assert!(
+    mapped.bytes().iter().all(|byte| *byte == 0x6B),
+    "a range opened after the refusal maps and reads back whole"
+  );
+}
