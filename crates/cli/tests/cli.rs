@@ -5502,3 +5502,129 @@ fn assert_linux_identities(entry: &serde_json::Value, path: &str) {
   assert_eq!(section(&out, "seen"), [me.as_str()]);
   assert_eq!(linux_owner(&format!("{path}/by-me")), me);
 }
+
+/// The container image the OCI consumption test runs: a tiny, pinned, widely mirrored one. Pulled once on a
+/// host that has never run it; a host that cannot reach a registry skips the test loudly rather than failing.
+#[cfg(target_os = "linux")]
+const OCI_IMAGE: &str = "docker.io/library/alpine:3.20";
+
+/// Whether this host can run the OCI consumption test: Linux, with `podman` and `/dev/fuse`. Rootless podman
+/// is the runtime under test on purpose — it is the unprivileged case R10 cares about, and the one slates'
+/// own gates had never had evidence for.
+#[cfg(target_os = "linux")]
+fn rootless_podman_available() -> bool {
+  std::path::Path::new("/dev/fuse").exists()
+    && Command::new("sh")
+      .args(["-c", "command -v podman"])
+      .output()
+      .map(|o| o.status.success())
+      .unwrap_or(false)
+}
+
+/// Runs `argv` in a container with `source` bound at `/vol` under `options`; (exit code, stdout, stderr).
+#[cfg(target_os = "linux")]
+fn podman_run(source: &str, options: &str, argv: &[&str]) -> (i32, String, String) {
+  let bind = format!("{source}:/vol:{options}");
+  let output = Command::new("podman")
+    .args(["run", "--rm", "-v", &bind, OCI_IMAGE])
+    .args(argv)
+    .output()
+    .unwrap();
+  (
+    output.status.code().unwrap_or(-1),
+    String::from_utf8_lossy(&output.stdout).into_owned(),
+    String::from_utf8_lossy(&output.stderr).into_owned(),
+  )
+}
+
+/// §4.6 A-9 / RQ-20: **an OCI container consumes the same VFS** — the row of `docs/wip/CONSUMERS.md` that read
+/// "mounted + read: no" until 2026-10-19, because `crates/bridge-oci`'s fifteen tests all assert on the mount
+/// verification and the runtime-spec entry and not one of them starts a container.
+///
+/// Do: create a volume, write a file into it, mount it (FUSE on Linux), and bind that mount into a **rootless**
+/// container twice — read-only, then writable. Expect: the container reads the bytes a client wrote; a write
+/// through the read-only bind is refused `EROFS` by the kernel, not by slates; a write through the writable
+/// bind lands; and the host sees it through the same mount. No privilege anywhere: rootless podman, the
+/// daemon's own uid, a FUSE mount with no `allow_other`.
+///
+/// Rootless on purpose. `crates/server/src/oci.rs` refuses a bind of a mount that is not shared with other
+/// users, reasoning that "a container's processes reach the source as their own ids ... would answer them
+/// EACCES" — which is true of a rootful engine and **false of a rootless one**, whose container-root maps to
+/// the mounting uid. This test is the evidence for that case, which slates' own `UserNamespaceUntested` and
+/// `ProfileUntested` refusals exist to demand.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_rootless_container_reads_and_writes_the_volume_through_its_mount() {
+  if !rootless_podman_available() {
+    eprintln!(
+      "skipping the OCI consumption flow: this host has no podman or no /dev/fuse (Linux, rootless, only)"
+    );
+    return;
+  }
+  let instance = format!("cli-oci-{}", std::process::id());
+  let anchor = start_anchor(&instance);
+
+  let (code, out, err) = run(
+    &instance,
+    &["volume", "create", "shared", "--bounded", "8MiB"],
+  );
+  assert_eq!(code, 0, "{err}");
+  let id = value_of(&out, "id");
+  let (code, out, err) = run(&instance, &["attach", &id, "--write"]);
+  assert_eq!(code, 0, "{err}");
+  let attachment = value_of(&out, "attachment");
+  let (code, _out, err) = run_with_stdin(
+    &instance,
+    &["write", &id, &attachment, "greeting.txt"],
+    b"hello from a slates volume",
+  );
+  assert_eq!(code, 0, "{err}");
+
+  // The guard tears the mount and the directory down even if an assertion below panics.
+  let mount_point = MountPoint {
+    path: fresh_mount_point(),
+  };
+  mount_and_check(&instance, &id, &mount_point.path);
+
+  // A read-only bind: the container reads what a client wrote, and the kernel refuses its write.
+  let (code, out, err) = podman_run(&mount_point.path, "ro", &["cat", "/vol/greeting.txt"]);
+  if code != 0 && err.contains("registry") {
+    eprintln!("skipping the OCI consumption flow: this host cannot pull {OCI_IMAGE}: {err}");
+    return;
+  }
+  assert_eq!(code, 0, "the container read the file: {err}");
+  assert_eq!(
+    out.trim(),
+    "hello from a slates volume",
+    "the container read the bytes a client wrote"
+  );
+  let (code, _out, err) = podman_run(
+    &mount_point.path,
+    "ro",
+    &["sh", "-c", "echo blocked > /vol/denied.txt"],
+  );
+  assert_ne!(code, 0, "a write through a read-only bind must be refused");
+  assert!(
+    err.contains("Read-only file system"),
+    "the kernel refuses it as EROFS, which is the read attachment's policy enforced by the runtime: {err}"
+  );
+
+  // A writable bind: the container's write lands, and the host sees it through the same mount.
+  let (code, _out, err) = podman_run(
+    &mount_point.path,
+    "rw",
+    &[
+      "sh",
+      "-c",
+      "echo 'written by a container' > /vol/from-container.txt",
+    ],
+  );
+  assert_eq!(code, 0, "the container wrote through the mount: {err}");
+  let seen = std::fs::read_to_string(format!("{}/from-container.txt", mount_point.path)).unwrap();
+  assert_eq!(
+    seen.trim(),
+    "written by a container",
+    "the host reads what the container wrote, through the same mount"
+  );
+  drop(anchor);
+}

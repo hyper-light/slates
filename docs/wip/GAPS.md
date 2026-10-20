@@ -8590,3 +8590,39 @@ design is now corrected, and it states the pairing callers must keep.
    sound whatever future caller creates the state.
 3. When the design and a bug record disagree about whether something is fixed, the bug record won here. Both
    are now consistent.
+
+### 2026-10-19: an OCI container really does read a slates volume — and slates refuses the configuration it works in
+
+The consumer ledger's OCI row said "mounted + read: no", because `crates/bridge-oci`'s fifteen tests all assert
+on the mount verification and the runtime-spec entry and none of them starts a container. It now says yes, by
+use: `a_rootless_container_reads_and_writes_the_volume_through_its_mount` creates a volume, writes a file,
+FUSE-mounts it and binds that mount into a **rootless podman** container twice. The container reads the bytes
+a client wrote; a write through the read-only bind is refused `EROFS` **by the kernel** — the read
+attachment's policy enforced by the runtime, which is what A-9 claims; a write through the writable bind lands
+and the host sees it through the same mount. Measured on fedora 6.19.10 as uid 1000, with no `allow_other`, no
+`--privileged` and no `CAP_*`. 34/34 of the CLI suite, no leftover daemon or mount.
+
+**And it exposed a gate that refuses what works.** `slates attach --oci` on that same mount refuses
+`AttachmentUnsupported { transport: Oci, reason: MountNotShared }`. Its stated reason is "a container's
+processes reach the source as their own ids, so the source must be a mount shared with other users
+(`allow_other`): a FUSE mount the daemon made for its user alone would answer them EACCES". That is true of a
+**rootful** engine and **false of a rootless one**, whose container-root maps to the mounting uid — which is
+why the container above read the file without any of it.
+
+What makes this worth fixing rather than just recording: the deciding fact is **already modelled**.
+`RuntimeProfile::rootless` is read from the engine's `name=rootless` security option
+(`crates/bridge-oci/src/runtime.rs`). The gate in `crates/server/src/oci.rs` simply never asks it — it decides
+on the mount alone. A rootless runtime needs no `allow_other`; a rootful one does.
+
+**The refusals are honest, not wrong-headed.** They are evidence gates in the design's own style —
+`UserNamespaceUntested: the engine runs rootless or remaps users; no workload has run so`,
+`ProfileUntested: no container workload has run through ... on ...`. They were waiting for exactly the
+workload this test now runs. **Owed:** let the bind consult the runtime profile, so a rootless engine's bind
+of an unshared mount is allowed on the evidence, and a rootful engine's still requires `allow_other`. The
+`MountNotShared` comment must be corrected whatever is decided, since its stated mechanism is false for the
+case slates' own R10 prefers.
+
+Also recorded: the full precondition chain a harness meets on Linux, which nothing documented end to end —
+`slates mount --shared` needs `user_allow_other` in `/etc/fuse.conf` (`AllowOtherNotGranted`), and without a
+shared mount `attach --oci` refuses `MountNotShared`, and without a mount at all it refuses
+`ChosenPathUnavailable { NotAMountPoint }`. Every step surfaced as a typed refusal, which is the gate working.

@@ -16,7 +16,7 @@ The columns are deliberately separate, because the gap between them is where the
 | **Kubernetes pods** | NFS PV over the daemon's RPC-with-TLS export, through the node's `tlshd` | yes | yes | **yes** | **yes** |
 | **Host processes** | kernel mount — FUSE on Linux, NFS loopback on macOS, WinFsp on Windows | yes | yes | yes | yes |
 | **crosvm / QEMU guests** | vhost-user virtio-fs, message-based `SHMEM_MAP` (DAX) | yes | yes | yes | no |
-| **OCI containers** | bind mount of a host attachment the runtime performs | yes | — | **no** | unit only |
+| **OCI containers** | bind mount of a host attachment the runtime performs | yes | yes | **yes** (rootless) | the test, on a host with podman |
 | **shards microVMs** | virtio-fs over shards' own frame socket (`shards_fs`), mediated — no DAX window | yes | yes | **no** | no |
 | **kiln agents** | nothing | **no** | — | — | — |
 
@@ -29,14 +29,26 @@ export, through the node's `tlshd`, and a second mount reads what the first wrot
 The same lane covers the fleet itself: formation, SIGKILL takeover, rejoin, scale, and WAN profiles under
 `tc netem`.
 
-**OCI containers — the contract is built and the consumption is not tested.** `crates/bridge-oci` verifies that
-the host path a consumer names really is the volume's mount (`getfsstat`/`mountinfo`, read as a query that
-never touches the mount) and hands back the runtime-specification `mounts` entry for the harness to pass to
-`runc`, `crun` or `docker`. Its 15 tests (`tests/verify.rs`, `tests/runtime.rs`) all assert on that
-verification and that entry. **None of them starts a container.** The crate's own doc is honest that slates
-"does the namespace work of neither the runtime nor the launcher" — but nothing proves the entry it emits is
-one a runtime accepts, or that the container can read the file. That is the nearest real gap, and Docker is
-available here to close it.
+**OCI containers — proven for rootless, 2026-10-19.** `crates/bridge-oci` verifies that the host path a
+consumer names really is the volume's mount (`getfsstat`/`mountinfo`, read as a query that never touches the
+mount) and hands back the runtime-specification `mounts` entry. Its 15 tests all assert on that verification
+and that entry, and **none of them starts a container**; that was the gap.
+`a_rootless_container_reads_and_writes_the_volume_through_its_mount` (`crates/cli/tests/cli.rs`) closes it by
+use: a volume is created, written, FUSE-mounted, and bound into a **rootless podman** container twice. The
+container reads the bytes a client wrote; a write through the read-only bind is refused `EROFS` **by the
+kernel**, which is the read attachment's policy enforced by the runtime; a write through the writable bind
+lands and the host sees it through the same mount. No privilege anywhere — uid 1000, no `allow_other`, no
+`--privileged`. Measured on fedora 6.19.10; skips loudly on a host without podman or `/dev/fuse`.
+
+**But slates' own `attach --oci` refuses that exact configuration.** `crates/server/src/oci.rs` requires the
+source be a mount shared with other users, reasoning "a container's processes reach the source as their own
+ids, so ... a FUSE mount the daemon made for its user alone would answer them EACCES". That is true of a
+**rootful** engine and false of a rootless one, whose container-root maps to the mounting uid — demonstrated
+above. The gate decides on the mount alone and never asks which runtime will bind it, even though slates
+already models the deciding fact (`RuntimeProfile::rootless`, read from the engine's `name=rootless` security
+option). The refusals are honest evidence gates, not mistakes — `UserNamespaceUntested` says "no workload has
+run so" — and the test above is the workload they were waiting for. Relaxing them for the now-tested profile
+is the next step, recorded in GAPS.
 
 **shards microVMs — connected, not booted.** `crates/bridge-fuse/src/shards_fs.rs` is the slates backend for
 shards' virtio-fs frame socket, dispatching through the one FUSE seam, and `tests/shards_fs.rs` drives the
