@@ -3490,3 +3490,65 @@ proptest! {
     );
   }
 }
+
+proptest! {
+  #![proptest_config(slates_test_seeds::unseeded(ProptestConfig { cases: slates_test_seeds::cases(if cfg!(miri) { 4 } else { 96 }), .. ProptestConfig::default() }))]
+
+  /// §4.6 — the disclosure boundary, at every length rather than one. A mapping hands the guest a whole page
+  /// whatever the file's length, so the bytes past that length must read as zero or the guest sees what a
+  /// truncate took away. `a_mapping_does_not_expose_the_bytes_past_the_files_length` proves this for a file
+  /// truncated to **100** bytes; an off-by-one, or a scrub that started at the next word or page boundary,
+  /// would leak at some other length and pass that test.
+  ///
+  /// Do: write a page of a secret byte, truncate to an arbitrary length, map read-only, read the whole page.
+  /// Expect: no byte at or past the file's length is the secret, and every byte before it still is — the tail
+  /// is hidden without the kept head being damaged.
+  #[test]
+  fn a_mapping_hides_the_tail_at_whatever_length_the_file_was_truncated_to(
+    len in 0usize..DAX_PAGE,
+  ) {
+    let mut store = store();
+    let mut volume = volume(&mut store, 1 << 20);
+    let secret = file_of(&mut store, &mut volume, "secret", SECRET, DAX_PAGE);
+    prop_assert!(
+      volume
+        .truncate(&mut store, secret, u64::try_from(len).unwrap_or(0))
+        .is_ok(),
+      "the truncate to {} is accepted",
+      len
+    );
+
+    let mapping = match volume.dax_map_read(&mut store, secret) {
+      Ok(mapping) => mapping,
+      Err(refusal) => {
+        return Err(TestCaseError::fail(format!(
+          "a read map of a {len}-byte file was refused: {refusal:?}"
+        )));
+      }
+    };
+    prop_assert_eq!(
+      mapping.file_len,
+      len,
+      "the authorized length is the truncated size"
+    );
+    let page = volume
+      .dax_read(&store, &mapping, 0, DAX_PAGE)
+      .map_err(|e| TestCaseError::fail(format!("the window reads: {e:?}")))?;
+
+    let leak = page
+      .get(len..)
+      .and_then(|tail| tail.iter().position(|&b| b == SECRET));
+    prop_assert_eq!(
+      leak,
+      None,
+      "a byte of the truncated-away secret is visible {:?} past a length of {}",
+      leak,
+      len
+    );
+    prop_assert!(
+      page.get(..len).is_some_and(|head| head.iter().all(|&b| b == SECRET)),
+      "and the kept head of {} bytes is intact",
+      len
+    );
+  }
+}

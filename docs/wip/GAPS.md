@@ -785,6 +785,22 @@ somewhere.
   the sweep ever asked it (live 3,032,879, gone 0), which is why the ending task now lives
   `GONE_TASK_STEPS` steps.
 
+**The DAX disclosure boundary was only tested at one length, and that mattered too
+(2026-10-20).** `a_mapping_does_not_expose_the_bytes_past_the_files_length` writes a page of a
+secret, truncates to **100** bytes and asserts `page[100..]` is zero. A mapping hands the guest a
+whole page whatever the file's length, so the scrub past `file_len` is a disclosure boundary at
+*every* length, and a bug that leaks only at some other length passes that test.
+`a_mapping_hides_the_tail_at_whatever_length_the_file_was_truncated_to` now truncates to an
+arbitrary length and asserts both halves: no byte at or past the length is the secret, and every
+byte before it still is.
+
+Red-checked with a bug the fixed-length test structurally cannot see — not an off-by-one, which
+it would catch, but a scrub that skips a *small* tail (`.filter(|t| t.len() >= 256)` on all three
+`get_mut(file_len..)` sites in `dax.rs`). The property fails and shrinks to **`len = 3841`**,
+where the tail is 255 bytes, one short of the threshold; the fixed test passes throughout,
+because its tail is 3,996 bytes and always scrubbed. A guest reading that window would see the
+truncated-away secret. `dax.rs` was restored byte-exact.
+
 **B2's heal was only ever tested at byte 0, and that mattered (2026-10-20).** Every heal test in
 `crates/vfs/tests/dax.rs` corrupts the same position — `flip_a_byte` is `bytes[0] ^= 0xFF` — and
 `a_flip_in_a_guarded_read_only_block_is_caught_and_healed` verifies the repair by reading back
