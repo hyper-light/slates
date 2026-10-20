@@ -140,13 +140,46 @@ impl FailurePersistence for CompiledSeeds {
   }
 }
 
+/// Proptest's global reject ceiling, scaled to the size of the sweep being asked for.
+///
+/// `max_global_rejects` is an absolute 1024 however many cases run, so a suite whose `prop_assume!` turns
+/// away a tenth of its draws passes at its committed count and **aborts** when deepened — the rejects are
+/// counted, the successes are not. Measured 2026-10-20 on
+/// `a_random_window_schedule_never_shows_the_guest_a_foreign_byte`: green at 2,000 cases, and at 10,000 it
+/// aborted "Too many global rejects" after 8,875 successes and 1,024 rejects. That is a rejection *rate* of
+/// about a tenth, which is the generator working as written, not a pathological one.
+///
+/// The rate is what is worth bounding, so the ceiling keeps the ratio proptest's own defaults express — 1024
+/// rejects to 256 cases — and grows with the count asked for. A generator that really cannot produce usable
+/// cases still aborts, at the same proportion it always did. Eight suites use `prop_assume` and none set
+/// this, so it belongs here beside [`cases`], for the reason that doc gives: one definition, so the next
+/// suite cannot miss it.
+///
+/// Derived: `REJECTS_PER_CASE` is proptest's own `DEFAULT_MAX_GLOBAL_REJECTS / DEFAULT_CASES` (1024 / 256).
+fn rejects_for(cases: u32) -> u32 {
+  /// Derived: proptest's default ceiling over its default case count (1024 / 256), so the ratio is unchanged
+  /// at the default and holds as the count grows.
+  const REJECTS_PER_CASE: u32 = 4;
+  cases.saturating_mul(REJECTS_PER_CASE)
+}
+
+/// `config` with the reject ceiling scaled to its case count ([`rejects_for`]), never lowered below whatever
+/// the caller already asked for.
+fn with_scaled_rejects(config: Config) -> Config {
+  let scaled = rejects_for(config.cases).max(config.max_global_rejects);
+  Config {
+    max_global_rejects: scaled,
+    ..config
+  }
+}
+
 /// `config` replaying the reviewed seeds `reviewed` (a seed file's text, `include_str!`-ed) and reporting
 /// a new failing seed instead of writing it.
 pub fn seeded(config: Config, reviewed: &str) -> Result<Config, SeedRefused> {
   let seeds = CompiledSeeds::parse(reviewed)?;
   Ok(Config {
     failure_persistence: Some(Box::new(seeds)),
-    ..config
+    ..with_scaled_rejects(config)
   })
 }
 
@@ -181,7 +214,7 @@ pub fn unseeded(config: Config) -> Config {
       reported: 0,
       last_reported: None,
     })),
-    ..config
+    ..with_scaled_rejects(config)
   }
 }
 

@@ -55,6 +55,11 @@ const MACOS_TRANSFER_BYTES: u32 = 128 * 1024;
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum MountBackend {
   /// The loopback NFS mount, via `mount_nfs`.
+  ///
+  /// Never constructed off Unix — `backend()` there answers `Unsupported`, because a Windows host's mount is
+  /// WinFsp and is reached elsewhere — but kept, because the enum is the vocabulary every platform's callers
+  /// match on, and a variant that exists only where it can occur would make those matches platform-shaped.
+  #[cfg_attr(not(unix), allow(dead_code))]
   NfsLoopback,
   /// No supported loopback mount on this host (`mount_nfs` is not on the `PATH`).
   Unsupported,

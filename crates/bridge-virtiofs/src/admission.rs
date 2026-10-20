@@ -412,8 +412,13 @@ fn unsupported(request: &GuestAttachRequest) -> Option<UnsupportedReason> {
   // That was one of four blocking items, and **two of the four are now closed**: descriptor confinement (A-138,
   // the `udmabuf`-narrowed descriptor, whose proof first ran on real hardware 2026-10-20) and L1's zones (closed
   // 2026-10-20 — they are transparent huge pages needing no privileged broker, and the two defects that kept them
-  // from forming are fixed). **B2's wiring and L2's device-side remap still block**, and the second of those is
-  // the one that matters here: without it a shift moves the block under a guest whose window is never remapped.
+  // from forming are fixed). **B2's wiring and L2's device-side remap still block.** The second is narrower
+  // than it sounds, and this comment overstated it on 2026-10-20 before being corrected the same day: a shift
+  // *is* delivered to the device — `dax_migrate` enqueues the inode on `pending_revokes`, a service pass
+  // drains it, the window is torn down under the two-phase revoke and the guest re-faults onto the row the
+  // content moved to (`a_shift_tells_the_device_so_the_guests_window_follows_the_content`). What is missing is
+  // the `MAP_FIXED` remap `dax_migrate`'s doc promised, so the cost is a fault per shifted window, not a guest
+  // left on a stale one.
   // The checklist is `docs/wip/GAPS.md` (2026-10-18, "what must be true before DAX is advertised"), kept current.
   // Read it before flipping this, not just the record above.
   if request.dax {

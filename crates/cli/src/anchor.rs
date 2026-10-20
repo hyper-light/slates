@@ -75,9 +75,14 @@ fn await_observation(supervisor: &Supervisor, watch: &mut DaemonWatch, pause: Du
 }
 
 /// See the Unix arm: off Unix the anchor parks for its pause.
+///
+/// Braces rather than a unit struct, deliberately: the shared call site builds it with
+/// `DaemonWatch::default()`, and `clippy::default_constructed_unit_structs` denies that for a unit struct —
+/// which made the Windows binary's lint red while the Unix one, where this type has a field, was fine.
+/// Empty braces keep one call site for both without an `allow`.
 #[cfg(not(unix))]
 #[derive(Default)]
-struct DaemonWatch;
+struct DaemonWatch {}
 
 /// See the Unix arm: no hold channel off Unix.
 #[cfg(not(unix))]

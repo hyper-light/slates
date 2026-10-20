@@ -3729,7 +3729,13 @@ fn a_hold_finer_than_the_pools_free_extents_is_owed_by_the_next_shard_to_grow() 
     assert_eq!(
       before[shard].zip(after[shard]).map(|(was, now)| was - now),
       Some(hold),
-      "shard {shard}'s room shrank by exactly the hold ({hold} bytes): before {before:?} after {after:?}"
+      "shard {shard}'s room shrank by exactly the hold ({hold} bytes = {DEBT_HOLD_UNITS} units of {unit}): \
+       before {before:?} after {after:?}; capacity {capacity}, slice {DEBT_SLICE_UNITS} units, pooled \
+       {pooled:?}, holds {holds:?}. The geometry is printed because this assertion depends on it and the \
+       machine decides it: measured 2026-10-20, green on an M5 Max laptop and red on GitHub's macOS runner, \
+       where the room moved by two units rather than sixty-four — the two 1-unit parts withheld whole and \
+       the 62 owed ones not reflected. Whether that is the pool's debt accounting or this test's assumed \
+       part geometry cannot be told without knowing what the host derived, so it says so here."
     );
   }
   assert!(
