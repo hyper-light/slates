@@ -330,6 +330,33 @@ fn occurrences_in_this_process(needle: &[u8]) -> usize {
   total
 }
 
+/// What an unexpected descriptor actually is, so a failure here can be acted on without a second run: the
+/// object `/proc/self/fd/N` names, its size, and whether the neighbour's marker is reachable through it.
+///
+/// That last part is the one that matters. The probe above counts *every* memory object this process holds,
+/// because the daemon runs in it, so a new one appearing between two samples is not by itself the arena
+/// crossing into the peer — the pool growing for its own reasons would look the same. Reachability of the
+/// marker is what separates the two, and a message that reports it turns one red CI run into the answer
+/// rather than into a question. Added 2026-10-20, when this assertion fired on a GitHub runner and on no
+/// machine here: the laptop's Docker Linux, the x86_64 box (32 cores, 124 GB) and the full test binary on
+/// both passed it three times each.
+#[cfg(target_os = "linux")]
+#[allow(clippy::disallowed_methods)] // reading this process's own descriptor table through /proc, read-only
+fn describe_descriptor(number: i32, needle: &[u8]) -> String {
+  use std::os::fd::AsFd;
+
+  let path = format!("/proc/self/fd/{number}");
+  let target = std::fs::read_link(&path)
+    .map(|link| link.to_string_lossy().into_owned())
+    .unwrap_or_else(|_| "<unreadable link>".to_owned());
+  let Ok(file) = std::fs::File::open(&path) else {
+    return format!("fd {number} -> {target} (could not be reopened to scan)");
+  };
+  let size = file.metadata().map(|data| data.len()).unwrap_or(0);
+  let markers = occurrences_through(file.as_fd(), needle);
+  format!("fd {number} -> {target}, {size} bytes, {markers} neighbour marker(s) reachable")
+}
+
 /// What a hostile peer does with the descriptor a zero-copy read handed it, and what must come of it: the
 /// neighbour's marker must not be reachable through it, and it must refuse a shared writable map. Split out of
 /// the test so each does one thing (the cognitive-complexity bound) and so the hostile part reads as the attack
@@ -469,10 +496,15 @@ fn a_zero_copy_reads_descriptor_authorizes_its_window_and_nothing_more() {
     // The hand-off was refused, so the bytes came by copy. Then nothing may have crossed: a refused
     // hand-off that still installed a descriptor in the peer would be the escape with the reply
     // changed.
+    let described: Vec<String> = arrived
+      .iter()
+      .map(|number| describe_descriptor(*number, NEIGHBOUR_MARKER))
+      .collect();
     assert!(
       arrived.is_empty(),
-      "a copy-path read still installed {} memory-object descriptor(s) in the peer: {arrived:?}",
-      arrived.len()
+      "a copy-path read still installed {} memory-object descriptor(s) in the peer: {}",
+      arrived.len(),
+      described.join("; ")
     );
     println!(
       "map_read took the copy path; no descriptor crossed (arena holds {in_the_arena} markers)"
