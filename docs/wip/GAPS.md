@@ -723,6 +723,30 @@ simulated guest memory that is the DAX device oracle's other leg, and one of the
 - `SimGuestMemory::clear_accesses` is unused test-support API; left alone, since a simulator
   offering a reset nobody needs costs nothing and misleads no one.
 
+`crates/land`, `crates/base`, `crates/wire`, `crates/ipc` and `crates/rt` were swept the same way.
+`base`, `wire` and `ipc` are clean; `land::hash_hex`, `rt::next_random` and `rt::sim_udp_rebind`
+are unused helpers worth no more than a mention. `rt::unregister_poller` was the one that led
+somewhere.
+
+- **`ShardInner::pollers` is bounded only by a sweep nothing tested.** `register_poller`
+  (`crates/rt/src/shard.rs:1440`) does a bare `inner.pollers.push(..)` with no bound and no typed
+  refusal, which reads as a CLAUDE.md #8 violation until you find what actually bounds it: the
+  first lines of `wake_ready_pollers` (`:1471`) retain only pollers whose slot still holds the
+  generation they registered with, so the list cannot outgrow the shard's task arena, which *is*
+  bounded. That also explains why `unregister_poller` has no caller — the sweep already does its
+  job. **But nothing tested the sweep.** The file's only test covered the wake path, so deleting
+  that `retain` left every test in the workspace green.
+  `crates/rt/tests/pollers.rs::a_poller_is_forgotten_when_its_task_ends` now holds it: on a shard
+  kept stepping by a yielding task, one poller is registered by a task that stays alive and one by
+  a task that returns after a few steps; the living one must keep being asked while the ended one
+  is never asked again. The live counter is the non-vacuity control — without it a parked shard
+  would freeze both counters and the test would pass for the wrong reason.
+  Red-checked by deleting the `retain` and re-running: the ended task's poller was asked **49,038
+  times, then 126,649** — called forever — and `shard.rs` was restored byte-exact. The first draft
+  of the test also failed usefully: a task that returned immediately had its poller reaped before
+  the sweep ever asked it (live 3,032,879, gone 0), which is why the ending task now lives
+  `GONE_TASK_STEPS` steps.
+
 Closed by measurement, and the reasoning was half wrong. I first wrote here that the
 `guards.len() >= self.dax.cap` arm of `dax_guard` (`dax.rs:1476`) "looks unreachable", on the
 argument that a guard implies a live mapping and mappings share the same `cap`. Measured by
