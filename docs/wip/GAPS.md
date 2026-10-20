@@ -723,12 +723,26 @@ simulated guest memory that is the DAX device oracle's other leg, and one of the
 - `SimGuestMemory::clear_accesses` is unused test-support API; left alone, since a simulator
   offering a reset nobody needs costs nothing and misleads no one.
 
-Open, flagged by reasoning rather than measurement: the `guards.len() >= self.dax.cap` arm of
-`dax_guard` (`dax.rs:1476`) looks unreachable. A guard exists only for a live mapping, so
-`guards.len() <= mappings`, and mappings are bounded by the same `cap`; reaching `guards == cap`
-therefore implies `mappings == cap`, where the next map is refused by the registry bound before
-`guard_if_asked` runs. The reachable refusal is the clean-copy allocation below it, which is what
-the new test drives. Worth confirming before anyone relies on that arm.
+Closed by measurement, and the reasoning was half wrong. I first wrote here that the
+`guards.len() >= self.dax.cap` arm of `dax_guard` (`dax.rs:1476`) "looks unreachable", on the
+argument that a guard implies a live mapping and mappings share the same `cap`. Measured by
+`the_guard_bound_is_reached_only_by_re_guarding_and_the_registry_refuses_first`
+(`crates/vfs/tests/dax.rs`), the truth splits in two:
+
+- **Unreachable from the production path, confirmed.** With the registry full at `cap` and every
+  mapping guarded, one more `dax_map_read` is refused `NoSpace` by `register`
+  (`dax.rs:454`) and `guards_refused` does **not** move — `guard_if_asked` is never consulted.
+  That is the measurement the earlier claim needed and did not have.
+- **Reachable through the public API, which the claim missed.** `Store::dax_guard` on a mapping
+  that already has a guard reaches the arm and is refused `NoSpace`, even though a refresh frees
+  the old clean copy (`drop_guard`, `dax.rs:1511`) before recording the new one, so the net would
+  not grow. That sits against `dax_guard`'s own words: "Re-guarding a mapping refreshes it (the
+  old clean copy is freed)."
+
+Left as it behaves rather than fixed. No production caller re-guards — `guard_if_asked` only ever
+guards a freshly minted mapping, which has no guard yet — so changing the bound would be a
+speculative edit to a path nothing walks, which is the same mistake as the reasoning it replaces,
+pointed the other way. The behaviour is pinned by the test so a future caller finds it stated.
 
 ## 8b. Unsafe, Miri and instruction counts (2026-09-05)
 

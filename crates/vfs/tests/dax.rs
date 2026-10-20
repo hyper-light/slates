@@ -3350,3 +3350,79 @@ fn a_full_guard_net_still_serves_the_window_and_counts_the_refusal() {
     "the unguarded window serves the file's real bytes"
   );
 }
+
+/// §4.6 B2 — the guard bound, measured instead of reasoned about. `dax_guard` refuses `NoSpace` when
+/// `guards.len() >= cap`, and the obvious question is whether that arm can ever be reached, since a guard
+/// exists only for a live mapping and mappings are bounded by the *same* `cap`. Do: fill the registry to its
+/// cap with guarded read-only mappings, then (a) ask for one more window and (b) re-guard a mapping that
+/// already has a guard. Expect: (a) is refused by the registry's own bound in `register`, before
+/// `guard_if_asked` is ever consulted — which is why the production path never reaches the guard arm — and
+/// (b) is refused `NoSpace` by the guard arm, even though a refresh frees the old clean copy before it
+/// records the new one, so the net would not grow.
+///
+/// Recorded because the previous entry in the ledger called this arm "unreachable" on reasoning alone. It is
+/// reachable, through the public `Store::dax_guard` on an already-guarded mapping, and the refusal there sits
+/// against `dax_guard`'s own words — "Re-guarding a mapping refreshes it (the old clean copy is freed)". No
+/// production caller does that today (`guard_if_asked` only ever guards a freshly minted mapping, which has no
+/// guard yet), so the behaviour is pinned here rather than changed: a speculative fix to a path nothing walks
+/// would be the same mistake in the other direction.
+#[test]
+fn the_guard_bound_is_reached_only_by_re_guarding_and_the_registry_refuses_first() {
+  const CAP: usize = 8;
+  const FILL: u8 = 0x3c;
+  let mut store = store_capped_chunks(CAP);
+  let mut volume = volume(&mut store, 1 << 22);
+  volume.enable_dax_integrity_guard();
+
+  let mut mappings = Vec::new();
+  for index in 0..CAP {
+    let no = file_of(
+      &mut store,
+      &mut volume,
+      &format!("g{index}"),
+      FILL,
+      DAX_PAGE,
+    );
+    mappings.push(
+      volume
+        .dax_map_read(&mut store, no)
+        .expect("each window up to the cap is served"),
+    );
+  }
+  assert_eq!(
+    store.dax.guards(),
+    CAP,
+    "every mapping up to the cap took a guard, so the net is exactly full"
+  );
+  assert_eq!(store.dax_mappings(), CAP, "and so is the registry");
+
+  // (a) One more window: the registry's bound answers first, so `guard_if_asked` never runs.
+  let refused_before = store.dax.guards_refused();
+  let one_more = file_of(&mut store, &mut volume, "overflow", FILL, DAX_PAGE);
+  assert!(
+    matches!(
+      volume.dax_map_read(&mut store, one_more),
+      Err(VfsError::NoSpace)
+    ),
+    "the registry refuses at its own bound"
+  );
+  assert_eq!(
+    store.dax.guards_refused(),
+    refused_before,
+    "and the net was never asked, so no guard refusal was counted: this is why the production \
+     path cannot reach the guard arm"
+  );
+
+  // (b) A refresh of a guard that already exists: the guard arm, reached.
+  let existing = mappings[0];
+  assert!(
+    matches!(store.dax_guard(&existing), Err(VfsError::NoSpace)),
+    "a re-guard at the bound is refused, though it would free the old clean copy before recording \
+     the new one"
+  );
+  assert_eq!(
+    store.dax.guards(),
+    CAP,
+    "and the refusal left the net exactly as it was"
+  );
+}
