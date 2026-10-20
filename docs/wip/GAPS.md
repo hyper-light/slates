@@ -8700,3 +8700,33 @@ and passed for the wrong reason until the disk check caught them. The observable
 target**, never the exit status; the test now says so at both sites. This is the same shape as the pin check
 that was necessary but not sufficient: an assertion that can pass for a reason other than the one intended is
 not evidence.
+
+### 2026-10-20: the full workspace after the CLI/OCI/grant work, and one load-sensitive landing test
+
+`cargo test --workspace` over the whole tree after the newest changes: **1,983 individual tests**, one failure
+— `landing_fairness::a_landing_longer_than_its_lease_term_renews_it_and_lands_everything`, which came back
+`"partial"` where it wanted `"done"`.
+
+**Chased rather than dismissed, and not reproduced below full-workspace parallelism:**
+
+| pressure | result |
+|---|---|
+| the test alone, 3 runs | passes (26 s, 30 s, 34 s — the climb is the load signal) |
+| under 18-core CPU saturation | **passes** (86 s) |
+| all 17 `slates-server` suites in parallel | passes |
+| full `cargo test --workspace` | failed once |
+
+So CPU is not the pressure that breaks it: the lease renewal holds with every core busy. What reproduces it is
+the whole workspace at once, and I could not narrow it further in four attempts. It is **not attributable to
+this session's changes** — the DAX shift and scrub loops were already present in the earlier clean workspace
+run (258 binaries, exit 0), and the later changes are tests plus a comment.
+
+Recorded as a load-sensitive test with its reproduction ladder, not as a flake to be ignored: per
+[[busy-machine-is-the-norm]] a landing that fails to renew its lease under contention would be a real
+robustness defect, and the ladder above is what a future chase should start from rather than repeat.
+
+**A trap re-met while measuring it.** The load generator leaked: `for p in $PIDS; do kill -9 $p; done` kills
+nothing in zsh, which does not word-split an unquoted variable, so all eighteen spinners survived a kill loop
+that printed as if it had run. `kill -9 $(cat file)` and a counted verification is the form that works. This
+is exactly [[load-generators-leak-spinners]], met again a day later — the lesson needed was not "remember to
+kill them" but "**verify the kill by counting**", which is now what the note says.
