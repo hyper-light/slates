@@ -2875,6 +2875,15 @@ same-namespace host process is the first delivered case.
 >      `transparent_hugepage/shmem_enabled`, not `transparent_hugepage/enabled`; the `MADV_COLLAPSE` ask above
 >      goes through either way, so a deployment does not have to tune that knob, but a host that cannot find the
 >      contiguous memory still gets no sandbox and the shift is refused.
+>      **The mapping is placed, not found (2026-10-20).** A huge page behind a memory object is addressed twice
+>      over — by where it sits in the process and by where it sits in the object — and the kernel forms one only
+>      where the two agree. `mmap` left to choose guarantees neither, so the sandbox was reserved only on the
+>      runs where it happened to land right: measured on Linux 6.12.76 (aarch64), 13 of 16 objects began off a
+>      huge boundary, `MADV_COLLAPSE` is refused `EINVAL` on an incongruent span whichever end is aligned, and
+>      eight volumes over their own objects were given a sandbox 0 of 8 or 8 of 8 by address alone. The window
+>      is now placed congruently when the object is mapped (`slates-mem` `shared.rs`, `Mapped`), and those same
+>      eight are reserved 8 of 8 on six consecutive runs
+>      (`docs/bugs/2026-10-20-the-dax-sandbox-was-reserved-by-mmap-address-luck.md`).
 >      **Measured across the platforms and architectures slates targets, 2026-10-19** — the whole DAX suite
 >      (59 tests), the device seam (36) and the daemon (23):
 >      | Host | THP | L1 sandbox | Result |
@@ -2883,6 +2892,7 @@ same-namespace host process is the first delivered case.
 >      | Linux x86_64 (adacachy, `shmem_enabled=[advise]`) | 2 MiB | reserved | 59 pass, no skip |
 >      | Linux x86_64 (fedora 6.19.10, `shmem_enabled=[never]`) | 2 MiB | reserved via `MADV_COLLAPSE` | 59 pass, 0–4 skips by host state |
 >      | Linux aarch64 (4 KiB base page) | 2 MiB | reserved | 59 pass, device seam 36 pass, daemon 23 pass |
+>      | Linux aarch64 (6.12.76, `shmem_enabled=[never]`) | 2 MiB | reserved, placed + `MADV_COLLAPSE` | 73 DAX pass, loud skips 3 → 1 |
 >      | Windows x86_64 (cross-lint, `x86_64-pc-windows-gnu`) | large pages need a privilege R10 refuses | refused | clippy clean over the Windows-buildable crates |
 >      A low-trust *sacrificial pool* may deliberately co-locate mutually-untrusted tenants so they absorb each
 >      other's leakage rather than the host — sound only paired with B2, and not built.

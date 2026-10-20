@@ -817,6 +817,24 @@ unverified *lane* would not is that this is two crates added to a **proven** lan
 Windows runner that already builds everything they depend on — and if it does go red, that is the
 finding, found in CI rather than at the first tag.
 
+### 8a-dax-place. The DAX sandbox was reserved by `mmap` address luck (2026-10-20, closed)
+
+Asking what §4.6's L1 sandbox does on a host whose `shmem_enabled` is `never` — the kernel's default,
+so most hosts — found that in the daemon's own configuration it was reserved **by chance**. The content
+arena is an anchor-backed shared memory object (`content_pool.rs:261`); a huge page behind one must
+agree in both its address and its offset in the object; `mmap` guarantees neither. Measured on Linux
+6.12.76 (aarch64): 13 of 16 objects began off a huge boundary, `MADV_COLLAPSE` is refused `EINVAL` on an
+incongruent span whichever end is aligned, and eight volumes were given a sandbox 0 of 8 or 8 of 8 from
+one run to the next. Nothing claimed an isolation it lacked — the refusal is the typed
+`NoPhysicalIsolation` — but L1, and L2 and B2 above it, were mostly simply absent.
+
+Closed by placing the window congruently when the object is mapped (`slates-mem` `shared.rs`, `Mapped`):
+8 of 8 on six consecutive runs, the suite's loud skips on Linux 3 → 1, and the measurement that makes it
+worth doing — an explicit `MADV_COLLAPSE` over a congruent span delivers a full huge page even where the
+host's shmem preference is `never`. Write-up:
+`docs/bugs/2026-10-20-the-dax-sandbox-was-reserved-by-mmap-address-luck.md`. The address-aligning variant
+that leaves the offset incongruent is recorded there as measured-and-rejected.
+
 ### 8a-dax. DAX surface audited for never-executed paths (2026-10-20)
 
 The codec defect above was found by asking which production paths nothing ever runs. The same

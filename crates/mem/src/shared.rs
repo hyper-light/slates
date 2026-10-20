@@ -698,13 +698,12 @@ fn word_view<W: Word>(inner: &platform::Inner, offset: usize) -> Result<&W, MemE
 mod platform {
   use std::os::fd::OwnedFd;
 
-  use memmap2::{MmapMut, MmapOptions};
 
   use super::Handoff;
   use crate::error::MemError;
 
   pub(super) struct Inner {
-    map: MmapMut,
+    map: Mapped,
     fd: OwnedFd,
     /// The object's name (macOS: what a handoff carries, known to the creator and to an
     /// opener alike, so an attached process can hand the object on again).
@@ -731,23 +730,143 @@ mod platform {
     }
   }
 
-  fn map(fd: &OwnedFd, offset: usize, len: usize) -> Result<MmapMut, MemError> {
-    let offset = u64::try_from(offset).map_err(|_| MemError::OsRefused {
+  /// A shared object's mapping, placed at an address where a huge page can form behind it.
+  ///
+  /// A huge page behind a memory object is addressed twice over — by where it sits in this process and by
+  /// where it sits in the object — and the kernel forms one only where the two agree, `address ≡ offset`
+  /// modulo the huge page. `mmap` left to choose returns whatever address suits it, which on Linux is a
+  /// 64 KiB boundary: measured 2026-10-20 on 6.12.76 (aarch64), 13 of 16 objects came back incongruent, and a
+  /// `MADV_COLLAPSE` over an incongruent span is refused `EINVAL` whether it is the address or the offset that
+  /// is huge-aligned. §4.6's L1 sandbox *is* that collapse, and a daemon serves DAX from this object
+  /// (`server/src/content_pool.rs`), so left to luck the sandbox was available only on the runs where `mmap`
+  /// happened to land right — 8 of 8 volumes got one or none of them did, by address. So the window is placed:
+  /// a reservation is taken with a huge page of slack, the object is mapped over the congruent address inside
+  /// it, and the reservation is given back whole at drop. The slack costs address space and no memory.
+  ///
+  /// The address is kept exposed rather than as a pointer, as the Windows view is, so the object is `Send`
+  /// (a mapping belongs to the process, not a thread) without an unsafe impl.
+  pub(super) struct Mapped {
+    /// The reservation the window was placed inside: what `munmap` is given back, whole, at drop.
+    reservation: usize,
+    /// The reservation's length — the window plus one grain of slack.
+    span: usize,
+    /// The placed window: the object's `len` bytes, at an address congruent with their offset in it.
+    window: usize,
+    len: usize,
+  }
+
+  impl std::ops::Deref for Mapped {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+      // SAFETY: `window` is this object's own live mapping of `len` bytes, placed in `map` and unmapped only by
+      // `Drop`, so it is mapped for at least as long as this borrow.
+      unsafe {
+        std::slice::from_raw_parts(std::ptr::with_exposed_provenance::<u8>(self.window), self.len)
+      }
+    }
+  }
+
+  impl std::ops::DerefMut for Mapped {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+      // SAFETY: as `Deref`, and `&mut self` makes this the only borrow of those bytes.
+      unsafe {
+        std::slice::from_raw_parts_mut(
+          std::ptr::with_exposed_provenance_mut::<u8>(self.window),
+          self.len,
+        )
+      }
+    }
+  }
+
+  impl Drop for Mapped {
+    fn drop(&mut self) {
+      // SAFETY: the reservation is this object's own mapping, made in `map` and not unmapped since; it covers
+      // the placed window, and no reference into either outlives `self`.
+      let _ = unsafe {
+        rustix::mm::munmap(
+          std::ptr::with_exposed_provenance_mut::<std::ffi::c_void>(self.reservation),
+          self.span,
+        )
+      };
+    }
+  }
+
+  fn map(fd: &OwnedFd, offset: usize, len: usize) -> Result<Mapped, MemError> {
+    let file_offset = u64::try_from(offset).map_err(|_| MemError::OsRefused {
       call: "mmap",
       code: None,
     })?;
-    // SAFETY: the object behind `fd` is a memory object this module created or opened by the
-    // handoff its creator gave; by this module's rule no process truncates it while a view
-    // lives, and every concurrent word is reached through the atomic views. The map borrows
-    // nothing that outlives it.
-    let map = unsafe { MmapOptions::new().offset(offset).len(len).map_mut(fd) }.map_err(|e| {
-      MemError::OsRefused {
-        call: "mmap",
-        code: e.raw_os_error(),
-      }
+    // Derived: the grain the address and the offset must agree on is this host's huge page, because that is the
+    // mapping the sandbox's collapse forms — but only where this object is long enough to hold one. An object
+    // shorter than a huge page can never be backed by one, and a host without huge pages has none to be
+    // congruent with; either way the grain is the page, which every mapping meets already. That matters because
+    // the slack a placement reserves is one grain and a client's ring is its own object (`ipc/src/region.rs`):
+    // reserving a huge page of address space per session would spend what i686, a tested target with about
+    // 3 GB of it, does not have. The same arithmetic throughout, asking for nothing it cannot use.
+    let page = rustix::param::page_size().max(1);
+    let grain = slates_machine::facts::huge_page_bytes()
+      .and_then(|bytes| usize::try_from(bytes).ok())
+      .filter(|huge| *huge <= len)
+      .unwrap_or(page)
+      .max(page);
+    let span = len.checked_add(grain).ok_or(MemError::OsRefused {
+      call: "mmap",
+      code: None,
     })?;
-    advise_huge_object(&map);
-    Ok(map)
+    // SAFETY: an anonymous reservation asked for at no particular address and reachable through nothing
+    // (`PROT_NONE`). No byte of it is read or written; it exists to own an address range long enough that a
+    // congruent window fits inside, and `Mapped::drop` gives it back whole.
+    let reservation = unsafe {
+      rustix::mm::mmap_anonymous(
+        std::ptr::null_mut(),
+        span,
+        rustix::mm::ProtFlags::empty(),
+        rustix::mm::MapFlags::PRIVATE,
+      )
+    }
+    .map_err(|e| refused("mmap", e))?;
+    let reserved_at = reservation.expose_provenance();
+    // The first address at or after the reservation that is congruent with this range's offset in the object.
+    let into = grain
+      .saturating_add(offset.checked_rem(grain).unwrap_or(0))
+      .saturating_sub(reserved_at.checked_rem(grain).unwrap_or(0))
+      .checked_rem(grain)
+      .unwrap_or(0);
+    let window = reserved_at.saturating_add(into);
+    // SAFETY: `window .. window + len` lies inside the reservation this call owns — `into` is less than one
+    // grain and the reservation is `len + grain` long — so `MAP_FIXED` replaces this call's own `PROT_NONE`
+    // slack and no other mapping. The object behind `fd` is a memory object this module created or opened by
+    // the handoff its creator gave; by this module's rule no process truncates it while a view lives, and every
+    // concurrent word is reached through the atomic views. The map borrows nothing that outlives it.
+    let placed = unsafe {
+      rustix::mm::mmap(
+        std::ptr::with_exposed_provenance_mut::<std::ffi::c_void>(window),
+        len,
+        rustix::mm::ProtFlags::READ | rustix::mm::ProtFlags::WRITE,
+        rustix::mm::MapFlags::SHARED | rustix::mm::MapFlags::FIXED,
+        fd,
+        file_offset,
+      )
+    };
+    match placed {
+      Ok(at) => {
+        let mapped = Mapped {
+          reservation: reserved_at,
+          span,
+          window: at.expose_provenance(),
+          len,
+        };
+        advise_huge_object(&mapped);
+        Ok(mapped)
+      }
+      Err(e) => {
+        // Nothing was placed in the reservation, so it is this call's to give straight back.
+        // SAFETY: `reservation` is the mapping this call just made and nothing holds a reference into it.
+        let _ = unsafe { rustix::mm::munmap(reservation, span) };
+        Err(refused("mmap", e))
+      }
+    }
   }
 
   /// Asks for transparent huge pages behind a shared object's mapping (Linux).
@@ -763,15 +882,22 @@ mod platform {
   /// whether a mapping actually got huge pages is `AnonHugePages`/`ShmemPmdMapped` in `/proc/self/smaps`, which
   /// L1's zones must read and refuse on rather than trusting this call.
   #[cfg(target_os = "linux")]
-  fn advise_huge_object(map: &MmapMut) {
+  fn advise_huge_object(map: &Mapped) {
     // A refusal here costs nothing: the mapping is correct either way, and the only consequence is base pages.
-    let _ = map.advise(memmap2::Advice::HugePage);
+    // SAFETY: the range is this object's own live mapping; the advice changes no byte of it and no other map.
+    let _ = unsafe {
+      rustix::mm::madvise(
+        std::ptr::with_exposed_provenance_mut::<std::ffi::c_void>(map.window),
+        map.len,
+        rustix::mm::Advice::LinuxHugepage,
+      )
+    };
   }
 
   /// The paired arm: no transparent huge pages to ask for off Linux (macOS offers user programs no superpages,
   /// Appendix C; Windows large pages need a privilege slates never requires, R10).
   #[cfg(not(target_os = "linux"))]
-  fn advise_huge_object(_map: &MmapMut) {}
+  fn advise_huge_object(_map: &Mapped) {}
 
   pub(super) fn create(name: &str, len: usize) -> Result<Inner, MemError> {
     let created = create_object(name)?;
@@ -1051,14 +1177,14 @@ mod platform {
     }
 
     pub(super) fn lock(&mut self) -> Result<(), MemError> {
-      crate::region::lock_map(&mut self.map).map_err(|e| MemError::OsRefused {
+      crate::region::lock_bytes_whole(&mut self.map).map_err(|e| MemError::OsRefused {
         call: "mlock",
         code: e.raw_os_error(),
       })
     }
 
     pub(super) fn lock_range(&mut self, offset: usize, len: usize) -> Result<(), MemError> {
-      crate::region::lock_map_range(&mut self.map, offset, len).map_err(|e| MemError::OsRefused {
+      crate::region::lock_bytes_range(&mut self.map, offset, len).map_err(|e| MemError::OsRefused {
         call: "mlock",
         code: e.raw_os_error(),
       })

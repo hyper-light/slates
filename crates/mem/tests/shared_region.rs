@@ -224,3 +224,70 @@ fn a_shared_objects_mapping_is_backed_by_huge_pages_so_a_shift_moves_physical_ro
     "the shared object's mapping is huge-page backed: {backed} bytes of {span}"
   );
 }
+
+/// §4.6 L1 — an object long enough to hold a huge page is mapped where one can form behind it, and that span
+/// collapses to a huge page even where the host has shmem huge pages switched off.
+///
+/// The sibling proof above asks only for the *advice*, which `shmem_enabled` governs, so it skips wherever
+/// shmem huge pages are off — and `never` is the kernel's default, so that is most hosts, including every one
+/// this project can reach. That left the premise under §4.6's sandbox asserted nowhere that runs.
+///
+/// Two things decide it, and this drives both. A huge page behind a memory object is addressed twice over, by
+/// where it sits in the process and by where it sits in the object, and the kernel forms one only where the
+/// two agree — so the mapping is *placed*, and that placement is asserted here rather than hoped for. Then the
+/// sandbox does not stop at the advice: it asks the kernel to compact the span now (`MADV_COLLAPSE`, Linux
+/// 6.1, shmem support 6.2), an explicit request rather than a preference.
+///
+/// Measured 2026-10-20 on Linux 6.12.76 (aarch64, `shmem_enabled` `never`): the advice delivered 0 bytes and
+/// the collapse delivered a full 2 MiB. Before the placement, 13 of 16 objects began off a huge boundary and
+/// the collapse was refused `EINVAL` on every one of them, whichever end was aligned — which is why the DAX
+/// sandbox was reserved by address luck
+/// (`docs/bugs/2026-10-20-the-dax-sandbox-was-reserved-by-mmap-address-luck.md`).
+#[cfg(target_os = "linux")]
+#[test]
+#[cfg_attr(miri, ignore)] // a shared memory object is not modelled by Miri, as at `region.rs`
+fn an_object_that_can_hold_a_huge_page_is_mapped_where_one_forms_and_collapses_to_it() {
+  let Some(huge) =
+    slates_machine::facts::huge_page_bytes().and_then(|bytes| usize::try_from(bytes).ok())
+  else {
+    println!(
+      "SKIP an_object_that_can_hold_a_huge_page_is_mapped_where_one_forms_and_collapses_to_it: this host has \
+       no huge page to ask for"
+    );
+    return;
+  };
+  // Derived: four huge pages, comfortably more than the one the placement must make room for.
+  let span = huge.saturating_mul(4);
+  let object = SharedObject::create(&object_name("placed"), span, Words::new()).unwrap();
+  // SAFETY: this test is the object's only accessor, which is what `ExclusiveObject` promises.
+  let mut region = Region::shared(unsafe { ExclusiveObject::new(object) }, PAGE);
+  let base = region.base() as usize;
+  assert_eq!(
+    base.checked_rem(huge),
+    Some(0),
+    "an object long enough to hold a huge page is mapped on a huge-page boundary, so its address and its \
+     offsets agree and the kernel can form one: base {base:#x}, huge page {huge}"
+  );
+  region.bytes_mut().fill(0x7A);
+
+  let shmem = std::fs::read_to_string("/sys/kernel/mm/transparent_hugepage/shmem_enabled")
+    .unwrap_or_default();
+  // Asked of the kernel both times, never of `madvise`'s return: the advice succeeds on mappings that get
+  // nothing, which is the trap `huge_backed_bytes` exists to avoid, and the sandbox reads the measurement too.
+  let advised = region
+    .huge_backed_bytes()
+    .expect("Linux answers how much of a mapping is huge-page backed");
+  let asked = region.collapse_huge(0, huge);
+  let collapsed = region
+    .huge_backed_bytes()
+    .expect("Linux answers how much of a mapping is huge-page backed");
+  eprintln!(
+    "shmem_enabled {shmem:?}: base {base:#x}; advice gave {advised} bytes, collapse returned {asked} and left \
+     {collapsed} of {span}"
+  );
+  assert!(
+    collapsed >= u64::try_from(huge).unwrap_or(u64::MAX),
+    "the placed span is huge-page backed after the collapse the sandbox asks for: {collapsed} bytes, advice \
+     alone gave {advised}, collapse returned {asked}, shmem_enabled {shmem:?}"
+  );
+}

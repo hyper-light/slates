@@ -482,45 +482,62 @@ mod os {
   /// guarantee (no locked page ever swaps) and the refusal are unchanged; an untouched page holds no content.
   /// A kernel without the flag refuses (`EINVAL`), typed by the caller.
   #[cfg(target_os = "linux")]
-  pub(crate) fn lock_map(map: &mut MmapMut) -> std::io::Result<()> {
-    // SAFETY: the range is exactly `map`'s own live mapping, borrowed mutably for the call; locking changes no
-    // byte of it and no other mapping.
+  pub(crate) fn lock_bytes_whole(bytes: &mut [u8]) -> std::io::Result<()> {
+    // SAFETY: `bytes` is exactly a live mapping of the caller's, borrowed mutably for the call; locking changes
+    // no byte of it and no other mapping.
     unsafe {
       rustix::mm::mlock_with(
-        map.as_mut_ptr().cast(),
-        map.len(),
+        bytes.as_mut_ptr().cast(),
+        bytes.len(),
         rustix::mm::MlockFlags::ONFAULT,
       )
     }
     .map_err(std::io::Error::from)
   }
 
-  /// Locks `map` against swapping. macOS has no on-fault lock: `mlock` wires the range whole.
+  /// Locks a whole mapping against swapping. macOS has no on-fault lock: `mlock` wires the range whole.
   #[cfg(not(target_os = "linux"))]
-  pub(crate) fn lock_map(map: &mut MmapMut) -> std::io::Result<()> {
-    map.lock()
+  pub(crate) fn lock_bytes_whole(bytes: &mut [u8]) -> std::io::Result<()> {
+    // SAFETY: as the Linux arm — a live mapping of the caller's, borrowed mutably for the call.
+    unsafe { rustix::mm::mlock(bytes.as_mut_ptr().cast(), bytes.len()) }.map_err(std::io::Error::from)
   }
 
-  /// Locks bytes `offset .. offset + len` of `map` against swapping (the kernel rounds to whole pages) and, on
-  /// Linux, keeps them out of core dumps (`MADV_DONTDUMP`). A range outside the map is refused `InvalidInput`.
-  pub(crate) fn lock_map_range(
-    map: &mut MmapMut,
+  /// Locks bytes `offset .. offset + len` of a mapping against swapping (the kernel rounds to whole pages) and,
+  /// on Linux, keeps them out of core dumps (`MADV_DONTDUMP`). A range outside it is refused `InvalidInput`.
+  pub(crate) fn lock_bytes_range(
+    bytes: &mut [u8],
     offset: usize,
     len: usize,
   ) -> std::io::Result<()> {
     let end = offset
       .checked_add(len)
       .ok_or(std::io::ErrorKind::InvalidInput)?;
-    let range = map
+    let range = bytes
       .get_mut(offset..end)
       .ok_or(std::io::ErrorKind::InvalidInput)?;
-    // SAFETY: `range` is a live part of `map`'s own mapping, borrowed mutably for the call; locking changes no byte
-    // of it and no other mapping.
+    // SAFETY: `range` is a live part of the caller's own mapping, borrowed mutably for the call; locking changes
+    // no byte of it and no other mapping.
     unsafe { rustix::mm::mlock(range.as_mut_ptr().cast(), range.len()) }
       .map_err(std::io::Error::from)?;
     #[cfg(target_os = "linux")]
-    map.advise_range(memmap2::Advice::DontDump, offset, len)?;
+    {
+      // SAFETY: as above; the advice changes no byte of the range and no other mapping.
+      unsafe {
+        rustix::mm::madvise(
+          range.as_mut_ptr().cast(),
+          range.len(),
+          rustix::mm::Advice::LinuxDontDump,
+        )
+      }
+      .map_err(std::io::Error::from)?;
+    }
     Ok(())
+  }
+
+  /// Locks a private mapping against swapping, as [`lock_bytes_whole`] does — one implementation, because a
+  /// mapping is its bytes whoever made it.
+  pub(crate) fn lock_map(map: &mut MmapMut) -> std::io::Result<()> {
+    lock_bytes_whole(map.as_mut())
   }
 
   /// Locks `bytes`, a block of a region's own mapping, against swapping (the kernel rounds to whole pages; a
@@ -634,7 +651,7 @@ mod os {
 /// What the shared content object discards with too (A-117 on macOS): the same advice and its mark.
 pub(crate) use os::{DISCARD_LEAVES_A_MARK, Discarded, discard_slice, reuse_slice};
 #[cfg(unix)]
-pub(crate) use os::{lock_map, lock_map_range};
+pub(crate) use os::{lock_bytes_range, lock_bytes_whole};
 
 #[cfg(windows)]
 mod os {

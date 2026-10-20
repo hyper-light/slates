@@ -3683,3 +3683,90 @@ fn a_shift_leaves_no_copy_of_the_content_on_the_row_it_vacated() {
     "and the content is intact where it moved to"
   );
 }
+
+/// §4.6 **L1** — whether a volume gets a sandbox in the shared object a daemon serves DAX from is decided by what
+/// this host backs, never by where `mmap` happened to put the object.
+///
+/// Do: build several independent stores, each over its own shared memory object exactly as the daemon's content
+/// pool does (`server/src/content_pool.rs` maps every content region from the anchor's object), and ask each for
+/// the first shift. Expect: every one of them answers the same way — all reserved, or all refused. A host either
+/// backs huge pages for a memory object or it does not, and that answer cannot differ between two objects a few
+/// microseconds apart.
+///
+/// Measured 2026-10-20 on Linux 6.12.76 (aarch64): outcomes disagreed, 3 of 16 mappings landing on a huge-page
+/// boundary and the rest not, so the same reservation was accepted or refused by address luck. The buddy hands a
+/// huge-sized allocation out at a huge-aligned *offset*, but the span's address is `region.base() + offset`, and a
+/// memory object's mapping begins on a 64 KiB boundary rather than a huge one — the kernel aligns a mapping to a
+/// huge page only for an anonymous span, or for an object where shmem huge pages are on. The private fixture is
+/// aligned for free and hid it.
+#[test]
+fn a_sandbox_in_a_shared_object_is_decided_by_the_host_not_by_where_mmap_put_the_object() {
+  use slates_mem::arena::ChunkArena;
+  use slates_mem::region::Region;
+  use slates_mem::shared::{ExclusiveObject, SharedObject};
+  use slates_mem::words::Words;
+  use slates_vfs::volume::StoreConfig;
+
+  let page = 4096usize;
+  // Derived: as the private fixture — eight of the host's huge pages, so the sandbox, the content and the arena's
+  // rounding all fit without the fixture's size shaping the result.
+  const SANDBOX_HUGE_PAGES: usize = 8;
+  // Derived: enough objects that one address landing aligned by chance cannot make the run look unanimous. At
+  // this host's 64 KiB granularity one address in 32 is huge-aligned, so eight objects agreeing by luck is one
+  // run in a million.
+  const OBJECTS: usize = 8;
+  let Some(huge) =
+    slates_machine::facts::huge_page_bytes().and_then(|bytes| usize::try_from(bytes).ok())
+  else {
+    println!(
+      "SKIP a_sandbox_in_a_shared_object_is_decided_by_the_host_not_by_where_mmap_put_the_object: this host \
+       has no transparent huge page, so every object is refused alike"
+    );
+    return;
+  };
+
+  let mut reserved = 0usize;
+  let mut addresses = Vec::new();
+  for sample in 0..OBJECTS {
+    let object = SharedObject::create(
+      &format!("sl-dax-luck-{}-{sample}", std::process::id()),
+      huge * SANDBOX_HUGE_PAGES,
+      Words::new(),
+    )
+    .unwrap();
+    let mut arena = ChunkArena::new(page);
+    // SAFETY: this test is the object's only mapper, and it declares no words.
+    let region = Region::shared(unsafe { ExclusiveObject::new(object) }, page);
+    addresses.push(region.base() as usize);
+    arena.add_region(region).unwrap();
+    let mut store = Store::new(
+      &StoreConfig {
+        page,
+        cache_line: 128,
+        max_dirs: 1 << 10,
+        max_inodes: 1 << 12,
+        max_chunks: 1 << 12,
+        max_dir_blocks: 1 << 10,
+        dir_cutover: 16,
+      },
+      arena,
+      0,
+    );
+    let mut volume = volume(&mut store, 1 << 20);
+    let f = file_of(&mut store, &mut volume, "f", 0x41, DAX_PAGE);
+    let m = volume.dax_map_write(&mut store, f).unwrap();
+    match volume.dax_migrate(&mut store, &m) {
+      Ok(_) => reserved = reserved.saturating_add(1),
+      Err(VfsError::NoPhysicalIsolation) => {}
+      Err(other) => panic!("a shift is either performed or refused for want of a sandbox: {other:?}"),
+    }
+  }
+  println!(
+    "{reserved} of {OBJECTS} shared objects were given a sandbox; object addresses {addresses:#x?}"
+  );
+  assert!(
+    reserved == 0 || reserved == OBJECTS,
+    "every shared object answers alike, because the host's backing decides and not the address `mmap` chose: \
+     {reserved} of {OBJECTS} were reserved, addresses {addresses:#x?} (huge page {huge})"
+  );
+}

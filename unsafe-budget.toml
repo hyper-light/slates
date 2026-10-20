@@ -39,6 +39,19 @@
 #   own live range (1, Linux only) — memmap2's safe `lock` is a plain `mlock`, which faults the whole range in under
 #   the process's memory-map lock and stalled every shard behind one strict volume's arena lock
 #   (docs/bugs/2026-10-03-locking-an-arena-stalled-every-shard-on-the-memory-map-lock.md). 23 → 24.
+#   Congruent placement of a shared object's mapping (`shared.rs` `Mapped`, 2026-10-20, §4.6 L1): a huge page
+#   behind a memory object is addressed twice over — by where it sits in this process and by where it sits in
+#   the object — and the kernel forms one only where the two agree, so the window is now placed instead of left
+#   to `mmap`. Measured on Linux 6.12.76 (aarch64): 13 of 16 objects came back incongruent, `MADV_COLLAPSE` over
+#   an incongruent span is refused `EINVAL`, and the DAX sandbox was reserved for 0 or for 8 of 8 volumes by
+#   address luck alone (docs/bugs/2026-10-20-the-dax-sandbox-was-reserved-by-mmap-address-luck.md). memmap2
+#   offers no placement, so the mapper is rustix: the `PROT_NONE` reservation (1), the `MAP_FIXED` of the object
+#   over the congruent address inside it (1), the `munmap` of that reservation when the placement is refused (1)
+#   and again in `Drop` (1), the huge-page advice the placement finally makes worth asking (1), and the two byte
+#   views the owner lends (`Deref`, `DerefMut`: 2), less the memmap2 map they replace (−1): +6. Locking moved
+#   with it, since a mapping is its bytes whoever made it (`region.rs` `lock_bytes_whole`/`lock_bytes_range`):
+#   the whole-map lock on fault and its macOS arm (2) and the range lock with `MADV_DONTDUMP` (2), less the two
+#   that took a memmap2 map and are now thin callers (−2): +2. 37 → 45.
 # slates-rt (48): rustix marks kevent unsafe because the kernel fills the buffer (3); io-uring
 #   marks push unsafe for buffer lifetimes (2); the RawWaker vtable is unsafe by signature (5);
 #   the IOCP calls are Win32 (6); the UDP readiness registration (§4.10a, added 2026-09-07): the
@@ -210,7 +223,7 @@ slates-machine = 51
 # has no Darwin advice, so they are `libc::madvise`); and the test-only footprint reader `test_serial::footprint`
 # (`proc_pid_rusage` into a buffer of its struct's size and the `assume_init` after it succeeded, 2), with which the
 # give-back's tests observe what macOS counts.
-slates-mem = 37
+slates-mem = 45
 # 2026-10-19 (+1, §4.6 L1): `region::collapse_huge` — one `libc::madvise(MADV_COLLAPSE)` block. The sandbox
 #   needs physical contiguity, not a preference for it, and neither memmap2 0.9.11 nor rustix 1.1.4 exposes the
 #   advice, so the call is made directly; it only changes how the kernel backs pages the map already owns.
