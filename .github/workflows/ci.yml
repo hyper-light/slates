@@ -493,7 +493,11 @@ jobs:
   # already keeps zstd out of `slates-machine`. vfs, cluster and server are deliberately absent:
   # they reach `slates-archive`, whose zstd needs a C toolchain for the target, and they hold no
   # architecture-conditional code, so the lane would cost a feature-graph change for no coverage.
-  # Verified in `rust:1.98.0` on Linux before it landed (2026-10-20, 5m36s, clean).
+  # Verified on Linux before it landed (2026-10-20): clean on a native `aarch64-unknown-linux-gnu`
+  # container, cargo reporting 7.29 s for this invocation on six cores. The first attempt at that
+  # verification is worth knowing about: `docker run rust:1.98.0` resolved to a cached **linux/386**
+  # image and ran under emulation, so it checked i686 Linux, not the x86_64 this lane runs on. Pass
+  # `--platform` when the host is arm64, and read the platform warning rather than the exit code.
   windows-arm64-lint:
     name: aarch64 windows (cross lint, by compile)
     runs-on: ubuntu-latest

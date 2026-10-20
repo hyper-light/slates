@@ -566,8 +566,18 @@ are retained with their scope; no documentation edit is an implementation accept
   the set has its own `build.rs`, and every third-party build script in it is pure Rust.
 
   It is now a permanent lane, `windows-arm64-lint` (`aarch64 windows (cross lint, by compile)`),
-  verified on Linux in `rust:1.98.0` before it landed (2026-10-20, 5m36s, exit 0) rather than
-  pushed and watched, because this project has shipped a red lane that way twice.
+  verified on Linux before it landed rather than pushed and watched, because this project has
+  shipped a red lane that way twice. **With a correction to how that verification was first
+  reported:** `docker run rust:1.98.0` on this arm64 Mac resolved to a cached **linux/386** image
+  and ran under emulation, so the first pass checked *i686* Linux (toolchain
+  `1.98.0-i686-unknown-linux-gnu`), not the x86_64 the lane runs on, and "verified on Linux,
+  5m36s" overstated what had been shown. Re-run 2026-10-20 with `--platform linux/arm64` on a
+  native `aarch64-unknown-linux-gnu` container: clean, cargo reporting 7.29 s on six cores. The
+  lane's runner is x86_64 Linux and that host arch still has not been exercised locally; the
+  reason to think it immaterial is the one already recorded — no crate in the selected set has
+  its own `build.rs`, and every third-party build script in the graph is pure Rust. Lesson for
+  the next container check: pass `--platform`, and read the platform warning rather than the exit
+  code.
 
   **Correction, same day:** I first wrote here that the lane "cannot run anything: GitHub has no
   aarch64 Windows image". That is wrong. GitHub's `windows-11-arm` image is generally available
@@ -743,6 +753,13 @@ itself (`files.delegate_write(..) == Some(delegation)`), which is stronger. One 
   request, which is the exact condition entry invalidation exists to break. Nothing is dropped.
   Write-up, with the three edits a fix would make:
   `docs/bugs/2026-10-20-the-fuse-notify-rounds-wake-was-built-and-never-wired.md`.
+
+  While there, the Linux-only module itself was linted on Linux for the first time from this
+  machine: `cargo clippy -p slates-bridge-fuse --all-targets -- -D warnings` is clean on a native
+  `aarch64-unknown-linux-gnu` container (2026-10-20, 9.32 s). That matters because `channel.rs` is
+  `#[cfg(target_os = "linux")]` and this laptop never compiles it, so it is the file in the
+  workspace with the least local scrutiny — but it also confirms a lint could not have found the
+  unwired setter, since `dead_code` says nothing about a `pub` item in a library crate.
 
 `crates/land`, `crates/base`, `crates/wire`, `crates/ipc` and `crates/rt` were swept the same way.
 `base`, `wire` and `ipc` are clean; `land::hash_hex`, `rt::next_random` and `rt::sim_udp_rebind`
