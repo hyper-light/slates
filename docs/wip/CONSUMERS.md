@@ -47,15 +47,27 @@ loopback source names the volume, not an attachment. The two cases have their ow
 `a_loopback_mount_of_the_volume_is_verified_and_names_it`. So the blocked path is **Linux rootless**
 specifically. Stated from what those tests assert, not from a live macOS run.
 
-**But slates' own `attach --oci` refuses that exact configuration.** `crates/server/src/oci.rs` requires the
-source be a mount shared with other users, reasoning "a container's processes reach the source as their own
-ids, so ... a FUSE mount the daemon made for its user alone would answer them EACCES". That is true of a
-**rootful** engine and false of a rootless one, whose container-root maps to the mounting uid — demonstrated
-above. The gate decides on the mount alone and never asks which runtime will bind it, even though slates
-already models the deciding fact (`RuntimeProfile::rootless`, read from the engine's `name=rootless` security
-option). The refusals are honest evidence gates, not mistakes — `UserNamespaceUntested` says "no workload has
-run so" — and the test above is the workload they were waiting for. Relaxing them for the now-tested profile
-is the next step, recorded in GAPS.
+**And `attach --oci` now records that bind, since 2026-10-20.** It used to refuse an unshared source
+`MountNotShared`, reasoning that "a container's processes reach the source as their own ids ... would answer
+them EACCES" — true of a **rootful** engine, false of a **rootless** one whose container-root maps to the
+mounting uid, as the test above demonstrates. That refusal blocked the unprivileged case R10 prefers and
+effectively demanded a root edit of `/etc/fuse.conf` for this form.
+
+The fact is now **reported instead of enforced**: `HostMountEvidence::shared_with_other_users` travels in the
+attach's evidence and the CLI prints it, because slates cannot see which runtime the harness will drive and
+§4.6 A-9 already puts that work on the harness — "slates does the namespace work of neither the runtime nor
+the launcher", and "a metadata record is insufficient evidence of a usable container path", which is why
+`oci-check` exists to be run immediately before the runtime binds. A harness driving a rootful engine checks
+the flag and refuses; one driving a rootless engine binds. Measured end to end on fedora 6.19.10:
+
+```
+oci_evidence: fstype=fuse.slates source=slates:0000000000000002 names_volume=true
+              mount_id=2147946108 mount_device=236 shared_with_other_users=false
+oci_mount: {"destination":"/vol2","options":["bind","ro","private","nosuid","nodev"],...,"type":"bind"}
+transport: oci supported=true ...
+```
+
+— and a rootless podman container then read the file through exactly that bind.
 
 **shards microVMs — connected, not booted.** `crates/bridge-fuse/src/shards_fs.rs` is the slates backend for
 shards' virtio-fs frame socket, dispatching through the one FUSE seam, and `tests/shards_fs.rs` drives the

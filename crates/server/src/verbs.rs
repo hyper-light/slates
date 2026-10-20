@@ -5837,12 +5837,13 @@ fn attach(
     return forbidden("attach");
   }
   let situation = crate::transports::situation(state, &rights);
-  let binding = match establish_form(&record, &situation, snapshot, (intent, principal), &form) {
+  let mut binding = match establish_form(&record, &situation, snapshot, (intent, principal), &form)
+  {
     Ok(binding) => binding,
     Err(refusal) => return refused(refusal),
   };
-  let consumer = binding.as_ref().map_or_else(
-    || consumer_of(&form, client_id),
+  let resolved = binding.as_ref().map_or_else(
+    || consumer_of(&form, client_id).map(|consumer| (consumer, false)),
     |binding| {
       binding.consumer(
         state.db.partition(),
@@ -5852,10 +5853,17 @@ fn attach(
       )
     },
   );
-  let consumer = match consumer {
-    Ok(consumer) => consumer,
+  let (consumer, shared_source) = match resolved {
+    Ok(resolved) => resolved,
     Err(refusal) => return refused(refusal),
   };
+  // Whether the source is shared with other users is the parent attachment's record, which only `consumer`
+  // above has resolved — so the evidence is stamped here rather than in `oci::bind`, which sees the mount
+  // table and not the attachment. A rootful runtime needs it true; a rootless one does not (§4.6 A-9, and
+  // `HostMountEvidence::shared_with_other_users`).
+  if let Some(binding) = binding.as_mut() {
+    binding.entry.evidence.shared_with_other_users = shared_source;
+  }
   let scope = match scope_of(state, volume, &form) {
     Ok(scope) => scope,
     Err(refusal) => return refused(refusal),

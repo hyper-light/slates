@@ -883,7 +883,7 @@ fn established_text(established: &Established) -> String {
   match established {
     Established::Record => "established: record\n".to_owned(),
     Established::OciBind { binding } => format!(
-      "established: oci_bind\noci_source: {}\noci_destination: {}\noci_read_only: {}\noci_evidence: fstype={} source={} names_volume={} mount_id={} mount_device={}\noci_mount: {}\n",
+      "established: oci_bind\noci_source: {}\noci_destination: {}\noci_read_only: {}\noci_evidence: fstype={} source={} names_volume={} mount_id={} mount_device={} shared_with_other_users={}\noci_mount: {}\n",
       binding.source,
       binding.destination,
       binding.read_only,
@@ -892,6 +892,9 @@ fn established_text(established: &Established) -> String {
       binding.evidence.names_volume,
       binding.evidence.mount_id,
       binding.evidence.mount_device,
+      // A rootful runtime's container cannot read an unshared source (`EACCES`); a rootless one can. slates
+      // cannot see which the harness drives, so it reports and the harness checks (§4.6 A-9).
+      binding.evidence.shared_with_other_users,
       slates_mcp::oci_mount_json(binding)
     ),
   }

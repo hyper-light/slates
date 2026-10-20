@@ -2074,6 +2074,19 @@ pub struct HostMountEvidence {
   pub mount_id: u64,
   /// See [`HostMountEvidence::mount_id`].
   pub mount_device: u64,
+  /// Whether the source was mounted **shared with other users** (`allow_other`), which decides whether a
+  /// **rootful** runtime's container processes can read it: they reach the mount as ids other than the
+  /// mounting user's, and a FUSE mount without `allow_other` answers them `EACCES`. A **rootless** runtime
+  /// maps container-root to the mounting uid and reads it either way — measured 2026-10-19, a rootless
+  /// podman container read and wrote a slates volume through an unshared FUSE mount.
+  ///
+  /// Reported rather than enforced, because slates cannot see which runtime the harness will drive and
+  /// §4.6 A-9 puts that work on the harness ("slates does the namespace work of neither the runtime nor the
+  /// launcher"; "a metadata record is insufficient evidence of a usable container path"). A harness driving
+  /// a rootful engine checks this and refuses; one driving a rootless engine binds. Until 2026-10-20 the
+  /// attach *refused* an unshared source outright, which blocked the unprivileged case R10 prefers and
+  /// effectively demanded a root edit of `/etc/fuse.conf` for this form. Appended for append-only evolution.
+  pub shared_with_other_users: bool,
 }
 
 /// The `mounts[]` entry the harness hands its OCI runtime (the OCI runtime specification's bind mount:

@@ -45,7 +45,7 @@ impl Binding {
     volume: slates_db::catalog::VolumeId,
     principal: &slates_db::catalog::Principal,
     snapshot: Option<slates_db::catalog::SnapshotId>,
-  ) -> Result<slates_db::catalog::Consumer, Refusal> {
+  ) -> Result<(slates_db::catalog::Consumer, bool), Refusal> {
     use slates_db::catalog::Consumer;
     let parent = partition
       .attachments_of(volume)
@@ -62,31 +62,31 @@ impl Binding {
       .ok_or(Refusal::Forbidden {
         verb: "OCI source mount".to_owned(),
       })?;
-    // On Linux a **rootful** engine's container processes reach the source as ids other than the mounting
-    // user's, so the source must be a mount shared with other users (`allow_other`) or the kernel answers
-    // them EACCES — standard FUSE behaviour, which restricts a mount to the mounting user without it.
+    // **Reported, not refused.** A rootful engine's container processes reach the source as ids other than
+    // the mounting user's, so a FUSE mount without `allow_other` answers them `EACCES` — standard FUSE
+    // behaviour. A **rootless** engine maps container-root to the mounting uid and reads it either way,
+    // measured 2026-10-19: a rootless podman container read and wrote a slates volume through an unshared
+    // FUSE mount, was refused `EROFS` on a read-only bind, and wrote through a writable one
+    // (`a_rootless_container_reads_and_writes_the_volume_through_its_mount`).
     //
-    // **This is false for a rootless engine, and the gate does not yet tell them apart.** A rootless
-    // runtime's container-root maps to the mounting uid, so it reads the mount with no `allow_other` at all:
-    // measured 2026-10-19 on fedora 6.19.10, where a rootless podman container read a slates volume through
-    // an unshared FUSE mount, was refused `EROFS` on a read-only bind, and wrote through a writable one
-    // (`a_rootless_container_reads_and_writes_the_volume_through_its_mount`). So this refusal currently
-    // closes the recorded-attachment path for exactly the unprivileged configuration R10 prefers, and
-    // requiring `allow_other` means requiring a root edit of `/etc/fuse.conf` for this form.
+    // slates cannot see which runtime the harness will drive, and §4.6 A-9 puts that work on the harness —
+    // "slates does the namespace work of neither the runtime nor the launcher", and "a metadata record is
+    // insufficient evidence of a usable container path", which is why `oci-check` exists for the harness to
+    // run immediately before its runtime binds. So the fact travels in the evidence
+    // (`HostMountEvidence::shared_with_other_users`) and the harness decides.
     //
-    // The deciding fact is already modelled — `RuntimeProfile::rootless`, from the engine's `name=rootless`
-    // security option — but this decision is taken on the mount alone, with no runtime in scope to ask.
-    // Threading it here is the owed fix (GAPS, 2026-10-19); until then the gate stays, because refusing a
-    // configuration that works is the safe direction of being wrong and the opposite is not.
-    if self.attachment.is_some() && !parent.form.shared_with_other_users() {
-      return Err(Refusal::AttachmentUnsupported {
-        transport: AttachTransport::Oci,
-        reason: UnsupportedReason::MountNotShared,
-      });
-    }
-    Ok(Consumer::Mount {
-      attachment: parent.id,
-    })
+    // Until 2026-10-20 this **refused** an unshared source outright, on reasoning that is true of a rootful
+    // engine and false of a rootless one. That blocked the unprivileged case R10 prefers and effectively
+    // demanded a root edit of `/etc/fuse.conf` for this form — a privilege requirement in a product whose
+    // rule is that none is ever needed. Refusing a configuration that demonstrably works is not the safe
+    // direction once you know it works.
+    let shared = parent.form.shared_with_other_users();
+    Ok((
+      Consumer::Mount {
+        attachment: parent.id,
+      },
+      shared,
+    ))
   }
 }
 
@@ -175,6 +175,9 @@ pub(crate) fn bind(
         names_volume: verified.names_volume,
         mount_id: verified.identity.mount,
         mount_device: verified.identity.device,
+        // Stamped by the caller once `consumer` has resolved the parent attachment, which is what records
+        // whether the mount was made `--shared`; the mount table alone does not say.
+        shared_with_other_users: false,
       },
     },
   })
@@ -297,6 +300,7 @@ mod tests {
           names_volume: true,
           mount_id: 0,
           mount_device: 0,
+          shared_with_other_users: false,
         },
       },
       mount_point: mount_point.to_owned(),
@@ -316,9 +320,12 @@ mod tests {
     let volume = volume().id;
     assert_eq!(
       binding(POINT, Some(MOUNTED)).consumer(&partition, volume, &OWNER, None),
-      Ok(Consumer::Mount {
-        attachment: MOUNTED
-      })
+      Ok((
+        Consumer::Mount {
+          attachment: MOUNTED
+        },
+        true
+      ))
     );
     for (bad, principal) in [
       (binding(POINT, Some(UNKNOWN)), &OWNER),
@@ -337,17 +344,27 @@ mod tests {
     }
     assert_eq!(
       binding(POINT, None).consumer(&partition, volume, &OWNER, None),
-      Ok(Consumer::Mount {
-        attachment: MOUNTED
-      })
+      Ok((
+        Consumer::Mount {
+          attachment: MOUNTED
+        },
+        true
+      ))
     );
   }
 
-  /// AUD-29-67 (a container reaches a Linux source as its own ids). Do: record the FUSE mount at [`POINT`] as one
-  /// the daemon made for its own user (not shared), and bind it by its attachment. Expect: refused
-  /// `MountNotShared` — a container's processes would meet `EACCES` on a mount without `allow_other`.
+  /// AUD-29-67 (a container reaches a Linux source as its own ids), as it stands since 2026-10-20. Do: record
+  /// the FUSE mount at [`POINT`] as one the daemon made for its own user (not shared), and bind it by its
+  /// attachment. Expect: the bind is **allowed and reports `shared_with_other_users: false`** — a rootful
+  /// runtime's processes would meet `EACCES` there and a rootless one would not, and slates cannot see which
+  /// the harness will drive, so the fact travels in the evidence for the harness's own pre-bind check
+  /// (§4.6 A-9; `oci-check`).
+  ///
+  /// This **replaces** a refusal. Until 2026-10-20 an unshared source was refused `MountNotShared`, which
+  /// blocked the unprivileged case R10 prefers — proven by a rootless podman container reading and writing a
+  /// slates volume through exactly such a mount — and effectively demanded a root edit of `/etc/fuse.conf`.
   #[test]
-  fn a_bind_of_a_mount_not_shared_with_other_users_is_refused() {
+  fn a_bind_of_a_mount_not_shared_with_other_users_reports_it_rather_than_refusing() {
     let mut partition = Partition::new(CAPS, 0);
     let volume = volume();
     partition
@@ -377,10 +394,13 @@ mod tests {
       .unwrap();
     assert_eq!(
       binding(POINT, Some(MOUNTED)).consumer(&partition, volume.id, &OWNER, None),
-      Err(Refusal::AttachmentUnsupported {
-        transport: AttachTransport::Oci,
-        reason: UnsupportedReason::MountNotShared,
-      })
+      Ok((
+        Consumer::Mount {
+          attachment: MOUNTED
+        },
+        false
+      )),
+      "an unshared source binds, and says it is unshared, instead of being refused"
     );
   }
 
@@ -418,9 +438,12 @@ mod tests {
     read_only.entry.read_only = true;
     assert_eq!(
       read_only.consumer(&partition, volume, &OWNER, Some(pinned)),
-      Ok(Consumer::Mount {
-        attachment: UNKNOWN
-      })
+      Ok((
+        Consumer::Mount {
+          attachment: UNKNOWN
+        },
+        false
+      ))
     );
     assert!(matches!(
       read_only.consumer(&partition, volume, &OWNER, None),

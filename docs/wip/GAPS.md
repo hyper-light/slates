@@ -8785,3 +8785,30 @@ The three aarch64 skips are the issuer-surface flows, which Linux structurally c
 device, and a container with `/dev/fuse` alone silently skips every mount flow while still printing
 "37 passed". That is the third time in two days that a green count meant less than it looked; the habit that
 catches it is to count the skips every time, not to read the pass line.
+
+### 2026-10-20: the OCI bind no longer refuses the unprivileged case — it reports the fact instead
+
+`attach --oci` refused an unshared source `MountNotShared`, on reasoning that is true of a **rootful** engine
+and false of a **rootless** one: a rootless runtime maps container-root to the mounting uid and reads a FUSE
+mount with no `allow_other` at all, which a rootless podman container demonstrated on 2026-10-19. The refusal
+therefore blocked exactly the unprivileged configuration R10 prefers, and demanding `allow_other` means
+demanding a root edit of `/etc/fuse.conf` for this form — a privilege requirement in a product whose rule is
+that none is ever needed.
+
+**Replaced, not layered.** `HostMountEvidence` gains `shared_with_other_users` (appended, as `mount_id` and
+`mount_device` were before it), `Binding::consumer` returns the fact instead of refusing on it, the attach
+verb stamps it from the parent attachment record — the only thing that knows whether the mount was made
+`--shared` — and the CLI prints it in `oci_evidence`. The refusal's unit test became its report test.
+
+**Why reporting is the right place, not a weakening.** slates cannot see which runtime the harness will drive,
+so a refusal here is a prediction about a third party made with missing information. §4.6 A-9 already assigns
+that work to the harness: "slates does the namespace work of neither the runtime nor the launcher", "a
+metadata record is insufficient evidence of a usable container path" — and `oci-check` exists precisely to be
+run immediately before the runtime binds. The authorization checks that *are* slates' — the source really is
+this volume's mount, the principal matches, the rights match, the attachment is live — all stay. And the
+failure mode of getting the new behaviour wrong is a container that meets `EACCES`, which is visible and
+harmless, where the old behaviour's failure mode was a working configuration permanently refused.
+
+Verified end to end on fedora 6.19.10: the attach records the bind and reports
+`shared_with_other_users=false`, emits the runtime-spec entry, and a rootless podman container reads the file
+through that very bind. macOS: server lib 176/176, CLI 24/24, recovery 39/39, workspace clippy and xtask clean.
