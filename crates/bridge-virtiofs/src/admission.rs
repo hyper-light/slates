@@ -409,10 +409,13 @@ fn unsupported(request: &GuestAttachRequest) -> Option<UnsupportedReason> {
   // confinement would rest on the frontend honouring them rather than on what slates handed it. The
   // fd-sharing placer does not have this property (the backend maps; the VMM gets no descriptor).
   //
-  // That is one of four remaining blocking items. The full list — descriptor confinement, B2's wiring, L2's
-  // missing device-side remap and L1's zones — is the gate checklist in `docs/wip/GAPS.md` (2026-10-18, "what
-  // must be true before DAX is advertised"), which also records the two closed that day and why. Read it before
-  // flipping this, not just the record above.
+  // That was one of four blocking items, and **two of the four are now closed**: descriptor confinement (A-138,
+  // the `udmabuf`-narrowed descriptor, whose proof first ran on real hardware 2026-10-20) and L1's zones (closed
+  // 2026-10-20 — they are transparent huge pages needing no privileged broker, and the two defects that kept them
+  // from forming are fixed). **B2's wiring and L2's device-side remap still block**, and the second of those is
+  // the one that matters here: without it a shift moves the block under a guest whose window is never remapped.
+  // The checklist is `docs/wip/GAPS.md` (2026-10-18, "what must be true before DAX is advertised"), kept current.
+  // Read it before flipping this, not just the record above.
   if request.dax {
     return Some(UnsupportedReason::DaxNotEstablished);
   }

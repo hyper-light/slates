@@ -48,9 +48,11 @@ pub const DAX_PAGE: usize = 4096;
 /// xorshift64* (Vigna 2016) seeded **from boot entropy**, so the sequence is unpredictable to a co-located attacker
 /// — who cannot observe the daemon's RNG state (it is daemon-only RAM, like the registry), which is what makes a
 /// non-cryptographic generator sound here; a cryptographic source may replace it without touching this selection
-/// logic. When the L1 hugetlb sandbox lands, [`Volume::dax_migrate`] draws its shift target's slot from here instead
-/// of the general arena allocator, binding the offset to a physically-contiguous sandbox so the shift actually moves
-/// physical rows — the stated deployment requirement (without contiguity, a virtual shift is security theatre).
+/// logic. [`Volume::dax_migrate`] draws its shift target's slot from the volume's L1 sandbox rather than from the
+/// general arena allocator, binding the offset to a physically-contiguous span so the shift actually moves physical
+/// rows — the stated deployment requirement (without contiguity, a virtual shift is security theatre). That sandbox
+/// is a **transparent** huge page and not a hugetlb reservation, so it needs no administrator and no privilege
+/// (`daxzone.rs` opens with why); it landed in `DaxZone`, and this sentence said "when it lands" until 2026-10-20.
 #[must_use]
 pub fn stripe_target(slots: NonZeroUsize, current: usize, rng: &mut Xorshift) -> usize {
   let n = slots.get();
@@ -1049,8 +1051,10 @@ impl Volume {
   /// content a guest cannot hammer into a neighbour, and moving it would break the share), a revoked mapping, or one
   /// whose block already moved; `NoSpace`/`PublishNeeded` if no fresh block can back the shift — the caller keeps the
   /// old mapping and retries, never a lost window. The pseudo-random *placement* of the fresh block within a bounded
-  /// physically-contiguous sandbox ([`stripe_target`]) is the L1 step bound to the hugetlb sandbox; here the arena
-  /// provides the fresh block and the VFS half of the handoff is complete and exact — the device half above is not.
+  /// physically-contiguous sandbox ([`stripe_target`]) is the L1 step, bound to the volume's `DaxZone` — a
+  /// **transparent** huge page, not a hugetlb reservation, so no administrator and no privilege is involved; here
+  /// the arena provides the fresh block and the VFS half of the handoff is complete and exact — the device half
+  /// above is not.
   pub fn dax_migrate(&mut self, store: &mut Store, old: &Mapping) -> Result<Mapping, VfsError> {
     if !old.writable || !store.dax.is_live(old) {
       return Err(VfsError::Invalid);
