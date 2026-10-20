@@ -436,6 +436,35 @@ are retained with their scope; no documentation edit is an implementation accept
 - Cross-target checks: the four shipped crates lint clean for `x86_64-unknown-linux-gnu` and
   `x86_64-pc-windows-msvc` from this machine (the targets were installed; the C dependencies are
   off for those checks behind `slates-machine`'s `codecs` and `pure-hash` features), and CI's
+
+  **Correction (2026-10-20).** "off for those checks" was not what the tree did. The switch was
+  written as `default-features = false` on the **workspace** dependency (`Cargo.toml:18`), which
+  turns `codecs` off for every build, and no crate turned it back on. The shipped `slates` binary
+  therefore measured no codec points, `codec_policy` derived `CodecPolicy::raw_only()` and the
+  daemon stored every archive chunk raw — D-17's ratio codec dead since 2026-09-05, in every
+  build, on every platform. Proven by use with the real binary (`slates profile --json`: zero
+  codec points and the profile's own note `codec probe not compiled in`), not by reading.
+  Fixed by having the binary that measures the profile ask for the probe
+  (`crates/cli/Cargo.toml`, `features = ["codecs"]`), which leaves the library crates' cross-lint
+  C-free because `slates-cli` is not in those graphs. Gated from now on by
+  `crates/cli/tests/cli.rs::the_shipped_binary_measures_the_codecs_its_archive_policy_chooses_from`,
+  the non-vacuity counter the codec path never had: every other codec test built its own policy
+  (`measured_policy()`, `CodecPolicy::raw_only()`), so all of them passed while the wiring was
+  dead. Write-up: `docs/bugs/2026-10-20-the-ratio-codec-was-compiled-out-of-every-build.md`.
+
+  Owed from the same finding: no test drives a *compressed* archive end to end. Every test
+  anchor starts `--quick`, which sets `codecs: false` so the suites skip the 250 ms probe, so
+  the policy under test is still `raw_only()`. One full-profile end-to-end test that archives a
+  compressible volume and asserts encoded chunks would close it.
+
+  Still open from the same root: `slates-archive` is declared at the root **without**
+  `default-features = false`, so its `zstd` feature is on for every dependent and zstd-sys
+  resolves for any cross-target check that includes `slates-vfs`, `slates-cluster` or
+  `slates-server`. That is what stops `aarch64-pc-windows-msvc` being checked from this machine
+  (measured 2026-10-20: `cc` cannot target MSVC, and with zstd off the next C blocker is
+  BLAKE3's `blake3_neon.c`, which `pure-hash` answers). Closing it needs `default-features =
+  false` at the root plus a default-on `zstd` forwarding feature through each dependent, since
+  `--no-default-features` applies only to the package named on the command line.
   `cross-lint` lane repeats it. This caught two real defects on 2026-09-05: three Windows imports
   behind an unrequested `Win32_Security` feature and a working-set call in the wrong module.
   Nothing on Windows or Linux has *run* yet: that needs those machines (Phase 1's reference

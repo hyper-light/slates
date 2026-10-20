@@ -6297,3 +6297,54 @@ fn removing_the_sharing_gate_left_every_other_oci_refusal_standing() {
   assert!(!err.is_empty(), "and it says so: {err}");
   drop(anchor);
 }
+
+/// D-17, §4.11 (the ratio codec): the shipped binary must be able to choose a codec at all.
+/// Do: run `slates profile --json`, the same full profile the anchor takes at boot (`--quick`
+/// skips the codec probe on purpose, so the gate is the full one). Expect: at least one measured
+/// codec point, zstd among them because it is the ratio codec D-17 names, and no note saying the
+/// probe was not compiled in.
+///
+/// This is the non-vacuity counter the codec path never had, and it is why the path could die
+/// unnoticed. Every other codec test hands `decide` a policy the test built itself —
+/// `measured_policy()` in `crates/archive/tests/archive.rs`, `CodecPolicy::raw_only()` in
+/// `crates/vfs/tests/special.rs` — so all of them kept passing while the shipped daemon derived
+/// an empty policy and stored every chunk raw. Root cause: `slates-machine` was declared
+/// `default-features = false` in the workspace root on 2026-09-05 to keep the C dependencies out
+/// of the cross-target lint, which also turned `codecs` off for the binaries, and nothing turned
+/// it back on. Measured here on 2026-10-20 before the fix: zero codec points, and the profile's
+/// own note `codec probe not compiled in (feature `codecs` off)`.
+#[test]
+fn the_shipped_binary_measures_the_codecs_its_archive_policy_chooses_from() {
+  let output = slates().args(["profile", "--json"]).output().unwrap();
+  assert!(
+    output.status.success(),
+    "the profile verb measures the machine: {}",
+    String::from_utf8_lossy(&output.stderr)
+  );
+  let json = String::from_utf8_lossy(&output.stdout).into_owned();
+  let profile = slates_machine::MachineProfile::from_json(&json).expect("the profile is JSON");
+
+  let compiled_out = profile
+    .facts
+    .notes
+    .iter()
+    .any(|note| note.contains("codec probe not compiled in"));
+  assert!(
+    !compiled_out,
+    "the shipped binary has the codec probe compiled in; notes: {:?}",
+    profile.facts.notes
+  );
+  assert!(
+    !profile.codecs.is_empty(),
+    "the full profile measured at least one codec point, so the archive policy has a candidate"
+  );
+  assert!(
+    profile.codecs.iter().any(|point| point.codec == "zstd"),
+    "zstd is among them (D-17's ratio codec); measured: {:?}",
+    profile
+      .codecs
+      .iter()
+      .map(|point| (point.codec.as_str(), point.level))
+      .collect::<Vec<_>>()
+  );
+}

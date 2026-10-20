@@ -4960,6 +4960,17 @@ rest restores. Insufficient memory to hold a compressed copy: Refused before wor
 **Derived constants.** All from the profile and per-volume observations; the only fixed rule is
 the format floor.
 
+> **Status (2026-10-20).** The cost model above ran with no inputs until this date. The boot
+> profile's codec probe was compiled out of every build — `slates-machine` was declared
+> `default-features = false` on the workspace dependency in 2026-09-05 so a cross-target lint
+> would resolve no C sources, and nothing turned `codecs` back on — so `profile.codecs` was
+> empty, `codec_policy` derived `CodecPolicy::raw_only()` and `decide` returned `Verdict::Raw`
+> for every chunk. Archives were valid and round-tripped, which is why no suite noticed; they
+> were simply never compressed. The binary that measures the profile now asks for the probe, and
+> `crates/cli/tests/cli.rs::the_shipped_binary_measures_the_codecs_its_archive_policy_chooses_from`
+> gates it against the real `slates profile --json`. Write-up:
+> `docs/bugs/2026-10-20-the-ratio-codec-was-compiled-out-of-every-build.md`.
+
 > **Status (2026-09-30, AUD-29-13, AUD-29-14, AUD-29-15).** An archive is admitted before it is
 > decoded or reconstructed, and only its canonical form decodes.
 > - **Chunks.** A chunk's declared raw length is at most the header's `chunk_max`, and `chunk_max` is at most

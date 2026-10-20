@@ -13,7 +13,15 @@ name = "slates"
 path = "src/main.rs"
 
 [dependencies]
-slates-machine = { workspace = true }
+# The codec probe is requested here, by the binary that measures the profile, because the
+# workspace root declares `slates-machine` with `default-features = false` so a cross-target
+# lint from a host with no C toolchain resolves no zstd (GAPS §8, 2026-09-05). That switch is
+# right for the library crates and wrong for the product: it also compiled the probe out of
+# `slates`, so `probes::codecs` returned the empty stub, `codec_policy` derived
+# `CodecPolicy::raw_only()` and the daemon stored every archive chunk raw — D-17's ratio codec
+# dead in every build, measured 2026-10-20. Asking for it here restores it for the product and
+# leaves the library crates' cross-lint C-free, since `slates-cli` is not in those graphs.
+slates-machine = { workspace = true, features = ["codecs"] }
 slates-anchor = { workspace = true }
 slates-db = { workspace = true }
 slates-ipc = { workspace = true }
