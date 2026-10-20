@@ -851,6 +851,21 @@ Neither was verifiable from this machine, for the reason stated above — cross-
 Windows needs an MSVC toolchain for `blake3`, `zstd-sys` and `aws-lc-sys` build scripts — so both fixes
 were made against the CI log and re-verified by the lane itself.
 
+**And behind them, R1's own lint wall (2026-10-20).** With the CLI's gaps closed the lane got far enough
+to evaluate `clippy.toml` against a crate that compiles, and failed on the wall: thirty-three entries name
+POSIX calls Windows cannot resolve — `rustix` is a `cfg(unix)` dependency and libc offers no `renameat`
+there — so clippy warns "does not refer to a reachable function" once per entry and `-D warnings` makes
+that a red lane. The entries arrived with AUD-29-31 while main was 228 commits ahead of origin, so no
+Windows runner had ever evaluated them. Fixed with clippy's own remedy, `allow-invalid = true`, on the
+`rustix::` and `libc::` entries **only**: it silences the unreachable-path diagnostic and nothing else, so
+where a path resolves the call is still denied and the wall is unchanged on Linux and macOS.
+
+The `std::` entries deliberately do not carry it, and the reason is worth keeping: the flag's cost is that
+a typo becomes an entry which silently denies nothing, and in a wall whose whole job is R1 that is the
+failure mode to protect against. `std::` paths resolve on every platform, so leaving them unmarked keeps a
+typo in them an error. Red-checked rather than assumed — a planted `rustix::fs::fsync` in `slates-mem`
+still fails `-D clippy::disallowed-methods` with the flag in place, and the plant was removed byte-exact.
+
 ### 8a-shards-boot. A real microVM mounted a slates volume and read it (2026-10-20, closed)
 
 `crates/bridge-fuse/examples/shards_fs_serve.rs` serves a volume to a shards microVM over virtio-fs:
@@ -865,6 +880,38 @@ test asserts the guest exited 0 *and* printed `SHARDS-TEST PASS`, which it print
 tag `shards0` and reading `/hello` back byte for byte. So a guest kernel's own virtio-fs client mounts a
 slates volume and reads it, with no host mount and no DAX window: the achievable integration where the
 VMM offers no DAX cache window. The DAX-window route stays as recorded in `8a-dax-confine`.
+
+### 8a-r9-gate. R9's provisioning ratchet is enforced by nothing (2026-10-20, OPEN — needs Ada)
+
+R9 reads: "The provisioning histogram (p50/p99/p999/max, spinning and parked) is a permanent,
+ratcheted CI gate." It is not in CI. `grep provision_bench .github/workflows/*.yml` returns nothing;
+`cargo xtask ratchet` runs in `gates`, but the histogram was deliberately pulled out of that omnibus
+on 2026-09-05 (`BENCHMARKS.md`) because it spawns a daemon whose shards spin, and measuring that
+beside other jobs measures the other jobs. Nothing replaced it, so the rule's enforcement mechanism
+does not exist — the floor is a command someone must remember to run.
+
+Found while checking that the mapping placement had not moved the floor, which is the measurement
+that also shows why a shared runner cannot host this gate as written. Interleaved A/B on the x86_64
+box, three rounds, `ad361113~1` against `HEAD`:
+
+| round | before p50 | after p50 | before p99 | after p99 |
+|---|---|---|---|---|
+| 1 | 25.4 µs | 20.5 µs | 1.90 ms | 1.68 ms |
+| 2 | 22.2 µs | 20.3 µs | 1.70 ms | 1.72 ms |
+| 3 | 21.2 µs | 19.2 µs | 1.60 ms | 1.64 ms |
+
+The placement is **not** a regression — `after` is never worse and p50 is consistently a little
+better. But the p99 is ~1.7 ms in *both* arms, 34× the 50 µs floor, under a load average of 8–27 on
+32 cores; on this laptop under load 38 on 18 cores it was 1.1 ms. The recorded baseline is p99 ~25 µs
+on a quiesced M5 Max. A client thread spinning for its reply competes with the shards for a core, so
+the number is a property of the machine's quiet as much as of the code.
+
+So the gap is not "add a lane": a lane on a shared GitHub runner would be red every run and teach
+everyone to ignore it. **Ada's call** between a quiesced self-hosted runner, gating a load-insensitive
+statistic instead (the spinning p50 held up here, and instruction counts are already gated by
+iai-callgrind), or amending R9 to say what is true — that the histogram is a release-time measurement
+on a quiesced machine, not a CI gate. What should not stand is the rule claiming an enforcement that
+is not there.
 
 ### 8a-dax-measure. The sandbox asked the wrong oracle: a whole-mapping total, not the span (2026-10-20, closed)
 
