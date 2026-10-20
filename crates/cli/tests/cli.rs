@@ -4253,6 +4253,33 @@ fn linux_fuse_mount_runs() -> bool {
   true
 }
 
+/// Whether this host lets an unprivileged process make a user namespace, which `slates exec` needs before it
+/// can map ids and mount anything of its own. A loud skip otherwise.
+///
+/// This is a *second* capability, and the launcher flow needs both: a host can have `fusermount3` and
+/// `/dev/fuse` and still deny the namespace. Ubuntu 24.04 does exactly that by default
+/// (`kernel.apparmor_restrict_unprivileged_userns=1`), which is what GitHub's `ubuntu-latest` runs — so the
+/// launcher tests passed the FUSE gate there, went on, and failed inside the launcher with
+/// `open /proc/self/setgroups: code 13`. Measured 2026-10-20: this laptop's Docker Linux denies it too, but
+/// there the FUSE gate had already skipped the test, which is why the gap never showed here.
+///
+/// The probe forks `unshare -U true` rather than attempting the namespace in-process, because an attempt
+/// made here would be made by the test runner's own process and a success would change it.
+#[cfg(target_os = "linux")]
+fn unprivileged_user_namespaces_run() -> bool {
+  let permitted = Command::new("unshare")
+    .args(["-U", "true"])
+    .output()
+    .map(|o| o.status.success())
+    .unwrap_or(false);
+  if !permitted {
+    eprintln!(
+      "SKIP: this host denies an unprivileged user namespace (Ubuntu's        kernel.apparmor_restrict_unprivileged_userns, or a container's seccomp); `slates exec` needs one"
+    );
+  }
+  permitted
+}
+
 /// `slates mount ID DIR` on Linux reports the mount point, and the kernel lists a `fuse.slates` mount there
 /// whose source names the volume's one attachment.
 #[cfg(target_os = "linux")]
@@ -5186,7 +5213,7 @@ const ROOT_ENV: &str = "SLATES_ROOT";
 #[cfg(target_os = "linux")]
 #[test]
 fn the_launcher_refuses_a_path_it_would_have_to_create_and_leaves_the_host_untouched() {
-  if !linux_fuse_mount_runs() {
+  if !linux_fuse_mount_runs() || !unprivileged_user_namespaces_run() {
     return;
   }
   let instance = format!("cli-exec-{}", std::process::id());
@@ -5428,9 +5455,20 @@ done
 echo "--- failed"; echo "$fails"
 "#;
 
-/// The bind is refused `MountNotShared` over a FUSE mount the daemon made for its user alone.
+/// A FUSE mount the daemon made for its user alone is **bound**, and the binding reports
+/// `shared_with_other_users: false` for the harness's own pre-bind check (AUD-29-67, as it stands since
+/// 2026-10-20; `server/src/oci.rs`). A rootful runtime's processes would meet `EACCES` there and a rootless
+/// one would not, and slates cannot see which the harness will drive, so the fact travels in the evidence
+/// rather than in a refusal — refusing blocked the unprivileged case R10 prefers and effectively demanded a
+/// root edit of `/etc/fuse.conf`.
+///
+/// This asserted the old `MountNotShared` refusal until 2026-10-20, and it is the **third** sibling of that
+/// one rule change: the unit test beside the rule was updated with it, `server/tests/fuse_mount.rs` was not,
+/// and nor was this. None of the three that were missed runs without a host that has `/dev/fuse`, and this
+/// one also needs `SLATES_TEST_CLI`, which only the `gates` job sets — so the rule changed under tests that
+/// nothing here could run.
 #[cfg(target_os = "linux")]
-fn an_unshared_mount_is_no_bind_source(instance: &str, id: &str) {
+fn an_unshared_mount_is_bound_and_reported_unshared(instance: &str, id: &str) {
   let point = MountPoint {
     path: fresh_mount_point(),
   };
@@ -5446,10 +5484,22 @@ fn an_unshared_mount_is_no_bind_source(instance: &str, id: &str) {
       &point.path,
       "--oci-destination",
       "/work",
+      "--json",
     ],
   );
-  assert_ne!(code, 0, "an unshared mount is no bind source: {out}");
-  assert!(err.contains("MountNotShared"), "{err}");
+  assert_eq!(
+    code, 0,
+    "an unshared mount is bound, not refused: {err}{out}"
+  );
+  assert_eq!(
+    json_field(&out, "shared_with_other_users"),
+    "false",
+    "the evidence reports the mount as made for its own user, which is the fact the harness checks \
+     before it binds: {out}"
+  );
+  // It is a real attachment now, so it is given back before the mount goes.
+  let (code, _, err) = run(instance, &["detach", &json_field(&out, "attachment")]);
+  assert_eq!(code, 0, "detach: {err}");
   let (code, _, err) = run(instance, &["unmount", &point.path]);
   assert_eq!(code, 0, "{err}");
 }
@@ -5505,7 +5555,7 @@ fn a_linux_container_reaches_the_shared_mount_as_its_own_ids() {
   );
   detach_all(&instance, &[writer["attachment"].as_u64().unwrap()]);
   let _ = unmount_after_container(&instance, &path);
-  an_unshared_mount_is_no_bind_source(&instance, &id);
+  an_unshared_mount_is_bound_and_reported_unshared(&instance, &id);
   drop(point);
   drop(anchor);
 }

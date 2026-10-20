@@ -866,6 +866,25 @@ failure mode to protect against. `std::` paths resolve on every platform, so lea
 typo in them an error. Red-checked rather than assumed — a planted `rustix::fs::fsync` in `slates-mem`
 still fails `-D clippy::disallowed-methods` with the flag in place, and the plant was removed byte-exact.
 
+### 8a-launcher-ci. `slates exec` has no CI coverage: the runner denies the namespace it needs (2026-10-20, OPEN — one line from Ada)
+
+The launcher flow gates on `fusermount3` and `/dev/fuse` and on nothing else, but `slates exec` needs a
+second capability: an **unprivileged user namespace**, before it can map ids and mount anything of its own.
+A host can have FUSE and still deny the namespace, and GitHub's `ubuntu-latest` is exactly that host —
+Ubuntu 24.04 ships `kernel.apparmor_restrict_unprivileged_userns=1`. So the test passed the FUSE gate there,
+went on, and failed inside the launcher with `open /proc/self/setgroups: code 13`.
+
+It never showed here because this laptop's Docker Linux denies the namespace **too**, and there the FUSE gate
+skipped the test first — two capabilities missing, one gate, and the one that was checked hid the one that
+was not.
+
+A loud skip is now in place (`unprivileged_user_namespaces_run`), so the lane is honest rather than red. But
+a skip is not coverage, and by this ledger's own rule a test that always skips is not a test: `slates exec`
+is now tested on **no machine this project can reach**. Enabling it on the runner is one line before the
+step — `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0` — which is **Ada's call**, in the
+same family as the `user_allow_other` grant of 2026-10-01. Until then the launcher's only evidence is the
+hand-run on a permissive host.
+
 ### 8a-win-dumps. Windows has no unprivileged core-dump exclusion, and the CLI now says so (2026-10-20, OPEN — needs Ada)
 
 Compiling `slates-cli` for Windows for the first time turned up three Unix-only sites in the shipped
