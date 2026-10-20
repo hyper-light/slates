@@ -8733,3 +8733,36 @@ nothing in zsh, which does not word-split an unquoted variable, so all eighteen 
 that printed as if it had run. `kill -9 $(cat file)` and a counted verification is the form that works. This
 is exactly [[load-generators-leak-spinners]], met again a day later — the lesson needed was not "remember to
 kill them" but "**verify the kill by counting**", which is now what the note says.
+
+### 2026-10-20: DAX at extremes, and the Windows gap in CI's own lane
+
+Two cross-platform holes closed, both of which had been passing unnoticed.
+
+**The DAX test code had never been compiled for Windows.** CI's Windows lane clippies a named package list, and
+`slates-vfs` was on it only as a *dependency* of `slates-server` — so the library was checked and its **tests
+were not**, which is where §4.6's whole suite lives, paired `#[cfg]` arms and the `huge_page_bytes` probe
+included. Cross-linted clean against `x86_64-pc-windows-gnu` (`-p slates-vfs -p slates-mem -p slates-machine
+--all-targets -- -D warnings`, exit 0), and `slates-vfs` and `slates-machine` are now **on the lane's list** so
+it stays closed. Note for whoever runs that container: the target needs `mingw-w64` *and* `nasm`, because
+`slates-vfs`'s dev-dependencies pull `hyper-seal` → `aws-lc-sys`, whose Windows assembly is NASM source.
+
+**The suite had never run under constrained resources** ([[test-at-extremes-law]]). Run with the limits proved
+in force by reading the container's own cgroup (`memory.max: 268435456`, `cpu.max: 100000 100000`):
+
+| limits | result |
+|---|---|
+| 1 CPU, 256 MB | 67/67, chaos property clean at 4,000 cases |
+| 1 CPU, 128 MB | 67/67 |
+| 1 CPU, 96 MB | 67/67 |
+| 1 CPU, 64 MB | 67/67 |
+
+**And the skips were counted, not assumed** — the lesson from the macOS assertions that passed for want of a
+host that could reach the state. One skip at 256 MB and the same one at 64 MB:
+`a_sandbox_is_reserved_in_the_shared_object_a_daemon_serves_dax_from`, which is the Docker VM's `shmem_enabled`
+and not memory pressure. So L1 really does reserve its 2 MiB huge page, lay out its guard rows, walk twenty
+shifts and survive the four-layer chaos property **inside a 64 MB cgroup on one core**.
+
+Methodology worth keeping: constrain the **run**, never the build. The first attempt put `--memory 256m` on a
+container that also compiled, cargo was OOM-killed, and both commands printed nothing at all — which reads as
+a pass if you only grep for failures. Build into a named volume with generous memory, then run the built
+binary under the limit.
