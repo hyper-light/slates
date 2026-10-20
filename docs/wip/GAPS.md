@@ -8714,10 +8714,13 @@ not evidence.
 | the test alone, 3 runs | passes (26 s, 30 s, 34 s — the climb is the load signal) |
 | under 18-core CPU saturation | **passes** (86 s) |
 | all 17 `slates-server` suites in parallel | passes |
-| full `cargo test --workspace` | failed once |
+| full `cargo test --workspace`, run 1 | **failed once** |
+| full `cargo test --workspace`, run 2 | passes (258 binaries, 2,720 tests, exit 0) |
 
-So CPU is not the pressure that breaks it: the lease renewal holds with every core busy. What reproduces it is
-the whole workspace at once, and I could not narrow it further in four attempts. It is **not attributable to
+So CPU is not the pressure that breaks it: the lease renewal holds with every core busy. It did **not recur**
+on a second full-workspace run, so the honest count is one failure in two runs of the broadest contention and
+none at any narrower pressure — a one-off I could not reproduce, not a standing defect and not a flake waved
+away. It is **not attributable to
 this session's changes** — the DAX shift and scrub loops were already present in the earlier clean workspace
 run (258 binaries, exit 0), and the later changes are tests plus a comment.
 
