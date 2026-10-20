@@ -558,12 +558,17 @@ fn a_map_read_returns_the_whole_file_at_every_size() {
     .expect("the fixture creates its local consensus group");
   let mut client = connect(&instance);
 
-  for kib in [4usize, 64, 256, 1024] {
+  // Zero is in the list because it was the corner none of these covered, and a 50,000-case sweep of the VFS
+  // property above it found the hole: `dax_map_read` of a 0-byte file has no extent at offset 0 and refuses
+  // `NotFound`, which the server turns into a refusal to the caller — so a zero-copy read of a file that
+  // plainly exists reported that it did not, while the copy path returns its zero bytes without complaint.
+  for kib in [0usize, 4, 64, 256, 1024] {
     let id = client
       .create(&CreateSpec {
         name: format!("whole-{kib}"),
         size: SizeClass::Bounded {
-          limit: u64::try_from(kib << 10)
+          // The volume still needs room for its own records when the file in it is empty.
+          limit: u64::try_from(kib.max(4) << 10)
             .unwrap_or(1 << 20)
             .saturating_mul(8),
         },

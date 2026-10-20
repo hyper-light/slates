@@ -3915,3 +3915,43 @@ fn many_tenants_coming_and_going_never_land_in_each_others_sandboxes() {
     "the tenants actually shifted rather than the loop passing over nothing: {shifts} shifts"
   );
 }
+
+/// §4.6 — a file truncated to nothing still maps, and maps as an empty window.
+///
+/// The property above this draws its length from `0..DAX_PAGE`, so it *can* reach zero, but its committed 96
+/// cases never had: the hole only showed at 50,000, where it shrank to `len = 0` and reported that a read map
+/// of a 0-byte file was refused `NotFound`. A boundary that a generator reaches once in hundreds of runs is
+/// not covered by that generator — it is covered by naming it — so this test names it and runs every time.
+///
+/// What was wrong: whether an empty file could be mapped depended on how it became empty. Written empty, its
+/// body is `Inline(&[])` and the inline arm maps it; truncated empty, the body is `None` or extents that no
+/// longer reach offset 0, and the call fell through to `sealed_extent_at`'s `NotFound` — telling a caller
+/// that a file it had just truncated did not exist. A mount is where this is reachable: `truncate(2)` on a
+/// mounted file, then any zero-copy map of that inode.
+#[test]
+fn a_file_truncated_to_nothing_still_maps_as_an_empty_window() {
+  let mut store = store();
+  let mut volume = volume(&mut store, 1 << 20);
+  let file = file_of(&mut store, &mut volume, "shrunk", SECRET, DAX_PAGE);
+  volume
+    .truncate(&mut store, file, 0)
+    .expect("a truncate to nothing is accepted");
+
+  let mapping = volume
+    .dax_map_read(&mut store, file)
+    .expect("a file with no bytes maps as an empty window, however it came to have none");
+  assert_eq!(
+    mapping.file_len, 0,
+    "the authorized length is the truncated size"
+  );
+  // The window must not show the bytes the file used to hold: that is the same tail rule as the property
+  // above, at the one length where the whole file is tail.
+  let page = volume
+    .dax_read(&store, &mapping, 0, DAX_PAGE)
+    .expect("the window reads");
+  assert!(
+    !page.contains(&SECRET),
+    "no byte of the truncated content is readable through the window"
+  );
+  store.dax_release_after_unmap(&mapping);
+}

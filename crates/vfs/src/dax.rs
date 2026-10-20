@@ -673,12 +673,32 @@ impl Volume {
     // An inline file keeps its bytes in the inode with no content block; materialize them at offset 0 into a
     // throwaway block the mapping owns, exactly as `dax_map_dir` does. The clone releases the store borrow before
     // the mutable materialize.
-    let inline = match &self.inode(&*store, no)?.body {
-      Body::Inline(bytes) if file_offset == 0 => Some(bytes.clone()),
-      _ => None,
+    let (inline, empty_file) = {
+      let inode = self.inode(&*store, no)?;
+      let inline = match &inode.body {
+        Body::Inline(bytes) if file_offset == 0 => Some(bytes.clone()),
+        _ => None,
+      };
+      // A regular file, explicitly: a directory's recorded size is 0 too, and without this the arm below
+      // would hand one an empty window where `mapping_a_directory_is_refused` requires a refusal (a
+      // directory is mapped by `dax_map_dir`, which serves rows, not content). The suite caught exactly
+      // that the first time this arm was written.
+      let empty_file =
+        inode.kind == crate::inode::Kind::File && inode.attrs.size == 0 && file_offset == 0;
+      (inline, empty_file)
     };
     if let Some(bytes) = inline {
       return self.map_owned_block(store, no, 0, &bytes);
+    }
+    // A file with no bytes maps as an empty window, however it came to have none. Written empty it is
+    // `Body::Inline(&[])` and the arm above takes it; **truncated** empty it is `Body::None` or extents that
+    // no longer reach offset 0, and before 2026-10-20 it fell past both arms below to `sealed_extent_at`'s
+    // `NotFound` — so whether an empty file could be mapped depended on its history rather than its state,
+    // and a caller was told a file it had just truncated did not exist. Found by a 50,000-case sweep of
+    // `a_mapping_hides_the_tail_at_whatever_length_the_file_was_truncated_to`, whose committed 96 cases had
+    // never drawn `len = 0`.
+    if empty_file {
+      return self.map_owned_block(store, no, 0, &[]);
     }
     // The open (plaintext) chunk at this offset maps zero-copy, directly off its arena block.
     if let Ok((block, block_file_start, file_len)) = open_chunk_at(&*store, self, no, file_offset) {
