@@ -1471,6 +1471,52 @@ mod tests {
     assert!(arena.bytes(a).unwrap().iter().all(|&b| b == 0));
   }
 
+  /// §4.6, and the reason the arena zeroes at all (no cross-tenant disclosure): a freed block is zeroed across
+  /// **every** page of it, not merely its first. Do: for extents of one to eight pages, fill with a secret, free,
+  /// and read the extent back; then allocate the same size again. Expect: every byte reads zero after the free,
+  /// and the pages handed to the next tenant are zero too.
+  ///
+  /// Both existing scrub assertions allocate exactly one page (`arena.alloc(p)`), so a scrub that covered only the
+  /// first page of a multi-page extent passed the whole suite. A DAX chunk is sixteen pages, and a freed chunk
+  /// reallocated to another volume is precisely the path this zeroing exists to close, so one page of coverage was
+  /// the wrong page count to stop at. Red-checked by capping the scrub at one page: this fails from two pages up
+  /// while `a_pinned_block_survives_its_free_until_the_last_holder_unpins` still passes.
+  #[test]
+  fn a_freed_extent_is_zeroed_across_every_one_of_its_pages() {
+    const SECRET: u8 = 0xCD;
+    let p = page();
+    for pages in 1..=8usize {
+      let mut arena = ChunkArena::new(p);
+      arena
+        .add_region(Region::map(p * 16, p, false).unwrap())
+        .unwrap();
+      let a = arena.alloc(p * pages).unwrap();
+      arena.bytes_mut(a).unwrap().fill(SECRET);
+      arena.free(a).unwrap();
+
+      // The extent is at least what was asked for and may be more: the allocator rounds a three-page request
+      // up, which this test found by asserting an exact length and being told otherwise. Assert over whatever
+      // the extent actually spans — that is the memory a next tenant could receive.
+      let after = arena.bytes(a);
+      assert!(
+        after.is_some_and(|b| b.len() >= p * pages && b.iter().all(|&x| x == 0)),
+        "a freed {}-page extent is zeroed across all {:?} bytes of it; first byte still set: {:?}",
+        pages,
+        after.map(<[u8]>::len),
+        after.and_then(|b| b.iter().position(|&x| x != 0))
+      );
+
+      let again = arena.alloc(p * pages).unwrap();
+      assert!(
+        arena
+          .bytes(again)
+          .is_some_and(|b| b.iter().all(|&x| x == 0)),
+        "and the next tenant of those {} pages sees zeros, never the secret",
+        pages
+      );
+    }
+  }
+
   /// §4.6. Do: pin a block, then try to pin a freed one. Expect: pinning a block no live allocation names is refused
   /// ([`ExtentRefusal::NotAllocated`]), so a stale extent can never pin memory; and trimming a pinned block is declined
   /// (`Ok(None)`), so a truncate cannot cut a mapped block's tail back to the free lists.

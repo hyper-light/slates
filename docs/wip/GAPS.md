@@ -785,6 +785,28 @@ somewhere.
   the sweep ever asked it (live 3,032,879, gone 0), which is why the ending task now lives
   `GONE_TASK_STEPS` steps.
 
+**The arena's zero-on-free was only tested on a one-page extent (2026-10-20).** `release_block`
+zeroes a block as it goes back to the free lists — "as Linux's `init_on_free=1` hardening does
+for the page allocator" — and that is the guarantee standing between one tenant's freed bytes and
+the next tenant who receives those pages. Both existing assertions in `crates/mem/src/arena.rs`
+allocate exactly one page (`arena.alloc(p)`), so a scrub covering only the *first* page of a
+multi-page extent passed the whole `slates-mem` suite. A DAX chunk is sixteen pages, and a freed
+chunk reallocated to another volume is exactly the path the zeroing closes, so one page was the
+wrong page count to stop at.
+
+`a_freed_extent_is_zeroed_across_every_one_of_its_pages` now fills extents of one to eight pages
+with a secret, frees them, and asserts every byte of the extent reads zero and that the next
+allocation of the same size sees zeros too. Red-checked by capping the scrub at one page
+(`scrub(region, offset, len.min(region.page()))`): the new test fails at **two pages**, naming
+byte **16384** — the first byte of the second page on this host's 16 KiB pages — while
+`two_holders_keep_a_block_until_the_last_unpin`, the existing single-page scrub assertion, passes
+under the same planted bug. `arena.rs` restored; 96 `slates-mem` lib tests green.
+
+Worth recording for the next test written here: the first draft asserted the freed extent's
+length was exactly the requested `p * pages` and failed at three pages — the allocator rounds a
+request up, so an extent spans at least what was asked for and may span more. Assert over what
+the extent actually covers, since that is the memory a next tenant can receive.
+
 **The DAX disclosure boundary was only tested at one length, and that mattered too
 (2026-10-20).** `a_mapping_does_not_expose_the_bytes_past_the_files_length` writes a page of a
 secret, truncates to **100** bytes and asserts `page[100..]` is zero. A mapping hands the guest a
