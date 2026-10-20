@@ -102,6 +102,12 @@ masquerade as a passing oracle". The codec path had no such counter.
   remained valid and round-tripped, which is why the suites stayed green.
 - The container image and the release binaries were not the same product. A fleet mixing them
   behaved differently by artifact, which no test or signal would have surfaced.
+- **But the behavioural impact was latent, not active, and saying otherwise would overstate it.**
+  Measured after the fix with the release binary on this machine: the derived policy decides
+  `Raw` for 67,500 bytes of highly compressible repeated text. So the release binaries, which
+  had the probe all along, were not compressing either. What the bug cost was the *capability*
+  and the artifact-to-artifact consistency, not — on a host like this one — a single compressed
+  chunk. The reason is a separate and larger gap, recorded in GAPS §8 and summarised below.
 - The boot profile carried a truthful note that no surface read.
 - Not a security or durability issue: nothing was lost, mis-sealed or mis-verified.
 
@@ -144,6 +150,33 @@ Reported, not fixed here:
   `zstd` feature is on for every dependent. That is why zstd-sys still resolves for a
   cross-target check of `slates-vfs` and why `aarch64-pc-windows-msvc` cannot be checked from a
   host with no C toolchain for it. Tracked in GAPS §8; untouched by this change.
+- **The cost model's live signals are never fed (new, open, not fixed here).** `CodecPolicy`
+  carries the three terms the design's formula needs — `value_of_byte_permille`,
+  `value_of_cpu_permille` and `expected_reads` — and `crates/archive`'s own tests drive them
+  (`archive.rs:310` raises the byte worth by `PRECIOUS_BYTES` and the chunk then compresses, so
+  the mechanism works). No production code writes any of the three. `codec_policy`
+  (`crates/server/src/config.rs:1227`) sets only `byte_ns_scaled`, from the largest measured
+  memcpy point, and leaves the rest at neutral. §4.11 specifies `value_of_byte(pressure)`,
+  `value_of_cpu(load)` and E[reads] "high for attached, ~1 per re-attach for archived", and says
+  "Hot volumes stay raw unless pressure raises `value_of_byte`; archived volumes compress once".
+  With all three neutral and a byte worth taken from a 39.6 GB/s memcpy, a byte is worth about
+  0.025 ns while zstd-1 costs about 1.45 ns/byte to round-trip, so no codec can ever pay and
+  archived volumes do not compress once or at all. Fixing it is design work, not a patch: the
+  pressure-to-permille and load-to-permille mappings have to be derived from something measured
+  (R3), and whether an archive's bytes should be valued at local memcpy bandwidth when the
+  archive is the replication unit that crosses a network (§4.10) is a question for Ada, not one
+  to invent a curve for.
+- **Swept the whole class, result negative.** The defect's shape is "a conditional-compilation
+  switch that silently disables a product path", so every such switch was enumerated rather than
+  grepped for one spelling. There are no `cfg(feature = ...)` sites at all in the production
+  sources of `slates-vfs`, `slates-mem`, `slates-rt` or `slates-server` (count: 0), so no DAX or
+  VFS path is feature-gated. The complete feature list across the workspace is `archive:
+  default/zstd`, `bridge-fskit: test-harness`, `client/db/sdk-node/sdk-python: pure-hash`,
+  `machine: default/codecs/pure-hash`, `mem/rt/wire: instruction-counts`. Of these, `pure-hash`
+  is off by default with the correct polarity, `test-harness` and `instruction-counts` are
+  opt-in test and bench gates, and the `callgrind` lane does pass `instruction-counts` to both
+  its clippy and bench steps, so it is not a second gate resolving to nothing. `codecs` was the
+  only member of the class that had gone wrong.
 - Four other root dependencies set `default-features = false`: `aws-lc-rs`, `rustls`, `rcgen`
   and `lz4_flex`. Each pairs it with an explicit `features = [...]` list, which is the correct
   use of the switch — a curated feature set, stated at the declaration. `slates-machine` was the

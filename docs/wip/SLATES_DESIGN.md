@@ -4968,7 +4968,18 @@ the format floor.
 > `codec_policy` derived `CodecPolicy::raw_only()` and `decide` returned `Verdict::Raw` for
 > every chunk. A build that named `slates-machine` on the command line escaped it, so the
 > release binaries (`cargo build --release --workspace`) compressed and the container image
-> (`cargo build --release -p slates-cli`) did not: one source, two products, which R8 forbids. Archives were valid and round-tripped, which is why no suite noticed; they
+> (`cargo build --release -p slates-cli`) did not: one source, two products, which R8 forbids.
+>
+> Fixing that made a codec **reachable**, not **chosen**, and the cost model above is still only
+> partly implemented. `CodecPolicy` carries `value_of_byte_permille`, `value_of_cpu_permille` and
+> `expected_reads`, and the archive crate's tests drive them, but no production code writes any
+> of the three: `codec_policy` sets `byte_ns_scaled` from the largest memcpy point and leaves the
+> rest neutral. So "hot volumes stay raw unless pressure raises `value_of_byte`; archived volumes
+> compress once" does not yet hold — nothing raises it, and archived volumes do not compress.
+> Measured 2026-10-20, release binary, M5 Max: the derived policy decides `Raw` for 67,500 bytes
+> of highly compressible text, because a byte worth 0.025 ns at 39.6 GB/s memcpy cannot pay for
+> zstd-1 at ~1.45 ns/byte. Open in GAPS §8, with the question of whether an archive's bytes
+> should be valued at local memcpy bandwidth when the archive crosses a network (§4.10). Archives were valid and round-tripped, which is why no suite noticed; they
 > were simply never compressed. The binary that measures the profile now asks for the probe, and
 > `crates/cli/tests/cli.rs::the_shipped_binary_measures_the_codecs_its_archive_policy_chooses_from`
 > gates it against the real `slates profile --json`. Write-up:

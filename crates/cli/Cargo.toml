@@ -51,6 +51,9 @@ windows-sys = { workspace = true }
 slates-bridge-fuse = { workspace = true }
 
 [dev-dependencies]
+# The archive's codec decision, so the codec gate can ask the policy the daemon derived what it
+# would actually do with a compressible chunk rather than stopping at "a candidate exists".
+slates-archive = { workspace = true }
 # Self-signed fleet identities for the multi-process deployment test (as the server's fleet tests mint them).
 rcgen = { workspace = true }
 # The RPC-with-TLS client a node's NFS client stands in for in the anchored export test (§4.6, AUD-29-75).

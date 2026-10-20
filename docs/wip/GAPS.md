@@ -424,7 +424,13 @@ are retained with their scope; no documentation edit is an implementation accept
   are loom-only.
 - Instruction-count gates (D-20, "iai-callgrind in CI"): iai-callgrind needs valgrind, which is
   non-Rust tooling and therefore banned from CI and this machine without Ada's explicit
-  authorization (asked 2026-09-05). The ratchet that exists is `cargo xtask ratchet`
+  authorization (asked 2026-09-05). **Stale as written, noticed 2026-10-20 while sweeping for
+  gates that silently do not apply:** the `callgrind` lane exists in `.github/workflows/ci.yml`,
+  installs valgrind and the pinned runner, and gates on `cargo xtask callgrind`. It does pass
+  `--features slates-mem/instruction-counts,slates-rt/instruction-counts,slates-wire/instruction-counts`
+  to both the clippy step and the bench step, so unlike the codec probe it is not a gate that
+  resolves to nothing. This bullet should be rewritten by whoever knows when the authorization
+  was given; it is recorded here rather than guessed at. The ratchet that exists is `cargo xtask ratchet`
   (`ratchets.toml`): wall-time ceilings keyed by machine identity, hierarchical over runs the
   way Kalibera and Jones prescribe (a ceiling is the highest upper edge across three runs; a
   check fails only when the lowest lower edge across three fresh runs lies above it), tightening
@@ -463,6 +469,30 @@ are retained with their scope; no documentation edit is an implementation accept
   anchor starts `--quick`, which sets `codecs: false` so the suites skip the 250 ms probe, so
   the policy under test is still `raw_only()`. One full-profile end-to-end test that archives a
   compressible volume and asserts encoded chunks would close it.
+
+  **Open, and larger than the bug above: the cost model's live signals are never fed.** Fixing
+  the probe made a codec *reachable*; it did not make one *chosen*. Measured 2026-10-20 with the
+  release binary on an M5 Max, the policy the daemon derives decides `Raw` for 67,500 bytes of
+  highly compressible repeated text, so the release binaries — which had the probe all along —
+  were not compressing either. §4.11's rule is `bytes_saved × value_of_byte(pressure) −
+  (t_compress + E[reads] × t_decompress) × value_of_cpu(load)`, with "hot volumes stay raw
+  unless pressure raises `value_of_byte`; archived volumes compress once".
+  `slates_archive::CodecPolicy` carries all three terms and the archive crate's own tests drive
+  them (`crates/archive/tests/archive.rs:310` raises `value_of_byte_permille` by
+  `PRECIOUS_BYTES` and the chunk compresses, so the mechanism is sound). **No production code
+  writes any of them**: `codec_policy` (`crates/server/src/config.rs:1227`) sets `byte_ns_scaled`
+  from the largest memcpy point and leaves `value_of_byte_permille`, `value_of_cpu_permille` and
+  `expected_reads` at their neutral defaults. At 39.6 GB/s memcpy a byte is worth ~0.025 ns while
+  zstd-1 costs ~1.45 ns/byte to round-trip, so nothing can pay. Measured codec rates on that
+  machine, release: lz4 1146/4761 MB/s at 72.7%, zstd 1/3/9/19 at 898/736/143/10 MB/s compress
+  and 2902/3088/3234/3757 MB/s decompress, ratios 63.4/62.5/62.3/60.6%.
+
+  This is design work, not a patch, and it is **Ada's call**, for two reasons. The
+  pressure-to-permille and load-to-permille mappings must be derived from something measured
+  (R3), and the deeper question is whether an archive's bytes should be valued at *local memcpy
+  bandwidth* at all when the archive is the replication unit that crosses a network (§4.10) —
+  valuing a wire byte at the rate a byte moves inside one host is what makes compression never
+  pay. Both wanted before anyone implements a curve.
 
   **arm64 Windows, measured 2026-10-20.** Two claims in the bullet above were stale. There is no
   `cross-lint` lane in CI: the jobs are `gates`, `live-guest`, `sdk`, `windows-lint`, `callgrind`,

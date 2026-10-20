@@ -6363,4 +6363,28 @@ fn the_shipped_binary_measures_the_codecs_its_archive_policy_chooses_from() {
     "and zstd levels among them, so D-17's ratio codec can be chosen; lz4 present: {}",
     config.codec.lz4.is_some()
   );
+
+  // What the policy actually does with a very compressible chunk, reported rather than asserted.
+  // Which way it goes is the cost model's business and it is machine-dependent by design: the
+  // neutral worth of a byte comes from this machine's memcpy bandwidth, so on a host that moves
+  // bytes far faster than any codec compresses them, raw is the correct answer and not a defect
+  // (§4.11, "Hot volumes stay raw unless pressure raises `value_of_byte`"). Asserting a codec is
+  // chosen here would be asserting a property of the machine, not of slates. What must hold is
+  // that the decision is reached with candidates in hand, which the assertions above cover.
+  let compressible = b"the quick brown fox jumps over the lazy dog. "
+    .repeat(1500)
+    .to_vec();
+  let (verdict, _) = slates_archive::codec::decide(&config.codec, &compressible);
+  eprintln!(
+    "codec gate: {} bytes of repeated text -> {:?} (byte worth {} scaled ns, zstd levels {:?})",
+    compressible.len(),
+    verdict,
+    config.codec.byte_ns_scaled,
+    config
+      .codec
+      .zstd
+      .iter()
+      .map(|rate| rate.level)
+      .collect::<Vec<_>>()
+  );
 }

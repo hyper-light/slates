@@ -1415,6 +1415,7 @@ dependencies = [
  "rustls",
  "serde_json",
  "slates-anchor",
+ "slates-archive",
  "slates-bridge-fuse",
  "slates-bridge-nfs",
  "slates-bridge-oci",
