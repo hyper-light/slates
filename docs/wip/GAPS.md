@@ -487,12 +487,47 @@ are retained with their scope; no documentation edit is an implementation accept
   machine, release: lz4 1146/4761 MB/s at 72.7%, zstd 1/3/9/19 at 898/736/143/10 MB/s compress
   and 2902/3088/3234/3757 MB/s decompress, ratios 63.4/62.5/62.3/60.6%.
 
-  This is design work, not a patch, and it is **Ada's call**, for two reasons. The
-  pressure-to-permille and load-to-permille mappings must be derived from something measured
-  (R3), and the deeper question is whether an archive's bytes should be valued at *local memcpy
-  bandwidth* at all when the archive is the replication unit that crosses a network (§4.10) —
-  valuing a wire byte at the rate a byte moves inside one host is what makes compression never
-  pay. Both wanted before anyone implements a curve.
+  **The numbers say the unwired pressure signal is not the main problem — the anchor is.**
+  Computed with the code's own objective (`worth`, `crates/archive/src/codec.rs:345`) over the
+  release profile above, the value of a byte would have to rise to this multiple of neutral
+  before any codec's worth turns positive on this machine:
+
+  | codec | bytes saved | break-even `value_of_byte` |
+  |---|---|---|
+  | lz4 | 27.3% | **159x neutral** |
+  | zstd-1 | 36.6% | **159x neutral** |
+  | zstd-3 | 37.5% | 179x neutral |
+  | zstd-9 | 37.7% | 777x neutral |
+  | zstd-19 | 39.4% | 9737x neutral |
+
+  So wiring `value_of_byte(pressure)` as a plausible multiplier — two-fold, ten-fold under
+  memory pressure — would change nothing at all. With a byte anchored to a 39.6 GB/s memcpy
+  (316 Gb/s), compression is two orders of magnitude from paying and no pressure short of
+  "about to refuse work" closes it.
+
+  Anchor the byte to **the link that carries the archive** instead, which is what the archive is
+  for (§4.10: the same container is the replication unit), and the model starts behaving like a
+  cost model. At neutral pressure, compression pays for any link slower than:
+
+  | codec | pays below |
+  |---|---|
+  | lz4, zstd-1 | ~252 MB/s (2.0 Gb/s) |
+  | zstd-3 | ~223 MB/s (1.8 Gb/s) |
+  | zstd-9 | ~52 MB/s (0.41 Gb/s) |
+  | zstd-19 | ~4 MB/s (0.03 Gb/s) |
+
+  That is the right shape: raw on a 10-25 Gb/s datacentre LAN, zstd-1 on a WAN or a constrained
+  link, deeper levels only on a slow one, chosen per link by measurement rather than by a
+  constant. It also matches `nfs-transport-constrained-links.md`'s premise that the interesting
+  links are the slow ones.
+
+  **Still Ada's call, and now a well-posed one.** Changing the anchor is a §4.11 amendment, not a
+  patch, and the plumbing is real: the link rate is measured by the transport at run time, while
+  `codec_policy` derives once at boot from a local profile, so the policy would have to become
+  per-destination or be re-derived as the transport learns. The question to settle is exactly
+  this: should an archive's byte be valued at the rate it moves inside one host, or at the rate
+  of the link it was built to cross? Everything else follows from the answer, and the numbers for
+  either choice are above.
 
   **arm64 Windows, measured 2026-10-20.** Two claims in the bullet above were stale. There is no
   `cross-lint` lane in CI: the jobs are `gates`, `live-guest`, `sdk`, `windows-lint`, `callgrind`,
