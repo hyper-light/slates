@@ -501,6 +501,16 @@ impl DaxRegistry {
     self.refused
   }
 
+  /// Every block a live mapping names, writable or not — the rows §4.6's L1 sandbox must not re-claim, however
+  /// free the arena says they look. A block whose pin was dropped while its mapping stayed live (the shared
+  /// per-block pin in §4.6 item 2) has its deferred free complete and reads as free, and a zone that took it
+  /// would hand a guest's live window to the next tenant. Bounded by the registry's cap, and asked only on the
+  /// cold placement path.
+  #[must_use]
+  pub fn mapped_blocks(&self) -> Vec<Block> {
+    self.mappings.iter().map(|mapping| mapping.block).collect()
+  }
+
   /// The live **writable** mappings of the volume with `prefix`: the set §4.6's periodic shift walks, and what a
   /// caller names when it asks for one to be moved. Collected rather than borrowed, because shifting one borrows
   /// the store; bounded by the registry's own cap, as every list here is, and small in practice because L0 keeps
@@ -981,11 +991,13 @@ impl Volume {
       store.inodes.get_mut(handle)?.body = Body::Open { open, sealed };
       return Err(VfsError::Invalid);
     }
+    let mapped = store.dax.mapped_blocks();
     let target = match store.dax_zones.shift_target(
       no.prefix(),
       store.content.arena_mut(),
       slot_bytes,
       open.block,
+      &mapped,
     ) {
       Ok(target) => target,
       Err(refusal) => {
@@ -1061,6 +1073,7 @@ impl Volume {
     // physical row, which is the security theatre §4.6 names — so a host that cannot offer a sandbox is refused
     // here rather than served a shift that does not shift.
     let slot_bytes = NonZeroUsize::new(store.content.chunk_bytes());
+    let mapped = store.dax.mapped_blocks();
     let target = match slot_bytes
       .ok_or(VfsError::NoPhysicalIsolation)
       .and_then(|slot| {
@@ -1069,6 +1082,7 @@ impl Volume {
           store.content.arena_mut(),
           slot,
           old.block,
+          &mapped,
         )
       }) {
       Ok(target) => target,

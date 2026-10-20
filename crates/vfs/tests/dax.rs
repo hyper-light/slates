@@ -1404,18 +1404,23 @@ fn two_tenants_never_land_on_a_row_inside_the_others_sandbox() {
   assert_eq!(store.dax_zones.len(), 2, "each tenant has its own sandbox");
 }
 
-/// §4.6 L1 (the sandbox's own lifecycle). Do: on a host that backs sandboxes, shift a volume's content so it
-/// reserves one, then destroy the volume. Expect: the sandbox's huge page goes back to the arena — the shard's
-/// free bytes return to what they were before the tenant existed, so a sandbox is a cost that ends with its
-/// tenant and not a page the shard loses for the rest of its life.
+/// §4.6 L1 (the sandbox's own lifecycle). Do: on a host that backs sandboxes, give a volume a writable window
+/// so it reserves one, then destroy the volume. Expect: the sandbox's huge page goes back to the arena — the
+/// shard's allocated bytes return to what they were before the tenant existed, so a sandbox is a cost that
+/// ends with its tenant and not a page the shard loses for the rest of its life.
+///
+/// The measurement is taken **before the map**, because the map is what reserves the sandbox now: a window is
+/// placed in its tenant's rows from the first byte rather than from the first shift
+/// (`a_writable_window_is_placed_in_its_sandbox_before_any_shift`). Measuring after the map was this test's
+/// own bug — it then saw the shift add nothing, which is exactly right and read as a failure.
 #[test]
 fn destroying_a_volume_gives_its_sandbox_back_to_the_arena() {
   let mut store = store_sandboxed();
   let mut volume = volume(&mut store, 1 << 20);
   let prefix = volume.prefix();
   let f = file_of(&mut store, &mut volume, "f", 0x41, DAX_PAGE);
-  let m = volume.dax_map_write(&mut store, f).unwrap();
   let allocated_before = store.content.arena().allocated_bytes();
+  let m = volume.dax_map_write(&mut store, f).unwrap();
 
   let Some(moved) = first_shift(
     &mut store,
@@ -1431,6 +1436,7 @@ fn destroying_a_volume_gives_its_sandbox_back_to_the_arena() {
     with_sandbox > allocated_before,
     "the sandbox took a huge page from the arena ({allocated_before} -> {with_sandbox})"
   );
+
   assert_eq!(store.dax_zones.len(), 1);
 
   store.dax_release_after_unmap(&moved);
@@ -1440,9 +1446,20 @@ fn destroying_a_volume_gives_its_sandbox_back_to_the_arena() {
     0,
     "the destroyed volume's sandbox is gone"
   );
+  let after_destroy = store.content.arena().allocated_bytes();
   assert!(
-    store.content.arena().allocated_bytes() < with_sandbox,
-    "the sandbox's rows went back to the arena"
+    after_destroy < with_sandbox,
+    "the sandbox's rows went back to the arena ({with_sandbox} -> {after_destroy})"
+  );
+  // What the destroy gives back is the sandbox: every row the zone was holding. What stays is the tenant's
+  // own content, at **row granularity** — a file placed in a sandbox occupies a whole row, because a row
+  // shared with another file is precisely the co-location the sandbox exists to prevent. So the page comes
+  // back *minus that row*, and the shard is left holding one row per placed file more than before the tenant
+  // existed: the price of the guarantee, not a leak. This bound says both halves at once, which the two
+  // over-claims it replaced — "no worse off than before" and "a whole huge page came back" — did not.
+  assert!(
+    after_destroy <= allocated_before.saturating_add(store.content.chunk_bytes()),
+    "and what stays is the tenant's own content at row granularity, nothing more      ({allocated_before} -> {after_destroy})"
   );
 }
 
@@ -1621,8 +1638,16 @@ fn one_round_of_the_periodic_shift_visits_every_window_once_and_slices() {
       zone.slot_of(moved.block).is_some(),
       "a shifted window sits in the tenant's sandbox"
     );
-    assert!(
-      !mapped.iter().any(|before| before.block == moved.block),
+    // Its *own* previous row, not any window's: since a writable map is now placed in the sandbox from the
+    // start, the rows the three windows began on are all inside it, and one window landing on a row another
+    // has just vacated is a correct draw, not a failure to move.
+    let was = mapped
+      .iter()
+      .find(|before| before.inode == moved.inode)
+      .map(|before| before.block);
+    assert_ne!(
+      Some(moved.block),
+      was,
       "a shifted window is not on the row it left"
     );
   }
@@ -1744,12 +1769,15 @@ fn a_refused_sandbox_is_remembered_until_the_caller_re_arms() {
   let mut store = store_sandboxed();
   let mut volume = volume(&mut store, 1 << 20);
   let f = file_of(&mut store, &mut volume, "f", 0x41, DAX_PAGE);
-  let m = volume.dax_map_write(&mut store, f).unwrap();
   assert_eq!(
     store.dax_zones.refused_len(),
     0,
     "nothing is remembered before the question is asked"
   );
+  // The map asks the question too, since a writable window is placed in its sandbox from the first byte, so
+  // the memo may already hold this volume by the time the shift runs. Checked above rather than below for
+  // exactly that reason.
+  let m = volume.dax_map_write(&mut store, f).unwrap();
 
   match volume.dax_migrate(&mut store, &m) {
     Err(VfsError::NoPhysicalIsolation) => {
@@ -1933,6 +1961,59 @@ fn the_net_never_heals_through_a_block_the_arena_has_freed() {
     Some(after_free),
     "the freed block's bytes are exactly as the free left them"
   );
+}
+
+/// §4.6 L1 (containment from the first window, not the first shift). The periodic shift arms within a liveness
+/// budget of a volume's opt-in, so a window placed only by its first shift would spend that budget on
+/// general-allocator rows, beside any tenant. §4.6 says the strategy "leans on *contain* (L1 zones) and *heal*
+/// (B2) over *detect*", so containment is the layer that must not wait.
+///
+/// Do: map a file writable on a volume that has never shifted. Expect: the block is already a row of the
+/// volume's own sandbox, with the guard rows untouched, and the content intact — no shift required. Where the
+/// host backs no sandbox the map still succeeds with the block the allocator gave it, because the sandbox is
+/// where the row *should* be and never a condition of serving the window; only the shift refuses, since a
+/// shift is what would be theatre without it.
+#[test]
+fn a_writable_window_is_placed_in_its_sandbox_before_any_shift() {
+  let mut store = store_sandboxed();
+  let mut volume = volume(&mut store, 1 << 20);
+  let f = file_of(&mut store, &mut volume, "f", 0x41, DAX_PAGE);
+
+  let mapped = volume.dax_map_write(&mut store, f).unwrap();
+
+  assert_eq!(
+    store.dax.migrated(),
+    0,
+    "no shift has happened: placement is the map's own doing"
+  );
+  match store.dax_zones.of_volume(volume.prefix()) {
+    Some(zone) => {
+      let (_, slots) = zone.held();
+      let slot = zone
+        .slot_of(mapped.block)
+        .expect("the first writable window is already on a row of the sandbox");
+      assert_ne!(slot, 0, "and not on the leading guard row");
+      assert_ne!(
+        slot,
+        slots.saturating_sub(1),
+        "nor on the trailing guard row"
+      );
+      assert!(
+        all_bytes(&store.dax_read_raw(&mapped, 0, 16), 0x41),
+        "the content came with it"
+      );
+    }
+    None => {
+      println!(
+        "SKIP a_writable_window_is_placed_in_its_sandbox_before_any_shift: this host backs no transparent \
+         huge page, so §4.6's L1 sandbox cannot be reserved"
+      );
+      assert!(
+        all_bytes(&store.dax_read_raw(&mapped, 0, 16), 0x41),
+        "the window is served anyway, with its content"
+      );
+    }
+  }
 }
 
 // ───────────────────────────────────────────────────────────── B2 the self-healing safety net (checksum + heal)

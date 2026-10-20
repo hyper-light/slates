@@ -2842,6 +2842,13 @@ same-namespace host process is the first delivered case.
 >      request, not a preference — but it still needs the kernel to find the contiguous memory, so an isolated
 >      reservation succeeded in three runs of eight on that host. A reservation that cannot be backed is refused,
 >      which is the only honest answer: physical contiguity is the host's to give.
+>      **A window is placed from its first byte, not its first shift.** `Volume::dax_map_write` puts the block
+>      on a sandbox row as it mints the window, so containment — the layer §4.6 leans on — never waits for the
+>      periodic shift to arm. The cost is that a placed file holds a **whole row**: a 4 KiB file in a 64 KiB row
+>      measured here. That is necessary rather than waste — a row shared with another file is precisely the
+>      co-location the sandbox prevents, so a row is indivisible by construction — and it is bounded at one row
+>      per writable-DAX file, which L0 keeps rare. A host that backs no sandbox serves the window with the block
+>      the allocator gave it; only the *shift* refuses, because a shift is what would be theatre without one.
 >      **The zone holds every slot it is not lending.** A row the zone does not hold is a row the general allocator
 >      may give another volume — the co-location the zone exists to prevent — so the span is allocated whole and
 >      any row that left (an ordinary delete or truncate frees a block by a path the zone does not sit on) is

@@ -8495,3 +8495,39 @@ block may be free memory" — and shipped with a red-checked regression test tha
 because the statement described *one* way the entry goes stale and I treated it as *the* way. The chaos
 property is what distinguished those; a hand-written test for a cause I had already named could not have.
 A red-check proves an assertion can fail. It does not prove the assertion is the right one.
+
+### 2026-10-19: placing at map time closed the exposure bound, and broke four assertions that were wrong
+
+`Volume::dax_map_write` now places the block on a sandbox row as it mints the window, instead of waiting for
+the first shift. That closes the containment half of the bound recorded earlier: the periodic loop still arms
+within a liveness budget of the volume's opt-in, but a window is no longer unsandboxed while it waits, and
+containment is the layer §4.6 leans on. What remains of that bound is only the first *shift*.
+
+**The cost, which is necessary rather than waste.** A placed file holds a whole row — measured here, a 4 KiB
+file in a 64 KiB row. A row shared with another file is precisely the co-location the sandbox prevents, so a
+row is indivisible by construction, and the cost is one row per writable-DAX file, which L0 keeps rare. This
+was already true of `dax_migrate`; placing at map time only made it visible earlier.
+
+**Four assertions it broke, all of which were wrong rather than the code.** Worth listing, because each was a
+test encoding a sequence rather than a rule, and only a host that backs sandboxes could tell:
+
+1. `destroying_a_volume_gives_its_sandbox_back_to_the_arena` measured allocation *after* the map, so it saw the
+   shift add nothing — which is now exactly right.
+2. Then it claimed the shard ends "no worse off than before the tenant existed". False by one row, by design.
+3. Then it claimed "a whole huge page came back". False by one row again: the page comes back *minus* the row
+   the content still sits on. The bound that is actually true says both halves at once.
+4. `one_round_of_the_periodic_shift_visits_every_window_once_and_slices` checked a shifted window had not
+   landed on *any* window's previous row. With windows placed in the sandbox from the start, landing on a row
+   another window has just vacated is a correct draw; the rule is about a window's **own** previous row.
+5. `a_refused_sandbox_is_remembered_until_the_caller_re_arms` checked the memo was empty after the map. The map
+   now asks the sandbox question too, so the check belongs before it.
+
+All five were caught only on Linux, where a sandbox can actually be reserved — macOS skips those paths
+entirely. A test fixture that cannot reach the state cannot check the rule, which is the same lesson as the
+anon-versus-shared-object backing, met again.
+
+**And one real bug, found by the chaos property:** "the sandbox is holding row 23 while a live window sits on
+it". A block whose pin was dropped while its mapping stayed live (the shared per-block pin, §4.6 item 2) has
+its deferred free complete and reads as *free*, so the zone's re-claim took a row a guest was still mapping
+through. `reclaim_missing` now refuses any row a live mapping names, which is sound whatever made it look
+free. Clean at 3 × 4,000 cases on aarch64 Linux after, and 10 / 10 full-suite runs.

@@ -223,9 +223,10 @@ impl DaxZone {
     arena: &mut ChunkArena,
     current: Option<Block>,
     rng: &mut Xorshift,
+    mapped: &[Block],
   ) -> Option<Block> {
     let here = current.and_then(|block| self.slot_of(block));
-    self.reclaim_missing(arena, here);
+    self.reclaim_missing(arena, here, mapped);
     // The draw runs over the non-guard slots, with one place standing for where the content is now — inside the
     // zone at `here`, or outside it on a first shift. `stripe_target` returns a *different* place, so the content
     // always moves, and every other place is a slot the zone holds.
@@ -266,8 +267,16 @@ impl DaxZone {
     }
   }
 
-  /// Re-claims every slot the zone is missing except the one at `keep`, which the tenant's content occupies.
-  fn reclaim_missing(&mut self, arena: &mut ChunkArena, keep: Option<usize>) {
+  /// Re-claims every slot the zone is missing except the one at `keep`, which the tenant's content occupies,
+  /// and any row in `mapped`, which a live window still names.
+  ///
+  /// The `mapped` check is not redundant with the arena's. A row a live mapping names is normally *allocated*,
+  /// so the claim fails on its own — but a block whose pin was dropped while its mapping stayed live (the
+  /// shared per-block pin recorded in §4.6 item 2) has its deferred free complete and looks free, and the zone
+  /// would take a row a guest is still mapping through. The chaos property found exactly that: "the sandbox is
+  /// holding row 23 while a live window sits on it". Refusing to claim a row any live mapping names is sound
+  /// whatever made it look free.
+  fn reclaim_missing(&mut self, arena: &mut ChunkArena, keep: Option<usize>, mapped: &[Block]) {
     for index in 0..self.slots.len() {
       if Some(index) == keep || self.slots.get(index).is_some_and(Option::is_some) {
         continue;
@@ -275,6 +284,12 @@ impl DaxZone {
       let at = self
         .base
         .saturating_add(index.saturating_mul(self.slot_bytes));
+      if mapped
+        .iter()
+        .any(|block| block.region() == self.region && block.offset() == at)
+      {
+        continue;
+      }
       if let Ok(block) = arena.claim(self.region, at, self.slot_bytes)
         && let Some(place) = self.slots.get_mut(index)
       {
@@ -395,6 +410,7 @@ impl DaxZones {
     arena: &mut ChunkArena,
     slot_bytes: NonZeroUsize,
     current: Block,
+    mapped: &[Block],
   ) -> Result<Block, VfsError> {
     self.reserve_for(prefix, arena, slot_bytes)?;
     // Split the borrow: the draw needs the volume's zone and the shared generator at once, and they are separate
@@ -403,7 +419,7 @@ impl DaxZones {
     zones
       .iter_mut()
       .find(|(held, _)| *held == prefix)
-      .and_then(|(_, zone)| zone.shift_target(arena, Some(current), rng))
+      .and_then(|(_, zone)| zone.shift_target(arena, Some(current), rng, mapped))
       .ok_or(VfsError::NoPhysicalIsolation)
   }
 
