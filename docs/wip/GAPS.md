@@ -8871,3 +8871,32 @@ remaining periodic wake.
 suites, the chaos property and the adversarial passes, on four platform/arch pairs and down to 64 MB on one
 core. It is complete and proven; it is simply gated off at L0 until the registry half of AC-4.12 lands, which
 is Ada's call.
+
+### 2026-10-20: a chaos property over the OCI reporting behaviour, red-checked both ways
+
+The hand-written attacks on the attach path drive four shapes; `the_reported_sharing_always_matches_the_record_and_nothing_else_widened`
+drives the space of them — shared or not, this principal or another, this mount point or elsewhere, the right
+attachment or a wrong one, head or snapshot, read-only or needing write — 200 cases, with an **oracle derived
+from the record rather than copied from the code**.
+
+Two properties, because removing the `MountNotShared` refusal could have gone wrong in two directions:
+
+1. **The reported sharing is never invented.** An allowed bind returns exactly the parent attachment record's
+   own `form.shared_with_other_users()`. That is what the removed refusal used to stand in for and what a
+   rootful harness now relies on: a wrong answer sends a container at a mount it cannot read, or says
+   "shared" of one that is not.
+2. **Nothing else widened.** A bind is allowed only when the parent is the bridge's attachment of *this*
+   volume, for *this* principal, at *this* mount point, presenting the version asked for and carrying the
+   rights needed.
+
+**Red-checked in both directions, because an oracle that cannot fail is decoration** — the lesson from the
+pin check that was true but insufficient, and from the exit codes that passed for the wrong reason:
+
+| break | result |
+|---|---|
+| report `!shared` instead of `shared` | fails, shrunk to `shared = false, …` |
+| drop the `parent.principal == *principal` binding | fails, shrunk to `other_principal = true, …` |
+
+It is a unit-level property, so unlike the CLI attacks it runs on **every** platform — including the Windows
+cross-lint, which is now the only Windows coverage available and where `-p slates-server -p slates-vfs
+--all-targets` is clean with it in. Server lib 177/177, workspace clippy and xtask clean.

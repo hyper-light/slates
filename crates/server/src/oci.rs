@@ -200,6 +200,7 @@ pub(crate) fn bind(
 #[cfg(test)]
 mod tests {
   use super::*;
+  use proptest::prelude::*;
   use slates_db::Op;
   use slates_db::catalog::{
     AttachForm, AttachmentRecord, BaseRecord, Consumer, NamePolicy, PolicyRecord, Principal,
@@ -453,5 +454,91 @@ mod tests {
       binding(POINT, None).consumer(&partition, volume, &OWNER, Some(pinned)),
       Err(Refusal::Forbidden { .. })
     ));
+  }
+  proptest! {
+    #![proptest_config(slates_test_seeds::unseeded(ProptestConfig {
+      cases: slates_test_seeds::cases(if cfg!(miri) { 4 } else { 200 }),
+      ..ProptestConfig::default()
+    }))]
+
+    /// §4.6 A-9 under chaos, over the reporting behaviour that replaced the `MountNotShared` refusal on
+    /// 2026-10-20. The hand-written attacks beside this drive four shapes; this drives the whole space of
+    /// them at once — a mount that is shared or not, under this principal or another, at this path or
+    /// elsewhere, named by the right attachment or a wrong one, for the head or a snapshot.
+    ///
+    /// Expect, for every generated case:
+    ///
+    /// - **the reported sharing is never invented.** When the bind is allowed, the `bool` it returns equals
+    ///   the parent attachment record's own `form.shared_with_other_users()`. This is the property the
+    ///   removed refusal used to stand in for, and the one a rootful harness now relies on: a wrong answer
+    ///   here sends a container at a mount it cannot read, or worse, says "shared" of one that is not.
+    /// - **removing the refusal widened nothing else.** A bind is allowed only when the parent is the
+    ///   bridge's attachment of *this* volume, for *this* principal, at *this* mount point, presenting the
+    ///   version asked for, carrying the rights the bind needs — the oracle below re-derives that from the
+    ///   record and must agree with the code on every case, allow or refuse.
+    #[test]
+    fn the_reported_sharing_always_matches_the_record_and_nothing_else_widened(
+      shared in any::<bool>(),
+      other_principal in any::<bool>(),
+      elsewhere in any::<bool>(),
+      name_wrong_attachment in any::<bool>(),
+      read_only in any::<bool>(),
+      write_rights in any::<bool>(),
+      ask_snapshot in any::<bool>(),
+      record_snapshot in any::<bool>(),
+    ) {
+      let mut partition = Partition::new(CAPS, 0);
+      let volume = volume();
+      partition
+        .apply(&Op::VolumeCreated { record: volume.clone() })
+        .unwrap();
+      let form = if shared {
+        AttachForm::SharedFuseMount { path: POINT.to_owned(), scope: None }
+      } else {
+        AttachForm::FuseMount { path: POINT.to_owned() }
+      };
+      let principal = if other_principal { Principal::Uid { uid: 1001 } } else { OWNER };
+      let snapshot = record_snapshot.then_some(SnapshotId { value: 1 });
+      partition
+        .apply(&Op::AttachmentAdded {
+          record: AttachmentRecord {
+            id: MOUNTED,
+            volume: volume.id,
+            consumer: Consumer::Bridge,
+            snapshot,
+            form,
+            principal,
+            rights: Rights { read: true, write: write_rights, admin: false },
+            token: [1; 16],
+          },
+        })
+        .unwrap();
+
+      let at = if elsewhere { ELSEWHERE } else { POINT };
+      let named = if name_wrong_attachment { Some(UNKNOWN) } else { Some(MOUNTED) };
+      let asked = ask_snapshot.then_some(SnapshotId { value: 1 });
+      let mut binding = binding(at, named);
+      binding.entry.read_only = read_only;
+      let got = binding.consumer(&partition, volume.id, &OWNER, asked);
+
+      // The oracle: what the record says the answer must be, derived here rather than copied from the code.
+      let allowed = !elsewhere
+        && !name_wrong_attachment
+        && !other_principal
+        && asked == snapshot
+        && (read_only || write_rights);
+      if allowed {
+        prop_assert_eq!(
+          got,
+          Ok((Consumer::Mount { attachment: MOUNTED }, shared)),
+          "an allowed bind reports exactly the record's own sharing"
+        );
+      } else {
+        prop_assert!(
+          got.is_err(),
+          "a bind the record does not cover must refuse, however the sharing reads: {got:?}"
+        );
+      }
+    }
   }
 }
