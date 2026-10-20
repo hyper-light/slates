@@ -1636,15 +1636,55 @@ impl Store {
   /// `release_refusals`, never a silent double-free.
   pub fn dax_release_after_unmap(&mut self, mapping: &Mapping) -> bool {
     match self.content.arena_mut().unpin(mapping.block) {
-      Ok(_) => {
+      Ok(released) => {
         // A metadata snapshot owns its throwaway block; free it now the pin is gone (phase two), or it would leak.
         self.free_snapshot_block(mapping);
+        // A released block was scrubbed by the arena's free path on its way to the free lists. A row that was
+        // *not* freed may be one an L2 shift handed back to its tenant's sandbox, which nothing else scrubs.
+        if !released {
+          self.scrub_vacated_sandbox_row(mapping);
+        }
         true
       }
       Err(_) => {
         self.release_refusals = self.release_refusals.saturating_add(1);
         false
       }
+    }
+  }
+
+  /// Zeroes a row an L2 shift vacated, once its stale-TLB hold is gone (§4.6 L2).
+  ///
+  /// A shift hands the row the content left back to the tenant's own sandbox ([`DaxZones::return_slot`]) rather than
+  /// to the arena's free lists — "so no neighbour can take a row inside this tenant's page while the tenant still
+  /// writes the page" — and the arena's free path is the only thing that scrubs. So without this the tenant's
+  /// plaintext stayed readable on every row it had ever moved off, for the life of the sandbox: unbounded, where
+  /// the sealing sweep bounds how long the *live* copy may sit in the clear ([`Volume::WRITE_PLAINTEXT_SWEEPS`]).
+  /// Measured on Linux 2026-10-20 before this existed: the secret was still at byte 0 of the vacated row, and a
+  /// volume that shifts periodically accumulates one such copy per shift.
+  ///
+  /// Scrubbing any earlier would be a use-after-unmap hazard rather than a fix: between phase one and phase two a
+  /// guest's TLB may still reach those bytes, which is the whole reason the hold exists.
+  ///
+  /// Narrow on purpose, because zeroing the wrong block destroys live content. It runs only when the last holder
+  /// has gone, when no deferred free was waiting (a freed block is already scrubbed), and when the block is a slot
+  /// this volume's zone currently holds **free** — a slot whose row is in use reads `None`, so content a mapping or
+  /// an inode still owns is never touched.
+  fn scrub_vacated_sandbox_row(&mut self, mapping: &Mapping) {
+    let vacated = self
+      .dax_zones
+      .of_volume(mapping.inode.prefix())
+      .and_then(|zone| {
+        zone
+          .slot_of(mapping.block)
+          .map(|slot| zone.holds_slot(slot))
+      })
+      .unwrap_or(false);
+    if !vacated || self.content.arena().is_pinned(mapping.block) {
+      return;
+    }
+    if let Some(bytes) = self.content.arena_mut().bytes_mut(mapping.block) {
+      bytes.fill(0);
     }
   }
 

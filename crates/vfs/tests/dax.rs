@@ -3641,6 +3641,15 @@ fn a_shift_leaves_no_copy_of_the_content_on_the_row_it_vacated() {
     "and whatever it is handed carries none of the tenant's bytes"
   );
 
+  // And the row carries no copy of what left it: a moving target that keeps the bytes on the row it
+  // vacated has duplicated the tenant's plaintext onto a second physical row rather than left one.
+  let vacated_bytes = store.content.arena().bytes(vacated);
+  assert!(
+    vacated_bytes.is_some_and(|b| !b.contains(&SECRET)),
+    "the vacated row is scrubbed once its stale-TLB hold is gone; first secret byte at {:?}",
+    vacated_bytes.and_then(|b| b.iter().position(|&x| x == SECRET))
+  );
+
   let now = store.dax_read_raw(&moved, 0, DAX_PAGE);
   assert!(
     now.iter().take(DAX_PAGE).all(|&b| b == SECRET),

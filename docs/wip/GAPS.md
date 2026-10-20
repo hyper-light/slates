@@ -804,15 +804,29 @@ path scrubs. Measured consequences, all three on Linux with THP `[always]`:
 - a fresh allocation of the same size is handed a **different** block containing **zero** bytes
   of the secret.
 
-So this is same-tenant **retention**, not cross-tenant disclosure, and the test now asserts those
-three facts rather than the scrub that does not happen. What is left open is worth a decision: a
-volume that shifts repeatedly leaves an unsealed plaintext copy on every row it has vacated, for
-the life of the sandbox, and nothing seals or scrubs them. That sits oddly beside the sealing
-sweep's own bound on how long a write may sit in the clear
-(`WRITE_PLAINTEXT_SWEEPS`, §4.6), which bounds the *live* copy while these stale ones are
-unbounded. Scrubbing a returned slot costs one `fill(0)` per shift; whether that is worth paying
-on the shift path is Ada's call, and so is whether the sandbox should be re-scrubbed when its
-volume is destroyed by a path other than the arena free.
+So this was same-tenant **retention**, not cross-tenant disclosure. **Fixed the same day**
+(`Store::scrub_vacated_sandbox_row`, called from `dax_release_after_unmap`): a volume that shifts
+repeatedly was leaving an unsealed plaintext copy on every row it had vacated, for the life of
+the sandbox — unbounded, where the sealing sweep bounds how long the *live* copy may sit in the
+clear (`WRITE_PLAINTEXT_SWEEPS`, §4.6). That asymmetry is what decided it rather than a
+preference: one `fill(0)` per shift, on a path that already copies the whole block, against an
+unbounded number of stale plaintext copies.
+
+It is deliberately narrow, because zeroing the wrong block destroys live content. It runs only
+when `unpin` reports no deferred free was released (a freed block is already scrubbed by the
+arena's free path), when the last holder has gone, and when the block is a slot this volume's
+zone currently holds **free** — a slot whose row is in use reads `None`, so content a mapping or
+an inode still owns is never touched. And it runs at **phase two** only: scrubbing between the
+two phases would be a use-after-unmap hazard rather than a fix, since a guest's TLB may still
+reach those bytes, which is the whole reason the hold exists. The test asserts both ends — the
+bytes are still there before the release and gone after it.
+
+Red before, green after, on Linux (the only host where a transparent huge page can back the
+sandbox): the assertion failed with "first secret byte at Some(0)" and now the full DAX suite is
+72 green there, both chaos properties included.
+
+Still open from the same area, and a smaller question: whether a sandbox should be scrubbed when
+its volume is destroyed by a path other than the arena free.
 
 **The arena's zero-on-free was only tested on a one-page extent (2026-10-20).** `release_block`
 zeroes a block as it goes back to the free lists — "as Linux's `init_on_free=1` hardening does
