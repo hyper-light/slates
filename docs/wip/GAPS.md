@@ -825,8 +825,15 @@ Red before, green after, on Linux (the only host where a transparent huge page c
 sandbox): the assertion failed with "first secret byte at Some(0)" and now the full DAX suite is
 72 green there, both chaos properties included.
 
-Still open from the same area, and a smaller question: whether a sandbox should be scrubbed when
-its volume is destroyed by a path other than the arena free.
+The smaller question raised alongside it — whether a sandbox is scrubbed when its volume is
+destroyed — turns out to be closed already, by composition rather than by its own test.
+`DaxZone::release` walks the zone's slots and hands every row it holds to `ChunkArena::free`
+(`daxzone.rs:331`), and `free` is `release_extent(.., scrubbed = true)`, whose free path runs
+`release_block` and zeroes the whole extent — which
+`a_freed_extent_is_zeroed_across_every_one_of_its_pages` now covers across page counts rather
+than at one page. A slot whose row is still in use reads `None` and is skipped, correctly: that
+block belongs to an inode and is freed by the inode's own lifecycle, down the same scrubbing
+path. With the vacated-row fix above, a row is already zero by the time a destroy reaches it.
 
 **The arena's zero-on-free was only tested on a one-page extent (2026-10-20).** `release_block`
 zeroes a block as it goes back to the free lists — "as Linux's `init_on_free=1` hardening does
