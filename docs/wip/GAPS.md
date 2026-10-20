@@ -9366,6 +9366,15 @@ Chasing the remaining DAX item (a volume opting into writable DAX waits up to on
 first shift) turned up the fact that makes it moot, and it is worth stating plainly because it is easy to
 read the last three days' work as live.
 
+**Re-verified 2026-10-21**, because a claim this load-bearing should not rest on a memory of
+having checked: `grep -rn "enable_writable_dax" --include='*.rs' crates/` still answers with
+tests only — `crates/vfs/tests/dax.rs`, `crates/bridge-virtiofs/tests/{device,admission}.rs` —
+plus `crates/vfs/examples/dax_bench.rs` and the definition itself. The other half of the pair is
+worth naming too: `writable_dax_enabled()` *is* read in production, at
+`crates/server/src/daemon.rs:3614`, where the shift loop asks whether any volume has opted in
+before it arms. Nothing opts in, so the question is always answered no and L2's periodic shift
+never runs in a deployed daemon — which is exactly why the first-shift bound cannot bite.
+
 **`Volume::enable_writable_dax()` has no production caller.** All 23 call sites are tests and one bench;
 there is no CLI verb, no protocol field and no `VolumeConfig` flag that turns it on. That is **deliberate**,
 not an oversight: `slates_ipc::protocol` says DAX is advertised "never, until its gate is met (AC-4.12)" and
