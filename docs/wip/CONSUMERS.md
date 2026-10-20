@@ -40,6 +40,13 @@ kernel**, which is the read attachment's policy enforced by the runtime; a write
 lands and the host sees it through the same mount. No privilege anywhere — uid 1000, no `allow_other`, no
 `--privileged`. Measured on fedora 6.19.10; skips loudly on a host without podman or `/dev/fuse`.
 
+**The gate is Linux-shaped, which narrows the limitation.** The refusal fires only when the mount table
+*names an attachment*, and only a Linux FUSE mount's source does (`slates:<attachment>`, AUD-29-64); the macOS
+loopback source names the volume, not an attachment. The two cases have their own tests in
+`crates/bridge-oci/tests/verify.rs` — `a_fuse_mount_is_verified_by_the_attachment_its_source_names` against
+`a_loopback_mount_of_the_volume_is_verified_and_names_it`. So the blocked path is **Linux rootless**
+specifically. Stated from what those tests assert, not from a live macOS run.
+
 **But slates' own `attach --oci` refuses that exact configuration.** `crates/server/src/oci.rs` requires the
 source be a mount shared with other users, reasoning "a container's processes reach the source as their own
 ids, so ... a FUSE mount the daemon made for its user alone would answer them EACCES". That is true of a
