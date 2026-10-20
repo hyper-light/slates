@@ -3413,25 +3413,40 @@ const DAX_SCRUB_DROPPED: &str = "dax.scrub_dropped";
 /// A shard with no guard — the common case, since the guard is the owner's opt-in
 /// (`Volume::enable_dax_integrity_guard`) — finds an empty list and returns.
 async fn scrub_guarded_windows() {
-  let mut at = 0usize;
-  loop {
-    let turn = state::with_state(|s| {
-      let budget = s.config.archive_slice_bytes().max(1);
-      let slice = s.store.dax_scrub_slice(at, budget);
-      s.count(DAX_SCRUB_CLEAN, slice.clean);
-      s.count(DAX_SCRUB_HEALED, slice.healed);
-      s.count(DAX_SCRUB_UNHEALABLE, slice.unhealable);
-      s.count(DAX_SCRUB_DROPPED, slice.dropped);
-      (slice.next, s.store.dax.guards())
-    });
-    let Some((next, guards)) = turn else {
-      return;
-    };
-    if next >= guards || next <= at {
-      return;
+  let Some(volumes) = state::with_state(|s| {
+    s.volumes
+      .iter_mut_all()
+      .map(|(handle, _)| handle)
+      .collect::<Vec<_>>()
+  }) else {
+    return;
+  };
+  for handle in volumes {
+    let mut at = 0usize;
+    loop {
+      let turn = state::with_state(|s| {
+        let budget = s.config.archive_slice_bytes().max(1);
+        let Ok(slot) = s.volumes.get(handle) else {
+          return None;
+        };
+        // The volume is the one that can say whether a guard's mapping is still current for its inode, which
+        // is the check that stops a heal writing a dead file's bytes over a live one's re-allocated block.
+        let slice = slot.volume.dax_scrub_slice(&mut s.store, at, budget);
+        s.count(DAX_SCRUB_CLEAN, slice.clean);
+        s.count(DAX_SCRUB_HEALED, slice.healed);
+        s.count(DAX_SCRUB_UNHEALABLE, slice.unhealable);
+        s.count(DAX_SCRUB_DROPPED, slice.dropped);
+        Some((slice.next, s.store.dax.guards()))
+      });
+      let Some(Some((next, guards))) = turn else {
+        return;
+      };
+      if next >= guards || next <= at {
+        break;
+      }
+      at = next;
+      futures::yield_now().await;
     }
-    at = next;
-    futures::yield_now().await;
   }
 }
 

@@ -922,6 +922,14 @@ impl Volume {
     // here, as before — offset 0 is a sealed chunk once the file spans more than one). Writable per-chunk DAX is the
     // gated follow-on; this stays the single-block writable path.
     let (block, block_file_start, file_len) = open_chunk_at(&*store, self, no, 0)?;
+    // Put it in the volume's L1 sandbox now, not at the first shift (§4.6). Containment is the primary layer —
+    // §4.6 says the strategy "leans on *contain* (L1 zones) and *heal* (B2) over *detect*" — and the periodic
+    // shift arms within a liveness budget of the volume's opt-in, so a window that waited for the first shift
+    // to be placed would spend that budget on general-allocator rows beside any tenant. Nothing is mapped yet,
+    // so this is a plain relocation with no window to revoke. A host that can back no sandbox leaves the block
+    // where it is and the map still succeeds: the sandbox is where the row *should* be, never a condition of
+    // serving the window (the shift is what refuses, because a shift is what would be theatre without it).
+    let block = self.place_in_sandbox(store, no).unwrap_or(block);
     store.content.arena_mut().pin(block)?;
     if let Some(tail) = store
       .content
@@ -947,6 +955,62 @@ impl Volume {
       return Err(refusal);
     }
     Ok(mapping)
+  }
+
+  /// Moves inode `no`'s single open block onto a row of its volume's L1 sandbox (§4.6), reserving the sandbox
+  /// on first use: the row the content now sits on.
+  ///
+  /// For a block that is not yet mapped — there is no window to revoke and no stale TLB to hold — so the row
+  /// it leaves is freed immediately. [`Volume::dax_migrate`] does the same move under the two-phase revoke,
+  /// which is the part that differs.
+  ///
+  /// Refused as [`crate::daxzone::DaxZones::shift_target`] refuses, leaving the content exactly where it is;
+  /// the caller keeps the block it had, because a host that cannot back a sandbox still serves the window.
+  fn place_in_sandbox(&mut self, store: &mut Store, no: InodeNo) -> Result<Block, VfsError> {
+    let Some(handle) = crate::trie::get(&store.tries, self.inode_root, no) else {
+      return Err(VfsError::NotFound);
+    };
+    let slot_bytes =
+      NonZeroUsize::new(store.content.chunk_bytes()).ok_or(VfsError::NoPhysicalIsolation)?;
+    let body = std::mem::replace(&mut store.inodes.get_mut(handle)?.body, Body::None);
+    let Body::Open { mut open, sealed } = body else {
+      store.inodes.get_mut(handle)?.body = body;
+      return Err(VfsError::Invalid);
+    };
+    if !sealed.is_empty() {
+      store.inodes.get_mut(handle)?.body = Body::Open { open, sealed };
+      return Err(VfsError::Invalid);
+    }
+    let target = match store.dax_zones.shift_target(
+      no.prefix(),
+      store.content.arena_mut(),
+      slot_bytes,
+      open.block,
+    ) {
+      Ok(target) => target,
+      Err(refusal) => {
+        store.inodes.get_mut(handle)?.body = Body::Open { open, sealed };
+        return Err(refusal);
+      }
+    };
+    let vacated = match store.content.relocate_into(open.as_mut(), target) {
+      Ok(vacated) => vacated,
+      Err(refusal) => {
+        store.dax_zones.return_slot(no.prefix(), target);
+        store.inodes.get_mut(handle)?.body = Body::Open { open, sealed };
+        return Err(refusal);
+      }
+    };
+    let placed = open.block;
+    store.inodes.get_mut(handle)?.body = Body::Open { open, sealed };
+    // Nothing maps the row it left, so its free is immediate — unless it was a sandbox row, which goes back to
+    // the sandbox rather than to the general free lists where a neighbour could take it.
+    if !store.dax_zones.return_slot(no.prefix(), vacated)
+      && store.content.arena_mut().free(vacated).is_err()
+    {
+      store.release_refusals = store.release_refusals.saturating_add(1);
+    }
+    Ok(placed)
   }
 
   /// **Migrates** a live writable mapping to a fresh block (§4.6 L2, the moving target) — the stripe-shift primitive
@@ -1137,6 +1201,70 @@ impl Volume {
         break;
       }
     }
+    slice
+  }
+
+  /// One cooperative slice of §4.6 B2's **periodic scrub**: the guards from index `from`, each checked
+  /// against the clean checksum it was taken with and healed from its clean copy where they differ, until
+  /// `budget_bytes` have been hashed.
+  ///
+  /// This is the net's only use. A flip in read-only content is invisible to slates by construction — nothing
+  /// in the daemon wrote it, so no code path can notice — which is why it has to be *looked for* on a timer
+  /// rather than caught at a write.
+  ///
+  /// **A guard is dropped, never acted on, unless its mapping is live, its block is pinned, *and* the mapping
+  /// is still current for its inode.** All three, because each catches a different way the entry can outlive
+  /// what it describes, and healing through any of them writes one file's bytes over another's:
+  ///
+  /// - not live: the window is gone and so is the reason to keep a clean copy;
+  /// - not pinned: the block was released and may already be scrubbed free memory, so a heal would put a
+  ///   deleted file's plaintext back where the allocator will hand it out
+  ///   (`docs/bugs/2026-10-19-the-self-healing-net-resurrects-a-deleted-files-plaintext.md`);
+  /// - not current: the block was released **and re-allocated to another file**, which pins it again — so the
+  ///   pin check passes and the bytes under the guard are now someone else's. Healing there overwrites a live
+  ///   file with a dead one's content. The chaos property found this one after the pin check was already in,
+  ///   which is why the pin check alone was not the fix.
+  ///
+  /// `due`'s cadence and budget are the caller's; `next` says where the next slice resumes, and equals the
+  /// guard count when the pass is done.
+  pub fn dax_scrub_slice(&self, store: &mut Store, from: usize, budget_bytes: u64) -> ScrubSlice {
+    let mut slice = ScrubSlice {
+      next: from,
+      ..ScrubSlice::default()
+    };
+    let mut at = from;
+    while let Some(guard) = store.dax.guards.get(at).copied() {
+      let stale = !store.dax.is_live(&guard.mapping)
+        || !store.content.arena().is_pinned(guard.mapping.block)
+        || !self.dax_still_current(&*store, &guard.mapping);
+      if stale {
+        // The list shrinks under `at`, so the cursor stays put and the next entry slides into this place.
+        store.drop_guard(&guard.mapping);
+        slice.dropped = slice.dropped.saturating_add(1);
+        continue;
+      }
+      let hashed = store
+        .content
+        .arena()
+        .bytes(guard.mapping.block)
+        .map(<[u8]>::len)
+        .unwrap_or(0);
+      match store.dax_scrub(&guard.mapping) {
+        DaxScrub::Clean => slice.clean = slice.clean.saturating_add(1),
+        DaxScrub::Healed => slice.healed = slice.healed.saturating_add(1),
+        DaxScrub::Unhealable => slice.unhealable = slice.unhealable.saturating_add(1),
+        DaxScrub::Unguarded => slice.dropped = slice.dropped.saturating_add(1),
+      }
+      slice.bytes = slice
+        .bytes
+        .saturating_add(u64::try_from(hashed).unwrap_or(u64::MAX));
+      at = at.saturating_add(1);
+      slice.next = at;
+      if slice.bytes >= budget_bytes {
+        break;
+      }
+    }
+    slice.next = slice.next.min(store.dax.guards.len());
     slice
   }
 
@@ -1446,58 +1574,6 @@ impl Store {
     }
   }
 
-  /// One cooperative slice of §4.6 B2's **periodic scrub**: the guards from index `from`, each checked against
-  /// the clean checksum it was taken with and healed from its clean copy where they differ, until
-  /// `budget_bytes` have been hashed.
-  ///
-  /// This is the net's only use. A flip in read-only content is invisible to slates by construction — nothing in
-  /// the daemon wrote it, so no code path can notice — which is why it has to be *looked for* on a timer rather
-  /// than caught at a write. A guard whose mapping is no longer live is dropped as it is passed, so a round over
-  /// a churning volume shrinks the list instead of re-checking dead entries.
-  ///
-  /// The caller owns the cadence and the budget; `next` says where the next slice resumes, and equals the guard
-  /// count when the pass is done. Like the shift's slice, nothing here decides *whether* to scrub.
-  pub fn dax_scrub_slice(&mut self, from: usize, budget_bytes: u64) -> ScrubSlice {
-    let mut slice = ScrubSlice {
-      next: from,
-      ..ScrubSlice::default()
-    };
-    let mut at = from;
-    while let Some(guard) = self.dax.guards.get(at).copied() {
-      // Two ways a guard is stale: its mapping left the registry, or its block is no longer pinned — the
-      // second means the entry outlived the block, and the bytes under it may be freed memory already
-      // (the bug above). Either way the guard goes, and the list shrinks under `at`, so the cursor stays put
-      // and the next entry slides into this place.
-      if !self.dax.is_live(&guard.mapping) || !self.content.arena().is_pinned(guard.mapping.block) {
-        self.drop_guard(&guard.mapping);
-        slice.dropped = slice.dropped.saturating_add(1);
-        continue;
-      }
-      let hashed = self
-        .content
-        .arena()
-        .bytes(guard.mapping.block)
-        .map(<[u8]>::len)
-        .unwrap_or(0);
-      match self.dax_scrub(&guard.mapping) {
-        DaxScrub::Clean => slice.clean = slice.clean.saturating_add(1),
-        DaxScrub::Healed => slice.healed = slice.healed.saturating_add(1),
-        DaxScrub::Unhealable => slice.unhealable = slice.unhealable.saturating_add(1),
-        DaxScrub::Unguarded => slice.dropped = slice.dropped.saturating_add(1),
-      }
-      slice.bytes = slice
-        .bytes
-        .saturating_add(u64::try_from(hashed).unwrap_or(u64::MAX));
-      at = at.saturating_add(1);
-      slice.next = at;
-      if slice.bytes >= budget_bytes {
-        break;
-      }
-    }
-    slice.next = slice.next.min(self.dax.guards.len());
-    slice
-  }
-
   /// Drops a mapping's integrity guard (§4.6 B2) if it has one, freeing the clean copy; returns whether one was held.
   /// The explicit teardown a caller runs before it revokes a guarded mapping; [`Store::dax_revoke`] also calls it.
   pub fn dax_unguard(&mut self, mapping: &Mapping) -> bool {
@@ -1505,7 +1581,7 @@ impl Store {
   }
 
   /// Removes `mapping`'s guard and releases its clean copy (unpin then free). Internal to the B2 paths.
-  fn drop_guard(&mut self, mapping: &Mapping) -> bool {
+  pub(crate) fn drop_guard(&mut self, mapping: &Mapping) -> bool {
     let Some(index) = self.dax.guards.iter().position(|g| &g.mapping == mapping) else {
       return false;
     };

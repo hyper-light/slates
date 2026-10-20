@@ -8469,3 +8469,29 @@ per tick, and a host that frees memory still gets its sandbox within one tick. P
 `a_refused_sandbox_is_remembered_until_the_caller_re_arms`, which drives all three host cases — no huge page at
 all (the `Option` is already the memo, nothing to remember), a huge page the kernel declined for this span (the
 53 µs case, remembered), and a sandbox reserved (nothing remembered).
+
+### 2026-10-19: the pin check was not the fix — a freed block gets re-pinned by whoever takes it next
+
+The chaos property fired again with the pin check already in, at 4,000 cases
+(`cc a61af512137a4d9b8afc615c7a3c3164f08ebd6375dd49c181870024854e71a7`). The first fix refused to scrub a
+mapping whose block was not pinned, on the reasoning that an unpinned block may already be released and
+scrubbed. True, and insufficient: **a released block re-allocated to another file is pinned again.** The pin
+check then passes, the bytes under the stale guard are the new owner's, and the heal writes a dead file's
+content over a live one's.
+
+Pinning says the block is *someone's*. It does not say it is still *this mapping's*. The question that does is
+`Volume::dax_still_current`, and only a `Volume` can ask it — so `dax_scrub_slice` moved from `Store` to
+`Volume` and `daemon::scrub_guarded_windows` walks volumes, as the shift loop already does. The scrub now
+requires all three: live, pinned, current.
+
+Red-checked both directions. With the currency check removed the hunt fails on run 1 of 8 × 4,000 cases; with
+it in, all 8 × 4,000 pass — where the same hunt previously failed on run 5. The named regression,
+`the_net_drops_a_guard_whose_mapping_is_no_longer_its_inodes_content`, builds the state directly (unlink the
+file while its own window keeps the block pinned, so live and pinned both hold and only currency can tell) and
+fails `healed: 1` when the check is removed.
+
+**The generalisable mistake, worth keeping.** The first fix was reasoned from a true statement — "an unpinned
+block may be free memory" — and shipped with a red-checked regression test that passed. It was still wrong,
+because the statement described *one* way the entry goes stale and I treated it as *the* way. The chaos
+property is what distinguished those; a hand-written test for a cause I had already named could not have.
+A red-check proves an assertion can fail. It does not prove the assertion is the right one.

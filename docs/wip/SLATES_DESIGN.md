@@ -2886,14 +2886,18 @@ same-namespace host process is the first delivered case.
 >      host's other tenants, so it cannot make that call. A guard the shard has no room for is counted
 >      (`DaxRegistry::guards_refused`) and the mapping served unguarded: the net is under the map, never a
 >      condition of it.
->      **The net never writes through a block the arena has freed.** A scrub acts only on a mapping whose block
->      is still **pinned** — a live mapping's block always is, since every `dax_map_*` pins and only a revoke
->      unpins, so an unpinned block under a live entry means the entry is stale and its bytes may already be
->      released and scrubbed. Healing there put a deleted file's plaintext back into free memory: the
->      cross-tenant disclosure this whole gate exists to prevent, performed by its own net
->      (`docs/bugs/2026-10-19-the-self-healing-net-resurrects-a-deleted-files-plaintext.md`, found by the
->      four-layer chaos property on its second run). The state arises from the shared per-block pin recorded in
->      item 2 above, which stays owed; refusing to write through a stale entry is sound whatever created it.
+>      **The net never writes through a block that is not still this mapping's.** A scrub acts only when the
+>      mapping is live, its block is **pinned**, *and* the mapping is still **current** for its inode. Each
+>      catches a different way an entry outlives what it describes, and the first two alone were not enough:
+>      an unpinned block may already be released and scrubbed, so healing it put a deleted file's plaintext back
+>      into free memory — and a released block **re-allocated to another file is pinned again**, so the pin
+>      check passes while the bytes belong to someone else and a heal overwrites a live file with a dead one's
+>      content. Both are the cross-tenant disclosure this gate exists to prevent, performed by its own net
+>      (`docs/bugs/2026-10-19-the-self-healing-net-resurrects-a-deleted-files-plaintext.md`); both were found by
+>      the four-layer chaos property, the second *after* the first was fixed. Only a `Volume` can answer the
+>      currency question, so the sliced pass is `Volume::dax_scrub_slice` and the reap tick walks volumes as the
+>      shift loop does. The state arises from the shared per-block pin recorded in item 2 above, which stays
+>      owed; refusing to write through a stale entry is sound whatever created it.
 >      **The pass runs on the reap tick** (`daemon::scrub_guarded_windows`), in cooperative slices of
 >      `archive_slice_bytes` — the archive walk's budget, because this spends it the same way, BLAKE3 over
 >      content under the shard's own step quantum. A flip in read-only content is invisible to slates by

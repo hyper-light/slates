@@ -1795,6 +1795,72 @@ fn a_refused_sandbox_is_remembered_until_the_caller_re_arms() {
   }
 }
 
+/// §4.6 B2, the **second** way a guard outlives what it describes — found by the chaos property *after* the
+/// pin check was already in, which is why the pin check alone was not the fix. A guard can name a block that is
+/// live in the registry and still pinned, yet no longer the content of the inode it was taken for: the inode is
+/// gone, or its content moved. The bytes under that guard are not the file's any more — once the block is
+/// re-allocated they are another file's — and healing there writes a dead file's content over a live one's.
+///
+/// Do: guard a read map of a file, unlink the file so the mapping is no longer current for any inode while its
+/// own window keeps the block pinned, then change the block's bytes as a hammer would. Run the scrub. Expect:
+/// the stale guard is **dropped** and nothing is healed, even though the mapping is live and the block is
+/// pinned — the two conditions the earlier fix checked.
+#[test]
+fn the_net_drops_a_guard_whose_mapping_is_no_longer_its_inodes_content() {
+  let mut store = store();
+  let mut volume = volume(&mut store, 1 << 20);
+  volume.enable_dax_integrity_guard();
+  const FILL: u8 = 0x41;
+
+  let no = file_of(&mut store, &mut volume, "dead", FILL, DAX_PAGE);
+  let stale = volume.dax_map_read(&mut store, no).unwrap();
+  assert_eq!(store.dax.guards(), 1, "the read map is guarded");
+
+  // The file goes, but its own window still holds the block, so the two conditions the earlier fix checks
+  // both still hold — and only the currency check can tell that the guard describes nothing.
+  let root = volume.root_inode(&store).unwrap();
+  volume.unlink_no(&mut store, root, "dead").unwrap();
+  assert!(
+    store.dax.is_live(&stale),
+    "the mapping is still in the registry"
+  );
+  assert!(
+    store.content.arena().is_pinned(stale.block),
+    "and its block is still pinned, so the pin check would pass"
+  );
+  assert!(
+    !volume.dax_still_current(&store, &stale),
+    "but it is no longer any inode's content: this is the condition under test"
+  );
+
+  // Change the bytes, as a hammer or a re-allocation would. A net that acted here would write the dead file's
+  // content back over them.
+  flip_a_byte(&mut store, stale.block);
+  let changed = store
+    .content
+    .arena()
+    .bytes(stale.block)
+    .map(<[u8]>::to_vec)
+    .unwrap_or_default();
+
+  let slice = volume.dax_scrub_slice(&mut store, 0, u64::MAX);
+
+  assert_eq!(
+    slice.healed, 0,
+    "the net wrote a dead file's content back over a block it no longer describes"
+  );
+  assert_eq!(
+    slice.dropped, 1,
+    "the stale guard was dropped instead (non-vacuity: the pass reached it)"
+  );
+  assert_eq!(store.dax.guards(), 0, "and its clean copy went with it");
+  assert_eq!(
+    store.content.arena().bytes(stale.block).map(<[u8]>::to_vec),
+    Some(changed),
+    "the block's bytes are exactly as they were left"
+  );
+}
+
 /// §4.6 B2, the bug the chaos property found
 /// (`docs/bugs/2026-10-19-the-self-healing-net-resurrects-a-deleted-files-plaintext.md`). The net must never
 /// write through a mapping whose block is no longer pinned: the block may already have been released *and
@@ -1847,7 +1913,7 @@ fn the_net_never_heals_through_a_block_the_arena_has_freed() {
     .map(<[u8]>::to_vec)
     .unwrap_or_default();
 
-  let slice = store.dax_scrub_slice(0, u64::MAX);
+  let slice = volume.dax_scrub_slice(&mut store, 0, u64::MAX);
 
   assert_eq!(
     slice.healed, 0,
@@ -1894,13 +1960,13 @@ fn flip_a_byte(store: &mut Store, block: slates_mem::arena::Extent) {
 /// One whole scrub pass, driven in slices as the reap tick drives it: the blocks healed, the blocks found
 /// clean, and the slices it took. The budget is one byte, so a slice stops after the first block it hashes and
 /// the pass's slicing is what is under test.
-fn run_one_scrub_pass(store: &mut Store) -> (u64, u64, usize) {
+fn run_one_scrub_pass(store: &mut Store, volume: &Volume) -> (u64, u64, usize) {
   let mut at = 0usize;
   let mut healed = 0u64;
   let mut clean = 0u64;
   let mut passes = 0usize;
   while at < store.dax.guards() {
-    let slice = store.dax_scrub_slice(at, 1);
+    let slice = volume.dax_scrub_slice(store, at, 1);
     assert!(
       slice.next > at,
       "a slice always advances, so a pass terminates"
@@ -1913,7 +1979,7 @@ fn run_one_scrub_pass(store: &mut Store) -> (u64, u64, usize) {
   (healed, clean, passes)
 }
 
-/// §4.6 **B2's net, driven as the shard drives it** ([`Store::dax_scrub_slice`]) — the pass the reap tick runs.
+/// §4.6 **B2's net, driven as the shard drives it** ([`Volume::dax_scrub_slice`]) — the pass the reap tick runs.
 /// Do: opt a volume into the guard, map three files read-only so each is guarded at map time, flip a byte in
 /// one behind the daemon's back as a hardware hammer would, then run a scrub pass in slices with a budget
 /// smaller than the pass. Expect: every guard is visited, the flipped block is healed back to its clean bytes,
@@ -1948,7 +2014,7 @@ fn the_scrub_pass_heals_a_flip_no_write_explains_and_leaves_the_rest_clean() {
   );
 
   // The pass, in slices of one block each, as the reap tick runs it.
-  let (healed, clean, passes) = run_one_scrub_pass(&mut store);
+  let (healed, clean, passes) = run_one_scrub_pass(&mut store, &volume);
   assert_eq!(healed, 1, "the flipped block was healed");
   assert_eq!(
     clean,
@@ -1979,7 +2045,7 @@ fn without_the_opt_in_nothing_is_guarded_and_the_scrub_pass_has_nothing_to_find(
   assert_eq!(store.dax.guards(), 0, "no opt-in, no guard");
 
   flip_a_byte(&mut store, m.block);
-  let slice = store.dax_scrub_slice(0, u64::MAX);
+  let slice = volume.dax_scrub_slice(&mut store, 0, u64::MAX);
   assert_eq!(slice.clean, 0, "nothing was checked");
   assert_eq!(slice.healed, 0, "nothing was healed");
   assert_eq!(slice.next, 0, "the pass was over before it began");
@@ -1994,7 +2060,7 @@ fn without_the_opt_in_nothing_is_guarded_and_the_scrub_pass_has_nothing_to_find(
   let armed = volume.dax_map_read(&mut store, f).unwrap();
   assert_eq!(store.dax.guards(), 1, "the opt-in guarded the re-map");
   flip_a_byte(&mut store, armed.block);
-  let slice = store.dax_scrub_slice(0, u64::MAX);
+  let slice = volume.dax_scrub_slice(&mut store, 0, u64::MAX);
   assert_eq!(slice.healed, 1, "the armed net healed the same flip");
 }
 
@@ -3013,7 +3079,7 @@ fn layers_step(
     }
     6 => {
       // B2's net, one slice, as the reap tick runs it.
-      let slice = store.dax_scrub_slice(0, u64::from(size).max(1));
+      let slice = volume.dax_scrub_slice(store, 0, u64::from(size).max(1));
       // Nothing in this schedule corrupts a block, so the net must never claim it found a flip. A heal here
       // would mean a legitimate operation reached a guarded block without dropping its guard first — which
       // would make B2 *revert* that operation, the worst thing a self-healing net can do.
