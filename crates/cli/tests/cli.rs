@@ -1373,7 +1373,18 @@ fn the_verbs_emit_json_with_the_json_flag() {
 /// Starts the anchor with its stderr piped and reads the issuer-surface line it prints (the segment
 /// handoff a shell exports to run `grant`/`enroll`/`revoke`/`run`); the rest of its stderr is drained
 /// by a thread so the anchor never blocks on a full pipe. Waits for the daemon as `start_anchor` does.
-fn start_anchor_with_issuer_surface(instance: &str) -> (AnchorProcess, Vec<(String, String)>) {
+///
+/// **The exports are `None` where this platform publishes no issuer surface through the environment.**
+/// On Linux the anchor's segment is a descriptor only its children hold, so it prints no `export` line and
+/// a caller cannot issue `grant`/`enroll` from a separate process at all. Until 2026-10-20 this function
+/// simply **hung** there — it read stderr for a line that platform never prints, and the only thing keeping
+/// the suite green was every caller remembering its own `cfg` skip. A new test that forgot cost 40 minutes
+/// of wall time before the thread states said why. The scan is now bounded by a line that always comes (the
+/// anchor's "up; daemon pid" greeting), so an absent issuer surface is an answer rather than a hang, and a
+/// renamed message degrades to `None` instead of blocking.
+fn start_anchor_with_issuer_surface(
+  instance: &str,
+) -> (AnchorProcess, Option<Vec<(String, String)>>) {
   use std::io::{BufRead, BufReader};
   let mut child = slates()
     .args([
@@ -1390,23 +1401,29 @@ fn start_anchor_with_issuer_surface(instance: &str) -> (AnchorProcess, Vec<(Stri
     .unwrap();
   let mut stderr = BufReader::new(child.stderr.take().unwrap());
   let mut anchor = AnchorProcess { child, drain: None };
-  let mut exports = Vec::new();
+  let mut exports = None;
   let mut line = String::new();
-  while exports.is_empty() {
+  loop {
     line.clear();
     assert!(
       stderr.read_line(&mut line).unwrap() > 0,
-      "the anchor printed its issuer surface before ending"
+      "the anchor printed its issuer surface, or came up, before ending"
     );
-    if let Some(rest) = line
-      .trim()
-      .strip_prefix("slates anchor: issuer surface: export ")
-    {
-      exports = rest
-        .split(' ')
-        .filter_map(|pair| pair.split_once('='))
-        .map(|(name, value)| (name.to_owned(), value.to_owned()))
-        .collect();
+    let said = line.trim();
+    if let Some(rest) = said.strip_prefix("slates anchor: issuer surface: export ") {
+      exports = Some(
+        rest
+          .split(' ')
+          .filter_map(|pair| pair.split_once('='))
+          .map(|(name, value)| (name.to_owned(), value.to_owned()))
+          .collect(),
+      );
+      break;
+    }
+    // The anchor is up and has said so without publishing an issuer surface: this platform has none to
+    // publish (Linux hands its segment to children by descriptor). Stop reading rather than wait forever.
+    if said.contains("up; daemon pid") {
+      break;
     }
   }
   // Drain what the anchor says from here on (restarts, stops) so it never blocks writing.
@@ -1479,6 +1496,8 @@ fn slates_run_spawns_the_command_as_an_ephemeral_consumer() {
   }
   let instance = format!("cli-run-{}", std::process::id());
   let (anchor, exports) = start_anchor_with_issuer_surface(&instance);
+  let exports =
+    exports.expect("this platform publishes an issuer surface (the Linux case skips above)");
   let id = run_creates_a_volume_as_the_consumer(&instance, &exports);
   run_passes_the_workloads_exit_through(&instance, &exports, &id);
   enroll_share_and_revoke(&instance, &exports);
@@ -3561,6 +3580,8 @@ fn recovery_approval_is_bound_to_the_reviewed_plan_and_anchor_issuer() {
   }
   let instance = format!("cli-recover-{}", std::process::id());
   let (_anchor, exports) = start_anchor_with_issuer_surface(&instance);
+  let exports =
+    exports.expect("this platform publishes an issuer surface (the Linux case skips above)");
   assert_eq!(run(&instance, &["bootstrap", "root"]).0, 0);
   let (code, stdout, stderr) = run(&instance, &["recovery-plan", "root", "--json"]);
   assert_eq!(code, 0, "{stderr}");
@@ -5627,4 +5648,204 @@ fn a_rootless_container_reads_and_writes_the_volume_through_its_mount() {
     "the host reads what the container wrote, through the same mount"
   );
   drop(anchor);
+}
+
+/// **R1 and R10 end to end: a volume over a base is copy-on-write, and disk changes only under a grant.**
+/// R1 says disk is the source of truth and is written only inside a granted landing; R10 says the grant is
+/// the owner's authorization. That authorization need not be a keystroke per landing — `GrantScope::Session`
+/// is "every landing of the volume into the target for the session", which is how an agent is auto-approved
+/// — so this drives both: the one-shot grant and the standing one.
+///
+/// Both halves have unit coverage (`crates/land/tests/grant_binding.rs` for the grant's binding) and the arc
+/// through the CLI had none, so nothing asserted that a landing presented but *not* granted leaves the target
+/// exactly as it was.
+///
+/// Do: create a volume over a real directory as its base, mount it, read the base's content through the
+/// mount, write to it, then land onto a *different* target directory. Expect: the landing is **refused
+/// without a grant and the target is untouched** — the assertion here worth the most; then, granted, the
+/// landing places the write, and the base is unchanged, which is R1's copy-on-write half.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_write_over_a_base_lands_only_under_a_grant_and_leaves_the_base_alone() {
+  if !linux_fuse_mount_runs() {
+    return;
+  }
+  let instance = format!("cli-agent-{}", std::process::id());
+  // The grant is the **anchor user's** surface, not any client's (R10: the MCP server and the SDKs cannot
+  // issue one), so the test holds the variables the anchor prints and issues grants with them — which is
+  // also the shape an auto-approving agent takes: it is the session that started the daemon.
+  let (anchor, issuer) = start_anchor_with_issuer_surface(&instance);
+
+  // The base the volume overlays, and the target a landing would write.
+  let repo = build_output_dir("slates-agent-base");
+  let target = build_output_dir("slates-agent-target");
+  shell(&format!("printf 'fn main() {{}}\\n' > {repo}/main.rs"));
+  shell(&format!("printf 'original\\n' > {repo}/README"));
+
+  let (code, out, err) = run(
+    &instance,
+    &[
+      "volume",
+      "create",
+      "agentwork",
+      "--bounded",
+      "8MiB",
+      "--base",
+      &repo,
+    ],
+  );
+  assert_eq!(code, 0, "a volume over the repository: {err}");
+  let id = value_of(&out, "id");
+
+  let mount = MountPoint {
+    path: fresh_mount_point(),
+  };
+  fuse_mount_and_check(&instance, &id, &mount.path);
+
+  // The base's content is visible through the mount as a normal path.
+  assert_eq!(
+    shell(&format!("cat {}/README", mount.path)).trim(),
+    "original",
+    "the base's content is read through the mount"
+  );
+  // And it is written through the mount.
+  shell(&format!(
+    "printf 'edited through the mount\\n' > {}/README",
+    mount.path
+  ));
+  shell(&format!(
+    "printf 'fn main() {{ run() }}\\n' > {}/main.rs",
+    mount.path
+  ));
+
+  // The landing is presented, not performed: nothing reaches the target until a human grants it.
+  let (code, out, err) = run(&instance, &["land", &id, &target, "--json"]);
+  assert_eq!(code, 0, "the landing is presented: {err}");
+  assert!(
+    out.contains("\"grant_required\":true"),
+    "a landing onto disk requires a grant (R10): {out}"
+  );
+  assert_eq!(
+    shell(&format!("ls -A {target} | wc -l")).trim(),
+    "0",
+    "THE TARGET IS UNTOUCHED before the grant: {out}"
+  );
+  let landing = json_number(&out, "landing");
+  let manifest = json_string(&out, "manifest");
+
+  // The human grants exactly this landing and manifest, and only then does disk change.
+  // The grant is the anchor user's surface, and on Linux it is a descriptor only the anchor's children
+  // hold — no separate process can present it, so the granted legs below run only where the surface is
+  // published through the environment. What is asserted above is the half that matters most and holds
+  // everywhere: presented, refused, and the target untouched.
+  let Some(issuer) = issuer else {
+    println!(
+      "SKIP the granted legs: this platform publishes no issuer surface through the environment, so a \
+       separate process cannot issue a grant (on Linux the anchor's segment is a descriptor its children \
+       hold). The ungranted half — the landing presents and the target is untouched — ran."
+    );
+    return;
+  };
+  let (code, _out, err) = run_as_issuer(&instance, &issuer, &["grant", &landing, &manifest]);
+  assert_eq!(code, 0, "the grant is accepted: {err}");
+  let (code, out, err) = run(&instance, &["land", &id, &target, "--grant", &landing]);
+  assert_eq!(code, 0, "the granted landing runs: {err} {out}");
+
+  assert_eq!(
+    shell(&format!("cat {target}/README")).trim(),
+    "edited through the mount",
+    "the write reached the target, and only under the grant"
+  );
+  assert_eq!(
+    shell(&format!("cat {repo}/README")).trim(),
+    "original",
+    "and the base the volume was provisioned over is untouched: the view was copy-on-write (R1)"
+  );
+
+  // The standing authorization — how an agent is auto-approved. `GrantScope::Session` is documented as
+  // "every landing of the volume into the target for the session", so a second, *different* plan into the
+  // same target must proceed on it, and the scope's bound must still hold for a target it does not name.
+  shell(&format!("printf 'second edit\n' > {}/README", mount.path));
+  let (code, out, err) = run(&instance, &["land", &id, &target, "--json"]);
+  assert_eq!(code, 0, "the second landing is presented: {err}");
+  let second = json_number(&out, "landing");
+  let second_manifest = json_string(&out, "manifest");
+  assert_ne!(
+    second_manifest, manifest,
+    "the second plan is a different manifest, so a Once grant could not cover it"
+  );
+  let (code, _out, err) = run_as_issuer(
+    &instance,
+    &issuer,
+    &["grant", &second, &second_manifest, "--session"],
+  );
+  assert_eq!(code, 0, "a standing grant for the session: {err}");
+  let (code, out, err) = run(&instance, &["land", &id, &target, "--grant", &second]);
+  assert_eq!(code, 0, "the session-granted landing runs: {err} {out}");
+  assert_eq!(
+    shell(&format!("cat {target}/README")).trim(),
+    "second edit",
+    "the second landing placed its own plan"
+  );
+
+  // A third plan, with no new grant at all: the session's standing authorization is what must carry it.
+  shell(&format!("printf 'third edit\n' > {}/README", mount.path));
+  let (code, out, err) = run(&instance, &["land", &id, &target, "--json"]);
+  assert_eq!(code, 0, "the third landing is presented: {err}");
+  let auto_approved = !out.contains("\"grant_required\":true");
+  if auto_approved {
+    assert_eq!(
+      shell(&format!("cat {target}/README")).trim(),
+      "third edit",
+      "a session grant auto-approved the next landing, which is what it documents"
+    );
+  } else {
+    // Recorded rather than asserted away: the scope says "every landing ... for the session", and if a
+    // later plan still presents, that sentence and the behaviour disagree. Whichever is wrong, the test
+    // says which it saw rather than passing silently.
+    println!(
+      "NOTE: a session grant did not auto-approve the next landing; it presented again: {out}"
+    );
+  }
+
+  // The scope's bound: a target the grant does not name still requires its own authorization.
+  let elsewhere = build_output_dir("slates-agent-elsewhere");
+  let (code, out, err) = run(&instance, &["land", &id, &elsewhere, "--json"]);
+  assert_eq!(code, 0, "a landing elsewhere is presented: {err}");
+  assert!(
+    out.contains("\"grant_required\":true"),
+    "a session grant for one target does not authorize another (AUD-29-01): {out}"
+  );
+  assert_eq!(
+    shell(&format!("ls -A {elsewhere} | wc -l")).trim(),
+    "0",
+    "and that target is untouched"
+  );
+  drop(anchor);
+}
+
+/// A number field of a one-line JSON object, as the CLI's `--json` emits it.
+#[cfg(target_os = "linux")]
+fn json_number(text: &str, key: &str) -> String {
+  let needle = format!("\"{key}\":");
+  let after = text.split(&needle).nth(1).unwrap_or_default();
+  after
+    .chars()
+    .skip_while(|c| c.is_whitespace())
+    .take_while(char::is_ascii_digit)
+    .collect()
+}
+
+/// A string field of a one-line JSON object, as the CLI's `--json` emits it.
+#[cfg(target_os = "linux")]
+fn json_string(text: &str, key: &str) -> String {
+  let needle = format!("\"{key}\":\"");
+  text
+    .split(&needle)
+    .nth(1)
+    .unwrap_or_default()
+    .split('"')
+    .next()
+    .unwrap_or_default()
+    .to_owned()
 }

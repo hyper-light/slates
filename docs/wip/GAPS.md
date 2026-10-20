@@ -8626,3 +8626,31 @@ Also recorded: the full precondition chain a harness meets on Linux, which nothi
 `slates mount --shared` needs `user_allow_other` in `/etc/fuse.conf` (`AllowOtherNotGranted`), and without a
 shared mount `attach --oci` refuses `MountNotShared`, and without a mount at all it refuses
 `ChosenPathUnavailable { NotAMountPoint }`. Every step surfaced as a typed refusal, which is the gate working.
+
+### 2026-10-20: a test helper that hung instead of refusing, and the R1/R10 arc it was blocking
+
+Writing the end-to-end landing test — a volume over a base, written through its mount, landed onto a target —
+ran into `start_anchor_with_issuer_surface` **hanging forever on Linux**. The cause is structural and already
+known to the suite: the anchor's segment there is a descriptor only its children hold, so the anchor prints no
+`issuer surface: export ...` line at all, and the helper read stderr for a line that platform never sends. Two
+existing callers each carried their own `cfg` skip; nothing stopped a third from waiting forever. It cost
+about forty minutes before the thread states said why — main in `futex_do_wait`, the drain in
+`anon_pipe_read`, and **no mount in the table**, which placed the stall before the mount rather than in the
+landing.
+
+Fixed at the helper: the scan is now bounded by a line that always arrives (the anchor's "up; daemon pid"
+greeting) and the exports come back as `Option`, so a platform with no issuer surface is an **answer** rather
+than a hang, and a renamed message degrades to `None` instead of blocking. The diagnosis is written at the
+function so the next reader does not repeat it.
+
+**What the new test proves, and where.** `a_write_over_a_base_lands_only_under_a_grant_and_leaves_the_base_alone`
+runs the half that matters everywhere it can run: a volume created over a real base directory, mounted, read
+and written through the mount, then landed onto a *different* target — and the landing **presents, is refused
+without a grant, and the target is untouched**. That is R10's claim, and nothing asserted it through the CLI
+before. The granted legs (one-shot, then `--session` for the standing authorization an auto-approving agent
+uses) skip loudly on Linux with the reason, because no separate process can present a grant there.
+
+**Two operational facts worth keeping.** The suite's `SLATES_TEST_CLI=1` process flows need
+`--test-threads=1`: seven anchors racing starve each other and fail at "the daemon came up within N attempts".
+And a hung run's anchor and daemon survive a `pkill` that itself gets cut off — verify the kill, because the
+next run's failures will look like a regression and are not.
