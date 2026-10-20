@@ -825,6 +825,27 @@ Red before, green after, on Linux (the only host where a transparent huge page c
 sandbox): the assertion failed with "first secret byte at Some(0)" and now the full DAX suite is
 72 green there, both chaos properties included.
 
+**Promoted to an invariant under random schedules (2026-10-21).** One hand-built case proves a
+fix on one path; the four-layer chaos property now carries the rule itself — after every released
+mapping, a row the sandbox holds **free** must carry none of its file's bytes. Red-checked by
+disabling `scrub_vacated_sandbox_row`: the property fails across the schedule space ("a row the
+sandbox holds free still carries file byte 0x10") and proptest shrinks to a minimal schedule.
+
+Two things that run deserve recording, because both were my error rather than the product's:
+
+- The invariant was first written without a pin guard and failed twice on paths that are
+  **correct**. Between a shift's `return_slot` and the VMM's confirmed unmap the zone holds the
+  row free *and* its bytes are deliberately kept — that is the stale-TLB hold, and the scrub
+  waits for it on purpose. The condition is `holds_slot && !is_pinned`. The lesson is the one
+  this ledger keeps relearning: when a property fails, the property is as likely to be wrong as
+  the code, and the way to tell is to look rather than to patch.
+- A second scrub was added in `DaxZone::reclaim_missing`, where `ChunkArena::claim` takes a row
+  back with its bytes intact (A-64's claim-in-place). It looked necessary and was **not**:
+  disabling it left the chaos property green over its whole schedule space, because a row only
+  becomes reclaimable after `ChunkArena::free`, which already scrubs on the way to the free
+  lists. Removed rather than kept — CLAUDE.md #7 does not keep a path nothing walks — with the
+  reasoning written at the site so the next reader does not re-add it.
+
 The smaller question raised alongside it — whether a sandbox is scrubbed when its volume is
 destroyed — turns out to be closed already, by composition rather than by its own test.
 `DaxZone::release` walks the zone's slots and hands every row it holds to `ChunkArena::free`

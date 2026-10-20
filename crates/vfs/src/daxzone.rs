@@ -293,6 +293,14 @@ impl DaxZone {
       if let Ok(block) = arena.claim(self.region, at, self.slot_bytes)
         && let Some(place) = self.slots.get_mut(index)
       {
+        // Not scrubbed here, deliberately, and measured rather than assumed. `claim` takes a row back with its
+        // bytes intact — it is A-64's claim-in-place — so zeroing looked necessary to keep the sandbox's rule
+        // that a row the zone holds holds nobody's bytes. It is not: a row only becomes reclaimable after it has
+        // gone through `ChunkArena::free`, which scrubs on the way to the free lists. Disabling a scrub added
+        // here left the four-layer chaos property green over its whole schedule space (2026-10-21), so the
+        // scrub guarded nothing a test could reach, and CLAUDE.md #7 does not keep a path nothing walks. The
+        // rule itself is enforced where a row *can* come back dirty: `Store::scrub_vacated_sandbox_row`, on a
+        // shift's return through `return_slot`.
         *place = Some(block);
       }
     }

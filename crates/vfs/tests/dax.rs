@@ -3263,6 +3263,33 @@ proptest! {
         .collect();
       for mapping in &dead {
         store.dax_release_after_unmap(mapping);
+        // A row the sandbox is holding **free** belongs to nobody — no mapping, no inode, no snapshot — so it
+        // must carry none of the tenant's bytes. This is the vacated-row scrub as a property rather than the
+        // single hand-built case: a shift hands the row the content left back to this tenant's own zone
+        // instead of to the arena's free lists, and only the free path scrubs, so before
+        // `Store::scrub_vacated_sandbox_row` every shift in this schedule left a copy behind. The condition is
+        // the zone's own "holds it free" and not "is no longer current", because a block a snapshot still
+        // references is legitimately not current and legitimately keeps its bytes.
+        let held_free = store
+          .dax_zones
+          .of_volume(volume.prefix())
+          .and_then(|zone| zone.slot_of(mapping.block).map(|slot| zone.holds_slot(slot)))
+          .unwrap_or(false);
+        // ...unless the row is still pinned. Between a shift's `return_slot` and the VMM's confirmed unmap the
+        // zone holds the row free *and* its bytes are deliberately kept: that is the stale-TLB hold, and the
+        // scrub waits for it on purpose. Only an unpinned row is one nobody can still be reading.
+        if held_free
+          && !store.content.arena().is_pinned(mapping.block)
+          && let Some(index) = files.iter().position(|no| *no == mapping.inode)
+          && let Some(bytes) = store.content.arena().bytes(mapping.block)
+        {
+          let fill = 0x10u8.saturating_add(u8::try_from(index).unwrap_or(0));
+          prop_assert!(
+            !bytes.contains(&fill),
+            "a row the sandbox holds free still carries file byte {fill:#04x}: the content left this row \
+             and its bytes stayed on it"
+          );
+        }
       }
       held.retain(|mapping| store.dax_is_live(mapping));
     }
