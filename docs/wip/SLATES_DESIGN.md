@@ -2898,7 +2898,8 @@ same-namespace host process is the first delivered case.
 >      | Linux x86_64 (adacachy, `shmem_enabled=[advise]`) | 2 MiB | reserved | 59 pass, no skip |
 >      | Linux x86_64 (fedora 6.19.10, `shmem_enabled=[never]`) | 2 MiB | reserved via `MADV_COLLAPSE` | 59 pass, 0–4 skips by host state |
 >      | Linux aarch64 (4 KiB base page) | 2 MiB | reserved | 59 pass, device seam 36 pass, daemon 23 pass |
->      | Linux aarch64 (6.12.76, `shmem_enabled=[never]`) | 2 MiB | reserved, placed + `MADV_COLLAPSE` | 73 DAX pass, loud skips 3 → 1 |
+>      | Linux aarch64 (6.12.76, `shmem_enabled=[never]`) | 2 MiB | reserved: placed, then `MADV_COLLAPSE` | 73 DAX pass, loud skips 3,1,0,1,2 → **0 across six runs** |
+>      | Linux x86_64 (7.2.9, 4 KiB page, `shmem_enabled=[advise]`) | 2 MiB | reserved: placed, advice alone sufficed (8 MiB of 8 MiB) | 73 DAX pass, **0 skips across five runs**; mem, VFS, the 41-test recovery arbiter and 87 device-seam tests green (2026-10-20) |
 >      | Windows x86_64 (cross-lint, `x86_64-pc-windows-gnu`) | large pages need a privilege R10 refuses | refused | clippy clean over the Windows-buildable crates |
 >      A low-trust *sacrificial pool* may deliberately co-locate mutually-untrusted tenants so they absorb each
 >      other's leakage rather than the host — sound only paired with B2, and not built.

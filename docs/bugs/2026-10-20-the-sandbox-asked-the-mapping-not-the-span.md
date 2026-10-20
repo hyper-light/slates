@@ -67,3 +67,14 @@ So the verdict means what this code takes it to mean **only for a span that is h
 which is what the alignment check immediately above it guarantees. Removing that check, or moving the collapse
 before it, turns the oracle into a rubber stamp that certifies isolation nobody has. The check now says so at
 its site.
+
+## Verified on a second architecture and a second THP policy
+
+Run on real x86_64 hardware (not emulation): Linux 7.2.9, 4 KiB base page, `shmem_enabled=`**`[advise]`** —
+a different policy from the aarch64 host above, where it is `[never]`. The placement holds and the whole
+8 MiB object came back huge-backed from the *advice* alone (`advice gave 8388608 bytes, collapse returned
+true and left 8388608 of 8388608`), which is the permitted branch of
+`an_object_that_can_hold_a_huge_page_is_mapped_where_one_forms_and_collapses_to_it` running for the first
+time anywhere. DAX loud skips: **0 across five runs**, 73 tests pass; mem, VFS, the 41-test recovery arbiter
+and the 87 device-seam tests are green. The checkout was a throwaway extracted from `git archive HEAD` and
+removed afterwards, so the box's own working tree was never touched.
