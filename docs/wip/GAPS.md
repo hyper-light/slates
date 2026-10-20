@@ -703,6 +703,40 @@ are retained with their scope; no documentation edit is an implementation accept
   Nothing on Windows or Linux has *run* yet: that needs those machines (Phase 1's reference
   boxes).
 
+### 8a-lint. The Linux lint gate was red, and only Linux could see it (2026-10-21)
+
+Running `cargo clippy --workspace --all-targets -- -D warnings` in a native
+`aarch64-unknown-linux-gnu` container — which is what CI's `gates` lane runs on ubuntu, and which
+nothing local reproduces — failed with three `cognitive_complexity` errors in
+`crates/cli/tests/cli.rs`: `a_rootless_container_reads_and_writes_the_volume_through_its_mount`
+(11/10), `a_write_over_a_base_lands_only_under_a_grant_and_leaves_the_base_alone` (21/10) and
+`removing_the_sharing_gate_left_every_other_oci_refusal_standing` (12/10).
+
+**They are pre-existing, from the tests added on 2026-10-20, and the macOS gate structurally
+cannot see them.** All three carry `#[cfg(target_os = "linux")]`, so on this laptop they are not
+compiled at all — `cargo clippy --workspace --all-targets` passes here while the same command
+fails on the platform CI runs. That is the same blind spot as `channel.rs` (recorded above) and
+the same one the socket-option red of 2026-10-07 taught: a local green says nothing about a
+`cfg`-gated path.
+
+Fixed by splitting, which is what CLAUDE.md prescribes when the threshold trips and what the
+file already does elsewhere ("Phase one/two/three/four" for the grant test). Five phase functions
+came out: `the_base_is_read_and_written_through_the_mount`,
+`a_landing_presents_and_leaves_the_target_untouched`,
+`a_session_grant_carries_the_landings_after_it`,
+`a_session_grant_does_not_reach_a_target_it_does_not_name`,
+`a_read_only_bind_reads_and_is_refused_its_write` (returning `false` when the host cannot pull
+the image, so the caller still skips rather than fails), and
+`neither_a_path_inside_the_mount_nor_another_volumes_mount_binds`. Each carries the same
+`#[cfg(target_os = "linux")]` as the test it serves — without it they are dead code on macOS,
+which the first attempt proved by failing there.
+
+Now green both ways: the whole workspace lints clean on Linux (43 s) and on macOS, and
+`slates-cli`'s 26 macOS tests still pass. **The lesson for the lint wall is the one worth
+keeping: a gate that only ever runs on one platform is not a gate.** The `gates` lane runs on
+ubuntu and macos both, so CI would have caught this on the next push — it had simply never been
+pushed.
+
 ### 8a-dax. DAX surface audited for never-executed paths (2026-10-20)
 
 The codec defect above was found by asking which production paths nothing ever runs. The same

@@ -5623,28 +5623,9 @@ fn a_rootless_container_reads_and_writes_the_volume_through_its_mount() {
   };
   mount_and_check(&instance, &id, &mount_point.path);
 
-  // A read-only bind: the container reads what a client wrote, and the kernel refuses its write.
-  let (code, out, err) = podman_run(&mount_point.path, "ro", &["cat", "/vol/greeting.txt"]);
-  if code != 0 && err.contains("registry") {
-    eprintln!("skipping the OCI consumption flow: this host cannot pull {OCI_IMAGE}: {err}");
+  if !a_read_only_bind_reads_and_is_refused_its_write(&mount_point.path) {
     return;
   }
-  assert_eq!(code, 0, "the container read the file: {err}");
-  assert_eq!(
-    out.trim(),
-    "hello from a slates volume",
-    "the container read the bytes a client wrote"
-  );
-  let (code, _out, err) = podman_run(
-    &mount_point.path,
-    "ro",
-    &["sh", "-c", "echo blocked > /vol/denied.txt"],
-  );
-  assert_ne!(code, 0, "a write through a read-only bind must be refused");
-  assert!(
-    err.contains("Read-only file system"),
-    "the kernel refuses it as EROFS, which is the read attachment's policy enforced by the runtime: {err}"
-  );
 
   // A writable bind: the container's write lands, and the host sees it through the same mount.
   let (code, _out, err) = podman_run(
@@ -5717,37 +5698,10 @@ fn a_write_over_a_base_lands_only_under_a_grant_and_leaves_the_base_alone() {
     path: fresh_mount_point(),
   };
   fuse_mount_and_check(&instance, &id, &mount.path);
+  the_base_is_read_and_written_through_the_mount(&mount.path);
 
-  // The base's content is visible through the mount as a normal path.
-  assert_eq!(
-    shell(&format!("cat {}/README", mount.path)).trim(),
-    "original",
-    "the base's content is read through the mount"
-  );
-  // And it is written through the mount.
-  shell(&format!(
-    "printf 'edited through the mount\\n' > {}/README",
-    mount.path
-  ));
-  shell(&format!(
-    "printf 'fn main() {{ run() }}\\n' > {}/main.rs",
-    mount.path
-  ));
-
-  // The landing is presented, not performed: nothing reaches the target until a human grants it.
-  let (code, out, err) = run(&instance, &["land", &id, &target, "--json"]);
-  assert_eq!(code, 0, "the landing is presented: {err}");
-  assert!(
-    out.contains("\"grant_required\":true"),
-    "a landing onto disk requires a grant (R10): {out}"
-  );
-  assert_eq!(
-    shell(&format!("ls -A {target} | wc -l")).trim(),
-    "0",
-    "THE TARGET IS UNTOUCHED before the grant: {out}"
-  );
-  let landing = json_number(&out, "landing");
-  let manifest = json_string(&out, "manifest");
+  let (landing, manifest) =
+    a_landing_presents_and_leaves_the_target_untouched(&instance, &id, &target);
 
   // The human grants exactly this landing and manifest, and only then does disk change.
   // The grant is the anchor user's surface, and on Linux it is a descriptor only the anchor's children
@@ -5777,12 +5731,150 @@ fn a_write_over_a_base_lands_only_under_a_grant_and_leaves_the_base_alone() {
     "original",
     "and the base the volume was provisioned over is untouched: the view was copy-on-write (R1)"
   );
+  a_session_grant_carries_the_landings_after_it(
+    &instance,
+    &issuer,
+    &id,
+    &target,
+    &mount.path,
+    &manifest,
+  );
 
+  a_session_grant_does_not_reach_a_target_it_does_not_name(&instance, &id);
+  drop(anchor);
+}
+
+/// Phase, cases (2) and (3) of the OCI bind's refusals: a path *inside* the mount is not the mount point,
+/// and another volume's mount does not bind this volume however real a mount it is.
+#[cfg(target_os = "linux")]
+fn neither_a_path_inside_the_mount_nor_another_volumes_mount_binds(
+  instance: &str,
+  mine: &str,
+  mount: &str,
+  other_mount: &str,
+) {
+  let inside = format!("{mount}/inside");
+  shell(&format!("mkdir -p {inside}"));
+  let (code, _out, err) = run(
+    instance,
+    &[
+      "attach",
+      mine,
+      "--read",
+      "--oci-source",
+      &inside,
+      "--oci-destination",
+      "/vol",
+    ],
+  );
+  assert_ne!(
+    code, 0,
+    "a directory inside the mount is not the attachment"
+  );
+  assert!(!err.is_empty(), "and it says so: {err}");
+
+  let (code, _out, err) = run(
+    instance,
+    &[
+      "attach",
+      mine,
+      "--read",
+      "--oci-source",
+      other_mount,
+      "--oci-destination",
+      "/vol",
+    ],
+  );
+  assert_ne!(code, 0, "another volume's mount does not bind this one");
+  assert!(!err.is_empty(), "and it says so: {err}");
+}
+
+/// Phase: a read-only bind reads what a client wrote and the kernel refuses the container's write (EROFS,
+/// the read attachment's policy enforced by the runtime). `false` when this host cannot pull the image, in
+/// which case the caller skips the rest of the flow rather than failing on the registry.
+#[cfg(target_os = "linux")]
+fn a_read_only_bind_reads_and_is_refused_its_write(mount: &str) -> bool {
+  let (code, out, err) = podman_run(mount, "ro", &["cat", "/vol/greeting.txt"]);
+  if code != 0 && err.contains("registry") {
+    eprintln!("skipping the OCI consumption flow: this host cannot pull {OCI_IMAGE}: {err}");
+    return false;
+  }
+  assert_eq!(code, 0, "the container read the file: {err}");
+  assert_eq!(
+    out.trim(),
+    "hello from a slates volume",
+    "the container read the bytes a client wrote"
+  );
+  let (code, _out, err) = podman_run(mount, "ro", &["sh", "-c", "echo blocked > /vol/denied.txt"]);
+  assert_ne!(code, 0, "a write through a read-only bind must be refused");
+  assert!(
+    err.contains("Read-only file system"),
+    "the kernel refuses it as EROFS, which is the read attachment's policy enforced by the runtime: {err}"
+  );
+  true
+}
+
+/// Phase: the base the volume overlays is read through the mount as a normal path, and written through it.
+#[cfg(target_os = "linux")]
+fn the_base_is_read_and_written_through_the_mount(mount: &str) {
+  // The base's content is visible through the mount as a normal path.
+  assert_eq!(
+    shell(&format!("cat {}/README", mount)).trim(),
+    "original",
+    "the base's content is read through the mount"
+  );
+  // And it is written through the mount.
+  shell(&format!(
+    "printf 'edited through the mount\\n' > {}/README",
+    mount
+  ));
+  shell(&format!(
+    "printf 'fn main() {{ run() }}\\n' > {}/main.rs",
+    mount
+  ));
+}
+
+/// Phase: a landing presents its plan and nothing reaches the target until a human grants it (R10). Returns
+/// the landing and manifest the grant must name.
+#[cfg(target_os = "linux")]
+fn a_landing_presents_and_leaves_the_target_untouched(
+  instance: &str,
+  id: &str,
+  target: &str,
+) -> (String, String) {
+  // The landing is presented, not performed: nothing reaches the target until a human grants it.
+  let (code, out, err) = run(instance, &["land", id, target, "--json"]);
+  assert_eq!(code, 0, "the landing is presented: {err}");
+  assert!(
+    out.contains("\"grant_required\":true"),
+    "a landing onto disk requires a grant (R10): {out}"
+  );
+  assert_eq!(
+    shell(&format!("ls -A {target} | wc -l")).trim(),
+    "0",
+    "THE TARGET IS UNTOUCHED before the grant: {out}"
+  );
+  let landing = json_number(&out, "landing");
+  let manifest = json_string(&out, "manifest");
+  (landing, manifest)
+}
+
+/// Phase: the standing authorization — a session grant covers a second, different plan into the same target,
+/// and the third plan after it with no new grant at all, which is what auto-approving an agent means.
+#[cfg(target_os = "linux")]
+fn a_session_grant_carries_the_landings_after_it(
+  instance: &str,
+  issuer: &[(String, String)],
+  id: &str,
+  target: &str,
+  mount: &str,
+  manifest: &str,
+) {
   // The standing authorization — how an agent is auto-approved. `GrantScope::Session` is documented as
   // "every landing of the volume into the target for the session", so a second, *different* plan into the
   // same target must proceed on it, and the scope's bound must still hold for a target it does not name.
-  shell(&format!("printf 'second edit\n' > {}/README", mount.path));
-  let (code, out, err) = run(&instance, &["land", &id, &target, "--json"]);
+  shell(&format!("printf 'second edit\n' > {}/README", mount));
+  let (code, out, err) = run(instance, &["land", id, target, "--json"]);
   assert_eq!(code, 0, "the second landing is presented: {err}");
   let second = json_number(&out, "landing");
   let second_manifest = json_string(&out, "manifest");
@@ -5791,12 +5883,12 @@ fn a_write_over_a_base_lands_only_under_a_grant_and_leaves_the_base_alone() {
     "the second plan is a different manifest, so a Once grant could not cover it"
   );
   let (code, _out, err) = run_as_issuer(
-    &instance,
-    &issuer,
+    instance,
+    issuer,
     &["grant", &second, &second_manifest, "--session"],
   );
   assert_eq!(code, 0, "a standing grant for the session: {err}");
-  let (code, out, err) = run(&instance, &["land", &id, &target, "--grant", &second]);
+  let (code, out, err) = run(instance, &["land", id, target, "--grant", &second]);
   assert_eq!(code, 0, "the session-granted landing runs: {err} {out}");
   assert_eq!(
     shell(&format!("cat {target}/README")).trim(),
@@ -5805,8 +5897,8 @@ fn a_write_over_a_base_lands_only_under_a_grant_and_leaves_the_base_alone() {
   );
 
   // A third plan, with no new grant at all: the session's standing authorization is what must carry it.
-  shell(&format!("printf 'third edit\n' > {}/README", mount.path));
-  let (code, out, err) = run(&instance, &["land", &id, &target, "--json"]);
+  shell(&format!("printf 'third edit\n' > {}/README", mount));
+  let (code, out, err) = run(instance, &["land", id, target, "--json"]);
   assert_eq!(code, 0, "the third landing is presented: {err}");
   let auto_approved = !out.contains("\"grant_required\":true");
   if auto_approved {
@@ -5823,10 +5915,14 @@ fn a_write_over_a_base_lands_only_under_a_grant_and_leaves_the_base_alone() {
       "NOTE: a session grant did not auto-approve the next landing; it presented again: {out}"
     );
   }
+}
 
+/// Phase: the scope's bound — a target the grant does not name still requires its own authorization.
+#[cfg(target_os = "linux")]
+fn a_session_grant_does_not_reach_a_target_it_does_not_name(instance: &str, id: &str) {
   // The scope's bound: a target the grant does not name still requires its own authorization.
   let elsewhere = build_output_dir("slates-agent-elsewhere");
-  let (code, out, err) = run(&instance, &["land", &id, &elsewhere, "--json"]);
+  let (code, out, err) = run(instance, &["land", id, &elsewhere, "--json"]);
   assert_eq!(code, 0, "a landing elsewhere is presented: {err}");
   assert!(
     out.contains("\"grant_required\":true"),
@@ -5837,7 +5933,6 @@ fn a_write_over_a_base_lands_only_under_a_grant_and_leaves_the_base_alone() {
     "0",
     "and that target is untouched"
   );
-  drop(anchor);
 }
 
 /// A number field of a one-line JSON object, as the CLI's `--json` emits it.
@@ -6221,42 +6316,12 @@ fn removing_the_sharing_gate_left_every_other_oci_refusal_standing() {
     "and refused as 'no mount here', not something vaguer: {err}"
   );
 
-  // (2) A path *inside* the mount is not the mount point.
-  let inside = format!("{}/inside", mount.path);
-  shell(&format!("mkdir -p {inside}"));
-  let (code, _out, err) = run(
+  neither_a_path_inside_the_mount_nor_another_volumes_mount_binds(
     &instance,
-    &[
-      "attach",
-      &mine,
-      "--read",
-      "--oci-source",
-      &inside,
-      "--oci-destination",
-      "/vol",
-    ],
+    &mine,
+    &mount.path,
+    &other_mount.path,
   );
-  assert_ne!(
-    code, 0,
-    "a directory inside the mount is not the attachment"
-  );
-  assert!(!err.is_empty(), "and it says so: {err}");
-
-  // (3) Another volume's mount does not bind this volume, however real a mount it is.
-  let (code, _out, err) = run(
-    &instance,
-    &[
-      "attach",
-      &mine,
-      "--read",
-      "--oci-source",
-      &other_mount.path,
-      "--oci-destination",
-      "/vol",
-    ],
-  );
-  assert_ne!(code, 0, "another volume's mount does not bind this one");
-  assert!(!err.is_empty(), "and it says so: {err}");
 
   // The honest bind still works, and reports the fact a rootful harness needs.
   let (code, out, err) = run(
