@@ -460,15 +460,6 @@ fn children_of(nodes: &Slab<TrieNode>, slot: Slot) -> Option<[Slot; FANOUT]> {
   }
 }
 
-/// Every trie node reachable from `root`, for a destroy walk.
-pub fn nodes_under(
-  nodes: &Slab<TrieNode>,
-  root: Handle<TrieNode>,
-  out: &mut Vec<Handle<TrieNode>>,
-) {
-  nodes_under_since(nodes, root, None, out);
-}
-
 /// Every trie node reachable from `root` and born after `since` (see [`walk_since`]).
 pub fn nodes_under_since(
   nodes: &Slab<TrieNode>,

@@ -965,6 +965,11 @@ fn the_ring_protocol_asks_for_its_ordering_edges_where_virtio_puts_them() {
     BATCH,
   )
   .unwrap();
+  assert_eq!(
+    driver.memory.accesses_dropped(),
+    0,
+    "the access log holds every access this test reasons about"
+  );
   let accesses = driver.memory.accesses();
   let edges = driver.memory.edges();
   let at = |start: u64, write: bool| {

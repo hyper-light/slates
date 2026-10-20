@@ -60,6 +60,13 @@ fn buffers_of(chain: &DescriptorChain) -> Vec<GuestRange> {
 
 /// Whether the simulated memory logged any access touching one of `ranges`.
 fn touched(memory: &SimGuestMemory, ranges: &[GuestRange]) -> bool {
+  // The log is bounded (`ACCESS_LOG_CAP`) and drops silently past it, so evidence read from it
+  // is only evidence if nothing was dropped. Nothing checked this until 2026-10-20.
+  assert_eq!(
+    memory.accesses_dropped(),
+    0,
+    "the access log holds every access this test reasons about"
+  );
   memory
     .accesses()
     .iter()
@@ -137,6 +144,11 @@ fn a_used_element_is_published_after_its_id_and_length_are_written() {
       writable: 64
     },
     "a used length past the chain's writable bytes is refused"
+  );
+  assert_eq!(
+    driver.memory.accesses_dropped(),
+    0,
+    "the access log holds every write this test reasons about"
   );
   let writes: Vec<GuestRange> = driver
     .memory

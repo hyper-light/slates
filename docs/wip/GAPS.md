@@ -672,6 +672,57 @@ The other two were real.
 Swept the rest of the class and found nothing: every other counter on `DaxRegistry` (`healed`,
 `migrated`, `revoked`, `scrubbed`, `flips`, `release_refusals`) has readers outside `dax.rs`.
 
+Widened the same filter — a `pub fn` in `crates/vfs/src` with **no mention anywhere in the
+workspace outside its own definition** — and it returned five more. One was the same shape as
+`dax_unguard` and went with it; four are unwired rather than duplicated, and are reported here
+rather than deleted, because removing an accessor that a surface was meant to call is a
+different judgement from removing a second path to an existing one (CLAUDE.md's sibling rule:
+report, do not widen the fix).
+
+- **`trie::nodes_under` — removed.** A wrapper calling `nodes_under_since(nodes, root, None,
+  out)`, while every real caller already calls `nodes_under_since` with `None` itself
+  (`volume.rs:3666`, `volume.rs:6658`). A second public path to the one in use, CLAUDE.md #7.
+- **`Volume::set_plaintext_hold_cap` — an operator control with no surface.** It lowers how many
+  idle sweeps a DAX-reopened chunk may stay plaintext after its window is gone, and its doc calls
+  it "policy, not performance — an operator trading at-rest exposure for the re-seal churn the
+  hold avoids". Nothing calls it: no CLI flag, no config field, no server verb. So
+  `reseal_hold_cap_sweeps` is always the derived default `WRITE_PLAINTEXT_SWEEPS = 2` at all
+  three construction sites. Not a hole — the setter only ever *lowers* the cap
+  (`sweeps.min(Self::WRITE_PLAINTEXT_SWEEPS)`), so its absence cannot make exposure worse than
+  designed — but an operator who wants tighter at-rest exposure has no way to ask. Either wire a
+  surface or drop the control; leaving it is the one option that claims something untrue. (The
+  constant itself is fine: its derivation is stated — a file is swept once its last write is
+  older than the previous tick, so one to two ticks pass between write and seal.)
+- **`Volume::dax_integrity_guard_enabled`** — the getter for §4.6's B2 opt-in, read by nothing.
+  The device and the server both report other DAX state; this one never reaches them.
+- **`Volume::destroy_pending`** — "objects still queued for a destroy in progress", read by
+  nothing, so the queue depth of a cooperative destroy is not observable anywhere.
+- **`volume::chunk_record_bytes`** — the §4.2 metadata cost of one chunk record, called by
+  nothing; the accounting it was written for uses another path.
+
+None of the four is a correctness defect. They are claims the code makes about capabilities that
+do not exist end to end, which is the same species as the codec probe: the difference is that
+these were caught before anyone relied on them.
+
+The same filter over `crates/mem` and `crates/bridge-core` returned nothing — every public
+function there has a caller. Over `crates/bridge-virtiofs` it returned two, both on the
+simulated guest memory that is the DAX device oracle's other leg, and one of them mattered:
+
+- **`SimGuestMemory::accesses_dropped` was read by nothing, and five tests reason about the log
+  it guards.** The access log is bounded at `ACCESS_LOG_CAP = 1 << 16` and drops silently past
+  it (`sim.rs:144`, `if log.len() < ACCESS_LOG_CAP`), while `virtqueue.rs:64`, `virtqueue.rs:143`,
+  `admission.rs:311`, `admission.rs:453` and `device.rs:968` all draw conclusions from
+  `accesses()` — including "a revoked device touches nothing, not even the ring", which reads an
+  **empty** log as proof of absence. A test that grew past the cap would have had its evidence
+  truncated and passed anyway. This is the gotcha CLAUDE.md names for an oracle's other leg: the
+  simulator has to model what the real thing does, and a silently lossy log models nothing.
+  All five sites now assert `accesses_dropped() == 0` before they read, so the day a test
+  outgrows the cap it fails loudly instead of concluding from a prefix. No site drops today —
+  the 72 `slates-bridge-virtiofs` tests pass with the assertions in — so this is a guard against
+  a future untruth rather than a fix to a present one.
+- `SimGuestMemory::clear_accesses` is unused test-support API; left alone, since a simulator
+  offering a reset nobody needs costs nothing and misleads no one.
+
 Open, flagged by reasoning rather than measurement: the `guards.len() >= self.dax.cap` arm of
 `dax_guard` (`dax.rs:1476`) looks unreachable. A guard exists only for a live mapping, so
 `guards.len() <= mappings`, and mappings are bounded by the same `cap`; reaching `guards == cap`

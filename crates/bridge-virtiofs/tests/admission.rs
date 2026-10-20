@@ -308,6 +308,11 @@ fn a_chain_beyond_the_byte_credit_is_refused_before_access_and_faults_the_device
     .seam()
     .guest()
     .writable_of(usize::from(FIRST_REQUEST_QUEUE), 0);
+  assert_eq!(
+    admitted.seam().guest().memory.accesses_dropped(),
+    0,
+    "the access log holds every access this test reasons about"
+  );
   let accesses = admitted.seam().guest().memory.accesses();
   assert!(
     !accesses
@@ -448,6 +453,11 @@ fn assert_revoked_touches_nothing(
   assert_eq!(
     admitted.service(bridge, registry).unwrap_err(),
     ServeError::Revoked
+  );
+  assert_eq!(
+    admitted.seam().guest().memory.accesses_dropped(),
+    0,
+    "an empty log means nothing happened only if nothing was dropped"
   );
   assert!(
     admitted.seam().guest().memory.accesses().is_empty(),
