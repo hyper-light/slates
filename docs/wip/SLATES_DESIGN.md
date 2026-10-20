@@ -4960,12 +4960,15 @@ rest restores. Insufficient memory to hold a compressed copy: Refused before wor
 **Derived constants.** All from the profile and per-volume observations; the only fixed rule is
 the format floor.
 
-> **Status (2026-10-20).** The cost model above ran with no inputs until this date. The boot
-> profile's codec probe was compiled out of every build — `slates-machine` was declared
-> `default-features = false` on the workspace dependency in 2026-09-05 so a cross-target lint
-> would resolve no C sources, and nothing turned `codecs` back on — so `profile.codecs` was
-> empty, `codec_policy` derived `CodecPolicy::raw_only()` and `decide` returned `Verdict::Raw`
-> for every chunk. Archives were valid and round-tripped, which is why no suite noticed; they
+> **Status (2026-10-20).** The cost model above ran with no inputs in some builds and not
+> others until this date. The boot profile's codec probe was compiled out wherever
+> `slates-machine` was reached as a dependency — it was declared `default-features = false` on
+> the workspace dependency in 2026-09-05 so a cross-target lint would resolve no C sources, and
+> nothing turned `codecs` back on — so in those builds `profile.codecs` was empty,
+> `codec_policy` derived `CodecPolicy::raw_only()` and `decide` returned `Verdict::Raw` for
+> every chunk. A build that named `slates-machine` on the command line escaped it, so the
+> release binaries (`cargo build --release --workspace`) compressed and the container image
+> (`cargo build --release -p slates-cli`) did not: one source, two products, which R8 forbids. Archives were valid and round-tripped, which is why no suite noticed; they
 > were simply never compressed. The binary that measures the profile now asks for the probe, and
 > `crates/cli/tests/cli.rs::the_shipped_binary_measures_the_codecs_its_archive_policy_chooses_from`
 > gates it against the real `slates profile --json`. Write-up:

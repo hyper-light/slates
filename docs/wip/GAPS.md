@@ -439,11 +439,18 @@ are retained with their scope; no documentation edit is an implementation accept
 
   **Correction (2026-10-20).** "off for those checks" was not what the tree did. The switch was
   written as `default-features = false` on the **workspace** dependency (`Cargo.toml:18`), which
-  turns `codecs` off for every build, and no crate turned it back on. The shipped `slates` binary
-  therefore measured no codec points, `codec_policy` derived `CodecPolicy::raw_only()` and the
-  daemon stored every archive chunk raw — D-17's ratio codec dead since 2026-09-05, in every
-  build, on every platform. Proven by use with the real binary (`slates profile --json`: zero
-  codec points and the profile's own note `codec probe not compiled in`), not by reading.
+  turns `codecs` off wherever `slates-machine` is reached as a *dependency*, and no crate turned
+  it back on. It does not apply when `slates-machine` is itself named on the command line, so the
+  defect was build-command-dependent: `cargo build --release --workspace` (`release.yml:52`, the
+  release binaries) had codecs on, while `cargo build --release -p slates-cli` (`Dockerfile:27`,
+  the container image) and `cargo build -p slates-cli` (`ci.yml:265`, `ci.yml:639`) had them off.
+  In those builds the daemon measured no codec points, `codec_policy` derived
+  `CodecPolicy::raw_only()` and every archive chunk was stored raw — D-17's ratio codec dead
+  since 2026-09-05. One source tree, two different products, which is what R8 forbids. Proven by
+  use with the real binary (`cargo run -p slates-cli -- profile --json`: zero codec points and
+  the profile's own note `codec probe not compiled in`) and by resolution with an untouched
+  control (`cargo tree -p slates-vfs -i lz4_flex` omits `slates-machine`; `--workspace` includes
+  it), not by reading.
   Fixed by having the binary that measures the profile ask for the probe
   (`crates/cli/Cargo.toml`, `features = ["codecs"]`), which leaves the library crates' cross-lint
   C-free because `slates-cli` is not in those graphs. Gated from now on by

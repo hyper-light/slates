@@ -1,4 +1,7 @@
-# The ratio codec was compiled out of every build
+# The ratio codec was compiled out of the container image, and on in the release binaries
+
+(The file name says "every build". That was the first reading and it is too strong; the scope is
+corrected below and the name is kept because commits already cite it.)
 
 - Date: 2026-10-20
 - Area: §4.11 archive policy, D-17 (the ratio codec), §4.1 boot profile
@@ -8,10 +11,27 @@
 
 ## Description
 
-The daemon never compressed an archive chunk. Every chunk was stored raw, on every platform, in
-every build, since 2026-09-05. Nothing refused and nothing logged an error: the archive format is
-self-describing, so raw chunks are valid archives, and the one signal — a note in the boot
-profile — went to a field nobody read.
+The daemon did not compress an archive chunk in builds that did not name `slates-machine` as a
+package — which is the container image and every `-p slates-cli` build, though **not** the
+GitHub release binaries. Chunks were stored raw, on every platform, since 2026-09-05. Nothing
+refused and nothing logged an error: the archive format is self-describing, so raw chunks are
+valid archives, and the one signal — a note in the boot profile — went to a field nobody read.
+
+The sharpest part of this is not that compression was off. It is that **one source tree produced
+two different products depending on the build command**, with no way to tell them apart from the
+outside:
+
+| build command | `slates-machine` | codecs | used by |
+|---|---|---|---|
+| `cargo build --release --workspace` | selected member, so its own `default = ["codecs"]` applies | on | `release.yml:52`, the release binaries |
+| `cargo build --release -p slates-cli` | dependency only, so the root's `default-features = false` applies | off | `Dockerfile:27`, the container image |
+| `cargo build -p slates-cli` | dependency only | off | `ci.yml:265`, `ci.yml:639` |
+
+Proven by resolution on the current tree, with a crate my fix does not touch as the control:
+`cargo tree -p slates-vfs -i lz4_flex` does not list `slates-machine` among lz4_flex's dependents
+(machine reached as a dependency has `codecs` off), while `cargo tree --workspace -i lz4_flex`
+does (machine selected as a member has it on). That divergence is what R8 — one code path,
+laptop and fleet alike — exists to forbid.
 
 Measured on this machine (M5 Max, macOS 15.4, 2026-10-20) with the shipped binary:
 
@@ -42,8 +62,10 @@ declaration was added (§8, 2026-09-05): "the C dependencies are off for those c
 `slates-machine`'s `codecs` and `pure-hash` features".
 
 The switch was correct in intent and wrong in placement. Put on the **workspace dependency**, it
-applies to every build of every crate, not to the cross-target lint it was written for, and no
-crate anywhere re-enabled `codecs`. Confirmed by resolution rather than by reading: in the
+governs every edge that reaches `slates-machine` as a dependency rather than the cross-target
+lint it was written for, and no crate anywhere re-enabled `codecs`. It does not govern
+`slates-machine` when that crate is itself named on the command line, which is why
+`--workspace` builds escaped it and `-p slates-cli` builds did not. Confirmed by resolution rather than by reading: in the
 `slates-cli` graph, `lz4_flex` is reached only through `slates-archive`, never through
 `slates-machine`, and `slates-machine`'s sole path to `lz4_flex` is its `codecs` feature.
 
@@ -75,9 +97,11 @@ masquerade as a passing oracle". The codec path had no such counter.
 
 ## Impact
 
-- Archives (§4.11, §4.16, Phase 7) were stored raw: more bytes on every replication and every
-  export. No corruption, no refusal, no incorrect output — archives remained valid and
-  round-tripped, which is why the suites stayed green.
+- Archives (§4.11, §4.16, Phase 7) were stored raw in the affected builds: more bytes on every
+  replication and every export. No corruption, no refusal, no incorrect output — archives
+  remained valid and round-tripped, which is why the suites stayed green.
+- The container image and the release binaries were not the same product. A fleet mixing them
+  behaved differently by artifact, which no test or signal would have surfaced.
 - The boot profile carried a truthful note that no surface read.
 - Not a security or durability issue: nothing was lost, mis-sealed or mis-verified.
 
