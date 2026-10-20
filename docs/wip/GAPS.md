@@ -8900,3 +8900,27 @@ pin check that was true but insufficient, and from the exit codes that passed fo
 It is a unit-level property, so unlike the CLI attacks it runs on **every** platform — including the Windows
 cross-lint, which is now the only Windows coverage available and where `-p slates-server -p slates-vfs
 --all-targets` is clean with it in. Server lib 177/177, workspace clippy and xtask clean.
+
+### 2026-10-20: what an arm64-Windows lint would and would not add, measured
+
+`aarch64-pc-windows-msvc` **is** a release target (`release.yml`), so the question of arm64-Windows coverage
+for the DAX code is a fair one. Attempted from here and then measured rather than assumed:
+
+**The attempt.** `rustup` has both `aarch64-pc-windows-gnullvm` and `aarch64-pc-windows-msvc`, and clippy does
+not link — but the build scripts do compile C for the target. `blake3` is cleared by the workspace's existing
+`slates-machine/pure-hash` feature; `zstd-sys` is not, and arm64-Windows C needs **llvm-mingw**, which Debian
+does not package (`mingw-w64` is x86 only). So an arm64-Windows cross-lint needs an external toolchain
+download, and the x86_64 one does not.
+
+**What it would add: nothing for this code.** `crates/vfs/src` and `crates/mem/src` contain **zero**
+`target_arch` branches — every platform split in the DAX path is `target_os`. So the
+`x86_64-pc-windows-gnu` cross-lint already compiles *every* Windows `cfg` arm the DAX code has; an arm64
+build would compile the identical source. The only thing it could catch beyond that is arch-specific
+codegen, and the release lane already builds `aarch64-pc-windows-msvc` natively on a Windows runner where
+those C dependencies compile.
+
+So the honest statement of Windows coverage, in full: **every Windows `cfg` branch in the DAX and VFS code is
+compiled** (x86_64 cross-lint, `-p slates-vfs -p slates-mem -p slates-machine -p slates-server --all-targets`,
+clean, with the DAX tests and the new OCI chaos property included); **no Windows code has been executed** by
+this session, because kiln's relay wraps every command in `/bin/bash` through a WSL distro that has none.
+Execution remains CI's `windows-lint` lane and the release lane's native runners.
