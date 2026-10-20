@@ -74,6 +74,33 @@ two paths with different behaviour — the layering CLAUDE.md #7 forbids — so 
 doing at once, with a test that drives a second round behind a first on a mount receiving no
 requests.
 
+## Why no lint could have caught it either
+
+`channel.rs` is `#[cfg(target_os = "linux")]` (`lib.rs:28`), so this laptop never type-checks it
+at all — `cargo check -p slates-bridge-fuse` passes on macOS without compiling the file. And on
+Linux `dead_code` says nothing, because `wakes_with` is `pub` in a library crate and a `pub` item
+is reachable by definition. A setter that no one calls, in a module half the fleet never
+compiles, is invisible to every tool the project runs. The sweep found it because it asks a
+question no lint asks: not "is this reachable?" but "does anything actually reach it?"
+
+## The shape a fix should probably take
+
+Racing two readiness futures in the serve task is the obvious reading and the worse one: it means
+registering the notifier's fd with the driver per mount and hand-rolling a select, in the loop
+whose last bug deadlocked mounts.
+
+The runtime already has the right mechanism, and it is now tested. A **poller**
+(`ShardContext::register_poller`) wakes a task whenever its predicate says ready, which is exactly
+how the daemon's own control loops are driven (`daemon.rs:4031`, `:4189`). Registering one per
+mount whose predicate reports "this mount's round has returned" makes a completed round wake the
+serve task through a path already in use, with no new wait and no second fd. It also cleans
+itself up: a poller is dropped when its task ends, which
+`crates/rt/tests/pollers.rs::a_poller_is_forgotten_when_its_task_ends` now holds.
+
+One trap to design around, named in the project's own record: a poller predicate runs inside the
+shard loop, so it must not take a `with_state` borrow that something up the stack already holds —
+a nested borrow returns `None` silently rather than refusing.
+
 ## Exact edits a fix would make
 
 1. `crates/server/src/fuse.rs::serve` — wait on device readability **or** the mount's round
