@@ -723,6 +723,27 @@ simulated guest memory that is the DAX device oracle's other leg, and one of the
 - `SimGuestMemory::clear_accesses` is unused test-support API; left alone, since a simulator
   offering a reset nobody needs costs nothing and misleads no one.
 
+The bridges and `crates/archive`/`crates/machine` were swept too. `bridge-fskit`, `bridge-winfsp`
+and `archive` are clean. `bridge-nfs::delegation_count`, `encode_stateid`, `fore_channel`,
+`holds_client` and `machine::core_rtt_median_ns` are unused accessors — the delegation tests in
+particular are *not* vacuous without the counter, since they assert on the granted delegation
+itself (`files.delegate_write(..) == Some(delegation)`), which is stronger. One was a defect:
+
+- **`bridge-fuse::ServeState::wakes_with` had no caller, so a finished invalidation round never
+  wakes the serve loop.** `b9935dfe` moved the FUSE invalidation write off the serving thread to
+  break a mount deadlock, and built the out-of-band completion signal to go with it:
+  `NotifyThread` fires a `ChangeNotifier` the moment the round is sent (`channel.rs:318`),
+  `deliver_owed` clones it in from `state.notify_wake`, and `wakes_with` is what sets that field.
+  Nothing calls `wakes_with`, so the field is always `None` and the branch never fires. The
+  round's *writes* still reach the kernel — the thread does them — but the loop does not learn
+  the round finished, and the daemon's serve task waits only on device readability
+  (`crates/server/src/fuse.rs:467`), which a completed round does not produce. Since at most one
+  round is in flight by design, every invalidation raised after it waits for the next kernel
+  request; on a quiet mount that is unbounded, and a kernel serving a cached entry sends no
+  request, which is the exact condition entry invalidation exists to break. Nothing is dropped.
+  Write-up, with the three edits a fix would make:
+  `docs/bugs/2026-10-20-the-fuse-notify-rounds-wake-was-built-and-never-wired.md`.
+
 `crates/land`, `crates/base`, `crates/wire`, `crates/ipc` and `crates/rt` were swept the same way.
 `base`, `wire` and `ipc` are clean; `land::hash_hex`, `rt::next_random` and `rt::sim_udp_rebind`
 are unused helpers worth no more than a mention. `rt::unregister_poller` was the one that led
