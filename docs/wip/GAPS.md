@@ -525,6 +525,22 @@ are retained with their scope; no documentation edit is an implementation accept
   Windows box, so arm64 Windows is compiled and linted, never executed. That limit stands until
   such a machine exists.
 
+  **The arm64 Windows *release* target is declared and has never been built, and it has a named
+  unmet prerequisite.** `release.yml:34` lists `aarch64-pc-windows-msvc` in the matrix and builds
+  it with `cargo build --release --workspace --target ...` on `windows-latest`. That workflow has
+  never run: there are no tags (`git tag` is empty) and `gh run list --workflow=release.yml`
+  returns nothing. So the whole workspace has never been compiled for arm64 Windows, only the
+  five crates the new lint lane covers. Two C dependencies are in that build and neither is
+  exercised for the target anywhere: `zstd-sys`, and `aws-lc-sys`, whose own builder says
+  "Windows ARM64 (aarch64-pc-windows-msvc) requires clang-cl ... or set CC to a working
+  clang-cl" (`aws-lc-sys-0.45.0/builder/cc_builder.rs:1113`, the version `Cargo.lock` pins).
+  `release.yml` installs NASM only, and its own comment scopes that to "Windows **x86**
+  assembly". GitHub's `windows-latest` image does ship LLVM, so the build may find `clang-cl` on
+  PATH and succeed — but that is a guess, and the first release cut will be the first test of
+  it. Not changed here: adding an unverified step to a workflow that cannot be run from this
+  machine is how this project has shipped red lanes before. The cheap mitigation before the
+  first tag is a `workflow_dispatch` run of `release.yml`, which it already supports.
+
   **Deliberately not extended to `slates-vfs`, `slates-cluster` and `slates-server`.** They reach
   `slates-archive`, whose `zstd` is on for every dependent because the root declares it without
   `default-features = false`, so a cross-check of them needs a C toolchain for the target.
