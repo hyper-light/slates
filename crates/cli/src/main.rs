@@ -32,6 +32,9 @@ mod exec;
 mod fleet;
 mod format;
 mod mount;
+// The handshake asks a container engine's CLI over a poll loop (`rustix`) and judges the answer with
+// `slates-bridge-oci`; both are `cfg(unix)` dependencies, so the module is too.
+#[cfg(unix)]
 mod oci_runtime;
 mod parent;
 mod recovery_key;
@@ -78,7 +81,7 @@ fn main() -> ExitCode {
     Command::Exec(request) => run_exec(&request),
     Command::Run(request) => verbs::run_consumer(&request),
     Command::OciCheck(check) => verbs::oci_check(&check),
-    Command::OciRuntime(runtime) => oci_runtime::oci_runtime(&runtime),
+    Command::OciRuntime(runtime) => run_oci_runtime(&runtime),
   };
   match outcome {
     Ok(()) => ExitCode::SUCCESS,
@@ -145,6 +148,24 @@ fn run_exec(request: &args::ExecRequest) -> Result<(), Failure> {
 fn run_exec(_request: &args::ExecRequest) -> Result<(), Failure> {
   Err(Failure::Failed(
     "slates exec needs Linux user and mount namespaces; it is not available on this platform"
+      .to_owned(),
+  ))
+}
+
+/// Runs the consuming runtime's handshake on Unix, where the engine's CLI can be polled and judged.
+#[cfg(unix)]
+fn run_oci_runtime(runtime: &str) -> Result<(), Failure> {
+  oci_runtime::oci_runtime(runtime)
+}
+
+/// The handshake is Unix-only: it polls the engine's CLI through `rustix` and judges the answer with
+/// `slates-bridge-oci`, both `cfg(unix)` dependencies. Windows refuses it rather than pretending to check,
+/// because a bind source this verb has not judged is exactly what it exists to catch.
+#[cfg(not(unix))]
+fn run_oci_runtime(_runtime: &str) -> Result<(), Failure> {
+  Err(Failure::Failed(
+    "slates oci-runtime polls a container engine's CLI through facilities this platform does not have; \
+     it is not available here"
       .to_owned(),
   ))
 }

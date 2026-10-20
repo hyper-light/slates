@@ -190,34 +190,57 @@ fn mount_work_and_detach(
     "{removed:?}; refusals {:?}",
     daemon.refusals_on_every_shard()
   );
-  // The container bind of this mount: its source authority is verified (the table names this attachment, held
-  // to the record), but the mount was made for its user alone, so a container's ids could not reach it: refused
-  // `MountNotShared` (a `--shared` mount is the bind source; `a_linux_container_reaches_the_shared_mount_as_its_own_ids`).
-  let bind = client.attach_with(
-    volume,
-    None,
-    Intent::Write,
-    slates_client::AttachRequest::Oci {
-      source: point.path.clone(),
-      destination: "/work".to_owned(),
-    },
-  );
-  assert!(
-    matches!(
-      bind,
-      Err(ClientError::Refused(Refusal::AttachmentUnsupported {
-        reason: slates_client::UnsupportedReason::MountNotShared,
-        ..
-      }))
-    ),
-    "{bind:?}"
-  );
+  bind_reports_that_the_mount_is_not_shared(client, volume, &point.path);
   client.detach(attached.attachment).unwrap();
   assert!(
     eventually(|| mounted_at(&point.path).is_none()),
     "the detach unmounted"
   );
   assert_eq!(client.status(volume).unwrap().attachments, 0);
+}
+
+/// The container bind of a mount the daemon made for its own user: the source authority is verified (the
+/// table names this attachment, held to the record), and the mount is **not** shared with other users.
+///
+/// Since 2026-10-20 that is reported rather than refused (`server/src/oci.rs`, whose
+/// `a_bind_of_a_mount_not_shared_with_other_users_reports_it_rather_than_refusing` is the unit half): a
+/// rootful runtime's processes would meet `EACCES` there and a rootless one would not, and slates cannot see
+/// which the harness will drive, so the fact travels in the evidence for the harness's own pre-bind check.
+/// Refusing it blocked the unprivileged case R10 prefers and effectively demanded a root edit of
+/// `/etc/fuse.conf`.
+///
+/// This assertion expected the old `MountNotShared` refusal until the first CI run on a host with
+/// `/dev/fuse` — the suite skips loudly without one, so this sibling was never run when the rule changed and
+/// only the unit half was updated.
+fn bind_reports_that_the_mount_is_not_shared(
+  client: &mut slates_client::Client,
+  volume: slates_client::VolumeId,
+  source: &str,
+) {
+  let bound = client
+    .attach_with(
+      volume,
+      None,
+      Intent::Write,
+      slates_client::AttachRequest::Oci {
+        source: source.to_owned(),
+        destination: "/work".to_owned(),
+      },
+    )
+    .expect("an unshared source is bound and its sharing reported");
+  let evidence = match &bound.established {
+    slates_client::Established::OciBind { binding } => binding.evidence.clone(),
+    other => panic!("an OCI request establishes an OCI bind: {other:?}"),
+  };
+  assert!(
+    !evidence.shared_with_other_users,
+    "the mount was made for its own user, and the evidence says so rather than the bind refusing: {evidence:?}"
+  );
+  assert!(
+    evidence.names_volume && evidence.fstype == "fuse.slates",
+    "the evidence names this volume's own FUSE mount as the source: {evidence:?}"
+  );
+  client.detach(bound.attachment).unwrap();
 }
 
 /// A second mount sees what the first wrote; the kernel's own unmount ends its attachment.

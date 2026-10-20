@@ -828,6 +828,29 @@ unverified *lane* would not is that this is two crates added to a **proven** lan
 Windows runner that already builds everything they depend on — and if it does go red, that is the
 finding, found in CI rather than at the first tag.
 
+**It went red, and that was the finding (2026-10-20).** The first run of this lane against the real
+runner failed at *Clippy the Windows-buildable crates*; every Windows **test** step passed (shared
+memory, the rings and the Event wake, the rendezvous, capability delivery, the IOCP kick, the base
+host, AFD readiness over loopback UDP). Two things had never been compiled for Windows:
+
+- **`crates/cli/src/oci_runtime.rs`** — the whole module. It polls a container engine's CLI through
+  `rustix` and judges the answer with `slates-bridge-oci`, both of which are
+  `[target.'cfg(unix)'.dependencies]`, while `mod oci_runtime;` was declared unconditionally. Fixed as
+  the file already does for the Linux-only launcher: the module is `#[cfg(unix)]` and the verb is a
+  paired `run_oci_runtime` whose non-Unix arm returns a typed `Failure`, so Windows refuses the
+  handshake rather than pretending to have performed it — the whole point of a verb that exists to
+  catch an unjudged bind source.
+- **`crates/cli/tests/cli.rs`** — five sites across the fleet and export halves (`std::os::fd`,
+  `slates_bridge_nfs`). Gated at the file with `#![cfg(unix)]`, which costs nothing today because the
+  `gates` job runs this suite on ubuntu and macOS only, and **that is itself the gap**: the suite's
+  platform-free half (the verbs, the parsed output, the refusal taxonomy's exit codes) is not Unix by
+  nature and no Windows runner has ever driven it. Owed, and written at the top of the file too, so it
+  is not rediscovered by someone wondering why Windows runs no CLI test.
+
+Neither was verifiable from this machine, for the reason stated above — cross-linting `slates-cli` for
+Windows needs an MSVC toolchain for `blake3`, `zstd-sys` and `aws-lc-sys` build scripts — so both fixes
+were made against the CI log and re-verified by the lane itself.
+
 ### 8a-shards-boot. A real microVM mounted a slates volume and read it (2026-10-20, closed)
 
 `crates/bridge-fuse/examples/shards_fs_serve.rs` serves a volume to a shards microVM over virtio-fs:

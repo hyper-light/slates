@@ -2,6 +2,15 @@
 //! process supervising a real `slates daemon`, the verbs driven through the binary, the
 //! outputs parsed back, the exit codes of the refusal taxonomy, and the daemon leaving when
 //! its anchor is killed.
+//!
+//! **Unix only, and that is a gap rather than a decision.** Much of this file is Unix by nature — a node's
+//! serve sockets are handed to a daemon as inherited descriptors (`std::os::fd`), and the export leg speaks
+//! NFS through `slates-bridge-nfs`, a `cfg(unix)` dependency. The rest of it — the verbs, the parsed output,
+//! the refusal taxonomy's exit codes — is not, and a Windows runner could drive it. Nothing does: the `gates`
+//! job runs this suite on ubuntu and macOS alone, so gating the file costs no coverage that exists today. It
+//! is recorded in `docs/wip/GAPS.md` so that it stays visible: the day a Windows runner can run the CLI, the
+//! platform-free half of this belongs in a target it can build.
+#![cfg(unix)]
 // Test harness code: an unwrap here is a failed test, which is what it should be.
 #![allow(
   clippy::unwrap_used,
