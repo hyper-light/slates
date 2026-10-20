@@ -751,6 +751,38 @@ keeping: a gate that only ever runs on one platform is not a gate.** The `gates`
 ubuntu and macos both, so CI would have caught this on the next push — it had simply never been
 pushed.
 
+### 8a-dax-confine. The DAX window confinement's refusal had no test (2026-10-21)
+
+A guest's DAX window is handed to the front end as a `udmabuf` covering **only** that window. A host
+that cannot carve one must **refuse** the map: sending the wide descriptor instead is the escape of
+`docs/bugs/2026-10-18-the-message-based-dax-map-hands-the-vmm-the-whole-arena.md`, and
+`device.rs:1661` says so — "The wide descriptor is never sent as a fallback — that is the escape
+itself, and CLAUDE.md #7 has no room for a second path."
+
+The confinement is proven by
+`a_message_based_setupmapping_parks_until_the_front_end_acks_then_answers_the_guest`, which **needs
+`/dev/udmabuf`** and skips loudly without it. Measured here: this laptop has no such device, Docker's
+linuxkit VM has neither the device nor the module, and a GitHub runner cannot load one as non-root.
+So that proof runs on no machine this project can currently reach — and `MessagePlacer` appeared in
+no other test, which means **the refusal was asserted nowhere either**. A regression that sent the
+unconfined descriptor would have passed everywhere.
+
+`a_message_based_setupmapping_is_refused_where_the_window_cannot_be_confined` now holds the other
+half, gated on `/dev/udmabuf` being **absent** — the mirror of the existing gate, so the two tests
+partition the hosts and every host runs one of them. It asserts the pass does not park waiting for an
+acknowledgement of a descriptor it sent, that the guest is answered `EOPNOTSUPP`, and that no window
+is recorded.
+
+Red-checked against the historical escape itself rather than a stand-in: making `udmabuf::confine`
+hand back `object.try_clone_to_owned()` — the whole arena object, which is exactly what the
+2026-10-18 bug did — fails the new test on the right assertion ("the map was refused outright, not
+parked waiting for an acknowledgement of a descriptor it sent"). `udmabuf.rs` restored byte-exact;
+87 `slates-bridge-virtiofs` tests green on Linux.
+
+What is still proven nowhere is the positive direction: that a carved descriptor really does stop at
+the window. That needs a host with `/dev/udmabuf` — adacachy is one, a Fedora host is one, a GitHub
+runner is not.
+
 ### 8a-win. The shipped binary's Windows code was compiled by nothing (2026-10-21)
 
 Same question as the lint-gate entry above, asked of the other platform: **what does only one

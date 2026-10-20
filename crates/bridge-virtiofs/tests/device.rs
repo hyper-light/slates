@@ -47,6 +47,11 @@ const FUSE_MAP_ALIGNMENT: u64 = 1 << 26;
 /// Format: `ENOENT`, `EIO`.
 const ENOENT: i32 = 2;
 const EIO: i32 = 5;
+/// Linux's `EOPNOTSUPP`, the errno a map refuses with when the host cannot carve a confined descriptor
+/// (`device.rs`'s `dax_errno::EOPNOTSUPP`, which is private to that crate). Gated like the one test that
+/// reads it: an ungated constant used only from a `cfg(linux)` test is dead code on every other host.
+#[cfg(target_os = "linux")]
+const EOPNOTSUPP: i32 = 95;
 /// Format: `O_RDWR`.
 const O_RDWR: u32 = 2;
 /// Format: the FUSE node id of the root directory.
@@ -3776,6 +3781,100 @@ fn front_send_ack(socket: &std::os::fd::OwnedFd, request: u32, status: u64) {
     rustix::net::SendFlags::NOSIGNAL,
   )
   .unwrap();
+}
+
+/// §4.6 — the other half of the message-based SETUPMAPPING proof above, and the half that runs on every host
+/// this project can reach. `udmabuf::confine` carves a descriptor covering **only** the guest's window; a host
+/// that cannot carve one must **refuse** the map, because sending the wide descriptor instead is the escape
+/// itself (`docs/bugs/2026-10-18-the-message-based-dax-map-hands-the-vmm-the-whole-arena.md`) and CLAUDE.md #7
+/// leaves no room for a fallback.
+///
+/// Do: on a host with no `/dev/udmabuf` — this laptop, Docker's linuxkit VM, and any runner without the
+/// module — install a message placer and ask for a SETUPMAPPING. Expect: the pass does **not** park waiting
+/// for a front-end acknowledgement, which is what a descriptor actually sent would do; the guest is answered
+/// `EOPNOTSUPP`; and no window is recorded.
+///
+/// Until this existed the refusal was asserted nowhere. `MessagePlacer` appeared only in the test above, which
+/// skips exactly when this condition holds, so a regression that sent the unconfined descriptor would have
+/// passed on every machine reachable from here. The two tests partition the hosts: one proves confinement
+/// where `/dev/udmabuf` exists, this one proves refusal where it does not, and each skips loudly on the other's
+/// host.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_message_based_setupmapping_is_refused_where_the_window_cannot_be_confined() {
+  use slates_bridge_virtiofs::device::DaxWindowEntry;
+  use slates_bridge_virtiofs::vhost_user::{BackendReqChannel, MessagePlacer};
+
+  if rustix::fs::open(
+    "/dev/udmabuf",
+    rustix::fs::OFlags::RDWR | rustix::fs::OFlags::CLOEXEC,
+    rustix::fs::Mode::empty(),
+  )
+  .is_ok()
+  {
+    eprintln!(
+      "skipping the refusal proof: this host has /dev/udmabuf, so the placer confines the window instead — \
+       which is what a_message_based_setupmapping_parks_until_the_front_end_acks_then_answers_the_guest proves"
+    );
+    return;
+  }
+
+  let page = rustix::param::page_size().max(1);
+  let mut store = dax_shared_store(page, "msgrefuse");
+  let mut vol = volume(&mut store);
+  let root = vol.root_inode(&store).unwrap();
+  let no = vol.create_file_no(&mut store, root, "f", 0o644).unwrap();
+  vol.write(&mut store, no, 0, &vec![0x5Au8; page]).unwrap();
+  let nodeid = no.0;
+
+  let (mut device, mut driver) = device_and_driver();
+  let (_front, back) = rustix::net::socketpair(
+    rustix::net::AddressFamily::UNIX,
+    rustix::net::SocketType::STREAM,
+    rustix::net::SocketFlags::CLOEXEC,
+    None,
+  )
+  .unwrap();
+  let placer: MessagePlacer<DaxWindowEntry> =
+    MessagePlacer::new(BackendReqChannel::adopt(back), page, (page * 16) as u64);
+  device.install_dax_message_placer(placer);
+  assert!(device.dax_offered(), "the device serves message-based DAX");
+
+  let cx = context();
+  let mut bridge = VolumeBridge::new(vid(), &mut vol, &mut store);
+  let init_reply = dax_exchange(
+    &mut device,
+    &mut driver,
+    &mut bridge,
+    &cx,
+    (Opcode::Init, 1, ROOT),
+    &dax_init_body(),
+  );
+  assert_eq!(reply_error(&init_reply), 0, "INIT served");
+
+  let setup = dax_setup_body(0, (2 * 1024 * 1024) as u64, false, 0);
+  let request = message(Opcode::SetupMapping.to_wire(), 2, nodeid, &setup);
+  let queue = FIRST_REQUEST_QUEUE;
+  let head = driver.submit(usize::from(queue), &request, 4096, 1);
+  let pass = serve(&mut device, queue, &mut driver, &mut bridge, &cx, BATCH).unwrap();
+
+  assert!(
+    !pass.more_pending,
+    "the map was refused outright, not parked waiting for an acknowledgement of a descriptor it sent"
+  );
+  let (_, len) = driver
+    .reap(usize::from(queue))
+    .expect("the guest is answered rather than left waiting");
+  assert_eq!(
+    reply_error(&driver.reply_of(usize::from(queue), head, len)),
+    -EOPNOTSUPP,
+    "a window that cannot be confined is refused EOPNOTSUPP, never served wide"
+  );
+  assert_eq!(
+    device.dax_window_count(),
+    0,
+    "and no window is recorded for a map that never happened"
+  );
 }
 
 /// §4.6 / A-9 / A-135 (message-based DAX, Piece C.2b, by use with no VMM): a guest FUSE_SETUPMAPPING over a
