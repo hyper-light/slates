@@ -3552,3 +3552,98 @@ proptest! {
     );
   }
 }
+
+/// §4.6 L2 — what a shift leaves on the row it vacated, measured rather than assumed. The existing shift tests
+/// assert the arena's allocation accounting and never look at the vacated bytes, so this asks directly.
+///
+/// Do: map a file writable, shift it onto another row of the sandbox, complete the two-phase release of the old
+/// mapping, and interrogate the row it left. Expect: before the release its bytes are still there — that is the
+/// stale-TLB hold, and a scrub *there* would be a use-after-unmap hazard rather than a fix; after it, the row is
+/// not handed to anyone else — the arena's allocated byte count does not move and a fresh allocation of the same
+/// size gets a different block carrying none of the tenant's bytes; and the content is intact where it moved to.
+///
+/// **What this deliberately does not assert is that the vacated row is scrubbed, because it is not.** The first
+/// draft asserted exactly that and failed on Linux with the secret still at byte 0. The reason is in the design:
+/// the row is a slot of this tenant's own sandbox (`slot_of` answers `Some`), so `DaxZones::return_slot`
+/// takes it back into the zone instead of freeing it — "so no neighbour can take a row inside this tenant's page
+/// while the tenant still writes the page" — and only the arena's free path scrubs. Measured on Linux
+/// 2026-10-20: same-tenant retention, not cross-tenant disclosure. That an unsealed copy of the tenant's
+/// plaintext stays on the vacated row for the life of the sandbox is recorded in GAPS as a finding, not fixed
+/// here.
+///
+/// Skips loudly on a host that backs no transparent huge page, as every sandbox test here does.
+#[test]
+fn a_shift_leaves_no_copy_of_the_content_on_the_row_it_vacated() {
+  let mut store = store();
+  let mut volume = volume(&mut store, 1 << 20);
+  let f = file_of(&mut store, &mut volume, "f", SECRET, DAX_PAGE);
+  let m = volume.dax_map_write(&mut store, f).unwrap();
+  let vacated = m.block;
+
+  let Some(moved) = first_shift(
+    &mut store,
+    &mut volume,
+    &m,
+    "a_shift_leaves_no_copy_of_the_content_on_the_row_it_vacated",
+  ) else {
+    return;
+  };
+  assert_ne!(
+    moved.block, vacated,
+    "the shift put the content on a different block, or there is nothing to vacate"
+  );
+
+  // Phase one only: the old block's bytes are held on purpose until the VMM confirms the unmap, because a guest
+  // TLB entry may still point at them. A scrub here would be a use-after-unmap hazard, not a fix.
+  let held = store.content.arena().bytes(vacated).map(<[u8]>::to_vec);
+  assert!(
+    held.is_some_and(|b| b.contains(&SECRET)),
+    "before the release the vacated row still holds its bytes: that is the stale-TLB hold"
+  );
+
+  let allocated_before = store.content.arena().allocated_bytes();
+  assert!(
+    store.dax_release_after_unmap(&m),
+    "the hold is dropped by the second phase"
+  );
+  // Which slot it is depends on the host's page size and the zone's layout, so the assertion is that it *is*
+  // one — the index itself would be a constant of this machine, not of slates.
+  let slot = store
+    .dax_zones
+    .of_volume(volume.prefix())
+    .and_then(|zone| zone.slot_of(vacated));
+  assert!(
+    slot.is_some(),
+    "the row the content left is a slot of this tenant's own sandbox, which is why it goes back to the \
+     sandbox rather than to the arena's free lists; slot_of said {slot:?}"
+  );
+
+  // The row is not handed to anyone else: it went back to this tenant's own sandbox, not to the free lists.
+  assert_eq!(
+    store.content.arena().allocated_bytes(),
+    allocated_before,
+    "the release returned nothing to the arena's free lists"
+  );
+  let fresh = store
+    .content
+    .alloc_block(DAX_PAGE, false)
+    .expect("a fresh block is available");
+  assert_ne!(
+    fresh, vacated,
+    "a later allocation is not handed the row the content left"
+  );
+  assert!(
+    store
+      .content
+      .arena()
+      .bytes(fresh)
+      .is_some_and(|b| b.iter().all(|&x| x != SECRET)),
+    "and whatever it is handed carries none of the tenant's bytes"
+  );
+
+  let now = store.dax_read_raw(&moved, 0, DAX_PAGE);
+  assert!(
+    now.iter().take(DAX_PAGE).all(|&b| b == SECRET),
+    "and the content is intact where it moved to"
+  );
+}

@@ -785,6 +785,35 @@ somewhere.
   the sweep ever asked it (live 3,032,879, gone 0), which is why the ending task now lives
   `GONE_TASK_STEPS` steps.
 
+**An L2 shift leaves an unsealed copy of the tenant's plaintext on the row it vacated (2026-10-20,
+measured on Linux; open, not fixed).** The moving target's purpose is to leave a row an attacker
+may be hammering. Asking what it actually leaves behind —
+`a_shift_leaves_no_copy_of_the_content_on_the_row_it_vacated` in `crates/vfs/tests/dax.rs`, which
+runs only where a transparent huge page can back the sandbox — the first draft asserted the
+vacated row reads as zeros and **failed on Linux with the secret still at byte 0**.
+
+The cause is in the design, not a slip. On a shift the row the content left is a slot of this
+tenant's *own* sandbox (`DaxZone::slot_of` answers `Some`), so `DaxZones::return_slot` takes it
+back into the zone rather than freeing it — the comment says why: "so no neighbour can take a row
+inside this tenant's page while the tenant still writes the page" — and only the arena's free
+path scrubs. Measured consequences, all three on Linux with THP `[always]`:
+
+- `released=true`, `pinned=false` after `dax_release_after_unmap`, so the hold really is dropped;
+- the arena's allocated byte count does **not** move across the release (2,097,152 → 2,097,152:
+  the sandbox's huge page and nothing else), so the row never reaches the free lists;
+- a fresh allocation of the same size is handed a **different** block containing **zero** bytes
+  of the secret.
+
+So this is same-tenant **retention**, not cross-tenant disclosure, and the test now asserts those
+three facts rather than the scrub that does not happen. What is left open is worth a decision: a
+volume that shifts repeatedly leaves an unsealed plaintext copy on every row it has vacated, for
+the life of the sandbox, and nothing seals or scrubs them. That sits oddly beside the sealing
+sweep's own bound on how long a write may sit in the clear
+(`WRITE_PLAINTEXT_SWEEPS`, §4.6), which bounds the *live* copy while these stale ones are
+unbounded. Scrubbing a returned slot costs one `fill(0)` per shift; whether that is worth paying
+on the shift path is Ada's call, and so is whether the sandbox should be re-scrubbed when its
+volume is destroyed by a path other than the arena free.
+
 **The arena's zero-on-free was only tested on a one-page extent (2026-10-20).** `release_block`
 zeroes a block as it goes back to the free lists — "as Linux's `init_on_free=1` hardening does
 for the page allocator" — and that is the guarantee standing between one tenant's freed bytes and
