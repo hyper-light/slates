@@ -1258,9 +1258,20 @@ ring and kicks the driver; a stale generation is ignored.
 > **Update (A-134, 2026-10-11):** the incremental refinement landed for plain volumes (A-68) and now for **overlay
 > (base-backed) volumes** — every OCI/container volume: a barrier publishes a delta while the base plane is unchanged,
 > forcing the whole image only on a copy-up/whiteout/rename/drift (gated by `BasePlane::durable_change_token`), so the
-> overlay write path is O(delta) not O(volume) (was O(N²) to fill a directory). Snapshot and clone volumes still
-> publish whole (the head-into-snapshot and shared-root cases a delta cannot carry). Evidence:
+> overlay write path is O(delta) not O(volume) (was O(N²) to fill a directory). Evidence:
 > `docs/bugs/2026-10-11-overlay-volumes-republish-whole-image-per-operation.md`.
+>
+> **Correction (2026-10-20).** The sentence that stood here — "Snapshot and clone volumes still publish whole (the
+> head-into-snapshot and shared-root cases a delta cannot carry)" — was stale within the same day and stayed that way
+> for nine. A-134 was generalized to all three shapes on 2026-10-11 (`BENCHMARKS.md`, "own-snapshot volumes publish
+> deltas too — all three shapes now O(delta)"), and the code says so: `publishes_whole` (`crates/vfs/src/delta.rs:421`)
+> takes the whole image only when the volume is unpublished, its shape changed, the changed set has grown to the live
+> inode count, `base_plane_changed`, or `shared_diverged` — the last being the shared→private move a delta genuinely
+> cannot carry, set in `make_current_inode` when it copies up a clone-origin or own-snapshot-pinned inode. So **all
+> three volume shapes are O(delta) per op**, whole-image only on that divergence. Proven load-independently by
+> allocation count in `crates/vfs/tests/delta_cost.rs` (one create costs the same in a 4,096-file volume as in a
+> 64-file one, for overlay, clone and snapshotted shapes) and end to end by
+> `crates/server/tests/recovery.rs::acknowledged_content_and_its_snapshot_survive_a_restart`.
 
 **Loop.** Each iteration: drain the driver's completions (epoll events / kqueue events / IOCP
 packets) into the run queue; drain inbound rings (client command rings, cross-shard rings, the

@@ -5578,6 +5578,8 @@ oracle). `cargo clippy --workspace --all-targets -- -D warnings` and `cargo xtas
 A wall-clock p99 A/B (overlay create flat vs the earlier 196 → 714 µs growth) is owed on a quiet machine — this session's
 host was at load 48 (other sessions), where timing is unreliable; the allocation-count proof above is load-independent
 and establishes the asymptotic win now. Snapshot/clone volumes still publish whole (owed, a separate delta refinement).
+**Superseded the same day** — see "own-snapshot volumes publish deltas too — all three shapes now O(delta)" below;
+this sentence records what was true at this measurement, not what is true now.
 
 **Wall-clock confirmation (A-134; Linux FUSE in Docker, kernel 6.12, 3 runs at load 6–15, 2026-10-11).** Overlay create
 p50 by 500-op window in a single growing directory, against a plain volume on the same build:
@@ -5639,6 +5641,8 @@ recovery refuses an inode in both `inodes` and `origin_shared`). Proof (load-ind
 `crates/server/tests/recovery.rs::a_clone_recovers_over_its_recovered_origin...`, now extended to diverge an inherited
 file in the clone, restart, and confirm the clone reads its diverged bytes while the origin's copy is untouched.
 Snapshot (own-snapshot) volumes still publish whole — a separate snapshot-image delta (`trie::changed`) is owed.
+**Superseded by the next entry, the same day:** all three shapes are O(delta); this records the state at this
+measurement.
 
 ### Condition 2: own-snapshot volumes publish deltas too — all three shapes now O(delta) (A-134 generalized; 2026-10-11)
 
