@@ -8839,3 +8839,35 @@ relay is a change to Ada's machine and hers to make.**
 
 For the record on the arch question: this host *is* arm64 macOS, so every "macOS" run in these entries is
 `aarch64-apple-darwin`. arm64 Windows has no runner and no cross-lint target configured.
+
+### 2026-10-20: the writable-DAX stack is complete and *deliberately unreachable* — and that closes the first-shift bound
+
+Chasing the remaining DAX item (a volume opting into writable DAX waits up to one liveness budget for its
+first shift) turned up the fact that makes it moot, and it is worth stating plainly because it is easy to
+read the last three days' work as live.
+
+**`Volume::enable_writable_dax()` has no production caller.** All 23 call sites are tests and one bench;
+there is no CLI verb, no protocol field and no `VolumeConfig` flag that turns it on. That is **deliberate**,
+not an oversight: `slates_ipc::protocol` says DAX is advertised "never, until its gate is met (AC-4.12)" and
+carries `DaxNotEstablished` for a guest that asks. So in a deployed daemon today:
+
+- `Volume::dax_map_write` always refuses `NotPermitted` (L0), so no writable window exists;
+- L1 reserves no sandbox, because nothing shifts;
+- `daemon::dax_shift_loop`'s armed predicate (`writable_dax_enabled()` over the shard's volumes) is always
+  false, so the loop costs exactly **one liveness-budget wake and nothing else** — there is no 16 ms cadence
+  running anywhere, and the battery question raised when it was built does not arise in production at all;
+- and the first-shift bound cannot bite, because the opt-in that would start the clock has no surface.
+
+**So the bound is closed by circumstance, and the mechanism to close it properly is now identified.** When
+the opt-in surface is built with the rest of AC-4.12's gate, the wake should be built with it, and the
+runtime already has everything needed — no new primitive: a task registers `futures::current_task()` in
+shard state while it parks on `futures::idle()`, and another path calls `slates_rt::registry::wake(task.0)`.
+`ShardState::server_task` and `link_waiters` are the two worked examples (`state.rs`, `fleet::wake_link_waiter`).
+The shift loop would hold a `dax_shift_task` the same way, park on `idle()` while unarmed instead of waiting
+the liveness budget, and be woken the moment a volume opts in — which removes the bound *and* the one
+remaining periodic wake.
+
+**What this does not change:** everything built and tested over the last three days is exercised by the
+suites, the chaos property and the adversarial passes, on four platform/arch pairs and down to 64 MB on one
+core. It is complete and proven; it is simply gated off at L0 until the registry half of AC-4.12 lands, which
+is Ada's call.
