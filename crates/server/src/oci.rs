@@ -62,8 +62,22 @@ impl Binding {
       .ok_or(Refusal::Forbidden {
         verb: "OCI source mount".to_owned(),
       })?;
-    // On Linux a container's processes reach the source as their own ids, so the source must be a mount shared
-    // with other users (`allow_other`): a FUSE mount the daemon made for its user alone would answer them EACCES.
+    // On Linux a **rootful** engine's container processes reach the source as ids other than the mounting
+    // user's, so the source must be a mount shared with other users (`allow_other`) or the kernel answers
+    // them EACCES — standard FUSE behaviour, which restricts a mount to the mounting user without it.
+    //
+    // **This is false for a rootless engine, and the gate does not yet tell them apart.** A rootless
+    // runtime's container-root maps to the mounting uid, so it reads the mount with no `allow_other` at all:
+    // measured 2026-10-19 on fedora 6.19.10, where a rootless podman container read a slates volume through
+    // an unshared FUSE mount, was refused `EROFS` on a read-only bind, and wrote through a writable one
+    // (`a_rootless_container_reads_and_writes_the_volume_through_its_mount`). So this refusal currently
+    // closes the recorded-attachment path for exactly the unprivileged configuration R10 prefers, and
+    // requiring `allow_other` means requiring a root edit of `/etc/fuse.conf` for this form.
+    //
+    // The deciding fact is already modelled — `RuntimeProfile::rootless`, from the engine's `name=rootless`
+    // security option — but this decision is taken on the mount alone, with no runtime in scope to ask.
+    // Threading it here is the owed fix (GAPS, 2026-10-19); until then the gate stays, because refusing a
+    // configuration that works is the safe direction of being wrong and the opposite is not.
     if self.attachment.is_some() && !parent.form.shared_with_other_users() {
       return Err(Refusal::AttachmentUnsupported {
         transport: AttachTransport::Oci,
