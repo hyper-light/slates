@@ -529,9 +529,17 @@ jobs:
           components: clippy
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
+      # Every crate that builds without a C toolchain for the target. The rest reach `slates-archive`
+      # (zstd) or `rustls` (aws-lc-sys) and need one, so they are covered natively instead — Windows by
+      # `windows-lint`, Linux and macOS by `gates`. Note what is *not* named: `slates-machine`. Naming it
+      # would select it as a package, which enables its own `default = ["codecs"]` and pulls zstd back in;
+      # as a dependency it inherits the workspace's `default-features = false` and stays C-free. That is
+      # the same mechanism that compiled the ratio codec out of the container image
+      # (docs/bugs/2026-10-20-the-ratio-codec-was-compiled-out-of-every-build.md), met from the other side.
       - name: Clippy the cross-buildable crates
         run: >-
           cargo clippy -p slates-wire -p slates-mem -p slates-rt -p slates-ipc
+          -p slates-merge -p slates-db -p slates-wire-derive -p slates-test-seeds
           --all-targets --target ${{ matrix.target }}
           --features slates-machine/pure-hash -- -D warnings
 

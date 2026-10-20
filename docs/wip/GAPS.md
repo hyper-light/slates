@@ -606,6 +606,20 @@ are retained with their scope; no documentation edit is an implementation accept
   actually build it (the five on ubuntu, `x86_64-apple-darwin` on macos), rather than the
   arm64-only one it started as.
 
+  **Widened from four crates to eight (2026-10-21), after measuring which more can build without a
+  C toolchain for the target:** `slates-merge`, `slates-db`, `slates-wire-derive` and
+  `slates-test-seeds` join `wire`, `mem`, `rt` and `ipc`. `slates-bridge-core` and `slates-land`
+  cannot — they reach `slates-vfs` → `slates-archive` → `zstd-sys` — and neither can anything
+  pulling `rustls` → `aws-lc-sys`; those are covered natively instead (Windows by `windows-lint`,
+  Linux and macOS by `gates`). All eight verified on all six targets before landing.
+
+  One crate is deliberately *not* named, and the reason is today's codec bug met from the other
+  side: adding `-p slates-machine` makes it a **selected package**, which enables its own
+  `default = ["codecs"]` and pulls zstd straight back in — the nine-crate attempt failed on
+  `zstd-sys` for exactly that reason. As a dependency it inherits the workspace's
+  `default-features = false` and stays C-free. The lane's comment says so, so the next person to
+  widen it does not rediscover it.
+
   It is now a permanent lane, `windows-arm64-lint` (`aarch64 windows (cross lint, by compile)`),
   verified on Linux before it landed rather than pushed and watched, because this project has
   shipped a red lane that way twice. **With a correction to how that verification was first
