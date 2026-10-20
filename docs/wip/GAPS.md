@@ -785,6 +785,24 @@ somewhere.
   the sweep ever asked it (live 3,032,879, gone 0), which is why the ending task now lives
   `GONE_TASK_STEPS` steps.
 
+**B2's heal was only ever tested at byte 0, and that mattered (2026-10-20).** Every heal test in
+`crates/vfs/tests/dax.rs` corrupts the same position — `flip_a_byte` is `bytes[0] ^= 0xFF` — and
+`a_flip_in_a_guarded_read_only_block_is_caught_and_healed` verifies the repair by reading back
+the **first 64 bytes**. Rowhammer flips land wherever the aggressor rows put them, so a heal that
+restored only a prefix would have passed the entire suite. Now covered by
+`a_flip_anywhere_in_a_guarded_block_heals_every_byte`: for an arbitrary fill, an arbitrary
+position anywhere in the mapped block (its zeroed tail past the file's length included) and an
+arbitrary non-zero mask, the scrub must report `Healed` and **every** byte of the block must
+equal what it was, compared whole and reported by first differing index.
+
+Red-checked by truncating the restore to a 64-byte prefix
+(`let n = dst.len().min(restore.len()).min(64)` in `dax.rs`), which is the bug the old tests
+could not see. The property fails and proptest shrinks to the boundary exactly — `fill = 0,
+position = 64, mask = 1`, the first byte past the prefix — **while
+`a_flip_in_a_guarded_read_only_block_is_caught_and_healed` still passes**. That pair is the whole
+argument for the property: the old test is not wrong, it is blind past byte 64. `dax.rs` was
+restored byte-exact afterwards; the DAX suite is 70 tests, green.
+
 Closed by measurement, and the reasoning was half wrong. I first wrote here that the
 `guards.len() >= self.dax.cap` arm of `dax_guard` (`dax.rs:1476`) "looks unreachable", on the
 argument that a guard implies a live mapping and mappings share the same `cap`. Measured by

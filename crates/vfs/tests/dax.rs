@@ -3426,3 +3426,67 @@ fn the_guard_bound_is_reached_only_by_re_guarding_and_the_registry_refuses_first
     "and the refusal left the net exactly as it was"
   );
 }
+
+proptest! {
+  #![proptest_config(slates_test_seeds::unseeded(ProptestConfig { cases: slates_test_seeds::cases(if cfg!(miri) { 4 } else { 96 }), .. ProptestConfig::default() }))]
+
+  /// §4.6 B2 under arbitrary corruption, which is the shape the threat actually has. Every heal test above
+  /// corrupts **byte 0** — `flip_a_byte` is `bytes[0] ^= 0xFF` — and the one that checks the repair reads back
+  /// only the first 64 bytes. A Rowhammer flip lands wherever the aggressor rows put it, and a heal that
+  /// restored a prefix would pass every one of those tests.
+  ///
+  /// Do: for an arbitrary fill byte, an arbitrary position anywhere in the mapped block (its zeroed tail past
+  /// the file's length included) and an arbitrary non-zero mask, guard a read-only mapping, flip that byte, and
+  /// scrub. Expect: the scrub reports `Healed`, and **every** byte of the block equals what it was before the
+  /// corruption — compared whole, reported by first differing index so a failure is readable rather than a
+  /// 64 KiB diff.
+  #[test]
+  fn a_flip_anywhere_in_a_guarded_block_heals_every_byte(
+    fill in any::<u8>(),
+    position in any::<u16>(),
+    mask in 1u8..=u8::MAX,
+  ) {
+    let mut store = store();
+    let mut volume = volume(&mut store, 1 << 20);
+    let f = file_of(&mut store, &mut volume, "f", fill, DAX_PAGE);
+    let m = volume.dax_map_read(&mut store, f).unwrap();
+    store.dax_guard(&m).unwrap();
+    prop_assert_eq!(
+      store.dax_scrub(&m),
+      DaxScrub::Clean,
+      "a freshly guarded block scrubs clean, so anything found below is the corruption and not the fixture"
+    );
+
+    let Some(before) = store.content.arena().bytes(m.block).map(<[u8]>::to_vec) else {
+      return Err(TestCaseError::reject("the mapped block has no bytes to corrupt"));
+    };
+    prop_assume!(!before.is_empty());
+    let at = usize::from(position) % before.len();
+    let was = before[at];
+    poison_a_byte(&mut store, m.block, at, was ^ mask);
+
+    prop_assert_eq!(
+      store.dax_scrub(&m),
+      DaxScrub::Healed,
+      "a flip at byte {} of {} is caught wherever it lands",
+      at,
+      before.len()
+    );
+    let Some(after) = store.content.arena().bytes(m.block).map(<[u8]>::to_vec) else {
+      return Err(TestCaseError::fail("the block vanished across the heal"));
+    };
+    prop_assert_eq!(after.len(), before.len(), "the heal kept the block's length");
+    let first_difference = before
+      .iter()
+      .zip(after.iter())
+      .position(|(a, b)| a != b);
+    prop_assert_eq!(
+      first_difference,
+      None,
+      "the heal restored every byte, not a prefix: corrupted byte {} of {}, first byte still wrong {:?}",
+      at,
+      before.len(),
+      first_difference
+    );
+  }
+}
