@@ -291,3 +291,142 @@ fn an_object_that_can_hold_a_huge_page_is_mapped_where_one_forms_and_collapses_t
      alone gave {advised}, collapse returned {asked}, shmem_enabled {shmem:?}"
   );
 }
+
+/// The environment variable that turns [`a_quiet_process_reports_what_a_placed_mapping_costs`] into the
+/// measuring child. Unset, that test does nothing, which is how it behaves inside the ordinary suite run.
+#[cfg(target_os = "linux")]
+const SLACK_CHILD: &str = "SLATES_TEST_SLACK_CHILD";
+
+/// The process's virtual size in bytes, from the first field of `statm` (pages).
+#[cfg(target_os = "linux")]
+fn virtual_bytes() -> usize {
+  std::fs::read_to_string("/proc/self/statm")
+    .ok()
+    .and_then(|statm| {
+      statm
+        .split_whitespace()
+        .next()
+        .and_then(|pages| pages.parse::<usize>().ok())
+    })
+    .map_or(0, |pages| pages.saturating_mul(PAGE))
+}
+
+/// The measuring half of [`a_placed_mapping_costs_a_page_of_slack_and_returns_every_byte_of_it`], run in a
+/// process of its own so that nothing else is allocating while it reads a process-wide figure. Does nothing
+/// unless the parent selected it, so an ordinary suite run passes straight over it.
+#[cfg(target_os = "linux")]
+#[test]
+#[cfg_attr(miri, ignore)] // a shared memory object is not modelled by Miri, as at `region.rs`
+fn a_quiet_process_reports_what_a_placed_mapping_costs() {
+  if std::env::var(SLACK_CHILD).is_err() {
+    return;
+  }
+  // Derived: a client's ring is far smaller than a huge page, which is the case the bound is about; sixty-four
+  // of them so the per-object slack stands well above the allocator's own movement.
+  const OBJECTS: usize = 64;
+  let each = PAGE.saturating_mul(16);
+  let before = virtual_bytes();
+  let mut held = Vec::new();
+  for sample in 0..OBJECTS {
+    let Ok(object) =
+      SharedObject::create(&object_name(&format!("slack{sample}")), each, Words::new())
+    else {
+      println!("SLACK refused");
+      return;
+    };
+    // SAFETY: this test is the object's only accessor, which is what `ExclusiveObject` promises.
+    held.push(Region::shared(
+      unsafe { ExclusiveObject::new(object) },
+      PAGE,
+    ));
+  }
+  let mapped = virtual_bytes().saturating_sub(before);
+  drop(held);
+  let kept = virtual_bytes().saturating_sub(before);
+  println!(
+    "SLACK {mapped} {kept} {} {OBJECTS}",
+    each.saturating_mul(OBJECTS)
+  );
+}
+
+/// §4.6 L1 — placing a mapping costs one grain of address space and gives every byte of it back.
+///
+/// A placed mapping reserves more address space than it maps, and two things about that have to be true or
+/// the placement is worse than the bug it fixed. It must give the reservation back when the object goes: a
+/// daemon opens an object per client session (`ipc/src/region.rs`), so a reservation outliving its owner
+/// would bleed address space for as long as the process ran. And the slack must be one *page* for an object
+/// too small to hold a huge page, not one huge page — i686 is a tested target with about 3 GB of address
+/// space to spend, and a huge page per session would spend it.
+///
+/// The figure is process-wide, so it is read in a **child process of its own**: measured first in-process,
+/// sixty-four ring-sized objects read as 153 MB because seven sibling tests were allocating 8 and 16 MiB
+/// objects at the same time, and the same measurement run alone read 4.5 MB. A test that only holds when it
+/// runs alone is not a test, so the parent re-invokes this binary for the one case, as `anchor.rs` and
+/// `reap.rs` do, and reads a tagged line out of it.
+#[cfg(target_os = "linux")]
+#[test]
+#[cfg_attr(miri, ignore)] // spawning the test binary is not modelled by Miri
+fn a_placed_mapping_costs_a_page_of_slack_and_returns_every_byte_of_it() {
+  let Ok(binary) = std::env::current_exe() else {
+    println!(
+      "SKIP a_placed_mapping_costs_a_page_of_slack_and_returns_every_byte_of_it: no path to re-invoke"
+    );
+    return;
+  };
+  let run = std::process::Command::new(binary)
+    .args([
+      "--exact",
+      "a_quiet_process_reports_what_a_placed_mapping_costs",
+      "--nocapture",
+    ])
+    .env(SLACK_CHILD, "1")
+    .output();
+  let Ok(run) = run else {
+    println!(
+      "SKIP a_placed_mapping_costs_a_page_of_slack_and_returns_every_byte_of_it: the child did not run"
+    );
+    return;
+  };
+  let printed = String::from_utf8_lossy(&run.stdout);
+  // Tagged, because libtest prints its own banner on the child's stdout before the role runs.
+  let Some(line) = printed.lines().find_map(|line| line.strip_prefix("SLACK ")) else {
+    panic!("the child reports what it measured; it printed {printed:?}");
+  };
+  let figures: Vec<usize> = line
+    .split_whitespace()
+    .filter_map(|word| word.parse().ok())
+    .collect();
+  let (Some(mapped), Some(kept), Some(asked), Some(objects)) = (
+    figures.first().copied(),
+    figures.get(1).copied(),
+    figures.get(2).copied(),
+    figures.get(3).copied(),
+  ) else {
+    println!("SKIP a_placed_mapping_costs_a_page_of_slack_and_returns_every_byte_of_it: {line:?}");
+    return;
+  };
+  let huge = slates_machine::facts::huge_page_bytes()
+    .and_then(|bytes| usize::try_from(bytes).ok())
+    .unwrap_or(0);
+  // The placement reserves one grain beyond the object, and the grain for an object this small is the page.
+  let allowed = asked.saturating_add(PAGE.saturating_mul(objects).saturating_mul(2));
+  assert!(
+    mapped >= asked,
+    "the objects are mapped at all: {mapped} bytes for {asked} asked (non-vacuity — a reading that saw \
+     nothing would pass the bound below for the wrong reason)"
+  );
+  assert!(
+    mapped <= allowed,
+    "a small object reserves a page of slack, not a huge page: {mapped} bytes of address space for {asked} \
+     asked over {objects} objects, which allows {allowed}; a huge-page grain would have cost about {}",
+    asked.saturating_add(huge.saturating_mul(objects))
+  );
+  // Derived: the allocator's own bookkeeping moves the figure a little either way, so the test is that the
+  // objects' address space came back, not that the number is identical to the byte.
+  let noise = asked.checked_div(8).unwrap_or(0);
+  assert!(
+    kept <= noise,
+    "dropping the objects gives their address space back: {kept} bytes still held of the {mapped} the \
+     mappings took, which is more than the {noise} the allocator's own movement allows"
+  );
+}
