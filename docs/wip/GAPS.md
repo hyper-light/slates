@@ -8557,3 +8557,36 @@ rather than the host, "sound only paired with B2" — and B2 is now wired, so th
 needs is a way to put chosen volumes in a shared zone instead of one each, which `DaxZones` keys by prefix and
 would key by pool. It is not built because it is a feature whose purpose is to *reduce* isolation for a
 deployment that wants that trade, and choosing to offer it is a product decision, not an implementation gap.
+
+### 2026-10-19: the three B2 bugs were a test harness unpinning twice — correcting the record
+
+Earlier today the four-layer chaos property reported three states where a guard or a sandbox row outlived what
+it described, and I fixed each at the consumer and wrote them up as security bugs. The fixes are right to
+keep. **The impact claims were wrong, and one question would have caught it: which production caller creates
+this state?**
+
+All three need a block whose pin reaches zero while a mapping of it is still live. Pins are already per
+*window handed out* — that is the 2026-10-18 map-storm fix, where `dax_map_*` pins again on every dedup hit —
+so reaching zero early takes **two unpins for one window**, and no production path does it: the device pairs
+`dax_revoke_pending` with `dax_release_after_unmap` and never calls `Bridge::dax_revoke`; client maps (A-135)
+get `dax_revoke` alone in `reap::drop_client`; `merge_service` revokes only mappings it is abandoning; and
+there is no client-facing release verb at all.
+
+The double-unpin was **the chaos harness's own** teardown step, calling `dax_revoke` *and*
+`dax_release_after_unmap` on one mapping — and it predates this session, in the older `chaos_step` too. Both
+are fixed to one unpin per window. Proven rather than argued: with the harness corrected, the chaos property
+is green at 4 × 4,000 cases **with the currency check removed**, where removing it previously failed on run 1.
+
+**What sent me down the wrong road was a stale design paragraph.** §4.6 item 2 still said the per-window pin
+fix was owed, eight days after `docs/bugs/2026-10-18-…map-storm…md` recorded it as done. I read the design,
+believed the defect was live, and had a ready-made explanation for every state the property reported. The
+design is now corrected, and it states the pairing callers must keep.
+
+**Three lessons, all about the same reflex.**
+1. A plausible cause that is *already written down* is the most dangerous kind, because it costs nothing to
+   believe. "Which caller does this?" is cheap and I asked it three bugs late.
+2. Keep the fixes anyway, but describe them correctly: a scrub that heals is a **write**, and checking the
+   entry is live, pinned and current is that write's own precondition — not a "just in case" path (#7), and
+   sound whatever future caller creates the state.
+3. When the design and a bug record disagree about whether something is fixed, the bug record won here. Both
+   are now consistent.

@@ -2797,11 +2797,17 @@ same-namespace host process is the first delivered case.
 >    `NoSpace` (`one_volumes_map_storm_does_not_deny_another_volume`, committed `#[ignore]`d as the reproduction of
 >    an open finding). Refusing a storm is a bound on *growth*; it is not fairness, and the tenant who fills a
 >    shared bound is not the tenant who pays for it. A fix that returned the live window for a repeat request was
->    built and withdrawn the same day — it shares one refcounted pin between two guest windows, so the first unmap
->    would unpin a block the second still maps. **A correct fix moves the pin from the mapping to the window**, so
->    the holder count tracks guest windows rather than registry entries, and that changes the invariant above;
->    until then the denial stands recorded rather than claimed away
->    (`docs/bugs/2026-10-18-one-volumes-dax-map-storm-denies-every-other-volume.md`).
+>    built and withdrawn the same day — it shared one refcounted pin between two guest windows, so the first
+>    unmap would unpin a block the second still maps. **The fix that stands moves the pin from the mapping to
+>    the window**: `dax_map_*` pins again on every dedup hit, so the holder count tracks guest windows rather
+>    than registry entries, and the denial is closed
+>    (`docs/bugs/2026-10-18-one-volumes-dax-map-storm-denies-every-other-volume.md`; this paragraph said the
+>    fix was still owed until 2026-10-19, when three bugs apparently caused by it turned out to be a test
+>    harness unpinning twice — the stale wording is what sent that investigation down the wrong road).
+>    **The pairing callers must keep:** `dax_revoke` is the synchronous teardown and unregisters *and* unpins;
+>    `dax_release_after_unmap` is phase two of the two-phase revoke, whose phase one (`dax_revoke_pending`)
+>    keeps the pin. One of the two per window, never both — the arena's holder count cannot tell whose pin a
+>    second unpin takes, so with two windows over one block it steals the other's.
 > 3. **Rowhammer / hardware co-location.** Two untrusted tenants whose writable DAX blocks land on physically
 >    adjacent DRAM rows face bit-flip risk at the silicon layer, independent of software isolation — slates cannot
 >    prevent the physics and does not claim to. The hardware floor stays the host/VMM's: ECC/Chipkill, DDR4/5 Target

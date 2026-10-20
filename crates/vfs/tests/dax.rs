@@ -2967,9 +2967,14 @@ fn chaos_step(
       }
     }
     4 => {
+      // One unpin per window. `dax_revoke` is the synchronous teardown: it unregisters *and* unpins, which is
+      // what a client's own map release does (`reap::drop_client`). Calling `dax_release_after_unmap` after it
+      // — phase two of the *two-phase* revoke, whose phase one is `dax_revoke_pending` and keeps the pin — is a
+      // second unpin, and the arena's holder count cannot tell whose pin it takes: with two windows over one
+      // block it steals the other's. This harness did exactly that until 2026-10-19, which is the only way the
+      // "live mapping over an unpinned block" states the layered chaos property reported were reachable.
       if let Some(mapping) = held.pop() {
         store.dax_revoke(&mapping);
-        store.dax_release_after_unmap(&mapping);
       }
     }
     5 => {
@@ -3150,7 +3155,6 @@ fn layers_step(
     4 => {
       if let Some(mapping) = held.pop() {
         store.dax_revoke(&mapping);
-        store.dax_release_after_unmap(&mapping);
       }
     }
     5 => {

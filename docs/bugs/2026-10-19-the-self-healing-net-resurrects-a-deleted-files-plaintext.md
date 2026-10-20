@@ -1,6 +1,9 @@
 # B2's self-healing net resurrects a deleted file's plaintext into freed memory
 
-**Status:** fixed (two changes, the same day — the first was insufficient and the chaos property said so). Found by `the_four_layers_under_chaos_never_heal_what_nothing_corrupted`
+**Status:** **corrected 2026-10-19, later the same day — see "What this document got wrong" at the end.** The
+unsoundness is real and the fixes stand as preconditions, but the state that triggers it is **not reachable in
+production**: it needed a double-unpin that only the test harness performed. The impact section below was
+written before that was checked, and overstated it. Found by `the_four_layers_under_chaos_never_heal_what_nothing_corrupted`
 on its second run, 2026-10-19 — the assertion was written for exactly this and fired within minutes of landing.
 
 ## What happens
@@ -64,8 +67,38 @@ describes; the first two alone let a real schedule through.
 This is still deliberately narrow. The shared pin stays recorded and owed: moving the pin from the mapping to
 the window is the correct repair and it changes the gate's invariant, which is a separate change.
 
+## What this document got wrong
+
+The sections above describe the unsoundness correctly and the fixes are right to keep. The **impact claim was
+wrong**, and finding that out took one question I should have asked before writing it: *which production
+caller creates this state?*
+
+The state needs a block whose pin reaches zero while a mapping of it is still live. Pins are per *window*
+handed out, not per registry entry — that is already the fix recorded in
+`docs/bugs/2026-10-18-one-volumes-dax-map-storm-denies-every-other-volume.md`, where `dax_map_*` pins again on
+every dedup hit. So reaching zero early requires **two unpins for one window**, and the production paths do
+not do it:
+
+- the virtio-fs device pairs `dax_revoke_pending` (unregisters, keeps the pin) with `dax_release_after_unmap`
+  (unpins) — one unpin per window, and it never calls the `Bridge::dax_revoke` verb at all;
+- a client's own maps (A-135) are torn down by `reap::drop_client` with `dax_revoke` alone — one unpin;
+- `merge_service` calls `dax_revoke` only on abandon paths, for a mapping it just minted and never released;
+- there is no client-facing "release this mapping" verb, so nothing drains `client.dax_maps` twice.
+
+**The double-unpin was the chaos harness's.** Its teardown step called `dax_revoke` *and*
+`dax_release_after_unmap` on one mapping. `dax_revoke` is the synchronous one-shot that unregisters **and**
+unpins; `dax_release_after_unmap` is phase two of the *two-phase* revoke whose phase one keeps the pin. Doing
+both is a second unpin, and the arena's holder count cannot tell whose pin it takes — with two windows over one
+block it steals the other's. The bug predates this session: the older `chaos_step` had the same step. Both are
+fixed.
+
+Proven rather than argued: with the harness corrected to one unpin per window, the chaos property is green at
+4 × 4,000 cases **with the currency check removed** — where, before, removing it failed on run 1.
+
 ## Impact
 
-Any shard running B2 (`Volume::enable_dax_integrity_guard`) where one inode had both a writable and a read-only
-DAX window at once and was then deleted. Before 2026-10-19 B2 had no production caller at all, so no deployed
-daemon could reach it; the window was between wiring B2 and this fix, which is the same day.
+**None in a deployed daemon.** No production caller double-unpins, and B2 had no production caller at all
+before the same day. The fixes stay as what they should have been described as from the start: **preconditions
+on an operation that writes memory**. A scrub that heals is a write, and checking that the entry it writes
+through is live, pinned and still its inode's content is that write's own precondition, not a "just in case"
+second path — cheap, and sound whatever future caller creates the state.
