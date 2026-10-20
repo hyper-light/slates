@@ -499,7 +499,8 @@ mod os {
   #[cfg(not(target_os = "linux"))]
   pub(crate) fn lock_bytes_whole(bytes: &mut [u8]) -> std::io::Result<()> {
     // SAFETY: as the Linux arm — a live mapping of the caller's, borrowed mutably for the call.
-    unsafe { rustix::mm::mlock(bytes.as_mut_ptr().cast(), bytes.len()) }.map_err(std::io::Error::from)
+    unsafe { rustix::mm::mlock(bytes.as_mut_ptr().cast(), bytes.len()) }
+      .map_err(std::io::Error::from)
   }
 
   /// Locks bytes `offset .. offset + len` of a mapping against swapping (the kernel rounds to whole pages) and,

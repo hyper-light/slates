@@ -817,38 +817,33 @@ unverified *lane* would not is that this is two crates added to a **proven** lan
 Windows runner that already builds everything they depend on — and if it does go red, that is the
 finding, found in CI rather than at the first tag.
 
-### 8a-dax-measure. The sandbox's huge-page check is a whole-mapping delta, so it refuses spans that are already backed (2026-10-20, OPEN — design call)
+### 8a-dax-measure. The sandbox asked the wrong oracle: a whole-mapping total, not the span (2026-10-20, closed)
 
-Fixing `8a-dax-place` below exposed the next layer. `DaxZone::verify_contiguous` decides whether a span
-really is one physical huge page by discarding it, reading the mapping's PMD-mapped bytes, faulting the
-span back in, reading again, and requiring the **growth** to be at least a huge page (then a
-`MADV_COLLAPSE` and a third reading). But `/proc/self/smaps` reports per **VMA**, not per span, so that
-growth is attributable only while nothing else about the mapping moves — and two things routinely do.
-Measured 2026-10-20 on Linux 6.12.76 (aarch64), instrumented at the refusal while the DAX suite ran its
-73 tests in parallel:
+Fixing `8a-dax-place` below exposed the next layer. `DaxZone::verify_contiguous` decided whether a span
+really is one physical huge page by reading the **mapping's** PMD-mapped bytes from `/proc/self/smaps`
+before and after faulting the span in, and requiring the difference to be at least a huge page. The span
+is not the mapping, and that cost the sandbox twice over. Measured 2026-10-20 on Linux 6.12.76 (aarch64)
+with the DAX suite's own 73 tests running in parallel, instrumented at every refusal point:
 
-- `before=4194304 after=4194304 collapsed=4194304 wanted=2097152` — no growth at all, because with
-  `enabled=[always]` the span came straight back as a huge page on fault. A span that **is** backed reads
-  as zero growth and is refused.
-- `before=8388608 after=4194304` — the total *fell* between two readings, the rest of the mapping having
-  been broken up under the suite's own memory pressure.
+- **No reading at all, the commonest refusal (`Q_NOMEASURE`, 9–11 per run).** The kernel merges a mapping
+  with an identical neighbour, and the parser matches an entry that begins *exactly* at the region's base.
+  After a merge none does, so the answer is `None` and the zone is refused — then cached as refused, which
+  repeated it 16–17 times a run.
+- **A difference that says nothing (`R_FINAL`).** Every refusal taken there had `MADV_COLLAPSE` reporting
+  **success** for the span, one of them while the mapping's total *fell* from 14 MiB to 4 MiB as its other
+  pages were broken up around it. The span was backed; the zone was refused anyway.
 
-Consequence: L1 is refused non-deterministically, and with it L2 and B2. Three identical runs of the DAX
-suite skipped 1, 1 and 3 tests, naming different ones each time, so the L1 coverage that runs on Linux is
-a coin flip rather than a gate. Worse for the product than for the suite: in a long-lived daemon with a
-warm arena, a span that is *already* huge-backed is the ordinary case, and that is exactly the case this
-refuses. Nothing claims an isolation it lacks — the refusal is conservative — but the defence is absent
-whenever it fires.
+Closed by asking the span's own oracle: `MADV_COLLAPSE` reports success only when every huge-aligned
+region of the range it is given is PMD-mapped, including one that already was, so it answers about the
+span and needs no `smaps` entry to exist. The reading is kept, no longer fatal when absent, as the leg for
+a kernel before Linux 6.1 that has no `MADV_COLLAPSE` to ask.
 
-Measured and rejected: advising the span alone, so the advice splits its VMA and `smaps` can report it by
-itself. The mapping is advised whole when it is made, so a sub-range advice changes no VMA flag and the
-kernel does not split — `huge_backed_bytes(span_address)` answered `None` (measured). Per-page attribution
-through `/proc/self/pagemap` is not open to us either: the PFN field reads zero without `CAP_SYS_ADMIN`,
-which R10 and banned item 4 refuse.
-
-What would settle it is the sandbox owning its **own mapping**, so its VMA is its own and the question is
-answered absolutely rather than as a difference. That is a §4.6 change — the arena hands out regions, and a
-sandbox is cut from one — so it is Ada's call, not mine.
+Effect on the gate, which is the point: the DAX suite's loud skips on Linux went from 3, 1, 0, 1, 2 across
+five runs to **0 across six**. Every L1, L2 and B2 test now runs on Linux instead of quietly opting out,
+so §4.6's coverage is a gate rather than a coin flip. An earlier reading of these numbers — that the kernel
+was genuinely declining under memory pressure, and that only a §4.6 redesign giving each sandbox its own
+mapping could fix it — was wrong, and the collapse verdict disproved it: no redesign was needed.
+Write-up: `docs/bugs/2026-10-20-the-sandbox-asked-the-mapping-not-the-span.md`.
 
 ### 8a-dax-place. The DAX sandbox was reserved by `mmap` address luck (2026-10-20, closed)
 

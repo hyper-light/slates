@@ -3758,7 +3758,9 @@ fn a_sandbox_in_a_shared_object_is_decided_by_the_host_not_by_where_mmap_put_the
     match volume.dax_migrate(&mut store, &m) {
       Ok(_) => reserved = reserved.saturating_add(1),
       Err(VfsError::NoPhysicalIsolation) => {}
-      Err(other) => panic!("a shift is either performed or refused for want of a sandbox: {other:?}"),
+      Err(other) => {
+        panic!("a shift is either performed or refused for want of a sandbox: {other:?}")
+      }
     }
   }
   println!(

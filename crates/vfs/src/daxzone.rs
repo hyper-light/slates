@@ -74,7 +74,8 @@ impl DaxZone {
   ///
   /// `NoSpace` where the arena cannot spare a huge page or the span cuts into fewer than [`MIN_SLOTS`] slots;
   /// [`VfsError::NoPhysicalIsolation`] where the span is not huge-page aligned, or where the kernel declined to
-  /// back it with a huge page after it was faulted in — the measurement that decides it, never the advice.
+  /// back it with a huge page after it was faulted in — `MADV_COLLAPSE`'s verdict on this span decides it,
+  /// never the advice, and never a difference in the whole mapping's total.
   ///
   /// Nothing is left allocated on a refusal.
   pub fn reserve(
@@ -127,13 +128,24 @@ impl DaxZone {
     })
   }
 
-  /// Whether `[base, base + huge)` of `region` really is one physical huge page, by measurement.
+  /// Whether `[base, base + huge)` of `region` really is one physical huge page, asked of the kernel.
   ///
   /// Two questions, both of which must be yes. First, is the span huge-page aligned in this process's address
-  /// space — a PMD entry maps an aligned span, so an unaligned one is at best two halves of two pages. Second, did
-  /// the kernel actually give it a huge page: the span is faulted in and the mapping's PMD-mapped bytes are read
-  /// before and after, so the growth is attributable to *this* span rather than to whatever the mapping held
-  /// already. Off Linux the question has no answer and the zone is refused, which is correct — macOS offers user
+  /// space — a PMD entry maps an aligned span, so an unaligned one is at best two halves of two pages. Second,
+  /// did the kernel actually give it a huge page.
+  ///
+  /// The second is put to `MADV_COLLAPSE`, which reports success only when every huge-page-aligned region of
+  /// the range it was given is PMD-mapped, including one that already was. That is an answer about **this
+  /// span**. The mapping's own `smaps` total is not, and was the wrong oracle twice over (measured 2026-10-20
+  /// on Linux 6.12.76, aarch64, under this suite's 73 tests in parallel): the kernel breaks up and reforms the
+  /// rest of a mapping for its own reasons, so a before-and-after difference credited to this span was
+  /// routinely swamped — every refusal taken that way had the collapse reporting success, one while the
+  /// mapping's total *fell* from 14 MiB to 4 MiB — and the kernel merges a mapping with an identical
+  /// neighbour, after which no `smaps` entry begins at the region's base and there is no reading at all, which
+  /// was the commonest refusal of the three. The reading is kept as the leg for a kernel before Linux 6.1,
+  /// which has no `MADV_COLLAPSE` to ask.
+  ///
+  /// Off Linux the question has no answer and the zone is refused, which is correct — macOS offers user
   /// programs no superpages and Windows large pages need a privilege R10 refuses to require.
   fn verify_contiguous(
     arena: &mut ChunkArena,
@@ -153,6 +165,12 @@ impl DaxZone {
     if address.checked_rem(huge).unwrap_or(1) != 0 {
       return Err(VfsError::NoPhysicalIsolation);
     }
+    // This check must stay, and must stay *before* the collapse below, because it is what gives that call's
+    // answer any meaning. `MADV_COLLAPSE` reports on the huge-aligned regions its range wholly covers, so a
+    // range that covers none of them has nothing to report and succeeds having done nothing: measured
+    // 2026-10-20 on Linux 6.12.76 (aarch64), a span of one huge page starting one page past a boundary came
+    // back successful with no huge page anywhere near it. Aligned and huge-sized, the range covers exactly one
+    // such region, and success means that region is PMD-mapped — which is the question.
     // Drop whatever already backs the span before measuring, so the measurement is *attributable*. The
     // mapping's PMD-mapped bytes are a whole-mapping total, so a reading taken over a span the arena had
     // already faulted counts pages this reservation did not get and the growth understates by exactly what was
@@ -162,10 +180,13 @@ impl DaxZone {
     if let Some(mapping) = arena.region_mut(region) {
       mapping.discard(base, huge);
     }
+    // Advisory, not decisive: `smaps` answers for a whole mapping, and the kernel merges a mapping with an
+    // identical neighbour, after which no entry begins at this region's base and there is no answer at all —
+    // measured 2026-10-20 under the DAX suite's own parallel tests, where that was the commonest refusal of
+    // all. So the reading is taken where it can be, and the span's own oracle below decides.
     let before = arena
       .region(region)
-      .and_then(slates_mem::region::Region::huge_backed_bytes)
-      .ok_or(VfsError::NoPhysicalIsolation)?;
+      .and_then(slates_mem::region::Region::huge_backed_bytes);
     let from_page = base.checked_div(page).unwrap_or(0);
     let to_page = base.saturating_add(huge).checked_div(page).unwrap_or(0);
     if let Some(mapping) = arena.region_mut(region) {
@@ -174,28 +195,44 @@ impl DaxZone {
     let wanted = u64::try_from(huge).unwrap_or(u64::MAX);
     let after = arena
       .region(region)
-      .and_then(slates_mem::region::Region::huge_backed_bytes)
-      .ok_or(VfsError::NoPhysicalIsolation)?;
-    if after.saturating_sub(before) >= wanted {
+      .and_then(slates_mem::region::Region::huge_backed_bytes);
+    let grew_by_a_page = |now: Option<u64>| {
+      now
+        .zip(before)
+        .is_some_and(|(now, before)| now.saturating_sub(before) >= wanted)
+    };
+    if grew_by_a_page(after) {
       return Ok(());
     }
     // The advice is a *preference*: the kernel grants it out of whatever contiguous memory it has at fault
     // time, so the same span comes back huge on a quiet machine and base-paged on a busy one — measured here
     // 2026-10-19, two of four reservations declined under 59 parallel tests on a host with 81 GB free. A
     // sandbox cannot be best-effort, so ask the kernel to do the compaction work now instead
-    // (`MADV_COLLAPSE`), and measure again. A kernel that does not know the advice, or cannot compact, simply
-    // leaves the second measurement short and the zone is refused.
-    if let Some(mapping) = arena.region_mut(region) {
-      mapping.collapse_huge(base, huge);
+    // (`MADV_COLLAPSE`).
+    //
+    // Its answer is the one to take, and it is a *better* answer than the reading above: `MADV_COLLAPSE`
+    // reports success only when every huge-page-aligned region of the range it was given is PMD-mapped —
+    // including one that already was — so it speaks about **this span**. `smaps` speaks about the whole
+    // mapping, and the kernel breaks up and reforms the rest of that mapping for its own reasons, so the
+    // difference between two readings of it says nothing reliable about the span between them. Measured
+    // 2026-10-20 on Linux 6.12.76 (aarch64), under the DAX suite's own 73 tests in parallel: every refusal
+    // taken here had the collapse reporting success, one of them while the mapping's total *fell* from 14 MiB
+    // to 4 MiB as its other pages were broken up. The span was backed, and the zone was refused anyway.
+    let collapsed_the_span = arena
+      .region_mut(region)
+      .is_some_and(|mapping| mapping.collapse_huge(base, huge));
+    if collapsed_the_span {
+      return Ok(());
     }
+    // A kernel too old to know `MADV_COLLAPSE` (before Linux 6.1) refuses it outright, and can still have
+    // given the span a huge page on fault, so there the mapping's own reading is all there is to go on.
     let collapsed = arena
       .region(region)
-      .and_then(slates_mem::region::Region::huge_backed_bytes)
-      .ok_or(VfsError::NoPhysicalIsolation)?;
-    if collapsed.saturating_sub(before) < wanted {
-      return Err(VfsError::NoPhysicalIsolation);
+      .and_then(slates_mem::region::Region::huge_backed_bytes);
+    if grew_by_a_page(collapsed) {
+      return Ok(());
     }
-    Ok(())
+    Err(VfsError::NoPhysicalIsolation)
   }
 
   /// The slot `block` occupies, if it is one of this zone's.

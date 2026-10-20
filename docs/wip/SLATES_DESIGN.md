@@ -2848,16 +2848,22 @@ same-namespace host process is the first delivered case.
 >      needs nothing, and whether the kernel actually gave one is a question `/proc/self/smaps` answers
 >      (`slates_machine::facts::huge_backed_bytes`); `madvise` returning `OK` is not an answer (measured on
 >      Linux 7.2: a 64 KiB and a 1 MiB mapping both take it and receive none).
->      The zone **discards the span, measures, faults it, and measures again**, so the growth is attributable to
->      that span. The discard is not tidiness: the PMD-mapped figure is a whole-mapping total, so a reading taken
->      over a span the arena had already faulted counts pages this reservation did not get, and the growth
->      understates by exactly what was there — which is how a span that really was one huge page read as short
->      (measured 2026-10-19; it was costing two to six of the sandbox tests per run).
->      And where the preference is not honoured the zone **asks the kernel to do the compaction work now**
->      (`MADV_COLLAPSE`, Linux 6.1) and measures a third time, because a sandbox cannot be best-effort. Measured
->      on fedora 6.19.10: the collapse honours the request even where `shmem_enabled` is `[never]` — it is a
->      request, not a preference — but it still needs the kernel to find the contiguous memory, so an isolated
->      reservation succeeded in three runs of eight on that host. A reservation that cannot be backed is refused,
+>      The zone discards the span and faults it back, and then **asks `MADV_COLLAPSE` about that span and takes
+>      its verdict** (Linux 6.1; shmem support 6.2). That call reports success only where every huge-aligned
+>      region of the range it was given is PMD-mapped, *including one that already was*, so it answers about the
+>      span. A whole-mapping `smaps` total cannot, and asking it that way was wrong twice over: the kernel
+>      reshapes the rest of a mapping, and merges a mapping with an identical neighbour, for reasons that have
+>      nothing to do with this reservation. Measured 2026-10-20 on Linux 6.12.76 (aarch64) under the DAX suite's
+>      own 73 tests in parallel, with a probe at every refusal point: the commonest refusal was **no reading at
+>      all** — after a merge no `smaps` entry begins at the region's base, 9–11 a run, then cached and repeated
+>      16–17 — and every refusal that did read had the collapse reporting **success**, one of them while the
+>      mapping's total *fell* from 14 MiB to 4 MiB as its other pages were broken up. The skips that cost "two
+>      to six of the sandbox tests per run" above, and the "three runs of eight" on fedora, were this and not
+>      the host declining. Asked about the span directly, the suite's loud skips on Linux went 3, 1, 0, 1, 2
+>      across five runs to **0 across six**. The collapse honours the request even where `shmem_enabled` is
+>      `[never]` — it is a request, not a preference. The `smaps` reading is kept, no longer fatal when absent,
+>      as the leg for a kernel before 6.1 that has no `MADV_COLLAPSE` to ask
+>      (`docs/bugs/2026-10-20-the-sandbox-asked-the-mapping-not-the-span.md`). A reservation that cannot be backed is refused,
 >      which is the only honest answer: physical contiguity is the host's to give.
 >      **A window is placed from its first byte, not its first shift.** `Volume::dax_map_write` puts the block
 >      on a sandbox row as it mints the window, so containment — the layer §4.6 leans on — never waits for the

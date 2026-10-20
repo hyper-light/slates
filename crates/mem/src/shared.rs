@@ -698,7 +698,6 @@ fn word_view<W: Word>(inner: &platform::Inner, offset: usize) -> Result<&W, MemE
 mod platform {
   use std::os::fd::OwnedFd;
 
-
   use super::Handoff;
   use crate::error::MemError;
 
@@ -762,7 +761,10 @@ mod platform {
       // SAFETY: `window` is this object's own live mapping of `len` bytes, placed in `map` and unmapped only by
       // `Drop`, so it is mapped for at least as long as this borrow.
       unsafe {
-        std::slice::from_raw_parts(std::ptr::with_exposed_provenance::<u8>(self.window), self.len)
+        std::slice::from_raw_parts(
+          std::ptr::with_exposed_provenance::<u8>(self.window),
+          self.len,
+        )
       }
     }
   }
