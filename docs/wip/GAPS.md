@@ -626,13 +626,29 @@ are retained with their scope; no documentation edit is an implementation accept
   `actions/runner-images` `images/windows/Windows2025-Readme.md`, image version 20261013.288.2):
   LLVM 20.1.8 is installed, `Microsoft.VisualStudio.Component.VC.Llvm.Clang` and
   `.ClangToolset` are present, and so is `Microsoft.VisualStudio.Component.VC.Tools.ARM64`, which
-  the cross-link needs. What is still unproven is the last hop — whether `cc` and aws-lc-sys's
-  own probe (it searches `clang-cl`, `clang-cl.exe`, `cl`, `cl.exe` on PATH,
-  `cc_builder.rs:1457`) find it in that environment. No workflow change here: adding an
-  unverified step to a workflow I cannot run is how this project has shipped red lanes before,
-  and the components being installed is a better reason to leave it alone than to patch it. The
-  cheap check before the first tag is a `workflow_dispatch` run of `release.yml`, which it
-  already supports.
+  the cross-link needs.
+
+  **The last hop is verified too (2026-10-21), by two independent routes — and the citation I
+  first gave for it was wrong.** `cc_builder.rs:1457` is aws-lc-sys's own unit test, not its
+  probe. The real logic is `cc_builder.rs:1103`: for a windows/aarch64/msvc target with no crate
+  `CC` set it calls `find_clang_cl()` and, failing that, only `emit_warning`s — it does not
+  hard-fail. `find_clang_cl()` (`main.rs:1221`) tries two things: it runs `clang-cl --version`,
+  resolving it on PATH; failing that it finds the Visual Studio installation through
+  `cc::windows_registry::find_tool` and looks for
+  `<VS>/VC/Tools/Llvm/{ARM64,x64}/bin/clang-cl.exe`.
+
+  The image satisfies both. Its LLVM installer ends with
+  `Add-MachinePathItem (Join-Path $installDir "bin")` and `Update-Environment`, with
+  `$installDir = "C:\Program Files\LLVM"` (`actions/runner-images`,
+  `images/windows/scripts/build/Install-LLVM.ps1:29`), so route one resolves; and the VS Clang
+  components above are exactly where route two looks. So the arm64 Windows release target's named
+  prerequisite is met, established from the image's own installer script rather than inferred
+  from its software list. What remains untested is the build itself, which needs the workflow to
+  run.
+
+  No workflow change here: adding an unverified step to a workflow I cannot run is how this
+  project has shipped red lanes before. The cheap check before the first tag is a
+  `workflow_dispatch` run of `release.yml`, which it already supports.
 
   **Deliberately not extended to `slates-vfs`, `slates-cluster` and `slates-server`.** They reach
   `slates-archive`, whose `zstd` is on for every dependent because the root declares it without
