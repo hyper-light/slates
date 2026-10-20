@@ -3772,3 +3772,146 @@ fn a_sandbox_in_a_shared_object_is_decided_by_the_host_not_by_where_mmap_put_the
      {reserved} of {OBJECTS} were reserved, addresses {addresses:#x?} (huge page {huge})"
   );
 }
+
+/// One tenant's shift, with the isolation checked against every other tenant's sandbox. `false` where this
+/// host backs no sandbox, which is the caller's signal to skip the whole arrangement loudly.
+fn shift_and_check_isolation(
+  store: &mut Store,
+  live: &mut [(Volume, Mapping, u8)],
+  index: usize,
+  prefixes: &[u16],
+  round: usize,
+) -> bool {
+  let Some((prefix, byte)) = live.get(index).map(|(v, _, b)| (v.prefix(), *b)) else {
+    return true;
+  };
+  let moved = {
+    let Some((volume, mapping, _)) = live.get_mut(index) else {
+      return true;
+    };
+    match volume.dax_migrate(store, mapping) {
+      Ok(moved) => moved,
+      Err(VfsError::NoPhysicalIsolation) => return false,
+      Err(other) => panic!("a shift is performed or refused for want of a sandbox: {other:?}"),
+    }
+  };
+  if let Some((_, mapping, _)) = live.get_mut(index) {
+    store.dax_release_after_unmap(mapping);
+    *mapping = moved;
+  }
+
+  // Its own sandbox holds the row, and not one other tenant's does — every pair, every shift.
+  let block = moved.block;
+  assert!(
+    store
+      .dax_zones
+      .of_volume(prefix)
+      .and_then(|zone| zone.slot_of(block))
+      .is_some(),
+    "round {round}: the tenant at prefix {prefix} landed inside its own sandbox"
+  );
+  for theirs in prefixes.iter().copied().filter(|held| *held != prefix) {
+    assert!(
+      store
+        .dax_zones
+        .of_volume(theirs)
+        .and_then(|zone| zone.slot_of(block))
+        .is_none(),
+      "round {round}: the row prefix {prefix} landed on is not inside prefix {theirs}'s sandbox — a \
+       neighbour's hammer would reach it there"
+    );
+  }
+  assert!(
+    all_bytes(&store.dax_read_raw(&moved, 8, 16), byte),
+    "round {round}: the tenant at prefix {prefix} reads its own byte {byte:#x} and nobody else's"
+  );
+  true
+}
+
+/// A tenant leaves and another takes its place, so the huge page the first held goes back and is handed out
+/// again — the arrangement a long-lived shard reaches, and the one no fixed pair can stand in for.
+fn churn_one_tenant(store: &mut Store, live: &mut Vec<(Volume, Mapping, u8)>) {
+  if let Some((mut going, mapping, _)) = live.pop() {
+    let prefix = going.prefix();
+    store.dax_release_after_unmap(&mapping);
+    store
+      .dax_zones
+      .release_volume(prefix, store.content.arena_mut());
+    let _ = going.destroy(store);
+  }
+  let Ok(mut arriving) = Volume::create(store, clone_config(99)) else {
+    return;
+  };
+  arriving.enable_writable_dax();
+  let file = file_of(store, &mut arriving, "f", 0x5E, DAX_PAGE);
+  if let Ok(mapping) = arriving.dax_map_write(store, file) {
+    live.push((arriving, mapping, 0x5E));
+  }
+}
+
+/// §4.6 **L1** — the isolation holds when the tenants are many and they come and go, not only for the one
+/// pair arranged in advance.
+///
+/// The two-tenant proof above pins one arrangement; a hostile neighbour picks any, and the arrangement a
+/// daemon actually reaches is tenants arriving and leaving on a shard whose huge pages get handed round. Do:
+/// give four volumes on one arena a writable DAX block each and shift them all, round after round; partway
+/// through, destroy one tenant outright and admit a new one onto whatever it left behind. Expect, after
+/// **every** shift: no row any tenant holds lies inside another's sandbox — checked across all pairs, not one
+/// — and every tenant reads back its own byte and nobody else's. The tenant admitted after the churn is held
+/// to the same rule, which is the recycled huge page's case.
+///
+/// Non-vacuity: the shifts are counted and the count asserted, so a run where the loop passed over nothing
+/// cannot read as a pass. Red-checked 2026-10-20 by drawing every tenant's row from the first zone instead of
+/// its own (`shift_target`): the test failed at round 0, on prefix 9.
+#[test]
+fn many_tenants_coming_and_going_never_land_in_each_others_sandboxes() {
+  let mut store = store_sandboxed();
+  // Derived: four tenants is the smallest number that makes "every pair" mean more than the pair the
+  // two-tenant proof already pins, and the fixture's eight huge pages hold four sandboxes and the content.
+  const TENANTS: usize = 4;
+  // Derived: enough rounds that a placement straying into a neighbour would be drawn, cheap enough to stay
+  // fast; the churn lands in the middle of them.
+  const ROUNDS: usize = 6;
+  let patterns = [0xA1u8, 0xB2, 0xC3, 0xD4];
+
+  let mut live: Vec<(Volume, Mapping, u8)> = Vec::new();
+  for tenant in 0..TENANTS {
+    let prefix = 7u16.saturating_add(u16::try_from(tenant).unwrap_or(0).saturating_mul(2));
+    let mut volume = Volume::create(&mut store, clone_config(prefix)).unwrap();
+    volume.enable_writable_dax();
+    let byte = patterns.get(tenant).copied().unwrap_or(0xEE);
+    let file = file_of(&mut store, &mut volume, "f", byte, DAX_PAGE);
+    let mapping = volume.dax_map_write(&mut store, file).unwrap();
+    live.push((volume, mapping, byte));
+  }
+
+  let mut shifts = 0usize;
+  let mut churned = false;
+  for round in 0..ROUNDS {
+    // Snapshotted before the shifts, and again after the churn, because the pairwise check reads every
+    // tenant's prefix while one tenant's mapping is being moved.
+    let prefixes: Vec<u16> = live.iter().map(|(volume, _, _)| volume.prefix()).collect();
+    for index in 0..live.len() {
+      if !shift_and_check_isolation(&mut store, &mut live, index, &prefixes, round) {
+        println!(
+          "SKIP many_tenants_coming_and_going_never_land_in_each_others_sandboxes: this host backed no \
+           transparent huge page, so §4.6's L1 sandbox cannot be reserved"
+        );
+        return;
+      }
+      shifts = shifts.saturating_add(1);
+    }
+    if !churned && round.saturating_mul(2) >= ROUNDS {
+      churn_one_tenant(&mut store, &mut live);
+      churned = true;
+    }
+  }
+  assert!(
+    churned,
+    "the churn happened, so the recycled huge page was covered"
+  );
+  assert!(
+    shifts >= TENANTS,
+    "the tenants actually shifted rather than the loop passing over nothing: {shifts} shifts"
+  );
+}
