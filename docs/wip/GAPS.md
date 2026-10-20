@@ -577,6 +577,18 @@ are retained with their scope; no documentation edit is an implementation accept
   graph once the root's `default-features = false` keeps `slates-machine`'s zstd out; no crate in
   the set has its own `build.rs`, and every third-party build script in it is pure Rust.
 
+  **i686 Windows was the same hole, found 2026-10-21 by asking the same question of the rest of
+  the release matrix.** `release.yml:35` ships `i686-pc-windows-msvc` and `publish-node.yml:47`
+  publishes for it, and no lane compiled it: CI's `i686` lane is **linux/386**, so the 32-bit
+  narrowing tests run on Linux while the Win32 shared-memory, IOCP and AFD code had never been
+  compiled at 32 bits on any platform — and `usize` is 32 bits there, which is where CLAUDE.md's
+  `usize::try_from` rule earns its keep. It lints clean over the same five crates, verified on
+  this machine and again on native `aarch64-unknown-linux-gnu` in a container. No defect found;
+  what changed is that it is now known rather than assumed.
+
+  The lane is therefore a matrix over both triples, `windows-cross-lint`
+  (`${{ matrix.target }} (cross lint, by compile)`), rather than an arm64-only one.
+
   It is now a permanent lane, `windows-arm64-lint` (`aarch64 windows (cross lint, by compile)`),
   verified on Linux before it landed rather than pushed and watched, because this project has
   shipped a red lane that way twice. **With a correction to how that verification was first
