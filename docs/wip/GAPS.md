@@ -476,11 +476,23 @@ are retained with their scope; no documentation edit is an implementation accept
   the scarcity multiplier to 1: the walk then yields `[(Raw, 65536, 65536), (Raw, 24464, 24464)]`
   and the test fails — which is also an independent confirmation that neutral worth means raw.
 
-  Still open, and blocked on the anchor question below rather than on test plumbing: a *daemon*
-  end to end writing a compressed archive. The archive is produced on the fleet replication path
-  (`crates/server/src/fleet.rs:2277`, `:2584`), every test anchor starts `--quick` so the suites
-  skip the 250 ms codec probe, and the derived policy chooses raw anyway. All three have to move
-  before such a test could assert anything, and the third is a design decision.
+  **The "--quick everywhere" half is closed too (2026-10-21).** Every anchor in the CLI suite
+  passed `--quick`, which sets `codecs: false`, so no test had ever booted a *daemon* that
+  measured a codec: `slates profile --json` covered the probe and nothing covered the daemon that
+  consumes it.
+  `crates/cli/tests/cli.rs::a_full_profile_daemon_derives_an_archive_policy_with_codec_candidates`
+  now starts an anchor **without** `--quick` and reads the daemon's own derivation lines off its
+  stderr, asserting the `codec = ...` line reports lz4 present and a non-empty zstd level list.
+  Red-checked by removing `features = ["codecs"]` from `crates/cli/Cargo.toml` — the exact defect
+  of 2026-10-20 — and the daemon prints what the container image used to ship:
+
+      slates daemon: codec = lz4 false, zstd levels [], byte worth 15 scaled ns
+
+  What stays open is only the last link, and it is a design decision rather than test plumbing: a
+  daemon writing a *compressed* archive. The archive is produced on the fleet replication path
+  (`crates/server/src/fleet.rs:2277`, `:2584`), and the derived policy chooses raw because on this
+  host the cheapest codec is about 159x from paying — the model working, not failing. That test
+  can only assert compression once the byte-worth anchor question below is settled.
 
   **Open, and larger than the bug above: the cost model's live signals are never fed.** Fixing
   the probe made a codec *reachable*; it did not make one *chosen*. Measured 2026-10-20 with the

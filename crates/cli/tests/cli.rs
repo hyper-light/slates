@@ -6388,3 +6388,67 @@ fn the_shipped_binary_measures_the_codecs_its_archive_policy_chooses_from() {
       .collect::<Vec<_>>()
   );
 }
+
+/// Shape: how many lines of the anchor's output the codec gate reads before giving up. The daemon prints one
+/// line per derived constant at boot and the codec line sits among them, so this only has to clear the
+/// derivation block with room for the anchor's own startup lines; a daemon that never printed it would
+/// otherwise block the test until the harness timed it out.
+const DERIVATION_LINES: usize = 512;
+
+/// D-17, §4.11, end to end through a real daemon: a daemon booted from a **full** profile derives an archive
+/// policy that has codec candidates in it. Do: start an anchor **without** `--quick` and read the daemon's own
+/// derivation lines off its stderr. Expect: the `codec = ...` line reports lz4 present and a non-empty list of
+/// zstd levels.
+///
+/// Every other anchor in this suite passes `--quick`, which sets `codecs: false` so the suites skip the 250 ms
+/// probe — so until this test no daemon in any test had ever *measured* a codec, and the whole path from the
+/// anchor's boot profile through `codec_policy` was exercised only in pieces. `slates profile --json` covers
+/// the probe; this covers the daemon that consumes it.
+///
+/// What it deliberately does not assert is that an archive comes out compressed, and that is the model working
+/// rather than a gap in the test: the policy weighs bytes saved against the measured worth of a byte, and on a
+/// host whose memcpy runs at 39.6 GB/s the cheapest codec is about 159x from paying, so `Raw` is the right
+/// answer here. Recorded with the numbers in GAPS §8, where the open question — whether an archive's byte
+/// should be valued at the rate it moves inside one host or at the rate of the link it was built to cross —
+/// belongs to Ada.
+#[test]
+fn a_full_profile_daemon_derives_an_archive_policy_with_codec_candidates() {
+  use std::io::{BufRead, BufReader};
+  let instance = "codec-derivation";
+  let child = slates()
+    .args(["--instance", instance, "anchor", "--shards", SHARDS])
+    .stdout(Stdio::null())
+    .stderr(Stdio::piped())
+    .spawn()
+    .unwrap();
+  let mut child = child;
+  let mut stderr = BufReader::new(child.stderr.take().unwrap());
+  let mut anchor = AnchorProcess { child, drain: None };
+
+  let mut codec = None;
+  for _ in 0..DERIVATION_LINES {
+    let mut line = String::new();
+    if stderr.read_line(&mut line).unwrap_or(0) == 0 {
+      break;
+    }
+    if line.contains("codec = lz4 ") {
+      codec = Some(line);
+      break;
+    }
+  }
+  // Keep draining so the daemon never blocks writing, however this test ends.
+  anchor.drain = Some(std::thread::spawn(move || {
+    let _ = std::io::copy(&mut stderr, &mut std::io::sink());
+  }));
+
+  let codec = codec.expect("the daemon printed its codec derivation at boot");
+  assert!(
+    codec.contains("codec = lz4 true"),
+    "a full-profile daemon measured the lz4 point: {codec}"
+  );
+  assert!(
+    !codec.contains("zstd levels []"),
+    "and measured zstd levels, so the archive policy has candidates to choose from: {codec}"
+  );
+  drop(anchor);
+}
