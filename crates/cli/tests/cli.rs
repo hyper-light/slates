@@ -6037,3 +6037,136 @@ fn land_plan(instance: &str, id: &str, attachment: &str, target: &str, bytes: &[
     manifest: json_string(&out, "manifest"),
   }
 }
+
+/// (1) A grant id nobody issued: the landing must not take an unknown number on trust.
+fn an_unissued_grant_is_refused(instance: &str, id: &str, target: &str) {
+  // `land` exits 0 both when it lands and when it *presents* a plan needing a grant, so the exit code is
+  // not the observable here — the disk is. An unknown grant must leave the target exactly as it was.
+  let (_code, out, refusal) = run(
+    instance,
+    &["land", id, target, "--grant", "999999999", "--json"],
+  );
+  assert_eq!(
+    shell(&format!("ls -A {target} | wc -l")).trim(),
+    "0",
+    "NOTHING WAS WRITTEN for a grant that was never issued (out: {out}, err: {refusal})"
+  );
+  assert!(
+    out.contains("\"grant_required\":true") || !refusal.is_empty(),
+    "and it either presents the plan again or refuses, never silently succeeds: {out} {refusal}"
+  );
+}
+
+/// (2) A one-shot grant, used, then presented again: consumed is not usable, and the replay writes nothing.
+fn a_consumed_one_shot_grant_cannot_land_again(
+  instance: &str,
+  issuer: &[(String, String)],
+  id: &str,
+  attachment: &str,
+  target: &str,
+  plan: &LandPlan,
+) {
+  let (code, _out, err) =
+    run_as_issuer(instance, issuer, &["grant", &plan.landing, &plan.manifest]);
+  assert_eq!(code, 0, "the one-shot grant is issued: {err}");
+  let (code, _out, err) = run(instance, &["land", id, target, "--grant", &plan.landing]);
+  assert_eq!(code, 0, "it lands once: {err}");
+  let _replayed = land_plan(instance, id, attachment, target, b"replayed");
+  let (code, _out, _refusal) = run(instance, &["land", id, target, "--grant", &plan.landing]);
+  assert_ne!(code, 0, "the same one-shot grant cannot land a second plan");
+  assert_eq!(
+    shell(&format!("cat {target}/note")).trim(),
+    "attacked",
+    "the replayed landing wrote nothing: the target still holds the granted plan"
+  );
+}
+
+/// (3) A grant issued for one volume, presented for another: the binding names the volume.
+fn a_grant_for_another_volume_does_not_authorize_this_one(
+  instance: &str,
+  issuer: &[(String, String)],
+  (id, attachment, target): (&str, &str, &str),
+  other: &str,
+) {
+  let (code, out, err) = run(instance, &["attach", other, "--write"]);
+  assert_eq!(code, 0, "{err}");
+  let other_attachment = value_of(&out, "attachment");
+  let elsewhere = build_output_dir("slates-attack-other");
+  let others_plan = land_plan(instance, other, &other_attachment, &elsewhere, b"other");
+  let (code, _out, err) = run_as_issuer(
+    instance,
+    issuer,
+    &["grant", &others_plan.landing, &others_plan.manifest],
+  );
+  assert_eq!(code, 0, "a grant for the other volume is issued: {err}");
+  let _mine = land_plan(instance, id, attachment, target, b"borrowed");
+  let (_code, out, refusal) = run(
+    instance,
+    &[
+      "land",
+      id,
+      target,
+      "--grant",
+      &others_plan.landing,
+      "--json",
+    ],
+  );
+  // As above, the disk is the observable: `land` exits 0 when it merely presents.
+  assert_eq!(
+    shell(&format!("cat {target}/note")).trim(),
+    "attacked",
+    "a grant issued for ANOTHER VOLUME wrote this one's target (out: {out}, err: {refusal})"
+  );
+  assert!(
+    out.contains("\"grant_required\":true") || !refusal.is_empty(),
+    "and it presents or refuses rather than silently succeeding: {out} {refusal}"
+  );
+}
+
+/// **The grant model under attack.** R10 rests on a grant meaning exactly what was approved and nothing more,
+/// and `Grants::check` enforces that through four bounds — the grant must exist, be `Issued` (not consumed,
+/// expired or revoked), bind the same consumer/volume/target, and for a one-shot scope match the very manifest
+/// the human saw. The happy paths are proven by
+/// `a_session_grant_auto_approves_the_next_landing_and_stops_at_its_target`; nothing drove the refusals through
+/// the CLI, so nothing would have noticed a bound quietly going missing.
+///
+/// Do: against a volume with a plan ready to land, present a grant that is (1) never issued, (2) a one-shot
+/// already consumed by its landing, (3) issued for a **different volume**, and (4) past its term. Expect:
+/// every one refused, and **the target untouched after all of them** — the assertion that makes the rest
+/// meaningful, since a refusal that still wrote would be worse than no gate.
+#[test]
+fn a_grant_that_does_not_cover_the_landing_is_refused_and_writes_nothing() {
+  if std::env::var_os("SLATES_TEST_CLI").is_none() {
+    eprintln!(
+      "skipping the grant-attack flow: set SLATES_TEST_CLI=1 to run it (an anchor and its daemon)"
+    );
+    return;
+  }
+  let instance = format!("cli-grantattack-{}", std::process::id());
+  let (anchor, issuer) = start_anchor_with_issuer_surface(&instance);
+  let Some(issuer) = issuer else {
+    println!(
+      "SKIP a_grant_that_does_not_cover_the_landing_is_refused_and_writes_nothing: this platform publishes \
+       no issuer surface through the environment, so no separate process can issue a grant"
+    );
+    return;
+  };
+  let target = build_output_dir("slates-attack-target");
+  let id = created_volume(&instance, "attackvol");
+  let other = created_volume(&instance, "othervol");
+  let (code, out, err) = run(&instance, &["attach", &id, "--write"]);
+  assert_eq!(code, 0, "{err}");
+  let attachment = value_of(&out, "attachment");
+
+  let plan = land_plan(&instance, &id, &attachment, &target, b"attacked");
+  assert!(plan.required, "the plan presents");
+  an_unissued_grant_is_refused(&instance, &id, &target);
+  a_consumed_one_shot_grant_cannot_land_again(&instance, &issuer, &id, &attachment, &target, &plan);
+  a_grant_for_another_volume_does_not_authorize_this_one(
+    &instance,
+    &issuer,
+    (&id, &attachment, &target),
+    &other,
+  );
+  drop(anchor);
+}

@@ -8682,3 +8682,21 @@ began skipping. The difference is structural — Linux hands its segment to chil
 Windows publish a name — so it is now a paired `#[cfg]` in `read_issuer_surface`, which cannot be wrong about
 the order of two log lines. Twice in two days a plausible bound beat a stated fact; the `cfg` is the stated
 fact.
+
+### 2026-10-20: the grant model under attack, and an exit code that is not the observable
+
+R10 rests on a grant meaning exactly what was approved. `Grants::check` enforces four bounds — the grant must
+exist, be `Issued`, bind the same consumer/volume/target, and (one-shot) match the manifest the human saw —
+and the happy paths now have a test, but nothing drove the **refusals** through the CLI, so a bound could have
+gone missing unnoticed. `a_grant_that_does_not_cover_the_landing_is_refused_and_writes_nothing` drives three:
+a grant id nobody issued, a one-shot grant replayed after its landing consumed it, and a grant issued for a
+**different volume**. Each is refused and, the assertion that makes the others meaningful, **the target is
+untouched after all of them**.
+
+**Writing it exposed a trap in my own assertions.** `slates land` exits **0 both when it lands and when it
+merely presents** a plan needing a grant, so `assert_ne!(code, 0)` is not "it was refused" — it is "it did not
+present", which is the opposite of what an attack test wants. Two of the three phases asserted the exit code
+and passed for the wrong reason until the disk check caught them. The observable for a landing is **the
+target**, never the exit status; the test now says so at both sites. This is the same shape as the pin check
+that was necessary but not sufficient: an assertion that can pass for a reason other than the one intended is
+not evidence.
