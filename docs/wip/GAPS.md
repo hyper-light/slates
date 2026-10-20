@@ -8812,3 +8812,30 @@ harmless, where the old behaviour's failure mode was a working configuration per
 Verified end to end on fedora 6.19.10: the attach records the bind and reports
 `shared_with_other_users=false`, emits the runtime-spec entry, and a rootless podman container reads the file
 through that very bind. macOS: server lib 176/176, CLI 24/24, recovery 39/39, workspace clippy and xtask clean.
+
+### 2026-10-20: the OCI bind attacked after the gate came out, and Windows proven unreachable from here
+
+**Removing a gate is the moment to prove its neighbours still stand**, because a removal that quietly took one
+with it looks exactly like a removal that worked.
+`removing_the_sharing_gate_left_every_other_oci_refusal_standing` attacks the attach path with the
+`MountNotShared` refusal gone: a plain directory that is no mount, a path *inside* the mount rather than the
+mount point, **another volume's** mount, and the real mount after it has been unmounted. All four are refused
+with their own reasons and record nothing; between them the honest bind still succeeds and reports
+`shared_with_other_users=false`, the fact a rootful harness checks. Ran on fedora 6.19.10 (Linux is where the
+FUSE mount exists); CLI suite 38/38 there and 24/24 on macOS, no leftover daemons or mounts.
+
+That also gives the OCI CLI path its **first Linux coverage** — the two pre-existing OCI CLI tests both skip
+there ("skipping OCI lifecycle", "skipping T-4.13's container leg"), so until now nothing exercised
+`attach --oci` against a real kernel mount in CI's own Linux lane.
+
+**Native Windows is unreachable from this session, proven rather than asserted.** The `jupiter` runner is
+connected and idle, but every command form fails identically — `cmd /c cargo --version`,
+`powershell -Command cargo --version` and a bare `cargo --version` all return
+`WSL (N - Relay) ERROR: CreateProcessCommon:875: execvpe(/bin/bash) failed: No such file or directory`. kiln
+wraps every command in `/bin/bash` through a WSL relay whose distro has no bash, so the shell cannot be
+chosen around. Windows coverage therefore remains: the `x86_64-pc-windows-gnu` cross-lint (which now includes
+`slates-vfs --all-targets`, so the DAX tests compile there) plus CI's native `windows-lint` lane. **Fixing the
+relay is a change to Ada's machine and hers to make.**
+
+For the record on the arch question: this host *is* arm64 macOS, so every "macOS" run in these entries is
+`aarch64-apple-darwin`. arm64 Windows has no runner and no cross-lint target configured.

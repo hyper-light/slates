@@ -6170,3 +6170,130 @@ fn a_grant_that_does_not_cover_the_landing_is_refused_and_writes_nothing() {
   );
   drop(anchor);
 }
+
+/// **The OCI bind under attack, after the `MountNotShared` refusal was removed.** Taking a gate out is the
+/// moment to prove the gates beside it still stand, because a removal that quietly took a neighbour with it
+/// looks exactly like a removal that worked. Every check that is slates' own must still refuse: the source
+/// really is *this* volume's mount, it is a mount at all, and it is still there.
+///
+/// Do: against a volume with a live FUSE mount, ask to bind (1) a plain directory that is no mount, (2) a
+/// path inside the mount rather than the mount point, (3) **another volume's** mount, and (4) the real mount
+/// after it has been unmounted. Expect: each refused with its own reason and **no attachment recorded for
+/// it**; and between them, the honest bind still succeeds and reports `shared_with_other_users=false`, which
+/// is the fact a rootful harness checks.
+#[cfg(target_os = "linux")]
+#[test]
+fn removing_the_sharing_gate_left_every_other_oci_refusal_standing() {
+  if !linux_fuse_mount_runs() {
+    return;
+  }
+  let instance = format!("cli-ociatk-{}", std::process::id());
+  let anchor = start_anchor(&instance);
+  let mine = created_volume(&instance, "mine");
+  let theirs = created_volume(&instance, "theirs");
+
+  let mount = MountPoint {
+    path: fresh_mount_point(),
+  };
+  fuse_mount_and_check(&instance, &mine, &mount.path);
+  let other_mount = MountPoint {
+    path: fresh_mount_point(),
+  };
+  fuse_mount_and_check(&instance, &theirs, &other_mount.path);
+  let plain = build_output_dir("slates-ociatk-plain");
+
+  // (1) A plain directory is no mount, so there is nothing to bind.
+  let (code, out, err) = run(
+    &instance,
+    &[
+      "attach",
+      &mine,
+      "--read",
+      "--oci-source",
+      &plain,
+      "--oci-destination",
+      "/vol",
+    ],
+  );
+  assert_ne!(code, 0, "a plain directory is refused: {out}");
+  assert!(
+    err.contains("NotAMountPoint") || err.contains("ChosenPathUnavailable"),
+    "and refused as 'no mount here', not something vaguer: {err}"
+  );
+
+  // (2) A path *inside* the mount is not the mount point.
+  let inside = format!("{}/inside", mount.path);
+  shell(&format!("mkdir -p {inside}"));
+  let (code, _out, err) = run(
+    &instance,
+    &[
+      "attach",
+      &mine,
+      "--read",
+      "--oci-source",
+      &inside,
+      "--oci-destination",
+      "/vol",
+    ],
+  );
+  assert_ne!(
+    code, 0,
+    "a directory inside the mount is not the attachment"
+  );
+  assert!(!err.is_empty(), "and it says so: {err}");
+
+  // (3) Another volume's mount does not bind this volume, however real a mount it is.
+  let (code, _out, err) = run(
+    &instance,
+    &[
+      "attach",
+      &mine,
+      "--read",
+      "--oci-source",
+      &other_mount.path,
+      "--oci-destination",
+      "/vol",
+    ],
+  );
+  assert_ne!(code, 0, "another volume's mount does not bind this one");
+  assert!(!err.is_empty(), "and it says so: {err}");
+
+  // The honest bind still works, and reports the fact a rootful harness needs.
+  let (code, out, err) = run(
+    &instance,
+    &[
+      "attach",
+      &mine,
+      "--read",
+      "--oci-source",
+      &mount.path,
+      "--oci-destination",
+      "/vol",
+    ],
+  );
+  assert_eq!(code, 0, "the real mount binds: {err}");
+  assert!(
+    out.contains("shared_with_other_users=false"),
+    "and reports that the source is not shared, which is what a rootful runtime must check: {out}"
+  );
+
+  // (4) Once the mount is gone, the same source binds nothing.
+  drop(other_mount);
+  let gone = mount.path.clone();
+  drop(mount);
+  let (code, _out, err) = run(
+    &instance,
+    &[
+      "attach",
+      &mine,
+      "--read",
+      "--oci-source",
+      &gone,
+      "--oci-destination",
+      "/vol",
+    ],
+  );
+  assert_ne!(code, 0, "an unmounted source binds nothing");
+  assert!(!err.is_empty(), "and it says so: {err}");
+  drop(anchor);
+}
