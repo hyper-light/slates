@@ -457,6 +457,41 @@ are retained with their scope; no documentation edit is an implementation accept
   the policy under test is still `raw_only()`. One full-profile end-to-end test that archives a
   compressible volume and asserts encoded chunks would close it.
 
+  **arm64 Windows, measured 2026-10-20.** Two claims in the bullet above were stale. There is no
+  `cross-lint` lane in CI: the jobs are `gates`, `live-guest`, `sdk`, `windows-lint`, `callgrind`,
+  `i686`, `miri-and-loom`, `windows-nightly`, `conformance`, `shuttle-nightly`, `tsan-nightly`
+  and `kind`, and none of them passes `--target`. And the earlier arm64 attempt used
+  `aarch64-pc-windows-gnullvm`, which fails in zstd-sys; the right triple,
+  `aarch64-pc-windows-msvc`, was already installed.
+
+  What arm64 Windows can actually add is now bounded by measurement: exactly one file in the
+  workspace is architecture-conditional, `crates/wire/src/crc32c.rs` (three `target_arch =
+  "x86_64"` and two `target_arch = "aarch64"` sites; every other crate, DAX included, has none).
+  Its aarch64 arm — `std::arch::is_aarch64_feature_detected!("crc")`, `__crc32cb`/`__crc32cd` and
+  `#[target_feature(enable = "crc")]` — compiles for `aarch64-pc-windows-msvc`, checked with
+  `rustc` directly on that shape.
+
+  The real lint now passes from this machine, `--all-targets` and `-D warnings` clean over
+  `slates-wire`, `slates-mem`, `slates-rt`, `slates-ipc` and `slates-machine` (44 s):
+
+      cargo clippy -p slates-wire -p slates-mem -p slates-rt -p slates-ipc --all-targets \
+        --target aarch64-pc-windows-msvc --features slates-machine/pure-hash -- -D warnings
+
+  `pure-hash` is needed because BLAKE3's C and NEON sources are the only remaining C in that
+  graph once the root's `default-features = false` keeps `slates-machine`'s zstd out; no crate in
+  the set has its own `build.rs`, and every third-party build script in it is pure Rust.
+
+  **Deliberately not extended to `slates-vfs`, `slates-cluster` and `slates-server`.** They reach
+  `slates-archive`, whose `zstd` is on for every dependent because the root declares it without
+  `default-features = false`, so a cross-check of them needs a C toolchain for the target.
+  Making it switchable is a two-line change and was rejected on evidence: those crates contain no
+  architecture-conditional code at all, so arm64 adds no coverage x86_64 Windows does not already
+  give natively in CI, while an archive built without `zstd` encodes a zstd verdict as LZ4 and
+  **refuses to decode a peer's zstd chunk** (`ArchiveError::BadPayload`,
+  `crates/archive/src/archive.rs:634`). That is the same silent-off-switch shape as the codec bug
+  above, with a worse failure mode, and it would need its own production gate before the switch
+  could be trusted. Revisit if architecture-conditional code ever lands in those crates.
+
   Still open from the same root: `slates-archive` is declared at the root **without**
   `default-features = false`, so its `zstd` feature is on for every dependent and zstd-sys
   resolves for any cross-target check that includes `slates-vfs`, `slates-cluster` or

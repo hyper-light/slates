@@ -6347,4 +6347,20 @@ fn the_shipped_binary_measures_the_codecs_its_archive_policy_chooses_from() {
       .map(|point| (point.codec.as_str(), point.level))
       .collect::<Vec<_>>()
   );
+
+  // The rest of the wiring, in the same test because the measured points are only worth having if
+  // the daemon's own derivation turns them into candidates. This is the step the bug made
+  // unobservable: `codec_policy` reads `profile.codecs`, and an empty list there is indistinguishable
+  // from a machine where no codec was worth it, so the policy went to `raw_only()` and every chunk
+  // was stored raw with nothing to show for it.
+  let config = slates_server::config::DaemonConfig::derive(&profile, "codec-gate", Some(1));
+  assert!(
+    config.codec.has_codecs(),
+    "the derived archive policy has a candidate to choose from"
+  );
+  assert!(
+    !config.codec.zstd.is_empty(),
+    "and zstd levels among them, so D-17's ratio codec can be chosen; lz4 present: {}",
+    config.codec.lz4.is_some()
+  );
 }
