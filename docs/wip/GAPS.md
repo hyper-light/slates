@@ -7486,12 +7486,39 @@ its own page table and never calls the daemon), so the defense had to be at the 
      any window the device no longer backs (its discarded result is deliberate and the comment above it says
      why — the lapse is folded into the pass below, not lost).
 
-     So the question is one of *ordering across hosts*, not of a missing mechanism: whether a remote merge,
-     `advance` or landing can reclaim content between that reclaim and the local revoke completing. **No test
-     anywhere pairs a remotely-originated advance with a live DAX window** — `crates/server/tests/fleet.rs` and
-     `recovery.rs` do not mention DAX at all, and `revalidate_windows` is exercised only in the in-process
-     device suite. The local path is origin-agnostic (R8's one code path), which is the reason to expect it
-     holds and not the evidence that it does.
+     So the question is one of *ordering*: whether the block can be reclaimed before the revoke completes.
+
+     **Closed 2026-10-21, and it was not a coverage gap — it was two defects.** Following
+     `revalidate_windows` down to the teardown it shares with every other revoke (`teardown_dax_window`)
+     found the ordering broken in both of its arms:
+
+     - *Local placer.* `let _ = cache.unmap(..)` followed by an unconditional
+       `dax_release_after_unmap`. A refused unmap leaves the window mapped and the block went back to the
+       arena anyway. `mmap(MAP_FIXED)` over a sub-range splits a VMA, so the unmap can fail with `ENOMEM`
+       at `vm.max_map_count` — which a device with many live windows walks toward by doing exactly this.
+       Fixed in `45937ac8`; red-checked (restoring the old code fails the test with `0 pinned`).
+     - *Message placer (the out-of-process VMM, so crosvm and QEMU).* It unpinned on **any**
+       `begin_unmap` refusal, under a comment saying a failure means the channel is gone. Only
+       `Channel(..)` means that. `TooManyOutstanding` means the ring is at its bound with the channel
+       alive and the front end still holding the window; `BadRange` means the unmap was never attempted.
+       **An advance is how this is reached without a hostile guest** — `revalidate_windows` tears every
+       stale window in one pass and each `begin_unmap` takes an outstanding slot, so a volume whose stale
+       windows outnumber the bound overflows it partway through, and every window past that point was
+       unpinned while still mapped. Fixed in `c4343670`.
+
+     Five tests now hold the property, **all run on Linux** (arm64 container, 41 passed, 0 failed):
+     `a_revoke_whose_unmap_is_refused_keeps_the_block_pinned`,
+     `a_message_based_teardown_holds_the_block_until_the_front_end_acks_the_unmap`,
+     `a_teardown_refused_short_of_a_dead_channel_keeps_the_block_pinned`,
+     `an_advance_that_tears_a_window_balances_its_pin` and
+     `an_advance_revalidate_tears_the_stale_window_and_keeps_the_current_one`.
+
+     **On the origin of the advance**, which this entry previously treated as the open part: it does not
+     reach the teardown. `revalidate_windows` is handed the device's current view and compares its windows
+     against it; nothing in that path knows or can know whether the advance it is reacting to began with a
+     local write or a remote merge. That is R8's one code path, and it is why a fleet-originated test would
+     exercise the same function a third time rather than a different one. Recorded as a deliberate
+     non-test, not an omission.
 
 3. **File-shape scope and the open-frontier rule (2026-10-16).** DAX maps a chunk only in its **open (plaintext)**
    representation; a **sealed** chunk (AES-GCM at-rest, A-92/A-99) reads over **FUSE_READ** — a guest's MMU would read
