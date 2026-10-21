@@ -279,6 +279,23 @@ box shared with two other builds — timings are not benchmarks)
    than the volume's capacity or the content arena, since DAX maps arena blocks and can never usefully exceed
    either, and aligns it to the mapping alignment. No window, no DAX: the device then serves plain FUSE.
 
+   **The Linux protocol, decided from the existing daemon→client pattern (`Control::send_mapping`).** The client
+   sends the descriptor up the control socket **first**, in one `sendmsg` with `SCM_RIGHTS`, tagged with the request
+   id of the attach it is about to submit; only then does it write the attach to the ring. `sendmsg` returns once the
+   kernel has queued the message, so by the time the daemon serves the ring request the descriptor is waiting — the
+   daemon never waits on the socket. The reverse of `send_mapping`'s rule holds: **a descriptor from a client is
+   hostile input** (a §4.13 consumer is an untrusted process of this uid). So the daemon, before using it:
+   - receives into a fixed ancillary buffer sized for exactly one descriptor, and treats `MSG_CTRUNC` or any count
+     but one as a refusal — closing every descriptor that did arrive, so a flood cannot exhaust its table;
+   - `fstat`s it and refuses anything that is not a stream socket, so a regular file or a pipe is never mistaken
+     for a device channel;
+   - sets it non-blocking and gives it to the device task alone, so a peer that never drains can stall only its own
+     device, never the shard;
+   - keeps at most one unclaimed descriptor per client, bound to one request id, and drops it if the ring request
+     that claims it does not arrive with the matching id — a bounded stash, never a queue (banned item 8).
+   The descriptor then **moves** to the volume's owner shard over the existing bounded cross-shard channel (R2),
+   where the device is served by the code the in-process path already uses.
+
    **Build order:** (a) Linux, where the handoff machinery exists — the verb, admission, lifetime, recovery,
    vhost-user, with the existing in-process tests as the oracle's other leg; (b) the shards framing on the same
    verb; (c) DAX as the per-attach option, then the capability report says advertised when a window was given;
