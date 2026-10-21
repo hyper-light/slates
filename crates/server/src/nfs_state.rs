@@ -316,6 +316,7 @@ fn file_op(change: FileChange) -> Op {
         other: record.other,
         clientid: record.clientid,
         owner: record.owner,
+        uid: record.uid,
         fh: record.fh,
         access: record.share.access,
         deny: record.share.deny,
@@ -402,6 +403,7 @@ fn open_of(record: &NfsOpenRecord) -> OpenRecord {
     other: record.other,
     clientid: record.clientid,
     owner: record.owner.clone(),
+    uid: record.uid,
     fh: record.fh.clone(),
     share: Share {
       access: record.access,

@@ -22,6 +22,10 @@ const LEASE: u64 = 90_000_000_000;
 /// Shape: see [`LEASE`].
 const QUIET: u64 = LEASE;
 /// Format: the two clients.
+/// The uid every open in these tests is made by. They exercise delegation, not principals, so one
+/// user makes every open and the per-principal open identity (`v4::files::OpenKey`) never splits one.
+const OPENER: u32 = 0;
+
 const A: u64 = 1;
 /// Format: see [`A`].
 const B: u64 = 2;
@@ -73,23 +77,23 @@ fn owner() -> FileState {
 fn opens_past_the_bound_are_refused_without_starving_the_owner() {
   let mut files = FileState::new(owner_tag(0, 1), 3, 3);
   files
-    .open(A, b"a".to_vec(), &handle(10, 1), read_only())
+    .open(A, b"a".to_vec(), OPENER, &handle(10, 1), read_only())
     .unwrap();
   files
-    .open(A, b"a".to_vec(), &handle(11, 1), read_only())
+    .open(A, b"a".to_vec(), OPENER, &handle(11, 1), read_only())
     .unwrap();
   files
-    .open(A, b"a".to_vec(), &handle(12, 1), read_only())
+    .open(A, b"a".to_vec(), OPENER, &handle(12, 1), read_only())
     .unwrap();
   assert_eq!(files.open_count(), 3, "the table is full at its bound");
   // A fourth distinct file is refused NOSPC, not admitted past the bound.
   assert_eq!(
-    files.open(A, b"a".to_vec(), &handle(13, 1), read_only()),
+    files.open(A, b"a".to_vec(), OPENER, &handle(13, 1), read_only()),
     Err(Nfsstat4::Nospc)
   );
   // An upgrade of an open the client already holds still succeeds and adds no entry.
   files
-    .open(A, b"a".to_vec(), &handle(10, 1), read_write())
+    .open(A, b"a".to_vec(), OPENER, &handle(10, 1), read_write())
     .unwrap();
   assert_eq!(files.open_count(), 3, "an upgrade is not a new open");
   // A conflicting share from another owner is told apart from exhaustion, even with the table full.
@@ -97,6 +101,7 @@ fn opens_past_the_bound_are_refused_without_starving_the_owner() {
     files.open(
       B,
       b"b".to_vec(),
+      OPENER,
       &handle(10, 1),
       Share {
         access: share::READ,
@@ -117,7 +122,9 @@ fn opens_past_the_bound_are_refused_without_starving_the_owner() {
 fn locks_past_the_bound_are_delayed_not_admitted() {
   let mut files = FileState::new(owner_tag(0, 1), 8, 3);
   let fh = handle(10, 1);
-  let open = files.open(A, b"a".to_vec(), &fh, read_write()).unwrap();
+  let open = files
+    .open(A, b"a".to_vec(), OPENER, &fh, read_write())
+    .unwrap();
   let range = |start| LockRequest::Lock {
     kind: LockKind::Write,
     range: Range::of(start, 10).unwrap(),
@@ -166,7 +173,9 @@ fn locks_past_the_bound_are_delayed_not_admitted() {
 fn a_read_only_open_is_delegated_unless_another_client_writes_the_file() {
   let mut files = owner();
   let fh = handle(10, 1);
-  files.open(A, b"a".to_vec(), &fh, read_only()).unwrap();
+  files
+    .open(A, b"a".to_vec(), OPENER, &fh, read_only())
+    .unwrap();
   let delegation = files
     .delegate_read(A, &fh, 0, QUIET)
     .expect("A's read-only open is delegated");
@@ -175,7 +184,9 @@ fn a_read_only_open_is_delegated_unless_another_client_writes_the_file() {
     Some(delegation),
     "the same delegation again"
   );
-  files.open(B, b"b".to_vec(), &fh, read_write()).unwrap();
+  files
+    .open(B, b"b".to_vec(), OPENER, &fh, read_write())
+    .unwrap();
   assert_eq!(
     files.delegate_read(3, &fh, 2, QUIET),
     None,
@@ -190,7 +201,9 @@ fn a_read_only_open_is_delegated_unless_another_client_writes_the_file() {
 fn a_conflicting_change_recalls_once_and_waits_until_the_return() {
   let mut files = owner();
   let fh = handle(10, 1);
-  files.open(A, b"a".to_vec(), &fh, read_only()).unwrap();
+  files
+    .open(A, b"a".to_vec(), OPENER, &fh, read_only())
+    .unwrap();
   let delegation = files.delegate_read(A, &fh, 0, QUIET).unwrap();
   assert!(
     !files.recall(&fh, Some(A), Conflict::Change, 1).waiting,
@@ -224,7 +237,9 @@ fn a_conflicting_change_recalls_once_and_waits_until_the_return() {
 fn a_recalled_file_is_not_delegated_again_within_the_quiet_period() {
   let mut files = owner();
   let fh = handle(10, 1);
-  files.open(A, b"a".to_vec(), &fh, read_only()).unwrap();
+  files
+    .open(A, b"a".to_vec(), OPENER, &fh, read_only())
+    .unwrap();
   let delegation = files.delegate_read(A, &fh, 0, QUIET).unwrap();
   files.recall(&fh, Some(B), Conflict::Change, 10);
   files.return_delegation(&delegation, A, &fh).unwrap();
@@ -245,7 +260,9 @@ fn a_recalled_file_is_not_delegated_again_within_the_quiet_period() {
 fn an_unreturned_delegation_is_revoked_after_a_lease() {
   let mut files = owner();
   let fh = handle(10, 1);
-  files.open(A, b"a".to_vec(), &fh, read_only()).unwrap();
+  files
+    .open(A, b"a".to_vec(), OPENER, &fh, read_only())
+    .unwrap();
   let delegation = files.delegate_read(A, &fh, 0, QUIET).unwrap();
   files.take_changes();
   files.recall(&fh, Some(B), Conflict::Change, 100);
@@ -286,7 +303,7 @@ fn an_unreturned_delegation_is_revoked_after_a_lease() {
 fn a_change_through_another_mount_recalls_the_delegation() {
   let mut files = owner();
   files
-    .open(A, b"a".to_vec(), &handle(10, 1), read_only())
+    .open(A, b"a".to_vec(), OPENER, &handle(10, 1), read_only())
     .unwrap();
   files.delegate_read(A, &handle(10, 1), 0, QUIET).unwrap();
   let plan = files.recall(&handle(10, 2), Some(B), Conflict::Change, 1);
@@ -299,7 +316,9 @@ fn a_change_through_another_mount_recalls_the_delegation() {
 fn a_read_by_another_client_does_not_recall_a_read_delegation() {
   let mut files = owner();
   let fh = handle(10, 1);
-  files.open(A, b"a".to_vec(), &fh, read_only()).unwrap();
+  files
+    .open(A, b"a".to_vec(), OPENER, &fh, read_only())
+    .unwrap();
   files.delegate_read(A, &fh, 0, QUIET).unwrap();
   let plan = files.recall(&fh, Some(B), Conflict::Read, 1);
   assert!(!plan.waiting && plan.send.is_empty());
@@ -311,7 +330,9 @@ fn a_read_by_another_client_does_not_recall_a_read_delegation() {
 fn a_delegations_state_id_serves_its_holders_reads_only() {
   let mut files = owner();
   let fh = handle(10, 1);
-  files.open(A, b"a".to_vec(), &fh, read_only()).unwrap();
+  files
+    .open(A, b"a".to_vec(), OPENER, &fh, read_only())
+    .unwrap();
   let delegation = files.delegate_read(A, &fh, 0, QUIET).unwrap();
   assert_eq!(
     files.check_io(&delegation, &fh, A, IoWant::Read),
@@ -334,7 +355,9 @@ fn a_delegations_state_id_serves_its_holders_reads_only() {
 fn a_delegation_survives_a_restart_through_its_record() {
   let mut files = owner();
   let fh = handle(10, 1);
-  files.open(A, b"a".to_vec(), &fh, read_only()).unwrap();
+  files
+    .open(A, b"a".to_vec(), OPENER, &fh, read_only())
+    .unwrap();
   files.take_changes();
   let delegation = files.delegate_read(A, &fh, 0, QUIET).unwrap();
   let records: Vec<DelegationRecord> = files
@@ -368,7 +391,9 @@ fn a_delegation_survives_a_restart_through_its_record() {
 fn an_open_for_writing_is_write_delegated_only_while_no_other_client_has_the_file() {
   let mut files = owner();
   let fh = handle(10, 1);
-  files.open(A, b"a".to_vec(), &fh, read_write()).unwrap();
+  files
+    .open(A, b"a".to_vec(), OPENER, &fh, read_write())
+    .unwrap();
   let delegation = files
     .delegate_write(A, &fh, 0, QUIET)
     .expect("A's open for writing is delegated");
@@ -385,7 +410,9 @@ fn an_open_for_writing_is_write_delegated_only_while_no_other_client_has_the_fil
   );
   assert_eq!(files.delegate_read(B, &fh, QUIET + 1, QUIET), None);
   let other = handle(11, 1);
-  files.open(B, b"b".to_vec(), &other, read_only()).unwrap();
+  files
+    .open(B, b"b".to_vec(), OPENER, &other, read_only())
+    .unwrap();
   assert_eq!(
     files.delegate_write(3, &other, 2, QUIET),
     None,
@@ -400,7 +427,9 @@ fn an_open_for_writing_is_write_delegated_only_while_no_other_client_has_the_fil
 fn any_open_by_another_client_recalls_a_write_delegation() {
   let mut files = owner();
   let fh = handle(10, 1);
-  files.open(A, b"a".to_vec(), &fh, read_write()).unwrap();
+  files
+    .open(A, b"a".to_vec(), OPENER, &fh, read_write())
+    .unwrap();
   let delegation = files.delegate_write(A, &fh, 0, QUIET).unwrap();
   assert_eq!(files.check_open_conflicts(A, &fh, read_only(), 1), Ok(()));
   assert_eq!(
@@ -425,7 +454,9 @@ fn any_open_by_another_client_recalls_a_write_delegation() {
 fn an_open_that_writes_or_denies_reads_recalls_a_read_delegation() {
   let mut files = owner();
   let fh = handle(10, 1);
-  files.open(A, b"a".to_vec(), &fh, read_only()).unwrap();
+  files
+    .open(A, b"a".to_vec(), OPENER, &fh, read_only())
+    .unwrap();
   files.delegate_read(A, &fh, 0, QUIET).unwrap();
   assert_eq!(files.check_open_conflicts(B, &fh, read_only(), 1), Ok(()));
   let denying = Share {
@@ -450,13 +481,17 @@ fn an_open_that_writes_or_denies_reads_recalls_a_read_delegation() {
 fn another_clients_getattr_recalls_a_write_delegation() {
   let mut files = owner();
   let fh = handle(10, 1);
-  files.open(A, b"a".to_vec(), &fh, read_write()).unwrap();
+  files
+    .open(A, b"a".to_vec(), OPENER, &fh, read_write())
+    .unwrap();
   files.delegate_write(A, &fh, 0, QUIET).unwrap();
   assert!(!files.check_read_conflicts(&fh, A, 1));
   assert!(files.check_read_conflicts(&fh, B, 2));
   assert_eq!(files.take_recalls().len(), 1);
   let read = handle(12, 1);
-  files.open(A, b"a".to_vec(), &read, read_only()).unwrap();
+  files
+    .open(A, b"a".to_vec(), OPENER, &read, read_only())
+    .unwrap();
   files.delegate_read(A, &read, 0, QUIET).unwrap();
   assert!(!files.check_read_conflicts(&read, B, 3));
 }
@@ -467,9 +502,13 @@ fn another_clients_getattr_recalls_a_write_delegation() {
 fn a_write_delegations_holder_is_not_given_it_again_as_a_read_one() {
   let mut files = owner();
   let fh = handle(10, 1);
-  files.open(A, b"a".to_vec(), &fh, read_write()).unwrap();
+  files
+    .open(A, b"a".to_vec(), OPENER, &fh, read_write())
+    .unwrap();
   files.delegate_write(A, &fh, 0, QUIET).unwrap();
-  files.open(A, b"a2".to_vec(), &fh, read_only()).unwrap();
+  files
+    .open(A, b"a2".to_vec(), OPENER, &fh, read_only())
+    .unwrap();
   assert_eq!(files.delegate_read(A, &fh, QUIET + 1, QUIET), None);
 }
 
@@ -503,12 +542,16 @@ fn the_gate_updated_by_changed_inodes_equals_a_whole_rebuild() {
   let mut held = Vec::new();
   for (index, fh) in fhs.iter().enumerate() {
     let client = if index % 2 == 0 { A } else { B };
-    files.open(client, b"o".to_vec(), fh, read_only()).unwrap();
+    files
+      .open(client, b"o".to_vec(), OPENER, fh, read_only())
+      .unwrap();
     held.push((client, files.delegate_read(client, fh, 0, QUIET).unwrap()));
     check(&mut files, "a read grant");
   }
   let shared = &fhs[0];
-  files.open(B, b"o".to_vec(), shared, read_only()).unwrap();
+  files
+    .open(B, b"o".to_vec(), OPENER, shared, read_only())
+    .unwrap();
   let second = files.delegate_read(B, shared, 0, QUIET).unwrap();
   check(&mut files, "a second holder");
   files.return_delegation(&second, B, shared).unwrap();
@@ -521,7 +564,9 @@ fn the_gate_updated_by_changed_inodes_equals_a_whole_rebuild() {
   files.purge(A);
   check(&mut files, "a purge");
   let write = handle(20, 1);
-  files.open(B, b"w".to_vec(), &write, read_write()).unwrap();
+  files
+    .open(B, b"w".to_vec(), OPENER, &write, read_write())
+    .unwrap();
   files.delegate_write(B, &write, 0, QUIET).unwrap();
   check(&mut files, "a write grant");
 }

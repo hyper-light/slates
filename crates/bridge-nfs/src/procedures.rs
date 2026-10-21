@@ -1229,11 +1229,18 @@ impl<'b> Export<'b> {
     // holder would return the delegation to change it, a round trip for nothing (A-78; measured 2026-10-04: a Rust
     // build returned 1,328 of 1,759 delegations on its own and ran 3% slower).
     let settled = procedure != extension::STATE_OPEN || self.settled(&handle);
+    // Read before the file state is borrowed: an open is identified by the uid that made it, so one
+    // open-owner never lends one user's access to another (`v4::files::OpenKey`).
+    let acting = self.caller.uid;
     let files = self.file_states_mut().ok_or(Nfsstat4::Serverfault)?;
     match procedure {
-      extension::STATE_OPEN | extension::STATE_CLOSE | extension::STATE_DOWNGRADE => {
-        open_state(files, (procedure, settled), &handle, clientid, args)
-      }
+      extension::STATE_OPEN | extension::STATE_CLOSE | extension::STATE_DOWNGRADE => open_state(
+        files,
+        (procedure, settled),
+        &handle,
+        (clientid, acting),
+        args,
+      ),
       extension::STATE_DELEGRETURN => {
         let stateid = Stateid::decode(args).map_err(bad)?;
         files.return_delegation(&stateid, clientid, &handle)?;
@@ -3080,7 +3087,7 @@ fn open_state(
   files: &mut FileState,
   (procedure, settled): (u32, bool),
   handle: &Nfsfh3,
-  clientid: u64,
+  (clientid, acting): (u64, u32),
   args: &mut XdrReader<'_>,
 ) -> Result<Vec<u8>, crate::v4::files::LockRefused> {
   use crate::v4::Nfsstat4;
@@ -3102,7 +3109,7 @@ fn open_state(
       // Another holder's delegation this open conflicts with is recalled first (RFC 8881 §10.4.4).
       files.check_open_conflicts(clientid, handle, share, now_ns)?;
       files
-        .open(clientid, owner, handle, share)?
+        .open(clientid, owner, acting, handle, share)?
         .encode(&mut body);
       let (kind, delegation) = open_delegation(
         files,

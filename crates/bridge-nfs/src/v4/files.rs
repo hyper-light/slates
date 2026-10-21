@@ -56,6 +56,9 @@ pub struct Share {
 struct Open {
   clientid: u64,
   owner: Vec<u8>,
+  /// The uid that opened it. Part of the open's identity, so one open-owner never pools two users'
+  /// access (see [`OpenKey`]).
+  uid: u32,
   fh: Nfsfh3,
   share: Share,
   seqid: u32,
@@ -77,7 +80,20 @@ pub enum IoWant {
 pub use slates_bridge_core::access::IoAuthority;
 
 /// The key an open is found by from its file: the file first, so every open of one file is one range.
-type OpenKey = (Vec<u8>, u64, Vec<u8>);
+/// What names one open: the file, the client, the open-owner the client chose — and the **uid acting**.
+///
+/// The uid is in the key because an open-owner is opaque data the *client* picks, so it carries no
+/// authority between users (RFC 8881 §9.1.2: the server checks the acting credential on every operation
+/// that reaches it). Without it, a second user's open of the same open-owner joined the first's share
+/// (`open.share.access |= share.access`) and inherited its access: `check_io` then answered that user
+/// `IoAuthority::Open`, which both `write_result` and `access::setattr_denial` take as "already checked,
+/// no bits test" — so a user the mode denies writing could write and truncate through another user's
+/// open. Measured 2026-10-21 (`two_users_sharing_an_open_owner_do_not_pool_their_access`): uid 1000,
+/// owner of a 0477 file, truncated it by sharing an open-owner with uid 1001.
+///
+/// The same user's reopen still merges, which is what RFC 8881 §9.1.1 asks for; only a principal change
+/// starts a separate open.
+type OpenKey = (Vec<u8>, u64, Vec<u8>, u32);
 
 /// Format: the bytes of a state id's counter.
 const COUNTER_BYTES: usize = 6;
@@ -303,6 +319,8 @@ pub struct OpenRecord {
   pub clientid: u64,
   /// The open-owner.
   pub owner: Vec<u8>,
+  /// The uid that opened it, part of the open's identity (see [`OpenKey`]).
+  pub uid: u32,
   /// The file handle.
   pub fh: Vec<u8>,
   /// The share it holds.
@@ -410,7 +428,12 @@ impl FileState {
     for record in opens {
       let fh = Nfsfh3(record.fh);
       state.by_file.insert(
-        (identity(&fh), record.clientid, record.owner.clone()),
+        (
+          identity(&fh),
+          record.clientid,
+          record.owner.clone(),
+          record.uid,
+        ),
         record.other,
       );
       state.opens.insert(
@@ -418,6 +441,7 @@ impl FileState {
         Open {
           clientid: record.clientid,
           owner: record.owner,
+          uid: record.uid,
           fh,
           share: record.share,
           seqid: record.seqid,
@@ -464,6 +488,7 @@ impl FileState {
         other: *other,
         clientid: open.clientid,
         owner: open.owner.clone(),
+        uid: open.uid,
         fh: open.fh.0.clone(),
         share: open.share,
         seqid: open.seqid,
@@ -508,23 +533,27 @@ impl FileState {
     self.locks.state_count()
   }
 
-  /// OPEN's state (§18.16): an open of `fh` by `owner` of `clientid` holding `share`. The owner's
-  /// existing open of the file is upgraded (its share joined with the new one) and its state id
-  /// advanced; a share that conflicts with another owner's open is `NFS4ERR_SHARE_DENIED`; a new open
-  /// past the bound is `NFS4ERR_NOSPC` (OPEN's exhaustion status, RFC 8881 §15.2).
+  /// OPEN's state (§18.16): an open of `fh` by `owner` of `clientid`, made by `uid`, holding `share`.
+  /// That same opener's existing open of the file is upgraded (its share joined with the new one) and
+  /// its state id advanced; a share that conflicts with another owner's open is `NFS4ERR_SHARE_DENIED`;
+  /// a new open past the bound is `NFS4ERR_NOSPC` (OPEN's exhaustion status, RFC 8881 §15.2).
+  ///
+  /// `uid` is part of what names the open ([`OpenKey`]), so a second *user* under the same open-owner
+  /// gets its own open rather than joining this one's access.
   pub fn open(
     &mut self,
     clientid: u64,
     owner: Vec<u8>,
+    uid: u32,
     fh: &Nfsfh3,
     share: Share,
   ) -> Result<Stateid, Nfsstat4> {
     let file = identity(fh);
-    let key: OpenKey = (file.clone(), clientid, owner);
+    let key: OpenKey = (file.clone(), clientid, owner, uid);
     let conflicts = self
       .by_file
-      .range((file.clone(), 0, Vec::new())..)
-      .take_while(|((held, _, _), _)| *held == file)
+      .range((file.clone(), 0, Vec::new(), 0)..)
+      .take_while(|((held, _, _, _), _)| *held == file)
       .filter(|(other_key, _)| **other_key != key)
       .filter_map(|(_, other)| self.opens.get(other))
       .any(|other| share.access & other.share.deny != 0 || share.deny & other.share.access != 0);
@@ -551,6 +580,7 @@ impl FileState {
       Open {
         clientid,
         owner: key.2.clone(),
+        uid,
         fh: fh.clone(),
         share,
         seqid: 1,
@@ -641,8 +671,8 @@ impl FileState {
     let file = identity(fh);
     let refused = self
       .by_file
-      .range((file.clone(), 0, Vec::new())..)
-      .take_while(|((held, _, _), _)| *held == file)
+      .range((file.clone(), 0, Vec::new(), 0)..)
+      .take_while(|((held, _, _, _), _)| *held == file)
       .filter(|(_, other)| Some(*other) != except)
       .filter_map(|(_, other)| self.opens.get(other))
       .any(|open| open.share.deny & denied != 0);
@@ -895,8 +925,8 @@ impl FileState {
     let file = identity(fh);
     let contended = self
       .by_file
-      .range((file.clone(), 0, Vec::new())..)
-      .take_while(|((held, _, _), _)| *held == file)
+      .range((file.clone(), 0, Vec::new(), 0)..)
+      .take_while(|((held, _, _, _), _)| *held == file)
       .filter_map(|(_, other)| self.opens.get(other))
       .any(|open| {
         open.clientid != clientid
@@ -931,9 +961,9 @@ impl FileState {
     let file = identity(fh);
     let opened_elsewhere = self
       .by_file
-      .range((file.clone(), 0, Vec::new())..)
-      .take_while(|((held, _, _), _)| *held == file)
-      .any(|((_, holder, _), _)| *holder != clientid);
+      .range((file.clone(), 0, Vec::new(), 0)..)
+      .take_while(|((held, _, _, _), _)| *held == file)
+      .any(|((_, holder, _, _), _)| *holder != clientid);
     if opened_elsewhere {
       return None;
     }
@@ -1118,7 +1148,7 @@ impl FileState {
     if let Some(open) = self.opens.remove(other) {
       self
         .by_file
-        .remove(&(identity(&open.fh), open.clientid, open.owner));
+        .remove(&(identity(&open.fh), open.clientid, open.owner, open.uid));
     }
   }
 }

@@ -10273,3 +10273,35 @@ the ones that matter for soundness), and only the call that reaches the syscall 
 whole test would have reported no coverage where there is real coverage to report. What the syscall itself
 does is covered by the real-hardware runs — the L1 sandbox reservations on fedora, adacachy and aarch64
 Linux.
+
+### 2026-10-21: one open-owner pooled two users' access — a write, not only a truncate
+
+The sibling the delegation-truncate work left open (`nfs-v4-delegation-truncate-escape`, "Open
+cross-principal") is real, reproduced and fixed. An NFSv4 open was keyed `(file, clientid, open-owner)`,
+and a second OPEN under an existing key joined the first's share (`open.share.access |= share.access`).
+The open-owner is **opaque data the client chooses**, so that pooled two users' access, and the pooled
+share is then read as authority: `check_io` answers `IoAuthority::Open`, which `access::setattr_denial`
+treats as already checked for a size change and `write_result` treats as already checked for a WRITE.
+
+Measured with a file owned by uid 1000 at mode 0477 — `r--` for its owner, `rwx` for everyone else. uid
+1001 opened it for writing under the open-owner `pooled`; uid 1000 then opened it for reading under that
+same open-owner and truncated: `merge … now_access=3`, `check_io … access=3 want=Write`, `SETATTR -> 0`.
+Served. **A read-only owner wrote and truncated its own file by sharing an open-owner with somebody who
+could write it.** Fixed by putting the acting uid in the open's identity; the same user's reopen still
+merges, only a principal change starts a separate open. Now `NFS4ERR_OPENMODE`, red-checked by dropping
+the uid back out (the truncate is served again).
+
+**The first version of the test passed, and that is the lesson.** `Export::new` gives an export its own
+`FileState`, so two exports meant two independent open tables and the two users' opens never met. The
+daemon lends the owner shard's state to the export it builds per request (`crates/server/src/nfs.rs:380`);
+the test now lends one state to both exports, which is the daemon's actual shape. A test that builds the
+state per caller cannot see this class of bug at all — worth checking wherever a test stands in for a
+shared, per-request-lent structure.
+
+The uid rides the durable open record so a restored open still knows whose it was; otherwise the
+descriptor-keeps-its-access rule would quietly change meaning across a restart.
+
+Still open and Ada's call, unchanged: `write_result`/`read_into` use `permits_io` (owner override) for a
+plain WRITE or READ under a **special** state id, so a read-only-mode owner can write its own file that
+way. Deliberate NFS owner-override policy, not this escape.
+(`docs/bugs/2026-10-21-one-open-owner-pooled-two-users-access.md`.)

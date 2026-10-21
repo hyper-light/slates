@@ -16,6 +16,7 @@ use slates_bridge_nfs::Export;
 use slates_bridge_nfs::v4::Nfsstat4;
 use slates_bridge_nfs::v4::backend::serve_compound;
 use slates_bridge_nfs::v4::compound::{COMPOUND_HEADER_BYTES, MIN_OPERATION_BYTES, Server, op};
+use slates_bridge_nfs::v4::files::{FileState, owner_tag};
 use slates_bridge_nfs::v4::session::Limits;
 use slates_bridge_nfs::v4::types::{Bitmap, ChannelAttrs, Stateid};
 use slates_bridge_nfs::xdr::{XdrReader, XdrWriter};
@@ -80,12 +81,17 @@ fn volume(store: &mut Store) -> Volume {
 }
 
 fn root_cx() -> OpContext {
+  cx_as(0)
+}
+
+/// A context acting as `uid`, so a test can own a file as somebody other than root.
+fn cx_as(uid: u32) -> OpContext {
   let mut attachments = Attachments::new();
   let id = attachments
     .attach(
       VOLUME,
       View::Current,
-      Principal::Uid { uid: 0 },
+      Principal::Uid { uid },
       Rights {
         read: true,
         write: true,
@@ -2646,6 +2652,107 @@ fn setattr_status(
   }
   args.opaque(values.as_slice());
   Client::call(service, server, args.as_slice()).status
+}
+
+/// RFC 8881 §9.1.2 (A-35, A-38): an open-owner is opaque data the *client* chooses, so it carries no
+/// authority between users. Two principals that share one open-owner must not pool their access — the
+/// server checks the acting caller on every operation that reaches it, and a client that reuses an
+/// open-owner across users (a hostile one, or a careless one) cannot lend one user's write right to
+/// another.
+///
+/// The file state is **lent** to both exports, as the daemon lends its owner shard's state to the export
+/// it builds per request (`crates/server/src/nfs.rs`); an export that owns its own state cannot show this
+/// at all, because each export would start empty and the two opens would never meet.
+///
+/// Do: own `victim` as uid 1000 with mode 0477 — `r--` for its owner, `rwx` for everyone else — so 1001
+/// may write it and its own owner may not. Open it for writing as 1001 under the open-owner `pooled`,
+/// then open it for reading as 1000 under that same open-owner, and truncate under the state id that
+/// comes back. Expect: the truncate is refused `NFS4ERR_OPENMODE` — uid 1000 holds its own read-only
+/// open, which is the same answer a single user's read-only open gets
+/// (`a_state_ids_access_mode_and_other_opens_denials_govern_io`), and what the Linux client turns into
+/// `EACCES`. Pooled, the truncate was *served*: uid 1000 truncated a file its own mode bits forbid it to
+/// write (measured 2026-10-21, `NFS4ERR_OK` with the merged share reading access=3).
+#[test]
+fn two_users_sharing_an_open_owner_do_not_pool_their_access() {
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let mut bridge = VolumeBridge::new(VOLUME, &mut vol, &mut store);
+  let owning = cx_as(1000);
+  let root = bridge.root(&owning).unwrap();
+  bridge
+    .create(ObjectId::new(root, 0), &owning, "victim", 0o477, 0)
+    .unwrap();
+
+  let mut files = FileState::new(owner_tag(0, 0), 64, 64);
+  let mut server = Server::standalone();
+  let pooled = b"pooled-open-owner".to_vec();
+  let open_existing = |client: &mut Client,
+                       service: &mut Export<'_>,
+                       server: &mut Server,
+                       access: u32|
+   -> Result<(Stateid, Vec<u8>), u32> {
+    let mut args = client.sequenced(3);
+    args.u32(op::PUTROOTFH);
+    client.open_args(&mut args, &pooled, "victim", access, DENY_NONE, None);
+    args.u32(op::GETFH);
+    let reply = Client::call(service, server, args.as_slice());
+    if reply.status != Nfsstat4::Ok.wire() {
+      return Err(reply.status);
+    }
+    let mut body = reply.walk();
+    skip_sequence(&mut body);
+    expect_ok(&mut body, op::PUTROOTFH);
+    let (stateid, _) = open_result(&mut body);
+    expect_ok(&mut body, op::GETFH);
+    Ok((stateid, body.opaque(128).unwrap().to_vec()))
+  };
+
+  // uid 1001 falls in the file's `other` class, which 0477 grants `rwx`, so its write-capable open is
+  // legitimate and must stay so.
+  let mut client = {
+    let mut service = export(&mut bridge, 1001);
+    service.lend_file_state(&mut files);
+    let mut client = Client::connect(&mut service, &mut server, b"host-pooled");
+    let (writer_state, writer_fh) = open_existing(&mut client, &mut service, &mut server, WRITE)
+      .expect("uid 1001 may open the file for writing");
+    assert_eq!(
+      setattr_status(
+        &mut client,
+        &mut service,
+        &mut server,
+        (writer_fh.as_slice(), writer_state),
+        Some(0),
+      ),
+      Nfsstat4::Ok.wire(),
+      "non-vacuity: 1001's own write-capable open does truncate, so the refusal below is about the user"
+    );
+    client
+  };
+
+  // The file's own owner may only read it. Its open joins the same open-owner.
+  let mut service = export(&mut bridge, 1000);
+  service.lend_file_state(&mut files);
+  let (stateid, fh) = open_existing(&mut client, &mut service, &mut server, READ)
+    .expect("the owner may open the file for reading");
+  let status = setattr_status(
+    &mut client,
+    &mut service,
+    &mut server,
+    (fh.as_slice(), stateid),
+    Some(0),
+  );
+  assert_eq!(
+    status,
+    Nfsstat4::Openmode.wire(),
+    "a user the bits deny writing does not truncate through another user's open"
+  );
+  // The pooling let the other user *write* as well as truncate: `write_result` checks the bits only under
+  // `IoAuthority::Mode`, so a pooled open skipped that check for a plain WRITE too.
+  assert_eq!(
+    write_status(&mut client, &mut service, &mut server, &fh, stateid),
+    Nfsstat4::Openmode.wire(),
+    "nor write through it"
+  );
 }
 
 /// RFC 8881 §9.1.2 (A-38): a state id's access mode governs write-type operations — a read-only

@@ -733,6 +733,9 @@ pub struct NfsOpenRecord {
   pub clientid: u64,
   /// The open-owner.
   pub owner: Vec<u8>,
+  /// The uid that made the open. Part of the open's identity: an open-owner is opaque data the client
+  /// chooses, so it carries no authority between users, and a restored open must know whose it was.
+  pub uid: u32,
   /// The file handle it opened.
   pub fh: Vec<u8>,
   /// The share access.

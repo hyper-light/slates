@@ -755,6 +755,9 @@ fn op_for_nfs(step: &Step, ids: &mut Ids) -> Option<Op> {
         other: mint(ids),
         clientid: u64::from(*client),
         owner: vec![*client, *file],
+        // Distinct uids across the generated history, so the field makes the recovery round trip under
+        // test rather than riding along as one constant.
+        uid: u32::from(*client),
         fh: vec![*file; 16],
         access: *access,
         deny: 0,

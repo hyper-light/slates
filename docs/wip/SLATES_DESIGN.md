@@ -2446,10 +2446,18 @@ therefore one implementation shared by both versions.
     client, session and state id therefore names an instance no earlier life used.
   - Kept records come back even if a smaller bound was derived since; only new state is refused until
     the tables are back under their bounds.
-- **Open state** (§9, kept at the file's owner): one state id per (client, open-owner, file), upgraded and advanced by a reopen;
+- **Open state** (§9, kept at the file's owner): one state id per (client, open-owner, file, **acting uid**),
+  upgraded and advanced by a reopen;
   share reservations enforced across owners (`NFS4ERR_SHARE_DENIED`); a state id serves only its own
   file and client, at its current seqid (`NFS4ERR_OLD_STATEID` for an earlier one, §8.2.2). OPEN of an
   existing file checks the caller's access for the share asked; a create needs none on the new file.
+  The uid is part of the identity because an open-owner is opaque data the *client* chooses, so it
+  carries no authority between users (§9.1.2: the server checks the acting credential on every operation
+  that reaches it). Keyed without it, a second user's open joined the first's share and inherited its
+  access, and both the `IoAuthority::Open` write path and the size path take that as already checked —
+  a user the mode denied writing could write and truncate through another user's open (measured
+  2026-10-21, `docs/bugs/2026-10-21-one-open-owner-pooled-two-users-access.md`). The same user's reopen
+  still merges, which is what §9.1.1 asks for; only a principal change starts a separate open.
   An `UNCHECKED` open of an existing name applies only the size (the `O_TRUNC`), also when another
   client creates the name between the open's LOOKUP and its create. An exclusive create (EXCLUSIVE4,
   EXCLUSIVE4_1, and NFSv3 `EXCLUSIVE`) keeps its verifier in the new file's modification and access
