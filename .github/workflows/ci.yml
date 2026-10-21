@@ -508,27 +508,6 @@ jobs:
       - name: Instruction-count gate
         run: cargo xtask callgrind --iai target/iai
 
-  # i686 is a tested target, not a build-only one (CLAUDE.md §3; AUD-29-32): every u64 → usize of a mapped or
-  # user-supplied size goes through `usize::try_from`, and these crates' unit tests run as 32-bit code. The
-  # official linux/386 Rust image runs natively on the x86_64 runner, so the lane installs nothing. On a
-  # target the runtime serves through epoll, as every target does since A-136 removed io_uring. slates-rt
-  # and slates-mem run whole, integration tests included: a 32-bit waker carries its shard and slot and
-  # wakes the slot (docs/bugs/2026-10-01-a-32-bit-waker-lost-its-task.md). cargo is invoked directly, not
-  # through a login shell: `bash -l` sources the image's /etc/profile, which resets PATH without cargo.
-  i686:
-    name: i686 (32-bit narrowing, by test)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Unit tests as 32-bit code
-        run: >-
-          docker run --rm --platform linux/386 -v "$PWD":/src -w /src rust:1.98.0
-          cargo test -p slates-wire -p slates-archive -p slates-ipc -p slates-db -p slates-vfs --lib
-      - name: The runtime and memory crates as 32-bit code
-        run: >-
-          docker run --rm --platform linux/386 -v "$PWD":/src -w /src rust:1.98.0
-          cargo test --no-fail-fast -p slates-rt -p slates-mem
-
   # The cheap half of arm64 Windows: a cross lint from Linux on every push and pull request, paired
   # with the `windows-arm64` lane below that runs the code natively on main and the nightly. Same
   # split as `windows-lint` and `windows-nightly`, for the same reason — a compile break should fail
@@ -543,31 +522,27 @@ jobs:
   # architecture-conditional code, so the lane would cost a feature-graph change for no coverage.
   # Verified on Linux before it landed (2026-10-20): clean on a native `aarch64-unknown-linux-gnu`
   # container, cargo reporting 7.29 s for this invocation on six cores. The first attempt at that
-  # verification is worth knowing about: `docker run rust:1.98.0` resolved to a cached **linux/386**
-  # image and ran under emulation, so it checked i686 Linux, not the x86_64 this lane runs on. Pass
-  # `--platform` when the host is arm64, and read the platform warning rather than the exit code.
+  # verification is worth knowing about: `docker run rust:1.98.0` resolved to a cached image for a
+  # different architecture and ran under emulation, so it checked the wrong one. Pass `--platform` when
+  # the host is arm64, and read the platform warning rather than the exit code.
   cross-lint:
     name: ${{ matrix.target }} (cross lint, by compile)
     strategy:
       fail-fast: false
       matrix:
         # Every triple `release.yml` ships and `publish-node.yml` publishes that no lane ever compiled.
-        # Three of the nine are covered by the hosts CI already runs on — x86_64 linux-gnu by ubuntu,
-        # aarch64-apple-darwin by macos, x86_64 windows-msvc by `windows-lint`. These six had no build
+        # Three of the seven are covered by the hosts CI already runs on — x86_64 linux-gnu by ubuntu,
+        # aarch64-apple-darwin by macos, x86_64 windows-msvc by `windows-lint`. The rest had no build
         # behind them at all, which for a declared release target means the first person to cut a tag
-        # is the first to compile it. Two of them are worth more than box-ticking: `usize` is 32 bits on
-        # i686, and while the `i686` lane below runs the narrowing tests on **Linux**, the Win32
-        # shared-memory, IOCP and AFD code had never been compiled at 32 bits anywhere; and musl is a
-        # different libc under code that reaches for `rustix` and `libc` on every syscall.
+        # is the first to compile it. musl earns its square: a different libc under code that reaches
+        # for `rustix` and `libc` on every syscall.
         #
         # Each target is paired with a host that can actually build it rather than assumed portable.
         include:
           - { target: aarch64-pc-windows-msvc, runner: ubuntu-latest }
-          - { target: i686-pc-windows-msvc, runner: ubuntu-latest }
           - { target: x86_64-unknown-linux-musl, runner: ubuntu-latest }
           - { target: aarch64-unknown-linux-musl, runner: ubuntu-latest }
           - { target: aarch64-unknown-linux-gnu, runner: ubuntu-latest }
-          - { target: x86_64-apple-darwin, runner: macos-latest }
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4

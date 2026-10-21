@@ -25,14 +25,12 @@ jobs:
       matrix:
         include:
           - { target: aarch64-apple-darwin, runner: macos-latest }
-          - { target: x86_64-apple-darwin, runner: macos-latest }
           - { target: x86_64-unknown-linux-gnu, runner: ubuntu-latest }
           - { target: aarch64-unknown-linux-gnu, runner: ubuntu-24.04-arm }
           - { target: x86_64-unknown-linux-musl, runner: ubuntu-latest, musl: true }
           - { target: aarch64-unknown-linux-musl, runner: ubuntu-24.04-arm, musl: true }
           - { target: x86_64-pc-windows-msvc, runner: windows-latest }
           - { target: aarch64-pc-windows-msvc, runner: windows-latest }
-          - { target: i686-pc-windows-msvc, runner: windows-latest }
     runs-on: ${{ matrix.runner }}
     env:
       # AWS-LC's Windows x86 assembly is built from its NASM source, never the prebuilt objects (ignored elsewhere).
