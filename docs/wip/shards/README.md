@@ -7,7 +7,15 @@ model (the guest's `mount` is refused without `CAP_SYS_ADMIN`).
 
 ## What's built, and proven
 
-**slates side** (`crates/bridge-fuse`, branch `writable-dax`):
+> **Status checked 2026-10-21, and two things below were overstated.** (1) The slates half is on **main**, but
+> **the daemon never calls `shards_fs::serve`** — no reference in `crates/server` or `crates/cli`. The only server
+> is `examples/shards_fs_serve.rs`, which serves a hard-coded one-file RAM volume, so a real volume (its
+> attachment, capability, scope and rights) cannot be served to a shards VM yet. (2) The shards half
+> (`--slates-fs-fd`) is on shards branch `slates-fs-native` (`08066b27`, 2026-10-14), which is on **no remote**;
+> shards' `origin/gpu` (`0aa00196`, 2026-10-21), the branch kiln vendors, contains none of it. "Proven" below
+> means a real HVF VM **connected** to the example server; a guest kernel mounting and reading has never run.
+
+**slates side** (`crates/bridge-fuse`, now on main):
 - `shards_fs::serve` — the backend. Transport-agnostic (generic over `Read + Write`), so cross-platform. It speaks
   shards' own framing: a little-endian `u32` length, then the FUSE request/reply bytes, one at a time — byte-for-byte
   what shards' fs device drives (`Slot::ask`/`write_frame`/`read_frame`).
@@ -62,10 +70,22 @@ the same backend serves `SETUPMAPPING` and the guest reaches the block through i
   and reaches the backend over a named pipe / `AF_UNIX`. Native Windows/Linux builds are slates' CI lanes (the
   workspace's C deps can't cross-compile from macOS).
 
-## Owed follow-ups (shards-side, Ada's to direct)
+## Owed follow-ups (Ada's to direct)
 
-1. The **Agentfile `SLATES` directive** (see `Agentfile`): daemon-side, connect to the slates socket and fill the
-   share slot from the Agentfile, so `shards run <image>` mounts a slates volume (today it's the low-level flag).
+0. **slates side, and the largest gap: the daemon serving a real volume.** A daemon verb that attaches a volume
+   (or creates a session's copy-on-write overlay) for a guest, with a scope and rights, and returns a **connected
+   descriptor** that the real daemon serves in shards' framing. The descriptor is the capability: whoever holds it
+   reaches exactly that attachment. It must be a descriptor, not a path, because the macOS App Sandbox stops the VM
+   process from opening a socket (shown on a real boot). **Isolation on this route is one attachment per session,
+   never per uid:** every FUSE request carries a uid, but inside a microVM that is whatever the guest kernel says,
+   and the guest can be root.
+1. The **Agentfile side**, revised 2026-10-21. Split the **declaration** from the **binding**. The Agentfile
+   (shards' syntax, shards' call) declares only where the agent mounts a slates volume and whether it may write —
+   no socket path and no volume id, because an Agentfile is a signed artifact pushed to a registry, and a host
+   socket path is per-run state that doesn't belong in a signed spec any more than a bind source does. Reusing
+   shards' `VOLUME … FOR` (D109) may serve. The **binding** happens at launch: the runner asks the slates daemon
+   for a descriptor for one attachment and passes it as `--slates-fs-fd`. This supersedes the earlier proposal,
+   `SLATES ${SLATES_SOCK} shards0 /slates`, which put the socket in the Agentfile.
 2. The **guest-kernel mount+read** proof (`SHARDS-TEST PASS`): one more boot of `tests/slates_fs.rs`, deferred here
    only because the auto-mode classifier denied it as shared-machine workload interference.
 3. The **Windows runtime** (HANDLE-passing + a named-pipe/`AF_UNIX` slates server) and, for DAX, a guest-physical

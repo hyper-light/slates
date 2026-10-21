@@ -12,17 +12,18 @@
 # yet; when it gains one, the same backend serves SETUPMAPPING and the guest reaches the block through its own page
 # table. So "DAX-compatible" = the backend supports DAX; the microVM is accelerated once shards adds the window.
 #
-# STATUS of the directive below: the `SLATES` line is the INTENDED high-level packaging. It is NOT yet a shards
-# Agentfile directive — the daemon-side wiring (connect to the slates socket, hand the descriptor to the VM's fs
-# share slot, as the daemon already does for its share process) is the shards-side follow-up. The WORKING mechanism
-# today is the low-level `run --kernel … --slates-fs-fd <N>` flag, which this repo builds and proves end to end
-# (slates `crates/bridge-fuse`; shards `crates/shards/src/vm_run.rs` + `crates/shards/tests/slates_fs.rs`). See
-# README.md for the full runnable recipe.
+# STATUS (revised 2026-10-21): the `SLATES` line below is a WITHDRAWN proposal, kept so the history reads. It is
+# not a shards directive, and its shape was wrong: it puts a host socket path into a signed Agentfile, where per-run
+# state does not belong. The revised shape (README.md, "Owed follow-ups") splits the DECLARATION — the Agentfile says
+# where the agent mounts a slates volume and whether it may write, in shards' syntax — from the BINDING, done at
+# launch: the runner asks the slates daemon for a connected descriptor for ONE attachment and passes it as
+# `--slates-fs-fd`. Two facts as of 2026-10-21: `--slates-fs-fd` exists only on shards branch `slates-fs-native`
+# (on no remote; shards' `gpu` lacks it), and the slates daemon does not yet serve `shards_fs` at all — only the
+# one-file example `crates/bridge-fuse/examples/shards_fs_serve.rs` does.
 
 FROM alpine:3.22
 
-# Mount a slates volume, served by a slates daemon on SLATES_SOCK, at tag `shards0` -> /slates.
-# (Proposed directive; today this is `--slates-fs-fd <N>`, the daemon filling the share slot from the socket.)
+# WITHDRAWN proposal (see STATUS above): the socket does not belong here; the binding is a launch-time descriptor.
 SLATES ${SLATES_SOCK} shards0 /slates
 
 # Hand off to the workload once the slates volume is mounted.
