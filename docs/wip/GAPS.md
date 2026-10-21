@@ -901,6 +901,55 @@ and the reason is not a host that will not have it — it is that the launcher c
 written. Nothing had ever run it, because the flow also needs `/dev/fuse` and `SLATES_TEST_CLI`, and the FUSE
 gate skipped first everywhere here.
 
+### 8a-tsan-shadow. ThreadSanitizer could not see slates unmap anything (2026-10-20, closed)
+
+Two TSan races, on different runs and in different crates, had one shape: a write to a freshly created
+shared region reported as racing a *read of a different region* at the **same address**.
+
+| Run | Address | Writer | Reader |
+|---|---|---|---|
+| 39527867650 | `0x7f07b1029000` | `ClientRegion::create` in `rings.rs::a_missing_reply_ends_at_the_deadline` | `ClientRegion::open` in `rings.rs::a_full_ring_refuses_and_never_drops` |
+| 39538566246 | `0x7f2ff993b000` | `Ring::init` under a daemon's `ClientRegion::create` | `copy_out` under a client's `ClientRegion::open` |
+
+Two shared objects cannot be live at one address, so in both cases one had been unmapped and the address
+reused — and ThreadSanitizer's shadow for it had outlived the mapping. The eight `rings.rs` regions carry
+eight distinct names, which rules out their being the same object.
+
+**Cause: ThreadSanitizer learns about memory by intercepting libc, and rustix does not go through libc.**
+Its default backend on Linux is `linux_raw`, which issues syscalls by inline assembly. Every `mmap` and
+`munmap` slates makes (`crates/mem/src/shared.rs:789`) is therefore invisible to the instrumentation, the
+shadow for an unmapped range is never cleared, and the next mapping at that address inherits the old one's
+history. rustix's own `build.rs` documents the escape hatch, in those words: `--cfg=rustix_use_libc`
+"allows end users to enable the libc backend even if rustix is depended on transitively".
+
+Added to the lane's `RUSTFLAGS`. The cost is that the lane exercises rustix's libc backend rather than its
+raw one — a deviation from the shipped build, but a smaller one than `-Zbuild-std` already is, against a
+lane whose reports could not be trusted and in which a real race would have been lost among the false ones.
+
+**Owed:** the next TSan run is the proof. If races at reused addresses persist, the cause is something else
+and this cfg should come back out rather than stay as decoration.
+
+### 8a-sdk-loop. The async Python SDK held the event loop for 0.3 s, once in eight runs (2026-10-20, OPEN)
+
+`test_every_async_call_ends_across_restart_silence_cancellation_and_death` (AUD-29-19/20) failed on run
+39538566246: **worst loop lateness 0.298 s against a bound of 0.1 s plus 0.001 s of measured machine noise.**
+
+This one is not a measurement defect, and that is why it is recorded rather than fixed in passing. The
+bound's noise term is not a constant or a guess: `Noise` runs a sampler **in a separate process** for the
+whole scenario, sleeping the ticker's own period and recording how late each sleep returned — a separate
+process precisely so that a native call wrongly holding the GIL cannot mask the hold the bound exists to
+catch. Across the same window in which the loop's ticker was 298 ms late, that sampler was never more than
+**1 ms** late. The machine was not busy; the loop was held.
+
+Intermittent: the lane passed on seven of the eight most recent runs of `main` and failed on this one.
+Nothing in that commit touches the Python SDK.
+
+**Not yet root-caused, and not guessed at.** The scenario kills a daemon under outstanding calls and waits
+for the anchor to restart it, so a reconnect happens inside the measured window, and `CLAIM_WAIT_NS` is one
+second — but whether the async client's reconnect path is what holds the loop is a hypothesis with no log
+behind it. Reproducing needs the built extension against a real daemon on Linux. Related prior work:
+`reply-park-lost-wake` (an unfenced reply-side park, fixed bc81da4).
+
 ### 8a-tsan-wait. The TSan lane declared itself 25× slow and one budget never listened (2026-10-20, closed)
 
 `a_client_maps_files_across_shards_and_always_gets_the_bytes` failed on the TSan lane (run 39527867650) with
