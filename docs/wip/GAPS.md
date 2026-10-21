@@ -7784,7 +7784,7 @@ finding above showed a doc promising a device half that does not exist. The answ
 | **L0** writable-DAX opt-in (`Volume::enable_writable_dax` checked in `dax_map_write`) | yes — it is a check on the map path itself |
 | **L2** the moving target (`Volume::dax_migrate`) | ~~**none**~~ — **stale; corrected 2026-10-20.** The daemon drives it: `shift_mapped_windows` (`daemon.rs:3630`) → `Volume::dax_shift_slice` → `dax_migrate` (`dax.rs:1221`). The device is told too, by the `pending_revokes` queue a service pass drains, so the guest re-faults onto the moved row. What does not exist is the `MAP_FIXED` remap the doc promised — a fault per shifted window, not a stale guest. |
 | **B2** the self-healing net (`Store::dax_guard` / `dax_scrub`) | ~~**none**~~ — **stale; corrected 2026-10-20.** Both are called: `dax_guard` from `guard_if_asked` on the read-map paths, `dax_scrub` from the daemon's sweep (`daemon.rs:3434` → `dax_scrub_slice` → `dax_scrub`). What is unwired is `Volume::enable_dax_integrity_guard`, the opt-in `guard_if_asked` checks — so nothing is ever guarded and the sweep passes over an empty set. |
-| `Store::dax_revoke_block` | **none** |
+| ~~`Store::dax_revoke_block`~~ | **gone, 2026-10-18** — removed rather than wired, for the reason row 5 of the gate checklist gives: no reference anywhere, and every path that could harm a mapped block already checks the pin. Kept in this table struck through so the row is not read as an outstanding one. |
 | `dax_map_dir`, `dax_map_read/write`, `dax_revoke_inode`, `dax_revoke_writable_of_prefix`, `dax_revoke_volume`, `dax_still_current` | yes |
 
 Checked, not assumed: outside `crates/vfs/src/dax.rs` the only references to `dax_guard`, `dax_scrub` and
