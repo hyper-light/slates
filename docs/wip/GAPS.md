@@ -7506,7 +7506,24 @@ its own page table and never calls the daemon), so the defense had to be at the 
        windows outnumber the bound overflows it partway through, and every window past that point was
        unpinned while still mapped. Fixed in `c4343670`.
 
-     Five tests now hold the property, **all run on Linux** (arm64 container, 41 passed, 0 failed):
+     **Verified on every architecture slates ships**, 2026-10-21 — not inferred from one:
+
+     | host | how | result |
+     |---|---|---|
+     | macOS arm64 | native | 73 passed (whole crate) |
+     | Linux arm64 | `rust:1.98` container, native on Apple Silicon | 41 passed, 0 failed |
+     | Linux x86_64 | same image, `--platform linux/amd64` | 41 passed, 0 failed |
+     | Windows | n/a — virtio-fs and the DAX path are Unix; the lane is green on CI | — |
+
+     **On chaos.** The teardown path is already under the random schedule: `device_chaos_step` has five
+     operations and four of them (unmap, write, truncate, sweep) produce a teardown, with the pin ledger
+     balanced across the run. The two *refusal* arms this change added are not reached by it, and
+     deliberately are not chased there: each is a single branch inside one call (`if unmap.is_ok()`,
+     `if matches!(refusal, Channel(_))`) with no interleaving component for a schedule to find, and each is
+     held by a targeted test that was red-checked by restoring the old code. Chaos earns its cost on orderings;
+     these are decisions.
+
+     Five tests hold the property, all run on both Linux architectures:
      `a_revoke_whose_unmap_is_refused_keeps_the_block_pinned`,
      `a_message_based_teardown_holds_the_block_until_the_front_end_acks_the_unmap`,
      `a_teardown_refused_short_of_a_dead_channel_keeps_the_block_pinned`,
