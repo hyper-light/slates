@@ -34,7 +34,7 @@ use slates_db::register::HostId;
 
 /// Format: the first renewal nonce. The detector numbers its probes and relays from zero, one per probe, so its
 /// nonces stay below this for 2⁶³ probes (at one a microsecond, about 292,000 years); a renewal's are at or above it,
-/// and a detector nonce that ever reaches it stops renewals ([`Renewals::detector_nonce`]).
+/// and a detector nonce that ever reaches it stops renewals ([`Renewals::detector_probed`]).
 pub const RENEWAL_NONCE_BASE: u64 = 1 << 63;
 
 /// How the owner renews its lease: how often, and for how long an answer can still confirm it.

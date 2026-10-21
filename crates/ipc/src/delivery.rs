@@ -770,7 +770,7 @@ mod platform {
   }
 
   /// The `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` naming exactly the handles the child inherits (Raymond
-  /// Chen, "Programmatically controlling which handles are inherited by new processes in Win32" [D]).
+  /// Chen, "Programmatically controlling which handles are inherited by new processes in Win32" \[D\]).
   /// The list's storage is pointer-aligned and the handle array outlives the list, as the attribute
   /// keeps a pointer to it until the list is deleted (on drop).
   struct AttributeList {
@@ -835,7 +835,7 @@ mod platform {
   }
 
   /// Appends `argument` to a command line under the C runtime's parsing rules (Microsoft, "Parsing
-  /// C++ command-line arguments" [B]): an argument with a space, a tab, a quote — or nothing at all —
+  /// C++ command-line arguments" \[B\]): an argument with a space, a tab, a quote — or nothing at all —
   /// is quoted; a quote inside is escaped with a backslash; backslashes are doubled only where they
   /// precede a quote or the closing quote.
   fn append_quoted(line: &mut Vec<u16>, argument: &OsStr) {
@@ -1279,7 +1279,7 @@ mod platform {
   }
 
   /// Format: the two low bits of a kernel handle's value, which the kernel ignores and never sets
-  /// (Chen, "Why are kernel HANDLEs always a multiple of four?" [D]); a named value with either set
+  /// (Chen, "Why are kernel HANDLEs always a multiple of four?" \[D\]); a named value with either set
   /// aliases another value, so it is refused as malformed.
   const HANDLE_TAG_BITS: usize = 0b11;
 
@@ -1374,7 +1374,7 @@ mod platform {
   }
 
   /// Format: the longest pipe name read back — `MAX_PATH` UTF-16 units, the bound the standard
-  /// library's own pipe-name query uses (Rust std, `msys_tty_on` [C]); a delivery name is far shorter,
+  /// library's own pipe-name query uses (Rust std, `msys_tty_on` \[C\]); a delivery name is far shorter,
   /// and a name that does not fit is not a delivery's.
   const NAME_UNITS: usize = MAX_PATH as usize;
 

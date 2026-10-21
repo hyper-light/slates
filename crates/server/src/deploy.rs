@@ -151,7 +151,7 @@ pub struct FleetNodeEntry {
   pub domain: Option<DomainId>,
   /// The node's **region** (the operator assigns it), so the root group across regions agrees on which
   /// regions exist and routes cross-region (§4.8, D-14). `None` — the default — puts the node in the sole
-  /// region [`RegionId(0)`], which collapses to a single-region fleet whose root group is the degenerate
+  /// region `RegionId(0)`, which collapses to a single-region fleet whose root group is the degenerate
   /// self-leading group (R8); the operator declares one only for a genuine multi-region deployment.
   pub region: Option<RegionId>,
 }

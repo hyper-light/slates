@@ -901,6 +901,61 @@ and the reason is not a host that will not have it — it is that the launcher c
 written. Nothing had ever run it, because the flow also needs `/dev/fuse` and `SLATES_TEST_CLI`, and the FUSE
 gate skipped first everywhere here.
 
+### 8a-rustdoc. Nothing ever ran rustdoc; 95 references named things that do not exist (2026-10-20, closed)
+
+The only `RUSTDOCFLAGS` in the tree was in `xtask/src/tsan.rs`, for sanitizer flags. No lane, no xtask and no
+habit ever ran `cargo doc`, so in a project whose numbered identifiers and module docs are the handover
+mechanism, nothing checked that a doc reference named a real item. The first run failed with **95 errors
+across fourteen crates**, peeled one crate at a time (rustdoc stops at the first crate that fails).
+
+What they were, by kind:
+
+| Kind | Count | Examples |
+|---|---|---|
+| A type or function that does not exist anywhere | 14 | `WithHost::land_advance_one`/`_end`/`land_advance` (no `WithHost` has ever been in this tree; the methods are `Overlay`'s), `Renewals::detector_nonce` (it is `detector_probed`), `collect_acks` (`collect_bound`), `record_acks` (`record_acks_in`), `placed_on_current_cohort` (`greens_placed_on_current_cohort`), `subject_of` (`auth_sys_identity`), `serve_one` (`serve_connection`), `Fattr3::change` (`V4Attrs::change`), `Self::set_owner_gid` (`set_groups`), `Demux::accept` (`DemuxId::accept`), `Slot::generation_base` (`Entry::generation_base`), `accept_probes`, `probe_peer`, `serve_peer_probes`, `fold_peer_state`, `ProbeTiming::budget` |
+| Prose that rustdoc read as a link | 33 | the evidence-tier markers `\[A\]` and `\[C\]` (12), the editorial `\[its\]` in a quotation of Appendix C (2), `RegionId(0)` (2), and the PyO3 docstrings' Python method names `Client.connect` and the rest (15) |
+| A real item named by a path that does not reach it | 30 | `MemError::ForeignExtent`, `DaxZones::return_slot`, `BasePlane::durable_change_token`, `crate::fleet::*` (private items of another module), `ConfigCommand`, `RootGroup::leader`, `FleetNode::observe` |
+| An item that no documentation build can see | 10 | `#[cfg]`-gated: `crate::channel` and `crate::vhost_user` (Linux-only), `mount`/`Mount::unmount`/`begin_mount`/`begin_unmount`, `Event` (Windows-only), `classify` (non-macOS non-Linux Unix or `test`) |
+| Ambiguous or redundant | 7 | a name that is both a module and a macro (`derived`, `derive`, `bench`), both a module and a function (`splice`, `crate::restore`), and three explicit targets equal to what the text already resolved to |
+| A doc comment attached to the wrong item | 1 | `volume.rs`: `IdleSweep` was inserted between a paragraph on how an inode's content bytes are charged and `content_by_epoch`, the function it describes, so `IdleSweep` rendered with that paragraph and `content_by_epoch` had none |
+
+The last one is the second orphaned doc comment found today (the first was in `crates/test-seeds`), and the
+`WithHost` trio is the same shape as the stale caller table corrected in `ecb2210f`: a document kept claiming
+a name the code had moved past, and nothing could tell.
+
+**Gated** in `gates` (ubuntu and macos) as `cargo doc --workspace --no-deps --document-private-items` with
+`-D warnings -A rustdoc::private_intra_doc_links`. Private items are documented because most of slates' design
+lives in private module docs, and the private-link lint is allowed for the same reason — those links resolve in
+the output this builds. `broken_intra_doc_links`, the one that catches a stale reference, stays denied.
+
+**Owed:** the gate runs on ubuntu and macos, so Windows-only documentation (`bridge-winfsp`, the Windows arms
+of the paired `#[cfg]` modules) is still checked by nothing. Five of the ten cfg-gated references above were
+found only because macOS cannot see Linux items; the reverse set has never been looked at.
+
+**Owed:** five references were deleted rather than repointed, because nothing of that name exists and the
+right pointer needs someone who owns §4.8's SWIM wiring: `accept_probes`, `probe_peer`, `serve_peer_probes`,
+`fold_peer_state`, `ProbeTiming::budget`, all in `crates/server/src/fleet.rs`.
+
+### 8a-fdscan. A descriptor probe counted every parallel test's objects as its own (2026-10-20, closed)
+
+The same push turned the `gates (ubuntu-latest)` lane red on
+`a_zero_copy_reads_descriptor_authorizes_its_window_and_nothing_more` — the §4.6 A-135 test that a copy-path
+read installs no memory-object descriptor in the peer. It reported thirteen. Every one of the thirteen was
+named `cl-resume-slow-1-18164`: a **different test's** daemon, with `0 neighbour marker(s) reachable` through
+any of them.
+
+`memory_object_descriptors()` read `/proc/self/fd` with no filter beyond `memfd:`, and the probe is a
+difference — the set before the map against the set after. The client test binary runs its tests on parallel
+threads over one descriptor table and the daemon runs in-process, so that difference reports whatever a
+sibling test opened while this one ran. The security property was never in question; the measurement was not
+attributable.
+
+Scoped both scans to this test's own daemon instance (`cl-mapauth-<pid>`), which a descriptor from *this*
+hand-off necessarily names, so the property is kept whole and only the noise goes.
+`crates/server/tests/recovery.rs` (`occurrences_in_content`, `allocated_in_content`) had already scoped its
+scans by object name; this was the one site that had not. **Third instance today of one shape: a test whose
+claim is narrower than the thing it measures** — see `8a-crlf` and `sweep-for-paths-nothing-runs`.
+
 ### 8a-crlf. A Windows checkout rewrote the bytes a doc-truth test compares (2026-10-20, closed)
 
 The first push of this session's 250 commits turned the `aarch64 windows (native, by test)` lane red on
@@ -924,7 +979,7 @@ it staged 263 changed lines in each of 24 NIST SHAVS vectors, whose upstream `.g
 restores no-opinion over vendor and stages zero files.
 `docs/bugs/2026-10-20-a-windows-checkout-rewrote-the-bytes-a-doc-truth-test-compares.md`.
 
-**Owed:** the proof is the next arm64 Windows run; native Windows cannot be executed from this machine.
+**Proven** on run 39528936826: `aarch64 windows (native, by test)` success, against failure on the parent commit's run 39527867650. Native Windows cannot be executed from this machine, so CI was the arbiter.
 
 ### 8a-win-dumps. Windows has no unprivileged core-dump exclusion, and the CLI now says so (2026-10-20, OPEN — needs Ada)
 

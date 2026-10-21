@@ -1,5 +1,5 @@
 //! A windowed maximum filter (draft-ietf-ccwg-bbr-06 §5.5.5, which names Kathleen Nichols' algorithm as
-//! implemented in Linux's `lib/win_minmax.c` [C]): the maximum of a stream of samples over the most recent
+//! implemented in Linux's `lib/win_minmax.c` \[C\]): the maximum of a stream of samples over the most recent
 //! `window` units of a caller-chosen clock (a round count, or BBR's ProbeBW cycle count), in constant space
 //! — three samples, the best, second-best and third-best in successive sub-windows — so the estimate
 //! forgets an old peak once it ages out, without keeping every sample.
@@ -82,7 +82,7 @@ impl WindowedMax {
 
 /// A windowed minimum filter: the same algorithm as [`WindowedMax`] over the negated order (Linux
 /// `minmax_running_min`) — the minimum of the samples over the last `window` time units in constant space.
-/// Copa's minimum-RTT, standing-RTT and mode-detection windows use it, as mvfst's Copa does [C].
+/// Copa's minimum-RTT, standing-RTT and mode-detection windows use it, as mvfst's Copa does \[C\].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct WindowedMin {
   inverted: WindowedMax,

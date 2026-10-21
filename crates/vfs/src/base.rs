@@ -3098,7 +3098,7 @@ impl Overlay<'_> {
   }
 
   /// The one-time setup of a landing's advance (A-133): the overlay's base plane, if a fresh (non-overlay) volume is
-  /// gaining one. The per-entry advance ([`WithHost::land_advance_one`]) and its end ([`WithHost::land_advance_end`])
+  /// gaining one. The per-entry advance ([`Overlay::land_advance_one`]) and its end ([`Overlay::land_advance_end`])
   /// follow, so a large landing's O(entries) advance is sliced across the shard's steps rather than held in one.
   pub fn land_advance_begin(
     &mut self,
@@ -3118,7 +3118,7 @@ impl Overlay<'_> {
   /// One entry of a landing's advance (A-133): the overlay surgery for a single landed path — pure in-memory, no
   /// durable op, so a crash before the completion commits rebuilds the un-advanced overlay and the resume re-lands.
   /// Each entry is independent, re-evaluated against the current head, so slicing the loop across the shard's steps
-  /// is equivalent to one call ([`WithHost::land_advance`]).
+  /// is equivalent to one call ([`Overlay::land_advance`]).
   pub fn land_advance_one(
     &mut self,
     store: &mut Store,

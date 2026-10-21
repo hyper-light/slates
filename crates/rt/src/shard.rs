@@ -845,7 +845,7 @@ impl ShardContext {
 
   /// Registers one-shot interest in a socket's readability with the shard's driver (§4.10a): when it
   /// next becomes readable, the driver wakes the task whose `word` this is. The path a UDP recv future
-  /// takes; mirrors [`arm_timer`], but on the driver rather than the wheel.
+  /// takes; mirrors [`Self::arm_timer`], but on the driver rather than the wheel.
   pub fn register_readable(&self, raw: i32, word: u64) -> Result<(), RtError> {
     self
       .with_inner(|inner| inner.driver.register_readable(raw, word))
@@ -991,7 +991,7 @@ impl ShardContext {
   }
 
   /// Harvests the driver's ready I/O completions **without blocking** (a zero timeout) and queues their
-  /// tasks: for a continuously busy [`run`] that would otherwise never reach [`park`] where I/O is
+  /// tasks: for a continuously busy [`Self::run`] that would otherwise never reach [`Self::park`] where I/O is
   /// harvested, and on every turn of the idle spin ([`Self::spin_for_work`]), whose socket readiness
   /// would otherwise wait out the window. True when a completion was queued. Unlike `park` it does not
   /// set the parked flag: the shard is not waiting, so a concurrent kick must not believe it is. A

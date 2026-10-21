@@ -28,7 +28,7 @@
 //! scoped to that capability), `ls /` (a `READDIR` of the host root scatters an entry-gather to every
 //! shard and lists the volume the capability authorizes by its friendly name), `cd <name>` (a root
 //! `LOOKUP` routes across shards by `owner_of_name`), read/write. Each request runs as the mounting user
-//! ([`subject_of`] reads the uid from the `AUTH_SYS` credential, §4.13; `AUTH_NONE` falls back to root)
+//! ([`auth_sys_identity`] reads the uid from the `AUTH_SYS` credential, §4.13; `AUTH_NONE` falls back to root)
 //! for the POSIX permission rules — but **authorization is the mount capability, never the uid**
 //! (§4.13; AUD-01): a supplied uid and loopback reachability identify no consumer, so every volume is
 //! served only through the capability `attach` returned — `<attachment_hex>.<token_hex>` in the mount
@@ -558,7 +558,7 @@ fn publication_reply(
 }
 
 /// The rights every NFS request runs under (§4.13): read-write, so a mount can read and write the
-/// volumes it reaches. Which *user* the request runs as comes from its credential ([`subject_of`]).
+/// volumes it reaches. Which *user* the request runs as comes from its credential ([`auth_sys_identity`]).
 fn mount_rights() -> Rights {
   Rights {
     read: true,
@@ -2262,7 +2262,7 @@ impl Call {
 }
 
 /// The RPC reply for one deframed call message, framed as one record: the entry the network export's TLS session
-/// serves its plaintext calls through ([`crate::nfs_tls`]), exactly as [`serve_one`] serves the loopback's.
+/// serves its plaintext calls through ([`crate::nfs_tls`]), exactly as [`serve_connection`] serves the loopback's.
 pub(crate) async fn reply_to_message(this: u16, message: Vec<u8>, port: u16) -> Vec<u8> {
   reply_to(this, Call::parse(message), port, None).await
 }

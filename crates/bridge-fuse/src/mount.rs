@@ -14,12 +14,12 @@
 //! is reaped and its exit reported, a helper that never answers is killed at the deadline and
 //! reaped, and a helper that sends a descriptor hands it over (AC-3.12/T-3.15; audit BUG-14,
 //! "early failure receiving the mount helper's descriptor returns before waiting for its
-//! child"). Only [`mount`] and [`Mount::unmount`], which name `fusermount3` and the FUSE channel,
+//! child"). Only `mount` and `Mount::unmount`, which name `fusermount3` and the FUSE channel,
 //! are Linux; the handshake runs against the real helper in the CI Linux lane.
 //!
-//! The daemon's shard never blocks on a helper (R6; AUD-29-64): [`begin_handshake`] and [`begin_mount`]
+//! The daemon's shard never blocks on a helper (R6; AUD-29-64): [`begin_handshake`] and `begin_mount`
 //! spawn it and return a [`PendingHandshake`] the shard polls when the socket is readable and on its tick
-//! until the helper is reaped, and [`begin_unmount`] returns a [`PendingExit`] it polls the same way. Both
+//! until the helper is reaped, and `begin_unmount` returns a [`PendingExit`] it polls the same way. Both
 //! own their helper as the blocking form does: dropped (a cancelled task), they kill and reap it
 //! (`tests/handshake.rs`, every Unix; `tests/owner_turn.rs`, a real mount on Linux). No `unsafe`: the
 //! socket pair, the descriptor pass, the deadline and the spawn use rustix's I/O-safe wrappers

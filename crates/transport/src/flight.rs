@@ -3,7 +3,7 @@
 //! A handshake flight — the bytes `rustls::quic::Connection::write_hs` produces for one turn of the
 //! TLS 1.3 handshake — can be larger than a single datagram: a mutual-TLS server flight carries the
 //! server's certificate chain, and an operator's chain of a leaf plus an intermediate or two exceeds the
-//! [`MIN_DATAGRAM_BYTES`](crate::endpoint::MIN_DATAGRAM_BYTES) path floor. Before this the whole flight
+//! [`MIN_DATAGRAM_BYTES`] path floor. Before this the whole flight
 //! rode one datagram, so a flight above the receiver's buffer was refused typed
 //! (`EndpointError::FlightTooLarge`) and a flight above the path MTU relied on IP fragmentation (which a
 //! router may drop). This splits a flight into fragments that each fit the path floor and reassembles

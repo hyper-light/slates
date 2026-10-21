@@ -801,7 +801,7 @@ const ROUND_ANCHORS: RoundAnchors = RoundAnchors {
 };
 
 /// The record-plane and configuration-consensus budget for one period (§4.8 "late work"). Unlike a single
-/// SWIM probe ([`ProbeTiming::budget`], a hard deadline — one missed probe is absorbed by the suspicion
+/// SWIM probe (a hard deadline — one missed probe is absorbed by the suspicion
 /// window), a record commit, a takeover promotion, a Raft replication round, an election or a learner fetch
 /// **gathers replies from several holders or voters at once**, and under CPU starvation — a noisy
 /// shared-tenant neighbour, a hypervisor steal, the kernel saturated by another process's syscalls — those
@@ -1086,7 +1086,7 @@ async fn run_demux(demux: DemuxId) {
 
 /// Accepts every record session a peer dials on the record socket and serves it over this node's durable
 /// holds (§4.8): one serve task per session, which resolves the peer it authenticated through `roster`.
-/// Bounded as [`accept_probes`] is.
+/// Bounded as the peer accept loops are.
 async fn accept_records(demux: DemuxId, local: HostId, roster: Vec<Rostered>, driver: PeerDriver) {
   loop {
     // An unreachable demultiplexer (the shard's context ended) ends the loop, counted as a serve socket
@@ -1275,7 +1275,7 @@ pub(crate) fn count_refusal_in(state: &mut ShardState, kind: &'static str) {
 /// candidate holder), and a **prepare** (a new owner's phase-one message when it takes over an object) is
 /// answered from that same hold with a binding promise. Both are served here because the session plane
 /// carries both and `serve_once` hands the handler the raw request either way; the two never collide, a
-/// [`Prepare`] being a fixed 40 bytes and a [`Record`] always longer (its prefix alone exceeds that), so
+/// [`slates_db::register::Prepare`] being a fixed 40 bytes and a [`Record`] always longer (its prefix alone exceeds that), so
 /// the length disambiguates. The acceptor authorizes the record's or prepare's owner and configuration generation against
 /// the authority the takeover installed, fences the epoch, and refuses a stale writer. The peer is whoever
 /// the handshake authenticated — its certificate names it in `roster` (mutual TLS admits only roster
@@ -3892,7 +3892,7 @@ pub(crate) fn count_refusal(kind: &'static str) -> u64 {
 }
 
 /// Whether this node keeps **direct contact** with `peer` — a record session dialed and kept up for the
-/// coordinator ([`establish_record_link`]) and a SWIM probe of its own ([`probe_peer`]): the peers the
+/// coordinator ([`establish_record_link`]) and a SWIM probe of its own: the peers the
 /// coordinator ever borrows a session to ([`take_sessions`]) and whose liveness it must see first-hand. That
 /// is a **candidate holder** in this owner's bounded record neighbourhood (§4.8, D-14 — the copyset,
 /// `select_neighbourhood` at the scatter width, so at the candidate floor `2f + 1` an owner reaches just `2f`
@@ -3913,7 +3913,7 @@ pub(crate) fn count_refusal(kind: &'static str) -> u64 {
 /// wired), so judged by role alone a dead voter stayed probed and linked for good — its probe session still
 /// counted as formed (`fleet_peers_probed` in `slates status` stayed at two after the owner's death in the
 /// three-process deployment test) and its record link re-dialed into the void, a handshake budget at a
-/// time. A retired peer that comes back is re-admitted alive by its own probes ([`serve_peer_probes`]) and
+/// time. A retired peer that comes back is re-admitted alive by its own probes and
 /// regains contact then — which is what reaching the surviving voters makes possible.
 pub(crate) fn keeps_direct_contact_with(state: &ShardState, peer: HostId) -> bool {
   direct_contact(state, peer).kept()
@@ -4757,7 +4757,7 @@ const FORWARD_STREAM: u64 = 11;
 
 /// Format: the stream id a member's **report** to the council rides on a record session (§4.8 "Neighbourhood
 /// changes", "Promotion and takeover"): a settlement or a takeover confirmation the member makes about itself,
-/// as an encoded [`ConfigCommand`], answered with a [`ReportOutcome`]. Distinct from every other stream the
+/// as an encoded [`slates_cluster::config_group::ConfigCommand`], answered with a [`ReportOutcome`]. Distinct from every other stream the
 /// session multiplexes (1–14), so `serve_peer_records` dispatches it by its stream.
 const REPORT_STREAM: u64 = 15;
 /// The stream a node's recipient public key is asked on (A-92 piece 4b): answered from the control shard, which holds
@@ -5406,7 +5406,7 @@ async fn drive_council_election(
 /// Whether this node's own SWIM membership view differs from the members of the configuration it has
 /// installed — the signal a learner uses to fetch the council's committed configuration reactively (§4.8 the
 /// piggyback rule). It compares this node's **alive** set against the configuration's **members**, which is
-/// exactly the predicate the council leader reconciles from ([`RegionalCouncil::reconcile_alive`] admits an
+/// exactly the predicate the council leader reconciles from ([`slates_cluster::config_group::RegionalCouncil::reconcile_alive`] admits an
 /// alive non-member and takes over a member SWIM confirmed dead), so a divergence means the council has — or, if
 /// this node's view is ahead of the leader's, soon will have — a newer configuration this node must install:
 /// to admit a newcomer, retire a departed member, or take over a failed owner's objects (the quiescent
@@ -6138,7 +6138,7 @@ async fn drive_learner_fetch(
 /// Installs the configuration the council has committed into this node's placement view and takes over any
 /// object whose owner it has retired (§4.8, D-14 — the council is the authority, this node places under what
 /// it agreed). Derives this node's owner view from the regional configuration (`configuration_for`) and
-/// installs it ([`FleetNode::install_configuration`]): the placement configuration the verbs read is updated,
+/// installs it ([`slates_cluster::fleet::FleetNode::install_configuration`]): the placement configuration the verbs read is updated,
 /// the owner acceptor's authority is brought into step (records write under the current generation), and the
 /// departed owners' objects this node now owns are returned — recorded as pending takeovers the record plane
 /// drives, with every held acceptor's authority brought into step so this node can promote what it took over
@@ -6210,7 +6210,7 @@ fn sync_config_from_council(local: HostId) {
 /// Fans the control shard's current committed configurations — the council's placement `Configuration` and the
 /// root group's `RootConfiguration` — to every other shard each period (§4.8, D-7 "one owning shard per
 /// volume", §4.8 "Lookup"). Every shard serves clients: the placement verbs (`place`/`region_placed`/
-/// `await_placed`/`host_epoch`) and the cross-region lookup guard ([`crate::verbs::home_redirect`]) run on a
+/// `await_placed`/`host_epoch`) and the cross-region lookup guard (`crate::verbs::home_redirect`) run on a
 /// volume's owner shard, which may not be this control shard, so each shard must read what the council and the
 /// root group committed or a volume owned elsewhere would report a stale placement or home after a membership
 /// change, move or promotion. Only the control shard drives the council and the root group and installs their
@@ -6218,11 +6218,11 @@ fn sync_config_from_council(local: HostId) {
 /// from here.
 ///
 /// **Re-fanned every period, not only on change.** `run_on` is refused when a shard's control channel is
-/// momentarily full ([`RtError::ControlFull`]), and a fan dropped on the one period a configuration changed
+/// momentarily full ([`slates_rt::RtError::ControlFull`]), and a fan dropped on the one period a configuration changed
 /// would otherwise leave that shard stale until the next change. Re-fanning heals it next period. This is the
 /// authoritative cross-shard state: an owner shard routes and admits from the **committed configuration**
 /// fanned here (`fleet.configuration()`, `object_owner`), never from the raw SWIM membership, which
-/// [`fold_peer_state`] publishes to the other shards **best-effort** for D-7 uniformity but which no
+/// The peer-state fold publishes to the other shards **best-effort** for D-7 uniformity but which no
 /// off-control-shard path reads, so a membership fold dropped on a full channel is harmless where a dropped
 /// configuration fan would not be. The receiving side is
 /// version-gated (`install_configuration` installs only a newer version; `RootGroup::adopt` ignores an
@@ -6884,7 +6884,7 @@ const NANOS_PER_SECOND: u64 = 1_000_000_000;
 /// Commits one head to the candidate holders that have not yet acknowledged it (those with a live session in
 /// the shard state), through the owner's own acceptor, at `f + 1`. The holders' sessions are borrowed for the
 /// commit and returned whatever the outcome (`request_within`; stragglers later). Every acknowledgement the
-/// round collected is recorded **whatever the round's outcome** ([`record_acks`]): once a head is placed by
+/// round collected is recorded **whatever the round's outcome** ([`record_acks_in`]): once a head is placed by
 /// an earlier round, a later round re-shipping to a straggler is short of quorum on its own — `commit_record`
 /// counts only its own round — and discarding its acknowledgements re-shipped that straggler forever at
 /// `f > 1`. Returns the dispatch to settle, or `None` if no holder could be reached this period.

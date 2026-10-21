@@ -5,7 +5,7 @@
 //! that dialer), a 1-RTT packet by the **connection id** in its short header (`endpoint.rs`: eight bytes
 //! both ends derive from the TLS exporter once the handshake completes, so the id needs no wire
 //! negotiation and is unique per session). A datagram from an unknown source opens a new server session
-//! and hands it to whoever awaits [`Demux::accept`]; a 1-RTT packet naming no session is dropped and
+//! and hands it to whoever awaits [`DemuxId::accept`]; a 1-RTT packet naming no session is dropped and
 //! counted, never a panic.
 //!
 //! **Why this shape.** Before it, the fleet bound one serve socket per peer per plane because an
@@ -200,7 +200,7 @@ struct Inner {
   /// Every established session by the peer certificate it authenticated with.
   by_peer: BTreeMap<Vec<u8>, PeerSessions>,
   pending_handshakes: usize,
-  /// Server sessions opened for a new source, awaiting [`Demux::accept`].
+  /// Server sessions opened for a new source, awaiting [`DemuxId::accept`].
   pending: VecDeque<Endpoint>,
   accept_waker: Option<Waker>,
   counters: DemuxCounters,

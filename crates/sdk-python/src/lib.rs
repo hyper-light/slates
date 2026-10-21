@@ -771,7 +771,7 @@ impl AsyncClient {
   /// (AUD-29-19): the rendezvous claim is made at once and its answer read on the loop's timers at the
   /// pacing the client asks for. Awaitable; raises `SlatesError` when the daemon refuses the claim or
   /// leaves it unanswered past the claim wait. `reply_ns`/`reconnect_ns` are the same derived budgets
-  /// [`Client.connect`] takes.
+  /// `Client.connect` takes.
   #[staticmethod]
   #[pyo3(signature = (instance, reply_ns, reconnect_ns))]
   fn connect(
@@ -818,7 +818,7 @@ impl AsyncClient {
     self.inner.outstanding_limit()
   }
 
-  /// Creates a volume and returns its id as hex (§4.4) — the async form of [`Client.create`].
+  /// Creates a volume and returns its id as hex (§4.4) — the async form of `Client.create`.
   #[pyo3(signature = (name, size_bytes, dynamic=false, fold=true, require_locked=false, base=None))]
   fn create<'py>(
     slf: Bound<'py, Self>,
@@ -845,7 +845,7 @@ impl AsyncClient {
   }
 
   /// Takes a snapshot of the volume named by its hex id and returns the snapshot's sequence (§4.4) —
-  /// the async form of [`Client.snapshot`].
+  /// the async form of `Client.snapshot`.
   fn snapshot<'py>(slf: Bound<'py, Self>, volume: &str) -> PyResult<Bound<'py, PyAny>> {
     let py = slf.py();
     let id = parse_volume(volume)?;
@@ -862,7 +862,7 @@ impl AsyncClient {
     finish(&slf, ticket, fast, Decode::Snapshotted)
   }
 
-  /// Reads the volume's status as a dict (§4.4) — the async form of [`Client.status`], the identical
+  /// Reads the volume's status as a dict (§4.4) — the async form of `Client.status`, the identical
   /// shape.
   fn status<'py>(slf: Bound<'py, Self>, volume: &str) -> PyResult<Bound<'py, PyAny>> {
     let py = slf.py();
@@ -880,7 +880,7 @@ impl AsyncClient {
     finish(&slf, ticket, fast, Decode::Status)
   }
 
-  /// Lists the daemon's volumes as a list of dicts (§4.4) — the async form of [`Client.list`].
+  /// Lists the daemon's volumes as a list of dicts (§4.4) — the async form of `Client.list`.
   fn list<'py>(slf: Bound<'py, Self>) -> PyResult<Bound<'py, PyAny>> {
     let py = slf.py();
     let (ticket, fast) = slf.borrow_mut().begin_spin(
@@ -896,7 +896,7 @@ impl AsyncClient {
     finish(&slf, ticket, fast, Decode::Listed)
   }
 
-  /// Resizes the volume's quota (§4.4) — the async form of [`Client.resize`]; resolves to `None`.
+  /// Resizes the volume's quota (§4.4) — the async form of `Client.resize`; resolves to `None`.
   #[pyo3(signature = (volume, size_bytes, dynamic=false))]
   fn resize<'py>(
     slf: Bound<'py, Self>,
@@ -924,7 +924,7 @@ impl AsyncClient {
     finish(&slf, ticket, fast, Decode::Resized)
   }
 
-  /// Destroys the volume and reclaims its memory (§4.4) — the async form of [`Client.destroy`];
+  /// Destroys the volume and reclaims its memory (§4.4) — the async form of `Client.destroy`;
   /// resolves to `None`.
   fn destroy<'py>(slf: Bound<'py, Self>, volume: &str) -> PyResult<Bound<'py, PyAny>> {
     let py = slf.py();
@@ -942,7 +942,7 @@ impl AsyncClient {
     finish(&slf, ticket, fast, Decode::Destroyed)
   }
 
-  /// Creates a green merge target (§4.16) — the async form of [`Client.create_green`].
+  /// Creates a green merge target (§4.16) — the async form of `Client.create_green`.
   #[pyo3(signature = (name, require_evidence=false))]
   fn create_green<'py>(
     slf: Bound<'py, Self>,
@@ -967,7 +967,7 @@ impl AsyncClient {
   }
 
   /// Creates a work volume over a green (§4.16) as a `{id, base}` dict — the async form of
-  /// [`Client.create_work`].
+  /// `Client.create_work`.
   fn create_work<'py>(
     slf: Bound<'py, Self>,
     green: &str,
@@ -991,7 +991,7 @@ impl AsyncClient {
     finish(&slf, ticket, fast, Decode::WorkCreated)
   }
 
-  /// Declares a content edit on a work volume (§4.16) — the async form of [`Client.edit`]; resolves
+  /// Declares a content edit on a work volume (§4.16) — the async form of `Client.edit`; resolves
   /// to `None`.
   fn edit<'py>(
     slf: Bound<'py, Self>,
@@ -1020,7 +1020,7 @@ impl AsyncClient {
   }
 
   /// Submits a work volume's operations to its green (§4.16) as an outcome dict — the async form of
-  /// [`Client.submit`].
+  /// `Client.submit`.
   fn submit<'py>(slf: Bound<'py, Self>, work: &str) -> PyResult<Bound<'py, PyAny>> {
     let py = slf.py();
     let work = parse_volume(work)?;
@@ -1037,7 +1037,7 @@ impl AsyncClient {
     finish(&slf, ticket, fast, Decode::Submitted)
   }
 
-  /// A green's head version (§4.16) — the async form of [`Client.versions`].
+  /// A green's head version (§4.16) — the async form of `Client.versions`.
   fn versions<'py>(slf: Bound<'py, Self>, green: &str) -> PyResult<Bound<'py, PyAny>> {
     let py = slf.py();
     let green = parse_volume(green)?;
@@ -1055,7 +1055,7 @@ impl AsyncClient {
   }
 
   /// The files a green changed strictly after `version` (§4.16) — the async form of
-  /// [`Client.changed_since`].
+  /// `Client.changed_since`.
   fn changed_since<'py>(
     slf: Bound<'py, Self>,
     green: &str,
@@ -1077,7 +1077,7 @@ impl AsyncClient {
   }
 
   /// Rebases a work volume onto its green's head (§4.16) as an outcome dict — the async form of
-  /// [`Client.rebase`].
+  /// `Client.rebase`.
   fn rebase<'py>(slf: Bound<'py, Self>, work: &str) -> PyResult<Bound<'py, PyAny>> {
     let py = slf.py();
     let work = parse_volume(work)?;
@@ -1244,7 +1244,7 @@ impl AsyncClient {
     )
   }
 
-  /// Executes a landing (§4.15) — the async form of [`Client.land`]. Resolves to a dict: the finished
+  /// Executes a landing (§4.15) — the async form of `Client.land`. Resolves to a dict: the finished
   /// `outcome`, or `grant_required` with the exact `slates grant` command a human runs. The SDK creates
   /// no grant itself (R10) — a landing without a satisfying `grant` comes back for a human to authorize.
   #[pyo3(signature = (volume, target, snapshot=None, include=None, exclude=None, grant=None))]

@@ -348,7 +348,7 @@ pub struct WccAttr {
   pub mtime: Nfstime3,
   /// The last change time.
   pub ctime: Nfstime3,
-  /// The change counter, carried only in the NFSv4 dialect (as [`Fattr3::change`]).
+  /// The change counter, carried only in the NFSv4 dialect (as [`V4Attrs::change`]).
   pub change: Option<u64>,
 }
 

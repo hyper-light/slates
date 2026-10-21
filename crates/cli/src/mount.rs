@@ -5,7 +5,7 @@
 //! own NFS, so it needs no FUSE library at all.
 //!
 //! The shape is adapted from sylk's cgofuse mount (`core/purevfs`): a **pure, injectable capability
-//! detection** ([`classify`]) so the selection tests on any host with no live mount, a **probe** that
+//! detection** (`classify`) so the selection tests on any host with no live mount, a **probe** that
 //! refuses with a message naming what is missing rather than a raw `mount_nfs` failure, and the
 //! **mount/unmount lifecycle** ([`establish`]/[`unmount`]). Where sylk classifies a FUSE backend
 //! (macFUSE vs FUSE-T), slates classifies its one mechanism — `mount_nfs`, built into macOS and the

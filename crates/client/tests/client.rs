@@ -250,19 +250,32 @@ const NEIGHBOUR_MARKER: &[u8; 16] = b"SL-NEIGHBOUR-SEC";
 #[cfg(target_os = "linux")]
 const ARENA_BACKED_BYTES: usize = 20 << 10;
 
-/// This process's descriptors that name a kernel memory object (`/memfd:…`), by descriptor number.
-/// The daemon in these tests runs in this process, so its own descriptors are in the set too; the
-/// probe takes the set before a map and the set after, and what is new is what the hand-off installed.
+/// This process's descriptors that name a kernel memory object (`/memfd:…`) **of the daemon named by
+/// `instance`**, by descriptor number. The daemon in these tests runs in this process, so its own
+/// descriptors are in the set; the probe takes the set before a map and the set after, and what is new
+/// is what the hand-off installed.
+///
+/// `instance` is not an optimisation, it is what makes the difference attributable. This test binary
+/// runs its tests on parallel threads against one descriptor table, so an unfiltered scan reports every
+/// other test's objects too, and `after - before` reports whatever a sibling happened to open while this
+/// test ran. That is exactly how the ubuntu gates lane went red on 2026-10-20: thirteen descriptors
+/// "arrived" on the copy path and every one of them was named `cl-resume-slow-1`, a different test's
+/// daemon, with zero neighbour markers reachable through any of them. A descriptor this hand-off
+/// installed necessarily names this daemon's own segment or content object, so filtering to this
+/// instance keeps the whole property and drops only the noise. `crates/server/tests/recovery.rs`
+/// (`occurrences_in_content`, `allocated_in_content`) already scoped its scans by object name; this was
+/// the one that did not.
 #[cfg(target_os = "linux")]
 #[allow(clippy::disallowed_methods)] // reading this process's own descriptor table through /proc, read-only
-fn memory_object_descriptors() -> std::collections::BTreeSet<i32> {
+fn memory_object_descriptors(instance: &str) -> std::collections::BTreeSet<i32> {
   let mut found = std::collections::BTreeSet::new();
   let Ok(entries) = std::fs::read_dir("/proc/self/fd") else {
     return found;
   };
   for entry in entries.flatten() {
     let target = std::fs::read_link(entry.path()).unwrap_or_default();
-    if !target.to_string_lossy().contains("memfd:") {
+    let named = target.to_string_lossy();
+    if !named.contains("memfd:") || !named.contains(instance) {
       continue;
     }
     if let Some(number) = entry
@@ -310,7 +323,7 @@ fn occurrences_through(descriptor: std::os::fd::BorrowedFd<'_>, needle: &[u8]) -
 /// about that descriptor.
 #[cfg(target_os = "linux")]
 #[allow(clippy::disallowed_methods)] // reading this process's own descriptor table through /proc, read-only
-fn occurrences_in_this_process(needle: &[u8]) -> usize {
+fn occurrences_in_this_process(needle: &[u8], instance: &str) -> usize {
   use std::os::fd::AsFd;
 
   let mut total = 0;
@@ -319,7 +332,11 @@ fn occurrences_in_this_process(needle: &[u8]) -> usize {
   };
   for entry in entries.flatten() {
     let target = std::fs::read_link(entry.path()).unwrap_or_default();
-    if !target.to_string_lossy().contains("memfd:") {
+    let named = target.to_string_lossy();
+    // Scoped to this test's own daemon for the same reason `memory_object_descriptors` is: the claim
+    // being made is about this daemon's content object, and a parallel sibling's multi-GiB objects are
+    // neither part of it nor free to scan.
+    if !named.contains("memfd:") || !named.contains(instance) {
       continue;
     }
     let Ok(file) = std::fs::File::open(entry.path()) else {
@@ -472,13 +489,13 @@ fn a_zero_copy_reads_descriptor_authorizes_its_window_and_nothing_more() {
   // Non-vacuity, taken before the map: the neighbour's secret really is in this daemon's content
   // object, so "the handed descriptor does not show it" is a fact about the descriptor rather than
   // about the marker being absent everywhere.
-  let in_the_arena = occurrences_in_this_process(NEIGHBOUR_MARKER);
+  let in_the_arena = occurrences_in_this_process(NEIGHBOUR_MARKER, &instance);
   assert!(
     in_the_arena > 0,
     "the neighbour's content is in the daemon's content object, so the scan can find it"
   );
 
-  let before = memory_object_descriptors();
+  let before = memory_object_descriptors(&instance);
   // Non-vacuity for the detector itself, not just for the marker scan. The copy branch below asserts that *no*
   // descriptor arrived, which a detector that can see none would satisfy however the daemon behaved — so prove
   // it sees memory objects at all. The daemon runs in this process, so its own are here.
@@ -488,7 +505,7 @@ fn a_zero_copy_reads_descriptor_authorizes_its_window_and_nothing_more() {
   );
   let mapped = client.map_read(mine, "/mine.bin").unwrap();
   assert_eq!(mapped.bytes(), bytes.as_slice(), "the peer's own bytes");
-  let after = memory_object_descriptors();
+  let after = memory_object_descriptors(&instance);
   let arrived: Vec<i32> = after.difference(&before).copied().collect();
   let authorized = u64::try_from(ARENA_BACKED_BYTES).unwrap_or(0);
 

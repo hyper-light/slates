@@ -28,7 +28,7 @@ use crate::session::Frame;
 /// initial window both ends derive (R8) and doubles whenever the reader consumed a whole window in less
 /// than two round trips — the sign that the window, not the path, limited the transfer — up to the
 /// session's receive ceiling, the bound the daemon derives from its memory budget (Banned #8). The rule is
-/// Chromium QUIC's `QuicFlowController::MaybeIncreaseMaxWindowSize` [C]; the ceiling replaces Chromium's
+/// Chromium QUIC's `QuicFlowController::MaybeIncreaseMaxWindowSize` \[C\]; the ceiling replaces Chromium's
 /// fixed maximum with a derived one (R3). Without it a session's window stayed at four frames — 4.8 kB,
 /// about 48 kB/s on a 100 ms path, whatever the congestion controller allowed.
 #[derive(Debug)]

@@ -91,7 +91,7 @@ pub struct ShiftSlice {
   pub unsupported: bool,
 }
 
-/// What one slice of §4.6 B2's periodic scrub did ([`Store::dax_scrub_slice`]).
+/// What one slice of §4.6 B2's periodic scrub did ([`Volume::dax_scrub_slice`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ScrubSlice {
   /// Guarded blocks that still matched the checksum they were guarded with.
@@ -1663,7 +1663,7 @@ impl Store {
   /// call this before that acknowledgement — holding the pin across the unmap is exactly what closes the stale-TLB
   /// cross-tenant read. `true` when the hold was dropped (the block is no longer pinned here, and a deferred free,
   /// if one was waiting, is released and scrubbed); `false` only when the arena refused the unpin
-  /// ([`MemError::ForeignExtent`] — a double release or a block this held no pin on), counted in
+  /// ([`slates_mem::MemError::ForeignExtent`] — a double release or a block this held no pin on), counted in
   /// `release_refusals`, never a silent double-free.
   pub fn dax_release_after_unmap(&mut self, mapping: &Mapping) -> bool {
     match self.content.arena_mut().unpin(mapping.block) {
@@ -1686,7 +1686,7 @@ impl Store {
 
   /// Zeroes a row an L2 shift vacated, once its stale-TLB hold is gone (§4.6 L2).
   ///
-  /// A shift hands the row the content left back to the tenant's own sandbox ([`DaxZones::return_slot`]) rather than
+  /// A shift hands the row the content left back to the tenant's own sandbox ([`crate::daxzone::DaxZones::return_slot`]) rather than
   /// to the arena's free lists — "so no neighbour can take a row inside this tenant's page while the tenant still
   /// writes the page" — and the arena's free path is the only thing that scrubs. So without this the tenant's
   /// plaintext stayed readable on every row it had ever moved off, for the life of the sandbox: unbounded, where

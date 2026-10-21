@@ -1,5 +1,5 @@
 //! `slates-base` — the host side of the base plane (design §4.5, §4.15, D-25; Phase 1 task
-//! 10): the read-only [`HostFs`] implementation over the operating system. It opens the base
+//! 10): the read-only [`slates_vfs::host::HostFs`] implementation over the operating system. It opens the base
 //! directory once and every later access is relative to a descriptor (`openat` with
 //! `O_NOFOLLOW`, `fstat`, `getdents` with a `statat` per entry, `pread`, `readlinkat`), so a
 //! rename of the base directory by the user changes nothing and no path string is ever

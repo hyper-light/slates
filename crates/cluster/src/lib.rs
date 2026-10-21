@@ -24,10 +24,10 @@
 //! that already accepted (§4.8 "network receipt is not acceptance"; a retry preserves record identity).
 //!
 //! Membership ([`membership`]): the SWIM/Lifeguard failure-detection view that maintains which hosts
-//! are alive — the neighbourhood the configuration and placement draw from — and the [`detector`]
+//! are alive — the neighbourhood the configuration and placement draw from — and the `detector`
 //! protocol-period machine that probes members and drives that view alive → suspect → dead. The
 //! configuration group ([`config_group`]) turns that view into the versioned
-//! [`Configuration`](slates_db::register::Configuration) each request carries: it reconciles the
+//! [`Configuration`] each request carries: it reconciles the
 //! neighbourhood to the alive membership, advancing the version so a stale request is refused (the
 //! `f = 0` degenerate of the fleet consensus, which is owed).
 
@@ -248,7 +248,7 @@ impl CommitBudget {
 }
 
 /// The dispatch collection loop's wait-and-decide step (§4.8 "late work"), shared by the commit
-/// ([`collect_acks`]) and ledger promotion loops so both age a slow dispatch the same
+/// ([`collect_bound`]) and ledger promotion loops so both age a slow dispatch the same
 /// way. It parks one poll interval, then judges from the dispatch's own progress — the size of its
 /// acknowledged (or promised) set — whether a dispatch that has reached its deadline is still filling
 /// its quorum (extend) or has stalled / spent its extension budget (time out). The [`hard`] budget's

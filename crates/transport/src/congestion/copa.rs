@@ -1,5 +1,5 @@
 //! Copa (Arun & Balakrishnan, "Copa: Practical Delay-Based Congestion Control for the Internet", NSDI
-//! 2018 [A]; deployed in Meta's mvfst QUIC stack [C]) — a candidate in the session plane's congestion
+//! 2018 \[A\]; deployed in Meta's mvfst QUIC stack \[C\]) — a candidate in the session plane's congestion
 //! bake-off (see the module above), added 2026-09-27 when the first bake-off runs showed every loss- or
 //! probe-driven law letting the bottleneck queue reach a full buffer at its p99 (research note §5.3's goal:
 //! a small request must not wait behind bulk data).
@@ -17,16 +17,16 @@
 //! Details fixed from the primary sources: `RTTmin` over 10 s, `RTTstanding` the minimum over the last
 //! `srtt/2`, pacing at `2·cwnd/RTTstanding` (§2.1); the mode test "nearly empty" as a four-`srtt` minimum
 //! RTT within 10 % of the four-`srtt` RTT spread above `RTTmin`, and competitive `1/δ` AIMD at most once per
-//! RTT (the authors' reference implementation, `genericCC` `rtt-window.cc` and `markoviancc.cc` [C]); the
+//! RTT (the authors' reference implementation, `genericCC` `rtt-window.cc` and `markoviancc.cc` \[C\]); the
 //! velocity capped at `cwnd·δ` packets (reference `update_amt`); slow start doubling once per `srtt` until
 //! the first decrease, loss ignored in the default mode, persistent congestion collapsing to the minimum
-//! window (mvfst `Copa.cpp` [C]). Windows are Nichols filters as in mvfst, so every structure is bounded.
+//! window (mvfst `Copa.cpp` \[C\]). Windows are Nichols filters as in mvfst, so every structure is bounded.
 //! `δ` is held as the integer `1/δ`, so the law is integer arithmetic throughout.
 //!
 //! One departure from the paper, measured (`docs/wip/BENCHMARKS.md`, "Copa reads independent jitter out of its queue
 //! estimate", 2026-10-07): `d_q` is reduced by the jitter excess `RTTstanding` carries, estimated from each `srtt/2`
 //! epoch's samples ([`Epoch`]), so independent non-congestive jitter of tens of milliseconds is not read as queue
-//! (Arun, Alizadeh & Balakrishnan, "Starvation in End-to-End Congestion Control", SIGCOMM 2022 [A], §6). On a thin
+//! (Arun, Alizadeh & Balakrishnan, "Starvation in End-to-End Congestion Control", SIGCOMM 2022 \[A\], §6). On a thin
 //! 200 ms link with ±40 ms of independent jitter an 8 MiB pull went from 79–102 s to 24–33 s (median of 8 seeds),
 //! with the 58-scenario grid's share +1.6% and ping p99 −1.9%. The first estimate modelled each sample's jitter as
 //! uniform; a round trip's jitter is the sum of two directions', whose least sample sits about four times further

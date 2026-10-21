@@ -71,7 +71,7 @@ pub struct MergeShardState {
   pub placed: BTreeMap<ObjectId, u64>,
   /// The holders that acknowledged the version `placed` names, per owned green: whether this owner may report
   /// its neighbourhood change placed reads them (§4.8 "the newest committed record is held by f+1 of the new
-  /// candidates"; [`placed_on_current_cohort`]). Bounded by the owned greens, dropped with the green.
+  /// candidates"; [`greens_placed_on_current_cohort`]). Bounded by the owned greens, dropped with the green.
   pub placed_holders: BTreeMap<ObjectId, (u64, Vec<HostId>)>,
   /// This holder's replica of each green it backs (§4.16 "Apply on holders"): the engine the
   /// holder recomputes every version into before accepting the record that names it. Empty on a
@@ -1875,7 +1875,7 @@ pub(crate) fn next_merge_work(state: &mut ShardState, local: HostId) -> Vec<Merg
 }
 
 /// One period of the merge record plane for the greens `shard` owns, run on the control shard by
-/// [`crate::fleet::run_record_period`] after the seals and heads: each holder's first missing version this
+/// `crate::fleet::run_record_period` after the seals and heads: each holder's first missing version this
 /// period is dispatched over the holders' borrowed sessions, and the acknowledgements are recorded
 /// back on the owner shard.
 pub(crate) async fn run_merge_period(

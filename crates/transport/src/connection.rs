@@ -1748,7 +1748,7 @@ impl Connection {
 
   /// Allocates the next packet number and a bare, decryptable payload — a re-advertisement of the
   /// connection's current flow-control credit — for a **handshake-confirmation** packet
-  /// ([`Endpoint::establish`](crate::Endpoint::establish)); see RFC 9000 §19.20, RFC 9001 §4.1.2. It is
+  /// ([`Endpoint::establish`](crate::endpoint::Endpoint::establish)); see RFC 9000 §19.20, RFC 9001 §4.1.2. It is
   /// not ack-eliciting and not tracked; the endpoint resends a confirmation with a fresh number each
   /// probe timeout, so no number is ever reused under the packet keys (RFC 9001 §9.5).
   pub fn emit_confirm(&mut self) -> Option<(u64, Vec<Frame>)> {
@@ -1757,7 +1757,7 @@ impl Connection {
   }
 
   /// Whether the packet-number space is spent (`2^62`, RFC 9000 §12.3): the connection sends nothing more
-  /// and its endpoint ends the session ([`EndpointError::PacketNumbersExhausted`](crate::EndpointError)).
+  /// and its endpoint ends the session ([`EndpointError::PacketNumbersExhausted`](crate::endpoint::EndpointError::PacketNumbersExhausted)).
   pub fn packet_numbers_exhausted(&self) -> bool {
     self.sent.exhausted()
   }

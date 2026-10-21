@@ -66,7 +66,7 @@ impl Snapshotted for RegionalConfiguration {
 }
 
 /// A configuration change as it rides the Raft log — the command a committed [`LogEntry`](crate::raft::LogEntry)
-/// carries, decoded and applied to the [`Configuration`] in commit order so every voter reaches the same
+/// carries, decoded and applied to the [`slates_db::register::Configuration`] in commit order so every voter reaches the same
 /// configuration. The Raft core treats it as opaque bytes; this is the config group's interpretation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ConfigCommand {
@@ -747,7 +747,7 @@ impl RegionalCouncil {
     self.raft.forget_leader();
   }
 
-  /// **DRIVE**: begins a **pre-election** on an election timeout (Raft §9.6), returning the [`PreVote`]s to
+  /// **DRIVE**: begins a **pre-election** on an election timeout (Raft §9.6), returning the [`crate::raft::PreVote`]s to
   /// ship to the other voters — asked *without inflating the term*, so a partitioned node cannot disrupt a
   /// healthy leader. A lone voter proceeds straight to leading with no messages (the `f = 0` degenerate).
   pub fn election_timeout(&mut self) -> Vec<RaftMessage> {
@@ -932,7 +932,7 @@ impl RegionalCouncil {
   }
 
   /// **DRIVE**: folds a reply to one of this node's requests, returning any follow-on messages to ship — a
-  /// granted pre-vote majority yields the real [`RequestVote`]s (the pre-election succeeded, so the term is
+  /// granted pre-vote majority yields the real [`crate::raft::RequestVote`]s (the pre-election succeeded, so the term is
   /// advanced only now); a vote reply or append reply yields none. Applies whatever newly committed to the
   /// regional configuration on an append reply (the leader once a majority acknowledges).
   pub fn fold_reply(&mut self, reply: RaftMessage) -> Vec<RaftMessage> {

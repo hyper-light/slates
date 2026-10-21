@@ -292,64 +292,123 @@ fn an_object_that_can_hold_a_huge_page_is_mapped_where_one_forms_and_collapses_t
   );
 }
 
-/// The environment variable that turns [`a_quiet_process_reports_what_a_placed_mapping_costs`] into the
-/// measuring child. Unset, that test does nothing, which is how it behaves inside the ordinary suite run.
+/// One row of `/proc/self/maps`: where it starts and ends, whether it is a mapping of a memory object whose
+/// name carries `prefix`, and whether it is an anonymous `PROT_NONE` reservation (which is what a placement's
+/// slack looks like once the window has been mapped inside it).
 #[cfg(target_os = "linux")]
-const SLACK_CHILD: &str = "SLATES_TEST_SLACK_CHILD";
-
-/// The process's virtual size in bytes, from the first field of `statm` (pages).
-#[cfg(target_os = "linux")]
-fn virtual_bytes() -> usize {
-  std::fs::read_to_string("/proc/self/statm")
-    .ok()
-    .and_then(|statm| {
-      statm
-        .split_whitespace()
-        .next()
-        .and_then(|pages| pages.parse::<usize>().ok())
-    })
-    .map_or(0, |pages| pages.saturating_mul(PAGE))
+struct MapRow {
+  start: usize,
+  end: usize,
+  ours: bool,
+  reserved: bool,
+  line: String,
 }
 
-/// The measuring half of [`a_placed_mapping_costs_a_page_of_slack_and_returns_every_byte_of_it`], run in a
-/// process of its own so that nothing else is allocating while it reads a process-wide figure. Does nothing
-/// unless the parent selected it, so an ordinary suite run passes straight over it.
+/// The address space this process holds for the memory objects named with `prefix`: every mapping of one, plus
+/// the anonymous `PROT_NONE` slack abutting it that the placement reserved around it. Returns the total and the
+/// rows it counted, so a failure says exactly what it saw instead of only a number.
+///
+/// This is read per object rather than process-wide, and that is the whole point of it. The first version of
+/// this test took the difference of `/proc/self/statm` across the allocation, which is every byte the *process*
+/// gained — so it measured the seven sibling tests allocating 8 and 16 MiB objects beside it (153 MB where the
+/// same run alone read 4.5 MB), and it was answered with a child process of its own. That was treating the
+/// symptom. Under ThreadSanitizer the child is not quiet either: the instrumentation's own bookkeeping grows
+/// with the memory the test touches, and the lane failed on 2026-10-20 reading three pages of slack per object
+/// where the placement reserves one (run 39527867650). A figure that is attributable to the objects needs no
+/// quiet process and cannot be moved by anything that is not one of them.
 #[cfg(target_os = "linux")]
-#[test]
-#[cfg_attr(miri, ignore)] // a shared memory object is not modelled by Miri, as at `region.rs`
-fn a_quiet_process_reports_what_a_placed_mapping_costs() {
-  if std::env::var(SLACK_CHILD).is_err() {
-    return;
+#[allow(clippy::disallowed_methods)] // reading this process's own address space through /proc, read-only
+fn address_space_held(prefix: &str) -> (usize, Vec<String>) {
+  let Ok(maps) = std::fs::read_to_string("/proc/self/maps") else {
+    return (0, Vec::new());
+  };
+  let rows: Vec<MapRow> = maps
+    .lines()
+    .filter_map(|line| parse_map_row(line, prefix))
+    .collect();
+  // Every row to charge, by index, so slack lying between two of our own windows is counted once.
+  let mut charged: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+  for at in rows
+    .iter()
+    .enumerate()
+    .filter(|(_, row)| row.ours)
+    .map(|(at, _)| at)
+  {
+    charged.insert(at);
+    charge_abutting_slack(&rows, at, &mut charged);
   }
-  // Derived: a client's ring is far smaller than a huge page, which is the case the bound is about; sixty-four
-  // of them so the per-object slack stands well above the allocator's own movement.
-  const OBJECTS: usize = 64;
-  let each = PAGE.saturating_mul(16);
-  let before = virtual_bytes();
-  let mut held = Vec::new();
-  for sample in 0..OBJECTS {
-    let Ok(object) =
-      SharedObject::create(&object_name(&format!("slack{sample}")), each, Words::new())
-    else {
-      println!("SLACK refused");
-      return;
-    };
-    // SAFETY: this test is the object's only accessor, which is what `ExclusiveObject` promises.
-    held.push(Region::shared(
-      unsafe { ExclusiveObject::new(object) },
-      PAGE,
-    ));
+  let mut held = 0usize;
+  let mut counted = Vec::new();
+  for row in charged.iter().filter_map(|at| rows.get(*at)) {
+    held = held.saturating_add(row.end.saturating_sub(row.start));
+    counted.push(row.line.clone());
   }
-  let mapped = virtual_bytes().saturating_sub(before);
-  drop(held);
-  let kept = virtual_bytes().saturating_sub(before);
-  println!(
-    "SLACK {mapped} {kept} {} {OBJECTS}",
-    each.saturating_mul(OBJECTS)
-  );
+  (held, counted)
 }
 
-/// §4.6 L1 — placing a mapping costs one grain of address space and gives every byte of it back.
+/// Charges the run of anonymous `PROT_NONE` reservations abutting the window at `rows[at]`, on both sides of
+/// it. A placement whose congruent address falls inside its reservation leaves slack before *and* after the
+/// window, so both directions are walked, and each stops at the first row that is not an abutting reservation.
+#[cfg(target_os = "linux")]
+fn charge_abutting_slack(
+  rows: &[MapRow],
+  at: usize,
+  charged: &mut std::collections::BTreeSet<usize>,
+) {
+  for before in (0..at).rev() {
+    if !abuts_before(rows, before) {
+      break;
+    }
+    charged.insert(before);
+  }
+  for after in at.saturating_add(1)..rows.len() {
+    if !abuts_after(rows, after) {
+      break;
+    }
+    charged.insert(after);
+  }
+}
+
+/// Whether `rows[before]` is a reservation that ends exactly where the row after it begins.
+#[cfg(target_os = "linux")]
+fn abuts_before(rows: &[MapRow], before: usize) -> bool {
+  match (rows.get(before), rows.get(before.saturating_add(1))) {
+    (Some(row), Some(next)) => row.reserved && row.end == next.start,
+    _ => false,
+  }
+}
+
+/// Whether `rows[after]` is a reservation that begins exactly where the row before it ends.
+#[cfg(target_os = "linux")]
+fn abuts_after(rows: &[MapRow], after: usize) -> bool {
+  match (rows.get(after.saturating_sub(1)), rows.get(after)) {
+    (Some(previous), Some(row)) => row.reserved && previous.end == row.start,
+    _ => false,
+  }
+}
+
+/// Parses one `/proc/self/maps` row (`start-end perms offset dev inode path`). `None` for a row that does not
+/// parse, which is never one of ours.
+#[cfg(target_os = "linux")]
+fn parse_map_row(line: &str, prefix: &str) -> Option<MapRow> {
+  let mut fields = line.split_whitespace();
+  let range = fields.next()?;
+  let perms = fields.next()?;
+  let (start, end) = range.split_once('-')?;
+  let start = usize::from_str_radix(start, 16).ok()?;
+  let end = usize::from_str_radix(end, 16).ok()?;
+  // Fields three to five are the offset, the device and the inode; the path, if any, is the rest.
+  let path = fields.nth(3).unwrap_or("");
+  Some(MapRow {
+    start,
+    end,
+    ours: path.contains(prefix),
+    reserved: path.is_empty() && perms.starts_with("---"),
+    line: line.to_owned(),
+  })
+}
+
+/// §4.6 L1 — placing a mapping costs one page of address space per object and gives every byte of it back.
 ///
 /// A placed mapping reserves more address space than it maps, and two things about that have to be true or
 /// the placement is worse than the bug it fixed. It must give the reservation back when the object goes: a
@@ -358,76 +417,69 @@ fn a_quiet_process_reports_what_a_placed_mapping_costs() {
 /// too small to hold a huge page, not one huge page — i686 is a tested target with about 3 GB of address
 /// space to spend, and a huge page per session would spend it.
 ///
-/// The figure is process-wide, so it is read in a **child process of its own**: measured first in-process,
-/// sixty-four ring-sized objects read as 153 MB because seven sibling tests were allocating 8 and 16 MiB
-/// objects at the same time, and the same measurement run alone read 4.5 MB. A test that only holds when it
-/// runs alone is not a test, so the parent re-invokes this binary for the one case, as `anchor.rs` and
-/// `reap.rs` do, and reads a tagged line out of it.
+/// Do: map sixty-four ring-sized objects, read the address space charged to those objects out of
+/// `/proc/self/maps`, drop them, and read it again. Expect: every byte of every window, no more than one page
+/// of slack each, and nothing at all left afterwards.
 #[cfg(target_os = "linux")]
 #[test]
-#[cfg_attr(miri, ignore)] // spawning the test binary is not modelled by Miri
+#[cfg_attr(miri, ignore)] // a shared memory object is not modelled by Miri, as at `region.rs`
 fn a_placed_mapping_costs_a_page_of_slack_and_returns_every_byte_of_it() {
-  let Ok(binary) = std::env::current_exe() else {
-    println!(
-      "SKIP a_placed_mapping_costs_a_page_of_slack_and_returns_every_byte_of_it: no path to re-invoke"
-    );
-    return;
-  };
-  let run = std::process::Command::new(binary)
-    .args([
-      "--exact",
-      "a_quiet_process_reports_what_a_placed_mapping_costs",
-      "--nocapture",
-    ])
-    .env(SLACK_CHILD, "1")
-    .output();
-  let Ok(run) = run else {
-    println!(
-      "SKIP a_placed_mapping_costs_a_page_of_slack_and_returns_every_byte_of_it: the child did not run"
-    );
-    return;
-  };
-  let printed = String::from_utf8_lossy(&run.stdout);
-  // Tagged, because libtest prints its own banner on the child's stdout before the role runs.
-  let Some(line) = printed.lines().find_map(|line| line.strip_prefix("SLACK ")) else {
-    panic!("the child reports what it measured; it printed {printed:?}");
-  };
-  let figures: Vec<usize> = line
-    .split_whitespace()
-    .filter_map(|word| word.parse().ok())
-    .collect();
-  let (Some(mapped), Some(kept), Some(asked), Some(objects)) = (
-    figures.first().copied(),
-    figures.get(1).copied(),
-    figures.get(2).copied(),
-    figures.get(3).copied(),
-  ) else {
-    println!("SKIP a_placed_mapping_costs_a_page_of_slack_and_returns_every_byte_of_it: {line:?}");
-    return;
-  };
+  // Derived: a client's ring is far smaller than a huge page, which is the case the bound is about; sixty-four
+  // of them so a per-object page of slack is well clear of a single row's rounding.
+  const OBJECTS: usize = 64;
+  let each = PAGE.saturating_mul(16);
+  let tag = format!("slack{}", std::process::id());
+  let (before, _) = address_space_held(&tag);
+  assert_eq!(
+    before, 0,
+    "nothing holds this tag's address space before the objects exist"
+  );
+
+  let mut held = Vec::new();
+  for sample in 0..OBJECTS {
+    let Ok(object) =
+      SharedObject::create(&object_name(&format!("{tag}-{sample}")), each, Words::new())
+    else {
+      println!(
+        "SKIP a_placed_mapping_costs_a_page_of_slack_and_returns_every_byte_of_it: the host refused a shared object"
+      );
+      return;
+    };
+    // SAFETY: this test is the object's only accessor, which is what `ExclusiveObject` promises.
+    held.push(Region::shared(
+      unsafe { ExclusiveObject::new(object) },
+      PAGE,
+    ));
+  }
+
+  let (mapped, counted) = address_space_held(&tag);
+  let asked = each.saturating_mul(OBJECTS);
+  let allowed = asked.saturating_add(PAGE.saturating_mul(OBJECTS));
   let huge = slates_machine::facts::huge_page_bytes()
     .and_then(|bytes| usize::try_from(bytes).ok())
     .unwrap_or(0);
-  // The placement reserves one grain beyond the object, and the grain for an object this small is the page.
-  let allowed = asked.saturating_add(PAGE.saturating_mul(objects).saturating_mul(2));
   assert!(
     mapped >= asked,
-    "the objects are mapped at all: {mapped} bytes for {asked} asked (non-vacuity — a reading that saw \
-     nothing would pass the bound below for the wrong reason)"
+    "every byte of every window is mapped: {mapped} bytes charged to {OBJECTS} objects of {each}, which is \
+     under the {asked} they asked for (non-vacuity — a reading that saw nothing would pass the bound below \
+     for the wrong reason)"
   );
   assert!(
     mapped <= allowed,
     "a small object reserves a page of slack, not a huge page: {mapped} bytes of address space for {asked} \
-     asked over {objects} objects, which allows {allowed}; a huge-page grain would have cost about {}",
-    asked.saturating_add(huge.saturating_mul(objects))
+     asked over {OBJECTS} objects, which allows {allowed}; a huge-page grain would have cost about {}. The \
+     rows charged were:\n{}",
+    asked.saturating_add(huge.saturating_mul(OBJECTS)),
+    counted.join("\n")
   );
-  // Derived: the allocator's own bookkeeping moves the figure a little either way, so the test is that the
-  // objects' address space came back, not that the number is identical to the byte.
-  let noise = asked.checked_div(8).unwrap_or(0);
-  assert!(
-    kept <= noise,
-    "dropping the objects gives their address space back: {kept} bytes still held of the {mapped} the \
-     mappings took, which is more than the {noise} the allocator's own movement allows"
+
+  drop(held);
+  let (kept, left) = address_space_held(&tag);
+  assert_eq!(
+    kept,
+    0,
+    "dropping the objects gives their address space back whole; {kept} bytes are still held:\n{}",
+    left.join("\n")
   );
 }
 

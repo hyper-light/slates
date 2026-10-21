@@ -126,7 +126,10 @@ declared binary explicitly besides.
   `eol: lf`; the same query over a NIST vector reports only upstream's
   `eol: crlf`, and over `vendor/aws-lc-sys/builder/prebuilt-nasm.bat` reports
   nothing at all, which is its pre-change state.
-- The proof is the next `aarch64 windows (native, by test)` run: the same test
-  that returned FAILED must pass. It cannot be reproduced on this machine — the
-  Windows relay here dies in a WSL shim, so native Windows execution is not
-  available locally.
+- **Proven.** Run 39528936826, the first push carrying `.gitattributes`:
+  `aarch64 windows (native, by test)` completed **success**, where run
+  39527867650 on the parent commit failed on
+  `the_recorded_chokepoint_table_is_the_registry`. The other three Windows
+  lanes (`native clippy + tests`, `windows`, both cross-lint squares) are green
+  on the same run. The bug could not be reproduced on this machine — the
+  Windows relay here dies in a WSL shim — so CI is the arbiter, and it ruled.

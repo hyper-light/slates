@@ -483,7 +483,7 @@ fn promote_region_on_root(
 
 /// On the control shard, either proposes the region-loss promotion here (when this node leads the root group)
 /// or forwards it to the leader this node knows, so the operator may issue `promote-region` on **any** node,
-/// not only the leader (§4.8, D-14). The leader is a redirection hint ([`RootGroup::leader`]): a stale hint or
+/// not only the leader (§4.8, D-14). The leader is a redirection hint ([`slates_cluster::root_group::RootGroup::leader`]): a stale hint or
 /// an unavailable leader session yields `NotRootLeader`, which the operator retries — never a wrong outcome
 /// (the target proposes only if it is in fact the leader). `PromoteRegion` is idempotent, so a forward that is
 /// retried after it already took is a no-op.

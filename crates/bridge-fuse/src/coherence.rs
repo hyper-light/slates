@@ -5,7 +5,7 @@
 //! the transport runs at every wake — a kernel request *or* a change signalled by another mutation
 //! source — and advances the cursor only past what the kernel was actually told. The sink is a
 //! closure, so the rules are pure, cfg-free and unit-tested on every host; the Linux transport
-//! ([`crate::channel`]) runs them against a real mount.
+//! (`crate::channel`) runs them against a real mount.
 //!
 //! The two losses this closes (AUD-02, `docs/bugs/2026-09-14_AUDIT.md`): a seam refusal to gather
 //! left the cursor where it was, but the advance after the request then skipped the ungathered

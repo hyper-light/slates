@@ -41,6 +41,21 @@ jobs:
         run: cargo fmt --all --check
       - name: Clippy (the lint wall)
         run: cargo clippy --workspace --all-targets -- -D warnings
+      # Documentation is load-bearing here: the design's numbered identifiers and the module docs are how a
+      # subsystem is handed to the next engineer, and rustdoc is the only thing that can tell a reference to a
+      # real item from a reference to one that was renamed or deleted. Nothing in this repository ran it until
+      # 2026-10-20, and the first run failed with 95 errors across fourteen crates — among them three links to
+      # `WithHost`, a type that has never existed in this tree, and a doc comment that had become separated from
+      # the function it described by an item inserted between them.
+      #
+      # Private items are documented because most of slates' design lives in private module docs, and
+      # `private_intra_doc_links` is allowed for the same reason: with `--document-private-items` those links do
+      # resolve in the output this builds. `broken_intra_doc_links` — the one that catches a stale reference —
+      # stays denied, which is the check worth having.
+      - name: Documentation (every reference names something that exists)
+        env:
+          RUSTDOCFLAGS: -D warnings -A rustdoc::private_intra_doc_links
+        run: cargo doc --workspace --no-deps --document-private-items
       # R1/R2 by construction: forbidden symbols, forbidden dependencies, and write-capable
       # syscalls outside the landing crate fail the build (AC-0.1).
       - name: Structural test

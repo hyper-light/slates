@@ -7,7 +7,7 @@
 //!   `os_sync_wake_by_address_any` (macOS 14.4+); a spurious wake surfaces as `EINTR` and the
 //!   caller re-checks.
 //! - Windows: `WaitOnAddress` wakes only threads of the same process, so the cross-process wake is a
-//!   named auto-reset [`Event`] per client (below), derived from the region's object name so both ends
+//!   named auto-reset `Event` per client (below), derived from the region's object name so both ends
 //!   open the one Event; the endpoint waits on and signals it rather than the wake word. The word-based
 //!   [`wait`]/[`wake_one`] below stay `Unsupported` there — they are the Linux/macOS path.
 //!

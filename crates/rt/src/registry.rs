@@ -8,7 +8,7 @@
 //! freed, so a waker that outlives its shard reads a live-or-free word, never freed memory; what a
 //! stale waker finds is either a free slot (its wake is dropped and counted) or a *new* shard that
 //! reused the slot (its wake is delivered and refused by that shard's task arena, whose generations
-//! continue from where the old shard's ended — [`Slot::generation_base`] — so a stale word can
+//! continue from where the old shard's ended — [`Entry::generation_base`] — so a stale word can
 //! never name a live task). The kick descriptor is owned by the slot and closed at unregistration,
 //! so a process that starts runtimes repeatedly holds exactly the descriptors of its live shards.
 //! Before 2026-09-14 every registration leaked its entry, its descriptor and its context for the

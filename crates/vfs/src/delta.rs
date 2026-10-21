@@ -428,7 +428,7 @@ impl Volume {
       || self.base_plane_changed()
   }
 
-  /// This volume's base-plane change token now ([`BasePlane::durable_change_token`]), or `None` with no base.
+  /// This volume's base-plane change token now ([`crate::base::BasePlane::durable_change_token`]), or `None` with no base.
   fn base_change_token(&self) -> Option<u64> {
     self.base.as_ref().map(|plane| plane.durable_change_token())
   }

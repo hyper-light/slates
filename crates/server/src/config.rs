@@ -157,7 +157,7 @@ pub struct FleetMembership {
   pub domains: BTreeMap<HostId, DomainId>,
   /// Each fleet member's **region** (§4.8, D-14 — "a root group across regions holds region membership"), so
   /// the root group agrees on which regions exist and the regional council scopes its membership to the hosts
-  /// of one region. A host absent from the map is in the **sole region** [`RegionId(0)`] — the default when
+  /// of one region. A host absent from the map is in the **sole region** `RegionId(0)` — the default when
   /// the deployment declares none, which collapses to a single-region fleet whose root group is the degenerate
   /// self-leading group (R8). This node's own region is `regions[host]` (or the sole region if absent).
   pub regions: BTreeMap<HostId, RegionId>,

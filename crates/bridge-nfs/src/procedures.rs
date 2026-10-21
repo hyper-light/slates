@@ -482,7 +482,7 @@ impl<'b> Export<'b> {
   /// is the NFS analogue of the FUSE mount edge: the credentials are established once, at mount, and
   /// the seam checks every later request against the resulting context. Refuses (`NotPermitted` at
   /// the registry bound) if the attachment cannot be admitted. The mounting user's group is set
-  /// separately with [`Self::set_owner_gid`] (it defaults to none — a parent-inherited group).
+  /// separately with [`Self::set_groups`] (it defaults to none — a parent-inherited group).
   pub fn new(
     bridge: &'b mut dyn Bridge,
     volume: VolumeId,

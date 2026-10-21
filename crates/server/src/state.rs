@@ -321,7 +321,7 @@ pub struct ShardState {
   /// The owner runtime this node takes part in a region as (§4.8, boot step 6): the SWIM membership
   /// view, the configuration group, and the owner's register acceptor, composed by `slates-cluster`'s
   /// `FleetNode`. `FleetNode::solo` at `f = 0` (the laptop) — the same code path a fleet runs (R8), a
-  /// membership event folding into the configuration through [`slates_cluster::FleetNode::observe`]. The
+  /// membership event folding into the configuration through [`slates_cluster::fleet::FleetNode::observe`]. The
   /// verbs read `fleet.configuration()` for the candidate placement of an object and `placed_heads` for
   /// what the fleet has actually committed; the live probe/gossip loop that drives `observe` and the
   /// cross-node commit run in `crate::fleet` on the control shard.
@@ -617,7 +617,7 @@ pub struct ShardState {
   /// The register records this node holds as a **candidate holder** for other owners' objects (§4.8
   /// "records are sent to all candidates; committed at `f + 1`"): one durable [`Acceptor`] per object
   /// this node backs, keyed by the object. A peer's record commit — served on the per-peer record socket
-  /// by [`crate::fleet::serve_peer_records`] — is accepted into the object's acceptor and **stored here**,
+  /// by `crate::fleet::serve_peer_records` — is accepted into the object's acceptor and **stored here**,
   /// so the record survives the serve task (the task-local acceptor it replaced held nothing a survivor
   /// could read). It is exactly the state phase-one recovery reads on a takeover: when the owner dies, the
   /// survivor that rendezvous ranks first for the object promotes over the holders, each answering from
@@ -644,7 +644,7 @@ pub struct ShardState {
   /// period (§4.8 the reactive piggyback). Set when this node **received** a record naming a newer
   /// configuration generation than its own (the holder-behind case, [`crate::fleet::accept_held_record`]),
   /// or when a holder **refused** one of this node's records as `ConfigurationStale` naming a newer version
-  /// (the stale-sender case, surfaced by `commit_record` and read in [`crate::fleet::ship_head`]). The
+  /// (the stale-sender case, surfaced by `commit_record` and read in `crate::fleet::ship_head`). The
   /// record-plane coordinator fetches once when it is set (or when this node's own SWIM view diverges from
   /// its installed membership) and clears it — so an idle learner whose view matches its configuration sends
   /// nothing, replacing the per-period conditional poll. Only meaningful on the control shard (which drives
@@ -655,7 +655,7 @@ pub struct ShardState {
   /// When an uninitialized root learner fetches next, and the wait after it.
   pub(crate) root_learner_pace: crate::fleet::LearnerPace,
   /// This node's client record sessions to its candidate holder peers (§4.8), keyed by peer host: each
-  /// per-peer link task ([`crate::fleet::establish_record_link`]) brings its session up on one socket and
+  /// per-peer link task (`crate::fleet::establish_record_link`) brings its session up on one socket and
   /// installs it here as `Some`; the record-plane coordinator borrows a session for each dispatch — leaving
   /// the entry `None` while it is out — and returns it after, straggler sessions being recovered later. An
   /// absent entry means no session (never established, or lost — a borrow that ended without a return),
@@ -821,7 +821,7 @@ pub struct ShardState {
   /// The measured **put-failure rate** of this owner shard's content class (§4.8 "Derived constants":
   /// "healer cadence from the measured put-failure rate"): how many content rounds ended placed and how
   /// many ended short (uncertain at the deadline, or every holder answering short of quorum), over the
-  /// shard's lifetime. The healer's cadence is derived from their ratio ([`crate::fleet::heal_period_ns`]):
+  /// shard's lifetime. The healer's cadence is derived from their ratio (`crate::fleet::heal_period_ns`):
   /// a shard whose puts fail often walks its placed content sooner. Both zero on a laptop.
   pub put_outcomes: crate::fleet::PutOutcomes,
   /// The healer's position (§4.10 "anti-entropy … the healer"): which owned volume's placed snapshot it

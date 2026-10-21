@@ -1,7 +1,7 @@
 //! The loopback server's stream loop and RPC dispatch (§4.6, the socket half the codec sits behind).
 //!
 //! [`serve_connection`] reads ONC RPC records off one connected stream, dispatches portmap `GETPORT`,
-//! MOUNT `MNT`, and the NFSv3 procedures onto an [`Export`] (which wraps the volume's [`Bridge`]), and
+//! MOUNT `MNT`, and the NFSv3 procedures onto an [`crate::procedures::Export`] (which wraps the volume's [`slates_bridge_core::Bridge`]), and
 //! writes the framed replies, until the client closes the connection. It is transport-generic (any
 //! `Read + Write`), so a test drives it over a socket pair and the `nfs_loopback` example serves a real
 //! `mount_nfs` client over TCP. This is a blocking, one-connection-at-a-time serve — enough for a mount
