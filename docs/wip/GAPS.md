@@ -10369,3 +10369,44 @@ id, both refused and the file unchanged, red-checked by disabling the stranger g
 No test had driven a stranger through a delegation before. The truncate stays strict under a delegation
 because a real client launders truncates and none is known to launder writes.
 (`docs/bugs/2026-10-21-one-open-owner-pooled-two-users-access.md`.)
+
+
+### 2026-10-21: `slates run`'s consumer lifetime — what a real run proved, and what it could not
+
+The escape record held one open item, "`slates run` leaks its enrollment if the harness dies", marked
+code-read only with the instruction to prove it by a real run first. Tried on macOS (the issuer surface is
+reachable there): a long workload under `run --json` in its own process group, the announced consumer read,
+the group killed and verified gone with `pgrep -g`, then `revoke` of that consumer. The revoke succeeded.
+
+**That is not a proof, and it is recorded so nobody repeats it.** A control in the same run showed **a
+revoke is idempotent on an already-revoked consumer**: revoking consumer 18 a second time answered
+`{"ok":true}`, and enroll → revoke → revoke answered success both times. `revoke_on_channel` and the
+`ConsumerRevoked` check test only that the record exists, never `revoked`. So a successful revoke cannot tell
+"still enrolled" from "already revoked", and a regression test built on it could never pass, even after a
+correct fix. The probe was removed; nothing was committed from it.
+
+Established, and how:
+
+- **Revoke is idempotent** — real run, twice.
+- **Revoked consumers are tombstoned, never removed** — read: `Op::ConsumerRevoked` sets `revoked = true`
+  (`crates/db/src/partition.rs`). With the enroll guard checking only duplicates, the table grows by one
+  record per `run`, **successful or not**. The table's own comment says it is "bounded by the enrollments a
+  human makes … never grown by a workload". That is false for `run`, which programs invoke — kiln's agents
+  will. That puts it in banned-item-8 territory (unbounded growth), not merely cleanup. Not yet run-proven:
+  no verb or report exposes the table's size.
+- **Nothing revokes when the harness dies** — read: the revoke is only in `spawn_as_ephemeral_consumer`,
+  after `wait_with_output`, and only without `--keep`. Still code-read only. Proving it needs an observable
+  that tells a live consumer from a revoked one. The candidate is a workload that outlives its harness and
+  then tries to act as the consumer, which is refused once revoked. No listing or count exists.
+
+Decisions owed to Ada before building anything, because each changes behaviour and two touch durable state:
+
+1. **Whose lifetime.** §4.13 and `run`'s usage say "a consumer enrolled for **its** lifetime", meaning the
+   command's. Binding the enrollment to the harness's channel (the earlier note's proposal) would revoke a
+   workload that outlives a killed harness while it still runs. Binding it to the command needs the daemon to
+   learn the command's lifetime, and a workload that never connects gives it nothing to watch.
+2. **Tombstone or remove.** Removing a revoked record bounds the table. The tombstone may be deliberate,
+   either for audit or so a channel bound to a revoked consumer keeps refusing. Consumer ids come from a
+   counter, so removal does not risk id reuse.
+3. **Should a revoke of a revoked consumer say so?** Idempotent success is a fair API choice, but it leaves
+   a human no way to learn whether a consumer was still live.
