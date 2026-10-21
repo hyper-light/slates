@@ -7525,8 +7525,31 @@ its own page table and never calls the daemon), so the defense had to be at the 
    ciphertext. **Built:** single-block *unsealed* files map their block directly, and **inline** files are
    materialized into a throwaway page block the mapping owns (`Volume::dax_map_read`,
    `an_inline_file_is_mapped_read_only_through_a_materialized_block`; the snapshot `dax_still_current` fix rides it).
-   A multi-block file reads correctly over FUSE_READ; its open tail is not yet mapped. **Owed — the open-frontier rule
-   (SLATES_DESIGN.md §4.6 "DAX maps the open frontier", advertisement-gated):** the gate that maps the open chunk at a
+   A multi-block file reads correctly over FUSE_READ; its open tail is not yet mapped.
+
+   **Audited 2026-10-21: most of what the paragraph below calls owed is built and tested.** Taken in turn:
+
+   - *The open-frontier gate* — built, and proven by
+     `the_open_tail_maps_directly_and_the_sealed_head_is_reopened_in_place` (passes). The device backs each
+     chunk rather than one span (`device.rs:1757`), the open tail zero-copy and a sealed chunk per its arm.
+   - *pin-defers-seal* — built, and the code names the rule in those words at `volume.rs` in `reseal_inode`:
+     "A mapped chunk is not cold at all: the window still reads it, and sealing under a live window would hand
+     the guest ciphertext (the pin-defers-seal rule)", guarded by
+     `store.content.arena().is_pinned(c.block)`. Proven by
+     `the_idle_sweep_defers_sealing_a_mapped_block_until_it_is_unmapped` and
+     `a_reopened_dax_chunk_is_resealed_once_its_window_is_revoked` (both pass).
+   - *force-seal-revoke-on-growth* — **no separate mechanism exists and none is needed**, which is why
+     searching for one finds nothing. A file grows by a write, and `Volume::write_with` revokes the inode's
+     DAX mappings *before* the write (`volume.rs:2479`, "a second write boundary onto content a guest holds
+     mapped: revoke its mappings first so the one boundary stays single"), as `truncate_with` does
+     (`volume.rs:2709`). So a live window cannot be present when the single open slot changes hands; the
+     blanket rule subsumes the named one. Recorded rather than built.
+
+   This is the third ledger entry today found describing as owed something the code already does — after the
+   2026-10-18 caller table and `dax_migrate`'s own doc. The pattern is worth naming: an entry written when a
+   piece was planned, never revisited when it landed.
+
+   **The paragraph as it was written (kept for the rejected alternatives it records):** the gate that maps the open chunk at a
    `SETUPMAPPING`'s offset and refuses a sealed one (the open tail of a growing/edited file is then zero-copy, the
    sealed body FUSE_READ); **pin-defers-seal** (the DAX pin extends to block the *encrypt* of a mapped chunk, not just
    its free/reuse, so a seal never swaps plaintext→ciphertext under a live window) and **force-seal-revoke-on-growth**
