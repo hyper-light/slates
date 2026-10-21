@@ -866,24 +866,40 @@ failure mode to protect against. `std::` paths resolve on every platform, so lea
 typo in them an error. Red-checked rather than assumed — a planted `rustix::fs::fsync` in `slates-mem`
 still fails `-D clippy::disallowed-methods` with the flag in place, and the plant was removed byte-exact.
 
-### 8a-launcher-ci. `slates exec` has no CI coverage: the runner denies the namespace it needs (2026-10-20, OPEN — one line from Ada)
+### 8a-launcher-ci. `slates exec` writes its own userns maps, which two kernels refuse (2026-10-20, OPEN — a defect, not a runner setting)
 
-The launcher flow gates on `fusermount3` and `/dev/fuse` and on nothing else, but `slates exec` needs a
-second capability: an **unprivileged user namespace**, before it can map ids and mount anything of its own.
-A host can have FUSE and still deny the namespace, and GitHub's `ubuntu-latest` is exactly that host —
-Ubuntu 24.04 ships `kernel.apparmor_restrict_unprivileged_userns=1`. So the test passed the FUSE gate there,
-went on, and failed inside the launcher with `open /proc/self/setgroups: code 13`.
+**This entry said the wrong thing when it was written, and the correction is the finding.** It claimed the
+runner denies the user namespace the launcher needs — Ubuntu 24.04's
+`kernel.apparmor_restrict_unprivileged_userns=1` — and asked Ada for one `sysctl` line before the step. That
+is wrong: `unshare -U true` **succeeds** on GitHub's `ubuntu-latest` and on the x86_64 box, so a gate asking
+that question never fires, and the launcher failed past it with `open /proc/self/setgroups: code 13`.
 
-It never showed here because this laptop's Docker Linux denies the namespace **too**, and there the FUSE gate
-skipped the test first — two capabilities missing, one gate, and the one that was checked hid the one that
-was not.
+What is actually true, measured on the box (Linux 7.2.9) inside a fresh namespace with no maps written:
 
-A loud skip is now in place (`unprivileged_user_namespaces_run`), so the lane is honest rather than red. But
-a skip is not coverage, and by this ledger's own rule a test that always skips is not a test: `slates exec`
-is now tested on **no machine this project can reach**. Enabling it on the runner is one line before the
-step — `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0` — which is **Ada's call**, in the
-same family as the `user_allow_other` grant of 2026-10-01. Until then the launcher's only evidence is the
-hand-run on a permissive host.
+| | |
+|---|---|
+| unprivileged user namespaces | **permitted** |
+| `cat /proc/self/setgroups` | `allow` |
+| `cat /proc/self/uid_map` | *empty* |
+| `echo deny > /proc/self/setgroups` | **Permission denied** |
+| `echo "0 0 1" > /proc/self/uid_map` | **denied** |
+| `unshare -U --map-user=$(id -u)` (the **parent** writes the maps) | **works**, uid 1000 inside |
+
+`exec::enter_namespace` unshares and then writes its *own* `/proc/self/setgroups`, `gid_map` and `uid_map`.
+The capability is there; the launcher asks for it the one way these kernels refuse. Reproducing identically
+on a GitHub runner and a CachyOS box rules out one host's policy, so this is a defect in the launcher, not a
+CI setting Ada can grant — and no sysctl would fix it.
+
+The fix is to fork so the parent writes the child's maps, which is what `unshare(1)` does; it is a
+restructuring of launcher startup with its own error and lifetime handling, written up rather than rushed in
+`docs/bugs/2026-10-20-the-launcher-writes-its-own-userns-maps.md`. Until then
+`a_process_can_write_its_own_userns_maps` skips the flow and names that file, so the lane reports the defect
+once here instead of once a run.
+
+**The coverage point stands, and is now sharper:** `slates exec` runs on no machine this project can reach,
+and the reason is not a host that will not have it — it is that the launcher cannot work unprivileged as
+written. Nothing had ever run it, because the flow also needs `/dev/fuse` and `SLATES_TEST_CLI`, and the FUSE
+gate skipped first everywhere here.
 
 ### 8a-win-dumps. Windows has no unprivileged core-dump exclusion, and the CLI now says so (2026-10-20, OPEN — needs Ada)
 
