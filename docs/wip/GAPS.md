@@ -1045,6 +1045,12 @@ sweep reported eleven, eight of them false — the pattern `target_os = "macos"`
 real set is so small:** a name with one arm per platform resolves everywhere, and only an unpaired item can
 vanish.
 
+**The Linux half came up clean, which was not a given.** Seven modules only Linux compiles — `channel`,
+`udmabuf`, `vhost_user`, `epoll`, `fuse`, `fuse_hold`, `write_log` — carry about 85 doc links between them
+that no macOS build had ever resolved, and the expectation was that they would surface a lane at a time.
+After the two Linux findings (`establish`, `NO_BOUND`) the gate's Documentation step reports **success** on
+ubuntu (run 39540020206), so those 85 are sound. Measured, not swept.
+
 **Closed 2026-10-20: the Windows half is gated too**, in `windows-lint`, over that lane's own crate list.
 A reference resolves or not *per platform* — an item behind `#[cfg(windows)]` exists for no other — and of
 the errors the ubuntu/macos gate found, five were visible only to macOS and two only to Linux. Nothing had
