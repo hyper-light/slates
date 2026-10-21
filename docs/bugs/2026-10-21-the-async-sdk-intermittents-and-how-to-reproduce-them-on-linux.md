@@ -105,6 +105,29 @@ Notes that cost time to learn:
 - To change the test without touching the shared tree, copy it to a scratch directory and mount that
   read-only beside the repo.
 
+## How often B actually fires, measured
+
+Do not trust the first impression. B appeared on the **first** batch of ten Linux runs, which read as
+1 in 10 and is what the harness note above says. It is not that rate. Totals from 2026-10-21:
+
+| batch | conditions | runs | failures |
+|---|---|---|---|
+| 1 | built and run in the same container pass, machine busy from the build | 10 | **1** |
+| 2 | warm cache, idle, instrumented | 12 | 0 |
+| 3 | warm cache, idle | 40 | 0 |
+| 4 | **constrained: 1.5 CPUs, 2 GB** — a loaded runner | 20 | 0 |
+| | | **82** | **1** |
+
+**Constraining the container did not amplify it**, which is the first thing to try under this project's
+own rule about forcing the extreme, and it failed. The one failure came while the machine was still
+busy from the build that preceded it, so whatever the trigger is, it is not steady CPU scarcity — a
+transient, perhaps page cache being cold for the freshly written daemon binary, is a better guess than
+load. That is a guess and is labelled one.
+
+At 1 in 82 a hunt is not the way in. Either capture the failing shape from a CI occurrence with the
+instrumentation above, or find the mechanism by reasoning about what phase 1 leaves behind and then
+*constructing* the state directly rather than waiting for it.
+
 ## Owed
 
 - Capture the failing shape of B with the instrumentation, then root-cause it.
