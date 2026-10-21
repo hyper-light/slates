@@ -2755,6 +2755,94 @@ fn two_users_sharing_an_open_owner_do_not_pool_their_access() {
   );
 }
 
+proptest::proptest! {
+  #![proptest_config(slates_test_seeds::unseeded(proptest::test_runner::Config {
+    cases: 96,
+    ..proptest::test_runner::Config::default()
+  }))]
+
+  /// RFC 8881 §9.1.2 (A-35, A-38): over a random interleaving of users, open-owners and share accesses
+  /// against one file, a write-type operation is served only to a user whose **own** open asked for write
+  /// access. The escape this guards was exactly a hole in that invariant — a second user's open joined
+  /// the first's share and inherited it
+  /// (`docs/bugs/2026-10-21-one-open-owner-pooled-two-users-access.md`). One fixed ordering pins one
+  /// position where an attacker picks any, so the orderings are generated.
+  ///
+  /// Do: own the file as uid 1000 at mode 0477, so 1001 and 1002 may write it through the `other` class
+  /// and its own owner may not. Replay a generated sequence of opens — each a (user, open-owner, access)
+  /// over three users and two open-owners, one lent file state as the daemon has — and after each, try a
+  /// truncate under the state id it returned. Expect: served exactly when that user's own opens under
+  /// that open-owner have asked for WRITE. The model is a map from (user, open-owner) to the access that
+  /// user asked for itself, which is all an open-owner may carry; anything served beyond it is one user's
+  /// access reaching another.
+  #[test]
+  fn no_interleaving_of_shared_open_owners_lends_one_users_write_to_another(
+    steps in proptest::collection::vec(
+      (0usize..3, 0usize..2, proptest::sample::select(vec![READ, WRITE, READ | WRITE])),
+      1..12,
+    )
+  ) {
+    let mut store = store();
+    let mut vol = volume(&mut store);
+    let mut bridge = VolumeBridge::new(VOLUME, &mut vol, &mut store);
+    let owning = cx_as(1000);
+    let root = bridge.root(&owning).unwrap();
+    bridge
+      .create(ObjectId::new(root, 0), &owning, "shared", 0o477, 0)
+      .unwrap();
+
+    let users = [1000u32, 1001, 1002];
+    let owners: [&[u8]; 2] = [b"owner-one", b"owner-two"];
+    let mut files = FileState::new(owner_tag(0, 0), 64, 64);
+    let mut server = Server::standalone();
+    let mut asked: std::collections::BTreeMap<(u32, usize), u32> = std::collections::BTreeMap::new();
+    let mut client: Option<Client> = None;
+
+    for (user, owner, access) in steps {
+      let uid = users[user];
+      let mut service = export(&mut bridge, uid);
+      service.lend_file_state(&mut files);
+      let mut live = match client.take() {
+        Some(live) => live,
+        None => Client::connect(&mut service, &mut server, b"host-chaos"),
+      };
+      let mut args = live.sequenced(3);
+      args.u32(op::PUTROOTFH);
+      live.open_args(&mut args, owners[owner], "shared", access, DENY_NONE, None);
+      args.u32(op::GETFH);
+      let reply = Client::call(&mut service, &mut server, args.as_slice());
+      if reply.status == Nfsstat4::Ok.wire() {
+        let mut body = reply.walk();
+        skip_sequence(&mut body);
+        expect_ok(&mut body, op::PUTROOTFH);
+        let (stateid, _) = open_result(&mut body);
+        expect_ok(&mut body, op::GETFH);
+        let fh = body.opaque(128).unwrap().to_vec();
+        *asked.entry((uid, owner)).or_insert(0) |= access;
+        let own = asked.get(&(uid, owner)).copied().unwrap_or(0);
+        let status = setattr_status(
+          &mut live,
+          &mut service,
+          &mut server,
+          (fh.as_slice(), stateid),
+          Some(0),
+        );
+        let served = status == Nfsstat4::Ok.wire();
+        proptest::prop_assert_eq!(
+          served,
+          own & WRITE != 0,
+          "uid {} truncating under open-owner {}: served={}, its own opens asked for {}",
+          uid,
+          owner,
+          served,
+          own
+        );
+      }
+      client = Some(live);
+    }
+  }
+}
+
 /// RFC 8881 §9.1.2 (A-38): a state id's access mode governs write-type operations — a read-only
 /// open's state id is refused a WRITE and a truncating SETATTR (`NFS4ERR_OPENMODE`, which the Linux
 /// client turns into `EACCES` for an `O_RDONLY|O_TRUNC` open) yet sets other attributes; and a special
