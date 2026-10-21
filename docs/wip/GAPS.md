@@ -7643,12 +7643,30 @@ the delegation change.
    near-identical**, which is the signature of one mandated SETATTR per exclusive create, not of an
    independent op that happens to land near 1/file.
 
-   Labelled a strong hypothesis rather than a finding, because the `createmode4` actually on the wire was
-   never captured — the profile counted ops, not modes. **Confirming it is cheap and needs no clone run:** log
-   the `createmode4` in `open_createhow` over any create workload and see whether it is `EXCLUSIVE`. If it is,
-   SETATTR at ~1/file is RFC-required for this client's create pattern, the lever does not exist, and the
-   2×-vs-tmpfs target has to come from the other ops. If it is not, the question is open again and the two
-   routes above are still closed.
+   **Measured 2026-10-21, and it holds.** A probe on `open_createhow`, run against the real Linux kernel
+   NFSv4 client through `crates/server/tests/nfs_v4_kernel.rs` in a privileged container — no clone run, as
+   predicted — counted the modes actually on the wire:
+
+   ```
+   10 × createmode4=0   UNCHECKED
+    5 × createmode4=3   EXCLUSIVE4_1
+   ```
+
+   So the client does issue exclusive creates, and it uses `EXCLUSIVE4_1`, not `EXCLUSIVE4`. That refines the
+   conclusion rather than overturning it. `EXCLUSIVE4_1` carries an attribute set beside its verifier and
+   slates honours it — `open_createhow` decodes both and `exclusive_open` applies the attributes — so **mode
+   is settable at create and costs nothing extra**. But the verifier still lives in the file's times
+   (`suppattr_exclcreat` excludes them, and slates refuses an atime/mtime in the create attrs for exactly that
+   reason), so a client that wants real times **must** SETATTR afterwards. There is no way to carry them in
+   the create.
+
+   **Conclusion: for an exclusive create the follow-up SETATTR is required by RFC 8881 §18.16.3, and no
+   server-side change removes it.** The profile's OPEN 14% against SETATTR 13.5% is consistent with git's
+   storm being overwhelmingly exclusive creates. The 2×-vs-tmpfs target has to come from the other ops, and
+   the remaining per-file budget is LOOKUP, OPEN, WRITE and CLOSE.
+
+   What is *not* established: the exclusive share of git's own create storm specifically. The 10:5 split above
+   is this test's workload (create, write, mkdir, rename, symlink, link, truncate), not a checkout.
 
 ## DAX sealed-chunk backing decided by A/B; the re-seal hold is learned (§4.6, 2026-10-17)
 
