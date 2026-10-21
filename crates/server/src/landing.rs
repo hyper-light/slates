@@ -1173,7 +1173,7 @@ async fn run_barrier_away(
   }
 }
 
-/// How long until the landing's lease is due its renewal ([`keep_lease_alive`]), `None` when it is due already (a
+/// How long until the landing's lease is due its renewal (`keep_lease_alive`, Unix's), `None` when it is due already (a
 /// renewal just refused leaves it so) or the shard's clock cannot be read.
 #[cfg(unix)]
 fn renewal_wait_ns(granted: &GrantedRun, ask: LeaseAsk) -> Option<u64> {

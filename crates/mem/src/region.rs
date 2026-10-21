@@ -73,7 +73,7 @@ impl Region {
     }
   }
 
-  /// The byte offset of this region's bytes within its [`backing_fd`](Self::backing_fd): the shared
+  /// The byte offset of this region's bytes within its `backing_fd` (Unix's arm): the shared
   /// object is mapped as a sub-range (A-64, a shard's slice of the anchor content object), so a block's
   /// offset in the descriptor is `backing_base() + the block's offset in this region`. Zero for a
   /// private (anonymous) region, which has no descriptor.

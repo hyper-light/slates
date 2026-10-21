@@ -759,7 +759,7 @@ fn takeovers_pending(state: &ShardState) -> u64 {
 /// clock, so a paused shard's lease has already lapsed by the clock when it resumes. It holds when `f` of the
 /// other candidates (every one of them when there are fewer) confirmed within the lease bound, within the
 /// bounded startup allowance, and on a laptop (`f = 0`, no other candidate needed). Read by the verb gate
-/// ([`dispatch`]), the mount bridge ([`crate::nfs`]) and the daemon's test observation.
+/// ([`dispatch`]), the mount bridge (`crate::nfs`, which is Unix's) and the daemon's test observation.
 pub(crate) fn lease_verdict(state: &ShardState, object: ObjectId) -> crate::lease::LeaseVerdict {
   let config = state.fleet.configuration();
   // The cohorts a successor's promotion quorum can be drawn from: the settled one, and — while this owner's

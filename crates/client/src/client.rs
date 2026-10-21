@@ -878,7 +878,7 @@ impl Client {
   /// A-135: read a file's bytes with no copy where the daemon can map them for this same-kernel client,
   /// else the daemon's copy — either way [`MappedRead::bytes`] is the file's bytes. The daemon mints a
   /// read mapping and sends the arena block's descriptor over the control socket; this maps it. The
-  /// mapping is released when the returned [`MappedRead`] is dropped (the daemon pins the version until
+  /// mapping is released when the returned `MappedRead` (Unix only) is dropped (the daemon pins the version until
   /// the client disconnects; an explicit release is owed).
   #[cfg(unix)]
   pub fn map_read(&mut self, volume: VolumeId, path: &str) -> Result<MappedRead, ClientError> {

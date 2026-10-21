@@ -179,7 +179,7 @@ struct DeviceHold {
 #[cfg(unix)]
 /// Derived: one hold + one session + one release per attachment.
 const MESSAGES_PER_DEVICE: usize = 3;
-/// The most messages one drain applies per connection the bound allows, as [`MESSAGES_PER_DEVICE`] is for devices.
+/// The most messages one drain applies per connection the bound allows, as `MESSAGES_PER_DEVICE` is for devices (both Unix's).
 #[cfg(unix)]
 /// Derived: one hold + one release per connection (A-113).
 const MESSAGES_PER_CONNECTION: usize = 2;
