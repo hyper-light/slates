@@ -388,11 +388,20 @@ class SlatesAsyncEveryCallEnds(unittest.TestCase):
             for result in doomed:
                 self.assertIsInstance(result, slates.SlatesError)
                 self.assertIn("DaemonGone", str(result))
+            # Stop measuring before tearing the sampler down. `noise.stop()` blocks: `communicate()`
+            # closes the child's stdin, reads to EOF and waits for a whole Python interpreter to exit,
+            # and it was being called while the ticker still ran — so that block landed in
+            # `ticker.worst`, charged to the SDK. The sampler has already stopped by then, so
+            # `scheduling` cannot account for it either. Measured on an idle machine 2026-10-20:
+            # `communicate()` blocked 3–11 ms and the loop's lateness tracked it almost exactly
+            # (10.9 ms blocked → 10.6 ms recorded), while the sampler reported a flat ~8 ms.
+            ticker.task.cancel()
+            worst, worst_phase = ticker.worst, ticker.worst_phase
             scheduling = noise.stop()
             self.assertLess(
-                ticker.worst, TICK_BOUND_SECS + scheduling,
-                f"the loop was never held: worst lateness {ticker.worst:.3f} s in phase "
-                f"{ticker.worst_phase!r}, bound {TICK_BOUND_SECS} s plus the machine's own scheduling "
+                worst, TICK_BOUND_SECS + scheduling,
+                f"the loop was never held: worst lateness {worst:.3f} s in phase "
+                f"{worst_phase!r}, bound {TICK_BOUND_SECS} s plus the machine's own scheduling "
                 f"noise {scheduling:.3f} s",
             )
         finally:
