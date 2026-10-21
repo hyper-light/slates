@@ -13,6 +13,7 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 import unittest
 
@@ -256,15 +257,50 @@ class Ticker:
         self.worst = 0.0
         self.phase = "connecting"
         self.worst_phase = self.phase
+        self.worst_cpu = 0.0
+        self.worst_thread = 0.0
+        self.thread_late = 0.0
+        self._stop = threading.Event()
+        # A sibling probe *inside this process*, on a thread of its own. The separate-process sampler
+        # answers "was the machine scheduling anyone", which is not the same question: a process that
+        # sleeps 99.9% of the time is easy to schedule even on a runner that is starving the test, whose
+        # daemon, anchor and sampler all want the same cores. This one answers "could any Python code in
+        # *this* process run", and the pair of them separates the two causes. The test's older comment
+        # rejected a thread because a native call holding the GIL would delay it as much as the loop —
+        # which is precisely the signal, once there is a process probe beside it to rule out starvation.
+        self._thread = threading.Thread(target=self._sibling, daemon=True)
+        self._thread.start()
         self.task = asyncio.get_running_loop().create_task(self._run())
+
+    def _sibling(self):
+        while not self._stop.is_set():
+            due = time.monotonic() + TICK_SECS
+            time.sleep(TICK_SECS)
+            self.thread_late = max(self.thread_late, time.monotonic() - due)
 
     async def _run(self):
         while True:
             due = time.monotonic() + TICK_SECS
+            cpu = time.process_time()
+            thread_before = self.thread_late
             await asyncio.sleep(TICK_SECS)
             late = time.monotonic() - due
             if late > self.worst:
                 self.worst, self.worst_phase = late, self.phase
+                # How much CPU this process burned across the gap, and whether a plain Python thread of
+                # its own was held over the same gap. Together they read three ways:
+                #
+                #   CPU burned                      something ran while holding the GIL
+                #   no CPU, sibling thread held     the OS kept this whole process off a core
+                #   no CPU, sibling thread free     a blocking call on the loop thread that releases
+                #                                   the GIL (what `park_timeout` in Rust looks like)
+                #
+                # Measured 2026-10-20 to check neither probe is vacuous: a deliberate 200 ms busy GIL
+                # hold read 200.7 ms late / 195.6 ms CPU / 24.7 ms thread (the sibling gets the GIL back
+                # in switch-interval slices, so it reads less than the hold); a 200 ms GIL-releasing
+                # `time.sleep` read 272.3 ms late / 1.0 ms CPU / 0.2 ms thread.
+                self.worst_cpu = time.process_time() - cpu
+                self.worst_thread = self.thread_late - thread_before
 
 
 async def _run_async(*argv):
@@ -402,11 +438,16 @@ class SlatesAsyncEveryCallEnds(unittest.TestCase):
                 worst, TICK_BOUND_SECS + scheduling,
                 f"the loop was never held: worst lateness {worst:.3f} s in phase "
                 f"{worst_phase!r}, bound {TICK_BOUND_SECS} s plus the machine's own scheduling "
-                f"noise {scheduling:.3f} s",
+                f"noise {scheduling:.3f} s. Across that gap this process burned "
+                f"{ticker.worst_cpu:.3f} s of CPU and a plain Python thread of its own was held "
+                f"{ticker.worst_thread:.3f} s — busy CPU means something ran; no CPU with the thread "
+                f"held too means a blocking call kept the GIL; no CPU with the thread free means the "
+                f"OS kept this whole process off a core, which is the runner and not the SDK",
             )
         finally:
             noise.stop()
             ticker.task.cancel()
+            ticker._stop.set()
             try:
                 os.killpg(os.getpgid(anchor.pid), signal.SIGKILL)
             except ProcessLookupError:
