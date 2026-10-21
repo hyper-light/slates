@@ -28,8 +28,14 @@ use slates_server::{Daemon, DaemonConfig, SegmentSource};
 const PROBE_MS: u64 = 5;
 /// Shape: shards per test daemon: two, so a client's shard and the control shard differ.
 const TEST_SHARDS: u16 = 2;
-/// Shape: how long a client retries the rendezvous while a daemon starts.
-const START_WAIT: Duration = Duration::from_secs(5);
+/// Shape: how long a client retries the rendezvous while a daemon starts — five seconds on a dev machine,
+/// scaled by [`RESTART_SLOWDOWN`] so a lane that declares itself slow gives the daemon the same room in its own
+/// terms. ThreadSanitizer forced this: on run 39527867650 a shard took 15 753 µs to initialize against 2 106 µs
+/// unloaded, one poll ran 11 922 ms against an anchor budget of 1 000 ms, and a flat five seconds read a daemon
+/// that was still starting as a daemon that was never coming.
+static START_WAIT: LazyLock<Duration> = LazyLock::new(|| {
+  Duration::from_secs(5).saturating_mul(u32::try_from(*RESTART_SLOWDOWN).unwrap_or(1))
+});
 
 /// The machine profile this binary's daemons derive from, measured once per process (§4.1), as
 /// production measures once at the anchor's boot. Measured afresh per daemon, the wake probe ran beside
@@ -81,9 +87,9 @@ fn connect(instance: &str) -> Client {
     match Client::connect(instance, deadlines()) {
       Ok(client) => return client,
       Err(ClientError::Ipc(slates_ipc::IpcError::DaemonUnavailable { .. }))
-        if started.elapsed() < START_WAIT =>
+        if started.elapsed() < *START_WAIT =>
       {
-        std::hint::spin_loop();
+        std::thread::yield_now();
       }
       Err(e) => panic!("{e}"),
     }
@@ -114,7 +120,7 @@ fn wait_until_listed(client: &mut Client, names: &[&str]) {
       return;
     }
     assert!(
-      started.elapsed() < START_WAIT,
+      started.elapsed() < *START_WAIT,
       "listing settles to {names:?}: {listed:?}"
     );
   }
@@ -788,7 +794,7 @@ fn discard_reply(client: &mut Client, request: slates_wire::request::RequestId) 
   let waiting = Instant::now();
   while client.poll_reply(request).unwrap().is_none() {
     assert!(
-      waiting.elapsed() < START_WAIT,
+      waiting.elapsed() < *START_WAIT,
       "the committed create must reply"
     );
     std::thread::yield_now();
@@ -1322,10 +1328,10 @@ fn drive_edit(client: &mut Client, word: u64) -> Result<bool, slates_client::Cli
       return Ok(done);
     }
     assert!(
-      started.elapsed() < START_WAIT,
+      started.elapsed() < *START_WAIT,
       "the chained edit resolved in time"
     );
-    std::hint::spin_loop();
+    std::thread::yield_now();
   }
 }
 

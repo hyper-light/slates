@@ -901,6 +901,32 @@ and the reason is not a host that will not have it — it is that the launcher c
 written. Nothing had ever run it, because the flow also needs `/dev/fuse` and `SLATES_TEST_CLI`, and the FUSE
 gate skipped first everywhere here.
 
+### 8a-tsan-wait. The TSan lane declared itself 25× slow and one budget never listened (2026-10-20, closed)
+
+`a_client_maps_files_across_shards_and_always_gets_the_bytes` failed on the TSan lane (run 39527867650) with
+"the daemon did not answer the claim within the claim wait" — while that daemon was still starting. The
+evidence is in the test's own output: a shard initialized in **15 753 µs** against about **2 106 µs**
+unloaded, and the daemon's heartbeat reported a single poll of **11 922 ms** against the anchor's 1 000 ms
+budget. ThreadSanitizer is 10–20× slower and the lane's CI comment already said so.
+
+It said so to the lane: `SLATES_TEST_RESTART_SLOWDOWN: "25"` has been set on that job all along. But only the
+slow-restart test read the knob. `START_WAIT` — how long a client retries the rendezvous while a daemon
+starts — was a flat `Duration::from_secs(5)`, so the lane announced it was 25× slow and the one budget that
+decided this test's fate did not hear it. **The knob existed; one spelling of "wait for the daemon" did not
+read it** — the shape recorded in `sibling-sweep-every-spelling`. `START_WAIT` now scales by the same figure
+(125 s on that lane, unchanged at 5 s by default).
+
+Found alongside it, and worse the slower the machine: two of the three wait loops in that file spun on
+`std::hint::spin_loop()` rather than yielding, so a test thread held a core the daemon needed in order to
+finish starting — the thing it was waiting for. The third loop, `discard_reply`, already called
+`std::thread::yield_now()`; the other two now do too. This is the same finding CLAUDE.md already records
+against `provision_bench` ("a client thread spinning for its reply competes with the shards for a core"),
+in a second place.
+
+**Owed:** the lane's other failure that run,
+`a_placed_mapping_costs_a_page_of_slack_and_returns_every_byte_of_it`, is a different cause and is fixed
+under `8a-rustdoc`'s commit — see the measurement note there.
+
 ### 8a-rustdoc. Nothing ever ran rustdoc; 95 references named things that do not exist (2026-10-20, closed)
 
 The only `RUSTDOCFLAGS` in the tree was in `xtask/src/tsan.rs`, for sanitizer flags. No lane, no xtask and no

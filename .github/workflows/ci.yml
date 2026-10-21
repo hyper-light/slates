@@ -879,6 +879,13 @@ jobs:
           # ThreadSanitizer's 10-20x slowdown inflates the restart-detection publish window far past a native run, so
           # the slow-restart client test needs a larger scale than the plain Test lane (same reason; the invariant
           # publish << reply << recovery << reconnect holds at any scale). crates/client/tests/client.rs.
+          #
+          # Since 2026-10-20 this also scales START_WAIT, how long a client retries the rendezvous while a daemon
+          # starts. That budget was a flat five seconds and read this knob not at all, so the lane declared itself
+          # 25x slow and one of the two budgets that needed to hear it did not: run 39527867650 failed
+          # a_client_maps_files_across_shards_and_always_gets_the_bytes with "the daemon did not answer the claim
+          # within the claim wait" while that daemon was still starting (a shard took 15 753 us against 2 106 us
+          # unloaded).
           SLATES_TEST_RESTART_SLOWDOWN: "25"
         run: cargo xtask tsan
 
