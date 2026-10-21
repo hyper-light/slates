@@ -3593,12 +3593,23 @@ fn a_pressured_daemons_hold_is_withheld_whole_from_a_volume_on_any_one_shard() {
   ];
   daemon.inject_available_memory(capacity - hold).unwrap();
   let mut after = before;
+  // Waits for the room to have shrunk **by the hold**, not merely to have changed. The withholding arrives in
+  // stages — the whole extents first, the owed remainder after — so a predicate that stops at "different" can
+  // sample between them and then demand the whole of it. Measured 2026-10-20: green on this laptop, where the
+  // stages collapse into one sample, and red on GitHub's macOS runner with exactly two units moved of
+  // sixty-four, which is the first stage on its own. The assertions below are unchanged; this only stops them
+  // being read mid-flight, and `moved` still carries the non-vacuity.
   let moved = within_sampler_wait(|| {
     after = [
       room_on(&mut client, 0, capacity),
       room_on(&mut client, 1, capacity),
     ];
-    after[0] != before[0] && after[1] != before[1]
+    (0..usize::from(POOL_SHARDS)).all(|shard| {
+      before[shard]
+        .zip(after[shard])
+        .map(|(was, now)| was.saturating_sub(now))
+        == Some(hold)
+    })
   });
   let pooled = daemon.pressure_pooled();
   let holds = daemon.pressure_holds();
@@ -3703,12 +3714,23 @@ fn a_hold_finer_than_the_pools_free_extents_is_owed_by_the_next_shard_to_grow() 
   ];
   daemon.inject_available_memory(capacity - hold).unwrap();
   let mut after = before;
+  // Waits for the room to have shrunk **by the hold**, not merely to have changed. The withholding arrives in
+  // stages — the whole extents first, the owed remainder after — so a predicate that stops at "different" can
+  // sample between them and then demand the whole of it. Measured 2026-10-20: green on this laptop, where the
+  // stages collapse into one sample, and red on GitHub's macOS runner with exactly two units moved of
+  // sixty-four, which is the first stage on its own. The assertions below are unchanged; this only stops them
+  // being read mid-flight, and `moved` still carries the non-vacuity.
   let moved = within_sampler_wait(|| {
     after = [
       room_on(&mut client, 0, capacity),
       room_on(&mut client, 1, capacity),
     ];
-    after[0] != before[0] && after[1] != before[1]
+    (0..usize::from(POOL_SHARDS)).all(|shard| {
+      before[shard]
+        .zip(after[shard])
+        .map(|(was, now)| was.saturating_sub(now))
+        == Some(hold)
+    })
   });
   let filled = after[1].map(|room| {
     client.create(&CreateSpec {
