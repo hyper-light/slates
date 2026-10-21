@@ -1064,6 +1064,11 @@ every one was false. **A sweep cannot tell whether the *linking site* is itself 
 so they appear and vanish together and can never be an error. rustdoc knows that; a grep does not. The lane
 is the oracle.
 
+**And it was: the Windows gate's first run found exactly one error, not thirty.** `crates/rt/src/driver.rs:96`
+— a `#[cfg(windows)]` completion-port type documenting itself as "the counterpart of [`KickFd`]", where
+`KickFd` is `#[cfg(unix)]`. The two never coexist, so that link could resolve on neither platform. One real
+finding against the sweep's thirty candidates is the measure of how far a grep was from the compiler.
+
 **Owed:** five references were deleted rather than repointed, because nothing of that name exists and the
 right pointer needs someone who owns §4.8's SWIM wiring: `accept_probes`, `probe_peer`, `serve_peer_probes`,
 `fold_peer_state`, `ProbeTiming::budget`, all in `crates/server/src/fleet.rs`.

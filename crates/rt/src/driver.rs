@@ -93,7 +93,8 @@ impl KickFd {
 }
 
 /// A copyable, generational name for a registry-owned completion port (Windows; §4.3, D-8): the
-/// counterpart of [`KickFd`]. The registry closes the port only after the shard's contexts ended and
+/// counterpart of `KickFd`, which is this type's Unix arm and so never exists where this one does —
+/// a link between the two could not resolve on either platform. The registry closes the port only after the shard's contexts ended and
 /// every foreign borrow of it returned, so a kick copied before retirement is a typed miss afterwards,
 /// never a packet posted to a handle value the process has since reused.
 #[cfg(windows)]
