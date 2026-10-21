@@ -421,9 +421,20 @@ impl DaxZones {
   pub fn new() -> DaxZones {
     let here = 0u8;
     let address = std::ptr::from_ref(&here) as u64;
-    let clock = std::time::SystemTime::now()
-      .duration_since(std::time::UNIX_EPOCH)
-      .map_or(0u128, |since| since.as_nanos());
+    // Miri's isolation has no `REALTIME` clock and **aborts** the test rather than returning an error, so a
+    // read here takes the whole DAX suite's Miri leg down with it — it has been down since this seeding
+    // landed on 2026-10-19, while the ledger recorded the leg as clean. Under the interpreter the mix is the
+    // address alone, which costs nothing that matters: Miri runs deterministic tests, not a daemon a
+    // co-located attacker is guessing at. Outside Miri this is unchanged. `-Zmiri-disable-isolation` would
+    // also silence it and was rejected — it would turn isolation off for every other test in the suite to
+    // get past one line.
+    let clock = if cfg!(miri) {
+      0u128
+    } else {
+      std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0u128, |since| since.as_nanos())
+    };
     let mut mixer = blake3::Hasher::new();
     mixer.update(&address.to_le_bytes());
     mixer.update(&clock.to_le_bytes());
