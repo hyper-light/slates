@@ -7389,8 +7389,22 @@ its own page table and never calls the daemon), so the defense had to be at the 
      `dax_map_*` **mint** it, and only after device admission authenticates the consumer and reads its rights from the
      volume's access list (§4.6). An agent can request a map, never forge or edit an entry.
    - *Unforgeable handle.* A guest must reference a mapping by a daemon-minted opaque capability (a generational id),
-     not a raw `Mapping`, so it can neither name a mapping it was not granted nor forge the block/length fields. (The
-     `Mapping` is daemon-internal today; the device wiring adds the id.)
+     not a raw `Mapping`, so it can neither name a mapping it was not granted nor forge the block/length fields.
+     **Half built, and the half that is built is not the half this line promised (checked 2026-10-20).** The id
+     exists and is unforgeable: `MappingId`'s inner is module-private, every `Mapping` carries one minted by
+     `DaxRegistry::mint_id` (five call sites), and `DaxRegistry::is_live` is consulted on the production paths. But
+     **the device wiring did not add the id** — `crates/bridge-virtiofs` contains no reference to `MappingId` at all.
+     It keys a window by `moffset`, the guest's own offset into the DAX cache region the device gave it, validated
+     for page alignment and range. That is a sound confinement (a guest cannot name an offset outside its own
+     region, which the cross-tenant isolation test proves) but it is **not** the mechanism written here, and
+     `MappingId::as_u64` — the accessor whose doc said it exists "so a same-host client can name this mapping when
+     it asks to release it" — **has no caller in the tree**. There is no DAX release verb on the wire
+     (`DaxRelease`/`MapRelease`/`dax_release` appear nowhere in `wire`, `server/verbs.rs` or `client`), and
+     `dax_release_after_unmap` takes a daemon-held `&Mapping`. So: either reword this item to describe the
+     `moffset` confinement that exists, or build the release-by-id path it describes — **Ada's call, because it is
+     a question about what the guest interface should be, not about what the code says.** The accessor is kept
+     meanwhile, with its doc corrected to state that nothing calls it; it is unwired planned work, not the
+     superseded code `dax_revoke_block` was when it was deleted (e74daf77).
    - *Integrity at pin.* `ChunkArena::pin` already refuses an extent that is not a live allocation (`ForeignExtent`),
      so even a daemon-internal slip cannot pin a forged or stale block.
    - *VMM-enforced teardown.* Revocation is not "ask the guest": the daemon tells the VMM/hypervisor to remove the DAX

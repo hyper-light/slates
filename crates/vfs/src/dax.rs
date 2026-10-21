@@ -121,9 +121,19 @@ pub struct ScrubSlice {
 pub struct MappingId(u64);
 
 impl MappingId {
-  /// The id's opaque value, so a same-host client can name this mapping when it asks to release it
-  /// (§4.6, A-135). Reading the value never *forms* a `MappingId` — the inner stays private, so a
-  /// client-supplied `u64` can only be looked up in the registry, never fabricated into a mapping.
+  /// The id's opaque value, for the release-by-id path §4.6 A-135 describes — **which is not built, and this
+  /// accessor has no caller anywhere in the tree** (checked 2026-10-20: the only `as_u64` hits outside this
+  /// file are `serde_json::Value`'s, in unrelated MCP tests). There is no DAX release verb on the wire, and
+  /// [`Store::dax_release_after_unmap`] takes a daemon-held `&Mapping`, never an id a caller supplied. So no
+  /// client today can name a mapping at all, by this value or otherwise.
+  ///
+  /// Kept rather than removed because it is unwired planned work, not superseded code: the DAX gate's step 2
+  /// names a daemon-minted opaque capability as the mechanism a guest should use, and this is how that value
+  /// would reach the wire. `dax_revoke_block` was deleted (e74daf77) on the opposite finding — that the pin
+  /// already covered what it was written for.
+  ///
+  /// What *is* true today: reading the value never *forms* a `MappingId` — the inner stays private, so a
+  /// client-supplied `u64` could only ever be looked up in the registry, never fabricated into a mapping.
   #[must_use]
   pub fn as_u64(self) -> u64 {
     self.0
