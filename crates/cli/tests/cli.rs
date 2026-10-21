@@ -2392,7 +2392,8 @@ fn fleet_view(instance: &str) -> Option<FleetView> {
 /// the fleet wait passes; returns the views then (the caller asserts on them, so a failure shows every
 /// node's view).
 fn wait_fleet_views(instances: &[String], members: usize, probed: u32) -> Vec<Option<FleetView>> {
-  let deadline = Instant::now() + FLEET_WAIT;
+  let began = Instant::now();
+  let deadline = began + FLEET_WAIT;
   loop {
     let views: Vec<Option<FleetView>> = instances.iter().map(|i| fleet_view(i)).collect();
     let settled = views.iter().all(|view| {
@@ -2400,7 +2401,21 @@ fn wait_fleet_views(instances: &[String], members: usize, probed: u32) -> Vec<Op
         .as_ref()
         .is_some_and(|v| v.members.len() == members && v.peers_probed == probed)
     });
-    if settled || Instant::now() >= deadline {
+    if settled {
+      return views;
+    }
+    if Instant::now() >= deadline {
+      // Say that the wait expired, because the caller's assertion cannot: it receives the last views and
+      // reports them as though the fleet had settled on something wrong, when what happened is that it had
+      // not settled at all. Measured 2026-10-20 on GitHub's macOS runner — three daemons on a three-core
+      // host, the whole test 105 s — where retirement reported one member and the message gave no hint that
+      // a deadline was involved. It passes here in 13 s, so the number is a property of the machine and the
+      // next failure should say how far off it was rather than leave that to be guessed.
+      eprintln!(
+        "fleet wait expired after {:?} (FLEET_WAIT {FLEET_WAIT:?}) waiting for {members} members and \
+         {probed} peers probed; last views {views:?}",
+        began.elapsed()
+      );
       return views;
     }
     pause();

@@ -7686,6 +7686,16 @@ noting because a stopped Miri burned a core for 84 minutes on 2026-10-18 when it
 
 ### 2026-10-18: Miri over the DAX suite — 51/51 clean, and the proptest case is the whole cost
 
+**This leg was dead from 2026-10-19 to 2026-10-20, while the lines below said it was clean.** The L1
+sandbox commit of the 19th gave `DaxZones::new` a wall-clock read for its placement seed, and Miri's
+isolation has no `REALTIME` clock: it **aborts** rather than returning an error, so the first test to build a
+store took the whole run with it. Under the interpreter the seed is now the ASLR address alone
+(`cfg!(miri)`), isolation stays **on**, and the leg is back and stronger than the record it replaces —
+**75 passed, 0 failed, 722.30 s, nothing skipped, no undefined behaviour and no unsupported operation**
+(macOS aarch64, 2026-10-20), against the 51 below that were taken with the chaos schedule skipped by name.
+`-Zmiri-disable-isolation` would also have got past it and was rejected: it turns isolation off for every
+other test in the suite to accommodate one line.
+
 The DAX gate's pin and free paths now have a Miri result, which they did not before: **51 passed, 0 failed, in
 391.80 s** on macOS aarch64 (`MIRIFLAGS=-Zmiri-ignore-leaks cargo +nightly miri test -p slates-vfs --test dax --
 --skip a_random_interleaving`), with no undefined behaviour and no unsupported operation reported. That covers
@@ -7846,7 +7856,7 @@ demand now that the case count reads from the environment:
 ```
 PROPTEST_CASES=20000 cargo test --release -p slates-vfs --test dax a_random_interleaving      # 12.60 s, green
 PROPTEST_CASES=2000  cargo test --release -p slates-bridge-virtiofs --test device a_random_window_schedule   # 0.24 s, green
-MIRIFLAGS=-Zmiri-ignore-leaks cargo +nightly miri test -p slates-vfs --test dax    # nothing skipped since 2026-10-19
+MIRIFLAGS=-Zmiri-ignore-leaks cargo +nightly miri test -p slates-vfs --test dax    # 75 passed, 722 s, 2026-10-20
 ```
 
 The first two are 133× and 25× their committed defaults and cover this session's pin dedup and snapshot-recall
