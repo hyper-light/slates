@@ -241,66 +241,37 @@ box shared with two other builds — timings are not benchmarks)
 6. **The notification queue** (`VIRTIO_FS_F_NOTIFICATION`) and **indirect descriptors**, if a VMM
    negotiates them; refused typed today.
 
-7. **The descriptor handoff from an out-of-process launcher — the missing link, and the prerequisite for DAX in
-   production (designed 2026-10-21, not built).** The serving half exists and is tested: `attach_vhost_user_device`
-   (and `_dax`) serve an inherited vhost-user descriptor, and `bridge-fuse::shards_fs::serve` speaks shards'
-   framing. But both are reachable only by code linked into the daemon's own process (tests, the crosvm A/B
-   example). Over the daemon's interface a `Guest` attach is refused `SeamNotOnWire`, because the client's channel
-   is a shared-memory ring and a ring cannot carry a descriptor. So **production cannot give a VM a slates volume
-   at all**, and since DAX is offered per guest device, production DAX cannot be "turned on" until this exists.
-   It is also exactly what kiln's microVM sessions need (`docs/wip/shards/README.md`, owed item 0).
+7. **How a VM or container reaches a slates volume in production: as a mount (decided 2026-10-21, Ada).** A
+   slates volume is mounted on the host as an ordinary folder (`slates mount`: NFS on macOS, FUSE on Linux), and each
+   platform shares that folder in with its own mechanism, including its own DAX where it has one. slates needs no
+   new transport for this, and every platform it targets is covered:
 
-   **The design (§4.6 A-9 already chooses it: "an in-process interface or an inherited descriptor … the harness
-   owns VM creation; Slates owns the exported attachment").** The launcher makes a socketpair, starts the VM on one
-   end (QEMU `-chardev socket,fd=N`, crosvm, or shards `--slates-fs-fd N`), and hands the other end to the daemon
-   with an attach request naming the volume, an optional scope and snapshot, the rights it asks, the protocol on
-   the descriptor (vhost-user, or shards' framing), and an optional DAX window. The daemon admits it under a fresh
-   attachment for the requesting consumer — rights from the volume's access list, as every attach — and serves it.
-   **The descriptor is the only key**, one per VM session; per-uid permissions mean nothing on this route, since a
-   guest kernel can claim any uid (`nfs-uid-is-client-asserted` reasoning, stronger here). The device's end is the
-   attachment's end: when the launcher's end closes, the device ends and the attachment detaches, recorded.
+   | target | how it reaches the volume | DAX |
+   |---|---|---|
+   | bare metal | the host mount | slates' own: a read-only map of slates' memory handed to a program (A-135, built) |
+   | OCI (Docker, Kubernetes on runc) | the host mount bound into the container (A-28, proven 2026-10-19) | not applicable: no VM, the host kernel serves reads |
+   | Shards | the host mount shared with `VOLUME … FOR` | Shards' DAX window (D189, `crates/vmm/src/devices/virtio/fs/mod.rs` on `gpu`, read 2026-10-21) maps the host file |
+   | QEMU, crosvm, Kubernetes on VM runtimes (Kata) | the host mount shared by virtio-fs (virtiofsd or the VMM's own device) | the sharer's DAX window maps the host file |
+   | Firecracker | **no folder sharing at all** — no virtio-fs (its README, read 2026-10-21) | only a file-backed block or pmem device; a volume must be presented as a disk-image file |
 
-   **How the descriptor reaches the daemon, per platform — the one open question is macOS:**
-   - *Linux:* the rendezvous is an abstract-namespace socket that stays open as the client's control channel
-     (`crates/ipc/src/rendezvous.rs`). The client sends the descriptor up it with `SCM_RIGHTS`, the same machinery the
-     daemon uses in the other direction (`MAPPING_FDS`). No new channel, no filesystem entry.
-   - *Windows:* the bootstrap claim slot already carries the client's pid, so the client can `DuplicateHandle` into
-     the daemon or the daemon out of the client; the pid is in a section whose DACL is the authentication.
-   - *macOS: open.* The rendezvous is a shared-memory claim table with no socket, so nothing between an unrelated
-     launcher and the daemon can carry a descriptor today. R1 forbids an on-disk socket "if any alternative exists".
-     Candidate: a Mach port send right with `fileport_makeport`, if a per-user, non-launchd service registration is
-     still permitted on current macOS — **unverified; needs Apple's primary sources, not recollection.** If none
-     exists, whether a 0600 socket in a 0700 per-user directory meets R1's "if any alternative exists" is Ada's call.
+   **What the mount route costs, stated so it is weighed honestly:** every uncached operation crosses two
+   filesystems on the host instead of one; DAX maps the host kernel's cached copy of a file rather than slates'
+   own memory, so the host holds the data twice and fills its cache by one copy from slates; and a change slates
+   makes on the host reaches the guest after two caches expire, not one. None of that is a correctness loss. It
+   is measured against each consumer's bar (kiln's: a build in the volume at most 1.5x the host).
 
-   **The DAX window.** `VHOST_USER_GET_SHMEM_CONFIG` is the VMM asking the *back end* how large a window to
-   allocate, so slates answers, and R3 forbids a fixed number. The launcher supplies the size, because only it knows
-   the guest's memory and the window costs the guest memory for its page records — about 1.6% of the window's size
-   on a Linux guest (a 64-byte record per 4 KiB page; **from memory, to verify**). Slates refuses a window larger
-   than the volume's capacity or the content arena, since DAX maps arena blocks and can never usefully exceed
-   either, and aligns it to the mapping alignment. No window, no DAX: the device then serves plain FUSE.
+   **What has to be proven, per target, by real runs** (the goal's bar: adversarial and chaos testing at each
+   step): the guest or container reads and writes the volume; DAX works where the platform has it, which needs a
+   slates mount's files to accept a shared `mmap` from the sharer; changes on either side reach the other; a
+   session's writes stay inside its own volume or clone; and nothing breaks when the daemon or the guest goes away.
+   Firecracker needs a new piece — a volume, or a snapshot of one, presented as a disk-image file.
 
-   **The Linux protocol, decided from the existing daemon→client pattern (`Control::send_mapping`).** The client
-   sends the descriptor up the control socket **first**, in one `sendmsg` with `SCM_RIGHTS`, tagged with the request
-   id of the attach it is about to submit; only then does it write the attach to the ring. `sendmsg` returns once the
-   kernel has queued the message, so by the time the daemon serves the ring request the descriptor is waiting — the
-   daemon never waits on the socket. The reverse of `send_mapping`'s rule holds: **a descriptor from a client is
-   hostile input** (a §4.13 consumer is an untrusted process of this uid). So the daemon, before using it:
-   - receives into a fixed ancillary buffer sized for exactly one descriptor, and treats `MSG_CTRUNC` or any count
-     but one as a refusal — closing every descriptor that did arrive, so a flood cannot exhaust its table;
-   - `fstat`s it and refuses anything that is not a stream socket, so a regular file or a pipe is never mistaken
-     for a device channel;
-   - sets it non-blocking and gives it to the device task alone, so a peer that never drains can stall only its own
-     device, never the shard;
-   - keeps at most one unclaimed descriptor per client, bound to one request id, and drops it if the ring request
-     that claims it does not arrive with the matching id — a bounded stash, never a queue (banned item 8).
-   The descriptor then **moves** to the volume's owner shard over the existing bounded cross-shard channel (R2),
-   where the device is served by the code the in-process path already uses.
-
-   **Build order:** (a) Linux, where the handoff machinery exists — the verb, admission, lifetime, recovery,
-   vhost-user, with the existing in-process tests as the oracle's other leg; (b) the shards framing on the same
-   verb; (c) DAX as the per-attach option, then the capability report says advertised when a window was given;
-   (d) Windows; (e) macOS once its mechanism is decided. Each platform not yet built refuses typed
-   (`AttachmentUnsupported`), never silently.
+   **slates' direct connection** (the VM's virtio-fs device talking to slates itself, built in-process as
+   `attach_vhost_user_device` and `shards_fs::serve`) is kept as a later optimization: it removes the host's
+   filesystem layer and lets DAX map slates' own memory with no copy. It is not needed for any target to work.
+   Two designs for it were written and withdrawn on 2026-10-21: handing slates a socket from the launcher (which
+   had no answer on macOS), then a slates-owned listener (Ada asked why another socket was needed when NFS has
+   one, and why a mount would not do — it does).
 
 ## 9. For the integrator (docs this branch does not touch)
 

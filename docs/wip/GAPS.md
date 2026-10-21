@@ -10412,7 +10412,15 @@ Decisions owed to Ada before building anything, because each changes behaviour a
    a human no way to learn whether a consumer was still live.
 
 
-### 2026-10-21: DAX in production is not one switch away — it needs the out-of-process descriptor handoff
+### 2026-10-21: DAX in production is not one switch away — superseded the same day: volumes reach VMs as mounts
+
+> **Superseded (2026-10-21, Ada's decision).** The plan below — a descriptor handoff so VMs connect to slates
+> directly — is withdrawn as the production route. A slates volume reaches every target as a host mount, shared in
+> by each platform's own mechanism with its own DAX: Shards has a DAX window (D189, read on `gpu` 2026-10-21; the
+> claim below that it had none was a week stale), QEMU/crosvm/Kata via virtio-fs, OCI by bind, bare metal directly;
+> Firecracker has no folder sharing and needs a disk-image form. slates' direct connection stays a later
+> optimization. The design and the per-target proof list are in `docs/wip/virtiofs.md` §8 item 7. What stays true
+> below: production cannot attach a guest device to slates directly, and the DAX safety gate is closed.
 
 DAX had been described (in this ledger's framing and to Ada) as "built, withheld, turning it on is Ada's call".
 Ada answered yes. On going to flip it: there is nothing in production to turn it on *for*. DAX is offered per
