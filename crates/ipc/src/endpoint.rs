@@ -289,7 +289,7 @@ impl ClientEnd {
   /// The completion socket for an async SDK event loop to poll (`uv_poll` / a Python selector, D-19),
   /// or `None` for a sync client or until [`Self::enable_async_completion`] starts the bridge. The
   /// loop waits for it to become readable, drains it ([`Self::drain_completion`]), then takes the
-  /// reply with [`Self::try_take`]. The Windows analogue of [`Self::completion_fd`].
+  /// reply with [`Self::try_take`]. The Windows analogue of `Self::completion_fd`, which is the Unix arm and so never exists where this one does.
   #[cfg(windows)]
   pub fn completion_socket(&self) -> Option<RawSocket> {
     self

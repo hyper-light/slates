@@ -22,7 +22,7 @@
 //! A stopped process has not exited, so a stall stays a stall. A Linux client needs no watch (the control socket's
 //! peer end closes with the daemon's process); the supervising anchor does, to restart a daemon the moment it dies
 //! rather than at its next observation (A-113's follow-up): on Unix the watch's descriptor
-//! ([`ExitWatch::readiness`]) becomes readable at the exit, so the anchor waits on it beside its hold channel. For a
+//! (`ExitWatch::readiness`, the Unix arm) becomes readable at the exit, so the anchor waits on it beside its hold channel. For a
 //! client the question is a cold path, asked only after a reply is overdue.
 
 use crate::error::IpcError;
