@@ -1175,10 +1175,13 @@ impl<'b> Export<'b> {
         return writer.into_bytes();
       }
     };
+    // The acting caller, read before the file state is borrowed: a state id authorizes only the
+    // principal that made it (`v4::files::FileState::check_io`).
+    let acting = self.caller.uid;
     let checked = self
       .file_states()
       .map_or(Err(crate::v4::Nfsstat4::Serverfault), |files| {
-        files.check_io(&stateid, &handle, clientid, want)
+        files.check_io(&stateid, &handle, clientid, want, acting)
       });
     let authority = match checked {
       Ok(authority) => authority,
@@ -1249,7 +1252,7 @@ impl<'b> Export<'b> {
       extension::STATE_LOCK | extension::STATE_LOCKT | extension::STATE_LOCKU => {
         lock_state(files, procedure, &handle, clientid, args)
       }
-      _ => other_state(files, procedure, &handle, clientid, args),
+      _ => other_state(files, procedure, &handle, (clientid, acting), args),
     }
   }
 
@@ -3211,7 +3214,7 @@ fn other_state(
   files: &mut FileState,
   _procedure: u32,
   handle: &Nfsfh3,
-  clientid: u64,
+  (clientid, acting): (u64, u32),
   args: &mut XdrReader<'_>,
 ) -> Result<Vec<u8>, crate::v4::files::LockRefused> {
   let bad = |_| crate::v4::Nfsstat4::Badxdr;
@@ -3221,6 +3224,6 @@ fn other_state(
     io_want::WRITE => IoWant::Write,
     _ => return Err(crate::v4::Nfsstat4::Badxdr.into()),
   };
-  files.check_io(&stateid, handle, clientid, want)?;
+  files.check_io(&stateid, handle, clientid, want, acting)?;
   Ok(Vec::new())
 }

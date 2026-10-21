@@ -78,6 +78,50 @@ knows whose it was. Failing that, a daemon restart would have to fail closed and
 descriptor-keeps-its-access rule would quietly change meaning across a restart — a second path for the
 same job, which this project does not keep.
 
+## The second door: a lock state id carried the same access
+
+Putting the uid in the open key closed the pooled open and nothing else. Hunting the same class again
+found a second way in, and this one the key fix did not touch.
+
+`check_io` resolves a **lock** state id to its open and reads that open's share access:
+
+```rust
+let lock = self.locks.get(stateid, fh, Some(clientid))?;
+let open = self.opens.get(&lock.open).ok_or(Nfsstat4::BadStateid)?;
+```
+
+and a LOCK names an open state id plus a lock-owner, validated by `check_open(&open, fh, clientid)` —
+which proves the open belongs to the same **client**, never to the acting **user**. So a second user
+could build a lock over the first's open and read its access through the lock state id. Presenting
+another user's lock state id directly does the same thing.
+
+Measured, `a_lock_does_not_carry_another_users_open_access`: uid 1001 opens the 0477 file for writing,
+uid 1000 locks naming 1001's open state id with a lock-owner of its own, and truncates under the lock
+state id. Served. uid 1000 owns the file and its own bits are `r--`.
+
+The fix is the general rule the first one only approximated: **a state id confers authority on the
+principal that made it and on nobody else.** `check_io` now refuses `NFS4ERR_ACCESS` when the open it
+resolved to was not made by the acting caller. That one check covers both lock doors — building a lock
+over another user's open, and presenting another user's lock state id — and it is why the acting uid had
+to be on the open in the first place. Red-checked: disabling it fails exactly the lock test and nothing
+else, which is the clean split — the key fix owns the pooled open, this rule owns the lock paths.
+
+Delegations and special state ids are unaffected: both return before the open is resolved, and both
+already decide strictly on the bits.
+
+The chaos property was extended to generate locks over *other users'* opens, and with the rule disabled
+it shrinks to and reports the escape itself:
+
+```
+uid 1002 truncating (locked over Some((1001, 0))): served=true, its own opens asked for 1
+```
+
+Writing that property taught one thing worth keeping: the first version failed in the *opposite*
+direction, served=false where the model expected true, and the model was wrong, not the server. A
+repeated lock-owner returns the lock state it was **first** created over, not the open the current LOCK
+names, so the lock-owner is now unique per step. A model that states the implementation's accident
+rather than the design's rule certifies drift either way.
+
 ## Why not the alternatives
 
 - **Refuse the cross-principal merge at OPEN.** Needs the principal on the open anyway, and invents a
@@ -91,6 +135,23 @@ same job, which this project does not keep.
 The cost of the chosen fix is that two users sharing one open-owner now hold two opens, so a DENY set by
 one is a share conflict for the other where before it was not. They are genuinely separate opens, and a
 client that shares an open-owner across users while setting deny bits is not a case the RFC contemplates.
+
+## Checked and deliberately left alone: CLOSE, OPEN_DOWNGRADE, LOCKU
+
+These take a state id too and also prove only the client (`check_open(stateid, fh, clientid)`), so one
+user of a client can close or unlock another's state. That is **not** this escape and is not worth the
+same rule:
+
+- Nothing crosses a permission boundary. The damage is confined to the users of the one client, whose
+  requests that client already composes — a client that wants to disrupt its own users can simply not
+  send theirs. The I/O paths are different in kind: there the server is the only thing standing between
+  a user and a file it may not write, so only the server can enforce it.
+- Tightening them has a real cost. A client may legitimately tear down state under a credential other
+  than the one that opened it — unmount and lease-expiry cleanup are the obvious cases — and refusing
+  those would break clients to buy nothing.
+
+Recorded rather than silently skipped, so the next person does not have to re-derive why the rule stops
+where it does.
 
 ## Still open, and not mine to decide
 

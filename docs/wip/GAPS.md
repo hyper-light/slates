@@ -10305,3 +10305,40 @@ Still open and Ada's call, unchanged: `write_result`/`read_into` use `permits_io
 plain WRITE or READ under a **special** state id, so a read-only-mode owner can write its own file that
 way. Deliberate NFS owner-override policy, not this escape.
 (`docs/bugs/2026-10-21-one-open-owner-pooled-two-users-access.md`.)
+
+
+### 2026-10-21: the same escape had a second door — a lock state id carried another user's open access
+
+Putting the acting uid in the open key closed the pooled open-owner and nothing else. `check_io`
+resolves a **lock** state id to its open and reads that open's share access, and a LOCK names an open
+state id plus a lock-owner validated by `check_open`, which proves the open belongs to the same
+*client* and never to the acting *user*. So a second user could build a lock over the first's open — or
+present the first's lock state id — and inherit its access.
+
+Measured (`a_lock_does_not_carry_another_users_open_access`): uid 1001 opens the 0477 file for writing,
+uid 1000 locks naming 1001's open state id with a lock-owner of its own, truncates under the lock state
+id, **served** — and uid 1000 owns the file with `r--`.
+
+Fixed with the general rule the first fix only approximated: a state id confers authority on the
+principal that made it and on nobody else. `check_io` refuses `NFS4ERR_ACCESS` when the open it resolved
+to was not made by the acting caller, which covers both lock doors at once. Delegations and special
+state ids return before that point and already decide strictly on the bits. Red-checked: disabling the
+rule fails exactly the lock test and nothing else — the key fix owns the pooled open, this rule owns the
+lock paths.
+
+The chaos property now generates locks over other users' opens, and with the rule disabled it shrinks to
+`uid 1002 truncating (locked over Some((1001, 0))): served=true, its own opens asked for 1`.
+
+**Method note.** The first version of that property failed in the opposite direction — `served=false`
+where the model expected `true` — and the *model* was wrong: a repeated lock-owner returns the lock state
+it was first created over, not the open the current LOCK names. The lock-owner is now unique per step. A
+model that encodes the implementation's accident instead of the design's rule certifies drift in either
+direction.
+
+Verified on Linux arm64 for the first fix (v4 37/0, v4_delegation 16/0, v4_session 15/0, procedures 50/0,
+nfs 6/0, multi 2/0, auth 4/0, db model 14/0, nfs_mount 38/0, recovery 41/0). What this machine cannot run
+is the real-kernel leg: `nfs_v4_kernel.rs` is opt-in (`SLATES_TEST_NFS4_KERNEL=1`) and needs a real NFS
+mount, and the pjdfstest conformance lane drives `open/07.t`'s multi-user cases against a real client.
+Those two are CI's, and they are what confirms a real client's per-credential open-owners make this a
+no-op for it rather than splitting opens it expects to share.
+(`docs/bugs/2026-10-21-one-open-owner-pooled-two-users-access.md`.)

@@ -2654,6 +2654,92 @@ fn setattr_status(
   Client::call(service, server, args.as_slice()).status
 }
 
+/// PUTROOTFH then OPEN of the existing `name` (no create) for `owner` with `access`, then GETFH: the
+/// state id and the handle, or the status that refused it.
+fn open_existing_at_root(
+  client: &mut Client,
+  service: &mut Export<'_>,
+  server: &mut Server,
+  owner: &[u8],
+  name: &str,
+  access: u32,
+) -> Result<(Stateid, Vec<u8>), u32> {
+  let mut args = client.sequenced(3);
+  args.u32(op::PUTROOTFH);
+  client.open_args(&mut args, owner, name, access, DENY_NONE, None);
+  args.u32(op::GETFH);
+  let reply = Client::call(service, server, args.as_slice());
+  if reply.status != Nfsstat4::Ok.wire() {
+    return Err(reply.status);
+  }
+  let mut body = reply.walk();
+  skip_sequence(&mut body);
+  expect_ok(&mut body, op::PUTROOTFH);
+  let (stateid, _) = open_result(&mut body);
+  expect_ok(&mut body, op::GETFH);
+  Ok((stateid, body.opaque(128).unwrap().to_vec()))
+}
+
+/// RFC 8881 §9.1.2 (A-35, A-38): a LOCK names an open state id and a lock-owner, and `check_open` only
+/// proves the open belongs to the same *client* — not to the acting user. A lock state id resolves
+/// through `check_io` to **its open's** share access, so if one user may build a lock over another
+/// user's open it inherits that user's access, which is the same escape as the pooled open-owner by a
+/// different door (`docs/bugs/2026-10-21-one-open-owner-pooled-two-users-access.md`).
+///
+/// Do: own `victim` as uid 1000 at mode 0477, so 1001 may write it and its own owner may not. Open it
+/// for writing as 1001, then as uid 1000 LOCK it naming 1001's open state id and a lock-owner of its
+/// own, and truncate under the lock state id. Expect: refused.
+#[test]
+fn a_lock_does_not_carry_another_users_open_access() {
+  let mut store = store();
+  let mut vol = volume(&mut store);
+  let mut bridge = VolumeBridge::new(VOLUME, &mut vol, &mut store);
+  let owning = cx_as(1000);
+  let root = bridge.root(&owning).unwrap();
+  bridge
+    .create(ObjectId::new(root, 0), &owning, "victim", 0o477, 0)
+    .unwrap();
+
+  let mut files = FileState::new(owner_tag(0, 0), 64, 64);
+  let mut server = Server::standalone();
+  let (mut client, writer_state, fh) = {
+    let mut service = export(&mut bridge, 1001);
+    service.lend_file_state(&mut files);
+    let mut client = Client::connect(&mut service, &mut server, b"host-lock");
+    let (state, fh) = open_existing_at_root(
+      &mut client,
+      &mut service,
+      &mut server,
+      b"writer",
+      "victim",
+      WRITE,
+    )
+    .expect("uid 1001 may open the file for writing");
+    (client, state, fh)
+  };
+
+  let mut service = export(&mut bridge, 1000);
+  service.lend_file_state(&mut files);
+  let (status, body) = lock_call(&mut client, &mut service, &mut server, &fh, |args| {
+    lock_args(args, WRITE_LT, 0, 1, writer_state, None, b"locker-of-1000");
+  });
+  if status != Nfsstat4::Ok.wire() {
+    return; // refusing the lock itself is also a correct answer.
+  }
+  let locked = Stateid::decode(&mut XdrReader::new(&body)).unwrap();
+  assert_ne!(
+    setattr_status(
+      &mut client,
+      &mut service,
+      &mut server,
+      (fh.as_slice(), locked),
+      Some(0),
+    ),
+    Nfsstat4::Ok.wire(),
+    "a lock built over another user's open does not lend that user's write"
+  );
+}
+
 /// RFC 8881 §9.1.2 (A-35, A-38): an open-owner is opaque data the *client* chooses, so it carries no
 /// authority between users. Two principals that share one open-owner must not pool their access — the
 /// server checks the acting caller on every operation that reaches it, and a client that reuses an
@@ -2778,7 +2864,12 @@ proptest::proptest! {
   #[test]
   fn no_interleaving_of_shared_open_owners_lends_one_users_write_to_another(
     steps in proptest::collection::vec(
-      (0usize..3, 0usize..2, proptest::sample::select(vec![READ, WRITE, READ | WRITE])),
+      (
+        0usize..3,
+        0usize..2,
+        proptest::sample::select(vec![READ, WRITE, READ | WRITE]),
+        proptest::option::of(0usize..8),
+      ),
       1..12,
     )
   ) {
@@ -2796,9 +2887,12 @@ proptest::proptest! {
     let mut files = FileState::new(owner_tag(0, 0), 64, 64);
     let mut server = Server::standalone();
     let mut asked: std::collections::BTreeMap<(u32, usize), u32> = std::collections::BTreeMap::new();
+    // Every open made so far, so a step can build a lock over somebody else's — the second door this
+    // property has to cover, since a lock state id resolves through `check_io` to its open's access.
+    let mut made: Vec<(u32, usize, Stateid)> = Vec::new();
     let mut client: Option<Client> = None;
 
-    for (user, owner, access) in steps {
+    for (at, (user, owner, access, lock_over)) in steps.into_iter().enumerate() {
       let uid = users[user];
       let mut service = export(&mut bridge, uid);
       service.lend_file_state(&mut files);
@@ -2819,23 +2913,52 @@ proptest::proptest! {
         expect_ok(&mut body, op::GETFH);
         let fh = body.opaque(128).unwrap().to_vec();
         *asked.entry((uid, owner)).or_insert(0) |= access;
-        let own = asked.get(&(uid, owner)).copied().unwrap_or(0);
+        made.push((uid, owner, stateid));
+
+        // Either truncate under the open just returned, or build a lock over one of the opens made so
+        // far — possibly another user's — and truncate under the lock state id.
+        let target = lock_over.and_then(|pick| made.get(pick % made.len()).copied());
+        let (used, expected) = match target {
+          Some((holder, held_owner, open)) => {
+            // A lock-owner unique to this step, built without a lossy cast: the tag, the acting uid and
+            // the step's number, each in full.
+            let mut lock_owner = b"lk".to_vec();
+            lock_owner.extend_from_slice(&uid.to_le_bytes());
+            lock_owner.extend_from_slice(&u64::try_from(at).unwrap_or(u64::MAX).to_le_bytes());
+            let (status, body) = lock_call(&mut live, &mut service, &mut server, &fh, |args| {
+              // Unique per step, so the LOCK binds to the open it names: a repeated lock-owner returns
+              // the lock state it was first created over, which is a different question from the one
+              // this property asks.
+              lock_args(args, WRITE_LT, 0, 1, open, None, &lock_owner);
+            });
+            if status != Nfsstat4::Ok.wire() {
+              client = Some(live);
+              continue; // refusing the lock itself is a correct answer.
+            }
+            // A lock may only carry the access of an open its own holder made, and only what that
+            // holder asked for under that open-owner.
+            let carried = holder == uid
+              && asked.get(&(uid, held_owner)).copied().unwrap_or(0) & WRITE != 0;
+            (Stateid::decode(&mut XdrReader::new(&body)).unwrap(), carried)
+          }
+          None => (stateid, asked.get(&(uid, owner)).copied().unwrap_or(0) & WRITE != 0),
+        };
         let status = setattr_status(
           &mut live,
           &mut service,
           &mut server,
-          (fh.as_slice(), stateid),
+          (fh.as_slice(), used),
           Some(0),
         );
         let served = status == Nfsstat4::Ok.wire();
         proptest::prop_assert_eq!(
           served,
-          own & WRITE != 0,
-          "uid {} truncating under open-owner {}: served={}, its own opens asked for {}",
+          expected,
+          "uid {} truncating (locked over {:?}): served={}, its own opens asked for {}",
           uid,
-          owner,
+          target.map(|(holder, held, _)| (holder, held)),
           served,
-          own
+          asked.get(&(uid, owner)).copied().unwrap_or(0)
         );
       }
       client = Some(live);

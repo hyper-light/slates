@@ -2458,6 +2458,12 @@ therefore one implementation shared by both versions.
   a user the mode denied writing could write and truncate through another user's open (measured
   2026-10-21, `docs/bugs/2026-10-21-one-open-owner-pooled-two-users-access.md`). The same user's reopen
   still merges, which is what §9.1.1 asks for; only a principal change starts a separate open.
+  For the same reason a state id authorizes **only the principal that made it**: an I/O check refuses
+  `NFS4ERR_ACCESS` when the open a state id resolves to was made by somebody else. That is what a lock
+  needs, because a LOCK names an open state id and a lock-owner and the open is proven to belong to the
+  same *client*, not the same user — so without it a second user could build a lock over the first's
+  open, or present the first's lock state id, and read its access. Delegations and special state ids
+  resolve before that point and decide strictly on the bits.
   An `UNCHECKED` open of an existing name applies only the size (the `O_TRUNC`), also when another
   client creates the name between the open's LOOKUP and its create. An exclusive create (EXCLUSIVE4,
   EXCLUSIVE4_1, and NFSv3 `EXCLUSIVE`) keeps its verifier in the new file's modification and access

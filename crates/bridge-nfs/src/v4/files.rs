@@ -623,6 +623,7 @@ impl FileState {
     fh: &Nfsfh3,
     clientid: u64,
     want: IoWant,
+    acting: u32,
   ) -> Result<IoAuthority, Nfsstat4> {
     if stateid.is_special() {
       self.refuse_denied(fh, None, want)?;
@@ -645,6 +646,18 @@ impl FileState {
     } else {
       (stateid.other, self.check_open(stateid, fh, clientid)?)
     };
+    // A state id confers authority on the principal that made it and on nobody else. Both the share
+    // access read just below and the `IoAuthority::Open` answer stand for "this caller's open was
+    // permission-checked when it was made", which is only true for that caller. The lock branch above is
+    // why this is checked here rather than at the open alone: a LOCK names an open state id and a
+    // lock-owner, and `check_open` proves only that the open belongs to the same *client*, so a second
+    // user could build a lock over the first's open — or simply present the first's lock state id — and
+    // read its access. Measured 2026-10-21: uid 1000 truncated a 0477 file it owns and may not write by
+    // locking uid 1001's write-capable open
+    // (`docs/bugs/2026-10-21-one-open-owner-pooled-two-users-access.md`).
+    if open.uid != acting {
+      return Err(Nfsstat4::Access);
+    }
     match want {
       IoWant::Write if open.share.access & share::WRITE == 0 => Err(Nfsstat4::Openmode),
       IoWant::Read if open.share.access & share::READ == 0 => {

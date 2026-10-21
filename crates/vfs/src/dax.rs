@@ -669,7 +669,7 @@ impl Volume {
   /// **A sealed chunk is reopened, not refused, and that is a change to data at rest.** This doc said the opposite
   /// until 2026-10-21 — "a sealed chunk … is refused — the caller falls back to FUSE_READ" — which would have told
   /// a reader that no DAX read can ever turn ciphertext into plaintext on this host. It can, and here is where: the
-  /// sealed arm below calls [`crate::content::Content::reopen_in_place`], transitioning the chunk sealed→open in its
+  /// sealed arm below calls [`crate::content::ChunkStore::reopen_in_place`], transitioning the chunk sealed→open in its
   /// **own canonical block**, because refusing instead would SIGBUS a `dax=always` guest mmap. That is a real
   /// canonical state change — it allocates, decrypts, can fail `NoSpace`, dirties the recovery image and adds
   /// re-seal churn — and `Volume::seal_pending`'s pin-defers-seal rule is what keeps the sweep from encrypting it

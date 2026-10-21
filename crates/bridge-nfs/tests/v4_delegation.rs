@@ -335,15 +335,15 @@ fn a_delegations_state_id_serves_its_holders_reads_only() {
     .unwrap();
   let delegation = files.delegate_read(A, &fh, 0, QUIET).unwrap();
   assert_eq!(
-    files.check_io(&delegation, &fh, A, IoWant::Read),
+    files.check_io(&delegation, &fh, A, IoWant::Read, OPENER),
     Ok(IoAuthority::Delegation)
   );
   assert_eq!(
-    files.check_io(&delegation, &fh, A, IoWant::Write),
+    files.check_io(&delegation, &fh, A, IoWant::Write, OPENER),
     Err(Nfsstat4::Openmode)
   );
   assert_eq!(
-    files.check_io(&delegation, &fh, B, IoWant::Read),
+    files.check_io(&delegation, &fh, B, IoWant::Read, OPENER),
     Err(Nfsstat4::BadStateid)
   );
   assert_eq!(files.test(&delegation.other, A), Nfsstat4::Ok);
@@ -378,7 +378,7 @@ fn a_delegation_survives_a_restart_through_its_record() {
     records,
   );
   assert_eq!(
-    rebuilt.check_io(&delegation, &fh, A, IoWant::Read),
+    rebuilt.check_io(&delegation, &fh, A, IoWant::Read, OPENER),
     Ok(IoAuthority::Delegation)
   );
   assert!(rebuilt.recall(&fh, Some(B), Conflict::Change, 1).waiting);
@@ -399,12 +399,12 @@ fn an_open_for_writing_is_write_delegated_only_while_no_other_client_has_the_fil
     .expect("A's open for writing is delegated");
   assert_eq!(files.delegate_write(A, &fh, 1, QUIET), Some(delegation));
   assert_eq!(
-    files.check_io(&delegation, &fh, A, IoWant::Write),
+    files.check_io(&delegation, &fh, A, IoWant::Write, OPENER),
     Ok(IoAuthority::Delegation),
     "the holder writes under it, as the client, not as one checked open"
   );
   assert_eq!(
-    files.check_io(&delegation, &fh, A, IoWant::Read),
+    files.check_io(&delegation, &fh, A, IoWant::Read, OPENER),
     Ok(IoAuthority::Delegation),
     "and reads (§9.1.2)"
   );
