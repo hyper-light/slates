@@ -922,6 +922,34 @@ tag `shards0` and reading `/hello` back byte for byte. So a guest kernel's own v
 slates volume and reads it, with no host mount and no DAX window: the achievable integration where the
 VMM offers no DAX cache window. The DAX-window route stays as recorded in `8a-dax-confine`.
 
+### 8a-deep-sweep. Every property suite run deep, twice over what any of them had seen (2026-10-20)
+
+The DAX properties only started exploring their own sandbox paths once the L1 defects were fixed, so the
+whole project's property coverage was worth re-taking at depth rather than at its committed counts. Two
+real findings came out of it, and the rest is evidence.
+
+**Found and fixed.** A DAX property shrank to `len = 0` at 50,000 cases and reported that a read map of a
+0-byte file was refused `NotFound` — mappability depended on *how* a file became empty, written or truncated
+(`8a-dax` family; `docs/bugs/2026-10-20-...`). And the device seam's chaos schedule **aborted** at 10,000
+rather than running: proptest's `max_global_rejects` is an absolute 1024 whatever the case count, so a
+generator turning away a tenth of its draws passes small and aborts deep. Eight suites use `prop_assume` and
+none set it; the ceiling now scales with the sweep in `slates-test-seeds`, keeping proptest's own ratio.
+
+**Run clean at depth afterwards** (Linux aarch64, release):
+
+| Suite | Cases | Result |
+|---|---|---|
+| `slates-vfs` dax | 50,000 | 75 passed |
+| `slates-bridge-virtiofs` device | 50,000 | 37 passed, 3.8 s |
+| `slates-vfs` allocate, base, charge_oracle, derive, change, clones, seek | 5,000 | all passed |
+| `slates-merge` increment, map, engine | 5,000 | 42, 10, 45 passed |
+| `slates-archive` archive, `slates-bridge-nfs` attr_floor | 5,000 | 20, 1 passed |
+| `slates-db` promote_oracle, reconfig, model, ledger | 5,000 | 2, 7, 14, 16 passed |
+
+The virtiofs row is the one that could not have been taken before today: at its recorded 2,000 it was green,
+and every count past ~10,000 aborted instead of running, so "deepen on demand" was true of the case count
+and not of the sweep.
+
 ### 8a-r9-gate. R9's provisioning ratchet is enforced by nothing (2026-10-20, OPEN — needs Ada)
 
 R9 reads: "The provisioning histogram (p50/p99/p999/max, spinning and parked) is a permanent,
