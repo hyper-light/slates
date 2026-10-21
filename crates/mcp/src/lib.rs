@@ -2442,3 +2442,64 @@ mod resource_encoding_tests {
     assert_eq!(percent_decode("%ff%fe"), None);
   }
 }
+
+#[cfg(test)]
+mod oci_binding_json_tests {
+  use super::oci_binding_json;
+  use slates_ipc::protocol::{HostMountEvidence, OciBinding};
+
+  /// AUD-29-67 — every fact the kernel's mount table gave about a bind source reaches the machine-readable
+  /// surface, `shared_with_other_users` above all.
+  ///
+  /// That one is the fact that **replaced a refusal** on 2026-10-20: an unshared source is bound and
+  /// reported rather than refused `MountNotShared`, because a rootful runtime's processes would meet
+  /// `EACCES` there and a rootless one would not, and slates cannot see which the harness will drive. The
+  /// design says it travels "in the evidence for the harness's own pre-bind check" — and `--json`, the
+  /// surface a harness actually reads, did not carry it, while the text form always had.
+  ///
+  /// It survived because nothing tested this function's shape: the only consumer that would have noticed is
+  /// a CLI flow needing `/dev/fuse` and `SLATES_TEST_CLI`, which no machine here has, so it took a GitHub
+  /// runner to find it. This test needs neither and runs on every platform.
+  #[test]
+  fn the_binding_json_carries_every_fact_the_mount_table_gave() {
+    let binding = OciBinding {
+      source: "/mnt/point".to_owned(),
+      destination: "/work".to_owned(),
+      read_only: false,
+      mount_type: "bind".to_owned(),
+      options: vec!["bind".to_owned(), "rw".to_owned()],
+      evidence: HostMountEvidence {
+        fstype: "fuse.slates".to_owned(),
+        mount_source: "slates:0001".to_owned(),
+        names_volume: true,
+        mount_id: 42,
+        mount_device: 7,
+        shared_with_other_users: false,
+      },
+    };
+    let json = oci_binding_json(&binding);
+    let evidence = json
+      .get("evidence")
+      .and_then(serde_json::Value::as_object)
+      .expect("the binding carries its evidence");
+    for key in [
+      "fstype",
+      "mount_source",
+      "names_volume",
+      "mount_id",
+      "mount_device",
+      "shared_with_other_users",
+    ] {
+      assert!(
+        evidence.contains_key(key),
+        "the evidence names {key}, so a harness reading this surface sees every fact the text form prints: \
+         {evidence:?}"
+      );
+    }
+    assert_eq!(
+      evidence.get("shared_with_other_users"),
+      Some(&serde_json::Value::Bool(false)),
+      "the sharing fact crosses as the boolean it is, not as a string or an omission: {evidence:?}"
+    );
+  }
+}
