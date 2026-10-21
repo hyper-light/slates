@@ -1064,6 +1064,12 @@ every one was false. **A sweep cannot tell whether the *linking site* is itself 
 so they appear and vanish together and can never be an error. rustdoc knows that; a grep does not. The lane
 is the oracle.
 
+**Green on all three platforms as of 2026-10-21** (run on `21b6b89e`). The Windows lane found six errors over
+three rounds, every one of them a cross-platform reference to an arm the naming platform does not have:
+`KickFd`, `Self::completion_fd`, `ExitWatch::readiness`, `crate::nfs`, `Self::backing_fd`, `MappedRead`,
+`MESSAGES_PER_DEVICE` and `keep_lease_alive`. None was reachable from macOS or Linux, which is the whole
+argument for the third lane.
+
 **And it was: the Windows gate's first run found exactly one error, not thirty.** `crates/rt/src/driver.rs:96`
 — a `#[cfg(windows)]` completion-port type documenting itself as "the counterpart of [`KickFd`]", where
 `KickFd` is `#[cfg(unix)]`. The two never coexist, so that link could resolve on neither platform. One real
