@@ -1,6 +1,9 @@
 # The async SDK's two intermittents, and how to reproduce them on Linux
 
-**Status:** open. One measurement flaw fixed (`967fd387`); neither intermittent root-caused.
+**Status:** **B is root-caused and fixed** — see
+`docs/bugs/2026-10-21-a-signalled-daemon-had-not-stopped-and-answered-the-call.md`: `killpg` queues a
+signal and returns, and the daemon answered the call before it stopped (measured, state `R` after the
+stop). A is open; one measurement flaw in it was fixed (`967fd387`).
 **Why this exists:** three hypotheses were tested and refuted, and a Linux reproduction harness now
 exists. Without a record, the next person repeats all of it.
 
@@ -11,7 +14,7 @@ They are different, and conflating them wasted time.
 | | symptom | where seen | rate |
 |---|---|---|---|
 | **A, the held loop** | `the loop was never held: worst lateness 0.298 s … bound 0.1 s plus … noise 0.001 s` | ubuntu CI, runs 39538566246 and 39539155335 | 2 of 10 |
-| **B, the unstalled call** | `AssertionError: SlatesError not raised` | ubuntu CI 2026-10-02 and 2026-10-06; reproduced locally 2026-10-21 | 1 of 10 |
+| **B, the unstalled call** (**fixed**) | `AssertionError: SlatesError not raised` | ubuntu CI 2026-10-02 and 2026-10-06; reproduced locally 2026-10-21 | 1 of 10 |
 
 Both are in
 `crates/sdk-python/tests/test_sdk_async.py::test_every_async_call_ends_across_restart_silence_cancellation_and_death`
@@ -44,10 +47,16 @@ Recorded so nobody re-walks them. Each looked right from the code.
    directly, with a real reconnect (`client.reconnects() == 1`): worst lateness **5 ms**.
 
 3. **"B is a race between `killpg(SIGSTOP)` returning and the daemon actually stopping."** Plausible:
-   the test calls `client.list()` with no wait after the signal. **Refuted by A/B:** arm A (call
-   straight after `killpg`, as the test does) stalled 12/12; arm B (poll `/proc/<pid>/stat` until the
-   state is `T`, then call) stalled 12/12. Even trials that read state `R` at the call stalled
-   correctly.
+   the test calls `client.list()` with no wait after the signal. Judged **refuted by A/B** at the time:
+   arm A (call straight after `killpg`, as the test does) stalled 12/12; arm B (poll `/proc/<pid>/stat`
+   until the state is `T`, then call) stalled 12/12.
+
+   **That judgement was wrong, and this was the answer all along.** The A/B ran *phase 2 in isolation*,
+   where the daemon is idle and parked and so stops promptly; 24 trials of a case that fails about 5
+   times in 100 was nowhere near enough to see it, and "12/12 both arms" was read as a refutation when
+   it was only an absence. Run after a phase-1 restart, with the daemon fresh and busy, the window
+   opens: the failing trial read the daemon's state as `R` immediately after the group stop. A
+   hypothesis is not refuted by a sample too small to show it.
 
 Also ruled out while reading, so not worth re-checking: `poll_reply_word` is non-blocking (buffer
 check plus `try_take`), and `recv_mapping` — the only Linux-specific path in the client's poll — uses
@@ -130,6 +139,8 @@ instrumentation above, or find the mechanism by reasoning about what phase 1 lea
 
 ## Owed
 
-- Capture the failing shape of B with the instrumentation, then root-cause it.
 - Establish whether anything of A survives the measurement fix. The ticker now reports which of the
   four scenario phases held it, which the earlier failures could not say.
+
+B is closed; its cause, its evidence and the wrong turn taken on the way are in
+`docs/bugs/2026-10-21-a-signalled-daemon-had-not-stopped-and-answered-the-call.md`.

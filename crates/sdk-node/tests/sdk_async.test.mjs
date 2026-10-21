@@ -274,6 +274,60 @@ async function waitFor(condition, what) {
   }
 }
 
+// The process's state letter, or null when it is gone; `ps` reads it on Linux and macOS alike. A `ps`
+// that could not run at all is thrown, never reported as "gone": `runAsync` turns a spawn failure into
+// status -1, and reading that as gone would make every wait below pass at once and silently restore the
+// race they exist to close.
+async function stateOf(pid) {
+  const { status, stdout } = await runAsync('ps', ['-o', 'state=', '-p', String(pid)]);
+  if (status === -1) throw new Error('`ps` could not be run, so no process state can be read');
+  const letter = stdout.trim();
+  return status === 0 && letter ? letter[0] : null;
+}
+
+// Signals, tolerating only the process having already exited between the scan and the signal -- which is
+// the state the caller wanted anyway. Anything else is a real failure and is rethrown.
+function signalIfAlive(pid, signal) {
+  try {
+    process.kill(pid, signal);
+  } catch (error) {
+    if (error.code !== 'ESRCH') throw error;
+  }
+}
+
+// SIGSTOP every pid and return only once each has really stopped (or gone). `kill` queues the signal and
+// returns; the target stops when it is next scheduled, and a daemon that has been signalled but not yet
+// stopped is still a live daemon and still answers.
+async function stopAndWait(pids, what) {
+  for (const pid of pids) signalIfAlive(pid, 'SIGSTOP');
+  await waitFor(async () => {
+    for (const pid of pids) {
+      const state = await stateOf(pid);
+      if (state !== 'T' && state !== null) return false;
+    }
+    return true;
+  }, what);
+}
+
+// Stops the anchor's whole process group and returns only once every member has really stopped. Measured
+// on Linux 2026-10-21 against the Python twin: with the call made straight after the group stop, the
+// daemon answered it 5 times in 100, reading state `R` in the instant after the stop. The anchor is
+// confirmed stopped first, because only a running anchor can fork a replacement the group signal has
+// already swept past; once it is stopped the set of daemons is closed.
+async function stopGroupAndWait(daemon, instance, anchorPid) {
+  signalIfAlive(-anchorPid, 'SIGSTOP');
+  await stopAndWait([anchorPid], 'the anchor stopped');
+  await waitFor(async () => {
+    const running = [];
+    for (const pid of await daemonPids(daemon, instance)) {
+      const state = await stateOf(pid);
+      if (state !== 'T' && state !== null) running.push(pid);
+    }
+    for (const pid of running) signalIfAlive(pid, 'SIGSTOP');
+    return running.length === 0;
+  }, 'every daemon the anchor supervises stopped');
+}
+
 test('every async call ends across restart, silence, reader loss and death', async (t) => {
   const daemon = process.env.SLATES_DAEMON;
   if (!addonPath || !existsSync(addonPath) || !daemon || !existsSync(daemon)) {
@@ -297,8 +351,9 @@ test('every async call ends across restart, silence, reader loss and death', asy
     // (1) Overflow, then a restart under the calls.
     const first = await daemonPids(daemon, instance);
     assert.ok(first.length > 0, 'the daemon is running');
-    // Stopped first, so the calls stay outstanding (a live daemon answers within the fast-path spin).
-    for (const pid of first) process.kill(pid, 'SIGSTOP');
+    // Stopped first, so the calls stay outstanding (a live daemon answers within the fast-path spin) —
+    // and stopped means stopped, or the daemon drains them and nothing overflows.
+    await stopAndWait(first, 'the daemon stopped');
     const calls = Array.from({ length: limit * 3 }, () => client.list());
     for (const pid of first) process.kill(pid, 'SIGKILL');
     const settled = await Promise.allSettled(calls);
@@ -312,9 +367,9 @@ test('every async call ends across restart, silence, reader loss and death', asy
     // (2) A live but silent daemon: the call ends Stalled at its reply deadline. The anchor's whole process
     // group (it leads it, `detached`, and every daemon it spawns is in it) is stopped in one signal (a negative
     // pid), so its supervision cannot replace the silent daemon and no child it forked can escape the stop.
-    // Stopping the anchor and then each `pgrep`-found daemon left a window: a child forked but not yet exec'd
-    // does not match the daemon's command line (the Python twin failed so on CI, 2026-10-02 and 2026-10-06).
-    process.kill(-anchor.pid, 'SIGSTOP');
+    // The helper waits until every member has really stopped, because the signal only queues and a daemon
+    // still running answers the call this requires to stall.
+    await stopGroupAndWait(daemon, instance, anchor.pid);
     await assert.rejects(client.list(), /Stalled/);
 
     // (2b) A cancelled call is released at once: it rejects AbortError and nothing is left waiting.

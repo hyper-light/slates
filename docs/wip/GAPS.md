@@ -4597,18 +4597,23 @@ one resolves, so it drops none, but real UDP loss would still wedge the vendored
 probes wait on the handshake's round trip instead of RFC 6298's fixed 1 s. Owed with the re-vendor: `join_addressable`
 joins with the keying record session's measured handshake round trip.
 
-### 2026-10-04: an intermittent async-SDK overflow assertion (open, not yet reproduced)
+### 2026-10-04: an intermittent async-SDK overflow assertion (closed 2026-10-21)
 
 CI run 37183276944 (`ec4a56c`, ubuntu SDK packaging): `test_every_async_call_ends_across_restart_silence_cancellation_and_death`
 failed with `0 not greater than 0 : the overflow is refused at once`. With the daemon stopped (`SIGSTOP`), three times the
 client's outstanding limit of `list()` calls produced no `TooManyOutstanding`. It passed on the next runs, and `ec4a56c`
 changed only the transport's exported secret.
 
-Suspects, unverified:
-- `_daemon_pids` named no live daemon, so nothing was stopped and completions freed the slots;
-- the outstanding count admits a call before the bound is checked.
-
-Next: reproduce under parallel load with `SIGSTOP` timing logged, failing test first.
+**Closed: the daemon had been signalled but had not stopped.** The first suspect recorded here —
+"`_daemon_pids` named no live daemon, so nothing was stopped" — was the right family, and the
+measurement sharpened it: the daemon *was* named and *was* signalled, but `kill` only queues a signal,
+so it kept running, drained the calls, freed the slots and nothing overflowed. The same cause produced
+the unrelated-looking "SlatesError not raised" failure in phase 2 of the same test: measured on Linux
+at 5 failures in 100, with the daemon reading state `R` in the instant after the group stop, dropping to
+0 in 100 once every member is confirmed stopped. Both SDK tests now stop through `_stop_and_wait` /
+`_stop_group_and_wait` (`stopAndWait` / `stopGroupAndWait` in Node), which wait for state `T` through the
+existing `_wait_for` deadline. No product change: a running daemon answering a call is correct.
+(`docs/bugs/2026-10-21-a-signalled-daemon-had-not-stopped-and-answered-the-call.md`.)
 
 ### 2026-10-04: a strict volume's first arena lock on macOS is one unsliced step (owed)
 

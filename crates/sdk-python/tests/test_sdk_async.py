@@ -341,6 +341,68 @@ async def _wait_for(condition, what):
         await asyncio.sleep(POLL_SECS)
 
 
+async def _state_of(pid):
+    """The process's state letter, or `None` when the process is gone. `ps` reads it on every platform
+    the SDK ships on; Linux has `/proc` and macOS does not."""
+    status, stdout = await _run_async("ps", "-o", "state=", "-p", str(pid))
+    letter = stdout.strip()
+    return letter[0] if status == 0 and letter else None
+
+
+def _signal_if_alive(pid, number):
+    """Signals `pid`, tolerating only its having already exited — which is the state the caller wanted."""
+    try:
+        os.kill(pid, number)
+    except ProcessLookupError:
+        pass
+
+
+async def _stop_and_wait(pids, what):
+    """SIGSTOP every pid and return only once each has really stopped (or gone).
+
+    `kill` and `killpg` queue a signal and return; the target stops when it is next scheduled. A daemon
+    that has been signalled but not yet stopped is still a live daemon and still answers, so a test that
+    calls straight after the signal is not yet testing a silent daemon.
+    """
+    for pid in pids:
+        _signal_if_alive(pid, signal.SIGSTOP)
+
+    async def all_stopped():
+        for pid in pids:
+            if await _state_of(pid) not in ("T", None):
+                return False
+        return True
+
+    await _wait_for(all_stopped, what)
+
+
+async def _stop_group_and_wait(binary, instance, anchor_pid):
+    """Stop the anchor's whole process group and return the group id once every member has really
+    stopped.
+
+    Measured on Linux 2026-10-21: with the call made straight after `killpg`, the daemon answered it 5
+    times in 100, reading state `R` in the instant after the stop — which is what made this test
+    intermittent on CI (2026-10-02, 2026-10-06). The anchor is confirmed stopped first, because only a
+    running anchor can fork a replacement that the group signal has already swept past; once it is
+    stopped the set of daemons is closed, so any still running is stopped individually.
+    """
+    group = os.getpgid(anchor_pid)
+    os.killpg(group, signal.SIGSTOP)
+    await _stop_and_wait([anchor_pid], "the anchor stopped")
+
+    async def daemons_stopped():
+        running = []
+        for pid in await _daemon_pids(binary, instance):
+            if await _state_of(pid) not in ("T", None):
+                running.append(pid)
+        for pid in running:
+            _signal_if_alive(pid, signal.SIGSTOP)
+        return not running
+
+    await _wait_for(daemons_stopped, "every daemon the anchor supervises stopped")
+    return group
+
+
 class SlatesAsyncEveryCallEnds(unittest.TestCase):
     @unittest.skipIf(
         _daemon_binary() is None,
@@ -378,8 +440,7 @@ class SlatesAsyncEveryCallEnds(unittest.TestCase):
             # (1) Overflow, then a restart under the calls. Stopped first, so the calls stay outstanding.
             first = await _daemon_pids(binary, instance)
             self.assertTrue(first, "the daemon is running")
-            for pid in first:
-                os.kill(pid, signal.SIGSTOP)
+            await _stop_and_wait(first, "the daemon stopped")
             calls = []
             refused = 0
             for _ in range(limit * 3):
@@ -404,11 +465,9 @@ class SlatesAsyncEveryCallEnds(unittest.TestCase):
             # (2) A live but silent daemon: the call ends Stalled. The anchor's whole process group (the
             # anchor leads it, `start_new_session`, and every daemon it spawns is in it) is stopped in one
             # signal, so its supervision cannot replace the silent daemon and no child it forked can escape
-            # the stop. Stopping the anchor and then each `pgrep`-found daemon still left a window: a child
-            # forked but not yet exec'd does not match the daemon's command line (CI 2026-10-02 and
-            # 2026-10-06: "SlatesError not raised", the second after the pids were read post-stop).
-            group = os.getpgid(anchor.pid)
-            os.killpg(group, signal.SIGSTOP)
+            # the stop — and the helper waits until every member has really stopped, because the signal
+            # only queues and a daemon still running answers the call this requires to stall.
+            group = await _stop_group_and_wait(binary, instance, anchor.pid)
             with self.assertRaisesRegex(slates.SlatesError, "Stalled"):
                 await client.list()
 
