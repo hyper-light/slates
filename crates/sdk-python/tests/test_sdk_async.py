@@ -26,11 +26,21 @@ ASYNC_VERBS = {
     "unlink", "rename", "mkdir", "rmdir", "chmod", "symlink", "link", "set_xattr", "remove_xattr",
     "land", "reconnects", "outstanding_limit",
 }
+# How much slower this lane is than a dev machine, the same knob the Rust client tests read
+# (SLATES_TEST_RESTART_SLOWDOWN; the gates lane sets 10 and the TSan lane 25). An integer >= 1,
+# default 1, so a normal local run is unchanged.
+SLOWDOWN = max(1, int(os.environ.get("SLATES_TEST_RESTART_SLOWDOWN") or 1))
 # Test deadlines in nanoseconds; a production caller derives these from the machine's budgets.
-REPLY_NS = 1_000_000_000
-RECONNECT_NS = 2_000_000_000
+# Scaled, because they are budgets for work a slow machine does slowly. Measured 2026-10-20: with ten
+# busy spinners on an 18-core machine (load 32), phase 1's calls came back
+# `Stalled { after_ns: 1000000000 }` instead of being answered across the restart — the restarted
+# daemon simply had not answered inside a flat one second. One failure in five runs; none in six at
+# four spinners. That is the same defect as the Rust side's flat START_WAIT, in a test that read no
+# knob at all.
+REPLY_NS = 1_000_000_000 * SLOWDOWN
+RECONNECT_NS = 2_000_000_000 * SLOWDOWN
 # How long to wait for a freshly spawned anchor+daemon to answer, and the pause between polls.
-STARTUP_SECS = 20.0
+STARTUP_SECS = 20.0 * SLOWDOWN
 POLL_SECS = 0.02
 # A small bounded RAM volume for the round-trip.
 VOLUME_BYTES = 8 * 1024 * 1024
@@ -196,7 +206,10 @@ class SlatesAsyncRoundTrip(unittest.TestCase):
 # Derived: the longest the loop may go without running a ready callback — a tenth of the reply deadline,
 # the longest pause the reconnect pacing itself allows. A call that blocked the loop on a reply, a ring
 # slot or a reconnect would exceed it.
-TICK_BOUND_SECS = REPLY_NS / 10 / 1e9
+# Deliberately *not* scaled, and derived from the unscaled reply budget rather than REPLY_NS. How
+# responsive an event loop must be is not a function of how slow the lane is: scaling this with
+# SLOWDOWN would take the TSan lane's bound to 2.5 s and mask the very hold it exists to catch.
+TICK_BOUND_SECS = 1_000_000_000 / 10 / 1e9
 # The ticker's own period: a tenth of its bound, so a held loop shows as lateness well past one period.
 TICK_SECS = TICK_BOUND_SECS / 10
 # Shape: the noise sampler's sleep — the ticker's own period, so both measure the same scheduling grain.
