@@ -1056,15 +1056,22 @@ impl Volume {
   /// until the device confirms the window unmap and calls [`Store::dax_release_after_unmap`] (the stale-TLB hold). So
   /// at no point is a block both reachable through the guest's possibly-stale page table and reusable by a neighbour.
   ///
-  /// **The device half this depends on is not built, and that is why nothing calls this yet.** The intended
-  /// hand-off is that the device remaps the guest window old→new — an atomic `MAP_FIXED`/`mremap` over the same
-  /// guest address, so the guest re-faults transparently onto the moved bytes — and **no such daemon-initiated
-  /// remap exists** in `crates/bridge-virtiofs`. A guest can replace its own window by sending SETUPMAPPING at the
-  /// same offset, but the daemon cannot push one, and the only daemon→device channel today is the pending-revoke
-  /// queue, which this deliberately does **not** use: an inode-global revoke would tear every window of the inode
-  /// rather than move the one that is being shifted. So whoever wires L2's trigger owes the backend-initiated
-  /// remap (or a decision to use the revoke-and-refault path instead and accept the tear). Until then this is a
-  /// complete and measured primitive with no production caller — tests and `dax_bench` only. Recorded in
+  /// **The hand-off is revoke-and-re-fault, and the decision this comment used to pose has been taken.** It read,
+  /// until 2026-10-20, that nothing called this and that it "deliberately does not use" the pending-revoke queue,
+  /// because an inode-global revoke would tear every window of the inode rather than the one being shifted. Both
+  /// halves are now false and the second is how the first stopped being true: this enqueues the inode with
+  /// `writable_only` (below), which tears the *writable* windows and leaves a read-only window of the same inode
+  /// standing — the narrowing the old objection was waiting for. A device service pass drains the queue, tears the
+  /// window down under the two-phase revoke, and the guest re-faults onto the row the content moved to. Proven end
+  /// to end through a real device by
+  /// `bridge-virtiofs/tests/device.rs::a_shift_tells_the_device_so_the_guests_window_follows_the_content`, which
+  /// loud-skips where the host backs no sandbox for the shift to land in — read its skip line before reading a
+  /// green run as proof on a given machine.
+  ///
+  /// The production caller is the daemon's periodic shift: `shift_mapped_windows` → [`Volume::dax_shift_slice`] →
+  /// here. What is still owed is only the *optimisation* the intended hand-off described — an atomic
+  /// `MAP_FIXED`/`mremap` over the same guest address, so the guest never faults at all. Without it a shifted
+  /// window costs one fault; with the old comment, a reader would have believed it costs a stale guest. Recorded in
   /// `docs/wip/GAPS.md` under the L2 owed list.
   ///
   /// Refused `Invalid` for a read-only mapping (immutable shared
