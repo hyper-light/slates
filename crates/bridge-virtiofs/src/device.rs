@@ -1492,15 +1492,24 @@ fn teardown_dax_window(
       }
     }
     // Phase two deferred: the front end owns the window, so send SHMEM_UNMAP and keep the block pinned until its
-    // ack drains (the loop then unpins) — never unpin before the front end removes it (§4.6 #1). A send failure
-    // means the channel is gone (the guest cannot reach the block any more), so unpin now rather than leak the pin.
+    // ack drains (the loop then unpins) — never unpin before the front end removes it (§4.6 #1).
+    //
+    // **Only a dead channel justifies unpinning now**, and that is one of the three ways this can fail. It used to
+    // unpin on all of them, which is the same defect the local arm above had: `TooManyOutstanding` means the
+    // back-end-request ring is at its bound — the channel is alive, the front end still has the window, and the
+    // guest can still reach the block — and `BadRange` means the unmap was never even attempted. Returning the
+    // block to the arena on either hands a live guest mapping's memory to the next tenant.
+    //
+    // An `advance` is how this is reached without a hostile guest: `revalidate_windows` tears every stale window
+    // in one pass and each `begin_unmap` takes an outstanding slot, so a volume whose stale windows outnumber the
+    // ring's bound overflows it partway through the pass.
     #[cfg(target_os = "linux")]
     crate::dax::DaxPlacer::Message(message) => {
-      if message
-        .begin_unmap(entry.moffset, entry.len, *entry)
-        .is_err()
-      {
-        let _ = bridge.dax_release_after_unmap(&entry.mapping, cx);
+      if let Err(refusal) = message.begin_unmap(entry.moffset, entry.len, *entry) {
+        // The channel is gone, so the guest cannot reach the block any more: unpin rather than leak the pin.
+        if matches!(refusal, crate::vhost_user::MessagePlaceError::Channel(_)) {
+          let _ = bridge.dax_release_after_unmap(&entry.mapping, cx);
+        }
       }
     }
   }
