@@ -5,6 +5,7 @@
 # 3079 ms after the last against the anchor's 1000 ms budget) with the CLI flow (real FUSE mounts), the
 # live guest (KVM + docker) and the i686 lane (docker). A pod sees every host CPU but is granted only its
 # request, so each pod job caps cargo's jobs and libtest's threads at that request (GitHub's runner: 4 vCPU).
+# kiln's bare-metal machines aren't all Linux (a Mac, a Windows PC), so the bare-metal legs ask for `linux` too.
 #
 # Not translated: the macOS legs (FSKit Swift checks, the macOS SDK leg), windows-lint and windows-nightly,
 # callgrind (no valgrind on the agents), conformance (sudo: apt, user_allow_other, root NFS mounts, sudo
@@ -48,7 +49,7 @@ jobs:
 
   gates-test:
     name: "gates: test (workspace + CLI flow, bare metal)"
-    runs-on: [baremetal]
+    runs-on: [baremetal, linux]
     timeout-minutes: 90
     steps:
       - name: toolchain (rust-toolchain.toml)
@@ -140,7 +141,7 @@ jobs:
   # kills the docker client at the job limit.
   live-guest:
     name: live guest over vhost-user (QEMU, KVM)
-    runs-on: [baremetal]
+    runs-on: [baremetal, linux]
     timeout-minutes: 60
     artifacts: [live-guest.log]
     steps:
@@ -227,7 +228,7 @@ jobs:
   # container runs as the agent's uid (HOME=/tmp), so its target/ stays removable without sudo.
   i686:
     name: i686 (32-bit narrowing, by test)
-    runs-on: [baremetal]
+    runs-on: [baremetal, linux]
     timeout-minutes: 60
     steps:
       - name: Unit tests as 32-bit code

@@ -40,7 +40,7 @@ jobs:
 
   gates-test:
     name: "gates: test (workspace + CLI flow, bare metal)"
-    runs-on: [baremetal]
+    runs-on: [baremetal, linux]
     timeout-minutes: 90
     steps:
       - name: toolchain (rust-toolchain.toml)
@@ -132,7 +132,7 @@ jobs:
   # kills the docker client at the job limit.
   live-guest:
     name: live guest over vhost-user (QEMU, KVM)
-    runs-on: [baremetal]
+    runs-on: [baremetal, linux]
     timeout-minutes: 60
     artifacts: [live-guest.log]
     steps:
@@ -219,7 +219,7 @@ jobs:
   # container runs as the agent's uid (HOME=/tmp), so its target/ stays removable without sudo.
   i686:
     name: i686 (32-bit narrowing, by test)
-    runs-on: [baremetal]
+    runs-on: [baremetal, linux]
     timeout-minutes: 60
     steps:
       - name: Unit tests as 32-bit code
