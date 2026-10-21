@@ -577,7 +577,7 @@ pub mod platform {
   const HANDOFF_FDS: usize = 3;
   /// Format: the client id a refusal handoff names — never assigned (a hello of zero asks for a fresh
   /// id), so a handoff naming it carries no region: its length word is the client bound the connect
-  /// was refused at (`IpcError::TooManyClients`), or [`NO_BOUND`] for a region refused for another
+  /// was refused at (`IpcError::TooManyClients`), or [`super::NO_BOUND`] for a region refused for another
   /// reason.
   const REFUSED_CLIENT: u32 = 0;
 
