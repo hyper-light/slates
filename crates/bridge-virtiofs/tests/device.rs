@@ -2024,77 +2024,6 @@ impl PinLedgerFixture {
   }
 }
 
-/// §4.6 #1 — a message-based teardown whose `begin_unmap` is **refused** must keep the block pinned too, and
-/// only a dead channel says otherwise.
-///
-/// `MessagePlacer::begin_unmap` fails three ways and they do not mean the same thing. `Channel` means the front
-/// end is gone, so the guest cannot reach the block and holding the pin would only leak it. `BadRange` means the
-/// unmap was never attempted, and `TooManyOutstanding` means the back-end-request ring is at its bound — in both
-/// the channel is alive and the front end still holds the window, so the guest can still read those pages.
-/// Unpinning on either hands a live guest mapping's memory to the next tenant, which is the defect the local arm
-/// had. The sibling test above covers the accepted path; this one covers a refusal.
-///
-/// `BadRange` is the one a test can reach deterministically. `TooManyOutstanding` cannot be reached by distinct
-/// in-region windows at all — the bound is `region_bytes / page + 1`, so a region never holds more windows than
-/// its own bound — it needs maps already awaiting acks, which needs `/dev/udmabuf` and so no machine this project
-/// reaches. Recorded rather than skipped silently.
-///
-/// Do: map a window over the device's second page, then hand the device a message placer whose region is one page
-/// — so that window now lies outside what `check_range` will accept — and revoke the inode. Expect: the window is
-/// torn from the device, the block is still pinned, and the arena was never asked to release it.
-#[cfg(target_os = "linux")]
-#[test]
-fn a_message_based_teardown_whose_unmap_is_refused_keeps_the_block_pinned() {
-  use slates_bridge_virtiofs::device::DaxWindowEntry;
-  use slates_bridge_virtiofs::vhost_user::{BackendReqChannel, MessagePlacer};
-
-  let mut f = pin_ledger_fixture("msgrefused");
-  let second = f.page_len;
-  assert_eq!(
-    f.map(2, second),
-    0,
-    "the window maps over the device's second page"
-  );
-  let mapped = f.pinned();
-  assert!(
-    mapped > f.quiet,
-    "non-vacuity: mapping a window pins a block ({} -> {mapped})",
-    f.quiet
-  );
-
-  // A live channel, so a refusal here cannot be `Channel` — and a one-page region, so this window's range is
-  // outside it and `check_range` refuses. `front` stays open for the whole test.
-  let (front, back) = rustix::net::socketpair(
-    rustix::net::AddressFamily::UNIX,
-    rustix::net::SocketType::STREAM,
-    rustix::net::SocketFlags::CLOEXEC,
-    None,
-  )
-  .unwrap();
-  let page = usize::try_from(f.page_len).unwrap_or(4096);
-  let placer: MessagePlacer<DaxWindowEntry> =
-    MessagePlacer::new(BackendReqChannel::adopt(back), page, f.page_len);
-  f.device.install_dax_message_placer(placer);
-
-  let torn = {
-    let mut bridge = VolumeBridge::new(vid(), &mut f.tenant, &mut f.store);
-    f.device.request_revoke_inode(f.no, &mut bridge, &f.cx)
-  };
-
-  assert_eq!(torn, 1, "the revoke tore the window from the device");
-  assert_eq!(
-    f.pinned(),
-    mapped,
-    "a refused unmap keeps the block pinned: the channel is alive and the front end still holds the window, \
-     so the guest can still reach these pages"
-  );
-  assert_eq!(
-    f.store.release_refusals, 0,
-    "the release was never attempted, rather than attempted and refused"
-  );
-  drop(front);
-}
-
 /// §4.6 #1 — a teardown whose SHMEM_UNMAP is refused **for a reason that is not a dead channel** must keep the
 /// block pinned. Only a gone channel means the guest can no longer reach the window; the other two refusals leave
 /// it mapped, so returning the block to the arena hands a live guest mapping's memory to the next tenant.
@@ -2107,6 +2036,11 @@ fn a_message_based_teardown_whose_unmap_is_refused_keeps_the_block_pinned() {
 /// **An `advance` reaches this without a hostile guest.** `revalidate_windows` tears every stale window in one
 /// pass and each `begin_unmap` takes an outstanding slot, so a volume whose stale windows outnumber the ring's
 /// bound overflows it partway through — and every window after that point was being unpinned while still mapped.
+///
+/// `TooManyOutstanding` itself is **not** covered here, and that is a limit rather than an oversight: the bound is
+/// `region_bytes / page + 1`, so a region never holds more distinct windows than its own bound, and reaching it
+/// needs maps already awaiting their acks — which needs `/dev/udmabuf`, which no machine this project can reach
+/// has. `BadRange` exercises the same branch of the same `match`.
 ///
 /// Do: map a window near the end of a four-page region, install a message placer that declares a one-page window
 /// (so the live window's range is outside what `begin_unmap` will accept, refusing `BadRange` deterministically
