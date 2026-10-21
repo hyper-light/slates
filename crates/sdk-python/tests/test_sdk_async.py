@@ -242,17 +242,29 @@ class Noise:
 
 
 class Ticker:
-    """An independent task on the loop: sleeps one period at a time and records how late it woke."""
+    """An independent task on the loop: sleeps one period at a time and records how late it woke, and in
+    which phase of the scenario the worst lateness happened.
+
+    The phase is carried because this test has failed on CI without one and could not be acted on: runs
+    39538566246 and 39539155335 reported 0.298 s and 0.243 s of lateness against a 0.1 s bound, with the
+    separate-process noise sampler seeing 1 ms and 0 ms over the same window — so the loop really was held,
+    and nothing said by what. The scenario kills a daemon under outstanding calls, stops a process group,
+    cancels a call and kills an anchor; those are very different suspects. Whoever sees the next failure
+    should not have to guess which."""
 
     def __init__(self):
         self.worst = 0.0
+        self.phase = "connecting"
+        self.worst_phase = self.phase
         self.task = asyncio.get_running_loop().create_task(self._run())
 
     async def _run(self):
         while True:
             due = time.monotonic() + TICK_SECS
             await asyncio.sleep(TICK_SECS)
-            self.worst = max(self.worst, time.monotonic() - due)
+            late = time.monotonic() - due
+            if late > self.worst:
+                self.worst, self.worst_phase = late, self.phase
 
 
 async def _run_async(*argv):
@@ -313,6 +325,7 @@ class SlatesAsyncEveryCallEnds(unittest.TestCase):
             self.assertEqual(status, 0, "the consensus group bootstraps")
             limit = client.outstanding_limit()
 
+            ticker.phase = "(1) overflow, then a restart under the outstanding calls"
             # (1) Overflow, then a restart under the calls. Stopped first, so the calls stay outstanding.
             first = await _daemon_pids(binary, instance)
             self.assertTrue(first, "the daemon is running")
@@ -338,6 +351,7 @@ class SlatesAsyncEveryCallEnds(unittest.TestCase):
 
             await _wait_for(restarted, "the anchor restarted the daemon")
 
+            ticker.phase = "(2) a live but silent daemon, stopped by signal"
             # (2) A live but silent daemon: the call ends Stalled. The anchor's whole process group (the
             # anchor leads it, `start_new_session`, and every daemon it spawns is in it) is stopped in one
             # signal, so its supervision cannot replace the silent daemon and no child it forked can escape
@@ -349,6 +363,7 @@ class SlatesAsyncEveryCallEnds(unittest.TestCase):
             with self.assertRaisesRegex(slates.SlatesError, "Stalled"):
                 await client.list()
 
+            ticker.phase = "(3) a cancelled call is released"
             # (3) A cancelled call is released: nothing is left waiting on the loop.
             waiting = asyncio.ensure_future(client.list())
             await asyncio.sleep(POLL_SECS)
@@ -359,6 +374,7 @@ class SlatesAsyncEveryCallEnds(unittest.TestCase):
             os.killpg(group, signal.SIGCONT)
             self.assertIsInstance(await client.list(), list, "the client serves after the cancel")
 
+            ticker.phase = "(4) the anchor and its daemon killed for good"
             # (4) Death: a fresh client, then the anchor and its daemon killed for good.
             fresh = await _connect_when_ready(instance)
             os.killpg(os.getpgid(anchor.pid), signal.SIGKILL)
@@ -375,8 +391,9 @@ class SlatesAsyncEveryCallEnds(unittest.TestCase):
             scheduling = noise.stop()
             self.assertLess(
                 ticker.worst, TICK_BOUND_SECS + scheduling,
-                f"the loop was never held: worst lateness {ticker.worst:.3f} s, bound {TICK_BOUND_SECS} s "
-                f"plus the machine's own scheduling noise {scheduling:.3f} s",
+                f"the loop was never held: worst lateness {ticker.worst:.3f} s in phase "
+                f"{ticker.worst_phase!r}, bound {TICK_BOUND_SECS} s plus the machine's own scheduling "
+                f"noise {scheduling:.3f} s",
             )
         finally:
             noise.stop()

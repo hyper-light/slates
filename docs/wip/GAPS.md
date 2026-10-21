@@ -944,11 +944,20 @@ catch. Across the same window in which the loop's ticker was 298 ms late, that s
 Intermittent: the lane passed on seven of the eight most recent runs of `main` and failed on this one.
 Nothing in that commit touches the Python SDK.
 
-**Not yet root-caused, and not guessed at.** The scenario kills a daemon under outstanding calls and waits
-for the anchor to restart it, so a reconnect happens inside the measured window, and `CLAIM_WAIT_NS` is one
-second — but whether the async client's reconnect path is what holds the loop is a hypothesis with no log
-behind it. Reproducing needs the built extension against a real daemon on Linux. Related prior work:
-`reply-park-lost-wake` (an unfenced reply-side park, fixed bc81da4).
+It failed again on the very next run, 39539155335: **0.243 s against 0.1 s plus 0.000 s of noise.** So it is
+two of the last nine and twice consecutively, not a one-off — and **both failures are the ubuntu lane**;
+the macOS lane's result on those runs is not recorded either way, so that is not yet a platform split, only
+an absence.
+
+**Not root-caused, and not guessed at.** The scenario kills a daemon under outstanding calls and waits for
+the anchor to restart it, so a reconnect falls inside the measured window and `CLAIM_WAIT_NS` is one second
+— but whether the async client's reconnect is what holds the loop is a hypothesis with no log behind it.
+Reproducing locally would mean building the extension on macOS, which is not where it fails.
+
+**So the next failure is made to say it.** The ticker now carries the scenario's phase and reports which one
+it was held in — the four are very different suspects (a daemon killed under outstanding calls, a process
+group stopped by signal, a cancelled call, an anchor killed for good) and the failure said nothing about
+which. Related prior work: `reply-park-lost-wake` (an unfenced reply-side park, fixed bc81da4).
 
 ### 8a-tsan-wait. The TSan lane declared itself 25× slow and one budget never listened (2026-10-20, closed)
 
