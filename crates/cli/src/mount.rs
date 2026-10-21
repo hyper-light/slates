@@ -7,7 +7,7 @@
 //! The shape is adapted from sylk's cgofuse mount (`core/purevfs`): a **pure, injectable capability
 //! detection** (`classify`) so the selection tests on any host with no live mount, a **probe** that
 //! refuses with a message naming what is missing rather than a raw `mount_nfs` failure, and the
-//! **mount/unmount lifecycle** ([`establish`]/[`unmount`]). Where sylk classifies a FUSE backend
+//! **mount/unmount lifecycle** (`establish`, which is not Linux's, and [`unmount`], which is). Where sylk classifies a FUSE backend
 //! (macFUSE vs FUSE-T), slates classifies its one mechanism — `mount_nfs`, built into macOS and the
 //! BSDs — because its NFS server replaces the FUSE library.
 
@@ -288,7 +288,7 @@ fn mount_volume(
   Ok(())
 }
 
-/// Unmounts the loopback bridge at `path` with `umount`, the lifecycle counterpart of [`establish`]
+/// Unmounts the loopback bridge at `path` with `umount`, the lifecycle counterpart of `establish`
 /// (sylk's cgofuse `Close`). No privilege: a user unmounts a mount they made.
 pub(crate) fn unmount(path: &str) -> Result<(), Failure> {
   let status = Command::new(UNMOUNT_PROGRAM)

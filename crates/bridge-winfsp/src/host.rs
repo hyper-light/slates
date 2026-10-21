@@ -12,7 +12,7 @@
 //! channels. WinFsp's COARSE operation guard serializes the callbacks on top of this, so the handler
 //! pointer stored in the file system's `UserContext` is never touched concurrently.
 //!
-//! **Verification.** Every struct and export is hand-transcribed from winfsp's headers ([`crate::ffi`])
+//! **Verification.** Every struct and export is hand-transcribed from winfsp's headers (`crate::ffi`)
 //! and cross-lints on the Windows target from any host; the live mount — provision a volume, mount a
 //! drive letter, create/write/read/list/delete through the Windows kernel, unmount — runs on the native
 //! Windows CI runner (`WINFSP_TEST_MOUNT=1`), the way the FSKit handler's live mount runs on macOS.

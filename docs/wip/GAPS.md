@@ -923,9 +923,18 @@ finish starting — the thing it was waiting for. The third loop, `discard_reply
 against `provision_bench` ("a client thread spinning for its reply competes with the shards for a core"),
 in a second place.
 
-**Owed:** the lane's other failure that run,
-`a_placed_mapping_costs_a_page_of_slack_and_returns_every_byte_of_it`, is a different cause and is fixed
-under `8a-rustdoc`'s commit — see the measurement note there.
+The lane's other failure that run, `a_placed_mapping_costs_a_page_of_slack_and_returns_every_byte_of_it`, had
+a different cause and took two goes. Measuring the objects rather than the process was right, but charging
+*every* abutting `PROT_NONE` row to them was not: the i686 lane then read 6 422 528 bytes where 4 456 448 was
+allowed, and because the failure printed the rows it had charged, the arithmetic was visible — 64 windows of
+16 pages summing to **exactly** the 4 194 304 asked, 63 slack rows of **exactly one page**, and two foreign
+rows of 258 and 223 pages that the walk had reached. The kernel had merged one object's slack page with an
+adjoining anonymous `PROT_NONE` region belonging to something else. The placement was never wrong; the
+attribution was. It now reads only the row immediately after each window — where this placement always puts
+its slack, since for a page grain the congruent address is the reservation's base exactly — and judges the
+population by its **median**, which a handful of merges cannot move and a grain changed from the page to the
+huge page would move all sixty-four of. **A sum cannot tell a merge from a regression; an order statistic
+can.**
 
 ### 8a-rustdoc. Nothing ever ran rustdoc; 95 references named things that do not exist (2026-10-20, closed)
 
@@ -954,9 +963,20 @@ a name the code had moved past, and nothing could tell.
 lives in private module docs, and the private-link lint is allowed for the same reason — those links resolve in
 the output this builds. `broken_intra_doc_links`, the one that catches a stale reference, stays denied.
 
-**Owed:** the gate runs on ubuntu and macos, so Windows-only documentation (`bridge-winfsp`, the Windows arms
-of the paired `#[cfg]` modules) is still checked by nothing. Five of the ten cfg-gated references above were
-found only because macOS cannot see Linux items; the reverse set has never been looked at.
+**The gate found three more on its first run**, all of them items a *Linux* build cannot see where macOS can,
+which is the half this machine could never check: `establish` in `crates/cli/src/mount.rs` (twice —
+`#[cfg(not(target_os = "linux"))]` with no Linux arm), `armed_with_reply_waiting` in
+`crates/ipc/src/completion.rs` (twice — `cfg(any(macos, windows))`), and `crate::ffi` in
+`crates/bridge-winfsp/src/host.rs` (`cfg(windows)`). Rather than take one CI round trip per finding, the class
+was enumerated statically: every item whose *every* definition sits behind a cfg excluding Linux, cross-checked
+against every doc link naming it. That found exactly these three and nothing else. The first pass of that
+sweep reported eleven, eight of them false — the pattern `target_os = "macos"` also matches inside
+`not(target_os = "macos")`, which is visible on Linux. **The project's paired-`#[cfg]` discipline is why the
+real set is so small:** a name with one arm per platform resolves everywhere, and only an unpaired item can
+vanish.
+
+**Owed:** the gate runs on ubuntu and macos, so Windows-only documentation (`bridge-winfsp`'s own items, the
+Windows arms that are unpaired) is still checked by nothing.
 
 **Owed:** five references were deleted rather than repointed, because nothing of that name exists and the
 right pointer needs someone who owns §4.8's SWIM wiring: `accept_probes`, `probe_peer`, `serve_peer_probes`,

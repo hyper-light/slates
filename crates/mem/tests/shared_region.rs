@@ -304,87 +304,48 @@ struct MapRow {
   line: String,
 }
 
-/// The address space this process holds for the memory objects named with `prefix`: every mapping of one, plus
-/// the anonymous `PROT_NONE` slack abutting it that the placement reserved around it. Returns the total and the
-/// rows it counted, so a failure says exactly what it saw instead of only a number.
+/// This process's `/proc/self/maps`, in address order, with each row marked for whether it maps a memory
+/// object whose name carries `prefix` and whether it is an anonymous `PROT_NONE` reservation.
 ///
-/// This is read per object rather than process-wide, and that is the whole point of it. The first version of
-/// this test took the difference of `/proc/self/statm` across the allocation, which is every byte the *process*
-/// gained — so it measured the seven sibling tests allocating 8 and 16 MiB objects beside it (153 MB where the
-/// same run alone read 4.5 MB), and it was answered with a child process of its own. That was treating the
-/// symptom. Under ThreadSanitizer the child is not quiet either: the instrumentation's own bookkeeping grows
-/// with the memory the test touches, and the lane failed on 2026-10-20 reading three pages of slack per object
-/// where the placement reserves one (run 39527867650). A figure that is attributable to the objects needs no
-/// quiet process and cannot be moved by anything that is not one of them.
+/// Read per object rather than process-wide, and that is the whole point of it. The first version of this test
+/// took the difference of `/proc/self/statm` across the allocation, which is every byte the *process* gained —
+/// so it measured the seven sibling tests allocating 8 and 16 MiB objects beside it (153 MB where the same run
+/// alone read 4.5 MB), and it was answered with a child process of its own, which treated the symptom. Under
+/// ThreadSanitizer the child is not quiet either: the instrumentation allocates in proportion to the memory the
+/// test touches, and the lane read three pages of slack per object where the placement reserves one (run
+/// 39527867650). A figure attributable to the objects needs no quiet process and cannot be moved by anything
+/// that is not one of them.
 #[cfg(target_os = "linux")]
 #[allow(clippy::disallowed_methods)] // reading this process's own address space through /proc, read-only
-fn address_space_held(prefix: &str) -> (usize, Vec<String>) {
+fn map_rows(prefix: &str) -> Vec<MapRow> {
   let Ok(maps) = std::fs::read_to_string("/proc/self/maps") else {
-    return (0, Vec::new());
+    return Vec::new();
   };
-  let rows: Vec<MapRow> = maps
+  maps
     .lines()
     .filter_map(|line| parse_map_row(line, prefix))
-    .collect();
-  // Every row to charge, by index, so slack lying between two of our own windows is counted once.
-  let mut charged: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
-  for at in rows
-    .iter()
-    .enumerate()
-    .filter(|(_, row)| row.ours)
-    .map(|(at, _)| at)
-  {
-    charged.insert(at);
-    charge_abutting_slack(&rows, at, &mut charged);
-  }
-  let mut held = 0usize;
-  let mut counted = Vec::new();
-  for row in charged.iter().filter_map(|at| rows.get(*at)) {
-    held = held.saturating_add(row.end.saturating_sub(row.start));
-    counted.push(row.line.clone());
-  }
-  (held, counted)
+    .collect()
 }
 
-/// Charges the run of anonymous `PROT_NONE` reservations abutting the window at `rows[at]`, on both sides of
-/// it. A placement whose congruent address falls inside its reservation leaves slack before *and* after the
-/// window, so both directions are walked, and each stops at the first row that is not an abutting reservation.
+/// The bytes mapped by the objects named with `prefix`, and the size of the row immediately following each of
+/// their windows — which is where this placement puts its slack, every time. `0` for a window the next row does
+/// not abut, or that is followed by something other than a reservation; that is a failure, and the caller says so.
 #[cfg(target_os = "linux")]
-fn charge_abutting_slack(
-  rows: &[MapRow],
-  at: usize,
-  charged: &mut std::collections::BTreeSet<usize>,
-) {
-  for before in (0..at).rev() {
-    if !abuts_before(rows, before) {
-      break;
+fn windows_and_their_slack(rows: &[MapRow]) -> (usize, Vec<usize>) {
+  let mut mapped = 0usize;
+  let mut slack = Vec::new();
+  for (at, row) in rows.iter().enumerate() {
+    if !row.ours {
+      continue;
     }
-    charged.insert(before);
+    mapped = mapped.saturating_add(row.end.saturating_sub(row.start));
+    let after = match rows.get(at.saturating_add(1)) {
+      Some(next) if next.reserved && next.start == row.end => next.end.saturating_sub(next.start),
+      _ => 0,
+    };
+    slack.push(after);
   }
-  for after in at.saturating_add(1)..rows.len() {
-    if !abuts_after(rows, after) {
-      break;
-    }
-    charged.insert(after);
-  }
-}
-
-/// Whether `rows[before]` is a reservation that ends exactly where the row after it begins.
-#[cfg(target_os = "linux")]
-fn abuts_before(rows: &[MapRow], before: usize) -> bool {
-  match (rows.get(before), rows.get(before.saturating_add(1))) {
-    (Some(row), Some(next)) => row.reserved && row.end == next.start,
-    _ => false,
-  }
-}
-
-/// Whether `rows[after]` is a reservation that begins exactly where the row before it ends.
-#[cfg(target_os = "linux")]
-fn abuts_after(rows: &[MapRow], after: usize) -> bool {
-  match (rows.get(after.saturating_sub(1)), rows.get(after)) {
-    (Some(previous), Some(row)) => row.reserved && previous.end == row.start,
-    _ => false,
-  }
+  (mapped, slack)
 }
 
 /// Parses one `/proc/self/maps` row (`start-end perms offset dev inode path`). `None` for a row that does not
@@ -417,19 +378,42 @@ fn parse_map_row(line: &str, prefix: &str) -> Option<MapRow> {
 /// too small to hold a huge page, not one huge page — i686 is a tested target with about 3 GB of address
 /// space to spend, and a huge page per session would spend it.
 ///
-/// Do: map sixty-four ring-sized objects, read the address space charged to those objects out of
-/// `/proc/self/maps`, drop them, and read it again. Expect: every byte of every window, no more than one page
-/// of slack each, and nothing at all left afterwards.
+/// Do: map sixty-four ring-sized objects, read what `/proc/self/maps` charges them, drop them, read it again.
+/// Expect: every byte of every window mapped and not one more, one page of slack behind each, and nothing left.
+///
+/// **Why the slack is judged by its median and not its sum.** For an object this small the grain is the page,
+/// the reservation's base is page-aligned and the window's offset in the object is zero, so the congruent
+/// address is the reservation's base exactly: the slack is always the one page *after* the window, never split
+/// around it. The kernel is free to merge that page with an adjoining anonymous `PROT_NONE` region belonging to
+/// something else, and on i686 it does — the first run of this test on that target (run 39536306686) found 63
+/// windows followed by exactly one page and one followed by a 258-page row, because the slack had merged with a
+/// neighbour. A sum cannot tell that from a regression; the median is not moved by a handful of merges, and a
+/// grain changed from the page to the huge page would move every one of the sixty-four.
 #[cfg(target_os = "linux")]
 #[test]
 #[cfg_attr(miri, ignore)] // a shared memory object is not modelled by Miri, as at `region.rs`
 fn a_placed_mapping_costs_a_page_of_slack_and_returns_every_byte_of_it() {
   // Derived: a client's ring is far smaller than a huge page, which is the case the bound is about; sixty-four
-  // of them so a per-object page of slack is well clear of a single row's rounding.
+  // of them so the median below rests on a real population rather than one or two rows.
   const OBJECTS: usize = 64;
   let each = PAGE.saturating_mul(16);
+  // The design's rule is "one page of slack *for an object too small to hold a huge page*", so the premise has
+  // to hold before the conclusion can be asserted. It does on every host seen so far (4 KiB pages, 2 MiB huge
+  // pages, sixteen pages per object), but a host whose huge page is no larger than the object is one where the
+  // placement is right to use the huge grain, and this test would be asserting the implementation's rule
+  // against itself rather than the design's.
+  let huge = slates_machine::facts::huge_page_bytes()
+    .and_then(|bytes| usize::try_from(bytes).ok())
+    .unwrap_or(0);
+  if huge != 0 && huge <= each {
+    println!(
+      "SKIP a_placed_mapping_costs_a_page_of_slack_and_returns_every_byte_of_it: this host's huge page is \
+       {huge} bytes and the object is {each}, so the object can hold one and the page grain is not the rule"
+    );
+    return;
+  }
   let tag = format!("slack{}", std::process::id());
-  let (before, _) = address_space_held(&tag);
+  let (before, _) = windows_and_their_slack(&map_rows(&tag));
   assert_eq!(
     before, 0,
     "nothing holds this tag's address space before the objects exist"
@@ -452,34 +436,47 @@ fn a_placed_mapping_costs_a_page_of_slack_and_returns_every_byte_of_it() {
     ));
   }
 
-  let (mapped, counted) = address_space_held(&tag);
+  let rows = map_rows(&tag);
+  let (mapped, mut slack) = windows_and_their_slack(&rows);
   let asked = each.saturating_mul(OBJECTS);
-  let allowed = asked.saturating_add(PAGE.saturating_mul(OBJECTS));
-  let huge = slates_machine::facts::huge_page_bytes()
-    .and_then(|bytes| usize::try_from(bytes).ok())
-    .unwrap_or(0);
-  assert!(
-    mapped >= asked,
-    "every byte of every window is mapped: {mapped} bytes charged to {OBJECTS} objects of {each}, which is \
-     under the {asked} they asked for (non-vacuity — a reading that saw nothing would pass the bound below \
-     for the wrong reason)"
+  assert_eq!(
+    slack.len(),
+    OBJECTS,
+    "every object is mapped once: {} windows for {OBJECTS} objects",
+    slack.len()
+  );
+  assert_eq!(
+    mapped, asked,
+    "every byte of every window is mapped and not one more: {mapped} bytes charged to {OBJECTS} objects of \
+     {each}, which asked for {asked}"
   );
   assert!(
-    mapped <= allowed,
-    "a small object reserves a page of slack, not a huge page: {mapped} bytes of address space for {asked} \
-     asked over {OBJECTS} objects, which allows {allowed}; a huge-page grain would have cost about {}. The \
-     rows charged were:\n{}",
-    asked.saturating_add(huge.saturating_mul(OBJECTS)),
-    counted.join("\n")
+    slack.iter().all(|bytes| *bytes > 0),
+    "each window is followed by its reservation's slack: {} of {OBJECTS} are not",
+    slack.iter().filter(|bytes| **bytes == 0).count()
+  );
+
+  slack.sort_unstable();
+  let middle = slack.get(OBJECTS / 2).copied().unwrap_or(0);
+  assert_eq!(
+    middle,
+    PAGE,
+    "a small object reserves a page of slack, not a huge page: the median window is followed by {middle} \
+     bytes, where a huge-page grain would have reserved about {huge}. The slack behind the sixty-four \
+     windows, sorted, was {slack:?}, out of these rows:\n{}",
+    rows
+      .iter()
+      .filter(|row| row.ours || row.reserved)
+      .map(|row| row.line.clone())
+      .collect::<Vec<_>>()
+      .join("\n")
   );
 
   drop(held);
-  let (kept, left) = address_space_held(&tag);
+  let (kept, _) = windows_and_their_slack(&map_rows(&tag));
   assert_eq!(
-    kept,
-    0,
-    "dropping the objects gives their address space back whole; {kept} bytes are still held:\n{}",
-    left.join("\n")
+    kept, 0,
+    "dropping the objects gives their address space back whole; {kept} bytes are still mapped"
   );
 }
 

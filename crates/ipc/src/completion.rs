@@ -166,7 +166,7 @@ impl CompletionBridge {
 
 /// The macOS bridge thread: park on the wake word; after every return, whether woken or timed out, make
 /// the completion pipe readable while the client is armed and a reply waits in its ring
-/// ([`armed_with_reply_waiting`], a level). A fast-path reply, taken during the spin, finds the client
+/// (`armed_with_reply_waiting`, a level). A fast-path reply, taken during the spin, finds the client
 /// unarmed, so the async fast path never wakes the event loop.
 #[cfg(target_os = "macos")]
 fn run(region: ClientRegion, write: OwnedFd, stop: &'static AtomicBool) {
@@ -450,7 +450,7 @@ impl CompletionBridge {
 
 /// The Windows bridge thread: park on the region's named Event; after every return, whether signalled or
 /// timed out, make the completion socket readable while the client is armed and a reply waits in its ring
-/// ([`armed_with_reply_waiting`], a level). A fast-path reply, taken during the spin, finds the client
+/// (`armed_with_reply_waiting`, a level). A fast-path reply, taken during the spin, finds the client
 /// unarmed, so the async fast path never wakes the event loop.
 #[cfg(windows)]
 fn run(region: ClientRegion, mut write: TcpStream, stop: &'static AtomicBool) {
