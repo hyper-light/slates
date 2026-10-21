@@ -664,9 +664,20 @@ impl Volume {
   /// sealed while mapped — [`Volume::seal_pending`] defers the seal); every byte of the block past the chunk's valid
   /// length is scrubbed to zero, so the guest's whole-page view never reaches a prior allocation's bytes or a sealed
   /// neighbour. An **inline** file (bytes in the inode, no content block) is materialized at offset 0 into a throwaway
-  /// block the mapping owns, as [`Volume::dax_map_dir`] does. A **sealed** chunk (ciphertext at rest, A-92/A-99), a
-  /// hole, a directory, an attribute inode, or a full registry is refused — the caller falls back to FUSE_READ for
-  /// that range. A single-block file maps at offset 0 (the whole block); a multi-block file maps only its open tail.
+  /// block the mapping owns, as [`Volume::dax_map_dir`] does.
+  ///
+  /// **A sealed chunk is reopened, not refused, and that is a change to data at rest.** This doc said the opposite
+  /// until 2026-10-21 — "a sealed chunk … is refused — the caller falls back to FUSE_READ" — which would have told
+  /// a reader that no DAX read can ever turn ciphertext into plaintext on this host. It can, and here is where: the
+  /// sealed arm below calls [`crate::content::Content::reopen_in_place`], transitioning the chunk sealed→open in its
+  /// **own canonical block**, because refusing instead would SIGBUS a `dax=always` guest mmap. That is a real
+  /// canonical state change — it allocates, decrypts, can fail `NoSpace`, dirties the recovery image and adds
+  /// re-seal churn — and `Volume::seal_pending`'s pin-defers-seal rule is what keeps the sweep from encrypting it
+  /// back under the live window. Proven by
+  /// `the_open_tail_maps_directly_and_the_sealed_head_is_reopened_in_place`.
+  ///
+  /// A hole, a directory, an attribute inode, or a full registry **is** refused — the caller falls back to
+  /// FUSE_READ for that range. A single-block file maps at offset 0 (the whole block); a multi-block file maps only its open tail.
   pub fn dax_map_read_at(
     &mut self,
     store: &mut Store,

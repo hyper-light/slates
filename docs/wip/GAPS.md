@@ -7538,6 +7538,20 @@ its own page table and never calls the daemon), so the defense had to be at the 
      `store.content.arena().is_pinned(c.block)`. Proven by
      `the_idle_sweep_defers_sealing_a_mapped_block_until_it_is_unmapped` and
      `a_reopened_dax_chunk_is_resealed_once_its_window_is_revoked` (both pass).
+   - *The device's sealed-refuse* — **there is no sealed-refuse, because the design does not refuse a sealed
+     chunk; it reopens it.** `Volume::dax_map_read_at`'s sealed arm calls `Content::reopen_in_place`, with the
+     reason in the code: "a guest MMU would read ciphertext, and a refused SETUPMAPPING SIGBUSes a
+     `dax=always` mmap. Reopen it in place." So what this line asked for would be the wrong behaviour.
+     **Which means "Gated follow-on (b)" below — `reopen`-on-map, recorded as "built only if a
+     read-only-large-file zero-copy workload asks for it" — is already built**, and
+     `the_open_tail_maps_directly_and_the_sealed_head_is_reopened_in_place` proves it (passes).
+
+     That matters beyond bookkeeping: **a DAX read of a sealed chunk changes data at rest.** The chunk is
+     decrypted into its own canonical block — it allocates, can fail `NoSpace`, dirties the recovery image and
+     adds re-seal churn — and `pin-defers-seal` is the only thing keeping the sweep from encrypting it back
+     under the live window. `dax_map_read_at`'s own doc claimed the opposite ("a sealed chunk … is refused"),
+     so a reader reasoning about A-92 from that doc would have concluded a DAX read can never turn ciphertext
+     into plaintext on the host. Corrected at the function in the same change.
    - *force-seal-revoke-on-growth* — **no separate mechanism exists and none is needed**, which is why
      searching for one finds nothing. A file grows by a write, and `Volume::write_with` revokes the inode's
      DAX mappings *before* the write (`volume.rs:2479`, "a second write boundary onto content a guest holds
