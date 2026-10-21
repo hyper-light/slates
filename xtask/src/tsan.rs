@@ -45,11 +45,23 @@ const SERVER_TARGETS: [&str; 4] = [
 
 /// Shape: the tests the lane leaves out, each with why. A skipped test still runs in every other lane;
 /// only its assertion is one the instrumentation itself falsifies.
-const SKIPPED: [(&str, &str); 4] = [
+const SKIPPED: [(&str, &str); 5] = [
   (
     "region::tests::locking_a_small_region_is_reported_by_the_os_within_one_page",
     "ThreadSanitizer ignores mlock (its runtime prints `ThreadSanitizer ignores mlock/mlockall/munlock/\
      munlockall` at verbosity 1), so the locked delta is 0; it passes uninstrumented in the same container",
+  ),
+  (
+    "the_arena_locks_the_blocks_asked_never_the_region_or_their_neighbours",
+    "the same mlock interception as the entry above, which this lane only started to see when \
+     `--cfg=rustix_use_libc` was added: before that rustix's `linux_raw` backend issued `mlock` by inline \
+     assembly and walked straight past the interceptor, so the arena really locked and the kernel's count \
+     really moved. Through libc it does not — run 39540020206 read VmLck move by 0 where the test wants \
+     16384 — while `ChunkArena::locked_bytes`, which is slates' own accounting of a call that returned Ok, \
+     still says 16384. Only the assertions against the *kernel's* count are falsified, which is why this \
+     test is skipped and the rest of the file is not. `lock_on_fault`'s two tests read the same counter and \
+     are not listed: they lock 256 MiB, which this runner's memlock capacity refuses, so they take their own \
+     loud skip first. On a host that allowed that lock they would need this entry too",
   ),
   (
     "driver::tests::a_zero_timeout_wait_delivers_what_is_ready_and_never_sleeps",

@@ -926,8 +926,20 @@ Added to the lane's `RUSTFLAGS`. The cost is that the lane exercises rustix's li
 raw one — a deviation from the shipped build, but a smaller one than `-Zbuild-std` already is, against a
 lane whose reports could not be trusted and in which a real race would have been lost among the false ones.
 
-**Owed:** the next TSan run is the proof. If races at reused addresses persist, the cause is something else
-and this cfg should come back out rather than stay as decoration.
+**Proven on run 39540020206: six races became zero.** The cause was the invisible unmaps, and the three that
+survived the previous run were all the same shape (`copy_in` against `copy_out` in `slates_mem::shared`, at
+page-aligned addresses — region headers written once at create and read once at open), so none of them was
+a real race hiding among the false ones.
+
+**It cost one test, which is the trade in the open.** Through libc, ThreadSanitizer now intercepts slates'
+`mlock` as well — and its runtime ignores `mlock` by design, printing so at verbosity 1. So
+`the_arena_locks_the_blocks_asked_never_the_region_or_their_neighbours` read the kernel's `VmLck` move by 0
+where it wants 16 384, while `ChunkArena::locked_bytes` — slates' own accounting of a call that returned
+`Ok` — still said 16 384. Only assertions against the *kernel's* count are falsified, which is why that one
+test joins the lane's `SKIPPED` list (beside the entry already there for the identical reason) and the rest
+of the file does not. `lock_on_fault`'s two tests read the same counter and are not listed: they lock
+256 MiB, which this runner's memlock capacity refuses, so they take their own loud skip first — on a host
+that allowed the lock they would need the entry too.
 
 ### 8a-sdk-loop. The async Python SDK held the event loop for 0.3 s, once in eight runs (2026-10-20, OPEN)
 
