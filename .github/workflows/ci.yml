@@ -374,6 +374,25 @@ jobs:
         env:
           WINFSP_LIB: C:\Program Files (x86)\WinFsp\lib
         run: cargo clippy -p slates-cli -- -D warnings
+      # The other half of the documentation gate in `gates`. That one runs on ubuntu and macos, so it checks
+      # every reference those two hosts can resolve — and a reference resolves or not *per platform*, because
+      # an item behind `#[cfg(windows)]` exists for no other. Of the errors that gate found, five were visible
+      # only to macOS and two only to Linux; nothing had ever looked from Windows.
+      #
+      # Enumerating the Windows-invisible set statically was tried on 2026-10-20 and abandoned: three
+      # iterations of the sweep reported 79, then 31, then 30 candidates, and the macOS control — where the
+      # real build passes — still showed seven, every one of them false, because a sweep cannot tell whether
+      # the *linking site* is itself compiled on that platform. `MAX_SHARDS_32` is the example: it and its
+      # only reference are both `#[cfg(not(target_pointer_width = "64"))]`, so they appear and vanish
+      # together and are never an error. rustdoc knows that and a grep does not.
+      #
+      # Scoped to this lane's own crate list, as its clippy steps are; `--no-deps` makes it one rustdoc pass
+      # over a cache those steps have already warmed.
+      - name: Documentation (every reference names something Windows can see)
+        env:
+          WINFSP_LIB: C:\Program Files (x86)\WinFsp\lib
+          RUSTDOCFLAGS: -D warnings -A rustdoc::private_intra_doc_links
+        run: cargo doc -p slates-mem -p slates-ipc -p slates-rt -p slates-base -p slates-client -p slates-server -p slates-vfs -p slates-machine -p slates-bridge-winfsp -p slates-anchor -p slates-cli --no-deps --document-private-items
       # Run the tests whose Win32 cfg branches only a native Windows runner can exercise: the shared
       # memory (`CreateFileMappingW`); the cross-process wake (the named auto-reset Event — §4.7's
       # `WaitOnAddress`-is-process-local case, so the park/late-reply wake in `rings` goes through the

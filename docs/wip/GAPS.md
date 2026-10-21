@@ -1045,8 +1045,18 @@ sweep reported eleven, eight of them false — the pattern `target_os = "macos"`
 real set is so small:** a name with one arm per platform resolves everywhere, and only an unpaired item can
 vanish.
 
-**Owed:** the gate runs on ubuntu and macos, so Windows-only documentation (`bridge-winfsp`'s own items, the
-Windows arms that are unpaired) is still checked by nothing.
+**Closed 2026-10-20: the Windows half is gated too**, in `windows-lint`, over that lane's own crate list.
+A reference resolves or not *per platform* — an item behind `#[cfg(windows)]` exists for no other — and of
+the errors the ubuntu/macos gate found, five were visible only to macOS and two only to Linux. Nothing had
+ever looked from Windows.
+
+Enumerating the Windows-invisible set statically was tried first and abandoned, which is worth recording
+because it looked like the cheap option. Three iterations of the sweep reported 79, then 31, then 30
+candidates; the macOS control — a platform where the real build is known to pass — still showed seven, and
+every one was false. **A sweep cannot tell whether the *linking site* is itself compiled on that platform.**
+`MAX_SHARDS_32` is the example: it and its only reference are both `#[cfg(not(target_pointer_width = "64"))]`,
+so they appear and vanish together and can never be an error. rustdoc knows that; a grep does not. The lane
+is the oracle.
 
 **Owed:** five references were deleted rather than repointed, because nothing of that name exists and the
 right pointer needs someone who owns §4.8's SWIM wiring: `accept_probes`, `probe_peer`, `serve_peer_probes`,
