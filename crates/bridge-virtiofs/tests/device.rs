@@ -2723,6 +2723,96 @@ proptest! {
   /// of the whole cache region is either zero or one of the fills this volume wrote. A byte that is neither came
   /// from somewhere the guest has no business reaching — another volume's block, arena metadata, or memory never
   /// initialised — which is exactly the class of leak a shared window makes possible and a per-access check
+  /// §4.6 #1 (chaos over the two refusal arms) — under a random interleaving of clean and refused teardowns,
+  /// a teardown whose unmap is refused must **never** return the block to the arena, and once one has been
+  /// refused the block must stay pinned for the rest of the run however many clean teardowns follow.
+  ///
+  /// The two arms each had one deterministic test
+  /// (`a_revoke_whose_unmap_is_refused_keeps_the_block_pinned`,
+  /// `a_teardown_refused_short_of_a_dead_channel_keeps_the_block_pinned`). Those prove the branch; they do not
+  /// prove it survives being interleaved with the clean path over a shared pin whose holder count moves up and
+  /// down underneath. A release that fired one step late — correct at the branch, wrong in sequence — passes
+  /// both and fails here.
+  ///
+  /// Each step maps a window over the region's **last** page and then tears it down one of two ways: cleanly,
+  /// or with the cache region shrunk to a single page first, so `DaxCacheRegion::unmap` refuses `BadRange`
+  /// (the deterministic stand-in for the `ENOMEM` at `vm.max_map_count` that reaches this in production, which
+  /// a test cannot summon without a machine-wide act). The region is restored afterwards so the next map
+  /// succeeds. Non-vacuous by construction: every case maps and tears down at least once, and
+  /// `release_refusals` must stay 0 throughout — a release that was *attempted* and refused by the arena is a
+  /// different bug and would read as this one.
+  #[cfg(unix)]
+  #[test]
+  fn a_random_interleaving_of_refused_and_clean_teardowns_never_unpins_a_mapped_block(
+    schedule in prop::collection::vec(any::<bool>(), 1..16)
+  ) {
+    let page = rustix::param::page_size().max(1);
+    let whole = (page * 4) as u64;
+    let last = (page * 3) as u64;
+    let mut store = dax_shared_store(page, "refusechaos");
+    let (mut tenant, no) = tenant_with_file(&mut store, (1, "r", 0xC7), page);
+    let (mut device, mut driver) = device_and_driver();
+    let cache = tenant_cache("refusechaos", page);
+    device.install_dax_window(Some(
+      slates_bridge_virtiofs::dax::DaxCacheRegion::new(cache.as_fd(), whole).unwrap(),
+    ));
+    let cx = context_for(vid());
+    tenant_connect((&mut device, &mut driver), (vid(), &mut tenant, &mut store), &cx);
+    let quiet = store.content.arena().pinned_blocks();
+
+    let mut refused = 0usize;
+    for (step, refuse) in schedule.into_iter().enumerate() {
+      let unique = (step as u64).saturating_add(2);
+      let mapped = tenant_dax_map(
+        (&mut device, &mut driver),
+        (vid(), &mut tenant, &mut store),
+        &cx,
+        (unique, no),
+        (last, page as u64),
+      );
+      prop_assert_eq!(mapped, 0, "the window maps at step {}", step);
+      prop_assert!(
+        store.content.arena().pinned_blocks() > quiet,
+        "non-vacuity: a mapped window pins its block at step {}", step
+      );
+
+      if refuse {
+        // Shrink the region under the live window so the unmap refuses, then put it back.
+        device.install_dax_window(Some(
+          slates_bridge_virtiofs::dax::DaxCacheRegion::new(cache.as_fd(), page as u64).unwrap(),
+        ));
+      }
+      {
+        let mut bridge = VolumeBridge::new(vid(), &mut tenant, &mut store);
+        device.request_revoke_inode(no, &mut bridge, &cx);
+      }
+      if refuse {
+        refused = refused.saturating_add(1);
+        device.install_dax_window(Some(
+          slates_bridge_virtiofs::dax::DaxCacheRegion::new(cache.as_fd(), whole).unwrap(),
+        ));
+      }
+
+      prop_assert_eq!(
+        store.release_refusals, 0,
+        "the arena was never asked to release a block it refused, at step {}", step
+      );
+      if refused > 0 {
+        prop_assert!(
+          store.content.arena().pinned_blocks() > quiet,
+          "a block held by a refused teardown is never returned, however many clean teardowns follow \
+           (step {}, {} refusals so far)", step, refused
+        );
+      }
+    }
+    if refused == 0 {
+      prop_assert_eq!(
+        store.content.arena().pinned_blocks(), quiet,
+        "with no refusal in the schedule, every clean teardown gave its block back"
+      );
+    }
+  }
+
   /// cannot catch, since the guest reads these pages through its own page table.
   ///
   /// **What this schedule does NOT catch, measured rather than assumed:** a revoke that forgets to unmap.
