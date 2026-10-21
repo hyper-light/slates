@@ -241,6 +241,50 @@ box shared with two other builds — timings are not benchmarks)
 6. **The notification queue** (`VIRTIO_FS_F_NOTIFICATION`) and **indirect descriptors**, if a VMM
    negotiates them; refused typed today.
 
+7. **The descriptor handoff from an out-of-process launcher — the missing link, and the prerequisite for DAX in
+   production (designed 2026-10-21, not built).** The serving half exists and is tested: `attach_vhost_user_device`
+   (and `_dax`) serve an inherited vhost-user descriptor, and `bridge-fuse::shards_fs::serve` speaks shards'
+   framing. But both are reachable only by code linked into the daemon's own process (tests, the crosvm A/B
+   example). Over the daemon's interface a `Guest` attach is refused `SeamNotOnWire`, because the client's channel
+   is a shared-memory ring and a ring cannot carry a descriptor. So **production cannot give a VM a slates volume
+   at all**, and since DAX is offered per guest device, production DAX cannot be "turned on" until this exists.
+   It is also exactly what kiln's microVM sessions need (`docs/wip/shards/README.md`, owed item 0).
+
+   **The design (§4.6 A-9 already chooses it: "an in-process interface or an inherited descriptor … the harness
+   owns VM creation; Slates owns the exported attachment").** The launcher makes a socketpair, starts the VM on one
+   end (QEMU `-chardev socket,fd=N`, crosvm, or shards `--slates-fs-fd N`), and hands the other end to the daemon
+   with an attach request naming the volume, an optional scope and snapshot, the rights it asks, the protocol on
+   the descriptor (vhost-user, or shards' framing), and an optional DAX window. The daemon admits it under a fresh
+   attachment for the requesting consumer — rights from the volume's access list, as every attach — and serves it.
+   **The descriptor is the only key**, one per VM session; per-uid permissions mean nothing on this route, since a
+   guest kernel can claim any uid (`nfs-uid-is-client-asserted` reasoning, stronger here). The device's end is the
+   attachment's end: when the launcher's end closes, the device ends and the attachment detaches, recorded.
+
+   **How the descriptor reaches the daemon, per platform — the one open question is macOS:**
+   - *Linux:* the rendezvous is an abstract-namespace socket that stays open as the client's control channel
+     (`crates/ipc/src/rendezvous.rs`). The client sends the descriptor up it with `SCM_RIGHTS`, the same machinery the
+     daemon uses in the other direction (`MAPPING_FDS`). No new channel, no filesystem entry.
+   - *Windows:* the bootstrap claim slot already carries the client's pid, so the client can `DuplicateHandle` into
+     the daemon or the daemon out of the client; the pid is in a section whose DACL is the authentication.
+   - *macOS: open.* The rendezvous is a shared-memory claim table with no socket, so nothing between an unrelated
+     launcher and the daemon can carry a descriptor today. R1 forbids an on-disk socket "if any alternative exists".
+     Candidate: a Mach port send right with `fileport_makeport`, if a per-user, non-launchd service registration is
+     still permitted on current macOS — **unverified; needs Apple's primary sources, not recollection.** If none
+     exists, whether a 0600 socket in a 0700 per-user directory meets R1's "if any alternative exists" is Ada's call.
+
+   **The DAX window.** `VHOST_USER_GET_SHMEM_CONFIG` is the VMM asking the *back end* how large a window to
+   allocate, so slates answers, and R3 forbids a fixed number. The launcher supplies the size, because only it knows
+   the guest's memory and the window costs the guest memory for its page records — about 1.6% of the window's size
+   on a Linux guest (a 64-byte record per 4 KiB page; **from memory, to verify**). Slates refuses a window larger
+   than the volume's capacity or the content arena, since DAX maps arena blocks and can never usefully exceed
+   either, and aligns it to the mapping alignment. No window, no DAX: the device then serves plain FUSE.
+
+   **Build order:** (a) Linux, where the handoff machinery exists — the verb, admission, lifetime, recovery,
+   vhost-user, with the existing in-process tests as the oracle's other leg; (b) the shards framing on the same
+   verb; (c) DAX as the per-attach option, then the capability report says advertised when a window was given;
+   (d) Windows; (e) macOS once its mechanism is decided. Each platform not yet built refuses typed
+   (`AttachmentUnsupported`), never silently.
+
 ## 9. For the integrator (docs this branch does not touch)
 
 `docs/wip/GAPS.md`, Bridges (4.6) row — append to the status cell:

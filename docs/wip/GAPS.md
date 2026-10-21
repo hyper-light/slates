@@ -10410,3 +10410,24 @@ Decisions owed to Ada before building anything, because each changes behaviour a
    counter, so removal does not risk id reuse.
 3. **Should a revoke of a revoked consumer say so?** Idempotent success is a fair API choice, but it leaves
    a human no way to learn whether a consumer was still live.
+
+
+### 2026-10-21: DAX in production is not one switch away — it needs the out-of-process descriptor handoff
+
+DAX had been described (in this ledger's framing and to Ada) as "built, withheld, turning it on is Ada's call".
+Ada answered yes. On going to flip it: there is nothing in production to turn it on *for*. DAX is offered per
+guest device, and production cannot create a guest device. `attach_vhost_user_device` and `_dax` are called only by
+`crates/server/tests/virtiofs.rs` and the crosvm A/B example, both linked into the daemon's own process; over the
+daemon's interface a `Guest` attach is refused `SeamNotOnWire`, because the client channel is a shared-memory ring
+that cannot carry a descriptor. The daemon's own status line already said so: "the inherited-descriptor binding
+not built".
+
+Every safety item of the gate is closed (the registry's fleet ordering closed today by the teardown fixes), so
+nothing *technical* blocks DAX once a production guest attach exists. The missing piece is the descriptor handoff
+from an out-of-process launcher, which §4.6 A-9 already chooses. It is also what kiln's microVM sessions need.
+Designed in `docs/wip/virtiofs.md` §8 item 7: Linux over the existing abstract control socket with `SCM_RIGHTS`,
+Windows by handle duplication via the bootstrap slot's pid, **macOS open** (no channel can carry a descriptor
+between unrelated processes today; a Mach-port route is unverified; an on-disk socket is R1's "if any alternative
+exists" and Ada's call). The DAX window is launcher-supplied (VHOST_USER_GET_SHMEM_CONFIG asks the back end; R3
+forbids a fixed number; the guest pays page records for it), capped by the volume's capacity and the content arena.
+Building it, Linux first, with Ada's yes.
