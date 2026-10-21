@@ -78,3 +78,15 @@ implementation that the memmap2 wrapper calls too, since a mapping is its bytes 
   than waiting on luck, so it measures rather than hopes.
 - Suites green after: slates-mem (macOS and Linux aarch64), slates-vfs (73 DAX tests, both), DAX loud skips on
   Linux 3 → 1.
+
+## The 32-bit bound, measured rather than reasoned
+
+Bounding the placement's grain — the huge page only where the object can hold one, the page otherwise — was
+argued from i686's roughly 3 GB of address space and a shared object per client session: a huge page of slack
+per session would spend an address space that small. That was reasoning, not evidence.
+
+CI's `i686 (32-bit narrowing, by test)` lane runs `cargo test -p slates-rt -p slates-mem` under
+`--platform linux/386`, so the full `slates-mem` suite executes as 32-bit code. On run 39518402693 all four of
+the placement's tests **ran and passed there** — `a_placed_mapping_costs_a_page_of_slack_and_returns_every_byte_of_it`
+and its quiet-child half, the congruent-mapping proof, and the hostile-length refusal. The slack bound the
+argument was about is therefore held on the architecture the argument was about.
