@@ -2024,6 +2024,132 @@ impl PinLedgerFixture {
   }
 }
 
+/// §4.6 #1 — with an **out-of-process VMM**, tearing a window down must keep the block pinned until the front
+/// end acknowledges the unmap. The front end owns the guest's mapping there, so until it confirms removal the
+/// guest can still reach those pages; returning the block to the arena before then hands a live mapping's
+/// memory to whoever allocates next.
+///
+/// This had no test. `MessagePlacer::begin_unmap` — the whole deferred phase two — appears once in the product
+/// (`device.rs`, inside `teardown_dax_window`) and in no test at all, while both existing message-based tests
+/// cover SETUPMAPPING. That is the placer a real crosvm or QEMU uses.
+///
+/// It needs no `/dev/udmabuf`, which is why it can run where the map-side proof cannot (no machine this project
+/// reaches has that device): the window is established through the **local** placer, then handed to a message
+/// placer before the teardown, which is the only part under test.
+///
+/// Do: map a window, install a message placer over a live socketpair, revoke the inode. Expect: the window is
+/// torn from the device and the block is **still pinned**. The assertion discriminates by itself — if the
+/// channel were dead the code unpins deliberately (documented, so a lost guest cannot leak a pin), so "still
+/// pinned" can only mean the SHMEM_UNMAP went out and phase two is correctly waiting for its ack.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_message_based_teardown_holds_the_block_until_the_front_end_acks_the_unmap() {
+  use slates_bridge_virtiofs::device::DaxWindowEntry;
+  use slates_bridge_virtiofs::vhost_user::{BackendReqChannel, MessagePlacer};
+
+  let mut f = pin_ledger_fixture("msgunmap");
+  assert_eq!(f.map(2, 0), 0, "the window maps");
+  let mapped = f.pinned();
+  assert!(
+    mapped > f.quiet,
+    "non-vacuity: mapping a window pins a block ({} -> {mapped})",
+    f.quiet
+  );
+
+  // The front end takes ownership of the window, so phase two of a revoke is now deferred to its ack. `front`
+  // is held open for the whole test: a closed peer makes `begin_unmap` fail, and the product then unpins at
+  // once by design, which would pass this test for precisely the wrong reason.
+  let (front, back) = rustix::net::socketpair(
+    rustix::net::AddressFamily::UNIX,
+    rustix::net::SocketType::STREAM,
+    rustix::net::SocketFlags::CLOEXEC,
+    None,
+  )
+  .unwrap();
+  let page = usize::try_from(f.page_len).unwrap_or(4096);
+  let placer: MessagePlacer<DaxWindowEntry> = MessagePlacer::new(
+    BackendReqChannel::adopt(back),
+    page,
+    f.page_len.saturating_mul(4),
+  );
+  f.device.install_dax_message_placer(placer);
+
+  let torn = {
+    let mut bridge = VolumeBridge::new(vid(), &mut f.tenant, &mut f.store);
+    f.device.request_revoke_inode(f.no, &mut bridge, &f.cx)
+  };
+
+  assert_eq!(torn, 1, "the revoke tore the window from the device");
+  assert_eq!(
+    f.pinned(),
+    mapped,
+    "the block stays pinned until the front end acks the unmap: it owns the guest's mapping, so the guest \
+     can still reach these pages"
+  );
+  assert_eq!(
+    f.store.release_refusals, 0,
+    "the release was deferred, not attempted and refused"
+  );
+  drop(front);
+}
+
+/// §4.6 (adversarial) — a revoke whose **unmap is refused** must not unpin the block. The window is still
+/// mapped to it, so handing it back to the arena would give a live guest mapping's block to whoever allocates
+/// next: the cross-tenant disclosure the two-phase revoke exists to prevent. The message placer already states
+/// this invariant for itself ("never unpin before the front end removes it"); the local placer broke it, calling
+/// `dax_release_after_unmap` unconditionally after a `let _ = cache.unmap(..)`.
+///
+/// In production the refusal is `mmap(MAP_FIXED)` failing: the unmap overlays the slot with an anonymous
+/// `PROT_NONE` mapping, and a `MAP_FIXED` over a sub-range splits a VMA, so a device with many live windows
+/// walks toward `vm.max_map_count` and `ENOMEM` by doing exactly this. Exhausting that in a test would be a
+/// machine-wide act, so the refusal is reached by its other door — `DaxCacheRegion::unmap` refuses a range
+/// outside the region, so installing a smaller region under a live window makes the next unmap of it refuse,
+/// deterministically and with no fault-injection seam in the product.
+///
+/// Do: map a window over the last page of a four-page region, replace the region with a one-page one, then
+/// revoke the inode. Expect: the block is **still pinned** afterwards, and the arena was never asked to release
+/// it (`release_refusals` stays 0 — the release was not attempted and refused, it was not attempted).
+#[cfg(unix)]
+#[test]
+fn a_revoke_whose_unmap_is_refused_keeps_the_block_pinned() {
+  let mut f = pin_ledger_fixture("unmaprefused");
+  let last = f.page_len.saturating_mul(3);
+  assert_eq!(
+    f.map(2, last),
+    0,
+    "the window maps over the region's last page"
+  );
+  let with_one = f.pinned();
+  assert!(
+    with_one > f.quiet,
+    "non-vacuity: mapping a window pins a block ({} -> {with_one})",
+    f.quiet
+  );
+
+  // The region shrinks under the live window, so its range is now outside what `unmap` will accept.
+  let smaller = slates_bridge_virtiofs::dax::DaxCacheRegion::new(f._cache.as_fd(), f.page_len)
+    .expect("a one-page cache region");
+  f.device.install_dax_window(Some(smaller));
+
+  let torn = {
+    let mut bridge = VolumeBridge::new(vid(), &mut f.tenant, &mut f.store);
+    f.device.request_revoke_inode(f.no, &mut bridge, &f.cx)
+  };
+
+  assert_eq!(torn, 1, "the revoke tore the window from the device");
+  assert!(
+    f.pinned() > f.quiet,
+    "a refused unmap keeps the block pinned: the window still maps it, so the arena must not have it back \
+     ({} pinned, quiet is {})",
+    f.pinned(),
+    f.quiet
+  );
+  assert_eq!(
+    f.store.release_refusals, 0,
+    "the release was never attempted, rather than attempted and refused"
+  );
+}
+
 /// §4.6 — a window a device maps gives its pin back when it unmaps. A pin left behind holds a chunk out of the
 /// arena for good. Do: map one window over a real cache region, then unmap it. Expect: mapping pins a block
 /// (non-vacuity) and the unmap returns the arena to exactly where it started.

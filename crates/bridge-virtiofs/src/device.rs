@@ -1477,9 +1477,19 @@ fn teardown_dax_window(
   let _ = bridge.dax_revoke_pending(&entry.mapping, cx);
   match placer {
     crate::dax::DaxPlacer::Local(cache) => {
-      // Phase two now: the back end owns the window, so the munmap is synchronous, then the block is unpinned.
-      let _ = cache.unmap(entry.moffset, entry.len);
-      let _ = bridge.dax_release_after_unmap(&entry.mapping, cx);
+      // Phase two now: the back end owns the window, so the munmap is synchronous, then the block is unpinned —
+      // **only if the unmap actually happened.** A refused unmap leaves the window still mapped to the block, and
+      // unpinning then returns a block a guest can still reach to the arena's free lists, for the next tenant to
+      // be given. That is the cross-tenant disclosure this two-phase revoke exists to prevent, and it is the same
+      // invariant the message arm below states for itself: never unpin before the window is gone.
+      //
+      // `DaxCacheRegion::unmap` overlays the slot with an anonymous `PROT_NONE` mapping, and `mmap(MAP_FIXED)`
+      // over a sub-range splits a VMA — so it can fail with `ENOMEM` once the process reaches `vm.max_map_count`,
+      // which a device with many live windows approaches by doing exactly this. On that path the pin is held
+      // instead: the block stays charged and unreusable, which leaks memory where unpinning would leak content.
+      if cache.unmap(entry.moffset, entry.len).is_ok() {
+        let _ = bridge.dax_release_after_unmap(&entry.mapping, cx);
+      }
     }
     // Phase two deferred: the front end owns the window, so send SHMEM_UNMAP and keep the block pinned until its
     // ack drains (the loop then unpins) — never unpin before the front end removes it (§4.6 #1). A send failure
