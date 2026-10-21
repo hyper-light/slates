@@ -1,5 +1,5 @@
 //! The consuming runtime's handshake, judged (§4.6 A-9 "Capabilities differ by host, kernel, runtime and VMM
-//! and must be reported"; Appendix C "OCI namespace handoff ... must report [its] own tested semantics";
+//! and must be reported"; Appendix C "OCI namespace handoff ... must report \[its\] own tested semantics";
 //! AUD-29-67).
 //!
 //! What it is. The daemon exports a host mount and verifies a bind source against the kernel's table; it does

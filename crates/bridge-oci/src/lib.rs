@@ -4,7 +4,7 @@
 //! insufficient evidence of a usable container path or guest device. No disk socket, image
 //! construction, target mkdir or privilege escalation is implicit in attaching a VFS volume"; RQ-20:
 //! "Host processes, OCI containers and Linux microVM guests can consume the same VFS"; Appendix C:
-//! "OCI namespace handoff ... must report [its] own tested semantics").
+//! "OCI namespace handoff ... must report \[its\] own tested semantics").
 //!
 //! What the form is. A container consumes a volume through a bind mount, performed by the host's OCI
 //! runtime, of a host attachment that already exists — the kernel mount `slates mount` establishes

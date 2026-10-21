@@ -5,7 +5,7 @@
 //! — a receiver that already holds a previous version's chunks receives only the new ones.
 //!
 //! This module is pure: set arithmetic over chunk identities and a filter over the archive's
-//! chunks, no I/O. It composes with [`crate::restore`]: the receiver combines its held chunks with
+//! chunks, no I/O. It composes with [`mod@crate::restore`]: the receiver combines its held chunks with
 //! the shipped chunks and restores the manifest.
 
 use std::collections::BTreeSet;

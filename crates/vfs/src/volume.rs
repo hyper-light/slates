@@ -1414,7 +1414,7 @@ impl Volume {
 
   /// Lowers the ceiling on the learned hold (§4.6): how many sweeps a DAX-reopened chunk may stay plaintext after its
   /// window is gone. Policy, not performance — an operator trading at-rest exposure for the re-seal churn the hold
-  /// avoids. Never raised past the derived default ([`Volume::WRITE_PLAINTEXT_SWEEPS`]).
+  /// avoids. Never raised past the derived default (`Volume::WRITE_PLAINTEXT_SWEEPS`).
   pub fn set_plaintext_hold_cap(&mut self, sweeps: u32) {
     self.reseal_hold_cap_sweeps = sweeps.min(Self::WRITE_PLAINTEXT_SWEEPS);
     self.reseal_hold_sweeps = self.reseal_hold_sweeps.min(self.reseal_hold_cap_sweeps);
@@ -6134,12 +6134,6 @@ impl ByEpoch {
   }
 }
 
-/// An inode's content bytes by birth epoch — the bytes it is charged (§4.2 "physical_used
-/// includes allocator rounding"; D-13's `referenced` counts allocated bytes): inline bytes byte for
-/// byte, born with the record (they live in the inode); a chunk's whole arena block, born with the
-/// chunk; an open extent's whole block, born with the extent. A block is the buddy block its
-/// window's materialized length takes ([`charged_window`]), so the sum is exactly the arena the
-/// head holds.
 /// What one idle sweep of a volume did (A-99).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct IdleSweep {
@@ -6153,6 +6147,12 @@ pub struct IdleSweep {
   pub left: u64,
 }
 
+/// An inode's content bytes by birth epoch — the bytes it is charged (§4.2 "physical_used
+/// includes allocator rounding"; D-13's `referenced` counts allocated bytes): inline bytes byte for
+/// byte, born with the record (they live in the inode); a chunk's whole arena block, born with the
+/// chunk; an open extent's whole block, born with the extent. A block is the buddy block its
+/// window's materialized length takes ([`charged_window`]), so the sum is exactly the arena the
+/// head holds.
 pub(crate) fn content_by_epoch(store: &Store, handle: Handle<Inode>) -> EpochContent {
   let mut out = EpochContent::Empty;
   let Ok(inode) = store.inodes.get(handle) else {

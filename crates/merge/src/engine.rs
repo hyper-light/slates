@@ -103,7 +103,7 @@ impl Increment {
   /// Decodes an increment persisted by [`Increment::encode`] — the inverse used to replay a green's
   /// chain on recovery. Every length is bounds-checked against the bytes that remain before it is
   /// read (a torn db entry never allocates a wild length; a wild evidence count is refused before
-  /// its table is reserved), and any malformation is a typed [`DocDecodeError`], never a panic.
+  /// its table is reserved), and any malformation is a typed [`crate::ops_doc::DocDecodeError`], never a panic.
   pub fn decode(bytes: &[u8]) -> Result<Increment, crate::ops_doc::DocDecodeError> {
     use crate::ops_doc::{DocDecodeError, OpsDoc, Reader};
     let mut reader = Reader::new(bytes);

@@ -16,11 +16,11 @@
 //! slow machine still boots (the bound makes the profile "quick", which the profile says).
 //!
 //! Modules:
-//! - [`derived`] — the [`Derived`] value type and the `derived!` macro: a value with its formula
+//! - [`mod@derived`] — the [`Derived`] value type and the `derived!` macro: a value with its formula
 //!   and anchors, which is what "no magic numbers" means in code.
 //! - [`stats`] — medians, percentiles by integer rationals, bootstrap intervals with a seeded
 //!   generator, and the stopping rule.
-//! - [`bench`] — the measurement harness with batching for sub-timer-resolution operations.
+//! - [`mod@bench`] — the measurement harness with batching for sub-timer-resolution operations.
 //! - [`facts`] — the fixed facts queried from the OS (pages, cache line, the cores this process may run
 //!   on, its CPU budget, memory, power).
 //! - [`placement`] — where the shards run: how many, and whether they are fixed to cores the process

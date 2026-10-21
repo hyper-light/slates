@@ -11,12 +11,12 @@
 //! path: disjoint ranges accept, same-range candidates are handed to pass two, everything else
 //! is a conflict with its class. Pass two is a memcmp of the same-range candidates' bytes:
 //! equal bytes accept-identical, unequal conflict. Neither pass does I/O, reads a clock, draws
-//! randomness, or (in its hot comparison) allocates. The content deriver ([`derive`]) composes a
+//! randomness, or (in its hot comparison) allocates. The content deriver ([`mod@derive`]) composes a
 //! path's declared operations into the canonical net op set by interval algebra (never a diff),
 //! the ops document ([`ops_doc`]) serializes an increment's ops into the bytes whose BLAKE3 is
 //! half its identity, and the position mapping ([`map`]) shifts an increment's ranges forward
 //! through the intervening deltas to head coordinates for the verdict and the splice; the
-//! splice ([`splice`]) applies a path's accepted ops to its base extent list by reference
+//! splice ([`mod@splice`]) applies a path's accepted ops to its base extent list by reference
 //! surgery (no byte copied); the chain and the fleet commit are the engine's other pieces, built
 //! on these.
 //!

@@ -193,7 +193,7 @@ pub struct EntryImage {
 pub enum BodyImage {
   /// No content yet.
   Empty,
-  /// A directory's entries, in canonical order ([`entry_order`]); none in a delta's image of a changed directory.
+  /// A directory's entries, in canonical order (`entry_order`); none in a delta's image of a changed directory.
   Directory {
     /// The entries.
     entries: Vec<EntryImage>,
