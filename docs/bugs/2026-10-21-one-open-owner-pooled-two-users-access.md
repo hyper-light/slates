@@ -1,8 +1,12 @@
 # One open-owner pooled two users' access, so either could write the other's file
 
 **Status:** fixed (the acting uid is part of an open's identity; this change).
-**Severity:** a privilege bypass between users of one NFSv4 client. A user the mode denies writing could
-**write and truncate** a file by sharing an open-owner with a user the mode allows.
+**Severity:** a bypass between users of one **honest** NFSv4 client, on an **unbound** export. A user the
+mode denies writing could **write and truncate** a file through another user's open or lock state.
+**It is not a boundary against a hostile client** — read "The threat model, stated after the fact" below
+before weighing it. The uid these checks use is the one the client's `AUTH_SYS` credential asserts, so a
+client willing to lie can simply claim root; what stops a hostile client is the mount capability and, per
+identity, a bound export. This was first written up as a privilege escape without that qualification.
 **Found:** 2026-10-21, working the sibling left open by
 `docs/bugs/2026-10-05-a-delegation-let-any-user-of-its-client-truncate.md`.
 
@@ -122,6 +126,67 @@ repeated lock-owner returns the lock state it was **first** created over, not th
 names, so the lock-owner is now unique per step. A model that states the implementation's accident
 rather than the design's rule certifies drift either way.
 
+## The threat model, stated after the fact
+
+These two fixes were found and landed before asking where the uid they check comes from. The answer
+changes how much they are worth, so it belongs here rather than in a later note.
+
+The uid an NFS request runs as comes from its `AUTH_SYS` credential (`crates/server/src/nfs.rs`,
+`auth_sys_identity`), which the **client asserts**, and `AUTH_NONE` falls back to root. So the per-uid
+POSIX checks inside one export are only as strong as the client's honesty. Three layers, strongest first:
+
+| layer | what it stops | how strong |
+|---|---|---|
+| the mount capability in every file handle (AUD-01) | reaching the volume at all | the boundary |
+| a bound export (§4.6 A-115) | every uid but the bound one, refused before the request touches the volume | the per-identity boundary |
+| per-uid checks within an unbound export | an honest multi-user client attributing one user's act to another's state | correctness, and defence against a confused deputy |
+
+Both fixes in this document live in the third layer. They are still right to keep: no conformant client
+presents one user's state under another user's credential, so they cost nothing and refuse nothing a real
+client does — the pjdfstest conformance lane, which drives `open/07.t`'s multi-user cases against real
+kernel clients on macOS and ubuntu, is green with them (CI run 39670111696). And that layer is not
+hypothetical: a real client, Linux 6.17, laundered a read-only opener's truncate through another user's
+delegation (`docs/bugs/2026-10-05-a-delegation-let-any-user-of-its-client-truncate.md`). But they are
+not what isolates one agent from another. Isolation comes from a separate capability per agent, and from
+binding the export to one identity.
+
+## A third shape, deliberately not changed: a WRITE under a delegation
+
+Hunting the class a third time found that `write_result` checks the bits only under `IoAuthority::Mode`,
+so a WRITE under a **delegation** gets no per-user check at all. Measured: root creates a file — mode 0644,
+so `other` is `r--` — and takes a write delegation; uid 1002 then writes through root's delegation state
+id. Served. No chmod happened, so nothing recalled the delegation, and uid 1002 holds no open.
+
+**It is left as it is, for three reasons, each checked rather than assumed.**
+
+1. **The RFC puts this check on the client.** RFC 8881 §10.4: per-user access for an open the client makes
+   locally under a delegation is the client's to enforce — *"the client should be sure authentication and
+   authorization occurs for each user by use of the ACCESS operation"* — and *"any requirement for other
+   checks to be made by the delegate should result in the OPEN delegation being denied."* A conformant
+   client access-checks a write before it opens for writing, so it never sends this request.
+2. **A strict server check would lose real data.** RFC 8881 §10.2.1: on recall, *"the client has the duty to
+   write all modified state to the server and then return the delegation"*, and §9.1.2 lets that I/O ride
+   the delegation state id. Nothing requires server-side opens first — CLAIM_DELEGATE_CUR is for opens the
+   client wants to keep afterwards. So after a chmod that removes a writer's class (which is exactly what
+   triggers the recall), a conformant client flushes that writer's legitimately written data under the
+   delegation, holding no server-side open for that writer. A strict bits check would refuse the flush. So
+   would "require the caller's own open", the option the 2026-10-14 analysis proposed. Either loses data a
+   permitted user wrote.
+3. **Against a hostile client it buys nothing.** On an unbound export such a client asserts any uid it
+   likes, root included. On a bound export the stranger gate already refuses it.
+
+Point 3 is proven rather than argued. `a_stranger_to_a_bound_export_cannot_write_through_its_identitys_delegation`
+(`crates/server/tests/nfs_mount.rs`) drives the same trick at the real boundary: the bound identity takes a
+write delegation and writes through it, then another uid and root each try to write under that delegation
+state id. Both are refused and the file keeps only the owner's six bytes. Red-checked: with the stranger
+gate disabled, uid 502 writes through it and the test fails. No existing test drove a stranger through a
+delegation — the bound-export test probed mount, attributes, ACCESS, lookup, readlink and create.
+
+The asymmetry with the truncate, which *is* checked strictly under a delegation, is deliberate and recorded
+so it is not "fixed" later by symmetry: a real client launders truncates (6.17, `nfs_may_open` checks only
+read for `O_RDONLY|O_TRUNC`), and no client is known to launder writes, while writes are the bulk of what a
+recall flushes.
+
 ## Why not the alternatives
 
 - **Refuse the cross-principal merge at OPEN.** Needs the principal on the open anyway, and invents a
@@ -171,3 +236,10 @@ POSIX conformance should make it strict the way truncate now is belongs to Ada.
 - `crates/bridge-nfs/tests/v4.rs` — the escape test and `cx_as`.
 - `crates/bridge-nfs/tests/v4_delegation.rs` — `OPENER` for the 27 direct `FileState::open` calls.
 - `crates/db/tests/model.rs` — a distinct uid per client through the recovery history.
+- `crates/bridge-nfs/src/v4/files.rs` (second door) — `check_io` refuses `NFS4ERR_ACCESS` when the open a
+  state id resolves to was made by another uid; `crates/bridge-nfs/src/procedures.rs` threads the acting uid
+  into both `check_io` call sites.
+- `crates/bridge-nfs/tests/v4.rs` — `a_lock_does_not_carry_another_users_open_access`, and the chaos property
+  extended to locks over other users' opens.
+- `crates/server/tests/nfs_mount.rs` — `a_stranger_to_a_bound_export_cannot_write_through_its_identitys_delegation`,
+  the real boundary attacked with the delegation trick (no code change: it holds).

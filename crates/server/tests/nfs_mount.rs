@@ -3136,6 +3136,87 @@ fn a_bound_export_serves_its_identity_and_shows_any_other_caller_only_attributes
   drop(daemon);
 }
 
+/// §4.6 A-115, RFC 8881 §9.1.2 and §10.4: a bound export's stranger refusal must hold for I/O that rides the
+/// bound identity's **delegation**, not only for procedures that name a file. On an *unbound* export the server
+/// trusts I/O under a delegation the way RFC 8881 §10.4 describes — per-user access for a delegated open is the
+/// client's to check — so a client that sends another user's WRITE under a holder's delegation is served (measured
+/// 2026-10-21: root's write delegation on a 0644 file, then uid 1002, whose bits are `r--`, wrote through it). That
+/// is the confused-deputy layer, where the uid is whatever `AUTH_SYS` asserts; the per-identity boundary is the
+/// bound export, which refuses a stranger before the request touches the volume. This drives the same trick at that
+/// boundary. Do: bind an export to the owner's uid with a proven back channel; as the owner create a file wanting a
+/// write delegation and write through it; then as another uid, and as root, write under the owner's delegation state
+/// id. Expect every stranger refused and the file holding only the owner's bytes.
+#[test]
+fn a_stranger_to_a_bound_export_cannot_write_through_its_identitys_delegation() {
+  let (daemon, instance) = single_shard_daemon("bound-delegation");
+  let mut client = Client::connect(&instance);
+  let ReplyBody::Created { id } = client.call(&scratch("bounddeleg")) else {
+    panic!("the volume is created");
+  };
+  let owner = rustix::process::getuid().as_raw();
+  let ReplyBody::Attached {
+    attachment,
+    token: Some(token),
+    ..
+  } = client.call(&RequestBody::Attach {
+    volume: id,
+    snapshot: None,
+    intent: Intent::Write,
+    form: AttachRequest::BoundHostMount {
+      uid: owner,
+      subtree: None,
+    },
+  })
+  else {
+    panic!("the bound export's attachment was refused");
+  };
+  let token_hex: String = token.iter().map(|byte| format!("{byte:02x}")).collect();
+  // The path names the volume, then the attachment and its token.
+  let component = format!("bounddeleg@{attachment:x}.{token_hex}");
+  let port = daemon.nfs_port().expect("the daemon is serving NFS");
+  let mut v4 = V4Client::connect_full(port, b"bound-holder", 4, Some(CB_PROGRAM));
+  v4.prove_back_channel(&daemon);
+  v4.caller = Some((owner, owner));
+  let (_open, fh, delegation) = v4.open_creating_wanting(&component, "held.txt", WANT_WRITE_DELEG);
+  let (kind, delegation) = delegation.expect("the bound identity's open for writing is delegated");
+  assert_eq!(
+    kind, 2,
+    "non-vacuity: a write delegation, so the strangers below have one to ride"
+  );
+  assert_eq!(
+    v4.write_under(&fh, delegation, b"owner!"),
+    NFS4_OK,
+    "the bound identity writes through its own delegation"
+  );
+  let strangers = if owner == 0 {
+    vec![1000]
+  } else {
+    vec![owner.wrapping_add(1).max(1), 0]
+  };
+  let refused: Vec<(u32, u32)> = strangers
+    .into_iter()
+    .map(|stranger| {
+      v4.caller = Some((stranger, stranger));
+      (stranger, v4.write_under(&fh, delegation, b"XX"))
+    })
+    .collect();
+  v4.caller = Some((owner, owner));
+  let size = v4.size_of(&fh);
+  drop(client);
+  drop(daemon);
+  for (stranger, status) in refused {
+    assert_ne!(
+      status, NFS4_OK,
+      "uid {stranger} is a stranger to the bound export and may not write through its identity's delegation"
+    );
+  }
+  assert_eq!(
+    size,
+    Some(6),
+    "the file holds only the bound identity's six bytes"
+  );
+}
+
 /// Probes the bound export as `stranger`: the mount and the root's attributes are served, `ACCESS` grants nothing,
 /// and a lookup, a link's read and a create are each `NFS4ERR_ACCESS` (A-115).
 fn probe_as_stranger(

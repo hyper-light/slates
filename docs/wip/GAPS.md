@@ -10342,3 +10342,30 @@ mount, and the pjdfstest conformance lane drives `open/07.t`'s multi-user cases 
 Those two are CI's, and they are what confirms a real client's per-credential open-owners make this a
 no-op for it rather than splitting opens it expects to share.
 (`docs/bugs/2026-10-21-one-open-owner-pooled-two-users-access.md`.)
+
+
+### 2026-10-21: the threat model under today's NFSv4 fixes, and a third shape deliberately left alone
+
+Today's two NFSv4 fixes (`e9fc5977`, `bdb73ec9`) were written up as privilege escapes before asking where
+the uid they check comes from. It comes from the request's `AUTH_SYS` credential, which the client asserts
+(`crates/server/src/nfs.rs`, `auth_sys_identity`; `AUTH_NONE` falls back to root). So per-uid checks inside
+one unbound export are the **confused-deputy** layer — they stop an honest multi-user client from attributing
+one user's act to another's state — and not a boundary against a hostile client, which can claim root. The
+boundaries are the mount capability (AUD-01) and the bound export (§4.6 A-115), which refuses every uid but
+its own before the request touches the volume. The fixes stay: they refuse nothing a conformant client does
+(pjdfstest on real kernels, macOS and ubuntu, green in CI run 39670111696), and that layer is real (Linux
+6.17 laundered a truncate through it).
+
+A third shape was found and **deliberately not changed**: a WRITE under a delegation has no per-user check
+(`write_result` checks only under `IoAuthority::Mode`). Measured — root's write delegation on a 0644 file,
+then uid 1002 (`r--`) wrote through it. Left alone because RFC 8881 §10.4 puts per-user access for delegated
+opens on the client; because §10.2.1 has a recalled client "write all modified state to the server and then
+return the delegation" under the delegation state id (§9.1.2), with no server-side opens required first, so a
+strict check would refuse a permitted writer's flush after the very chmod that triggered the recall, and lose
+the data; and because against a hostile client it buys nothing. The last point is proven at the real
+boundary: `a_stranger_to_a_bound_export_cannot_write_through_its_identitys_delegation` has the bound identity
+take a write delegation and write through it, then another uid and root each try to write under that state
+id, both refused and the file unchanged, red-checked by disabling the stranger gate (uid 502 then writes).
+No test had driven a stranger through a delegation before. The truncate stays strict under a delegation
+because a real client launders truncates and none is known to launder writes.
+(`docs/bugs/2026-10-21-one-open-owner-pooled-two-users-access.md`.)
