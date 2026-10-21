@@ -1745,6 +1745,12 @@ pub fn oci_binding_json(binding: &OciBinding) -> Value {
       "names_volume": binding.evidence.names_volume,
       "mount_id": binding.evidence.mount_id,
       "mount_device": binding.evidence.mount_device,
+      // The fact that replaced a refusal on 2026-10-20 (`server/src/oci.rs`): an unshared source is bound
+      // and reported rather than refused `MountNotShared`, because a rootful runtime's processes would meet
+      // `EACCES` there and a rootless one would not, and slates cannot see which the harness will drive. It
+      // travels "in the evidence for the harness's own pre-bind check" — and this, the machine-readable
+      // surface a harness actually reads, did not carry it until now, while the text form always printed it.
+      "shared_with_other_users": binding.evidence.shared_with_other_users,
     },
     "mount": oci_mount_json(binding),
   })

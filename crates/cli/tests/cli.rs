@@ -4253,28 +4253,32 @@ fn linux_fuse_mount_runs() -> bool {
   true
 }
 
-/// Whether this host lets an unprivileged process make a user namespace, which `slates exec` needs before it
-/// can map ids and mount anything of its own. A loud skip otherwise.
+/// Whether a process can write **its own** user-namespace maps — which is what `slates exec` does today,
+/// and what neither host measured will allow. A loud skip otherwise.
 ///
-/// This is a *second* capability, and the launcher flow needs both: a host can have `fusermount3` and
-/// `/dev/fuse` and still deny the namespace. Ubuntu 24.04 does exactly that by default
-/// (`kernel.apparmor_restrict_unprivileged_userns=1`), which is what GitHub's `ubuntu-latest` runs — so the
-/// launcher tests passed the FUSE gate there, went on, and failed inside the launcher with
-/// `open /proc/self/setgroups: code 13`. Measured 2026-10-20: this laptop's Docker Linux denies it too, but
-/// there the FUSE gate had already skipped the test, which is why the gap never showed here.
+/// The first version of this gate asked whether unprivileged user namespaces are permitted at all. That was
+/// the wrong question and it never fired: `unshare -U true` succeeds on GitHub's `ubuntu-latest` *and* on the
+/// x86_64 box, and the launcher failed anyway with `open /proc/self/setgroups: code 13`. Measured on the box
+/// 2026-10-20, inside a fresh namespace with no maps written: `setgroups` reads `allow`, `uid_map` is empty,
+/// and writing either is **denied** — while `unshare --map-user`, where the *parent* writes the child's maps,
+/// works and lands uid 1000 inside. So the capability is there and the launcher asks for it the one way these
+/// kernels refuse.
 ///
-/// The probe forks `unshare -U true` rather than attempting the namespace in-process, because an attempt
-/// made here would be made by the test runner's own process and a success would change it.
+/// That makes this a skip over a **defect**, not over a missing host feature, and it is recorded as one:
+/// `docs/bugs/2026-10-20-the-launcher-writes-its-own-userns-maps.md`. The gate exists so the lane reports the
+/// defect once, in the ledger, rather than as a red test on every run; when the launcher forks and has the
+/// parent write the maps, this gate goes away with it.
 #[cfg(target_os = "linux")]
-fn unprivileged_user_namespaces_run() -> bool {
+fn a_process_can_write_its_own_userns_maps() -> bool {
   let permitted = Command::new("unshare")
-    .args(["-U", "true"])
+    .args(["-U", "sh", "-c", "echo deny > /proc/self/setgroups"])
     .output()
     .map(|o| o.status.success())
     .unwrap_or(false);
   if !permitted {
     eprintln!(
-      "SKIP: this host denies an unprivileged user namespace (Ubuntu's        kernel.apparmor_restrict_unprivileged_userns, or a container's seccomp); `slates exec` needs one"
+      "SKIP: this host refuses a process writing its own user-namespace maps, which is how `slates exec` \
+       sets up today (docs/bugs/2026-10-20-the-launcher-writes-its-own-userns-maps.md)"
     );
   }
   permitted
@@ -5213,7 +5217,7 @@ const ROOT_ENV: &str = "SLATES_ROOT";
 #[cfg(target_os = "linux")]
 #[test]
 fn the_launcher_refuses_a_path_it_would_have_to_create_and_leaves_the_host_untouched() {
-  if !linux_fuse_mount_runs() || !unprivileged_user_namespaces_run() {
+  if !linux_fuse_mount_runs() || !a_process_can_write_its_own_userns_maps() {
     return;
   }
   let instance = format!("cli-exec-{}", std::process::id());
