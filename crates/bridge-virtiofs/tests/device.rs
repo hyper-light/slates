@@ -2169,6 +2169,58 @@ fn a_message_based_teardown_holds_the_block_until_the_front_end_acks_the_unmap()
   drop(front);
 }
 
+/// §4.6 "revoke on advance" — an advance that tears a stale window must also **balance its pin**: give the
+/// block back, and not before the window is gone.
+///
+/// `an_advance_revalidate_tears_the_stale_window_and_keeps_the_current_one` asserts how many windows a
+/// re-validate tears and which survive. It says nothing about the arena, and the tear and the unpin are two
+/// different things: `revalidate_windows` reuses `teardown_dax_window`, so the ordering is right by
+/// construction — but "by construction" is the claim a test is supposed to check, and the two halves were only
+/// ever asserted apart (`a_device_window_gives_its_pin_back_when_it_unmaps` for the pin,
+/// `an_advance_revalidate_...` for the tear). A regression that tore the window and leaked the pin, or unpinned
+/// without tearing, would pass both.
+///
+/// Do: map a window, move the file's content so the window no longer matches what backs it (the change an
+/// advance presents), then re-validate. Expect: the window is torn, the arena is back exactly where it started,
+/// and it refused no release on the way.
+#[cfg(unix)]
+#[test]
+fn an_advance_that_tears_a_window_balances_its_pin() {
+  let mut f = pin_ledger_fixture("advancepin");
+  assert_eq!(f.map(2, 0), 0, "the window maps");
+  let mapped = f.pinned();
+  assert!(
+    mapped > f.quiet,
+    "non-vacuity: mapping a window pins a block ({} -> {mapped})",
+    f.quiet
+  );
+
+  // Move the content, which is what an advance presents to the device. The length has to change with it: a
+  // rewrite of the same size leaves block and length matching, the window reads as current and nothing is torn
+  // — which is how the first version of this test failed, with `torn` 0.
+  let no = slates_vfs::ids::InodeNo(f.no);
+  let page = usize::try_from(f.page_len).unwrap_or(4096);
+  f.tenant
+    .write(&mut f.store, no, 0, &vec![0x3C; page.saturating_mul(2)])
+    .expect("the file is rewritten longer, moving its content to a new block");
+
+  let torn = {
+    let mut bridge = VolumeBridge::new(vid(), &mut f.tenant, &mut f.store);
+    f.device.revalidate_windows(&mut bridge, &f.cx)
+  };
+
+  assert_eq!(
+    torn, 1,
+    "the re-validate tore the window the move made stale"
+  );
+  assert_eq!(f.device.dax_window_count(), 0, "no window remains");
+  assert_eq!(
+    (f.pinned(), f.store.release_refusals),
+    (f.quiet, 0),
+    "the pin came back whole and the arena refused no release: the tear and the unpin compose"
+  );
+}
+
 /// §4.6 (adversarial) — a revoke whose **unmap is refused** must not unpin the block. The window is still
 /// mapped to it, so handing it back to the arena would give a live guest mapping's block to whoever allocates
 /// next: the cross-tenant disclosure the two-phase revoke exists to prevent. The message placer already states
