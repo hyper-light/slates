@@ -7618,6 +7618,24 @@ tests green (v4 suites 63/0, nfs_mount delegation subset 10/0); clippy `--all-ta
 (~1/file, git's per-file mode/mtime) — profiled but not yet addressed; and the controlled best-of-N wall-clock for
 the delegation change.
 
+**Two routes to SETATTR closed by reading, 2026-10-21, before anyone spends a clone run on them:**
+
+1. *"slates ignores the mode the client set at create, so the client must SETATTR after."* **False.** The v4
+   `OPEN` decodes `createhow4`'s attributes (`open_createhow` → `decode_fattr_set`) and carries them through
+   `create_or_open` into `create_new`, so an `UNCHECKED`/`GUARDED` create applies them. The per-file SETATTR is
+   git setting mode and mtime *after* writing, which is the client's choice and not something the server
+   forces.
+2. *"Offer a write delegation again so the client can cache the attribute set."* It would work — RFC 8881
+   §10.4 lets a write delegation cache attribute changes and flush at `DELEGRETURN` — **and it is the trade
+   this section already measured and lost.** A write delegation saves roughly one SETATTR per file and costs
+   roughly one DELEGRETURN per file; the A-80 amendment above removed write delegations and that alone cut
+   DELEGRETURN 91,034 → 4 (13% of all RPCs). Re-offering them to chase SETATTR would hand most of that back.
+
+   So the two levers pull against each other, and the measurement already chose. **Whatever closes SETATTR has
+   to be something other than a delegation**, and the remaining ideas are client-side (git's own behaviour) or
+   a compound-level one — folding the client's SETATTR into a reply it already awaits — which needs the clone
+   run to value.
+
 ## DAX sealed-chunk backing decided by A/B; the re-seal hold is learned (§4.6, 2026-10-17)
 
 Rule (a) of the open-frontier decision — map only a file's one open chunk, refuse a sealed one to FUSE_READ — was
