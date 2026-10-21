@@ -901,6 +901,31 @@ and the reason is not a host that will not have it — it is that the launcher c
 written. Nothing had ever run it, because the flow also needs `/dev/fuse` and `SLATES_TEST_CLI`, and the FUSE
 gate skipped first everywhere here.
 
+### 8a-crlf. A Windows checkout rewrote the bytes a doc-truth test compares (2026-10-20, closed)
+
+The first push of this session's 250 commits turned the `aarch64 windows (native, by test)` lane red on
+`the_recorded_chokepoint_table_is_the_registry`, reporting "the record has the chokepoints:begin marker"
+about a marker that sits on line 12 of `docs/wip/observability.md`. The repository had no `.gitattributes`,
+GitHub's Windows images ship git with `core.autocrlf=true`, and the test searches for
+`"<!-- chokepoints:begin -->\n"` — which cannot match a line that a Windows checkout ended `-->\r\n`. The
+byte-for-byte table compare behind the search would have failed next, for the same reason.
+
+Eight sibling sites read a document the same way and were latent, not red, only because no Windows lane runs
+them: `crates/ipc/src/protocol.rs` has the identical marker pattern over the same record, but the arm64 lane
+runs `-p slates-ipc --test rings`/`rendezvous`/`delivery` and never `--lib`; conformance and the xtask gates
+are ubuntu and macos. **This is a second instance of the audit lens recorded in `sweep-for-paths-nothing-runs`
+— a test that pins one position while the threat picks any — read here as: a platform lane that runs a subset
+of a crate's tests certifies only that subset.**
+
+Fixed by declaring the tree's own text LF in `.gitattributes`, so every platform checks out the committed
+bytes. The first attempt excluded `vendor/**` with `-text` and was wrong: a `git add --renormalize .` under
+it staged 263 changed lines in each of 24 NIST SHAVS vectors, whose upstream `.gitattributes` says
+`*.rsp eol=crlf` *because* `sha256sum` is used to check they have not been tampered with. `!text !eol`
+restores no-opinion over vendor and stages zero files.
+`docs/bugs/2026-10-20-a-windows-checkout-rewrote-the-bytes-a-doc-truth-test-compares.md`.
+
+**Owed:** the proof is the next arm64 Windows run; native Windows cannot be executed from this machine.
+
 ### 8a-win-dumps. Windows has no unprivileged core-dump exclusion, and the CLI now says so (2026-10-20, OPEN — needs Ada)
 
 Compiling `slates-cli` for Windows for the first time turned up three Unix-only sites in the shipped
