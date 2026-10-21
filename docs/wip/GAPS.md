@@ -7418,21 +7418,41 @@ its own page table and never calls the daemon), so the defense had to be at the 
      volume's access list (§4.6). An agent can request a map, never forge or edit an entry.
    - *Unforgeable handle.* A guest must reference a mapping by a daemon-minted opaque capability (a generational id),
      not a raw `Mapping`, so it can neither name a mapping it was not granted nor forge the block/length fields.
-     **Half built, and the half that is built is not the half this line promised (checked 2026-10-20).** The id
-     exists and is unforgeable: `MappingId`'s inner is module-private, every `Mapping` carries one minted by
-     `DaxRegistry::mint_id` (five call sites), and `DaxRegistry::is_live` is consulted on the production paths. But
-     **the device wiring did not add the id** — `crates/bridge-virtiofs` contains no reference to `MappingId` at all.
-     It keys a window by `moffset`, the guest's own offset into the DAX cache region the device gave it, validated
-     for page alignment and range. That is a sound confinement (a guest cannot name an offset outside its own
-     region, which the cross-tenant isolation test proves) but it is **not** the mechanism written here, and
-     `MappingId::as_u64` — the accessor whose doc said it exists "so a same-host client can name this mapping when
-     it asks to release it" — **has no caller in the tree**. There is no DAX release verb on the wire
-     (`DaxRelease`/`MapRelease`/`dax_release` appear nowhere in `wire`, `server/verbs.rs` or `client`), and
-     `dax_release_after_unmap` takes a daemon-held `&Mapping`. So: either reword this item to describe the
-     `moffset` confinement that exists, or build the release-by-id path it describes — **Ada's call, because it is
-     a question about what the guest interface should be, not about what the code says.** The accessor is kept
-     meanwhile, with its doc corrected to state that nothing calls it; it is unwired planned work, not the
-     superseded code `dax_revoke_block` was when it was deleted (e74daf77).
+     **Satisfied, by a different mechanism than this line prescribes — checked against the code and its tests
+     2026-10-20, and no longer a blocker.** The property has two halves and both hold.
+
+     *A guest cannot name a mapping it was not granted.* `crates/bridge-virtiofs` contains no reference to
+     `MappingId` at all; the device keys a window by `moffset`, the guest's own offset into the DAX cache region
+     the device gave it. `DaxCacheRegion::fixed_addr` refuses anything else: a `moffset` or `len` that does not
+     fit `usize`, a zero or non-page-aligned length, a `moffset + len` that overflows, and any `end` past
+     `window.len()`. The window is per-device, so the furthest a guest can reach is its own region. Proven by
+     `a_setupmapping_past_the_window_is_refused` and `two_tenants_dax_windows_each_show_only_their_own_bytes`.
+
+     *A guest cannot forge the block or length.* `SetupMappingIn` has five fields — `fh`, `foffset`, `len`,
+     `flags`, `moffset` — and **none of them is a block.** The guest names a file handle and an offset in the
+     file; the daemon resolves that to a block through the bridge. The length is capped to the file's authorized
+     pages rather than honoured
+     (`a_setupmapping_reaching_past_the_file_is_capped_to_its_authorized_pages`), and
+     `a_device_window_past_the_files_length_shows_zeroes_not_the_truncated_secret` holds the tail.
+
+     *Adversarially.* `hostile_dax_requests_are_refused_and_establish_no_window` drives a truncated SETUPMAPPING
+     body, `len = u64::MAX`, an unaligned window offset, a SETUPMAPPING of an inline (non-mappable) file, a
+     truncated REMOVEMAPPING and a REMOVEMAPPING claiming `u32::MAX` entries — each a typed refusal or a no-op,
+     no window established, the block a refused map briefly pinned released, no panic, and a valid map still
+     works after. `device_chaos_step` puts the same seam under the random schedule.
+
+     So the id never needed to cross to the guest for this property to hold, and the parenthetical that said
+     "the device wiring adds the id" described a plan rather than the design that was built. The minted id is
+     still real and still load-bearing *daemon-side*: `MappingId`'s inner is module-private so a `Mapping` can
+     only come from the mint paths, every one carries an id (five `mint_id` call sites), and `is_live` is
+     consulted on the production paths (`dax.rs:1086`, `:1282`, `:1329`).
+
+     **What is left is a separate, non-blocking item:** `MappingId::as_u64` exists for a release-by-id path that
+     does not exist — no `DaxRelease`/`MapRelease`/`dax_release` anywhere in `wire`, `server/verbs.rs` or
+     `client`, and `dax_release_after_unmap` takes a daemon-held `&Mapping`. Whether a same-host client should be
+     able to name a mapping and release it is a question about the guest interface, not about confinement, and it
+     does not gate advertising. The accessor is kept with its doc corrected to say nothing calls it; it is unwired
+     planned work, not the superseded code `dax_revoke_block` was when it was deleted (e74daf77).
    - *Integrity at pin.* `ChunkArena::pin` already refuses an extent that is not a live allocation (`ForeignExtent`),
      so even a daemon-internal slip cannot pin a forged or stale block.
    - *VMM-enforced teardown.* Revocation is not "ask the guest": the daemon tells the VMM/hypervisor to remove the DAX
@@ -7445,6 +7465,22 @@ its own page table and never calls the daemon), so the defense had to be at the 
      "Destroy/revoke releases credits only after … mappings"), so no other node's merge/`advance`/landing reclaims a
      version a remote mapping pins. On takeover the dead owner's guests die with it, so the successor starts with no
      mappings — nothing to inherit or forge.
+
+     **Audited 2026-10-20; this is the one sub-item still open, and narrower than it reads.** What was checked:
+     a `Mapping` carries `id`, `inode`, `block_file_start`, `block`, `file_len` and **no version** — it pins a
+     *block* through `ChunkArena::pin`, not a version, so "a mapping pins a version" is not literally what the
+     type does. `crates/server/src/content_retention.rs` contains no mention of DAX or of a mapping, so the
+     retention path does not consult the registry. What does protect the guest is the revoke-on-`advance` path,
+     and that **is** wired in production: `serve.rs:385` calls `revalidate_windows` on the drain kick, tearing
+     any window the device no longer backs (its discarded result is deliberate and the comment above it says
+     why — the lapse is folded into the pass below, not lost).
+
+     So the question is one of *ordering across hosts*, not of a missing mechanism: whether a remote merge,
+     `advance` or landing can reclaim content between that reclaim and the local revoke completing. **No test
+     anywhere pairs a remotely-originated advance with a live DAX window** — `crates/server/tests/fleet.rs` and
+     `recovery.rs` do not mention DAX at all, and `revalidate_windows` is exercised only in the in-process
+     device suite. The local path is origin-agnostic (R8's one code path), which is the reason to expect it
+     holds and not the evidence that it does.
 
 3. **File-shape scope and the open-frontier rule (2026-10-16).** DAX maps a chunk only in its **open (plaintext)**
    representation; a **sealed** chunk (AES-GCM at-rest, A-92/A-99) reads over **FUSE_READ** — a guest's MMU would read

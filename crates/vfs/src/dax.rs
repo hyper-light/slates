@@ -127,10 +127,14 @@ impl MappingId {
   /// [`Store::dax_release_after_unmap`] takes a daemon-held `&Mapping`, never an id a caller supplied. So no
   /// client today can name a mapping at all, by this value or otherwise.
   ///
-  /// Kept rather than removed because it is unwired planned work, not superseded code: the DAX gate's step 2
-  /// names a daemon-minted opaque capability as the mechanism a guest should use, and this is how that value
-  /// would reach the wire. `dax_revoke_block` was deleted (e74daf77) on the opposite finding — that the pin
-  /// already covered what it was written for.
+  /// Kept rather than removed because it is unwired planned work, not superseded code. Note what it is *not*
+  /// blocking: the DAX gate's confinement property does not rest on this id reaching a guest — the device keys
+  /// a window by `moffset` into the guest's own cache region and `SetupMappingIn` carries no block field at
+  /// all, so a guest can neither name a window it was not granted nor forge a block, and both halves are
+  /// tested (§4.6; `hostile_dax_requests_are_refused_and_establish_no_window`). What this accessor would serve
+  /// is a release-by-id path, which is a question about the guest interface rather than about confinement.
+  /// `dax_revoke_block` was deleted (e74daf77) on the opposite finding — that the pin already covered what it
+  /// was written for.
   ///
   /// What *is* true today: reading the value never *forms* a `MappingId` — the inner stays private, so a
   /// client-supplied `u64` could only ever be looked up in the registry, never fabricated into a mapping.
