@@ -287,7 +287,15 @@ jobs:
           "$RUNNER_TEMP/venv/bin/maturin" sdist --out "$RUNNER_TEMP/dist" -m crates/sdk-python/Cargo.toml
           "$RUNNER_TEMP/venv/bin/twine" check --strict "$RUNNER_TEMP"/dist/*
           "$RUNNER_TEMP/venv/bin/pip" install --quiet --no-index "$RUNNER_TEMP"/dist/slates-*.whl
+      # The async suite's budgets scale with this, the same knob the Rust client tests read. Measured
+      # 2026-10-20: under ten busy spinners on an 18-core machine, phase 1's calls came back
+      # `Stalled { after_ns: 1000000000 }` once in five runs instead of being answered across the
+      # restart — a flat one second is not a budget a loaded two-core runner can meet. With the knob
+      # at 10 under the same load: five of five. The loop-responsiveness bound deliberately does not
+      # scale with it, so this cannot mask the held-loop failure it is there to catch.
       - name: The Python suites (sync and async) against the installed wheel over a live daemon
+        env:
+          SLATES_TEST_RESTART_SLOWDOWN: "10"
         run: SLATES_DAEMON="$PWD/target/debug/slates" "$RUNNER_TEMP/venv/bin/python" -m unittest discover -s crates/sdk-python/tests -v
       - name: Build the napi addon and run the Node suites (sync and async) over a live daemon
         run: |
