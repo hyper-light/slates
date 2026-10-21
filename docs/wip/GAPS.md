@@ -7631,10 +7631,24 @@ the delegation change.
    roughly one DELEGRETURN per file; the A-80 amendment above removed write delegations and that alone cut
    DELEGRETURN 91,034 → 4 (13% of all RPCs). Re-offering them to chase SETATTR would hand most of that back.
 
-   So the two levers pull against each other, and the measurement already chose. **Whatever closes SETATTR has
-   to be something other than a delegation**, and the remaining ideas are client-side (git's own behaviour) or
-   a compound-level one — folding the client's SETATTR into a reply it already awaits — which needs the clone
-   run to value.
+   So the two levers pull against each other, and the measurement already chose.
+
+3. **And the third reading is that there is no lever, because the op is protocol-mandated.** An `EXCLUSIVE`
+   create stores the verifier *in the file's times* (RFC 8881 §18.16.3), so the client **must** follow it with
+   a SETATTR to set the real attributes — `exclusive_open` in `v4/compound.rs` does exactly this and its own
+   comment says why: "The times hold the verifier: naming them tells the client to set its own". Git creates
+   with `O_CREAT|O_EXCL`, which the Linux client maps to `EXCLUSIVE4`.
+
+   **The existing profile already corroborates it and nobody read it that way: OPEN 14% and SETATTR 13.5% are
+   near-identical**, which is the signature of one mandated SETATTR per exclusive create, not of an
+   independent op that happens to land near 1/file.
+
+   Labelled a strong hypothesis rather than a finding, because the `createmode4` actually on the wire was
+   never captured — the profile counted ops, not modes. **Confirming it is cheap and needs no clone run:** log
+   the `createmode4` in `open_createhow` over any create workload and see whether it is `EXCLUSIVE`. If it is,
+   SETATTR at ~1/file is RFC-required for this client's create pattern, the lever does not exist, and the
+   2×-vs-tmpfs target has to come from the other ops. If it is not, the question is open again and the two
+   routes above are still closed.
 
 ## DAX sealed-chunk backing decided by A/B; the re-seal hold is learned (§4.6, 2026-10-17)
 
