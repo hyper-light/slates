@@ -211,7 +211,13 @@ impl WritableOpens {
 /// of any age is judged:
 /// - **a fetch** at head `h` makes its bytes (`h`, fresh);
 /// - **the mount's own record** at `s` makes bytes with an older point (`s`, fresh), since its own write refreshed them;
-/// - **another path's record** at `s` makes bytes with an older point stale.
+/// - **another path's record** at `s` makes bytes with an older point stale;
+/// - **an ambiguous read** at head `h` (A-144) — a READ through a handle opened `O_DIRECT` — leaves its fresh bytes as
+///   they are and makes the rest (`h`, unknown). It is a direct read, which leaves the kernel's copy as it was, or a
+///   fill of that copy (a fault on a map of the handle, a buffered fallback), and FUSE carries nothing that tells them
+///   apart. Counted as a fetch it once marked a stale cached page fresh, and that page's write-back undid another
+///   path's write. A write-back over an unknown byte is refused, as one the states cannot tell; a fetch or the mount's
+///   own record makes the byte fresh again, and another path's record makes it stale, as both readings are then.
 ///
 /// A fetch and an own write may reset bytes because the kernel orders them after every write-back of their pages still
 /// in flight. Linux 6.12 keeps each write-back in the inode's tree until the daemon answers it (`fs/fuse/file.c:2124`,
@@ -236,11 +242,23 @@ pub struct PageStates {
   touched: Vec<u64>,
 }
 
+/// What the mount knows of one byte of its kernel's cached copy, beside the point that copy is as of.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Byte {
+  /// No other path changed it since the point.
+  Fresh,
+  /// Another path changed it since the point: the kernel's copy predates that change.
+  Stale,
+  /// One of the two, which the mount cannot tell: an ambiguous read (A-144) left it stale if the read was direct, and
+  /// fresh if it filled the cache.
+  Unknown,
+}
+
 /// One tracked file's byte states.
 #[derive(Debug, Clone)]
 struct FileStates {
-  /// Start → (end, point, stale), disjoint and covering every byte; touching neighbours of one state are merged.
-  ranges: std::collections::BTreeMap<u64, (u64, u64, bool)>,
+  /// Start → (end, point, state), disjoint and covering every byte; touching neighbours of one state are merged.
+  ranges: std::collections::BTreeMap<u64, (u64, u64, Byte)>,
   /// The file needed more ranges than the bound: what its kernel holds can no longer be told.
   lost: bool,
   /// Listed in [`PageStates::touched`].
@@ -265,9 +283,35 @@ impl PageStates {
   /// Bytes `range` of `ino` were fetched at head `point`: fresh as of it. Nothing for a file not tracked.
   pub fn fetched(&mut self, ino: u64, range: std::ops::Range<u64>, point: u64, bound: usize) {
     if let Some(file) = self.files.get_mut(&ino) {
-      file.update(range, bound, |_, _| (point, false));
+      file.update(range, bound, |_, _| (point, Byte::Fresh));
       file.touch(ino, &mut self.touched);
     }
+  }
+
+  /// Bytes `range` of `ino` were read at head `point` through a handle that may bypass the kernel's page cache
+  /// (`O_DIRECT`; A-144): a direct read, which leaves the kernel's copy as it was, or a fill of that copy (a fault on a
+  /// map of the handle, a buffered fallback), which the mount cannot tell apart. A byte fresh after the not yet
+  /// consumed `pending` changes is fresh either way and stays so; any other becomes unknown as of `point`, since the
+  /// two readings disagree on it. Nothing for a file not tracked or lost.
+  pub fn read_ambiguously(
+    &mut self,
+    ino: u64,
+    range: std::ops::Range<u64>,
+    point: u64,
+    pending: &[(std::ops::Range<u64>, u64, bool)],
+    bound: usize,
+  ) {
+    let Some(file) = self.files.get_mut(&ino) else {
+      return;
+    };
+    let mut scratch = file.clipped(range.clone());
+    for (changed, seq, own) in pending {
+      scratch.change(changed.clone(), *seq, *own, usize::MAX);
+    }
+    for part in scratch.not_fresh_within(range) {
+      file.update(part, bound, |_, _| (point, Byte::Unknown));
+    }
+    file.touch(ino, &mut self.touched);
   }
 
   /// A journal change to `ino`'s bytes `range` at sequence `seq`: the mount's own (`own`), which refreshes the bytes
@@ -302,7 +346,7 @@ impl PageStates {
 
   /// The stale bytes of `range` of `ino`, after the not yet consumed `pending` changes to it (each with whether it is the
   /// mount's own) applied in order to a scratch copy: ascending and disjoint. A file not tracked is judged as fresh at
-  /// `untracked`. `None` when the file's states were lost.
+  /// `untracked`. `None` when it cannot be told: the file's states were lost, or a byte of `range` is unknown (A-144).
   pub fn stale_after(
     &self,
     ino: u64,
@@ -318,7 +362,7 @@ impl PageStates {
     for (changed, seq, own) in pending {
       scratch.change(changed.clone(), *seq, *own, usize::MAX);
     }
-    Some(scratch.stale_within(range))
+    scratch.known_stale_within(range)
   }
 
   /// Every tracked file is lost: the journal no longer holds the records since this mount last consumed it, so what its
@@ -345,7 +389,7 @@ impl FileStates {
   /// Every byte fresh as of `point`.
   fn fresh(point: u64) -> FileStates {
     let mut ranges = std::collections::BTreeMap::new();
-    ranges.insert(0, (u64::MAX, point, false));
+    ranges.insert(0, (u64::MAX, point, Byte::Fresh));
     FileStates {
       ranges,
       lost: false,
@@ -363,16 +407,16 @@ impl FileStates {
 
   /// Raises every point below `floor` to it and merges the touching ranges that then hold one state.
   fn raise_points(&mut self, floor: u64) {
-    let mut raised: std::collections::BTreeMap<u64, (u64, u64, bool)> =
+    let mut raised: std::collections::BTreeMap<u64, (u64, u64, Byte)> =
       std::collections::BTreeMap::new();
-    let mut run: Option<(u64, (u64, u64, bool))> = None;
-    for (&start, &(end, point, stale)) in &self.ranges {
-      let state = (end, point.max(floor), stale);
+    let mut run: Option<(u64, (u64, u64, Byte))> = None;
+    for (&start, &(end, point, byte)) in &self.ranges {
+      let state = (end, point.max(floor), byte);
       run = match run {
-        Some((run_start, (run_end, run_point, run_stale)))
-          if run_end == start && run_point == state.1 && run_stale == stale =>
+        Some((run_start, (run_end, run_point, run_byte)))
+          if run_end == start && run_point == state.1 && run_byte == byte =>
         {
-          Some((run_start, (end, run_point, run_stale)))
+          Some((run_start, (end, run_point, run_byte)))
         }
         Some((run_start, run_state)) => {
           raised.insert(run_start, run_state);
@@ -387,15 +431,17 @@ impl FileStates {
     self.ranges = raised;
   }
 
-  /// A journal change at `seq`: bytes in `range` with an older point are refreshed (`own`) or left stale.
+  /// A journal change at `seq`: bytes in `range` with an older point are refreshed (`own`) or left stale. An unknown byte
+  /// is either reading of it, and the change settles both alike: the mount's own write refreshed the kernel's copy, and
+  /// another path's made it stale whether the ambiguous read had filled it or not.
   fn change(&mut self, range: std::ops::Range<u64>, seq: u64, own: bool, bound: usize) {
-    self.update(range, bound, |point, stale| {
+    self.update(range, bound, |point, byte| {
       if point >= seq {
-        (point, stale)
+        (point, byte)
       } else if own {
-        (seq, false)
+        (seq, Byte::Fresh)
       } else {
-        (point, true)
+        (point, Byte::Stale)
       }
     });
   }
@@ -406,21 +452,21 @@ impl FileStates {
     &mut self,
     range: std::ops::Range<u64>,
     bound: usize,
-    f: impl Fn(u64, bool) -> (u64, bool),
+    f: impl Fn(u64, Byte) -> (u64, Byte),
   ) {
     if self.lost || range.start >= range.end {
       return;
     }
     self.split_at(range.start);
     self.split_at(range.end);
-    let inside: Vec<(u64, (u64, u64, bool))> = self
+    let inside: Vec<(u64, (u64, u64, Byte))> = self
       .ranges
       .range(range.start..range.end)
       .map(|(&start, &state)| (start, state))
       .collect();
-    for (start, (end, point, stale)) in inside {
-      let (point, stale) = f(point, stale);
-      self.ranges.insert(start, (end, point, stale));
+    for (start, (end, point, byte)) in inside {
+      let (point, byte) = f(point, byte);
+      self.ranges.insert(start, (end, point, byte));
     }
     self.merge_around(range);
     if self.ranges.len() > bound {
@@ -431,12 +477,12 @@ impl FileStates {
 
   /// Splits the range containing `at` so one starts there.
   fn split_at(&mut self, at: u64) {
-    if let Some((&start, &(end, point, stale))) = self.ranges.range(..=at).next_back()
+    if let Some((&start, &(end, point, byte))) = self.ranges.range(..=at).next_back()
       && start < at
       && at < end
     {
-      self.ranges.insert(start, (at, point, stale));
-      self.ranges.insert(at, (end, point, stale));
+      self.ranges.insert(start, (at, point, byte));
+      self.ranges.insert(at, (end, point, byte));
     }
   }
 
@@ -453,15 +499,15 @@ impl FileStates {
       .map(|(&start, _)| start)
       .collect();
     for start in starts {
-      let Some(&(end, point, stale)) = self.ranges.get(&start) else {
+      let Some(&(end, point, byte)) = self.ranges.get(&start) else {
         continue;
       };
-      if let Some(&(next_end, next_point, next_stale)) = self.ranges.get(&end)
+      if let Some(&(next_end, next_point, next_byte)) = self.ranges.get(&end)
         && next_point == point
-        && next_stale == stale
+        && next_byte == byte
       {
         self.ranges.remove(&end);
-        self.ranges.insert(start, (next_end, point, stale));
+        self.ranges.insert(start, (next_end, point, byte));
       }
     }
   }
@@ -475,10 +521,10 @@ impl FileStates {
       .next_back()
       .filter(|(_, (end, _, _))| *end > range.start);
     let inside = self.ranges.range(range.start.saturating_add(1)..range.end);
-    for (&start, &(end, point, stale)) in reaching.into_iter().chain(inside) {
+    for (&start, &(end, point, byte)) in reaching.into_iter().chain(inside) {
       let (start, end) = (start.max(range.start), end.min(range.end));
       if start < end {
-        ranges.insert(start, (end, point, stale));
+        ranges.insert(start, (end, point, byte));
       }
     }
     FileStates {
@@ -488,20 +534,41 @@ impl FileStates {
     }
   }
 
-  /// The stale bytes within `range`, ascending and disjoint.
-  fn stale_within(&self, range: std::ops::Range<u64>) -> Vec<std::ops::Range<u64>> {
-    let mut stale: Vec<std::ops::Range<u64>> = Vec::new();
-    for (&start, &(end, _, is_stale)) in &self.ranges {
+  /// The bytes within `range` whose state `wanted` accepts, ascending and disjoint, touching runs joined.
+  fn bytes_within(
+    &self,
+    range: std::ops::Range<u64>,
+    wanted: impl Fn(Byte) -> bool,
+  ) -> Vec<std::ops::Range<u64>> {
+    let mut found: Vec<std::ops::Range<u64>> = Vec::new();
+    for (&start, &(end, _, byte)) in &self.ranges {
       let (start, end) = (start.max(range.start), end.min(range.end));
-      if !is_stale || start >= end {
+      if !wanted(byte) || start >= end {
         continue;
       }
-      match stale.last_mut() {
+      match found.last_mut() {
         Some(last) if last.end == start => last.end = end,
-        _ => stale.push(start..end),
+        _ => found.push(start..end),
       }
     }
-    stale
+    found
+  }
+
+  /// The stale bytes within `range`, ascending and disjoint; `None` when one of its bytes is unknown, so which are stale
+  /// cannot be told.
+  fn known_stale_within(&self, range: std::ops::Range<u64>) -> Option<Vec<std::ops::Range<u64>>> {
+    if !self
+      .bytes_within(range.clone(), |byte| byte == Byte::Unknown)
+      .is_empty()
+    {
+      return None;
+    }
+    Some(self.bytes_within(range, |byte| byte == Byte::Stale))
+  }
+
+  /// The bytes within `range` that are stale or unknown: those an ambiguous read leaves unknown.
+  fn not_fresh_within(&self, range: std::ops::Range<u64>) -> Vec<std::ops::Range<u64>> {
+    self.bytes_within(range, |byte| byte != Byte::Fresh)
   }
 }
 
@@ -668,37 +735,49 @@ mod tests {
     /// Shape: the point the file's first writable open is at.
     const OPENED_AT: u64 = 3;
 
-    /// One generated event: a fetch at the head, the mount's own record, another path's record (each with its range), or
-    /// the mount consuming the journal through the head; and how far the journal moved before it (records of other
-    /// files).
+    /// One generated event: a fetch at the head, an ambiguous read at the head (A-144), the mount's own record, another
+    /// path's record (each with its range), or the mount consuming the journal through the head; and how far the journal
+    /// moved before it (records of other files).
     #[derive(Clone, Debug)]
     enum Event {
       Fetch(u64, u64),
+      Ambiguous(u64, u64),
       Own(u64, u64),
       Other(u64, u64),
       Consume,
     }
 
     fn event() -> impl Strategy<Value = (Event, u64)> {
-      (0..4u8, 0..80u64, 1..24u64, 0..3u64).prop_map(|(kind, at, len, gap)| {
+      (0..5u8, 0..80u64, 1..24u64, 0..3u64).prop_map(|(kind, at, len, gap)| {
         let event = match kind {
           0 => Event::Fetch(at, at + len),
-          1 => Event::Own(at, at + len),
-          2 => Event::Other(at, at + len),
+          1 => Event::Ambiguous(at, at + len),
+          2 => Event::Own(at, at + len),
+          3 => Event::Other(at, at + len),
           _ => Event::Consume,
         };
         (event, gap)
       })
     }
 
-    /// The model's rule for one byte, as the design states it: what `event` at `at` (the head, for a fetch; the record's
-    /// sequence, otherwise) makes of the byte's (point, stale).
-    fn rule(event: &Event, (point, stale): (u64, bool), at: u64) -> (u64, bool) {
+    /// What the model knows of one byte of the kernel's copy, written apart from the implementation's own type.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Known {
+      Fresh,
+      Stale,
+      Unknown,
+    }
+
+    /// The model's rule for one byte, as the design states it: what `event` at `at` (the head, for a read; the record's
+    /// sequence, otherwise) makes of the byte's (point, state). An ambiguous read is a direct read or a fill: a byte the
+    /// two leave alike (fresh) keeps its state, and any other becomes unknown.
+    fn rule(event: &Event, (point, known): (u64, Known), at: u64) -> (u64, Known) {
       match event {
-        Event::Fetch(..) => (at, false),
-        Event::Own(..) if point < at => (at, false),
-        Event::Other(..) if point < at => (point, true),
-        Event::Own(..) | Event::Other(..) | Event::Consume => (point, stale),
+        Event::Fetch(..) => (at, Known::Fresh),
+        Event::Ambiguous(..) if known != Known::Fresh => (at, Known::Unknown),
+        Event::Own(..) if point < at => (at, Known::Fresh),
+        Event::Other(..) if point < at => (point, Known::Stale),
+        Event::Ambiguous(..) | Event::Own(..) | Event::Other(..) | Event::Consume => (point, known),
       }
     }
 
@@ -708,12 +787,13 @@ mod tests {
         .. ProptestConfig::default()
       }))]
 
-      /// The dirty-page write-back rule's byte states, against a per-byte model of (point, stale) stated as the design's
-      /// rule: a fetch at the head makes its bytes fresh at the head; a record at sequence `s` (the journal moves on by
-      /// one) refreshes the bytes fetched before it when it is the mount's own and leaves them stale when it is another
-      /// path's. The model never raises a point; the states raise them whenever the mount has consumed every record so
-      /// far, which must change no answer. After any history, the stale bytes of any range — with the last few events
-      /// held back as pending and applied to a scratch copy — equal the model's.
+      /// The dirty-page write-back rule's byte states, against a per-byte model of (point, state) stated as the design's
+      /// rule: a fetch at the head makes its bytes fresh at the head; an ambiguous read at the head leaves fresh bytes
+      /// alone and makes the others unknown at the head; a record at sequence `s` (the journal moves on by one) refreshes
+      /// the bytes read before it when it is the mount's own and leaves them stale when it is another path's. The model
+      /// never raises a point; the states raise them whenever the mount has consumed every record so far, which must
+      /// change no answer. After any history, with the last few records held back as pending and applied to a scratch
+      /// copy, a range holding an unknown byte cannot be told, and any other range's stale bytes equal the model's.
       #[test]
       fn stale_bytes_follow_the_rule(
         events in prop::collection::vec(event(), 0..20),
@@ -722,14 +802,17 @@ mod tests {
       ) {
         let mut states = PageStates::default();
         states.opened(INO, OPENED_AT);
-        let mut model = vec![(OPENED_AT, false); usize::try_from(MODEL_BYTES).unwrap()];
+        let mut model = vec![(OPENED_AT, Known::Fresh); usize::try_from(MODEL_BYTES).unwrap()];
         let mut head = OPENED_AT;
         let split = events.len().saturating_sub(held_back);
         let mut pending = Vec::new();
         for (index, (event, gap)) in events.iter().enumerate() {
           head += gap;
           let (from, to) = match event {
-            Event::Fetch(from, to) | Event::Own(from, to) | Event::Other(from, to) => (*from, (*to).min(MODEL_BYTES)),
+            Event::Fetch(from, to)
+            | Event::Ambiguous(from, to)
+            | Event::Own(from, to)
+            | Event::Other(from, to) => (*from, (*to).min(MODEL_BYTES)),
             // Only while nothing is held back: a pending record lies at or below the head and is not consumed yet.
             Event::Consume => {
               if index < split {
@@ -738,7 +821,7 @@ mod tests {
               continue;
             }
           };
-          if !matches!(event, Event::Fetch(..)) {
+          if matches!(event, Event::Own(..) | Event::Other(..)) {
             head += 1;
           }
           for byte in from..to {
@@ -747,6 +830,8 @@ mod tests {
           }
           match event {
             Event::Fetch(..) => states.fetched(INO, from..to, head, usize::MAX),
+            // An ambiguous read is judged with the records held back so far, as the mount judges it.
+            Event::Ambiguous(..) => states.read_ambiguously(INO, from..to, head, &pending, usize::MAX),
             Event::Own(..) | Event::Other(..) if index < split => {
               states.changed(INO, from..to, head, matches!(event, Event::Own(..)), usize::MAX);
             }
@@ -756,10 +841,17 @@ mod tests {
             Event::Consume => {}
           }
         }
-        // A fetch held back behind pending records would be out of order: fetches are applied as they happen.
+        // A read held back behind pending records would be out of order: reads are applied as they happen.
         let (from, len) = query;
         let to = (from + len).min(MODEL_BYTES);
-        let stale = states.stale_after(INO, from..to, 0, &pending).unwrap();
+        let answer = states.stale_after(INO, from..to, 0, &pending);
+        let queried = &model[usize::try_from(from).unwrap()..usize::try_from(to).unwrap()];
+        if queried.iter().any(|(_, known)| *known == Known::Unknown) {
+          prop_assert_eq!(answer, None, "an unknown byte in {}..{}: which are stale cannot be told", from, to);
+          return Ok(());
+        }
+        prop_assert!(answer.is_some(), "no unknown byte in {}..{}: it can be told", from, to);
+        let stale = answer.unwrap();
         let mut got = vec![false; usize::try_from(MODEL_BYTES).unwrap()];
         for range in &stale {
           prop_assert!(range.start >= from && range.end <= to && range.start < range.end, "{:?}", stale);
@@ -769,10 +861,72 @@ mod tests {
         }
         for byte in from..to {
           let index = usize::try_from(byte).unwrap();
-          prop_assert_eq!(got[index], model[index].1, "byte {} in {:?}", byte, stale);
+          prop_assert_eq!(got[index], model[index].1 == Known::Stale, "byte {} in {:?}", byte, stale);
         }
         prop_assert!(stale.windows(2).all(|pair| pair[0].end < pair[1].start), "{:?}", stale);
       }
+    }
+
+    /// A-144, the ambiguous read, case by case. Do: open a file (fresh at 3); another path changes bytes 0..4 at 5; an
+    /// ambiguous read covers 2..8 at head 6. Expect: bytes 0..2 stay known stale and 4..8 stay fresh, but a range over
+    /// 2..4 cannot be told. Then a fetch of 2..4 at 7 makes them known fresh; another ambiguous read of 0..2 at 8 makes
+    /// those unknown, and another path's change of byte 0 at 9 makes it stale, as both readings are, while byte 1 stays
+    /// unknown. Last, an ambiguous read made while another path's change is still pending makes the bytes it covers
+    /// unknown, as the mount judges with the records it has not consumed.
+    #[test]
+    #[allow(clippy::single_range_in_vec_init)] // a list of one stale range, not the numbers inside it
+    fn an_ambiguous_read_makes_stale_bytes_unknown_until_a_fetch_or_a_change() {
+      /// Shape: ranges enough for every split below.
+      const BOUND: usize = 16;
+      let mut states = PageStates::default();
+      states.opened(INO, OPENED_AT);
+      states.changed(INO, 0..4, 5, false, BOUND);
+      states.read_ambiguously(INO, 2..8, 6, &[], BOUND);
+      assert_eq!(
+        states.stale_after(INO, 0..2, 0, &[]),
+        Some(vec![0..2]),
+        "stale bytes the read did not cover stay known stale"
+      );
+      assert_eq!(
+        states.stale_after(INO, 4..8, 0, &[]),
+        Some(vec![]),
+        "fresh bytes the read covered stay fresh"
+      );
+      assert_eq!(
+        states.stale_after(INO, 0..8, 0, &[]),
+        None,
+        "a write-back over the unknown bytes cannot be told"
+      );
+      states.fetched(INO, 2..4, 7, BOUND);
+      assert_eq!(
+        states.stale_after(INO, 0..8, 0, &[]),
+        Some(vec![0..2]),
+        "a fetch makes them known again"
+      );
+      states.read_ambiguously(INO, 0..2, 8, &[], BOUND);
+      states.changed(INO, 0..1, 9, false, BOUND);
+      assert_eq!(
+        states.stale_after(INO, 0..1, 0, &[]),
+        Some(vec![0..1]),
+        "another path's later change makes an unknown byte stale either way"
+      );
+      assert_eq!(
+        states.stale_after(INO, 1..2, 0, &[]),
+        None,
+        "the byte it did not change stays unknown"
+      );
+      let pending = vec![(10..12, 10, false)];
+      states.read_ambiguously(INO, 8..16, 11, &pending, BOUND);
+      assert_eq!(
+        states.stale_after(INO, 8..16, 0, &pending),
+        None,
+        "a pending change counts: the bytes it made stale are unknown after the read"
+      );
+      assert_eq!(
+        states.stale_after(INO, 12..16, 0, &pending),
+        Some(vec![]),
+        "and the bytes it did not touch stay fresh"
+      );
     }
 
     /// An untracked file is judged as fresh at the point the caller gives; a file whose ranges passed the bound is

@@ -8,8 +8,8 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use slates_bridge_core::{
-  Bridge, CacheLifetime, DirEntry, FsStat, Invalidation, InvalidationCursor, NodeAttr, ObjectId,
-  OpContext, RenameFlags, SetAttr,
+  Bridge, CacheLifetime, DataChange, DirEntry, FsStat, Invalidation, InvalidationCursor, NodeAttr,
+  ObjectId, OpContext, RenameFlags, SetAttr,
 };
 use slates_mem::arena::ChunkArena;
 use slates_mem::region::Region;
@@ -333,5 +333,22 @@ impl<B: Bridge> Bridge for FailingGather<B> {
 
   fn seen(&mut self, cx: &OpContext) -> InvalidationCursor {
     self.inner.seen(cx)
+  }
+
+  // The dirty-page write-back rule's inputs (A-140), forwarded like everything but the gather: the trait's defaults
+  // report no change and a journal of no capacity, under which every fetched file is lost at once and every
+  // write-back from a map is refused unknown — the rule switched off. Until 2026-10-22 this wrapper took those
+  // defaults, so no in-process mount test had exercised the rule.
+  fn data_changes(
+    &mut self,
+    cx: &OpContext,
+    since: u64,
+    out: &mut Vec<DataChange>,
+  ) -> Result<bool, VfsError> {
+    self.inner.data_changes(cx, since, out)
+  }
+
+  fn journal_capacity(&mut self, cx: &OpContext) -> usize {
+    self.inner.journal_capacity(cx)
   }
 }

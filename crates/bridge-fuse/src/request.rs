@@ -113,8 +113,9 @@ fn name_of(bytes: &[u8]) -> Result<&str, FuseError> {
   std::str::from_utf8(bytes).map_err(|_| FuseError::NameNotUtf8)
 }
 
-/// A `READ`/`READDIR` body (`struct fuse_read_in`): fh, offset, size, then fields slates does
-/// not use. The fields slates reads are fh, offset, size.
+/// A `READ`/`READDIR` body (`struct fuse_read_in`): fh, offset, size, then the read flags, the lock
+/// owner and, from protocol 7.9, the handle's open flags, then padding. The fields slates reads are
+/// fh, offset, size and the open flags.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ReadIn {
   /// The open file handle.
@@ -123,16 +124,37 @@ pub struct ReadIn {
   pub offset: u64,
   /// The bytes to read.
   pub size: u32,
+  /// The handle's open flags as the kernel holds them now (`file->f_flags`, so an `fcntl` that set
+  /// `O_DIRECT` shows): whether the read may bypass the kernel's page cache (A-144). `None` for a
+  /// body from before protocol 7.9, which has no such field.
+  pub flags: Option<u32>,
 }
 
+/// Format: the bytes of `fuse_read_in` between `size` and the open flags: the read flags (4) and
+/// the lock owner (8).
+const READ_IN_BEFORE_FLAGS: usize = size_of::<u32>() + size_of::<u64>();
+/// Format: the bytes of `fuse_read_in` from just past `size` through the open flags, which a body
+/// from protocol 7.9 on carries.
+const READ_IN_THROUGH_FLAGS: usize = READ_IN_BEFORE_FLAGS + size_of::<u32>();
+
 impl ReadIn {
-  /// Parses a read body; refuses a short one.
+  /// Parses a read body; refuses one too short for its handle, offset and size.
   pub fn parse(opcode: u32, body: &[u8]) -> Result<ReadIn, FuseError> {
     let mut r = Reader::new(body);
+    let fh = r.u64(opcode)?;
+    let offset = r.u64(opcode)?;
+    let size = r.u32(opcode)?;
+    let flags = if r.remaining() >= READ_IN_THROUGH_FLAGS {
+      r.skip(READ_IN_BEFORE_FLAGS, opcode)?;
+      Some(r.u32(opcode)?)
+    } else {
+      None
+    };
     Ok(ReadIn {
-      fh: r.u64(opcode)?,
-      offset: r.u64(opcode)?,
-      size: r.u32(opcode)?,
+      fh,
+      offset,
+      size,
+      flags,
     })
   }
 }

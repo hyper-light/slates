@@ -469,7 +469,7 @@ fn setattr_in_is_read_at_the_headers_offsets() {
 }
 
 /// `fuse_read_in` and `fuse_write_in` (40 bytes each) are read at the header's offsets: fh 0,
-/// offset 8, size 16; a write's data follows the 40-byte struct.
+/// offset 8, size 16, a read's open flags 32 (A-144); a write's data follows the 40-byte struct.
 #[test]
 fn read_in_and_write_in_are_read_at_the_headers_offsets() {
   let mut body = vec![0u8; 40];
@@ -478,8 +478,10 @@ fn read_in_and_write_in_are_read_at_the_headers_offsets() {
   put_u32(&mut body, 16, 512);
   put_u32(&mut body, 20, 0xFFFF_FFFF); // read_flags / write_flags: not read
   put_u64(&mut body, 24, 0xFFFF_FFFF_FFFF_FFFF); // lock_owner: not read
+  put_u32(&mut body, 32, 0x0001_4002); // a read's open flags; a write's are not read
   let r = ReadIn::parse(Opcode::Read.to_wire(), &body).unwrap();
   assert_eq!((r.fh, r.offset, r.size), (7, 4096, 512));
+  assert_eq!(r.flags, Some(0x0001_4002), "the open flags at byte 32");
 
   put_u32(&mut body, 16, 3);
   body.extend_from_slice(b"abc");

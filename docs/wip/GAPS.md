@@ -10703,12 +10703,25 @@ stale page back, and the other write's bytes on it reverted: measured 4,095 of 4
     every round.
 
   Which way to go is Ada's call. Not yet reproduced.
-- **`O_DIRECT` reads** were found by reading Linux 6.12's source on 2026-10-22 and have not been reproduced. A direct
-  READ looks like a cache READ on the wire, but it leaves the cached page in place. Counting it as a fetch can therefore
-  clear a staleness the cached page still holds. The window is between a round's gather and the kernel's handling of
-  that round's invalidation (written off the serving thread). Not counting it is no clean fix either: a fault on a map
-  of an `O_DIRECT` file sends the same READ, so its stores would then be kept back for as long as the file stays open.
-  Present since A-139. Needs a reproduction first.
+- **`O_DIRECT` reads — fixed 2026-10-22 (A-144).** It was found by reading Linux 6.12's source, then reproduced on the
+  box (kernel 7.2.9) by `a_direct_read_does_not_make_a_cached_page_fresh`. A shared map's page is faulted in, another
+  attachment replaces the file while the mount's rounds are held, one `O_DIRECT` read is made, and a store goes into
+  the page the kernel still caches:
+
+  | | bytes kept back | the volume |
+  |---|---|---|
+  | without the direct read | 4,096 | the replacement survives |
+  | with it | 0 | all 4,096 bytes reverted to the stale page, 3 of 3 |
+
+  A direct READ is ambiguous: it may be a fill of the cache (a fault on a map of the `O_DIRECT` handle, a buffered
+  fallback) or not, and the wire cannot say. Such a READ now leaves fresh bytes alone and makes the rest unknown. A
+  write-back over an unknown byte is refused `EIO`, and a later fetch, own write or other path's write settles the
+  byte.
+- **The in-process harness never ran the write-back rule — fixed 2026-10-22 with A-144.** `FailingGather`
+  (`crates/bridge-fuse/tests/common/mod.rs`) did not forward `data_changes` or `journal_capacity`. Those arrived with
+  A-140 with trait defaults: no change, and no capacity. So every fetched file was lost at once, and every map
+  write-back in `coherence_mount` was refused unknown. A sweep of the trait's implementers found only this one;
+  `VolumeBridge` and `ScopedBridge` implement both.
 - **The residual:** a store into bytes another path is changing, made between the page's fetch and the change's
   delivery. That needs AC-3.3, above.
 

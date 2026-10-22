@@ -96,7 +96,8 @@ fn hostile_bodies_are_refused() {
   ));
 }
 
-/// A READ body parses to its handle, offset and size.
+/// A READ body parses to its handle, offset and size. The 24-byte body of a protocol before 7.9
+/// carries no open flags, so whether the read bypasses the page cache is unknown (A-144).
 #[test]
 fn a_read_body_parses() {
   let mut read = vec![0u8; 24];
@@ -104,7 +105,7 @@ fn a_read_body_parses() {
   read[8..16].copy_from_slice(&4096u64.to_le_bytes());
   read[16..20].copy_from_slice(&65536u32.to_le_bytes());
   let r = ReadIn::parse(Opcode::Read.to_wire(), &read).unwrap();
-  assert_eq!((r.fh, r.offset, r.size), (5, 4096, 65536));
+  assert_eq!((r.fh, r.offset, r.size, r.flags), (5, 4096, 65536, None));
 }
 
 /// A WRITE body parses to its handle, offset and data.

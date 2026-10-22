@@ -72,6 +72,11 @@ enum Ask {
   Snapshot,
   /// Refuse the next invalidation gather (the injected collection failure).
   RefuseNextGather,
+  /// Refuse every invalidation gather until [`Ask::ReleaseGathers`]: the mount's rounds stay owed, held back from its
+  /// kernel, which keeps every page it caches meanwhile.
+  HoldGathers,
+  /// Let gathers through again: the owed round is delivered at the next wake.
+  ReleaseGathers,
   /// Report the loop's counters — answered after the step the ask woke, so a report is a barrier:
   /// every ask before it is applied and the round they woke is delivered.
   Report,
@@ -88,6 +93,12 @@ struct Report {
   reads: u64,
   /// Rounds that found the mount behind the journal's retention (A-141).
   overruns: u64,
+  /// `WRITE` requests the kernel sent, write-backs from its page cache included.
+  writes: u64,
+  /// Bytes of cache write-backs kept back as stale (the dirty-page write-back rule, A-140).
+  kept_back: u64,
+  /// Cache write-backs refused because which bytes were stale could not be told.
+  unknown: u64,
 }
 
 fn command_available(name: &str) -> bool {
@@ -188,6 +199,9 @@ fn serve(
   let mut getattrs = 0u64;
   let mut reads = 0u64;
   let mut overruns = 0u64;
+  let mut writes = 0u64;
+  let mut kept_back = 0u64;
+  let mut unknown = 0u64;
   let mut report_pending = false;
   loop {
     let wake = match wait(mounted.channel(), Some(&signal)) {
@@ -282,6 +296,8 @@ fn serve(
           attachments.end(other);
         }
         Ask::RefuseNextGather => bridge.refuse_gathers = 1,
+        Ask::HoldGathers => bridge.refuse_gathers = u32::MAX,
+        Ask::ReleaseGathers => bridge.refuse_gathers = 0,
         Ask::Report => report_pending = true,
       }
     }
@@ -308,10 +324,16 @@ fn serve(
         opcode: Some(Opcode::Read),
         ..
       } => reads += 1,
+      Step::Request {
+        opcode: Some(Opcode::Write),
+        ..
+      } => writes += 1,
       Step::Ended => return Ok(()),
       _ => {}
     }
     overruns += state.take_journal_overruns();
+    kept_back += state.take_writeback_bytes_kept_back();
+    unknown += state.take_writebacks_unknown();
     if std::mem::take(&mut report_pending) {
       reports
         .send(Report {
@@ -319,6 +341,9 @@ fn serve(
           gather_refusals: state.coherence.gather_refusals(),
           reads,
           overruns,
+          writes,
+          kept_back,
+          unknown,
         })
         .unwrap();
     }
@@ -844,4 +869,250 @@ fn a_generated_history_with_overruns_leaves_the_mount_equal_to_the_volume() {
       );
     }
   });
+}
+
+/// Shape: the bytes a direct-read file starts with, the other attachment's replacement, and the store a map makes, all
+/// distinct so each byte names its writer.
+const SEED: u8 = b'A';
+const REPLACED: u8 = b'S';
+const STORED: u8 = b'M';
+/// Shape: where in the page the map stores its byte.
+const STORE_AT: usize = 10;
+
+/// One page of a file in the mount, open for reading and writing and mapped `MAP_SHARED`; unmapped on drop, before the
+/// file closes.
+struct SharedPage {
+  map: *mut u8,
+  page: usize,
+  /// Held so the map's file stays open; it closes after `Drop` unmaps.
+  _file: std::fs::File,
+}
+
+impl SharedPage {
+  /// Opens `path` for reading and writing (the file's first writable open on the mount, which drops its cached pages)
+  /// and maps its first page shared.
+  #[allow(clippy::disallowed_methods)] // the test's own open through the slates mount: RAM, not disk
+  fn open(path: &str) -> SharedPage {
+    use std::os::fd::AsFd;
+    let file = std::fs::OpenOptions::new()
+      .read(true)
+      .write(true)
+      .open(path)
+      .unwrap();
+    let page = rustix::param::page_size();
+    // SAFETY: a fresh shared map of one page of an open file this struct holds, at an address the kernel chooses;
+    // nothing else maps it, and `Drop` unmaps it before the file closes.
+    let map = unsafe {
+      rustix::mm::mmap(
+        std::ptr::null_mut(),
+        page,
+        rustix::mm::ProtFlags::READ | rustix::mm::ProtFlags::WRITE,
+        rustix::mm::MapFlags::SHARED,
+        file.as_fd(),
+        0,
+      )
+    }
+    .unwrap()
+    .cast::<u8>();
+    SharedPage {
+      map,
+      page,
+      _file: file,
+    }
+  }
+
+  /// The byte at `at` as the kernel's page holds it, faulting the page in if it is not cached.
+  fn byte(&self, at: usize) -> u8 {
+    assert!(at < self.page, "a byte within the mapped page");
+    // SAFETY: `at` is within the one live page mapped in `open`; a volatile read, so the fault happens here.
+    unsafe { self.map.add(at).read_volatile() }
+  }
+
+  /// Stores `value` at `at` into the kernel's page, leaving it dirty.
+  fn store(&self, at: usize, value: u8) {
+    assert!(at < self.page, "a byte within the mapped page");
+    // SAFETY: `at` is within the one live, writable page mapped in `open`; volatile, so the store is not elided.
+    unsafe { self.map.add(at).write_volatile(value) }
+  }
+
+  /// `msync`s the page: its dirty bytes are written back before this returns. The write-back rule may refuse them
+  /// (`EIO`), which is the outcome under test, so the result is returned rather than asserted.
+  fn sync(&self) -> rustix::io::Result<()> {
+    // SAFETY: syncs exactly the one live page mapped in `open`.
+    unsafe { rustix::mm::msync(self.map.cast(), self.page, rustix::mm::MsyncFlags::SYNC) }
+  }
+}
+
+impl Drop for SharedPage {
+  fn drop(&mut self) {
+    // SAFETY: unmaps exactly the page mapped in `open`, once; nothing reads it afterwards. The file field closes after.
+    let unmapped = unsafe { rustix::mm::munmap(self.map.cast(), self.page) };
+    // A failed assertion already unwinding through here must not abort the test in a second panic.
+    assert!(
+      unmapped.is_ok() || std::thread::panicking(),
+      "the map is unmapped: {unmapped:?}"
+    );
+  }
+}
+
+/// Writes `bytes` to `path` through the mount, as the mounting user, and opens it to every user (`0o666`): the other
+/// attachment's principal is not its owner, and both parties write it.
+#[allow(clippy::disallowed_methods)] // the test's own writes through the slates mount: RAM, not disk
+fn write_shared_file(path: &str, bytes: &[u8]) {
+  use std::os::unix::fs::PermissionsExt;
+  std::fs::write(path, bytes).unwrap();
+  std::fs::set_permissions(path, std::fs::Permissions::from_mode(SHARED_FILE_MODE)).unwrap();
+}
+
+/// Format: the mode of a file both the mounting user and the other attachment's principal write.
+const SHARED_FILE_MODE: u32 = 0o666;
+
+/// Reads `path`'s first `page` bytes with `O_DIRECT`, into a page-aligned buffer as a direct-I/O user would: the bytes
+/// the server returned, never the kernel's cached page.
+#[allow(clippy::disallowed_methods)] // the test's own open through the slates mount: RAM, not disk
+fn read_directly(path: &str, page: usize) -> Vec<u8> {
+  use std::io::Read;
+  use std::os::unix::fs::OpenOptionsExt;
+  let mut file = std::fs::OpenOptions::new()
+    .read(true)
+    .custom_flags(i32::try_from(rustix::fs::OFlags::DIRECT.bits()).unwrap())
+    .open(path)
+    .unwrap();
+  let mut buffer = vec![0u8; page.checked_mul(2).unwrap()];
+  let skip = buffer.as_ptr().align_offset(page);
+  let aligned = buffer
+    .get_mut(skip..skip.checked_add(page).unwrap())
+    .unwrap();
+  let read = file.read(aligned).unwrap();
+  aligned.get(..read).unwrap().to_vec()
+}
+
+/// A-144 (§4.6 cache posture; the dirty-page write-back rule, A-140;
+/// `docs/bugs/2026-10-22-a-direct-read-made-a-stale-cached-page-fresh.md`). A direct READ is answered from the volume
+/// and leaves the kernel's cached page as it was, so it must not make that page's bytes fresh. Do, for a file mapped
+/// shared through the mount with its page faulted in: hold the mount's invalidation rounds; replace the file through
+/// another attachment; [read the page with `O_DIRECT`]; store a byte through the map into the page the kernel still
+/// caches; release the rounds, so the kernel launders the page, and sync the map. Expect the replacement whole in the
+/// volume: without the direct read the stale page's bytes are kept back and the sync succeeds; with it, which bytes are
+/// stale cannot be told, so the write-back is refused and the sync reports it. Run without and then with the direct
+/// read, so it is the only difference. Before A-144 the direct read made the page fresh and its write-back reverted all
+/// 4,096 bytes of the replacement (3 of 3 on the box, 2026-10-22).
+#[test]
+fn a_direct_read_does_not_make_a_cached_page_fresh() {
+  with_mounted_loop("odirect", |control, mount_point| {
+    let page = rustix::param::page_size();
+    for direct in [false, true] {
+      let name = format!("direct-{direct}");
+      let outcome = store_into_a_stale_cached_page(control, mount_point, &name, page, direct);
+      judge_the_write_back(control, &name, page, direct, &outcome);
+    }
+  });
+}
+
+/// What became of a store into a stale cached page: the loop's reports before the release and after the map's sync,
+/// and the sync's result.
+struct WriteBackOutcome {
+  stored: Report,
+  written: Report,
+  synced: rustix::io::Result<()>,
+}
+
+/// The scenario of [`a_direct_read_does_not_make_a_cached_page_fresh`] for file `name` of one `page`: written and mapped
+/// through the mount, faulted in, replaced through the other attachment while the rounds are held, read once with
+/// `O_DIRECT` when `direct`, stored into through the map, the rounds released and the map synced. Asserts the steps'
+/// own preconditions.
+fn store_into_a_stale_cached_page(
+  control: &Loop,
+  mount_point: &str,
+  name: &str,
+  page: usize,
+  direct: bool,
+) -> WriteBackOutcome {
+  let path = format!("{mount_point}/{name}");
+  write_shared_file(&path, &vec![SEED; page]);
+  control.report();
+  let mapped = SharedPage::open(&path);
+  assert_eq!(mapped.byte(0), SEED, "the page is faulted in, fetched");
+  control.ask(Ask::HoldGathers);
+  control.ask(Ask::Replace {
+    name: name.to_owned(),
+    bytes: vec![REPLACED; page],
+  });
+  let reads_before = control.report().reads;
+  if direct {
+    assert_eq!(
+      read_directly(&path, page),
+      vec![REPLACED; page],
+      "the direct read is answered from the volume"
+    );
+    assert!(
+      control.report().reads > reads_before,
+      "non-vacuous: the direct read reached the mount as a READ"
+    );
+  }
+  assert_eq!(
+    mapped.byte(0),
+    SEED,
+    "non-vacuous: with the rounds held, the kernel still caches the page from before the replacement"
+  );
+  mapped.store(STORE_AT, STORED);
+  let stored = control.report();
+  control.ask(Ask::ReleaseGathers);
+  control.report();
+  let synced = mapped.sync();
+  drop(mapped);
+  WriteBackOutcome {
+    stored,
+    written: control.report(),
+    synced,
+  }
+}
+
+/// The write-back judged as A-144 says: it reached the mount; without the direct read every byte of the stale page was
+/// kept back and the sync succeeded; with it, the write-back was refused as one the states cannot tell and the sync
+/// reports it; either way the volume holds the replacement whole.
+fn judge_the_write_back(
+  control: &Loop,
+  name: &str,
+  page: usize,
+  direct: bool,
+  outcome: &WriteBackOutcome,
+) {
+  let WriteBackOutcome {
+    stored,
+    written,
+    synced,
+  } = outcome;
+  eprintln!(
+    "direct read {direct}: {} WRITE(s) after the store, {} byte(s) kept back, {} refused unknown; the map's sync \
+     {synced:?}",
+    written.writes - stored.writes,
+    written.kept_back - stored.kept_back,
+    written.unknown - stored.unknown
+  );
+  assert!(
+    written.writes > stored.writes,
+    "non-vacuous: the stored page was written back to the mount"
+  );
+  let judged = if direct {
+    written.unknown > stored.unknown && synced.is_err()
+  } else {
+    written.kept_back - stored.kept_back == u64::try_from(page).unwrap() && synced.is_ok()
+  };
+  assert!(
+    judged,
+    "with the direct read {direct}: without it every stale byte is kept back and the sync succeeds; with it the \
+     write-back is refused unknown and the sync says so ({synced:?})"
+  );
+  let held = control
+    .snapshot()
+    .into_iter()
+    .find(|(file, _)| file == name)
+    .map(|(_, bytes)| bytes);
+  assert!(
+    held == Some(vec![REPLACED; page]),
+    "with the direct read {direct}: the replacement survives the stale page's write-back (the map's sync: \
+     {synced:?}); the volume holds {:?}",
+    held.map(|bytes| bytes.iter().filter(|byte| **byte != REPLACED).count())
+  );
 }

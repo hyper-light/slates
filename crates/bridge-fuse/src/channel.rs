@@ -982,7 +982,9 @@ fn dispatch_request(
 ///   `FOPEN_KEEP_CACHE`, so the kernel drops the file's cached pages as it opens it and every page cached after was
 ///   fetched after (or written whole by this mount);
 /// - a `READ` of a file open for writing makes the bytes it returned fresh as of the journal's head, since a read
-///   changes nothing ([`PageStates::fetched`]);
+///   changes nothing ([`PageStates::fetched`]) — unless it was made through a handle that may bypass the page cache
+///   (`O_DIRECT`), which fills nothing the mount can count on: its stale bytes become unknown
+///   ([`PageStates::read_ambiguously`], A-144);
 /// - a `RELEASE` forgets its handle, and with the file's last writable handle its byte states (no write-back of it can
 ///   follow, since a write-back holds its file open until it is answered).
 fn note_opens_and_fetches(
@@ -1023,7 +1025,20 @@ fn note_opens_and_fetches(
       if let (true, Ok(read)) = (answered && state.writable.holds(ino), read) {
         let end = read.offset.saturating_add(u64::from(read.size));
         let bound = bridge.journal_capacity(cx);
-        state.states.fetched(ino, read.offset..end, before, bound);
+        if may_bypass_the_cache(read.flags) {
+          let started_at = state.started_at.unwrap_or(before);
+          match pending_changes(ino, started_at, bridge, cx, state) {
+            Some(pending) => {
+              state
+                .states
+                .read_ambiguously(ino, read.offset..end, before, &pending, bound);
+            }
+            // As a round that finds the journal no longer reaching back loses every tracked file.
+            None => state.states.lose_all(),
+          }
+        } else {
+          state.states.fetched(ino, read.offset..end, before, bound);
+        }
       }
     }
     Some(Opcode::Release) => {
@@ -1170,6 +1185,22 @@ fn stale_in_writeback(
   let end = write
     .offset
     .saturating_add(u64::try_from(write.data.len()).unwrap_or(u64::MAX));
+  let pending = pending_changes(nodeid, started_at, bridge, cx, state)?;
+  state
+    .states
+    .stale_after(nodeid, write.offset..end, started_at, &pending)
+}
+
+/// The journal's changes to node `nodeid` that its byte states do not hold yet, each with whether it is the mount's own:
+/// those after the coherence cursor, or, for a file not tracked, after `started_at`. A cache write-back and an ambiguous
+/// read are judged with the same records. `None` when the journal no longer reaches back that far.
+fn pending_changes(
+  nodeid: u64,
+  started_at: u64,
+  bridge: &mut dyn Bridge,
+  cx: &slates_bridge_core::OpContext,
+  state: &ServeState,
+) -> Option<Vec<(std::ops::Range<u64>, u64, bool)>> {
   let since = if state.states.tracks(nodeid) {
     state
       .coherence
@@ -1182,17 +1213,24 @@ fn stale_in_writeback(
   if !bridge.data_changes(cx, since, &mut changes).ok()? {
     return None;
   }
-  let pending: Vec<(std::ops::Range<u64>, u64, bool)> = changes
-    .into_iter()
-    .filter(|change| change.ino == nodeid)
-    .map(|change| {
-      let own = state.own.took(change.seq);
-      (change.range, change.seq, own)
-    })
-    .collect();
-  state
-    .states
-    .stale_after(nodeid, write.offset..end, started_at, &pending)
+  Some(
+    changes
+      .into_iter()
+      .filter(|change| change.ino == nodeid)
+      .map(|change| {
+        let own = state.own.took(change.seq);
+        (change.range, change.seq, own)
+      })
+      .collect(),
+  )
+}
+
+/// Whether a `READ` made through a handle with these open flags may have bypassed the kernel's page cache (A-144): a
+/// handle opened `O_DIRECT` reads directly, or fills the cache through a map or a buffered fallback, and nothing on the
+/// wire says which; a body from before protocol 7.9 carries no flags, so it cannot say either. `O_DIRECT` is the
+/// running architecture's value, which differs between them.
+fn may_bypass_the_cache(flags: Option<u32>) -> bool {
+  flags.is_none_or(|flags| flags & OFlags::DIRECT.bits() != 0)
 }
 
 /// Serves one admitted request: the owed round first, so the reply never coexists with a stale

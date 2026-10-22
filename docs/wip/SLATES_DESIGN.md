@@ -2275,9 +2275,17 @@ applied except over the bytes another path changed after the kernel's copy of th
 since excepted. That is what one shared page cache would hold. For each byte of a file open for writing, the mount keeps
 the journal point its kernel's copy is as of and whether another path changed it since. These states are fed from the
 records its invalidation rounds already walk, so a copy fetched any time ago is judged. A file's first writable open on a
-mount drops the kernel's cached pages (no `FOPEN_KEEP_CACHE`), so every byte starts fresh. Where the states cannot tell,
-the write-back is refused `EIO` rather than guessed: a file past its bound, or a mount fallen behind the journal's
-retention. Two other ways were measured and rejected:
+mount drops the kernel's cached pages (no `FOPEN_KEEP_CACHE`), so every byte starts fresh. **A READ through a handle
+opened `O_DIRECT` is ambiguous** (A-144). It is a direct read, which leaves the kernel's copy as it was, or a fill of
+that copy (a fault on a map of the handle, a buffered fallback), and FUSE carries nothing that tells them apart. So it
+leaves the bytes that are fresh either way as they are, and makes the others unknown. Counted as a fetch, one direct
+read once marked a stale cached page fresh, and that page's write-back undid another path's write. Where the states
+cannot tell, the write-back is refused `EIO` rather than guessed:
+- a file past its bound;
+- a mount fallen behind the journal's retention;
+- a write-back over an unknown byte.
+
+Two other ways were measured and rejected:
 - Invalidation rounds cannot judge it, because Linux writes a page back from a temporary copy and an invalidation passes
   the page meanwhile (A-139).
 - Walking the journal back from each fetch cannot either, because a long-lived map outlives the journal's retention
@@ -11917,6 +11925,50 @@ Applied in the same change to: §4.6 (the same-kernel direct map paragraph + its
 - Realized: `RequestBody::MapRead`/`ReplyBody::Mapped`; `Control::send_mapping`/`Liveness::recv_mapping`/`ClientEnd::recv_mapping`; `Volume::dax_map_read` + `Store::dax_backing` reused; `merge_service::map_read`/`try_local_map`; `Client::map_read` → `MappedRead`. Proven end to end on x86_64 Linux (`a_same_kernel_client_maps_a_file_with_no_copy`).
 - Fixes a latent arena bug the first real descriptor map surfaced: `ChunkArena::block_backing` returned a region-relative offset against the whole-object descriptor, which would have mis-mapped the guest DAX window too; `ExclusiveObject`/`Region`/`block_backing` now return the descriptor-absolute offset (`base + extent.offset()`).
 - Does not change: the guest DAX gate's own contract (still unadvertised, Ada-gated); the copy transport (the universal base); the single-binary model (no VMM embedded). Owed: the cross-shard owner→home descriptor hand-off; an explicit release on the client's drop; the macOS control socket (stubs refuse → copy).
+
+### A-144 — A READ through an `O_DIRECT` handle is ambiguous, and a write-back over what it left unknown is refused (accepted 2026-10-22)
+Applied in the same change to:
+- §4.6 (the cache posture's write-back rule);
+- `crates/bridge-fuse/src/request.rs` (`ReadIn::flags`, the handle's open flags from `fuse_read_in`);
+- `crates/bridge-fuse/src/coherence.rs`:
+  - the byte state is three-way (`Byte`: fresh, stale, unknown);
+  - `PageStates::read_ambiguously`;
+  - `stale_after` answers `None` over an unknown byte;
+  - the oracle's model and a case-by-case test;
+- `crates/bridge-fuse/src/channel.rs` (the READ arm, `may_bypass_the_cache`, and `pending_changes`, shared with the
+  write-back judgment);
+- the tests:
+  - `crates/bridge-fuse/tests/coherence_mount.rs`: `a_direct_read_does_not_make_a_cached_page_fresh`, and the
+    harness asks that hold the mount's rounds;
+  - `crates/bridge-fuse/tests/common/mod.rs`: `FailingGather` forwards the rule's inputs;
+  - the ABI and codec vectors;
+- GAPS ("`O_DIRECT` reads");
+- `docs/bugs/2026-10-22-a-direct-read-made-a-stale-cached-page-fresh.md`.
+
+- **What it answers.** A-140 counted every READ of a file open for writing as a fetch, making its bytes fresh at the
+  head. A direct READ is answered from the volume and leaves the kernel's cached page as it was. One direct read of a
+  page another path had just changed therefore marked the stale cached copy fresh. A store into that copy was then
+  written back, and the write-back was applied whole, reverting all 4,096 bytes of the other path's acknowledged write.
+  Reproduced on the box (kernel 7.2.9), 3 of 3, against the same steps without the direct read, which kept the stale
+  bytes back.
+- **The rule.** A READ through a handle whose open flags carry `O_DIRECT` (or a body too old to carry flags) is
+  **ambiguous**: it is a direct read or a fill of the kernel's copy (a fault on a map of the handle, a buffered
+  fallback), and nothing on the wire tells which.
+  - Bytes fresh after the records not yet consumed are fresh either way, and stay so.
+  - Every other byte it covers becomes **unknown** as of the read's head.
+  - A fetch, or the mount's own later record, makes an unknown byte fresh. Another path's later record makes it stale,
+    as both readings are then.
+  - A write-back over an unknown byte is refused `EIO`, as one the states cannot tell. It is loud: neither reading
+    may be guessed.
+
+  "Always a fetch" silently undid another path's write. "Never a fetch" would silently keep back a process's real
+  store into a page it had just filled.
+- **Evidence.**
+  - The mount test is red before the change: all 4,096 bytes reverted, 3 of 3. After it, the write-back is refused and
+    the replacement survives.
+  - The oracle's three-way model, with generated ambiguous reads, fails when the read is counted as a fetch.
+  - On the way, the in-process harness was found never to have run A-140: its wrapping bridge did not forward
+    `data_changes` or `journal_capacity`, so every map write-back there was refused unknown.
 
 ### A-143 — A client judges the daemon that answered its claim (accepted 2026-10-22)
 Applied in the same change to:
