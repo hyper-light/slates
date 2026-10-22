@@ -1012,8 +1012,24 @@ The evidence:
 The fix runs the spawns on a worker thread (`asyncio.to_thread`). It also corrects the failure message's reading of
 "no CPU, thread free", which had blamed the runner.
 
-**Still a hypothesis:** that the runner's first exec is slow because its disk is cold. Each run now prints the
-slowest exec wait per command, so the lane's log will say.
+**Not supported by CI's own figures.** The hypothesis was that the runner's first exec is slow because its disk is
+cold. The first three runs after the fix (`dd35c5f1`, `75f39162`, `65d67f7c`, each 19 of 19 jobs green) printed:
+
+| lane | slowest exec wait |
+|---|---|
+| ubuntu | `pgrep` 1.0–1.9 ms, `ps` 1.0–2.4 ms |
+| macOS | 10–34 ms |
+
+So in those runs no cold disk slowed the first exec. With failures at about one run in five, three fast runs are no
+refutation either: three fast runs would come about half the time anyway (0.8³ ≈ 0.51).
+
+What made the failing runs' spawns slow is therefore not established. What stands, by measurement:
+- the harness held the loop for every spawn;
+- a slow spawn reproduces the failure field for field;
+- the fix takes the harness out of the measurement, however slow a spawn is.
+
+If a held loop recurs with the spawns off the loop, its cause is elsewhere. The test then names the phase, the CPU and
+the sibling thread, and the printed exec waits rule the harness in or out.
 
 **Sibling, closed 2026-10-22: the Node SDK's async test had the same defect.** `runAsync` in
 `crates/sdk-node/tests/sdk_async.test.mjs` used `child_process.spawn`, which also returns only after the child's

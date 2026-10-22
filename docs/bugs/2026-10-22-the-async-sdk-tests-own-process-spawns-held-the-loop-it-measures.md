@@ -1,8 +1,9 @@
 # The async SDK test's own process spawns held the loop it measures
 
 **Status:** fixed 2026-10-22 (approved by Ada in plan mode). The mechanism is confirmed by measurement and by a
-red-check. One thing is still a hypothesis: that the runner's first exec of these binaries is slow because its disk
-is cold. The fix makes every CI run print that figure.
+red-check. Why the failing runs' spawns were slow is not established. The first guess was a cold first exec, but the
+first three runs after the fix printed exec waits of 1–2 ms on ubuntu, so the guess is not supported (see "What it was
+not").
 **Severity:** a test defect, not a product defect.
 `test_every_async_call_ends_across_restart_silence_cancellation_and_death` failed on the ubuntu lane, each time
 charging the SDK with a hold the harness itself made. Its failure message then pointed the reader at the runner. For
@@ -107,8 +108,14 @@ show that thread free.
 The 2026-10-21 record measured phase (1), driven directly, at 5 ms of lateness (its hypothesis 2). That is this
 spawn cost on a warm machine.
 
-**Still a hypothesis:** that the runner's first exec of `pgrep` and of `ps` takes 100–180 ms because its disk is
-cold. The fix prints each command's slowest exec wait at the end of every run, so the lane's next log says.
+**Not supported, once CI printed it.** The hypothesis was that the runner's first exec of `pgrep` and of `ps` takes
+100–180 ms because its disk is cold. The first three runs after the fix printed slowest exec waits of 1–2 ms on
+ubuntu (10–34 ms on macOS). No cold disk slowed the first exec in those runs. At a failure rate of about one run in
+five, three fast runs would still come about half the time, so this is no refutation either.
+
+What made the failing runs' spawns slow stays unknown. What is established is the mechanism: every spawn held the
+loop, and a slow one reproduces the failure exactly. If a held loop recurs now that the spawns run off the loop, the
+cause lies elsewhere.
 
 ## Exact edits
 
