@@ -4765,7 +4765,21 @@ at 5 failures in 100, with the daemon reading state `R` in the instant after the
 existing `_wait_for` deadline. No product change: a running daemon answering a call is correct.
 (`docs/bugs/2026-10-21-a-signalled-daemon-had-not-stopped-and-answered-the-call.md`.)
 
-### 2026-10-04: a strict volume's first arena lock on macOS is one unsliced step (owed)
+### 2026-10-04: a strict volume's first arena lock on macOS is one unsliced step (closed 2026-10-06; marked 2026-10-22)
+
+**Closed by the second remedy below, built two days later and left unmarked here until 2026-10-22.** Since `6b9ce5c7`
+the arena locks a strict volume's own blocks as it allocates them (`ChunkArena::lock_extent`, one `mlock` a block),
+never its region (see "2026-10-06: a strict volume locks only its own content" and
+`docs/bugs/2026-10-06-a-locked-volume-wired-its-shards-whole-arena.md`). So no step wires the arena whole:
+- a 4 MiB strict create had wired the shard's 16 GiB arena (+16,434 MiB, a 2 s stall); since then it wires nothing
+  until content is written;
+- a 1 MiB file locks exactly 1 MiB.
+
+Held by `the_arena_locks_the_blocks_asked_never_the_region_or_their_neighbours` (`crates/mem/tests/capacity.rs`) and
+by the CLI's strict-volume test, which reads the kernel's `VmLck`. The only whole-mapping lock left in the source is the
+machine probe's single page; `ClientRegion::lock` (`crates/ipc/src/region.rs`) has no caller (checked 2026-10-22).
+
+The original entry:
 
 Measured with a scratch probe on an Apple M5 Max: `mlock` wires 4 GiB in 143–144 ms, about 36 ms a GiB, in one call
 on the shard that admits the first strict volume. Other threads' mapping calls are unaffected (worst 24–30 µs), so
