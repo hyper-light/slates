@@ -440,19 +440,25 @@ impl Bridge for ScopedBridge<'_> {
     self.inner.cache_lifetime(object, cx)
   }
 
-  fn changed_since(
+  fn data_changes(
     &mut self,
     cx: &OpContext,
     since: u64,
-    ino: u64,
-    own: &[std::ops::Range<u64>],
-  ) -> Result<crate::Changed, VfsError> {
-    // The kernel of a scoped mount only ever learned in-scope inodes, but the scope invariant is held here as
-    // everywhere: an inode outside it is answered as nothing changed, revealing nothing about it.
-    if !self.inner.within(ObjectId::new(ino, 0), self.scope, cx)? {
-      return Ok(crate::Changed::Known(Vec::new()));
+    out: &mut Vec<crate::DataChange>,
+  ) -> Result<bool, VfsError> {
+    // The inner bridge reports the whole volume's changes; the scope invariant holds here as for invalidations — keep
+    // only the files the scope admits, by the same `within` climb every other verb uses.
+    let start = out.len();
+    let complete = self.inner.data_changes(cx, since, out)?;
+    for change in out.split_off(start) {
+      if self
+        .inner
+        .within(ObjectId::new(change.ino, 0), self.scope, cx)?
+      {
+        out.push(change);
+      }
     }
-    self.inner.changed_since(cx, since, ino, own)
+    Ok(complete)
   }
 
   fn journal_capacity(&mut self, cx: &OpContext) -> usize {

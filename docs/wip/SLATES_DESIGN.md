@@ -2269,13 +2269,20 @@ the mount happened to get a request — indefinitely for a shared map or DAX thr
 and is *after* the writer is answered: a shared map read the new bytes 52–193 µs after the reply, median 82 µs. AC-3.3's
 "invalidates before it is acknowledged" therefore does not hold for a change through another path; which writers can
 be made to wait for the mount, and which cannot without a deadlock, is open in the ledger. **A page the kernel writes
-back from its cache is judged by when it was fetched** (A-139): a `WRITE` carrying `FUSE_WRITE_CACHE` is applied
-except over the bytes another path changed after the daemon served that page's fetch, the mount's own writes since
-excepted. That is what one shared page cache would hold. A file's first writable open on a mount drops the kernel's
-cached pages (no `FOPEN_KEEP_CACHE`), so every page has a known fetch. Where the journal no longer holds every change
-since a page's fetch, the write-back is refused `EIO` rather than guessed. Invalidation rounds cannot judge it, because
-Linux writes a page back from a temporary copy and an invalidation passes the page meanwhile (measured; the
-amendment). §4.15 supplies the source
+back from its cache is applied only where it is not stale** (A-139, A-140). A `WRITE` carrying `FUSE_WRITE_CACHE` is
+applied except over the bytes another path changed after the kernel's copy of them was fetched, the mount's own writes
+since excepted. That is what one shared page cache would hold. For each byte of a file open for writing, the mount keeps
+the journal point its kernel's copy is as of and whether another path changed it since. These states are fed from the
+records its invalidation rounds already walk, so a copy fetched any time ago is judged. A file's first writable open on a
+mount drops the kernel's cached pages (no `FOPEN_KEEP_CACHE`), so every byte starts fresh. Where the states cannot tell,
+the write-back is refused `EIO` rather than guessed: a file past its bound, or a mount fallen behind the journal's
+retention. Two other ways were measured and rejected:
+- Invalidation rounds cannot judge it, because Linux writes a page back from a temporary copy and an invalidation passes
+  the page meanwhile (A-139).
+- Walking the journal back from each fetch cannot either, because a long-lived map outlives the journal's retention
+  (A-140).
+
+§4.15 supplies the source
 validation rules; finite stale-data TTLs do not silently become exact live-source semantics. The
 launcher (`slates exec`) implements the chosen-path form with `CLONE_NEWUSER|CLONE_NEWNS`,
 recursive-private root, and a bind mount; on AppArmor-restricted hosts it reports the exact
@@ -11901,7 +11908,51 @@ Applied in the same change to: §4.6 (the same-kernel direct map paragraph + its
 - Fixes a latent arena bug the first real descriptor map surfaced: `ChunkArena::block_backing` returned a region-relative offset against the whole-object descriptor, which would have mis-mapped the guest DAX window too; `ExclusiveObject`/`Region`/`block_backing` now return the descriptor-absolute offset (`base + extent.offset()`).
 - Does not change: the guest DAX gate's own contract (still unadvertised, Ada-gated); the copy transport (the universal base); the single-binary model (no VMM embedded). Owed: the cross-shard owner→home descriptor hand-off; an explicit release on the client's drop; the macOS control socket (stubs refuse → copy).
 
+### A-140 — A cache write-back is judged by byte states the mount keeps as it consumes the journal (accepted 2026-10-22)
+Applied in the same change to: §4.6 (cache posture); A-139 (its basis superseded); `crates/bridge-core`
+(`changed.rs` `DataChange`/`data_change`; `Bridge::data_changes` replaces `Bridge::changed_since`; `volume_bridge.rs`,
+`scoped.rs`; `tests/data_changes.rs` replaces `tests/changed_since.rs`); `crates/bridge-fuse` (`coherence.rs`
+`PageStates` replaces `FetchPoints`, `OwnRecords::took`; `channel.rs`: the states fed at each round's gather, at the
+mount's own requests and at reads, and judged at write-back); `crates/server/src/fuse.rs` (the two counters' meaning);
+`crates/cli/tests/cli.rs` (two tests); GAPS; the bug record; `docs/wip/virtiofs.md` §8 item 7.
+- **Changes §4.6 and A-139's basis.** For each file open for writing on a mount, the mount keeps, for every byte, the
+  journal point its kernel's copy is as of and whether another path changed it since. A fetch makes its bytes fresh at
+  the head. The mount's own record refreshes the bytes fetched before it, and another path's record marks them stale.
+  The states are fed from the records the mount's invalidation rounds already walk, so no record older than the
+  mount's cursor is ever needed. Once every record through the cursor is consumed, the points at or below it can no
+  longer be told apart by any record to come; they are raised to it, which merges the ranges they split. A write-back
+  is judged by the states within it, plus the few records after the cursor applied to a scratch copy. A file whose
+  states would need more ranges than the journal's capacity is lost, and so is every file when the mount falls behind
+  the journal's retention. A lost file's write-backs are refused `EIO`, counted, until its last writable release.
+- **Why A-139's walk was replaced (measured-and-rejected).** A-139 walked the journal back from each page's fetch
+  point. The journal keeps a 10‰ share of the quota, about 850 records for an 8 MiB volume, and a long-lived map has
+  an old fetch point. That is exactly what DAX keeps. `a_long_lived_maps_write_back_survives_unrelated_activity_past_the_journal`
+  (a store, 2,000 SDK writes to another file, then `msync`) failed 2 runs of 3 on A-139, `msync` answering `EIO`.
+- **Why the raise.** Every fetch is stamped with the head at that moment, so a map faulted in a page at a time while
+  the volume is busy would keep one range per page. The bound on ranges would then refuse it, which is the DAX case
+  again. The raise is exact: a record still to come is later than the cursor, so it treats every point at or below
+  the cursor alike.
+- **Why a fetch and an own write may reset bytes, and nothing else.** Linux 6.12 keeps each write-back in the inode's
+  in-flight tree until the daemon answers it (`fs/fuse/file.c:2124`, removed at `:1931`). A cache read (`:872`,
+  readahead page by page at `:1020`) and a write (`:1141`) wait on that tree before they are sent, so no older copy of
+  their pages can arrive after them. The end of an invalidation round resets nothing: a write-back copied out before
+  it can still be in flight (A-139's evidence).
+- **Proven.** See the bug record's verification.
+- **What it does not change.** The write-back's routing, the masked apply and the write log's applied parts, the first
+  writable open's cache drop, the residual race (AC-3.3), and every other transport.
+- **Owed, stated in the ledger.**
+  - A mount restored across a daemon restart has files whose opens predate the daemon. They have no states and are
+    judged from the mount's start against every record since, as under A-139, so a long-lived one is refused past
+    the journal's retention.
+  - `O_DIRECT` reads were found by reading the source on 2026-10-22, not reproduced. On the wire a direct READ looks
+    like a cache READ, but it leaves the cached page in place. Counting it as a fetch can therefore clear a staleness
+    that page still holds, in the window before the round's invalidation reaches the kernel. This has been present
+    since A-139.
+
 ### A-139 — A cache write-back is applied only where it is not stale, judged by its page's fetch (accepted 2026-10-21)
+> Basis superseded 2026-10-22 by A-140: the walk back from each page's fetch point below needed records the journal no
+> longer held for a long-lived map (2 runs of 3 refused `EIO`, measured). The rule itself and its evidence stand.
+
 Applied in the same change to: §4.6 (cache posture); `crates/bridge-core` (`changed.rs`, `Bridge::changed_since`,
 `Bridge::journal_capacity`); `crates/vfs/src/journal.rs` (`OpLog::oldest_seq`, `OpLog::capacity`); `crates/bridge-fuse`
 (`coherence.rs` `OwnRecords`/`WritableOpens`/`FetchPoints`, `channel.rs`, `bridge.rs`, `request.rs`, `abi.rs`);

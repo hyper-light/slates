@@ -10492,28 +10492,54 @@ one is shown. If a replaced path is the cause, the hardening would be for the an
 (`/proc/self/exe` on Linux) rather than a path, which also pins every restart to the anchor's own version
 (`docs/bugs/2026-10-21-the-cli-tests-start-wait-spent-its-attempts-on-the-anchors-boot.md`).
 
-### 2026-10-21: a dirty shared-map page is written back over a later write through another path — fixed on Linux (A-139); macOS open
+### 2026-10-21: a dirty shared-map page is written back over a later write through another path — fixed on Linux (A-139, A-140); macOS open
 
 Found by adversarial testing of the mount route. A store through a mount's writable `MAP_SHARED` map left its page
 dirty in the kernel. A later write through another path was applied and acknowledged. Then the kernel wrote its whole
 stale page back, and the other write's bytes on it reverted: measured 4,095 of 4,096 on Linux FUSE and 16,383 of
 16,384 on macOS NFS v3. DAX through a mount makes it common, since a guest's DAX stores are dirty host pages.
 
-**Fixed on Linux (A-139).** A cache write-back (`FUSE_WRITE_CACHE`) is applied except over the bytes another path
-changed after the daemon served that page's fetch, the mount's own writes since excepted. A file's first writable open
-drops the kernel's cache so every page has a known fetch. Where the journal cannot tell, the write-back is refused
-`EIO`. A first version judged write-backs by completed invalidation rounds and still failed 9 of 10 runs, because Linux
-6.12 writes back from a temporary copy that outlives the round. It is kept on record in the bug as
-measured-and-rejected.
+**Fixed on Linux (A-139; basis revised by A-140, 2026-10-22).**
+- **The rule.** A cache write-back (`FUSE_WRITE_CACHE`) is applied except over the bytes another path changed after the
+  kernel's copy of them was fetched, the mount's own writes since excepted.
+- **How it is judged.** For each file open for writing, the mount keeps, for every byte, the journal point its kernel's
+  copy is as of and whether another path changed it since. The states are fed from the records its invalidation rounds
+  already walk, and the points at or below the cursor are raised as it is consumed. A file's first writable open drops
+  the kernel's cache, so every byte starts fresh. Where the states cannot tell, the write-back is refused `EIO`.
+- **Two versions were measured and rejected,** both kept on record in the bug:
+  - judged by completed invalidation rounds: failed 9 of 10 runs, because Linux 6.12 writes back from a temporary copy
+    that outlives the round;
+  - judged by walking the journal back from each page's fetch: failed 2 of 3 runs, because a long-lived map outlived
+    the journal's retention and its write-backs were refused `EIO`.
 
 **Still open:**
 - **macOS:** NFS v3 has no write-back mark and no callback. The choice is NFSv4 with delegations (the Mac client is
   v4.0, which D-2 rejects) or recording such sharing as unsupported over v3. Ada's decision.
 - **The direct virtio-fs route** shares `serve_write`, and a guest's page cache gets no invalidation, so its stale
-  write-backs are not judged. Its fetch points would come from the guest's READs.
+  write-backs are not judged. Its byte states would come from the guest's READs.
 - **The invalidation feed's eviction gap:** a mount whose cursor falls behind the journal's retention silently misses
-  invalidations (`OpLog::since` starts at the oldest retained record). The write-back rule answers `Unknown` there; the
-  feed does not yet.
+  invalidations (`OpLog::since` starts at the oldest retained record). The write-back rule loses every tracked file
+  there and refuses its write-backs `EIO`; the feed does not yet notice. Both rest on the journal's budget, below.
+- **The journal's budget is not the design's formula, and its ratification is not recorded.** §4.5's derived constants say
+  "journal budget = mutation rate × max subscriber lag × record size"; the code takes a fixed 10‰ of the quota
+  (`JOURNAL_SHARE_PERMILLE`, `crates/server/src/verbs.rs`). Its doc and its `derived!` anchor both cite a ratification
+  in §5 of this ledger that §5 does not contain. Found 2026-10-22 while sizing the write-back rule's bound on it (about
+  850 records, and so 850 ranges a file, for an 8 MiB volume).
+- **A restored mount's files.** A mount taken over across a daemon restart (A-61) has files whose writable opens predate
+  the daemon. They have no byte states, so their write-backs are judged from the mount's start against every record
+  since, and a long-lived one is refused `EIO` past the journal's retention.
+- **A takeover sends the kernel no invalidation** (found reading `crates/server/src/fuse.rs` 2026-10-22, not
+  reproduced). The coherence cursor is process-local, and a restored mount's first round starts at the new daemon's
+  head. A change the dead daemon had not yet delivered is therefore never invalidated: its kernel keeps that name,
+  attribute or page, whose lifetimes are unbounded under the `Invalidated` posture. Delivery takes about 82 µs after
+  the writer's reply (measured, above), so the window is a crash inside it. The same gap hides such a change from the
+  write-back rule, above.
+- **`O_DIRECT` reads** were found by reading Linux 6.12's source on 2026-10-22 and have not been reproduced. A direct
+  READ looks like a cache READ on the wire, but it leaves the cached page in place. Counting it as a fetch can therefore
+  clear a staleness the cached page still holds. The window is between a round's gather and the kernel's handling of
+  that round's invalidation (written off the serving thread). Not counting it is no clean fix either: a fault on a map
+  of an `O_DIRECT` file sends the same READ, so its stores would then be kept back for as long as the file stays open.
+  Present since A-139. Needs a reproduction first.
 - **The residual:** a store into bytes another path is changing, made between the page's fetch and the change's
   delivery. That needs AC-3.3, above.
 

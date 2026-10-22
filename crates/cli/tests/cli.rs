@@ -5956,6 +5956,110 @@ fn a_dirty_page_past_a_truncation_never_grows_the_file_back() {
   );
 }
 
+/// Shape: unrelated writes the long-lived map test makes — each SDK write journals at least two records, so this is
+/// well past the journal a test volume keeps (its quota × 10‰ over a record's size, some 850 records for 8 MiB).
+#[cfg(target_os = "linux")]
+const UNRELATED_WRITES: u32 = 2000;
+
+/// The dirty-page write-back rule over a long-lived map, as DAX keeps one. A page fetched long ago must still be
+/// judged: unrelated activity on the volume, enough to roll the journal past the page's fetch, must not make its
+/// write-back unanswerable. Do: store a byte through the map and leave it unsynced; write another file through the SDK
+/// [`UNRELATED_WRITES`] times; sync the map. Expect the sync to succeed and slates to hold the store, the rest of the page
+/// as it was. Linux only, as above.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_long_lived_maps_write_back_survives_unrelated_activity_past_the_journal() {
+  if !live_mount_runs() {
+    return;
+  }
+  let mut fixture = MappedThroughAMount::with_pages("maplong", b'A', 1);
+  let length = fixture.length;
+  fixture.view()[10] = b'M';
+  for round in 0..UNRELATED_WRITES {
+    let bytes = round.to_le_bytes();
+    let wrote = fixture.writer.fs_write(
+      (fixture.volume, fixture.attachment),
+      "other.bin",
+      &bytes,
+      FILE_MODE,
+    );
+    assert!(wrote.is_ok(), "unrelated write {round}: {wrote:?}");
+  }
+  fixture.sync_map();
+  let mut expected = vec![b'A'; length];
+  expected[10] = b'M';
+  assert!(
+    fixture.volume_bytes() == expected,
+    "the store survived unrelated activity past the journal's retention"
+  );
+}
+
+/// Shape: the quota `MappedThroughAMount` gives its volume (`--bounded 8MiB`).
+#[cfg(target_os = "linux")]
+const MAP_VOLUME_QUOTA: usize = 8 << 20;
+/// Shape: the most records that volume's journal holds — the daemon's 10‰ share of the quota (`JOURNAL_SHARE_PERMILLE`
+/// in `slates-server`) over a record's fixed size, which is also the bound on a file's byte-state ranges.
+#[cfg(target_os = "linux")]
+const MAP_JOURNAL_RECORDS: usize =
+  MAP_VOLUME_QUOTA / 100 / std::mem::size_of::<slates_vfs::journal::OpRecord>();
+/// Shape: the pages the page-at-a-time test fetches, a quarter more than the journal holds records, so one range per
+/// fetch would pass the bound.
+#[cfg(target_os = "linux")]
+const FETCHED_PAGES: usize = MAP_JOURNAL_RECORDS + MAP_JOURNAL_RECORDS / 4;
+
+/// The dirty-page write-back rule over a map its kernel fetched a page at a time while the volume was busy, as a guest's
+/// DAX window is faulted in (§4.6; the bug record above). Each fetch is at a journal head of its own, so the mount must
+/// raise the points it has consumed past, or the file's states keep one range per page and are lost past the bound.
+/// Do: map a [`FETCHED_PAGES`]-page file; tell its kernel to read it a page at a time (`POSIX_FADV_RANDOM`, which
+/// forgoes readahead); read every page through the mount, writing another file through the SDK between reads; store a
+/// byte in a middle page and in the last through the map; sync. Expect the sync to succeed and slates to hold both
+/// stores, every other byte as it was. Linux only, as above.
+#[cfg(target_os = "linux")]
+#[test]
+#[allow(clippy::disallowed_methods)] // the test's own reads through the slates mount: RAM, not disk
+fn a_map_fetched_a_page_at_a_time_under_activity_keeps_its_write_backs() {
+  use std::os::unix::fs::FileExt;
+  if !live_mount_runs() {
+    return;
+  }
+  let page = rustix::param::page_size();
+  if FETCHED_PAGES.saturating_mul(page) > MAP_VOLUME_QUOTA * 3 / 4 {
+    eprintln!(
+      "SKIP a_map_fetched_a_page_at_a_time: {FETCHED_PAGES} pages of {page} bytes leave the {MAP_VOLUME_QUOTA}-byte quota no room"
+    );
+    return;
+  }
+  let mut fixture = MappedThroughAMount::with_pages("mapfetched", b'A', FETCHED_PAGES);
+  let length = fixture.length;
+  let fadvised = rustix::fs::fadvise(&fixture.file, 0, None, rustix::fs::Advice::Random);
+  assert!(fadvised.is_ok(), "page-at-a-time reads: {fadvised:?}");
+  let mut bytes = vec![0u8; page];
+  for index in 0..FETCHED_PAGES {
+    let at = u64::try_from(index * page).unwrap();
+    let read = fixture.file.read_exact_at(&mut bytes, at);
+    assert!(read.is_ok(), "page {index} through the mount: {read:?}");
+    let wrote = fixture.writer.fs_write(
+      (fixture.volume, fixture.attachment),
+      "other.bin",
+      &index.to_le_bytes(),
+      FILE_MODE,
+    );
+    assert!(wrote.is_ok(), "unrelated write {index}: {wrote:?}");
+  }
+  let middle = FETCHED_PAGES / 2 * page + 10;
+  let last = length - page + 10;
+  fixture.view()[middle] = b'M';
+  fixture.view()[last] = b'L';
+  fixture.sync_map();
+  let mut expected = vec![b'A'; length];
+  expected[middle] = b'M';
+  expected[last] = b'L';
+  assert!(
+    fixture.volume_bytes() == expected,
+    "both stores reached slates after {FETCHED_PAGES} fetches at heads of their own"
+  );
+}
+
 /// §4.6 cache posture, chaos over the dirty-page write-back rule: the three-writer history with the map's stores left
 /// unsynced for generated stretches, so dirty pages meet the other writers' changes — and Linux's write-back from a
 /// temporary copy meets their invalidations — at every interleaving the generator reaches. Do: run

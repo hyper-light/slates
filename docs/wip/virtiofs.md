@@ -276,9 +276,13 @@ box shared with two other builds — timings are not benchmarks)
    `msync`s each map write before the next writer acts. Without the sync it first failed on both platforms: a store
    left dirty in a mount's map, which is what a guest's DAX stores are on the host, was written back over a later write
    through another path, and the other write's bytes on that page reverted, including bytes the map never touched.
-   **Fixed on Linux (A-139):** a cache write-back is applied except over bytes another path changed after the page was
-   fetched, and the history with the map's stores left unsynced for generated stretches now agrees at every sync point
-   (`unsynced_map_stores_a_second_mount_and_the_sdk_agree_at_every_sync_point`). **macOS stays open:** NFS v3 has no
+   **Fixed on Linux (A-139, A-140):** a cache write-back is applied except over bytes another path changed after the
+   kernel's copy of them was fetched. The history with the map's stores left unsynced for generated stretches now agrees
+   at every sync point (`unsynced_map_stores_a_second_mount_and_the_sdk_agree_at_every_sync_point`). A long-lived map
+   is judged too, which is what DAX keeps. The mount keeps each byte's state as it consumes the journal, so a map whose
+   store outlived 2,000 unrelated writes, or one faulted in a page at a time past the journal's capacity, still syncs
+   (`a_long_lived_maps_write_back_survives_unrelated_activity_past_the_journal`,
+   `a_map_fetched_a_page_at_a_time_under_activity_keeps_its_write_backs`). **macOS stays open:** NFS v3 has no
    write-back mark and no callback, so the server cannot tell a stale page from a new write. That is Ada's call
    (`docs/bugs/2026-10-21-a-dirty-shared-map-page-overwrites-a-later-write-through-another-path.md`). **On macOS it does not and cannot, over NFS v3:** the client cannot be
    told of a change, and a memory-only reader refreshes only when something makes the client revalidate (seen both

@@ -103,14 +103,15 @@ const RESENT: &str = "fuse.resent";
 /// reading; any movement means this mount's `Invalidated` posture is not being honoured by the kernel it is
 /// talking to (`docs/bugs/2026-10-19-linux-6-19-refuses-the-entry-invalidation-slates-swallows.md`).
 const ENTRY_INVALIDATION_REFUSED: &str = "fuse.entry_invalidation_refused";
-/// Format: bytes of cache write-backs kept back because another path changed them after the kernel last confirmed its
-/// cache — each a byte of a stale dirty page that would have undone a later write
+/// Format: bytes of cache write-backs kept back because another path changed them after the kernel's copy was fetched
+/// — each a byte of a stale dirty page that would have undone a later write
 /// (`docs/bugs/2026-10-21-a-dirty-shared-map-page-overwrites-a-later-write-through-another-path.md`). The dirty-page
 /// write-back rule's non-vacuity count: it moves only when the rule protected a write.
 const WRITEBACK_BYTES_KEPT_BACK: &str = "fuse.writeback_bytes_kept_back";
-/// Format: cache write-backs refused `EIO` because the journal no longer held every change since the kernel's confirmed
-/// point, so which bytes were stale could not be told. Zero is the healthy reading; movement means a round stalled
-/// while more changes arrived than the journal retains.
+/// Format: cache write-backs refused `EIO` because which of their bytes were stale could not be told: the file's byte
+/// states were lost (more ranges than the journal's capacity, or the journal no longer held the records since the
+/// mount last consumed it), or a file with no states was judged against records already gone. Zero is the healthy
+/// reading.
 const WRITEBACKS_UNKNOWN: &str = "fuse.writebacks_unknown";
 /// Format: see [`MOUNT_REFUSED`] — resent requests answered from the reply their dead daemon published and never
 /// delivered (A-61); the exact replay's non-vacuity counter.

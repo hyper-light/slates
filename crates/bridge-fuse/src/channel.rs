@@ -37,7 +37,7 @@ use rustix::fs::{Mode, OFlags};
 use crate::abi::{IN_HEADER_LEN, OUT_HEADER_LEN, Opcode};
 use crate::allocate::{Allocation, Begun};
 use crate::bridge::Bridge;
-use crate::coherence::{Coherence, Delivered, FetchPoints, OwnRecords, WritableOpens};
+use crate::coherence::{Coherence, Delivered, OwnRecords, PageStates, WritableOpens};
 use crate::dispatch;
 use crate::error::FuseError;
 use crate::init::negotiate;
@@ -540,16 +540,18 @@ pub struct ServeState {
   own: OwnRecords,
   /// The handles this mount's kernel holds open for writing: only their files can have dirty pages.
   writable: WritableOpens,
-  /// When each cached page of a file open for writing was fetched, which is what a cache write-back is judged by.
-  fetched: FetchPoints,
+  /// What the kernel holds of each file open for writing — per byte, the point it is as of and whether another path
+  /// changed it since — which is what a cache write-back is judged by. Fed as this mount consumes the journal.
+  states: PageStates,
   /// The journal's head when this mount served its first request: the point a file with no record here is judged
   /// from — one a restored mount's kernel opened before this daemon served it (A-61).
   started_at: Option<u64>,
-  /// Bytes of cache write-backs kept back because another path changed them after the kernel's confirmed point, since
+  /// Bytes of cache write-backs kept back because another path changed them after the kernel's copy was fetched, since
   /// this was last read: the rule's non-vacuity count. Read and cleared by the owner that reports it.
   writeback_bytes_kept_back: u64,
-  /// Cache write-backs refused `EIO` because the journal no longer held every change since the confirmed point, since
-  /// this was last read. Read and cleared by the owner that reports it.
+  /// Cache write-backs refused `EIO` because which of their bytes were stale could no longer be told (the file's states
+  /// were lost, or the journal no longer held the records needed), since this was last read. Read and cleared by the
+  /// owner that reports it.
   writebacks_unknown: u64,
 }
 
@@ -577,7 +579,7 @@ impl ServeState {
       entry_invalidations_refused: 0,
       own: OwnRecords::default(),
       writable: WritableOpens::default(),
-      fetched: FetchPoints::default(),
+      states: PageStates::default(),
       started_at: None,
       writeback_bytes_kept_back: 0,
       writebacks_unknown: 0,
@@ -797,6 +799,11 @@ fn deliver_owed(
       }
       Ok::<(), ChannelError>(())
     })?;
+  // The records this round gathered, consumed by the byte states from the same point (the dirty-page write-back rule).
+  // Before the first round nothing is tracked, so there is nothing to feed.
+  if let (false, Some(since)) = (delivered.gather_refused, before) {
+    feed_states(bridge, cx, state, since.journal_seq);
+  }
   if !messages.is_empty() {
     let wake = match state.notify_wake.as_ref() {
       Some(notifier) => Some(notifier.try_clone()?),
@@ -871,9 +878,9 @@ fn dispatch_request(
 /// - a granted writable `OPEN` or `CREATE` is noted, and the file's first on this mount has its reply cleared of
 ///   `FOPEN_KEEP_CACHE`, so the kernel drops the file's cached pages as it opens it and every page cached after was
 ///   fetched after (or written whole by this mount);
-/// - a `READ` of a file open for writing records the journal's head as its pages' fetch point, since a read changes
-///   nothing;
-/// - a `RELEASE` forgets its handle, and with the file's last writable handle its fetch points (no write-back of it can
+/// - a `READ` of a file open for writing makes the bytes it returned fresh as of the journal's head, since a read
+///   changes nothing ([`PageStates::fetched`]);
+/// - a `RELEASE` forgets its handle, and with the file's last writable handle its byte states (no write-back of it can
 ///   follow, since a write-back holds its file open until it is answered).
 fn note_opens_and_fetches(
   request: &[u8],
@@ -901,7 +908,7 @@ fn note_opens_and_fetches(
         if let Some(reply) = state.reply.get_mut(..len) {
           crate::bridge::clear_keep_cache(parsed.opcode, reply);
         }
-        state.fetched.opened(file, bridge.seen(cx).journal_seq);
+        state.states.opened(file, bridge.seen(cx).journal_seq);
       }
     }
     Some(Opcode::Read) => {
@@ -913,7 +920,7 @@ fn note_opens_and_fetches(
       if let (true, Ok(read)) = (answered && state.writable.holds(ino), read) {
         let end = read.offset.saturating_add(u64::from(read.size));
         let bound = bridge.journal_capacity(cx);
-        state.fetched.fetched(ino, read.offset..end, before, bound);
+        state.states.fetched(ino, read.offset..end, before, bound);
       }
     }
     Some(Opcode::Release) => {
@@ -923,7 +930,7 @@ fn note_opens_and_fetches(
         .and_then(|bytes| bytes.try_into().ok())
         .map(u64::from_le_bytes);
       if let Some(file) = handle.and_then(|fh| state.writable.released(fh)) {
-        state.fetched.dropped(file);
+        state.states.dropped(file);
       }
     }
     _ => {}
@@ -931,13 +938,13 @@ fn note_opens_and_fetches(
 }
 
 /// Forgets the writable handle a lost `OPEN` or `CREATE` reply granted, when the server gives it back itself
-/// ([`crate::bridge::reclaim_unreported`]), and with the file's last such handle its fetch points.
+/// ([`crate::bridge::reclaim_unreported`]), and with the file's last such handle its byte states.
 fn forget_unreported_open(state: &mut ServeState, opcode: Option<Opcode>, len: usize) {
   let reply = state.reply.get(..len).unwrap_or(&[]);
   if let Some(file) =
     crate::bridge::granted_handle(opcode, reply).and_then(|fh| state.writable.released(fh))
   {
-    state.fetched.dropped(file);
+    state.states.dropped(file);
   }
 }
 
@@ -952,13 +959,58 @@ fn note_own_records(
   let after = bridge.seen(cx).journal_seq;
   let capacity = bridge.journal_capacity(cx);
   state.own.record(before, after, capacity);
+  if after <= before {
+    return;
+  }
+  // The request's records refresh what they wrote in this kernel, applied now: the cursor moves past them without a
+  // gather when the request's round was whole (`Coherence::served_own_request`).
+  let mut changes = Vec::new();
+  match bridge.data_changes(cx, before, &mut changes) {
+    Ok(true) => {
+      for change in changes {
+        state
+          .states
+          .changed(change.ino, change.range, change.seq, true, capacity);
+      }
+    }
+    Ok(false) | Err(_) => state.states.lose_all(),
+  }
+}
+
+/// Feeds the journal's data changes after `since` to the byte states, each the mount's own or another path's by its
+/// sequence ([`OwnRecords`]): what the round just gathered for invalidation, consumed from the same point in the same
+/// turn. Every record through the head is then consumed, so the points at or below it are raised to it
+/// ([`PageStates::consumed`]). A journal that no longer reaches back to `since` loses every tracked file, whose
+/// write-backs are then refused rather than guessed.
+fn feed_states(
+  bridge: &mut dyn Bridge,
+  cx: &slates_bridge_core::OpContext,
+  state: &mut ServeState,
+  since: u64,
+) {
+  let mut changes = Vec::new();
+  let complete = bridge
+    .data_changes(cx, since, &mut changes)
+    .unwrap_or(false);
+  if !complete {
+    state.states.lose_all();
+    return;
+  }
+  let capacity = bridge.journal_capacity(cx);
+  for change in changes {
+    let own = state.own.took(change.seq);
+    state
+      .states
+      .changed(change.ino, change.range, change.seq, own, capacity);
+  }
+  // The same synchronous turn as the walk: no record can have come between it and this reading of the head.
+  state.states.consumed(bridge.seen(cx).journal_seq);
 }
 
 /// Serves a cache write-back of node `nodeid` by the dirty-page write-back rule ([`dispatch_request`]): applied whole
-/// when nothing changed since the kernel's confirmed point, outside the changed ranges when some did, and refused `EIO`
-/// when the journal no longer holds every change since — then neither applying (which may revert an acknowledged
-/// write) nor dropping (which would discard data the process synced) is safe, and the process is told at its next
-/// `fsync` or `msync`.
+/// when none of its bytes is stale, outside the stale ranges when some are, and refused `EIO` when which are stale can
+/// no longer be told — then neither applying (which may revert an acknowledged write) nor dropping (which would discard
+/// data the process synced) is safe, and the process is told at its next `fsync` or `msync`.
 fn serve_writeback(
   request: &[u8],
   nodeid: u64,
@@ -983,11 +1035,11 @@ fn serve_writeback(
   (len, stale)
 }
 
-/// The bytes of a cache write-back of node `nodeid` that are stale: for each part of its range with the point that part
-/// was fetched at ([`FetchPoints::parts`]), what another path changed after that point, this mount's own writes since
-/// excepted ([`slates_bridge_core::Bridge::changed_since`]). Ascending and disjoint, since the parts are. `None` when it
-/// cannot be told: the file's fetch points were lost, the journal no longer holds every change since a part's point, or
-/// the write-back cannot be read.
+/// The bytes of a cache write-back of node `nodeid` that are stale ([`PageStates::stale_after`]): the file's stale bytes
+/// within the write, with the records not yet consumed — those after the coherence cursor, a few — applied in order to a
+/// scratch copy. A file with no states (a mount restored across a daemon restart, whose opens predate this daemon) is
+/// judged as fresh at `started_at` against every record since. Ascending and disjoint. `None` when it cannot be told: the
+/// file's states were lost, the journal no longer holds the records needed, or the write-back cannot be read.
 fn stale_in_writeback(
   request: &[u8],
   nodeid: u64,
@@ -1001,20 +1053,29 @@ fn stale_in_writeback(
   let end = write
     .offset
     .saturating_add(u64::try_from(write.data.len()).unwrap_or(u64::MAX));
-  let mut stale = Vec::new();
-  for (part, point) in state.fetched.parts(nodeid, write.offset..end, started_at)? {
-    let slates_bridge_core::Changed::Known(changed) = bridge
-      .changed_since(cx, point, nodeid, state.own.spans())
-      .ok()?
-    else {
-      return None;
-    };
-    stale.extend(changed.into_iter().filter_map(|range| {
-      let (start, end) = (range.start.max(part.start), range.end.min(part.end));
-      (start < end).then_some(start..end)
-    }));
+  let since = if state.states.tracks(nodeid) {
+    state
+      .coherence
+      .cursor()
+      .map_or(started_at, |cursor| cursor.journal_seq)
+  } else {
+    started_at
+  };
+  let mut changes = Vec::new();
+  if !bridge.data_changes(cx, since, &mut changes).ok()? {
+    return None;
   }
-  Some(stale)
+  let pending: Vec<(std::ops::Range<u64>, u64, bool)> = changes
+    .into_iter()
+    .filter(|change| change.ino == nodeid)
+    .map(|change| {
+      let own = state.own.took(change.seq);
+      (change.range, change.seq, own)
+    })
+    .collect();
+  state
+    .states
+    .stale_after(nodeid, write.offset..end, started_at, &pending)
 }
 
 /// Serves one admitted request: the owed round first, so the reply never coexists with a stale
@@ -1076,8 +1137,8 @@ pub struct Dispatched {
   /// Where the kernel's cache stood just before the request was served: a refused reply rewinds to it, so the
   /// request's own applied change is delivered as an invalidation ([`redeliver_after_refusal`]).
   cursor_before: Option<slates_bridge_core::InvalidationCursor>,
-  /// For a cache write-back, the byte ranges it was not applied over (another path changed them after the kernel's
-  /// confirmed point); empty for every other request. What it applied, and so what its owner logs, excludes them.
+  /// For a cache write-back, the byte ranges it was not applied over (another path changed them after the kernel's copy
+  /// was fetched); empty for every other request. What it applied, and so what its owner logs, excludes them.
   kept_back: Vec<std::ops::Range<u64>>,
 }
 

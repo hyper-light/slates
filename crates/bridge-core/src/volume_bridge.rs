@@ -1362,28 +1362,22 @@ impl Bridge for VolumeBridge<'_> {
     }
   }
 
-  fn changed_since(
+  fn data_changes(
     &mut self,
     cx: &OpContext,
     since: u64,
-    ino: u64,
-    own: &[std::ops::Range<u64>],
-  ) -> Result<crate::Changed, VfsError> {
+    out: &mut Vec<crate::DataChange>,
+  ) -> Result<bool, VfsError> {
     self.authorize_read(cx)?;
     // A pinned view never sees a head change (as `invalidations` holds), so nothing its kernel caches goes stale.
     if !matches!(cx.view, View::Current) {
-      return Ok(crate::Changed::Known(Vec::new()));
+      return Ok(true);
     }
     let log = self.volume.op_log();
-    // A record after `since` that retention evicted is a change nobody can name any more: unknown, not "none".
-    if since.saturating_add(1) < log.oldest_seq() {
-      return Ok(crate::Changed::Unknown);
-    }
-    Ok(crate::Changed::Known(crate::changed::changed_ranges(
-      log.since(since),
-      InodeNo(ino),
-      own,
-    )))
+    // A record after `since` that retention evicted is a change nobody can name any more.
+    let complete = since.saturating_add(1) >= log.oldest_seq();
+    out.extend(log.since(since).filter_map(crate::changed::data_change));
+    Ok(complete)
   }
 
   fn journal_capacity(&mut self, _cx: &OpContext) -> usize {
