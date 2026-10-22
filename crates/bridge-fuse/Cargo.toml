@@ -25,6 +25,9 @@ slates-vfs = { workspace = true }
 # per-byte model.
 proptest = { workspace = true }
 slates-test-seeds = { workspace = true }
+# `mincore(2)`, which rustix does not bind: whether the kernel still caches a mapped file's pages
+# (`tests/coherence_mount.rs`).
+libc = { workspace = true }
 
 [lints]
 workspace = true

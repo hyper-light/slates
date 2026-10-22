@@ -6077,3 +6077,186 @@ A bare thread start and join, timed in the same runs: p50 16.2–19.8 µs, p90 2
 
 **What remains**, about 2 µs at the p90, is the round itself: the gather, the encode and the hand-off over the
 notifier's channel.
+
+## A change drops only its bytes from a mount's cache: what a guest's DAX map saves (A-146; 2026-10-22)
+
+**The question.** A guest's DAX map of a file shared through a slates mount lives in the host kernel's page cache for
+that file (`virtiofs.md` §8 item 7). Until A-146, every content change through another path dropped the whole file from
+that cache, so the guest re-fetched every page of its map through the mount.
+
+**The command.** On the box, a slates anchor runs the release `slates` with one 2 GiB volume mounted twice by FUSE, and
+a 128 MiB file of one byte value is written through mount one. crosvm (built from upstream source on 2026-10-16) shares
+mount one into a guest running the box's own kernel, with its own virtio-fs device (`dax=true`, its sandbox on). The
+guest's static `/init` maps the file shared (`dax=always`) and scans one byte per page: once cold, twice warm, then six
+rounds. In each round it signals through a file, waits touching memory only until the middle byte changes, and times
+one scan and then another. The host writes the middle byte through mount two, one `pwrite` a round.
+
+The two arms are release builds of one tree differing only in A-146 (before: `1e6d7253`), each in its own target
+directory, run interleaved before then after, three times (`dax_cost_run.sh SLATES 128` per run). The probe and the
+driver are below, kept here rather than in the tree. A gated test that runs them is owed (GAPS).
+
+**The machine.** The box (x86_64, 32 cores, 124 GiB, kernel 7.2.9-2-cachyos), 2026-10-22 21:30–21:31 UTC. The load
+average was 39–43 from other sessions' builds at the start of each run, and 99 just after the last.
+
+All times are µs.
+
+| run | arm | cold scan | scan after each change | the scan after that |
+|---|---|---|---|---|
+| 1 | before | 244,986 | 301,358 · 277,229 · 367,014 · 823,576 · 1,263,233 · 1,174,719 | 923 · 458 · 400 · 1,819 · 3,082 · 16,786 |
+| 1 | after | 213,095 | 1,479 · 929 · 527 · 432 · 597 · 483 | 233 · 595 · 232 · 248 · 224 · 237 |
+| 2 | before | 238,206 | 408,092 · 232,255 · 284,675 · 310,996 · 387,225 · 217,906 | 2,415 · 674 · 830 · 571 · 921 · 629 |
+| 2 | after | 199,913 | 440 · 429 · 277 · 301 · 341 · 257 | 227 · 163 · 230 · 226 · 238 · 220 |
+| 3 | before | 190,089 | 241,785 · 268,905 · 164,072 · 214,258 · 189,710 · 231,134 | 876 · 1,118 · 384 · 430 · 1,152 · 6,862 |
+| 3 | after | 208,472 | 463 · 473 · 374 · 348 · 909 · 574 | 210 · 324 · 236 · 206 · 1,037 · 175 |
+
+**What it shows.**
+- **The scan after a one-byte change:** a median of 273 ms (164–1,263 ms) before, and 0.45 ms (0.26–1.48 ms) after,
+  about 600× at the median. Before, every change re-fetched the whole 128 MiB through the mount.
+- **The cold scan does not move** (190–245 ms before, 200–213 ms after): a first fault-in is the same work either way.
+- **After a change, the scan sits near the warm scan** (0.2–0.3 ms), plus the one folio re-fetched.
+- **Not read:** the guest's wait to see each change (8–137 ms). That is the host driver's poll and Python's start, not
+  the delivery.
+
+An earlier run of the same probe on a debug build, before A-146 only, gave 356–382 ms for each scan after a change and
+113 ms cold.
+
+**The probe** (`gcc -static -O2`, the initramfs's `/init`):
+
+```c
+/* Measures what one byte changed through another path costs a guest's DAX map of a large file on the mount route:
+   the guest scans every page of its map cold, warm, then after each change, and reports each scan's time. A static
+   /init; markers on the console; the host makes the changes. Experiment artifact, not product code. */
+#define _GNU_SOURCE
+#include <errno.h>
+#include <fcntl.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <string.h>
+#include <time.h>
+#include <unistd.h>
+#include <sys/mman.h>
+#include <sys/mount.h>
+#include <sys/reboot.h>
+#include <sys/stat.h>
+
+#define PAGE 4096
+#define ROUNDS 6
+#define SECOND (1000L * 1000)
+
+static void say(const char *fmt, ...) {
+  char line[512];
+  va_list args;
+  va_start(args, fmt);
+  int n = vsnprintf(line, sizeof line, fmt, args);
+  va_end(args);
+  if (n > 0) write(1, line, (size_t)(n < (int)sizeof line ? n : (int)sizeof line - 1));
+}
+
+static long now_us(void) {
+  struct timespec t;
+  clock_gettime(CLOCK_MONOTONIC, &t);
+  return t.tv_sec * 1000000L + t.tv_nsec / 1000;
+}
+
+static long scan(const volatile unsigned char *map, long size, unsigned long *sum) {
+  long started = now_us();
+  unsigned long total = 0;
+  for (long at = 0; at < size; at += PAGE) total += map[at];
+  *sum = total;
+  return now_us() - started;
+}
+
+static int write_file(const char *path, const char *text) {
+  int fd = open(path, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+  if (fd < 0) return -1;
+  int ok = write(fd, text, strlen(text)) == (ssize_t)strlen(text) && fsync(fd) == 0;
+  close(fd);
+  return ok ? 0 : -1;
+}
+
+int main(void) {
+  mount("dev", "/dev", "devtmpfs", 0, 0);
+  int console = open("/dev/console", O_RDWR);
+  if (console >= 0) { dup2(console, 0); dup2(console, 1); dup2(console, 2); }
+  mount("proc", "/proc", "proc", 0, 0);
+  say("GUEST-BOOTED\n");
+  if (mount("slates", "/mnt", "virtiofs", 0, "dax=always") != 0) { say("GUEST-MOUNT-FAILED errno=%d\n", errno); goto out; }
+  int fd = open("/mnt/big.bin", O_RDWR);
+  struct stat info;
+  if (fd < 0 || fstat(fd, &info) != 0) { say("GUEST-OPEN-FAILED errno=%d\n", errno); goto out; }
+  long size = info.st_size;
+  volatile unsigned char *map = mmap(0, (size_t)size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+  if (map == MAP_FAILED) { say("GUEST-MAP-FAILED errno=%d\n", errno); goto out; }
+  unsigned long sum = 0;
+  say("COST size=%ld pages=%ld\n", size, size / PAGE);
+  say("COST cold-scan-us=%ld\n", scan(map, size, &sum));
+  say("COST warm-scan-us=%ld\n", scan(map, size, &sum));
+  say("COST warm-scan-us=%ld\n", scan(map, size, &sum));
+  long middle = size / 2;
+  for (int round = 1; round <= ROUNDS; round++) {
+    char name[64];
+    snprintf(name, sizeof name, "/mnt/cost-%d", round);
+    if (write_file(name, "ready") != 0) { say("GUEST-SIGNAL-FAILED errno=%d\n", errno); goto out; }
+    unsigned char want = (unsigned char)('A' + round);
+    long started = now_us();
+    while (map[middle] != want && now_us() - started < 20 * SECOND) {}
+    long seen = map[middle] == want ? now_us() - started : -1;
+    long after = scan(map, size, &sum);
+    long again = scan(map, size, &sum);
+    say("COST round=%d saw-change-us=%ld scan-after-change-us=%ld scan-again-us=%ld\n", round, seen, after, again);
+  }
+  say("COST-END\n");
+out:
+  sleep(1);
+  reboot(RB_POWER_OFF);
+  for (;;) pause();
+  return 0;
+}
+```
+
+**The driver** (one run of one arm):
+
+```bash
+#!/bin/bash
+# What one byte changed through another path costs a guest's DAX map on the mount route. Usage: dax_cost_run.sh SLATES
+# [SIZE_MIB]. Experiment, not product.
+set -u
+S=${1:?the slates binary}
+SIZE_MIB=${2:-128}
+R=~/r12-daxcost-run
+I=gcost-$$
+CROSVM=~/crosvm/crosvm
+KERNEL=~/crosvm-ab/vmlinuz
+rm -rf "$R"; mkdir -p "$R/m1" "$R/m2" "$R/initramfs/proc" "$R/initramfs/sys" "$R/initramfs/mnt" "$R/initramfs/dev"
+cleanup() {
+  pkill -9 -f "crosvm run.*$R/m1" 2>/dev/null
+  sleep 0.5
+  for m in "$R/m1" "$R/m2"; do mountpoint -q "$m" && { "$S" --instance "$I" unmount "$m" >/dev/null 2>&1 || fusermount3 -u "$m"; }; done
+  [ -n "${APID:-}" ] && kill "$APID" 2>/dev/null && wait "$APID" 2>/dev/null
+  pgrep -f "instance $I" >/dev/null && pkill -f "instance $I"
+}
+trap cleanup EXIT
+gcc -static -O2 -o "$R/initramfs/init" ~/r12-guestdax-run-src/dax_cost_init.c || exit 1
+( cd "$R/initramfs" && find . -print0 | cpio --null -o --format=newc 2>/dev/null | gzip -9 > "$R/initramfs.cpio.gz" )
+setsid "$S" --instance "$I" anchor --quick --shards 2 > "$R/anchor.log" 2>&1 &
+APID=$!
+for _ in $(seq 1 600); do grep -q "serving on" "$R/anchor.log" && break; sleep 0.1; done
+"$S" --instance "$I" bootstrap root >/dev/null || exit 1
+ID=$("$S" --instance "$I" volume create gc --bounded 2GiB | sed -n 's/^id: //p')
+"$S" --instance "$I" mount "$ID" "$R/m1" >/dev/null || exit 1
+"$S" --instance "$I" mount "$ID" "$R/m2" >/dev/null || exit 1
+head -c $((SIZE_MIB * 1048576)) /dev/zero | tr '\0' 'h' | dd of="$R/m1/big.bin" bs=1M status=none
+timeout 600 "$CROSVM" run -m 2048 --cpus 2 \
+  --shared-dir "$R/m1:slates:type=fs:cache=always:timeout=3600:dax=true:writeback=false:posix_acl=false:security_ctx=false" \
+  --initrd "$R/initramfs.cpio.gz" -p "console=ttyS0 earlycon=uart8250,io,0x3f8,115200 rdinit=/init" \
+  --serial type=stdout,hardware=serial,num=1,console,earlycon \
+  "$KERNEL" < /dev/null > "$R/crosvm.log" 2>&1 &
+for round in 1 2 3 4 5 6; do
+  for _ in $(seq 1 30000); do [ -e "$R/m2/cost-$round" ] && break; pgrep -f "crosvm run.*$R/m1" >/dev/null || break; sleep 0.01; done
+  [ -e "$R/m2/cost-$round" ] || { echo "no cost-$round"; break; }
+  letter=$(printf "\\$(printf '%03o' $((65 + round)))")
+  python3 -I -c "import os, sys; descriptor = os.open(sys.argv[1], os.O_WRONLY); os.pwrite(descriptor, sys.argv[2].encode(), int(sys.argv[3])); os.close(descriptor)" "$R/m2/big.bin" "$letter" $((SIZE_MIB * 1048576 / 2))
+done
+for _ in $(seq 1 3000); do grep -q "COST-END\|FAILED" "$R/crosvm.log" && break; sleep 0.1; done
+grep -aE "COST|FAILED" "$R/crosvm.log"
+```

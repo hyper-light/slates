@@ -105,6 +105,8 @@ struct Report {
   kept_back: u64,
   /// Cache write-backs refused because which bytes were stale could not be told.
   unknown: u64,
+  /// Entry invalidations the kernel refused, as `fuse.entry_invalidation_refused` counts them.
+  entry_refusals: u64,
 }
 
 fn command_available(name: &str) -> bool {
@@ -208,6 +210,7 @@ fn serve(
   let mut writes = 0u64;
   let mut kept_back = 0u64;
   let mut unknown = 0u64;
+  let mut entry_refusals = 0u64;
   let mut report_pending = false;
   loop {
     let wake = match wait(mounted.channel(), Some(&signal)) {
@@ -351,6 +354,7 @@ fn serve(
     overruns += state.take_journal_overruns();
     kept_back += state.take_writeback_bytes_kept_back();
     unknown += state.take_writebacks_unknown();
+    entry_refusals += state.take_entry_invalidations_refused();
     if std::mem::take(&mut report_pending) {
       reports
         .send(Report {
@@ -361,6 +365,7 @@ fn serve(
           writes,
           kept_back,
           unknown,
+          entry_refusals,
         })
         .unwrap();
     }
@@ -959,6 +964,18 @@ impl SharedMap {
     // SAFETY: syncs exactly the live map made in `open`.
     unsafe { rustix::mm::msync(self.map.cast(), self.len, rustix::mm::MsyncFlags::SYNC) }
   }
+
+  /// Whether the kernel holds each of the map's pages in its page cache, one flag a page (`mincore(2)`), as any program
+  /// may ask. Reading it faults nothing in.
+  fn resident_pages(&self) -> Vec<bool> {
+    let page = rustix::param::page_size();
+    let mut flags = vec![0u8; self.len / page];
+    // SAFETY: the map made in `open` is live for `self.len` bytes from `self.map`, which mmap returned page-aligned;
+    // `flags` holds one byte for each of its pages, which is what mincore writes.
+    let answered = unsafe { libc::mincore(self.map.cast(), self.len, flags.as_mut_ptr()) };
+    assert_eq!(answered, 0, "mincore: {}", std::io::Error::last_os_error());
+    flags.iter().map(|flag| flag & 1 == 1).collect()
+  }
 }
 
 impl Drop for SharedMap {
@@ -1157,6 +1174,138 @@ fn judge_the_write_back(
      {synced:?}); the volume holds {:?}",
     held.map(|bytes| bytes.iter().filter(|byte| **byte != REPLACED).count())
   );
+}
+
+/// Format: the bytes of one page-table entry on the 64-bit targets slates ships (x86_64 and aarch64).
+const PAGE_TABLE_ENTRY_BYTES: usize = 8;
+/// Shape: the blocks the ranged-invalidation file spans: a changed first and last, and an untouched one between.
+const RANGED_BLOCKS: usize = 3;
+
+/// The largest folio a Linux page cache makes: one page table's worth of pages (a PMD), `page / 8` entries of eight
+/// bytes each, so 2 MiB with 4 KiB pages. Folios are aligned to their size, so a changed byte's folio lies within the
+/// block of this size around it.
+fn largest_folio(page: usize) -> usize {
+  page.checked_mul(page / PAGE_TABLE_ENTRY_BYTES).unwrap()
+}
+
+/// A-146 (§4.6 cache posture). A change through another path drops from the kernel's cache the bytes it changed, not
+/// the whole file. A guest's DAX map of a file shared through the mount (`docs/wip/virtiofs.md` §8 item 7) is held in
+/// that cache, and one byte changed elsewhere had dropped all of it. Measured on the box (Linux 7.2.9, crosvm, a 128 MiB
+/// map, 2026-10-22): each one-byte change made the guest's next scan take 356–382 ms, against 0.2–0.3 ms warm.
+///
+/// Do: write a file of [`RANGED_BLOCKS`] blocks through the mount (a block is [`largest_folio`]), map it shared and
+/// fault every page in. Through the other attachment, change one byte in the first block, then one in the last. Wait
+/// until the last block's changed page has left the cache. The kernel is told of changes one round at a time, each
+/// round's messages in order, so by then the first change's invalidation has finished too.
+///
+/// Expect every page of the middle block, which no change touched, still cached, and the map to read both new bytes
+/// and the unchanged ones beside them. Before A-146 every content change dropped the whole file, so the middle block
+/// was gone with it.
+#[test]
+fn a_change_through_another_path_drops_only_the_pages_it_changed() {
+  with_mounted_loop("ranged", |control, mount_point| {
+    let page = rustix::param::page_size();
+    let block = largest_folio(page);
+    let len = block.checked_mul(RANGED_BLOCKS).unwrap();
+    let name = "ranged";
+    let mapped = written_mapped_and_cached(control, &format!("{mount_point}/{name}"), len);
+    let first = page + STORE_AT;
+    let last = len - page + STORE_AT;
+    for at in [first, last] {
+      control.ask(Ask::WriteAt {
+        name: name.to_owned(),
+        offset: u64::try_from(at).unwrap(),
+        bytes: vec![REPLACED],
+      });
+    }
+    control.report();
+    assert!(
+      eventually(|| !mapped.resident_pages()[last / page]),
+      "the last block's changed page leaves the kernel's cache"
+    );
+    let resident = mapped.resident_pages();
+    let untouched = &resident[block / page..(len - block) / page];
+    let dropped = untouched.iter().filter(|resident| !**resident).count();
+    assert_eq!(
+      dropped,
+      0,
+      "the middle block, which no change touched, stays in the kernel's cache: {dropped} of its {} pages were dropped",
+      untouched.len()
+    );
+    assert_eq!(mapped.byte(first), REPLACED, "the first change reads back");
+    assert_eq!(mapped.byte(last), REPLACED, "the last change reads back");
+    assert_eq!(
+      mapped.byte(first - 1),
+      SEED,
+      "the byte before the first change is unchanged"
+    );
+    assert_eq!(
+      mapped.byte(last + 1),
+      SEED,
+      "the byte after the last change is unchanged"
+    );
+  });
+}
+
+/// `fuse.entry_invalidation_refused` counts only names the kernel was handed (§4.6 cache posture). The kernel answers
+/// `ENOENT` for any name it does not cache, and since A-137 it caches no lookup miss, so a name another path makes that
+/// this mount's kernel never looked up gets `ENOENT` with nothing stale. Before, every entry invalidation's `ENOENT`
+/// counted, so the count moved for such names (seen on the box during the 2026-10-22 guest run, after the guest polled
+/// for a name another mount then made).
+///
+/// Do: map a one-page file through the mount and fault it in. Through the other attachment, create a name the kernel
+/// has never looked up; then, in a later round, change the mapped file, and wait until its page has left the kernel's
+/// cache. Rounds go out one at a time, and a round's outcome is taken in before the next is handed off, so by then the
+/// creation's outcome is counted. Expect the count unmoved, and the mount to list the new name.
+#[test]
+fn a_name_the_kernel_was_never_handed_is_not_counted_as_a_refused_invalidation() {
+  with_mounted_loop("unseen", |control, mount_point| {
+    let page = rustix::param::page_size();
+    let sentinel = written_mapped_and_cached(control, &format!("{mount_point}/sentinel"), page);
+    let before = control.report().entry_refusals;
+    control.ask(Ask::Create {
+      name: "unseen".to_owned(),
+    });
+    control.report();
+    control.ask(Ask::WriteAt {
+      name: "sentinel".to_owned(),
+      offset: 0,
+      bytes: vec![REPLACED],
+    });
+    control.report();
+    assert!(
+      eventually(|| !sentinel.resident_pages()[0]),
+      "the later round reaches the kernel"
+    );
+    let moved = control.report().entry_refusals - before;
+    assert_eq!(
+      moved, 0,
+      "an invalidation of a name the kernel never held is not a refusal: the count moved by {moved}"
+    );
+    assert!(
+      mount_files(mount_point)
+        .iter()
+        .any(|(name, _)| name == "unseen"),
+      "the mount lists the name the other attachment made"
+    );
+  });
+}
+
+/// A file of `len` bytes of [`SEED`] written to `path` through the mount, mapped shared, and every page faulted in, so
+/// the kernel caches all of it.
+fn written_mapped_and_cached(control: &Loop, path: &str, len: usize) -> SharedMap {
+  let page = rustix::param::page_size();
+  write_shared_file(path, &vec![SEED; len]);
+  control.report();
+  let mapped = SharedMap::open(path, len / page);
+  for at in (0..len).step_by(page) {
+    assert_eq!(mapped.byte(at), SEED, "page {} is faulted in", at / page);
+  }
+  assert!(
+    mapped.resident_pages().iter().all(|resident| *resident),
+    "non-vacuous: every page is in the kernel's cache before the changes"
+  );
+  mapped
 }
 
 /// Shape: the pages the write-back chaos maps.

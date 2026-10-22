@@ -288,8 +288,35 @@ box shared with two other builds — timings are not benchmarks)
    told of a change, and a memory-only reader refreshes only when something makes the client revalidate (seen both
    never in 8 s and at 0.88 s); a `stat` of the file — what a guest's attribute request becomes on the host — makes it
    follow at once. So DAX through a mount on macOS sees host-side changes on the guest's next attribute refresh, not
-   sooner. Still owed: an actual VM's DAX window over the mount (Shards on the Mac, QEMU or crosvm on Linux), and
-   Firecracker's disk-image form.
+   sooner.
+
+   **A real VM's DAX window over the mount, on Linux (2026-10-22, by hand on the box).** crosvm's own virtio-fs device
+   shared a `slates mount` folder into a guest running the box's own kernel (7.2.9), mounted `dax=always`, with a second
+   mount of the same volume on the host as the other path. The sharer runs unprivileged only with crosvm's sandbox on:
+   with `--disable-sandbox`, crosvm jails the device by pivoting into the folder without a user namespace, which needs
+   root (`jail/src/helpers.rs` `create_base_minijail`). What the run showed:
+   - The guest read the host's file and wrote one the host read back. Its inode reported DAX (`STATX_ATTR_DAX`), and
+     its shared map read the volume's bytes.
+   - A write through the second mount reached the guest's map as memory alone, and the guest's synced stores reached
+     the volume, each at its own page.
+   - **Unsynced guest stores on a page another path then wrote:** with the other path writing half the page, each side
+     kept its own half; writing the whole page, the later acknowledged write won. The guest's map showed the same before
+     it synced. This is the revert bug A-139/A-140 fixed, now through a real guest.
+   - **The daemon killed under the guest's live maps:** the anchor restarted it and both mounts were taken over. The
+     guest's next sync succeeded, its first fault afterwards read the volume, and a later write through the second mount
+     reached its map as memory alone.
+   - **The VM killed with an unsynced store:** the host's page cache still held the dirty page, and it landed in the
+     volume.
+
+   Every page agreed at the end through the second mount and through slates itself. The run also found that every
+   change dropped the whole file from the kernel's cache, and so from the guest's map: each one-byte change to a 128 MiB
+   file made the guest's next scan take 356–382 ms against 0.2–0.3 ms warm. Fixed by A-146, which drops only the bytes a
+   change touched. The guest side was a static C `/init` and the host side a shell driver, kept outside the tree; a gated
+   test that runs them is owed (GAPS).
+
+   Still owed: Shards' DAX window over the macOS mount, and Firecracker's disk-image form. crosvm has prior art for the
+   latter: its experimental `--pmem-ext2` builds an ext2 file system in memory from a host directory and presents it to
+   the guest on a pmem device (`crosvm run --help` and its `ext2` crate, read on the box 2026-10-22).
 
    **What has to be proven, per target, by real runs** (the goal's bar: adversarial and chaos testing at each
    step): the guest or container reads and writes the volume; DAX works where the platform has it, which needs a

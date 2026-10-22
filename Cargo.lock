@@ -1345,6 +1345,7 @@ dependencies = [
 name = "slates-bridge-fuse"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "proptest",
  "rustix",
  "slates-base",

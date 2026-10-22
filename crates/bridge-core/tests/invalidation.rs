@@ -13,8 +13,8 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use slates_bridge_core::{
-  Attachments, Bridge, CacheLifetime, Invalidation, InvalidationCursor, ObjectId, OpContext,
-  Rights, View, VolumeBridge, new_handle_store,
+  Attachments, Bridge, CacheLifetime, CachedBytes, Invalidation, InvalidationCursor, ObjectId,
+  OpContext, Rights, View, VolumeBridge, new_handle_store,
 };
 use slates_db::catalog::{Principal, VolumeId};
 use slates_mem::Slab;
@@ -178,7 +178,7 @@ fn entry(parent: u64, name: &str, expire: bool) -> Invalidation {
   }
 }
 
-fn inode(ino: u64, data: bool) -> Invalidation {
+fn inode(ino: u64, data: CachedBytes) -> Invalidation {
   Invalidation::Inode { ino, data }
 }
 
@@ -217,14 +217,20 @@ fn a_change_outside_the_transport_owes_its_kernel_entries_and_the_transports_own
     "the transport's own create owes nothing: {owed:?}"
   );
 
-  // The SDK writes and truncates "f": its attributes and data are stale in the kernel.
+  // The SDK writes and truncates "f": its attributes are stale in the kernel, and the bytes each change touched.
   let f_no = slates_vfs::ids::InodeNo(f);
   vol.write(&mut store, f_no, 0, b"hello").unwrap();
   vol.truncate(&mut store, f_no, 2).unwrap();
   let cursor = bridge(&mut vol, &mut store, &mut handles)
     .invalidations(&cx, cursor, &mut owed)
     .unwrap();
-  assert_eq!(owed, vec![inode(f, true), inode(f, true)]);
+  assert_eq!(
+    owed,
+    vec![
+      inode(f, CachedBytes::Range { at: 0, len: 5 }),
+      inode(f, CachedBytes::From { at: 2 })
+    ]
+  );
   owed.clear();
 
   // The SDK renames "f" to "g" and creates "h": both names and the directory are stale.
@@ -238,11 +244,11 @@ fn a_change_outside_the_transport_owes_its_kernel_entries_and_the_transports_own
     owed,
     vec![
       entry(root, "f", false),
-      inode(root, true),
+      inode(root, CachedBytes::ALL),
       entry(root, "g", false),
-      inode(root, true),
+      inode(root, CachedBytes::ALL),
       entry(root, "h", false),
-      inode(root, true),
+      inode(root, CachedBytes::ALL),
     ]
   );
   owed.clear();
@@ -252,7 +258,91 @@ fn a_change_outside_the_transport_owes_its_kernel_entries_and_the_transports_own
   let _ = bridge(&mut vol, &mut store, &mut handles)
     .invalidations(&cx, cursor, &mut owed)
     .unwrap();
-  assert_eq!(owed, vec![inode(f, false)]);
+  assert_eq!(owed, vec![inode(f, CachedBytes::Kept)]);
+}
+
+/// Shape: the file the byte-range test changes: sixteen 4 KiB pages, so each change lies well inside it.
+const RANGED_FILE: usize = 16 * 4096;
+
+/// One change the byte-range test makes through the volume: what it is, the change, and the bytes it must owe.
+type RangedStep<'s> = (
+  &'s str,
+  &'s dyn Fn(&mut Volume, &mut Store),
+  Vec<CachedBytes>,
+);
+
+/// A-146 (§4.6 cache posture): a content change owes the transport's kernel the bytes it touched, never the whole file.
+/// A guest's DAX map of a file shared through a mount is held in that kernel's cache, and a whole-file drop per change
+/// made it re-fetch the file each time (`docs/wip/virtiofs.md` §8 item 7). Do: with a 64 KiB file written and the
+/// transport's cursor taken after it, change the file through the volume one way at a time, gathering after each.
+/// Expect: an overwrite owes exactly its bytes; bytes appended past the end owe exactly those; a truncate owes
+/// everything from its new length; an SDK edit owes everything from its point (its delete and its insert shift the
+/// rest); a chmod owes the attributes and no bytes.
+#[test]
+fn a_content_change_owes_its_kernel_the_bytes_it_touched_not_the_whole_file() {
+  let mut store = store();
+  let mut vol = Volume::create(&mut store, config(1)).unwrap();
+  let mut handles = new_handle_store();
+  let cx = rw_cx();
+  let root = vol.root();
+  let file = vol.create_file(&mut store, root, "f", 0o644).unwrap();
+  vol
+    .write(&mut store, file, 0, &[b'a'; RANGED_FILE])
+    .unwrap();
+  let mut cursor = VolumeBridge::attached(
+    VolumeId { bytes: [0; 16] },
+    &mut vol,
+    &mut store,
+    &mut handles,
+    None,
+  )
+  .seen(&cx);
+  let size = u64::try_from(RANGED_FILE).unwrap();
+  let steps: [RangedStep<'_>; 5] = [
+    (
+      "an overwrite in place",
+      &|vol, store| assert_eq!(vol.write(store, file, 30_000, b"hello").unwrap(), 5),
+      vec![CachedBytes::Range { at: 30_000, len: 5 }],
+    ),
+    (
+      "bytes appended past the end",
+      &|vol, store| assert_eq!(vol.write(store, file, size, b"0123456789").unwrap(), 10),
+      vec![CachedBytes::Range { at: size, len: 10 }],
+    ),
+    (
+      "a truncate",
+      &|vol, store| vol.truncate(store, file, 40_000).unwrap(),
+      vec![CachedBytes::From { at: 40_000 }],
+    ),
+    (
+      "an SDK edit: three bytes out and two in at 100",
+      &|vol, store| vol.edit(store, file, 100, 3, b"xy").unwrap(),
+      vec![CachedBytes::From { at: 100 }, CachedBytes::From { at: 100 }],
+    ),
+    (
+      "a chmod",
+      &|vol, store| vol.chmod(store, file, 0o600).unwrap(),
+      vec![CachedBytes::Kept],
+    ),
+  ];
+  for (what, change, expected) in steps {
+    change(&mut vol, &mut store);
+    let mut owed = Vec::new();
+    cursor = VolumeBridge::attached(
+      VolumeId { bytes: [0; 16] },
+      &mut vol,
+      &mut store,
+      &mut handles,
+      None,
+    )
+    .invalidations(&cx, cursor, &mut owed)
+    .unwrap();
+    let expected: Vec<Invalidation> = expected
+      .into_iter()
+      .map(|data| inode(file.0, data))
+      .collect();
+    assert_eq!(owed, expected, "{what}");
+  }
 }
 
 /// Shape: a journal that keeps four records' fixed parts, so a handful of changes evicts the oldest.
@@ -297,7 +387,7 @@ fn a_transport_behind_the_journals_retention_is_told_everything() {
     .unwrap();
   assert_eq!(
     owed,
-    vec![inode(a.0, true)],
+    vec![inode(a.0, CachedBytes::Range { at: 0, len: 3 })],
     "within retention: the change itself"
   );
 
@@ -357,11 +447,11 @@ fn a_watcher_hint_expires_the_directorys_live_entries_and_the_next_lookup_relist
   let relist = f.host.calls() - before;
   // The directory itself, an expire for each live name beneath it, and each name's attributes.
   for expected in [
-    inode(src, true),
+    inode(src, CachedBytes::ALL),
     entry(src, "lib.rs", true),
     entry(src, "main.rs", true),
-    inode(lib, true),
-    inode(main, true),
+    inode(lib, CachedBytes::ALL),
+    inode(main, CachedBytes::ALL),
   ] {
     assert!(
       owed.contains(&expected),
@@ -478,8 +568,8 @@ fn a_watcher_overflow_expires_every_loaded_directorys_live_entries() {
     entry(root, "b", true),
     entry(a, "x", true),
     entry(b, "y", true),
-    inode(x, true),
-    inode(y, true),
+    inode(x, CachedBytes::ALL),
+    inode(y, CachedBytes::ALL),
   ] {
     assert!(
       owed.contains(&expected),

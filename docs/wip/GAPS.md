@@ -10766,3 +10766,38 @@ stale page back, and the other write's bytes on it reverted: measured 4,095 of 4
   delivery. That needs AC-3.3, above.
 
 (`docs/bugs/2026-10-21-a-dirty-shared-map-page-overwrites-a-later-write-through-another-path.md`).
+
+### 2026-10-22: a real VM's DAX window over the mount (crosvm), and what it found
+
+**Run by hand on Linux, 2026-10-22.** crosvm's own virtio-fs device shared a `slates mount` folder into a guest running
+the box's own kernel (7.2.9) with `dax=always`, while a second mount of the same volume was the host's other path. The
+guest read and wrote the volume; its map followed the other path's writes as memory alone; unsynced guest stores lost
+only the bytes another path later wrote; a daemon killed under the guest's live maps was taken over and the guest went
+on; a VM killed with an unsynced store left it in the host's cache, and it landed. Every page agreed at the end
+(`virtiofs.md` §8 item 7). The sharer needs crosvm's sandbox on: with `--disable-sandbox` it pivots into the folder
+without a user namespace, which needs root.
+
+- **Found: every change dropped the whole file from the kernel's cache — fixed (A-146).** So one changed byte made a
+  guest re-fetch its whole map. With a 128 MiB map, the guest's next scan after a one-byte change took a median of 273
+  ms (164–1,263 ms) before, and 0.45 ms (0.26–1.48 ms) after, release builds interleaved (`BENCHMARKS.md`).
+  `a_change_through_another_path_drops_only_the_pages_it_changed` was red before (the untouched middle block lost 512
+  of its 512 pages) and is green after.
+- **Found: `fuse.entry_invalidation_refused` moved with nothing stale — fixed.** It counted every entry invalidation
+  the kernel answered `ENOENT`. The kernel answers so for any name it does not cache, and since A-137 it caches no
+  lookup miss, so a name another path made that this mount's kernel never looked up moved the count. The count now
+  takes only names the mount handed the kernel (`KernelHolds::holds_name`).
+  `a_name_the_kernel_was_never_handed_is_not_counted_as_a_refused_invalidation` was red-checked both ways on the box
+  (the count moved by 1 without the fix). What can still move it: a name the kernel dropped on its own (an evicted
+  dentry, which the mount cannot see), and a kernel refusing to drop an entry it serves.
+- **Measured, not explained.** With the host's writer making 4,096 single-byte writes to a page, 79,544 bytes were kept
+  back from write-backs. With one write per range, exactly the 2,048 bytes the other path overwrote on a dirty page were
+  kept back. The end state was right in both runs.
+- **Owed:**
+  - a gated test that runs a guest over the mount (the run used a static C `/init` and a shell driver, kept in
+    `BENCHMARKS.md`);
+  - Shards' DAX window over the macOS mount;
+  - Firecracker's disk-image form. crosvm's experimental `--pmem-ext2` is prior art: it builds an ext2 file system in
+    memory from a host directory and presents it on a pmem device.
+
+  AC-3.3's residual applies to a guest as to any map: a store into bytes another path is changing, made between the
+  page's fetch and the change's delivery, is kept back.

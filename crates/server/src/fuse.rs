@@ -98,10 +98,11 @@ const ADOPTED: &str = "fuse.adopted";
 /// Format: see [`MOUNT_REFUSED`] — requests the kernel resent after a takeover's `FUSE_NOTIFY_RESEND` (A-61): ones
 /// a dead daemon read and never answered, served here; the resend's non-vacuity counter.
 const RESENT: &str = "fuse.resent";
-/// Format: entry invalidations the kernel **refused**, each one a name this mount believes it has told the kernel
-/// about and has not — the kernel kept the cached entry and goes on answering from it. Zero is the healthy
-/// reading; any movement means this mount's `Invalidated` posture is not being honoured by the kernel it is
-/// talking to (`docs/bugs/2026-10-19-linux-6-19-refuses-the-entry-invalidation-slates-swallows.md`).
+/// Format: entry invalidations the kernel **refused** with `ENOENT`, counted only for names this mount handed the
+/// kernel: a name it never got cannot be in its cache, and since A-137 no lookup miss is cached either. Zero is the
+/// healthy reading. Movement means the kernel dropped a name it was handed on its own (a dentry evicted, which the
+/// mount cannot see), or refused to drop an entry it goes on serving, as Linux 6.19 did for a negative entry
+/// (`docs/bugs/2026-10-19-linux-6-19-refuses-the-entry-invalidation-slates-swallows.md`).
 const ENTRY_INVALIDATION_REFUSED: &str = "fuse.entry_invalidation_refused";
 /// Format: bytes of cache write-backs kept back because another path changed them after the kernel's copy was fetched
 /// — each a byte of a stale dirty page that would have undone a later write

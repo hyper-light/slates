@@ -37,8 +37,8 @@ use slates_vfs::journal::Op;
 use slates_vfs::volume::{Observed, Store, Volume};
 
 use crate::{
-  Bridge, CacheLifetime, DirEntry, FsStat, Invalidation, InvalidationCursor, NodeAttr, ObjectId,
-  OpContext, RenameFlags, SetAttr, View,
+  Bridge, CacheLifetime, CachedBytes, DirEntry, FsStat, Invalidation, InvalidationCursor, NodeAttr,
+  ObjectId, OpContext, RenameFlags, SetAttr, View,
 };
 
 /// Shape: the read cap, one arena chunk (256 KiB), matched to the INIT negotiation; here it
@@ -232,6 +232,32 @@ fn host_for<'h>(
   }
 }
 
+/// The cached bytes a journal record's change made stale (A-146): exactly the bytes an overwrite or an extension wrote,
+/// everything from the new end after a truncate and from the shift point after an insert or a delete, the whole file
+/// for a base witness or drift (which carry no range), and none for a change that leaves the bytes alone.
+fn journal_bytes(op: &Op) -> CachedBytes {
+  match op {
+    Op::Overwrite { at, len } | Op::Extend { at, len } => CachedBytes::Range { at: *at, len: *len },
+    Op::Truncate { len } => CachedBytes::From { at: *len },
+    Op::Insert { at, .. } | Op::Delete { at, .. } => CachedBytes::From { at: *at },
+    Op::Witness | Op::Drift => CachedBytes::ALL,
+    Op::Create
+    | Op::Mknod
+    | Op::Mkdir
+    | Op::Unlink
+    | Op::Rmdir
+    | Op::Rename { .. }
+    | Op::Link
+    | Op::Symlink
+    | Op::Setattr
+    | Op::SetXattr { .. }
+    | Op::RemoveXattr { .. }
+    | Op::Whiteout
+    | Op::Redirect { .. }
+    | Op::Snapshot => CachedBytes::Kept,
+  }
+}
+
 /// The file and the end of an allocation of `[offset, offset + len)` (A-108). A derived view's bytes are its owner's
 /// rendering, with no holes of their own to hold, so it is refused as a special file is; a range past the largest
 /// offset is `FileTooLarge`.
@@ -406,10 +432,11 @@ impl<'v> VolumeBridge<'v> {
   }
 
   /// The kernel invalidations one journal record owes (§4.6): a content or attribute change on an
-  /// inode drops that inode's cached attributes (and its data for a content change or a drift); a
-  /// namespace change drops the name's cached mapping in its parent and the parent's attributes (a
-  /// rename both names). A record whose path no longer resolves over the volume's nodes (the entry
-  /// has since gone) owes nothing the kernel could still hold under that name.
+  /// inode drops that inode's cached attributes, and with a content change the cached bytes it
+  /// touched ([`journal_bytes`]); a namespace change drops the name's cached mapping in its parent
+  /// and the parent's attributes (a rename both names). A record whose path no longer resolves over
+  /// the volume's nodes (the entry has since gone) owes nothing the kernel could still hold under
+  /// that name.
   fn journal_invalidations(
     &mut self,
     op: &Op,
@@ -417,16 +444,7 @@ impl<'v> VolumeBridge<'v> {
     inode: Option<InodeNo>,
     out: &mut Vec<Invalidation>,
   ) {
-    let data = matches!(
-      op,
-      Op::Overwrite { .. }
-        | Op::Extend { .. }
-        | Op::Truncate { .. }
-        | Op::Insert { .. }
-        | Op::Delete { .. }
-        | Op::Witness
-        | Op::Drift
-    );
+    let data = journal_bytes(op);
     match op {
       Op::Overwrite { .. }
       | Op::Extend { .. }
@@ -475,9 +493,10 @@ impl<'v> VolumeBridge<'v> {
         name: name.to_owned(),
         expire: false,
       });
+      // A directory's cached listing has no byte range a name maps to: all of it.
       out.push(Invalidation::Inode {
         ino: located.inode.0,
-        data: true,
+        data: CachedBytes::ALL,
       });
     }
   }
@@ -1341,10 +1360,11 @@ impl Bridge for VolumeBridge<'_> {
         .volume
         .with_host(host)
         .take_stale_base_entries(self.store, cursor.hint_seq)?;
+      // An outsider's change carries no byte range: all of each file's cached bytes.
       for dir in stale.dirs {
         out.push(Invalidation::Inode {
           ino: dir.0,
-          data: true,
+          data: CachedBytes::ALL,
         });
       }
       for entry in stale.entries {
@@ -1355,7 +1375,7 @@ impl Bridge for VolumeBridge<'_> {
         });
         out.push(Invalidation::Inode {
           ino: entry.child.0,
-          data: true,
+          data: CachedBytes::ALL,
         });
       }
     }

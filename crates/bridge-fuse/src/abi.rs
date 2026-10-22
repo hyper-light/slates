@@ -212,7 +212,8 @@ pub mod flags {
 pub mod open {
   /// Format: FOPEN_KEEP_CACHE — the kernel keeps the file's cached pages across opens instead of dropping them at
   /// each one. Set for the volume's own objects, whose every change through another attachment is invalidated
-  /// explicitly (`Invalidation::Inode { data: true }`); never for a live base object an outsider may change.
+  /// explicitly, the bytes it touched (`Invalidation::Inode`, A-146); never for a live base object an outsider may
+  /// change.
   pub const KEEP_CACHE: u32 = 1 << 1;
   /// Format: FOPEN_CACHE_DIR — the kernel caches the directory's listing (7.28, Linux 4.20+); a change of a name in
   /// it invalidates the directory's data as well as the name (`entry_invalidation`).

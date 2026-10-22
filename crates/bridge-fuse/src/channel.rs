@@ -45,7 +45,7 @@ use crate::notify::{EXPIRE_ONLY, inval_entry, inval_inode};
 use crate::reply::ReplyHeader;
 use crate::request::Request;
 use crate::session::Session;
-use slates_bridge_core::{AttachmentId, Attachments, Invalidation};
+use slates_bridge_core::{AttachmentId, Attachments, CachedBytes, Invalidation};
 
 /// Format: the device the kernel's FUSE client and the daemon exchange messages over.
 const FUSE_DEVICE: &str = "/dev/fuse";
@@ -60,8 +60,9 @@ const NOTIFY_BYTES: usize = OUT_HEADER_LEN + 24 + 255 + 1;
 
 /// Format: `fuse_notify_inval_inode_out.off` of -1 — invalidate the attributes only, no data.
 const ATTRIBUTES_ONLY: i64 = -1;
-/// Format: `fuse_notify_inval_inode_out.len` of -1 with a zero offset — the whole data range.
-const WHOLE_FILE: i64 = -1;
+/// Format: `fuse_notify_inval_inode_out.len` of -1 — the data from `off` to the end of the file (the kernel reads any
+/// `len` of zero or less so, `fs/fuse/inode.c` `fuse_reverse_inval_inode`); with a zero `off`, the whole file.
+const TO_THE_END: i64 = -1;
 
 /// A refusal from the transport.
 #[derive(Debug)]
@@ -242,17 +243,31 @@ fn encode_invalidation(invalidation: &Invalidation, expire_only: bool) -> Option
       inval_entry(*parent, name, flags, &mut out)
     }
     Invalidation::Inode { ino, data } => {
-      if *data {
-        inval_inode(*ino, 0, WHOLE_FILE, &mut out)
-      } else {
-        inval_inode(*ino, ATTRIBUTES_ONLY, 0, &mut out)
-      }
+      let (off, len) = notified_range(*data);
+      inval_inode(*ino, off, len, &mut out)
     }
     // Never one message: the round expands it into what the kernel holds ([`everything_told`]).
     Invalidation::Everything => return None,
   };
   let n = encoded.ok()?;
   Some((out.get(..n)?.to_vec(), entry))
+}
+
+/// The `off` and `len` of the `FUSE_NOTIFY_INVAL_INODE` that drops `data` with the attributes (A-146). The kernel drops
+/// every cached page holding a byte of `[off, off + len)`, or from `off` to the end for [`TO_THE_END`]. The ABI's
+/// offsets are signed (`loff_t`): a range they cannot express lies past any file's largest size, and is sent as the
+/// rest of the file from where it can still be named, which drops more than the change and so is never stale. An empty
+/// range drops no bytes.
+fn notified_range(data: CachedBytes) -> (i64, i64) {
+  match data {
+    CachedBytes::Kept | CachedBytes::Range { len: 0, .. } => (ATTRIBUTES_ONLY, 0),
+    CachedBytes::Range { at, len } => match (i64::try_from(at), i64::try_from(len)) {
+      (Ok(off), Ok(len)) if off.checked_add(len).is_some() => (off, len),
+      (Ok(off), _) => (off, TO_THE_END),
+      (Err(_), _) => (0, TO_THE_END),
+    },
+    CachedBytes::From { at } => (i64::try_from(at).unwrap_or(0), TO_THE_END),
+  }
 }
 
 /// The mount's notify thread (§4.6 "Cache posture"; A-142). It writes each round of kernel invalidations **away from the
@@ -371,8 +386,8 @@ impl Drop for Notifier {
   }
 }
 
-/// One round of notifications: each message's bytes, and whether it is an entry invalidation, whose `ENOENT` is counted
-/// as a refusal ([`write_round`]).
+/// One round of notifications: each message's bytes, and whether its `ENOENT` is counted as a refusal ([`write_round`]):
+/// set for an entry invalidation of a name the kernel was handed, and for nothing else.
 type Round = Vec<(Vec<u8>, bool)>;
 /// A round's outcome: how many entry invalidations the kernel refused, or the device's own refusal.
 type Outcome = Result<u32, ChannelError>;
@@ -381,17 +396,17 @@ type Outcome = Result<u32, ChannelError>;
 /// invalidations the kernel refused, or that refusal.
 fn write_round(device: &OwnedFd, messages: &[(Vec<u8>, bool)]) -> Outcome {
   let mut refused = 0u32;
-  for (message, entry) in messages {
+  for (message, counted) in messages {
     // `ENOTEMPTY` is the kernel declining to drop a directory that is in use, and `ENOENT` on an *inode* invalidation
-    // is the kernel not holding that inode — neither is a fault of the mount. `ENOENT` on an **entry** invalidation is
-    // not benign and is counted, not discarded: on Linux 6.19 the kernel refuses it and goes on answering from the
-    // cached negative entry, so the name a neighbour created is never seen
-    // (`docs/bugs/2026-10-19-linux-6-19-refuses-the-entry-invalidation-slates-swallows.md`). It is counted rather than
-    // raised because the refusal is not retryable — the next round would be refused the same way, and a round kept for
-    // retry is an unbounded loop.
+    // is the kernel not holding that inode — neither is a fault of the mount. Nor is `ENOENT` for a name the kernel was
+    // never handed, which cannot be in its cache. `ENOENT` for an entry the kernel **was** handed is counted, not
+    // discarded: on Linux 6.19 the kernel refused it and went on answering from the cached negative entry, so the name a
+    // neighbour created was never seen (`docs/bugs/2026-10-19-linux-6-19-refuses-the-entry-invalidation-slates-swallows.md`).
+    // It is counted rather than raised because the refusal is not retryable — the next round would be refused the same
+    // way, and a round kept for retry is an unbounded loop.
     match rustix::io::write(device, message) {
       Ok(_) => {}
-      Err(rustix::io::Errno::NOENT) if *entry => refused = refused.saturating_add(1),
+      Err(rustix::io::Errno::NOENT) if *counted => refused = refused.saturating_add(1),
       Err(rustix::io::Errno::NOENT | rustix::io::Errno::NOTEMPTY) => {}
       Err(e) => {
         return Err(ChannelError::Device {
@@ -572,10 +587,11 @@ pub struct ServeState {
   /// Wakes this loop when a round finishes, so its outcome is seen and the next round started without waiting for
   /// the kernel's next request. Absent in a harness that drives the loop itself.
   notify_wake: Option<ChangeNotifier>,
-  /// Entry invalidations the kernel refused with `ENOENT` since this was last read. Every one of them is a name
-  /// this mount believes it has told the kernel about and has not: the kernel kept the cached entry. Counted so a
-  /// mount losing coherence is visible instead of silent (CLAUDE.md #9); read and cleared by the owner that
-  /// reports it.
+  /// Entry invalidations the kernel refused with `ENOENT` since this was last read, counted only for names the kernel
+  /// was handed ([`KernelHolds`]). Each is a name this mount believes the kernel holds, which the kernel says it does
+  /// not: it dropped the name on its own (a dentry evicted, which [`KernelHolds`] cannot see), or it refused to drop an
+  /// entry it still serves. Counted so a mount losing coherence is visible instead of silent (CLAUDE.md #9); read and
+  /// cleared by the owner that reports it.
   entry_invalidations_refused: u64,
   /// The journal records this mount's own requests made: the bytes they wrote are fresh in its kernel, so a later cache
   /// write-back is not held stale there (the dirty-page write-back rule, [`dispatch_request`]).
@@ -654,8 +670,9 @@ impl ServeState {
     std::mem::take(&mut self.journal_overruns)
   }
 
-  /// The entry invalidations the kernel has refused since this was last asked, and zero afterwards. A non-zero
-  /// answer means the kernel is still serving names this mount has tried to invalidate.
+  /// The entry invalidations the kernel has refused since this was last asked, and zero afterwards: names it was handed
+  /// that it says it does not hold. A non-zero answer means the kernel dropped such names on its own, or is still
+  /// serving names this mount has tried to invalidate.
   pub fn take_entry_invalidations_refused(&mut self) -> u64 {
     std::mem::take(&mut self.entry_invalidations_refused)
   }
@@ -856,14 +873,20 @@ fn deliver_owed(
         return Ok::<(), ChannelError>(());
       }
       let addressed = addressed_to_the_kernel(invalidation, root);
-      if let Some(message) = encode_invalidation(&addressed, expire_only) {
+      if let Some((message, entry)) = encode_invalidation(&addressed, expire_only) {
         // The kernel drops or expires the name as this round reaches it; a later use is a new lookup that names it
         // again ([`KernelHolds::unnamed`]). Taken now, not when the round returns, so a lookup answered meanwhile is
-        // never lost.
-        if let Invalidation::Entry { parent, name, .. } = &addressed {
-          holds.unnamed(*parent, name);
-        }
-        messages.push(message);
+        // never lost. Its `ENOENT` counts as a refusal only for a name the kernel was handed: one it never got is not in
+        // its cache, and since A-137 no lookup miss is cached either, so its `ENOENT` is the expected answer.
+        let held = match &addressed {
+          Invalidation::Entry { parent, name, .. } => {
+            let held = holds.holds_name(*parent, name);
+            holds.unnamed(*parent, name);
+            held
+          }
+          Invalidation::Inode { .. } | Invalidation::Everything => false,
+        };
+        messages.push((message, entry && held));
       }
       Ok::<(), ChannelError>(())
     })?;
@@ -903,9 +926,13 @@ fn everything_told(holds: &mut KernelHolds, expire_only: bool, messages: &mut Ro
     .into_iter()
     .chain(std::iter::once(crate::bridge::FUSE_ROOT_ID))
   {
-    if let Some(message) =
-      encode_invalidation(&Invalidation::Inode { ino, data: true }, expire_only)
-    {
+    if let Some(message) = encode_invalidation(
+      &Invalidation::Inode {
+        ino,
+        data: CachedBytes::ALL,
+      },
+      expire_only,
+    ) {
       messages.push(message);
     }
   }

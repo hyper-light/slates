@@ -638,6 +638,12 @@ impl KernelHolds {
     }
   }
 
+  /// Whether the kernel was handed `name` in `parent` and has not given it back. A name it never got cannot be in its
+  /// cache, so the kernel's `ENOENT` for an invalidation of it is the expected answer, not a refusal.
+  pub fn holds_name(&self, parent: u64, name: &str) -> bool {
+    self.names.contains_key(&(parent, name.to_owned()))
+  }
+
   /// The mount's own rename moved `from` to `to`, or swapped the two when `exchange` is set (`RENAME_EXCHANGE`).
   pub fn renamed(&mut self, from: (u64, &str), to: (u64, &str), exchange: bool) {
     let moved = self.names.get(&(from.0, from.1.to_owned())).copied();

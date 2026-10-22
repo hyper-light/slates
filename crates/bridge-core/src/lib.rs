@@ -207,13 +207,12 @@ pub enum Invalidation {
     /// Expire rather than drop.
     expire: bool,
   },
-  /// The cached attributes of `ino` are stale, and its cached data too when `data` is set (a
-  /// content change or a drift; a metadata change leaves the pages alone).
+  /// The cached attributes of `ino` are stale, and the cached bytes `data` names with them.
   Inode {
     /// The inode.
     ino: u64,
-    /// Whether the cached data is stale as well.
-    data: bool,
+    /// Which of its cached bytes are stale as well.
+    data: CachedBytes,
   },
   /// Anything the transport's kernel holds of this volume may be stale: the journal no longer holds every record since
   /// the transport's cursor, so which names, attributes and pages changed can no longer be told
@@ -221,6 +220,36 @@ pub enum Invalidation {
   /// transport invalidates every name it handed out and every inode its kernel still references, then resumes from the
   /// cursor returned with it. Writers never wait for a transport that falls behind; this is what it costs instead.
   Everything,
+}
+
+/// Which of an inode's cached bytes an [`Invalidation::Inode`] makes stale along with its attributes (§4.6 "Cache
+/// posture"; A-146). Only the bytes a change touched are named. A guest's DAX map of a file shared through a mount is
+/// held in the kernel's cache, and a whole-file drop for every change made it re-fetch the file: measured on Linux
+/// 7.2.9 under crosvm (2026-10-22), each one-byte change to a 128 MiB file cost the guest's next scan 356–382 ms, against
+/// 0.2–0.3 ms warm. A transport drops at least the pages holding the bytes named; dropping more is never stale.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CachedBytes {
+  /// None: a metadata change (mode, ownership, an extended attribute) leaves the pages alone.
+  Kept,
+  /// The bytes in `[at, at + len)`: an overwrite in place, or bytes appended past the old end.
+  Range {
+    /// The first byte.
+    at: u64,
+    /// How many bytes.
+    len: u64,
+  },
+  /// Every byte from `at` to the end of the file. A truncate drops from its new length, and an insert or a delete from
+  /// where it shifts the rest; [`CachedBytes::ALL`] is used where what changed has no byte range — a directory's
+  /// listing, or a base file an outsider changed.
+  From {
+    /// The first byte.
+    at: u64,
+  },
+}
+
+impl CachedBytes {
+  /// The whole file.
+  pub const ALL: CachedBytes = CachedBytes::From { at: 0 };
 }
 
 /// Where a transport has delivered invalidations up to: its position in the volume's journal and

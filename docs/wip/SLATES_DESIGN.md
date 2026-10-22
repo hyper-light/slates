@@ -2281,8 +2281,18 @@ the mount happened to get a request — indefinitely for a shared map or DAX thr
 `docs/bugs/2026-10-21-a-fuse-mount-hears-of-another-paths-change-only-on-its-next-request.md`). "At once" is measured
 and is *after* the writer is answered: a shared map read the new bytes 52–193 µs after the reply, median 82 µs. AC-3.3's
 "invalidates before it is acknowledged" therefore does not hold for a change through another path; which writers can
-be made to wait for the mount, and which cannot without a deadlock, is open in the ledger. **A page the kernel writes
-back from its cache is applied only where it is not stale** (A-139, A-140). A `WRITE` carrying `FUSE_WRITE_CACHE` is
+be made to wait for the mount, and which cannot without a deadlock, is open in the ledger. **What the kernel is told to
+drop is what changed** (A-146). A content change drops the cached pages holding the bytes it touched, never the whole
+file:
+- an overwrite, or bytes appended past the end, drops its own bytes;
+- a truncate drops from its new length;
+- an insert or a delete drops from its point, since the rest shifts.
+
+A directory's listing, an outsider's change beneath a base, and a mount fallen behind the journal still drop all of it,
+having no byte range. A guest's DAX map of a file shared through a mount lives in that cache. Under a whole-file drop
+for every change, each one-byte change elsewhere to a 128 MiB file made the guest's next scan of its map take 356–382
+ms, against 0.2–0.3 ms warm (Linux 7.2.9, crosvm, 2026-10-22). **A page the kernel writes back from its cache is applied
+only where it is not stale** (A-139, A-140). A `WRITE` carrying `FUSE_WRITE_CACHE` is
 applied except over the bytes another path changed after the kernel's copy of them was fetched, the mount's own writes
 since excepted. That is what one shared page cache would hold. For each byte of a file open for writing, the mount keeps
 the journal point its kernel's copy is as of and whether another path changed it since. These states are fed from the
@@ -11937,6 +11947,40 @@ Applied in the same change to: §4.6 (the same-kernel direct map paragraph + its
 - Realized: `RequestBody::MapRead`/`ReplyBody::Mapped`; `Control::send_mapping`/`Liveness::recv_mapping`/`ClientEnd::recv_mapping`; `Volume::dax_map_read` + `Store::dax_backing` reused; `merge_service::map_read`/`try_local_map`; `Client::map_read` → `MappedRead`. Proven end to end on x86_64 Linux (`a_same_kernel_client_maps_a_file_with_no_copy`).
 - Fixes a latent arena bug the first real descriptor map surfaced: `ChunkArena::block_backing` returned a region-relative offset against the whole-object descriptor, which would have mis-mapped the guest DAX window too; `ExclusiveObject`/`Region`/`block_backing` now return the descriptor-absolute offset (`base + extent.offset()`).
 - Does not change: the guest DAX gate's own contract (still unadvertised, Ada-gated); the copy transport (the universal base); the single-binary model (no VMM embedded). Owed: the cross-shard owner→home descriptor hand-off; an explicit release on the client's drop; the macOS control socket (stubs refuse → copy).
+
+### A-146 — A change drops from a mount's cache only the bytes it touched (accepted 2026-10-22)
+Applied in the same change to:
+- §4.6 (the cache posture);
+- `crates/bridge-core/src/lib.rs` (`CachedBytes`, the type of `Invalidation::Inode`'s `data`);
+- `crates/bridge-core/src/volume_bridge.rs` (`journal_bytes`; a directory's and the base plane's invalidations name
+  `CachedBytes::ALL`);
+- `crates/bridge-fuse/src/channel.rs` (`notified_range`, `TO_THE_END`) and `crates/bridge-fuse/src/abi.rs` (a doc line);
+- the tests: `a_content_change_owes_its_kernel_the_bytes_it_touched_not_the_whole_file` in
+  `crates/bridge-core/tests/invalidation.rs`, whose other expectations now name exact ranges too, and
+  `a_change_through_another_path_drops_only_the_pages_it_changed` in `crates/bridge-fuse/tests/coherence_mount.rs`;
+- `virtiofs.md` §8 item 7 (the crosvm run that found it), `BENCHMARKS.md` (the A/B), GAPS.
+
+- **What it answers.** Every content change through another path was sent to each mount as
+  `FUSE_NOTIFY_INVAL_INODE` for the whole file. The kernel dropped every cached page of the file, after writing back
+  every dirty one. A guest's DAX map of a file shared through the mount lives in that cache, so one changed byte made
+  the guest re-fetch all of it. Found running a real guest under crosvm over a slates mount: with a 128 MiB map, the
+  guest's next scan after each one-byte change took a median of 273 ms, against 0.2–0.3 ms warm.
+- **The rule.** An invalidation names the bytes the change touched:
+  - an overwrite, or bytes appended past the end: exactly those bytes;
+  - a truncate: everything from its new length;
+  - an insert or a delete: everything from its point, since the rest shifts;
+  - a metadata change: no bytes;
+  - a directory's listing, a base witness or drift, and an overrun: the whole file, having no byte range.
+
+  The FUSE transport hands the kernel that range as `off` and `len`, and the kernel drops the pages holding it, a whole
+  folio at a time. A range the ABI's signed offsets cannot express is sent as the rest of the file from where it can
+  still be named; dropping more is never stale.
+- **Why it is safe.** The write-back rule (A-140, A-144) judges each byte against the journal's records, never against
+  what an invalidation laundered. A dirty page outside a changed range keeps its bytes and is judged when it is written
+  back. Both real-mount chaos tests pass unchanged.
+- **Evidence.** The real-mount test: before, the untouched middle block lost 512 of its 512 pages; after, none. The
+  A/B in `BENCHMARKS.md`: the scan after a change went from a median of 273 ms to 0.45 ms, with the cold scan
+  unchanged.
 
 ### A-145 — The anchor starts and restarts its own image, never a path (accepted 2026-10-22)
 Applied in the same change to:
