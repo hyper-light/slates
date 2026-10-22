@@ -10517,9 +10517,16 @@ stale page back, and the other write's bytes on it reverted: measured 4,095 of 4
   v4.0, which D-2 rejects) or recording such sharing as unsupported over v3. Ada's decision.
 - **The direct virtio-fs route** shares `serve_write`, and a guest's page cache gets no invalidation, so its stale
   write-backs are not judged. Its byte states would come from the guest's READs.
-- **The invalidation feed's eviction gap:** a mount whose cursor falls behind the journal's retention silently misses
-  invalidations (`OpLog::since` starts at the oldest retained record). The write-back rule loses every tracked file
-  there and refuses its write-backs `EIO`; the feed does not yet notice. Both rest on the journal's budget, below.
+- **The invalidation feed's eviction gap — fixed 2026-10-22 (A-141).** A mount whose cursor fell behind the journal's
+  retention silently missed invalidations, because `OpLog::since` started at the oldest retained record, and its
+  kernel served the old bytes indefinitely. It was reproduced on the bare-metal box: one SDK client pipelining a ring
+  of writes onto a 256 KiB volume left a FUSE mount serving an acknowledged write's old bytes for 10 s, 2 runs of 33.
+  The gather now reports an overrun (`Invalidation::Everything`). The mount then invalidates every node and name its
+  kernel holds (`KernelHolds`, fed as each reply reaches the kernel) and counts the event as `fuse.journal_overruns`.
+  Writers never wait. The same test passes 30 of 30, and a deterministic real-mount test fails when the overrun is not
+  reported, when the expansion leaves out the nodes, or when it leaves out the names. Record:
+  `docs/bugs/2026-10-22-a-mount-that-falls-behind-the-journal-never-hears-of-the-changes-it-missed.md`. The journal's
+  budget, below, still decides how often an overrun happens.
 - **The journal's budget is not the design's formula, and its ratification is not recorded.** §4.5's derived constants say
   "journal budget = mutation rate × max subscriber lag × record size"; the code takes a fixed 10‰ of the quota
   (`JOURNAL_SHARE_PERMILLE`, `crates/server/src/verbs.rs`). Its doc and its `derived!` anchor both cite a ratification

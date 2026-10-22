@@ -33,7 +33,7 @@ use slates_bridge_fuse::volume_bridge::VolumeBridge;
 use slates_db::catalog::{Principal, VolumeId};
 
 mod common;
-use common::{FailingGather, store, volume_for_owner};
+use common::{FailingGather, JOURNAL_BYTES, store, volume_for_owner};
 
 /// Shape: how long the helper may take to hand back the device, and a report to arrive.
 const MOUNT_WAIT: Duration = Duration::from_secs(60);
@@ -55,6 +55,12 @@ enum Ask {
   Truncate { name: String, size: u64 },
   /// Create `name` in the volume's root through the other attachment.
   Create { name: String },
+  /// Replace `name`'s bytes with `bytes` through the other attachment.
+  Replace { name: String, bytes: Vec<u8> },
+  /// Remove `name` from the volume's root through the other attachment.
+  Remove { name: String },
+  /// Create `name` and write it `times` times through the other attachment, one journal record each.
+  Churn { name: String, times: usize },
   /// Refuse the next invalidation gather (the injected collection failure).
   RefuseNextGather,
   /// Report the loop's counters — answered after the step the ask woke, so a report is a barrier:
@@ -69,6 +75,10 @@ struct Report {
   getattrs: u64,
   /// Gathers the seam refused.
   gather_refusals: u64,
+  /// `READ` requests the kernel sent (a read answered from its page cache sends none).
+  reads: u64,
+  /// Rounds that found the mount behind the journal's retention (A-141).
+  overruns: u64,
 }
 
 fn command_available(name: &str) -> bool {
@@ -95,9 +105,10 @@ impl Drop for Scratch {
   }
 }
 
-fn scratch() -> Scratch {
+/// A scratch directory of its own for the test named `tag`: the tests of this file run at once.
+fn scratch(tag: &str) -> Scratch {
   let root = format!(
-    "{}/slates-coherence-{}",
+    "{}/slates-coherence-{tag}-{}",
     env!("CARGO_TARGET_TMPDIR"),
     std::process::id()
   );
@@ -166,6 +177,8 @@ fn serve(
   };
   let mut state = ServeState::new();
   let mut getattrs = 0u64;
+  let mut reads = 0u64;
+  let mut overruns = 0u64;
   let mut report_pending = false;
   loop {
     let wake = match wait(mounted.channel(), Some(&signal)) {
@@ -204,6 +217,43 @@ fn serve(
             .unwrap();
           attachments.end(other);
         }
+        Ask::Replace { name, bytes } => {
+          let cx = attachments.begin(other).unwrap();
+          let root = bridge.root(&cx).unwrap();
+          let file = bridge.lookup(ObjectId::new(root, 0), &cx, &name).unwrap();
+          let object = ObjectId::new(file.ino, file.generation);
+          bridge
+            .setattr(
+              object,
+              &cx,
+              SetAttr {
+                size: Some(0),
+                ..SetAttr::default()
+              },
+            )
+            .unwrap();
+          bridge.write(object, &cx, 0, &bytes).unwrap();
+          attachments.end(other);
+        }
+        Ask::Remove { name } => {
+          let cx = attachments.begin(other).unwrap();
+          let root = bridge.root(&cx).unwrap();
+          bridge.unlink(ObjectId::new(root, 0), &cx, &name).unwrap();
+          attachments.end(other);
+        }
+        Ask::Churn { name, times } => {
+          let cx = attachments.begin(other).unwrap();
+          let root = bridge.root(&cx).unwrap();
+          let (made, fh) = bridge
+            .create(ObjectId::new(root, 0), &cx, &name, 0o100644, 1)
+            .unwrap();
+          let object = ObjectId::new(made.ino, made.generation);
+          bridge.release(object, &cx, fh).unwrap();
+          for round in 0..times {
+            bridge.write(object, &cx, 0, &round.to_le_bytes()).unwrap();
+          }
+          attachments.end(other);
+        }
         Ask::RefuseNextGather => bridge.refuse_gathers = 1,
         Ask::Report => report_pending = true,
       }
@@ -227,14 +277,21 @@ fn serve(
         opcode: Some(Opcode::GetAttr),
         ..
       } => getattrs += 1,
+      Step::Request {
+        opcode: Some(Opcode::Read),
+        ..
+      } => reads += 1,
       Step::Ended => return Ok(()),
       _ => {}
     }
+    overruns += state.take_journal_overruns();
     if std::mem::take(&mut report_pending) {
       reports
         .send(Report {
           getattrs,
           gather_refusals: state.coherence.gather_refusals(),
+          reads,
+          overruns,
         })
         .unwrap();
     }
@@ -275,24 +332,20 @@ impl Loop {
   }
 }
 
-/// AUD-02 over a real mount: the kernel's warm, unbounded attribute cache is told of another
-/// attachment's change with no kernel request in flight (the change signal), and a gather the seam
-/// refuses under a request is retried at the next wake rather than skipped.
-#[test]
-fn a_change_through_another_attachment_reaches_the_kernel_without_a_request_and_a_refused_gather_is_retried()
- {
+/// Runs `phases` against a real FUSE mount served by [`serve`] on a thread of its own, named `tag`; skips loudly when
+/// the host cannot mount. The scratch unmounts during unwind before the scope joins its server.
+fn with_mounted_loop(tag: &str, phases: impl FnOnce(&Loop, &str)) {
   if !command_available("fusermount3") {
-    eprintln!("skipping the mounted coherence proof: fusermount3 is not on this host");
+    eprintln!("skipping the mounted coherence proof ({tag}): fusermount3 is not on this host");
     return;
   }
-  // The scratch unmounts during unwind before the scope joins its server.
   std::thread::scope(|scope| {
-    let scratch = scratch();
+    let scratch = scratch(tag);
     let mounted = match mount(&scratch.mount_point, &[], MOUNT_WAIT) {
       Ok(mounted) => mounted,
       Err(MountError::NoDevice { exit, .. } | MountError::Helper { exit, .. }) => {
         eprintln!(
-          "skipping the mounted coherence proof: fusermount3 refused the mount or found no /dev/fuse (exit {exit:?})"
+          "skipping the mounted coherence proof ({tag}): fusermount3 refused the mount or found no /dev/fuse (exit {exit:?})"
         );
         return;
       }
@@ -309,16 +362,99 @@ fn a_change_through_another_attachment_reaches_the_kernel_without_a_request_and_
       reports,
     };
     let mount_point = scratch.mount_point.clone();
-    let cached = warm_and_prove_cached(&control, &mount_point);
-    let told = a_change_is_seen_without_a_request(&control, &mount_point, cached);
-    a_refused_gather_is_retried(&control, &mount_point, told);
-    a_name_cached_absent_in_the_root_appears_when_another_attachment_makes_it(
-      &control,
-      &mount_point,
-    );
-
+    phases(&control, &mount_point);
     drop(scratch);
     server.join().unwrap().unwrap();
+  });
+}
+
+/// AUD-02 over a real mount: the kernel's warm, unbounded attribute cache is told of another
+/// attachment's change with no kernel request in flight (the change signal), and a gather the seam
+/// refuses under a request is retried at the next wake rather than skipped.
+#[test]
+fn a_change_through_another_attachment_reaches_the_kernel_without_a_request_and_a_refused_gather_is_retried()
+ {
+  with_mounted_loop("aud02", |control, mount_point| {
+    let cached = warm_and_prove_cached(control, mount_point);
+    let told = a_change_is_seen_without_a_request(control, mount_point, cached);
+    a_refused_gather_is_retried(control, mount_point, told);
+    a_name_cached_absent_in_the_root_appears_when_another_attachment_makes_it(control, mount_point);
+  });
+}
+
+/// Shape: the writes the overrun test makes in one wake: twice the records the scratch volume's journal keeps (each
+/// write one record), so the mount's next round finds its cursor past retention.
+const CHURN_WRITES: usize =
+  2 * JOURNAL_BYTES / std::mem::size_of::<slates_vfs::journal::OpRecord>();
+/// Shape: how long a change may take to show through the mount once its round is out: the notify thread's write, far
+/// above it.
+const DELIVERY_WAIT: Duration = Duration::from_secs(10);
+
+/// Whether `check` holds within [`DELIVERY_WAIT`], asked every [`POLL_MS`].
+fn eventually(mut check: impl FnMut() -> bool) -> bool {
+  let deadline = Instant::now() + DELIVERY_WAIT;
+  loop {
+    if check() {
+      return true;
+    }
+    if Instant::now() >= deadline {
+      return false;
+    }
+    // The test harness paces its polls; shipped code parks on its driver (D-9).
+    #[allow(clippy::disallowed_methods)]
+    std::thread::sleep(Duration::from_millis(POLL_MS));
+  }
+}
+
+/// A-141 over a real mount: a mount that falls behind its volume journal's retention is told that anything it holds
+/// may be stale, and invalidates exactly what its kernel holds, so neither a replaced file's page nor a removed name
+/// outlives the change (`docs/bugs/2026-10-22-a-mount-that-falls-behind-the-journal-never-hears-of-the-changes-it-missed.md`).
+/// Do: through the mount, write `kept` and `gone`, read `kept` and stat `gone`, and prove `kept`'s page cached (a second
+/// read sends no `READ`); then, in the loop's one wake, replace `kept` and remove `gone` through another attachment and
+/// write a third file [`CHURN_WRITES`] times, past what the journal keeps. Expect the round to count an overrun, `kept`
+/// to read the replacement, and `gone` to be absent through the mount.
+#[test]
+fn a_mount_behind_the_journal_drops_everything_its_kernel_holds() {
+  with_mounted_loop("overrun", |control, mount_point| {
+    through_the_mount(
+      mount_point,
+      "printf A > \"$1/kept\"; printf G > \"$1/gone\"",
+    );
+    assert_eq!(through_the_mount(mount_point, "cat \"$1/kept\""), "A");
+    through_the_mount(mount_point, "stat \"$1/gone\" > /dev/null");
+    let warm = control.report();
+    assert_eq!(through_the_mount(mount_point, "cat \"$1/kept\""), "A");
+    let cached = control.report();
+    assert_eq!(
+      cached.reads, warm.reads,
+      "kept's page is the kernel's: a second read sends no READ"
+    );
+
+    control.ask_quietly(Ask::Replace {
+      name: "kept".to_owned(),
+      bytes: b"Z".to_vec(),
+    });
+    control.ask_quietly(Ask::Remove {
+      name: "gone".to_owned(),
+    });
+    control.ask(Ask::Churn {
+      name: "churn".to_owned(),
+      times: CHURN_WRITES,
+    });
+    let told = control.report();
+    assert!(
+      told.overruns > cached.overruns,
+      "the round found the mount behind the journal: {told:?}"
+    );
+    assert!(
+      eventually(|| through_the_mount(mount_point, "cat \"$1/kept\"") == "Z"),
+      "the replacement is read through the mount"
+    );
+    let probe = "test -e \"$1/gone\" && echo present || echo absent";
+    assert!(
+      eventually(|| through_the_mount(mount_point, probe) == "absent"),
+      "the removed name is gone through the mount"
+    );
   });
 }
 

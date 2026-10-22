@@ -483,6 +483,11 @@ impl Bridge for ScopedBridge<'_> {
       let object = match &invalidation {
         Invalidation::Inode { ino, .. } => *ino,
         Invalidation::Entry { parent, .. } => *parent,
+        // It names no object: it stands for whatever this transport's kernel holds, which is all within the scope.
+        Invalidation::Everything => {
+          out.push(invalidation);
+          continue;
+        }
       };
       if self
         .inner

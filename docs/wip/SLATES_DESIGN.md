@@ -2282,6 +2282,12 @@ retention. Two other ways were measured and rejected:
 - Walking the journal back from each fetch cannot either, because a long-lived map outlives the journal's retention
   (A-140).
 
+**A mount that falls behind the journal is told everything** (A-141). The journal keeps a bounded share of the quota.
+When more changes land between two of a mount's rounds than it keeps, the gather reports an overrun instead of walking
+from the oldest record still held, which silently skipped the rest. The mount then invalidates every node and name its
+kernel holds, which it knows by following the FUSE lookup protocol as each reply reaches the kernel. Writers never wait
+on a mount that falls behind; an overrun costs a cold cache instead, counted as `fuse.journal_overruns`.
+
 §4.15 supplies the source
 validation rules; finite stale-data TTLs do not silently become exact live-source semantics. The
 launcher (`slates exec`) implements the chosen-path form with `CLONE_NEWUSER|CLONE_NEWNS`,
@@ -11907,6 +11913,36 @@ Applied in the same change to: §4.6 (the same-kernel direct map paragraph + its
 - Realized: `RequestBody::MapRead`/`ReplyBody::Mapped`; `Control::send_mapping`/`Liveness::recv_mapping`/`ClientEnd::recv_mapping`; `Volume::dax_map_read` + `Store::dax_backing` reused; `merge_service::map_read`/`try_local_map`; `Client::map_read` → `MappedRead`. Proven end to end on x86_64 Linux (`a_same_kernel_client_maps_a_file_with_no_copy`).
 - Fixes a latent arena bug the first real descriptor map surfaced: `ChunkArena::block_backing` returned a region-relative offset against the whole-object descriptor, which would have mis-mapped the guest DAX window too; `ExclusiveObject`/`Region`/`block_backing` now return the descriptor-absolute offset (`base + extent.offset()`).
 - Does not change: the guest DAX gate's own contract (still unadvertised, Ada-gated); the copy transport (the universal base); the single-binary model (no VMM embedded). Owed: the cross-shard owner→home descriptor hand-off; an explicit release on the client's drop; the macOS control socket (stubs refuse → copy).
+
+### A-141 — A mount that falls behind the journal is told everything, and drops what its kernel holds (accepted 2026-10-22)
+Applied in the same change to: §4.6 (cache posture); `crates/bridge-core` (`Invalidation::Everything`; the overrun
+check in `VolumeBridge::invalidations`; `ScopedBridge` passes it through); `crates/bridge-fuse` (`coherence.rs`
+`KernelHolds`; `bridge.rs` `KernelChange`/`kernel_changes`; `channel.rs`: the holdings fed as each reply reaches the
+kernel, an `Everything` expanded in the round, `fuse.journal_overruns`); `crates/server/src/fuse.rs` (the counter);
+tests in `bridge-core/tests/invalidation.rs`, `bridge-fuse/tests/kernel_changes.rs` and `coherence_mount.rs`, and
+`cli/tests/cli.rs`; GAPS; the bug record.
+- **Changes §4.6.** The journal keeps a bounded share of the quota. A mount whose cursor has fallen behind its
+  retention can no longer be told which names, attributes and pages changed. Walking from the oldest record still held
+  skipped the rest, and the kernel kept serving them. The gather now reports an overrun, `Invalidation::Everything`,
+  and the mount invalidates everything its kernel holds, then resumes from the head:
+  - every node it references, with an attribute-and-data invalidation, and the root;
+  - every name it holds, with an entry invalidation, expire-only where negotiated.
+
+  The mount knows what its kernel holds by following the FUSE lookup protocol as each reply reaches the kernel:
+  - entry replies add a lookup and a name, and `FORGET` gives lookups back;
+  - its own unlinks and renames take names away or move them;
+  - an invalidation of a name takes it away, since a later use is a new lookup.
+- **Why writers never wait instead** (the alternative weighed in the bug record). Holding the journal for a lagging
+  mount would make writers wait on mounts. That is the AC-3.3 machinery, and a mount whose round is blocked in its
+  kernel would hold every writer behind it. Pushing changes to each mount as they are journaled would keep a second
+  record of every change beside the journal. An overrun costs one burst of notifications and a cold kernel cache, and
+  only when the bound is reached.
+- **Evidence.** One SDK client pipelining a ring of writes onto a volume with a one-page journal left a FUSE mount
+  serving an acknowledged write's old bytes for 10 s, 2 runs of 33. A trace showed the change's records evicted before
+  the mount's gather ("since 7, oldest 16").
+- **Proven.** See the bug record's verification.
+- **What it does not change.** Rounds within retention, the byte states (an overrun already loses them: A-140 refuses
+  their write-backs `EIO`), and the journal's budget, which stays as the ledger records it.
 
 ### A-140 — A cache write-back is judged by byte states the mount keeps as it consumes the journal (accepted 2026-10-22)
 Applied in the same change to: §4.6 (cache posture); A-139 (its basis superseded); `crates/bridge-core`

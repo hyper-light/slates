@@ -346,6 +346,143 @@ pub fn created_node(opcode: Option<Opcode>, reply: &[u8]) -> Option<u64> {
   u64_at(success_body(reply)?, 0)
 }
 
+/// One change a delivered reply, or a request that takes none, made to what the kernel holds of the volume
+/// ([`crate::coherence::KernelHolds`], A-141).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KernelChange<'a> {
+  /// The kernel took a lookup on `node`, handed out as `name` in `parent`: no name for an `O_TMPFILE`.
+  HandedOut {
+    /// The directory the name is in (a FUSE node id).
+    parent: u64,
+    /// The name.
+    name: Option<&'a str>,
+    /// The node it names.
+    node: u64,
+  },
+  /// The kernel gave back `count` lookups on `node`.
+  Forgot {
+    /// The node.
+    node: u64,
+    /// The lookups given back.
+    count: u64,
+  },
+  /// The mount's own unlink or rmdir took `name` in `parent` away.
+  Unnamed {
+    /// The directory.
+    parent: u64,
+    /// The name.
+    name: &'a str,
+  },
+  /// The mount's own rename moved `from` to `to`, or swapped the two (`RENAME_EXCHANGE`).
+  Renamed {
+    /// The old directory and name.
+    from: (u64, &'a str),
+    /// The new directory and name.
+    to: (u64, &'a str),
+    /// The two were exchanged.
+    exchange: bool,
+  },
+}
+
+/// Hands `f` each change to what the kernel holds that `request` made once its `reply` reached the kernel (A-141):
+/// - the entries a success reply granted, read where [`reclaim_unreported`] reads them;
+/// - the lookups a `FORGET` or a `BATCH_FORGET` gave back (these take no reply);
+/// - the names a successful `UNLINK`, `RMDIR` or `RENAME` took away or moved.
+///
+/// An error reply changed nothing.
+pub fn kernel_changes<'a>(request: &'a [u8], reply: &'a [u8], f: &mut dyn FnMut(KernelChange<'a>)) {
+  /// Format: `fuse_mknod_in` and `fuse_create_in` before the name: four words.
+  const FOUR_WORDS: usize = 4 * size_of::<u32>();
+  /// Format: `fuse_mkdir_in` (mode, umask) and `fuse_link_in` (oldnodeid) before the name: eight bytes.
+  const EIGHT_BYTES: usize = size_of::<u64>();
+  let Ok(parsed) = Request::parse(request) else {
+    return;
+  };
+  let Some(opcode) = parsed.opcode else {
+    return;
+  };
+  let (parent, body) = (parsed.header.nodeid, parsed.body);
+  match opcode {
+    Opcode::Forget => {
+      if let Some(count) = u64_at(body, 0) {
+        f(KernelChange::Forgot {
+          node: parent,
+          count,
+        });
+      }
+      return;
+    }
+    Opcode::BatchForget => {
+      // `fuse_batch_forget_in`: count (4), dummy (4), then `count` × (nodeid, nlookup), as `serve_batch_forget` reads.
+      const HEAD: usize = 2 * size_of::<u32>();
+      const ENTRY: usize = 2 * size_of::<u64>();
+      let claimed = body
+        .get(..size_of::<u32>())
+        .and_then(|word| word.try_into().ok())
+        .map_or(0, |word| {
+          usize::try_from(u32::from_le_bytes(word)).unwrap_or(usize::MAX)
+        });
+      let (whole, _partial) = body.get(HEAD..).unwrap_or_default().as_chunks::<ENTRY>();
+      for entry in whole.iter().take(claimed) {
+        if let (Some(node), Some(count)) = (u64_at(entry, 0), u64_at(entry, size_of::<u64>())) {
+          f(KernelChange::Forgot { node, count });
+        }
+      }
+      return;
+    }
+    _ => {}
+  }
+  let Some(granted) = success_body(reply) else {
+    return;
+  };
+  let entry = |name_at: usize| -> Option<KernelChange<'a>> {
+    Some(KernelChange::HandedOut {
+      parent,
+      name: Some(parse_name(body.get(name_at..)?).ok()?),
+      node: u64_at(granted, 0)?,
+    })
+  };
+  let change = match opcode {
+    Opcode::Lookup | Opcode::SymLink => entry(0),
+    Opcode::MkNod | Opcode::Create => entry(FOUR_WORDS),
+    Opcode::MkDir | Opcode::Link => entry(EIGHT_BYTES),
+    Opcode::TmpFile => u64_at(granted, 0).map(|node| KernelChange::HandedOut {
+      parent,
+      name: None,
+      node,
+    }),
+    Opcode::Unlink | Opcode::RmDir => parse_name(body)
+      .ok()
+      .map(|name| KernelChange::Unnamed { parent, name }),
+    Opcode::Rename | Opcode::Rename2 => {
+      RenameIn::parse(opcode.to_wire(), body, opcode == Opcode::Rename2)
+        .ok()
+        .map(|rename| KernelChange::Renamed {
+          from: (parent, rename.old_name),
+          to: (rename.newdir, rename.new_name),
+          exchange: rename.flags & RenameIn::RENAME_EXCHANGE != 0,
+        })
+    }
+    Opcode::ReadDirPlus => {
+      for (node, name) in plus_entries(granted) {
+        // "." and ".." are never referenced by READDIRPLUS (the kernel never forgets them).
+        if let (false, Ok(name)) = (name == b"." || name == b"..", std::str::from_utf8(name)) {
+          f(KernelChange::HandedOut {
+            parent,
+            name: Some(name),
+            node,
+          });
+        }
+      }
+      None
+    }
+    _ => None,
+  };
+  if let Some(change) = change {
+    f(change);
+  }
+}
+
 /// Whether an `OPEN` or a `CREATE` asked for writing: its body's `flags` (the first word of `fuse_open_in` and of
 /// `fuse_create_in`) carry an access mode other than read-only. `None` for any other request.
 pub fn opens_for_writing(opcode: Option<Opcode>, body: &[u8]) -> Option<bool> {

@@ -36,8 +36,8 @@ use rustix::fs::{Mode, OFlags};
 
 use crate::abi::{IN_HEADER_LEN, OUT_HEADER_LEN, Opcode};
 use crate::allocate::{Allocation, Begun};
-use crate::bridge::Bridge;
-use crate::coherence::{Coherence, Delivered, OwnRecords, PageStates, WritableOpens};
+use crate::bridge::{Bridge, KernelChange};
+use crate::coherence::{Coherence, Delivered, KernelHolds, OwnRecords, PageStates, WritableOpens};
 use crate::dispatch;
 use crate::error::FuseError;
 use crate::init::negotiate;
@@ -248,6 +248,8 @@ fn encode_invalidation(invalidation: &Invalidation, expire_only: bool) -> Option
         inval_inode(*ino, ATTRIBUTES_ONLY, 0, &mut out)
       }
     }
+    // Never one message: the round expands it into what the kernel holds ([`everything_told`]).
+    Invalidation::Everything => return None,
   };
   let n = encoded.ok()?;
   Some((out.get(..n)?.to_vec(), entry))
@@ -553,6 +555,12 @@ pub struct ServeState {
   /// were lost, or the journal no longer held the records needed), since this was last read. Read and cleared by the
   /// owner that reports it.
   writebacks_unknown: u64,
+  /// What this mount's kernel holds of the volume — every node it references and every name it was handed — fed by
+  /// each reply as it reaches the kernel: what an overrun invalidates (A-141).
+  holds: KernelHolds,
+  /// Rounds that found this mount behind the journal's retention and invalidated everything its kernel holds, since
+  /// this was last read. Read and cleared by the owner that reports it.
+  journal_overruns: u64,
 }
 
 impl std::fmt::Debug for ServeState {
@@ -583,6 +591,8 @@ impl ServeState {
       started_at: None,
       writeback_bytes_kept_back: 0,
       writebacks_unknown: 0,
+      holds: KernelHolds::default(),
+      journal_overruns: 0,
     }
   }
 
@@ -596,6 +606,12 @@ impl ServeState {
   /// ([`dispatch_request`]).
   pub fn take_writebacks_unknown(&mut self) -> u64 {
     std::mem::take(&mut self.writebacks_unknown)
+  }
+
+  /// The rounds that found this mount behind the journal's retention since this was last asked, and zero afterwards:
+  /// each invalidated everything the kernel held (A-141). Zero is the healthy reading.
+  pub fn take_journal_overruns(&mut self) -> u64 {
+    std::mem::take(&mut self.journal_overruns)
   }
 
   /// The entry invalidations the kernel has refused since this was last asked, and zero afterwards. A non-zero
@@ -789,16 +805,31 @@ fn deliver_owed(
   let root = bridge.root(cx).ok();
   let before = state.coherence.cursor();
   let mut messages: Vec<(Vec<u8>, bool)> = Vec::new();
+  let mut overran = false;
+  let holds = &mut state.holds;
   let delivered = state
     .coherence
     .deliver(bridge, cx, &mut |invalidation: &Invalidation| {
-      if let Some(message) =
-        encode_invalidation(&addressed_to_the_kernel(invalidation, root), expire_only)
-      {
+      if matches!(invalidation, Invalidation::Everything) {
+        overran = true;
+        everything_told(holds, expire_only, &mut messages);
+        return Ok::<(), ChannelError>(());
+      }
+      let addressed = addressed_to_the_kernel(invalidation, root);
+      if let Some(message) = encode_invalidation(&addressed, expire_only) {
+        // The kernel drops or expires the name as this round reaches it; a later use is a new lookup that names it
+        // again ([`KernelHolds::unnamed`]). Taken now, not when the round returns, so a lookup answered meanwhile is
+        // never lost.
+        if let Invalidation::Entry { parent, name, .. } = &addressed {
+          holds.unnamed(*parent, name);
+        }
         messages.push(message);
       }
       Ok::<(), ChannelError>(())
     })?;
+  if overran {
+    state.journal_overruns = state.journal_overruns.saturating_add(1);
+  }
   // The records this round gathered, consumed by the byte states from the same point (the dirty-page write-back rule).
   // Before the first round nothing is tracked, so there is nothing to feed.
   if let (false, Some(since)) = (delivered.gather_refused, before) {
@@ -817,6 +848,39 @@ fn deliver_owed(
     )?);
   }
   Ok(delivered)
+}
+
+/// The messages an `Everything` becomes (A-141): an attribute-and-data invalidation of every node the kernel references
+/// and of the root, and an entry invalidation of every name it holds — expire-only where the kernel took that, so a
+/// busy directory is revalidated rather than torn down
+/// (`docs/bugs/2026-10-22-a-mount-that-falls-behind-the-journal-never-hears-of-the-changes-it-missed.md`). The kernel
+/// may have dropped some of these already, so its `ENOENT` for a name here is expected and is not counted as a refusal.
+fn everything_told(
+  holds: &mut KernelHolds,
+  expire_only: bool,
+  messages: &mut Vec<(Vec<u8>, bool)>,
+) {
+  let (nodes, names) = holds.invalidate_everything();
+  for ino in nodes
+    .into_iter()
+    .chain(std::iter::once(crate::bridge::FUSE_ROOT_ID))
+  {
+    if let Some(message) =
+      encode_invalidation(&Invalidation::Inode { ino, data: true }, expire_only)
+    {
+      messages.push(message);
+    }
+  }
+  for (parent, name) in names {
+    let entry = Invalidation::Entry {
+      parent,
+      name,
+      expire: true,
+    };
+    if let Some((message, _counted)) = encode_invalidation(&entry, expire_only) {
+      messages.push((message, false));
+    }
+  }
 }
 
 /// `invalidation` with the volume's root inode (`root`) named as the kernel names it, node id 1.
@@ -842,6 +906,7 @@ fn addressed_to_the_kernel(invalidation: &Invalidation, root: Option<u64>) -> In
       ino: kernel(*ino),
       data: *data,
     },
+    Invalidation::Everything => Invalidation::Everything,
   }
 }
 
@@ -935,6 +1000,20 @@ fn note_opens_and_fetches(
     }
     _ => {}
   }
+}
+
+/// Feeds what `request` made the kernel hold now that its reply of `len` bytes reached it — or at once, for a request
+/// that takes no reply (a `FORGET`): the entries it handed out, the lookups given back, the names taken away or moved
+/// ([`KernelHolds`], A-141). A reply the kernel never received is not fed, so nothing it granted is counted as held.
+fn note_delivered(request: &[u8], len: usize, state: &mut ServeState) {
+  let reply = state.reply.get(..len).unwrap_or(&[]);
+  let holds = &mut state.holds;
+  crate::bridge::kernel_changes(request, reply, &mut |change| match change {
+    KernelChange::HandedOut { parent, name, node } => holds.handed_out(parent, name, node),
+    KernelChange::Forgot { node, count } => holds.forgot(node, count),
+    KernelChange::Unnamed { parent, name } => holds.unnamed(parent, name),
+    KernelChange::Renamed { from, to, exchange } => holds.renamed(from, to, exchange),
+  });
 }
 
 /// Forgets the writable handle a lost `OPEN` or `CREATE` reply granted, when the server gives it back itself
@@ -1103,6 +1182,8 @@ fn serve_request(
       cx,
     );
     forget_unreported_open(state, opcode, n);
+  } else {
+    note_delivered(request, n, state);
   }
   state.coherence.served_own_request(bridge, cx, delivered);
   Ok((delivered, error))
@@ -1379,10 +1460,17 @@ pub fn send_reply(
   refuse_with: Option<i32>,
 ) -> Result<Sent, ChannelError> {
   if dispatched.len == 0 {
+    note_delivered(&dispatched.request, 0, state);
     return Ok(Sent::Delivered);
   }
   match refuse_with {
-    None => channel.write_reply(state.reply.get(..dispatched.len).unwrap_or(&[])),
+    None => {
+      let sent = channel.write_reply(state.reply.get(..dispatched.len).unwrap_or(&[]))?;
+      if sent == Sent::Delivered {
+        note_delivered(&dispatched.request, dispatched.len, state);
+      }
+      Ok(sent)
+    }
     Some(errno) => {
       let n = ReplyHeader::write_error(dispatched.unique, errno, &mut state.reply)
         .map_err(ChannelError::from)?;

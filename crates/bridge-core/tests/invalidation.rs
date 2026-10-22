@@ -255,6 +255,74 @@ fn a_change_outside_the_transport_owes_its_kernel_entries_and_the_transports_own
   assert_eq!(owed, vec![inode(f, false)]);
 }
 
+/// Shape: a journal that keeps four records' fixed parts, so a handful of changes evicts the oldest.
+const FOUR_RECORDS: usize = 4 * std::mem::size_of::<slates_vfs::journal::OpRecord>();
+
+/// §4.6 cache posture at the journal's bound: a transport whose cursor has fallen behind the journal's retention is
+/// told that anything its kernel holds may be stale. Walking from the oldest record still held skipped the changes in
+/// between, and a mount served them stale indefinitely
+/// (`docs/bugs/2026-10-22-a-mount-that-falls-behind-the-journal-never-hears-of-the-changes-it-missed.md`). Do: with a
+/// journal that keeps four records, take the transport's cursor; write `a` through the volume and gather (within
+/// retention it owes `a`'s own invalidation); from the same cursor, write `b` eight more times and gather again.
+/// Expect the second gather to owe exactly `Everything` and to return the head, and a gather from there to owe nothing.
+#[test]
+fn a_transport_behind_the_journals_retention_is_told_everything() {
+  fn bridge<'v>(
+    vol: &'v mut Volume,
+    store: &'v mut Store,
+    handles: &'v mut Slab<u64>,
+  ) -> VolumeBridge<'v> {
+    VolumeBridge::attached(VolumeId { bytes: [0; 16] }, vol, store, handles, None)
+  }
+  let mut store = store();
+  let mut vol = Volume::create(
+    &mut store,
+    VolumeConfig {
+      journal_bytes: FOUR_RECORDS,
+      ..config(3)
+    },
+  )
+  .unwrap();
+  let mut handles = new_handle_store();
+  let cx = rw_cx();
+  let root = vol.root();
+  let a = vol.create_file(&mut store, root, "a", 0o644).unwrap();
+  let b = vol.create_file(&mut store, root, "b", 0o644).unwrap();
+  let cursor = bridge(&mut vol, &mut store, &mut handles).seen(&cx);
+
+  vol.write(&mut store, a, 0, b"new").unwrap();
+  let mut owed = Vec::new();
+  bridge(&mut vol, &mut store, &mut handles)
+    .invalidations(&cx, cursor, &mut owed)
+    .unwrap();
+  assert_eq!(
+    owed,
+    vec![inode(a.0, true)],
+    "within retention: the change itself"
+  );
+
+  owed.clear();
+  for round in 0..8u8 {
+    vol.write(&mut store, b, 0, &[round]).unwrap();
+  }
+  let next = bridge(&mut vol, &mut store, &mut handles)
+    .invalidations(&cx, cursor, &mut owed)
+    .unwrap();
+  assert_eq!(
+    owed,
+    vec![Invalidation::Everything],
+    "past retention: anything the kernel holds may be stale"
+  );
+  let head = bridge(&mut vol, &mut store, &mut handles).seen(&cx);
+  assert_eq!(next, head, "the transport resumes from the head");
+
+  owed.clear();
+  bridge(&mut vol, &mut store, &mut handles)
+    .invalidations(&cx, next, &mut owed)
+    .unwrap();
+  assert!(owed.is_empty(), "caught up: {owed:?}");
+}
+
 /// A watcher hint on a base directory (an outsider replaced a file beneath it) owes the transport
 /// an expire-only invalidation for every live entry the kernel may hold under that directory and
 /// an inode invalidation for each, plus the directory's own; the next lookup then re-lists (the
@@ -347,6 +415,7 @@ fn a_scoped_view_filters_an_out_of_scope_base_plane_hint() {
     owed.iter().any(|inv| match inv {
       Invalidation::Inode { ino, .. } => *ino == other_ino || *ino == secret,
       Invalidation::Entry { parent, .. } => *parent == other_ino,
+      Invalidation::Everything => false,
     })
   };
 

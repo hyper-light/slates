@@ -44,6 +44,10 @@ pub(crate) fn store() -> Store {
   )
 }
 
+/// Shape: the scratch volume's journal budget — room for every record most tests make, and small enough that a test
+/// can outrun it on purpose.
+pub(crate) const JOURNAL_BYTES: usize = 1 << 16;
+
 /// A scratch volume in `store`, journalled so the seam can report what changed (§4.6).
 pub(crate) fn volume(store: &mut Store) -> Volume {
   Volume::create(
@@ -52,7 +56,7 @@ pub(crate) fn volume(store: &mut Store) -> Volume {
       prefix: 1,
       names: NameEquivalence::Exact,
       quota: Quota::Bounded { limit: 1 << 30 },
-      journal_bytes: 1 << 16,
+      journal_bytes: JOURNAL_BYTES,
       clock: Box::new(HostClock::default()),
     },
   )

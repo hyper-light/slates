@@ -5994,6 +5994,159 @@ fn a_long_lived_maps_write_back_survives_unrelated_activity_past_the_journal() {
   );
 }
 
+/// Shape: the quota of the eviction test's volume, small enough that its journal is the one-page floor (the daemon's
+/// 10‰ share of it is under a page), so the journal keeps a page's worth of records: some 46 at 4 KiB.
+#[cfg(target_os = "linux")]
+const ONE_PAGE_JOURNAL_QUOTA: &str = "256KiB";
+/// Shape: the replacements of another file sent in one batch after the change the mount must hear of. Each journals
+/// at least two records, so the batch alone holds more than a one-page journal keeps; with the first, one ring's
+/// worth of requests (32 slots, the daemon's boot log).
+#[cfg(target_os = "linux")]
+const PIPELINED_REPLACEMENTS: usize = 31;
+/// Shape: the eviction test's file length: small enough that a whole replacement fits one ring slot, which a page does
+/// not (4,149 bytes offered against a 4,096-byte slot, measured 2026-10-22).
+#[cfg(target_os = "linux")]
+const PIPELINED_FILE_BYTES: usize = 64;
+
+/// A volume whose journal is the one-page floor: `a.bin` and `b.bin` written through the SDK client that later
+/// replaces them, and the volume mounted through the CLI (Linux FUSE). Fields drop in order, so the mount goes before
+/// the anchor.
+#[cfg(target_os = "linux")]
+struct OnePageJournal {
+  writer: slates_client::Client,
+  volume: slates_client::VolumeId,
+  attachment: u64,
+  point: MountPoint,
+  _anchor: AnchorProcess,
+}
+
+#[cfg(target_os = "linux")]
+impl OnePageJournal {
+  /// Starts a daemon, creates the volume, writes both files and mounts it.
+  fn new(tag: &str) -> OnePageJournal {
+    let instance = format!("cli-{tag}-{}", std::process::id());
+    let anchor = start_anchor(&instance);
+    let created = ["volume", "create", tag, "--bounded", ONE_PAGE_JOURNAL_QUOTA];
+    let (code, out, err) = run(&instance, &created);
+    assert_eq!(code, 0, "{err}");
+    let id = value_of(&out, "id");
+    let deadlines = slates_client::Deadlines::derive(
+      slates_server::daemon::LIVENESS_BUDGET_NS,
+      slates_db::replay::RECOVERY_BUDGET_NS,
+    )
+    .get();
+    let mut writer = slates_client::Client::connect(&instance, deadlines).unwrap();
+    let volume = volume_id_of(&id);
+    let attachment = writer
+      .attach(volume, None, slates_client::Intent::Write)
+      .unwrap()
+      .attachment;
+    for (path, fill) in [("a.bin", b'A'), ("b.bin", b'0')] {
+      let wrote = writer.fs_write(
+        (volume, attachment),
+        path,
+        &[fill; PIPELINED_FILE_BYTES],
+        FILE_MODE,
+      );
+      assert!(wrote.is_ok(), "{path}: {wrote:?}");
+    }
+    let point = MountPoint {
+      path: fresh_mount_point(),
+    };
+    let (code, _, err) = run(&instance, &["mount", &id, &point.path]);
+    assert_eq!(code, 0, "slates mount: {err}");
+    OnePageJournal {
+      writer,
+      volume,
+      attachment,
+      point,
+      _anchor: anchor,
+    }
+  }
+
+  /// `name`, read whole through the mount.
+  #[allow(clippy::disallowed_methods)] // the test's own reads through the slates mount: RAM, not disk
+  fn read_through_mount(&self, name: &str) -> Vec<u8> {
+    std::fs::read(format!("{}/{name}", self.point.path)).unwrap()
+  }
+
+  /// A whole-file replacement of `path` with [`PIPELINED_FILE_BYTES`] of `fill`, as the SDK sends it.
+  fn replacement(&self, path: &str, fill: u8) -> slates_ipc::protocol::RequestBody {
+    slates_ipc::protocol::RequestBody::FsWrite {
+      volume: self.volume,
+      attachment: self.attachment,
+      path: path.to_owned(),
+      bytes: vec![fill; PIPELINED_FILE_BYTES],
+      mode: FILE_MODE,
+    }
+  }
+
+  /// Sends every request in `batch` without waiting, then collects each reply within [`WAIT_FOR`]: every one the end of
+  /// a write.
+  fn pipeline(&mut self, batch: &[slates_ipc::protocol::RequestBody]) {
+    let sent: Vec<_> = batch
+      .iter()
+      .map(|body| self.writer.begin(body).unwrap())
+      .collect();
+    let started = Instant::now();
+    for request in sent {
+      let reply = loop {
+        let spin = self.writer.published_spin_ns();
+        if let Some(reply) = self.writer.spin_reply(request, spin).unwrap() {
+          break reply;
+        }
+        assert!(started.elapsed() < WAIT_FOR, "no reply to {request:?}");
+      };
+      assert!(
+        matches!(reply, slates_ipc::protocol::ReplyBody::FsDone { .. }),
+        "{reply:?}"
+      );
+    }
+  }
+
+  /// Whether reading `name` through the mount comes to show `expected` within [`WAIT_FOR`].
+  fn comes_to_read(&self, name: &str, expected: &[u8]) -> bool {
+    let started = Instant::now();
+    while self.read_through_mount(name) != expected {
+      if started.elapsed() >= WAIT_FOR {
+        return false;
+      }
+      pause();
+    }
+    true
+  }
+}
+
+/// §4.6 cache posture: a change must reach a mount's kernel even when more changes follow it than the journal keeps
+/// before the mount's next round, or the kernel serves its cached copy for as long as it holds it (A-141). Do: on a
+/// volume whose journal holds one page of records, cache `a.bin` through a FUSE mount; send, without waiting, a
+/// replacement of `a.bin` and then [`PIPELINED_REPLACEMENTS`] replacements of `b.bin` through the SDK; collect every
+/// reply; read `a.bin` through the mount. Expect the replacement's bytes within [`WAIT_FOR`]. Linux only, as the other
+/// FUSE coherence tests are. The overrun this needs depends on the mount not running between the two writes, so it
+/// failed 2 runs of 33 before the fix; `coherence_mount.rs` in `slates-bridge-fuse` makes it every time.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_change_reaches_the_mount_even_when_more_follow_than_the_journal_keeps() {
+  if !live_mount_runs() {
+    return;
+  }
+  let mut fixture = OnePageJournal::new("evict");
+  assert!(
+    fixture.read_through_mount("a.bin") == vec![b'A'; PIPELINED_FILE_BYTES],
+    "a.bin is cached through the mount"
+  );
+  let mut batch = vec![fixture.replacement("a.bin", b'Z')];
+  for round in 0..PIPELINED_REPLACEMENTS {
+    let fill = b'a' + u8::try_from(round % 26).unwrap();
+    batch.push(fixture.replacement("b.bin", fill));
+  }
+  fixture.pipeline(&batch);
+  assert!(
+    fixture.comes_to_read("a.bin", &[b'Z'; PIPELINED_FILE_BYTES]),
+    "the mount still serves the old bytes after {WAIT_FOR:?}, not the replacement"
+  );
+}
+
 /// Shape: the quota `MappedThroughAMount` gives its volume (`--bounded 8MiB`).
 #[cfg(target_os = "linux")]
 const MAP_VOLUME_QUOTA: usize = 8 << 20;

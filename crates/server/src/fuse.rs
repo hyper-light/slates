@@ -113,6 +113,11 @@ const WRITEBACK_BYTES_KEPT_BACK: &str = "fuse.writeback_bytes_kept_back";
 /// mount last consumed it), or a file with no states was judged against records already gone. Zero is the healthy
 /// reading.
 const WRITEBACKS_UNKNOWN: &str = "fuse.writebacks_unknown";
+/// Format: rounds that found a mount behind its volume journal's retention, so the changes it missed could no longer be
+/// named, and that invalidated everything its kernel held instead (A-141;
+/// `docs/bugs/2026-10-22-a-mount-that-falls-behind-the-journal-never-hears-of-the-changes-it-missed.md`). Zero is the
+/// healthy reading; movement means writes outran a mount's rounds by more than the journal keeps.
+const JOURNAL_OVERRUNS: &str = "fuse.journal_overruns";
 /// Format: see [`MOUNT_REFUSED`] — resent requests answered from the reply their dead daemon published and never
 /// delivered (A-61); the exact replay's non-vacuity counter.
 const REPLAYED: &str = "fuse.replayed";
@@ -736,6 +741,8 @@ fn turn(s: &mut ShardState, attachment: u64, kind: TurnKind) -> Turned {
   s.count(WRITEBACK_BYTES_KEPT_BACK, kept_back);
   let unknown = mount.serve.take_writebacks_unknown();
   s.count(WRITEBACKS_UNKNOWN, unknown);
+  let overruns = mount.serve.take_journal_overruns();
+  s.count(JOURNAL_OVERRUNS, overruns);
   // What a delivering turn delivered is behind it — the owed round, and any change it made itself, which its own
   // kernel needs no notice of — so the task parks past the generation as it now stands. Any other path's change after
   // this point moves the generation again and wakes it.

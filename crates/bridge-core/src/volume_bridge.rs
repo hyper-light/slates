@@ -1315,15 +1315,22 @@ impl Bridge for VolumeBridge<'_> {
     //    in the `Advanced` reply (server `snapshot_view::advance`), not here. Emitting a head
     //    change to a pinned view would drop caches still valid for its version and disclose
     //    current-head file names and inodes it must never see (§4.16, §4.6).
+    //    A cursor older than the journal's retention cannot be walked: the records after it are partly gone, and
+    //    walking from the oldest still held skipped the rest, so the kernel kept serving them stale indefinitely
+    //    (`docs/bugs/2026-10-22-a-mount-that-falls-behind-the-journal-never-hears-of-the-changes-it-missed.md`).
+    //    The transport is told that anything it holds may be stale instead, and resumes from the head.
     if matches!(cx.view, View::Current) {
-      let records: Vec<(Op, Box<str>, Option<InodeNo>)> = self
-        .volume
-        .op_log()
-        .since(cursor.journal_seq)
-        .map(|r| (r.op.clone(), r.path.clone(), r.inode))
-        .collect();
-      for (op, path, inode) in records {
-        self.journal_invalidations(&op, &path, inode, out);
+      let log = self.volume.op_log();
+      if cursor.journal_seq.saturating_add(1) < log.oldest_seq() {
+        out.push(Invalidation::Everything);
+      } else {
+        let records: Vec<(Op, Box<str>, Option<InodeNo>)> = log
+          .since(cursor.journal_seq)
+          .map(|r| (r.op.clone(), r.path.clone(), r.inode))
+          .collect();
+        for (op, path, inode) in records {
+          self.journal_invalidations(&op, &path, inode, out);
+        }
       }
     }
     // 2. The base plane: every directory a watcher hint invalidated since the cursor, with the

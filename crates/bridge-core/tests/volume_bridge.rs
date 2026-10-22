@@ -1498,6 +1498,10 @@ fn a_scoped_view_never_leaks_an_out_of_scope_cache_invalidation() {
         *parent != private && *parent != secret,
         "an out-of-scope entry leaked ({name}) through the scoped invalidation stream: {inv:?}"
       ),
+      // It names no object, so it can disclose none; and this journal holds every record, so none is owed.
+      Invalidation::Everything => {
+        panic!("the journal kept every record, so nothing overran: {inv:?}")
+      }
     }
   }
   // Non-vacuity: the in-scope change is still delivered — the filter is confinement, not a blanket drop.

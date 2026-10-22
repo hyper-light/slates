@@ -505,6 +505,120 @@ impl FileStates {
   }
 }
 
+/// What this mount's kernel holds of the volume (§4.6 "Cache posture"; A-141): every node it references, with the
+/// lookups it holds on it, and every name it was handed out under. When the mount falls behind the journal's retention
+/// it is told [`slates_bridge_core::Invalidation::Everything`] and invalidates exactly these
+/// (`docs/bugs/2026-10-22-a-mount-that-falls-behind-the-journal-never-hears-of-the-changes-it-missed.md`).
+///
+/// It follows the FUSE lookup protocol. Every entry reply the kernel received adds a lookup on its node and the name it
+/// came under, and `FORGET` gives lookups back; at none left the node and its names go. A name also goes when the
+/// mount's own unlink or rename takes it away, or when an invalidation of it reached the kernel, since the kernel has
+/// then dropped or expired it and a later use is a new lookup that names it again. The set errs one way only. A name
+/// kept too long costs one redundant notification, but a name the kernel holds is never missing, because every name it
+/// holds came in a reply.
+///
+/// Bounded by the volume: every node id is a volume inode, so nodes are at most its inode allowance; and the names are
+/// its entries naming referenced nodes, plus names in flight until their invalidation reaches the kernel.
+#[derive(Debug, Default)]
+pub struct KernelHolds {
+  /// Node id → the lookups the kernel holds on it.
+  lookups: std::collections::BTreeMap<u64, u64>,
+  /// (parent node id, name) → the node it names.
+  names: std::collections::BTreeMap<(u64, String), u64>,
+  /// Node id → the names it was handed out under: the reverse of `names`, so a forgotten node's names go with it.
+  named: std::collections::BTreeMap<u64, std::collections::BTreeSet<(u64, String)>>,
+}
+
+impl KernelHolds {
+  /// The kernel took one lookup on `node`, handed out as `name` in `parent` (an entry reply or a READDIRPLUS entry), or
+  /// under no name (an `O_TMPFILE`). Node id 0 is a negative entry and takes nothing.
+  pub fn handed_out(&mut self, parent: u64, name: Option<&str>, node: u64) {
+    if node == 0 {
+      return;
+    }
+    let held = self.lookups.entry(node).or_insert(0);
+    *held = held.saturating_add(1);
+    if let Some(name) = name {
+      self.name(parent, name, node);
+    }
+  }
+
+  /// The kernel gave back `count` lookups on `node`. At none left, the node and every name it was handed out under go.
+  pub fn forgot(&mut self, node: u64, count: u64) {
+    let Some(held) = self.lookups.get_mut(&node) else {
+      return;
+    };
+    *held = held.saturating_sub(count);
+    if *held > 0 {
+      return;
+    }
+    self.lookups.remove(&node);
+    for key in self.named.remove(&node).unwrap_or_default() {
+      if self.names.get(&key) == Some(&node) {
+        self.names.remove(&key);
+      }
+    }
+  }
+
+  /// The name `name` in `parent` is no longer the kernel's: the mount's own unlink or rmdir removed it, or an
+  /// invalidation of it reached the kernel.
+  pub fn unnamed(&mut self, parent: u64, name: &str) {
+    let key = (parent, name.to_owned());
+    if let Some(node) = self.names.remove(&key)
+      && let Some(set) = self.named.get_mut(&node)
+    {
+      set.remove(&key);
+    }
+  }
+
+  /// The mount's own rename moved `from` to `to`, or swapped the two when `exchange` is set (`RENAME_EXCHANGE`).
+  pub fn renamed(&mut self, from: (u64, &str), to: (u64, &str), exchange: bool) {
+    let moved = self.names.get(&(from.0, from.1.to_owned())).copied();
+    let displaced = self.names.get(&(to.0, to.1.to_owned())).copied();
+    self.unnamed(from.0, from.1);
+    self.unnamed(to.0, to.1);
+    if let Some(node) = moved {
+      self.name(to.0, to.1, node);
+    }
+    if let (true, Some(node)) = (exchange, displaced) {
+      self.name(from.0, from.1, node);
+    }
+  }
+
+  /// Every node the kernel references, and every name it holds: what an `Everything` invalidates.
+  pub fn everything(&self) -> (Vec<u64>, Vec<(u64, String)>) {
+    (
+      self.lookups.keys().copied().collect(),
+      self.names.keys().cloned().collect(),
+    )
+  }
+
+  /// What an `Everything` invalidates ([`KernelHolds::everything`]), taking the names away as it goes: once the round
+  /// is written the kernel has dropped or expired each, and a later use is a new lookup that names it again. The nodes
+  /// stay, since an invalidation takes no lookup away. Taken when the round is built, not when it returns: a lookup
+  /// answered meanwhile then adds its name back, so a name the kernel holds is never missing.
+  pub fn invalidate_everything(&mut self) -> (Vec<u64>, Vec<(u64, String)>) {
+    let held = self.everything();
+    self.names.clear();
+    for set in self.named.values_mut() {
+      set.clear();
+    }
+    held
+  }
+
+  /// Notes that `name` in `parent` names `node`, taking the name from whatever node it named before.
+  fn name(&mut self, parent: u64, name: &str, node: u64) {
+    let key = (parent, name.to_owned());
+    if let Some(before) = self.names.insert(key.clone(), node)
+      && before != node
+      && let Some(set) = self.named.get_mut(&before)
+    {
+      set.remove(&key);
+    }
+    self.named.entry(node).or_default().insert(key);
+  }
+}
+
 #[cfg(test)]
 mod tests {
   use super::OwnRecords;
@@ -742,6 +856,131 @@ mod tests {
         states.stale_after(INO, 0..PAGES * PAGE, 0, &[]),
         Some(vec![changed])
       );
+    }
+  }
+
+  mod kernel_holds {
+    // proptest's strategy types carry `Arc` (D-8's harness exception).
+    #![allow(clippy::disallowed_types)]
+    #![allow(clippy::unwrap_used)]
+
+    use std::collections::BTreeMap;
+
+    use proptest::prelude::*;
+
+    use super::super::KernelHolds;
+
+    /// One generated event of the FUSE lookup protocol, over a few directories, names and nodes (node 0 is a negative
+    /// entry): an entry reply received, lookups given back, the mount's own unlink, or its own rename or exchange.
+    #[derive(Clone, Debug)]
+    enum Event {
+      HandOut(u64, u8, u64),
+      Forget(u64, u64),
+      Unname(u64, u8),
+      Rename((u64, u8), (u64, u8), bool),
+    }
+
+    fn name(byte: u8) -> String {
+      format!("n{byte}")
+    }
+
+    fn event() -> impl Strategy<Value = Event> {
+      prop_oneof![
+        (1..4u64, 0..4u8, 0..6u64)
+          .prop_map(|(parent, name, node)| Event::HandOut(parent, name, node)),
+        (0..6u64, 1..3u64).prop_map(|(node, count)| Event::Forget(node, count)),
+        (1..4u64, 0..4u8).prop_map(|(parent, name)| Event::Unname(parent, name)),
+        ((1..4u64, 0..4u8), (1..4u64, 0..4u8), any::<bool>())
+          .prop_map(|(from, to, swap)| Event::Rename(from, to, swap)),
+      ]
+    }
+
+    /// The protocol's rule, as a reference: lookups per node; each name the node it names. A forgotten node's names
+    /// go; a rename moves a name, an exchange swaps two.
+    #[derive(Default)]
+    struct Model {
+      lookups: BTreeMap<u64, u64>,
+      names: BTreeMap<(u64, String), u64>,
+    }
+
+    impl Model {
+      fn apply(&mut self, event: &Event) {
+        match event {
+          Event::HandOut(_, _, 0) => {}
+          Event::HandOut(parent, byte, node) => {
+            *self.lookups.entry(*node).or_insert(0) += 1;
+            self.names.insert((*parent, name(*byte)), *node);
+          }
+          Event::Forget(node, count) => {
+            if let Some(held) = self.lookups.get_mut(node) {
+              *held = held.saturating_sub(*count);
+              if *held == 0 {
+                self.lookups.remove(node);
+                self.names.retain(|_, named| named != node);
+              }
+            }
+          }
+          Event::Unname(parent, byte) => {
+            self.names.remove(&(*parent, name(*byte)));
+          }
+          Event::Rename((from_parent, from_name), (to_parent, to_name), exchange) => {
+            let from = (*from_parent, name(*from_name));
+            let to = (*to_parent, name(*to_name));
+            let moved = self.names.remove(&from);
+            let displaced = self.names.remove(&to);
+            if let Some(node) = moved {
+              self.names.insert(to.clone(), node);
+            }
+            if let (true, Some(node)) = (exchange, displaced) {
+              self.names.insert(from, node);
+            }
+          }
+        }
+      }
+    }
+
+    proptest! {
+      #![proptest_config(slates_test_seeds::unseeded(ProptestConfig {
+        cases: slates_test_seeds::cases(2000),
+        .. ProptestConfig::default()
+      }))]
+
+      /// What a mount's kernel holds (A-141), against the protocol's rule kept as a reference model: after every event
+      /// of a generated history the nodes and names an `Everything` would invalidate are exactly the model's — every
+      /// node with a lookup left, every name the kernel was handed and has not lost.
+      #[test]
+      fn the_kernels_holdings_follow_the_lookup_protocol(events in prop::collection::vec(event(), 0..40)) {
+        let mut holds = KernelHolds::default();
+        let mut model = Model::default();
+        for (step, event) in events.iter().enumerate() {
+          model.apply(event);
+          match event {
+            Event::HandOut(parent, byte, node) => holds.handed_out(*parent, Some(&name(*byte)), *node),
+            Event::Forget(node, count) => holds.forgot(*node, *count),
+            Event::Unname(parent, byte) => holds.unnamed(*parent, &name(*byte)),
+            Event::Rename((from_parent, from_name), (to_parent, to_name), exchange) => holds.renamed(
+              (*from_parent, &name(*from_name)),
+              (*to_parent, &name(*to_name)),
+              *exchange,
+            ),
+          }
+          let (nodes, names) = holds.everything();
+          prop_assert_eq!(&nodes, &model.lookups.keys().copied().collect::<Vec<_>>(), "nodes after step {}", step);
+          prop_assert_eq!(&names, &model.names.keys().cloned().collect::<Vec<_>>(), "names after step {}", step);
+        }
+      }
+    }
+
+    /// A node handed out under no name (an `O_TMPFILE`) is still the kernel's until it is forgotten, and a node id of
+    /// zero (a negative entry) is never held.
+    #[test]
+    fn an_unnamed_node_is_held_and_a_negative_entry_is_not() {
+      let mut holds = KernelHolds::default();
+      holds.handed_out(1, None, 9);
+      holds.handed_out(1, Some("missing"), 0);
+      assert_eq!(holds.everything(), (vec![9], Vec::new()));
+      holds.forgot(9, 1);
+      assert_eq!(holds.everything(), (Vec::new(), Vec::new()));
     }
   }
 }

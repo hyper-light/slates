@@ -215,6 +215,12 @@ pub enum Invalidation {
     /// Whether the cached data is stale as well.
     data: bool,
   },
+  /// Anything the transport's kernel holds of this volume may be stale: the journal no longer holds every record since
+  /// the transport's cursor, so which names, attributes and pages changed can no longer be told
+  /// (`docs/bugs/2026-10-22-a-mount-that-falls-behind-the-journal-never-hears-of-the-changes-it-missed.md`). The
+  /// transport invalidates every name it handed out and every inode its kernel still references, then resumes from the
+  /// cursor returned with it. Writers never wait for a transport that falls behind; this is what it costs instead.
+  Everything,
 }
 
 /// Where a transport has delivered invalidations up to: its position in the volume's journal and

@@ -237,8 +237,9 @@ let before_sync = fixture.volume_bytes(); // page 0 already stale: 'A' except th
     present since revision 3.
   - **The journal's budget.** The code takes 10‰ of the quota; §4.5 derives it from the mutation rate and the longest
     subscriber lag. The constant cites a ratification in GAPS §5 that is not there.
-  - **The invalidation feed's eviction gap.** Under it, the write-back rule now refuses `EIO` rather than guessing; the
-    feed itself still does not notice.
+  - **The invalidation feed's eviction gap.** Under it, the write-back rule refuses `EIO` rather than guessing. The
+    feed itself now notices too: since A-141 a mount that falls behind invalidates everything its kernel holds
+    (`docs/bugs/2026-10-22-a-mount-that-falls-behind-the-journal-never-hears-of-the-changes-it-missed.md`).
   - **A restored mount's files.** They are judged from the mount's start, as revision 3 judged every file.
   - **A takeover sends no invalidation.** A restored mount's first round starts at the new daemon's head, so a change
     the dead daemon had not yet delivered stays in the kernel's cache. Found by reading `crates/server/src/fuse.rs`,
