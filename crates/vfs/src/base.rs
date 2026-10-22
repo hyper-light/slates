@@ -2990,6 +2990,19 @@ impl Overlay<'_> {
   /// (§4.15); an overflow does all of these for every loaded directory and drops every kept
   /// digest.
   pub fn process_hints(&mut self, store: &mut Store) -> Result<(), VfsError> {
+    let before = self.vol.base.as_ref().map_or(0, |plane| plane.hint_seq);
+    let drained = self.drain_hints(store);
+    // A hint drained marks base directories stale for every transport's kernel cache: a transport parked on the volume
+    // is woken to deliver them now, not at its kernel's next request (§4.6 cache posture). Driven by the sequence
+    // having moved, and after the drain whatever it answered, so a refusal partway cannot strand the wake.
+    if self.vol.base.as_ref().map_or(0, |plane| plane.hint_seq) != before {
+      self.vol.change.changed();
+    }
+    drained
+  }
+
+  /// [`Self::process_hints`]'s drain, without the wake.
+  fn drain_hints(&mut self, store: &mut Store) -> Result<(), VfsError> {
     let hints = self.host.hints();
     let plane = self.vol.base.as_mut().ok_or(VfsError::NotOverlay)?;
     if !hints.is_empty() {

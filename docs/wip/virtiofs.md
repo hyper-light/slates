@@ -260,6 +260,21 @@ box shared with two other builds — timings are not benchmarks)
    makes on the host reaches the guest after two caches expire, not one. None of that is a correctness loss. It
    is measured against each consumer's bar (kiln's: a build in the volume at most 1.5x the host).
 
+   **Proven so far (2026-10-21), on real mounts:** a shared map through a slates mount reads the volume, and a write
+   through it, `msync`ed, reaches the volume — read back through slates itself, bypassing the mount — on Linux (FUSE,
+   arm64 container) and macOS (NFS). A change made through any other path reaches the map **as memory alone on Linux**,
+   which is what DAX through a mount needs; that took a fix, found by this proof
+   (`docs/bugs/2026-10-21-a-fuse-mount-hears-of-another-paths-change-only-on-its-next-request.md`), and holds over a
+   generated sequence of sixteen replacements: the map read the new bytes 52–193 µs after the writer's reply, median
+   82 µs (51 replacements, arm64 container). That is *after* the reply, not before it: a reader of the mount in that
+   window sees the old bytes, which AC-3.3 as written does not allow (open in the ledger, with what can and cannot be
+   made to wait). **On macOS it does not and cannot, over NFS v3:** the client cannot be
+   told of a change, and a memory-only reader refreshes only when something makes the client revalidate (seen both
+   never in 8 s and at 0.88 s); a `stat` of the file — what a guest's attribute request becomes on the host — makes it
+   follow at once. So DAX through a mount on macOS sees host-side changes on the guest's next attribute refresh, not
+   sooner. Still owed: an actual VM's DAX window over the mount (Shards on the Mac, QEMU or crosvm on Linux), and
+   Firecracker's disk-image form.
+
    **What has to be proven, per target, by real runs** (the goal's bar: adversarial and chaos testing at each
    step): the guest or container reads and writes the volume; DAX works where the platform has it, which needs a
    slates mount's files to accept a shared `mmap` from the sharer; changes on either side reach the other; a

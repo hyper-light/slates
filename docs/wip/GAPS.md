@@ -10439,3 +10439,55 @@ between unrelated processes today; a Mach-port route is unverified; an on-disk s
 exists" and Ada's call). The DAX window is launcher-supplied (VHOST_USER_GET_SHMEM_CONFIG asks the back end; R3
 forbids a fixed number; the guest pays page records for it), capped by the volume's capacity and the content arena.
 Building it, Linux first, with Ada's yes.
+
+
+### 2026-10-21: a FUSE mount heard of another path's change only on its next request — fixed, found by proving the mount route
+
+Proving the mount route for DAX (`docs/wip/virtiofs.md` §8 item 7) on a real Linux FUSE mount: a map of a file, read as
+memory alone, never saw a `slates write` through another attachment in 8 s; after a listing of the mount root (another
+object) it saw it at once. The daemon's mount task waited only on its device, `dispatch_ready` returned before
+delivering when no request waited, and bridge-fuse's `ChangeSignal` was never wired into the daemon — so a change
+through any other path stayed owed until the mount happened to get a request. That breaks §4.6's rule that infinite
+cache lifetimes need "proven invalidation delivery … for every mutation source".
+
+Fixed structurally: a volume wakes its parked waiters at the one place every change passes through (`Volume::record`,
+and the base plane's hint drain), and the mount's task waits on its device, its signal and the volume, running a
+delivery-only turn on a change. The first version of the fix was itself wrong — it advanced the mount's seen generation
+after an idle request turn that delivered nothing — and only instrumenting each link found it. Proven: the VFS tests
+(red-checked both ways), and over a real mount on Linux a shared map following a replacement as memory alone and over
+a generated sequence of sixteen (red-checked end to end: both fail without the wake). Measured on Linux (arm64
+container, 51 replacements): the map read the new bytes 52–193 µs after the writer's reply, median 82 µs, the read
+fault included. macOS over NFS v3 cannot be told of a change at all; its tests assert only what a `stat` gives, and
+the limit is recorded in the mount-route design.
+(`docs/bugs/2026-10-21-a-fuse-mount-hears-of-another-paths-change-only-on-its-next-request.md`.)
+
+**Open (AC-3.3): the mount is told after the writer is answered, not before.** AC-3.3 reads "every mutation
+invalidates before it is acknowledged (a second process never reads stale attributes after the mutating call
+returns)". The 2026-10-17 amendment withdrew delivery before each request on the mount's own serving thread (it
+deadlocked), but AC-3.3's text was never brought into line. For a change through another path the window is now the
+82 µs median above, not indefinite, yet it is still a window: a reader of the mount right after the write returns can
+see the old bytes. Writers that hold no kernel lock — the typed channel and SDK, NFS, merges — could wait, without
+blocking their shard, until every FUSE mount of the volume has been told. A write through one FUSE mount cannot wait on
+another: the kernel holds the written pages locked for the whole request, so two mounts writing one file, each waiting
+for the other's invalidation, would deadlock — the amendment's reason again. Owed: the design's answer for each source,
+and AC-3.3's text.
+
+### 2026-10-21: an anchor exited during its boot once in seven Linux CLI suite runs — open, unexplained (tripwire)
+
+In an arm64 Linux container (6 CPUs, 8 GB), the whole CLI suite at two threads: one start of
+`a_destroyed_volumes_mount_refuses_writes_and_never_lets_them_reach_the_disk_beneath` saw the anchor's stderr close
+before its daemon served — the anchor process ended during its own boot. Its lines were lost to the run's output
+filter; the VM's kernel log shows no out-of-memory kill; six further suite runs (252 test starts) and three runs of
+that test alone did not reproduce it. Before 2026-10-21 the CLI tests' start wait would have reported the same exit as
+"the daemon came up within 60 attempts", pointing at the daemon; the wait now prints the anchor's own lines above the
+panic, so a recurrence names its cause.
+
+It recurred the same evening, in the same container setup, in the first test started after a rebuild, and this time
+named itself: `slates: start: daemon spawn refused (code Some(2))` — the anchor's spawn of its own executable
+(`std::env::current_exe()`, `crates/cli/src/anchor.rs`) failed with `ENOENT`. That path names a file that no longer
+exists when the binary the anchor was started from has been replaced since. But replacing the binary on the container's
+bind-mounted target directory just before starting an anchor — by rename (5 tries) and the way cargo uplifts it, a
+fresh file hard-linked in place of the removed one (5 tries) — did not reproduce it, so no cause is claimed. Open until
+one is shown. If a replaced path is the cause, the hardening would be for the anchor to spawn the very file it runs
+(`/proc/self/exe` on Linux) rather than a path, which also pins every restart to the anchor's own version
+(`docs/bugs/2026-10-21-the-cli-tests-start-wait-spent-its-attempts-on-the-anchors-boot.md`).

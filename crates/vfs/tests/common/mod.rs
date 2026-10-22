@@ -204,3 +204,29 @@ pub(crate) fn claims(
 ) -> slates_vfs::recover::Claims {
   slates_vfs::recover::Claims::prepare(store, images.iter().copied()).unwrap()
 }
+
+/// A waker that counts its wakes, so a test sees a parked task actually woken rather than only told it may go.
+#[allow(clippy::disallowed_types)] // `std::task::Wake` takes `Arc<Self>` by signature (D-8's test-harness exception).
+pub(crate) struct CountingWaker(std::sync::atomic::AtomicUsize);
+
+#[allow(clippy::disallowed_types)] // as above: `Wake::wake` receives `self: Arc<Self>`.
+impl std::task::Wake for CountingWaker {
+  fn wake(self: std::sync::Arc<Self>) {
+    self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+  }
+}
+
+impl CountingWaker {
+  /// The wakes so far.
+  pub(crate) fn wakes(&self) -> usize {
+    self.0.load(std::sync::atomic::Ordering::Relaxed)
+  }
+}
+
+/// A counting waker, and the `Waker` over it.
+#[allow(clippy::disallowed_types)] // as above: the `Waker` is built from an `Arc` (D-8's test-harness exception).
+pub(crate) fn counting_waker() -> (std::sync::Arc<CountingWaker>, std::task::Waker) {
+  let counter = std::sync::Arc::new(CountingWaker(std::sync::atomic::AtomicUsize::new(0)));
+  let waker = std::task::Waker::from(std::sync::Arc::clone(&counter));
+  (counter, waker)
+}

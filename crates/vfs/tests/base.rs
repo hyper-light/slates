@@ -2172,6 +2172,43 @@ fn an_untouched_base_directory_the_disk_made_a_file_shows_the_file() {
   );
   assert_eq!(vol.diverged(&store), Vec::new());
 }
+/// §4.6 cache posture: an outsider's change beneath a base directory reaches the kernel caches of the volume's
+/// transports through the watcher's hints, drained each reap tick. Do: load a base directory, park a counting waker on
+/// the overlay volume, edit a file beneath it from outside, and drain the hints. Expect the parked task woken, so a FUSE
+/// mount delivers the stale marks without waiting for its kernel's next request — and a drain with no hints to wake no one.
+#[test]
+fn an_outsiders_change_beneath_a_base_directory_wakes_a_task_parked_on_the_volume() {
+  let mut host = SimHost::new();
+  host.mkdir("/d");
+  host.replace_file("/d/edited", b"one");
+  host.advance_ns(2);
+  let mut store = store();
+  let mut vol = overlay(&mut host, &mut store);
+  let _ = vol
+    .with_host(&mut host)
+    .resolve(&mut store, "/d/edited")
+    .unwrap();
+  let (counter, waker) = common::counting_waker();
+  vol.with_host(&mut host).process_hints(&mut store).unwrap();
+  let seen = vol.change_generation();
+  assert!(
+    !vol.wait_for_change(seen, &waker),
+    "nothing changed yet: park"
+  );
+  vol.with_host(&mut host).process_hints(&mut store).unwrap();
+  assert_eq!(counter.wakes(), 0, "a drain with no hints wakes no one");
+  host.write_in_place("/d/edited", b"one, edited", 2);
+  vol.with_host(&mut host).process_hints(&mut store).unwrap();
+  assert_eq!(
+    counter.wakes(),
+    1,
+    "the outsider's change woke the parked task"
+  );
+  assert!(
+    vol.wait_for_change(seen, &waker),
+    "and moved the generation"
+  );
+}
 
 /// RFC 8881 §10.2 (A-79's gate; found 2026-10-08 reading why an outsider's edit under an NFSv4 mount might never reach
 /// a delegation holder): "operations done outside the NFSv4.1 protocol ... also need to result in delegation recall".

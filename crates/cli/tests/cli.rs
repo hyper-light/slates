@@ -42,15 +42,25 @@ const RESTART_RETRIES: u32 = 50;
 /// Shape: consecutive daemon responses `start_anchor` waits for, so the anchor's one startup restart
 /// (a heartbeat-lapse recovery) has settled before a test runs its verbs.
 const STABLE_STREAK: u32 = 10;
-/// Derived: the most `volume list` attempts a startup wait makes before it calls the daemon absent — the streak
-/// it needs, plus the refusals a single verb already tolerates while the daemon's one startup restart settles
-/// ([`RESTART_RETRIES`]). Both numbers are ones this file already states.
+/// Derived: the most `volume list` attempts a startup wait makes, **counted from the daemon's serving line**
+/// ([`await_serving`]), before it calls the daemon absent — the streak it needs, plus the refusals a single verb
+/// already tolerates while the daemon's one startup restart settles ([`RESTART_RETRIES`]). Both numbers are ones
+/// this file already states.
 ///
 /// **Counted in attempts, not wall time, on purpose.** Each attempt is a whole CLI process: spawn, connect, list,
 /// exit. A contended host makes each attempt slower, not more numerous, so a wall bound over eleven of them
 /// measures the host. Twenty seconds was enough alone and not enough inside a full `cargo test --workspace`,
 /// where this failed on 2026-10-18 with exit 3 while passing by itself in well under a second. An absent daemon
 /// still ends the wait — it refuses every attempt — and so does one that flaps, which never reaches the streak.
+///
+/// **Slower, not more numerous, holds only once the daemon serves.** Until the daemon publishes its rendezvous a
+/// client is refused at once ("the daemon has not yet published its rendezvous object"); after that, a client of a
+/// live anchor waits out a restart instead (A-114). Counting from the spawn, the anchor's own boot spent the budget
+/// on a loaded host: on 2026-10-21, at load 25–110 on an 18-core Mac, twelve of fifteen starts failed. Measured
+/// beside them — an anchor started as this file starts it, polled as this file polls, each attempt's start compared
+/// with the anchor's greeting and the daemon's serving line — the greeting came 3.6–5.4 s after the spawn with
+/// 30–51 attempts already refused before it; in four rounds at load 67–78 every refusal came before the serving
+/// line, and none of the 39 attempts begun after it was refused.
 const START_ATTEMPTS: u32 = STABLE_STREAK.saturating_add(RESTART_RETRIES);
 
 fn slates() -> Command {
@@ -137,7 +147,21 @@ fn start_anchor_with_environment(
   instance: &str,
   environment: &[(String, String)],
 ) -> AnchorProcess {
-  let child = slates()
+  let (mut anchor, mut stderr) = spawn_anchor(instance, environment);
+  await_serving(&mut stderr, instance, false);
+  anchor.drain = Some(echo_the_rest(stderr));
+  let bootstrap = !environment.iter().any(|(name, _)| name == UNBOOTSTRAPPED);
+  await_stable_daemon(instance, bootstrap);
+  anchor
+}
+
+/// `slates --instance INSTANCE anchor --quick --shards SHARDS` with `environment`, its stderr piped so the start can
+/// hear when the daemon serves ([`await_serving`]).
+fn spawn_anchor(
+  instance: &str,
+  environment: &[(String, String)],
+) -> (AnchorProcess, std::io::BufReader<std::process::ChildStderr>) {
+  let mut child = slates()
     .envs(environment.iter().cloned())
     .args([
       "--instance",
@@ -148,10 +172,73 @@ fn start_anchor_with_environment(
       SHARDS,
     ])
     .stdout(Stdio::null())
-    .stderr(Stdio::inherit())
+    .stderr(Stdio::piped())
     .spawn()
     .unwrap();
-  let anchor = AnchorProcess { child, drain: None };
+  let stderr = std::io::BufReader::new(child.stderr.take().unwrap());
+  (AnchorProcess { child, drain: None }, stderr)
+}
+
+/// Format: the start of the line the daemon prints once it serves (`crates/cli/src/daemon.rs`), after its shards
+/// started and its rendezvous was published; the instance name follows.
+const SERVING_LINE: &str = "slates daemon: instance ";
+
+/// Format: the anchor's line when its supervision finds the daemon in a crash loop (`crates/cli/src/anchor.rs`,
+/// A-119). The anchor never gives up on a daemon, so a daemon that can never serve shows here, not as an exit.
+const CRASH_LOOP_LINE: &str = "slates anchor: the daemon is in a crash loop";
+
+/// Reads the anchor's stderr until the daemon says it serves — and, when `issuer` is asked on a platform that prints
+/// one ([`PRINTS_ISSUER_SURFACE`]), until the anchor has printed its issuer surface too — echoing every line to this
+/// process's stderr, where the anchor's output went before it was piped. Returns the issuer surface's exports when
+/// asked for and printed. The attempts a start counts begin after this ([`START_ATTEMPTS`] says why).
+///
+/// **The lines come from two processes, so they are taken in whichever order they arrive.** The anchor prints its
+/// greeting and its issuer surface; the daemon, a separate process, prints its serving line. Nothing orders a line of
+/// one after a line of the other, and assuming an order between log lines is what broke this file twice on
+/// 2026-10-20 ([`PRINTS_ISSUER_SURFACE`]).
+///
+/// Ends the test rather than waiting on: when the anchor ends before its daemon serves (its stderr closes), and when
+/// it reports the daemon in a crash loop — the anchor's own supervision is the bound on a daemon that cannot serve.
+fn await_serving(
+  stderr: &mut impl std::io::BufRead,
+  instance: &str,
+  issuer: bool,
+) -> Option<Vec<(String, String)>> {
+  use std::io::Write;
+  let serving_line = format!("{SERVING_LINE}{instance} serving on ");
+  let wants_issuer = issuer && PRINTS_ISSUER_SURFACE;
+  let mut exports = None;
+  let mut serving = false;
+  let mut line = String::new();
+  while !serving || (wants_issuer && exports.is_none()) {
+    line.clear();
+    let read = stderr.read_line(&mut line).unwrap();
+    assert!(
+      read > 0,
+      "the anchor ended before its daemon served (its lines are above)"
+    );
+    let _ = std::io::stderr().write_all(line.as_bytes());
+    assert!(
+      !line.starts_with(CRASH_LOOP_LINE),
+      "the daemon never served: {line}"
+    );
+    serving |= line.starts_with(&serving_line);
+    exports = exports.or_else(|| issuer_exports(&line));
+  }
+  exports.filter(|_| wants_issuer)
+}
+
+/// Copies what the anchor says from here on (restarts, stops, the daemon's own lines) to this process's stderr, so
+/// the anchor never blocks writing and its words still land where they went before its stderr was piped.
+fn echo_the_rest(mut stderr: impl std::io::Read + Send + 'static) -> std::thread::JoinHandle<()> {
+  std::thread::spawn(move || {
+    let _ = std::io::copy(&mut stderr, &mut std::io::stderr());
+  })
+}
+
+/// Waits for [`STABLE_STREAK`] consecutive answers to `volume list` within [`START_ATTEMPTS`] attempts, then
+/// bootstraps the consensus group when `bootstrap` holds. Called once the daemon serves ([`await_serving`]).
+fn await_stable_daemon(instance: &str, bootstrap: bool) {
   // The anchor restarts the daemon once at startup if its first heartbeat lapses (a known liveness
   // recovery, logged as "heartbeat lapsed; killing it"). Wait for several *consecutive* successes so
   // that restart has settled before returning — otherwise a test verb lands in the restart window and
@@ -161,22 +248,21 @@ fn start_anchor_with_environment(
   loop {
     let (code, _, _) = run(instance, &["volume", "list"]);
     attempts = attempts.saturating_add(1);
-    if code == 0 {
-      streak += 1;
-      if streak >= STABLE_STREAK {
-        if environment.iter().any(|(name, _)| name == UNBOOTSTRAPPED) {
-          return anchor;
-        }
+    streak = if code == 0 {
+      streak.saturating_add(1)
+    } else {
+      0
+    };
+    if streak >= STABLE_STREAK {
+      if bootstrap {
         let (code, _, error) = run(instance, &["bootstrap", "root"]);
         assert_eq!(code, 0, "explicit first-time bootstrap: {error}");
-        return anchor;
       }
-    } else {
-      streak = 0;
+      return;
     }
     assert!(
       attempts < START_ATTEMPTS,
-      "the daemon came up within {START_ATTEMPTS} attempts (last exit {code})"
+      "the serving daemon answered {STABLE_STREAK} verbs in a row within {START_ATTEMPTS} attempts (last exit {code})"
     );
     pause();
   }
@@ -1379,99 +1465,52 @@ fn the_verbs_emit_json_with_the_json_flag() {
   drop(anchor);
 }
 
-/// The issuer surface the anchor publishes through the environment, read from its stderr.
+/// Whether this platform's anchor prints its issuer surface as an `export` line.
 ///
-/// **Paired by platform, because the fact is structural rather than something to sniff for.** On macOS and
-/// Windows the anchor names its segment and prints an `export` line a shell can pass to `grant`/`enroll`; on
-/// Linux the segment is a **descriptor only the anchor's children hold**, so no such line exists and no
-/// separate process can issue those verbs at all.
+/// **A platform fact stated as a `cfg`, because it is structural rather than something to sniff for.** On macOS and
+/// Windows the anchor names its segment and prints an `export` line a shell can pass to `grant`/`enroll`; on Linux
+/// the segment is a **descriptor only the anchor's children hold**, so no such line exists and no separate process
+/// can issue those verbs at all.
 ///
-/// Getting this wrong twice on 2026-10-20 is why it is a `cfg` and not a heuristic. First the Linux arm hung:
-/// it read stderr for a line that platform never sends, and only each caller's own skip kept the suite
-/// green. Then a bound that stopped at the anchor's "up; daemon pid" greeting broke macOS instead, because
-/// there the greeting is printed *first* and the issuer line second — so the bound returned "no surface" on
-/// the one platform that has one. A platform difference stated as a `cfg` cannot be wrong about the order of
-/// two log lines.
-#[cfg(not(target_os = "linux"))]
-fn read_issuer_surface(stderr: &mut impl std::io::BufRead) -> Option<Vec<(String, String)>> {
-  let mut line = String::new();
-  loop {
-    line.clear();
-    assert!(
-      stderr.read_line(&mut line).unwrap() > 0,
-      "the anchor printed its issuer surface before ending"
-    );
-    if let Some(rest) = line
-      .trim()
-      .strip_prefix("slates anchor: issuer surface: export ")
-    {
-      return Some(
-        rest
-          .split(' ')
-          .filter_map(|pair| pair.split_once('='))
-          .map(|(name, value)| (name.to_owned(), value.to_owned()))
-          .collect(),
-      );
-    }
-  }
-}
+/// Getting this wrong twice on 2026-10-20 is why it is a `cfg` and not a heuristic. First the Linux arm hung: it read
+/// stderr for a line that platform never sends, and only each caller's own skip kept the suite green. Then a bound
+/// that stopped at the anchor's "up; daemon pid" greeting broke macOS instead, because there the greeting is printed
+/// *first* and the issuer line second — so the bound returned "no surface" on the one platform that has one. A
+/// platform difference stated as a `cfg` cannot be wrong about the order of two log lines, and [`await_serving`]
+/// assumes no order at all.
+const PRINTS_ISSUER_SURFACE: bool = cfg!(not(target_os = "linux"));
 
-/// The paired arm: Linux publishes no issuer surface through the environment, so there is nothing to read
-/// and nothing to wait for.
-#[cfg(target_os = "linux")]
-fn read_issuer_surface(_stderr: &mut impl std::io::BufRead) -> Option<Vec<(String, String)>> {
-  None
+/// The exports of the anchor's issuer-surface line (`slates anchor: issuer surface: export NAME=VALUE ...`), or
+/// `None` for any other line.
+fn issuer_exports(line: &str) -> Option<Vec<(String, String)>> {
+  let rest = line
+    .trim()
+    .strip_prefix("slates anchor: issuer surface: export ")?;
+  Some(
+    rest
+      .split(' ')
+      .filter_map(|pair| pair.split_once('='))
+      .map(|(name, value)| (name.to_owned(), value.to_owned()))
+      .collect(),
+  )
 }
 
 /// Starts the anchor with its stderr piped and reads the issuer-surface line it prints (the segment
-/// handoff a shell exports to run `grant`/`enroll`/`revoke`/`run`); the rest of its stderr is drained
-/// by a thread so the anchor never blocks on a full pipe. Waits for the daemon as `start_anchor` does.
+/// handoff a shell exports to run `grant`/`enroll`/`revoke`/`run`), then waits for the daemon as `start_anchor`
+/// does; the anchor's stderr is echoed throughout, so it never blocks on a full pipe.
 ///
 /// **The exports are `None` where this platform publishes no issuer surface through the environment** — see
-/// [`read_issuer_surface`], which is where that platform split and the two ways of getting it wrong live.
+/// [`PRINTS_ISSUER_SURFACE`], which is where that platform split and the two ways of getting it wrong live.
 /// Until 2026-10-20 this function simply **hung** on Linux, and the only thing keeping the suite green was
 /// every caller remembering its own skip; a new test that forgot cost 40 minutes.
 fn start_anchor_with_issuer_surface(
   instance: &str,
 ) -> (AnchorProcess, Option<Vec<(String, String)>>) {
-  use std::io::BufReader;
-  let mut child = slates()
-    .args([
-      "--instance",
-      instance,
-      "anchor",
-      "--quick",
-      "--shards",
-      SHARDS,
-    ])
-    .stdout(Stdio::null())
-    .stderr(Stdio::piped())
-    .spawn()
-    .unwrap();
-  let mut stderr = BufReader::new(child.stderr.take().unwrap());
-  let mut anchor = AnchorProcess { child, drain: None };
-  let exports = read_issuer_surface(&mut stderr);
-  // Drain what the anchor says from here on (restarts, stops) so it never blocks writing.
-  anchor.drain = Some(std::thread::spawn(move || {
-    let _ = std::io::copy(&mut stderr, &mut std::io::sink());
-  }));
-  let mut streak = 0u32;
-  let mut attempts = 0u32;
-  loop {
-    let (code, _, _) = run(instance, &["volume", "list"]);
-    attempts = attempts.saturating_add(1);
-    streak = if code == 0 { streak + 1 } else { 0 };
-    if streak >= STABLE_STREAK {
-      let (code, _, error) = run(instance, &["bootstrap", "root"]);
-      assert_eq!(code, 0, "explicit first-time bootstrap: {error}");
-      return (anchor, exports);
-    }
-    assert!(
-      attempts < START_ATTEMPTS,
-      "the daemon came up within {START_ATTEMPTS} attempts (last exit {code})"
-    );
-    pause();
-  }
+  let (mut anchor, mut stderr) = spawn_anchor(instance, &[]);
+  let exports = await_serving(&mut stderr, instance, true);
+  anchor.drain = Some(echo_the_rest(stderr));
+  await_stable_daemon(instance, true);
+  (anchor, exports)
 }
 
 /// Runs a client verb with the issuer surface's variables in its environment; (exit code, stdout,
@@ -5349,6 +5388,244 @@ fn slates_mount_subtree_presents_one_directory_of_the_volume() {
   drop(scoped);
   drop(whole);
   drop(anchor);
+}
+
+/// A volume mounted with one file, `map.bin`, of one page of `seed`, mapped `MAP_SHARED` through the mount: the
+/// fixture of the mount-route tests below.
+///
+/// **The other path is an SDK client the fixture holds, not `slates write`.** An attachment belongs to the client that
+/// made it and is removed once that client is reaped (`crates/server/src/reap.rs`; §4.7, D-16), and a `slates attach`
+/// process exits as soon as it prints. A first draft attached through the CLI and replaced through `slates write`:
+/// on macOS, where each replacement waits for the NFS client to revalidate, the sequence below outlived the
+/// attachment and a write was refused `NotFound` at change 3 to 12 in five of six runs on 2026-10-21, the
+/// attachment's record gone from its partition. Linux passed only because its map follows in microseconds. Held for
+/// the fixture's life, the writer's attachment lives exactly as long as the map it changes.
+///
+/// **The field order is the teardown order, and it matters.** A struct's fields drop in declaration order, top to
+/// bottom — the opposite of local variables — so the file closes first, then the mount point unmounts while the daemon
+/// still lives, then the writer's client closes, and the anchor goes last. On macOS, killing a daemon under a live kernel NFS mount has panicked the
+/// kernel (`macos-nfs-kill-test-panics-the-mac`); a first draft of this fixture declared the anchor first, which would
+/// have done exactly that. The map itself is unmapped in `Drop::drop`, which runs before any field drops.
+struct MappedThroughAMount {
+  map: *mut u8,
+  page: usize,
+  file: std::fs::File,
+  /// Held for its `Drop`: unmounts while the daemon below still lives.
+  _point: MountPoint,
+  /// The other path: an SDK client whose write attachment, `attachment`, lives while it does.
+  writer: slates_client::Client,
+  volume: slates_client::VolumeId,
+  attachment: u64,
+  instance: String,
+  id: String,
+  /// Held for its `Drop`, and declared last so it drops last.
+  _anchor: AnchorProcess,
+}
+
+impl MappedThroughAMount {
+  /// Starts a daemon, writes `map.bin` through the fixture's SDK client, mounts the volume and maps the file shared.
+  #[allow(clippy::disallowed_methods)] // the test's own calls through the slates mount: RAM, not disk
+  fn new(tag: &str, seed: u8) -> MappedThroughAMount {
+    use std::os::fd::AsFd;
+    let instance = format!("cli-{tag}-{}", std::process::id());
+    let anchor = start_anchor(&instance);
+    let (code, out, err) = run(
+      &instance,
+      &["volume", "create", "maps", "--bounded", "8MiB"],
+    );
+    assert_eq!(code, 0, "{err}");
+    let id = value_of(&out, "id");
+    let deadlines = slates_client::Deadlines::derive(
+      slates_server::daemon::LIVENESS_BUDGET_NS,
+      slates_db::replay::RECOVERY_BUDGET_NS,
+    )
+    .get();
+    let mut writer = slates_client::Client::connect(&instance, deadlines).unwrap();
+    let volume = volume_id_of(&id);
+    let attachment = writer
+      .attach(volume, None, slates_client::Intent::Write)
+      .unwrap()
+      .attachment;
+    let page = rustix::param::page_size();
+    writer
+      .fs_write(
+        (volume, attachment),
+        "map.bin",
+        &vec![seed; page],
+        FILE_MODE,
+      )
+      .unwrap();
+    let point = MountPoint {
+      path: fresh_mount_point(),
+    };
+    let (code, _, err) = run(&instance, &["mount", &id, &point.path]);
+    assert_eq!(code, 0, "slates mount: {err}");
+    let file = std::fs::OpenOptions::new()
+      .read(true)
+      .write(true)
+      .open(format!("{}/map.bin", point.path))
+      .unwrap();
+    // SAFETY: a fresh shared map of `page` bytes of an open file this fixture holds, at an address the kernel
+    // chooses; nothing else maps it, and `Drop` unmaps it before the file is closed and the mount removed.
+    let map = unsafe {
+      rustix::mm::mmap(
+        std::ptr::null_mut(),
+        page,
+        rustix::mm::ProtFlags::READ | rustix::mm::ProtFlags::WRITE,
+        rustix::mm::MapFlags::SHARED,
+        file.as_fd(),
+        0,
+      )
+    }
+    .unwrap()
+    .cast::<u8>();
+    MappedThroughAMount {
+      map,
+      page,
+      file,
+      _point: point,
+      writer,
+      volume,
+      attachment,
+      instance,
+      id,
+      _anchor: anchor,
+    }
+  }
+
+  /// The mapped page.
+  fn view(&mut self) -> &mut [u8] {
+    // SAFETY: `map` is `page` readable and writable bytes, mapped in `new` and unmapped only in `Drop`.
+    unsafe { std::slice::from_raw_parts_mut(self.map, self.page) }
+  }
+
+  /// Replaces `map.bin` with a page of `fill` through slates itself — the fixture's SDK client, under another
+  /// attachment than the mount's.
+  fn replace_through_slates(&mut self, fill: u8) {
+    let replaced = self.writer.fs_write(
+      (self.volume, self.attachment),
+      "map.bin",
+      &vec![fill; self.page],
+      FILE_MODE,
+    );
+    assert!(
+      replaced.is_ok(),
+      "the replacement through another attachment: {replaced:?}"
+    );
+  }
+
+  /// Whether the map comes to read a page of `fill` within [`WAIT_FOR`]: **as memory alone on Linux**, with no request
+  /// on the mount, since slates tells the kernel of a change when it is made (§4.6); on macOS once the file is
+  /// `stat`ed, because an NFS v3 client cannot be told and revalidates only when asked.
+  fn follows(&mut self, fill: u8) -> bool {
+    let started = Instant::now();
+    while started.elapsed() < WAIT_FOR {
+      if !cfg!(target_os = "linux") {
+        let _ = rustix::fs::fstat(&self.file);
+      }
+      if self.view().iter().all(|byte| *byte == fill) {
+        return true;
+      }
+      pause();
+    }
+    false
+  }
+}
+
+impl Drop for MappedThroughAMount {
+  fn drop(&mut self) {
+    // SAFETY: unmaps exactly the map made in `new`; nothing reads it after this. The fields then drop in declaration
+    // order: the file, the mount point (unmounted while the daemon lives), and the anchor last.
+    let _ = unsafe { rustix::mm::munmap(self.map.cast(), self.page) };
+  }
+}
+
+/// §4.6, the mount route (`docs/wip/virtiofs.md` §8 item 7) and the Linux cache posture: a VM's sharer maps a host
+/// file `MAP_SHARED` into the guest's DAX window (Shards D189, virtiofsd), so a slates mount's files must take a shared
+/// map whose writes reach the volume and whose pages follow the volume's changes. Do: map a file through a mount; write
+/// through the map and `msync`; read the file through slates itself, bypassing the mount; then replace it through
+/// another attachment. Expect the map to read the volume, its write to reach the volume, and the replacement to reach
+/// the map — on Linux as memory alone, with no request on the mount ([`MappedThroughAMount::follows`]). Record:
+/// `docs/bugs/2026-10-21-a-fuse-mount-hears-of-another-paths-change-only-on-its-next-request.md`.
+#[test]
+fn a_shared_map_through_a_mount_writes_back_and_follows_another_paths_change() {
+  if !live_mount_runs() {
+    return;
+  }
+  let mut fixture = MappedThroughAMount::new("maproute", b'A');
+  let first = fixture.view().get(..8).map(<[u8]>::to_vec);
+  assert_eq!(
+    first.as_deref(),
+    Some(&b"AAAAAAAA"[..]),
+    "the shared map reads the volume's bytes"
+  );
+  fixture.view().fill(b'B');
+  // SAFETY: syncs the whole live map just written.
+  let synced = unsafe {
+    rustix::mm::msync(
+      fixture.map.cast(),
+      fixture.page,
+      rustix::mm::MsyncFlags::SYNC,
+    )
+  };
+  assert!(synced.is_ok(), "the map's write is flushed: {synced:?}");
+  let (code, read, err) = run_with_stdin(&fixture.instance, &["read", &fixture.id, "map.bin"], b"");
+  assert_eq!(code, 0, "{err}");
+  assert!(
+    read.len() == fixture.page && read.iter().all(|byte| *byte == b'B'),
+    "the map's write reached the volume, read through slates itself"
+  );
+  fixture.replace_through_slates(b'C');
+  assert!(
+    fixture.follows(b'C'),
+    "the replacement reached the map within {WAIT_FOR:?}"
+  );
+}
+
+/// Format: the permission bits the fixture's file takes (`rw-r--r--`, what `slates write` gives a file by default).
+const FILE_MODE: u32 = 0o644;
+
+/// The volume id a CLI verb printed — 32 hexadecimal characters — as the SDK takes it.
+fn volume_id_of(hex: &str) -> slates_client::VolumeId {
+  let mut bytes = [0u8; 16];
+  for (index, byte) in bytes.iter_mut().enumerate() {
+    *byte = u8::from_str_radix(&hex[index * 2..index * 2 + 2], 16).unwrap();
+  }
+  slates_client::VolumeId { bytes }
+}
+
+/// Shape: how many replacements the generated sequence makes — enough that a change landing while the mount's task is
+/// mid-turn, idle, or delivering an earlier round is likely to occur, few enough that each is a whole CLI process.
+const MAP_CHANGES: u32 = 16;
+
+/// §4.6 cache posture, chaos over the mount route: the same file replaced through slates again and again, each time
+/// with bytes from a fixed-seed generator, and the map read after each. One ordering pins one interleaving of a change
+/// with the mount's own turns; the sequence varies it. Do: replace `map.bin` [`MAP_CHANGES`] times with generated
+/// fills, the map read between them. Expect the map to follow every one ([`MappedThroughAMount::follows`]). The
+/// length never changes: shrinking a file under a live map would make touching the map a `SIGBUS`.
+#[test]
+fn a_shared_map_through_a_mount_follows_every_change_in_a_generated_sequence() {
+  if !live_mount_runs() {
+    return;
+  }
+  let mut fixture = MappedThroughAMount::new("mapchaos", 0);
+  // A fixed-seed xorshift, so a failure names a reproducible sequence.
+  let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
+  let mut missed = Vec::new();
+  for change in 0..MAP_CHANGES {
+    state ^= state << 13;
+    state ^= state >> 7;
+    state ^= state << 17;
+    let fill = u8::try_from(state % 255).unwrap_or(0).saturating_add(1);
+    fixture.replace_through_slates(fill);
+    if !fixture.follows(fill) {
+      missed.push((change, fill));
+    }
+  }
+  assert!(
+    missed.is_empty(),
+    "the map followed every replacement; missed (change, fill): {missed:?}"
+  );
 }
 
 /// `slates mount ID INNER --subtree /shared` mounts `shared` alone: it lists `g`, serves its bytes, and a write

@@ -2260,7 +2260,15 @@ cannot implement the requested coherence refuses that guarantee. **A lookup miss
 negative entry** (A-137): a negative entry can only be ended by `FUSE_NOTIFY_INVAL_ENTRY`, Linux 6.19 refuses
 that for a negative dentry, and nothing else clears it — so its delivery is not proven and an infinite lifetime
 for it is not available under the rule above. Positive entries, attributes, pages and listings keep their
-lifetimes, because the kernel honours *their* invalidation. §4.15 supplies the source
+lifetimes, because the kernel honours *their* invalidation — and because it is told **when a change is made**: every
+mutation journals through `Volume::record` and every outsider change beneath a base directory advances the base plane's
+hint sequence, and both wake the tasks parked on the volume, so a mount's task delivers the owed notifications at once
+rather than at its kernel's next request (2026-10-21; before then a change through any other path waited, owed, until
+the mount happened to get a request — indefinitely for a shared map or DAX through the mount, measured; see
+`docs/bugs/2026-10-21-a-fuse-mount-hears-of-another-paths-change-only-on-its-next-request.md`). "At once" is measured
+and is *after* the writer is answered: a shared map read the new bytes 52–193 µs after the reply, median 82 µs. AC-3.3's
+"invalidates before it is acknowledged" therefore does not hold for a change through another path; which writers can
+be made to wait for the mount, and which cannot without a deadlock, is open in the ledger. §4.15 supplies the source
 validation rules; finite stale-data TTLs do not silently become exact live-source semantics. The
 launcher (`slates exec`) implements the chosen-path form with `CLONE_NEWUSER|CLONE_NEWNS`,
 recursive-private root, and a bind mount; on AppArmor-restricted hosts it reports the exact

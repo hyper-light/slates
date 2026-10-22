@@ -9,6 +9,7 @@
 //! tests is the specification this file must equal on every generated history.
 
 use std::collections::BTreeMap;
+use std::task::Waker;
 
 use slates_machine::{Derived, derived};
 use slates_mem::MemError;
@@ -389,6 +390,9 @@ pub struct Volume {
   /// Head-reachable content bytes by birth epoch; the two public counters are sums of it.
   pub(crate) bytes: ByEpoch,
   pub(crate) journal: OpLog,
+  /// Who waits for this volume to change ([`ChangeWaiters`]): a transport whose kernel caches the volume is told when
+  /// a change is made, not when its kernel next asks.
+  pub(crate) change: ChangeWaiters,
   /// The key this volume's chunks are sealed under, by the store cipher's reference (A-99); `None` keeps them in the
   /// clear (no cipher, or sealing unavailable on this node).
   pub(crate) seal_key: Option<u32>,
@@ -687,6 +691,7 @@ impl Volume {
       base: None,
       bytes: ByEpoch::default(),
       journal: OpLog::new(config.journal_bytes),
+      change: ChangeWaiters::default(),
       seal_key: None,
       locked: false,
       writable_dax: false,
@@ -768,6 +773,7 @@ impl Volume {
         .map(|b| b.for_clone(InodeNo::compose(config.prefix, 1), epoch)),
       bytes: ByEpoch::inherited(epoch, referenced),
       journal: OpLog::new(config.journal_bytes),
+      change: ChangeWaiters::default(),
       seal_key: None,
       locked: false,
       writable_dax: false,
@@ -869,6 +875,7 @@ impl Volume {
       base: None,
       bytes: ByEpoch::default(),
       journal: OpLog::new(journal_bytes),
+      change: ChangeWaiters::default(),
       seal_key: None,
       locked: false,
       writable_dax: false,
@@ -6051,6 +6058,68 @@ impl Volume {
     self
       .journal
       .append(op, path, inode, self.epoch, at, prev_version);
+    self.change.changed();
+  }
+
+  /// This volume's change generation: it moves with every journaled mutation and every outsider change a base
+  /// directory's watcher reported ([`ChangeWaiters`]).
+  pub fn change_generation(&self) -> u64 {
+    self.change.generation
+  }
+
+  /// Whether the volume has changed past generation `seen`; when it has not, `waker` is woken at its next change
+  /// (§4.6 Linux cache posture; the shape of [`crate::recall_gate::RecallGate::wait_for_release`]). A transport parks
+  /// here so that a change made through any other path reaches its kernel's cache when the change is made.
+  pub fn wait_for_change(&mut self, seen: u64, waker: &Waker) -> bool {
+    self.change.wait(seen, waker)
+  }
+}
+
+/// Who waits for a volume to change, and the generation they wait past (§4.6 Linux cache posture: "Infinite cache
+/// lifetimes require proven invalidation delivery and recovery for every mutation source").
+///
+/// Every mutation journals through [`Volume::record`], and every outsider change beneath a base directory advances the
+/// base plane's hint sequence ([`crate::base::Overlay::process_hints`]); both call [`ChangeWaiters::changed`], which
+/// moves the generation and wakes every parked waiter. So a FUSE mount, whose kernel keeps long cache lifetimes on the
+/// strength of being told, is told when a change is made. Before 2026-10-21 it was told only when its kernel next sent
+/// a request, so an idle mount kept serving old bytes from its cache — a shared memory map, or DAX through the mount,
+/// indefinitely (`docs/bugs/2026-10-21-a-fuse-mount-hears-of-another-paths-change-only-on-its-next-request.md`).
+///
+/// Bounded by the distinct tasks waiting: a task that parks again replaces its own waker (`will_wake`), so the list
+/// holds at most one entry per transport task serving the volume, and a change drains it. The waker is the runtime's
+/// packed task word, generation-checked, so waking one whose task has ended reaches nothing.
+#[derive(Debug, Default)]
+pub(crate) struct ChangeWaiters {
+  /// Moves at every change; compared only for inequality, so it wraps rather than saturating — a saturated
+  /// generation would stop moving and strand every waiter.
+  generation: u64,
+  /// The tasks parked until the next change.
+  waiting: Vec<Waker>,
+}
+
+impl ChangeWaiters {
+  /// A change: moves the generation and wakes every parked task.
+  pub(crate) fn changed(&mut self) {
+    self.generation = self.generation.wrapping_add(1);
+    for waker in self.waiting.drain(..) {
+      waker.wake();
+    }
+  }
+
+  /// Whether the generation has moved past `seen`; when it has not, parks `waker` until it does.
+  fn wait(&mut self, seen: u64, waker: &Waker) -> bool {
+    if self.generation != seen {
+      return true;
+    }
+    match self
+      .waiting
+      .iter_mut()
+      .find(|parked| parked.will_wake(waker))
+    {
+      Some(parked) => parked.clone_from(waker),
+      None => self.waiting.push(waker.clone()),
+    }
+    false
   }
 }
 

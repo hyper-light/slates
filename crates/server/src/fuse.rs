@@ -47,8 +47,8 @@ use slates_bridge_core::scoped::ScopedBridge;
 use slates_bridge_core::volume_bridge::new_handle_store;
 use slates_bridge_core::{AttachmentId, Bridge, LostWrites, Rights, View, VolumeBridge};
 use slates_bridge_fuse::channel::{
-  Dispatched, FuseChannel, Sent, ServeState, Turn, dispatch_ready, reclaim_dispatched,
-  redeliver_after_refusal, send_reply,
+  ChangeSignal, Dispatched, FuseChannel, Sent, ServeState, Step, Turn, Wake, dispatch_ready,
+  reclaim_dispatched, redeliver_after_refusal, send_reply, serve_step,
 };
 use slates_bridge_fuse::mount::{
   Awaiting, Mount, MountError, PendingExit, Progress, begin_mount, begin_unmount,
@@ -124,6 +124,12 @@ pub(crate) struct FuseMount {
   /// For a mount taken over from a daemon that died, the files whose acknowledged writes the death lost (A-61):
   /// reported `EIO` once to each handle opened before the takeover. Empty for a mount this daemon established.
   lost: LostWrites,
+  /// The mount's change signal (§4.6 cache posture): the notification thread signals it when a round's write returns,
+  /// so the task collects the round — and redelivers a refused one — without waiting for the kernel's next request.
+  change: ChangeSignal,
+  /// The volume's change generation as of this mount's last turn (`Volume::change_generation`): the task parks on the
+  /// volume past it, so a change made through any other path wakes it to deliver.
+  seen: u64,
 }
 
 impl std::fmt::Debug for FuseMount {
@@ -358,6 +364,12 @@ fn established(s: &mut ShardState, pending: PendingAttach, mount: Mount) -> Repl
     release_unmounted_lease(s, &pending.record);
     crate::verbs::refused(refusal)
   };
+  // The mount's change signal (§4.6 cache posture), made before anything is held or recorded, so a refusal leaves
+  // nothing behind.
+  let mut serve_state = ServeState::new();
+  let Some(change) = change_signal(&mut serve_state) else {
+    return refuse(s, &mount_point, Refusal::Overloaded { shard: s.shard });
+  };
   // The anchor holds the device before the record commits (A-61), so a recorded mount's device outlives this
   // process. A hold refused leaves a mount that ends with the process, counted; it is still served.
   if matches!(
@@ -383,8 +395,9 @@ fn established(s: &mut ShardState, pending: PendingAttach, mount: Mount) -> Repl
     Ok(registry) => registry,
     Err(e) => return refuse(s, &mount_point, crate::error::refusal_of_vfs(&e)),
   };
-  // The serve turn delivers the volume's invalidations before each request (AUD-29-79); the kernel's references
-  // are the record's, so they are carried across a restart (A-61).
+  // The serve task delivers the volume's invalidations before each request and whenever the volume changes through
+  // any other path (AUD-29-79; §4.6 cache posture); the kernel's references are the record's, so they are carried
+  // across a restart (A-61).
   s.attachments
     .set_coherence(registry, slates_bridge_core::CacheCoherence::Invalidated);
   s.attachments.set_owner(registry, attachment);
@@ -392,7 +405,7 @@ fn established(s: &mut ShardState, pending: PendingAttach, mount: Mount) -> Repl
     attachment,
     FuseMount {
       channel,
-      serve: ServeState::new(),
+      serve: serve_state,
       handles: new_handle_store(),
       registry,
       volume,
@@ -400,6 +413,8 @@ fn established(s: &mut ShardState, pending: PendingAttach, mount: Mount) -> Repl
       scope: pending.record.form.scope(),
       session_held: false,
       lost: LostWrites::default(),
+      change,
+      seen: 0,
     },
   );
   if futures::spawn(serve(attachment))
@@ -462,23 +477,107 @@ enum Turned {
   Ended,
 }
 
-/// The serve task of one mount: wait for the device's readiness, take requests until none waits, yield
-/// between them; end the attachment when the mount ends.
+/// What woke a mount's task.
+enum Woke {
+  /// The device is readable: the kernel's requests wait.
+  Request,
+  /// The volume changed past what this mount last delivered, or a finished round of notifications signalled.
+  Change,
+}
+
+/// Which work a turn does.
+#[derive(Clone, Copy)]
+enum TurnKind {
+  /// Read and serve a waiting request, delivering the owed round first.
+  Request,
+  /// Deliver the owed round alone, reading no request (`serve_step` with `Wake::Change`).
+  Change,
+}
+
+/// A mount's change signal, wired so a finished round of notifications wakes the mount's task. `None` when no signal
+/// can be made (the process is out of descriptors), which refuses the mount rather than serve it untold of changes.
+fn change_signal(serve: &mut ServeState) -> Option<ChangeSignal> {
+  let signal = ChangeSignal::new().ok()?;
+  serve.wakes_with(signal.notifier().ok()?);
+  Some(signal)
+}
+
+/// Whether mount `attachment`'s volume has changed past what the mount last delivered; when it has not, `waker` is
+/// woken at its next change (§4.6 cache posture). `false` for a mount or a volume already gone: the device's wait
+/// reports the end.
+fn volume_changed(s: &mut ShardState, attachment: u64, waker: &std::task::Waker) -> bool {
+  let Some(mount) = s.fuse_mounts.get(&attachment) else {
+    return false;
+  };
+  let seen = mount.seen;
+  let Some(&handle) = s.by_id.get(&mount.volume) else {
+    return false;
+  };
+  s.volumes
+    .get_mut(handle)
+    .is_ok_and(|slot| slot.volume.wait_for_change(seen, waker))
+}
+
+/// Waits until mount `attachment` has work (§4.6 cache posture): a request on its device, a finished round of
+/// notifications on its signal, or a change to its volume made through any other path. Until 2026-10-21 the device
+/// was the only source, so a change made elsewhere reached the kernel's cache only at its next request — never, on an
+/// idle mount read through a shared map
+/// (`docs/bugs/2026-10-21-a-fuse-mount-hears-of-another-paths-change-only-on-its-next-request.md`). Races the three as
+/// `futures::within` races its deadline; the device is preferred when several are ready.
+async fn wait_for_work(
+  attachment: u64,
+  device: std::os::fd::RawFd,
+  signal: std::os::fd::RawFd,
+) -> Result<Woke, slates_rt::RtError> {
+  let mut device = std::pin::pin!(slates_rt::readiness::readable(device));
+  let mut signal = std::pin::pin!(slates_rt::readiness::readable(signal));
+  std::future::poll_fn(|cx| {
+    if let std::task::Poll::Ready(ready) = device.as_mut().poll(cx) {
+      return std::task::Poll::Ready(ready.map(|()| Woke::Request));
+    }
+    if let std::task::Poll::Ready(ready) = signal.as_mut().poll(cx) {
+      return std::task::Poll::Ready(ready.map(|()| Woke::Change));
+    }
+    if state::with_state(|s| volume_changed(s, attachment, cx.waker())).unwrap_or(false) {
+      return std::task::Poll::Ready(Ok(Woke::Change));
+    }
+    std::task::Poll::Pending
+  })
+  .await
+}
+
+/// The serve task of one mount: wait for work — a request, a change to the volume, a finished round of notifications —
+/// take requests until none waits, yielding between them, or deliver what a change owes; end the attachment when the
+/// mount ends.
 async fn serve(attachment: u64) {
   loop {
-    let Some(Some(raw)) = state::with_state(|s| {
+    let Some(Some((device, signal))) = state::with_state(|s| {
       s.fuse_mounts
         .get(&attachment)
-        .map(|m| m.channel.raw_device())
+        .map(|m| (m.channel.raw_device(), m.change.raw_signal()))
     }) else {
       return;
     };
-    if slates_rt::readiness::readable(raw).await.is_err() {
-      let _ = state::with_state_counted(|s| fail(s, attachment));
-      return;
+    let woke = match wait_for_work(attachment, device, signal).await {
+      Ok(woke) => woke,
+      Err(_) => {
+        let _ = state::with_state_counted(|s| fail(s, attachment));
+        return;
+      }
+    };
+    if matches!(woke, Woke::Change) {
+      match state::with_state(|s| turn(s, attachment, TurnKind::Change)) {
+        Some(Turned::Fenced) => crate::daemon::pace(crate::daemon::HEARTBEAT_NS).await,
+        Some(Turned::Ended) | None => {
+          let _ = state::with_state_counted(|s| ended(s, attachment));
+          return;
+        }
+        Some(Turned::Idle | Turned::Served) => {}
+      }
+      continue;
     }
     loop {
-      match state::with_state(|s| turn(s, attachment)) {
+      match state::with_state(|s| turn(s, attachment, TurnKind::Request)) {
         Some(Turned::Idle) => break,
         Some(Turned::Served) => {
           // A served request is client activity, as an NFS call and a guest's request are: the shard spins out its
@@ -505,9 +604,10 @@ async fn serve(attachment: u64) {
   }
 }
 
-/// One turn: one request dispatched over a transient bridge on the volume's slot, its barrier run when it
-/// changed what survives a restart, its reply (or `EIO`) written.
-fn turn(s: &mut ShardState, attachment: u64) -> Turned {
+/// One turn over a transient bridge on the volume's slot, under the mount's one gating (the volume present, the
+/// live-tree fence, the scope). A request turn dispatches one request, runs its barrier when it changed what survives a
+/// restart and writes its reply (or `EIO`); a change turn delivers the owed round alone, reading no request.
+fn turn(s: &mut ShardState, attachment: u64, kind: TurnKind) -> Turned {
   let Some(mut mount) = s.fuse_mounts.remove(&attachment) else {
     return Turned::Ended;
   };
@@ -557,16 +657,43 @@ fn turn(s: &mut ShardState, attachment: u64) -> Turned {
     )
     .with_lost_writes(&mut mount.lost);
     let mut scoped = None;
-    dispatch_ready(
-      &mut mount.channel,
-      scoped_or_whole(&mut bridge, &mut scoped, mount.scope),
-      attachments,
-      mount.registry,
-      &mut mount.serve,
-      slice_bytes,
-    )
+    let served = scoped_or_whole(&mut bridge, &mut scoped, mount.scope);
+    match kind {
+      TurnKind::Request => dispatch_ready(
+        &mut mount.channel,
+        served,
+        attachments,
+        mount.registry,
+        &mut mount.serve,
+        slice_bytes,
+      ),
+      TurnKind::Change => {
+        mount.change.drain();
+        serve_step(
+          &mut mount.channel,
+          served,
+          attachments,
+          mount.registry,
+          &mut mount.serve,
+          Wake::Change,
+        )
+        .map(|step| match step {
+          Step::Ended => Turn::Ended,
+          // A change wake reads no request, so it only delivers or ends; the other steps are a request's.
+          Step::Change(_) | Step::Request { .. } | Step::Dropped => Turn::Idle,
+        })
+      }
+    }
   };
   hand_over_session(s, attachment, &mut mount);
+  // Whether this turn delivered the owed round: a change turn always does; a request turn only when it dispatched a
+  // request, since `dispatch_ready` delivers just before dispatching and returns before it when nothing waits. An idle
+  // turn delivered nothing, so it must not move `seen` past a change it never told the kernel of — the first version
+  // did, and a change made while a spurious device wake was being served was marked seen and never delivered.
+  let delivered = match kind {
+    TurnKind::Change => dispatched.is_ok(),
+    TurnKind::Request => matches!(dispatched, Ok(Turn::Dispatched(_))),
+  };
   let turned = match dispatched {
     Ok(Turn::Idle) => Turned::Idle,
     Ok(Turn::Dropped | Turn::Continued) => Turned::Served,
@@ -595,6 +722,15 @@ fn turn(s: &mut ShardState, attachment: u64) -> Turned {
   // never silent — CLAUDE.md #9.
   let refused = mount.serve.take_entry_invalidations_refused();
   s.count(ENTRY_INVALIDATION_REFUSED, refused);
+  // What a delivering turn delivered is behind it — the owed round, and any change it made itself, which its own
+  // kernel needs no notice of — so the task parks past the generation as it now stands. Any other path's change after
+  // this point moves the generation again and wakes it.
+  if delivered {
+    mount.seen = s
+      .volumes
+      .get(handle)
+      .map_or(mount.seen, |slot| slot.volume.change_generation());
+  }
   s.fuse_mounts.insert(attachment, mount);
   turned
 }
@@ -881,11 +1017,17 @@ fn adopt_one(s: &mut ShardState, record: AttachmentRecord, held: crate::fuse_hol
     s.attachments.drain(registry);
     return end(s);
   }
+  let mut serve_state = ServeState::restored(session, s.recovered_replies.remove(&attachment));
+  let Some(change) = change_signal(&mut serve_state) else {
+    s.attachments.revoke(registry);
+    s.attachments.drain(registry);
+    return end(s);
+  };
   s.fuse_mounts.insert(
     attachment,
     FuseMount {
       channel,
-      serve: ServeState::restored(session, s.recovered_replies.remove(&attachment)),
+      serve: serve_state,
       handles: new_handle_store(),
       registry,
       volume: record.volume,
@@ -893,6 +1035,8 @@ fn adopt_one(s: &mut ShardState, record: AttachmentRecord, held: crate::fuse_hol
       scope: record.form.scope(),
       session_held: true,
       lost: LostWrites::new(std::collections::BTreeSet::new(), s.writes_lost),
+      change,
+      seen: 0,
     },
   );
   if futures::spawn(serve(attachment))

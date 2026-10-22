@@ -401,8 +401,17 @@ impl ChangeSignal {
     Ok(ChangeNotifier { fd })
   }
 
-  /// Takes the pending signals (the counter, in one read); a counter already at zero is nothing.
-  fn drain(&self) {
+  /// The signal's descriptor number, for registering its readiness with a runtime beside the device's
+  /// ([`FuseChannel::raw_device`]); the signal keeps owning it. An owner that interleaves other work awaits both
+  /// itself, rather than through the blocking [`wait`].
+  pub fn raw_signal(&self) -> std::os::fd::RawFd {
+    use std::os::fd::AsRawFd;
+    self.fd.as_raw_fd()
+  }
+
+  /// Takes the pending signals (the counter, in one read); a counter already at zero is nothing. An owner awaiting
+  /// [`Self::raw_signal`] itself drains once it is readable, or the descriptor stays readable and the wait spins.
+  pub fn drain(&self) {
     let mut word = [0u8; EVENTFD_WORD];
     let _ = rustix::io::read(&self.fd, &mut word);
   }
