@@ -10491,3 +10491,18 @@ fresh file hard-linked in place of the removed one (5 tries) — did not reprodu
 one is shown. If a replaced path is the cause, the hardening would be for the anchor to spawn the very file it runs
 (`/proc/self/exe` on Linux) rather than a path, which also pins every restart to the anchor's own version
 (`docs/bugs/2026-10-21-the-cli-tests-start-wait-spent-its-attempts-on-the-anchors-boot.md`).
+
+### 2026-10-21: a dirty shared-map page is written back over a later write through another path — open, design needed
+
+Found by adversarial testing of the mount route. A store through a mount's writable `MAP_SHARED` map leaves the page
+dirty in that mount's kernel cache; a later write through another path (the SDK here) is applied and acknowledged;
+then the kernel writes its dirty page back — the whole page, pre-write bytes and all — and slates applies it, so the
+other write's bytes on that page revert. Measured on both platforms (macOS NFS v3, 2 runs: 16,383 of the page's
+16,384 bytes reverted; Linux FUSE, 3 runs: 4,095 of 4,096), the stale page in the volume before any `msync`. DAX
+through a mount makes this the common case: a guest's DAX stores are dirty host pages until written back. The recall
+gate already prevents it for an NFSv4 client's write delegation (RFC 8881 §10.2.1: the client flushes before it
+returns the delegation); FUSE and NFS v3 mounts have no recall. Owed: Ada's decision on the fix — on Linux a recall
+before another path's write (park it, invalidate the mount's range so its dirty pages come back first, apply, and hold
+the mount's reads of the range until then), sharing machinery with the AC-3.3 entry above; on macOS either NFSv4 with
+delegations or recording such sharing as unsupported over v3
+(`docs/bugs/2026-10-21-a-dirty-shared-map-page-overwrites-a-later-write-through-another-path.md`).
