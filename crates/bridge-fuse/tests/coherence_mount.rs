@@ -68,6 +68,12 @@ enum Ask {
   Rename { from: String, to: String },
   /// Write `name` `times` times through the other attachment, one journal record each, creating it if it is missing.
   Churn { name: String, times: usize },
+  /// Write `bytes` at `offset` of `name` through the other attachment, creating it if it is missing; nothing truncated.
+  WriteAt {
+    name: String,
+    offset: u64,
+    bytes: Vec<u8>,
+  },
   /// Send the volume's root files and their bytes, by name: the oracle a generated history is held to.
   Snapshot,
   /// Refuse the next invalidation gather (the injected collection failure).
@@ -293,6 +299,17 @@ fn serve(
           for round in 0..times {
             bridge.write(object, &cx, 0, &round.to_le_bytes()).unwrap();
           }
+          attachments.end(other);
+        }
+        Ask::WriteAt {
+          name,
+          offset,
+          bytes,
+        } => {
+          let cx = attachments.begin(other).unwrap();
+          let root = bridge.root(&cx).unwrap();
+          let object = file_named(&mut bridge, &cx, root, &name);
+          bridge.write(object, &cx, offset, &bytes).unwrap();
           attachments.end(other);
         }
         Ask::RefuseNextGather => bridge.refuse_gathers = 1,
@@ -879,33 +896,34 @@ const STORED: u8 = b'M';
 /// Shape: where in the page the map stores its byte.
 const STORE_AT: usize = 10;
 
-/// One page of a file in the mount, open for reading and writing and mapped `MAP_SHARED`; unmapped on drop, before the
-/// file closes.
-struct SharedPage {
+/// The first pages of a file in the mount, open for reading and writing and mapped `MAP_SHARED`; unmapped on drop,
+/// before the file closes.
+struct SharedMap {
   map: *mut u8,
-  page: usize,
+  /// The bytes mapped: a whole number of pages.
+  len: usize,
   /// Held so the map's file stays open; it closes after `Drop` unmaps.
   _file: std::fs::File,
 }
 
-impl SharedPage {
+impl SharedMap {
   /// Opens `path` for reading and writing (the file's first writable open on the mount, which drops its cached pages)
-  /// and maps its first page shared.
+  /// and maps its first `pages` pages shared.
   #[allow(clippy::disallowed_methods)] // the test's own open through the slates mount: RAM, not disk
-  fn open(path: &str) -> SharedPage {
+  fn open(path: &str, pages: usize) -> SharedMap {
     use std::os::fd::AsFd;
     let file = std::fs::OpenOptions::new()
       .read(true)
       .write(true)
       .open(path)
       .unwrap();
-    let page = rustix::param::page_size();
-    // SAFETY: a fresh shared map of one page of an open file this struct holds, at an address the kernel chooses;
+    let len = rustix::param::page_size().checked_mul(pages).unwrap();
+    // SAFETY: a fresh shared map of `len` bytes of an open file this struct holds, at an address the kernel chooses;
     // nothing else maps it, and `Drop` unmaps it before the file closes.
     let map = unsafe {
       rustix::mm::mmap(
         std::ptr::null_mut(),
-        page,
+        len,
         rustix::mm::ProtFlags::READ | rustix::mm::ProtFlags::WRITE,
         rustix::mm::MapFlags::SHARED,
         file.as_fd(),
@@ -914,39 +932,39 @@ impl SharedPage {
     }
     .unwrap()
     .cast::<u8>();
-    SharedPage {
+    SharedMap {
       map,
-      page,
+      len,
       _file: file,
     }
   }
 
   /// The byte at `at` as the kernel's page holds it, faulting the page in if it is not cached.
   fn byte(&self, at: usize) -> u8 {
-    assert!(at < self.page, "a byte within the mapped page");
-    // SAFETY: `at` is within the one live page mapped in `open`; a volatile read, so the fault happens here.
+    assert!(at < self.len, "a byte within the map");
+    // SAFETY: `at` is within the live map made in `open`; a volatile read, so the fault happens here.
     unsafe { self.map.add(at).read_volatile() }
   }
 
   /// Stores `value` at `at` into the kernel's page, leaving it dirty.
   fn store(&self, at: usize, value: u8) {
-    assert!(at < self.page, "a byte within the mapped page");
-    // SAFETY: `at` is within the one live, writable page mapped in `open`; volatile, so the store is not elided.
+    assert!(at < self.len, "a byte within the map");
+    // SAFETY: `at` is within the live, writable map made in `open`; volatile, so the store is not elided.
     unsafe { self.map.add(at).write_volatile(value) }
   }
 
-  /// `msync`s the page: its dirty bytes are written back before this returns. The write-back rule may refuse them
+  /// `msync`s the map: its dirty bytes are written back before this returns. The write-back rule may refuse them
   /// (`EIO`), which is the outcome under test, so the result is returned rather than asserted.
   fn sync(&self) -> rustix::io::Result<()> {
-    // SAFETY: syncs exactly the one live page mapped in `open`.
-    unsafe { rustix::mm::msync(self.map.cast(), self.page, rustix::mm::MsyncFlags::SYNC) }
+    // SAFETY: syncs exactly the live map made in `open`.
+    unsafe { rustix::mm::msync(self.map.cast(), self.len, rustix::mm::MsyncFlags::SYNC) }
   }
 }
 
-impl Drop for SharedPage {
+impl Drop for SharedMap {
   fn drop(&mut self) {
-    // SAFETY: unmaps exactly the page mapped in `open`, once; nothing reads it afterwards. The file field closes after.
-    let unmapped = unsafe { rustix::mm::munmap(self.map.cast(), self.page) };
+    // SAFETY: unmaps exactly the map made in `open`, once; nothing reads it afterwards. The file field closes after.
+    let unmapped = unsafe { rustix::mm::munmap(self.map.cast(), self.len) };
     // A failed assertion already unwinding through here must not abort the test in a second panic.
     assert!(
       unmapped.is_ok() || std::thread::panicking(),
@@ -967,13 +985,17 @@ fn write_shared_file(path: &str, bytes: &[u8]) {
 /// Format: the mode of a file both the mounting user and the other attachment's principal write.
 const SHARED_FILE_MODE: u32 = 0o666;
 
-/// Reads `path`'s first `page` bytes with `O_DIRECT`, into a page-aligned buffer as a direct-I/O user would: the bytes
-/// the server returned, never the kernel's cached page.
-#[allow(clippy::disallowed_methods)] // the test's own open through the slates mount: RAM, not disk
+/// Reads `path`'s first `page` bytes with `O_DIRECT`: the bytes the server returned, never the kernel's cached page.
 fn read_directly(path: &str, page: usize) -> Vec<u8> {
-  use std::io::Read;
-  use std::os::unix::fs::OpenOptionsExt;
-  let mut file = std::fs::OpenOptions::new()
+  read_directly_at(path, 0, page)
+}
+
+/// Reads `page` bytes of `path` at `offset` (a page boundary) with `O_DIRECT`, into a page-aligned buffer as a
+/// direct-I/O user would.
+#[allow(clippy::disallowed_methods)] // the test's own open through the slates mount: RAM, not disk
+fn read_directly_at(path: &str, offset: u64, page: usize) -> Vec<u8> {
+  use std::os::unix::fs::{FileExt, OpenOptionsExt};
+  let file = std::fs::OpenOptions::new()
     .read(true)
     .custom_flags(i32::try_from(rustix::fs::OFlags::DIRECT.bits()).unwrap())
     .open(path)
@@ -983,8 +1005,28 @@ fn read_directly(path: &str, page: usize) -> Vec<u8> {
   let aligned = buffer
     .get_mut(skip..skip.checked_add(page).unwrap())
     .unwrap();
-  let read = file.read(aligned).unwrap();
+  let read = file.read_at(aligned, offset).unwrap();
   aligned.get(..read).unwrap().to_vec()
+}
+
+/// Reads `len` bytes of `path` at `offset` through the kernel's page cache: a fill of whatever it does not hold.
+#[allow(clippy::disallowed_methods)] // the test's own open through the slates mount: RAM, not disk
+fn read_buffered_at(path: &str, offset: u64, len: usize) -> Vec<u8> {
+  use std::os::unix::fs::FileExt;
+  let file = std::fs::File::open(path).unwrap();
+  let mut bytes = vec![0u8; len];
+  let read = file.read_at(&mut bytes, offset).unwrap();
+  bytes.truncate(read);
+  bytes
+}
+
+/// Writes `bytes` to `path` at `offset` through the mount with `pwrite`: the mount's own write, sent to it as it is
+/// made.
+#[allow(clippy::disallowed_methods)] // the test's own write through the slates mount: RAM, not disk
+fn write_through_the_mount_at(path: &str, offset: u64, bytes: &[u8]) {
+  use std::os::unix::fs::FileExt;
+  let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+  file.write_all_at(bytes, offset).unwrap();
 }
 
 /// A-144 (§4.6 cache posture; the dirty-page write-back rule, A-140;
@@ -1031,7 +1073,7 @@ fn store_into_a_stale_cached_page(
   let path = format!("{mount_point}/{name}");
   write_shared_file(&path, &vec![SEED; page]);
   control.report();
-  let mapped = SharedPage::open(&path);
+  let mapped = SharedMap::open(&path, 1);
   assert_eq!(mapped.byte(0), SEED, "the page is faulted in, fetched");
   control.ask(Ask::HoldGathers);
   control.ask(Ask::Replace {
@@ -1115,4 +1157,184 @@ fn judge_the_write_back(
      {synced:?}); the volume holds {:?}",
     held.map(|bytes| bytes.iter().filter(|byte| **byte != REPLACED).count())
   );
+}
+
+/// Shape: the pages the write-back chaos maps.
+const WRITEBACK_PAGES: usize = 3;
+/// Shape: the steps of each generated write-back history: fewer than either writer's stamps, so every stamp of one
+/// history is distinct.
+const WRITEBACK_STEPS: usize = 80;
+/// Shape: the longest run another path writes in one step, and the mount in one `pwrite`.
+const OTHER_RUN: u64 = 48;
+const MOUNT_RUN: u64 = 8;
+/// Format: the other path's stamps are 1..=120 and the mount's 128..=247, one per step, so a byte's value names its
+/// writer and its step; a file starts all zero.
+const OTHER_STAMPS: usize = 120;
+const MOUNT_STAMP_BASE: usize = 128;
+
+/// One byte's history as the oracle keeps it: the other path's latest write (its step and stamp), and every write the
+/// mount made (its map's stores and its own `pwrite`s).
+#[derive(Clone, Default)]
+struct ByteHistory {
+  other: Option<(usize, u8)>,
+  mount: Vec<(usize, u8)>,
+}
+
+impl ByteHistory {
+  /// Whether the volume may hold `value` for this byte after a sync, by the write-back rule (A-140, A-144): the other
+  /// path's latest write, or a mount write made after it — never anything older; with no other write, zero or any
+  /// mount write. A mount write may be lost (kept back as stale, or refused unknown); another path's write never is.
+  fn allows(&self, value: u8) -> bool {
+    match self.other {
+      Some((step, stamp)) => {
+        value == stamp
+          || self
+            .mount
+            .iter()
+            .any(|&(made, mounted)| made > step && mounted == value)
+      }
+      None => value == 0 || self.mount.iter().any(|&(_, mounted)| mounted == value),
+    }
+  }
+}
+
+/// What a generated write-back history exercised, summed over its syncs: the rule's paths, each of which must run.
+#[derive(Clone, Copy, Default)]
+struct WriteBackPaths {
+  kept_back: u64,
+  unknown: u64,
+  direct_reads: u64,
+}
+
+/// One generated write-back history against a real mount, from `seed`: map stores, the mount's own writes, another
+/// path's writes, direct and buffered reads, the mount's rounds held and released, and syncs, each sync checked by
+/// the oracle. What it exercised.
+fn writeback_history(control: &Loop, mount_point: &str, seed: u64) -> WriteBackPaths {
+  let page = rustix::param::page_size();
+  let len = page.checked_mul(WRITEBACK_PAGES).unwrap();
+  let name = format!("chaos-writeback-{seed:x}");
+  let path = format!("{mount_point}/{name}");
+  write_shared_file(&path, &vec![0; len]);
+  control.report();
+  let mapped = SharedMap::open(&path, WRITEBACK_PAGES);
+  for at in (0..len).step_by(page) {
+    mapped.byte(at);
+  }
+  let mut history = vec![ByteHistory::default(); len];
+  let mut paths = WriteBackPaths::default();
+  let mut state = seed;
+  let start = control.report();
+  for step in 0..WRITEBACK_STEPS {
+    let roll = xorshift(&mut state);
+    let at = usize::try_from(xorshift(&mut state) % u64::try_from(len).unwrap()).unwrap();
+    let mount_stamp = u8::try_from(MOUNT_STAMP_BASE + step).unwrap();
+    let other_stamp = u8::try_from(1 + step % OTHER_STAMPS).unwrap();
+    match roll % 12 {
+      0..=2 => {
+        mapped.store(at, mount_stamp);
+        history.get_mut(at).unwrap().mount.push((step, mount_stamp));
+      }
+      3 | 4 => {
+        let run = usize::try_from(1 + xorshift(&mut state) % OTHER_RUN)
+          .unwrap()
+          .min(len.saturating_sub(at));
+        control.ask(Ask::WriteAt {
+          name: name.clone(),
+          offset: u64::try_from(at).unwrap(),
+          bytes: vec![other_stamp; run],
+        });
+        for byte in history.get_mut(at..at + run).unwrap() {
+          byte.other = Some((step, other_stamp));
+        }
+      }
+      5 => {
+        read_directly_at(&path, u64::try_from(at / page * page).unwrap(), page);
+        paths.direct_reads += 1;
+      }
+      6 => {
+        read_buffered_at(&path, u64::try_from(at / page * page).unwrap(), page);
+      }
+      7 => {
+        let run = usize::try_from(1 + xorshift(&mut state) % MOUNT_RUN)
+          .unwrap()
+          .min(len.saturating_sub(at));
+        write_through_the_mount_at(&path, u64::try_from(at).unwrap(), &vec![mount_stamp; run]);
+        for byte in history.get_mut(at..at + run).unwrap() {
+          byte.mount.push((step, mount_stamp));
+        }
+      }
+      8 => control.ask(Ask::HoldGathers),
+      9 => control.ask(Ask::ReleaseGathers),
+      _ => check_writeback(control, &mapped, &name, &history, (seed, step)),
+    }
+  }
+  control.ask(Ask::ReleaseGathers);
+  check_writeback(control, &mapped, &name, &history, (seed, WRITEBACK_STEPS));
+  let end = control.report();
+  paths.kept_back = end.kept_back - start.kept_back;
+  paths.unknown = end.unknown - start.unknown;
+  paths
+}
+
+/// Syncs the map and holds the volume's file to the oracle: every byte one the write-back rule allows.
+fn check_writeback(
+  control: &Loop,
+  mapped: &SharedMap,
+  name: &str,
+  history: &[ByteHistory],
+  (seed, step): (u64, usize),
+) {
+  // A refused write-back (EIO) is one of the rule's outcomes, and the oracle allows what it leaves.
+  let _refusal_is_an_outcome = mapped.sync();
+  control.report();
+  let held = control
+    .snapshot()
+    .into_iter()
+    .find(|(file, _)| file == name)
+    .map(|(_, bytes)| bytes)
+    .unwrap();
+  assert_eq!(
+    held.len(),
+    history.len(),
+    "seed {seed:#x}, step {step}: the file keeps its length"
+  );
+  for (at, (value, byte)) in held.iter().zip(history).enumerate() {
+    assert!(
+      byte.allows(*value),
+      "seed {seed:#x}, step {step}: byte {at} holds {value}, older than the write-back rule allows (the other path's \
+       latest {:?}, the mount's writes {:?})",
+      byte.other,
+      byte.mount
+    );
+  }
+}
+
+/// A-140 and A-144 under generated histories over a real mount: a shared map of three pages takes stores, the mount
+/// writes with `pwrite`, another attachment writes runs, pages are read directly and through the cache, and the
+/// mount's rounds are held and released, so stale cached pages, ambiguous reads and write-backs meet in every order.
+/// Do: three fixed seeds of 80 steps, syncing the map now and then. Expect after every sync: each byte holds the other
+/// path's latest write to it or a mount write made after that, never anything older. Non-vacuous: across the seeds,
+/// stale bytes were kept back, a write-back over unknown bytes was refused, and direct reads were made.
+#[test]
+fn generated_map_stores_direct_reads_and_other_writes_never_revert_another_paths_write() {
+  with_mounted_loop("writeback-chaos", |control, mount_point| {
+    let mut total = WriteBackPaths::default();
+    for seed in CHAOS_SEEDS {
+      let paths = writeback_history(control, mount_point, seed);
+      eprintln!(
+        "seed {seed:#x}: {} byte(s) kept back, {} write-back(s) refused unknown, {} direct read(s)",
+        paths.kept_back, paths.unknown, paths.direct_reads
+      );
+      total.kept_back += paths.kept_back;
+      total.unknown += paths.unknown;
+      total.direct_reads += paths.direct_reads;
+    }
+    assert!(
+      total.kept_back > 0 && total.unknown > 0 && total.direct_reads > 0,
+      "non-vacuous: stale bytes kept back ({}), unknown write-backs refused ({}) and direct reads made ({})",
+      total.kept_back,
+      total.unknown,
+      total.direct_reads
+    );
+  });
 }

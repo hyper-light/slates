@@ -11969,6 +11969,13 @@ Applied in the same change to:
   - The oracle's three-way model, with generated ambiguous reads, fails when the read is counted as a fetch.
   - On the way, the in-process harness was found never to have run A-140: its wrapping bridge did not forward
     `data_changes` or `journal_capacity`, so every map write-back there was refused unknown.
+  - **Chaos over a real mount** (`generated_map_stores_direct_reads_and_other_writes_never_revert_another_paths_write`,
+    added after). It runs three seeds of 80 steps over a three-page shared map: stores, the mount's own `pwrite`s,
+    another attachment's runs, direct and buffered reads, and rounds held and released. After every sync, each byte
+    must hold the other path's latest write or a mount write made after it. On the box it is green 3 of 3, and every
+    seed exercises both outcomes: 55–346 bytes kept back, and 1–2 write-backs refused unknown.
+  - **Red-checked by mutation.** With A-144 reverted, a byte read the file's original value although the other path
+    had written it ten steps before (step 56). With A-140's keep-back removed, that happened at step 23.
 
 ### A-143 — A client judges the daemon that answered its claim (accepted 2026-10-22)
 Applied in the same change to:

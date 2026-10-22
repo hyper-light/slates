@@ -10731,6 +10731,12 @@ stale page back, and the other write's bytes on it reverted: measured 4,095 of 4
   fallback) or not, and the wire cannot say. Such a READ now leaves fresh bytes alone and makes the rest unknown. A
   write-back over an unknown byte is refused `EIO`, and a later fetch, own write or other path's write settles the
   byte.
+
+  **Chaos test.** `generated_map_stores_direct_reads_and_other_writes_never_revert_another_paths_write` mixes map
+  stores, the mount's `pwrite`s, another path's writes, direct and buffered reads, held and released rounds, and
+  syncs. It holds each byte, at every sync, to the other path's latest write or a later mount write. Green 3 of 3,
+  every seed exercising both outcomes. It goes red at step 56 with A-144 reverted, and at step 23 with A-140's
+  keep-back removed.
 - **The in-process harness never ran the write-back rule — fixed 2026-10-22 with A-144.** `FailingGather`
   (`crates/bridge-fuse/tests/common/mod.rs`) did not forward `data_changes` or `journal_capacity`. Those arrived with
   A-140 with trait defaults: no change, and no capacity. So every fetched file was lost at once, and every map
