@@ -3,7 +3,10 @@
 **Status:** **B is root-caused and fixed** — see
 `docs/bugs/2026-10-21-a-signalled-daemon-had-not-stopped-and-answered-the-call.md`: `killpg` queues a
 signal and returns, and the daemon answered the call before it stopped (measured, state `R` after the
-stop). A is open; one measurement flaw in it was fixed (`967fd387`).
+stop). **A is root-caused and fixed (2026-10-22):** the harness's own `pgrep` and `ps` spawns held the loop,
+because `asyncio.create_subprocess_exec` runs `Popen` on the loop's thread. See
+`docs/bugs/2026-10-22-the-async-sdk-tests-own-process-spawns-held-the-loop-it-measures.md`. One earlier measurement
+flaw in A was also fixed (`967fd387`).
 **Why this exists:** three hypotheses were tested and refuted, and a Linux reproduction harness now
 exists. Without a record, the next person repeats all of it.
 

@@ -941,7 +941,10 @@ of the file does not. `lock_on_fault`'s two tests read the same counter and are 
 256 MiB, which this runner's memlock capacity refuses, so they take their own loud skip first — on a host
 that allowed the lock they would need the entry too.
 
-### 8a-sdk-loop. The async Python SDK held the event loop for 0.3 s, once in eight runs (2026-10-20, OPEN)
+### 8a-sdk-loop. The async SDK test's own process spawns held the loop it measures (2026-10-20, closed 2026-10-22; Node sibling OPEN)
+
+Opened as "the async Python SDK held the event loop for 0.3 s, once in eight runs". It was the test's harness, not the
+SDK; the closing paragraph below has the evidence.
 
 `test_every_async_call_ends_across_restart_silence_cancellation_and_death` (AUD-29-19/20) failed on run
 39538566246: **worst loop lateness 0.298 s against a bound of 0.1 s plus 0.001 s of measured machine noise.**
@@ -983,6 +986,77 @@ machine itself was not late. That points at a call made on the loop that waits d
 is one second), and away from a slow machine or a busy loop. Still a hypothesis: the next step is a trace of the loop
 thread's system calls in phase (1). The Linux box can build the extension, but that needs Ada's go for installing
 `maturin` there.
+
+**Closed 2026-10-22: the harness held the loop, not the SDK**
+(`docs/bugs/2026-10-22-the-async-sdk-tests-own-process-spawns-held-the-loop-it-measures.md`).
+
+The cause:
+- `_run_async` ran `pgrep` and `ps` through `asyncio.create_subprocess_exec`. That calls `subprocess.Popen` on the
+  loop's own thread.
+- `Popen` returns only once the child has exec'd.
+- Phase (1) is where the job execs `pgrep` and `ps` for the first time.
+
+The evidence:
+- **CI.** A third failure, run 39570188927 (0.177 s), was also in phase (1). All three phase-tagged failures read
+  0.002–0.003 s of CPU and a sibling thread free: a GIL-releasing wait on the loop's thread.
+- **The mechanism.** On Python 3.11.17 (the lane's version), a `pgrep` spawn whose child took 5.8 ms to exec left a
+  loop ticker 5.2–5.5 ms late, with a sibling thread running and 0.7 ms of CPU.
+- **The red-check.** A preloaded shim sleeps 150 ms in the child before it execs `pgrep` or `ps`. Under it:
+
+  | harness | result |
+  |---|---|
+  | pre-fix | failed 5 of 5: 0.150–0.153 s late, CPU 0.001–0.003 s, phase (1) four times and (2) once |
+  | fixed | passed 6 of 6 |
+  | both, with no delay | passed 7 of 7 |
+
+The fix runs the spawns on a worker thread (`asyncio.to_thread`). It also corrects the failure message's reading of
+"no CPU, thread free", which had blamed the runner.
+
+**Still a hypothesis:** that the runner's first exec is slow because its disk is cold. Each run now prints the
+slowest exec wait per command, so the lane's log will say.
+
+**Sibling, OPEN: the Node SDK's async test has the same defect.** `runAsync` in
+`crates/sdk-node/tests/sdk_async.test.mjs` uses `child_process.spawn`, which also returns only after the child's exec.
+Measured on Node v24.22.1:
+
+| | `spawn()` returned after | loop ticker late by |
+|---|---|---|
+| exec delayed 150 ms | 154–155 ms | 153–155 ms |
+| no delay | 0–1 ms | 2 ms |
+
+It is latent on CI so far. Its comment records an unattributed 106 ms hold on the macOS runner (2026-10-01).
+
+### 8a-sdk-stamp. A client that reconnects during a restart may judge the new daemon gone (macOS, Windows; 2026-10-22, OPEN)
+
+**Seen once.** macOS, 2026-10-22, load 14.5 from other sessions, while verifying §8a-sdk-loop's fix. Phase (2) of the
+async SDK test ended `DaemonGone { after_ns: 2000000000 }` instead of `Stalled`. It has not come back:
+- 0 of 12 interleaved reruns on macOS (pre-fix and fixed files, 6 each);
+- 0 of 12 on Linux, under one CPU with four spinners.
+
+**What `DaemonGone` means there.** On macOS and Windows a client judges its daemon gone in either of two cases
+(`Liveness::daemon_gone`, `crates/ipc/src/rendezvous.rs`):
+- its exit watch fired;
+- the bootstrap object's start stamp differs from the one it recorded.
+
+Linux judges by the socket's peer instead, which fits the failure appearing on macOS only.
+
+**Hypothesis, not yet confirmed.** A claim records the stamp when it *begins* (`Claim::begin` → `open_bootstrap`), but
+takes its exit watch on the daemon pid it reads when it *completes*. Suppose a claim begins during a restart, while
+the killed daemon's stamp is still published:
+1. The claim waits out the restart (A-114), and the new daemon answers it.
+2. The client now holds the new daemon's exit watch and the old daemon's stamp.
+3. The first reply that stalls afterwards reads "gone".
+4. The call ends `DaemonGone` after the reconnect budget instead of `Stalled`.
+
+The window opens only when the client's reconnect begins before the new daemon publishes. A slow start under load
+widens it.
+
+**Next:** a deterministic reproduction.
+1. Stop the anchor before killing the daemon, so the client's claim begins against the dead daemon's stamp.
+2. Resume the anchor.
+3. Stop the new daemon and call.
+
+If the hypothesis holds, the call ends `DaemonGone`.
 
 ### 8a-tsan-wait. The TSan lane declared itself 25× slow and one budget never listened (2026-10-20, closed)
 

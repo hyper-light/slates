@@ -303,10 +303,14 @@ class Ticker:
                 # How much CPU this process burned across the gap, and whether a plain Python thread of
                 # its own was held over the same gap. Together they read three ways:
                 #
-                #   CPU burned                      something ran while holding the GIL
-                #   no CPU, sibling thread held     the OS kept this whole process off a core
+                #   CPU burned                      code ran on the loop while holding the GIL
+                #   no CPU, sibling thread held     the OS kept this whole process off a core (the
+                #                                   separate noise sampler is usually late too), or a
+                #                                   blocking call kept the GIL (it is not)
                 #   no CPU, sibling thread free     a blocking call on the loop thread that releases
-                #                                   the GIL (what `park_timeout` in Rust looks like)
+                #                                   the GIL: what `park_timeout` in Rust looks like,
+                #                                   and what a process spawn waiting on its child's
+                #                                   exec looked like (`_run_async`, 2026-10-22)
                 #
                 # Measured 2026-10-20 to check neither probe is vacuous: a deliberate 200 ms busy GIL
                 # hold read 200.7 ms late / 195.6 ms CPU / 24.7 ms thread (the sibling gets the GIL back
@@ -316,14 +320,36 @@ class Ticker:
                 self.worst_thread = self.thread_late - thread_before
 
 
+# The slowest exec wait of each command the harness ran, in seconds, by program name: how long its `Popen`
+# took to return, which is how long the child took to exec. Printed once at the end of the scenario, so a
+# runner whose first exec is slow says so in its log.
+_exec_waits = {}
+
+
+def _spawn_and_wait(argv):
+    """Runs `argv` to its end on the calling thread: its exit status, its stdout, and how long the spawn
+    took (`Popen` returns once the child has exec'd)."""
+    began = time.monotonic()
+    process = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    exec_wait = time.monotonic() - began
+    stdout, _ = process.communicate()
+    return process.returncode, stdout, exec_wait
+
+
 async def _run_async(*argv):
-    """Runs a command without blocking the loop (the ticker must measure the SDK, not this harness's own
-    process spawns, which take tens of milliseconds on a loaded runner): its exit status and stdout."""
-    process = await asyncio.create_subprocess_exec(
-        *argv, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL
-    )
-    stdout, _ = await process.communicate()
-    return process.returncode, stdout.decode()
+    """Runs a command on a worker thread, so the loop stays free: its exit status and stdout.
+
+    The ticker must measure the SDK, not this harness. A process spawn blocks its calling thread until the
+    child has exec'd: CPython's `Popen` waits on a vfork on Linux and on an error pipe on macOS, and
+    `asyncio.create_subprocess_exec` runs `Popen` on the loop's own thread. That is how this helper held the
+    loop until 2026-10-22. With the child's exec delayed 150 ms, as a cold disk would delay it, the test
+    failed in phase (1) exactly as the ubuntu lane had: 0.150 s late, 0.002 s of CPU, a sibling thread
+    free (docs/bugs/2026-10-22-the-async-sdk-tests-own-process-spawns-held-the-loop-it-measures.md). On a
+    worker thread the same wait holds only that thread."""
+    status, stdout, exec_wait = await asyncio.to_thread(_spawn_and_wait, argv)
+    name = os.path.basename(argv[0])
+    _exec_waits[name] = max(_exec_waits.get(name, 0.0), exec_wait)
+    return status, stdout.decode()
 
 
 async def _daemon_pids(binary, instance):
@@ -506,15 +532,21 @@ class SlatesAsyncEveryCallEnds(unittest.TestCase):
             ticker.task.cancel()
             worst, worst_phase = ticker.worst, ticker.worst_phase
             scheduling = noise.stop()
+            print(
+                "the harness's own process spawns, each off the loop: slowest exec wait "
+                + ", ".join(f"{name} {seconds:.3f} s" for name, seconds in sorted(_exec_waits.items())),
+                file=sys.stderr,
+            )
             self.assertLess(
                 worst, TICK_BOUND_SECS + scheduling,
                 f"the loop was never held: worst lateness {worst:.3f} s in phase "
                 f"{worst_phase!r}, bound {TICK_BOUND_SECS} s plus the machine's own scheduling "
                 f"noise {scheduling:.3f} s. Across that gap this process burned "
                 f"{ticker.worst_cpu:.3f} s of CPU and a plain Python thread of its own was held "
-                f"{ticker.worst_thread:.3f} s — busy CPU means something ran; no CPU with the thread "
-                f"held too means a blocking call kept the GIL; no CPU with the thread free means the "
-                f"OS kept this whole process off a core, which is the runner and not the SDK",
+                f"{ticker.worst_thread:.3f} s — CPU burned means code ran on the loop holding the GIL; "
+                f"no CPU with the thread held too means the whole process was kept off a core or a "
+                f"blocking call kept the GIL, and the noise figure tells those apart; no CPU with the "
+                f"thread free means the loop's thread was blocked in a call that released the GIL",
             )
         finally:
             noise.stop()
